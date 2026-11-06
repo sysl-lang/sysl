@@ -31,6 +31,13 @@ import sysl.time.millis
 // the editor has sent. `didClose`, `shutdown` and `exit` are taken as they come, and a text still
 // waiting at `shutdown` is never analyzed -- nothing is published after it.
 //
+// **An analysis is published in two tiers, and a newer text stops it.** What the program's own text
+// says -- the parse, the declarations, every body it wrote -- is published as soon as it is known, and
+// what the whole program decides -- instantiations, module storage evaluated, the whole-program checks
+// such as `check_keeps` -- is merged in when it is (`EditorCheck`, `lsp_changed`); the second
+// publication is exactly what a whole analysis says. A `didChange` arriving meanwhile stops the
+// analysis at its next step, unpublished, and the newer text is analyzed instead.
+//
 // Positions are the protocol's: a line counted from zero and a character counted in UTF-16 code
 // units, converted from the byte offsets the compiler keeps (`lsp_position`, `lsp_offset`).
 
@@ -68,6 +75,9 @@ struct LspServer
     // Every file whose last published list was not empty, with the compilation it was published for:
     // what has to be cleared when that compilation's next analysis finds nothing wrong there.
     published: Buf[LspPublished]
+
+    // Every file's second-tier diagnostics as last published (`lsp_changed`).
+    held: Buf[LspHeld]
 end LspServer
 
 // A file the server last published diagnostics for, and the compilation that found them (`lsp_root`).
@@ -76,7 +86,7 @@ struct LspPublished
     uri: string
 end LspPublished
 
-lsp_server() -> LspServer = LspServer(false, false, None, buf(), buf())
+lsp_server() -> LspServer = LspServer(false, false, None, buf(), buf(), buf())
 
 // What a mistake in `sysl lsp` is answered with, and its line in `sysl --help`.
 lsp_usage() -> string = "usage: sysl lsp [--stdio]"
@@ -146,9 +156,60 @@ lsp_serve(r: *Reader, w: *Writer, note: string -> unit, arrives: int -> bool) ->
         // A change is analyzed once the input has been quiet; anything arriving meanwhile is read first.
         if !lsp_any_stale(server) || arrives(LspSettleMillis) then continue
 
-        for out in lsp_settle(&server)
-            lsp_write(w, out)
+        // Each publication is written as it is made, and a change arriving while the check runs
+        // stops it (`lsp_change_waiting`): the loop goes back to read it, and analyzes that instead.
+        lsp_settle_as_found(&server, m -> lsp_write(w, m), () -> lsp_change_waiting(r, &pending, arrives))
 end lsp_serve
+
+// Whether a message that makes the check in flight stale has arrived: a `didChange`, or the end of
+// the session (`shutdown`, `exit`, the input ending). What is waiting is read into `pending` and left
+// there, so the loop takes every message in the order it came; nothing is lost by looking.
+private lsp_change_waiting(r: *Reader, pending: *Buf[u8], arrives: int -> bool) -> bool
+    var chunk: [4096]u8 = [0; 4096]
+
+    while arrives(0)
+        val got = r.read(chunk)
+
+        if got.len == 0 then return true
+
+        for b in got do pending.push(b)
+
+    lsp_supersedes_any(*pending)
+end lsp_change_waiting
+
+// Whether any whole message in `waiting` is one that makes a check in flight stale.
+lsp_supersedes_any(waiting: Buf[u8]) -> bool
+    var rest: Buf[u8] = buf()
+
+    for b in waiting do rest.push(b)
+
+    loop
+        val head = lsp_header_end(rest) match
+            Some(h) -> h
+            None -> return false
+
+        val need = lsp_content_length(from_utf8_lossy(rest.view()[0..<head])) match
+            Ok(length) -> head + 4 + length
+            Err(_) -> return false
+
+        if rest.len() < need then return false
+
+        val body = from_utf8_lossy(rest.view()[(head + 4)..<need])
+
+        parse_json(body) match
+            Ok(msg) -> json_text_at(msg, ["method"]) match
+                Some(m) ->
+                    if m == "textDocument/didChange" || m == "shutdown" || m == "exit" then return true
+                None -> ()
+            Err(_) -> ()
+
+        var next: Buf[u8] = buf()
+
+        for i in need..<rest.len()
+            next.push(rest[i])
+
+        rest = next
+end lsp_supersedes_any
 
 // Whether `pending` already holds one whole message, or a header too broken to wait on.
 private lsp_buffered(pending: Buf[u8]) -> bool = lsp_header_end(pending) match
@@ -332,6 +393,7 @@ private lsp_notified(server: *LspServer, method: string, msg: Json, out: *Buf[st
             None -> ()
     else if method == "textDocument/didClose"
         release_editor_text(lsp_uri_file(uri))
+        lsp_release_held(server, lsp_uri_file(uri))
         lsp_forget(server,uri)
         lsp_unpublish(server, uri)
         out.push(lsp_publish(uri, buf()))
@@ -428,6 +490,7 @@ private lsp_hold(server: *LspServer, uri: string, text: string)
     val file = lsp_uri_file(uri)
 
     hold_editor_text(file, text)
+    lsp_release_held(server, file)
     lsp_forget(server, uri)
     server.documents.push(LspDocument(uri, file, text, buf(), true))
 end lsp_hold
@@ -445,7 +508,16 @@ end lsp_any_stale
 lsp_settle(server: *LspServer) -> Buf[string]
     var out: Buf[string] = buf()
 
-    if server.shut_down then return out
+    lsp_settle_as_found(server, m -> out.push(m), () -> false)
+    out
+end lsp_settle
+
+// The same, with each publication handed to `emit` as soon as it is made -- a check's first tier
+// before its second is done -- and `superseded` asked between the check's steps whether a newer text
+// has arrived. Where it has, the check stops, its document stays waiting, and nothing more is
+// analyzed: the answer is false, and the caller reads the input before settling again.
+lsp_settle_as_found(server: *LspServer, emit: string -> unit, superseded: () -> bool) -> bool
+    if server.shut_down then return true
 
     var waiting: Buf[string] = buf()
 
@@ -453,31 +525,73 @@ lsp_settle(server: *LspServer) -> Buf[string]
         if d.stale then waiting.push(d.uri)
 
     for uri in waiting
-        lsp_changed(server, uri, &out)
+        if !lsp_changed(server, uri, emit, superseded) then return false
 
-    out
-end lsp_settle
+    true
+end lsp_settle_as_found
 
 // A held document analyzed, remembered, and the diagnostics published -- the document's own first,
 // then every other file the analysis found something wrong in, then an empty list for each file this
-// compilation had published for and no longer finds anything wrong in.
-private lsp_changed(server: *LspServer, uri: string, out: *Buf[string])
+// compilation had published for and no longer finds anything wrong in. False where the check was
+// told to stop (`lsp_settle_as_found`), which leaves the document waiting.
+//
+// **The publication comes twice**: once when the check's first tier is done -- the program's own
+// text -- and again when the whole check is. **A file's second-tier diagnostics stay up across the
+// first publication** (`LspHeld`) while the text they were found in is unchanged, so a keeps refusal
+// in one file does not blink out while another is edited; the second publication is the whole
+// check's own, exactly what a check from nothing says. **A list the second publication would send
+// exactly as the first sent it is not sent again**, so a check whose whole program adds nothing is
+// one publication, as it was before there were tiers.
+private lsp_changed(server: *LspServer, uri: string, emit: string -> unit, superseded: () -> bool) -> bool
     val text = lsp_document(*server, uri) match
         Some(d) -> d.text
-        None -> return
+        None -> return true
 
     val file = lsp_uri_file(uri)
-    val (found, references, whole, root) = lsp_analyze(file, text)
+    // What the first tier found, kept to tell the second tier's own diagnostics from it, and what its
+    // publication sent.
+    var first: Buf[LspFound] = buf()
+    var sent: Buf[string] = buf()
+
+    val tell_first = (found: Buf[LspFound], root: string) ->
+        for f in found do first.push(f)
+
+        lsp_published(server, uri, file, lsp_with_held(*server, root, found), true, root, emit, buf(), sent)
+
+    val done = lsp_analyze_in_tiers(file, text, tell_first, superseded)
+
+    if done.abandoned then return false
 
     lsp_forget(server, uri)
-    server.documents.push(LspDocument(uri, file, text, references, false))
+    server.documents.push(LspDocument(uri, file, text, done.references, false))
 
+    if done.whole then lsp_hold_second_tier(server, done.root, done.found, first)
+
+    lsp_published(server, uri, file, done.found, done.whole, done.root, emit, sent, buf())
+    true
+end lsp_changed
+
+// `found` published as what the compilation at `root` says now, and remembered (`published`). A
+// message among `told` -- sent already, by this check's first tier -- is not sent again; every message
+// this publication makes is pushed onto `sent`.
+private lsp_published(server: *LspServer, uri: string, file: string, found: Buf[LspFound], whole: bool,
+                      root: string, emit: string -> unit, told: Buf[string], sent: Buf[string])
     var now: Buf[LspPublished] = buf()
+
+    val send = (m: string) ->
+        var already = false
+
+        for t in told
+            if t == m then already = true
+
+        if !already then emit(m)
+
+        sent.push(m)
 
     for f in found
         val there = if absolute_path(f.file) == absolute_path(file) then uri else lsp_uri_of(*server, f.file)
 
-        out.push(lsp_publish(there, f.diagnostics))
+        send(lsp_publish(there, f.diagnostics))
 
         if f.diagnostics.len() > 0 then now.push(LspPublished(root, there))
 
@@ -494,7 +608,7 @@ private lsp_changed(server: *LspServer, uri: string, out: *Buf[string])
         if still then continue
 
         if p.root == root && whole
-            out.push(lsp_publish(p.uri, buf()))
+            send(lsp_publish(p.uri, buf()))
         else
             kept.push(p)
 
@@ -502,7 +616,89 @@ private lsp_changed(server: *LspServer, uri: string, out: *Buf[string])
         kept.push(n)
 
     server.published = kept
-end lsp_changed
+end lsp_published
+
+// A file's diagnostics from a check's second tier, as last published, and the compilation that found
+// them: what the next check's first publication keeps up for the file while its text is unchanged.
+struct LspHeld
+    root: string
+    file: string
+    diagnostics: Buf[Json]
+end LspHeld
+
+// `found` with the second-tier diagnostics held for the compilation at `root` added, file by file.
+// Nothing in `found` is written to.
+private lsp_with_held(server: LspServer, root: string, found: Buf[LspFound]) -> Buf[LspFound]
+    var out: Buf[LspFound] = buf()
+
+    for f in found
+        var ds: Buf[Json] = buf()
+
+        for d in f.diagnostics do ds.push(d)
+
+        out.push(LspFound(f.file, ds))
+
+    for h in server.held
+        if h.root != root then continue
+
+        var k: usize = 0
+
+        while k < out.len() && out[k].file != h.file
+            k += 1
+
+        if k == out.len() then out.push(LspFound(h.file, buf()))
+
+        for d in h.diagnostics do out[k].diagnostics.push(d)
+
+    out
+end lsp_with_held
+
+// What a completed check at `root` found beyond its first tier, held in place of what the last one
+// at `root` held. A check whose first tier was never told -- one that stopped before it -- holds
+// nothing, since nothing it found is the second tier's alone.
+private lsp_hold_second_tier(server: *LspServer, root: string, found: Buf[LspFound], first: Buf[LspFound])
+    var kept: Buf[LspHeld] = buf()
+
+    for h in server.held
+        if h.root != root then kept.push(h)
+
+    if !first.is_empty()
+        for f in found
+            var only: Buf[Json] = buf()
+
+            for d in f.diagnostics
+                if !lsp_said_in(first, f.file, d) then only.push(d)
+
+            if !only.is_empty() then kept.push(LspHeld(root, f.file, only))
+    end if
+
+    server.held = kept
+end lsp_hold_second_tier
+
+// Whether `d` is among what `found` says about `file`.
+private lsp_said_in(found: Buf[LspFound], file: string, d: Json) -> bool
+    val shown = d.to_string()
+
+    for f in found
+        if f.file != file then continue
+
+        for e in f.diagnostics
+            if e.to_string() == shown then return true
+
+    false
+end lsp_said_in
+
+// A file's held second-tier diagnostics let go: its text has changed, so they are about a text that
+// is no longer there.
+private lsp_release_held(server: *LspServer, file: string)
+    val whole = absolute_path(file)
+    var kept: Buf[LspHeld] = buf()
+
+    for h in server.held
+        if h.file != whole then kept.push(h)
+
+    server.held = kept
+end lsp_release_held
 
 // What one file is told: where it is on disk, and its diagnostics.
 struct LspFound
@@ -552,6 +748,28 @@ private lsp_document(server: LspServer, uri: string) -> Option[LspDocument]
 // be assembled at all -- no standard library, an unreadable manifest -- is said once, at the top of
 // the file.
 lsp_analyze(file: string, text: string) -> (Buf[LspFound], Buf[Reference], bool, string)
+    val done = lsp_analyze_in_tiers(file, text, (_, _) -> (), () -> false)
+
+    (done.found, done.references, done.whole, done.root)
+end lsp_analyze
+
+// What an editor's check of a file came to (`lsp_analyze_in_tiers`).
+struct LspChecked
+    found: Buf[LspFound]
+    references: Buf[Reference]
+    whole: bool
+    root: string
+
+    // That the check was told to stop before it was done, so `found` is not its answer.
+    abandoned: bool
+end LspChecked
+
+// `lsp_analyze`, in the two tiers an editor's check comes in (`EditorCheck`): `first` is told the
+// first tier's diagnostics, file by file, and the compilation's root, as soon as they are found; and
+// `superseded` is asked between steps whether the text has changed, which stops the check. A syntax
+// error, or a compilation that cannot be assembled, has no tiers: nothing is told to `first`.
+lsp_analyze_in_tiers(file: string, text: string, first: (Buf[LspFound], string) -> unit,
+                     superseded: () -> bool) -> LspChecked
     var found: Buf[LspFound] = buf()
     val src = source(file, text.bytes)
     val parsed = parse(src)
@@ -572,30 +790,23 @@ lsp_analyze(file: string, text: string) -> (Buf[LspFound], Buf[Reference], bool,
             last_line = line
             found[0].diagnostics.push(lsp_diagnostic(src, d.span, d.severity, d.message))
 
-        return (found, buf(), false, lsp_root(file))
+        return LspChecked(found, buf(), false, lsp_root(file), false)
     end if
 
     val root = lsp_root(file, module_written(parsed.program))
     val in_std = lsp_std_dir() == Some(root)
+    val editor = editor_check(ds -> first(lsp_found_in(file, ds), root), () -> superseded())
 
-    (if in_std then indexed_std(root) else indexed_file(root)) match
+    (if in_std then indexed_std(root, Some(editor)) else indexed_file(root, Some(editor))) match
         Err(failure) ->
             found[0].diagnostics.push(lsp_diagnostic(src, Span(0, 0), Error, failure.message))
-            (found, buf(), false, root)
+            LspChecked(found, buf(), false, root, false)
         Ok(ix) ->
-            for p in ix.problems
-                val there = absolute_path(lsp_on_disk(p.src.name))
-                val at = if p.at_place then p.diag.span else Span(0, 0)
-                var k: usize = 0
+            if editor.abandoned then return LspChecked(found, buf(), false, root, true)
 
-                while k < found.len() && found[k].file != there
-                    k += 1
+            found = lsp_found_in(file, ix.problems)
 
-                if k == found.len() then found.push(LspFound(there, buf()))
-
-                found[k].diagnostics.push(lsp_diagnostic(p.src, at, p.diag.severity, p.diag.message))
-
-            if !in_std then return (found, ix.references, true, root)
+            if !in_std then return LspChecked(found, ix.references, true, root, false)
 
             // The library's files are named `library/…` (`StdPrefix`) whatever they were read from;
             // the document's own references are filed back under the file the editor opened.
@@ -606,8 +817,30 @@ lsp_analyze(file: string, text: string) -> (Buf[LspFound], Buf[Reference], bool,
             for r in ix.references
                 if r.at_file == named then mine.push(r with { at_file = file })
 
-            (found, mine, true, root)
-end lsp_analyze
+            LspChecked(found, mine, true, root, false)
+end lsp_analyze_in_tiers
+
+// An analysis's diagnostics file by file, with `file`'s own first whether or not it has any -- each
+// file named where it is on disk, absolute and normalized.
+private lsp_found_in(file: string, problems: Buf[Placed]) -> Buf[LspFound]
+    var found: Buf[LspFound] = buf()
+
+    found.push(LspFound(absolute_path(file), buf()))
+
+    for p in problems
+        val there = absolute_path(lsp_on_disk(p.src.name))
+        val at = if p.at_place then p.diag.span else Span(0, 0)
+        var k: usize = 0
+
+        while k < found.len() && found[k].file != there
+            k += 1
+
+        if k == found.len() then found.push(LspFound(there, buf()))
+
+        found[k].diagnostics.push(lsp_diagnostic(p.src, at, p.diag.severity, p.diag.message))
+
+    found
+end lsp_found_in
 
 // The standard library's root, absolute, where there is one.
 private lsp_std_dir() -> Option[string] = std_root() match
