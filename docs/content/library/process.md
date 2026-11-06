@@ -508,6 +508,11 @@ Like a `Child`, a `Spawned` dropped without being waited for is ended and reaped
 pipeline abandoned halfway leaves no stage running and no zombie; `spawn` takes `dir`, `env`,
 `timeout` and `inherit_env` meaning what they mean for `run`, the `timeout` kept by `wait`.
 
+**`detach` lets a child outlive its handle.** `s.detach()` answers the child's pid, and dropping `s`
+afterwards signals and waits for nothing, so a daemon a command line program starts keeps running.
+Reaping is then the caller's business: a detached child that ends while the program lives is a
+zombie until someone waits for it by its pid, and init adopts it once the program has exited.
+
 ## Who the program is
 
 **`user()` and `group()` answer the ids the program acts as**, as `u32`s — the type
@@ -555,6 +560,31 @@ set_user(1000)?
 
 Mapping a number to a name — `/etc/passwd`, `/etc/group` — is not here: that is a system database, and
 a program that reads one reads the system's own.
+
+## How much memory
+
+**`total_memory()` is the physical memory the machine has, in bytes** (macOS's `hw.memsize`, Linux's
+`sysinfo` total), and **`resident_bytes(pid)` is the memory a process has in RAM now** (macOS's
+`proc_pidinfo` task info, Linux's `/proc/<pid>/statm`). Both answer a `u64` in a `Result`;
+`resident_bytes(child.pid())` is a child's and `resident_bytes(int(pid()))` the program's own:
+
+```sysl
+import sysl.process.{pid, resident_bytes, total_memory}
+
+val own = resident_bytes(int(pid())).unwrap()
+
+print(own > 0, total_memory().unwrap() >= own)
+print(resident_bytes(0).is_err())
+```
+
+```output
+true true
+true
+```
+
+`resident_bytes` fails for a process that is not there (a reaped child), for one the program may not
+look at (`NotPermitted`), and for a pid of zero or less. A target with no way to ask fails with
+`UNSUPPORTED`'s error.
 
 ## Becoming another program
 

@@ -1164,3 +1164,77 @@ int sysl_proc_posix_tcsetpgrp(int pgid) {
     close(tty);
     return e;
 }
+
+#if defined(__APPLE__)
+#include <libproc.h>
+#include <sys/sysctl.h>
+#elif defined(__linux__)
+#include <sys/sysinfo.h>
+#endif
+
+/* The physical memory the machine has, in bytes, written to `out`; an `errno` where it cannot be
+ * told. macOS asks `hw.memsize`; Linux multiplies `sysinfo`'s `totalram` by its `mem_unit`. */
+int sysl_proc_posix_total_memory(unsigned long long *out) {
+#if defined(__APPLE__)
+    unsigned long long bytes = 0;
+    size_t size = sizeof bytes;
+
+    if (sysctlbyname("hw.memsize", &bytes, &size, NULL, 0) != 0) return errno;
+
+    *out = bytes;
+    return 0;
+#elif defined(__linux__)
+    struct sysinfo info;
+
+    if (sysinfo(&info) != 0) return errno;
+
+    *out = (unsigned long long)info.totalram * (info.mem_unit ? info.mem_unit : 1);
+    return 0;
+#else
+    (void)out;
+    return ENOSYS;
+#endif
+}
+
+/* The resident set of process `pid`, in bytes, written to `out`; an `errno` where it cannot be read:
+ * `ESRCH` for a process that is not there, `EPERM` (or `EACCES`) for one this program may not look
+ * at, `EINVAL` for a number no process has. */
+int sysl_proc_posix_resident(long long pid, unsigned long long *out) {
+    if (pid <= 0 || pid > 0x7fffffffLL) return EINVAL;
+#if defined(__APPLE__)
+    struct proc_taskinfo info;
+
+    errno = 0;
+
+    int got = proc_pidinfo((int)pid, PROC_PIDTASKINFO, 0, &info, (int)sizeof info);
+
+    if (got <= 0) return errno != 0 ? errno : ESRCH;
+    if (got < (int)sizeof info) return ESRCH;
+
+    *out = info.pti_resident_size;
+    return 0;
+#elif defined(__linux__)
+    char name[64];
+
+    snprintf(name, sizeof name, "/proc/%lld/statm", pid);
+
+    FILE *f = fopen(name, "r");
+
+    if (!f) return errno;
+
+    unsigned long long size = 0, resident = 0;
+    int n = fscanf(f, "%llu %llu", &size, &resident);
+
+    fclose(f);
+
+    if (n != 2) return EIO;
+
+    long page = sysconf(_SC_PAGESIZE);
+
+    *out = resident * (unsigned long long)(page > 0 ? page : 4096);
+    return 0;
+#else
+    (void)out;
+    return ENOSYS;
+#endif
+}
