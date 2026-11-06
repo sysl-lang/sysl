@@ -58,3 +58,46 @@ private[sysl] extern "sysl_io_flush" fd_flush(fd: int) -> int
 @blocks
 @needs(os)
 private[sysl] extern "sysl_io_wait" fd_wait(fd: int, writable: int, micros: long) -> int
+
+// ## The readiness poller's hooks
+//
+// `sysl.io.poll` is a kernel's readiness set -- kqueue, epoll -- reached through five hooks. A poller
+// is two descriptors: the set itself, and a second one a wake is written to where the system needs
+// one (epoll's `eventfd`); a system that wakes the set through the set itself answers `-1` for the
+// second, and every hook below takes it back as it was handed out.
+//
+// **An event crosses as 32 bytes the caller owns** -- `sysl.io.poll.Event`'s layout: the token as a
+// `u64`, then four `bool`s (readable, writable, hung up, failed), then padding. The supplier may use
+// the whole of the caller's storage as its own scratch before writing the events into it, which is
+// what lets a wait allocate nothing; and it writes no more than `room` of them.
+
+/** Makes a readiness set, answering its descriptor or the failure's code, negated, and leaving the
+ * descriptor a wake is written to -- or `-1` -- in `wake`.
+ */
+@needs(os)
+private[sysl] extern "sysl_io_poll_open" poll_open(wake: *i32) -> int
+
+/** Adds `fd` to the set (`op` 0), changes what it is registered for (1), or takes it out (2),
+ * answering zero or the failure's code, negated. `interest` is a set of bits -- 1 readable, 2
+ * writable -- and `mode` is 0 for level-triggered, 1 for one-shot, 2 for edge-triggered.
+ */
+@needs(os)
+private[sysl] extern "sysl_io_poll_control" poll_control(poller: int, fd: int, op: int, interest: int,
+                                                         mode: int, token: u64) -> int
+
+/** Waits at most `micros` microseconds -- for ever where it is negative -- for something in the set to
+ * be ready, writing at most `room` events at `into` and answering how many, or the failure's code,
+ * negated. A wake ends the wait and is not itself one of the events; a signal does not end it.
+ */
+@blocks
+@needs(os)
+private[sysl] extern "sysl_io_poll_wait" poll_wait(poller: int, wake: int, into: *u8, room: usize,
+                                                   micros: long) -> isize
+
+/** Ends a wait on the set, from any thread, answering zero or the failure's code, negated. */
+@needs(os)
+private[sysl] extern "sysl_io_poll_wake" poll_wake(poller: int, wake: int) -> int
+
+/** Closes both of a poller's descriptors, answering zero or the first failure's code, negated. */
+@needs(os)
+private[sysl] extern "sysl_io_poll_close" poll_close(poller: int, wake: int) -> int

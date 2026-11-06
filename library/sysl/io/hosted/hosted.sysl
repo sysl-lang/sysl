@@ -72,4 +72,55 @@ io_wait(fd: int, writable: int, micros: long) -> int = c_wait(fd, writable, micr
 @export("sysl_io_wait")
 io_wait(fd: int, writable: int, micros: long) -> int = UNSUPPORTED
 #endif
+
+// **The readiness poller is answered by `poll.c` beside this file**: kqueue on Darwin and the BSDs,
+// epoll on Linux, and the host's "no such call" -- `UNSUPPORTED` -- on a POSIX system with neither.
+// Each of its functions answers a count, a descriptor or zero, or an `errno` negated, and the hook
+// here turns a failure into the contract's status.
+#if posix
+private extern "sysl_io_posix_poll_open" c_poll_open(wake: *i32) -> int
+private extern "sysl_io_posix_poll_control" c_poll_control(poller: int, fd: int, op: int, interest: int,
+                                                           mode: int, token: u64) -> int
+private extern "sysl_io_posix_poll_wait" c_poll_wait(poller: int, wake: int, into: *u8, room: usize,
+                                                     micros: long) -> isize
+private extern "sysl_io_posix_poll_wake" c_poll_wake(poller: int, wake: int) -> int
+private extern "sysl_io_posix_poll_close" c_poll_close(poller: int, wake: int) -> int
+
+/** A shim's answer as a hook's: what it answered, or the failure's status. */
+private polled(k: int) -> int = if k < 0 then host_status(-k) else k
+
+@export("sysl_io_poll_open")
+io_poll_open(wake: *i32) -> int = polled(c_poll_open(wake))
+
+@export("sysl_io_poll_control")
+io_poll_control(poller: int, fd: int, op: int, interest: int, mode: int, token: u64) -> int =
+    polled(c_poll_control(poller, fd, op, interest, mode, token))
+
+@export("sysl_io_poll_wait")
+io_poll_wait(poller: int, wake: int, into: *u8, room: usize, micros: long) -> isize
+    val k = c_poll_wait(poller, wake, into, room, micros)
+
+    if k < 0 then isize(host_status(int(-k))) else k
+
+@export("sysl_io_poll_wake")
+io_poll_wake(poller: int, wake: int) -> int = polled(c_poll_wake(poller, wake))
+
+@export("sysl_io_poll_close")
+io_poll_close(poller: int, wake: int) -> int = polled(c_poll_close(poller, wake))
+#else
+@export("sysl_io_poll_open")
+io_poll_open(wake: *i32) -> int = UNSUPPORTED
+
+@export("sysl_io_poll_control")
+io_poll_control(poller: int, fd: int, op: int, interest: int, mode: int, token: u64) -> int = UNSUPPORTED
+
+@export("sysl_io_poll_wait")
+io_poll_wait(poller: int, wake: int, into: *u8, room: usize, micros: long) -> isize = isize(UNSUPPORTED)
+
+@export("sysl_io_poll_wake")
+io_poll_wake(poller: int, wake: int) -> int = UNSUPPORTED
+
+@export("sysl_io_poll_close")
+io_poll_close(poller: int, wake: int) -> int = UNSUPPORTED
+#endif
 #endif

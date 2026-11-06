@@ -1,0 +1,532 @@
+module sysl.fiber
+@requires(posix)
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fenv.{RoundingMode, rounding, set_rounding}
+import sysl.fs.{make_temp_dir, page_size, remove_dir_all, write_text}
+import sysl.hint.black_box
+import sysl.process.{Status, capture}
+import sysl.testing.compiler
+import sysl.threads.{ScopeSlot, current, scope_in}
+import sysl.time.monotonic
+
+// The axes: a fresh context against a saved one; the thread a context is resumed on; what a switch
+// must carry (integers, the frame chain, d8--d15, the rounding mode); what a stack costs untouched,
+// touched and overrun; how many at once; and an entry that breaks its contract. Not here: the x87
+// control word (no sysl operation reads it) and an overflow on a carrier other than the main thread
+// (the same handler, reached through the signal stack the first switch gives a thread, which the
+// migration test exercises without faulting).
+
+// -- ping-pong ---------------------------------------------------------------------------------------
+
+private struct Pong
+    home: Context
+    me: Context
+    n: int
+
+private pong(p: *Pong)
+    loop
+        p.n += 1
+        switch(&p.me, &p.home)
+
+@test("two contexts switch a million times each way, and every switch lands")
+fbr_ping_pong_a_million()
+    val s = Stack.reserve(64 * 1024).unwrap()
+    var p = Pong(Context.new(), Context.new(), 0)
+
+    p.me = Context.start(s, &pong, &p)
+    assert(p.me.is_ready())
+    assert(!p.home.is_ready())
+
+    val t0 = monotonic()
+
+    for i in 0..<1000000
+        switch(&p.home, &p.me)
+        assert(p.n == i + 1)
+
+    val us = (monotonic() - t0).us
+
+    assert_eq(p.n, 1000000)
+    assert(p.home.is_ready())
+    eprints(s"fiber: ${us * 1000 / 2000000} ns per switch (debug build, information only)\n")
+
+@test("a context started but never switched to is dropped with its stack, and runs nothing")
+fbr_never_entered()
+    val s = Stack.reserve(16 * 1024).unwrap()
+    var p = Pong(Context.new(), Context.new(), 0)
+
+    p.me = Context.start(s, &pong, &p)
+    assert_eq(p.n, 0)
+
+@test("one stack is started a second time once its first fiber is finished with")
+fbr_stack_reused()
+    val s = Stack.reserve(16 * 1024).unwrap()
+    var a = Pong(Context.new(), Context.new(), 0)
+
+    a.me = Context.start(s, &pong, &a)
+    switch(&a.home, &a.me)
+
+    var b = Pong(Context.new(), Context.new(), 0)
+
+    b.me = Context.start(s, &pong, &b)
+    switch(&b.home, &b.me)
+    switch(&b.home, &b.me)
+    assert_eq(a.n, 1)
+    assert_eq(b.n, 2)
+
+// -- three contexts in a ring: a saved context is resumed from somewhere other than where it left ---
+
+private struct Ring
+    home: Context
+    a: Context
+    b: Context
+    trail: Buf[int]
+
+private ring_a(r: *Ring)
+    loop
+        r.trail.push(1)
+        switch(&r.a, &r.b)
+
+private ring_b(r: *Ring)
+    loop
+        r.trail.push(2)
+        switch(&r.b, &r.home)
+
+@test("a context left for a third one comes back where it was")
+fbr_ring_of_three()
+    val sa = Stack.reserve(32 * 1024).unwrap()
+    val sb = Stack.reserve(32 * 1024).unwrap()
+    var r = Ring(Context.new(), Context.new(), Context.new(), buf())
+
+    r.a = Context.start(sa, &ring_a, &r)
+    r.b = Context.start(sb, &ring_b, &r)
+
+    for _ in 0..<3
+        switch(&r.home, &r.a)
+
+    assert_eq(r.trail.len(), 6)
+
+    for i in 0..<6
+        assert_eq(r.trail[i], i % 2 + 1)
+
+// -- carrier migration -------------------------------------------------------------------------------
+
+@thread_local
+private var carrier_tag: int = 0
+
+@noinline
+private tag_now() -> int = carrier_tag
+
+private struct Hop
+    home: Context
+    away: Context
+    me: Context
+    first: u64
+    second: u64
+    first_tag: int
+    second_tag: int
+    deep: u64
+
+private hop(h: *Hop)
+    h.first = current().id
+    h.first_tag = tag_now()
+    switch(&h.me, &h.home)
+    h.second = current().id
+    h.second_tag = tag_now()
+    h.deep = dig(64)
+    switch(&h.me, &h.away)
+
+private on_another_thread(h: *Hop)
+    carrier_tag = 2
+    switch(&h.away, &h.me)
+
+@test("a context parked on one thread resumes on another, and sees that thread's thread-locals")
+fbr_migrates_between_threads()
+    carrier_tag = 1
+
+    val s = Stack.reserve(256 * 1024).unwrap()
+    var h = Hop(Context.new(), Context.new(), Context.new(), 0, 0, 0, 0, 0)
+
+    h.me = Context.start(s, &hop, &h)
+    switch(&h.home, &h.me)
+    assert_eq(h.first, current().id)
+    assert_eq(h.first_tag, 1)
+
+    val ph = &h
+    var slots: [1]ScopeSlot = [ScopeSlot.new(); 1]
+
+    scope_in(slots[..], (s) -> s.start(&on_another_thread, ph))
+
+    assert(h.second != h.first)
+    assert_eq(h.second_tag, 2)
+    assert_eq(h.deep, dug(64))
+    assert_eq(tag_now(), 1)
+
+// -- a stack is committed as it is touched -----------------------------------------------------------
+
+// Each frame holds a KiB that it writes all of, so `n` frames touch about `n` KiB of stack.
+private dig(n: int) -> u64
+    var pad: [1024]u8 = [0; 1024]
+
+    for i in 0..<pad.len do pad[i] = u8(i % 7)
+
+    val below = if n == 0 then 0 else dig(black_box(n - 1))
+
+    below + u64(pad[n % 1024]) + 1
+end dig
+
+private dug(n: int) -> u64
+    var total: u64 = 0
+
+    for i in 0..<n + 1 do total += u64((i % 1024) % 7) + 1
+
+    total
+
+private struct Dig
+    home: Context
+    me: Context
+    depth: int
+    answer: u64
+
+private dig_body(d: *Dig)
+    d.answer = dig(d.depth)
+    switch(&d.me, &d.home)
+
+@test("a large stack costs only what is touched: 64 MiB reserved, about 1 MiB committed")
+fbr_commits_lazily()
+    val s = Stack.reserve(64 * 1024 * 1024).unwrap()
+
+    assert(s.len() >= 64 * 1024 * 1024)
+    assert(s.committed() <= 64 * 1024, s"${s.committed()} before anything ran")
+
+    var d = Dig(Context.new(), Context.new(), 1024, 0)
+
+    d.me = Context.start(s, &dig_body, &d)
+    switch(&d.home, &d.me)
+
+    val got = s.committed()
+
+    assert_eq(d.answer, dug(1024))
+    assert(got >= 1024 * 1024, s"$got committed")
+    assert(got <= 8 * 1024 * 1024, s"$got committed")
+
+@test("a stack of one byte holds at least one, and costs at most the page its bookkeeping is on")
+fbr_sizes_round_up()
+    val s = Stack.reserve(1).unwrap()
+
+    assert(s.len() >= 1)
+    assert(s.committed() <= page_size(), s"${s.committed()}")
+
+    val big = Stack.reserve(page_size() * 3 + 1).unwrap()
+
+    assert(big.len() >= page_size() * 3 + 1)
+    assert(big.committed() <= page_size(), s"${big.committed()}")
+
+@test("a stack of no bytes is refused")
+fbr_zero_refused()
+    val r = Stack.reserve(0)
+
+    assert(r.is_err())
+    assert_eq(r.unwrap_err().code(), 22)
+
+@test("ten thousand stacks reserved at once, every one usable, then all dropped")
+fbr_ten_thousand_stacks()
+    var stacks: Buf[&Stack] = buf()
+
+    for _ in 0..<10000
+        stacks.push(Stack.reserve(16 * 1024).unwrap())
+
+    var p = Pong(Context.new(), Context.new(), 0)
+
+    for i in 0..<stacks.len()
+        if i % 1000 == 0
+            p.me = Context.start(stacks[i], &pong, &p)
+            switch(&p.home, &p.me)
+
+    assert_eq(p.n, 10)
+    stacks.clear()
+
+    val again = Stack.reserve(16 * 1024).unwrap()
+
+    assert(again.len() >= 16 * 1024)
+
+// -- what a switch carries besides the integer registers ---------------------------------------------
+
+private struct Modes
+    home: Context
+    me: Context
+    at_start: RoundingMode
+    after_home: RoundingMode
+
+private modes(m: *Modes)
+    m.at_start = rounding()
+    set_rounding(Upward)
+    switch(&m.me, &m.home)
+    m.after_home = rounding()
+    switch(&m.me, &m.home)
+
+@test("the rounding mode is each context's own: a fiber starts with its starter's and keeps its own")
+fbr_rounding_mode_is_saved()
+    set_rounding(Downward)
+
+    val s = Stack.reserve(32 * 1024).unwrap()
+    var m = Modes(Context.new(), Context.new(), NearestEven, NearestEven)
+
+    m.me = Context.start(s, &modes, &m)
+    set_rounding(TowardZero)
+    switch(&m.home, &m.me)
+
+    val home_mode = rounding()
+
+    switch(&m.home, &m.me)
+    set_rounding(NearestEven)
+    assert(m.at_start == Downward)
+    assert(home_mode == TowardZero)
+    assert(m.after_home == Upward)
+
+#if aarch64
+private struct Floats
+    home: Context
+    me: Context
+
+// Fills d8--d15 with the bit patterns 0x100 + i, then goes home with them still there.
+private trample(f: *Floats)
+    loop
+        var a: u64 = 0x100
+        var b: u64 = 0x101
+        var c: u64 = 0x102
+        var d: u64 = 0x103
+        var e: u64 = 0x104
+        var g: u64 = 0x105
+        var h: u64 = 0x106
+        var k: u64 = 0x107
+
+        asm
+            [aarch64]
+                "fmov d8, {a}"
+                "fmov d9, {b}"
+                "fmov d10, {c}"
+                "fmov d11, {d}"
+                "fmov d12, {e}"
+                "fmov d13, {g}"
+                "fmov d14, {h}"
+                "fmov d15, {k}"
+                in a : reg
+                in b : reg
+                in c : reg
+                in d : reg
+                in e : reg
+                in g : reg
+                in h : reg
+                in k : reg
+                clobbers "d8", "d9", "d10", "d11", "d12", "d13", "d14", "d15"
+            [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "d8--d15 are aarch64's"
+        switch(&f.me, &f.home)
+    end loop
+end trample
+
+@test("d8 to d15 hold the same bits after a switch away and back, whatever the other side put there")
+fbr_callee_saved_floats_survive()
+    val s = Stack.reserve(32 * 1024).unwrap()
+    var f = Floats(Context.new(), Context.new())
+
+    f.me = Context.start(s, &trample, &f)
+
+    var a: u64 = 0x200
+    var b: u64 = 0x201
+    var c: u64 = 0x202
+    var d: u64 = 0x203
+    var e: u64 = 0x204
+    var g: u64 = 0x205
+    var h: u64 = 0x206
+    var k: u64 = 0x207
+
+    asm
+        [aarch64]
+            "fmov d8, {a}"
+            "fmov d9, {b}"
+            "fmov d10, {c}"
+            "fmov d11, {d}"
+            "fmov d12, {e}"
+            "fmov d13, {g}"
+            "fmov d14, {h}"
+            "fmov d15, {k}"
+            in a : reg
+            in b : reg
+            in c : reg
+            in d : reg
+            in e : reg
+            in g : reg
+            in h : reg
+            in k : reg
+            clobbers "d8", "d9", "d10", "d11", "d12", "d13", "d14", "d15"
+        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "d8--d15 are aarch64's"
+    switch(&f.home, &f.me)
+
+    asm
+        [aarch64]
+            "fmov {a}, d8"
+            "fmov {b}, d9"
+            "fmov {c}, d10"
+            "fmov {d}, d11"
+            "fmov {e}, d12"
+            "fmov {g}, d13"
+            "fmov {h}, d14"
+            "fmov {k}, d15"
+            out a : reg
+            out b : reg
+            out c : reg
+            out d : reg
+            out e : reg
+            out g : reg
+            out h : reg
+            out k : reg
+        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "d8--d15 are aarch64's"
+    assert_eq([a, b, c, d, e, g, h, k], [0x200, 0x201, 0x202, 0x203, 0x204, 0x205, 0x206, 0x207])
+end fbr_callee_saved_floats_survive
+#endif
+
+// -- the frame chain ends at the entry ---------------------------------------------------------------
+
+private extern "backtrace" c_backtrace(frames: **u8, n: int) -> int
+
+@noinline
+private frames_here() -> int
+    var room: [64]*u8 = [null; 64]
+
+    c_backtrace(&room[0], 64)
+
+private struct Walk
+    home: Context
+    me: Context
+    frames: int
+
+private walk(w: *Walk)
+    w.frames = frames_here()
+    switch(&w.me, &w.home)
+
+@test("a backtrace taken on a fiber stops at the fiber's entry")
+fbr_backtrace_ends_at_the_entry()
+    val s = Stack.reserve(32 * 1024).unwrap()
+    var w = Walk(Context.new(), Context.new(), 0)
+
+    w.me = Context.start(s, &walk, &w)
+    switch(&w.home, &w.me)
+
+    // `frames_here`, `walk` and the frame `walk` was called from, and nothing below it.
+    assert(w.frames >= 2, s"${w.frames} frames")
+    assert(w.frames <= 4, s"${w.frames} frames")
+    assert(frames_here() > w.frames)
+
+// -- what is reported where a fiber breaks its stack or its contract -------------------------------
+
+// `main` of a program that runs `body` (a function of an `*S`) on a fiber whose stack is `size` bytes.
+private fbr_program(body: string, size: int) -> string =
+    "import sysl.fiber.{Context, Stack, switch}\n\n" +
+    "struct S\n    home: Context\n    me: Context\n\n" + body + "\n" +
+    s"main()\n    val st = Stack.reserve($size).unwrap()\n" +
+    "    var s = S(Context.new(), Context.new())\n\n" +
+    "    s.me = Context.start(st, &run, &s)\n" +
+    "    switch(&s.home, &s.me)\n" +
+    "    print(\"back home\")\n"
+
+private struct Ran
+    status: Status
+    out: string
+    err: string
+
+private fbr_run(text: string) -> Ran
+    val root = make_temp_dir("sysl-fbr-").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val built = capture(compiler(), ["build", "-o", s"$root/prog", s"$root/main.sysl"],
+                        stderr = true).unwrap()
+
+    assert_eq(built.status, Status.Exited(0), built.err.unwrap_or(""))
+
+    val o = capture(s"$root/prog", stderr = true).unwrap()
+
+    remove_dir_all(root).unwrap()
+    Ran(o.status, o.text, o.err.unwrap_or(""))
+end fbr_run
+
+@test("recursion past a fiber's stack is reported as a stack overflow, not a bare fault")
+fbr_overflow_is_reported()
+    val r = fbr_run(fbr_program(raw"""
+        var one: int = 1
+
+        deep(n: int) -> int
+            var pad: [256]int = [0; 256]
+
+            pad[0] = n
+
+            val r = deep(n + one)
+
+            pad[usize(r % 7)] + 1
+
+        run(s: *S)
+            print("about to recurse")
+            print(deep(1))
+            switch(&s.me, &s.home)
+        """, 256 * 1024))
+
+    assert_eq(r.status, Status.Exited(139), r.err)
+    assert(r.err.contains("sysl: this program has overflowed its stack -- a recursion with no " +
+                          "base case, or a walk over a structure that contains itself"), r.err)
+    assert(r.out.contains("about to recurse"), r.out)
+    assert(!r.out.contains("back home"), r.out)
+
+@test("a fiber's guard catches a frame larger than a page that steps over its first page")
+fbr_overflow_by_a_large_frame()
+    val r = fbr_run(fbr_program(raw"""
+        var one: int = 1
+
+        deep(n: int) -> int
+            var pad: [4000]int = [0; 4000]
+
+            pad[0] = n
+
+            val r = deep(n + one)
+
+            pad[usize(r % 7)] + 1
+
+        run(s: *S)
+            print(deep(1))
+            switch(&s.me, &s.home)
+        """, 64 * 1024))
+
+    assert_eq(r.status, Status.Exited(139), r.err)
+    assert(r.err.contains("overflowed its stack"), r.err)
+
+@test("an entry that returns traps, and says why")
+fbr_entry_returning_traps()
+    val r = fbr_run(fbr_program(raw"""
+        run(s: *S)
+            print("printed first")
+            eprints("in the fiber\n")
+        """, 64 * 1024))
+
+    assert_eq(r.out, "printed first\n")
+
+    val signalled = r.status match
+        Signalled(_) -> true
+        _ -> false
+
+    assert(signalled, r.err)
+    assert(r.err.contains("in the fiber\n"), r.err)
+    assert(r.err.contains("sysl: a fiber's entry function returned -- an entry must switch away " +
+                          "for good, since there is no caller on its stack to return to"), r.err)
+    assert(!r.out.contains("back home"), r.out)
+
+@test("a fiber that switches home for good leaves the program to finish normally")
+fbr_finishing_normally()
+    val r = fbr_run(fbr_program(raw"""
+        run(s: *S)
+            eprints("in the fiber\n")
+            switch(&s.me, &s.home)
+        """, 64 * 1024))
+
+    assert_eq(r.status, Status.Exited(0), r.err)
+    assert_eq(r.out, "back home\n")

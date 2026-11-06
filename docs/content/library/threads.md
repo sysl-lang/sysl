@@ -920,6 +920,34 @@ the scope joins those too, and a handle may be joined from a sibling. Where the 
 another thread, `spawn` stops the program with a message rather than answer `None`: running a child
 inline instead could leave its siblings waiting at a barrier for ever.
 
+**A thread borrows only what outlives the `scope` call.** `body` is a frame of its own, and it has
+returned by the time the scope joins, so a local of the body — or of a block inside it, or a temporary
+made there — is gone while the thread may still be using it. That is refused, naming the local:
+
+```sysl
+import sysl.sync.*
+import sysl.threads.*
+
+count() -> int
+    scope((s) ->
+        var n = 0
+        val p = &n
+
+        s.spawn(() -> atomic_add(p, 1, SeqCst))
+        n)
+
+print(count())
+```
+
+```error
+a thread started on a scope may borrow only storage that outlives the 'scope' call, and 'n' does not; declare 'n' before 'scope'
+```
+
+Declared before `scope`, `n` belongs to the frame that called it, which the scope does not leave until
+every thread is joined, as in the pool below. The same holds for a helper handed `s`, which
+returns before the scope joins, and for `scope_in`'s `start`. A nested scope's threads may borrow the
+outer body's locals, since the outer body outlives the inner `scope` call.
+
 **A handle holds the thread's joiner and the slot its answer is left in, and nothing of the closure**,
 which stays in the scope's own list. So a handle is kept wherever the body likes — a slice made with
 `[None; n]`, a `Buf` — and a pool sized at run time is written as it reads:
