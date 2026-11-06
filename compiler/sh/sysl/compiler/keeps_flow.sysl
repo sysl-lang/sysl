@@ -1089,6 +1089,8 @@ place_loc(o: &Origins, place: TExpr) -> string
             s"l:$n"
         TGlobal(symbol, _, _) -> s"g:$symbol"
         TField(r, index, _) ->
+            if by_reference_capture(o, r, index) then return ""
+
             val base = place_loc(o, r)
 
             if base == "" then return ""
@@ -1106,6 +1108,26 @@ place_loc(o: &Origins, place: TExpr) -> string
             if b == "" then deref_name(o, x) else b
         _ -> ""
 end place_loc
+
+// **A capture a closure may hold by reference is the variable it captured, wherever that lives** --
+// the frame that built the closure, which its caller cannot name. The walks read the by-value form,
+// where a closure's body reaches the capture as a field of the environment `self` points at, so the
+// place would be named after the body's own parameter: a store into it (`last = Some(a)`), or its
+// address handed on (`keep(&last, a)`), would be translated at the call into the caller's argument --
+// a local of the caller -- and what is stored would seem to stay in a frame it outlives. A capture the
+// literal ends up holding by value is a copy no write may reach (`say_lost_writes`), so naming it as
+// nowhere costs only the address of a copy.
+private by_reference_capture(o: &Origins, r: TExpr, index: int) -> bool
+    val ty = texpr_type(r)
+
+    if index < 0 || !is_closure_literal(ty) then return false
+
+    ty match
+        Struct(st) -> o.cx.an.closure_refs.get(st.base) match
+            Some(refs) -> usize(index) < refs.len() && refs[usize(index)]
+            None -> false
+        _ -> false
+end by_reference_capture
 
 // **A store through a pointer the body did not make is named by where the pointer came from**, so
 // that a later store through the same pointer is seen to overwrite it. Two kinds of pointer qualify:
