@@ -1,0 +1,267 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `Buffer[T]` and `buffer()` are the longer names of `Buf[T]` and `buf()`: one type, one constructor.
+// Each program below is built and run, so what is asserted is what a user sees.
+
+private bnm_ready() -> bool
+    std_root() match
+        Err(_) ->
+            print("skipped: the standard module's source is not on this machine")
+            return false
+        Ok(_) -> ()
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end bnm_ready
+
+// What a program prints, or why it did not build.
+private bnm_ran(text: string) -> string
+    val root = make_temp_dir("sysl-bnm").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end bnm_ran
+
+@test("bnm: the two names mix in parameters, returns, fields and generic arguments")
+bnm_mixing()
+    if !bnm_ready() then return
+
+    assert_eq(bnm_ran(raw"""
+import sysl.buf.{Buf, Buffer, buf, buffer}
+
+struct Holder
+    items: Buffer[int]
+
+total(b: Buf[int]) -> int
+    var n = 0
+
+    for x in b
+        n += x
+
+    n
+
+make() -> Buffer[int]
+    var out: Buf[int] = buf()
+
+    out.push(5)
+    out
+
+fresh[T]() -> Buf[T] = buffer()
+
+main()
+    var a: Buffer[int] = buffer()
+    var b: Buf[int] = buf()
+
+    a.push(1)
+    b.push(2)
+
+    val h = Holder(b)
+
+    h.items.push(3)
+
+    var nested: Buffer[Buf[int]] = buffer()
+
+    nested.push(a)
+    nested[0].push(10)
+
+    var s: Buf[string] = fresh()
+
+    s.push("x")
+
+    print(total(a), total(b), make().len(), a.len(), nested.len(), s)
+"""), "11 5 1 2 1 [x]\n")
+end bnm_mixing
+
+@test("bnm: an impl for Buffer is seen through Buf, and the other way round")
+bnm_impls()
+    if !bnm_ready() then return
+
+    assert_eq(bnm_ran(raw"""
+import sysl.buf.{Buf, Buffer, buf, buffer}
+
+trait Twice
+    twice(self) -> usize
+
+trait Thrice
+    thrice(self) -> usize
+
+impl[T] Twice for Buffer[T]
+    twice(self) -> usize = self.len() * 2
+
+impl[T] Thrice for Buf[T]
+    thrice(self) -> usize = self.len() * 3
+
+main()
+    var a: Buf[int] = buf()
+    var b: Buffer[int] = buffer()
+
+    a.push(1)
+    b.push(1)
+
+    print(a.twice(), b.twice(), a.thrice(), b.thrice())
+"""), "2 2 3 3\n")
+end bnm_impls
+
+@test("bnm: print, interpolation, comparison and for work under either name")
+bnm_printing()
+    if !bnm_ready() then return
+
+    assert_eq(bnm_ran(raw"""
+import sysl.buf.{Buf, Buffer, buffer, buf}
+
+main()
+    var a: Buffer[int] = buffer()
+    var b: Buf[int] = buf()
+
+    for i in 0..<3
+        a.push(i)
+        b.push(i)
+
+    var seen = 0
+
+    for x in a
+        seen += x
+
+    print(a, s"$b", a == b, seen, a[2])
+"""), "[0, 1, 2] [0, 1, 2] true 3 2\n")
+end bnm_printing
+
+@test("bnm: Buf still works with no warning, and a Buffer taken for a Buf is no mismatch")
+bnm_buf_unchanged()
+    if !bnm_ready() then return
+
+    assert_eq(bnm_ran(raw"""
+import sysl.buf.{Buf, buf}
+
+main()
+    var b: Buf[int] = buf()
+
+    b.push(7)
+    print(b)
+"""), "[7]\n")
+end bnm_buf_unchanged
+
+@test("bnm: a type mismatch names the type, and a wrong element type is refused under both names")
+bnm_diagnostic()
+    if !bnm_ready() then return
+
+    val said = bnm_ran(raw"""
+import sysl.buf.{Buffer, buffer}
+
+main()
+    var a: Buffer[int] = buffer()
+
+    a.push("x")
+""")
+
+    assert(said.contains("Buf"), said)
+    assert(said.contains("string") || said.contains("int"), said)
+end bnm_diagnostic
+
+@test("bnm: Buffer lowers on a bare-metal target as Buf does")
+bnm_freestanding()
+    if !bnm_ready() then return
+
+    val dir = make_temp_dir("sysl-bnm-thumb").unwrap()
+
+    write_text(s"$dir/main.sysl", raw"""
+import sysl.buf.{Buffer, buffer}
+
+@export("probe")
+probe(n: int) -> int
+    var b: Buffer[int] = buffer()
+
+    b.push(n)
+    b[0]
+""").unwrap()
+
+    val text = emit_llvm_text(dir, Some("thumb-freestanding-softfp"), DefaultOptimization, buf(), Some(buf())) match
+        Err(why) -> s"did not compile: ${failure_text(why)}"
+        Ok(e) -> if e.report.is_empty() then e.text else s"did not compile: ${analysis_report(e.report)}"
+
+    remove_dir_all(dir).unwrap_or(())
+
+    assert(text.contains("define") && text.contains("@probe"), text)
+    assert(!text.contains("did not compile"), text)
+end bnm_freestanding
+
+@test("bnm: a mismatch on a Buffer names it as written, with the Buf it is")
+bnm_alias_shown()
+    if !bnm_ready() then return
+
+    val said = bnm_ran(raw"""
+import sysl.buf.{Buffer, buffer}
+
+main()
+    var a: Buffer[int] = buffer()
+    val n: int = a
+""")
+
+    assert(said.contains("Buffer[int] (aka Buf[int])"), said)
+end bnm_alias_shown
+
+@test("bnm: an impl for any generic alias is an impl for the type it names, and a wrong arity is refused")
+bnm_user_alias_impl()
+    if !bnm_ready() then return
+
+    assert_eq(bnm_ran(raw"""
+struct Box[T]
+    v: T
+
+type Crate[T] = Box[T]
+
+trait Peek
+    peek(self) -> int
+
+impl[T] Peek for Crate[T]
+    peek(self) -> int = 7
+
+main()
+    val c: Crate[f64] = Box(2.5)
+
+    print(Box(1).peek(), c.peek())
+"""), "7 7\n")
+
+    val said = bnm_ran(raw"""
+struct Box[T]
+    v: T
+
+type Crate[T] = Box[T]
+
+trait Peek
+    peek(self) -> int
+
+impl[T, U] Peek for Crate[T]
+    peek(self) -> int = 7
+
+main()
+    print(Box(1).peek())
+""")
+
+    assert(said.contains("error"), said)
+end bnm_user_alias_impl
