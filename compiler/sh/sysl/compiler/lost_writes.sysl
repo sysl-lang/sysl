@@ -3,7 +3,7 @@ module sh.sysl.compiler
 import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
 
-// A write to a by-value parameter that nothing reads afterwards: a warning, at the write.
+// A write to a by-value parameter that nothing reads afterwards: an error, at the write.
 //
 // **A parameter written `p: P` is the function's own copy of what the caller passed**, so a write to
 // it -- or to a field or an element of it held in place -- changes that copy and nothing else. When
@@ -36,7 +36,7 @@ import sysl.buf.{Buf, buf}
 // **A generic body is told at its definition**, where its own parameters are what it writes; an
 // instantiation is the same body over the caller's choice of type.
 
-// One write to a parameter: where it is, the parameter's unique name, and how the warning names it.
+// One write to a parameter: where it is, the parameter's unique name, and how the error names it.
 private struct LostSite
     span: Span
     unique: string
@@ -65,7 +65,7 @@ private struct LostWalk
     cx: &Analyzer
 end LostWalk
 
-// Every write to a by-value parameter of one body that no later read can see, warned about once each.
+// Every write to a by-value parameter of one body that no later read can see, reported once each.
 check_lost_writes(cx: &Analyzer, params: Buf[(string, Type)], body: TBlock, ensures: Buf[TClause])
     if cx.an.reading_instance then return
 
@@ -115,10 +115,10 @@ private warn_lost(w: &LostWalk, params: Buf[(string, Type)], site: LostSite)
 
     val take = if name == "self" then "'*self'" else s"'$name: *${type_show(ty)}'"
 
-    w.cx.an.caution(w.cx.scope, site.span,
-                    s"this ${site.form} changes '$name', a copy of what the caller passed, and nothing " +
-                    s"reads '$name' afterwards, so the change is lost — take $take to change the " +
-                    "caller's value, or return the value")
+    w.cx.an.fault(w.cx.scope, site.span,
+                  s"this ${site.form} changes '$name', a copy of what the caller passed, and nothing " +
+                  s"reads '$name' afterwards, so the change is lost — take $take to change the " +
+                  "caller's value, or return the value")
 end warn_lost
 
 // -- parameters reached under another name ----------------------------------------------------------

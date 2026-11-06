@@ -6,10 +6,9 @@ import sysl.buf.{Buf, buf}
 import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
 import sysl.text.{join, split, str_builder, Search}
 
-// A write to a by-value parameter that nothing reads afterwards is a warning, at the write
-// (`reference/declarations.md § A write to a by-value parameter nothing reads is lost`), and the
-// program still builds. The warnings are read off an in-process analysis, as `tests_mus_must_use.sysl`
-// reads them.
+// A write to a by-value parameter that nothing reads afterwards is an error, at the write
+// (`reference/declarations.md § A write to a by-value parameter nothing reads is lost`). The errors
+// are read off an in-process analysis.
 
 private lwp_prelude() -> string = raw"""
     import sysl.buf.Buf
@@ -46,9 +45,9 @@ private lwp_warnings(text: string) -> Buf[string]
     val done = analyze_bodies(units, host_target())
     var out: Buf[string] = buf()
 
-    assert(errors_of(done.an.diagnostics()).is_empty(), analysis_report(errors_of(done.an.diagnostics())))
+    for item in errors_of(done.an.diagnostics())
+        assert(item.diag.message.contains("so the change is lost"), analysis_report(errors_of(done.an.diagnostics())))
 
-    for item in done.an.warnings()
         if item.src.name == "main.sysl" && item.diag.message.contains("so the change is lost") then
             out.push(s"${item.src.locate(item.diag.span.start).line - lwp_first() + 1}: ${item.diag.message}")
 
@@ -289,16 +288,8 @@ lwp_ensures()
 
     assert_eq(lwp_lines("a(n: int) -> int\n    ensure n >= 0\n    n = 1\n    0\n"), "")
 
-@test("a warning does not stop the build, and the program runs")
-lwp_still_builds()
-    if xvr_no_library() then return
-
-    val out = xvr_ran([("main.sysl", lwp_prelude() + "bump2(p: P) = p.n += 1\n\nvar x = P(1)\nbump2(x)\nprint(x.n)\n")])
-
-    assert_eq(out.trim(), "1")
-
-@test("warnings do not count toward '--error-limit': three of them, a limit of one, and the build succeeds")
-lwp_not_an_error()
+@test("errors count toward '--error-limit': three of them, a limit of one, and the build fails showing one")
+lwp_counts_toward_the_limit()
     if xvr_no_library() || !clang_available() then return
 
     val dir = absolute_path(make_temp_dir("sysl-lwp").unwrap())
@@ -327,10 +318,10 @@ lwp_not_an_error()
     val said = join(notes.view(), "\n")
 
     remove_dir_all(dir).unwrap_or(())
-    assert_eq(code, 0)
-    assert_eq(split(said, "so the change is lost").len, 4)
-    assert(!said.contains("not shown"), said)
-end lwp_not_an_error
+    assert(code != 0, said)
+    assert_eq(split(said, "so the change is lost").len, 2)
+    assert(said.ends_with("\n\n2 more errors not shown; '--error-limit 0' shows all"), said)
+end lwp_counts_toward_the_limit
 
 @test("the standard library, every body of it typed as its own build types it, loses no write")
 lwp_std_loses_none()
@@ -340,7 +331,7 @@ lwp_std_loses_none()
     val done = analyze_produced(units, host_target(), file_names(units), false)
     var said = ""
 
-    for item in done.an.warnings()
+    for item in errors_of(done.an.diagnostics())
         if item.diag.message.contains("so the change is lost") then
             said = said + s"${item.src.name}:${item.src.locate(item.diag.span.start).line}\n"
 

@@ -885,8 +885,7 @@ already a body, and a block's statement line may be a bare call.
 
 **A parameter written `p: P` is the function's own copy of what the caller passed**, so writing it —
 or a field or an element of it — changes the copy and nothing else. When no read in the body can see
-the write afterwards, the write does nothing, and the compiler says so with a warning; the program
-still builds:
+the write afterwards, the write does nothing, and the compiler refuses it:
 
 ```sysl
 struct Counter
@@ -900,14 +899,13 @@ bump(c)
 print(c.n)
 ```
 
-```warning
-warning: this '+=' changes 'c', a copy of what the caller passed, and nothing reads 'c' afterwards,
-so the change is lost — take 'c: *Counter' to change the caller's value, or return the value
+```error
+this '+=' changes 'c', a copy of what the caller passed, and nothing reads 'c' afterwards, so the change is lost — take 'c: *Counter' to change the caller's value, or return the value
 ```
 
-The two ways to say what was meant are the ones the warning names: `bump(c: *Counter)`, called as
+The two ways to say what was meant are the ones the error names: `bump(c: *Counter)`, called as
 `bump(&c)`, writes the caller's value; `bump(c: Counter) -> Counter`, ending with `c`, hands the new
-value back. A write the body goes on to read is the copy doing its job, and is not warned about:
+value back. A write the body goes on to read is the copy doing its job, and is not refused:
 
 ```sysl
 struct Counter
