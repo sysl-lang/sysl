@@ -534,6 +534,21 @@ private declared_subject(a: &Analysis, im: Impl) -> Option[(string, Buf[string])
         _ -> None
 end declared_subject
 
+// The distinct traits among a parameter's bounds, and the traits those require, that declare `member`
+// themselves -- two of them make `T::member` ambiguous, as Rust's "ambiguous associated type" is. A
+// trait two bounds both require is one trait. One bound cannot be ambiguous, so it is not walked.
+private declaring_bounds(a: &Analysis, subject: Type, bounds: Buf[Bound], member: string) -> Buf[string]
+    var found: Buf[string] = buf()
+
+    if bounds.len() < 2 then return found
+
+    for b in bounds
+        for c in trait_closure(a, b, self_binding(subject))
+            if !holds_string(found, c.name) && declares_assoc_named(a, c.name, member) then found.push(c.name)
+
+    found
+end declaring_bounds
+
 // `T::Item` -- the associated type, or the diagnostic saying why there is none.
 assoc_type(a: &Analysis, scope: Scope, span: Span, subject: Type, member: string) -> Type
     // A subject that could not be worked out has already been reported, and a projection off it is a
@@ -542,6 +557,17 @@ assoc_type(a: &Analysis, scope: Scope, span: Span, subject: Type, member: string
 
     subject match
         Abstract(n, bounds) ->
+            val ambiguous = declaring_bounds(a, subject, bounds, member)
+
+            if ambiguous.len() > 1
+                val both = s"'${qualified_name(ambiguous[0])}' and '${qualified_name(ambiguous[1])}'"
+
+                a.bound_fault(scope, span, s"'$n::$member' is ambiguous: $both both declare an associated " +
+                              s"type '$member', and since an associated type is named without its trait, " +
+                              s"no one type implements both — bound '$n' by one of them")
+                return Unknown
+            end if
+
             val found = abstract_assoc(a, subject, n, bounds, member)
 
             if found.is_some() then return found.unwrap()

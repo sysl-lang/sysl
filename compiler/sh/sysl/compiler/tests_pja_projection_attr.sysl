@@ -255,7 +255,7 @@ pja_bound_does_not_fix_refused()
     if im_can_run() then return
 
     pja_refused(pja_out("widest[M: Has]() -> string = s\"${M::Item::Max}\"\n\nmain()\n    print(widest[Box]())\n"),
-                "'str' needs 'M::Item: Display'", "main.sysl:62:30")
+                "interpolation needs 'M::Item: Display'", "main.sysl:62:30")
 
 @test("a walk over the fields of what a projection names refuses an enum as the enum's name would")
 pja_walk_of_an_enum_refused()
@@ -273,3 +273,117 @@ pja_value_on_the_left_refused()
                 "'::Name' is a type attribute, so its left side must be a type name", "main.sysl:64:18")
     pja_refused(pja_out("main()\n    print(Kind::Image(Light::Red::Kind))\n"),
                 "'::Kind' is a type attribute, so its left side must be a type name", "main.sysl:63:33")
+
+// -- in a constant, and in a match ---------------------------------------------------------------
+
+@test("Min and Max fold in a const through a projection, through Target and through an alias")
+pja_min_max_in_a_const()
+    if im_can_run() then return
+
+    // `Max` read only a bare built-in name, so each of these was "not a constant expression" while
+    // the same question in a body answered.
+    assert_eq(pja_out(raw"""
+        const A = Box::Item::Max
+        const B = (&u16)::Target::Max
+        const C = Shelf::Item::Min
+        const D = Meters::Max
+        const E = (&Box)::Target::Item::Max
+        var bytes: [Shelf::Item::Max]u8
+
+        main()
+            print(A, B, C, D, E, bytes.len)
+
+        """), "65535 65535 0 65535 65535 65535\n[exit 0]")
+
+@test("Name, Kind and sizeof through a projection are constants as well")
+pja_name_kind_size_in_a_const()
+    if im_can_run() then return
+
+    assert_eq(pja_out(raw"""
+        const NAMED = Shelf::Item::Name
+        const KIND = Plot::Item::Kind
+        const SIZE = sizeof(Shelf::Item)
+
+        main()
+            print(NAMED, Kind::Image(KIND), SIZE)
+
+        """), "u16 Struct 2\n[exit 0]")
+
+@test("a projection's Kind is a value a run-time match takes apart, concrete and in a bounded body")
+pja_kind_in_a_match()
+    if im_can_run() then return
+
+    assert_eq(pja_out(raw"""
+        described(k: Kind) -> string = k match
+            Kind.Int -> "an integer"
+            Kind.Struct -> "a struct"
+            _ -> "something else"
+
+        told[M: Has]() -> string = M::Item::Kind match
+            Kind.Int -> "int " + M::Item::Name
+            Kind.SimpleEnum -> "enum " + M::Item::Name
+            _ -> "other"
+
+        main()
+            print(described(Shelf::Item::Kind), described(Plot::Item::Kind), described(Lamp::Item::Kind))
+            print(told[Shelf](), told[Lamp](), told[Plot]())
+
+        """), "an integer a struct something else\nint ushort enum Light other\n[exit 0]")
+
+// -- ambiguity ------------------------------------------------------------------------------------
+
+@test("two bounds that each declare the associated type make the projection ambiguous, as a type and as a subject")
+pja_ambiguous_projection_refused()
+    if im_can_run() then return
+
+    val why = "'M::Item' is ambiguous: 'Has' and 'Also' both declare an associated type 'Item', and since " +
+              "an associated type is named without its trait, no one type implements both — bound 'M' " +
+              "by one of them"
+
+    val also = "trait Also\n    type Item\n\n"
+
+    pja_refused(pja_out(also + "named[M: Has + Also]() -> string = M::Item::Name\n\nmain()\n    print(1)\n"),
+                why, "main.sysl:65:36")
+    pja_refused(pja_out(also + "held[M: Has + Also](x: M::Item) -> M::Item = x\n\nmain()\n    print(1)\n"),
+                why, "main.sysl:65:24")
+    pja_refused(pja_out(also + "size[M: Has + Also]() -> usize = sizeof(M::Item)\n\nmain()\n    print(1)\n"),
+                why, "main.sysl:65:41")
+
+@test("one trait reached through two bounds, or a bound that fixes the type, is not ambiguous")
+pja_shared_requirement_not_ambiguous()
+    if im_can_run() then return
+
+    assert_eq(pja_out(raw"""
+        trait Tagged: Has
+            tag(self) -> int
+
+        trait Marked: Has
+            mark(self) -> int
+
+        impl Tagged for Box
+            tag(self) -> int = 1
+
+        impl Marked for Box
+            mark(self) -> int = 2
+
+        shared[M: Tagged + Marked]() -> string = M::Item::Name
+
+        fixed[M: Has[Item = u16] + Tagged]() -> string = M::Item::Name
+
+        main()
+            print(shared[Box](), fixed[Box](), Box::Item::Name)
+
+        """), "ushort ushort u16\n[exit 0]")
+
+@test("a trait asked for its layout is told so once, in a const and in a body")
+pja_trait_layout_told_once()
+    if im_can_run() then return
+
+    val why = "'Has' is a trait, so it describes behaviour rather than a layout — write '*Has' or '&Has' " +
+              "for a trait object, or bound a type parameter with '[T: Has]'"
+
+    for src in ["const T = Has::Max\n\nmain()\n    print(T)\n", "main()\n    print(Has::Max)\n"]
+        val said = pja_out(src)
+
+        assert(said.contains("error: " + why), said)
+        assert(!said.contains("has no type attributes"), said)

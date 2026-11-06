@@ -620,17 +620,15 @@ end stored_names
 private width_of(cx: &Analyzer, name: string) -> Option[Type] =
     width_type(cx.an, cx.scope, Span(0, 0), name)
 
-// `T::Min` and `T::Max` on a built-in integer -- written by name, or reached through a type parameter
-// the instantiation bound to one, which is the nearer binding and so is asked first.
+// `T::Min` and `T::Max` on a built-in integer, with the left side read as typing reads it: a name --
+// a type parameter the instantiation bound, a declared type or alias (`Meters::Max`), a built-in
+// width -- or a left side only the type grammar reads (`M::Item::Max`, `(&u16)::Target::Max`).
 private const_type_attr(cx: &Analyzer, receiver: Expr, attr: string) -> Option[Const]
-    val name = *receiver.kind match
-        Ident(n) -> Some(n)
-        _ -> None
+    if attr != "Min" && attr != "Max" then return None
 
-    if name.is_none() then return None
-
-    val written = scalar_named(name.unwrap(), word_bits(cx)).or_else(() -> width_of(cx, name.unwrap()))
-    val t = bound_type(cx.subst, name.unwrap()).or_else(() -> written)
+    val t = *receiver.kind match
+        Ident(n) -> attr_subject(cx, receiver.span, n)
+        _ -> if spelled_as_type(cx, receiver) then Some(written_as_type(cx, receiver)) else None
 
     if t.is_none() then return None
 
