@@ -1,0 +1,278 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.{Search, replace_all}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **A `[]const T` views elements it may not write, and every way of writing one is refused, not only
+// the assignment.** The refusal used to be asked only of a place that was itself an element of the
+// view, so three forms wrote through one: a `*self` method called on an element (`xs[0].bump()`), a
+// `ref` bound to an element and then written (`ref r = xs[0]; r = 4`), and an assignment to a part of
+// an element (`xs[0].f.n = 5`). The place is now walked out to the view it is part of
+// (`place.sysl`'s `const_view_of`), the way `root_local` walks out to a `val`: through a field of a
+// value, an array's own elements, and the place a `ref` stands for -- stopping at storage held by
+// address, which is somebody else's to write.
+//
+// Axes: the write (assignment, compound assignment, `++`, a `*self` method, a write through a `ref`);
+// the path (the element, a field of it, an array field's element, a nested field's method, a `ref`
+// of a `ref`); how the method is reached (inherent, through a trait, through a generic `T` bound);
+// where the view lives (a parameter, a local, a nested `[]const []const`, a closure's capture). The
+// controls, accepted with their output: a `(self)` method, a `ref` that only reads, `&xs[0]` (a raw
+// pointer, as `reference/arrays.md` shows), an element that is a `&P` box, a `[]int` field of an
+// element, a `[]const` of writable `[]P` views, and a `[]P`. Build modes, targets and the counted heap
+// are skipped: the change is in what analysis refuses, and the accepted programs lower as before.
+
+private cwh_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end cwh_ready
+
+private cwh_root(text: string) -> string
+    val root = replace_all(make_temp_dir("sysl-cwh").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+end cwh_root
+
+private cwh_refused(text: string, message: string, at: string)
+    if !cwh_ready() then return
+
+    val root = cwh_root(cwh_head + text)
+
+    val said = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> replace_all(failure_text(why), root, "@")
+        Ok(made) -> replace_all(analysis_report(made.report), root, "@")
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert(said.contains(s"error: $message"), said)
+    assert(said.contains(s" --> @/main.sysl:$at\n"), said)
+end cwh_refused
+
+private cwh_prints(text: string, expected: string)
+    if !cwh_ready() then return
+
+    val root = cwh_root(cwh_head + text)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization,
+                                     Some(s"$root/built"))
+
+    built match
+        Err(why) ->
+            val said = replace_all(failure_text(why), root, "@")
+
+            remove_dir_all(root).unwrap_or(())
+            assert_eq(s"did not build: $said", expected)
+            return
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> assert(false, "the program that was built could not be run")
+        Ok(o) ->
+            assert_eq(o.text, expected)
+            assert(o.status.ok(), o.text)
+end cwh_prints
+
+// Sixteen lines, so a program's first line is line 17.
+private const cwh_head: string =
+    "struct In\n    n: int\nimpl In\n    bump(*self) = self.n += 1\n" +
+    "struct P\n    n: int\n    f: In\n    arr: [2]int\n    items: []int\n" +
+    "impl P\n    bump(*self) = self.n += 1\n    get(self) -> int = self.n\n" +
+    "trait Bumps\n    bump2(*self)\nimpl Bumps for P\n    bump2(*self) = self.n += 10\n"
+
+private const cwh_method: string =
+    "'bump' takes '*self', so it writes through what it is called on, and this element belongs to " +
+    "a '[]const P', which views elements it may not write — elements you may write are elements of " +
+    "your own: copy them into a '[]P' first"
+
+private const cwh_method2: string =
+    "'bump2' takes '*self', so it writes through what it is called on, and this element belongs to " +
+    "a '[]const P', which views elements it may not write"
+
+private const cwh_assign: string =
+    "this element belongs to a '[]const P', which views elements it may not write, so there is " +
+    "nothing to assign through. Elements you may write are elements of your own: copy them into a " +
+    "'[]P' first"
+
+private const cwh_assign_int: string =
+    "this element belongs to a '[]const int', which views elements it may not write, so there is " +
+    "nothing to assign through"
+
+@test("a *self method called on an element of a []const parameter is refused")
+cwh_method_on_element()
+    cwh_refused(raw"""
+        go(xs: []const P)
+            xs[0].bump()
+        """, cwh_method, "18:11")
+end cwh_method_on_element
+
+@test("a *self method called on a field of an element of a []const is refused")
+cwh_method_on_field()
+    cwh_refused(raw"""
+        go(xs: []const P)
+            xs[0].f.bump()
+        """, "'bump' takes '*self', so it writes through what it is called on, and this element " +
+             "belongs to a '[]const P'", "18:13")
+end cwh_method_on_field
+
+@test("a *self trait method called on an element of a []const is refused")
+cwh_trait_method()
+    cwh_refused(raw"""
+        go(xs: []const P)
+            xs[0].bump2()
+        """, cwh_method2, "18:11")
+end cwh_trait_method
+
+// A generic body is read at each instantiation, so the refusal names the view it was instantiated at.
+@test("a *self method reached through a generic bound on an element of a []const T is refused")
+cwh_generic_method()
+    cwh_refused(raw"""
+        go[T: Bumps](xs: []const T)
+            xs[0].bump2()
+        var ps = [P(1, In(1), [0, 0], [])]
+        go(ps)
+        """, cwh_method2, "18:11")
+end cwh_generic_method
+
+@test("a *self method called on an element of a []const local is refused")
+cwh_method_on_local()
+    cwh_refused(raw"""
+        var ps = [P(1, In(1), [0, 0], [])]
+        val c: []const P = ps[..]
+        c[0].bump()
+        """, cwh_method, "19:6")
+end cwh_method_on_local
+
+@test("a *self method called on an element of a nested []const []const is refused")
+cwh_method_nested()
+    cwh_refused(raw"""
+        go(xss: []const []const P)
+            xss[0][0].bump()
+        """, cwh_method, "18:15")
+end cwh_method_nested
+
+@test("a *self method called on an element of a []const a closure captured is refused")
+cwh_method_in_closure()
+    cwh_refused(raw"""
+        go(xs: []const P)
+            val f = () -> xs[0].bump()
+            f()
+        """, cwh_method, "18:25")
+end cwh_method_in_closure
+
+@test("a ref bound to an element of a []const and then assigned is refused")
+cwh_ref_assigned()
+    cwh_refused(raw"""
+        go(xs: []const int)
+            ref r = xs[0]
+            r = 4
+        """, cwh_assign_int, "19:5")
+end cwh_ref_assigned
+
+@test("a ref bound to an element of a []const is refused a *self method and a compound assignment")
+cwh_ref_method()
+    cwh_refused(raw"""
+        go(xs: []const P)
+            ref r = xs[0]
+            r.bump()
+        """, cwh_method, "19:7")
+    cwh_refused(raw"""
+        go(xs: []const P)
+            ref r = xs[0]
+            r.n += 1
+        """, cwh_assign, "19:5")
+end cwh_ref_method
+
+@test("a ref bound to a field of an element of a []const, and a ref of that ref, are refused writes")
+cwh_ref_of_field()
+    cwh_refused(raw"""
+        go(xs: []const P)
+            ref r = xs[0].f
+            r.n = 6
+        """, cwh_assign, "19:5")
+    cwh_refused(raw"""
+        go(xs: []const P)
+            ref r = xs[0]
+            ref q = r.f
+            q.bump()
+        """, cwh_method, "20:7")
+end cwh_ref_of_field
+
+@test("an assignment to a field or an array field's element of a []const's element is refused")
+cwh_part_assigned()
+    cwh_refused(raw"""
+        go(xs: []const P)
+            xs[0].f.n = 5
+        """, cwh_assign, "18:5")
+    cwh_refused(raw"""
+        go(xs: []const P)
+            xs[0].arr[1] = 3
+        """, cwh_assign, "18:5")
+end cwh_part_assigned
+
+@test("++ and += on an element or a field of an element of a []const are refused")
+cwh_increments()
+    cwh_refused(raw"""
+        go(xs: []const int)
+            xs[0]++
+        """, cwh_assign_int, "18:10")
+    cwh_refused(raw"""
+        go(xs: []const P)
+            xs[0].n++
+        """, cwh_assign, "18:12")
+    cwh_refused(raw"""
+        go(xs: []const P)
+            xs[0].f.n -= 1
+        """, cwh_assign, "18:5")
+end cwh_increments
+
+@test("reading through a []const's elements is accepted: a (self) method, a ref that only reads, and &xs[0]")
+cwh_reads_accepted()
+    cwh_prints(raw"""
+        go(xs: []const P) -> int
+            ref r = xs[0]
+            ref g = xs[0].f
+            val p = &xs[0]
+            (*p).n = 40
+            xs[0].get() + r.n + g.n
+        var ps = [P(1, In(2), [0, 0], [])]
+        print(go(ps))
+        """, "82\n")
+end cwh_reads_accepted
+
+@test("a []const's elements that are boxes, views or a writable view are written through as before")
+cwh_addresses_accepted()
+    cwh_prints(raw"""
+        boxes(xs: []const &P)
+            xs[0].bump()
+            xs[0].f.bump()
+        views(xs: []const P)
+            xs[0].items[1] = 9
+        inner(xss: []const []P)
+            xss[0][0].bump()
+        mine(xs: []P)
+            xs[0].bump()
+            xs[0].f.n = 7
+            ref r = xs[0].arr[1]
+            r = 5
+        var store = [1, 2]
+        val b: &P = P(1, In(1), [0, 0], [])
+        var ps = [P(1, In(1), [0, 0], store[..])]
+        boxes([b])
+        views(ps)
+        var vs = [ps[..]]
+        inner(vs)
+        mine(ps)
+        print(b.n, b.f.n, store[1], ps[0].n, ps[0].f.n, ps[0].arr[1])
+        """, "2 2 9 3 7 5\n")
+end cwh_addresses_accepted

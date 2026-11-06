@@ -1331,3 +1331,93 @@ buffer_names_behave_alike()
     assert_eq(a.to_string(), "[0, 1, 2]")
     assert_eq(s"$b", "[0, 1, 2]")
     assert_eq(a.view(), [0, 1, 2])
+
+// -- view_mut and into_view -----------------------------------------------------------------------
+
+private write_ends(b: *Buf[int]) -> usize
+    var w = b.view_mut()
+
+    w[0] = 10
+    w[2] = 30
+    w.len
+
+@test("a write through view_mut is seen through the buffer, and through a second name of it")
+view_mut_writes_are_seen()
+    var b: Buf[int] = buf()
+
+    b.push(1)
+    b.push(2)
+    b.push(3)
+
+    val same = b
+    val n = write_ends(&b)
+
+    assert_eq(n, 3)
+    assert_eq(b.view(), [10, 2, 30])
+    assert_eq(same[0], 10)
+
+@test("view_mut of an empty buffer is empty")
+view_mut_empty()
+    var b: Buf[int] = buf()
+
+    val n = b.view_mut().len
+
+    assert_eq(n, 0)
+
+@test("view_mut on a Buffer is the same member")
+view_mut_on_buffer()
+    var b: Buffer[u8] = buffer()
+
+    b.push(7)
+    b.view_mut()[0] = 9
+
+    assert_eq(b[0], 9)
+
+private built_ints(n: int) -> []int
+    var out: Buf[int] = buf()
+
+    for i in 0..<n do out.push(i * i)
+
+    out.into_view()
+
+@test("a slice from into_view returned out of its function holds what the buffer held")
+into_view_returned()
+    assert_eq(built_ints(4), [0, 1, 4, 9])
+
+@test("into_view of an empty buffer is an empty slice")
+into_view_empty()
+    assert_eq(built_ints(0).len, 0)
+
+    var never: Buf[int] = buf()
+
+    assert_eq(never.into_view().len, 0)
+
+@test("into_view of a buffer with spare room answers only the live elements")
+into_view_live_prefix()
+    var b: Buf[int] = buf()
+
+    b.reserve(100)
+    b.push(5)
+
+    assert_eq(b.into_view(), [5])
+
+private built_tracked(n: int) -> []&Dropped
+    var out: Buf[&Dropped] = buf()
+
+    for i in 0..<n do out.push(Dropped(i))
+
+    out.into_view()
+
+private hold_tracked()
+    val kept = built_tracked(3)
+
+    assert_eq(kept.len, 3)
+    assert_eq(kept[2].n, 2)
+    assert_eq(dropped_count, 0)
+
+@test("into_view of counted elements neither leaks nor drops one twice")
+into_view_drops_once()
+    dropped_count = 0
+    hold_tracked()
+
+    assert_eq(dropped_count, 3)

@@ -1151,6 +1151,50 @@ which views elements it may not write, so there is nothing to assign through
 The same diagnostic answers `xs[i] += 1` and `xs[i]++`, and ends by naming the alternative: to write
 the elements, copy them into a `[]T` of your own first.
 
+**Every other road to an element is the same write.** An assignment to a part of one (`xs[0].n = 1`,
+`xs[0].arr[1] = 3`) is refused as the element is, and so is a `*self` method called on an element or
+a part of one, since `*self` is a licence to write handed over without an `&` being written:
+
+```sysl
+struct Counter
+    n: int
+
+impl Counter
+    bump(*self) = self.n += 1
+
+tally(xs: []const Counter)
+    xs[0].bump()
+
+var cs = [Counter(1)]
+
+tally(cs)
+```
+
+```error
+'bump' takes '*self', so it writes through what it is called on, and this element belongs to a '[]const Counter', which views elements it may not write
+```
+
+A `ref` bound to an element is a second name for it, so it may be read through and not written:
+
+```sysl
+scale(xs: []const int)
+    ref first = xs[0]
+    print(first)
+    first = 4
+
+var data = [1, 2, 3]
+
+scale(data)
+```
+
+```error
+this element belongs to a '[]const int', which views elements it may not write
+```
+
+A `(self)` method is a copy and reads freely, and so does a `ref` that is only read. What the view
+leads to by address is not its own: an element that is a `&T` box, or a `[]T` field of an element, is
+written exactly as its owner allows.
+
 **It is one type with a bit, not two types.** Both forms are the same three words, reach through the
 same instructions, and keep the same thing alive; what the bit changes is only what may be *done*
 with the view. So a `[]T` is accepted wherever a `[]const T` is wanted — and never the other way
