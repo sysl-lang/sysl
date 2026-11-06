@@ -1,0 +1,566 @@
+module sysl.io.poll
+@requires(posix)
+@tests
+
+import sysl.buf.buf
+import sysl.fs.{AlreadyExists, File, IoError, NotFound, NotOpen}
+import sysl.io.sys.{fd_read, fd_write}
+import sysl.io.wait.{Readable, Writable}
+import sysl.net.{Address, Socket, resolve, socket, would_block}
+import sysl.process.pipe
+import sysl.threads.spawn
+import sysl.time.{millis, monotonic, sleep, whole_millis}
+
+// The poller over real pipes and loopback sockets: each direction, a hang-up, the three modes, a
+// wake and a registration from another thread, more descriptors than `select` could hold, and the
+// errors a bad registration answers.
+
+private fd_of(f: File) -> int = f.fd().unwrap()
+
+private put(fd: int, text: string) = assert_eq(fd_write(fd, &text.bytes[0], text.bytes.len), isize(text.bytes.len))
+
+private take(fd: int) -> isize
+    var into: [64]u8 = [0; 64]
+
+    fd_read(fd, &into[0], 64)
+
+private opened() -> Poller = Poller.open().unwrap()
+
+private waited(p: Poller, got: []Event, ms: long) -> usize = p.wait(got, Some(millis(ms))).unwrap()
+
+private extern "dup" iop_dup(fd: int) -> int
+private extern "close" iop_close(fd: int) -> int
+
+private is_open(fd: int) -> bool
+    val d = iop_dup(fd)
+
+    if d < 0 then return false
+
+    iop_close(d)
+    true
+end is_open
+
+@test("iop a pipe's read end is reported readable with its token once there are bytes, not before")
+iop_readable_with_token()
+    val p = opened()
+    val (r, w) = pipe().unwrap()
+    var got = [Event.none; 8]
+
+    p.register(fd_of(r), [Readable], 11).unwrap()
+
+    assert_eq(waited(p, got[..], 0), 0)
+
+    put(fd_of(w), "x")
+
+    assert_eq(waited(p, got[..], 1000), 1)
+    assert_eq(got[0].token, 11)
+    assert(got[0].readable && !got[0].writable && !got[0].hangup && !got[0].error)
+
+@test("iop a pipe's write end is reported writable, and only for what it was registered for")
+iop_writable_with_token()
+    val p = opened()
+    val (r, w) = pipe().unwrap()
+    var got = [Event.none; 8]
+
+    p.register(fd_of(w), [Writable], 22).unwrap()
+    p.register(fd_of(r), [Readable], 23).unwrap()
+
+    assert_eq(waited(p, got[..], 1000), 1)
+    assert_eq(got[0].token, 22)
+    assert(got[0].writable && !got[0].readable)
+
+@test("iop one registration for both directions reports each of them")
+iop_both_directions()
+    val p = opened()
+    val (r, w) = pipe().unwrap()
+    var got = [Event.none; 8]
+
+    put(fd_of(w), "x")
+    p.register(fd_of(w), [Readable, Writable], 1).unwrap()
+    p.register(fd_of(r), [Readable, Writable], 2).unwrap()
+
+    val n = waited(p, got[..], 1000)
+    var r_readable = false
+    var w_writable = false
+
+    for e in got[0..<n]
+        if e.token == 2 && e.readable then r_readable = true
+        if e.token == 1 && e.writable then w_writable = true
+
+    assert(r_readable && w_writable, s"$n events")
+
+@test("iop a pipe whose writer has gone is a hang-up on the read end, and readable")
+iop_hangup_on_writer_close()
+    val p = opened()
+    val (r, w) = pipe().unwrap()
+    var g = w
+    var got = [Event.none; 8]
+
+    p.register(fd_of(r), [Readable], 5).unwrap()
+    g.close().unwrap()
+
+    assert_eq(waited(p, got[..], 1000), 1)
+    assert_eq(got[0].token, 5)
+    assert(got[0].hangup && got[0].readable)
+
+// ## Sockets from `sysl.net`
+
+private listener() -> (Socket, Address)
+    val addrs = resolve("127.0.0.1", 0).unwrap()
+    var s = socket(addrs[0]).unwrap()
+
+    s.reuse_address().unwrap()
+    s.bind(addrs[0]).unwrap()
+    s.listen().unwrap()
+
+    (s, s.local().unwrap())
+end listener
+
+@test("iop a non-blocking sysl.net socket registers by its fd: readable on data, a hang-up on the peer's close")
+iop_net_socket_composes()
+    val p = opened()
+    var (l, at) = listener()
+
+    l.non_blocking().unwrap()
+    p.register(l.fd().unwrap(), [Readable], 100).unwrap()
+
+    var c = socket(at).unwrap()
+
+    c.connect(at).unwrap()
+
+    var got = [Event.none; 8]
+
+    assert_eq(waited(p, got[..], 2000), 1)
+    assert_eq(got[0].token, 100)
+
+    var (s, _) = l.accept().unwrap()
+
+    s.non_blocking().unwrap()
+    p.register(s.fd().unwrap(), [Readable], 101).unwrap()
+    p.deregister(l.fd().unwrap()).unwrap()
+
+    var into: [16]u8 = [0; 16]
+
+    assert(would_block(s.recv(into[..]).unwrap_err()))
+    assert_eq(waited(p, got[..], 0), 0)
+
+    c.send_all("hi".bytes).unwrap()
+
+    assert_eq(waited(p, got[..], 2000), 1)
+    assert_eq(got[0].token, 101)
+    assert(got[0].readable && !got[0].hangup)
+    assert_eq(s.recv(into[..]).unwrap(), 2)
+    assert(would_block(s.recv(into[..]).unwrap_err()))
+
+    c.close().unwrap()
+
+    assert_eq(waited(p, got[..], 2000), 1)
+    assert_eq(got[0].token, 101)
+    assert(got[0].hangup && got[0].readable)
+    assert_eq(s.recv(into[..]).unwrap(), 0)
+
+// ## Time and wakes
+
+@test("iop a wait with nothing ready answers zero once its time has passed, and not before")
+iop_timeout_answers_zero()
+    val p = opened()
+    val (r, w) = pipe().unwrap()
+    var got = [Event.none; 4]
+
+    p.register(fd_of(r), [Readable], 1).unwrap()
+
+    val began = monotonic()
+
+    assert_eq(waited(p, got[..], 60), 0)
+    assert(whole_millis(monotonic() - began) >= 59, s"${whole_millis(monotonic() - began)} ms")
+    assert(fd_of(w) >= 0)
+
+@test("iop an empty set waits out its time too, and a zero time asks once")
+iop_empty_set_times_out()
+    val p = opened()
+    var got = [Event.none; 4]
+    val began = monotonic()
+
+    assert_eq(waited(p, got[..], 0), 0)
+    assert_eq(waited(p, got[..], 30), 0)
+    assert(whole_millis(monotonic() - began) >= 29)
+
+@test("iop an empty events slice answers zero at once, whatever is ready and however long it may wait")
+iop_empty_slice_answers_at_once()
+    val p = opened()
+    val (r, w) = pipe().unwrap()
+    var got = [Event.none; 4]
+
+    p.register(fd_of(w), [Writable], 1).unwrap()
+
+    val began = monotonic()
+
+    assert_eq(p.wait(got[0..<0], None), Ok(0))
+    assert(whole_millis(monotonic() - began) < 1000)
+    assert_eq(waited(p, got[..], 1000), 1)
+    assert(fd_of(r) >= 0)
+
+private struct Later
+    poller: Poller
+    fd: int
+    after: long
+
+private wake_later(l: *Later) -> unit
+    sleep(millis(l.after))
+    l.poller.waker().wake().unwrap()
+
+@test("iop a waker fired from another thread ends a wait with no time limit, and is not an event")
+iop_waker_from_a_thread()
+    val p = opened()
+    val (r, w) = pipe().unwrap()
+    var got = [Event.none; 4]
+
+    p.register(fd_of(r), [Readable], 1).unwrap()
+
+    var l = Later(p, 0, 100)
+    val t = spawn(&wake_later, &l).unwrap()
+    val began = monotonic()
+    val n = p.wait(got[..], None).unwrap()
+    val took = whole_millis(monotonic() - began)
+
+    assert(t.join())
+    assert_eq(n, 0)
+    assert(took >= 90 && took < 10000, s"$took ms")
+    assert(fd_of(w) >= 0)
+
+@test("iop wakes do not queue: two before a wait end that wait, and the next one waits its time")
+iop_wakes_coalesce()
+    val p = opened()
+    val k = p.waker()
+    var got = [Event.none; 4]
+
+    k.wake().unwrap()
+    k.wake().unwrap()
+
+    val began = monotonic()
+
+    assert_eq(p.wait(got[..], None), Ok(0))
+    assert(whole_millis(monotonic() - began) < 1000)
+    assert_eq(waited(p, got[..], 40), 0)
+    assert(whole_millis(monotonic() - began) >= 39)
+
+@test("iop a wake ends a wait that also finds a descriptor ready, and only the descriptor is reported")
+iop_wake_beside_an_event()
+    val p = opened()
+    val (r, w) = pipe().unwrap()
+    var got = [Event.none; 4]
+
+    p.register(fd_of(w), [Writable], 9).unwrap()
+    p.waker().wake().unwrap()
+
+    assert_eq(waited(p, got[..], 1000), 1)
+    assert_eq(got[0].token, 9)
+    assert(fd_of(r) >= 0)
+
+private register_later(l: *Later) -> unit
+    sleep(millis(l.after))
+    l.poller.register(l.fd, [Writable], 77).unwrap()
+
+private modify_later(l: *Later) -> unit
+    sleep(millis(l.after))
+    l.poller.modify(l.fd, [Writable], 78).unwrap()
+
+@test("iop a registration made from another thread is seen by a wait already blocked")
+iop_register_during_wait()
+    val p = opened()
+    val (r, w) = pipe().unwrap()
+    var got = [Event.none; 4]
+    var l = Later(p, fd_of(w), 100)
+    val t = spawn(&register_later, &l).unwrap()
+    val n = waited(p, got[..], 10000)
+
+    assert(t.join())
+    assert_eq(n, 1)
+    assert_eq(got[0].token, 77)
+    assert(got[0].writable)
+    assert(fd_of(r) >= 0)
+
+@test("iop a modify made from another thread is seen by a wait already blocked")
+iop_modify_during_wait()
+    val p = opened()
+    val (r, w) = pipe().unwrap()
+    var got = [Event.none; 4]
+
+    p.register(fd_of(w), [Readable], 3).unwrap()
+
+    var l = Later(p, fd_of(w), 100)
+    val t = spawn(&modify_later, &l).unwrap()
+    val n = waited(p, got[..], 10000)
+
+    assert(t.join())
+    assert_eq(n, 1)
+    assert_eq(got[0].token, 78)
+    assert(got[0].writable)
+    assert(fd_of(r) >= 0)
+
+// ## Changing a registration
+
+@test("iop deregister stops a descriptor's events, and a second deregister is NotFound")
+iop_deregister_stops_events()
+    val p = opened()
+    val (r, w) = pipe().unwrap()
+    var got = [Event.none; 4]
+
+    put(fd_of(w), "x")
+    p.register(fd_of(r), [Readable], 1).unwrap()
+
+    assert_eq(waited(p, got[..], 1000), 1)
+
+    p.deregister(fd_of(r)).unwrap()
+
+    assert_eq(waited(p, got[..], 30), 0)
+    assert_eq(p.deregister(fd_of(r)), Err(NotFound))
+
+@test("iop modify changes what a descriptor is watched for and the token it comes back with")
+iop_modify_changes_interest_and_token()
+    val p = opened()
+    val (r, w) = pipe().unwrap()
+    var got = [Event.none; 4]
+
+    p.register(fd_of(w), [Readable], 1).unwrap()
+
+    assert_eq(waited(p, got[..], 30), 0)
+
+    p.modify(fd_of(w), [Writable], 2).unwrap()
+
+    assert_eq(waited(p, got[..], 1000), 1)
+    assert_eq(got[0].token, 2)
+    assert(got[0].writable)
+
+    p.modify(fd_of(w), [Readable], 3).unwrap()
+
+    assert_eq(waited(p, got[..], 30), 0)
+    assert(fd_of(r) >= 0)
+
+@test("iop modify of a descriptor that was never registered is NotFound")
+iop_modify_unregistered()
+    val p = opened()
+    val (r, w) = pipe().unwrap()
+
+    assert_eq(p.modify(fd_of(r), [Readable], 1), Err(NotFound))
+    assert(fd_of(w) >= 0)
+
+@test("iop a one-shot registration fires once, stays silent while ready, and fires again once re-armed")
+iop_one_shot_until_rearmed()
+    val p = opened()
+    val (r, w) = pipe().unwrap()
+    var got = [Event.none; 4]
+
+    put(fd_of(w), "x")
+    p.register(fd_of(r), [Readable], 4, OneShot).unwrap()
+
+    assert_eq(waited(p, got[..], 1000), 1)
+    assert_eq(waited(p, got[..], 30), 0)
+
+    put(fd_of(w), "y")
+
+    assert_eq(waited(p, got[..], 30), 0)
+
+    p.modify(fd_of(r), [Readable], 5, OneShot).unwrap()
+
+    assert_eq(waited(p, got[..], 1000), 1)
+    assert_eq(got[0].token, 5)
+    assert_eq(waited(p, got[..], 30), 0)
+
+    p.deregister(fd_of(r)).unwrap()
+
+@test("iop a level-triggered registration reports a ready descriptor at every wait")
+iop_level_refires()
+    val p = opened()
+    val (r, w) = pipe().unwrap()
+    var got = [Event.none; 4]
+
+    put(fd_of(w), "x")
+    p.register(fd_of(r), [Readable], 6).unwrap()
+
+    for _ in 0..<3
+        assert_eq(waited(p, got[..], 1000), 1)
+
+@test("iop an edge-triggered registration does not fire again without new data, and does with it")
+iop_edge_needs_new_data()
+    val p = opened()
+    val (r, w) = pipe().unwrap()
+    var got = [Event.none; 4]
+
+    put(fd_of(w), "x")
+    p.register(fd_of(r), [Readable], 7, Edge).unwrap()
+
+    assert_eq(waited(p, got[..], 1000), 1)
+    assert_eq(waited(p, got[..], 30), 0)
+
+    put(fd_of(w), "y")
+
+    assert_eq(waited(p, got[..], 1000), 1)
+    assert_eq(got[0].token, 7)
+    assert_eq(waited(p, got[..], 30), 0)
+    assert_eq(take(fd_of(r)), 2)
+
+// ## What a registration refuses
+
+@test("iop a descriptor that is not open, or is negative, is NotOpen rather than a trap")
+iop_register_bad_descriptor()
+    val p = opened()
+    val (r, w) = pipe().unwrap()
+    var g = r
+    val fd = fd_of(g)
+
+    g.close().unwrap()
+
+    assert_eq(p.register(fd, [Readable], 1), Err(NotOpen))
+    assert_eq(p.register(-1, [Readable], 1), Err(NotOpen))
+    assert_eq(p.register(1000000, [Readable], 1), Err(NotOpen))
+    assert_eq(p.deregister(-1), Err(NotOpen))
+    assert(fd_of(w) >= 0)
+
+@test("iop an empty interest and the poller's own token are refused as invalid arguments")
+iop_register_invalid_arguments()
+    val p = opened()
+    val (r, w) = pipe().unwrap()
+
+    assert_eq(p.register(fd_of(r), [], 1).unwrap_err().code(), 22)
+    assert_eq(p.register(fd_of(r), [Readable], u64::Max).unwrap_err().code(), 22)
+    assert_eq(p.modify(fd_of(r), [], 1).unwrap_err().code(), 22)
+    p.register(fd_of(r), [Readable], u64::Max - 1).unwrap()
+    put(fd_of(w), "x")
+
+    var got = [Event.none; 4]
+
+    assert_eq(waited(p, got[..], 1000), 1)
+    assert_eq(got[0].token, u64::Max - 1)
+
+#if linux
+@test("iop a second register of one descriptor is AlreadyExists under epoll")
+iop_register_twice_epoll()
+    val p = opened()
+    val (r, w) = pipe().unwrap()
+
+    p.register(fd_of(r), [Readable], 1).unwrap()
+
+    assert_eq(p.register(fd_of(r), [Readable], 2), Err(AlreadyExists))
+    assert(fd_of(w) >= 0)
+#endif
+
+// ## Many descriptors, and the poller's own
+
+private struct IopLimit
+    cur: u64
+    max: u64
+
+private extern "getrlimit" iop_getrlimit(which: int, into: *IopLimit) -> int
+private extern "setrlimit" iop_setrlimit(which: int, from: *IopLimit) -> int
+
+#if bsd
+private iop_nofile() -> int = 8
+#else
+private iop_nofile() -> int = 7
+#endif
+
+/** The descriptor limit raised to at least `n`, where the hard limit allows it; answers whether it is. */
+private iop_at_least(n: u64) -> bool
+    var l = IopLimit(0, 0)
+
+    assert_eq(iop_getrlimit(iop_nofile(), &l), 0)
+
+    if l.cur >= n then return true
+    if l.max < n then return false
+
+    l.cur = n
+    iop_setrlimit(iop_nofile(), &l) == 0
+end iop_at_least
+
+@test("iop more than 1024 descriptors, past what select can hold, come back from one wait")
+iop_many_descriptors()
+    assert(iop_at_least(4096), "the descriptor limit could not be raised to 4096")
+
+    val p = opened()
+    var ends = buf[File]()
+    var got = [Event.none; 2048]
+
+    for i in 0..<1100
+        val (r, w) = pipe().unwrap()
+
+        p.register(fd_of(w), [Writable], u64(i)).unwrap()
+        ends.push(r)
+        ends.push(w)
+
+    assert(fd_of(ends[ends.len() - 1]) > 1024)
+
+    var seen = [false; 1100]
+    val n = waited(p, got[..], 1000)
+
+    assert_eq(n, 1100)
+
+    for e in got[0..<n]
+        assert(e.writable)
+        seen[e.token] = true
+
+    for s in seen
+        assert(s)
+
+@test("iop a wait into fewer slots than are ready fills them all, and the rest wait for the next")
+iop_fewer_slots_than_ready()
+    val p = opened()
+    var ends = buf[File]()
+    var got = [Event.none; 3]
+
+    for i in 0..<5
+        val (r, w) = pipe().unwrap()
+
+        p.register(fd_of(w), [Writable], u64(i), OneShot).unwrap()
+        ends.push(r)
+        ends.push(w)
+
+    assert_eq(waited(p, got[..], 1000), 3)
+    assert_eq(waited(p, got[..], 1000), 2)
+    assert_eq(waited(p, got[..], 30), 0)
+
+private poller_fd() -> int
+    val p = opened()
+    val fd = p.state.fd
+
+    assert(is_open(fd))
+    fd
+end poller_fd
+
+@test("iop the poller's descriptor is closed when the last copy goes, and not while a waker holds it")
+iop_drop_closes()
+    val fd = poller_fd()
+
+    assert(!is_open(fd), "the poller's descriptor outlived the poller")
+
+    var k = opened().waker()
+    val held = k.state.fd
+
+    assert(is_open(held), "a waker's poller was closed under it")
+    k.wake().unwrap()
+
+// ## Allocation
+
+/** A server loop's turn: a wait into storage on the stack, promised to make no heap storage -- the
+ * compiler refuses the promise if `wait` reaches an allocation anywhere below it.
+ */
+@no_alloc
+private turn(p: Poller) -> usize
+    var got = [Event.none; 16]
+    var total = 0
+
+    for _ in 0..<100
+        total += p.wait(got[..], Some(millis(0))).unwrap()
+
+    total
+end turn
+
+@test("iop a wait allocates nothing, which a @no_alloc caller proves, and still answers")
+iop_wait_allocates_nothing()
+    val p = opened()
+    val (r, w) = pipe().unwrap()
+
+    p.register(fd_of(w), [Writable], 1).unwrap()
+
+    assert_eq(turn(p), 100)
+    assert(fd_of(r) >= 0)

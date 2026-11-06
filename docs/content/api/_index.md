@@ -38,6 +38,7 @@ These pages are generated from the library's own doc comments: every declaration
 | [`sysl.hint`](sysl-hint/) | Hints to the optimizer that change what it may assume, never what a program computes. |
 | [`sysl.io`](sysl-io/) | The byte surface a program reads through, and the line cursor over it. |
 | [`sysl.io.hosted`](sysl-io-hosted/) |  |
+| [`sysl.io.poll`](sysl-io-poll/) | Waiting on many descriptors at once: a set of them registered with the kernel -- kqueue on Darwin and the BSDs, epoll on Linux -- and one call that answers which are ready. |
 | [`sysl.io.sys`](sysl-io-sys/) |  |
 | [`sysl.io.wait`](sysl-io-wait/) | Waiting for a descriptor with a time limit: whether a read, or a write, would go ahead without waiting, asked of the system and answered before the time runs out. |
 | [`sysl.log`](sysl-log/) | Structured logging: a level, a message, a few named fields, and somewhere for them to go. |
