@@ -133,6 +133,8 @@ context started on it, and must not be dropped while a fiber is running on it.
 |---|---|---|
 | `reserve` | `reserve(size: usize) -> Result[&Stack, IoError]` | Reserves a stack of at least `size` bytes, in a mapping of whole pages, with its guard below. |
 | `len` | `len(self) -> usize` | How many bytes the stack holds: at least what was asked for, since the mapping is whole pages. |
+| `low` | `low(self) -> *u8` | The lowest address a fiber may use: the first byte above the guard. |
+| `high` | `high(self) -> *u8` | One past the highest address a fiber may use, so `high() - low()` is `len()`. The bytes above it hold the stack's own bookkeeping and are not the fiber's. |
 | `committed` | `committed(self) -> usize` | How many of the stack's bytes are resident: the pages a fiber has touched so far, which is what the stack costs in memory. |
 
 ## Implementations

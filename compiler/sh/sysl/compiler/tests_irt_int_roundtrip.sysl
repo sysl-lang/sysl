@@ -1,0 +1,344 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A pointer `ptr_cast` makes from an integer is unchecked, wherever the integer came from -- a local
+// `val` or `var`, a field, module storage, a parameter, a call's answer, a computation (`at + 0`), or
+// `usize(p)` turned straight back: the keeps-analysis (`keeps.sysl`) follows no address through an
+// integer. `reference/memory.md § An address as an integer leaves the analysis` is the
+// specification, and `tests_irt_integer_round_trip.sysl` covers the rule's other shapes.
+//
+// Each accepted cell hands the pointer to a parameter that keeps it (`enqueue` stores it through
+// `q`), the refusal the analysis would give if it traced the integer; the counter-cells keep the
+// address a pointer, and are refused.
+//
+// Skipped cells, and why: a frame address as an integer leaving the frame is a number and is pinned
+// by `tests_kso_keeps_sound.sysl`; a nested function, a method and a build-lib split change nothing
+// the per-body walk reads.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private irt_outcome(text: string) -> (string, int)
+    val root = make_temp_dir("sysl-irt").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end irt_outcome
+
+private irt_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = irt_outcome(irt_head() + text)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+end irt_prints
+
+private irt_refused(text: string, part: string)
+    if xvr_no_library() then return
+
+    val out = irt_outcome(irt_head() + text)
+
+    assert_eq(out.1, -1, out.0)
+    assert(out.0.index_of(part).is_some(), out.0)
+end irt_refused
+
+// A queue whose `enqueue` keeps its parameter, and a few helpers the cells share.
+private irt_head() -> string = raw"""
+    import sysl.raw.ptr_cast
+
+    struct Node
+        next: *Node
+        n: int
+
+    struct Queue
+        head: *Node
+        tail: *Node
+
+    struct Hold
+        at: usize
+
+    var held: usize = 0
+
+    enqueue(q: *Queue, w: *Node)
+        if q.tail == null then q.head = w else q.tail.next = w
+        q.tail = w
+
+    drain(q: *Queue) -> int
+        val n = q.head.n
+
+        q.head = null
+        q.tail = null
+        n
+
+    addr(p: *Node) -> usize = usize(p)
+
+    pass(n: usize) -> usize = n
+
+    read(w: *Node) -> int = w.n
+
+    """
+
+// -- the regression -------------------------------------------------------------------------------
+
+@test("a pointer made from an integer held in a local val is unchecked, and may be handed to a parameter that keeps it")
+irt_local_val()
+    irt_prints(raw"""
+        run(q: *Queue)
+            var node = Node(null, 5)
+            val at = usize(&node)
+            val w: *Node = ptr_cast(at)
+            enqueue(q, w)
+            q.head = null
+            q.tail = null
+
+        main()
+            var q = Queue(null, null)
+            run(&q)
+            print("ran")
+        """, "ran\n")
+
+// -- where the integer was held ---------------------------------------------------------------------
+
+@test("an integer held in a var, or answered by a function and held in a local, makes an unchecked pointer")
+irt_var_and_answer()
+    irt_prints(raw"""
+        in_var(q: *Queue) -> int
+            var node = Node(null, 1)
+            var at = usize(&node)
+
+            at = usize(&node)
+            enqueue(q, ptr_cast(at))
+            drain(q)
+
+        answered(q: *Queue) -> int
+            var node = Node(null, 3)
+            val at = addr(&node)
+            val w: *Node = ptr_cast(at)
+
+            enqueue(q, w)
+            drain(q)
+
+        main()
+            var q = Queue(null, null)
+
+            print(in_var(&q))
+            print(answered(&q))
+        """, "1\n3\n")
+
+@test("an integer handed through a parameter, or through a call that answers it, makes an unchecked pointer")
+irt_parameter_and_pass()
+    irt_prints(raw"""
+        finish(q: *Queue, at: usize)
+            val w: *Node = ptr_cast(at)
+
+            enqueue(q, w)
+
+        by_param(q: *Queue) -> int
+            var node = Node(null, 2)
+            val at = usize(&node)
+
+            finish(q, at)
+            drain(q)
+
+        passed_on(q: *Queue) -> int
+            var node = Node(null, 4)
+            val at = usize(&node)
+            val w: *Node = ptr_cast(pass(at))
+
+            enqueue(q, w)
+            drain(q)
+
+        main()
+            var q = Queue(null, null)
+
+            print(by_param(&q))
+            print(passed_on(&q))
+        """, "2\n4\n")
+
+@test("an integer stored in a struct field or in module storage makes an unchecked pointer")
+irt_field_and_module()
+    irt_prints(raw"""
+        in_field(q: *Queue) -> int
+            var node = Node(null, 5)
+            val h = Hold(usize(&node))
+            val w: *Node = ptr_cast(h.at)
+
+            enqueue(q, w)
+            drain(q)
+
+        in_module(q: *Queue) -> int
+            var node = Node(null, 6)
+
+            held = usize(&node)
+
+            val w: *Node = ptr_cast(held)
+
+            enqueue(q, w)
+            held = 0
+            drain(q)
+
+        main()
+            var q = Queue(null, null)
+
+            print(in_field(&q))
+            print(in_module(&q))
+        """, "5\n6\n")
+
+@test("an integer put through arithmetic makes an unchecked pointer, inline and held in a local")
+irt_arithmetic()
+    irt_prints(raw"""
+        summed(q: *Queue) -> int
+            var node = Node(null, 7)
+            val w: *Node = ptr_cast(usize(&node) + 0)
+            val at = usize(&node) + 0
+
+            enqueue(q, w)
+            enqueue(q, ptr_cast(at))
+            drain(q)
+
+        main()
+            var q = Queue(null, null)
+
+            print(summed(&q))
+        """, "7\n")
+
+@test("an integer held in a local of a generic body, or captured by a closure, makes an unchecked pointer")
+irt_generic_and_closure()
+    irt_prints(raw"""
+        generic[T](q: *Queue, v: T) -> int
+            var node = Node(null, 8)
+            val at = usize(&node)
+            val w: *Node = ptr_cast(at)
+
+            enqueue(q, w)
+            drain(q)
+
+        captured(q: *Queue) -> int
+            var node = Node(null, 9)
+            val at = usize(&node)
+            val put = () -> enqueue(q, ptr_cast[*Node](at))
+
+            put()
+            drain(q)
+
+        main()
+            var q = Queue(null, null)
+
+            print(generic(&q, true))
+            print(generic(&q, 1))
+            print(captured(&q))
+        """, "8\n8\n9\n")
+
+@test("a pointer made from an integer held in a local may go to a @keeps extern and to a callee that keeps nothing")
+irt_keeps_and_plain_callee()
+    irt_prints(raw"""
+        @keeps(p)
+        extern "strlen" keep_len(p: *u8) -> usize
+
+        extern "strlen" plain_len(p: *u8) -> usize
+
+        through_extern() -> int
+            var bytes = [u8(104), u8(105), u8(0)]
+            val at = usize(&bytes)
+
+            int(keep_len(ptr_cast(at)) + plain_len(ptr_cast(at)))
+
+        through_plain() -> int
+            var node = Node(null, 11)
+            val at = usize(&node)
+
+            read(ptr_cast(at))
+
+        main()
+            print(through_extern())
+            print(through_plain())
+        """, "4\n11\n")
+
+// -- the address kept as a pointer is still refused -------------------------------------------------
+
+@test("a local's address handed straight to a parameter that keeps it is refused")
+irt_direct_refused()
+    irt_refused(raw"""
+        run(q: *Queue)
+            var node = Node(null, 5)
+            enqueue(q, &node)
+
+        main()
+            var q = Queue(null, null)
+            run(&q)
+        """, "'enqueue' keeps its parameter 'w' (it is stored in 'q.tail.next'), and '&node' is the address " +
+             "of a local of 'run'")
+
+@test("a local's address held in a local as a pointer is refused")
+irt_pointer_local_refused()
+    irt_refused(raw"""
+        run(q: *Queue)
+            var node = Node(null, 5)
+            val w = &node
+            enqueue(q, w)
+
+        main()
+            var q = Queue(null, null)
+            run(&q)
+        """, "'enqueue' keeps its parameter 'w' (it is stored in 'q.tail.next'), and 'w' holds the address " +
+             "of a local of 'run'")
+
+@test("a ptr_cast from a pointer is still that pointer, and is refused")
+irt_pointer_cast_refused()
+    irt_refused(raw"""
+        run(q: *Queue)
+            var node = Node(null, 5)
+            val w: *Node = ptr_cast(&node)
+            enqueue(q, w)
+
+        main()
+            var q = Queue(null, null)
+            run(&q)
+        """, "and 'w' holds the address of a local of 'run'")
+
+@test("ptr_cast(usize(p)) and ptr_cast of a call answering p as an integer are numbers made pointers, and are unchecked")
+irt_direct_image_unchecked()
+    irt_prints(raw"""
+        run(q: *Queue)
+            var node = Node(null, 5)
+            val w: *Node = ptr_cast(usize(&node))
+            enqueue(q, w)
+            q.head = null
+            q.tail = null
+
+        main()
+            var q = Queue(null, null)
+            run(&q)
+            print("ran")
+        """, "ran\n")
+    irt_prints(raw"""
+        run(q: *Queue)
+            var node = Node(null, 5)
+            enqueue(q, ptr_cast(addr(&node)))
+            q.head = null
+            q.tail = null
+
+        main()
+            var q = Queue(null, null)
+            run(&q)
+            print("ran")
+        """, "ran\n")

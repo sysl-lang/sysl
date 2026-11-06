@@ -130,7 +130,9 @@ fiber still in RoundingMode.Upward
 
 `Stack.reserve` asks for address space, not memory: the system backs a page the first time something
 touches it. **Reserving a megabyte for each of ten thousand fibers costs ten gigabytes of address
-space and nothing else**, until they run. `Stack.committed()` says how much of a stack is resident:
+space and nothing else**, until they run. `Stack.committed()` says how much of a stack is resident
+(`Stack.low()` and `Stack.high()` give the addresses a fiber may use, for a collector scanning a
+parked stack or a bounds check):
 
 ```sysl
 import sysl.fiber.{Context, Stack, switch}

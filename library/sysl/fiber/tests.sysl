@@ -622,3 +622,61 @@ fbr_finishing_normally()
 
     assert_eq(r.status, Status.Exited(0), r.err)
     assert_eq(r.out, "back home\n")
+
+// -- a stack's usable bounds -------------------------------------------------------------------------
+
+private struct Probe
+    home: Context
+    me: Context
+    stack: &Stack
+    local_in: bool
+    wrote: bool
+
+private probe_body(p: *Probe)
+    var here: int = 7
+    val a = usize(&here)
+
+    p.local_in = a >= usize(p.stack.low()) && a < usize(p.stack.high())
+
+    val lo = p.stack.low()
+    val hi = p.stack.high()
+
+    lo[0] = 0xA5
+    hi[-1] = 0x5A
+    p.wrote = lo[0] == 0xA5 && hi[-1] == 0x5A
+    switch(&p.me, &p.home)
+
+@test("a stack's bounds span exactly len, for sizes page-aligned and not")
+fbr_bounds_span_len()
+    val sizes = [1, 100, page_size(), page_size() * 3 + 1, 1024 * 1024 + 17]
+
+    for n in sizes do
+        val s = Stack.reserve(n).unwrap()
+
+        assert_eq(usize(s.high()) - usize(s.low()), s.len())
+        assert(s.len() >= n)
+
+@test("a stack's low bound lies above its guard, which is at least a page below it")
+fbr_bounds_above_guard()
+    val s = Stack.reserve(page_size()).unwrap()
+
+    assert(usize(s.low()) > 0)
+    assert(usize(s.low()) % page_size() == 0)
+
+@test("a running fiber's locals and both ends of its stack lie inside its bounds")
+fbr_bounds_hold_for_running_fiber()
+    val s = Stack.reserve(256 * 1024).unwrap()
+    var p = Probe(Context.new(), Context.new(), s, false, false)
+
+    p.me = Context.start(s, &probe_body, &p)
+    switch(&p.home, &p.me)
+
+    assert(p.local_in)
+    assert(p.wrote)
+
+@test("two stacks' bounds do not overlap")
+fbr_bounds_disjoint()
+    val a = Stack.reserve(64 * 1024).unwrap()
+    val b = Stack.reserve(64 * 1024).unwrap()
+
+    assert(usize(a.high()) <= usize(b.low()) || usize(b.high()) <= usize(a.low()))

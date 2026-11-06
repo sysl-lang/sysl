@@ -1,0 +1,192 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// **The env hooks a freestanding program is asked for, crossed with module storage.**
+//
+// A freestanding program answers each `sysl_env_*` hook it reaches with an `@export`, and one it leaves
+// unanswered is refused when it is compiled (`emit_checks.sysl`'s `check_library_hooks`). What it
+// reaches is decided after pruning, and pruning drops module storage nothing reads together with its
+// initializer (`reachability.sysl`'s `storage_kept`). So a `val` whose initializer reads the
+// environment asks for the hook only where something the program runs reads the `val` -- and a file
+// of bindings and no statement has none: its bindings are module storage, not a body's locals.
+// `library/env.md`'s refused program was such a file until it read its bindings.
+
+private val evm_target: string = "aarch64-freestanding"
+
+private val evm_refused: string = "this program reads its environment, and "
+
+private evm_tree(program: string) -> string =
+    lbr_tree(lbr_two("main.sysl", program, "sysl.hocon",
+                     "package { name = \"probe\", version = \"0.1.0\" }\n"))
+
+// What `sysl build-c` answers for `program` on `target`.
+private evm_build(program: string, target: Option[string]) -> (int, string)
+    val p = evm_tree(program)
+
+    val said = target match
+        Some(t) -> lbr_cli(["sysl", "build-c", "--target", t, "-o", s"$p/probe.a", p])
+        None -> lbr_cli(["sysl", "build-c", "-o", s"$p/probe.a", p])
+
+    lbr_drop([p])
+    said
+end evm_build
+
+// The hooks a refusal asks for, as its sentence lists them.
+private evm_asks(hooks: string) -> string = s"so the program answers it: define $hooks with '@export'"
+
+private val evm_all: string = "'sysl_env_count', 'sysl_env_entry', 'sysl_env_get'"
+
+// The page's program: two bindings, read by a statement.
+private val evm_page: string = raw"""
+    import sysl.env.{get, vars}
+
+    val home = get("HOME")
+    val all = vars()
+
+    assert(home.is_some() || all.is_empty())
+    """
+
+private val evm_hooks: string = raw"""
+
+    @export("sysl_env_get")
+    k_get(name: *u8, name_len: usize, into: *u8, room: usize, got: *usize) -> int = 0
+
+    @export("sysl_env_count")
+    k_count() -> isize = 0
+
+    @export("sysl_env_entry")
+    k_entry(i: usize, into: *u8, room: usize, got: *usize) -> int = 0
+    """
+
+// -- what the program runs ------------------------------------------------------------------------------
+
+@test("a freestanding program whose statement gets a variable is asked for the get hook alone")
+evm_get_only()
+    if !lbr_ready() then return
+
+    val said = evm_build("import sysl.env.get\n\nassert(get(\"HOME\").is_some())\n", Some(evm_target))
+
+    assert(said.0 != 0, "built with the get hook unanswered")
+    assert(said.1.contains(evm_refused), said.1)
+    assert(said.1.contains(evm_asks("'sysl_env_get'")), said.1)
+end evm_get_only
+
+@test("a freestanding program whose statement lists the variables is asked for count and entry alone")
+evm_vars_only()
+    if !lbr_ready() then return
+
+    val said = evm_build("import sysl.env.vars\n\nassert(vars().len() < 1000)\n", Some(evm_target))
+
+    assert(said.0 != 0, "built with the listing hooks unanswered")
+    assert(said.1.contains(evm_asks("'sysl_env_count', 'sysl_env_entry'")), said.1)
+end evm_vars_only
+
+@test("the env page's program, which reads both of its bindings, is asked for all three hooks")
+evm_page_program_refused()
+    if !lbr_ready() then return
+
+    val said = evm_build(evm_page, Some(evm_target))
+
+    assert(said.0 != 0, "built with every env hook unanswered")
+    assert(said.1.contains(evm_refused + s"'$evm_target' has no operating system under it"), said.1)
+    assert(said.1.contains(evm_asks(evm_all)), said.1)
+end evm_page_program_refused
+
+// -- module storage nothing reads -----------------------------------------------------------------------
+
+@test("a file of bindings and no statement reads nothing, so it builds asking for no env hook")
+evm_unread_storage_asks_nothing()
+    if !lbr_ready() then return
+
+    val said = evm_build("import sysl.env.{get, vars}\n\nval home = get(\"HOME\")\nval all = vars()\n",
+                         Some(evm_target))
+
+    assert(said.0 == 0, said.1)
+    assert(!said.1.contains(evm_refused), said.1)
+end evm_unread_storage_asks_nothing
+
+@test("of two static bindings only the one a statement reads asks for its hook")
+evm_static_storage_read_by_a_statement()
+    if !lbr_ready() then return
+
+    val said = evm_build(raw"""
+        import sysl.env.{get, vars}
+
+        static val home = get("HOME")
+        static val all = vars()
+
+        assert(home.is_some())
+        """, Some(evm_target))
+
+    assert(said.0 != 0, "built with the get hook unanswered")
+    assert(said.1.contains(evm_asks("'sysl_env_get'")), said.1)
+end evm_static_storage_read_by_a_statement
+
+@test("storage read only by a function nothing calls is dropped and asks for no hook")
+evm_storage_read_by_an_unreached_function()
+    if !lbr_ready() then return
+
+    val said = evm_build(raw"""
+        import sysl.env.get
+
+        static val home = get("HOME")
+
+        private unused() -> bool = home.is_some()
+
+        assert(true)
+        """, Some(evm_target))
+
+    assert(said.0 == 0, said.1)
+end evm_storage_read_by_an_unreached_function
+
+@test("storage read through a chain of storage a statement reads asks for its hook")
+evm_storage_read_through_a_chain()
+    if !lbr_ready() then return
+
+    val said = evm_build(raw"""
+        import sysl.env.vars
+
+        static val all = vars()
+        static val n = all.len()
+
+        assert(n < 1000)
+        """, Some(evm_target))
+
+    assert(said.0 != 0, "built with the listing hooks unanswered")
+    assert(said.1.contains(evm_asks("'sysl_env_count', 'sysl_env_entry'")), said.1)
+end evm_storage_read_through_a_chain
+
+// -- other targets, and the hooks answered ----------------------------------------------------------------
+
+@test("the page's program is refused alike on a second freestanding machine")
+evm_second_freestanding_target()
+    if !lbr_ready() then return
+
+    val said = evm_build(evm_page, Some("riscv64-freestanding"))
+
+    assert(said.0 != 0, "built with every env hook unanswered")
+    assert(said.1.contains(evm_refused + "'riscv64-freestanding' has no operating system"), said.1)
+    assert(said.1.contains(evm_asks(evm_all)), said.1)
+end evm_second_freestanding_target
+
+@test("the page's program builds on the host, where the library answers the hooks")
+evm_hosted_builds()
+    if !lbr_ready() then return
+
+    val said = evm_build(evm_page, None)
+
+    assert(said.0 == 0, said.1)
+    assert(!said.1.contains(evm_refused), said.1)
+end evm_hosted_builds
+
+@test("the page's program builds freestanding once it answers every hook with an @export")
+evm_answered_hooks_build()
+    if !lbr_ready() then return
+
+    val said = evm_build(evm_page + evm_hooks, Some(evm_target))
+
+    assert(said.0 == 0, said.1)
+    assert(!said.1.contains(evm_refused), said.1)
+end evm_answered_hooks_build

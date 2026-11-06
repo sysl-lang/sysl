@@ -42,6 +42,14 @@ Nothing in the language reaches it. An array literal makes a `[]T`, a `for` walk
 `import` is where it asked. That is the [core module's](/library/core/) rule applied from the other
 side: what a program cannot avoid needing arrives free, and what it has to ask for it asks for.
 
+## `Buffer` and `buffer`
+
+`Buffer[T]` and `buffer()` are the names 0.10.0 gives `Buf[T]` and `buf()`, and they are available now
+from the same module: `import sysl.buf.{Buffer, buffer}`. `Buffer[T]` is the same type as `Buf[T]`, not
+a second one, so the two names mix freely — in parameters, fields, generic arguments and `impl` blocks —
+and `buf()` keeps working unchanged. A diagnostic about a variable declared `Buffer[int]` shows it as
+`Buffer[int] (aka Buf[int])`.
+
 ## Why it can be written at all
 
 A container that sizes its own storage needs three things, and sysl's design notes once recorded all
