@@ -1175,7 +1175,8 @@ provisional_of(cx: &Analyzer, span: Span, scope: Scope, tparams: Buf[string], pa
             val reader = arg_reader(cx, span, scope, slots[at].is_none())
             val outer_yield = reader.yield_seed
 
-            reader.yield_seed = yield_seed_of(cx, scope, param_refs[at], tparams, bounds, sub, needs)
+            reader.yield_seed = yield_seed_of(cx, scope, param_refs[at], tparams, bounds, sub, needs,
+                                              anchor_of(written_arg(written[at].unwrap())))
 
             val want = settled_yield(reader, scope, written[at].unwrap(), wants[i],
                                      param_refs[at], tparams, bounds, sub)
@@ -1634,8 +1635,11 @@ end holds_index
 // What a parameter written as a generic enum fixes of it: the enum's own parameters whose written
 // arguments name nothing still open, resolved. Nothing where the parameter is no generic enum, or
 // fixes none of it.
+//
+// With `any_known`, a seed is answered even where the parameter fixes none of the enum: what a `?`
+// in a closure asks is which enum it yields, before what of it.
 private seed_of(cx: &Analyzer, scope: Scope, written: TypeRef, tparams: Buf[string], sub: Buf[Binding],
-                needs: Buf[string], at: Span) -> Option[VariantSeed]
+                needs: Buf[string], at: Span, any_known: bool = false) -> Option[VariantSeed]
     val applied = *written.kind match
         NamedType(n, args) -> Some((n, args))
         _ -> None
@@ -1665,19 +1669,21 @@ private seed_of(cx: &Analyzer, scope: Scope, written: TypeRef, tparams: Buf[stri
 
                     fixed.push(Binding(ed.tparams[k], t))
 
-            if fixed.is_empty() then None else Some(VariantSeed(at, key.unwrap(), fixed))
+            if fixed.is_empty() && !any_known then None else Some(VariantSeed(at, key.unwrap(), fixed))
         _ -> None
 end seed_of
 
 // The same for what a callable standing at `ptype` yields, where the shape states a result: the
-// closure's body places it on the value its last line gives.
+// closure's body places it on the value its last line gives. `at` is the argument's anchor, so only
+// the closure written AS the argument reads it as its own (`closure_body`'s `try_shape_of`).
 private yield_seed_of(cx: &Analyzer, scope: Scope, ptype: TypeRef, tparams: Buf[string],
-                      bounds: Buf[NamedBounds], sub: Buf[Binding], needs: Buf[string]) -> Option[VariantSeed]
+                      bounds: Buf[NamedBounds], sub: Buf[Binding], needs: Buf[string],
+                      at: Span) -> Option[VariantSeed]
     val shape = call_shape(cx, scope, ptype, tparams, bounds)
 
     if shape.is_none() || shape.unwrap().2.is_none() then return None
 
-    seed_of(cx, scope, shape.unwrap().2.unwrap(), tparams, sub, needs, span_zero())
+    seed_of(cx, scope, shape.unwrap().2.unwrap(), tparams, sub, needs, at, true)
 end yield_seed_of
 
 // -- the arguments a first pass holds back -------------------------------------------------------
