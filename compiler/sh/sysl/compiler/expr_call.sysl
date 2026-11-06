@@ -4382,6 +4382,8 @@ try_expr(cx: &Analyzer, span: Span, inner: Expr, expected: Option[Type]) -> TExp
     val (ok, fail, value) = parts.unwrap()
     val ret = cx.ret_ty.unwrap()
 
+    if ret == Unknown && cx.open_result != "" then return open_try(cx, span, mark, t, ty, ok, fail, value)
+
     if base_of(ret) != base_of(ty) then
         return cx.err(mark, s"'?' may only be used in a function returning " +
                       s"${module_show(base_of(ty))}, not ${type_show(ret)}")
@@ -4442,6 +4444,53 @@ try_expr(cx: &Analyzer, span: Span, inner: Expr, expected: Option[Type]) -> TExp
 
     TExpr(span, TTry(t, ok, fail, ret, ret_fail, value, convert))
 end try_expr
+
+// A `?` in a closure whose result nothing fixed (`closure.sysl`'s `closure_body`), or in a function
+// whose result is read off its body.
+//
+// **Its failure is returned as the closure's result, so the result has to be known first**, and the
+// body is what would have said it. Where the callable the closure stands at says which enum it
+// yields, the `?` is taken on trial on that word: the body then says the rest, and is read again
+// against it. A `Result` must also be told its error type, since that is what the failure is
+// converted into -- a closure at `f: Fn() -> Result[int, E]` with `E` still open has no such word,
+// and is refused like a closure with no context at all, as rustc refuses both.
+private open_try(cx: &Analyzer, span: Span, mark: Span, t: TExpr, ty: Type, ok: EnumVariant,
+                 fail: EnumVariant, value: Type) -> TExpr
+    val base = base_of(ty)
+
+    if cx.try_shape.is_some()
+        val shape = cx.try_shape.unwrap()
+
+        if shape.key != base then
+            return cx.err(mark, s"'?' may only be used in a function returning ${module_show(base)}, " +
+                          s"not ${module_show(shape.key)}")
+
+        if base == option_key() || result_error(cx, shape).is_some()
+            cx.open_try = true
+
+            // The trial's reading is thrown away, so the node only has to carry the success type.
+            return TExpr(span, TTry(t, ok, fail, ty, fail, value, None))
+    end if
+
+    if cx.open_result == "function" then
+        return cx.err(mark, s"'?' needs this function's result type, and nothing here fixes it — " +
+                      s"write it after the parameters, as in '(…) -> ${module_show(base)}[…]'")
+
+    cx.err(mark, s"'?' needs this closure's result type, and nothing here fixes it — write the " +
+           s"type where the closure is stored or passed, as in " +
+           s"'val f: &Fn(…) -> ${module_show(base)}[…] = …'")
+end open_try
+
+// The error type a generic call's parameter fixes of the `Result` its callable yields.
+private result_error(cx: &Analyzer, shape: VariantSeed) -> Option[Type]
+    val decl = cx.an.tables.types.get(result_key())
+
+    if decl.is_none() then return None
+
+    decl.unwrap().kind match
+        EnumOf(ed) -> if ed.tparams.len() < 2 then None else bound_type(shape.known, ed.tparams[1])
+        _ -> None
+end result_error
 
 // The library's `From`, whose one member is what a `?` across two error types goes through.
 private from_key() -> string = module_qualify(StdModule, "From")

@@ -1,0 +1,246 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// A write THROUGH a by-value parameter -- into the elements a slice views, the referent of a `*T` or
+// a `&T`, a `Buf`'s buffer -- reaches storage the parameter shares with the caller, so nothing is
+// lost and the lost-write check says nothing (`reference/declarations.md § A write to a by-value
+// parameter nothing reads is lost`). A run stored with `store` is a write of the elements it lands
+// in, the same as `out[i] = x`: through a slice it is shared, into an array it is the parameter's own.
+// The writes to the parameter's own bytes are still told, and are the guard on the other side.
+//
+// The lost writes, errors here, are read off an in-process analysis, as `tests_lwp_lost_write_param.sysl`
+// reads them;
+// the closure cells and the program the fix came from are built and run, since a closure's copy-write
+// refusal is said only once the whole program is lowered.
+
+private lwv_prelude() -> string = raw"""
+    import sysl.buf.Buf
+    import sysl.slices.{copy, sort}
+
+    struct Run
+        data: []f32
+        own: [4]f32
+        n: int
+
+    struct Box
+        n: int
+
+    """
+
+// The lost-write errors the program's own file is given, as `line: message`, the line counted from
+// the first line after the prelude. The program must analyse without any other error.
+private lwv_warnings(text: string) -> Buf[string]
+    var units: Buf[Program] = buf()
+
+    for item in lwv_library()
+        units.push(item)
+
+    units.push(parse(source_of("main.sysl", forms_imported(lwv_prelude() + text))).program)
+
+    val done = analyze_bodies(units, host_target())
+    var out: Buf[string] = buf()
+
+    for item in errors_of(done.an.diagnostics())
+        assert(item.diag.message.contains("so the change is lost"), analysis_report(errors_of(done.an.diagnostics())))
+
+        if item.src.name == "main.sysl" && item.diag.message.contains("so the change is lost") then
+            out.push(s"${item.src.locate(item.diag.span.start).line - lwv_first() + 1}: ${item.diag.message}")
+
+    out
+end lwv_warnings
+
+private var lwv_library_cache: Buf[Program] = buf()
+private var lwv_library_read: bool = false
+
+private lwv_library() -> Buf[Program]
+    if lwv_library_read then return lwv_library_cache
+
+    lwv_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> lwv_library_cache = units
+
+    lwv_library_cache
+end lwv_library
+
+private lwv_first() -> usize
+    var n: usize = 1
+
+    for b in lwv_prelude().bytes
+        if b == u8('\n') then n += 1
+
+    n
+
+// The lines warned about, in order, each followed by a space; the empty string where none is.
+private lwv_lines(text: string) -> string
+    var out = ""
+
+    for w in lwv_warnings(text)
+        out = out + w[0..<w.index_of(":").unwrap()] + " "
+
+    out
+
+private lwv_message(form: string, name: string, take: string) -> string =
+    s"this $form changes '$name', a copy of what the caller passed, and nothing reads '$name' " +
+    s"afterwards, so the change is lost — take $take to change the caller's value, or return the value"
+
+// -- written through: never told ------------------------------------------------------------------
+
+@test("a run stored into a slice parameter goes through to the caller's elements, and is not lost")
+lwv_store_into_slice()
+    if xvr_no_library() then return
+
+    assert_eq(lwv_lines("a(out: []f32, v: <4>f32) = out.store(0, v)\n"), "")
+    assert_eq(lwv_lines("b(out: []f32, i: usize, v: <4>f32)\n    out.store(i, v)\n    out.store(i + 4, v)\n"), "")
+
+@test("an element of a slice parameter assigned, compounded or incremented is not lost")
+lwv_slice_element_writes()
+    if xvr_no_library() then return
+
+    assert_eq(lwv_lines("a(out: []f32) = out[1] = 2.0\n"), "")
+    assert_eq(lwv_lines("b(out: []f32, i: usize) = out[i] += 2.0\n"), "")
+    assert_eq(lwv_lines("c(out: []int) = out[0]++\n"), "")
+
+@test("a slice parameter handed to what sorts or copies into it is only read")
+lwv_slice_library_writers()
+    if xvr_no_library() then return
+
+    assert_eq(lwv_lines("a(out: []int) = sort(out)\n"), "")
+    assert_eq(lwv_lines("b(out: []int, src: []const int) -> usize = copy(out, src)\n"), "")
+
+@test("a slice field of a by-value struct parameter is written through, by index and by 'store'")
+lwv_slice_field_of_struct()
+    if xvr_no_library() then return
+
+    assert_eq(lwv_lines("a(p: Run, v: <4>f32)\n    p.data[0] = 1.0\n    p.data.store(0, v)\n"), "")
+
+@test("a '*T' parameter, a '&T' parameter and a 'Buf' parameter are written through")
+lwv_pointer_ref_and_buf()
+    if xvr_no_library() then return
+
+    assert_eq(lwv_lines("a(p: *Run, v: <4>f32)\n    p.n = 3\n    p.own.store(0, v)\n"), "")
+    assert_eq(lwv_lines("b(r: &Box) = r.n = 3\n"), "")
+    assert_eq(lwv_lines("c(b: Buf[int]) = b.push(1)\n"), "")
+
+@test("a width-generic body and a type-generic body write through a slice parameter")
+lwv_generic_bodies()
+    if xvr_no_library() then return
+
+    assert_eq(lwv_lines("a[const W: usize](out: []f32, v: <W>f32) = out.store(0, v)\n"), "")
+    assert_eq(lwv_lines("b[T](out: []T, x: T) = out[0] = x\n"), "")
+    assert_eq(lwv_lines("c[const W: usize](xs: []const f32, out: []f32)\n" +
+                        "    val l: <W>f32 = xs.load(0)\n    out.store(0, l + l)\n"), "")
+
+@test("a method on a by-value 'self' writes through the slice its struct holds")
+lwv_method_on_self()
+    if xvr_no_library() then return
+
+    assert_eq(lwv_lines("struct R\n    data: []f32\n\n" +
+                        "    put(self, v: <4>f32) = self.data.store(0, v)\n\n" +
+                        "    set(self) = self.data[0] = 1.0\n"), "")
+
+@test("a closure's own slice parameter is written through")
+lwv_closure_parameter()
+    if xvr_no_library() then return
+
+    assert_eq(lwv_lines("a(xs: []f32, v: <4>f32)\n    val f = (out: []f32) -> out.store(0, v)\n" +
+                        "    f(xs)\n"), "")
+
+@test("an escaping closure storing through a captured slice reaches the caller's elements")
+lwv_closure_capture_runs()
+    if !enm_ready() then return
+
+    val got = enm_ran(raw"""
+        var kept: Option[&Fn() -> unit] = None
+
+        call(f: &Fn() -> unit)
+            kept = Some(f)
+            f()
+
+        var ys: [8]f32
+
+        main()
+            val v: <4>f32 = [1.0, 2.0, 3.0, 4.0]
+            var s = ys[..]
+
+            call(() -> s.store(4, v))
+
+            var t = ys[..]
+
+            call(() -> t[0] = 9.0)
+            print(s"${ys[0]} ${ys[7]}")
+        """)
+
+    assert_eq(got, "9 4\n")
+
+@test("the kernel the fix came from runs, and stores into the caller's array")
+lwv_kernel_runs()
+    if !enm_ready() then return
+
+    val got = enm_ran(raw"""
+        add(a: []const f32, out: []f32)
+            val l: <4>f32 = a.load(0)
+            out.store(0, l + l)
+
+        val xs: [4]f32 = [1.0, 2.0, 3.0, 4.0]
+        var ys: [4]f32
+
+        add(xs[..], ys[..])
+        print(ys[3])
+        """)
+
+    assert_eq(got, "8\n")
+
+// -- the parameter's own bytes: still told --------------------------------------------------------
+
+@test("a by-value struct parameter's own field written and never read is still lost")
+lwv_own_field_still_warns()
+    if xvr_no_library() then return
+
+    val got = lwv_warnings("a(p: Run)\n    p.n = 3\n")
+
+    assert_eq(got.len(), 1)
+    assert_eq(got[0], s"2: ${lwv_message("assignment", "p", "'p: *Run'")}")
+
+@test("a slice parameter itself reassigned and never read is still lost, in the page's words")
+lwv_slice_reassigned_still_warns()
+    if xvr_no_library() then return
+
+    val got = lwv_warnings("a(out: []f32)\n    out = out[1..]\n")
+
+    assert_eq(got.len(), 1)
+    assert_eq(got[0], s"2: ${lwv_message("assignment", "out", "'out: *[]f32'")}")
+
+@test("a run stored into an array parameter, or an array field, is the parameter's own and still lost")
+lwv_store_into_array_still_warns()
+    if xvr_no_library() then return
+
+    assert_eq(lwv_lines("a(xs: [8]f32, v: <4>f32)\n    xs.store(0, v)\n"), "2 ")
+    assert_eq(lwv_lines("b(p: Run, v: <4>f32)\n    p.own.store(0, v)\n"), "2 ")
+    assert_eq(lwv_lines("c[const W: usize](xs: [8]f32, v: <W>f32)\n    xs.store(0, v)\n"), "2 ")
+
+@test("an escaping closure storing into a captured array writes its own copy, and is still refused")
+lwv_closure_capture_array_still_refused()
+    if !enm_ready() then return
+
+    val said = enm_err(raw"""
+        var kept: Option[&Fn() -> unit] = None
+
+        call(f: &Fn() -> unit)
+            kept = Some(f)
+            f()
+
+        main()
+            val v: <4>f32 = [1.0, 2.0, 3.0, 4.0]
+            var a: [8]f32
+
+            call(() -> a.store(0, v))
+        """)
+
+    assert(enm_says(said, "so it holds a copy of 'a' — so assignment would reach that copy"), said)

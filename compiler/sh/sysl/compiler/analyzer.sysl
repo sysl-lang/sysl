@@ -465,7 +465,8 @@ struct Analyzer
 
     // The same for what a callable argument YIELDS (`() -> Ok(1)` at `f: &Fn() -> Result[T, E]`), set
     // around the reading of that argument; the closure's body hands it to the value its last line
-    // gives (`closure.sysl`'s `closure_body`), so `at` is filled in there.
+    // gives (`closure.sysl`'s `closure_body`). `at` is the argument's anchor, which tells the closure
+    // written as the argument from one written inside it; the variant's own anchor replaces it there.
     yield_seed: Option[VariantSeed]
 
     // How many `@unchecked` blocks the expression being read is lexically inside (`unchecked.sysl`).
@@ -501,6 +502,17 @@ struct Analyzer
     // read as. Its coverage is checked whatever it yields, and a gap is refused in a binding's words
     // rather than a `match`'s, since the reader wrote no `match` to add an arm to.
     binding_alts: bool
+
+    // **A body whose result nothing fixed, read for what it yields**: `"closure"` for a closure's
+    // (`closure.sysl`'s `closure_body`), `"function"` for a declaration written `= …` with no result
+    // (`inferred_results.sysl`'s `own_result_block`), and empty where the result is known. A `?` in
+    // it has no result type to early-return into, so it is refused in words that say what to write
+    // -- unless `try_shape` says the callable a closure stands at yields an `Option` or a `Result`
+    // (`f: T -> Option[U]` with `U` still open), when the `?` is taken on trial, `open_try` is set,
+    // and the body is read again against the result the trial settled.
+    open_result: string
+    try_shape: Option[VariantSeed]
+    open_try: bool
 
     // The body a `RefWatch` filed now belongs to.
     watch_key(self) -> string = if self.body != "" then self.body else self.func_name
@@ -841,7 +853,7 @@ analyzer_for(an: &Analysis, scope: Scope) -> &Analyzer =
              false, false, false, AwaitOutside, false, buf(), "", buf(), buf(), 0, 0, "", buf(), buf(), buf(),
              false, buf(), buf(), map(), map(), buf(), false, buf(), buf(), buf(), buf(), buf(), false,
              false, false, false, None, buf(), buf(), buf(), None, buf(), None, None, None, 0, None, None,
-             None, None, buf(), false, false)
+             None, None, buf(), false, false, "", None, false)
 
 // **The known half of a parameter like `Result[T, E]`, handed to the variant standing at it.** In
 // `keep[T](o: Result[T, E])` called as `keep(Ok(1))`, the `Ok` settles the enum's `T` from its value

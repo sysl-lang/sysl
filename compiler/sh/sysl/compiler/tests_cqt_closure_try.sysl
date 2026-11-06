@@ -1,0 +1,274 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.process.capture
+
+// **A `?` in a closure early-returns its failure as the closure's result, so the result has to be
+// known before the body is read** (`expr_call.sysl`'s `open_try`, `closure.sysl`'s `closure_body`).
+// Where the context gives the whole result -- a concrete `Fn` parameter, a typed `val`, a declared
+// `Fn` result, a generic `R` the binding's annotation settles -- the closure is read against it.
+// Where the callable's declaration says only which enum it yields (`and_then[U](f: T ->
+// Option[U])`), the body is read once on trial with the `?` taken on that word, and again against the
+// result the trial settled. Before, that second shape was refused with "'?' may only be used in a
+// function returning Option, not ?", the placeholder for a result nobody had worked out.
+//
+// **Where nothing fixes the result, the refusal says what to write** -- a closure with no context, a
+// generic `R` only the body could settle, a `Result[int, E]` whose `E` only the `?` could -- as rustc's
+// "type annotations needed" does. So does a function whose result is read off its body.
+//
+// The axes: **the context** (concrete parameter, typed `val`, declared `Fn` result, generic `R`
+// settled by the binding, `Scope.spawn`, `and_then`'s shape, nothing) × **the enum** (`Option`,
+// `Result`) × **the error** (the same, a `From` conversion, a crossed channel) × **the body** (an
+// expression, a block with the `?` in a statement, a nested closure with a `?` of its own) × **the
+// outcome** (output and a heap that nets zero; one refusal, exactly). Skipped, with the reason: a
+// named function as the callable (it has a declared result and takes no part in this); a trailing
+// block (it lowers through the same `closure_expr`).
+
+// The program built with counting on and run: what it printed, and what the heap said at exit.
+private cqt_counted(text: string) -> (string, string)
+    val prog = lbr_program(text)
+    val out_dir = lbr_temp("sysl-cqt-exe")
+
+    force_alloc_counting(true)
+
+    val built = build_native_program(prog, None, None, DefaultOptimization, Some(s"$out_dir/program"))
+
+    force_alloc_counting(false)
+    reset_search_paths()
+
+    val said = built match
+        Err(why) -> (s"refused: ${failure_text(why)}", "")
+        Ok(made) ->
+            capture(made, [], "", [], true) match
+                Err(_) -> ("could not be started", "")
+                Ok(o) -> (o.text, o.err.unwrap_or(""))
+
+    lbr_drop([prog, out_dir])
+    said
+end cqt_counted
+
+// Asserts the program prints `want` and its counted heap nets zero.
+private cqt_prints(text: string, want: string)
+    if !lbr_ready() then return
+
+    val (out, err) = cqt_counted(text)
+
+    assert_eq(out, want)
+    assert(!err.contains("still live"), err)
+
+// Asserts the whole list of diagnostics, one `line:col message` per line.
+private cqt_says(text: string, want: string)
+    if !lbr_ready() then return
+
+    assert_eq(isc_diags(text), want)
+
+private cqt_fixes() -> string = raw"""
+    half(n: int) -> Option[int] = if n % 2 == 0 then Some(n / 2) else None
+    parse(s: string) -> Result[int, string] = if s == "1" then Ok(1) else Err("bad")
+    """
+
+// -- the context gives the whole result -------------------------------------------------------------
+
+@test("a closure at a concrete Fn parameter yielding an Option takes '?'")
+cqt_concrete_parameter()
+    cqt_prints(cqt_fixes() + raw"""
+        call(f: &Fn() -> Option[int]) -> Option[int] = f()
+
+        print(call(() -> Some(half(8)? + 1)).unwrap(), call(() -> Some(half(3)? + 1)).is_none())
+        """, "5 true\n")
+
+@test("a closure stored into a typed val takes '?'")
+cqt_typed_val()
+    cqt_prints(cqt_fixes() + raw"""
+        val f: &Fn(int) -> Option[int] = n -> Some(half(n)? * 10)
+        val g: &Fn(string) -> Result[int, string] = s -> Ok(parse(s)? + 1)
+
+        print(f(4).unwrap(), f(3).is_none(), g("1").unwrap(), g("x").unwrap_err())
+        """, "20 true 2 bad\n")
+
+@test("a closure returned from a function declared to return an Fn takes '?'")
+cqt_declared_fn_result()
+    cqt_prints(cqt_fixes() + raw"""
+        maker() -> &Fn(string) -> Result[int, string] = s -> Ok(parse(s)? + 1)
+
+        print(maker()("1").unwrap(), maker()("2").unwrap_err())
+        """, "2 bad\n")
+
+@test("a generic R the binding's annotation settles gives the closure its result")
+cqt_generic_settled_by_the_binding()
+    cqt_prints(cqt_fixes() + raw"""
+        run[R](f: &sync Fn() -> R) -> R = f()
+
+        val r: Result[int, string] = run(() -> Ok(parse("1")? + 1))
+        val o: Option[int] = run(() -> Some(half(6)? + 1))
+
+        print(r.unwrap(), o.unwrap())
+        """, "2 4\n")
+
+@test("a block body with the '?' in a statement takes the result the binding settles")
+cqt_block_body()
+    cqt_prints(cqt_fixes() + raw"""
+        run[R](f: &sync Fn() -> R) -> R = f()
+
+        val r: Result[int, string] = run(() ->
+            val n = parse("2")?
+
+            Ok(n + 1))
+
+        print(r.unwrap_err())
+        """, "bad\n")
+
+@test("Scope.spawn's R settled by an annotation gives its closure the result")
+cqt_scope_spawn()
+    cqt_prints(raw"""
+        import sysl.threads.{scope, ScopedThread}
+
+        enum Bad
+            Odd
+
+        half(n: int) -> Result[int, Bad] = if n % 2 == 0 then Ok(n / 2) else Err(Odd)
+
+        val got = scope((s) ->
+            val t: ScopedThread[Result[int, Bad]] = s.spawn(() -> Ok(half(8)? + 1))
+            val u: ScopedThread[Result[int, Bad]] = s.spawn(() -> Ok(half(3)? + 1))
+
+            (t.join(), u.join()))
+
+        print(got.0.unwrap(), got.1.is_err())
+        """, "5 true\n")
+
+// -- the declaration says which enum, the body says the rest ---------------------------------------
+
+@test("a '?' in a closure at Option.and_then is taken, the body settling U")
+cqt_option_and_then()
+    cqt_prints(cqt_fixes() + raw"""
+        val a = Some(8).and_then(n -> Some(half(n)? + 1))
+        val b = Some(3).and_then(n -> Some(half(n)? + 1))
+
+        print(a.unwrap(), b.is_none())
+        """, "5 true\n")
+
+@test("a '?' in a closure at Result.and_then is taken, E coming from the receiver")
+cqt_result_and_then()
+    cqt_prints(cqt_fixes() + raw"""
+        val r: Result[string, string] = Ok("1")
+        val w: Result[string, string] = Ok("7")
+
+        print(r.and_then(s -> Ok(parse(s)? + 1)).unwrap(), w.and_then(s -> Ok(parse(s)? + 1)).unwrap_err())
+        """, "2 bad\n")
+
+@test("a '?' in a closure at and_then converts its error through From")
+cqt_from_conversion()
+    cqt_prints(cqt_fixes() + raw"""
+        struct AppErr
+            msg: string
+
+        impl From[string] for AppErr
+            from(s: string) -> AppErr = AppErr("app: " + s)
+
+        val r: Result[string, AppErr] = Ok("2")
+        val k: Result[string, AppErr] = Ok("1")
+
+        r.and_then(s -> Ok(parse(s)? + 1)) match
+            Ok(n) -> print("ok", n)
+            Err(e) -> print("err", e.msg)
+
+        print(k.and_then(s -> Ok(parse(s)? + 1)).unwrap())
+        """, "err app: bad\n2\n")
+
+@test("a '?' in a closure nested in another closure's body is its own closure's")
+cqt_nested_closure()
+    cqt_prints(cqt_fixes() + raw"""
+        val outer: &Fn(int) -> Option[int] = n -> Some(half(n)?).and_then(m -> Some(half(m)? + 100))
+
+        print(Some(16).and_then(n -> Some(half(n)?).and_then(m -> Some(half(m)? + 100))).unwrap(),
+              outer(16).unwrap(), outer(12).unwrap(), outer(6).is_none(), outer(3).is_none())
+        """, "104 104 103 true true\n")
+
+@test("an and_then closure with no '?' in it is read once, as it always was")
+cqt_no_try_in_the_body()
+    cqt_prints(cqt_fixes() + raw"""
+        val a = Some(8).and_then(n -> half(n))
+        val b = Some(2).and_then(n -> if n > 1 then Some(n * 3) else None)
+
+        print(a.unwrap(), b.unwrap())
+        """, "4 6\n")
+
+// -- nothing fixes the result ----------------------------------------------------------------------
+
+@test("a '?' in a closure with no context says to write the result type")
+cqt_no_context()
+    cqt_says(cqt_fixes() + raw"""
+        val f = (s: string) -> Ok(parse(s)? + 1)
+
+        print(f("1").is_ok())
+        """, "3:35 '?' needs this closure's result type, and nothing here fixes it — write the type " +
+             "where the closure is stored or passed, as in 'val f: &Fn(…) -> Result[…] = …'\n")
+
+@test("an Option '?' in a block body with no context says Option in its advice")
+cqt_no_context_option_block()
+    cqt_says(cqt_fixes() + raw"""
+        val f = (n: int) ->
+            val h = half(n)?
+
+            Some(h)
+
+        print(f(4).unwrap())
+        """, "4:20 '?' needs this closure's result type, and nothing here fixes it — write the type " +
+             "where the closure is stored or passed, as in 'val f: &Fn(…) -> Option[…] = …'\n")
+
+@test("a generic R only the body could settle is refused in the same words")
+cqt_generic_from_the_body_only()
+    cqt_says(cqt_fixes() + raw"""
+        run[R](f: &sync Fn() -> R) -> R = f()
+
+        val r = run(() -> Ok(parse("1")? + 1))
+
+        print(r.is_ok())
+        """, "5:32 '?' needs this closure's result type, and nothing here fixes it — write the type " +
+             "where the closure is stored or passed, as in 'val f: &Fn(…) -> Result[…] = …'\n")
+
+@test("a Result whose error only the '?' could settle is refused in the same words")
+cqt_open_error_type()
+    cqt_says(cqt_fixes() + raw"""
+        run[E](f: &sync Fn() -> Result[int, E]) -> Result[int, E] = f()
+
+        val r = run(() -> Ok(parse("1")? + 1))
+
+        print(r.is_ok())
+        """, "5:32 '?' needs this closure's result type, and nothing here fixes it — write the type " +
+             "where the closure is stored or passed, as in 'val f: &Fn(…) -> Result[…] = …'\n")
+
+@test("an Option '?' in a closure whose callable yields a Result crosses channels")
+cqt_crossed_channels()
+    cqt_says(cqt_fixes() + raw"""
+        val r: Result[int, string] = Ok(4)
+        val o = r.and_then(n -> Ok(half(n)? + 1))
+
+        print(o.is_ok())
+        """, "4:35 '?' may only be used in a function returning Option, not Result\n")
+
+@test("a body yielding the success type where the callable yields an Option is told so")
+cqt_body_yields_the_payload()
+    cqt_says(cqt_fixes() + raw"""
+        val o = Some(8).and_then(n -> half(n)? + 1)
+
+        print(o.is_some())
+        """, "3:26 this closure should yield Option, but its body yields int\n")
+
+@test("a trial that complains of something else says only that")
+cqt_other_complaint()
+    cqt_says(cqt_fixes() + raw"""
+        val o = Some(8).and_then(n -> Some(half(n)? + nope))
+
+        print(o.is_some())
+        """, "3:47 undefined name 'nope'\n")
+
+@test("a '?' in a function whose result is read off its body says to write the result")
+cqt_inferred_function()
+    cqt_says(cqt_fixes() + raw"""
+        inc(s: string) = Ok(parse(s)? + 1)
+
+        print(inc("1").is_ok())
+        """, "3:29 '?' needs this function's result type, and nothing here fixes it — write it " +
+             "after the parameters, as in '(…) -> Result[…]'\n")

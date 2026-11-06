@@ -359,6 +359,40 @@ cross(n: int) -> Result[int, string]
 '?' may only be used in a function returning Option, not Result[int, string]
 ```
 
+**In a closure, the enclosing function is the closure**, so a `?` returns the failure from the
+closure. Its result has to be known before the body is read, and the context supplies it: a typed
+`val`, the parameter the closure is passed to, or a generic one like `and_then`'s `T -> Option[U]`,
+where the body settles `U`:
+
+```sysl
+half(n: int) -> Option[int]
+    if n % 2 == 0 then Some(n / 2) else None
+
+val quarter: &Fn(int) -> Option[int] = n -> half(half(n)?)
+
+print(quarter(8).unwrap(), quarter(6).is_none())
+print(Some(12).and_then(n -> Some(half(n)? + 1)).unwrap())
+```
+
+```output
+2 true
+7
+```
+
+Where nothing says what the closure returns, the `?` has nowhere to send the failure. You write the
+type on what holds the closure:
+
+```sysl
+half(n: int) -> Option[int]
+    if n % 2 == 0 then Some(n / 2) else None
+
+val quarter = (n: int) -> half(half(n)?)
+```
+
+```error
+'?' needs this closure's result type, and nothing here fixes it — write the type where the closure is stored or passed, as in 'val f: &Fn(…) -> Option[…] = …'
+```
+
 **An early return by `?` runs the block's deferred statements**, as any `return` does, and is a
 failure: an [`errdefer`](/reference/statements/#errdefer) written above it runs too, undoing the
 steps the function had already taken.

@@ -757,7 +757,7 @@ private note_copy_use(a: &Analysis, scan: &CopyScan, e: TExpr)
         TStore(place, _, _, _) -> note_copy_write(scan, place, "assignment", e.span)
         TUpdate(place, op, _, _, _, _, _) -> note_copy_write(scan, place, s"'$op'", e.span)
         TIncDec(place, op, _, _, _) -> note_copy_write(scan, place, s"'$op'", e.span)
-        TVecStore(recv, _, _) -> note_copy_write(scan, recv, "assignment", e.span)
+        TVecStore(recv, _, _) -> if run_in_place(recv) then note_copy_write(scan, recv, "assignment", e.span)
         TCall(name, _, ty, _) ->
             val place = self_receiver(a, e)
 
@@ -896,9 +896,7 @@ private copy_root(place: TExpr) -> Option[int] = *place.kind match
         if env_root(recv) then Some(slot)
         else if held_by_value(texpr_type(recv)) then copy_root(recv)
         else None
-    TIndex(recv, _, _) -> texpr_type(recv) match
-        Array(_, _) -> copy_root(recv)
-        _ -> None
+    TIndex(recv, _, _) -> if run_in_place(recv) then copy_root(recv) else None
     _ -> None
 
 private held_by_value(t: Type) -> bool = t match
@@ -1082,7 +1080,7 @@ end holds_index
 // file's terms, what a type parameter stands for, and the name `__FUNCTION__` answers with, since a
 // closure has no name a reader wrote.
 private closure_body(cx: &Analyzer, span: Span, st: &StructType, fname: string,
-                     names: Buf[string], ptypes: Buf[Type], result: Option[Type],
+                     names: Buf[string], ptypes: Buf[Type], given: Option[Type],
                      captured: Buf[string], body: Buf[Stmt], named: string) -> TFunc
     val inner = analyzer_for(cx.an, cx.scope)
 
@@ -1146,11 +1144,11 @@ private closure_body(cx: &Analyzer, span: Span, st: &StructType, fname: string,
     carry_outer_nested(cx, inner, no_siblings())
     carry_declares(cx, inner)
 
-    inner.ret_ty = Some(result.unwrap_or(Unknown))
+    inner.ret_ty = Some(given.unwrap_or(Unknown))
     inner.await_site = closure_await_site(cx.await_site)
 
     val split = contract_length(body)
-    val contract = analyze_contract(inner, span, body, split, result.unwrap_or(Unit), false)
+    val contract = analyze_contract(inner, span, body, split, given.unwrap_or(Unit), false)
     val rest = statements_from(body, split)
 
     // **What the call's parameter fixes of the result is handed to the value the body gives**, as it
@@ -1166,15 +1164,58 @@ private closure_body(cx: &Analyzer, span: Span, st: &StructType, fname: string,
     // A closure whose result the context did not fix is analyzed with nothing expected, so what its
     // body yields is what it yields -- the only reading under which `x -> x * 2` has a result at
     // all.
-    val was = inner.unit_tail
+    //
+    // **A `?` in it is the one thing that needs the result first**, since its failure is returned
+    // as the result. Where the callable the closure stands at yields an `Option` or a `Result` --
+    // `and_then[U](f: T -> Option[U])` before anything has said what `U` is -- the body is read once
+    // on trial with the `?` taken on that word alone, and what the trial yields is the result it is
+    // then read against for real, exactly as a closure the context gave the whole result is read.
+    var result = given
+    var read: Option[TBlock] = None
+    val shape = try_shape_of(cx, span, given)
 
-    inner.unit_tail = result.is_none()
+    if shape.is_some()
+        inner.open_result = "closure"
+        inner.try_shape = shape
+        inner.open_try = false
 
-    val block = if result.is_some() && result.unwrap() == Unit then
-        type_value_block(inner, rest, None, true)
-    else type_value_block(inner, rest, result, false)
+        val opened = begin_trial(inner)
+        val first = closure_block(inner, rest, None)
+        var still_open = false
 
-    inner.unit_tail = was
+        // A body with no `?` in it was read the one way it is ever read, so that reading is kept.
+        if !inner.open_try
+            keep_trial(inner)
+            read = Some(first)
+        else
+            val refused = refused_since(inner, opened)
+
+            discard_trial(inner, opened)
+
+            // **A trial that complained keeps its `?` on trial**, so what it is told again is the
+            // complaint and not a second one about a result it never reached.
+            val yields = if first.result.is_some() then first.ty else Unit
+
+            if refused then still_open = true
+            else if enum_base(yields) == shape.unwrap().key then result = Some(yields)
+            // What the callable yields is the one thing the trial knew, so a body yielding something
+            // else is told that, as a closure given its whole result is.
+            else
+                inner.fault(span, s"this closure should yield ${module_show(shape.unwrap().key)}, " +
+                            s"but its body yields ${type_show(yields)}")
+                still_open = true
+        end if
+
+        inner.open_try = false
+
+        if !still_open then inner.try_shape = None
+    end if
+
+    inner.open_result = if result.is_none() then "closure" else ""
+
+    val block = if read.is_some() then read.unwrap() else closure_block(inner, rest, result)
+
+    inner.try_shape = None
 
     check_consumes(inner, block)
     check_counted_pointers(inner, block)
@@ -1206,6 +1247,36 @@ private closure_body(cx: &Analyzer, span: Span, st: &StructType, fname: string,
           false, contract.3, false, false, None, None, None, None, no_marks(), inner.owner, false,
           Some(cx.scope.src), false)
 end closure_body
+
+// A closure's body read against the result it is asked for, or for what it yields where nothing asked.
+private closure_block(inner: &Analyzer, rest: Buf[Stmt], result: Option[Type]) -> TBlock
+    val was = inner.unit_tail
+
+    inner.unit_tail = result.is_none()
+    inner.ret_ty = Some(result.unwrap_or(Unknown))
+
+    val block = if result.is_some() && result.unwrap() == Unit then
+        type_value_block(inner, rest, None, true)
+    else type_value_block(inner, rest, result, false)
+
+    inner.unit_tail = was
+    block
+end closure_block
+
+// Which generic enum the callable this closure is written at yields, where its context says that much
+// and no more: the closure must be the argument itself, not one written inside it, and nothing may
+// have given it a whole result already. A `?` asks whether it is an `Option` or a `Result`.
+private try_shape_of(cx: &Analyzer, span: Span, given: Option[Type]) -> Option[VariantSeed]
+    if given.is_some() || cx.yield_seed.is_none() then return None
+
+    val seed = cx.yield_seed.unwrap()
+
+    if seed.at.start != span.start || seed.at.end != span.end then None else Some(seed)
+end try_shape_of
+
+private enum_base(t: Type) -> string = repr(t) match
+    Enum(d) -> d.base
+    _ -> ""
 
 // A body yielding something other than the result its closure -- or nested function -- promised,
 // in the reference's words. It is said where the closure was written, not at the body's last line.
