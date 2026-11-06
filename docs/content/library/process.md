@@ -556,6 +556,31 @@ set_user(1000)?
 Mapping a number to a name — `/etc/passwd`, `/etc/group` — is not here: that is a system database, and
 a program that reads one reads the system's own.
 
+## How much memory
+
+**`total_memory()` is the physical memory the machine has, in bytes** (macOS's `hw.memsize`, Linux's
+`sysinfo` total), and **`resident_bytes(pid)` is the memory a process has in RAM now** (macOS's
+`proc_pidinfo` task info, Linux's `/proc/<pid>/statm`). Both answer a `u64` in a `Result`;
+`resident_bytes(child.pid())` is a child's and `resident_bytes(int(pid()))` the program's own:
+
+```sysl
+import sysl.process.{pid, resident_bytes, total_memory}
+
+val own = resident_bytes(int(pid())).unwrap()
+
+print(own > 0, total_memory().unwrap() >= own)
+print(resident_bytes(0).is_err())
+```
+
+```output
+true true
+true
+```
+
+`resident_bytes` fails for a process that is not there (a reaped child), for one the program may not
+look at (`NotPermitted`), and for a pid of zero or less. A target with no way to ask fails with
+`UNSUPPORTED`'s error.
+
 ## Becoming another program
 
 **`exec` replaces this program with another, in the same process**, and answers only if that failed:
