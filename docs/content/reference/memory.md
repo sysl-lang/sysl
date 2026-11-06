@@ -5852,6 +5852,33 @@ print(halves())
 12
 ```
 
+**What a scoped thread borrows has to outlive the `scope` call, not only the body.** The body is a
+frame of its own and returns before the scope joins, so its own locals — and a nested block's, and its
+temporaries — are refused, as Rust tells a scope's `'env` from its `'scope`. What a scope member is
+handed is held by the scope its `*self` points at, so a helper handed `s` is refused the same way for
+its locals, and so is a wrapper that forwards to `spawn`:
+
+```sysl
+import sysl.threads.scope
+
+halves() -> int
+    scope((s) ->
+        var v = [0; 8]
+        val all = v[..]
+
+        s.spawn(() -> all[0] = 1)
+        v[0])
+
+print(halves())
+```
+
+```error
+'() -> all[0] = 1' holds a view of 'v', a local of 'call' — a thread started on a scope may borrow only storage that outlives the 'scope' call, and 'v' does not; declare 'v' before 'scope'
+```
+
+Declaring `v` before `scope`, as `halves` above does, is the cure. A scope nested in the body may
+borrow the outer body's locals, since the outer body outlives the inner `scope` call.
+
 **A fan-out needs no joining loop.** Handles may be kept in an array or a `Buf`, joined in any order,
 joined only in part or not at all: whatever the body leaves unjoined, the scope joins. A handle's
 `join` answers what its closure answered, and `scope` answers what its body answered:

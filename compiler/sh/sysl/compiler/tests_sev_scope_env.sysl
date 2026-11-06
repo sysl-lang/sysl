@@ -1,0 +1,459 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.cstring
+
+// A thread started on a scope borrows only storage that outlives the `scope` call
+// (`reference/memory.md § A thread borrows a frame only inside a scope`): the frame that called
+// `scope`, and anything longer. The scope's own body is a frame of its own, which ends before the
+// scope joins its threads, so its locals and temporaries are refused, and the refusal names the local
+// and says to declare it before `scope`. What a scope member is handed is held where its `*self`
+// points (`keeps.sysl`'s `scope_held`), so a scope the frame was handed -- the body's `s`, a helper's
+// parameter -- holds it past the frame, and the scope `scope` makes in its own frame does not.
+//
+// Axes: what is borrowed (a local's address, a closure writing a local, a view of a local array, a
+// field's address, a temporary, a nested block's local), which scope (`scope`'s `spawn`,
+// `scope_in`'s `start`), how it gets there (directly, a wrapper, a helper handed the scope), and what
+// is still accepted (the enclosing frame's local, its parameter, module storage, heap `&sync`, a
+// value copied in, a view of the enclosing frame, nested scopes borrowing the outer body), plus the
+// build (plain, AddressSanitizer). Skipped: a view or a closure on `scope_in` -- `start` takes a
+// `*T` and an `extern` function, so neither can be written there; a trait object as the scope -- a
+// scope is a struct, and `spawn` is generic, so no object can stand for one.
+
+private extern "setenv" sev_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" sev_c_unsetenv(name: *u8) -> int
+
+// What building `text` said, or what running it printed, its status, and the symbols the binary
+// leaves undefined (where a sanitizer's runtime shows itself).
+private sev_outcome(text: string, flags: string) -> (string, int, string)
+    val root = make_temp_dir("sysl-sev").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+    val name = cstring("SYSL_EXTRA_CFLAGS")
+    val value = cstring(flags)
+
+    if flags != "" then sev_c_setenv(name.ptr, value.ptr, 1)
+
+    val made = build_native_program(root, None, None, DefaultOptimization, Some(exe))
+
+    if flags != "" then sev_c_unsetenv(name.ptr)
+
+    made match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1, "")
+        Ok(_) -> ()
+
+    val undefined = capture("nm", ["-u", exe], "", [], true) match
+        Ok(out) -> out.text
+        Err(_) -> ""
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1, undefined)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status), undefined)
+end sev_outcome
+
+private sev_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = sev_outcome(text, "")
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+
+private sev_refused(text: string, part: string)
+    if xvr_no_library() then return
+
+    val out = sev_outcome(text, "")
+
+    assert_eq(out.1, -1, out.0)
+    assert(out.0.index_of(part).is_some(), out.0)
+
+// The opening every refused program shares, with `body` as the scope body's lines.
+private sev_scope(body: string) -> string =
+    "import sysl.sync.*\nimport sysl.threads.*\n\nstruct P\n    n: int\n\nlook(p: *P) -> int = p.n\n\n" +
+        "go(flag: bool) -> int\n    scope((s) ->\n" + body + "        ())\n\n    1\n\nprint(go(true))\n"
+
+// The same for `scope_in`, whose `start` hands `work` a `*int`.
+private sev_slots(body: string) -> string =
+    "import sysl.sync.*\nimport sysl.threads.*\n\nstruct P\n    n: int\n\n" +
+        "work(p: *int)\n    atomic_add(p, 1, SeqCst)\n    ()\n\npoke(p: *P)\n    ()\n\n" +
+        "go(flag: bool) -> int\n    var slots: [2]ScopeSlot = [ScopeSlot.new(); 2]\n\n" +
+        "    scope_in(slots[..], (s) ->\n" + body + "        ())\n\n    1\n\nprint(go(true))\n"
+
+private val SevCure = "a thread started on a scope may borrow only storage that outlives the 'scope' call"
+
+// -- refused on `scope` -------------------------------------------------------------------------------
+
+@test("a scope's thread may not borrow a local of the scope's own body")
+sev_body_local_refused()
+    sev_refused(sev_scope("        var x = 0\n        val px = &x\n\n        s.spawn(() -> atomic_add(px, 1, SeqCst))\n"),
+                "error: 'spawn' keeps its parameter 'f' (the scope that lent it holds it until the 'scope' call " +
+                "returns), and '() -> atomic_add(px, 1, SeqCst)' holds the address of a local of 'call' — a " +
+                "thread started on a scope may borrow only storage that outlives the 'scope' call, and 'x' does " +
+                "not; declare 'x' before 'scope'")
+
+// A scoped child holds its captures by value, so a closure that assigns the body's local is refused
+// before the scope rule is reached: the write would land in the copy.
+@test("a scope's thread that writes a local of the scope's body is refused, since it holds a copy")
+sev_body_local_written_refused()
+    sev_refused(sev_scope("        var n = 0\n\n        s.spawn(() -> n = 1)\n"),
+                "this closure captures by value, since it is handed to 'spawn' on line 13, whose parameter 'f' " +
+                "is '@scoped', so another domain may run it before the scope ends, so it holds a copy of 'n'")
+
+@test("a scope's thread may not borrow a view of an array local to the scope's body")
+sev_body_view_refused()
+    sev_refused(sev_scope("        var a = [0; 4]\n        val v = a[..]\n\n        s.spawn(() -> v[0] = 1)\n"),
+                "'() -> v[0] = 1' holds a view of 'a', a local of 'call' — " + SevCure +
+                ", and 'a' does not; declare 'a' before 'scope'")
+
+@test("a scope's thread may not borrow a field of a struct local to the scope's body")
+sev_body_field_refused()
+    sev_refused(sev_scope("        var p = P(0)\n        val q = &p.n\n\n        s.spawn(() -> atomic_add(q, 1, SeqCst))\n"),
+                "holds the address of a field of 'p', a local of 'call' — " + SevCure +
+                ", and 'p' does not; declare 'p' before 'scope'")
+
+@test("a scope's thread may not borrow a temporary of the scope's body")
+sev_body_temporary_refused()
+    sev_refused(sev_scope("        val q = &P(4)\n\n        s.spawn(() -> look(q))\n"),
+                "'() -> look(q)' holds the address of a value made in place in 'call' — " + SevCure +
+                "; declare it before 'scope'")
+
+@test("a scope's thread may not borrow a local of a block nested in the scope's body")
+sev_nested_block_refused()
+    sev_refused(sev_scope("        if flag\n            var y = 0\n            val py = &y\n\n" +
+                          "            s.spawn(() -> atomic_add(py, 1, SeqCst))\n"),
+                SevCure + ", and 'y' does not; declare 'y' before 'scope'")
+
+// -- refused on `scope_in` ----------------------------------------------------------------------------
+
+@test("scope_in's start may not borrow a local of the scope's own body")
+sev_slots_local_refused()
+    sev_refused(sev_slots("        var x = 0\n\n        s.start(&work, &x)\n"),
+                "error: 'start' keeps its parameter 'arg' (the scope that lent it holds it until the 'scope' " +
+                "call returns), and '&x' is the address of a local of 'call' — " + SevCure +
+                ", and 'x' does not; declare 'x' before 'scope'")
+
+@test("scope_in's start may not borrow an element of an array local to the scope's body")
+sev_slots_element_refused()
+    sev_refused(sev_slots("        var a = [0, 0]\n\n        s.start(&work, &a[1])\n"),
+                SevCure + ", and 'a' does not; declare 'a' before 'scope'")
+
+@test("scope_in's start may not borrow a field of a struct local to the scope's body")
+sev_slots_field_refused()
+    sev_refused(sev_slots("        var p = P(0)\n\n        s.start(&work, &p.n)\n"),
+                SevCure + ", and 'p' does not; declare 'p' before 'scope'")
+
+@test("scope_in's start may not borrow a temporary of the scope's body")
+sev_slots_temporary_refused()
+    sev_refused(sev_slots("        s.start(&poke, &P(3))\n"),
+                "'&P(3)' is the address of a value made in place in 'call' — " + SevCure + "; declare it before 'scope'")
+
+@test("scope_in's start may not borrow a local of a block nested in the scope's body")
+sev_slots_nested_block_refused()
+    sev_refused(sev_slots("        if flag\n            var y = 0\n\n            s.start(&work, &y)\n"),
+                SevCure + ", and 'y' does not; declare 'y' before 'scope'")
+
+// -- refused through a wrapper or a helper -------------------------------------------------------------
+
+@test("a body local handed to a wrapper that forwards to spawn is refused, with the scope's cure")
+sev_wrapper_refused()
+    sev_refused("import sysl.sync.*\nimport sysl.threads.*\n\n" +
+                "fwd(s: *Scope, f: &sync Fn() -> unit) = s.spawn(f)\n\n" +
+                "go() -> int\n    scope((s) ->\n        var x = 0\n        val px = &x\n\n" +
+                "        fwd(s, () -> atomic_add(px, 1, SeqCst))\n        ())\n\n    1\n\nprint(go())\n",
+                "error: 'fwd' keeps its parameter 'f' (it is passed to 'spawn', where the scope that lent it " +
+                "holds it until the 'scope' call returns), and '() -> atomic_add(px, 1, SeqCst)' holds the " +
+                "address of a local of 'call' — " + SevCure + ", and 'x' does not; declare 'x' before 'scope'")
+
+    // A wrapper of `scope_in`'s `start`.
+    sev_refused("import sysl.sync.*\nimport sysl.threads.*\n\n" +
+                "work(p: *int)\n    atomic_add(p, 1, SeqCst)\n    ()\n\n" +
+                "go_on(s: *SlotScope, p: *int) = s.start(&work, p)\n\n" +
+                "go() -> int\n    var slots: [2]ScopeSlot = [ScopeSlot.new(); 2]\n\n" +
+                "    scope_in(slots[..], (s) ->\n        var x = 0\n\n        go_on(s, &x))\n\n    1\n\nprint(go())\n",
+                "'go_on' keeps its parameter 'p' (it is passed to 'start', where the scope that lent it holds " +
+                "it until the 'scope' call returns)")
+end sev_wrapper_refused
+
+// A helper handed the scope is a frame of its own as surely as the body is: it returns before the
+// scope joins.
+@test("a helper handed a scope may not start a thread borrowing the helper's own local")
+sev_helper_local_refused()
+    sev_refused("import sysl.sync.*\nimport sysl.threads.*\n\n" +
+                "helper(s: *Scope)\n    var y = 0\n    val py = &y\n\n    s.spawn(() -> atomic_add(py, 1, SeqCst))\n\n" +
+                "go() -> int\n    scope((s) ->\n        helper(s)\n        ())\n\n    1\n\nprint(go())\n",
+                "holds the address of a local of 'helper' — " + SevCure + ", and 'y' does not; declare 'y' before 'scope'")
+
+// -- still accepted ------------------------------------------------------------------------------------
+
+@test("a scope's thread borrows a local of the enclosing function declared before scope")
+sev_enclosing_local_accepted()
+    sev_prints(raw"""
+        import sysl.sync.*
+        import sysl.threads.*
+
+        go() -> int
+            var x = 0
+            val px = &x
+
+            scope((s) ->
+                s.spawn(() -> atomic_add(px, 1, SeqCst))
+                s.spawn(() -> atomic_add(px, 2, SeqCst))
+                ())
+
+            x
+
+        print(go())
+        """, "3\n")
+
+@test("a scope's thread borrows a view of the enclosing function's array, and a re-slice of it in the body")
+sev_enclosing_view_accepted()
+    sev_prints(raw"""
+        import sysl.threads.*
+
+        go() -> int
+            var a = [0; 4]
+            val v = a[..]
+
+            scope((s) ->
+                val w = v[2..<4]
+
+                s.spawn(() -> v[0] = 1)
+                s.spawn(() -> w[1] = 5)
+                ())
+
+            a[0] * 10 + a[3]
+
+        print(go())
+        """, "15\n")
+
+@test("a scope's thread borrows the enclosing function's parameter")
+sev_enclosing_param_accepted()
+    sev_prints(raw"""
+        import sysl.sync.*
+        import sysl.threads.*
+
+        bump(p: *int, by: int)
+            scope((s) ->
+                s.spawn(() -> atomic_add(p, by, SeqCst))
+                ())
+
+        var n = 1
+
+        bump(&n, 41)
+        print(n)
+        """, "42\n")
+
+@test("a scope's thread borrows module storage from inside the scope's body")
+sev_module_storage_accepted()
+    sev_prints(raw"""
+        import sysl.sync.*
+        import sysl.threads.*
+
+        static var total = 0
+
+        go(k: int)
+            scope((s) ->
+                s.spawn(() -> atomic_add(&total, k, SeqCst))
+                ())
+
+        go(5)
+        go(6)
+        print(total)
+        """, "11\n")
+
+@test("a scope's thread borrows heap storage shared as '&sync' made inside the scope's body")
+sev_heap_sync_accepted()
+    sev_prints(raw"""
+        import sysl.sync.*
+        import sysl.threads.*
+
+        struct S
+            n: int
+
+        go() -> int
+            scope((s) ->
+                val b: &sync S = S(0)
+
+                s.spawn(() -> atomic_add(&b.n, 4, SeqCst)).join()
+                b.n)
+
+        print(go())
+        """, "4\n")
+
+// The closure holds its own copy -- an array among them, viewed inside the thread -- so nothing of
+// the body's frame is borrowed.
+@test("a scope's thread may hold a copy of a value local to the scope's body")
+sev_copied_value_accepted()
+    sev_prints(raw"""
+        import sysl.threads.*
+
+        go() -> int
+            scope((s) ->
+                val n = 20
+                val pair = (n, 2)
+                val arr = [1, 2]
+
+                s.spawn(() -> n + pair.1 + arr[..][1]).join())
+
+        print(go())
+        """, "24\n")
+
+// The outer body outlives the inner `scope` call, so the inner scope's threads may borrow it.
+@test("a nested scope's thread borrows a local and a view of the outer scope's body")
+sev_nested_outer_body_accepted()
+    sev_prints(raw"""
+        import sysl.sync.*
+        import sysl.threads.*
+
+        go() -> int
+            scope((outer) ->
+                var n = 0
+                val pn = &n
+                var a = [0, 0]
+                val v = a[..]
+
+                scope((inner) ->
+                    inner.spawn(() -> atomic_add(pn, 7, SeqCst))
+                    inner.spawn(() -> v[1] = 30))
+
+                scope_in_body(pn)
+                n + a[1])
+
+        scope_in_body(p: *int)
+            var slots: [1]ScopeSlot = [ScopeSlot.new(); 1]
+
+            scope_in(slots[..], (s) -> s.start(&work, p))
+
+        work(p: *int)
+            atomic_add(p, 100, SeqCst)
+            ()
+
+        print(go())
+        """, "137\n")
+
+// The scope holding a thread that holds the scope keeps nothing past the scope: what `s` points at
+// ends exactly when `s`'s storage does.
+@test("a scope's thread that captured the scope starts more threads on it, from the body and a helper")
+sev_thread_holds_its_scope_accepted()
+    sev_prints(raw"""
+        import sysl.sync.*
+        import sysl.threads.*
+
+        more(s: *Scope, c: &sync Atomic[int])
+            s.spawn(() -> s.spawn(() -> c.add(10, Relaxed)))
+
+        go() -> int
+            val c: &sync Atomic[int] = Atomic(0)
+
+            scope((s) ->
+                val f: &sync Fn() -> unit = () -> s.spawn(() -> c.add(1, Relaxed))
+
+                s.spawn(f)
+                s.spawn(() -> s.spawn(() -> c.add(1, Relaxed)))
+                more(s, c))
+
+            c.load(Relaxed)
+
+        print(go())
+        """, "12\n")
+
+// -- under AddressSanitizer -----------------------------------------------------------------------------
+
+// Every accepted shape at once, built with AddressSanitizer: a thread that outlived the storage it
+// borrows would touch a stack that is gone, which ASan reports as a use after return.
+private sev_accepted_program() -> string = raw"""
+    import sysl.sync.*
+    import sysl.threads.*
+
+    struct P
+        n: int
+
+    static var total = 0
+
+    look(p: *P) -> int = p.n
+
+    work(p: *int)
+        atomic_add(p, 1, SeqCst)
+        ()
+
+    fwd(s: *Scope, f: &sync Fn() -> unit) = s.spawn(f)
+
+    bump(p: *int, by: int)
+        scope((s) ->
+            s.spawn(() -> atomic_add(p, by, SeqCst))
+            ())
+
+    go(k: int) -> int
+        var x = 0
+        val px = &x
+        var a = [0; 4]
+        val v = a[..]
+        var p = P(7)
+        val pp = &p
+        var shared = Atomic(0)
+        val sh = &shared
+        val c = 3
+
+        scope((s) ->
+            val b: &sync P = P(9)
+
+            s.spawn(() -> atomic_add(px, 1, SeqCst))
+            s.spawn(() -> v[0] = c)
+            s.spawn(() -> atomic_add(&total, k, SeqCst))
+            s.spawn(() -> sh.add(look(pp)))
+            s.spawn(() -> atomic_add(&b.n, 0, SeqCst))
+            fwd(s, () -> atomic_add(px, 10, SeqCst))
+
+            var outer_local = 0
+            val po = &outer_local
+            var ol = [0; 2]
+            val ov = ol[..]
+
+            scope((t) ->
+                t.spawn(() -> atomic_add(po, 100, SeqCst))
+                t.spawn(() -> ov[1] = 1000))
+
+            atomic_add(px, outer_local + ov[1], SeqCst)
+            ())
+
+        bump(px, 10000)
+
+        var slots: [2]ScopeSlot = [ScopeSlot.new(); 2]
+
+        scope_in(slots[..], (s) ->
+            s.start(&work, px)
+            s.start(&work, &total))
+
+        x * 10 + a[0] * 100000000 + shared.load() * 1000000 + total
+
+    print(go(2))
+    """
+
+@test("every accepted shape of borrowing on a scope runs")
+sev_accepted_runs()
+    sev_prints(sev_accepted_program(), "307111123\n")
+
+@test("every accepted shape of borrowing on a scope is a clean AddressSanitizer run")
+sev_asan_is_clean()
+    if xvr_no_library() then return
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return
+    end if
+
+    val out = sev_outcome(sev_accepted_program(), "-fsanitize=address -g")
+
+    assert(out.2.contains("__asan_report"), out.2)
+    assert_eq(out.0, "307111123\n")
+    assert_eq(out.1, 0)

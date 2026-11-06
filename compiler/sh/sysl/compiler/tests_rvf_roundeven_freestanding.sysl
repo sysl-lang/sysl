@@ -1,0 +1,253 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{join, replace_all, split}
+import sysl.fs.{exists, make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A float method on a board calls nothing its C library lacks. LLVM lowers an `llvm.` intrinsic the
+// machine has no instruction for to C's function of the same name, and newlib -- the C library of
+// every Arm and RISC-V GNU toolchain -- has C99's roundings and not C23's: no `roundeven`, no
+// `fmaximum`, no `fminimum`. So `round_even` rounds on the encoding there (`sysl.sys`'s
+// `sysl_roundeven_encoded`, whose answers `library/sysl/math/round_even_tests.sysl` holds against the
+// machine's), and `maximum`/`minimum` are comparisons, and every other method still calls only what
+// newlib has. A hosted build, and a board with the instruction, keep `llvm.roundeven`.
+
+private rvf_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    if !exists("/usr/bin/nm")
+        print("skipped: the archive is read with nm, which this machine does not have")
+        return false
+    end if
+
+    true
+end rvf_ready
+
+// Every freestanding target with floating point, each with its own float unit and ABI.
+private val rvf_boards: []string = ["thumb-freestanding", "thumb-freestanding-softfp", "thumb-freestanding-soft",
+    "thumbv6m-freestanding", "thumbv7m-freestanding", "thumbv7em-freestanding", "thumbv7em-freestanding-soft",
+    "thumbv7em-freestanding-dp", "riscv32-freestanding", "riscv64-freestanding", "aarch64-freestanding",
+    "x86_64-freestanding", "wasm32-freestanding"]
+
+private rvf_root(text: string) -> string
+    val root = replace_all(make_temp_dir("sysl-rvf").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+end rvf_root
+
+// `sysl build-c` of `text` for `target`: what was said where it failed, else the archive's undefined
+// symbols, one per entry.
+private rvf_undefined(text: string, target: string) -> Result[Buf[string], string]
+    val root = rvf_root(text)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(["sysl", "build-c", root, "--target", target, "-o", s"$root/app.a"], (line) -> sink.push(line))
+
+    if code != Fine
+        remove_dir_all(root).unwrap_or(())
+        return Err(s"$target: " + replace_all(join(lines.view(), "\n"), root, "@"))
+    end if
+
+    val listed = capture("/usr/bin/nm", ["-u", s"$root/app.a"], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    var names: Buf[string] = buf()
+
+    for line in split(listed.unwrap().text, "\n")
+        val word = line.trim()
+        if word.starts_with("U ") then names.push(word[2..<word.len].trim())
+    end for
+
+    Ok(names)
+end rvf_undefined
+
+private rvf_has(names: []string, name: string) -> bool
+    for each in names
+        if each == name then return true
+    false
+end rvf_has
+
+private rvf_lacks(names: Buf[string], target: string, absent: []string)
+    for name in absent
+        assert(!rvf_has(names.view(), name), s"$target still calls '$name', which newlib does not have: ${join(names.view(), " ")}")
+end rvf_lacks
+
+// What newlib's libm has of the functions LLVM calls for a float intrinsic, and what a board's runtime
+// supplies for the rest: memory, and the soft-float routines (`__adddf3`, …).
+private val rvf_newlib: []string = ["ceil", "ceilf", "floor", "floorf", "trunc", "truncf", "round", "roundf",
+    "rint", "rintf", "nearbyint", "nearbyintf", "sqrt", "sqrtf", "fma", "fmaf", "fmax", "fmaxf", "fmin", "fminf",
+    "fabs", "fabsf", "copysign", "copysignf", "memcpy", "memset", "memmove"]
+
+private val rvf_round_even: string = raw"""
+    @export("even64")
+    even64(x: real) -> real = x.round_even()
+
+    @export("even32")
+    even32(x: f32) -> f32 = x.round_even()
+
+    @export("even16")
+    even16(x: f16) -> f16 = x.round_even()
+
+    @export("even_b16")
+    even_b16(x: bf16) -> bf16 = x.round_even()
+
+    @export("main")
+    boot() -> i32 = 0
+    """
+
+@test("round_even at every float width calls no roundeven on any freestanding target")
+rvf_round_even_every_board()
+    if !rvf_ready() then return
+
+    for target in rvf_boards
+        rvf_undefined(rvf_round_even, target) match
+            Err(why) -> assert(false, why)
+            Ok(names) -> rvf_lacks(names, target, ["roundeven", "roundevenf"])
+    end for
+end rvf_round_even_every_board
+
+@test("maximum and minimum call no fmaximum or fminimum on any freestanding target")
+rvf_maximum_every_board()
+    if !rvf_ready() then return
+
+    val program = "@export(\"hi64\")\nhi64(x: real, y: real) -> real = x.maximum(y)\n\n" +
+                  "@export(\"lo64\")\nlo64(x: real, y: real) -> real = x.minimum(y)\n\n" +
+                  "@export(\"hi32\")\nhi32(x: f32, y: f32) -> f32 = x.maximum(y)\n\n" +
+                  "@export(\"lo32\")\nlo32(x: f32, y: f32) -> f32 = x.minimum(y)\n"
+
+    for target in rvf_boards
+        rvf_undefined(program, target) match
+            Err(why) -> assert(false, why)
+            Ok(names) -> rvf_lacks(names, target, ["fmaximum", "fmaximumf", "fminimum", "fminimumf"])
+    end for
+end rvf_maximum_every_board
+
+@test("every rounding, root, sign and extremum method calls only what newlib has, on every freestanding target")
+rvf_every_method_every_board()
+    if !rvf_ready() then return
+
+    val body = "x.sqrt() + x.floor() + x.ceil() + x.round() + x.trunc() + x.round_even() + x.nearbyint() + " +
+               "x.rint() + x.max_num(y) + x.min_num(y) + x.maximum(y) + x.minimum(y) + x.abs() + " +
+               "x.copysign(y) + x.mul_add(y, z) + x.max(y) + x.min(y) + x.signum()"
+    val program = s"@export(\"p64\")\np64(x: real, y: real, z: real) -> real =\n    $body\n\n" +
+                  s"@export(\"p32\")\np32(x: f32, y: f32, z: f32) -> f32 =\n    $body\n"
+
+    for target in rvf_boards
+        rvf_undefined(program, target) match
+            Err(why) -> assert(false, why)
+            Ok(names) ->
+                for name in names
+                    assert(name.starts_with("__") || rvf_has(rvf_newlib, name),
+                           s"$target calls '$name', which is not one newlib has: ${join(names.view(), " ")}")
+    end for
+end rvf_every_method_every_board
+
+@test("round_even in a strict body on a board calls no roundeven either")
+rvf_strict_body()
+    if !rvf_ready() then return
+
+    // A strict body needs a unit that holds the width, so a single-precision Arm unit is asked at f32
+    // and x86-64's SSE at both.
+    val single = "@strict_fp\n@export(\"s32\")\ns32(x: f32) -> f32 = x.round_even()\n"
+    val double = "@strict_fp\n@export(\"s64\")\ns64(x: real) -> real = x.round_even()\n\n" + single
+
+    for (target, program) in [("thumb-freestanding", single), ("thumbv7em-freestanding", single),
+                              ("x86_64-freestanding", double)]
+        rvf_undefined(program, target) match
+            Err(why) -> assert(false, why)
+            Ok(names) -> rvf_lacks(names, target, ["roundeven", "roundevenf"])
+    end for
+end rvf_strict_body
+
+@test("a module-level value computed by round_even still folds on a board")
+rvf_module_value_folds()
+    if !rvf_ready() then return
+
+    val program = "val tie = 2.5.round_even()\nval tie32 = (-3.5f32).round_even()\n\n" +
+                  "@export(\"ties\")\nties() -> real = tie + real(tie32)\n"
+
+    for target in ["thumbv7m-freestanding", "thumbv6m-freestanding"]
+        rvf_undefined(program, target) match
+            Err(why) -> assert(false, why)
+            Ok(names) -> rvf_lacks(names, target, ["roundeven", "roundevenf"])
+    end for
+end rvf_module_value_folds
+
+private rvf_ir(text: string, target: Option[string]) -> string
+    val root = rvf_root(text)
+
+    val out = emit_llvm_text(root, target) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end rvf_ir
+
+@test("a hosted build and a board with the instruction keep llvm.roundeven; one without rounds on the encoding")
+rvf_where_the_intrinsic_stays()
+    if !rvf_ready() then return
+
+    for target in [None, Some("aarch64-freestanding"), Some("thumbv7em-freestanding-dp"), Some("wasm32-freestanding")]
+        val ir = rvf_ir(rvf_round_even, target)
+        val named = target.unwrap_or("the host")
+
+        assert(ir.contains("@llvm.roundeven.f64("), s"$named:\n$ir")
+        assert(ir.contains("@llvm.roundeven.f32("), s"$named:\n$ir")
+    end for
+
+    for target in ["thumbv7m-freestanding", "thumb-freestanding", "riscv32-freestanding", "x86_64-freestanding"]
+        val ir = rvf_ir(rvf_round_even, Some(target))
+
+        assert(!ir.contains("llvm.roundeven"), s"$target:\n$ir")
+        assert(ir.contains("define"), s"$target:\n$ir")
+    end for
+end rvf_where_the_intrinsic_stays
+
+@test("a Cortex-M3 and an M0+ firmware calling round_even links against newlib")
+rvf_links_against_newlib()
+    if !rvf_ready() then return
+
+    val gcc = "/Applications/ArmGNUToolchain/15.3.rel2/arm-none-eabi/bin/arm-none-eabi-gcc"
+
+    if !exists(gcc)
+        print("skipped: the Arm GNU Toolchain 15.3 is not on this machine")
+        return
+    end if
+
+    for (target, cpu) in [("thumbv7m-freestanding", "cortex-m3"), ("thumbv6m-freestanding", "cortex-m0plus")]
+        val root = rvf_root("@export(\"even64\")\neven64(x: real) -> real = x.round_even()\n\n" +
+                            "@export(\"even32\")\neven32(x: f32) -> f32 = x.round_even()\n")
+        var lines: Buf[string] = buf()
+        val sink = &lines
+        val code = run_cli(["sysl", "build-c", root, "--target", target, "-o", s"$root/app.a"], (line) -> sink.push(line))
+
+        assert(code == Fine, join(lines.view(), "\n"))
+        write_text(s"$root/boot.c", "double even64(double);\nfloat even32(float);\nvolatile double a;\n" +
+                   "volatile float b;\nint main(void) { a = even64(2.5); b = even32(3.5f); return 0; }\n").unwrap()
+
+        val linked = capture(gcc, [s"-mcpu=$cpu", "-mthumb", "--specs=nosys.specs", s"$root/boot.c", s"$root/app.a",
+                                   "-lm", "-o", s"$root/app.elf"], "", [], true)
+
+        remove_dir_all(root).unwrap_or(())
+
+        linked match
+            Err(_) -> assert(false, s"$target: arm-none-eabi-gcc could not be run")
+            Ok(out) ->
+                assert(!out.text.contains("undefined reference"), s"$target:\n${out.text}")
+                assert(out.status.ok(), s"$target:\n${out.text}")
+    end for
+end rvf_links_against_newlib

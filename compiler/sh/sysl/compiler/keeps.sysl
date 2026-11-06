@@ -965,6 +965,13 @@ private answer(cx: &KeepsCx, name: string, i: usize, q: string) -> KeptWhy
     if cx.mistaken.has(name) then return not_kept()
 
     if q != ClearsQ && i >= f.params.len() then return not_kept()
+
+    if keeping
+        val lent = scope_held(f, i)
+
+        if lent.is_some() then return lent.unwrap()
+    end if
+
     if keeping && lent_by_rule(cx, f, i) then return not_kept()
     if through && !read_through(f.params[i].1, 0) then return not_kept()
 
@@ -1494,6 +1501,7 @@ val CROSSING_HOW = "it reaches another concurrency domain"
 private passed_how(callee: string, kept: bool, inner: string) -> string
     if !kept then return s"it is passed to $callee, which lets what it reads through it out"
     if inner.ends_with(CROSSING_HOW) then return s"it is passed to $callee, where $CROSSING_HOW"
+    if inner.ends_with(SCOPE_HOW) then return s"it is passed to $callee, where $SCOPE_HOW"
 
     s"it is passed to $callee, which keeps it"
 end passed_how
@@ -1614,6 +1622,131 @@ scoped_at(f: TFunc, i: usize) -> bool
 
     i == 0 && name == "self" && scopes_a_call(f)
 end scoped_at
+
+// **What a scoped member runs is held by the scope that lent its `*self`, until the call that lent it
+// returns** -- the `sysl.threads.scope` call, not the body it runs. So it is held where the
+// receiver points (`p0:`), and the caller says what that is: a scope that is the caller's own local
+// lets go of it before the caller returns, as `scope` itself does; a scope the caller was handed --
+// the body's `s`, or a helper's parameter -- holds it past the caller's frame, so an address of that
+// frame is refused there (`scope_cure`). Rust's 'env and 'scope are this one distinction.
+private scope_held(f: TFunc, i: usize) -> Option[KeptWhy]
+    if f.marks.scoped.is_empty() || i == 0 || f.params.is_empty() || f.params[0].0 != "self" then return None
+    if !holds_string(f.marks.scoped, f.params[i].0) then return None
+
+    // A pointer a blocking primitive holds while its caller waits is let go before the call returns;
+    // only one that also crosses -- `SlotScope.start`'s `arg` -- goes on to a thread the scope joins.
+    if is_raw_pointer(f.params[i].1) && !holds_string(f.marks.copies, f.params[i].0) then return None
+
+    var locs: Buf[KeptAt] = buf()
+
+    locs.push(KeptAt("p0:", SCOPE_HOW, span_zero(), 0))
+    Some(KeptWhy(true, SCOPE_HOW, span_zero(), locs))
+end scope_held
+
+// Why a scoped member keeps what it runs, which a refusal follows with the scope cure (`scope_cure`).
+val SCOPE_HOW = "the scope that lent it holds it until the 'scope' call returns"
+
+// The cure for an address of a frame that a scope it was handed holds past its end -- the scope body's
+// own local, or a helper's -- naming the local where the value shows which one it is.
+private scope_cure(ft: &FrameTrack, how: string, arg: TExpr) -> string
+    if !how.ends_with(SCOPE_HOW) then return ""
+
+    val lead = " — a thread started on a scope may borrow only storage that outlives the 'scope' call"
+
+    val local = borrowed_local(ft, arg, 0)
+
+    (if local.is_some() then local else viewed_local(ft, arg, 0)) match
+        Some(n) -> s"$lead, and '$n' does not; declare '$n' before 'scope'"
+        None -> s"$lead; declare it before 'scope'"
+end scope_cure
+
+// The local of this frame whose address a value is or holds, as the source spells it: followed through
+// the locals bound once to a pointer and into what a closure or a struct is built of.
+private borrowed_local(ft: &FrameTrack, e: TExpr, depth: int) -> Option[string]
+    if depth > 16 then return None
+
+    *e.kind match
+        TAddrOf(place, _) -> frame_root_of(ft.refs, place) match
+            Some(root) -> Some(source_text(ft.scope, root.1))
+            None -> None
+        TLoad(n, _) ->
+            for item in ft.inits
+                if item.0 == n then return borrowed_local(ft, item.1, depth + 1)
+
+            None
+        TStructNew(_, args) -> first_borrowed(ft, args, depth)
+        TEnumNew(_, _, args) -> first_borrowed(ft, args, depth)
+        TArrayLit(elems, _) -> first_borrowed(ft, elems, depth)
+        TCall(_, args, _, _) -> first_borrowed(ft, args, depth)
+        TBox(v, _) -> borrowed_local(ft, v, depth + 1)
+        TErase(v, _, _) -> borrowed_local(ft, v, depth + 1)
+        TCast(v, _) -> borrowed_local(ft, v, depth + 1)
+        TField(r, _, _) -> borrowed_local(ft, r, depth + 1)
+        _ -> None
+end borrowed_local
+
+// **A view of this frame's own array, handed to a parameter a scope holds** (`scope_held`): a scoped
+// child borrows the views it captures rather than counting them (`lending_closure_base`), so the
+// array is not moved off the frame, and a scope the frame was handed would run the child after the
+// array is gone. Asked only where the callee's keep is the scope's, so a view handed anywhere else is
+// what it always was.
+private scope_view(ft: &FrameTrack, name: string, j: usize, arg: TExpr) -> Option[string]
+    if !keeps_of(ft.cx, name, j).how.ends_with(SCOPE_HOW) then return None
+
+    viewed_local(ft, arg, 0) match
+        Some(n) -> Some(s"a view of '$n', a local of '${ft.owner}'")
+        None -> None
+end scope_view
+
+// The local array of this frame a value views, or holds a view of, as the source spells it.
+private viewed_local(ft: &FrameTrack, e: TExpr, depth: int) -> Option[string]
+    if depth > 16 then return None
+
+    *e.kind match
+        TSlice(base, _, _, _, _) ->
+            if !is_array_type(texpr_type(base)) then return viewed_local(ft, base, depth + 1)
+
+            frame_root_of(ft.refs, base) match
+                Some(root) ->
+                    for item in ft.decls
+                        if item.0 == root.0 then return Some(source_text(ft.scope, root.1))
+
+                    None
+                None -> None
+        TLoad(n, _) ->
+            for item in ft.decls
+                if item.0 == n then return viewed_local(ft, item.1, depth + 1)
+
+            None
+        TViewAs(v, _) -> viewed_local(ft, v, depth + 1)
+        TBox(v, _) -> viewed_local(ft, v, depth + 1)
+        TErase(v, _, _) -> viewed_local(ft, v, depth + 1)
+        TCast(v, _) -> viewed_local(ft, v, depth + 1)
+        TStructNew(_, args) -> first_viewed(ft, args, depth)
+        TEnumNew(_, _, args) -> first_viewed(ft, args, depth)
+        TField(r, _, _) -> viewed_local(ft, r, depth + 1)
+        _ -> None
+end viewed_local
+
+private first_viewed(ft: &FrameTrack, es: Buf[TExpr], depth: int) -> Option[string]
+    for x in es
+        val n = viewed_local(ft, x, depth + 1)
+
+        if n.is_some() then return n
+    end for
+
+    None
+end first_viewed
+
+private first_borrowed(ft: &FrameTrack, es: Buf[TExpr], depth: int) -> Option[string]
+    for x in es
+        val n = borrowed_local(ft, x, depth + 1)
+
+        if n.is_some() then return n
+    end for
+
+    None
+end first_borrowed
 
 // Whether `@scoped` names a parameter that is a call rather than a pointer.
 private scopes_a_call(f: TFunc) -> bool
@@ -2158,6 +2291,12 @@ private kept_at(t: &Track, evs: &EvBuf, e: TExpr)
                     // parameter points at does not keep it. Said here, because the caller, handed a
                     // pointer read out of memory, could not name that storage again.
                     if at < kept_n && in_place_of(item.loc, j) && value_read_in(t, args[j]) then continue
+
+                    // **A scope holding what carries the scope itself holds nothing past the scope**: a
+                    // thread that captured `s` and starts more on it is kept in what `s` points at, which
+                    // ends exactly when `s`'s storage does -- as a body keeping its parameter in what the
+                    // parameter points at does not keep it.
+                    if at < kept_n && item.how == SCOPE_HOW && item.loc == "p0:" && hands_on(t, args[0]) then continue
 
                     val loc = if item.loc == "j" then task_loc(t.hs, true) else track_loc(t, args, item.loc)
 
@@ -3394,6 +3533,10 @@ struct FrameTrack
     // local, points at the local whole.
     local_types: Buf[(string, string)]
 
+    // Every local with what it was declared with, whatever its type (`viewed_local`): a view of a local
+    // array is no pointer, so `inits` does not hold it.
+    decls: Buf[(string, TExpr)]
+
     // What a local holds. **A probe joins everything it was bound to**, since each closure a local
     // may hold is decided on its own; the rule's own walk names the first thing, as its refusal does.
     core_of(self, name: string) -> Option[string]
@@ -3495,12 +3638,14 @@ private frame_walk(cx: &KeepsCx, faults: &KeepFaults, f: TFunc, probe: bool)
     val org = origins_of(cx, f)
     val ft: &FrameTrack = FrameTrack(cx, faults, func_home(cx.an, f.name), shown_name(cx.an, f.name),
                                      f.params, buf(), buf(), false, org, round_handles(cx, org, f), buf(),
-                                     buf(), buf(), buf(), buf(), buf(), false, probe, buf(), buf(), buf(), buf())
+                                     buf(), buf(), buf(), buf(), buf(), false, probe, buf(), buf(), buf(), buf(),
+                                     buf())
 
     walk_block_stmts(f.body, stmt_walk(false, s -> s match
         TRefDecl(n, _, place) -> ft.refs.push((n, place))
         TVarDecl(n, ty, init, _) ->
             ft.local_types.push((n, type_show(ty)))
+            ft.decls.push((n, init))
 
             if may_hold_pointer(cx, ty) && stable_name(org, n) != "" then ft.inits.push((n, init))
         _ -> ()))
@@ -4204,9 +4349,14 @@ private call_at(ft: &FrameTrack, evs: &EvBuf, e: TExpr)
                 val arg = args[j]
 
                 // An address handed on as an integer is a number.
-                if !may_hold_pointer(ft.cx, texpr_type(arg)) then continue
+                val pointerish = may_hold_pointer(ft.cx, texpr_type(arg))
 
-                val core = frame_core(ft, arg)
+                // A view of a local array is no address the rule follows, but a scope that outlives
+                // this frame holds it as surely (`scope_view`).
+                val found = if pointerish then frame_core(ft, arg) else None
+                val core = if found.is_some() || ft.probe then found else scope_view(ft, name, j, arg)
+
+                if !pointerish && core.is_none() then continue
                 val reads = frame_read_locs(ft, name, j, arg)
 
                 if core.is_none() && reads.is_empty() then continue
@@ -4252,7 +4402,7 @@ private call_at(ft: &FrameTrack, evs: &EvBuf, e: TExpr)
                     // A task holds it until it is awaited, so the cure is an await on every way out; a
                     // thread that crosses holds it for good, and borrowing the frame needs a scope.
                     val cure = if item.loc == "j" then s" — await that task on every way out of '${ft.owner}', " +
-                        "or hand it storage that lasts" else crossing_cure(item.how, ft.owner)
+                        "or hand it storage that lasts" else crossing_cure(item.how, ft.owner) + scope_cure(ft, item.how, arg)
                     var said = if read
                         read_said(ft, name, param_name(ft.cx, name, j), item.how, arg, h.2, false) + cure
                     else

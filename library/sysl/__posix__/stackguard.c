@@ -27,6 +27,7 @@
 
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <pthread.h>
@@ -58,10 +59,101 @@ static void sysl_say(const char *s) {
   (void)ignored;
 }
 
+/* **The guards of stacks the library made itself** (`sysl.fiber.Stack`), each a node laid in the
+ * stack's own mapping, so registering one allocates nothing. A fault in any of their guard ranges is
+ * an overflow exactly as one below the main thread's stack is.
+ *
+ * The list is changed under a lock and read by the handler without one: a handler cannot take a lock
+ * the faulting thread may hold, and what it reads is only ever a node that was whole when it was
+ * linked. A node is unlinked before its mapping goes, so the one race left is a stack dropped on one
+ * thread at the instant another overflows a different one -- which at worst costs that overflow its
+ * report (the process still ends), never a wrong one. */
+struct sysl_guard_node {
+  char *lo;
+  char *hi;
+  struct sysl_guard_node *volatile next;
+  struct sysl_guard_node *prev;
+};
+
+static struct sysl_guard_node *volatile sysl_guards = 0;
+static pthread_mutex_t sysl_guards_lock = PTHREAD_MUTEX_INITIALIZER;
+
+void sysl_stack_guard_add(struct sysl_guard_node *n, char *lo, char *hi) {
+  n->lo = lo;
+  n->hi = hi;
+  n->prev = 0;
+  pthread_mutex_lock(&sysl_guards_lock);
+  n->next = sysl_guards;
+  if (sysl_guards) sysl_guards->prev = n;
+  __atomic_store_n(&sysl_guards, n, __ATOMIC_RELEASE);
+  pthread_mutex_unlock(&sysl_guards_lock);
+}
+
+void sysl_stack_guard_remove(struct sysl_guard_node *n) {
+  pthread_mutex_lock(&sysl_guards_lock);
+  if (n->prev) n->prev->next = n->next;
+  else __atomic_store_n(&sysl_guards, n->next, __ATOMIC_RELEASE);
+  if (n->next) n->next->prev = n->prev;
+  pthread_mutex_unlock(&sysl_guards_lock);
+}
+
+static int sysl_in_a_guard(char *at) {
+  struct sysl_guard_node *n = __atomic_load_n(&sysl_guards, __ATOMIC_ACQUIRE);
+
+  for (; n; n = n->next)
+    if (at >= n->lo && at < n->hi) return 1;
+  return 0;
+}
+
+/* **Every thread a fault can be reported on needs an alternate stack of its own**: the setting is
+ * per thread, and only the main thread's is made at start-up. A thread that runs a fiber -- whose
+ * overflow is reported from the carrier it happens on -- gets one the first time it switches, and
+ * gives it back when it ends. */
+static pthread_key_t sysl_alt_key;
+static pthread_once_t sysl_alt_once = PTHREAD_ONCE_INIT;
+
+static void sysl_alt_free(void *mem) {
+  stack_t off;
+
+  memset(&off, 0, sizeof off);
+  off.ss_flags = SS_DISABLE;
+  sigaltstack(&off, 0);
+  free(mem);
+}
+
+static void sysl_alt_key_make(void) {
+  pthread_key_create(&sysl_alt_key, sysl_alt_free);
+}
+
+void sysl_stack_guard_thread(void) {
+  stack_t now;
+  stack_t alt;
+  void *mem;
+
+  if (sigaltstack(0, &now) != 0) return;
+  if (!(now.ss_flags & SS_DISABLE)) return;
+
+  pthread_once(&sysl_alt_once, sysl_alt_key_make);
+  mem = malloc(sizeof sysl_alt_stack);
+  if (!mem) return;
+
+  alt.ss_sp = mem;
+  alt.ss_size = sizeof sysl_alt_stack;
+  alt.ss_flags = 0;
+
+  if (sigaltstack(&alt, 0) != 0) {
+    free(mem);
+    return;
+  }
+
+  pthread_setspecific(sysl_alt_key, mem);
+}
+
 static void sysl_fault(int sig, siginfo_t *info, void *ctx) {
   char *at = info ? (char *)info->si_addr : 0;
-  int overflowed = sysl_stack_low != 0 && at >= sysl_stack_low - SYSL_GUARD_SLACK &&
-                   at < sysl_stack_high;
+  int overflowed = (sysl_stack_low != 0 && at >= sysl_stack_low - SYSL_GUARD_SLACK &&
+                    at < sysl_stack_high) ||
+                   sysl_in_a_guard(at);
 
   (void)sig;
   (void)ctx;
