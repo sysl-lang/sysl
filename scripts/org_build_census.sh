@@ -223,7 +223,7 @@ copy_path_deps() {
     cpd_manifest=$(manifest_of "$cpd_dir")
     [ -n "$cpd_manifest" ] || return 0
 
-    for cpd_name in $(sed -n 's/.*path *= *"\.\.\/\([^"\/]*\)".*/\1/p' "$cpd_manifest"); do
+    for cpd_name in $(sed -n 's/.*path *= *"\(\.\.\/\)\{1,2\}\([^"\/]*\)".*/\2/p' "$cpd_manifest"); do
         [ -d "$2/$cpd_name" ] && continue
         [ -d "$org/$cpd_name" ] || continue
         copy_tree "$org/$cpd_name" "$2/$cpd_name"
@@ -271,7 +271,8 @@ mkdir -p "$work/rows"
 # terminal, so a reason holding a newline (a panic message quoting a document) or built from several
 # `echo`s came out interleaved with the next row's.
 row() {
-    printf '%s\n' "$1" > "$work/rows/$name.tmp" && mv "$work/rows/$name.tmp" "$work/rows/$name"
+    row_key=$(printf '%s' "$name" | tr / _)
+    printf '%s\n' "$1" > "$work/rows/$row_key.tmp" && mv "$work/rows/$row_key.tmp" "$work/rows/$row_key"
     printf '%s\n' "$(printf '%s' "$2" | tr '\n\t' '  ' | cut -c1-400)"
 }
 
@@ -302,15 +303,20 @@ census_jobs=${SYSL_CENSUS_JOBS:-$(( $(sysctl -n hw.ncpu 2> /dev/null || nproc) /
 
 # One repository asked, in a tree of its own: every name the loop below settled is read here, in a
 # subshell started after they were.
+#
+# **A row is a repository (`$repo`, copied whole) and the directory in it the command runs in
+# (`$subpath`, `.` for the repository's own root).** `$name` is what the row is called, `amber` or
+# `amber/app`, and `$key` is that name made safe for a file name.
 census_row() {
-    tree=$work/trees/$name
-    here=$tree/$name
+    key=$(printf '%s' "$name" | tr / _)
+    tree=$work/trees/$key
+    here=$tree/$repo
     copy_tree "$dir" "$here"
-    copy_path_deps "$dir" "$tree"
+    copy_path_deps "$dir$subpath" "$tree"
 
     ours_ok=0
 
-    ( cd "$here" && run_row ours ) > "$work/$name.out" 2>&1 || ours_ok=1
+    ( cd "$here/$subpath" && run_row ours ) > "$work/$key.out" 2>&1 || ours_ok=1
 
     if [ $ours_ok -eq 0 ]; then
         case $label in
@@ -333,22 +339,22 @@ census_row() {
     # A suite whose every failure is "no server at ..." is the package working as designed: its
     # README says an absent server reddens the suite rather than skipping it, since a green run over
     # nothing is the one result worth less than a red one.
-    if grep -q "no server at" "$work/$name.out"; then
-        row serverless "needs a server      $name -- $(grep -c 'no server at' "$work/$name.out") of its tests want one"
+    if grep -q "no server at" "$work/$key.out"; then
+        row serverless "needs a server      $name -- $(grep -c 'no server at' "$work/$key.out") of its tests want one"
         return 0
     fi
 
     # **Every failure is re-asked of the reference on the same files**, because a repository the
     # reference also refuses is a fact about that repository rather than a defect here. A fresh copy,
     # since the run above may have written a `sysl.sum`.
-    tree=$work/trees/$name.reference
-    theirs=$tree/$name
+    tree=$work/trees/$key.reference
+    theirs=$tree/$repo
     copy_tree "$dir" "$theirs"
-    copy_path_deps "$dir" "$tree"
+    copy_path_deps "$dir$subpath" "$tree"
 
     theirs_ok=0
 
-    ( cd "$theirs" && run_row theirs ) > "$work/$name.theirs" 2>&1 || theirs_ok=1
+    ( cd "$theirs/$subpath" && run_row theirs ) > "$work/$key.theirs" 2>&1 || theirs_ok=1
 
     # **A board row that stops where the reference stops is a PASS, and the row says so.** The
     # header is one the SDK generates during a CMake configure, so neither compiler can reach it
@@ -356,9 +362,9 @@ census_row() {
     # is claiming. Both texts are required to name a missing header: a stop anywhere else, or a
     # reference that got further, is still a failure.
     if [ -n "$board" ] && [ $theirs_ok -ne 0 ] \
-       && grep -q "file not found" "$work/$name.out" \
-       && grep -q "file not found" "$work/$name.theirs"; then
-        row ok_typecheck "ok (type-check $board_target)  $name -- the analysis passed; $(grep -m1 -o "'[^']*' file not found" "$work/$name.out") is written by a CMake configure"
+       && grep -q "file not found" "$work/$key.out" \
+       && grep -q "file not found" "$work/$key.theirs"; then
+        row ok_typecheck "ok (type-check $board_target)  $name -- the analysis passed; $(grep -m1 -o "'[^']*' file not found" "$work/$key.out") is written by a CMake configure"
         return 0
     fi
 
@@ -366,43 +372,73 @@ census_row() {
     # Both compilers must say the same thing -- "needs the '<x>' headers and nothing supplied them" --
     # so a failure of any other kind in either run is still a failure.
     if [ $theirs_ok -ne 0 ] \
-       && grep -q "needs the '[^']*' headers and nothing supplied them" "$work/$name.out" \
-       && grep -q "needs the '[^']*' headers and nothing supplied them" "$work/$name.theirs"; then
-        row needs_lib "needs a library     $name -- $(grep -m1 -o "needs the '[^']*' headers" "$work/$name.out")"
+       && grep -q "needs the '[^']*' headers and nothing supplied them" "$work/$key.out" \
+       && grep -q "needs the '[^']*' headers and nothing supplied them" "$work/$key.theirs"; then
+        row needs_lib "needs a library     $name -- $(grep -m1 -o "needs the '[^']*' headers" "$work/$key.out")"
         return 0
     fi
 
     if [ $theirs_ok -ne 0 ]; then
-        row both_refused "refused by both     $name ($shown) -- $(why "$work/$name.out")"
+        row both_refused "refused by both     $name ($shown) -- $(why "$work/$key.out")"
     else
-        row failed "FAILED              $name ($shown) -- $(why "$work/$name.out")"
+        row failed "FAILED              $name ($shown) -- $(why "$work/$key.out")"
+    fi
+}
+
+# **`SYSL_CENSUS_ONLY` names the repositories to ask about**, space separated, so a row can be
+# re-asked on its own; a repository's nested projects are asked with it. A census of eighty
+# repositories is not the loop to iterate a single board's flags in, and the alternative -- running
+# those commands by hand beside the script -- proves the hand-written command rather than the one the
+# census will run. `wanted_repo <name>` answers whether the repository is asked about.
+wanted_repo() {
+    [ -n "$SYSL_CENSUS_ONLY" ] || return 0
+
+    for only in $SYSL_CENSUS_ONLY; do
+        if [ "$only" = "$1" ]; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# **A project with a manifest at its root is a package or a program, and an entry file is what tells
+# them apart**: a program's beginning is a file at the root with no `module` header, which is the
+# language's own rule for where a program starts. `classify <dir>` sets `command` and `label` for the
+# project whose manifest `<dir>` carries.
+classify() {
+    entry=""
+
+    for file in "$1"*.sysl "$1"*.lsysl; do
+        [ -f "$file" ] || continue
+        grep -q '^module ' "$file" || entry=$file
+    done
+
+    if [ -n "$entry" ]; then
+        command="build ."
+        label="build"
+    elif grep -rlE --include="*.sysl" --include="*.lsysl" '^@test\b' "$1" > /dev/null 2>&1; then
+        command="test ."
+        label="test"
+    else
+        # A package with no `@test` function has no suite to run: `sysl test .` answers
+        # "no '@test' functions in .", which says nothing about whether it builds. Its analysis
+        # is what can be asked, and `build-lib` runs all of it.
+        command="build-lib ."
+        label="build-lib"
     fi
 }
 
 for dir in "$org"/*/; do
     name=$(basename "$dir")
+    repo=$name
+    subpath=.
 
     # **A worktree's `.git` is a FILE and a repository's is a DIRECTORY**, which is the whole of the
     # test: a worktree is a second checkout of a repository this sweep has already read.
     [ -d "$dir/.git" ] || continue
 
-    # **`SYSL_CENSUS_ONLY` names the repositories to ask about**, space separated, so a row can be
-    # re-asked on its own. A census of eighty repositories is not the loop to iterate a single
-    # board's flags in, and the alternative -- running those commands by hand beside the script --
-    # proves the hand-written command rather than the one the census will run.
-    if [ -n "$SYSL_CENSUS_ONLY" ]; then
-        wanted=0
-
-        # Not `[ … ] && wanted=1`: under `set -e` a failing test is the list's status and the
-        # script exits on the first repository that is not the one asked for.
-        for only in $SYSL_CENSUS_ONLY; do
-            if [ "$only" = "$name" ]; then
-                wanted=1
-            fi
-        done
-
-        [ $wanted -eq 1 ] || continue
-    fi
+    wanted_repo "$name" || continue
 
     case $name in
         # The compiler's own trees, the site, and two directories that are not components.
@@ -440,26 +476,7 @@ for dir in "$org"/*/; do
     label=""
 
     if [ -n "$(manifest_of "$dir")" ]; then
-        entry=""
-
-        for file in "$dir"*.sysl "$dir"*.lsysl; do
-            [ -f "$file" ] || continue
-            grep -q '^module ' "$file" || entry=$file
-        done
-
-        if [ -n "$entry" ]; then
-            command="build ."
-            label="build"
-        elif grep -rlE --include="*.sysl" --include="*.lsysl" '^@test\b' "$dir" > /dev/null 2>&1; then
-            command="test ."
-            label="test"
-        else
-            # A package with no `@test` function has no suite to run: `sysl test .` answers
-            # "no '@test' functions in .", which says nothing about whether it builds. Its analysis
-            # is what can be asked, and `build-lib` runs all of it.
-            command="build-lib ."
-            label="build-lib"
-        fi
+        classify "$dir"
     else
         for subdir in "$dir"*/; do
             [ -n "$(manifest_of "$subdir")" ] || continue
@@ -580,6 +597,61 @@ build-c tools/portable --target riscv32-freestanding"
 
     dispatched=$((dispatched + 1))
     census_row &
+done
+
+# **A repository with a manifest at its root can hold more projects one directory down** -- amber's
+# `app/` and `cli/` are programs with their own manifests and tests, which the root's row never
+# builds. Each is a row of its own, `<repo>/<dir>`, classified as a root is. A repository with no
+# root manifest already has its subdirectory built by `build-c`, so it is not asked twice; nor are
+# the repositories whose rows are written by hand above (boards, kernels, `skiff`). Directories that
+# hold a manifest as a fixture or a copy rather than a project are not rows.
+for dir in "$org"/*/; do
+    repo=$(basename "$dir")
+
+    [ -d "$dir/.git" ] || continue
+    wanted_repo "$repo" || continue
+    [ -n "$(manifest_of "$dir")" ] || continue
+
+    case $repo in
+        sysl|sysl.sh|sysl-bootstrap|harness|pico-scratch) continue ;;
+        pico|pico2|picokit|ogol-pico|ogol-pico2|solder-pico2|musicbox-pico) continue ;;
+        zephyr|zephyr-demo|keel|skiff|freertos) continue ;;
+    esac
+
+    for subdir in "$dir"*/; do
+        sub=$(basename "$subdir")
+
+        case $sub in
+            tests|testdata|fixtures|vendor|examples|scratchpad|node_modules|target|build) continue ;;
+        esac
+
+        [ -n "$(manifest_of "$subdir")" ] || continue
+
+        name=$repo/$sub
+        subpath=$sub
+        board=""
+        board_target=""
+        kernel=""
+        via=""
+        flags=""
+
+        classify "$subdir"
+        commands=$command
+        shown=$label
+        found_flags=$(header_flags "$subdir")
+
+        if [ -n "$found_flags" ]; then
+            flags=$found_flags
+            shown="$label $found_flags"
+        fi
+
+        while [ "$(jobs -p | wc -l)" -ge "$census_jobs" ]; do
+            sleep 1
+        done
+
+        dispatched=$((dispatched + 1))
+        census_row &
+    done
 done
 
 wait
