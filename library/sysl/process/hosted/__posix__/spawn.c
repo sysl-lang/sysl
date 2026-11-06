@@ -709,6 +709,24 @@ static int start_spawned(const char *program, char *const *argv,
     posix_spawnattr_t attr;
     posix_spawnattr_t *attrs = NULL;
 
+#if defined(__APPLE__) && defined(POSIX_SPAWN_CLOEXEC_DEFAULT)
+    /* A backstop for descriptors a linked C library opened without close-on-exec: the child starts
+     * with only the three streams, each kept explicitly. `adddup2` already keeps the ones it places;
+     * a stream left alone, or one that already is itself, is kept here. */
+    for (int i = 0; i < 3 && e == 0; i++)
+        if (fds[i] < 0 || fds[i] == i) e = posix_spawn_file_actions_addinherit_np(&actions, i);
+
+    if (e == 0) {
+        e = posix_spawnattr_init(&attr);
+        if (e == 0) attrs = &attr;
+    }
+
+    short flags = POSIX_SPAWN_CLOEXEC_DEFAULT;
+
+    if (pgid >= 0) flags |= POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK;
+
+    if (e == 0) e = posix_spawnattr_setflags(&attr, flags);
+#else
     if (e == 0 && pgid >= 0) {
         e = posix_spawnattr_init(&attr);
 
@@ -717,7 +735,10 @@ static int start_spawned(const char *program, char *const *argv,
             e = posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGDEF |
                                                 POSIX_SPAWN_SETSIGMASK);
         }
+    }
+#endif
 
+    if (e == 0 && pgid >= 0) {
         if (e == 0) e = posix_spawnattr_setpgroup(&attr, pgid);
 
         /* A job: the job signals at their defaults and nothing blocked, as `child_group` does on the
@@ -1031,6 +1052,8 @@ int sysl_proc_posix_temp_path(char *buf, size_t n) {
     int fd = mkstemp(buf);
 
     if (fd < 0) return errno;
+
+    fcntl(fd, F_SETFD, FD_CLOEXEC);
 
     close(fd);
     return 0;

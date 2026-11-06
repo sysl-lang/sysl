@@ -37,7 +37,8 @@ int sysl_fs_host_open(const char *path, unsigned flags, unsigned mode) {
     if (flags & SYSL_FS_OPEN_TRUNCATE) how |= O_TRUNC;
     if (flags & SYSL_FS_OPEN_APPEND) how |= O_APPEND;
 
-    return open(path, how, (mode_t) mode);
+    /* Close-on-exec, so a child started by `sysl.process` does not inherit the file. */
+    return open(path, how | O_CLOEXEC, (mode_t) mode);
 }
 
 // The five calls that take or answer an `off_t`, whose width is the platform's: 64 bits on every

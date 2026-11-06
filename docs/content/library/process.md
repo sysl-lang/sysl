@@ -502,7 +502,7 @@ closed, so the read end goes as soon as its stage has started too.
 
 **A pipe's ends are never inherited by accident.** Each is made to close when a program is started,
 and reaches a child only as the stream it was handed as — so `tr` above holds no copy of its own write
-end, which would be a writer it waits for and never hears from.
+end, which would be a writer it waits for and never hears from. **The same holds for every descriptor sysl opens** — files, sockets, accepted connections and the temporary files a capture uses are close-on-exec, so a child holds only the three streams it was given; on macOS a program is also started with every other descriptor closed, which covers those a linked C library opened.
 
 Like a `Child`, a `Spawned` dropped without being waited for is ended and reaped there and then, so a
 pipeline abandoned halfway leaves no stage running and no zombie; `spawn` takes `dir`, `env`,
