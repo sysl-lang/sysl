@@ -1,0 +1,218 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// The field-path analysis (`fpa.sysl`), asked directly: what each function keeps of each parameter,
+// path by path, what its answer is made of and where in it, and what a local may point to; and where
+// it parts from the keeps analysis (`keeps.sysl`), which it is built to replace.
+//
+// The cells cross where the address sits (a field held in place, a nested field, a field through a
+// pointer, a list or tree reached through itself, an array element, a heap object answered) with
+// what the body does with it (stores it in module storage, stores it through another parameter,
+// hands it back, hands it to a callee by name, through a `&Fn`, through a function pointer). Skipped
+// cells, and why: a trait object's call is answered by the trait's `@keeps` declaration exactly as a
+// `&Fn`'s is by its marks, through the same path (`vcall`), so the `&Fn` cells stand for it; a task
+// is held by the async tests of the keeps analysis, which this one does not replace yet.
+
+private val fpa_decls: string = "var spare = 0\nvar held: *int = &spare\n\n" +
+    "struct S\n    a: *int\n    b: *int\n\n" +
+    "struct O\n    inner: S\n    c: *int\n\n" +
+    "struct Cpu\n    bus: *int\n    peer: *int\n\n" +
+    "struct Node\n    next: *Node\n    v: *int\n\n" +
+    "struct Tree\n    left: *Tree\n    right: *Tree\n    v: *int\n\n"
+
+private fpa_of(text: string) -> &Fpa
+    val done = typed_of(fpa_decls + text)
+
+    assert(done.reported.is_empty(), if done.reported.is_empty() then "" else done.reported[0].diag.message)
+    fpa_analyze(done.an, done.funcs)
+end fpa_of
+
+private fpa_diffs(text: string) -> string
+    val done = typed_of(fpa_decls + text)
+    var out = ""
+
+    for line in fpa_disagreements(done.an, done.funcs)
+        out = out + line + "\n"
+
+    out
+end fpa_diffs
+
+// -- field-sensitive keeps ------------------------------------------------------------------------
+
+@test("a struct held in place keeps the one field it stores, and nothing of the other")
+fpa_one_field()
+    val fx = fpa_of("keep_a(s: S)\n    held = s.a\n\nmain()\n    var x = 1\n    keep_a(S(&x, &x))\n")
+
+    assert_eq(fpa_kept_text(fx, "keep_a", 0), ".0")
+    assert(fpa_keeps(fx, "keep_a", 0))
+    assert(!fpa_answers(fx, "keep_a", 0))
+
+@test("a nested field is kept along its whole path: the inner struct's second field, not the outer's own")
+fpa_nested_field()
+    val fx = fpa_of("keep_ib(o: O)\n    held = o.inner.b\n\nmain()\n    var x = 1\n    keep_ib(O(S(&x, &x), &x))\n")
+
+    assert_eq(fpa_kept_text(fx, "keep_ib", 0), ".0.1")
+
+@test("a field read through a pointer is let out one step in, and the pointer itself is not kept")
+fpa_through_pointer()
+    val fx = fpa_of("keep_bus(c: *Cpu)\n    held = c.bus\n\nmain()\n    var x = 1\n    var c = Cpu(&x, &x)\n    keep_bus(&c)\n")
+
+    assert_eq(fpa_kept_text(fx, "keep_bus", 0), "*.0")
+    assert(!fpa_keeps(fx, "keep_bus", 0))
+    assert(fpa_lets_out(fx, "keep_bus", 0))
+
+@test("a field kept by a callee is kept by the caller handing the field on, and the other field is not")
+fpa_field_through_callee()
+    val fx = fpa_of("keep_a(s: S)\n    held = s.a\n\nwrapper(t: S)\n    keep_a(t)\n\n" +
+                    "main()\n    var x = 1\n    wrapper(S(&x, &x))\n")
+
+    assert_eq(fpa_kept_text(fx, "wrapper", 0), ".0")
+
+@test("a callee keeping the second field: the caller's struct built from two pointers keeps only the second")
+fpa_field_built_in_caller()
+    val fx = fpa_of("keep_b(s: S)\n    held = s.b\n\nboth(p: *int, q: *int)\n    keep_b(S(p, q))\n\n" +
+                    "main()\n    var x = 1\n    both(&x, &x)\n")
+
+    assert_eq(fpa_kept_text(fx, "both", 0), "")
+    assert_eq(fpa_kept_text(fx, "both", 1), "ε")
+
+// -- recursive types: a path is cut at the first type that repeats ---------------------------------
+
+@test("walking a list to its end keeps a value one step in: the path is cut where Node repeats")
+fpa_list_collapse()
+    val fx = fpa_of("last_v(n: *Node)\n    var m = n\n    while m.next != null\n        m = m.next\n" +
+                    "    held = m.v\n\nmain()\n    var x = 1\n    var a = Node(null, &x)\n    last_v(&a)\n")
+
+    assert_eq(fpa_kept_text(fx, "last_v", 0), "*.1")
+    assert_eq(fpa_local_text(fx, "last_v", "m"), "p0 p0*.0")
+
+@test("a tree walked by recursion down both sides settles, every depth answered by one cut path")
+fpa_tree_collapse()
+    val fx = fpa_of("stash(t: *Tree)\n    if t == null then return\n    held = t.v\n    stash(t.left)\n    stash(t.right)\n\n" +
+                    "main()\n    var x = 1\n    var a = Tree(null, null, &x)\n    stash(&a)\n")
+
+    assert_eq(fpa_kept_text(fx, "stash", 0), "*.2")
+
+@test("a list's next pointer handed back after any number of steps is answered along the cut path")
+fpa_list_answer()
+    val fx = fpa_of("far(n: *Node) -> *Node\n    var m = n\n    while m.next != null\n        m = m.next\n    m\n\n" +
+                    "main()\n    var a = Node(null, &spare)\n    held = far(&a).v\n")
+
+    assert_eq(fpa_answers_text(fx, "far", 0), "*.0@ε ε@ε")
+
+// -- through a callable: answered by its signature -------------------------------------------------
+
+@test("a call through an unmarked &Fn keeps nothing it is handed, and may answer with it")
+fpa_fn_unmarked()
+    val fx = fpa_of("via(f: &Fn(*int) -> *int, p: *int) -> *int = f(p)\n\n" +
+                    "main()\n    var x = 1\n    held = via(q -> q, &spare)\n")
+
+    assert_eq(fpa_kept_text(fx, "via", 1), "")
+    assert(fpa_answers(fx, "via", 1))
+
+@test("a call through a &Fn whose type marks the parameter '@keeps' keeps what it hands the closure")
+fpa_fn_marked()
+    val fx = fpa_of("via(f: &Fn(@keeps *int) -> unit, p: *int) = f(p)\n\n" +
+                    "main()\n    via(q -> held = q, &spare)\n")
+
+    assert_eq(fpa_kept_text(fx, "via", 1), "ε")
+
+@test("a call through a function pointer keeps nothing and may answer with any argument")
+fpa_fn_pointer()
+    val fx = fpa_of("id(p: *int) -> *int = p\n\nvia(f: (*int) -> *int, p: *int) -> *int = f(p)\n\n" +
+                    "main()\n    held = via(&id, &spare)\n")
+
+    assert_eq(fpa_kept_text(fx, "via", 1), "")
+    assert(fpa_answers(fx, "via", 1))
+
+// -- a view in a heap object handed back (M24) -----------------------------------------------------
+
+@test("a view put into a heap object the function answers is lent back, not kept, and sits one '*' in")
+fpa_view_boxed_answer()
+    val fx = fpa_of("struct H\n    v: []u8\n\nwrap(v: []u8) -> &H = H(v)\n\n" +
+                    "main()\n    var a: [4]u8 = [1, 2, 3, 4]\n    val h = wrap(a[..])\n    spare = int(h.v[0])\n")
+
+    assert_eq(fpa_kept_text(fx, "wrap", 0), "")
+    assert_eq(fpa_answers_text(fx, "wrap", 0), "ε@*.0")
+    assert(fpa_answers_boxed(fx, "wrap", 0))
+
+@test("the same heap object stored in module storage keeps the view it holds")
+fpa_view_boxed_kept()
+    val fx = fpa_of("struct H\n    v: *int\n\nvar hold: Option[&H] = None\n\n" +
+                    "wrap(v: *int)\n    hold = Some(H(v))\n\nmain()\n    wrap(&spare)\n")
+
+    assert_eq(fpa_kept_text(fx, "wrap", 0), "ε")
+
+@test("the keeps analysis keeps a pointer put in an answered box; this one says where the box lends it")
+fpa_view_boxed_disagrees()
+    val said = fpa_diffs("struct H\n    v: *int\n\nwrap(v: *int) -> &H = H(v)\n\nmain()\n    held = wrap(&spare).v\n")
+
+    assert(said.contains("keeps-old-only:boxed-answer wrap|0"), said)
+
+// -- stores through another parameter --------------------------------------------------------------
+
+@test("a pointer stored through another parameter is the caller's to place: written, not kept outright")
+fpa_store_through_param()
+    val fx = fpa_of("set(out: **int, p: *int)\n    *out = p\n\nmain()\n    var q: *int = &spare\n    set(&q, &spare)\n")
+
+    assert_eq(fpa_kept_text(fx, "set", 1), "ε>p0")
+    assert(fpa_writes(fx, "set", 1))
+
+@test("a caller's local written through by a callee holds what was written, and is followed from there")
+fpa_store_through_param_followed()
+    val fx = fpa_of("set(out: **int, p: *int)\n    *out = p\n\nrelay(p: *int)\n    var q: *int = &spare\n" +
+                    "    set(&q, p)\n    held = q\n\nmain()\n    relay(&spare)\n")
+
+    assert_eq(fpa_kept_text(fx, "relay", 0), "ε")
+
+@test("a node pointed back into itself is not kept by that store")
+fpa_store_in_place()
+    val fx = fpa_of("loop_back(n: *Node)\n    n.next = n\n\nmain()\n    var a = Node(null, &spare)\n    loop_back(&a)\n")
+
+    assert_eq(fpa_kept_text(fx, "loop_back", 0), "")
+
+// -- what a value may point to ---------------------------------------------------------------------
+
+@test("a local assigned on two arms may point to either, and a local's address is told by name")
+fpa_local_points_to()
+    val fx = fpa_of("pick(c: bool, p: *int) -> *int\n    var x = 1\n    var r = p\n    if c then r = &x\n    r\n\n" +
+                    "main()\n    spare = *pick(true, &spare)\n")
+
+    assert_eq(fpa_local_text(fx, "pick", "r"), "&x p1")
+    assert_eq(fpa_result_text(fx, "pick"), "&x p1")
+
+@test("an element read out of an array of pointers held in place is the array parameter's element")
+fpa_array_element()
+    val fx = fpa_of("first(xs: [2]*int)\n    held = xs[0]\n\nmain()\n    first([&spare, &spare])\n")
+
+    assert_eq(fpa_kept_text(fx, "first", 0), "[]")
+
+// -- agreement with the keeps analysis, and the error paths -----------------------------------------
+
+@test("where there is nothing to tell apart, the two analyses agree on keeping and answering")
+fpa_agrees()
+    val said = fpa_diffs("store(p: *int)\n    held = p\n\nread(p: *int)\n    spare = *p\n\n" +
+                         "ident(p: *int) -> *int = p\n\nhand_on(p: *int)\n    store(p)\n\n" +
+                         "main()\n    store(&spare)\n    read(&spare)\n    held = ident(&spare)\n    hand_on(&spare)\n")
+
+    assert_eq(said, "")
+
+@test("a name the program does not have is answered '?', not taken for one that keeps nothing")
+fpa_unknown_name()
+    val fx = fpa_of("main()\n    spare = 1\n")
+
+    assert_eq(fpa_kept_text(fx, "nosuch", 0), "?")
+    assert(!fpa_keeps(fx, "nosuch", 0))
+
+@test("a body refused where it was read has an empty summary and is left out of the comparison")
+fpa_refused_body()
+    val done = typed_of(fpa_decls + "bad(p: *int)\n    held = nosuch(p)\n\nmain()\n    bad(&spare)\n")
+
+    assert(!done.reported.is_empty())
+
+    val fx = fpa_analyze(done.an, done.funcs)
+
+    assert_eq(fpa_kept_text(fx, "bad", 0), "")
+    assert_eq(fpa_disagreements(done.an, done.funcs).len(), 0)

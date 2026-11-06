@@ -176,7 +176,18 @@ end KeepFaults
 // -- the whole program ----------------------------------------------------------------------------
 
 // Holds every call in the program to the rule, and every body a default promised for to its promise.
-check_keeps(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable], vals: Buf[TVal])
+check_keeps(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable], vals: Buf[TVal], fx: &Fpa)
+    val cx = settled_keeps(a, funcs, vtables)
+
+    // **Under `SYSL_FPA_COMPARE=1` the field-path analysis is held to these answers** (`fpa.sysl`),
+    // each disagreement said on standard error with its kind, and a count of each kind.
+    if fpa_comparing() then fpa_report(fpa_compare(cx, fx))
+
+    hold_keeps(a, cx, funcs, vals)
+end check_keeps
+
+// Every keeps answer, settled: the whole program's questions asked and worked out to a fixed point.
+settled_keeps(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable]) -> &KeepsCx
     var index: Map[string, usize] = map()
 
     for i in 0..<funcs.len()
@@ -230,6 +241,12 @@ check_keeps(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable], vals: Buf[TV
         if cx.strayed then settle_by_rounds(cx)
     end if
 
+    cx
+end settled_keeps
+
+// The settled answers put to use: told where asked for, handed to the lowering, and every call held
+// to them.
+private hold_keeps(a: &Analysis, cx: &KeepsCx, funcs: Buf[TFunc], vals: Buf[TVal])
     if explaining_borrows() then note_borrows(cx)
 
     // The answers a call may read through a place entry (`place_entry.sysl`), handed to the lowering.
@@ -263,7 +280,7 @@ check_keeps(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable], vals: Buf[TV
 
         said.push(item.1)
         a.fault(item.0, item.1, item.2)
-end check_keeps
+end hold_keeps
 
 private note_addressed(cx: &KeepsCx, e: TExpr)
     *e.kind match
@@ -1729,7 +1746,7 @@ private env_type(t: Type) -> Type = t match
 
 // Whether a body holds an expression its reading refused: the node a complaint leaves where the value
 // would have been (`bad_expr`).
-private mistaken(f: TFunc) -> bool
+mistaken(f: TFunc) -> bool
     var found: Buf[bool] = buf()
     val sink = &found
 

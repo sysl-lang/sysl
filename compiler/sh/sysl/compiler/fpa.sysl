@@ -1,0 +1,1676 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+import sysl.env.get
+import sysl.text.from_utf8_unchecked
+import sysl.time.monotonic
+
+// **Where every value may point, field by field, and what each function does with what it is handed**
+// (`reference/memory.md § A borrowed pointer cannot escape`).
+//
+// One forward walk over each body, callees first, says for every value what it may be made of: a
+// parameter's value or something read along a path through it (`p0.*.1`), the address of a local's
+// storage, a heap object the body made, or module storage. From the walk each function gets a
+// summary, per parameter:
+//
+// - the paths through it that may be **kept** -- stored somewhere that outlives the call;
+// - the paths through it that may flow to the **result**, with where in the result they sit;
+// - what it may **write** through another parameter, which is the caller's to place.
+//
+// **Paths are field-sensitive**: `keep(s: S) = G = s.a` keeps `s.a` and nothing of `s.b`, and a value
+// read along `.a` is told apart from one along `.b`. **A path stops at the first type that repeats
+// along it**: a step landing on a struct or enum the path already went through goes back to where it
+// first did, so `n.*.next.*` is `n.*` and every summary is finite -- no longer than the number of
+// distinct types it crosses -- with no count of steps anywhere. A path stands for everything below
+// it, so a cut path answers for every depth of the list or tree it walked.
+//
+// **A view or an address put into a heap object the function answers is lent back, not kept**: the
+// summary says where in the result it sits (`*.0`), and the caller follows the result as it follows
+// the argument, so a later store of the object is caught where the caller makes it.
+//
+// **A call with no body in sight is answered by its signature**: an `extern` keeps what `@keeps`
+// names and answers what `@answers` names; a call through a `&Fn` keeps what the callable type marks
+// `@keeps` and may answer with any argument; a call through any other trait object keeps what the
+// trait method declares `@keeps`, every argument where it answers a task; a function pointer keeps
+// nothing and may answer with any argument.
+//
+// Each body is walked until what its locals and heap objects hold stops growing -- a value only ever
+// gains members, and there are finitely many -- and a body whose summary grew sends its callers back
+// to be walked again. Nothing is asked on demand.
+
+// One step of a path: a field (`.3`, or `.Some:0` for a variant's), the pointee or the element a view
+// reaches (`*`), an element of an array held in place (`[]`), or somewhere at or below here (`~`); with
+// the struct or enum the step lands on, which is what a path is cut at.
+struct FStep
+    s: string
+    n: string
+
+// What a value may be made of: `root` along `path`, sitting at `off` within the value. A root is a
+// parameter's value (`p<i>`), the address of a local's storage (`l:<name>`), a heap object made in
+// the body (`h:<site>`), or module storage (`g`). For an address, `path` is where in the storage it
+// points.
+struct FAtom
+    off: Buf[FStep]
+    root: string
+    path: Buf[FStep]
+    key: string
+
+// One function's summary: per parameter, the paths kept and the paths answered with where in the
+// answer they sit; what is written through one parameter out of another; and where in the answer a
+// heap object made inside the call sits.
+struct FpaSum
+    kept: Buf[Buf[Buf[FStep]]]
+    answers: Buf[Buf[(Buf[FStep], Buf[FStep])]]
+    writes: Buf[(usize, usize, Buf[FStep])]
+    fresh: Buf[Buf[FStep]]
+    seen: Map[string, bool]
+    size: int
+end FpaSum
+
+// The analysis of a whole program.
+struct Fpa
+    an: &Analysis
+    funcs: Buf[TFunc]
+    index: Map[string, usize]
+    sums: Buf[&FpaSum]
+    holds: Map[string, bool]
+    mistaken: Map[string, bool]
+    walks: int
+end Fpa
+
+// One walk of one body: what every cell may hold -- a local (`l:<name>`), a heap object (`h:<site>`),
+// the answer (`$ret`), what a loop breaks with (`$brk`), what is kept (`$kept`) and what is stored
+// through a parameter (`$thr<i>`) -- with which cells were read in the walk under way, since a cell
+// that grows after it was read sends the body round again.
+struct FBody
+    fx: &Fpa
+    f: TFunc
+    cells: Map[string, Buf[FAtom]]
+    members: Map[string, bool]
+    read: Map[string, bool]
+    refs: Map[string, TExpr]
+    changed: bool
+    count: int
+    names: Buf[string]
+end FBody
+
+// -- the whole program ----------------------------------------------------------------------------
+
+// Every function's summary, callees first; a function whose summary grows sends its callers round
+// again until none does.
+fpa_analyze(a: &Analysis, funcs: Buf[TFunc]) -> &Fpa
+    var index: Map[string, usize] = map()
+
+    for i in 0..<funcs.len()
+        if !index.has(funcs[i].name) then index.put(funcs[i].name, i)
+
+    val fx: &Fpa = Fpa(a, funcs, index, buf(), map(), map(), 0)
+    var callees: Buf[Buf[usize]] = buf()
+    var callers: Buf[Buf[usize]] = buf()
+
+    for f in funcs
+        fx.sums.push(empty_sum(f.params.len()))
+        callers.push(buf())
+
+        if mistaken(f) then fx.mistaken.put(f.name, true)
+
+    for i in 0..<funcs.len()
+        val cs = fpa_callees(fx, funcs[i])
+
+        callees.push(cs)
+
+        for c in cs
+            callers[c].push(i)
+
+    var queue = callees_first(callees)
+    var queued: Buf[bool] = buf()
+
+    for _ in 0..<funcs.len()
+        queued.push(true)
+
+    var at: usize = 0
+
+    while at < queue.len()
+        val fi = queue[at]
+
+        at += 1
+        queued[fi] = false
+
+        if fx.mistaken.has(funcs[fi].name) then continue
+
+        val sum = walk_func(fx, fi)
+
+        if fpa_tracing() && sum.size > 100 then eprints(s"FPA-SUM ${funcs[fi].name} ${sum.size}\n")
+
+        if sum.size > fx.sums[fi].size
+            fx.sums[fi] = sum
+
+            for c in callers[fi]
+                if !queued[c]
+                    queued[c] = true
+                    queue.push(c)
+        end if
+
+    fx
+end fpa_analyze
+
+private empty_sum(n: usize) -> &FpaSum
+    var kept: Buf[Buf[Buf[FStep]]] = buf()
+    var answers: Buf[Buf[(Buf[FStep], Buf[FStep])]] = buf()
+
+    for _ in 0..<n
+        kept.push(buf())
+        answers.push(buf())
+
+    FpaSum(kept, answers, buf(), buf(), map(), 0)
+end empty_sum
+
+// The functions a body calls by name, as indices, once each.
+private struct FCallees
+    fx: &Fpa
+    seen: Map[usize, bool]
+    out: Buf[usize]
+end FCallees
+
+private fpa_callees(fx: &Fpa, f: TFunc) -> Buf[usize]
+    val c: &FCallees = FCallees(fx, map(), buf())
+
+    walk_block_stmts(f.body, expr_walk(false, e -> note_fpa_callee(c, e)))
+    c.out
+end fpa_callees
+
+private note_fpa_callee(c: &FCallees, e: TExpr)
+    *e.kind match
+        TCall(name, _, _, _) -> c.fx.index.get(name) match
+            Some(i) ->
+                if !c.seen.has(i)
+                    c.seen.put(i, true)
+                    c.out.push(i)
+            None -> ()
+        _ -> ()
+end note_fpa_callee
+
+// Every function once, each after the functions it calls where no recursion says otherwise: a depth
+// first walk's post-order, kept on a stack of its own.
+private callees_first(callees: Buf[Buf[usize]]) -> Buf[usize]
+    var out: Buf[usize] = buf()
+    var state: Buf[int] = buf()
+
+    for _ in 0..<callees.len()
+        state.push(0)
+
+    for start in 0..<callees.len()
+        if state[start] != 0 then continue
+
+        var stack: Buf[(usize, usize)] = buf()
+
+        stack.push((start, 0))
+        state[start] = 1
+
+        while !stack.is_empty()
+            val top = stack[stack.len() - 1]
+            val cs = callees[top.0]
+
+            if top.1 < cs.len()
+                stack[stack.len() - 1] = (top.0, top.1 + 1)
+
+                val next = cs[top.1]
+
+                if state[next] == 0
+                    state[next] = 1
+                    stack.push((next, 0))
+                end if
+            else
+                stack.pop()
+                state[top.0] = 2
+                out.push(top.0)
+            end if
+        end while
+    end for
+
+    out
+end callees_first
+
+// -- one body -------------------------------------------------------------------------------------
+
+// The body walked until no cell it read grows, and its summary read off what the walk found.
+private walk_func(fx: &Fpa, fi: usize) -> &FpaSum
+    val fb = settle_body(fx, fx.funcs[fi])
+
+    summarize(fb)
+end walk_func
+
+private settle_body(fx: &Fpa, f: TFunc) -> &FBody
+    val fb: &FBody = FBody(fx, f, map(), map(), map(), map(), false, 0, buf())
+
+    loop
+        fb.changed = false
+        fb.read = map()
+        fb.refs = map()
+        fx.walks += 1
+
+        val t0 = monotonic().us
+
+        for i in 0..<f.params.len()
+            if fpa_holds(fx, f.params[i].1)
+                var one: Buf[FAtom] = buf()
+
+                one.push(atom(buf(), s"p$i", buf()))
+                add_to(fb, s"l:${f.params[i].0}", one)
+            end if
+
+        add_to(fb, "$ret", eval_block(fb, f.body))
+
+        if fpa_tracing()
+            eprints(s"FPA-TRACE ${f.name} walk ${fx.walks} atoms ${fb.count} changed ${fb.changed} us ${monotonic().us - t0}\n")
+
+            if fb.count > 3000
+                for n in fb.names
+                    val c = fb.cells.get(n).unwrap()
+
+                    if c.len() > 300
+                        eprints(s"FPA-CELL ${f.name} $n ${c.len()} ${c[0].key} ${c[c.len() / 2].key} ${c[c.len() - 1].key}\n")
+            end if
+        end if
+
+        if !fb.changed then break
+
+    fb
+end settle_body
+
+// The summary of a settled body: what is kept, with everything a kept heap object or local holds; what
+// the answer is made of, through every heap object it holds; and what is stored through each
+// parameter.
+private summarize(fb: &FBody) -> &FpaSum
+    val f = fb.f
+    val sum = empty_sum(f.params.len())
+
+    for i in 0..<f.params.len()
+        if is_ptr_type(f.params[i].1) && holds_string(f.marks.copies, f.params[i].0)
+            sum_kept(sum, i, buf())
+
+    var visited: Map[string, bool] = map()
+    var work: Buf[FAtom] = buf()
+
+    for a in cell(fb, "$kept")
+        work.push(a)
+
+    for i in 0..<f.params.len()
+        for a in cell(fb, s"$$thr$i")
+            if a.root.starts_with("p")
+                sum_write(sum, i, param_of(a.root), a.path)
+            else
+                work.push(a)
+
+    var at: usize = 0
+
+    while at < work.len()
+        val a = work[at]
+
+        at += 1
+
+        if a.root.starts_with("p")
+            sum_kept(sum, param_of(a.root), a.path)
+        else if (a.root.starts_with("h:") || a.root.starts_with("l:")) && !visited.has(a.root)
+            visited.put(a.root, true)
+
+            for b in cell(fb, a.root)
+                work.push(b)
+        end if
+
+    var seen: Map[string, bool] = map()
+
+    if fpa_holds(fb.fx, f.ret_ty) then answer_from(fb, sum, cell(fb, "$ret"), buf(), &seen)
+    sum
+end summarize
+
+// What the answer is made of: a parameter's value where it sits, and through each heap object it
+// holds, what that object holds, one `*` further in.
+private answer_from(fb: &FBody, sum: &FpaSum, atoms: Buf[FAtom], prefix: Buf[FStep], seen: *Map[string, bool])
+    for a in atoms
+        val o = concat(prefix, a.off)
+
+        if a.root.starts_with("p")
+            sum_answer(sum, param_of(a.root), a.path, o)
+        else if a.root.starts_with("h:")
+            sum_fresh(sum, o)
+
+            if !seen.has(a.root)
+                seen.put(a.root, true)
+
+                var deeper = o
+
+                deeper = concat(deeper, one_step("*", ""))
+                answer_from(fb, sum, cell(fb, a.root), deeper, seen)
+            end if
+        end if
+end answer_from
+
+private sum_kept(sum: &FpaSum, i: usize, path: Buf[FStep])
+    if covered(&sum.seen, s"k$i|", without_tilde(path)) then return
+
+    sum.kept[i].push(path)
+    sum.size += 1
+end sum_kept
+
+// **Whether a path, or one it extends, is already in a set**, since a path stands for everything below
+// it: a kept `*.0` holds every `*.0.…` there is. A path that is not is added.
+private covered(seen: *Map[string, bool], tag: string, path: Buf[FStep]) -> bool
+    var k = tag
+
+    if seen.has(k) then return true
+
+    for st in path
+        k = k + st.s + "@" + st.n
+
+        if seen.has(k) then return true
+
+    seen.put(k, true)
+    false
+end covered
+
+private sum_answer(sum: &FpaSum, i: usize, path: Buf[FStep], off: Buf[FStep])
+    if i >= sum.answers.len() then return
+
+    val k = s"a$i|${path_key(path)}|${path_key(off)}"
+
+    if sum.seen.has(k) then return
+
+    sum.seen.put(k, true)
+    sum.answers[i].push((path, off))
+    sum.size += 1
+end sum_answer
+
+private sum_write(sum: &FpaSum, dest: usize, src: usize, path: Buf[FStep])
+    val k = s"w$dest|$src|${path_key(path)}"
+
+    if sum.seen.has(k) then return
+
+    sum.seen.put(k, true)
+    sum.writes.push((dest, src, path))
+    sum.size += 1
+end sum_write
+
+private sum_fresh(sum: &FpaSum, off: Buf[FStep])
+    val k = s"f|${path_key(off)}"
+
+    if sum.seen.has(k) then return
+
+    sum.seen.put(k, true)
+    sum.fresh.push(off)
+    sum.size += 1
+end sum_fresh
+
+// -- cells ----------------------------------------------------------------------------------------
+
+// What a cell holds, which counts as reading it.
+private cell(fb: &FBody, name: string) -> Buf[FAtom]
+    fb.read.put(name, true)
+
+    fb.cells.get(name) match
+        Some(v) -> v
+        None -> buf()
+end cell
+
+// Adds what a cell may hold. A cell the walk under way already read sends the body round again.
+private add_to(fb: &FBody, name: string, atoms: Buf[FAtom])
+    if atoms.is_empty() then return
+
+    var held = fb.cells.get(name) match
+        Some(v) -> v
+        None ->
+            val fresh: Buf[FAtom] = buf()
+
+            fb.cells.put(name, fresh)
+            fb.names.push(name)
+            fresh
+
+    var grew = false
+
+    for a in atoms
+        val k = s"$name|${a.key}"
+
+        if fb.members.has(k) then continue
+
+        // A parameter's path somewhere inside a value stands for every path it begins.
+        if !a.off.is_empty() && a.off[0].s == "~" && a.root.starts_with("p") &&
+           covered(&fb.members, s"~$name|${a.root}|", without_tilde(a.path))
+            continue
+
+        fb.members.put(k, true)
+        held.push(a)
+        fb.count += 1
+        grew = true
+
+    if grew && fb.read.has(name) then fb.changed = true
+end add_to
+
+// Notes what is kept: let out of the call, through anything that holds it.
+//
+// Where in a value a kept part sat says nothing more, and a parameter's path already kept, or one it
+// extends, holds this one too.
+private keep(fb: &FBody, atoms: Buf[FAtom])
+    var out: Buf[FAtom] = buf()
+
+    for a in atoms
+        if a.root.starts_with("p")
+            if !covered(&fb.members, s"K${a.root}|", without_tilde(a.path)) then out.push(atom(buf(), a.root, a.path))
+        else
+            out.push(atom(buf(), a.root, a.path))
+
+    add_to(fb, "$kept", out)
+end keep
+
+// -- atoms and paths ------------------------------------------------------------------------------
+
+private atom(off: Buf[FStep], root: string, path: Buf[FStep]) -> FAtom
+    val o = if off.len() > 1 then cut_offset(off) else off
+
+    FAtom(o, root, path, s"$root|${path_key(path)}|${path_key(o)}")
+end atom
+
+// **Where a part sits in a value is cut the way a path is** (M25): at the second step landing on a
+// type the offset already went through, it becomes "somewhere at or below the first" (`~`). A `~`
+// already stands for everything below it.
+private cut_offset(off: Buf[FStep]) -> Buf[FStep]
+    var out: Buf[FStep] = buf()
+
+    for i in 0..<off.len()
+        val st = off[i]
+
+        out.push(st)
+
+        if st.s == "~" then return out
+
+        if st.n != ""
+            for j in 0..<i
+                if off[j].n == st.n
+                    var cut: Buf[FStep] = buf()
+
+                    for k in 0..<j + 1
+                        cut.push(off[k])
+
+                    cut.push(FStep("~", ""))
+                    return cut
+                end if
+        end if
+
+    out
+end cut_offset
+
+private path_key(p: Buf[FStep]) -> string
+    var out = ""
+
+    for st in p
+        out = out + st.s
+
+        if st.n != "" then out = out + "@" + st.n
+
+    out
+end path_key
+
+// A path as a summary says it: the steps alone.
+fpa_path_text(p: Buf[FStep]) -> string
+    var out = ""
+
+    for st in p
+        out = out + st.s
+
+    out
+end fpa_path_text
+
+private one_step(s: string, n: string) -> Buf[FStep]
+    var out: Buf[FStep] = buf()
+
+    out.push(FStep(s, n))
+    out
+end one_step
+
+private concat(a: Buf[FStep], b: Buf[FStep]) -> Buf[FStep]
+    var out: Buf[FStep] = buf()
+
+    for st in a
+        out.push(st)
+
+    for st in b
+        out.push(st)
+
+    out
+end concat
+
+private tail(p: Buf[FStep]) -> Buf[FStep]
+    var out: Buf[FStep] = buf()
+
+    for i in 1..<p.len()
+        out.push(p[i])
+
+    out
+end tail
+
+// **One step further along a path, cut at the first type that repeats along it**: a step landing on a
+// struct or enum the path already went through goes back to where it first did. A path ending in `~`
+// already stands for everything below it.
+private extend(p: Buf[FStep], st: FStep) -> Buf[FStep]
+    var out: Buf[FStep] = buf()
+
+    if !p.is_empty() && p[p.len() - 1].s == "~"
+        for item in p
+            out.push(item)
+
+        return out
+    end if
+
+    var boxed = false
+
+    for item in p
+        out.push(item)
+
+        if st.n != "" && item.n == st.n then return out
+        if item.n.starts_with("&") then boxed = true
+
+    // **A path ends at the second box it enters** (`&T`): what is inside a box inside a box is the
+    // program's heap, followed as everything at or below where the path stands. Without it the paths
+    // into a large object graph -- an analysis's tables, each a box of boxes -- are finite but too
+    // many to follow.
+    out.push(if boxed && st.n.starts_with("&") then FStep("~", "") else st)
+    out
+end extend
+
+private without_tilde(p: Buf[FStep]) -> Buf[FStep]
+    if p.is_empty() || p[p.len() - 1].s != "~" then return p
+
+    var out: Buf[FStep] = buf()
+
+    for i in 0..<p.len() - 1
+        out.push(p[i])
+
+    out
+end without_tilde
+
+// **A variant's field is named by its position alone**, whichever variant holds it: an enum of a
+// hundred variants read field by field would otherwise multiply every path through it a hundredfold.
+// Two variants' fields at one position are one field to this analysis, which only answers more.
+private variant_step(k: usize) -> string = s".v$k"
+
+private is_field_step(s: string) -> bool = s.starts_with(".")
+
+private param_of(root: string) -> usize
+    var n: usize = 0
+    val b = root.bytes
+
+    for i in 1..<b.len
+        n = n * 10 + usize(b[i] - u8('0'))
+
+    n
+end param_of
+
+// The value one step into each atom: the field, element or pointee `st` names.
+private project(fb: &FBody, v: Buf[FAtom], st: FStep) -> Buf[FAtom]
+    var out: Buf[FAtom] = buf()
+
+    for a in v
+        project_one(fb, a, st, &out)
+
+    distinct(out)
+end project
+
+// Each atom once: a value reached two ways is still one value, and a step taken from both would take
+// it twice, and the next step four times.
+private distinct(v: Buf[FAtom]) -> Buf[FAtom]
+    if v.len() < 2 then return v
+
+    var seen: Map[string, bool] = map()
+    var out: Buf[FAtom] = buf()
+
+    for a in v
+        if !seen.has(a.key)
+            seen.put(a.key, true)
+            out.push(a)
+
+    out
+end distinct
+
+private project_one(fb: &FBody, a: FAtom, st: FStep, out: *Buf[FAtom])
+    if !a.off.is_empty()
+        val h = a.off[0]
+
+        if h.s == "~"
+            // Somewhere at or below here: still below, or exactly here and so stepped into.
+            out.push(a)
+
+            // A parameter's value is not followed into: what is there is anything at or below it.
+            if a.root.starts_with("p") then out.push(atom(buf(), a.root, extend(a.path, FStep("~", ""))))
+            else project_one(fb, atom(buf(), a.root, a.path), st, out)
+        else if h.s == st.s
+            out.push(atom(tail(a.off), a.root, a.path))
+        else if !is_field_step(h.s) || !is_field_step(st.s)
+            out.push(a)
+        end if
+
+        return
+    end if
+
+    if a.root.starts_with("p")
+        out.push(atom(buf(), a.root, extend(a.path, st)))
+    else if a.root == "g"
+        out.push(a)
+    else
+        // An address: what the storage it points at holds, at the place it points.
+        if st.s == "*"
+            for b in along(fb, cell(fb, a.root), a.path)
+                out.push(b)
+        else
+            // A step into an address that is not through it: typed code takes none, and the address is
+            // followed whole.
+            out.push(a)
+        end if
+    end if
+end project_one
+
+// The value along a path, a step at a time.
+private along(fb: &FBody, v: Buf[FAtom], p: Buf[FStep]) -> Buf[FAtom]
+    var cur = v
+
+    for st in p
+        cur = project(fb, cur, st)
+
+    cur
+end along
+
+// `along`, with the value at every beginning of the path kept for the next path to start from.
+private along_shared(fb: &FBody, v: Buf[FAtom], p: Buf[FStep], memo: *Map[string, Buf[FAtom]]) -> Buf[FAtom]
+    var cur = v
+    var key = ""
+
+    for st in p
+        key = key + st.s + "@" + st.n
+
+        memo.get(key) match
+            Some(got) -> cur = got
+            None ->
+                cur = project(fb, cur, st)
+                memo.put(key, cur)
+
+    cur
+end along_shared
+
+// The same atoms, sitting further into a value.
+private placed(v: Buf[FAtom], at: Buf[FStep]) -> Buf[FAtom]
+    if at.is_empty() then return v
+
+    var out: Buf[FAtom] = buf()
+
+    for a in v
+        out.push(atom(concat(at, a.off), a.root, a.path))
+
+    out
+end placed
+
+private placed_step(v: Buf[FAtom], s: string, n: string) -> Buf[FAtom] = placed(v, one_step(s, n))
+
+// Somewhere inside a value: what a call no body answers for may hand back.
+private anywhere_in(v: Buf[FAtom]) -> Buf[FAtom]
+    var out: Buf[FAtom] = buf()
+
+    for a in v
+        out.push(atom(one_step("~", ""), a.root, a.path))
+
+    out
+end anywhere_in
+
+private join_into(out: *Buf[FAtom], v: Buf[FAtom])
+    for a in v
+        out.push(a)
+end join_into
+
+// An address one step further into the storage it points at. A parameter's value stands for every
+// address inside what it points at.
+private addr_step(v: Buf[FAtom], st: FStep) -> Buf[FAtom]
+    var out: Buf[FAtom] = buf()
+
+    for a in v
+        if a.off.is_empty() && (a.root.starts_with("l:") || a.root.starts_with("h:"))
+            out.push(atom(buf(), a.root, extend(a.path, st)))
+        else
+            out.push(a)
+
+    out
+end addr_step
+
+// -- types ----------------------------------------------------------------------------------------
+
+// The struct or enum a step lands on, which is what a path is cut at.
+private nominal(t: Type) -> string = t match
+    Struct(d) -> last_segment(d.base)
+    Enum(d) -> last_segment(d.base)
+    Ptr(inner) -> pointer_nominal(*inner)
+    Ref(inner, _) -> pointer_nominal(*inner)
+    Weak(inner) -> pointer_nominal(*inner)
+    _ -> ""
+
+// A pointer to a struct or an enum is a type a path can repeat too: a field holding `&Type` inside a
+// `Type` reached through another such field.
+private pointer_nominal(inner: Type) -> string
+    val n = nominal(inner)
+
+    if n == "" then "" else "^" + n
+end pointer_nominal
+
+// A type's name without its module: two types of one name in two modules are cut as one, which only
+// cuts a path sooner.
+private last_segment(name: string) -> string
+    val b = name.bytes
+    var from: usize = 0
+
+    for i in 0..<b.len
+        if b[i] == u8('$') || b[i] == u8('.') then from = i + 1
+
+    if from == 0 then name else from_utf8_unchecked(b[from..<b.len])
+end last_segment
+
+private pointee_of(t: Type) -> Option[Type] = t match
+    Ptr(inner) -> Some(*inner)
+    Ref(inner, _) -> Some(*inner)
+    Weak(inner) -> Some(*inner)
+    Volatile(inner) -> pointee_of(*inner)
+    Slice(elem, _) -> Some(*elem)
+    _ -> None
+
+private is_ptr_type(t: Type) -> bool = t match
+    Ptr(_) -> true
+    _ -> false
+
+private is_array_t(t: Type) -> bool = t match
+    Array(_, _) -> true
+    _ -> false
+
+private deref_step(t: Type) -> FStep = t match
+    Ref(inner, _) -> FStep("*", "&" + nominal(*inner))
+    _ -> pointee_of(t) match
+        Some(inner) -> FStep("*", nominal(inner))
+        None -> FStep("*", "")
+
+// Whether a value of this type can hold an address: what a body passes around that is followed at all.
+// A string is not followed -- it outlives every frame -- nor is an integer, whatever it was made from.
+fpa_holds(fx: &Fpa, t: Type) -> bool = t match
+    Ptr(inner) -> !is_opaque_struct_t(*inner)
+    Trait(_, _, _) -> true
+    Abstract(_, _) -> true
+    Ref(_, _) -> true
+    Weak(inner) -> fpa_holds(fx, *inner)
+    Volatile(inner) -> fpa_holds(fx, *inner)
+    Array(_, elem) -> fpa_holds(fx, *elem)
+    Slice(_, _) -> true
+    Struct(d) -> aggregate_fpa_holds(fx, t, d.base)
+    Enum(d) -> aggregate_fpa_holds(fx, t, d.base)
+    _ -> false
+
+private is_opaque_struct_t(t: Type) -> bool = t match
+    Struct(d) -> d.opaque
+    _ -> false
+
+private aggregate_fpa_holds(fx: &Fpa, t: Type, base: string) -> bool
+    val key = type_show(t)
+
+    fx.holds.get(key) match
+        Some(v) -> return v
+        None -> ()
+
+    // Asked again while its own answer is being worked out, a type answers what its other fields say.
+    fx.holds.put(key, false)
+
+    val out = t match
+        Struct(d) -> any_field_holds(fx, d.fields)
+        Enum(d) ->
+            var found = false
+
+            for v in d.variants
+                if any_field_holds(fx, v.fields) then found = true
+
+            found
+        _ -> false
+
+    fx.holds.put(key, out)
+    out
+end aggregate_fpa_holds
+
+private any_field_holds(fx: &Fpa, fields: Buf[(string, Type)]) -> bool
+    for item in fields
+        if fpa_holds(fx, item.1) then return true
+
+    false
+end any_field_holds
+
+// -- expressions ----------------------------------------------------------------------------------
+
+private eval_block(fb: &FBody, b: TBlock) -> Buf[FAtom]
+    for s in b.stmts
+        eval_stmt(fb, s)
+
+    if b.result.is_some() then eval(fb, b.result.unwrap()) else buf()
+end eval_block
+
+private eval_stmts(fb: &FBody, stmts: Buf[TStmt])
+    for s in stmts
+        eval_stmt(fb, s)
+end eval_stmts
+
+private eval_opt_block(fb: &FBody, b: Option[TBlock]) -> Buf[FAtom] =
+    if b.is_some() then eval_block(fb, b.unwrap()) else buf()
+
+private eval_stmt(fb: &FBody, s: TStmt)
+    s match
+        TVarDecl(name, ty, init, _) ->
+            val v = eval(fb, init)
+
+            if fpa_holds(fb.fx, ty) then add_to(fb, s"l:$name", v)
+        TExprStmt(e) -> eval(fb, e)
+        TInvariant(cond, _) -> eval(fb, cond)
+        TVariantCheck(slot, _, e) -> add_to(fb, s"l:$slot", eval(fb, e))
+        TRefDecl(name, _, place) ->
+            fb.refs.put(name, place)
+            addr(fb, place)
+        TWriteStmt(w) -> store(fb, w.place, eval(fb, w.value))
+        TMultiAssign(writes) ->
+            var vals: Buf[Buf[FAtom]] = buf()
+
+            for w in writes
+                vals.push(eval(fb, w.value))
+
+            for i in 0..<writes.len()
+                store(fb, writes[i].place, vals[i])
+        TReturn(value) -> if value.is_some() then add_to(fb, "$ret", eval(fb, value.unwrap()))
+        TBecome(call) -> add_to(fb, "$ret", eval(fb, call))
+        TBreak(value, _) -> if value.is_some() then add_to(fb, "$brk", eval(fb, value.unwrap()))
+        TDefer(stmts, _) -> eval_stmts(fb, stmts)
+        _ -> ()
+end eval_stmt
+
+// What a value may be made of, with every store and call on the way noted.
+private eval(fb: &FBody, e: TExpr) -> Buf[FAtom]
+    val v = eval_kind(fb, e)
+
+    if v.is_empty() then v else if fpa_holds(fb.fx, texpr_type(e)) then distinct(v) else buf()
+end eval
+
+private eval_kind(fb: &FBody, e: TExpr) -> Buf[FAtom] = *e.kind match
+    TLoad(name, _) -> fb.refs.get(name) match
+        Some(place) -> eval(fb, place)
+        None -> copy_of(cell(fb, s"l:$name"))
+    TGlobal(_, ty, _) -> if fpa_holds(fb.fx, ty) then single(atom(buf(), "g", buf())) else buf()
+    TAddrOf(place, _) -> addr(fb, place)
+    TTempAddr(value, _) ->
+        val name = s"l:$$t${e.span.start}.${e.span.end}"
+
+        add_to(fb, name, eval(fb, value))
+        single(atom(buf(), name, buf()))
+    TDeref(op, _) -> project(fb, eval(fb, op), deref_step(texpr_type(op)))
+    TField(recv, index, ty) ->
+        val rt = texpr_type(recv)
+        var v = eval(fb, recv)
+
+        if pointee_of(rt).is_some() && !is_slice_t(rt) then v = project(fb, v, deref_step(rt))
+
+        project(fb, v, FStep(s".$index", nominal(ty)))
+    TIndex(recv, index, ty) ->
+        eval(fb, index)
+
+        val rt = texpr_type(recv)
+        val v = eval(fb, recv)
+
+        if is_array_t(rt) then project(fb, v, FStep("[]", nominal(ty)))
+        else project(fb, v, FStep("*", nominal(ty)))
+    TSlice(base, lo, hi, _, _) ->
+        if lo.is_some() then eval(fb, lo.unwrap())
+        if hi.is_some() then eval(fb, hi.unwrap())
+
+        val bt = texpr_type(base)
+
+        if is_array_t(bt) then addr_step(addr(fb, base), FStep("[]", "")) else eval(fb, base)
+    TBox(value, _) ->
+        val name = s"h:${e.span.start}.${e.span.end}"
+
+        add_to(fb, name, eval(fb, value))
+        single(atom(buf(), name, buf()))
+    TBufLit(elems, _) -> fresh_of(fb, e, eval_all(fb, elems))
+    TBufFill(value, count, _) ->
+        eval(fb, count)
+        fresh_of(fb, e, eval(fb, value))
+    TStructNew(_, args) ->
+        var out: Buf[FAtom] = buf()
+
+        for k in 0..<args.len()
+            join_into(&out, placed_step(eval(fb, args[k]), s".$k", nominal(texpr_type(args[k]))))
+
+        made(fb, e, out)
+    TEnumNew(_, variant, args) ->
+        var out: Buf[FAtom] = buf()
+
+        for k in 0..<args.len()
+            join_into(&out, placed_step(eval(fb, args[k]), variant_step(k), nominal(texpr_type(args[k]))))
+
+        made(fb, e, out)
+    TArrayLit(elems, _) -> placed_step(eval_all(fb, elems), "[]", "")
+    TArrayFill(value, _) -> placed_step(eval(fb, value), "[]", "")
+    TStore(place, value, _, yields) ->
+        val v = eval(fb, value)
+
+        store(fb, place, v)
+        if yields then v else buf()
+    TUpdate(place, _, value, _, _, _, _) ->
+        val v = eval(fb, value)
+        val old = eval(fb, place)
+
+        store(fb, place, v)
+
+        var out = copy_of(old)
+
+        join_into(&out, v)
+        out
+    TSlots(op, args, _, _) ->
+        val vals = eval_each(fb, args)
+
+        if op == "slot_storage" then fresh_of(fb, e, buf())
+        else
+            if op == "slot_place" && vals.len() > 2 then store_at(fb, vals[0], vals[2])
+
+            buf()
+    TAtomic(_, address, ops, _, _, _) ->
+        val at = eval(fb, address)
+        val vals = eval_all(fb, ops)
+
+        store_at(fb, at, vals)
+
+        var out = project(fb, at, deref_step(texpr_type(address)))
+
+        join_into(&out, vals)
+        out
+    TCall(name, args, _, _) -> call(fb, e, name, eval_each(fb, args))
+    TVCall(recv, slot, args, ty, _) -> vcall(fb, recv, slot, eval_each(fb, args), ty)
+    TCallPtr(callee, args, _, _) ->
+        eval(fb, callee)
+        anywhere_in(eval_all(fb, args))
+    TStep(task, wake) ->
+        eval(fb, task)
+        keep(fb, eval(fb, wake))
+        buf()
+    TPark(register) ->
+        keep(fb, eval(fb, register))
+        buf()
+    TTry(operand, ok, _, _, _, _, _) ->
+        val v = eval(fb, operand)
+
+        add_to(fb, "$ret", anywhere_in(v))
+        project(fb, v, FStep(variant_step(0), ""))
+    TSeq(exprs) ->
+        var last: Buf[FAtom] = buf()
+
+        for x in exprs
+            last = eval(fb, x)
+
+        last
+    TIf(cond, then_block, else_block, _) ->
+        eval_conds(fb, cond)
+
+        var out = eval_block(fb, then_block)
+
+        join_into(&out, eval_opt_block(fb, else_block))
+        out
+    TMatch(scrutinee, arms, _) ->
+        val st = texpr_type(scrutinee)
+        var v = eval(fb, scrutinee)
+        var out: Buf[FAtom] = buf()
+
+        for arm in arms
+            var sv = v
+
+            if !arm.patterns.is_empty() && pointee_of(st).is_some() && !is_slice_t(st) &&
+               pointee_of(tpattern_type(arm.patterns[0])).is_none()
+                sv = project(fb, v, deref_step(st))
+
+            for p in arm.patterns
+                bind(fb, p, sv)
+
+            if arm.guard.is_some() then eval(fb, arm.guard.unwrap())
+
+            join_into(&out, eval_block(fb, arm.body))
+
+        out
+    TBlockExpr(block) -> eval_block(fb, block)
+    TWhile(cond, body, else_block, _) ->
+        eval_conds(fb, cond)
+        eval_stmts(fb, body)
+        loop_result(fb, else_block)
+    TDoWhile(body, cond, else_block, _) ->
+        eval_stmts(fb, body)
+        eval(fb, cond)
+        loop_result(fb, else_block)
+    TLoop(body, _) ->
+        eval_stmts(fb, body)
+        loop_result(fb, None)
+    TFor(_, _, lo, hi, _, body, else_block, _) ->
+        eval(fb, lo)
+        eval(fb, hi)
+        eval_stmts(fb, body)
+        loop_result(fb, else_block)
+    TCFor(init, cond, step, body, else_block, _) ->
+        eval_stmts(fb, init)
+        if cond.is_some() then eval(fb, cond.unwrap())
+        eval_stmts(fb, body)
+        eval_stmts(fb, step)
+        loop_result(fb, else_block)
+    TForEach(name, elem_ty, seq, body, else_block, _) ->
+        val st = texpr_type(seq)
+        val v = eval(fb, seq)
+
+        if fpa_holds(fb.fx, elem_ty)
+            val elems = if is_array_t(st) then project(fb, v, FStep("[]", nominal(elem_ty)))
+            else if pointee_of(st).is_some() then project(fb, v, FStep("*", nominal(elem_ty)))
+            else reachable(fb, v)
+
+            add_to(fb, s"l:$name", elems)
+        end if
+
+        eval_stmts(fb, body)
+        loop_result(fb, else_block)
+    TIterate(cursor, _, init, next, pattern, body, else_block, _) ->
+        add_to(fb, s"l:$cursor", eval(fb, init))
+
+        val got = eval(fb, next)
+
+        add_to(fb, s"l:$cursor", reachable(fb, got))
+        bind(fb, pattern, got)
+        eval_stmts(fb, body)
+        loop_result(fb, else_block)
+    TQuantifier(_, _, _, lo, hi, _, pred) ->
+        eval(fb, lo)
+        eval(fb, hi)
+        eval(fb, pred)
+        buf()
+    TCheckedLoop(_, _, loop_expr) -> eval(fb, loop_expr)
+    TCast(operand, _) -> eval(fb, operand)
+    TFuncAddr(_, _, _) -> buf()
+    _ ->
+        var out: Buf[FAtom] = buf()
+
+        for c in texpr_children(e)
+            join_into(&out, eval(fb, c))
+
+        out
+end eval_kind
+
+private is_slice_t(t: Type) -> bool = t match
+    Slice(_, _) -> true
+    _ -> false
+
+private single(a: FAtom) -> Buf[FAtom]
+    var out: Buf[FAtom] = buf()
+
+    out.push(a)
+    out
+end single
+
+private copy_of(v: Buf[FAtom]) -> Buf[FAtom]
+    var out: Buf[FAtom] = buf()
+
+    join_into(&out, v)
+    out
+end copy_of
+
+private eval_all(fb: &FBody, es: Buf[TExpr]) -> Buf[FAtom]
+    var out: Buf[FAtom] = buf()
+
+    for x in es
+        join_into(&out, eval(fb, x))
+
+    out
+end eval_all
+
+private eval_each(fb: &FBody, es: Buf[TExpr]) -> Buf[Buf[FAtom]]
+    var out: Buf[Buf[FAtom]] = buf()
+
+    for x in es
+        out.push(eval(fb, x))
+
+    out
+end eval_each
+
+// A value constructed: in place, or -- a type with a destructor, whose construction yields `&T` -- in
+// a heap object made here.
+private made(fb: &FBody, e: TExpr, parts: Buf[FAtom]) -> Buf[FAtom] = texpr_type(e) match
+    Ref(_, _) -> fresh_of(fb, e, parts)
+    _ -> parts
+
+// A heap object made here, holding `held` as what it points at.
+private fresh_of(fb: &FBody, e: TExpr, held: Buf[FAtom]) -> Buf[FAtom]
+    val name = s"h:${e.span.start}.${e.span.end}"
+
+    add_to(fb, name, held)
+    single(atom(buf(), name, buf()))
+end fresh_of
+
+// What a loop yields: whatever any `break` in the body carried, or its `else`.
+private loop_result(fb: &FBody, else_block: Option[TBlock]) -> Buf[FAtom]
+    var out = copy_of(cell(fb, "$brk"))
+
+    join_into(&out, eval_opt_block(fb, else_block))
+    out
+end loop_result
+
+private eval_conds(fb: &FBody, terms: Buf[TCondTerm])
+    for t in terms
+        t match
+            TCondTest(c) -> eval(fb, c)
+            TCondIs(subject, patterns, _) ->
+                val st = texpr_type(subject)
+                var v = eval(fb, subject)
+
+                if !patterns.is_empty() && pointee_of(st).is_some() && !is_slice_t(st) &&
+                   pointee_of(tpattern_type(patterns[0])).is_none()
+                    v = project(fb, v, deref_step(st))
+
+                for p in patterns
+                    bind(fb, p, v)
+end eval_conds
+
+// Everything a value may reach: itself anywhere inside, and what any address it holds points at.
+private reachable(fb: &FBody, v: Buf[FAtom]) -> Buf[FAtom]
+    var out: Buf[FAtom] = buf()
+    var seen: Map[string, bool] = map()
+    var work = copy_of(v)
+    var at: usize = 0
+
+    while at < work.len()
+        val a = work[at]
+
+        at += 1
+
+        if seen.has(a.key) then continue
+
+        seen.put(a.key, true)
+
+        if a.root.starts_with("p")
+            out.push(atom(buf(), a.root, extend(a.path, FStep("~", ""))))
+        else if a.root.starts_with("l:") || a.root.starts_with("h:")
+            out.push(atom(buf(), a.root, a.path))
+
+            for b in cell(fb, a.root)
+                work.push(b)
+        end if
+
+    out
+end reachable
+
+// The names a pattern binds, each to the part of the value it matched.
+private bind(fb: &FBody, p: TPattern, v: Buf[FAtom])
+    p match
+        TBindPattern(name, ty) -> if fpa_holds(fb.fx, ty) then add_to(fb, s"l:$name", v)
+        TAtPattern(name, inner) ->
+            add_to(fb, s"l:$name", v)
+            bind(fb, *inner, v)
+        TVariantPattern(_, variant, args) ->
+            for k in 0..<args.len()
+                bind(fb, args[k], project(fb, v, FStep(variant_step(k), nominal(tpattern_type(args[k])))))
+        TStructPattern(_, args) ->
+            for k in 0..<args.len()
+                bind(fb, args[k], project(fb, v, FStep(s".$k", nominal(tpattern_type(args[k])))))
+        _ -> ()
+end bind
+
+// -- places ---------------------------------------------------------------------------------------
+
+// The addresses a place may be at.
+private addr(fb: &FBody, place: TExpr) -> Buf[FAtom] = *place.kind match
+    TLoad(name, _) -> fb.refs.get(name) match
+        Some(p) -> addr(fb, p)
+        None -> single(atom(buf(), s"l:$name", buf()))
+    TGlobal(_, _, _) -> single(atom(buf(), "g", buf()))
+    TField(recv, index, ty) ->
+        val rt = texpr_type(recv)
+        val st = FStep(s".$index", nominal(ty))
+
+        if pointee_of(rt).is_some() && !is_slice_t(rt) then addr_step(eval(fb, recv), st)
+        else addr_step(addr(fb, recv), st)
+    TIndex(recv, index, ty) ->
+        eval(fb, index)
+
+        if is_array_t(texpr_type(recv)) then addr_step(addr(fb, recv), FStep("[]", nominal(ty)))
+        else eval(fb, recv)
+    TDeref(op, _) -> eval(fb, op)
+    _ -> eval(fb, place)
+end addr
+
+// A value stored into a place.
+private store(fb: &FBody, place: TExpr, v: Buf[FAtom])
+    val at = addr(fb, place)
+
+    if !v.is_empty() then store_at(fb, at, v)
+end store
+
+// A value stored at each address: into what a local or a heap object holds there, through a
+// parameter, or into module storage.
+private store_at(fb: &FBody, at: Buf[FAtom], v: Buf[FAtom])
+    if v.is_empty() then return
+
+    for a in at
+        // An address somewhere inside a value is at least that value's own storage, or storage
+        // reached from it: stored into anywhere there.
+        val inside = !a.off.is_empty() && a.off[0].s == "~"
+
+        if !a.off.is_empty() && !inside
+            keep(fb, v)
+        else if a.root.starts_with("l:") || a.root.starts_with("h:")
+            add_to(fb, a.root, if inside then anywhere_in(v) else placed(v, a.path))
+        else if a.root.starts_with("p")
+            // Stored through a parameter, which is the caller's to place; a value of the parameter
+            // stored back into what it points at is not kept by that.
+            var out: Buf[FAtom] = buf()
+
+            for b in v
+                if b.root != a.root
+                    if !b.root.starts_with("p") || !covered(&fb.members, s"T${a.root}|${b.root}|", without_tilde(b.path))
+                        out.push(atom(buf(), b.root, b.path))
+
+            add_to(fb, s"$$thr${param_of(a.root)}", out)
+        else
+            keep(fb, v)
+end store_at
+
+// -- calls ----------------------------------------------------------------------------------------
+
+// A call by name: its summary applied to the arguments, or its declaration where no body is in sight.
+private call(fb: &FBody, e: TExpr, name: string, argv: Buf[Buf[FAtom]]) -> Buf[FAtom]
+    fb.fx.index.get(name) match
+        Some(i) -> return apply(fb, e, fb.fx.sums[i], argv)
+        None -> ()
+
+    fb.fx.an.tables.externs.get(name) match
+        Some(d) ->
+            var out: Buf[FAtom] = buf()
+
+            for k in 0..<argv.len()
+                if k < d.params.len() && holds_string(d.keeps, d.params[k].name) then keep(fb, argv[k])
+                if k < d.params.len() && holds_string(d.answers, d.params[k].name) then join_into(&out, anywhere_in(argv[k]))
+
+            return out
+        None -> ()
+
+    var out: Buf[FAtom] = buf()
+
+    for v in argv
+        join_into(&out, anywhere_in(v))
+
+    out
+end call
+
+// A summary applied at a call: what it keeps of each argument is kept, what it writes through one
+// argument is stored where that argument points, and its answer is made of the arguments where the
+// summary says. A heap object the call made is one object per call site, holding everything the
+// summary places inside one.
+private apply(fb: &FBody, e: TExpr, sum: &FpaSum, argv: Buf[Buf[FAtom]]) -> Buf[FAtom]
+    val t0 = monotonic().us
+    val r = apply_inner(fb, e, sum, argv)
+    val dt = monotonic().us - t0
+
+    if fpa_tracing() && dt > 50000
+        var na = 0
+
+        for v in argv
+            na += int(v.len())
+
+        eprints(s"FPA-APPLY ${fb.f.name} at ${e.span.start} us $dt size ${sum.size} argatoms $na\n")
+    end if
+
+    r
+end apply
+
+private apply_inner(fb: &FBody, e: TExpr, sum: &FpaSum, argv: Buf[Buf[FAtom]]) -> Buf[FAtom]
+    val blob = s"h:c${e.span.start}.${e.span.end}"
+    var out: Buf[FAtom] = buf()
+    val n = if argv.len() < sum.kept.len() then argv.len() else sum.kept.len()
+
+    for k in 0..<n
+        // The paths of one parameter share their beginnings, so each is followed once.
+        var memo: Map[string, Buf[FAtom]] = map()
+
+        for p in sum.kept[k]
+            keep(fb, along_shared(fb, argv[k], p, &memo))
+
+        for item in sum.answers[k]
+            val got = along_shared(fb, argv[k], item.0, &memo)
+
+            if has_deref(item.1) then add_to(fb, blob, anywhere_in(got)) else join_into(&out, placed(got, item.1))
+
+    for w in sum.writes
+        if w.0 < argv.len() && w.1 < argv.len()
+            store_at(fb, argv[w.0], anywhere_in(along(fb, argv[w.1], w.2)))
+
+    for o in sum.fresh
+        if has_deref(o)
+            add_to(fb, blob, single(atom(one_step("~", ""), blob, buf())))
+        else
+            out.push(atom(o, blob, buf()))
+
+    out
+end apply_inner
+
+private has_deref(p: Buf[FStep]) -> bool
+    for st in p
+        if st.s == "*" then return true
+
+    false
+end has_deref
+
+// A call through an object, answered by the object's type: a callable keeps what its type marks
+// `@keeps`, any other trait what its method declares `@keeps` -- every argument where the call
+// answers a task. The answer may be made of any argument, or of what the object holds.
+private vcall(fb: &FBody, recv: TExpr, slot: int, argv: Buf[Buf[FAtom]], ty: Type) -> Buf[FAtom]
+    val rv = eval(fb, recv)
+    val rt = texpr_type(recv)
+    var assocs: Buf[(string, Type)] = buf()
+    var callable = false
+
+    erased_trait(rt) match
+        Some(Trait(name, _, marks)) ->
+            callable = is_call_trait(module_bare(name))
+            assocs = marks
+        _ -> ()
+
+    val task = task_result(ty).is_some()
+    var out = anywhere_in(reachable(fb, rv))
+
+    for k in 0..<argv.len()
+        val kept = if callable then marks_kept(assocs, k) else task || object_declares_kept(fb.fx.an, rt, slot, k + 1)
+
+        if kept then keep(fb, argv[k])
+
+        join_into(&out, anywhere_in(argv[k]))
+
+    out
+end vcall
+
+// -- answers --------------------------------------------------------------------------------------
+
+private fpa_index(fx: &Fpa, name: string) -> Option[usize]
+    fx.index.get(name) match
+        Some(i) -> return Some(i)
+        None -> ()
+
+    for i in 0..<fx.funcs.len()
+        if fx.funcs[i].name.ends_with(s".$name") then return Some(i)
+
+    None
+end fpa_index
+
+// Whether `name` keeps its parameter `i` itself, or a field of it held in place -- what the keeps
+// analysis asks (`keeps.sysl`'s `keeps_of`): a path with no `*` on it, or a store of it through
+// another parameter.
+fpa_keeps(fx: &Fpa, name: string, i: usize) -> bool
+    val fi = fpa_index(fx, name)
+
+    if fi.is_none() then return false
+
+    val sum = fx.sums[fi.unwrap()]
+
+    if i < sum.kept.len()
+        for p in sum.kept[i]
+            if !has_deref(p) then return true
+
+    fpa_writes(fx, name, i)
+end fpa_keeps
+
+// Whether `name` stores its parameter `i` through another parameter, and nothing more.
+fpa_writes(fx: &Fpa, name: string, i: usize) -> bool
+    val fi = fpa_index(fx, name)
+
+    if fi.is_none() then return false
+
+    for w in fx.sums[fi.unwrap()].writes
+        if w.1 == i && !has_deref(w.2) then return true
+
+    false
+end fpa_writes
+
+// Whether `name` lets out anything of parameter `i`: the value, or anything read through it.
+fpa_lets_out(fx: &Fpa, name: string, i: usize) -> bool
+    val fi = fpa_index(fx, name)
+
+    if fi.is_none() then return false
+
+    val sum = fx.sums[fi.unwrap()]
+
+    if i < sum.kept.len() && !sum.kept[i].is_empty() then return true
+
+    for w in sum.writes
+        if w.1 == i then return true
+
+    false
+end fpa_lets_out
+
+// Whether what `name` answers can be made of parameter `i` itself: a path with no `*` on it.
+fpa_answers(fx: &Fpa, name: string, i: usize) -> bool
+    val fi = fpa_index(fx, name)
+
+    if fi.is_none() then return false
+
+    val sum = fx.sums[fi.unwrap()]
+
+    if i < sum.answers.len()
+        for item in sum.answers[i]
+            if !has_deref(item.0) then return true
+
+    false
+end fpa_answers
+
+// Whether `name` answers parameter `i` only from inside a heap object it made.
+fpa_answers_boxed(fx: &Fpa, name: string, i: usize) -> bool
+    val fi = fpa_index(fx, name)
+
+    if fi.is_none() then return false
+
+    val sum = fx.sums[fi.unwrap()]
+
+    if i < sum.answers.len()
+        for item in sum.answers[i]
+            if has_deref(item.1) then return true
+
+    false
+end fpa_answers_boxed
+
+// The paths `name` keeps of parameter `i`, in order, as `ε` for the value itself.
+fpa_kept_text(fx: &Fpa, name: string, i: usize) -> string
+    val fi = fpa_index(fx, name)
+
+    if fi.is_none() then return "?"
+
+    val sum = fx.sums[fi.unwrap()]
+    var parts: Buf[string] = buf()
+
+    if i < sum.kept.len()
+        for p in sum.kept[i]
+            parts.push(shown_path(p))
+
+    for w in sum.writes
+        if w.1 == i then parts.push(s"${shown_path(w.2)}>p${w.0}")
+
+    sorted_text(parts)
+end fpa_kept_text
+
+// Where `name`'s answer holds parameter `i`, as `path@offset`.
+fpa_answers_text(fx: &Fpa, name: string, i: usize) -> string
+    val fi = fpa_index(fx, name)
+
+    if fi.is_none() then return "?"
+
+    val sum = fx.sums[fi.unwrap()]
+    var parts: Buf[string] = buf()
+
+    if i < sum.answers.len()
+        for item in sum.answers[i]
+            parts.push(s"${shown_path(item.0)}@${shown_path(item.1)}")
+
+    sorted_text(parts)
+end fpa_answers_text
+
+// What a local of `name` may point to once its body has settled, which is the per-expression answer
+// for every read of it.
+fpa_local_text(fx: &Fpa, name: string, local: string) -> string
+    val fi = fpa_index(fx, name)
+
+    if fi.is_none() then return "?"
+
+    val fb = settle_body(fx, fx.funcs[fi.unwrap()])
+
+    atoms_text(cell(fb, s"l:$local"))
+end fpa_local_text
+
+// What the answer of `name` may point to.
+fpa_result_text(fx: &Fpa, name: string) -> string
+    val fi = fpa_index(fx, name)
+
+    if fi.is_none() then return "?"
+
+    val fb = settle_body(fx, fx.funcs[fi.unwrap()])
+
+    atoms_text(cell(fb, "$ret"))
+end fpa_result_text
+
+private atoms_text(v: Buf[FAtom]) -> string
+    var parts: Buf[string] = buf()
+
+    for a in v
+        val root = if a.root.starts_with("h:") then "heap"
+        else if a.root.starts_with("l:") then s"&${local_name(a.root)}"
+        else a.root
+
+        val path = if a.path.is_empty() then "" else fpa_path_text(a.path)
+        val off = if a.off.is_empty() then "" else s"@${fpa_path_text(a.off)}"
+
+        parts.push(root + path + off)
+
+    sorted_text(parts)
+end atoms_text
+
+private local_name(root: string) -> string
+    val b = root.bytes
+
+    from_utf8_unchecked(b[2..<b.len])
+end local_name
+
+private shown_path(p: Buf[FStep]) -> string = if p.is_empty() then "ε" else fpa_path_text(p)
+
+private sorted_text(parts: Buf[string]) -> string
+    var out = ""
+
+    for x in sorted_labels(parts)
+        if out != "" then out = out + " "
+
+        out = out + x
+
+    out
+end sorted_text
+
+// How many walks the analysis took, all bodies together.
+fpa_walks(fx: &Fpa) -> int = fx.walks
+
+// -- held to the keeps analysis -------------------------------------------------------------------
+
+// Whether `SYSL_FPA_COMPARE=1` asks for the comparison with the keeps analysis.
+private fpa_tracing() -> bool = get("SYSL_FPA_TRACE").unwrap_or("") == "1"
+
+fpa_comparing() -> bool = get("SYSL_FPA_COMPARE").unwrap_or("") == "1"
+
+// **Every place this analysis and the keeps analysis (`keeps.sysl`) answer differently**, as
+// `<kind> <function>|<position>`, over every parameter that can hold an address. The kinds say which
+// side keeps or answers and the likely reason: a value kept only inside a heap object the function
+// answers (`boxed-answer`, the M24 rule), a closure body, a store through another parameter. A
+// parameter both keep, where this one keeps only some of its fields, is said as `field-narrowed`.
+fpa_compare(cx: &KeepsCx, fx: &Fpa) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for f in fx.funcs
+        if cx.mistaken.has(f.name) || fx.mistaken.has(f.name) then continue
+
+        for i in 0..<f.params.len()
+            if !may_hold_pointer(cx, f.params[i].1) then continue
+
+            val at = s"${f.name}|$i"
+            val ok = keeps_of(cx, f.name, i).kept
+            val nk = fpa_keeps(fx, f.name, i)
+
+            if ok && !nk
+                val why = if fpa_answers_boxed(fx, f.name, i) then "boxed-answer"
+                else if is_closure_body(f) then "closure"
+                else "other"
+
+                out.push(s"keeps-old-only:$why $at")
+            else if nk && !ok
+                val why = if fpa_writes(fx, f.name, i) then "through-param"
+                else if is_closure_body(f) then "closure"
+                else "other"
+
+                out.push(s"keeps-new-only:$why $at")
+            else if ok && field_narrowed(fx, f.name, i)
+                out.push(s"agree:field-narrowed $at")
+            end if
+
+            if !may_hold_pointer(cx, f.ret_ty) then continue
+
+            val oa = answers_of(cx, f.name, i)
+            val na = fpa_answers(fx, f.name, i)
+
+            if oa && !na then out.push(s"answers-old-only $at")
+            if na && !oa then out.push(s"answers-new-only $at")
+
+    out
+end fpa_compare
+
+// Whether every path kept of a parameter is a field of it held in place, none the value whole.
+private field_narrowed(fx: &Fpa, name: string, i: usize) -> bool
+    val fi = fpa_index(fx, name)
+
+    if fi.is_none() then return false
+
+    val sum = fx.sums[fi.unwrap()]
+
+    if i >= sum.kept.len() || sum.kept[i].is_empty() || fpa_writes(fx, name, i) then return false
+
+    for p in sum.kept[i]
+        if p.is_empty() || has_deref(p) then return false
+
+    true
+end field_narrowed
+
+// The comparison said on standard error: each disagreement, then how many of each kind.
+fpa_report(lines: Buf[string])
+    var kinds: Buf[string] = buf()
+    var counts: Map[string, int] = map()
+
+    for line in lines
+        eprints(s"FPA-DIFF $line\n")
+
+        val kind = first_word(line)
+
+        counts.get(kind) match
+            Some(n) -> counts.put(kind, n + 1)
+            None ->
+                kinds.push(kind)
+                counts.put(kind, 1)
+
+    for k in sorted_labels(kinds)
+        eprints(s"FPA-SUMMARY $k=${counts.get(k).unwrap_or(0)}\n")
+end fpa_report
+
+private first_word(line: string) -> string
+    val b = line.bytes
+
+    for i in 0..<b.len
+        if b[i] == u8(' ') then return from_utf8_unchecked(b[0..<i])
+
+    line
+end first_word
+
+// The comparison of one compilation, from the outside: what a test asks of a source.
+fpa_disagreements(a: &Analysis, funcs: Buf[TFunc]) -> Buf[string] =
+    fpa_compare(settled_keeps(a, funcs, reached_vtables(a)), fpa_analyze(a, funcs))
