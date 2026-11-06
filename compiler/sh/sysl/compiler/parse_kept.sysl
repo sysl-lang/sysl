@@ -1,0 +1,113 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Source
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+import sysl.fs.is_file
+import sysl.text.{from_utf8_unchecked, str_builder}
+
+// A package's files parsed once and kept, in a process that compiles the same files again and again --
+// `sysl lsp`, which analyzes the whole compilation on every keystroke.
+//
+// **A parse is a function of the file's text and of what gates it**: the target, which every `#if`
+// on a machine asks, and the `#if` symbols and option lines the file's package hands it (`parse`). So
+// a kept parse is answered for a file exactly when all four are what they were, and the text is
+// compared whole rather than through a digest that could collide. The text is what the compilation
+// read -- the editor's where the editor holds the file, the disk's otherwise -- so an edit, a save
+// from another program and a `git checkout` are all a changed text, and nothing has to be told.
+//
+// **A file is kept under its name, one parse a name**, so a changed text replaces what the old one
+// left, and a file that is gone -- deleted, or renamed to another name -- is let go of by
+// `prune_kept_parses` rather than lingering for the life of the process. What it cannot do is serve a
+// file that is not there: a compilation only asks for the files its walk found.
+//
+// A build keeps nothing and pays one test of a flag per file.
+
+// One file's parse, and everything it was a function of.
+private struct KeptParse
+    gate: string
+    text: string
+    parsed: Parsed
+end KeptParse
+
+private var keeping_parses: bool = false
+private var kept_parses: Map[string, KeptParse] = map()
+private var kept_parse_hits: usize = 0
+private var kept_parse_misses: usize = 0
+
+// Whether `parse_kept` keeps what it parses. Either way the parses kept so far are let go of and the
+// counts start again.
+keep_parses(on: bool)
+    keeping_parses = on
+    kept_parses = map()
+    kept_parse_hits = 0
+    kept_parse_misses = 0
+end keep_parses
+
+// `src` parsed for `t` with its package's `#if` symbols and option lines, as `parse` parses it --
+// answered from what an earlier compilation parsed where the text and the gating are unchanged.
+parse_kept(src: Source, t: Target, features: Buf[string], options: Buf[string]) -> Parsed
+    if !keeping_parses then return parse(src, t, features, options)
+
+    val gate = parse_gate(t, features, options)
+    val text = from_utf8_unchecked(src.bytes)
+
+    kept_parses.get(src.name) match
+        Some(k) ->
+            if k.gate == gate && k.text == text
+                kept_parse_hits += 1
+                return k.parsed
+            end if
+        None -> ()
+
+    val parsed = parse(src, t, features, options)
+
+    kept_parse_misses += 1
+    kept_parses.put(src.name, KeptParse(gate, text, parsed))
+    parsed
+end parse_kept
+
+// What a parse is gated by besides its text, as one string: the target's name, then each symbol and
+// each option line, each closed by a byte no name or line holds.
+private parse_gate(t: Target, features: Buf[string], options: Buf[string]) -> string
+    var b = str_builder()
+
+    b.push(t.name)
+    b.push("\u{1}")
+
+    for f in features
+        b.push(f)
+        b.push("\u{1}")
+
+    b.push("\u{2}")
+
+    for o in options
+        b.push(o)
+        b.push("\u{1}")
+
+    b.finish()
+end parse_gate
+
+// Every kept parse of a file that is neither on the disk nor held by an editor let go of: a file
+// deleted, or renamed away from the name it was kept under.
+prune_kept_parses()
+    if kept_parses.is_empty() then return
+
+    var gone: Buf[string] = buf()
+
+    for (name, _) in kept_parses
+        if !is_file(name) && editor_text(name).is_none() then gone.push(name)
+
+    for name in gone
+        kept_parses.remove(name)
+end prune_kept_parses
+
+// How many files have a parse kept -- what a test of the keeping's bound reads.
+kept_parse_count() -> usize = kept_parses.len()
+
+// How many times `parse_kept` answered with a kept parse, and how many times it parsed, since the
+// keeping was last switched: the tests' evidence of which files a compilation read afresh, which a
+// clock cannot give on a loaded machine.
+kept_parse_hit_count() -> usize = kept_parse_hits
+
+kept_parse_miss_count() -> usize = kept_parse_misses
