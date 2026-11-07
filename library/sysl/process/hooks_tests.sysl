@@ -2,6 +2,7 @@ module sysl.process
 @requires(posix)
 @tests
 
+import sysl.buf.{Buf, buf}
 import sysl.fs.{IoError, append, create, make_temp_dir, read_text, remove_dir_all}
 
 // What `sysl.process` does over `sysl.process.sys`'s hooks on a hosted target, where
@@ -89,6 +90,118 @@ hk_both_streams_to_an_open_file()
 
     remove_dir_all(dir)
 end hk_both_streams_to_an_open_file
+
+@test("a file opened to append, with a write pending, takes both streams once each after it")
+hk_appended_file_with_pending_write_takes_both_streams_once()
+    val dir = scratch()
+    val listing = s"$dir/listing.txt"
+
+    run("echo", ["first"], stdout = Stdio.ToPath(listing)).unwrap()
+
+    var log = append(listing).unwrap()
+
+    log.write("between\n".bytes)
+    run("sh", ["-c", "echo second; echo third >&2"], stdout = Stdio.ToFile(log),
+        stderr = Stdio.ToFile(log)).unwrap()
+    log.close().unwrap()
+
+    assert_eq(read_text(listing).unwrap(), "first\nbetween\nsecond\nthird\n")
+
+    remove_dir_all(dir)
+end hk_appended_file_with_pending_write_takes_both_streams_once
+
+@test("an open file as standard output alone takes the pending bytes and the output, not the errors")
+hk_open_file_as_stdout_only()
+    val dir = scratch()
+    val log = s"$dir/log.txt"
+    var f = append(log).unwrap()
+
+    f.write("before\n".bytes)
+    run("sh", ["-c", "echo out; echo err >&2"], stdout = Stdio.ToFile(f),
+        stderr = Stdio.ToPath(s"$dir/err.txt")).unwrap()
+    f.write("after\n".bytes)
+    f.close().unwrap()
+
+    assert_eq(read_text(log).unwrap(), "before\nout\nafter\n")
+    assert_eq(read_text(s"$dir/err.txt").unwrap(), "err\n")
+
+    remove_dir_all(dir)
+end hk_open_file_as_stdout_only
+
+@test("an open file as standard error alone takes the pending bytes and the errors, not the output")
+hk_open_file_as_stderr_only()
+    val dir = scratch()
+    val log = s"$dir/log.txt"
+    var f = append(log).unwrap()
+
+    f.write("before\n".bytes)
+    run("sh", ["-c", "echo out; echo err >&2"], stdout = Stdio.ToPath(s"$dir/out.txt"),
+        stderr = Stdio.ToFile(f)).unwrap()
+    f.write("after\n".bytes)
+    f.close().unwrap()
+
+    assert_eq(read_text(log).unwrap(), "before\nerr\nafter\n")
+    assert_eq(read_text(s"$dir/out.txt").unwrap(), "out\n")
+
+    remove_dir_all(dir)
+end hk_open_file_as_stderr_only
+
+@test("two open files, one per stream, each take their own pending bytes once and their own stream")
+hk_two_open_files_one_per_stream()
+    val dir = scratch()
+    var o = append(s"$dir/o.txt").unwrap()
+    var e = append(s"$dir/e.txt").unwrap()
+
+    o.write("o-before\n".bytes)
+    e.write("e-before\n".bytes)
+    run("sh", ["-c", "echo out; echo err >&2"], stdout = Stdio.ToFile(o),
+        stderr = Stdio.ToFile(e)).unwrap()
+    o.close().unwrap()
+    e.close().unwrap()
+
+    assert_eq(read_text(s"$dir/o.txt").unwrap(), "o-before\nout\n")
+    assert_eq(read_text(s"$dir/e.txt").unwrap(), "e-before\nerr\n")
+
+    remove_dir_all(dir)
+end hk_two_open_files_one_per_stream
+
+@test("both streams to paths of their own: each file holds its stream once")
+hk_both_streams_to_paths()
+    val dir = scratch()
+
+    run("sh", ["-c", "echo out; echo err >&2"], stdout = Stdio.ToPath(s"$dir/o.txt"),
+        stderr = Stdio.ToPath(s"$dir/e.txt")).unwrap()
+
+    assert_eq(read_text(s"$dir/o.txt").unwrap(), "out\n")
+    assert_eq(read_text(s"$dir/e.txt").unwrap(), "err\n")
+
+    remove_dir_all(dir)
+end hk_both_streams_to_paths
+
+@test("a pending write larger than the file's buffer is handed over once, whole, before the child's output")
+hk_large_pending_write_handed_over_once()
+    val dir = scratch()
+    val log = s"$dir/log.txt"
+    var f = create(log).unwrap()
+    var big: Buf[u8] = buf()
+
+    for i in 0..<100000
+        big.push(u8('a') + u8(i % 26))
+
+    f.write("head\n".bytes)
+    f.write(big.view())
+    run("sh", ["-c", "echo; echo out; echo err >&2"], stdout = Stdio.ToFile(f),
+        stderr = Stdio.ToFile(f)).unwrap()
+    f.close().unwrap()
+
+    val text = read_text(log).unwrap()
+
+    assert_eq(text.len, 5 + 100000 + 1 + 4 + 4)
+    assert(text.starts_with("head\nabc"), "the pending bytes did not come first")
+    assert(text.ends_with("cd\nout\nerr\n"), "the child's output did not follow the pending bytes")
+
+    remove_dir_all(dir)
+end hk_large_pending_write_handed_over_once
 
 @test("a path that cannot be opened is an error and nothing is started")
 hk_unopenable_path_starts_nothing()
