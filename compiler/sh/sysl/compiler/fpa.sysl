@@ -137,7 +137,8 @@ fpa_analyze(a: &Analysis, funcs: Buf[TFunc]) -> &Fpa
     for i in 0..<funcs.len()
         if !index.has(funcs[i].name) then index.put(funcs[i].name, i)
 
-    val fx = Fpa(a, funcs, index, buf(), map(), map(), 0, fpa_tracing(), map(), map(), map(), map(), map(), map(), map(), map())
+    // One box every walk shares, so the walk counter a cell's `read` is stamped with is one count.
+    val fx: &Fpa = Fpa(a, funcs, index, buf(), map(), map(), 0, fpa_tracing(), map(), map(), map(), map(), map(), map(), map(), map())
 
     // The steps every walk takes, first, so the constants below name them.
     step_in(fx, "~", "")
@@ -568,7 +569,8 @@ private cell_of(fb: &FBody, name: string) -> &FCell
         Some(c) -> return c
         None -> ()
 
-    val c = FCell(buf(), map(), map(), 0)
+    // The box the table holds is the one handed back, so a read stamped on it here is seen there.
+    val c: &FCell = FCell(buf(), map(), map(), 0)
 
     fb.cells.put(name, c)
     fb.names.push(name)
@@ -1501,6 +1503,13 @@ private eval_kind(fb: &FBody, e: TExpr) -> Buf[FAtom] = *e.kind match
         fb.driven.put(node_id(task), true)
         eval(fb, task)
     TFuncAddr(_, _, _) -> buf()
+
+    // Bytes made into a string in place have left the call: a string outlives every frame
+    // (`escape.sysl`'s `carries_view`), so what they view is kept, and the string holds nothing to
+    // follow.
+    TStrView(v) ->
+        keep(fb, eval(fb, v))
+        buf()
     _ ->
         var out: Buf[FAtom] = buf()
 
@@ -1891,8 +1900,8 @@ end fpa_keeps
 
 // **Whether `name` lets what parameter `i` holds outlive the call** -- what the escape analysis asks
 // of a view (`escape.sysl`'s `kept_by`): a path of it kept, or stored through another parameter,
-// that stays out of a box. What is inside a box is one heap cell (M28), never the caller's storage,
-// and a view put into a heap object the call answers is handed back, not kept.
+// that stays out of a box, or handed back inside a heap object the call made. What is inside a box
+// is one heap cell (M28), never the caller's storage.
 fpa_lets_out_whole(fx: &Fpa, name: string, i: usize) -> bool
     val fi = fx.index.get(name)
 
@@ -1910,6 +1919,13 @@ fpa_lets_out_whole(fx: &Fpa, name: string, i: usize) -> bool
 
     for w in sum.writes
         if w.1 == i && !has_box_step(w.2) then return true
+
+    // Handed back inside a heap object the call made -- a closure's environment, a box -- is out of
+    // the escape analysis's sight: it follows a view through what a value holds in place, never into a
+    // `&T` or a `&Fn` (`carries_view`), so the caller could not see the view leave with the object.
+    if i < sum.answers.len()
+        for item in sum.answers[i]
+            if has_deref(item.1) && !has_box_step(item.0) then return true
 
     false
 end fpa_lets_out_whole

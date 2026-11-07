@@ -181,6 +181,52 @@ esc_a_tuple_is_a_carrier()
     esc_prints(src, "42 1\n")
 end esc_a_tuple_is_a_carrier
 
+// **A view a callee hands back inside a heap object it made leaves with the object**, which this
+// analysis does not look inside: a box and a closure's environment are both out of its sight, so the
+// caller's array is promoted where the view is handed over. The cells: a `&T` box, a closure
+// capturing the parameter, and the same box handed back only to be read in the frame, which promotes
+// too -- the analysis cannot tell the two apart from the call.
+@test("a view a callee puts in a box it answers moves the caller's array, the box returned further")
+esc_boxed_answer_returned()
+    esc_moves(raw"""
+        struct H
+            v: []u8
+        wrap(v: []u8) -> &H = H(v)
+        leak() -> &H
+            var a: [4]u8 = [1, 2, 3, 4]
+            wrap(a[..])
+        deeper(n: int) -> int
+            var pad: [64]u8 = [0; 64]
+            if n == 0 then int(pad[0]) else deeper(n - 1) + int(pad[1])
+        val h = leak()
+        print(deeper(8), h.v[3])
+        """, "0 4\n")
+
+@test("a view a callee's closure captures moves the caller's array, the closure returned further")
+esc_closure_answer_returned()
+    esc_moves(raw"""
+        cap(v: []u8) -> &Fn() -> int = () -> int(v[2])
+        leak() -> &Fn() -> int
+            var a: [4]u8 = [1, 2, 3, 4]
+            cap(a[..])
+        deeper(n: int) -> int
+            var pad: [64]u8 = [0; 64]
+            if n == 0 then int(pad[0]) else deeper(n - 1) + int(pad[1])
+        val f = leak()
+        print(deeper(8), f())
+        """, "0 3\n")
+
+@test("a view a callee puts in a box it answers moves the caller's array even where the box stays in the frame")
+esc_boxed_answer_kept_local()
+    esc_moves(raw"""
+        struct H
+            v: []u8
+        wrap(v: []u8) -> &H = H(v)
+        var a: [4]u8 = [1, 2, 3, 4]
+        val h = wrap(a[..])
+        print(h.v[1])
+        """, "2\n")
+
 @test("and so is one slot of a multi-result list, which is not a tuple at all")
 esc_one_slot_of_a_multi_result_list()
     val src = raw"""
