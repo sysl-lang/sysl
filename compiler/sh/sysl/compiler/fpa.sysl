@@ -518,12 +518,16 @@ end summarize_lent
 
 // What the answer is made of: a parameter's value where it sits, and through each heap object it
 // holds, what that object holds, one `*` further in. Inside a heap object the place is the object
-// itself, whatever deeper: its interior is one cell (M28).
+// itself, whatever deeper: its interior is one cell (M28) -- except a raw-pointer or view field of a
+// heap object the answer holds in place, which keeps its place (`.0*.0`), with the object it points at
+// one `*` further in (M40).
 private answer_from(fb: &FBody, sum: &FpaSum, atoms: Buf[FAtom], prefix: Buf[FStep], seen: *Map[string, bool])
     val inside = has_deref(prefix)
+    val first = inside && first_inside(prefix)
 
     for a in atoms
-        val o = if inside then prefix else concat(prefix, a.off)
+        val at_raw = first && a.off.len() == 1 && is_raw_field_step(a.off[0])
+        val o = if at_raw then concat(prefix, a.off) else if inside then prefix else concat(prefix, a.off)
 
         if a.root.starts_with("p")
             sum_answer(fb.fx, sum, param_of(a.root), a.pid, a.path, o)
@@ -533,7 +537,7 @@ private answer_from(fb: &FBody, sum: &FpaSum, atoms: Buf[FAtom], prefix: Buf[FSt
             if !seen.has(a.root)
                 seen.put(a.root, true)
 
-                val deeper = if inside then o else concat(o, one_step(star_step()))
+                val deeper = if inside && !at_raw then o else concat(o, one_step(star_step()))
 
                 answer_from(fb, sum, cell(fb, a.root), deeper, seen)
             end if
@@ -785,9 +789,11 @@ private cut_offset(off: Buf[FStep]) -> Buf[FStep]
 
         if st.s == "~" then return out
 
-        if st.n != ""
+        val key = cut_key(st.n)
+
+        if key != ""
             for j in 0..<i
-                if off[j].n == st.n
+                if cut_key(off[j].n) == key
                     var cut: Buf[FStep] = buf()
 
                     for k in 0..<j + 1
@@ -850,11 +856,12 @@ private extend(p: Buf[FStep], st: FStep) -> Buf[FStep]
     if ends_whole(p) then return p
 
     var out: Buf[FStep] = buf()
+    val key = cut_key(st.n)
 
     for item in p
         out.push(item)
 
-        if st.n != "" && item.n == st.n then return out
+        if key != "" && cut_key(item.n) == key then return out
 
     out.push(st)
     out
@@ -868,6 +875,9 @@ private ends_whole(p: Buf[FStep]) -> bool
 
     last.s == "~" || is_box_step(last)
 end ends_whole
+
+// A field step onto a raw pointer or a view (`field_nominal`).
+private is_raw_field_step(st: FStep) -> bool = is_field_step(st.s) && st.n.starts_with("#")
 
 // The step into a `&T` box (`deref_step`).
 private is_box_step(st: FStep) -> bool = st.s == "*" && st.n.starts_with("&")
@@ -1063,6 +1073,23 @@ private nominal(t: Type) -> string = t match
     Ref(inner, _) -> pointer_nominal(*inner)
     Weak(inner) -> pointer_nominal(*inner)
     _ -> ""
+
+// The type a field step lands on, marked `#` where the field is a raw pointer or a view: the one kind
+// of field whose place is kept inside a heap object a call answers (M40, `answer_from`). The mark is
+// not part of the type a path is cut at (`cut_key`).
+private field_nominal(t: Type) -> string = t match
+    Ptr(_) -> "#" + nominal(t)
+    Slice(_, _) -> "#" + nominal(t)
+    _ -> nominal(t)
+
+// The type a step lands on, as a path is cut at it: without a raw field's `#`.
+private cut_key(n: string) -> string
+    if !n.starts_with("#") then return n
+
+    val b = n.bytes
+
+    from_utf8_unchecked(b[1..<b.len])
+end cut_key
 
 // A pointer to a struct or an enum is a type a path can repeat too: a field holding `&Type` inside a
 // `Type` reached through another such field.
@@ -1371,7 +1398,7 @@ private eval_kind(fb: &FBody, e: TExpr) -> Buf[FAtom] = *e.kind match
 
         if pointee_of(rt).is_some() && !is_slice_t(rt) then v = project(fb, v, deref_step(fb, rt))
 
-        project(fb, v, step(fb, s".$index", nominal(ty)))
+        project(fb, v, step(fb, s".$index", field_nominal(ty)))
     TIndex(recv, index, ty) ->
         eval(fb, index)
 
@@ -1400,14 +1427,14 @@ private eval_kind(fb: &FBody, e: TExpr) -> Buf[FAtom] = *e.kind match
         var out: Buf[FAtom] = buf()
 
         for k in 0..<args.len()
-            join_into(&out, placed_step(fb, eval(fb, args[k]), s".$k", nominal(texpr_type(args[k]))))
+            join_into(&out, placed_step(fb, eval(fb, args[k]), s".$k", field_nominal(texpr_type(args[k]))))
 
         made(fb, e, out)
     TEnumNew(_, variant, args) ->
         var out: Buf[FAtom] = buf()
 
         for k in 0..<args.len()
-            join_into(&out, placed_step(fb, eval(fb, args[k]), variant_step(variant, k), nominal(texpr_type(args[k]))))
+            join_into(&out, placed_step(fb, eval(fb, args[k]), variant_step(variant, k), field_nominal(texpr_type(args[k]))))
 
         made(fb, e, out)
     TArrayLit(elems, _) -> placed_step(fb, eval_all(fb, elems), "[]", "")
@@ -1469,7 +1496,7 @@ private eval_kind(fb: &FBody, e: TExpr) -> Buf[FAtom] = *e.kind match
         val v = eval(fb, operand)
 
         add_to(fb, "$ret", anywhere_in(fb, v))
-        project(fb, v, step(fb, variant_step(ok, 0), nominal(ty)))
+        project(fb, v, step(fb, variant_step(ok, 0), field_nominal(ty)))
     TSeq(exprs) ->
         var last: Buf[FAtom] = buf()
 
@@ -1695,14 +1722,14 @@ private bind(fb: &FBody, p: TPattern, v: Buf[FAtom], vt: Type)
             for k in 0..<args.len()
                 val ft = field_type(variant.fields, k, tpattern_type(args[k]))
 
-                bind(fb, args[k], project(fb, sv, step(fb, variant_step(variant, k), nominal(ft))), ft)
+                bind(fb, args[k], project(fb, sv, step(fb, variant_step(variant, k), field_nominal(ft))), ft)
         TStructPattern(decl, args) ->
             val sv = through_pointer(fb, v, vt)
 
             for k in 0..<args.len()
                 val ft = field_type(decl.fields, k, tpattern_type(args[k]))
 
-                bind(fb, args[k], project(fb, sv, step(fb, s".$k", nominal(ft))), ft)
+                bind(fb, args[k], project(fb, sv, step(fb, s".$k", field_nominal(ft))), ft)
         _ -> ()
 end bind
 
@@ -1723,7 +1750,7 @@ private addr(fb: &FBody, place: TExpr) -> Buf[FAtom] = *place.kind match
     TGlobal(_, _, _) -> single(atom(fb, buf(), "g", buf()))
     TField(recv, index, ty) ->
         val rt = texpr_type(recv)
-        val st = step(fb, s".$index", nominal(ty))
+        val st = step(fb, s".$index", field_nominal(ty))
 
         if pointee_of(rt).is_some() && !is_slice_t(rt) then addr_step(fb, eval(fb, recv), st)
         else addr_step(fb, addr(fb, recv), st)
@@ -1900,16 +1927,18 @@ private apply_inner(fb: &FBody, e: TExpr, sum: &FpaSum, args: Buf[TExpr], argv: 
         for p in sum.lent[k]
             lend(fb, summary_along(fb, argv[k], p, &memo))
 
-        // What the answer cannot hold by its type is not answered (M35); a path through a box reaches
-        // what the box holds, whose type is not the argument's, and is left as the summary says.
+        // What the answer cannot hold by its type is not answered (M35). A path through a pointer is
+        // left as the summary says: through a box it reaches what the box holds, whose type is not the
+        // argument's, and a raw pointer may point into a box too -- `Buf`'s `&*self.core` is the
+        // address of its core's interior, and its storage is read through it.
         val fits = k >= args.len() || fits_at(fb.fx, e, k, ty, texpr_type(args[k]))
 
         for item in sum.answers[k]
-            if !fits && !has_box_step(item.0) then continue
+            if !fits && !has_deref(item.0) then continue
 
             val got = summary_along(fb, argv[k], item.0, &memo)
 
-            if has_deref(item.1) then add_to(fb, blob, anywhere_in(fb, got)) else join_into(&out, placed(fb, got, item.1))
+            if has_deref(item.1) then into_made(fb, blob, item.1, got) else join_into(&out, placed(fb, got, item.1))
 
     // Each place written is stored into once, with everything written there: the places reached along
     // different paths are often one place -- a box's whole interior above all.
@@ -1942,13 +1971,41 @@ private apply_inner(fb: &FBody, e: TExpr, sum: &FpaSum, args: Buf[TExpr], argv: 
         store_at(fb, single(places[i]), distinct(held[i]))
 
     for o in sum.fresh
-        if has_deref(o)
-            add_to(fb, blob, single(atom(fb, one_step(tilde_step()), blob, buf())))
+        val k = inside_kind(o)
+
+        if k.0 == 0 then out.push(atom(fb, o, blob, buf()))
+        else if k.0 == 1 then raw_object(fb, blob, o, k.1)
+        else if k.0 == 2
+            val inner = raw_object(fb, blob, o, k.1)
+
+            add_to(fb, inner, single(atom(fb, one_step(tilde_step()), inner, buf())))
         else
-            out.push(atom(fb, o, blob, buf()))
+            add_to(fb, blob, single(atom(fb, one_step(tilde_step()), blob, buf())))
+        end if
 
     out
 end apply_inner
+
+// **What a call's answer holds inside a heap object it made, placed in the caller** (M40). The
+// objects a call makes are one heap cell, `blob`, except what a raw-pointer or view field of one of
+// them points at -- a `Buf` core's storage -- which is a cell of its own, held at that field: a value
+// at the field sits there, one inside what it points at sits anywhere in that cell, and anything
+// else anywhere in `blob`.
+private into_made(fb: &FBody, blob: string, off: Buf[FStep], v: Buf[FAtom])
+    val k = inside_kind(off)
+
+    if k.0 == 1 then add_to(fb, blob, placed(fb, v, one_step(off[k.1 - 1])))
+    else if k.0 == 2 then add_to(fb, raw_object(fb, blob, off, k.1), anywhere_in(fb, v))
+    else add_to(fb, blob, anywhere_in(fb, v))
+end into_made
+
+// The cell of what the raw field at `off`'s first `n` steps points at, held in `blob` at that field.
+private raw_object(fb: &FBody, blob: string, off: Buf[FStep], n: usize) -> string
+    val name = s"$blob#${path_id(fb.fx, prefix_of(off, n))}"
+
+    add_to(fb, blob, single(atom(fb, one_step(off[n - 1]), name, buf())))
+    name
+end raw_object
 
 // **What a summary's path names in an argument.** A path that stops inside a box (M28) names the box's
 // whole interior at every depth, so in the caller it is what the interior holds, each part sitting
@@ -1977,6 +2034,45 @@ private has_box_step(p: Buf[FStep]) -> bool
 
     false
 end has_box_step
+
+// Whether a place in an answer is just inside a heap object the answer holds in place: its one `*` is
+// its last step.
+private first_inside(p: Buf[FStep]) -> bool
+    if p.is_empty() || p[p.len() - 1].s != "*" then return false
+
+    for i in 0..<p.len() - 1
+        if p[i].s == "*" then return false
+
+    true
+end first_inside
+
+// **Where in a call's answer a place inside a heap object sits** (M40), with the length of the place
+// of the raw field it is at or under: `0` held in place, outside every heap object; `1` at a raw
+// field of a heap object held in place (`q*f`); `2` inside what that field points at (`q*f*`); `3`
+// anywhere else inside the object.
+private inside_kind(p: Buf[FStep]) -> (int, usize)
+    for i in 0..<p.len()
+        if p[i].s == "*"
+            if i + 1 < p.len() && is_raw_field_step(p[i + 1])
+                if i + 2 == p.len() then return (1, i + 2)
+                if p[i + 2].s == "*" then return (2, i + 2)
+            end if
+
+            return (3, 0)
+        end if
+
+    (0, 0)
+end inside_kind
+
+// The prefix of a path, its first `n` steps.
+private prefix_of(p: Buf[FStep], n: usize) -> Buf[FStep]
+    var out: Buf[FStep] = buf()
+
+    for i in 0..<n
+        out.push(p[i])
+
+    out
+end prefix_of
 
 private has_deref(p: Buf[FStep]) -> bool
     for st in p

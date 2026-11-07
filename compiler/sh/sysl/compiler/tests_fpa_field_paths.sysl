@@ -124,13 +124,13 @@ fpa_object_marked()
 
 // -- a view in a heap object handed back (M24) -----------------------------------------------------
 
-@test("a view put into a heap object the function answers is lent back, not kept, and sits one '*' in")
+@test("a view put into a heap object the function answers is lent back, not kept, and sits at its field one '*' in")
 fpa_view_boxed_answer()
     val fx = fpa_of("struct H\n    v: []u8\n\nwrap(v: []u8) -> &H = H(v)\n\n" +
                     "main()\n    var a: [4]u8 = [1, 2, 3, 4]\n    val h = wrap(a[..])\n    spare = int(h.v[0])\n")
 
     assert_eq(fpa_kept_text(fx, "wrap", 0), "")
-    assert_eq(fpa_answers_text(fx, "wrap", 0), "ε@*")
+    assert_eq(fpa_answers_text(fx, "wrap", 0), "ε@*.0")
     assert(fpa_answers_boxed(fx, "wrap", 0))
 
     // The escape analysis does not follow a view into a box, so to it the view has left the call.
@@ -151,14 +151,14 @@ fpa_view_boxed_kept()
 
     assert_eq(fpa_kept_text(fx, "wrap", 0), "ε")
 
-@test("a pointer put in an answered box is lent back by both analyses, and this one says where the box holds it")
+@test("a pointer put in an answered box is lent back by both analyses, and this one says which field of the box holds it")
 fpa_view_boxed_agrees()
     val text = "struct H\n    v: *int\n\nwrap(v: *int) -> &H = H(v)\n\nmain()\n    held = wrap(&spare).v\n"
     val fx = fpa_of(text)
 
     assert_eq(fpa_diffs(text), "")
     assert_eq(fpa_kept_text(fx, "wrap", 0), "")
-    assert_eq(fpa_answers_text(fx, "wrap", 0), "ε@*")
+    assert_eq(fpa_answers_text(fx, "wrap", 0), "ε@*.0")
     assert(fpa_answers_boxed(fx, "wrap", 0))
 
 // -- stores through another parameter --------------------------------------------------------------
@@ -280,6 +280,65 @@ fpa_dest_buffer_kept()
 
     assert(fpa_keeps(fx, "stash", 0))
     assert(!fpa_keeps(fx, "scratch", 0))
+
+// A buffer a call makes is two heap objects in the caller, the box and the storage its raw field
+// points at (M40), so a store into a slot of a fresh buffer lands in its storage, never on what the
+// elements copied into it point at. The cells cross what the slot is filled with (an element read out
+// of a parameter's buffer, a value built from another parameter), how deep the buffer sits (a buffer
+// of buffers, whose inner buffers are the parameter's own and so ARE written through), and an object
+// a call makes that holds a parameter's pointer at a raw field (written through where it points).
+
+private val fpa_rebuilds: string = "struct K\n    p: *int\n\nenum Ty\n    Plain\n    Ptr(inner: &Ty)\n" +
+    "    Pack(es: Buf[Ty])\n    Leaf(k: &K)\n\n" +
+    "rebuild(t: Ty, x: *int) -> Ty = t match\n    Ptr(inner) -> Ptr(rebuild(*inner, x))\n" +
+    "    Pack(es) -> Pack(rebuild_list(es, x))\n    Leaf(_) -> Leaf(K(x))\n    _ -> t\n\n" +
+    "rebuild_list(ts: Buf[Ty], x: *int) -> Buf[Ty]\n    var out: Buf[Ty] = buf()\n\n" +
+    "    for item in ts\n        out.push(rebuild(item, x))\n\n    out\n\n"
+
+@test("a value pushed into a fresh buffer that holds a parameter's elements lands in its storage, not on the elements")
+fpa_fresh_buffer_slot()
+    val got = fpa_with_library_after("import sysl.buf.{Buf, buf}\n\n", fpa_rebuilds +
+                                     "main()\n    val t = rebuild(Ptr(Plain), &spare)\n    val l = rebuild_list(buf(), &spare)\n")
+
+    if got.is_none() then return
+
+    val fx = got.unwrap()
+
+    assert_eq(fpa_kept_text(fx, "rebuild_list", 1), "")
+    assert_eq(fpa_kept_text(fx, "rebuild", 1), "")
+    assert(!fpa_writes(fx, "rebuild_list", 1))
+    assert(fpa_answers_boxed(fx, "rebuild_list", 1))
+
+@test("a slot of a fresh buffer of a parameter's inner buffers is the parameter's storage, and is written through")
+fpa_fresh_buffer_nested()
+    val got = fpa_with_library_after("import sysl.buf.{Buf, buf}\n\n",
+                                     "alias_slot(ts: Buf[Buf[*int]], x: *int)\n    var out: Buf[Buf[*int]] = buf()\n\n" +
+                                     "    for item in ts\n        out.push(item)\n\n    out[0][0] = x\n\n" +
+                                     "fresh_slot(ts: Buf[Buf[*int]], x: *int)\n    var out: Buf[Buf[*int]] = buf()\n\n" +
+                                     "    for item in ts\n        out.push(item)\n\n    var inner: Buf[*int] = buf()\n\n" +
+                                     "    inner.push(x)\n    out[0] = inner\n\n" +
+                                     "grab(ts: Buf[*int])\n    for item in ts\n        held = item\n\n" +
+                                     "main()\n    alias_slot(buf(), &spare)\n    fresh_slot(buf(), &spare)\n    grab(buf())\n")
+
+    if got.is_none() then return
+
+    val fx = got.unwrap()
+
+    // A buffer's elements are read through `&*self.core`, a raw pointer into the core's box, so the
+    // answer's type is no reason to drop them (M35): the loop sees them, and so does a store into one.
+    assert(fpa_lets_out(fx, "grab", 0))
+    assert(fpa_writes(fx, "alias_slot", 1))
+    assert(!fpa_writes(fx, "fresh_slot", 1))
+    assert_eq(fpa_kept_text(fx, "fresh_slot", 1), "")
+
+@test("a parameter's pointer held at a raw field of a box a call makes is stored through where it points")
+fpa_fresh_box_raw_field()
+    val fx = fpa_of(fpa_handles + "make_bp(q: **int) -> &Bp = Bp(q)\n\n" +
+                    "put_made(q: **int, x: *int)\n    val b = make_bp(q)\n\n    *b.q = x\n\n" +
+                    "main()\n    var s: *int = &spare\n    put_made(&s, &spare)\n")
+
+    assert(fpa_writes(fx, "put_made", 1))
+    assert_eq(fpa_kept_text(fx, "put_made", 1), "ε>p0")
 
 // -- what a value may point to ---------------------------------------------------------------------
 
