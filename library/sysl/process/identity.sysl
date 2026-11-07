@@ -1,6 +1,7 @@
 module sysl.process
 @requires(posix)
 
+import sysl.buf.{Buf, buf}
 import sysl.fs.{IoError, from_status}
 import sysl.sys.UNSUPPORTED
 import sysl.process.sys as psys
@@ -132,3 +133,45 @@ resident_bytes(pid: int) -> Result[u64, IoError]
 
     if code < 0 then Err(from_status(code)) else Ok(bytes)
 end resident_bytes
+
+private listed(which: int, id: int) -> Result[Buf[int], IoError]
+    if id <= 0 then return Err(IoError.Other(22))
+
+    var found: Buf[int] = buf()
+    var room: usize = 64
+
+    loop
+        found.reserve(room)
+
+        val n = psys.list(which, i64(id), as_mut_ptr(found.spare()), room)
+
+        if n < 0 then return Err(from_status(int(n)))
+
+        if usize(n) <= room
+            found.set_len(usize(n))
+            return Ok(found)
+
+        room = usize(n) + 16
+    end loop
+end listed
+
+/** The live processes whose process group is `pgid`, as pids: macOS's `proc_listpids` with
+ * `PROC_PGRP_ONLY`, Linux's `/proc/<n>/stat` scanned for the group field. A child that has exited but
+ * has not been waited for yet is still listed, as `ps` lists it; once `wait_pid` has reaped it, it is not.
+ *
+ * **A group nothing is in, or one that has ended, answers `Ok` with an empty buffer**, and so does a
+ * group the program may not see. **A `pgid` of zero or less fails** with `Other(22)` (`EINVAL`). The
+ * answer is a snapshot: a process may have exited or started by the time it is read. A target with no
+ * processes fails with `UNSUPPORTED`'s error.
+ */
+group_members(pgid: int) -> Result[Buf[int], IoError] = listed(psys.list_group, pgid)
+
+/** The live processes whose parent is `pid`, as pids, found as `group_members` finds a group's. This
+ * program's own children are `children(int(pid()))`, one per `start`, `spawn` or `run` not yet waited
+ * for, and not the children's own children.
+ *
+ * **A parent with no children, or one that is gone, answers `Ok` with an empty buffer.** **A `pid` of zero
+ * or less fails** with `Other(22)`. The answer is a snapshot, and a target with no processes fails with
+ * `UNSUPPORTED`'s error.
+ */
+children(pid: int) -> Result[Buf[int], IoError] = listed(psys.list_children, pid)

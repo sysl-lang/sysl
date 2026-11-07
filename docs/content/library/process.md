@@ -595,6 +595,46 @@ true
 has), with `NotPermitted` for one the program may not look at, and for a pid of zero or less. A target with no way to ask fails with
 `UNSUPPORTED`'s error.
 
+## Who is in a group, and whose child a process is
+
+**`group_members(pgid)` lists the live processes in a process group, and `children(pid)` the live
+processes whose parent is `pid`**, each as a `Buf[int]` of pids in a `Result` (macOS's `proc_listpids`,
+Linux's `/proc/<n>/stat`). `children(int(pid()))` is this program's own children and not their children.
+A child started with the default `Group.Inherit` is in this program's group, so it is listed in
+`group_members(process_group())`; one started with `Group.New` leads a group of its own, numbered by its
+pid, and a `Group.Join` child is listed in the group it joined:
+
+```sysl
+import sysl.process.{Group, children, group_members, pid, spawn, wait_pid}
+import sysl.slices.contains
+
+val job = spawn("sleep", ["5"], group = Group.New).unwrap()
+val id = job.pid()
+
+print(contains(children(int(pid())).unwrap().view(), id))
+print(group_members(job.group()).unwrap().len())
+
+job.kill(9).unwrap()
+job.detach()
+wait_pid(id).unwrap()
+
+print(group_members(id).unwrap().len())
+print(children(0).is_err())
+```
+
+```output
+true
+1
+0
+true
+```
+
+**A group or parent nothing is in, one that has ended, and one the program may not see all answer `Ok`
+with an empty buffer**; a `pgid` or `pid` of zero or less fails with `Other(22)`. A child that has
+exited is still listed until it is waited for, as `ps` lists it. **The answer is a snapshot**: a process
+may have exited or started by the time it is read. A target with no way to ask fails with `UNSUPPORTED`'s
+error.
+
 ## Becoming another program
 
 **`exec` replaces this program with another, in the same process**, and answers only if that failed:
