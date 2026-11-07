@@ -819,8 +819,8 @@ through `index_place_mut`, since a container that wrote one has something to do 
 ```sysl
 import sysl.buf.{Buf, buf}
 
-var reads = 0
-var writes = 0
+static var reads = 0
+static var writes = 0
 
 struct Logged
     cells: Buf[int]
