@@ -3,8 +3,9 @@ module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
 import sysl.env.{get as env_var}
-import sysl.fs.{append_text, make_dir_all, make_temp_dir, metadata, read_text, remove_dir_all, walk, write_text}
-import sysl.process.capture
+import sysl.fs.{append_text, make_dir_all, make_temp_dir, metadata, read_text, remove_dir_all, remove_file, walk,
+                write_text}
+import sysl.process.{capture, pid}
 import sysl.text.{replace_all, split, str_builder, Search}
 
 // The site's executable documentation, run against this compiler.
@@ -268,10 +269,15 @@ end docs_compile
 // that comes back, or dies of anything else, under an `output trap` one. The trap's own message goes
 // to standard error, which is not compared.
 //
+// **It runs in `home`, a directory of its own sweep's**, never the test process's: a block that
+// names a file by a relative path would otherwise share it with the same block run at once by the
+// other sweep, and each would read the other's writes.
+//
 // **A page's block is what `sysl run` makes of it**, so it is built in `run`'s mode -- debug, where a
 // plain integer overflow stops the program -- and not in the release mode a test process's own builds
 // default to.
-private docs_prints(src: string, exe: string, b: DocsBlock, where: string) -> Option[string]
+private docs_prints(src: string, exe: string, home: string, b: DocsBlock,
+                    where: string) -> Option[string]
     use_command_mode("run")
 
     val built = build_native_program(src, None, None, DefaultOptimization, Some(exe))
@@ -283,7 +289,7 @@ private docs_prints(src: string, exe: string, b: DocsBlock, where: string) -> Op
             return Some(s"$where: expected it to run, but it did not compile:\n${failure_text(why)}")
         Ok(_) -> ()
 
-    capture(exe, [], "", [], true) match
+    capture(exe, [], home, [], true) match
         Err(_) -> return Some(s"$where: expected it to run, and the program could not be started")
         Ok(said) ->
             val ended = shell_status(said.status)
@@ -341,7 +347,10 @@ private rgp_checked(program: string, under: string) -> Option[string]
 
     write_text(src, program).unwrap()
 
-    val said = docs_check(src, s"$dir/program", s"$dir/program.a", rgp_block(program, under))
+    make_dir_all(s"$dir/home").unwrap()
+
+    val said = docs_check(src, s"$dir/program", s"$dir/program.a", s"$dir/home",
+                          rgp_block(program, under))
 
     remove_dir_all(dir).unwrap_or(())
     said
@@ -436,6 +445,39 @@ rgp_an_unmarked_trap_fails()
     assert_eq(said, "p.md, sysl block 1: expected it to run, but it trapped (exit status 133) — a block " +
                     "that traps says so with 'output trap'")
 
+// -- where a block runs ----------------------------------------------------------------------------
+
+// The output sweep and the leak sweep run the same block at the same time, so a block that names a
+// file by a relative path (`library/process.md` writes `process-page-listing.txt`) must not find it
+// in a directory the other run shares. Each run is in a directory of its own sweep's, never the test
+// process's.
+@test("a page's block runs in a directory of its own: a relative name is not the test process's")
+rgp_block_runs_in_its_own_directory()
+    if !rgp_ready() then return
+
+    val name = s"sysl-docs-home-probe-${pid()}.txt"
+
+    write_text(name, "outer\n").unwrap()
+
+    val program = s"import sysl.fs.{exists, write_text}\n\nprint(exists(\"$name\"))\n" +
+        s"write_text(\"$name\", \"inner\\n\").unwrap()\nprint(exists(\"$name\"))\n"
+    val said = rgp_checked(program, "```output\nfalse\ntrue\n```\n")
+    val left = read_text(name).unwrap_or("")
+
+    remove_file(name).unwrap_or(())
+    assert_eq(said, None)
+    assert_eq(left, "outer\n")
+
+@test("two checks of one block that appends to a relative name each see only their own writes")
+rgp_two_checks_of_one_appending_block_do_not_share_a_file()
+    if !rgp_ready() then return
+
+    val program = "import sysl.fs.{append_text, read_text}\n\n" +
+        "append_text(\"shared.txt\", \"once\\n\").unwrap()\nprint(read_text(\"shared.txt\").unwrap().len)\n"
+
+    assert_eq(rgp_checked(program, "```output\n5\n```\n"), None)
+    assert_eq(rgp_checked(program, "```output\n5\n```\n"), None)
+
 // A block the page says is refused: compiled, required to fail, and the diagnostic required to
 // **contain** what the page quotes.
 //
@@ -495,7 +537,8 @@ end docs_warns
 // **Every block answers rather than stopping the sweep**, so one run reports every page that has
 // drifted instead of the first: documentation breaks in groups, one language fact invalidating the
 // six pages that lean on it.
-private docs_check(src: string, exe: string, archive_at: string, b: DocsBlock) -> Option[string]
+private docs_check(src: string, exe: string, archive_at: string, home: string,
+                   b: DocsBlock) -> Option[string]
     val where = s"${b.page}, sysl block ${b.nth}"
 
     if b.archive && b.claim == DocsClaim.PagePrints
@@ -519,7 +562,7 @@ private docs_check(src: string, exe: string, archive_at: string, b: DocsBlock) -
                     "compiled and not run")
 
     if b.claim == DocsClaim.PageShows then return None
-    if b.claim == DocsClaim.PagePrints then return docs_prints(src, exe, b, where)
+    if b.claim == DocsClaim.PagePrints then return docs_prints(src, exe, home, b, where)
     if b.claim == DocsClaim.PageWarns then return docs_warns(src, exe, b, where)
 
     docs_refuses(src, archive_at, b, where)
@@ -747,6 +790,9 @@ private docs_sweep_part(part: usize)
     val src = s"$dir/main.sysl"
     val exe = s"$dir/program"
     val archive_at = s"$dir/program.a"
+    val home = s"$dir/home"
+
+    make_dir_all(home).unwrap()
 
     var report: Buf[string] = buf()
     var bad: Buf[string] = buf()
@@ -767,7 +813,7 @@ private docs_sweep_part(part: usize)
             if placed.is_some() then path = placed.unwrap()
             else write_text(src, b.source).unwrap()
 
-            val said = docs_check(path, exe, archive_at, b)
+            val said = docs_check(path, exe, archive_at, home, b)
 
             if placed.is_some() then remove_dir_all(s"$dir/tree").unwrap_or(())
 
@@ -964,13 +1010,13 @@ end docs_excuse_of
 
 // The net count a block's program reported at exit, or why there is no count: a block that does not
 // build or does not finish cleanly is the output sweep's to report, and a program that stopped
-// partway still holds its frames.
-private docs_live_at_exit(src: string, exe: string) -> Result[long, string]
+// partway still holds its frames. It runs in `home`, as `docs_prints` does and for the same reason.
+private docs_live_at_exit(src: string, exe: string, home: string) -> Result[long, string]
     build_native_program(src, None, None, DefaultOptimization, Some(exe)) match
         Err(why) -> return Err(failure_text(why))
         Ok(_) -> ()
 
-    capture(exe, [], "", [], true) match
+    capture(exe, [], home, [], true) match
         Err(_) -> Err("the program could not be started")
         Ok(said) ->
             if !said.status.ok() then return Err(s"it exited with ${shell_status(said.status)}")
@@ -998,12 +1044,15 @@ private docs_heap_part(part: usize)
     val dir = make_temp_dir("sysl-leaks").unwrap()
     val src = s"$dir/main.sysl"
     val exe = s"$dir/program"
+    val home = s"$dir/home"
     val pages = docs_pages_of_part(root, part)
 
     if pages.is_empty()
         remove_dir_all(dir).unwrap_or(())
         return
     end if
+
+    make_dir_all(home).unwrap()
 
     val excuses = docs_leak_excuses()
 
@@ -1038,7 +1087,7 @@ private docs_heap_part(part: usize)
             if placed.is_some() then at = placed.unwrap()
             else write_text(src, b.source).unwrap()
 
-            val counted = docs_live_at_exit(at, exe)
+            val counted = docs_live_at_exit(at, exe, home)
 
             if placed.is_some() then remove_dir_all(s"$dir/tree").unwrap_or(())
 
