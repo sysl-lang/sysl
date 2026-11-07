@@ -2,6 +2,9 @@ module sysl.process
 @requires(posix)
 @tests
 
+import sysl.buf.{Buf, buf}
+import sysl.posix.time.sleep
+import sysl.time.millis
 import sysl.fs.{IoError, make_temp_dir, metadata, remove_dir_all, set_owner, write_text}
 import sysl.process.sys as psys
 import sysl.slices.as_mut_ptr
@@ -198,3 +201,153 @@ mem_resident_of_pid_one()
     resident_bytes(1) match
         Ok(n) -> assert(n > 0, "pid 1 resident")
         Err(e) -> assert_eq(e, IoError.NotPermitted)
+
+// ## Who is in a group, and whose child a process is
+
+private has(found: Buf[int], id: int) -> bool
+    for v in found.view()
+        if v == id then return true
+
+    false
+end has
+
+@test("children lists every child the program started, and only those")
+tree_children_lists_each_child()
+    val before = children(int(pid())).unwrap().len()
+    var a = spawn("sleep", ["5"]).unwrap()
+    var b = spawn("sleep", ["5"]).unwrap()
+    var c = spawn("sleep", ["5"]).unwrap()
+    val mine = children(int(pid())).unwrap()
+
+    assert(has(mine, a.pid()), "the first child")
+    assert(has(mine, b.pid()), "the second child")
+    assert(has(mine, c.pid()), "the third child")
+    assert(!has(mine, int(pid())), "the program is not its own child")
+    assert_eq(mine.len(), before + 3)
+
+    a.kill(9).unwrap()
+    b.kill(9).unwrap()
+    c.kill(9).unwrap()
+    a.wait().unwrap()
+    b.wait().unwrap()
+    c.wait().unwrap()
+
+@test("children does not list a grandchild")
+tree_children_skips_grandchildren()
+    var child = spawn("sh", ["-c", "sleep 5 & wait"]).unwrap()
+    val own = children(int(pid())).unwrap()
+
+    assert(has(own, child.pid()), "the shell is a child")
+
+    var grand: Buf[int] = buf()
+
+    for _ in 0..<100
+        grand = children(child.pid()).unwrap()
+        if grand.len() > 0 then break
+        sleep(millis(20))
+
+    assert(grand.len() > 0, "the shell's own child never appeared")
+    assert(!has(own, grand[0]), "a grandchild is not this program's child")
+    assert(!has(grand, child.pid()), "a process is not its own child")
+
+    child.kill(9).unwrap()
+    child.wait().unwrap()
+
+@test("a child started in a group of its own leads it, and group_members lists it there alone")
+tree_new_group_has_the_child()
+    var child = spawn("sleep", ["5"], group = Group.New).unwrap()
+    val members = group_members(child.group()).unwrap()
+
+    assert_eq(child.group(), child.pid())
+    assert_eq(members.len(), 1)
+    assert(has(members, child.pid()), "the leader")
+
+    child.kill(9).unwrap()
+    child.wait().unwrap()
+
+@test("a child left in this program's group is listed in it beside the program")
+tree_inherited_group_holds_the_child()
+    var child = spawn("sleep", ["5"]).unwrap()
+    val members = group_members(process_group()).unwrap()
+
+    assert(has(members, child.pid()), "the child")
+    assert(has(members, int(pid())), "this program")
+
+    child.kill(9).unwrap()
+    child.wait().unwrap()
+
+@test("a child that joins another's group is listed in it with the leader")
+tree_joined_group_holds_both()
+    var leader = spawn("sleep", ["5"], group = Group.New).unwrap()
+    var member = spawn("sleep", ["5"], group = Group.Join(leader.group())).unwrap()
+    val members = group_members(leader.group()).unwrap()
+
+    assert_eq(members.len(), 2)
+    assert(has(members, leader.pid()), "the leader")
+    assert(has(members, member.pid()), "the member")
+
+    leader.kill(9).unwrap()
+    member.kill(9).unwrap()
+    leader.wait().unwrap()
+    member.wait().unwrap()
+
+@test("a child reaped by wait_pid is in neither list afterwards")
+tree_reaped_child_is_gone()
+    var child = spawn("sleep", ["5"], group = Group.New).unwrap()
+    val id = child.pid()
+    val group = child.group()
+
+    assert(has(children(int(pid())).unwrap(), id), "listed while it runs")
+    child.kill(9).unwrap()
+
+    val gone = child.detach()
+
+    assert_eq(gone, id)
+    wait_pid(id).unwrap()
+    assert(!has(children(int(pid())).unwrap(), id), "still a child after the wait")
+    assert_eq(group_members(group).unwrap().len(), 0)
+
+@test("a pid or group nothing has answers an empty list, not an error")
+tree_unused_is_empty()
+    assert_eq(children(2147483647).unwrap().len(), 0)
+    assert_eq(group_members(2147483647).unwrap().len(), 0)
+
+@test("a process with no children answers an empty list")
+tree_leaf_has_no_children()
+    var child = spawn("sleep", ["5"]).unwrap()
+
+    assert_eq(children(child.pid()).unwrap().len(), 0)
+    child.kill(9).unwrap()
+    child.wait().unwrap()
+
+@test("a pid or group of zero or less is Other(22), whatever the sign")
+tree_non_positive_is_an_error()
+    assert_eq(children(0).unwrap_err(), IoError.Other(22))
+    assert_eq(children(-1).unwrap_err(), IoError.Other(22))
+    assert_eq(children(-2147483647).unwrap_err(), IoError.Other(22))
+    assert_eq(group_members(0).unwrap_err(), IoError.Other(22))
+    assert_eq(group_members(-1).unwrap_err(), IoError.Other(22))
+    assert_eq(group_members(-2147483647).unwrap_err(), IoError.Other(22))
+
+@test("pid 1's children, or its group, are answered where the host lets the program see them")
+tree_pid_one_is_listed_or_empty()
+    assert(children(1).is_ok(), "children of pid 1")
+    assert(group_members(1).is_ok(), "group of pid 1")
+
+@test("more members than the first guess holds are all listed")
+tree_a_long_list_is_complete()
+    var kids: Buf[&Spawned] = buf()
+
+    for _ in 0..<90
+        kids.push(spawn("sleep", ["5"], group = Group.Join(process_group())).unwrap())
+
+    val mine = children(int(pid())).unwrap()
+    val group = group_members(process_group()).unwrap()
+
+    for k in kids.view()
+        assert(has(mine, k.pid()), "a child is missing from children")
+        assert(has(group, k.pid()), "a child is missing from group_members")
+
+    for i in 0..<kids.len()
+        kids[i].kill(9).unwrap()
+        kids[i].wait().unwrap()

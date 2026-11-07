@@ -1193,6 +1193,8 @@ int sysl_proc_posix_tcsetpgrp(int pgid) {
 #include <sys/sysctl.h>
 #elif defined(__linux__)
 #include <sys/sysinfo.h>
+#include <dirent.h>
+#include <ctype.h>
 #endif
 
 /* The physical memory the machine has, in bytes, written to `out`; an `errno` where it cannot be
@@ -1258,6 +1260,103 @@ int sysl_proc_posix_resident(long long pid, unsigned long long *out) {
     return 0;
 #else
     (void)out;
+    return ENOSYS;
+#endif
+}
+
+/* The live processes whose process group is `id` (`which` 0) or whose parent is `id` (`which` 1): up to
+ * `room` pids written to `into`, and the number there are in all written to `*count`, so a caller whose
+ * room was short asks again with more. 0 or an `errno`. A group or parent nothing has is an empty
+ * answer. The list is a snapshot. */
+int sysl_proc_posix_list(int which, long long id, int *into, unsigned long long room,
+                         unsigned long long *count) {
+    unsigned long long n = 0;
+
+    *count = 0;
+    if (id <= 0 || id > 0x7fffffffLL) return EINVAL;
+#if defined(__APPLE__)
+    int need = proc_listpids(which == 0 ? PROC_PGRP_ONLY : PROC_PPID_ONLY, (uint32_t)id, NULL, 0);
+
+    if (need < 0) return errno != 0 ? errno : ESRCH;
+    if (need == 0) return 0;
+
+    int size = need + 16 * (int)sizeof(int);
+    int *found = NULL;
+    int got = 0;
+
+    loop_again:
+    found = (int *)malloc((size_t)size);
+    if (!found) return ENOMEM;
+
+    got = proc_listpids(which == 0 ? PROC_PGRP_ONLY : PROC_PPID_ONLY, (uint32_t)id, found, size);
+
+    if (got < 0) {
+        int e = errno != 0 ? errno : ESRCH;
+
+        free(found);
+        return e;
+    }
+    if (got >= size) {
+        free(found);
+        size *= 2;
+        goto loop_again;
+    }
+
+    for (int i = 0; i < got / (int)sizeof(int); i++) {
+        if (found[i] <= 0) continue;
+        if (n < room) into[n] = found[i];
+        n++;
+    }
+
+    free(found);
+    *count = n;
+    return 0;
+#elif defined(__linux__)
+    DIR *proc = opendir("/proc");
+
+    if (!proc) return errno;
+
+    struct dirent *entry;
+
+    while ((entry = readdir(proc)) != NULL) {
+        if (!isdigit((unsigned char)entry->d_name[0])) continue;
+
+        char name[64];
+        snprintf(name, sizeof name, "/proc/%s/stat", entry->d_name);
+
+        FILE *f = fopen(name, "r");
+
+        if (!f) continue;
+
+        char line[1024];
+        size_t got = fread(line, 1, sizeof line - 1, f);
+
+        fclose(f);
+        line[got] = 0;
+
+        /* comm is in parentheses and may hold spaces and parentheses, so the fields start after the
+         * last ')'. */
+        char *close = strrchr(line, ')');
+
+        if (!close) continue;
+
+        char state = 0;
+        long ppid = 0, pgrp = 0;
+
+        if (sscanf(close + 1, " %c %ld %ld", &state, &ppid, &pgrp) != 3) continue;
+        /* an exited child not yet waited for (a zombie) is listed, as the macOS call lists it */
+        if (state == 'X') continue;
+        if ((which == 0 ? pgrp : ppid) != id) continue;
+
+        if (n < room) into[n] = atoi(entry->d_name);
+        n++;
+    }
+
+    closedir(proc);
+    *count = n;
+    return 0;
+#else
+    (void)which; (void)into; (void)room;
     return ENOSYS;
 #endif
 }
