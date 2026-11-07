@@ -591,8 +591,8 @@ true true
 true
 ```
 
-`resident_bytes` fails for a process that is not there (a reaped child), for one the program may not
-look at (`NotPermitted`), and for a pid of zero or less. A target with no way to ask fails with
+`resident_bytes` fails with `NotFound` for a process that is not there (a reaped child, a pid nothing
+has), with `NotPermitted` for one the program may not look at, and for a pid of zero or less. A target with no way to ask fails with
 `UNSUPPORTED`'s error.
 
 ## Becoming another program
