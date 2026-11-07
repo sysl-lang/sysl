@@ -415,6 +415,23 @@ with no `*T` in it cannot fault, so the old storage stays until the last view of
 What `v` does *not* do is grow with the buffer. It is a view of some elements and it has the length it
 was made with. Take it again to see more.
 
+**`view()` is read-only: it answers a `[]const T`.** A view is a read of the buffer, so a write
+through one is refused, as is handing one to a parameter that may write (`[]T`). A writer takes
+`view_mut()`, and a function handing a local buffer's elements out takes `into_view()`, below:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+var b: Buf[int] = buf()
+
+b.push(1)
+b.view()[0] = 5
+```
+
+```error
+this element belongs to a '[]const int', which views elements it may not write, so there is nothing to assign through
+```
+
 ### `view_mut` writes, `into_view` hands over
 
 **`view_mut()`** is the same storage as `view()`, writable: a write through it is seen through the

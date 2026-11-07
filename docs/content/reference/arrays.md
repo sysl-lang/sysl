@@ -801,6 +801,83 @@ print(r.cells)
 [1, 2, 30, 0]
 ```
 
+### Writing through a subscript
+
+**A write through a subscript goes through `index_place_mut`; a read goes through `index_place`.**
+A write is the target of an assignment or a compound assignment, the operand of `&`, `++` or `--`,
+the place a `ref` names, a destructuring target, and the receiver of a `*self` method called on the
+element. The subscripts it writes through are every one on the path from the place down to the first
+step that keeps its elements somewhere else: `o.inner[1].n = 7` writes through `o.inner[1]`, while
+`ps[0].n = 1` with `*P` elements writes through the pointer and only reads `ps[0]`. A subscript read
+inside a write — `c[c[0].n].n = 3` — is still a read.
+
+The member's default is `index_place`, so a container that leaves it out is indexed the same way at a
+write as at a read. A container that owes something before an element is written — making shared
+storage its own, counting the write — overrides it. Inside an `@unchecked` block a write still goes
+through `index_place_mut`, since a container that wrote one has something to do before the write:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+static var reads = 0
+static var writes = 0
+
+struct Logged
+    cells: Buf[int]
+
+impl IndexPlace[usize, int] for Logged
+    index_place(self, i: usize) -> *int
+        reads += 1
+        self.cells.index_place(i)
+
+    override index_place_mut(*self, i: usize) -> *int
+        writes += 1
+        self.cells.index_place(i)
+
+var l = Logged(buf())
+
+l.cells.push(1)
+l.cells.push(2)
+
+l[0] += 10
+l[1] = l[0] + 1
+
+ref r = l[1]
+
+r += 1
+
+print(l[0], l[1], reads, writes)
+```
+
+```output
+11 13 3 3
+```
+
+**The write member takes `*self`, so a write through a `val` is refused** even where `index_place`
+takes `self` and the `val` may still be read:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+struct Logged
+    cells: Buf[int]
+
+impl IndexPlace[usize, int] for Logged
+    index_place(self, i: usize) -> *int = self.cells.index_place(i)
+    override index_place_mut(*self, i: usize) -> *int = self.cells.index_place(i)
+
+val l = Logged(buf())
+
+l[0] = 1
+```
+
+```error
+'index_place_mut' takes '*self', so it writes through what it is called on, and a 'val' is written once — write 'var l' if it is meant to change
+```
+
+A generic body over an `IndexPlace[I, E]` bound is read through `index_place` where it is defined;
+each instantiation is read again at its concrete type, so it writes through that type's own member.
+
 **A view of part of an element keeps the storage the element lives in.** Where the element is an
 array, `c[i][..]`, `c[i].cells[1..]` and `c[i][j][..]` are taken through the trait's `index_view`
 rather than `index_place`: `c[i][..]` is `c.index_view(i)[0][..]`, the element read as the one element

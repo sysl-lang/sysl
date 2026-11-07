@@ -2420,7 +2420,7 @@ const sorted_gcds(xs: []const int) -> Buf[int]
     for i in 1..<xs.len
         out.push(gcd(xs[i - 1], xs[i]))
 
-    sort(out.view())
+    sort(out.view_mut())
     out
 
 const LEAST: int = sorted_gcds([12, 18, 27, 36][..])[0]

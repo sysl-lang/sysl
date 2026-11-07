@@ -1,0 +1,293 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.{Search, replace_all}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **A subscript's read and its write are routed apart** (`reference/arrays.md § Writing through a
+// subscript`). A container whose `IndexPlace` block wrote `index_place_mut` is indexed through it at
+// every write position -- assignment, compound assignment, `++`, `&`, `ref`, a destructuring target,
+// and a `*self` method called on the element -- and through `index_place` at every read, including a
+// subscript read inside a write's index and an element that is a pointer written through. And
+// `Buf.view()` answers a read-only `[]const T`: a writer takes `view_mut()`, a function handing a
+// local buffer's elements out takes `into_view()`.
+//
+// Axes: the write form (the seven above); the path to the subscript (the target itself, a field of a
+// value holding the container, a pointer to the container, a generic body over an `IndexPlace`
+// bound, an `@unchecked` block); the read forms (a plain read, a `(self)` method, a read in the index
+// of a write, a write through an element that is a pointer); the receiver (`var`, `val`); a container
+// that wrote the member against one that did not (`Ring`, read and written exactly as before); the
+// container generic (`Counted[T]`, instantiated at a struct and at a pointer). For the views: a write
+// through `view()`, `view()` passed to a `[]T` parameter, `view_mut()` on a `var` and on a `val`,
+// `sort` through `view_mut()`, and `into_view()` returned and written. The counters are module `var`s
+// rather than fields, so a `(self)` read can count too. Skipped: build modes and targets (the change
+// is which member a subscript calls, and both lower as any member call does) and a container defined
+// in another module (the member is found by the same lookup any method call uses).
+
+private ipm_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end ipm_ready
+
+private ipm_root(text: string) -> string
+    val root = replace_all(make_temp_dir("sysl-ipm").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+end ipm_root
+
+private ipm_refused(text: string, message: string, at: string)
+    if !ipm_ready() then return
+
+    val root = ipm_root(ipm_head + text)
+
+    val said = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> replace_all(failure_text(why), root, "@")
+        Ok(made) -> replace_all(analysis_report(made.report), root, "@")
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert(said.contains(s"error: $message"), said)
+    assert(said.contains(s" --> @/main.sysl:$at\n"), said)
+end ipm_refused
+
+private ipm_prints(text: string, expected: string)
+    if !ipm_ready() then return
+
+    val root = ipm_root(ipm_head + text)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization,
+                                     Some(s"$root/built"))
+
+    built match
+        Err(why) ->
+            val said = replace_all(failure_text(why), root, "@")
+
+            remove_dir_all(root).unwrap_or(())
+            assert_eq(s"did not build: $said", expected)
+            return
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> assert(false, "the program that was built could not be run")
+        Ok(o) ->
+            assert_eq(o.text, expected)
+            assert(o.status.ok(), o.text)
+end ipm_prints
+
+// Thirty-two lines, so a program's first line is line 33. `tally` prints how many reads and writes
+// the subscripts made since it last ran.
+private const ipm_head: string =
+    "import sysl.buf.{Buf, buf}\nimport sysl.slices.sort\nvar reads = 0\nvar writes = 0\n" +
+    "var x = P(100)\nstruct P\n    n: int\nimpl P\n    bump(*self) = self.n += 1\n" +
+    "    get(self) -> int = self.n\nstruct Counted[T]\n    cells: Buf[T]\n" +
+    "impl[T] IndexPlace[usize, T] for Counted[T]\n    index_place(self, i: usize) -> *T\n" +
+    "        reads += 1\n        self.cells.index_place(i)\n" +
+    "    override index_place_mut(*self, i: usize) -> *T\n        writes += 1\n" +
+    "        self.cells.index_place(i)\nstruct Ring\n    cells: [4]int\n" +
+    "impl IndexPlace[usize, int] for Ring\n    index_place(*self, i: usize) -> *int = &self.cells[i]\n" +
+    "tally(what: string)\n    print(what, reads, writes)\n    reads = 0\n    writes = 0\n" +
+    "two() -> Counted[P]\n    var c = Counted[P](buf())\n    c.cells.push(P(1))\n" +
+    "    c.cells.push(P(2))\n    c\n"
+
+@test("every write position goes through index_place_mut, once")
+ipm_write_positions()
+    ipm_prints(raw"""
+        main()
+            var c = two()
+            c[0].n = 5
+            tally("assign")
+            c[0].n += 1
+            tally("compound")
+            c[0].n++
+            tally("inc")
+            val p = &c[0]
+            p.n += 1
+            tally("addr")
+            if true
+                ref r = c[0]
+                r.n += 10
+            tally("ref")
+            c[0].bump()
+            tally("method")
+            c[1] = P(30)
+            tally("element")
+            (c[0].n, c[1].n) = (c[0].n + 1, c[1].n + 1)
+            tally("destructure")
+            print(c.cells[0].n, c.cells[1].n)
+        """, "assign 0 1\ncompound 0 1\ninc 0 1\naddr 0 1\nref 0 1\nmethod 0 1\nelement 0 1\n" +
+             "destructure 2 2\n20 31\n")
+end ipm_write_positions
+
+@test("every read goes through index_place, including a read inside a write")
+ipm_read_positions()
+    ipm_prints(raw"""
+        main()
+            var c = two()
+            print(c[1].n)
+            tally("read")
+            val g = c[1].get()
+            tally("self method")
+            c[c[0].n].n = g + 1
+            tally("index of a write")
+            var ps = Counted[*P](buf())
+            ps.cells.push(&x)
+            ps[0].n = 101
+            tally("through a pointer element")
+            print(x.n, c.cells[1].n)
+        """, "2\nread 1 0\nself method 1 0\nindex of a write 1 1\nthrough a pointer element 1 0\n" +
+             "101 3\n")
+end ipm_read_positions
+
+@test("a write reaches index_place_mut through a field, a pointer, a generic body and @unchecked")
+ipm_write_paths()
+    ipm_prints(raw"""
+        struct Outer
+            inner: Counted[P]
+
+        poke[C: IndexPlace[usize, P]](c: *C) = c[0].n = 40
+
+        main()
+            var o = Outer(two())
+            o.inner[1].n = 7
+            tally("field")
+            var c = two()
+            val q = &c
+            q[1].n = 8
+            tally("pointer")
+            poke(&c)
+            tally("generic")
+            @unchecked
+                c[1].n += 1
+            tally("unchecked")
+            print(o.inner.cells[1].n, c.cells[0].n, c.cells[1].n)
+        """, "field 0 1\npointer 0 1\ngeneric 0 1\nunchecked 0 1\n7 40 9\n")
+end ipm_write_paths
+
+@test("a val container that wrote index_place_mut is still read")
+ipm_val_read()
+    ipm_prints(raw"""
+        main()
+            val c = two()
+            print(c[0].n + c[1].n)
+            tally("val")
+        """, "3\nval 2 0\n")
+end ipm_val_read
+
+@test("a write through a val container that wrote index_place_mut is refused")
+ipm_val_write()
+    ipm_refused(raw"""
+        main()
+            val c = two()
+            c[0].n = 2
+        """, "'index_place_mut' takes '*self', so it writes through what it is called on, and a " +
+             "'val' is written once — write 'var c' if it is meant to change", "35:6")
+end ipm_val_write
+
+@test("a *self method on an element of a val container that wrote index_place_mut is refused")
+ipm_val_method()
+    ipm_refused(raw"""
+        main()
+            val c = two()
+            c[0].bump()
+        """, "'index_place_mut' takes '*self', so it writes through what it is called on", "35:6")
+end ipm_val_method
+
+@test("a container with only index_place is read and written as before")
+ipm_only_index_place()
+    ipm_prints(raw"""
+        main()
+            var r = Ring([1, 2, 3, 4])
+            r[1] = 20
+            r[2] += 10
+            r[3]++
+            ref last = r[0]
+            last = 9
+            print(r.cells, r[1])
+        """, "[9, 20, 13, 5] 20\n")
+end ipm_only_index_place
+
+@test("a val container with only index_place is refused as before")
+ipm_only_index_place_val()
+    ipm_refused(raw"""
+        main()
+            val r = Ring([1, 2, 3, 4])
+            r[1] = 9
+        """, "'index_place' takes '*self', so it writes through what it is called on, and a 'val' " +
+             "is written once — write 'var r' if it is meant to change", "35:6")
+end ipm_only_index_place_val
+
+@test("a write through Buf.view() is refused")
+ipm_view_is_read_only()
+    ipm_refused(raw"""
+        main()
+            var b: Buf[int] = buf()
+            b.push(1)
+            b.view()[0] = 5
+        """, "this element belongs to a '[]const int', which views elements it may not write, so " +
+             "there is nothing to assign through", "36:5")
+end ipm_view_is_read_only
+
+@test("Buf.view() passed to a []T parameter is refused")
+ipm_view_to_writable_parameter()
+    ipm_refused(raw"""
+        clear(xs: []int) = xs[0] = 0
+
+        main()
+            var b: Buf[int] = buf()
+            b.push(1)
+            clear(b.view())
+        """, "a '[]const int' views elements it may not write, and a '[]int' is a licence to " +
+             "write them", "38:13")
+end ipm_view_to_writable_parameter
+
+@test("view_mut writes the buffer, and sorts it, on a var")
+ipm_view_mut()
+    ipm_prints(raw"""
+        main()
+            var b: Buf[int] = buf()
+            b.push(3)
+            b.push(1)
+            b.push(2)
+            sort(b.view_mut())
+            b.view_mut()[2] += 10
+            print(b, b.view().len)
+        """, "[1, 2, 13] 3\n")
+end ipm_view_mut
+
+@test("view_mut on a val is refused")
+ipm_view_mut_val()
+    ipm_refused(raw"""
+        main()
+            val b: Buf[int] = buf()
+            b.view_mut()[0] = 5
+        """, "'view_mut' takes '*self', so it writes through what it is called on, and a 'val' is " +
+             "written once — write 'var b' if it is meant to change", "35:7")
+end ipm_view_mut_val
+
+@test("into_view hands a local buffer's elements out as a writable slice")
+ipm_into_view()
+    ipm_prints(raw"""
+        squares(n: int) -> []int
+            var out: Buf[int] = buf()
+
+            for i in 0..<n do out.push(i * i)
+
+            out.into_view()
+
+        main()
+            val v = squares(4)
+            v[0] = -1
+            print(v)
+        """, "[-1, 1, 4, 9]\n")
+end ipm_into_view
