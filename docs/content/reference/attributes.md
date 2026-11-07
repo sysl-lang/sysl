@@ -228,7 +228,7 @@ struct Runner
         for j in s.jobs do j()
         r
 
-total(v: []int) -> int
+total(v: []const int) -> int
     Runner(0).scope((s) ->
         s.spawn(() -> print(v[0] + v[1] + v[2]))
         int(v.len))
@@ -286,7 +286,7 @@ scale(m: Matrix, k: int) -> int
 var b: Buf[int] = buf()
 
 for i in 1..4 do b.push(i)
-print(scale(Matrix(b.view(), 2, 2), 10))
+print(scale(Matrix(b.view_mut(), 2, 2), 10))
 print(b.view()[0] + b.view()[3])
 ```
 

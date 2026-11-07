@@ -1,0 +1,151 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// **A subscript written through is routed apart from one read** (`reference/arrays.md § Writing
+// through a subscript`). `b[i]` on a container implementing `IndexPlace` reads through `index_place`;
+// where the container's own block wrote `index_place_mut`, a subscript the program writes through
+// goes through that member instead, so a container can do what a write owes before handing out the
+// address -- make its storage its own, count the write -- and a read owes none of it.
+//
+// A write position is an assignment's or a compound assignment's target, the operand of `&` and of
+// `++`/`--`, the place a `ref` names, and the receiver of a `*self` method called on an element.
+// What it writes through is every subscript on the path from the place down to the first step that
+// is not part of a value: a view, a pointer or a reference stores its elements elsewhere, so a write
+// past one does not write the container it was reached from.
+//
+// A container whose block left `index_place_mut` out has the trait's default, `index_place` itself,
+// and is read at a write exactly as it always was -- the same member, the same receiver, the same
+// refusals. A bound (`T: IndexPlace[…]`) is read through `index_place` at the definition, and the
+// instantiation, read again at the concrete type, is routed by that type's block.
+//
+// The target is read once on trial to find which subscripts it writes through, and only where a
+// block in the program wrote `index_place_mut` and the written path has a subscript in it; otherwise
+// the one reading is the reading the program gets.
+
+// The member a subscript at `span` on a container of type `ty` goes through.
+subscript_member(cx: &Analyzer, span: Span, ty: Type) -> string
+    if holds_span(cx.write_subscripts, span) && writes_own_place(cx, receiver_type(ty)) then
+        return "index_place_mut"
+
+    place_member(cx)
+end subscript_member
+
+// Whether the block making `ty` a place wrote its own `index_place_mut`.
+private writes_own_place(cx: &Analyzer, ty: Type) -> bool
+    val name = view_member_name(cx, ty, "index_place_mut")
+
+    name != "" && !cx.an.tables.members.default_origin.has(name)
+end writes_own_place
+
+// A target written through: an assignment's, a compound assignment's, `&`'s, `++`'s, a `ref`'s.
+type_write_target(cx: &Analyzer, target: Expr) -> TExpr
+    if !may_write_through(cx, target) then return type_expr_bare(cx, target)
+
+    val tried = begin_trial(cx)
+    val t = type_expr_bare(cx, target)
+    var spans: Buf[Span] = buf()
+
+    written_subscripts(cx, t, &spans)
+
+    if spans.is_empty()
+        keep_trial(cx)
+        return t
+    end if
+
+    discard_trial(cx, tried)
+    read_writing(cx, spans, () -> type_expr_bare(cx, target))
+end type_write_target
+
+// A method call on an element: `b[i].bump()` writes the element when `bump` takes `*self`, which the
+// call's own reading is what decides.
+type_write_call(cx: &Analyzer, callee: Expr, read: () -> TExpr) -> TExpr
+    val receiver = *callee.kind match
+        Field(r, _, _) -> Some(r)
+        _ -> None
+
+    if receiver.is_none() || !may_write_through(cx, receiver.unwrap()) then return read()
+
+    val tried = begin_trial(cx)
+    val t = read()
+    var spans: Buf[Span] = buf()
+
+    *t.kind match
+        TCall(_, args, _, _) ->
+            if !args.is_empty()
+                *args[0].kind match
+                    TAddrOf(place, _) -> written_subscripts(cx, place, &spans)
+                    TCall(_, _, _, _) -> written_subscripts(cx, args[0], &spans)
+                    _ -> ()
+            end if
+        _ -> ()
+
+    if spans.is_empty()
+        keep_trial(cx)
+        return t
+    end if
+
+    discard_trial(cx, tried)
+    read_writing(cx, spans, read)
+end type_write_call
+
+// Whether a written path could reach a container whose block wrote `index_place_mut`: one does
+// somewhere in the program, and the path has a subscript in it.
+private may_write_through(cx: &Analyzer, e: Expr) -> bool =
+    cx.an.tables.members.place_mut_blocks > 0 && subscripted_path(e)
+
+private subscripted_path(e: Expr) -> bool = *e.kind match
+    Index(_, _, _) -> true
+    Field(r, _, _) -> subscripted_path(r)
+    _ -> false
+
+// The reading the program gets, with the subscripts at `spans` written through.
+private read_writing(cx: &Analyzer, spans: Buf[Span], read: () -> TExpr) -> TExpr
+    val outer = cx.write_subscripts
+
+    cx.write_subscripts = spans
+
+    val t = read()
+
+    cx.write_subscripts = outer
+    t
+end read_writing
+
+// The subscripts a write to the place `t` writes through, by span, out to the first step that keeps
+// its elements somewhere else.
+private written_subscripts(cx: &Analyzer, t: TExpr, out: *Buf[Span])
+    *t.kind match
+        TField(recv, _, _) -> if holds_its_value(texpr_type(recv)) then written_subscripts(cx, recv, out)
+        TIndex(recv, _, _) -> if holds_its_value(texpr_type(recv)) then written_subscripts(cx, recv, out)
+        TDeref(operand, _) -> subscript_step(cx, t.span, operand, out)
+        TCall(_, _, _, _) -> subscript_step(cx, t.span, t, out)
+        _ -> ()
+end written_subscripts
+
+private subscript_step(cx: &Analyzer, span: Span, call: TExpr, out: *Buf[Span])
+    val container = placed_by(cx, call)
+
+    if container.is_none() then return
+
+    out.push(span)
+
+    val c = container.unwrap()
+
+    if holds_its_value(texpr_type(c)) then written_subscripts(cx, c, out)
+end subscript_step
+
+// Whether a step holds what is reached through it, so that writing there writes the step itself.
+private holds_its_value(t: Type) -> bool = repr(t) match
+    Ptr(_) -> false
+    Ref(_, _) -> false
+    Slice(_, _) -> false
+    Str -> false
+    _ -> true
+
+private holds_span(spans: Buf[Span], span: Span) -> bool
+    for s in spans
+        if s == span then return true
+
+    false
+end holds_span

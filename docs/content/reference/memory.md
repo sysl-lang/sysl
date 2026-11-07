@@ -2983,7 +2983,7 @@ array is promoted, as it would be for `rows[1..]`.
 ```sysl
 import sysl.buf.{Buf, buf}
 
-row(rows: [][4]int, i: usize) -> []int = rows[i][..]
+row(rows: []const [4]int, i: usize) -> []const int = rows[i][..]
 
 var b: Buf[[4]int] = buf()
 b.push([1, 2, 3, 4])

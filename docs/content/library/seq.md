@@ -200,7 +200,7 @@ pair(n: int) -> []int
     b.push(n)
     b.push(n * 10)
 
-    b.view()
+    b.into_view()
 
 val xs = [1, 2, 3]
 
