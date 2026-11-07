@@ -16,7 +16,8 @@ import sysl.time.monotonic
 //
 // - the paths through it that may be **kept** -- stored somewhere that outlives the call;
 // - the paths through it that may flow to the **result**, with where in the result they sit;
-// - what it may **write** through another parameter, which is the caller's to place.
+// - what it may **write** through another parameter, which is the caller's to place, and where: the
+//   path through that parameter the store went along (`p0.0`, the pointer a handle holds).
 //
 // **Paths are field-sensitive**: `keep(s: S) = G = s.a` keeps `s.a` and nothing of `s.b`, and a value
 // read along `.a` is told apart from one along `.b`. **A path stops at the first type that repeats
@@ -67,12 +68,13 @@ struct FAtom
 end FAtom
 
 // One function's summary: per parameter, the paths kept and the paths answered with where in the
-// answer they sit; what is written through one parameter out of another; and where in the answer a
-// heap object made inside the call sits.
+// answer they sit; what is written through one parameter out of another -- `(dest, src, path, at)`:
+// what `src` holds along `path`, stored where `dest`'s value along `at` points; and where in the
+// answer a heap object made inside the call sits.
 struct FpaSum
     kept: Buf[Buf[Buf[FStep]]]
     answers: Buf[Buf[(Buf[FStep], Buf[FStep])]]
-    writes: Buf[(usize, usize, Buf[FStep])]
+    writes: Buf[(usize, usize, Buf[FStep], Buf[FStep])]
     fresh: Buf[Buf[FStep]]
     seen: Map[u64, bool]
     size: int
@@ -98,6 +100,7 @@ struct Fpa
     reach: Map[string, Map[string, bool]]
     lent: Map[string, Buf[string]]
     fits: Map[string, bool]
+    fits_at: Map[u64, bool]
 end Fpa
 
 // What one cell may hold, with the atoms already in it by key, the parameter paths already in it
@@ -111,9 +114,11 @@ end FCell
 
 // One walk of one body: what every cell may hold -- a local (`l:<name>`), a heap object (`h:<site>`),
 // the answer (`$ret`), what a loop breaks with (`$brk`), what is kept (`$kept`) and what is stored
-// through a parameter (`$thr<i>`) -- with which cells were read in the walk under way, since a cell
-// that grows after it was read sends the body round again. `kept` and `thru` are the parameter paths
-// already kept, and already stored through another parameter.
+// through a parameter (`$thr<i>:<at>`, one cell for each parameter and path through it stored at) --
+// with which cells were read in the walk under way, since a cell that grows after it was read sends
+// the body round again. `kept` and `thru` are the parameter paths already kept, and already stored
+// through another parameter; `dests` names each `$thr` cell by parameter and path id, and `dest_list`
+// holds them in the order they were first stored into.
 struct FBody
     fx: &Fpa
     f: TFunc
@@ -125,6 +130,8 @@ struct FBody
     count: int
     names: Buf[string]
     driven: Map[usize, bool]
+    dests: Map[u64, string]
+    dest_list: Buf[(string, usize, Buf[FStep])]
 end FBody
 
 // -- the whole program ----------------------------------------------------------------------------
@@ -138,7 +145,7 @@ fpa_analyze(a: &Analysis, funcs: Buf[TFunc]) -> &Fpa
         if !index.has(funcs[i].name) then index.put(funcs[i].name, i)
 
     // One box every walk shares, so the walk counter a cell's `read` is stamped with is one count.
-    val fx: &Fpa = Fpa(a, funcs, index, buf(), map(), map(), 0, fpa_tracing(), map(), map(), map(), map(), map(), map(), map(), map())
+    val fx: &Fpa = Fpa(a, funcs, index, buf(), map(), map(), 0, fpa_tracing(), map(), map(), map(), map(), map(), map(), map(), map(), map())
 
     // The steps every walk takes, first, so the constants below name them.
     step_in(fx, "~", "")
@@ -202,7 +209,7 @@ fpa_analyze(a: &Analysis, funcs: Buf[TFunc]) -> &Fpa
 
             val sum = walk_func(fx, fi)
 
-            if fx.tracing && sum.size > 100 then eprints(s"FPA-SUM ${funcs[fi].name} ${sum.size}\n")
+            if fx.tracing && sum.size > 100 then eprints(s"FPA-SUM ${funcs[fi].name} ${sum.size} writes ${sum.writes.len()}\n")
 
             if sum.size > fx.sums[fi].size
                 fx.sums[fi] = sum
@@ -363,7 +370,8 @@ private walk_func(fx: &Fpa, fi: usize) -> &FpaSum
     summarize(fb)
 end walk_func
 
-private settle_body(fx: &Fpa, f: TFunc) -> &FBody = settle(FBody(fx, f, map(), map(), map(), map(), false, 0, buf(), map()))
+private settle_body(fx: &Fpa, f: TFunc) -> &FBody =
+    settle(FBody(fx, f, map(), map(), map(), map(), false, 0, buf(), map(), map(), buf()))
 
 // Walks a body until no cell it read grows. A cell counts as read in this walk when its `read` is this
 // walk's number, `fx.walks`.
@@ -417,12 +425,8 @@ private summarize(fb: &FBody) -> &FpaSum
     for a in cell(fb, "$kept")
         work.push(a)
 
-    for i in 0..<f.params.len()
-        for a in cell(fb, s"$$thr$i")
-            if a.root.starts_with("p")
-                sum_write(fb.fx, sum, i, param_of(a.root), a.path)
-            else
-                work.push(a)
+    for d in fb.dest_list
+        written_through(fb, sum, d.0, d.1, d.2, &work)
 
     var at: usize = 0
 
@@ -447,6 +451,44 @@ private summarize(fb: &FBody) -> &FpaSum
     if fpa_holds(fb.fx, f.ret_ty) then answer_from(fb, sum, cell(fb, "$ret"), buf(), &seen)
     sum
 end summarize
+
+// **What is stored through parameter `dest` where its value along `at` points**, from its cell `name`:
+// a parameter's path is written there; what a heap object stored there holds is written inside it
+// (`at~`), at every depth of heap objects, since the object now lives where the caller placed it and
+// is the caller's to keep or not; a parameter's own value stored back inside what it points at is
+// not written, as `store_at` leaves it. The address of a local stored there lets the local's storage
+// out, so it goes to `work`, to be kept with what it holds.
+private written_through(fb: &FBody, sum: &FpaSum, name: string, dest: usize, at: Buf[FStep], work: *Buf[FAtom])
+    val inside = extend(at, tilde_step())
+    var visited: Map[string, bool] = map()
+    var todo: Buf[(FAtom, bool)] = buf()
+
+    for a in cell(fb, name)
+        todo.push((a, false))
+
+    var i: usize = 0
+
+    while i < todo.len()
+        val a = todo[i].0
+        val deep = todo[i].1
+
+        i += 1
+
+        if a.root.starts_with("p")
+            val src = param_of(a.root)
+
+            if !deep then sum_write(fb.fx, sum, dest, src, a.path, at)
+            else if src != dest then sum_write(fb.fx, sum, dest, src, a.path, inside)
+        else if a.root.starts_with("h:")
+            if !visited.has(a.root)
+                visited.put(a.root, true)
+
+                for b in cell(fb, a.root)
+                    todo.push((b, true))
+        else
+            work.push(a)
+        end if
+end written_through
 
 // The parameter paths handed where no body answers for a view (`lend`), through every local and heap
 // object that holds them.
@@ -541,13 +583,14 @@ private sum_answer(fx: &Fpa, sum: &FpaSum, i: usize, pid: u32, path: Buf[FStep],
     sum.size += 1
 end sum_answer
 
-private sum_write(fx: &Fpa, sum: &FpaSum, dest: usize, src: usize, path: Buf[FStep])
-    val k = SEEN_WRITE | (u64(pair_id(fx, u32(dest), u32(src))) << 32) | u64(path_id(fx, path))
+private sum_write(fx: &Fpa, sum: &FpaSum, dest: usize, src: usize, path: Buf[FStep], at: Buf[FStep])
+    val k = SEEN_WRITE | (u64(pair_id(fx, pair_id(fx, u32(dest), u32(src)), path_id(fx, at))) << 32) |
+        u64(path_id(fx, path))
 
     if sum.seen.has(k) then return
 
     sum.seen.put(k, true)
-    sum.writes.push((dest, src, path))
+    sum.writes.push((dest, src, path, at))
     sum.size += 1
 end sum_write
 
@@ -984,8 +1027,9 @@ private anywhere_in(fb: &FBody, v: Buf[FAtom]) -> Buf[FAtom]
     var out: Buf[FAtom] = buf()
     val here = one_step(tilde_step())
 
+    // An atom already anywhere inside is the one asked for.
     for a in v
-        out.push(moved(fb, here, a))
+        if a.off.len() == 1 && a.off[0].id == TILDE then out.push(a) else out.push(moved(fb, here, a))
 
     out
 end anywhere_in
@@ -1113,6 +1157,20 @@ private any_field_holds(fx: &Fpa, fields: Buf[(string, Type)]) -> bool
 
     false
 end any_field_holds
+
+// `answer_may_hold` for argument `k` of the call `e`, asked once for each call and argument.
+private fits_at(fx: &Fpa, e: TExpr, k: usize, answer: Type, arg: Type) -> bool
+    val key = (u64(node_id(e)) << 8) | u64(k)
+
+    fx.fits_at.get(key) match
+        Some(v) -> return v
+        None -> ()
+
+    val out = answer_may_hold(fx, answer, arg)
+
+    fx.fits_at.put(key, out)
+    out
+end fits_at
 
 // **Whether a call's answer can be made of an argument, by their types** (M35). An answer of type
 // `R` can hold an argument of type `A` only if a value of `A`, or an address into storage `A` holds in
@@ -1691,28 +1749,47 @@ private store_at(fb: &FBody, at: Buf[FAtom], v: Buf[FAtom])
     if v.is_empty() then return
 
     for a in at
-        // An address somewhere inside a value is at least that value's own storage, or storage
-        // reached from it: stored into anywhere there.
-        val inside = !a.off.is_empty() && a.off[0].s == "~"
+        // An address held somewhere inside a value -- at an offset in it (`.0` of a buffer, a variant's
+        // payload), or anywhere at or below one (`~`) -- is still the address of its own root's
+        // storage, though which of the value's pointers the store went through is not told apart:
+        // stored into anywhere there.
+        val inside = !a.off.is_empty()
 
-        if !a.off.is_empty() && !inside
-            keep(fb, v)
-        else if a.root.starts_with("l:") || a.root.starts_with("h:")
+        if a.root.starts_with("l:") || a.root.starts_with("h:")
             add_to(fb, a.root, if inside then anywhere_in(fb, v) else placed(fb, v, a.path))
         else if a.root.starts_with("p")
-            // Stored through a parameter, which is the caller's to place; a value of the parameter
-            // stored back into what it points at is not kept by that.
+            // Stored through a parameter, which is the caller's to place, where the parameter's value
+            // along the address's path points (`.0` for the pointer a handle holds in its first
+            // field), or anywhere inside that; a value of the parameter stored back into what it points
+            // at is not kept by that.
+            val at_path = if inside then extend(a.path, tilde_step()) else a.path
+            val at_id = path_id(fb.fx, at_path)
             var out: Buf[FAtom] = buf()
 
             for b in v
                 if b.rid != a.rid
-                    if !b.root.starts_with("p") || !covered(fb.fx, &fb.thru, u64(pair_id(fb.fx, a.rid, b.rid)) << 32, without_tilde(b.path))
+                    if !b.root.starts_with("p") || !covered(fb.fx, &fb.thru, u64(pair_id(fb.fx, pair_id(fb.fx, a.rid, b.rid), at_id)) << 32, without_tilde(b.path))
                         out.push(moved(fb, buf(), b))
 
-            add_to(fb, s"$$thr${param_of(a.root)}", out)
+            add_to(fb, dest_cell(fb, param_of(a.root), at_path, at_id), out)
         else
             keep(fb, v)
 end store_at
+
+// The cell of what is stored through parameter `dest` where its value along `at` points.
+private dest_cell(fb: &FBody, dest: usize, at: Buf[FStep], at_id: u32) -> string
+    val k = (u64(dest) << 32) | u64(at_id)
+
+    fb.dests.get(k) match
+        Some(name) -> return name
+        None -> ()
+
+    val name = s"$$thr$dest:$at_id"
+
+    fb.dests.put(k, name)
+    fb.dest_list.push((name, dest, at))
+    name
+end dest_cell
 
 // -- calls ----------------------------------------------------------------------------------------
 
@@ -1767,7 +1844,7 @@ private apply(fb: &FBody, e: TExpr, sum: &FpaSum, args: Buf[TExpr], argv: Buf[Bu
         for v in argv
             na += int(v.len())
 
-        eprints(s"FPA-APPLY ${fb.f.name} at ${e.span.start} us $dt size ${sum.size} argatoms $na\n")
+        eprints(s"FPA-APPLY ${fb.f.name} at ${e.span.start} us $dt size ${sum.size} writes ${sum.writes.len()} argatoms $na\n")
     end if
 
     r
@@ -1779,9 +1856,43 @@ private apply_inner(fb: &FBody, e: TExpr, sum: &FpaSum, args: Buf[TExpr], argv: 
     var out: Buf[FAtom] = buf()
     val n = if argv.len() < sum.kept.len() then argv.len() else sum.kept.len()
 
+    // What is written through each argument, gathered by where it is written, so each place is found
+    // once and stored into once.
+    var group_of: Map[u64, usize] = map()
+    var groups: Buf[(usize, Buf[FStep], Buf[FAtom])] = buf()
+
+    for w in sum.writes
+        if w.0 < argv.len() && w.1 < argv.len()
+            val gk = (u64(w.0) << 32) | u64(path_id(fb.fx, w.3))
+
+            if !group_of.has(gk)
+                group_of.put(gk, groups.len())
+                groups.push((w.0, w.3, buf()))
+
     for k in 0..<n
         // The paths of one parameter share their beginnings, so each is followed once.
         var memo: Map[u32, Buf[FAtom]] = map()
+
+        // What one path of the argument reaches is the same for every place it is written to.
+        var reached: Map[u32, Buf[FAtom]] = map()
+
+        for w in sum.writes
+            if w.1 == k && w.0 < argv.len()
+                val g = group_of.get((u64(w.0) << 32) | u64(path_id(fb.fx, w.3))).unwrap()
+                val pid = path_id(fb.fx, w.2)
+                val got = reached.get(pid) match
+                    Some(v) -> v
+                    None ->
+                        val v = anywhere_in(fb, summary_along(fb, argv[k], w.2, &memo))
+
+                        reached.put(pid, v)
+                        v
+
+                // A buffer copied is a second name for the one buffer, so this adds to the group's.
+                var into = groups[g].2
+
+                join_into(&into, got)
+            end if
 
         for p in sum.kept[k]
             keep(fb, summary_along(fb, argv[k], p, &memo))
@@ -1791,7 +1902,7 @@ private apply_inner(fb: &FBody, e: TExpr, sum: &FpaSum, args: Buf[TExpr], argv: 
 
         // What the answer cannot hold by its type is not answered (M35); a path through a box reaches
         // what the box holds, whose type is not the argument's, and is left as the summary says.
-        val fits = k >= args.len() || answer_may_hold(fb.fx, ty, texpr_type(args[k]))
+        val fits = k >= args.len() || fits_at(fb.fx, e, k, ty, texpr_type(args[k]))
 
         for item in sum.answers[k]
             if !fits && !has_box_step(item.0) then continue
@@ -1800,11 +1911,35 @@ private apply_inner(fb: &FBody, e: TExpr, sum: &FpaSum, args: Buf[TExpr], argv: 
 
             if has_deref(item.1) then add_to(fb, blob, anywhere_in(fb, got)) else join_into(&out, placed(fb, got, item.1))
 
-    for w in sum.writes
-        if w.0 < argv.len() && w.1 < argv.len()
-            var memo: Map[u32, Buf[FAtom]] = map()
+    // Each place written is stored into once, with everything written there: the places reached along
+    // different paths are often one place -- a box's whole interior above all.
+    var place_of: Map[u64, usize] = map()
+    var places: Buf[FAtom] = buf()
+    var held: Buf[Buf[FAtom]] = buf()
 
-            store_at(fb, argv[w.0], anywhere_in(fb, summary_along(fb, argv[w.1], w.2, &memo)))
+    for d in 0..<argv.len()
+        var memo: Map[u32, Buf[FAtom]] = map()
+
+        for g in groups
+            if g.0 != d || g.2.is_empty() then continue
+
+            for a in written_at(fb, argv[d], g.1, &memo)
+                if !place_of.has(a.key)
+                    place_of.put(a.key, places.len())
+                    places.push(a)
+                    held.push(buf())
+
+                val at = place_of.get(a.key).unwrap()
+
+                // A buffer copied is a second name for the one buffer, so this adds to the place's.
+                var into = held[at]
+
+                join_into(&into, g.2)
+            end for
+        end for
+
+    for i in 0..<places.len()
+        store_at(fb, single(places[i]), distinct(held[i]))
 
     for o in sum.fresh
         if has_deref(o)
@@ -1824,6 +1959,17 @@ private summary_along(fb: &FBody, v: Buf[FAtom], p: Buf[FStep], memo: *Map[u32, 
 
     if ends_whole(p) then anywhere_in(fb, got) else got
 end summary_along
+
+// **Where a callee's store through a parameter lands in the caller**: the argument read along the
+// path the callee stored through, which is the address it stored at -- anywhere inside it, where that
+// path ends at `~`.
+private written_at(fb: &FBody, v: Buf[FAtom], at: Buf[FStep], memo: *Map[u32, Buf[FAtom]]) -> Buf[FAtom]
+    if at.is_empty() then return v
+
+    if at[at.len() - 1].id == TILDE then return anywhere_in(fb, along_shared(fb, v, without_tilde(at), memo))
+
+    along_shared(fb, v, at, memo)
+end written_at
 
 private has_box_step(p: Buf[FStep]) -> bool
     for st in p
@@ -2010,7 +2156,7 @@ fpa_kept_text(fx: &Fpa, name: string, i: usize) -> string
             parts.push(shown_path(p))
 
     for w in sum.writes
-        if w.1 == i then parts.push(s"${shown_path(w.2)}>p${w.0}")
+        if w.1 == i then parts.push(s"${shown_path(w.2)}>p${w.0}${fpa_path_text(w.3)}")
 
     sorted_text(parts)
 end fpa_kept_text

@@ -183,6 +183,104 @@ fpa_store_in_place()
 
     assert_eq(fpa_kept_text(fx, "loop_back", 0), "")
 
+// -- where a store through another parameter lands -------------------------------------------------
+//
+// A write through a parameter says the path through it the store went along (`ε>p0.0`: stored where
+// the parameter's `.0` points). The cells cross the shape of that path -- a field of a handle passed
+// by value, a nested field, a variant's payload, a view held in a field, a pointer read out of a box,
+// a heap object stored there -- with the caller's argument: a local, built in place, and the caller's
+// own parameter. A store at a box's interior is the box's one cell (M28), so the box cell pins the
+// whole-box answer rather than a field of it.
+
+private val fpa_handles: string = "struct H\n    p: **int\n\nstruct HH\n    tag: int\n    h: H\n\n" +
+    "enum Dst\n    Nowhere\n    At(p: **int)\n\nstruct V\n    items: []*int\n\nstruct Bp\n    q: **int\n\n" +
+    "struct Hb\n    b: &Bp\n\n"
+
+@test("a store through a field of a handle passed by value lands where that field points")
+fpa_dest_handle_field()
+    val fx = fpa_of(fpa_handles + "put(h: H, x: *int)\n    *h.p = x\n\n" +
+                    "fill(x: *int)\n    var slot: *int = &spare\n    put(H(&slot), x)\n\n" +
+                    "relay(q: **int, x: *int)\n    put(H(q), x)\n\n" +
+                    "main()\n    var s: *int = &spare\n    fill(&spare)\n    relay(&s, &spare)\n")
+
+    assert_eq(fpa_kept_text(fx, "put", 1), "ε>p0.0")
+    assert_eq(fpa_kept_text(fx, "fill", 0), "")
+    assert(!fpa_keeps(fx, "fill", 0))
+    assert_eq(fpa_kept_text(fx, "relay", 1), "ε>p0")
+
+@test("a store through a nested field of a handle names the whole path")
+fpa_dest_nested_field()
+    val fx = fpa_of(fpa_handles + "put2(hh: HH, x: *int)\n    *hh.h.p = x\n\n" +
+                    "fill2(x: *int)\n    var slot: *int = &spare\n    put2(HH(0, H(&slot)), x)\n\n" +
+                    "main()\n    fill2(&spare)\n")
+
+    assert_eq(fpa_kept_text(fx, "put2", 1), "ε>p0.1.0")
+    assert_eq(fpa_kept_text(fx, "fill2", 0), "")
+
+@test("a store through a variant's payload names the variant's field")
+fpa_dest_variant_payload()
+    val fx = fpa_of(fpa_handles + "put_v(d: Dst, x: *int)\n    d match\n        At(p) -> *p = x\n        Nowhere -> ()\n\n" +
+                    "fill_v(x: *int)\n    var slot: *int = &spare\n    put_v(At(&slot), x)\n\n" +
+                    "relay_v(q: **int, x: *int)\n    put_v(At(q), x)\n\n" +
+                    "main()\n    var s: *int = &spare\n    fill_v(&spare)\n    relay_v(&s, &spare)\n")
+
+    assert_eq(fpa_kept_text(fx, "put_v", 1), "ε>p0.At:0")
+    assert_eq(fpa_kept_text(fx, "fill_v", 0), "")
+    assert_eq(fpa_kept_text(fx, "relay_v", 1), "ε>p0")
+
+@test("a store into an element of a view held in a field lands in what the view covers")
+fpa_dest_view_element()
+    val fx = fpa_of(fpa_handles + "put_e(w: V, x: *int)\n    w.items[0] = x\n\n" +
+                    "fill_e(x: *int)\n    var arr: [2]*int = [&spare, &spare]\n    put_e(V(arr[..]), x)\n\n" +
+                    "relay_e(xs: []*int, x: *int)\n    put_e(V(xs), x)\n\n" +
+                    "main()\n    var a: [2]*int = [&spare, &spare]\n    fill_e(&spare)\n    relay_e(a[..], &spare)\n")
+
+    assert_eq(fpa_kept_text(fx, "put_e", 1), "ε>p0.0")
+    assert_eq(fpa_kept_text(fx, "fill_e", 0), "")
+    assert_eq(fpa_kept_text(fx, "relay_e", 1), "ε>p0")
+
+@test("a pointer read out of a box is stored through as the box's whole interior, and lands where it points")
+fpa_dest_through_box()
+    val fx = fpa_of(fpa_handles + "put_b(h: Hb, x: *int)\n    *h.b.q = x\n\n" +
+                    "relay_b(q: **int, x: *int)\n    put_b(Hb(Bp(q)), x)\n\n" +
+                    "fill_b(x: *int)\n    var slot: *int = &spare\n    put_b(Hb(Bp(&slot)), x)\n\n" +
+                    "main()\n    var s: *int = &spare\n    relay_b(&s, &spare)\n    fill_b(&spare)\n")
+
+    assert_eq(fpa_kept_text(fx, "put_b", 1), "ε>p0.0*")
+    assert_eq(fpa_kept_text(fx, "relay_b", 1), "ε>p0~")
+    assert_eq(fpa_kept_text(fx, "fill_b", 0), "")
+
+@test("a heap object stored through a parameter is the caller's: what it holds is written there, not kept")
+fpa_dest_heap_object()
+    val fx = fpa_of(fpa_handles + "struct Rec\n    who: *int\n\nstruct Shelf\n    top: &Rec\n    own: *int\n\n" +
+                    "shelve(s: *Shelf, x: *int)\n    s.top = Rec(x)\n\n" +
+                    "self_shelve(s: *Shelf)\n    s.top = Rec(s.own)\n\n" +
+                    "main()\n    var sh = Shelf(Rec(&spare), &spare)\n    shelve(&sh, &spare)\n    self_shelve(&sh)\n")
+
+    assert_eq(fpa_kept_text(fx, "shelve", 1), "ε>p0~")
+    assert(!fpa_keeps(fx, "self_shelve", 0))
+
+@test("a store at an address held at an offset in a value lands in that address's storage, not kept")
+fpa_dest_offset_address()
+    val fx = fpa_of(fpa_handles + "local_slot(x: *int)\n    var arr: [2]*int = [&spare, &spare]\n    val v = arr[..]\n    v[0] = x\n\n" +
+                    "main()\n    local_slot(&spare)\n")
+
+    assert_eq(fpa_kept_text(fx, "local_slot", 0), "")
+
+@test("a pointer pushed into a local buffer that is then stored in module storage is kept")
+fpa_dest_buffer_kept()
+    val got = fpa_with_library_after("import sysl.buf.{Buf, buf}\n\n", "var shelf: Buf[*int] = buf()\n\n" +
+                                     "stash(x: *int)\n    var b: Buf[*int] = buf()\n    b.push(x)\n    shelf = b\n\n" +
+                                     "scratch(x: *int)\n    var b: Buf[*int] = buf()\n    b.push(x)\n\n" +
+                                     "main()\n    stash(&spare)\n    scratch(&spare)\n")
+
+    if got.is_none() then return
+
+    val fx = got.unwrap()
+
+    assert(fpa_keeps(fx, "stash", 0))
+    assert(!fpa_keeps(fx, "scratch", 0))
+
 // -- what a value may point to ---------------------------------------------------------------------
 
 @test("a local assigned on two arms may point to either, and a local's address is told by name")
