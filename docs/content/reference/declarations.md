@@ -655,7 +655,25 @@ filled 2
 ```
 
 `c` is never read, so `noisy(3)` never runs: an initializer is a value to compute, not a place to put
-work the program depends on. Storage something outside the program names is kept however little the
+work the program depends on. **A check in a dropped initializer does not run either** — an
+`invariant`, a constrained type's range, a `require` — so a value that would break one traps only
+where something reads its storage:
+
+```sysl
+struct Tag
+    name: string
+    invariant name.len > 0
+
+static val t: Tag = Tag("")
+
+print("t is never read")
+```
+
+```output
+t is never read
+```
+
+Storage something outside the program names is kept however little the
 program reads it — an `@export`ed binding, which whatever links the program reads by its symbol, and a
 `@section` one, which a linker script places. A library built on its own (`sysl build-lib`) keeps
 every binding it declares, since any of them may be what a program linking it reads; that program

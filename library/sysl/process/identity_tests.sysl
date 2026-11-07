@@ -136,3 +136,59 @@ id_pid_is_not_a_childs()
 @test("the process id is asked, never set")
 id_the_process_is_not_set()
     assert(psys.set_id(psys.id_process, 1) < 0, "set_id took the process id")
+
+@test("total_memory is the machine's memory: positive, and more than this program holds")
+mem_total_exceeds_own_resident()
+    val total = total_memory().unwrap()
+    val own = resident_bytes(int(pid())).unwrap()
+
+    assert(total > 0, "the machine has no memory")
+    assert(own > 0, "this program has no resident memory")
+    assert(total >= own, s"total $total is less than own resident $own")
+
+#if bsd
+private system_total() -> string = capture("sysctl", ["-n", "hw.memsize"]).unwrap().text.trim()
+#else
+private system_total() -> string =
+    capture("sh", ["-c", "awk '/MemTotal/ {printf \"%.0f\", $2 * 1024}' /proc/meminfo"]).unwrap().text.trim()
+#endif
+
+@test("total_memory agrees with the system's own answer")
+mem_total_matches_the_system()
+    assert_eq(system_total(), s"${total_memory().unwrap()}")
+
+@test("resident_bytes of this program grows by about what it allocates and touches")
+mem_resident_grows_when_touched()
+    val before = resident_bytes(int(pid())).unwrap()
+    val size: usize = 64 * 1024 * 1024
+    var block: []u8 = [0; 64 * 1024 * 1024]
+
+    var i: usize = 0
+
+    loop
+        if i >= size then break
+        block[i] = u8(1)
+        i += 4096
+    end loop
+
+    val after = resident_bytes(int(pid())).unwrap()
+
+    assert(after >= before + 32 * 1024 * 1024, s"resident went from $before to $after")
+    assert_eq(block[4096], u8(1))
+
+@test("resident_bytes reads a live child, and a reaped child is an error")
+mem_resident_of_a_child()
+    var child = start("sleep", ["5"]).unwrap()
+    val id = child.pid()
+
+    assert(resident_bytes(id).unwrap() > 0, "a live child has resident memory")
+    child.kill().unwrap()
+    child.wait().unwrap()
+    assert(resident_bytes(id).is_err(), "a reaped child still has resident memory")
+
+@test("resident_bytes of a pid no process can have is an error")
+mem_resident_of_no_process()
+    assert(resident_bytes(0).is_err(), "pid 0")
+    assert(resident_bytes(-1).is_err(), "pid -1")
+    assert(resident_bytes(-2147483647).is_err(), "a very negative pid")
+    assert(resident_bytes(2147483647).is_err(), "the largest pid")

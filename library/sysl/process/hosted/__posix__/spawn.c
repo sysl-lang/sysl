@@ -709,6 +709,24 @@ static int start_spawned(const char *program, char *const *argv,
     posix_spawnattr_t attr;
     posix_spawnattr_t *attrs = NULL;
 
+#if defined(__APPLE__) && defined(POSIX_SPAWN_CLOEXEC_DEFAULT)
+    /* A backstop for descriptors a linked C library opened without close-on-exec: the child starts
+     * with only the three streams, each kept explicitly. `adddup2` already keeps the ones it places;
+     * a stream left alone, or one that already is itself, is kept here. */
+    for (int i = 0; i < 3 && e == 0; i++)
+        if (fds[i] < 0 || fds[i] == i) e = posix_spawn_file_actions_addinherit_np(&actions, i);
+
+    if (e == 0) {
+        e = posix_spawnattr_init(&attr);
+        if (e == 0) attrs = &attr;
+    }
+
+    short flags = POSIX_SPAWN_CLOEXEC_DEFAULT;
+
+    if (pgid >= 0) flags |= POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK;
+
+    if (e == 0) e = posix_spawnattr_setflags(&attr, flags);
+#else
     if (e == 0 && pgid >= 0) {
         e = posix_spawnattr_init(&attr);
 
@@ -717,7 +735,10 @@ static int start_spawned(const char *program, char *const *argv,
             e = posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGDEF |
                                                 POSIX_SPAWN_SETSIGMASK);
         }
+    }
+#endif
 
+    if (e == 0 && pgid >= 0) {
         if (e == 0) e = posix_spawnattr_setpgroup(&attr, pgid);
 
         /* A job: the job signals at their defaults and nothing blocked, as `child_group` does on the
@@ -1032,6 +1053,8 @@ int sysl_proc_posix_temp_path(char *buf, size_t n) {
 
     if (fd < 0) return errno;
 
+    fcntl(fd, F_SETFD, FD_CLOEXEC);
+
     close(fd);
     return 0;
 }
@@ -1163,4 +1186,78 @@ int sysl_proc_posix_tcsetpgrp(int pgid) {
     e = handed_terminal(tty, (pid_t) pgid);
     close(tty);
     return e;
+}
+
+#if defined(__APPLE__)
+#include <libproc.h>
+#include <sys/sysctl.h>
+#elif defined(__linux__)
+#include <sys/sysinfo.h>
+#endif
+
+/* The physical memory the machine has, in bytes, written to `out`; an `errno` where it cannot be
+ * told. macOS asks `hw.memsize`; Linux multiplies `sysinfo`'s `totalram` by its `mem_unit`. */
+int sysl_proc_posix_total_memory(unsigned long long *out) {
+#if defined(__APPLE__)
+    unsigned long long bytes = 0;
+    size_t size = sizeof bytes;
+
+    if (sysctlbyname("hw.memsize", &bytes, &size, NULL, 0) != 0) return errno;
+
+    *out = bytes;
+    return 0;
+#elif defined(__linux__)
+    struct sysinfo info;
+
+    if (sysinfo(&info) != 0) return errno;
+
+    *out = (unsigned long long)info.totalram * (info.mem_unit ? info.mem_unit : 1);
+    return 0;
+#else
+    (void)out;
+    return ENOSYS;
+#endif
+}
+
+/* The resident set of process `pid`, in bytes, written to `out`; an `errno` where it cannot be read:
+ * `ESRCH` for a process that is not there, `EPERM` (or `EACCES`) for one this program may not look
+ * at, `EINVAL` for a number no process has. */
+int sysl_proc_posix_resident(long long pid, unsigned long long *out) {
+    if (pid <= 0 || pid > 0x7fffffffLL) return EINVAL;
+#if defined(__APPLE__)
+    struct proc_taskinfo info;
+
+    errno = 0;
+
+    int got = proc_pidinfo((int)pid, PROC_PIDTASKINFO, 0, &info, (int)sizeof info);
+
+    if (got <= 0) return errno != 0 ? errno : ESRCH;
+    if (got < (int)sizeof info) return ESRCH;
+
+    *out = info.pti_resident_size;
+    return 0;
+#elif defined(__linux__)
+    char name[64];
+
+    snprintf(name, sizeof name, "/proc/%lld/statm", pid);
+
+    FILE *f = fopen(name, "r");
+
+    if (!f) return errno;
+
+    unsigned long long size = 0, resident = 0;
+    int n = fscanf(f, "%llu %llu", &size, &resident);
+
+    fclose(f);
+
+    if (n != 2) return EIO;
+
+    long page = sysconf(_SC_PAGESIZE);
+
+    *out = resident * (unsigned long long)(page > 0 ? page : 4096);
+    return 0;
+#else
+    (void)out;
+    return ENOSYS;
+#endif
 }

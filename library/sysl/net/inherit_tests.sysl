@@ -1,0 +1,70 @@
+module sysl.net
+@requires(posix)
+@tests
+
+import sysl.fs.{make_temp_dir, remove_dir_all}
+import sysl.path.join
+import sysl.process.capture
+
+// A socket is not inherited by a child started with `sysl.process`: each test compares the
+// descriptors a child shell can duplicate before and after the socket is made, so a descriptor the
+// test runner itself leaves open does not count.
+
+private ih_open_in_child() -> string
+    val probe = "i=3; while [ $i -lt 64 ]; do if (exec 9<&$i) 2>/dev/null; then echo $i; fi; i=$((i+1)); done"
+
+    capture("sh", ["-c", probe]).unwrap().text
+end ih_open_in_child
+
+private ih_scratch(name: string) -> string = make_temp_dir(f"sysl-inherit-${name}").unwrap()
+
+@test("a TCP socket is not inherited by a child")
+ih_tcp_socket()
+    val before = ih_open_in_child()
+    val at = resolve("127.0.0.1", 0).unwrap()[0]
+    val s = socket(at).unwrap()
+
+    assert_eq(ih_open_in_child(), before)
+    assert(s.fd().unwrap() >= 0)
+
+@test("a UDP socket is not inherited by a child")
+ih_udp_socket()
+    val before = ih_open_in_child()
+    val at = resolve("127.0.0.1", 0).unwrap()[0]
+    val s = udp_socket(at).unwrap()
+
+    assert_eq(ih_open_in_child(), before)
+    assert(s.fd().unwrap() >= 0)
+
+@test("a TCP listener and the connection it accepted are not inherited by a child")
+ih_tcp_listener_and_accepted()
+    val before = ih_open_in_child()
+    val at = resolve("127.0.0.1", 0).unwrap()[0]
+    var l = socket(at).unwrap()
+
+    l.reuse_address().unwrap()
+    l.bind(at).unwrap()
+    l.listen().unwrap()
+
+    val here = l.local().unwrap()
+    var c = socket(here).unwrap()
+
+    c.connect(here).unwrap()
+
+    var (a, _) = l.accept().unwrap()
+
+    assert_eq(ih_open_in_child(), before)
+    assert(a.fd().unwrap() >= 0 && c.fd().unwrap() >= 0)
+
+@test("a Unix listener, a connection to it and the one it accepted are not inherited by a child")
+ih_unix_listener()
+    val before = ih_open_in_child()
+    val dir = ih_scratch("unix")
+    val at = unix(join(dir, "s.sock")).unwrap()
+    var l = unix_listen(at).unwrap()
+    var c = unix_connect(at).unwrap()
+    var a = l.accept().unwrap()
+
+    assert_eq(ih_open_in_child(), before)
+    assert(a.fd().unwrap() >= 0 && c.fd().unwrap() >= 0)
+    remove_dir_all(dir).unwrap()
