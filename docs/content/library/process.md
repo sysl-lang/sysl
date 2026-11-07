@@ -513,6 +513,15 @@ afterwards signals and waits for nothing, so a daemon a command line program sta
 Reaping is then the caller's business: a detached child that ends while the program lives is a
 zombie until someone waits for it by its pid, and init adopts it once the program has exited.
 
+**`wait_pid` and `try_wait_pid` wait by pid, holding no `Spawned`.** `wait_pid(pid: int) ->
+Result[Status, IoError]` (`@blocks`) is `Spawned.wait` for a child that was `detach`ed or started by an
+earlier image of this program (a daemon that `exec`s its new binary keeps its pid, and the new image
+reaps its running jobs this way), and `try_wait_pid(pid: int) -> Result[Option[Status], IoError]` is
+`try_wait`: `None` while the child runs. The `Status` is the one `Spawned.wait` answers, there is no
+`timeout`, and the child is reaped, so a second wait on the same pid is an error. A pid that is not this
+program's child -- or was already reaped -- is `Other(10)` (`ECHILD`); a pid of zero or less is
+`Other(22)`, since waitpid's process-group meanings are not offered.
+
 ## Who the program is
 
 **`user()` and `group()` answer the ids the program acts as**, as `u32`s — the type
@@ -582,8 +591,8 @@ true true
 true
 ```
 
-`resident_bytes` fails for a process that is not there (a reaped child), for one the program may not
-look at (`NotPermitted`), and for a pid of zero or less. A target with no way to ask fails with
+`resident_bytes` fails with `NotFound` for a process that is not there (a reaped child, a pid nothing
+has), with `NotPermitted` for one the program may not look at, and for a pid of zero or less. A target with no way to ask fails with
 `UNSUPPORTED`'s error.
 
 ## Becoming another program
