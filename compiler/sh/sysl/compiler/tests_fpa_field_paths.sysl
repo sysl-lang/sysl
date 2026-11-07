@@ -1,6 +1,7 @@
 module sh.sysl.compiler
 @tests
 
+import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 
 // The field-path analysis (`fpa.sysl`), asked directly: what each function keeps of each parameter,
@@ -10,11 +11,11 @@ import sysl.buf.{Buf, buf}
 // The cells cross where the address sits (a field held in place, a nested field, a field through a
 // pointer, a list or tree reached through itself, an array element, a heap object answered) with
 // what the body does with it (stores it in module storage, stores it through another parameter,
-// hands it back, hands it to a callee by name, through a trait object). Skipped cells, and why: a
-// `&Fn`, a function pointer and `Option` need the library, which a program read here has not got
-// (`typed_of`), and a `&Fn`'s marks are read through the same path as a trait method's `@keeps`
-// (`vcall`), so the trait-object cells stand for it, and an enum declared here for `Option`; a task
-// is held by the async tests of the keeps analysis, which this one does not replace yet.
+// hands it back, hands it to a callee by name, through a trait object, through a `&Fn`). A `&Fn`
+// cell reads its program with the library (`fpa_with_library`); the rest are read without it
+// (`typed_of`), so an enum declared here stands for `Option`. Skipped cells, and why: a function
+// pointer is answered by the same signature rule as a `&Fn` and a task by the escape tests that read
+// this analysis (`FpaSum.lent`), so neither has a cell of its own here.
 
 private val fpa_decls: string = "var spare = 0\nvar held: *int = &spare\n\n" +
     "struct S\n    a: *int\n    b: *int\n\n" +
@@ -131,6 +132,17 @@ fpa_view_boxed_answer()
     assert_eq(fpa_kept_text(fx, "wrap", 0), "")
     assert_eq(fpa_answers_text(fx, "wrap", 0), "ε@*")
     assert(fpa_answers_boxed(fx, "wrap", 0))
+
+    // The escape analysis does not follow a view into a box, so to it the view has left the call.
+    assert(fpa_lets_out_whole(fx, "wrap", 0))
+
+@test("a view answered in place is not let out, where one answered inside a box is")
+fpa_view_answered_in_place()
+    val fx = fpa_of("struct H\n    v: []u8\n\npass(v: []u8) -> H = H(v)\n\n" +
+                    "main()\n    var a: [4]u8 = [1, 2, 3, 4]\n    val h = pass(a[..])\n    spare = int(h.v[0])\n")
+
+    assert_eq(fpa_answers_text(fx, "pass", 0), "ε@.0")
+    assert(!fpa_lets_out_whole(fx, "pass", 0))
 
 @test("the same heap object stored in module storage keeps the view it holds")
 fpa_view_boxed_kept()
@@ -286,6 +298,41 @@ fpa_pattern_top_box()
 
     assert_eq(fpa_kept_text(fx, "take", 0), "*")
 
+// -- a local read in a loop before it is first written --------------------------------------------
+//
+// A cell is made the first time a walk asks for it, and asking for it counts as reading it, so what is
+// written into it later in the same walk sends the body round again. The cells cross the loop (`for`,
+// `while`, `loop`) with what is read (the local itself, a field of a struct local), and the same
+// order with no loop, which keeps it too: a local holds everything it is ever given, wherever in the
+// body it is read (the analysis does not follow the order of statements).
+
+@test("a local a 'for' body stores before it is first written keeps what the next round finds there")
+fpa_read_first_for()
+    val fx = fpa_of("late(p: *int)\n    var x: *int = null\n\n    for _ in 0..<2\n        held = x\n        x = p\n\n" +
+                    "main()\n    late(&spare)\n")
+
+    assert_eq(fpa_kept_text(fx, "late", 0), "ε")
+
+@test("a 'while' body storing a local before writing it keeps what the next round finds there")
+fpa_read_first_while()
+    val fx = fpa_of("late(p: *int)\n    var x: *int = null\n    var n = 0\n\n    while n < 2\n" +
+                    "        held = x\n        x = p\n        n += 1\n\nmain()\n    late(&spare)\n")
+
+    assert_eq(fpa_kept_text(fx, "late", 0), "ε")
+
+@test("a field of a struct local stored before the struct is rebuilt in a 'loop' keeps that field of the next")
+fpa_read_first_field()
+    val fx = fpa_of("late(s: S)\n    var t = S(null, null)\n    var n = 0\n\n    loop\n        held = t.b\n" +
+                    "        t = s\n        n += 1\n\n        if n > 2 then break\n\nmain()\n    late(S(&spare, &spare))\n")
+
+    assert_eq(fpa_kept_text(fx, "late", 0), ".1")
+
+@test("a local stored before it is written, with no loop to come round again, still keeps what it is given")
+fpa_read_first_straight()
+    val fx = fpa_of("early(p: *int)\n    var x: *int = null\n\n    held = x\n    x = p\n\nmain()\n    early(&spare)\n")
+
+    assert_eq(fpa_kept_text(fx, "early", 0), "ε")
+
 // -- agreement with the keeps analysis, and the error paths -----------------------------------------
 
 @test("where there is nothing to tell apart, the two analyses agree on keeping and answering")
@@ -313,3 +360,124 @@ fpa_refused_body()
 
     assert_eq(fpa_kept_text(fx, "bad", 0), "")
     assert_eq(fpa_disagreements(done.an, done.funcs).len(), 0)
+
+// -- what a call answers is filtered by type reachability (M35) ------------------------------------
+//
+// A call with no body in sight may answer with an argument only where the answer's type can reach the
+// argument's: through a field, a box, a generic argument, or as a raw pointer a cast may have made of
+// anything. The cells cross the answer's type (cannot hold it, holds it through a box, through a
+// generic struct's argument, a raw pointer) with how the call is made (a trait object, a `&Fn`, a
+// body calling either, whose summary carries the answer on) and what is done with the answer (handed
+// back, stored at an offset).
+
+private val fpa_picks: string = "struct Q\n    q: *u8\n\nstruct Bx\n    v: *int\n\n" +
+    "struct G[T]\n    x: T\n\nvar held_q = Q(null)\n\n"
+
+@test("an answer whose type cannot hold the argument is not made of it, and storing it keeps nothing")
+fpa_m35_cannot_hold()
+    val fx = fpa_of(fpa_picks + "trait Pick\n    pick(*self, p: *int) -> Q\n\n" +
+                    "via(o: *Pick, p: *int) -> Q = o.pick(p)\n\n" +
+                    "outer(o: *Pick, p: *int) -> Q = via(o, p)\n\n" +
+                    "hold(o: *Pick, p: *int)\n    held_q = o.pick(p)\n\nmain()\n    spare = 1\n")
+
+    assert_eq(fpa_answers_text(fx, "via", 1), "")
+    assert_eq(fpa_answers_text(fx, "outer", 1), "")
+    assert_eq(fpa_kept_text(fx, "hold", 1), "")
+    assert(!fpa_lets_out(fx, "hold", 1))
+
+@test("an answer that holds the argument through a box is made of it, and storing it keeps it")
+fpa_m35_through_box()
+    val fx = fpa_of(fpa_picks + "var held_b: &Bx = Bx(&spare)\n\n" +
+                    "trait Pick\n    pick(*self, p: *int) -> &Bx\n\n" +
+                    "via(o: *Pick, p: *int) -> &Bx = o.pick(p)\n\n" +
+                    "hold(o: *Pick, p: *int)\n    held_b = o.pick(p)\n\nmain()\n    spare = 1\n")
+
+    assert(fpa_answers(fx, "via", 1))
+    assert(fpa_keeps(fx, "hold", 1))
+
+@test("a generic struct holds the argument where it is instantiated at the argument's type, and not elsewhere")
+fpa_m35_generic()
+    val fx = fpa_of(fpa_picks + "trait Pick\n    at_int(*self, p: *int) -> G[*int]\n    at_u8(*self, p: *int) -> G[*u8]\n\n" +
+                    "via_int(o: *Pick, p: *int) -> G[*int] = o.at_int(p)\n\n" +
+                    "via_u8(o: *Pick, p: *int) -> G[*u8] = o.at_u8(p)\n\nmain()\n    spare = 1\n")
+
+    assert(fpa_answers(fx, "via_int", 1))
+    assert(!fpa_answers(fx, "via_u8", 1))
+
+@test("an answer that is a raw pointer may be made of any address, whatever it points at")
+fpa_m35_raw_pointer()
+    val fx = fpa_of(fpa_picks + "trait Pick\n    pick(*self, p: *int) -> *u8\n\n" +
+                    "via(o: *Pick, p: *int) -> *u8 = o.pick(p)\n\nmain()\n    spare = 1\n")
+
+    assert(fpa_answers(fx, "via", 1))
+
+@test("an argument holding the address in place is answered by a struct that can hold a field of it")
+fpa_m35_field_of_argument()
+    val fx = fpa_of(fpa_picks + "trait Pick\n    pick(*self, s: *S) -> Bx\n\n" +
+                    "via(o: *Pick, s: *S) -> Bx = o.pick(s)\n\nmain()\n    spare = 1\n")
+
+    // `Bx` holds a `*int`, the type of `S`'s fields, held in place where `s` points.
+    assert(fpa_answers(fx, "via", 1))
+
+// The same, through a `&Fn`, whose type the program reads from the library.
+private var fpa_library_cache: Buf[Program] = buf()
+private var fpa_library_read: bool = false
+
+private fpa_with_library(text: string) -> Option[&Fpa] = fpa_with_library_after("", text)
+
+// The same, with `head` -- its imports -- ahead of the declarations every cell shares.
+private fpa_with_library_after(head: string, text: string) -> Option[&Fpa]
+    if !fpa_library_read
+        fpa_library_read = true
+
+        std_root() match
+            Err(_) -> ()
+            Ok(root) -> std_units(root, host_target()) match
+                Err(_) -> ()
+                Ok(units) -> fpa_library_cache = units
+
+    if fpa_library_cache.is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return None
+
+    var units: Buf[Program] = buf()
+
+    for item in fpa_library_cache
+        units.push(item)
+
+    units.push(parse(source_of("test.sysl", head + fpa_decls + fpa_picks + text)).program)
+
+    val done = analyze_bodies(units, host_target())
+
+    assert(done.reported.is_empty(), if done.reported.is_empty() then "" else done.reported[0].diag.message)
+    Some(fpa_analyze(done.an, program_of(done, "").funcs))
+end fpa_with_library_after
+
+@test("bytes made into a string in place are kept: a string outlives every frame")
+fpa_str_alias_keeps()
+    val got = fpa_with_library_after("import sysl.raw.str_alias\n\n",
+                                     "view(b: []u8) -> string = str_alias(b)\n\nhand_on(b: []u8) -> string = view(b)\n\n" +
+                                     "main()\n    var a: [2]u8 = [111, 107]\n    spare = int(view(a[..]).len)\n")
+
+    if got.is_none() then return
+
+    val fx = got.unwrap()
+
+    assert_eq(fpa_kept_text(fx, "view", 0), "ε")
+    assert_eq(fpa_kept_text(fx, "hand_on", 0), "ε")
+    assert(fpa_lets_out_whole(fx, "view", 0))
+
+@test("a call through a '&Fn' answers with an argument only where its answer's type can hold it")
+fpa_m35_callable()
+    val got = fpa_with_library("via_q(f: &Fn(*int) -> Q, p: *int) -> Q = f(p)\n\n" +
+                               "via_b(f: &Fn(*int) -> &Bx, p: *int) -> &Bx = f(p)\n\n" +
+                               "hold(f: &Fn(*int) -> Q, p: *int)\n    held_q = f(p)\n\n" +
+                               "main()\n    spare = 1\n")
+
+    if got.is_none() then return
+
+    val fx = got.unwrap()
+
+    assert(!fpa_answers(fx, "via_q", 1))
+    assert(fpa_answers(fx, "via_b", 1))
+    assert_eq(fpa_kept_text(fx, "hold", 1), "")

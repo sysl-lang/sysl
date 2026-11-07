@@ -2805,20 +2805,26 @@ in that frame, so `each` above allocates nothing.
 Two facts about a function are enough to keep the caller's analysis local and exact, and both are
 **inferred from the body** rather than written:
 
-- **per parameter** — does the callee let this argument outlive the call?
-- **for the result** — which parameters may the returned value be a view of?
+- **per parameter** — which parts of this argument does the callee let outlive the call?
+- **for the result** — which parts of which parameters may the returned value be a view of?
 
-They are computed bottom-up over the call graph and recorded in module metadata. Recursion starts
-optimistic and iterates to a fixpoint, so a self- or mutually-recursive function converges on the
-truth rather than on the conservative answer.
+Both are answered field by field: a callee that stores `s.a` lets out the view in `s.a` and not the
+one in `s.b`, and a result whose type cannot hold an argument's view is not taken for one. They are
+computed bottom-up over the call graph. Recursion starts optimistic and iterates to a fixpoint, so a
+self- or mutually-recursive function converges on the truth rather than on the conservative answer.
 
-Two cases get the pessimistic answer instead — every parameter kept, the result viewing everything:
+A call with no body to consult is answered by what its declaration says instead:
 
-- **a call through a trait object**, because which body it reaches is a word read at run time, so
-  there is no one summary to consult. Reading through a *concrete* type or through a bounded type
-  parameter is unaffected, since monomorphization turns the second into a direct call too;
-- **a function whose body is not available** — an `extern`, which is the declaration form for exactly
-  that. The foreign side may retain what it was given, and nothing here can tell.
+- **a call through a trait object**, because which body it reaches is a word read at run time. It
+  lets out what the trait's declaration of the method marks
+  [`@keeps`](/reference/attributes/#keeps-and-answers-on-a-trait-method), and nothing else. Reading
+  through a *concrete* type or through a bounded type parameter is unaffected, since monomorphization
+  turns the second into a direct call too;
+- **an `extern`**, whose body is on the foreign side: it lets out what its `@keeps` names, and its
+  result views what its `@answers` names;
+- **a call through a `&Fn` or a function pointer**, and an `async` call whose task is not awaited where
+  it is made: a view handed to one is counted as let out. A callable's type can say what it keeps, with
+  `@keeps`, but nothing in it says that a view is only borrowed, so the view is promoted.
 
 ### What happens when a slice escapes
 

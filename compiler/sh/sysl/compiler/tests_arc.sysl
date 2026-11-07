@@ -705,17 +705,45 @@ an_implementation_that_keeps_what_it_borrowed()
               "a view of the caller's stack. Copy what this needs into storage of its own")
 end an_implementation_that_keeps_what_it_borrowed
 
-// **Which parameters a function keeps is a fixpoint, and it looks at a function again only when
-// something it consulted has grown.** Two chains of 200 functions each hand a slice down to one that
-// stores it, one written caller-first and one callee-first, so whichever order the program lists its
-// functions in, one chain runs against it: a fixpoint that re-walked every function on every round
-// would take a round per link of that chain, some eighty thousand walks, where one that wakes only
-// the callers of what grew takes a few hundred -- and every link keeps what it was handed either way.
+// **Which parameters a function keeps is settled callees first, so no function is walked again for a
+// callee that grew.** Two chains of 200 functions each hand a slice down to one that stores it, one
+// written caller-first and one callee-first, so whichever order the program lists its functions in,
+// one chain runs against it: a fixpoint that re-walked every function on every round would take a
+// round per link of that chain, some eighty thousand walks. The field-path analysis walks the call
+// graph's components callees first (`fpa_analyze`), so each link here -- a component of its own --
+// is settled once, in one walk; every link keeps what it was handed either way.
+//
+// The chains are written once as functions of their own (`main` declared, so the file is not a body)
+// and once as the nested functions of an entry file's body, where `held` is a local of that body: a
+// link there does not keep its slice but stores it through its environment, parameter 0, into the
+// body's own storage, and that store is carried up the whole chain just as the keep is.
 @test("the kept-parameter fixpoint wakes only the callers of what grew")
 the_kept_parameter_fixpoint_wakes_only_callers()
     if arc_no_library() then return
 
     val n: usize = 200
+    val top = fpa_chains(n, true)
+
+    for i in 0..<n
+        assert_eq(fpa_kept_text(top.0, s"a$i", 0), "ε")
+        assert_eq(fpa_kept_text(top.0, s"b$i", 0), "ε")
+
+    val nested = fpa_chains(n, false)
+
+    for i in 0..<n
+        assert_eq(fpa_kept_text(nested.0, s"a$i", 0), "")
+        assert_eq(fpa_kept_text(nested.0, s"a$i", 1), "ε>p0")
+        assert_eq(fpa_kept_text(nested.0, s"b$i", 1), "ε>p0")
+
+    // One walk a function, whichever order the chains are written in: each link is a component of its
+    // own, settled after the link it calls, and nothing its walk reads grows after it is read.
+    assert_eq(fpa_walks(top.0), top.1)
+    assert_eq(fpa_walks(nested.0), nested.1)
+end the_kept_parameter_fixpoint_wakes_only_callers
+
+// The two chains, each function handing its slice to the next, as functions of their own or as the
+// nested functions of an entry file's body; and how many functions the analysis was given.
+private fpa_chains(n: usize, own: bool) -> (&Fpa, int)
     var text = "var held: []const u8\n\n"
 
     for i in 0..<n
@@ -724,28 +752,28 @@ the_kept_parameter_fixpoint_wakes_only_callers()
         text = text + s"b$i(b: []const u8)\n"
         text = text + (if i == 0 then "    held = b\n\n" else s"    b${i - 1}(b)\n\n")
 
-    text = text + s"var store: [8]u8\n\na0(store[0..<4])\nb${n - 1}(store[0..<4])\n"
+    // With `main` declared, `store` is module storage too and the calls are main's body.
+    val pad = if own then "    " else ""
+
+    text = text + "var store: [8]u8\n\n" + (if own then "main()\n" else "")
+    text = text + s"${pad}a0(store[0..<4])\n${pad}b${n - 1}(store[0..<4])\n"
 
     val parsed = parse(source_of("test.sysl", text))
     var units: Buf[Program] = buf()
-    val library = arc_library()
 
-    for item in library
+    for item in arc_library()
         units.push(item)
 
     units.push(parsed.program)
 
     val done = analyze_bodies(units, host_target())
 
-    assert(done.reported.is_empty())
+    assert(done.reported.is_empty(), if done.reported.is_empty() then "" else done.reported[0].diag.message)
 
-    val cost = settle_cost(done.an, program_of(done, ""))
+    val funcs = program_of(done, "").funcs
 
-    // Every link keeps its slice, and the walks stay linear in the length of the chains: a walk per
-    // link to start with, and one more for each link woken when the link below it grew. It is 599.
-    assert_eq(cost.1, 2 * n)
-    assert(cost.0 <= 4 * n)
-end the_kept_parameter_fixpoint_wakes_only_callers
+    (fpa_analyze(done.an, funcs), int(funcs.len()))
+end fpa_chains
 
 // **A term of an `&&` chain is reached only where the chain got that far**, so a count it takes has
 // to be given back before the branch it guards -- a release registered with the enclosing scope is

@@ -117,18 +117,8 @@ struct EscapeWalk
     // that have to say something else about a promotion.
     sites: Buf[EscapeSite]
 
-    // Whether any confined view left the frame at all, promotable or not. This is what a parameter
-    // summary asks -- "does the callee let this outlive the call" is a yes/no, and the roots that
-    // answer promotion are not its question.
-    got_out: bool
-
     // The first escape that has nowhere to be promoted, which is the one refusal this walk makes.
     refusal: Option[(Span, string)]
-
-    // Whether returning a view counts as leaving. A returned view goes up one frame, where the
-    // storage it names is still alive; that is the difference between keeping a thing and viewing
-    // it, and it is what a parameter summary is asked without.
-    returning_escapes: bool
 
     // The arrays this body declares for itself, which are the ones it may move. A `[N]T` parameter
     // is storage the caller laid out, so it is deliberately not here.
@@ -233,7 +223,7 @@ private join_views(a: EView, b: EView) -> EView
         push_name(&out.named, item)
 
     // A temporary is one root however many times a value reaches it, exactly as a name is: the
-    // fixpoint in `walk_seeded` joins a binding's view with itself every round, and a list that grew
+    // fixpoint in `walk_body` joins a binding's view with itself every round, and a list that grew
     // there would never compare equal to the round before.
     for temp in a.temps
         if !holds_temp_span(out.temps, temp.0) then out.temps.push(temp)
@@ -260,14 +250,13 @@ end push_name
 check_escapes(a: &Analysis, p: TProgram) -> Promotions
     val keeps = kept_params(a, p)
 
-    settle_summaries(p, keeps)
     refuse_borrowed(a, p, keeps)
 
     var out = no_promotions()
 
     for i in 0..<p.funcs.len()
         val f = p.funcs[i]
-        val w = walk_body(p, keeps, f.body.stmts, f.body.result, true)
+        val w = walk_body(p, keeps, f.body.stmts, f.body.result)
         val home = func_home(a, f.name)
 
         report_body(a, p, home, Some(f.name), f.marks.gives_up("alloc"), w)
@@ -283,7 +272,7 @@ check_escapes(a: &Analysis, p: TProgram) -> Promotions
         for temp in w.temps
             out.temporaries.push(temp.0)
 
-    var mw = walk_body(p, keeps, p.main, None, true)
+    var mw = walk_body(p, keeps, p.main, None)
 
     // The entry point lays the module's storage down as well as running the statements, and those
     // initializers were written in other files: each literal among them is counted as met and never
@@ -322,28 +311,22 @@ private note_promotions(into: *Buf[(string, string)], home: Scope, w: EscapeWalk
             into.push((home.src.name, line))
 end note_promotions
 
-// For each function, which of its slice-carrying parameters it lets outlive the call. Starts
-// optimistic -- nothing is kept -- and grows until it stops changing, which is what makes a
-// recursive function converge on its real behaviour.
+// **Whether a callee lets an argument outlive the call is read off the field-path analysis**
+// (`fpa.sysl`), which every body's summary was settled by: a parameter is let out when a path of it
+// that stays out of a box is kept, or stored through another parameter. A view put into a heap
+// object the callee answers is handed back rather than kept (`reference/memory.md`, L5): the caller
+// treats the answer as made of its arguments (`any_view`), so a later store of the object is caught
+// where the caller makes it.
 //
 // A function is known by its index in `p.funcs` -- the first one of its name, which is the one a
-// lookup by name always found -- so a pair is two numbers and asking about one is a hash lookup
-// rather than a walk over every function. `asked` records which functions' answers the walk under
-// way consulted, which is what tells the fixpoint whom to wake when an answer grows.
+// lookup by name always found.
 struct KeptParams
     index: Map[string, usize]
-    pairs: Set[(usize, usize)]
-    asked: Buf[usize]
-    examined: usize
+    fx: &Fpa
 
-    // The positions each `extern` declares `@keeps`, by name, and the analysis, which answers what a
-    // trait's own declaration of a method says (`object_declares_kept`).
-    c_kept: Map[string, Buf[usize]]
+    // The analysis, which answers what a trait's own declaration of a method says
+    // (`object_declares_kept`) and what an `extern` declares `@keeps`.
     an: &Analysis
-
-    holds(self, name: string, i: usize) -> bool = self.index.get(name) match
-        Some(id) -> self.pairs.has((id, i))
-        None -> false
 end KeptParams
 
 private kept_params(a: &Analysis, p: TProgram) -> &KeptParams
@@ -354,152 +337,47 @@ private kept_params(a: &Analysis, p: TProgram) -> &KeptParams
 
         if !index.has(name) then index.put(name, i)
 
-    var c_kept: Map[string, Buf[usize]] = map()
-
-    for i in 0..<a.tables.externs.len()
-        val d = a.tables.externs.at(i)
-        var at: Buf[usize] = buf()
-
-        for j in 0..<d.params.len()
-            if holds_string(d.keeps, d.params[j].name) then at.push(j)
-
-        c_kept.put(a.tables.externs.key_at(i), at)
-    end for
-
-    KeptParams(index, set(), buf(), 0, c_kept, a)
+    KeptParams(index, field_paths_of(a, p), a)
 end kept_params
 
-// The pairs grow until nothing changes, and a function is looked at again only when something it
-// consulted last time -- a callee's answer, its own among them -- has grown since. Every walk only
-// ever turns more of its answer on as the pairs grow, so the order the functions are looked at in
-// does not change where the growth stops.
-private settle_summaries(p: TProgram, keeps: &KeptParams)
-    val n = p.funcs.len()
-    var queue: Buf[usize] = buf()
-    var queued: Buf[bool] = buf()
-    var callers: Map[usize, Buf[usize]] = map()
-    var edges: Set[(usize, usize)] = set()
+// The field-path analysis the checks ran, where it summarized every body of this program; otherwise
+// one of this program's own bodies.
+private field_paths_of(a: &Analysis, p: TProgram) -> &Fpa
+    a.field_paths match
+        Some(fx) ->
+            if fpa_covers(fx, p.funcs) then return fx
+        None -> ()
 
-    for i in 0..<n
-        queue.push(i)
-        queued.push(true)
-
-    var head: usize = 0
-
-    while head < queue.len()
-        val fi = queue[head]
-
-        head += 1
-        queued[fi] = false
-
-        val f = p.funcs[fi]
-        var grew = false
-
-        keeps.asked.clear()
-
-        for j in 0..<f.params.len()
-            if !carries_view(f.params[j].1) then continue
-            if keeps.pairs.has((fi, j)) then continue
-
-            keeps.examined += 1
-
-            if kepts(p, keeps, f, f.params[j].0)
-                keeps.pairs.add((fi, j))
-                grew = true
-
-        for callee in keeps.asked
-            if edges.add((callee, fi))
-                var list = callers.get_or(callee, buf())
-
-                list.push(fi)
-                callers.put(callee, list)
-
-        if !grew then continue
-
-        // Its own answer grew, so it is among those to look at again when it consulted itself.
-        callers.get(fi) match
-            None -> ()
-            Some(list) ->
-                for c in list
-                    if !queued[c]
-                        queued[c] = true
-                        queue.push(c)
-end settle_summaries
-
-// How many parameter walks it took the fixpoint to settle `p`, and how many pairs it settled on --
-// the measure of whether it looked at a function again only when it had to.
-settle_cost(a: &Analysis, p: TProgram) -> (usize, usize)
-    val keeps = kept_params(a, p)
-
-    settle_summaries(p, keeps)
-    (keeps.examined, keeps.pairs.len())
-end settle_cost
-
-// Whether a function lets a parameter outlive the *call* -- which returning a view of it does not.
-private kepts(p: TProgram, keeps: &KeptParams, f: TFunc, param: string) -> bool
-    var seeds: Buf[(string, EView)] = buf()
-
-    seeds.push((param, unnamed_view("")))
-
-    val w = walk_seeded(p, keeps, seeds, f.body.stmts, f.body.result, false, false)
-
-    w.got_out
-end kepts
+    fpa_analyze(a, p.funcs)
+end field_paths_of
 
 // **An `extern` borrows what it is handed for the call unless its declaration says `@keeps`**, which
 // is C's own convention: a view handed to C stays where it is. Any other function whose body is not
 // here -- a form the compiler supplies -- keeps everything, since nothing can tell.
 private kept_by(p: TProgram, keeps: &KeptParams, name: string, i: usize) -> bool
-    keeps.index.get(name) match
-        None -> keeps.c_kept.get(name) match
-            Some(at) ->
-                for j in at
-                    if j == i then return true
+    if keeps.index.has(name) then return fpa_lets_out_whole(keeps.fx, name, i)
 
-                false
-            None -> true
-        Some(id) ->
-            keeps.asked.push(id)
-            keeps.pairs.has((id, i))
+    keeps.an.tables.externs.get(name) match
+        Some(d) -> i < d.params.len() && holds_string(d.keeps, d.params[i].name)
+        None -> true
 end kept_by
 
 // -- one body ----------------------------------------------------------------------------------------
 
-private walk_body(p: TProgram, keeps: &KeptParams, stmts: Buf[TStmt], result: Option[TExpr],
-                  returning: bool) -> EscapeWalk
-    var seeds: Buf[(string, EView)] = buf()
-
-    walk_seeded(p, keeps, seeds, stmts, result, returning, true)
-end walk_body
-
 // Propagates through the body's own locals to a fixpoint, then looks for the places a confined view
 // could get out.
-private walk_seeded(p: TProgram, keeps: &KeptParams, seeds: Buf[(string, EView)], stmts: Buf[TStmt],
-                    result: Option[TExpr], returning: bool, gather: bool) -> EscapeWalk
+private walk_body(p: TProgram, keeps: &KeptParams, stmts: Buf[TStmt], result: Option[TExpr]) -> EscapeWalk
+    var confined: Buf[(string, EView)] = buf()
     var promoted: Buf[string] = buf()
     var temps: Buf[(Span, string)] = buf()
     var sites: Buf[EscapeSite] = buf()
-    var locals: Buf[string] = buf()
-    var ref_of: Buf[(string, TExpr)] = buf()
-    var aligned: Buf[(string, usize)] = buf()
-    var decl_at: Buf[(string, Span)] = buf()
-    var blocks: Buf[Span] = buf()
-
-    if gather
-        locals = local_arrays(stmts)
-        ref_of = ref_bindings(stmts)
-        aligned = aligned_arrays(stmts)
-
-        val found = scopes(stmts)
-
-        decl_at = found.0
-        blocks = found.1
-
+    val found = scopes(stmts)
     var lits: Buf[Span] = buf()
     var framed: Buf[Span] = buf()
 
-    val w: &EscapeWalk = EscapeWalk(seeds, promoted, temps, sites, false, None, returning, locals,
-                                    ref_of, aligned, lits, framed, decl_at, blocks, buf())
+    val w: &EscapeWalk = EscapeWalk(confined, promoted, temps, sites, None, local_arrays(stmts),
+                                    ref_bindings(stmts), aligned_arrays(stmts), lits, framed, found.0,
+                                    found.1, buf())
     val prog = p
     val kp = keeps
     var changed = true
@@ -518,7 +396,7 @@ private walk_seeded(p: TProgram, keeps: &KeptParams, seeds: Buf[(string, EView)]
         None -> ()
 
     *w
-end walk_seeded
+end walk_body
 
 // One statement's bindings: a local views whatever it was given, and a `ref` name views whatever its
 // place views.
@@ -718,7 +596,7 @@ private struct ScopeList
     blocks: Buf[Span]
 
 private returned(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, v: TExpr)
-    if w.returning_escapes && views(p, keeps, w, v).non_empty() then gets_out(p, keeps, w, v,
+    if views(p, keeps, w, v).non_empty() then gets_out(p, keeps, w, v,
                                                                              "is returned")
     else escaping(p, keeps, w, v)
 end returned
@@ -844,8 +722,6 @@ private gets_out(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, at: TExpr, how
         if !holds_temp_span(w.temps, t.0)
             w.sites.push(EscapeSite("", t.1, t.0, how, "the frame"))
             w.temps.push(t)
-
-    w.got_out = true
 
     if v.anonymous && w.refusal.is_none()
         // Placed at the view's own bracket, as a promotion's note is: what has to change is the
@@ -1581,7 +1457,7 @@ private refuse_borrowed(a: &Analysis, p: TProgram, keeps: &KeptParams)
             // The receiver is the object itself, which is a box of its own rather than the caller's. A
             // parameter the trait declares `@keeps` may be kept: every call is held to that instead.
             for at in 1..<f.params.len()
-                if !carries_view(f.params[at].1) || !keeps.holds(slot.target, at) then continue
+                if !carries_view(f.params[at].1) || !kept_by(p, keeps, slot.target, at) then continue
                 if table_declares_kept(a, vt, int(s), at) then continue
 
                 val pname = f.params[at].0
