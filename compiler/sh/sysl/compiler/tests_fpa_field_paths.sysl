@@ -1,6 +1,7 @@
 module sh.sysl.compiler
 @tests
 
+import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 
 // The field-path analysis (`fpa.sysl`), asked directly: what each function keeps of each parameter,
@@ -313,3 +314,107 @@ fpa_refused_body()
 
     assert_eq(fpa_kept_text(fx, "bad", 0), "")
     assert_eq(fpa_disagreements(done.an, done.funcs).len(), 0)
+
+// -- what a call answers is filtered by type reachability (M35) ------------------------------------
+//
+// A call with no body in sight may answer with an argument only where the answer's type can reach the
+// argument's: through a field, a box, a generic argument, or as a raw pointer a cast may have made of
+// anything. The cells cross the answer's type (cannot hold it, holds it through a box, through a
+// generic struct's argument, a raw pointer) with how the call is made (a trait object, a `&Fn`, a
+// body calling either, whose summary carries the answer on) and what is done with the answer (handed
+// back, stored at an offset).
+
+private val fpa_picks: string = "struct Q\n    q: *u8\n\nstruct Bx\n    v: *int\n\n" +
+    "struct G[T]\n    x: T\n\nvar held_q = Q(null)\n\n"
+
+@test("an answer whose type cannot hold the argument is not made of it, and storing it keeps nothing")
+fpa_m35_cannot_hold()
+    val fx = fpa_of(fpa_picks + "trait Pick\n    pick(*self, p: *int) -> Q\n\n" +
+                    "via(o: *Pick, p: *int) -> Q = o.pick(p)\n\n" +
+                    "outer(o: *Pick, p: *int) -> Q = via(o, p)\n\n" +
+                    "hold(o: *Pick, p: *int)\n    held_q = o.pick(p)\n\nmain()\n    spare = 1\n")
+
+    assert_eq(fpa_answers_text(fx, "via", 1), "")
+    assert_eq(fpa_answers_text(fx, "outer", 1), "")
+    assert_eq(fpa_kept_text(fx, "hold", 1), "")
+    assert(!fpa_lets_out(fx, "hold", 1))
+
+@test("an answer that holds the argument through a box is made of it, and storing it keeps it")
+fpa_m35_through_box()
+    val fx = fpa_of(fpa_picks + "var held_b: &Bx = Bx(&spare)\n\n" +
+                    "trait Pick\n    pick(*self, p: *int) -> &Bx\n\n" +
+                    "via(o: *Pick, p: *int) -> &Bx = o.pick(p)\n\n" +
+                    "hold(o: *Pick, p: *int)\n    held_b = o.pick(p)\n\nmain()\n    spare = 1\n")
+
+    assert(fpa_answers(fx, "via", 1))
+    assert(fpa_keeps(fx, "hold", 1))
+
+@test("a generic struct holds the argument where it is instantiated at the argument's type, and not elsewhere")
+fpa_m35_generic()
+    val fx = fpa_of(fpa_picks + "trait Pick\n    at_int(*self, p: *int) -> G[*int]\n    at_u8(*self, p: *int) -> G[*u8]\n\n" +
+                    "via_int(o: *Pick, p: *int) -> G[*int] = o.at_int(p)\n\n" +
+                    "via_u8(o: *Pick, p: *int) -> G[*u8] = o.at_u8(p)\n\nmain()\n    spare = 1\n")
+
+    assert(fpa_answers(fx, "via_int", 1))
+    assert(!fpa_answers(fx, "via_u8", 1))
+
+@test("an answer that is a raw pointer may be made of any address, whatever it points at")
+fpa_m35_raw_pointer()
+    val fx = fpa_of(fpa_picks + "trait Pick\n    pick(*self, p: *int) -> *u8\n\n" +
+                    "via(o: *Pick, p: *int) -> *u8 = o.pick(p)\n\nmain()\n    spare = 1\n")
+
+    assert(fpa_answers(fx, "via", 1))
+
+@test("an argument holding the address in place is answered by a struct that can hold a field of it")
+fpa_m35_field_of_argument()
+    val fx = fpa_of(fpa_picks + "trait Pick\n    pick(*self, s: *S) -> Bx\n\n" +
+                    "via(o: *Pick, s: *S) -> Bx = o.pick(s)\n\nmain()\n    spare = 1\n")
+
+    // `Bx` holds a `*int`, the type of `S`'s fields, held in place where `s` points.
+    assert(fpa_answers(fx, "via", 1))
+
+// The same, through a `&Fn`, whose type the program reads from the library.
+private var fpa_library_cache: Buf[Program] = buf()
+private var fpa_library_read: bool = false
+
+private fpa_with_library(text: string) -> Option[&Fpa]
+    if !fpa_library_read
+        fpa_library_read = true
+
+        std_root() match
+            Err(_) -> ()
+            Ok(root) -> std_units(root, host_target()) match
+                Err(_) -> ()
+                Ok(units) -> fpa_library_cache = units
+
+    if fpa_library_cache.is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return None
+
+    var units: Buf[Program] = buf()
+
+    for item in fpa_library_cache
+        units.push(item)
+
+    units.push(parse(source_of("test.sysl", fpa_decls + fpa_picks + text)).program)
+
+    val done = analyze_bodies(units, host_target())
+
+    assert(done.reported.is_empty(), if done.reported.is_empty() then "" else done.reported[0].diag.message)
+    Some(fpa_analyze(done.an, program_of(done, "").funcs))
+end fpa_with_library
+
+@test("a call through a '&Fn' answers with an argument only where its answer's type can hold it")
+fpa_m35_callable()
+    val got = fpa_with_library("via_q(f: &Fn(*int) -> Q, p: *int) -> Q = f(p)\n\n" +
+                               "via_b(f: &Fn(*int) -> &Bx, p: *int) -> &Bx = f(p)\n\n" +
+                               "hold(f: &Fn(*int) -> Q, p: *int)\n    held_q = f(p)\n\n" +
+                               "main()\n    spare = 1\n")
+
+    if got.is_none() then return
+
+    val fx = got.unwrap()
+
+    assert(!fpa_answers(fx, "via_q", 1))
+    assert(fpa_answers(fx, "via_b", 1))
+    assert_eq(fpa_kept_text(fx, "hold", 1), "")
