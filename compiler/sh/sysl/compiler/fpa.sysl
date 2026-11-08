@@ -82,7 +82,8 @@ struct FpaSum
 end FpaSum
 
 // The analysis of a whole program, with the tables that name steps, paths, roots and pairs of them by
-// integers: a path is a walk down `paths` from the empty path (0), one step id at a time.
+// integers: a path is a walk down `paths` from the empty path (0), one step id at a time. `places`,
+// `reach_of`, `type_ids` and `named` remember what a place can hold by its type (`place_reach`).
 struct Fpa
     an: &Analysis
     funcs: Buf[TFunc]
@@ -101,6 +102,10 @@ struct Fpa
     lent: Map[string, Buf[string]]
     fits: Map[string, bool]
     fits_at: Map[u64, bool]
+    places: Map[u64, Map[u32, Option[Buf[Map[string, bool]]]]]
+    reach_of: Map[u64, Option[Buf[Map[string, bool]]]]
+    type_ids: Map[string, u32]
+    named: Map[string, Buf[(Type, string)]]
 end Fpa
 
 // What one cell may hold, with the atoms already in it by key, the parameter paths already in it
@@ -118,7 +123,8 @@ end FCell
 // with which cells were read in the walk under way, since a cell that grows after it was read sends
 // the body round again. `kept` and `thru` are the parameter paths already kept, and already stored
 // through another parameter; `dests` names each `$thr` cell by parameter and path id, and `dest_list`
-// holds them in the order they were first stored into.
+// holds them in the order they were first stored into. `held` is what each parameter holds in place,
+// by type (`param_fits`), and `reach` what a place through one can hold (`param_reach`).
 struct FBody
     fx: &Fpa
     f: TFunc
@@ -132,6 +138,8 @@ struct FBody
     driven: Map[usize, bool]
     dests: Map[u64, string]
     dest_list: Buf[(string, usize, Buf[FStep])]
+    held: Map[usize, Buf[string]]
+    reach: Map[u64, Option[Buf[Map[string, bool]]]]
 end FBody
 
 // -- the whole program ----------------------------------------------------------------------------
@@ -145,7 +153,7 @@ fpa_analyze(a: &Analysis, funcs: Buf[TFunc]) -> &Fpa
         if !index.has(funcs[i].name) then index.put(funcs[i].name, i)
 
     // One box every walk shares, so the walk counter a cell's `read` is stamped with is one count.
-    val fx: &Fpa = Fpa(a, funcs, index, buf(), map(), map(), 0, fpa_tracing(), map(), map(), map(), map(), map(), map(), map(), map(), map())
+    val fx: &Fpa = Fpa(a, funcs, index, buf(), map(), map(), 0, fpa_tracing(), map(), map(), map(), map(), map(), map(), map(), map(), map(), map(), map(), map(), map())
 
     // The steps every walk takes, first, so the constants below name them.
     step_in(fx, "~", "")
@@ -371,7 +379,7 @@ private walk_func(fx: &Fpa, fi: usize) -> &FpaSum
 end walk_func
 
 private settle_body(fx: &Fpa, f: TFunc) -> &FBody =
-    settle(FBody(fx, f, map(), map(), map(), map(), false, 0, buf(), map(), map(), buf()))
+    settle(FBody(fx, f, map(), map(), map(), map(), false, 0, buf(), map(), map(), buf(), map(), map()))
 
 // Walks a body until no cell it read grows. A cell counts as read in this walk when its `read` is this
 // walk's number, `fx.walks`.
@@ -455,11 +463,18 @@ end summarize
 // **What is stored through parameter `dest` where its value along `at` points**, from its cell `name`:
 // a parameter's path is written there; what a heap object stored there holds is written inside it
 // (`at~`), at every depth of heap objects, since the object now lives where the caller placed it and
-// is the caller's to keep or not; a parameter's own value stored back inside what it points at is
-// not written, as `store_at` leaves it. The address of a local stored there lets the local's storage
+// is the caller's to keep or not, except a parameter's own value the place cannot hold by its type;
+// a parameter's own value stored back inside what it points at is not written, as `store_at` leaves
+// it. The address of a local stored there lets the local's storage
 // out, so it goes to `work`, to be kept with what it holds.
 private written_through(fb: &FBody, sum: &FpaSum, name: string, dest: usize, at: Buf[FStep], work: *Buf[FAtom])
     val inside = extend(at, tilde_step())
+
+    // A parameter's own value held in a heap object stored there is written only where the place's
+    // type can hold it (M44): the object may have been filled from a box's whole interior. The type
+    // is asked the first time it matters.
+    var reach: Option[Buf[Map[string, bool]]] = None
+    var asked = false
     var visited: Map[string, bool] = map()
     var todo: Buf[(FAtom, bool)] = buf()
 
@@ -477,8 +492,17 @@ private written_through(fb: &FBody, sum: &FpaSum, name: string, dest: usize, at:
         if a.root.starts_with("p")
             val src = param_of(a.root)
 
-            if !deep then sum_write(fb.fx, sum, dest, src, a.path, at)
-            else if src != dest then sum_write(fb.fx, sum, dest, src, a.path, inside)
+            if !deep
+                sum_write(fb.fx, sum, dest, src, a.path, at)
+            else if src != dest
+                if a.path.is_empty() && !asked && dest < fb.f.params.len()
+                    reach = reach_at(fb.fx, fb.f.params[dest].1, at)
+                    asked = true
+                end if
+
+                if !a.path.is_empty() || reach.is_none() || param_fits(fb, src, reach.unwrap())
+                    sum_write(fb.fx, sum, dest, src, a.path, inside)
+            end if
         else if a.root.starts_with("h:")
             if !visited.has(a.root)
                 visited.put(a.root, true)
@@ -691,6 +715,10 @@ end lend
 private val TILDE: u32 = 1
 private val STAR: u32 = 2
 private val ELEM: u32 = 3
+
+// The slots `place_reach` keeps a call's answer and a store under, beside an argument's index.
+private val PLACE_ANSWER: usize = 254
+private val PLACE_STORE: usize = 255
 
 private tilde_step() -> FStep = FStep("~", "", TILDE)
 private star_step() -> FStep = FStep("*", "", STAR)
@@ -915,6 +943,8 @@ private project(fb: &FBody, v: Buf[FAtom], st: FStep) -> Buf[FAtom]
 
     var out: Buf[FAtom] = buf()
 
+    out.reserve(v.len())
+
     for a in v
         project_one(fb, a, st, &out)
 
@@ -927,6 +957,8 @@ private distinct(v: Buf[FAtom]) -> Buf[FAtom]
     if v.len() < 2 then return v
 
     var out: Buf[FAtom] = buf()
+
+    out.reserve(v.len())
 
     // A short value is checked atom against atom, which allocates nothing.
     if v.len() <= 16
@@ -1045,6 +1077,8 @@ private anywhere_in(fb: &FBody, v: Buf[FAtom]) -> Buf[FAtom]
 end anywhere_in
 
 private join_into(out: *Buf[FAtom], v: Buf[FAtom])
+    out.reserve(v.len())
+
     for a in v
         out.push(a)
 end join_into
@@ -1323,6 +1357,294 @@ private name_type(seen: *Map[string, bool], names: *Buf[string], key: string)
     seen.put(key, true)
     names.push(key)
 end name_type
+
+// **What a place can hold, by its type** (M44): for each type the place may have, the names
+// `reached_from` gives for it. `None` says nothing -- every value may land there -- and is the answer
+// wherever the types cannot tell: the path is one the types do not follow, the place is a raw pointer
+// (a cast may have made it of any address), or an open type is reached. Asked once per place: `slot`
+// is the argument written through, or `PLACE_ANSWER` / `PLACE_STORE`, and `site` the call or the store.
+private place_reach(fx: &Fpa, site: TExpr, slot: usize, base: Type, at: Buf[FStep]) -> Option[Buf[Map[string, bool]]]
+    val outer = (u64(node_id(site)) << 8) | u64(slot)
+    val pid = path_id(fx, at)
+
+    fx.places.get(outer) match
+        Some(inner) ->
+            inner.get(pid) match
+                Some(r) -> return r
+                None -> ()
+        None -> ()
+
+    val r = reach_at(fx, base, at)
+
+    fx.places.get(outer) match
+        Some(inner) -> inner.put(pid, r)
+        None ->
+            var inner: Map[u32, Option[Buf[Map[string, bool]]]] = map()
+
+            inner.put(pid, r)
+            fx.places.put(outer, inner)
+
+    r
+end place_reach
+
+// The same from a value of type `base`, once per type and path.
+private reach_at(fx: &Fpa, base: Type, at: Buf[FStep]) -> Option[Buf[Map[string, bool]]]
+    val key = (u64(enter_types(fx, base)) << 32) | u64(path_id(fx, at))
+
+    fx.reach_of.get(key) match
+        Some(r) -> return r
+        None -> ()
+
+    val r = reach_of_types(fx, types_along(fx, base, at))
+
+    fx.reach_of.put(key, r)
+    r
+end reach_at
+
+private reach_of_types(fx: &Fpa, found: Option[Buf[Type]]) -> Option[Buf[Map[string, bool]]]
+    if found.is_none() then return None
+
+    var out: Buf[Map[string, bool]] = buf()
+
+    for t in found.unwrap()
+        if !fpa_holds(fx, t) || is_ptr_type(t) || task_result(t).is_some() then return None
+
+        val from = reached_from(fx, t)
+
+        if from.has("?") then return None
+
+        out.push(from)
+    end for
+
+    Some(out)
+end reach_of_types
+
+// **The types the place at the end of `path` may have**, from a value of type `root`: a field by its
+// index, a variant's field by its variant, the pointee of a pointer, box or view, an array's element,
+// each step held to the name it says it lands on. A `~` stands for anywhere at or below where it is,
+// which the type there already covers.
+//
+// **A path may have been cut** (`extend`): a step landing on a name the path already went through
+// went back to where it first did, so the steps after a named landing may be a deeper value's of
+// that name -- `BufCore[Stmt]` inside `BufCore[Program]`, or a type of the same name in another
+// module. So at every named landing each type of that name the root can reach is a candidate too, and
+// the steps after it keep only the candidates whose names agree.
+private types_along(fx: &Fpa, root: Type, path: Buf[FStep]) -> Option[Buf[Type]]
+    var from: Option[Map[string, bool]] = None
+    var cur: Buf[Type] = buf()
+
+    cur.push(root)
+
+    for st in path
+        if st.s == "~" then break
+
+        var next: Buf[Type] = buf()
+
+        for t in cur
+            val got = step_type(t, st.s)
+
+            if got.is_some() && step_named(t, st, got.unwrap()) then next.push(got.unwrap())
+
+        val key = cut_key(st.n)
+
+        if key != ""
+            if from.is_none() then from = Some(reached_from(fx, root))
+
+            named_in(fx, key, from.unwrap(), &next)
+
+            if st.s == "*" && key.starts_with("&") then named_in(fx, without_box_mark(key), from.unwrap(), &next)
+        end if
+
+        if next.is_empty() then return None
+
+        cur = next
+    end for
+
+    Some(cur)
+end types_along
+
+// A box step's name without its `&`: the name of the type inside the box.
+private without_box_mark(key: string) -> string
+    val b = key.bytes
+
+    from_utf8_unchecked(b[1..<b.len])
+end without_box_mark
+
+// Whether a step from a value of type `t` onto `landed` names what it lands on as `st` does, as
+// `deref_step` and `field_nominal` name it. A step that names nothing agrees with every type.
+private step_named(t: Type, st: FStep, landed: Type) -> bool
+    if st.n == "" then return true
+
+    val key = cut_key(st.n)
+    val n = nominal(landed)
+
+    if st.s == "*" then key == n || key == "&" + n else key == cut_key(field_nominal(landed))
+end step_named
+
+// The types of each name a cut path may have landed on (`types_along`): every type named so far, by
+// name, with how each is shown. Entering a type enters everything it can reach, through boxes too, so
+// once `t` is entered the types of a name `t` can reach are among those listed under it, told from the
+// rest by `reached_from`. Answers `t`'s number, by which a place's answer is remembered.
+private enter_types(fx: &Fpa, t: Type) -> u32
+    val top = type_show(t)
+
+    fx.type_ids.get(top) match
+        Some(id) -> return id
+        None -> ()
+
+    var work: Buf[Type] = buf()
+
+    work.push(t)
+
+    loop
+        val next = work.pop()
+
+        if next.is_none() then break
+
+        val cur = next.unwrap()
+        val key = type_show(cur)
+
+        if fx.type_ids.has(key) then continue
+
+        fx.type_ids.put(key, u32(fx.type_ids.len()))
+
+        val n = nominal(cur)
+
+        if n != ""
+            var list: Buf[(Type, string)] = fx.named.get(n).unwrap_or(buf())
+
+            list.push((cur, key))
+            fx.named.put(n, list)
+        end if
+
+        cur match
+            Ptr(inner) -> work.push(*inner)
+            Slice(elem, _) -> work.push(*elem)
+            Ref(inner, _) -> work.push(*inner)
+            Weak(inner) -> work.push(*inner)
+            Volatile(inner) -> work.push(*inner)
+            Array(_, elem) -> work.push(*elem)
+            Vector(_, elem) -> work.push(*elem)
+            Pack(elems) ->
+                for x in elems
+                    work.push(x)
+            Struct(d) ->
+                for item in d.fields
+                    work.push(item.1)
+            Results(d) ->
+                for item in d.fields
+                    work.push(item.1)
+            Enum(d) ->
+                for v in d.variants
+                    for item in v.fields
+                        work.push(item.1)
+            Constrained(d) -> work.push(d.base)
+            _ -> ()
+    end loop
+
+    fx.type_ids.get(top).unwrap_or(0)
+end enter_types
+
+// Every type entered under the name `key` (`enter_types`) that the root can reach (`from`), added to
+// `out`.
+private named_in(fx: &Fpa, key: string, from: Map[string, bool], out: *Buf[Type])
+    fx.named.get(key) match
+        Some(list) ->
+            for t in list
+                if from.has(t.1) then out.push(t.0)
+        None -> ()
+end named_in
+
+private step_type(t: Type, s: string) -> Option[Type] = t match
+    Volatile(inner) -> step_type(*inner, s)
+    Constrained(d) -> step_type(d.base, s)
+    Array(_, elem) -> if s == "[]" then Some(*elem) else None
+    Struct(d) -> field_by_step(d.fields, s)
+    Results(d) -> field_by_step(d.fields, s)
+    Enum(d) ->
+        for v in d.variants
+            for k in 0..<v.fields.len()
+                if variant_step(v, k) == s then return Some(v.fields[k].1)
+
+        None
+    _ -> if s == "*" then pointee_of(t) else None
+
+private field_by_step(fields: Buf[(string, Type)], s: string) -> Option[Type]
+    for k in 0..<fields.len()
+        if s == s".$k" then return Some(fields[k].1)
+
+    None
+end field_by_step
+
+// What is written at a place, less each parameter's own value whose type the place cannot hold: an
+// `&Analysis` read out of the box of an analyzer that holds it is not stored into a `Type`'s list,
+// whatever else was read out of that box (M28 makes a box's interior one cell). Only a parameter's
+// value itself is told apart, since its type is the parameter's.
+private held_by_place(fb: &FBody, v: Buf[FAtom], reach: Option[Buf[Map[string, bool]]]) -> Buf[FAtom]
+    if reach.is_none() then return v
+
+    val from = reach.unwrap()
+    var out: Buf[FAtom] = buf()
+    var dropped = false
+
+    for x in v
+        if x.path.is_empty() && x.root.starts_with("p") && !param_fits(fb, param_of(x.root), from)
+            dropped = true
+            continue
+        end if
+
+        out.push(x)
+    end for
+
+    if dropped then out else v
+end held_by_place
+
+// What parameter `i` can hold where its value along `at` points (`reach_at`), once per body.
+private param_reach(fb: &FBody, i: usize, at: Buf[FStep], at_id: u32) -> Option[Buf[Map[string, bool]]]
+    val key = (u64(i) << 32) | u64(at_id)
+
+    fb.reach.get(key) match
+        Some(r) -> return r
+        None -> ()
+
+    val r = reach_at(fb.fx, fb.f.params[i].1, at)
+
+    fb.reach.put(key, r)
+    r
+end param_reach
+
+// Whether a parameter's own value is among `v`: the one thing `held_by_place` tells apart, so the
+// place's type is asked only then.
+private has_param_value(v: Buf[FAtom]) -> bool
+    for x in v
+        if x.path.is_empty() && x.root.starts_with("p") then return true
+
+    false
+end has_param_value
+
+// Whether a place that can reach the types `from` can hold parameter `i`'s value, or an address into
+// what it holds in place (`answer_may_hold`'s rule, for a place rather than an answer).
+private param_fits(fb: &FBody, i: usize, froms: Buf[Map[string, bool]]) -> bool
+    if i >= fb.f.params.len() then return true
+
+    val names = fb.held.get(i) match
+        Some(got) -> got
+        None ->
+            val t = fb.f.params[i].1
+            val got: Buf[string] = if fpa_holds(fb.fx, t) then held_in_place(fb.fx, t) else buf()
+
+            fb.held.put(i, got)
+            got
+
+    for k in names
+        if k == "?" then return true
+
+        for from in froms
+            if from.has(k) then return true
+    end for
+
+    false
+end param_fits
 
 // An argument's atoms where the answer's type can hold it, and none where it cannot.
 private answered_arg(fx: &Fpa, answer: Type, args: Buf[TExpr], k: usize, v: Buf[FAtom]) -> Buf[FAtom] =
@@ -1766,8 +2088,10 @@ end addr
 // A value stored into a place.
 private store(fb: &FBody, place: TExpr, v: Buf[FAtom])
     val at = addr(fb, place)
+    val held = if !has_param_value(v) then v
+    else held_by_place(fb, v, place_reach(fb.fx, place, PLACE_STORE, texpr_type(place), buf()))
 
-    if !v.is_empty() then store_at(fb, at, v)
+    if !held.is_empty() then store_at(fb, at, held)
 end store
 
 // A value stored at each address: into what a local or a heap object holds there, through a
@@ -1798,7 +2122,14 @@ private store_at(fb: &FBody, at: Buf[FAtom], v: Buf[FAtom])
                     if !b.root.starts_with("p") || !covered(fb.fx, &fb.thru, u64(pair_id(fb.fx, pair_id(fb.fx, a.rid, b.rid), at_id)) << 32, without_tilde(b.path))
                         out.push(moved(fb, buf(), b))
 
-            add_to(fb, dest_cell(fb, param_of(a.root), at_path, at_id), out)
+            // What the parameter can hold there, by its own type, bounds what lands (M44): the place may
+            // have been reached through a box's whole interior, where a store into one field of the
+            // box is a store into every value the box holds.
+            val dest = param_of(a.root)
+            val held = if !has_param_value(out) || dest >= fb.f.params.len() then out
+            else held_by_place(fb, out, param_reach(fb, dest, at_path, at_id))
+
+            add_to(fb, dest_cell(fb, dest, at_path, at_id), held)
         else
             keep(fb, v)
 end store_at
@@ -1895,6 +2226,7 @@ private apply_inner(fb: &FBody, e: TExpr, sum: &FpaSum, args: Buf[TExpr], argv: 
             if !group_of.has(gk)
                 group_of.put(gk, groups.len())
                 groups.push((w.0, w.3, buf()))
+            end if
 
     for k in 0..<n
         // The paths of one parameter share their beginnings, so each is followed once.
@@ -1918,7 +2250,11 @@ private apply_inner(fb: &FBody, e: TExpr, sum: &FpaSum, args: Buf[TExpr], argv: 
                 // A buffer copied is a second name for the one buffer, so this adds to the group's.
                 var into = groups[g].2
 
-                join_into(&into, got)
+                // A parameter's own value lands only where the place's type can hold it (M44).
+                val held = if !has_param_value(got) || argv.len() != args.len() || w.0 >= args.len() then got
+                else held_by_place(fb, got, place_reach(fb.fx, e, w.0, texpr_type(args[w.0]), w.3))
+
+                join_into(&into, held)
             end if
 
         for p in sum.kept[k]
@@ -1936,7 +2272,11 @@ private apply_inner(fb: &FBody, e: TExpr, sum: &FpaSum, args: Buf[TExpr], argv: 
         for item in sum.answers[k]
             if !fits && !has_deref(item.0) then continue
 
-            val got = summary_along(fb, argv[k], item.0, &memo)
+            // A parameter's own value read out of a box along the path is answered only where the
+            // answer's type can hold it there (M44).
+            val read = summary_along(fb, argv[k], item.0, &memo)
+            val got = if !has_param_value(read) then read
+            else held_by_place(fb, read, place_reach(fb.fx, e, PLACE_ANSWER, ty, item.1))
 
             if has_deref(item.1) then into_made(fb, blob, item.1, got) else join_into(&out, placed(fb, got, item.1))
 

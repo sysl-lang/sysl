@@ -638,3 +638,75 @@ fpa_m35_callable()
     assert(!fpa_answers(fx, "via_q", 1))
     assert(fpa_answers(fx, "via_b", 1))
     assert_eq(fpa_kept_text(fx, "hold", 1), "")
+
+// -- a place holds only what its type can (M44) ---------------------------------------------------
+
+// An analyzer-shaped box: it holds the analysis `a` beside a type, so a read of the type out of the
+// box is a read of the box's whole interior (M28), the analysis among it. Where that read lands is
+// told by the place's type: a list of types cannot hold the analysis, a list of analyses can.
+private val fpa_places: string = "struct An\n    n: int\n\nenum Ty\n    Plain\n    Ptr(inner: &Ty)\n\n" +
+    "struct Cx\n    an: &An\n    ty: Ty\n\n" +
+    "read_ty(cx: &Cx, out: Buf[Ty]) = out.push(cx.ty)\n\n" +
+    "read_an(cx: &Cx, out: Buf[&An]) = out.push(cx.an)\n\n" +
+    "get_ty(cx: &Cx) -> Ty = cx.ty\n\n" +
+    "get_an(cx: &Cx) -> &An = cx.an\n\n"
+
+private fpa_with_places(text: string) -> Option[&Fpa] =
+    fpa_with_library_after("import sysl.buf.{Buf, buf}\n\n", fpa_places + text + "main()\n    spare = 1\n")
+
+@test("a value read out of a box that holds the analysis is not written into a list of types as the analysis")
+fpa_place_type_write()
+    val got = fpa_with_places("fill(a: &An, out: Buf[Ty])\n    val cx: &Cx = Cx(a, Plain)\n\n    read_ty(cx, out)\n\n" +
+                              "fill_an(a: &An, out: Buf[&An])\n    val cx: &Cx = Cx(a, Plain)\n\n    read_an(cx, out)\n\n")
+
+    if got.is_none() then return
+
+    val fx = got.unwrap()
+
+    assert(!fpa_writes(fx, "fill", 0))
+    assert_eq(fpa_kept_text(fx, "fill", 0), "")
+
+    // The same read where the place can hold the analysis is still a store of it.
+    assert(fpa_writes(fx, "fill_an", 0))
+
+@test("a list reached through a list is held to its own element type, where a path cut at the inner buffer lands")
+fpa_place_type_nested()
+    val got = fpa_with_places("fill_all(a: &An, outs: Buf[Buf[Ty]])\n    val cx: &Cx = Cx(a, Plain)\n\n" +
+                              "    for o in outs\n        read_ty(cx, o)\n\n" +
+                              "fill_all_an(a: &An, outs: Buf[Buf[&An]])\n    val cx: &Cx = Cx(a, Plain)\n\n" +
+                              "    for o in outs\n        read_an(cx, o)\n\n")
+
+    if got.is_none() then return
+
+    val fx = got.unwrap()
+
+    assert(!fpa_writes(fx, "fill_all", 0))
+    assert(fpa_writes(fx, "fill_all_an", 0))
+
+@test("an answer read out of a box that holds the analysis is not the analysis where the answer's type cannot hold it")
+fpa_place_type_answer()
+    val got = fpa_with_places("answer_ty(a: &An) -> Ty\n    val cx: &Cx = Cx(a, Plain)\n\n    get_ty(cx)\n\n" +
+                              "answer_an(a: &An) -> &An\n    val cx: &Cx = Cx(a, Plain)\n\n    get_an(cx)\n\n")
+
+    if got.is_none() then return
+
+    val fx = got.unwrap()
+
+    assert(!fpa_answers(fx, "answer_ty", 0))
+    assert(fpa_answers(fx, "answer_an", 0))
+
+@test("a store into one field of a box made of a parameter's value lands in that value only where its type can hold it")
+fpa_place_type_box_field()
+    val got = fpa_with_places("struct Wx\n    ans: Buf[&An]\n    tys: Buf[Ty]\n\n" +
+                              "put_an(w: &Wx, x: &An) = w.ans.push(x)\n\n" +
+                              "into_list(a: &An, tys: Buf[Ty])\n    val w: &Wx = Wx(buf(), tys)\n\n    put_an(w, a)\n\n" +
+                              "into_refs(a: &An, ans: Buf[&An])\n    val w: &Wx = Wx(ans, buf())\n\n    put_an(w, a)\n\n")
+
+    if got.is_none() then return
+
+    val fx = got.unwrap()
+
+    // The box's interior is one cell, so the store into its list of analyses reaches `tys` too; the
+    // list of types cannot hold the analysis, and the list of analyses handed in really holds it.
+    assert(!fpa_writes(fx, "into_list", 0))
+    assert(fpa_writes(fx, "into_refs", 0))
