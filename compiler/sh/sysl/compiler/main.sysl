@@ -1226,6 +1226,8 @@ private test_project(file: string, named: Option[string], cc: Option[string], gi
             Err(_) -> ()
     end if
 
+    compiling_started(file)
+
     val seconds =asked.seconds.unwrap_or(settings.timeout.unwrap_or(DefaultTestSeconds))
     val opts = TestOptions(given.filter, given.fail_fast,
                            asked.jobs.unwrap_or(settings.jobs.unwrap_or(cpu_count())), settings.alone)
@@ -1344,6 +1346,8 @@ end nothing_to_run
 private tests_run(file: string, exe: string, all: Buf[TTest], opts: TestOptions, seconds: int,
                   discard: bool, run: RefusedRun, note: string -> unit, report: string -> unit,
                   within: Buf[string], keep: Option[string]) -> int
+    compiling_done()
+
     nothing_to_run(file, all, run.files, opts.filter, within, note) match
         Some(code) -> return code
         None -> ()
@@ -1513,17 +1517,6 @@ private build_lib_usage() -> string =
 build_lib_output_refusal() -> string =
     "build-lib writes nothing anybody names — it checks a library, and what it compiles is this " +
     "compiler's cache, found by the compiler alone — so it takes no -o"
-
-// One piece of a report, written and **flushed**, so that a run followed through a log file shows each
-// verdict as it lands rather than only once the process exits. The pieces carry their own newlines,
-// which is what makes the concatenation of them the whole report.
-private stream_out(piece: string)
-    prints(piece)
-    c_flush_all(null)
-
-// Standard output is buffered when it is not a terminal, which is exactly the case a streaming report
-// is for. There is no flush in the library's printing surface, so the C one is named here.
-private extern "fflush" c_flush_all(stream: *u8) -> int
 
 // `sysl add <coordinate>[@<version>] [<path>]` -- one dependency written into a project's manifest.
 //
@@ -1817,6 +1810,16 @@ private said_to_terminal(line: string)
     else print(line)
 
 main(args: []string)
-    val code = run_cli_noted(args, said_to_terminal, line -> eprints(line + "\n"))
+    if args.len > 1 && args[1] == "test" then watch_for_stop()
+
+    val code = run_cli_noted(args,
+        line ->
+            flush_report()
+            said_to_terminal(line),
+        line ->
+            flush_report()
+            eprints(line + "\n"))
+
+    flush_report()
 
     if code != Fine then exit(code)
