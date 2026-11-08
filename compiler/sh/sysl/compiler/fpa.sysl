@@ -1102,6 +1102,15 @@ private join_into(out: *Buf[FAtom], v: Buf[FAtom])
         out.push(a)
 end join_into
 
+// The atoms of `v` not already in `out`, added to it; `has` holds the keys `out` has. What a call writes
+// to one place is gathered from every path written there, and the same atoms come along many of them.
+private join_new(out: *Buf[FAtom], has: *Map[u64, bool], v: Buf[FAtom])
+    for a in v
+        if !has.has(a.key)
+            has.put(a.key, true)
+            out.push(a)
+end join_new
+
 // An address one step further into the storage it points at. A parameter's value stands for every
 // address inside what it points at.
 private addr_step(fb: &FBody, v: Buf[FAtom], st: FStep) -> Buf[FAtom]
@@ -2136,7 +2145,7 @@ private store_at(fb: &FBody, at: Buf[FAtom], v: Buf[FAtom])
             // `e.ds` points at, which the caller places.
             val at_path = if inside then extend(a.path, tilde_step()) else a.path
             val at_id = path_id(fb.fx, at_path)
-            val beyond = derefs_in(at_path) > 1
+            val beyond = derefs_in(a.path) > 1
             var out: Buf[FAtom] = buf()
 
             for b in v
@@ -2240,6 +2249,7 @@ private apply_inner(fb: &FBody, e: TExpr, sum: &FpaSum, args: Buf[TExpr], argv: 
     // once and stored into once.
     var group_of: Map[u64, usize] = map()
     var groups: Buf[(usize, Buf[FStep], Buf[FAtom])] = buf()
+    var group_has: Buf[Map[u64, bool]] = buf()
 
     for w in sum.writes
         if w.0 < argv.len() && w.1 < argv.len()
@@ -2248,6 +2258,7 @@ private apply_inner(fb: &FBody, e: TExpr, sum: &FpaSum, args: Buf[TExpr], argv: 
             if !group_of.has(gk)
                 group_of.put(gk, groups.len())
                 groups.push((w.0, w.3, buf()))
+                group_has.push(map())
             end if
 
     for k in 0..<n
@@ -2276,7 +2287,9 @@ private apply_inner(fb: &FBody, e: TExpr, sum: &FpaSum, args: Buf[TExpr], argv: 
                 val held = if !has_param_value(got) || argv.len() != args.len() || w.0 >= args.len() then got
                 else held_by_place(fb, got, place_reach(fb.fx, e, w.0, texpr_type(args[w.0]), w.3))
 
-                join_into(&into, held)
+                var has = group_has[g]
+
+                join_new(&into, &has, held)
             end if
 
         for p in sum.kept[k]
@@ -2307,6 +2320,7 @@ private apply_inner(fb: &FBody, e: TExpr, sum: &FpaSum, args: Buf[TExpr], argv: 
     var place_of: Map[u64, usize] = map()
     var places: Buf[FAtom] = buf()
     var held: Buf[Buf[FAtom]] = buf()
+    var held_has: Buf[Map[u64, bool]] = buf()
 
     for d in 0..<argv.len()
         var memo: Map[u32, Buf[FAtom]] = map()
@@ -2319,18 +2333,20 @@ private apply_inner(fb: &FBody, e: TExpr, sum: &FpaSum, args: Buf[TExpr], argv: 
                     place_of.put(a.key, places.len())
                     places.push(a)
                     held.push(buf())
+                    held_has.push(map())
 
                 val at = place_of.get(a.key).unwrap()
 
                 // A buffer copied is a second name for the one buffer, so this adds to the place's.
                 var into = held[at]
+                var has = held_has[at]
 
-                join_into(&into, g.2)
+                join_new(&into, &has, g.2)
             end for
         end for
 
     for i in 0..<places.len()
-        store_at(fb, single(places[i]), distinct(held[i]))
+        store_at(fb, single(places[i]), held[i])
 
     // A place the callee pointed at storage that is not the caller's: module storage, or a heap object
     // the call made.
@@ -2631,12 +2647,14 @@ fpa_answers_within(fx: &Fpa, name: string, i: usize, steps: int) -> Option[bool]
     Some(false)
 end fpa_answers_within
 
-// How many `*` steps a path takes, a `~` counting as one more (it may go on through a pointer).
+// How many `*` steps a path takes. A `~` is not counted: a store anywhere inside a value is a store
+// into its own root's storage, and counting it would turn every store into a box's interior into a
+// write of the parameter into itself.
 private derefs_in(p: Buf[FStep]) -> int
     var n = 0
 
     for st in p
-        if st.s == "*" || st.id == TILDE then n += 1
+        if st.s == "*" then n += 1
 
     n
 end derefs_in
