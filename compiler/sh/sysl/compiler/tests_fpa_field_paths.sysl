@@ -3,6 +3,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
+import sysl.text.from_utf8_unchecked
 
 // The field-path analysis (`fpa.sysl`), asked directly: what each function keeps of each parameter,
 // path by path, what its answer is made of and where in it, and what a local may point to; and where
@@ -639,18 +640,7 @@ private fpa_with_library(text: string) -> Option[&Fpa] = fpa_with_library_after(
 
 // The same, with `head` -- its imports -- ahead of the declarations every cell shares.
 private fpa_with_library_after(head: string, text: string) -> Option[&Fpa]
-    if !fpa_library_read
-        fpa_library_read = true
-
-        std_root() match
-            Err(_) -> ()
-            Ok(root) -> std_units(root, host_target()) match
-                Err(_) -> ()
-                Ok(units) -> fpa_library_cache = units
-
-    if fpa_library_cache.is_empty()
-        print("skipped: the standard module's source is not on this machine")
-        return None
+    if !fpa_library_loaded() then return None
 
     var units: Buf[Program] = buf()
 
@@ -664,6 +654,44 @@ private fpa_with_library_after(head: string, text: string) -> Option[&Fpa]
     assert(done.reported.is_empty(), if done.reported.is_empty() then "" else done.reported[0].diag.message)
     Some(fpa_analyze(done.an, program_of(done, "").funcs))
 end fpa_with_library_after
+
+// Whether the standard module's source is read, read once.
+private fpa_library_loaded() -> bool
+    if !fpa_library_read
+        fpa_library_read = true
+
+        std_root() match
+            Err(_) -> ()
+            Ok(root) -> std_units(root, host_target()) match
+                Err(_) -> ()
+                Ok(units) -> fpa_library_cache = units
+
+    if fpa_library_cache.is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    true
+end fpa_library_loaded
+
+// The comparison's lines for a program read with the library, as `fpa_diffs` says them.
+private fpa_library_diffs(head: string, text: string) -> Option[string]
+    if !fpa_library_loaded() then return None
+
+    var units: Buf[Program] = buf()
+
+    for item in fpa_library_cache
+        units.push(item)
+
+    units.push(parse(source_of("test.sysl", head + fpa_decls + fpa_picks + text)).program)
+
+    val done = analyze_bodies(units, host_target())
+    var out = ""
+
+    for line in fpa_disagreements(done.an, program_of(done, "").funcs)
+        out = out + line + "\n"
+
+    Some(out)
+end fpa_library_diffs
 
 @test("bytes made into a string in place are kept: a string outlives every frame")
 fpa_str_alias_keeps()
@@ -765,3 +793,157 @@ fpa_place_type_box_field()
     // list of types cannot hold the analysis, and the list of analyses handed in really holds it.
     assert(!fpa_writes(fx, "into_list", 0))
     assert(fpa_writes(fx, "into_refs", 0))
+
+// -- where a kept value goes (M45 i) --------------------------------------------------------------
+//
+// The cells cross the location (module storage named by its place, module storage reached through a
+// field of it, another parameter, anywhere) with how the body gets it there (a store, a store on one
+// branch only, a callee by name, a chain of two callees, a trait object, an `extern`'s `@keeps`, a
+// buffer stored whole), and hold the reason and the span to the keeps analysis's wording. Skipped
+// cells, and why: a task's handle (`j`) and the scope a body is lent are facts M45 iv owes, so this
+// analysis names neither yet; the comparison's lines for them are counted, not asserted.
+
+// The reasons `name` gives for keeping parameter `i`, in order, each once.
+private fpa_hows(fx: &Fpa, name: string, i: usize) -> string
+    var out: Buf[string] = buf()
+
+    for d in fpa_dests(fx, name, i)
+        if !holds_string(out, d.how) then out.push(d.how)
+
+    var text = ""
+
+    for h in out
+        if text != "" then text = text + " / "
+
+        text = text + h
+
+    text
+end fpa_hows
+
+// The source text the first place `name` keeps parameter `i` at points to.
+private fpa_first_at(fx: &Fpa, name: string, i: usize, text: string) -> string
+    val ds = fpa_dests(fx, name, i)
+
+    if ds.is_empty() then return "?"
+
+    val b = (fpa_decls + text).bytes
+    val at = ds[0].at
+
+    if at.end > b.len || at.start > at.end then return "?"
+
+    from_utf8_unchecked(b[at.start..<at.end])
+end fpa_first_at
+
+private val fpa_dest_src: string = "keep_a(s: S)\n    held = s.a\n\nwrapper(t: S)\n    keep_a(t)\n\n" +
+    "outer(u: S)\n    wrapper(u)\n\nmain()\n    outer(S(&spare, &spare))\n"
+
+@test("a store into module storage keeps the value there, by the place's name, at the value stored")
+fpa_dest_global()
+    val fx = fpa_of(fpa_dest_src)
+    val where = fpa_dests_text(fx, "keep_a", 0)
+
+    assert(where.starts_with("g:") && where.contains("held"), where)
+    assert_eq(fpa_hows(fx, "keep_a", 0), "it is stored in 'held'")
+    // A field read is pointed at by its field's name, as the keeps analysis points at it.
+    assert_eq(fpa_first_at(fx, "keep_a", 0, fpa_dest_src), "a")
+
+@test("a callee's location is the caller's, said as handed to the callee, at the argument, down a chain of two")
+fpa_dest_chained()
+    val fx = fpa_of(fpa_dest_src)
+
+    assert_eq(fpa_dests_text(fx, "wrapper", 0), fpa_dests_text(fx, "keep_a", 0))
+    assert_eq(fpa_hows(fx, "wrapper", 0), "it is passed to 'keep_a', which keeps it")
+    assert_eq(fpa_first_at(fx, "wrapper", 0, fpa_dest_src), "t")
+    assert_eq(fpa_dests_text(fx, "outer", 0), fpa_dests_text(fx, "keep_a", 0))
+    assert_eq(fpa_hows(fx, "outer", 0), "it is passed to 'wrapper', which keeps it")
+
+@test("a store into a field of module storage is module storage, and a store on one branch only is still kept there")
+fpa_dest_global_field()
+    val text = "var pair: S = S(&spare, &spare)\n\n" +
+        "half(c: bool, p: *int)\n    if c\n        pair.b = p\n\nmain()\n    half(true, &spare)\n"
+    val fx = fpa_of(text)
+    val where = fpa_dests_text(fx, "half", 1)
+
+    assert(where.starts_with("g:") && where.contains("pair"), where)
+    assert_eq(fpa_hows(fx, "half", 1), "it is stored in 'pair.b'")
+    assert_eq(fpa_dests_text(fx, "half", 0), "")
+
+@test("a store through another parameter is that parameter's to place, and the parameter stored into keeps nothing")
+fpa_dest_through_param()
+    val text = "put(o: **int, p: *int)\n    *o = p\n\nmain()\n    var q = &spare\n    put(&q, &spare)\n"
+    val fx = fpa_of(text)
+
+    assert_eq(fpa_dests_text(fx, "put", 1), "p0")
+    assert_eq(fpa_hows(fx, "put", 1), "it is stored in '*o'")
+    assert_eq(fpa_first_at(fx, "put", 1, text), "p")
+    assert_eq(fpa_dests_text(fx, "put", 0), "")
+
+@test("a trait object whose method declares '@keeps(p)' keeps it anywhere, said as the call through the object")
+fpa_dest_object()
+    val fx = fpa_of("trait Sink\n    @keeps(p)\n    put(*self, p: *int)\n\n" +
+                    "via(o: *Sink, p: *int)\n    o.put(p)\n\nmain()\n    spare = 1\n")
+
+    assert_eq(fpa_dests_text(fx, "via", 1), "any")
+    assert(fpa_hows(fx, "via", 1).starts_with("it is passed to a call through '"), fpa_hows(fx, "via", 1))
+    assert(fpa_hows(fx, "via", 1).ends_with("', which keeps it"), fpa_hows(fx, "via", 1))
+
+@test("an extern's '@keeps' keeps the argument anywhere, with its declaration as the reason")
+fpa_dest_extern()
+    val text = "@keeps(p)\nextern \"sysl_fpa_keep\" c_keep(p: *int)\n\nhand(x: *int)\n    c_keep(x)\n\n" +
+        "main()\n    hand(&spare)\n"
+    val fx = fpa_of(text)
+
+    assert_eq(fpa_dests_text(fx, "hand", 0), "any")
+    assert_eq(fpa_hows(fx, "hand", 0), "it is passed to 'c_keep', which keeps it")
+    assert_eq(fpa_first_at(fx, "hand", 0, text), "x")
+
+@test("a buffer holding the value, stored whole in module storage, keeps it there; one dropped keeps it nowhere")
+fpa_dest_heap_stored()
+    val got = fpa_with_library_after("import sysl.buf.{Buf, buf}\n\n", "var shelf: Buf[*int] = buf()\n\n" +
+                                     "stash(x: *int)\n    var b: Buf[*int] = buf()\n    b.push(x)\n    shelf = b\n\n" +
+                                     "scratch(x: *int)\n    var b: Buf[*int] = buf()\n    b.push(x)\n\n" +
+                                     "main()\n    stash(&spare)\n    scratch(&spare)\n")
+
+    if got.is_none() then return
+
+    val fx = got.unwrap()
+    val where = fpa_dests_text(fx, "stash", 0)
+
+    assert(where.starts_with("g:") && where.contains("shelf"), where)
+    assert_eq(fpa_hows(fx, "stash", 0), "it is stored in 'shelf'")
+    assert_eq(fpa_dests_text(fx, "scratch", 0), "")
+
+@test("a value a callee reads through what it is handed, and keeps, is let out as read through it, at the argument")
+fpa_dest_read_through()
+    val text = "keep_bus(c: *Cpu)\n    held = c.bus\n\nhand(p: *int)\n    var c = Cpu(p, &spare)\n    keep_bus(&c)\n\n" +
+        "main()\n    hand(&spare)\n"
+    val fx = fpa_of(text)
+
+    assert_eq(fpa_dests_text(fx, "hand", 0), fpa_dests_text(fx, "keep_bus", 0))
+    assert_eq(fpa_hows(fx, "hand", 0), "it is passed to 'keep_bus', which lets what it reads through it out")
+    assert_eq(fpa_first_at(fx, "hand", 0, text), "&c")
+
+@test("a value pushed into module storage's buffer is kept in module storage here, where the keeps analysis says anywhere")
+fpa_dest_pushed_into_global()
+    val got = fpa_library_diffs("import sysl.buf.{Buf, buf}\n\n",
+                                "var shelf: Buf[*int] = buf()\n\nput(x: *int)\n    shelf.push(x)\n\n" +
+                                "put_into(b: *Buf[*int], x: *int)\n    b.push(x)\n\nmain()\n    put(&spare)\n" +
+                                "    var b: Buf[*int] = buf()\n    put_into(&b, &spare)\n")
+
+    if got.is_none() then return
+
+    val diffs = got.unwrap()
+
+    assert(diffs.contains("dest-old-only:any put|0 -- old: it is passed to 'push', which keeps it"), diffs)
+    assert(diffs.contains("dest-new-only:g put|0 -- new: it is passed to 'push', which keeps it"), diffs)
+
+    // Pushed into a buffer handed in, both say it is the caller's to place.
+    assert(!diffs.contains("put_into|1"), diffs)
+
+@test("where both analyses keep a parameter in the same kind of place, for the same reason, the comparison says nothing of it")
+fpa_dest_agrees()
+    val got = fpa_diffs(fpa_dest_src + "\nput(o: **int, p: *int)\n    *o = p\n")
+
+    assert(!got.contains("dest-"), got)
+    assert(!got.contains("how-differs"), got)
+    assert(!got.contains("at-differs"), got)

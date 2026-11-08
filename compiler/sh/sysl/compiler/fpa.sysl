@@ -1,5 +1,6 @@
 module sh.sysl.compiler
 
+import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
 import sysl.container.{Map, map}
 import sysl.env.get
@@ -71,6 +72,11 @@ end FAtom
 // answer they sit; what is written through one parameter out of another -- `(dest, src, path, at)`:
 // what `src` holds along `path`, stored where `dest`'s value along `at` points; and where in the
 // answer a heap object made inside the call sits.
+//
+// `dests` says, per parameter, **where** each kept path is kept, in the keeps analysis's words
+// (`keeps_flow.sysl`): `g:<symbol>` for module storage (`g:` where no place names the symbol), `p<j>:`
+// through another parameter, and the empty string for anywhere -- with why, and where the body lets
+// it go.
 struct FpaSum
     kept: Buf[Buf[Buf[FStep]]]
     answers: Buf[Buf[(Buf[FStep], Buf[FStep])]]
@@ -79,7 +85,26 @@ struct FpaSum
     seen: Map[u64, bool]
     size: int
     lent: Buf[Buf[Buf[FStep]]]
+    dests: Buf[Buf[FDest]]
+    dseen: Map[string, bool]
 end FpaSum
+
+// One place a path of a parameter is kept: the path, the location, why, and where.
+struct FDest
+    path: Buf[FStep]
+    loc: string
+    how: string
+    at: Span
+end FDest
+
+// One way a body keeps what it is handed, as `keep` was told it: the cell of what it kept that way,
+// the location, why, and the first expression that did.
+struct FSite
+    cell: string
+    loc: string
+    how: string
+    at: Span
+end FSite
 
 // The analysis of a whole program, with the tables that name steps, paths, roots and pairs of them by
 // integers: a path is a walk down `paths` from the empty path (0), one step id at a time. `places`,
@@ -140,6 +165,18 @@ struct FBody
     dest_list: Buf[(string, usize, Buf[FStep])]
     held: Map[usize, Buf[string]]
     reach: Map[u64, Option[Buf[Map[string, bool]]]]
+
+    // Where what is kept goes (`FpaSum.dests`): each way the body keeps something, by location and
+    // reason (`site_of`), and the first reason each `$thr` cell was stored into. `why_how`, `why_place`
+    // and `why_at` are the reason the next keep or store is given -- a store's place is said only when
+    // a new way is found -- and `gsym` the module storage a store's place names.
+    sites: Buf[FSite]
+    site_of: Map[string, usize]
+    dest_why: Map[string, (string, Span)]
+    why_how: string
+    why_place: Option[TExpr]
+    why_at: Span
+    gsym: string
 end FBody
 
 // -- the whole program ----------------------------------------------------------------------------
@@ -244,7 +281,12 @@ private empty_sum(n: usize) -> &FpaSum
         answers.push(buf())
         lent.push(buf())
 
-    FpaSum(kept, answers, buf(), buf(), map(), 0, lent)
+    var dests: Buf[Buf[FDest]] = buf()
+
+    for _ in 0..<n
+        dests.push(buf())
+
+    FpaSum(kept, answers, buf(), buf(), map(), 0, lent, dests, map())
 end empty_sum
 
 // The functions a body calls by name, as indices, once each.
@@ -379,7 +421,8 @@ private walk_func(fx: &Fpa, fi: usize) -> &FpaSum
 end walk_func
 
 private settle_body(fx: &Fpa, f: TFunc) -> &FBody =
-    settle(FBody(fx, f, map(), map(), map(), map(), false, 0, buf(), map(), map(), buf(), map(), map()))
+    settle(FBody(fx, f, map(), map(), map(), map(), false, 0, buf(), map(), map(), buf(), map(), map(), buf(), map(),
+                 map(), "", None, span_zero(), ""))
 
 // Walks a body until no cell it read grows. A cell counts as read in this walk when its `read` is this
 // walk's number, `fx.walks`.
@@ -426,6 +469,8 @@ private summarize(fb: &FBody) -> &FpaSum
     for i in 0..<f.params.len()
         if is_ptr_type(f.params[i].1) && holds_string(f.marks.copies, f.params[i].0)
             sum_kept(fb.fx, sum,i, buf())
+            sum_dest(fb.fx, sum, i, buf(), "", CROSSING_HOW, span_zero())
+        end if
 
     var visited: Map[string, bool] = map()
     var work: Buf[FAtom] = buf()
@@ -434,7 +479,7 @@ private summarize(fb: &FBody) -> &FpaSum
         work.push(a)
 
     for d in fb.dest_list
-        written_through(fb, sum, d.0, d.1, d.2, &work)
+        written_through(fb, sum, d.0, d.1, d.2, &work, fb.dest_why.get(d.0).unwrap_or(("", span_zero())))
 
     var at: usize = 0
 
@@ -454,6 +499,9 @@ private summarize(fb: &FBody) -> &FpaSum
 
     summarize_lent(fb, sum)
 
+    for s in fb.sites
+        dests_from(fb, sum, s.cell, s.loc, s.how, s.at)
+
     var seen: Map[string, bool] = map()
 
     if fpa_holds(fb.fx, f.ret_ty) then answer_from(fb, sum, cell(fb, "$ret"), buf(), &seen)
@@ -467,8 +515,13 @@ end summarize
 // a parameter's own value stored back inside what it points at is not written, as `store_at` leaves
 // it. The address of a local stored there lets the local's storage
 // out, so it goes to `work`, to be kept with what it holds.
-private written_through(fb: &FBody, sum: &FpaSum, name: string, dest: usize, at: Buf[FStep], work: *Buf[FAtom])
+//
+// Each path written is kept at `p<dest>:`, for the reason and at the span the cell was first stored
+// into with (`why`), and so is what a local stored there holds.
+private written_through(fb: &FBody, sum: &FpaSum, name: string, dest: usize, at: Buf[FStep], work: *Buf[FAtom],
+                        why: (string, Span))
     val inside = extend(at, tilde_step())
+    val loc = s"p$dest:"
 
     // A parameter's own value held in a heap object stored there is written only where the place's
     // type can hold it (M44): the object may have been filled from a box's whole interior. The type
@@ -494,6 +547,7 @@ private written_through(fb: &FBody, sum: &FpaSum, name: string, dest: usize, at:
 
             if !deep
                 sum_write(fb.fx, sum, dest, src, a.path, at)
+                sum_dest(fb.fx, sum, src, a.path, loc, why.0, why.1)
             else if src != dest
                 if a.path.is_empty() && !asked && dest < fb.f.params.len()
                     reach = reach_at(fb.fx, fb.f.params[dest].1, at)
@@ -502,6 +556,8 @@ private written_through(fb: &FBody, sum: &FpaSum, name: string, dest: usize, at:
 
                 if !a.path.is_empty() || reach.is_none() || param_fits(fb, src, reach.unwrap())
                     sum_write(fb.fx, sum, dest, src, a.path, inside)
+                    sum_dest(fb.fx, sum, src, a.path, loc, why.0, why.1)
+                end if
             end if
         else if a.root.starts_with("h:")
             if !visited.has(a.root)
@@ -511,6 +567,7 @@ private written_through(fb: &FBody, sum: &FpaSum, name: string, dest: usize, at:
                     todo.push((b, true))
         else
             work.push(a)
+            dests_of_atoms(fb, sum, single(a), loc, why.0, why.1)
         end if
 end written_through
 
@@ -539,6 +596,44 @@ private summarize_lent(fb: &FBody, sum: &FpaSum)
                 work.push(b)
         end if
 end summarize_lent
+
+// **Where each parameter path a cell holds is kept**: the cell's location, through every local and heap
+// object it holds, as `summarize` follows `$kept`.
+private dests_from(fb: &FBody, sum: &FpaSum, name: string, loc: string, how: string, at: Span) =
+    dests_of_atoms(fb, sum, cell(fb, name), loc, how, at)
+
+private dests_of_atoms(fb: &FBody, sum: &FpaSum, atoms: Buf[FAtom], loc: string, how: string, at: Span)
+    var visited: Map[string, bool] = map()
+    var work = copy_of(atoms)
+    var k: usize = 0
+
+    while k < work.len()
+        val a = work[k]
+
+        k += 1
+
+        if a.root.starts_with("p")
+            sum_dest(fb.fx, sum, param_of(a.root), a.path, loc, how, at)
+        else if (a.root.starts_with("h:") || a.root.starts_with("l:")) && !visited.has(a.root)
+            visited.put(a.root, true)
+
+            for b in cell(fb, a.root)
+                work.push(b)
+        end if
+end dests_of_atoms
+
+// A path kept at a location, once for each path, location and reason.
+private sum_dest(fx: &Fpa, sum: &FpaSum, i: usize, path: Buf[FStep], loc: string, how: string, at: Span)
+    if i >= sum.dests.len() then return
+
+    val k = s"$i|${path_id(fx, without_tilde(path))}|$loc|$how"
+
+    if sum.dseen.has(k) then return
+
+    sum.dseen.put(k, true)
+    sum.dests[i].push(FDest(path, loc, how, at))
+    sum.size += 1
+end sum_dest
 
 // What the answer is made of: a parameter's value where it sits, and through each heap object it
 // holds, what that object holds, one `*` further in. Inside a heap object the place is the object
@@ -683,7 +778,14 @@ end add_to
 //
 // Where in a value a kept part sat says nothing more, and a parameter's path already kept, or one it
 // extends, holds this one too.
-private keep(fb: &FBody, atoms: Buf[FAtom])
+//
+// `loc` is where it is kept, for the reason the body was last given (`why`).
+private keep(fb: &FBody, atoms: Buf[FAtom], loc: string)
+    keep_only(fb, atoms)
+    note_kept(fb, atoms, loc)
+end keep
+
+private keep_only(fb: &FBody, atoms: Buf[FAtom])
     var out: Buf[FAtom] = buf()
 
     for a in atoms
@@ -693,7 +795,61 @@ private keep(fb: &FBody, atoms: Buf[FAtom])
             out.push(at_place(fb, buf(), a, a.path))
 
     add_to(fb, "$kept", out)
-end keep
+end keep_only
+
+// Notes where what is kept goes: into the cell of this location and reason, made the first time the
+// body keeps something that way.
+private note_kept(fb: &FBody, atoms: Buf[FAtom], loc: string)
+    if atoms.is_empty() then return
+
+    val reason = fb.why_place match
+        Some(p) -> s"#${node_id(p)}"
+        None -> fb.why_how
+
+    val key = s"$loc|$reason"
+    val k = fb.site_of.get(key) match
+        Some(k) -> k
+        None ->
+            val k = fb.sites.len()
+
+            fb.site_of.put(key, k)
+            fb.sites.push(FSite(s"$$k$k", loc, why_said(fb), fb.why_at))
+            k
+
+    var out: Buf[FAtom] = buf()
+
+    for a in atoms
+        out.push(at_place(fb, buf(), a, a.path))
+
+    add_to(fb, fb.sites[k].cell, out)
+end note_kept
+
+// The reason the next keep or store is given: a sentence, or a store into a place, said only when it
+// is needed.
+private give_why(fb: &FBody, how: string, at: Span)
+    fb.why_how = how
+    fb.why_place = None
+    fb.why_at = at
+    fb.gsym = ""
+end give_why
+
+private why_stored(fb: &FBody, place: TExpr, at: Span)
+    fb.why_how = ""
+    fb.why_place = Some(place)
+    fb.why_at = at
+    fb.gsym = global_symbol(place)
+end why_stored
+
+private why_said(fb: &FBody) -> string = fb.why_place match
+    Some(p) -> s"it is stored in '${place_said(func_home(fb.fx.an, fb.f.name), p)}'"
+    None -> fb.why_how
+
+// The module storage a place is in, where the place names it: a field or element of it held in place.
+private global_symbol(place: TExpr) -> string = *place.kind match
+    TGlobal(symbol, _, _) -> symbol
+    TField(recv, _, _) -> if pointee_of(texpr_type(recv)).is_none() then global_symbol(recv) else ""
+    TIndex(recv, _, _) -> if is_array_t(texpr_type(recv)) then global_symbol(recv) else ""
+    _ -> ""
 
 // Notes what is handed where no body answers for a view: a call through a `&Fn` or a function pointer
 // that does not mark it `@keeps`, a form the compiler supplies, or an async call whose task is not
@@ -1679,7 +1835,7 @@ private eval_stmt(fb: &FBody, s: TStmt)
         TRefDecl(name, _, place) ->
             fb.refs.put(name, place)
             addr(fb, place)
-        TWriteStmt(w) -> store(fb, w.place, eval(fb, w.value))
+        TWriteStmt(w) -> store(fb, w.place, eval(fb, w.value), w.value)
         TMultiAssign(writes) ->
             var vals: Buf[Buf[FAtom]] = buf()
 
@@ -1687,7 +1843,7 @@ private eval_stmt(fb: &FBody, s: TStmt)
                 vals.push(eval(fb, w.value))
 
             for i in 0..<writes.len()
-                store(fb, writes[i].place, vals[i])
+                store(fb, writes[i].place, vals[i], writes[i].value)
         TReturn(value) -> if value.is_some() then add_to(fb, "$ret", eval(fb, value.unwrap()))
         TBecome(call) -> add_to(fb, "$ret", eval(fb, call))
         TBreak(value, _) -> if value.is_some() then add_to(fb, "$brk", eval(fb, value.unwrap()))
@@ -1764,13 +1920,13 @@ private eval_kind(fb: &FBody, e: TExpr) -> Buf[FAtom] = *e.kind match
     TStore(place, value, _, yields) ->
         val v = eval(fb, value)
 
-        store(fb, place, v)
+        store(fb, place, v, value)
         if yields then v else buf()
     TUpdate(place, _, value, _, _, _, _) ->
         val v = eval(fb, value)
         val old = eval(fb, place)
 
-        store(fb, place, v)
+        store(fb, place, v, value)
 
         var out = copy_of(old)
 
@@ -1781,13 +1937,17 @@ private eval_kind(fb: &FBody, e: TExpr) -> Buf[FAtom] = *e.kind match
 
         if op == "slot_storage" then fresh_of(fb, e, buf())
         else
-            if op == "slot_place" && vals.len() > 2 then store_at(fb, vals[0], vals[2])
+            if op == "slot_place" && vals.len() > 2
+                give_why(fb, "it is stored in a buffer's slot", args[2].span)
+                store_at(fb, vals[0], vals[2])
+            end if
 
             buf()
     TAtomic(_, address, ops, _, _, _) ->
         val at = eval(fb, address)
         val vals = eval_all(fb, ops)
 
+        give_why(fb, "it is stored through a pointer by an atomic", e.span)
         store_at(fb, at, vals)
 
         var out = project(fb, at, deref_step(fb, texpr_type(address)))
@@ -1809,10 +1969,17 @@ private eval_kind(fb: &FBody, e: TExpr) -> Buf[FAtom] = *e.kind match
         out
     TStep(task, wake) ->
         eval(fb, task)
-        keep(fb, eval(fb, wake))
+
+        val v = eval(fb, wake)
+
+        give_why(fb, "it is the waker handed to 'step', which the task keeps for its parks", wake.span)
+        keep(fb, v, "")
         buf()
     TPark(register) ->
-        keep(fb, eval(fb, register))
+        val v = eval(fb, register)
+
+        give_why(fb, "it is the waker handed to 'park', which the task keeps until it wakes", register.span)
+        keep(fb, v, "")
         buf()
     TTry(operand, ok, _, _, _, ty, _) ->
         val v = eval(fb, operand)
@@ -1915,7 +2082,10 @@ private eval_kind(fb: &FBody, e: TExpr) -> Buf[FAtom] = *e.kind match
     // (`escape.sysl`'s `carries_view`), so what they view is kept, and the string holds nothing to
     // follow.
     TStrView(v) ->
-        keep(fb, eval(fb, v))
+        val held = eval(fb, v)
+
+        give_why(fb, "it is made into a string, which outlasts every frame", v.span)
+        keep(fb, held, "")
         buf()
     _ ->
         var out: Buf[FAtom] = buf()
@@ -2085,13 +2255,19 @@ private addr(fb: &FBody, place: TExpr) -> Buf[FAtom] = *place.kind match
     _ -> eval(fb, place)
 end addr
 
-// A value stored into a place.
-private store(fb: &FBody, place: TExpr, v: Buf[FAtom])
+// Where an argument was written, or the call where it was not.
+private arg_span(e: TExpr, args: Buf[TExpr], k: usize) -> Span = if k < args.len() then args[k].span else e.span
+
+// A value stored into a place, by the expression `by`.
+private store(fb: &FBody, place: TExpr, v: Buf[FAtom], by: TExpr)
     val at = addr(fb, place)
     val held = if !has_param_value(v) then v
     else held_by_place(fb, v, place_reach(fb.fx, place, PLACE_STORE, texpr_type(place), buf()))
 
-    if !held.is_empty() then store_at(fb, at, held)
+    if held.is_empty() then return
+
+    why_stored(fb, place, by.span)
+    store_at(fb, at, held)
 end store
 
 // A value stored at each address: into what a local or a heap object holds there, through a
@@ -2129,9 +2305,13 @@ private store_at(fb: &FBody, at: Buf[FAtom], v: Buf[FAtom])
             val held = if !has_param_value(out) || dest >= fb.f.params.len() then out
             else held_by_place(fb, out, param_reach(fb, dest, at_path, at_id))
 
-            add_to(fb, dest_cell(fb, dest, at_path, at_id), held)
+            val name = dest_cell(fb, dest, at_path, at_id)
+
+            if !held.is_empty() && !fb.dest_why.has(name) then fb.dest_why.put(name, (why_said(fb), fb.why_at))
+
+            add_to(fb, name, held)
         else
-            keep(fb, v)
+            keep(fb, v, s"g:${fb.gsym}")
 end store_at
 
 // The cell of what is stored through parameter `dest` where its value along `at` points.
@@ -2161,7 +2341,7 @@ private call(fb: &FBody, e: TExpr, name: string, args: Buf[TExpr], argv: Buf[Buf
                 for v in argv
                     lend(fb, v)
 
-            return apply(fb, e, fb.fx.sums[i], args, argv)
+            return apply(fb, e, name, fb.fx.sums[i], args, argv)
         None -> ()
 
     fb.fx.an.tables.externs.get(name) match
@@ -2169,7 +2349,13 @@ private call(fb: &FBody, e: TExpr, name: string, args: Buf[TExpr], argv: Buf[Buf
             var out: Buf[FAtom] = buf()
 
             for k in 0..<argv.len()
-                if k < d.params.len() && holds_string(d.keeps, d.params[k].name) then keep(fb, argv[k])
+                if k < d.params.len() && holds_string(d.keeps, d.params[k].name)
+                    val inner = s"its declaration says '@keeps(${d.params[k].name})'"
+
+                    give_why(fb, passed_how(callee_said(fb.fx.an, name), true, inner), arg_span(e, args, k))
+                    keep(fb, argv[k], "")
+                end if
+
                 if k < d.params.len() && holds_string(d.answers, d.params[k].name)
                     join_into(&out, anywhere_in(fb, answered_arg(fb.fx, ty, args, k, argv[k])))
 
@@ -2189,11 +2375,11 @@ end call
 // argument is stored where that argument points, and its answer is made of the arguments where the
 // summary says. A heap object the call made is one object per call site, holding everything the
 // summary places inside one.
-private apply(fb: &FBody, e: TExpr, sum: &FpaSum, args: Buf[TExpr], argv: Buf[Buf[FAtom]]) -> Buf[FAtom]
-    if !fb.fx.tracing then return apply_inner(fb, e, sum, args, argv)
+private apply(fb: &FBody, e: TExpr, callee: string, sum: &FpaSum, args: Buf[TExpr], argv: Buf[Buf[FAtom]]) -> Buf[FAtom]
+    if !fb.fx.tracing then return apply_inner(fb, e, callee, sum, args, argv)
 
     val t0 = monotonic().us
-    val r = apply_inner(fb, e, sum, args, argv)
+    val r = apply_inner(fb, e, callee, sum, args, argv)
     val dt = monotonic().us - t0
 
     if dt > 50000
@@ -2208,7 +2394,7 @@ private apply(fb: &FBody, e: TExpr, sum: &FpaSum, args: Buf[TExpr], argv: Buf[Bu
     r
 end apply
 
-private apply_inner(fb: &FBody, e: TExpr, sum: &FpaSum, args: Buf[TExpr], argv: Buf[Buf[FAtom]]) -> Buf[FAtom]
+private apply_inner(fb: &FBody, e: TExpr, callee: string, sum: &FpaSum, args: Buf[TExpr], argv: Buf[Buf[FAtom]]) -> Buf[FAtom]
     val blob = heap_site(e)
     val ty = texpr_type(e)
     var out: Buf[FAtom] = buf()
@@ -2219,6 +2405,10 @@ private apply_inner(fb: &FBody, e: TExpr, sum: &FpaSum, args: Buf[TExpr], argv: 
     var group_of: Map[u64, usize] = map()
     var groups: Buf[(usize, Buf[FStep], Buf[FAtom])] = buf()
 
+    // Which argument the first write of each group came from, and whether it was read through it: the
+    // reason and the span a store of the group is given.
+    var group_src: Buf[(usize, bool)] = buf()
+
     for w in sum.writes
         if w.0 < argv.len() && w.1 < argv.len()
             val gk = (u64(w.0) << 32) | u64(path_id(fb.fx, w.3))
@@ -2226,6 +2416,7 @@ private apply_inner(fb: &FBody, e: TExpr, sum: &FpaSum, args: Buf[TExpr], argv: 
             if !group_of.has(gk)
                 group_of.put(gk, groups.len())
                 groups.push((w.0, w.3, buf()))
+                group_src.push((w.1, has_deref(w.2)))
             end if
 
     for k in 0..<n
@@ -2258,7 +2449,15 @@ private apply_inner(fb: &FBody, e: TExpr, sum: &FpaSum, args: Buf[TExpr], argv: 
             end if
 
         for p in sum.kept[k]
-            keep(fb, summary_along(fb, argv[k], p, &memo))
+            keep_only(fb, summary_along(fb, argv[k], p, &memo))
+
+        // Where the callee keeps it is where this body does, said as handed to the callee; what the
+        // callee stores through another parameter is placed with its writes, below.
+        for d in sum.dests[k]
+            if d.loc.starts_with("p") then continue
+
+            give_why(fb, passed_how(callee_said(fb.fx.an, callee), !has_deref(d.path), d.how), arg_span(e, args, k))
+            note_kept(fb, summary_along(fb, argv[k], d.path, &memo), d.loc)
 
         for p in sum.lent[k]
             lend(fb, summary_along(fb, argv[k], p, &memo))
@@ -2285,11 +2484,14 @@ private apply_inner(fb: &FBody, e: TExpr, sum: &FpaSum, args: Buf[TExpr], argv: 
     var place_of: Map[u64, usize] = map()
     var places: Buf[FAtom] = buf()
     var held: Buf[Buf[FAtom]] = buf()
+    var place_src: Buf[(usize, bool)] = buf()
 
     for d in 0..<argv.len()
         var memo: Map[u32, Buf[FAtom]] = map()
 
-        for g in groups
+        for gi in 0..<groups.len()
+            val g = groups[gi]
+
             if g.0 != d || g.2.is_empty() then continue
 
             for a in written_at(fb, argv[d], g.1, &memo)
@@ -2297,6 +2499,7 @@ private apply_inner(fb: &FBody, e: TExpr, sum: &FpaSum, args: Buf[TExpr], argv: 
                     place_of.put(a.key, places.len())
                     places.push(a)
                     held.push(buf())
+                    place_src.push(group_src[gi])
 
                 val at = place_of.get(a.key).unwrap()
 
@@ -2308,6 +2511,7 @@ private apply_inner(fb: &FBody, e: TExpr, sum: &FpaSum, args: Buf[TExpr], argv: 
         end for
 
     for i in 0..<places.len()
+        give_why(fb, passed_how(callee_said(fb.fx.an, callee), !place_src[i].1, ""), arg_span(e, args, place_src[i].0))
         store_at(fb, single(places[i]), distinct(held[i]))
 
     for o in sum.fresh
@@ -2442,8 +2646,12 @@ private vcall(fb: &FBody, recv: TExpr, slot: int, args: Buf[TExpr], argv: Buf[Bu
     for k in 0..<argv.len()
         val kept = if callable then marks_kept(assocs, k) else task || object_declares_kept(fb.fx.an, rt, slot, k + 1)
 
-        if kept then keep(fb, argv[k])
-        else if callable then lend(fb, argv[k])
+        if kept
+            give_why(fb, passed_how(object_callee(recv), true, ""), arg_span(recv, args, k))
+            keep(fb, argv[k], "")
+        else if callable
+            lend(fb, argv[k])
+        end if
 
         join_into(&out, anywhere_in(fb, answered_arg(fb.fx, ty, args, k, argv[k])))
 
@@ -2722,6 +2930,8 @@ fpa_compare(cx: &KeepsCx, fx: &Fpa) -> Buf[string]
                 out.push(s"agree:field-narrowed $at")
             end if
 
+            if ok == nk then dest_diffs(&out, fx, old, f.name, i, at)
+
             if !may_hold_pointer(cx, f.ret_ty) then continue
 
             val oa = answers_of(cx, f.name, i)
@@ -2732,6 +2942,131 @@ fpa_compare(cx: &KeepsCx, fx: &Fpa) -> Buf[string]
 
     out
 end fpa_compare
+
+// **Where the two analyses say a parameter both keep, or neither does, is held**, by the kind of
+// location (`loc_class`): a kind only one names is `dest-old-only:<kind>` or `dest-new-only:<kind>`.
+// Module storage both name, where this one names the symbol and the keeps analysis names another, is
+// `dest-global-differs`. Where both keep it, the keeps analysis's reason and span are those of its
+// first location outside the parameter's own pointee: a reason this one gives for none of its
+// locations is `how-differs`, and a span none of its spans lies in or around is `at-differs`.
+private dest_diffs(out: *Buf[string], fx: &Fpa, old: KeptWhy, name: string, i: usize, at: string)
+    val own = s"p$i"
+    var olds: Buf[(string, string)] = buf()
+    var news: Buf[FDest] = buf()
+
+    for item in old.locs
+        val c = loc_class(item.loc)
+
+        if c != own && c != "*" then olds.push((c, item.how))
+
+    // The keeps analysis follows the parameter's value and what is held in place with it; a path
+    // through a pointer is what is read through it, which is a question of its own (M45 iii).
+    for d in fpa_dests(fx, name, i)
+        if loc_class(d.loc) != own && !has_deref(d.path) then news.push(d)
+
+    for o in olds
+        if !has_class(news, o.0) && !said_kind(out, s"dest-old-only:${o.0} $at")
+            out.push(s"dest-old-only:${o.0} $at -- old: ${o.1}")
+
+    for d in news
+        val c = loc_class(d.loc)
+        var found = false
+
+        for o in olds
+            if o.0 == c then found = true
+
+        if !found && !said_kind(out, s"dest-new-only:$c $at") then out.push(s"dest-new-only:$c $at -- new: ${d.how}")
+
+        if found && d.loc != "g:" && d.loc.starts_with("g:") && !names_global(old, d.loc) &&
+           !said_kind(out, s"dest-global-differs $at")
+            out.push(s"dest-global-differs $at -- new: ${d.loc}")
+        end if
+
+    if !old.kept || olds.is_empty() || news.is_empty() then return
+
+    var how_ok = false
+    var at_ok = false
+
+    for d in news
+        if d.how == old.how then how_ok = true
+        if spans_meet(d.at, old.at) then at_ok = true
+
+    if !how_ok then out.push(s"how-differs $at -- old: ${old.how} / new: ${news[0].how}")
+    if !at_ok then out.push(s"at-differs $at -- old: ${old.at.start} / new: ${news[0].at.start}")
+end dest_diffs
+
+// Whether a line of this kind and position was said already.
+private said_kind(out: *Buf[string], head: string) -> bool
+    for line in *out
+        if line.starts_with(head + " ") then return true
+
+    false
+end said_kind
+
+private has_class(v: Buf[FDest], c: string) -> bool
+    for d in v
+        if loc_class(d.loc) == c then return true
+
+    false
+end has_class
+
+// Whether the keeps analysis holds a parameter in the module storage `loc` names, or inside it.
+private names_global(old: KeptWhy, loc: string) -> bool
+    for item in old.locs
+        if item.loc.starts_with(loc) || item.loc.starts_with(s"d:$loc") then return true
+
+    false
+end names_global
+
+// Whether one span lies inside the other.
+private spans_meet(a: Span, b: Span) -> bool =
+    (a.start <= b.start && b.end <= a.end) || (b.start <= a.start && a.end <= b.end)
+
+// **The kind of location a kept place is at**: `g` module storage, `p<j>` storage through parameter
+// `j`, `j` a task's handle, `l` the frame's own storage, `@` storage a `ref` binding names, `any`
+// anywhere else, and `*` what a body overwrites -- with a dereference (`d:`) said as what it
+// dereferences.
+private loc_class(loc: string) -> string
+    val b = loc.bytes
+    val l = if loc.starts_with("d:") then from_utf8_unchecked(b[2..<b.len]) else loc
+
+    if l == "" then return "any"
+    if l.starts_with("g:") then return "g"
+    if l.starts_with("j") then return "j"
+    if l.starts_with("l:") then return "l"
+    if l.starts_with("*") then return "*"
+    if l.starts_with("@") then return "@"
+
+    val lb = l.bytes
+
+    for k in 0..<lb.len
+        if lb[k] == u8(':') then return from_utf8_unchecked(lb[0..<k])
+
+    l
+end loc_class
+
+// Where `name` keeps each path of parameter `i`, as its summary says.
+fpa_dests(fx: &Fpa, name: string, i: usize) -> Buf[FDest]
+    val fi = fpa_index(fx, name)
+
+    if fi.is_none() then return buf()
+
+    val sum = fx.sums[fi.unwrap()]
+
+    if i < sum.dests.len() then sum.dests[i] else buf()
+end fpa_dests
+
+// The kinds of location `name` keeps parameter `i` at, in order, each once, as `loc_class` says them.
+fpa_dests_text(fx: &Fpa, name: string, i: usize) -> string
+    var parts: Buf[string] = buf()
+
+    for d in fpa_dests(fx, name, i)
+        val c = if d.loc.starts_with("g:") then d.loc else loc_class(d.loc)
+
+        if !holds_string(parts, c) then parts.push(c)
+
+    sorted_text(parts)
+end fpa_dests_text
 
 // Whether every path kept of a parameter is a field of it held in place, none the value whole.
 private field_narrowed(fx: &Fpa, name: string, i: usize) -> bool
