@@ -497,6 +497,13 @@ the next test. A module's hooks are held to the run's limit.
 the runner stops — interrupted, killed, or its terminal closed — the test ends itself and everything
 it started, so a stopped run leaves nothing running.
 
+**A stopped run says what it was doing.** The report is written as the run goes, at most twice a
+second, so a log followed from outside is never more than half a second behind. On `SIGTERM` or
+`SIGINT` the runner writes what it still holds, then `interrupted by SIGTERM after 12.3s` and an
+`in flight:` list — the file, the test and how long it had been running, or the project and
+`compiling` where the stop came during the build — kills the test processes, and exits non-zero
+(143 for `SIGTERM`, 130 for `SIGINT`) within a few milliseconds.
+
 **The exit status is 0 if and only if every test that ran passed.** A tree with no tests, and a
 filter that matched none of the tests present, both exit 0. Neither is a failure, and the report
 says which of the two occurred.

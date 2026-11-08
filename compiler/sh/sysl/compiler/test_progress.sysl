@@ -1,0 +1,217 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.signal.{watch, send, INT, TERM, KILL}
+import sysl.sync.{Atomic, SpinLock}
+import sysl.threads.spawn
+import sysl.time.{monotonic, sleep, millis, whole_millis}
+
+// What `sysl test` writes while it runs, and what it says when it is stopped.
+//
+// **The report is buffered and written at most twice a second.** A suite of thousands of fast tests
+// would otherwise make one write per row; here a row is added to a buffer and the buffer is written
+// when half a second has passed since the last write -- by the next row, or by the watcher below if
+// no row comes -- and at exit. A line is never held longer than that, so a log followed from outside
+// is half a second behind at worst.
+//
+// **A run that is stopped says what it was doing.** The watcher is a thread that notices SIGTERM or
+// SIGINT even while the main thread is inside a compile, writes what is buffered at once, then names
+// every process in flight -- file, test, phase, how long -- and the compile if that is where the run
+// was, kills the test processes (each is in a group of its own, so the signal sent to the run's group
+// never reached them), and exits. That is all done in a few milliseconds: a job runner that sends
+// TERM waits a fixed five seconds before it sends KILL.
+
+const FlushAfterMillis: long = 500
+
+// Text waiting to be written, and when the last write was.
+struct ReportBuffer
+    held: string
+    flushed_at: long
+    writes: usize
+
+    // Adds `piece` and answers what is to be written now: everything held, where nothing has been
+    // written yet or the last write was long enough ago, and nothing otherwise.
+    offer(*self, piece: string, now: long) -> string
+        self.held = self.held + piece
+        self.due(now)
+
+    // What is to be written at `now` without a new piece: the held text once its time has come.
+    due(*self, now: long) -> string
+        if self.held.is_empty() then return ""
+
+        if self.flushed_at >= 0 && now - self.flushed_at < FlushAfterMillis then return ""
+
+        self.drain(now)
+
+    // Everything held, whether or not its time has come.
+    drain(*self, now: long) -> string
+        val text = self.held
+
+        self.held = ""
+        self.flushed_at = now
+
+        if !text.is_empty() then self.writes += 1
+
+        text
+end ReportBuffer
+
+// A process the run has out.
+struct InFlight
+    id: usize
+    file: string
+    name: string
+    began: long
+    pid: int
+end InFlight
+
+// What a stopped run says: the signal, how far into the run it came, and what was in flight.
+// `compiling` is the project being compiled, or empty where the run was past that.
+interruption_report(signal_name: string, run_millis: long, compiling: string, compiling_millis: long,
+                    live: Buf[InFlight], now: long) -> string
+    var text = s"\ninterrupted by $signal_name after ${tenths(run_millis)}s\n"
+
+    if compiling.is_empty() && live.is_empty()
+        text += "nothing was in flight\n"
+        return text
+    end if
+
+    text += "in flight:\n"
+
+    if !compiling.is_empty()
+        text += s"  $compiling  compiling  ${tenths(compiling_millis)}s\n"
+
+    for item in live
+        text += s"  ${item.file}  ${item.name}  running  ${tenths(now - item.began)}s\n"
+
+    text
+end interruption_report
+
+// Milliseconds as seconds with one decimal: 12345 is "12.3".
+private tenths(millis: long) -> string
+    val t = if millis < 0 then 0 else millis / 100
+    s"${t / 10}.${t % 10}"
+
+private var buffer: ReportBuffer = ReportBuffer("", -1, 0)
+private var flying: Buf[InFlight] = buf()
+private var compiling_what: string = ""
+private var compiling_since: long = 0
+private var run_began: long = 0
+private var guard: SpinLock = SpinLock(0)
+
+private now_millis() -> long = whole_millis(monotonic())
+
+private extern "fflush" c_flush_all(stream: *u8) -> int
+
+private write_out(text: string)
+    if text.is_empty() then return
+
+    prints(text)
+    c_flush_all(null)
+
+/** One piece of the report: added to the buffer, and written if half a second has passed. */
+stream_out(piece: string)
+    guard.lock()
+    write_out(buffer.offer(piece, now_millis()))
+    guard.unlock()
+
+/** Everything buffered, written now. Called before anything else is written and at exit. */
+flush_report()
+    guard.lock()
+    write_out(buffer.drain(now_millis()))
+    guard.unlock()
+
+/** How many times the report has been written. */
+report_writes() -> usize = buffer.writes
+
+/** The run is compiling `what`; `done_compiling` ends it. */
+compiling_started(what: string)
+    guard.lock()
+    compiling_what = what
+    compiling_since = now_millis()
+    guard.unlock()
+
+compiling_done()
+    guard.lock()
+    compiling_what = ""
+    guard.unlock()
+
+// The process `id` is in flight: a test of `file` called `name`, running as `pid`.
+process_started(id: usize, file: string, name: string, pid: int)
+    guard.lock()
+    flying.push(InFlight(id, file, name, now_millis(), pid))
+    guard.unlock()
+
+// The process `id` has ended.
+process_ended(id: usize)
+    guard.lock()
+
+    var kept: Buf[InFlight] = buf()
+
+    for item in flying
+        if item.id != id then kept.push(item)
+
+    flying = kept
+    guard.unlock()
+
+// What is in flight, as the report a stop would write now.
+stop_report(signal_name: string) -> string
+    guard.lock()
+
+    val now = now_millis()
+    val text = interruption_report(signal_name, now - run_began, compiling_what, now - compiling_since,
+                                   flying, now)
+
+    guard.unlock()
+    text
+
+// The state of the watcher thread: set once its handlers are installed.
+private struct Watcher
+    ready: Atomic[i32]
+
+private watching(w: *Watcher)
+    val ended = watch(TERM).unwrap()
+    val interrupted = watch(INT).unwrap()
+
+    w.ready.store(1)
+
+    loop
+        if ended.take() then stopped("SIGTERM", 143)
+
+        if interrupted.take() then stopped("SIGINT", 130)
+
+        guard.lock()
+        write_out(buffer.due(now_millis()))
+        guard.unlock()
+        sleep(millis(10))
+
+// Write what is buffered, then what was in flight, then kill the test processes and leave.
+private stopped(signal_name: string, code: int)
+    guard.lock()
+
+    val now = now_millis()
+
+    write_out(buffer.drain(now))
+    write_out(interruption_report(signal_name, now - run_began, compiling_what, now - compiling_since,
+                                  flying, now))
+
+    for item in flying
+        send(-i64(item.pid), KILL)
+
+    exit(code)
+
+/** Starts the thread that watches for SIGTERM and SIGINT. Called once, by the command-line program
+ * when it is running `sysl test`; a compiler called from a test never starts one.
+ */
+watch_for_stop()
+    run_began = now_millis()
+
+    val w: &sync Watcher = Watcher(Atomic(0))
+
+    spawn(&watching, &*w, 1024 * 1024) match
+        Some(_) ->
+            var waited = 0
+
+            while w.ready.load() == 0 && waited < 1000
+                sleep(millis(1))
+                waited += 1
+        None -> ()
