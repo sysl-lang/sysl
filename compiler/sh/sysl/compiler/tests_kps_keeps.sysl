@@ -495,6 +495,139 @@ kps_lock_body_reads_capture()
         print(m.with((j) -> j.thread.is_some()))
         """, "3\ntrue\n")
 
+// -- a closure body storing the address of its own capture: told at the closure ----------------------
+
+// A refusal that must point at the program's own line, never into the library body that ran the
+// closure.
+private kps_refused_at(text: string, part: string, at: string)
+    if xvr_no_library() then return
+
+    val out = kps_outcome(text)
+
+    assert_eq(out.1, -1, out.0)
+    assert(out.0.index_of(part).is_some(), out.0)
+    assert(out.0.index_of(s"main.sysl:$at").is_some(), out.0)
+    assert(out.0.index_of("library/").is_none(), out.0)
+    assert(out.0.index_of("a copy in its frame").is_none(), out.0)
+end kps_refused_at
+
+private kps_address_out(capture: string, how: string) -> string =
+    s"a closure lets the address of its capture '$capture' outlive the call (it is $how), and the closure " +
+        s"holds '$capture' by value, in its own storage"
+
+@test("a lock's body storing the address of its capture is refused at the closure, not in the library")
+kps_lock_body_stores_capture_address()
+    kps_refused_at(kps_lock() + raw"""
+        run()
+            var local = 3
+            m.with((j) -> j.thread = Some(Th(&local)))
+
+        run()
+        """, kps_address_out("local", "stored in 'j.thread'"), "21:12")
+
+@test("the same through try_with is refused at the closure")
+kps_lock_try_with_stores_capture_address()
+    kps_refused_at(kps_lock() + raw"""
+        run()
+            var local = 3
+            m.try_with((j) -> j.thread = Some(Th(&local)))
+
+        run()
+        """, kps_address_out("local", "stored in 'j.thread'"), "21:16")
+
+// The program's own `with` is blamed no more than the library's: what it does is run the closure it
+// was handed, and the address is taken in the closure.
+@test("the same through a with method of the program's own is refused at the closure")
+kps_own_with_stores_capture_address()
+    kps_refused_at(kps_lock() + raw"""
+        struct Own
+            v: Joint
+
+            with(*self, body: *Joint -> unit)
+                body(&self.v)
+
+        var own = Own(Joint(None, Inner(None), buf(), 0))
+
+        run()
+            var local = 3
+            own.with((j) -> j.thread = Some(Th(&local)))
+
+        run()
+        """, kps_address_out("local", "stored in 'j.thread'"), "29:14")
+
+@test("the same through a function of the program's own storing into module storage is refused at the closure")
+kps_own_runner_stores_capture_address()
+    kps_refused_at(kps_lock() + raw"""
+        static var kept: Option[Th] = None
+
+        each(f: () -> unit)
+            f()
+
+        run()
+            var local = 3
+            each(() -> kept = Some(Th(&local)))
+
+        run()
+        """, kps_address_out("local", "stored in 'kept'"), "26:10")
+
+@test("a closure bound to a name and handed to a lock is refused where it is written")
+kps_named_closure_stores_capture_address()
+    kps_refused_at(kps_lock() + raw"""
+        run()
+            var local = 3
+            val set = (j: *Joint) -> j.thread = Some(Th(&local))
+
+            m.with(set)
+
+        run()
+        """, kps_address_out("local", "stored in 'j.thread'"), "21:15")
+
+@test("a nested function handed to a lock in place of the closure is refused where it is handed")
+kps_nested_fn_stores_capture_address()
+    kps_refused_at(kps_lock() + raw"""
+        run()
+            var local = 3
+
+            set(j: *Joint)
+                j.thread = Some(Th(&local))
+
+            m.with(set)
+
+        run()
+        """, "'set' is a nested function, so it is called where it is written rather than passed", "25:12")
+
+@test("a closure handed to scope storing the address of its capture is refused at the closure")
+kps_scope_body_stores_capture_address()
+    kps_refused_at(raw"""
+        import sysl.threads.scope
+
+        struct Th
+            p: *int
+
+        static var g: Option[Th] = None
+
+        run()
+            var local = 3
+            scope((s) -> g = Some(Th(&local)))
+
+        run()
+        print(g.is_some())
+        """, kps_address_out("local", "stored in 'g'"), "10:11")
+
+@test("a lock's body may take its capture's address for what it only reads or keeps in itself")
+kps_lock_body_uses_capture_address()
+    kps_prints(kps_lock() + raw"""
+        run()
+            var local = 3
+            m.with((j) -> j.n = *Th(&local).p)
+            m.with((j) ->
+                val t = Th(&local)
+                j.n += *t.p)
+
+        run()
+        print(m.with((j) -> j.n))
+        """, "6\n")
+
 // -- recursion settles on what the body does ----------------------------------------------------------
 
 @test("a recursive function that keeps on one branch keeps, and one that never does is accepted")

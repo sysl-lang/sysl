@@ -3894,6 +3894,8 @@ private captures_let_out(ft: &FrameTrack, evs: &EvBuf, st: &StructType, args: Bu
 
     if ft.cx.find(body).is_none() then return
 
+    val told = ft.faults.items.len() + evs.items.len()
+
     for c in 0..<args.len()
         if c >= st.fields.len() then break
 
@@ -3931,7 +3933,78 @@ private captures_let_out(ft: &FrameTrack, evs: &EvBuf, st: &StructType, args: Bu
             end for
         end for
     end for
+
+    if ft.faults.items.len() + evs.items.len() == told then environment_let_out(ft, evs, st, args, body)
 end captures_let_out
+
+// **A body that lets the address of a capture it holds by value out is judged at the literal too**:
+// such a capture is a field of the closure, so `&x` in the body is the address of the closure's own
+// storage -- a frame's local, or a copy in the frame of whatever runs it, gone with that frame. The
+// function that runs it (`m.with(…)`, or one of the program's own) is not told: what it hands over is
+// only the closure it was given, and the address is taken in the closure (`env_judged_at_literal`).
+private environment_let_out(ft: &FrameTrack, evs: &EvBuf, st: &StructType, args: Buf[TExpr], body: string)
+    val taken = by_value_address_taken(ft.cx, body)
+
+    if taken < 0 || usize(taken) >= args.len() || usize(taken) >= st.fields.len() then return
+
+    val at = args[usize(taken)]
+    val field = st.fields[usize(taken)].0
+
+    for item in keeps_of(ft.cx, body, 0).locs
+        val loc = outlasting_loc(item.loc)
+
+        if loc.is_none() then continue
+
+        val said = s"a closure lets the address of its capture '$field' outlive the call (${item.how}), and " +
+            s"the closure holds '$field' by value, in its own storage — store the value itself, or the " +
+            s"address of storage that lasts"
+
+        if loc.unwrap() == ""
+            ft.faults.items.push((ft.scope, at.span, said))
+            return
+        end if
+
+        evs.items.push(kept_ev(loc.unwrap(), said, at))
+    end for
+end environment_let_out
+
+// The first capture a closure's body takes the address of in its own storage -- `&x`, `&x.f`,
+// `&x[i]` for one held by value -- by its field's index, or -1. One held by reference is a pointer
+// field, and `&x` reads the pointer out of it rather than pointing into the closure.
+private by_value_address_taken(cx: &KeepsCx, body: string) -> int
+    val f = cx.find(body)
+
+    if f.is_none() || !is_closure_body(f.unwrap()) then return -1
+
+    var found: Buf[int] = buf()
+    val sink = &found
+
+    walk_block_stmts(f.unwrap().body, expr_walk(true, x -> *x.kind match
+        TAddrOf(place, _) ->
+            val c = env_field_of(place)
+
+            if c >= 0 then sink.push(c)
+        _ -> ()))
+
+    if found.is_empty() then -1 else found[0]
+end by_value_address_taken
+
+// The environment field a place lies inside, in place: `(*self).x`, a field or array element of it.
+private env_field_of(place: TExpr) -> int = *place.kind match
+    TField(r, index, _) -> *r.kind match
+        TDeref(x, _) -> if is_environment_load(x) then index else -1
+        _ -> env_field_of(r)
+    TIndex(r, _, _) -> if is_array_type(texpr_type(r)) then env_field_of(r) else -1
+    _ -> -1
+
+private is_environment_load(x: TExpr) -> bool = *x.kind match
+    TLoad(n, ty) -> n == "self" && is_closure_literal(env_type(ty))
+    _ -> false
+
+// Whether what a closure's body keeps of its environment, handed to it at `j`, is told where the
+// closure is written (`environment_let_out`): a capture's own address, kept where it outlasts the call.
+private env_judged_at_literal(cx: &KeepsCx, name: string, j: usize, loc: string) -> bool =
+    j == 0 && name.ends_with(".call") && outlasting_loc(loc).is_some() && by_value_address_taken(cx, name) >= 0
 
 // **The waker handed to `step` is kept by the task**: every `park` in it, this step's or one woken
 // long after the step returned, calls that waker, so it outlives the frame that built it whatever
@@ -4270,6 +4343,7 @@ private call_at(ft: &FrameTrack, evs: &EvBuf, e: TExpr)
                     val read = h.2 != ""
 
                     if item.loc == "j" && has_span(ft.hs.chained, e.span) then continue
+                    if !read && !ft.probe && env_judged_at_literal(ft.cx, name, j, item.loc) then continue
 
                     var loc = if item.loc == "j" then joined_loc(ft.hs, false) else translate_loc(ft.org, args, item.loc)
 
