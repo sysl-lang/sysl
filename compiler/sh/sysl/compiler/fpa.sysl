@@ -2145,7 +2145,7 @@ private store_at(fb: &FBody, at: Buf[FAtom], v: Buf[FAtom])
             // `e.ds` points at, which the caller places.
             val at_path = if inside then extend(a.path, tilde_step()) else a.path
             val at_id = path_id(fb.fx, at_path)
-            val beyond = derefs_in(a.path) > 1
+            val beyond = derefs_in(a.path) > 0
             var out: Buf[FAtom] = buf()
 
             for b in v
@@ -2198,6 +2198,18 @@ private call(fb: &FBody, e: TExpr, name: string, args: Buf[TExpr], argv: Buf[Buf
     fb.fx.an.tables.externs.get(name) match
         Some(d) ->
             var out: Buf[FAtom] = buf()
+
+            // **C may point what a pointer argument points at anywhere**: where the pointee can itself hold an
+            // address (`zap(pp: ***int)`), the caller's place there may afterwards point at storage that
+            // outlives every frame, as `redirect(pp) = *pp = &slot` would.
+            for k in 0..<argv.len()
+                val pt = if k < args.len() then pointee_of(texpr_type(args[k])) else None
+
+                if pt.is_some() && fpa_holds(fb.fx, pt.unwrap())
+                    var memo: Map[u32, Buf[FAtom]] = map()
+
+                    store_at(fb, written_at(fb, argv[k], buf(), &memo), single(atom(fb, buf(), "g", buf())))
+                end if
 
             for k in 0..<argv.len()
                 if k < d.params.len() && holds_string(d.keeps, d.params[k].name) then keep(fb, argv[k])
@@ -2647,9 +2659,8 @@ fpa_answers_within(fx: &Fpa, name: string, i: usize, steps: int) -> Option[bool]
     Some(false)
 end fpa_answers_within
 
-// How many `*` steps a path takes. A `~` is not counted: a store anywhere inside a value is a store
-// into its own root's storage, and counting it would turn every store into a box's interior into a
-// write of the parameter into itself.
+// How many `*` steps a path takes. A `~` is not counted: a store anywhere inside what a parameter points
+// at is a store into its own pointee, not through a pointer read out of it.
 private derefs_in(p: Buf[FStep]) -> int
     var n = 0
 

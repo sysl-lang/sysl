@@ -156,6 +156,9 @@ struct KeepsCx
     // Whether each struct or enum type reaches itself (`reaches_itself`), by `type_show`.
     self_reaching: Map[string, bool]
 
+    // Whether each body runs code the field-path analysis cannot see into (`fpa_blind`), by name.
+    fpa_blind: Map[string, bool]
+
     // The closure bodies a call through a `&Fn` may land in: every slot of a call trait's table. A call
     // there sees no body, so each is held to its callable type where it is written (`refuse_promised`).
     erased: Map[string, bool]
@@ -193,7 +196,7 @@ settled_keeps(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable]) -> &KeepsC
     val cx: &KeepsCx = KeepsCx(a, funcs, index, map(), map(), map(), buf(), buf(), false, 0, map(),
                                map(), map(), map(), map(), map(), map(), vtables,
                                map(), buf(), map(), map(), map(), map(), buf(), false, map(), false, map(),
-                               0, false, buf(), map(), map(), map())
+                               0, false, buf(), map(), map(), map(), map())
 
     // Every method an `impl` of a trait brought, by the function it was lowered to, and every slot of
     // every table -- an instance of a generic one among them.
@@ -758,6 +761,12 @@ private val CycleStep = 1 << 30
 private fpa_rules_out(cx: &KeepsCx, f: TFunc, i: usize, q: string) -> bool
     if i >= f.params.len() then return false
 
+    // **What a closure does is seen where it is written, not where it is called**: a call through a
+    // callable is answered by its type, so a parameter that is a callable, and a body that makes a
+    // closure or calls through one, are the summary layer's own to answer. A closure body itself is
+    // summarized like any other.
+    if callable_t(f.params[i].1) || fpa_blind(cx, f) then return false
+
     val fx = cx.an.field_paths match
         Some(x) -> x
         None -> return false
@@ -778,6 +787,68 @@ private fpa_rules_out(cx: &KeepsCx, f: TFunc, i: usize, q: string) -> bool
 
     said_no(fpa_lets_out_within(fx, f.name, i, steps, fpa_first(cx, f.params[i].1, path_of(q))))
 end fpa_rules_out
+
+// Whether a value of type `t` is something to call: a closure, a callable object, or a reference to one.
+private callable_t(t: Type) -> bool = t match
+    Ref(inner, _) -> callable_t(*inner)
+    Ptr(inner) -> callable_t(*inner)
+    Trait(_, _, _) -> true
+    Abstract(_, _) -> true
+    Struct(_) -> is_closure_literal(t)
+    _ -> false
+
+// **Whether `f`'s body runs code whose effects the field-path analysis answers by signature where the
+// call is made**: it makes a closure or calls through a callable or a pointer, or calls a function that
+// does. A summary is built from its callees', so what one cannot see none of its callers can either.
+// Worked out for every body at once, the first time it is asked.
+private fpa_blind(cx: &KeepsCx, f: TFunc) -> bool
+    if cx.fpa_blind.is_empty() then settle_blind(cx)
+
+    cx.fpa_blind.get(f.name).unwrap_or(false)
+end fpa_blind
+
+private settle_blind(cx: &KeepsCx)
+    var calls: Buf[Buf[string]] = buf()
+    var blind: Buf[bool] = buf()
+
+    for f in cx.funcs
+        var hit: Buf[bool] = buf()
+
+        walk_block_stmts(f.body, expr_walk(false, e -> if blind_expr(e) then hit.push(true)))
+        blind.push(!hit.is_empty())
+        calls.push(callees_of(f))
+
+    var moved = true
+
+    while moved
+        moved = false
+
+        for i in 0..<cx.funcs.len()
+            if blind[i] then continue
+
+            for name in calls[i]
+                val j = cx.index.get(name)
+
+                if j.is_some() && blind[j.unwrap()]
+                    blind[i] = true
+                    moved = true
+                    break
+                end if
+            end for
+        end for
+    end while
+
+    // Marked even where nothing is blind, so the work is done once.
+    cx.fpa_blind.put("", false)
+
+    for i in 0..<cx.funcs.len()
+        cx.fpa_blind.put(cx.funcs[i].name, blind[i])
+end settle_blind
+
+private blind_expr(e: TExpr) -> bool = *e.kind match
+    TCallPtr(_, _, _, _) -> true
+    TVCall(_, _, _, _, _) -> true
+    _ -> callable_t(texpr_type(e)) && is_closure_literal(texpr_type(e))
 
 // **Whether a value of type `t` can hold, somewhere below it, another value of the same type**,
 // through fields, elements, pointers, views and boxes. An object or a closure may hold anything.
@@ -1111,8 +1182,9 @@ private answer(cx: &KeepsCx, name: string, i: usize, q: string) -> KeptWhy
 
     // **The field-path analysis says what is reached** (`fpa_rules_out`); the walk says where and how. A
     // read question is the walk of what is read at any depth along the same field. Where the analysis
-    // lets out nothing the question asks about, the answer is not kept, and keeps only what the walk
-    // put back in place -- in what the parameter itself points at -- which is the caller's to place.
+    // lets out nothing the question asks about, the answer is not kept. What is kept keeps only what the
+    // walk put back in place -- in what the parameter itself points at -- which is the caller's to place;
+    // what is read through it and put back where it was read from lets nothing out.
     val ruled_out = fpa_rules_out(cx, f, i, q)
     val found = if reading then deep_path_of(cx, name, i, path_of(q))
     else if read_answering then summary(cx, name, i, ThroughAnswersQ)
@@ -1126,7 +1198,7 @@ private answer(cx: &KeepsCx, name: string, i: usize, q: string) -> KeptWhy
     else if q == ThroughAnswersQ then walk_answers_through(cx, f, i)
     else walk_answers(cx, f, i, q == RawAnswersQ)
 
-    val walked = if ruled_out then put_back_only(found, i) else found
+    val walked = if !ruled_out then found else if keeping then put_back_only(found, i) else not_kept()
 
     // A read question not ruled out answered with the walk at any depth, which a task already holds.
     val held_on = keeping || q == ThroughQ || q == VesselQ || (reading && ruled_out) || deep
