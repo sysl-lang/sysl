@@ -153,11 +153,8 @@ struct KeepsCx
     deferred: Buf[(string, usize, string)]
     pending: Map[string, bool]
 
-    // How deep each parameter's type can hold a pointer (`read_depth`), by `<name>|<position>`.
-    depths: Map[string, int]
-
-    // The same, by struct or enum type (`type_show`): a type met along many paths is worked out once.
-    type_depths: Map[string, int]
+    // Whether each struct or enum type reaches itself (`reaches_itself`), by `type_show`.
+    self_reaching: Map[string, bool]
 
     // The closure bodies a call through a `&Fn` may land in: every slot of a call trait's table. A call
     // there sees no body, so each is held to its callable type where it is written (`refuse_promised`).
@@ -196,7 +193,7 @@ settled_keeps(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable]) -> &KeepsC
     val cx: &KeepsCx = KeepsCx(a, funcs, index, map(), map(), map(), buf(), buf(), false, 0, map(),
                                map(), map(), map(), map(), map(), map(), vtables,
                                map(), buf(), map(), map(), map(), map(), buf(), false, map(), false, map(),
-                               0, false, buf(), map(), map(), map(), map())
+                               0, false, buf(), map(), map(), map())
 
     // Every method an `impl` of a trait brought, by the function it was lowered to, and every slot of
     // every table -- an instance of a generic one among them.
@@ -707,28 +704,27 @@ through_answers_of(cx: &KeepsCx, name: string, i: usize) -> bool = summary(cx, n
 // -- one step: the pointee's own fields and elements; two: what is read through an address one of
 // those holds -- which is the borrow rule's question (`read_cores`): `stash(p: *H) = kept.push(p.p)`
 // lets out, one step in, the address the caller's `h` holds, and `deep(w: *W) = kept.push(w.s.f)`
-// lets out only what sits two steps in. A pointer on the way handed on, or stored, counts, as for
-// `through_of`, since whoever holds it may read on; a value read `steps` in and handed on counts only
-// where the callee keeps it. Where no body is in sight the signature answers: an `extern` borrows
-// unless its `@keeps` names the parameter, a call through an object as its trait's declaration says,
-// and a call through a function pointer borrows (`vcall_reads`, `pointer_reads`). **A question deeper
-// than the parameter's type can hold, or one a cycle in the caller's storage asks, is what the body
-// lets out of anything it reads through the parameter** (`reads_past`, `deep_of`), which holds every
-// step at once: answered conservatively, never let through.
+// lets out only what sits two steps in. A pointer on the way handed on, or stored, counts, since
+// whoever holds it may read on. **Which steps are reached is the field-path analysis's answer**
+// (`fpa_rules_out`): a path it lets out counts at its number of `*` steps. Where it rules nothing out,
+// the answer -- where it is held, and why -- is what the body lets out of anything it reads through
+// the parameter along the same field (`deep_path_of`). Where no body is in sight the signature
+// answers: an `extern` borrows unless its `@keeps` names the parameter, a call through an object as
+// its trait's declaration says, and a call through a function pointer borrows (`vcall_reads`,
+// `pointer_reads`).
 read_of(cx: &KeepsCx, name: string, i: usize, steps: int) -> KeptWhy = read_path_of(cx, name, i, steps, "")
 
 // **The same, where the first step goes through one field of the pointee** (`path`: `.bus`,
 // `.inner.bus`, `.cells[]`; empty for every field): `keep_bus(c: *Cpu) = last = c.bus` lets out what
-// it reads one step in along `.bus`, and nothing along `.peer`. A read along a field the path does not
-// overlap is not followed (`path_ok`); one the body cannot place -- through a copy of the pointer, the
-// pointee whole -- is followed whatever field it may be along, so the answer only narrows.
+// it reads one step in along `.bus`, and nothing along `.peer` (`fpa_first`).
 read_path_of(cx: &KeepsCx, name: string, i: usize, steps: int, path: string) -> KeptWhy =
-    if reads_past(cx, name, i, steps) then deep_path_of(cx, name, i, path)
-    else if path == "" then summary(cx, name, i, s"$ReadQ$steps")
+    if path == "" then summary(cx, name, i, s"$ReadQ$steps")
     else summary(cx, name, i, s"$ReadQ$steps<$path>")
 
-// `deep_of` along one field of the pointee (`read_path_of`): a cycle along `.peer` is asked at every
-// step at once, and what the body lets out of anything it reads along `.mem` is no part of it.
+// `deep_of` along one field of the pointee (`read_path_of`): what the body lets out of anything it
+// reads along `.mem` is no part of what it lets out along `.peer`. A read along a field the path does
+// not overlap is not followed (`path_ok`); one the body cannot place -- through a copy of the pointer,
+// the pointee whole -- is followed whatever field it may be along, so the answer only narrows.
 deep_path_of(cx: &KeepsCx, name: string, i: usize, path: string) -> KeptWhy =
     if path == "" then deep_of(cx, name, i) else summary(cx, name, i, s"$DeepQ<$path>")
 
@@ -744,118 +740,184 @@ deep_of(cx: &KeepsCx, name: string, i: usize) -> KeptWhy = summary(cx, name, i, 
 vessel_of(cx: &KeepsCx, name: string, i: usize) -> KeptWhy = summary(cx, name, i, VesselQ)
 
 // Whether what `name` answers can be made of a value it read `steps` steps through the parameter at
-// `i` -- past what its type can hold (`reads_past`), of anything it read through it.
+// `i`: ruled out by the field-path analysis (`fpa_rules_out`), or else whether it answers anything it
+// read through it.
 read_answers_of(cx: &KeepsCx, name: string, i: usize, steps: int) -> bool =
-    if reads_past(cx, name, i, steps) then through_answers_of(cx, name, i)
-    else summary(cx, name, i, s"$ReadAnswersQ$steps").kept
+    summary(cx, name, i, s"$ReadAnswersQ$steps").kept
 
 // **The step a frame asks about where its own storage holds a cycle** (`read_cores`): from there on
 // every step reaches what it already reached, so the callee is asked what it lets out of anything it
-// reads through the argument (`deep_of`), which holds every step at once.
+// reads through the argument, which holds every step at once.
 private val CycleStep = 1 << 30
 
-// **Whether a read question asks deeper than the parameter's type can hold**, so that it is asked as
-// what the body lets out of anything it reads (`deep_of`) rather than step by step. A type that holds
-// no pointer to its own kind is a finite tree of pointers (`read_depth`): nothing in typed code sits
-// deeper than its depth, so every question a chain of such types asks is answered exactly, however
-// long the chain. A type that reaches itself -- a list, a ring, an object -- holds pointers at every
-// depth; there `RecursiveSteps` bounds the questions, since a body taking the address of what it
-// reads and handing it to itself would otherwise ask a deeper one each time.
-private reads_past(cx: &KeepsCx, name: string, i: usize, steps: int) -> bool
-    if steps >= CycleStep then return true
+// **Whether the field-path analysis (`fpa.sysl`) says the body lets out nothing a question asks
+// about**, so that nothing is walked: what is kept (no `*` step), what is read through the parameter
+// (any number), `steps` in along a field (`read_path_of`), and what the answer is made of, read through
+// it. Where it has no summary of the body, nothing is ruled out. Every other question -- what is
+// cleared, borrowed, written, held in a vessel, answered as the value -- is the walk's alone.
+private fpa_rules_out(cx: &KeepsCx, f: TFunc, i: usize, q: string) -> bool
+    if i >= f.params.len() then return false
 
-    val key = s"$name|$i"
-    val d = cx.depths.get(key) match
-        Some(n) -> n
-        None ->
-            var n = 0
+    val fx = cx.an.field_paths match
+        Some(x) -> x
+        None -> return false
 
-            cx.find(name) match
-                Some(f) ->
-                    if i < f.params.len()
-                        var seen: Buf[string] = buf()
+    val reading = q.starts_with(ReadQ)
+    val read_answering = q.starts_with(ReadAnswersQ)
+    val deep = q.starts_with(DeepQ)
 
-                        n = read_depth(cx, f.params[i].1, &seen, 0)
-                    end if
-                None -> ()
+    if q == ThroughAnswersQ || read_answering
+        val steps = if read_answering then steps_of(q) else CycleStep
 
-            cx.depths.put(key, n)
-            n
+        return said_no(fpa_answers_within(fx, f.name, i, steps))
+    end if
 
-    if d < 0 then steps > RecursiveSteps else steps > d
-end reads_past
+    if q != KeepsQ && q != ThroughQ && !reading && !deep then return false
 
-// The deepest step a read question through a type that reaches itself tells apart.
-private val RecursiveSteps = 8
+    val steps = if q == KeepsQ then 0 else if reading then steps_of(q) else CycleStep
 
-// **How many pointers deep a value of this type can hold another pointer** -- a step for each pointer,
-// view or box on the way, the deepest field deciding -- or -1 where it is unbounded: a struct or an
-// enum reaching itself, an object, a closure's captures. Counted generously, so a walk never steps
-// further than this into a value of the type.
-//
-// **A struct's or an enum's answer is kept by type** (`type_depths`), since a type met along many
-// paths would otherwise be walked once per path. The answer does not depend on the path: a type that
-// reaches one on the way down (`seen`) is in a cycle with it, so it reaches itself and answers -1 from
-// anywhere. Only the cut at 32 nested steps depends on where the walk starts, and it answers -1,
-// which is the conservative answer.
-private read_depth(cx: &KeepsCx, t: Type, seen: *Buf[string], depth: int) -> int
-    if depth > 32 then return -1
+    said_no(fpa_lets_out_within(fx, f.name, i, steps, fpa_first(cx, f.params[i].1, path_of(q))))
+end fpa_rules_out
 
+// **Whether a value of type `t` can hold, somewhere below it, another value of the same type**,
+// through fields, elements, pointers, views and boxes. An object or a closure may hold anything.
+// Kept by type (`self_reaching`).
+private reaches_itself(cx: &KeepsCx, t: Type) -> bool
+    val key = type_show(t)
+
+    cx.self_reaching.get(key) match
+        Some(b) -> return b
+        None -> ()
+
+    var seen: Map[string, bool] = map()
+    var work: Buf[Type] = buf()
+    var found = false
+
+    push_parts(t, &work)
+
+    while !work.is_empty() && !found
+        val cur = work.pop().unwrap()
+
+        cur match
+            Trait(_, _, _) -> found = true
+            Struct(_) ->
+                val k = type_show(cur)
+
+                if k == key || is_closure_literal(cur)
+                    found = true
+                else if !seen.has(k)
+                    seen.put(k, true)
+                    push_parts(cur, &work)
+                end if
+            Enum(_) ->
+                val k = type_show(cur)
+
+                if k == key
+                    found = true
+                else if !seen.has(k)
+                    seen.put(k, true)
+                    push_parts(cur, &work)
+                end if
+            _ -> push_parts(cur, &work)
+    end while
+
+    cx.self_reaching.put(key, found)
+    found
+end reaches_itself
+
+// The types a value of type `t` holds one step down.
+private push_parts(t: Type, work: *Buf[Type])
     t match
-        Ptr(inner) -> if is_opaque_struct(*inner) then 0 else deeper(read_depth(cx, *inner, seen, depth + 1))
-        Slice(elem, _) -> deeper(read_depth(cx, *elem, seen, depth + 1))
-        Ref(inner, _) -> deeper(read_depth(cx, *inner, seen, depth + 1))
-        Weak(inner) -> deeper(read_depth(cx, *inner, seen, depth + 1))
-        Volatile(inner) -> read_depth(cx, *inner, seen, depth + 1)
-        Array(_, elem) -> read_depth(cx, *elem, seen, depth + 1)
-        Trait(_, _, _) -> -1
+        Ptr(inner) -> work.push(*inner)
+        Slice(elem, _) -> work.push(*elem)
+        Ref(inner, _) -> work.push(*inner)
+        Weak(inner) -> work.push(*inner)
+        Volatile(inner) -> work.push(*inner)
+        Array(_, elem) -> work.push(*elem)
         Struct(d) ->
-            if is_closure_literal(t) && !d.fields.is_empty() then return -1
-
-            val key = type_show(t)
-
-            cx.type_depths.get(key) match
-                Some(n) -> return n
-                None -> ()
-
-            if holds_string(*seen, key) then return -1
-
-            seen.push(key)
-
-            var most = 0
-
             for item in d.fields
-                if most >= 0 then most = widest(most, read_depth(cx, item.1, seen, depth + 1))
-
-            seen.truncate(seen.len() - 1)
-            cx.type_depths.put(key, most)
-            most
+                work.push(item.1)
         Enum(d) ->
-            val key = type_show(t)
-
-            cx.type_depths.get(key) match
-                Some(n) -> return n
-                None -> ()
-
-            if holds_string(*seen, key) then return -1
-
-            seen.push(key)
-
-            var most = 0
-
             for v in d.variants
                 for item in v.fields
-                    if most >= 0 then most = widest(most, read_depth(cx, item.1, seen, depth + 1))
+                    work.push(item.1)
+        _ -> ()
+end push_parts
 
-            seen.truncate(seen.len() - 1)
-            cx.type_depths.put(key, most)
-            most
-        _ -> 0
-end read_depth
+// An answer the field-path analysis ruled out: nothing kept, and only the locations the walk found in
+// what the parameter at `i` itself points at, which the caller places.
+private put_back_only(w: KeptWhy, i: usize) -> KeptWhy
+    var locs: Buf[KeptAt] = buf()
 
-private deeper(d: int) -> int = if d < 0 then -1 else d + 1
+    for item in w.locs
+        if in_place_of(item.loc, i) then locs.push(item)
 
-private widest(a: int, b: int) -> int = if a < 0 || b < 0 then -1 else if b > a then b else a
+    KeptWhy(false, "", span_zero(), locs)
+end put_back_only
+
+private said_no(o: Option[bool]) -> bool = o match
+    Some(b) -> !b
+    None -> false
+
+// **A read question's field path in the field-path analysis's steps** (`.bus` of a `*Cpu` is `.0`):
+// each field of the pointee by its index, an element of an array held in place as `[]`. It stops at
+// whatever it cannot place -- a union, a variant, a view's element -- which asks about everything
+// below there, as the path itself does. **A pointee whose type reaches itself is not told apart by
+// field at all**: the analysis cuts a path where it lands on that type again, back to the pointee, so
+// `c.peer.bus` is kept as `*.0` -- the field it went through first is no longer in it.
+private fpa_first(cx: &KeepsCx, t: Type, path: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    var cur = t match
+        Ptr(inner) -> *inner
+        _ -> return out
+
+    if path == "" || reaches_itself(cx, cur) then return out
+
+    val b = path.bytes
+    var at = 0
+
+    while at < b.len
+        if b[at] == u8('[')
+            if at + 1 >= b.len || b[at + 1] != u8(']') || !is_array_type(cur) then break
+
+            cur = cur match
+                Array(_, elem) -> *elem
+                _ -> cur
+
+            out.push("[]")
+            at += 2
+            continue
+        end if
+
+        if b[at] != u8('.') then break
+
+        var end_at = at + 1
+
+        while end_at < b.len && b[end_at] != u8('.') && b[end_at] != u8('[') && b[end_at] != u8('#')
+            end_at += 1
+
+        val label = from_utf8_unchecked(b[at + 1..<end_at])
+        var found = -1
+
+        cur match
+            Struct(d) ->
+                if !d.union_layout
+                    for k in 0..<d.fields.len()
+                        if found < 0 && d.fields[k].0 == label then found = int(k)
+                end if
+            _ -> ()
+
+        if found < 0 then break
+
+        out.push(s".$found")
+        cur = cur match
+            Struct(d) -> d.fields[usize(found)].1
+            _ -> cur
+        at = end_at
+    end while
+
+    out
+end fpa_first
 
 // **Whether a frame's walk of what an argument reaches has come round to storage it already
 // reached** (`read_cores`): every point of the level is one an earlier level held. Each level that
@@ -1047,7 +1109,14 @@ private answer(cx: &KeepsCx, name: string, i: usize, q: string) -> KeptWhy
 
     cx.taint = false
 
-    val walked = if keeping then walk_kept(cx, f, i)
+    // **The field-path analysis says what is reached** (`fpa_rules_out`); the walk says where and how. A
+    // read question is the walk of what is read at any depth along the same field. Where the analysis
+    // lets out nothing the question asks about, the answer is not kept, and keeps only what the walk
+    // put back in place -- in what the parameter itself points at -- which is the caller's to place.
+    val ruled_out = fpa_rules_out(cx, f, i, q)
+    val found = if reading then deep_path_of(cx, name, i, path_of(q))
+    else if read_answering then summary(cx, name, i, ThroughAnswersQ)
+    else if keeping then walk_kept(cx, f, i)
     else if q == ClearsQ then walk_clears(cx, f)
     else if q == BorrowQ then walk_borrow(cx, f, i)
     else if q == VesselQ then walk_vessel(cx, f, i)
@@ -1055,11 +1124,12 @@ private answer(cx: &KeepsCx, name: string, i: usize, q: string) -> KeptWhy
     else if q == ThroughQ then walk_through(cx, f, i)
     else if deep then walk_deep(cx, f, i, path_of(q))
     else if q == ThroughAnswersQ then walk_answers_through(cx, f, i)
-    else if reading then walk_track(read_track(cx, f, i, q), i)
-    else if read_answering then answered(track_as(cx, f, i, false, true, steps_of(q)), f)
     else walk_answers(cx, f, i, q == RawAnswersQ)
 
-    val held_on = keeping || q == ThroughQ || q == VesselQ || reading || deep
+    val walked = if ruled_out then put_back_only(found, i) else found
+
+    // A read question not ruled out answered with the walk at any depth, which a task already holds.
+    val held_on = keeping || q == ThroughQ || q == VesselQ || (reading && ruled_out) || deep
     val out = if held_on && f.marks.is_async() then task_held(walked) else walked
 
     val leaned = cx.taint
@@ -1794,10 +1864,9 @@ struct Track
     // field of its pointee, an element of its view -- is followed as the parameter itself is.
     through: bool
 
-    // A walk of what is read EXACTLY `steps` steps through the parameter (`read_of`), where it is not
-    // zero: a value read fewer steps in is a pointer on the way (`ptrs`, with its step), followed as
-    // the parameter is, and a step through a value read `steps` in reads storage nobody asked about.
-    steps: int
+    // **How many steps from the parameter each local holding part of it sits** (`gather_steps`): zero for
+    // the parameter, one less for each address taken on the way, so that a callee handed the address
+    // of a local holding the parameter is asked what it reads that many steps through it (`value_reads`).
     ptrs: Buf[(string, int)]
 
     // Every local the body declares, with its initializer (`read_back_loc`).
@@ -1830,22 +1899,17 @@ struct Track
     holds(self, name: string) -> bool = holds_string(self.held, name)
 end Track
 
-// A walk of what is read through the parameter at `i` as a read question asks it: its steps, and the
-// field the first one goes through (`read_path_of`).
-private read_track(cx: &KeepsCx, f: TFunc, i: usize, q: string) -> &Track =
-    track_along(cx, f, i, false, true, steps_of(q), path_of(q))
-
 // A walk following the parameter at `i`, or nothing at all where `i` is past the parameters -- which
 // is how what a body overwrites is asked.
-private track(cx: &KeepsCx, f: TFunc, i: usize, raw: bool) -> &Track = track_as(cx, f, i, raw, false, 0)
+private track(cx: &KeepsCx, f: TFunc, i: usize, raw: bool) -> &Track = track_as(cx, f, i, raw, false)
 
-private track_as(cx: &KeepsCx, f: TFunc, i: usize, raw: bool, through: bool, steps: int) -> &Track =
-    track_along(cx, f, i, raw, through, steps, "")
+private track_as(cx: &KeepsCx, f: TFunc, i: usize, raw: bool, through: bool) -> &Track =
+    track_along(cx, f, i, raw, through, "")
 
-private track_along(cx: &KeepsCx, f: TFunc, i: usize, raw: bool, through: bool, steps: int, path: string) -> &Track
+private track_along(cx: &KeepsCx, f: TFunc, i: usize, raw: bool, through: bool, path: string) -> &Track
     val org = origins_of(cx, f)
     val t: &Track = Track(cx, func_home(cx.an, f.name), buf(), buf(), false, not_kept(), org, raw, through,
-                          steps, buf(), buf(), false, round_handles(cx, org, f), f, false, path, "", buf())
+                          buf(), buf(), false, round_handles(cx, org, f), f, false, path, "", buf())
 
     if i < f.params.len()
         t.held.push(f.params[i].0)
@@ -1980,11 +2044,11 @@ end handed_on
 
 // Every location a value `f` reads through its parameter at `i` may still be held at once it returns.
 private walk_through(cx: &KeepsCx, f: TFunc, i: usize) -> KeptWhy =
-    walk_track(track_as(cx, f, i, false, true, 0), i)
+    walk_track(track_as(cx, f, i, false, true), i)
 
 // The same, as the borrow rule asks it (`deep_of`).
 private walk_deep(cx: &KeepsCx, f: TFunc, i: usize, path: string) -> KeptWhy
-    val t = track_along(cx, f, i, false, true, 0, path)
+    val t = track_along(cx, f, i, false, true, path)
 
     t.deep = true
     walk_track(t, i)
@@ -1992,7 +2056,7 @@ end walk_deep
 
 // Whether what `f` answers can be made of a value it reads through its parameter at `i`.
 private walk_answers_through(cx: &KeepsCx, f: TFunc, i: usize) -> KeptWhy =
-    answered(track_as(cx, f, i, false, true, 0), f)
+    answered(track_as(cx, f, i, false, true), f)
 
 private walk_track(t: &Track, i: usize) -> KeptWhy
     val f = t.func
@@ -2001,7 +2065,7 @@ private walk_track(t: &Track, i: usize) -> KeptWhy
 
     flow_body(w, f.body)
 
-    val pending = if t.steps > 0 || t.deep then read_back_locs(t, w.out_pending) else w.out_pending
+    val pending = if t.deep then read_back_locs(t, w.out_pending) else w.out_pending
     var first: Option[KeptAt] = None
 
     for item in pending
@@ -2012,13 +2076,12 @@ private walk_track(t: &Track, i: usize) -> KeptWhy
     KeptWhy(true, first.unwrap().how, first.unwrap().at, pending)
 end walk_track
 
-// **A store through a local holding a pointer on the way is a store through the parameter**, for a walk
-// of what is read some steps in: `val vm = s.vm` then `vm.con = old` is held at `d:@vm.con`, the local's
-// own name, which the caller cannot say -- so it is said as the pointer it was read from
-// (`d:p0:.vm>{*VM}.con`), which the caller can tell is reached through what it handed over
-// (`frame_read_locs`). The walk of what is read at any depth (`walk_deep`) says it the same way: a
-// frame whose storage the call itself may make into a cycle -- a callee that puts back what it read
-// -- asks that walk, and must still see the put-back.
+// **A store through a local holding a pointer on the way is a store through the parameter**, for the
+// walk of what is read at any depth (`walk_deep`): `val vm = s.vm` then `vm.con = old` is held at
+// `d:@vm.con`, the local's own name, which the caller cannot say -- so it is said as the pointer it was
+// read from (`d:p0:.vm>{*VM}.con`), which the caller can tell is reached through what it handed over
+// (`frame_read_locs`). A frame whose storage the call itself may make into a cycle -- a callee that
+// puts back what it read -- must still see the put-back.
 private read_back_locs(t: &Track, locs: Buf[KeptAt]) -> Buf[KeptAt]
     var out: Buf[KeptAt] = buf()
 
@@ -2033,10 +2096,8 @@ private read_back_loc(t: &Track, loc: string, depth: int) -> string
 
     val n = local_of(loc[1..<loc.bytes.len])
 
-    // A walk of what is read at any depth counts no steps, so any local it names (`d:@n` names only one
-    // bound once and never written again) is said as the place it was read from.
-    if !t.deep && !bound_step(t, n) then return loc
-
+    // Any local it names (`d:@n` names only one bound once and never written again) is said as the
+    // place it was read from.
     for item in t.decls
         if item.0 != n then continue
 
@@ -2258,7 +2319,7 @@ private kept_at(t: &Track, evs: &EvBuf, e: TExpr)
 
                     if item.loc == "j" && has_span(t.hs.chained, e.span) then continue
 
-                    // **A callee keeping the value read `steps` in only in what that value points at**,
+                    // **A callee keeping a value read through the parameter only in what that value points at**,
                     // in place (`launch(m)` pairing `&m.cores[0]` into `m.cores[1]`), keeps it no longer
                     // than its own pointee lasts -- as a body keeping its parameter in what the
                     // parameter points at does not keep it. Said here, because the caller, handed a
@@ -2332,10 +2393,8 @@ private kept_at(t: &Track, evs: &EvBuf, e: TExpr)
         _ -> ()
 end kept_at
 
-// Whether an argument is the pointer a walk of what is read `steps` in follows, rather than a pointer on
-// the way to it.
-private value_read_in(t: &Track, arg: TExpr) -> bool =
-    t.steps > 0 && is_ptr_type(texpr_type(arg)) && ptr_steps(t, arg).is_empty()
+// Whether an argument is a pointer the walk of what is read at any depth (`walk_deep`) follows.
+private value_read_in(t: &Track, arg: TExpr) -> bool = t.deep && is_ptr_type(texpr_type(arg))
 
 // **Where a call may hold what a walk follows in an argument**: what the callee keeps of it, and for a
 // walk of what is read through a parameter (`through_of`), what the callee lets out of what it reads
@@ -2368,14 +2427,8 @@ private track_call_locs(t: &Track, name: string, j: usize, arg: TExpr) -> Buf[Ke
         return out
     end if
 
-    if t.steps == 0
-        for item in (if t.deep then deep_path_of(t.cx, name, j, hand_path(t, arg, 0)) else through_of(t.cx, name, j)).locs
-            out.push(item)
-    end if
-
-    for k in steps_left(t, arg)
-        for item in read_path_of(t.cx, name, j, k, hand_path(t, arg, k)).locs
-            out.push(item)
+    for item in (if t.deep then deep_path_of(t.cx, name, j, hand_path(t, arg)) else through_of(t.cx, name, j)).locs
+        out.push(item)
 
     out
 end track_call_locs
@@ -2404,15 +2457,8 @@ private track_vcall_locs(t: &Track, recv: TExpr, slot: int, k: usize, arg: TExpr
     for item in kept
         out.push(item)
 
-    if t.steps == 0
-        for item in (if t.deep then vcall_deep(t.cx, recv, slot, k) else vcall_through(t.cx, recv, slot, k))
-            out.push(item)
-    end if
-
-    if !steps_left(t, arg).is_empty()
-        for item in vcall_reads(t.cx, recv, slot, k)
-            out.push(item)
-    end if
+    for item in (if t.deep then vcall_deep(t.cx, recv, slot, k) else vcall_through(t.cx, recv, slot, k))
+        out.push(item)
 
     out
 end track_vcall_locs
@@ -2441,14 +2487,8 @@ private track_pointer_locs(t: &Track, callee: TExpr, j: usize, arg: TExpr) -> Bu
     for item in kept
         out.push(item)
 
-    if t.steps == 0
-        for item in (if t.deep then pointer_deep(t.cx, callee, j, hand_path(t, arg, 0)) else pointer_through(t.cx, callee, j))
-            out.push(item)
-    end if
-
-    for left in steps_left(t, arg)
-        for item in pointer_reads(t.cx, callee, j, left, hand_path(t, arg, left))
-            out.push(item)
+    for item in (if t.deep then pointer_deep(t.cx, callee, j, hand_path(t, arg)) else pointer_through(t.cx, callee, j))
+        out.push(item)
 
     out
 end track_pointer_locs
@@ -2460,7 +2500,7 @@ end track_pointer_locs
 // lets out is told capture by capture at the literal, where the body is in hand (`captures_kept`):
 // asked here, every capture would go with whichever one the body keeps.
 private lends_held(t: &Track, name: string, arg: TExpr) -> bool
-    if t.through || t.steps != 0 || lends_vessel(t, arg) || closure_call(name) then return false
+    if t.through || lends_vessel(t, arg) || closure_call(name) then return false
 
     *arg.kind match
         TAddrOf(place, _) -> holds_local(t, place)
@@ -2533,42 +2573,19 @@ private outlasting_loc(loc: string, how: string) -> Option[string]
 end outlasting_loc
 
 // Whether a callee handed `arg` is asked what it lets out of what it reads through it: in a walk of
-// what is read through the parameter, an argument something can be read through -- and in a walk of
-// what is read `steps` in, only a pointer on the way handed on, of which the callee is asked the steps
-// left (`steps_left`); a value read `steps` in and handed on is followed by what the callee keeps of it.
-private reads_on(t: &Track, arg: TExpr) -> bool =
-    t.through && asks_through(t.cx, texpr_type(arg)) && (t.steps == 0 || !ptr_steps(t, arg).is_empty())
+// what is read through the parameter, an argument something can be read through.
+private reads_on(t: &Track, arg: TExpr) -> bool = t.through && asks_through(t.cx, texpr_type(arg))
 
-// The steps a callee handed `arg` is asked about: what is still to be read past each step it may
-// have been read at -- more than the walk's own where it points at a pointer on the way (`&q`, `q`
-// bound to the parameter, reads two steps to what the parameter reads one).
-private steps_left(t: &Track, arg: TExpr) -> Buf[int]
-    var out: Buf[int] = buf()
-
-    for s in ptr_steps(t, arg)
-        push_step(&out, t.steps - s)
-
-    out
-end steps_left
-
-// **Every step through the parameter a pointer on the way may have been read at** in a walk of what is
-// read `steps` in, or none for a value that is no such pointer: 0 for the parameter and a name bound
-// to it, one more for each step through one (`p.s`, `p[i]` of a view), the same for a field or
-// element in place, a view or a cast of it, and one fewer for an address taken of a place holding one
-// (`&p.x` reads, a step in, what `p` does; `&q`, where `q` is bound to the parameter, is a step
-// further out than the parameter). The address of a place holding the value read `steps` in is a
-// pointer on the way one step short of it. A local given values read at different steps has them all
-// (`ptrs`); so does a branch, and a call answering a value it read through a pointer on the way
-// (`call_steps`). A value read `steps` in is what is followed, not a pointer on the way.
-//
-// **A walk of the value itself** (not through it) counts the same way from 0: the parameter and every
-// copy of it are at 0, and the address of a place holding a copy is at −1, the address of a local
-// holding that address at −2 -- a pointer through which a callee reads the value itself one or two
-// steps in (`value_reads`).
+// **Where a walk of the value itself (not through it) holds the value, counted in addresses taken**:
+// the parameter and every copy of it are at 0, the address of a place holding a copy at −1, the
+// address of a local holding that address at −2 -- a pointer through which a callee reads the value
+// itself one or two steps in (`value_reads`). A local given several has them all (`ptrs`); so does a
+// branch, and a call answering what it read through such a pointer (`call_steps`). A walk through the
+// parameter counts nothing.
 private ptr_steps(t: &Track, e: TExpr) -> Buf[int]
     var out: Buf[int] = buf()
 
-    if t.steps > 0 || !t.through then gather_steps(t, e, &out, 0)
+    if !t.through then gather_steps(t, e, &out, 0)
 
     out
 end ptr_steps
@@ -2580,7 +2597,7 @@ end ptr_steps
 private value_reads(t: &Track, arg: TExpr) -> Buf[int]
     var out: Buf[int] = buf()
 
-    if t.through || t.steps != 0 || !asks_through(t.cx, texpr_type(arg)) || lends_vessel(t, arg) then return out
+    if t.through || !asks_through(t.cx, texpr_type(arg)) || lends_vessel(t, arg) then return out
 
     // A closure's environment is asked where the closure is made, capture by capture
     // (`captures_kept`): asked of the whole environment at a call, everything the body lets out of
@@ -2594,13 +2611,7 @@ private value_reads(t: &Track, arg: TExpr) -> Buf[int]
 end value_reads
 
 private gather_steps(t: &Track, e: TExpr, out: *Buf[int], depth: int)
-    // An expression nested past what is followed may be a pointer at any step on the way.
-    if depth > 64
-        for s in 0..<t.steps
-            push_step(out, s)
-
-        return
-    end if
+    if depth > 64 then return
 
     *e.kind match
         TLoad(n, _) ->
@@ -2614,7 +2625,7 @@ private gather_steps(t: &Track, e: TExpr, out: *Buf[int], depth: int)
             for s in inner
                 push_step(out, s - 1)
 
-            if carries(t, place) then push_step(out, t.steps - 1)
+            if carries(t, place) then push_step(out, -1)
         TDeref(x, _) -> steps_on(t, x, out, depth)
         TField(r, _, _) -> if path_ok(t, e) then gather_steps(t, r, out, depth + 1)
         TIndex(r, _, _) -> texpr_type(r) match
@@ -2657,27 +2668,26 @@ private element_steps(t: &Track, v: TExpr, out: *Buf[int], depth: int)
     for s in inner
         push_step(out, s - 1)
 
-    if carries(t, v) then push_step(out, t.steps - 1)
+    if carries(t, v) then push_step(out, -1)
 end element_steps
 
 // A view of an array is the array's address; a view of a view is the same pointer.
 private view_steps(t: &Track, base: TExpr, out: *Buf[int], depth: int)
     if is_array_type(texpr_type(base)) then element_steps(t, base, out, depth) else gather_steps(t, base, out, depth + 1)
 
-// One step further through a pointer read some steps in: still a pointer on the way short of `steps`.
+// One step further through an address held: an address of the value one fewer taken.
 private steps_on(t: &Track, x: TExpr, out: *Buf[int], depth: int)
     var inner: Buf[int] = buf()
 
     gather_steps(t, x, &inner, depth + 1)
 
     for s in inner
-        if s + 1 < t.steps then push_step(out, s + 1)
+        if s + 1 < 0 then push_step(out, s + 1)
 end steps_on
 
-// **What a call answers, read through a pointer on the way**: the pointer itself where the answer is
-// made of the argument, and a pointer `k` steps further in where the callee answers what it reads
-// `k` steps through it (`read_answers_of`) -- `get_s(w)` answering `w.s` hands back what the walk
-// reads one step through `w`.
+// **What a call answers, read through an address of the value**: the address itself where the answer
+// is made of the argument, and one `k` steps further in where the callee answers what it reads `k`
+// steps through it (`read_answers_of`) -- `get(pp)` answering `*pp` hands back what `&b` held.
 private call_steps(t: &Track, name: string, args: Buf[TExpr], ty: Type, out: *Buf[int], depth: int)
     for i in 0..<args.len()
         var inner: Buf[int] = buf()
@@ -2695,16 +2705,8 @@ private call_steps(t: &Track, name: string, args: Buf[TExpr], ty: Type, out: *Bu
 
             var k = 1
 
-            while s + k < t.steps
-                if read_answers_of(t.cx, name, i, k)
-                    // An answer read past the steps a summary tells apart may be any of them.
-                    if reads_past(t.cx, name, i, k)
-                        for m in s + k..<t.steps
-                            push_step(out, m)
-                    else
-                        push_step(out, s + k)
-                    end if
-                end if
+            while s + k < 0
+                if read_answers_of(t.cx, name, i, k) then push_step(out, s + k)
 
                 k += 1
             end while
@@ -2712,8 +2714,8 @@ private call_steps(t: &Track, name: string, args: Buf[TExpr], ty: Type, out: *Bu
     end for
 end call_steps
 
-// A call through an object or a function pointer may answer any pointer on the way it was handed, or
-// anything further in.
+// A call through an object or a function pointer may answer any address of the value it was handed,
+// or anything further in.
 private any_steps(t: &Track, args: Buf[TExpr], out: *Buf[int], depth: int)
     for a in args
         var inner: Buf[int] = buf()
@@ -2721,7 +2723,7 @@ private any_steps(t: &Track, args: Buf[TExpr], out: *Buf[int], depth: int)
         gather_steps(t, a, &inner, depth + 1)
 
         for s in inner
-            for m in s..<t.steps
+            for m in s..<0
                 push_step(out, m)
     end for
 end any_steps
@@ -2733,10 +2735,8 @@ private push_step(out: *Buf[int], s: int)
     out.push(s)
 end push_step
 
-// A step through `x` reads what is followed: anything for a walk of what is read through the
-// parameter; for a walk of what is read `steps` in, the last step, or one that reads a pointer on the
-// way.
-private steps_in(t: &Track, x: TExpr) -> bool = t.through && (t.steps == 0 || !ptr_steps(t, x).is_empty())
+// A step through `x` reads what is followed in a walk of what is read through the parameter.
+private steps_in(t: &Track, x: TExpr) -> bool = t.through
 
 // **Whether a read may be along the field the walk asks about** (`Track.path`): anything, where it asks
 // about every field; otherwise a read straight through the parameter -- `c.bus`, `c.inner.bus`,
@@ -2805,9 +2805,9 @@ private path_within(inner: string, outer: string) -> bool
 end path_within
 
 // The field a callee handed `arg` is asked about, for a walk asking about one: the same, where the
-// argument is the parameter itself and the callee is asked the walk's own steps; every field otherwise.
-private hand_path(t: &Track, arg: TExpr, left: int) -> string =
-    if t.path != "" && left == t.steps && param_load(t, arg) then t.path else ""
+// argument is the parameter itself; every field otherwise.
+private hand_path(t: &Track, arg: TExpr) -> string =
+    if t.path != "" && param_load(t, arg) then t.path else ""
 
 // A store: into this frame's own storage it binds the local (`track_locals`); anywhere else it is
 // held at the location the place names.
@@ -3051,7 +3051,7 @@ private element_steps(t: &Track, seq: TExpr) -> Buf[int]
     var out: Buf[int] = buf()
 
     for s in steps
-        if s + 1 < t.steps then push_step(&out, s + 1)
+        if s + 1 < 0 then push_step(&out, s + 1)
 
     out
 end element_steps
@@ -3085,9 +3085,8 @@ private bind(t: &Track, name: string, value: TExpr)
     bind_name(t, name)
 end bind
 
-// **A name bound to a pointer on the way is read through as that pointer is** -- at every step it may
-// have been read at, since a local given a pointer read one step in and then one read two steps in
-// holds either afterwards.
+// **A name bound to an address of the value is read through as that address is** -- at every count it
+// may hold, since a local given `&b` and then `&c` holds either afterwards.
 private bind_steps(t: &Track, name: string, steps: Buf[int])
     for s in steps
         if !has_step(t, name, s)
@@ -3102,13 +3101,6 @@ private has_step(t: &Track, name: string, s: int) -> bool
 
     false
 end has_step
-
-private bound_step(t: &Track, name: string) -> bool
-    for item in t.ptrs
-        if item.0 == name then return true
-
-    false
-end bound_step
 
 private bind_name(t: &Track, name: string)
     if t.holds(name) then return
@@ -3181,13 +3173,11 @@ private carries(t: &Track, e: TExpr) -> bool = *e.kind match
         (t.raw || may_hold_pointer(t.cx, ty)) && (carries(t, left) || carries(t, right))
 
     // What a call answers may be made of what it was handed. A callee with a body here says which of
-    // its arguments its answer is made of; one through an object or a pointer may be made of any. An
-    // answer that is a pointer on the way, read further in than what the walk follows, carries it too
-    // (`call_steps`). Only a raw walk follows an integer, and only through a body.
+    // its arguments its answer is made of; one through an object or a pointer may be made of any. Only
+    // a raw walk follows an integer, and only through a body.
     TCall(name, args, ty, _) ->
         (may_hold_pointer(t.cx, ty) || (t.raw && is_integer_type(ty) && t.cx.find(name).is_some())) &&
-            (call_carries(t, name, args, ty) || (t.steps > 0 && !ptr_steps(t, e).is_empty()) ||
-             (may_hold_pointer(t.cx, ty) && reads_vessel(t, args)))
+            (call_carries(t, name, args, ty) || (may_hold_pointer(t.cx, ty) && reads_vessel(t, args)))
     TVCall(recv, _, args, ty, _) ->
         may_hold_pointer(t.cx, ty) && (carries(t, recv) || any_carries(t, args))
     TCallPtr(callee, args, _, ty) ->
@@ -3236,7 +3226,7 @@ private carries(t: &Track, e: TExpr) -> bool = *e.kind match
 // Whether a step through `x` reads the value a walk of the value itself follows: `*c`, where `c` holds
 // the address of a copy of the parameter.
 private at_the_value(t: &Track, x: TExpr) -> bool
-    if t.through || t.steps != 0 then return false
+    if t.through then return false
 
     for s in ptr_steps(t, x)
         if s == -1 then return true
@@ -3272,7 +3262,7 @@ private holds_local(t: &Track, place: TExpr) -> bool = *place.kind match
     TIndex(_, _, _) -> value_walk(t) && part_held(t, place)
     _ -> false
 
-private value_walk(t: &Track) -> bool = !t.through && t.steps == 0
+private value_walk(t: &Track) -> bool = !t.through
 
 private part_held(t: &Track, place: TExpr) -> bool = local_root(t.refs, place) match
     Some(n) -> t.holds(n) && carries(t, place)
@@ -3290,7 +3280,7 @@ private call_carries(t: &Track, name: string, args: Buf[TExpr], ty: Type) -> boo
     for i in 0..<args.len()
         if !carries(t, args[i]) then continue
         if answers_arg(t.cx, name, args, i, ty, t.raw) then return true
-        if reads_on(t, args[i]) && answers_read(t, name, args, i) then return true
+        if reads_on(t, args[i]) && through_answers_of(t.cx, name, i) then return true
 
         // An answer read out as far in as the value sits is the value: `get(&b)` answering `*p`.
         for k in value_reads(t, args[i])
@@ -3329,15 +3319,6 @@ private lends_vessel(t: &Track, arg: TExpr) -> bool = *arg.kind match
 private is_ptr_type(ty: Type) -> bool = ty match
     Ptr(_) -> true
     _ -> false
-
-private answers_read(t: &Track, name: string, args: Buf[TExpr], i: usize) -> bool
-    if t.steps == 0 then return through_answers_of(t.cx, name, i)
-
-    for k in steps_left(t, args[i])
-        if read_answers_of(t.cx, name, i, k) then return true
-
-    false
-end answers_read
 
 private any_carries(t: &Track, es: Buf[TExpr]) -> bool
     for item in es
