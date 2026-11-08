@@ -5912,6 +5912,33 @@ print(m.with((j) -> j.thread.is_some()))
 a closure lets its capture 'started' outlive the call (it is stored in 'j.thread'), and 'started' holds the address of a local of 'run'
 ```
 
+**So does the address of a capture, and it is told at the closure.** Written straight into the body,
+`&local` is the address of the capture, which the closure holds by value in its own storage — gone
+with the frame that holds the closure, or with the frame of whatever runs it. The refusal points at
+the closure, never into the body of `with` or of any other function that only runs it:
+
+```sysl
+import sysl.threads.Mutex
+
+struct Th
+    p: *int
+
+struct Joint
+    thread: Option[Th]
+
+var m = Mutex.new(Joint(None))
+
+run()
+    var local = 3
+    m.with((j) -> j.thread = Some(Th(&local)))
+
+run()
+```
+
+```error
+a closure lets the address of its capture 'local' outlive the call (it is stored in 'j.thread'), and the closure holds 'local' by value, in its own storage
+```
+
 **What a call with no body answers is asked the same way.** An `extern`'s answer is fresh — storage
 the library made, which is made of none of its arguments — unless its declaration says
 [`@answers(p)`](/reference/ffi/#answers-a-c-function-whose-answer-points-into-an-argument), and then
