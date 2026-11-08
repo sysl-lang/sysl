@@ -1176,3 +1176,50 @@ esc_store_as_a_one_line_if_value() =
             val v = tail(true)
             print(smash(), v[0] + v[1])
         """, "92 5\n")
+
+// -- EscapeClaimTests: where a callee's stores land ----------------------------------------------------
+
+// The number of arrays promoted to the heap in a program, `None` without the library.
+private esc_promoted(text: string) -> int
+    esc_notes(text) match
+        None -> -1
+        Some(notes) -> int(notes.len())
+end esc_promoted
+
+private const esc_repoint_head: string = raw"""
+    extern zap(pp: **[]int)
+    extern zap_int(pp: *int)
+
+    wrap(pp: **[]int) = zap(pp)
+
+    """
+
+private esc_repoint(setup: string) -> string = esc_repoint_head + s"""
+    key(a: []int)
+        var tmp: []int = []
+        var p: *[]int = &tmp
+        $setup
+        *p = a
+
+    f()
+        var arr: [3]int = [4, 5, 6]
+        key(arr[..])
+
+    main()
+        f()
+    """
+
+@test("a pointer handed to C may be repointed anywhere, so a view stored through it is kept")
+esc_extern_repoints_pointer()
+    if xvr_no_library() then return
+
+    assert_eq(esc_promoted(esc_repoint("zap(&p)")), 1)
+end esc_extern_repoints_pointer
+
+@test("a pointer nobody repoints, or handed to C whose pointee holds no address, keeps its target")
+esc_extern_repoint_neighbours()
+    if xvr_no_library() then return
+
+    assert_eq(esc_promoted(esc_repoint("")), 0)
+    assert_eq(esc_promoted(esc_repoint("var n = 1\n    zap_int(&n)")), 0)
+end esc_extern_repoint_neighbours

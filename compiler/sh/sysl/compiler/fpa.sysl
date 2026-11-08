@@ -2168,6 +2168,18 @@ private call(fb: &FBody, e: TExpr, name: string, args: Buf[TExpr], argv: Buf[Buf
         Some(d) ->
             var out: Buf[FAtom] = buf()
 
+            // **C may point what a pointer argument points at anywhere**: where the pointee can itself
+            // hold an address (`zap(pp: ***int)`), the caller's place there may afterwards point at
+            // storage that outlives every frame, as `redirect(pp) = *pp = &slot` would.
+            for k in 0..<argv.len()
+                val pt = if k < args.len() then pointee_of(texpr_type(args[k])) else None
+
+                if pt.is_some() && fpa_holds(fb.fx, pt.unwrap())
+                    var memo: Map[u32, Buf[FAtom]] = map()
+
+                    store_at(fb, written_at(fb, argv[k], buf(), &memo), single(atom(fb, buf(), "g", buf())))
+                end if
+
             for k in 0..<argv.len()
                 if k < d.params.len() && holds_string(d.keeps, d.params[k].name) then keep(fb, argv[k])
                 if k < d.params.len() && holds_string(d.answers, d.params[k].name)
