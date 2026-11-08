@@ -1,7 +1,8 @@
 module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
-import sysl.fs.IoError
+import sysl.env.get
+import sysl.fs.{append_bytes, IoError}
 import sysl.process.{start, Child, Group, Output, Status}
 import sysl.signal.{send, KILL}
 import sysl.text.{from_utf8_unchecked, repeat, split, Search}
@@ -548,6 +549,9 @@ private test_landed(exe: string, t: TTest, ran: BoundedRun, took: long, limit: i
     val raw = ran.raw
     val state = ran.state
     val output = unmarked_output(raw)
+
+    record_fpa_compare(t, output)
+
     val setup_ran = t.hooks.setup.is_none() || raw.has_byte(setup_byte())
     val entered_down = t.hooks.teardown.is_some() && raw.has_byte(test_byte())
 
@@ -586,6 +590,23 @@ private test_landed(exe: string, t: TTest, ran: BoundedRun, took: long, limit: i
 
     Outcome(t, detail, output + trailing, took, skipped)
 end test_landed
+
+// **Under `SYSL_FPA_COMPARE_OUT=<file>` the field-path comparison of what a test compiled is kept.**
+// A test that passes shows none of its output, so the `FPA-DIFF` lines its own compilations said
+// (`SYSL_FPA_COMPARE=1`, `fpa.sysl`) would be lost; each is appended to the file as `<test>: <line>`,
+// so they can be counted per test.
+private record_fpa_compare(t: TTest, output: string)
+    val out = get("SYSL_FPA_COMPARE_OUT").unwrap_or("")
+
+    if out == "" || !output.contains("FPA-DIFF ") then return
+
+    var text = ""
+
+    for line in text_lines(output)
+        if line.starts_with("FPA-DIFF ") then text = text + t.func + ": " + line + "\n"
+
+    append_bytes(out, text.bytes).unwrap_or(())
+end record_fpa_compare
 
 // What one hook's own process did. `ending` is how a report says it did not come back, where it did
 // not: an exit status, or the limit it outlasted.
