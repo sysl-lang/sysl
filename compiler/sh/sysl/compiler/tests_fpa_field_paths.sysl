@@ -498,6 +498,55 @@ fpa_cleared_inline_differs()
 
     assert(said.contains("keeps-new-only:other cleared|0"), said)
 
+// A body held to a promise to borrow -- a function whose address is taken, a method a trait object
+// dispatches to -- is answered by the promise to its callers and refused where it breaks it. The
+// comparison holds this analysis to what the body itself keeps, so a body that breaks the promise is
+// no disagreement, and one that keeps it is none either. Cells: stored through another parameter,
+// stored in module storage, only read, each where the address is taken and where a trait dispatches.
+// Skipped: a closure body (its `&Fn` needs the library; the keeps files run under the comparison cover
+// it) and a `@scoped` member (answered by the scope, not by the promise, and not changed here).
+
+private val fpa_code: string = "type Code = *extern(*Cpu, *int) -> unit\n\n"
+
+@test("a function whose address is taken and stores what it is handed through another parameter: the analyses agree")
+fpa_promised_writes_agree()
+    val said = fpa_diffs(fpa_code + "halt(c: *Cpu, sp: *int)\n    c.bus = sp\n\nvar cpu = Cpu(&spare, &spare)\n\n" +
+                         "main()\n    val f: Code = &halt\n\n    f(&cpu, &spare)\n")
+
+    assert(!said.contains("halt|"), said)
+
+@test("a function whose address is taken and keeps what it is handed in module storage: the analyses agree")
+fpa_promised_global_agrees()
+    val said = fpa_diffs(fpa_code + "grab(c: *Cpu, sp: *int)\n    held = sp\n\nvar cpu = Cpu(&spare, &spare)\n\n" +
+                         "main()\n    val f: Code = &grab\n\n    f(&cpu, &spare)\n")
+
+    assert(!said.contains("grab|"), said)
+
+@test("a function whose address is taken and only reads what it is handed: the analyses agree")
+fpa_promised_reader_agrees()
+    val said = fpa_diffs(fpa_code + "peek(c: *Cpu, sp: *int)\n    spare = *sp + *c.bus\n\nvar cpu = Cpu(&spare, &spare)\n\n" +
+                         "main()\n    val f: Code = &peek\n\n    f(&cpu, &spare)\n")
+
+    assert_eq(said, "")
+
+@test("a method a trait object dispatches to that keeps what it is handed: the analyses agree on the method")
+fpa_promised_method_agrees()
+    val said = fpa_diffs("trait Taker\n    take(*self, p: *int)\n\nstruct K\n    k: int\n\n" +
+                         "impl Taker for K\n    take(*self, p: *int)\n        held = p\n\n" +
+                         "via(o: *Taker, p: *int)\n    o.take(p)\n\nvar k = K(1)\n\nmain()\n    via(&k, &spare)\n")
+
+    assert(!said.contains("take|"), said)
+    assert(!said.contains("via|"), said)
+
+@test("a generic calling a promised method directly keeps for this analysis and not for the keeps analysis, and the comparison says so")
+fpa_promised_caller_differs()
+    val said = fpa_diffs("trait Taker\n    take(*self, p: *int)\n\nstruct K\n    k: int\n\n" +
+                         "impl Taker for K\n    take(*self, p: *int)\n        held = p\n\n" +
+                         "relay[T: Taker](t: *T, p: *int) = t.take(p)\n\nvar k = K(1)\n\nmain()\n    relay(&k, &spare)\n")
+
+    assert(!said.contains("take|"), said)
+    assert(said.contains("keeps-new-only:other relay"), said)
+
 @test("where there is nothing to tell apart, the two analyses agree on keeping and answering")
 fpa_agrees()
     val said = fpa_diffs("store(p: *int)\n    held = p\n\nread(p: *int)\n    spare = *p\n\n" +
