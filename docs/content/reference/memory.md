@@ -5603,6 +5603,37 @@ print(closure())
 a closure lets its capture 'p' outlive the call (it is stored in 'kept'), and 'p' holds the address of a local of 'closure' — capture the value itself, or storage that lasts
 ```
 
+**A capture stored through a parameter of the closure outlives the frame too.** Nothing at the
+literal says where a parameter points — a lock's `with` hands the body the value a module lock
+guards — so a capture holding the frame's address that the body stores into what it is lent, a field
+of it however deep, or a buffer inside it, is refused the same way. A capture of a heap value or of a
+plain number is stored freely:
+
+```sysl
+import sysl.threads.Mutex
+
+struct Th
+    p: *int
+
+struct Joint
+    thread: Option[Th]
+
+var m = Mutex.new(Joint(None))
+
+run()
+    var local = 3
+    val started = Some(Th(&local))
+
+    m.with((j) -> j.thread = started)
+
+run()
+print(m.with((j) -> j.thread.is_some()))
+```
+
+```error
+a closure lets its capture 'started' outlive the call (it is stored in 'j.thread'), and 'started' holds the address of a local of 'run'
+```
+
 **What a call with no body answers is asked the same way.** An `extern`'s answer is fresh — storage
 the library made, which is made of none of its arguments — unless its declaration says
 [`@answers(p)`](/reference/ffi/#answers-a-c-function-whose-answer-points-into-an-argument), and then

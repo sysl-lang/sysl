@@ -312,6 +312,189 @@ kps_lasting_storage_accepted()
         print(*held)
         """, "4\n5\n")
 
+// -- a closure body storing its capture into what it is lent -----------------------------------------
+
+// A module lock guarding a value with room for an address at every depth: a field, a nested field,
+// a buffer, and a plain number.
+private kps_lock() -> string = raw"""
+    import sysl.threads.Mutex
+    import sysl.buf.{Buf, buf}
+
+    struct Th
+        p: *int
+
+    struct Inner
+        thread: Option[Th]
+
+    struct Joint
+        thread: Option[Th]
+        inner: Inner
+        list: Buf[Th]
+        n: int
+
+    var m = Mutex.new(Joint(None, Inner(None), buf(), 0))
+    static var spare = 0
+
+    """
+
+private kps_lets_out(capture: string) -> string =
+    s"a closure lets its capture '$capture' outlive the call"
+
+private kps_holds_run(capture: string) -> string =
+    s"'$capture' holds the address of a local of 'run'"
+
+@test("a lock's body storing a captured address into what it is lent is refused")
+kps_lock_body_stores_capture()
+    val text = kps_lock() + raw"""
+        run()
+            var local = 3
+            val started = Some(Th(&local))
+
+            m.with((j) -> j.thread = started)
+
+        run()
+        print(m.with((j) -> j.thread.is_some()))
+        """
+
+    kps_refused(text, kps_lets_out("started") + " (it is stored in 'j.thread'), and " + kps_holds_run("started"))
+
+@test("the same through try_with is refused")
+kps_lock_try_with_stores_capture()
+    kps_refused(kps_lock() + raw"""
+        run()
+            var local = 3
+            val started = Some(Th(&local))
+
+            m.try_with((j) -> j.thread = started)
+
+        run()
+        """, kps_lets_out("started") + " (it is stored in 'j.thread'), and " + kps_holds_run("started"))
+
+@test("the same through a with method of the program's own is refused")
+kps_own_with_stores_capture()
+    kps_refused(kps_lock() + raw"""
+        struct Own
+            v: Joint
+
+            with(*self, body: *Joint -> unit)
+                body(&self.v)
+
+        var own = Own(Joint(None, Inner(None), buf(), 0))
+
+        run()
+            var local = 3
+            val started = Some(Th(&local))
+
+            own.with((j) -> j.thread = started)
+
+        run()
+        print(own.v.thread.is_some())
+        """, kps_lets_out("started") + " (it is stored in 'j.thread'), and " + kps_holds_run("started"))
+
+@test("a captured address stored through a nested field of what the body is lent is refused")
+kps_lock_body_stores_capture_nested()
+    kps_refused(kps_lock() + raw"""
+        run()
+            var local = 3
+            val started = Some(Th(&local))
+
+            m.with((j) -> j.inner.thread = started)
+
+        run()
+        """, kps_lets_out("started") + " (it is stored in 'j.inner.thread'), and " + kps_holds_run("started"))
+
+@test("a captured address pushed into a buffer inside what the body is lent is refused")
+kps_lock_body_pushes_capture()
+    kps_refused(kps_lock() + raw"""
+        run()
+            var local = 3
+            val started = Th(&local)
+
+            m.with((j) -> j.list.push(started))
+
+        run()
+        """, kps_lets_out("started") + " (it is passed to 'push', which keeps it), and " + kps_holds_run("started"))
+
+// The literal cannot see where the parameter points, so a body storing into the caller's own local is
+// held to the same rule: the closure may be handed anywhere a body of its type is run.
+@test("a captured address stored through the parameter is refused even when the call lends a local")
+kps_body_stores_capture_into_a_lent_local()
+    kps_refused(kps_lock() + raw"""
+        apply(j: *Joint, body: *Joint -> unit)
+            body(j)
+
+        run()
+            var local = 3
+            var mine = Joint(None, Inner(None), buf(), 0)
+            val started = Some(Th(&local))
+
+            apply(&mine, (j) -> j.thread = started)
+
+        run()
+        """, kps_lets_out("started") + " (it is stored in 'j.thread'), and " + kps_holds_run("started"))
+
+@test("a function whose closure stores its parameter into a lock's value keeps that parameter")
+kps_lock_body_keeps_a_parameter()
+    kps_refused(kps_lock() + raw"""
+        keep_it(p: *int)
+            m.with((j) -> j.thread = Some(Th(p)))
+
+        run()
+            var local = 3
+
+            keep_it(&local)
+
+        run()
+        """, "'keep_it' keeps its parameter 'p' (it is captured by a closure, which lets it out (it is " +
+             "stored in 'j.thread')), and '&local' is the address of a local of 'run'")
+
+@test("a lock's body may store a captured heap value, a number, or module storage's address")
+kps_lock_body_stores_what_lasts()
+    kps_prints(kps_lock() + raw"""
+        struct Cell
+            v: int
+
+        struct Hp
+            c: &Cell
+
+        struct Slot
+            h: Option[Hp]
+
+        var mh = Mutex.new(Slot(None))
+
+        run()
+            var local = 3
+            val heap = Hp(Cell(7))
+
+            local += 1
+            mh.with((j) -> j.h = Some(heap))
+            m.with((j) -> j.n = local)
+            m.with((j) -> j.thread = Some(Th(&spare)))
+
+        run()
+        print(mh.with((j) -> j.h.unwrap().c.v))
+        print(m.with((j) -> j.n))
+        print(m.with((j) -> j.thread.is_some()))
+        """, "7\n4\ntrue\n")
+
+@test("a lock's body that only reads a captured address, or a named function, is accepted")
+kps_lock_body_reads_capture()
+    kps_prints(kps_lock() + raw"""
+        put(j: *Joint)
+            j.thread = Some(Th(&spare))
+
+        run()
+            var local = 3
+            val started = Some(Th(&local))
+
+            m.with((j) -> j.n = if started.is_some() then *started.unwrap().p else 0)
+            m.with(put)
+
+        run()
+        print(m.with((j) -> j.n))
+        print(m.with((j) -> j.thread.is_some()))
+        """, "3\ntrue\n")
+
 // -- recursion settles on what the body does ----------------------------------------------------------
 
 @test("a recursive function that keeps on one branch keeps, and one that never does is accepted")
