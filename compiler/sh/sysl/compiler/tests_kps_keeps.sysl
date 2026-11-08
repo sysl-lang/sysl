@@ -494,6 +494,75 @@ kps_lock_body_reads_capture()
         print(m.with((j) -> j.thread.is_some()))
         """, "3\ntrue\n")
 
+// A scope is a parameter the body is lent too, but `scope` joins every thread started on it before it
+// returns, so a thread borrowing the caller's local through the body's capture is sound -- whatever the
+// body answers. Storing the same capture where it outlives the scope is still refused.
+private kps_race() -> string = raw"""
+    import sysl.threads.*
+    import sysl.buf.{Buf, buf}
+
+    struct Race
+        n: int
+
+    struct Th
+        p: *Race
+
+    static var spare_race = Race(0)
+    var kept: Option[Th] = None
+    var m = Mutex.new(Th(&spare_race))
+
+    """
+
+@test("a scope's thread borrowing the caller's local through the body's capture is accepted, the body answering a value")
+kps_scope_thread_borrows_caller_local()
+    kps_prints(kps_race() + raw"""
+        go() -> int
+            var race = Race(0)
+            val p = &race
+
+            val seen = scope((s) ->
+                s.spawn(() -> p.n = 5)
+
+                var found: Buf[int] = buf()
+
+                found.push(7)
+                found)
+
+            race.n * 10 + seen[0]
+
+        print(go())
+        """, "57\n")
+
+@test("the same capture stored into module storage from the scope's body is refused")
+kps_scope_body_stores_capture_globally()
+    kps_refused(kps_race() + raw"""
+        go() -> int
+            var race = Race(0)
+            val p = &race
+
+            scope((s) ->
+                s.spawn(() -> p.n = 5)
+                kept = Some(Th(p))
+                7)
+
+        print(go())
+        """, "holds the address of a local of 'go'")
+
+@test("the same capture stored into a lock's value from the scope's body is refused")
+kps_scope_body_stores_capture_in_a_lock()
+    kps_refused(kps_race() + raw"""
+        go() -> int
+            var race = Race(0)
+            val p = &race
+
+            scope((s) ->
+                s.spawn(() -> p.n = 5)
+                m.with((j) -> j.p = p)
+                7)
+
+        print(go())
+        """, "holds the address of a local of 'go'")
+
 // -- recursion settles on what the body does ----------------------------------------------------------
 
 @test("a recursive function that keeps on one branch keeps, and one that never does is accepted")

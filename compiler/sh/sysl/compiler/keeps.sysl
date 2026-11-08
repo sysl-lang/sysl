@@ -2489,7 +2489,7 @@ private captures_kept(t: &Track, evs: &EvBuf, st: &StructType, args: Buf[TExpr])
         if !carries(t, arg) then continue
 
         for item in read_path_of(t.cx, body, 0, capture_steps(arg), s".${st.fields[c].0}").locs
-            val loc = outlasting_loc(item.loc)
+            val loc = outlasting_loc(item.loc, item.how)
 
             if loc.is_some()
                 evs.items.push(kept_ev(loc.unwrap(), s"it is captured by a closure, which lets it out (${item.how})", arg))
@@ -2519,10 +2519,13 @@ private capture_steps(arg: TExpr) -> int = *arg.kind match
 // there. **One through a parameter the body is lent outlasts the frame that wrote the closure**: the
 // body is run wherever it is handed -- `m.with((j) -> j.x = Some(&local))` stores the address into
 // the value a global lock guards -- and nothing at the literal says where that parameter points, so
-// a capture stored into it may outlive whatever it holds the address of.
-private outlasting_loc(loc: string) -> Option[string]
+// a capture stored into it may outlive whatever it holds the address of. **The one exception is a
+// scope the body is lent** (`how` is the scope's): `scope` joins every thread started on it before it
+// returns, so what it holds is let go before the frame that called `scope` is, and the scope rule
+// (`scope_held`) is what judges it.
+private outlasting_loc(loc: string, how: string) -> Option[string]
     if loc == "" then return Some("")
-    if param_of_loc(loc) >= 1 then return Some("")
+    if param_of_loc(loc) >= 1 && !how.ends_with(SCOPE_HOW) then return Some("")
     if loc.index_of("?").is_some() && !loc.starts_with("j?") then return Some("")
     if loc.starts_with("g:") || loc.starts_with("d:g:") then return Some(loc)
 
@@ -4028,7 +4031,7 @@ private captures_let_out(ft: &FrameTrack, evs: &EvBuf, st: &StructType, args: Bu
 
         for h in held
             for item in read_path_of(ft.cx, body, 0, h.0, s".$field").locs
-                val loc = outlasting_loc(item.loc)
+                val loc = outlasting_loc(item.loc, item.how)
 
                 if loc.is_none() then continue
 
