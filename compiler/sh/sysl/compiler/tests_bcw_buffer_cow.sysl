@@ -1,0 +1,554 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// `Buffer[T]` is a copy-on-write value (`library/sysl/buf/buf.sysl`): a copy shares the storage until
+// one side writes, and the writer copies first unless its share is the only one (`is_unique`). Each
+// cell here writes through one side and reads both, across what a copy can be -- an assignment, a
+// parameter, a capture, a struct field, an element of another buffer, a dereference -- and what a
+// write can be -- every mutating member, a subscript, a `*Buffer`, `view_mut()`, `into_view()`,
+// `freeze()`. The refusals that keep a write from landing on a copy nobody reads are pinned with
+// their wording.
+
+private bcw_ready() -> bool
+    std_root() match
+        Err(_) ->
+            print("skipped: the standard module's source is not on this machine")
+            false
+        Ok(_) -> true
+
+// What a program built from `text` does: what it printed, and whether it built, ran and exited zero.
+// A refused build answers the driver's whole report.
+private bcw_outcome(text: string) -> (string, bool)
+    val root = make_temp_dir("sysl-bcw").unwrap()
+
+    write_text(s"$root/main.sysl", "import sysl.buf.{Buffer, buffer}\n\n" + text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), false)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", false)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), out.status.ok())
+end bcw_outcome
+
+private bcw_ran(text: string) -> string
+    val out = bcw_outcome(text)
+
+    if !out.1 then return s"it did not run to the end: ${out.0}"
+
+    out.0
+end bcw_ran
+
+private bcw_err(text: string) -> string
+    val out = bcw_outcome(text)
+
+    if out.1 then return s"it was not refused, and printed: ${out.0}"
+
+    out.0
+end bcw_err
+
+// -- a copy, then a write on either side --------------------------------------------------------------
+
+@test("a write to a copy, or to the original after a copy, is seen on that side only")
+bcw_copy_then_write_either_side()
+    if !bcw_ready() then return
+
+    assert_eq(bcw_ran(raw"""
+        var a = buffer[int]()
+
+        a.extend([1, 2, 3])
+
+        var b = a
+
+        b.push(4)
+        print(a, b)
+
+        var c = a
+
+        a[0] = 9
+        print(a, c)
+
+        var d = a
+
+        a.insert(0, 7)
+        d.remove(0)
+        print(a, d)
+
+        var e = a
+
+        e.pop()
+        a.truncate(1)
+        print(a, e)
+
+        var f = a
+
+        f.clear()
+        print(a, f)
+        """), "[1, 2, 3] [1, 2, 3, 4]\n[9, 2, 3] [1, 2, 3]\n[7, 9, 2, 3] [2, 3]\n[7] [7, 9, 2]\n[7] []\n")
+
+// -- writing through a pointer ---------------------------------------------------------------------------
+
+@test("a function handed a '*Buffer' writes the caller's buffer, and a copy taken before keeps its own")
+bcw_write_through_pointer()
+    if !bcw_ready() then return
+
+    assert_eq(bcw_ran(raw"""
+        grow(b: *Buffer[int], v: int)
+            b.push(v)
+            b[0] = 0
+
+        var a = buffer[int]()
+
+        a.push(1)
+
+        val before = a
+
+        grow(&a, 2)
+        print(a, before)
+        """), "[0, 2] [1]\n")
+
+// -- the unique fast path ------------------------------------------------------------------------------
+
+// The address of the first slot says whether storage moved: a write into storage nobody else holds is
+// made where it is, and the first write after a copy moves the writer to storage of its own while the
+// copy keeps the old.
+@test("a buffer nobody else holds is written in place, and a shared one is copied once")
+bcw_unique_writes_in_place()
+    if !bcw_ready() then return
+
+    assert_eq(bcw_ran(raw"""
+        first(b: Buffer[int]) -> usize = usize(&b.elems[0])
+
+        var a = buffer[int]()
+
+        a.reserve(8)
+        a.push(1)
+
+        val at = first(a)
+
+        a.push(2)
+        a[0] = 5
+        print(first(a) == at)
+
+        val b = a
+
+        a[1] = 6
+        print(first(a) == at, first(b) == at)
+
+        val moved = first(a)
+
+        a.push(7)
+        print(first(a) == moved)
+        print(a, b)
+        """), "true\nfalse true\ntrue\n[5, 6, 7] [5, 2]\n")
+
+// -- the empty buffer ------------------------------------------------------------------------------------
+
+@test("the empty buffer owns nothing: copies of it compare equal, and a push into one gives it storage")
+bcw_empty_null_core()
+    if !bcw_ready() then return
+
+    assert_eq(bcw_ran(raw"""
+        var a: Buffer[int]
+        var b = a
+
+        print(a.len(), a.cap(), a == b, a == buffer[int]())
+
+        b.push(1)
+        print(a.len(), b, a == b)
+
+        var c = buffer[string]()
+        val d = c
+
+        c.push("x")
+        print(c, d.len(), d.is_empty())
+        """), "0 0 true true\n0 [1] false\n[x] 0 true\n")
+
+@test("a struct with a counted field has no zero value unless it says '@zero_is_empty'")
+bcw_zero_is_empty_attribute()
+    if !bcw_ready() then return
+
+    assert_eq(bcw_ran(raw"""
+        struct Thing
+            n: int
+
+        @zero_is_empty
+        struct Handle
+            r: &Thing
+
+        var h: Handle
+
+        print("declared")
+        """), "declared\n")
+
+    val plain = bcw_err(raw"""
+        struct Thing
+            n: int
+
+        struct Handle
+            r: &Thing
+
+        var h: Handle
+
+        print("declared")
+        """)
+
+    assert(plain.contains("Handle"), plain)
+
+    val misplaced = bcw_err(raw"""
+        @zero_is_empty
+        f() -> int = 1
+
+        print(f())
+        """)
+
+    assert(misplaced.contains("zero_is_empty"), misplaced)
+
+// -- a buffer inside a struct, a closure, another buffer ------------------------------------------------
+
+@test("a struct holding a buffer, copied by value, holds a copy")
+bcw_struct_field_copy()
+    if !bcw_ready() then return
+
+    assert_eq(bcw_ran(raw"""
+        struct Bag
+            items: Buffer[int]
+
+        var s = Bag(buffer())
+
+        s.items.push(1)
+
+        var t = s
+
+        t.items.push(2)
+        s.items[0] = 3
+        print(s.items, t.items)
+        """), "[3] [1, 2]\n")
+
+@test("a closure that outlives its scope holds a copy; one that does not reads the variable")
+bcw_closure_capture()
+    if !bcw_ready() then return
+
+    assert_eq(bcw_ran(raw"""
+        keep(b: Buffer[int]) -> &Fn() -> usize = () -> b.len()
+
+        var a = buffer[int]()
+
+        a.push(1)
+
+        val held = keep(a)
+        val here = () -> a.len()
+
+        a.push(2)
+        print(held(), here())
+        """), "1 2\n")
+
+@test("an element of a buffer of buffers is written where it lives, and a copy of the outer one keeps its own")
+bcw_nested_buffers()
+    if !bcw_ready() then return
+
+    assert_eq(bcw_ran(raw"""
+        var outer = buffer[Buffer[int]]()
+
+        outer.push(buffer())
+
+        val before = outer
+
+        outer[0].push(5)
+        outer[0][0] += 1
+        print(outer, before)
+        """), "[[6]] [[]]\n")
+
+@test("the buffer behind a reference, read out of it, is a copy")
+bcw_deref_copy()
+    if !bcw_ready() then return
+
+    assert_eq(bcw_ran(raw"""
+        val r: &Buffer[int] = buffer()
+        var v = *r
+
+        v.push(1)
+        r.push(2)
+        print(v, *r)
+        """), "[1] [2]\n")
+
+// -- by value into a function -------------------------------------------------------------------------
+
+@test("a buffer passed by value and pushed into by the callee leaves the caller's alone")
+bcw_param_by_value()
+    if !bcw_ready() then return
+
+    assert_eq(bcw_ran(raw"""
+        with_more(b: Buffer[int]) -> Buffer[int]
+            var mine = b
+
+            mine.push(9)
+            mine
+
+        var a = buffer[int]()
+
+        a.push(1)
+
+        val more = with_more(a)
+
+        print(a, more)
+        """), "[1] [1, 9]\n")
+
+// -- generic ---------------------------------------------------------------------------------------------
+
+@test("copy-on-write holds at every element type a generic function is instantiated at")
+bcw_generic()
+    if !bcw_ready() then return
+
+    assert_eq(bcw_ran(raw"""
+        appended[T](b: Buffer[T], x: T) -> Buffer[T]
+            var mine = b
+
+            mine.push(x)
+            mine
+
+        var ints = buffer[int]()
+
+        ints.push(1)
+
+        var words = buffer[string]()
+
+        words.push("a")
+        print(ints, appended(ints, 2), words, appended(words, "b"))
+        """), "[1] [1, 2] [a] [a, b]\n")
+
+// -- counted elements ---------------------------------------------------------------------------------
+
+// A copy of a buffer of counted elements takes a count of each element only when it is written: the
+// shared storage holds one, the copy made at the write holds one more, and every element is let go of
+// exactly once, when the last storage holding it goes.
+@test("elements with a destructor are dropped once each, however the buffer was copied and written")
+bcw_counted_elements_drop_once()
+    if !bcw_ready() then return
+
+    assert_eq(bcw_ran(raw"""
+        struct Thing
+            n: int
+
+        impl Drop for Thing
+            drop(self) = print("drop", self.n)
+
+        run()
+            var a = buffer[&Thing]()
+
+            a.push(Thing(1))
+            a.push(Thing(2))
+
+            var b = a
+
+            b.push(Thing(3))
+            b[0] = Thing(4)
+            print("a", a.len(), a[0].n, "b", b.len(), b[0].n)
+            a.clear()
+            print("cleared")
+
+        run()
+        print("done")
+        """), "a 2 1 b 3 4\ndrop 1\ncleared\ndrop 4\ndrop 2\ndrop 3\ndone\n")
+
+// -- views ----------------------------------------------------------------------------------------------
+
+@test("a view taken before a copy is written reads what it read")
+bcw_view_before_copy_and_write()
+    if !bcw_ready() then return
+
+    assert_eq(bcw_ran(raw"""
+        var a = buffer[int]()
+
+        a.extend([1, 2, 3])
+
+        val v = a.view()
+        var b = a
+
+        b[0] = 7
+        b.push(4)
+        print(v, a, b)
+        """), "[1, 2, 3] [1, 2, 3] [7, 2, 3, 4]\n")
+
+@test("view_mut makes the storage this buffer's own, so a write through it reaches no copy")
+bcw_view_mut_unshares()
+    if !bcw_ready() then return
+
+    assert_eq(bcw_ran(raw"""
+        var a = buffer[int]()
+
+        a.extend([1, 2])
+
+        val b = a
+
+        set_first(a.view_mut(), 5)
+        print(a, b)
+
+        set_first(xs: []int, v: int) = xs[0] = v
+        """), "[5, 2] [1, 2]\n")
+
+@test("into_view of a shared buffer hands over storage of its own")
+bcw_into_view_shared()
+    if !bcw_ready() then return
+
+    assert_eq(bcw_ran(raw"""
+        take(b: Buffer[int]) -> []int = b.into_view()
+
+        var a = buffer[int]()
+
+        a.extend([1, 2])
+
+        val v = take(a)
+
+        v[0] = 9
+        print(v, a)
+        """), "[9, 2] [1, 2]\n")
+
+// -- freeze -----------------------------------------------------------------------------------------------
+
+@test("freezing a buffer leaves a copy taken before it holding the elements, and writable")
+bcw_freeze_after_copy()
+    if !bcw_ready() then return
+
+    assert_eq(bcw_ran(raw"""
+        var a = buffer[int]()
+
+        a.extend([1, 2])
+
+        var b = a
+        val f = a.freeze()
+
+        b.push(3)
+        b[0] = 0
+        print(f[0], f.len(), b)
+        """), "1 2 [0, 2, 3]\n")
+
+// -- what is refused --------------------------------------------------------------------------------------
+
+@test("a 'val' buffer is not written: a push, a subscript store")
+bcw_val_refused()
+    if !bcw_ready() then return
+
+    val pushed = bcw_err("val a = buffer[int]()\n\na.push(1)\n")
+
+    assert(pushed.contains("'push' takes '*self', so it writes through what it is called on, and a " +
+                           "'val' is written once — write 'var' if it is meant to change"), pushed)
+
+    val stored = bcw_err("val a = buffer[int]()\n\na[0] = 1\n")
+
+    assert(stored.contains("a 'val' is written once"), stored)
+
+@test("a push into a buffer parameter taken by value is refused, naming '*Buffer'")
+bcw_param_push_refused()
+    if !bcw_ready() then return
+
+    val out = bcw_err("grow(b: Buffer[int]) = b.push(1)\n\nvar a = buffer[int]()\n\ngrow(a)\n")
+
+    assert(out.contains("this call to 'push' changes 'b', a copy of what the caller passed, and " +
+                        "nothing reads 'b' afterwards, so the change is lost — take 'b: *"), out)
+
+@test("a write through view() is refused, naming view_mut()")
+bcw_view_write_refused()
+    if !bcw_ready() then return
+
+    val out = bcw_err("var a = buffer[int]()\n\na.push(1)\n\nval v = a.view()\n\nv[0] = 3\n")
+
+    assert(out.contains("this element belongs to a '[]const int', which views elements it may not " +
+                        "write"), out)
+    assert(out.contains("take the view with 'view_mut()', which may write them"), out)
+
+@test("a subscript write while a 'ref' into the buffer is live is refused")
+bcw_ref_guard_refused()
+    if !bcw_ready() then return
+
+    val out = bcw_err("var a = buffer[int]()\n\na.extend([1, 2])\n\nref e = a[0]\n\na[1] = 5\n\nprint(e)\n")
+
+    assert(out.contains("'e' is a 'ref' standing on storage this call could release, since a " +
+                        "'*self' method may write its receiver"), out)
+
+// What `fzb_earlier_view` once wrote through: a writable view held across the freeze. `freeze` may
+// write what it is called on, so the view could be left reading storage the freeze let go of.
+@test("freezing a buffer while a view_mut() view of it is live is refused")
+bcw_freeze_under_view_mut_refused()
+    if !bcw_ready() then return
+
+    val out = bcw_err("var a = buffer[int]()\n\na.push(1)\n\nval w = a.view_mut()\nval f = a.freeze()\n\n" +
+                      "w[0] = 2\nprint(f[0])\n")
+
+    assert(out.contains("'w' is a view borrowed from 'a', and this call may write what it is called " +
+                        "on — so it could free what the view reads. Make the call before the view is " +
+                        "taken, or put the view in a block that closes first"), out)
+
+// -- the `is_unique` form ---------------------------------------------------------------------------------
+
+@test("is_unique answers whether a reference is the only share, and a name of the program's own wins")
+bcw_is_unique_form()
+    if !bcw_ready() then return
+
+    assert_eq(bcw_ran(raw"""
+        struct Thing
+            n: int
+
+        ask(r: &Thing) -> bool = is_unique(r)
+
+        val a: &Thing = Thing(1)
+
+        print(is_unique(a))
+
+        val b = a
+
+        print(is_unique(a), is_unique(b))
+        """), "true\nfalse false\n")
+
+    assert_eq(bcw_ran("is_unique(n: int) -> bool = n == 1\n\nprint(is_unique(1))\n"), "true\n")
+
+    val plain = bcw_err("val n = 3\n\nprint(is_unique(n))\n")
+
+    assert(plain.contains("'is_unique' asks whether a reference is the only share of what it names, " +
+                          "and int is not a reference"), plain)
+
+    val weak_one = bcw_err("struct Thing\n    n: int\n\nval a: &Thing = Thing(1)\nval w: weak Thing = a\n\n" +
+                           "print(is_unique(w))\n")
+
+    assert(weak_one.contains("'is_unique' asks about a counted reference, and a weak one holds no " +
+                             "share to be the only one of"), weak_one)
+
+// -- constant evaluation -------------------------------------------------------------------------------
+
+// A constant keeps no counts, so every write while evaluating one copies first: the table comes out
+// right, and a copy taken inside the evaluation is not written by the writes after it.
+@test("a module value built by pushing at compile time is the buffer the pushes made")
+bcw_const_eval()
+    if !bcw_ready() then return
+
+    assert_eq(bcw_ran(raw"""
+        const squares(n: int) -> (Buffer[int], Buffer[int])
+            var b = buffer[int]()
+
+            for i in 0..<n
+                b.push(i * i)
+
+            val half = b
+
+            b.push(-1)
+            (half, b)
+
+        val TABLE = squares(4)
+
+        print(TABLE.0, TABLE.1)
+        """), "[0, 1, 4, 9] [0, 1, 4, 9, -1]\n")

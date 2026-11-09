@@ -8,8 +8,8 @@ weight: 30
 
 `sysl.buf` holds two types and three functions, and the interesting thing about the larger of them is
 what it is *not*: **`Buf[T]` is not a type the compiler knows.** It is a `[]T` for the storage and
-a `usize` for how much of it is live, kept in one box that every name for the buffer shares, and a
-dozen members — ordinary sysl, in a file a program could have written.
+a `usize` for how much of it is live, kept in one box that copies of the buffer share until one of
+them writes, and a dozen members — ordinary sysl, in a file a program could have written.
 
 ```sysl
 import sysl.buf.{Buf, buf}
@@ -265,7 +265,7 @@ methods themselves — `insert`, `remove` — take a `usize`, as written. An ind
 count traps, as `b[i]` does — `index 3 out of bounds for length 1`.
 
 **A member that can move the storage is `@relocates`** — `push`, `extend`, `insert`, `pop`,
-`truncate`, `clear`, `remove`, `reserve`, `set_len` and `release` — and is refused on a buffer a live
+`truncate`, `clear`, `remove`, `reserve` and `set_len` — and is refused on a buffer a live
 `ref` has an element of, since growing reallocates and shrinking gives the element up. A `*T` made by
 `&b[i]` is held to the same rule for as long as it is still to be used:
 
@@ -304,26 +304,28 @@ print(*p)
 ```
 
 The check is local, as every `ref` check is ([memory](/reference/memory/#the-one-rule-what-may-move-underneath-it)):
-a second name for the same buffer, or a function handed it, can still push while the `ref` or the
-pointer is live.
+a function handed a `*Buf` of the same buffer can still push while the `ref` or the pointer is live.
 
-**`index_place` takes `self`**: a `Buf` is a handle, so a copy of one writes the buffer the
-original names, and `b[i] = x` works on a `val` as `b(i) = x` does on a Scala `val ArrayBuffer`:
+**A read of `b[i]` goes through `index_place`, which takes `self`, and a write through
+`index_place_mut`, which takes `*self`**: a write makes the storage this buffer's own first, so it
+never reaches a copy, and a `val` buffer is read but not written:
 
 ```sysl
 import sysl.buf.{Buf, buf}
 
-val b: Buf[int] = buf()
-val c = b
+var b: Buf[int] = buf()
 
 b.push(1)
+
+val c = b
+
 b[0] = 5
 
-print(c[0])
+print(b[0], c[0])
 ```
 
 ```output
-5
+5 1
 ```
 
 Two other shapes a first program tries. `len` is a **method**, unlike `StrBuilder`'s property:
@@ -531,11 +533,69 @@ true false true
 ```
 
 That is not a rule about buffers — it is true of every `&T` whose referent is `Eq`. A `&Buf` is
-seldom worth writing now, a `Buf` being shared without one (below), but it still means what it says.
+what a program writes to share one buffer on purpose, a `Buf` itself being a value (below).
 
-## How a push is seen follows from how the `Buf` is held
+## A `Buf` is a value
 
-It does not, any more — **a `Buf` is a reference, so every way of holding one holds the same buffer:**
+**A `Buf` is a value, as an array is: every way of handing one on hands on a copy.** Assigning it,
+passing it by value, capturing it in a closure that outlives it, keeping it in a struct or reading
+it back out of another container all give the receiver a buffer of its own, and a push through one
+is never seen through the other:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+var a: Buf[int] = buf()
+
+a.push(1)
+
+var b = a
+
+b.push(2)
+a[0] = 9
+
+print(a, b)
+```
+
+```output
+[9] [1, 2]
+```
+
+**A copy costs nothing until one side writes.** What a `Buf` holds is a counted reference to its
+storage and count, and a copy shares it; a member that writes asks first whether this buffer's share
+is the only one, writes in place where it is, and otherwise copies the elements into storage of its
+own — once, at the first write after the copy (*copy-on-write*, the model of Swift's `Array`). So a
+loop of pushes into a buffer nobody else holds is a store, and handing a buffer to a function that
+only reads it copies nothing at all.
+
+**Every member that changes a buffer takes `*self`**, so it is called on a `var`, on a field or an
+element reached through one, or through a `*Buf`. A function that grows its caller's buffer says so
+by taking a `*Buf`; one that takes a `Buf` gets its own copy, and a push into the parameter itself is
+refused, since the change would be lost:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+fill(b: *Buf[int]) = b.push(9)
+
+var a: Buf[int] = buf()
+
+fill(&a)
+
+var outer: Buf[Buf[int]] = buf()
+
+outer.push(a)
+outer[0].push(10)
+
+print(a, outer)
+```
+
+```output
+[9] [[9, 10]]
+```
+
+`outer[0].push(10)` writes the element where it lives in `outer`; `a`, copied in before, is
+unchanged. A buffer shared on purpose is held by reference, as any `&T` is:
 
 ```sysl
 import sysl.buf.{Buf, buf}
@@ -550,86 +610,38 @@ print(q.len(), c.len())
 ```
 
 ```output
-1 1
+1 0
 ```
 
-`q` is a second name for the box, and `c` — the struct `*p` reads out of it — is a second name for
-the buffer, because what a `Buf` holds is a counted reference to its storage and count rather than
-the two themselves. The same is true without a `&` anywhere: assigning a `Buf`, passing it by value,
-capturing it in a closure, keeping it in a struct or reading it back out of another container hands
-on the buffer, never a copy of it.
+`q` is a second name for the box, and `c` — the buffer `*p` reads out of it — is a copy.
 
-```sysl
-import sysl.buf.{Buf, buf}
-
-var outer: Buf[Buf[int]] = buf()
-
-outer.push(buf())
-outer[0].push(1)
-
-print(outer[0].len())
-```
-
-```output
-1
-```
-
-That is what a growable collection is in most languages a program has met — Scala's `ArrayBuffer`,
-Java's `ArrayList`, a Python list — and it is what a program reaching for one expects: a function that
-fills the buffer it was handed fills the caller's.
-
-**So every member that changes a buffer takes it by value**, a copy of the handle being the same
-buffer, and **a `val` buffer is pushed into like any other.** What `val` promises is about the name: it
-always refers to the same buffer, which is exactly what a parameter or a field holding one wants to
-say. A program that wants a *second* buffer asks for one with `copy()`:
-
-```sysl
-import sysl.buf.{Buf, buf}
-
-fill(b: Buf[int]) = b.push(9)
-
-val a: Buf[int] = buf()
-
-fill(a)
-
-val b = a.copy()
-
-b.push(10)
-
-print(a.len(), b.len())
-```
-
-```output
-1 2
-```
-
-**A `Buf` has no zero value, because a buffer is a box and a box is made by somebody.** A declaration
-has to say which buffer it starts as:
+**`var b: Buf[int]` with nothing after it is an empty buffer**, as is `buf()`: the empty buffer owns
+nothing and allocates nothing, and the first write gives it storage.
 
 ```sysl
 import sysl.buf.Buf
 
 var b: Buf[int]
+
+print(b.len(), b.cap())
+
+b.push(3)
+
+print(b)
 ```
 
-```error
-Buf[int] has no zero value, so 'b' needs an initial value
+```output
+0 0
+[3]
 ```
 
-### In storage the program zeroed itself, a `Buf` is empty until it is assigned
+### In storage the program zeroed itself, a `Buf` is empty
 
-The refusal is about a *declaration*. A program can still lay a `Buf` in memory the language did not
-initialise — a `calloc`ed block, a garbage collector's arena, a struct of an interpreter's objects
-reached through a `*T` — and there the handle names no buffer at all. **That handle is an empty
-buffer**: `len()` is 0, `view()` is empty, `for` visits nothing, `b[i]` reports the index past the end,
-and assigning into it gives back nothing, so `p.items = buf()` is how it gets storage. What it cannot
-do is grow where it stands: `push`, `extend` and `insert` take the handle by value and have nowhere to
-put a buffer they made, so they panic, naming the fix, rather than adding to nothing.
-
-**`release()` is the way back to that state without allocating**, and it is what a finalizer for
-such storage calls: it gives back this name's share — the elements go when the last name does — and
-leaves the handle naming nothing. Assigning `buf()` there instead would give the old buffer back too,
-but make a fresh one that is lost the moment the storage is freed.
+The empty buffer is the all-zero one, so a `Buf` laid in memory the language did not initialise — a
+`calloc`ed block, a garbage collector's arena, a struct of an interpreter's objects reached through a
+`*T` — **is an empty buffer**: `len()` is 0, `view()` is empty, `for` visits nothing, `b[i]` reports
+the index past the end, and the first push gives it storage. Assigning `buf()` gives back what it held
+and allocates nothing, which is what a finalizer for such storage does:
 
 ```sysl
 import sysl.buf.{Buf, buf}
@@ -645,11 +657,10 @@ val o: *Obj = ptr_cast(c_calloc(1, sizeof(Obj)))
 
 print(o.items.len(), o.items.view())
 
-o.items = buf()
 o.items.push(7)
 print(o.items.count, o.items)
 
-o.items.release()
+o.items = buf()
 print(o.items.len())
 
 c_free(ptr_cast(o))
@@ -661,9 +672,9 @@ c_free(ptr_cast(o))
 0
 ```
 
-`Map`, `Deque`, `Set` and `Heap` behave the same way and each has its own `release()`
-([containers](/library/container/)). A plain `&T` field in such storage is emptied the same way by
-the built-in `release(o.field)`
+`Map`, `Deque`, `Set` and `Heap` each have a `release()` for the same purpose
+([containers](/library/container/)). A plain `&T` field in such storage is emptied by the built-in
+`release(o.field)`
 ([memory](/reference/memory/#storage-the-compiler-did-not-lay-out-may-not-hold-a-counted-value)).
 
 ## Capacity, and what it costs
@@ -717,7 +728,7 @@ a RAM disk or a frame buffer starts as, and what `vec![0; n]` is in Rust:
 ```sysl
 import sysl.buf.{Buf, buf_filled}
 
-val disk: Buf[u8] = buf_filled(4096, 0)
+var disk: Buf[u8] = buf_filled(4096, 0)
 
 print(disk.len(), disk[0], disk[4095])
 
@@ -741,7 +752,7 @@ import sysl.buf.{Buf, buf_filled}
 struct Cell
     n: int
 
-val cells: Buf[&Cell] = buf_filled(3, Cell(0))
+var cells: Buf[&Cell] = buf_filled(3, Cell(0))
 
 cells[0].n = 7
 
@@ -839,14 +850,15 @@ print(b.len())
 ```
 
 ```error
-this reaches 'sysl.buf.buf.int', which makes heap storage, and this module declared '@no_alloc'
+this reaches 'sysl.buf.Buf.push.int', which makes heap storage through 'sysl.buf.Buf.own.int', and this module declared '@no_alloc'
 ```
 
-**The refusal names `buf()`, and that is the box.** A `Buf` is a reference, so making one makes the
-counted box every name for it will share — an allocation before a single element is pushed. [`alloc` is
-checked on what a module *calls*](/reference/modules/), at the smallest expression that still reaches
-an allocator, so it falls on the first thing that really makes storage: here the constructor, and in
-a module that was handed its buffer, the `grow` that `push` and `extend` share, kept out of line so a
+**The refusal names `push`, not `buf()`.** The empty buffer owns nothing, so making one allocates
+nothing; the first write is what gives a buffer storage of its own — `own`, which also copies a
+buffer whose storage a copy still shares. [`alloc` is checked on what a module
+*calls*](/reference/modules/), at the smallest expression that still reaches an allocator, so it
+falls on the first thing that really makes storage: here the push, and in a module that was handed
+its buffer, the same `own`, or the `grow` that `push` and `extend` share, both kept out of line so a
 hot `push` stays a compare, a store and a bump.
 
 There is still no allocator-free `Buf` and there cannot be one: growing is the whole of what it does.

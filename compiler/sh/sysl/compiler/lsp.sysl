@@ -558,10 +558,14 @@ private lsp_changed(server: *LspServer, uri: string, emit: string -> unit, super
     var first: Buf[LspFound] = buf()
     var sent: Buf[string] = buf()
 
+    // The closure writes both through pointers it holds, so calling it changes nothing of its own.
+    val into_first = &first
+    val into_sent = &sent
     val tell_first = (found: Buf[LspFound], root: string) ->
-        for f in found do first.push(f)
+        for f in found do into_first.push(f)
 
-        lsp_published(server, uri, file, lsp_with_held(*server, root, found), true, root, emit, buf(), sent)
+        lsp_published(server, uri, file, lsp_with_held(*server, root, found), true, root, emit, buf(),
+                      into_sent)
 
     val done = lsp_analyze_in_tiers(file, text, tell_first, superseded)
 
@@ -572,7 +576,9 @@ private lsp_changed(server: *LspServer, uri: string, emit: string -> unit, super
 
     if done.whole then lsp_hold_second_tier(server, done.root, done.found, first)
 
-    lsp_published(server, uri, file, done.found, done.whole, done.root, emit, sent, buf())
+    var resent: Buf[string] = buf()
+
+    lsp_published(server, uri, file, done.found, done.whole, done.root, emit, sent, &resent)
     true
 end lsp_changed
 
@@ -580,7 +586,7 @@ end lsp_changed
 // message among `told` -- sent already, by this check's first tier -- is not sent again; every message
 // this publication makes is pushed onto `sent`.
 private lsp_published(server: *LspServer, uri: string, file: string, found: Buf[LspFound], whole: bool,
-                      root: string, emit: string -> unit, told: Buf[string], sent: Buf[string])
+                      root: string, emit: string -> unit, told: Buf[string], sent: *Buf[string])
     var now: Buf[LspPublished] = buf()
 
     val send = (m: string) ->

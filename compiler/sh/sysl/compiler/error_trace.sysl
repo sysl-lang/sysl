@@ -129,8 +129,10 @@ trace_function(e: *Emit, f: TFunc)
 
     var found: Buf[string] = buf()
 
-    tail_origins(f.body, found)
-    walk_block_stmts(f.body, stmt_walk(false, s -> returned_origins(s, found)))
+    val into = &found
+
+    tail_origins(f.body, into)
+    walk_block_stmts(f.body, stmt_walk(false, s -> returned_origins(s, into)))
 
     for key in found
         e.trace_origins.add(key)
@@ -166,7 +168,11 @@ trace_closure_owners(e: *Emit, p: TProgram)
         if f.src.is_none() then continue
 
         by_file.get(f.src.unwrap().name) match
-            Some(bodies) -> bodies.push(f)
+            Some(bodies) ->
+                var more = bodies
+
+                more.push(f)
+                by_file.put(f.src.unwrap().name, more)
             None -> ()
 
     for f in p.funcs
@@ -185,17 +191,17 @@ trace_closure_owners(e: *Emit, p: TProgram)
         if best.is_some() then e.trace_owners.put(f.name, best.unwrap().name)
 end trace_closure_owners
 
-private returned_origins(s: TStmt, found: Buf[string]) = s match
+private returned_origins(s: TStmt, found: *Buf[string]) = s match
     TReturn(value) -> if value.is_some() then tail_expr_origins(value.unwrap(), found)
     _ -> ()
 
-private tail_origins(b: TBlock, found: Buf[string])
+private tail_origins(b: TBlock, found: *Buf[string])
     if b.result.is_some() then tail_expr_origins(b.result.unwrap(), found)
 end tail_origins
 
 // The `Err(...)` constructors `x` can be, as a function's result: `x` itself, or the value of an arm
 // of an `if` or a `match` it is, or the value of a block it is -- as deep as they nest.
-private tail_expr_origins(x: TExpr, found: Buf[string]) = *x.kind match
+private tail_expr_origins(x: TExpr, found: *Buf[string]) = *x.kind match
     TEnumNew(en, variant, _) -> if variant.name == "Err" && is_result_type(en) then found.push(site_key(x.span))
     TIf(_, then_block, else_block, _) ->
         tail_origins(then_block, found)

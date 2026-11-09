@@ -52,7 +52,7 @@ elide_arc_pairs(blocks: Buf[IrBlock], inert: Set[string]) -> Buf[IrBlock]
     val edges = join_edges(out)
 
     for j in 1..<out.len()
-        hoist_join_releases(out, j, clean, edges)
+        hoist_join_releases(&out, j, clean, edges)
 
     // What is left is a count a covering slot may make needless however far away it is given back
     // (`arc_cover.sysl`). A view of a view is given back inside its parent's window, so the parent's
@@ -277,7 +277,7 @@ private elide_in_block(instrs: Buf[Inst], clean: Set[string]) -> Buf[Inst]
                                 if is_release(name)
                                     val via = loaded_from.get(v_render(v)).unwrap_or("")
 
-                                    close_window(open, dropped, i, name, key_of(canon, v), via)
+                                    close_window(&open, dropped, i, name, key_of(canon, v), via)
                                 else open.clear()
                     None -> open.clear()
             InAsm(_, _, _, _, _) -> open.clear()
@@ -308,7 +308,7 @@ end elide_in_block
 // value's own slot leaves no such floor -- the release inside the window may be of the very value it
 // was copied out of -- and neither does a window that wrote outside the frame, which the destructor
 // of the release inside it could reach.
-private close_window(open: Buf[Open], dropped: Set[usize], i: usize, name: string, key: string, via: string)
+private close_window(open: *Buf[Open], dropped: Set[usize], i: usize, name: string, key: string, via: string)
     var j = open.len()
 
     while j > 0
@@ -347,7 +347,11 @@ private join_edges(bs: Buf[IrBlock]) -> JoinEdges
                 if l == bs[k].label then shut.add(l)
 
                 preds.get(l) match
-                    Some(ks) -> ks.push(k)
+                    Some(ks) ->
+                        var more = ks
+
+                        more.push(k)
+                        preds.put(l, more)
                     None ->
                         var ks: Buf[usize] = buf()
 
@@ -369,7 +373,7 @@ end join_edges
 // Copies the releases block `j` opens with to the end of each of its predecessors, where that lets a
 // predecessor cancel one (see `elide_arc_pairs`). The releases moved are those of a value loaded from
 // a clean slot, reached through nothing but clean-slot loads, field reads and other such releases.
-private hoist_join_releases(bs: Buf[IrBlock], j: usize, clean: Set[string], edges: JoinEdges)
+private hoist_join_releases(bs: *Buf[IrBlock], j: usize, clean: Set[string], edges: JoinEdges)
     val join = bs[j]
 
     if edges.shut.has(join.label) then return

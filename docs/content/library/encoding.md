@@ -234,7 +234,7 @@ handle, and the caller's buffer grows through the copy.
 import sysl.buf.buf
 import sysl.encoding.{push_u16_be, push_u32_le, push_u64_be}
 
-val out = buf[u8]()
+var out = buf[u8]()
 
 out.push(0xaa)
 push_u16_be(out, 0x1122)

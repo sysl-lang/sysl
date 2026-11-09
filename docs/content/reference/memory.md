@@ -119,6 +119,30 @@ Two live mutable aliases is what Rust exists to prevent, and permitting them is 
 trade. Reference counting pays for it at run time — a retain here, a release there — and buys a
 language with no lifetimes, no borrow checker, and nothing to prove to a checker as you write.
 
+A `Buf` held by value is a value in the same way, though its storage is on the heap: a copy shares
+the storage until one side writes, and the write copies it first (copy-on-write), so neither side
+ever sees the other's writes:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+struct Bag
+    items: Buf[int]
+
+var s = Bag(buf())
+
+s.items.push(1)
+
+var t = s
+
+t.items.push(2)
+print(s.items, t.items)
+```
+
+```output
+[1] [1, 2]
+```
+
 ### References compare through their referent
 
 **A reference respects its referent's `Eq` and `Hash`.** `==` and `!=` on two `&T`s (or two
@@ -1677,7 +1701,7 @@ run() -> int
     var p = &n
 
     if true
-        val b: Buf[int] = buf()
+        var b: Buf[int] = buf()
 
         b.push(41)
         p = &b[0]
@@ -1883,7 +1907,7 @@ the end of the statement while the name would live on:
 import sysl.buf.{Buf, buf}
 
 fresh() -> Buf[int]
-    val b: Buf[int] = buf()
+    var b: Buf[int] = buf()
 
     b.push(5)
     b
@@ -2042,7 +2066,7 @@ is its **last use** on any path the body can take, a later turn of a loop and a 
 import sysl.buf.{Buf, buf}
 
 run() -> int
-    val b: Buf[int] = buf()
+    var b: Buf[int] = buf()
 
     b.push(41)
 
@@ -2065,7 +2089,7 @@ Once the last use is behind it, the storage may move freely:
 import sysl.buf.{Buf, buf}
 
 run() -> int
-    val b: Buf[int] = buf()
+    var b: Buf[int] = buf()
 
     b.push(41)
 
@@ -2096,16 +2120,16 @@ nor used after it:
 ```sysl
 import sysl.buf.{Buf, buf}
 
-grow_and_read(p: *int, b: Buf[int]) -> int
+grow_and_read(p: *int, b: *Buf[int]) -> int
     for i in 0..<100 do b.push(i)
 
     *p
 
 run() -> int
-    val b: Buf[int] = buf()
+    var b: Buf[int] = buf()
 
     b.push(41)
-    grow_and_read(&b[0], b)
+    grow_and_read(&b[0], &b)
 
 print(run())
 ```
@@ -2115,18 +2139,18 @@ this pointer is a pointer into storage this call also hands 'grow_and_read', whi
 ```
 
 **The check is otherwise local, for a pointer as for a ref's path**: it sees the `&`, the path
-written after it, and the calls and assignments on that path in the same body. A second name for
-the buffer (`val b2 = b`, then `b2.push(…)`, or a binding out of a place matched on), a callee
-reached through a trait object or a function pointer, and an aggregate handed to a call are not
-followed. A view of the buffer is not a pointer into it: the view keeps the storage it was made
+written after it, and the calls and assignments on that path in the same body. A copy of the
+buffer (`var b2 = b`, then `b2.push(…)`) needs no following: a buffer is a value, so the push copies
+the storage first and leaves `b`'s where it was. A callee reached through a trait object or a
+function pointer, and an aggregate handed to a call, are not followed. A view of the buffer is not a pointer into it: the view keeps the storage it was made
 from, so a `*T` into `b.view()` outlives a push. A ref's place may also be rooted at a pointer, and
 whether *that* points anywhere is the raw tier's ordinary bargain.
 
 **Writing a value that holds an owning step by value writes the step too.** With `h` a local `H`,
 `h = H(…)` replaces `h.node` as surely as `h.node = …` does, so it is refused on the same terms.
 
-**A second name for the same object is held to the rule as well.** A `&T` or a `Buf` may be held
-under many names, and whether two of them name one object is a run-time fact, so the question is
+**A second name for the same object is held to the rule as well.** A `&T` may be held under many
+names, and whether two of them name one object is a run-time fact, so the question is
 asked of **types**: while a ref stands inside storage that a value of type `T` holds, writing storage
 held in any `T` other than along the ref's own path is refused. Here `n` is a second name for
 `h.node`:
@@ -3429,7 +3453,7 @@ release(h.names)
 ```
 
 ```error
-'release' gives back what a '&T' place holds, and Buf[string] gives its share back through its own member — call '.release()' on it
+'release' gives back what a '&T' place holds, and Buf[string] is a value whose empty one owns nothing — assign it an empty one, which gives back what it held and allocates nothing
 ```
 
 Like `is_null`, it is a form the compiler answers only where nothing else claims the name: a function

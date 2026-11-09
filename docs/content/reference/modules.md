@@ -544,7 +544,7 @@ an enum variant without saying which it expected to be.
 ```sysl
 import sysl.buf.{Buf, buf}
 
-val b: Buf[Option[u8]] = buf()
+var b: Buf[Option[u8]] = buf()
 val n: int = b
 ```
 

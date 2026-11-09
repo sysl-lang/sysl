@@ -513,7 +513,7 @@ lower_closure(cx: &Analyzer, span: Span, names: Buf[string], ptypes: Buf[Type],
     if !lends && !captured.is_empty() then cx.an.closure_refs.put(base, refs)
     if refuse_pinned_captures(cx, span, captured, refs, base) then return bad_expr(span)
 
-    val st = StructType(base, buf(), fields, false, None, None, false, None, buf(), false, buf())
+    val st = StructType(base, buf(), fields, false, None, None, false, None, buf(), false, buf(), false)
 
     cx.an.tables.struct_insts.put(base, Struct(st))
 
@@ -779,7 +779,7 @@ end scan_copy_writes
 // One node of the body: a mention of a capture, a write, or neither.
 private note_copy_use(a: &Analysis, scan: &CopyScan, e: TExpr)
     *e.kind match
-        TField(recv, slot, _) -> if env_root(recv) then bump_at(scan.uses, scan.slots, slot)
+        TField(recv, slot, _) -> if env_root(recv) then bump_at(&scan.uses, scan.slots, slot)
         TStore(place, _, _, _) -> note_copy_write(scan, place, "assignment", e.span)
         TUpdate(place, op, _, _, _, _, _) -> note_copy_write(scan, place, s"'$op'", e.span)
         TIncDec(place, op, _, _, _) -> note_copy_write(scan, place, s"'$op'", e.span)
@@ -790,7 +790,7 @@ private note_copy_use(a: &Analysis, scan: &CopyScan, e: TExpr)
             if place.is_some() && note_copy_write(scan, place.unwrap(), self_call_form(a, name), e.span)
                 // The answer is what the method read of the copy, so the copy is read back.
                 if answers_a_value(ty) then
-                    bump_at(scan.uses, scan.slots, copy_root(place.unwrap()).unwrap())
+                    bump_at(&scan.uses, scan.slots, copy_root(place.unwrap()).unwrap())
             end if
         TStructNew(st, args) -> if is_closure_literal(Struct(st)) then note_inner_writes(a, scan, st, args)
         _ -> ()
@@ -911,7 +911,7 @@ self_call_form(a: &Analysis, name: string) -> string
     if is_setter_name(word) then "assignment" else s"'$word', which takes '*self',"
 end self_call_form
 
-private bump_at(counts: Buf[int], slots: Buf[int], slot: int)
+private bump_at(counts: *Buf[int], slots: Buf[int], slot: int)
     for i in 0..<slots.len()
         if slots[i] == slot then counts[i] = counts[i] + 1
 
@@ -1853,7 +1853,7 @@ with_struct_call_bounds(d: StructDecl) -> StructDecl
     StructDecl(d.name, d.tparams, d.fields, lowered_members(d.members), d.bounds, d.invariants,
                d.vis, d.tdefaults, d.opaque, d.tvalues, d.packed, d.alignment, d.cname, d.deriving,
                d.byte_order, d.guards, d.pinned, d.union_layout, d.anon, d.bits, d.annotation,
-               d.annots)
+               d.annots, d.zero_is_empty)
 
 with_enum_call_bounds(d: EnumDecl) -> EnumDecl
     EnumDecl(d.name, d.tparams, d.underlying, d.variants, lowered_members(d.members), d.bounds,

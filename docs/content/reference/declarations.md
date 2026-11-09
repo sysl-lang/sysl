@@ -941,9 +941,30 @@ print(next(Counter(1)))
 ```
 
 A `*self` method called on the copy (`c.reset()`) is a write in the same sense, and so is a whole
-assignment (`c = Counter(0)`). A write through what the copy refers to — a `*T` or `&T` field, a
-slice's element, a `Buf` — reaches storage the caller shares, and is never lost. A parameter that is
-itself a `*T`, `&T` or `&sync T` is not a copy. Where the parameter may be reached under another name —
+assignment (`c = Counter(0)`), and so is a push into a `Buf` parameter, which is a value: a function
+that grows its caller's buffer takes a `*Buf`. A write through what the copy refers to — a `*T` or
+`&T` field, a slice's element — reaches storage the caller shares, and is never lost.
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+with_nine(b: Buf[int]) -> Buf[int]
+    var mine = b
+
+    mine.push(9)
+    mine
+
+var a: Buf[int] = buf()
+
+a.push(1)
+print(with_nine(a), a)
+```
+
+```output
+[1, 9] [1]
+```
+
+A parameter that is itself a `*T`, `&T` or `&sync T` is not a copy. Where the parameter may be reached under another name —
 a closure or a nested function captures it, its address is taken, a `ref` stands for it — the body
 is not followed, and nothing is said.
 

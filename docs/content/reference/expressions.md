@@ -2319,8 +2319,29 @@ print(inc(41), bump(), bump(), n)
 42 1 2 2
 ```
 
-A write through what a capture refers to — a `&T`, a `*T`, a slice's element, a `Buf` — reaches
-storage the closure shares, and a `val` may hold that closure whatever its mode.
+A write through what a capture refers to — a `&T`, a `*T`, a slice's element — reaches storage the
+closure shares, and a `val` may hold that closure whatever its mode. A captured `Buf` is not one: it
+is a value, so a push into one the closure holds by value is a write to the closure's own copy.
+One that outlives `a` holds `a` as it was when it was made:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+keep(b: Buf[int]) -> &Fn() -> usize = () -> b.len()
+
+var a: Buf[int] = buf()
+
+a.push(1)
+
+val n = keep(a)
+
+a.push(2)
+print(n(), a.len())
+```
+
+```output
+1 2
+```
 
 **A closure that holds a written capture by value is a value the call mutates**, so a `val` holding
 one is refused, and the refusal says what keeps the closure:
@@ -2457,8 +2478,8 @@ print(*hit)
 true
 ```
 
-A `*T` to a local, a field of a captured `&T` and a captured `Buf` reach shared storage the same
-way. A closure that reads back what it wrote, with the variable outside left alone, keeps its state
+A `*T` to a local and a field of a captured `&T` reach shared storage the same way; a captured
+`Buf` is a value, and is written as one. A closure that reads back what it wrote, with the variable outside left alone, keeps its state
 and is accepted: a closure whose body is `n += 1` followed by `n` is a counter of its own.
 
 **A `*self` method called on the copy is a write to it**, exactly as an assignment is: the method is

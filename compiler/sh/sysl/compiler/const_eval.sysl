@@ -316,7 +316,7 @@ end constant_message
 // at. `None` where nothing in it runs while compiling, where the reading complained (taken back, for
 // the caller to read again for real), or where it did not come to an array; where running it failed,
 // why has been said.
-const_lanes_of_call(cx: &Analyzer, e: Expr) -> Option[(Buf[Const], Type)]
+const_lanes_of_call(cx: &Analyzer, e: Expr) -> Option[(&Buf[Const], Type)]
     if !mentions_const_call(cx.an, e) then return None
 
     val typed = typed_call(cx, e, None)
@@ -940,8 +940,8 @@ private struct EvFrame
     caller: Scope
     home: Scope
     // Each local's cell: a buffer of one value, so a pointer to the local is a pointer into it.
-    locals: Map[string, Buf[Const]]
-    olds: Buf[Const]
+    locals: Map[string, &Buf[Const]]
+    olds: &Buf[Const]
     result: Option[Const]
     slots: Map[string, Const]
 end EvFrame
@@ -1161,8 +1161,8 @@ private value_text(v: Const, t: Type) -> string = v match
     ConstErased(_, _) -> s"a '${type_show(t)}'"
 
 // The elements a slice sees, as a buffer of their own.
-private viewed(xs: Buf[Const], lo: usize, n: usize) -> Buf[Const]
-    var out: Buf[Const] = buf()
+private viewed(xs: &Buf[Const], lo: usize, n: usize) -> &Buf[Const]
+    var out: &Buf[Const] = buf()
 
     for i in 0..<n
         out.push(xs[lo + i])
@@ -1172,7 +1172,7 @@ end viewed
 
 // A struct as `Name(a, b)`, an enum value as its variant's name and what it carries.
 @noinline
-private record_text(variant: int, fields: Buf[Const], t: Type) -> string
+private record_text(variant: int, fields: &Buf[Const], t: Type) -> string
     if variant <= -2
         val (named, declared) = record_shape(-1, t)
         val i = usize(union_written(variant))
@@ -1201,7 +1201,7 @@ private record_shape(variant: int, t: Type) -> (string, Buf[(string, Type)]) = u
     _ -> ("?", buf())
 
 @noinline
-private array_text(xs: Buf[Const], elem: Type) -> string
+private array_text(xs: &Buf[Const], elem: Type) -> string
     var out = "["
 
     for i in 0..<xs.len()
@@ -1225,7 +1225,7 @@ private element_type(t: Type) -> Type = underlying(t) match
 // need not be.
 private copied(v: Const) -> Const = v match
     ConstArray(xs) ->
-        var out: Buf[Const] = buf()
+        var out: &Buf[Const] = buf()
 
         for x in xs
             out.push(copied(x))
@@ -1234,8 +1234,8 @@ private copied(v: Const) -> Const = v match
     ConstRecord(variant, fields) -> ConstRecord(variant, copied_all(fields))
     _ -> v
 
-private copied_all(xs: Buf[Const]) -> Buf[Const]
-    var out: Buf[Const] = buf()
+private copied_all(xs: &Buf[Const]) -> &Buf[Const]
+    var out: &Buf[Const] = buf()
 
     for x in xs
         out.push(copied(x))
@@ -1254,7 +1254,7 @@ private holds_view(v: Const) -> bool = v match
     ConstRecord(_, fields) -> any_view(fields)
     _ -> false
 
-private any_view(xs: Buf[Const]) -> bool
+private any_view(xs: &Buf[Const]) -> bool
     for x in xs
         if holds_view(x) then return true
 
@@ -1271,7 +1271,7 @@ private dangles(v: Const, depth: int) -> bool = v match
     ConstRecord(_, fields) -> any_dangles(fields, depth)
     _ -> false
 
-private any_dangles(xs: Buf[Const], depth: int) -> bool
+private any_dangles(xs: &Buf[Const], depth: int) -> bool
     for x in xs
         if dangles(x, depth) then return true
 
@@ -1285,7 +1285,7 @@ private overwrite(old: Const, new: Const) -> bool = (old, new) match
     (ConstRecord(a, xs), ConstRecord(b, ys)) -> a == b && overwrite_all(xs, ys)
     _ -> false
 
-private overwrite_all(xs: Buf[Const], ys: Buf[Const]) -> bool
+private overwrite_all(xs: &Buf[Const], ys: &Buf[Const]) -> bool
     if xs.len() != ys.len() then return false
 
     var held = xs
@@ -1322,7 +1322,7 @@ private value_literal(span: Span, v: Const, t: Type) -> Option[TExpr] = v match
     ConstPtr(cells, at, _) -> underlying(t) match
         Ref(inner, _) -> value_literal(span, cells[at], *inner).map(lit -> TExpr(span, TBox(lit, t)))
         Ptr(inner) ->
-            var rest: Buf[Const] = buf()
+            var rest: &Buf[Const] = buf()
 
             for i in at..<cells.len()
                 rest.push(cells[i])
@@ -1333,7 +1333,7 @@ private value_literal(span: Span, v: Const, t: Type) -> Option[TExpr] = v match
     _ -> None
 
 // A slice's elements, laid down as the literal of a slice over constant data.
-private frozen_view(span: Span, xs: Buf[Const], t: Type) -> Option[TExpr]
+private frozen_view(span: Span, xs: &Buf[Const], t: Type) -> Option[TExpr]
     val elem = element_type(t)
     var items: Buf[TExpr] = buf()
 
@@ -1400,7 +1400,7 @@ private answer_refusal_in(v: Const, t: Type, in_frozen: bool, laying: *Laying) -
             if !in_frozen then Some(s"holds a pointer to storage the run made, ${laid_text()} — answer the value " +
                                     "itself")
             else
-                var rest: Buf[Const] = buf()
+                var rest: &Buf[Const] = buf()
 
                 for i in at..<cells.len()
                     rest.push(cells[i])
@@ -1431,7 +1431,7 @@ private answer_refusal_in(v: Const, t: Type, in_frozen: bool, laying: *Laying) -
     ConstWriter(_) -> Some("holds a writer, which exists only while a value renders")
     _ -> None
 
-private elements_refusal(xs: Buf[Const], elem: Type, in_frozen: bool, laying: *Laying) -> Option[string]
+private elements_refusal(xs: &Buf[Const], elem: Type, in_frozen: bool, laying: *Laying) -> Option[string]
     for x in xs
         val why = answer_refusal_in(x, elem, in_frozen, laying)
 
@@ -1467,7 +1467,7 @@ end short_name
 // A variant's payload is laid down as bytes (`payload_image.sysl`); where one has no byte image the
 // value stays code, and `const_val_run` says why.
 @noinline
-private record_literal(span: Span, variant: int, fields: Buf[Const], t: Type) -> Option[TExpr]
+private record_literal(span: Span, variant: int, fields: &Buf[Const], t: Type) -> Option[TExpr]
     val (_, types) = record_shape(if variant <= -2 then -1 else variant, t)
     var args: Buf[TExpr] = buf()
 
@@ -1495,7 +1495,7 @@ end record_literal
 
 // A vector as the literal of its lanes it is laid down as.
 @noinline
-private vector_literal(span: Span, xs: Buf[Const], t: Type) -> Option[TExpr]
+private vector_literal(span: Span, xs: &Buf[Const], t: Type) -> Option[TExpr]
     val lane = element_type(t)
     var lits: Buf[TExpr] = buf()
 
@@ -1511,7 +1511,7 @@ end vector_literal
 
 // A table as the array literal it is laid down as, every element a literal at the element type.
 @noinline
-private array_literal(span: Span, xs: Buf[Const], t: Type) -> Option[TExpr]
+private array_literal(span: Span, xs: &Buf[Const], t: Type) -> Option[TExpr]
     val elem = element_type(t)
     var lits: Buf[TExpr] = buf()
 
@@ -2032,7 +2032,7 @@ private zero_value(r: &EvRun, at: Span, ty: Type) -> Flow = underlying(ty) match
 private zero_record(r: &EvRun, at: Span, d: &StructType) -> Flow
     if d.opaque then return refuse_form(r, at, s"an opaque '${d.name()}' is not evaluated while compiling")
 
-    var out: Buf[Const] = buf()
+    var out: &Buf[Const] = buf()
 
     for f in d.fields
         // A union's zero is all-zero bytes, which is its first field's zero; the rest stand in.
@@ -2056,8 +2056,8 @@ end zero_record
 // step per element, so the step bound is also the bound on how large a table may be.
 
 // `n` copies of one value, each a place of its own.
-private filled(v: Const, n: int) -> Buf[Const]
-    var out: Buf[Const] = buf()
+private filled(v: Const, n: int) -> &Buf[Const]
+    var out: &Buf[Const] = buf()
 
     for _ in 0..<n
         out.push(copied(v))
@@ -2092,7 +2092,7 @@ private array_lit(r: &EvRun, at: Span, elems: Buf[TExpr], ty: Type) -> Flow
 
     if why.is_some() then return refuse_form(r, at, why.unwrap())
 
-    var out: Buf[Const] = buf()
+    var out: &Buf[Const] = buf()
 
     for elem in elems
         eval_value(r, elem) match
@@ -2172,7 +2172,7 @@ private buffer_lit(r: &EvRun, at: Span, elems: Buf[TExpr], ty: Type) -> Flow
 
     if why.is_some() then return refuse_form(r, at, why.unwrap())
 
-    var out: Buf[Const] = buf()
+    var out: &Buf[Const] = buf()
 
     for elem in elems
         eval_value(r, elem) match
@@ -2208,7 +2208,7 @@ end buffer_fill
 // slot until one is placed there, and the run keeps no count for a vacate to let go of.
 @noinline
 private slots(r: &EvRun, at: Span, op: string, args: Buf[TExpr]) -> Flow
-    var vals: Buf[Const] = buf()
+    var vals: &Buf[Const] = buf()
 
     for arg in args
         eval_value(r, arg) match
@@ -2237,6 +2237,10 @@ private slots(r: &EvRun, at: Span, op: string, args: Buf[TExpr]) -> Flow
             _ -> refuse_form(r, at, "'slot_place' over something that is not a slice")
         "slot_take" -> raw_move(r, at, op)
         "slot_put" -> raw_move(r, at, op)
+        // **A constant keeps no counts, so nothing it holds is known to be the only share**: the
+        // answer is "shared", and a copy-on-write value copies before every write -- which is the
+        // answer that is right whatever else names the storage.
+        "is_unique" -> EvGave(ConstBool(false))
         _ -> EvNone
 end slots
 
@@ -2258,7 +2262,7 @@ private placed(r: &EvRun, at: Span, v: Const) -> Flow = v match
 // refused on a vector before anything runs.
 
 // A vector's lanes; nothing for a value that is not one.
-private lanes_of(v: Const) -> Buf[Const] = v match
+private lanes_of(v: Const) -> &Buf[Const] = v match
     ConstArray(xs) -> xs
     _ -> buf()
 
@@ -2270,7 +2274,7 @@ private lane_count(t: Type) -> int = underlying(t) match
 // `[a, b, c, d]` at a vector type: each lane computed in order.
 @noinline
 private vector_new(r: &EvRun, lanes: Buf[TExpr]) -> Flow
-    var out: Buf[Const] = buf()
+    var out: &Buf[Const] = buf()
 
     for lane in lanes
         eval_value(r, lane) match
@@ -2301,7 +2305,7 @@ private lanewise(r: &EvRun, at: Span, op: string, lt: Type, rt: Type, ty: Type, 
         ConstArray(found) -> found
         _ -> filled(y, int(xs.len()))
     val (ll, rl, tl) = (vector_lane_of(lt), vector_lane_of(rt), vector_lane_of(ty))
-    var out: Buf[Const] = buf()
+    var out: &Buf[Const] = buf()
 
     for i in 0..<xs.len()
         val lane = if fixed_arith_op(op, ll, rl, tl) then fixed_operate(r, at, op, ll, rl, tl, xs[i], ys[i])
@@ -2344,7 +2348,7 @@ private select_lanes(r: &EvRun, mask: TExpr, when_true: TExpr, when_false: TExpr
         Ok(v) -> lanes_of(v)
         Err(f) -> return f
 
-    var out: Buf[Const] = buf()
+    var out: &Buf[Const] = buf()
 
     for i in 0..<m.len()
         val chosen = m[i] match
@@ -2364,14 +2368,14 @@ private shuffle_lanes(r: &EvRun, receiver: TExpr, second: Option[TExpr], lanes: 
         Ok(v) -> lanes_of(v)
         Err(f) -> return f
 
-    var b: Buf[Const] = buf()
+    var b: &Buf[Const] = buf()
 
     if second.is_some()
         eval_value(r, second.unwrap()) match
             Ok(v) -> b = lanes_of(v)
             Err(f) -> return f
 
-    var out: Buf[Const] = buf()
+    var out: &Buf[Const] = buf()
 
     for lane in lanes
         out.push(if usize(lane) < a.len() then a[usize(lane)] else b[usize(lane) - a.len()])
@@ -2391,7 +2395,7 @@ private lane_set(r: &EvRun, receiver: TExpr, lanes: Buf[int], value: TExpr) -> F
         Ok(v) -> v
         Err(f) -> return f
 
-    var out: Buf[Const] = buf()
+    var out: &Buf[Const] = buf()
 
     for item in a
         out.push(copied(item))
@@ -2479,7 +2483,7 @@ end propagating
 // held, and the position of the first. A run that does not fit traps, as it does where the program
 // runs -- checked as a whole, so a run starting at an element that exists still traps if the last
 // does not.
-private lane_run(r: &EvRun, held: Const, receiver: TExpr, index: TExpr, n: int) -> Result[(Buf[Const], usize), Flow]
+private lane_run(r: &EvRun, held: Const, receiver: TExpr, index: TExpr, n: int) -> Result[(&Buf[Const], usize), Flow]
     val (xs, lo, len) = held match
         ConstArray(found) -> (found, usize(0), found.len())
         ConstView(found, from, count, _) -> (found, from, count)
@@ -2510,7 +2514,7 @@ private vector_load(r: &EvRun, receiver: TExpr, index: TExpr, vec_ty: Type) -> F
 
     lane_run(r, held, receiver, index, n) match
         Ok((xs, first)) ->
-            var out: Buf[Const] = buf()
+            var out: &Buf[Const] = buf()
 
             for k in 0..<usize(n)
                 out.push(copied(xs[first + k]))
@@ -2667,7 +2671,7 @@ private bytes_of(r: &EvRun, receiver: TExpr) -> Flow
 
     if !charged(r, receiver.span, long(b.len), s"a string of ${b.len} bytes") then return EvStop
 
-    var out: Buf[Const] = buf()
+    var out: &Buf[Const] = buf()
 
     for x in b
         out.push(ConstInt(from_int(long(x))))
@@ -2782,7 +2786,7 @@ const_renderer(shown: string) -> bool = shown match
     _ -> false
 
 @noinline
-private library_render(r: &EvRun, at: Span, shown: string, vals: Buf[Const]) -> Flow
+private library_render(r: &EvRun, at: Span, shown: string, vals: &Buf[Const]) -> Flow
     val text = shown match
         "sysl.fmt.format_int" ->
             format_int(wide_arg(vals, 0), small_arg(vals, 1), text_arg(vals, 2), small_arg(vals, 3),
@@ -2801,12 +2805,12 @@ private library_render(r: &EvRun, at: Span, shown: string, vals: Buf[Const]) -> 
     built(r, at, text)
 end library_render
 
-private real_arg(vals: Buf[Const], i: usize) -> real = vals[i] match
+private real_arg(vals: &Buf[Const], i: usize) -> real = vals[i] match
     ConstFloat(f) -> f
     _ -> 0.0
 
 // A binary128 argument from the two halves of its bits, which is how the evaluator holds one.
-private quad_arg(vals: Buf[Const], i: usize) -> f128 = vals[i] match
+private quad_arg(vals: &Buf[Const], i: usize) -> f128 = vals[i] match
     ConstQuad(hi, lo) -> f128.from_bits((u128(hi) << 64) | u128(lo))
     _ -> f128.from_bits(0)
 
@@ -2845,7 +2849,7 @@ private render(r: &EvRun, at: Span, value: TExpr, method: string, spec: TExpr, s
 
     r.writers.push(byte_sink())
 
-    var vals: Buf[Const] = buf()
+    var vals: &Buf[Const] = buf()
 
     vals.push(shown)
     vals.push(ConstWriter(int(k)))
@@ -2897,7 +2901,7 @@ writer_routine(shown: string) -> bool = shown match
     _ -> false
 
 @noinline
-private writer_render(r: &EvRun, at: Span, shown: string, vals: Buf[Const]) -> Flow
+private writer_render(r: &EvRun, at: Span, shown: string, vals: &Buf[Const]) -> Flow
     val at_writer: usize = if shown == "sysl.display_fill" then 0 else 1
 
     val k = vals[at_writer] match
@@ -2934,11 +2938,11 @@ private writer_render(r: &EvRun, at: Span, shown: string, vals: Buf[Const]) -> F
 end writer_render
 
 // The `FormatSpec` a rendering routine was handed, which is its last argument.
-private spec_of(vals: Buf[Const]) -> FormatSpec = vals[vals.len() - 1] match
+private spec_of(vals: &Buf[Const]) -> FormatSpec = vals[vals.len() - 1] match
     ConstRecord(_, fields) -> FormatSpec(small_arg(fields, 0), small_arg(fields, 1), flag_arg(fields, 2))
     _ -> FormatSpec(0, -1, false)
 
-private char_arg(vals: Buf[Const], i: usize) -> char = vals[i] match
+private char_arg(vals: &Buf[Const], i: usize) -> char = vals[i] match
     ConstChar(c) -> c
     ConstInt(n) -> char(u32(n.to_long().unwrap_or(0)))
     _ -> char(0)
@@ -2963,20 +2967,20 @@ private byte_list(v: Const) -> Option[Buf[u8]]
     Some(out)
 end byte_list
 
-private small_arg(vals: Buf[Const], i: usize) -> int = vals[i] match
+private small_arg(vals: &Buf[Const], i: usize) -> int = vals[i] match
     ConstInt(n) -> int(n.to_long().unwrap_or(0))
     _ -> 0
 
-private text_arg(vals: Buf[Const], i: usize) -> string = vals[i] match
+private text_arg(vals: &Buf[Const], i: usize) -> string = vals[i] match
     ConstStr(s) -> s
     _ -> ""
 
-private flag_arg(vals: Buf[Const], i: usize) -> bool = vals[i] match
+private flag_arg(vals: &Buf[Const], i: usize) -> bool = vals[i] match
     ConstBool(b) -> b
     _ -> false
 
 // An integer argument at `i128`, which is the width the renderers take every integer at.
-private wide_arg(vals: Buf[Const], i: usize) -> i128
+private wide_arg(vals: &Buf[Const], i: usize) -> i128
     val n = vals[i] match
         ConstInt(x) -> x
         _ -> return 0
@@ -3019,7 +3023,7 @@ private record_new(r: &EvRun, at: Span, variant: int, args: Buf[TExpr], ty: Type
 
     if variant < -1 then return refuse_form(r, at, s"a '${type_show(ty)}' is not evaluated while compiling yet")
 
-    var out: Buf[Const] = buf()
+    var out: &Buf[Const] = buf()
 
     for arg in args
         eval_value(r, arg) match
@@ -3044,7 +3048,7 @@ private union_new(r: &EvRun, at: Span, decl: &StructType, args: Buf[TExpr]) -> F
     if why.is_some() then return refuse_form(r, at, why.unwrap())
 
     var written = 0
-    var out: Buf[Const] = buf()
+    var out: &Buf[Const] = buf()
 
     for i in 0..<args.len()
         *args[i].kind match
@@ -3139,7 +3143,7 @@ private variant_matches(r: &EvRun, enum_ty: Type, variant: EnumVariant, args: Bu
 end variant_matches
 
 // Whether each field matches its pattern, in order, binding as they go.
-private fields_match(r: &EvRun, args: Buf[TPattern], fields: Buf[Const]) -> Result[bool, Flow]
+private fields_match(r: &EvRun, args: Buf[TPattern], fields: &Buf[Const]) -> Result[bool, Flow]
     for i in 0..<args.len()
         matches(r, args[i], fields[i]) match
             Ok(true) -> ()
@@ -3208,7 +3212,7 @@ private checked_member(r: &EvRun, at: Span, op: string, operand: TExpr, amount: 
     val fits = exact.is_some() && !traps && cmp(exact.unwrap(), min) >= 0 &&
         cmp(exact.unwrap(), base_max(bits, signed)) <= 0
 
-    var parts: Buf[Const] = buf()
+    var parts: &Buf[Const] = buf()
 
     if fits then parts.push(ConstInt(exact.unwrap()))
 
@@ -3354,7 +3358,7 @@ private unary(r: &EvRun, at: Span, op: string, operand: TExpr, ty: Type) -> Flow
 
     underlying(ty) match
         Vector(_, _) ->
-            var out: Buf[Const] = buf()
+            var out: &Buf[Const] = buf()
 
             for x in lanes_of(v)
                 unary_value(r, at, op, x, vector_lane_of(ty)) match
@@ -3448,7 +3452,7 @@ private ev_contracted(r: &EvRun, at: Span, k: Contraction, addend: Option[TExpr]
             val xs = lanes_of(x)
             val ys = lanes_of(y)
             val cs = lanes_of(c)
-            var out: Buf[Const] = buf()
+            var out: &Buf[Const] = buf()
 
             for i in 0..<xs.len()
                 fused_const(k, bits, xs[i], ys[i], cs[i]) match
@@ -3619,7 +3623,7 @@ private dispatched_comparison(r: &EvRun, at: Span, c: TCmp, d: TDispatch, left: 
             Err(f) -> return f
     end for
 
-    var vals: Buf[Const] = buf()
+    var vals: &Buf[Const] = buf()
 
     vals.push(if d.swap then b else a)
     vals.push(if d.swap then a else b)
@@ -3868,7 +3872,7 @@ private call(r: &EvRun, at: Span, name: string, args: Buf[TExpr], results: bool)
     if results then return refuse_form(r, at, "a call answering a list of results is not evaluated " +
                                        "while compiling yet")
 
-    var vals: Buf[Const] = buf()
+    var vals: &Buf[Const] = buf()
 
     for arg in args
         eval_value(r, arg) match
@@ -3880,7 +3884,7 @@ end call
 
 // A call whose arguments are worked out: the library's routines the compiler runs itself, or the
 // body.
-private call_with(r: &EvRun, at: Span, name: string, vals: Buf[Const]) -> Flow
+private call_with(r: &EvRun, at: Span, name: string, vals: &Buf[Const]) -> Flow
     val shown = qualified_name(name)
 
     if const_renderer(shown) then return library_render(r, at, shown, vals)
@@ -3934,7 +3938,7 @@ private dispatched(r: &EvRun, at: Span, receiver: TExpr, slot: int, args: Buf[TE
         None -> return refuse_form(r, at, s"a call through the table '$vt_name', which this compilation does not have")
 
     val target = vt.slots[usize(slot)]
-    var vals: Buf[Const] = buf()
+    var vals: &Buf[Const] = buf()
 
     target.recv match
         ByValue -> data match
@@ -3964,7 +3968,7 @@ private atomic(r: &EvRun, at: Span, op: string, addr: TExpr, ops: Buf[TExpr], at
         Ok(v) -> return through_unowned(r, addr.span, v)
         Err(f) -> return f
 
-    var vals: Buf[Const] = buf()
+    var vals: &Buf[Const] = buf()
 
     for o in ops
         eval_value(r, o) match
@@ -4033,7 +4037,7 @@ frozen_routine(shown: string) -> bool = shown == "sysl.buf.freeze_buf" || shown 
 // is 0, which is what a frozen buffer nothing frees has. Freezing copies the elements into storage
 // sized to them and leaves the buffer empty, through every name it has, as the program's does.
 @noinline
-private frozen_call(r: &EvRun, at: Span, routine: string, name: string, vals: Buf[Const]) -> Flow
+private frozen_call(r: &EvRun, at: Span, routine: string, name: string, vals: &Buf[Const]) -> Flow
     if routine == "sysl.buf.Frozen.view"
         return vals[0] match
             ConstPtr(cells, i, _) -> cells[i] match
@@ -4060,12 +4064,12 @@ private frozen_call(r: &EvRun, at: Span, routine: string, name: string, vals: Bu
         _ -> return refuse_form(r, at, "a buffer the run did not make")
 
     val data_ty = r.a.tables.members.func_insts.get(name).map(sig -> frozen_data_type(sig.ret)).unwrap_or(Unknown)
-    var items: Buf[Const] = buf()
+    var items: &Buf[Const] = buf()
 
     for i in 0..<count
         items.push(copied(elems[lo + i]))
 
-    var fields: Buf[Const] = buf()
+    var fields: &Buf[Const] = buf()
 
     fields.push(ConstInt(from_int(0)))
 
@@ -4182,7 +4186,7 @@ private callee(r: &EvRun, at: Span, name: string) -> Option[&TFunc]
 end callee
 
 @noinline
-private run_call(r: &EvRun, at: Span, name: string, vals: Buf[Const]) -> Flow
+private run_call(r: &EvRun, at: Span, name: string, vals: &Buf[Const]) -> Flow
     val found = callee(r, at, name)
 
     if found.is_none() then return EvStop
@@ -4245,7 +4249,7 @@ end run_call
 // a parameter or result the evaluator does not hold, or of a call nested too deep. Kept out of
 // `run_call`, which sits on the stack once per call level, so its strings do not.
 @noinline
-private entered(r: &EvRun, at: Span, name: string, vals: Buf[Const], f: &TFunc,
+private entered(r: &EvRun, at: Span, name: string, vals: &Buf[Const], f: &TFunc,
                 key: string) -> Result[&EvFrame, Flow]
     for param in f.params
         val why = unheld(param.1)
@@ -4363,7 +4367,7 @@ private below(a: Const, b: Const) -> bool = (a, b) match
 
 // The key a run of a callee is kept by: the callee, and each argument's exact value.
 @noinline
-private memo_key(name: string, vals: Buf[Const]) -> string
+private memo_key(name: string, vals: &Buf[Const]) -> string
     if any_view(vals) then return ""
 
     var out = name
@@ -4574,8 +4578,8 @@ end variant_check
 // union's value and so lands in the slot that holds the union.
 private enum EvSlot
     SlotLocal(name: string)
-    SlotElem(elems: Buf[Const], at: usize, owner: int)
-    SlotUnion(holder: &EvSlot, fields: Buf[Const], written: int, at: usize, ty: Type)
+    SlotElem(elems: &Buf[Const], at: usize, owner: int)
+    SlotUnion(holder: &EvSlot, fields: &Buf[Const], written: int, at: usize, ty: Type)
 end EvSlot
 
 // The slot a place names, its indices worked out: a local, an element, a field, at any depth.
@@ -4682,7 +4686,7 @@ end assign
 // A value written into slot `i` of a buffer of values: in the storage already there where the two
 // have the same shape, so a slice or a pointer taken into the old value sees the new one, as the
 // program's would; as a copy of its own where they do not.
-private written_over(xs: Buf[Const], i: usize, v: Const)
+private written_over(xs: &Buf[Const], i: usize, v: Const)
     if overwrite(xs[i], v) then return
 
     var held = xs
@@ -4691,8 +4695,8 @@ private written_over(xs: Buf[Const], i: usize, v: Const)
 end written_over
 
 // A local's cell, holding its first value.
-private cell_of(v: Const) -> Buf[Const]
-    var out: Buf[Const] = buf()
+private cell_of(v: Const) -> &Buf[Const]
+    var out: &Buf[Const] = buf()
 
     out.push(v)
     out

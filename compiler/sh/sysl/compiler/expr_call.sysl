@@ -911,6 +911,8 @@ private special_form(cx: &Analyzer, span: Span, written: string, args: Buf[Expr]
 
     if null_test_form(cx, name) then return Some(null_test_call(cx, span, args))
 
+    if unique_test_form(cx, name) then return Some(unique_test_call(cx, span, args))
+
     if release_form(cx, name) then return Some(release_call(cx, span, args))
 
     None
@@ -959,6 +961,43 @@ private null_test_fault(t: Type) -> Option[string] = t match
     Unknown -> None
     other -> Some(s"'is_null' asks whether a reference names nothing, and ${type_show(other)} is " +
                   "not a reference — a '*T' is compared with 'null' directly")
+
+// `is_unique(r)` -- whether a counted reference is the only share of what it names: not null, and a
+// strong count of one. It is what a copy-on-write value asks before it writes: storage nobody else
+// holds is written where it is, and shared storage is copied first. Like `is_null`, a function or a
+// local of the name is what a call reaches, and the form applies only where nothing else claims it.
+unique_test_form(cx: &Analyzer, name: string) -> bool =
+    name == "is_unique" && cx.lookup(name).is_none() && function_keys(cx, name).is_empty()
+
+// **The count is read where the reference stands and nothing is done to it**: no share is taken to
+// ask the question, since a share taken to ask would make every answer "shared". It is one of the
+// slot forms in the typed tree (`TSlots`), so the analyses that already know those forms read it as
+// a read of storage the call did not create.
+private unique_test_call(cx: &Analyzer, span: Span, args: Buf[Expr]) -> TExpr
+    if args.len() != 1 then
+        return cx.err(span, "'is_unique' takes exactly one value, the reference to ask about")
+
+    val t = type_expr_bare(cx, args[0])
+    val ty = underlying(texpr_type(t))
+
+    if ty == Unknown then return bad_expr(span)
+
+    ty match
+        Ref(inner, _) ->
+            if is_trait_type(*inner) then
+                return cx.err(span, "'is_unique' asks about a reference's count, and a reference to " +
+                              "a trait is two words — the address and the table of the type it was " +
+                              "erased from")
+
+            var all: Buf[TExpr] = buf()
+
+            all.push(t)
+            TExpr(span, TSlots("is_unique", all, *inner, Bool))
+        Weak(_) -> cx.err(span, "'is_unique' asks about a counted reference, and a weak one holds " +
+                          "no share to be the only one of")
+        other -> cx.err(span, s"'is_unique' asks whether a reference is the only share of what it " +
+                        s"names, and ${type_show(other)} is not a reference")
+end unique_test_call
 
 // `release(place)` -- the counted reference a `&T` place holds given back where it stands, and the
 // place left naming nothing, as zeroed storage does. It is `is_null`'s other half: a `&T` field in
@@ -1010,6 +1049,16 @@ private release_fault(cx: &Analyzer, t: Type) -> Option[string] = underlying(t) 
     _ -> not_a_reference(cx, t)
 
 private not_a_reference(cx: &Analyzer, t: Type) -> Option[string]
+    // A value whose all-zero bytes are its empty one gives back what it holds by being assigned that.
+    val empty_owns_nothing = underlying(t) match
+        Struct(d) -> d.zero_is_empty
+        _ -> false
+
+    if empty_owns_nothing then
+        return Some(s"'release' gives back what a '&T' place holds, and ${type_show(t)} is a value " +
+                        "whose empty one owns nothing — assign it an empty one, which gives back what " +
+                        "it held and allocates nothing")
+
     if has_member(cx.an, t, "release") then
         return Some(s"'release' gives back what a '&T' place holds, and ${type_show(t)} gives its " +
                     "share back through its own member — call '.release()' on it")
@@ -1112,8 +1161,8 @@ private is_trait_type(t: Type) -> bool = t match
 // none either, and saying so is better than reporting the name as uncallable.
 private special_form_name(cx: &Analyzer, name: string) -> bool =
     special_form_word(name) || atomic_form(cx, name) || task_form(cx, name) || slot_form(cx, name) ||
-    null_test_form(cx, name) || release_form(cx, name) || sysreg_form(cx, name) ||
-    embed_form(cx, name) || debug_form(cx, name) || name == DebugPart || name == SubscriptIndex ||
+    null_test_form(cx, name) || unique_test_form(cx, name) || release_form(cx, name) ||
+    sysreg_form(cx, name) || embed_form(cx, name) || debug_form(cx, name) || name == DebugPart || name == SubscriptIndex ||
     name == UncheckedBlock
 
 // The words the compiler answers itself, the atomics aside: a form belongs to no module, so an import
@@ -3720,7 +3769,7 @@ private call_key_declared(cx: &Analyzer, span: Span, written: string, key: strin
         for i in slots.len()..<args.len()
             ts.push(variadic_extra(cx, args[i], false))
 
-    // **`@crossing` says a parameter hands what it is given to another domain**, so the rule about
+    // **`@crossing` says a parameter hands what it is given to another domain&**, so the rule about
     // what may cross is asked at the CALL: the argument is the thing that could have been written
     // differently. The list is built only where there is an annotation, since it is otherwise a
     // walk over every parameter of every call in the program for nothing.
@@ -3730,7 +3779,7 @@ private call_key_declared(cx: &Analyzer, span: Span, written: string, key: strin
         for param in f.decl.params
             pts.push((param.name, param_type(cx, f, param)))
 
-        check_crossings(cx, f.decl.crossing, f.decl.marks.copies, shown, pts, ts)
+        check_crossings(cx, f.decl.crossing, f.decl.marks.copies, shown, pts, &ts)
     end if
 
     val ret = declared_result(cx, f.scope, f.decl.ret_type, f.decl.needs)

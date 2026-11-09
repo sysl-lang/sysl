@@ -172,7 +172,7 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
 
             gen_function(e, f) match
                 Some(built) ->
-                    for whole in owned_split(e, f, built, lazy, false, pending)
+                    for whole in owned_split(e, f, built, lazy, false, &pending)
                         for item in split_disjoint(f, whole)
                             for part in split_self(e, f, item, self_bodies)
                                 funcs.push(part)
@@ -194,8 +194,8 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
                     if keeps_import(f, built)
                         // An owning function's entry and body are both copies of what the artifact
                         // defines (`owned_params.sysl`).
-                        for whole in owned_split(e, f, built, lazy, true, pending)
-                            push_copy(funcs, split_disjoint(f, whole))
+                        for whole in owned_split(e, f, built, lazy, true, &pending)
+                            push_copy(&funcs, split_disjoint(f, whole))
 
                         imported.add(f.name)
                 None -> ()
@@ -308,7 +308,7 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
     // And where a block on a boundary beyond the pair's comes from (`emit_box.sysl`).
     request_aligned_heap(e, p)
 
-    made = drain_helpers(e, made, built_helpers, gaps)
+    made = drain_helpers(e, made, &built_helpers, &gaps)
 
     // The two words a `bool` renders as are asked for by what the bodies and helpers wrote, so they
     // are settled here, before the storage below is.
@@ -347,18 +347,18 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
         for item in e.globals
             stored.push(item)
 
-        for item in named_entries(pending, everything, built_helpers, stored, module_asm_lines(p.module_asm))
+        for item in named_entries(&pending, everything, built_helpers, stored, module_asm_lines(p.module_asm))
             set_promoted(e, pr, item.f.name)
 
             val parts = split_disjoint(item.f, pending_entry(e, item))
 
             if item.copy
-                push_copy(funcs, parts)
+                push_copy(&funcs, parts)
             else
                 for part in parts
                     funcs.push(part)
 
-        made = drain_helpers(e, made, built_helpers, gaps)
+        made = drain_helpers(e, made, &built_helpers, &gaps)
     end if
 
     // The hand-written blocks go in front of the generated ones, and which of them the module needs
@@ -412,7 +412,7 @@ end codegen_into
 
 // Every helper requested from `made` on, each of which may request another, until nothing new is.
 // Answers how far the queue has been built.
-private drain_helpers(e: *Emit, from: usize, built_helpers: Buf[IrRuntime], gaps: Buf[(string, string)]) -> usize
+private drain_helpers(e: *Emit, from: usize, built_helpers: *Buf[IrRuntime], gaps: *Buf[(string, string)]) -> usize
     var made = from
 
     while made < e.queue.len()
@@ -440,7 +440,7 @@ end drain_helpers
 // A precompiled function's copy, as this module carries it: the first part `available_externally`,
 // and a view's body half this unit's own `internal` copy, which is inlined into the first and never
 // linked against.
-private push_copy(funcs: Buf[IrFunc], parts: Buf[IrFunc])
+private push_copy(funcs: *Buf[IrFunc], parts: Buf[IrFunc])
     funcs.push(parts[0] with { sig = parts[0].sig with { linkage = LinkAvailableExternally } })
 
     for i in 1..<parts.len()

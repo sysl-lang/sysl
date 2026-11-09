@@ -366,19 +366,20 @@ removing_past_the_count_traps()
 // than left for the next read to find. They are made here on a core directly, which only this module
 // can name.
 
-// An empty buffer is already a buffer: every name taken from it before its first push is a name for
-// the same one, which is why making it has to make the box.
-@test("two handles copied from one empty Buf share its first push")
-handles_of_one_empty_buf_share_its_first_push()
-    val a: Buf[int] = buf()
-    val b = a
+// An empty buffer owns nothing, so two copies of one are two buffers from the start: the first push
+// into either gives that one storage of its own and leaves the other empty.
+@test("two copies of one empty Buf are two buffers, each growing on its own")
+copies_of_one_empty_buf_grow_apart()
+    var a: Buf[int] = buf()
+    var b = a
 
     b.push(1)
-    assert_eq(a.len(), 1usize)
-    assert_eq(a[0], 1)
+    assert_eq(a.len(), 0usize)
+    assert_eq(b[0], 1)
 
     a.push(2)
-    assert_eq(b.len(), 2usize)
+    assert_eq(a.view(), [2])
+    assert_eq(b.view(), [1])
 
 @test(should_trap)
 moving_the_count_past_the_storage_traps()
@@ -589,14 +590,14 @@ with_capacity_keeps_no_fill()
     assert_eq(b.cap(), 4)
 end with_capacity_keeps_no_fill
 
-// -- every name for a buffer is the same buffer ------------------------------------------------------
+// -- a buffer is a value -----------------------------------------------------------------------------
 //
-// A `Buf` is a reference: whatever hands one on -- an assignment, a parameter, a capture, a field,
-// another container -- hands on a second name for the one buffer, so a push through either name is
-// seen through both. Each case pushes through the second name and reads through the first.
+// Whatever hands a buffer on -- an assignment, a parameter, a capture, a field, another container --
+// hands on a copy, so a push through the copy is never seen through the original, nor the other way
+// round. Each case writes through one side and reads both.
 
-@test("an assigned buffer is the same buffer")
-assignment_shares()
+@test("an assigned buffer is a copy")
+assignment_copies()
     var a: Buf[int] = buf()
 
     a.push(1)
@@ -605,88 +606,113 @@ assignment_shares()
 
     b.push(2)
 
-    assert_eq(a.len(), 2)
-    assert_eq(b.len(), 2)
-    assert_eq(a[1], 2)
-end assignment_shares
+    assert_eq(a.view(), [1])
+    assert_eq(b.view(), [1, 2])
 
-private push_nine(b: Buf[int]) = b.push(9)
+    a[0] = 7
 
-@test("a buffer passed by value is the caller's buffer")
-parameter_shares()
+    assert_eq(a.view(), [7])
+    assert_eq(b.view(), [1, 2])
+end assignment_copies
+
+private push_nine(b: Buf[int]) -> Buf[int]
+    var mine = b
+
+    mine.push(9)
+    mine
+end push_nine
+
+@test("a buffer passed by value is the callee's copy")
+parameter_copies()
     var a: Buf[int] = buf()
 
     a.push(1)
-    push_nine(a)
 
-    assert_eq(a.len(), 2)
-    assert_eq(a[1], 9)
-end parameter_shares
+    val got = push_nine(a)
 
-@test("a buffer a closure captured is the buffer it was captured from")
-capture_shares()
+    assert_eq(a.view(), [1])
+    assert_eq(got.view(), [1, 9])
+end parameter_copies
+
+private keep_it(b: Buf[int]) -> &Fn() -> usize = () -> b.len()
+
+@test("a buffer a closure captured by value is a copy of it")
+capture_copies()
     var a: Buf[int] = buf()
 
-    val add = (x: int) -> a.push(x)
+    a.push(3)
 
-    add(3)
-    add(4)
+    val n = keep_it(a)
 
+    a.push(4)
+
+    assert_eq(n(), 1)
     assert_eq(a.len(), 2)
-    assert_eq(a[0], 3)
-end capture_shares
+end capture_copies
 
-@test("a push into a buffer read out of another one sticks")
+@test("a push into a buffer held by another one writes it where it lives")
 nested_push_sticks()
     var outer: Buf[Buf[int]] = buf()
 
     outer.push(buf())
+
+    val before = outer
+
     outer[0].push(5)
 
     assert_eq(outer[0].len(), 1)
     assert_eq(outer[0][0], 5)
+    assert_eq(before[0].len(), 0)
 end nested_push_sticks
 
 struct Bag
     items: Buf[int]
 
-@test("a struct holding a buffer, copied, holds the same buffer")
-struct_copy_shares()
-    val s1 = Bag(buf())
-    val s2 = s1
+@test("a struct holding a buffer, copied, holds a copy")
+struct_copy_copies()
+    var s1 = Bag(buf())
+
+    s1.items.push(1)
+
+    var s2 = s1
 
     s2.items.push(4)
 
-    assert_eq(s1.items.len(), 1)
-    assert_eq(s1.items[0], 4)
-end struct_copy_shares
+    assert_eq(s1.items.view(), [1])
+    assert_eq(s2.items.view(), [1, 4])
+end struct_copy_copies
 
-@test("the buffer behind a reference, read out of it, is the same buffer")
-deref_shares()
+@test("the buffer behind a reference, read out of it, is a copy")
+deref_copies()
     val r: &Buf[int] = buf()
-    val v = *r
+    var v = *r
 
     v.push(1)
+    r.push(2)
+    r.push(3)
 
-    assert_eq(r.len(), 1)
-end deref_shares
+    assert_eq(v.view(), [1])
+    assert_eq(r.view(), [2, 3])
+end deref_copies
 
-@test("growth through one name is seen through the other")
-growth_is_shared()
-    val a: Buf[int] = buf()
-    val b = a
+@test("growth through a copy leaves the original's storage alone")
+growth_is_not_shared()
+    var a: Buf[int] = buf()
 
-    for i in 0..<20
+    a.push(0)
+
+    var b = a
+
+    for i in 1..<20
         b.push(i)
 
-    assert_eq(a.len(), 20)
-    assert(a.cap() >= 20)
-    assert_eq(a[19], 19)
-    assert_eq(a.cap(), b.cap())
-end growth_is_shared
+    assert_eq(a.len(), 1)
+    assert_eq(b.len(), 20)
+    assert_eq(b[19], 19)
+end growth_is_not_shared
 
-@test("a view taken before a growth through another name still reads the old storage")
-view_survives_growth_elsewhere()
+@test("a view taken before a copy is written reads what it read")
+view_survives_copy_and_write()
     var a: Buf[int] = buf()
 
     a.extend([1, 2, 3, 4, 5, 6, 7, 8])
@@ -699,13 +725,14 @@ view_survives_growth_elsewhere()
 
     assert_eq(v.len, 8)
     assert_eq(v[0], 1)
-    assert_eq(a[0], 100)
-    assert_eq(a.len(), 9)
-end view_survives_growth_elsewhere
+    assert_eq(a[0], 1)
+    assert_eq(a.len(), 8)
+    assert_eq(b[0], 100)
+end view_survives_copy_and_write
 
-@test("a buffer bound with val is pushed into, every mutator taking the handle by value")
-val_bound_mutates()
-    val b: Buf[int] = buf()
+@test("every mutator writes a var's own buffer")
+var_bound_mutates()
+    var b: Buf[int] = buf()
 
     b.push(1)
     b.extend([2, 3, 4])
@@ -724,7 +751,7 @@ val_bound_mutates()
     b.clear()
 
     assert(b.is_empty())
-end val_bound_mutates
+end var_bound_mutates
 
 private push_through(p: *Buf[int], v: int) = p.push(v)
 
@@ -866,8 +893,8 @@ zeroed_reads_empty()
     assert_eq(walked, 0)
 end zeroed_reads_empty
 
-@test("a buffer in zeroed storage takes an assignment, and release leaves it empty again")
-zeroed_assign_then_release()
+@test("a buffer in zeroed storage takes an assignment")
+zeroed_takes_an_assignment()
     var raw = zeroed_word()
     val p: *Buf[int] = ptr_cast(&raw[0])
 
@@ -875,32 +902,36 @@ zeroed_assign_then_release()
     p.push(3)
     assert_eq(p.count, 1)
 
-    p.release()
+    *p = buf()
     assert_eq(raw[0], 0)
     assert_eq(p.len(), 0)
+end zeroed_takes_an_assignment
 
-    p.release()
-    assert_eq(p.len(), 0)
-end zeroed_assign_then_release
-
-@test("release gives back only this name's share")
-release_keeps_other_names()
-    var a: Buf[int] = buf()
-    var b = a
-
-    a.push(1)
-    b.release()
-    assert_eq(b.len(), 0)
-    assert_eq(a.len(), 1)
-
-@test(should_trap)
-zeroed_push_panics()
+@test("a buffer in zeroed storage is empty, and the first push gives it storage")
+zeroed_push_grows()
     var raw = zeroed_word()
     val p: *Buf[int] = ptr_cast(&raw[0])
 
     p.push(1)
+    p.push(2)
 
-// An index into a handle naming nothing reads through the shared empty core, whose count of zero
+    assert_eq(p.view(), [1, 2])
+
+    *p = buf()
+    assert_eq(raw[0], 0)
+
+@test("a var declared with no initializer is an empty buffer")
+uninitialized_var_is_empty()
+    var b: Buf[int]
+
+    assert_eq(b.len(), 0)
+    assert(b == buf())
+
+    b.push(4)
+
+    assert_eq(b.view(), [4])
+
+// An index into a buffer with no core reads through the shared empty core, whose count of zero
 // refuses it -- `at`, `set` and `b[i]` alike, with nothing written anywhere.
 @test(should_trap)
 zeroed_at_traps()
@@ -923,28 +954,27 @@ zeroed_index_traps()
 
     (*p)[0] = 7
 
-@test("a released buffer reads as empty, and the empty core it reads through stays all zero")
-released_index_refused_live_index_kept()
+@test("an emptied buffer reads as empty, and the empty core it reads through stays all zero")
+emptied_index_refused_live_index_kept()
     var a: Buf[int] = buf()
     var b: Buf[int] = buf()
 
     a.push(5)
     b.push(6)
-    b.release()
+    b = buf()
     a[0] = 9
-    assert_eq(a[0], 9)
     assert_eq(a[0], 9)
     assert_eq(b.len(), 0)
     assert_eq(NoCore[0] + NoCore[1] + NoCore[2] + NoCore[3], 0)
 
-@test("freezing takes the elements, in order, and leaves every name of the buffer empty")
+@test("freezing takes the elements, in order, and leaves a copy of the buffer as it was")
 freeze_takes_the_elements()
     var b: Buf[int] = buf()
-    val other = b
 
     for i in 0..<4
         b.push(i + 1)
 
+    val other = b
     val f = b.freeze()
     var seen: Buf[int] = buf()
 
@@ -955,9 +985,9 @@ freeze_takes_the_elements()
     assert_eq(f[3], 4)
     assert_eq(seen.view(), [1, 2, 3, 4])
     assert_eq(f.view(), [1, 2, 3, 4])
-    // `b` itself may not be read again ('freeze' is '@consumes'); a second name of it may, and
-    // finds it empty.
-    assert_eq(other.len(), 0)
+    // `b` itself may not be read again ('freeze' is '@consumes'); a copy taken before may, and
+    // still holds the elements.
+    assert_eq(other.view(), [1, 2, 3, 4])
 
 @test("a frozen buffer's view outlives every name of the buffer it views")
 frozen_view_outlives()
@@ -1163,31 +1193,29 @@ zeroed_drop_elements()
     p.push(Dropped(2))
     p.pop()
     assert_eq(dropped_count, before + 1)
-    p.release()
+    *p = buf()
     assert_eq(dropped_count, before + 2)
     assert_eq(raw[0], 0)
 
-@test(should_trap)
-zeroed_push_drop_panics()
+@test("a push into zeroed storage of counted elements gives it storage, and the elements go with it")
+zeroed_push_drop_grows()
     var raw = zeroed_word()
     val p: *Buf[&Dropped] = ptr_cast(&raw[0])
+    val before = dropped_count
 
     p.push(Dropped(1))
+    assert_eq(p.len(), 1)
+    *p = buf()
+    assert_eq(dropped_count, before + 1)
 
-@test(should_trap)
-zeroed_push_wide_panics()
+@test("a push of a wide element into zeroed storage gives it storage")
+zeroed_push_wide_grows()
     var raw = zeroed_word()
     val p: *Buf[(int, real, string)] = ptr_cast(&raw[0])
 
     p.push((1, 2.5, "x"))
-
-@test(should_trap)
-released_push_panics()
-    var b: Buf[int] = buf()
-
-    b.push(1)
-    b.release()
-    b.push(2)
+    assert_eq(p[0].2, "x")
+    *p = buf()
 
 struct HoldsBuf
     tag: int
@@ -1208,7 +1236,7 @@ zeroed_struct_field()
     assert_eq(h.items.pop(), Some(5))
     assert_eq(h.items.len(), 1)
 
-    h.items.release()
+    h.items = buf()
     assert_eq(raw[1], 0)
     assert_eq(h.items.len(), 0)
 
@@ -1229,19 +1257,20 @@ emptied_takes_pushes()
     assert_eq(b[0].n, 11)
     assert_eq(b.cap(), room)
 
-@test("a second name of a frozen buffer is empty and takes pushes")
-frozen_other_name_takes_pushes()
+@test("a copy of a frozen buffer keeps its elements and takes pushes")
+frozen_copy_takes_pushes()
     var b: Buf[int] = buf()
-    val other = b
 
     b.push(1)
 
+    var other = b
     val f = b.freeze()
 
-    assert(other.pop().is_none())
+    assert_eq(other.pop(), Some(1))
     other.push(2)
-    assert_eq(other.len(), 1)
+    assert_eq(other.view(), [2])
     assert_eq(f.len(), 1)
+    assert_eq(f[0], 1)
 
 private var module_buf: Buf[int] = buf()
 
@@ -1295,10 +1324,11 @@ buffer_names_are_one_type()
     assert_eq(bn_sum(a), 1)
     assert_eq(bn_sum(b), 5)
 
-    val holder = BnHolder(a)
+    var holder = BnHolder(a)
 
     holder.items.push(9)
-    assert_eq(a.len(), 2)
+    assert_eq(a.len(), 1)
+    assert_eq(holder.items.len(), 2)
     assert_eq(bn_make().len(), 1)
 
 @test("an impl for Buffer is seen through Buf, and generics take either name")

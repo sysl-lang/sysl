@@ -1567,8 +1567,34 @@ It lives in [`sysl.buf`](/library/buf/), which is where the surface is documente
 language reaches it: an array literal makes an array or a slice, and a `for` walks whatever
 implements `Iterate`.
 
-Whether a push is seen through another name for the same buffer needs no special rule; it follows
-from how the buffer is held:
+**A `Buf` is a value**, as an array is: assigning one, passing it, capturing it or storing it in a
+struct hands over a copy, and a push through the copy is never seen through the original. The copy
+costs nothing until one side writes — the two share the storage, and the first write through either
+copies it first, unless nothing else holds it (*copy-on-write*, Swift's `Array` model). A member that
+changes a buffer takes `*self`, so it is called on a `var`, and a function that grows its caller's
+buffer takes a `*Buf`:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+grow(b: *Buf[int]) = b.push(9)
+
+var a: Buf[int] = buf()
+
+a.push(1)
+
+var c = a
+
+c.push(2)
+grow(&a)
+print(a, c)
+```
+
+```output
+[1, 9] [1, 2]
+```
+
+Held by reference it is shared, as any `&T` is:
 
 ```
 var p: &Buf[int] = buf()
@@ -1582,7 +1608,8 @@ rule specific to growable arrays.
 
 **A buffer that is done growing can be frozen.** `b.freeze()` takes its elements and answers a `&sync
 Frozen[T]` — one atomic count on the whole buffer, indexed, walked and viewed as a `[]const T`, and
-never written — which every thread may read at once without a lock; `b` is left empty. An index
+never written — which every thread may read at once without a lock; a local `b` may not be read
+again until it is assigned (`@consumes`). An index
 past its length traps, as a `Buf`'s does. What it may
 hold, and why, is in [A frozen buffer crosses](/reference/memory/#a-frozen-buffer-crosses):
 
@@ -1597,11 +1624,11 @@ b.push(4)
 val f = b.freeze()
 val v = f.view()
 
-print(f[1], f.len(), v, b.len())
+print(f[1], f.len(), v)
 ```
 
 ```output
-4 2 [3, 4] 0
+4 2 [3, 4]
 ```
 
 ### Its elements are never its header

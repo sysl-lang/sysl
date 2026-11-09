@@ -570,7 +570,7 @@ points at the `2.5`, the one arm the `u8` could not reach:
 import sysl.buf.{Buf, buf_filled}
 
 val c = true
-val b: Buf[u8] = buf_filled(3, if c then 1 else 2.5)
+var b: Buf[u8] = buf_filled(3, if c then 1 else 2.5)
 ```
 
 ```error

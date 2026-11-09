@@ -908,7 +908,7 @@ struct Line
 async fill() -> int
     @align(64)
     var buf: [64]u8 = [0; 64]
-    val head = buf[0..<4]
+    var head = buf[0..<4]
     var line = Line([0; 64])
     val p = &line
 

@@ -119,14 +119,14 @@ strict_fp_body(e: *Emit, f: IrFunc) -> IrFunc
         var instrs: Buf[Inst] = buf()
 
         for i in b.instrs
-            strict_inst(e, i, instrs)
+            strict_inst(e, i, &instrs)
 
         blocks.push(IrBlock(b.label, instrs, b.terminator))
 
     IrFunc(f.sig, blocks)
 end strict_fp_body
 
-private strict_inst(e: *Emit, i: Inst, out: Buf[Inst])
+private strict_inst(e: *Emit, i: Inst, out: *Buf[Inst])
     i match
         InBin(d, op, ty, a, b) -> float_op_name(op) match
             Some(name) ->
@@ -307,7 +307,7 @@ end intrinsic_rounds
 // A call of an LLVM float intrinsic, in its strict form, where `called` is one: the constrained
 // twin of a rounding or a comparison, or the saturating conversion spelled out. Whether it was.
 private strict_intrinsic(e: *Emit, d: Option[Val], ret: LType, called: string, args: Buf[IrArg],
-                         out: Buf[Inst]) -> bool
+                         out: *Buf[Inst]) -> bool
     if !called.starts_with(LlvmPrefix) || d.is_none() then return false
 
     val sat_s = llvm_fptosi_sat_entry().base + "."
@@ -385,7 +385,7 @@ end constrained
 // stretch between the writes it was written between nor be merged with its twin, whose operand comes
 // out of a different fence. An empty `asm` is no instruction: the value stays in its register.
 private strict_op(e: *Emit, d: Val, op: string, ret: LType, types: []const LType, args: Buf[IrArg],
-                  rounds: bool, predicate: Option[string], out: Buf[Inst])
+                  rounds: bool, predicate: Option[string], out: *Buf[Inst])
     if e.target.cpu != Thumb || args.is_empty()
         out.push(constrained(e, Some(d), op, ret, types, args, rounds, predicate))
         return
@@ -405,7 +405,7 @@ private strict_op(e: *Emit, d: Val, op: string, ret: LType, types: []const LType
 end strict_op
 
 // `v` passed through a fence, as a fresh value.
-private fenced_value(e: *Emit, ty: LType, v: Val, out: Buf[Inst]) -> Val
+private fenced_value(e: *Emit, ty: LType, v: Val, out: *Buf[Inst]) -> Val
     val d = fresh_reg(e)
 
     fence_into(e, d, ty, v, out)
@@ -416,7 +416,7 @@ end fenced_value
 // for an `f32` or `f64` (on a 32-bit Arm core a single-precision one for an `f32`, a double one for
 // an `f64`), a core register otherwise, an `f16`'s bits among them -- and a vector a lane at a time,
 // since a core without a vector unit computes it a lane at a time and every lane needs its fence.
-private fence_into(e: *Emit, d: Val, ty: LType, v: Val, out: Buf[Inst])
+private fence_into(e: *Emit, d: Val, ty: LType, v: Val, out: *Buf[Inst])
     ty match
         LVec(n, elem) ->
             var acc = VPoison
@@ -462,7 +462,7 @@ private float_register(cpu: Cpu, bits: int) -> string = cpu match
 
 // `d = fptosi.sat(v)` (or `fptoui`), strictly: the conversion, which raises what it raises, and the
 // answer it gives only where the input is in range.
-private saturating(e: *Emit, d: Val, it: LType, signed: bool, arg: IrArg, out: Buf[Inst])
+private saturating(e: *Emit, d: Val, it: LType, signed: bool, arg: IrArg, out: *Buf[Inst])
     val ft = arg.ty
     val v = arg.value
     val lane_bits = int_lane_bits(it)
@@ -534,7 +534,7 @@ private saturating(e: *Emit, d: Val, it: LType, signed: bool, arg: IrArg, out: B
 end saturating
 
 // A quiet comparison, strictly.
-private quiet(e: *Emit, d: Val, p: FCmp, ft: LType, cmp: LType, a: Val, b: Val, out: Buf[Inst])
+private quiet(e: *Emit, d: Val, p: FCmp, ft: LType, cmp: LType, a: Val, b: Val, out: *Buf[Inst])
     var args: Buf[IrArg] = buf()
 
     args.push(ir_arg(ft, a))

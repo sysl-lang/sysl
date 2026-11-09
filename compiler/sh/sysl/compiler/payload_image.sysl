@@ -52,7 +52,7 @@ payload_units(l: TargetLayout, d: &EnumType, v: EnumVariant, args: Buf[TExpr]) -
     for _ in 0..<count * unit
         bytes.push(0)
 
-    if !variant_bytes(l, v, args, bytes, refs, 0) then return None
+    if !variant_bytes(l, v, args, &bytes, &refs, 0) then return None
 
     for item in refs
         if unit != l.pointer_bytes() || item.0 % unit != 0 then return None
@@ -119,8 +119,8 @@ private payload_unit(l: TargetLayout, d: &EnumType) -> usize
 
 // A variant's fields, written where a construction stores them: each stored one at its own alignment
 // after the one before it. An address goes in `refs`, by the offset it starts at.
-private variant_bytes(l: TargetLayout, v: EnumVariant, args: Buf[TExpr], out: Buf[u8],
-                      refs: Buf[(usize, PayloadUnit)], at: usize) -> bool
+private variant_bytes(l: TargetLayout, v: EnumVariant, args: Buf[TExpr], out: *Buf[u8],
+                      refs: *Buf[(usize, PayloadUnit)], at: usize) -> bool
     var off: usize = 0
 
     for i in 0..<args.len()
@@ -138,7 +138,7 @@ private variant_bytes(l: TargetLayout, v: EnumVariant, args: Buf[TExpr], out: Bu
 end variant_bytes
 
 // The bytes of one constant of type `ty`, written into `out` at `at`.
-private byte_image(l: TargetLayout, t: TExpr, ty: Type, out: Buf[u8], refs: Buf[(usize, PayloadUnit)],
+private byte_image(l: TargetLayout, t: TExpr, ty: Type, out: *Buf[u8], refs: *Buf[(usize, PayloadUnit)],
                    at: usize) -> bool = *t.kind match
     TIntLit(n, _) ->
         if l.size(ty) > 8 then return false
@@ -211,8 +211,8 @@ private byte_image(l: TargetLayout, t: TExpr, ty: Type, out: Buf[u8], refs: Buf[
 
 // The three words of a string with no owner: null, the address of the bytes `text` lays down, and
 // `len`.
-private text_bytes(l: TargetLayout, text: TExpr, ty: Type, len: long, refs: Buf[(usize, PayloadUnit)],
-                   out: Buf[u8], at: usize) -> bool
+private text_bytes(l: TargetLayout, text: TExpr, ty: Type, len: long, refs: *Buf[(usize, PayloadUnit)],
+                   out: *Buf[u8], at: usize) -> bool
     val word = l.pointer_bytes()
 
     if l.size(ty) != 3 * word then return false
@@ -223,8 +223,8 @@ end text_bytes
 
 // A plain struct's stored fields at the offsets the layout gives them. A bitfield struct packs its
 // fields into one container, and a `@byte_order` one reverses them, so neither is written here.
-private struct_bytes(l: TargetLayout, d: &StructType, args: Buf[TExpr], out: Buf[u8],
-                     refs: Buf[(usize, PayloadUnit)], at: usize) -> bool
+private struct_bytes(l: TargetLayout, d: &StructType, args: Buf[TExpr], out: *Buf[u8],
+                     refs: *Buf[(usize, PayloadUnit)], at: usize) -> bool
     if d.opaque || d.union_layout || d.big_endian.is_some() || bitfield_ranges_of(Struct(d)).is_some() ||
        !d.c_bits.is_empty() then
         return false
@@ -248,11 +248,9 @@ private element_of(t: Type) -> Type = underlying(t) match
     _ -> Unknown
 
 // `width` bytes of a word, in the target's order.
-private put_word(l: TargetLayout, out: Buf[u8], at: usize, width: usize, v: long) -> bool
-    var o = out
-
+private put_word(l: TargetLayout, out: *Buf[u8], at: usize, width: usize, v: long) -> bool
     for i in 0..<width
-        o[if l.little_endian then at + i else at + width - 1 - i] = u8((v >> (8 * i)) & 0xFF)
+        out[if l.little_endian then at + i else at + width - 1 - i] = u8((v >> (8 * i)) & 0xFF)
 
     true
 

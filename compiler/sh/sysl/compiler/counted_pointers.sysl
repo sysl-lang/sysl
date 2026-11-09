@@ -456,17 +456,19 @@ end shown_local
 // them run and every local it declared let go of, which strands what pointed into it.
 private seq_flow(w: &PtrWalk, stmts: Buf[TStmt], result: Option[TExpr], entry: PtrFlow) -> PtrVal
     var f = entry
-    val held: Buf[(Buf[TStmt], usize)] = buf()
-    val mine: Buf[string] = buf()
 
-    w.scopes.push(mine)
-    w.defers.push(held)
+    // The block's locals and `defer` bodies are kept where a jump out of it reads them, in the
+    // walk's own stacks, and written there as they are met.
+    w.scopes.push(buf())
+    w.defers.push(buf())
+
+    val top = w.scopes.len() - 1
 
     for s in stmts
         s match
-            TDefer(body, _) -> held.push((body, mine.len()))
+            TDefer(body, _) -> w.defers[top].push((body, w.scopes[top].len()))
             TVarDecl(name, _, _, _) ->
-                mine.push(name)
+                w.scopes[top].push(name)
                 f = stmt_flow(w, s, f)
             _ -> f = stmt_flow(w, s, f)
 
@@ -477,8 +479,9 @@ private seq_flow(w: &PtrWalk, stmts: Buf[TStmt], result: Option[TExpr], entry: P
         f = out.flow
     end if
 
-    w.defers.pop()
-    w.scopes.pop()
+    val held = w.defers.pop().unwrap()
+    val mine = w.scopes.pop().unwrap()
+
     PtrVal(leave(w, held, mine, f, true), out.facts, out.inner)
 end seq_flow
 
