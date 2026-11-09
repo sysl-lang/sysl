@@ -184,19 +184,20 @@ bfa_subscript_marks_both_sides()
 
     assert(!bfa_lines(at, ["load double", element_mark()]).is_empty(), at)
 
-    // `place` only reads its receiver, so the body is the one that reads it where its caller lent it,
-    // and the fields it reads there are the header all the same.
-    val place = bfa_body(out, "@sysl.buf$BufCore.place.real.owned(")
+    // `place` only reads its receiver, so the body is the one that reads it where its caller lent it
+    // (`.owned`), and the fields it reads there -- the count and the storage, which are the value's
+    // own -- are marked as a buffer's value, never as an element.
+    val place = bfa_body(out, "@sysl.buf$Buf.place.real.owned(")
 
-    assert(!bfa_lines(place, ["load i64", header_mark()]).is_empty(), place)
+    assert(!bfa_lines(place, ["load i64", handle_mark()]).is_empty(), place)
     assert(bfa_lines(place, ["load i64", element_mark()]).is_empty(), place)
 
-    val outer = bfa_body(out, "@sysl.buf$Buf.index_place.real(")
+    val outer = bfa_body(out, "@sysl.buf$Buf.index_place.real.owned(")
 
-    // The handle's `index_place` hands the core's address to the core's own `place`, which reads the
-    // header (above), so it reads none itself.
-    assert(outer.contains("call ptr @sysl.buf$BufCore.place.real.owned(ptr "), outer)
-    assert(!outer.contains("load %struct.sysl.buf$BufCore.real"), outer)
+    // `index_place` hands the address it was lent to `place`, which reads the fields (above), so it
+    // copies none of the value itself.
+    assert(outer.contains("call ptr @sysl.buf$Buf.place.real.owned(ptr "), outer)
+    assert(!outer.contains("load %struct.sysl.buf$Buf.real"), outer)
 
 private bfa_subscripts() -> string = raw"""
     module demo
@@ -249,26 +250,30 @@ bfa_subscript_marks_reach_into_the_element()
     if bfa_no_library() then return
 
     val out = bfa_ir(bfa_subscripts())
-    val field = bfa_body(out, "@demo$field(")
-    val unchecked = bfa_body(out, "@demo$unchecked(")
-    val nested = bfa_body(out, "@demo$nested(")
+    val field = bfa_body(out, "@demo$field.owned(")
+    val unchecked = bfa_body(out, "@demo$unchecked.owned(")
+    val nested = bfa_body(out, "@demo$nested.owned(")
     val grid = bfa_body(out, "@demo$grid(")
 
     assert(!bfa_lines(field, ["load %struct.demo$P, ptr", element_mark()]).is_empty(), field)
     assert(unchecked.contains("index_place_unchecked"), unchecked)
     assert(!bfa_lines(unchecked, ["load %struct.demo$P, ptr", element_mark()]).is_empty(), unchecked)
-    assert(!bfa_lines(nested, ["load %struct.sysl.buf$Buf.int, ptr", element_mark()]).is_empty(), nested)
+    // A buffer that is an element is lent to its member where it lies, so nothing of it is loaded here
+    // and nothing here says it is a handle.
+    assert(nested.contains("index_place"), nested)
+    assert(!nested.contains("load %struct.sysl.buf$Buf.int"), nested)
     assert(bfa_lines(nested, [handle_mark()]).is_empty(), nested)
     assert(grid.contains("load double"), grid)
     assert(!grid.contains("sysl.buf"), grid)
 
-@test("a program's read of a Buf through a counted reference is a read of its box")
+@test("a program's Buf behind a counted reference is lent to its member from the box, not copied out")
 bfa_counted_reference_is_box()
     if bfa_no_library() then return
 
     val body = bfa_body(bfa_ir(bfa_matrix()), "$M.at(")
 
-    assert(!bfa_lines(body, ["load %struct.sysl.buf$Buf.real, ptr", box_mark()]).is_empty(), body)
+    assert(body.contains("call ptr @sysl.buf$Buf.index_place.real.owned(ptr "), body)
+    assert(!body.contains("load %struct.sysl.buf$Buf.real"), body)
 
 private bfa_stack_machine() -> string = raw"""
     module demo
@@ -299,20 +304,19 @@ private bfa_stack_machine() -> string = raw"""
         popped_twice(&m)
     """
 
-// A write to a count is the commonest thing between two reads of an interpreter's stack, and a
-// `BufCore` holds no handle: the handle in a struct's field is read alone, under its own mark, so the
-// optimizer can keep it across that write. A field beside it stays unmarked.
-@test("a Buf in a struct's field is read alone and marked as a handle")
+// A buffer in a struct's field is four words, so its members are lent it where it lies: nothing loads
+// the buffer, or the struct around it, whole.
+@test("a Buf in a struct's field is lent to its members where it lies")
 bfa_field_is_a_marked_handle()
     if bfa_no_library() then return
 
     val body = bfa_body(bfa_ir(bfa_stack_machine()), "@demo$popped_twice(")
 
-    assert(!bfa_lines(body, ["load %struct.sysl.buf$Buf.int, ptr", handle_mark()]).is_empty(), body)
+    assert(body.contains("Buf.len.int"), body)
+    assert(!body.contains("load %struct.sysl.buf$Buf.int"), body)
     assert(!body.contains("load %struct.demo$Machine"), body)
 
-@test("at -O2 a Buf's handle in a struct's field survives a write to the count",
-      ignore: "a write's uniqueness check reads the count unmarked, so the handle is read again after it")
+@test("at -O2 a Buf's handle in a struct's field survives a write to the count")
 bfa_handle_kept_across_count_write()
     if bfa_no_library() then return
 
@@ -335,14 +339,13 @@ bfa_views_and_raw_pointers_are_unmarked()
 
     assert(first.contains("load double"), first)
     assert(!first.contains("sysl.buf"), first)
-    assert(held.contains("load %struct.sysl.buf$Buf.real"), held)
+    assert(held.contains("Buf.len.real"), held)
     assert(!held.contains("sysl.buf.header"), held)
 
 // The point of the marks: the row loop of an elimination keeps the buffer's handle, its storage
 // pointer and its count in registers, so its loops read nothing but cells -- which is also what lets
 // clang vectorize it.
-@test("at -O2 a row loop over a Buf reads only its elements",
-      ignore: "each element write checks the storage is unique, and the check is not hoisted out of the loop")
+@test("at -O2 a row loop over a Buf reads only its elements")
 bfa_row_loop_reads_only_elements()
     if bfa_no_library() then return
 
