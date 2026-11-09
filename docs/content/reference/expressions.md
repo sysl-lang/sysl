@@ -1345,6 +1345,60 @@ print(hot.fg, hot.bg, hot.pad)
 1 9 8
 ```
 
+### A path changes a field inside a field
+
+The left of each `=` may be a path of field names, at any depth: `pos.x = 3` changes the `x` of the
+copy's `pos` and leaves the rest of `pos` as it was. Paths and plain fields mix in one clause, and
+each value is read against the type of the field the path ends at.
+
+```sysl
+struct Point
+    x: int
+    y: int
+
+struct Sprite
+    pos: Point
+    name: string
+
+val s = Sprite(Point(1, 2), "ship")
+val t = s with { pos.x = 3, name = "ghost" }
+
+print(s.pos.x, s.pos.y, s.name)
+print(t.pos.x, t.pos.y, t.name)
+```
+
+```output
+1 2 ship
+3 2 ghost
+```
+
+A path goes through fields that hold a struct of their own, and nothing else. A pointer or a counted
+reference on the way is refused, because the write would go through it to an object the copy shares
+with every other holder; the change that is meant is to the field itself. A property on the way is
+refused too, since its value is not stored in the copy, and so is an index — an array's element is
+not a field, so the change is to the whole array, `items = […]`.
+
+```sysl
+struct Point
+    x: int
+
+struct Handle
+    at: *Point
+
+var p = Point(1)
+val h = Handle(&p)
+val g = h with { at.x = 3 }
+
+print(g.at.x)
+```
+
+```error
+'with' changes its own copy, and 'at' is a pointer to a 'Point'
+```
+
+Two changes may not overlap: a path named twice is refused as a field named twice is, and so is a
+field changed whole beside a path inside it (`pos = Point(0, 0), pos.x = 3`), in either order.
+
 ### It is a copy followed by assignments
 
 The rule is one desugaring. `base with { bg = 9 }` means:
@@ -1356,7 +1410,7 @@ tmp
 ```
 
 so the base is copied first, the fields are assigned to **in the order written**, and the copy is the
-value. Everything else follows from that: a struct's `invariant` is re-checked because a field
+value. A path is the same with a longer place: `base with { pos.x = 3 }` assigns `tmp.pos.x = 3`. Everything else follows from that: a struct's `invariant` is re-checked because a field
 assignment re-checks it, a field another module keeps `private` is refused because an assignment
 refuses it, a literal needs no width suffix because it is read against the field's type, and a
 [settable property](/reference/declarations/) runs its setter because `p.count = v` is a call.

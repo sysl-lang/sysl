@@ -1,0 +1,539 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{Status, capture}
+
+// A path inside a `with` clause: `q with { pos.x = 3 }` copies `q` and then assigns `tmp.pos.x = 3`
+// (`reference/expressions.md § with`). The cases come in groups: what a path reaches, the refusals
+// that keep every write inside the copy, how two changes in one clause may overlap, and the
+// neighbours a path meets -- a generic struct, a `with` inside a value, a reference-type base, an
+// array field, module storage and a constant.
+//
+// Not covered, with the reason: a struct `invariant` on an inner struct (the change is a field
+// assignment, which `wex_invariant_rechecked` already pins); a tuple step (`t.0` is not a name, so the
+// parser refuses it before anything here runs).
+
+private var wfp_library_cache: Buf[Program] = buf()
+private var wfp_library_read: bool = false
+
+private wfp_library() -> Buf[Program]
+    if wfp_library_read then return wfp_library_cache
+
+    wfp_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> wfp_library_cache = units
+
+    wfp_library_cache
+end wfp_library
+
+private wfp_ready() -> bool
+    if wfp_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end wfp_ready
+
+// What a one-file program printed where it exited 0; how it ended in front otherwise, and the
+// refusal where the build refused it.
+private wfp_ran(text: string) -> string
+    val root = make_temp_dir("sysl-wfp").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(o) -> o.status match
+            Status.Exited(code) -> if code == 0 then o.text else s"exited $code: ${o.text}"
+            Status.Signalled(sig) -> s"signalled $sig: ${o.text}"
+            _ -> s"timed out: ${o.text}"
+end wfp_ran
+
+// A refusal carries this message, anchored at this `line:column` of `main.sysl`.
+private wfp_refused(said: string, message: string, at: string) =
+    assert(said.contains(s"error: $message\n"), said)
+    assert(said.contains(s"/main.sysl:$at\n"), said)
+
+// Two structs, one inside the other, and nothing else.
+private wfp_shapes() -> string = raw"""
+    struct P
+        x: int
+        y: int
+
+    struct Q
+        pos: P
+        name: string
+
+    """
+
+// -- what a path reaches ---------------------------------------------------------------------------
+
+@test("a path changes a field inside a field, beside a top-level one, and the base is untouched")
+wfp_nested_update()
+    if !wfp_ready() then return
+
+    assert_eq(wfp_ran(wfp_shapes() + raw"""
+        val q = Q(P(1, 2), "a")
+        val r = q with { pos.x = 3, name = "b" }
+        print(q.pos.x, q.pos.y, q.name)
+        print(r.pos.x, r.pos.y, r.name)
+        """), "1 2 a\n3 2 b\n")
+
+@test("a path may be any depth")
+wfp_any_depth()
+    if !wfp_ready() then return
+
+    assert_eq(wfp_ran(wfp_shapes() + raw"""
+        struct R
+            q: Q
+            n: int
+
+        val a = R(Q(P(1, 2), "a"), 5)
+        val b = a with { q.pos.y = 9, n = 6, q.name = "z" }
+        print(b.q.pos.x, b.q.pos.y, b.q.name, b.n)
+        print(a.q.pos.y, a.q.name, a.n)
+        """), "1 9 z 6\n2 a 5\n")
+
+@test("two paths into one field each change their own part")
+wfp_sibling_paths()
+    if !wfp_ready() then return
+
+    assert_eq(wfp_ran(wfp_shapes() + raw"""
+        val q = Q(P(1, 2), "a")
+        val r = q with { pos.x = 3, pos.y = 4 }
+        print(r.pos.x, r.pos.y)
+        """), "3 4\n")
+
+// `p` is a prefix of `pq` as a string but not as a path, so the two do not overlap.
+@test("a field whose name merely begins with another's is not inside it")
+wfp_name_prefix_not_a_path_prefix()
+    if !wfp_ready() then return
+
+    assert_eq(wfp_ran(wfp_shapes() + raw"""
+        struct S
+            p: P
+            pq: P
+
+        val s = S(P(1, 2), P(3, 4))
+        val t = s with { p = P(5, 6), pq.x = 7 }
+        print(t.p.x, t.p.y, t.pq.x, t.pq.y)
+        """), "5 6 7 4\n")
+
+@test("the values are evaluated in the order written, path or not")
+wfp_order_written()
+    if !wfp_ready() then return
+
+    assert_eq(wfp_ran(wfp_shapes() + raw"""
+        f(n: int) -> int
+            print(n)
+            n
+
+        val q = Q(P(0, 0), "a")
+        val r = q with { pos.y = f(1), name = "b", pos.x = f(2) }
+        print(r.pos.x, r.pos.y, r.name)
+        """), "1\n2\n2 1 b\n")
+
+@test("a literal is read against the leaf field's type, so it needs no suffix")
+wfp_literal_takes_the_leaf_type()
+    if !wfp_ready() then return
+
+    assert_eq(wfp_ran(raw"""
+        struct C
+            v: u8
+            w: f32
+
+        struct D
+            c: C
+
+        val d = D(C(1, 1.5))
+        val e = d with { c.v = 200, c.w = 2.25 }
+        print(e.c.v, e.c.w)
+        """), "200 2.25\n")
+
+@test("a value the leaf does not take is refused in the assignment's words")
+wfp_leaf_type_refused()
+    if !wfp_ready() then return
+
+    wfp_refused(wfp_ran(wfp_shapes() + raw"""
+        val q = Q(P(1, 2), "a")
+        val r = q with { pos.x = "nine" }
+        print(r.pos.x)
+        """), "cannot assign string to field 'x' of type int", "10:18")
+
+@test("a pointer at the end of a path is a field like any other, and replacing it is a change of the copy")
+wfp_pointer_leaf_replaced()
+    if !wfp_ready() then return
+
+    assert_eq(wfp_ran(raw"""
+        struct P
+            x: int
+
+        struct H
+            at: *P
+
+        struct G
+            h: H
+
+        var p = P(1)
+        var o = P(2)
+        val g = G(H(&p))
+        val k = g with { h.at = &o }
+        print(g.h.at.x, k.h.at.x, p.x, o.x)
+        """), "1 2 1 2\n")
+
+@test("a settable property at the end of a path runs its setter on the copy")
+wfp_setter_at_the_leaf()
+    if !wfp_ready() then return
+
+    assert_eq(wfp_ran(raw"""
+        struct P
+            v: int
+
+            count -> int = self.v
+
+            set count(x)
+                self.v = x * 10
+
+        struct Q
+            pos: P
+
+        val q = Q(P(0))
+        print((q with { pos.count = 4 }).pos.v, q.pos.v)
+        """), "40 0\n")
+
+// -- every write stays inside the copy -------------------------------------------------------------
+
+@test("a path through a pointer is refused at the step, since the write would land on shared storage")
+wfp_pointer_step_refused()
+    if !wfp_ready() then return
+
+    wfp_refused(wfp_ran(raw"""
+        struct P
+            x: int
+
+        struct H
+            at: *P
+
+        var p = P(1)
+        val h = H(&p)
+        val g = h with { at.x = 3 }
+        print(p.x, g.at.x)
+        """),
+                "'with' changes its own copy, and 'at' is a pointer to a 'P' \u{2014} writing through it would " +
+                "change the 'P' every other holder can see. Change the field itself, as 'at = \u{2026}'", "9:18")
+
+@test("so is a path through a counted reference")
+wfp_reference_step_refused()
+    if !wfp_ready() then return
+
+    wfp_refused(wfp_ran(raw"""
+        struct P
+            x: int
+
+        struct H
+            at: &P
+
+        val h = H(P(1))
+        val g = h with { at.x = 3 }
+        print(h.at.x, g.at.x)
+        """),
+                "'with' changes its own copy, and 'at' is a counted reference to a 'P' \u{2014} writing through it " +
+                "would change the 'P' every other holder can see. Change the field itself, as 'at = \u{2026}'", "8:18")
+
+@test("and the refusal names the whole path up to the indirection, at its last step")
+wfp_deep_pointer_step_refused()
+    if !wfp_ready() then return
+
+    wfp_refused(wfp_ran(raw"""
+        struct P
+            x: int
+
+        struct H
+            at: *P
+
+        struct G
+            h: H
+            n: int
+
+        var p = P(1)
+        val g = G(H(&p), 0)
+        val k = g with { n = 1, h.at.x = 3 }
+        print(p.x, k.n)
+        """),
+                "'with' changes its own copy, and 'h.at' is a pointer to a 'P' \u{2014} writing through it would " +
+                "change the 'P' every other holder can see. Change the field itself, as 'h.at = \u{2026}'", "13:27")
+
+@test("a path through a property is refused, since its value is not stored in the copy")
+wfp_property_step_refused()
+    if !wfp_ready() then return
+
+    wfp_refused(wfp_ran(raw"""
+        struct P
+            x: int
+
+        struct Q
+            pos: P
+
+            twin -> P = self.pos
+
+        val q = Q(P(1))
+        val r = q with { twin.x = 3 }
+        print(r.pos.x)
+        """),
+                "'with' follows a path through fields, and 'twin' is not a field but a property, whose value " +
+                "is not stored in the copy \u{2014} change it whole, as 'twin = \u{2026}'", "10:18")
+
+// -- two changes that overlap ----------------------------------------------------------------------
+
+@test("the same path twice is refused as the same field twice is")
+wfp_same_path_twice()
+    if !wfp_ready() then return
+
+    wfp_refused(wfp_ran(wfp_shapes() + raw"""
+        val q = Q(P(1, 2), "a")
+        val r = q with { pos.x = 3, pos.x = 4 }
+        print(r.pos.x)
+        """),
+                "'pos.x' is changed twice in one 'with', so the first change is thrown away \u{2014} write the " +
+                "value it should end with, once", "10:29")
+
+@test("a field and a path under it are refused, the field first")
+wfp_field_then_path_inside_it()
+    if !wfp_ready() then return
+
+    wfp_refused(wfp_ran(wfp_shapes() + raw"""
+        val q = Q(P(1, 2), "a")
+        val r = q with { pos = P(0, 0), pos.x = 3 }
+        print(r.pos.x)
+        """),
+                "'pos.x' is part of 'pos', which this 'with' changes too \u{2014} change 'pos' once, as the " +
+                "value it should end with", "10:33")
+
+@test("and the path first")
+wfp_path_then_field_around_it()
+    if !wfp_ready() then return
+
+    wfp_refused(wfp_ran(wfp_shapes() + raw"""
+        val q = Q(P(1, 2), "a")
+        val r = q with { pos.x = 3, pos = P(0, 0) }
+        print(r.pos.x)
+        """),
+                "'pos.x' is part of 'pos', which this 'with' changes too \u{2014} change 'pos' once, as the " +
+                "value it should end with", "10:29")
+
+// -- names the struct has not got ------------------------------------------------------------------
+
+@test("an unknown name first in a path is refused at that name")
+wfp_unknown_first_step()
+    if !wfp_ready() then return
+
+    wfp_refused(wfp_ran(wfp_shapes() + raw"""
+        val q = Q(P(1, 2), "a")
+        val r = q with { poz.x = 3 }
+        print(r.pos.x)
+        """), "'Q' has no field or property 'poz'", "10:18")
+
+@test("an unknown name inside a path is refused at that name, not at the path's start")
+wfp_unknown_middle_step()
+    if !wfp_ready() then return
+
+    wfp_refused(wfp_ran(wfp_shapes() + raw"""
+        struct R
+            q: Q
+
+        val a = R(Q(P(1, 2), "a"))
+        val b = a with { q.poz.x = 3 }
+        print(b.q.pos.x)
+        """), "'Q' has no field or property 'poz'", "13:20")
+
+@test("an unknown name at the end of a path is refused at that name")
+wfp_unknown_leaf()
+    if !wfp_ready() then return
+
+    wfp_refused(wfp_ran(wfp_shapes() + raw"""
+        val q = Q(P(1, 2), "a")
+        val r = q with { pos.z = 3 }
+        print(r.pos.x)
+        """), "'P' has no field or property 'z'", "10:22")
+
+@test("a step into a field with no fields is refused as any selection on it is")
+wfp_step_into_a_scalar()
+    if !wfp_ready() then return
+
+    wfp_refused(wfp_ran(wfp_shapes() + raw"""
+        val q = Q(P(1, 2), "a")
+        val r = q with { pos.x.y = 3 }
+        print(r.pos.x)
+        """), "cannot read field 'y' of int", "10:24")
+
+// -- an index is not a step ------------------------------------------------------------------------
+
+@test("an array element is refused with the spelling that changes the whole field")
+wfp_index_refused()
+    if !wfp_ready() then return
+
+    wfp_refused(wfp_ran(raw"""
+        struct B
+            items: [3]int
+
+        val b = B([1, 2, 3])
+        val c = b with { items[0] = 9 }
+        print(c.items[0])
+        """),
+                "'with' changes a field by its name, and an index picks an element of 'items' rather than a " +
+                "field \u{2014} change the whole field, as 'items = \u{2026}'", "5:23")
+
+@test("and inside a path it names the path")
+wfp_index_in_a_path_refused()
+    if !wfp_ready() then return
+
+    wfp_refused(wfp_ran(raw"""
+        struct B
+            items: [3]int
+
+        struct A
+            box: B
+
+        val a = A(B([1, 2, 3]))
+        val c = a with { box.items[1] = 9 }
+        print(c.box.items[1])
+        """),
+                "'with' changes a field by its name, and an index picks an element of 'box.items' rather than " +
+                "a field \u{2014} change the whole field, as 'box.items = \u{2026}'", "8:27")
+
+@test("the whole array, reached by a path, is a change like any other")
+wfp_whole_array_by_path()
+    if !wfp_ready() then return
+
+    assert_eq(wfp_ran(raw"""
+        struct B
+            items: [3]int
+
+        struct A
+            box: B
+
+        val a = A(B([1, 2, 3]))
+        val c = a with { box.items = [7, 8, 9] }
+        print(c.box.items[1], a.box.items[1])
+        """), "8 2\n")
+
+// -- the neighbours --------------------------------------------------------------------------------
+
+@test("a generic struct, at two instantiations and nested in itself")
+wfp_generic_struct()
+    if !wfp_ready() then return
+
+    assert_eq(wfp_ran(wfp_shapes() + raw"""
+        struct W[T]
+            inner: T
+            n: int
+
+        val a = W(P(1, 2), 3)
+        val b = a with { inner.x = 9 }
+        val c = W(W(P(1, 2), 4), 5)
+        val d = c with { inner.inner.y = 8, inner.n = 6 }
+        print(b.inner.x, b.inner.y, b.n)
+        print(d.inner.inner.x, d.inner.inner.y, d.inner.n, d.n)
+        """), "9 2 3\n1 8 6 5\n")
+
+@test("a path through a type parameter, in a generic function, at two instantiations")
+wfp_generic_function()
+    if !wfp_ready() then return
+
+    assert_eq(wfp_ran(wfp_shapes() + raw"""
+        struct W[T]
+            inner: T
+            n: int
+
+        reset[T](w: W[W[T]]) -> W[W[T]] = w with { inner.n = 0 }
+
+        val a = reset(W(W(P(1, 2), 4), 5))
+        val b = reset(W(W("s", 4), 5))
+        print(a.inner.inner.x, a.inner.n, a.n)
+        print(b.inner.inner, b.inner.n, b.n)
+        """), "1 0 5\ns 0 5\n")
+
+@test("a 'with' inside a value, and a 'with' on a value a path made")
+wfp_nested_with()
+    if !wfp_ready() then return
+
+    assert_eq(wfp_ran(wfp_shapes() + raw"""
+        val q = Q(P(1, 2), "a")
+        val r = q with { pos = q.pos with { x = 3 } }
+        val s = q with { name = "c", pos.y = (q with { pos.y = 7 }).pos.y + 1 }
+        val t = (q with { pos.x = 5 }) with { pos.y = 6 }
+        print(r.pos.x, r.pos.y)
+        print(s.pos.y, s.name)
+        print(t.pos.x, t.pos.y, q.pos.x, q.pos.y)
+        """), "3 2\n8 c\n5 6 1 2\n")
+
+@test("a reference-type base is refused with a path as it is without one")
+wfp_drop_base_refused()
+    if !wfp_ready() then return
+
+    wfp_refused(wfp_ran(raw"""
+        struct P
+            x: int
+
+        struct Q
+            pos: P
+
+        impl Drop for Q
+            drop(self) = ()
+
+        val q = Q(P(1))
+        val r = q with { pos.x = 3 }
+        print(r.pos.x)
+        """),
+                "'with' copies a struct, and this is a counted reference to one \u{2014} writing through it would " +
+                "change the 'Q' every other holder can see. Copy what it points at first, as " +
+                "'(*base) with { \u{2026} }'", "11:11")
+
+@test("a module value built by a path is read from a function")
+wfp_module_value()
+    if !wfp_ready() then return
+
+    assert_eq(wfp_ran(wfp_shapes() + raw"""
+        val M = Q(P(1, 2), "m") with { pos.y = 5 }
+
+        show()
+            print(M.pos.x, M.pos.y, M.name)
+
+        show()
+        """), "1 5 m\n")
+
+// A `with` is not a constant expression, with a path or without one, so a constant may not use it.
+@test("a constant may not use one, path or not")
+wfp_not_in_a_constant()
+    if !wfp_ready() then return
+
+    wfp_refused(wfp_ran(wfp_shapes() + raw"""
+        const N = (Q(P(1, 2), "a") with { pos.x = 5 }).pos.x
+        print(N)
+        """), "the value of 'N' is not a constant expression", "9:52")

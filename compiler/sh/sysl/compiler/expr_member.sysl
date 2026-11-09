@@ -1246,27 +1246,95 @@ with_expr(cx: &Analyzer, span: Span, word: Span, base: Expr, fields: Buf[WithFie
     end if
 
     // Written twice, the second write is what the value would carry and the first is dead -- which
-    // no reader means, and which the desugaring would carry out in silence.
+    // no reader means, and which the desugaring would carry out in silence. A path inside a field
+    // the same clause changes whole overlaps it the same way, whichever is written first.
     for i in 0..<fields.len()
         for j in 0..<i
-            if fields[j].name == fields[i].name then
-                return cx.err(fields[i].span, s"'${fields[i].name}' is changed twice in one " +
+            val (a, b) = (fields[j].name, fields[i].name)
+
+            if a == b then
+                return cx.err(fields[i].span, s"'$b' is changed twice in one " +
                               "'with', so the first change is thrown away — write the value it " +
                               "should end with, once")
+
+            val (outer, inner) = if a.len < b.len then (a, b) else (b, a)
+
+            if inner.starts_with(outer + ".") then
+                return cx.err(fields[i].span, s"'$inner' is part of '$outer', which this 'with' " +
+                              s"changes too — change '$outer' once, as the value it should end with")
+
+    // A path is followed through fields of the copy, and only through fields that hold a struct of
+    // their own. A pointer or a counted reference on the way would carry the write out of the copy
+    // to storage other holders share, and a property's value is not storage at all.
+    if probed != Unknown
+        for f in fields
+            for k in 1..<f.steps.len()
+                val refused = with_step_refused(cx, base, f.steps, k)
+
+                if refused.is_some() then return refused.unwrap()
 
     val tmp = s"${ModuleSep}with"
     var stmts: Buf[Stmt] = buf()
 
     stmts.push(stmt(span, VarDecl(tmp, None, Some(base), File, None, None, OneCopy, None)))
 
+    // Each step is a selection of its own, positioned at its name, so a field the struct has not got
+    // is refused at the step that named it.
     for f in fields
-        val place = expr(f.span, Field(expr(f.span, Ident(tmp)), f.name, f.span))
+        var place = expr(f.span, Ident(tmp))
+
+        for s in f.steps
+            place = expr(f.steps[0].span.to(s.span), Field(place, s.name, s.span))
 
         stmts.push(stmt(f.span, ExprStmt(expr(f.span, Assign("=", place, f.value)))))
 
     stmts.push(stmt(span, ExprStmt(expr(span, Ident(tmp)))))
     type_expr(cx, expr(span, Block(stmts)), expected)
 end with_expr
+
+// Whether a `with` path may go on past its first `k` steps: what they select, read speculatively off
+// the base, has to be a field holding a struct. A selection that does not analyze is left to the
+// desugaring, which refuses it at its own step; so is one that holds something with no fields.
+private with_step_refused(cx: &Analyzer, base: Expr, steps: Buf[WithStep], k: usize) -> Option[TExpr]
+    var sel = base
+
+    for i in 0..<k
+        sel = expr(steps[0].span.to(steps[i].span), Field(sel, steps[i].name, steps[i].span))
+
+    val tried = begin_trial(cx)
+    val read = type_expr(cx, sel, None)
+
+    discard_trial(cx, tried)
+
+    val ty = texpr_type(read)
+    val at = steps[k - 1].span
+    var path = steps[0].name
+
+    for i in 1..<k
+        path = path + "." + steps[i].name
+
+    if ty == Unknown then return None
+
+    val is_field = *read.kind match
+        TField(_, _, _) -> true
+        _ -> false
+
+    repr(ty) match
+        Ref(inner, _) -> Some(through_indirection(cx, at, path, "a counted reference to", *inner))
+        Ptr(inner) -> Some(through_indirection(cx, at, path, "a pointer to", *inner))
+        _ if !is_field ->
+            Some(cx.err(at, s"'with' follows a path through fields, and '$path' is not a field " +
+                        s"but a property, whose value is not stored in the copy — change it whole, " +
+                        s"as '$path = …'"))
+        _ -> None
+end with_step_refused
+
+// The refusal for a path that would go on through a pointer or a counted reference: the write would
+// land on what it points at, which the copy shares with every other holder.
+private through_indirection(cx: &Analyzer, at: Span, path: string, what: string, inner: Type) -> TExpr =
+    cx.err(at, s"'with' changes its own copy, and '$path' is $what a '${type_show(inner)}' — writing " +
+           s"through it would change the '${type_show(inner)}' every other holder can see. Change " +
+           s"the field itself, as '$path = …'")
 
 // The refusal for a base that reaches a struct without being one. It names the copy, because the
 // copy is the whole difference between what was written and what it would have meant.

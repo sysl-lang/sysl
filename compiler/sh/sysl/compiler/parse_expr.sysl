@@ -1117,9 +1117,23 @@ private led_with(lhs: Expr, at: Span, p: *Parser) -> Expr
 
     loop
         val start = p.here()
-        val n = p.name() match
-            Some(x) -> x
-            None -> ""
+        var steps: Buf[WithStep] = buf()
+        var n = with_step(p, &steps)
+
+        // A path into a field, `pos.x = 3`, is a name after each dot. An index is not a step: the
+        // element of an array is not a field, so it is refused here and read past, and the change is
+        // left to be spelled as the whole field.
+        loop
+            if p.accept_kw(".")
+                n = n + "." + with_step(p, &steps)
+            elif p.at_kw("[")
+                p.fault(p.here(), s"'with' changes a field by its name, and an index picks an element " +
+                        s"of '$n' rather than a field \u{2014} change the whole field, as '$n = \u{2026}'")
+                p.bump()
+                parse_expr(p)
+                p.expect_kw("]")
+            else
+                break
 
         p.expect_kw("=")
 
@@ -1128,7 +1142,7 @@ private led_with(lhs: Expr, at: Span, p: *Parser) -> Expr
         // **A field's span is the whole change, `x = 2`**, as the reference's is: the assignment the
         // desugaring writes for it is positioned here, so a refusal of the write -- the field written
         // twice, a field the struct has not got, a value of the wrong type -- underlines all of it.
-        fields.push(WithField(start.to(p.just_taken()), n, v))
+        fields.push(WithField(start.to(p.just_taken()), n, steps, v))
 
         if !p.accept_kw(",") then break
         if p.at_kw("}") then break
@@ -1136,6 +1150,17 @@ private led_with(lhs: Expr, at: Span, p: *Parser) -> Expr
     p.expect_kw("}")
     expr(lhs.span.to(at), WithExpr(lhs, fields, at))
 end led_with
+
+// One name of a `with` path, recorded with where it was written.
+private with_step(p: *Parser, steps: *Buf[WithStep]) -> string
+    val at = p.here()
+    val n = p.name() match
+        Some(x) -> x
+        None -> ""
+
+    steps.push(WithStep(at, n))
+    n
+end with_step
 
 // -- match ------------------------------------------------------------------------------------------
 
