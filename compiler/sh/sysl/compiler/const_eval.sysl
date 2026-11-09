@@ -1092,17 +1092,42 @@ end out_of_steps
 // -- values -----------------------------------------------------------------------------------------
 
 // Why a value of this type is not one the evaluator holds, or nothing where it is.
-private unheld(t: Type) -> Option[string] = t match
-    Constrained(d) -> unheld(d.base)
+//
+// **A struct or an enum is asked about once.** A type reaches itself through a slice -- `struct Node` holding a
+// `[]Node`, or a `Buf[Node]`, whose storage is one -- and a walk that asked again would never end. A
+// type already on the walk answers nothing: whatever is wrong with it is reported where the walk
+// first reached it.
+private unheld(t: Type) -> Option[string]
+    var seen: Buf[string] = buf()
+
+    unheld_in(t, &seen)
+
+private unheld_in(t: Type, seen: *Buf[string]) -> Option[string] = t match
+    Constrained(d) -> unheld_in(d.base, seen)
     Integer(_, _, _) -> None
     Floating(_, _) -> None
     Fixed(_, _, _) -> None
-    Array(_, elem) -> unheld(*elem)
+    Array(_, elem) -> unheld_in(*elem, seen)
     Struct(d) ->
-        if d.opaque then Some(s"an opaque '${d.name()}' is not evaluated while compiling") else unheld_fields(d.fields)
+        if d.opaque then return Some(s"an opaque '${d.name()}' is not evaluated while compiling")
+
+        val key = type_show(t)
+
+        for k in seen.view()
+            if k == key then return None
+
+        seen.push(key)
+        unheld_fields(d.fields, seen)
     Enum(d) ->
+        val key = type_show(t)
+
+        for k in seen.view()
+            if k == key then return None
+
+        seen.push(key)
+
         for v in d.variants
-            val why = unheld_fields(v.fields)
+            val why = unheld_fields(v.fields, seen)
 
             if why.is_some() then return why
 
@@ -1113,8 +1138,8 @@ private unheld(t: Type) -> Option[string] = t match
     Never -> None
     Unknown -> None
     Str -> None
-    Slice(elem, _) -> unheld(*elem)
-    Vector(_, elem) -> unheld(*elem)
+    Slice(elem, _) -> unheld_in(*elem, seen)
+    Vector(_, elem) -> unheld_in(*elem, seen)
     // The writer a rendering hands its `display` (`ConstWriter`), and an address the linker fills
     // in (`ConstLink`): held and handed on, never read through.
     Ptr(_) -> None
@@ -1129,9 +1154,9 @@ private unheld_other(t: Type) -> Option[string] =
               "of them are")
 
 // The first field whose type the evaluation does not hold, as `unheld` says it.
-private unheld_fields(fields: Buf[(string, Type)]) -> Option[string]
+private unheld_fields(fields: Buf[(string, Type)], seen: *Buf[string]) -> Option[string]
     for f in fields
-        val why = unheld(f.1)
+        val why = unheld_in(f.1, seen)
 
         if why.is_some() then return why
 

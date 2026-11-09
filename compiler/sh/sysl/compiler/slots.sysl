@@ -231,8 +231,19 @@ end gen_slots
 // Whether the reference is the only share of what it names: one compare with null, and then the
 // strong count, at the head of the header, compared with one (`arc.unique`). The reference is read as
 // it stands -- no share is taken to ask.
+//
+// A view is asked about its owner, the first of its three words: the block its elements live in.
 private gen_is_unique(e: *Emit, r: TExpr) -> Val
-    val p = gen_expr(e, r)
+    val ty = texpr_type(r)
+    var p = gen_expr(e, r)
+
+    if underlying(ty) is Slice(_, _)
+        val owner = fresh_reg(e)
+
+        emit(e, InExtract(owner, lty(e, ty), p, index_list(0)))
+        p = owner
+    end if
+
     val got = fresh_reg(e)
     var args: Buf[IrArg] = buf()
 
@@ -296,8 +307,13 @@ private gen_slot_place(e: *Emit, xs: TExpr, index: TExpr, value: TExpr, elem: Ty
 
     if zero_sized(elem) then return
 
+    // **The slot is an element and the live count is the block's header**, and each access says so
+    // (`AccBufElement`, `AccBufHeader`): a block's header is never one of its elements, nor a field of
+    // a value, so a loop appending to a buffer keeps what it read of the value in registers across the
+    // store, and the strong count `is_unique` read stays read.
+
     if !contains_counted(elem)
-        emit(e, InStore(lty(e, elem), v, p, AccPlain, None))
+        emit(e, InStore(lty(e, elem), v, p, AccBufElement, None))
         return
 
     // **Only the first free slot is placed in line.** It is the case a container appending to its own
@@ -324,7 +340,7 @@ private gen_slot_place(e: *Emit, xs: TExpr, index: TExpr, value: TExpr, elem: Ty
     val lp = slot_header(e, elem, view.0, header_fields())
     val live = fresh_reg(e)
 
-    emit(e, InLoad(live, word_lty(e), lp, AccPlain, None))
+    emit(e, InLoad(live, word_lty(e), lp, AccBufHeader, None))
 
     val edge = slot_at(e, elem, slot_header(e, elem, view.0, buf_elems_field(e, elem)), live)
     val at_edge = fresh_reg(e)
@@ -334,12 +350,12 @@ private gen_slot_place(e: *Emit, xs: TExpr, index: TExpr, value: TExpr, elem: Ty
 
     // The first free slot: nothing is there to give back, and the prefix now covers it.
     emit_label(e, fresh_l)
-    emit(e, InStore(lty(e, elem), v, p, AccPlain, None))
+    emit(e, InStore(lty(e, elem), v, p, AccBufElement, None))
 
     val grown = fresh_reg(e)
 
     emit(e, InBin(grown, OpAdd, word_lty(e), live, VInt(from_int(1))))
-    emit(e, InStore(word_lty(e), grown, lp, AccPlain, None))
+    emit(e, InStore(word_lty(e), grown, lp, AccBufHeader, None))
     emit_term(e, InBr(done_l))
 
     emit_label(e, rest_l)
@@ -487,7 +503,7 @@ private buffer_test(e: *Emit, elem: Type, owner: Val, yes: string, no: string)
 
     val hook = fresh_reg(e)
 
-    emit(e, InLoad(hook, LPtr, slot_header(e, elem, owner, 1), AccPlain, None))
+    emit(e, InLoad(hook, LPtr, slot_header(e, elem, owner, 1), AccBufHeader, None))
 
     val mine = fresh_reg(e)
 

@@ -5,7 +5,7 @@ import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
 import sysl.process.capture
-import sysl.text.Search
+import sysl.text.{Search, cstring}
 
 // `Buffer[T]` is a copy-on-write value (`library/sysl/buf/buf.sysl`): a copy shares the storage until
 // one side writes, and the writer copies first unless its share is the only one (`is_unique`). Each
@@ -546,8 +546,8 @@ bcw_is_unique_form()
 
     val plain = bcw_err("val n = 3\n\nprint(is_unique(n))\n")
 
-    assert(plain.contains("'is_unique' asks whether a reference is the only share of what it names, " +
-                          "and int is not a reference"), plain)
+    assert(plain.contains("'is_unique' asks whether a reference or a view is the only share of what " +
+                          "it names, and int is neither"), plain)
 
     val weak_one = bcw_err("struct Thing\n    n: int\n\nval a: &Thing = Thing(1)\nval w: weak Thing = a\n\n" +
                            "print(is_unique(w))\n")
@@ -579,3 +579,335 @@ bcw_const_eval()
 
         print(TABLE.0, TABLE.1)
         """), "[0, 1, 4, 9] [0, 1, 4, 9, -1]\n")
+
+// -- the value's layout: storage and count side by side ---------------------------------------------
+//
+// A buffer is `{ slots: []T, used }` -- the storage a separately allocated block of slots, the count
+// in the value -- so what the cells below hunt is where the two can disagree: growth while the storage
+// is this buffer's alone, growth while a view or a copy holds it, a shrink that moves only one side's
+// count, and the zero value through every member. Each runs at both ends of the optimizer on the
+// counted heap (everything given back) and again under AddressSanitizer with the instrumentation
+// confirmed in the binary, which is what catches an element dropped twice or read after its storage
+// went.
+
+private extern "setenv" bcw_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" bcw_c_unsetenv(name: *u8) -> int
+
+private struct BcwRun
+    ok: bool
+    out: string
+    err: string
+    hooks: usize
+
+private bcw_run(text: string, level: string, counted: bool, flags: string) -> BcwRun
+    val root = make_temp_dir("sysl-bcw").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", "import sysl.buf.{Buffer, buffer}\n\n" + text).unwrap()
+
+    val exe = s"$root/built"
+
+    if counted then force_alloc_counting(true)
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+        val v = cstring(flags)
+
+        bcw_c_setenv(n.ptr, v.ptr, 1)
+    end if
+
+    val built = build_native_program(s"$root/main.sysl", None, None, level, Some(exe))
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+
+        bcw_c_unsetenv(n.ptr)
+
+    if counted then force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return BcwRun(false, failure_text(why), "", 0)
+        Ok(_) -> ()
+
+    val hooks = capture("nm", ["-u", exe], "", [], true) match
+        Ok(o) -> o.text.count_of("__asan_report")
+        Err(_) -> 0
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> BcwRun(false, "could not be started", "", hooks)
+        Ok(o) -> BcwRun(o.status.ok(), o.text, o.err.unwrap_or(""), hooks)
+end bcw_run
+
+// Printed exactly `expected` at -O0 and -O2 on the counted heap, giving everything back, and again
+// under AddressSanitizer.
+private bcw_prints(text: string, expected: string)
+    if !bcw_ready() then return
+
+    for level in ["0", "2"]
+        val run = bcw_run(text, level, true, "")
+
+        assert(run.ok, s"-O$level: ${run.out}${run.err}")
+        assert_eq(run.out, expected)
+        assert(alloc_count_reported(run.err) == 0, s"-O$level: ${run.err}")
+
+    val asan = bcw_run(text, "0", false, "-fsanitize=address -g")
+
+    assert(asan.hooks > 0, "the AddressSanitizer build carries no instrumentation")
+    assert(asan.ok, s"asan: ${asan.out}${asan.err}")
+    assert_eq(asan.out, expected)
+end bcw_prints
+
+// The counted element every cell below pushes: its drop says which one went, so a drop missed or made
+// twice is a line missing or repeated.
+private bcw_thing() -> string = raw"""
+    struct Thing
+        n: int
+
+    impl Drop for Thing
+        drop(self) = print("drop", self.n)
+
+    """
+
+@test("a buffer nobody else holds grows by doubling and keeps every element, each dropped once")
+bcw_unique_growth()
+    bcw_prints(bcw_thing() + raw"""
+        run()
+            var b = buffer[&Thing]()
+
+            print(b.cap())
+
+            for i in 0..<9
+                b.push(Thing(i))
+
+            print(b.len(), b.cap(), b[0].n, b[8].n)
+
+            for i in 9..<17
+                b.push(Thing(i))
+
+            print(b.len(), b.cap(), b[16].n)
+            b.truncate(2)
+            print("kept", b.len(), b.cap())
+
+        run()
+        print("done")
+        """, "0\n9 16 0 8\n17 32 16\n" + bcw_drops(2, 17) + "kept 2 32\ndrop 0\ndrop 1\ndone\n")
+
+// `drop a`, `drop a + 1`, ..., `drop b - 1`, a line each.
+private bcw_drops(a: int, b: int) -> string
+    var out = ""
+
+    for i in a..<b
+        out += s"drop $i\n"
+
+    out
+end bcw_drops
+
+@test("a buffer grown while a view of it is held leaves the view reading the storage it had")
+bcw_growth_with_live_view()
+    bcw_prints(bcw_thing() + raw"""
+        run()
+            var b = buffer[&Thing]()
+
+            for i in 0..<8
+                b.push(Thing(i))
+
+            val v = b.view()
+
+            b.push(Thing(8))
+            b[0] = Thing(10)
+            print(v.len, v[0].n, v[7].n, b.len(), b[0].n, b[8].n)
+
+        run()
+        print("done")
+        """, "8 0 7 9 10 8\ndrop 0\ndrop 10\n" + bcw_drops(1, 9) + "done\n")
+end bcw_growth_with_live_view
+
+@test("a copy grown past the shared capacity takes storage of its own, and the original is untouched")
+bcw_copy_then_grow()
+    bcw_prints(bcw_thing() + raw"""
+        run()
+            var a = buffer[&Thing]()
+
+            for i in 0..<8
+                a.push(Thing(i))
+
+            var b = a
+
+            b.push(Thing(8))
+            print(a.len(), a.cap(), b.len(), b.cap())
+            a.push(Thing(9))
+            print(a.len(), a[8].n, b[8].n)
+            a.clear()
+            print("a cleared")
+
+        run()
+        print("done")
+        """, "8 8 9 16\n9 9 8\ndrop 9\na cleared\n" + bcw_drops(0, 9) + "done\n")
+end bcw_copy_then_grow
+
+@test("shrinking a shared buffer moves only its own count; a push on either side then writes its own storage")
+bcw_shrink_shared_then_push()
+    bcw_prints(bcw_thing() + raw"""
+        run()
+            var a = buffer[&Thing]()
+
+            for i in 0..<4
+                a.push(Thing(i))
+
+            var b = a
+
+            print(b.pop().unwrap().n)
+            b.truncate(2)
+            print("shrunk", a.len(), b.len())
+            a.push(Thing(4))
+            b.push(Thing(5))
+            print(a.len(), a[3].n, a[4].n, b.len(), b[1].n, b[2].n)
+
+        run()
+        print("done")
+        """, "3\nshrunk 4 2\n5 3 4 3 1 5\n" +
+             "drop 5\ndrop 0\ndrop 1\ndrop 2\ndrop 3\ndrop 4\ndone\n")
+end bcw_shrink_shared_then_push
+
+@test("a shrunk buffer left the storage's only holder takes the given-up slots back, dropping what they held")
+bcw_shrink_shared_then_unique_push()
+    bcw_prints(bcw_thing() + raw"""
+        run()
+            var b = buffer[&Thing]()
+
+            for i in 0..<4
+                b.push(Thing(i))
+
+            if true
+                val a = b
+
+                b.truncate(1)
+                print("a sees", a.len())
+
+            print("a gone", b.len())
+            b.push(Thing(7))
+            print("pushed", b.len(), b[1].n)
+            b.truncate(0)
+            print("emptied")
+
+        run()
+        print("done")
+        """, "a sees 4\na gone 1\ndrop 1\npushed 2 7\ndrop 0\ndrop 7\ndrop 2\ndrop 3\nemptied\ndone\n")
+end bcw_shrink_shared_then_unique_push
+
+@test("a copied buffer of counted elements dropped on both sides drops each element once")
+bcw_copied_counted_dropped_both_sides()
+    bcw_prints(bcw_thing() + raw"""
+        hold(b: Buffer[&Thing]) -> Buffer[&Thing]
+            var c = b
+
+            c.pop()
+            c
+
+        run()
+            var a = buffer[&Thing]()
+
+            a.push(Thing(1))
+            a.push(Thing(2))
+
+            val c = hold(a)
+            var d = a
+
+            d[0] = Thing(3)
+            print(a.len(), c.len(), d[0].n)
+
+        run()
+        print("done")
+        """, "2 1 3\ndrop 3\ndrop 1\ndrop 2\ndone\n")
+end bcw_copied_counted_dropped_both_sides
+
+@test("the zero buffer answers every member as the empty one, and its first write gives it storage")
+bcw_empty_every_member()
+    bcw_prints(raw"""
+        run()
+            var e: Buffer[int]
+
+            print(e.len(), e.cap(), e.is_empty(), e.get(0), e.view().len, e.elems.len, e.count)
+            print(e.pop(), e == buffer(), e, e.copy().len())
+            e.truncate(0)
+            e.clear()
+            e.extend([])
+            e.reserve(0)
+            print(e.cap(), e.view_mut().len, e.spare().len)
+            e.set_len(0)
+
+            val gone = e.into_view()
+            var z: Buffer[int]
+
+            print(gone.len, z.freeze().len())
+
+            var f: Buffer[int]
+
+            f.insert(0, 5)
+            print(f, f.remove(0), f.len())
+
+            var g: Buffer[int]
+
+            g.reserve(3)
+            print(g.cap() >= 3, g.len())
+
+        run()
+        """, "0 0 true None 0 0 0\nNone true [] 0\n0 0 0\n0 0\n[5] 5 0\ntrue 0\n")
+end bcw_empty_every_member
+
+@test("a buffer is four words: its storage's three and its count")
+bcw_four_words()
+    if !bcw_ready() then return
+
+    assert_eq(bcw_ran("print(sizeof(Buffer[u8]), sizeof(Buffer[string]), sizeof(Buffer[Buffer[int]]))\n"),
+              "32 32 32\n")
+end bcw_four_words
+
+// A buffer holds its storage as a `[]T`, so a type holding a buffer of itself reaches itself through a
+// slice -- with no box between -- and both walks that judge whether a value can be held while
+// compiling (`const_check.sysl`'s `const_type_refusal`, `const_eval.sysl`'s `unheld`) recursed
+// without end on it. The cells: a struct through a `Buffer` and through a bare slice, an enum through
+// a slice, each built by a `const` function into a module value.
+@test("a type that holds a buffer or a slice of itself is evaluated while compiling")
+bcw_self_reaching_type_const()
+    if !bcw_ready() then return
+
+    assert_eq(bcw_ran(raw"""
+        struct Node
+            n: int
+            kids: Buffer[Node]
+
+        struct Bare
+            n: int
+            kids: []Bare
+
+        enum Tree
+            Leaf(n: int)
+            Branch(kids: []Tree)
+
+        const make(n: int) -> Node
+            var x = Node(n, buffer())
+
+            x.kids.push(Node(n + 1, buffer()))
+            x
+
+        const bare(n: int) -> Bare
+            val x = Bare(n, [])
+
+            x
+
+        const tree() -> Tree = Branch([Leaf(1), Branch([])])
+
+        val root = make(3)
+        val b = bare(2)
+        val t = tree()
+
+        print(root.n, root.kids.len(), root.kids[0].n, b.n, b.kids.len, t is Branch(_))
+        """), "3 1 4 2 0 true\n")
+end bcw_self_reaching_type_const
