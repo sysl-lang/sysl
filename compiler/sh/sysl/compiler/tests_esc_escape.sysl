@@ -1223,3 +1223,255 @@ esc_extern_repoint_neighbours()
     assert_eq(esc_promoted(esc_repoint("")), 0)
     assert_eq(esc_promoted(esc_repoint("var n = 1\n    zap_int(&n)")), 0)
 end esc_extern_repoint_neighbours
+
+// -- a view reached through the address of a local that holds it -------------------------------------
+
+// A local struct holding a view of a local array, whose address is handed to a callee that stores
+// what it reads through that address in module storage. `clobber` reuses the dead frame, so a view
+// left pointing into it reads 99 where the promoted array still reads 7.
+private const esc_addr_head: string = raw"""
+    struct Sink
+        q: []int
+
+    struct H
+        p: []int
+
+    var sink: Sink
+
+    clobber() -> int
+        var junk: [64]int
+        for i in 0..<64 do junk[i] = 99
+        junk[3]
+
+    """
+
+private esc_addr(rest: string) -> string = esc_addr_head + rest + raw"""
+
+    main()
+        fill()
+        clobber()
+        print(sink.q[1])
+    """
+
+// The array moved, and the program reads it after the frame that declared it is gone.
+private esc_addr_moves(rest: string)
+    if xvr_no_library() then return
+
+    val src = esc_addr(rest)
+
+    assert_eq(esc_promoted(src), 1)
+    esc_prints(src, "7\n")
+end esc_addr_moves
+
+@test("a view a local struct holds moves its array when the struct's address goes to a callee that keeps it")
+esc_addr_struct_kept_through_its_address() =
+    esc_addr_moves(raw"""
+        put(h: *H)
+            sink.q = h.p
+
+        fill()
+            var arr: [4]int
+            arr[1] = 7
+            var h = H(arr[..])
+            put(&h)
+        """)
+
+@test("and through a struct that holds that address, two '&'s away")
+esc_addr_two_levels() =
+    esc_addr_moves(raw"""
+        struct W
+            s: *H
+
+        put(w: *W)
+            sink.q = w.s.p
+
+        fill()
+            var arr: [4]int
+            arr[1] = 7
+            var h = H(arr[..])
+            var w = W(&h)
+            put(&w)
+        """)
+
+@test("and with the view one field deeper in the struct")
+esc_addr_nested_field() =
+    esc_addr_moves(raw"""
+        struct In
+            p: []int
+
+        struct N
+            inner: In
+
+        put(n: *N)
+            sink.q = n.inner.p
+
+        fill()
+            var arr: [4]int
+            arr[1] = 7
+            var n = N(In(arr[..]))
+            put(&n)
+        """)
+
+@test("and through a '*H' local bound to the address")
+esc_addr_pointer_local() =
+    esc_addr_moves(raw"""
+        put(h: *H)
+            sink.q = h.p
+
+        fill()
+            var arr: [4]int
+            arr[1] = 7
+            var h = H(arr[..])
+            val ph = &h
+            put(ph)
+        """)
+
+@test("and through the address of that pointer, a '**H'")
+esc_addr_pointer_to_pointer() =
+    esc_addr_moves(raw"""
+        put(pp: **H)
+            val h = *pp
+            sink.q = h.p
+
+        fill()
+            var arr: [4]int
+            arr[1] = 7
+            var h = H(arr[..])
+            var ph = &h
+            put(&ph)
+        """)
+
+@test("and through a '(*self)' method's receiver")
+esc_addr_star_self_method() =
+    esc_addr_moves(raw"""
+        struct M
+            p: []int
+
+            put(*self)
+                sink.q = self.p
+
+        fill()
+            var arr: [4]int
+            arr[1] = 7
+            var m = M(arr[..])
+            m.put()
+        """)
+
+@test("and where the callee passes the address on to the function that stores it")
+esc_addr_stored_by_a_callee_of_the_callee() =
+    esc_addr_moves(raw"""
+        store(h: *H)
+            sink.q = h.p
+
+        put(h: *H) = store(h)
+
+        fill()
+            var arr: [4]int
+            arr[1] = 7
+            var h = H(arr[..])
+            put(&h)
+        """)
+
+@test("and where what is kept is a closure that captured the view")
+esc_addr_kept_in_a_closure()
+    if xvr_no_library() then return
+
+    val src = raw"""
+        import sysl.buf.{Buf, buf}
+
+        struct H
+            p: []int
+
+        var keep: Buf[&Fn() -> int] = buf()
+
+        put(h: *H)
+            val v = h.p
+            keep.push(() -> v[1])
+
+        fill()
+            var arr: [4]int
+            arr[1] = 7
+            var h = H(arr[..])
+            put(&h)
+
+        clobber() -> int
+            var junk: [64]int
+            for i in 0..<64 do junk[i] = 99
+            junk[3]
+
+        main()
+            fill()
+            clobber()
+            print(keep[0]())
+        """
+
+    esc_notes(src) match
+        None -> return
+        Some(notes) ->
+            assert_eq(notes.len(), 1)
+            assert(notes[0].contains("'arr' is promoted to the heap"), notes[0])
+
+    esc_prints(src, "7\n")
+end esc_addr_kept_in_a_closure
+
+// What stays: a callee that only reads through the address, or copies the view into a local of its
+// own, lets nothing out.
+@test("a view whose struct's address goes to a callee that only reads through it stays in the frame")
+esc_addr_read_only_stays()
+    if xvr_no_library() then return
+
+    val src = raw"""
+        struct H
+            p: []int
+
+        look(h: *H) -> int
+            val v = h.p
+            v[1]
+
+        fill() -> int
+            var arr: [4]int
+            arr[1] = 7
+            var h = H(arr[..])
+            val ph = &h
+            look(&h) + look(ph)
+
+        main()
+            print(fill())
+        """
+
+    assert_eq(esc_promoted(src), 0)
+    esc_prints(src, "14\n")
+end esc_addr_read_only_stays
+
+// Handing the address answers exactly as handing the struct does, for a callee that stores the view
+// through its other parameter into a second local of the caller.
+@test("an address and the struct it addresses get the same answer from a callee storing into a sibling")
+esc_addr_matches_by_value()
+    if xvr_no_library() then return
+
+    val by_addr = esc_sibling("*H", "&h")
+    val by_value = esc_sibling("H", "h")
+
+    assert_eq(esc_promoted(by_addr), esc_promoted(by_value))
+    esc_prints(by_addr, "7\n")
+    esc_prints(by_value, "7\n")
+end esc_addr_matches_by_value
+
+private esc_sibling(param: string, handed: string) -> string = s"""
+    struct H
+        p: []int
+
+    put(h: $param, o: *H)
+        o.p = h.p
+
+    fill() -> int
+        var arr: [4]int
+        arr[1] = 7
+        var h = H(arr[..])
+        var o = H(arr[0..<0])
+        put($handed, &o)
+        o.p[1]
+
+    main()
+        print(fill())
+    """
