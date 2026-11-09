@@ -360,11 +360,11 @@ removing_past_the_count_traps()
 
 // -- the count never passes the storage -----------------------------------------------------------
 //
-// The clause every member of the core is told on entry, and so the one every write has to keep. A
+// The clause every member of a buffer is told on entry, and so the one every write has to keep. A
 // program cannot write either field -- a `Buf` hands out `elems` read-only and the count not at all --
 // so the writes that could break it are this module's, and each is refused where it is made rather
-// than left for the next read to find. They are made here on a core directly, which only this module
-// can name.
+// than left for the next read to find. They are made here on the fields directly, which only this
+// module can name.
 
 // An empty buffer owns nothing, so two copies of one are two buffers from the start: the first push
 // into either gives that one storage of its own and leaves the other empty.
@@ -931,8 +931,8 @@ uninitialized_var_is_empty()
 
     assert_eq(b.view(), [4])
 
-// An index into a buffer with no core reads through the shared empty core, whose count of zero
-// refuses it -- `at`, `set` and `b[i]` alike, with nothing written anywhere.
+// An index into the zero buffer meets its count of zero, which refuses it -- `at`, `set` and `b[i]`
+// alike, with nothing written anywhere.
 @test(should_trap)
 zeroed_at_traps()
     var raw = zeroed_word()
@@ -954,7 +954,7 @@ zeroed_index_traps()
 
     (*p)[0] = 7
 
-@test("an emptied buffer reads as empty, and the empty core it reads through stays all zero")
+@test("an emptied buffer reads as empty, and a write to another one reaches only that one")
 emptied_index_refused_live_index_kept()
     var a: Buf[int] = buf()
     var b: Buf[int] = buf()
@@ -965,7 +965,7 @@ emptied_index_refused_live_index_kept()
     a[0] = 9
     assert_eq(a[0], 9)
     assert_eq(b.len(), 0)
-    assert_eq(NoCore[0] + NoCore[1] + NoCore[2] + NoCore[3], 0)
+    assert_eq(b.cap(), 0)
 
 @test("freezing takes the elements, in order, and leaves a copy of the buffer as it was")
 freeze_takes_the_elements()
@@ -1129,13 +1129,13 @@ zeroed_spare_is_empty()
     p.set_len(0)
     assert_eq(p.len(), 0)
 
-// -- a handle naming nothing, through the members that read the shared empty core -------------------
+// -- the zero buffer, through every member that reads it ---------------------------------------------
 //
-// `len`, `cap`, `view`, `pop`, `truncate`, `clear` and `push` read through the shared empty core when
-// the handle names nothing, rather than branching around it. None of them may write it, and `push`
-// has to be refused on its growth path, at every kind of element.
+// `len`, `cap`, `view`, `pop`, `truncate`, `clear` and `push` read the zero buffer's fields as they
+// read any buffer's. None but `push` may write them, and `push` gives it storage on its growth path, at
+// every kind of element.
 
-@test("truncate and clear of a handle naming nothing write nothing anywhere")
+@test("truncate and clear of the zero buffer write nothing anywhere")
 zeroed_truncate_and_clear_write_nothing()
     var raw = zeroed_word()
     val p: *Buf[int] = ptr_cast(&raw[0])
@@ -1145,8 +1145,7 @@ zeroed_truncate_and_clear_write_nothing()
     p.clear()
     assert_eq(p.len(), 0)
     assert(p.pop().is_none())
-    assert_eq(raw[0], 0)
-    assert_eq(NoCore[0] + NoCore[1] + NoCore[2] + NoCore[3], 0)
+    assert_eq(raw[0] + raw[1] + raw[2] + raw[3], 0)
 
 @test("a handle naming nothing, of counted elements, reads as empty")
 zeroed_counted_reads_empty()
@@ -1158,7 +1157,7 @@ zeroed_counted_reads_empty()
     assert_eq(p.len(), 0)
     assert_eq(p.cap(), 0)
     assert_eq(p.view().len, 0)
-    assert_eq(NoCore[0] + NoCore[1] + NoCore[2] + NoCore[3], 0)
+    assert_eq(raw[0] + raw[1] + raw[2] + raw[3], 0)
 
 @test("a push of a counted element into zeroed storage gives it storage")
 zeroed_push_counted_grows()
@@ -1225,7 +1224,7 @@ struct HoldsBuf
 
 @test("a Buf field of a zeroed struct is empty until assigned, then takes pushes and pops")
 zeroed_struct_field()
-    var raw: [2]usize = [0, 0]
+    var raw: [5]usize = [0, 0, 0, 0, 0]
     val h: *HoldsBuf = ptr_cast(&raw[0])
 
     assert_eq(h.items.len(), 0)
@@ -1239,7 +1238,7 @@ zeroed_struct_field()
     assert_eq(h.items.len(), 1)
 
     h.items = buf()
-    assert_eq(raw[1], 0)
+    assert_eq(raw[1] + raw[2] + raw[3] + raw[4], 0)
     assert_eq(h.items.len(), 0)
 
 @test("a buffer emptied by clear or truncate keeps its storage and takes pushes again")
