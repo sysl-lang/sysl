@@ -944,11 +944,38 @@ end variants_carry_view
 // Which frame-owned storage a value may view. Answering with the *roots* rather than with a yes/no
 // is the whole of what promotion needs: the escape sites already knew that something got out, and
 // what they could not say was which array to move.
+//
+// **An address of a local that holds a view reaches that view**, so `&h` views what `h` does: a
+// callee handed `&h` that lets out what it reads through it (`sink.q = h.p`) lets the array out as
+// surely as one handed `h` by value. The same holds of a pointer local bound to such an address, of
+// a struct that carries one in a field, and of a pointer to either. An address of storage that holds
+// no view -- `&buf`, `&h.p[0]` -- is the `*T` tier and views nothing here.
 private views(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, e: TExpr) -> EView
-    if !carries_view(texpr_type(e)) then return no_view()
+    val t = texpr_type(e)
 
-    views_value(p, keeps, w, e)
+    if carries_view(t) then return views_value(p, keeps, w, e)
+    if !points_at_view(t, 0) then return no_view()
+
+    *e.kind match
+        TAddrOf(place, _) -> views(p, keeps, w, place)
+        _ -> views_value(p, keeps, w, e)
 end views
+
+// Whether a value of this type can reach a view through a raw pointer: a pointer to something that
+// carries one or reaches one, or a struct with such a pointer among its fields. The depth bounds the
+// walk through a type that points at itself.
+private points_at_view(t: Type, depth: int) -> bool
+    if depth > 4 then return false
+
+    t match
+        Ptr(inner) -> carries_view(*inner) || points_at_view(*inner, depth + 1)
+        Struct(d) ->
+            for item in d.fields
+                if points_at_view(item.1, depth + 1) then return true
+
+            false
+        _ -> false
+end points_at_view
 
 private views_value(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, e: TExpr) -> EView = *e.kind match
     // A **whole** temporary array, viewed. It has no declaration to promote, so what it is instead
