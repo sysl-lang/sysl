@@ -70,13 +70,13 @@ private ixv_tally() -> string = raw"""
     trait Bump
         bump(*self)
     struct Tally
-        b: Buf[int]
+        b: &Buf[int]
     impl Bump for Tally
         bump(self) = self.b.push(1)
     """
 
-@test("a val Buf is written with a subscript, and the write is seen through a second name")
-ixv_a_val_buf_is_written()
+@test("a Buf written with a subscript is written alone, and a copy taken before keeps its element")
+ixv_a_buf_write_reaches_no_copy()
     if !ixv_can_run() then return
 
     assert_eq(ixv_ran(raw"""
@@ -84,14 +84,14 @@ ixv_a_val_buf_is_written()
         b.push(1)
         val c = b
         b[0] = 5
-        print(c[0])
-        """), "5\n")
+        print(c[0], b[0])
+        """), "1 5\n")
 
-@test("a Buf parameter taken by value is written with a subscript, and the caller sees it")
-ixv_a_by_value_parameter_is_written()
+@test("a Buf parameter taken by value is refused a subscript write, the change being lost")
+ixv_a_by_value_parameter_is_refused()
     if !ixv_can_run() then return
 
-    assert_eq(ixv_ran(raw"""
+    ixv_refused(raw"""
         f(b: Buf[int])
             b[0] = 9
 
@@ -99,7 +99,8 @@ ixv_a_by_value_parameter_is_written()
         b.push(1)
         f(b)
         print(b[0])
-        """), "9\n")
+        """, "this call to 'index_place_mut' changes 'b', a copy of what the caller passed, and nothing " +
+            "reads 'b' afterwards, so the change is lost")
 
 @test("a val Deque is written with a subscript, and the write is seen through a second name")
 ixv_a_val_deque_is_written()
@@ -181,7 +182,7 @@ ixv_a_generic_body_reaches_the_self_implementation()
             val u = t
             u.bump()
 
-        val b: Buf[int] = buf()
+        val b: &Buf[int] = buf()
         once(Tally(b))
         print(b.len())
         """), "1\n")
@@ -224,7 +225,7 @@ ixv_through_a_counted_object()
     if !ixv_can_run() then return
 
     assert_eq(ixv_ran(ixv_tally() + raw"""
-        val b: Buf[int] = buf()
+        val b: &Buf[int] = buf()
         val o: &Bump = Tally(b)
         o.bump()
         print(b.len())

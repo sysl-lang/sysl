@@ -436,15 +436,17 @@ this element belongs to a '[]const int', which views elements it may not write, 
 
 ### `view_mut` writes, `into_view` hands over
 
-**`view_mut()`** is the same storage as `view()`, writable: a write through it is seen through the
-buffer and through every other name for it. It is tied to the buffer it was taken from — a function
+**`view_mut()`** is the same storage as `view()`, writable, and made this buffer's own first, as any
+write makes it: a write through it is seen through the buffer and through no copy of it. It is tied to the buffer it was taken from — a function
 may not return it, as it may not return a view of any local it was taken from — and it is taken
 through `*self`, so a `val` buffer is refused.
 
 **`into_view()`** is for the function that builds a local buffer and returns what it holds. It gives
 the buffer up and answers an owned slice; the slice keeps the storage alive, so returning it is
-accepted, and each element is let go of once, when the slice goes. A local it is called on may not be
-read again until it is assigned a new value.
+accepted, and each element is let go of once, when the slice goes. It takes `*self`, so it is called on
+a `var`: storage a copy still shares is copied first, so the slice never writes through to the copy,
+and a buffer that is not a local — a field, one reached through a pointer — is left empty. A local
+it is called on may not be read again until it is assigned a new value.
 
 ```sysl
 import sysl.buf.{Buf, buf}

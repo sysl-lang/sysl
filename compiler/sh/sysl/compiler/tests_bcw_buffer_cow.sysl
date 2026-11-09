@@ -217,7 +217,8 @@ bcw_zero_is_empty_attribute()
         print(f())
         """)
 
-    assert(misplaced.contains("zero_is_empty"), misplaced)
+    assert(misplaced.contains("'@zero_is_empty' says the all-zero bytes are a struct's empty value, so " +
+                              "it can only mark a struct — and this declares none"), misplaced)
 
 // -- a buffer inside a struct, a closure, another buffer ------------------------------------------------
 
@@ -402,12 +403,30 @@ bcw_view_mut_unshares()
         set_first(xs: []int, v: int) = xs[0] = v
         """), "[5, 2] [1, 2]\n")
 
-@test("into_view of a shared buffer hands over storage of its own")
+@test("into_view of a shared buffer hands over storage of its own, and empties a buffer that is not a local")
 bcw_into_view_shared()
     if !bcw_ready() then return
 
     assert_eq(bcw_ran(raw"""
-        take(b: Buffer[int]) -> []int = b.into_view()
+        struct Bag
+            items: Buffer[int]
+
+        var bag = Bag(buffer())
+
+        bag.items.extend([3, 4])
+
+        val kept = bag.items
+        val got = bag.items.into_view()
+
+        got[0] = 0
+        print(got, bag.items.len(), kept)
+        """), "[0, 4] 0 [3, 4]\n")
+
+    assert_eq(bcw_ran(raw"""
+        take(b: Buffer[int]) -> []int
+            var mine = b
+
+            mine.into_view()
 
         var a = buffer[int]()
 
@@ -447,11 +466,19 @@ bcw_val_refused()
     val pushed = bcw_err("val a = buffer[int]()\n\na.push(1)\n")
 
     assert(pushed.contains("'push' takes '*self', so it writes through what it is called on, and a " +
-                           "'val' is written once — write 'var' if it is meant to change"), pushed)
+                           "'val' is written once — write 'var a' if it is meant to change"), pushed)
 
     val stored = bcw_err("val a = buffer[int]()\n\na[0] = 1\n")
 
     assert(stored.contains("a 'val' is written once"), stored)
+
+@test("into_view of a buffer parameter taken by value is refused, as any write to it is")
+bcw_param_into_view_refused()
+    if !bcw_ready() then return
+
+    val out = bcw_err("take(b: Buffer[int]) -> []int = b.into_view()\n\nprint(take(buffer()))\n")
+
+    assert(out.contains("this call to 'into_view' changes 'b', a copy of what the caller passed"), out)
 
 @test("a push into a buffer parameter taken by value is refused, naming '*Buffer'")
 bcw_param_push_refused()

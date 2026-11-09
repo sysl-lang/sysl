@@ -194,8 +194,8 @@ private leaves_handle(cx: &KeepsCx, name: string, k: usize, depth: int) -> bool
 
     val u: &PointerUses = PointerUses(g.params[k].0, buf(), false)
 
-    walk_block_stmts(g.body, TWalk(false, e -> pointer_use(cx, u, e, depth), w -> pointer_write(u, w.place),
-                                   s -> pointer_stmt(u, s)))
+    walk_block_stmts(g.body, TWalk(false, e -> pointer_use(cx, g, u, e, depth),
+                                   w -> pointer_write(cx, g, u, w.place, w.value, depth), s -> pointer_stmt(u, s)))
 
     cx.made.put(key, !u.other)
     !u.other
@@ -207,13 +207,17 @@ private pointer_stmt(u: &PointerUses, s: TStmt)
         _ -> ()
 end pointer_stmt
 
-private pointer_write(u: &PointerUses, place: TExpr) = if mentions(place, u.name) then u.other = true
+// A write through the parameter leaves the buffer in place where what it writes is made there: a
+// buffer giving its storage a core of its own before a write (`Buf.own`), or emptying it (`release`),
+// shares that core with nothing, so the slots are still the ones the pointed-at local holds.
+private pointer_write(cx: &KeepsCx, g: TFunc, u: &PointerUses, place: TExpr, v: TExpr, depth: int)
+    if mentions(place, u.name) && !made_value(cx, g, v, depth + 1) then u.other = true
 
 // Every use of the parameter is one of the three the rule allows; any other -- a copy, a store of
 // it, an object or a pointer call handed it -- is not followed, and refuses.
-private pointer_use(cx: &KeepsCx, u: &PointerUses, e: TExpr, depth: int)
+private pointer_use(cx: &KeepsCx, g: TFunc, u: &PointerUses, e: TExpr, depth: int)
     *e.kind match
-        TStore(place, _, _, _) -> pointer_write(u, place)
+        TStore(place, v, _, _) -> pointer_write(cx, g, u, place, v, depth)
         TCall(name, args, _, _) ->
             for k in 0..<args.len()
                 if is_param_load(args[k], u.name) && leaves_handle(cx, name, k, depth + 1)
@@ -256,6 +260,7 @@ private made_value(cx: &KeepsCx, f: TFunc, e: TExpr, depth: int) -> bool
         TBufLit(_, _) -> true
         TBufFill(_, _, _) -> true
         TArrayLit(_, _) -> true
+        TZero(_) -> true
         TSlots(op, _, _, _) -> op == "slot_storage"
         TCall(name, _, _, _) -> made_answer(cx, name, depth + 1)
         TLoad(n, _) -> made_local(cx, f, n, depth + 1)

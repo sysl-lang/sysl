@@ -76,15 +76,16 @@ dcn_no_alloc_names_buf()
 
         import sysl.buf.Buf
 
-        fill(b: Buf[int])
+        fill(b: *Buf[int])
             b.push(1)
-        """, dcn_through("sysl.buf.Buf.push.int", "sysl.buf.Buf.grow.int"), "6:7")
+        """, dcn_through("sysl.buf.Buf.push.int", "sysl.buf.Buf.own.int"), "6:7")
 end dcn_no_alloc_names_buf
 
-// The members that read through the shared empty core when the handle names nothing make no storage
-// of their own, and the report `push` makes on that core goes out in pieces, so an allocator-free
-// module may call every one of them.
-@test("a '@no_alloc' module reads, pops, truncates and clears a Buf")
+// The readers go through the shared empty core when there is no core, and `clear` gives a shared
+// core back rather than copying it, so neither makes storage and an allocator-free module may call
+// them. A member that gives elements up one by one -- `pop`, `truncate` -- writes the storage, and a
+// write first makes shared storage this buffer's own, which allocates.
+@test("a '@no_alloc' module reads and clears a Buf, and is refused a pop, naming the copy a write makes")
 dcn_no_alloc_reads_buf()
     if !dcn_ready() then return
 
@@ -93,13 +94,21 @@ dcn_no_alloc_reads_buf()
 
         import sysl.buf.Buf
 
-        drain(b: Buf[int]) -> int
-            var total = int(b.len()) + int(b.cap()) + int(b.view().len) + b.pop().unwrap_or(0)
+        drain(b: *Buf[int]) -> int
+            val total = int(b.len()) + int(b.cap()) + int(b.view().len) + b.get(0).unwrap_or(0)
 
-            b.truncate(1)
             b.clear()
             total
         """), "")
+
+    dcn_refused(raw"""
+        @no_alloc
+
+        import sysl.buf.Buf
+
+        drain(b: *Buf[int]) -> int
+            b.pop().unwrap_or(0)
+        """, dcn_through("sysl.buf.Buf.pop.int", "sysl.buf.Buf.own.int"), "6:7")
 end dcn_no_alloc_reads_buf
 
 @test("a '@no_alloc' put into a Map names the Map, not its core or its unassigned report")
@@ -129,9 +138,9 @@ dcn_no_alloc_names_a_field_buf()
         struct Holder
             items: Buf[string]
 
-        add(h: Holder)
+        add(h: *Holder)
             h.items.push("x")
-        """, dcn_through("sysl.buf.Buf.push.string", "sysl.buf.Buf.grow.string"), "9:13")
+        """, dcn_through("sysl.buf.Buf.push.string", "sysl.buf.Buf.own.string"), "9:13")
 end dcn_no_alloc_names_a_field_buf
 
 @test("a '@no_alloc' push onto a Deque names the Deque")
