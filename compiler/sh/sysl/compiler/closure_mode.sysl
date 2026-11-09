@@ -352,10 +352,19 @@ apply_closure_modes(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal])
     end for
 
     for i in 0..<a.tables.struct_insts.len()
-        turn_stale(a, seen, a.tables.struct_insts.at(i))
+        turn_stale(a, turned, seen, a.tables.struct_insts.at(i))
 
     for i in 0..<a.tables.enum_insts.len()
-        turn_stale(a, seen, a.tables.enum_insts.at(i))
+        turn_stale(a, turned, seen, a.tables.enum_insts.at(i))
+
+    // A record reached only from the tree -- a parameter's type, an expression's -- is turned too:
+    // the fields of each record are its own, so turning one turns no other.
+    for f in funcs
+        for p in f.params
+            turn_stale(a, turned, seen, p.1)
+
+        turn_stale(a, turned, seen, f.ret_ty)
+        walk_texpr(walk_body_of(f), expr_walk(true, x -> turn_stale(a, turned, seen, texpr_type(x))))
 
     for f in funcs
         turn_body(a, turned, f)
@@ -382,6 +391,31 @@ private turn_fields(a: &Analysis, st: &StructType) -> &Turned
     t
 end turn_fields
 
+// A second record's by-reference fields become addresses, each one that is not one already: a record
+// whose fields were turned with the first one's (they were one list) is left as it is.
+private turn_stale_fields(a: &Analysis, turned: Map[string, &Turned], st: &StructType)
+    val t = turned.get(st.base)
+
+    if t.is_none() then
+        turn_fields(a, st)
+        return
+    end if
+
+    val refs = a.closure_refs.get(st.base).unwrap()
+    var k: usize = 0
+
+    for i in 0..<st.fields.len()
+        if i >= refs.len() || !refs[i] then continue
+
+        val field = st.fields[i]
+
+        if k < t.unwrap().types.len() && field.1 != Ptr(t.unwrap().types[k]) then
+            st.fields[i] = (field.0, Ptr(field.1))
+
+        k += 1
+    end for
+end turn_stale_fields
+
 private record_address(st: &StructType) -> usize
     val p: *StructType = &*st
 
@@ -393,7 +427,7 @@ end record_address
 // `Option[$closure0]` for `Some(() -> …)` handed to a call -- outlives it and still holds that record,
 // which a layout measures. Every such record reached from an instantiation is turned too, so the
 // payload holds the addresses the struct now does.
-private turn_stale(a: &Analysis, seen: Set[usize], t: Type)
+private turn_stale(a: &Analysis, turned: Map[string, &Turned], seen: Set[usize], t: Type)
     t match
         Struct(st) ->
             val at = record_address(st)
@@ -402,11 +436,11 @@ private turn_stale(a: &Analysis, seen: Set[usize], t: Type)
 
             seen.add(at)
 
-            if a.by_ref_closures.has(st.base) then turn_fields(a, st)
+            if a.by_ref_closures.has(st.base) then turn_stale_fields(a, turned, st)
 
             for item in st.fields
-                turn_stale(a, seen, item.1)
-        Results(st) -> turn_stale(a, seen, Struct(st))
+                turn_stale(a, turned, seen, item.1)
+        Results(st) -> turn_stale(a, turned, seen, Struct(st))
         Enum(e) ->
             val p: *EnumType = &*e
             val at = usize(p)
@@ -417,9 +451,9 @@ private turn_stale(a: &Analysis, seen: Set[usize], t: Type)
 
             for v in e.variants
                 for item in v.fields
-                    turn_stale(a, seen, item.1)
-        Array(_, elem) -> turn_stale(a, seen, *elem)
-        Vector(_, elem) -> turn_stale(a, seen, *elem)
+                    turn_stale(a, turned, seen, item.1)
+        Array(_, elem) -> turn_stale(a, turned, seen, *elem)
+        Vector(_, elem) -> turn_stale(a, turned, seen, *elem)
         _ -> ()
 end turn_stale
 
