@@ -458,16 +458,13 @@ depends_on_module(a: &Analysis, scope: Scope, to: string, written: Span, importe
 
     for i in 0..<a.tables.module_deps.len()
         if a.tables.module_deps[i].0 == from
-            val reached = a.tables.module_deps[i].1
-
-            if holds_string(reached, to)
+            // The list is read and grown where it lives: a copy of it held across the push would
+            // make the push copy the list.
+            if holds_string(a.tables.module_deps[i].1, to)
                 if !span.is_empty() then position_edge(a, from, to, scope, span)
                 return
 
-            var grown = reached
-
-            grown.push(to)
-            a.tables.module_deps[i] = (from, grown)
+            a.tables.module_deps[i].1.push(to)
             a.tables.module_edges.push(ModuleEdge(from, to, scope, span))
             return
 
@@ -701,7 +698,11 @@ enums_declaring(a: &Analysis, name: string) -> Buf[string]
     val types = a.tables.types
 
     if a.tables.variant_index_for != types.changes + 1
-        var index: Map[string, Buf[string]] = map()
+        // Each variant name's list is grown where it lives, in `lists`, and filed in the map once at
+        // the end: a list read out of the map is a copy, and a push into it would copy the list.
+        var slot_of: Map[string, usize] = map()
+        var names: Buf[string] = buf()
+        var lists: Buf[Buf[string]] = buf()
 
         for i in 0..<types.len()
             val key = types.key_at(i)
@@ -709,20 +710,22 @@ enums_declaring(a: &Analysis, name: string) -> Buf[string]
             types.at(i).kind match
                 EnumOf(e) ->
                     for item in e.variants
-                        index.get(item.name) match
-                            Some(keys) ->
-                                if keys[keys.len() - 1] != key
-                                    var more = keys
-
-                                    more.push(key)
-                                    index.put(item.name, more)
-                                end if
+                        slot_of.get(item.name) match
+                            Some(s) ->
+                                if lists[s][lists[s].len() - 1] != key then lists[s].push(key)
                             None ->
                                 var keys: Buf[string] = buf()
 
                                 keys.push(key)
-                                index.put(item.name, keys)
+                                slot_of.put(item.name, lists.len())
+                                names.push(item.name)
+                                lists.push(keys)
                 _ -> ()
+
+        var index: Map[string, Buf[string]] = map()
+
+        for s in 0..<names.len()
+            index.put(names[s], lists[s])
 
         a.tables.variant_index = index
         a.tables.variant_index_for = types.changes + 1

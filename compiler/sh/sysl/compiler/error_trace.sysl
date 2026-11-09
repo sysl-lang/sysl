@@ -157,22 +157,23 @@ trace_closure_owners(e: *Emit, p: TProgram)
     if !traces_on then return
 
     // The bodies of each file that has a closure in it, so a closure is held against its own file's.
-    var by_file: Map[string, Buf[TFunc]] = map()
+    // Each file's list is grown where it lives, in `bodies`: a list read out of a map is a copy, and a
+    // push into it would copy the list.
+    var slot_of: Map[string, usize] = map()
+    var bodies: Buf[Buf[TFunc]] = buf()
 
     for f in p.funcs
-        if is_closure_symbol(f.name) && f.src.is_some() then by_file.put(f.src.unwrap().name, buf())
+        if is_closure_symbol(f.name) && f.src.is_some() && !slot_of.has(f.src.unwrap().name)
+            slot_of.put(f.src.unwrap().name, bodies.len())
+            bodies.push(buf())
 
-    if by_file.is_empty() then return
+    if bodies.is_empty() then return
 
     for f in p.funcs
         if f.src.is_none() then continue
 
-        by_file.get(f.src.unwrap().name) match
-            Some(bodies) ->
-                var more = bodies
-
-                more.push(f)
-                by_file.put(f.src.unwrap().name, more)
+        slot_of.get(f.src.unwrap().name) match
+            Some(s) -> bodies[s].push(f)
             None -> ()
 
     for f in p.funcs
@@ -182,7 +183,7 @@ trace_closure_owners(e: *Emit, p: TProgram)
 
         // **Strictly** around it: two closures with one span are one closure lowered twice -- a
         // generic body's, once per instantiation -- and neither is the other's owner.
-        for g in by_file.get(f.src.unwrap().name).unwrap()
+        for g in bodies[slot_of.get(f.src.unwrap().name).unwrap()]
             if g.span.start > f.span.start || g.span.end < f.span.end then continue
             if g.span.start == f.span.start && g.span.end == f.span.end then continue
 

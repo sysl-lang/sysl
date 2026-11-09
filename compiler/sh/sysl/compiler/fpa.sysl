@@ -1540,6 +1540,8 @@ private enter_types(fx: &Fpa, t: Type) -> u32
         if n != ""
             var list: Buf[(Type, string)] = fx.named.get(n).unwrap_or(buf())
 
+            // Out of the map before the push, so the list is this name's alone and grows in place.
+            fx.named.remove(n)
             list.push((cur, key))
             fx.named.put(n, list)
         end if
@@ -2288,16 +2290,13 @@ private apply_inner(fb: &FBody, e: TExpr, sum: &FpaSum, args: Buf[TExpr], argv: 
                         reached.put(pid, v)
                         v
 
-                // A buffer copied is a second name for the one buffer, so this adds to the group's.
-                var into = groups[g].2
-
                 // A parameter's own value lands only where the place's type can hold it (M44).
                 val held = if !has_param_value(got) || argv.len() != args.len() || w.0 >= args.len() then got
                 else held_by_place(fb, got, place_reach(fb.fx, e, w.0, texpr_type(args[w.0]), w.3))
 
-                var has = group_has[g]
-
-                join_new(&into, &has, held)
+                // Joined into the group's own list, where it lives: a copy of it would be a list of
+                // its own, and what it gained would never reach the group.
+                join_new(&groups[g].2, &group_has[g], held)
             end if
 
         for p in sum.kept[k]
@@ -2345,11 +2344,8 @@ private apply_inner(fb: &FBody, e: TExpr, sum: &FpaSum, args: Buf[TExpr], argv: 
 
                 val at = place_of.get(a.key).unwrap()
 
-                // A buffer copied is a second name for the one buffer, so this adds to the place's.
-                var into = held[at]
-                var has = held_has[at]
-
-                join_new(&into, &has, g.2)
+                // Joined into the place's own list, where it lives, for the reason the groups are.
+                join_new(&held[at], &held_has[at], g.2)
             end for
         end for
 
