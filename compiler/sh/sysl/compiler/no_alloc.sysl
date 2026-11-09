@@ -693,10 +693,9 @@ private declared_as(a: &Analysis, name: string) -> string =
     if name == BlockOnKey then "block_on" else a.tables.members.func_origin.get(name).unwrap_or(name)
 
 // **A member of a handle's core is named as the handle's.** A container is a struct whose one field
-// is a counted reference to the struct that does the work -- `Buf[T]` over `BufCore[T]`, `Map[K, V]`
-// over `MapCore[K, V]` -- and the core is the library's own business: a program writes `Buf[int]` and
-// can neither name nor reach a `BufCore`. So `BufCore[int]`'s `grow` is reported as `Buf[int]`'s,
-// the type the reader wrote, which is also how the refusal read before the containers had a core.
+// is a counted reference to the struct that does the work -- `Map[K, V]` over `MapCore[K, V]` -- and
+// the core is the library's own business: a program writes `Map[string, int]` and can neither name
+// nor reach a `MapCore`. So `MapCore`'s `rehash` is reported as `Map`'s, the type the reader wrote.
 private handle_side(a: &Analysis, who: string) -> string
     val insts = a.tables.struct_insts
 
@@ -713,12 +712,14 @@ private handle_side(a: &Analysis, who: string) -> string
 end handle_side
 
 // The core a handle holds, with the handle's own base: a struct of one field, that field a counted
-// reference to another struct -- which is not itself a handle. A struct wrapping a `Buf` (`ByteSink`)
-// has that shape too, `Buf` being a reference, but `Buf` is what a program writes and never a core.
+// reference to another struct -- which is not itself a handle. A struct holding a boxed `Buf`
+// (`ByteSink`) has that shape too, but `Buf` is what a program writes and never a core.
 private held_core(t: Type) -> Option[(string, string)] = t match
     Struct(d) if d.fields.len() == 1 -> d.fields[0].1 match
         Ref(inner, _) -> *inner match
-            Struct(c) -> if held_core(*inner).is_some() then None else Some((d.base, c.base))
+            Struct(c) ->
+                if held_core(*inner).is_some() || c.base == module_qualify("sysl.buf", "Buf") then None
+                else Some((d.base, c.base))
             _ -> None
         _ -> None
     _ -> None
