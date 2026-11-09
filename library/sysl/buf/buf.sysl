@@ -18,7 +18,7 @@ import sysl.raw.ptr_cast
  * it needs: `push` allocates a slice twice the size and copies, so the amortized cost is the one a
  * growable sequence has anywhere, and none of it is underneath the language. A program never names
  * it: a `Buf` holds one in a box, and every copy of that `Buf` shares the box until one of them
- * writes, when the writer is given a box of its own (`Buf.writing`).
+ * writes, when the writer is given a box of its own (`Buf.unique`).
  *
  * **The spare capacity holds nothing.** The storage comes from `slot_storage`, whose slots start out
  * empty: a buffer box releases only its *live prefix*, and `slot_place` is what fills the first slot
@@ -387,7 +387,10 @@ struct Buf[T]
      */
     const get_unchecked(self, i: usize) -> T = self.reading().get_unchecked(i)
 
-    const set_unchecked(*self, i: usize, v: T) = self.writing().set_unchecked(i, v)
+    const set_unchecked(*self, i: usize, v: T)
+        self.unique()
+
+        self.core.set_unchecked(i, v)
 
     /** The core every read works through: this buffer's own, or the empty one a null core reads as --
      * whose count of zero refuses every index with the same report a buffer's own would and answers
@@ -400,56 +403,66 @@ struct Buf[T]
      */
     private reading(self) -> *BufCore[T] = if is_null(self.core) then ptr_cast(&NoCore[0]) else &*self.core
 
-    /** The core every write works through, made this buffer's own first: where the share is the only
-     * one the answer is the core as it stands, and otherwise -- a copy shares it, or there is none yet
-     * -- `own` gives this buffer storage of its own. The test is two compares, and the copy behind it
+    /** The core made this buffer's own before a write: where the share is the only one it is left as
+     * it stands, and otherwise -- a copy shares it, or there is none yet -- `own` gives this buffer
+     * storage of its own. The test is two compares, and the copy behind it
      * is out of line, so a push into a buffer nobody else holds is still a store.
      */
     @inline
-    private writing(*self) -> *BufCore[T]
-        if !is_unique(self.core) then self.own()
+    private[buf] unique(*self) = if !is_unique(self.core) then self.own()
 
-        &*self.core
-    end writing
-
-    /** This buffer's elements copied into storage of its own, with the capacity it had, and the
-     * shared core let go of -- or, for a buffer with no core, an empty one made.
+    /** A core of this buffer's own: an empty one made for a buffer with none, or -- where a copy
+     * shares it -- the elements copied into storage of its own, with the capacity it had, and the
+     * shared core let go of.
      */
     @noinline
     @cold
     private own(*self)
-        val from = self.reading()
-        var mine: &BufCore[T] = BufCore(slot_storage(from.elems.len), 0)
+        if is_null(self.core)
+            self.core = BufCore([], 0)
+            return
+        end if
 
-        mine.extend(from.view())
-        self.core = mine
+        val from = self.reading()
+        var storage: []T = slot_storage(from.elems.len)
+
+        for i in 0..<from.count
+            slot_place(storage, i, from.elems[i])
+
+        self.core = BufCore(storage, from.count)
     end own
 
     // Every member that can move the storage or give an element up is `@relocates`, so a live `ref`
     // to an element is refused the call.
     @inline
     @relocates
-    const push(*self, v: T) = self.writing().push(v)
+    const push(*self, v: T)
+        self.unique()
+
+        self.core.push(v)
 
     @relocates
     const extend(*self, xs: []const T)
         if xs.len == 0 then return
 
-        self.writing().extend(xs)
+        self.unique()
+        self.core.extend(xs)
     end extend
 
     @relocates
     const pop(*self) -> Option[T]
         if self.len() == 0 then return None
 
-        self.writing().pop()
+        self.unique()
+        self.core.pop()
     end pop
 
     @relocates
     const truncate(*self, n: usize)
         if n >= self.len() then return
 
-        self.writing().truncate(n)
+        self.unique()
+        self.core.truncate(n)
     end truncate
 
     /** Every element given up. A buffer whose storage is shared lets go of its share rather than
@@ -464,7 +477,10 @@ struct Buf[T]
 
     @relocates
     @track_caller
-    const insert(*self, i: usize, v: T) = self.writing().insert(i, v)
+    const insert(*self, i: usize, v: T)
+        self.unique()
+
+        self.core.insert(i, v)
 
     /** Room for at least `more` elements past `len()`, so that many pushes -- or that many slots
      * written through `spare()` -- need no growth. `cap()` afterwards is at least `len() + more`;
@@ -473,14 +489,18 @@ struct Buf[T]
      * where nothing had to grow.
      */
     @relocates
-    const reserve(*self, more: usize) = self.writing().reserve(more)
+    const reserve(*self, more: usize)
+        self.unique()
+
+        self.core.reserve(more)
 
     @relocates
     @track_caller
     const remove(*self, i: usize) -> T
         if self.len() == 0 then index_past(i, 0)
 
-        self.writing().remove(i)
+        self.unique()
+        self.core.remove(i)
     end remove
 
     /** A second buffer holding the same elements in storage of its own, sized to them. Assigning
@@ -515,7 +535,10 @@ struct Buf[T]
      * buffer leaves the view on the storage it had.
      */
     @views(self)
-    view_mut(*self) -> []T = self.writing().view()
+    view_mut(*self) -> []T
+        self.unique()
+
+        self.core.view()
 
     /** The buffer given up and its elements handed over as an owned slice: for a function that
      * builds a local buffer and returns what it holds. The slice keeps the storage alive after the
@@ -529,7 +552,9 @@ struct Buf[T]
     @relocates
     @consumes
     const into_view(*self) -> []T
-        val mine = self.writing().view()
+        self.unique()
+
+        val mine = self.core.view()
 
         release(self.core)
         mine
@@ -584,7 +609,7 @@ private[sysl] enum Unassigned
 /** An empty core at every element type: storage `[]` and a count of zero are all-zero words, four of
  * them -- the view's three and the count -- whatever `T` is. What a buffer with no core reads through.
  * A `var` only because an address is taken of it: it is never written, since a count of zero refuses
- * every index before anything is, and every write goes through `Buf.writing`, which never answers it.
+ * every index before anything is, and every write goes through `Buf.unique`, which never answers it.
  */
 private[buf] var NoCore: [4]usize = [0, 0, 0, 0]
 
@@ -620,7 +645,10 @@ impl[T: AnyBits] Buf[T]
      * view of the storage, made this buffer's own first, so it is valid only until the buffer next
      * grows.
      */
-    spare(*self) -> []T = self.writing().spare()
+    spare(*self) -> []T
+        self.unique()
+
+        self.core.spare()
 
     /** The length set to `n`, taking the slots between the old length and `n` as the elements they
      * already hold. **Nothing is written** -- not a fill, not a zero: a slot holds what was last
@@ -634,7 +662,8 @@ impl[T: AnyBits] Buf[T]
 
         if is_null(self.core) then past_room(n, 0)
 
-        self.writing().set_len(n)
+        self.unique()
+        self.core.set_len(n)
     end set_len
 
 /** A buffer compares as the sequence it holds, which is `view()` -- the elements it actually has,
@@ -670,7 +699,10 @@ impl[T] Index[usize, T] for Buf[T]
 
 impl[T] IndexSet[usize, T] for Buf[T]
     @track_caller
-    const index_set(*self, i: usize, v: T) = self.writing().set(i, v)
+    const index_set(*self, i: usize, v: T)
+        self.unique()
+
+        self.core.set(i, v)
 
 /** `b[i]` is the element where it lives: the address, checked against the count, so `b[i].f` reads
  * one field without copying the element and `ref e = b[i]` names it. Good until a `@relocates`
@@ -687,7 +719,10 @@ impl[T] IndexPlace[usize, T] for Buf[T]
     // call: the storage made this buffer's own first, so a write never reaches a copy. Inside an
     // `@unchecked` block a write comes here too, and keeps its test.
     @track_caller
-    override index_place_mut(*self, i: usize) -> *T = self.writing().place(i)
+    override index_place_mut(*self, i: usize) -> *T
+        self.unique()
+
+        self.core.place(i)
 
     // `b[i][..]`: the element as a view of one, whose owner is the storage's.
     @track_caller
@@ -758,7 +793,10 @@ struct ByteSink
     /** What has been written, as a slice of the sink's own storage: a write through it is seen by
      * the next `text()`, which is how a caller sizes the sink with zeros and then fills it in place.
      */
-    text(self) -> []u8 = self.bytes.writing().view()
+    text(self) -> []u8
+        self.bytes.unique()
+        self.bytes.core.view()
+    end text
 
 byte_sink() -> ByteSink = ByteSink(buf())
 
