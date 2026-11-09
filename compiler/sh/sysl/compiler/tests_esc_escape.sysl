@@ -1191,6 +1191,20 @@ private const esc_repoint_head: string = raw"""
     extern zap_int(pp: *int)
 
     wrap(pp: **[]int) = zap(pp)
+    wrap_twice(pp: **[]int) = wrap(pp)
+    wrap_int(pp: *int) = zap_int(pp)
+    same(pp: **[]int) -> **[]int = pp
+
+    var spare: []int = []
+
+    redirect(pp: **[]int)
+        *pp = &spare
+
+    struct R
+        tag: int
+
+    impl R
+        repoint(self, pp: **[]int) = zap(pp)
 
     """
 
@@ -1223,6 +1237,26 @@ esc_extern_repoint_neighbours()
     assert_eq(esc_promoted(esc_repoint("")), 0)
     assert_eq(esc_promoted(esc_repoint("var n = 1\n    zap_int(&n)")), 0)
 end esc_extern_repoint_neighbours
+
+// A body that hands its pointer parameter to C, or points what it points at module storage itself,
+// leaves its caller's place pointing anywhere: the summary carries that to every caller, at any depth.
+@test("a pointer handed to C through a helper may be repointed, so a view stored through it is kept")
+esc_extern_repoints_through_a_helper()
+    if xvr_no_library() then return
+
+    assert_eq(esc_promoted(esc_repoint("wrap(&p)")), 1)
+    assert_eq(esc_promoted(esc_repoint("wrap_twice(&p)")), 1)
+    assert_eq(esc_promoted(esc_repoint("R(1).repoint(&p)")), 1)
+    assert_eq(esc_promoted(esc_repoint("redirect(&p)")), 1)
+end esc_extern_repoints_through_a_helper
+
+@test("a helper whose C call's pointee holds no address, or that calls no C, leaves the pointer alone")
+esc_extern_helper_neighbours()
+    if xvr_no_library() then return
+
+    assert_eq(esc_promoted(esc_repoint("var n = 1\n    wrap_int(&n)")), 0)
+    assert_eq(esc_promoted(esc_repoint("same(&p)")), 0)
+end esc_extern_helper_neighbours
 
 // -- a view reached through the address of a local that holds it -------------------------------------
 

@@ -79,6 +79,11 @@ struct FpaSum
     seen: Map[u64, bool]
     size: int
     lent: Buf[Buf[Buf[FStep]]]
+
+    // **Where module storage's address is written through a parameter** -- `(dest, at)`: the caller's
+    // place where `dest`'s value along `at` points afterwards points at storage that outlives every
+    // frame, as after `redirect(pp) = *pp = &slot`, or after handing `pp` to C.
+    foreign: Buf[(usize, Buf[FStep])]
 end FpaSum
 
 // The analysis of a whole program, with the tables that name steps, paths, roots and pairs of them by
@@ -244,7 +249,7 @@ private empty_sum(n: usize) -> &FpaSum
         answers.push(buf())
         lent.push(buf())
 
-    FpaSum(kept, answers, buf(), buf(), map(), 0, lent)
+    FpaSum(kept, answers, buf(), buf(), map(), 0, lent, buf())
 end empty_sum
 
 // The functions a body calls by name, as indices, once each.
@@ -489,7 +494,9 @@ private written_through(fb: &FBody, sum: &FpaSum, name: string, dest: usize, at:
 
         i += 1
 
-        if a.root.starts_with("p")
+        if a.root == "g"
+            if !deep then sum_foreign(fb.fx, sum, dest, at)
+        else if a.root.starts_with("p")
             val src = param_of(a.root)
 
             if !deep
@@ -574,6 +581,7 @@ private val SEEN_ANSWER: u64 = 2 << 60
 private val SEEN_WRITE: u64 = 3 << 60
 private val SEEN_FRESH: u64 = 4 << 60
 private val SEEN_LENT: u64 = 5 << 60
+private val SEEN_FOREIGN: u64 = 6 << 60
 
 private sum_kept(fx: &Fpa, sum: &FpaSum, i: usize, path: Buf[FStep])
     if covered(fx, &sum.seen, SEEN_KEPT | (u64(i) << 32), without_tilde(path)) then return
@@ -621,6 +629,16 @@ private sum_write(fx: &Fpa, sum: &FpaSum, dest: usize, src: usize, path: Buf[FSt
     sum.writes.push((dest, src, path, at))
     sum.size += 1
 end sum_write
+
+private sum_foreign(fx: &Fpa, sum: &FpaSum, dest: usize, at: Buf[FStep])
+    val k = SEEN_FOREIGN | (u64(dest) << 32) | u64(path_id(fx, at))
+
+    if sum.seen.has(k) then return
+
+    sum.seen.put(k, true)
+    sum.foreign.push((dest, at))
+    sum.size += 1
+end sum_foreign
 
 private sum_fresh(fx: &Fpa, sum: &FpaSum, off: Buf[FStep])
     val k = SEEN_FRESH | u64(path_id(fx, off))
@@ -2321,6 +2339,14 @@ private apply_inner(fb: &FBody, e: TExpr, sum: &FpaSum, args: Buf[TExpr], argv: 
 
     for i in 0..<places.len()
         store_at(fb, single(places[i]), distinct(held[i]))
+
+    // A place the callee pointed at module storage, itself or through a call of its own.
+    for w in sum.foreign
+        if w.0 < argv.len()
+            var memo: Map[u32, Buf[FAtom]] = map()
+
+            store_at(fb, written_at(fb, argv[w.0], w.1, &memo), single(atom(fb, buf(), "g", buf())))
+        end if
 
     for o in sum.fresh
         val k = inside_kind(o)
