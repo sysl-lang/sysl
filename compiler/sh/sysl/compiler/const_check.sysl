@@ -480,12 +480,21 @@ private both_point(a: Type, b: Type) -> bool = pointee(a).is_some() && pointee(b
 // enums made of them, all by value; a raw pointer and a function pointer are admitted too, held as
 // the addresses the linker fills in and never read or called through. A type parameter stands for
 // whatever fills it, and is judged there.
-const_type_refusal(t: Type) -> Option[string] = t match
+//
+// **A struct or an enum is judged once.** A type reaches itself through a slice -- `struct Node`
+// holding a `[]Node` -- and a walk that judged it again would never end; one already on the walk
+// answers nothing, its fields being judged where it was reached.
+const_type_refusal(t: Type) -> Option[string]
+    var seen: Buf[string] = buf()
+
+    refusal_in(t, &seen)
+
+private refusal_in(t: Type, seen: *Buf[string]) -> Option[string] = t match
     // An `f128` is held as its encoding and computed exactly (`quad_arith.sysl`), and the two
     // sixteen-bit formats as the `real`s their values are, rounded to the format at every operation.
     Floating(_, _) -> None
-    Slice(elem, _) -> const_type_refusal(*elem)
-    Vector(_, elem) -> const_type_refusal(*elem)
+    Slice(elem, _) -> refusal_in(*elem, seen)
+    Vector(_, elem) -> refusal_in(*elem, seen)
     VaList -> Some(not_yet("C variadic arguments are"))
     // A reference is to a box the evaluation makes and holds; a weak one answers whether its object
     // is still alive, which counts kept only when the program runs decide.
@@ -493,19 +502,21 @@ const_type_refusal(t: Type) -> Option[string] = t match
     Weak(_) -> Some("a weak reference answers whether its object is still alive, which is decided by " +
                     "counts kept only when the program runs")
     Trait(_, _, _) -> Some(trait_object())
-    Volatile(inner) -> const_type_refusal(*inner)
-    Array(_, elem) -> const_type_refusal(*elem)
-    Constrained(decl) -> const_type_refusal(decl.base)
+    Volatile(inner) -> refusal_in(*inner, seen)
+    Array(_, elem) -> refusal_in(*elem, seen)
+    Constrained(decl) -> refusal_in(decl.base, seen)
     Struct(decl) ->
-        if decl.opaque then None
-        else fields_refusal(decl.fields)
-    Results(parts) -> fields_refusal(parts.fields)
-    Pack(elems) -> types_refusal(elems)
+        if decl.opaque || on_walk(t, seen) then None
+        else fields_refusal(decl.fields, seen)
+    Results(parts) -> fields_refusal(parts.fields, seen)
+    Pack(elems) -> types_refusal(elems, seen)
     Enum(decl) ->
+        if on_walk(t, seen) then return None
+
         var out: Option[string] = None
 
         for item in decl.variants
-            if out.is_none() then out = fields_refusal(item.fields)
+            if out.is_none() then out = fields_refusal(item.fields, seen)
 
         out
     _ -> None
@@ -513,18 +524,29 @@ const_type_refusal(t: Type) -> Option[string] = t match
 private trait_object() -> string =
     "which function a call through a trait object reaches is decided when the program runs"
 
-private fields_refusal(fields: Buf[(string, Type)]) -> Option[string]
+// Whether a struct or enum is already on the walk, putting it there where it is not.
+private on_walk(t: Type, seen: *Buf[string]) -> bool
+    val key = type_show(t)
+
+    for k in seen.view()
+        if k == key then return true
+
+    seen.push(key)
+    false
+end on_walk
+
+private fields_refusal(fields: Buf[(string, Type)], seen: *Buf[string]) -> Option[string]
     for field in fields
-        val why = const_type_refusal(field.1)
+        val why = refusal_in(field.1, seen)
 
         if why.is_some() then return why
 
     None
 end fields_refusal
 
-private types_refusal(ts: Buf[Type]) -> Option[string]
+private types_refusal(ts: Buf[Type], seen: *Buf[string]) -> Option[string]
     for item in ts
-        val why = const_type_refusal(item)
+        val why = refusal_in(item, seen)
 
         if why.is_some() then return why
 
