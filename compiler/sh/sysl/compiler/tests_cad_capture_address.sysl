@@ -1,0 +1,237 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A written `&x` of a capture, inside a closure that holds `x` by value, is the address of the
+// closure's own copy (`reference/memory.md`). Handed to a call, it is a write of that copy exactly as
+// a `*self` method's receiver is, so the callee's writes never reach the variable. Where the
+// enclosing body uses the variable after the closure, as though they had, the program is refused at
+// the address -- through `sysl.threads.scope`, a closure a callee keeps, a `&sync Fn`, and a closure
+// written inside one of those. The callee may only read through the address, so the address is also a
+// read back: a closure that hands one out with the variable outside left alone is accepted.
+//
+// A closure that does not escape holds its captures by reference, so `&x` in it is the variable's own
+// address and the callee's writes arrive; so do a `&T` box and, across a thread, a `&sync T` one --
+// the way out the refusal points at -- and a `*T` taken outside a scope. Each accepted cell runs at
+// `-O0`, `-O1` and `-O2`.
+//
+// The helpers are `tests_enm_enum_run.sysl`'s.
+
+private const cad_prelude: string = "import sysl.threads.scope\n\nstruct Seen\n    ran: bool\n    n: int\n\nfill(s: *Seen)\n    s.ran = true\n    s.n = 42\n\nbump(p: *int) = *p = 7\n\nshow(s: *Seen) = print(s.n)\n\nrun(f: &Fn() -> unit) = f()\n\nvar kept: Option[&Fn() -> unit] = None\n\ncall(f: &Fn() -> unit)\n    kept = Some(f)\n    f()\n\nvar held: Option[&Fn() -> int] = None\n\nstash(f: &Fn() -> int)\n    held = Some(f)\n    print(f())\n\n"
+
+// The words after the reason the closure holds its captures by value, for a capture `name` handed
+// by address to `callee`.
+private cad_lost(name: string, callee: string) -> string =
+    s", so it holds a copy of '$name' — so '$callee', which is handed its address, would reach that " +
+    s"copy rather than the variable it came from, and the variable is used afterwards as though it " +
+    s"had. Where you mean to change '$name'"
+
+// The way out the refusal names, for a capture of a type shown as `shown`.
+private cad_hint(name: string, shown: string) -> string =
+    s"hold it as a '&$shown' (a '&sync $shown' where another thread runs the closure) and hand the " +
+    s"callee '&*$name', or have the closure return the value"
+
+// What a refused program said, checked to hold `want` exactly once.
+private cad_refused(text: string, want: string) -> string
+    val said = enm_err(cad_prelude + text)
+
+    assert(enm_says(said, want), said)
+
+    val first = said.index_of(want).unwrap()
+
+    assert(said[first + want.bytes.len..<said.bytes.len].index_of(want).is_none(), said)
+    said
+end cad_refused
+
+// What an accepted program printed, built at `level`.
+private cad_ran_at(text: string, level: string) -> string
+    val root = make_temp_dir("sysl-cad").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", forms_imported(cad_prelude + text)).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, level, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> if out.status.ok() then out.text else s"it did not exit zero: ${out.text}"
+end cad_ran_at
+
+// The same output at every optimization level.
+private cad_runs(text: string, want: string)
+    for level in ["0", "1", "2"]
+        assert_eq(cad_ran_at(text, level), want, s"at -O$level")
+
+// ---- refused: the callee writes the copy, and the variable is read afterwards
+
+@test("a scoped thread handed '&seen' of a struct, read after the scope")
+cad_scope_spawn_struct()
+    if !enm_ready() then return
+
+    val said = cad_refused("main()\n    var seen = Seen(false, 0)\n" +
+                           "    scope((s) -> s.spawn(() -> fill(&seen)).join())\n    print(seen.n)\n",
+                           cad_lost("seen", "fill"))
+
+    assert(enm_says(said, "'@scoped'"), said)
+    assert(enm_says(said, cad_hint("seen", "Seen")), said)
+
+@test("a scoped thread handed '&k' of an int")
+cad_scope_spawn_int()
+    if !enm_ready() then return
+
+    cad_refused("main()\n    var k = 0\n    scope((s) -> s.spawn(() -> bump(&k)).join())\n    print(k)\n",
+                cad_lost("k", "bump"))
+
+@test("a scoped thread handed the address of an array's element")
+cad_scope_spawn_array_element()
+    if !enm_ready() then return
+
+    cad_refused("main()\n    var a = [0, 0, 0]\n    scope((s) -> s.spawn(() -> bump(&a[1])).join())\n" +
+                "    print(a[1])\n",
+                cad_lost("a", "bump"))
+
+@test("a scoped thread handed a field's address")
+cad_scope_spawn_field()
+    if !enm_ready() then return
+
+    cad_refused("struct Two\n    a: int\n    b: int\n\nmain()\n    var t = Two(0, 0)\n" +
+                "    scope((s) -> s.spawn(() -> bump(&t.b)).join())\n    print(t.b)\n",
+                cad_lost("t", "bump"))
+
+@test("a private callee is named as written, not by its lowered name")
+cad_private_callee_named()
+    if !enm_ready() then return
+
+    cad_refused("private zero(p: *int) = *p = 0\n\nmain()\n    var k = 5\n" +
+                "    scope((s) -> s.spawn(() -> zero(&k)).join())\n    print(k)\n",
+                cad_lost("k", "zero"))
+
+@test("a generic callee is named as its declaration")
+cad_generic_callee_named()
+    if !enm_ready() then return
+
+    cad_refused("put[T](p: *T, v: T) = *p = v\n\nmain()\n    var k = 5\n" +
+                "    scope((s) -> s.spawn(() -> put(&k, 9)).join())\n    print(k)\n",
+                cad_lost("k", "put"))
+
+@test("a method handed the address as an argument, not as its receiver")
+cad_method_argument_named()
+    if !enm_ready() then return
+
+    cad_refused("struct Setter\n    v: int\n\n    into(self, p: *int) = *p = self.v\n\nmain()\n" +
+                "    var k = 5\n    val st = Setter(9)\n" +
+                "    scope((s) -> s.spawn(() -> st.into(&k)).join())\n    print(k)\n",
+                cad_lost("k", "into"))
+
+@test("a closure a callee keeps, handed '&seen'")
+cad_kept_closure()
+    if !enm_ready() then return
+
+    val said = cad_refused("main()\n    var seen = Seen(false, 0)\n    call(() -> fill(&seen))\n" +
+                           "    print(seen.ran)\n",
+                           cad_lost("seen", "fill"))
+
+    assert(enm_says(said, cad_hint("seen", "Seen")), said)
+
+@test("the way out for a kept closure: a '&T' box, its address handed to the callee")
+cad_kept_closure_box()
+    if !enm_ready() then return
+
+    cad_runs("main()\n    val seen: &Seen = Seen(false, 0)\n    call(() -> fill(&*seen))\n" +
+             "    print(seen.n)\n",
+             "42\n")
+
+@test("a closure made a '&sync Fn', handed '&k'")
+cad_sync_fn()
+    if !enm_ready() then return
+
+    cad_refused("main()\n    var k = 0\n    val f: &sync Fn() -> unit = () -> bump(&k)\n    f()\n    print(k)\n",
+                cad_lost("k", "bump"))
+
+@test("a closure written inside a scoped thread's, handed '&k', reaches the copy the thread holds")
+cad_nested_in_scoped()
+    if !enm_ready() then return
+
+    val said = cad_refused("main()\n    var k = 0\n" +
+                           "    scope((s) -> s.spawn(() -> run(() -> bump(&k))).join())\n    print(k)\n",
+                           cad_lost("k", "bump"))
+
+    assert(enm_says(said, "this closure writes through to a closure it is written in"), said)
+
+@test("written directly in a scoped thread, the assignment is refused in its own words")
+cad_scope_spawn_direct_write()
+    if !enm_ready() then return
+
+    cad_refused("main()\n    var d = Seen(false, 0)\n    scope((s) -> s.spawn(() -> d.n = 5).join())\n" +
+                "    print(d.n)\n",
+                "so it holds a copy of 'd' — so assignment would reach that copy")
+
+// ---- accepted: the callee reaches the variable, or nothing reads the variable afterwards
+
+@test("a closure called in place holds its captures by reference: the struct is written")
+cad_in_place_struct()
+    if !enm_ready() then return
+
+    cad_runs("main()\n    var b = Seen(false, 0)\n    val f = () -> fill(&b)\n    f()\n    f()\n" +
+             "    print(b.ran, b.n)\n",
+             "true 42\n")
+
+@test("a closure called in place: an int and an array's element are written")
+cad_in_place_int_and_array()
+    if !enm_ready() then return
+
+    cad_runs("main()\n    var k = 0\n    var a = [0, 0, 0]\n    run(() -> bump(&k))\n" +
+             "    run(() -> bump(&a[2]))\n    print(k, a[2])\n",
+             "7 7\n")
+
+@test("the address taken outside the scope crosses to the scoped thread")
+cad_scope_pointer_outside()
+    if !enm_ready() then return
+
+    cad_runs("main()\n    var seen = Seen(false, 0)\n    var k = 0\n    val p = &seen\n    val q = &k\n" +
+             "    scope((s) -> s.spawn(() -> fill(p)).join())\n" +
+             "    scope((s) -> s.spawn(() -> bump(q)).join())\n    print(seen.n, k)\n",
+             "42 7\n")
+
+@test("a '&sync' box crosses to the scoped thread and is written through")
+cad_scope_sync_box()
+    if !enm_ready() then return
+
+    cad_runs("main()\n    val h: &sync Seen = Seen(false, 0)\n" +
+             "    scope((s) -> s.spawn(() -> fill(&*h)).join())\n    print(h.n)\n",
+             "42\n")
+
+@test("a callee that only reads through the address, the variable unused afterwards")
+cad_read_only_callee()
+    if !enm_ready() then return
+
+    cad_runs("main()\n    var seen = Seen(false, 3)\n    var other = Seen(false, 3)\n" +
+             "    call(() -> show(&seen))\n    scope((s) -> s.spawn(() -> show(&other)).join())\n",
+             "3\n3\n")
+
+@test("a second closure handing the same capture's address out reads it after the first: refused")
+cad_second_closure_reads_after()
+    if !enm_ready() then return
+
+    cad_refused("main()\n    var seen = Seen(false, 3)\n    call(() -> fill(&seen))\n" +
+                "    scope((s) -> s.spawn(() -> show(&seen)).join())\n",
+                cad_lost("seen", "fill"))
+
+@test("a kept closure that writes its copy by address and reads it back is a closure of its own")
+cad_reads_its_copy_back()
+    if !enm_ready() then return
+
+    cad_runs("main()\n    var k = 0\n    stash(() ->\n        bump(&k)\n        k)\n",
+             "7\n")

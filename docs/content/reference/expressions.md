@@ -2485,6 +2485,48 @@ install(() -> c.bump())
 so it holds a copy of 'c' — so 'bump', which takes '*self', would reach that copy rather than the variable it came from, and nothing in the closure reads it back
 ```
 
+**A written `&x` of a capture handed to a call is the copy's address too**, so the callee writes the
+copy, as a `*self` method does. The callee may only read through it, so handing the address out also
+counts as reading the copy back: the call is refused where the enclosing body uses the variable
+afterwards, as though the callee's writes had reached it. A thread started with
+[`scope`](/reference/memory/#a-thread-borrows-a-frame-only-inside-a-scope) holds its captures by value, so this is the shape it takes there:
+
+```sysl
+import sysl.threads.scope
+
+bump(p: *int) = *p = 7
+
+var k = 0
+scope((s) -> s.spawn(() -> bump(&k)).join())
+print(k)
+```
+
+```error
+so it holds a copy of 'k' — so 'bump', which is handed its address, would reach that copy rather than the variable it came from, and the variable is used afterwards as though it had. Where you mean to change 'k', hold it as a '&int' (a '&sync int' where another thread runs the closure) and hand the callee '&*k', or have the closure return the value
+```
+
+A box both sides share is the variable itself, and a `&sync` one may cross to the scoped thread.
+Inside a `scope`, an address taken outside the closure is the variable's own too, and a `*T` crosses
+as well:
+
+```sysl
+import sysl.threads.scope
+
+bump(p: *int) = *p = 7
+
+val k: &sync int = 0
+var n = 0
+val p = &n
+
+scope((s) -> s.spawn(() -> bump(&*k)).join())
+scope((s) -> s.spawn(() -> bump(p)).join())
+print(*k, n)
+```
+
+```output
+7 7
+```
+
 A call answering a value hands back what it read of the copy, so `() -> it.next()` reads its copy
 back and is a generator of its own. Where such a closure holds that capture by value it can no longer
 be held in a `val`, for the reason an escaping counter cannot: calling it writes its environment.
