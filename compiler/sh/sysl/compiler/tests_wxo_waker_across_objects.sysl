@@ -1,0 +1,405 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **A `step` and the `park` it resumes meet in one slot, and they are often in different objects.**
+// `step` puts the executor's waker in `@sysl.task.current` for the length of a resumption, and a
+// `park` at any depth of the task reads it there. Each object carries the task runtime it calls, so
+// an executor in the program stepping a task whose `park` was compiled into a `--lib` root's
+// `.syslib` -- what a program on an event-loop package does on every await -- reads the slot of
+// another object. With a slot per object the waker a `park` handed out was null: calling it did
+// nothing, the task was never stepped again, and the program ended with the work still parked.
+//
+// Each case puts the two halves in different places -- the program, a root, two roots -- and is run
+// at three levels, which must print the same thing: at `-O0` the null came from an unset slot, and
+// optimized the read was folded to null outright.
+
+// The two allocation hooks, counting, so a case can say every frame and waker box was given back.
+private wxo_pool() -> string = raw"""
+    module pool
+
+    extern "malloc" c_malloc(n: usize) -> *u8
+    extern "free" c_free(p: *u8)
+
+    var allocs: int = 0
+    var frees: int = 0
+
+    @export("sysl_task_alloc")
+    task_alloc(size: usize) -> *u8
+        allocs += 1
+        c_malloc(size)
+
+    @export("sysl_task_free")
+    task_free(p: *u8)
+        frees += 1
+        c_free(p)
+
+    balance() -> string = if allocs > 0 && allocs == frees then "balanced" else s"$allocs/$frees"
+    """
+
+// One task, stepped with a waker that counts its calls.
+private wxo_exec() -> string = raw"""
+    module exec
+
+    var wakes: int = 0
+
+    tick(t: Task[unit]) -> bool = step(t, () -> wakes += 1)
+
+    woken() -> int = wakes
+    """
+
+// Where a waker is kept until something calls it.
+private wxo_wakers() -> string = raw"""
+    module wakers
+
+    var held: Option[&Fn() -> unit] = None
+
+    stash(w: &Fn() -> unit)
+        held = Some(w)
+
+    wake_held()
+        held match
+            Some(w) -> w()
+            None -> print("nothing held")
+
+    forget()
+        held = None
+    """
+
+// A task that parks once, its waker stashed.
+private wxo_work() -> string = raw"""
+    module work
+
+    import wakers.*
+
+    async waiter()
+        print("parking")
+        await park((w) -> stash(w))
+        print("woken")
+    """
+
+// The program that drives `waiter` once to its park, wakes it, and drives it to the end. The task is
+// a local of `drive`, so it is let go of before the pool is asked whether everything came back.
+private wxo_main() -> string = raw"""
+    import pool.*
+    import exec.*
+    import wakers.*
+    import work.*
+
+    drive()
+        val t = waiter()
+
+        print(s"done ${tick(t)}")
+        wake_held()
+        print(s"woken ${woken()}")
+        print(s"done ${tick(t)}")
+        forget()
+
+    drive()
+    print(balance())
+    """
+
+private wxo_expected() -> string = "parking\ndone false\nwoken 1\nwoken\ndone true\nbalanced\n"
+
+// Files at their paths below a fresh directory, which is answered.
+private wxo_tree(files: []const (string, string)) -> string
+    val root = absolute_path(make_temp_dir("sysl-wxo").unwrap())
+
+    for i in 0..<files.len
+        val at = s"$root/${files[i].0}"
+        val slash = at.last_index_of("/")
+
+        if slash.is_some() then make_dir_all(at[0..<slash.unwrap()]).unwrap()
+
+        write_text(at, files[i].1).unwrap()
+
+    root
+end wxo_tree
+
+// What the program in `program` prints, built at `level` with each of `roots` handed over as `--lib`.
+private wxo_outcome(program: []const (string, string), roots: []const Buf[(string, string)],
+                    level: string) -> string
+    val dir = wxo_tree(program)
+    var libs: Buf[string] = buf()
+
+    for r in roots
+        libs.push(wxo_tree(r.view()))
+
+    lbr_hand(libs.view_mut())
+
+    val exe = s"$dir/built"
+    val built = build_native_program(dir, None, None, level, Some(exe))
+
+    reset_search_paths()
+
+    val said = built match
+        Err(why) -> s"it did not build: ${failure_text(why)}"
+        Ok(_) ->
+            capture(exe, [], "", [], true) match
+                Err(_) -> "the program that was built could not be run"
+                Ok(out) -> if out.status.ok() then out.text else
+                    s"it did not run to the end: ${out.text}${out.err.unwrap_or("")}"
+
+    remove_dir_all(dir).unwrap_or(())
+
+    for l in libs
+        remove_dir_all(l).unwrap_or(())
+
+    said
+end wxo_outcome
+
+// The same, at `-O0`, the default level and `-O2`, where all three agree.
+private wxo_ran(program: []const (string, string), roots: []const Buf[(string, string)]) -> string
+    val low = wxo_outcome(program, roots, "0")
+    val mid = wxo_outcome(program, roots, DefaultOptimization)
+    val high = wxo_outcome(program, roots, "2")
+
+    if low != mid || mid != high
+        return s"-O0 printed:\n$low\nthe default level printed:\n$mid\n-O2 printed:\n$high"
+
+    low
+end wxo_ran
+
+private wxo_files(names: []const string) -> Buf[(string, string)]
+    var out: Buf[(string, string)] = buf()
+
+    for n in names
+        if n == "pool" then out.push(("pool/pool.sysl", wxo_pool()))
+        if n == "exec" then out.push(("exec/exec.sysl", wxo_exec()))
+        if n == "wakers" then out.push(("wakers/wakers.sysl", wxo_wakers()))
+        if n == "work" then out.push(("work/work.sysl", wxo_work()))
+
+    out
+end wxo_files
+
+private wxo_program(names: []const string, main: string) -> Buf[(string, string)]
+    var out = wxo_files(names)
+
+    out.push(("main.sysl", main))
+    out
+end wxo_program
+
+private wxo_skip() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the standard module's source or clang is not on this machine")
+        return true
+    end if
+
+    false
+end wxo_skip
+
+// -- where the halves are --------------------------------------------------------------------------
+
+@test("one program: the step and the park share a slot, the control every other case is held to")
+wxo_one_program()
+    if wxo_skip() then return
+
+    val none: Buf[Buf[(string, string)]] = buf()
+
+    assert_eq(wxo_ran(wxo_program(["pool", "exec", "wakers", "work"], wxo_main()).view(), none.view()),
+              wxo_expected())
+
+@test("a task whose park is in a --lib root, stepped by the program, is woken by the waker it stashed")
+wxo_park_in_a_root()
+    if wxo_skip() then return
+
+    assert_eq(wxo_ran(wxo_program(["pool", "exec"], wxo_main()).view(),
+                      [wxo_files(["wakers", "work"])]), wxo_expected())
+
+@test("an executor in a --lib root steps a task whose park is in the program")
+wxo_step_in_a_root()
+    if wxo_skip() then return
+
+    assert_eq(wxo_ran(wxo_program(["pool", "wakers", "work"], wxo_main()).view(),
+                      [wxo_files(["exec"])]), wxo_expected())
+
+@test("the executor and the task in one root, the program only driving them")
+wxo_both_in_one_root()
+    if wxo_skip() then return
+
+    assert_eq(wxo_ran(wxo_program(["pool"], wxo_main()).view(),
+                      [wxo_files(["exec", "wakers", "work"])]), wxo_expected())
+
+@test("the executor in one root and the parking task in another")
+wxo_two_roots()
+    if wxo_skip() then return
+
+    assert_eq(wxo_ran(wxo_program(["pool"], wxo_main()).view(),
+                      [wxo_files(["exec"]), wxo_files(["wakers", "work"])]), wxo_expected())
+
+// -- what reaches the park -------------------------------------------------------------------------
+
+@test("a park two awaits down, in a root, under a task of the program's, reads the program's waker")
+wxo_await_chain_into_a_root()
+    if wxo_skip() then return
+
+    val main = raw"""
+        import pool.*
+        import exec.*
+        import wakers.*
+        import work.*
+
+        async outer()
+            print("outer")
+            await waiter()
+            print("outer again")
+
+        drive()
+            val t = outer()
+
+            print(s"done ${tick(t)}")
+            wake_held()
+            print(s"woken ${woken()}")
+            print(s"done ${tick(t)}")
+            forget()
+
+        drive()
+        print(balance())
+        """
+
+    assert_eq(wxo_ran(wxo_program(["pool", "exec"], main).view(), [wxo_files(["wakers", "work"])]),
+              "outer\nparking\ndone false\nwoken 1\nwoken\nouter again\ndone true\nbalanced\n")
+
+@test("a root's generic task, instantiated by the program, parks and is woken the same way")
+wxo_generic_task_in_a_root()
+    if wxo_skip() then return
+
+    val generic = raw"""
+        module work
+
+        import wakers.*
+
+        async echo[T](v: T) -> T
+            await park((w) -> stash(w))
+            v
+
+        async waiter()
+            print("parking")
+            val n = await echo(41)
+            print(s"woken ${n + 1}")
+        """
+    var root = wxo_files(["wakers"])
+
+    root.push(("work/work.sysl", generic))
+
+    assert_eq(wxo_ran(wxo_program(["pool", "exec"], wxo_main()).view(), [root]),
+              "parking\ndone false\nwoken 1\nwoken 42\ndone true\nbalanced\n")
+
+@test("block_on in the program over a root's task that wakes itself while it registers")
+wxo_block_on_over_a_root_park()
+    if wxo_skip() then return
+
+    val eager = raw"""
+        module eager
+
+        async eager() -> int
+            await park((w) -> w())
+            7
+        """
+    val main = raw"""
+        import pool.*
+        import eager.*
+
+        print(block_on(eager()))
+        print(balance())
+        """
+
+    assert_eq(wxo_ran(wxo_program(["pool"], main).view(), [wxo_one("eager/eager.sysl", eager)]),
+              "7\nbalanced\n")
+
+@test("a root's executor calls block_on over the program's task, whose waker is called later")
+wxo_block_on_in_a_root()
+    if wxo_skip() then return
+
+    val drive = raw"""
+        module drive
+
+        run_it(t: Task[int]) -> int = block_on(t)
+        """
+    val main = raw"""
+        import pool.*
+        import drive.*
+
+        async later() -> int
+            await park((w) -> w())
+            await park((w) -> w())
+            9
+
+        print(run_it(later()))
+        print(balance())
+        """
+
+    assert_eq(wxo_ran(wxo_program(["pool"], main).view(), [wxo_one("drive/drive.sysl", drive)]),
+              "9\nbalanced\n")
+
+private wxo_one(at: string, text: string) -> Buf[(string, string)]
+    var out: Buf[(string, string)] = buf()
+
+    out.push((at, text))
+    out
+end wxo_one
+
+// -- the slot as the text writes it ----------------------------------------------------------------
+
+// A program with a task, a park and a step, and nothing that needs an operating system.
+private wxo_bare() -> string = raw"""
+    async waiter()
+        await park((w) -> w())
+
+    @export("wxo_entry")
+    entry() -> bool = step(waiter(), () -> ())
+    """
+
+private wxo_text(target: Option[string]) -> string
+    val program = if target.is_some() then wxo_one("main.sysl", wxo_bare()) else
+        wxo_program(["pool", "exec", "wakers", "work"], wxo_main())
+    val dir = wxo_tree(program.view())
+
+    val text = emit_llvm_text(dir, target) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(emitted) -> emitted.text
+
+    remove_dir_all(dir).unwrap_or(())
+    text
+end wxo_text
+
+@test("the slot is one weak definition per link, a thread's own on a host")
+wxo_slot_is_weak_on_a_host()
+    if wxo_skip() then return
+
+    val text = wxo_text(None)
+
+    assert(text.contains("@sysl.task.current = weak_odr thread_local global { ptr, ptr } zeroinitializer\n"),
+           text)
+    assert(!text.contains("@sysl.task.current = internal"), "no slot of the object's own")
+
+@test("on a target with no thread-local storage it is one weak definition all the same")
+wxo_slot_is_weak_bare()
+    if wxo_skip() then return
+
+    val text = wxo_text(Some("thumb-freestanding"))
+
+    assert(text.contains("@sysl.task.current = weak_odr global { ptr, ptr } zeroinitializer\n"), text)
+
+@test("cut into codegen units, one unit defines the slot and every other one that uses it declares it")
+wxo_slot_across_units()
+    if wxo_skip() then return
+
+    val cut = split_module(wxo_text(None), 4)
+
+    assert(cut.is_some(), "the text was not cut")
+
+    val parts = cut.unwrap()
+    var defining = 0
+    var declaring = 0
+
+    for p in parts
+        if p.contains("@sysl.task.current = weak_odr thread_local global") then defining += 1
+        if p.contains("@sysl.task.current = external thread_local global") then declaring += 1
+        assert(!p.contains("sysl.cgu:sysl.task.current"), "the slot is not renamed as a local is")
+
+    assert_eq(defining, 1)
+    assert(defining + declaring >= 2, s"$defining defining, $declaring declaring")
