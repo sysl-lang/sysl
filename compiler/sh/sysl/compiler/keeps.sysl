@@ -160,6 +160,10 @@ struct KeepsCx
     deferred: Buf[(string, usize, string)]
     pending: Map[string, bool]
 
+    // For each function whose address is taken, the `@keeps` marks every type it is taken at shares
+    // (`pointer_licensed`).
+    addressed_marks: Map[string, Buf[(string, Type)]]
+
     find(self, name: string) -> Option[TFunc] = self.index.get(name) match
         Some(i) -> Some(self.funcs[i])
         None -> None
@@ -182,7 +186,7 @@ check_keeps(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable], vals: Buf[TV
     val cx: &KeepsCx = KeepsCx(a, funcs, index, map(), map(), map(), buf(), buf(), false, 0, map(),
                                map(), buf(), map(), buf(), map(), map(), map(), vtables, cast_graph_new(),
                                map(), buf(), map(), map(), map(), map(), buf(), false, map(), false, map(),
-                               0, false, buf(), map())
+                               0, false, buf(), map(), map())
 
     for i in 0..<a.tables.extern_vars.len()
         cx.c_vars.push(extern_var_symbol(a.tables.extern_vars.at(i)))
@@ -268,9 +272,25 @@ check_keeps(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable], vals: Buf[TV
         a.fault(item.0, item.1, item.2)
 end check_keeps
 
+// A function's address, by the type it is taken at, and the marks of that type, kept only where every
+// other taking of the same address marks them too.
 private note_addressed(cx: &KeepsCx, e: TExpr)
     *e.kind match
         TFuncAddr(name, _, ty) ->
+            val marks = pointer_marks(ty)
+
+            if cx.addressed.has(name)
+                var shared: Buf[(string, Type)] = buf()
+
+                for item in cx.addressed_marks.get(name).unwrap_or(buf())
+                    for m in marks
+                        if m.0 == item.0 then shared.push(item)
+
+                cx.addressed_marks.put(name, shared)
+            else
+                cx.addressed_marks.put(name, marks)
+            end if
+
             cx.addressed.put(name, true)
 
             val key = fn_key(ty)
@@ -288,8 +308,35 @@ end note_addressed
 // The type of a function pointer, as the calls through it are matched with the functions it may
 // reach, or nothing for any other type.
 private fn_key(t: Type) -> string = t match
-    CFn(_, _) -> type_show(t)
+    CFn(_, _, _) -> type_show(t)
     _ -> ""
+
+// The `@keeps` marks a function pointer type carries, none for any other type.
+private pointer_marks(ty: Type) -> Buf[(string, Type)] = underlying(ty) match
+    CFn(_, _, marks) -> marks
+    _ -> buf()
+
+// **Whether a function whose address is taken may keep its parameter `i`**: every type its address is
+// taken at marks the parameter `@keeps`, so every call through a pointer to it is held to the mark
+// (`pointer_marked`). A method a table holds answers to its trait instead.
+private pointer_licensed(cx: &KeepsCx, name: string, i: usize) -> bool
+    if !cx.addressed.has(name) || cx.dispatched.has(name) || trait_of(cx, name).is_some() then return false
+
+    marks_kept(cx.addressed_marks.get(name).unwrap_or(buf()), i)
+end pointer_licensed
+
+// What a call through a function pointer keeps at its argument `j` where its type marks it `@keeps`:
+// anywhere, with everything read through it, as a call through a callable object's marked parameter
+// is (`object_kept`). Nothing where it is unmarked.
+private pointer_marked(callee: TExpr, j: usize) -> Buf[(string, KeptAt)]
+    var out: Buf[(string, KeptAt)] = buf()
+    val ty = texpr_type(callee)
+
+    if marks_kept(pointer_marks(ty), j)
+        out.push((s"a call through '${type_show(ty)}'", KeptAt("", "its type says '@keeps'", span_zero(), 0)))
+
+    out
+end pointer_marked
 
 // **A function pointer C can reach may be called with anything**: one handed to a call with no body
 // here -- C's, or a form the compiler supplies -- or answered by one, which is storage C made, or
@@ -323,7 +370,7 @@ private escape_types(cx: &KeepsCx, t: Type, depth: int)
     if depth > 6 then return
 
     t match
-        CFn(params, ret) ->
+        CFn(params, ret, _) ->
             cx.escaped.put(type_show(t), true)
 
             for p in params
@@ -396,11 +443,13 @@ end held_through_params
 // **A call through a function pointer may land in any function whose address was taken at that
 // pointer's type**, and keeps what any of them keeps -- each location with the function that keeps
 // it there. A type C may call through reaches bodies held to the default instead (`refuse_promised`).
+// **A parameter the type marks `@keeps` is kept anywhere** (`pointer_marked`), by whatever function
+// the pointer holds.
 pointer_keeps(cx: &KeepsCx, callee: TExpr, j: usize) -> Buf[(string, KeptAt)]
-    var out: Buf[(string, KeptAt)] = buf()
+    var out = pointer_marked(callee, j)
     val key = fn_key(texpr_type(callee))
 
-    if key == "" || cx.escaped.has(key) then return out
+    if !out.is_empty() || key == "" || cx.escaped.has(key) then return out
 
     for item in cx.by_type
         if item.0 != key then continue
@@ -1308,10 +1357,13 @@ end vcall_through_answers
 
 // What a call through a function pointer lets out of what it reads through its argument at `j`:
 // whatever any function it may land in does (`pointer_keeps`), and a location nothing can name where
-// C may call through the type, or no function is known to be taken at it.
+// C may call through the type, or no function is known to be taken at it. All of it where the type
+// marks the parameter `@keeps`, a hard keep to every depth as an `extern`'s.
 pointer_through(cx: &KeepsCx, callee: TExpr, j: usize) -> Buf[(string, KeptAt)]
-    var out: Buf[(string, KeptAt)] = buf()
+    var out = pointer_marked(callee, j)
     val key = fn_key(texpr_type(callee))
+
+    if !out.is_empty() then return out
 
     if key == "" || cx.escaped.has(key)
         out.push(("a call through a function pointer", KeptAt("", "no body says what it does with it", span_zero(), 0)))
@@ -1329,10 +1381,10 @@ end pointer_through
 
 // The same as the borrow rule asks it (`deep_of`): nothing where C may call through the type.
 private pointer_deep(cx: &KeepsCx, callee: TExpr, j: usize, path: string) -> Buf[(string, KeptAt)]
-    var out: Buf[(string, KeptAt)] = buf()
+    var out = pointer_marked(callee, j)
     val key = fn_key(texpr_type(callee))
 
-    if key == "" || cx.escaped.has(key) then return out
+    if !out.is_empty() || key == "" || cx.escaped.has(key) then return out
 
     for item in cx.by_type
         if item.0 != key then continue
@@ -1346,10 +1398,10 @@ end pointer_deep
 // What a call through a function pointer lets out of what it reads `steps` steps through its argument
 // at `j` (`read_of`): nothing where C may call through the type, which the rule holds to the default.
 pointer_reads(cx: &KeepsCx, callee: TExpr, j: usize, steps: int, path: string) -> Buf[(string, KeptAt)]
-    var out: Buf[(string, KeptAt)] = buf()
+    var out = pointer_marked(callee, j)
     val key = fn_key(texpr_type(callee))
 
-    if key == "" || cx.escaped.has(key) then return out
+    if !out.is_empty() || key == "" || cx.escaped.has(key) then return out
 
     for item in cx.by_type
         if item.0 != key then continue
@@ -1524,14 +1576,19 @@ private lent_by_rule(cx: &KeepsCx, f: TFunc, i: usize) -> bool
     // holds instead (`task_held`), and an `await` of it takes it back.
     if f.marks.is_async() then return false
 
-    trait_of(cx, f.name).is_some() || (cx.addressed.has(f.name) && !relays(cx, f.name))
+    if trait_of(cx, f.name).is_some() then return true
+
+    // A function whose address is only ever taken at types marking the parameter `@keeps` was
+    // promised nothing about it.
+    cx.addressed.has(f.name) && !relays(cx, f.name) && !pointer_licensed(cx, f.name, i)
 end lent_by_rule
 
 // Whether `f` is reached through a function pointer whose calls are all in sight, so what it keeps
-// at `i` is held to each of them (`relays`).
+// at `i` is held to each of them (`relays`). One whose every pointer type marks the parameter
+// `@keeps` may keep it anywhere (`pointer_licensed`), so a call that sees its body is told all of it.
 private pointer_reached(cx: &KeepsCx, f: TFunc, i: usize) -> bool =
     !is_closure_body(f) && trait_of(cx, f.name).is_none() && holds_raw_pointer(f.params[i].1, 0) &&
-        relays(cx, f.name)
+        relays(cx, f.name) && !pointer_licensed(cx, f.name, i)
 
 // The trait a function implements a method of, whether it is that method's own lowering or an
 // instance of a generic one.
@@ -2176,8 +2233,13 @@ private kept_at(t: &Track, evs: &EvBuf, e: TExpr)
                 for at in 0..<held.len()
                     val item = held[at]
                     val loc = track_loc(t, args, item.1.loc)
-                    val how = s"it is passed through a function pointer to '${shown_name(t.cx.an, item.0)}', " +
-                        (if at < kept_n then "which keeps it" else "which lets what it reads through it out")
+                    // A parameter the pointer's type marks is kept by the call itself (`pointer_marked`).
+                    val how = if item.0.starts_with("a call through '")
+                        s"it is passed to ${item.0}, " +
+                            (if at < kept_n then "which keeps it" else "which lets what it reads through it out")
+                    else
+                        s"it is passed through a function pointer to '${shown_name(t.cx.an, item.0)}', " +
+                            (if at < kept_n then "which keeps it" else "which lets what it reads through it out")
 
                     if !loc.starts_with("l:") then evs.items.push(kept_ev(loc, how, args[j]))
         _ -> ()
@@ -4470,7 +4532,14 @@ private call_at(ft: &FrameTrack, evs: &EvBuf, e: TExpr)
                     if loc.starts_with("l:") then continue
 
                     val through = s"a call through '${type_show(texpr_type(callee))}' may reach "
-                    var said = if read
+                    val marked = marks_kept(pointer_marks(texpr_type(callee)), j)
+                    var said = if read && marked
+                        s"${item.0} may keep what it reads through its parameter ${j + 1} (${item.1.how}), " +
+                            s"and what is read through '${value_text(ft.scope, arg)}' holds ${h.3}"
+                    else if marked
+                        s"${item.0} keeps its parameter ${j + 1} (${item.1.how}), and " +
+                            argument_said(ft, arg, core.unwrap())
+                    else if read
                         through + read_said(ft, item.0, param_name(ft.cx, item.0, j), item.1.how, arg, h.3, true)
                     else
                         through + s"'${shown_name(ft.cx.an, item.0)}', which keeps its parameter " +
@@ -5942,6 +6011,10 @@ private refuse_promised(cx: &KeepsCx, faults: &KeepFaults, f: TFunc)
         // call through that type is held to the mark instead (`object_marks_kept`), and a call that
         // sees the body, to what the body keeps.
         if closure && closure_licensed(cx, f.name, i) then continue
+
+        // **So may a function whose address is taken only at function pointer types marking it**:
+        // every call through the pointer is held to the mark (`pointer_marked`).
+        if !closure && pointer_licensed(cx, f.name, i) then continue
 
         val w = walk_kept(cx, f, i)
 

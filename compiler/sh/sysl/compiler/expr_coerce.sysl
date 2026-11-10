@@ -211,6 +211,9 @@ analyze_unwidened(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr
         // where a mismatch belongs.
         Ptr(inner) ->
             if is_trait(*inner) then return coerce(cx, analyze_value(cx, e, expected), want)
+        // A function pointer is taken at a type that differs only in its `@keeps` marks
+        // (`pointer_retyped`); any other mismatch is handed back for the position to diagnose.
+        CFn(_, _, _) -> return coerce(cx, analyze_value(cx, e, expected), want)
         _ -> ()
 
     // A construction of a type with a `Drop` is a `&T` wherever no conversion above already made it
@@ -256,12 +259,74 @@ named_place(e: Expr) -> bool = *e.kind match
     Unary(op, _) -> op == "*"
     _ -> false
 
+// **A function pointer where one differing only in its `@keeps` marks is asked for**
+// (`callable_within`), held as a callable object is (`erase.sysl`'s `callable_retyped`): one that
+// keeps nothing more than the slot lets it stands as it is, and one that may keep a parameter the slot
+// borrows is refused, since every call through the slot may hand that parameter the address of its
+// own storage. **A function's address taken where a marked type is asked for is taken at that type**,
+// which is what lets the function keep what the type marks (`keeps.sysl`'s `refuse_promised`).
+// `None` for any other pair.
+private pointer_retyped(cx: &Analyzer, t: TExpr, got: Type, want: Type) -> Option[TExpr]
+    if type_eq(got, want) then return None
+
+    val fits = callable_within(got, want)
+
+    if fits.is_none() then return None
+
+    var gk: Buf[(string, Type)] = buf()
+    var wk: Buf[(string, Type)] = buf()
+    var arity: usize = 0
+
+    underlying(got) match
+        CFn(ps, _, k) ->
+            gk = k
+            arity = ps.len()
+        _ -> return None
+
+    underlying(want) match
+        CFn(_, _, k) -> wk = k
+        _ -> return None
+
+    if fits.unwrap()
+        *t.kind match
+            TFuncAddr(name, entry, _) -> return Some(TExpr(t.span, TFuncAddr(name, entry, want)))
+            _ -> return Some(t)
+    end if
+
+    var i: usize = 0
+
+    for k in 0..<arity
+        if marks_kept(gk, k) && !marks_kept(wk, k)
+            i = k
+            break
+
+    var marks: Buf[(string, Type)] = buf()
+
+    for item in wk
+        marks.push(item)
+
+    marks.push(fn_keeps_assoc(i))
+
+    val shown = underlying(want) match
+        CFn(ps, r, _) -> type_show(CFn(ps, *r, marks))
+        _ -> type_show(want)
+
+    Some(cx.err(t.span, s"a '${type_show(got)}' may keep its parameter ${i + 1} past the call, and a " +
+                s"'${type_show(want)}' borrows what it is handed for the call — whoever calls it may " +
+                "hand it the address of their own storage. Mark the parameter '@keeps' where the " +
+                s"type it goes into is written, '$shown', or copy what the function keeps into " +
+                "storage of its own"))
+end pointer_retyped
+
 // What a position does to a value of the wrong-but-convertible type.
 //
 // Nothing else coerces -- any other mismatch is left for the caller to diagnose, where the message
 // can name the parameter or the variable it is about.
 coerce(cx: &Analyzer, t: TExpr, expected: Type) -> TExpr
     val got = texpr_type(t)
+    val pointer = pointer_retyped(cx, t, got, expected)
+
+    if pointer.is_some() then return pointer.unwrap()
 
     // A value where an object was expected is put behind the trait's table, which is what an object
     // is. It is asked first because the modes below would otherwise box or view a value the context
