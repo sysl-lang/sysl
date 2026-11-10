@@ -186,23 +186,49 @@ lvc_own_method_refused()
 
         assert(out.contains("'xs' is a view borrowed from 'order'"), s"with $view, got: $out")
 
-@test("a closure that captured the buffer is refused where it is called, and one that did not is not")
-lvc_captured_refused()
+// **A view keeps the storage it reads alive after the buffer grows** (`reference/memory.md`), so a
+// closure that holds the buffer by value and pushes into it, called while the view is live, is
+// accepted: the view goes on reading the old storage and the buffer moves on to new storage.
+@test("a closure holding the buffer by value that pushes into it is accepted, and the view reads the old storage")
+lvc_captured_push_accepted()
     if !lvc_ready() then return
 
-    for view in ["view_mut"]
-        val out = lvc_said(lvc_program("f()\n    var order: Buf[Placed] = buf()\n\n" +
-                                       "    order.push(Placed(1, 2))\n" +
-                                       "    val add = () -> order.push(Placed(0, 0))\n" +
-                                       "    val xs = order.VIEW()\n\n    add()\n    print(xs.len)\n\nrun() = f()\n",
-                                       view))
+    val text = "import sysl.buf.{Buf, buf}\n\nstruct Placed\n    start: usize\n    index: usize\n\n" +
+               "f()\n    var order: Buf[Placed] = buf()\n\n    order.push(Placed(1, 2))\n" +
+               "    val add = () -> order.push(Placed(0, 0))\n    val xs = order.view_mut()\n\n" +
+               "    for _ in 0..<100\n        add()\n\n    xs[0] = Placed(7, 7)\n" +
+               "    print(xs.len, xs[0].start, order.len(), order[0].start)\n\nmain()\n    f()\n"
+    val out = lvc_said(text)
 
-        assert(out.contains("'xs' is a view borrowed from 'order'"), s"with $view, got: $out")
+    assert(!out.contains("error"), s"expected no complaint, got: $out")
+
+    force_alloc_counting(true)
+
+    val ran = lvc_ran(text)
+
+    force_alloc_counting(false)
+    assert_eq(ran, "1 7 101 1\n")
 
     // A closure that did not capture it is called with nothing of the buffer's.
     lvc_clean("f()\n    var b = str_builder()\n    var order: Buf[Placed] = buf()\n\n" +
               "    order.push(Placed(1, 2))\n    val add = () -> b.push(\"x\")\n" +
               "    val xs = order.VIEW()\n\n    add()\n    print(xs.len)\n\nrun() = f()\n")
+
+// A closure that assigns the buffer captures it by reference, and replacing it lets go of what the
+// view reads: called while the view is live, it is refused.
+@test("a closure that replaces the captured buffer is refused where it is called while the view is live")
+lvc_captured_replace_refused()
+    if !lvc_ready() then return
+
+    val out = lvc_said("import sysl.buf.{Buf, buf}\n\nstruct Placed\n    start: usize\n    index: usize\n\n" +
+                       "f()\n    var order: Buf[Placed] = buf()\n\n    order.push(Placed(1, 2))\n" +
+                       "    val replace = () -> order = buf()\n    val xs = order.view_mut()\n\n" +
+                       "    replace()\n    print(xs.len)\n\nmain()\n    f()\n")
+    val said = "'xs' is a view borrowed from 'order', held in a 'Buf[Placed]', and the closure in 'f' " +
+               "may write a 'Buf[Placed]' — which could free what the view reads. Make the call before " +
+               "the view is taken, or put the view in a block that closes first"
+
+    assert(out.contains(said), s"expected '$said' in: $out")
 
 @test("a buffer stored in module storage or a struct is refused at a call that writes it there")
 lvc_stored_refused()
