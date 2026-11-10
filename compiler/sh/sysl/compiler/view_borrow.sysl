@@ -39,18 +39,28 @@ struct ViewRoot
 end ViewRoot
 
 // The local name at the bottom of a receiver place, or nothing where the receiver is a temporary.
+// A place reached through a raw pointer that a call answers is the root itself: what a `*T` points
+// at is storage the pointer does not own, so it is no temporary, though the pointer is.
 private receiver_root(cx: &Analyzer, t: TExpr) -> Option[TExpr] = *t.kind match
     TLoad(_, _) -> Some(t)
     TGlobal(_, _, _) -> Some(t)
-    TField(recv, _, _) -> receiver_root(cx, recv)
-    TIndex(recv, _, _) -> receiver_root(cx, recv)
-    TDeref(operand, _) -> receiver_root(cx, operand)
+    TField(recv, _, _) -> root_through(cx, recv)
+    TIndex(recv, _, _) -> root_through(cx, recv)
+    TDeref(operand, _) -> root_through(cx, operand)
     TConstView(arg) -> receiver_root(cx, arg)
     TAddrOf(inner, _) -> receiver_root(cx, inner)
     TCall(_, _, _, _) -> placed_by(cx, t) match
         Some(recv) -> receiver_root(cx, recv)
         None -> None
     _ -> None
+
+// The root below a place read through `recv`: `recv`'s own, or `recv` itself where it is a raw
+// pointer that is not a place -- a call's answer, a cast -- whose pointee outlives the statement.
+private root_through(cx: &Analyzer, recv: TExpr) -> Option[TExpr] = receiver_root(cx, recv) match
+    Some(r) -> Some(r)
+    None -> underlying(texpr_type(recv)) match
+        Ptr(_) -> Some(recv)
+        _ -> None
 
 // The local a unique name is bound to, with its position in the scope stack, while it is in scope.
 private local_at(cx: &Analyzer, unique: string) -> Option[(usize, Local)]
@@ -96,7 +106,11 @@ note_view_call(cx: &Analyzer, span: Span, receiver: TExpr, member: string)
 
         if l.is_some() then name = l.unwrap().1.name
     else
-        name = "module storage"
+        name = *root.unwrap().kind match
+            TGlobal(_, _, _) -> "module storage"
+            TCall(callee, _, _, _) -> s"*${qualified_name(callee)}(…)"
+            _ -> "*(…)"
+    end if
 
     cx.view_calls.push((span, ViewRoot(receiver, unique, name)))
 end note_view_call
@@ -375,9 +389,17 @@ note_view_return(cx: &Analyzer, span: Span, value: TExpr)
     for r in roots
         if cx.views_self && r.unique == "self" then continue
 
-        if r.unique == ""
+        if r.unique == "" && r.name == "module storage"
             cx.fault(span, "this returns a view borrowed from module storage, which may be " +
                      "reassigned while the caller still reads it. Return a copy")
+            return
+        end if
+
+        if r.unique == ""
+            cx.fault(span, s"this returns a view borrowed from '${r.name}', and nothing keeps what " +
+                     "that pointer points at alive once this function returns — so the caller " +
+                     "could read freed memory. Return a copy, or return it from a member of its " +
+                     "type marked '@views(self)'")
             return
         end if
 
