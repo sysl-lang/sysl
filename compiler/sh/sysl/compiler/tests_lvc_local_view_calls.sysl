@@ -1,0 +1,245 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Text
+
+// A view of a buffer held in a local that no other name can reach (`checks.sysl`'s
+// `confined_local`): a call may free what the view reads only where it is handed the local, so a call
+// that is not is allowed whatever its type says it may write -- and every route by which a callee
+// CAN reach the buffer is still refused.
+//
+// Every program carries what makes the by-type answer give up: module storage holding a C function
+// pointer, which is taken to reach every type, and a pointer cast to `*u8`, which may point into
+// anything. That is the program shape a package meets inside a larger consumer. Each accepted case is
+// checked with the buffer's `view_mut()` and with its `view()`. The refusals are checked with
+// `view_mut()` alone: `Buf.view()` is not `@views(self)` in this release, so a view it answers is
+// held by its owner word and carries no borrow to refuse a call against.
+
+private lvc_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end lvc_ready
+
+private lvc_head() -> string =
+    "import sysl.buf.{Buf, buf}\nimport sysl.text.str_builder\nimport sysl.slices.sort_by\n" +
+    "import sysl.raw.ptr_cast\n\nstruct Placed\n    start: usize\n    index: usize\n\n" +
+    "var hook: Option[*extern() -> unit] = None\n\n"
+
+private lvc_tail() -> string =
+    "\nmain()\n    var x = 5\n    val p = ptr_cast[*u8](&x)\n\n    print(p[0])\n    run()\n"
+
+// The program around `body`, with `VIEW` spelled as `view`.
+private lvc_program(body: string, view: string) -> string =
+    lvc_head() + body.replace_all("VIEW", view) + lvc_tail()
+
+private lvc_root(text: string) -> string
+    val root = make_temp_dir("sysl-local-view").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+
+// What analysing a program said, all of it.
+private lvc_said(text: string) -> string
+    val root = lvc_root(text)
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end lvc_said
+
+// What a program printed, or what the compiler said instead.
+private lvc_ran(text: string) -> string
+    val root = lvc_root(text)
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text + out.err.unwrap_or("")
+end lvc_ran
+
+private lvc_clean(body: string)
+    for view in ["view_mut", "view"]
+        val out = lvc_said(lvc_program(body, view))
+
+        assert(!out.contains("error"), s"with $view, expected no complaint, got: $out")
+
+// Refused with the wording every such call gets: the view, its buffer, and what the call may do.
+private lvc_refused(body: string, part: string)
+    for view in ["view_mut"]
+        val out = lvc_said(lvc_program(body, view))
+
+        assert(out.contains("'xs' is a view borrowed from 'order', held in a 'Buf[Placed]', and"),
+               s"with $view, expected the refusal in: $out")
+        assert(out.contains(part), s"with $view, expected '$part' in: $out")
+        assert(out.contains("which could free what the view reads"), s"with $view, got: $out")
+
+// -- accepted ---------------------------------------------------------------------------------------
+
+@test("the parsing package's report shape: a sorted local table, read while a builder is pushed to")
+lvc_parsing_shape()
+    if !lvc_ready() then return
+
+    val body = "item(i: usize) -> string = s\"<$i>\"\n\nrender(n: usize) -> string\n" +
+               "    var b = str_builder()\n    var order: Buf[Placed] = buf()\n\n" +
+               "    for i in 0..<n\n        order.push(Placed(n - i, i))\n\n" +
+               "    val xs = order.VIEW()\n\n" +
+               "    sort_by(xs, (p, q) -> p.start < q.start || (p.start == q.start && p.index < q.index))\n\n" +
+               "    for i in 0..<xs.len\n        if i > 0 then b.push(\"\\n\")\n\n" +
+               "        b.push(item(xs[i].index))\n\n    b.finish()\nend render\n\nrun() = print(render(3))\n"
+
+    lvc_clean(body)
+
+    for view in ["view_mut", "view"]
+        assert_eq(lvc_ran(lvc_program(body, view)), "5\n<2>\n<1>\n<0>\n")
+
+@test("an unrelated builder push and an unrelated function answering a string are allowed")
+lvc_unrelated_calls()
+    if !lvc_ready() then return
+
+    lvc_clean("label(i: usize) -> string = s\"#$i\"\n\nf() -> usize\n" +
+              "    var b = str_builder()\n    var order: Buf[Placed] = buf()\n\n" +
+              "    order.push(Placed(1, 2))\n    val xs = order.VIEW()\n\n    b.push(\"x\")\n" +
+              "    val s = label(xs[0].index)\n\n    xs.len + s.len + b.finish().len\nend f\n\nrun() = print(f())\n")
+
+@test("a call writing a different buffer of the same type, directly or through a generic, is allowed")
+lvc_other_buffer()
+    if !lvc_ready() then return
+
+    lvc_clean("fill(other: *Buf[Placed]) = other.push(Placed(0, 0))\n\nf() -> usize\n" +
+              "    var order: Buf[Placed] = buf()\n    var other: Buf[Placed] = buf()\n\n" +
+              "    order.push(Placed(1, 2))\n    val xs = order.VIEW()\n\n    fill(&other)\n" +
+              "    xs.len + other.len()\nend f\n\nrun() = print(f())\n")
+
+    lvc_clean("twice[T](b: *Buf[T], v: T)\n    b.push(v)\n    b.push(v)\n\nf() -> usize\n" +
+              "    var order: Buf[Placed] = buf()\n    var other: Buf[Placed] = buf()\n\n" +
+              "    order.push(Placed(1, 2))\n    val xs = order.VIEW()\n\n" +
+              "    twice(&other, Placed(3, 4))\n    xs.len + other.len()\nend f\n\nrun() = print(f())\n")
+
+@test("a view looped over, in a nested block, beside a defer, or feeding a returned value is allowed")
+lvc_interactions()
+    if !lvc_ready() then return
+
+    val pre = "f() -> string\n    var b = str_builder()\n    var order: Buf[Placed] = buf()\n\n" +
+              "    order.push(Placed(1, 2))\n"
+
+    lvc_clean(pre + "    val xs = order.VIEW()\n\n    for item in xs\n        b.push(s\"${item.index}\")\n\n" +
+              "    b.finish()\nend f\n\nrun() = print(f())\n")
+
+    lvc_clean(pre + "    if order.len() > 0\n        val xs = order.VIEW()\n\n        b.push(s\"${xs[0].start}\")\n\n" +
+              "    b.finish()\nend f\n\nrun() = print(f())\n")
+
+    lvc_clean(pre + "    defer print(\"done\")\n\n    val xs = order.VIEW()\n\n    b.push(s\"${xs.len}\")\n" +
+              "    b.finish()\nend f\n\nrun() = print(f())\n")
+
+    lvc_clean("g() -> usize\n    var b = str_builder()\n    var order: Buf[Placed] = buf()\n\n" +
+              "    order.push(Placed(1, 2))\n    val xs = order.VIEW()\n\n    b.push(\"x\")\n" +
+              "    return xs[0].index + b.finish().len\nend g\n\nrun() = print(g())\n")
+
+// -- still refused ----------------------------------------------------------------------------------
+
+@test("a call handed the buffer, by pointer or by value, is refused")
+lvc_passed_refused()
+    if !lvc_ready() then return
+
+    lvc_refused("reset(b: *Buf[Placed])\n    *b = buf()\n\nf()\n" +
+                "    var order: Buf[Placed] = buf()\n\n    order.push(Placed(1, 2))\n" +
+                "    val xs = order.VIEW()\n\n    reset(&order)\n    print(xs.len)\n\nrun() = f()\n",
+                "'reset' may write a 'Buf[Placed]'")
+
+    lvc_refused("var kept: Buf[Placed] = buf()\n\nkeep(b: Buf[Placed])\n    kept = b\n\nf()\n" +
+                "    var order: Buf[Placed] = buf()\n\n    order.push(Placed(1, 2))\n" +
+                "    val xs = order.VIEW()\n\n    keep(order)\n    print(xs.len)\n\nrun() = f()\n",
+                "'keep' may write a 'Buf[Placed]'")
+
+@test("a method on the buffer itself is refused while the view is in scope")
+lvc_own_method_refused()
+    if !lvc_ready() then return
+
+    for view in ["view_mut"]
+        val out = lvc_said(lvc_program("f()\n    var order: Buf[Placed] = buf()\n\n" +
+                                       "    order.push(Placed(1, 2))\n    val xs = order.VIEW()\n\n" +
+                                       "    order.push(Placed(3, 4))\n    print(xs.len)\n\nrun() = f()\n", view))
+
+        assert(out.contains("'xs' is a view borrowed from 'order'"), s"with $view, got: $out")
+
+@test("a closure that captured the buffer is refused where it is called, and one that did not is not")
+lvc_captured_refused()
+    if !lvc_ready() then return
+
+    for view in ["view_mut"]
+        val out = lvc_said(lvc_program("f()\n    var order: Buf[Placed] = buf()\n\n" +
+                                       "    order.push(Placed(1, 2))\n" +
+                                       "    val add = () -> order.push(Placed(0, 0))\n" +
+                                       "    val xs = order.VIEW()\n\n    add()\n    print(xs.len)\n\nrun() = f()\n",
+                                       view))
+
+        assert(out.contains("'xs' is a view borrowed from 'order'"), s"with $view, got: $out")
+
+    // A closure that did not capture it is called with nothing of the buffer's.
+    lvc_clean("f()\n    var b = str_builder()\n    var order: Buf[Placed] = buf()\n\n" +
+              "    order.push(Placed(1, 2))\n    val add = () -> b.push(\"x\")\n" +
+              "    val xs = order.VIEW()\n\n    add()\n    print(xs.len)\n\nrun() = f()\n")
+
+@test("a buffer stored in module storage or a struct is refused at a call that writes it there")
+lvc_stored_refused()
+    if !lvc_ready() then return
+
+    lvc_refused("var kept: Buf[Placed] = buf()\n\npoke()\n    kept = buf()\n\nf()\n" +
+                "    var order: Buf[Placed] = buf()\n\n    order.push(Placed(1, 2))\n    kept = order\n" +
+                "    val xs = order.VIEW()\n\n    poke()\n    print(xs.len)\n\nrun() = f()\n",
+                "'poke' may write a 'Buf[Placed]'")
+
+    lvc_refused("struct Holder\n    b: Buf[Placed]\n\nbump(h: &Holder)\n    h.b = buf()\n\nf()\n" +
+                "    var order: Buf[Placed] = buf()\n\n    order.push(Placed(1, 2))\n" +
+                "    val h: &Holder = Holder(order)\n    val xs = order.VIEW()\n\n    bump(h)\n" +
+                "    print(xs.len)\n\nrun() = f()\n",
+                "'bump' may write a 'Buf[Placed]'")
+
+@test("a buffer handed earlier to something that kept it is refused at an unrelated-looking call")
+lvc_kept_earlier_refused()
+    if !lvc_ready() then return
+
+    lvc_refused("var kept: Buf[Placed] = buf()\n\nkeep(b: Buf[Placed])\n    kept = b\n\n" +
+                "tick()\n    kept = buf()\n\nf()\n" +
+                "    var order: Buf[Placed] = buf()\n\n    order.push(Placed(1, 2))\n    keep(order)\n" +
+                "    val xs = order.VIEW()\n\n    tick()\n    print(xs.len)\n\nrun() = f()\n",
+                "'tick' may write a 'Buf[Placed]'")
+
+@test("a call in a defer or a loop that is handed the buffer is still refused")
+lvc_interactions_refused()
+    if !lvc_ready() then return
+
+    lvc_refused("reset(b: *Buf[Placed])\n    *b = buf()\n\nf()\n" +
+                "    var order: Buf[Placed] = buf()\n\n    order.push(Placed(1, 2))\n" +
+                "    val xs = order.VIEW()\n\n    for item in xs\n        reset(&order)\n\n" +
+                "    print(xs.len)\n\nrun() = f()\n",
+                "'reset' may write a 'Buf[Placed]'")
+
+    lvc_refused("reset(b: *Buf[Placed])\n    *b = buf()\n\nf()\n" +
+                "    var order: Buf[Placed] = buf()\n\n    order.push(Placed(1, 2))\n" +
+                "    val xs = order.VIEW()\n\n    defer reset(&order)\n\n" +
+                "    print(xs.len)\n\nrun() = f()\n",
+                "'reset' may write a 'Buf[Placed]'")
