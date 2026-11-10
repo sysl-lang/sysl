@@ -746,6 +746,16 @@ private task_hook_text(e: *Emit) -> string =
 // **It is a thread's own where the target has thread-local storage**, as `block_on`'s note is: a task
 // handed to another thread is stepped there by an executor of its own, and two threads stepping at
 // once would otherwise each read the other's waker. A target with none has one slot.
+//
+// **The slot is ONE symbol for the whole link, `weak_odr` and not `internal`**, because the `step`
+// and the `park` that meet in it are often in different objects: an executor in the program stepping
+// a task whose `park` was compiled into a `--lib` root's or a package's `.syslib`, or the other way
+// round. Each object carries the runtime it calls, and a slot of its own in each would let a `park`
+// read a slot no `step` ever set -- the waker it hands out is then null, and calling it does nothing,
+// so the task is never stepped again. With one slot of its own the optimizer goes further and folds
+// the `park`'s read to null outright. It is not `hidden` either: a relocatable link (`ld -r`, which a
+// `.syslib` of several units goes through on Mach-O) turns a hidden symbol into a local one, which is
+// the same separate slot again.
 
 // `thread_local ` where the target keeps storage per thread, and nothing where it does not.
 private task_tls(e: *Emit) -> string = if e.target.thread_local_storage() then "thread_local " else ""
@@ -753,7 +763,7 @@ private task_tls(e: *Emit) -> string = if e.target.thread_local_storage() then "
 // The waker of the step in progress, `{ table, box }` as any `&Fn() -> unit` is; null outside one.
 private request_current(e: *Emit)
     request_helper(e, "sysl.task.current", HrText(
-        s"@sysl.task.current = internal ${task_tls(e)}global { ptr, ptr } zeroinitializer\n"))
+        s"@sysl.task.current = weak_odr ${task_tls(e)}global { ptr, ptr } zeroinitializer\n"))
 
 // `step`'s runtime, with the slot it sets; answers its name.
 private request_stepping(e: *Emit) -> string
