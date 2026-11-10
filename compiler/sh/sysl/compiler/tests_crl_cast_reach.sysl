@@ -1,0 +1,227 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A call made while a view is live is cleared where its callee cannot get hold of a value of the
+// type the view's storage is held in (`checks.sysl`'s `unreachable_to`), and a pointer cast to a type
+// holding one is a way to get hold of it -- but only for a callee that can run the code that casts:
+// its own body and everything that calls, and, once it calls a foreign function the program or a
+// package declared, everything C can enter. The standard library's own foreign functions never call
+// back into the program, so a callee reaching only those is not answerable for a cast elsewhere.
+//
+// Module storage is counted the same way: a `*extern` function pointer reaches anything, so a
+// global holding one counts against a callee that names it or that calls such a foreign function,
+// which may hold its address, and not against one that does neither.
+//
+// Every program views a `Buf[string]` and calls something while the view is live; `Vm` holds a
+// `Buf[string]` by value, and `back` casts a pointer to one. Every accepted program is built and
+// run at `-O0` with the heap counted (net zero), at `-O1` and at `-O2`, and prints the same at each.
+
+private crl_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end crl_ready
+
+private crl_head() -> string = """
+    import sysl.buf.{Buf, buf}
+    import sysl.fs.{is_dir, read_bytes}
+    import sysl.raw.ptr_cast
+
+    struct Vm
+        names: Buf[string]
+
+    gather(out: *Buf[string]) -> bool
+        if is_dir("/") then out.push("/etc/hosts")
+        true
+
+    seen(s: string) -> int = read_bytes(s) match
+        Err(_) -> 0
+        Ok(body) -> if body.len > 0 then 1 else 0
+
+    """
+
+private crl_tail(call: string) -> string = """
+
+    hash() -> int
+        var paths: Buf[string] = buf()
+
+        if !gather(&paths) then return -1
+
+        var names = paths.view_mut()
+        var total = 0
+
+        for i in 0..<names.len
+    """ + s"        total += $call\n" + """
+
+        total
+    end hash
+
+    main()
+        var vm = Vm(buf())
+
+        print(back(ptr_cast[*u8](&vm)), hash())
+    """
+
+// A program: `decls` at the top level, and `call` made on `names[i]` while the view is live.
+private crl_program(decls: string, call: string) -> string = crl_head() + decls + crl_tail(call)
+
+private crl_root(text: string) -> string
+    val root = make_temp_dir("sysl-cast-reach").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+
+private crl_said(text: string) -> string
+    val root = crl_root(text)
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end crl_said
+
+private crl_ran(text: string, level: string, counted: bool) -> string
+    val root = crl_root(text)
+    val exe = s"$root/built"
+
+    force_alloc_counting(counted)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, level, Some(exe))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text + out.err.unwrap_or("")
+end crl_ran
+
+private crl_accepted(decls: string, call: string)
+    val text = crl_program(decls, call)
+    val out = crl_said(text)
+
+    assert(!out.contains("error"), s"expected no complaint, got: $out")
+    assert_eq(crl_ran(text, "0", true), "0 1\n")
+    assert_eq(crl_ran(text, "1", false), "0 1\n")
+    assert_eq(crl_ran(text, "2", false), "0 1\n")
+end crl_accepted
+
+private crl_refused(decls: string, call: string, callee: string)
+    val out = crl_said(crl_program(decls, call))
+    val said = s"'names' is a view borrowed from 'paths', held in a 'Buf[string]', and '$callee' may " +
+               "write a 'Buf[string]'"
+
+    assert(out.contains(said), s"expected '$said' in: $out")
+end crl_refused
+
+private crl_back() -> string = "back(p: *u8) -> usize = ptr_cast[*Vm](p).names.len()\n"
+
+private crl_exported() -> string = "@export(\"crl_back\")\n" + crl_back()
+
+private crl_abs() -> string = "extern \"abs\" crl_abs(n: int) -> int\n\n" +
+    "measured(s: string) -> int = if crl_abs(0 - int(s.len)) > 0 then 1 else 0\n"
+
+private crl_hook() -> string = "twice(n: int) -> int = n * 2\n\n" +
+    "var hook: *extern(int) -> int = &twice\n\n" +
+    "back(p: *u8) -> usize = ptr_cast[*Vm](p).names.len() + usize(hook(0))\n"
+
+@test("a callee reaching only the standard library's foreign functions is not answerable for a cast an exported function makes")
+crl_std_externs_exported_cast()
+    if !crl_ready() then return
+
+    crl_accepted(crl_exported(), "seen(names[i])")
+
+@test("a callee whose own body casts a pointer to a type holding the viewed buffer is refused")
+crl_own_cast()
+    if !crl_ready() then return
+
+    crl_refused(crl_back() + "\npoke(s: string) -> int\n    var spare = 0\n" +
+                "    val vm = ptr_cast[*Vm](ptr_cast[*u8](&spare))\n\n" +
+                "    if s.len > 1000 then *vm = Vm(buf())\n    if s.len > 0 then 1 else 0\n",
+                "poke(names[i])", "poke")
+
+@test("a callee that casts only through a function it calls is refused")
+crl_callee_of_callee_casts()
+    if !crl_ready() then return
+
+    crl_refused(crl_back() + "\nbump(s: string)\n    var spare = 0\n" +
+                "    val vm = ptr_cast[*Vm](ptr_cast[*u8](&spare))\n\n" +
+                "    if s.len > 1000 then *vm = Vm(buf())\n\n" +
+                "poke(s: string) -> int\n    bump(s)\n    seen(s)\n",
+                "poke(names[i])", "poke")
+
+@test("a callee calling a foreign function the program declares is refused where a function C can enter casts")
+crl_program_extern_exported_cast()
+    if !crl_ready() then return
+
+    crl_refused(crl_exported() + "\n" + crl_abs(), "measured(names[i])", "measured")
+
+@test("a global holding a C function pointer is not answerable for a callee that reaches only the standard library")
+crl_hook_global_std_only()
+    if !crl_ready() then return
+
+    crl_accepted(crl_hook(), "seen(names[i])")
+
+@test("a global holding a C function pointer counts against a callee calling a foreign function the program declares")
+crl_hook_global_program_extern()
+    if !crl_ready() then return
+
+    crl_refused(crl_hook() + "\n" + crl_abs(), "measured(names[i])", "measured")
+
+@test("a global holding a C function pointer counts against a callee that names it")
+crl_hook_global_named()
+    if !crl_ready() then return
+
+    crl_refused(crl_hook() + "\nhooked(s: string) -> int = hook(int(s.len)) + seen(s)\n",
+                "hooked(names[i])", "hooked")
+
+@test("a destructor that casts a pointer to a type holding the viewed buffer counts against a callee reaching only the standard library")
+crl_destructor_casts()
+    if !crl_ready() then return
+
+    crl_refused("struct Guard\n    n: int\n\nimpl Drop for Guard\n    drop(self)\n" +
+                "        var spare = 0\n        val vm = ptr_cast[*Vm](ptr_cast[*u8](&spare))\n\n" +
+                "        if self.n > 1000 then *vm = Vm(buf())\n\n" +
+                "back(p: *u8) -> usize\n    val g = Guard(1)\n\n" +
+                "    ptr_cast[*Vm](p).names.len() + usize(g.n - 1)\n",
+                "seen(names[i])", "seen")
+
+@test("a generic callee whose instance casts a pointer to a type holding the viewed buffer is refused")
+crl_generic_cast()
+    if !crl_ready() then return
+
+    crl_refused(crl_back() + "\npoke[T](s: string, fill: T) -> int\n    var spare = u8(0)\n" +
+                "    val p = ptr_cast[*T](ptr_cast[*u8](&spare))\n\n" +
+                "    if s.len > 1000 then *p = fill\n    if s.len > 0 then 1 else 0\n",
+                "poke(names[i], Vm(buf()))", "poke.Vm")
+
+@test("a generic callee whose instance casts only to a type unrelated to the viewed buffer is accepted")
+crl_generic_cast_unrelated()
+    if !crl_ready() then return
+
+    crl_accepted(crl_back() + "\npoke[T](s: string, fill: T) -> int\n    var spare = u8(0)\n" +
+                 "    val p = ptr_cast[*T](ptr_cast[*u8](&spare))\n\n" +
+                 "    if s.len > 1000 then *p = fill\n" +
+                 "    seen(s)\n",
+                 "poke(names[i], 7)")

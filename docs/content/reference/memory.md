@@ -2157,7 +2157,46 @@ directly, or through anything it calls — is refused while the ref is live; one
 writes only its own locals and types unrelated to the ref's storage, is not. A call through a closure
 or a trait object names no body to ask, so it is refused. A function with no body in the program — a
 library's already compiled, or a foreign one — was compiled without the program's types, so it is
-judged by its arguments: it is refused when one of them can reach such a value.
+judged by what it can get hold of: it is refused when one of its arguments can reach such a value,
+when module storage it can name holds one, or when code it can run casts a pointer to a type holding
+one. The same answer clears a callee whose body ends in such a function, as `print` and `read_bytes`
+do.
+
+**What a callee can run is what it reaches**: its own body, every body it calls, and every
+destructor, since letting go of a value may run one. A call through a pointer or a trait object
+anywhere in that could run anything, so there every cast and all module storage in the program
+count. A foreign function the program or a package declares may call back into the program through
+whatever C can enter — an `@export`, a `@section` function, one whose address is taken, one with a
+foreign calling convention — so calling one reaches all of those, and all module storage, whose
+address C may hold. **The standard library's own `extern`s are the exception**: they are the C
+library and the runtime, which never call back into the program, so a `ptr_cast` somewhere else in it
+is no reason to refuse a call to `read_bytes`. Here `first` makes a `*Vm` out of bytes, and `print`,
+which cannot run `first`, is still asked nothing about it while `e` is live:
+
+```sysl
+import sysl.raw.ptr_cast
+
+struct Node
+    cell: []int
+
+struct Vm
+    node: Node
+
+first(p: *u8) -> int = ptr_cast[*Vm](p).node.cell[0]
+
+var vm = Vm(Node([1, 2, 3]))
+
+ref e = vm.node.cell[1]
+
+print("held", e)
+e = 5
+print(first(ptr_cast(&vm)), vm.node.cell[1])
+```
+
+```output
+held 2
+1 5
+```
 
 ```sysl
 struct Node

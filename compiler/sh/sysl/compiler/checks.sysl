@@ -107,15 +107,27 @@ private check_over(a: &Analysis, name: string) -> bool
 // have no body here at all. It can get hold of one only through what it is handed, through module
 // storage, or by making a pointer to one out of something else: so it is cleared where no argument
 // reaches a slot of the type behind a reference, pointer or view (an argument of the type itself is
-// the callee's own copy), no module storage reaches one, and nothing in the program casts a pointer
-// to the type.
+// the callee's own copy), no module storage it can name reaches one, and no code it can run casts a
+// pointer to the type.
+//
+// **What a callee can run is what it reaches** (`Reacher`): its own body and every body it calls, on
+// any path, with each destructor in the program, since letting go of a value may run one. A body
+// that may run code no call names -- a call through a pointer or a trait's table, a suspension --
+// could run anything, so there every cast and all module storage count, as they do for a program
+// read whole. **A foreign function can call back into the program** through whatever C can enter
+// (`c_entered`: the exported functions, those whose address is taken, those in a `@section` or with
+// a foreign convention), so reaching one reaches all of those, and all module storage, which C may
+// hold the address of. **The standard library's own foreign functions are the exception**: the ones
+// declared under `sysl.*` are the C library's and the runtime's, and none calls back into the
+// program, so reaching one reaches nothing more. A foreign function a program or a package declares
+// is not trusted, and nor is a function with no body here outside `sysl.*`.
 private check_ref_calls(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal])
     if a.ref_watches.is_empty() then return
 
-    var globals: Buf[Type] = buf()
+    var globals: Buf[(string, Type)] = buf()
 
     for item in vals
-        globals.push(item.ty)
+        globals.push((item.symbol, item.ty))
 
     // **The program's foreign functions are part of what the bodies are read against**: a path that
     // ends the program -- `unwrap`'s panic, a failed bounds check -- reports why through them, and
@@ -125,6 +137,7 @@ private check_ref_calls(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal])
                      false, buf(), buf(), "", buf(), buf(), buf(), buf(), buf(), buf(), buf(), None,
                      buf(), false, false, false, true, map())
     var u = untouched_summary(p, dropping_reached(a))
+    val reach = reacher(a, p, &u)
     var known: Set[string] = set()
     val sink: &ErasedSink = ErasedSink(buf())
 
@@ -155,9 +168,119 @@ private check_ref_calls(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal])
             if w.root != "" && !confined.has(w.root) && confined_local(at, consts, erased, f, w.root, w.types)
                 confined.add(w.root)
 
-        walk_block_stmts(f.body, expr_walk(false, e -> ref_call(a, at, known, globals, erased, scope,
-                                                                mine, holders, confined, e)))
+        walk_block_stmts(f.body, expr_walk(false, e -> ref_call(a, at, reach, known, globals, erased,
+                                                                scope, mine, holders, confined, e)))
 end check_ref_calls
+
+// What one callee can run, as `check_ref_calls` counts it: the types the casts in it make pointers to,
+// the module storage it names, and whether all module storage counts (`all_reads`) or every cast and
+// all of it does (`all`).
+private struct Reach
+    casts: Buf[Type]
+    reads: Set[string]
+    all_reads: bool
+    all: bool
+
+// Each callee's `Reach`, worked out from the bodies' summary the first time a call to it is judged.
+private struct Reacher
+    index: Map[string, usize]
+    foreign: Set[string]
+    trusted: Set[string]
+    entered: Buf[string]
+    drops: Buf[string]
+    known: Map[string, Reach]
+
+    of(*self, a: &Analysis, u: *Untouched, name: string) -> Reach
+        self.known.get(name) match
+            Some(r) -> return r
+            None -> ()
+
+        var out = Reach(buf(), set(), false, false)
+        var seen: Set[string] = set()
+        var todo: Buf[string] = buf()
+
+        todo.push(name)
+
+        for item in self.drops
+            todo.push(item)
+
+        val called_c = self.gather(a, u, &todo, &seen, &out)
+
+        // C may call back into whatever it can enter, and each of those may reach another foreign
+        // function: the second walk's answer adds nothing, since every entry is already on it.
+        if called_c && !out.all
+            out.all_reads = true
+
+            for item in self.entered
+                todo.push(item)
+
+            val _ = self.gather(a, u, &todo, &seen, &out)
+
+        self.known.put(name, out)
+        out
+    end of
+
+    // Walks every body reached from `todo` into `out`, and answers whether one of them calls a
+    // foreign function that is not the standard library's.
+    gather(*self, a: &Analysis, u: *Untouched, todo: *Buf[string], seen: *Set[string], out: *Reach) -> bool
+        var called_c = false
+
+        while !todo.is_empty() && !out.all
+            val name = todo.pop().unwrap()
+
+            if seen.has(name) then continue
+
+            seen.add(name)
+
+            self.index.get(name) match
+                Some(i) ->
+                    if u.opaque[i]
+                        out.all = true
+                        break
+
+                    for item in u.casts[i]
+                        out.casts.push(item)
+
+                    for item in u.reads[i]
+                        out.reads.add(item)
+
+                    for item in u.calls[i]
+                        todo.push(item)
+
+                    for item in u.exits[i]
+                        todo.push(item)
+                None ->
+                    val std = self.trusted.has(name) ||
+                              (!self.foreign.has(name) && std_module(func_home(a, name).module_name))
+
+                    if !std then called_c = true
+
+        called_c
+    end gather
+end Reacher
+
+private reacher(a: &Analysis, p: TProgram, u: *Untouched) -> &Reacher
+    var index: Map[string, usize] = map()
+
+    for i in 0..<u.names.len()
+        index.put(u.names[i], i)
+
+    var foreign: Set[string] = set()
+    var trusted: Set[string] = set()
+
+    for item in p.externs
+        val home = a.tables.extern_scopes.get(item.name)
+
+        if home.is_some() && std_module(home.unwrap().scope.module_name) then trusted.add(item.name)
+        else foreign.add(item.name)
+
+    var drops: Buf[string] = buf()
+
+    for f in p.funcs
+        if module_bare(f.name) == "drop" || f.name.ends_with(".drop") then drops.push(f.name)
+
+    Reacher(index, foreign, trusted, c_entered(p), drops, map())
+end reacher
 
 // -- a local no callee can reach --------------------------------------------------------------------
 
@@ -440,7 +563,7 @@ private note_erased(out: &ErasedSink, e: TExpr) = *e.kind match
             _ -> ()
     _ -> ()
 
-private ref_call(a: &Analysis, u: *Untouched, known: Set[string], globals: Buf[Type],
+private ref_call(a: &Analysis, u: *Untouched, reach: &Reacher, known: Set[string], globals: Buf[(string, Type)],
                  erased: Buf[(string, Type)], scope: Scope,
                  mine: Buf[RefWatch], holders: Map[string, Buf[string]], confined: Set[string], e: TExpr)
     val callee = *e.kind match
@@ -482,7 +605,7 @@ private ref_call(a: &Analysis, u: *Untouched, known: Set[string], globals: Buf[T
             var cleared = false
 
             if name != ""
-                cleared = unreachable_to(u, globals, erased, args, t) ||
+                cleared = unreachable_to(u, reach.of(a, u, name), globals, erased, args, t) ||
                           (known.has(name) && untouched_by(u, t, w.lent).has(name))
             end if
 
@@ -507,18 +630,24 @@ private ref_call(a: &Analysis, u: *Untouched, known: Set[string], globals: Buf[T
             end if
 end ref_call
 
-// Whether a callee handed `args` has no way to get hold of a value of type `t` held anywhere else.
-private unreachable_to(u: *Untouched, globals: Buf[Type], erased: Buf[(string, Type)],
+// Whether a callee handed `args`, which can run what `r` says, has no way to get hold of a value of
+// type `t` held anywhere else.
+private unreachable_to(u: *Untouched, r: Reach, globals: Buf[(string, Type)], erased: Buf[(string, Type)],
                        args: Buf[TExpr], t: Type) -> bool
     val want = underlying(t)
 
     var cast: Buf[Type] = buf()
 
-    for item in u.laundered.anywhere
-        cast.push(item)
+    if r.all
+        for item in u.laundered.anywhere
+            cast.push(item)
 
-    for item in u.laundered.into
-        cast.push(item)
+        for item in u.laundered.into
+            cast.push(item)
+    else
+        for item in r.casts
+            cast.push(item)
+    end if
 
     for item in cast
         var parts: Buf[Type] = buf()
@@ -529,9 +658,11 @@ private unreachable_to(u: *Untouched, globals: Buf[Type], erased: Buf[(string, T
             if part == want then return false
 
     for item in globals
+        if !r.all && !r.all_reads && !r.reads.has(item.0) then continue
+
         var seen: Set[string] = set()
 
-        if type_reaches(item, want, true, erased, &seen) then return false
+        if type_reaches(item.1, want, true, erased, &seen) then return false
 
     for item in args
         var seen: Set[string] = set()
