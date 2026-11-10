@@ -1042,8 +1042,14 @@ end untouched_summary
 
 // The functions that cannot write a value of type `t` held anywhere, nor give back a count one holds,
 // before they return: the greatest set closed under the rule, as `inert_callees` computes it.
-untouched_by(u: *Untouched, t: Type) -> Set[string]
-    val key = mangle(t)
+//
+// **`lent` is the element type of a view the caller holds of a `t`'s storage**, asked about by a call
+// made while the view is live (`checks.sysl`'s `ref_call`). Writing a value of that type through a
+// cast pointer is still a write of something no `t` holds by value -- it gives back no count, so it
+// frees nothing the view reads -- and so a write whose object is of that type is judged by what holds
+// what, not by the casts. Every count it gives back is judged as before.
+untouched_by(u: *Untouched, t: Type, lent: Type = Unknown) -> Set[string]
+    val key = if lent == Unknown then mangle(t) else s"${mangle(t)}|${mangle(lent)}"
     val known = u.answers.get(key)
 
     if known.is_some() then return known.unwrap()
@@ -1065,7 +1071,13 @@ untouched_by(u: *Untouched, t: Type) -> Set[string]
             if ok
                 val k = mangle(root)
 
-                if !root_hits.has(k) then root_hits.put(k, overlaps(root, t, parts, u.laundered))
+                if !root_hits.has(k)
+                    if lent != Unknown && underlying(root) == lent
+                        root_hits.put(k, held_with(underlying(root), t, parts))
+                    else
+                        root_hits.put(k, overlaps(root, t, parts, u.laundered))
+                end if
+
                 if root_hits.get(k).unwrap() then ok = false
 
         for given in u.gives[i]

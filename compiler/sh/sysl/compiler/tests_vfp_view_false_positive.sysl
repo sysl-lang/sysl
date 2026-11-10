@@ -1,0 +1,238 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// Two refusals of a view that read a legal program as an escape or a free.
+//
+// **A value made by a call that cannot hold a view hands back nothing of what the call was given**
+// (`view_borrow.sysl`'s `view_roots`): `count(xs.view_mut()) match …` answering a buffer built in an
+// arm returns nothing borrowed from `xs`. A call's own span is its callee's name, so the arguments
+// under it are told apart from the rest of the value by the nodes the walk visits, not by lying inside
+// that span.
+//
+// **A callee handed a view writes the view's elements, which is what `view_mut` is for** (`checks.sysl`'s
+// `ref_call`, `borrowing.sysl`'s `untouched_by`): a write of a value of the element type gives back no
+// count and frees nothing the view reads, even where the program casts a pointer to that type. A
+// callee that can reach the buffer -- handed it beside the view, through a closure that captured it,
+// or through module storage it was put in -- is still refused.
+//
+// Every program carries what makes the by-type answers give up: module storage holding a C function
+// pointer, which is taken to reach every type, and a pointer cast to `*long`, the element type, from
+// something that is not the address of a named object -- a pointer that may point anywhere.
+
+private vfp_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end vfp_ready
+
+private vfp_head() -> string =
+    "import sysl.buf.{Buf, buf}\nimport sysl.slices.{sort, sort_by}\nimport sysl.raw.ptr_cast\n\n" +
+    "var hook: Option[*extern() -> unit] = None\n\n" +
+    "made(n: long) -> Buf[long]\n    var out = buf[long]()\n\n    out.push(n)\n    out.push(n - 3)\n" +
+    "    out.push(n + 3)\n    out\nend made\n\n"
+
+private vfp_tail() -> string =
+    "\nmain()\n    var x = 5\n    val p = ptr_cast[*u8](&x)\n    val q = ptr_cast[*long](p)\n\n" +
+    "    if q[0] == 0 then print(\"zero\")\n    if hook.is_some() then print(\"hook\")\n    run()\n"
+
+private vfp_program(body: string) -> string = vfp_head() + body + vfp_tail()
+
+private vfp_root(text: string) -> string
+    val root = make_temp_dir("sysl-view-fp").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+
+// What analysing a program said, all of it.
+private vfp_said(body: string) -> string
+    val root = vfp_root(vfp_program(body))
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end vfp_said
+
+// What a program printed, or what the compiler said instead.
+private vfp_ran(body: string) -> string
+    val root = vfp_root(vfp_program(body))
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text + out.err.unwrap_or("")
+end vfp_ran
+
+// Accepted, and run: what it printed.
+private vfp_accepted(body: string, printed: string)
+    val out = vfp_said(body)
+
+    assert(!out.contains("error"), s"expected no complaint, got: $out")
+    assert_eq(vfp_ran(body), printed)
+
+// Refused with the wording a view of a local held over a call gets: the view, its buffer, and what
+// the call may do.
+private vfp_refused(body: string, part: string)
+    val out = vfp_said(body)
+
+    assert(out.contains("'view' is a view borrowed from "), s"expected the refusal in: $out")
+    assert(out.contains(part), s"expected '$part' in: $out")
+    assert(out.contains("which could free what the view reads"), s"got: $out")
+
+// -- a call answering no view, inside a value that could hold one -----------------------------------
+
+@test("a match on a call handed a view_mut, whose arm returns a fresh local Buf, is accepted")
+vfp_match_scrutinee()
+    if !vfp_ready() then return
+
+    vfp_accepted("struct State\n    xs: Buf[long]\n\nstruct Vm\n    state: State\n\n" +
+                 "fill(v: []long, n: long) -> long\n    if v.len > 0 then v[0] = n\n\n    n\nend fill\n\n" +
+                 "build(vm: &Vm, n: long) -> Buf[long]\n    fill(vm.state.xs.view_mut(), n) match\n" +
+                 "        0 -> buf()\n        k ->\n            var out = buf[long]()\n\n" +
+                 "            out.push(k)\n            out\nend build\n\n" +
+                 "local(n: long) -> Buf[long]\n    var xs = made(n)\n\n    (fill(xs.view_mut(), n)) match\n" +
+                 "        0 -> buf()\n        _ -> made(1)\nend local\n\n" +
+                 "run()\n    val vm = Vm(State(made(2)))\n\n    print(build(vm, 4)[0])\n" +
+                 "    print(build(vm, 0).len())\n    print(vm.state.xs[0])\n    print(local(4).len())\n",
+                 "4\n0\n0\n3\n")
+
+@test("an Option or enum scrutinee from such a call, and an if, are accepted")
+vfp_option_and_if()
+    if !vfp_ready() then return
+
+    vfp_accepted("enum Seen\n    Empty\n    Got(n: long)\n\n" +
+                 "first(v: []long) -> Option[long]\n    if v.len == 0 then return None\n\n" +
+                 "    v[0] = v[0] + 1\n    Some(v[0])\nend first\n\n" +
+                 "seen(v: []long) -> Seen = if v.len == 0 then Empty else Got(v[0])\n\n" +
+                 "by_option(n: long) -> Buf[long]\n    var xs = made(n)\n\n    first(xs.view_mut()) match\n" +
+                 "        Some(k) ->\n            var out = buf[long]()\n\n            out.push(k)\n" +
+                 "            out\n        None -> buf()\nend by_option\n\n" +
+                 "by_enum(n: long) -> Buf[long]\n    var xs = made(n)\n\n    seen(xs.view_mut()) match\n" +
+                 "        Got(k) -> made(k)\n        Empty -> buf()\n\n" +
+                 "by_if(n: long) -> Buf[long]\n    var xs = made(n)\n\n" +
+                 "    if first(xs.view_mut()).is_some() then made(9) else buf()\nend by_if\n\n" +
+                 "run()\n    print(by_option(4)[0])\n    print(by_enum(4)[1])\n    print(by_if(4)[0])\n",
+                 "5\n1\n9\n")
+
+@test("a struct holding a string, built from a call handed a view_mut, borrows nothing")
+vfp_struct_of_call()
+    if !vfp_ready() then return
+
+    vfp_accepted("struct Tally\n    n: long\n    label: string\n\n" +
+                 "count(v: []long) -> long\n    v[0] = 0\n    long(v.len)\nend count\n\n" +
+                 "tally(n: long) -> Tally\n    var xs = made(n)\n\n    Tally(count(xs.view_mut()), \"ok\")\nend tally\n\n" +
+                 "run()\n    val t = tally(4)\n\n    print(t.n)\n    print(t.label)\n",
+                 "3\nok\n")
+
+// -- a named view handed to a callee that writes its elements --------------------------------------
+
+@test("a named view_mut handed to sort is accepted, as the inline form is")
+vfp_named_sort()
+    if !vfp_ready() then return
+
+    vfp_accepted("named(n: long) -> Option[Buf[long]]\n    var keys = made(n)\n" +
+                 "    var view = keys.view_mut()\n\n    sort(view)\n    Some(keys)\nend named\n\n" +
+                 "inline(n: long) -> Option[Buf[long]]\n    var keys = made(n)\n\n" +
+                 "    sort(keys.view_mut())\n    Some(keys)\nend inline\n\n" +
+                 "run()\n    print(named(4).unwrap()[0])\n    print(inline(4).unwrap()[2])\n",
+                 "1\n7\n")
+
+@test("a named view handed to sort_by with a closure, and to a user function writing its elements")
+vfp_sort_by_and_writer()
+    if !vfp_ready() then return
+
+    vfp_accepted("negate(v: []long)\n    for i in 0..<v.len\n        v[i] = -v[i]\nend negate\n\n" +
+                 "down(n: long) -> long\n    var keys = made(n)\n    val view = keys.view_mut()\n\n" +
+                 "    sort_by(view, (a, b) -> a > b)\n    view[0] * 10 + keys[2]\nend down\n\n" +
+                 "flipped(n: long) -> long\n    var keys = made(n)\n    val view = keys.view_mut()\n\n" +
+                 "    negate(view)\n    view[1] + keys[0]\nend flipped\n\n" +
+                 "run()\n    print(down(4))\n    print(flipped(4))\n",
+                 "71\n-5\n")
+
+@test("two views of two buffers handed to one call are accepted")
+vfp_two_views()
+    if !vfp_ready() then return
+
+    vfp_accepted("trade(a: []long, b: []long)\n    val t = a[0]\n\n    a[0] = b[0]\n    b[0] = t\nend trade\n\n" +
+                 "both(n: long) -> long\n    var a = made(n)\n    var b = made(n * 10)\n" +
+                 "    val va = a.view_mut()\n    val vb = b.view_mut()\n\n    trade(va, vb)\n" +
+                 "    va[0] + vb[0] * 100\nend both\n\n" +
+                 "run() = print(both(4))\n",
+                 "440\n")
+
+@test("the view read by a for after the call, in a nested block, and by a defer")
+vfp_view_interactions()
+    if !vfp_ready() then return
+
+    vfp_accepted("summed(n: long) -> long\n    var keys = made(n)\n    val view = keys.view_mut()\n\n" +
+                 "    sort(view)\n\n    var total = 0\n\n    for x in view\n        total = total * 10 + x\n\n" +
+                 "    total\nend summed\n\n" +
+                 "nested(n: long) -> long\n    var keys = made(n)\n    var got = 0\n\n    if n > 0\n" +
+                 "        val view = keys.view_mut()\n\n        sort(view)\n        got = view[0]\n\n" +
+                 "    keys.push(got)\n    keys[3]\nend nested\n\n" +
+                 "deferred(n: long) -> long\n    var keys = made(n)\n    var got = 0\n\n    if n > 0\n" +
+                 "        val view = keys.view_mut()\n\n        defer got = view[2]\n        sort(view)\n\n" +
+                 "    got\nend deferred\n\n" +
+                 "run()\n    print(summed(4))\n    print(nested(4))\n    print(deferred(4))\n",
+                 "147\n1\n7\n")
+
+// -- still refused ---------------------------------------------------------------------------------
+
+@test("a call answering a slice of its view argument, returned, is still a view escaping")
+vfp_returned_slice_refused()
+    if !vfp_ready() then return
+
+    val out = vfp_said("head(v: []long) -> []long = v[0..<1]\n\n" +
+                       "escape(n: long) -> []long\n    var xs = made(n)\n\n    head(xs.view_mut())\nend escape\n\n" +
+                       "run() = print(escape(4)[0])\n")
+
+    assert(out.contains("this returns a view borrowed from 'xs', and nothing keeps 'xs' alive once " +
+                        "this function returns"), s"got: $out")
+
+@test("the view handed to a callee that is also handed the buffer and pushes is refused")
+vfp_owner_handed_refused()
+    if !vfp_ready() then return
+
+    vfp_refused("grow(v: []long, owner: *Buf[long]) = owner.push(v[0])\n\n" +
+                "f(n: long) -> long\n    var keys = made(n)\n    val view = keys.view_mut()\n\n" +
+                "    grow(view, &keys)\n    view[0]\nend f\n\nrun() = print(f(4))\n",
+                "'grow' may write a 'Buf[long]'")
+
+@test("the view handed to a closure that captured the buffer is refused")
+vfp_closure_refused()
+    if !vfp_ready() then return
+
+    vfp_refused("f(n: long) -> long\n    var keys = made(n)\n    val add = (v: []long) -> keys.push(v[0])\n" +
+                "    val view = keys.view_mut()\n\n    add(view)\n    view[0]\nend f\n\nrun() = print(f(4))\n",
+                "the closure in 'f' may write a 'Buf[long]'")
+
+@test("the view handed to a callee that reaches the buffer through module storage is refused")
+vfp_global_refused()
+    if !vfp_ready() then return
+
+    vfp_refused("var store: Buf[long] = buf()\n\nstash(v: []long) = store.push(v[0])\n\n" +
+                "f(n: long) -> long\n    store = made(n)\n    val view = store.view_mut()\n\n" +
+                "    stash(view)\n    view[0]\nend f\n\nrun() = print(f(4))\n",
+                "'stash' may write a 'Buf[long]'")

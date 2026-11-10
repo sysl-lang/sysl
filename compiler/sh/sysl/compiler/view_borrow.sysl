@@ -2,6 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
+import sysl.container.{Set, set}
 import sysl.text.Search
 
 // A view a member hands back of its own receiver, and the receiver it may not outlive.
@@ -156,31 +157,33 @@ end fresh_string
 
 private struct RootSink
     roots: Buf[ViewRoot]
-    pruned: Buf[Span]
+    pruned: Set[string]
 end RootSink
 
 // The receivers a value may hold a view borrowed from: every `@views(self)` call in it and every
 // local it reads that holds one, reached through nothing that cannot hold a view. **A node that
 // cannot hold one ends the walk below it** -- `v.len` is an integer, so a value made from it is not
-// borrowed from anything `v` was.
+// borrowed from anything `v` was, and `count(v)` answering an integer hands back nothing of `v`.
 //
-// The walk visits the outermost node first, so a node is skipped when it lies inside a span already
-// found to be one of those.
+// The walk visits the outermost node first, so a node is skipped when it is one of the nodes under
+// one already found to be one of those. **They are told by their own spans, not by lying inside the
+// outer node's**: a call's span is its callee's name, so its arguments lie outside it.
 view_roots(cx: &Analyzer, e: TExpr) -> Buf[ViewRoot]
     var out: Buf[ViewRoot] = buf()
 
     if cx.view_calls.is_empty() && cx.view_borrows.is_empty() then return out
     if !holds_borrow(texpr_type(e), 0) then return out
 
-    val sink: &RootSink = RootSink(buf(), buf())
+    val sink: &RootSink = RootSink(buf(), set())
 
     walk_texpr(e, expr_walk(false, x -> visit_root(cx, sink, x)))
     sink.roots
 end view_roots
 
+private span_key(s: Span) -> string = s"${s.start}:${s.end}"
+
 private visit_root(cx: &Analyzer, sink: &RootSink, x: TExpr)
-    for s in sink.pruned
-        if x.span.start >= s.start && x.span.end <= s.end then return
+    if sink.pruned.has(span_key(x.span)) then return
 
     for item in cx.view_calls
         if item.0.start == x.span.start && item.0.end == x.span.end
@@ -189,7 +192,7 @@ private visit_root(cx: &Analyzer, sink: &RootSink, x: TExpr)
         end if
 
     if !holds_borrow(texpr_type(x), 0) || fresh_string(x)
-        sink.pruned.push(x.span)
+        walk_texpr(x, expr_walk(false, y -> sink.pruned.add(span_key(y.span))))
         return
     end if
 
@@ -290,6 +293,10 @@ private file_borrow(cx: &Analyzer, span: Span, unique: string, name: string, roo
 
     if at.is_none() then return
 
+    val lent = underlying(at.unwrap().1.ty) match
+        Slice(elem, _) -> underlying(*elem)
+        _ -> Unknown
+
     for r in roots
         var types: Buf[Type] = buf()
 
@@ -300,7 +307,7 @@ private file_borrow(cx: &Analyzer, span: Span, unique: string, name: string, roo
             _ -> ""
 
         cx.an.ref_watches.push(RefWatch(cx.watch_key(), name, types, span.end, None, at.unwrap().0,
-                                        r.name, buf(), root))
+                                        r.name, buf(), root, lent))
 end file_borrow
 
 // An assignment of `value` into `target`. **The target has to die before the receiver does**: a
