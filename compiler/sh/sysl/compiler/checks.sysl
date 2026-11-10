@@ -124,8 +124,12 @@ private check_ref_calls(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal])
     var known: Set[string] = set()
     val sink: &ErasedSink = ErasedSink(buf())
 
+    var consts: Set[string] = set()
+
     for f in funcs
         known.add(f.name)
+
+        if f.const_fn then consts.add(f.name)
         walk_block_stmts(f.body, expr_walk(false, e -> note_erased(sink, e)))
 
     val erased = sink.items
@@ -141,10 +145,128 @@ private check_ref_calls(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal])
         val scope = func_home(a, f.name)
         val at: *Untouched = &u
         val holders = closure_holders(f)
+        var confined: Set[string] = set()
+
+        for w in mine
+            if w.root != "" && !confined.has(w.root) && confined_local(at, consts, erased, f, w.root, w.types)
+                confined.add(w.root)
 
         walk_block_stmts(f.body, expr_walk(false, e -> ref_call(a, at, known, globals, erased, scope,
-                                                                mine, holders, e)))
+                                                                mine, holders, confined, e)))
 end check_ref_calls
+
+// -- a local no callee can reach --------------------------------------------------------------------
+
+// Whether the object a local of `f` holds is reachable by no name but the local's own, so that a
+// call can write it only where the local is written into the call.
+//
+// **The object is one only this local can name** where three things hold. The local is declared
+// once, from a fresh value: a buffer literal or a call to a `const` function, which can reach no
+// module storage and no address and so answers nothing but what it builds from its arguments, none
+// of whose types can reach a value of a type in `types`. Nothing assigns the local again. And every
+// other use of it hands it to a call that lets nothing of it out: one that is `const` or writes no
+// value of the type anywhere (`untouched_by`), whose other arguments and whose answer cannot hold a
+// value of the type -- or reads it in place, by subscript or length, for an element that cannot.
+//
+// A closure capturing it, a copy into another name, an assignment, a `ref` or a pointer taken
+// anywhere else is a use of none of those shapes, so the local is not confined and the call is
+// asked about by type, as every other one is.
+private confined_local(u: *Untouched, consts: Set[string], erased: Buf[(string, Type)], f: TFunc,
+                       root: string, types: Buf[Type]) -> bool
+    val tally: &LocalUses = LocalUses(0, 0, 0, true)
+
+    walk_block_stmts(f.body, TWalk(false, e -> tally_use(u, consts, erased, root, types, tally, e),
+                                   w -> (),
+                                   s -> tally_decl(consts, erased, root, types, tally, s)))
+
+    tally.decls == 1 && tally.fresh && tally.uses == tally.lent
+end confined_local
+
+// What `confined_local` counts: the declarations of the local, every load of it, the loads it
+// accepted as lending nothing out, and whether every declaration was fresh.
+private struct LocalUses
+    decls: int
+    uses: int
+    lent: int
+    fresh: bool
+end LocalUses
+
+private tally_decl(consts: Set[string], erased: Buf[(string, Type)], root: string, types: Buf[Type],
+                   tally: &LocalUses, s: TStmt) = s match
+    TVarDecl(name, _, init, _) ->
+        if name == root
+            tally.decls += 1
+
+            if !fresh_value(consts, erased, init, types) then tally.fresh = false
+        end if
+    _ -> ()
+
+// A value only the expression that made it holds.
+private fresh_value(consts: Set[string], erased: Buf[(string, Type)], e: TExpr, types: Buf[Type]) -> bool =
+    *e.kind match
+        TCall(name, args, _, _) -> consts.has(name) && none_reach(args, types, erased)
+        TBufLit(elems, _) -> none_reach(elems, types, erased)
+        _ -> false
+
+// Whether no value of these expressions' types can hold a value of a type in `types`, by value or
+// behind anything.
+private none_reach(es: Buf[TExpr], types: Buf[Type], erased: Buf[(string, Type)]) -> bool
+    for item in es
+        if reaches_any(texpr_type(item), types, erased) then return false
+
+    true
+end none_reach
+
+private reaches_any(from: Type, types: Buf[Type], erased: Buf[(string, Type)]) -> bool
+    for t in types
+        var seen: Set[string] = set()
+
+        if type_reaches(from, underlying(t), true, erased, &seen) then return true
+
+    false
+end reaches_any
+
+private is_load_of(e: TExpr, root: string) -> bool = *e.kind match
+    TLoad(name, _) -> name == root
+    TAddrOf(place, _) -> is_load_of(place, root)
+    _ -> false
+
+private tally_use(u: *Untouched, consts: Set[string], erased: Buf[(string, Type)], root: string,
+                  types: Buf[Type], tally: &LocalUses, e: TExpr) = *e.kind match
+    TLoad(name, _) -> if name == root then tally.uses += 1
+    TCall(name, args, ty, _) ->
+        var mine = 0
+        var others: Buf[TExpr] = buf()
+
+        for item in args
+            if is_load_of(item, root) then mine += 1 else others.push(item)
+
+        if mine > 0 && !reaches_any(ty, types, erased) && none_reach(others, types, erased) &&
+           (consts.has(name) || untouched_all(u, name, types))
+            tally.lent += mine
+        end if
+    TIndex(receiver, _, ty) ->
+        if is_load_of(receiver, root) && !reaches_any(ty, types, erased) then tally.lent += 1
+    TLen(receiver, _) -> if is_load_of(receiver, root) then tally.lent += 1
+    _ -> ()
+
+private untouched_all(u: *Untouched, name: string, types: Buf[Type]) -> bool
+    for t in types
+        if !untouched_by(u, t).has(name) then return false
+
+    true
+end untouched_all
+
+// Whether a call names a local anywhere in what it is handed.
+private call_names(e: TExpr, root: string) -> bool
+    val hit: &LocalUses = LocalUses(0, 0, 0, false)
+
+    walk_texpr(e, expr_walk(false, x -> *x.kind match
+        TLoad(name, _) -> if name == root then hit.uses += 1
+        _ -> ()))
+
+    hit.uses > 0
+end call_names
 
 // -- a closure held by reference, writing what a live `ref` stands on ----------------------------
 //
@@ -316,7 +438,7 @@ private note_erased(out: &ErasedSink, e: TExpr) = *e.kind match
 
 private ref_call(a: &Analysis, u: *Untouched, known: Set[string], globals: Buf[Type],
                  erased: Buf[(string, Type)], scope: Scope,
-                 mine: Buf[RefWatch], holders: Map[string, Buf[string]], e: TExpr)
+                 mine: Buf[RefWatch], holders: Map[string, Buf[string]], confined: Set[string], e: TExpr)
     val callee = *e.kind match
         TCall(name, args, ty, _) -> if ty == Never then None else Some((name, args))
         TCallPtr(_, args, _, _) -> Some(("", args))
@@ -334,6 +456,9 @@ private ref_call(a: &Analysis, u: *Untouched, known: Set[string], globals: Buf[T
         val live = e.span.start >= w.start && (w.end.is_none() || e.span.start < w.end.unwrap())
 
         if !live then continue
+
+        // A local's object no other name can reach is written only by a call it is handed to.
+        if w.root != "" && confined.has(w.root) && !call_names(e, w.root) then continue
 
         val written = if closures.is_empty() then None else closure_writes_under(a, closures, w.keys)
 
