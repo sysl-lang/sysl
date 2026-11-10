@@ -5847,8 +5847,8 @@ C programs already live by — **a pointer handed to a call is borrowed for the 
 |---|---|
 | a sysl function | what its body keeps |
 | a method through a trait object | what the trait's declaration of the method says: nothing, unless it says [`@keeps(p)`](/reference/attributes/#keeps-and-answers-on-a-trait-method), or `@keeps(self)` for the object itself; an `async` method's task holds every argument until it is awaited. An implementation reached through an object that keeps a parameter or its receiver the declaration does not name — a pointer, an object, a callback, or what it reads through a pointer — is refused where it is written |
-| a closure | nothing — a closure that keeps what it is handed is refused where it is written; the variables it captures are judged at the closure literal, where its body is in hand. A parameter its type marks [`@keeps`](#a-callable-that-keeps-what-it-is-handed) is kept, as an `extern`'s is |
-| a function through a pointer | nothing — a function whose address is taken and keeps a parameter, or lets out what it reads through one, is refused where it is written |
+| a closure | nothing — a closure that keeps what it is handed is refused where it is written; the variables it captures are judged at the closure literal, where its body is in hand. A parameter its type marks [`@keeps`](#a-callable-that-keeps-what-it-is-handed) is kept, as an `extern`'s is, and what is read through one it marks `@lets_out` may be kept |
+| a function through a pointer | nothing — a function whose address is taken and keeps a parameter, or lets out what it reads through one, is refused where it is written, unless every type its address is taken at marks the parameter: [`@keeps`](#a-callable-that-keeps-what-it-is-handed) lets it keep the parameter and what it reads through it, and every call through the pointer keeps the argument; `@lets_out` lets it let out only what it reads through the parameter, and every call borrows the argument and keeps what is reached through it |
 | an `extern` | nothing, and nothing it reads through a pointer, unless its declaration says [`@keeps(p)`](/reference/ffi/#keeps-a-c-function-that-holds-on-to-a-pointer). The declaration is trusted: a C function that holds a pointer past the call without saying so is a wrong declaration |
 
 No table of the program's bodies is consulted for any of these: which body a call through an object or
@@ -6208,6 +6208,65 @@ collect(r: Roots)
 
 ```error
 a call through '*extern(@keeps *Heap) -> unit' keeps its parameter 1 (its type says '@keeps'), and '&mine' is the address of a local of 'collect'
+```
+
+**A callable that only lets out what it reads is marked
+[`@lets_out`](/reference/types/#what-the-callable-reads-may-outlive-the-call-lets-out)**:
+`*extern(@lets_out *Heap) -> unit`, `&Fn(@lets_out *Heap) -> unit`. A function or closure taken at the
+type may let out what it reads through that parameter, and is still refused where it keeps the
+parameter itself. A call through the type borrows the argument, so the address of a local may be
+handed there — a collector's heap on the caller's stack — but whatever is reachable *through* it may be
+kept anywhere: storing the address of storage that ends into it before the call is what is refused,
+exactly as a call of a body that lets its reads out is. A function handing its own parameter on there
+lets out what it reads through it, so its callers are held to that, and not to keeping it.
+
+```sysl
+struct Node
+    next: *Node
+    v: int
+
+struct Heap
+    gray: *Node
+
+type Roots = *extern(@lets_out *Heap) -> unit
+
+var root = Node(null, 7)
+
+roots(h: *Heap)
+    root.next = h.gray
+    h.gray = &root
+
+collect(h: *Heap, r: Roots)
+    r(h)
+
+main()
+    var h = Heap(null)
+    collect(&h, &roots)
+    print(h.gray.v)
+```
+
+```output
+7
+```
+
+```sysl
+struct Node
+    next: *Node
+    v: int
+
+struct Heap
+    gray: *Node
+
+type Roots = *extern(@lets_out *Heap) -> unit
+
+visit(r: Roots)
+    var mine = Node(null, 1)
+    var h = Heap(&mine)
+    r(&h)
+```
+
+```error
+a call through '*extern(@lets_out *Heap) -> unit' may keep what it reads through its parameter 1 (its type says '@lets_out')
 ```
 
 **A stored callback keeps what it captured, and nothing else.** A closure is an object, and storing

@@ -293,30 +293,36 @@ private pointer_retyped(cx: &Analyzer, t: TExpr, got: Type, want: Type) -> Optio
             _ -> return Some(t)
     end if
 
-    var i: usize = 0
+    val over = mark_exceeding(gk, wk, arity)
 
-    for k in 0..<arity
-        if marks_kept(gk, k) && !marks_kept(wk, k)
-            i = k
-            break
+    if over.is_none() then return None
 
-    var marks: Buf[(string, Type)] = buf()
-
-    for item in wk
-        marks.push(item)
-
-    marks.push(fn_keeps_assoc(i))
-
+    val o = over.unwrap()
     val shown = underlying(want) match
-        CFn(ps, r, _) -> type_show(CFn(ps, *r, marks))
+        CFn(ps, r, _) -> type_show(CFn(ps, *r, o.2))
         _ -> type_show(want)
 
-    Some(cx.err(t.span, s"a '${type_show(got)}' may keep its parameter ${i + 1} past the call, and a " +
-                s"'${type_show(want)}' borrows what it is handed for the call — whoever calls it may " +
-                "hand it the address of their own storage. Mark the parameter '@keeps' where the " +
-                s"type it goes into is written, '$shown', or copy what the function keeps into " +
-                "storage of its own"))
+    Some(cx.err(t.span, marks_refused(got, want, o.0, o.1, marks_lets_out_only(wk, o.0), shown, "function")))
 end pointer_retyped
+
+// **The refusal of a callable whose type marks its parameter `i` further than the type it goes into**:
+// `kept`, it may keep the parameter; otherwise it may let out what it reads through it. `lets_out` says
+// the wanted type marks the parameter `@lets_out`; `shown` is that type with the parameter marked as
+// the callable needs.
+marks_refused(got: Type, want: Type, i: usize, kept: bool, lets_out: bool, shown: string, what: string) -> string
+    val did = if kept then s"may keep its parameter ${i + 1} past the call"
+    else s"may let out what it reads through its parameter ${i + 1}"
+    val asks = if lets_out then "lets out only what it reads through it, never the parameter itself"
+    else if kept then "borrows what it is handed for the call"
+    else "borrows what it is handed for the call, and everything reached through it"
+    val whose = if kept then "the address of their own storage" else "a pointer to storage that ends"
+    val word = if kept then "@keeps" else "@lets_out"
+    val keeps = if kept then "keeps" else "lets out"
+
+    s"a '${type_show(got)}' $did, and a '${type_show(want)}' $asks — whoever calls it may hand it $whose. " +
+        s"Mark the parameter '$word' where the type it goes into is written, '$shown', or copy what the " +
+        s"$what $keeps into storage of its own"
+end marks_refused
 
 // What a position does to a value of the wrong-but-convertible type.
 //

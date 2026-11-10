@@ -200,44 +200,57 @@ end enum_tag_text
 private trait_text(n: string, args: Buf[Type], assocs: Buf[(string, Type)]) -> string =
     bound_text(n, args, assocs)
 
-// A callable's type as a program spells it, each parameter it may keep marked `@keeps`.
+// A callable's type as a program spells it, each parameter marked as its type marks it.
 private fn_text(parts: (Buf[Type], Type), assocs: Buf[(string, Type)]) -> string =
     s"Fn(${marked_list(parts.0, assocs)}) -> ${type_show(parts.1)}"
 
-// Parameters as a program spells them, each one `marks` lets the callee keep written `@keeps`.
+// Parameters as a program spells them, each one `marks` lets the callee keep written `@keeps`, and
+// each one it lets the callee let out what it reads through written `@lets_out`.
 private marked_list(ps: Buf[Type], marks: Buf[(string, Type)]) -> string
     var b = str_builder()
 
     for i in 0..<ps.len()
         if i > 0 then b.push(", ")
         if marks_kept(marks, i) then b.push("@keeps ")
+        else if marks_lets_out_only(marks, i) then b.push("@lets_out ")
 
         b.push(type_show(ps[i]))
 
     b.finish()
 end marked_list
 
-// **A callable's `@keeps` marks ride in its trait's associated-type list**, one entry per marked
-// parameter, under a name no program can write (`@keeps:<i>`), so a marked type and an unmarked one
-// are two types to `type_eq` and to a substitution, while the trait, its table and every symbol stay
-// the one the unmarked type names (`mangled` reads no associated type). Nothing that looks an
-// associated type up by its name can find one of these.
+// **A callable's `@keeps` and `@lets_out` marks ride in its trait's associated-type list**, one entry
+// per marked parameter, under a name no program can write (`@keeps:<i>`, `@lets_out:<i>`), so a marked
+// type and an unmarked one are two types to `type_eq` and to a substitution, while the trait, its table
+// and every symbol stay the one the unmarked type names (`mangled` reads no associated type). Nothing
+// that looks an associated type up by its name can find one of these.
 fn_keeps_assoc(i: usize) -> (string, Type) = (s"@keeps:$i", Unit)
 
-// Whether an associated-type entry is a callable's `@keeps` mark rather than a binding.
-is_keeps_assoc(name: string) -> bool = name.starts_with("@keeps:")
+// The mark of a parameter the callable may let out what it reads through, but not keep.
+fn_lets_out_assoc(i: usize) -> (string, Type) = (s"@lets_out:$i", Unit)
+
+// Whether an associated-type entry is a callable's mark rather than a binding.
+is_keeps_assoc(name: string) -> bool = name.starts_with("@keeps:") || name.starts_with("@lets_out:")
 
 // Whether a callable's marks say it may keep its parameter at `i`.
-marks_kept(assocs: Buf[(string, Type)], i: usize) -> bool
-    val want = fn_keeps_assoc(i).0
+marks_kept(assocs: Buf[(string, Type)], i: usize) -> bool = has_mark(assocs, fn_keeps_assoc(i).0)
 
+// Whether a callable's marks say it may let out what it reads through its parameter at `i`: a parameter
+// it may keep, or one marked `@lets_out`.
+marks_lets_out(assocs: Buf[(string, Type)], i: usize) -> bool =
+    marks_kept(assocs, i) || marks_lets_out_only(assocs, i)
+
+// Whether the parameter at `i` is marked `@lets_out` itself.
+marks_lets_out_only(assocs: Buf[(string, Type)], i: usize) -> bool = has_mark(assocs, fn_lets_out_assoc(i).0)
+
+private has_mark(assocs: Buf[(string, Type)], want: string) -> bool
     for item in assocs
         if item.0 == want then return true
 
     false
-end marks_kept
+end has_mark
 
-// The associated types an object or a bound fixes by name, without a callable's `@keeps` marks.
+// The associated types an object or a bound fixes by name, without a callable's marks.
 without_keeps(assocs: Buf[(string, Type)]) -> Buf[(string, Type)]
     var out: Buf[(string, Type)] = buf()
 
@@ -247,21 +260,45 @@ without_keeps(assocs: Buf[(string, Type)]) -> Buf[(string, Type)]
     out
 end without_keeps
 
-// Whether every parameter `got` marks `@keeps` is marked in `want` too: a callable that keeps nothing
-// stands wherever one that may keep is wanted, and never the other way round.
+// **Whether every parameter `got` marks is marked at least as far in `want`**: unmarked, then
+// `@lets_out`, then `@keeps`. A callable that lets out nothing stands wherever one that may is wanted,
+// and one that only lets out what it reads wherever one that may keep is, never the other way round.
 keeps_within(got: Buf[(string, Type)], want: Buf[(string, Type)]) -> bool
     for item in got
-        if !is_keeps_assoc(item.0) then continue
+        if item.0.starts_with("@keeps:")
+            if !has_mark(want, item.0) then return false
+        else if item.0.starts_with("@lets_out:")
+            val i = item.0["@lets_out:".bytes.len..<item.0.bytes.len]
 
-        var found = false
-
-        for w in want
-            if w.0 == item.0 then found = true
-
-        if !found then return false
+            if !has_mark(want, item.0) && !has_mark(want, s"@keeps:$i") then return false
+        end if
 
     true
 end keeps_within
+
+// **The first parameter `got` marks further than `want` does** (`keeps_within`), whether `got` may keep
+// it rather than only let out what it reads through it, and `want`'s marks with that parameter marked as
+// `got` marks it -- what a refusal suggests writing. `None` where `got` fits.
+mark_exceeding(got: Buf[(string, Type)], want: Buf[(string, Type)],
+               arity: usize) -> Option[(usize, bool, Buf[(string, Type)])]
+    for k in 0..<arity
+        val kept = marks_kept(got, k) && !marks_kept(want, k)
+        val lets = marks_lets_out_only(got, k) && !marks_lets_out(want, k)
+
+        if !kept && !lets then continue
+
+        var marks: Buf[(string, Type)] = buf()
+
+        for item in want
+            if item.0 != fn_lets_out_assoc(k).0 then marks.push(item)
+
+        marks.push(if kept then fn_keeps_assoc(k) else fn_lets_out_assoc(k))
+
+        return Some((k, kept, marks))
+    end for
+
+    None
+end mark_exceeding
 
 // A trait with its arguments and the associated types it fixes by name, as an object or a bound
 // writes it: `Keyed[int, Item = string]`. A callable is spelled the way a program writes one.

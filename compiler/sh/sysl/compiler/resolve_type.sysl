@@ -146,10 +146,12 @@ resolve_type(a: &Analysis, scope: Scope, t: TypeRef, subst: Buf[Binding]) -> Typ
     // A callable's own parameters, and a function pointer's, are read by `kept_params`, so a `@keeps`
     // reaching here stands somewhere nothing is called with it. The type under it is still read, so
     // the rest is checked.
-    KeptParamType(inner) ->
-        a.fault(scope, t.span, s"'@keeps' marks a parameter of a callable's type that the callable may " +
-                s"hold past the call — 'Fn(@keeps ${type_text(inner)}) -> …' or " +
-                s"'*extern(@keeps ${type_text(inner)}) -> …' — and this " +
+    KeptParamType(inner, lets_out) ->
+        val w = if lets_out then "@lets_out" else "@keeps"
+        val what = if lets_out then "may let what it reads through it outlive the call" else "may hold past the call"
+
+        a.fault(scope, t.span, s"'$w' marks a parameter of a callable's type that the callable $what — " +
+                s"'Fn($w ${type_text(inner)}) -> …' or '*extern($w ${type_text(inner)}) -> …' — and this " +
                 s"'${type_text(inner)}' is no callable's parameter")
         resolve_type(a, scope, inner, subst)
     ValueArgType(e) -> const_argument(a, scope, t.span, e, subst)
@@ -896,18 +898,27 @@ private resolve_fn_trait(a: &Analysis, scope: Scope, span: Span, params: Buf[Typ
     Trait(key.unwrap_or(fn_base(params.len())), args, kept.1)
 end resolve_fn_trait
 
-// **A callable's parameters with each `@keeps` taken off**, and the marks the trait carries for them
-// (`fn_keeps_assoc`). A parameter marked twice is refused: it is kept or it is not, as an `extern`'s
-// `@keeps(p)` naming one twice is told. A mark on a parameter that holds no address is accepted and
-// changes nothing, as it is on an `extern`.
+// **A callable's parameters with each `@keeps` and `@lets_out` taken off**, and the marks the trait
+// carries for them (`fn_keeps_assoc`, `fn_lets_out_assoc`). A parameter marked twice is refused: it is
+// kept, its reads are let out, or neither, as an `extern`'s `@keeps(p)` naming one twice is told. A
+// mark on a parameter that holds no address is accepted and changes nothing, as it is on an `extern`.
 kept_params(a: &Analysis, scope: Scope, params: Buf[TypeRef]) -> (Buf[TypeRef], Buf[(string, Type)])
     for p in params
         *p.kind match
-            KeptParamType(inner) ->
+            KeptParamType(inner, outer) ->
                 *inner.kind match
-                    KeptParamType(_) ->
-                        a.fault(scope, p.span, "'@keeps' is written twice on one parameter, and a " +
-                                "parameter is kept or it is not — the second says nothing the first does not")
+                    KeptParamType(_, lets_out) ->
+                        if outer == lets_out
+                            val w = if outer then "@lets_out" else "@keeps"
+                            val is = if outer then "marked '@lets_out'" else "kept"
+
+                            a.fault(scope, p.span, s"'$w' is written twice on one parameter, and a " +
+                                    s"parameter is $is or it is not — the second says nothing the first does not")
+                        else
+                            a.fault(scope, p.span, "'@keeps' and '@lets_out' are both written on one " +
+                                    "parameter, and '@keeps' already lets the callable let out what it reads " +
+                                    "through what it keeps — write one of them")
+                        end if
                     _ -> ()
             _ -> ()
 
@@ -923,17 +934,22 @@ split_kept(params: Buf[TypeRef]) -> (Buf[TypeRef], Buf[(string, Type)])
         val p = params[i]
 
         *p.kind match
-            KeptParamType(inner) ->
+            KeptParamType(inner, _) ->
                 out.push(strip_kept(inner))
-                marks.push(fn_keeps_assoc(i))
+                marks.push(if marked_keeps(p) then fn_keeps_assoc(i) else fn_lets_out_assoc(i))
             _ -> out.push(p)
 
     (out, marks)
 end split_kept
 
 private strip_kept(t: TypeRef) -> TypeRef = *t.kind match
-    KeptParamType(inner) -> strip_kept(inner)
+    KeptParamType(inner, _) -> strip_kept(inner)
     _ -> t
+
+// Whether any of the marks on a parameter is `@keeps`, which says all a `@lets_out` beside it would.
+private marked_keeps(t: TypeRef) -> bool = *t.kind match
+    KeptParamType(inner, lets_out) -> !lets_out || marked_keeps(inner)
+    _ -> false
 
 // How long a written extent is.
 //
