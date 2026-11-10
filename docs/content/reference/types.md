@@ -1908,10 +1908,10 @@ roots(h: *Heap)
 collect(h: *Heap, r: Roots)
     r(h)
 
-var h = Heap(null)
-
-collect(&h, &roots)
-print(h.gray.v)
+main()
+    var h = Heap(null)
+    collect(&h, &roots)
+    print(h.gray.v)
 ```
 
 ```output
