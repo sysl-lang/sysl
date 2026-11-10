@@ -1866,6 +1866,22 @@ a '&Fn(@keeps *int) -> int' may keep its parameter 1 past the call, and a '&Fn(*
 A mark on a parameter that holds no address — an `int` — changes nothing, as it does on an `extern`.
 What a call through a marked type may be handed is in [memory](/reference/memory/#a-callable-that-keeps-what-it-is-handed).
 
+**A function pointer type takes the mark too**, with the same meaning: `*extern(@keeps *Heap) ->
+unit` is the type of a pointer to a function that may keep its parameter, and a function whose
+address is taken at it may. The mark is part of that type as well, and is named in no symbol:
+
+```sysl
+type Roots = *extern(@keeps *int) -> unit
+type Loose = *extern(*int) -> unit
+
+widen(f: Loose) -> Roots = f
+narrow(f: Roots) -> Loose = f
+```
+
+```error
+a '*extern(@keeps *int) -> unit' may keep its parameter 1 past the call, and a '*extern(*int) -> unit' borrows what it is handed for the call
+```
+
 ### A parameter passed by name
 
 A parameter written with the arrow and **nothing on its left** takes an expression the call does not

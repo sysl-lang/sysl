@@ -157,7 +157,7 @@ private canonical_name(t: Type) -> string = t match
     Ptr(inner) -> s"*${type_show(*inner)}"
     Ref(inner, sync) -> s"&${if sync then "sync " else ""}${type_show(*inner)}"
     Weak(inner) -> s"weak ${type_show(*inner)}"
-    CFn(ps, r) -> s"*extern(${show_list(ps)}) -> ${type_show(*r)}"
+    CFn(ps, r, k) -> s"*extern(${marked_list(ps, k)}) -> ${type_show(*r)}"
     Array(n, elem) -> s"[$n]${type_show(*elem)}"
     Vector(n, elem) -> s"<$n>${type_show(*elem)}"
     Slice(elem, ro) -> s"[]${if ro then "const " else ""}${type_show(*elem)}"
@@ -201,21 +201,21 @@ private trait_text(n: string, args: Buf[Type], assocs: Buf[(string, Type)]) -> s
     bound_text(n, args, assocs)
 
 // A callable's type as a program spells it, each parameter it may keep marked `@keeps`.
-private fn_text(parts: (Buf[Type], Type), assocs: Buf[(string, Type)]) -> string
+private fn_text(parts: (Buf[Type], Type), assocs: Buf[(string, Type)]) -> string =
+    s"Fn(${marked_list(parts.0, assocs)}) -> ${type_show(parts.1)}"
+
+// Parameters as a program spells them, each one `marks` lets the callee keep written `@keeps`.
+private marked_list(ps: Buf[Type], marks: Buf[(string, Type)]) -> string
     var b = str_builder()
 
-    b.push("Fn(")
-
-    for i in 0..<parts.0.len()
+    for i in 0..<ps.len()
         if i > 0 then b.push(", ")
-        if marks_kept(assocs, i) then b.push("@keeps ")
+        if marks_kept(marks, i) then b.push("@keeps ")
 
-        b.push(type_show(parts.0[i]))
+        b.push(type_show(ps[i]))
 
-    b.push(") -> ")
-    b.push(type_show(parts.1))
     b.finish()
-end fn_text
+end marked_list
 
 // **A callable's `@keeps` marks ride in its trait's associated-type list**, one entry per marked
 // parameter, under a name no program can write (`@keeps:<i>`), so a marked type and an unmarked one
@@ -409,7 +409,7 @@ mangle(t: Type) -> string = t match
     Slice(elem, ro) -> if ro then s"constslice.${mangle(*elem)}" else s"slice.${mangle(*elem)}"
     Volatile(inner) -> s"volatile.${mangle(*inner)}"
     Trait(n, args, _) -> mangled(n, args)
-    CFn(ps, r) -> cfn_mangle(ps, *r)
+    CFn(ps, r, _) -> cfn_mangle(ps, *r)
     // A fixed-point type mangles under its full spelling whatever alias it was written with.
     Fixed(bits, frac, signed) -> fixed_canonical(bits, frac, signed)
     // A name and nothing more is its base wherever types are checked, so `Buf[H]` shares

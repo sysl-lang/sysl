@@ -6160,6 +6160,56 @@ f(&m, m.sp)
 Such a primitive takes a callable whose type marks the parameter instead — `&Fn(*M, @keeps *isize) ->
 unit` — so every call through it is held to the mark, and each closure made at it may keep it.
 
+**A function pointer type takes the mark the same way**: `*extern(*M, @keeps *isize) -> unit`. A
+function whose address is taken only at types marking a parameter may keep it, or let out what it
+reads through it; every call through the pointer is held to the mark as a call of an `extern` is to
+its `@keeps(p)`; and every unmarked parameter is still borrowed. A pointer that keeps nothing stands
+where a marked one is asked for, never the other way round:
+
+```sysl
+struct Node
+    next: *Node
+    v: int
+
+struct Heap
+    gray: *Node
+
+type Roots = *extern(@keeps *Heap) -> unit
+
+var root = Node(null, 7)
+var heap = Heap(null)
+
+roots(h: *Heap)
+    root.next = h.gray
+    h.gray = &root
+
+collect(h: *Heap, r: Roots)
+    r(h)
+
+main()
+    collect(&heap, &roots)
+    print(heap.gray.v)
+```
+
+```output
+7
+```
+
+```sysl
+struct Heap
+    gray: *int
+
+type Roots = *extern(@keeps *Heap) -> unit
+
+collect(r: Roots)
+    var mine = Heap(null)
+    r(&mine)
+```
+
+```error
+a call through '*extern(@keeps *Heap) -> unit' keeps its parameter 1 (its type says '@keeps'), and '&mine' is the address of a local of 'collect'
+```
+
 **A stored callback keeps what it captured, and nothing else.** A closure is an object, and storing
 one — in a field, module storage, a buffer, a trait's implementation — is refused only where the
 closure captured an address that is not the program's to give away. One capturing nothing, a number,
