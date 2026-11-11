@@ -1,0 +1,224 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A `ref` standing on an element of a `Buf` is left pointing at freed memory when the buffer's storage
+// moves, and a `@relocates` member is what moves it. Called in the ref's own body it is refused by the
+// mark; called inside a callee, the callee is asked what its body can write (`checks.sysl`'s
+// `ref_call`), and the write a member like `push` makes lands in the buffer's core, which no value
+// holds by value -- so it must count as a write of the buffer's type itself (`borrowing.sysl`'s
+// `moves`), wherever the callee got the buffer: a parameter, a copy of the handle, a global, or a
+// pointer a cast made out of bytes.
+//
+// A view is not a ref: it keeps the storage it reads alive, so the same callee is accepted while a
+// view is live and the view goes on reading the old storage. A callee that relocates only a buffer of
+// another type, that casts to a type holding no buffer, that only reads, or that grows a buffer only
+// it holds is accepted too. Every accepted program is built and run at `-O0` with the heap counted
+// (net zero), at `-O1` and at `-O2`, and prints the same at each.
+//
+// Not crossed: bare metal and the layout axes (the change is to an analysis, and emits nothing), and
+// separate compilation (a callee with no body in the program is judged by what it can reach, which
+// this does not change).
+
+private rmc_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end rmc_ready
+
+private rmc_head() -> string = """
+    import sysl.buf.{Buf, buf}
+    import sysl.raw.ptr_cast
+
+    struct Vm
+        names: Buf[string]
+        sizes: Buf[int]
+
+    """
+
+private rmc_main() -> string = """
+
+    main()
+        var owner = Vm(buf(), buf())
+
+        owner.names.push("first")
+        owner.sizes.push(1)
+
+        print(look(&owner, ptr_cast[*u8](&owner)), owner.names.len(), owner.sizes.len())
+    """
+
+// A program: `decls` at the top level, and `call` made while `ref e = owner.names[0]` is live.
+private rmc_ref(decls: string, call: string) -> string =
+    rmc_head() + decls + "\nlook(owner: *Vm, raw: *u8) -> usize\n    ref e = owner.names[0]\n\n" +
+    s"    $call\n    e.len\n" + rmc_main()
+
+// The same, with a view of the buffer live across the call instead of a ref.
+private rmc_view(decls: string, call: string) -> string =
+    rmc_head() + decls + "\nlook(owner: *Vm, raw: *u8) -> usize\n    val v = owner.names.view_mut()\n\n" +
+    s"    $call\n    v[0].len + v.len\n" + rmc_main()
+
+private rmc_root(text: string) -> string
+    val root = make_temp_dir("sysl-ref-moving").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+
+private rmc_said(text: string) -> string
+    val root = rmc_root(text)
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end rmc_said
+
+private rmc_ran(text: string, level: string, counted: bool) -> string
+    val root = rmc_root(text)
+    val exe = s"$root/built"
+
+    force_alloc_counting(counted)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, level, Some(exe))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text + out.err.unwrap_or("")
+end rmc_ran
+
+private rmc_accepted(text: string, printed: string)
+    val out = rmc_said(text)
+
+    assert(!out.contains("error"), s"expected no complaint, got: $out")
+    assert_eq(rmc_ran(text, "0", true), printed)
+    assert_eq(rmc_ran(text, "1", false), printed)
+    assert_eq(rmc_ran(text, "2", false), printed)
+end rmc_accepted
+
+private rmc_refused(text: string, callee: string)
+    val out = rmc_said(text)
+    val said = s"'e' is a 'ref' standing on storage held in a 'Buf[string]', and '$callee' may write a " +
+               "'Buf[string]' — another name for the same object would leave the 'ref' pointing at freed memory"
+
+    assert(out.contains(said), s"expected '$said' in: $out")
+end rmc_refused
+
+private rmc_cast_grow() -> string =
+    "grow(raw: *u8)\n    val vm = ptr_cast[*Vm](raw)\n\n    for i in 0..<64\n        vm.names.push(\"grown\")\n"
+
+// -- refused: a callee that moves a buffer of the ref's type --------------------------------------
+
+@test("a callee pushing through a pointer cast from bytes is refused while a ref into the buffer is live")
+rmc_cast_push()
+    if !rmc_ready() then return
+
+    rmc_refused(rmc_ref(rmc_cast_grow(), "grow(raw)"), "grow")
+
+@test("a callee pushing through the pointer it is handed is refused")
+rmc_pointer_push()
+    if !rmc_ready() then return
+
+    rmc_refused(rmc_ref("grow(vm: *Vm)\n    for i in 0..<64\n        vm.names.push(\"grown\")\n",
+                        "grow(owner)"), "grow")
+
+@test("a callee pushing into a copy of the buffer's handle is refused")
+rmc_handle_push()
+    if !rmc_ready() then return
+
+    rmc_refused(rmc_ref("grow(b: Buf[string])\n    for i in 0..<64\n        b.push(\"grown\")\n",
+                        "grow(owner.names)"), "grow")
+
+    rmc_refused(rmc_ref("grow(vm: Vm)\n    for i in 0..<64\n        vm.names.push(\"grown\")\n",
+                        "grow(*owner)"), "grow")
+
+@test("a callee handed a copy of the buffer's handle that only reads it is accepted")
+rmc_handle_reads()
+    if !rmc_ready() then return
+
+    rmc_accepted(rmc_ref("count(b: Buf[string]) -> usize = b.len() + b[0].len\n", "count(owner.names)"),
+                 "5 1 1\n")
+
+@test("a callee reaching the push through a generic helper is refused")
+rmc_generic_push()
+    if !rmc_ready() then return
+
+    rmc_refused(rmc_ref("add[T](b: Buf[T], x: T)\n    for i in 0..<64\n        b.push(x)\n\n" +
+                        "grow(vm: *Vm) = add(vm.names, \"grown\")\n", "grow(owner)"), "grow")
+
+@test("a callee clearing the buffer through a cast pointer is refused")
+rmc_cast_clear()
+    if !rmc_ready() then return
+
+    rmc_refused(rmc_ref("wipe(raw: *u8) = ptr_cast[*Vm](raw).names.clear()\n", "wipe(raw)"), "wipe")
+
+@test("a callee pushing into module storage of the ref's type is refused")
+rmc_global_push()
+    if !rmc_ready() then return
+
+    rmc_refused(rmc_ref("var kept: Buf[string] = buf()\n\ngrow() = kept.push(\"grown\")\n", "grow()"), "grow")
+
+@test("a callee calling through a C function pointer is refused while the ref is live")
+rmc_extern_handle()
+    if !rmc_ready() then return
+
+    rmc_refused(rmc_ref("twice(n: int) -> int = n * 2\n\nvar hook: *extern(int) -> int = &twice\n\n" +
+                        "hooked(n: int) -> int = hook(n)\n", "hooked(3)"), "hooked")
+
+// -- accepted --------------------------------------------------------------------------------------
+
+@test("a callee pushing through a cast pointer is accepted while a view is live, and the view reads the old storage")
+rmc_view_cast_push()
+    if !rmc_ready() then return
+
+    rmc_accepted(rmc_view(rmc_cast_grow(), "grow(raw)"), "6 65 1\n")
+
+@test("a callee pushing into a buffer of another type through a cast pointer is accepted")
+rmc_other_type_push()
+    if !rmc_ready() then return
+
+    rmc_accepted(rmc_ref("grow(raw: *u8)\n    val vm = ptr_cast[*Vm](raw)\n\n    for i in 0..<64\n" +
+                         "        vm.sizes.push(i)\n", "grow(raw)"), "5 1 65\n")
+
+@test("a callee casting to a type that holds no buffer is accepted")
+rmc_cast_no_buffer()
+    if !rmc_ready() then return
+
+    rmc_accepted(rmc_ref("struct Pair\n    a: int\n    b: int\n\npoke() -> int\n    var spare = Pair(1, 2)\n" +
+                         "    val p = ptr_cast[*Pair](ptr_cast[*u8](&spare))\n\n    p.a = 3\n    p.a + p.b\n",
+                         "poke()"), "5 1 1\n")
+
+@test("a callee whose cast pointer only reads the buffer is accepted")
+rmc_cast_reads()
+    if !rmc_ready() then return
+
+    rmc_accepted(rmc_ref("count(raw: *u8) -> usize = ptr_cast[*Vm](raw).names.len()\n", "count(raw)"),
+                 "5 1 1\n")
+
+@test("a callee growing a buffer of the ref's type that only it holds is accepted")
+rmc_fresh_local_push()
+    if !rmc_ready() then return
+
+    rmc_accepted(rmc_ref("fresh() -> usize\n    var b: Buf[string] = buf()\n\n    for i in 0..<64\n" +
+                         "        b.push(\"grown\")\n\n    b.len()\n", "fresh()"), "5 1 1\n")

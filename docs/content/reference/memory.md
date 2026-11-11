@@ -2222,6 +2222,33 @@ e = 5
 A second handle on a `Buf` is the same case: `val b2 = b` makes `b2.push(…)` a `@relocates` call on
 the buffer a `ref r = b[0]` stands in, and it is refused with the `@relocates` message.
 
+**A callee that reaches a `@relocates` member on a buffer of that type writes it too**, wherever it
+got the buffer: handed it, handed a copy of the handle (which is the same buffer), from module
+storage, or through a pointer a cast made out of bytes. The member's write lands in the buffer's
+storage rather than in anything holding the handle by value, so it is the mark that answers, as it
+does for a call in the ref's own body. A view is not held to this: it keeps the storage it reads
+alive, so a callee growing the buffer under it is accepted.
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+grow(b: Buf[int])
+    for i in 0..<64 do b.push(i)
+
+var b: Buf[int] = buf()
+
+b.push(1)
+
+ref first = b[0]
+
+grow(b)
+first = 5
+```
+
+```error
+'first' is a 'ref' standing on storage held in a 'Buf[int]', and 'grow' may write a 'Buf[int]'
+```
+
 What stays open is everything that cannot be the ref's storage: other fields of the ref's own object
 reached along its path (`h.node.count = 2` beside `ref e = h.node.cell[0]`), values of unrelated
 types, calls whose bodies only read, and anything at all once the ref's block has closed:

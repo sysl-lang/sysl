@@ -604,9 +604,14 @@ private ref_call(a: &Analysis, u: *Untouched, reach: &Reacher, known: Set[string
         for t in w.types
             var cleared = false
 
+            // **A copy of a handle is the same buffer**: where a `@relocates` member moves the
+            // storage behind a `t`, an argument holding a `t` by value hands the callee the storage
+            // a `ref` stands in, not a copy of it.
+            val moving = w.view_of == "" && relocated(u, t)
+
             if name != ""
-                cleared = unreachable_to(u, reach.of(a, u, name), globals, erased, args, t) ||
-                          (known.has(name) && untouched_by(u, t, w.lent).has(name))
+                cleared = unreachable_to(u, reach.of(a, u, name), globals, erased, args, t, moving) ||
+                          (known.has(name) && untouched_by(u, t, w.lent, moving).has(name))
             end if
 
             if !cleared
@@ -631,9 +636,10 @@ private ref_call(a: &Analysis, u: *Untouched, reach: &Reacher, known: Set[string
 end ref_call
 
 // Whether a callee handed `args`, which can run what `r` says, has no way to get hold of a value of
-// type `t` held anywhere else.
+// type `t` held anywhere else. Where `shared` is set, an argument holding a `t` by value is one: a
+// handle whose storage a `@relocates` member moves.
 private unreachable_to(u: *Untouched, r: Reach, globals: Buf[(string, Type)], erased: Buf[(string, Type)],
-                       args: Buf[TExpr], t: Type) -> bool
+                       args: Buf[TExpr], t: Type, shared: bool = false) -> bool
     val want = underlying(t)
 
     var cast: Buf[Type] = buf()
@@ -667,7 +673,7 @@ private unreachable_to(u: *Untouched, r: Reach, globals: Buf[(string, Type)], er
     for item in args
         var seen: Set[string] = set()
 
-        if type_reaches(texpr_type(item), want, false, erased, &seen) then return false
+        if type_reaches(texpr_type(item), want, shared, erased, &seen) then return false
 
     true
 end unreachable_to
