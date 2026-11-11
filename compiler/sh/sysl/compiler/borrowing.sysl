@@ -509,18 +509,33 @@ private through_key(i: usize, j: usize) -> usize = i * 1024 + j
 // exports, is one of `quiet`. A standard function whose address is taken is still checked: it may be
 // handed to C to call back into the program's own code.
 private c_reaches_quiet(p: TProgram, quiet: Set[string]) -> bool
-    val addressed = addressed_funcs(p)
-    val entry = if p.entry.is_some() then p.entry.unwrap().func else ""
-
-    for f in p.funcs
-        val supplier = f.exported.is_some() && (f.declared_in == "sysl" || f.declared_in.starts_with("sysl."))
-        val reached = (f.exported.is_some() && !supplier) || f.section.is_some() || f.conv.is_some() ||
-                      addressed.has(f.name)
-
-        if reached && f.name != entry && !quiet.has(f.name) then return false
+    for item in c_entered(p)
+        if !quiet.has(item) then return false
 
     true
 end c_reaches_quiet
+
+// The sysl functions C can call while the program runs: the exported ones but the standard library's
+// own, those laid in a `@section`, those with a foreign calling convention, and those whose address is
+// taken -- a standard one included, since it may be handed to C to call back into the program's code.
+// The program's entry is left out: C calls it once, to start the program.
+c_entered(p: TProgram) -> Buf[string]
+    val addressed = addressed_funcs(p)
+    val entry = if p.entry.is_some() then p.entry.unwrap().func else ""
+    var out: Buf[string] = buf()
+
+    for f in p.funcs
+        val supplier = f.exported.is_some() && std_module(f.declared_in)
+        val reached = (f.exported.is_some() && !supplier) || f.section.is_some() || f.conv.is_some() ||
+                      addressed.has(f.name)
+
+        if reached && f.name != entry then out.push(f.name)
+
+    out
+end c_entered
+
+// Whether a module is the standard library's.
+std_module(name: string) -> bool = name == "sysl" || name.starts_with("sysl.")
 
 // The greatest set of `p.funcs` closed under the rule that a function stays only while every name in
 // its `calls` is still in it or is one of `also`, starting from those `seed` admits. A cycle stays,
@@ -873,6 +888,13 @@ inert_leaf(x: TExpr) -> bool = *x.kind match
 // **A write that gives back a count is judged by what letting go of the old value could free**
 // (`gives_back_clear`), not refused outright: growing a `Buf[Value]` lets go of the old `[]Value`
 // storage, which frees an array of `Value`s and nothing a `Machine` holding that buffer is part of.
+//
+// **What each body can run is kept beside the verdict**, for the question of what a callee can get
+// hold of at all (`checks.sysl`'s `unreachable_to`): the calls it makes on a path that ends the
+// program (`exits`, beside `calls`), the types its own casts make pointers to (`casts`), the module
+// storage it names (`reads`), and whether it holds a node that may run code no call names (`opaque`):
+// a call through a pointer or a trait's table, a rendering through a table, a place another task may
+// run (`touch_node`).
 struct Untouched
     names: Buf[string]
     calls: Buf[Buf[string]]
@@ -882,11 +904,28 @@ struct Untouched
     laundered: Casts
     dropping: Buf[Type]
     answers: Map[string, Set[string]]
+    exits: Buf[Buf[string]]
+    casts: Buf[Buf[Type]]
+    reads: Buf[Set[string]]
+    opaque: Buf[bool]
 end Untouched
 
 // An empty summary, for an emitter that has not read a program yet.
 untouched_none() -> Untouched =
-    Untouched(buf(), buf(), buf(), buf(), buf(), no_casts(), buf(), map())
+    Untouched(buf(), buf(), buf(), buf(), buf(), no_casts(), buf(), map(), buf(), buf(), buf(), buf())
+
+// What one body's walk gathers for the `Untouched` lists that say what it can run: the module storage
+// it names, and whether it holds a node that may run code no call names.
+private struct ReachSink
+    reads: Set[string]
+    opaque: bool
+
+    read(*self, symbol: string)
+        self.reads.add(symbol)
+
+    hide(*self)
+        self.opaque = true
+end ReachSink
 
 // Whether a body that gives back the count of a value of type `given` -- the old value of a place it
 // overwrites -- leaves every value of type `t` it does not write where it was: nothing it lets go of
@@ -1004,7 +1043,9 @@ untouched_summary(p: TProgram, dropping: Buf[Type], owning: Set[string] = set(),
         val locals = own_locals(f)
         val ending = exit_kinds(f.body)
         val gives = type_sink()
-        val walk = TWalk(true, x -> touch_node(v, calls, exits, ending, roots, gives, laundered, dropping,
+        val own = cast_sink()
+        val reach: &ReachSink = ReachSink(set(), false)
+        val walk = TWalk(true, x -> touch_node(v, calls, exits, ending, roots, gives, own, reach, dropping,
                                                locals, tables, x),
                          w -> touch_write(v, calls, roots, gives, locals, w),
                          s -> if !touch_stmt(s) then v.refuse())
@@ -1034,6 +1075,21 @@ untouched_summary(p: TProgram, dropping: Buf[Type], owning: Set[string] = set(),
         u.roots.push(roots.types)
         u.gives.push(gives.types)
         u.open.push(!v.ok || owning.has(f.name))
+        u.exits.push(exits.names)
+        u.reads.push(reach.reads)
+        u.opaque.push(reach.opaque)
+
+        var made: Buf[Type] = buf()
+
+        for item in own.c.anywhere
+            made.push(item)
+            laundered.anywhere(item)
+
+        for j in 0..<own.c.into.len()
+            made.push(own.c.into[j])
+            laundered.add(own.c.into[j], own.c.from[j])
+
+        u.casts.push(made)
 
     u.laundered = laundered.c
     u.dropping = dropping
@@ -1042,8 +1098,14 @@ end untouched_summary
 
 // The functions that cannot write a value of type `t` held anywhere, nor give back a count one holds,
 // before they return: the greatest set closed under the rule, as `inert_callees` computes it.
-untouched_by(u: *Untouched, t: Type) -> Set[string]
-    val key = mangle(t)
+//
+// **`lent` is the element type of a view the caller holds of a `t`'s storage**, asked about by a call
+// made while the view is live (`checks.sysl`'s `ref_call`). Writing a value of that type through a
+// cast pointer is still a write of something no `t` holds by value -- it gives back no count, so it
+// frees nothing the view reads -- and so a write whose object is of that type is judged by what holds
+// what, not by the casts. Every count it gives back is judged as before.
+untouched_by(u: *Untouched, t: Type, lent: Type = Unknown) -> Set[string]
+    val key = if lent == Unknown then mangle(t) else s"${mangle(t)}|${mangle(lent)}"
     val known = u.answers.get(key)
 
     if known.is_some() then return known.unwrap()
@@ -1065,7 +1127,13 @@ untouched_by(u: *Untouched, t: Type) -> Set[string]
             if ok
                 val k = mangle(root)
 
-                if !root_hits.has(k) then root_hits.put(k, overlaps(root, t, parts, u.laundered))
+                if !root_hits.has(k)
+                    if lent != Unknown && underlying(root) == lent
+                        root_hits.put(k, held_with(underlying(root), t, parts))
+                    else
+                        root_hits.put(k, overlaps(root, t, parts, u.laundered))
+                end if
+
                 if root_hits.get(k).unwrap() then ok = false
 
         for given in u.gives[i]
@@ -1179,11 +1247,15 @@ private touch_stmt(s: TStmt) -> bool = s match
     _ -> inert_stmt(s)
 
 private touch_node(v: &Verdict, calls: &CallSink, exits: &CallSink, ending: &KindSink,
-                   roots: &TypeSink, gives: &TypeSink, laundered: &CastSink, dropping: Buf[Type],
-                   locals: Set[string], tables: Option[Buf[TVtable]], x: TExpr)
+                   roots: &TypeSink, gives: &TypeSink, laundered: &CastSink, reach: &ReachSink,
+                   dropping: Buf[Type], locals: Set[string], tables: Option[Buf[TVtable]], x: TExpr)
     note_laundered(laundered, x)
 
     if makes_dropping(x, dropping) then v.refuse()
+
+    *x.kind match
+        TGlobal(symbol, _, _) -> reach.read(symbol)
+        _ -> ()
 
     *x.kind match
         // A call on a path that ends the program is `quiet_callees`' question, which a call that never
@@ -1192,7 +1264,7 @@ private touch_node(v: &Verdict, calls: &CallSink, exits: &CallSink, ending: &Kin
 
         TVCall(recv, slot, _, _, _) -> tables match
             Some(all) -> slot_callees(v, calls, all, recv, slot)
-            None -> v.refuse()
+            None -> hidden(v, reach)
 
         TStore(place, _, _, _) -> touch_place(v, roots, gives, locals, place)
         TIncDec(place, _, _, _, _) -> touch_place(v, roots, gives, locals, place)
@@ -1228,8 +1300,26 @@ private touch_node(v: &Verdict, calls: &CallSink, exits: &CallSink, ending: &Kin
                 _ -> ()
             _ -> v.refuse()
 
+        // **The nodes that run code no call names**: a call through a pointer, a value rendered
+        // through its trait's table, and the places another task may run. A rendering through a
+        // method the type supplied names it, as a call does.
+        TCallPtr(_, _, _, _) -> hidden(v, reach)
+        TRender(_, method, _, slot) ->
+            v.refuse()
+
+            if slot.is_some() then reach.hide() else calls.add(method)
+        TAwait(_, _) -> hidden(v, reach)
+        TBlockOn(_, _) -> hidden(v, reach)
+        TStep(_, _) -> hidden(v, reach)
+        TPark(_) -> hidden(v, reach)
+        TYieldNow -> hidden(v, reach)
+
         _ -> if !inert_leaf(x) then v.refuse()
 end touch_node
+
+private hidden(v: &Verdict, reach: &ReachSink)
+    v.refuse()
+    reach.hide()
 
 // A call through slot `slot` of a trait object, in a program that sees every table: a call to what
 // that slot holds in each table of the trait. A receiver whose trait cannot be named is refused.

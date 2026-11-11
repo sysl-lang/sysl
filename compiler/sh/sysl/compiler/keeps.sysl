@@ -163,6 +163,10 @@ struct KeepsCx
     // there sees no body, so each is held to its callable type where it is written (`refuse_promised`).
     erased: Map[string, bool]
 
+    // For each function whose address is taken, the `@keeps` marks every type it is taken at shares
+    // (`pointer_licensed`).
+    addressed_marks: Map[string, Buf[(string, Type)]]
+
     find(self, name: string) -> Option[TFunc] = self.index.get(name) match
         Some(i) -> Some(self.funcs[i])
         None -> None
@@ -196,7 +200,7 @@ settled_keeps(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable]) -> &KeepsC
     val cx: &KeepsCx = KeepsCx(a, funcs, index, map(), map(), map(), buf(), buf(), false, 0, map(),
                                map(), map(), map(), map(), map(), map(), vtables,
                                map(), buf(), map(), map(), map(), map(), buf(), false, map(), false, map(),
-                               0, false, buf(), map(), map(), map(), map())
+                               0, false, buf(), map(), map(), map(), map(), map())
 
     // Every method an `impl` of a trait brought, by the function it was lowered to, and every slot of
     // every table -- an instance of a generic one among them.
@@ -282,11 +286,58 @@ private hold_keeps(a: &Analysis, cx: &KeepsCx, funcs: Buf[TFunc], vals: Buf[TVal
         a.fault(item.0, item.1, item.2)
 end hold_keeps
 
+// A function's address, and the marks of the type it is taken at, kept only where every other taking
+// of the same address marks them too.
 private note_addressed(cx: &KeepsCx, e: TExpr)
     *e.kind match
-        TFuncAddr(name, _, _) -> cx.addressed.put(name, true)
+        TFuncAddr(name, _, ty) ->
+            val marks = pointer_marks(ty)
+
+            // Each parameter keeps the weaker of the two marks: `@lets_out` where one taking says
+            // `@keeps` and the other `@lets_out`, nothing where either says nothing.
+            if cx.addressed.has(name)
+                val had = cx.addressed_marks.get(name).unwrap_or(buf())
+                var shared: Buf[(string, Type)] = buf()
+
+                for k in 0..<pointer_arity(ty)
+                    if marks_kept(had, k) && marks_kept(marks, k) then shared.push(fn_keeps_assoc(k))
+                    else if marks_lets_out(had, k) && marks_lets_out(marks, k) then shared.push(fn_lets_out_assoc(k))
+
+                cx.addressed_marks.put(name, shared)
+            else
+                cx.addressed_marks.put(name, marks)
+            end if
+
+            cx.addressed.put(name, true)
         _ -> ()
 end note_addressed
+
+// The `@keeps` and `@lets_out` marks a function pointer type carries, none for any other type.
+private pointer_marks(ty: Type) -> Buf[(string, Type)] = underlying(ty) match
+    CFn(_, _, marks) -> marks
+    _ -> buf()
+
+private pointer_arity(ty: Type) -> usize = underlying(ty) match
+    CFn(ps, _, _) -> ps.len()
+    _ -> 0
+
+// **Whether a function whose address is taken may keep its parameter `i`**: every type its address is
+// taken at marks the parameter `@keeps`, so every call through a pointer to it is held to the mark
+// (`pointer_keeps`). A method a table holds answers to its trait instead.
+private pointer_licensed(cx: &KeepsCx, name: string, i: usize) -> bool
+    if !cx.addressed.has(name) || cx.slotted.has(name) || trait_of(cx, name).is_some() then return false
+
+    marks_kept(cx.addressed_marks.get(name).unwrap_or(buf()), i)
+end pointer_licensed
+
+// **Whether a function whose address is taken may let out what it reads through its parameter `i`**:
+// every type its address is taken at marks the parameter `@lets_out` or `@keeps`, so every call through
+// a pointer to it is held to that (`pointer_through`).
+private pointer_reads_licensed(cx: &KeepsCx, name: string, i: usize) -> bool
+    if !cx.addressed.has(name) || cx.slotted.has(name) || trait_of(cx, name).is_some() then return false
+
+    marks_lets_out(cx.addressed_marks.get(name).unwrap_or(buf()), i)
+end pointer_reads_licensed
 
 // Whether a location is one held through a parameter of the function it is said in.
 private through_param(loc: string) -> bool
@@ -306,8 +357,28 @@ end through_param
 // argument for the call** -- as an `extern` does without `@keeps`. Which function it lands in is
 // decided when the program runs, so no body is asked; a function whose address is taken is held to
 // the same promise where it is written (`refuse_promised`). Nothing is kept, and nothing read
-// through an argument is let out.
-pointer_keeps(cx: &KeepsCx, callee: TExpr, j: usize) -> Buf[(string, KeptAt)] = buf()
+// through an argument is let out -- **except at a parameter the type marks `@keeps`**, which is
+// answered as a call through a callable object's marked parameter is (`object_kept`): it may be
+// kept anywhere, with everything read through it, by whatever function the pointer holds. A parameter
+// marked `@lets_out` is borrowed for the call, and only what is read through it may be kept anywhere
+// (`pointer_through`).
+pointer_keeps(cx: &KeepsCx, callee: TExpr, j: usize) -> Buf[(string, KeptAt)] = pointer_marked(callee, j, false)
+
+// What a call through a function pointer keeps at its argument `j` -- or, `reads`, of what it reads
+// through it: anywhere where its type marks it, `@keeps` for the argument itself, `@lets_out` or
+// `@keeps` for what is read through it.
+private pointer_marked(callee: TExpr, j: usize, reads: bool) -> Buf[(string, KeptAt)]
+    var out: Buf[(string, KeptAt)] = buf()
+    val ty = texpr_type(callee)
+    val marks = pointer_marks(ty)
+
+    if marks_kept(marks, j)
+        out.push((s"a call through '${type_show(ty)}'", KeptAt("", "its type says '@keeps'", span_zero(), 0)))
+    else if reads && marks_lets_out(marks, j)
+        out.push((s"a call through '${type_show(ty)}'", KeptAt("", "its type says '@lets_out'", span_zero(), 0)))
+
+    out
+end pointer_marked
 
 // Whether the round just made is the last: every answer that leaned on an assumption came out as it
 // was assumed.
@@ -1261,20 +1332,28 @@ end declared_answers
 // what is let out of what is read through it at any step, what the call answers -- is answered the
 // way an `extern`'s is (`extern_kept`): a callable that may keep a pointer may keep
 // whatever it reads through it as well, so a marked parameter is a hard keep to every depth. `k`
-// numbers the receiver first.
-private object_marks_kept(recv: TExpr, k: usize) -> bool
+// numbers the receiver first. A parameter marked `@lets_out` is borrowed for the call, and what is read
+// through it is answered as a `@keeps` parameter's is (`object_marks_lets_out`).
+private object_marks_kept(recv: TExpr, k: usize) -> bool = object_marked(recv, k, false)
+
+// Whether a call through a callable object may let out what it reads through its parameter `k`: its
+// type marks the parameter `@lets_out`, or `@keeps`.
+private object_marks_lets_out(recv: TExpr, k: usize) -> bool = object_marked(recv, k, true)
+
+private object_marked(recv: TExpr, k: usize, reads: bool) -> bool
     if k == 0 then return false
 
     erased_trait(texpr_type(recv)) match
-        Some(Trait(n, _, assocs)) -> fn_is_call(n) && marks_kept(assocs, k - 1)
+        Some(Trait(n, _, assocs)) ->
+            fn_is_call(n) && (if reads then marks_lets_out(assocs, k - 1) else marks_kept(assocs, k - 1))
         _ -> false
-end object_marks_kept
+end object_marked
 
 // What a call through a callable object keeps at a parameter its type marks: anywhere, said by the type.
-private object_kept(recv: TExpr) -> Buf[(string, KeptAt)]
+private object_kept(recv: TExpr, word: string = "@keeps") -> Buf[(string, KeptAt)]
     var out: Buf[(string, KeptAt)] = buf()
 
-    out.push((object_callee(recv), KeptAt("", "its type says '@keeps'", span_zero(), 0)))
+    out.push((object_callee(recv), KeptAt("", s"its type says '$word'", span_zero(), 0)))
     out
 end object_kept
 
@@ -1290,19 +1369,21 @@ callee_said(a: &Analysis, name: string) -> string =
 
 // Whether a closure's body may keep its parameter `i` (its environment is parameter 0): the callable
 // type it was made at marks the parameter `@keeps` (`Analysis.closure_keeps`).
-private closure_licensed(cx: &KeepsCx, name: string, i: usize) -> bool
-    if i == 0 || !name.ends_with(".call") then return false
+private closure_licensed(cx: &KeepsCx, name: string, i: usize) -> bool =
+    i > 0 && marks_kept(closure_marks(cx, name), i - 1)
 
-    val base = name[0..<name.bytes.len - ".call".bytes.len]
+// Whether a closure's body may let out what it reads through its parameter `i`: the callable type it
+// was made at marks the parameter `@lets_out`, or `@keeps`, which says as much.
+private closure_reads_licensed(cx: &KeepsCx, name: string, i: usize) -> bool =
+    i > 0 && marks_lets_out(closure_marks(cx, name), i - 1)
 
-    cx.an.closure_keeps.get(base) match
-        Some(marks) ->
-            for m in marks
-                if m + 1 == i then return true
+// The marks of the callable type a closure's body was made at, numbered from the first parameter a
+// caller hands over.
+private closure_marks(cx: &KeepsCx, name: string) -> Buf[(string, Type)]
+    if !name.ends_with(".call") then return buf()
 
-            false
-        None -> false
-end closure_licensed
+    cx.an.closure_keeps.get(name[0..<name.bytes.len - ".call".bytes.len]).unwrap_or(buf())
+end closure_marks
 
 // **Whether a call through an object may answer with what it is handed at `k`** (the receiver first):
 // where the trait's declaration of the method says `@answers` of it (`declared_answers`). **A callable
@@ -1337,10 +1418,11 @@ vcall_through(cx: &KeepsCx, recv: TExpr, slot: int, k: usize) -> Buf[(string, Ke
 end vcall_through
 
 // What a call through an object keeps of what it reads through its argument at `k`, by its type: all of
-// it where the type marks the parameter `@keeps`, nothing for an unmarked parameter of a callable, and
-// for a trait's object what the method's declaration says.
+// it where the type marks the parameter `@keeps` or `@lets_out`, nothing for an unmarked parameter of a
+// callable, and for a trait's object what the method's declaration says.
 private by_signature(cx: &KeepsCx, recv: TExpr, slot: int, k: usize) -> Buf[(string, KeptAt)]
     if object_marks_kept(recv, k) then return object_kept(recv)
+    if object_marks_lets_out(recv, k) then return object_kept(recv, "@lets_out")
     if through_closure(recv) then return buf()
 
     declared_kept(cx, recv, slot, k)
@@ -1372,12 +1454,16 @@ vcall_through_answers(cx: &KeepsCx, recv: TExpr, slot: int, k: usize) -> bool
 end vcall_through_answers
 
 // What a call through a function pointer lets out of what it reads through its argument at `j`, at
-// any depth or at `steps` steps (`read_of`): nothing, by its type's promise (`pointer_keeps`).
-pointer_through(cx: &KeepsCx, callee: TExpr, j: usize) -> Buf[(string, KeptAt)] = buf()
+// any depth or at `steps` steps (`read_of`): nothing, by its type's promise (`pointer_keeps`), and
+// all of it where the type marks the parameter `@keeps` or `@lets_out`, to every depth as an `extern`'s
+// `@keeps(p)` is.
+pointer_through(cx: &KeepsCx, callee: TExpr, j: usize) -> Buf[(string, KeptAt)] = pointer_marked(callee, j, true)
 
-private pointer_deep(cx: &KeepsCx, callee: TExpr, j: usize, path: string) -> Buf[(string, KeptAt)] = buf()
+private pointer_deep(cx: &KeepsCx, callee: TExpr, j: usize, path: string) -> Buf[(string, KeptAt)] =
+    pointer_marked(callee, j, true)
 
-pointer_reads(cx: &KeepsCx, callee: TExpr, j: usize, steps: int, path: string) -> Buf[(string, KeptAt)] = buf()
+pointer_reads(cx: &KeepsCx, callee: TExpr, j: usize, steps: int, path: string) -> Buf[(string, KeptAt)] =
+    pointer_marked(callee, j, true)
 
 // Whether a call through a function pointer may answer with a value it read through its argument at
 // `j`: it may, since its type cannot say otherwise -- the answer is followed as a call's whose body is
@@ -1540,8 +1626,11 @@ private lent_by_rule(cx: &KeepsCx, f: TFunc, i: usize) -> bool
     // A trait method declared `@keeps(p)` promised nothing about `p`, so a call that sees the body is
     // held to what the body keeps.
     if trait_declares(cx, f, i, true) then return false
+    if trait_of(cx, f.name).is_some() then return true
 
-    trait_of(cx, f.name).is_some() || cx.addressed.has(f.name)
+    // A function whose address is only ever taken at a type marking the parameter `@keeps` was
+    // promised nothing about it either.
+    cx.addressed.has(f.name) && !pointer_licensed(cx, f.name, i)
 end lent_by_rule
 
 // **Whether the trait method `f` implements declares its parameter `i` `@keeps`** (`keeping`) or
@@ -2325,8 +2414,13 @@ private kept_at(t: &Track, evs: &EvBuf, e: TExpr)
                 for at in 0..<held.len()
                     val item = held[at]
                     val loc = track_loc(t, args, item.1.loc)
-                    val how = s"it is passed through a function pointer to '${shown_name(t.cx.an, item.0)}', " +
-                        (if at < kept_n then "which keeps it" else "which lets what it reads through it out")
+                    // A parameter the pointer's type marks is kept by the call itself, said as a call
+                    // through an object's marked parameter is (`pointer_marked`).
+                    val how = if item.0.starts_with("a call through '")
+                        passed_how(callee_said(t.cx.an, item.0), at < kept_n, item.1.how)
+                    else
+                        s"it is passed through a function pointer to '${shown_name(t.cx.an, item.0)}', " +
+                            (if at < kept_n then "which keeps it" else "which lets what it reads through it out")
 
                     if !loc.starts_with("l:") then evs.items.push(kept_ev(loc, how, args[j]))
         _ -> ()
@@ -4526,7 +4620,7 @@ private call_at(ft: &FrameTrack, evs: &EvBuf, e: TExpr)
                     else if declared.is_some()
                         s"${item.0} keeps its parameter '${declared.unwrap()}' (${item.1.how}), and " +
                             argument_said(ft, arg, core.unwrap())
-                    else if read && marked
+                    else if read && object_marks_lets_out(recv, k)
                         s"${item.0} may keep what it reads through its parameter $k (${item.1.how}), " +
                             s"and what is read through '${value_text(ft.scope, arg)}' holds ${h.3}"
                     else if read
@@ -4576,7 +4670,14 @@ private call_at(ft: &FrameTrack, evs: &EvBuf, e: TExpr)
                     if loc.starts_with("l:") then continue
 
                     val through = s"a call through '${type_show(texpr_type(callee))}' may reach "
-                    var said = if read
+                    val marked = marks_kept(pointer_marks(texpr_type(callee)), j)
+                    var said = if read && marks_lets_out(pointer_marks(texpr_type(callee)), j)
+                        s"${item.0} may keep what it reads through its parameter ${j + 1} (${item.1.how}), " +
+                            s"and what is read through '${value_text(ft.scope, arg)}' holds ${h.3}"
+                    else if marked
+                        s"${item.0} keeps its parameter ${j + 1} (${item.1.how}), and " +
+                            argument_said(ft, arg, core.unwrap())
+                    else if read
                         through + read_said(ft, item.0, param_name(ft.cx, item.0, j), item.1.how, arg, h.3, true)
                     else
                         through + s"'${shown_name(ft.cx.an, item.0)}', which keeps its parameter " +
@@ -6065,6 +6166,10 @@ private refuse_promised(cx: &KeepsCx, faults: &KeepFaults, f: TFunc)
         // sees the body, to what the body keeps.
         if closure && closure_licensed(cx, f.name, i) then continue
 
+        // **So may a function whose address is taken only at function pointer types marking it**:
+        // every call through the pointer is held to the mark (`pointer_keeps`).
+        if !closure && pointer_licensed(cx, f.name, i) then continue
+
         // **The receiver is held to the declaration too**: the object a call went through may be made in
         // the caller's frame, so an implementation that keeps it past the call needs the trait's
         // `@keeps(self)`, which every call through an object then answers to.
@@ -6080,14 +6185,20 @@ private refuse_promised(cx: &KeepsCx, faults: &KeepFaults, f: TFunc)
 
         if !reached then continue
 
-        if !declared && asks_through(cx, f.params[i].1)
+        // **A type marking the parameter `@lets_out` lets the body let out what it reads through it**,
+        // and nothing more: the pointer itself is still held to the promise above.
+        val reads = if closure then closure_reads_licensed(cx, f.name, i) else pointer_reads_licensed(cx, f.name, i)
+
+        if !declared && !reads && asks_through(cx, f.params[i].1)
             val d = deep_of(cx, f.name, i)
 
             // What a closure reads through a parameter and puts back into the same pointee -- a scope's
             // own spawn list -- stays in the caller's storage, which is the caller's to answer for.
             if d.kept && (!closure || !all_in_place(d.locs, i))
                 faults.items.push((scope, d.at, through_broken(cx, f, f.params[i].0, d.how, closure, trait_name) +
-                                   (if closure then marked_hint(f, i) else keeps_hint(cx, f, i, trait_name))))
+                                   (if closure then marked_hint(f, i, "@lets_out")
+                                    else if trait_name.is_none() then pointer_hint(f, i, "@lets_out")
+                                    else keeps_hint(cx, f, i, trait_name))))
                 continue
             end if
         end if
@@ -6138,19 +6249,33 @@ private answers_broken(cx: &KeepsCx, f: TFunc, pname: string, trait_name: string
         "storage back unseen. Write '@answers' above the trait's declaration, or answer a copy"
 
 // **The way a closure may keep what it is handed**: the callable type it is made at says so, with
-// `@keeps` on that parameter -- written out here with the closure's own parameter types.
-private marked_hint(f: TFunc, i: usize) -> string
+// `@keeps` on that parameter -- written out here with the closure's own parameter types -- or, for what
+// it reads through the parameter, `@lets_out`.
+private marked_hint(f: TFunc, i: usize, word: string = "@keeps") -> string
+    val what = if word == "@keeps" then "keep it" else "let out what it reads through it"
+
+    s", or let it $what by marking the parameter '$word' in the type it is made at: " +
+        s"'Fn(${hinted_params(f, 1, i, word)}) -> ${type_show(f.ret_ty)}'"
+end marked_hint
+
+// **The way a function whose address is taken may let out what it reads through a parameter**: the
+// function pointer type its address is taken at says so, with `@lets_out` on that parameter.
+private pointer_hint(f: TFunc, i: usize, word: string) -> string =
+    s", or let it by marking the parameter '$word' in the function pointer type its address is taken " +
+        s"at: '*extern(${hinted_params(f, 0, i, word)}) -> ${type_show(f.ret_ty)}'"
+
+// A function's parameter types from `from` on, the one at `i` marked `word`.
+private hinted_params(f: TFunc, from: usize, i: usize, word: string) -> string
     var ps = ""
 
-    for j in 1..<f.params.len()
-        if j > 1 then ps = ps + ", "
-        if j == i then ps = ps + "@keeps "
+    for j in from..<f.params.len()
+        if j > from then ps = ps + ", "
+        if j == i then ps = ps + word + " "
 
         ps = ps + type_show(f.params[j].1)
 
-    s", or let it keep it by marking the parameter '@keeps' in the type it is made at: " +
-        s"'Fn($ps) -> ${type_show(f.ret_ty)}'"
-end marked_hint
+    ps
+end hinted_params
 
 // **A `@scoped` promise is the body's own and does not spread**: the body that says it may hold the
 // pointer, but a callee it hands the pointer to that keeps it, or an object that captured it and is

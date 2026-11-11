@@ -2,6 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
+import sysl.container.{Set, set}
 import sysl.text.Search
 
 // A view a member hands back of its own receiver, and the receiver it may not outlive.
@@ -38,18 +39,28 @@ struct ViewRoot
 end ViewRoot
 
 // The local name at the bottom of a receiver place, or nothing where the receiver is a temporary.
+// A place reached through a raw pointer that a call answers is the root itself: what a `*T` points
+// at is storage the pointer does not own, so it is no temporary, though the pointer is.
 private receiver_root(cx: &Analyzer, t: TExpr) -> Option[TExpr] = *t.kind match
     TLoad(_, _) -> Some(t)
     TGlobal(_, _, _) -> Some(t)
-    TField(recv, _, _) -> receiver_root(cx, recv)
-    TIndex(recv, _, _) -> receiver_root(cx, recv)
-    TDeref(operand, _) -> receiver_root(cx, operand)
+    TField(recv, _, _) -> root_through(cx, recv)
+    TIndex(recv, _, _) -> root_through(cx, recv)
+    TDeref(operand, _) -> root_through(cx, operand)
     TConstView(arg) -> receiver_root(cx, arg)
     TAddrOf(inner, _) -> receiver_root(cx, inner)
     TCall(_, _, _, _) -> placed_by(cx, t) match
         Some(recv) -> receiver_root(cx, recv)
         None -> None
     _ -> None
+
+// The root below a place read through `recv`: `recv`'s own, or `recv` itself where it is a raw
+// pointer that is not a place -- a call's answer, a cast -- whose pointee outlives the statement.
+private root_through(cx: &Analyzer, recv: TExpr) -> Option[TExpr] = receiver_root(cx, recv) match
+    Some(r) -> Some(r)
+    None -> underlying(texpr_type(recv)) match
+        Ptr(_) -> Some(recv)
+        _ -> None
 
 // The local a unique name is bound to, with its position in the scope stack, while it is in scope.
 private local_at(cx: &Analyzer, unique: string) -> Option[(usize, Local)]
@@ -95,7 +106,11 @@ note_view_call(cx: &Analyzer, span: Span, receiver: TExpr, member: string)
 
         if l.is_some() then name = l.unwrap().1.name
     else
-        name = "module storage"
+        name = *root.unwrap().kind match
+            TGlobal(_, _, _) -> "module storage"
+            TCall(callee, _, _, _) -> s"*${qualified_name(callee)}(…)"
+            _ -> "*(…)"
+    end if
 
     cx.view_calls.push((span, ViewRoot(receiver, unique, name)))
 end note_view_call
@@ -156,31 +171,33 @@ end fresh_string
 
 private struct RootSink
     roots: Buf[ViewRoot]
-    pruned: Buf[Span]
+    pruned: Set[string]
 end RootSink
 
 // The receivers a value may hold a view borrowed from: every `@views(self)` call in it and every
 // local it reads that holds one, reached through nothing that cannot hold a view. **A node that
 // cannot hold one ends the walk below it** -- `v.len` is an integer, so a value made from it is not
-// borrowed from anything `v` was.
+// borrowed from anything `v` was, and `count(v)` answering an integer hands back nothing of `v`.
 //
-// The walk visits the outermost node first, so a node is skipped when it lies inside a span already
-// found to be one of those.
+// The walk visits the outermost node first, so a node is skipped when it is one of the nodes under
+// one already found to be one of those. **They are told by their own spans, not by lying inside the
+// outer node's**: a call's span is its callee's name, so its arguments lie outside it.
 view_roots(cx: &Analyzer, e: TExpr) -> Buf[ViewRoot]
     var out: Buf[ViewRoot] = buf()
 
     if cx.view_calls.is_empty() && cx.view_borrows.is_empty() then return out
     if !holds_borrow(texpr_type(e), 0) then return out
 
-    val sink: &RootSink = RootSink(buf(), buf())
+    val sink: &RootSink = RootSink(buf(), set())
 
     walk_texpr(e, expr_walk(false, x -> visit_root(cx, sink, x)))
     sink.roots
 end view_roots
 
+private span_key(s: Span) -> string = s"${s.start}:${s.end}"
+
 private visit_root(cx: &Analyzer, sink: &RootSink, x: TExpr)
-    for s in sink.pruned
-        if x.span.start >= s.start && x.span.end <= s.end then return
+    if sink.pruned.has(span_key(x.span)) then return
 
     for item in cx.view_calls
         if item.0.start == x.span.start && item.0.end == x.span.end
@@ -189,7 +206,7 @@ private visit_root(cx: &Analyzer, sink: &RootSink, x: TExpr)
         end if
 
     if !holds_borrow(texpr_type(x), 0) || fresh_string(x)
-        sink.pruned.push(x.span)
+        walk_texpr(x, expr_walk(false, y -> sink.pruned.add(span_key(y.span))))
         return
     end if
 
@@ -290,12 +307,21 @@ private file_borrow(cx: &Analyzer, span: Span, unique: string, name: string, roo
 
     if at.is_none() then return
 
+    val lent = underlying(at.unwrap().1.ty) match
+        Slice(elem, _) -> underlying(*elem)
+        _ -> Unknown
+
     for r in roots
         var types: Buf[Type] = buf()
 
         types.push(object_type(texpr_type(r.place)))
+
+        val root = *r.place.kind match
+            TLoad(_, _) -> r.unique
+            _ -> ""
+
         cx.an.ref_watches.push(RefWatch(cx.watch_key(), name, types, span.end, None, at.unwrap().0,
-                                        r.name, buf()))
+                                        r.name, buf(), root, lent))
 end file_borrow
 
 // An assignment of `value` into `target`. **The target has to die before the receiver does**: a
@@ -363,9 +389,17 @@ note_view_return(cx: &Analyzer, span: Span, value: TExpr)
     for r in roots
         if cx.views_self && r.unique == "self" then continue
 
-        if r.unique == ""
+        if r.unique == "" && r.name == "module storage"
             cx.fault(span, "this returns a view borrowed from module storage, which may be " +
                      "reassigned while the caller still reads it. Return a copy")
+            return
+        end if
+
+        if r.unique == ""
+            cx.fault(span, s"this returns a view borrowed from '${r.name}', and nothing keeps what " +
+                     "that pointer points at alive once this function returns — so the caller " +
+                     "could read freed memory. Return a copy, or return it from a member of its " +
+                     "type marked '@views(self)'")
             return
         end if
 

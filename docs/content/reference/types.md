@@ -1866,6 +1866,77 @@ a '&Fn(@keeps *int) -> int' may keep its parameter 1 past the call, and a '&Fn(*
 A mark on a parameter that holds no address — an `int` — changes nothing, as it does on an `extern`.
 What a call through a marked type may be handed is in [memory](/reference/memory/#a-callable-that-keeps-what-it-is-handed).
 
+**A function pointer type takes the mark too**, with the same meaning: `*extern(@keeps *Heap) ->
+unit` is the type of a pointer to a function that may keep its parameter, and a function whose
+address is taken at it may. The mark is part of that type as well, and is named in no symbol:
+
+```sysl
+type Roots = *extern(@keeps *int) -> unit
+type Loose = *extern(*int) -> unit
+
+widen(f: Loose) -> Roots = f
+narrow(f: Roots) -> Loose = f
+```
+
+```error
+a '*extern(@keeps *int) -> unit' may keep its parameter 1 past the call, and a '*extern(*int) -> unit' borrows what it is handed for the call
+```
+
+### What the callable reads may outlive the call: `@lets_out`
+
+**`@lets_out` is the narrower mark: the callable may let out what it reads through the parameter,
+but does not keep the parameter itself.** It is written where `@keeps` is, on a callable's type or a
+function pointer type. A collector's root hook is the shape it is for: the hook puts what it finds
+into the heap it is handed, so the heap may live in the caller's frame:
+
+```sysl
+struct Node
+    next: *Node
+    v: int
+
+struct Heap
+    gray: *Node
+
+type Roots = *extern(@lets_out *Heap) -> unit
+
+var root = Node(null, 7)
+
+roots(h: *Heap)
+    root.next = h.gray
+    h.gray = &root
+
+collect(h: *Heap, r: Roots)
+    r(h)
+
+main()
+    var h = Heap(null)
+    collect(&h, &roots)
+    print(h.gray.v)
+```
+
+```output
+7
+```
+
+**`@keeps` says all `@lets_out` does and more**, so the three marks stand in order: an unmarked
+callable stands where a `@lets_out` one is asked for, and a `@lets_out` one where a `@keeps` one is,
+never the other way:
+
+```sysl
+type Hard = *extern(@keeps *int) -> unit
+type Roots = *extern(@lets_out *int) -> unit
+
+widen(f: Roots) -> Hard = f
+narrow(f: Hard) -> Roots = f
+```
+
+```error
+a '*extern(@keeps *int) -> unit' may keep its parameter 1 past the call, and a '*extern(@lets_out *int) -> unit' lets out only what it reads through it, never the parameter itself
+```
+
+What a call through a `@lets_out` type may be handed is in
+[memory](/reference/memory/#a-callable-that-keeps-what-it-is-handed).
+
 ### A parameter passed by name
 
 A parameter written with the arrow and **nothing on its left** takes an expression the call does not

@@ -783,3 +783,90 @@ cfe_said_once()
               "3:16 'z' traps while it is being compiled: integer division by zero (main.sysl:1:36) — " +
               "inside 'per(1, 0)', called at main.sysl:3:16\n")
 end cfe_said_once
+
+// A type that reaches itself through a slice -- directly, as an enum, or by way of a second type --
+// is walked once by the two checks that judge whether a value can be held while compiling, rather
+// than without end.
+@test("a struct holding a slice of itself is evaluated while compiling")
+cfe_self_reaching_struct()
+    if !cfe_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        struct Node
+            n: int
+            kids: []Node
+
+        const make(n: int) -> Node
+            val x = Node(n, [])
+
+            x
+
+        val root = make(2)
+
+        print(root.n, root.kids.len)
+        """), "2 0\n")
+end cfe_self_reaching_struct
+
+@test("an enum holding a slice of itself is evaluated while compiling")
+cfe_self_reaching_enum()
+    if !cfe_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        enum Tree
+            Leaf(n: int)
+            Branch(kids: []Tree)
+
+        const tree() -> Tree = Branch([Leaf(1), Branch([])])
+
+        val t = tree()
+
+        print(t is Branch(_))
+        """), "true\n")
+end cfe_self_reaching_enum
+
+@test("two types reaching each other through slices are evaluated while compiling")
+cfe_mutually_reaching_types()
+    if !cfe_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        struct A
+            n: int
+            bs: []B
+
+        struct B
+            m: int
+            back: []A
+
+        const make(n: int) -> A
+            val x = A(n, [])
+
+            x
+
+        const back(a: A) -> int = a.n + 1
+
+        val a = make(4)
+        val k = back(a)
+
+        print(a.n, a.bs.len, k)
+        """), "4 0 5\n")
+end cfe_mutually_reaching_types
+
+@test("a self-reaching type is still refused where one of its fields cannot be held")
+cfe_self_reaching_type_refused()
+    if !cfe_ready() then return
+
+    val said = cfe_said(raw"""
+        struct Owner
+            n: int
+
+        struct Node
+            kids: []Node
+            w: weak Owner
+
+        const f(x: Node) -> int = x.kids.len
+
+        print(1)
+        """)
+
+    assert(said.contains("weak reference"), said)
+end cfe_self_reaching_type_refused

@@ -143,46 +143,42 @@ private erase(cx: &Analyzer, t: TExpr, tr: Type, inner: Type, want: Type, boxed:
     TExpr(t.span, TErase(t, vtable_for(cx, t.span, tr, inner, boxed), want))
 end erase
 
-// **A callable object where another callable object differing only in its `@keeps` marks is asked
-// for** (`callable_within`): one that keeps nothing more than the slot lets it is the same object --
-// the same table, the same box -- and stands as it is; one that may keep a parameter the slot borrows
-// is refused, since every call through the slot may hand that parameter the address of its own
-// storage. `None` for any other pair.
+// **A callable object where another callable object differing only in its `@keeps` and `@lets_out`
+// marks is asked for** (`callable_within`): one that does nothing more than the slot lets it is the
+// same object -- the same table, the same box -- and stands as it is; one that may keep a parameter the
+// slot borrows, or let out what it reads through one the slot does not mark, is refused, since every
+// call through the slot may hand that parameter the address of its own storage. `None` for any other
+// pair.
 private callable_retyped(cx: &Analyzer, t: TExpr, got: Type, want: Type, tr: Type) -> Option[TExpr]
     val fits = callable_within(got, want)
 
     if fits.is_none() then return None
     if fits.unwrap() then return Some(t)
 
-    val g = erased_trait(got).unwrap()
-    var i: usize = 0
-    var shown = ""
+    val wk = trait_assocs_of(tr)
+    val over = erased_trait(got).unwrap() match
+        Trait(_, args, assocs) -> mark_exceeding(assocs, wk, args.len() - 1)
+        _ -> None
 
-    g match
-        Trait(_, args, assocs) ->
-            for k in 0..<args.len() - 1
-                if marks_kept(assocs, k) && !marks_kept(trait_assocs_of(tr), k)
-                    i = k
-                    break
-        _ -> ()
+    if over.is_none() then return None
 
-    tr match
-        Trait(n, args, assocs) ->
-            var marks: Buf[(string, Type)] = buf()
+    val o = over.unwrap()
+    val shown = tr match
+        Trait(n, args, assocs) -> type_show(Trait(n, args, with_marks(assocs, o.2)))
+        _ -> type_show(want)
 
-            for item in assocs
-                marks.push(item)
-
-            marks.push(fn_keeps_assoc(i))
-            shown = type_show(Trait(n, args, marks))
-        _ -> ()
-
-    Some(cx.err(t.span, s"a '${type_show(got)}' may keep its parameter ${i + 1} past the call, and a " +
-                s"'${type_show(want)}' borrows what it is handed for the call — whoever calls it may " +
-                "hand it the address of their own storage. Mark the parameter '@keeps' where the " +
-                s"type it goes into is written, '$shown', or copy what the callable keeps into " +
-                "storage of its own"))
+    Some(cx.err(t.span, marks_refused(got, want, o.0, o.1, marks_lets_out_only(wk, o.0), shown, "callable")))
 end callable_retyped
+
+// A trait's associated types with its callable marks replaced by `marks`.
+private with_marks(assocs: Buf[(string, Type)], marks: Buf[(string, Type)]) -> Buf[(string, Type)]
+    var out = without_keeps(assocs)
+
+    for m in marks
+        out.push(m)
+
+    out
+end with_marks
 
 // The associated types an object wrote down.
 private trait_assocs_of(t: Type) -> Buf[(string, Type)] = t match

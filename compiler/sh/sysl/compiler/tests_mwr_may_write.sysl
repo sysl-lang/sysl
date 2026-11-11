@@ -1,0 +1,277 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A call made while a view is live is refused where its callee may write a value of the type the
+// view's storage is held in (`checks.sysl`'s `ref_call`). A callee is cleared by its body
+// (`untouched_by`) or by having no way to reach such a value at all.
+//
+// **A path that ends the program is part of the body, and it reports why through foreign
+// functions** -- `unwrap`'s panic, `expect`'s, a `panic` of the program's own. Those are trusted
+// only once the check has seen the program's foreign functions, so every accepted program here
+// calls something whose dying path does that, on an `Option[*T]` or an `Option[&T]` whose pointee
+// holds the viewed buffer, while the view is live.
+//
+// What is still refused: a callee handed the owner that replaces its buffer, one that replaces a
+// buffer of the type in module storage, and one that replaces it as well as dying.
+//
+// Every accepted program is built and run at `-O0` with the heap counted (net zero), at `-O1` and at
+// `-O2`, and prints the same at each.
+
+private mwr_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end mwr_ready
+
+private mwr_head() -> string = """
+    import sysl.buf.{Buf, buf}
+
+    struct State
+        xs: Buf[int]
+
+    struct Vm
+        state: State
+        other: Buf[int]
+
+    find(vm: *Vm) -> Option[*Vm] = if vm.state.xs.len() > 0 then Some(vm) else None
+
+    lend(vm: &Vm) -> Option[&Vm] = if vm.state.xs.len() > 0 then Some(vm) else None
+
+    total(s: []const int) -> int
+        var t = 0
+
+        for x in s
+            t += x
+
+        t
+
+    three() -> Buf[int]
+        var out = buf[int]()
+
+        out.push(1)
+        out.push(2)
+        out.push(3)
+        out
+
+    fresh_vm() -> Vm = Vm(State(three()), three())
+
+    """
+
+private mwr_program(body: string) -> string = mwr_head() + body + "\nmain()\n    run()\n"
+
+private mwr_root(text: string) -> string
+    val root = make_temp_dir("sysl-may-write").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+
+// What analysing a program said, all of it.
+private mwr_said(text: string) -> string
+    val root = mwr_root(text)
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end mwr_said
+
+// What a program printed at `level`, with what the counted heap said on stderr when `counted`.
+private mwr_ran(text: string, level: string, counted: bool) -> string
+    val root = mwr_root(text)
+    val exe = s"$root/built"
+
+    force_alloc_counting(counted)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, level, Some(exe))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text + out.err.unwrap_or("")
+end mwr_ran
+
+// Accepted, and run at every level: what it printed, with nothing left on the counted heap.
+private mwr_whole_accepted(text: string, printed: string)
+    val out = mwr_said(text)
+
+    assert(!out.contains("error"), s"expected no complaint, got: $out")
+    assert_eq(mwr_ran(text, "0", true), printed)
+    assert_eq(mwr_ran(text, "1", false), printed)
+    assert_eq(mwr_ran(text, "2", false), printed)
+end mwr_whole_accepted
+
+private mwr_accepted(body: string, printed: string) = mwr_whole_accepted(mwr_program(body), printed)
+
+private mwr_refused(body: string, said: string)
+    val out = mwr_said(mwr_program(body))
+
+    assert(out.contains(said), s"expected '$said' in: $out")
+
+// The opening every case shares: a view of a buffer reached through a `*Vm`, live to the end.
+private mwr_view() -> string =
+    "run()\n    var vm = fresh_vm()\n    var spare = fresh_vm()\n    val p = find(&vm).unwrap()\n" +
+    "    val v = p.state.xs.view_mut()\n"
+
+// -- accepted: a callee whose only way out is a dying path ------------------------------------------
+
+@test("unwrap of an Option[*T] whose pointee holds the viewed buffer is accepted while the view is live")
+mwr_repro()
+    if !mwr_ready() then return
+
+    mwr_accepted("run()\n    var vm = fresh_vm()\n    val p = find(&vm).unwrap()\n" +
+                 "    val v = p.state.xs.view_mut()\n    val o = find(&vm)\n    val q = o.unwrap()\n\n" +
+                 "    v[0] = 5\n    print(q.state.xs[0], total(v))\n",
+                 "5 10\n")
+
+@test("unwrap_or, expect and a match on an Option[*T] are accepted while the view is live")
+mwr_option_ptr_forms()
+    if !mwr_ready() then return
+
+    mwr_accepted(mwr_view() + "    val a = find(&vm).unwrap_or(&spare)\n" +
+                 "    val b = find(&vm) match\n        Some(x) -> x\n        None -> &spare\n" +
+                 "    val c = find(&vm).expect(\"no vm\")\n\n" +
+                 "    v[1] = 7\n    print(a.state.xs[1], b.state.xs[1], c.state.xs[1], spare.state.xs[1])\n",
+                 "7 7 7 2\n")
+
+@test("unwrap, unwrap_or and a match on an Option[&T] are accepted while a view of its pointee is live")
+mwr_option_ref_forms()
+    if !mwr_ready() then return
+
+    mwr_accepted("run()\n    val vm: &Vm = fresh_vm()\n    val v = vm.state.xs.view_mut()\n" +
+                 "    val r = lend(vm).unwrap()\n    val s = lend(vm).unwrap_or(vm)\n" +
+                 "    val t = lend(vm) match\n        Some(x) -> x\n        None -> vm\n\n" +
+                 "    v[2] = 9\n    print(r.state.xs[2], s.state.xs[2], t.state.xs[2], total(v))\n",
+                 "9 9 9 12\n")
+
+@test("a function of the program's own that panics, or reads with a bounds check, is accepted")
+mwr_own_dying_paths()
+    if !mwr_ready() then return
+
+    mwr_accepted("must(vm: *Vm) -> *Vm\n    if vm.other.len() == 0 then panic(\"empty\")\n    vm\n\n" +
+                 "nth(vm: *Vm, i: usize) -> int = vm.other[i]\n\n" + mwr_view() +
+                 "    val m = must(p)\n    val n = nth(p, 1)\n\n" +
+                 "    v[0] = 6\n    print(m.state.xs[0], n, total(v))\n",
+                 "6 2 11\n")
+
+@test("a generic callee at the view's element type, handed an unrelated buffer, is accepted")
+mwr_generic_unrelated()
+    if !mwr_ready() then return
+
+    mwr_accepted("first[T](b: *Buf[T]) -> T = b[0]\n\nsum_by[T](b: Buf[T], f: (T) -> int) -> int\n" +
+                 "    var t = 0\n\n    for x in b\n        t += f(x)\n\n    t\n\n" + mwr_view() +
+                 "    var mine = three()\n\n    print(first(&mine), sum_by(mine, x -> x * 2))\n" +
+                 "    v[0] = 4\n    print(total(v))\n",
+                 "1 12\n9\n")
+
+@test("a callee handed a fresh buffer, as a file read is, is accepted")
+mwr_fresh_buffer()
+    if !mwr_ready() then return
+
+    mwr_accepted("sum_of(b: Buf[int]) -> int = total(b.view())\n\n" +
+                 "made(n: int) -> Option[Buf[int]] = if n > 0 then Some(three()) else None\n\n" +
+                 mwr_view() + "    print(sum_of(three()), made(1).unwrap().len())\n" +
+                 "    v[2] = 0\n    print(total(v))\n",
+                 "6 3\n3\n")
+
+// -- still refused ----------------------------------------------------------------------------------
+
+@test("a callee handed the owner that replaces its buffer is refused, through an unwrap or directly")
+mwr_owner_refused()
+    if !mwr_ready() then return
+
+    val said = "'v' is a view borrowed from 'p', held in a 'Buf[int]', and 'reset' may write a " +
+               "'Buf[int]' — which could free what the view reads. Make the call before the view " +
+               "is taken, or put the view in a block that closes first"
+
+    mwr_refused("reset(vm: *Vm)\n    vm.state.xs = buf()\n\n" + mwr_view() + "    reset(p)\n    v[0] = 1\n",
+                said)
+    mwr_refused("reset(vm: *Vm)\n    vm.state.xs = buf()\n\n" + mwr_view() +
+                "    reset(find(&vm).unwrap())\n    v[0] = 1\n", said)
+
+@test("a callee that replaces the buffer as well as having a dying path is refused")
+mwr_dying_and_writing_refused()
+    if !mwr_ready() then return
+
+    mwr_refused("reset(vm: *Vm)\n    if vm.other.len() == 0 then panic(\"empty\")\n" +
+                "    vm.state.xs = buf()\n\n" + mwr_view() + "    reset(p)\n    v[0] = 1\n",
+                "'v' is a view borrowed from 'p', held in a 'Buf[int]', and 'reset' may write a 'Buf[int]'")
+    mwr_refused("reset(o: Option[*Vm])\n    o.unwrap().state.xs = buf()\n\n" + mwr_view() +
+                "    reset(find(&vm))\n    v[0] = 1\n",
+                "'v' is a view borrowed from 'p', held in a 'Buf[int]', and 'reset' may write a 'Buf[int]'")
+
+@test("a callee that replaces a buffer of the type in module storage is refused")
+mwr_module_storage_refused()
+    if !mwr_ready() then return
+
+    mwr_refused("var stash: Buf[int] = buf()\n\nclear_stash()\n    stash = buf()\n\n" + mwr_view() +
+                "    clear_stash()\n    v[0] = 1\n",
+                "'v' is a view borrowed from 'p', held in a 'Buf[int]', and 'clear_stash' may write a " +
+                "'Buf[int]'")
+
+// -- a cast elsewhere in the program ----------------------------------------------------------------
+
+// A pointer cast to a struct holding a `Buf[string]` by value, elsewhere in the program, is not
+// counted against a call to `read_bytes`, which cannot run the code that casts: what it reaches ends
+// in the standard library's own foreign functions, which never call back into the program.
+@test("a pointer cast elsewhere in the program does not refuse a library call made while a view is live")
+mwr_cast_elsewhere()
+    if !mwr_ready() then return
+
+    mwr_whole_accepted("""
+        import sysl.buf.{Buf, buf}
+        import sysl.fs.{is_dir, read_bytes}
+        import sysl.raw.ptr_cast
+
+        struct Vm
+            names: Buf[string]
+
+        back(p: *u8) -> usize = ptr_cast[*Vm](p).names.len()
+
+        gather(out: *Buf[string]) -> bool
+            if is_dir("/") then out.push("/etc/hosts")
+            true
+
+        hash() -> int
+            var paths: Buf[string] = buf()
+
+            if !gather(&paths) then return -1
+
+            var names = paths.view_mut()
+            var total = 0
+
+            for i in 0..<names.len
+                read_bytes(names[i]) match
+                    Err(_) -> return -1
+                    Ok(body) -> total += if body.len > 0 then 1 else 0
+
+            total
+        end hash
+
+        main()
+            var vm = Vm(buf())
+
+            print(back(ptr_cast[*u8](&vm)), hash())
+        """, "0 1\n")

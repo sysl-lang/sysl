@@ -1829,10 +1829,16 @@ private eval_kind(fb: &FBody, e: TExpr) -> Buf[FAtom] = *e.kind match
         eval(fb, callee)
 
         val argv = eval_each(fb, args)
+        val marks = underlying(texpr_type(callee)) match
+            CFn(_, _, ks) -> ks
+            _ -> buf()
         var out: Buf[FAtom] = buf()
 
+        // A parameter the pointer's type marks `@keeps` is kept, as a callable's is (`vcall`), and what
+        // is reached through one it marks `@lets_out` is kept while the pointer is lent.
         for k in 0..<argv.len()
-            lend(fb, argv[k])
+            if marks_kept(marks, k) then keep(fb, argv[k]) else lend(fb, argv[k])
+            if !marks_kept(marks, k) && marks_lets_out(marks, k) then keep(fb, reached_through(fb, argv[k]))
             join_into(&out, anywhere_in(fb, answered_arg(fb.fx, texpr_type(e), args, k, argv[k])))
 
         out
@@ -2029,6 +2035,21 @@ private eval_conds(fb: &FBody, terms: Buf[TCondTerm])
                 for p in patterns
                     bind(fb, p, v, st)
 end eval_conds
+
+// What a value reaches through the addresses it holds, without the value itself: what a callee marked
+// `@lets_out` may let out (`fn_lets_out_assoc`).
+private reached_through(fb: &FBody, v: Buf[FAtom]) -> Buf[FAtom]
+    var out: Buf[FAtom] = buf()
+
+    for a in v
+        if a.root.starts_with("p")
+            out.push(at_place(fb, buf(), a, extend(a.path, star_step())))
+        else if a.root.starts_with("l:") || a.root.starts_with("h:")
+            join_into(&out, reachable(fb, cell(fb, a.root)))
+        end if
+
+    out
+end reached_through
 
 // Everything a value may reach: itself anywhere inside, and what any address it holds points at.
 private reachable(fb: &FBody, v: Buf[FAtom]) -> Buf[FAtom]
@@ -2494,6 +2515,8 @@ private vcall(fb: &FBody, recv: TExpr, slot: int, args: Buf[TExpr], argv: Buf[Bu
 
         if kept then keep(fb, argv[k])
         else if callable then lend(fb, argv[k])
+
+        if callable && !kept && marks_lets_out(assocs, k) then keep(fb, reached_through(fb, argv[k]))
 
         join_into(&out, anywhere_in(fb, answered_arg(fb.fx, ty, args, k, argv[k])))
 

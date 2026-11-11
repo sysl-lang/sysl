@@ -1,0 +1,343 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `@keeps` on a parameter of a function pointer type (`*extern(@keeps *Heap) -> unit`), with exactly
+// the meaning it has on a callable's type: a function whose address is taken only at types marking the
+// parameter may keep it, or let out what it reads through it, and every call through a pointer of the
+// type is held to the mark the way a call of an `extern` is held to its `@keeps(p)`
+// (`keeps.sysl`'s `pointer_licensed`, `pointer_keeps`). The mark is part of the type: a pointer that
+// keeps nothing stands where a marked one is asked for, never the other way round
+// (`analyzer.sysl`'s `callable_within`, `expr_coerce.sysl`'s `pointer_retyped`).
+// `reference/memory.md § A callable that keeps what it is handed` is the specification.
+//
+// The matrix crosses where the pointer type stands (an alias, a parameter, a struct field, an
+// `Option`, a generic struct, an `extern`'s parameter) with what is taken at it (a function keeping
+// the marked parameter, one keeping an unmarked one, one taken at a marked and an unmarked type, an
+// `@export`ed one) and with the call through it (module storage, a local, a local's field, a
+// parameter's copy, a pointer handed on from a parameter).
+//
+// Skipped cells, and why: a closure is not a function pointer and is `tests_ftk_fn_type_keeps.sysl`'s;
+// an address taken in a module initializer is held as before (nothing walks one for addresses);
+// separate compilation reads the same typed tree.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private kfn_outcome(text: string) -> (string, int)
+    val root = make_temp_dir("sysl-kfn").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", kfn_prelude + text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end kfn_outcome
+
+private kfn_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = kfn_outcome(text)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+end kfn_prints
+
+private kfn_refused(text: string, part: string)
+    if xvr_no_library() then return
+
+    val out = kfn_outcome(text)
+
+    assert_eq(out.1, -1, out.0)
+    assert(out.0.index_of(part).is_some(), out.0)
+end kfn_refused
+
+private const kfn_prelude: string = raw"""
+    struct Node
+        next: *Node
+        v: int
+
+    struct Heap
+        gray: *Node
+
+    struct Pair
+        h: Heap
+        n: int
+
+    mark(h: *Heap, o: *Node)
+        o.next = h.gray
+        h.gray = o
+
+    type Roots = *extern(@keeps *Heap) -> unit
+
+    var n = Node(null, 7)
+    var held: *Heap = null
+
+    """
+
+private const kfn_unmarked: string = "'roots' lets what it reads through its parameter 'h' outlive the call (it is passed to " +
+    "'mark', which lets what it reads through it out), but its address is taken — a call through a function pointer sees no body"
+
+private const kfn_call_through: string = "a call through '*extern(@keeps *Heap) -> unit' keeps its parameter 1 (its type says '@keeps'), and "
+
+// -- accepted ------------------------------------------------------------------------------------
+
+@test("a function taken at a marked pointer type lets out what it reads through the marked parameter")
+kfn_reduction()
+    kfn_prints(raw"""
+        roots(h: *Heap)
+            mark(h, &n)
+
+        collect(h: *Heap, r: Roots)
+            r(h)
+
+        var the = Heap(null)
+
+        main()
+            collect(&the, &roots)
+            print(the.gray.v)
+        """, "7\n")
+
+@test("a function taken at a marked pointer type keeps the marked parameter in module storage")
+kfn_kept_in_global()
+    kfn_prints(raw"""
+        var the = Heap(null)
+
+        keep(h: *Heap)
+            held = h
+
+        main()
+            val r: Roots = &keep
+            r(&the)
+            print(held == &the)
+        """, "true\n")
+
+@test("a marked parameter among unmarked ones: only it may be kept")
+kfn_marked_among_unmarked()
+    kfn_prints(raw"""
+        type Visit = *extern(*Heap, @keeps *Node, int) -> int
+
+        var last: *Node = null
+
+        visit(h: *Heap, o: *Node, k: int) -> int
+            last = o
+            k + o.v
+
+        run(f: Visit) -> int
+            var h = Heap(null)
+            f(&h, &n, 1)
+
+        main()
+            print(run(&visit), last.v)
+        """, "8 7\n")
+
+@test("a marked pointer stored in a struct field, and called through it")
+kfn_in_a_field()
+    kfn_prints(raw"""
+        struct Hooks
+            roots: Roots
+
+        var the = Heap(null)
+
+        roots(h: *Heap)
+            mark(h, &n)
+
+        main()
+            val hooks = Hooks(&roots)
+            hooks.roots(&the)
+            print(the.gray.v)
+        """, "7\n")
+
+@test("a marked pointer held in an Option and in a generic struct, as gc keeps its hooks")
+kfn_in_an_option()
+    kfn_prints(raw"""
+        struct Holder[T]
+            f: T
+
+        var the = Heap(null)
+
+        roots(h: *Heap)
+            mark(h, &n)
+
+        main()
+            var hook: Option[Roots] = None
+            hook = Some(&roots)
+            hook match
+                Some(f) -> f(&the)
+                None -> ()
+            val box = Holder[Roots](&roots)
+            box.f(&the)
+            print(the.gray.v, the.gray.next.v)
+        """, "7 7\n")
+
+@test("an extern taking a marked pointer: a C callback that keeps what C hands it")
+kfn_c_callback()
+    kfn_prints(raw"""
+        extern qsort(base: *int, count: usize, size: usize, cmp: *extern(@keeps *int, *int) -> i32)
+
+        var seen: *int = null
+
+        by_value(a: *int, b: *int) -> i32
+            seen = a
+            if *a < *b then -1 else if *a > *b then 1 else 0
+
+        var xs = [3, 1, 2]
+
+        main()
+            qsort(&xs[0], 3, 4, &by_value)
+            print(xs[0], xs[1], xs[2], seen != null)
+        """, "1 2 3 true\n")
+
+@test("an exported function taken at a marked pointer type may keep the marked parameter")
+kfn_exported()
+    kfn_prints(raw"""
+        var the = Heap(null)
+
+        @export("kfn_roots_hook")
+        roots(h: *Heap)
+            held = h
+
+        main()
+            val r: Roots = &roots
+            r(&the)
+            print(held == &the)
+        """, "true\n")
+
+@test("a pointer that keeps nothing stands where a marked one is asked for")
+kfn_widened()
+    kfn_prints(raw"""
+        var three = Node(null, 3)
+        var the = Heap(&three)
+
+        peek(h: *Heap)
+            print(h.gray.v)
+
+        main()
+            val loose: *extern(*Heap) -> unit = &peek
+            val strict: Roots = loose
+            strict(&the)
+        """, "3\n")
+
+// -- still refused -------------------------------------------------------------------------------
+
+@test("without the mark the function is refused where it is written, as before")
+kfn_unmarked_refused()
+    kfn_refused(raw"""
+        type Loose = *extern(*Heap) -> unit
+
+        roots(h: *Heap)
+            mark(h, &n)
+
+        main()
+            var h = Heap(null)
+            val r: Loose = &roots
+            r(&h)
+        """, kfn_unmarked)
+
+@test("a function keeping a parameter the marked type leaves unmarked is refused")
+kfn_unmarked_parameter_refused()
+    kfn_refused(raw"""
+        type Visit = *extern(@keeps *Heap, *Node) -> unit
+
+        var last: *Node = null
+
+        visit(h: *Heap, o: *Node)
+            last = o
+
+        main()
+            var h = Heap(null)
+            val f: Visit = &visit
+            f(&h, &n)
+        """, "'visit' keeps its parameter 'o' (it is stored in 'last'), and its address is taken")
+
+@test("a function taken at a marked type and at an unmarked one is held to the unmarked one")
+kfn_taken_twice_refused()
+    kfn_refused(raw"""
+        roots(h: *Heap)
+            mark(h, &n)
+
+        main()
+            var h = Heap(null)
+            val r: Roots = &roots
+            val loose: *extern(*Heap) -> unit = &roots
+            r(&h)
+            loose(&h)
+        """, kfn_unmarked)
+
+@test("a call through the marked pointer handing it the address of a local is refused")
+kfn_local_refused()
+    kfn_refused(raw"""
+        collect(r: Roots)
+            var mine = Heap(null)
+            r(&mine)
+        """, kfn_call_through + "'&mine' is the address of a local of 'collect'")
+
+@test("a call through the marked pointer handing it the address of a local's field is refused")
+kfn_local_field_refused()
+    kfn_refused(raw"""
+        collect(r: Roots)
+            var p = Pair(Heap(null), 1)
+            r(&p.h)
+        """, kfn_call_through + "'&p.h'")
+
+@test("a call through the marked pointer handing it the address of a parameter's copy is refused")
+kfn_param_copy_refused()
+    kfn_refused(raw"""
+        collect(r: Roots, h: Heap)
+            r(&h)
+        """, kfn_call_through + "'&h'")
+
+@test("a function handing its own parameter on through the marked pointer keeps it, so its caller handing it a local is refused")
+kfn_relay_refused()
+    kfn_refused(raw"""
+        relay(r: Roots, h: *Heap)
+            r(h)
+
+        roots(h: *Heap)
+            mark(h, &n)
+
+        main()
+            var mine = Heap(null)
+            relay(&roots, &mine)
+        """, "'relay' keeps its parameter 'h' (it is passed to a call through '*extern(@keeps *Heap) -> unit', which keeps it), and " +
+            "'&mine' is the address of a local of 'main'")
+
+@test("a direct call of a function taken at a marked type is held to its body")
+kfn_direct_call_refused()
+    kfn_refused(raw"""
+        keep(h: *Heap)
+            held = h
+
+        use(r: Roots)
+            var mine = Heap(null)
+            keep(&mine)
+
+        main()
+            use(&keep)
+        """, "'keep' keeps its parameter 'h' (it is stored in 'held'), and '&mine' is the address of a local of 'use'")
+
+@test("a marked pointer never stands where the parameter is borrowed")
+kfn_narrowed_refused()
+    kfn_refused(raw"""
+        roots(h: *Heap)
+            mark(h, &n)
+
+        main()
+            val r: Roots = &roots
+            val loose: *extern(*Heap) -> unit = r
+        """, "a '*extern(@keeps *Heap) -> unit' may keep its parameter 1 past the call, and a " +
+            "'*extern(*Heap) -> unit' borrows what it is handed for the call")

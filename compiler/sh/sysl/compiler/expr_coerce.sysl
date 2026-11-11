@@ -211,6 +211,9 @@ analyze_unwidened(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr
         // where a mismatch belongs.
         Ptr(inner) ->
             if is_trait(*inner) then return coerce(cx, analyze_value(cx, e, expected), want)
+        // A function pointer is taken at a type that differs only in its `@keeps` marks
+        // (`pointer_retyped`); any other mismatch is handed back for the position to diagnose.
+        CFn(_, _, _) -> return coerce(cx, analyze_value(cx, e, expected), want)
         _ -> ()
 
     // A construction of a type with a `Drop` is a `&T` wherever no conversion above already made it
@@ -256,12 +259,80 @@ named_place(e: Expr) -> bool = *e.kind match
     Unary(op, _) -> op == "*"
     _ -> false
 
+// **A function pointer where one differing only in its `@keeps` marks is asked for**
+// (`callable_within`), held as a callable object is (`erase.sysl`'s `callable_retyped`): one that
+// keeps nothing more than the slot lets it stands as it is, and one that may keep a parameter the slot
+// borrows is refused, since every call through the slot may hand that parameter the address of its
+// own storage. **A function's address taken where a marked type is asked for is taken at that type**,
+// which is what lets the function keep what the type marks (`keeps.sysl`'s `refuse_promised`).
+// `None` for any other pair.
+private pointer_retyped(cx: &Analyzer, t: TExpr, got: Type, want: Type) -> Option[TExpr]
+    if type_eq(got, want) then return None
+
+    val fits = callable_within(got, want)
+
+    if fits.is_none() then return None
+
+    var gk: Buf[(string, Type)] = buf()
+    var wk: Buf[(string, Type)] = buf()
+    var arity: usize = 0
+
+    underlying(got) match
+        CFn(ps, _, k) ->
+            gk = k
+            arity = ps.len()
+        _ -> return None
+
+    underlying(want) match
+        CFn(_, _, k) -> wk = k
+        _ -> return None
+
+    if fits.unwrap()
+        *t.kind match
+            TFuncAddr(name, entry, _) -> return Some(TExpr(t.span, TFuncAddr(name, entry, want)))
+            _ -> return Some(t)
+    end if
+
+    val over = mark_exceeding(gk, wk, arity)
+
+    if over.is_none() then return None
+
+    val o = over.unwrap()
+    val shown = underlying(want) match
+        CFn(ps, r, _) -> type_show(CFn(ps, *r, o.2))
+        _ -> type_show(want)
+
+    Some(cx.err(t.span, marks_refused(got, want, o.0, o.1, marks_lets_out_only(wk, o.0), shown, "function")))
+end pointer_retyped
+
+// **The refusal of a callable whose type marks its parameter `i` further than the type it goes into**:
+// `kept`, it may keep the parameter; otherwise it may let out what it reads through it. `lets_out` says
+// the wanted type marks the parameter `@lets_out`; `shown` is that type with the parameter marked as
+// the callable needs.
+marks_refused(got: Type, want: Type, i: usize, kept: bool, lets_out: bool, shown: string, what: string) -> string
+    val did = if kept then s"may keep its parameter ${i + 1} past the call"
+    else s"may let out what it reads through its parameter ${i + 1}"
+    val asks = if lets_out then "lets out only what it reads through it, never the parameter itself"
+    else if kept then "borrows what it is handed for the call"
+    else "borrows what it is handed for the call, and everything reached through it"
+    val whose = if kept then "the address of their own storage" else "a pointer to storage that ends"
+    val word = if kept then "@keeps" else "@lets_out"
+    val keeps = if kept then "keeps" else "lets out"
+
+    s"a '${type_show(got)}' $did, and a '${type_show(want)}' $asks — whoever calls it may hand it $whose. " +
+        s"Mark the parameter '$word' where the type it goes into is written, '$shown', or copy what the " +
+        s"$what $keeps into storage of its own"
+end marks_refused
+
 // What a position does to a value of the wrong-but-convertible type.
 //
 // Nothing else coerces -- any other mismatch is left for the caller to diagnose, where the message
 // can name the parameter or the variable it is about.
 coerce(cx: &Analyzer, t: TExpr, expected: Type) -> TExpr
     val got = texpr_type(t)
+    val pointer = pointer_retyped(cx, t, got, expected)
+
+    if pointer.is_some() then return pointer.unwrap()
 
     // A value where an object was expected is put behind the trait's table, which is what an object
     // is. It is asked first because the modes below would otherwise box or view a value the context

@@ -1,0 +1,238 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A view of a place reached through a raw pointer that a call answers (`view_borrow.sysl`'s
+// `receiver_root`): the pointer is a temporary, but what a `*T` points at is storage it does not own,
+// so the place lies past the statement and the view is no view of a temporary. The pointer the call
+// answers is the root the view is borrowed from, and nothing is held still by name for it -- what a
+// raw pointer points at is the programmer's business, as it is for any `*T`.
+//
+// What is still refused: a view of a struct a call answers BY VALUE, and of one a call answers as a
+// `&T` -- that answer is a count the statement holds and gives back at its end, so the object may be
+// freed under the view; and such a view leaving the function, or stored where it may outlive it.
+//
+// Every accepted program is built and run at `-O0` with the heap counted (net zero), at `-O1` and at
+// `-O2`, and prints the same at each.
+
+private vcp_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end vcp_ready
+
+private vcp_head() -> string = """
+    import sysl.buf.{Buf, buf}
+
+    struct State
+        xs: Buf[int]
+
+    struct Inner
+        state: State
+
+    struct Vm
+        state: State
+        inner: Inner
+
+        at(*self) -> *Vm = self
+
+    cur(vm: *Vm) -> *Vm = vm
+
+    pass[T](p: T) -> T = p
+
+    find(vm: *Vm) -> Option[*Vm] = if vm.state.xs.len() > 0 then Some(vm) else None
+
+    fill(s: []int, v: int)
+        for i in 0..<s.len
+            s[i] = v
+
+    total(s: []const int) -> int
+        var t = 0
+
+        for x in s
+            t += x
+
+        t
+
+    three() -> Buf[int]
+        var out = buf[int]()
+
+        out.push(1)
+        out.push(2)
+        out.push(3)
+        out
+
+    fresh_vm() -> Vm = Vm(State(three()), Inner(State(three())))
+
+    """
+
+private vcp_program(body: string) -> string = vcp_head() + body + "\nmain()\n    run()\n"
+
+private vcp_root(text: string) -> string
+    val root = make_temp_dir("sysl-view-call-ptr").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+
+// What analysing a program said, all of it.
+private vcp_said(body: string) -> string
+    val root = vcp_root(vcp_program(body))
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end vcp_said
+
+// What a program printed at `level`, with what the counted heap said on stderr when `counted`.
+private vcp_ran(body: string, level: string, counted: bool) -> string
+    val root = vcp_root(vcp_program(body))
+    val exe = s"$root/built"
+
+    force_alloc_counting(counted)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, level, Some(exe))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text + out.err.unwrap_or("")
+end vcp_ran
+
+// Accepted, and run at every level: what it printed, with nothing left on the counted heap.
+private vcp_accepted(body: string, printed: string)
+    val out = vcp_said(body)
+
+    assert(!out.contains("error"), s"expected no complaint, got: $out")
+    assert_eq(vcp_ran(body, "0", true), printed)
+    assert_eq(vcp_ran(body, "1", false), printed)
+    assert_eq(vcp_ran(body, "2", false), printed)
+end vcp_accepted
+
+private vcp_refused(body: string, said: string)
+    val out = vcp_said(body)
+
+    assert(out.contains(said), s"expected '$said' in: $out")
+
+// -- accepted: a place through the pointer a call answers ------------------------------------------
+
+@test("a view_mut of a field through the *T a free call answers, handed to a call, is accepted")
+vcp_repro()
+    if !vcp_ready() then return
+
+    vcp_accepted("run()\n    var vm = fresh_vm()\n\n    fill(cur(&vm).state.xs.view_mut(), 7)\n" +
+                 "    print(vm.state.xs[0], vm.state.xs[2], vm.inner.state.xs[0])\n",
+                 "7 7 1\n")
+
+@test("a view of the same place, read by a call, is accepted")
+vcp_view_read()
+    if !vcp_ready() then return
+
+    vcp_accepted("run()\n    var vm = fresh_vm()\n\n    print(total(cur(&vm).state.xs.view()))\n" +
+                 "    fill(cur(&vm).state.xs.view_mut(), 2)\n    print(total(cur(&vm).state.xs.view()))\n",
+                 "6\n6\n")
+
+@test("the *T a method answers, and an explicit dereference of a call's *T, are accepted")
+vcp_method_and_deref()
+    if !vcp_ready() then return
+
+    vcp_accepted("run()\n    var vm = fresh_vm()\n\n    fill(vm.at().state.xs.view_mut(), 5)\n" +
+                 "    print(vm.state.xs[1])\n    fill((*cur(&vm)).state.xs.view_mut(), 6)\n" +
+                 "    print(vm.state.xs[1], total(vm.at().state.xs.view()))\n",
+                 "5\n6 18\n")
+
+@test("a place two fields down through the call's *T is accepted")
+vcp_two_levels()
+    if !vcp_ready() then return
+
+    vcp_accepted("run()\n    var vm = fresh_vm()\n\n    fill(cur(&vm).inner.state.xs.view_mut(), 4)\n" +
+                 "    print(vm.inner.state.xs[2], vm.state.xs[2])\n" +
+                 "    print(total(vm.at().inner.state.xs.view()))\n",
+                 "4 3\n12\n")
+
+@test("a *T passed through a generic call, and one unwrapped inline from an Option, are accepted")
+vcp_generic_and_option()
+    if !vcp_ready() then return
+
+    vcp_accepted("run()\n    var vm = fresh_vm()\n\n    fill(pass(cur(&vm)).state.xs.view_mut(), 8)\n" +
+                 "    print(vm.state.xs[0])\n    fill(find(&vm).unwrap().state.xs.view_mut(), 9)\n" +
+                 "    print(vm.state.xs[0])\n    fill(pass(&vm).inner.state.xs.view_mut(), 3)\n" +
+                 "    print(total(vm.inner.state.xs.view()))\n",
+                 "8\n9\n9\n")
+
+@test("the view kept in a val and used on the lines after is accepted")
+vcp_kept_in_a_val()
+    if !vcp_ready() then return
+
+    vcp_accepted("run()\n    var vm = fresh_vm()\n    val w = find(&vm).unwrap().inner.state.xs.view()\n\n" +
+                 "    print(total(w))\n    val v = cur(&vm).state.xs.view_mut()\n\n" +
+                 "    v[1] = 40\n    fill(v[2..], 50)\n    print(v.len, vm.state.xs[1], vm.state.xs[2])\n",
+                 "6\n3 40 50\n")
+
+// -- still refused ---------------------------------------------------------------------------------
+
+@test("such a view returned from a function is refused: nothing ties the pointee to the caller")
+vcp_returned_refused()
+    if !vcp_ready() then return
+
+    vcp_refused("out(vm: *Vm) -> []int = cur(vm).state.xs.view_mut()\n\n" +
+                "run()\n    var vm = fresh_vm()\n\n    print(out(&vm).len)\n",
+                "this returns a view borrowed from '*cur(…)', and nothing keeps what that pointer " +
+                "points at alive once this function returns")
+
+@test("such a view stored in module storage or through a reference is refused")
+vcp_stored_refused()
+    if !vcp_ready() then return
+
+    val said = "this stores a view borrowed from '*cur(…)' somewhere reached through a reference, " +
+               "a pointer or module storage, which may outlive it"
+
+    vcp_refused("var kept: []int = []\n\nrun()\n    var vm = fresh_vm()\n\n" +
+                "    kept = cur(&vm).state.xs.view_mut()\n", said)
+    vcp_refused("struct Holder\n    v: []int\n\nrun()\n    var vm = fresh_vm()\n" +
+                "    val h: &Holder = Holder([])\n\n    h.v = cur(&vm).state.xs.view_mut()\n", said)
+
+@test("a view of a field of a struct a call answers by value is still refused")
+vcp_by_value_refused()
+    if !vcp_ready() then return
+
+    vcp_refused("copy_of(vm: *Vm) -> Vm = *vm\n\nrun()\n    var vm = fresh_vm()\n\n" +
+                "    fill(copy_of(&vm).state.xs.view_mut(), 1)\n",
+                "'*self' needs a variable, field, or dereference to point at — this receiver has no " +
+                "address")
+    vcp_refused("run()\n    fill(fresh_vm().state.xs.view_mut(), 1)\n",
+                "'*self' needs a variable, field, or dereference to point at — this receiver has no " +
+                "address")
+
+@test("a view through the &T a call answers is still refused: the statement holds its only count")
+vcp_ref_answer_refused()
+    if !vcp_ready() then return
+
+    val said = "'view_mut' answers a view borrowed from what it is called on, and that is the value " +
+               "it is called on — a temporary, freed at the end of this statement"
+
+    vcp_refused("boxed() -> &Vm = fresh_vm()\n\nrun()\n    fill(boxed().state.xs.view_mut(), 1)\n", said)
+    vcp_refused("same(vm: &Vm) -> &Vm = vm\n\nrun()\n    val vm: &Vm = fresh_vm()\n\n" +
+                "    fill(same(vm).state.xs.view_mut(), 1)\n", said)

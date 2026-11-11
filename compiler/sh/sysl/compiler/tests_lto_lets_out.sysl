@@ -1,0 +1,432 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `@lets_out` on a parameter of a callable's type (`*extern(@lets_out *Heap) -> unit`,
+// `&Fn(@lets_out *Heap) -> unit`): the callable may let out what it READS through the parameter, but
+// does not keep the pointer itself. A function or closure taken at the type may let reads through the
+// parameter out and is still refused if it keeps the parameter; a call through the type borrows the
+// argument, so the address of a local may be handed over, while whatever is reachable through it may
+// be kept anywhere (`keeps.sysl`'s `pointer_reads_licensed`, `closure_reads_licensed`,
+// `pointer_marked`, `object_marks_lets_out`). `@keeps` implies `@lets_out`: unmarked stands where
+// `@lets_out` is asked, `@lets_out` where `@keeps` is, never the other way (`type_show.sysl`'s
+// `keeps_within`). `reference/memory.md § A callable that keeps what it is handed` is the
+// specification.
+//
+// The matrix crosses the callable's kind (a function pointer, a closure, a named function made a
+// closure) with where the type stands (a parameter, a struct field, an `Option`, an alias, a generic
+// function's parameter) and with what the body does (lets reads out, keeps the parameter) and what the
+// caller hands (a local, a local holding the address of another local, through a relay), plus the
+// orderings between the three marks and a function taken at two marks.
+//
+// Skipped cells, and why: a trait method's `@keeps(p)` declaration has no `@lets_out` counterpart (the
+// mark is a type's, not a declaration's); separate compilation reads the same typed tree; module
+// initializers taking an address are walked as for `@keeps` (`tests_kfn_keeps_fn_pointer.sysl`).
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private lto_outcome(text: string) -> (string, int)
+    val root = make_temp_dir("sysl-lto").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", lto_prelude + text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end lto_outcome
+
+private lto_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = lto_outcome(text)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+end lto_prints
+
+private lto_refused(text: string, part: string)
+    if xvr_no_library() then return
+
+    val out = lto_outcome(text)
+
+    assert_eq(out.1, -1, out.0)
+    assert(out.0.index_of(part).is_some(), out.0)
+end lto_refused
+
+private const lto_prelude: string = raw"""
+    struct Node
+        next: *Node
+        v: int
+
+    struct Heap
+        gray: *Node
+
+    mark(h: *Heap, o: *Node)
+        o.next = h.gray
+        h.gray = o
+
+    type Roots = *extern(@lets_out *Heap) -> unit
+    type Hard = *extern(@keeps *Heap) -> unit
+    type Loose = *extern(*Heap) -> unit
+    type Step = &Fn(@lets_out *Heap) -> unit
+
+    var n = Node(null, 7)
+    var held: *Heap = null
+
+    roots(h: *Heap)
+        mark(h, &n)
+
+    collect(h: *Heap, r: Roots)
+        r(h)
+
+    """
+
+// -- accepted ------------------------------------------------------------------------------------
+
+@test("gc's shape: a heap on the stack collected through a hook that lets out what it reads")
+lto_stack_heap()
+    lto_prints(raw"""
+        main()
+            var h = Heap(null)
+            collect(&h, &roots)
+            print(h.gray.v)
+        """, "7\n")
+
+@test("the same through a closure at a callable type marking the parameter")
+lto_closure()
+    lto_prints(raw"""
+        run(h: *Heap, r: Step)
+            r(h)
+
+        main()
+            var h = Heap(null)
+            run(&h, (x) -> mark(x, &n))
+            print(h.gray.v)
+        """, "7\n")
+
+@test("the same through a named function handed where the callable type is asked for")
+lto_named_function()
+    lto_prints(raw"""
+        run(h: *Heap, r: Step)
+            r(h)
+
+        main()
+            var h = Heap(null)
+            run(&h, roots)
+            print(h.gray.v)
+        """, "7\n")
+
+@test("the marked pointer in a struct field and in an Option")
+lto_field_and_option()
+    lto_prints(raw"""
+        struct Hooks
+            roots: Roots
+
+        main()
+            var h = Heap(null)
+            val hooks = Hooks(&roots)
+            hooks.roots(&h)
+            var hook: Option[Roots] = None
+            hook = Some(&roots)
+            hook match
+                Some(f) -> f(&h)
+                None -> ()
+            print(h.gray.v, h.gray.next.v)
+        """, "7 7\n")
+
+@test("a @lets_out parameter among unmarked ones")
+lto_among_unmarked()
+    lto_prints(raw"""
+        type Visit = *extern(int, @lets_out *Heap, *Node) -> int
+
+        visit(k: int, h: *Heap, o: *Node) -> int
+            mark(h, &n)
+            k + o.v
+
+        run(f: Visit) -> int
+            var h = Heap(null)
+            var o = Node(null, 1)
+            f(1, &h, &o)
+
+        main()
+            print(run(&visit))
+        """, "2\n")
+
+@test("a pointer marking nothing stands where a @lets_out one is asked for")
+lto_unmarked_widened()
+    lto_prints(raw"""
+        var three = Node(null, 3)
+
+        peek(h: *Heap)
+            print(h.gray.v)
+
+        main()
+            var h = Heap(&three)
+            val loose: Loose = &peek
+            val r: Roots = loose
+            r(&h)
+        """, "3\n")
+
+@test("a @lets_out pointer and closure stand where @keeps ones are asked for")
+lto_into_keeps()
+    lto_prints(raw"""
+        var the = Heap(null)
+
+        main()
+            val r: Roots = &roots
+            val k: Hard = r
+            k(&the)
+            val s: Step = (x) -> mark(x, &n)
+            val t: &Fn(@keeps *Heap) -> unit = s
+            t(&the)
+            print(the.gray.v)
+        """, "7\n")
+
+@test("a function taken at a @keeps type and at a @lets_out one may still let out what it reads")
+lto_taken_at_both()
+    lto_prints(raw"""
+        main()
+            var h = Heap(null)
+            val k: Hard = &roots
+            collect(&h, &roots)
+            print(h.gray.v, k != null)
+        """, "7 true\n")
+
+// -- interactions ----------------------------------------------------------------------------------
+
+@test("@keeps and @lets_out on two parameters of one type")
+lto_both_marks()
+    lto_prints(raw"""
+        type Two = *extern(@keeps *Heap, @lets_out *Heap) -> unit
+
+        var the = Heap(null)
+
+        both(a: *Heap, b: *Heap)
+            held = a
+            mark(b, &n)
+
+        main()
+            var h = Heap(null)
+            val f: Two = &both
+            f(&the, &h)
+            print(held == &the, h.gray.v)
+        """, "true 7\n")
+
+@test("a generic function calling through a @lets_out pointer at its type parameter")
+lto_generic()
+    lto_prints(raw"""
+        collect_g[T](h: *T, r: *extern(@lets_out *T) -> unit)
+            r(h)
+
+        main()
+            var h = Heap(null)
+            collect_g(&h, &roots)
+            print(h.gray.v)
+        """, "7\n")
+
+@test("a call through a @lets_out pointer deferred to the end of the scope")
+lto_defer()
+    lto_prints(raw"""
+        later(h: *Heap, r: Roots)
+            defer r(h)
+            print(h.gray == null)
+
+        main()
+            var h = Heap(null)
+            later(&h, &roots)
+            print(h.gray.v)
+        """, "true\n7\n")
+
+@test("an exported function taken at a @lets_out type")
+lto_exported()
+    lto_prints(raw"""
+        @export("lto_roots_hook")
+        hook(h: *Heap)
+            mark(h, &n)
+
+        main()
+            var h = Heap(null)
+            collect(&h, &hook)
+            print(h.gray.v)
+        """, "7\n")
+
+// -- still refused -------------------------------------------------------------------------------
+
+@test("a hook keeping the parameter itself is refused under @lets_out")
+lto_keeps_refused()
+    lto_refused(raw"""
+        keep(h: *Heap)
+            held = h
+
+        main()
+            var h = Heap(null)
+            collect(&h, &keep)
+        """, "'keep' keeps its parameter 'h' (it is stored in 'held'), and its address is taken")
+
+@test("a closure keeping the parameter itself is refused under @lets_out")
+lto_closure_keeps_refused()
+    lto_refused(raw"""
+        run(h: *Heap, r: Step)
+            r(h)
+
+        main()
+            var h = Heap(null)
+            run(&h, (x) -> held = x)
+        """, "a closure borrows what it is handed for the call, and this one keeps its parameter")
+
+@test("a caller storing a local's address into what it hands a @lets_out hook is refused")
+lto_local_inside_refused()
+    lto_refused(raw"""
+        main()
+            var h = Heap(null)
+            var mine = Node(null, 1)
+            h.gray = &mine
+            val r: Roots = &roots
+            r(&h)
+        """, "a call through '*extern(@lets_out *Heap) -> unit' may keep what it reads through its parameter 1 " +
+            "(its type says '@lets_out')")
+
+@test("a relay handing its parameter on through @lets_out holds its caller to what is inside")
+lto_relay_refused()
+    lto_refused(raw"""
+        main()
+            var h = Heap(null)
+            var mine = Node(null, 1)
+            h.gray = &mine
+            collect(&h, &roots)
+        """, "'collect' lets what it reads through its parameter 'h' outlive the call (it is passed to a call " +
+            "through '*extern(@lets_out *Heap) -> unit', which lets what it reads through it out), and what is " +
+            "read through '&h' holds the address of a local of 'main'")
+
+@test("a @keeps pointer does not stand where a @lets_out one is asked for")
+lto_keeps_into_lets_out_refused()
+    lto_refused(raw"""
+        keep(h: *Heap)
+            held = h
+
+        main()
+            val k: Hard = &keep
+            val r: Roots = k
+        """, "a '*extern(@keeps *Heap) -> unit' may keep its parameter 1 past the call, and a " +
+            "'*extern(@lets_out *Heap) -> unit' lets out only what it reads through it, never the parameter itself")
+
+@test("a @lets_out pointer does not stand where an unmarked one is asked for")
+lto_lets_out_into_unmarked_refused()
+    lto_refused(raw"""
+        main()
+            val r: Roots = &roots
+            val loose: Loose = r
+        """, "a '*extern(@lets_out *Heap) -> unit' may let out what it reads through its parameter 1, and a " +
+            "'*extern(*Heap) -> unit' borrows what it is handed for the call, and everything reached through it")
+
+@test("a @lets_out closure does not stand where an unmarked one is asked for")
+lto_closure_into_unmarked_refused()
+    lto_refused(raw"""
+        main()
+            val s: Step = (x) -> mark(x, &n)
+            val t: &Fn(*Heap) -> unit = s
+        """, "a '&Fn(@lets_out *Heap) -> unit' may let out what it reads through its parameter 1")
+
+@test("the unmarked type refuses the hook as before, and names the mark")
+lto_unmarked_refused()
+    lto_refused(raw"""
+        main()
+            var h = Heap(null)
+            val r: Loose = &roots
+            r(&h)
+        """, "'roots' lets what it reads through its parameter 'h' outlive the call (it is passed to " +
+            "'mark', which lets what it reads through it out), but its address is taken — a call through a " +
+            "function pointer sees no body")
+
+@test("the unmarked refusal suggests @lets_out in the pointer type")
+lto_unmarked_hint()
+    lto_refused(raw"""
+        main()
+            var h = Heap(null)
+            val r: Loose = &roots
+            r(&h)
+        """, "or let it by marking the parameter '@lets_out' in the function pointer type its address is " +
+            "taken at: '*extern(@lets_out *Heap) -> unit'")
+
+@test("a closure at an unmarked type letting out what it reads is told the @lets_out mark")
+lto_closure_unmarked_hint()
+    lto_refused(raw"""
+        run(h: *Heap, r: &Fn(*Heap) -> unit)
+            r(h)
+
+        main()
+            var h = Heap(null)
+            run(&h, (x) -> mark(x, &n))
+        """, "let it let out what it reads through it by marking the parameter '@lets_out' in the type it " +
+            "is made at: 'Fn(@lets_out *Heap) -> unit'")
+
+@test("a function taken at a @keeps type and at a @lets_out one may not keep the parameter")
+lto_taken_at_both_refused()
+    lto_refused(raw"""
+        keep(h: *Heap)
+            held = h
+
+        main()
+            var h = Heap(null)
+            val k: Hard = &keep
+            collect(&h, &keep)
+        """, "'keep' keeps its parameter 'h' (it is stored in 'held'), and its address is taken")
+
+@test("both marks on two parameters: the @keeps one still refuses a local")
+lto_both_marks_refused()
+    lto_refused(raw"""
+        type Two = *extern(@keeps *Heap, @lets_out *Heap) -> unit
+
+        both(a: *Heap, b: *Heap)
+            held = a
+            mark(b, &n)
+
+        main()
+            var h = Heap(null)
+            var g = Heap(null)
+            val f: Two = &both
+            f(&g, &h)
+        """, "keeps its parameter 1 (its type says '@keeps'), and '&g' is the address of a local of 'main'")
+
+@test("@keeps and @lets_out on one parameter are refused")
+lto_double_mark_refused()
+    lto_refused(raw"""
+        type Odd = *extern(@keeps @lets_out *Heap) -> unit
+
+        main()
+            val r: Odd = &roots
+        """, "'@keeps' and '@lets_out' are both written on one parameter")
+
+@test("@lets_out written twice on one parameter is refused")
+lto_twice_refused()
+    lto_refused(raw"""
+        type Odd = *extern(@lets_out @lets_out *Heap) -> unit
+
+        main()
+            val r: Odd = &roots
+        """, "'@lets_out' is written twice on one parameter, and a parameter is marked '@lets_out' or it is not")
+
+@test("@lets_out outside a callable's parameters is refused")
+lto_misplaced_refused()
+    lto_refused(raw"""
+        var p: @lets_out *Heap = null
+
+        main()
+            print(p == null)
+        """, "'@lets_out' marks a parameter of a callable's type that the callable may let what it reads " +
+            "through it outlive the call")
