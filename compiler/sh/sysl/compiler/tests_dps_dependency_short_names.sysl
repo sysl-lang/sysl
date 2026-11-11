@@ -1,0 +1,211 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, remove_dir_all, write_text}
+import sysl.text.{join, Search}
+
+// A diagnostic names a type a DEPENDENCY declares by its simple name, as it does the library's
+// (`short_names.sysl`): `Vertex`, never the key the package's types are filed under
+// (`github.com.x-y.geo-kit.sh.e.geo.Vertex`), whose coordinate no file writes and whose `-` no name
+// holds. Where the name is kept -- the file sees another `Vertex`, or the message names two -- it is
+// kept as the path a consumer imports it by, `sh.e.geo.Vertex`.
+//
+// The axes: how the package arrived (a workspace member published at a coordinate holding `-`, a
+// `path` dependency named by its label), which refusal names the type (a view's constness, a type
+// mismatch, a missing member, a type argument, a call through a `@keeps` pointer type), and what else
+// is called `Vertex` (nothing, the file's own type, a second package's type in the same message).
+// Left out: a `--lib` root, whose modules carry no prefix and are already said as written, and a
+// coordinate fetched over the network, which files its modules exactly as a published member does.
+
+private dps_ready() -> bool = std_root().is_ok() && clang_available()
+
+private const DpsGeo: string =
+    "module sh.e.geo\n\n" +
+    "struct Vertex\n    x: int\n\n" +
+    "type Keeper = *extern(@keeps *Vertex) -> int\n"
+
+private const DpsOther: string = "module sh.e.other\n\nstruct Vertex\n    y: int\n"
+
+private dps_write(root: string, rel: string, text: string)
+    val slash = rel.last_index_of("/")
+
+    if slash.is_some() then make_dir_all(s"$root/${rel[0..<slash.unwrap()]}").unwrap()
+    write_text(s"$root/$rel", text).unwrap()
+end dps_write
+
+// A workspace of `geo` (published at a coordinate holding `-`), `other` and `app`, whose entry file
+// is `main`; `app` depends on `geo`, and on `other` where `both`.
+private dps_workspace(main: string, both: bool) -> string
+    val ws = lbr_temp("sysl-dps-ws-")
+    val members = if both then "\"app\", \"geo\", \"other\"" else "\"app\", \"geo\""
+    val deps = if both then "geo { workspace = true }, other { workspace = true }" else "geo { workspace = true }"
+
+    dps_write(ws, "sysl.hocon", s"workspace = [$members]\n")
+    dps_write(ws, "geo/sysl.hocon",
+              "package { name = \"geo\", version = \"0.1.0\", repository = \"github.com/x-y/geo-kit\" }\n")
+    dps_write(ws, "geo/sh/e/geo/geo.sysl", DpsGeo)
+    dps_write(ws, "other/sysl.hocon",
+              "package { name = \"other\", version = \"0.1.0\", repository = \"github.com/x-y/other-kit\" }\n")
+    dps_write(ws, "other/sh/e/other/other.sysl", DpsOther)
+    dps_write(ws, "app/sysl.hocon", s"package { name = \"app\", version = \"0.1.0\" }\ndependencies { $deps }\n")
+    dps_write(ws, "app/main.sysl", main)
+    ws
+end dps_workspace
+
+// What `sysl build-c` says about `root`, every line joined; the tree is removed after.
+private dps_said(tree: string, root: string) -> string
+    var lines: Buf[string] = buf()
+    val sink = &lines
+
+    run_cli(["sysl", "build-c", root, "-o", s"$root/out.a"], (line) -> sink.push(line))
+    reset_search_paths()
+    remove_dir_all(tree).unwrap_or(())
+    join(lines.view(), "\n")
+end dps_said
+
+private dps_member(main: string) -> string
+    val ws = dps_workspace(main, false)
+
+    dps_said(ws, s"$ws/app")
+end dps_member
+
+private dps_never_keyed(out: string)
+    assert(!out.contains("github.com"), out)
+    assert(!out.contains("geo-kit"), out)
+end dps_never_keyed
+
+// -- each refusal, the name alone -------------------------------------------------------------------
+
+@test("dps: a view's constness names a dependency's element type simply")
+dps_view_const()
+    if !dps_ready() then return
+
+    val out = dps_member("import sh.e.geo.Vertex\n\ntouch(v: []Vertex) -> usize = v.len\n\n" +
+                         "val vs = [Vertex(1), Vertex(2)]\nval cv: []const Vertex = vs[..]\nprint(touch(cv))\n")
+
+    assert(out.contains("error: a '[]const Vertex' views elements it may not write, and a '[]Vertex' is " +
+                        "a licence to write them"), out)
+    dps_never_keyed(out)
+end dps_view_const
+
+@test("dps: a type mismatch names a dependency's type simply")
+dps_mismatch()
+    if !dps_ready() then return
+
+    val out = dps_member("import sh.e.geo.Vertex\n\nval n: int = Vertex(1)\n")
+
+    assert(out.contains("error: cannot initialize 'n': declared int but the value is Vertex\n"), out)
+    dps_never_keyed(out)
+end dps_mismatch
+
+@test("dps: a missing member names a dependency's type simply")
+dps_missing_member()
+    if !dps_ready() then return
+
+    val out = dps_member("import sh.e.geo.Vertex\n\nprint(Vertex(1).nope)\n")
+
+    assert(out.contains("error: 'Vertex' has no field or property 'nope'"), out)
+    dps_never_keyed(out)
+end dps_missing_member
+
+@test("dps: a dependency's type as a type argument is named simply, and so is the library's around it")
+dps_type_argument()
+    if !dps_ready() then return
+
+    val out = dps_member("import sh.e.geo.Vertex\n\nval o: Option[Vertex] = None\nval m: int = o\n")
+
+    assert(out.contains("error: cannot initialize 'm': declared int but the value is Option[Vertex]\n"), out)
+    dps_never_keyed(out)
+end dps_type_argument
+
+@test("dps: a call through a dependency's @keeps pointer type names its parameter's type simply")
+dps_keeps()
+    if !dps_ready() then return
+
+    val out = dps_member("import sh.e.geo.{Vertex, Keeper}\n\nhold(f: Keeper)\n    var k = Vertex(5)\n    f(&k)\n")
+
+    assert(out.contains("error: a call through '*extern(@keeps *Vertex) -> int' keeps its parameter 1"), out)
+    dps_never_keyed(out)
+end dps_keeps
+
+@test("dps: a type written by its whole path in the source is still named simply")
+dps_written_whole()
+    if !dps_ready() then return
+
+    val out = dps_member("val n: int = sh.e.geo.Vertex(1)\n")
+
+    assert(out.contains("error: cannot initialize 'n': declared int but the value is Vertex\n"), out)
+    dps_never_keyed(out)
+end dps_written_whole
+
+// -- a name that could mean something else ---------------------------------------------------------
+
+@test("dps: where the file declares its own Vertex, the dependency's keeps the path it is imported by")
+dps_own_clash()
+    if !dps_ready() then return
+
+    val out = dps_member("struct Vertex\n    y: int\n\nval v: Vertex = sh.e.geo.Vertex(1)\nval n: int = sh.e.geo.Vertex(2)\n")
+
+    assert(out.contains("error: cannot initialize 'v': declared Vertex but the value is sh.e.geo.Vertex\n"), out)
+    assert(out.contains("error: cannot initialize 'n': declared int but the value is sh.e.geo.Vertex\n"), out)
+    dps_never_keyed(out)
+end dps_own_clash
+
+@test("dps: two packages' Vertex in one message are both said by the paths they are imported by")
+dps_two_packages()
+    if !dps_ready() then return
+
+    val ws = dps_workspace("val v: sh.e.other.Vertex = sh.e.geo.Vertex(1)\nval w: Option[sh.e.geo.Vertex] = None\n" +
+                           "val n: int = w\n", true)
+    val out = dps_said(ws, s"$ws/app")
+
+    assert(out.contains("error: cannot initialize 'v': declared sh.e.other.Vertex but the value is sh.e.geo.Vertex\n"),
+           out)
+    assert(out.contains("error: cannot initialize 'n': declared int but the value is Option[Vertex]\n"), out)
+    dps_never_keyed(out)
+    assert(!out.contains("other-kit"), out)
+end dps_two_packages
+
+// -- a `path` dependency, named by its label --------------------------------------------------------
+
+private dps_path_dep(main: string) -> string
+    val tree = lbr_temp("sysl-dps-path-")
+
+    dps_write(tree, "geo/sysl.hocon", "package { name = \"geo\", version = \"0.1.0\" }\n")
+    dps_write(tree, "geo/sh/e/geo/geo.sysl", DpsGeo)
+    dps_write(tree, "app/sysl.hocon", "package { name = \"app\", version = \"0.1.0\" }\n" +
+                                      s"dependencies { geo { path = \"$tree/geo\" } }\n")
+    dps_write(tree, "app/shapes/shapes.sysl", "module shapes\n\nstruct Point\n    x: int\n")
+    dps_write(tree, "app/main.sysl", main)
+    dps_said(tree, s"$tree/app")
+end dps_path_dep
+
+@test("dps: a path dependency's type is named simply, never by its label's prefix")
+dps_path_simple()
+    if !dps_ready() then return
+
+    val out = dps_path_dep("import sh.e.geo.Vertex\n\nval n: int = Vertex(1)\n")
+
+    assert(out.contains("error: cannot initialize 'n': declared int but the value is Vertex\n"), out)
+    assert(!out.contains("geo.sh.e.geo"), out)
+end dps_path_simple
+
+@test("dps: beside a path dependency's type, a type of the program's own other module keeps its module")
+dps_path_own_module()
+    if !dps_ready() then return
+
+    val out = dps_path_dep("import sh.e.geo.Vertex\n\nval p: shapes.Point = Vertex(1)\n")
+
+    assert(out.contains("error: cannot initialize 'p': declared shapes.Point but the value is Vertex\n"), out)
+end dps_path_own_module
+
+@test("dps: where the file declares its own Vertex, a path dependency's is said as imported, not by its label")
+dps_path_clash()
+    if !dps_ready() then return
+
+    val out = dps_path_dep("struct Vertex\n    y: int\n\nval v: Vertex = sh.e.geo.Vertex(1)\n")
+
+    assert(out.contains("error: cannot initialize 'v': declared Vertex but the value is sh.e.geo.Vertex\n"), out)
+    assert(!out.contains("geo.sh.e.geo"), out)
+end dps_path_clash

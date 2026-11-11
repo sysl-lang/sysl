@@ -575,6 +575,12 @@ case. A path that goes on past the type names a member of it (`'sysl.buf.Buf.pus
 of the program's own other modules keeps its module (`geom.Point`), which is how a reader tells two of
 their own modules' types apart.
 
+**A type a dependency declares is named the same way** — by its simple name, `Vertex`, unless the
+simple name could mean something else. Its modules are filed under the package's coordinate
+([what a dependency's modules are called](/reference/packages/#what-a-dependency-s-modules-are-called)),
+which no file writes, so where its path is kept it is the path a consumer imports it by,
+`sh.sysl.sdl3.c.Vertex`, never `github.com.sysl-lang.sdl3.sh.sysl.sdl3.c.Vertex`.
+
 ### Where an import may stand
 
 Imports normally sit just below the `module` header, but — following Scala — **an import may also
