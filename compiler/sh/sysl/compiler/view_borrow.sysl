@@ -2,7 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
-import sysl.container.{Set, set}
+import sysl.container.{Map, map, Set, set}
 import sysl.text.Search
 
 // A view a member hands back of its own receiver, and the receiver it may not outlive.
@@ -32,11 +32,29 @@ import sysl.text.Search
 // One receiver a view is borrowed from: the place it was called on, the local at the bottom of that
 // place by its unique name (empty for module storage, which no scope closes on), and that local's
 // name as written, which is what a refusal says.
+//
+// **A view handed to a call reaches the call's answer only if the callee answers with it**, which is
+// a fact about the callee's body (`view_answer`), known only once every body is typed. So a root reached through a call's answer carries `via`: each call it went through, by
+// callee and argument position. A root with no `via` is borrowed outright and refused where it is
+// met; one with a `via` is refused the same way, but told only once every call on it is known to
+// answer with what it was handed (`settle_view_refusals`).
 struct ViewRoot
     place: TExpr
     unique: string
     name: string
+    via: Buf[(string, usize)]
 end ViewRoot
+
+// A refusal that holds only if every call in `via` answers with the argument it names, kept until
+// the answers are settled. `for_ref` is a refusal on a live borrow's account, which the
+// whole-program call check is told about as `refuse_for_ref` tells it.
+struct ViewRefusal
+    scope: Scope
+    span: Span
+    message: string
+    via: Buf[(string, usize)]
+    for_ref: bool
+end ViewRefusal
 
 // The local name at the bottom of a receiver place, or nothing where the receiver is a temporary.
 // A place reached through a raw pointer that a call answers is the root itself: what a `*T` points
@@ -112,7 +130,7 @@ note_view_call(cx: &Analyzer, span: Span, receiver: TExpr, member: string)
             _ -> "*(…)"
     end if
 
-    cx.view_calls.push((span, ViewRoot(receiver, unique, name)))
+    cx.view_calls.push((span, ViewRoot(receiver, unique, name, buf())))
 end note_view_call
 
 // -- which receivers a value is borrowed from ------------------------------------------------------
@@ -120,14 +138,15 @@ end note_view_call
 // Whether a value of this type can hold a view: a view or a string, or anything a view can be kept
 // in -- a struct, an enum, a fixed array, a closure (a closure is a struct of what it captured), a
 // reference to one of those, a trait object or a value whose type is not settled yet. A raw pointer
-// cannot: what it points at is the programmer's problem, like every `*T`.
+// cannot: what it points at is the programmer's problem, like every `*T`. **Nor can a `&sync T`**:
+// a shared object holds no view at all (`sharing.sysl`), so one read out of a view is its own.
 private holds_borrow(t: Type, depth: int) -> bool
     if depth > 6 then return true
 
     underlying(t) match
         Slice(_, _) -> true
         Str -> true
-        Ref(inner, _) -> holds_borrow(*inner, depth + 1)
+        Ref(inner, sync) -> !sync && holds_borrow(*inner, depth + 1)
         Weak(inner) -> holds_borrow(*inner, depth + 1)
         Array(_, elem) -> holds_borrow(*elem, depth + 1)
         Struct(d) -> parts_hold_borrow(d.fields, d.targs, depth)
@@ -216,15 +235,280 @@ private visit_root(cx: &Analyzer, sink: &RootSink, x: TExpr)
                 if item.0 == name then
                     for r in item.1
                         add_root(sink, r)
+        TCall(callee, args, _, _) ->
+            // **A call's answer holds what an argument is borrowed from only if the callee answers
+            // with that argument**: each argument's roots are taken on the call's account, and the
+            // walk goes no further below it.
+            for i in 0..<args.len()
+                for r in view_roots(cx, args[i])
+                    var via = r.via.copy()
+
+                    via.push((callee, i))
+                    add_root(sink, ViewRoot(r.place, r.unique, r.name, via))
+
+            walk_texpr(x, expr_walk(false, y -> sink.pruned.add(span_key(y.span))))
         _ -> ()
 end visit_root
 
 private add_root(sink: &RootSink, r: ViewRoot)
     for item in sink.roots
-        if item.unique == r.unique && item.place.span.start == r.place.span.start then return
+        if item.unique == r.unique && item.place.span.start == r.place.span.start && same_via(item.via, r.via)
+            return
 
     sink.roots.push(r)
 end add_root
+
+private same_via(a: Buf[(string, usize)], b: Buf[(string, usize)]) -> bool
+    if a.len() != b.len() then return false
+
+    for i in 0..<a.len()
+        if a[i].0 != b[i].0 || a[i].1 != b[i].1 then return false
+
+    true
+end same_via
+
+// The roots with those borrowed outright first, so that a refusal that holds whatever the callees
+// answer is the one told.
+private outright_first(roots: Buf[ViewRoot]) -> Buf[ViewRoot]
+    var out: Buf[ViewRoot] = buf()
+
+    for r in roots
+        if r.via.is_empty() then out.push(r)
+
+    for r in roots
+        if !r.via.is_empty() then out.push(r)
+
+    out
+end outright_first
+
+// Refuses what `r` is borrowed from, now where it is borrowed outright, and once the answers are
+// settled where it reached here through calls' answers.
+private refuse_view(cx: &Analyzer, span: Span, message: string, r: ViewRoot, for_ref: bool)
+    if r.via.is_empty()
+        if for_ref then refuse_for_ref(cx, span, message) else cx.fault(span, message)
+        return
+    end if
+
+    cx.an.view_refusals.push(ViewRefusal(cx.scope, span, message, r.via, for_ref))
+end refuse_view
+
+// -- whether a callee answers with what it was handed ---------------------------------------------
+
+// **What a body's answer may hold of a parameter, asked as this file asks it of a value**: a part of
+// the answer that cannot hold a view, or a string made fresh, holds nothing; a read of the parameter,
+// or of a local something holding it was put in, holds it; and a call holds it where an argument
+// does and the callee's own answer is made of that argument. A local bound by a form this does not
+// follow -- an `if` that binds, an `or` pattern -- is taken to hold it. A callee with no body in sight
+// is taken to answer with everything it was handed, and a recursion with nothing beyond what its
+// other ways out answer.
+//
+// The view-address questions of `keeps.sysl` are about addresses (`may_hold_pointer`), and a view
+// is not one to them: its owner word keeps its storage, except where a `@views(self)` member lent it
+// with none, which is the case asked about here.
+private struct AnswerProbe
+    cx: &KeepsCx
+    memo: Map[string, bool]
+    busy: Buf[string]
+    leaned: bool
+end AnswerProbe
+
+// Whether what `name` answers may hold what its argument at `i` is borrowed from.
+private view_answer(p: &AnswerProbe, name: string, i: usize) -> bool
+    val key = s"$name|$i"
+
+    p.memo.get(key) match
+        Some(v) -> return v
+        None -> ()
+
+    for item in p.busy
+        if item == key
+            p.leaned = true
+            return false
+        end if
+
+    val found = p.cx.find(name)
+
+    if found.is_none() then return true
+
+    val f = found.unwrap()
+
+    if i >= f.params.len() then return false
+
+    val outer = p.leaned
+
+    p.leaned = false
+    p.busy.push(key)
+
+    val out = body_answers(p, f, i)
+
+    p.busy.truncate(p.busy.len() - 1)
+
+    // An answer worked out over a recursion still open read a guess, so it is not kept.
+    if !p.leaned then p.memo.put(key, out)
+
+    p.leaned = outer || p.leaned
+    out
+end view_answer
+
+// The locals of one body that may hold what its parameter `param` is borrowed from.
+private struct BodyTaint
+    probe: &AnswerProbe
+    param: string
+    tainted: Set[string]
+    declared: Set[string]
+    changed: bool
+end BodyTaint
+
+private struct CarrySink
+    found: bool
+    pruned: Set[string]
+end CarrySink
+
+private body_answers(p: &AnswerProbe, f: TFunc, i: usize) -> bool
+    val bt: &BodyTaint = BodyTaint(p, f.params[i].0, set(), set(), true)
+
+    for item in f.params
+        bt.declared.add(item.0)
+
+    walk_block_stmts(f.body, TWalk(false, e -> declare_bound(bt, e), w -> (), s -> s match
+        TVarDecl(n, _, _, _) -> bt.declared.add(n)
+        _ -> ()))
+
+    while bt.changed
+        bt.changed = false
+        walk_block_stmts(f.body, TWalk(false, e -> spread_expr(bt, e), w -> spread_write(bt, w.place, w.value),
+                                       s -> s match
+                                           TVarDecl(n, _, init, _) -> if carries(bt, init) then taint(bt, n)
+                                           _ -> ()))
+
+    val out: &CarrySink = CarrySink(false, set())
+
+    walk_block_stmts(f.body, stmt_walk(false, s -> s match
+        TReturn(v) -> if v.is_some() && carries(bt, v.unwrap()) then out.found = true
+        TBecome(call) -> if carries(bt, call) then out.found = true
+        _ -> ()))
+
+    out.found || (f.body.result.is_some() && carries(bt, f.body.result.unwrap()))
+end body_answers
+
+// The names a match arm or a loop binds, which take what their subject holds.
+private declare_bound(bt: &BodyTaint, e: TExpr)
+    *e.kind match
+        TMatch(_, arms, _) ->
+            for arm in arms
+                for pat in arm.patterns
+                    var names: Buf[string] = buf()
+
+                    pattern_names(pat, &names)
+
+                    for n in names
+                        bt.declared.add(n)
+        TForEach(name, _, _, _, _, _) -> bt.declared.add(name)
+        TFor(name, _, _, _, _, _, _, _) -> bt.declared.add(name)
+        _ -> ()
+end declare_bound
+
+private spread_expr(bt: &BodyTaint, e: TExpr)
+    *e.kind match
+        TStore(place, v, _, _) -> spread_write(bt, place, v)
+        TMatch(subject, arms, _) ->
+            if carries(bt, subject)
+                for arm in arms
+                    for pat in arm.patterns
+                        var names: Buf[string] = buf()
+
+                        pattern_names(pat, &names)
+
+                        for n in names
+                            taint(bt, n)
+            end if
+        TForEach(name, _, seq, _, _, _) -> if carries(bt, seq) then taint(bt, name)
+        _ -> ()
+end spread_expr
+
+private spread_write(bt: &BodyTaint, place: TExpr, value: TExpr)
+    if !carries(bt, value) then return
+
+    by_value_local(place) match
+        Some(n) -> taint(bt, n)
+        None -> ()
+end spread_write
+
+private taint(bt: &BodyTaint, n: string)
+    if bt.tainted.has(n) then return
+
+    bt.tainted.add(n)
+    bt.changed = true
+end taint
+
+// Whether a value may hold what the parameter is borrowed from, walked as `view_roots` walks one.
+private carries(bt: &BodyTaint, e: TExpr) -> bool
+    if !holds_borrow(texpr_type(e), 0) then return false
+
+    val sink: &CarrySink = CarrySink(false, set())
+
+    walk_texpr(e, expr_walk(false, x -> carry_visit(bt, sink, x)))
+    sink.found
+end carries
+
+private carry_visit(bt: &BodyTaint, sink: &CarrySink, x: TExpr)
+    if sink.found || sink.pruned.has(span_key(x.span)) then return
+
+    if !holds_borrow(texpr_type(x), 0) || fresh_string(x)
+        walk_texpr(x, expr_walk(false, y -> sink.pruned.add(span_key(y.span))))
+        return
+    end if
+
+    *x.kind match
+        TLoad(n, _) ->
+            if n == bt.param || bt.tainted.has(n) || !bt.declared.has(n) then sink.found = true
+        TCall(callee, args, _, _) ->
+            for j in 0..<args.len()
+                if carries(bt, args[j]) && view_answer(bt.probe, callee, j)
+                    sink.found = true
+                    return
+                end if
+
+            walk_texpr(x, expr_walk(false, y -> sink.pruned.add(span_key(y.span))))
+        _ -> ()
+end carry_visit
+
+// Whether every call a borrow went through answers with the argument it was handed there.
+private via_holds(p: &AnswerProbe, via: Buf[(string, usize)]) -> bool
+    for step in via
+        if !view_answer(p, step.0, step.1) then return false
+
+    true
+end via_holds
+
+// **The refusals that waited on calls' answers, told now that every body is typed**, and the live
+// borrows that were filed through calls kept only where those calls answer with the view.
+settle_view_refusals(a: &Analysis, cx: &KeepsCx)
+    if a.view_refusals.is_empty() && a.ref_watches.is_empty() then return
+
+    val p: &AnswerProbe = AnswerProbe(cx, map(), buf(), false)
+
+    for item in a.view_refusals
+        if !via_holds(p, item.via) then continue
+
+        a.fault(item.scope, item.span, item.message)
+
+        if item.for_ref then a.ref_refusals.push(item.span.start)
+
+    var kept = false
+
+    for w in a.ref_watches
+        if !w.via.is_empty() then kept = true
+
+    if !kept then return
+
+    var watches: Buf[RefWatch] = buf()
+
+    for w in a.ref_watches
+        if w.via.is_empty() || via_holds(p, w.via) then watches.push(w)
+
+    a.ref_watches = watches
+end settle_view_refusals
 
 // -- where a borrowed view may go ------------------------------------------------------------------
 
@@ -232,12 +516,13 @@ end add_root
 // closed, so what it held has been let go of and the view is reading freed memory -- `val v = if c
 // then (val o = open(); o.view()) else …` is this.
 private roots_in_scope(cx: &Analyzer, span: Span, what: string, roots: Buf[ViewRoot]) -> bool
-    for r in roots
+    for r in outright_first(roots)
         if r.unique != "" && local_at(cx, r.unique).is_none()
-            cx.fault(span, s"$what a view borrowed from '${r.name}', which is let go of at the end " +
-                     "of the block that bound it — so the view would be left reading freed " +
-                     "memory. Use the view inside that block")
-            return false
+            refuse_view(cx, span, s"$what a view borrowed from '${r.name}', which is let go of at the " +
+                        "end of the block that bound it — so the view would be left reading freed " +
+                        "memory. Use the view inside that block", r, false)
+
+            if r.via.is_empty() then return false
         end if
 
     true
@@ -321,7 +606,7 @@ private file_borrow(cx: &Analyzer, span: Span, unique: string, name: string, roo
             _ -> ""
 
         cx.an.ref_watches.push(RefWatch(cx.watch_key(), name, types, span.end, None, at.unwrap().0,
-                                        r.name, buf(), root, lent))
+                                        r.name, buf(), root, lent, r.via))
 end file_borrow
 
 // An assignment of `value` into `target`. **The target has to die before the receiver does**: a
@@ -336,10 +621,14 @@ note_view_store(cx: &Analyzer, span: Span, target: TExpr, value: TExpr)
     val owner = by_value_local(target)
 
     if owner.is_none()
-        cx.fault(span, s"this stores a view borrowed from '${roots[0].name}' somewhere reached " +
-                 "through a reference, a pointer or module storage, which may outlive it — so the " +
-                 "view could be read after what it views is freed. Keep the view in a local bound " +
-                 s"after '${roots[0].name}'")
+        for r in outright_first(roots)
+            refuse_view(cx, span, s"this stores a view borrowed from '${r.name}' somewhere reached " +
+                        "through a reference, a pointer or module storage, which may outlive it — so " +
+                        "the view could be read after what it views is freed. Keep the view in a local " +
+                        s"bound after '${r.name}'", r, false)
+
+            if r.via.is_empty() then return
+
         return
     end if
 
@@ -347,17 +636,18 @@ note_view_store(cx: &Analyzer, span: Span, target: TExpr, value: TExpr)
 
     if l.is_none() then return
 
-    for r in roots
+    for r in outright_first(roots)
         if r.unique == "" then continue
 
         val at = local_at(cx, r.unique)
 
         if at.is_some() && at.unwrap().0 >= l.unwrap().0
-            cx.fault(span, s"'${l.unwrap().1.name}' is bound before '${r.name}', so it outlives it, " +
-                     s"and this stores in it a view borrowed from '${r.name}' — the view would be " +
-                     "read after what it views is freed. Bind the view's holder after " +
-                     s"'${r.name}'")
-            return
+            refuse_view(cx, span, s"'${l.unwrap().1.name}' is bound before '${r.name}', so it outlives " +
+                        s"it, and this stores in it a view borrowed from '${r.name}' — the view would " +
+                        "be read after what it views is freed. Bind the view's holder after " +
+                        s"'${r.name}'", r, false)
+
+            if r.via.is_empty() then return
         end if
 
     file_borrow(cx, span, owner.unwrap(), l.unwrap().1.name, roots)
@@ -386,35 +676,31 @@ private indirect(t: Type) -> bool = underlying(t) match
 note_view_return(cx: &Analyzer, span: Span, value: TExpr)
     val roots = view_roots(cx, value)
 
-    for r in roots
+    for r in outright_first(roots)
         if cx.views_self && r.unique == "self" then continue
 
+        var message = s"this returns a view borrowed from '${r.name}', and nothing keeps " +
+                      s"'${r.name}' alive once this function returns — so the caller could read " +
+                      "freed memory. Return a copy, or return it from a member of its type marked " +
+                      "'@views(self)'"
+
         if r.unique == "" && r.name == "module storage"
-            cx.fault(span, "this returns a view borrowed from module storage, which may be " +
-                     "reassigned while the caller still reads it. Return a copy")
-            return
+            message = "this returns a view borrowed from module storage, which may be reassigned " +
+                      "while the caller still reads it. Return a copy"
+        else if r.unique == ""
+            message = s"this returns a view borrowed from '${r.name}', and nothing keeps what that " +
+                      "pointer points at alive once this function returns — so the caller could " +
+                      "read freed memory. Return a copy, or return it from a member of its type " +
+                      "marked '@views(self)'"
+        else if r.unique == "self"
+            message = "this returns a view borrowed from 'self', and only a member marked " +
+                      "'@views(self)' may — the mark is what tells the caller the view lives no " +
+                      "longer than what it was called on"
         end if
 
-        if r.unique == ""
-            cx.fault(span, s"this returns a view borrowed from '${r.name}', and nothing keeps what " +
-                     "that pointer points at alive once this function returns — so the caller " +
-                     "could read freed memory. Return a copy, or return it from a member of its " +
-                     "type marked '@views(self)'")
-            return
-        end if
+        refuse_view(cx, span, message, r, false)
 
-        if r.unique == "self"
-            cx.fault(span, s"this returns a view borrowed from 'self', and only a member marked " +
-                     "'@views(self)' may — the mark is what tells the caller the view lives no " +
-                     "longer than what it was called on")
-            return
-        end if
-
-        cx.fault(span, s"this returns a view borrowed from '${r.name}', and nothing keeps " +
-                 s"'${r.name}' alive once this function returns — so the caller could read freed " +
-                 "memory. Return a copy, or return it from a member of its type marked " +
-                 "'@views(self)'")
-        return
+        if r.via.is_empty() then return
 end note_view_return
 
 // -- what a live borrowed view holds still ---------------------------------------------------------
@@ -446,12 +732,13 @@ check_view_guards(cx: &Analyzer, at: Span, target: TExpr) -> bool
                           (k.starts_with(s"$p/") && holds_storage(texpr_type(target)))
 
             if related
-                refuse_for_ref(cx, at, s"'${holder.unwrap().1.name}' is a view borrowed from " +
-                               s"'${r.name}', and this assignment could free what it views — so " +
-                               "the view would be left reading freed memory. Write the " +
-                               "assignment before the view is taken, or put the view in a block " +
-                               "that closes first")
-                return true
+                refuse_view(cx, at, s"'${holder.unwrap().1.name}' is a view borrowed from " +
+                            s"'${r.name}', and this assignment could free what it views — so " +
+                            "the view would be left reading freed memory. Write the " +
+                            "assignment before the view is taken, or put the view in a block " +
+                            "that closes first", r, true)
+
+                if r.via.is_empty() then return true
             end if
 
     false
@@ -480,11 +767,12 @@ check_view_call(cx: &Analyzer, at: Span, place: TExpr) -> bool
             val p = rk.unwrap()
 
             if k == p || p.starts_with(s"$k/") || k.starts_with(s"$p/")
-                refuse_for_ref(cx, at, s"'${holder.unwrap().1.name}' is a view borrowed from " +
-                               s"'${r.name}', and this call may write what it is called on — so " +
-                               "it could free what the view reads. Make the call before the view " +
-                               "is taken, or put the view in a block that closes first")
-                return true
+                refuse_view(cx, at, s"'${holder.unwrap().1.name}' is a view borrowed from " +
+                            s"'${r.name}', and this call may write what it is called on — so " +
+                            "it could free what the view reads. Make the call before the view " +
+                            "is taken, or put the view in a block that closes first", r, true)
+
+                if r.via.is_empty() then return true
             end if
 
     false

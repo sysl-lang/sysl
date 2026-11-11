@@ -1,0 +1,210 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A borrowed view handed to a call, and what the call's answer holds.
+//
+// **A call's answer is borrowed from what a view argument is borrowed from only if the callee answers
+// with that argument** (`view_borrow.sysl`'s `ViewRoot.via`, settled by `settle_view_refusals` from
+// the callee's body, `view_answer`): `encode(out.view_mut())` answering a `Result[Buf[long], string]` it
+// built, with a fresh string in its `Err`, hands back nothing of `out`, while `id(xs.view_mut())`
+// answering its argument hands back the view itself. The answer is read off the callee's body, so a
+// nested call, a generic instance, a local the answer is bound to first and a recursion are each
+// followed; a call through a function value names no body and is still refused.
+//
+// **A `&sync T` holds no view at all** (a shared object refuses one), so one read out of a view and
+// handed back borrows nothing.
+//
+// Each program also holds a `Buf` across a call the answer was bound from, which is refused exactly
+// when the answer is the view.
+
+private vca_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end vca_ready
+
+private vca_head() -> string =
+    "import sysl.buf.{Buf, buf}\n\n" +
+    "made(n: long) -> Buf[long]\n    var out = buf[long]()\n\n    out.push(n)\n    out.push(n - 3)\n" +
+    "    out.push(n + 3)\n    out\nend made\n\n" +
+    "encode(v: []long) -> Result[Buf[long], string]\n    if v.len == 0 then return Err(f\"empty: ${v.len}\")\n\n" +
+    "    var b = buf[long]()\n\n    for x in v do b.push(x * 2)\n    Ok(b)\nend encode\n\n" +
+    "id(v: []long) -> []long = v\n\n"
+
+private vca_program(body: string) -> string = vca_head() + body + "\nmain() = run()\n"
+
+private vca_root(text: string) -> string
+    val root = make_temp_dir("sysl-view-call").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+
+// What analysing a program said, all of it.
+private vca_said(body: string) -> string
+    val root = vca_root(vca_program(body))
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end vca_said
+
+// What a program printed, or what the compiler said instead.
+private vca_ran(body: string) -> string
+    val root = vca_root(vca_program(body))
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text + out.err.unwrap_or("")
+end vca_ran
+
+// Accepted, and run: what it printed.
+private vca_accepted(body: string, printed: string)
+    val out = vca_said(body)
+
+    assert(!out.contains("error"), s"expected no complaint, got: $out")
+    assert_eq(vca_ran(body), printed)
+
+// Refused, saying `part`.
+private vca_refused(body: string, part: string)
+    val out = vca_said(body)
+
+    assert(out.contains(part), s"expected '$part' in: $out")
+
+// -- an answer the callee built ---------------------------------------------------------------------
+
+@test("a Result of a fresh Buf and a formatted Err, from a call handed a local's view_mut, is returned")
+vca_result_returned()
+    if !vca_ready() then return
+
+    vca_accepted("png(n: long) -> Result[Buf[long], string]\n    var out = made(n)\n\n" +
+                 "    out.push(1)\n    encode(out.view_mut())\nend png\n\n" +
+                 "empty() -> Result[Buf[long], string]\n    var out = buf[long]()\n\n" +
+                 "    encode(out.view_mut())\nend empty\n\n" +
+                 "run()\n    print(png(4).unwrap()[3])\n    empty() match\n        Ok(_) -> print(\"ok\")\n" +
+                 "        Err(e) -> print(e)\n",
+                 "2\nempty: 0\n")
+
+@test("the answer bound to a local, returned, stored in module storage and held across a push")
+vca_bound_then_used()
+    if !vca_ready() then return
+
+    vca_accepted("var kept: Result[Buf[long], string] = Err(\"none\")\n\n" +
+                 "bound(n: long) -> Result[Buf[long], string]\n    var out = made(n)\n" +
+                 "    val r = encode(out.view_mut())\n\n    out.push(9)\n    r\nend bound\n\n" +
+                 "stored(n: long)\n    var out = made(n)\n\n    kept = encode(out.view_mut())\nend stored\n\n" +
+                 "run()\n    print(bound(4).unwrap().len())\n    stored(5)\n    print(kept.unwrap()[0])\n",
+                 "3\n10\n")
+
+@test("a fresh answer through a generic instance and through a nested pass-through call is accepted")
+vca_generic_and_nested()
+    if !vca_ready() then return
+
+    vca_accepted("copied[T](v: []T) -> Option[Buf[T]]\n    var b = buf[T]()\n\n    for x in v do b.push(x)\n" +
+                 "    Some(b)\nend copied\n\n" +
+                 "same[T](x: T) -> T = x\n\n" +
+                 "generic(n: long) -> Option[Buf[long]]\n    var out = made(n)\n\n    copied(out.view_mut())\nend generic\n\n" +
+                 "nested(n: long) -> Result[Buf[long], string]\n    var out = made(n)\n\n" +
+                 "    same(encode(out.view_mut()))\nend nested\n\n" +
+                 "run()\n    print(generic(4).unwrap()[1])\n    print(nested(4).unwrap()[2])\n",
+                 "1\n14\n")
+
+@test("a &sync element read out of a local buffer's view and returned borrows nothing")
+vca_sync_element()
+    if !vca_ready() then return
+
+    vca_accepted("struct Item\n    n: long\n\n" +
+                 "first(xs: []&sync Item) -> &sync Item = xs[0]\n\n" +
+                 "built(items: Buf[&sync Item]) -> &sync Item\n    var held = items\n\n" +
+                 "    first(held.view_mut())\nend built\n\n" +
+                 "run()\n    var items: Buf[&sync Item] = buf()\n\n    items.push(Item(7))\n" +
+                 "    print(built(items).n)\n",
+                 "7\n")
+
+// -- an answer made of the view ---------------------------------------------------------------------
+
+@test("a call answering its view argument, returned, is still a view escaping")
+vca_identity_refused()
+    if !vca_ready() then return
+
+    vca_refused("escape(n: long) -> []long\n    var xs = made(n)\n\n    id(xs.view_mut())\nend escape\n\n" +
+                "run() = print(escape(4)[0])\n",
+                "this returns a view borrowed from 'xs', and nothing keeps 'xs' alive")
+
+@test("the view wrapped in an Option or an Ok by the callee, returned, is refused")
+vca_wrapped_refused()
+    if !vca_ready() then return
+
+    val body = "some(v: []long) -> Option[[]long] = Some(v)\n\n" +
+               "ok(v: []long) -> Result[[]long, string] = if v.len == 0 then Err(\"none\") else Ok(v)\n\n" +
+               "a(n: long) -> Option[[]long]\n    var xs = made(n)\n\n    some(xs.view_mut())\nend a\n\n" +
+               "b(n: long) -> Result[[]long, string]\n    var ys = made(n)\n\n    ok(ys.view_mut())\nend b\n\n" +
+               "run()\n    print(a(4).unwrap()[0])\n    print(b(4).unwrap()[0])\n"
+
+    vca_refused(body, "this returns a view borrowed from 'xs'")
+    vca_refused(body, "this returns a view borrowed from 'ys'")
+
+@test("the view through a nested pass-through, a generic instance and a recursion is refused")
+vca_followed_refused()
+    if !vca_ready() then return
+
+    val body = "same[T](x: T) -> T = x\n\n" +
+               "rec(v: []long, k: long) -> []long = if k == 0 then v else rec(v, k - 1)\n\n" +
+               "a(n: long) -> []long\n    var xs = made(n)\n\n    same(id(xs.view_mut()))\nend a\n\n" +
+               "b(n: long) -> []long\n    var ys = made(n)\n\n    rec(ys.view_mut(), 3)\nend b\n\n" +
+               "run()\n    print(a(4)[0])\n    print(b(4)[0])\n"
+
+    vca_refused(body, "this returns a view borrowed from 'xs'")
+    vca_refused(body, "this returns a view borrowed from 'ys'")
+
+@test("the view answered and bound to a local is held still: a push while it is live is refused")
+vca_held_refused()
+    if !vca_ready() then return
+
+    vca_refused("f(n: long) -> long\n    var xs = made(n)\n    val v = id(xs.view_mut())\n\n" +
+                "    xs.push(1)\n    v[0]\nend f\n\nrun() = print(f(4))\n",
+                "'v' is a view borrowed from 'xs'")
+
+@test("the view answered and stored in module storage, or in a local bound before its buffer, is refused")
+vca_stored_refused()
+    if !vca_ready() then return
+
+    val body = "var kept: []long = []\n\n" +
+               "a(n: long)\n    var xs = made(n)\n\n    kept = id(xs.view_mut())\nend a\n\n" +
+               "b(n: long) -> long\n    var v: []long = []\n\n    if n > 0\n        var ys = made(n)\n\n" +
+               "        v = id(ys.view_mut())\n\n    long(v.len)\nend b\n\n" +
+               "run()\n    a(4)\n    print(b(4))\n"
+
+    vca_refused(body, "this stores a view borrowed from 'xs' somewhere reached through a reference")
+    vca_refused(body, "'v' is bound before 'ys', so it outlives it, and this stores in it a view borrowed from 'ys'")
+
+@test("a call through a function value names no body, so its answer is taken to hold the view")
+vca_pointer_refused()
+    if !vca_ready() then return
+
+    vca_refused("enc(n: long) -> Result[Buf[long], string]\n    var xs = made(n)\n    val f: &Fn([]long) -> Result[Buf[long], string] = encode\n\n" +
+                "    f(xs.view_mut())\nend enc\n\nrun() = print(enc(4).unwrap()[0])\n",
+                "this returns a view borrowed from 'xs'")

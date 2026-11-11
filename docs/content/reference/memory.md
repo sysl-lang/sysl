@@ -1204,7 +1204,11 @@ The view is an ordinary `[]const u8`; nothing changes at run time. The mark adds
 
 What a view is copied into — a sub-slice, a struct or `Option` around it, a closure capturing it, a
 name a pattern binds, a loop variable over a view of views — is borrowed from the same receiver; a
-value that cannot hold a view (`v.len`, `v[0]`, a rendered string) is borrowed from nothing.
+value that cannot hold a view (`v.len`, `v[0]`, a rendered string, a `&sync T`) is borrowed from
+nothing. **A call handed the view answers with it only where its body does**: `encode(out.view_mut())`
+answering a `Result[Buf[u8], string]` it built is borrowed from nothing, while `id(v) -> []u8 = v`
+hands the view straight back. A call through a function value or a trait object names no body, so
+its answer is taken to hold everything it was handed.
 
 ```sysl
 extern "free" c_free(p: *u8)
