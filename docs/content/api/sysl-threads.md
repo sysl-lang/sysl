@@ -168,7 +168,8 @@ returns (`reference/memory.md § A thread borrows a frame only inside a scope`).
 body may hand what it reads through `arg` to anything -- a worker's own deque, a queue every thread
 shares -- and that is no more than `arg` already promises by being kept. It still may not keep the
 address itself. An unmarked body stands where a `@lets_out` one is asked for, so `&work` of a plain
-`work(s: *State)` is the whole of the call either way (`reference/types.md § @lets_out`).
+`work(s: *State)` is the whole of the call either way
+(`reference/types.md § What the callable reads may outlive the call`).
 
 ### `spawn_on`
 
