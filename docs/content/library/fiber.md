@@ -60,7 +60,10 @@ main again
 - **`Stack.reserve(size)`** maps a stack and answers a `&Stack`; dropping the last reference unmaps it.
 - **`Context.start(stack, entry, arg)`** prepares a context that begins at `entry(arg)` on that stack
   the first time something switches to it. `entry` has the shape a [thread's body](/library/threads/)
-  has, `*extern(*T) -> unit`, and `T` is inferred from it.
+  has, `*extern(@lets_out *T) -> unit`, and `T` is inferred from it. The
+  [`@lets_out`](/reference/types/#what-the-callable-reads-may-outlive-the-call-lets-out) says the entry
+  may hand on what it reads through its argument, as a scheduler's entry does when it unlinks the job
+  it runs; an entry that does not, like `count`, stands there all the same.
 - **`Context.new()`** is a context for the stack running now. It holds nothing until a switch leaves
   through it.
 - **`switch(&from, &to)`** saves the running stack in `from` and resumes `to`. To the code that called
