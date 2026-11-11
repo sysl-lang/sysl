@@ -705,28 +705,39 @@ private subscripted_in_place(cx: &Analyzer, container: Expr) -> bool
         _ ->
             if !indexes_through(cx.an, key.unwrap(), ty) then return false
 
-            if answers_own_view(cx, ty) then return true
-
-            // **A default whose view would own nothing it should is refused here**, where the view of
-            // part of an element is taken (`index_view_infer.sysl`).
+            // **A view of part of an element through the trait's default is refused here**, where it
+            // is taken: the default's view owns nothing, and only the container knows what keeps its
+            // elements alive.
             val member = if cx.unchecked > 0 then "index_view_unchecked" else "index_view"
-            val why = ownerless_view_refusal(cx.an, view_member_name(cx, ty, member))
+            val why = default_view_refusal(cx, ty, member)
 
-            if why.is_some() then
-                cx.fault(container.span, s"a view of part of an element of '${type_show(ty)}' is " +
-                         s"taken through the default '$member', but ${why.unwrap()}")
+            if why.is_none() then return true
+
+            cx.fault(container.span, s"a view of part of an element of '${type_show(ty)}' is taken " +
+                     s"through the default '$member', ${why.unwrap()}")
             false
 end subscripted_in_place
 
-// Whether a container answers `index_view` itself rather than inheriting the trait's default. The
-// default's view owns nothing, as the element's address does, so a container that keeps it is read
-// through `index_place` exactly as before -- the same code, and the same receiver: the default takes
-// `*self` where the container's own `index_place` may take `self`.
-private answers_own_view(cx: &Analyzer, ty: Type) -> bool
-    val name = view_member_name(cx, ty, "index_view")
+// Why a view taken through a container's `member` (`index_view` or `index_view_unchecked`) is refused,
+// where the container inherits the trait's default rather than writing it: that default answers a view
+// whose owner is nothing, which outlives the storage once the container grows or is dropped. **It is
+// never written for the container**: the fix is the container's one line, and the refusal spells it.
+default_view_refusal(cx: &Analyzer, ty: Type, member: string) -> Option[string]
+    val name = view_member_name(cx, ty, member)
 
-    name != "" && !cx.an.tables.members.default_origin.has(name)
-end answers_own_view
+    if name == "" || !cx.an.tables.members.default_origin.has(name) then return None
+
+    val sig = member_sig(cx.an, name)
+    val written = if sig.is_some() && sig.unwrap().params.len() == 2 then
+        s"'override $member(*self, i: ${type_show(sig.unwrap().params[1].1)}) -> " +
+            s"${type_show(sig.unwrap().ret)} = <storage>.$member(i)'"
+    else
+        s"'override $member(*self, i) -> []E = <storage>.$member(i)'"
+
+    Some(s"which owns nothing of the storage the element lives in — write '$member' in the " +
+         s"container's 'impl IndexPlace' block, answering the element as a view of that storage: " +
+         written)
+end default_view_refusal
 
 // The name a container's view member was lowered under, or empty where it has none.
 view_member_name(cx: &Analyzer, ty: Type, member: string) -> string
@@ -770,13 +781,8 @@ private slice_elem(cx: &Analyzer, span: Span, rt: Type, hi: Option[Expr]) -> Opt
     // An exported alias of a pointer is sliced as the pointer it names.
     repr(rt) match
         Str -> return Some(byte_type())
-        Ref(inner, sync) ->
-            if sync then
-                cx.fault(span, "a slice does not record whether its owner's count is atomic, so a " +
-                         "'&sync' array cannot be sliced")
-
-                return None
-
+        // A `&sync` array's view takes no count of the box, and may only be lent (`escape.sysl`).
+        Ref(inner, _) ->
             *inner match
                 Array(_, e) -> return Some(*e)
                 _ -> ()

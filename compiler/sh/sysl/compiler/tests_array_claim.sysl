@@ -587,12 +587,17 @@ acl_read_only_through_a_reslice_and_a_call()
         take(table[0..])
         """, acl_not_a_licence())
 
-@test("but a '&sync' array still cannot be sliced, since that is the owner's property and not the view's")
-acl_a_sync_array_cannot_be_sliced()
+// A view records nothing about whether its owner's count is atomic, so a view of a `&sync` array
+// counts nothing of the box: it is lent, and may not get out.
+@test("a '&sync' array is sliced to be lent, and a view of it that would get out is refused")
+acl_a_sync_array_is_sliced_to_be_lent()
     if !acl_ready() then return
 
-    acl_refused("var p: &sync [4]int = [1, 2, 3, 4]\nvar v = p[..]",
-        "error: a slice does not record whether its owner's count is atomic, so a '&sync' array cannot be sliced")
+    assert_eq(acl_ran("total(xs: []int) -> int\n    var t = 0\n    for x in xs\n        t += x\n    t\n" +
+                      "val p: &sync [4]int = [1, 2, 3, 4]\nval v = p[1..]\nprint(total(p[..<2]), total(v))\n"),
+              "3 9\n")
+    acl_refused("whole(p: &sync [4]int) -> []int = p[..]\nval p: &sync [4]int = [1, 2, 3, 4]\nprint(whole(p).len)",
+        "error: a view of storage inside a '&sync [4]int' is returned, but such a view takes no count of the box")
 
 // -- what a view that may not be written promises ----------------------------------------------------
 
@@ -832,12 +837,12 @@ acl_so_is_one_inside_a_struct_whose_invariant_reads_it()
         print(grab(b.xs))
         """, "error: this view may be written, and it views storage inside Box, whose invariant reads 'xs' — a '[]int' names no Box, so a write through it would break the clause with nothing left to re-check it against. Take it as a '[]const int', which may not write, or make the change through a method")
 
-@test("and a '&sync' array, whose owner's count a view does not record")
+@test("and a '&sync' array converts to the view it is lent as, as a '&[N]T' does")
 acl_and_a_sync_array()
     if !acl_ready() then return
 
-    acl_refused("len(xs: []const int) -> usize = xs.len\nval r: &sync [3]int = [1, 2, 3]\nprint(len(r))\n",
-        "error: 'xs' of 'len' is []const int, but &sync [3]int was given")
+    assert_eq(acl_ran("len(xs: []const int) -> usize = xs.len\nval r: &sync [3]int = [1, 2, 3]\nprint(len(r))\n"),
+              "3\n")
 
 @test("while an array of other elements is reported as the array it is")
 acl_an_array_of_other_elements()

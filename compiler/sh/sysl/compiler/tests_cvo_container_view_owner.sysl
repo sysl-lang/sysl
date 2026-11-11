@@ -19,15 +19,16 @@ import sysl.process.capture
 // than a `Buf`. Routes: kept across growth and drop (counted), lent to a borrowing callee (no count
 // where the callee can reach neither the container nor a view of its elements), and the routes out of
 // the frame -- returned, stored in a module var, captured by a heap closure, pushed into a `Buf` --
-// which a counted view takes. A container that answers no `index_view` keeps the default -- an owner
-// of nothing -- which is right for elements in its own bytes or in static storage, pinned here too; a
-// view of part of an element in a container's own bytes lasts as long as the container, so it leaves
-// the frame only where the container is not the frame's (escape.sysl's `container_bytes`). Every runnable cell
-// is run at -O0 and -O2 on the counted heap and once under AddressSanitizer.
+// which a counted view takes. A container whose elements are its own bytes or in static storage writes
+// an `index_view` answering a part of its array, owning nothing (the default is refused,
+// `tests_ivi_index_view_written`); a view of part of an element in a container's own bytes lasts as
+// long as the container, so it leaves the frame only where the container is not the frame's
+// (escape.sysl's `container_bytes`). Every runnable cell is run at -O0 and -O2 on the counted heap and
+// once under AddressSanitizer.
 //
 // Also here: a generic body's `p[0..<n]` over `*T` views `T`s at every instantiation -- at
-// `T = [4]int` it read as a view of the first array's `int`s, which is what the default `index_view`
-// tripped on.
+// `T = [4]int` it read as a view of the first array's `int`s, which is what a view answered from a
+// `*T` region tripped on.
 //
 // Cells not written: separate compilation -- `index_view` is an ordinary trait member, called as any
 // member is; bare metal -- no new runtime call, only the existing `arc.retain_maybe`; `&sync` -- a view
@@ -347,10 +348,10 @@ cvo_bounds()
     assert(!run.ok, run.out)
     assert(run.err.contains("3") && run.err.contains("main.sysl"), run.err)
 
-// -- a container that answers no index_view ----------------------------------------------------------
+// -- a container whose view owns nothing ---------------------------------------------------------------
 
-@test("a container whose elements are its own bytes or static storage keeps the default, owning nothing")
-cvo_default_own_bytes_and_static()
+@test("a container whose elements are its own bytes or static storage writes a view owning nothing")
+cvo_own_bytes_and_static_written()
     cvo_prints(raw"""
         var table: [3][4]i32 = [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]]
 
@@ -361,11 +362,16 @@ cvo_default_own_bytes_and_static()
         impl IndexPlace[usize, [4]i32] for Ring
             index_place(*self, i: usize) -> *[4]i32 = &self.cells[(self.head + i) % 2]
 
+            override index_view(*self, i: usize) -> [][4]i32
+                val k = (self.head + i) % 2
+                self.cells[k..<k + 1]
+
         struct Static
             base: usize
 
         impl IndexPlace[usize, [4]i32] for Static
             index_place(*self, i: usize) -> *[4]i32 = &table[self.base + i]
+            override index_view(*self, i: usize) -> [][4]i32 = table[self.base + i..<self.base + i + 1]
 
         main()
             var r = Ring([[1, 2, 3, 4], [5, 6, 7, 8]], 1)
@@ -376,8 +382,8 @@ cvo_default_own_bytes_and_static()
             print(v[0] + v[2], w[0] + w[3], s[0][..].len)
         """, "14 21 4\n")
 
-@test("a container taking self whose index_view is written for it is read so, a temporary one included")
-cvo_default_self_container_on_a_temporary()
+@test("a container taking self whose index_view it writes is read so, a temporary one included")
+cvo_self_container_on_a_temporary()
     cvo_prints(raw"""
         import sysl.buf.{Buf, buf}
 
@@ -386,6 +392,7 @@ cvo_default_self_container_on_a_temporary()
 
         impl[T] IndexPlace[usize, T] for Plain[T]
             index_place(self, i: usize) -> *T = self.items.index_place(i)
+            override index_view(self, i: usize) -> []T = self.items.index_view(i)
 
         make() -> Plain[[4]i32]
             val p: Plain[[4]i32] = Plain(buf())
@@ -398,8 +405,8 @@ cvo_default_self_container_on_a_temporary()
             print(v[0] + v[2], make()[0][..].len)
         """, "6 4\n")
 
-@test("the default view of an element counts nothing, as the element's address owned nothing")
-cvo_default_counts_nothing()
+@test("an own-bytes view of an element counts nothing, as the element's address owned nothing")
+cvo_own_bytes_counts_nothing()
     if !cvo_ready() then return
 
     val f = cvo_body(cvo_ir(raw"""
@@ -408,6 +415,7 @@ cvo_default_counts_nothing()
 
         impl IndexPlace[usize, [4]i32] for Ring
             index_place(*self, i: usize) -> *[4]i32 = &self.cells[i]
+            override index_view(*self, i: usize) -> [][4]i32 = self.cells[i..<i + 1]
 
         peek(r: *Ring) -> i32
             val v = r[1][..]
@@ -418,8 +426,7 @@ cvo_default_counts_nothing()
             print(peek(&r))
         """), "peek")
 
-    assert(f.contains("call ptr @Ring.index_place("), f)
-    assert(!f.contains("index_view"), f)
+    assert(f.contains("@Ring.index_view"), f)
     assert(!f.contains("@arc.retain_maybe(ptr %"), f)
 
 // -- the routes out of the frame ---------------------------------------------------------------------
@@ -527,6 +534,7 @@ private cvo_ring() -> string = raw"""
 
     impl IndexPlace[usize, [4]i32] for Ring
         index_place(*self, i: usize) -> *[4]i32 = &self.cells[i]
+        override index_view(*self, i: usize) -> [][4]i32 = self.cells[i..<i + 1]
 
     ring() -> Ring = Ring([[1, 2, 3, 4], [5, 6, 7, 8]])
 
@@ -611,6 +619,7 @@ cvo_own_bytes_forwarded_refused()
 
         impl IndexPlace[usize, [4]i32] for Outer
             index_place(*self, i: usize) -> *[4]i32 = self.inner.index_place(i)
+            override index_view(*self, i: usize) -> [][4]i32 = self.inner.index_view(i)
 
         row() -> []i32
             var r = Outer(ring())
@@ -666,17 +675,21 @@ cvo_static_and_raw_escape()
     cvo_prints(raw"""
         var table: [3][4]i32 = [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]]
 
+        region[T](p: *T, n: usize) -> []T = p[0..<n]
+
         struct Static
             base: usize
 
         impl IndexPlace[usize, [4]i32] for Static
             index_place(*self, i: usize) -> *[4]i32 = &table[self.base + i]
+            override index_view(*self, i: usize) -> [][4]i32 = table[self.base + i..<self.base + i + 1]
 
         struct Raw
             p: *[4]i32
 
         impl IndexPlace[usize, [4]i32] for Raw
             index_place(*self, i: usize) -> *[4]i32 = &self.p[i]
+            override index_view(*self, i: usize) -> [][4]i32 = region(&self.p[i], 1)
 
         from_static() -> []i32
             var s = Static(1)

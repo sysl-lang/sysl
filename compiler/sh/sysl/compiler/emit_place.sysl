@@ -854,7 +854,13 @@ address_owned(e: *Emit, place: TExpr) -> (Val, Val)
                     idx.push(ir_arg(l_i32(), VInt(from_int(0))))
                     idx.push(ir_arg(l_i32(), VInt(from_int(long(box_payload_field(e, inner))))))
                     emit(e, InGep(at, box_lty(e, inner), box, idx))
-                    return (box, address_under(e, place, root.unwrap(), at))
+
+                    // **A view of storage inside a `&sync` box owns nothing of it**: a count taken
+                    // through the view would be the ordinary one, and the analysis has kept the view
+                    // lent, so the box outlives it (`escape.sysl`).
+                    val owner = if is_sync_ref(texpr_type(operand)) then VNull else box
+
+                    return (owner, address_under(e, place, root.unwrap(), at))
 
             // An element of a view lives in the view's storage, so the view's owner is the element's:
             // the view is read once, and the element is reached from the pointer it carries.
@@ -934,6 +940,10 @@ end address_under
 // the owner of everything the place reaches.
 private is_counted_ref(t: Type) -> bool = t match
     Ref(_, _) -> true
+    _ -> false
+
+private is_sync_ref(t: Type) -> bool = repr(t) match
+    Ref(_, sync) -> sync
     _ -> false
 
 // Whether two nodes are the same occurrence, which a span answers here where the reference compares
@@ -1162,7 +1172,8 @@ end gen_slice_of
 // A pointer to an array is sliced as the array unless the view is of the arrays themselves: a generic
 // body's `p[0..<n]` over `*T` views `T`s, whatever `T` stands for this time.
 private slice_base(e: *Emit, base: TExpr, slice_ty: Type) -> (Val, Val, Option[Val]) = nameless(texpr_type(base)) match
-    Ref(inner, _) -> underlying(*inner) match
+    // A `&sync` array's view owns nothing of the box, as a view of storage inside one does.
+    Ref(inner, sync) -> underlying(*inner) match
         Array(n, _) ->
             val r = gen_expr(e, base)
             val p = fresh_reg(e)
@@ -1172,7 +1183,7 @@ private slice_base(e: *Emit, base: TExpr, slice_ty: Type) -> (Val, Val, Option[V
             idx.push(ir_arg(l_i32(), VInt(from_int(0))))
             idx.push(ir_arg(l_i32(), VInt(from_int(long(box_payload_field(e, *inner))))))
             emit(e, InGep(p, box_lty(e, *inner), r, idx))
-            (r, p, Some(VInt(from_int(long(n)))))
+            (if sync then VNull else r, p, Some(VInt(from_int(long(n)))))
         other ->
             gap_here(e, s"slice of ${type_show(other)}")
             (VNull, VUndef, None)

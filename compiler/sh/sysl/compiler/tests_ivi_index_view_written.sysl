@@ -5,29 +5,27 @@ import sysl.text.cstring
 import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
 import sysl.process.capture
 
-// **An `IndexPlace` container is safe by default** (`index_view_infer.sysl`): where its block leaves
-// `index_view` out and its `index_place` forwards to a field that answers views of its own, the
-// compiler writes `index_view` as the same forwarding, so `c[i][..]` keeps the field's storage alive;
-// where the elements are anywhere but the container's own bytes through `*self`, static storage or
-// behind a raw pointer, a view of part of an element taken through the default `index_view` -- which
-// owns nothing -- is refused, and so is a call of that default. Before, both compiled, and a view kept
-// past the container's growth or drop read freed storage (ASan heap-use-after-free).
+// **A view of part of an element (`c[i][..]`) is taken through the container's own `index_view`, which
+// the container writes; it is never written for it.** The trait's default answers a view that owns
+// nothing, so a view taken through it -- or a call of it -- is refused wherever the elements live,
+// and the refusal spells the one-line override (`expr_coll.sysl`'s `default_view_refusal`). A written
+// member answers a view of the storage, so the view keeps that storage alive past the container's
+// growth or drop.
 //
-// The axes: the four forwarding shapes; a receiver by value and by `*self`; an index with arithmetic;
-// statements before the forwarding; a generic container; `@unchecked`; a container reached through a
-// bound; a container forwarding to another whose view was itself written for it; a written member
-// beside an inferred one, and a written member winning over the forwarding. The refusals: a helper
-// call, a local, a module `Buf`, through a bound, through another container's default, inside
-// `@unchecked`, and an explicit call. The defaults kept: own bytes (a nested struct's array), a
-// fixed-array module variable, a raw pointer reached through a fixed array of pointers and through a
-// pointer field, and an unproven container from which no view is taken. Every runnable cell runs at
-// -O0 and -O2 on the counted heap and once under AddressSanitizer.
+// The axes: the shapes a written member takes (a field's `index_view`, with arithmetic in the index, a
+// part of a view field, a part of the container's own array, a part of a fixed-array module var, a
+// region behind a raw pointer); a receiver by value and by `*self`; statements before the answer; a
+// generic container; `@unchecked` with and without a written `index_view_unchecked`; a container
+// reached through a bound; a container whose member answers another container's written one. The
+// refusals: a forwarding `index_place` (`self.f.index_place(i)`, `&self.f[i]`) with no written view,
+// a helper call, a local, a module `Buf`, own bytes, static storage, a raw pointer, through a bound,
+// through another container's default, inside `@unchecked` beside a written `index_view`, and an
+// explicit call. A container whose default is never used to take a view still compiles. Every
+// runnable cell runs at -O0 and -O2 on the counted heap and once under AddressSanitizer.
 //
 // Cells not written: a by-value `self` over its own bytes -- `&self.cells[i]` in such an
-// `index_place` is already refused as the address of a copy; a `&self` receiver over the object's own
-// bytes -- refused by the same rule as anything else that is neither `*self` nor a raw pointer;
-// separate compilation -- the written member is an ordinary member; bare metal -- no runtime call is
-// added.
+// `index_place` is already refused as the address of a copy; separate compilation -- the written
+// member is an ordinary member; bare metal -- no runtime call is added.
 
 private extern "setenv" ivi_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
 private extern "unsetenv" ivi_c_unsetenv(name: *u8) -> int
@@ -135,10 +133,16 @@ private ivi_prints(text: string, expected: string)
     assert_eq(asan.out, expected)
 end ivi_prints
 
-// -- the forwarding shapes: index_view is written, and the view keeps the storage ---------------------
+// What a refusal of a default `member` at a container of `[4]i32`s says after naming the container.
+private ivi_why(member: string) -> string =
+    "which owns nothing of the storage the element lives in — write " +
+    s"'$member' in the container's 'impl IndexPlace' block, answering the element as a view of that " +
+    s"storage: 'override $member(*self, i: usize) -> [][4]int = <storage>.$member(i)'"
 
-@test("index_place forwarding to a field's index_place gets an owning index_view, generic and by value")
-ivi_forwards_index_place()
+// -- a written index_view: the view keeps the storage --------------------------------------------------
+
+@test("a written index_view answering a field's view keeps the storage, generic and by value")
+ivi_written_field_view()
     ivi_prints(raw"""
         import sysl.buf.{Buf, buf}
 
@@ -147,6 +151,7 @@ ivi_forwards_index_place()
 
         impl[T] IndexPlace[usize, T] for Plain[T]
             index_place(self, i: usize) -> *T = self.items.index_place(i)
+            override index_view(self, i: usize) -> []T = self.items.index_view(i)
 
         main()
             var p: Plain[[4]i32] = Plain(buf())
@@ -158,8 +163,8 @@ ivi_forwards_index_place()
             print(v[0] + v[3])
         """, "5\n")
 
-@test("&self.f[e] over a Buf with an arithmetic index gets an owning index_view")
-ivi_forwards_address_of_buf_subscript()
+@test("a written index_view with an arithmetic index, through *self, keeps the storage")
+ivi_written_arithmetic_index()
     ivi_prints(raw"""
         import sysl.buf.{Buf, buf}
 
@@ -169,6 +174,7 @@ ivi_forwards_address_of_buf_subscript()
 
         impl IndexPlace[usize, [4]i32] for Offset
             index_place(*self, i: usize) -> *[4]i32 = &self.items[i + self.start]
+            override index_view(*self, i: usize) -> [][4]i32 = self.items.index_view(i + self.start)
 
         main()
             var o = Offset(buf(), 1)
@@ -179,14 +185,15 @@ ivi_forwards_address_of_buf_subscript()
             print(w[0] + w[2], w.len)
         """, "14 3\n")
 
-@test("&self.f[e] over a view gets an index_view that is part of the view, kept when it is replaced")
-ivi_forwards_address_of_view_subscript()
+@test("a written index_view that is part of a view field is kept when the field is replaced")
+ivi_written_part_of_a_view()
     ivi_prints(raw"""
         struct Grid
             cells: [][4]i32
 
         impl IndexPlace[usize, [4]i32] for Grid
             index_place(*self, i: usize) -> *[4]i32 = &self.cells[i]
+            override index_view(*self, i: usize) -> [][4]i32 = self.cells[i..<i + 1]
 
         main()
             var g = Grid([[1, 2, 3, 4], [5, 6, 7, 8]])
@@ -195,8 +202,8 @@ ivi_forwards_address_of_view_subscript()
             print(v[0] + v[2], g[0][0], g[0][..].len)
         """, "14 0 4\n")
 
-@test("a written index_place_unchecked forwarding gives the unchecked view, read inside @unchecked")
-ivi_forwards_index_place_unchecked()
+@test("a written index_view_unchecked is what a view inside @unchecked is read through")
+ivi_written_unchecked()
     ivi_prints(raw"""
         import sysl.buf.{Buf, buf}
 
@@ -206,6 +213,8 @@ ivi_forwards_index_place_unchecked()
         impl IndexPlace[usize, [4]i32] for Rows
             index_place(self, i: usize) -> *[4]i32 = self.items.index_place(i)
             override index_place_unchecked(self, i: usize) -> *[4]i32 = self.items.index_place_unchecked(i)
+            override index_view(self, i: usize) -> [][4]i32 = self.items.index_view(i)
+            override index_view_unchecked(self, i: usize) -> [][4]i32 = self.items.index_view_unchecked(i)
 
         main()
             var r = Rows(buf())
@@ -219,8 +228,8 @@ ivi_forwards_index_place_unchecked()
             print(u[0] + u[1])
         """, "7\n")
 
-@test("statements before the forwarding are kept, and the view is taken through a bound and @unchecked")
-ivi_forwards_after_statements_through_a_bound()
+@test("statements before the answer, a view through a bound and @unchecked, and an explicit call")
+ivi_written_after_statements_through_a_bound()
     ivi_prints(raw"""
         import sysl.buf.{Buf, buf}
 
@@ -228,9 +237,13 @@ ivi_forwards_after_statements_through_a_bound()
             items: Buf[T]
 
         impl[T] IndexPlace[usize, T] for Rows[T]
-            index_place(self, i: usize) -> *T
+            index_place(self, i: usize) -> *T = self.items.index_place(i)
+
+            override index_view(self, i: usize) -> []T
                 if i > 1000 then panic("far")
-                self.items.index_place(i)
+                self.items.index_view(i)
+
+            override index_view_unchecked(self, i: usize) -> []T = self.items.index_view_unchecked(i)
 
         first_and_last[C: IndexPlace[usize, [4]i32]](c: *C, reset: (*C) -> unit) -> i32
             val v = c[0][..]
@@ -254,8 +267,8 @@ ivi_forwards_after_statements_through_a_bound()
             print(u[3], t, w[0][1], w.len)
         """, "4 5 7 1\n")
 
-@test("a container forwarding to another whose index_view was written for it keeps the storage")
-ivi_forwards_through_an_inferred_container()
+@test("a written index_view answering another container's written one keeps the storage")
+ivi_written_through_another_container()
     ivi_prints(raw"""
         import sysl.buf.{Buf, buf}
 
@@ -264,12 +277,14 @@ ivi_forwards_through_an_inferred_container()
 
         impl[T] IndexPlace[usize, T] for Plain[T]
             index_place(self, i: usize) -> *T = self.items.index_place(i)
+            override index_view(self, i: usize) -> []T = self.items.index_view(i)
 
         struct Outer
             inner: Plain[[4]i32]
 
         impl IndexPlace[usize, [4]i32] for Outer
             index_place(*self, i: usize) -> *[4]i32 = &self.inner[i]
+            override index_view(*self, i: usize) -> [][4]i32 = self.inner.index_view(i)
 
         main()
             var o = Outer(Plain(buf()))
@@ -279,30 +294,50 @@ ivi_forwards_through_an_inferred_container()
             print(v[0] + v[2])
         """, "6\n")
 
-@test("a written index_view wins over the forwarding, and index_view_unchecked is still written")
-ivi_written_member_wins()
+@test("own bytes, a fixed-array module var and a raw-pointer region each answer a written index_view")
+ivi_written_own_bytes_static_and_raw()
     ivi_prints(raw"""
         import sysl.buf.{Buf, buf}
+        import sysl.slices.as_mut_ptr
 
-        struct Two
-            a: Buf[[4]i32]
-            b: Buf[[4]i32]
+        var table: [3][4]i32 = [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]]
 
-        impl IndexPlace[usize, [4]i32] for Two
-            index_place(self, i: usize) -> *[4]i32 = self.a.index_place(i)
-            override index_view(self, i: usize) -> [][4]i32 = self.b.index_view(i)
+        region[T](p: *T, n: usize) -> []T = p[0..<n]
+
+        struct Cells
+            rows: [2][4]i32
+
+        struct Nested
+            inner: Cells
+
+        impl IndexPlace[usize, [4]i32] for Nested
+            index_place(*self, i: usize) -> *[4]i32 = &self.inner.rows[i]
+            override index_view(*self, i: usize) -> [][4]i32 = self.inner.rows[i..<i + 1]
+
+        struct Static
+            base: usize
+
+        impl IndexPlace[usize, [4]i32] for Static
+            index_place(*self, i: usize) -> *[4]i32 = &table[self.base + i]
+            override index_view(*self, i: usize) -> [][4]i32 = table[self.base + i..<self.base + i + 1]
+
+        struct Base
+            base: *[4]i32
+            owner: Buf[[4]i32]
+
+        impl IndexPlace[usize, [4]i32] for Base
+            index_place(self, i: usize) -> *[4]i32 = &self.base[i]
+            override index_view(self, i: usize) -> [][4]i32 = region(&self.base[i], 1)
 
         main()
-            var t = Two(buf(), buf())
-            t.a.push([1, 1, 1, 1])
-            t.b.push([2, 2, 2, 2])
-            val v = t[0][..]
-            var u: []i32 = []
-            @unchecked
-                u = t[0][..]
-            t = Two(buf(), buf())
-            print(v[0], u[0])
-        """, "2 1\n")
+            var n = Nested(Cells([[1, 2, 3, 4], [5, 6, 7, 8]]))
+            var s = Static(1)
+            var owner: Buf[[4]i32] = buf()
+            owner.push([1, 1, 1, 1])
+            owner.push([2, 2, 2, 2])
+            var b = Base(as_mut_ptr(owner.view_mut()), owner)
+            print(n[1][1..].len, s[1][..][3], b[1][2..][0])
+        """, "3 12 2\n")
 
 // -- the refusals ----------------------------------------------------------------------------------
 
@@ -324,10 +359,43 @@ private ivi_hidden() -> string = raw"""
 
     """
 
-private ivi_why() -> string = "its 'index_place' does not reach the element in the container's own " +
-    "bytes through '*self', in static storage or through a raw pointer, so the view would own nothing " +
-    "and could outlive the storage once the container grows or is dropped — answer the view from the " +
-    "storage: 'override index_view(*self, i: usize) -> [][4]int = <storage>.index_view(i)'"
+@test("an index_place forwarding to a field's index_place is not read for a view: the view is refused")
+ivi_refused_forwarding_index_place()
+    ivi_refused(raw"""
+        import sysl.buf.{Buf, buf}
+
+        struct Plain[T]
+            items: Buf[T]
+
+        impl[T] IndexPlace[usize, T] for Plain[T]
+            index_place(self, i: usize) -> *T = self.items.index_place(i)
+
+        main()
+            var p: Plain[[4]i32] = Plain(buf())
+            p.items.push([1, 2, 3, 4])
+            val v = p[0][..]
+            print(v[0])
+        """, "is taken through the default 'index_view', which owns nothing", "main.sysl:12:")
+
+@test("an index_place answering &self.f[e] over a Buf is refused the same, with the override spelled")
+ivi_refused_address_of_buf_subscript()
+    ivi_refused(raw"""
+        import sysl.buf.{Buf, buf}
+
+        struct Offset
+            items: Buf[[4]i32]
+            start: usize
+
+        impl IndexPlace[usize, [4]i32] for Offset
+            index_place(*self, i: usize) -> *[4]i32 = &self.items[i + self.start]
+
+        main()
+            var o = Offset(buf(), 1)
+            o.items.push([5, 6, 7, 8])
+            val w = o[0][1..]
+            print(w[0])
+        """, "a view of part of an element of 'Offset' is taken through the default 'index_view', " +
+        ivi_why("index_view"), "main.sysl:13:")
 
 @test("a view of part of an element of a container whose index_place calls a helper is refused")
 ivi_refused_helper()
@@ -336,30 +404,40 @@ ivi_refused_helper()
             var h = hidden()
             val v = h[0][1..]
             print(v[0])
-        """, "a view of part of an element of 'Hidden' is taken through the default 'index_view', but " +
-        ivi_why(), "main.sysl:18:")
+        """, "a view of part of an element of 'Hidden' is taken through the default 'index_view', " +
+        ivi_why("index_view"), "main.sysl:18:")
 
-@test("a call of a default index_view whose view would own nothing is refused")
+@test("a call of a default index_view is refused")
 ivi_refused_explicit_call()
     ivi_refused(ivi_hidden() + raw"""
         main()
             var h = hidden()
             print(h.index_view(0).len)
-        """, "'Hidden.index_view' is the trait's default, but " + ivi_why(), "main.sysl:18:")
+        """, "'Hidden.index_view' is the trait's default, " + ivi_why("index_view"), "main.sysl:18:")
 
-@test("a view of part of an element inside @unchecked names index_view_unchecked")
-ivi_refused_unchecked()
-    ivi_refused(ivi_hidden() + raw"""
+@test("a view inside @unchecked beside a written index_view names the default index_view_unchecked")
+ivi_refused_unchecked_beside_a_written_view()
+    ivi_refused(raw"""
+        import sysl.buf.{Buf, buf}
+
+        struct Rows
+            items: Buf[[4]i32]
+
+        impl IndexPlace[usize, [4]i32] for Rows
+            index_place(self, i: usize) -> *[4]i32 = self.items.index_place(i)
+            override index_view(self, i: usize) -> [][4]i32 = self.items.index_view(i)
+
         main()
-            var h = hidden()
+            var r = Rows(buf())
+            r.items.push([1, 2, 3, 4])
             var v: []i32 = []
             @unchecked
-                v = h[0][..]
-            print(v[0])
-        """, "taken through the default 'index_view_unchecked', but its 'index_place' does not reach",
-        "'override index_view_unchecked(*self, i: usize) -> [][4]int = <storage>.index_view_unchecked(i)'")
+                v = r[0][..]
+            print(v[0], r[0][..].len)
+        """, "a view of part of an element of 'Rows' is taken through the default 'index_view_unchecked', " +
+        ivi_why("index_view_unchecked"), "main.sysl:15:")
 
-@test("a view taken through a bound at a container whose default owns nothing is refused")
+@test("a view taken through a bound at a container keeping the default is refused")
 ivi_refused_through_a_bound()
     ivi_refused(ivi_hidden() + raw"""
         first[C: IndexPlace[usize, [4]i32]](c: *C) -> i32
@@ -369,11 +447,11 @@ ivi_refused_through_a_bound()
         main()
             var h = hidden()
             print(first(&h))
-        """, "a view of part of an element of 'Hidden' is taken through the default 'index_view', but " +
-        ivi_why(), "main.sysl:17:")
+        """, "a view of part of an element of 'Hidden' is taken through the default 'index_view', " +
+        ivi_why("index_view"), "main.sysl:17:")
 
-@test("a container forwarding to another whose default owns nothing is refused at its index_place")
-ivi_refused_forwarding_to_a_refused_default()
+@test("a container whose index_place forwards to another container is refused at its own default")
+ivi_refused_forwarding_to_a_container()
     ivi_refused(ivi_hidden() + raw"""
         struct Outer
             inner: Hidden
@@ -384,9 +462,10 @@ ivi_refused_forwarding_to_a_refused_default()
         main()
             var o = Outer(hidden())
             print(o[0][..].len)
-        """, "'Hidden.index_view' is the trait's default, but " + ivi_why(), "main.sysl:20:")
+        """, "a view of part of an element of 'Outer' is taken through the default 'index_view', " +
+        ivi_why("index_view"), "main.sysl:24:")
 
-@test("a local and a module Buf are not where the default is right")
+@test("a local and a module Buf are refused")
 ivi_refused_other_reaches()
     ivi_refused(raw"""
         import sysl.buf.{Buf, buf}
@@ -424,24 +503,23 @@ ivi_refused_other_reaches()
         """, "a view of part of an element of 'Global' is taken through the default 'index_view'",
         "main.sysl:14:")
 
-// -- the defaults kept -----------------------------------------------------------------------------
-
-@test("own bytes through a nested struct, a fixed-array module var and a raw pointer keep the default")
-ivi_default_kept()
-    ivi_prints(raw"""
-        import sysl.buf.{Buf, buf}
-        import sysl.slices.as_mut_ptr
-
-        var table: [3][4]i32 = [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]]
-
+@test("own bytes, static storage and a raw pointer are refused the default too")
+ivi_refused_own_bytes_static_and_raw()
+    ivi_refused(raw"""
         struct Cells
             rows: [2][4]i32
 
-        struct Nested
-            inner: Cells
+        impl IndexPlace[usize, [4]i32] for Cells
+            index_place(*self, i: usize) -> *[4]i32 = &self.rows[i]
 
-        impl IndexPlace[usize, [4]i32] for Nested
-            index_place(*self, i: usize) -> *[4]i32 = &self.inner.rows[i]
+        main()
+            var c = Cells([[1, 2, 3, 4], [5, 6, 7, 8]])
+            print(c[1][1..].len)
+        """, "a view of part of an element of 'Cells' is taken through the default 'index_view', " +
+        ivi_why("index_view"), "main.sysl:9:")
+
+    ivi_refused(raw"""
+        var table: [3][4]i32 = [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]]
 
         struct Static
             base: usize
@@ -449,34 +527,30 @@ ivi_default_kept()
         impl IndexPlace[usize, [4]i32] for Static
             index_place(*self, i: usize) -> *[4]i32 = &table[self.base + i]
 
-        struct Chunks
-            chunks: [2]*[4]i32
-            owner: Buf[[4]i32]
+        main()
+            var s = Static(1)
+            print(s[1][..].len)
+        """, "a view of part of an element of 'Static' is taken through the default 'index_view'",
+        "main.sysl:11:")
 
-        impl IndexPlace[usize, [4]i32] for Chunks
-            index_place(self, i: usize) -> *[4]i32 = &self.chunks[i / 2][i % 2]
+    ivi_refused(raw"""
+        struct Raw
+            p: *[4]i32
 
-        struct Base
-            base: *[4]i32
-            owner: Buf[[4]i32]
-
-        impl IndexPlace[usize, [4]i32] for Base
-            index_place(self, i: usize) -> *[4]i32 = &self.base[i]
+        impl IndexPlace[usize, [4]i32] for Raw
+            index_place(*self, i: usize) -> *[4]i32 = &self.p[i]
 
         main()
-            var n = Nested(Cells([[1, 2, 3, 4], [5, 6, 7, 8]]))
-            var s = Static(1)
-            var owner: Buf[[4]i32] = buf()
-            owner.push([1, 1, 1, 1])
-            owner.push([2, 2, 2, 2])
-            val p = as_mut_ptr(owner.view_mut())
-            var c = Chunks([p, p], owner)
-            var b = Base(p, owner)
-            print(n[1][1..].len, s[1][..][3], c[1][..][0], b[1][2..][0])
-        """, "3 12 2 2\n")
+            var t = [[1, 2, 3, 4], [5, 6, 7, 8]]
+            var r = Raw(&t[0])
+            print(r[1][..].len)
+        """, "a view of part of an element of 'Raw' is taken through the default 'index_view'",
+        "main.sysl:10:")
 
-@test("a container whose default owns nothing compiles while no view of part of an element is taken")
-ivi_unproven_without_views()
+// -- what still compiles ---------------------------------------------------------------------------
+
+@test("a container keeping the default compiles while no view of part of an element is taken")
+ivi_default_without_views()
     ivi_prints(ivi_hidden() + raw"""
         main()
             var h = hidden()

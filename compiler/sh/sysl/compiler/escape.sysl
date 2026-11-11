@@ -147,6 +147,10 @@ struct EscapeWalk
     // Every call written straight under an `await` or a `block_on`: its task ends before the
     // expression does, so what it was handed outlives nothing.
     driven: Buf[Span]
+
+    // The locals the body stores into or takes the address of, which a view of storage inside the
+    // `&sync` box one holds may not rely on (`sync_root_stays`).
+    rebound: Buf[string]
 end EscapeWalk
 
 // One promotion, with its parts still separate.
@@ -181,6 +185,10 @@ struct EView
     temps: Buf[(Span, string)]
     why: string
 
+    // The `&sync` box the view is of storage inside, as written, where it is one: such a view takes
+    // no count of the box (`address_owned`), so it may be lent and may not get out.
+    sync: string
+
     non_empty(self) -> bool = !self.named.is_empty() || self.anonymous || !self.temps.is_empty()
 end EView
 
@@ -188,8 +196,17 @@ private no_view() -> EView
     var named: Buf[string] = buf()
     var temps: Buf[(Span, string)] = buf()
 
-    EView(named, false, temps, "")
+    EView(named, false, temps, "", "")
 end no_view
+
+// A view of storage inside a `&sync` box, which owns nothing of it.
+private sync_view(box: Type) -> EView
+    var v = no_view()
+
+    v.anonymous = true
+    v.sync = type_show(box)
+    v
+end sync_view
 
 private unnamed_view(why: string) -> EView
     var v = no_view()
@@ -233,6 +250,7 @@ private join_views(a: EView, b: EView) -> EView
 
     out.anonymous = a.anonymous || b.anonymous
     out.why = if a.why.is_empty() then b.why else a.why
+    out.sync = if a.sync.is_empty() then b.sync else a.sync
     out
 end join_views
 
@@ -377,7 +395,7 @@ private walk_body(p: TProgram, keeps: &KeptParams, stmts: Buf[TStmt], result: Op
 
     val w: &EscapeWalk = EscapeWalk(confined, promoted, temps, sites, None, local_arrays(stmts),
                                     ref_bindings(stmts), aligned_arrays(stmts), lits, framed, found.0,
-                                    found.1, buf())
+                                    found.1, buf(), rebound_locals(stmts))
     val prog = p
     val kp = keeps
     var changed = true
@@ -390,6 +408,11 @@ private walk_body(p: TProgram, keeps: &KeptParams, stmts: Buf[TStmt], result: Op
         changed = before.n > 0
 
     walk_stmts(stmts, stmt_walk(false, s -> check_one(prog, kp, w, s)))
+    walk_stmts(stmts, expr_walk(false, x -> check_sync_root(w, x)))
+
+    result match
+        Some(r) -> walk_texpr(r, expr_walk(false, x -> check_sync_root(w, x)))
+        None -> ()
 
     result match
         Some(r) -> returned(prog, kp, w, r)
@@ -456,7 +479,7 @@ private set_confined(w: &EscapeWalk, name: string, v: EView)
 end set_confined
 
 private view_eq(a: EView, b: EView) -> bool
-    if a.anonymous != b.anonymous then return false
+    if a.anonymous != b.anonymous || a.sync != b.sync then return false
     if a.named.len() != b.named.len() || a.temps.len() != b.temps.len() then return false
 
     for i in 0..<a.named.len()
@@ -723,6 +746,13 @@ private gets_out(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, at: TExpr, how
             w.sites.push(EscapeSite("", t.1, t.0, how, "the frame"))
             w.temps.push(t)
 
+    if v.sync != "" && w.refusal.is_none()
+        w.refusal = Some((view_anchor(at),
+            s"a view of storage inside a '${v.sync}' $how, but such a view takes no count of the box — " +
+            "a count update through it would not be atomic — so it may only be lent: handed to a call " +
+            "that borrows it, or held in a local of this body. Copy the elements into an array of " +
+            "their own to keep them"))
+
     if v.anonymous && w.refusal.is_none()
         // Placed at the view's own bracket, as a promotion's note is: what has to change is the
         // slice, and the function around it is fine.
@@ -894,6 +924,12 @@ private views_value(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, e: TExpr) -
     // **Part of one is the same case**: the whole temporary moves and the view is narrowed over the
     // buffer it moved into, exactly as a part of a promoted named array is.
     TSlice(base, _, _, _, _) ->
+        // **Storage inside a `&sync` box is viewed with no count of the box**, so the view is lent:
+        // handed to a call that borrows it, or held in this frame, and never further.
+        val box = sync_box_around(base, n -> ref_place(w, n))
+
+        if box.is_some() then return join_views(views(p, keeps, w, base), sync_view(box.unwrap()))
+
         if is_array(texpr_type(base)) && !is_place(base)
             join_views(views(p, keeps, w, base), temp_view(e.span, describe_temp(base)))
         else if is_array(texpr_type(base))
@@ -1235,6 +1271,67 @@ end NameList
 struct RefList
     places: Buf[(string, TExpr)]
 end RefList
+
+// The locals a body stores a new value into, or hands out the address of, directly or through a
+// `ref` that stands for one: the bindings whose value may change while a view taken through it lives.
+private rebound_locals(stmts: Buf[TStmt]) -> Buf[string]
+    val found: &RefList = RefList(buf())
+    val refs = ref_bindings(stmts)
+
+    walk_stmts(stmts, expr_walk(false, x -> note_rebound(found, refs, x)))
+
+    var out: Buf[string] = buf()
+
+    for item in found.places
+        out.push(item.0)
+
+    out
+end rebound_locals
+
+private note_rebound(found: &RefList, refs: Buf[(string, TExpr)], x: TExpr) = *x.kind match
+    TStore(place, _, _, _) -> note_bound_name(found, refs, place)
+    TAddrOf(place, _) -> note_bound_name(found, refs, place)
+    _ -> ()
+
+private note_bound_name(found: &RefList, refs: Buf[(string, TExpr)], place: TExpr) -> unit = *place.kind match
+    TLoad(name, _) ->
+        found.places.push((name, place))
+
+        for item in refs
+            if item.0 == name then note_bound_name(found, refs, item.1)
+    _ -> ()
+
+// **A view of storage inside a `&sync` box counts nothing of the box**, so what keeps the box alive
+// while the view lives is the binding it was reached through, which must go on holding it.
+private check_sync_root(w: &EscapeWalk, x: TExpr) = *x.kind match
+    TSlice(base, _, _, _, _) ->
+        val box = sync_box_around(base, n -> ref_place(w, n))
+
+        if box.is_some() && !sync_root_stays(w, base) && w.refusal.is_none()
+            w.refusal = Some((view_anchor(x),
+                s"a view of storage inside a '${type_show(box.unwrap())}' takes no count of the box — a " +
+                "count update through it would not be atomic — so the box must be held for as long as " +
+                "the view lives by what it was reached through, and this is a field of another box, a " +
+                "module 'var', a 'ref', or a local this body stores into or hands out the address of. " +
+                "Hold the box in a 'val' first, and view it through that"))
+    _ -> ()
+
+// Whether the binding a view of `&sync` storage reaches its box through keeps holding that box for as
+// long as the view can live: a local or parameter the body never stores into nor hands out the address
+// of, or a module `val`. A view reached through a field of another box is not, since that field may
+// be written while the view lives, and the view counts nothing of the box to keep it.
+private sync_root_stays(w: &EscapeWalk, base: TExpr) -> bool = *base.kind match
+    TDeref(operand, _) -> *operand.kind match
+        TLoad(name, _) -> ref_place(w, name).is_none() && !holds_string(w.rebound, name)
+        TGlobal(_, _, writable) -> !writable
+        _ -> false
+    TField(r, _, _) -> sync_root_stays(w, r)
+    TIndex(r, _, _) -> sync_root_stays(w, r)
+    TLoad(name, _) -> ref_place(w, name) match
+        Some(place) -> sync_root_stays(w, place)
+        None -> !holds_string(w.rebound, name)
+    TGlobal(_, _, writable) -> !writable
+    _ -> false
 
 struct AlignList
     asked: Buf[(string, usize)]

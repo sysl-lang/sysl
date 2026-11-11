@@ -885,21 +885,9 @@ of a view, so the view taken carries that view's owner and stays good after the 
 dropped. A container whose elements live in a `Buf` or a view says so by answering a part of it —
 `Buf` does, which is all that makes `b[i][..]` safe.
 
-**A container whose `index_place` forwards to such a field has that answer written for it.** Where
-the block leaves `index_view` out and the last expression of `index_place` is one of these, `f` a field
-of `self` and `e` any index expression, the compiler writes `index_view` as the same forwarding, the
-statements before that expression kept:
-
-| `index_place` ends in | `index_view` is written as |
-|---|---|
-| `self.f.index_place(e)` | `self.f.index_view(e)` |
-| `self.f.index_place_unchecked(e)` | `self.f.index_view_unchecked(e)` |
-| `&self.f[e]`, `f` a container | `self.f.index_view(e)` |
-| `&self.f[e]`, `f` a view | `self.f[e..][0..<1]` |
-
-`index_view_unchecked` is written the same way, from `index_place_unchecked` where the block wrote
-one. A member the block wrote itself is never replaced. So `Rows` needs no more than its
-`index_place`:
+**A container that is viewed into writes its `index_view`; it is never written for it.** Only the
+container knows what keeps its elements alive, so its block answers the view from that storage — a
+field's own view, a part of a view field, a part of its own array:
 
 ```sysl
 import sysl.buf.{Buf, buf}
@@ -909,6 +897,7 @@ struct Rows
 
 impl IndexPlace[usize, [4]int] for Rows
     index_place(self, i: usize) -> *[4]int = self.items.index_place(i)
+    override index_view(self, i: usize) -> [][4]int = self.items.index_view(i)
 
 var r = Rows(buf())
 
@@ -927,19 +916,15 @@ print(v)
 [2, 3, 4]
 ```
 
-**The default `index_view` answers a view whose owner is nothing**, which is exactly right for elements
-that are the container's own bytes, like `Ring`'s above, or static storage: those live as long as
-the container or the program. A container that keeps its elements behind a `*T` is in the raw-pointer
-tier, where nothing is kept alive for it, as nothing is for `p[0..<n]`. The default is kept where
-`index_place` ends in `&` of a place reached through `*self` by fields and fixed arrays' subscripts,
-of a module variable written as a fixed array, or of anything reached through a raw pointer. A view
-of part of an element in the container's own bytes leaves a frame only where the container lives
-outside it — in module storage, or reached through a `*T` — and is refused where the container is
-the frame's own ([Memory](memory.md)).
+A container whose elements are its own bytes answers a part of its array
+(`self.cells[i..<i + 1]`), which owns nothing and lasts as long as the container: a view of part of
+such an element leaves a frame only where the container lives outside it — in module storage, or
+reached through a `*T` — and is refused where the container is the frame's own
+([Memory](memory.md)).
 
-**Anywhere else, a view of part of an element taken through the default is refused**, since it would
-own nothing and could outlive the storage once the container grows or is dropped; so is a call of
-the default `index_view` itself. The diagnostic gives the one line that answers it:
+**The trait's default `index_view` answers a view whose owner is nothing, and a view of part of an
+element taken through it is refused**, wherever the elements live; so is a call of the default
+itself. The diagnostic gives the one line that answers it:
 
 ```sysl
 import sysl.buf.{Buf, buf}
@@ -947,10 +932,8 @@ import sysl.buf.{Buf, buf}
 struct Hidden
     items: Buf[[4]int]
 
-    slot(*self, i: usize) -> *[4]int = self.items.index_place(i)
-
 impl IndexPlace[usize, [4]int] for Hidden
-    index_place(*self, i: usize) -> *[4]int = self.slot(i)
+    index_place(self, i: usize) -> *[4]int = self.items.index_place(i)
 
 var h = Hidden(buf())
 
@@ -962,12 +945,12 @@ print(v)
 ```
 
 ```error
-a view of part of an element of 'Hidden' is taken through the default 'index_view', but its 'index_place' does not reach the element in the container's own bytes through '*self', in static storage or through a raw pointer, so the view would own nothing and could outlive the storage once the container grows or is dropped — answer the view from the storage: 'override index_view(*self, i: usize) -> [][4]int = <storage>.index_view(i)'
+a view of part of an element of 'Hidden' is taken through the default 'index_view', which owns nothing of the storage the element lives in — write 'index_view' in the container's 'impl IndexPlace' block, answering the element as a view of that storage: 'override index_view(*self, i: usize) -> [][4]int = <storage>.index_view(i)'
 ```
 
-`override index_view(*self, i: usize) -> [][4]int = self.items.index_view(i)` in the block is the
-answer here. `index_view_unchecked` is the same member inside an `@unchecked` block, defaulting to
-`index_view`'s answer over `index_place_unchecked`.
+`override index_view(self, i: usize) -> [][4]int = self.items.index_view(i)` in the block is the
+answer here. `index_view_unchecked` is the member a view inside an `@unchecked` block is taken
+through, and is written the same way where the container is viewed into there.
 
 **Where the method takes a `usize`, the subscript takes any integer**, exactly as an array's does: the
 compiler brings the index to a `usize` before the call, so `b[i]` with `i` an `int`, an `i8` or a
@@ -1156,7 +1139,8 @@ fill(a, 7)
 is a licence to write them — so the one does not become the other
 ```
 
-A `&sync [N]T` does not convert either, for the same reason it cannot be sliced. A `*[N]T` is
+A `&sync [N]T` converts too, into a view that is only lent (§ Views of storage inside a '&sync'
+box, below). A `*[N]T` is
 excluded deliberately: the raw-pointer tier is written out where it is used, and a view of
 pointed-at storage taken silently is the one case where nothing in the type says the elements are
 really there.
@@ -1407,7 +1391,7 @@ frozen() -> int
 
 **What a view does not record** is whose elements these are, whether they outlive the program, and
 whether their owner's count is atomic. Those are properties of the *owner*, which a view cannot
-describe; the [refusal below](#what-is-still-refused) follows from that.
+describe; the rule for views of storage inside a `&sync` box, below, follows from that.
 
 ## Length
 
@@ -1643,37 +1627,55 @@ print(b.len(), b[0], b[20], b.cap())
 21 1 21 32
 ```
 
-## What is still refused
+## Views of storage inside a '&sync' box
 
-**A `&sync` array cannot be sliced.**
-
-```sysl
-var boxed: &sync [4]int = [1, 2, 3, 4]
-var v = boxed[..]
-```
-
-```error
-a slice does not record whether its owner's count is atomic
-```
-
-**Nor can an array that lives inside a `&sync` box**, whether it is a field, a field of a field, or
-handed to a parameter that takes a view. A view of it would hold its share of the box, and take and
-give back that share the ordinary way while another domain changes the same count atomically:
+**A view of a `&sync` array, or of an array inside a `&sync` box, is lent.** A view's count of its
+owner would be the ordinary one while another domain changes the same count atomically, so such a
+view counts nothing of the box: it may be handed to a call that borrows it or held in a local of the
+body — a field, a field of a field, the array converted where a view is wanted — and the binding the
+box was reached through keeps it alive meanwhile:
 
 ```sysl
 struct Ring
     samples: [8]i16
 
+total(xs: []const i16) -> int
+    var t = 0
+    for x in xs
+        t += x
+    t
+
 val r: &sync Ring = Ring([1, 2, 3, 4, 5, 6, 7, 8])
 val recent = r.samples[2..<5]
-print(recent.len)
+val boxed: &sync [4]i16 = [1, 2, 3, 4]
+
+print(recent.len, total(r.samples), total(boxed[1..]))
+```
+
+```output
+3 36 9
+```
+
+**A view that would get out is refused** — returned, stored anywhere the frame does not own,
+captured by a closure that is kept, or handed to a callee that holds on to it — and so is one whose
+box is reached through something that may let go of it while the view lives: a field of another box,
+a module `var`, or a local the body stores into. A `val` holding the box is the answer to the second:
+
+```sysl
+struct Ring
+    samples: [8]i16
+
+recent(r: &sync Ring) -> []i16 = r.samples[2..<5]
+
+val r: &sync Ring = Ring([1, 2, 3, 4, 5, 6, 7, 8])
+print(recent(r).len)
 ```
 
 ```error
-a slice does not record whether its owner's count is atomic, so storage inside a '&sync Ring' cannot be sliced — a view of it would take its share of the box with a count update that is not atomic. Read it by index, or walk it with 'for'
+a view of storage inside a '&sync Ring' is returned, but such a view takes no count of the box — a count update through it would not be atomic — so it may only be lent: handed to a call that borrows it, or held in a local of this body. Copy the elements into an array of their own to keep them
 ```
 
-Neither of those takes a share, so both work through the same box:
+An index and a walk take no view at all, so both work through the same box anywhere:
 
 ```sysl
 struct Ring
@@ -1693,13 +1695,15 @@ print(r.samples[3], sum)
 40 72
 ```
 
-This is the one place where a bit like the read-only one cannot help, because the two properties are
+A bit like the read-only one could not make such a view counted, because the two properties are
 not symmetric. A `[]const T` can be *made* out of a writable view by giving
 something up, which is why widening is safe and why the bit costs nothing at run time. An atomic
 count cannot be made out of a non-atomic one at all: it is fixed when the object is allocated, and a
 view claiming it would be reporting on another object's storage rather than describing itself. Rust
 divides the same properties the same way — `&[T]` carries writability in the reference, while
 `Rc<[T]>` against `Arc<[T]>` carries count discipline in the *owner's* type.
+
+## What is still refused
 
 **There is no rectangular multi-dimensional type.** `[3][3]f64` is an array of arrays and works;
 there is no distinct type with one bounds check for two indexes.
