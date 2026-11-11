@@ -46,6 +46,13 @@ gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
     var none: Buf[TVal] = buf()
 
     e.caller_exposed = exposed_in(f.body.stmts, f.body.result, none)
+
+    // What is out before the first statement runs: what the body's result lets out, which is lowered
+    // after every statement but is counted from the start rather than tracked to where it stands.
+    // Each statement adds its own as it is reached (`expose_through`).
+    var no_stmts: Buf[TStmt] = buf()
+
+    e.exposed_now = exposed_in(no_stmts, f.body.result, none)
     begin_moves(e, f.body.stmts, f.body.result)
 
     // The local every `return` hands back, where it can be built in the caller's result storage.
@@ -134,6 +141,10 @@ gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
         e.tail_target = l
         emit_term(e, InBr(l))
         emit_label(e, l)
+
+        // Going round again carries whatever the last round let out, so every address the body
+        // takes is out from its first statement.
+        e.exposed_now = exposed_in(f.body.stmts, f.body.result, none)
 
     for item in f.requires
         if !ghostly(e, item.cond) then

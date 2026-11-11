@@ -472,8 +472,12 @@ What the caller has to look at is one question with three answers:
 - a **temporary** — a call's result, a newly built object, a value out of an `if` — is a count this
   frame already took and does not give back until the statement ends, which is after the call
   returns. Nothing to do.
-- a **local or a parameter** whose address the caller never let out keeps its count in a slot nothing
-  the callee can reach has a name for. Nothing to do.
+- a **local or a parameter** whose address the caller has not let out yet keeps its count in a slot
+  nothing the callee can reach has a name for. Nothing to do. "Yet" is counted a statement at a time:
+  a buffer filled by calls and only then handed to `sort(keys.view_mut())`, which takes its address,
+  is lent on its own count for every call before the sort. A loop counts as one statement, so an
+  address its body takes is out on every round, and so is one the function's result expression takes
+  or one taken in a function that calls itself last.
 - **anything else** — a field, an element, a global, something behind a `ref` or a `&` the caller
   handed out — keeps its count in memory the call itself may write. That one costs a retain before
   the call and a release after it, and it is the only shape that does.
