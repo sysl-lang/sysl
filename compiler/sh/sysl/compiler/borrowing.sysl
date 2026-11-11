@@ -1916,6 +1916,33 @@ private exposed_stmt(out: &NameSink, s: TStmt) = s match
             out.add(op.slot)
     _ -> ()
 
+// **A local is exposed from the first statement that lets its address out, not from the top of the
+// body.** Until then no address of it exists, so nothing a call does can reach its slot: the pushes
+// that fill a buffer before `sort(b.view_mut())` hands its address on are made on a count the slot
+// holds, as they were before the view was written.
+//
+// The emitter calls this as it reaches each statement, and the statement is counted WHOLE, before
+// any of it is lowered. That is what keeps the order honest wherever the IR does not follow the text:
+// a loop is one statement, so an address its body takes is out on the second time round and on the
+// first, and so is one its condition takes; a later argument of the same call that takes the address
+// is out before the earlier argument is read; and a `defer`'s statements are out from where the
+// `defer` stands, before any exit that runs them. Each return lowers its own way out, so a way out
+// sees exactly the statements that ran before it.
+//
+// A function that jumps back to its own entry (a tail call to itself) starts out with everything it
+// exposes (`emit_func.sysl`), since an address taken late in one round may still be held in the next.
+expose_through(e: *Emit, s: TStmt)
+    if e.exposed_now.len() >= e.caller_exposed.len() then return
+
+    var one: Buf[TStmt] = buf()
+    var none: Buf[TVal] = buf()
+
+    one.push(s)
+
+    for name in exposed_in(one, None, none)
+        e.exposed_now.add(name)
+end expose_through
+
 // What a body that has not said which of its locals a call can reach exposes: everything.
 exposed_unknown() -> Set[string]
     var out: Set[string] = set()
@@ -1937,10 +1964,10 @@ held(e: *Emit, a: TExpr) -> bool = held_unless(e, a, set())
 // not still for the length of the call, however private its slot: the write would reach the callee
 // through the address a large argument crosses at, or give back the count a small one is read under.
 held_unless(e: *Emit, a: TExpr, written: Set[string]) -> bool = *a.kind match
-    // A local or parameter the caller never let the address of out.
+    // A local or parameter the caller has not let the address of out by this point (`expose_through`).
     TLoad(name, _) ->
-        !e.caller_exposed.has(OPAQUE) && !e.caller_exposed.has(name) && !is_promoted(e, name) &&
-            !written.has(name)
+        !e.caller_exposed.has(OPAQUE) && !e.exposed_now.has(OPAQUE) && !e.exposed_now.has(name) &&
+            !is_promoted(e, name) && !written.has(name)
 
     // A field of a struct held by value lies in its receiver's own storage, so it is held exactly
     // when the receiver is -- `self.noise` of a `self` read in place is the caller's snapshot. A field

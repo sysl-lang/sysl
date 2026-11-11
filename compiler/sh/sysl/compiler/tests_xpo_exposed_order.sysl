@@ -1,0 +1,295 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A by-value argument read out of a local is handed over on the count the local's slot holds, unless
+// a call could reach that slot through an address the caller let out (`borrowing.sysl`'s
+// `held_unless`). Then the caller takes a count of its own around the call: `arc.copy` before it and
+// `arc.dispose` after.
+//
+// **An address that is not out yet cannot be used**, so a local is exposed from the first statement
+// that lets its address out (`expose_through`), not from the top of the body. The shape that needed
+// it is slate's integer sort: a buffer filled by `push` in a loop, then `sort(keys.view_mut())`. The
+// view takes `&keys`, and before this every push in the loop paid a retain and a release.
+//
+// The cells: a read before the first address (no count), and every way the order in the text can
+// differ from the order things run in -- a read after it, a loop round whose body takes it after the
+// read, a loop condition that takes it, a later argument of the same call, a `defer` that runs after
+// it, a branch that took it earlier, the body's result expression taking it, and a function that
+// jumps back to its own entry. Each keeps its count. `add` writes a module `Buf[long]`, so no rule
+// but this one could lend `keys` to it as it lies.
+
+private xpo_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end xpo_ready
+
+private xpo_program() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+    import sysl.slices.sort
+
+    var spare: Buf[long] = buf()
+
+    @noinline
+    add(b: Buf[long], x: long)
+        b.push(x)
+        spare = buf()
+
+    @noinline
+    add_through(b: Buf[long], p: *Buf[long])
+        p.push(long(b.len()))
+        spare = buf()
+
+    @noinline
+    sorted_len(p: *Buf[long]) -> usize
+        sort(p.view_mut())
+        p.len()
+
+    filled_first(n: long) -> usize
+        var keys: Buf[long] = buf()
+
+        for i in 0..<n
+            add(keys, n - i)
+
+        var v = keys.view_mut()
+
+        sort(v)
+        keys.len()
+
+    added_after(n: long) -> usize
+        var keys: Buf[long] = buf()
+
+        sort(keys.view_mut())
+        add(keys, n)
+        keys.len()
+
+    in_one_loop(n: long) -> usize
+        var keys: Buf[long] = buf()
+
+        for i in 0..<n
+            add(keys, n - i)
+            sort(keys.view_mut())
+
+        keys.len()
+
+    viewed_in_condition(n: long) -> usize
+        var keys: Buf[long] = buf()
+
+        while sorted_len(&keys) < usize(n)
+            add(keys, 7)
+
+        keys.len()
+
+    later_argument(n: long) -> usize
+        var keys: Buf[long] = buf()
+
+        add(keys, n)
+        add_through(keys, &keys)
+        keys.len()
+
+    deferred(n: long) -> usize
+        var keys: Buf[long] = buf()
+
+        add(keys, n)
+        defer add(keys, 1)
+        sorted_len(&keys)
+        keys.len()
+
+    branch_first(n: long) -> usize
+        var keys: Buf[long] = buf()
+
+        add(keys, n)
+
+        if n > 2
+            sort(keys.view_mut())
+
+        add(keys, 1)
+        keys.len()
+
+    in_result(n: long) -> usize
+        var keys: Buf[long] = buf()
+
+        add(keys, n)
+        add(keys, n + 1)
+        sorted_len(&keys)
+
+    rounds(keys: Buf[long], n: long) -> usize
+        if n == 0 then return keys.len()
+
+        add(keys, n)
+        sort(keys.view_mut())
+        rounds(keys, n - 1)
+
+    main()
+        print(filled_first(5))
+        print(added_after(5))
+        print(in_one_loop(3))
+        print(viewed_in_condition(2))
+        print(later_argument(4))
+        print(deferred(4))
+        print(branch_first(3))
+        print(in_result(3))
+
+        var b: Buf[long] = buf()
+
+        print(rounds(b, 3))
+    """
+
+private xpo_ir() -> string
+    val root = make_temp_dir("sysl-xpo").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, forms_imported(xpo_program())).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end xpo_ir
+
+// Each call of `add` or `add_through` in `name`'s emitted text, in order: whether the call right
+// before it takes a count of a `Buf[long]` -- the caller's own count, held around the call.
+private xpo_guards(out: string, name: string) -> Buf[bool]
+    var said: Buf[bool] = buf()
+    var inside = false
+    var prev = ""
+
+    for line in lines_of(out)
+        if !inside && line.starts_with("define ") && mentions_as_written(line, name) then inside = true
+
+        if !inside then continue
+
+        if line == "}" then break
+
+        if line.contains("@add$$sysl(") || line.contains("@add_through$$sysl(")
+            said.push(prev.contains("@arc.copy.sysl.buf$Buf.long("))
+
+        if line.contains(" call ") then prev = line
+
+    said
+end xpo_guards
+
+// What `name`'s calls of `add` took, one letter a call: `g` for a count of the caller's own, `-` for
+// none.
+private xpo_shape(out: string, name: string) -> string
+    var s = ""
+
+    for g in xpo_guards(out, name)
+        s = s + (if g then "g" else "-")
+
+    s
+end xpo_shape
+
+@test("a local filled by calls before its address is first taken is lent on its slot's count")
+xpo_read_before_the_address()
+    if !xpo_ready() then return
+
+    val out = xpo_ir()
+
+    assert_eq(xpo_shape(out, "filled_first"), "-")
+end xpo_read_before_the_address
+
+@test("a read after the address is taken keeps the caller's count")
+xpo_read_after_the_address()
+    if !xpo_ready() then return
+
+    assert_eq(xpo_shape(xpo_ir(), "added_after"), "g")
+end xpo_read_after_the_address
+
+@test("a loop whose body takes the address after the read keeps the count on every round")
+xpo_loop_round()
+    if !xpo_ready() then return
+
+    assert_eq(xpo_shape(xpo_ir(), "in_one_loop"), "g")
+end xpo_loop_round
+
+@test("a loop whose condition takes the address keeps the count in its body")
+xpo_loop_condition()
+    if !xpo_ready() then return
+
+    assert_eq(xpo_shape(xpo_ir(), "viewed_in_condition"), "g")
+end xpo_loop_condition
+
+@test("a later argument of the same call taking the address keeps the count of the earlier one")
+xpo_later_argument()
+    if !xpo_ready() then return
+
+    assert_eq(xpo_shape(xpo_ir(), "later_argument"), "-g")
+end xpo_later_argument
+
+@test("a deferred read runs after the address is out and keeps the count; the read before it does not")
+xpo_deferred()
+    if !xpo_ready() then return
+
+    assert_eq(xpo_shape(xpo_ir(), "deferred"), "-g")
+end xpo_deferred
+
+@test("an address taken in a branch keeps the count of every read after the branch")
+xpo_branch()
+    if !xpo_ready() then return
+
+    assert_eq(xpo_shape(xpo_ir(), "branch_first"), "-g")
+end xpo_branch
+
+@test("an address the body's result takes is out from the first statement")
+xpo_result()
+    if !xpo_ready() then return
+
+    assert_eq(xpo_shape(xpo_ir(), "in_result"), "gg")
+end xpo_result
+
+@test("a function that jumps back to its own entry has every address out from the start")
+xpo_tail_self_call()
+    if !xpo_ready() then return
+
+    assert_eq(xpo_shape(xpo_ir(), "rounds"), "g")
+end xpo_tail_self_call
+
+// Built at `level` and run: every cell's answer, and a clean exit.
+private xpo_runs_at(level: string)
+    if !xpo_ready() then return
+
+    val root = make_temp_dir("sysl-xpo").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", forms_imported(xpo_program())).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, level, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            assert(false, failure_text(why))
+            return
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> assert(false, "the program that was built could not be run")
+        Ok(out) ->
+            assert_eq(out.text, "5\n1\n3\n2\n2\n1\n2\n2\n3\n")
+            assert(out.status.ok(), "the program printed what was expected and did not exit cleanly")
+end xpo_runs_at
+
+@test("every cell runs to the same answers unoptimised and optimised")
+xpo_runs()
+    xpo_runs_at("0")
+    xpo_runs_at("2")
+end xpo_runs

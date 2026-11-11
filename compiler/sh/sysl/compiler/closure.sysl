@@ -657,11 +657,20 @@ end refuse_lost_writes
 // **A write made through a closure written inside the one that holds the copy** (`via` not empty)
 // names both: the closure the write is in, and the one around it that captures by value.
 private lost_write_owed(cx: &Analyzer, at: Span, name: string, form: string, shown: string, why: string,
-                        base: string, capture: usize, via: Buf[(string, usize)]) =
+                        base: string, capture: usize, via: Buf[(string, usize)])
+    // A callee handed the copy's address is handed the box's instead. Where another domain runs the
+    // closure a `&T` may not cross, so the box is a `&sync T` there.
+    val fix =
+        if form.ends_with(handed_suffix) then
+            s"hold it as a '&$shown' (a '&sync $shown' where another thread runs the closure) and " +
+                s"hand the callee '&*$name'"
+        else s"hold it as a '&$shown' and write through it"
+
     cx.an.lost_writes.push(OwedWrite(cx.scope, at, if via.is_empty() then here else around, ", since ",
         s", so it holds a copy of '$name' — so $form would reach that copy rather than the variable it " +
-        s"came from, $why. Where you mean to change '$name', hold it as a '&$shown' and write through " +
-        "it, or have the closure return the value", base, capture, via))
+        s"came from, $why. Where you mean to change '$name', $fix, or have the closure return the value",
+        base, capture, via))
+end lost_write_owed
 
 private const here: string = "this closure captures by value"
 
@@ -792,8 +801,37 @@ private note_copy_use(a: &Analysis, scan: &CopyScan, e: TExpr)
                 if answers_a_value(ty) then
                     bump_at(&scan.uses, scan.slots, copy_root(place.unwrap()).unwrap())
             end if
+
+            note_handed_addresses(a, scan, e, name)
         TStructNew(st, args) -> if is_closure_literal(Struct(st)) then note_inner_writes(a, scan, st, args)
         _ -> ()
+
+// **A written `&x` of a capture handed to a call** (`fill(&seen)`) is the address of the closure's
+// own copy (`reference/memory.md`), so the callee writes the copy exactly as a `*self` method does.
+// The callee may only read through it as well, so the address handed out is also a read back: such a
+// call is refused only where the enclosing body uses the variable after the closure, as though the
+// callee's writes had reached it. The receiver a `*self` call takes for itself has the call's own
+// span and is `self_receiver`'s.
+private note_handed_addresses(a: &Analysis, scan: &CopyScan, e: TExpr, name: string)
+    val args = *e.kind match
+        TCall(_, args, _, _) -> args
+        _ -> return
+
+    for arg in args
+        if arg.span.start == e.span.start && arg.span.end == e.span.end then continue
+
+        *arg.kind match
+            TAddrOf(place, _) ->
+                if note_copy_write(scan, place, handed_form(a, name), arg.span) then
+                    bump_at(scan.uses, scan.slots, copy_root(place).unwrap())
+            _ -> ()
+    end for
+end note_handed_addresses
+
+// How the refusal names a call handed a capture's address: by the function as the program wrote it.
+private handed_form(a: &Analysis, name: string) -> string = s"'${shown_name(a, name)}'$handed_suffix"
+
+private const handed_suffix: string = ", which is handed its address,"
 
 // **A closure built here from this closure's captures**: each capture it is handed that it writes is
 // a write of this closure's copy where it holds that capture by reference, and one it also reads is
