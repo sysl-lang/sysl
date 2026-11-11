@@ -3,10 +3,16 @@ module sh.sysl.compiler
 import sysl.buf.{Buf, buf}
 import sysl.text.from_utf8_unchecked
 
-// How a diagnostic names a type or trait the library declares: by its simple name -- `Option[int]`,
-// `Buf[u8]`, `Display` -- unless that name could mean something else where the diagnostic is reported.
-// A type of the program's own other modules keeps its path, which is how a reader tells two of their
-// own modules' types apart.
+// How a diagnostic names a type or trait the library or a dependency declares: by its simple name --
+// `Option[int]`, `Buf[u8]`, `Display`, a package's `Vertex` -- unless that name could mean something
+// else where the diagnostic is reported. A type of the program's own other modules keeps its path,
+// which is how a reader tells two of their own modules' types apart.
+//
+// **A dependency's type is filed under its package's prefix** (`github.com.e.geo-kit.sh.e.geo.Vertex`),
+// which no file ever writes. Where such a type keeps its path, the path kept is the one its package's
+// own files declare it under and a consumer imports it by (`sh.e.geo.Vertex`), never the prefix. A
+// source root handed over with `--lib` carries no prefix, and its types are said the same way, so a
+// package reads alike whether it was fetched or stood in for.
 //
 // **Where is the file the diagnostic is reported in.** A name is kept qualified when that file can
 // see another type of the same simple name: one its own module declares (its own file-private one
@@ -32,10 +38,12 @@ names_shown(t: &Tables, scope: Scope, message: string) -> string
     var at: usize = 0
 
     for run in runs
-        if !shortened(t, scope, runs, run) then continue
+        val said = if shortened(t, scope, runs, run) then run.name else run.kept
+
+        if said.is_empty() then continue
 
         out.extend(bytes[at..<run.from])
-        out.extend(run.name.bytes)
+        out.extend(said.bytes)
         at = run.to
 
     if at == 0 then return message
@@ -45,8 +53,9 @@ names_shown(t: &Tables, scope: Scope, message: string) -> string
 end names_shown
 
 // One qualified path in a message that ends at a type: where it is, the simple name it ends in, the
-// key of the type it names, and whether it is one this rewrite may shorten -- the library's, and not
-// spelled out for an `import`. The rest are kept because they are what a shortened name would be
+// key of the type it names, whether it is one this rewrite may shorten -- the library's or a
+// dependency's, and not spelled out for an `import` -- and what it is said as where it is not
+// shortened, empty for as written. The rest are kept because they are what a shortened name would be
 // mistaken for.
 private struct TypePath
     from: usize
@@ -54,6 +63,7 @@ private struct TypePath
     name: string
     key: string
     library: bool
+    kept: string
 end TypePath
 
 // Every qualified path in a message that ends at a declared type, in the order they are written.
@@ -73,6 +83,14 @@ private type_paths(t: &Tables, message: string) -> Buf[TypePath]
         val from = i
         var last = i
 
+        // A coordinate may hold a byte no name does (`github.com.e.geo-kit`), so a package prefix
+        // written at the start of a path is taken whole before the names after it are read.
+        val prefix = prefix_at(t, b, from)
+
+        if !prefix.is_empty()
+            i += prefix.bytes.len + 1
+            last = i
+
         // A dot belongs to the path only between two names, so a sentence's full stop is not one. A
         // message may still hold a key as it was filed (`sysl.text$StrBuilder`), which the report
         // spells with a dot later (`readable_keys`), so the separator counts as one here.
@@ -81,18 +99,49 @@ private type_paths(t: &Tables, message: string) -> Buf[TypePath]
 
             i += 1
 
-        if last == from || !upper(b[last]) then continue
+        if last == from || last >= i || !upper(b[last]) then continue
 
         val name = from_utf8_unchecked(b[last..<i])
         val home = from_utf8_unchecked(b[from..<last - 1])
         val key = module_qualify(home, name)
 
-        if t.types.has(key) then
-            runs.push(TypePath(from, i, name, key,
-                               starts_with_module(home, AutoImportedModule) && !imported_after(b, from)))
+        if !t.types.has(key) then continue
+
+        val package = package_of_home(t, home)
+        val library = package != "" || starts_with_module(home, AutoImportedModule) ||
+                      holds_string(t.handed_root_modules, home)
+        val kept = if package == "" then "" else s"${home[package.bytes.len + 1..<home.bytes.len]}.$name"
+
+        runs.push(TypePath(from, i, name, key, library && !imported_after(b, from), kept))
 
     runs
 end type_paths
+
+// The package prefix written at `from`, followed by a dot and a name, or empty.
+private prefix_at(t: &Tables, b: []const u8, from: usize) -> string
+    var best = ""
+
+    for p in t.package_prefixes
+        val end_at = from + p.bytes.len
+
+        if p.bytes.len <= best.bytes.len || end_at + 1 >= b.len then continue
+        if b[end_at] != u8('.') || !name_byte(b[end_at + 1]) then continue
+
+        if from_utf8_unchecked(b[from..<end_at]) == p then best = p
+
+    best
+end prefix_at
+
+// The package prefix a type's module arrived under -- the longest one it sits below -- and empty for
+// the program's own modules and the library's.
+private package_of_home(t: &Tables, home: string) -> string
+    var best = ""
+
+    for p in t.package_prefixes
+        if p.bytes.len > best.bytes.len && home.bytes.len > p.bytes.len && home.starts_with(s"$p.") then best = p
+
+    best
+end package_of_home
 
 // Whether a path in a message may be said by its simple name.
 private shortened(t: &Tables, scope: Scope, runs: Buf[TypePath], run: TypePath) -> bool
