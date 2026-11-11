@@ -1,0 +1,183 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A pointer walked through a cast of itself (`w = *ptr_cast[**u8](w)`) lands every round on a pointer
+// of the type it started from, so the field-path analysis (`fpa.sysl`) cuts the path there, as it cuts
+// one at a struct or enum that repeats, and settles. A typed path never meets a scalar pointer twice,
+// so these cuts change no typed answer: a `***u8` read two steps in is still kept two steps in.
+//
+// The cells cross how the walk goes round (a `while`, recursion), what the walk steps over (`*u8`,
+// `*int`, two derefs a round, a struct's raw field) with what the body does with where it ends (counts
+// it, hands it back, stores it in module storage), plus the typed depth beside them, and two programs
+// built and run. Skipped: a walk through a `&T` box, which the path already stops at (M28), and one
+// through a view, which no cast can deref.
+
+private val fpw_decls: string = "var spare: u8 = 0\nvar held: *u8 = &spare\nvar held_i: *int = null\n\n" +
+    "struct Link\n    next: *u8\n    v: int\n\n"
+
+private var fpw_library_cache: Buf[Program] = buf()
+private var fpw_library_read: bool = false
+
+// The analysis of a program read with the library, so `sysl.raw.ptr_cast` can be imported.
+private fpw_of(text: string) -> Option[&Fpa]
+    if !fpw_library_read
+        fpw_library_read = true
+
+        std_root() match
+            Err(_) -> ()
+            Ok(root) -> std_units(root, host_target()) match
+                Err(_) -> ()
+                Ok(units) -> fpw_library_cache = units
+
+    if fpw_library_cache.is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return None
+
+    var units: Buf[Program] = buf()
+
+    for item in fpw_library_cache
+        units.push(item)
+
+    units.push(parse(source_of("test.sysl", "import sysl.raw.ptr_cast\n\n" + fpw_decls + text)).program)
+
+    val done = analyze_bodies(units, host_target())
+
+    assert(done.reported.is_empty(), if done.reported.is_empty() then "" else done.reported[0].diag.message)
+    Some(fpa_analyze(done.an, program_of(done, "").funcs))
+end fpw_of
+
+// -- the walk settles -----------------------------------------------------------------------------
+
+@test("a pointer walked through a cast of itself in a 'while' settles, keeping nothing it only counts")
+fpw_while_walk()
+    val got = fpw_of("count(head: *u8) -> int\n    var n = 0\n    var w = head\n    while w != null\n" +
+                     "        n += 1\n        w = *ptr_cast[**u8](w)\n    n\n\nmain()\n    spare = 1\n")
+
+    if got.is_none() then return
+
+    val fx = got.unwrap()
+
+    assert_eq(fpa_kept_text(fx, "count", 0), "")
+    assert_eq(fpa_local_text(fx, "count", "w"), "p0 p0*")
+
+@test("a pointer walked through a cast of itself by recursion settles")
+fpw_recursive_walk()
+    val got = fpw_of("depth(w: *u8) -> int = if w == null then 0 else 1 + depth(*ptr_cast[**u8](w))\n\n" +
+                     "main()\n    spare = 1\n")
+
+    if got.is_none() then return
+
+    assert_eq(fpa_kept_text(got.unwrap(), "depth", 0), "")
+
+@test("where a cast walk ends is handed back along the cut path")
+fpw_walk_answered()
+    val got = fpw_of("last(head: *u8) -> *u8\n    var w = head\n    while *ptr_cast[**u8](w) != null\n" +
+                     "        w = *ptr_cast[**u8](w)\n    w\n\nmain()\n    spare = 1\n")
+
+    if got.is_none() then return
+
+    assert_eq(fpa_answers_text(got.unwrap(), "last", 0), "*@ε ε@ε")
+
+@test("where a cast walk ends, stored in module storage, keeps the parameter itself, which covers every step in")
+fpw_walk_kept()
+    val got = fpw_of("stash(head: *u8)\n    var w = head\n    while *ptr_cast[**u8](w) != null\n" +
+                     "        w = *ptr_cast[**u8](w)\n    held = w\n\nmain()\n    spare = 1\n")
+
+    if got.is_none() then return
+
+    val fx = got.unwrap()
+
+    assert_eq(fpa_kept_text(fx, "stash", 0), "ε")
+    assert(fpa_keeps(fx, "stash", 0))
+
+@test("a walk over '*int' through '**int', begun one step in, keeps the one cut path: every depth below the first")
+fpw_int_walk()
+    val got = fpw_of("stash_i(head: *int)\n    var w = *ptr_cast[**int](head)\n    while *ptr_cast[**int](w) != null\n" +
+                     "        w = *ptr_cast[**int](w)\n    held_i = w\n\nmain()\n    spare = 1\n")
+
+    if got.is_none() then return
+
+    assert_eq(fpa_kept_text(got.unwrap(), "stash_i", 0), "*")
+
+@test("a walk two derefs a round, through '***u8', settles")
+fpw_two_deref_walk()
+    val got = fpw_of("stash2(head: *u8)\n    var w = head\n    while w != null\n" +
+                     "        held = w\n        w = **ptr_cast[***u8](w)\n\nmain()\n    spare = 1\n")
+
+    if got.is_none() then return
+
+    assert(fpa_keeps(got.unwrap(), "stash2", 0))
+
+@test("a walk through a struct's raw field, cast from the pointer it holds, settles")
+fpw_field_walk()
+    val got = fpw_of("stash_f(head: *u8)\n    var w = head\n    while w != null\n" +
+                     "        held = w\n        w = ptr_cast[*Link](w).next\n\nmain()\n    spare = 1\n")
+
+    if got.is_none() then return
+
+    assert(fpa_keeps(got.unwrap(), "stash_f", 0))
+
+// -- a typed path is not cut ----------------------------------------------------------------------
+
+@test("a '***u8' read two steps in is kept two steps in: a typed path meets each pointer type once")
+fpw_typed_depth()
+    val got = fpw_of("deep(ppp: ***u8)\n    held = **ppp\n\nonce(p: *u8)\n    held = *ptr_cast[**u8](p)\n\n" +
+                     "main()\n    spare = 1\n")
+
+    if got.is_none() then return
+
+    val fx = got.unwrap()
+
+    assert_eq(fpa_kept_text(fx, "deep", 0), "**")
+    assert_eq(fpa_kept_text(fx, "once", 0), "*")
+
+// -- built and run --------------------------------------------------------------------------------
+
+private fpw_ran(text: string) -> string
+    if std_root().is_err() || !clang_available()
+        print("skipped: the standard module's source or clang is not on this machine")
+        return "skipped"
+    end if
+
+    val root = make_temp_dir("sysl-fpw").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end fpw_ran
+
+private val fpw_count: string = "import sysl.raw.ptr_cast\n\ncount(head: *u8) -> int\n    var n = 0\n" +
+    "    var w = head\n    while w != null\n        n += 1\n        w = *ptr_cast[**u8](w)\n    n\n\n"
+
+@test("a program walking a pointer through a cast of itself builds, and counts one cell")
+fpw_ran_one()
+    val out = fpw_ran(fpw_count + "main()\n    var x: *u8 = null\n    print(count(ptr_cast(&x)))\n")
+
+    if out != "skipped" then assert_eq(out, "1\n")
+
+@test("a program walking three cells chained through casts counts three")
+fpw_ran_three()
+    val out = fpw_ran(fpw_count + "main()\n    var c: *u8 = null\n    var b: *u8 = ptr_cast(&c)\n" +
+                      "    var a: *u8 = ptr_cast(&b)\n    print(count(ptr_cast(&a)))\n")
+
+    if out != "skipped" then assert_eq(out, "3\n")

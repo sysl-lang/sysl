@@ -2033,8 +2033,24 @@ private compare_expr(cx: &Analyzer, span: Span, operands: Buf[Expr], ops: Buf[st
 
     for i in 0..<ops.len()
         val op = ops[i]
-        val a = texpr_type(ts[i])
-        val b = texpr_type(ts[i + 1])
+
+        // **Two function pointers differing only in their marks meet at the one the other stands
+        // within** (`callable_within`), as an assignment or an argument would: a function's address
+        // compared with a marked pointer is taken at that pointer's type (`pointer_retyped`), so the
+        // comparison takes no address at a type that borrows what the function keeps. The marks say
+        // only what a call through the pointer is held to, so the link compares the two addresses.
+        var a = texpr_type(ts[i])
+        var b = texpr_type(ts[i + 1])
+
+        if op != "===" && op != "!==" && cfn_of(a).is_some() && cfn_of(b).is_some() &&
+                !type_eq(repr(a), repr(b))
+            if callable_within(a, b) == Some(true)
+                ts[i] = coerce(cx, ts[i], b)
+                a = b
+            else if callable_within(b, a) == Some(true)
+                ts[i + 1] = coerce(cx, ts[i + 1], a)
+                b = a
+        end if
 
         // `===` and `!==` are the identity of two references or pointers, whatever their referent
         // defines: the machine's comparison of the addresses.
