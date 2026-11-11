@@ -1,28 +1,34 @@
 ---
 title: Memory
-summary: The three modes, ARC, weak references, places and `ref`, escape analysis, the raw tier, and device memory.
+summary: The kinds of name, the block lifetimes the compiler checks without being told, the annotations, destructors, crossing a domain, places and `ref`, and the raw tier.
 weight: 70
 ---
 
-Every value in a sysl program lives in one of three ways, and the declaration that names it is what
-says which. This page is the whole of that model: what each mode costs, what it guarantees, how a
-reference is made, when storage moves without being asked, and where the guarantees stop.
+Every value in a sysl program is named in one of a few ways, and the declaration that names it says
+which. This page is the whole of the model: the kinds of name, the lifetimes the compiler works out
+from blocks with nothing written, the few annotations that exist for code it cannot see, what a
+destructor guarantees, and where the guarantees stop.
 
 **If you do not write `*T`, you cannot segfault.** The safe subset — values, references, weak
-references, arrays, and slices — has no use-after-free, no null dereference, no out-of-bounds access,
-and no dangling pointer. The single unsafe primitive over memory is the raw pointer, and it is
-**greppable**: a program's exposure to C's hazards is exactly the lines with a `*` in the type, plus
-the subscripts it has asked by name not to check — `get_unchecked`, `set_unchecked` and an
-[`@unchecked`](/reference/arrays/#unchecked-access) block. A driver has them and an application does
-not, and you can tell which by looking.
+references, arrays and views — has no use-after-free, no null dereference, no out-of-bounds access
+and no dangling pointer. The one unsafe primitive over memory is the raw pointer, and it is
+**greppable**: a program's exposure to C's hazards is the lines with a `*` in the type, the
+`import sysl.raw.ptr_cast` lines, and the subscripts it asked by name not to check —
+`get_unchecked`, `set_unchecked` and an [`@unchecked`](/reference/arrays/#unchecked-access) block.
 
-## The three modes
+## The kinds of name
 
-| mode | what it is | who frees it | needs an allocator |
+| kind | what it is | who frees it | needs an allocator |
 |---|---|---|---|
-| `T` | a value — on the stack, in a register, or inline in something bigger | nobody; it goes when its frame or its container does | no |
+| `T` | a value — in a register, a stack slot, or inline in something bigger; copied | nobody; it goes with its block or its container | no |
 | `&T` | a counted reference to a heap object | the compiler, when the last reference goes | to **make** one |
-| `*T` | a raw machine pointer | you | no |
+| `weak T` | a reference that does not keep its object alive, read as an `Option` | — | no |
+| `&sync T` | a `&T` whose count is atomic: the one kind that may cross a domain | the compiler | to make one |
+| `*T` | a machine address | you | no |
+| `[]T`, `[]const T` | a view: owner word, address, length | its owner | no |
+
+`ref x = place` is a [declaration](#ref-a-name-for-a-place), not a kind. `Buf`, `Frozen`, `Map` and
+the other collections are library types built from these. **There is no other kind.**
 
 ```sysl
 struct Point
@@ -40,23 +46,20 @@ print(here.x, shared.x, raw.x)
 1 3 1
 ```
 
-**The choice is per declaration, not per type.** The same `struct Point` is a value in the first
-line, a heap object in the second, and a pointer's target in the third. This is C's arrangement
-rather than Swift's or Scala's, where a type is `struct` or `class` once and for all, and systems
-code depends on it: a page-table entry, a temporary in a loop, and a shared configuration object may
-all be the same type held three ways.
+**The choice is per declaration, not per type.** The same `struct Point` is a value, a heap object
+and a pointer's target above. This is C's arrangement rather than Swift's or Scala's, where a type is
+`struct` or `class` once and for all: a page-table entry, a temporary in a loop and a shared
+configuration object may be one type held three ways.
 
-**Value is the unmarked default, and the kernel is why.** A module that has given up the allocator
-cannot *make* a reference. If the reference were the bare default, the unmarked spelling would be
-the one that is illegal exactly where value semantics matter most — every kernel struct would need a
-mark, and would hit "references need an allocator" on its most natural form. With value as the
-default, `T` is usable in both worlds, `*T` covers pointers, and `&T` appears in allocator-free code
-only where something else handed one over.
+**The value is the unmarked default, because it is the only kind a kernel can use.** A module that
+has given up the allocator cannot *make* a reference, so a reference default would make the unmarked
+spelling the illegal one exactly where value semantics matter most. With `T` the default, `T` works
+in both worlds, `*T` covers pointers, and `&T` appears in allocator-free code only where something
+else handed one over.
 
-## `T` — values
+### `T` — values
 
-A value lives inline: in a stack slot, in a register, or embedded in the struct or array that
-contains it. **Assignment and argument passing copy it**, exactly as in C.
+A value lives inline. **Assignment and argument passing copy it**, as in C:
 
 ```sysl
 struct Counter
@@ -74,27 +77,18 @@ print(a.n, b.n)
 1 99
 ```
 
-There is **no move semantics and no use-after-move**. `a` is still a whole `Counter` after `b = a`,
-and it always will be — the concept of a value that has been given away does not exist here, so
-neither does the class of error built on it. Where a copy is a local's last use, the compiler hands
-the value over instead of copying it ([below](#a-count-that-would-be-taken-and-given-straight-back-is-not-taken)) —
-which changes how many counts are taken, and nothing a program can observe.
+**There is no move semantics and no use-after-move**: `a` is a whole `Counter` after `b = a`, and
+always will be. A value holding a `&T` field is still a value, and copying it **retains** that field,
+so the copy is independently safe. Where a copy is a local's last use the compiler hands the value
+over instead ([below](#a-count-that-would-be-taken-and-given-straight-back-is-not-taken)), which
+changes how many counts are taken and nothing a program can observe.
 
-A value containing a `&T` field is still a value: copying it **retains** that field, so the copy is
-independently safe and the original is untouched. That is the one thing a copy does beyond moving
-bytes, and it is what makes "values are simple" true rather than approximately true.
+### `&T` — counted references
 
-Values need no allocator and are always safe.
-
-## `&T` — counted references
-
-A `&T` is a reference to a heap object managed by **ARC**: the compiler emits the retains and
-releases, and the object is destroyed the moment the last strong reference to it goes away. It is:
-
-- **shared and freely aliased** — many references may point at one object;
-- **mutable through any alias** — there is no borrow checker and no exclusivity rule;
-- **non-null** — a `&T` always points at a live object;
-- **automatically managed** — no `free`, and no place to forget one.
+A `&T` refers to a heap object managed by **ARC**: the compiler emits the retains and releases, and
+the object is destroyed the moment the last strong reference goes. It is **shared and freely
+aliased**, **mutable through any alias** (there is no borrow checker and no exclusivity rule),
+**non-null**, and **automatically managed**:
 
 ```sysl
 struct Counter
@@ -112,154 +106,13 @@ print(a.n, b.n, a == b)
 99 99 true
 ```
 
-Compare that with the value example above: **the same two lines, and the declared mode is the only
-difference.** `b = a` copied a `Counter` there and made a second reference here.
+The same two lines as above, and the declared kind is the only difference: `b = a` copied a
+`Counter` there and made a second reference here. Two live mutable aliases are what Rust exists to
+prevent; permitting them is the deliberate trade, paid for at run time by counting, and it buys a
+language with no lifetimes written and nothing to prove to a checker.
 
-Two live mutable aliases is what Rust exists to prevent, and permitting them is the deliberate
-trade. Reference counting pays for it at run time — a retain here, a release there — and buys a
-language with no lifetimes, no borrow checker, and nothing to prove to a checker as you write.
-
-### References compare through their referent
-
-**A reference respects its referent's `Eq` and `Hash`.** `==` and `!=` on two `&T`s (or two
-`&sync T`s) compare the objects as `T` does wherever `T` has an `Eq` — written, derived, or a
-built-in's — and a `&T` hashes as `T` does wherever `T` has a `Hash`. That is what a reader expects
-of a `&Point` whose `Point` says what equal points are, and it is the rule of Rust's `&T`, and of
-every language whose objects are references until their type defines equality:
-
-```sysl
-struct Point derives Eq, Hash
-    x: int
-    y: int
-
-main()
-    val a: &Point = Point(1, 2)
-    val b: &Point = Point(1, 2)
-
-    print(a == b, a != b, a === b, a === a)
-```
-
-```output
-true false false true
-```
-
-**`===` and `!==` are identity**, always: whether two references or two pointers name the same
-object, whatever the referent's `==` says. They take two references or two pointers of one type, and
-nothing else — an integer has no identity apart from its value, and a trait object is two words
-rather than one address:
-
-```sysl
-main()
-    print(1 === 1)
-```
-
-```error
-'===' compares the identity of two references or pointers, and int is neither — '==' compares its value
-```
-
-**Where `T` has no `Eq`, a reference is its own identity**: `==` asks whether the two name the
-same object, and a `&T` hashes by the address it holds — so the two still agree. A table keyed on such
-references keys by **identity**. Two distinct objects holding equal values are two keys; the same
-object twice is one. That is what a hash-consing table wants, where a node is made once per distinct
-pair of children:
-
-```sysl
-import sysl.container.{Map, map}
-
-struct Node
-    level: int
-
-main()
-    val leaf: &Node = Node(0)
-    val twin: &Node = Node(0)
-    val made = map[(&Node, &Node), &Node]()
-
-    for k in [(leaf, leaf), (leaf, twin), (leaf, leaf)]
-        if !made.has(k) then made.put(k, Node(k.0.level + k.1.level + 1))
-
-    print(made.len(), made.get((leaf, leaf)).unwrap() == made.get((leaf, leaf)).unwrap())
-```
-
-```output
-2 true
-```
-
-A **bound** gets the same answer: inside a `[K: Hash + Eq]` body standing at `&Node`, `k.hash()`
-and `k.eq(other)` are `Node`'s own where `Node` has them and the address's where it does not, as
-`k == other` is — so a `Map[&Node, V]` keys by value or by identity exactly as `==` on two `&Node`s
-compares. A member call written on a reference you named reaches the referent's own (`r.hash()`,
-`r.eq(*s)`), the one level a member call sees through. A struct deriving `Eq` or `Hash` over a
-`&T` field, and a tuple of references, compare and hash each reference the same way.
-
-**A method the referent declares itself wins over the rule.** Where `Node` has an inherent `hash`
-or `eq` and no `Hash` or `Eq` implementation, `r.hash()` written on a `&Node` (or a `&sync Node`, or
-a `*Node`) calls that method, as any member call on a reference reaches its referent's. But an
-inherent method of that name implements nothing, so `==`, a `Map` key and a `[K: Hash + Eq]` body
-still see a `Node` with no `Eq` or `Hash`, and compare and hash the reference by its identity. Only
-an `impl Eq` or `impl Hash` (written or derived) changes what those answer.
-
-**A referent with an `Eq` and no `Hash` makes a reference that is no key**: its `==` is the
-referent's, and a hash of the address would give two equal references two hashes. It is refused
-rather than keyed wrongly:
-
-```sysl
-import sysl.container.{Map, map}
-
-struct Tag derives Eq
-    id: int
-
-main()
-    val tags = map[&Tag, int]()
-
-    print(tags.len())
-```
-
-```error
-Tag defines 'Eq' but not 'Hash', so a reference to it compares by its value and has no hash that agrees
-```
-
-**To key by identity when the referent defines equality**, wrap the reference in `ByAddress`, whose
-`Eq` is `===` and whose `Hash` is the address's:
-
-```sysl
-import sysl.container.{Set, set}
-
-struct Point derives Eq, Hash
-    x: int
-    y: int
-
-main()
-    val a: &Point = Point(1, 2)
-    val b: &Point = Point(1, 2)
-    val seen = set[ByAddress[Point]]()
-
-    seen.add(ByAddress(a))
-    print(seen.has(ByAddress(a)), seen.has(ByAddress(b)), a == b)
-```
-
-```output
-true false true
-```
-
-**A reference to a reference compares as the inner reference does**: two `& &Point`s are equal when
-the `&Point`s they reach are, which is the points' `==` — and the identity of the inner references
-where `Point` has no `Eq`. **A trait object** (`&Shape`) has no `==`: it has forgotten which type it
-holds, and with it what equal would mean.
-
-**A pointer compares by address.** `==` and `!=` on two `*T`s ask whether they hold one address, and
-a `*T` hashes by it, whatever `T` defines: a pointer is the unchecked tier's address, which is what
-`p == null` and a `p != end` walk over an array ask about, and a comparison through it would read
-storage a null or a one-past-the-end pointer does not have. There is no ordering on a reference or
-a pointer.
-
-**Its other bounds a reference meets through its referent**, wherever a member call on the
-reference would reach the referent's members: a `[C: Index[usize, int]]` body takes a `&Buf[int]`
-and reads the buffer ([generics](/reference/generics/#a-reference-meets-its-referent-s-bounds)).
-
-### There is no allocation keyword
-
-A reference is made by writing an ordinary construction **where a `&T` is expected**. The expectation
-is what puts the object on the heap:
+**There is no allocation keyword.** A construction written **where a `&T` is expected** puts the
+object on the heap, and with no expectation a construction is a value:
 
 ```sysl
 struct Process
@@ -279,54 +132,13 @@ print(p.id, q.id, v.id)
 7 8 9
 ```
 
-`Process(id, 0)` in the body allocates because the return type says `&Process`. `Process(8, 1)`
-allocates because the annotation says so. `Process(9, 2)` does not, because nothing asked — with no
-expectation at all, a construction is a value.
-
-No `new`, no `malloc`, no `Rc::new`, no `.clone()`, and no wrapper type. The positions that fix the
-expectation are the ones that already state a type for generic inference:
-
-| position | example |
-|---|---|
-| a declared local | `var p: &Point = Point(1, 2)` |
-| a parameter | `f(p: &Point)`, called as `f(Point(1, 2))` |
-| a return type | `-> &Point`, with a construction as the result |
-| a struct field | `Item("a", Node(1))` where the field is `&Node` |
-| an enum variant's payload | `Some(Node(1))` where the payload is `&Node` |
-
-An element of an array or slice, a part of a tuple, a generic argument, and a parameter of a callable
-type all ask the same way. **The rule is about the types and not about the syntax**: a `T` written
-where a `&T` is expected goes on the heap, whatever produced it.
-
-A prefix `&` on a construction was considered as an explicit mark and not taken — it would collide
-with address-of, which is a different operation producing a different type.
-
-### The expectation reaches each branch
-
-An `if`, a `match`, and a loop yield their value through their branches, so a `&T` expectation
-reaches **each branch on its own** rather than the expression as a whole:
-
-```sysl
-struct Point
-    x: int
-    y: int
-
-var origin: &Point = Point(0, 0)
-var far = true
-var p: &Point = if far then Point(9, 9) else origin
-
-print(p.x, p.y)
-```
-
-```output
-9 9
-```
-
-That is what lets a value branch and an already-reference branch meet at `&Point`. Boxing the whole
-expression instead would fail, because a branch that is already a `&Point` cannot un-become a value —
-something that is already a reference passes through untouched.
-
-It is also what lets a scalar be referenced without `int` needing a constructor of its own:
+The positions that fix the expectation are the ones that already state a type: a declared local, a
+parameter, a return type, a struct field, an enum variant's payload, an element of an array or a
+slice, a part of a tuple, a generic argument and a parameter of a callable type. **The rule is about
+types, not syntax**: a `T` where a `&T` is expected goes on the heap, whatever produced it. An `if`,
+a `match` and a loop yield through their branches, so **the expectation reaches each branch on its
+own** — a value branch and an already-reference branch meet at `&Point`, and what is already a
+reference passes through untouched. A scalar is referenced the same way:
 
 ```sysl
 var n: &int = 41
@@ -338,725 +150,85 @@ print(*n + 1)
 42
 ```
 
-### A reference is never null
+**A reference is never null.** There is no null in the safe subset; something that may be absent is
+an `Option[&T]`, and a `match` is the only route to it. A box is made from what the allocator answers,
+and a null answer **traps** before anything is stored, exactly as a failed array allocation does. The
+one `&T` that reads as null is one in storage the language did not lay out and the program zeroed
+([below](#storage-the-compiler-did-not-lay-out-may-not-hold-a-counted-value)).
 
-There is no null in the safe subset and no way to make one, so there is no null dereference to
-diagnose. Something that may be absent is an `Option[&T]`, and getting at it is a `match`:
+### References compare through their referent
+
+**`==` and `!=` on two `&T`s (or two `&sync T`s) compare the objects as `T` does wherever `T` has an
+`Eq`**, written, derived or a built-in's, and a `&T` hashes as `T` does wherever `T` has a `Hash`.
+That is Rust's `&T` rule:
 
 ```sysl
-struct Item
-    label: string
+struct Point derives Eq, Hash
+    x: int
+    y: int
 
-show(o: Option[&Item]) -> string
-    o match
-        Some(i) -> i.label
-        None    -> "(none)"
+main()
+    val a: &Point = Point(1, 2)
+    val b: &Point = Point(1, 2)
 
-var it: &Item = Item("a")
-
-print(show(Some(it)), show(None))
+    print(a == b, a != b, a === b, a === a)
 ```
 
 ```output
-a (none)
+true false false true
 ```
 
-The `match` is not ceremony around a null check. It is the only route to the item, so the absent case
-cannot be forgotten rather than merely being unwise to forget.
-
-The one place a `&T` reads as null is storage the language did not lay out and the program zeroed —
-[below](#storage-the-compiler-did-not-lay-out-may-not-hold-a-counted-value), with `is_null`, the raw
-tier's question for it, and `release`, the way such a field is emptied again.
-
-### A box whose allocation fails traps
-
-The heap can refuse. A box is made from whatever the program's allocator answers, and the answer is
-checked before anything is stored through it: a null traps, exactly as a failed array allocation does
-([arrays](arrays.md)). So a `&T` is never built over a null, which is what lets the section above say
-a reference is never null; the allocator-failure case is a trap, not a value the program must handle.
-
-### What a heap object costs
-
-Every ARC object carries **three header words**: the strong count, a pointer to the function that
-destroys it, and a weak count. Release decrements the strong count; at zero it calls through the
-hook, which releases whatever the payload holds and returns the storage to the heap the object came
-from — [one heap for the whole program](/reference/packages/#one-heap-and-the-package-that-names-it),
-libc's unless a package named another pair.
-
-Putting the destructor behind a hook rather than inline at each release site is what makes letting go
-of a reference **type-erased** — one instruction sequence, no static type. Slices need exactly that,
-since a `[]T` gives no clue what type of object its owner word points at.
-
-One word per object buys three things:
-
-- **ARC works the same everywhere.** A module that never allocates can still retain and release,
-  because the free path calls back into the heap the object came from. The operations are a few
-  instructions and depend on no runtime.
-- **Several heaps coexist.** A kernel heap, a server's heap, and an arena are different allocators,
-  and an object frees itself into the one that made it, wherever it is dropped.
-- **There is no boundary rule to learn.** Ownership crosses an allocator-free edge like any other
-  value.
-
-**Teardown is iterative, so depth is bounded.** Destroying the head of a long chain of references
-would recurse one frame per node if a destructor called the next destructor. It does not: an object
-whose count reaches zero is pushed onto a worklist, reusing its now-dead refcount slot as the link,
-and the first release to hit zero drains the list in a loop. A structure of any depth comes apart in
-O(1) stack. The worklist is **per thread**, because it is scratch space a drain uses rather than
-state anything shares.
-
-**On a freestanding target the worklist is asked for rather than assumed**, since there is no thread
-pointer to key it on. A `&sync` release that reaches zero fetches it through one weak symbol,
-`__sysl_arc_reaper`, which answers with a `head` pointer and a `draining` flag belonging to the
-running task:
-
-```c
-struct sysl_arc_reaper { void *head; unsigned char draining; };
-
-/* FreeRTOS, say: whatever this runtime keeps per task. The storage is the port's to give out and
-   must last as long as the task — set when the task is created, never shared with another:
-
-       static struct sysl_arc_reaper slots[MAX_TASKS];
-       vTaskSetThreadLocalStoragePointer(task, 0, &slots[n]);            */
-struct sysl_arc_reaper *__sysl_arc_reaper(void) {
-    return pvTaskGetThreadLocalStoragePointer(NULL, 0);
-}
-```
-
-Define nothing and the program uses the single slot it carries, which is right for a machine where
-nothing schedules — the overwhelming case, and why the symbol is weak. Define it in an RTOS port and
-`&sync T` means on that target what it means everywhere else. This is the arrangement `&sync`'s
-counts are already under there: with no `ldrex`/`strex` beneath it an atomic increment becomes a call
-to an `__atomic_*` the board defines, and on a two-core part that needs a hardware spinlock.
-
-**A scheduler written in sysl defines the hook with [`@export`](/reference/ffi/)**, as
-`__sysl_arc_reaper() -> *T` where `T` is a struct of the same two fields. The program's definition is
-then the only one: the compiler leaves its weak default out, and every drain calls the program's.
-
-```sysl build=c target=aarch64-freestanding
-struct Reaper
-    head: *u8
-    draining: u8
-
-// Whatever the scheduler keeps per task.
-extern "current_task_reaper" current_task_reaper() -> *Reaper
-
-@export("__sysl_arc_reaper")
-arc_reaper() -> *Reaper = current_task_reaper()
-
-struct Job
-    n: int
-
-@export("run_job")
-run_job(n: int) -> int
-    val job: &sync Job = Job(n)
-    job.n
-```
-
-The header is the same three words for every object whether or not anything weakly references it,
-which is what keeps the type-erased release path expressible at all. The cost is eight bytes on an
-allocation that already cost a `malloc`, and it lands only where the feature is used: values, fixed
-arrays, and `*T` buffers have no header, so allocator-free code pays nothing for a mechanism it never
-touches.
-
-### Passing a reference to a call usually costs nothing
-
-The obvious way to count a by-value argument is for the function to take a share of it on the way in
-and give it back on the way out, so that a parameter is a thing the callee owns. sysl does not do
-that, because the caller is still standing there: **an argument is handed over under a guarantee that
-it stays alive for the length of the call**, and the callee reads it through the count the caller is
-already holding. That is Swift's `guaranteed` convention and Rust's `&self` borrow, arrived at the
-same way — it is the caller, not the callee, that knows where the value came from.
-
-What the caller has to look at is one question with three answers:
-
-- a **temporary** — a call's result, a newly built object, a value out of an `if` — is a count this
-  frame already took and does not give back until the statement ends, which is after the call
-  returns. Nothing to do.
-- a **local or a parameter** whose address the caller has not let out yet keeps its count in a slot
-  nothing the callee can reach has a name for. Nothing to do. "Yet" is counted a statement at a time:
-  a buffer filled by calls and only then handed to `sort(keys.view_mut())`, which takes its address,
-  is lent on its own count for every call before the sort. A loop counts as one statement, so an
-  address its body takes is out on every round, and so is one the function's result expression takes
-  or one taken in a function that calls itself last.
-- **anything else** — a field, an element, a global, something behind a `ref` or a `&` the caller
-  handed out — keeps its count in memory the call itself may write. That one costs a retain before
-  the call and a release after it, and it is the only shape that does.
-
-**A call to an [async function](/reference/async/) is the one place the first answer changes.** Its
-task keeps a count of every parameter of its own, since its body runs after the call has returned, so
-a temporary handed to it **moves into the task**: the caller gives its count back as soon as the call
-returns instead of holding it to the end of the statement. What the task was handed goes when the
-task lets go of it — at its `return` — and not when the statement that made the call has run to its
-end. A local or a parameter handed to an async call is still the caller's, and keeps its count where
-it always does; a plain call keeps its temporaries to the end of the statement, as above.
+**`===` and `!==` are identity**, always, and take two references or two pointers of one type and
+nothing else — an integer has no identity apart from its value, and a trait object is two words:
 
 ```sysl
-struct Noisy
-    id: int
-
-impl Drop for Noisy
-    drop(self)
-        print(s"dropped ${self.id}")
-
-async keep(n: &Noisy) -> int = n.id
-
-plain(n: &Noisy) -> int = n.id
-
-async run()
-    print(s"async ${await keep(Noisy(1))}")
-    print(s"plain ${plain(Noisy(2))}")
-
-    val named: &Noisy = Noisy(3)
-
-    print(s"named ${await keep(named)}")
-    print("end of run")
-
-block_on(run())
+main()
+    print(1 === 1)
 ```
 
-```output
-dropped 1
-async 1
-plain 2
-dropped 2
-named 3
-end of run
-dropped 3
+```error
+'===' compares the identity of two references or pointers, and int is neither — '==' compares its value
 ```
 
-The third case is not a technicality. `remember` below is handed a field of module storage and then
-assigns to that very field, so the count the argument was resting on is given back **while the callee
-is still running** — and the read on the next line would be a read of freed storage if nobody else
-were holding one:
-
-```sysl
-struct Node
-    v: int
-
-struct Holder
-    r: &Node
-
-var latest: Holder = Holder(Node(0))
-
-remember(h: Holder) -> int
-    latest = h
-    h.r.v
-
-var first: &Node = Node(1)
-var box = Holder(first)
-
-print(remember(box), latest.r.v)
-```
-
-```output
-1 1
-```
-
-`box` is a local nobody took the address of, so this particular call is free at both ends; written
-`remember(latest)` it would cost the pair, for the reason above.
-
-**Nothing about this is something to write down or reason about while programming.** It is not a
-mode, it is not spelled in a signature, and two implementations of one trait method may disagree
-about it without anything noticing — the obligation is the caller's and is the same whether the
-callee is a name, a vtable slot or a function pointer. What it is worth knowing is the shape it
-rewards: a hot loop that builds values and pushes them into a container passes temporaries and
-locals, and pays no reference traffic at all for the handover.
-
-Two things a callee still takes a count for, and both are the same reason — it is about to give one
-back:
-
-- **a parameter it assigns to.** `h = other` releases whatever was in the slot, and under a borrow
-  that would be the caller's count, so a body that rebinds a parameter owns it instead.
-- **a parameter of a function something outside the program may call** — `@export`, a `@section`, or
-  one whose address is taken for a `*fn`. There is no sysl caller on the other side of those to make
-  the guarantee, so the function makes it for itself.
-
-Storing a parameter is the third, and it goes the other way round: the callee does not take a count
-for it, it is **handed** one.
-
-### A parameter the function keeps arrives with its count
-
-A function that keeps a counted parameter — stores it in a field, a global, a box, a closure or a
-container's element, returns it, or hands it on to another function that keeps it — would otherwise
-take a count at the store for a value whose caller is, as often as not, about to give its own back.
-So **such a parameter is owned**: the compiler reads each function's body (and the answers of the
-functions it calls, to a fixed point over recursion) and decides which parameters it keeps, and
-those arrive with a count the callee is responsible for. The caller supplies it the cheap way:
-
-- an argument at its **last use** — a temporary, or a local the statement names for the last time —
-  hands over the count the frame already holds, so the call costs nothing at either end;
-- any other argument is retained before the call, which is the count the store would have taken.
-
-`b.push(x)` and `Label(x)` returned through a helper are therefore free at `x`'s last use, and a loop
-that builds a value and pushes it pays no reference traffic at all. A parameter only a part of which
-is kept, and every parameter of a function that does not keep it, stays borrowed as above.
-
-**Kept means kept on every way out.** A function that keeps a parameter on some paths only — an
-interning table that stores the pair it was asked about only when the pair is new, a set's `add`
-that stores nothing for a key it already holds — leaves it borrowed, and the path that keeps it
-takes a count where it stores it. Owned, every call would pay for the count's round trip, taken by
-the caller and given back by the callee, to spare one retain on the path that keeps; and the path
-that keeps nothing is, as often as not, the one that runs. The ways out are each `return`, each `?`
-that fails, and the end of the body. A branch keeps where each of its arms does; a loop
-keeps where each `break` out of it has kept and, unless it is a `loop` that only `break` ends, where
-the code before it already had, since its body may not run; a path that traps does not leave. A call that hands the parameter on to an owned parameter keeps it, recursion included.
+- **Where `T` has no `Eq`, a reference is its own identity**: `==` asks whether the two name one
+  object, and the hash is the address's, so a `Map[&Node, V]` keys by identity — what a
+  hash-consing table wants.
+- **A bound gets the same answer**: inside a `[K: Hash + Eq]` body at `&Node`, `k.hash()` and
+  `k.eq(o)` are `Node`'s where it has them and the address's where it does not. A member call written
+  on a reference reaches the referent's own (`r.hash()`, `r.eq(*s)`). A struct deriving `Eq` or
+  `Hash` over a `&T` field, and a tuple of references, compare and hash each reference the same way.
+- **A method the referent declares itself wins at a member call, and only there.** An inherent `hash`
+  or `eq` with no `impl Hash` or `impl Eq` is what `r.hash()` calls on a `&Node`, `&sync Node` or
+  `*Node`, but `==`, a `Map` key and a bounded body still see a `Node` with neither, and use identity.
+- **A referent with an `Eq` and no `Hash` makes a reference that is no key**, and is refused rather
+  than keyed wrongly. To key by identity where the referent defines equality, wrap the reference in
+  `ByAddress`, whose `Eq` is `===` and whose `Hash` is the address's.
+- **A reference to a reference** compares as the inner reference does. **A trait object** (`&Shape`)
+  has no `==`. **A pointer compares and hashes by address**, whatever `T` defines. There is no ordering
+  on a reference or a pointer. Its other bounds a reference meets through its referent
+  ([generics](/reference/generics/#a-reference-meets-its-referent-s-bounds)).
 
 ```sysl
 import sysl.container.{Map, map}
 
-struct Node
+struct Tag derives Eq
     id: int
 
-// A hit hands back what the table holds and touches no count of `a` or `b`; only a miss takes one,
-// for each, where the pair is put in.
-intern(table: Map[(&Node, &Node), &Node], a: &Node, b: &Node) -> &Node
-    if table.get((a, b)) is Some(n) then return n
+main()
+    val tags = map[&Tag, int]()
 
-    val n: &Node = Node(a.id + b.id)
-
-    table.put((a, b), n)
-    n
-
-val table = map[(&Node, &Node), &Node]()
-val x: &Node = Node(1)
-val y: &Node = Node(2)
-var sum = 0
-
-for _ in 0..<1000
-    sum += intern(table, x, y).id
-
-print(sum, table.len())
+    print(tags.len())
 ```
 
-```output
-3000 1
+```error
+Tag defines 'Eq' but not 'Hash', so a reference to it compares by its value and has no hash that agrees
 ```
 
-Nothing about it is spelled in a signature either. A call through a closure, a function value or a
-trait object, and a call from C, reaches a borrowing entry that takes the count itself and then runs
-the owned body, so the convention is a matter between a function and its direct callers. A function
-that is `@export`ed, `async`, `@scoped` or carries a contract keeps the borrowed convention
-throughout. A library and the program built against it read the same bodies, so they agree on which
-parameters are owned.
-
-**A value whose release can run a destructor is destroyed where its scope ends**, exactly as before
-owned parameters existed. A local of a `Drop` type, or of anything holding one in a field, an element
-or a payload, is not handed to an owned parameter at its last use: the call might keep it only in its
-result, which goes at the end of the statement, while a view of what the value owns — a slice made
-through `ptr_cast` of storage a C library frees in the destructor — is still being read. Such a local
-is retained for the call instead, given back at its scope's end, and never handed into the arms of
-an `if`. Only a value nothing observable is released with — no destructor anywhere inside it — goes
-at its last use, which no program can tell apart:
-
-```sysl
-struct Tag
-    id: int
-
-impl Drop for Tag
-    drop(self) = print("drop", self.id)
-
-struct Label
-    tag: &Tag
-
-label(t: &Tag) -> Label = Label(t)
-
-show()
-    val t: &Tag = Tag(1)
-
-    print("label", label(t).tag.id)
-    print("end of show")
-
-show()
-```
-
-```output
-label 1
-end of show
-drop 1
-```
-
-`t` is at its last use in `label(t)`, and `label` keeps it in the label it returns, which goes at the
-end of the statement. The tag still goes at the end of `show`, because `t` holds its own count to
-there. A value moved somewhere that lasts — bound to a `val`, stored in a field or a global, returned
-— is destroyed by its new owner.
-
-### A count that would be taken and given straight back is not taken
-
-Binding a call's result to a `val`, or returning a local through an `if` or a `match`, moves a value
-from one owner in the frame to another: the new owner takes a share and the old one gives its share
-back at the end of the statement or scope. On a `&sync T` each of those is an atomic operation on a
-count every thread shares, so a value copied up a recursive search would pay two contended atomics
-per level for a count that ends where it began. **The compiler drops such a pair.** A retain is
-cancelled against a later release of the same reference when nothing between them can give back the
-count that release would have given back:
-
-- loads and stores of the frame's own slots, arithmetic, and other retains never can;
-- the release of a different value may run a destructor, which is arbitrary code, but it cannot reach
-  a slot of this frame whose address never left it. So it may sit between the pair, unless the stretch
-  between them also writes to memory outside those slots;
-- any other call ends the stretch.
-
-Where the pair would be split by the arms of an `if` or a `match`, the releases at the end of the scope
-are given back at the end of each arm instead, so that the arm which returns a local takes no count
-for it. A count therefore never reaches zero at a different point, and **no destructor runs earlier,
-later or in a different order** than it would with every count taken. Nothing about it is visible
-except the time it saves: on a recursive search over a tree of `&sync` shapes it removes three of every
-four atomic operations.
-
-**A value's last use hands it over.** Where what is stored, bound, returned or made a branch's value
-is a count the frame was about to give back — a fresh box, a call's result, or a local the statement
-names for the last time in its scope — the destination takes that count instead of a new one, and
-the give-back is never emitted. A struct or enum built on the spot is handed over field by field, so
-`Some(Node(n))` and `Pair(x, 1)` at `x`'s last use cost no count at all. A local still read later,
-named in a `defer`, used inside a loop it was declared outside of, or reached through an address or a
-`ref` is copied as before. One whose life ends in an `if` with an `else` is handed into each arm, so
-an arm that uses it last moves it and the others give it back where they end — unless its release
-can run a destructor, which keeps it to its scope's end (see
-[owned parameters](#a-parameter-the-function-keeps-arrives-with-its-count)).
-
-```sysl
-struct Tag
-    id: int
-
-impl Drop for Tag
-    drop(self) = print("drop", self.id)
-
-struct Hit
-    t: int
-    tag: &sync Tag
-
-probe(t: int, tag: &sync Tag) -> Option[Hit] = Some(Hit(t, tag))
-
-pick(near: bool) -> Option[Hit]
-    val x = probe(1, Tag(1))
-    val y = probe(2, Tag(2))
-    if near then x else y
-
-show(near: bool)
-    val h = pick(near)
-    print("got", h.unwrap().t)
-
-show(true)
-show(false)
-```
-
-```output
-drop 2
-got 1
-drop 1
-drop 1
-got 2
-drop 2
-```
-
-### A view of something the frame already holds takes no count
-
-A slice of a slice retains the owner, and a `val` copied out of a field retains what it refers to.
-Where the value it was read from is a **parameter or a `val`** — written once, in a slot nothing
-outside the function can reach — that value's own count already keeps the object alive, and **a
-share taken from it and given back before it is given back its own is dropped**, however far apart
-the two are: across a `for` that walks the view, or the rest of a loop's round. A view taken every
-time round a loop then costs nothing:
-
-- the parent must stay put: a `var` assigned in the loop, or one whose address is taken, keeps every
-  count;
-- a view that leaves the function, or is stored anywhere but a local, keeps its count;
-- **a count can be looked at**, so nothing between the share and its return may look: storage is let
-  go of by `slot_vacate` only where the strong count is one, and a view whose share had been dropped
-  would leave it free to give back slots the view still reads. So the stretch may hold arithmetic,
-  reads of locals and of fields and elements, and calls to functions that release nothing and write
-  nothing but their own locals; any other call, and any other release (a destructor is code too),
-  keeps the count.
-
-The parent's count holds the object from before the share is taken until after it would have been
-given back, so the object's count never reaches zero inside, nothing inside reads it, and **no
-destructor moves**. Below, `sums` takes no count at all; `label`'s `print` is a call that could, so
-`t` keeps its share there.
-
-```sysl
-import sysl.buf.{Buf, buf}
-
-struct Tag
-    id: int
-
-impl Drop for Tag
-    drop(self) = print("drop", self.id)
-
-struct Shelf
-    tag: &Tag
-
-sums(src: []const u8, most: usize) -> u32
-    var t: u32 = 0
-    var i: usize = 0
-
-    while i + most <= src.len
-        val here = src[i..<i + most]
-
-        for x in here
-            t += u32(x)
-
-        i += most
-
-    t
-
-label(s: Shelf, rounds: int)
-    for k in 0..<rounds
-        val t = s.tag
-        print("round", k, t.id)
-
-var b: Buf[u8] = buf()
-
-for k in 0..<10
-    b.push(u8(k))
-
-print(sums(b.view(), 5))
-label(Shelf(Tag(7)), 2)
-print("done")
-```
-
-```output
-45
-round 0 7
-round 1 7
-drop 7
-done
-```
-
-### A share of something read out of storage takes no count while nothing can move
-
-The same goes for a reference read out of **storage** rather than out of a local: a field of the
-object a parameter refers to, an element of a buffer, the payload of the enum a `match` is looking at.
-A `val` bound to one, a tuple or struct built of them on the spot, and a key handed to a lookup each
-take a count and give it back at the end of their statement or scope; **where nothing between the
-two can give a count back, look at one, or hand the thread to other code, neither is taken**. That is
-what makes a map keyed by a tuple of references cost what a map keyed by numbers costs: the key built
-for `get`, and the stored key each probe compares it with, are read and never counted.
-
-- the stretch may hold what the rule above allows: arithmetic, reads, and calls to functions that
-  release nothing and write nothing but their own locals. Any other call or release keeps the count;
-- a path that ends the program is held to the same rule, since the count is missing while it runs
-  too: a function that never comes back counts by what it does before the end, not as nothing. What
-  such a path may call besides is C — the report `unwrap` or a bounds check prints, `exit`, the trap —
-  as long as nothing C could call back into (an `@export`, a `@section` function, one whose address
-  was taken) releases anything. A function that never comes back and is handed **only numbers** —
-  or arrays, structs and enums made of them: `exit`, `trap`, the report behind a `Buf`'s index — is
-  not asked even that: whatever it, or C calling back, releases on the way out, no frame holding the
-  uncounted value ever runs again;
-- a call that may write memory is judged by **the type of what it writes**: a field read through a
-  pointer, `vm.stack` with `vm: *Machine`, is handed to `vm.stack.push(vm.stack[i])` with no count
-  of its own, since growing a `Buf[Value]` writes the buffer's storage and lets go of an array of
-  `Value`s, neither of which can hold a `Machine`;
-- an `await` keeps it too, since another task may run there and write the storage;
-- a value that is returned, stored, captured by a closure, or handed to a function that keeps it
-  keeps its count. A tuple or struct built on the spot for such a call is **handed over whole**: the
-  call costs one copy of it, not a copy for the call and a second for the parameter.
-
-The reference is alive when the count would have been taken, and nothing in the stretch can lower a
-count, so it stays alive to the end of it, whoever else holds it — the storage need not stay put, and
-the count is the same afterwards as with both taken. Another thread reaches the same storage only
-under its lock, and taking or giving back a lock is a call that ends the stretch. As above, **no
-destructor moves**: below, the tags drop where they did when every count was taken.
-
-```sysl
-import sysl.buf.{Buf, buf}
-import sysl.container.{Map, map}
-
-struct Tag
-    id: int
-
-impl Drop for Tag
-    drop(self) = print("drop", self.id)
-
-struct Pair
-    a: &Tag
-    b: &Tag
-
-joined(m: Map[(&Tag, &Tag), int], tags: Buf[&Tag]) -> int
-    var n = 0
-
-    for i in 0..<tags.len() - 1
-        if m.get((tags[i], tags[i + 1])) is Some(v) then n += v
-
-    n
-
-ends(pairs: Buf[Pair]) -> int
-    pairs[0] match
-        Pair(a, b) -> a.id * b.id
-
-var tags: Buf[&Tag] = buf()
-
-for i in 1..3
-    tags.push(Tag(i))
-
-var m: Map[(&Tag, &Tag), int] = map()
-
-m.put((tags[0], tags[1]), 10)
-m.put((tags[1], tags[2]), 20)
-print(joined(m, tags))
-
-var pairs: Buf[Pair] = buf()
-
-pairs.push(Pair(tags[0], tags[2]))
-print(ends(pairs))
-tags.clear()
-m.clear()
-print("kept by the pair")
-pairs.clear()
-print("done")
-```
-
-```output
-30
-3
-drop 2
-kept by the pair
-drop 1
-drop 3
-done
-```
-
-### A method's answer borrowed from its receiver
-
-The rule above stops at a call: `n.kids match Some(q) -> …` reads the field and takes no count, but a
-method `quad(self) -> Kids = self.kids.unwrap()` that does the same reading hands back a **copy**, a
-count taken for every reference in it, which the caller gives back when it is done. **A function whose
-answer is read out of a parameter's storage is called so that the caller reads it there instead**, and
-the two spellings below cost the same — no count at all in either walk:
-
-```sysl
-struct Node
-    level: int
-    kids: Option[Kids]
-
-    quad(self) -> Kids = self.kids.unwrap()
-
-struct Kids
-    nw: &Node
-    ne: &Node
-    sw: &Node
-    se: &Node
-
-leaf() -> &Node = Node(0, None)
-
-by_method(n: &Node) -> int
-    if n.level == 0 then return 1
-
-    val q = n.quad()
-
-    by_method(q.nw) + by_method(q.ne) + by_method(q.sw) + by_method(q.se)
-
-by_match(n: &Node) -> int = n.kids match
-    Some(q) -> by_match(q.nw) + by_match(q.ne) + by_match(q.sw) + by_match(q.se)
-    None -> 1
-
-val l = leaf()
-val top: &Node = Node(1, Some(Kids(l, l, l, l)))
-
-print(by_method(top), by_match(top))
-```
-
-```output
-4 4
-```
-
-Nothing is written to ask for it; the compiler works out from the body what an answer is made of:
-
-- **a place of a parameter** — a field, a field of a field, an element of a fixed array or of a buffer
-  the parameter holds, the payload a `match` binds where every other arm ends the program, or the
-  answer of another such method on such a place (`self.kids.unwrap()`). Where the body is one such
-  expression, the call reads the value where it lies;
-- **+0 from a parameter** — a value built on the spot out of references read from its storage and
-  nothing else: `Some(it)` for an element `it` of `self.items`, a struct or a tuple of fields. Such a
-  function is called so that it hands the references over without a count of its own, and the caller
-  counts them only where it has to.
-
-```sysl
-import sysl.buf.{Buf, buf}
-
-struct Item
-    key: int
-    value: int
-
-impl Drop for Item
-    drop(self) = print("drop", self.key)
-
-struct Table
-    items: Buf[&Item]
-
-    find(self, key: int) -> Option[&Item]
-        for it in self.items
-            if it.key == key then return Some(it)
-
-        None
-
-look(t: &Table, k: int) -> int = t.find(k) match
-    Some(it) -> it.value
-    None -> 0
-
-drained(t: &Table) -> int
-    val it = t.find(2)
-
-    t.items.clear()
-    print("cleared")
-    it.unwrap().value
-
-val t: &Table = Table(buf())
-
-for i in 1..3
-    t.items.push(Item(i, i * 10))
-
-print(look(t, 1) + look(t, 3))
-print(drained(t))
-```
-
-```output
-40
-drop 1
-drop 3
-cleared
-drop 2
-20
-```
-
-`look` takes no count of the item it reads, and neither does `find` for the one it answers. In
-`drained` the stretch ends at `clear`, which releases what the buffer held, so the answer's count is
-taken at the call and the item outlives the buffer's hold on it, exactly as it did when every count
-was taken. The stretch is the one above, and **what keeps the count is the same list**: a release, a
-write that may reach the storage, a call into anything that might do either, an `await`, a lock, or
-using the answer in a way that keeps it — storing, returning, capturing or handing it to a function
-that keeps it.
-
-A function keeps the ordinary call — an answer with its count — where:
-
-- **some path answers a reference made there** (`if c then Some(self.one) else Some(Item(9, 90))`);
-- **the body may release or write what it answers**, or calls anything that might: reading an
-  element and then clearing the buffer it came from. The body has to release nothing the caller
-  could be relying on, so that what it read is still held by the storage when it returns;
-- **no body is in sight**: a call through a trait object or a function value, an `extern`, a function
-  a library already compiled. These are the defaults every inferred fact here keeps (see
-  [where no body is in sight](#where-no-body-is-in-sight-the-call-borrows)).
-
-A generic is decided per instantiation: `get(self) -> Option[T]` answers `+0` for `T = &Item` and
-holds nothing to count for `T = int`. Nothing about any function's type changes, so none of this is
-visible except in the time it saves and in what `--explain-borrows` reports
-([the CLI](/getting-started/cli/#explain-borrows)):
-
-```
-$ sysl build --explain-borrows table.sysl
-table.sysl:13:5: 'Table.find' answers +0 from 'self': self.items.walk()[_]
-table.sysl:19:1: 'look' is not borrowed: its answer is a fresh value
-table.sysl:23:1: 'drained' answers a place of 't': t.items.walk()[_].unwrap().value, but its body may write or release what it was handed
-```
-
-## `weak T` — breaking cycles
-
-Reference counting has one honest weakness: a cycle of strong references keeps itself alive. A parent
-holding its children while each child holds its parent is the shape that does it, and it is common
-enough in systems code — a back-link in an intrusive list, a process's pointer to its parent — to
-have a purpose-built answer.
-
-A **`weak T` does not keep its referent alive.** When the last strong reference goes, the object is
-destroyed and every weak reference to it becomes empty.
+### `weak T` — breaking cycles
+
+A cycle of strong references keeps itself alive — a parent holding its children while each child holds
+its parent. **A `weak T` does not keep its referent alive**: when the last strong reference goes the
+object is destroyed and every weak reference to it becomes empty.
 
 ```sysl
 struct Node
@@ -1078,16 +250,18 @@ print(parent_of(root), parent_of(kid))
 (none) root
 ```
 
-**`weak T` is a type, not an operator.** There is nothing that makes one; a `&T` becomes a `weak T`
-wherever a `weak T` is what the context asked for — the struct field above, an argument, a declared
-local, a returned value. That is the same rule that makes a `&T` out of a `T`, so both `&` and `weak`
-live at the boundaries a program annotates and neither appears in a body.
-
-The conversion goes one way. A `weak T` is not a `&T` and never silently becomes one, because
-becoming one is the operation that can fail.
-
-**The `&` is in the mode already, so `weak &T` is the word said twice** — and it is refused rather
-than read as a weak edge to a box holding a reference, which is not a thing sysl has:
+- **It is a type, not an operator.** A `&T` becomes a `weak T` wherever a `weak T` is what the context
+  asked for, and never the other way: becoming a `&T` is the operation that can fail.
+- **Reading one is a question, `get()`**, answering `Option[&T]` with a count taken for the caller.
+  No field, method or `==` is reached through a weak reference directly.
+- **An empty one is written `None`** — the weak reference's own empty value, not an `Option` — and it
+  is the **zero value** of `weak T`, so a struct with a weak field still has one. `None` is also the
+  only default a `weak T` parameter can have: anything naming an object would have to outlive every
+  frame.
+- **`weak &T` says the mode twice**, and **`weak sync T` is refused**: upgrading an atomic weak
+  reference is a compare-and-swap loop against a count another thread may be driving to zero.
+- Everything a `&T` may point at — a struct, a scalar, an array, a generic instance, a trait object, a
+  type parameter — may be held weakly.
 
 ```sysl
 struct Node
@@ -1101,59 +275,9 @@ var w: weak &Node = r
 'weak Node' is already a weak edge to a counted Node, so the '&' says the mode a second time — write 'weak Node'
 ```
 
-**Reading one is a question, and it is `get()`.** The answer is `Option[&T]`: a live strong reference
-with a count taken for the caller, or `None`. Nothing else may be done to a weak reference — no field
-selection, no method call, no `==`:
-
-```sysl
-struct Node
-    label: string
-    parent: weak Node
-
-var root: &Node = Node("root", None)
-var kid: &Node = Node("kid", root)
-
-print(kid.parent.label)
-```
-
-```error
-may be gone, so nothing is read off one directly
-```
-
-Every road to the object goes through the `Option`, which is what makes "a weak reference never
-dangles" a fact about the language rather than a promise about the programmer.
-
-The parentheses are not decoration. `.len` is a **property** — a fact about the value, the same answer
-every time it is asked — while `get()` is a **question about the world**: two calls a moment apart may
-disagree, and the answer costs a count. sysl puts the parentheses on the second kind.
-
-**An empty weak reference is written `None`**, and it is the same state whether the object is gone or
-there never was one. This `None` is not an `Option` — it is the empty value of the weak reference
-itself, chosen because it is exactly what `get()` will hand back for it.
-
-It is also the **zero value** of `weak T`, which is the one place `weak T` parts company with `&T`:
-there is no such thing as a reference to nothing, so `&T` has no zero. A struct with a weak field
-therefore still has one, and an uninitialized declaration of it is still a declaration:
-
-```sysl
-struct Node
-    label: string
-    parent: weak Node
-
-var n: Node
-
-n.parent.get() match
-    Some(p) -> print("held")
-    None    -> print("empty")
-```
-
-```output
-empty
-```
-
-**A weak reference may not be made from a value with nowhere else to live.** Constructing into a weak
-position would box the value and then weaken it, leaving the weak edge as the object's only holder —
-and the object dead before the statement ended:
+**A weak reference may not be made from a value with nowhere else to live**: boxing a construction
+straight into a weak position would leave the weak edge its only holder, and the object dead before
+the statement ended.
 
 ```sysl
 struct Node
@@ -1169,44 +293,15 @@ print(kid.label)
 a weak reference does not keep Node alive, and nothing else here holds this one
 ```
 
-**The only default a `weak T` parameter can have is `None`**, and that falls out rather than being
-decided. A default is produced afresh at each call that omits it, in a scope holding none of the
-caller's locals, so what it names would have to outlive every frame — and every candidate that names
-an *object* is closed off. A construction is refused by the rule above; a top-level `var` is a local
-of the entry point; and a module-level `val` counts nothing, which a reference does. What is left is
-the one value that holds nothing:
+### `&sync T`, `*T` and `[]T`
 
-```sysl
-struct Node
-    label: string
-    parent: weak Node
+**`&sync T` is a `&T` with an atomic count**, a distinct type with no conversion either way, chosen
+where the object is allocated. It is the only kind that may cross a concurrency domain
+([below](#crossing-a-concurrency-domain)).
 
-adopt(child: string, parent: weak Node = None) -> string
-    parent.get() match
-        Some(p) -> child + " of " + p.label
-        None    -> child + " of nobody"
-
-var root: &Node = Node("root", None)
-
-print(adopt("a"), adopt("b", root))
-```
-
-```output
-a of nobody b of root
-```
-
-**`weak sync T` is refused**, naming the concurrency chapter. Upgrading an atomic weak reference is a
-compare-and-swap loop against a count another thread may be driving to zero underneath it, and that
-is written when there is something to race with.
-
-Everything a `&T` may point at, a `weak T` may be taken of: a struct, a scalar, an array, a generic
-instantiation, a trait object, and a type parameter.
-
-## `*T` — the raw pointer
-
-`*T` is a bare machine pointer, exactly like C's: no length, no count, no checks, manual lifetime. It
-is the only unsafe primitive over data, it needs no runtime, and it is how a kernel, a driver, or an
-allocator's own internals are written.
+**`*T` is C's pointer**: no length, no count, manual lifetime. The address of the frame's own storage
+is checked by the lifetime rules below; past that it is the [raw tier](#the-raw-tier), which carries
+C's whole surface because a subset would only mean a kernel that could not be written here.
 
 ```sysl
 bump(n: *int)
@@ -1223,455 +318,96 @@ print(counter)
 42
 ```
 
-**Anything C can do through a pointer, sysl can.** The pointer is where the language's guarantees
-stop, so it carries C's whole surface rather than a safer subset of it — a subset would only mean a
-kernel that could not be written here.
-
-### `null` exists, and only here
-
-`null` is the absent raw pointer. It has no type of its own and takes the `*T` its context expects,
-the way a bare `None` takes its type argument:
+**A view is three words**: `{ owner, ptr, len }`, 24 bytes on a 64-bit target. `ptr` and `len` name
+the range and **`owner` keeps the bytes alive**, since sysl has no collector to find an object from an
+interior pointer. Taking a view of heap storage retains, dropping one releases, slicing stays O(1),
+and a view of heap storage survives the buffer growing or being dropped:
 
 ```sysl
-struct Node
-    value: int
-    next: *Node
+tail() -> []int
+    var xs: []int = [1, 2, 3, 4]
 
-var third = Node(3, null)
-var second = Node(2, &third)
-var first = Node(1, &second)
+    xs[2..]
 
-var walk = &first
-var total = 0
+var t = tail()
 
-while walk != null
-    total += walk.value
-    walk = walk.next
-
-print(total)
+print(t.len, t[0], t[1])
 ```
 
 ```output
-6
+2 3 4
 ```
 
-That program is also the answer to "how does a type reach itself" — see [recursive
-types](#recursive-types) below.
+**`owner` is null when there is nothing to keep alive** — a view of static data, of a `*T` region, or
+of a local fixed array — and retaining or releasing such a view is a no-op, so allocator-free code
+slicing a static or stack buffer pays nothing. A view of a local array is the case the compiler checks
+([escape analysis](#escape-analysis)). A `string` is exactly an **immutable, validated `[]u8`**, with
+one representation and one implementation.
 
-**A generic parameter is a context like any other, and it answers late.** A callee still being
-solved has no type at that position yet, so an argument with none of its own is set aside until the
-ones that have have been read, and is then taken against the parameter it turned out to stand at:
+### Library types: a `Buf` is a shared handle
+
+`Buf[T]` is a handle to a counted block, so **assigning a `Buf` makes a second name for the same
+buffer**, as assigning a `&T` does, and a `push` through either is seen through both:
 
 ```sysl
-two[T](a: *T, b: *T) -> bool = a == b
+import sysl.buf.{Buf, buf}
 
-var x: int = 3
+var a: Buf[int] = buf()
+val b = a
 
-print(two(&x, null), two(null, &x))
-```
+b.push(1)
 
-```output
-false false
-```
-
-Either order answers alike, because waiting is not queueing. Setting an argument aside cannot lose
-the solution — one with no type of its own has nothing to contribute to it — so the parameter is
-settled by the other arguments or by nothing at all. **Nothing at all is refused rather than
-defaulted**: a call with no other argument to read is asked what the pointer points at.
-
-```sysl
-one[T](a: *T) -> bool = true
-
-print(one(null))
-```
-
-```error
-'null' takes its type from its context, and there is none here
-```
-
-### Arithmetic: two directions, one spelling each
-
-```sysl
-var buf: [8]int = [10, 20, 30, 40, 50, 60, 70, 80]
-var base = &buf[0]
-var third = &buf[2]
-
-print(*third, third - base, base - third, *(&base[3]))
-```
-
-```output
-30 2 -2 40
-```
-
-**`p - q` between two pointers of the same pointee is an `isize`, and it counts elements**, not bytes
-— C's `ptrdiff_t`. It is signed because the order of the operands is the programmer's, and it is the
-exact inverse of `&p[n]`: indexing takes an address and a count to an address, and the difference
-takes two addresses back to a count, both striding by the pointee.
-
-It is here because the interior-pointer half of libc needs it. `memchr`, `strchr`, `strrchr`,
-`strstr` and `memmem` all hand back a pointer *into* a buffer the caller owns, and without a
-difference every one of them is callable and useless, because nothing could turn the answer into an
-index.
-
-**Offsetting stays `&p[n]`.** `p + n` is not spelled, deliberately: indexing already exists and
-already strides by the pointee, and a second spelling for one address would be a second thing to keep
-in step. `p + q` names no address and is refused too.
-
-**Two pointers of different pointee types have no shared element to count**, and are refused by the
-ordinary matching-types rule rather than by one of this operator's own:
-
-```sysl
-var n = 1
-var c = 'x'
-var pn = &n
-var pc = &c
-
-print(pn - pc)
-```
-
-```error
-'-' needs matching types, got *int and *char
-```
-
-**A counted `&T` has no arithmetic at all**, keeping the equality it always had and nothing more:
-
-```sysl
-struct Point
-    x: int
-
-var a: &Point = Point(1)
-var b: &Point = Point(2)
-
-print(a - b)
-```
-
-```error
-operator '-' is not defined for &Point
-```
-
-Arithmetic is a property of the unsafe mode, not of holding an address.
-
-Whether two pointers into unrelated objects may be subtracted is the programmer's business, as `p[i]`
-past the end already is.
-
-### Bounds safety follows length, not pointers
-
-The out-of-bounds hazard is governed by whether a value **carries its length**, independently of
-where it was allocated:
-
-- **arrays and slices carry their length**, so indexing is bounds-checked in every context — hosted
-  or allocator-free, over static, stack, or heap memory — except where the program has asked by name
-  for the check to be left out ([unchecked access](/reference/arrays/#unchecked-access));
-- **`*T` carries no length**, so it is the one primitive that cannot be checked. `p[i]` reads the `i`th element
-  and `p[0..<n]` views `n` of them, both exactly as C does and both unchecked, because there is no
-  length to check against and supplying one is the programmer's assertion. A pointer to something
-  with a subscript of its own — a `*[N]T`, or a `*Buf[T]` and any other type indexed through a trait
-  — is indexed as that thing, with its check
-  ([Arrays](/reference/arrays/#a-raw-pointer-is-indexed-anyway)).
-
-So even low-level, allocator-free code stays bounds-safe by *choosing* slices, and reaches for `*T`
-where it must — an MMIO window, a page table, a buffer a C function filled. That choice is the point.
-
-## Places
-
-A **place** is something with an address: a local or parameter, a dereference, an **element**, and a
-field of any of them. Everything else — a call result, an arithmetic result, a freshly built struct —
-is a value with no address of its own, and `&` in front of one *makes* it a place rather than
-refusing it; [Addressing a value](#addressing-a-value) below is that rule.
-
-| operation | what it does |
-|---|---|
-| `&place` | yields a **`*T`** — C's address-of, with C's result |
-| `&value` | writes the value into a hidden local of this scope, and yields a **`*T`** to that |
-| `*p` | reads through a `*T` or a `&T`, and is itself a place |
-| `p.f` | selects, dereferencing **one** level automatically on both `*T` and `&T` |
-
-**`&` on a place yields a raw pointer, never a reference.** A place lives in a frame or inside
-another object, so there is no count to take a share of. Reaching a `&T` means being handed one or
-constructing one, and taking the address of a local is therefore inherently in the unsafe tier —
-which is right, because it can dangle and nothing promotes it.
-
-**Selection is the only implicit dereference, with the subscript of an indexable pointee.** `p.x` is
-`(*p).x` and `p.x = 9` writes through the pointer — Go's rule, with no `->` — and `p[i]` on a pointer
-to an array or a container is `(*p)[i]`. Matching a reference to an enum against its variants is `match *e`.
-
-**The shorthand stops at one level**, so reaching through a `**T` is written:
-
-```sysl
-struct Point
-    x: int
-    y: int
-
-var p = Point(1, 2)
-var pp = &p
-var ppp = &pp
-
-print(pp.x, (*ppp).x)
+print(a.len(), b.len())
 ```
 
 ```output
 1 1
 ```
 
-Leaving the step out is a diagnostic rather than a second implicit dereference, and it says how many
-levels are left:
+A `Map` and a `Deque` are handles the same way. A buffer crosses a domain
+only [frozen](#a-frozen-buffer-crosses).
+
+## Lifetimes are blocks
+
+A `*T` is a type, so once one exists it can be carried anywhere — which is wrong for the address of a
+local, good only until its block closes. Nothing in a type says how long storage lives. What the
+compiler can see is what each body **does** with each address and view, so it works that out, and
+**nothing is written for any of it**: no lifetime parameter, no `@escaping`, no "this result views
+that argument" marker. The rules are twelve, and each section below is one of them.
+
+### A block's local lives as long as its block
+
+**Frame storage ends with its block.** Frame storage is a local, a by-value parameter or `(self)`, or
+a field or element of one; its block is the innermost one declaring it — a function body, an `if` or
+`else` arm, a `match` arm, a `for`, `while` or `loop` body, a nested block. A loop body's local is a
+new variable every turn. **A temporary ends with its statement.**
+
+So the address of a block's local may not be kept anywhere still there after the block — a local of an
+enclosing block, a field of one, a buffer an enclosing block holds, a closure stored in one — however
+it gets there: through a local, a struct or variant built around it, a closure that captures it, a
+call that answers it, a callee that stores it into what another argument points at, or a block or
+`break` that yields it.
 
 ```sysl
-struct Point
-    x: int
-    y: int
+run()
+    var spare = ""
+    var q = &spare
 
-var p = Point(1, 2)
-var pp = &p
-var ppp = &pp
+    if true
+        var s = "abc".copy()
 
-print(ppp.x)
+        q = &s
+
+    print(*q)
 ```
 
 ```error
-selection reaches through one level of indirection and **Point has more
+'&s' is the address of 's', a local of the 'if' block, and it is kept in 'q', which outlives that block — keep the value itself, or declare 's' where 'q' is declared
 ```
 
-Assignment, compound assignment, and `++`/`--` all take a place, so the same three forms work on a
-variable, on a field, and through a pointer with nothing special said about any of them.
-
-**An element carries one wrinkle the other three do not.** A slice's elements and a pointer's live
-wherever the storage is, which is somewhere the expression naming them is not, so they have an
-address whether or not the expression naming them does. That is what makes `rows(g)[i] = v` write
-through to the grid rather than into the view the call handed back. An **array's** elements *are* the
-array, so they are places exactly when the array is. A string's bytes are never one: writing a byte
-of UTF-8 is how a string stops being UTF-8, and that is refused as immutability rather than as the
-absence of an address.
-
-The hazard on the other side of that rule is the one dangle a **single statement** can produce. If a
-temporary view is the only holder of its buffer, the buffer is released at the end of the statement,
-and `&f()[i]` is a pointer to freed storage before the next line runs. That is the unsafe tier
-behaving as advertised — `&` yields a raw pointer, a raw pointer can dangle, nothing promotes it —
-and it is called out because every other dangle needs the pointer to be carried somewhere first.
-
-## Addressing a value
-
-`&` in front of something with no address of its own does not refuse — it **makes** the storage. The
-value is written into a hidden local of the scope the `&` stands in, and what comes back is that
-slot's address:
-
-```sysl
-trait Shape
-    area(self) -> int
-
-struct Rect
-    w: int
-
-impl Shape for Rect
-    area(self) -> int = self.w
-
-var s: *Shape = &Rect(2)
-
-print(s.area())
-```
-
-```output
-2
-```
-
-So `&Rect(2)` is `var t = Rect(2)` and `&t` with the name left out, and the name is the only thing
-it leaves out: the slot is laid down for the frame, the count a counted value carries is taken
-exactly as a `var`'s initializer takes one, and it is released where the scope ends.
-
-**Any value, not only a construction.** `Rect(2)` and `make()` are the same expression as far as the
-language is concerned — a call — so a rule that took one and refused the other could only be stated
-as "you may address a constructor call but not a function call". A literal and an arithmetic result
-are the same case again:
-
-```sysl
-mid(p: *int) -> int = *p
-
-var a = 3
-var b = 4
-
-print(mid(&1), mid(&(a + b)))
-```
-
-```output
-1 7
-```
-
-**It is storage rather than a copy handed out to be read**, so a program may write through it, and
-the write is there when the pointer is read again:
-
-```sysl
-var p: *int = &1
-
-*p = 9
-
-print(*p)
-```
-
-```output
-9
-```
-
-**The operand is evaluated once**, at the `&`, and not again per use of the pointer:
-
-```sysl
-var calls = 0
-
-next() -> int
-    calls += 1
-    7
-
-var p: *int = &next()
-
-print(*p, *p, calls)
-```
-
-```output
-7 7 1
-```
-
-**The scope is the one the `&` was written in**, so a pointer carried out of that scope is stale —
-which is the raw tier behaving as advertised rather than a hole this form opens. The same pointer can
-be had by naming the local yourself and taking its address, and neither is checked in general — what
-a `*T` promises is spelled out above, and it is not lifetime. The one route that is checked is the
-function's own answer, below.
-
-**A name is answered rather than copied.** `&x`, `&t.f`, `&xs[i]` and `&*p` are asking for *that
-thing's* address, so they go on meaning what they always did — and go on being refused where what
-they name has no address. A **property** is the case that makes this a rule rather than a detail:
-`t.f` at a property and `t.f` at a field are one spelling, and handing the first a pointer into a
-copy would make a write through it go nowhere while looking exactly like a write that lands.
-
-```sysl
-struct Temp
-    c: int
-
-    f -> int = self.c * 9 / 5 + 32
-
-var t = Temp(0)
-var p = &t.f
-
-print(*p)
-```
-
-```error
-something with an address
-```
-
-A constant is the same shape and the same answer: `&capacity` reads as storage and there is none,
-while `&8` — the value it stands for, written out — makes a slot like any other value does.
-
-**Module storage has no such scope, and is refused.** An initializer there runs in a prologue, so the
-slot would be that prologue's frame and the pointer would be stale by the program's first statement:
-
-```sysl
-struct Rect
-    w: int
-
-static var p: *Rect = &Rect(2)
-
-print(p.w)
-```
-
-```error
-module storage has no such scope
-```
-
-Give the value a name that lasts the run instead, and take the address of that:
-
-```sysl
-struct Rect
-    w: int
-
-static var r: Rect = Rect(2)
-static var p: *Rect = &r
-
-print(p.w)
-```
-
-```output
-2
-```
-
-### An address of the frame's own storage is not an answer
-
-A parameter passed by value — `(self)` among them — and a local `var` live in the function's frame,
-and the frame is gone the moment the function returns. So **the address of one, or of a field or an
-element of one, may not be what a function returns**: whether it is the body's value, a `return`'s,
-the tail of an `if` or `match` arm, or wrapped in `ptr_cast`. A `(self)` method handing out a field is
-the usual way to write it by accident, since `self` reads like the caller's value and is a copy:
-
-```sysl
-import sysl.raw.ptr_cast
-
-struct Rec
-    a: int
-    b: int
-
-struct Ev
-    rec: Rec
-
-    key(self) -> *u8 = ptr_cast(&self.rec)
-```
-
-```error
-the address of 'self' is returned, but '(self)' is a copy of the receiver in this frame, and its storage ends when the function returns — return the value itself, or take '*self', so the address is of the caller's value
-```
-
-Storage reached **through** a pointer or a reference is wherever the address points, which is the
-caller's to keep alive, so `*self`, `&self`, a `*T` or `&T` parameter and an element of a `[]T` are all
-fine — as is module storage, which outlives every frame:
-
-```sysl
-struct Rec
-    a: int
-    b: int
-
-struct Ev
-    rec: Rec
-
-    key(*self) -> *int = &self.rec.b
-
-var e = Ev(Rec(1, 2))
-val p = e.key()
-
-*p = 9
-print(e.rec.b)
-```
-
-```output
-9
-```
-
-`&make()` makes a slot in the frame (§ Addressing a value), so returning it is refused the same way.
-What is checked is the result only: a pointer to a local stored into module storage or into a struct
-somewhere else is still the raw tier's bargain.
-
-**Inside the function, a local lasts as long as its block**, not the whole frame, so the address of
-an inner block's local may not be kept in a local of the block around it (§ A block's local lives as
-long as its block):
-
-```sysl
-run(c: bool) -> int
-    var m = 1
-    var p = &m
-
-    if c
-        var n = 41
-
-        p = &n
-
-    *p + 1
-
-print(run(true))
-```
-
-```error
-'&n' is the address of 'n', a local of the 'if' block, and it is kept in 'p', which outlives that block — keep the value itself, or declare 'n' where 'p' is declared
-```
-
-**What a block lets go of when it closes is what its locals hold**: a `Buf`'s elements, the object a
-`&T` names, a value with a `Drop`. A pointer into that storage is refused where it is read after the
-block, since the storage may be freed by then:
+**What a block lets go of when it closes is what its locals hold** — a `Buf`'s elements, the object a
+`&T` names, a value with a `Drop` — so a pointer into that storage is refused where it is read after
+the block:
 
 ```sysl
 import sysl.buf.{Buf, buf}
@@ -1695,887 +431,693 @@ print(run())
 'p' points into storage 'b' holds, and 'b' was let go of where its block ended — so this would read freed memory
 ```
 
-**The `&` in a type is a different thing, and neither is a way of writing the other.** `&T` is a
-counted box, which owns what is in it; the operator takes an address, which owns nothing. So a box
-is not made by writing the operator in front of a value — it is made by the value arriving where a
-`&T` is wanted, with no operator at all:
+**Inside the block, and into it, the address is free**: a local of the same block or a deeper one may
+hold it, a borrowing callee may be handed it, and an enclosing block's local may be pointed at from
+inside. What leaves the block by value is a copy, and is never refused.
+
+### The entry file's statements are the outermost block
+
+**The top-level statements of the file a program starts in are the program's outermost block**, and
+their locals live until the program exits: that frame is laid down before anything else runs and given
+back only as it ends. So it is the one body the outliving rules pass over — its locals' addresses may
+be stored in module storage, and a plain `spawn` may borrow them — and every other frame is held to
+them:
 
 ```sysl
-trait Shape
-    area(self) -> int
+static var held: *int = null
 
-struct Rect
-    w: int
+var n = 41
 
-impl Shape for Rect
-    area(self) -> int = self.w
-
-var s: &Shape = &Rect(2)
-
-print(s.area())
-```
-
-```error
-an address is not a way of making a box
-```
-
-Which is the whole of the fix — the same program with the operator dropped:
-
-```sysl
-trait Shape
-    area(self) -> int
-
-struct Rect
-    w: int
-
-impl Shape for Rect
-    area(self) -> int = self.w
-
-var s: &Shape = Rect(2)
-
-print(s.area())
-```
-
-```output
-2
-```
-
-## `ref` — a name for a place
-
-A place can be deep, and until `ref` the two ways to shorten one both cost something.
-`var t = self.tasks[i]` binds a **copy**, so every read and every write walks the path from the table
-again; `&self.tasks[i]` gives the name back and gives up bounds checking, `within` checking,
-invariant re-checking, and the guarantee at the top of this page, all in one step. That is a cliff
-rather than a gradient.
-
-**`ref` binds a name to a place.**
-
-```sysl
-struct Task
-    state: int
-    prio: int
-
-struct Kernel
-    tasks: [4]Task
-
-    advance(*self, i: usize)
-        ref t = self.tasks[i]
-
-        t.state = 2
-        t.prio = t.prio + 1
-end Kernel
-
-var k = Kernel([Task(0, 7); 4])
-
-k.advance(2)
-
-print(k.tasks[2].state, k.tasks[2].prio, k.tasks[0].prio)
-```
-
-```output
-2 8 7
-```
-
-**The place is evaluated once**, where the binding is written — the index is computed once, the bounds
-are checked once — and what the name means afterwards is the storage that was found, not the
-expression that found it. A later `i += 1` leaves `t` naming the element it always named. Scala's
-by-name parameter is the thing this is *not*: `x: => T` re-evaluates at every use, which would save
-no check and would silently make `t` follow a later change to `i`.
-
-### It is a declaration, never a type
-
-This is the whole of why it can exist in a language with no borrow checker. `ref` may be written
-**only as a local declaration**. There is no `ref` type, so a ref cannot be a field, a parameter, an
-element, or a type argument; it cannot be re-pointed at a second place once bound; it cannot be
-captured by a closure; and it does not outlive the block that declares it. The one place `ref` is
-written beside a type is a method's result, `-> ref T`, and that is not a type either: it says the
-call **is a place**, which the caller names with a `ref` of its own or writes through at once
-([A member that answers a place](#a-member-that-answers-a-place)).
-
-A ref *of* a ref is not a re-pointing and is ordinary — one more name for the place the first one
-stands for, with the walks following through it:
-
-```sysl
-var xs: [3]int = [1, 2, 3]
-
-ref a = xs[1]
-ref b = a
-
-b = 42
-
-print(xs[0], xs[1], xs[2])
-```
-
-```output
-1 42 3
-```
-
-That restriction is what keeps the compiler's knowledge complete. A `*T` is a type, so the moment one
-exists it can be carried somewhere the compiler has lost the path it came from. A ref never travels,
-so the analyzer still holds the place expression, at the point it was written, in the same body.
-
-**At run time a ref stores an address. At compile time it remembers a place.** Both halves are
-load-bearing. The address is what makes sixty-five path walks one. The remembered place is what keeps
-every check a `*T` would have severed:
-
-- a write through the ref re-runs the `invariant` clauses of every struct the place lies inside,
-  found by the same outward walk, because the walk still has the whole place to walk;
-- a ref into a `val`, or into an element of one, is read-only, since reaching into read-only storage
-  keeps the property;
-- a ref to a `within`-constrained slot is checked on assignment exactly as the slot is;
-- and the bounds check a subscript owes is paid once, at the binding, rather than not at all.
-
-A ref is therefore **not a fourth memory mode**. It introduces no representation, no new type, and
-nothing that can be stored: it is a second way to *say* a place the three modes already describe.
-
-### What may be written
-
-**A ref's initializer must be a place**, and a call result has no address for the name to mean:
-
-```sysl
-make() -> int = 7
-
-demo()
-    ref x = make()
-
-    print(x)
-
-demo()
-```
-
-```error
-'ref' names a place — a local, a field, an element, or a dereference — and this expression has no address for 'x' to name
-```
-
-**A ref inherits the place's writability and gets no modifier of its own.** A ref into a `val` may be
-read and not written, exactly as the `val` may. Stating it twice would only create the chance to
-state it wrong.
-
-**A user type's subscript is a place when the type implements `IndexPlace`**, whose method answers
-the element's address: `b[i]` is `*b.index_place(i)`, a dereference, so a ref names the element
-where it lives. `Buf` is one ([arrays](/reference/arrays/)). Through `Index` alone the subscript is a
-call answering a value, and there is nothing there for a name to mean.
-
-```sysl
-import sysl.buf.{Buf, buf}
-
-struct Item
-    block: u64
-    data: Buf[u8]
-
-var items: Buf[Item] = buf()
-
-items.push(Item(1, buf()))
-
-ref t = items[0]
-
-t.block = 41
-t.block += 1
-
-print(items[0].block)
+held = &n
+print(*held + 1)
 ```
 
 ```output
 42
 ```
 
-**The place must lie in storage something holds past the statement** — a local, a parameter, module
-storage, or what a `*T` points at. A place inside a call's answer is inside a temporary, released at
-the end of the statement while the name would live on:
+### A borrowed pointer cannot escape
+
+**An address or a view of frame storage outlives its block when it is:**
+
+- **returned**, directly or inside whatever carries it back;
+- **stored anywhere the block cannot show is its own** — module storage, the heap, a field reached
+  through a pointer it did not make, a buffer's slot;
+- **handed to a parameter that keeps it**;
+- **captured by a kept closure**;
+- **held by a task not awaited, or a thread not joined, inside the block** — a call of an `async`
+  function is accepted only where its task is awaited or `block_on`'d before the lending frame ends
+  ([a task holds its arguments](/reference/async/#a-task-holds-its-arguments-until-it-ends)), and a
+  thread that borrows a frame is started [on a scope](#a-thread-borrows-a-frame-only-inside-a-scope).
+
+**Unknown means foreign**, and outliving is refused, except that a frame array or a closure box moves
+to the heap instead ([escape analysis](#escape-analysis)). The rule, asked at the call:
+
+> The address of storage that is not the program's to give away — a local, a parameter's place, a
+> field of a value in the frame, a value made in place — may not be passed to a parameter that keeps it.
 
 ```sysl
-import sysl.buf.{Buf, buf}
+struct Registry
+    last: *int
 
-fresh() -> Buf[int]
-    val b: Buf[int] = buf()
+    remember(*self, p: *int)
+        self.last = p
 
-    b.push(5)
-    b
-
-ref t = fresh()[0]
-
-t += 1
+run(r: *Registry)
+    var n = 5
+    r.remember(&n)
 ```
 
 ```error
-'t' would stand on a place inside a value nothing holds — a temporary, released at the end of this statement while the name lives on
+'remember' keeps its parameter 'p' (it is stored in 'self.last'), and '&n' is the address of a local of 'run'
 ```
 
-Bind the answer with `val` first and the `ref` to a place inside that.
-
-### The one rule: what may move underneath it
-
-A stored address is only as good as the storage staying where it is. C# has ref locals and needs no
-rule like this, because a tracing collector keeps the old array alive when the variable is pointed at
-a new one. sysl has no collector in this tier, so the same program would dangle:
-
-```sysl
-struct Table
-    cell: []int
-
-    swap(*self)
-        ref e = self.cell[0]
-
-        self.cell = [0; 8]
-
-        print(e)
-end Table
-
-var t = Table([1, 2, 3])
-
-t.swap()
-```
-
-```error
-'e' is a 'ref' standing on storage this assignment would release, so the name would be left pointing at freed memory
-```
-
-**While a ref is live, no step of its place that could come to name different storage may be
-assigned, and no mutating method may be called on a prefix of one.** The check is decided from types
-(and, for a call, from what the callee's body writes), and never asks where the ref is *used* —
-which is the question that would need lifetimes.
-
-Which steps are hazards falls out of the model rather than being a list, and **the discriminator is
-ownership, not indirection.** Only a step that *releases* something when it is overwritten can strand
-a ref:
-
-| step | hazard? | why |
-|---|---|---|
-| a `&T` | **yes** | overwriting it drops what it held, and that release may be the last |
-| a view (`[]T`) | **yes** | the same — a view owns its buffer |
-| a `*T` | no | a raw pointer owns nothing, so `p = q` frees nothing |
-| a field, a fixed array, or an element of one | no | that storage *is* the enclosing object's bytes |
-
-Two words carry the rule, and between them they keep the set small. A step is held still when it is
-an **owning** step that the path goes **through** — so the place itself is never in the set, because
-an assignment to it is what writing through the ref *is*. `ref r = h.node` names the slot, so
-`r = other` and `h.node = other` are one statement written two ways and neither is refused, while
-`h = other` on a `&Holder` is.
-
-The `*T` exclusion is not a concession. A program that reaches its tables through a `*Self` receiver
-has no owning step anywhere in its chains, so it is asked for nothing at all — which is exactly the
-`advance` above, where the rule costs the program nothing.
-
-The mutating-call half is the conservative one, deliberately. A `*self` method may write any part of
-its receiver, so a live ref into that receiver is refused the call whether or not that particular
-method reassigns anything:
-
-```sysl
-struct Table
-    cell: []int
-
-    grow(*self)
-        self.cell = [0; 8]
-
-var t = Table([1, 2, 3])
-
-ref e = t.cell[0]
-
-t.grow()
-
-e = 5
-```
-
-```error
-'e' is a 'ref' standing on storage this call could release, since a '*self' method may write its receiver
-```
-
-Deciding otherwise would mean reading the callee's body, and a module compiles against its imports'
-signatures and never their bodies. The cost is one refusal in a program that could have written the
-ref one line later.
-
-**A closure that holds the variable by reference writes it when it runs, so a call that runs one
-writes it too.** The closure's own body is in hand wherever it is built, so here the check reads it:
-a call that is handed the closure — directly, through a local, a `&Fn` or a struct holding one, or
-inside another closure — or that calls it is refused while a ref stands through an owning step the
-closure writes:
-
-```sysl
-struct Node
-    v: int
-
-struct Holder
-    node: &Node
-    count: int
-
-call(f: &Fn() -> unit) = f()
-
-main()
-    var h = Holder(Node(1), 0)
-    ref r = h.node.v
-
-    call(() -> h = Holder(Node(2), 0))
-    print(r)
-```
-
-```error
-'r' is a 'ref' standing on storage this call could release, since a closure it runs writes 'h'
-```
-
-A closure that writes only storage the ref does not stand through — `h.count += 1`, or `h.node.v`
-itself — is run without complaint, and so is one called after the ref's block has closed.
-
-**A container's storage moves under a `@relocates` member, whatever its receiver mode.** A `Buf`
-is a handle, so its `push` takes `self` and still reallocates what the handle points at. Each member
-that can move the storage or give an element up is marked, and the mark is what the check asks:
-
-```sysl
-import sysl.buf.{Buf, buf}
-
-var b: Buf[int] = buf()
-
-b.push(1)
-
-ref first = b[0]
-
-b.push(2)
-first = 5
-```
-
-```error
-'first' is a 'ref' standing on an element whose storage 'push' could move or give up, since it is '@relocates'
-```
-
-**A `*T` taken by `&` into the same storage is held to the same rule, for as long as it is live.**
-`&b[0]` is the address `ref first = b[0]` stands on, so a `@relocates` member, a `*self` call on the
-owner, and an assignment that replaces the owner are refused while the pointer — or a copy of it, or
-an address computed from it — is still to be used. A pointer has no block of its own, so what counts
-is its **last use** on any path the body can take, a later turn of a loop and a `defer` included:
-
-```sysl
-import sysl.buf.{Buf, buf}
-
-run() -> int
-    val b: Buf[int] = buf()
-
-    b.push(41)
-
-    val p = &b[0]
-
-    for i in 0..<100 do b.push(i)
-
-    *p + 1
-
-print(run())
-```
-
-```error
-'p' is a pointer to an element whose storage 'push' could move or give up, since it is '@relocates', and it is used after this call
-```
-
-Once the last use is behind it, the storage may move freely:
-
-```sysl
-import sysl.buf.{Buf, buf}
-
-run() -> int
-    val b: Buf[int] = buf()
-
-    b.push(41)
-
-    val p = &b[0]
-    val first = *p
-
-    b.push(first + 1)
-    b[1]
-
-print(run())
-```
-
-```output
-42
-```
-
-A `defer` that reads the pointer is a use on every way out of its block — the end, a `break`, a
-`continue`, a `return` and a `?`. A pointer kept in a local aggregate — a struct, a tuple, an
-`Option`, an array, a `Buf` of pointers — is followed through it and refused where it is taken out
-and used; so is one into what a match arm, an `is` test or a `for` loop bound out of a value made
-for it, which is let go of where the arm or the turn ends.
-
-**A function handed the buffer is asked what its body does with it.** One that calls a
-`@relocates` member on a parameter — or hands the parameter on to a function that does — may move
-what it is handed there, so a pointer into that argument may be neither handed to the same call
-nor used after it:
-
-```sysl
-import sysl.buf.{Buf, buf}
-
-grow_and_read(p: *int, b: Buf[int]) -> int
-    for i in 0..<100 do b.push(i)
-
-    *p
-
-run() -> int
-    val b: Buf[int] = buf()
-
-    b.push(41)
-    grow_and_read(&b[0], b)
-
-print(run())
-```
-
-```error
-this pointer is a pointer into storage this call also hands 'grow_and_read', which could move or give it up, since it calls '@relocates' 'push' on its parameter 'b'
-```
-
-**The check is otherwise local, for a pointer as for a ref's path**: it sees the `&`, the path
-written after it, and the calls and assignments on that path in the same body. A second name for
-the buffer (`val b2 = b`, then `b2.push(…)`, or a binding out of a place matched on), a callee
-reached through a trait object or a function pointer, and an aggregate handed to a call are not
-followed. A view of the buffer is not a pointer into it: the view keeps the storage it was made
-from, so a `*T` into `b.view()` outlives a push. A ref's place may also be rooted at a pointer, and
-whether *that* points anywhere is the raw tier's ordinary bargain.
-
-**Writing a value that holds an owning step by value writes the step too.** With `h` a local `H`,
-`h = H(…)` replaces `h.node` as surely as `h.node = …` does, so it is refused on the same terms.
-
-**A second name for the same object is held to the rule as well.** A `&T` or a `Buf` may be held
-under many names, and whether two of them name one object is a run-time fact, so the question is
-asked of **types**: while a ref stands inside storage that a value of type `T` holds, writing storage
-held in any `T` other than along the ref's own path is refused. Here `n` is a second name for
-`h.node`:
-
-```sysl
-struct Node
-    cell: []int
-
-struct H
-    node: &Node
-
-var h = H(Node([1, 2, 3]))
-
-ref e = h.node.cell[0]
-
-val n = h.node
-
-n.cell = [7; 8]
-e = 5
-```
-
-```error
-'e' is a 'ref' standing on storage held in a 'Node', and this assignment writes one that may be the same object by another name
-```
-
-**A call is asked what its callee's body can write.** One that may write a value of such a type —
-directly, or through anything it calls — is refused while the ref is live; one that only reads, or
-writes only its own locals and types unrelated to the ref's storage, is not. A call through a closure
-or a trait object names no body to ask, so it is refused. A function with no body in the program — a
-library's already compiled, or a foreign one — was compiled without the program's types, so it is
-judged by what it can get hold of: it is refused when one of its arguments can reach such a value,
-when module storage it can name holds one, or when code it can run casts a pointer to a type holding
-one. The same answer clears a callee whose body ends in such a function, as `print` and `read_bytes`
-do.
-
-**What a callee can run is what it reaches**: its own body, every body it calls, and every
-destructor, since letting go of a value may run one. A call through a pointer or a trait object
-anywhere in that could run anything, so there every cast and all module storage in the program
-count. A foreign function the program or a package declares may call back into the program through
-whatever C can enter — an `@export`, a `@section` function, one whose address is taken, one with a
-foreign calling convention — so calling one reaches all of those, and all module storage, whose
-address C may hold. **The standard library's own `extern`s are the exception**: they are the C
-library and the runtime, which never call back into the program, so a `ptr_cast` somewhere else in it
-is no reason to refuse a call to `read_bytes`. Here `first` makes a `*Vm` out of bytes, and `print`,
-which cannot run `first`, is still asked nothing about it while `e` is live:
+A function that reads and writes through what it is handed, and passes it only to callees that only
+use it, keeps nothing, and the address of anything may be passed to it — **every `*self` method called
+on a local is checked this way**, and almost all of them keep nothing.
+
+**Returning the frame's own storage is refused** — whether it is the body's value, a `return`'s, an
+arm's tail, or wrapped in `ptr_cast`. `(self)` is a copy in the frame, so a `(self)` method handing out
+a field's address is the usual way to write it by accident. Storage reached **through** a pointer or a
+reference — `*self`, `&self`, a `*T` or `&T` parameter, an element of a `[]T` — is the caller's to
+keep alive, as module storage is, and may be answered. `&make()` makes a slot in the frame
+([addressing a value](#addressing-a-value)), so returning it is refused the same way.
 
 ```sysl
 import sysl.raw.ptr_cast
 
-struct Node
-    cell: []int
-
-struct Vm
-    node: Node
-
-first(p: *u8) -> int = ptr_cast[*Vm](p).node.cell[0]
-
-var vm = Vm(Node([1, 2, 3]))
-
-ref e = vm.node.cell[1]
-
-print("held", e)
-e = 5
-print(first(ptr_cast(&vm)), vm.node.cell[1])
-```
-
-```output
-held 2
-1 5
-```
-
-```sysl
-struct Node
-    cell: []int
-
-struct H
-    node: &Node
-
-alias(n: &Node) = n.cell = [0; 8]
-
-var h = H(Node([1, 2, 3]))
-
-ref e = h.node.cell[0]
-
-alias(h.node)
-e = 5
-```
-
-```error
-'e' is a 'ref' standing on storage held in a 'Node', and 'alias' may write a 'Node'
-```
-
-A second handle on a `Buf` is the same case: `val b2 = b` makes `b2.push(…)` a `@relocates` call on
-the buffer a `ref r = b[0]` stands in, and it is refused with the `@relocates` message.
-
-**A callee that reaches a `@relocates` member on a buffer of that type writes it too**, wherever it
-got the buffer: handed it, handed a copy of the handle (which is the same buffer), from module
-storage, or through a pointer a cast made out of bytes. The member's write lands in the buffer's
-storage rather than in anything holding the handle by value, so it is the mark that answers, as it
-does for a call in the ref's own body. A view is not held to this: it keeps the storage it reads
-alive, so a callee growing the buffer under it is accepted.
-
-```sysl
-import sysl.buf.{Buf, buf}
-
-grow(b: Buf[int])
-    for i in 0..<64 do b.push(i)
-
-var b: Buf[int] = buf()
-
-b.push(1)
-
-ref first = b[0]
-
-grow(b)
-first = 5
-```
-
-```error
-'first' is a 'ref' standing on storage held in a 'Buf[int]', and 'grow' may write a 'Buf[int]'
-```
-
-What stays open is everything that cannot be the ref's storage: other fields of the ref's own object
-reached along its path (`h.node.count = 2` beside `ref e = h.node.cell[0]`), values of unrelated
-types, calls whose bodies only read, and anything at all once the ref's block has closed:
-
-```sysl
-struct Node
-    cell: []int
-    count: int
-
-struct H
-    node: &Node
-
-look(n: &Node) -> int = n.count + 1
-
-var h = H(Node([1, 2, 3], 0))
-
-if true
-    ref e = h.node.cell[1]
-
-    h.node.count = 2
-    e = look(h.node)
-
-val n = h.node
-
-n.cell = [7; 2]
-print(n.cell, h.node.count)
-```
-
-```output
-[7, 7] 2
-```
-
-**What this does not make safe is a `*T`**, as above: a ref rooted at a raw pointer, or storage
-reached through a reinterpreting cast, is the raw tier's ordinary bargain.
-
-### A ref to a slot that holds a reference
-
-`ref r = self.node`, where `node` is a `&Node`, names the **slot**, not the object in it. So the
-binding takes no count — nothing new holds the object — and `r = other` is the assignment
-`self.node = other` by another name, releasing what was there and retaining what arrives, in that
-order. Reading `r` produces the reference and takes a count for the reader exactly as reading the
-field would.
-
-The distinction matters because the other reading is available and wrong: if binding retained, a ref
-would be a `&T` with extra steps, and the count it took would keep an object alive past the write
-that replaced it.
-
-### A member that answers a place
-
-A method can say its call **is a place**: `-> ref T`. Its body comes to a place reached through a
-parameter, and every call of it is that place in the caller — written through at once, named by a
-`ref`, or read, which reads a copy:
-
-```sysl
-struct Task
-    state: int
-    prio: int
-
-    bump(*self) = self.prio += 100
-
-struct Kernel
-    tasks: [4]Task
-
-    task(*self, i: usize) -> ref Task = self.tasks[i]
-
-var k = Kernel([Task(0, 7); 4])
-
-k.task(2).state = 2
-
-ref t = k.task(1)
-
-t.prio += 1
-k.task(0).bump()
-
-val copy = k.task(2)
-
-k.task(2).state = 9
-
-print(k.tasks[2].state, t.prio, k.tasks[0].prio, copy.state)
-```
-
-```output
-9 8 107 2
-```
-
-**It is the same `ref`, written in the callee.** The compiler keeps the body's place as a template over
-the member's parameters, and a caller's walks go on through it with the call's arguments put in: a
-`ref` bound to `b.at(0)` holds `b.items` still exactly as a `ref` bound to `b.items[0]` does, so every
-hazard of [the one rule](#the-one-rule-what-may-move-underneath-it) is refused through a method too:
-
-```sysl
-import sysl.buf.{Buf, buf}
-
-struct Bag
-    items: Buf[int]
-
-    at(*self, i: usize) -> ref int = self.items[i]
-
-var b = Bag(buf())
-
-b.items.push(1)
-
-ref first = b.at(0)
-
-b.items.push(2)
-first = 5
-```
-
-```error
-'first' is a 'ref' standing on an element whose storage 'push' could move or give up
-```
-
-A second `*self` call of the member while such a `ref` stands is a `*self` call like any other, and is
-refused when the `ref`'s path goes through storage the receiver owns (a `Buf`'s, a `&T`'s).
-
-**What the body may be.** Its last expression and nothing else is the answer — a field chain, an
-element, a dereference — reached from a parameter or module storage, and leaving the parameter's own
-bytes on the way: through a `*self` receiver, a reference, a view, a container's element, a `*T`.
-Each of these is refused, with what to write instead:
-
-- a field of a by-value `self`, or a local: the storage is the call's, gone when it returns;
-- a value (`self.a + 1`), or a place chosen by an `if`: there is no one address to answer;
-- a `return` or a `?` in the body: they leave with a value;
-- a place inside a struct with an `invariant`: a write through the answer lands in the caller,
-  where nothing walks out to the clause.
-
-```sysl
-struct Pair
+struct Rec
     a: int
+    b: int
 
-    get(self) -> ref int = self.a
+struct Ev
+    rec: Rec
+
+    key(self) -> *u8 = ptr_cast(&self.rec)
 ```
 
 ```error
-'Pair.get' would answer a place in storage of its own call — a by-value parameter or a local — which is gone when it returns
+the address of 'self' is returned, but '(self)' is a copy of the receiver in this frame, and its storage ends when the function returns — return the value itself, or take '*self', so the address is of the caller's value
 ```
 
-**Where it may be written.** On a type's own member, inherent or generic (`Grid[T].at(x, y) -> ref T`
-answers an element at every instantiation, `&Node` slots included). Not on a free function, not in a
-trait, and not on an `impl` member a trait declares: a call through a trait object names no body to
-read the place from.
-
-**The address is never a value.** `&k.task(0)` and `&Kernel.task` are refused — either would carry the
-address where the compiler has lost the place.
-
-### Where it comes from
-
-The form is old and lives outside this language's usual references, none of which have it. **Ada's
-`renames`** is the general case and evaluates the name once at the declaration; **Fortran's
-`ASSOCIATE`** is the closest in shape, being block-scoped and deliberately not a type; **C#'s `ref`
-locals** are the closest in spelling. C# also shows what the restriction is worth: having added ref
-returns and ref fields, it spent several releases building the escape analysis that keeping the form
-local avoids entirely.
-
-## Recursive types
-
-A type may reach itself **through an indirection**, and only through one. `next: *Node` is
-pointer-sized and legal, as is `next: Option[&Node]`; a struct holding itself by value has no finite
-size:
+**Storing through an out-parameter is the caller's to judge**, but the address of a function's own
+local written through any out-parameter — or through a pointer read out of one — outlives it:
 
 ```sysl
-struct Node
-    value: int
-    next: Node
-
-print(1)
+leak(out: **int)
+    var n = 1
+    *out = &n
 ```
 
 ```error
-type 'Node' contains itself, so it has no finite size
+'&n' is the address of a local of 'leak', and it is stored in '*out', which outlives 'leak' — store the value itself, or storage that lasts
 ```
 
-The rule is **per cycle rather than per field**: a cycle is legal as soon as one edge on it is a `*T`,
-a `&T` or a `[]T`, so mutually recursive types work as long as the loop passes through one of the
-three somewhere. A slice is on that list because it is a pointer and a length — it *points at* its
-elements rather than holding them — while a fixed array `[4]T` holds them and is not.
+**Storage the frame cannot show is its own is foreign.** A place reached through what a call answered
+— `current().p`, a chain of calls, a trait object's answer, a local bound to any of them, an element of
+a `Buf` — may be held by someone else long after the frame is gone. A call that answers its argument is
+no exception: what else it may answer is not something its signature says. The frame's own places stay
+open — a local, a field or element of one, and what a local bound once to such an address, or to an
+object the frame made, points at — and an address that lasts (module storage's, or one a parameter
+brought) may go anywhere.
 
 ```sysl
-struct Node
-    tag: int
-    kids: []Node
+struct Slot
+    p: *int
 
-var n = Node(1, [])
+var the_slot = Slot(null)
 
-print(n.tag)
+current() -> *Slot = &the_slot
+
+remember()
+    var n = 1
+    current().p = &n
 ```
 
-```output
-1
+```error
+'&n' is the address of a local of 'remember', and it is stored in 'current().p', which 'remember' cannot show is its own storage — store the value itself, or storage that lasts
 ```
 
-### A type argument is not containment
+#### An address held inside what is handed over
 
-Whether `Wrap[Node]` contains a `Node` is **`Wrap`'s** business, not something the argument list can
-say. `Buf[T]` reaches its elements through a `[]T`, so a node whose children are a growable sequence
-of itself is finite — and it is the shape a syntax tree has:
+**A function may let out what it reads through a pointer as well as the pointer itself.** So the
+address of a local stored in a struct, an array or a view whose address goes to a callee is refused
+when the callee lets out what it reads there — stores it, pushes it, puts it in a heap object, hands
+it to a callee that does, or answers with it:
+
+```sysl
+var last: *int = null
+
+struct Holder
+    p: *int
+
+keep(h: *Holder)
+    last = h.p
+
+run()
+    var n = 5
+    var h = Holder(&n)
+    keep(&h)
+```
+
+```error
+'keep' lets what it reads through its parameter 'h' outlive the call (it is stored in 'last'), and what is read through '&h' holds the address of a local of 'run'
+```
+
+A callee that only reads through it, copies out a number rather than an address, or lets out only what
+it reads a step further — through the address the struct holds, which is not this frame's storage — is
+accepted. **How the address got there does not matter**: copied out of a field, read through a pointer,
+chosen by a branch, stored after the struct was made, or answered by a call, it is followed into
+whatever is handed over at whatever depth, and asked of what the callee lets out of what it reads that
+many steps through its parameter. **The fields are told apart**: what the callee lets out is asked of
+the field the address sits in (a field of a field; an array field's elements all alike; a union's
+members are one field), and a read the callee cannot place by field — through a copy of the pointer,
+or the pointee whole — counts for every field.
+
+### Keeping is read off bodies
+
+**A parameter is kept if its body lets it, or a field path of what it points at, outlive the call**,
+and the answer is followed into every callee, computed callees first, and settled over recursion at a
+fixed point: a recursive function keeps a parameter when one of its paths does.
 
 ```sysl
 import sysl.buf.{Buf, buf}
 
-enum Json
-    Num(v: int)
-    Arr(items: Buf[Json])
+static var all: Buf[*int] = buf()
 
-total(j: Json) -> int
-    j match
-        Num(v) -> v
-        Arr(items) ->
-            var sum = 0
+collect(p: *int)
+    all.push(p)
 
-            for i in 0..<items.len()
-                sum += total(items[i])
+relay(p: *int) = collect(p)
 
-            sum
-end total
+run()
+    var n = 1
+    relay(&n)
+```
 
-var xs: Buf[Json] = buf()
+```error
+'relay' keeps its parameter 'p' (it is passed to 'collect', which keeps it), and '&n' is the address of a local of 'run'
+```
 
-xs.push(Num(1))
-xs.push(Num(41))
+#### Taken back before it returns
 
-print(total(Arr(xs)))
+**A store into foreign storage that the same body overwrites on every way out is not a keep** —
+written over in the body, in a `defer`, or by a callee whose own body writes it on every way out. That
+is how a sink is lent to a module for the length of a call:
+
+```sysl
+static var spare = 0
+static var held: *int = &spare
+
+store(p: *int)
+    held = p
+
+clear()
+    held = &spare
+
+run() -> int
+    var n = 41
+    store(&n)
+    val seen = *held + 1
+    clear()
+    seen
+
+print(run())
 ```
 
 ```output
 42
 ```
 
-**Two types reaching each other is the same rule, and the loop may pass through a third type's
-argument list.** A real document has objects in it, so `Json` needs a member — and a member holds a
-`Json` by value, which closes a cycle that goes `Json` → `Buf[Member]` → `[]Member` → `Member` →
-`Json`. The `[]Member` inside `Buf` is the edge that makes it finite, exactly as the `[]Json` above
-was. **Which of the two is written first decides nothing**: declaration order has never meant
-anything in sysl and it does not start meaning something here.
+The place may be reached through a pointer, spelled out (`s.vm.con`) or through a local holding it
+(`val vm = s.vm`), so long as the store and the overwrite are known to reach the same storage: a local
+bound once holds one pointer, and a pointer read out of memory is the same one until a call, or a
+store of a pointer of its type, may have changed it. A way out that skips the overwrite — an early
+`return`, a `?`, a call that never comes back, a `break` past it, one `match` arm without it — leaves
+the pointer held, and writing a *different* place (another global, another field, the same field of
+another instance) takes nothing back:
+
+```sysl
+static var spare = 0
+static var held: *int = &spare
+
+store(p: *int)
+    held = p
+
+clear()
+    held = &spare
+
+run(c: bool)
+    var n = 1
+    store(&n)
+    if c then return
+    clear()
+```
+
+```error
+'store' keeps its parameter 'p' (it is stored in 'held'), and '&n' is the address of a local of 'run'
+```
+
+### Handing it back is not keeping it
+
+**An answer made of arguments is lent for as long as those arguments live in the caller.**
+`field(s: *S) -> *int = &s.y` keeps nothing; the caller follows the answer as it follows the argument,
+so keeping the answer is keeping the argument, and a function may not hand back an answer made of its
+own frame:
+
+```sysl
+struct S
+    x: int
+    y: int
+
+field(s: *S) -> *int = &s.y
+
+run() -> *int
+    var s = S(1, 2)
+
+    field(&s)
+```
+
+```error
+'field(&s)' is returned, but it holds the address of a local of 'run', whose storage ends when 'run' returns
+```
+
+A pointer the callee **read out of** what it was handed — `q.first()` answering `self.head` — is
+somebody else's address, and is the caller's to keep.
+
+### Only a type that can hold an address carries a loan
+
+**An `int`, a `bool`, a float, a bare enum and a struct with no pointer in it answer nothing about
+where their arguments lived**, so `Ok(n)` after a C function filled `&n` is an ordinary value. A C
+function's pointer answer is taken to be made of its pointer arguments that could hold what it points
+at — one to the same type or to a struct holding it, and bytes from bytes, as `strchr`'s is — and not
+of an out-parameter of another type, so a handle a library allocated is not made of the `*i32` it
+reported an error code through.
+
+#### An address as an integer leaves the analysis
+
+**An address as an integer is a number**: `usize(&marker)` stored, handed on or handed back keeps
+nothing, and outlives nothing. It is how a program measures its stack:
+
+```sysl
+var top: usize = 0
+
+mark()
+    var marker = 0
+
+    top = usize(&marker)
+
+here() -> usize
+    var marker = 0
+
+    usize(&marker)
+
+main()
+    mark()
+    print(here() > 0 && top > 0)
+```
+
+```output
+true
+```
+
+**Turning that number back into a pointer is the program's responsibility.** `ptr_cast` of an integer
+is unchecked, as an `as usize` round trip is in Rust: the compiler follows no address through an
+integer — not through module storage, a field, a parameter, an answer or arithmetic — and refuses
+nothing; a `ptr_cast` read after the frame has returned compiles just the same and reads whatever the
+slot holds by then. No `unsafe` block is asked for, and `@unchecked` has nothing to do with it: the
+`import sysl.raw.ptr_cast` a file must write is where a reader finds every round trip. The address
+kept **as a pointer** is still the analysis's:
+
+```sysl
+var top: *int = null
+
+mark()
+    var marker = 7
+
+    top = &marker
+
+mark()
+```
+
+```error
+'&marker' is the address of a local of 'mark', and it is stored in 'top', which outlives 'mark'
+```
+
+### Where no body is in sight, the call borrows
+
+A call the compiler cannot follow into a body is answered by its **signature**, and the answer is the
+one C programs live by — **a pointer handed to a call is borrowed for the call**:
+
+| what is called | what it keeps |
+|---|---|
+| a sysl function | what its body keeps |
+| a method through a trait object | what the trait's declaration of the method says: nothing, unless it says [`@keeps(p)`](/reference/attributes/#keeps-and-answers-on-a-trait-method), or `@keeps(self)` for the object itself; an `async` method's task holds every argument until it is awaited |
+| a closure, a `&Fn` | nothing, unless its type marks the parameter [`@keeps`](#a-callable-that-keeps-what-it-is-handed); what is read through one it marks `@lets_out` may be kept |
+| a function through a pointer | nothing, unless the pointer type marks the parameter `@keeps` or `@lets_out` |
+| an `extern` | nothing, and nothing it reads through a pointer, unless its declaration says [`@keeps(p)`](/reference/ffi/#keeps-a-c-function-that-holds-on-to-a-pointer) |
+
+- **The answer is fresh** — an `extern`'s is storage the library made — unless the declaration says
+  [`@answers(p)`](/reference/ffi/#answers-a-c-function-whose-answer-points-into-an-argument), and then
+  it is made of what `p` was handed. An inline-assembly output is fresh the same way. The answer of a
+  call through an object may be made of the receiver, and of nothing else unless the declaration says
+  `@answers(p)` — Rust's elision rule for a method. A callable's type cannot say `@answers`, so a call
+  through one may answer with anything it was handed.
+- **A body reached through such a type that keeps an unmarked parameter is refused where it is
+  written**: an `impl` method keeping what its trait's declaration does not name, a closure keeping its
+  parameter, a function whose address is taken keeping one. The declaration of an `extern` is trusted:
+  a C function holding a pointer past the call without saying so is a wrong declaration.
+- **There is no whole-program answer**: no table of the bodies a call through an object or a pointer
+  may land in is consulted, since which one it lands in is decided when the program runs.
+
+```sysl
+@answers(s)
+extern "strchr" c_strchr(s: *u8, c: int) -> *u8
+
+static var spare: u8 = 0
+static var held: *u8 = &spare
+
+find()
+    var text: [3]u8 = [104, 105, 0]
+
+    held = c_strchr(&text[0], 105)
+```
+
+```error
+'c_strchr(&text[0], 105)' holds the address of a field of 'text', a local of 'find', and it is stored in 'held', which outlives 'find'
+```
+
+```sysl
+trait Bump
+    bump(*self, n: *int)
+
+struct Keeper
+    held: *int
+
+impl Bump for Keeper
+    bump(*self, n: *int)
+        self.held = n
+```
+
+```error
+'bump' keeps its parameter 'n' (it is stored in 'self.held'), but a method of 'Bump' borrows its parameters for the call
+```
+
+**A default is a promise, so the body behind it is held to it.** That is what makes a lock's `with`
+safe without an annotation: the closure it calls borrows the value's address for the call, and a
+closure that keeps it is refused where it keeps it — the one mistake a returned address could not
+prevent, using it after the release:
+
+```sysl
+struct Cell
+    v: int
+
+    with[R](*self, body: *int -> R) -> R = body(&self.v)
+
+static var spare = 0
+static var kept: *int = &spare
+
+var c = Cell(1)
+
+c.with((v) -> *v += 1)
+print(c.v)
+c.with((v) -> kept = v)
+```
+
+```error
+a closure borrows what it is handed for the call, and this one keeps its parameter 'v' (it is stored in 'kept')
+```
+
+**A closure is judged where it is written**, capture by capture, by what its body lets out of each,
+and again at every call it is handed to, so it makes no difference whether a call runs it, it is boxed
+behind a `&Fn`, or a `@scoped` member runs it later. A capture holding the frame's address that the
+body stores in module storage, or into what a parameter of the closure points at (a lock's `with`
+hands the body the value a module lock guards), outlives the frame. So does `&capture` written in the
+body: the closure holds the capture by value in its own storage, and the refusal points at the closure,
+never into the body of whatever runs it. A capture of a heap value or a plain number is stored freely.
+
+```sysl
+static var idle = 0
+static var kept: *int = &idle
+
+run(f: () -> unit) = f()
+
+closure() -> int
+    var n = 5
+    val p = &n
+    run(() -> kept = p)
+    0
+
+print(closure())
+```
+
+```error
+a closure lets its capture 'p' outlive the call (it is stored in 'kept'), and 'p' holds the address of a local of 'closure' — capture the value itself, or storage that lasts
+```
+
+#### A callable that keeps what it is handed
+
+A callback that keeps what it is handed — an interpreter's primitive putting its handle into the term
+it builds, a visitor collecting nodes — says so in its type, with
+[`@keeps`](/reference/types/#a-parameter-the-callable-may-keep-keeps) on the parameter:
+`&Fn(@keeps *Handle) -> Step`, or `*extern(*M, @keeps *isize) -> unit` for a function pointer. A
+closure or function taken at that type may keep that parameter, and every other parameter is still
+borrowed. **A call through the type is held to the mark the way a call of an `extern` is held to its
+`@keeps(p)`**: the address of storage that ends is refused there, and a function handing its own
+parameter on there keeps it. A pointer that keeps nothing stands where a marked one is asked for,
+never the other way round.
 
 ```sysl
 import sysl.buf.{Buf, buf}
 
-struct Member
-    key: string
-    value: Json
+struct Handle
+    n: int
 
-enum Json
-    Null
-    Num(v: int)
-    Obj(members: Buf[Member])
+type Visit = &Fn(@keeps *Handle) -> unit
 
-var members: Buf[Member] = buf()
+var seen: Buf[*Handle] = buf()
 
-members.push(Member("answer", Num(42)))
-print(members[0].key)
-```
-
-```output
-answer
-```
-
-A generic that holds its parameter **by value** is the other answer, from the same argument list —
-and the refusal names the field that holds it rather than the argument that was passed:
-
-```sysl
-struct Wrap[T]
-    x: T
-
-struct Node
-    w: Wrap[Node]
-
-var n: Node
-
-print(1)
+visit_one(f: Visit)
+    var mine = Handle(1)
+    f(&mine)
 ```
 
 ```error
-type 'Node' contains itself, so it has no finite size
+a call through '&Fn(@keeps *Handle) -> unit' keeps its parameter 1 (its type says '@keeps'), and '&mine' is the address of a local of 'visit_one'
 ```
 
-## Slices keep their backing alive
-
-A slice is **three words**, not two:
-
-```
-[]T = { owner: *Buf, ptr: *T, len: usize }        // 24 bytes on a 64-bit target
-```
-
-`ptr` and `len` name the range; **`owner` keeps the bytes alive.** A bare `{ptr, len}` view can
-outlive the buffer it views — Go gets away with it because its collector finds the object from an
-interior pointer, and sysl has no collector — so the slice carries the owning reference itself.
-Taking a slice retains, dropping one releases, slicing stays O(1) and allocation-free, and "a slice
-never dangles" becomes true rather than aspirational.
+Without the mark, the closure is refused where it keeps the parameter, and told the type that would
+let it. **An unmarked parameter is answered by the type, never by the closures made at it**: the call
+borrows the argument and everything read through it, so a closure that lets out what it reads through
+a pointer is refused as well, whatever any caller hands it.
 
 ```sysl
-tail() -> []int
-    var xs: []int = [1, 2, 3, 4]
+import sysl.buf.{Buf, buf}
 
-    xs[2..]
+struct Handle
+    n: int
 
-var t = tail()
+var seen: Buf[*Handle] = buf()
 
-print(t.len, t[0], t[1])
+val f: &Fn(*Handle) -> unit = (h) -> seen.push(h)
+```
+
+```error
+a closure borrows what it is handed for the call, and this one keeps its parameter 'h' (it is passed to 'push', which keeps it) — whoever calls it may hand it the address of their own storage. Copy what this needs into storage of its own, or let it keep it by marking the parameter '@keeps' in the type it is made at: 'Fn(@keeps *Handle) -> unit'
+```
+
+**A call through a function pointer borrows every argument**, so a function whose address is taken is
+held to that where it is written — even one that only stores what it is handed into what another
+parameter points at, such as a primitive writing its stack pointer back into the machine — unless
+every type its address is taken at marks the parameter:
+
+```sysl
+struct M
+    sp: *isize
+
+type Code = *extern(*M, *isize) -> unit
+
+halt(m: *M, sp: *isize)
+    m.sp = sp
+
+var stack: [8]isize
+var m: M
+
+m.sp = &stack[0]
+val f: Code = &halt
+
+f(&m, m.sp)
+```
+
+```error
+'halt' keeps its parameter 'sp' (it is stored in 'm.sp'), and its address is taken — a call through a function pointer sees no body
+```
+
+**A callable that only lets out what it reads is marked
+[`@lets_out`](/reference/types/#what-the-callable-reads-may-outlive-the-call-lets-out)**:
+`*extern(@lets_out *Heap) -> unit`. A function or closure taken at the type may let out what it reads
+through that parameter, and is still refused where it keeps the parameter itself. A call through the
+type borrows the argument — a collector's heap on the caller's stack may be handed there — but what is
+reachable through it may be kept anywhere, so storing the address of storage that ends into it before
+the call is what is refused.
+
+**A stored callback keeps what it captured, and nothing else.** Storing a closure — in a field, module
+storage, a buffer, a trait's implementation — is refused only where it captured an address that is not
+the program's to give away; one capturing nothing, a number, a `&T`, a string or a struct by value may
+be stored anywhere. A trait's method borrows a view it is handed the same way
+([traits](/reference/traits/#a-method-borrows-what-it-is-handed)).
+
+```sysl
+static var later: &Fn() -> int = () -> 0
+
+install(f: &Fn() -> int)
+    later = f
+
+run()
+    var n = 7
+    val p = &n
+    install(() -> *p)
+```
+
+```error
+'install' keeps its parameter 'f' (it is stored in 'later'), and '() -> *p' holds the address of a local of 'run'
+```
+
+### Escape analysis
+
+**A frame array or closure box that would outlive its block moves to the heap, silently.** Its type
+stays the same, `--explain-escapes` lists every move, and it is refused only where there is no
+allocator. A view of a local fixed array has a null owner and is good only while the frame lives, so
+the compiler finds the views for which that matters:
+
+| a view of | `owner` | safe to keep? |
+|---|---|---|
+| a heap buffer | the buffer | yes — retained |
+| static data, a string literal | null (immortal) | yes — never freed |
+| a `*T` region | null | the programmer's problem — unless a [`@views(self)`](#a-view-borrowed-from-its-receiver) member hands it out |
+| **a local fixed array** | **null** | **only while the frame lives** |
+
+A view of a local array **escapes** when it is returned (directly or inside a struct, an enum, an
+`Option`, a tuple or one slot of a multi-result list), stored into anything that outlives the frame,
+passed to a parameter the callee keeps, captured by a closure that escapes, or assigned into a local
+that escapes (resolved as a fixed point over the function's locals). Indexing, iterating, sub-slicing
+into a local that stays local, comparing and passing to a callee that only reads allocate nothing.
+Field by field: a callee storing `s.a` lets out the view in `s.a` and not the one in `s.b`, and a
+result whose type cannot hold a view is not taken for one. A call with no body — through a trait
+object, an `extern`, a `&Fn`, a function pointer, or an `async` call whose task is not awaited where it
+is made — lets out what its declaration says, and a view handed to a callable is promoted, since no
+type says a view is only borrowed.
+
+**With an allocator, the array is promoted**: allocated as a counted buffer instead of a stack slot,
+with the view's `owner` pointing at it, and nothing else changes:
+
+```sysl
+render() -> []u8
+    var line: [8]u8
+
+    line[0] = 104u8
+    line[1] = 105u8
+
+    line[0..<2]
+
+var l = render()
+
+print(l.len, l[0], l[1])
 ```
 
 ```output
-2 3 4
+2 104 105
 ```
 
-The buffer `xs` named is gone as a name before `print` runs, and the slice is still valid, because
-the slice is one of its owners.
+- **The array keeps its type, and only its storage moves.** A promoted `[8]u8` is still a `[8]u8` — a
+  constant length, a value that copies on assignment, every index emitted as before.
+- **Which array moves is the root of the escaping view.** An index step is walked through, since an
+  element of a local array of arrays is part of that array; a field step is not. Only arrays both
+  viewed and escaped move.
+- **A temporary moves too.** An array the frame computed and nobody named — a literal, a call's answer
+  such as a `[32]u8` digest sliced straight into module storage, a field of either — is nobody's, so it
+  is this frame's, and a view of it that gets out is given storage of its own. A `...T` variadic packs
+  its arguments into exactly such a literal. A literal written where a `[]T` is expected and handed to
+  a call that keeps nothing of it, and whose answer could not carry a view of it, is laid in the frame
+  and allocates nothing.
+- **A view that outlives its scope is promoted too**, not only one that leaves the frame: a
+  temporary's view kept in a local read on later lines, and a view of an array declared in a loop body
+  or an `if` arm kept in an enclosing block. Nothing moves where nothing outlives anything.
+- **Module storage is never a root**, whatever the path to it; it outlives every frame where it is.
+- **An element of a view or of a `Buf` is not the frame's storage**: `rows[i][..]` and `b[i][..]` carry
+  the owner of the storage they live in, and outlive the buffer growing or being dropped. A program's
+  own container that answers its storage's view is the same; one whose elements are its own bytes is
+  the frame's where it is, so a view of part of one may leave a frame only when the container lives in
+  module storage or behind a `*T`.
 
-**`owner` is null when there is nothing to keep alive** — a slice of static data, of a `*T` buffer, or
-of a fixed array whose storage outlives every view of it. Retain and release on such a slice are
-no-ops, so allocator-free code slicing a static or stack buffer pays nothing at all. This is the same
-immortality rule string literals use, generalized.
+**Two roots have nowhere to be promoted to**, and are refused: an array a caller passed **by value**,
+which is the caller's layout, and an array that is a **field** of a **named** struct on the frame,
+since a field moves only with its struct. A part of a temporary is not one of them: the whole
+temporary moves.
 
-A `string` is then exactly an **immutable, validated `[]u8`**, and the two share one representation
-and one implementation.
+```sysl
+first_two(a: [4]int) -> []int = a[0..<2]
 
-### A view borrowed from its receiver
+print(first_two([1, 2, 3, 4]).len)
+```
 
-A null owner is exactly right for static data and exactly wrong for memory **a C library owns**: an
-object wraps the library's handle, frees it in its destructor (below), and hands out a view
-of what the handle points at. Nothing in that view keeps the object alive, so the view can be read
-after the destructor has run. **`@views(self)` on the member says so, and the compiler holds every
-caller to it:**
+```error
+a slice of an array this frame owns is returned, so it would outlive the array, and the storage is not this body's to move — 'a' is an array this body holds by value without having declared it, such as a parameter, so there is no declaration to move. Declare it as a '[]T', which makes a buffer of its own and owns it, or as a '&[N]T' where the length is fixed
+```
+
+**Without an allocator every promotion is a compile error** at the view, and so is every literal
+argument a callee keeps. A `@no_alloc` module is told it declared so; a machine whose manifest says
+`capabilities { heap = false }` is held to the same line in every module, and the refusal names the
+machine (`'thumbv7em-freestanding' provides no allocator`) rather than leaving the link to say
+`undefined symbol: malloc`. Growable arrays, escaping closures and `&T` creation are refused there the
+same way.
+
+```sysl
+@no_alloc
+
+first() -> int
+    var keep: []int = []
+
+    for i in 0..<3
+        if i == 0 then keep = [i * 10][..]
+
+    keep[0]
+
+print(first())
+```
+
+```error
+this view of an array literal is kept in 'keep', which outlives it, so the array would move to the heap to outlive its statement — and this module declared '@no_alloc', so there is nothing to move it into
+```
+
+#### Promotion is silent, not hidden
+
+**`--explain-escapes`** reports every promotion and the route that forced it — one line per array, in
+source order, on stderr, accepted by every subcommand, at the **view that forced the move** rather than
+the declaration. This is Go's `-m`. A program that must not allocate says `no alloc`, and the
+compiler then enforces it rather than reporting it.
+
+```
+$ sysl build --explain-escapes tty.sysl
+tty.sysl:31:12: 'buf' is promoted to the heap, because this view of it is returned
+```
+
+The idiom worth reaching for first, even with an allocator, is **return a count and let the caller
+slice its own buffer** — what `snprintf` does, and what most kernel code wants.
+
+### Views own their heap storage, and a lent view takes no count
+
+**A view of heap storage owns a count of it**, so it survives growth and drop and may escape. **A view
+that is only lent** — handed to a call, or held in a local that never outlives its block — needs no
+count of its own while its parent's count holds the storage
+([what a count costs](#a-view-of-something-the-frame-already-holds-takes-no-count)).
+
+#### A view borrowed from its receiver
+
+A null owner is right for static data and wrong for memory **a C library owns**: an object wraps the
+library's handle, frees it in its destructor, and hands out a view of what the handle points at, which
+nothing keeps alive. **`@views(self)` on the member says so, and the compiler holds every caller to
+it:**
 
 ```sysl
 extern "malloc" c_malloc(n: usize) -> *u8
@@ -2621,13 +1163,21 @@ run()
 freed
 ```
 
-The view is an ordinary `[]const u8` — no extra word, no count, nothing at run time. What the mark
-adds is a fact the compiler keeps about the names in one body: **the view lives no longer than the
-name it was called through**, because that name holds the count that keeps the object alive. The
-check is lexical, the same one a `ref` gets (above), and it refuses four things.
+The view is an ordinary `[]const u8`; nothing changes at run time. The mark adds one lexical fact:
+**the view lives no longer than the name it was called through**, and four things are refused:
 
-**A receiver that is not a name.** A temporary is freed at the end of its statement, so a view of it
-is refused at the call, naming it:
+1. **a receiver that is not a name** — a temporary is freed at the end of its statement;
+2. **the view leaving the function that holds its receiver** — returned, or what the body comes to,
+   unless the member is itself `@views(self)` and the view is borrowed from its own `self`;
+3. **the view stored where it outlives the receiver** — a local bound before the receiver, a field
+   reached through a reference or pointer, module storage (a local bound *after* it, or a struct value
+   one holds, closes first and is fine);
+4. **freeing the receiver while a local holding the view is in scope** — assigning the name, a
+   `*self` call on it, or a call that may write an object of its type.
+
+What a view is copied into — a sub-slice, a struct or `Option` around it, a closure capturing it, a
+name a pattern binds, a loop variable over a view of views — is borrowed from the same receiver; a
+value that cannot hold a view (`v.len`, `v[0]`, a rendered string) is borrowed from nothing.
 
 ```sysl
 extern "free" c_free(p: *u8)
@@ -2650,116 +1200,6 @@ print(open().bytes().len)
 ```error
 'bytes' answers a view borrowed from what it is called on, and that is the value 'open' answers — a temporary, freed at the end of this statement
 ```
-
-**A view leaving the function that holds its receiver.** A `return`, or what the body comes to:
-
-```sysl
-extern "free" c_free(p: *u8)
-
-struct Column
-    p: *u8
-    n: usize
-
-    @views(self)
-    bytes(&self) -> []const u8 = self.p[0..<self.n]
-
-impl Drop for Column
-    drop(self) = c_free(self.p)
-
-first() -> []const u8
-    val c: &Column = Column(null, 0)
-
-    c.bytes()
-```
-
-```error
-this returns a view borrowed from 'c', and nothing keeps 'c' alive once this function returns
-```
-
-Only a member that is itself marked `@views(self)` hands one back, and only one borrowed from
-`self` — which is how a wrapper passes the borrow on to its own caller. A free function handed the
-receiver as a parameter does not: the caller has no way to know its result is tied to that argument.
-
-**A view stored where it outlives the receiver.** It may go into a local bound *after* the receiver,
-or into a struct value held by one, since those close first. A local bound before it, a field
-reached through a reference or a pointer, and module storage are refused:
-
-```sysl
-extern "free" c_free(p: *u8)
-
-struct Column
-    p: *u8
-    n: usize
-
-    @views(self)
-    bytes(&self) -> []const u8 = self.p[0..<self.n]
-
-impl Drop for Column
-    drop(self) = c_free(self.p)
-
-run()
-    var keep: []const u8 = []
-    val c: &Column = Column(null, 0)
-
-    keep = c.bytes()
-```
-
-```error
-'keep' is bound before 'c', so it outlives it, and this stores in it a view borrowed from 'c'
-```
-
-What a view is copied into is borrowed from the same receiver — a sub-slice, a struct or `Option`
-built around it, a closure that captures it, a name a pattern binds out of it, a loop variable
-walking a view of views — so each of those is held to the same places. A value that cannot hold a
-view (`v.len`, `v[0]`, a string rendered from it, a byte a loop takes out of it) is not borrowed from
-anything:
-
-```sysl
-struct Table
-    rows: []const []const u8
-
-    @views(self)
-    all(&self) -> []const []const u8 = self.rows
-
-run()
-    var keep: []const u8 = []
-    val t: &Table = Table(["ab".bytes, "cde".bytes])
-
-    for row in t.all() do keep = row
-```
-
-```error
-'keep' is bound before 't', so it outlives it, and this stores in it a view borrowed from 't'
-```
-
-A trait member may carry the mark too, and then a call through a trait object (`&Viewer`) is held
-to it exactly as a call on the type is. An implementation of a marked member inherits the mark, so
-it need not repeat it. The other way round is refused — a call through the object reads only the
-trait's member, so a mark the trait does not carry would hold nobody to anything:
-
-```sysl
-trait Viewer
-    look(&self) -> []const u8
-
-struct S
-    n: int
-
-impl Viewer for S
-    @views(self)
-    look(&self) -> []const u8 = []
-```
-
-```error
-'look' of 'impl Viewer for S' is marked '@views(self)', but trait 'Viewer' declares 'look' without it
-```
-
-A marked member is only ever called on a value: `Column.bytes(c)` is refused, as every method
-reached through its type is.
-
-**Freeing the receiver while the view is in scope.** Assigning the name it was called through, a
-`*self` call on it, and a call that may write an object of its type — which a member that frees the
-memory does, and a call through a closure or a trait object might, naming no body to ask — are
-refused for as long as a local holding the view is in scope:
 
 ```sysl
 extern "free" c_free(p: *u8)
@@ -2786,60 +1226,164 @@ run()
 'v' is a view borrowed from 'c', and this assignment could free what it views
 ```
 
-Put the view in a block that closes first, and the name is free again once it has.
+**It is narrow on purpose.** The mark names only `self`, marks only a member whose result is a view
+(`[]T`, `[]const T`, `string`), and is in no type: no lifetime parameters, and no borrow tracked
+through a struct a member returns. A trait member may carry it, and then a call through a trait object
+is held to it; an implementation inherits it, and an implementation may not add it where the trait's
+member lacks it. A marked member is called only on a value (`Column.bytes(c)` is refused). A member
+whose answer is simply read out of its receiver's storage needs no mark: the compiler works that out
+from the body ([below](#a-method-s-answer-borrowed-from-its-receiver)).
 
-**This is the whole of it, and it is narrow on purpose.** The mark names only `self`, it marks only
-a member whose result is a view (`[]T`, `[]const T`, `string`), and nothing about the borrow is in a
-type: there are no lifetime parameters, and no borrow is tracked through a struct a member returns.
-A view of a `*T` region that no member marked stays the programmer's problem, as every `*T` is.
-The mark is about memory a *destructor* frees, which is why it is declared. A member whose answer is
-simply read out of its receiver's storage — a field, an element, a `Some` of one — needs no mark at
-all: the compiler works that out from the body and reads the answer where it lies (see
-[a method's answer borrowed from its receiver](#a-method-s-answer-borrowed-from-its-receiver)).
+### Nothing moves under a live interior name
 
-## Escape analysis
+**While a pointer, a `ref` or a view into relocatable storage is live, what could move or free that
+storage is refused**: a `@relocates` call, an assignment to an owning step of its path, and a write
+through a second name. The check is decided from types and from what callees' bodies write, and never
+asks where the name is *used* — the question that would need lifetimes.
 
-The `owner` word answers "who keeps this alive" for every slice except one: a slice of a **local
-fixed array**. That storage is a stack slot, valid until the frame returns and no longer.
+#### The one rule: what may move underneath it
 
-| slice of | `owner` | safe to keep? |
+A stored address is only as good as the storage staying where it is. C# has ref locals and needs no
+such rule, because its collector keeps the old array alive; sysl has none in this tier:
+
+```sysl
+struct Table
+    cell: []int
+
+    swap(*self)
+        ref e = self.cell[0]
+
+        self.cell = [0; 8]
+        print(e)
+end Table
+
+var t = Table([1, 2, 3])
+
+t.swap()
+```
+
+```error
+'e' is a 'ref' standing on storage this assignment would release, so the name would be left pointing at freed memory
+```
+
+**While a ref is live, no step of its place that could come to name different storage may be
+assigned, and no mutating method may be called on a prefix of one.** The discriminator is
+**ownership, not indirection** — only a step that *releases* something when overwritten can strand it:
+
+| step | hazard? | why |
 |---|---|---|
-| a heap buffer | the buffer | yes — retained |
-| static data, a string literal | null (immortal) | yes — never freed |
-| a `*T` region | null | the programmer's problem, like every `*T` — unless a `@views(self)` member hands it out, which ties it to the receiver (above) |
-| **a local fixed array** | **null** | **only while the frame lives** |
+| a `&T` | **yes** | overwriting it drops what it held, and that release may be the last |
+| a view (`[]T`) | **yes** | the same — a view owns its buffer |
+| a `*T` | no | a raw pointer owns nothing, so `p = q` frees nothing |
+| a field, a fixed array, or an element of one | no | that storage *is* the enclosing object's bytes |
 
-The compiler finds the slices for which that matters, and **the programmer writes nothing**. There is
-no `@escaping`, no lifetime parameter, and no "this result views that argument" marker anywhere in a
-signature. Go is the precedent; Rust's lifetimes and Swift's `@escaping` are the alternative, and both
-charge the programmer for what a compiler can work out. (`@views(self)`, above, is about memory no
-frame owns — a C library's — which is exactly what the compiler cannot work out from a body.)
+A step is held still when it is an **owning** step the path goes **through**, so the place itself is
+never held: `ref r = h.node` names the slot, and `r = other` and `h.node = other` are one statement
+written two ways, while `h = other` on a `&Holder` is refused. Writing a value that holds an owning
+step by value writes the step too (`h = H(…)`). A program reaching its tables through a `*Self`
+receiver has no owning step in its chains and is asked for nothing.
 
-### What escapes
+- **A `*self` call on the owner is refused** whether or not that method reassigns anything — a module
+  compiles against signatures, and the cost is writing the ref one line later.
+- **A call that runs a closure writing an owning step is refused** — the closure handed directly,
+  through a local, a `&Fn` or a struct, or called; one writing only storage the ref does not stand
+  through is run without complaint.
+- **A `@relocates` member moves a container's storage whatever its receiver mode.** A `Buf` is a
+  handle, so `push` takes `self` and still reallocates; each member that can move the storage or give
+  an element up is marked, and the mark is what the check asks.
 
-A slice whose origin is a local array escapes if it can be reached after the frame returns — that is,
-if it is:
+```sysl
+import sysl.buf.{Buf, buf}
 
-1. **returned**, directly or nested inside whatever carries it back: a struct, an enum, an `Option`,
-   a tuple, or one slot of a multi-result list;
-2. **stored into anything that outlives the frame** — a global, a field reached through a `&T`, or an
-   aggregate that is itself stored somewhere that outlives the frame;
-3. **passed as an argument the callee keeps**;
-4. **captured by a closure that itself escapes** — a closure that does not escape holds the array
-   [by reference](#a-closure-is-asked-the-same-question);
-5. **assigned into a local that escapes** — the rule is transitive, resolved as a fixpoint over the
-   function's own locals.
+var b: Buf[int] = buf()
 
-Everything else needs no allocation: indexing, iterating, sub-slicing into a local that stays local,
-comparing, and passing to a callee that only reads.
+b.push(1)
 
-### A closure is asked the same question
+ref first = b[0]
 
-A closure is a value that can be kept, so the variables it names are asked about the same flows: is
-the closure returned, stored where it outlives the block, handed to a parameter its function keeps,
-built in an `async` body, or erased into a `&sync Fn`? **Where none of them applies, the closure holds
-each variable by reference**, and a write in it is a write to the variable. Where one does, it holds a
-copy, taken when the closure is built.
+b.push(2)
+first = 5
+```
+
+```error
+'first' is a 'ref' standing on an element whose storage 'push' could move or give up, since it is '@relocates'
+```
+
+**A `*T` taken by `&` into the same storage is held to the same rule for as long as it is live** — the
+pointer, a copy, or an address computed from it. A pointer has no block, so what counts is its **last
+use** on any path, a later turn of a loop and a `defer` (a use on every way out of its block) included;
+once the last use is behind it, the storage may move freely. A pointer kept in a local aggregate is
+followed through it, and so is one into what a match arm, an `is` test or a `for` bound out of a value
+made for it.
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+run() -> int
+    val b: Buf[int] = buf()
+
+    b.push(41)
+
+    val p = &b[0]
+
+    for i in 0..<100 do b.push(i)
+
+    *p + 1
+
+print(run())
+```
+
+```error
+'p' is a pointer to an element whose storage 'push' could move or give up, since it is '@relocates', and it is used after this call
+```
+
+**A function handed the buffer is asked what its body does with it**: one that calls a `@relocates`
+member on a parameter, or hands it on to one that does, may not be handed a pointer into that argument
+too, nor may the pointer be used after the call.
+
+**A second name for the same object is held to the rule.** Whether two `&T`s or `Buf`s name one object
+is a run-time fact, so the question is asked of **types**: while a ref stands inside storage a value
+of type `T` holds, writing storage held in any `T` other than along the ref's own path is refused —
+directly, or by a call whose body (or anything it reaches) may write a `T`. A call through a closure or
+trait object names no body and is refused; a function with no body in the program is judged by what it
+can get hold of ([edge cases](#edge-cases)). A callee reaching a `@relocates` member on a buffer of the
+ref's type writes it too, however it got the buffer.
+
+```sysl
+struct Node
+    cell: []int
+
+struct H
+    node: &Node
+
+var h = H(Node([1, 2, 3]))
+
+ref e = h.node.cell[0]
+
+val n = h.node
+
+n.cell = [7; 8]
+e = 5
+```
+
+```error
+'e' is a 'ref' standing on storage held in a 'Node', and this assignment writes one that may be the same object by another name
+```
+
+What stays open is everything that cannot be the ref's storage: other fields of the ref's own object
+along its path (`h.node.count = 2` beside `ref e = h.node.cell[0]`), values of unrelated types, calls
+whose bodies only read, and anything once the ref's block has closed. A view of a buffer is not a
+pointer into it: it keeps its storage, so growing the buffer under a view is accepted. **What this does
+not make safe is a `*T`**: a ref rooted at a raw pointer, or storage reached through a reinterpreting
+cast, is the raw tier's bargain.
+
+### Capture follows keeping
+
+**A borrowed closure refers to its captures, and a kept closure holds copies.** A closure that is
+returned, stored where it outlives the block, handed to a parameter that keeps it, built in an `async`
+body, or erased into a `&sync Fn` holds a copy of each variable, taken when it is built; otherwise it
+holds each variable by reference, and a write in it is a write to the variable. A reference to a local
+costs a pointer and takes no count, and a borrowed closure handed on as a `&Fn` is built in the frame:
 
 ```sysl
 import sysl.buf.{Buf, buf}
@@ -2865,1080 +1409,209 @@ print(best, peek(), kept[0]())
 9 5 1
 ```
 
-`peek` is called in the block that declares `n`, so it reads the variable; the closure pushed into
-`kept` may outlive it, so it carries the `1` it was built with. A reference to a local costs a pointer
-and takes no count, and a closure that does not outlive its frame and is handed on as a `&Fn` is built
-in that frame, so `each` above allocates nothing.
-
-### Crossing a call
-
-Two facts about a function are enough to keep the caller's analysis local and exact, and both are
-**inferred from the body** rather than written:
-
-- **per parameter** — which parts of this argument does the callee let outlive the call?
-- **for the result** — which parts of which parameters may the returned value be a view of?
-
-Both are answered field by field: a callee that stores `s.a` lets out the view in `s.a` and not the
-one in `s.b`, and a result whose type cannot hold an argument's view is not taken for one. They are
-computed bottom-up over the call graph. Recursion starts optimistic and iterates to a fixpoint, so a
-self- or mutually-recursive function converges on the truth rather than on the conservative answer.
-
-A call with no body to consult is answered by what its declaration says instead:
-
-- **a call through a trait object**, because which body it reaches is a word read at run time. It
-  lets out what the trait's declaration of the method marks
-  [`@keeps`](/reference/attributes/#keeps-and-answers-on-a-trait-method), and nothing else. Reading
-  through a *concrete* type or through a bounded type parameter is unaffected, since monomorphization
-  turns the second into a direct call too;
-- **an `extern`**, whose body is on the foreign side: it lets out what its `@keeps` names, and its
-  result views what its `@answers` names;
-- **a call through a `&Fn` or a function pointer**, and an `async` call whose task is not awaited where
-  it is made: a view handed to one is counted as let out. A callable's type can say what it keeps, with
-  `@keeps`, but nothing in it says that a view is only borrowed, so the view is promoted.
-
-### What happens when a slice escapes
-
-**With an allocator, the array is promoted.** It is allocated as an ARC buffer instead of a stack
-slot, the slice's `owner` points at it, and nothing else about the program changes:
+**A write to a copy that is read after it would be lost, and is refused** — where the closure never
+reads the capture back, or the enclosing body uses the variable after the closure
+([expressions](/reference/expressions/#a-write-to-a-copy-that-nothing-will-see-is-refused)). **So is a
+write to a by-value parameter that nothing reads after it**
+([declarations](/reference/declarations/#a-write-to-a-by-value-parameter-nothing-reads-is-lost)):
 
 ```sysl
-render() -> []u8
-    var line: [8]u8
+var later: Option[&Fn() -> unit] = None
 
-    line[0] = 104u8
-    line[1] = 105u8
+install(f: &Fn() -> unit) = later = Some(f)
 
-    line[0..<2]
-
-var l = render()
-
-print(l.len, l[0], l[1])
-```
-
-```output
-2 104 105
-```
-
-**The array keeps its type, and only its storage moves.** A promoted `[8]u8` is still a `[8]u8`: its
-length is still a compile-time constant, it is still a value that copies on assignment, and every
-index and store is emitted exactly as an unpromoted one's is. What changes is where the name's
-address points, and that a view of it carries that buffer as its owner. Rewriting the declaration
-into a `[]u8` would have been the other way to do it and is wrong — it changes the type at every use,
-and an array is a value type where a view is not.
-
-**Which array moves** is decided by the *root* of the escaping view. An index step is walked through,
-because an element of a local array of arrays is part of that array's storage; a **field** step is
-not, because that storage belongs to a struct. Only arrays that are *both* sliced *and* escaped are
-promoted.
-
-**A TEMPORARY is promoted too, and it has no declaration to promote.** A whole array the frame
-computed and nobody named — an array literal, a call's answer, a field of either — is a temporary of
-the frame that made it, which is exactly what promotion exists for, so a view of it that gets out is
-given storage of its own: the same storage a literal written where a `[]T` is expected already gets.
-
-What makes something a temporary is having **no address of its own**. That is the same line the
-paragraph above draws from the other side: a local array, a field of one, an element of one and a
-parameter are all storage that is somewhere, and the question for each is whose it is to move. A
-temporary is nowhere yet, so it is nobody's, so it is this frame's:
-
-```sysl
-trait Sink
-    take(self, xs: []const int) -> int
-
-struct Adder
-    base: int
-
-impl Sink for Adder
-    take(self, xs: []const int) -> int = self.base + int(xs.len)
-
-var a = Adder(10)
-val d: &Sink = a
-
-print(d.take([4, 5, 6][..]))
-```
-
-```output
-13
-```
-
-This is the case a **variadic** call meets without trying: `xs: ...int` packs a call's trailing
-arguments into exactly `[a, b, c][..]`, so a `...T` member reached through a trait object is a
-literal that has to outlive the frame. It costs an allocation there and nothing at a call whose slice
-stays put.
-
-**A literal written where a `[]T` is expected is the same temporary**, and it is laid in the frame
-on the same terms: handed straight to a call that keeps nothing of it, and whose answer could not
-carry a view of it out, it is the array `val xs: [N]T = [...]` would have been, viewed whole, and
-allocates nothing. Its elements may be anything the frame computes:
-
-```sysl
-sum(xs: []const int) -> int
-    var s = 0
-
-    for x in xs
-        s += x
-
-    s
-
-val g = 3
-
-print(sum([g, g * 2, sum([g, 1])]))
-```
-
-```output
-13
-```
-
-Everywhere else it is a buffer of its own, as before — bound to a name, returned, stored, handed to a
-callee that keeps it, to an `async` function (whose task holds its arguments until it runs), or to a
-call whose answer may be a view of it, such as `first([a, b])` answering `[]const int`. Those can
-outlive the statement that made them, and a slot cannot.
-
-A **call's answer** is the same temporary written a different way, and it is the one a reader meets
-first: a digest is a `[32]u8`, so slicing one straight into something that keeps it is a view of an
-array with no declaration behind it.
-
-```sysl
-import sysl.crypto.sha256
-
-static var fingerprint: []const u8 = []
-
-record(data: []const u8)
-    fingerprint = sha256(data)[..]
-
-record("abc".bytes)
-
-print(fingerprint.len, fingerprint[0], fingerprint[31])
-```
-
-```output
-32 186 173
-```
-
-**Binding it to a name first would have worked all along**, and that is the point: `val d =
-sha256(data)` then `d[..]` is a declared array, promoted by the paragraph above. The two spellings are
-one frame slot, so refusing the shorter one bought nothing.
-
-Two roots have nowhere to be promoted to, and are diagnostics rather than promotions — an array a
-caller passed **by value**, which is the caller's layout, and an array that is a **field** of a
-**named** struct on the frame, where moving the field alone or the struct with it is the choice this
-reference leaves unspecified. A **part** of a temporary is not one of them: the whole temporary
-moves, and the view is narrowed over the buffer it moved into.
-
-```sysl
-first_two(a: [4]int) -> []int = a[0..<2]
-
-print(first_two([1, 2, 3, 4]).len)
+var hit = false
+install(() -> hit = true)
+print(hit)
 ```
 
 ```error
-a slice of an array this frame owns is returned, so it would outlive the array, and the storage is not this body's to move — 'a' is an array this body holds by value without having declared it, such as a parameter, so there is no declaration to move. Declare it as a '[]T', which makes a buffer of its own and owns it, or as a '&[N]T' where the length is fixed
+this closure captures by value, since it is handed to 'install' on line 6, which keeps its parameter 'f' (it is stored in 'later'), so it holds a copy of 'hit' — so assignment would reach that copy rather than the variable it came from, and nothing in the closure reads it back. Where you mean to change 'hit', hold it as a '&bool' and write through it, or have the closure return the value
 ```
-
-A field of a struct value is refused the same way, and the diagnostic says which of the two it met:
 
 ```sysl
-struct Pair
-    xs: [2]int
-
-firsts(p: Pair) -> []int = p.xs[..]
-
-print(firsts(Pair([1, 2])).len)
-```
-
-```error
-it is a field of 'p', a struct value, and a field moves only with its struct
-```
-
-**An element of a view or of a `Buf` is not the frame's storage.** `rows[i][..]` lives in the storage
-`rows` views, and `b[i][..]` in the buffer's, so the view's owner is that storage's owner. It may be
-returned, stored, captured or pushed like any other slice of a `Buf`, and it keeps the storage alive
-after the buffer grows or is dropped. Where `rows` is itself a view of an array on the frame, that
-array is promoted, as it would be for `rows[1..]`.
-
-```sysl
-import sysl.buf.{Buf, buf}
-
-row(rows: []const [4]int, i: usize) -> []const int = rows[i][..]
-
-var b: Buf[[4]int] = buf()
-b.push([1, 2, 3, 4])
-val first = row(b.view(), 0)
-val tail = b[0][2..]
-b = buf()
-print(first[3], tail.len)
-```
-
-```output
-4 2
-```
-
-**An element of a program's own container is the same where the container answers its storage's
-view** ([Arrays § A type with no elements of its own](arrays.md)): `c[i][..]` carries the owner of the `Buf` or view the
-elements live in, and leaves the frame by any route. **A container whose elements are its own bytes
-is the frame's where it is**: a view of part of one owns nothing and lasts as long as the container,
-so it may leave a frame only when the container lives outside it — in module storage, or reached
-through a `*T`.
-
-```sysl
-struct Ring
-    cells: [2][4]int
-
-impl IndexPlace[usize, [4]int] for Ring
-    index_place(*self, i: usize) -> *[4]int = &self.cells[i]
-
-row() -> []int
-    var r = Ring([[1, 2, 3, 4], [5, 6, 7, 8]])
-    r[1][..]
-
-print(row()[0])
-```
-
-```error
-it is an element of 'r', a container whose elements are its own bytes, so a view of part of one owns nothing and lasts only as long as the container does
-```
-
-**Module storage is never a root, whatever the path to it.** It lasts the whole run, so a view of it
-outlives every frame without moving anywhere: a field of a module array's element is as static as the
-array, and a slice of it goes through a trait object, or anywhere else, with nothing promoted.
-
-```sysl
-trait Sink
-    take(*self, words: []const u32)
-
-struct Count
-    n: usize
-
-impl Sink for Count
-    take(*self, words: []const u32) = self.n += words.len
-
-struct Row
-    words: [4]u32
-    len: usize
-
-var rows: [2]Row = [Row([0; 4], 0); 2]
-var sink: Count = Count(0)
-
-feed(s: *Sink, i: usize)
-    s.take(rows[i].words[0..<rows[i].len])
-
-rows[1].len = 3
-feed(&sink, 1)
-print(sink.n)
-```
-
-```output
-3
-```
-
-**Without an allocator it is always a compile error.** Under `no alloc` there is nothing to promote
-into, so every promotion becomes a refusal reported at the view that leaves the frame — and so does
-every literal argument a callee keeps. A machine whose manifest took the heap away (`capabilities {
-heap = false }`) is held to the same line in every module it builds, without a clause written
-anywhere: the refusal names the machine, `'thumbv7em-freestanding' provides no allocator`, rather
-than leaving the link to say `undefined symbol: malloc`. That is how
-every other allocation-gated feature behaves in the allocator-free subset — growable arrays, escaping
-closures, and `&T` creation are all compile errors there — so it introduces no new rule.
-
-### A view that outlives its scope is promoted too
-
-Leaving the frame is the widest way for a view to outlive its storage, and not the only one. The
-rule is the same at every width: **storage whose view outlives the storage's scope is promoted**.
-
-A **temporary**'s scope is its statement. What it holds is let go of at the end of it, and the slot
-it sat in is reused, by the next statement or by the same one on the next round of a loop. A view of
-it **kept in a local** is read on later lines, so the temporary moves to the heap and the local reads
-what was written:
-
-```sysl
-id(xs: []string) -> []string = xs
-
-val s = id([7.to_string() + "y"][..])
-
-print(s[0])
-
-first() -> int
-    var keep: []int = []
-
-    for i in 0..<3
-        if i == 0 then keep = [i * 10][..]
-
-    keep[0]
-
-print(first())
-```
-
-```output
-7y
-0
-```
-
-A **named array**'s scope is the block that declares it. One declared in a loop's body or an `if`'s
-branch is gone when that block closes, so a view of it kept in a local of an enclosing block moves it
-the same way. A part of either is the same case: the whole array moves, and the view names its part
-of the buffer.
-
-```sysl
-first() -> int
-    var keep: []int = []
-
-    for i in 0..<3
-        var row = [i * 10, i]
-
-        if i == 0 then keep = row[..]
-
-    keep[0]
-
-tail() -> []string
-    var keep: []string = []
-
-    if true
-        keep = [1.to_string(), 2.to_string() + "b", "c"][1..<2]
-
-    keep
-
-print(first(), tail()[0])
-```
-
-```output
-0 2b
-```
-
-Nothing moves where nothing outlives anything: a view used within its own statement, and a view of
-a named array kept while that array is still in scope, stay where they are.
-
-```sysl
-id(xs: []string) -> []string = xs
-
-print(id([7.to_string() + "y"][..])[0])
-
-val a = [7.to_string() + "y"]
-val s = a[..]
-
-print(s[0])
-```
-
-```output
-7y
-7y
-```
-
-Without an allocator, each of these promotions is a compile error at the view, as an escape from the
-frame is. A machine whose manifest says `heap = false` is told that it provides no allocator, and a
-module that declared `@no_alloc` is told that it did:
-
-```sysl
-@no_alloc
-
-first() -> int
-    var keep: []int = []
-
-    for i in 0..<3
-        if i == 0 then keep = [i * 10][..]
-
-    keep[0]
-
-print(first())
-```
-
-```error
-this view of an array literal is kept in 'keep', which outlives it, so the array would move to the heap to outlive its statement — and this module declared '@no_alloc', so there is nothing to move it into
-```
-
-### Promotion is silent, not hidden
-
-Silent promotion earns the obvious objection: an allocation appears that nothing in the source asked
-for. The answer is discoverability rather than ceremony — **`--explain-escapes`** reports every
-promotion the compiler made and the route that forced it:
-
-```
-$ sysl build --explain-escapes tty.sysl
-tty.sysl:31:12: 'buf' is promoted to the heap, because this view of it is returned
-```
-
-One line per array, in source order, on stderr, accepted by every subcommand. The position is the
-**view that forced the move** rather than the declaration, because that is the half a reader cannot
-work out for themselves. This is Go's `-m`, and it is the right shape: the common case costs no
-reading, and "why did this allocate?" always has an answer. A program that must not allocate says so
-with `no alloc`, and then the compiler enforces it rather than reporting it.
-
-The idiom worth reaching for first, even where an allocator exists, is the last one: **return a count
-and let the caller slice its own buffer.** That is what `snprintf` does, what Rust's buffer writers
-do, and what most kernel code wants.
-
-## Reinterpreting storage
-
-An allocator carves bytes and hands back a typed pointer — that is the whole of what an allocator
-does. A driver takes an address the datasheet gives as a number and reaches the register block at it.
-Both need a way to say which type some bytes are, and both are cases the raw tier already committed
-to.
-
-**Three directions, two spellings**, because they are not equally dangerous:
-
-| written | direction | tier |
-|---|---|---|
-| `usize(p)` | a pointer as a number | an ordinary conversion |
-| `ptr_cast(n)` | a number as a pointer | unsafe |
-| `ptr_cast(p)` | one pointee type as another | unsafe |
-
-**`ptr_cast` is imported, from `sysl.raw`** — `import sysl.raw.ptr_cast` — beside `str_cast` and
-`str_alias` (`strings.md`). The compiler still answers it, since its target comes from the position
-its value fills and no signature can say that, but its name is not in scope everywhere: a file names
-the raw-tier casts it makes, so every reinterpretation in a program is found by its imports. An
-alias (`import sysl.raw.ptr_cast as pc`), a wildcard (`import sysl.raw.*`) and a path through the
-module (`raw.ptr_cast(p)` after `import sysl.raw`) reach it as they reach anything else. **The
-import is required.** Written bare without one, the form is refused, and the error names the line
-to add:
-
-```sysl
-var arena: [8]u8 = [0u8; 8]
-val p: *u32 = ptr_cast(&arena[0])
-
-print(*p)
-```
-
-```error
-'ptr_cast' is in sysl.raw: add 'import sysl.raw.ptr_cast'
-```
-
-A function or a local the reader names `ptr_cast` is what a call reaches, imported or not; importing
-the form under the name of one is refused, since the name would mean two things.
-
-**A pointer becomes an integer through the ordinary conversion syntax**, because it is an ordinary
-conversion: `usize` is wide enough to hold any address by definition, so it is total and loses
-nothing, and the result is a number that cannot be dereferenced. `isize` takes one too, which is what
-a program comparing addresses against a signed offset wants.
-
-```sysl
-import sysl.raw.ptr_cast
-
-struct Node
-    value: int
-
-var arena: [64]u8 = [0u8; 64]
-var n: *Node = ptr_cast(&arena[0])
-
-n.value = 42
-
-print(n.value, sizeof(Node), usize(n) == usize(&arena[0]))
-```
-
-```output
-42 4 true
-```
-
-**The address of a function converts as well**, and for the same reason: `&f` is an address, it is a
-pointer's width, and the number that comes out cannot be dereferenced any more than the one above
-can. It is what a binding reaches for when a C library wants a callback registered through something
-that takes a number, and it is the same row of the table rather than a special case.
-
-**A number becomes a pointer only from an address-width integer**, `usize` or `isize`. A fixed width
-is not an address's width on every target, and reading a narrower one would invent the address's top
-bits. **The operand of `ptr_cast` is an address-width position**, as the initializer of a
-`val a: usize` is: a bare integer literal, or an expression made of nothing but bare integer
-literals, is a `usize` at the target's width. So the address a datasheet gives is written as it is
-printed there, and so is a base plus an offset or a bit shifted into place:
-
-```sysl
-import sysl.raw.ptr_cast
-
-struct Uart
-    data: u32
-    status: u32
-
-val uart: *Uart = ptr_cast(0x4000_4000)
-val status: *u32 = ptr_cast(0x4000_4000 + 4)
-val bit: *u8 = ptr_cast(1 << 20)
-val none: *Uart = ptr_cast(0)
-
-print(usize(uart), usize(status), usize(bit), usize(none))
-```
-
-```output
-1073758208 1073758212 1048576 0
-```
-
-Each literal has to fit: an address too wide for the target's `usize` — above `0xFFFF` on a 16-bit
-machine, above `0xFFFF_FFFF` on a 32-bit one — or a negative one is refused as any literal that does
-not fit its type is, and the arithmetic over them wraps at that width as integer arithmetic does. A
-value that already has a type keeps it, so an `int`, a suffixed literal such as `16u32`, or an
-expression with either inside it is still refused, and is converted where it is meant as an address:
-
-```sysl
-import sysl.raw.ptr_cast
-
-var base = 0x4000_4000
-val uart: *u32 = ptr_cast(base)
-
-print(usize(uart))
-```
-
-```error
-'ptr_cast' reads an address, and int is not address-width — convert it first, as 'ptr_cast(usize(n))'
-```
-
-**The target type comes from whatever receives the result** — the same way `va_arg`, a bare `None`,
-and a bare `null` all take theirs. Where that is not where a reader wants to say it, it may be
-written on the form: `ptr_cast[*Node](&arena[0])` is
-[the written type-argument list](/reference/generics/) at a special form. Where neither says which
-pointer is wanted, the program is told to annotate what receives it:
-
-```sysl
-import sysl.raw.ptr_cast
-
-var arena: [64]u8 = [0u8; 64]
-var p = ptr_cast(&arena[0])
-
-print(1)
-```
-
-```error
-'ptr_cast' reads an address as a pointer to some type, and nothing here says which
-```
-
-**`ptr_cast` never produces a `&T`.** A reference is a safe-tier value — non-null, refcounted, and
-relied on by everything the safe subset promises — and an address invented from bytes has no count for
-ARC to own and no object to be non-null about:
-
-```sysl
-import sysl.raw.ptr_cast
-
-struct Node
-    value: int
-
-var arena: [64]u8 = [0u8; 64]
-var n: &Node = ptr_cast(&arena[0])
-
-print(n.value)
-```
-
-```error
-'ptr_cast' never produces a reference: a '&T' is counted and non-null, and an address read out of bytes carries no count for anything to own — read it as a '*T'
-```
-
-A `weak T` is refused for the same reason, and the fat types — a slice, a `string` — for that reason
-and one more: they are wider than an address, so there is nothing to reinterpret. What comes out is a
-`*T`, and reaching anything else from it is the ordinary route through `*p`.
-
-### Storage the compiler did not lay out may not hold a counted value
-
-`ptr_cast` says which type some bytes are. It does not make those bytes into storage the language
-manages, and the difference has one consequence worth stating on its own: **a `&T`, a `weak T`, a
-slice or a `string` may not be written into memory reached that way** — nor may a struct or an enum
-that carries one.
-
-The reason is what an assignment to such a field *does*. It releases whatever occupied the slot
-before writing the new value, so the release walks whatever the bytes happened to look like.
-
-**Nothing refuses this**, and that is why it is written here. The compiler knows the field's type but
-not where the pointer came from: `p.next = other` through a `p` that is `&local` writes a field it
-laid out, whose previous occupant is a real box, and the release is correct; through a `p` that is
-`ptr_cast` over an arena the same line walks raw bytes. Telling the two apart needs provenance the
-front end does not track.
-
-**Zeroed storage is the exception, and it is the one a collector or a `calloc` gives.** A counted
-reference that is all zero bits names nothing, and giving back a share of nothing is nothing — so a
-`&T` field (or a `Buf`, `Map` or `Deque`, each of which is one) in storage zeroed before its first use
-takes its first assignment safely, and `string` and slice fields already did. Until it is assigned it
-is the one `&T` that is null, and **`is_null(r)` is how a program asks**: one compare of the address
-with null, no share taken. An ordinary `&T` — one the language made — is never null, and `is_null`
-answers `false` for it; a trait object and a `weak T` are refused, the latter answering through
-`.get()`, and anything that is not a reference is refused naming its type.
-
-```sysl
-import sysl.raw.ptr_cast
-
-extern "calloc" c_calloc(n: usize, size: usize) -> *u8
-extern "free" c_free(p: *u8)
-
-struct Item
-    label: string
-
-struct Slot
-    item: &Item
-
-val s: *Slot = ptr_cast(c_calloc(1, sizeof(Slot)))
-
-print(is_null(s.item))
-
-s.item = Item("a")
-
-print(is_null(s.item), s.item.label)
-
-release(s.item)
-
-print(is_null(s.item))
-
-c_free(ptr_cast(s))
-```
-
-```output
-true
-false a
-true
-```
-
-The storage is still the program's to free, and freeing it releases nothing: a counted field there is
-given back before the block goes, and **`release(place)` is how** — `is_null`'s other half. It gives
-back the share the `&T` place held, running the destructor when that was the last one, and leaves the
-place naming nothing, exactly as the zeroed storage started; nothing is allocated, which is why a
-finalizer calls it rather than assigning a fresh value it would only lose. A place released twice gives
-back nothing the second time, and one released may be assigned again. A container gives its share back
-through its own `release()` member, and an `Option` or a `weak T` is emptied by assigning `None`, so
-`release` is refused on those — and on anything that is not a place, or not a counted reference at all:
-
-```sysl
-import sysl.buf.{Buf, buf}
-
-struct Holder
-    names: Buf[string]
-
-val h = Holder(buf())
-
-release(h.names)
-```
-
-```error
-'release' gives back what a '&T' place holds, and Buf[string] gives its share back through its own member — call '.release()' on it
-```
-
-Like `is_null`, it is a form the compiler answers only where nothing else claims the name: a function
-or a local called `release` is what a call reaches.
-
-**Keep an index, a raw pointer, or a copy instead.** An arena of nodes linked by index is the
-ordinary answer, and it costs nothing a box was buying:
-
-```sysl
-struct Node
-    value: int
-    next: usize          // an index into the arena, not a '&Node'
-
-const nowhere: usize = 999
-
-main()
-    var arena: [4]Node = [Node(0, nowhere); 4]
-
-    arena[0] = Node(10, 1)
-    arena[1] = Node(20, 2)
-    arena[2] = Node(30, nowhere)
-
-    var at: usize = 0
-    var total = 0
-
-    while at != nowhere
-        total += arena[at].value
-        at = arena[at].next
-
-    print(total)
-```
-
-```output
-60
-```
-
-The same rule read from the other side: a type whose fields are all scalars, raw pointers and arrays
-of those is free to live in storage you carved. That covers every C ABI struct, which is what the raw
-tier is mostly for.
-
-`sizeof`, `alignof` and `offsetof`, which measure what is being carved, are on the
-[expressions](/reference/expressions/) page.
-
-## Slot storage: room that holds no value yet
-
-A growable container needs storage whose spare end holds **nothing** — not a fill value repeated into
-every slot, which for a counted element would keep whatever it names alive until the slot is
-overwritten. Three forms give the raw tier exactly that, and they are what
-[`sysl.buf.Buf`](/library/buf/) is written with:
-
-- **`slot_storage(n)`** (or `slot_storage[T](n)`) is a `[]T` of `n` slots of which **none is live**.
-  The element type comes from the position, the way `ptr_cast`'s does.
-- **`slot_place(xs, i, v)`** puts `v` in slot `i`. The first slot past the live ones is filled
-  without letting go of anything, and the live run grows by one; a live slot is an ordinary
-  assignment; a slot further on would leave a gap, so it **traps**.
-- **`slot_vacate(xs, n)`** lets go of every live slot from `n` on and shortens the live run to `n` —
-  but only where nothing else holds the storage. A view handed out earlier still reads those slots,
-  so while one exists the form does nothing, and the next vacate after the sharing ends catches up.
-
-```sysl
-struct Node
+struct Counter
     n: int
 
-var xs: []&Node = slot_storage(4)
+bump(c: Counter) = c.n += 1
 
-slot_place(xs, 0, Node(1))
-slot_place(xs, 1, Node(2))
+var c = Counter(1)
 
-print(xs.len, xs[0].n + xs[1].n)
+bump(c)
+print(c.n)
+```
 
-slot_vacate(xs, 1)
-slot_place(xs, 1, Node(5))
+```error
+this '+=' changes 'c', a copy of what the caller passed, and nothing reads 'c' afterwards, so the change is lost — take 'c: *Counter' to change the caller's value, or return the value
+```
 
-print(xs[0].n + xs[1].n)
+### A value's own storage is not foreign
+
+**Where it is stored decides, not only that it is.** None of these is a keep:
+
+- a pointer stored into what it points at — a node linked to itself, a struct whose field points into
+  its own buffer — which ends exactly when that storage does;
+- nodes linked inside one local or one local array;
+- a store into what *another* parameter points at, which is the caller's to judge: if that argument
+  points into the caller's frame, the pointer stays in the frame too — so an out-parameter writes into
+  the caller's storage;
+- a value pushed onto a `Buf` the function made itself, held only as long as that buffer — unless the
+  buffer gets out (returned, stored, captured by a kept closure, handed to a keeping callee) or
+  something read back out of it is kept. A buffer the function was handed, reached through a `ref`,
+  or copied from module storage is not its own.
+
+```sysl
+struct Node
+    next: *Node
+    v: int
+
+link(a: *Node, b: *Node)
+    a.next = b
+
+put(out: **Node, v: *Node)
+    *out = v
+
+run() -> int
+    var nodes: [3]Node = [Node(null, 1), Node(null, 2), Node(null, 3)]
+    var last: *Node = null
+
+    link(&nodes[0], &nodes[1])
+    link(&nodes[1], &nodes[2])
+    put(&last, &nodes[2])
+    nodes[0].next.next.v + last.v
+
+print(run())
 ```
 
 ```output
-4 3
 6
 ```
 
-**The live run is the storage's own, not the slice's**: the buffer's box carries the count of live
-slots, and its destructor releases exactly those, so storage dropped with two of four slots placed
-releases two. The slice's `len` is still the whole room. **What the compiler cannot check is the one
-thing the caller owes**: nothing reads a slot past the live run, whose bytes are whatever the
-allocator left. That is the raw tier's bargain, as it is for `ptr_cast` — the forms are greppable, and
-`Buf` is what writes them so that a program does not have to.
+## The annotation layer
 
-A form with no element type to make is refused at the call:
+Every annotation is a promise the compiler **checks against the body where it has one, and trusts
+where it has none**. They exist for the code the rules above cannot see into:
+
+| spelling | where | says |
+|---|---|---|
+| `@keeps(p)` | `extern`, trait method | `p` may be held past the call ([ffi](/reference/ffi/#keeps-a-c-function-that-holds-on-to-a-pointer), [attributes](/reference/attributes/#keeps-and-answers-on-a-trait-method)) |
+| `@keeps *T` | a parameter of a callable or function pointer type | the same, for whatever is made at that type |
+| `@lets_out *T` | a parameter of a callable or function pointer type | what is read through it may be held past the call; the pointer itself is borrowed |
+| `@answers(p)` | `extern`, trait method | the answer is made of `p` |
+| `@scoped(p)` | a primitive | `p` is held only while the caller waits — a scope's join, an `await`, a wake |
+| `@views(self)` | a member | the view it answers is borrowed from the receiver |
+| `@relocates` | a member | it may move or give up the receiver's storage |
+| `@crossing(p)` | a function, a member | `p` reaches another concurrency domain ([below](#crossing-a-concurrency-domain)) |
+| `ptr_cast`, `@unchecked` | expression, block | the unchecked tier; `usize(p)` is a number, and the compiler follows no provenance through integers |
+
+**Released in another context, the primitive says `@scoped`.** A scope's join, the `deliver` that ends
+an `await`, a kernel's `wake` hold a pointer past the call and let go of it somewhere the compiler
+cannot follow, while the caller is suspended or still inside its scope. The primitive declares it once
+with [`@scoped(p)`](/reference/attributes/#scoped-p-on-a-pointer-held-only-while-the-caller-waits) and
+is trusted, so `block(&local)` and `await read(&buf)` carry no annotation. Handing `p` on to a callee
+that keeps it is refused unless that callee says `@scoped` too.
+
+## Threads
+
+### A thread borrows a frame only inside a scope
+
+**A `*T` that crosses into another domain is kept**: the thread may read it after the starting call
+has returned, so `spawn(&work, &local)` is refused whether or not the handle is joined afterwards —
+`spawn`'s `arg` is `@crossing`, and the refusal names what works:
 
 ```sysl
-var xs = slot_storage(4)
+import sysl.threads.*
+
+struct Tally
+    n: int
+
+add(t: *Tally)
+    t.n = t.n + 1
+
+count() -> int
+    var t = Tally(0)
+
+    spawn(&add, &t).unwrap().join()
+    t.n
+
+print(count())
 ```
 
 ```error
-'slot_storage' makes storage for elements of some type, and nothing here says which
+'spawn' keeps its parameter 'arg' (it reaches another concurrency domain), and '&t' is the address of a local of 'count' — a thread that borrows the frame of 'count' is started on 'sysl.threads.scope', which joins it before the scope returns; anything else is handed storage that lasts
 ```
 
-On storage that `slot_storage` did not make — an array, a frame, a view of a struct's field — the
-two writing forms are an ordinary assignment and nothing at all, since there is no live run to move.
-
-### Moving one value through a raw pointer
-
-Storage whose live slots are not a prefix — a ring's run wraps, so a vacated slot can sit between two
-live ones — cannot use the three forms above, which count a run. Two more move a single value through
-a raw pointer, one slot at a time:
-
-- **`slot_take(p)`** moves the value out of the slot `p` points at. The share the slot held becomes the
-  result's, so **no count is taken or given back**, and the slot is left **empty**. Over an element
-  that holds a count the slot is zeroed, which is the state zeroed storage starts in; over a plain
-  value it is only read.
-- **`slot_put(p, v)`** moves `v` into an **empty** slot. Nothing that was there is given back, so a
-  slot that was not empty keeps its old share for ever.
-
-**This is the raw tier's bargain again, and the caller owes the compiler's missing check**: a taken
-slot must be live, a put slot must be empty, and nothing reads or lets go of a slot while it is empty.
-Rust's `ptr::read` and `ptr::write` are the same pair. A container written with them gives a value up
-at the moment it hands it over — `Ring`'s `pop_front` returns the value with its destructor still to
-run in the caller, rather than leaving a second share behind in the slot for the next push to release.
+**[`scope`](/library/threads/#scoped-threads) joins every thread started on it before it returns**,
+whichever way its body leaves, and its `spawn` is
+[`@scoped(f)`](/reference/attributes/#scoped-f-a-member-that-finishes-what-it-starts-before-its-scope-closes),
+so a closure started there may hold a view of the caller's array or the address of its local — Rust's
+`std::thread::scope`:
 
 ```sysl
-var x = 5
-val p = &x
+import sysl.threads.scope
 
-print(slot_take(p))
-slot_put(p, 9)
-print(x)
+halves() -> int
+    var v = [0; 8]
+    val all = v[..]
+    val half = all.len / 2
+
+    scope((s) ->
+        s.spawn(() -> for i in 0..<half do all[i] = 1)
+        s.spawn(() -> for i in half..<all.len do all[i] = 2))
+
+    var sum = 0
+
+    for x in v do sum += x
+
+    sum
+
+print(halves())
 ```
 
 ```output
-5
-9
+12
 ```
 
-Both refuse what is not a pointer:
+- **What a scoped thread borrows has to outlive the `scope` call, not only the body**, so the body's
+  own locals, a nested block's and its temporaries are refused (Rust's `'env` against `'scope`). A
+  helper handed `s`, and a wrapper forwarding to `spawn`, are held the same way. A scope nested in the
+  body may borrow the outer body's locals.
+- **A fan-out needs no joining loop**: whatever the body leaves unjoined, the scope joins. A handle's
+  `join` answers what its closure answered, and `scope` what its body answered. A function handed the
+  `*Scope` may start threads with its own caller's storage; one opening a scope of its own keeps
+  nothing it is handed. A scope may be opened inside a scoped thread, and its threads may borrow that
+  thread's locals. A program with no heap opens [`scope_in`](/library/threads/#scoped-threads), whose
+  thread records are slots the caller lays out, and starts threads with `start(&body, arg)`, which
+  may be handed a local's address on the same terms.
+- **A wrapper keeps what it hands `spawn`**, so a frame address handed to it is refused at the
+  wrapper's call, and the refusal still names the scope.
+- **A plain `spawn` is for storage that lasts** — a box shared as `&sync`, or module storage — so the
+  thread may outlive its caller and never be joined. The entry file's own statements are exempt: their
+  frame outlives every thread.
 
 ```sysl
-val n = 3
+import sysl.threads.scope
 
-print(slot_take(n))
+halves() -> int
+    scope((s) ->
+        var v = [0; 8]
+        val all = v[..]
+
+        s.spawn(() -> all[0] = 1)
+        v[0])
+
+print(halves())
 ```
 
 ```error
-'slot_take' moves a value through a raw pointer, which is a '*T' — this is int
+'() -> all[0] = 1' holds a view of 'v', a local of 'call' — a thread started on a scope may borrow only storage that outlives the 'scope' call, and 'v' does not; declare 'v' before 'scope'
 ```
-
-## Device memory
-
-`ptr_cast` gets a driver to the register block. It does not get it a *correct* driver, and the missing
-half is this: an optimizer is entitled to assume that reading the same storage twice yields the same
-value, that a store nobody reads is a store nobody needs, and that two accesses in a row may be one
-wider access. Every one of those assumptions is false at a device. `while regs.status == 0u32 do ()`
-is a loop that reads a register until the hardware changes it, and a compiler that hoisted the read
-out would spin forever on the first value it saw.
-
-So sysl has C's qualifier, spelled the way C spells it — in the type:
-
-```sysl
-struct Uart
-    status: volatile u32
-    data:   volatile u32
-    baud:   u32
-
-var block = Uart(1, 0, 115200)
-var regs: *Uart = &block
-
-regs.data = 65
-
-print(regs.status, regs.data, regs.baud)
-```
-
-```output
-1 65 115200
-```
-
-> A **`volatile`** place is one whose reads and writes are **effects, not value computations**. It
-> may change without the program changing it, and reading it may itself do something. So the compiler
-> emits exactly the accesses the source wrote, exactly once each, in the order written — never adding,
-> dropping, merging, or moving them relative to one another.
-
-**It constrains the compiler, not the machine.** No atomicity, no ordering against another core, no
-protection from a torn read. C spent two decades learning this; for talking to another thread the
-tools are `&sync T`, `Mutex[T]`, `Atomic[T]` and explicit orderings, and none of them is spelled
-`volatile`. A program that reaches for this word to share a counter has written a race with a keyword
-in front of it.
-
-### It qualifies storage, and a value read out of storage is an ordinary value
-
-This is the rule everything else follows from. `regs.status` above has type `u32` — not
-`volatile u32` — because what a load hands back is a number, and a number is not somewhere a device
-can write. What is qualified is the **place**, and the qualifier lives in the three types that name a
-place somebody else owns, and on the one declaration that names storage where it stands:
-
-| written | what is qualified |
-|---|---|
-| `status: volatile u32` | a struct field |
-| `bank: [4]volatile u32` | an element — a GPIO bank |
-| `p: *volatile u32` | a pointee — the lone register |
-| `var tick: volatile u64` | a module's own storage — a word an interrupt handler writes |
-
-Everywhere else the type being written is the type of a **value**: what a local `var` holds, what a
-parameter receives, what a function hands back, what a type argument stands for.
-
-```sysl
-var x: volatile u32 = 0u32
-
-print(x)
-```
-
-```error
-'volatile u32' is the type of *storage*, and this is a value — what a read of a volatile place hands back is an ordinary 'u32'. The qualifier goes where the storage is named: a struct field, an element, or the pointee of a '*T', as '*volatile u32'
-```
-
-The diagnostic says which spelling was wanted, because a program that writes `var x: volatile u32`
-in a body almost always meant `*volatile u32`.
-
-### Module storage shared with an interrupt handler
-
-A module `var` — or a `static var` in the file a program starts in — **is** storage, named where it
-is declared, so it may be `volatile`. It is how a kernel or a bare-metal program shares a word with
-an interrupt handler before anything heavier exists: the handler writes it, the program polls it, and
-the poll has to read memory every time round.
-
-```sysl build=c target=aarch64-freestanding
-var ticks: volatile u64 = 0
-
-@export("on_timer")
-on_timer()
-    ticks += 1
-
-@export("wait_for")
-wait_for(n: u64)
-    while ticks < n do ()
-```
-
-Every read of `ticks` is one volatile load and every write one volatile store, of the whole width.
-At `-O2` the loop in `wait_for` stays a loop that loads `ticks` each time round; with a plain `var`
-the optimizer is entitled to load it once and branch to itself for ever, since nothing in the program
-it can see writes it. What a read hands back is an ordinary `u64`, and `&ticks` is a
-`*volatile u64`, exactly as `&` of a volatile field is.
-
-**`ticks += 1` is a volatile load and then a volatile store — it is NOT atomic.** An interrupt taken
-between the two, whose handler writes `ticks` as well, loses that write. That is fine where only the
-handler writes and the program only reads, which is the shape above; where both sides write, or two
-cores share the word, the tool is `Atomic[T]` from `sysl.sync`, and the qualifier says nothing about
-ordering against another core.
-
-The type is held to what a field is held to — a scalar or a raw pointer — since the promise is one
-access of the whole width. A struct is refused as a whole, and the refusal points at the spelling
-that works, a struct whose fields are volatile:
-
-```sysl target=aarch64-freestanding
-struct Counts
-    ticks: u64
-    irqs: u64
-
-static var counts: volatile Counts
-```
-
-```error
-'volatile Counts' cannot be the type of 'counts': a volatile access is one load or one store of the whole width, and 'Counts' is a struct. Write 'volatile' on its fields instead, as 'n: volatile u64', and declare the storage as a plain 'Counts'
-```
-
-A `val` is refused: it is a constant, so nothing can write it behind the program's back.
-
-```sysl target=aarch64-freestanding
-val limit: volatile u64 = 3
-```
-
-```error
-'limit' is a 'val', and a 'val' is a constant: nothing writes it once it starts, so no access to it can be one the program did not make, and 'volatile' has nothing to say. Storage an interrupt handler or a device writes is a 'var'
-```
-
-**Per field, not per aggregate.** C also allows `volatile struct Uart`; sysl does not, and the block
-above shows why. `baud` is a shadow value the driver keeps in ordinary memory beside the registers,
-and every real device header has one — a reserved word, a cached configuration, a software flag. A
-qualifier on the whole struct would sweep it in:
-
-```sysl
-struct Uart
-    status: u32
-
-var p: *volatile Uart = null
-
-print(1)
-```
-
-```error
-a register block is qualified one field at a time
-```
-
-Qualifying per field is the same power with the opt-out, it is what CMSIS and every other vendor
-header already does, and it makes the restriction below a check on one scalar instead of a walk of a
-type.
-
-**Only a scalar or a raw pointer may be qualified.** The promise is about *the* load and *the* store
-the source wrote, so it is only meaningful where an access is one instruction:
-
-- **a counted value is refused outright** — a `&T`, a `weak T`, a slice and a `string` come with
-  retains and releases the compiler places, and a retain that may not be elided is not a request
-  anybody could act on;
-- **a trait object is refused** for a plainer reason: it is two words, so touching one is two accesses
-  whatever the source says, and the table beside the value is this program's rather than a device's;
-- **a constrained subtype is refused**, and this one is about trust rather than instructions. A
-  `Level = int within 0..7` is the claim that a value *has been checked*; a register holds whatever
-  the device put there. So the register is declared at the base type and what comes back is converted
-  — one written conversion, checked, at the point the value arrives;
-- **a data enum is refused** — a tag beside a payload is more than one access however it is written.
-
-A **simple enum** is admitted, since it *is* its underlying integer: it is one load, and it is the
-spelling a register's mode field wants. So is a **bitfield**, which is the one case where the access
-reaches more than the field named — the qualifier applies to the container the field is bits of, so a
-write is a read-modify-write of the whole of it. `@packed` on
-[attributes](/reference/attributes/) states that rule and what it costs a driver.
-
-**A struct that holds a register carries no `invariant`.** A check is a call taking every field, so it
-reads the whole block however few fields the clause names — an invariant written over the shadow value
-beside the registers would make writing that shadow an access to the device. There is nothing to hold
-the clause true either: a device changes a register between the check and the instruction after it. A
-register is checked where it is read.
-
-### What the compiler does with it
-
-A qualified access lowers to LLVM's `load volatile` / `store volatile`, which is exactly the barrier
-this needs: it stops the reordering, elision and merging above, and stops nothing else. There is no
-runtime cost and no runtime component.
-
-- **A qualified field is reached at its own address**, not lifted out of the block. Reading a `Uart`
-  to find out what is in `status` would also read `data`, and reading a data register is how a FIFO is
-  popped — so a qualified field gets a place walk, one `getelementptr` and one `load volatile`, with
-  nothing else touched.
-- **A whole block copied is a copy of every register in it.** `var u = *regs` is one access to each,
-  which is as much an effect as one access to one of them, so the aggregate access is marked too.
-  Whether a driver wants that is the driver's business; what it does not get is a silent unqualified
-  read of hardware.
-- **An address taken of a register is the address of a register.** `&regs.status` has type
-  `*volatile u32`, so a driver may hand one register to a helper and every access the helper makes is
-  still an access to a device. Without that, a driver would have to be one function.
-- **A type parameter never binds to a qualified type.** The loads and stores a generic body emits are
-  *its* accesses, written once and shared by every instantiation, so it cannot promise to have written
-  the ones a particular caller had in mind.
-
-**`volatile` is not reserved.** It is special only in front of another type, so a program with a
-variable, a field, a function, or a type of its own by that name still compiles — the same arrangement
-`sync` has after `&`:
-
-```sysl
-var volatile = 7
-
-print(volatile + 1)
-```
-
-```output
-8
-```
-
-**`[]const T` composes with it and means a different thing.** `const` is a property of the *view* —
-these elements may not be written through this handle — while `volatile` is a property of the
-*element*. A read-only device register is `[]const volatile u32`, and both words are doing work.
-
-### Memory a device reads and writes is a library type, not a qualifier
-
-`volatile` is about the device's **registers**. The memory a device reaches by DMA — a buffer, a
-descriptor ring — is ordinary memory the processor reads and writes normally; what it needs is an
-address the *device* can use and a handover that keeps the caches honest, and neither is a property
-of a place. So it is [`sysl.dma`'s `Region`](/library/dma/): it carries the device's address of its
-first byte, is made only by `adopt` from memory somebody knows to be device-reachable, and an ordinary
-`[]u8` is not one. No qualifier on `*T` or `[]T` says where storage is, because a slice's type cannot
-know whether it was cut from a stack, a heap block or a frame — the region's maker does.
-
-## Where `defer` sits
-
-[`defer`](/reference/statements/#defer) is the model's answer for what the language does *not* own: a
-descriptor from `open`, a `FILE*` from `fopen`, a block from `malloc`, a lock taken from a mutex. ARC
-gives back a reference, a string, and a slice's backing without being asked, and knows nothing about
-those.
-
-Three facts place it against everything above:
-
-- **Leaving a block undoes it in reverse.** Each deferred statement the block reached and each local
-  it declared is undone in the reverse order of where it was written, the last one first: a `defer`
-  runs after every local declared below it has been released, and before every local declared above
-  it. A deferred statement can name only the locals above it, so every one it names is still alive
-  when it runs — including the one holding the resource it is closing. Leaving from the middle unwinds
-  outward: the innermost block is undone whole, then the block outside it.
-- **It owns nothing and allocates nothing.** `defer` takes no count, makes no box, and adds no word to
-  any value; a program that does not use it emits nothing for it. That is what keeps it available
-  under `no alloc`, where the resources it releases are the only ones there are.
-- **A trap runs nothing.** A trap aborts without stack cleanup, and `defer` does not qualify that: a
-  broken invariant means the program's model of itself is already wrong, and running cleanup against
-  that state is how a corrupt program writes its corruption to disk on the way down.
-
-The order is what makes a lock taken, then `defer`-unlocked, stay held while everything made under
-it is given back — a destructor that runs on the last count runs inside the lock, not after it:
-
-```sysl
-struct Conn
-    name: string
-
-impl Drop for Conn
-    drop(self) = print(s"close ${self.name}")
-
-serve()
-    val a: &Conn = Conn("a")
-    print("lock")
-    defer print("unlock")
-    val b: &Conn = Conn("b")
-    defer print("flush")
-    val c: &Conn = Conn("c")
-
-    print(s"serve ${a.name}${b.name}${c.name}")
-
-serve()
-```
-
-```output
-lock
-serve abc
-close c
-flush
-close b
-unlock
-close a
-```
-
-This is the order Rust, C++ and D give destructors and scope guards, and Zig's `defer`s, which are its
-only cleanup, run in it trivially. A `return`, a `break`, a `continue` and a `?` undo the blocks they
-leave in the same order; an [`errdefer`](/reference/statements/#errdefer) takes its written place
-when the function is failing and is skipped otherwise. A temporary is still released at the end of
-its statement.
-
-**What it is not is a destructor.** A destructor belongs to a *type* and runs wherever a value of that
-type dies; `defer` belongs to one place in one body and runs for the resource that body took. Both
-exist, and the next section is why neither replaces the other.
 
 ## A destructor
 
 **`impl Drop for T` says what a type does when the last reference to one of its values goes.** It
-declares one member, `drop(self)`, and it answers nothing:
+declares one member, `drop(self)`, answering nothing. It is for the resource the language does not
+manage — a descriptor, a mapped region, a handle a C library made — said once, beside the type:
 
 ```sysl
 struct Handle
@@ -3961,65 +1634,35 @@ closing 7
 done
 ```
 
-**It is for the resource the language does not manage.** ARC returns the storage and releases
-whatever the value holds; what it cannot do is close a descriptor, unmap a region, or hand a handle
-back to the C library that made it. Those live at the far end of a `*T` or behind an integer, and
-nothing about either says it is owned. The destructor is where that is said, once, beside the type.
-
 **`defer` is the other way to say it, and neither replaces the other.** `defer close(f)` covers every
-site a program can *name*. Under ARC a value can also die where there is no site to write one — and
-that case is the whole argument for this being a capability rather than a shorthand:
-
-```sysl
-struct Handle
-    id: int
-
-impl Drop for Handle
-    drop(self) = print("closing", self.id)
-
-hold()
-    var xs: []&Handle = [Handle(1), Handle(2)]
-    print("holding", xs.len)
-
-hold()
-print("done")
-```
-
-```output
-holding 2
-closing 1
-closing 2
-done
-```
-
-Nothing in that program names the moment either element dies. The slice goes, and its elements go
-with it — so no `defer` could have been written, and a leak there would not be something the author
-could have prevented. Where both would work, the destructor is the better one: it is written once,
-and a caller cannot forget it.
+site a program can *name*; under ARC a value can also die where there is no site to write one — an
+element of a `[]&Handle` goes when the slice does — and there only a destructor can be written. Where
+both work, the destructor is written once and a caller cannot forget it.
 
 **It costs nothing to have.** Release already calls through a per-payload hook, and a destructor is a
-call at the top of that hook. A type without one produces exactly the hook it always did. And a
-destructor is in the program only where the program holds a value of its type — made, stored, carried
-in a field, a container, an enum payload or a closure — so a library type's destructor costs a program
-that never makes one nothing at all: one that calls `sysl.process.pid` carries no `Child.drop`, and on
-a bare-metal target is not asked to answer the hooks that destructor would call.
+call at its top. A destructor is in the program only where the program holds a value of its type, so
+a library type's destructor costs a program that never makes one nothing, and on a bare-metal target
+the hooks it would call are not asked for.
 
-### The four limits, each a consequence of where it runs
+**What ARC and `Drop` guarantee:**
 
-**It runs before the value's own references are released**, so it is handed `self` intact and a field
-may be read to close what it names. It borrows rather than taking a count — the count is already
-zero, and taking one would resurrect the object into a second teardown.
-
-**It runs only for a value on the heap, so a type with a destructor is a reference type.** A value
-type is copied, and a copy is not a second resource: there is no single point of death to hook, and
-running it per copy would close one descriptor several times. So the language never lets a program
-hold one by value — the next section is what that means to write.
+- **Every heap object is released exactly once, on every path**: a `return`, a `?`, a `break`, a
+  `continue`, a `match` arm, a `defer` and an unwound temporary.
+- **The order is Rust's**: locals in reverse order of declaration at the end of their block, each
+  deferred statement in its written place among them; temporaries at the end of their statement;
+  fields and elements in declaration and index order.
+- **`drop(self)` runs before the object's own fields are released**, sees `self` intact, and may not
+  resurrect it.
+- **A type with `Drop` is a reference type**, so only `&T` of it exists.
+- **A copy of a value retains its `&T` fields.**
+- **Cycles leak unless broken with `weak`.**
 
 ### A type with a destructor is a reference type
 
-**Building one makes a `&T`, with nothing written.** `Thing(1)` is a `&Thing` wherever it stands — an
-inferred local, a temporary, a branch, a field, a container's element, an `Ok` — so the destructor
-always has a count to hang off:
+A value type is copied, and a copy is not a second resource, so a destructor runs only for a value on
+the heap. **Building one makes a `&T`, with nothing written** — an inferred local, a temporary, a
+branch, a field, an element, an `Ok` — and a position naming the count keeps it (`val t: &sync Thing
+= Thing(1)`; a trait object boxes on its way in):
 
 ```sysl
 import sysl.buf.{Buf, buf}
@@ -4057,14 +1700,9 @@ drop 1
 done
 ```
 
-A position that names the count keeps it: `val t: &sync Thing = Thing(1)` builds an atomically counted
-one, and a trait object — `val s: &Shape = Thing(1)` — boxes on its way into the table, as it does for
-any value.
-
-**Every spelling that would hold one by value is refused**, with the `&T` to write in its place: a
-binding, a parameter, a result, a field, an enum payload, module storage, and any of those holding it
-inside a `Buf`, an `Option`, an array, a slice or a tuple. The constructor that hands one back is the
-case that looks most innocent, and is told even when nothing calls it yet:
+**Every spelling that would hold one by value is refused**, with the `&T` to write: a binding, a
+parameter, a result, a field, an enum payload, module storage, and any of those inside a `Buf`, an
+`Option`, an array, a slice or a tuple — at every level that owns the resource, not only the outermost:
 
 ```sysl
 struct Encoder
@@ -4081,9 +1719,6 @@ print("ready")
 ```error
 'open' hands back 'Encoder' by value, inside 'Result[Encoder, string]', and 'Encoder' has a 'Drop' — a type with a destructor is a reference type, and building one makes a '&Encoder'. Write '&Encoder' in its place
 ```
-
-**The rule is the type at every level that owns a resource, not the outermost one**, so a field is
-asked as surely as a result is:
 
 ```sysl
 struct Thing
@@ -4102,10 +1737,8 @@ print("ready")
 field 'inner' of 'ByValue' holds 'Thing' by value and 'Thing' has a 'Drop' — a type with a destructor is a reference type, and building one makes a '&Thing'. Write '&Thing' in its place
 ```
 
-**A copy is never made into a second owner.** The one by-value value of the type a program still
-sees is a copy — a method's `self`, or `*r` read out of a reference. It may be read, and a method may
-take it, but it may not be boxed: a `&Thing` made from it would put the one resource in two boxes,
-and its destructor would run once for each:
+**A copy is never made into a second owner.** The one by-value value a program still sees is a copy —
+a method's `self`, or `*r` — which may be read and passed to a method, but not boxed:
 
 ```sysl
 struct Thing
@@ -4125,20 +1758,10 @@ hold(Thing(1))
 this makes a '&Thing' out of a copy of a 'Thing' value, and 'Thing' has a 'Drop' — the copy would be a second owner of the resource, and its destructor would run once for each. Only building one makes a '&Thing': hand over the reference that already holds it
 ```
 
-**A generic's signature is asked at the instantiation.** `id[T](x: T) -> T` called with `*r` binds
-`T` to the type by value, and the call is refused naming the parameter — `'id' binds its 'T' to
-'Thing' by value…` — rather than anything inside `id`, which the caller did not write. Called with
-the reference, `T` is `&Thing` and nothing is asked; and a signature that reaches `T` only through a
-reference — `keep[T](x: &T) -> &T` — may bind it to `Thing` itself, since nothing it declares holds
-one by value. A generic type is asked the same way, by what its fields hold: a `struct Box[T]` whose
-field is a `&T` holds a share, so `Box[Thing]` may be bound, while `Buf[Thing]` and `Option[Thing]`
-hold the value itself and are refused.
-
-**Its body is asked too, once per instance, at the types it was made at** — a library's generic
-bodies and a trait's default read at the implementing type among them. A signature that reaches `T`
-only through a reference still lets the body copy one out, and at `T = Thing` that copy is a second
-owner of the handle. The line the refusal points at is the same for every instance, so the message
-says which instance it is and the call that asked for it, one link per generic in between:
+**A generic is asked at the instantiation**: its signature (`id[T](x: T)` called with `*r` binds `T`
+by value, and the refusal names the parameter), a generic type by what its fields hold (`Box[T]`
+holding a `&T` may be bound to `Thing`; `Buf[Thing]` and `Option[Thing]` may not), and **its body,
+once per instance**, naming the instance and the call that asked for it:
 
 ```sysl
 struct Thing
@@ -4159,47 +1782,22 @@ print(peek(Thing(2)))
 'copy' holds 'Thing' by value and 'Thing' has a 'Drop' — a type with a destructor is a reference type, and building one makes a '&Thing'. Write '&Thing' in its place (in 'peek[Thing]', called from
 ```
 
-At `T = int` the same body is fine. An instance whose own signature was refused at its call says
-nothing more: everything inside it follows from that one complaint.
-
-**`@consumes` is unchanged**, and there is no use-after-move: a `&T` is shared and counted exactly as
-every other reference is.
-
-**A destructor needs an allocator**, since building one is an allocation: a `@no_alloc` module that
-builds one is refused with `a reference needs an allocator`, and on a bare-metal target the box comes
-from the target's `malloc` like any other. Where there is no allocator, `defer` is the tool.
-
-**An error path needs closing by hand.** Where a C call hands back a handle *and* fails — a refused
-connection whose connection object still has to be freed — the `Result` is an `Err`, no value ever
-owns the handle, and no box is ever made for a destructor to hang off. Read what you need from it and
-close it where it stands.
-
-**A handle that hands out a second value does NOT need a second type, and reaching for one is the
-mistake this paragraph exists to head off.** A method taking `self` has a copy and cannot name the box
-it was called through, so building a value around the same resource there would hand out a second
-*owner* and the destructor would run twice — boxing `self` itself is refused for that reason. The obvious escape is to split the type — a private
-handle carrying the `Drop`, and a copyable value holding a `&` to it — and it works, and it is
-unnecessary: [a `&self` method](/reference/declarations/#a-self-method-may-keep-what-it-was-called-on)
-is handed the box itself, so the value it constructs takes a share rather than a second owner. One
-type, one destructor, and the resource outlives everything that kept a share of it. Two of the org's
-own bindings carried the split before anybody checked.
-
-**It is not called for a value in a reference cycle**, whose count never reaches zero. That is not a
-new consequence of this feature but the existing cost of counting rather than collecting — the
-*storage* already leaks there. A `weak T` is what breaks a cycle.
-
-**It is not called for module storage when the program ends.** Storage that lasts the whole run is
-never let go of, so its count never reaches zero. There is no exit pass and there will not be one: a
-process exiting is what returns what it held, and running destructors at exit is the feature C++ has
-spent decades regretting, because the order two statics come apart in has no good answer. What it
-costs is that a buffered writer held in a static is not flushed at exit; the program flushes it.
+- **`@consumes` is unchanged**, and there is no use-after-move.
+- **A destructor needs an allocator**: a `@no_alloc` module building one is refused with `a reference
+  needs an allocator`. Where there is none, `defer` is the tool.
+- **An error path needs closing by hand**: where a C call hands back a handle *and* fails, the result
+  is an `Err`, no box is ever made, and the handle is closed where it stands.
+- **A handle that hands out a second value needs no second type.** A `(self)` method cannot name its
+  box, so boxing `self` is refused; [a `&self`
+  method](/reference/declarations/#a-self-method-may-keep-what-it-was-called-on) is handed the box,
+  and the value it builds takes a share rather than becoming a second owner.
+- **It is not called for a value in a reference cycle**, nor **for module storage at exit**: there is
+  no exit pass, so a buffered writer held in a static is flushed by the program.
 
 ### When a value is dropped
 
-**A value is dropped when the last reference to it goes, and a reference goes at the end of the block
-that holds it.** A function body, an `if` arm and a loop's body are each a block, so a local declared
-in a loop is dropped at the end of every trip, and a `continue` or a `break` drops it as the trip's end
-would:
+**A reference goes at the end of the block that holds it**, so a local in a loop is dropped at the end
+of every trip, and a `continue` or `break` drops it as the trip's end would:
 
 ```sysl
 struct Res
@@ -4226,137 +1824,20 @@ drop trip 2
 after
 ```
 
-**A temporary is dropped at the end of its statement**, before the next one starts. A value made only
-to be handed to a call is a temporary of the statement the call is in:
-
-```sysl
-struct Res
-    name: string
-
-impl Drop for Res
-    drop(self) = print(s"drop ${self.name}")
-
-show(r: &Res) = print(s"use ${r.name}")
-
-show(Res("t"))
-print("next statement")
-```
-
-```output
-use t
-drop t
-next statement
-```
-
-**Assigning to a variable drops what it held, at the assignment**:
-
-```sysl
-struct Res
-    name: string
-
-impl Drop for Res
-    drop(self) = print(s"drop ${self.name}")
-
-var r = Res("old")
-
-r = Res("new")
-print("assigned")
-```
-
-```output
-drop old
-assigned
-drop new
-```
-
-**Taking a value out of an enum, or binding it in a `match`, shares it rather than moving it.** There
-is no use-after-move: the enum still holds its payload, the new name holds another share, and the
-value is dropped once, when the later of the two goes. A closure is the same — it holds what it
-captured until the closure itself is dropped:
-
-```sysl
-struct Res
-    name: string
-
-impl Drop for Res
-    drop(self) = print(s"drop ${self.name}")
-
-enum Slot
-    Full(r: &Res)
-    Empty
-
-taken() -> &Res
-    val s = Slot.Full(Res("payload"))
-    val r = s match
-        Full(x) -> x
-        Empty -> Res("none")
-
-    print(s"took ${r.name}")
-    r
-
-captured() -> &Fn() -> unit
-    val r = Res("captured")
-
-    () -> print(s"use ${r.name}")
-
-val t = taken()
-
-print("the enum is gone; the payload is not")
-
-val f = captured()
-
-f()
-print("end")
-```
-
-```output
-took payload
-the enum is gone; the payload is not
-use captured
-end
-drop captured
-drop payload
-```
-
-**Every way out of a block drops what the block holds**: running off its end, a `return`, a `?`, a
-`break` and a `continue`. Leaving several blocks at once undoes the innermost first — a `return` from
-inside an `if` drops the arm's locals, then the function's:
-
-```sysl
-struct Res
-    name: string
-
-impl Drop for Res
-    drop(self) = print(s"drop ${self.name}")
-
-check(n: int) -> Result[int, string]
-    val a = Res("a")
-
-    if n > 0
-        val b = Res("b")
-
-        return Err("out")
-
-    Ok(0)
-
-print(check(1).is_err())
-```
-
-```output
-drop b
-drop a
-true
-```
-
-A trap is the exception: [it runs nothing](#where-defer-sits), no destructor and no `defer`.
+- **A temporary is dropped at the end of its statement**, a value made only to be handed to a call
+  among them.
+- **Assigning to a variable drops what it held**, at the assignment.
+- **Taking a value out of an enum, or binding it in a `match`, shares it** rather than moving it, and
+  a closure holds what it captured until it is itself dropped; the value goes once, with the last share.
+- **Every way out of a block drops what it holds** — its end, a `return`, a `?`, a `break`, a
+  `continue` — innermost block first. **A trap runs nothing**: no destructor and no `defer`.
 
 ### In what order
 
-**Locals are dropped in the reverse of the order they were declared in, each deferred statement in
-its written place among them** — [`Where defer sits`](#where-defer-sits) shows the interleaving. Within
-one value the order is the declaration's: **a struct's fields in the order they are declared, a
-tuple's in position order, and the elements of a slice or a `Buf` in index order**. Teardown is depth
-first, so each field comes apart whole — everything it holds included — before the next starts:
+Within one value the order is the declaration's — a struct's fields as declared, a tuple's by position,
+a slice's or a `Buf`'s elements by index — and teardown is depth first, so each field comes apart whole
+before the next. Teardown runs from a worklist rather than by recursion, so a million-node list comes
+apart in constant stack:
 
 ```sysl
 import sysl.buf.{Buf, buf}
@@ -4398,11 +1879,6 @@ drop c.0
 drop c.1
 ```
 
-`all` is declared after `o`, so it goes first; inside each, the order is the one they were written in.
-This is the order Rust gives, and it holds however deep the structure is: teardown runs from a
-worklist rather than by recursion, so a linked list of a million nodes comes apart head first without
-using a frame per node.
-
 **A destructor runs before the fields of the value it tears down, and its own locals are dropped at the
 end of its body — still before those fields:**
 
@@ -4439,46 +1915,11 @@ drop field
 
 ### What a destructor may do
 
-**It may read every field**, which is intact, call any function, and build and drop values of its own,
-as above. **It may keep a share of a field**: the field is then not dropped with the value, but when
-the last share of it goes:
-
-```sysl
-struct Res
-    name: string
-
-impl Drop for Res
-    drop(self) = print(s"drop ${self.name}")
-
-struct Node
-    leaf: &Res
-
-var kept: Option[&Res] = None
-
-impl Drop for Node
-    drop(self)
-        print("drop node")
-        kept = Some(self.leaf)
-
-main()
-    if true
-        val n = Node(Res("leaf"))
-
-    print("the node is gone")
-    kept = None
-    print("end")
-```
-
-```output
-drop node
-the node is gone
-drop leaf
-end
-```
-
-**It may not keep the value itself.** `self` is a copy handed to the destructor borrowed, and making a
-`&T` of it would be a second owner of what is already being torn down — so it is refused, as any copy
-boxed into a second owner is:
+It borrows `self` rather than taking a count — the count is already zero. **It may read every field,
+call any function, build and drop values, and keep a share of a field**, which then goes with its last
+share rather than with the value. **It may not keep the value itself**: boxing `self` would be a second
+owner of what is being torn down. **A `weak` reference to the value already reads as gone** while its
+destructor runs, since the count is zero before it is called.
 
 ```sysl
 struct Node
@@ -4498,45 +1939,52 @@ main()
 this makes a '&Node' out of a copy of a 'Node' value, and 'Node' has a 'Drop' — the copy would be a second owner of the resource, and its destructor would run once for each
 ```
 
-**A `weak` reference to the value already reads as gone while its destructor runs.** The count is zero
-before the destructor is called, so nothing can take a new share of the value from inside its own
-teardown:
+### Where `defer` sits
+
+[`defer`](/reference/statements/#defer) is the answer for what the language does *not* own: a
+descriptor, a `FILE*`, a block from `malloc`, a lock. **Leaving a block undoes it in reverse** — each
+deferred statement reached and each local declared, last first — so a `defer` runs after every local
+declared below it and before every local above it, and every local it names is still alive. **It owns
+nothing and allocates nothing**, so it stays available under `no alloc`. **A trap runs nothing.** A
+`return`, `break`, `continue` and `?` undo the blocks they leave in the same order; an
+[`errdefer`](/reference/statements/#errdefer) runs only when the function is failing. So a lock
+`defer`-unlocked stays held while everything made under it is given back:
 
 ```sysl
-struct Node
+struct Conn
     name: string
 
-var watch: Option[weak Node] = None
+impl Drop for Conn
+    drop(self) = print(s"close ${self.name}")
 
-impl Drop for Node
-    drop(self) = watch match
-        Some(w) -> print(s"${self.name}: the weak reads ${if w.get() == None then "gone" else "alive"}")
-        None -> ()
+serve()
+    val a: &Conn = Conn("a")
+    print("lock")
+    defer print("unlock")
+    val b: &Conn = Conn("b")
+    defer print("flush")
+    val c: &Conn = Conn("c")
 
-main()
-    if true
-        val n = Node("node")
+    print(s"serve ${a.name}${b.name}${c.name}")
 
-        watch = Some(n)
-
-    watch = None
-    print("end")
+serve()
 ```
 
 ```output
-node: the weak reads gone
-end
+lock
+serve abc
+close c
+flush
+close b
+unlock
+close a
 ```
 
 ## Crossing a concurrency domain
 
-A `&T` permits aliasing and mutation through any reference, which is safe **within one concurrency
-domain** and nowhere else: its refcount is non-atomic, and two threads touching it would race. So a
-`&T` may not leave its domain, and crossing one **copies** by default — which is what process IPC does
-anyway, and what keeps the ordinary path free of atomics.
-
-The exception is **`&sync T`**, whose refcount is atomic. It is a distinct type from `&T` with no
-conversion either way, and which one an object is is chosen where it is allocated:
+A `&T`'s count is not atomic, so it is safe **within one concurrency domain** and nowhere else: a
+`&T` may not leave its domain. **`&sync T`** is the exception, a distinct type with no conversion
+either way — a count is atomic or not from the moment the object exists:
 
 ```sysl
 struct Cell
@@ -4553,26 +2001,22 @@ print(send(c))
 '&Cell' and '&sync Cell' are distinct types, and neither converts to the other: a count is atomic or it is not from the moment the object is allocated, and a conversion would put an ordinary retain beside an atomic one. Allocate Cell as a '&sync Cell' where it is constructed
 ```
 
-Taking a share of a `&sync T` is a relaxed increment, since a count you already hold cannot reach
-zero underneath you. Giving one back is a decrement with release ordering, and the share that takes
-the count to zero acquires before destroying the object, so the thread that frees it sees every
-other thread's writes to it. The acquire is a `fence acquire` — except in a build whose
-`SYSL_EXTRA_CFLAGS` ask for `-fsanitize=thread`, where it is an acquire load of the count instead.
-The two order the same things, but ThreadSanitizer does not model a standalone fence, and with it
-every `&sync` object freed on another thread than its last user's would be reported as a race.
-
-A conversion would put an ordinary retain beside an atomic one, so the count is atomic or it is not
-from the moment the object exists. **`&sync T` makes the *reference* safe to share, not the object
-safe to mutate** — that still wants a `Mutex`.
-
-A `&T` held in a `@thread_local` is *not* a domain crossing and needs no `&sync`, the storage
-belonging to one thread by construction.
+Taking a share is a relaxed increment; giving one back is a release decrement, and the share reaching
+zero acquires before destroying, so the freeing thread sees every other thread's writes (a `fence
+acquire`, or an acquire load under `-fsanitize=thread`, which does not model a standalone fence).
+**`&sync T` makes the *reference* safe to share, not the object safe to mutate** — that wants a
+`Mutex`. A `&T` in `@thread_local` storage belongs to one thread and needs no `&sync`.
 
 ### Module storage reached from another domain
 
-A closure erased into a `&sync Fn` is asked about what it captures — and equally about the **module
-storage it reaches**, however many calls down. A module `var` is one object the whole program shares,
-so a count in it that is not atomic is the race a capture would have been:
+A closure erased into a `&sync Fn` is asked about what it captures **and about the module storage it
+reaches**, however many calls down. What may be reached is what may be captured: a scalar, an
+`Atomic`, a `&sync T`, a raw pointer, `@thread_local` storage, and a `val` laid down as constant data
+(a `val` over a slice literal is one; a `val` over a call is not, and a `[]T` without `const` is
+writable). An interrupt handler — the `interrupt` convention, or
+[`@domain(interrupt)`](/reference/attributes/#domain-interrupt-a-function-entered-on-top-of-whatever-was-running)
+— is held to it too; a bare `@export` is not, since nothing says a second domain exists until `@domain`
+does.
 
 ```sysl
 struct Cell
@@ -4593,96 +2037,21 @@ print(shared.n)
 a closure shared between two domains may be called from either, so every count it reaches has to be atomic — but the module storage 'shared' it reaches, which 'bump' reads, is a '&Cell', whose count is not. Hold it as a '&sync Cell' ('06')
 ```
 
-Hold it as a `&sync Cell` and the program prints `2`. What may be reached is what may be captured: a
-scalar, an `Atomic`, a `&sync T`, a raw pointer, and anything in `@thread_local` storage, which is
-one copy per thread; a `val` laid down as constant data is not asked either. Two kinds of body are
-held to it — whatever is erased into a `&sync` object (a closure, a named function read into a
-`&sync Fn`), and an interrupt handler, which the processor enters on top of whatever was running —
-one written in the `interrupt` convention, or an ordinary function marked
-[`@domain(interrupt)`](/reference/attributes/#domain-interrupt-a-function-entered-on-top-of-whatever-was-running),
-the shape a vector table written in assembly calls. **A bare `@export` is not**: it is how C enters
-sysl at all, almost always on the program's one thread, and nothing says a second domain exists until
-`@domain` does:
-
-```sysl build=c target=aarch64-freestanding
-struct Cell
-    n: int
-
-var shared: &Cell = Cell(1)
-
-@domain(interrupt)
-@export("on_timer")
-on_timer()
-    shared.n += 1
-```
-
-```error
-'on_timer' is entered in the 'interrupt' domain, on top of whatever was running, so every count it reaches has to be atomic — but the module storage 'shared' it reaches is a '&Cell', whose count is not. Hold it as a '&sync Cell' ('06')
-```
-
-Without the annotation the same archive builds, and the race it describes is the reader's to know
-about.
-
-**A `val` over a slice literal is constant data**, so it crosses. Its elements are laid down as an
-array in the object file and the view over them has no owner, exactly as a string literal's view has
-none — there is no count in it to race on, and nothing runs at startup to build it:
-
-```sysl
-static val colors: []const string = ["red", "green"]
-
-known(c: string) -> bool
-    for x in colors
-        if x == c then return true
-
-    false
-
-val job: &sync Fn() -> unit = () -> print(known("green"))
-
-job()
-```
-
-```output
-true
-```
-
-The elements have to be laid down themselves — literals, and the arrays, structs and views built
-from them. A `val` over a call is filled at startup with a counted owner like any other, and is
-refused as a `var` would be. A `[]T` without `const` can be written through, so its array goes in
-writable data, and a closure shared between domains may reach it only where its elements hold no
-count: a store into a `[]string` puts a heap string there.
-
 ### A guarded value crosses with its lock
 
-A `Map` shared through a count that is not atomic may not be reached from another domain — **but a
-`Mutex[Map[...]]` may**, whatever it holds. `Mutex[T]` is declared `@guards(inner)`, over a
-`Guarded[SleepLock, T]` that is itself `@guards(value)`: its own members are the only way to the `T`,
-and each takes the lock first, so sharing the lock does not share the value. A guarded field that is
-itself a guarding struct is looked through, so what leaves `Mutex.with` is held to the rule the `T`
-inside sets:
-
-```sysl
-import sysl.container.{map, Map}
-import sysl.threads.Mutex
-
-static var names: Mutex[Map[string, int]] = Mutex.new(map())
-
-lookup(s: string) -> int = names.with((t) -> t.get(s).unwrap_or(0))
-
-val job: &sync Fn() -> unit = () -> print(lookup("a"))
-
-job()
-```
-
-```output
-0
-```
-
-**What leaves through `with` or `try_with` is what is held instead**, at the call: once the lock is
-let go, the value it answered belongs to whoever holds the lock next as much as to the caller, so it
-is held to the rule a capture is. An `int` or a `bool` passes on its type, and so does a value built
-fresh inside the closure — a string literal, which is immortal, or a `.copy()` of a string, which
-gives the bytes an owner of their own. A string read out of the map still shares its count with the
-one inside, and is refused:
+**A `Mutex[Map[...]]` may be reached from another domain, whatever it holds.** `Mutex[T]` is
+`@guards(inner)` over a `Guarded[SleepLock, T]` that is `@guards(value)`: its members are the only way
+to the `T`, each takes the lock first, and a guarded field that is itself guarding is looked through.
+**What leaves through `with` or `try_with` is held to the rule a capture is**, at the call: an `int`
+passes, and so does a value built fresh inside the closure — a literal, a `.copy()` of a string, a
+`Buf` it makes and fills with copies, as long as that local goes nowhere but out through the answer
+(stored anywhere else as well — pushed into the guarded value, bound to a second name, handed to a
+function, its address taken — it is refused). A `.copy()` of a `Buf` is fresh where its elements hold
+no count, and one of strings or `Buf`s copies only the handles. A value read out of the guarded one
+still shares its count, and is refused; the guarded value held as a `&sync Mutex[...]` and captured
+crosses whole. A struct of the program's
+own opts in with `@guards(field)` over a `private` field. **Not checked**: a closure that *stores*
+something read out of the guarded value where it outlives the call.
 
 ```sysl
 import sysl.container.{map, Map}
@@ -4697,72 +2066,13 @@ print(names.with((t) -> t.get("a").unwrap_or("none")))
 'sysl.threads.Mutex.with' answers a value out of the 'value' it guards, and once the guard is let go that value is shared with whoever holds it next, so every count it reaches has to be atomic — but this answers a 'string', which may share its bytes' count with the guarded one. Answer a fresh string instead — '.copy()' inside the closure gives the string an owner of its own, and a literal is immortal
 ```
 
-`t.get("a").unwrap_or("none").copy()` is accepted, and so is the `Map` itself held as a `&sync
-Mutex[...]` and captured.
-
-**A value the closure builds itself is fresh too** — a `Buf` it makes and fills with copies of what
-it guards, a struct or a variant holding one, or a call handed nothing that shares a count. A local
-stays fresh while everything written into it is fresh and it goes nowhere but out through the answer:
-calling the `Buf`'s own members on it, reading a length or an element out of it, and looping over it
-are all it may meet. A `.copy()` of a `Buf` is fresh where its elements hold no count; one of strings
-or of `Buf`s copies only the handles, and is refused:
-
-```sysl
-import sysl.buf.{Buf, buf}
-import sysl.threads.Mutex
-
-static var log: Mutex[Buf[u8]] = Mutex.new(buf())
-
-snapshot() -> Buf[u8] = log.with((b) ->
-    var copy: Buf[u8] = buf()
-    copy.extend(b.view())
-    copy)
-
-log.with((b) -> b.extend([1, 2, 3]))
-print(snapshot().view())
-```
-
-```output
-[1, 2, 3]
-```
-
-**The same local stored anywhere else as well is refused**, since the guarded value, or whatever it
-was handed to, would then share it — pushed into the guarded value, bound to a second name, handed to
-a function, its address taken, or written over with something captured:
-
-```sysl
-import sysl.buf.{Buf, buf}
-import sysl.threads.Mutex
-
-static var nest: Mutex[Buf[Buf[u8]]] = Mutex.new(buf())
-
-print(nest.with((b) ->
-    var fresh: Buf[u8] = buf()
-    b.push(fresh)
-    fresh).len())
-```
-
-```error
-but this answers a 'Buf[byte]', whose 'core' reaches a '&BufCore[byte]', whose count is not atomic. Answer what the caller needs from it — a count, a flag, a '.copy()' of a string, a value built fresh inside the closure — rather than the value itself
-```
-
-A struct of a program's own opts in the same way — `@guards(items)` above
-it names a field that is `private`, and every member that answers something is held to the rule at
-its calls. **What is not checked** is a closure that *stores* something read out of the guarded
-value where it outlives the call — through a pointer it captured, say: nothing follows a counted
-value from the field to the store, so that one is the reader's to know about.
-
 ### A table whose every record has its own lock
 
-A buffer cache, an inode table, a page cache: each record is locked on its own, so two processors
-touch two records at once. **`sysl.sync.Guarded[L, T]` is that record** — a value, not a box, with
-the lock laid inline beside the `T` — and it is declared `@guards(value)` exactly as `Mutex[T]` is.
-The lock is any type implementing the `Lock` trait (`acquire`, `try_acquire`, `release`, each taking
-`*self`): a `SpinLock`, a `sysl.threads.SleepLock`, or a lock a package writes for itself.
-
-**Nothing new decides that the table crosses: an array is its elements**, so sharing a
-`[4]Guarded[...]` shares four locks, and sharing a lock does not share what it guards. The records
-may hold a `Buf`, a string, a `&T` — whatever they hold is reached only through `with`:
+**`sysl.sync.Guarded[L, T]` is one record of a buffer cache or an inode table**: a value, not a box,
+with the lock inline beside the `T`, `@guards(value)` as `Mutex` is. The lock is any `Lock` (`acquire`,
+`try_acquire`, `release`, each `*self`). **An array is its elements**, so sharing a `[4]Guarded[...]`
+shares four locks, and what the records hold is reached only through `with`, which hands the closure
+the record in place:
 
 ```sysl
 import sysl.buf.{Buf, buf}
@@ -4792,83 +2102,16 @@ job()
 2
 ```
 
-The same table of bare `Item`s is refused, naming the `Buf` that two domains would share:
-
-```sysl
-import sysl.buf.{Buf, buf}
-
-struct Item
-    hits: int
-    log: Buf[int]
-
-static var table: [2]Item = [Item(0, buf()), Item(0, buf())]
-
-touch(i: int) = table[i].log.push(i)
-
-val job: &sync Fn() -> unit = () -> touch(1)
-
-job()
-```
-
-```error
-the module storage 'table' it reaches, which 'touch' reads, holds a 'Buf[int]' in its 'log', which is shared through a count that is not atomic
-```
-
-**`with` hands the closure the record in place** — its address, lent for the call — so a field
-written inside it is a store into the table: the record is not copied and nothing it counts is
-retained. What leaves `with` (and `try_with`) is held to the rule `Mutex.with`'s result is, at the
-call, so the `Buf` itself may not come out:
-
-```sysl
-import sysl.buf.{Buf, buf}
-import sysl.sync.{Guarded, SpinLock}
-
-struct Item
-    log: Buf[int]
-
-var cell = Guarded.new(SpinLock(0), Item(buf()))
-
-val b = cell.with((r) -> r.log)
-```
-
-```error
-'sysl.sync.Guarded.with' answers a value out of the 'value' it guards, and once the guard is let go that value is shared with whoever holds it next, so every count it reaches has to be atomic — but this answers a 'Buf[int]'
-```
-
-A slice or a `Buf` of guarded records is asked the same way: what is in the way is the view's or the
-`Buf`'s own count, not the records, so one reached through a `*T` or held where it is constant data
-crosses, and one shared through its own ordinary count does not.
-
-**On a freestanding target the table is constant data**: `Guarded.new` is a `const` function, and
-an instance of a generic `const` function is run while compiling like any other, so a kernel writes
-the table as a module `var` and the image carries it laid out — every lock free, every record its
-initial value — with nothing run before `main`:
-
-```sysl
-import sysl.sync.{Guarded, SpinLock}
-
-struct Inode
-    refs: int
-    mode: u16
-
-var inodes: [64]Guarded[SpinLock, Inode] = [Guarded.new(SpinLock(0), Inode(0, 0)); 64]
-
-@export("iget")
-iget(i: int) -> int = inodes[i].with((n) ->
-    n.refs += 1
-    n.refs)
-```
-
-A record whose initializer is not constant — a `buf()` the heap fills, say — is still refused there,
-with the reason the call could not be run.
+The same table of bare `Item`s is refused, naming the `Buf` two domains would share. What leaves
+`with` is held as `Mutex.with`'s result is. A slice or a `Buf` of records is asked about its own count.
+On a freestanding target the table is constant data: `Guarded.new` is a `const` function, so a kernel
+writes it as a module `var` and the image carries it laid out, with nothing run before `main` (a record
+whose initializer is not constant is refused there, with the reason).
 
 ### A frozen buffer crosses
 
-A `Buf` and a view are shared through a count that is not atomic, so neither may sit in a `&sync`
-object — which leaves read-only heap data, decoded pixels or a list of shapes, behind a lock it does
-not need. **`buf.freeze()` takes a buffer's elements and answers a `&sync Frozen[T]`**: one atomic
-count on the whole buffer, and nothing that writes it. It goes wherever a `&sync` reference goes — a
-field of a `&sync` struct, a capture of a `&sync Fn`, the state handed to `spawn`:
+**`buf.freeze()` takes a buffer's elements and answers a `&sync Frozen[T]`**: one atomic count, and
+nothing that writes it. It goes wherever a `&sync` reference goes:
 
 ```sysl
 import sysl.buf.{Buf, buf, Frozen}
@@ -4901,61 +2144,15 @@ print(b.len())
 0
 ```
 
-**The buffer is left empty**, through this name and every other name of it: the elements are copied
-once into storage sized to them, so nothing that still holds the buffer — or a view taken of it
-earlier — can reach the frozen storage. What a frozen buffer offers is `len`, `is_empty`, `f[i]`
-(checked, as a `Buf`'s is), `for x in f`, and `view()`, a `[]const T`. A view keeps the buffer alive
-through a small box of its own, counted the ordinary way, which holds one atomic share — so it is kept
-and handed on like any other view, and costs one allocation where `f[i]` and `for` cost none. Nothing
-writes one:
-
-```sysl
-import sysl.buf.{Buf, buf, Frozen}
-
-var b: Buf[int] = buf()
-
-b.push(1)
-
-val f = b.freeze()
-
-f[0] = 2
-```
-
-```error
-assignment needs a variable, a field, an element, or a dereference — something with an address
-```
-
-`f.push(2)` is refused as a method `Frozen` does not have, and a store through `view()` is refused as
-a store through any `[]const T`.
-
-**Reading a local after `freeze` is refused**, since all it can find is the empty buffer: `freeze`
-is [`@consumes`](/reference/attributes/), so on every path after the call the local may not be read
-until it is assigned a new value. A field, or module storage like `b` above, is not followed, and
-reads as empty:
-
-```sysl
-import sysl.buf.{Buf, buf}
-
-pixels() -> usize
-    var b: Buf[u8] = buf()
-
-    b.push(1)
-
-    val f = b.freeze()
-
-    f.len() + b.len()
-
-print(pixels())
-```
-
-```error
-'b' is read here after 'b.freeze()' took everything it held
-```
-
-**A frozen buffer shares exactly what its elements share.** Every thread reading one reads its
-elements, so the element type is held to the rule a `&sync` struct's fields are: a scalar, a `&sync
-U` (a `&sync` trait object among them), a raw pointer, another frozen buffer, and arrays and structs
-of those. Freezing a buffer of plain references is refused at the call, naming the element:
+- **The buffer is left empty**, through every name: the elements are copied once into storage sized to
+  them. A frozen buffer offers `len`, `is_empty`, a checked `f[i]`, `for x in f`, and `view()`, a
+  `[]const T` that holds one atomic share through a small box of its own. Nothing writes one.
+- **Reading a local after `freeze` is refused**: `freeze` is
+  [`@consumes`](/reference/attributes/). A field or module storage is not followed, and reads empty.
+- **A frozen buffer shares exactly what its elements share**, so the element type is held to a `&sync`
+  struct's rule: a scalar, a `&sync U`, a raw pointer, another frozen buffer, arrays and structs of
+  those. A `Buf[string]` or a `Buf[Buf[u8]]` is refused for each element's count.
+- **Freezing allocates**, so a `@no_alloc` module may not call it.
 
 ```sysl
 import sysl.buf.{Buf, buf}
@@ -4974,16 +2171,12 @@ val f = b.freeze()
 '&sync Frozen[&Cell]' may be reached from two domains at once, so every count inside it has to be atomic — but it holds a '&Cell', whose count is not. Hold it as a '&sync Cell' ('06')
 ```
 
-Held as a `Buf[&sync Cell]`, it freezes. A `Buf[string]` or a `Buf[Buf[u8]]` is refused the same way,
-for the count each element carries. **Freezing allocates** — the storage and the box — so a
-`@no_alloc` module may not call it, and a freestanding program freezes where it has a heap.
-
 ### `@crossing` — where the rule is asked
 
-The rule above says *what* may cross. **`@crossing` says where**: it is the annotation a facility
-writes above the function that hands a value to another domain, naming the parameters it hands it
-through. `sysl.threads.spawn` is declared with one, and so is any package binding a scheduler
-of its own:
+**`@crossing(p)` is written above the function that hands `p` to another domain.**
+`sysl.threads.spawn` carries one, and so does a package binding a scheduler. A **`*T` parameter is
+looked through** — what crossed is the object at the far end. Nothing is emitted; the refusal is made
+at each call, afresh for every set of type arguments:
 
 ```sysl
 struct Cell
@@ -5005,1562 +2198,836 @@ print(start(&st))
 what 's' of 'start' points at reaches another concurrency domain, so every count inside it has to be atomic
 ```
 
-A **`*T` parameter is looked through**, and that is the whole of what the annotation buys. A raw
-pointer carries no refcount *of its own*, which says nothing about the object at the far end — and
-the object at the far end is what crossed. Everything else is asked about the parameter's own type.
-Hold the cell as a `&sync Cell` and the same program compiles.
+- **Where a body shows the boundary, nobody writes it**: a parameter handed on to a crossing one, or a
+  value stored in a `&sync` place, crosses too, however many functions deep. The address of one of its
+  fields hands over that field. **A written `@crossing` is for the boundaries no body shows** — an
+  `extern`, a function pointer, a closure called through its type, a trait's requirement.
+- **A member may carry it**: `@crossing`, `@reads` and `@writes` are about a parameter, and are the only
+  annotations a method, a property or an associated function may carry. A field or a variant has no
+  parameter for one to name.
+- **A parameter that crosses by value is handed a copy of every view it holds**, at every depth, made
+  where the callee reads it, so the caller's count never reaches the other domain. The elements are
+  still asked about, and a `*T` parameter is looked through and never copied. The copy allocates, so it is refused under `@no_alloc`. `sysl.threads.Channel`'s
+  `send` and `try_send` are `@crossing(value)`, which is how a channel
+  [takes a view](/library/threads/#a-view-goes-in-as-a-copy).
 
-It costs nothing at run time: no code is emitted, no signature moves, and a program that satisfies it
-is the program it would have been without the line. What it adds is the refusal, made at each call —
-so a generic facility is asked afresh for every set of type arguments, exactly as a `&sync Box[T]` is.
+## Places
 
-**Where a body shows the boundary, nobody writes the annotation.** A parameter whose function hands
-it to another one that crosses — `spawn`'s `arg`, a channel's `send`, a `@scoped` member's callable —
-crosses too, and so does a value (not a `*T`, which a `&sync` place holds as itself) it stores in a
-`&sync` place. Every call of that function is held to the rule exactly as a written `@crossing`
-holds it, however many functions deep the boundary is. What crosses is the parameter itself, its
-address, an element or a view of it — the address of one of its *fields* hands over that field, whose
-own type the inner call asks:
+A **place** is something with an address: a local or parameter, a dereference, an **element**, and a
+field of any of them. Anything else — a call's result, an arithmetic result, a fresh struct — is a
+value with no address of its own.
+
+| operation | what it does |
+|---|---|
+| `&place` | yields a **`*T`** — C's address-of |
+| `&value` | writes the value into a hidden local of this scope, and yields a **`*T`** to that |
+| `*p` | reads through a `*T` or a `&T`, and is itself a place |
+| `p.f` | selects, dereferencing **one** level automatically on both `*T` and `&T` |
+
+**`&` on a place yields a raw pointer, never a reference**: a place lives in a frame or inside another
+object, with no count to share. **Selection is the only implicit dereference**, with the subscript of
+an indexable pointee: `p.x` is `(*p).x` (Go's rule, no `->`), `p[i]` on a pointer to an array or a
+container is `(*p)[i]`, and matching a reference to an enum is `match *e`. Assignment, compound
+assignment and `++`/`--` take a place. **The shorthand stops at one level**, and says how many are
+left:
 
 ```sysl
-import sysl.threads.*
+struct Point
+    x: int
+    y: int
 
-struct Cell
-    n: int
+var p = Point(1, 2)
+var pp = &p
+var ppp = &pp
 
-struct State
-    cell: &Cell
-
-work(s: *State)
-    print(s.cell.n)
-
-start(s: *State) -> Option[Thread] = spawn(&work, s)
-
-var st = State(Cell(1))
-
-start(&st).unwrap().join()
+print(ppp.x)
 ```
 
 ```error
-what 's' of 'start' points at reaches another concurrency domain, so every count inside it has to be atomic
+selection reaches through one level of indirection and **Point has more
 ```
 
-**A written `@crossing` is for the boundaries no body shows**: an `extern`, a function pointer, a
-closure called through its type, a trait's requirement. `sysl.threads.spawn` is one, since its body
-hands `arg` to C; a sysl function wrapping a C scheduler says `@crossing` the same way, and a
-function wrapping *that* one says nothing.
+**An element has an address whether or not the expression naming it does**: a view's or a pointer's
+elements live wherever the storage is, which is what makes `rows(g)[i] = v` write through to the grid.
+An array's elements are places exactly when the array is. A string's bytes never are — writing a byte
+of UTF-8 is refused as immutability. The one dangle a **single statement** can make is `&f()[i]` where
+a temporary view is its buffer's only holder: the buffer goes at the end of the statement, and the
+`*T` is the raw tier behaving as advertised.
 
-**A member may carry it, and so may the two frames.** `@crossing`, `@reads` and `@writes` are the
-annotations that are about a **parameter**, which a member has exactly as a free function does — so
-they are the three a method, a property or an associated function may be written above, and the only
-three:
+## Addressing a value
+
+`&` in front of something with no address **makes** the storage: the value is written into a hidden
+local of the scope the `&` stands in, and the slot's address comes back:
 
 ```sysl
-struct Chan
-    open: bool
+trait Shape
+    area(self) -> int
 
-    @crossing(v)
-    send(*self, v: *int) -> int = v[0]
+struct Rect
+    w: int
 
-var c = Chan(true)
-var n = 7
+impl Shape for Rect
+    area(self) -> int = self.w
 
-print(c.send(&n))
+var s: *Shape = &Rect(2)
+
+print(s.area())
 ```
 
 ```output
-7
+2
 ```
 
-Everything else says something about a free function or about a type — what `sysl test` calls, what
-recurses, what a symbol names, how fields are laid out — and none of that is something a member
-supplies:
+`&Rect(2)` is `var t = Rect(2)` and `&t` with the name left out: the slot is the frame's, its count is
+taken as a `var`'s initializer takes one, and it is released where the scope ends. **Any value**, not
+only a construction — `&1`, `&(a + b)`, `&make()`. **It is storage, not a copy handed out**, so a write
+through it lands, and **the operand is evaluated once**, at the `&`. A pointer carried out of the scope
+is stale, as one to a named local would be; returning one is refused (above).
+
+**A name is answered rather than copied**: `&x`, `&t.f`, `&xs[i]` and `&*p` ask for that thing's
+address and are refused where it has none. A **property** is why: `t.f` at a property and at a field
+are one spelling, and a pointer into a copy would make a write go nowhere while looking like one that
+lands. A constant is the same (`&capacity` is refused; `&8` makes a slot).
 
 ```sysl
-struct P
-    v: int
+struct Temp
+    c: int
 
-    @tailrec
-    take(self, n: int) -> int = n
+    f -> int = self.c * 9 / 5 + 32
 
-print(P(1).take(2))
+var t = Temp(0)
+var p = &t.f
+
+print(*p)
 ```
 
 ```error
-the only annotations a member may carry are the ones about a parameter
+something with an address
 ```
 
-The three are refused above a **field** and above a **variant** for a different reason, which the
-sentence says: neither has parameters for one of them to name.
-
-### A view crosses as a copy
-
-**A parameter that crosses by value is handed a copy of every view it holds**, at every depth: a
-`[]T`, a `string`, a `[][]u8`, a struct or an enum with views in it. The copy is
-storage with a count of its own, made where the callee reads the parameter, so the caller's count
-never reaches the other domain and the caller may go on writing to what it handed over, or drop it.
-What the rule then asks is what is left once the views are copied — the elements are still the
-elements, so a view of `&T`s is refused as a `&T` is, and a view of `&sync T`s crosses:
+**Module storage has no such scope**: its initializer runs in a prologue whose frame is gone by the
+first statement. Name the value with a `static var` and take its address instead.
 
 ```sysl
-@crossing(grid)
-first(grid: [][]u8) -> u8 = grid[1][0]
+struct Rect
+    w: int
 
-var a: [1]u8 = [7]
-var b: [1]u8 = [8]
-var g: [2][]u8 = [a[..], b[..]]
+static var p: *Rect = &Rect(2)
 
-print(first(g[..]))
+print(p.w)
+```
+
+```error
+module storage has no such scope
+```
+
+**The `&` in a type is a different thing.** `&T` is a counted box, which owns what is in it; the
+operator takes an address, which owns nothing. A box is made by a value arriving where a `&T` is
+wanted, with no operator — `var s: &Shape = Rect(2)`:
+
+```sysl
+trait Shape
+    area(self) -> int
+
+struct Rect
+    w: int
+
+impl Shape for Rect
+    area(self) -> int = self.w
+
+var s: &Shape = &Rect(2)
+
+print(s.area())
+```
+
+```error
+an address is not a way of making a box
+```
+
+## `ref` — a name for a place
+
+`var t = self.tasks[i]` binds a **copy**, so every access walks the path again; `&self.tasks[i]` gives
+up bounds checking, `within` checking, invariant re-checking and the guarantee at the top of this page
+in one step. **`ref` binds a name to a place**:
+
+```sysl
+struct Task
+    state: int
+    prio: int
+
+struct Kernel
+    tasks: [4]Task
+
+    advance(*self, i: usize)
+        ref t = self.tasks[i]
+
+        t.state = 2
+        t.prio = t.prio + 1
+end Kernel
+
+var k = Kernel([Task(0, 7); 4])
+
+k.advance(2)
+
+print(k.tasks[2].state, k.tasks[2].prio, k.tasks[0].prio)
 ```
 
 ```output
-8
+2 8 7
 ```
 
-A `*T` parameter is looked through as before and never copied: what it points at is the caller's,
-and the thread reads it there. **The copy allocates**, so a call that hands a view to a parameter
-crossing by value is refused in a module that declared `@no_alloc`:
+- **The place is evaluated once**, where the binding is written: a later `i += 1` leaves `t` naming the
+  element it always named (not Scala's by-name `=> T`).
+- **It is a declaration, never a type.** A ref cannot be a field, a parameter, an element or a type
+  argument, cannot be re-pointed, cannot be captured by a closure, and does not outlive its block. A
+  ref of a ref is one more name for the same place. That is what keeps the compiler's knowledge
+  complete: a ref never travels, so the analyzer holds its place expression in the same body.
+- **At run time it stores an address; at compile time it remembers a place**, so a write through it
+  re-runs the `invariant` clauses of every struct the place lies in, a ref into a `val` is read-only, a
+  ref to a `within` slot is checked on assignment, and a subscript's bounds check is paid once, at the
+  binding. A ref inherits the place's writability and has no modifier of its own.
+- **A user type's subscript is a place when the type implements `IndexPlace`**, whose method answers
+  the element's address — `b[i]` is `*b.index_place(i)`. `Buf` is one. Through `Index` alone a
+  subscript is a call answering a value.
+- **A ref to a slot holding a `&T` names the slot**, not the object: binding it takes no count, `r =
+  other` is the field assignment, and reading `r` takes a count as reading the field would.
+- [The one rule](#the-one-rule-what-may-move-underneath-it) holds what may move under it.
 
 ```sysl
-@no_alloc
+make() -> int = 7
 
-@crossing(v)
-take(v: []u8) -> usize = v.len
+demo()
+    ref x = make()
+    print(x)
 
-var b: [2]u8 = [1, 2]
-
-print(take(b[..]))
+demo()
 ```
 
 ```error
-handing 'v' of 'take' a copy of every view in it needs an allocator, and this module declared '@no_alloc'
+'ref' names a place — a local, a field, an element, or a dereference — and this expression has no address for 'x' to name
 ```
 
-`sysl.threads.Channel[T]`'s `send` and `try_send` are `@crossing(value)`, which is how a channel
-[takes a view](/library/threads/#a-view-goes-in-as-a-copy): the channel's own two lines, so no code
-that sends ever writes one. A function that hands its own parameter on to `send` is inferred to cross
-by value, and copies as `send` does.
-
-`sysl.threads.Channel[T]` is what this changed. Its `send` and `try_send` were free functions
-taking the channel by address, because the annotation had to be written on a wrapper a caller went
-through; they are methods now, so a channel's transfers and its queries read alike.
-
-## A borrowed pointer cannot escape
-
-A `*T` is a type, so once one exists it can be carried anywhere — which is exactly wrong for the
-address of a local, which is good only until its function returns. Nothing in the type says how long
-the storage it points at lives. What the compiler can see instead is what every function **does** with
-each pointer it is handed, so it works that out, and nothing is written for it.
-
-**A function keeps a `*T` parameter** when it lets it outlive the call:
-
-- it stores it somewhere the call does not own — a field reached through a pointer, module storage, a
-  buffer's slot, or a box or a closure that is stored there;
-- it passes it to another function's parameter that keeps it;
-- it is `async`: the task its call answers holds every parameter until that task ends, so a call
-  is accepted only where the task is awaited or `block_on`'d before the frame that lent the address
-  ends ([a task holds its arguments](/reference/async/#a-task-holds-its-arguments-until-it-ends)).
-  A thread is held to a stricter rule: one that borrows the frame is started on a
-  [scope](#a-thread-borrows-a-frame-only-inside-a-scope).
-
-**An address as an integer is a number**: `usize(p)` stored, handed on or handed back keeps nothing,
-and the compiler follows no address through an integer. A pointer `ptr_cast` makes of one again is
-unchecked — [the program's responsibility](#an-address-as-an-integer-leaves-the-analysis), as an
-`as usize` round trip is in Rust.
-
-The answer is read out of the body, followed into every callee, and settled over recursion: a
-recursive function keeps a parameter when one of its paths does. Then **one rule, at the call**:
-
-> The address of storage that is not the program's to give away — a local, a parameter's place, a
-> field of a value in the frame, a value made in place — may not be passed to a parameter that keeps it.
+**The place must lie in storage something holds past the statement** — a local, a parameter, module
+storage, or what a `*T` points at. Bind a call's answer with `val` first:
 
 ```sysl
-struct Registry
-    last: *int
+import sysl.buf.{Buf, buf}
 
-    remember(*self, p: *int)
-        self.last = p
+fresh() -> Buf[int]
+    val b: Buf[int] = buf()
 
-run(r: *Registry)
-    var n = 5
-    r.remember(&n)
+    b.push(5)
+    b
+
+ref t = fresh()[0]
+
+t += 1
 ```
 
 ```error
-'remember' keeps its parameter 'p' (it is stored in 'self.last'), and '&n' is the address of a local of 'run'
+'t' would stand on a place inside a value nothing holds — a temporary, released at the end of this statement while the name lives on
 ```
 
-A function that reads and writes through what it is handed, and passes it to callees that only use it,
-keeps nothing, and the address of anything may be passed to it — **every `*self` method called on a
-local is checked this way**:
+### A member that answers a place
+
+A method can say its call **is a place**: `-> ref T`. Its body comes to a place reached through a
+parameter, and every call is that place in the caller — written through at once, named by a `ref`, or
+read, which reads a copy:
 
 ```sysl
-struct Account
-    balance: int
-    edits: int
+struct Task
+    state: int
+    prio: int
 
-    deposit(*self, n: int)
-        self.balance += n
-        self.edits += 1
+    bump(*self) = self.prio += 100
 
-add_ten(n: *int)
-    *n += 10
+struct Kernel
+    tasks: [4]Task
 
-twice(p: *int)
-    add_ten(p)
-    add_ten(p)
+    task(*self, i: usize) -> ref Task = self.tasks[i]
 
-run() -> int
-    var acct = Account(100, 0)
-    var n = 1
+var k = Kernel([Task(0, 7); 4])
 
-    acct.deposit(5)
-    twice(&n)
-    twice(&acct.balance)
-    acct.balance + n + acct.edits
+k.task(2).state = 2
 
-print(run())
+ref t = k.task(1)
+
+t.prio += 1
+k.task(0).bump()
+
+val copy = k.task(2)
+
+k.task(2).state = 9
+
+print(k.tasks[2].state, t.prio, k.tasks[0].prio, copy.state)
 ```
 
 ```output
-147
+9 8 107 2
 ```
 
-```sysl
-static var last: *Node = null
+**It is the same `ref`, written in the callee**: the body's place is kept as a template over the
+parameters, so every hazard of the one rule is refused through a method too. The body's last
+expression and nothing else is the answer — a field chain, an element or a dereference from a parameter
+or module storage, leaving the parameter's own bytes through a `*self`, a reference, a view, an element
+or a `*T`. Refused: a field of a by-value `self` or a local; a value or a place chosen by an `if`; a
+`return` or `?` in the body; a place inside a struct with an `invariant`. It is written on a type's own
+member, inherent or generic, and not on a free function, in a trait, or on an `impl` member a trait
+declares. **The address is never a value**: `&k.task(0)` and `&Kernel.task` are refused.
 
+```sysl
+struct Pair
+    a: int
+
+    get(self) -> ref int = self.a
+```
+
+```error
+'Pair.get' would answer a place in storage of its own call — a by-value parameter or a local — which is gone when it returns
+```
+
+## The raw tier
+
+**Anything C can do through a pointer, sysl can**, and the pointer is where the guarantees stop.
+
+**`null` is the absent raw pointer**, with no type of its own: it takes the `*T` its context expects.
+A generic parameter is such a context and answers late — an argument with no type of its own is set
+aside until the others have settled the parameter, in either order — and a call with nothing else to
+settle it is refused rather than defaulted:
+
+```sysl
 struct Node
+    value: int
     next: *Node
 
-    remember(*self)
-        last = self
+var third = Node(3, null)
+var second = Node(2, &third)
+var first = Node(1, &second)
 
-run()
-    var node = Node(null)
-    node.remember()
-```
+var walk = &first
+var total = 0
 
-```error
-'remember' keeps its parameter 'self' (it is stored in 'last'), and 'node' is a local of 'run'
-```
+while walk != null
+    total += walk.value
+    walk = walk.next
 
-**Where it is stored decides, not only that it is.** A pointer stored into what it points at — a node
-linked to itself, a struct whose field points into its own buffer — ends exactly when that storage
-does, so it is not kept. One stored into what *another* parameter points at is the caller's to judge:
-if that argument points into the caller's own frame, the pointer stays in the frame too. That is what
-makes an out-parameter, a pair of linked nodes or a list built in a local array work as written:
-
-```sysl
-struct Node
-    next: *Node
-    v: int
-
-link(a: *Node, b: *Node)
-    a.next = b
-
-put(out: **Node, v: *Node)
-    *out = v
-
-run() -> int
-    var nodes: [3]Node = [Node(null, 1), Node(null, 2), Node(null, 3)]
-    var last: *Node = null
-
-    link(&nodes[0], &nodes[1])
-    link(&nodes[1], &nodes[2])
-    put(&last, &nodes[2])
-    nodes[0].next.next.v + last.v
-
-print(run())
+print(total)
 ```
 
 ```output
 6
 ```
 
-The same address written through an out-parameter that points into module storage is kept, and so
-is the address of a function's own local written through any out-parameter at all — or through a
-pointer read out of one, `s.vm.con = &local`, since that is the caller's storage, not the frame's:
-
 ```sysl
-leak(out: **int)
-    var n = 1
-    *out = &n
+one[T](a: *T) -> bool = true
+
+print(one(null))
 ```
 
 ```error
-'&n' is the address of a local of 'leak', and it is stored in '*out', which outlives 'leak' — store the value itself, or storage that lasts
+'null' takes its type from its context, and there is none here
 ```
 
-**Storage the frame cannot show is its own is held to the same rule.** A place reached through what a
-call answered — `current().p`, a chain of calls, a trait object's answer, a local bound to any of
-them, an element of a `Buf` — may be storage someone else holds long after the frame is gone, and
-nothing the frame does next can change that, so the address of its local stored there is refused at
-the store. A call that answers its argument is no exception: what else it may answer is not
-something its signature says.
+### Arithmetic: two directions, one spelling each
+
+**`p - q` between two pointers of one pointee is an `isize` counting elements** — C's `ptrdiff_t`, the
+inverse of `&p[n]` — which is what turns `memchr`'s or `strstr`'s answer into an index. **Offsetting
+stays `&p[n]`**: `p + n` is not spelled, and `p + q` names no address. Two pointee types are refused by
+the ordinary matching-types rule, and **a `&T` has no arithmetic at all**. Whether two pointers into
+unrelated objects may be subtracted is the programmer's business.
 
 ```sysl
-struct Slot
-    p: *int
+var buf: [8]int = [10, 20, 30, 40, 50, 60, 70, 80]
+var base = &buf[0]
+var third = &buf[2]
 
-var the_slot = Slot(null)
-
-current() -> *Slot = &the_slot
-
-remember()
-    var n = 1
-    current().p = &n
-```
-
-```error
-'&n' is the address of a local of 'remember', and it is stored in 'current().p', which 'remember' cannot show is its own storage — store the value itself, or storage that lasts
-```
-
-The frame's own places stay open: a local, a field or element of one, and what a local bound once
-to the address of such storage — or to an object the frame made — points at. An address that lasts
-(module storage's, or one a parameter brought) may go anywhere:
-
-```sysl
-struct Slot
-    p: *int
-
-var the_slot = Slot(null)
-var spare = 3
-
-current() -> *Slot = &the_slot
-
-run() -> int
-    var n = 4
-    var s = Slot(null)
-    val q = &s
-
-    q.p = &n
-    current().p = &spare
-    *s.p + *current().p
-
-print(run())
+print(*third, third - base, base - third, *(&base[3]))
 ```
 
 ```output
-7
-```
-
-### An address held inside what is handed over
-
-**A function may let out what it reads through a pointer as well as the pointer itself.** `keep`
-below keeps nothing of `h` — the struct's own address ends with the call — but it copies the address
-the struct *holds* into module storage. So the same rule is asked of what the argument points at: the
-address of a local stored in a struct, an array or a view whose address goes to such a callee is
-refused, whether the callee stores what it read, pushes it into a buffer, puts it in a heap object,
-hands it to another callee that does, or answers with it:
-
-```sysl
-var last: *int = null
-
-struct Holder
-    p: *int
-
-keep(h: *Holder)
-    last = h.p
-
-run()
-    var n = 5
-    var h = Holder(&n)
-    keep(&h)
-```
-
-```error
-'keep' lets what it reads through its parameter 'h' outlive the call (it is stored in 'last'), and what is read through '&h' holds the address of a local of 'run'
-```
-
-The question is about the one step from the pointer into what it points at, since that is where the
-addresses the frame's storage holds are read. A callee that only reads through it, copies out a
-number rather than an address, or lets out only what it reads *through* the address the struct
-holds — a step further, which is not this frame's storage — stays accepted:
-
-```sysl
-struct Holder
-    p: *int
-    n: int
-
-total(h: *Holder) -> int = *h.p + h.n
-
-run() -> int
-    var n = 5
-    var h = Holder(&n, 2)
-    total(&h)
-
-print(run())
-```
-
-```output
-7
-```
-
-**How the address got there does not matter.** One copied out of a field into a local, read through a
-pointer, chosen by a branch, stored after the struct was made, or answered by another call is
-followed into whatever is handed over, at whatever depth it ends up — an address two steps in is
-asked of what the callee lets out of what it reads two steps through its parameter. Here `hs` is
-`&h`, read out of `w0`, and `&n` sits two steps through `&w`:
-
-```sysl
-var last: *int = null
-
-struct Holder
-    p: *int
-
-struct Wrap
-    h: *Holder
-
-keep_deep(w: *Wrap)
-    last = w.h.p
-
-run()
-    var n = 5
-    var h = Holder(&n)
-    var w0 = Wrap(&h)
-    val hs = w0.h
-    var w = Wrap(hs)
-    keep_deep(&w)
-```
-
-```error
-'keep_deep' lets what it reads through its parameter 'w' outlive the call (it is stored in 'last'), and what is read through '&w' holds the address of a local of 'run'
-```
-
-The callee is followed the same way: a pointer it copies out of its parameter into a local, gets back
-from another call, or hands on by the address of a local holding it is still read through as the
-parameter is. Each step is told apart however deep a chain of distinct types goes. Where the caller's
-storage holds a cycle — a value holding its own address, a ring — or the pointer's type reaches itself
-past eight steps, a callee is asked what it lets out of anything it reads through the pointer, which
-cannot tell the steps apart, so it is refused if it lets out anything read there — conservatively —
-and accepted if it only reads.
-
-**The fields are told apart too.** What the callee lets out is asked of the field the address sits
-in: here `&b` sits in `a.peer`, and `keep_bus` lets out only `c.bus`, so the call is accepted — a
-callee letting out `c.peer`, `c` itself, or anything read through `c.peer` is refused. The field is
-the one of the local the address is stored in (a field of a field, an array field's elements all
-alike, a field a callee stores into), and on the callee's side the field it reads straight through
-its parameter; a read it cannot place that way — through a copy of the pointer, or the pointee whole —
-counts for every field, and a union's members are one field.
-
-```sysl
-struct Cpu
-    peer: *Cpu
-    bus: *int
-
-var the_bus = 7
-var last: *int = null
-
-keep_bus(c: *Cpu)
-    last = c.bus
-
-run() -> int
-    var a: Cpu
-    var b: Cpu
-    a.bus = &the_bus
-    a.peer = &b
-    keep_bus(&a)
-    *last
-
-print(run())
-```
-
-```output
-7
-```
-
-As with the pointer itself, a call with no body in sight borrows what it reads for the call: an
-`extern` lets nothing out unless its `@keeps` names the parameter, and neither does a call through an
-object of no known trait or through a function pointer C may call.
-
-### A block's local lives as long as its block
-
-**A local is good for as long as the block that declares it, not as long as the frame.** A loop body's
-local is a new variable on every turn, and an `if` arm's `string` is released where the arm ends, so
-the address of one may not be kept anywhere that is still there after its block: a local of an
-enclosing block, a field of one, a buffer an enclosing block holds, or a closure stored in one. It is
-judged against the innermost block declaring the local — an `if` or `else` arm, a `match` arm, a
-`for`, `while` or `loop` body, a nested block — wherever the address goes on to, through a local that
-holds it, a struct or variant built around it, a closure that captures such a local, a call that
-answers it, or a block or `break` that yields it:
-
-```sysl
-run()
-    var spare = ""
-    var q = &spare
-
-    if true
-        var s = "abc".copy()
-
-        q = &s
-
-    print(*q)
-```
-
-```error
-'&s' is the address of 's', a local of the 'if' block, and it is kept in 'q', which outlives that block — keep the value itself, or declare 's' where 'q' is declared
+30 2 -2 40
 ```
 
 ```sysl
-run()
-    var spare = 0
-    var seen: [3]*int = [&spare, &spare, &spare]
-
-    for i in 0..<3
-        var n = i * 10
-
-        seen[i] = &n
-```
-
-```error
-'&n' is the address of 'n', a local of the 'for' body, and it is kept in 'seen', which outlives that block — keep the value itself, or declare 'n' where 'seen' is declared
-```
-
-A callee that stores what it is handed into what another argument points at keeps it there:
-
-```sysl
-put(out: **int, v: *int)
-    *out = v
-
-run(c: bool)
-    var spare = 0
-    var last = &spare
-
-    if c
-        var a = 1
-
-        put(&last, &a)
-```
-
-```error
-'&a' is the address of 'a', a local of the 'if' block, and 'put' keeps it in 'last', which outlives that block — keep the value itself, or declare 'a' where 'last' is declared
-```
-
-A closure holding such an address is the same address:
-
-```sysl
-run()
-    var g: &Fn() -> int = () -> 0
-
-    for i in 0..<3
-        var n = i * 10
-        val p = &n
-
-        g = () -> *p
-
-    print(g())
-```
-
-```error
-'() -> *p' holds the address of 'n', a local of the 'for' body, and it is kept in 'g', which outlives that block — keep the value itself, or declare 'n' where 'g' is declared
-```
-
-**Inside the block, and into it, the address is free**: a local of the same block or a deeper one may
-hold it, a borrowing callee may be handed it, and an enclosing block's local may be pointed at from
-inside. What leaves the block by value is a copy, and is never refused:
-
-```sysl
-bump(p: *int)
-    *p += 1
-
-run() -> int
-    var total = 0
-    var at = &total
-
-    for i in 0..<3
-        var n = i
-        val p = &n
-
-        bump(p)
-        at = &total
-        *at += *p
-
-    total
-
-print(run())
-```
-
-```output
-6
-```
-
-### Taken back before it returns
-
-**A store undone on every way out is not kept.** A place written over with something else before the
-function returns — in the body, in a `defer`, or by a callee whose own body writes it on every way out
-— no longer holds the pointer once the call is over. This is how a sink is lent to a module for the
-length of a call:
-
-```sysl
-static var spare = 0
-static var held: *int = &spare
-
-store(p: *int)
-    held = p
-
-clear()
-    held = &spare
-
-run() -> int
-    var n = 41
-    store(&n)
-    val seen = *held + 1
-    clear()
-    seen
-
-print(run())
-```
-
-```output
-42
-```
-
-**The place may be reached through a pointer**, spelled out (`s.vm.con`) or through a local that
-holds it (`val vm = s.vm`), so long as the store and the overwrite are known to reach the same
-storage: a local bound once and never written holds one pointer, and a pointer read out of memory is
-the same one until a call, or a store of a pointer of its type, may have changed it. A console lent
-to a machine for one evaluation is put back that way:
-
-```sysl
-struct Out
-    n: int
-
-struct Con
-    out: *Out
-
-struct M
-    con: *Con
-
-struct Session
-    vm: *M
-    home: *Con
-
-static var sink = Out(0)
-static var home = Con(&sink)
-static var m = M(&home)
-
-eval(s: *Session, out: *Out)
-    val vm = s.vm
-    var con = Con(out)
-
-    vm.con = &con
-    vm.con.out.n += 1
-    vm.con = s.home
-
-run(s: *Session) -> int
-    var o = Out(0)
-
-    eval(s, &o)
-    o.n
-
-var s = Session(&m, &home)
-
-print(run(&s))
-```
-
-```output
-1
-```
-
-A way out that skips the clear leaves it held: an early `return`, a `?`, a call that never comes back
-such as `panic`, a `break` past it, or one arm of a `match` without it. Writing a *different* place —
-another global, another field, the same field of another instance — takes nothing back:
-
-```sysl
-static var spare = 0
-static var held: *int = &spare
-
-store(p: *int)
-    held = p
-
-clear()
-    held = &spare
-
-run(c: bool)
-    var n = 1
-    store(&n)
-    if c then return
-    clear()
-```
-
-```error
-'store' keeps its parameter 'p' (it is stored in 'held'), and '&n' is the address of a local of 'run'
-```
-
-Each way of keeping is found wherever it is, however many calls down:
-
-```sysl
-import sysl.buf.{Buf, buf}
-
-static var all: Buf[*int] = buf()
-
-collect(p: *int)
-    all.push(p)
-
-relay(p: *int) = collect(p)
-
-run()
-    var n = 1
-    relay(&n)
-```
-
-```error
-'relay' keeps its parameter 'p' (it is passed to 'collect', which keeps it), and '&n' is the address of a local of 'run'
-```
-
-**A buffer the function made itself keeps nothing past the call.** A value pushed onto a `Buf` is held
-as long as that buffer is, so a local buffer used as a worklist ends with its frame, and pushing onto
-it is not keeping — unless the buffer itself gets out: returned, stored, captured by a closure that
-is, handed to a callee that keeps it, or something read back out of it is kept. A buffer the function
-was handed, reached through a `ref`, or copied from module storage is not its own:
-
-```sysl
-import sysl.buf.{Buf, buf}
-
-larger(a: *int, b: *int) -> int
-    var work: Buf[*int] = buf()
-    work.push(a)
-    work.push(b)
-
-    var best = 0
-
-    while work.pop() is Some(p)
-        if *p > best then best = *p
-
-    best
-
-run() -> int
-    var x = 3
-    var y = 8
-    larger(&x, &y)
-
-print(run())
-```
-
-```output
-8
-```
-
-Storage that outlives the call — module storage, a box's — is the program's to give away, and so is
-storage reached through a pointer the function was handed. **The entry file's own statements** are
-the one body passed over: their frame is the program's, laid down before anything else runs and given
-back only as it ends.
-
-### Handing it back is not keeping it
-
-A function may answer the pointer it was handed, or the address of something inside what it points
-at: `field(s: *S) -> *int = &s.y` keeps nothing, and **its answer is lent for as long as the argument
-is**. The caller follows the answer as it follows the argument — keeping it is keeping the argument,
-and a function may not hand back an answer made of its own frame:
-
-```sysl
-struct S
+struct Point
     x: int
-    y: int
 
-field(s: *S) -> *int = &s.y
+var a: &Point = Point(1)
+var b: &Point = Point(2)
 
-run() -> int
-    var s = S(1, 2)
-    val p = field(&s)
-
-    *p += 10
-    s.y
-
-print(run())
-```
-
-```output
-12
-```
-
-```sysl
-struct S
-    x: int
-    y: int
-
-field(s: *S) -> *int = &s.y
-
-run() -> *int
-    var s = S(1, 2)
-
-    field(&s)
+print(a - b)
 ```
 
 ```error
-'field(&s)' is returned, but it holds the address of a local of 'run', whose storage ends when 'run' returns
+operator '-' is not defined for &Point
 ```
 
-**Only a value that can hold an address is made of one.** An `int`, a `bool`, a float, a bare enum
-or a struct with no pointer in it answers nothing about where its argument lived, so `Ok(n)` after a
-C function filled `&n` is an ordinary value. A C function's pointer answer is taken to be made of its
-pointer arguments that could hold what it points at — one to the same type or to a struct holding
-it, and bytes from bytes, as `strchr`'s is — and not of an out-parameter of another type, so a handle
-a C library allocated is not made of the `*i32` it reported an error code through, nor of a context
-it was handed as bytes. **An integer is made of no address**: `address(p: *int) -> usize = usize(p)`
-answers a number, and a pointer `ptr_cast` makes of a number is made of nothing the compiler follows.
+**Bounds safety follows length, not pointers.** Arrays and views carry their length, so indexing is
+checked in every context — hosted or allocator-free, over static, stack or heap memory — except where
+the program asked by name for [unchecked access](/reference/arrays/#unchecked-access). `*T` carries
+none: `p[i]` and `p[0..<n]` are unchecked, as in C. A pointer to something with a subscript of its own
+— a `*[N]T`, a `*Buf[T]` — is indexed as that thing, with its check
+([arrays](/reference/arrays/#a-raw-pointer-is-indexed-anyway)).
 
-### An address as an integer leaves the analysis
+### Reinterpreting storage
 
-**A frame's own address as an integer is a number.** `usize(&marker)` remembered in module storage,
-or handed back, is how a program measures its stack, and as a number it outlives nothing:
+| written | direction | tier |
+|---|---|---|
+| `usize(p)` | a pointer as a number | an ordinary conversion |
+| `ptr_cast(n)` | a number as a pointer | unsafe |
+| `ptr_cast(p)` | one pointee type as another | unsafe |
+
+**`ptr_cast` is imported from `sysl.raw`**, beside `str_cast` and `str_alias`, so every
+reinterpretation is found by its imports; an alias, a wildcard and a module path reach it as they
+reach anything. A function or local the program names `ptr_cast` wins, and importing the form under
+such a name is refused.
 
 ```sysl
-var top: usize = 0
+var arena: [8]u8 = [0u8; 8]
+val p: *u32 = ptr_cast(&arena[0])
 
-mark()
-    var marker = 0
-
-    top = usize(&marker)
-
-here() -> usize
-    var marker = 0
-
-    usize(&marker)
-
-main()
-    mark()
-    print(here() > 0 && top > 0)
+print(*p)
 ```
 
-```output
-true
+```error
+'ptr_cast' is in sysl.raw: add 'import sysl.raw.ptr_cast'
 ```
 
-**Turning that number back into a pointer is the program's responsibility.** `ptr_cast` of an
-integer is unchecked, the way an `as usize` round trip is in Rust: the compiler tracks no address
-through the integer — not through module storage, a field, a parameter, an answer or arithmetic —
-and refuses nothing. Here `peek` reads `marker` while `mark` is still running, which is sound; the
-same `peek` called after `mark` has returned compiles just the same, and reads whatever that stack
-slot holds by then:
+**A pointer becomes an integer by ordinary conversion** — `usize` (or `isize`) holds any address, so
+it is total, and the number cannot be dereferenced. The address of a function converts the same way.
+
+**A number becomes a pointer only from an address-width integer**, `usize` or `isize`. The operand of
+`ptr_cast` is an address-width position, so a bare literal — or an expression of nothing but bare
+literals — is a `usize` at the target's width, written as the datasheet prints it; one too wide for the
+target, or negative, is refused as a literal that does not fit. A value that already has a type keeps
+it, and is converted where it is meant as an address:
 
 ```sysl
 import sysl.raw.ptr_cast
 
-var top: usize = 0
+struct Uart
+    data: u32
+    status: u32
 
-peek() -> int
-    val p: *int = ptr_cast(top)
+val uart: *Uart = ptr_cast(0x4000_4000)
+val status: *u32 = ptr_cast(0x4000_4000 + 4)
+val bit: *u8 = ptr_cast(1 << 20)
+val none: *Uart = ptr_cast(0)
 
-    *p
-
-mark() -> int
-    var marker = 7
-
-    top = usize(&marker)
-    peek()
-
-main()
-    print(mark())
+print(usize(uart), usize(status), usize(bit), usize(none))
 ```
 
 ```output
-7
+1073758208 1073758212 1048576 0
 ```
 
-No `unsafe` block is asked for, and `@unchecked` (which skips a subscript's bounds test) has nothing to
-do with it: the cast is the raw tier's, and the `import sysl.raw.ptr_cast` a file must write is where
-a reader finds every such round trip. The address kept **as a pointer** is still the analysis's, and
-still refused:
-
 ```sysl
-var top: *int = null
+import sysl.raw.ptr_cast
 
-mark()
-    var marker = 7
+var base = 0x4000_4000
+val uart: *u32 = ptr_cast(base)
 
-    top = &marker
-
-mark()
+print(usize(uart))
 ```
 
 ```error
-'&marker' is the address of a local of 'mark', and it is stored in 'top', which outlives 'mark'
+'ptr_cast' reads an address, and int is not address-width — convert it first, as 'ptr_cast(usize(n))'
 ```
 
-A pointer the callee **read out of** what it was handed is somebody else's address, and is the
-caller's to keep:
+**The target comes from whatever receives the result**, or is written on the form —
+`ptr_cast[*Node](&arena[0])`; with neither, the program is told to annotate. **`ptr_cast` never
+produces a `&T`**, a `weak T`, a view or a `string`: a reference is counted and non-null, and the fat
+types are wider than an address.
+
+```sysl
+import sysl.raw.ptr_cast
+
+struct Node
+    value: int
+
+var arena: [64]u8 = [0u8; 64]
+var n: &Node = ptr_cast(&arena[0])
+
+print(n.value)
+```
+
+```error
+'ptr_cast' never produces a reference: a '&T' is counted and non-null, and an address read out of bytes carries no count for anything to own — read it as a '*T'
+```
+
+### Storage the compiler did not lay out may not hold a counted value
+
+**A `&T`, a `weak T`, a view or a `string` may not be written into memory reached by `ptr_cast`** — nor
+a struct or enum carrying one — because an assignment releases what occupied the slot, and the release
+would walk whatever the bytes held. **Nothing refuses this**: the compiler does not track where a
+pointer came from. Keep an index, a raw pointer or a copy instead — an arena of nodes linked by index
+costs nothing a box was buying. A type of scalars, raw pointers and arrays of those may live in storage
+you carved, which covers every C ABI struct. `sizeof`, `alignof` and `offsetof` are on
+[expressions](/reference/expressions/).
+
+**Zeroed storage is the exception** — what `calloc` or a collector gives. An all-zero counted
+reference names nothing, so a `&T` field (or a `Buf`, `Map` or `Deque`) in zeroed storage takes its
+first assignment safely. Until then it is the one null `&T`, and **`is_null(r)`** asks, with no share
+taken; it answers `false` for any `&T` the language made, and refuses a trait object, a `weak T` and a
+non-reference. **`release(place)`** is its other half: it gives back the share the place held, running
+the destructor on the last one, and leaves the place empty; a second release gives back nothing. A
+container gives its share back through its own `.release()` member, and an `Option` or `weak T` is
+emptied by assigning `None`, so `release` refuses those. Both are forms a same-named function or local
+overrides.
+
+```sysl
+import sysl.raw.ptr_cast
+
+extern "calloc" c_calloc(n: usize, size: usize) -> *u8
+extern "free" c_free(p: *u8)
+
+struct Item
+    label: string
+
+struct Slot
+    item: &Item
+
+val s: *Slot = ptr_cast(c_calloc(1, sizeof(Slot)))
+
+print(is_null(s.item))
+
+s.item = Item("a")
+
+print(is_null(s.item), s.item.label)
+
+release(s.item)
+
+print(is_null(s.item))
+
+c_free(ptr_cast(s))
+```
+
+```output
+true
+false a
+true
+```
+
+### Slot storage: room that holds no value yet
+
+A growable container needs a spare end that holds **nothing**, not a fill value that would keep what
+it names alive. Three forms give the raw tier that, and [`sysl.buf.Buf`](/library/buf/) is written
+with them:
+
+- **`slot_storage(n)`** (or `slot_storage[T](n)`) is a `[]T` of `n` slots of which **none is live**;
+  the element type comes from the position, and with none it is refused.
+- **`slot_place(xs, i, v)`** fills the first slot past the live run without letting go of anything; a
+  live slot is an ordinary assignment; a slot further on would leave a gap, and **traps**.
+- **`slot_vacate(xs, n)`** lets go of every live slot from `n` on — only where nothing else holds the
+  storage; while a view handed out earlier exists it does nothing, and the next vacate catches up.
 
 ```sysl
 struct Node
-    v: int
+    n: int
 
-struct Queue
-    head: *Node
+var xs: []&Node = slot_storage(4)
 
-    first(*self) -> *Node = self.head
+slot_place(xs, 0, Node(1))
+slot_place(xs, 1, Node(2))
 
-static var n = Node(7)
-static var kept: *Node = &n
+print(xs.len, xs[0].n + xs[1].n)
 
-keep(p: *Node)
-    kept = p
+slot_vacate(xs, 1)
+slot_place(xs, 1, Node(5))
 
-run()
-    var q = Queue(&n)
-    keep(q.first())
-
-run()
-print(kept.v)
+print(xs[0].n + xs[1].n)
 ```
 
 ```output
-7
+4 3
+6
 ```
 
-### Where no body is in sight, the call borrows
+**The live run is the storage's own**: the buffer's box counts the live slots, and its destructor
+releases exactly those; the view's `len` is still the whole room. **The caller owes the one check the
+compiler cannot make**: nothing reads a slot past the live run. On storage `slot_storage` did not make,
+the two writing forms are an assignment and nothing.
 
-A call the compiler cannot follow into a body needs an answer all the same, and the answer is the one
-C programs already live by — **a pointer handed to a call is borrowed for the call**:
+### Moving one value through a raw pointer
 
-| what is called | what it keeps |
-|---|---|
-| a sysl function | what its body keeps |
-| a method through a trait object | what the trait's declaration of the method says: nothing, unless it says [`@keeps(p)`](/reference/attributes/#keeps-and-answers-on-a-trait-method), or `@keeps(self)` for the object itself; an `async` method's task holds every argument until it is awaited. An implementation reached through an object that keeps a parameter or its receiver the declaration does not name — a pointer, an object, a callback, or what it reads through a pointer — is refused where it is written |
-| a closure | nothing — a closure that keeps what it is handed is refused where it is written; the variables it captures are judged at the closure literal, where its body is in hand. A parameter its type marks [`@keeps`](#a-callable-that-keeps-what-it-is-handed) is kept, as an `extern`'s is, and what is read through one it marks `@lets_out` may be kept |
-| a function through a pointer | nothing — a function whose address is taken and keeps a parameter, or lets out what it reads through one, is refused where it is written, unless every type its address is taken at marks the parameter: [`@keeps`](#a-callable-that-keeps-what-it-is-handed) lets it keep the parameter and what it reads through it, and every call through the pointer keeps the argument; `@lets_out` lets it let out only what it reads through the parameter, and every call borrows the argument and keeps what is reached through it |
-| an `extern` | nothing, and nothing it reads through a pointer, unless its declaration says [`@keeps(p)`](/reference/ffi/#keeps-a-c-function-that-holds-on-to-a-pointer). The declaration is trusted: a C function that holds a pointer past the call without saying so is a wrong declaration |
+Storage whose live slots are not a prefix — a ring's run wraps — moves one value at a time, as Rust's
+`ptr::read` and `ptr::write` do. **`slot_take(p)`** moves the value out: the slot's share becomes the
+result's, **no count is taken or given back**, and the slot is left **empty** (zeroed, over an element
+holding a count). **`slot_put(p, v)`** moves `v` into an **empty** slot, giving nothing back. A taken
+slot must be live, a put slot empty, and nothing reads an empty slot — the caller's to keep. Both
+refuse what is not a `*T`.
 
-No table of the program's bodies is consulted for any of these: which body a call through an object or
-a pointer lands in is decided when the program runs, so the signature is the whole answer, and every
-body is held to it where it is written. The answer of a call through an object may be made of the
-receiver, and of nothing else it was handed unless the declaration says `@answers(p)` — Rust's
-elision rule for a method.
+### Device memory
 
-A closure is judged where it is written, capture by capture, by what its body lets out of each — and
-again at every call it is handed to — so it makes no difference whether a call runs it, it is boxed
-behind a `&Fn`, or a `@scoped` member runs it later. A capture holding the address of the frame's own
-storage, stored by the body in module storage, outlives the frame:
+An optimizer may assume that reading storage twice yields one value, that a store nobody reads is not
+needed, and that two accesses may merge — all false at a device. So sysl has C's qualifier, in the type:
 
 ```sysl
-static var idle = 0
-static var kept: *int = &idle
+struct Uart
+    status: volatile u32
+    data:   volatile u32
+    baud:   u32
 
-run(f: () -> unit) = f()
+var block = Uart(1, 0, 115200)
+var regs: *Uart = &block
 
-closure() -> int
-    var n = 5
-    val p = &n
-    run(() -> kept = p)
-    0
+regs.data = 65
 
-print(closure())
-```
-
-```error
-a closure lets its capture 'p' outlive the call (it is stored in 'kept'), and 'p' holds the address of a local of 'closure' — capture the value itself, or storage that lasts
-```
-
-**A capture stored through a parameter of the closure outlives the frame too.** Nothing at the
-literal says where a parameter points — a lock's `with` hands the body the value a module lock
-guards — so a capture holding the frame's address that the body stores into what it is lent, a field
-of it however deep, or a buffer inside it, is refused the same way. A capture of a heap value or of a
-plain number is stored freely:
-
-```sysl
-import sysl.threads.Mutex
-
-struct Th
-    p: *int
-
-struct Joint
-    thread: Option[Th]
-
-var m = Mutex.new(Joint(None))
-
-run()
-    var local = 3
-    val started = Some(Th(&local))
-
-    m.with((j) -> j.thread = started)
-
-run()
-print(m.with((j) -> j.thread.is_some()))
-```
-
-```error
-a closure lets its capture 'started' outlive the call (it is stored in 'j.thread'), and 'started' holds the address of a local of 'run'
-```
-
-**So does the address of a capture, and it is told at the closure.** Written straight into the body,
-`&local` is the address of the capture, which the closure holds by value in its own storage — gone
-with the frame that holds the closure, or with the frame of whatever runs it. The refusal points at
-the closure, never into the body of `with` or of any other function that only runs it:
-
-```sysl
-import sysl.threads.Mutex
-
-struct Th
-    p: *int
-
-struct Joint
-    thread: Option[Th]
-
-var m = Mutex.new(Joint(None))
-
-run()
-    var local = 3
-    m.with((j) -> j.thread = Some(Th(&local)))
-
-run()
-```
-
-```error
-a closure lets the address of its capture 'local' outlive the call (it is stored in 'j.thread'), and the closure holds 'local' by value, in its own storage
-```
-
-**What a call with no body answers is asked the same way.** An `extern`'s answer is fresh — storage
-the library made, which is made of none of its arguments — unless its declaration says
-[`@answers(p)`](/reference/ffi/#answers-a-c-function-whose-answer-points-into-an-argument), and then
-it is made of what `p` was handed, as a sysl function's answer is made of what it hands back. An
-inline-assembly output is fresh the same way: the compiler does not read the instructions, so what
-they leave in a register is made of none of the operands handed in. So an
-`opendir` handle may be carried out of the frame that passed it a path on its stack, and a `strchr`
-answer into a local's bytes may not:
-
-```sysl
-extern "opendir" c_opendir(dir: *u8) -> *u8
-extern "closedir" c_closedir(d: *u8) -> int
-
-static var spare: u8 = 0
-static var stream: *u8 = &spare
-
-open() -> bool
-    var dot: [2]u8 = [u8('.'), 0]
-
-    stream = c_opendir(&dot[0])
-    stream != null
-
-if open() then print(c_closedir(stream))
+print(regs.status, regs.data, regs.baud)
 ```
 
 ```output
-0
+1 65 115200
 ```
 
+> A **`volatile`** place is one whose reads and writes are **effects, not value computations**: the
+> compiler emits exactly the accesses the source wrote, once each, in the order written — never adding,
+> dropping, merging or moving them.
+
+**It constrains the compiler, not the machine**: no atomicity, no ordering against another core, no
+protection from a torn read. Talking to another thread is `&sync T`, `Mutex[T]` and `Atomic[T]`.
+
+**It qualifies storage, and a value read out of storage is an ordinary value**: `regs.status` is a
+`u32`. The qualifier goes on a struct field, an element (`[4]volatile u32`), a pointee
+(`*volatile u32`) and module storage (`var tick: volatile u64`, which an interrupt handler writes and
+the program polls). A local, a parameter, a result and a type argument are values:
+
 ```sysl
-@answers(s)
-extern "strchr" c_strchr(s: *u8, c: int) -> *u8
+var x: volatile u32 = 0u32
 
-static var spare: u8 = 0
-static var held: *u8 = &spare
-
-find()
-    var text: [3]u8 = [104, 105, 0]
-
-    held = c_strchr(&text[0], 105)
+print(x)
 ```
 
 ```error
-'c_strchr(&text[0], 105)' holds the address of a field of 'text', a local of 'find', and it is stored in 'held', which outlives 'find'
+'volatile u32' is the type of *storage*, and this is a value — what a read of a volatile place hands back is an ordinary 'u32'. The qualifier goes where the storage is named: a struct field, an element, or the pointee of a '*T', as '*volatile u32'
 ```
 
-A default is a promise, so the body behind it is held to it. That is what makes a lock's `with`
-safe without an annotation: the closure it calls borrows the address of the value for the call, and a
-closure that keeps it is refused where it keeps it, which is the one mistake a returned address could
-not prevent — using it after the release:
+```sysl build=c target=aarch64-freestanding
+var ticks: volatile u64 = 0
 
-```sysl
-struct Cell
-    v: int
+@export("on_timer")
+on_timer()
+    ticks += 1
 
-    with[R](*self, body: *int -> R) -> R = body(&self.v)
-
-static var spare = 0
-static var kept: *int = &spare
-
-var c = Cell(1)
-
-c.with((v) -> *v += 1)
-print(c.v)
-c.with((v) -> kept = v)
+@export("wait_for")
+wait_for(n: u64)
+    while ticks < n do ()
 ```
 
-```error
-a closure borrows what it is handed for the call, and this one keeps its parameter 'v' (it is stored in 'kept')
-```
+- **`ticks += 1` is a volatile load then a volatile store — not atomic.** Where both sides write, or two
+  cores share the word, the tool is `Atomic[T]`.
+- **Per field, not per aggregate**: a register block's shadow values (a cached baud, a reserved word)
+  stay ordinary memory. `*volatile Uart` and `volatile Counts` are refused, and the refusal points at
+  qualifying the fields. A `val` is refused: a constant has nothing writing it.
+- **Only a scalar or a raw pointer may be qualified** — one access, one instruction. A counted value, a
+  trait object (two words), a constrained subtype (a register holds whatever the device put there;
+  convert on arrival) and a data enum are refused; a simple enum and a bitfield (a read-modify-write of
+  its container, see [`@packed`](/reference/attributes/)) are admitted. A struct holding a register
+  carries no `invariant`.
+- **What the compiler does**: `load volatile` / `store volatile`, with no runtime cost. A qualified
+  field is reached at its own address, never lifted out of the block; copying a whole block is an
+  access to every register in it; `&regs.status` is a `*volatile u32`; a type parameter never binds a
+  qualified type.
+- **`volatile` is not reserved** — special only before a type, as `sync` is after `&`. `[]const
+  volatile u32` is a read-only register view: `const` is the view's property, `volatile` the
+  element's.
+- **Memory a device reads by DMA is a library type**, [`sysl.dma`'s `Region`](/library/dma/), not a
+  qualifier: it needs a device address and a cache-honest handover, neither a property of a place.
 
-```sysl
-trait Bump
-    bump(*self, n: *int)
+## Recursive types
 
-struct Keeper
-    held: *int
-
-impl Bump for Keeper
-    bump(*self, n: *int)
-        self.held = n
-```
-
-```error
-'bump' keeps its parameter 'n' (it is stored in 'self.held'), but a method of 'Bump' borrows its parameters for the call
-```
-
-### A callable that keeps what it is handed
-
-A callback that keeps what it is handed — an interpreter's primitive putting the handle it is called
-with into the term it builds, a visitor collecting the nodes it is shown — says so in its type, with
-[`@keeps`](/reference/types/#a-parameter-the-callable-may-keep-keeps) on the parameter:
-`&Fn(@keeps *Handle) -> Step`. A closure made at that type may keep that parameter; every other
-parameter is still borrowed. **A call through a value of the type is held to the mark the way a call
-of an `extern` is held to its `@keeps(p)`**: what is handed there may be kept anywhere, so the address
-of storage that ends — a local, a field of one, a parameter's copy — is refused, and a function that
-hands its own parameter on there keeps it, so its callers are held to that in turn.
-
-```sysl
-import sysl.buf.{Buf, buf}
-
-struct Handle
-    n: int
-
-type Visit = &Fn(@keeps *Handle) -> unit
-
-var seen: Buf[*Handle] = buf()
-var a = Handle(3)
-
-walk(f: Visit, h: *Handle) = f(h)
-
-walk(h -> seen.push(h), &a)
-print(seen[0].n)
-```
-
-```output
-3
-```
-
-```sysl
-import sysl.buf.{Buf, buf}
-
-struct Handle
-    n: int
-
-type Visit = &Fn(@keeps *Handle) -> unit
-
-var seen: Buf[*Handle] = buf()
-
-visit_one(f: Visit)
-    var mine = Handle(1)
-    f(&mine)
-```
-
-```error
-a call through '&Fn(@keeps *Handle) -> unit' keeps its parameter 1 (its type says '@keeps'), and '&mine' is the address of a local of 'visit_one'
-```
-
-Without the mark the closure is refused where it keeps the parameter, and told the type that would
-let it:
-
-```sysl
-import sysl.buf.{Buf, buf}
-
-struct Handle
-    n: int
-
-var seen: Buf[*Handle] = buf()
-
-val f: &Fn(*Handle) -> unit = (h) -> seen.push(h)
-```
-
-```error
-a closure borrows what it is handed for the call, and this one keeps its parameter 'h' (it is passed to 'push', which keeps it) — whoever calls it may hand it the address of their own storage. Copy what this needs into storage of its own, or let it keep it by marking the parameter '@keeps' in the type it is made at: 'Fn(@keeps *Handle) -> unit'
-```
-
-**An unmarked parameter is answered by the type too, never by the closures made at it**: the call
-borrows the argument and everything read through it, so a closure that keeps an object it is handed,
-or lets out what it reads through a pointer, is refused where it is written, whatever any caller
-hands it:
-
-```sysl
-struct Cell
-    p: *int
-
-var the = 1
-var kept: *int = &the
-
-poke(f: &Fn(*Cell) -> unit)
-    var x = 5
-    var c = Cell(&x)
-    f(&c)
-
-poke((c) -> kept = c.p)
-```
-
-```error
-a closure borrows what it is handed for the call, and this one lets what it reads through its parameter 'c' outlive the call (it is stored in 'kept')
-```
-
-A callable's type has no way to say `@answers`, so a call through one may answer with anything it was
-handed: `kept = f(&mine)` stores a local's address as far as the caller can tell, whatever the closure
-answers.
-
-Every question a call through the object is asked about a marked parameter is answered as for an
-`extern`: what it reads through the pointer may be kept too, at any depth, and what it answers may be
-made of what it was handed. A call that sees the body — a closure handed to a bare-arrow parameter,
-which the function calls directly — is held to what that body keeps instead, as any call with a body
-in sight is.
-
-**A call through a function pointer borrows every argument for the call**, as an `extern` does: which
-function it lands in is decided when the program runs, so its type is the whole answer, and no table of
-the functions whose address is taken is consulted. A function whose address is taken is held to that
-where it is written — even one that only holds what it is handed in what another parameter points
-at, such as an interpreter's primitive writing its stack pointer back into the machine:
-
-```sysl
-struct M
-    sp: *isize
-
-type Code = *extern(*M, *isize) -> unit
-
-halt(m: *M, sp: *isize)
-    m.sp = sp
-
-var stack: [8]isize
-var m: M
-
-m.sp = &stack[0]
-val f: Code = &halt
-
-f(&m, m.sp)
-```
-
-```error
-'halt' keeps its parameter 'sp' (it is stored in 'm.sp'), and its address is taken — a call through a function pointer sees no body
-```
-
-Such a primitive takes a callable whose type marks the parameter instead — `&Fn(*M, @keeps *isize) ->
-unit` — so every call through it is held to the mark, and each closure made at it may keep it.
-
-**A function pointer type takes the mark the same way**: `*extern(*M, @keeps *isize) -> unit`. A
-function whose address is taken only at types marking a parameter may keep it, or let out what it
-reads through it; every call through the pointer is held to the mark as a call of an `extern` is to
-its `@keeps(p)`; and every unmarked parameter is still borrowed. A pointer that keeps nothing stands
-where a marked one is asked for, never the other way round:
+A type may reach itself **through an indirection**, and only through one. The rule is **per cycle**: a
+cycle is legal as soon as one edge on it is a `*T`, a `&T` or a `[]T` (a view points at its elements;
+a fixed `[4]T` holds them). Mutually recursive types work, in either declaration order.
 
 ```sysl
 struct Node
-    next: *Node
-    v: int
+    value: int
+    next: Node
 
-struct Heap
-    gray: *Node
+print(1)
+```
 
-type Roots = *extern(@keeps *Heap) -> unit
+```error
+type 'Node' contains itself, so it has no finite size
+```
 
-var root = Node(null, 7)
-var heap = Heap(null)
+**A type argument is not containment**: whether `Wrap[Node]` holds a `Node` is `Wrap`'s business.
+`Buf[T]` reaches its elements through a `[]T`, so `enum Json` with `Arr(items: Buf[Json])` is finite,
+and so is a cycle `Json` → `Buf[Member]` → `Member` → `Json`. A generic holding its parameter **by
+value** (`struct Wrap[T]` with a field `x: T`) closes the cycle, and the refusal names the field.
 
-roots(h: *Heap)
-    root.next = h.gray
-    h.gray = &root
+## What a count costs
 
-collect(h: *Heap, r: Roots)
-    r(h)
+None of this section changes what a program prints or when a destructor runs; it is where counts are
+**not** taken.
 
-main()
-    collect(&heap, &roots)
-    print(heap.gray.v)
+**Every heap object carries three header words**: the strong count, a pointer to the function that
+destroys it, and a weak count. Release decrements the strong count and at zero calls through the hook,
+which releases the payload and returns the storage to the heap it came from
+([one heap for the program](/reference/packages/#one-heap-and-the-package-that-names-it)). The hook
+makes release **type-erased** — what a view's owner word needs — so ARC works the same in a module
+that never allocates, several heaps coexist, and ownership crosses an allocator-free edge like any
+value. Values, fixed arrays and `*T` buffers carry no header.
+
+**Teardown is iterative**: an object reaching zero is pushed onto a per-thread worklist through its
+dead count slot, and the first release to hit zero drains it, so any depth comes apart in O(1) stack.
+**On a freestanding target the worklist is asked for**: a `&sync` release reaching zero fetches it
+through the weak symbol `__sysl_arc_reaper`, answering a `head` pointer and a `draining` flag of the
+running task. Define nothing and the single built-in slot serves a machine where nothing schedules; an
+RTOS port defines it in C, and a scheduler written in sysl defines it with
+[`@export`](/reference/ffi/), as `__sysl_arc_reaper() -> *T` over a struct of the same two fields, and
+the compiler then leaves its weak default out.
+
+```c
+struct sysl_arc_reaper { void *head; unsigned char draining; };
+
+struct sysl_arc_reaper *__sysl_arc_reaper(void) {
+    return pvTaskGetThreadLocalStoragePointer(NULL, 0);
+}
+```
+
+### Passing a reference to a call usually costs nothing
+
+**An argument is handed over under a guarantee that it stays alive for the call**, and the callee
+reads it through the caller's count — Swift's `guaranteed` convention. The caller asks one question:
+
+- a **temporary** is a count the frame holds to the end of the statement: nothing to do;
+- a **local or parameter** whose address has not been let out yet keeps its count where the callee
+  cannot reach it: nothing to do ("yet" counts a statement at a time; a loop is one statement);
+- **anything else** — a field, an element, a global, something behind a `ref` or a `&` — costs a retain
+  before and a release after, since the call may write that memory.
+
+A callee still takes a count for **a parameter it assigns to**, and for every parameter of a function
+something outside the program may call (`@export`, a `@section`, one whose address is taken).
+**A call to an `async` function moves a temporary into its task**, which lets it go at its `return`,
+not at the end of the caller's statement:
+
+```sysl
+struct Noisy
+    id: int
+
+impl Drop for Noisy
+    drop(self)
+        print(s"dropped ${self.id}")
+
+async keep(n: &Noisy) -> int = n.id
+
+plain(n: &Noisy) -> int = n.id
+
+async run()
+    print(s"async ${await keep(Noisy(1))}")
+    print(s"plain ${plain(Noisy(2))}")
+
+    val named: &Noisy = Noisy(3)
+
+    print(s"named ${await keep(named)}")
+    print("end of run")
+
+block_on(run())
 ```
 
 ```output
-7
+dropped 1
+async 1
+plain 2
+dropped 2
+named 3
+end of run
+dropped 3
 ```
 
-```sysl
-struct Heap
-    gray: *int
+### A parameter the function keeps arrives with its count
 
-type Roots = *extern(@keeps *Heap) -> unit
+**A parameter kept on every way out is owned**: the caller hands over the count at the argument's last
+use, or retains, so `b.push(x)` at `x`'s last use costs nothing. The ways out are each `return`, each
+failing `?`, and the end; a branch keeps where each arm does; a loop keeps where each `break` has kept
+(and, unless it is a `loop` only `break` ends, where the code before it had); a trapping path does not
+leave. One kept on some paths only stays borrowed, and the keeping path takes its own count. A call
+through a closure, function value, trait object or C reaches a borrowing entry; an `@export`ed,
+`async` or `@scoped` function, or one with a contract, keeps the borrowed convention.
 
-collect(r: Roots)
-    var mine = Heap(null)
-    r(&mine)
+**A value whose release can run a destructor is still destroyed where its scope ends**: such a local is
+retained for the call, not handed over at its last use, and never handed into an `if`'s arms, since
+the call might keep it only in a result that goes at the end of the statement while a view of what it
+owns is still being read.
+
+### A count that would be taken and given straight back is not taken
+
+**A retain is cancelled against a later release of the same reference when nothing between can give
+back the count that release would** — loads and stores of the frame's slots, arithmetic and other
+retains never can; a different value's release may sit between unless the stretch also writes memory
+outside those slots; any other call ends it. Releases split by an `if` or `match` are given back at the
+end of each arm. **A value's last use hands it over**: a fresh box, a call's result, or a local named
+for the last time is taken by its destination with no new count, and a struct or enum built on the
+spot is handed over field by field. A local still read later, named in a `defer`, used in a loop it was
+declared outside, or reached through an address or a `ref` is copied. Recursive search over `&sync`
+shapes loses three of every four atomic operations.
+
+### A view of something the frame already holds takes no count
+
+A slice of a slice, or a `val` copied out of a field, of a **parameter or a `val`** takes no share
+where its parent's count already holds the object, across a `for` or the rest of a loop's round —
+provided the parent stays put (not a `var` assigned in the loop or whose address is taken), the view
+stays in a local, and nothing between may look at a count: only arithmetic, reads, and calls to
+functions that release nothing and write only their own locals (`slot_vacate` frees only at a strong
+count of one).
+
+**The same goes for a reference read out of storage** — a field through a parameter, a buffer's
+element, a matched payload, a key built for a lookup — where nothing between can give a count back,
+look at one, or hand the thread to other code. A path that ends the program is held to the same rule,
+except a function handed only numbers. A call writing memory is judged by the type of what it writes:
+growing a `Buf[Value]` cannot touch a `Machine`. An `await` keeps the count, as does storing,
+returning, capturing or keeping the value; a tuple built on the spot for a keeping call is handed over
+whole.
+
+### A method's answer borrowed from its receiver
+
+**A function whose answer is read out of a parameter's storage is called so that the caller reads it
+there**: a place of a parameter (a field, an element of a fixed array or of a held buffer, a payload a
+`match` binds where every other arm ends the program, or another such method's answer), or a value
+built on the spot out of references read from it ("+0"). It keeps the ordinary call where some path
+answers a reference made there, where the body may release or write what it answers, and where no body
+is in sight. So `quad(self) -> Kids = self.kids.unwrap()` costs what `n.kids match Some(q) -> …`
+costs: no count at all. A generic is decided per instance. `--explain-borrows`
+([the CLI](/getting-started/cli/#explain-borrows)) reports each — here for a `Table` whose `find`
+answers `Some(it)` for an element of its `items`, a `look` built on it, and a `drained` that clears
+the buffer after asking:
+
+```
+$ sysl build --explain-borrows table.sysl
+table.sysl:13:5: 'Table.find' answers +0 from 'self': self.items.walk()[_]
+table.sysl:19:1: 'look' is not borrowed: its answer is a fresh value
+table.sysl:23:1: 'drained' answers a place of 't': t.items.walk()[_].unwrap().value, but its body may write or release what it was handed
 ```
 
-```error
-a call through '*extern(@keeps *Heap) -> unit' keeps its parameter 1 (its type says '@keeps'), and '&mine' is the address of a local of 'collect'
-```
-
-**A callable that only lets out what it reads is marked
-[`@lets_out`](/reference/types/#what-the-callable-reads-may-outlive-the-call-lets-out)**:
-`*extern(@lets_out *Heap) -> unit`, `&Fn(@lets_out *Heap) -> unit`. A function or closure taken at the
-type may let out what it reads through that parameter, and is still refused where it keeps the
-parameter itself. A call through the type borrows the argument, so the address of a local may be
-handed there — a collector's heap on the caller's stack — but whatever is reachable *through* it may be
-kept anywhere: storing the address of storage that ends into it before the call is what is refused,
-exactly as a call of a body that lets its reads out is. A function handing its own parameter on there
-lets out what it reads through it, so its callers are held to that, and not to keeping it.
-
-```sysl
-struct Node
-    next: *Node
-    v: int
-
-struct Heap
-    gray: *Node
-
-type Roots = *extern(@lets_out *Heap) -> unit
-
-var root = Node(null, 7)
-
-roots(h: *Heap)
-    root.next = h.gray
-    h.gray = &root
-
-collect(h: *Heap, r: Roots)
-    r(h)
-
-main()
-    var h = Heap(null)
-    collect(&h, &roots)
-    print(h.gray.v)
-```
-
-```output
-7
-```
-
-```sysl
-struct Node
-    next: *Node
-    v: int
-
-struct Heap
-    gray: *Node
-
-type Roots = *extern(@lets_out *Heap) -> unit
-
-visit(r: Roots)
-    var mine = Node(null, 1)
-    var h = Heap(&mine)
-    r(&h)
-```
-
-```error
-a call through '*extern(@lets_out *Heap) -> unit' may keep what it reads through its parameter 1 (its type says '@lets_out')
-```
-
-**A stored callback keeps what it captured, and nothing else.** A closure is an object, and storing
-one — in a field, module storage, a buffer, a trait's implementation — is refused only where the
-closure captured an address that is not the program's to give away. One capturing nothing, a number,
-a `&T`, a string or a struct by value may be stored anywhere:
-
-```sysl
-static var later: &Fn() -> int = () -> 0
-
-install(f: &Fn() -> int)
-    later = f
-
-run()
-    val k = 2
-    install(() -> k + 40)
-
-run()
-print(later())
-```
-
-```output
-42
-```
-
-```sysl
-static var later: &Fn() -> int = () -> 0
-
-install(f: &Fn() -> int)
-    later = f
-
-run()
-    var n = 7
-    val p = &n
-    install(() -> *p)
-```
-
-```error
-'install' keeps its parameter 'f' (it is stored in 'later'), and '() -> *p' holds the address of a local of 'run'
-```
-
-A trait's method borrows a view it is handed the same way, so a view of a local array passed through
-an object stays in the frame ([`traits.md § A method borrows what it is handed`](/reference/traits/#a-method-borrows-what-it-is-handed)).
-
-### Released in another context: the primitive says `@scoped`
-
-Some pointers are held past the call and let go of somewhere the compiler cannot follow: a scope's
-join, the `deliver` that ends an `await`, a kernel's `wake`. The caller is suspended or still inside
-its scope the whole time, so handing such a primitive the address of a local is safe — but the body
-stores it, and the rule above would refuse it. **The primitive that gives the guarantee declares it
-once, with [`@scoped(p)`](/reference/attributes/#scoped-p-on-a-pointer-held-only-while-the-caller-waits)
-on the pointer parameter**, and the compiler trusts it: a call of it keeps nothing it is handed at
-`p`, so code calling `block(&local)` or `await read(&buf)` carries no annotation at all. The promise
-is the primitive's own — handing `p` on to a callee that keeps it is refused unless that callee says
-`@scoped` too.
-
-### A thread borrows a frame only inside a scope
-
-**A `*T` that crosses into another domain is kept**: the thread may go on reading it after the call
-that started it has returned, and nothing the caller writes later takes that back. So
-`spawn(&work, &local)` is refused, whether or not the handle is joined afterwards — `spawn`'s `arg` is
-`@crossing`, and the refusal names the way that does work:
-
-```sysl
-import sysl.threads.*
-
-struct Tally
-    n: int
-
-add(t: *Tally)
-    t.n = t.n + 1
-
-count() -> int
-    var t = Tally(0)
-
-    spawn(&add, &t).unwrap().join()
-    t.n
-
-print(count())
-```
-
-```error
-'spawn' keeps its parameter 'arg' (it reaches another concurrency domain), and '&t' is the address of a local of 'count' — a thread that borrows the frame of 'count' is started on 'sysl.threads.scope', which joins it before the scope returns; anything else is handed storage that lasts
-```
-
-**[`scope`](/library/threads/#scoped-threads) joins every thread started on it before it returns**,
-whichever way its body leaves — by running off its end or by an early `return` — and its `spawn` is
-[`@scoped(f)`](/reference/attributes/#scoped-f-a-member-that-finishes-what-it-starts-before-its-scope-closes),
-so a closure started there may hold a view of the caller's array or the address of its local. As in
-Rust's `std::thread::scope`, the borrow is safe because no thread outlives the call:
-
-```sysl
-import sysl.threads.scope
-
-halves() -> int
-    var v = [0; 8]
-    val all = v[..]
-    val half = all.len / 2
-
-    scope((s) ->
-        s.spawn(() -> for i in 0..<half do all[i] = 1)
-        s.spawn(() -> for i in half..<all.len do all[i] = 2))
-
-    var sum = 0
-
-    for x in v do sum += x
-
-    sum
-
-print(halves())
-```
-
-```output
-12
-```
-
-**What a scoped thread borrows has to outlive the `scope` call, not only the body.** The body is a
-frame of its own and returns before the scope joins, so its own locals — and a nested block's, and its
-temporaries — are refused, as Rust tells a scope's `'env` from its `'scope`. What a scope member is
-handed is held by the scope its `*self` points at, so a helper handed `s` is refused the same way for
-its locals, and so is a wrapper that forwards to `spawn`:
-
-```sysl
-import sysl.threads.scope
-
-halves() -> int
-    scope((s) ->
-        var v = [0; 8]
-        val all = v[..]
-
-        s.spawn(() -> all[0] = 1)
-        v[0])
-
-print(halves())
-```
-
-```error
-'() -> all[0] = 1' holds a view of 'v', a local of 'call' — a thread started on a scope may borrow only storage that outlives the 'scope' call, and 'v' does not; declare 'v' before 'scope'
-```
-
-Declaring `v` before `scope`, as `halves` above does, is the cure. A scope nested in the body may
-borrow the outer body's locals, since the outer body outlives the inner `scope` call.
-
-**A fan-out needs no joining loop.** Handles may be kept in an array or a `Buf`, joined in any order,
-joined only in part or not at all: whatever the body leaves unjoined, the scope joins. A handle's
-`join` answers what its closure answered, and `scope` answers what its body answered:
-
-```sysl
-import sysl.threads.*
-import sysl.sync.Atomic
-
-struct Tally
-    n: Atomic[int]
-
-count(workers: int) -> int
-    var t = Tally(Atomic(0))
-    val p = &t
-
-    scope((s) ->
-        for _ in 0..<workers
-            s.spawn(() -> p.n.add(1))
-
-        if workers > 2 then return)
-
-    t.n.load()
-
-sum_halves(v: []const int) -> int
-    scope((s) ->
-        val a = s.spawn(() -> v[0] + v[1])
-        val b = s.spawn(() -> v[2] + v[3])
-
-        a.join() * 10 + b.join())
-
-val xs = [1, 2, 3, 4]
-
-print(count(4))
-print(sum_halves(xs[..]))
-```
-
-```output
-4
-37
-```
-
-A function handed the `*Scope` may start threads on it with its own caller's storage, and those are
-joined by the same `scope` call; one that opens a scope of its own keeps nothing it is handed. A scope
-may be opened inside a scoped thread, and its threads may borrow that thread's locals. A program with
-no heap opens [`scope_in`](/library/threads/#scoped-threads) instead, whose thread
-records are slots the caller lays out, and starts its threads with `start(&body, arg)`, which may be
-handed the address of a local on the same terms.
-
-**A wrapper keeps what it hands `spawn`, and is told the same way.** A function that passes its
-parameter on to a crossing one keeps it as that callee does, so a frame address handed to the wrapper
-— one of `sysl.posix.threads`' forwarders, or a function of the program's own — is refused at the
-wrapper's call, and the refusal still names the scope:
-
-```sysl
-import sysl.threads.{spawn, Thread}
-
-struct Tally
-    n: int
-
-add(t: *Tally)
-    t.n = t.n + 1
-
-start(t: *Tally) -> Option[Thread] = spawn(&add, t)
-
-count() -> int
-    var t = Tally(0)
-
-    start(&t).unwrap().join()
-    t.n
-
-print(count())
-```
-
-```error
-'start' keeps its parameter 't' (it is passed to 'spawn', where it reaches another concurrency domain), and '&t' is the address of a local of 'count' — a thread that borrows the frame of 'count' is started on 'sysl.threads.scope'
-```
-
-**A plain `spawn` is for storage that lasts**: a box shared as `&sync` (`&*b`) or module storage,
-which no frame owns, so the thread may outlive the call that started it and never be joined at all.
-The program's own statements are exempt, as they are from every rule here: their frame outlives every
-thread.
+## Edge cases
+
+What a compiler maintainer needs and a program rarely meets:
+
+- **Deep or cyclic address chains.** An address held inside what is handed over is told apart step by
+  step however deep a chain of distinct types goes; where the caller's storage holds a cycle, or the
+  pointer's type reaches itself past eight steps, the callee is asked what it lets out of anything it
+  reads through the pointer, and is refused if it lets out anything read there.
+- **What a callee with no body can run, for the one rule.** A callee's reach is its body, every body it
+  calls, and every destructor. A call through a pointer or a trait object anywhere in that could run
+  anything, so every cast and all module storage count. A foreign function may call back into whatever
+  C can enter — an `@export`, a `@section` function, one whose address is taken, one with a foreign
+  convention — so it reaches those and all module storage. The standard library's own `extern`s are
+  the exception, since they never call back: a `ptr_cast` elsewhere is no reason to refuse
+  `read_bytes`. A library function already compiled is judged by what its arguments, the module
+  storage it can name, and the casts it can run can reach.
+- **The one rule is otherwise local.** It sees the `&`, the path after it, and the calls and
+  assignments on that path in one body. A second name for a buffer made with `val b2 = b` is a
+  `@relocates` call on the same buffer, refused with that message; a callee through a trait object or
+  function pointer and an aggregate handed to a call are not followed for a pointer.
+- **The `__sysl_arc_reaper` slot on two cores** needs `__atomic_*` the board defines, which on a
+  two-core part takes a hardware spinlock.
+- **A view or a `Buf` of guarded records** is asked about its own count, not the records', so one
+  reached through a `*T` or held as constant data crosses, and one shared through an ordinary count
+  does not.
+- **A generic instance whose own signature was refused at its call** says nothing more about its body:
+  everything inside follows from that one complaint.
 
 ## Hazard summary
 
@@ -6568,32 +3035,26 @@ thread.
 |---|---|
 | use-after-free / double-free | ARC on `&T`; `weak` degrades to `Option` and never dangles |
 | null dereference | non-null references; nullable is `Option` |
-| out-of-bounds | length-carrying arrays and slices, checked everywhere |
-| slice outliving its buffer | the slice's `owner` word retains it; escaping locals are promoted |
-| refcount race across threads | `&sync T` is atomic; a `&T` may not cross a domain, checked at a `@crossing` parameter |
-| dangling or wild pointer | impossible without `*T` |
+| out-of-bounds | length-carrying arrays and views, checked everywhere |
+| a view or address outliving its storage | block lifetimes; the view's `owner` word; escaping frame arrays are promoted |
+| refcount race across threads | `&sync T` is atomic; a `&T` may not cross a domain |
+| dangling or wild pointer | impossible without `*T` and `ptr_cast` |
 
-Only `*T` opts out, and it opts out visibly.
-
-One hazard is **not** on that list: racing on the *fields* of an object two threads deliberately
-share. Preventing that needs proof of exclusive access, which is the thing this language trades away,
-so it is answered by a `Mutex` and by convention rather than by the type checker. It takes `&sync` or
-`*T` to reach the situation at all, so it is at least as greppable as everything else here.
+One hazard is **not** on that list: racing on the *fields* of an object two threads deliberately share.
+Preventing it needs proof of exclusive access, which this language trades away, so it is a `Mutex`'s
+job. It takes `&sync` or `*T` to reach, so it is as greppable as the rest.
 
 ## The two worlds, one language
 
-- **Application, server, utility:** `T` and `&T`, plus `weak`, slices, and arrays. Safe, pleasant,
-  ARC-managed.
-- **Kernel, driver, allocator-free:** `T`, `*T`, fixed arrays, slices, and manual `malloc`/`free`. A
-  module that never *creates* a `&T` emits no allocation and no allocator dependency, exactly like C,
-  and stays bounds-checked wherever it uses arrays and slices.
+- **Application, server, utility:** `T` and `&T`, plus `weak`, views and arrays. Safe and ARC-managed.
+- **Kernel, driver, allocator-free:** `T`, `*T`, fixed arrays, views and manual `malloc`/`free`. A
+  module that never *creates* a `&T` emits no allocation and no allocator dependency, and stays
+  bounds-checked wherever it uses arrays and views.
 
-The boundary is not a convention — it is compiler-enforced through the allocator capability. **What it
-gates is allocation, not ownership.** Allocator-free code may hold, pass, copy, and drop a `&T` or a
-heap-backed slice that something else created: retain and release are a few instructions, and the free
-path goes through the object's own deallocation hook. What it may not do is *make* one. That is what
-lets a driver keep the `&Device` its bus manager handed it, and a `no alloc` parser read a heap-backed
-slice it was given — neither of which is expressible if ownership stops at the boundary.
+The boundary is compiler-enforced through the allocator capability, and **it gates allocation, not
+ownership**: allocator-free code may hold, pass, copy and drop a `&T` or a heap-backed view something
+else made — retain and release are a few instructions, and the free path is the object's own hook. That
+is what lets a driver keep the `&Device` its bus manager handed it.
 
 ---
 
