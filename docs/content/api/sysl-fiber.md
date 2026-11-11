@@ -106,7 +106,7 @@ around, not a copy taken before the switch.
 | Member | Signature | Description |
 |---|---|---|
 | `new` | `new() -> Context` | A context for the running stack, which holds nothing until `switch` leaves through it. |
-| `start` | `start[T](stack: &Stack, entry: *extern(*T) -> unit, arg: *T) -> Context` | A context that begins at `entry(arg)` on `stack` the first time something switches to it. |
+| `start` | `start[T](stack: &Stack, entry: *extern(@lets_out *T) -> unit, arg: *T) -> Context` | A context that begins at `entry(arg)` on `stack` the first time something switches to it. |
 | `is_ready` | `is_ready(self) -> bool` | Whether a context has somewhere to go: `false` for a `new()` that has not been left yet. |
 
 ### `Stack`
