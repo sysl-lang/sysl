@@ -1,0 +1,223 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `sysl.threads.spawn` and `spawn_on` take a body whose parameter is `@lets_out`
+// (`*extern(@lets_out *T) -> unit`): a thread runs past the call that started it, and `arg` is
+// already kept (`@crossing(arg)`), so a body may let out what it reads through it -- a pool's worker
+// handing its own state to a search -- while it is still refused where it keeps the address itself.
+// An unmarked body stands where the marked type is asked for (`reference/types.md § @lets_out`), so
+// every existing `spawn(&work, &state)` is unchanged. `SlotScope.start` is deliberately NOT marked:
+// its `arg` is lent for the scope, not kept, so a body that lets reads out is still refused there.
+//
+// The matrix crosses the entry point (`spawn`, `spawn_on`, their `sysl.posix.threads` forwarders, a generic `@crossing` wrapper forwarding
+// to `spawn`, `scope_in`'s `start`) with what the body does (lets reads out, plain, keeps the
+// parameter), how the body is handed (`&f` directly, a function-pointer value of the marked, the
+// unmarked and the `@keeps` type) and what `arg` is (module storage, a local's address).
+//
+// Skipped cells, and why: a closure body (spawn takes a `*extern`, never a callable); a bare target
+// (`spawn` reads the same signature there; the difference is the storage, not the check).
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private slo_outcome(text: string) -> (string, int)
+    val root = make_temp_dir("sysl-slo").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", slo_prelude + text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end slo_outcome
+
+private slo_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = slo_outcome(text)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+
+private slo_refused(text: string, part: string)
+    if xvr_no_library() then return
+
+    val out = slo_outcome(text)
+
+    assert_eq(out.1, -1, out.0)
+    assert(out.0.index_of(part).is_some(), out.0)
+
+private const slo_prelude: string = raw"""
+    import sysl.threads.*
+
+    struct Node
+        v: int
+
+    struct W
+        node: *Node
+
+    var a = Node(7)
+    var w = W(&a)
+    var last: *Node = null
+    var held: *W = null
+    var room: [131072]u8 = [0; 131072]
+
+    stash(x: *W)
+        last = x.node
+
+    body(x: *W)
+        stash(x)
+
+    plain(x: *W)
+        x.node.v += 1
+
+    keeper(x: *W)
+        held = x
+
+    """
+
+// -- accepted ------------------------------------------------------------------------------------
+
+@test("spawn starts a body that lets out what it reads through its argument")
+slo_spawn_lets_out()
+    slo_prints(raw"""
+        main()
+            spawn(&body, &w).unwrap().join()
+            print(last.v)
+        """, "7\n")
+
+@test("spawn_on starts a body that lets out what it reads through its argument")
+slo_spawn_on_lets_out()
+    slo_prints(raw"""
+        main()
+            spawn_on(room[..], &body, &w).unwrap().join()
+            print(last.v)
+        """, "7\n")
+
+@test("a function pointer of the marked type is handed to spawn, as a pool's worker is")
+slo_marked_pointer_value()
+    slo_prints(raw"""
+        main()
+            val f: *extern(@lets_out *W) -> unit = &body
+            spawn(f, &w).unwrap().join()
+            print(last.v)
+        """, "7\n")
+
+@test("an unmarked body still stands where spawn asks for the marked type")
+slo_plain_body()
+    slo_prints(raw"""
+        main()
+            spawn(&plain, &w).unwrap().join()
+            print(a.v)
+        """, "8\n")
+
+@test("a function pointer of the unmarked type still stands where spawn asks for the marked one")
+slo_unmarked_pointer_value()
+    slo_prints(raw"""
+        main()
+            val f: *extern(*W) -> unit = &plain
+            spawn(f, &w).unwrap().join()
+            print(a.v)
+        """, "8\n")
+
+@test("a generic crossing wrapper forwards a marked body to spawn")
+slo_generic_wrapper_marked()
+    slo_prints(raw"""
+        @crossing(x)
+        start[T](f: *extern(@lets_out *T) -> unit, x: *T) -> Option[Thread] = spawn(f, x)
+
+        main()
+            start(&body, &w).unwrap().join()
+            print(last.v)
+        """, "7\n")
+
+@test("a generic crossing wrapper taking the unmarked type forwards it to spawn")
+slo_generic_wrapper_unmarked()
+    slo_prints(raw"""
+        @crossing(x)
+        start[T](f: *extern(*T) -> unit, x: *T) -> Option[Thread] = spawn(f, x)
+
+        main()
+            start(&plain, &w).unwrap().join()
+            print(a.v)
+        """, "8\n")
+
+@test("sysl.posix.threads forwards the same marked body to spawn and spawn_on")
+slo_posix_forwarders()
+    slo_prints(raw"""
+        import sysl.posix.threads as pt
+
+        main()
+            pt.spawn(&body, &w).unwrap().join()
+            pt.spawn_on(room[..], &plain, &w).unwrap().join()
+            print(last.v)
+        """, "8\n")
+
+// -- refused -------------------------------------------------------------------------------------
+
+@test("a body that keeps its argument itself is still refused at spawn")
+slo_keeper_refused()
+    slo_refused(raw"""
+        main()
+            spawn(&keeper, &w).unwrap().join()
+            print(held == &w)
+        """, "'keeper' keeps its parameter 'x' (it is stored in 'held')")
+
+@test("a body that keeps its argument itself is still refused at spawn_on")
+slo_keeper_spawn_on_refused()
+    slo_refused(raw"""
+        main()
+            spawn_on(room[..], &keeper, &w).unwrap().join()
+            print(held == &w)
+        """, "'keeper' keeps its parameter 'x' (it is stored in 'held')")
+
+@test("a function pointer marked @keeps does not stand where spawn asks for @lets_out")
+slo_keeps_pointer_refused()
+    slo_refused(raw"""
+        main()
+            val f: *extern(@keeps *W) -> unit = &keeper
+            spawn(f, &w).unwrap().join()
+            print(held == &w)
+        """, "a '*extern(@lets_out *W) -> unit' lets out only what it reads through it, never the parameter itself")
+
+@test("spawn of a local's address is still refused with a body that lets out what it reads")
+slo_local_refused()
+    slo_refused(raw"""
+        main()
+            var mine = W(&a)
+            spawn(&body, &mine).unwrap().join()
+            print(last.v)
+        """, "'spawn' keeps its parameter 'arg' (it reaches another concurrency domain), and '&mine' is the address of a local of 'main'")
+
+@test("spawn_on of a local's address is still refused with a body that lets out what it reads")
+slo_local_spawn_on_refused()
+    slo_refused(raw"""
+        main()
+            var mine = W(&a)
+            spawn_on(room[..], &body, &mine).unwrap().join()
+            print(last.v)
+        """, "'spawn_on' keeps its parameter 'arg' (it reaches another concurrency domain), and '&mine' is the address of a local of 'main'")
+
+@test("scope_in's start lends its argument, so a body that lets out what it reads is still refused there")
+slo_scope_in_start_refused()
+    slo_refused(raw"""
+        main()
+            var mine = W(&a)
+            var slots: [1]ScopeSlot = [ScopeSlot.new(); 1]
+            scope_in(slots[..], (s) -> s.start(&body, &mine))
+            print(last.v)
+        """, "'body' lets what it reads through its parameter 'x' outlive the call")

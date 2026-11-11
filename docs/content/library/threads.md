@@ -86,9 +86,12 @@ print(job.input, job.output)
 12 144
 ```
 
-`&square` is the address of a named function, and the parameter's type is `*extern(*T) -> unit` —
-C's own shape, because what is underneath is a system's thread start: `pthread_create` on a hosted
-target, a kernel's `clone` on a bare one. **A closure will not do**, and the refusal is
+`&square` is the address of a named function, and the parameter's type is
+`*extern(@lets_out *T) -> unit` — C's own shape, because what is underneath is a system's thread
+start: `pthread_create` on a hosted target, a kernel's `clone` on a bare one. The
+[`@lets_out`](/reference/types/#what-the-callable-reads-may-outlive-the-call-lets-out) says the body
+may hand on what it reads through its argument, as a thread that runs past its start may well do; a
+body that does not, like `square`, stands there all the same. **A closure will not do**, and the refusal is
 worth seeing in both of the ways a reader will hit it. Written bare, the argument has nothing to
 infer its parameter type from, because `T` is what is being inferred:
 
@@ -119,7 +122,7 @@ print(c.is_some())
 ```
 
 ```error
-'body' of 'sysl.threads.spawn' is *extern(*Atomic[int]) -> unit, but a closure was given
+'body' of 'sysl.threads.spawn' is *extern(@lets_out *Atomic[int]) -> unit, but a closure was given
 ```
 
 Two reasons, and neither is a limitation waiting to be lifted. A closure would have to be **boxed**

@@ -131,7 +131,7 @@ scope_in(slots[..], (s) ->
 ### `spawn`
 
 ```sysl
-spawn[T](body: *extern(*T) -> unit, arg: *T, stack: usize = DEFAULT_STACK) -> Option[Thread]
+spawn[T](body: *extern(@lets_out *T) -> unit, arg: *T, stack: usize = DEFAULT_STACK) -> Option[Thread]
 ```
 
 Starts `body` on a new thread, with `arg` as the address it is handed.
@@ -164,10 +164,16 @@ nothing the caller writes later takes it back. The address of a caller's local i
 thread that borrows the caller's frame is started on `scope`, which joins it before the scope
 returns (`reference/memory.md § A thread borrows a frame only inside a scope`).
 
+**The body's parameter is `@lets_out`**, because a thread runs past the call that started it: the
+body may hand what it reads through `arg` to anything -- a worker's own deque, a queue every thread
+shares -- and that is no more than `arg` already promises by being kept. It still may not keep the
+address itself. An unmarked body stands where a `@lets_out` one is asked for, so `&work` of a plain
+`work(s: *State)` is the whole of the call either way (`reference/types.md § @lets_out`).
+
 ### `spawn_on`
 
 ```sysl
-spawn_on[T](stack: []u8, body: *extern(*T) -> unit, arg: *T) -> Option[Thread]
+spawn_on[T](stack: []u8, body: *extern(@lets_out *T) -> unit, arg: *T) -> Option[Thread]
 ```
 
 Starts `body` on a new thread whose storage is `stack`, which the program owns.

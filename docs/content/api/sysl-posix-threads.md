@@ -40,7 +40,7 @@ current() -> Thread
 ### `spawn`
 
 ```sysl
-spawn[T](body: *extern(*T) -> unit, arg: *T) -> Option[Thread]
+spawn[T](body: *extern(@lets_out *T) -> unit, arg: *T) -> Option[Thread]
 ```
 
 `sysl.threads.spawn`, with the stack it gives a thread where nothing else is asked for. `arg`
@@ -49,7 +49,7 @@ crosses because the body hands it to `spawn`'s, which the compiler sees.
 ### `spawn_on`
 
 ```sysl
-spawn_on[T](stack: []u8, body: *extern(*T) -> unit, arg: *T) -> Option[Thread]
+spawn_on[T](stack: []u8, body: *extern(@lets_out *T) -> unit, arg: *T) -> Option[Thread]
 ```
 
 `sysl.threads.spawn_on`.
