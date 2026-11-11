@@ -1665,6 +1665,30 @@ private trait_declares(cx: &KeepsCx, f: TFunc, i: usize, keeping: bool) -> bool
     false
 end trait_declares
 
+// The name the trait's declaration gives the parameter an implementation has at `i` -- which is the
+// name a mark on that declaration must write, whatever the implementation calls it.
+private trait_param_name(cx: &KeepsCx, f: TFunc, i: usize) -> Option[string]
+    if i == 0 || i >= f.params.len() then return None
+
+    val tr = trait_of(cx, f.name)
+
+    if tr.is_none() then return None
+
+    trait_decl_at(cx.an, tr.unwrap()) match
+        Some(d) ->
+            val mname = shown_name(cx.an, f.name)
+
+            for m in d.methods
+                if m.name != mname || m.recv_mode().is_none() then continue
+                if i - 1 >= m.params.len() then return None
+
+                return Some(m.params[i - 1].name)
+            end for
+        None -> ()
+
+    None
+end trait_param_name
+
 // The trait a function implements a method of, whether it is that method's own lowering or an
 // instance of a generic one.
 private trait_of(cx: &KeepsCx, name: string) -> Option[string]
@@ -2952,8 +2976,15 @@ end stored
 private place_said(scope: Scope, place: TExpr) -> string = *place.kind match
     // A nested function reaches its enclosing function's local through the address its environment
     // holds, and the reader wrote the local's name.
-    TDeref(x, _) -> capture_name(x).unwrap_or(s"*${place_path(scope, x)}")
+    TDeref(x, _) ->
+        if is_subscript_call(scope, x) then place_path(scope, x)
+        else capture_name(x).unwrap_or(s"*${place_path(scope, x)}")
     _ -> place_path(scope, place)
+
+// `b[i]` on a type someone wrote, read as the `*b.index_place(i)` it means.
+private is_subscript_call(scope: Scope, x: TExpr) -> bool = *x.kind match
+    TCall(_, args, _, _) -> args.len() > 0 && source_text(scope, x.span).starts_with("[")
+    _ -> false
 
 private capture_name(x: TExpr) -> Option[string] = *x.kind match
     TField(r, index, _) ->
@@ -2983,7 +3014,17 @@ private place_path(scope: Scope, place: TExpr) -> string = *place.kind match
             else source_text(scope, whole_place(place))
         _ -> source_text(scope, whole_place(place))
     TIndex(r, _, _) -> s"${place_path(scope, r)}[…]"
+    // A subscript on a type someone wrote is a call to its `index_place`, spanning the bracket alone;
+    // the reader wrote the receiver and the bracket.
+    TCall(_, args, _, _) ->
+        if is_subscript_call(scope, place) then s"${receiver_path(scope, args[0])}[…]"
+        else source_text(scope, place.span)
     _ -> source_text(scope, place.span)
+
+// The receiver of a subscript's call, which is handed over by address when the method takes `*self`.
+private receiver_path(scope: Scope, recv: TExpr) -> string = *recv.kind match
+    TAddrOf(p, _) -> place_path(scope, p)
+    _ -> place_path(scope, recv)
 
 // The last part of a dotted name.
 private bare_name(written: string) -> string = written.last_index_of(".") match
@@ -6232,7 +6273,7 @@ end refuse_promised
 private keeps_hint(cx: &KeepsCx, f: TFunc, i: usize, trait_name: Option[string]) -> string
     if trait_name.is_none() then return ""
 
-    val pname = if i == 0 then "self" else f.params[i].0
+    val pname = if i == 0 then "self" else trait_param_name(cx, f, i).unwrap_or(f.params[i].0)
 
     s", or let every implementation keep it by writing '@keeps($pname)' above the declaration " +
         s"of '${shown_name(cx.an, f.name)}' in '${qualified_name(trait_name.unwrap())}'"

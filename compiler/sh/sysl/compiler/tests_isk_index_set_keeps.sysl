@@ -1,0 +1,331 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **`IndexSet.index_set` keeps what it is handed**: storing `v` is the method's whole job, so the
+// trait's declaration says `@keeps(v)`, and a container whose element type carries an address -- a
+// `Buf[*Node]` behind a type someone wrote -- may implement it. The caller is held to the mark
+// instead: an address of a frame's local is refused at the subscript, as it is at a `Buf`'s `push`,
+// and a module variable's is accepted. The cells cross the path the store takes (a type's own
+// implementation, a type parameter bounded by `IndexSet` at every standard container, a trait
+// object) with what is stored (a module variable's address, a local's, a value with no address), and
+// keep `IndexPlace`, which writes a place rather than calling, as it was.
+//
+// A type parameter bounded by `IndexSet` alone is written with a subscript, as a concrete container
+// is: the store is decided by the parameter's bounds, so the body read once with the parameter
+// opaque and each instantiation of it read the store the same way.
+
+private isk_outcome(text: string) -> (string, bool)
+    val root = make_temp_dir("sysl-isk").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", "import sysl.buf.{Buf, buf}\n\nstruct Node\n    n: long\n\n" +
+               "var one = Node(1)\nvar two = Node(2)\n\n" + text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), false)
+        Ok(_) -> ()
+
+    val said = capture("/bin/sh", ["-c", s"'$exe' < /dev/null"], "", [], true, 60000)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", false)
+        Ok(out) ->
+            if out.status.ok() then (out.text, true) else (out.text + out.err.unwrap_or(""), false)
+end isk_outcome
+
+private isk_can_run() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end isk_can_run
+
+private isk_prints(text: string, want: string)
+    val out = isk_outcome(text)
+
+    assert(out.1, s"it did not exit zero: ${out.0}")
+    assert(out.0 == want, out.0)
+
+private isk_refused(text: string, part: string)
+    val out = isk_outcome(text)
+
+    assert(!out.1, s"it built and ran: ${out.0}")
+    assert(out.0.contains(part), out.0)
+
+// A container over a `Buf` of addresses, read from an offset; its `index_set` takes `self`, since the
+// value is a handle and a copy of it writes the one buffer.
+private isk_bag() -> string = raw"""
+    struct Bag
+        cells: Buf[*Node]
+        head: usize
+    impl Index[usize, *Node] for Bag
+        index(self, i: usize) -> *Node = self.cells[self.head + i]
+    impl IndexSet[usize, *Node] for Bag
+        index_set(self, i: usize, x: *Node)
+            self.cells[self.head + i] = x
+    """
+
+// -- a type's own implementation --------------------------------------------------------------------
+
+@test("a type's index_set stores an address it is handed, and a module variable's is accepted")
+isk_own_impl_keeps_a_module_address()
+    if !isk_can_run() then return
+
+    isk_prints(isk_bag() + raw"""
+        main()
+            var cells: Buf[*Node] = buf()
+            cells.push(&one)
+            cells.push(&one)
+            val b = Bag(cells, 1)
+            b[0] = &two
+            print(s"${b[0].n} ${cells[0].n}")
+        """, "2 1\n")
+
+@test("the address of a frame's local is refused at the subscript, naming the place it is stored in")
+isk_own_impl_refuses_a_local_address()
+    if !isk_can_run() then return
+
+    isk_refused(isk_bag() + raw"""
+        main()
+            var cells: Buf[*Node] = buf()
+            cells.push(&one)
+            val b = Bag(cells, 0)
+            var local = Node(9)
+            b[0] = &local
+            print(b[0].n)
+        """, "'index_set' keeps its parameter 'x' (it is stored in 'self.cells[…]'), and '&local' is the " +
+        "address of a local of 'main'")
+
+@test("an element with no address is stored as before")
+isk_element_with_no_address()
+    if !isk_can_run() then return
+
+    isk_prints(raw"""
+        struct Row
+            cells: Buf[int]
+        impl IndexSet[usize, int] for Row
+            index_set(*self, i: usize, v: int)
+                self.cells[i] = v
+        struct Names
+            names: Buf[string]
+        impl IndexSet[string, string] for Names
+            index_set(*self, k: string, v: string)
+                self.names.push(k + "=" + v)
+        main()
+            var r = Row(buf())
+            r.cells.push(0)
+            var local = 7
+            r[0] = local
+            var n = Names(buf())
+            n["x"] = "y"
+            print(s"${r.cells[0]} ${n.names[0]}")
+        """, "7 x=y\n")
+
+@test("IndexPlace writes the element in place, and an address stored through it is accepted as before")
+isk_index_place_is_unchanged()
+    if !isk_can_run() then return
+
+    isk_prints(raw"""
+        struct Bag
+            cells: Buf[*Node]
+            head: usize
+        impl IndexPlace[usize, *Node] for Bag
+            index_place(self, i: usize) -> **Node = &self.cells[self.head + i]
+        main()
+            var cells: Buf[*Node] = buf()
+            cells.push(&one)
+            cells.push(&one)
+            val b = Bag(cells, 1)
+            b[0] = &two
+            print(b[0].n)
+        """, "2\n")
+
+// -- through a type parameter -----------------------------------------------------------------------
+
+private isk_put() -> string = raw"""
+    import sysl.container.{Deque, deque}
+    import sysl.container.ring.{ring, inline_ring}
+    var slots: [2]*Node = [&one, &one]
+    put[C: IndexSet[usize, *Node]](c: *C, at: usize, v: *Node)
+        (*c)[at] = v
+    """
+
+@test("a type parameter bounded by IndexSet stores an address into Buf, Deque, Ring and InlineRing")
+isk_generic_at_every_standard_container()
+    if !isk_can_run() then return
+
+    isk_prints(isk_put() + raw"""
+        main()
+            var b: Buf[*Node] = buf()
+            b.push(&one)
+            put(&b, 0, &two)
+            var d: Deque[*Node] = deque()
+            d.push_back(&one)
+            put(&d, 0, &two)
+            var r = ring(slots[..])
+            r.push_back(&one)
+            put(&r, 0, &two)
+            var q = inline_ring[*Node, 2]()
+            q.push_back(&one)
+            put(&q, 0, &two)
+            print(s"${b[0].n} ${d[0].n} ${r[0].n} ${q[0].n}")
+        """, "2 2 2 2\n")
+
+@test("the address of a local handed to a generic store is refused at the generic's call")
+isk_generic_refuses_a_local_address()
+    if !isk_can_run() then return
+
+    isk_refused(isk_put() + raw"""
+        main()
+            var b: Buf[*Node] = buf()
+            var local = Node(9)
+            b.push(&one)
+            put(&b, 0, &local)
+            print(b[0].n)
+        """, "'put' keeps its parameter 'v' (it is passed to 'index_set', which keeps it), and '&local' " +
+        "is the address of a local of 'main'")
+
+@test("a type parameter bounded by IndexSet alone is written with a subscript, by value and through a pointer")
+isk_generic_subscript_store_by_bound()
+    if !isk_can_run() then return
+
+    isk_prints(raw"""
+        write_at[C: IndexSet[usize, int]](c: C, i: usize, v: int)
+            var w = c
+            w[i] = v
+        write_through[C: IndexSet[usize, int]](c: *C, i: usize, v: int)
+            c[i] = v
+        main()
+            var b: Buf[int] = buf()
+            b.push(1)
+            b.push(2)
+            write_at(b, 0, 5)
+            write_through(&b, 1, 6)
+            print(b[0], b[1])
+        """, "5 6\n")
+
+@test("a type parameter bounded by IndexSet and IndexPlace writes the element in place")
+isk_generic_with_index_place_writes_the_place()
+    if !isk_can_run() then return
+
+    isk_prints(raw"""
+        bump[C: IndexSet[usize, int] + IndexPlace[usize, int]](c: *C, i: usize)
+            (*c)[i] += 10
+            (*c)[i] = (*c)[i] + 1
+        main()
+            var b: Buf[int] = buf()
+            b.push(1)
+            bump(&b, 0)
+            print(b[0])
+        """, "12\n")
+
+@test("a type parameter bounded by IndexSet alone still refuses a compound store")
+isk_generic_compound_store_refused()
+    if !isk_can_run() then return
+
+    isk_refused(raw"""
+        bump[C: IndexSet[usize, int]](c: *C, i: usize)
+            (*c)[i] += 1
+        main()
+            var b: Buf[int] = buf()
+            b.push(1)
+            bump(&b, 0)
+        """, "would evaluate the receiver and the index twice")
+
+// -- through a trait object -------------------------------------------------------------------------
+
+private isk_object_bag() -> string = raw"""
+    struct Box
+        cells: Buf[*Node]
+    impl IndexSet[usize, *Node] for Box
+        index_set(*self, i: usize, x: *Node)
+            self.cells[i] = x
+    """
+
+@test("a call through an IndexSet object stores a module variable's address")
+isk_object_keeps_a_module_address()
+    if !isk_can_run() then return
+
+    isk_prints(isk_object_bag() + raw"""
+        main()
+            var cells: Buf[*Node] = buf()
+            cells.push(&one)
+            var box = Box(cells)
+            val r: *IndexSet[usize, *Node] = &box
+            r.index_set(0, &two)
+            print(cells[0].n)
+        """, "2\n")
+
+@test("a call through an IndexSet object refuses a local's address")
+isk_object_refuses_a_local_address()
+    if !isk_can_run() then return
+
+    isk_refused(isk_object_bag() + raw"""
+        main()
+            var cells: Buf[*Node] = buf()
+            cells.push(&one)
+            var box = Box(cells)
+            val r: *IndexSet[usize, *Node] = &box
+            var local = Node(9)
+            r.index_set(0, &local)
+            print(cells[0].n)
+        """, "'&local' is the address of a local of 'main'")
+
+// -- the refusal a trait with no mark still gives ----------------------------------------------------
+
+@test("a trait's method with no mark is told the mark under the trait's own name for the parameter")
+isk_hint_names_the_trait_parameter()
+    if !isk_can_run() then return
+
+    isk_refused(raw"""
+        trait Put
+            put(*self, v: *Node)
+        struct Bag
+            cells: Buf[*Node]
+        impl Put for Bag
+            put(*self, x: *Node)
+                self.cells.push(x)
+        main()
+            var bag = Bag(buf())
+            bag.put(&one)
+        """, "'put' keeps its parameter 'x' (it is passed to 'push', which keeps it), but a method of 'Put' " +
+        "borrows its parameters for the call")
+    isk_refused(raw"""
+        trait Put
+            put(*self, v: *Node)
+        struct Bag
+            cells: Buf[*Node]
+        impl Put for Bag
+            put(*self, x: *Node)
+                self.cells[0] = x
+        main()
+            var bag = Bag(buf())
+            bag.put(&one)
+        """, "it is stored in 'self.cells[…]'")
+    isk_refused(raw"""
+        trait Put
+            put(*self, v: *Node)
+        struct Bag
+            cells: Buf[*Node]
+        impl Put for Bag
+            put(*self, x: *Node)
+                self.cells.push(x)
+        main()
+            var bag = Bag(buf())
+            bag.put(&one)
+        """, "by writing '@keeps(v)' above the declaration of 'put' in 'Put'")
+end isk_hint_names_the_trait_parameter
