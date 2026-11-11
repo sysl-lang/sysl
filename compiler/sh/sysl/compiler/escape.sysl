@@ -327,6 +327,7 @@ check_escapes(a: &Analysis, p: TProgram) -> Promotions
     val entry = entry_home(a)
 
     report_body(a, p, entry, None, false, mw)
+    refuse_module_sync_roots(a, p)
     note_promotions(&out.notes, entry, mw)
 
     for temp in mw.temps
@@ -338,6 +339,27 @@ check_escapes(a: &Analysis, p: TProgram) -> Promotions
     out.zero_answers = a.zero_answers
     out
 end check_escapes
+
+// **A module initializer's view of `&sync` storage answers to the rule a body's does**
+// (`check_sync_root`): the view counts nothing of the box, so the binding it reaches the box through
+// must go on holding it for as long as the view lives. A module `var` holding the box may be rebound
+// by any body while a view taken in another initializer is still held, so only a module `val` is a
+// root such a view may be taken through. Each initializer is reported in the file that declares it.
+private refuse_module_sync_roots(a: &Analysis, p: TProgram)
+    var none: Buf[TStmt] = buf()
+    val w = fresh_walk(none)
+
+    for v in p.vals
+        v.init match
+            Some(init) ->
+                w.refusal = None
+                walk_texpr(init, expr_walk(false, x -> check_sync_root(w, x)))
+
+                w.refusal match
+                    Some(r) -> a.fault(val_home(a, v.symbol), r.0, r.1)
+                    None -> ()
+            None -> ()
+end refuse_module_sync_roots
 
 // One line per array a body moved, at the view that moved it. A temporary is not named here: what
 // the report answers is which *declaration* allocates, and a temporary has none to point at.
@@ -406,7 +428,8 @@ end kept_by
 
 // Propagates through the body's own locals to a fixpoint, then looks for the places a confined view
 // could get out.
-private walk_body(p: TProgram, keeps: &KeptParams, stmts: Buf[TStmt], result: Option[TExpr]) -> EscapeWalk
+// A walk of `stmts` that has found nothing yet.
+private fresh_walk(stmts: Buf[TStmt]) -> &EscapeWalk
     var confined: Buf[(string, EView)] = buf()
     var promoted: Buf[string] = buf()
     var temps: Buf[(Span, string)] = buf()
@@ -415,9 +438,13 @@ private walk_body(p: TProgram, keeps: &KeptParams, stmts: Buf[TStmt], result: Op
     var lits: Buf[Span] = buf()
     var framed: Buf[Span] = buf()
 
-    val w: &EscapeWalk = EscapeWalk(confined, promoted, temps, sites, None, local_arrays(stmts),
-                                    ref_bindings(stmts), aligned_arrays(stmts), lits, framed, found.0,
-                                    found.1, buf(), rebound_locals(stmts), stmts, None)
+    EscapeWalk(confined, promoted, temps, sites, None, local_arrays(stmts), ref_bindings(stmts),
+               aligned_arrays(stmts), lits, framed, found.0, found.1, buf(), rebound_locals(stmts), stmts,
+               None)
+end fresh_walk
+
+private walk_body(p: TProgram, keeps: &KeptParams, stmts: Buf[TStmt], result: Option[TExpr]) -> EscapeWalk
+    val w = fresh_walk(stmts)
     val prog = p
     val kp = keeps
     var changed = true

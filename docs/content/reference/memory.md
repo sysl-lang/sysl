@@ -1118,7 +1118,8 @@ count of its own while its parent's count holds the storage
 through a view is the ordinary one, so such a view takes none at all: `sum(f.data[1..<3])` on a
 `&sync Flash` is accepted, and the same view returned, stored past the frame, captured by a kept
 closure or held by the callee is refused. The box must be reached through a binding that keeps
-holding it — not a field of another box, a module `var`, or a local the body stores into
+holding it, in a body and in a module initializer alike — not a field of another box, a module
+`var`, or a local the body stores into
 ([arrays](/reference/arrays/)) — and the view may not be held in a local declared outside that
 binding's block, since the binding, and the box with it, ends there:
 
