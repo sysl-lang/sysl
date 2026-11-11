@@ -165,8 +165,11 @@ private check_ref_calls(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal])
         var confined: Set[string] = set()
 
         for w in mine
-            if w.root != "" && !confined.has(w.root) && confined_local(at, consts, erased, f, w.root, w.types)
-                confined.add(w.root)
+            if w.root == "" || confined.has(w.root) then continue
+
+            val ask: &FreshAsk = FreshAsk(a, at, reach, consts, known, globals, erased, w.types)
+
+            if confined_local(ask, f, w.root) then confined.add(w.root)
 
         walk_block_stmts(f.body, expr_walk(false, e -> ref_call(a, at, reach, known, globals, erased,
                                                                 scope, mine, holders, confined, e)))
@@ -182,6 +185,7 @@ private struct Reach
     all: bool
 
 // Each callee's `Reach`, worked out from the bodies' summary the first time a call to it is judged.
+// `answering` holds the same question asked only of the paths that come back (`answer_of`).
 private struct Reacher
     index: Map[string, usize]
     foreign: Set[string]
@@ -189,12 +193,34 @@ private struct Reacher
     entered: Buf[string]
     drops: Buf[string]
     known: Map[string, Reach]
+    answering: Map[string, Reach]
 
     of(*self, a: &Analysis, u: *Untouched, name: string) -> Reach
         self.known.get(name) match
             Some(r) -> return r
             None -> ()
 
+        val out = self.walk(a, u, name, true)
+
+        self.known.put(name, out)
+        out
+    end of
+
+    // What a callee can run on the paths that return to its caller: a path that ends the program
+    // (`unwrap`'s panic, a failed bounds check) never hands back an answer, so what it runs cannot
+    // be what the call answers.
+    answer_of(*self, a: &Analysis, u: *Untouched, name: string) -> Reach
+        self.answering.get(name) match
+            Some(r) -> return r
+            None -> ()
+
+        val out = self.walk(a, u, name, false)
+
+        self.answering.put(name, out)
+        out
+    end answer_of
+
+    walk(*self, a: &Analysis, u: *Untouched, name: string, ending: bool) -> Reach
         var out = Reach(buf(), set(), false, false)
         var seen: Set[string] = set()
         var todo: Buf[string] = buf()
@@ -204,7 +230,7 @@ private struct Reacher
         for item in self.drops
             todo.push(item)
 
-        val called_c = self.gather(a, u, &todo, &seen, &out)
+        val called_c = self.gather(a, u, &todo, &seen, &out, ending)
 
         // C may call back into whatever it can enter, and each of those may reach another foreign
         // function: the second walk's answer adds nothing, since every entry is already on it.
@@ -214,15 +240,16 @@ private struct Reacher
             for item in self.entered
                 todo.push(item)
 
-            val _ = self.gather(a, u, &todo, &seen, &out)
+            val _ = self.gather(a, u, &todo, &seen, &out, ending)
 
-        self.known.put(name, out)
         out
-    end of
+    end walk
 
     // Walks every body reached from `todo` into `out`, and answers whether one of them calls a
-    // foreign function that is not the standard library's.
-    gather(*self, a: &Analysis, u: *Untouched, todo: *Buf[string], seen: *Set[string], out: *Reach) -> bool
+    // foreign function that is not the standard library's. Where `ending` is unset, the calls on
+    // paths that end the program are left out.
+    gather(*self, a: &Analysis, u: *Untouched, todo: *Buf[string], seen: *Set[string], out: *Reach,
+           ending: bool) -> bool
         var called_c = false
 
         while !todo.is_empty() && !out.all
@@ -247,8 +274,9 @@ private struct Reacher
                     for item in u.calls[i]
                         todo.push(item)
 
-                    for item in u.exits[i]
-                        todo.push(item)
+                    if ending
+                        for item in u.exits[i]
+                            todo.push(item)
                 None ->
                     val std = self.trusted.has(name) ||
                               (!self.foreign.has(name) && std_module(func_home(a, name).module_name))
@@ -279,7 +307,7 @@ private reacher(a: &Analysis, p: TProgram, u: *Untouched) -> &Reacher
     for f in p.funcs
         if module_bare(f.name) == "drop" || f.name.ends_with(".drop") then drops.push(f.name)
 
-    Reacher(index, foreign, trusted, c_entered(p), drops, map())
+    Reacher(index, foreign, trusted, c_entered(p), drops, map(), map())
 end reacher
 
 // -- a local no callee can reach --------------------------------------------------------------------
@@ -288,9 +316,9 @@ end reacher
 // call can write it only where the local is written into the call.
 //
 // **The object is one only this local can name** where three things hold. The local is declared
-// once, from a fresh value: a buffer literal or a call to a `const` function, which can reach no
-// module storage and no address and so answers nothing but what it builds from its arguments, none
-// of whose types can reach a value of a type in `types`. Nothing assigns the local again. And every
+// once, from a fresh value (`fresh_in`): a buffer literal, or the answer of a call that can get hold
+// of no value of a type in `types` it was not handed fresh, taken out of a `match`, an `if`, a `?` or
+// a block that moves it along. Nothing assigns the local again. And every
 // other use of it hands it to a call that lets nothing of it out: one that is `const` or writes no
 // value of the type anywhere (`untouched_by`), whose other arguments and whose answer cannot hold a
 // value of the type -- or reads it in place, by subscript or length, for an element that cannot.
@@ -298,13 +326,13 @@ end reacher
 // A closure capturing it, a copy into another name, an assignment, a `ref` or a pointer taken
 // anywhere else is a use of none of those shapes, so the local is not confined and the call is
 // asked about by type, as every other one is.
-private confined_local(u: *Untouched, consts: Set[string], erased: Buf[(string, Type)], f: TFunc,
-                       root: string, types: Buf[Type]) -> bool
+private confined_local(ask: &FreshAsk, f: TFunc, root: string) -> bool
     val tally: &LocalUses = LocalUses(0, 0, 0, true)
 
-    walk_block_stmts(f.body, TWalk(false, e -> tally_use(u, consts, erased, root, types, tally, e),
+    walk_block_stmts(f.body, TWalk(false, e -> tally_use(ask.u, ask.consts, ask.erased, root, ask.types,
+                                                         tally, e),
                                    w -> (),
-                                   s -> tally_decl(consts, erased, root, types, tally, s)))
+                                   s -> tally_decl(ask, root, tally, s)))
 
     tally.decls == 1 && tally.fresh && tally.uses == tally.lent
 end confined_local
@@ -318,22 +346,158 @@ private struct LocalUses
     fresh: bool
 end LocalUses
 
-private tally_decl(consts: Set[string], erased: Buf[(string, Type)], root: string, types: Buf[Type],
-                   tally: &LocalUses, s: TStmt) = s match
+private tally_decl(ask: &FreshAsk, root: string, tally: &LocalUses, s: TStmt) = s match
     TVarDecl(name, _, init, _) ->
         if name == root
             tally.decls += 1
 
-            if !fresh_value(consts, erased, init, types) then tally.fresh = false
+            if !fresh_in(ask, buf(), init) then tally.fresh = false
         end if
     _ -> ()
 
-// A value only the expression that made it holds.
-private fresh_value(consts: Set[string], erased: Buf[(string, Type)], e: TExpr, types: Buf[Type]) -> bool =
-    *e.kind match
-        TCall(name, args, _, _) -> consts.has(name) && none_reach(args, types, erased)
-        TBufLit(elems, _) -> none_reach(elems, types, erased)
+// What `fresh_in` asks a callee with: the program's bodies, what each can reach, and the types whose
+// values the question is about.
+private struct FreshAsk
+    a: &Analysis
+    u: *Untouched
+    reach: &Reacher
+    consts: Set[string]
+    known: Set[string]
+    globals: Buf[(string, Type)]
+    erased: Buf[(string, Type)]
+    types: Buf[Type]
+end FreshAsk
+
+// Whether `e` makes a value of the types `ask` names that only the expression holds: one no name
+// outside it can reach. `names` are the locals and pattern bindings, inside `e`'s own blocks and arms,
+// that hold such a value and are used nowhere but where they hand it on.
+//
+// **A call's answer is fresh where the callee cannot get hold of a value of the types any other way**:
+// it is `const`, or a body that, on the paths that return, reads no module storage able to hold one
+// and makes no cast that could point at one (`unreachable_to`), and every argument that can hold one
+// is itself fresh. Whatever it
+// answers it built, or was handed fresh.
+//
+// **What a `match` arm or an `if let` binds out of a fresh subject is fresh**, and so is the arm's
+// value when it is that binding, or fresh in its own right; an arm that leaves -- `return`, `break`,
+// `continue` -- answers nothing. A `?` hands on what its operand made; a block hands on a binding it
+// declared fresh and uses nowhere else.
+private fresh_in(ask: &FreshAsk, names: Buf[string], e: TExpr) -> bool = *e.kind match
+    TLoad(n, _) -> holds_string(names, n)
+    TCall(name, args, _, _) ->
+        if !fresh_args(ask, names, args) then return false
+        if ask.consts.has(name) then return true
+        if !ask.known.has(name) then return false
+
+        val r = ask.reach.answer_of(ask.a, ask.u, name)
+
+        for t in ask.types
+            if !unreachable_to(ask.u, r, ask.globals, ask.erased, buf(), t, true) then return false
+
+        true
+    TBufLit(elems, _) -> fresh_args(ask, names, elems)
+    TEnumNew(_, _, args) -> fresh_args(ask, names, args)
+    TTry(operand, _, _, _, _, _, _) -> fresh_in(ask, names, operand)
+    TBlockExpr(b) -> fresh_block(ask, names, b)
+    TMatch(subject, arms, _) ->
+        val whole = fresh_in(ask, names, subject)
+
+        for arm in arms
+            var inner = names.copy()
+
+            if whole && arm.guard.is_none()
+                for p in arm.patterns do pattern_names(p, &inner)
+
+            if !fresh_block(ask, inner, arm.body) then return false
+
+        true
+    TIf(cond, then_block, else_block, _) ->
+        if else_block.is_none() then return false
+
+        var inner = names.copy()
+
+        for term in cond
+            term match
+                TCondIs(subject, patterns, negated) ->
+                    if !negated && fresh_in(ask, names, subject)
+                        for p in patterns do pattern_names(p, &inner)
+                TCondTest(c) ->
+                    for n in inner
+                        if loads(c, n) > 0 then return false
+
+        fresh_block(ask, inner, then_block) && fresh_block(ask, names, else_block.unwrap())
+    _ -> false
+end fresh_in
+
+// Whether every one of `args` that can hold a value of the types in question is fresh.
+private fresh_args(ask: &FreshAsk, names: Buf[string], args: Buf[TExpr]) -> bool
+    for item in args
+        if reaches_any(texpr_type(item), ask.types, ask.erased) && !fresh_in(ask, names, item)
+            return false
+
+    true
+end fresh_args
+
+// Whether a block either leaves or comes to a fresh value. Of `names`, only one its statements do
+// not use may be handed on; a local it declares from a fresh value, or straight from such a name, is
+// handed on where nothing else in the block uses it.
+private fresh_block(ask: &FreshAsk, names: Buf[string], b: TBlock) -> bool
+    if leaves(b) then return true
+    if b.result.is_none() then return false
+
+    var allowed: Buf[string] = buf()
+
+    for n in names
+        if stmt_loads(b.stmts, n) == 0 then allowed.push(n)
+
+    for s in b.stmts
+        s match
+            TVarDecl(name, _, init, _) ->
+                val moved = *init.kind match
+                    TLoad(m, _) -> holds_string(names, m) && stmt_loads(b.stmts, m) == 1
+                    _ -> false
+
+                if (moved || fresh_in(ask, allowed, init)) && stmt_loads(b.stmts, name) == 0
+                    allowed.push(name)
+                end if
+            _ -> ()
+
+    fresh_in(ask, allowed, b.result.unwrap())
+end fresh_block
+
+// Whether a block never comes to a value: its type is `Never`, or its last statement leaves.
+private leaves(b: TBlock) -> bool
+    if b.ty == Never then return true
+    if b.result.is_some() then return texpr_type(b.result.unwrap()) == Never
+    if b.stmts.is_empty() then return false
+
+    b.stmts[b.stmts.len() - 1] match
+        TReturn(_) -> true
+        TBecome(_) -> true
+        TBreak(_, _) -> true
+        TContinue(_) -> true
         _ -> false
+end leaves
+
+private loads(e: TExpr, n: string) -> int
+    val hit: &LocalUses = LocalUses(0, 0, 0, false)
+
+    walk_texpr(e, expr_walk(false, x -> *x.kind match
+        TLoad(name, _) -> if name == n then hit.uses += 1
+        _ -> ()))
+
+    hit.uses
+end loads
+
+private stmt_loads(stmts: Buf[TStmt], n: string) -> int
+    val hit: &LocalUses = LocalUses(0, 0, 0, false)
+
+    walk_stmts(stmts, expr_walk(false, x -> *x.kind match
+        TLoad(name, _) -> if name == n then hit.uses += 1
+        _ -> ()))
+
+    hit.uses
+end stmt_loads
 
 // Whether no value of these expressions' types can hold a value of a type in `types`, by value or
 // behind anything.
