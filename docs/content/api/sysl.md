@@ -1384,7 +1384,7 @@ trait IndexSet[I, E]
 
 | Member | Signature | Description |
 |---|---|---|
-| `index_set` | `index_set(*self, i: I, v: E)` |  |
+| `index_set` | `index_set(*self, i: I, v: E)` | Storing `v` is the method's whole job, so every implementation may keep it: an element that carries an address -- a `Buf[*Node]`'s -- is stored as a `Buf`'s own `push` stores it, and the caller is held to handing over only what may outlive the call. |
 
 ### `Integer`
 
