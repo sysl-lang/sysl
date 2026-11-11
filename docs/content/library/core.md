@@ -1465,11 +1465,73 @@ trait Index[I, E]
     index(self, i: I) -> E
 
 trait IndexSet[I, E]
+    @keeps(v)
     index_set(*self, i: I, v: E)
 ```
 
 Reading and writing are **separate traits** because a type may offer one without the other — a view
 that computes its elements has an `Index` and no `IndexSet` to give.
+
+**`index_set` keeps what it is handed**, since storing `v` is its whole job: the declaration says
+`@keeps(v)` ([attributes](/reference/attributes/#keeps-and-answers-on-a-trait-method)), so a container
+whose elements carry an address — a `Buf[*Node]` behind a type you wrote — may implement it, and
+`b[i] = &x` is held to what a `Buf`'s `push` is held to: the address of a module variable is
+accepted, and the address of a local is refused at the subscript.
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+struct Node
+    n: int
+
+var one = Node(1)
+var two = Node(2)
+
+struct Bag
+    cells: Buf[*Node]
+
+impl IndexSet[usize, *Node] for Bag
+    index_set(*self, i: usize, v: *Node)
+        self.cells[i] = v
+
+main()
+    var bag = Bag(buf())
+
+    bag.cells.push(&one)
+    bag[0] = &two
+    print(bag.cells[0].n)
+```
+
+```output
+2
+```
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+struct Node
+    n: int
+
+var one = Node(1)
+
+struct Bag
+    cells: Buf[*Node]
+
+impl IndexSet[usize, *Node] for Bag
+    index_set(*self, i: usize, v: *Node)
+        self.cells[i] = v
+
+main()
+    var bag = Bag(buf())
+    var local = Node(9)
+
+    bag.cells.push(&one)
+    bag[0] = &local
+```
+
+```error
+'&local' is the address of a local of 'main'
+```
 
 ```sysl
 struct Grid

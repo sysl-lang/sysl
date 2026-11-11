@@ -432,6 +432,13 @@ indexes_written(cx: &Analyzer, trait_name: string, receiver: Expr) -> bool
 
     if texpr_type(t) == Unknown then return false
 
+    // **A receiver a type parameter stands for is decided by the parameter's bounds**, for the reason
+    // `pointee_indexes` gives: the body was read once with the parameter opaque, and every
+    // instantiation must read the store the same way.
+    val decided = if trait_name == "IndexSet" then parameter_writes(cx, receiver_type(texpr_type(t))) else None
+
+    if decided.is_some() then return decided.unwrap()
+
     // A type indexed in place is written through the place, never through the trait's call -- and a
     // pointer to one is indexed as the thing it points at, so a write through `*Buf` is the same
     // write into the place that `(*p)[i] = v` is.
@@ -442,6 +449,37 @@ indexes_written(cx: &Analyzer, trait_name: string, receiver: Expr) -> bool
 
     indexes_through(cx.an, key.unwrap(), receiver_type(texpr_type(t)))
 end indexes_written
+
+// Whether a receiver that is a type parameter is written through `IndexSet`'s call: its bounds promise
+// `index_set` and no `index_place`, which would make the element a place. None where the receiver is
+// not a type parameter.
+private parameter_writes(cx: &Analyzer, receiver: Type) -> Option[bool]
+    val t = repr(receiver)
+
+    t match
+        Abstract(_, _) -> ()
+        _ ->
+            for b in cx.subst
+                if b.name != "Self" && repr(b.ty) == t then return Some(bounds_write(cx, b.name))
+
+    t match
+        Abstract(name, _) -> Some(bounds_write(cx, name))
+        _ -> None
+end parameter_writes
+
+private bounds_write(cx: &Analyzer, tparam: string) -> bool
+    var bounds: Buf[Bound] = buf()
+
+    for key in bound_traits(cx, tparam)
+        bounds.push(plain_bound(key, buf()))
+
+    if bounds.is_empty() then return false
+
+    val subject = Abstract(tparam, bounds)
+
+    bound_member(cx.an, subject, bounds, "index_place").is_none() &&
+        bound_member(cx.an, subject, bounds, "index_set").is_some()
+end bounds_write
 
 private lane_expr(cx: &Analyzer, span: Span, tr: TExpr, index: Expr, lanes: int,
                   elem: Type) -> TExpr
