@@ -1046,7 +1046,9 @@ print(l.len, l[0], l[1])
 - **Module storage is never a root**, whatever the path to it; it outlives every frame where it is.
 - **An element of a view or of a `Buf` is not the frame's storage**: `rows[i][..]` and `b[i][..]` carry
   the owner of the storage they live in, and outlive the buffer growing or being dropped. A program's
-  own container that answers its storage's view is the same; one whose elements are its own bytes is
+  own container writes `index_view` to answer its storage's view, and is the same — it is never
+  written for it, and a view of part of an element through the trait's default is refused
+  ([arrays](/reference/arrays/)); one whose elements are its own bytes is
   the frame's where it is, so a view of part of one may leave a frame only when the container lives in
   module storage or behind a `*T`.
 
@@ -1111,6 +1113,13 @@ slice its own buffer** — what `snprintf` does, and what most kernel code wants
 that is only lent** — handed to a call, or held in a local that never outlives its block — needs no
 count of its own while its parent's count holds the storage
 ([what a count costs](#a-view-of-something-the-frame-already-holds-takes-no-count)).
+
+**A view of storage inside a `&sync T` may therefore be lent, but may not escape.** A count taken
+through a view is the ordinary one, so such a view takes none at all: `sum(f.data[1..<3])` on a
+`&sync Flash` is accepted, and the same view returned, stored past the frame, captured by a kept
+closure or held by the callee is refused. The box must be reached through a binding that keeps
+holding it — not a field of another box, a module `var`, or a local the body stores into
+([arrays](/reference/arrays/)).
 
 #### A view borrowed from its receiver
 
