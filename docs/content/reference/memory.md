@@ -1119,7 +1119,25 @@ through a view is the ordinary one, so such a view takes none at all: `sum(f.dat
 `&sync Flash` is accepted, and the same view returned, stored past the frame, captured by a kept
 closure or held by the callee is refused. The box must be reached through a binding that keeps
 holding it — not a field of another box, a module `var`, or a local the body stores into
-([arrays](/reference/arrays/)).
+([arrays](/reference/arrays/)) — and the view may not be held in a local declared outside that
+binding's block, since the binding, and the box with it, ends there:
+
+```sysl
+struct Flash
+    data: [8]i32
+
+make(k: i32) -> &sync Flash = Flash([k, k, k, k, k, k, k, k])
+
+main()
+    var v: []i32 = []
+    if v.len == 0
+        val b = make(7)
+        v = b.data[0..<2]
+    print(v.len)
+```
+```error
+is kept in 'v', a local of the body, which outlives that block
+```
 
 #### A view borrowed from its receiver
 

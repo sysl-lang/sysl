@@ -151,6 +151,11 @@ struct EscapeWalk
     // The locals the body stores into or takes the address of, which a view of storage inside the
     // `&sync` box one holds may not rely on (`sync_root_stays`).
     rebound: Buf[string]
+
+    // The body itself, and its blocks once a view of `&sync` storage held in a local asks for them
+    // (`kept_in_local`): such a view is good only inside the block of the local holding its box.
+    body: Buf[TStmt]
+    block_scopes: Option[&BlockScopes]
 end EscapeWalk
 
 // One promotion, with its parts still separate.
@@ -189,6 +194,10 @@ struct EView
     // no count of the box (`address_owned`), so it may be lent and may not get out.
     sync: string
 
+    // The locals whose box such a view is of storage inside: what keeps that storage alive while the
+    // view lives, so the view may not be held past their block.
+    holders: Buf[string]
+
     non_empty(self) -> bool = !self.named.is_empty() || self.anonymous || !self.temps.is_empty()
 end EView
 
@@ -196,15 +205,21 @@ private no_view() -> EView
     var named: Buf[string] = buf()
     var temps: Buf[(Span, string)] = buf()
 
-    EView(named, false, temps, "", "")
+    var holders: Buf[string] = buf()
+
+    EView(named, false, temps, "", "", holders)
 end no_view
 
-// A view of storage inside a `&sync` box, which owns nothing of it.
-private sync_view(box: Type) -> EView
+// A view of storage inside a `&sync` box, which owns nothing of it, reached through the local
+// `holder` where it was one.
+private sync_view(box: Type, holder: Option[string]) -> EView
     var v = no_view()
 
     v.anonymous = true
     v.sync = type_show(box)
+
+    if holder.is_some() then v.holders.push(holder.unwrap())
+
     v
 end sync_view
 
@@ -251,6 +266,13 @@ private join_views(a: EView, b: EView) -> EView
     out.anonymous = a.anonymous || b.anonymous
     out.why = if a.why.is_empty() then b.why else a.why
     out.sync = if a.sync.is_empty() then b.sync else a.sync
+
+    for h in a.holders
+        push_name(&out.holders, h)
+
+    for h in b.holders
+        push_name(&out.holders, h)
+
     out
 end join_views
 
@@ -395,7 +417,7 @@ private walk_body(p: TProgram, keeps: &KeptParams, stmts: Buf[TStmt], result: Op
 
     val w: &EscapeWalk = EscapeWalk(confined, promoted, temps, sites, None, local_arrays(stmts),
                                     ref_bindings(stmts), aligned_arrays(stmts), lits, framed, found.0,
-                                    found.1, buf(), rebound_locals(stmts))
+                                    found.1, buf(), rebound_locals(stmts), stmts, None)
     val prog = p
     val kp = keeps
     var changed = true
@@ -481,6 +503,7 @@ end set_confined
 private view_eq(a: EView, b: EView) -> bool
     if a.anonymous != b.anonymous || a.sync != b.sync then return false
     if a.named.len() != b.named.len() || a.temps.len() != b.temps.len() then return false
+    if a.holders.len() != b.holders.len() then return false
 
     for i in 0..<a.named.len()
         if a.named[i] != b.named[i] then return false
@@ -551,7 +574,45 @@ private kept_in_local(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, name: str
         if !holds_temp_span(w.temps, t.0)
             w.sites.push(EscapeSite("", t.1, t.0, how, "its statement"))
             w.temps.push(t)
+
+    // **A view of `&sync` storage cannot move**: it counts nothing of the box, so the local holding
+    // the box is what keeps it, and that local ends with its block (L1).
+    if seen.holders.is_empty() || w.refusal.is_some() then return
+
+    if w.block_scopes.is_none() then w.block_scopes = Some(block_scopes_of_stmts(w.body))
+
+    val sc = w.block_scopes.unwrap()
+    val home = if sc.home_of(name) < 0 then 0 else sc.home_of(name)
+
+    for root in seen.holders
+        if sc.ends_within(sc.home_of(root), home)
+            val r = shown_block_local(root)
+            val h = shown_block_local(name)
+
+            w.refusal = Some((sync_anchor(w, v, root),
+                s"a view of storage inside the '${seen.sync}' in '$r', a local of ${sc.said_of(root)}, is " +
+                s"kept in '$h', a local of ${sc.said_of(name)}, which outlives that block — such a view " +
+                s"takes no count of the box, so nothing holds it once '$r' has ended. Copy the elements " +
+                s"into an array of their own, or declare '$r' where '$h' is declared"))
+            return
+        end if
+    end for
 end kept_in_local
+
+// Where a refusal of a view of storage inside the box `root` holds points: the slice taken through
+// `root` where `v` writes one -- a block's value, an `if` arm -- and otherwise `v` itself.
+private sync_anchor(w: &EscapeWalk, v: TExpr, root: string) -> Span
+    val found: &RefList = RefList(buf())
+
+    walk_texpr(v, expr_walk(false, x -> *x.kind match
+        TSlice(base, _, _, _, _) ->
+            sync_root_name(w, base) match
+                Some(n) -> if n == root then found.places.push((root, x))
+                None -> ()
+        _ -> ()))
+
+    if found.places.is_empty() then view_anchor(v) else view_anchor(found.places[0].1)
+end sync_anchor
 
 // Whether the array `array` is in scope for as long as the local `holder` is: the innermost block
 // that declared the array encloses the one that declared the holder. A name the body did not declare
@@ -928,7 +989,7 @@ private views_value(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, e: TExpr) -
         // handed to a call that borrows it, or held in this frame, and never further.
         val box = sync_box_around(base, n -> ref_place(w, n))
 
-        if box.is_some() then return join_views(views(p, keeps, w, base), sync_view(box.unwrap()))
+        if box.is_some() then return join_views(views(p, keeps, w, base), sync_view(box.unwrap(), sync_root_name(w, base)))
 
         if is_array(texpr_type(base)) && !is_place(base)
             join_views(views(p, keeps, w, base), temp_view(e.span, describe_temp(base)))
@@ -1332,6 +1393,21 @@ private sync_root_stays(w: &EscapeWalk, base: TExpr) -> bool = *base.kind match
         None -> !holds_string(w.rebound, name)
     TGlobal(_, _, writable) -> !writable
     _ -> false
+
+// The local or parameter a view of `&sync` storage reaches its box through, as `sync_root_stays`
+// walks it, or nothing where that is a module `val` -- which lives as long as the program.
+private sync_root_name(w: &EscapeWalk, base: TExpr) -> Option[string] = *base.kind match
+    TDeref(operand, _) -> *operand.kind match
+        TLoad(name, _) -> ref_place(w, name) match
+            Some(place) -> sync_root_name(w, place)
+            None -> Some(name)
+        _ -> None
+    TField(r, _, _) -> sync_root_name(w, r)
+    TIndex(r, _, _) -> sync_root_name(w, r)
+    TLoad(name, _) -> ref_place(w, name) match
+        Some(place) -> sync_root_name(w, place)
+        None -> Some(name)
+    _ -> None
 
 struct AlignList
     asked: Buf[(string, usize)]
