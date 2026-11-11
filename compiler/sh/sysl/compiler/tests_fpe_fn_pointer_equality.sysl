@@ -1,0 +1,204 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// Comparing two function pointers whose types differ only in their `@keeps` and `@lets_out` marks
+// (`expr.sysl`'s `compare_expr`). The pair meets at the type the other stands within, as an assignment
+// or an argument would, so a function's address compared with a marked pointer is taken at the marked
+// type and a function keeping that parameter is not refused for the comparison. `reference/memory.md §
+// A borrowed pointer cannot escape` is the specification: an unmarked pointer stands where a marked one
+// is asked for, and a function whose address is taken keeps a parameter only where every type its
+// address is taken at marks it.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private fpe_outcome(text: string) -> (string, int)
+    val root = make_temp_dir("sysl-fpe").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end fpe_outcome
+
+private fpe_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = fpe_outcome(text)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+end fpe_prints
+
+private fpe_refused(text: string, part: string)
+    if xvr_no_library() then return
+
+    val out = fpe_outcome(text)
+
+    assert_eq(out.1, -1, out.0)
+    assert(out.0.index_of(part).is_some(), out.0)
+end fpe_refused
+
+// A primitive that keeps what it is handed, one that keeps nothing, and the marked type both are
+// taken at.
+private fpe_prims() -> string = raw"""
+    type Code = *extern(@keeps *int) -> unit
+    type Plain = *extern(*int) -> unit
+
+    var held: *int = null
+
+    halt(p: *int)
+        held = p
+
+    skip(p: *int)
+        ()
+
+    """
+
+private fpe_promise() -> string =
+    "'halt' keeps its parameter 'p' (it is stored in 'held'), and its address is taken — a call " +
+        "through a function pointer sees no body"
+
+// -- the address meets the marked pointer -------------------------------------------------------
+
+@test("a marked pointer compared with the address of a function keeping the marked parameter")
+fpe_marked_left()
+    fpe_prints(fpe_prims() + raw"""
+        is_halt(c: Code) -> bool = c == &halt
+
+        main()
+            val c: Code = &halt
+            val d: Code = &skip
+
+            print(is_halt(c))
+            print(is_halt(d))
+        """, "true\nfalse\n")
+
+@test("the address on the left of the comparison, and '!=', are taken at the marked type too")
+fpe_marked_right_and_ne()
+    fpe_prints(fpe_prims() + raw"""
+        main()
+            val c: Code = &halt
+            val d: Code = &skip
+
+            print(&halt == c)
+            print(&halt != c)
+            print(&halt != d)
+            print(d == &skip)
+        """, "true\nfalse\ntrue\ntrue\n")
+
+@test("a comparison in a condition and a match guard takes the address at the marked type")
+fpe_in_conditions()
+    fpe_prints(fpe_prims() + raw"""
+        name(c: Code, k: int) -> string
+            if c == &halt then return "halt"
+
+            k match
+                _ if c == &skip -> "skip"
+                _ -> "other"
+
+        main()
+            print(name(&halt, 0))
+            print(name(&skip, 0))
+        """, "halt\nskip\n")
+
+@test("a '@lets_out' pointer compared with the address of a function letting out what it reads")
+fpe_lets_out()
+    fpe_prints(raw"""
+        type Reader = *extern(@lets_out **int) -> unit
+
+        var seen: *int = null
+
+        peek(pp: **int)
+            seen = *pp
+
+        main()
+            val r: Reader = &peek
+
+            print(r == &peek)
+        """, "true\n")
+
+// -- two pointers held, neither an address ---------------------------------------------------------
+
+@test("a pointer of the unmarked type compared with one of the marked type compares the addresses")
+fpe_unmarked_value_beside_marked()
+    fpe_prints(fpe_prims() + raw"""
+        main()
+            val c: Code = &halt
+            val u: Plain = &skip
+            val v: Plain = &skip
+            val w: Code = &skip
+
+            print(c == u)
+            print(u == w)
+            print(w == v)
+        """, "false\ntrue\ntrue\n")
+
+// -- what is still refused ------------------------------------------------------------------------
+
+@test("the address compared with an unmarked pointer is taken at the unmarked type and still refused")
+fpe_unmarked_partner_refused()
+    fpe_refused(fpe_prims() + raw"""
+        main()
+            val u: Plain = &skip
+
+            print(u == &halt)
+        """, fpe_promise())
+
+@test("an address taken at the marked type in a comparison and at the unmarked type elsewhere is refused")
+fpe_also_taken_unmarked_refused()
+    fpe_refused(fpe_prims() + raw"""
+        main()
+            val c: Code = &halt
+            val u: Plain = &halt
+
+            print(c == &halt)
+            print(u == u)
+        """, fpe_promise())
+
+@test("two pointers whose marks neither stands within are still not compared")
+fpe_crossed_marks_refused()
+    fpe_refused(raw"""
+        type A = *extern(@keeps *int, *int) -> unit
+        type B = *extern(*int, @keeps *int) -> unit
+
+        f(p: *int, q: *int)
+            ()
+
+        main()
+            val a: A = &f
+            val b: B = &f
+
+            print(a == b)
+        """, "cannot compare *extern(@keeps *int, *int) -> unit with *extern(*int, @keeps *int) -> unit")
+
+@test("two pointers differing in a parameter, not only in its marks, are still not compared")
+fpe_other_signature_refused()
+    fpe_refused(fpe_prims() + raw"""
+        type Wide = *extern(@keeps *i64) -> unit
+
+        other(p: *i64)
+            ()
+
+        main()
+            val c: Code = &halt
+            val w: Wide = &other
+
+            print(c == w)
+        """, "cannot compare *extern(@keeps *int) -> unit with *extern(@keeps *long) -> unit")
