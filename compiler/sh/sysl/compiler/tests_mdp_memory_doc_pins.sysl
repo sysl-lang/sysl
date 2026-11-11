@@ -1,0 +1,141 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+
+// Refusals the reference's memory chapter shows, each one pinned by its exact text: a frame address
+// a callee keeps past its block, a view stored where it outlives its receiver, a volatile that
+// names no access, a count that is not atomic reached from another domain, and the moves a slice
+// of a by-value array is refused. Every program is the chapter's own.
+//
+// The helpers are `tests_enm_enum_run.sysl`'s; `mdp_err_on` is `enm_err` for a named machine.
+
+// Everything a source has to say for itself when it is built for `machine`.
+private mdp_err_on(text: string, machine: string) -> string
+    val root = make_temp_dir("sysl-mdp").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, forms_imported(text)).unwrap()
+
+    val out = emit_llvm_text(src, Some(machine)) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end mdp_err_on
+
+// What building `text` as a C archive for `machine` said, as the chapter's `build=c` blocks are built.
+private mdp_archive_err(text: string, machine: string) -> string
+    val root = make_temp_dir("sysl-mdp").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, forms_imported(text)).unwrap()
+
+    val out = build_c_archive(src, Some(machine), None, DefaultOptimization, Some(s"$root/program.a"), None, (m) -> ()) match
+        Err(why) -> failure_text(why)
+        Ok(_) -> ""
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end mdp_archive_err
+
+private mdp_refused(text: string, want: string)
+    val said = enm_err(text)
+
+    assert(enm_says(said, want), said)
+
+private mdp_refused_on(text: string, machine: string, want: string)
+    val said = mdp_err_on(text, machine)
+
+    assert(enm_says(said, want), said)
+
+// ---- an address a callee keeps
+
+@test("a callee that stores through one parameter an address passed in another is refused at the address")
+mdp_callee_keeps_address_in_other_argument()
+    mdp_refused(
+        "put(out: **int, v: *int)\n    *out = v\n\nrun(c: bool)\n    var spare = 0\n    var last = &spare\n\n    if c\n        var a = 1\n\n        put(&last, &a)\n",
+        "'&a' is the address of 'a', a local of the 'if' block, and 'put' keeps it in 'last', which outlives that block — keep the value itself, or declare 'a' where 'last' is declared")
+
+@test("a callee that lets out what it reads two steps through its parameter is refused for the frame address behind it")
+mdp_callee_lets_out_address_two_steps_deep()
+    mdp_refused(
+        "var last: *int = null\n\nstruct Holder\n    p: *int\n\nstruct Wrap\n    h: *Holder\n\nkeep_deep(w: *Wrap)\n    last = w.h.p\n\nrun()\n    var n = 5\n    var h = Holder(&n)\n    var w0 = Wrap(&h)\n    val hs = w0.h\n    var w = Wrap(hs)\n    keep_deep(&w)\n",
+        "'keep_deep' lets what it reads through its parameter 'w' outlive the call (it is stored in 'last'), and what is read through '&w' holds the address of a local of 'run'")
+
+@test("a closure capture stored through the closure's parameter outlives the frame it holds the address of")
+mdp_closure_capture_stored_through_its_parameter()
+    mdp_refused(
+        "import sysl.threads.Mutex\n\nstruct Th\n    p: *int\n\nstruct Joint\n    thread: Option[Th]\n\nvar m = Mutex.new(Joint(None))\n\nrun()\n    var local = 3\n    val started = Some(Th(&local))\n\n    m.with((j) -> j.thread = started)\n\nrun()\nprint(m.with((j) -> j.thread.is_some()))\n",
+        "a closure lets its capture 'started' outlive the call (it is stored in 'j.thread'), and 'started' holds the address of a local of 'run'")
+
+@test("a wrapper that passes its parameter to spawn keeps it, and a frame address handed to it is refused naming the scope")
+mdp_wrapper_of_spawn_keeps_its_parameter()
+    mdp_refused(
+        "import sysl.threads.{spawn, Thread}\n\nstruct Tally\n    n: int\n\nadd(t: *Tally)\n    t.n = t.n + 1\n\nstart(t: *Tally) -> Option[Thread] = spawn(&add, t)\n\ncount() -> int\n    var t = Tally(0)\n\n    start(&t).unwrap().join()\n    t.n\n\nprint(count())\n",
+        "'start' keeps its parameter 't' (it is passed to 'spawn', where it reaches another concurrency domain), and '&t' is the address of a local of 'count' — a thread that borrows the frame of 'count' is started on 'sysl.threads.scope'")
+
+// ---- a view stored where it outlives its receiver
+
+@test("a view borrowed from a receiver is refused in a local bound before the receiver")
+mdp_view_stored_before_its_receiver()
+    mdp_refused(
+        "extern \"free\" c_free(p: *u8)\n\nstruct Column\n    p: *u8\n    n: usize\n\n    @views(self)\n    bytes(&self) -> []const u8 = self.p[0..<self.n]\n\nimpl Drop for Column\n    drop(self) = c_free(self.p)\n\nrun()\n    var keep: []const u8 = []\n    val c: &Column = Column(null, 0)\n\n    keep = c.bytes()\n",
+        "'keep' is bound before 'c', so it outlives it, and this stores in it a view borrowed from 'c'")
+
+@test("a loop variable walking a view of views is borrowed from the receiver, and stored before it is refused")
+mdp_view_of_views_loop_variable_stored_before_receiver()
+    mdp_refused(
+        "struct Table\n    rows: []const []const u8\n\n    @views(self)\n    all(&self) -> []const []const u8 = self.rows\n\nrun()\n    var keep: []const u8 = []\n    val t: &Table = Table([\"ab\".bytes, \"cde\".bytes])\n\n    for row in t.all() do keep = row\n",
+        "'keep' is bound before 't', so it outlives it, and this stores in it a view borrowed from 't'")
+
+// ---- a slice of a by-value array
+
+@test("a slice of a field of a struct taken by value is refused, saying a field moves only with its struct")
+mdp_slice_of_a_field_of_a_by_value_struct()
+    mdp_refused(
+        "struct Pair\n    xs: [2]int\n\nfirsts(p: Pair) -> []int = p.xs[..]\n\nprint(firsts(Pair([1, 2])).len)\n",
+        "it is a field of 'p', a struct value, and a field moves only with its struct")
+
+// ---- volatile
+
+@test("a volatile struct is refused, pointing at volatile fields")
+mdp_volatile_struct_storage_is_refused()
+    mdp_refused_on(
+        "struct Counts\n    ticks: u64\n    irqs: u64\n\nstatic var counts: volatile Counts\n",
+        "aarch64-freestanding",
+        "'volatile Counts' cannot be the type of 'counts': a volatile access is one load or one store of the whole width, and 'Counts' is a struct. Write 'volatile' on its fields instead, as 'n: volatile u64', and declare the storage as a plain 'Counts'")
+
+@test("a volatile val is refused, since a constant is written by nothing")
+mdp_volatile_val_is_refused()
+    mdp_refused_on(
+        "val limit: volatile u64 = 3\n",
+        "aarch64-freestanding",
+        "'limit' is a 'val', and a 'val' is a constant: nothing writes it once it starts, so no access to it can be one the program did not make, and 'volatile' has nothing to say. Storage an interrupt handler or a device writes is a 'var'")
+
+// ---- a count that is not atomic, reached from another domain
+
+@test("an interrupt-domain function reaching module storage held as a plain '&T' is refused")
+mdp_interrupt_domain_reaches_a_non_atomic_count()
+    val said = mdp_archive_err(
+        "struct Cell\n    n: int\n\nvar shared: &Cell = Cell(1)\n\n@domain(interrupt)\n@export(\"on_timer\")\non_timer()\n    shared.n += 1\n",
+        "aarch64-freestanding")
+
+    assert(enm_says(said, "'on_timer' is entered in the 'interrupt' domain, on top of whatever was running, so every count it reaches has to be atomic — but the module storage 'shared' it reaches is a '&Cell', whose count is not. Hold it as a '&sync Cell' ('06')"), said)
+
+@test("a lock's closure that answers a local also stored in the guarded value is refused")
+mdp_lock_closure_answers_a_value_it_also_stored()
+    mdp_refused(
+        "import sysl.buf.{Buf, buf}\nimport sysl.threads.Mutex\n\nstatic var nest: Mutex[Buf[Buf[u8]]] = Mutex.new(buf())\n\nprint(nest.with((b) ->\n    var fresh: Buf[u8] = buf()\n    b.push(fresh)\n    fresh).len())\n",
+        "but this answers a 'Buf[byte]', whose 'core' reaches a '&BufCore[byte]', whose count is not atomic. Answer what the caller needs from it — a count, a flag, a '.copy()' of a string, a value built fresh inside the closure — rather than the value itself")
+
+// ---- an allocation in a module that declared none
+
+@test("a call handing a view to a parameter that crosses by value is refused in a no_alloc module")
+mdp_crossing_copy_needs_an_allocator()
+    mdp_refused(
+        "@no_alloc\n\n@crossing(v)\ntake(v: []u8) -> usize = v.len\n\nvar b: [2]u8 = [1, 2]\n\nprint(take(b[..]))\n",
+        "handing 'v' of 'take' a copy of every view in it needs an allocator, and this module declared '@no_alloc'")
