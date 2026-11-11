@@ -12,11 +12,12 @@ import sysl.text.{join, Search}
 // kept as the path a consumer imports it by, `sh.e.geo.Vertex`.
 //
 // The axes: how the package arrived (a workspace member published at a coordinate holding `-`, a
-// `path` dependency named by its label), which refusal names the type (a view's constness, a type
+// `path` dependency named by its label, a `--lib` root), which refusal names the type (a view's constness, a type
 // mismatch, a missing member, a type argument, a call through a `@keeps` pointer type), and what else
-// is called `Vertex` (nothing, the file's own type, a second package's type in the same message).
-// Left out: a `--lib` root, whose modules carry no prefix and are already said as written, and a
-// coordinate fetched over the network, which files its modules exactly as a published member does.
+// is called `Vertex` (nothing, the file's own type, a second package's type in the same message). A
+// `--lib` root's modules carry no prefix but are no more the program's own than a fetched package's.
+// Left out: a coordinate fetched over the network, which files its modules exactly as a published
+// member does.
 
 private dps_ready() -> bool = std_root().is_ok() && clang_available()
 
@@ -54,15 +55,23 @@ private dps_workspace(main: string, both: bool) -> string
 end dps_workspace
 
 // What `sysl build-c` says about `root`, every line joined; the tree is removed after.
-private dps_said(tree: string, root: string) -> string
+private dps_said(tree: string, root: string) -> string = dps_said_with(tree, root, "")
+
+// The same, with `lib` handed over as a `--lib` source root where it is not empty.
+private dps_said_with(tree: string, root: string, lib: string) -> string
     var lines: Buf[string] = buf()
     val sink = &lines
+    var args: Buf[string] = buf()
 
-    run_cli(["sysl", "build-c", root, "-o", s"$root/out.a"], (line) -> sink.push(line))
+    args.extend(["sysl", "build-c", root, "-o", s"$root/out.a"])
+
+    if !lib.is_empty() then args.extend(["--lib", lib])
+
+    run_cli(args.view(), (line) -> sink.push(line))
     reset_search_paths()
     remove_dir_all(tree).unwrap_or(())
     join(lines.view(), "\n")
-end dps_said
+end dps_said_with
 
 private dps_member(main: string) -> string
     val ws = dps_workspace(main, false)
@@ -209,3 +218,46 @@ dps_path_clash()
     assert(out.contains("error: cannot initialize 'v': declared Vertex but the value is sh.e.geo.Vertex\n"), out)
     assert(!out.contains("geo.sh.e.geo"), out)
 end dps_path_clash
+
+// -- a source root handed over with `--lib` ---------------------------------------------------------
+
+// A program in `app/` (with its own module `shapes`) and the package `geo` handed over with `--lib`.
+private dps_lib_root(main: string) -> string
+    val tree = lbr_temp("sysl-dps-lib-")
+
+    dps_write(tree, "geo/sysl.hocon", "package { name = \"geo\", version = \"0.1.0\" }\n")
+    dps_write(tree, "geo/sh/e/geo/geo.sysl", DpsGeo)
+    dps_write(tree, "app/sysl.hocon", "package { name = \"app\", version = \"0.1.0\" }\n")
+    dps_write(tree, "app/shapes/shapes.sysl", "module shapes\n\nstruct Point\n    x: int\n")
+    dps_write(tree, "app/main.sysl", main)
+    dps_said_with(tree, s"$tree/app", s"$tree/geo")
+end dps_lib_root
+
+@test("dps: a --lib root's type is named simply, as the same package fetched would be")
+dps_lib_simple()
+    if !dps_ready() then return
+
+    val out = dps_lib_root("import sh.e.geo.Vertex\n\nval vs = [Vertex(1)]\nval o: Option[[]const Vertex] = Some(vs[..])\n" +
+                           "val n: int = o\n")
+
+    assert(out.contains("error: cannot initialize 'n': declared int but the value is Option[[]const Vertex]\n"), out)
+    assert(!out.contains("sh.e.geo.Vertex"), out)
+end dps_lib_simple
+
+@test("dps: beside a --lib root's type, a type of the program's own other module keeps its module")
+dps_lib_own_module()
+    if !dps_ready() then return
+
+    val out = dps_lib_root("import sh.e.geo.Vertex\n\nval p: shapes.Point = Vertex(1)\n")
+
+    assert(out.contains("error: cannot initialize 'p': declared shapes.Point but the value is Vertex\n"), out)
+end dps_lib_own_module
+
+@test("dps: where the file declares its own Vertex, a --lib root's keeps the path it is imported by")
+dps_lib_clash()
+    if !dps_ready() then return
+
+    val out = dps_lib_root("struct Vertex\n    y: int\n\nval v: Vertex = sh.e.geo.Vertex(1)\n")
+
+    assert(out.contains("error: cannot initialize 'v': declared Vertex but the value is sh.e.geo.Vertex\n"), out)
+end dps_lib_clash

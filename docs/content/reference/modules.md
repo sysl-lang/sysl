@@ -579,7 +579,9 @@ their own modules' types apart.
 simple name could mean something else. Its modules are filed under the package's coordinate
 ([what a dependency's modules are called](/reference/packages/#what-a-dependency-s-modules-are-called)),
 which no file writes, so where its path is kept it is the path a consumer imports it by,
-`sh.sysl.sdl3.c.Vertex`, never `github.com.sysl-lang.sdl3.sh.sysl.sdl3.c.Vertex`.
+`sh.sysl.sdl3.c.Vertex`, never `github.com.sysl-lang.sdl3.sh.sysl.sdl3.c.Vertex`. A source root
+handed over with `--lib` is a dependency here too, so a package's types read alike whether it was
+fetched or stood in for.
 
 ### Where an import may stand
 
