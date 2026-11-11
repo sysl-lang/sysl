@@ -1,0 +1,193 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Text
+
+// A local buffer made fresh by a call and taken out of a `match`, an `is` test, a `?` or an
+// `unwrap()` (`checks.sysl`'s `fresh_in`): no other name can reach it, so a view of it held across a
+// call that may write some other buffer of its type is allowed -- and where the value could be one
+// held elsewhere (a parameter, module storage, an arm answering something else, a binding stored
+// away), the call is still refused.
+//
+// Every program carries what makes the by-type answer give up -- a pointer cast to `*u8`, which may
+// point into anything -- and `other` frees the module buffer `keep`, so only a local no other name
+// can reach is allowed to keep its view across the call.
+
+private mfr_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end mfr_ready
+
+private mfr_head() -> string =
+    "import sysl.buf.{Buf, buf}\nimport sysl.raw.ptr_cast\n\nstruct Placed\n    start: usize\n" +
+    "    index: usize\n\nvar keep: Buf[Placed] = buf()\n\n" +
+    "make(k: usize) -> Result[Buf[Placed], string]\n    var b: Buf[Placed] = buf()\n\n" +
+    "    if k == 0 then return Err(\"none\")\n\n    b.push(Placed(k, 0))\n    Ok(b)\nend make\n\n" +
+    "maybe(k: usize) -> Option[Result[Buf[Placed], string]] = if k == 9 then None else Some(make(k))\n\n" +
+    "grab() -> Result[Buf[Placed], string] = Ok(keep)\n\n" +
+    "pass(b: Buf[Placed]) -> Result[Buf[Placed], string] = Ok(b)\n\n" +
+    "other(n: usize)\n    keep = buf()\n    keep.push(Placed(n, n))\n\n" +
+    "f(src: Buf[Placed]) -> Result[usize, string]\n"
+
+// `decl` declares `order`; the view of it is held across `other`, which frees `keep`.
+private mfr_program(decl: string) -> string =
+    mfr_head() + decl + "    val xs = order.view_mut()\n\n    other(xs.len)\n" +
+    "    Ok(xs.len + xs[0].start)\nend f\n\nmain()\n    var x = 5\n    val p = ptr_cast[*u8](&x)\n\n" +
+    "    print(p[0])\n\n    var s: Buf[Placed] = buf()\n\n    s.push(Placed(4, 0))\n" +
+    "    keep.push(Placed(7, 0))\n    print(f(s).unwrap())\n"
+
+private mfr_root(text: string) -> string
+    val root = make_temp_dir("sysl-match-fresh").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+
+// What analysing a program said, all of it.
+private mfr_said(text: string) -> string
+    val root = mfr_root(text)
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end mfr_said
+
+// What a program printed, or what the compiler said instead.
+private mfr_ran(text: string) -> string
+    val root = mfr_root(text)
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text + out.err.unwrap_or("")
+end mfr_ran
+
+// Accepted, and the view still reads the local's own elements after `keep` is replaced.
+private mfr_runs(decl: string, want: string)
+    val text = mfr_program(decl)
+    val out = mfr_said(text)
+
+    assert(!out.contains("error"), s"expected no complaint for:\n$decl\ngot: $out")
+    assert_eq(mfr_ran(text), want)
+
+// Refused with the wording every such call gets.
+private mfr_refused(decl: string)
+    val out = mfr_said(mfr_program(decl))
+
+    assert(out.contains("'xs' is a view borrowed from 'order', held in a 'Buf[Placed]', and 'other' " +
+                        "may write a 'Buf[Placed]' — which could free what the view reads"),
+           s"expected the refusal for:\n$decl\ngot: $out")
+
+// -- accepted ---------------------------------------------------------------------------------------
+
+@test("a buffer taken out of a match on a call's result is fresh: the view is held across the call")
+mfr_match_on_call()
+    if !mfr_ready() then return
+
+    mfr_runs("    var order = make(1) match\n        Ok(n) -> n\n        Err(_) -> return Err(\"no\")\n\n",
+             "5\n2\n")
+
+@test("an arm answering a fresh buffer of its own is fresh too")
+mfr_fresh_arm()
+    if !mfr_ready() then return
+
+    mfr_runs("    var order = make(1) match\n        Ok(n) -> n\n        Err(_) -> buf()\n\n" +
+             "    order.push(Placed(1, 0))\n", "5\n3\n")
+
+@test("an 'is' test binding the buffer, a '?' and an 'unwrap()' each hand on a fresh buffer")
+mfr_is_try_unwrap()
+    if !mfr_ready() then return
+
+    mfr_runs("    var order = if make(1) is Ok(n) then n else return Err(\"no\")\n\n", "5\n2\n")
+    mfr_runs("    var order = make(1)?\n\n", "5\n2\n")
+    mfr_runs("    var order = make(1).unwrap()\n\n", "5\n2\n")
+
+@test("a nested match, and an arm moving the binding through a local of its block, hand it on")
+mfr_nested_and_block()
+    if !mfr_ready() then return
+
+    mfr_runs("    var order = maybe(1) match\n        Some(r) -> r match\n            Ok(n) -> n\n" +
+             "            Err(_) -> return Err(\"no\")\n        None -> return Err(\"none\")\n\n", "5\n2\n")
+    mfr_runs("    var order = make(1) match\n        Ok(n) ->\n            val m = n\n            m\n" +
+             "        Err(_) -> return Err(\"no\")\n\n", "5\n2\n")
+
+@test("avin's directory walk: a sorted view of a listing from a match, held across the recursive call")
+mfr_avin_walk()
+    if !mfr_ready() then return
+
+    val text = "import sysl.buf.{Buf, buf}\nimport sysl.fs.entries\nimport sysl.slices.sort\n\n" +
+               "private walk(dir: string, depth: usize, found: *Buf[string])\n" +
+               "    if depth == 2 then return\n\n    var names = entries(dir) match\n" +
+               "        Ok(n) -> n\n        Err(_) -> return\n\n    val sorted = names.view_mut()\n\n" +
+               "    sort(sorted)\n\n    for name in sorted\n        found.push(name)\n" +
+               "        walk(dir, depth + 1, found)\nend walk\n\nmain()\n" +
+               "    var found: Buf[string] = buf()\n\n    walk(\".\", 0, &found)\n    print(found.len())\n"
+    val out = mfr_said(text)
+
+    assert(!out.contains("error"), s"expected no complaint, got: $out")
+
+@test("an object a call made, held by one name, keeps its view across a call through a closure")
+mfr_fresh_object_closure_call()
+    if !mfr_ready() then return
+
+    val text = "extern \"malloc\" c_malloc(n: usize) -> *u8\nextern \"free\" c_free(p: *u8)\n\n" +
+               "struct Owner\n    p: *u8\n    n: usize\n\n" +
+               "    @views(self)\n    view(&self) -> []const u8 = self.p[0..<self.n]\n\n" +
+               "impl Drop for Owner\n    drop(self)\n        print(\"freed\")\n        c_free(self.p)\n\n" +
+               "open(n: usize) -> &Owner\n    val p = c_malloc(n)\n\n    for i in 0..<n do p[i] = u8(65 + i)\n\n" +
+               "    Owner(p, n)\n\nrun()\n    val o = open(3)\n    val v = o.view()\n" +
+               "    val n: &Fn() -> usize = () -> v.len\n\n    print(n(), v[0])\n\nrun()\n"
+
+    assert(!mfr_said(text).contains("error"), "expected no complaint")
+    assert_eq(mfr_ran(text), "3 65\nfreed\n")
+
+// -- refused ----------------------------------------------------------------------------------------
+
+@test("a parameter handed back through a call, a match or a '?' is not fresh")
+mfr_parameter_refused()
+    if !mfr_ready() then return
+
+    mfr_refused("    var order = pass(src) match\n        Ok(n) -> n\n        Err(_) -> return Err(\"no\")\n\n")
+    mfr_refused("    var order = Some(src) match\n        Some(n) -> n\n        None -> return Err(\"no\")\n\n")
+    mfr_refused("    var order = pass(src)?\n\n")
+    mfr_refused("    var order = pass(src).unwrap()\n\n")
+
+@test("a call answering module storage is not fresh, through a match or not")
+mfr_module_storage_refused()
+    if !mfr_ready() then return
+
+    mfr_refused("    var order = grab() match\n        Ok(n) -> n\n        Err(_) -> return Err(\"no\")\n\n")
+    mfr_refused("    var order = grab().unwrap()\n\n")
+
+@test("an arm or an else answering something else, or a binding stored away first, is not fresh")
+mfr_other_arm_refused()
+    if !mfr_ready() then return
+
+    mfr_refused("    var order = make(1) match\n        Ok(n) -> n\n        Err(_) -> keep\n\n")
+    mfr_refused("    var order = if make(1) is Ok(n) then n else src\n\n")
+    mfr_refused("    var order = make(1) match\n        Ok(n) ->\n            keep = n\n            n\n" +
+                "        Err(_) -> return Err(\"no\")\n\n")
+    mfr_refused("    var order = maybe(1) match\n        Some(r) -> r match\n            Ok(n) -> n\n" +
+                "            Err(_) -> keep\n        None -> return Err(\"none\")\n\n")
