@@ -529,7 +529,8 @@ keep(job: &sync Fn(usize) -> unit)
     saved = Some(job)
     job(0)
 
-keep((i) -> print(i))
+main()
+    keep((i) -> print(i))
 ```
 
 ```error
