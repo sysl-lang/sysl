@@ -274,6 +274,7 @@ private hold_keeps(a: &Analysis, cx: &KeepsCx, funcs: Buf[TFunc], vals: Buf[TVal
         check_blocks(cx, faults, f)
         refuse_promised(cx, faults, f)
         refuse_spread(cx, faults, f)
+        refuse_unbounded(cx, faults, f)
 
     var said: Buf[Span] = buf()
 
@@ -1610,7 +1611,7 @@ end anywhere
 // of a body reached through a default -- whose own body is held to the default instead
 // (`refuse_promised`).
 private lent_by_rule(cx: &KeepsCx, f: TFunc, i: usize) -> bool
-    if scoped_at(f, i) then return true
+    if scoped_at(f, i) || bounded_at(f, i) then return true
 
     // A closure made at a callable type that marks the parameter `@keeps` was promised nothing about
     // it, so a call that sees its body is held to what the body keeps.
@@ -1688,6 +1689,17 @@ scoped_at(f: TFunc, i: usize) -> bool
 
     i == 0 && name == "self" && scopes_a_call(f)
 end scoped_at
+
+// Whether a call of `f` lets go of the argument at a position by `f`'s `@bounded` promise: every run
+// of the callable there finishes before the call returns, so the call keeps nothing it hands there,
+// and the body is held only to `refuse_unbounded`.
+bounded_at(f: TFunc, i: usize) -> bool =
+    i < f.params.len() && !f.marks.bounded.is_empty() && holds_string(f.marks.bounded, f.params[i].0)
+
+// A `&sync` call, which another domain may run: what a `@bounded` one is handed is held by value.
+private shared_call(t: Type) -> bool = t match
+    Ref(_, sync) -> sync
+    _ -> false
 
 // **What a scoped member runs is held by the scope that lent its `*self`, until the call that lent it
 // returns** -- the `sysl.threads.scope` call, not the body it runs. So it is held where the
@@ -4720,6 +4732,8 @@ private probe_held_apart(ft: &FrameTrack, call: TExpr, name: string, j: usize) -
 
             val how =
                 if scoped_at(f, j) then "'@scoped', so another domain may run it before the scope ends"
+                else if bounded_at(f, j) && shared_call(f.params[j].1)
+                    "'@bounded', so another domain may run it before the call returns"
                 else if holds_string(f.marks.copies, p) then "'@crossing', so another domain may run it"
                 else ""
 
@@ -6158,7 +6172,7 @@ private refuse_promised(cx: &KeepsCx, faults: &KeepFaults, f: TFunc)
         (!closure && !f.marks.is_async() && (cx.slotted.has(f.name) || addressed))
 
     for i in first..<f.params.len()
-        if !may_hold_pointer(cx, f.params[i].1) || scoped_at(f, i) then continue
+        if !may_hold_pointer(cx, f.params[i].1) || scoped_at(f, i) || bounded_at(f, i) then continue
 
         // A trait method declared `@keeps(p)` may keep `p`: every call through an object is held to
         // the declaration instead (`declared_kept`), and a call that sees the body, to what it keeps.
@@ -6305,6 +6319,44 @@ private refuse_spread(cx: &KeepsCx, faults: &KeepFaults, f: TFunc)
             s"${w.how} — the pointer may be handed on only to a parameter that says '@scoped' too, and " +
             "never captured by something stored"))
 end refuse_spread
+
+// **A `@bounded` promise is trusted, but two ways of breaking it are in plain sight**: a body that
+// answers the callable hands it to a caller who may run it at any time after the call, and one that
+// stores it in module storage leaves it where anything may run it later. Everything else the body does
+// with it -- a scope it spawns on, a field of its receiver it clears before returning, another
+// `@bounded` callee -- is the promise's to answer for.
+private refuse_unbounded(cx: &KeepsCx, faults: &KeepFaults, f: TFunc)
+    if f.marks.bounded.is_empty() || cx.mistaken.has(f.name) then return
+
+    val scope = func_home(cx.an, f.name)
+    val shown = shown_name(cx.an, f.name)
+
+    for i in 0..<f.params.len()
+        if !bounded_at(f, i) then continue
+
+        val pname = f.params[i].0
+        val lead = s"'$shown' says '@bounded($pname)', a promise that every run of '$pname' finishes " +
+            "before the call returns, "
+
+        if answers_of(cx, f.name, i)
+            faults.items.push((scope, f.span, lead + s"but it answers with '$pname', which its caller may " +
+                               "run after the call has returned — answer what running it produced instead"))
+            continue
+        end if
+
+        val w = walk_kept(cx, f, i)
+
+        if !w.kept then continue
+
+        for at in w.locs
+            if at.loc.starts_with("g:")
+                faults.items.push((scope, at.at, lead + s"but it stores '$pname' in module storage " +
+                                   s"(${at.how}), where anything may run it after the call has returned — " +
+                                   "keep it in a local, or in a field of the receiver cleared before returning"))
+                break
+            end if
+    end for
+end refuse_unbounded
 
 private promise_broken(cx: &KeepsCx, f: TFunc, pname: string, how: string, closure: bool,
                        trait_name: Option[string]) -> string
@@ -6457,6 +6509,56 @@ check_scoped_names(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, shown: s
                     "or that a pointer the function holds is let go of before its caller's scope " +
                     s"ends, written '${ss[i]}: *T'")
 end check_scoped_names
+
+// What `@bounded` may name: once each, a parameter that is a call -- a `&sync Fn`, a `&Fn`, a bare
+// arrow, a type parameter bounded by a call trait, or a `*extern` function pointer. It stands above a
+// function or a method alike, since the bound is the call itself and needs no receiver; a field and an
+// `extern` are refused by the parser.
+check_bounded_names(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, shown: string)
+    val bs = d.marks.bounded
+
+    if bs.is_empty() then return
+
+    val ps = d.params
+
+    for i in 0..<bs.len()
+        var found: Option[Param] = None
+
+        for item in ps
+            if item.name == bs[i] then found = Some(item)
+
+        var twice = false
+
+        for j in 0..<i
+            if bs[j] == bs[i] then twice = true
+
+        if found.is_none()
+            var listed = ""
+
+            for j in 0..<ps.len()
+                listed = if j == 0 then s"'${ps[j].name}'" else s"$listed, '${ps[j].name}'"
+
+            val tail = if ps.is_empty() then " — it takes none" else s" — its parameters are $listed"
+
+            a.fault(scope, span, s"'@bounded' names '${bs[i]}', which is not a parameter of '$shown'$tail")
+        else if twice
+            a.fault(scope, span, s"'@bounded' names '${bs[i]}' twice, and a callable's runs finish " +
+                    "before the call returns or they do not — the second says nothing the first does not")
+        else if holds_string(d.marks.scoped, bs[i])
+            a.fault(scope, span, s"'@bounded' names '${bs[i]}', which '@scoped' names too — '@scoped' " +
+                    "says its runs finish before the scope that lent the receiver closes, '@bounded' before " +
+                    "this call returns, and a parameter keeps one promise; write the one that is true")
+        else if !callable_param(d, found.unwrap()) && !erased_call(found.unwrap()) && !c_callable(found.unwrap())
+            a.fault(scope, span, s"'@bounded' names '${bs[i]}', which is not a call — what it promises " +
+                    "is that every run of a callable the function is handed finishes before the call " +
+                    s"returns, written '${bs[i]}: &sync Fn() -> R', '${bs[i]}: &Fn() -> R' or " +
+                    s"'${bs[i]}: *extern() -> R'")
+    end for
+end check_bounded_names
+
+private c_callable(p: Param) -> bool = *p.typ.kind match
+    CFnType(_, _) -> true
+    _ -> false
 
 private param_is_pointer(p: Param) -> bool = *p.typ.kind match
     PtrType(_) -> true

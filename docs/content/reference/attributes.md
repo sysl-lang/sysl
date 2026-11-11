@@ -474,6 +474,72 @@ It takes a `*T` or a call, and nothing else; it does not stand above an `extern`
 holds what `@keeps(...)` says, nor above a trait's requirement, which has no body to keep it — each
 `impl` writes it above its own method.
 
+### `@bounded(f)` — every run of a callable finishes before the call returns
+
+**`@bounded(f)` above a function or a method promises that every run of the callable `f`, on whatever
+domain it runs, finishes before the call returns.** `@scoped(f)` binds what a member runs to the scope
+that lent its receiver, which outlives the caller's frame when the caller was handed that scope; the
+bound `@bounded` names is the call itself, so it needs no receiver and stands above a free function
+too. A worker set that runs a job on threads of its own and joins them before returning says it:
+
+```sysl
+import sysl.sync.Atomic
+import sysl.threads.scope
+
+struct Spawned
+    n: usize
+
+    @bounded(job)
+    each(*self, job: &sync Fn(usize) -> unit)
+        scope((s) ->
+            for w in 1..<self.n
+                s.spawn(() -> job(w))
+            job(0))
+
+run(on: *Spawned)
+    var hits: [4]Atomic[int] = [Atomic(0); 4]
+    val v = hits[..]
+    on.each((i) -> v[i].add(int(i) + 1))
+    print(hits[0].load() + hits[3].load())
+
+var sp = Spawned(4)
+run(&sp)
+```
+
+```output
+5
+```
+
+**A closure written straight at `f` may capture views and addresses of the caller's frame**, lent to it
+exactly as a closure written at a `@scoped` parameter is lent them: its captures need only outlive the
+call. Only a closure written at the argument borrows; a closure made earlier and handed in, or a
+parameter that is not `@bounded`, is held to the crossing rule as it always was. A `@bounded`
+parameter may be handed on to another `@bounded` callee, spawned on a scope the body opens, or held in
+the receiver's own field for the call.
+
+**It is trusted**, like `@scoped`: the compiler cannot see that every run has finished, and does not
+check the body for it. What it does refuse is the two ways of breaking the promise in plain sight —
+answering the callable, and storing it in module storage:
+
+```sysl
+var saved: Option[&sync Fn(usize) -> unit] = None
+
+@bounded(job)
+keep(job: &sync Fn(usize) -> unit)
+    saved = Some(job)
+    job(0)
+
+keep((i) -> print(i))
+```
+
+```error
+but it stores 'job' in module storage
+```
+
+It names a callable — a `&sync Fn`, a `&Fn`, a bare arrow or a `*extern` function pointer — once, and
+never a parameter `@scoped` names too. Like `@scoped` it stands above neither an `extern` nor a trait's
+requirement: each `impl` writes it above its own method.
+
 ### There is no `@joined`
 
 **A `*T` a written `@crossing` names is kept for good**: the thread it reaches may read it after the

@@ -1530,6 +1530,7 @@ where it has none**. They exist for the code the rules above cannot see into:
 | `@lets_out *T` | a parameter of a callable or function pointer type | what is read through it may be held past the call; the pointer itself is borrowed |
 | `@answers(p)` | `extern`, trait method | the answer is made of `p` |
 | `@scoped(p)` | a primitive | `p` is held only while the caller waits — a scope's join, an `await`, a wake |
+| `@bounded(f)` | a function, a member | every run of the callable `f` finishes before the call returns, so a closure written there may capture the caller's views and addresses ([attributes](/reference/attributes/#bounded-f-every-run-of-a-callable-finishes-before-the-call-returns)) |
 | `@views(self)` | a member | the view it answers is borrowed from the receiver |
 | `@relocates` | a member | it may move or give up the receiver's storage |
 | `@crossing(p)` | a function, a member | `p` reaches another concurrency domain ([below](#crossing-a-concurrency-domain)) |

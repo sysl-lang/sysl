@@ -1,0 +1,417 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `@bounded(f)`: every run of the callable `f` finishes before the call returns
+// (`reference/attributes.md § @bounded(f)`). A closure written at the argument borrows the views and
+// addresses of the caller's frame it captures, as one written at a `@scoped` parameter does
+// (`member_call.sysl`'s `note_scoped_args`); the call keeps nothing it hands there (`keeps.sysl`'s
+// `bounded_at`); and the body is held only to not answering the callable and not storing it in module
+// storage (`refuse_unbounded`). The axes: a free function and a member, a generic, a trait reached
+// through a generic, passed on to another `@bounded` callee, a view and an address captured, the
+// receiver's own field holding the callable for the call, and -O0 and -O2.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private bdd_outcome(text: string, level: string) -> (string, int)
+    val root = make_temp_dir("sysl-bdd").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, level, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end bdd_outcome
+
+private bdd_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    for level in ["0", "2"]
+        val out = bdd_outcome(text, level)
+
+        assert_eq(out.0, want)
+        assert_eq(out.1, 0)
+end bdd_prints
+
+private bdd_refused(text: string, part: string)
+    if xvr_no_library() then return
+
+    val out = bdd_outcome(text, DefaultOptimization)
+
+    assert_eq(out.1, -1, out.0)
+    assert(out.0.index_of(part).is_some(), out.0)
+end bdd_refused
+
+// A free function and a member that run every job on a scope of their own and return once all are done.
+private bdd_runners(mark: string) -> string = raw"""
+    import sysl.sync.Atomic
+    import sysl.threads.scope
+
+    struct Spawned
+        n: usize
+
+        MARK
+        each(*self, job: &sync Fn(usize) -> unit)
+            scope((s) ->
+                for w in 1..<self.n
+                    s.spawn(() -> job(w))
+                job(0))
+
+    MARK
+    par_each(n: usize, job: &sync Fn(usize) -> unit)
+        scope((s) ->
+            for w in 1..<n
+                s.spawn(() -> job(w))
+            job(0))
+    """.replace_all("MARK", mark)
+
+// -- what it lets a call do -----------------------------------------------------------------------
+
+@test("a closure written at a '@bounded' member's argument may capture a view of the caller's array")
+bdd_member_view()
+    bdd_prints(bdd_runners("@bounded(job)") + raw"""
+
+        run(on: *Spawned)
+            var hits: [4]Atomic[int] = [Atomic(0); 4]
+            val v = hits[..]
+            on.each((i) -> v[i].add(int(i) + 1))
+            print(hits[0].load() + hits[3].load())
+
+        main()
+            var sp = Spawned(4)
+            run(&sp)
+        """, "5\n")
+
+@test("without '@bounded' the member's closure capturing a view is refused")
+bdd_member_view_unmarked()
+    bdd_refused(bdd_runners("") + raw"""
+
+        run(on: *Spawned)
+            var hits: [4]Atomic[int] = [Atomic(0); 4]
+            val v = hits[..]
+            on.each((i) -> v[i].add(1))
+            print(hits[3].load())
+
+        main()
+            var sp = Spawned(4)
+            run(&sp)
+        """, "which owns its elements through a count that is not atomic")
+
+@test("'@scoped' is not the call's own bound: the same member marked '@scoped' still refuses the view")
+bdd_member_view_scoped()
+    bdd_refused(bdd_runners("@scoped(job)").replace_all("@scoped(job)\npar_each", "par_each") + raw"""
+
+        run(on: *Spawned)
+            var hits: [4]Atomic[int] = [Atomic(0); 4]
+            val v = hits[..]
+            on.each((i) -> v[i].add(1))
+            print(hits[3].load())
+
+        main()
+            var sp = Spawned(4)
+            run(&sp)
+        """, "declare 'hits' before 'scope'")
+
+@test("a closure written at a '@bounded' free function's argument may capture a view")
+bdd_free_view()
+    bdd_prints(bdd_runners("@bounded(job)") + raw"""
+
+        main()
+            var hits: [4]Atomic[int] = [Atomic(0); 4]
+            val v = hits[..]
+            par_each(4, (i) -> v[i].add(int(i) * 10))
+            print(hits[1].load() + hits[3].load())
+        """, "40\n")
+
+@test("without '@bounded' the free function's closure capturing a view is refused")
+bdd_free_view_unmarked()
+    bdd_refused(bdd_runners("") + raw"""
+
+        main()
+            var hits: [4]Atomic[int] = [Atomic(0); 4]
+            val v = hits[..]
+            par_each(4, (i) -> v[i].add(1))
+            print(hits[3].load())
+        """, "which owns its elements through a count that is not atomic")
+
+@test("a closure at a '@bounded' argument may capture the address of a local scalar")
+bdd_free_address()
+    bdd_prints(bdd_runners("@bounded(job)") + raw"""
+
+        main()
+            var total = Atomic(0)
+            val p = &total
+            par_each(4, (i) -> p.add(int(i)))
+            var sp = Spawned(3)
+            sp.each((i) -> p.add(10))
+            print(total.load())
+        """, "36\n")
+
+@test("a '@bounded' parameter passed on to another '@bounded' callee keeps the caller's view lent")
+bdd_passed_on()
+    bdd_prints(bdd_runners("@bounded(job)") + raw"""
+
+        @bounded(job)
+        twice(n: usize, job: &sync Fn(usize) -> unit)
+            par_each(n, job)
+            var sp = Spawned(n)
+            sp.each(job)
+
+        main()
+            var hits: [4]Atomic[int] = [Atomic(0); 4]
+            val v = hits[..]
+            twice(4, (i) -> v[i].add(1))
+            print(hits[0].load() + hits[3].load())
+        """, "4\n")
+
+@test("a generic '@bounded' function lends at every instantiation")
+bdd_generic_free()
+    bdd_prints(bdd_runners("@bounded(job)") + raw"""
+
+        @bounded(job)
+        over[T](xs: []const T, job: &sync Fn(usize) -> unit)
+            par_each(xs.len, job)
+
+        main()
+            var hits: [4]Atomic[int] = [Atomic(0); 4]
+            val v = hits[..]
+            over([1, 2, 3, 4][..], (i) -> v[i].add(1))
+            over(["a", "b"][..], (i) -> v[i].add(100))
+            print(hits[1].load() + hits[3].load())
+        """, "102\n")
+
+@test("a '@bounded' implementation reached through a generic's trait bound lends at the instance")
+bdd_generic_trait()
+    bdd_prints(raw"""
+        import sysl.sync.Atomic
+        import sysl.threads.scope
+
+        trait Workers
+            each(*self, job: &sync Fn(usize) -> unit)
+
+        struct Spawned
+            n: usize
+
+        impl Workers for Spawned
+            @bounded(job)
+            each(*self, job: &sync Fn(usize) -> unit)
+                scope((s) ->
+                    for w in 1..<self.n
+                        s.spawn(() -> job(w))
+                    job(0))
+
+        check[W: Workers](on: *W) -> int
+            var hits: [4]Atomic[int] = [Atomic(0); 4]
+            val v = hits[..]
+            on.each((i) -> v[i].add(int(i) + 1))
+            hits[0].load() + hits[3].load()
+
+        main()
+            var sp = Spawned(4)
+            print(check(&sp))
+        """, "5\n")
+
+@test("a '@bounded' member may hold the callable in its receiver's field for the call")
+bdd_receiver_field()
+    bdd_prints(raw"""
+        import sysl.sync.Atomic
+
+        struct Crew
+            job: Option[&sync Fn(usize) -> unit]
+            n: usize
+
+            @bounded(job)
+            each(*self, job: &sync Fn(usize) -> unit)
+                self.job = Some(job)
+                for w in 0..<self.n
+                    self.job match
+                        Some(j) -> j(w)
+                        None -> ()
+                self.job = None
+
+        main()
+            var hits: [3]Atomic[int] = [Atomic(0); 3]
+            val v = hits[..]
+            var c = Crew(None, 3)
+            c.each((i) -> v[i].add(7))
+            print(hits[2].load())
+        """, "7\n")
+
+@test("a '@bounded' '&Fn' runs on the caller's thread and may write the caller's local")
+bdd_plain_fn()
+    bdd_prints(raw"""
+        @bounded(f)
+        thrice(f: &Fn(int) -> unit)
+            for i in 1..3 do f(i)
+
+        main()
+            var n = 0
+            thrice((x) -> n += x)
+            print(n)
+        """, "6\n")
+
+@test("a closure made earlier is not written at the argument, so it may not capture a view")
+bdd_made_earlier()
+    bdd_refused(bdd_runners("@bounded(job)") + raw"""
+
+        main()
+            var hits: [4]Atomic[int] = [Atomic(0); 4]
+            val v = hits[..]
+            val made: &sync Fn(usize) -> unit = (i) -> v[i].add(1)
+            par_each(4, made)
+            print(hits[3].load())
+        """, "which owns its elements through a count that is not atomic")
+
+// -- what it refuses ------------------------------------------------------------------------------
+
+@test("a '@bounded' body that answers the callable is refused")
+bdd_answered()
+    bdd_refused(raw"""
+        @bounded(job)
+        hand_back(job: &sync Fn(usize) -> unit) -> &sync Fn(usize) -> unit
+            job(0)
+            job
+
+        main()
+            hand_back((i) -> print(i))(1)
+        """, "but it answers with 'job', which its caller may run after the call has returned")
+
+@test("a '@bounded' body that stores the callable in module storage is refused")
+bdd_module_storage()
+    bdd_refused(raw"""
+        var saved: Option[&sync Fn(usize) -> unit] = None
+
+        @bounded(job)
+        keep(job: &sync Fn(usize) -> unit)
+            saved = Some(job)
+            job(0)
+
+        main()
+            keep((i) -> print(i))
+        """, "but it stores 'job' in module storage")
+
+@test("'@bounded' naming a parameter that is not a call is refused")
+bdd_not_a_call()
+    bdd_refused(raw"""
+        @bounded(n)
+        run(n: int, f: &sync Fn() -> int) -> int = f() + n
+
+        main()
+            print(run(1, () -> 2))
+        """, "'@bounded' names 'n', which is not a call")
+
+@test("'@bounded' naming a pointer is refused: it is about a callable")
+bdd_pointer()
+    bdd_refused(raw"""
+        @bounded(p)
+        run(p: *int) -> int = *p
+
+        main()
+            var n = 1
+            print(run(&n))
+        """, "'@bounded' names 'p', which is not a call")
+
+@test("'@bounded' naming no parameter of the function is refused")
+bdd_unknown_name()
+    bdd_refused(raw"""
+        @bounded(g)
+        run(f: &sync Fn() -> int) -> int = f()
+
+        main()
+            print(run(() -> 2))
+        """, "'@bounded' names 'g', which is not a parameter of 'run' — its parameters are 'f'")
+
+@test("'@bounded' naming one parameter twice is refused")
+bdd_twice()
+    bdd_refused(raw"""
+        @bounded(f, f)
+        run(f: &sync Fn() -> int) -> int = f()
+
+        main()
+            print(run(() -> 2))
+        """, "'@bounded' names 'f' twice")
+
+@test("'@bounded' and '@scoped' naming one parameter are refused")
+bdd_with_scoped()
+    bdd_refused(raw"""
+        struct Chan
+            open: bool
+
+            @scoped(f)
+            @bounded(f)
+            run(*self, f: &sync Fn() -> int) -> int = f()
+
+        main()
+            var c = Chan(true)
+            print(c.run(() -> 2))
+        """, "which '@scoped' names too")
+
+@test("'@bounded' has no empty form")
+bdd_empty()
+    bdd_refused(raw"""
+        @bounded()
+        run(f: &sync Fn() -> int) -> int = f()
+
+        main()
+            print(run(() -> 2))
+        """, "There is no empty form")
+
+@test("'@bounded' above a field is refused")
+bdd_on_field()
+    bdd_refused(raw"""
+        struct Chan
+            @bounded(f)
+            f: int
+
+        main()
+            print(Chan(1).f)
+        """, "a field and a variant are never called")
+
+@test("'@bounded' above an 'extern' is refused")
+bdd_on_extern()
+    bdd_refused(raw"""
+        @bounded(f)
+        extern qsort_r(f: *extern(int) -> int) -> int
+
+        main()
+            print(1)
+        """, "'@bounded' promises that every run of a callable parameter finishes before the call returns, so it marks a function or a method")
+
+@test("'@bounded' above a trait requirement with no body is refused")
+bdd_on_requirement()
+    bdd_refused(raw"""
+        trait Workers
+            @bounded(job)
+            each(*self, job: &sync Fn(usize) -> unit)
+
+        main()
+            print(1)
+        """, "'@bounded' promises what a body does with a parameter, and 'each' is a requirement with no body")
+
+@test("'@bounded' may name a '*extern' function pointer")
+bdd_c_callable()
+    bdd_prints(raw"""
+        @bounded(f)
+        apply(f: *extern(int) -> int, x: int) -> int = f(x)
+
+        @export("bdd_double")
+        double(x: int) -> int = x * 2
+
+        main()
+            print(apply(&double, 21))
+        """, "42\n")
