@@ -1,0 +1,155 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A `Buf` tests a handle naming nothing on a branch of its own in every member, rather than reading
+// through a stand-in core chosen by address. What a handle in zeroed storage or after `release()`
+// answers is unchanged by that, and these pin it across the axes the branch meets: the three
+// containers, a zeroed handle and a released one, element types with and without a destructor, a
+// generic function reading the handle, and three optimization levels.
+
+private bnn_ran_at(text: string, level: string) -> string
+    val root = make_temp_dir("sysl-bnn").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, level, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.status match
+            Signalled(n) -> s"${out.text}signal $n\n"
+            Exited(n) -> s"${out.text}exit $n\n"
+            _ -> s"${out.text}timed out\n"
+end bnn_ran_at
+
+private bnn_levels() -> [3]string = ["0", DefaultOptimization, "2"]
+
+private bnn_ready() -> bool
+    std_root() match
+        Ok(_) -> true
+        Err(_) ->
+            print("skipped: the standard module's source is not on this machine")
+            false
+
+private bnn_prelude() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+    import sysl.container.{Map, map, Deque, deque}
+
+    extern "calloc" c_calloc(n: usize, size: usize) -> *u8
+    extern "free" c_free(p: *u8)
+
+    struct Noisy
+        n: int
+
+    impl Drop for Noisy
+        drop(self)
+            print("drop", self.n)
+
+    struct Pair
+        a: int
+        b: string
+
+    struct Holder
+        i: Buf[int]
+        s: Buf[string]
+        n: Buf[&Noisy]
+        p: Buf[Pair]
+        d: Deque[string]
+        m: Map[string, &Noisy]
+
+    total[T](b: Buf[T]) -> usize
+        var k: usize = 0
+
+        for _ in b
+            k += 1
+
+        k + b.len() + b.cap() + b.view().len
+
+    first[T](b: Buf[T]) -> T = b[0]
+
+    val h: *Holder = ptr_cast(c_calloc(1, sizeof(Holder)))
+
+    """
+
+@test("every container in zeroed storage reads as empty at every element type, takes an assignment, and reads as empty again after release")
+bnn_zeroed_assigned_released()
+    if !bnn_ready() then return
+
+    val text = bnn_prelude() + raw"""
+        print(total(h.i), total(h.s), total(h.n), total(h.p))
+        print(h.i.get(0), h.s.pop(), h.n.get(3).is_none(), h.p.is_empty())
+        h.i.truncate(4)
+        h.s.clear()
+        print(h.i.len(), h.s.len(), h.d.len(), h.d.pop_front(), h.m.len(), h.m.has("a"))
+        h.i = buf()
+        h.i.push(7)
+        h.n = buf()
+        h.n.push(Noisy(1))
+        h.m = map()
+        h.m.put("k", Noisy(2))
+        h.d = deque()
+        h.d.push_back("x")
+        print(h.i[0], first(h.i), h.n[0].n, h.m.len(), h.d.len())
+        h.i.release()
+        h.n.release()
+        h.m.release()
+        h.d.release()
+        print(total(h.i), total(h.n), h.m.len(), h.d.len(), h.i.get(0), h.n.pop().is_none())
+        c_free(ptr_cast(h))
+        print("freed")
+        """
+
+    for level in bnn_levels()
+        assert_eq(bnn_ran_at(text, level),
+                  "0 0 0 0\nNone None true true\n0 0 0 None 0 false\n7 7 1 1 1\ndrop 1\ndrop 2\n" +
+                  "0 0 0 0 None true\nfreed\nexit 0\n", s"-O$level")
+end bnn_zeroed_assigned_released
+
+@test("an index into a zeroed or released Buf is refused as past a length of zero, directly and through a generic function")
+bnn_index_refused()
+    if !bnn_ready() then return
+
+    val cases = ["print(\"before\")\nprint(h.i[2])\n",
+                 "print(\"before\")\nh.s[1] = \"x\"\n",
+                 "print(\"before\")\nprint(first(h.p).a)\n",
+                 "h.i = buf()\nh.i.push(1)\nh.i.release()\nprint(\"before\")\nprint(h.i[0])\n",
+                 "h.n = buf()\nh.n.push(Noisy(3))\nh.n.release()\nprint(\"before\")\nprint(first(h.n).n)\n"]
+
+    for c in cases
+        for level in bnn_levels()
+            val said = bnn_ran_at(bnn_prelude() + c, level)
+
+            assert(said.starts_with("before\n") || said.starts_with("drop 3\nbefore\n"), s"-O$level: $said")
+            assert(said.contains("out of bounds for length 0"), s"-O$level: $said")
+            assert(!said.ends_with("exit 0\n"), s"-O$level: $said")
+end bnn_index_refused
+
+@test("a push to a zeroed or released Buf panics, saying so, at every element type and level")
+bnn_push_refused()
+    if !bnn_ready() then return
+
+    val cases = ["h.i.push(1)\n", "h.s.push(\"a\")\n", "h.n.push(Noisy(4))\n", "h.p.push(Pair(1, \"b\"))\n",
+                 "h.i = buf()\nh.i.push(1)\nh.i.release()\nh.i.push(2)\n"]
+
+    for c in cases
+        for level in bnn_levels()
+            val said = bnn_ran_at(bnn_prelude() + c + "print(\"never\")\n", level)
+
+            assert(said.contains("panic: this Buf was never given storage -- assign `buf()` to it first"),
+                   s"-O$level: $said")
+            assert(said.ends_with("exit 1\n") && !said.contains("never\n"), s"-O$level: $said")
+end bnn_push_refused

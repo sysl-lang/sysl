@@ -149,19 +149,11 @@ private[buf] struct BufCore[T]
      * **The `ensure` is what keeps that raise free.** Raising the count re-checks the clause, and on
      * this arm the promise is the only thing that can say there is room, repeated at the call as a
      * fact.
-     *
-     * **It is also where a push to a handle naming nothing is caught.** Such a handle pushes into the
-     * shared empty core (`Buf.reading`), whose storage is always full, so every push to it arrives
-     * here -- and the one test it needs costs nothing on the path a push normally takes.
      */
     @noinline
     @cold
     private grow_store(*self, v: T)
         ensure self.count < self.elems.len
-
-        val none: *BufCore[T] = ptr_cast(&NoCore[0])
-
-        if self == none then unassigned(BufUnassigned)
 
         self.grow(self.count + 1)
 
@@ -372,16 +364,16 @@ struct Buf[T]
      * as `&b.elems[i]` is. It is read-only as a field: the storage is replaced only by the buffer's
      * own growth, which is what keeps the count from passing it.
      */
-    elems -> []T = self.reading().elems
+    elems -> []T = if is_null(self.core) then [] else self.core.elems
 
     /** How many elements there are -- `len()` under the name the field had. Read-only: the count is
      * the buffer's to move.
      */
     count -> usize = self.len()
 
-    const len(self) -> usize = self.reading().count
+    const len(self) -> usize = if is_null(self.core) then 0 else self.core.count
 
-    const cap(self) -> usize = self.reading().elems.len
+    const cap(self) -> usize = if is_null(self.core) then 0 else self.core.elems.len
 
     const is_empty(self) -> bool = self.len() == 0
 
@@ -389,11 +381,9 @@ struct Buf[T]
      * The total form of `b[i]`, which traps; `i` may be any integer type.
      */
     const get[I: Integer](self, i: I) -> Option[T]
-        val core = self.reading()
+        if is_null(self.core) || i < 0 || u128(i) >= u128(self.core.count) then return None
 
-        if i < 0 || u128(i) >= u128(core.count) then return None
-
-        Some(core.get_unchecked(usize(i)))
+        Some(self.core.get_unchecked(usize(i)))
 
     /** `b[i]` and `b[i] = v` with no bounds check: the element at `i`, read or written where it lives, with
      * nothing comparing `i` to the count. **The caller owes the proof that `i < len()`**, and an index
@@ -401,29 +391,30 @@ struct Buf[T]
      * all. This is the unchecked tier, and the name is how a reader finds it -- the same access an
      * `@unchecked` block gives `b[i]` (`reference/arrays.md § Unchecked access`).
      */
-    const get_unchecked(self, i: usize) -> T = self.reading().get_unchecked(i)
+    const get_unchecked(self, i: usize) -> T = self.core.get_unchecked(i)
 
-    const set_unchecked(self, i: usize, v: T) = self.reading().set_unchecked(i, v)
+    const set_unchecked(self, i: usize, v: T) = self.core.set_unchecked(i, v)
 
-    /** The core every hot member works through: this handle's own, or the empty one a handle naming
-     * nothing reads as -- whose count of zero refuses every index with the same report a buffer's own
-     * would, answers `pop` with `None`, has nothing for `truncate` to give up, and sends `push` down
-     * its growth path, where `grow_store` recognises it and reports the buffer as never given storage.
+    /** The core an index at `i` works through, a handle naming nothing reporting `i` as past a length
+     * of zero -- the report a buffer's own count would make.
      *
-     * **It is a choice of address, not a branch around the read**, and that is what lets a loop of
-     * reads keep the storage and the count in registers. Behind an `if` the core's fields are read
-     * only on the arm where the handle names something, and a read the optimizer cannot prove happens
-     * on every turn is one it may not hoist; chosen this way, every turn reads the same address, the
-     * trap that reports an index stays inside the loop where the index is, and a run of pushes and
-     * pops on one buffer reads the handle once.
+     * **Every member tests the handle on a branch of its own and reads the core only past it**, never
+     * choosing between this core and a stand-in by address. A choice of address costs every read a
+     * compare, a select and an add before the load can start; the branch costs one compare-and-branch
+     * the predictor always gets right, and the load reads the core's field at its own offset. The
+     * unchecked members test nothing: an index into a handle naming nothing is past its length of
+     * zero, which is what their caller promised it is not.
      */
-    private reading(self) -> *BufCore[T] = if is_null(self.core) then ptr_cast(&NoCore[0]) else &*self.core
+    @track_caller
+    private indexing(self, i: usize) -> *BufCore[T] = if is_null(self.core) then index_past(i, 0) else &*self.core
 
     // Every member that can move the storage or give an element up is `@relocates`, so a live `ref`
     // to an element is refused the call.
     @inline
     @relocates
-    const push(self, v: T) = self.reading().push(v)
+    const push(self, v: T)
+        if is_null(self.core) then unassigned(BufUnassigned)
+        self.core.push(v)
 
     @relocates
     const extend(self, xs: []const T)
@@ -431,13 +422,15 @@ struct Buf[T]
         self.core.extend(xs)
 
     @relocates
-    const pop(self) -> Option[T] = self.reading().pop()
+    const pop(self) -> Option[T] = if is_null(self.core) then None else self.core.pop()
 
     @relocates
-    const truncate(self, n: usize) = self.reading().truncate(n)
+    const truncate(self, n: usize)
+        if !is_null(self.core) then self.core.truncate(n)
 
     @relocates
-    const clear(self) = self.reading().truncate(0)
+    const clear(self)
+        if !is_null(self.core) then self.core.truncate(0)
 
     @relocates
     @track_caller
@@ -486,14 +479,14 @@ struct Buf[T]
      * a writer takes `view_mut()`, and a function handing a local buffer's elements out takes
      * `into_view()`.
      */
-    const view(self) -> []const T = self.reading().view()
+    const view(self) -> []const T = if is_null(self.core) then [] else self.core.view()
 
     /** The elements as a slice that may be written, the same storage `view()` gives -- so a write
      * through it is seen through the buffer. The view is tied to the buffer it was taken from and may
      * not outlive it, and growing the buffer leaves the view on the storage it had.
      */
     @views(self)
-    view_mut(*self) -> []T = self.reading().view()
+    view_mut(*self) -> []T = if is_null(self.core) then [] else self.core.view()
 
     /** The buffer given up and its elements handed over as an owned slice: for a function that
      * builds a local buffer and returns what it holds. The slice keeps the storage alive after the
@@ -502,7 +495,7 @@ struct Buf[T]
      */
     @relocates
     @consumes
-    const into_view(self) -> []T = self.reading().view()
+    const into_view(self) -> []T = if is_null(self.core) then [] else self.core.view()
 
     /** This name's share of the buffer given back, and the handle left naming nothing -- the state
      * zeroed storage starts in, where every reader answers as an empty buffer does. Nothing is
@@ -530,8 +523,8 @@ private[sysl] forget[H](p: *H)
  * string, so a `@no_alloc` module using a container is told about the container's growth, which is
  * what it has to change, and never about this.
  *
- * **On a freestanding target it traps, saying nothing**, as `trap` does. `Buf`'s growth path reaches
- * this from every push, where no optimizer can see the handle names something, so a report that
+ * **On a freestanding target it traps, saying nothing**, as `trap` does. Every `Buf` push reaches
+ * this from its test of the handle, where no optimizer can see the handle names something, so a report that
  * printed and exited would make every bare image that pushes supply `putchar` and `exit` for a
  * message about a mistake it may never make.
  */
@@ -557,12 +550,6 @@ private[sysl] enum Unassigned
     BufUnassigned
     DequeUnassigned
     MapUnassigned
-
-/** An empty core at every element type: storage `[]` and a count of zero are all-zero words, four of
- * them -- the view's three and the count -- whatever `T` is. A `var` only because an address is taken
- * of it: it is never written, since a count of zero refuses every index before anything is.
- */
-private[buf] var NoCore: [4]usize = [0, 0, 0, 0]
 
 // The report a length past the storage makes, out of line because of what a checked member costs
 // when it is not: written inline, the report is a dozen calls in the middle of a small member, which
@@ -637,11 +624,11 @@ impl[T: Debug] Debug for Buf[T]
  */
 impl[T] Index[usize, T] for Buf[T]
     @track_caller
-    const index(self, i: usize) -> T = self.reading().at(i)
+    const index(self, i: usize) -> T = self.indexing(i).at(i)
 
 impl[T] IndexSet[usize, T] for Buf[T]
     @track_caller
-    const index_set(self, i: usize, v: T) = self.reading().set(i, v)
+    const index_set(self, i: usize, v: T) = self.indexing(i).set(i, v)
 
 /** `b[i]` is the element where it lives: the address, checked against the count, so `b[i].f` reads
  * one field without copying the element and `ref e = b[i]` names it. Good until a `@relocates`
@@ -649,16 +636,16 @@ impl[T] IndexSet[usize, T] for Buf[T]
  */
 impl[T] IndexPlace[usize, T] for Buf[T]
     @track_caller
-    index_place(self, i: usize) -> *T = self.reading().place(i)
+    index_place(self, i: usize) -> *T = self.indexing(i).place(i)
 
     // An `@unchecked` block's `b[i]`: the same address, with no test against the count.
-    override index_place_unchecked(self, i: usize) -> *T = self.reading().place_unchecked(i)
+    override index_place_unchecked(self, i: usize) -> *T = self.core.place_unchecked(i)
 
     // `b[i][..]`: the element as a view of one, whose owner is the storage's.
     @track_caller
-    override index_view(self, i: usize) -> []T = self.reading().view_at(i)
+    override index_view(self, i: usize) -> []T = self.indexing(i).view_at(i)
 
-    override index_view_unchecked(self, i: usize) -> []T = self.reading().view_at_unchecked(i)
+    override index_view_unchecked(self, i: usize) -> []T = self.core.view_at_unchecked(i)
 
 /** `for x in b` walks `view()`: the elements the buffer held when the loop began, read by index as a
  * slice's are, rather than through a cursor that would cost a call apiece. An element pushed during
