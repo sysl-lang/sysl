@@ -895,6 +895,15 @@ inert_leaf(x: TExpr) -> bool = *x.kind match
 // storage it names (`reads`), and whether it holds a node that may run code no call names (`opaque`):
 // a call through a pointer or a trait's table, a rendering through a table, a place another task may
 // run (`touch_node`).
+//
+// **A `@relocates` member moves the storage behind its receiver** (`moves`: the receiver's type), and
+// that write lands in an object the receiver reaches through a reference -- a `Buf`'s core -- which no
+// other value holds by value. Judged by what holds what, it would clear every caller, wherever the
+// receiver came from: a parameter, a global, or a pointer a cast made. A `ref` standing in storage a
+// value of that type holds is left pointing at freed memory all the same, so where the question is a
+// `ref`'s (`untouched_by`'s `relocation`) such a member, and every body that reaches it, is not
+// cleared for its receiver's type. A view keeps the storage it reads alive, so its question is not
+// asked this one.
 struct Untouched
     names: Buf[string]
     calls: Buf[Buf[string]]
@@ -908,11 +917,12 @@ struct Untouched
     casts: Buf[Buf[Type]]
     reads: Buf[Set[string]]
     opaque: Buf[bool]
+    moves: Buf[Option[Type]]
 end Untouched
 
 // An empty summary, for an emitter that has not read a program yet.
 untouched_none() -> Untouched =
-    Untouched(buf(), buf(), buf(), buf(), buf(), no_casts(), buf(), map(), buf(), buf(), buf(), buf())
+    Untouched(buf(), buf(), buf(), buf(), buf(), no_casts(), buf(), map(), buf(), buf(), buf(), buf(), buf())
 
 // What one body's walk gathers for the `Untouched` lists that say what it can run: the module storage
 // it names, and whether it holds a node that may run code no call names.
@@ -1079,6 +1089,10 @@ untouched_summary(p: TProgram, dropping: Buf[Type], owning: Set[string] = set(),
         u.reads.push(reach.reads)
         u.opaque.push(reach.opaque)
 
+        val moved = f.marks.relocates && !f.params.is_empty()
+
+        u.moves.push(if moved then Some(receiver_object(f.params[0].1)) else None)
+
         var made: Buf[Type] = buf()
 
         for item in own.c.anywhere
@@ -1104,8 +1118,13 @@ end untouched_summary
 // cast pointer is still a write of something no `t` holds by value -- it gives back no count, so it
 // frees nothing the view reads -- and so a write whose object is of that type is judged by what holds
 // what, not by the casts. Every count it gives back is judged as before.
-untouched_by(u: *Untouched, t: Type, lent: Type = Unknown) -> Set[string]
-    val key = if lent == Unknown then mangle(t) else s"${mangle(t)}|${mangle(lent)}"
+//
+// **`relocation` is a `ref`'s question**: a `@relocates` member on a receiver of type `t` moves the
+// storage a `ref` standing in a `t` may be on, so that member, and every body reaching it, is not
+// cleared (`moves`).
+untouched_by(u: *Untouched, t: Type, lent: Type = Unknown, relocation: bool = false) -> Set[string]
+    val asked = if lent == Unknown then mangle(t) else s"${mangle(t)}|${mangle(lent)}"
+    val key = if relocation then s"$asked|moves" else asked
     val known = u.answers.get(key)
 
     if known.is_some() then return known.unwrap()
@@ -1120,8 +1139,15 @@ untouched_by(u: *Untouched, t: Type, lent: Type = Unknown) -> Set[string]
     var root_hits: Map[string, bool] = map()
     var given_clear: Map[string, bool] = map()
 
+    val want = underlying(t)
+
     for i in 0..<u.names.len()
         var ok = !u.open[i]
+
+        if relocation && ok
+            u.moves[i] match
+                Some(m) -> if m == want then ok = false
+                None -> ()
 
         for root in u.roots[i]
             if ok
@@ -1162,6 +1188,18 @@ untouched_by(u: *Untouched, t: Type, lent: Type = Unknown) -> Set[string]
     out
 end untouched_by
 
+// Whether a `@relocates` member of the program moves the storage behind a value of type `t`.
+relocated(u: *Untouched, t: Type) -> bool
+    val want = underlying(t)
+
+    for item in u.moves
+        item match
+            Some(m) -> if m == want then return true
+            None -> ()
+
+    false
+end relocated
+
 // Whether an object of type `root` can share storage with a value of type `t`, whose by-value parts
 // are `parts`: one holds the other, or `root` is a type a pointer was made to by a cast -- from
 // anything, or from the address of a named object that can (`cast_reaches`).
@@ -1180,6 +1218,9 @@ private held_with(r: Type, t: Type, parts: Buf[Type]) -> bool
     by_value_parts(r, &inside)
     has_type(inside, underlying(t))
 end held_with
+
+// The type of the object a member's receiver names: the pointee of a `*self`, the value otherwise.
+private receiver_object(t: Type) -> Type = underlying(pointee(t).unwrap_or(t))
 
 // Whether a pointer to `r` made by a cast may reach storage holding a `t`: always where it was made
 // from something that is not the address of a named object, and otherwise where one of the objects it
