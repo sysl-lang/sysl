@@ -567,17 +567,21 @@ for dir in "$org"/*/; do
     commands=$command
 
     case $name in
-        # skiff has no package at its root: its kernel's host tests, then `tools/portable`, which
-        # instantiates every kernel generic, built for each target the kernel runs on. Its
-        # `arch/armv7m`, `chips/*` and `boards/*` are cross-only and checked by skiff's own QEMU gate
-        # (`scripts/gate.sh`), not here, as picokit's board build is not.
+        # skiff has no package at its root. Its rows are the host halves of its own `scripts/gate.sh`:
+        # the kernel's one-core tests, the three-core tests built with `--option cores=3` (built for
+        # one core they index past their per-core arrays), the PMSA tables, and `tools/portable`,
+        # which instantiates every kernel generic, built for each target the kernel runs on. Its
+        # `arch/armv7m`, `chips/*` and `boards/*` are cross-only and checked by the QEMU half of that
+        # gate, not here, as picokit's board build is not.
         skiff)
-            commands="test kernel
+            commands="test kernel --filter skiff.kernel
+test kernel --option cores=3 --filter skiff.cores
+test arch/pmsa
 build-c tools/portable --target thumbv6m-freestanding
 build-c tools/portable --target thumbv7em-freestanding
 build-c tools/portable --target thumb-freestanding
 build-c tools/portable --target riscv32-freestanding"
-            label="test kernel; build-c tools/portable x4 targets"
+            label="test kernel (1 core, cores=3); test arch/pmsa; build-c tools/portable x4 targets"
             ;;
     esac
 
