@@ -1,0 +1,201 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A line that opens with a call and goes on with `|` is a clause only where a guard's `= body`
+// follows on the line (`reference/declarations.md § Clauses`). `u64(u32(lo)) | hi` -- a call whose
+// first argument is itself a call, which reads like a variant pattern -- is an expression, in a body
+// and among an entry file's top-level statements alike.
+//
+// The axes: where the line stands (the last line of a body, a line before others, an entry file's top
+// level, beside a real clause function); what follows the call (`|` with a value, `|` with a
+// bracketed value holding `==`, `|` ending the line with the operand on the next, `||`, `==`); and the
+// refusals that must stay: a stray clause with `=`, a stray clause with a guard, both in a body too.
+// A guarded clause under its signature still parses. `|>` is not a sysl operator, so it has no cell.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private clb_runnable() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the standard module's source or clang is not on this machine")
+        return false
+
+    true
+end clb_runnable
+
+// What the program prints, or why it did not build.
+private clb_run(program: string) -> string
+    val root = make_temp_dir("sysl-clb").unwrap()
+
+    write_text(s"$root/main.sysl", program).unwrap()
+
+    val exe = s"$root/built"
+    val made = build_native_program(s"$root/main.sysl", None, None, "0", Some(exe))
+
+    made match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return s"it did not build: ${failure_text(why)}"
+        Ok(_) -> ()
+
+    val ran = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    ran match
+        Err(_) -> "the program that was built could not be run"
+        Ok(o) -> o.text
+end clb_run
+
+private clb_prints(program: string, expected: string)
+    val out = clb_run(program)
+
+    assert(out == expected, s"expected '$expected', got: $out")
+
+// The first thing said about the program.
+private clb_report(program: string) -> string
+    val root = make_temp_dir("sysl-clb").unwrap()
+
+    write_text(s"$root/main.sysl", program).unwrap()
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end clb_report
+
+private clb_refused(program: string, message: string)
+    val out = clb_report(program)
+
+    assert(out.starts_with(s"error: $message"), s"expected 'error: $message' first, got: $out")
+
+private val stray = "this is a clause of 'g', and a clause follows its function's signature"
+
+// == expressions that open with a call ===============================================================
+
+@test("a body's last line 'u64(u32(lo)) | …' is an expression, not a clause")
+clb_last_line_or()
+    if !clb_runnable() then return
+
+    clb_prints(raw"""
+        join(lo: u32, hi: u32) -> u64
+            u64(u32(lo)) | (u64(hi) << 32)
+
+        print(join(1, 2))
+        """, "8589934593\n")
+
+@test("a call-or line before other lines, and one continued on the next line, are expressions")
+clb_or_line_in_the_middle()
+    if !clb_runnable() then return
+
+    clb_prints(raw"""
+        mix(a: u32, b: u32) -> u64
+            var n: u64 = 0
+            n = u64(u32(a)) | 4
+            print(n)
+            print(u64(u32(a)) | (u64(b) << 8))
+            u64(u32(a)) |
+                (u64(b) << 16)
+
+        print(mix(1, 2))
+        """, "5\n513\n131073\n")
+
+@test("a call followed by '|' and a bracketed '==' is an expression")
+clb_or_with_equality_inside()
+    if !clb_runnable() then return
+
+    clb_prints(raw"""
+        flag(x: Option[int]) -> int = x.unwrap_or(0)
+
+        pick(v: int) -> int
+            flag(Some(v)) | (if v == 3 then 8 else 0)
+
+        print(pick(3), pick(1))
+        """, "11 1\n")
+
+@test("a call followed by '||' or '==' is an expression")
+clb_logical_or_and_equality()
+    if !clb_runnable() then return
+
+    clb_prints(raw"""
+        yes(x: Option[int]) -> bool = x.is_some()
+        one(x: Option[int]) -> int = x.unwrap_or(0)
+
+        both(v: int) -> bool
+            val a = yes(Some(v)) || false
+            one(Some(v)) == 2 && a
+
+        print(both(2), both(5))
+        """, "true false\n")
+
+@test("an entry file's top-level call followed by '| x' is an expression statement")
+clb_top_level_or()
+    if !clb_runnable() then return
+
+    clb_prints(raw"""
+        var hits = 0
+
+        bump(x: Option[int]) -> int
+            hits += 1
+            x.unwrap_or(0)
+
+        bump(Some(4)) | 1
+        print(hits)
+        """, "1\n")
+
+@test("a clause function beside a call-or line keeps its clauses, guarded ones included")
+clb_real_clause_beside()
+    if !clb_runnable() then return
+
+    clb_prints(raw"""
+        f(x: int) -> int
+        f(0) = 1
+        f(x) | x > 0 = 2
+        f(_) = 3
+
+        id(x: int) -> int = x
+
+        g(x: int) -> int
+            f(id(x)) | 4
+
+        print(f(0), f(5), f(-1), g(0), g(-2))
+        """, "1 2 3 5 7\n")
+
+// == the refusals that stay ==========================================================================
+
+@test("a stray clause with '=' is still refused, at the top level and in a body")
+clb_stray_equals_refused()
+    if !clb_runnable() then return
+
+    clb_refused(raw"""
+        g(Some(x)) = x
+
+        print(1)
+        """, stray)
+
+    clb_refused(raw"""
+        main()
+            g(Some(x)) = x
+            print(1)
+        """, stray)
+
+@test("a stray clause with a guard and its body is still refused, at the top level and in a body")
+clb_stray_guard_refused()
+    if !clb_runnable() then return
+
+    clb_refused(raw"""
+        g(Some(x)) | x > 0 = x
+
+        print(1)
+        """, stray)
+
+    clb_refused(raw"""
+        main()
+            g(Some(x)) | x > 0 = x
+            print(1)
+        """, stray)

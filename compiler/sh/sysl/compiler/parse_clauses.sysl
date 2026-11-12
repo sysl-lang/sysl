@@ -121,8 +121,34 @@ stray_clause_at(p: *Parser) -> bool
 
     val i = past_bracket(p, 1)
 
-    i != 0 && (p.kw_at(i, "=") || p.kw_at(i, "|"))
+    i != 0 && (p.kw_at(i, "=") || (p.kw_at(i, "|") && guard_body_at(p, i + 1)))
 end stray_clause_at
+
+// Whether a guard's `= body` follows on the line from `i`: an `=` outside every bracket before the
+// line ends. Without one, `f(g(x)) | y` is a call or-ed with a value -- an expression, not a clause.
+private guard_body_at(p: *Parser, at: usize) -> bool
+    var i = at
+    var depth: usize = 0
+
+    loop
+        p.peek_at(i) match
+            Eof -> return false
+            Newline -> if depth == 0 then return false
+            Indent -> if depth == 0 then return false
+            Dedent -> if depth == 0 then return false
+            Keyword(w) ->
+                if w == "(" || w == "[" || w == "{"
+                    depth += 1
+                elif w == ")" || w == "]" || w == "}"
+                    if depth == 0 then return false
+                    depth -= 1
+                elif w == "=" && depth == 0
+                    return true
+                end if
+            _ -> ()
+
+        i += 1
+end guard_body_at
 
 // The stray clause `stray_clause_at` found, refused and stepped over.
 refuse_stray_clause(p: *Parser, start: Span) -> Stmt
