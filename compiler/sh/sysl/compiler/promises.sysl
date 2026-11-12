@@ -1,0 +1,120 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// `@unchecked(Send)` and `@unchecked(Share)` above a struct: the program's promise that a value of it
+// may cross to another concurrency domain (`Send`), or that an object of it may be reached from two
+// at once (`Share`), where its fields alone do not show it (`reference/memory.md § Send and Share`).
+//
+// **It is the crossing walk's one exception, and the walk takes it in place of the fields**
+// (`sharing.sysl`): a promised struct is a leaf, for every check that asks the question -- a bound, a
+// `&sync T`, a `@crossing` parameter, a capture -- since there is one question and one answer.
+//
+// **The promise is held to the rule `@guards` is held to**, for the same reason. What makes a struct
+// safe that its fields do not show is its own members, and a field anyone may reach goes round them;
+// so every field the walk would refuse is `private`, and the promise is written above the declaration,
+// which is in that file. **A promise the fields already keep is refused too**: it says nothing, and
+// would go on saying nothing true the day a field changed.
+
+// The names read in `@unchecked(...)`'s parentheses, each held to being one of the two the promise
+// can make. `at` is the open parenthesis.
+promise_names(p: *Parser, at: Span, names: Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for n in names
+        if n != "Send" && n != "Share"
+            p.fault(at, s"'@unchecked($n)' names nothing it can promise — above a struct it is " +
+                    "'@unchecked(Send)' or '@unchecked(Share)', and above a block it takes no " +
+                    "parentheses at all")
+        else if holds_string(out, n)
+            p.fault(at, s"'@unchecked(...)' names '$n' twice")
+        else
+            out.push(n)
+    end for
+
+    if holds_string(out, "Send") && holds_string(out, "Share")
+        p.fault(at, "'@unchecked(Share)' already promises 'Send' — an object two domains may reach at " +
+                "once may be handed to one of them. Write '@unchecked(Share)' alone")
+        return buf()
+    end if
+
+    out
+end promise_names
+
+// The empty form's refusal.
+promise_names_refusal() -> string =
+    "'@unchecked(...)' above a struct names what it promises, in parentheses — '@unchecked(Send)' or " +
+    "'@unchecked(Share)'. Above a block it takes no parentheses at all"
+
+// The refusal for a promise above anything but a struct.
+promise_off_struct() -> string =
+    "'@unchecked(Send)' and '@unchecked(Share)' promise that a struct's own members keep what its " +
+    "fields hold safe across a concurrency domain, so they mark a struct, whose fields can be " +
+    "'private' — and this declares none"
+
+// Holds every struct's promise to its rules, once every field and member is in.
+settle_promises(a: &Analysis)
+    for i in 0..<a.tables.types.len()
+        val key = a.tables.types.key_at(i)
+        val decl = a.tables.types.at(i)
+
+        decl.kind match
+            StructOf(d) -> if !d.promised.is_empty() then check_promise(a, key, decl, d)
+            _ -> ()
+end settle_promises
+
+// One struct's promise: the type it promises about is the declaration's own, at its own parameters
+// where it has any, so a field of a parameter's type is asked by the parameter's bounds.
+private check_promise(a: &Analysis, key: string, decl: Decl, d: StructDecl)
+    var targs: Buf[Type] = buf()
+
+    if !d.tparams.is_empty()
+        val subst = abstract_subst(a, decl.scope, d.tparams, d.bounds, d.tvalues, buf(), buf())
+
+        for name in d.tparams
+            for b in subst
+                if b.name == name then targs.push(b.ty)
+
+        if targs.len() != d.tparams.len() then return
+    end if
+
+    instantiate_struct(a, decl.scope, decl.span, d.name, key, d, decl.scope, targs) match
+        Struct(st) ->
+            for word in d.promised
+                val why = promise_refusal(st, d, word)
+
+                if why.is_some() then a.fault(decl.scope, decl.span, why.unwrap())
+        _ -> ()
+end check_promise
+
+// Why `@unchecked(word)` may not stand above this struct, or nothing where it may: a field the walk
+// refuses that is not `private`, or no field the walk refuses at all.
+private promise_refusal(st: &StructType, d: StructDecl, word: string) -> Option[string]
+    var refused = false
+
+    for item in st.fields
+        if holds_string(st.guarded, item.0) then continue
+
+        val part = if word == "Share" then share_refusal(item.1) else send_refusal(item.1)
+
+        if part.is_none() then continue
+
+        refused = true
+
+        for f in d.fields
+            if f.name == item.0 && !promise_private(f.vis)
+                return Some(s"'@unchecked($word)' promises that '${d.name}''s own members keep its " +
+                            s"'${item.0}' safe across a concurrency domain, and a field visible beyond " +
+                            "this file is a way round them — declare it 'private'")
+    end for
+
+    if refused then return None
+
+    Some(s"'@unchecked($word)' promises what '${d.name}''s fields already show — every count they " +
+         s"reach is atomic, so '${d.name}' is '$word' without it. Remove the promise")
+end promise_refusal
+
+private promise_private(v: Visibility) -> bool = v match
+    File -> true
+    _ -> false

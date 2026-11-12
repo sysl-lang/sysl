@@ -2279,6 +2279,106 @@ what 's' of 'start' points at reaches another concurrency domain, so every count
   `send` and `try_send` are `@crossing(value)`, which is how a channel
   [takes a view](/library/threads/#a-view-goes-in-as-a-copy).
 
+### `Send` and `Share` — the rule given a name
+
+**`sysl.Send` and `sysl.Share` are the two questions above, as bounds a signature can write.** A type
+is **`Send`** where a value of it may be handed to another domain by value — the question a `@crossing`
+parameter taken by value asks, every view and string inside it copied on the way. It is **`Share`**
+where an object of it may be reached from two domains at once — the question `&sync T` asks, nothing
+copied, so a view and a `string` are out. `Share` is `Send` and more.
+
+| type | `Send` | `Share` |
+|---|---|---|
+| a scalar, a `*T`, a `&sync T`, a `Frozen[T]` of members, a `Mutex[T]` | yes | yes |
+| a `string`, a `[]T` of members | yes | no |
+| a `&T`, a `weak T`, a `Buf[T]` | no | no |
+| an array, a tuple, a struct or an enum | where every part is | where every part is |
+
+**The membership is the compiler's, and it is the crossing check's own answer** — one rule, so a type
+that crosses at a `@crossing` parameter meets `Send`, and one that forms a `&sync` meets `Share`.
+Nothing implements either. A generic states the bound and its body may hand the value on; the
+caller is refused where the call is written, naming the part in the way:
+
+```sysl
+struct Cell
+    n: int
+
+struct Inner
+    cell: &Cell
+
+struct Outer
+    b: Inner
+
+post[T: Send](x: T) -> int = 1
+
+val c: &Cell = Cell(1)
+
+print(post(Outer(Inner(c))))
+```
+
+```error
+'post' requires its type parameter 'T' to implement 'Send', but Outer does not — a value of it handed over reaches another concurrency domain, so every count inside it has to be atomic — but its 'b.cell' reaches a '&Cell', whose count is not. Hold it as a '&sync Cell' ('06')
+```
+
+**A type parameter meets the bound only through its own bounds.** Where `@crossing` waits for each
+instantiation, a bound is asked once, where it is written, so a parameter that promises nothing is
+refused there, and told the bound to write:
+
+```sysl
+post[T: Send](x: T) -> int = 1
+
+relay[U](x: U) -> int = post(x)
+
+print(relay(1))
+```
+
+```error
+'post' requires its type parameter 'T' to implement 'Send', but U does not — a value of it handed over reaches another concurrency domain, so every count inside it has to be atomic — but it is 'U', a type parameter that promises nothing about its counts. Bound it '[U: Send]'
+```
+
+**`@unchecked(Send)` and `@unchecked(Share)` above a struct are the program's promise** where the
+fields do not show it — a struct whose own members keep a `&T` to one domain at a time. The walk takes
+the promise in place of the fields, for every check that asks: a bound, a `&sync T`, a `@crossing`
+parameter, a capture. It is held to `@guards`' rule: every field the walk would refuse is `private`,
+so the members are the only way to it. A promise the fields already keep is refused, and so is
+`impl Send`.
+
+```sysl
+import sysl.threads.scope
+
+struct Cell
+    n: int
+
+@unchecked(Share)
+struct Gate
+    private c: &Cell
+
+    get(self) -> int = self.c.n
+
+val g = Gate(Cell(6))
+
+scope((s) -> s.spawn(() -> print(g.get())))
+```
+
+```output
+6
+```
+
+```sysl
+struct Cell
+    n: int
+
+@unchecked(Send)
+struct Leaky
+    c: &Cell
+
+print(1)
+```
+
+```error
+'@unchecked(Send)' promises that 'Leaky''s own members keep its 'c' safe across a concurrency domain, and a field visible beyond this file is a way round them — declare it 'private'
+```
+
 ## Places
 
 A **place** is something with an address: a local or parameter, a dereference, an **element**, and a

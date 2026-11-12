@@ -49,8 +49,9 @@ parse_at_stmt(p: *Parser, start: Span) -> Stmt
 
     if word == "assert" then return parse_assert_decl(p, start)
 
-    // `@unchecked` marks the block under it rather than a declaration (`unchecked.sysl`).
-    if word == "unchecked" then return parse_unchecked_block(p, start)
+    // `@unchecked` marks the block under it rather than a declaration (`unchecked.sysl`) -- unless
+    // parentheses follow it, where it is a struct's promise to cross (`promises.sysl`).
+    if word == "unchecked" && !p.kw_at(2, "(") then return parse_unchecked_block(p, start)
 
     parse_attributed_decl(p, start)
 end parse_at_stmt
@@ -139,7 +140,7 @@ parse_member_attrs(p: *Parser, in_trait: bool) -> Buf[Attr]
             else if word == "align" || word == "packed" || word == "byte_order"
                 p.fault(at, layout_attr_on_member(word))
             else if word == "unchecked"
-                p.fault(at, unchecked_not_a_block())
+                p.fault(at, if p.kw_at(2, "(") then promise_off_struct() else unchecked_not_a_block())
             else if word == "renamed" || word == "removed"
                 p.fault(at, tombstone_off_member(word))
             else
@@ -259,7 +260,7 @@ builtin_attr_word(w: string) -> bool
                  "section", "crossing", "domain", "keeps", "answers", "disjoint", "guards", "needs",
                  "noinline", "inline", "cold", "thread_local", "abandons", "per_cpu", "main_thread",
                  "pinned", "pins", "relocates", "views", "consumes", "blocks", "scoped", "bounded", "joined",
-                 "strict_fp", "track_caller", "returns_twice", "renamed", "removed"]
+                 "strict_fp", "track_caller", "returns_twice", "renamed", "removed", "unchecked"]
         if word == w then return true
 
     false
@@ -401,6 +402,8 @@ parse_attribute(p: *Parser) -> Option[Attr]
     if word == "bounded" then return Some(Bounded(parse_named_list(p, "bounded")))
     if word == "disjoint" then return Some(Disjoint(parse_named_list(p, "disjoint")))
     if word == "guards" then return Some(Guards(parse_named_list(p, "guards")))
+    if word == "unchecked" && p.at_kw("(") then
+        return Some(Promises(promise_names(p, p.here(), parse_named_list(p, "unchecked"))))
     if word == "needs" then return Some(Needs(parse_named_list(p, "needs")))
     if word == "noinline" then return no_inlining_args(p, NoInline, "whether a call stays a call is the whole of what it says")
     if word == "inline" then return parse_inline_attr(p)
@@ -727,6 +730,7 @@ private named_list_refusal(word: string) -> string
 
     if word == "bounded" then return "'@bounded' names the callable parameters every run of which finishes before the call returns, in parentheses: '@bounded(f)'. There is no empty form: a function that runs nothing past its call says so by not writing the annotation"
 
+    if word == "unchecked" then return promise_names_refusal()
     if word == "guards" then return "'@guards' names the fields a struct's own members are the only way into, in parentheses — '@guards(value)'. There is no empty form: a struct that guards nothing says so by not writing the annotation"
 
     if word == "disjoint" then return "'@disjoint' names the pointer and slice parameters whose memory nothing else reaches while a call runs, in parentheses — '@disjoint(y, x)'. There is no empty form: a function whose parameters may overlap says so by not writing the annotation"
@@ -1250,7 +1254,7 @@ private refuse_unless(p: *Parser, at: Span, attrs: Buf[Attr], form: string)
 
 private may_carry(form: string, a: Attr) -> bool
     if form == "struct"
-        return is_layout(a) || attr_word(a) == "export" || attr_word(a) == "guards" ||
+        return is_layout(a) || attr_word(a) == "export" || attr_word(a) == "guards" || attr_word(a) == "unchecked" ||
             attr_word(a) == "pinned" || is_user(a) || is_annotation_mark(a)
     end if
 
@@ -1263,6 +1267,7 @@ private may_carry(form: string, a: Attr) -> bool
         attr_word(a) == "returns_twice"
 
     !is_layout(a) && attr_word(a) != "keeps" && attr_word(a) != "returns_twice" && attr_word(a) != "answers" && attr_word(a) != "guards" &&
+        attr_word(a) != "unchecked" &&
         attr_word(a) != "relocates" && attr_word(a) != "views" && attr_word(a) != "consumes" &&
         !is_user(a) && !is_annotation_mark(a)
 end may_carry
@@ -1319,6 +1324,8 @@ private attributed_refusal(attrs: Buf[Attr]) -> string
 
     if any_is(attrs, "guards")
         return "'@guards(...)' names the fields a struct's own members are the only way into, so it can only mark a struct — and this declares none"
+
+    if any_is(attrs, "unchecked") then return promise_off_struct()
 
     if any_is(attrs, "relocates")
         return "'@relocates' says a call may move the storage its receiver's elements live in, so it marks a method — and this declares none"
@@ -1717,6 +1724,7 @@ private laid_out(p: *Parser, at: Span, s: Stmt, attrs: Buf[Attr]) -> Stmt
                     ByteOrder(big) -> decl.byte_order = Some(big)
                     Export(e) -> decl.cname = Some(e)
                     Guards(ns) -> decl.guards = guarded_fields(p, at, decl, ns)
+                    Promises(ns) -> decl.promised = ns
                     Pinned -> decl.pinned = true
                     AnnotationMark -> decl.annotation = true
                     User(u) -> decl.annots.push(u)
