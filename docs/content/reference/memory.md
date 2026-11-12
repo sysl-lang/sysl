@@ -1411,9 +1411,10 @@ too, nor may the pointer be used after the call.
 **A second name for the same object is held to the rule.** Whether two `&T`s or `Buf`s name one object
 is a run-time fact, so the question is asked of **types**: while a ref stands inside storage a value
 of type `T` holds, writing storage held in any `T` other than along the ref's own path is refused —
-directly, or by a call whose body (or anything it reaches) may write a `T`. A call through a closure or
-trait object names no body and is refused; a function with no body in the program is judged by what it
-can get hold of ([edge cases](#edge-cases)). A callee reaching a `@relocates` member on a buffer of the
+directly, or by a call whose body (or anything it reaches) may write a `T`. A call through a closure
+names no body and is refused; a call through a trait object is a call to the method in that slot of
+every table the program has for the trait, in a program's own build, and names no body in a library's
+([edge cases](#edge-cases)); a function with no body in the program is judged by what it can get hold of. A callee reaching a `@relocates` member on a buffer of the
 ref's type writes it too, however it got the buffer.
 
 ```sysl
@@ -3182,8 +3183,17 @@ What a compiler maintainer needs and a program rarely meets:
   object behind a trait, a closure) — every destructor. A maker such as `blank() -> Buf[u8] =
   buf_filled(n, u8(0))` lets go of nothing, so a destructor elsewhere that calls through a pointer does
   not stop a local it fills from being the only name for its buffer, and a call not handed that local
-  may write other `Buf[u8]`s while a view of it is held. A call through a pointer or a trait object anywhere in that could run
-  anything, so every cast and all module storage count. A foreign function may call back into whatever
+  may write other `Buf[u8]`s while a view of it is held. A call through a pointer anywhere in that could
+  run anything, so every cast and all module storage count. **A call through a trait object, in a
+  program's own build** (`sysl build`, `run`, `test`), runs the method in that slot of each table the
+  program has for the trait — one per type it put behind the trait, and none where it put none — so
+  its reach is those methods' reach, each handed the object as its own type, so a field the trait
+  hides (a `Clearer` holding a `&Keep` of owners) counts as an argument would. That holds of a call
+  in the frame holding the ref or view as much as of one deep in a callee (a `Display` rendered
+  through `*Writer` under `map_err`). A call through a closure names no body even there, since nothing
+  in its type says what it captured. **A library's
+  build** (`build-lib`, `build-c`) may be handed an object whose table it never saw, so there such a
+  call could run anything, as a call through a pointer. A foreign function may call back into whatever
   C can enter — an `@export`, a `@section` function, one whose address is taken, one with a foreign
   convention — so it reaches those and all module storage. The standard library's own `extern`s are
   the exception, since they never call back: a `ptr_cast` elsewhere is no reason to refuse
@@ -3204,6 +3214,40 @@ What a compiler maintainer needs and a program rarely meets:
   does not.
 - **A generic instance whose own signature was refused at its call** says nothing more about its body:
   everything inside follows from that one complaint.
+
+A program whose only `Bus` reads may call through one while a view is held, though module storage
+holds a `Buf[u8]`; a second `impl Bus` whose `read` wrote that storage would refuse the call, naming
+its method:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+static var keep: Buf[u8] = buf()
+
+trait Bus
+    read(*self, at: usize) -> u8
+
+struct Ram
+    cells: Buf[u8]
+
+impl Bus for Ram
+    read(*self, at: usize) -> u8 = self.cells[at]
+
+copy_in(sram: *Buf[u8], d: &Bus) -> u8
+    var v = sram.view_mut()
+    v[0] = d.read(0)
+    v[0]
+
+var cells: Buf[u8] = buf()
+cells.push(7)
+var sram: Buf[u8] = buf()
+sram.push(0)
+print(copy_in(&sram, Ram(cells)), keep.len())
+```
+
+```output
+7 0
+```
 
 ## Hazard summary
 

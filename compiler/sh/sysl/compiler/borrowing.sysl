@@ -1328,7 +1328,7 @@ private touch_node(v: &Verdict, calls: &CallSink, exits: &CallSink, ending: &Kin
         TCall(name, _, _, _) -> if ending.has(x.kind) then exits.add(name) else calls.add(name)
 
         TVCall(recv, slot, _, _, _) -> tables match
-            Some(all) -> slot_callees(v, calls, all, recv, slot)
+            Some(all) -> slot_callees(v, calls, reach, all, recv, slot)
             None -> hidden(v, reach)
 
         TStore(place, _, _, _) -> touch_place(v, roots, gives, locals, place)
@@ -1367,12 +1367,16 @@ private touch_node(v: &Verdict, calls: &CallSink, exits: &CallSink, ending: &Kin
 
         // **The nodes that run code no call names**: a call through a pointer, a value rendered
         // through its trait's table, and the places another task may run. A rendering through a
-        // method the type supplied names it, as a call does.
+        // method the type supplied names it, as a call does, and one through a table names what that
+        // slot holds in every table of the trait where the program sees them all.
         TCallPtr(_, _, _, _) -> hidden(v, reach)
-        TRender(_, method, _, slot) ->
+        TRender(value, method, _, slot) ->
             v.refuse()
 
-            if slot.is_some() then reach.hide() else calls.add(method)
+            if slot.is_none() then calls.add(method)
+            else tables match
+                Some(all) -> slot_callees(v, calls, reach, all, value, slot.unwrap())
+                None -> reach.hide()
         TAwait(_, _) -> hidden(v, reach)
         TBlockOn(_, _) -> hidden(v, reach)
         TStep(_, _) -> hidden(v, reach)
@@ -1388,20 +1392,24 @@ private hidden(v: &Verdict, reach: &ReachSink)
 
 // A call through slot `slot` of a trait object, in a program that sees every table: a call to what
 // that slot holds in each table of the trait. A receiver whose trait cannot be named is refused.
-private slot_callees(v: &Verdict, calls: &CallSink, tables: Buf[TVtable], recv: TExpr, slot: int)
+//
+// **What such a call can run is then what those bodies run**, and nothing more: a receiver whose trait
+// cannot be named, or a slot a table does not have, is hidden code as a call through a pointer is.
+private slot_callees(v: &Verdict, calls: &CallSink, reach: &ReachSink, tables: Buf[TVtable], recv: TExpr,
+                     slot: int)
     val name = erased_trait(texpr_type(recv)) match
         Some(Trait(n, _, _)) -> n
         _ -> ""
 
     if name == "" || slot < 0
-        v.refuse()
+        hidden(v, reach)
         return
     end if
 
     for vt in tables
         if vt.trait_name == name
             if usize(slot) < vt.slots.len() then calls.add(vt.slots[usize(slot)].target)
-            else v.refuse()
+            else hidden(v, reach)
 end slot_callees
 
 // The slot forms (`slots.sysl`), which are how a growable container writes its storage: `slot_storage`

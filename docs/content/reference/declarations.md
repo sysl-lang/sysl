@@ -942,10 +942,33 @@ print(next(Counter(1)))
 
 A `*self` method called on the copy (`c.reset()`) is a write in the same sense, and so is a whole
 assignment (`c = Counter(0)`). A write through what the copy refers to — a `*T` or `&T` field, a
-slice's element, a `Buf` — reaches storage the caller shares, and is never lost. A parameter that is
+slice's element, a `Buf` — reaches storage the caller shares, and is never lost. So is a `*self`
+call answering a view of a value that holds no elements in place: `items.view_mut()` on a `Buf`
+parameter is a view of the caller's elements, as `items[i]` is one of them, while a view of an array
+the copy holds is the copy's own. A parameter that is
 itself a `*T`, `&T` or `&sync T` is not a copy. Where the parameter may be reached under another name —
 a closure or a nested function captures it, its address is taken, a `ref` stands for it — the body
 is not followed, and nothing is said.
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+scale(items: Buf[int], k: int)
+    val v = items.view_mut()
+
+    for i in 0..<v.len do v[i] = k * v[i]
+
+var b: Buf[int] = buf()
+
+b.push(1)
+b.push(2)
+scale(b, 10)
+print(b.view())
+```
+
+```output
+[10, 20]
+```
 
 ### The result type
 

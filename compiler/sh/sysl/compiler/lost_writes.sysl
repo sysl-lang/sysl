@@ -15,7 +15,8 @@ import sysl.buf.{Buf, buf}
 // compound assignment, an increment or a lane store whose place is the parameter or a part of it
 // reached without passing through anything that refers elsewhere -- a field of a struct, an element
 // of an array or a vector -- and a `*self` method answering nothing called on such a place. One
-// answering a value is a read: what it did is in its answer. A write through a `*T`, a
+// answering a value is a read: what it did is in its answer. So is one answering a view of a value
+// holding no elements in place (`items.view_mut()` on a `Buf`): what it views is shared. A write through a `*T`, a
 // `&T`, a slice's element or a `Buf` reaches storage the copy shares with the caller, and is not
 // lost -- and a run stored into a slice (`out.store(i, v)`) is a write of its elements like any other,
 // so only one stored into an array is a write of the parameter. A parameter that is itself a `*T`, `&T` or `&sync T` is never followed.
@@ -461,14 +462,47 @@ private lost_call(w: &LostWalk, e: TExpr, name: string, args: Buf[TExpr], ty: Ty
     g = lost_steps(w, place.unwrap(), g)
 
     // One answering a value hands back what it did with the copy, so the call is itself the read: a
-    // `*self` accessor (`self.word(i)`) or a cursor's `next()` writes nothing that is lost.
-    if answers_a_value(ty)
+    // `*self` accessor (`self.word(i)`) or a cursor's `next()` writes nothing that is lost. So does one
+    // answering a view of a value that holds no elements of its own (a `Buf`'s `view_mut()`): the
+    // view is of storage the copy shares with the caller, and a write through it is not lost.
+    if answers_a_value(ty) || views_elsewhere(texpr_type(place.unwrap()), ty)
         lost_read(w, root.unwrap(), g)
         return g
     end if
 
     lost_write(w, root.unwrap(), e.span, s"call to '${member_word(w.cx.an, name)}'", false, g)
 end lost_call
+
+// Whether a view a `*self` call answers is of storage other than the receiver's own: the receiver
+// holds no run of elements in place for it to view, so the view reaches what its references do.
+private views_elsewhere(receiver: Type, answer: Type) -> bool = answer match
+    Slice(_, _) -> !holds_run(receiver)
+    _ -> false
+
+// Whether a value of this type holds a run of elements in itself: an array or a vector, or a struct
+// storing one among its fields. Handles, addresses and numbers hold none; anything else -- a type
+// parameter, an enum's payloads -- is taken to.
+private holds_run(t: Type) -> bool = t match
+    Struct(st) -> fields_hold_run(st.stored())
+    Integer(_, _, _) -> false
+    Floating(_, _) -> false
+    Fixed(_, _, _) -> false
+    Char -> false
+    Bool -> false
+    Unit -> false
+    Str -> false
+    Ptr(_) -> false
+    CFn(_, _, _) -> false
+    Ref(_, _) -> false
+    Weak(_) -> false
+    Slice(_, _) -> false
+    _ -> true
+
+private fields_hold_run(fields: Buf[(string, Type)]) -> bool
+    for item in fields
+        if holds_run(item.1) then return true
+
+    false
 
 // The member a lowered call name was filed under, as the program wrote it.
 private member_word(a: &Analysis, name: string) -> string

@@ -1,0 +1,295 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A `*self` call answering a view, on a by-value parameter (`reference/declarations.md § A write to a
+// by-value parameter nothing reads is lost`): where the receiver holds no elements in place -- a
+// `Buf`, a struct of handles -- the view is of storage the copy shares with the caller, so writing
+// through it is not lost, as `items[i] = v` is not. The view stays borrowed from the parameter, a
+// `*self` call answering nothing still changes the copy, and a view of an array the copy holds is
+// still the copy's.
+
+private bvp_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end bvp_ready
+
+private bvp_root(text: string) -> string
+    val root = make_temp_dir("sysl-buf-view-param").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+
+// What a program printed, or what the compiler said instead.
+private bvp_ran(text: string) -> string
+    val root = bvp_root(text)
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text + out.err.unwrap_or("")
+end bvp_ran
+
+// What analysing a program said, all of it.
+private bvp_said(text: string) -> string
+    val root = bvp_root(text)
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+
+private bvp_prints(text: string, want: string)
+    if !bvp_ready() then return
+
+    val out = bvp_ran(text)
+
+    assert(out == want, s"expected '$want', got: $out")
+
+private bvp_refused(text: string, part: string)
+    if !bvp_ready() then return
+
+    val out = bvp_said(text)
+
+    assert(out.contains(part), s"expected '$part' in: $out")
+
+private bvp_lost(call: string, name: string) -> string =
+    s"this call to '$call' changes '$name', a copy of what the caller passed, and nothing reads '$name' afterwards"
+
+@test("view_mut on a by-value Buf parameter writes the caller's elements")
+bvp_param_view_mut()
+    bvp_prints(raw"""
+        import sysl.buf.{Buf, buf}
+
+        fill(items: Buf[int])
+            val v = items.view_mut()
+
+            for i in 0..<v.len do v[i] = 10 * v[i]
+
+        var b: Buf[int] = buf()
+
+        b.push(1)
+        b.push(2)
+        fill(b)
+        print(b.view())
+        """, "[10, 20]\n")
+
+@test("view_mut handed straight to a call, as a sort or a tree build takes it, is accepted")
+bvp_param_view_mut_argument()
+    bvp_prints(raw"""
+        import sysl.buf.{Buf, buf}
+
+        twice(xs: []int)
+            for i in 0..<xs.len do xs[i] = 2 * xs[i]
+
+        build(items: Buf[int]) = twice(items.view_mut())
+
+        var b: Buf[int] = buf()
+
+        b.push(4)
+        build(b)
+        print(b[0])
+        """, "8\n")
+
+@test("view_mut on a generic Buf parameter is accepted at the definition and in the instance")
+bvp_generic_param()
+    bvp_prints(raw"""
+        import sysl.buf.{Buf, buf}
+
+        scale[T: Integer](items: Buf[T], k: T)
+            val v = items.view_mut()
+
+            for i in 0..<v.len do v[i] = k * v[i]
+
+        var b: Buf[int] = buf()
+
+        b.push(3)
+        scale(b, 5)
+        print(b[0])
+        """, "15\n")
+
+@test("view_mut on a Buf field of a by-value struct parameter, and of a by-value self, is accepted")
+bvp_field_and_self()
+    bvp_prints(raw"""
+        import sysl.buf.{Buf, buf}
+
+        struct Bag
+            items: Buf[int]
+            tag: int
+
+            bump(self)
+                val v = self.items.view_mut()
+
+                v[0] = v[0] + 1
+
+        double(bag: Bag)
+            val v = bag.items.view_mut()
+
+            v[0] = 2 * v[0]
+
+        var b: Buf[int] = buf()
+
+        b.push(3)
+        double(Bag(b, 0))
+        Bag(b, 1).bump()
+        print(b[0])
+        """, "7\n")
+
+@test("a '*self' member answering a view of a Buf it holds is accepted on a by-value struct")
+bvp_member_view_of_handle()
+    bvp_prints(raw"""
+        import sysl.buf.{Buf, buf}
+
+        struct Bag
+            items: Buf[int]
+
+            @views(self)
+            elems(*self) -> []int = self.items.view_mut()
+
+        zero(bag: Bag)
+            val v = bag.elems()
+
+            v[0] = 0
+
+        var b: Buf[int] = buf()
+
+        b.push(9)
+        zero(Bag(b))
+        print(b[0])
+        """, "0\n")
+
+@test("a closure capturing a local Buf writes through view_mut to the same buffer")
+bvp_closure_capture()
+    bvp_prints(raw"""
+        import sysl.buf.{Buf, buf}
+
+        run()
+            var b: Buf[int] = buf()
+
+            b.push(1)
+
+            val f = () -> b.view_mut()[0] = 7
+
+            f()
+            print(b[0])
+
+        run()
+        """, "7\n")
+
+@test("view_mut of a by-value Buf parameter is still borrowed from it, so returning it is refused")
+bvp_view_still_lent()
+    bvp_refused(raw"""
+        import sysl.buf.{Buf, buf}
+
+        leak(items: Buf[int]) -> []int = items.view_mut()
+
+        var b: Buf[int] = buf()
+
+        b.push(1)
+        print(leak(b))
+        """, "this returns a view borrowed from 'items'")
+
+@test("view_mut on a by-value Buf parameter says nothing about a lost write")
+bvp_view_not_lost()
+    if !bvp_ready() then return
+
+    val out = bvp_said(raw"""
+        import sysl.buf.{Buf, buf}
+
+        leak(items: Buf[int]) -> []int = items.view_mut()
+        """)
+
+    assert(!out.contains("a copy of what the caller passed"), s"expected no lost write, got: $out")
+
+@test("release on a by-value Buf parameter changes the copy's handle and is still lost")
+bvp_release_still_lost()
+    bvp_refused(raw"""
+        import sysl.buf.{Buf, buf}
+
+        drop_it(items: Buf[int])
+            items.release()
+
+        var b: Buf[int] = buf()
+
+        b.push(1)
+        drop_it(b)
+        """, bvp_lost("release", "items"))
+
+@test("release while a view_mut of the same parameter is held is refused as freeing what it views")
+bvp_release_under_view()
+    bvp_refused(raw"""
+        import sysl.buf.{Buf, buf}
+
+        hold(items: Buf[int])
+            val v = items.view_mut()
+
+            items.release()
+            print(v.len)
+
+        var b: Buf[int] = buf()
+
+        b.push(3)
+        hold(b)
+        """, "'v' is a view borrowed from 'items', and this call may write what it is called on")
+
+@test("a '*self' member answering a view of an array the by-value parameter holds is still lost")
+bvp_array_view_still_lost()
+    bvp_refused(raw"""
+        struct Cells
+            xs: [4]int
+
+            cells(*self) -> []int = self.xs[0..<4]
+
+        clear(c: Cells)
+            val v = c.cells()
+
+            v[0] = 0
+
+        clear(Cells([1, 2, 3, 4]))
+        """, bvp_lost("cells", "c"))
+
+@test("a struct holding both a Buf and an array is taken to answer a view of its own elements")
+bvp_mixed_holder_still_lost()
+    bvp_refused(raw"""
+        import sysl.buf.{Buf, buf}
+
+        struct Mixed
+            items: Buf[int]
+            pad: [2]int
+
+            @views(self)
+            elems(*self) -> []int = self.items.view_mut()
+
+        zero(m: Mixed)
+            val v = m.elems()
+
+            v[0] = 0
+
+        var b: Buf[int] = buf()
+
+        b.push(9)
+        zero(Mixed(b, [0, 0]))
+        """, bvp_lost("elems", "m"))
