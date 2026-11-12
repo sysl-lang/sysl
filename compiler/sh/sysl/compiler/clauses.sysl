@@ -1,0 +1,356 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.from_utf8_unchecked
+
+// A function given by clauses (`parse_clauses.sysl`), read.
+//
+// **Each clause tests its patterns against the arguments where they stand.** A parameter is read in
+// place -- a `&T` one as what it holds, which is what a `match` on it takes apart -- and each pattern
+// is a test of that one value, so no argument is copied into a tuple to be matched as a whole. The
+// clauses become the `if` chain whose conditions are those tests, an `is` term per parameter and the
+// guard after them, which is what the emitter lowers an `if x is P` to already: the pattern's test,
+// then its bindings, then the guard. A clause whose guards all fail goes on to the next clause, as
+// the next link of the chain. A clause with several guards is a link for each, every one testing the
+// same patterns and binding the same names.
+//
+// **The clauses must cover every argument list**, as a `match`'s arms cover its scrutinee: the check
+// is the same matrix with a column per parameter (`clauses_gap`). Past the last link is therefore a
+// point no call reaches, and it is `unreachable`.
+
+// The clauses of one function, as the `if` chain they mean.
+clauses_expr(cx: &Analyzer, span: Span, group: ClauseGroup, expected: Option[Type],
+             discarded: bool) -> TExpr
+    // Every parameter is read before any pattern binds, so a clause that binds a name another
+    // parameter has still tests that parameter rather than the binding.
+    var reads: Buf[TExpr] = buf()
+    var subjects: Buf[TExpr] = buf()
+    var tys: Buf[Type] = buf()
+
+    for name in group.params
+        val read = type_expr_bare(cx, expr(group.sig, Ident(name)))
+        val s = held_by(cx, group.sig, name, read)
+
+        reads.push(read)
+        subjects.push(s)
+        tys.push(texpr_type(s))
+
+    val said = cx.an.complaints()
+    var links: Buf[(Buf[TCondTerm], TBlock)] = buf()
+    var rows_of: Buf[Buf[Buf[TPattern]]] = buf()
+    var covering: Buf[bool] = buf()
+
+    for c in group.clauses
+        cx.enter()
+
+        var terms: Buf[TCondTerm] = buf()
+        var columns: Buf[Buf[TPattern]] = buf()
+
+        for i in 0..<subjects.len()
+            var wild: Buf[TPattern] = buf()
+
+            wild.push(TWildPattern(tys[i]))
+
+            if i >= c.patterns.len() || only_wildcard(c.patterns[i])
+                columns.push(wild)
+                continue
+            end if
+
+            clause_column(cx, c, group.params[i], reads[i], subjects[i], c.patterns[i]) match
+                None -> columns.push(wild)
+                Some(term) ->
+                    // A name bound to the whole argument matches every one, and stands as a wildcard
+                    // for coverage.
+                    columns.push(if term.0 then wild else term.2)
+                    terms.push(TCondIs(term.1, term.2, false))
+
+        var covers = false
+        var always = false
+
+        for b in c.bodies
+            if always
+                cx.fault(b.span, "this guard is never tried: the '| _' above it always holds")
+                continue
+            end if
+
+            var cond: Buf[TCondTerm] = buf()
+
+            for t in terms
+                cond.push(t)
+
+            if b.guard.is_some()
+                cond.push(TCondTest(analyze_bool(cx, b.guard.unwrap(), b.span)))
+            else
+                covers = true
+                always = true
+            end if
+
+            links.push((cond, type_value_block(cx, b.body, expected, discarded)))
+
+        cx.leave()
+        rows_of.push(spread_rows(columns))
+        covering.push(covers)
+    end for
+
+    // A pattern that was refused stands as a wildcard, so the clauses are read for coverage only when
+    // nothing among them was refused, as a `match`'s arms are.
+    if cx.an.complaints() == said && !holds_unknown(tys)
+        report_dead_clauses(cx, group, tys, rows_of, covering)
+
+        if cx.an.complaints() == said then check_clauses_cover(cx, group, tys, rows_of, covering)
+    end if
+
+    chain_of(cx, span, links)
+end clauses_expr
+
+// What a parameter's patterns take apart: the value itself, or what a `&T` holds, which is what a
+// `match` on it is written over.
+private held_by(cx: &Analyzer, at: Span, name: string, read: TExpr) -> TExpr = repr(texpr_type(read)) match
+    Ref(_, _) -> type_expr_bare(cx, expr(at, Unary("*", expr(at, Ident(name)))))
+    _ -> read
+
+// One parameter's test in a clause: whether it only binds a name, what it is matched against, and
+// its patterns -- or none where it tests nothing at all.
+//
+// **A pattern that only names the argument binds the argument**, not what a `&T` holds: the name is
+// a second reference to the one value, never a copy of its contents. And a name that is the
+// parameter's own binds nothing new, so the body reads the parameter itself.
+private clause_column(cx: &Analyzer, c: Clause, param: string, read: TExpr, subject: TExpr,
+                      alts: Buf[Pattern]) -> Option[(bool, TExpr, Buf[TPattern])]
+    val mark = cx.scope_mark()
+    val tpats = clause_patterns(cx, c, subject, alts)
+
+    if tpats.len() == 1
+        tpats[0] match
+            TBindPattern(_, _) ->
+                cx.rewind_scope(mark)
+
+                if written_name(alts[0]) == param then return None
+
+                return Some((true, read, clause_patterns(cx, c, read, alts)))
+            _ -> ()
+    end if
+
+    Some((false, subject, tpats))
+end clause_column
+
+private written_name(p: Pattern) -> string = *p.kind match
+    IdentPattern(n) -> n
+    _ -> ""
+
+// One parameter's pattern, typed against what the parameter holds, its names bound into the clause's
+// scope. A name bound out of a borrowed view is borrowed from the same receiver, as a `match` arm's is.
+private clause_patterns(cx: &Analyzer, c: Clause, subject: TExpr, alts: Buf[Pattern]) -> Buf[TPattern]
+    val site = cx.bind_site
+    val held = cx.pattern_roots
+
+    cx.bind_site = Some(c.head)
+    cx.pattern_roots = pattern_view_roots(cx, subject)
+
+    val tpats = type_alternatives(cx, alts, texpr_type(subject))
+
+    cx.pattern_roots = held
+    cx.bind_site = site
+    tpats
+end clause_patterns
+
+private only_wildcard(alts: Buf[Pattern]) -> bool =
+    alts.len() == 1 && *alts[0].kind is WildcardPattern
+
+private holds_unknown(tys: Buf[Type]) -> bool
+    for t in tys
+        if t == Unknown then return true
+
+    false
+end holds_unknown
+
+// Every way a clause matches, a pattern per parameter: one alternative of each, in order.
+private spread_rows(columns: Buf[Buf[TPattern]]) -> Buf[Buf[TPattern]]
+    var rows: Buf[Buf[TPattern]] = buf()
+
+    rows.push(buf())
+
+    for col in columns
+        var next: Buf[Buf[TPattern]] = buf()
+
+        for row in rows
+            for alt in col
+                var grown: Buf[TPattern] = buf()
+
+                for item in row
+                    grown.push(item)
+
+                grown.push(alt)
+                next.push(grown)
+
+        rows = next
+
+    rows
+end spread_rows
+
+// **A clause no argument list can reach is refused**, at its head, naming the clauses above it that
+// match everything it does -- the rule an unreachable `match` arm is held to. A guarded clause above
+// covers nothing, since its guard may fail.
+private report_dead_clauses(cx: &Analyzer, group: ClauseGroup, tys: Buf[Type],
+                            rows_of: Buf[Buf[Buf[TPattern]]], covering: Buf[bool])
+    val m = fold_machine(cx.an.tables)
+
+    for i in 0..<group.clauses.len()
+        var above: Buf[usize] = buf()
+
+        for k in 0..<i
+            if covering[k] then above.push(k)
+
+        if above.is_empty() || !clause_dead(rows_of, above, rows_of[i], tys, m) then continue
+
+        // The clauses it needs: every one above, then each that can be left out while it stays dead
+        // is.
+        var need: Buf[usize] = buf()
+
+        for k in above
+            need.push(k)
+
+        for k in above
+            var without: Buf[usize] = buf()
+
+            for n in need
+                if n != k then without.push(n)
+
+            if clause_dead(rows_of, without, rows_of[i], tys, m) then need = without
+
+        var lines: Buf[usize] = buf()
+
+        for k in need
+            lines.push(cx.scope.src.locate(group.clauses[k].span.start).line)
+
+        val c = group.clauses[i]
+        val text = from_utf8_unchecked(cx.scope.src.text(c.head))
+
+        cx.fault(c.head, s"unreachable clause '$text': every argument list it matches is already " +
+                 s"matched by ${clause_lines(lines)}")
+    end for
+end report_dead_clauses
+
+// Whether none of `rows` is matched by some argument list the clauses `by` leave unmatched.
+private clause_dead(rows_of: Buf[Buf[Buf[TPattern]]], by: Buf[usize], rows: Buf[Buf[TPattern]],
+                    tys: Buf[Type], m: FoldMachine) -> bool
+    var earlier: Buf[Buf[TPattern]] = buf()
+
+    for k in by
+        for row in rows_of[k]
+            earlier.push(row)
+
+    for row in rows
+        if clause_row_useful(earlier, row, tys, m) then return false
+
+    true
+end clause_dead
+
+private clause_lines(lines: Buf[usize]) -> string
+    if lines.len() == 1 then return s"the clause on line ${lines[0]}"
+
+    if lines.len() > 4
+        return s"the ${lines.len()} clauses above it, on lines ${lines[0]} to ${lines[lines.len() - 1]}"
+
+    var who = "the clauses on lines "
+
+    for i in 0..<lines.len()
+        if i > 0 then who = who + (if i + 1 == lines.len() then " and " else ", ")
+
+        who = who + s"${lines[i]}"
+
+    who
+end clause_lines
+
+// **The clauses cover every argument list, or the function is refused** at its signature, naming
+// what is missing as the calls that would reach no clause. Only a clause with a body that has no
+// guard, or the guard `| _`, covers anything.
+private check_clauses_cover(cx: &Analyzer, group: ClauseGroup, tys: Buf[Type],
+                            rows_of: Buf[Buf[Buf[TPattern]]], covering: Buf[bool])
+    var rows: Buf[Buf[TPattern]] = buf()
+
+    for k in 0..<rows_of.len()
+        if covering[k]
+            for row in rows_of[k]
+                rows.push(row)
+
+    val gap = clauses_gap(group.name, tys, rows, fold_machine(cx.an.tables))
+
+    if gap.is_none() then return
+
+    val g = gap.unwrap()
+    val more = if g.exact then "" else " (and the values those clauses' literals leave out)"
+
+    cx.fault(group.sig, s"clauses of '${group.name}' do not cover ${describe_gap(g.names)}$more " +
+             "— add a clause for it, or end with one that matches every argument")
+end check_clauses_cover
+
+// The links read, as the chain they make: each an `if` whose `else` is the rest, and past the last
+// the point no call reaches. A last link that tests nothing is the chain's own `else`.
+private chain_of(cx: &Analyzer, span: Span, links: Buf[(Buf[TCondTerm], TBlock)]) -> TExpr
+    var tys: Buf[Type] = buf()
+
+    for item in links
+        tys.push(item.1.ty)
+
+    val to = widest_branch(tys)
+    var blocks: Buf[TBlock] = buf()
+
+    for item in links
+        blocks.push(if to.is_some() then widened_block(item.1, to.unwrap()) else item.1)
+
+    val ty = chain_type(cx, span, blocks)
+    var k = links.len()
+    var rest = TBlock(buf(), Some(TExpr(span, TUnreachable)), Never)
+
+    if k > 0 && links[k - 1].0.is_empty()
+        k -= 1
+        rest = blocks[k]
+    end if
+
+    while k > 0
+        k -= 1
+
+        val link = TExpr(span, TIf(links[k].0, blocks[k], Some(rest), ty))
+
+        rest = TBlock(buf(), Some(link), ty)
+
+    // A chain of one link that tests nothing is that link's body, which may hold statements.
+    if rest.stmts.is_empty() && rest.result.is_some() then rest.result.unwrap()
+    else TExpr(span, TBlockExpr(rest))
+end chain_of
+
+// The type the bodies meet at: the one every body that finishes comes to, `unit` where one is used
+// for its effect, and `never` where none finishes.
+private chain_type(cx: &Analyzer, span: Span, blocks: Buf[TBlock]) -> Type
+    var met: Option[Type] = None
+    var unit = false
+    var unknown = false
+
+    for b in blocks
+        if b.ty == Never then continue
+        if b.ty == Unknown then unknown = true
+        if b.ty == Unit then unit = true
+        if b.ty == Never || b.ty == Unknown || b.ty == Unit then continue
+
+        if met.is_none() then met = Some(b.ty)
+        else
+            val j = join_types(met.unwrap(), b.ty)
+
+            if j.is_none()
+                cx.fault(span, s"clause bodies have different types: ${type_show(met.unwrap())} and " +
+                         s"${type_show(b.ty)}")
+                return Unknown
+            end if
+
+            met = j
+        end if
+    end for
+
+    if unit then return Unit
+    if met.is_some() then return met.unwrap()
+    if unknown then return Unknown
+
+    Never
+end chain_type

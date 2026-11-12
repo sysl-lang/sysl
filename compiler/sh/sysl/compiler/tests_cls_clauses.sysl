@@ -1,0 +1,631 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// Functions given by clauses (`reference/declarations.md § Clauses`, `clauses.sysl`,
+// `parse_clauses.sysl`): a signature with no body, then one clause per line, each a pattern per
+// parameter and a body or a block of guards, tried in order.
+//
+// The axes: how many parameters (one, two, three, none tested); what the patterns are (literal,
+// range, variant with a payload, nested, struct, `|` alternatives, `_`, a name, a string literal
+// matched by a sliced string); guards (on the clause's line, in a block, `| _`, every guard failing
+// so the next clause runs); where the function stands (top level, a method with `self`, an `impl`
+// method, a trait's default method, a local function capturing nothing and capturing); what the
+// parameters are (generic, instantiated twice; a `&T`, whose patterns take apart what it holds; a
+// `Drop` type held by a `&T`, on a counted heap; a parameter with a default); recursion (self, mutual,
+// and the self call in tail position, which stays a jump); and every refusal: a gap, an unreachable
+// clause, an unreachable guard, the wrong number of patterns, a clause named for another function, a
+// clause with no signature, a type written in a pattern, a second guard after a one-line guard (both
+// layouts), and a signature with no clauses, which keeps the meaning it had.
+//
+// Not written: separate compilation (a clause function is an ordinary function once read, so a
+// `.syslib` sees its body as it sees any other), a bare-metal target (the only new instruction is the
+// `unreachable` an exhaustive `match` already emits), `const` functions (their bodies are the same
+// `if` chain an ordinary `if` is evaluated as) and the comparison pattern `fib(n < 2)`, which is not
+// part of the form.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private cls_runnable() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the standard module's source or clang is not on this machine")
+        return false
+
+    true
+end cls_runnable
+
+private struct ClsRun
+    out: string
+    err: string
+end ClsRun
+
+// What the program prints, and what it said on standard error, built on a counted heap.
+private cls_run(program: string) -> ClsRun
+    val root = make_temp_dir("sysl-cls").unwrap()
+
+    write_text(s"$root/main.sysl", program).unwrap()
+
+    val exe = s"$root/built"
+
+    force_alloc_counting(true)
+
+    val made = build_native_program(s"$root/main.sysl", None, None, "0", Some(exe))
+
+    force_alloc_counting(false)
+
+    made match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return ClsRun(s"it did not build: ${failure_text(why)}", "")
+        Ok(_) -> ()
+
+    val ran = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    ran match
+        Err(_) -> ClsRun("the program that was built could not be run", "")
+        Ok(o) -> ClsRun(o.text, o.err.unwrap_or(""))
+end cls_run
+
+private cls_prints(program: string, expected: string)
+    val r = cls_run(program)
+
+    assert(r.out == expected, s"expected '$expected', got: ${r.out}")
+    assert(r.err == "", s"expected nothing on standard error, got: ${r.err}")
+end cls_prints
+
+// The LLVM text of the program, or everything said about it.
+private cls_report(program: string) -> string
+    val root = make_temp_dir("sysl-cls").unwrap()
+
+    write_text(s"$root/main.sysl", program).unwrap()
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end cls_report
+
+// The program is refused with exactly this message first, at this line and column.
+private cls_refused(program: string, message: string, at: string)
+    val out = cls_report(program)
+    val first = out.index_of("\n\n") match
+        Some(n) -> out[0..<n]
+        None -> out
+
+    assert(out.starts_with(s"error: $message\n "), s"expected 'error: $message' first, got: $out")
+    assert(first.index_of(s"/main.sysl:$at\n").is_some(), s"expected it first at main.sysl:$at, got: $out")
+end cls_refused
+
+private cls_shape() -> string = raw"""
+    enum Shape
+        Circle(r: int)
+        Rect(w: int, h: int)
+
+    """
+
+// == what the reference claims ======================================================================
+
+@test("a one-parameter function tries its clauses in order, guards in a block included")
+cls_one_parameter_with_a_guard_block()
+    if !cls_runnable() then return
+
+    cls_prints(raw"""
+        classify(n: int) -> string
+        classify(0) = "zero"
+        classify(n)
+            | n < 0 = "negative"
+            | n < 10 = "small"
+            | _ = "large"
+
+        main()
+            print(classify(0), classify(-3), classify(5), classify(50))
+        """, "zero negative small large\n")
+
+@test("a variant's payload is bound by the clause that takes it apart")
+cls_variants_with_payloads()
+    if !cls_runnable() then return
+
+    cls_prints(cls_shape() + raw"""
+        area(s: Shape) -> int
+        area(Circle(r)) = 3 * r * r
+        area(Rect(w, h)) = w * h
+
+        main()
+            print(area(Circle(2)), area(Rect(2, 5)))
+        """, "12 10\n")
+
+@test("two parameters are covered together, as a matrix, not one at a time")
+cls_two_parameters_cover_together()
+    if !cls_runnable() then return
+
+    cls_prints(raw"""
+        both(a: bool, b: bool) -> int
+        both(true, true) = 3
+        both(true, false) = 2
+        both(false, x) = if x then 1 else 0
+
+        main()
+            print(both(true, true), both(true, false), both(false, true), both(false, false))
+        """, "3 2 1 0\n")
+
+@test("three parameters, a wildcard among them")
+cls_three_parameters()
+    if !cls_runnable() then return
+
+    cls_prints(raw"""
+        pick3(a: int, b: bool, c: Option[int]) -> int
+        pick3(0, _, None) = 0
+        pick3(0, true, Some(n)) = n
+        pick3(0, false, Some(n)) = -n
+        pick3(a, _, _) = a * 100
+
+        main()
+            print(pick3(0, true, None), pick3(0, true, Some(4)), pick3(0, false, Some(4)), pick3(2, false, None))
+        """, "0 4 -4 200\n")
+
+@test("ranges, alternatives, nested and struct patterns stand in a clause as in a match arm")
+cls_pattern_kinds()
+    if !cls_runnable() then return
+
+    cls_prints(raw"""
+        struct Point
+            x: int
+            y: int
+
+        grade(n: u8) -> string
+        grade(0..59) = "F"
+        grade(60..69 | 70..79) = "C"
+        grade(80..255) = "A"
+
+        nested(o: Option[Option[int]]) -> int
+        nested(Some(Some(n))) = n
+        nested(Some(None)) = -1
+        nested(None) = -2
+
+        pt(p: Point) -> int
+        pt(Point { x: 0, y }) = y
+        pt(Point { x, y: 0 }) = x
+        pt(_) = 99
+
+        main()
+            print(grade(10), grade(75), grade(90))
+            print(nested(Some(Some(4))), nested(Some(None)), nested(None))
+            print(pt(Point(0, 7)), pt(Point(4, 0)), pt(Point(1, 1)))
+        """, "F C A\n4 -1 -2\n7 4 99\n")
+
+// A literal is NUL-terminated and a slice of a longer string is not, so the slice is the argument
+// that could tell a comparison reading past the length.
+@test("a string literal pattern matches a sliced string by its contents")
+cls_string_literal_patterns()
+    if !cls_runnable() then return
+
+    cls_prints(raw"""
+        greet(name: string) -> string
+        greet("bob") = "hi bob"
+        greet(other) = "hello " + other
+
+        main()
+            print(greet("bob"), greet("bobby"[0..<3]), greet("al"[0..<1]))
+        """, "hi bob hi bob hello a\n")
+
+@test("a clause whose guards all fail goes on to the next clause")
+cls_failed_guard_falls_to_the_next_clause()
+    if !cls_runnable() then return
+
+    cls_prints(cls_shape() + raw"""
+        describe(s: Shape, limit: int) -> string
+        describe(Circle(r), _) | r > 10 = "big circle"
+        describe(Rect(w, h), limit)
+            | w > limit = "wide"
+            | h > limit = "tall"
+        describe(Circle(_), _) = "circle"
+        describe(Rect(_, _), _) = "rect"
+
+        main()
+            print(describe(Circle(20), 0), describe(Circle(2), 0))
+            print(describe(Rect(9, 1), 5), describe(Rect(1, 9), 5), describe(Rect(1, 1), 5))
+        """, "big circle circle\nwide tall rect\n")
+
+@test("a generic function given by clauses is instantiated at each type it is called with")
+cls_generic()
+    if !cls_runnable() then return
+
+    cls_prints(raw"""
+        choose[T](c: bool, a: T, b: T) -> T
+        choose(true, a, _) = a
+        choose(false, _, b) = b
+
+        main()
+            print(choose(true, 1, 2), choose(false, "a", "b"))
+        """, "1 b\n")
+
+@test("a method's clauses match its parameters after 'self', in a type, an impl and a trait default")
+cls_methods()
+    if !cls_runnable() then return
+
+    cls_prints(raw"""
+        struct Point
+            x: int
+            y: int
+
+            side(self, scale: int) -> string
+            side(0) = "none"
+            side(s) | self.x * s > 0 = "east"
+            side(_) = "west"
+
+        trait Describe
+            describe(self, n: int) -> string
+            tag(self, n: int) -> string
+            tag(0) = "untagged"
+            tag(_) = "tagged"
+
+        impl Describe for Point
+            describe(self, n: int) -> string
+            describe(1) = s"one at ${self.x}"
+            describe(_) = "many"
+
+        main()
+            val p = Point(2, 5)
+            print(p.side(0), p.side(1), Point(-1, 0).side(1))
+            print(p.describe(1), p.describe(2), p.tag(0), p.tag(3))
+        """, "none east west\none at 2 many untagged tagged\n")
+
+@test("a trait signature with no clauses under it is still a requirement")
+cls_trait_requirement_unchanged()
+    if !cls_runnable() then return
+
+    cls_refused(raw"""
+        trait Describe
+            describe(self, n: int) -> string
+
+        struct P
+            x: int
+
+        impl Describe for P
+            other(self) -> int = 1
+
+        main()
+            print(P(1).other())
+        """, "'P' does not implement 'Describe': method 'describe' is missing", "7:1")
+
+@test("a local function may be given by clauses, capturing or not")
+cls_local_functions()
+    if !cls_runnable() then return
+
+    cls_prints(raw"""
+        main()
+            val k = 3
+
+            near(n: int) -> int
+            near(0) = k
+            near(n) = n + k
+
+            plain(n: int) -> int
+            plain(0) = 100
+            plain(_) = 200
+
+            print(near(0), near(5), plain(0), plain(1))
+        """, "3 8 100 200\n")
+
+@test("clauses recurse, and call each other")
+cls_recursion()
+    if !cls_runnable() then return
+
+    cls_prints(raw"""
+        fact(n: int) -> int
+        fact(0) = 1
+        fact(n) = n * fact(n - 1)
+
+        is_even(n: int) -> bool
+        is_even(0) = true
+        is_even(n) = is_odd(n - 1)
+
+        is_odd(n: int) -> bool
+        is_odd(0) = false
+        is_odd(n) = is_even(n - 1)
+
+        main()
+            print(fact(5), is_even(10), is_odd(7), is_even(3))
+        """, "120 true true false\n")
+
+// The self call in the last clause is in tail position, so it is the jump back to the top of the
+// function: no call of the function is left in its own body, and three million turns take no stack.
+@test("a self call in tail position in a clause stays a jump")
+cls_tail_call()
+    if !cls_runnable() then return
+
+    val program = raw"""
+        count(n: int, acc: int) -> int
+        count(0, acc) = acc
+        count(n, acc) = count(n - 1, acc + 1)
+
+        main()
+            print(count(3000000, 0))
+        """
+    val ir = cls_report(program)
+    val at = ir.index_of("define i32 @count$$sysl(")
+
+    assert(at.is_some(), s"expected count's definition, got: $ir")
+
+    val body = ir[at.unwrap()..<ir.len]
+    val end_at = body.index_of("\n}\n").unwrap_or(body.len)
+    val own = body[0..<end_at]
+
+    assert(own.index_of("tailrec").is_some(), s"expected the jump back, got: $own")
+    assert(own.index_of("call i32 @count$$sysl").is_none(), s"expected no self call, got: $own")
+    cls_prints(program, "3000000\n")
+
+// `match` takes a `&T` apart only as what it holds (`*t match`), so a clause's patterns on a `&T`
+// parameter are read against what it holds -- in place, with no copy of the referent. A name that
+// only binds the parameter binds the reference.
+@test("a '&T' parameter is taken apart as what it holds")
+cls_reference_parameter()
+    if !cls_runnable() then return
+
+    cls_prints(raw"""
+        enum Tree
+            Leaf
+            Node(left: &Tree, v: int, right: &Tree)
+
+        sum(t: &Tree) -> int
+        sum(Leaf) = 0
+        sum(Node(l, v, r)) = sum(l) + v + sum(r)
+
+        main()
+            print(sum(Node(Node(Leaf, 1, Leaf), 2, Node(Leaf, 3, Leaf))))
+        """, "6\n")
+
+@test("a 'Drop' value held by a '&T' argument is dropped once, and nothing leaks")
+cls_drop_argument()
+    if !cls_runnable() then return
+
+    cls_prints(raw"""
+        struct Res
+            id: int
+
+        impl Drop for Res
+            drop(self) = print("drop", self.id)
+
+        enum Msg
+            Quit
+            Hold(r: &Res)
+
+        look(m: &Msg, n: int) -> int
+        look(Quit, _) = 0
+        look(Hold(r), 0) = r.id
+        look(Hold(r), n) | n > 5 = r.id * 100
+        look(Hold(_), n) = n
+
+        own(r: &Res, k: int) -> int
+        own(r, 0) = r.id
+        own(other, k) = other.id + k
+
+        main()
+            val m = Hold(Res(7))
+            print(look(m, 0), look(m, 9), look(m, 2), look(Quit, 1))
+            val r = Res(3)
+            print(own(r, 0), own(r, 4))
+        """, "7 700 2 0\n3 7\ndrop 3\ndrop 7\n")
+
+@test("a parameter with a default is matched like any other")
+cls_default_parameter()
+    if !cls_runnable() then return
+
+    cls_prints(raw"""
+        add(a: int, b: int = 10) -> int
+        add(0, b) = b
+        add(a, b) = a + b
+
+        main()
+            print(add(0), add(1), add(1, 2))
+        """, "10 11 3\n")
+
+@test("a body under a clause may be an indented block")
+cls_block_body()
+    if !cls_runnable() then return
+
+    cls_prints(raw"""
+        steps(n: int) -> int
+        steps(0) = 0
+        steps(n) =
+            val half = n / 2
+            1 + steps(half)
+
+        main()
+            print(steps(8))
+        """, "4\n")
+
+// == every refusal ==================================================================================
+
+@test("clauses that leave an argument list unmatched are refused, naming it as a call")
+cls_not_exhaustive()
+    if !cls_runnable() then return
+
+    cls_refused(cls_shape() + raw"""
+        area(s: Shape) -> int
+        area(Circle(r)) = r
+
+        main()
+            print(area(Circle(1)))
+        """, "clauses of 'area' do not cover area(Rect) — add a clause for it, or end with one that " +
+             "matches every argument", "5:1")
+    cls_refused(raw"""
+        both(a: bool, b: bool) -> int
+        both(true, _) = 1
+        both(false, true) = 2
+
+        main()
+            print(both(true, true))
+        """, "clauses of 'both' do not cover both(false, false) — add a clause for it, or end with " +
+             "one that matches every argument", "1:1")
+
+@test("a guarded clause covers nothing, so guards alone leave a gap")
+cls_guards_cover_nothing()
+    if !cls_runnable() then return
+
+    cls_refused(raw"""
+        f(n: int) -> int
+        f(n) | n > 0 = 1
+
+        main()
+            print(f(1))
+        """, "clauses of 'f' do not cover f(_) — add a clause for it, or end with one that matches " +
+             "every argument", "1:1")
+
+@test("a clause the clauses above it already match is refused")
+cls_unreachable_clause()
+    if !cls_runnable() then return
+
+    cls_refused(raw"""
+        f(n: int) -> int
+        f(_) = 1
+        f(0) = 2
+
+        main()
+            print(f(0))
+        """, "unreachable clause 'f(0)': every argument list it matches is already matched by the " +
+             "clause on line 2", "3:1")
+    cls_refused(raw"""
+        g(a: bool, b: bool) -> int
+        g(true, _) = 1
+        g(_, true) = 2
+        g(true, true) = 3
+        g(_, _) = 4
+
+        main()
+            print(g(true, true))
+        """, "unreachable clause 'g(true, true)': every argument list it matches is already " +
+             "matched by the clause on line 3", "4:1")
+    cls_refused(raw"""
+        h(a: bool, b: bool) -> int
+        h(true, _) = 1
+        h(false, _) = 2
+        h(_, true) = 3
+
+        main()
+            print(h(true, true))
+        """, "unreachable clause 'h(_, true)': every argument list it matches is already " +
+             "matched by the clauses on lines 2 and 3", "4:1")
+
+@test("a guard after '| _' is refused")
+cls_guard_after_wildcard_guard()
+    if !cls_runnable() then return
+
+    cls_refused(raw"""
+        f(n: int) -> int
+        f(n)
+            | _ = 1
+            | n > 0 = 2
+
+        main()
+            print(f(0))
+        """, "this guard is never tried: the '| _' above it always holds", "4:5")
+
+@test("a clause with the wrong number of patterns is refused")
+cls_wrong_arity()
+    if !cls_runnable() then return
+
+    cls_refused(raw"""
+        f(n: int, m: int) -> int
+        f(0) = 2
+        f(_, _) = 1
+
+        main()
+            print(f(0, 1))
+        """, "this clause has 1 pattern and the signature 2 parameters to match — a clause takes " +
+             "one pattern for each parameter but 'self'", "2:1")
+
+@test("a clause named for another function than its signature is refused once")
+cls_misnamed_clause()
+    if !cls_runnable() then return
+
+    val misnamed = "this clause names 'aera', and the signature above it is 'area''s — a clause is " +
+                   "written with its function's own name"
+
+    cls_refused(raw"""
+        area(n: int) -> int
+        aera(0) = 2
+        aera(_) = 1
+
+        main()
+            print(area(0))
+        """, misnamed, "2:1")
+    cls_refused(raw"""
+        area(n: int) -> int
+        area(0) = 2
+        aera(_) = 1
+
+        main()
+            print(area(0))
+        """, misnamed, "3:1")
+
+    val out = cls_report("area(n: int) -> int\naera(0) = 2\naera(_) = 1\n\nmain()\n    print(area(0))\n")
+
+    assert(out.count_of("error:") == 1, s"expected the one refusal, got: $out")
+
+@test("a clause with no signature above it is refused")
+cls_clause_without_signature()
+    if !cls_runnable() then return
+
+    cls_refused(raw"""
+        g(0) = 1
+
+        main()
+            print(g(0))
+        """, "this is a clause of 'g', and a clause follows its function's signature — write " +
+             "'g(…: T) -> R' on the line above, with no body, and the clauses under it", "1:1")
+
+@test("a type written in a clause's pattern is refused")
+cls_type_in_pattern()
+    if !cls_runnable() then return
+
+    cls_refused(raw"""
+        f(n: int) -> int
+        f(n: int) = 1
+
+        main()
+            print(f(0))
+        """, "a clause's pattern is written without a type — the signature above gives every " +
+             "parameter its type", "2:4")
+
+@test("a second guard after a one-line guard is refused, on the next line or indented under it")
+cls_stray_guard_line()
+    if !cls_runnable() then return
+
+    val stray = "a clause with its guard on its own line has that one guard — write the guards in an " +
+                "indented block under the clause, one '| condition = body' a line"
+
+    cls_refused(raw"""
+        f(n: int) -> int
+        f(n) | n > 0 = 1
+        | _ = 2
+
+        main()
+            print(f(0))
+        """, stray, "3:1")
+    cls_refused(raw"""
+        f(n: int) -> int
+        f(n) | n > 0 = 1
+            | _ = 2
+
+        main()
+            print(f(0))
+        """, stray, "3:5")
+
+@test("a signature with no clauses under it is still a function missing its body")
+cls_bodiless_signature_unchanged()
+    if !cls_runnable() then return
+
+    cls_refused(raw"""
+        h(x: int) -> int
+
+        main()
+            print(h(0))
+        """, "indent expected", "3:1")

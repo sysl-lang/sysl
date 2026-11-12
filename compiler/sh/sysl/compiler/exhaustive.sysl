@@ -119,6 +119,42 @@ coverage_gap(scrut: Type, arms: Buf[TArm], m: FoldMachine) -> Option[Gap]
     Some(Gap(names, exact))
 end coverage_gap
 
+// The gap in a function's clauses: the argument lists no clause matches, each written as a call of
+// `name`, or none where the clauses cover every one. A row is one way a covering clause matches --
+// a pattern per parameter, one alternative of each -- and a column is a parameter, so this is the
+// `match` question with a column per parameter rather than one scrutinee.
+clauses_gap(name: string, tys: Buf[Type], rows: Buf[Buf[TPattern]], m: FoldMachine) -> Option[Gap]
+    if covers(rows, tys, 0, m) then return None
+
+    val ws = witnesses(rows, tys, 0, WitnessLimit + 1, m)
+
+    if ws.is_empty() then return None
+
+    var names: Buf[string] = buf()
+    var exact = true
+
+    for item in ws
+        var text = name + "("
+
+        for k in 0..<item.len()
+            if k > 0 then text = text + ", "
+
+            text = text + wit_show(item[k])
+
+            if !wit_exact(item[k]) then exact = false
+
+        text = text + ")"
+
+        if !holds_name(names, text) && names.len() <= WitnessLimit then names.push(text)
+
+    Some(Gap(names, exact))
+end clauses_gap
+
+// Whether some argument list matches the row `q` and none of `rows`: a clause none of whose rows is
+// useful against the covering clauses above it can never run.
+clause_row_useful(rows: Buf[Buf[TPattern]], q: Buf[TPattern], tys: Buf[Type], m: FoldMachine) -> bool =
+    useful(rows, q, tys, 0, m)
+
 private holds_name(names: Buf[string], text: string) -> bool
     for item in names
         if item == text then return true

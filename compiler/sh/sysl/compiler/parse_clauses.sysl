@@ -1,0 +1,394 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// A function given by clauses: its signature on a line with no body, then one clause per line, the
+// function's name applied to a pattern per parameter and followed by `= body` or by guards.
+//
+//     classify(n: int) -> string
+//     classify(0) = "zero"
+//     classify(n)
+//         | n < 0 = "negative"
+//         | _ = "positive"
+//
+// **A bodiless signature owns the lines under it that read as its clauses, and nothing else.** A
+// line is one when it opens with the signature's own name and a bracketed list, and goes on with a
+// `=`, a `|`, or an indented block of `|` lines. A signature followed by no such line means what it
+// meant before: a trait's requirement, or a function missing its body.
+
+// Whether the clauses of `name` begin on the line after the signature that ends here. In a trait's
+// member list (`in_trait`) a list opening on `name:` is another signature, an overload, rather than a
+// clause.
+clauses_ahead(p: *Parser, name: string, in_trait: bool) -> bool =
+    p.at(Newline) && clause_head_at(p, 1, name, in_trait)
+
+// The body of a function whose signature has just been read: its clauses where they follow it, and
+// otherwise whatever `parse_func_body` reads. `params` are the names the clauses take apart.
+func_body_or_clauses(p: *Parser, name: string, sig: Span, params: Buf[string],
+                     in_trait: bool) -> Buf[Stmt]
+    if !p.at_kw("=") && !p.block_ahead()
+        if clauses_ahead(p, name, in_trait) then return parse_clauses(p, name, sig, params, in_trait)
+
+        // A clause under the signature that names another function is a misspelt clause: the
+        // signature has none, and the line would otherwise be read as a declaration of its own.
+        if p.at(Newline) && misnamed_clause_at(p, 1, name)
+            p.bump()
+            refuse_misnamed(p, name)
+            return buf()
+        end if
+    end if
+
+    parse_func_body(p)
+end func_body_or_clauses
+
+// The names a signature's parameters are read by, which are what its clauses take apart.
+clause_params(params: Buf[Param]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for item in params
+        out.push(item.name)
+
+    out
+end clause_params
+
+// Whether a clause of `name` begins `k` tokens on.
+private clause_head_at(p: *Parser, k: usize, name: string, in_trait: bool) -> bool
+    if !names_this(p.peek_at(k), name) || !p.kw_at(k + 1, "(") then return false
+    if in_trait && typed_list_at(p, k + 1) then return false
+
+    val i = past_bracket(p, k + 1)
+
+    i != 0 && clause_rest_at(p, i)
+end clause_head_at
+
+// Whether what follows a clause's bracketed list is a clause's: `=`, a one-line guard, or a block of
+// guards.
+private clause_rest_at(p: *Parser, i: usize) -> bool
+    if p.kw_at(i, "=") || p.kw_at(i, "|") then return true
+
+    p.peek_at(i) == Newline && p.peek_at(i + 1) == Indent && p.kw_at(i + 2, "|")
+end clause_rest_at
+
+// Whether a clause-shaped line opening on some OTHER name than `name` begins `k` tokens on -- one whose
+// list is patterns rather than a signature's `name: type`s.
+private misnamed_clause_at(p: *Parser, k: usize, name: string) -> bool
+    val other = p.peek_at(k) match
+        Ident(n) -> n != name
+        QuotedIdent(n) -> n != name
+        _ -> false
+
+    if !other || !p.kw_at(k + 1, "(") || typed_list_at(p, k + 1) then return false
+
+    val i = past_bracket(p, k + 1)
+
+    i != 0 && clause_rest_at(p, i)
+end misnamed_clause_at
+
+private names_this(t: Tok, name: string) -> bool = t match
+    Ident(n) -> n == name
+    QuotedIdent(n) -> n == name
+    _ -> false
+
+// Whether the list opening at `k` begins `name:`, as a signature's does.
+private typed_list_at(p: *Parser, k: usize) -> bool = p.peek_at(k + 1) match
+    Ident(_) -> p.kw_at(k + 2, ":")
+    QuotedIdent(_) -> p.kw_at(k + 2, ":")
+    _ -> false
+
+// A clause with no signature above it: a name and a list whose first element can only be a pattern
+// -- a literal, `_`, a variant taking arguments, a struct, a tuple -- followed by a clause's `=` or
+// guard. Asked where a declaration would begin, so the line is refused for what it is rather than
+// for the parameter it does not have.
+stray_clause_at(p: *Parser) -> bool
+    val named = p.peek() match
+        Ident(_) -> true
+        QuotedIdent(_) -> true
+        _ -> false
+
+    if !named || !p.kw_at(1, "(") then return false
+
+    val first = p.peek_at(2) match
+        IntLit(_, _, _) -> true
+        FloatLit(_, _) -> true
+        CharLit(_) -> true
+        StrLit(_) -> true
+        Keyword(k) -> k == "-" || k == "(" || k == "true" || k == "false"
+        Ident(n) -> n == "_" || p.kw_at(3, "(") || p.kw_at(3, "{")
+        _ -> false
+
+    if !first then return false
+
+    val i = past_bracket(p, 1)
+
+    i != 0 && (p.kw_at(i, "=") || p.kw_at(i, "|"))
+end stray_clause_at
+
+// The stray clause `stray_clause_at` found, refused and stepped over.
+refuse_stray_clause(p: *Parser, start: Span) -> Stmt
+    val name = p.peek() match
+        Ident(n) -> n
+        QuotedIdent(n) -> n
+        _ -> ""
+
+    p.fault(p.here(), s"this is a clause of '$name', and a clause follows its function's signature " +
+            s"— write '$name(…: T) -> R' on the line above, with no body, and the clauses under it")
+    skip_line(p)
+    stmt(start.to(p.just_taken()), Bad)
+end refuse_stray_clause
+
+// A clause under the signature of `name` that names another function, refused and read as a clause
+// so the lines after it are not complained about a second time. The cursor is at its name.
+private refuse_misnamed(p: *Parser, name: string)
+    val other = p.peek() match
+        Ident(n) -> n
+        QuotedIdent(n) -> n
+        _ -> ""
+
+    p.fault(p.here(), s"this clause names '$other', and the signature above it is '$name''s — a " +
+            "clause is written with its function's own name")
+    parse_clause(p, -1)
+
+    // The same misspelling on the lines after it is the same mistake, told once.
+    loop
+        if p.at(Newline) && clause_head_at(p, 1, other, false) then p.bump()
+        else if !(p.prev() == Dedent && clause_head_at(p, 0, other, false)) then break
+
+        parse_clause(p, -1)
+end refuse_misnamed
+
+// The clauses of `name`, read up to the first line that is not one of them, as the body they make:
+// one statement holding the `ClausesExpr`.
+private parse_clauses(p: *Parser, name: string, sig: Span, params: Buf[string],
+                      in_trait: bool) -> Buf[Stmt]
+    var clauses: Buf[Clause] = buf()
+
+    loop
+        if p.at(Newline) && clause_head_at(p, 1, name, in_trait) then p.bump()
+        else if !(p.prev() == Dedent && clause_head_at(p, 0, name, in_trait)) then break
+
+        clauses.push(parse_clause(p, int(params.len())))
+
+    // A misspelt clause among them is refused, and the ones after it are still read as this
+    // function's.
+    loop
+        if !(p.at(Newline) && misnamed_clause_at(p, 1, name)) then break
+
+        p.bump()
+        refuse_misnamed(p, name)
+
+        loop
+            if p.at(Newline) && clause_head_at(p, 1, name, in_trait) then p.bump()
+            else if !(p.prev() == Dedent && clause_head_at(p, 0, name, in_trait)) then break
+
+            clauses.push(parse_clause(p, int(params.len())))
+
+    val span = sig.to(p.just_taken())
+    val group = ClauseGroup(name, sig, params, clauses)
+    val whole = expr(span, ClausesExpr(group, plain_chain(span, params, clauses)))
+    var out: Buf[Stmt] = buf()
+
+    out.push(stmt(span, ExprStmt(whole)))
+    out
+end parse_clauses
+
+// One clause, the cursor at its name. `arity` is how many patterns the signature asks for, or `-1`
+// where the clause is read only to be stepped over.
+private parse_clause(p: *Parser, arity: int) -> Clause
+    val start = p.here()
+
+    p.bump()
+    p.expect_kw("(")
+
+    var pats: Buf[Buf[Pattern]] = buf()
+
+    if !p.at_kw(")")
+        loop
+            pats.push(clause_pattern(p))
+
+            if !p.accept_kw(",") then break
+            if p.at_kw(")") then break
+
+    p.expect_kw(")")
+
+    val head = start.to(p.just_taken())
+    val said = int(pats.len())
+
+    if arity >= 0 && said != arity
+        p.fault(head, s"this clause has ${counted(said, "pattern")} and the signature " +
+                s"${counted(arity, "parameter")} to match — a clause takes one pattern for each " +
+                "parameter but 'self'")
+
+    var bodies: Buf[ClauseBody] = buf()
+
+    if p.at_kw("=")
+        val at = p.here()
+        val body = parse_func_body(p)
+
+        bodies.push(ClauseBody(at.to(p.just_taken()), None, body))
+    else if p.at_kw("|")
+        bodies.push(parse_guarded(p))
+
+        // **A guard on the clause's own line is its only one.** A second, on the line below, would
+        // read as a continuation nothing marks; the guards that go on are an indented block under
+        // the clause, as avin has them.
+        loop
+            val indented = p.at(Newline) && p.peek_at(1) == Indent && p.kw_at(2, "|")
+
+            if !(p.at(Newline) && p.kw_at(1, "|")) && !indented then break
+
+            if indented
+                for b in parse_guard_block(p, true)
+                    bodies.push(b)
+            else
+                p.bump()
+                refuse_second_guard(p)
+                bodies.push(parse_guarded(p))
+            end if
+    else
+        bodies = parse_guard_block(p)
+    end if
+
+    Clause(start.to(p.just_taken()), head, pats, bodies)
+end parse_clause
+
+private counted(n: int, what: string) -> string = if n == 1 then s"1 $what" else s"$n ${what}s"
+
+// One parameter's pattern, with the `|`-alternatives written at its top level. A type written after
+// it is refused: the signature gives every parameter its type.
+private clause_pattern(p: *Parser) -> Buf[Pattern]
+    var alts = parse_pattern_alts(p)
+
+    while p.accept_kw("|")
+        for item in parse_pattern_alts(p)
+            alts.push(item)
+
+    if p.at_kw(":")
+        val at = p.here()
+
+        p.bump()
+        parse_type(p)
+        p.fault(at.to(p.just_taken()), "a clause's pattern is written without a type — the " +
+                "signature above gives every parameter its type")
+    end if
+
+    alts
+end clause_pattern
+
+// `| condition = body`, or `| _ = body`, whose guard always holds.
+private parse_guarded(p: *Parser) -> ClauseBody
+    val start = p.here()
+
+    p.expect_kw("|")
+
+    var guard: Option[Expr] = None
+
+    if p.at_wildcard() && p.kw_at(1, "=") then p.bump()
+    else guard = Some(parse_guard_expr(p))
+
+    if !p.at_kw("=")
+        p.want("'='")
+        return ClauseBody(start.to(p.just_taken()), guard, buf())
+    end if
+
+    val body = parse_func_body(p)
+
+    ClauseBody(start.to(p.just_taken()), guard, body)
+end parse_guarded
+
+private refuse_second_guard(p: *Parser)
+    p.fault(p.here(), "a clause with its guard on its own line has that one guard — write the " +
+            "guards in an indented block under the clause, one '| condition = body' a line")
+
+// The indented block of guards under a clause, each a line of its own. `after_one` is a block under
+// a clause that already had its guard on its own line, which is refused at its first line.
+private parse_guard_block(p: *Parser, after_one: bool = false) -> Buf[ClauseBody]
+    var out: Buf[ClauseBody] = buf()
+
+    if !p.accept(Newline)
+        p.want("'=' or '|'")
+        return out
+    end if
+
+    if !p.accept(Indent)
+        p.want("indent")
+        return out
+    end if
+
+    if after_one then refuse_second_guard(p)
+
+    p.skip_newlines()
+    p.depth += 1
+
+    val outer = p.nest
+
+    p.nest = 0
+
+    loop
+        if p.at(Dedent) || p.at(Eof) then break
+
+        if !p.at_kw("|")
+            p.want("'|'")
+            skip_line(p)
+            p.skip_newlines()
+            continue
+        end if
+
+        out.push(parse_guarded(p))
+
+        if !p.end_of_statement() then drop_line(p)
+
+        p.skip_newlines()
+
+    p.nest = outer
+    p.depth -= 1
+
+    if !p.accept(Dedent) then p.want("dedent")
+
+    out
+end parse_guard_block
+
+// The clauses spelled as the `if` chain of `is` tests they mean, for the passes that only walk a
+// body's names and sub-expressions (`ClausesExpr`). A parameter whose pattern is `_` is not tested.
+private plain_chain(span: Span, params: Buf[string], clauses: Buf[Clause]) -> Expr
+    var arms: Buf[(Expr, Buf[Stmt])] = buf()
+
+    for c in clauses
+        for b in c.bodies
+            var cond: Option[Expr] = None
+
+            for i in 0..<c.patterns.len()
+                if i >= params.len() || only_wild(c.patterns[i]) then continue
+
+                val subject = expr(c.head, Ident(params[i]))
+                val test = expr(c.head, IsPattern(subject, c.patterns[i], false))
+
+                cond = Some(both(cond, test))
+
+            if b.guard.is_some() then cond = Some(both(cond, b.guard.unwrap()))
+
+            arms.push((cond.unwrap_or(expr(c.head, BoolLit(true))), b.body))
+
+    if arms.is_empty() then return expr(span, Block(buf()))
+
+    var chain: Option[Buf[Stmt]] = None
+    var made = expr(span, Bad)
+    var k = arms.len()
+
+    while k > 0
+        k -= 1
+        made = expr(span, IfExpr(arms[k].0, arms[k].1, chain, k > 0))
+
+        var one: Buf[Stmt] = buf()
+
+        one.push(stmt(span, ExprStmt(made)))
+        chain = Some(one)
+
+    made
+end plain_chain
+
+private both(left: Option[Expr], right: Expr) -> Expr = left match
+    Some(l) -> expr(l.span.to(right.span), Binary("&&", l, right))
+    None -> right
+
+private only_wild(alts: Buf[Pattern]) -> bool = alts.len() == 1 && *alts[0].kind is WildcardPattern

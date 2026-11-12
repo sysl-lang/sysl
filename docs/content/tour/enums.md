@@ -128,6 +128,29 @@ match on 'Shape' is not exhaustive; missing Rect (add an 'else' arm)
 This is the main benefit of a closed set of variants: when you add a variant, every `match` on the
 enum that does not handle it is reported at compile time, instead of failing at run time.
 
+A function that is one `match` over its parameters may be written as **clauses** instead: the
+signature with no body, then one line per case, the patterns standing where the arguments do. The
+clauses are tried in order and must cover every argument, as the arms of a `match` must
+([Clauses](/reference/declarations/#clauses)):
+
+```sysl
+enum Shape
+    Circle(radius: int)
+    Rect(w: int, h: int)
+    Empty
+
+area(s: Shape) -> int
+area(Circle(r)) = 3 * r * r
+area(Rect(w, h)) = w * h
+area(Empty) = 0
+
+print(area(Circle(2)), area(Rect(3, 4)), area(Empty))
+```
+
+```output
+12 12 0
+```
+
 Coverage is about which *values* are handled, not which tags appear, and the arms are considered
 together. `Some(Circle(r))`, `Some(Rect(w, h))` and `None` cover an `Option[Shape]` between them,
 although no single arm covers `Some` on its own. `Some(0)` alone does not cover `Some`, because a
