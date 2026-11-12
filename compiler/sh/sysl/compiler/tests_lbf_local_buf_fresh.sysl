@@ -1,0 +1,205 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A view of a local buffer that no other name can reach (`checks.sysl`'s `confined_local`) is not
+// refused at a call that is not handed the buffer. The local is one only it can name where it was
+// made by a call that cannot have kept another handle to what it answers (`fresh_in`), and that
+// question asks what the maker can run (`Reacher`).
+//
+// **A destructor is part of what a call can run only where something it runs can let go of a value
+// that may run one** (`Untouched.releases`). Every destructor in the program used to be taken as run
+// by every call, so one destructor calling through a pointer made every maker able to run anything,
+// no local was fresh, and every call writing any `Buf[u8]` was refused while a view of a local
+// `Buf[u8]` was held -- benchtop's `var disk = fat.ram_device(storage.view_mut())`, where
+// `fat.format`, `fs.write_bytes` and `fs.read_bytes` were all refused.
+//
+// The axes: how the callee could get the buffer (not at all; handed it by pointer; through a struct
+// it was stored in; through module storage it was stored in; through a closure that captured it),
+// where the view's buffer comes from (a fresh local; a parameter; a maker that kept a handle; a maker
+// that lets go of a value with a destructor), and where the call is made (straight-line, in a loop).
+
+private lbf_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end lbf_ready
+
+private lbf_root(text: string) -> string
+    val root = make_temp_dir("sysl-local-buf-fresh").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+
+// What a program printed, or what the compiler said instead.
+private lbf_ran(text: string) -> string
+    val root = lbf_root(text)
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text + out.err.unwrap_or("")
+end lbf_ran
+
+private lbf_said(text: string) -> string
+    val root = lbf_root(text)
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+
+private lbf_clean(text: string)
+    val out = lbf_said(text)
+
+    assert(!out.contains("error"), s"expected no complaint, got: $out")
+
+// Refused for the view `disk` of the buffer `root`, naming the callee.
+private lbf_refused(text: string, root: string, callee: string)
+    val out = lbf_said(text)
+
+    assert(out.contains(s"'disk' is a view borrowed from '$root'"), s"expected the refusal in: $out")
+    assert(out.contains(s"'$callee' may write a 'Buf["), s"expected '$callee' named in: $out")
+
+// The program around a test: a destructor that calls through a pointer, held while `main` runs, and
+// module storage holding a `Buf[u8]` that `grow` writes. Either alone makes the by-type answer give up.
+private const LbfHead: string =
+    "import sysl.buf.{Buf, buf, buf_filled}\n\n" +
+    "struct Disk\n    image: []u8\n\n" +
+    "struct Hook\n    f: *extern() -> unit\n\n" +
+    "impl Drop for Hook\n    drop(self)\n        self.f()\n\n" +
+    "var kept: Buf[u8] = buf()\n\n" +
+    "nothing() = ()\n\n" +
+    "blank() -> Buf[u8] = buf_filled(8, u8(0))\n\n" +
+    "grow() -> usize\n    kept.push(1)\n    kept.len()\n\n"
+
+private const LbfHook: string = "    val h: &Hook = Hook(&nothing)\n"
+
+// -- accepted ---------------------------------------------------------------------------------------
+
+@test("lbf: benchtop's shape: a fresh local's view in a struct, and a call writing another Buf[u8]")
+lbf_benchtop_shape()
+    if !lbf_ready() then return
+
+    val text = LbfHead +
+               "format(d: *Disk) -> usize\n    d.image[0] = 7\n    grow()\n\n" +
+               "main()\n" + LbfHook +
+               "    var storage = blank()\n    var disk = Disk(storage.view_mut())\n\n" +
+               "    val a = format(&disk)\n    val b = grow()\n\n" +
+               "    print(a, b, disk.image[0], storage[0], storage.len())\n"
+
+    lbf_clean(text)
+    assert_eq(lbf_ran(text), "1 2 7 7 8\n")
+
+@test("lbf: a callee allocating and growing its own Buf[u8] is accepted, straight-line and in a loop")
+lbf_callee_own_buffer()
+    if !lbf_ready() then return
+
+    val own = "fresh() -> usize\n    var b: Buf[u8] = buf()\n\n    b.push(1)\n    b.push(2)\n    b.len()\n\n"
+
+    lbf_clean(LbfHead + own + "main()\n" + LbfHook +
+              "    var storage = blank()\n    var disk = Disk(storage.view_mut())\n\n" +
+              "    print(fresh(), disk.image.len)\n")
+
+    val text = LbfHead + own + "main()\n" + LbfHook +
+               "    var storage = blank()\n    var disk = Disk(storage.view_mut())\n    var n: usize = 0\n\n" +
+               "    for i in 0..<3\n        n += fresh() + grow()\n        disk.image[i] = u8(i)\n\n" +
+               "    print(n, storage[2], kept.len())\n"
+
+    lbf_clean(text)
+    assert_eq(lbf_ran(text), "12 2 3\n")
+
+// -- still refused ----------------------------------------------------------------------------------
+
+@test("lbf: a callee handed the buffer by pointer is refused, straight-line and in a loop")
+lbf_handle_passed_refused()
+    if !lbf_ready() then return
+
+    val reset = "reset(b: *Buf[u8])\n    b.push(1)\n\n"
+
+    lbf_refused(LbfHead + reset + "main()\n" + LbfHook +
+                "    var storage = blank()\n    var disk = Disk(storage.view_mut())\n\n" +
+                "    reset(&storage)\n    print(disk.image.len)\n", "storage", "reset")
+
+    lbf_refused(LbfHead + reset + "main()\n" + LbfHook +
+                "    var storage = blank()\n    var disk = Disk(storage.view_mut())\n\n" +
+                "    for _ in 0..<2\n        reset(&storage)\n\n    print(disk.image.len)\n", "storage", "reset")
+
+@test("lbf: a buffer stored in a struct handed to the callee is refused")
+lbf_handle_in_struct_refused()
+    if !lbf_ready() then return
+
+    lbf_refused(LbfHead + "struct Holder\n    b: Buf[u8]\n\nbump(h: &Holder)\n    h.b.push(1)\n\n" +
+                "main()\n" + LbfHook +
+                "    var storage = blank()\n    val h: &Holder = Holder(storage)\n" +
+                "    var disk = Disk(storage.view_mut())\n\n    bump(h)\n    print(disk.image.len)\n",
+                "storage", "bump")
+
+@test("lbf: a buffer stored in module storage is refused at a call that writes it there")
+lbf_handle_in_module_var_refused()
+    if !lbf_ready() then return
+
+    lbf_refused(LbfHead + "main()\n" + LbfHook +
+                "    var storage = blank()\n\n    kept = storage\n" +
+                "    var disk = Disk(storage.view_mut())\n\n    print(grow(), disk.image.len)\n",
+                "storage", "grow")
+
+@test("lbf: a view of a parameter's buffer is refused at a call writing a Buf[u8]: the caller's may be it")
+lbf_parameter_refused()
+    if !lbf_ready() then return
+
+    lbf_refused(LbfHead + "run(storage: *Buf[u8]) -> usize\n" +
+                "    var disk = Disk(storage.view_mut())\n\n    grow() + disk.image.len\n\n" +
+                "main()\n" + LbfHook + "    print(run(&kept))\n", "storage", "grow")
+
+@test("lbf: a closure that replaces the captured buffer is refused where it is called")
+lbf_closure_refused()
+    if !lbf_ready() then return
+
+    val out = lbf_said(LbfHead + "main()\n" + LbfHook +
+                       "    var storage = blank()\n    val replace = () -> storage = buf()\n" +
+                       "    var disk = Disk(storage.view_mut())\n\n    replace()\n    print(disk.image.len)\n")
+
+    assert(out.contains("'disk' is a view borrowed from 'storage'"), s"expected the refusal in: $out")
+
+@test("lbf: a buffer from a maker that kept a handle to it is refused at a call that writes it there")
+lbf_maker_kept_refused()
+    if !lbf_ready() then return
+
+    lbf_refused(LbfHead + "stash() -> Buf[u8]\n    val b = buf_filled(8, u8(0))\n\n    kept = b\n    b\n\n" +
+                "main()\n" + LbfHook +
+                "    var storage = stash()\n    var disk = Disk(storage.view_mut())\n\n" +
+                "    print(grow(), disk.image.len)\n", "storage", "grow")
+
+// A maker that lets go of a value whose destructor calls through a pointer may run anything before
+// it answers, so what it answers is not known to be the local's alone.
+@test("lbf: a buffer from a maker that lets go of a value with a destructor is still asked by type")
+lbf_maker_releases_refused()
+    if !lbf_ready() then return
+
+    lbf_refused(LbfHead + "made() -> Buf[u8]\n    val g: &Hook = Hook(&nothing)\n\n    buf_filled(8, u8(0))\n\n" +
+                "main()\n" + LbfHook +
+                "    var storage = made()\n    var disk = Disk(storage.view_mut())\n\n" +
+                "    print(grow(), disk.image.len)\n", "storage", "grow")

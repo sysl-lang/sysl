@@ -1,7 +1,7 @@
 module sh.sysl.compiler
 @tests
 
-import sysl.text.Search
+import sysl.text.{Search, Text}
 import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
 import sysl.process.capture
 
@@ -149,13 +149,30 @@ vmw_regions_reached_write_refused()
                 "and 'fill' may write a 'Buf[byte]'")
 end vmw_regions_reached_write_refused
 
+// The callee reads module storage holding a `Buf[u8]`, so it can get hold of one, and writes only the
+// viewed bytes: an array of regions lends `byte`s, so that write is no write of a buffer; a struct
+// holding views of two element types lends nothing it can name, so every write is asked about.
+// (A callee that can get hold of no `Buf[u8]` at all is cleared either way: the program's destructor
+// is no part of what it runs, since it lets go of nothing that may run one.)
+@test("vmw: a callee reading a module Buf[u8] and writing the viewed bytes is cleared for regions")
+vmw_regions_reading_keep_cleared()
+    if !vmw_ready() then return
+
+    val out = vmw_ran(VmwOpen + VmwRegion.replace_all("    0\n", "    int(keep.len())\n") +
+                      "run(b: *Board) -> int\n    var regions = [Region(0, b.sram.view_mut())]\n" +
+                      "    val k = fill(regions[..])\n    regions[0].mem[1] = 1\n    k\n\n" +
+                      VmwMain + "print(run(&x), x.sram[0], x.sram[1], \"ab\".bytes.len)\n")
+
+    assert_eq(out, "0 9 1 2\n")
+end vmw_regions_reading_keep_cleared
+
 @test("vmw: a struct holding views of two element types is asked about every write, as before")
 vmw_two_view_types_refused()
     if !vmw_ready() then return
 
     vmw_refused(VmwOpen +
                 "struct Pair\n    bytes: []u8\n    words: []u16\n\n" +
-                "fill(ps: []Pair) -> int\n    ps[0].bytes[0] = 9\n    0\n\n" +
+                "fill(ps: []Pair) -> int\n    ps[0].bytes[0] = 9\n    int(keep.len())\n\n" +
                 "run(b: *Board, w: []u16) -> int\n    var pairs = [Pair(b.sram.view_mut(), w)]\n" +
                 "    val k = fill(pairs[..])\n    pairs[0].bytes[1] = 1\n    k\n\n" +
                 VmwMain + "var ws: Buf[u16] = buf()\nws.push(0)\nprint(run(&x, ws.view_mut()), \"ab\".bytes.len)\n",

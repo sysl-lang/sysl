@@ -183,6 +183,7 @@ private struct Reach
     reads: Set[string]
     all_reads: bool
     all: bool
+    releases: bool
 
 // Each callee's `Reach`, worked out from the bodies' summary the first time a call to it is judged.
 // `answering` holds the same question asked only of the paths that come back (`answer_of`).
@@ -220,17 +221,24 @@ private struct Reacher
         out
     end answer_of
 
+    // **A destructor is reached only through a body that can let go of a value that may run one**
+    // (`Untouched.releases`): a callee holding no such value, and calling only bodies that hold none,
+    // runs no destructor, so what the program's destructors reach is no part of what it can run.
+    // Where one does, every destructor is reached, as is everything C can enter.
     walk(*self, a: &Analysis, u: *Untouched, name: string, ending: bool) -> Reach
-        var out = Reach(buf(), set(), false, false)
+        var out = Reach(buf(), set(), false, false, false)
         var seen: Set[string] = set()
         var todo: Buf[string] = buf()
 
         todo.push(name)
 
-        for item in self.drops
-            todo.push(item)
+        var called_c = self.gather(a, u, &todo, &seen, &out, ending)
 
-        val called_c = self.gather(a, u, &todo, &seen, &out, ending)
+        if (out.releases || called_c) && !out.all
+            for item in self.drops
+                todo.push(item)
+
+            if self.gather(a, u, &todo, &seen, &out, ending) then called_c = true
 
         // C may call back into whatever it can enter, and each of those may reach another foreign
         // function: the second walk's answer adds nothing, since every entry is already on it.
@@ -264,6 +272,8 @@ private struct Reacher
                     if u.opaque[i]
                         out.all = true
                         break
+
+                    if u.releases[i] then out.releases = true
 
                     for item in u.casts[i]
                         out.casts.push(item)
