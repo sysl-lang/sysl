@@ -1,0 +1,240 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A call made while a local holds a view of a buffer is refused where it may write a buffer of that
+// type (`reference/memory.md § A view borrowed from its receiver`, rule 4), and cleared where it cannot
+// (`checks.sysl`'s `ref_call`). Two program-wide facts used to refuse calls that write no buffer:
+//
+// - **a view held inside an aggregate** (`[Region(base, sram.view_mut())]`) was asked about every
+//   write, so a callee writing the viewed bytes through the `[]u8` it was handed was taken to write the
+//   `Buf[u8]` wherever the program cast a pointer to bytes anywhere (`.bytes` is one);
+// - **a path that ends the program** (`unwrap`'s report) was held to `quiet_callees`, which a program
+//   whose exported functions release anything fails, so every `unwrap` in a callee refused it.
+//
+// The axes: where the view is held (a slice local, an array of structs holding one view type, a struct
+// holding two view types), what makes the program-wide question open (a destructor calling through a
+// pointer, a `static` buffer, an exported function that releases), what the callee does (writes the
+// viewed bytes, `unwrap`s, writes a buffer of the type on a path that comes back or on one that ends
+// the program), and how the callee is named (a plain function, a generic's instance). Left out: a
+// `ref` instead of a view, which takes the same `ref_call` path with no `lent` and is covered by
+// `tests_vwb_view_borrow.sysl`'s neighbours.
+
+private vmw_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end vmw_ready
+
+private vmw_root(text: string) -> string
+    val root = make_temp_dir("sysl-view-may-write").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+
+// What a program printed, or what the compiler said instead.
+private vmw_ran(text: string) -> string
+    val root = vmw_root(text)
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text + out.err.unwrap_or("")
+end vmw_ran
+
+private vmw_said(text: string) -> string
+    val root = vmw_root(text)
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+
+private vmw_refused(text: string, part: string)
+    val out = vmw_said(text)
+
+    assert(out.contains(part), s"expected '$part' in: $out")
+
+// What opens the program-wide question: a destructor that calls through a pointer (so a callee's
+// reach is everything), and module storage holding a `Buf[u8]` (so everything reaches one).
+private const VmwOpen: string =
+    "import sysl.buf.{Buf, buf}\n\n" +
+    "struct Board\n    sram: Buf[u8]\n\n" +
+    "static var keep: Buf[u8] = buf()\n\n" +
+    "struct Hook\n    f: *extern() -> unit\n\n" +
+    "impl Drop for Hook\n    drop(self)\n        self.f()\n\n" +
+    "nothing() = ()\n\n"
+
+// The board made and the hook held, before `tail` runs.
+private const VmwMain: string =
+    "var x = Board(buf())\nx.sram.push(0)\nx.sram.push(0)\nval h: &Hook = Hook(&nothing)\n"
+
+// -- a view held inside an aggregate -----------------------------------------------------------------
+
+private const VmwRegion: string =
+    "struct Region\n    base: u64\n    mem: []u8\n\n" +
+    "fill(rs: []Region) -> int\n    rs[0].mem[0] = 9\n    0\n\n"
+
+@test("vmw: a callee writing the bytes an array of regions views is cleared while the regions are held")
+vmw_regions_cleared()
+    if !vmw_ready() then return
+
+    val out = vmw_ran(VmwOpen + VmwRegion +
+                      "run(b: *Board) -> int\n    var regions = [Region(0, b.sram.view_mut())]\n" +
+                      "    val k = fill(regions[..])\n    regions[0].mem[1] = 1\n    k\n\n" +
+                      VmwMain + "print(run(&x), x.sram[0], x.sram[1], \"ab\".bytes.len)\n")
+
+    assert_eq(out, "0 9 1 2\n")
+end vmw_regions_cleared
+
+@test("vmw: the same callee is cleared for a view held in a slice local")
+vmw_slice_local_cleared()
+    if !vmw_ready() then return
+
+    val out = vmw_ran(VmwOpen +
+                      "fill(v: []u8) -> int\n    v[0] = 9\n    0\n\n" +
+                      "run(b: *Board) -> int\n    var v = b.sram.view_mut()\n    val k = fill(v)\n" +
+                      "    v[1] = 1\n    k\n\n" +
+                      VmwMain + "print(run(&x), x.sram[0], x.sram[1], \"ab\".bytes.len)\n")
+
+    assert_eq(out, "0 9 1 2\n")
+end vmw_slice_local_cleared
+
+@test("vmw: a callee that writes a Buf[u8] is still refused while the regions are held")
+vmw_regions_real_write_refused()
+    if !vmw_ready() then return
+
+    vmw_refused(VmwOpen +
+                "struct Region\n    base: u64\n    mem: []u8\n\n" +
+                "fill(rs: []Region) -> int\n    rs[0].mem[0] = 9\n    keep = buf()\n    0\n\n" +
+                "run(b: *Board) -> int\n    var regions = [Region(0, b.sram.view_mut())]\n" +
+                "    val k = fill(regions[..])\n    regions[0].mem[1] = 1\n    k\n\n" +
+                VmwMain + "print(run(&x))\n",
+                "'regions' is a view borrowed from 'b', held in a 'Buf[byte]', and 'fill' may write a 'Buf[byte]'")
+end vmw_regions_real_write_refused
+
+@test("vmw: a callee reaching a write of a Buf[u8] through another body is still refused")
+vmw_regions_reached_write_refused()
+    if !vmw_ready() then return
+
+    vmw_refused(VmwOpen +
+                "struct Region\n    base: u64\n    mem: []u8\n\n" +
+                "forget() = keep = buf()\n\n" +
+                "fill(rs: []Region) -> int\n    rs[0].mem[0] = 9\n    forget()\n    0\n\n" +
+                "run(b: *Board) -> int\n    var regions = [Region(0, b.sram.view_mut())]\n" +
+                "    val k = fill(regions[..])\n    regions[0].mem[1] = 1\n    k\n\n" +
+                VmwMain + "print(run(&x))\n",
+                "and 'fill' may write a 'Buf[byte]'")
+end vmw_regions_reached_write_refused
+
+@test("vmw: a struct holding views of two element types is asked about every write, as before")
+vmw_two_view_types_refused()
+    if !vmw_ready() then return
+
+    vmw_refused(VmwOpen +
+                "struct Pair\n    bytes: []u8\n    words: []u16\n\n" +
+                "fill(ps: []Pair) -> int\n    ps[0].bytes[0] = 9\n    0\n\n" +
+                "run(b: *Board, w: []u16) -> int\n    var pairs = [Pair(b.sram.view_mut(), w)]\n" +
+                "    val k = fill(pairs[..])\n    pairs[0].bytes[1] = 1\n    k\n\n" +
+                VmwMain + "var ws: Buf[u16] = buf()\nws.push(0)\nprint(run(&x, ws.view_mut()), \"ab\".bytes.len)\n",
+                "and 'fill' may write a 'Buf[byte]'")
+end vmw_two_view_types_refused
+
+// -- a path that ends the program -----------------------------------------------------------------------
+
+// An exported function that releases what it held, so a foreign call may call back into code that
+// releases, and the program's foreign functions are not trusted on a path that ends it.
+private const VmwExport: string =
+    "@export(\"vmw_callback\")\ncallback()\n    var t: Buf[u8] = buf()\n    t.push(1)\n    keep = t\n\n" +
+    "pick(n: usize) -> Option[usize] = if n > 0 then Some(n - 1) else None\n\n"
+
+@test("vmw: a callee whose only release is on its unwrap's failing path is cleared while a view is held")
+vmw_unwrap_cleared()
+    if !vmw_ready() then return
+
+    val out = vmw_ran(VmwOpen + VmwExport +
+                      "fill(v: []u8) -> usize\n    val i = pick(v.len).unwrap()\n    v[i] = 9\n    i\n\n" +
+                      "run(b: *Board) -> usize\n    var v = b.sram.view_mut()\n    val k = fill(v)\n" +
+                      "    v[0] = 1\n    k\n\n" +
+                      VmwMain + "print(run(&x), x.sram[0], x.sram[1])\n")
+
+    assert_eq(out, "1 1 9\n")
+end vmw_unwrap_cleared
+
+@test("vmw: the same unwrap is cleared for a view held inside an array of regions")
+vmw_unwrap_regions_cleared()
+    if !vmw_ready() then return
+
+    val out = vmw_ran(VmwOpen + VmwExport +
+                      "struct Region\n    base: u64\n    mem: []u8\n\n" +
+                      "fill(rs: []Region) -> usize\n    val i = pick(rs[0].mem.len).unwrap()\n" +
+                      "    rs[0].mem[i] = 9\n    i\n\n" +
+                      "run(b: *Board) -> usize\n    var regions = [Region(0, b.sram.view_mut())]\n" +
+                      "    val k = fill(regions[..])\n    regions[0].mem[0] = 1\n    k\n\n" +
+                      VmwMain + "print(run(&x), x.sram[0], x.sram[1], \"ab\".bytes.len)\n")
+
+    assert_eq(out, "1 1 9 2\n")
+end vmw_unwrap_regions_cleared
+
+@test("vmw: a write of a Buf[u8] made on the way to ending the program still refuses the call")
+vmw_write_before_exit_refused()
+    if !vmw_ready() then return
+
+    vmw_refused(VmwOpen + VmwExport +
+                "fill(v: []u8) -> usize\n    if v.len == 0\n        keep = buf()\n" +
+                "        panic(\"empty\")\n    v[0] = 9\n    0\n\n" +
+                "run(b: *Board) -> usize\n    var v = b.sram.view_mut()\n    val k = fill(v)\n" +
+                "    v[0] = 1\n    k\n\n" +
+                VmwMain + "print(run(&x))\n",
+                "and 'fill' may write a 'Buf[byte]'")
+end vmw_write_before_exit_refused
+
+@test("vmw: a write of a Buf[u8] on a path that comes back is refused beside an unwrap")
+vmw_write_and_unwrap_refused()
+    if !vmw_ready() then return
+
+    vmw_refused(VmwOpen + VmwExport +
+                "fill(v: []u8) -> usize\n    val i = pick(v.len).unwrap()\n    keep = buf()\n    i\n\n" +
+                "run(b: *Board) -> usize\n    var v = b.sram.view_mut()\n    val k = fill(v)\n" +
+                "    v[0] = 1\n    k\n\n" +
+                VmwMain + "print(run(&x))\n",
+                "and 'fill' may write a 'Buf[byte]'")
+end vmw_write_and_unwrap_refused
+
+// -- how the callee is named ------------------------------------------------------------------------------
+
+@test("vmw: a generic callee is named by the generic it was made from, not its instance's key")
+vmw_generic_named_by_origin()
+    if !vmw_ready() then return
+
+    val out = vmw_said(VmwOpen +
+                       "put[T](v: []T, x: T) -> int\n    v[0] = x\n    keep = buf()\n    0\n\n" +
+                       "run(b: *Board) -> int\n    var v = b.sram.view_mut()\n    val k = put(v, u8(9))\n" +
+                       "    v[1] = 1\n    k\n\n" +
+                       VmwMain + "print(run(&x))\n")
+
+    assert(out.contains("and 'put' may write a 'Buf[byte]'"), out)
+    assert(!out.contains("put.byte"), out)
+end vmw_generic_named_by_origin

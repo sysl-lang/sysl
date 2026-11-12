@@ -592,9 +592,7 @@ private file_borrow(cx: &Analyzer, span: Span, unique: string, name: string, roo
 
     if at.is_none() then return
 
-    val lent = underlying(at.unwrap().1.ty) match
-        Slice(elem, _) -> underlying(*elem)
-        _ -> Unknown
+    val lent = held_view_elem(at.unwrap().1.ty)
 
     for r in roots
         var types: Buf[Type] = buf()
@@ -608,6 +606,42 @@ private file_borrow(cx: &Analyzer, span: Span, unique: string, name: string, roo
         cx.an.ref_watches.push(RefWatch(cx.watch_key(), name, types, span.end, None, at.unwrap().0,
                                         r.name, buf(), root, lent, r.via))
 end file_borrow
+
+// The element type of every view a local of type `t` holds: the local itself a view, or an array or
+// struct holding views by value beside plain numbers -- `[Region(base, sram.view_mut())]` lends
+// `byte`s as surely as `sram.view_mut()` does. Anything else held, or views of two element types,
+// answers `Unknown`, which asks the call about every write.
+private held_view_elem(t: Type) -> Type
+    var elems: Buf[Type] = buf()
+
+    if !held_views(t, &elems) || elems.is_empty() then return Unknown
+
+    for item in elems
+        if item != elems[0] then return Unknown
+
+    elems[0]
+end held_view_elem
+
+private held_views(t: Type, out: *Buf[Type]) -> bool = underlying(t) match
+    Slice(elem, _) ->
+        out.push(underlying(*elem))
+        true
+    Array(_, elem) -> held_views(*elem, out)
+    Constrained(d) -> held_views(d.base, out)
+    Struct(d) ->
+        if !d.targs.is_empty() then return false
+
+        for item in d.fields
+            if !held_views(item.1, out) then return false
+
+        true
+    Integer(_, _, _) -> true
+    Floating(_, _) -> true
+    Fixed(_, _, _) -> true
+    Char -> true
+    Bool -> true
+    Unit -> true
+    _ -> false
 
 // An assignment of `value` into `target`. **The target has to die before the receiver does**: a
 // local bound after it, or storage held by value inside one, and nothing reached through a

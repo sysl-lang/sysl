@@ -3049,7 +3049,11 @@ What a compiler maintainer needs and a program rarely meets:
   convention — so it reaches those and all module storage. The standard library's own `extern`s are
   the exception, since they never call back: a `ptr_cast` elsewhere is no reason to refuse
   `read_bytes`. A library function already compiled is judged by what its arguments, the module
-  storage it can name, and the casts it can run can reach.
+  storage it can name, and the casts it can run can reach. Only the paths that come back count: one
+  that ends the program — `unwrap`'s report, a failed bounds check — never resumes the frame holding
+  the ref or view, whatever it runs. A view held inside an array or struct of plain values
+  (`[Region(base, sram.view_mut())]`) lends its elements as a view held alone does, so a callee writing
+  those bytes through the slice it is handed writes no buffer.
 - **The one rule is otherwise local.** It sees the `&`, the path after it, and the calls and
   assignments on that path in one body. A second name for a buffer made with `val b2 = b` is a
   `@relocates` call on the same buffer, refused with that message; a callee through a trait object or

@@ -774,14 +774,22 @@ private ref_call(a: &Analysis, u: *Untouched, reach: &Reacher, known: Set[string
             val moving = w.view_of == "" && relocated(u, t)
 
             if name != ""
-                cleared = unreachable_to(u, reach.of(a, u, name), globals, erased, args, t, moving) ||
-                          (known.has(name) && untouched_by(u, t, w.lent, moving).has(name))
+                // **The question is what comes back**: a path through the callee that ends the
+                // program never resumes this frame, so nothing reads through the name afterwards.
+                cleared = unreachable_to(u, reach.answer_of(a, u, name), globals, erased, args, t, moving) ||
+                          (known.has(name) && untouched_by(u, t, w.lent, moving, true).has(name))
             end if
 
             if !cleared
                 var what = "a call through a pointer or a trait names no body to ask"
 
-                if name != "" then what = s"'${qualified_name(name)}' may write a '${type_show(t)}'"
+                // An instantiation is named by the generic it was made from: `Result.map_err`, not
+                // the instance's key with its type arguments spelled into it.
+                if name != ""
+                    val origin = a.tables.members.func_origin.get(name).unwrap_or(name)
+
+                    what = s"'${qualified_name(origin)}' may write a '${type_show(t)}'"
+                end if
 
                 if w.view_of != ""
                     a.fault(scope, e.span, s"'${w.name}' is a view borrowed from '${w.view_of}', " +

@@ -22,9 +22,11 @@ import sysl.text.{join, Search}
 private dps_ready() -> bool = std_root().is_ok() && clang_available()
 
 private const DpsGeo: string =
-    "module sh.e.geo\n\n" +
+    "module sh.e.geo\n\nimport sysl.buf.Buf\n\n" +
     "struct Vertex\n    x: int\n\n" +
-    "type Keeper = *extern(@keeps *Vertex) -> int\n"
+    "type Keeper = *extern(@keeps *Vertex) -> int\n\n" +
+    "grow(b: *Buf[u8]) = b.push(1)\n\n" +
+    "impl Vertex\n    stretch(self, b: *Buf[u8]) = b.push(u8(self.x))\n"
 
 private const DpsOther: string = "module sh.e.other\n\nstruct Vertex\n    y: int\n"
 
@@ -147,6 +149,34 @@ dps_written_whole()
     assert(out.contains("error: cannot initialize 'n': declared int but the value is Vertex\n"), out)
     dps_never_keyed(out)
 end dps_written_whole
+
+// -- a function or method the dependency declares ---------------------------------------------------
+
+// A call that may write the buffer a view is borrowed from, made while the view is held.
+private dps_held(call: string) -> string =
+    "import sysl.buf.{Buf, buf}\nimport sh.e.geo\n\n" +
+    s"run(b: *Buf[u8], other: *Buf[u8]) -> int\n    var v = b.view_mut()\n    $call\n    v[0] = 1\n    0\n\n" +
+    "var x: Buf[u8] = buf()\nx.push(0)\nvar y: Buf[u8] = buf()\nprint(run(&x, &y))\n"
+
+@test("dps: a dependency's function is named by the path it is imported by, never by its package's prefix")
+dps_function_unprefixed()
+    if !dps_ready() then return
+
+    val out = dps_member(dps_held("geo.grow(other)"))
+
+    assert(out.contains("and 'sh.e.geo.grow' may write a 'Buf[byte]'"), out)
+    dps_never_keyed(out)
+end dps_function_unprefixed
+
+@test("dps: a dependency type's method keeps its type in the path, with the package's prefix taken off")
+dps_method_unprefixed()
+    if !dps_ready() then return
+
+    val out = dps_member(dps_held("geo.Vertex(2).stretch(other)"))
+
+    assert(out.contains("and 'sh.e.geo.Vertex.stretch' may write a 'Buf[byte]'"), out)
+    dps_never_keyed(out)
+end dps_method_unprefixed
 
 // -- a name that could mean something else ---------------------------------------------------------
 
