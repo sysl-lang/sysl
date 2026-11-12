@@ -961,24 +961,31 @@ on, so an entry that stores its argument and then loops is refused as one that r
 entry that hands its argument, at any depth, to a function that stores it and loops for ever:
 
 ```sysl
-import sysl.fiber.{Context, switch}
+import sysl.fiber.{Context, Stack, switch}
 
 struct Job
     home: Context
     me: Context
 
 var held: *Job = null
+var job = Job(Context.new(), Context.new())
 
 serve(j: *Job)
     held = j
     loop
         switch(&j.me, &j.home)
 
-val entry: *extern(*Job) -> unit = &serve
+entry(j: *Job)
+    serve(j)
+
+main()
+    val s = Stack.reserve(65536).unwrap()
+    job.me = Context.start(s, &entry, &job)
+    switch(&job.home, &job.me)
 ```
 
 ```error
-'serve' keeps its parameter 'j' (it is stored in 'held'), and its address is taken — a call through a function pointer sees no body
+'entry' keeps its parameter 'j' (it is passed to 'serve', which keeps it), and its address is taken — a call through a function pointer sees no body
 ```
 
 **A callable that only lets out what it reads is marked
