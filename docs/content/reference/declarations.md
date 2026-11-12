@@ -1552,6 +1552,117 @@ print(1)
 'leave' is '@abandons', and a call through a value cannot be followed to it
 ```
 
+### Clauses
+
+A function may be **given by clauses**: its signature on a line with no body, then one clause per
+line, each the function's name applied to a pattern per parameter and followed by `=` and a body.
+A call tries the clauses in order and runs the first whose patterns all match:
+
+```sysl
+enum Shape
+    Circle(r: int)
+    Rect(w: int, h: int)
+
+area(s: Shape) -> int
+area(Circle(r)) = 3 * r * r
+area(Rect(w, h)) = w * h
+
+print(area(Circle(2)), area(Rect(2, 5)))
+```
+
+```output
+12 10
+```
+
+The signature carries every type — the parameters', the result's, the type parameters and the
+defaults — and a clause's patterns carry none. A pattern is anything a `match` arm takes: a literal, a
+range, a variant, a struct, a nested pattern, `|` alternatives, `_`, or a name, which binds the
+argument. A body after `=` is an expression on the line or an indented block.
+
+A clause may instead be followed by **guards**, `| condition = body`: one on the clause's own line, or
+a block of them under it, tried in order. `| _` always holds. When the patterns match and every guard
+fails, the **next clause** is tried, as a failed guard on a `match` arm moves to the next arm:
+
+```sysl
+classify(n: int) -> string
+classify(0) = "zero"
+classify(n)
+    | n < 0 = "negative"
+    | n < 10 = "small"
+classify(_) = "large"
+
+both(a: bool, b: bool) -> int
+both(true, true) = 3
+both(true, false) = 2
+both(false, x) = if x then 1 else 0
+
+print(classify(0), classify(-3), classify(5), classify(50))
+print(both(true, false), both(false, true))
+```
+
+```output
+zero negative small large
+2 1
+```
+
+**Each parameter is tested where it stands.** No tuple of the arguments is built: a clause tests its
+first pattern against the first argument, its second against the second, and binds as it goes. A
+`&T` parameter's patterns take apart what it holds — the value `*t match` would match — while a
+pattern that is only a name binds the reference itself. A method's clauses match the parameters after
+`self`. Clauses may give a function at the top level, a method in a type or an `impl`, a trait's
+default method, and a function declared inside another. A trait's signature with no clauses under it
+is a requirement, as it always was.
+
+A self call in tail position in a clause is a [tail call](#tail-calls), like any other.
+
+**The clauses must cover every argument list**, exactly as a `match`'s arms must cover its value: the
+check is the same, with a column per parameter. A clause counts only where one of its bodies has no
+guard or the guard `| _`. What is missing is named as the call that no clause would take:
+
+```sysl
+enum Shape
+    Circle(r: int)
+    Rect(w: int, h: int)
+
+area(s: Shape) -> int
+area(Circle(r)) = r
+
+print(area(Circle(1)))
+```
+
+```error
+clauses of 'area' do not cover area(Rect)
+```
+
+A clause the clauses above it already match is refused, as an unreachable `match` arm is:
+
+```sysl
+f(n: int) -> int
+f(_) = 1
+f(0) = 2
+
+print(f(0))
+```
+
+```error
+unreachable clause 'f(0)': every argument list it matches is already matched by the clause on line 2
+```
+
+A clause takes one pattern for each parameter, and is written with its function's own name. A guard on
+the clause's own line is its only one; more go in an indented block:
+
+```sysl
+f(n: int) -> int
+f(n) | n > 0 = 1
+| _ = 2
+
+print(f(1))
+```
+
+```error
+a clause with its guard on its own line has that one guard
+```
+
 ### Several results
 
 A signature may declare more than one result, and the trailing expression or `return` supplies them

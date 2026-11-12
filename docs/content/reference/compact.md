@@ -149,7 +149,9 @@ is a body, the module member is asked for with `static val` / `static var`.
 **A function is a name, a parameter list, an optional `-> result`, and a body** — no keyword. The
 body is `= expr` or an indented block whose **trailing expression** is the result; `=` may also open
 a block. **With no `-> result`, a `= value` body takes the value's type** as a `val` does, and a block
-body with no `=` hands back `unit`.
+body with no `=` hands back `unit`. **A function may be given by clauses**: the signature with no
+body, then lines `f(pattern, …) = body` — or `f(pattern, …)` with `| guard = body` on its line or in
+a block under it — tried in order and held to a `match`'s exhaustiveness.
 
 ```sysl
 double(n: int) = n * 2
