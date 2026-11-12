@@ -1,0 +1,245 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A call made while a view or a `ref` is held is asked what it can run (`checks.sysl`'s `Reacher`).
+// **A callee can run only the destructors of what it can let go of**: the values its bodies are
+// handed, make, read or write, the module storage they name and the objects their casts point at,
+// each followed through what it holds and through every value the program put behind a trait it
+// holds, round by round through what each destructor reached can let go of in turn. A walk reaching
+// a foreign function takes in every destructor (`reference/memory.md § Edge cases`).
+//
+// The axes: how the destructor is reached (a value made in the callee, a parameter, module storage,
+// a destructor two deep, a closure's capture, a trait object's table types, C, a function pointer),
+// what the destructor does (only prints, writes module storage holding a `Buf[u8]`, calls through a
+// function pointer), and what is held (a view in a local, a view in an array of plain values). Left
+// out: a `ref` held, which is asked the same reach as a view; a library's build, where a destructor's
+// reach is asked the same way and a trait call is already opaque (tests_tvc).
+
+private drh_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end drh_ready
+
+// What the program printed, or what the compiler said instead.
+private drh_ran(text: string) -> string
+    val root = make_temp_dir("sysl-destructor-reach").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text + out.err.unwrap_or("")
+end drh_ran
+
+private drh_has(out: string, part: string) = assert(out.contains(part), s"expected '$part' in: $out")
+
+// A board whose SRAM a view is taken of; module storage holding a `Buf[u8]`; `Tap`, whose
+// destructor writes that storage; and `Quiet`, whose destructor only prints.
+private const DrhPrelude: string =
+    "import sysl.buf.{Buf, buf}\n\n" +
+    "struct Board\n    sram: Buf[u8]\n\n" +
+    "static var keep: Buf[u8] = buf()\n\n" +
+    "struct Tap\n    n: int\n\n" +
+    "impl Drop for Tap\n    drop(self)\n        keep = buf()\n\n" +
+    "struct Quiet\n    n: int\n\n" +
+    "impl Drop for Quiet\n    drop(self) = print(\"quiet\", self.n)\n\n"
+
+// `run` holds a view of the board's SRAM across `poke(<arg>)`.
+private drh_run(params: string, arg: string) -> string =
+    s"run(b: *Board$params) -> int\n    var v = b.sram.view_mut()\n    val k = poke($arg)\n" +
+    "    v[0] = u8(k)\n    k\n\n"
+
+private const DrhRefused: string = "'v' is a view borrowed from 'b', held in a 'Buf[byte]', and 'poke' may write a 'Buf[byte]'"
+
+private const DrhFault: string =
+    "enum Fault\n    Short\n\n" +
+    "impl Display for Fault\n    display(self, out: *Writer, fmt: FormatSpec)\n" +
+    "        out.write(\"short\".bytes)\n\n"
+
+// -- accepted ---------------------------------------------------------------------------------------
+
+@test("drh: benchtop's shape -- map_err rendering an error while regions are held, a destructor calling through a pointer")
+drh_map_err_beside_pointer_destructor_cleared()
+    if !drh_ready() then return
+
+    val out = drh_ran("import sysl.buf.{Buf, buf}\n\n" +
+                      "struct Chain\n    h: *extern(int) -> unit\n\n" +
+                      "impl Drop for Chain\n    drop(self) = self.h(1)\n\n" + DrhFault +
+                      "static var chain: Option[&Chain] = None\n\n" +
+                      "run(sram: *Buf[u8]) -> Result[int, string]\n    val n =\n" +
+                      "        var regions = [sram.view_mut()]\n        regions[0][0] = 4\n" +
+                      "        (if regions.len > 1 then Ok(1) else Err(Fault.Short)).map_err(why -> s\"load: $why\")?\n" +
+                      "    Ok(n + 1)\n\n" +
+                      "var b: Buf[u8] = buf()\nb.push(0)\nprint(run(&b), b[0])\n")
+
+    assert_eq(out, "Err(load: short) 4\n")
+end drh_map_err_beside_pointer_destructor_cleared
+
+@test("drh: a closure capturing nothing with a destructor runs no destructor that writes module storage")
+drh_closure_capturing_nothing_cleared()
+    if !drh_ready() then return
+
+    val out = drh_ran(DrhPrelude + DrhFault +
+                      "run(b: *Board) -> Result[int, string]\n    val n =\n" +
+                      "        var v = b.sram.view_mut()\n        v[0] = 9\n" +
+                      "        (if v.len > 1 then Ok(1) else Err(Fault.Short)).map_err(why -> s\"load: $why\")?\n" +
+                      "    Ok(n + 1)\n\n" +
+                      "val t: &Tap = Tap(1)\nvar x = Board(buf())\nx.sram.push(0)\nprint(run(&x), x.sram[0], t.n)\n")
+
+    assert_eq(out, "Err(load: short) 9 1\n")
+end drh_closure_capturing_nothing_cleared
+
+@test("drh: a callee letting go of a &Quiet, whose destructor cannot reach the buffer, is cleared")
+drh_quiet_destructor_cleared()
+    if !drh_ready() then return
+
+    val out = drh_ran(DrhPrelude +
+                      "poke(q: &Quiet) -> int\n    val r: &Quiet = Quiet(q.n + 1)\n    r.n\n\n" +
+                      drh_run(", q: &Quiet", "q") +
+                      "val t: &Tap = Tap(1)\nval q: &Quiet = Quiet(2)\nvar x = Board(buf())\nx.sram.push(0)\n" +
+                      "print(run(&x, q), x.sram[0], t.n)\n")
+
+    assert_eq(out, "quiet 3\n3 3 1\nquiet 2\n")
+end drh_quiet_destructor_cleared
+
+// -- still refused ----------------------------------------------------------------------------------
+
+@test("drh: a callee letting go of a &Tap, whose destructor writes the module's buffer, is refused")
+drh_tap_destructor_refused()
+    if !drh_ready() then return
+
+    val out = drh_ran(DrhPrelude +
+                      "poke(t: &Tap) -> int\n    val u: &Tap = Tap(t.n + 1)\n    u.n\n\n" +
+                      drh_run(", t: &Tap", "t") +
+                      "val t: &Tap = Tap(1)\nvar x = Board(buf())\nx.sram.push(0)\nprint(run(&x, t), x.sram[0])\n")
+
+    drh_has(out, DrhRefused)
+end drh_tap_destructor_refused
+
+@test("drh: a callee letting go of the view's owner itself, held in module storage, is refused")
+drh_owner_let_go_refused()
+    if !drh_ready() then return
+
+    val out = drh_ran(DrhPrelude +
+                      "struct Store\n    data: Buf[u8]\n\n" +
+                      "impl Drop for Store\n    drop(self) = print(\"store\", self.data.len())\n\n" +
+                      "static var slot: Option[&Store] = None\n\n" +
+                      "let_go() -> int\n    slot = None\n    0\n\n" +
+                      "run() -> int = slot match\n    Some(s) ->\n        var v = s.data.view_mut()\n" +
+                      "        val k = let_go()\n        v[0] = 1\n        k\n    None -> 0\n\n" +
+                      "var d: Buf[u8] = buf()\nd.push(0)\nslot = Some(Store(d))\nprint(run())\n")
+
+    drh_has(out, "'v' is a view borrowed from 's', held in a 'Buf[byte]', and 'let_go' may write a 'Buf[byte]'")
+end drh_owner_let_go_refused
+
+@test("drh: a callee letting go of a Tap held in module storage is refused")
+drh_module_storage_refused()
+    if !drh_ready() then return
+
+    val out = drh_ran(DrhPrelude +
+                      "static var held: Option[&Tap] = None\n\n" +
+                      "poke() -> int\n    held = None\n    0\n\n" + drh_run("", "") +
+                      "held = Some(Tap(1))\nvar x = Board(buf())\nx.sram.push(0)\nprint(run(&x), x.sram[0])\n")
+
+    drh_has(out, DrhRefused)
+end drh_module_storage_refused
+
+@test("drh: a destructor reached two deep -- Outer's makes a Tap -- is refused")
+drh_two_deep_refused()
+    if !drh_ready() then return
+
+    val out = drh_ran(DrhPrelude +
+                      "struct Outer\n    n: int\n\n" +
+                      "impl Drop for Outer\n    drop(self)\n        val t: &Tap = Tap(self.n)\n" +
+                      "        print(\"outer\", t.n)\n\n" +
+                      "poke(o: &Outer) -> int\n    val p: &Outer = Outer(o.n + 1)\n    p.n\n\n" +
+                      drh_run(", o: &Outer", "o") +
+                      "val o: &Outer = Outer(1)\nvar x = Board(buf())\nx.sram.push(0)\nprint(run(&x, o), x.sram[0])\n")
+
+    drh_has(out, DrhRefused)
+end drh_two_deep_refused
+
+@test("drh: a closure capturing a &Tap reaches Tap's destructor and is refused")
+drh_closure_capturing_tap_refused()
+    if !drh_ready() then return
+
+    val out = drh_ran(DrhPrelude + DrhFault +
+                      "run(b: *Board, t: &Tap) -> Result[int, string]\n    val n =\n" +
+                      "        var v = b.sram.view_mut()\n        v[0] = 9\n" +
+                      "        (if v.len > 1 then Ok(1) else Err(Fault.Short)).map_err(why -> s\"load: $why ${t.n}\")?\n" +
+                      "    Ok(n + 1)\n\n" +
+                      "val t: &Tap = Tap(1)\nvar x = Board(buf())\nx.sram.push(0)\nprint(run(&x, t), x.sram[0])\n")
+
+    drh_has(out, "'v' is a view borrowed from 'b', held in a 'Buf[byte]', and 'sysl.Result.map_err' may write a 'Buf[byte]'")
+end drh_closure_capturing_tap_refused
+
+@test("drh: a callee calling a foreign function takes in every destructor and is refused")
+drh_foreign_refused()
+    if !drh_ready() then return
+
+    val out = drh_ran(DrhPrelude +
+                      "extern abs(x: i32) -> i32\n\n" +
+                      "poke() -> int = int(abs(-3))\n\n" + drh_run("", "") +
+                      "val t: &Tap = Tap(1)\nvar x = Board(buf())\nx.sram.push(0)\nprint(run(&x), x.sram[0], t.n)\n")
+
+    drh_has(out, DrhRefused)
+end drh_foreign_refused
+
+// A module `&Shape` the callee lets go of; `kind` is the one type the program puts behind it.
+private drh_shape(kind: string) -> string =
+    DrhPrelude +
+    s"trait Shape\n    area(*self) -> int\n\nimpl Shape for $kind\n    area(*self) -> int = self.n\n\n" +
+    "static var shape: Option[&Shape] = None\n\n" +
+    "poke() -> int\n    shape = None\n    0\n\n" + drh_run("", "") +
+    s"val t: &Tap = Tap(1)\nshape = Some($kind(3))\nvar x = Board(buf())\nx.sram.push(0)\n" +
+    "print(run(&x), x.sram[0], t.n)\n"
+
+@test("drh: letting go of a trait object whose only table's type is Quiet runs only Quiet's destructor")
+drh_trait_object_quiet_cleared()
+    if !drh_ready() then return
+
+    assert_eq(drh_ran(drh_shape("Quiet")), "quiet 3\n0 0 1\n")
+end drh_trait_object_quiet_cleared
+
+@test("drh: letting go of a trait object the program put a Tap behind is refused")
+drh_trait_object_refused()
+    if !drh_ready() then return
+
+    drh_has(drh_ran(drh_shape("Tap")), DrhRefused)
+end drh_trait_object_refused
+
+@test("drh: a call through a function pointer whose target writes the buffer is refused")
+drh_function_pointer_refused()
+    if !drh_ready() then return
+
+    val out = drh_ran(DrhPrelude +
+                      "struct Hook\n    h: *extern() -> int\n\n" +
+                      "release() -> int\n    keep = buf()\n    0\n\n" +
+                      "poke(k: Hook) -> int = k.h()\n\n" + drh_run(", k: Hook", "k") +
+                      "var x = Board(buf())\nx.sram.push(0)\nprint(run(&x, Hook(&release)), x.sram[0])\n")
+
+    drh_has(out, DrhRefused)
+end drh_function_pointer_refused
