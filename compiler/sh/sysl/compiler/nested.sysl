@@ -125,6 +125,10 @@ lower_nested_group(cx: &Analyzer, span: Span, group: Buf[FuncDecl]) -> Buf[TStmt
 
     cx.an.tables.struct_insts.put(base, env)
 
+    // Marked before any body is read, so a group a body declares finds its own captures marked.
+    for item in captured
+        if holds_entry_binding(cx, item) then cx.an.tables.entry_env_slots.add(s"$base.$item")
+
     val slot = cx.bind(base, env)
     val here = TExpr(span, TAddrOf(TExpr(span, TLoad(slot, env)), Ptr(env)))
     val inner_self = TExpr(span, TLoad("self", Ptr(env)))
@@ -242,6 +246,42 @@ lower_nested_group(cx: &Analyzer, span: Span, group: Buf[FuncDecl]) -> Buf[TStmt
     out.push(TVarDecl(slot, env, TExpr(span, TStructNew(st, addresses)), None))
     out
 end lower_nested_group
+
+// **Whether a capture is one of the entry file's top-level bindings**, which live until the program
+// exits (`reference/memory.md § The entry file's statements are the outermost block`): a binding of
+// the entry file's outermost block captured where it is in scope, or a capture a nested function
+// reached through such a field of its own environment and hands on to a group it declares.
+private holds_entry_binding(cx: &Analyzer, name: string) -> bool
+    var i = cx.locals.len()
+
+    while i > 0
+        i -= 1
+
+        if cx.locals[i].name != name then continue
+
+        if in_entry_body(cx) then return cx.marks.len() < 2 || i < cx.marks[1].0
+
+        // A body reads its own captures by the name it bound them under, and the environment's
+        // field is what that name reaches.
+        cx.capture_read(cx.locals[i].unique) match
+            Some(reached) -> return entry_slot_of(cx.an.tables, reached)
+            None -> return false
+    end while
+
+    false
+end holds_entry_binding
+
+// Whether a place is the variable a field of a nested function's environment holds the address of,
+// and that field holds one of the entry file's top-level bindings.
+entry_slot_of(t: &Tables, place: TExpr) -> bool
+    *place.kind match
+        TDeref(field, _) -> *field.kind match
+            TField(env, slot, _) -> texpr_type(env) match
+                Struct(st) -> t.entry_env_slots.has(s"${st.base}.${field_label(Struct(st), slot)}")
+                _ -> false
+            _ -> false
+        _ -> false
+end entry_slot_of
 
 // What a nested function may not be, each a consequence of holding a frame rather than of where the
 // declaration was written.

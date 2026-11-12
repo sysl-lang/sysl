@@ -86,11 +86,16 @@ struct FlowWalk
     exited: bool
     loops: Buf[&LoopEdges]
     org: &Origins
+
+    // **A `loop` nothing leaves is a way out**, with what is held at its head: set for a body a starter
+    // may run past its own return (`keeps.sysl`'s `walk_kept_endless`). Otherwise such a loop ends
+    // nothing, and what it holds is never held past a call whose frame outlasts it.
+    endless: bool
 end FlowWalk
 
 flow_walk(org: &Origins, stmt_events: &Fn(TStmt) -> Buf[FlowEv], expr_events: &Fn(TExpr) -> Buf[FlowEv],
           arm_events: &Fn(TExpr, TPattern, bool) -> Buf[FlowEv]) -> &FlowWalk =
-    FlowWalk(stmt_events, expr_events, arm_events, buf(), buf(), buf(), buf(), false, buf(), org)
+    FlowWalk(stmt_events, expr_events, arm_events, buf(), buf(), buf(), buf(), false, buf(), org, false)
 
 // Walks a function's body from its entry to every way out.
 flow_body(w: &FlowWalk, body: TBlock)
@@ -598,6 +603,8 @@ private flow_loop(w: &FlowWalk, st: &PathState, body: Buf[TStmt], step: Buf[TStm
         if same_state(next, head) || rounds > 8 then break
 
         head = next
+
+    if !may_end && w.endless then flow_exit(w, head)
 
     var out = if may_end then copy_state(head) else dead_state()
 
@@ -1288,7 +1295,7 @@ translate_loc(o: &Origins, args: Buf[TExpr], callee_loc: string) -> string
             if base == ""
                 base = *args[j].kind match
                     TLoad(n, _) -> stable_name(o, n)
-                    _ -> ""
+                    _ -> module_slots(o, args[j], loc)
             end if
 
             if base == "" then return ""
@@ -1302,6 +1309,31 @@ translate_loc(o: &Origins, args: Buf[TExpr], callee_loc: string) -> string
 
     ""
 end translate_loc
+
+// **A buffer handed by value out of storage that lasts holds its slots there**: `jobs.push(job)` on a
+// `static var jobs: Buf[T]` hands a copy of the buffer, and the copy names the box the variable holds,
+// so what the callee puts in the slots is held by module storage for as long as the variable is. The
+// same holds of one of the entry file's top-level bindings, which a function declared there reaches
+// through a field of its environment (`nested.sysl`'s `entry_slot_of`): the slots are named after
+// that field, as a store into the binding itself is.
+private module_slots(o: &Origins, arg: TExpr, loc: string) -> string
+    if loc.index_of(SlotsMark).is_none() then return ""
+
+    val at = place_loc(o, arg)
+
+    if at.starts_with("g:") then return at
+
+    if !entry_slot_of(o.cx.an.tables, arg) then return ""
+
+    *arg.kind match
+        TDeref(field, _) -> *field.kind match
+            TField(env, slot, _) ->
+                val holder = place_loc(o, env)
+
+                if holder == "" || holder == "-" then "" else s"$holder.${field_label(texpr_type(env), slot)}"
+            _ -> ""
+        _ -> ""
+end module_slots
 
 // **A location is said to a bounded depth of elements**: a function handing on `&ip[1]` to itself,
 // or round a ring of functions that each step one element further, would otherwise be answered with

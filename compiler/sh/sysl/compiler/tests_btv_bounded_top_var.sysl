@@ -1,0 +1,422 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A top-level `var` of the file a program starts in is a local of the program's outermost block, and
+// it lasts until the program exits (`reference/memory.md § The entry file's statements are the
+// outermost block`). A function declared there reaches it through its environment, so a store into it
+// is a store through the function's first parameter -- which `@bounded`'s check (`keeps.sysl`'s
+// `refuse_unbounded`) read as the caller's storage and let through. It is held to what module storage
+// is held to (`nested.sysl`'s `entry_slot_of`, `keeps.sysl`'s `entry_binding_loc`).
+//
+// The axes: the variable itself, a field of it, a callee that stores it, a function nested two deep, a
+// generic nested function, a function declared inside a block of the entry file, a buffer pushed into
+// (in a `static var`, a field of one, the top-level `var`, and from two deep); and beside them what
+// stays accepted (a local of the body, a variable of a block rather than the file, a variable of an
+// ordinary function's frame) and the neighbouring rules that already held the variable to module
+// storage's terms (a closure's capture, `@scoped(p)`, `@crossing`, a closure's parameter). Refusals are
+// analysis only, so they are built once; what is accepted runs at -O0 and -O2. Not crossed: separate
+// compilation and bare metal, since a library and a bare image have no entry file's body.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private btv_outcome(text: string, level: string) -> (string, int)
+    val root = make_temp_dir("sysl-btv").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, level, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end btv_outcome
+
+private btv_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    for level in ["0", "2"]
+        val out = btv_outcome(text, level)
+
+        assert_eq(out.0, want)
+        assert_eq(out.1, 0)
+end btv_prints
+
+private btv_refused(text: string, part: string)
+    if xvr_no_library() then return
+
+    val out = btv_outcome(text, DefaultOptimization)
+
+    assert_eq(out.1, -1, out.0)
+    assert(out.0.index_of(part).is_some(), out.0)
+end btv_refused
+
+private val BtvTop = "but it stores 'job' in a top-level 'var' of the file the program starts in"
+
+// -- what is refused ------------------------------------------------------------------------------
+
+@test("a '@bounded' body storing the callable in the entry file's top-level 'var' is refused")
+btv_top_var()
+    btv_refused(raw"""
+        var saved: Option[&sync Fn(usize) -> unit] = None
+
+        @bounded(job)
+        keep(job: &sync Fn(usize) -> unit)
+            saved = Some(job)
+            job(0)
+
+        keep((i) -> print(i))
+        """, BtvTop + " (it is stored in 'saved')")
+
+@test("the same body storing into a 'static var' is told it is module storage")
+btv_static_var()
+    btv_refused(raw"""
+        static var saved: Option[&sync Fn(usize) -> unit] = None
+
+        @bounded(job)
+        keep(job: &sync Fn(usize) -> unit)
+            saved = Some(job)
+            job(0)
+
+        keep((i) -> print(i))
+        """, "but it stores 'job' in module storage (it is stored in 'saved')")
+
+@test("storing the callable in a field of the top-level 'var' is refused, and the field is named as written")
+btv_field_of_top_var()
+    btv_refused(raw"""
+        struct Holder
+            f: Option[&sync Fn(usize) -> unit]
+
+        var holder = Holder(None)
+
+        @bounded(job)
+        keep(job: &sync Fn(usize) -> unit)
+            holder.f = Some(job)
+            job(0)
+
+        keep((i) -> print(i))
+        """, BtvTop + " (it is stored in 'holder.f')")
+
+@test("handing the callable to a callee that stores it in the top-level 'var' is refused")
+btv_through_a_callee()
+    btv_refused(raw"""
+        var saved: Option[&sync Fn(usize) -> unit] = None
+
+        stash(j: &sync Fn(usize) -> unit)
+            saved = Some(j)
+
+        @bounded(job)
+        keep(job: &sync Fn(usize) -> unit)
+            stash(job)
+            job(0)
+
+        keep((i) -> print(i))
+        """, BtvTop + " (it is passed to 'stash', which keeps it)")
+
+@test("a '@bounded' function nested two deep reaches the top-level 'var' through both environments")
+btv_nested_two_deep()
+    btv_refused(raw"""
+        var saved: Option[&sync Fn(usize) -> unit] = None
+
+        outer()
+            @bounded(job)
+            keep(job: &sync Fn(usize) -> unit)
+                saved = Some(job)
+                job(0)
+
+            keep((i) -> print(i))
+
+        outer()
+        """, BtvTop)
+
+@test("a generic '@bounded' nested function storing into the top-level 'var' is refused")
+btv_generic_nested()
+    btv_refused(raw"""
+        var saved: Option[&sync Fn(usize) -> unit] = None
+
+        @bounded(job)
+        keep[T](x: T, job: &sync Fn(usize) -> unit)
+            saved = Some(job)
+            job(0)
+
+        keep(1, (i) -> print(i))
+        keep("a", (i) -> print(i))
+        """, BtvTop)
+
+@test("a '@bounded' function declared inside a block of the entry file still reaches the file's 'var'")
+btv_declared_in_a_block()
+    btv_refused(raw"""
+        var saved: Option[&sync Fn(usize) -> unit] = None
+
+        if saved.is_none()
+            @bounded(job)
+            keep(job: &sync Fn(usize) -> unit)
+                saved = Some(job)
+                job(0)
+
+            keep((i) -> print(i))
+        """, BtvTop)
+
+// A `Buf` handed by value to `push` is a copy naming the box the variable holds, so the slots the
+// callable lands in are held as long as the variable is (`keeps_flow.sysl`'s `module_slots`).
+
+@test("pushing the callable into a 'static var' buffer is told it is module storage")
+btv_push_static_buf()
+    btv_refused(raw"""
+        import sysl.buf.{Buf, buf}
+
+        static var jobs: Buf[&sync Fn(usize) -> unit] = buf()
+
+        @bounded(job)
+        keep(job: &sync Fn(usize) -> unit)
+            jobs.push(job)
+            job(0)
+
+        keep((i) -> print(i))
+        """, "but it stores 'job' in module storage (it is passed to 'push', which keeps it)")
+
+@test("pushing the callable into a buffer field of a 'static var' is told it is module storage")
+btv_push_static_field_buf()
+    btv_refused(raw"""
+        import sysl.buf.{Buf, buf}
+
+        struct Queue
+            jobs: Buf[&sync Fn(usize) -> unit]
+
+        static var queue = Queue(buf())
+
+        @bounded(job)
+        keep(job: &sync Fn(usize) -> unit)
+            queue.jobs.push(job)
+            job(0)
+
+        keep((i) -> print(i))
+        """, "but it stores 'job' in module storage (it is passed to 'push', which keeps it)")
+
+@test("pushing the callable into the entry file's top-level 'var' buffer is refused")
+btv_push_top_buf()
+    btv_refused(raw"""
+        import sysl.buf.{Buf, buf}
+
+        var jobs: Buf[&sync Fn(usize) -> unit] = buf()
+
+        @bounded(job)
+        keep(job: &sync Fn(usize) -> unit)
+            jobs.push(job)
+            job(0)
+
+        keep((i) -> print(i))
+        """, BtvTop + " (it is passed to 'push', which keeps it)")
+
+@test("a function nested two deep pushing into the top-level 'var' buffer is refused")
+btv_push_top_buf_nested()
+    btv_refused(raw"""
+        import sysl.buf.{Buf, buf}
+
+        var jobs: Buf[&sync Fn(usize) -> unit] = buf()
+
+        outer()
+            @bounded(job)
+            keep(job: &sync Fn(usize) -> unit)
+                jobs.push(job)
+                job(0)
+
+            keep((i) -> print(i))
+
+        outer()
+        """, BtvTop + " (it is passed to 'push', which keeps it)")
+
+// -- what stays accepted --------------------------------------------------------------------------
+
+@test("a '@bounded' body pushing the callable into a buffer of its own is accepted")
+btv_push_local_buf()
+    btv_prints(raw"""
+        import sysl.buf.{Buf, buf}
+
+        static var jobs: Buf[&sync Fn(usize) -> unit] = buf()
+
+        @bounded(job)
+        keep(job: &sync Fn(usize) -> unit)
+            var mine: Buf[&sync Fn(usize) -> unit] = buf()
+            mine.push(job)
+            mine[0](3)
+
+        keep((i) -> print(i))
+        print(jobs.len())
+        """, "3\n0\n")
+
+@test("a '@bounded' body keeping the callable in a local of its own is accepted")
+btv_local_of_the_body()
+    btv_prints(raw"""
+        var saved: Option[&sync Fn(usize) -> unit] = None
+
+        @bounded(job)
+        keep(job: &sync Fn(usize) -> unit)
+            var mine: Option[&sync Fn(usize) -> unit] = None
+            mine = Some(job)
+            mine.unwrap()(7)
+
+        keep((i) -> print(i))
+        print(saved.is_none())
+        """, "7\ntrue\n")
+
+@test("a variable of a block of the entry file is that block's, not the program's, and is not refused")
+btv_variable_of_a_block()
+    btv_prints(raw"""
+        var n = 0
+
+        if n == 0
+            var held: Option[&sync Fn(usize) -> unit] = None
+
+            @bounded(job)
+            keep(job: &sync Fn(usize) -> unit)
+                held = Some(job)
+                job(3)
+
+            keep((i) -> print(i))
+        """, "3\n")
+
+@test("a variable of an ordinary function's frame is that frame's, not the program's, and is not refused")
+btv_variable_of_a_function()
+    btv_prints(raw"""
+        outer()
+            var held: Option[&sync Fn(usize) -> unit] = None
+
+            @bounded(job)
+            keep(job: &sync Fn(usize) -> unit)
+                held = Some(job)
+                job(5)
+
+            keep((i) -> print(i))
+
+        outer()
+        """, "5\n")
+
+// -- the neighbouring rules, which already read the variable as lasting -----------------------------
+
+@test("a closure at a '@bounded' argument may not store the address of its caller's local in the top-level 'var'")
+btv_closure_at_the_argument()
+    btv_refused(raw"""
+        var held: *int = null
+
+        @bounded(f)
+        each(f: &Fn() -> unit) = f()
+
+        run()
+            var n = 5
+            val p = &n
+            each(() -> held = p)
+
+        run()
+        print(*held)
+        """, "a closure lets its capture 'p' outlive the call (it is stored in 'held'), and 'p' holds the address of a local of 'run'")
+
+@test("'@scoped(p)' may store its pointer in the top-level 'var', as it may in module storage")
+btv_scoped_pointer()
+    btv_prints(raw"""
+        var idle = 0
+        var waiter: *int = &idle
+
+        @scoped(slot)
+        block(slot: *int)
+            waiter = slot
+
+        wake(v: int)
+            *waiter = v
+            waiter = &idle
+
+        read_sensor() -> int
+            var got = 0
+
+            block(&got)
+            wake(42)
+            got
+
+        print(read_sensor())
+        """, "42\n")
+
+@test("'@scoped(p)' handing its pointer to a callee that stores it in the top-level 'var' is refused")
+btv_scoped_pointer_handed_on()
+    btv_refused(raw"""
+        var idle = 0
+        var waiter: *int = &idle
+
+        park(slot: *int)
+            waiter = slot
+
+        @scoped(slot)
+        block(slot: *int)
+            park(slot)
+
+        read_sensor() -> int
+            var got = 0
+
+            block(&got)
+            got
+
+        print(read_sensor())
+        """, "'block' says '@scoped(slot)', a promise to let go of 'slot' before its caller's scope ends that only its own body keeps, and it is passed to 'park', which keeps it")
+
+@test("a '@crossing' parameter stored in the top-level 'var' keeps it")
+btv_crossing()
+    btv_refused(raw"""
+        var held: *int = null
+
+        @crossing(p)
+        begin(p: *int)
+            held = p
+
+        run()
+            var n = 5
+            begin(&n)
+
+        run()
+        print(held == null)
+        """, "'begin' keeps its parameter 'p' (it reaches another concurrency domain), and '&n' is the address of a local of 'run'")
+
+@test("a closure pushing the pointer it is handed into the top-level 'var' keeps its parameter")
+btv_closure_parameter()
+    btv_refused(raw"""
+        import sysl.buf.{Buf, buf}
+
+        struct Handle
+            n: int
+
+        var seen: Buf[*Handle] = buf()
+
+        each(body: *Handle -> unit)
+            var b = Handle(6)
+            body(&b)
+
+        each(h -> seen.push(h))
+        print(seen.len())
+        """, "a closure borrows what it is handed for the call, and this one keeps its parameter 'h'")
+
+@test("the address of a function's local stored in a field of the top-level 'var' is named as written")
+btv_escape_into_a_field()
+    btv_refused(raw"""
+        struct Holder
+            p: *int
+
+        var holder = Holder(null)
+
+        run()
+            var n = 5
+            holder.p = &n
+
+        run()
+        print(*holder.p)
+        """, "'&n' is the address of a local of 'run', and it is stored in 'holder.p', which outlives 'run'")

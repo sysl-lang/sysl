@@ -537,6 +537,28 @@ main()
 but it stores 'job' in module storage
 ```
 
+A top-level `var` of the file a program starts in lasts as long as module storage does — it is a local
+of the program's outermost block ([Memory](memory.md)) — so storing the callable there is refused too.
+So is pushing it into a buffer either one holds, since the copy of a `Buf` that `push` is handed names
+the same slots:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+var jobs: Buf[&sync Fn(usize) -> unit] = buf()
+
+@bounded(job)
+keep(job: &sync Fn(usize) -> unit)
+    jobs.push(job)
+    job(0)
+
+keep((i) -> print(i))
+```
+
+```error
+but it stores 'job' in a top-level 'var' of the file the program starts in (it is passed to 'push', which keeps it)
+```
+
 It names a callable — a `&sync Fn`, a `&Fn`, a bare arrow or a `*extern` function pointer — once, and
 never a parameter `@scoped` names too. Like `@scoped` it stands above neither an `extern` nor a trait's
 requirement: each `impl` writes it above its own method.
