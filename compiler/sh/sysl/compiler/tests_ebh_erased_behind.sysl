@@ -1,0 +1,169 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A call made while a view is held, reaching a trait object.
+//
+// **A trait object reaches what every value the program put behind its trait reaches**
+// (`checks.sysl`'s `type_reaches`, asked against `ErasedSink.behind`), and an object is always a
+// `&Trait` or a `*Trait`: the erasure's type is the reference or the pointer, never the bare trait. So
+// every erasure counts -- one into a module value, an argument, a struct's field, another module's
+// storage, or a module value's own initializer -- and a callee that calls through such an object,
+// whose values can write the buffer a view stands on, is refused exactly as the same call through
+// the concrete type is. An object whose values touch no such buffer is still accepted, and so is one
+// whose only writing value was put behind a different trait and held where the callee cannot reach.
+
+private ebh_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end ebh_ready
+
+// A board whose bytes a view stands on, and a `Ram` that writes them through the trait `Bus`.
+private ebh_head() -> string =
+    "import sysl.buf.{Buf, buf}\n\nstruct Board\n    sram: Buf[u8]\n\ntrait Bus\n    wipe(*self)\n\n" +
+    "struct Ram\n    board: *Board\n\nimpl Bus for Ram\n    wipe(*self)\n" +
+    "        for i in 0..<100000 do self.board.sram.push(7)\n\n"
+
+// The view held across `call`, then read.
+private ebh_run(params: string, call: string) -> string =
+    s"run(b: *Board$params) -> int\n    var v = b.sram.view_mut()\n    $call\n    int(v[0])\n\n"
+
+private ebh_peek() -> string = "peek() = bus match\n    Some(d) -> d.wipe()\n    None -> ()\n\n"
+
+// What the program printed, or what the compiler said instead. `files` are written beside a manifest.
+private ebh_ran(files: []const (string, string)) -> string
+    val root = make_temp_dir("sysl-ebh").unwrap()
+
+    write_text(s"$root/sysl.hocon", "").unwrap()
+
+    for i in 0..<files.len
+        val dir = files[i].0.last_index_of("/")
+
+        if dir.is_some() then make_dir_all(s"$root/${files[i].0[0..<dir.unwrap()]}").unwrap()
+
+        write_text(s"$root/${files[i].0}", files[i].1).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text + out.err.unwrap_or("")
+end ebh_ran
+
+private ebh_refused(body: string, callee: string)
+    val out = ebh_ran([("main.sysl", ebh_head() + body)])
+
+    assert(out.contains(s"'$callee' may write a 'Buf[byte]'"), s"expected a refusal naming '$callee', got: $out")
+
+private ebh_accepted(body: string, printed: string) =
+    assert_eq(ebh_ran([("main.sysl", ebh_head() + body)]), printed)
+
+// -- refused: the object's values write the buffer ------------------------------------------------
+
+@test("the same call through the concrete type is refused: the baseline every object cell matches")
+ebh_concrete_refused()
+    if !ebh_ready() then return
+
+    ebh_refused("static var bus: Option[&Ram] = None\n\n" + ebh_peek() + ebh_run("", "peek()") +
+                "var x = Board(buf())\nx.sram.push(5)\nbus = Some(Ram(&x))\nprint(run(&x))\n", "peek")
+
+@test("a &Trait in module storage, read by the callee, whose value writes the viewed buffer")
+ebh_ref_in_storage_refused()
+    if !ebh_ready() then return
+
+    ebh_refused("static var bus: Option[&Bus] = None\n\n" + ebh_peek() + ebh_run("", "peek()") +
+                "var x = Board(buf())\nx.sram.push(5)\nbus = Some(Ram(&x))\nprint(run(&x))\n", "peek")
+
+@test("a *Trait handed to the callee as an argument")
+ebh_ptr_argument_refused()
+    if !ebh_ready() then return
+
+    ebh_refused("poke(d: *Bus) = d.wipe()\n\n" + ebh_run(", d: *Bus", "poke(d)") +
+                "var x = Board(buf())\nx.sram.push(5)\nvar r = Ram(&x)\nprint(run(&x, &r))\n", "poke")
+
+@test("a &Trait handed to the callee as an argument, boxed on its way in")
+ebh_ref_argument_refused()
+    if !ebh_ready() then return
+
+    ebh_refused("poke(d: &Bus) = d.wipe()\n\n" + ebh_run(", d: &Bus", "poke(d)") +
+                "var x = Board(buf())\nx.sram.push(5)\nprint(run(&x, Ram(&x)))\n", "poke")
+
+@test("a &Trait held in a struct's field, the struct handed to the callee")
+ebh_field_refused()
+    if !ebh_ready() then return
+
+    ebh_refused("struct Slot\n    bus: &Bus\n\npoke(s: &Slot) = s.bus.wipe()\n\n" +
+                ebh_run(", s: &Slot", "poke(s)") +
+                "var x = Board(buf())\nx.sram.push(5)\nprint(run(&x, Slot(Ram(&x))))\n", "poke")
+
+@test("a value erased only in a module value's initializer, writing a buffer of the viewed type")
+ebh_module_initializer_refused()
+    if !ebh_ready() then return
+
+    ebh_refused("struct Cells\n    cells: Buf[u8]\n\nimpl Bus for Cells\n    wipe(*self)\n" +
+                "        for i in 0..<100000 do self.cells.push(7)\n\n" +
+                "static var bus: Option[&Bus] = Some(Cells(buf()))\n\n" + ebh_peek() + ebh_run("", "peek()") +
+                "var x = Board(buf())\nx.sram.push(5)\nprint(run(&x))\n", "peek")
+
+@test("an object over another trait in module storage counts, since a call through an object counts all of it")
+ebh_other_trait_in_storage_refused()
+    if !ebh_ready() then return
+
+    ebh_refused("trait Log\n    note(*self)\n\nimpl Log for Ram\n    note(*self)\n        self.board.sram.push(1)\n\n" +
+                "struct Tick\n    count: int\n\nimpl Bus for Tick\n    wipe(*self)\n        self.count += 1\n\n" +
+                "static var bus: Option[&Bus] = None\nstatic var log: Option[&Log] = None\n\n" + ebh_peek() +
+                ebh_run("", "peek()") +
+                "var x = Board(buf())\nx.sram.push(5)\nbus = Some(Tick(0))\nlog = Some(Ram(&x))\nprint(run(&x))\n",
+                "peek")
+
+@test("the trait, its impl, the erasure and the object's storage all in another module")
+ebh_other_module_refused()
+    if !ebh_ready() then return
+
+    val dev = "module dev\n\n" + ebh_head() + "var bus: Option[&Bus] = None\n\n" +
+              "plug(b: *Board)\n    bus = Some(Ram(b))\n\n" + ebh_peek()
+    val main = "import sysl.buf.buf\nimport dev.{Board, plug, peek}\n\n" + ebh_run("", "peek()") +
+               "var x = Board(buf())\nx.sram.push(5)\nplug(&x)\nprint(run(&x))\n"
+    val out = ebh_ran([("dev/dev.sysl", dev), ("main.sysl", main)])
+
+    assert(out.contains("'dev.peek' may write a 'Buf[byte]'"), s"expected a refusal naming 'dev.peek', got: $out")
+end ebh_other_module_refused
+
+// -- accepted: the object's values do not touch the buffer ----------------------------------------
+
+@test("an object whose only value writes nothing a view could stand on is accepted")
+ebh_untouched_accepted()
+    if !ebh_ready() then return
+
+    ebh_accepted("struct Tick\n    count: int\n\nimpl Bus for Tick\n    wipe(*self)\n        self.count += 1\n\n" +
+                 "static var bus: Option[&Bus] = None\n\n" + ebh_peek() + ebh_run("", "peek()") +
+                 "var x = Board(buf())\nx.sram.push(5)\nbus = Some(Tick(0))\nprint(run(&x))\n", "5\n")
+
+@test("a writing value behind another trait, held only by a local the callee cannot reach, is not asked of")
+ebh_other_trait_local_accepted()
+    if !ebh_ready() then return
+
+    ebh_accepted("trait Log\n    note(*self)\n\nimpl Log for Ram\n    note(*self)\n        self.board.sram.push(1)\n\n" +
+                 "struct Tick\n    count: int\n\nimpl Bus for Tick\n    wipe(*self)\n        self.count += 1\n\n" +
+                 "static var bus: Option[&Bus] = None\n\n" + ebh_peek() + ebh_run("", "peek()") +
+                 "var x = Board(buf())\nx.sram.push(5)\nbus = Some(Tick(0))\nprint(run(&x))\n\n" +
+                 "val log: &Log = Ram(&x)\nlog.note()\nprint(x.sram.len())\n", "5\n2\n")
