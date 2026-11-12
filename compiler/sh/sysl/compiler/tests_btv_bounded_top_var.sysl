@@ -12,7 +12,8 @@ import sysl.process.capture
 // is held to (`nested.sysl`'s `entry_slot_of`, `keeps.sysl`'s `entry_binding_loc`).
 //
 // The axes: the variable itself, a field of it, a callee that stores it, a function nested two deep, a
-// generic nested function, a function declared inside a block of the entry file; and beside them what
+// generic nested function, a function declared inside a block of the entry file, a buffer pushed into
+// (in a `static var`, a field of one, the top-level `var`, and from two deep); and beside them what
 // stays accepted (a local of the body, a variable of a block rather than the file, a variable of an
 // ordinary function's frame) and the neighbouring rules that already held the variable to module
 // storage's terms (a closure's capture, `@scoped(p)`, `@crossing`, a closure's parameter). Refusals are
@@ -169,7 +170,93 @@ btv_declared_in_a_block()
             keep((i) -> print(i))
         """, BtvTop)
 
+// A `Buf` handed by value to `push` is a copy naming the box the variable holds, so the slots the
+// callable lands in are held as long as the variable is (`keeps_flow.sysl`'s `module_slots`).
+
+@test("pushing the callable into a 'static var' buffer is told it is module storage")
+btv_push_static_buf()
+    btv_refused(raw"""
+        import sysl.buf.{Buf, buf}
+
+        static var jobs: Buf[&sync Fn(usize) -> unit] = buf()
+
+        @bounded(job)
+        keep(job: &sync Fn(usize) -> unit)
+            jobs.push(job)
+            job(0)
+
+        keep((i) -> print(i))
+        """, "but it stores 'job' in module storage (it is passed to 'push', which keeps it)")
+
+@test("pushing the callable into a buffer field of a 'static var' is told it is module storage")
+btv_push_static_field_buf()
+    btv_refused(raw"""
+        import sysl.buf.{Buf, buf}
+
+        struct Queue
+            jobs: Buf[&sync Fn(usize) -> unit]
+
+        static var queue = Queue(buf())
+
+        @bounded(job)
+        keep(job: &sync Fn(usize) -> unit)
+            queue.jobs.push(job)
+            job(0)
+
+        keep((i) -> print(i))
+        """, "but it stores 'job' in module storage (it is passed to 'push', which keeps it)")
+
+@test("pushing the callable into the entry file's top-level 'var' buffer is refused")
+btv_push_top_buf()
+    btv_refused(raw"""
+        import sysl.buf.{Buf, buf}
+
+        var jobs: Buf[&sync Fn(usize) -> unit] = buf()
+
+        @bounded(job)
+        keep(job: &sync Fn(usize) -> unit)
+            jobs.push(job)
+            job(0)
+
+        keep((i) -> print(i))
+        """, BtvTop + " (it is passed to 'push', which keeps it)")
+
+@test("a function nested two deep pushing into the top-level 'var' buffer is refused")
+btv_push_top_buf_nested()
+    btv_refused(raw"""
+        import sysl.buf.{Buf, buf}
+
+        var jobs: Buf[&sync Fn(usize) -> unit] = buf()
+
+        outer()
+            @bounded(job)
+            keep(job: &sync Fn(usize) -> unit)
+                jobs.push(job)
+                job(0)
+
+            keep((i) -> print(i))
+
+        outer()
+        """, BtvTop + " (it is passed to 'push', which keeps it)")
+
 // -- what stays accepted --------------------------------------------------------------------------
+
+@test("a '@bounded' body pushing the callable into a buffer of its own is accepted")
+btv_push_local_buf()
+    btv_prints(raw"""
+        import sysl.buf.{Buf, buf}
+
+        static var jobs: Buf[&sync Fn(usize) -> unit] = buf()
+
+        @bounded(job)
+        keep(job: &sync Fn(usize) -> unit)
+            var mine: Buf[&sync Fn(usize) -> unit] = buf()
+            mine.push(job)
+            mine[0](3)
+
+        keep((i) -> print(i))
+        print(jobs.len())
+        """, "3\n0\n")
 
 @test("a '@bounded' body keeping the callable in a local of its own is accepted")
 btv_local_of_the_body()
