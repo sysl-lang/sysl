@@ -37,14 +37,15 @@ count(p: *Pair)
         print(s"fiber says ${p.said}")
         switch(&p.fiber, &p.home)
 
+var pair = Pair(Context.new(), Context.new(), 0)
+
 main()
     val stack = Stack.reserve(64 * 1024).unwrap()
-    var p = Pair(Context.new(), Context.new(), 0)
 
-    p.fiber = Context.start(stack, &count, &p)
+    pair.fiber = Context.start(stack, &count, &pair)
 
     for _ in 0..<3
-        switch(&p.home, &p.fiber)
+        switch(&pair.home, &pair.fiber)
         print("main again")
 ```
 
@@ -63,7 +64,10 @@ main again
   has, `*extern(@lets_out *T) -> unit`, and `T` is inferred from it. The
   [`@lets_out`](/reference/types/#what-the-callable-reads-may-outlive-the-call-lets-out) says the entry
   may hand on what it reads through its argument, as a scheduler's entry does when it unlinks the job
-  it runs; an entry that does not, like `count`, stands there all the same.
+  it runs; an entry that does not, like `count`, stands there all the same. **`start` keeps `arg`**:
+  the fiber reads it for as long as it runs, past the call that started it and past the frame that
+  call was made in, so `arg` is module storage, as `pair` is here, or an object the fiber's owner keeps
+  alive — never the address of a local.
 - **`Context.new()`** is a context for the stack running now. It holds nothing until a switch leaves
   through it.
 - **`switch(&from, &to)`** saves the running stack in `from` and resumes `to`. To the code that called
@@ -71,6 +75,34 @@ main again
 
 A context is a value, and **the one a switch saved into is the one to resume**: hand its address
 around, as `Pair` does above, rather than a copy taken before the switch.
+
+**A fiber outlives the frame that started it**, so the address of a local is refused as `arg` — the
+function may return while the fiber is still parked, holding it:
+
+```sysl
+import sysl.fiber.{Context, Stack, switch}
+
+struct Pair
+    home: Context
+    fiber: Context
+
+wait(p: *Pair)
+    loop
+        switch(&p.fiber, &p.home)
+
+begin(stack: &Stack) -> Context
+    var p = Pair(Context.new(), Context.new())
+
+    Context.start(stack, &wait, &p)
+```
+
+```error
+'start' keeps its parameter 'arg' (it is passed to 'c_start', which keeps it), and '&p' is the address of a local of 'begin'
+```
+
+An object the owner of the fiber keeps alive serves as well as module storage: a `&Pair` made with
+`val p: &Pair = Pair(…)` is handed over as `&*p`, and whoever owns the fiber holds `p` for as long as
+anything may switch to it.
 
 ## What a switch costs
 
@@ -111,15 +143,16 @@ upward(m: *Modes)
     print(s"fiber still in ${rounding()}")
     switch(&m.fiber, &m.home)
 
+var modes = Modes(Context.new(), Context.new())
+
 main()
     val stack = Stack.reserve(64 * 1024).unwrap()
-    var m = Modes(Context.new(), Context.new())
 
     set_rounding(TowardZero)
-    m.fiber = Context.start(stack, &upward, &m)
-    switch(&m.home, &m.fiber)
+    modes.fiber = Context.start(stack, &upward, &modes)
+    switch(&modes.home, &modes.fiber)
     print(s"main still in ${rounding()}")
-    switch(&m.home, &m.fiber)
+    switch(&modes.home, &modes.fiber)
     set_rounding(NearestEven)
 ```
 
@@ -156,12 +189,13 @@ run(d: *Dig)
     print(dig(500))
     switch(&d.fiber, &d.home)
 
+var digging = Dig(Context.new(), Context.new())
+
 main()
     val stack = Stack.reserve(16 * 1024 * 1024).unwrap()
-    var d = Dig(Context.new(), Context.new())
 
-    d.fiber = Context.start(stack, &run, &d)
-    switch(&d.home, &d.fiber)
+    digging.fiber = Context.start(stack, &run, &digging)
+    switch(&digging.home, &digging.fiber)
 
     val kib = stack.committed() / 1024
 
@@ -207,12 +241,13 @@ struct Once
 forgetful(o: *Once)
     print("ran, and fell off the end")
 
+var once = Once(Context.new(), Context.new())
+
 main()
     val stack = Stack.reserve(64 * 1024).unwrap()
-    var o = Once(Context.new(), Context.new())
 
-    o.fiber = Context.start(stack, &forgetful, &o)
-    switch(&o.home, &o.fiber)
+    once.fiber = Context.start(stack, &forgetful, &once)
+    switch(&once.home, &once.fiber)
 ```
 
 ```output trap
@@ -275,19 +310,19 @@ elsewhere(h: *Hop)
     carrier = 2
     switch(&h.away, &h.fiber)
 
+var hopper = Hop(Context.new(), Context.new(), Context.new())
+
 main()
     carrier = 1
 
     val stack = Stack.reserve(64 * 1024).unwrap()
-    var h = Hop(Context.new(), Context.new(), Context.new())
 
-    h.fiber = Context.start(stack, &hop, &h)
-    switch(&h.home, &h.fiber)
+    hopper.fiber = Context.start(stack, &hop, &hopper)
+    switch(&hopper.home, &hopper.fiber)
 
-    val ph = &h
     var slots: [1]ScopeSlot = [ScopeSlot.new(); 1]
 
-    scope_in(slots[..], (s) -> s.start(&elsewhere, ph))
+    scope_in(slots[..], (s) -> s.start(&elsewhere, &hopper))
     print(s"main on carrier $carrier")
 ```
 

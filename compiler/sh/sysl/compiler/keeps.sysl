@@ -2041,6 +2041,12 @@ private handles_copy(hs: &Handles) -> &Handles = Handles(hs.org, hs.sources, hs.
 // held at when the call returns.
 private walk_kept(cx: &KeepsCx, f: TFunc, i: usize) -> KeptWhy = walk_kept_as(cx, f, i, false)
 
+// **The same, for a body a call through a function pointer may land in**: a `loop` nothing leaves
+// still holds what it holds at its head. A body that never returns holds nothing past a call that
+// sees it, whose frame lasts as long; but a pointer may be handed to a starter -- `Context.start`,
+// `spawn` -- that returns while the body runs on, so there the loop is one more way out.
+private walk_kept_endless(cx: &KeepsCx, f: TFunc, i: usize) -> KeptWhy = walk_track(track(cx, f, i, false), i, true)
+
 private walk_kept_as(cx: &KeepsCx, f: TFunc, i: usize, promised: bool) -> KeptWhy
     val t = track(cx, f, i, false)
 
@@ -2123,11 +2129,13 @@ end walk_deep
 private walk_answers_through(cx: &KeepsCx, f: TFunc, i: usize) -> KeptWhy =
     answered(track_as(cx, f, i, false, true, 0), f)
 
-private walk_track(t: &Track, i: usize) -> KeptWhy
+// `endless` makes a `loop` nothing leaves a way out (`FlowWalk.endless`).
+private walk_track(t: &Track, i: usize, endless: bool = false) -> KeptWhy
     val f = t.func
     val w = flow_walk(t.org, s -> track_stmt_events(t, s), e -> track_expr_events(t, e),
                       (x, p, matched) -> arm_clears(t.hs, x, p, matched))
 
+    w.endless = endless
     flow_body(w, f.body)
 
     val pending = if t.steps > 0 || t.deep then read_back_locs(t, w.out_pending) else w.out_pending
@@ -6372,7 +6380,10 @@ private refuse_promised(cx: &KeepsCx, faults: &KeepFaults, f: TFunc)
         // the caller's frame, so an implementation that keeps it past the call needs the trait's
         // `@keeps(self)`, which every call through an object then answers to.
         if !declared && (raw || reached)
-            val w = walk_kept(cx, f, i)
+            // A function pointer or an erased closure may be what a starter hands to a fiber or a
+            // thread, which runs on after the starter returns (`walk_kept_endless`).
+            val started = if closure then cx.erased.has(f.name) else addressed
+            val w = if started then walk_kept_endless(cx, f, i) else walk_kept(cx, f, i)
 
             if w.kept
                 faults.items.push((scope, w.at, promise_broken(cx, f, f.params[i].0, w.how, closure, trait_name) +

@@ -1,0 +1,286 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A fiber, or a thread, runs on after the call that started it returns, so two things are held to
+// that:
+//
+// - **`sysl.fiber.Context.start` keeps `arg`**, as `sysl.threads.spawn` does: the address of a
+//   caller's local is refused there, and through any wrapper that forwards to it. Module storage and
+//   a heap object's address (`&*job`) are accepted, and a fiber started in a function that then
+//   returns is resumed from its caller.
+// - **A `loop` nothing leaves is a way out of a body a call through a pointer may land in**: an entry
+//   that stores its parameter and then loops is refused as one that stores it and returns. A body
+//   called where it is in sight still never returns, so the loop still holds nothing past that call.
+//
+// The matrix crosses what `arg` is (a local of the starter, of `main`, a local's field, module
+// storage, a heap object), how `start` is reached (directly, a wrapper), and, for the entry, where the
+// store is (before the loop, inside it, before the loop but overwritten), how the body is reached (a
+// function pointer at `start`, at `spawn`, an erased closure, a direct call) and what it does (keeps
+// the parameter, lets reads out).
+//
+// Skipped cells, and why: a `while` loop (its condition may end it, so it is a way out already); an
+// entry declared `-> never` (no entry type returns `never`); a body reached only through a trait
+// object (no starter takes one).
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private fen_outcome(text: string) -> (string, int)
+    val root = make_temp_dir("sysl-fen").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", fen_prelude + text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end fen_outcome
+
+private fen_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = fen_outcome(text)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+
+private fen_refused(text: string, part: string)
+    if xvr_no_library() then return
+
+    val out = fen_outcome(text)
+
+    assert_eq(out.1, -1, out.0)
+    assert(out.0.index_of(part).is_some(), out.0)
+
+private const fen_prelude: string = raw"""
+    import sysl.fiber.{Context, Stack, switch}
+    import sysl.hint.black_box
+
+    struct Job
+        home: Context
+        me: Context
+        n: int
+
+    struct Outer
+        tag: int
+        job: Job
+
+    var g = Job(Context.new(), Context.new(), 0)
+    var held: *Job = null
+
+    count(j: *Job)
+        loop
+            j.n += 1
+            switch(&j.me, &j.home)
+
+    """
+
+// -- start keeps arg -------------------------------------------------------------------------------
+
+@test("the address of a starter's local is refused at start, which keeps it")
+fen_starter_local_refused()
+    fen_refused(raw"""
+        begin(s: &Stack) -> Context
+            var job = Job(Context.new(), Context.new(), 0)
+            Context.start(s, &count, &job)
+
+        main()
+            g.me = begin(Stack.reserve(65536).unwrap())
+        """, "'start' keeps its parameter 'arg' (it is passed to 'c_start', which keeps it), and '&job' " +
+             "is the address of a local of 'begin'")
+
+@test("the address of a local of main is refused at start as well")
+fen_main_local_refused()
+    fen_refused(raw"""
+        main()
+            val s = Stack.reserve(65536).unwrap()
+            var job = Job(Context.new(), Context.new(), 0)
+            job.me = Context.start(s, &count, &job)
+            switch(&job.home, &job.me)
+        """, "'&job' is the address of a local of 'main'")
+
+@test("the address of a field of a local is refused at start")
+fen_local_field_refused()
+    fen_refused(raw"""
+        main()
+            val s = Stack.reserve(65536).unwrap()
+            var o = Outer(1, Job(Context.new(), Context.new(), 0))
+            o.job.me = Context.start(s, &count, &o.job)
+            switch(&o.job.home, &o.job.me)
+        """, "'start' keeps its parameter 'arg'")
+
+@test("a wrapper forwarding to start keeps its own parameter, and a local handed to it is refused")
+fen_wrapper_local_refused()
+    fen_refused(raw"""
+        begin[T](s: &Stack, f: *extern(@lets_out *T) -> unit, x: *T) -> Context = Context.start(s, f, x)
+
+        main()
+            val s = Stack.reserve(65536).unwrap()
+            var job = Job(Context.new(), Context.new(), 0)
+            job.me = begin(s, &count, &job)
+            switch(&job.home, &job.me)
+        """, "'begin' keeps its parameter 'x' (it is passed to 'start'")
+
+@test("a heap object's address is accepted at start, and the fiber runs on it")
+fen_heap_accepted()
+    fen_prints(raw"""
+        main()
+            val s = Stack.reserve(65536).unwrap()
+            val job: &Job = Job(Context.new(), Context.new(), 0)
+            job.me = Context.start(s, &count, &*job)
+            switch(&job.home, &job.me)
+            switch(&job.home, &job.me)
+            print(job.n)
+        """, "2\n")
+
+@test("a fiber started on module storage in a function that returns is resumed from its caller")
+fen_module_outlives_starter()
+    fen_prints(raw"""
+        launch(s: &Stack)
+            g.me = Context.start(s, &count, &g)
+
+        main()
+            val s = Stack.reserve(65536).unwrap()
+            launch(s)
+            switch(&g.home, &g.me)
+            switch(&g.home, &g.me)
+            switch(&g.home, &g.me)
+            print(g.n)
+        """, "3\n")
+
+// -- an endless loop is a way out of an entry ------------------------------------------------------
+
+@test("an entry that stores its parameter and then loops for ever is refused at start")
+fen_endless_store_refused()
+    fen_refused(raw"""
+        keeper(j: *Job)
+            held = j
+            loop
+                switch(&j.me, &j.home)
+
+        main()
+            val s = Stack.reserve(65536).unwrap()
+            g.me = Context.start(s, &keeper, &g)
+            switch(&g.home, &g.me)
+        """, "'keeper' keeps its parameter 'j' (it is stored in 'held')")
+
+@test("an entry that stores its parameter inside its endless loop is refused")
+fen_endless_store_in_loop_refused()
+    fen_refused(raw"""
+        keeper(j: *Job)
+            loop
+                held = j
+                switch(&j.me, &j.home)
+
+        main()
+            val s = Stack.reserve(65536).unwrap()
+            g.me = Context.start(s, &keeper, &g)
+            switch(&g.home, &g.me)
+        """, "'keeper' keeps its parameter 'j' (it is stored in 'held')")
+
+@test("an entry that overwrites what it stored before its endless loop is accepted")
+fen_endless_cleared_accepted()
+    fen_prints(raw"""
+        tidy(j: *Job)
+            held = j
+            j.n = 5
+            held = null
+            loop
+                j.n += 1
+                switch(&j.me, &j.home)
+
+        main()
+            val s = Stack.reserve(65536).unwrap()
+            g.me = Context.start(s, &tidy, &g)
+            switch(&g.home, &g.me)
+            print(g.n)
+            print(held == null)
+        """, "6\ntrue\n")
+
+@test("an entry that loops for ever letting out only what it reads is still accepted")
+fen_endless_lets_out_accepted()
+    fen_prints(raw"""
+        struct Link
+            home: Context
+            me: Context
+            next: *int
+
+        var target = 4
+        var last: *int = null
+        var link = Link(Context.new(), Context.new(), null)
+
+        watch(l: *Link)
+            loop
+                last = l.next
+                switch(&l.me, &l.home)
+
+        main()
+            val s = Stack.reserve(65536).unwrap()
+            link.next = &target
+            link.me = Context.start(s, &watch, &link)
+            switch(&link.home, &link.me)
+            print(*last)
+        """, "4\n")
+
+@test("a function that stores its parameter and loops is still accepted where it is called directly")
+fen_direct_call_accepted()
+    fen_prints(raw"""
+        var kept: *int = null
+
+        serve(p: *int)
+            kept = p
+            loop
+                *p += 1
+
+        main()
+            var n = 0
+            if black_box(false) then serve(&n)
+            print("ok")
+        """, "ok\n")
+
+@test("a thread's body that stores its parameter and loops for ever is refused at spawn")
+fen_spawn_endless_refused()
+    fen_refused(raw"""
+        import sysl.threads.spawn
+
+        var counter = 0
+        var kept: *int = null
+
+        serve(p: *int)
+            kept = p
+            loop
+                *p += 1
+
+        main()
+            _ = spawn(&serve, &counter)
+        """, "'serve' keeps its parameter 'p' (it is stored in 'kept')")
+
+@test("an erased closure that stores its parameter and loops for ever is refused")
+fen_closure_endless_refused()
+    fen_refused(raw"""
+        var kept: *int = null
+
+        main()
+            val f: &Fn(*int) -> unit = (p) ->
+                kept = p
+                loop
+                    *p += 1
+            if black_box(false)
+                var n = 0
+                f(&n)
+            end if
+        """, "this one keeps its parameter 'p'")

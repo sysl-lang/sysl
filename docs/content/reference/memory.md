@@ -953,6 +953,33 @@ f(&m, m.sp)
 'halt' keeps its parameter 'sp' (it is stored in 'm.sp'), and its address is taken — a call through a function pointer sees no body
 ```
 
+**A `loop` nothing leaves is a way out of a function whose address is taken**, holding what it holds
+at its head. Called where its body is in sight, such a function never returns to its caller, whose
+frame therefore outlasts everything it stores; but a pointer may be handed to a starter —
+[`Context.start`](/library/fiber/), [`spawn`](/library/threads/) — that returns while the body runs
+on, so an entry that stores its argument and then loops is refused as one that returns:
+
+```sysl
+import sysl.fiber.{Context, switch}
+
+struct Job
+    home: Context
+    me: Context
+
+var held: *Job = null
+
+serve(j: *Job)
+    held = j
+    loop
+        switch(&j.me, &j.home)
+
+val entry: *extern(*Job) -> unit = &serve
+```
+
+```error
+'serve' keeps its parameter 'j' (it is stored in 'held'), and its address is taken — a call through a function pointer sees no body
+```
+
 **A callable that only lets out what it reads is marked
 [`@lets_out`](/reference/types/#what-the-callable-reads-may-outlive-the-call-lets-out)**:
 `*extern(@lets_out *Heap) -> unit`. A function or closure taken at the type may let out what it reads
