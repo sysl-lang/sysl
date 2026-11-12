@@ -12,12 +12,14 @@ import sysl.process.capture
 //   a heap object's address (`&*job`) are accepted, and a fiber started in a function that then
 //   returns is resumed from its caller.
 // - **A `loop` nothing leaves is a way out of a body a call through a pointer may land in**: an entry
-//   that stores its parameter and then loops is refused as one that stores it and returns. A body
-//   called where it is in sight still never returns, so the loop still holds nothing past that call.
+//   that stores its parameter and then loops is refused as one that stores it and returns, and so is
+//   one that hands its parameter to a callee, at any depth, that does. A body called where it is in
+//   sight, from anywhere else, still never returns, so the loop still holds nothing past that call.
 //
 // The matrix crosses what `arg` is (a local of the starter, of `main`, a local's field, module
 // storage, a heap object), how `start` is reached (directly, a wrapper), and, for the entry, where the
-// store is (before the loop, inside it, before the loop but overwritten), how the body is reached (a
+// store is (before the loop, inside it, before the loop but overwritten; in the entry, in a callee one
+// or two calls down), how the body is reached (a
 // function pointer at `start`, at `spawn`, an erased closure, a direct call) and what it does (keeps
 // the parameter, lets reads out).
 //
@@ -284,3 +286,135 @@ fen_closure_endless_refused()
                 f(&n)
             end if
         """, "this one keeps its parameter 'p'")
+
+// -- an endless loop in a callee of an entry -------------------------------------------------------
+
+@test("an entry handing its parameter to a callee that stores it and loops for ever is refused")
+fen_callee_endless_refused()
+    fen_refused(raw"""
+        serve(j: *Job)
+            held = j
+            loop
+                switch(&j.me, &j.home)
+
+        entry(j: *Job)
+            serve(j)
+
+        main()
+            val s = Stack.reserve(65536).unwrap()
+            g.me = Context.start(s, &entry, &g)
+            switch(&g.home, &g.me)
+        """, "'entry' keeps its parameter 'j'")
+
+@test("a callee two calls down that stores the parameter and loops for ever is refused")
+fen_callee_deep_endless_refused()
+    fen_refused(raw"""
+        serve(j: *Job)
+            loop
+                held = j
+                switch(&j.me, &j.home)
+
+        middle(j: *Job)
+            serve(j)
+
+        entry(j: *Job)
+            middle(j)
+
+        main()
+            val s = Stack.reserve(65536).unwrap()
+            g.me = Context.start(s, &entry, &g)
+            switch(&g.home, &g.me)
+        """, "'entry' keeps its parameter 'j'")
+
+@test("a thread's body handing its parameter to a callee that stores it and loops is refused at spawn")
+fen_spawn_callee_endless_refused()
+    fen_refused(raw"""
+        import sysl.threads.spawn
+
+        var counter = 0
+        var kept: *int = null
+
+        serve(p: *int)
+            kept = p
+            loop
+                *p += 1
+
+        body(p: *int)
+            serve(p)
+
+        main()
+            _ = spawn(&body, &counter)
+        """, "'body' keeps its parameter 'p'")
+
+@test("an entry whose endless callee overwrites what it stored is accepted")
+fen_callee_endless_cleared_accepted()
+    fen_prints(raw"""
+        serve(j: *Job)
+            held = j
+            j.n = 7
+            held = null
+            loop
+                switch(&j.me, &j.home)
+
+        entry(j: *Job)
+            serve(j)
+
+        main()
+            val s = Stack.reserve(65536).unwrap()
+            g.me = Context.start(s, &entry, &g)
+            switch(&g.home, &g.me)
+            print(g.n)
+            print(held == null)
+        """, "7\ntrue\n")
+
+@test("an entry whose endless callee only counts through its parameter is accepted")
+fen_callee_endless_counts_accepted()
+    fen_prints(raw"""
+        entry(j: *Job)
+            count(j)
+
+        main()
+            val s = Stack.reserve(65536).unwrap()
+            g.me = Context.start(s, &entry, &g)
+            switch(&g.home, &g.me)
+            switch(&g.home, &g.me)
+            print(g.n)
+        """, "2\n")
+
+@test("a callee that stores its parameter and loops is still accepted where main calls it directly")
+fen_callee_endless_direct_accepted()
+    fen_prints(raw"""
+        var kept: *int = null
+
+        serve(p: *int)
+            kept = p
+            loop
+                *p += 1
+
+        relay(p: *int)
+            serve(p)
+
+        main()
+            var n = 0
+            if black_box(false) then relay(&n)
+            print("ok")
+        """, "ok\n")
+
+@test("an endless callee also called directly, first, is still refused through a started entry")
+fen_callee_endless_both_refused()
+    fen_refused(raw"""
+        serve(j: *Job)
+            held = j
+            loop
+                switch(&j.me, &j.home)
+
+        entry(j: *Job)
+            serve(j)
+
+        main()
+            var mine = Job(Context.new(), Context.new(), 0)
+            if black_box(false) then serve(&mine)
+            val s = Stack.reserve(65536).unwrap()
+            g.me = Context.start(s, &entry, &g)
+            switch(&g.home, &g.me)
+        """, "'entry' keeps its parameter 'j' (it is passed to 'serve', which keeps it)")

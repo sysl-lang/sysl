@@ -957,7 +957,8 @@ f(&m, m.sp)
 at its head. Called where its body is in sight, such a function never returns to its caller, whose
 frame therefore outlasts everything it stores; but a pointer may be handed to a starter —
 [`Context.start`](/library/fiber/), [`spawn`](/library/threads/) — that returns while the body runs
-on, so an entry that stores its argument and then loops is refused as one that returns:
+on, so an entry that stores its argument and then loops is refused as one that returns, and so is an
+entry that hands its argument, at any depth, to a function that stores it and loops for ever:
 
 ```sysl
 import sysl.fiber.{Context, switch}
