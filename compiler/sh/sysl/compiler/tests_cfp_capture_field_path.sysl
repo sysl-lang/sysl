@@ -1,0 +1,329 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A closure capturing a local by value is asked what its body lets out of that capture FIELD BY FIELD,
+// as a call in the frame handed the local's address is (`keeps.sysl`'s `held_in_capture`,
+// `hand_path`, `capture_rest`): a body handing `&a` to a callee that lets out what it reads along
+// `.reg` lets out nothing of the address `a.other` holds. `scope`'s body is the case that found it --
+// it runs inside the call, and a local of the frame around it outlives that call -- but the rule is
+// the closure's, so a plain callee taking a bare arrow, a nested closure and a loop are asked the same
+// way, and a body letting out the very field that holds the address is refused in every one of them.
+// `reference/memory.md § A closure is judged where it is written` is the specification.
+//
+// Skipped cells, and why: a `s.spawn` closure capturing `a` here is refused by the crossing rule
+// before this one is asked (`Cpu` holds a `&Mem`, whose count is not atomic); a call through a
+// function pointer or an object in the body stays judged by the body, as no frame call names its callee.
+//
+// **A closure that runs within the call is judged as the frame is** (`keeps.sysl`'s
+// `put_back_by_reference`): a callee that only writes into storage the frame owns (`c.bus` pointing at
+// another local, written through) is let through in a scope body, a plain runner, a nested closure and a
+// loop, as the frame's own call is (`frame_closed`). A closure stored in module storage holds a copy and
+// stays refused, and so does one whose callee lets the frame's address out, or writes it through a
+// pointer the frame does not own.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private cfp_outcome(text: string) -> (string, int)
+    val root = make_temp_dir("sysl-cfp").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end cfp_outcome
+
+private cfp_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = cfp_outcome(text)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+end cfp_prints
+
+private cfp_refused(text: string, part: string)
+    if xvr_no_library() then return
+
+    val out = cfp_outcome(text)
+
+    assert_eq(out.1, -1, out.0)
+    assert(out.0.index_of(part).is_some(), out.0)
+end cfp_refused
+
+// A core whose `other` holds the address of a local, a memory on the heap, and two callees: `poke`
+// lets out what it reads along `.reg`, `leak` what it reads along `.other`.
+private cfp_head() -> string = raw"""
+    import sysl.threads.scope
+
+    struct Mem
+        last: *int
+        cpu: *Cpu
+
+    struct Cpu
+        mem: &Mem
+        reg: *int
+        other: *Cpu
+
+    poke(c: *Cpu) = c.mem.last = c.reg
+    leak(c: *Cpu) = c.mem.cpu = c.other
+    via(c: *Cpu) = poke(c)
+    run(f: () -> unit) = f()
+
+    """
+
+private cfp_lets_out(how: string) -> string =
+    s"a closure lets its capture 'a' outlive the call ($how), and 'a' holds the address of a local of 'main'"
+
+// -- accepted: the field let out holds no address of the frame ------------------------------------
+
+@test("a scope body hands a captured local's address to a callee letting out a field that holds no frame address")
+cfp_scope_body_accepted()
+    cfp_prints(cfp_head() + raw"""
+        main()
+            var a = Cpu(Mem(null, null), null, null)
+            var b = Cpu(a.mem, null, null)
+            a.other = &b
+            poke(&a)
+            scope((s) -> poke(&a))
+            print(a.mem.last == null)
+        """, "true\n")
+
+@test("the same closure handed to a plain callee that runs it")
+cfp_plain_call_accepted()
+    cfp_prints(cfp_head() + raw"""
+        main()
+            var a = Cpu(Mem(null, null), null, null)
+            var b = Cpu(a.mem, null, null)
+            a.other = &b
+            run(() -> poke(&a))
+            print(1)
+        """, "1\n")
+
+@test("a scope body handing the address on through a relay")
+cfp_relay_accepted()
+    cfp_prints(cfp_head() + raw"""
+        main()
+            var a = Cpu(Mem(null, null), null, null)
+            var b = Cpu(a.mem, null, null)
+            a.other = &b
+            scope((s) -> via(&a))
+            print(2)
+        """, "2\n")
+
+@test("a closure nested in the scope body captures the outer one's copy")
+cfp_nested_accepted()
+    cfp_prints(cfp_head() + raw"""
+        main()
+            var a = Cpu(Mem(null, null), null, null)
+            var b = Cpu(a.mem, null, null)
+            a.other = &b
+            scope((s) -> scope((t) -> poke(&a)))
+            run(() -> run(() -> poke(&a)))
+            print(3)
+        """, "3\n")
+
+@test("a scope body calling the callee in a loop, and counting in a captured var")
+cfp_loop_accepted()
+    cfp_prints(cfp_head() + raw"""
+        main()
+            var a = Cpu(Mem(null, null), null, null)
+            var b = Cpu(a.mem, null, null)
+            a.other = &b
+            var n = 0
+            scope((s) ->
+                for i in 0..<3
+                    poke(&a)
+                    n += 1)
+            print(n)
+        """, "3\n")
+
+// -- refused: the field let out is the one holding the frame's address ----------------------------
+
+@test("a scope body handing the address to a callee letting out the field that holds a local's address")
+cfp_scope_body_refused()
+    cfp_refused(cfp_head() + raw"""
+        main()
+            var a = Cpu(Mem(null, null), null, null)
+            var b = Cpu(a.mem, null, null)
+            a.other = &b
+            scope((s) -> leak(&a))
+        """, cfp_lets_out("it is passed to 'leak', which lets what it reads through it out"))
+
+@test("the same through a plain callee, a loop, and a relay")
+cfp_plain_loop_refused()
+    cfp_refused(cfp_head() + raw"""
+        relay(c: *Cpu) = leak(c)
+
+        main()
+            var a = Cpu(Mem(null, null), null, null)
+            var b = Cpu(a.mem, null, null)
+            a.other = &b
+            scope((s) -> for i in 0..<3 do relay(&a))
+        """, cfp_lets_out("it is passed to 'relay', which lets what it reads through it out"))
+
+@test("a closure nested in the scope body letting out the field that holds a local's address")
+cfp_nested_refused()
+    cfp_refused(cfp_head() + raw"""
+        main()
+            var a = Cpu(Mem(null, null), null, null)
+            var b = Cpu(a.mem, null, null)
+            a.other = &b
+            scope((s) -> scope((t) -> leak(&a)))
+        """, cfp_lets_out("it is captured by a closure, which lets it out (it is passed to 'leak', which lets what it " +
+            "reads through it out)"))
+
+@test("a closure over the local stored in module storage is refused whatever its body lets out")
+cfp_stored_refused()
+    cfp_refused(cfp_head() + raw"""
+        var idle: &Fn() -> unit = () -> ()
+
+        main()
+            var a = Cpu(Mem(null, null), null, null)
+            var b = Cpu(a.mem, null, null)
+            a.other = &b
+            idle = () -> poke(&a)
+        """, "holds the address of a local of 'main', and it is stored in 'idle', which outlives 'main'")
+
+// -- a callee writing only into storage the frame owns --------------------------------------------
+
+// A core whose `bus` points at storage of the caller's choosing: `put` writes the core's `reg` through
+// it, which lets nothing out where the bus is another local of the same frame, and `drop_reg` lets
+// `reg` out into module storage.
+private cfp_frame_head() -> string = raw"""
+    import sysl.threads.scope
+
+    struct Bus
+        last: *int
+
+    struct Core
+        bus: *Bus
+        reg: *int
+
+    struct Board
+        core: Core
+
+    var kept: *int = null
+
+    put(c: *Core) = c.bus.last = c.reg
+    relay(c: *Core) = put(c)
+    drop_reg(c: *Core) = kept = c.reg
+    run(f: () -> unit) = f()
+
+    """
+
+private cfp_core_lets_out(how: string) -> string =
+    s"a closure lets its capture 'c' outlive the call ($how), and 'c' holds the address of a local of 'main'"
+
+@test("a scope body handing a captured local to a callee writing only into another local of the frame")
+cfp_frame_scope_accepted()
+    cfp_prints(cfp_frame_head() + raw"""
+        main()
+            var n = 7
+            var b = Bus(null)
+            var c = Core(&b, &n)
+            put(&c)
+            scope((s) -> put(&c))
+            print(*b.last)
+        """, "7\n")
+
+@test("the same closure handed to a plain runner, and a field's address handed on")
+cfp_frame_runner_accepted()
+    cfp_prints(cfp_frame_head() + raw"""
+        main()
+            var n = 8
+            var b = Bus(null)
+            var c = Core(&b, &n)
+            var w = Board(Core(&b, &n))
+            run(() -> put(&c))
+            scope((s) -> put(&w.core))
+            print(*b.last)
+        """, "8\n")
+
+@test("nested closures, a relay, and a loop counting in a captured var")
+cfp_frame_nested_loop_accepted()
+    cfp_prints(cfp_frame_head() + raw"""
+        main()
+            var n = 1
+            var b = Bus(null)
+            var c = Core(&b, &n)
+            scope((s) -> scope((t) -> put(&c)))
+            run(() -> run(() -> relay(&c)))
+            var k = 0
+            scope((s) ->
+                for i in 0..<3
+                    relay(&c)
+                    k += 1)
+            print(*b.last + k)
+        """, "4\n")
+
+@test("a closure over the local stored in a module &Fn is still refused though its callee writes only into the frame")
+cfp_frame_stored_refused()
+    cfp_refused(cfp_frame_head() + raw"""
+        var idle: &Fn() -> unit = () -> ()
+
+        main()
+            var n = 1
+            var b = Bus(null)
+            var c = Core(&b, &n)
+            idle = () -> put(&c)
+        """, "holds the address of a local of 'main', and it is stored in 'idle', which outlives 'main'")
+
+@test("a scope body whose callee lets the field holding the frame's address out is still refused")
+cfp_frame_lets_out_refused()
+    cfp_refused(cfp_frame_head() + raw"""
+        main()
+            var n = 1
+            var b = Bus(null)
+            var c = Core(&b, &n)
+            scope((s) -> drop_reg(&c))
+        """, cfp_core_lets_out("it is passed to 'drop_reg', which lets what it reads through it out"))
+
+@test("a nested closure whose callee lets the frame's address out is still refused")
+cfp_frame_nested_lets_out_refused()
+    cfp_refused(cfp_frame_head() + raw"""
+        main()
+            var n = 1
+            var b = Bus(null)
+            var c = Core(&b, &n)
+            run(() -> run(() -> drop_reg(&c)))
+        """, cfp_core_lets_out("it is captured by a closure, which lets it out (it is passed to 'drop_reg', which " +
+            "lets what it reads through it out)"))
+
+@test("a bus in module storage, or the caller's, is not the frame's: the write through it is refused")
+cfp_frame_not_owned_refused()
+    cfp_refused(cfp_frame_head() + raw"""
+        var shared = Bus(null)
+
+        main()
+            var n = 1
+            var c = Core(&shared, &n)
+            scope((s) -> put(&c))
+        """, cfp_core_lets_out("it is passed to 'put', which lets what it reads through it out"))
+    cfp_refused(cfp_frame_head() + raw"""
+        go(b: *Bus)
+            var n = 1
+            var c = Core(b, &n)
+            run(() -> put(&c))
+
+        main()
+            var b = Bus(null)
+            go(&b)
+        """, "a closure lets its capture 'c' outlive the call (it is passed to 'put', which lets what it reads " +
+            "through it out), and 'c' holds the address of a local of 'go'")
