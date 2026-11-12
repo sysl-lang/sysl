@@ -86,11 +86,16 @@ struct FlowWalk
     exited: bool
     loops: Buf[&LoopEdges]
     org: &Origins
+
+    // **A `loop` nothing leaves is a way out**, with what is held at its head: set for a body a starter
+    // may run past its own return (`keeps.sysl`'s `walk_kept_endless`). Otherwise such a loop ends
+    // nothing, and what it holds is never held past a call whose frame outlasts it.
+    endless: bool
 end FlowWalk
 
 flow_walk(org: &Origins, stmt_events: &Fn(TStmt) -> Buf[FlowEv], expr_events: &Fn(TExpr) -> Buf[FlowEv],
           arm_events: &Fn(TExpr, TPattern, bool) -> Buf[FlowEv]) -> &FlowWalk =
-    FlowWalk(stmt_events, expr_events, arm_events, buf(), buf(), buf(), buf(), false, buf(), org)
+    FlowWalk(stmt_events, expr_events, arm_events, buf(), buf(), buf(), buf(), false, buf(), org, false)
 
 // Walks a function's body from its entry to every way out.
 flow_body(w: &FlowWalk, body: TBlock)
@@ -598,6 +603,8 @@ private flow_loop(w: &FlowWalk, st: &PathState, body: Buf[TStmt], step: Buf[TStm
         if same_state(next, head) || rounds > 8 then break
 
         head = next
+
+    if !may_end && w.endless then flow_exit(w, head)
 
     var out = if may_end then copy_state(head) else dead_state()
 

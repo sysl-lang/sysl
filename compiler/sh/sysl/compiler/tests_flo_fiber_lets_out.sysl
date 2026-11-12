@@ -9,18 +9,16 @@ import sysl.process.capture
 // let out what it reads through `arg` -- a scheduler unlinking the job it runs -- while it is still
 // refused where it keeps the address itself. An unmarked entry stands where the marked type is asked
 // for (`reference/types.md § What the callable reads may outlive the call`), so every existing `Context.start(s, &f, &x)` is unchanged.
-// `start` lends `arg` (nothing it calls keeps it), so the address of a caller's local is still taken
-// there, as `library/fiber.md`'s own example takes it.
+// `start` keeps `arg`, so `arg` here is module storage or a heap object's address (`&*job`); what
+// `start` keeps, and an entry ending in an endless `loop`, are `tests_fen_fiber_entry.sysl`'s.
 //
 // The matrix crosses how `start` is reached (directly, a generic wrapper taking the marked type, one
 // taking the unmarked type) with what the entry does (lets reads out, plain, keeps the parameter),
 // how the entry is handed (`&f` directly, a function-pointer value of the marked, the unmarked and
-// the `@keeps` type) and what `arg` is (module storage, a local's address).
+// the `@keeps` type) and what `arg` is (module storage, a heap object).
 //
 // Every entry here switches home once and is never resumed, so it never reaches its end at run time;
-// the analysis still sees a body that comes back, which is what the marks are asked of. An entry
-// ending in an endless `loop` never comes back at all, so it holds nothing past its call and no mark
-// is asked of it.
+// the analysis still sees a body that comes back, which is what the marks are asked of.
 //
 // Skipped cells, and why: a closure entry (`start` takes a `*extern`, never a callable); a bare
 // target (`start` reads the same signature there; the difference is the stack's storage, not the
@@ -102,13 +100,13 @@ private const flo_prelude: string = raw"""
 
 // -- accepted ------------------------------------------------------------------------------------
 
-@test("start begins an entry that lets out what it reads through the address of a caller's local")
+@test("start begins an entry that lets out what it reads through a heap object")
 flo_local_lets_out()
     flo_prints(raw"""
         main()
             val s = Stack.reserve(65536).unwrap()
-            var job = Job(Context.new(), Context.new(), &a)
-            job.me = Context.start(s, &body, &job)
+            val job: &Job = Job(Context.new(), Context.new(), &a)
+            job.me = Context.start(s, &body, &*job)
             switch(&job.home, &job.me)
             print(last.v)
         """, "7\n")
@@ -132,6 +130,7 @@ flo_unlink_entry()
             next: *Lwt
 
         var spare: *Lwt = null
+        var tail = Lwt(Context.new(), Context.new(), null)
 
         finish(p: *Lwt)
             spare = p.next
@@ -142,9 +141,8 @@ flo_unlink_entry()
 
         main()
             val s = Stack.reserve(65536).unwrap()
-            var tail = Lwt(Context.new(), Context.new(), null)
-            var p = Lwt(Context.new(), Context.new(), &tail)
-            p.me = Context.start(s, &entry, &p)
+            val p: &Lwt = Lwt(Context.new(), Context.new(), &tail)
+            p.me = Context.start(s, &entry, &*p)
             switch(&p.home, &p.me)
             print(spare == &tail)
         """, "true\n")
@@ -165,8 +163,8 @@ flo_plain_entry()
     flo_prints(raw"""
         main()
             val s = Stack.reserve(65536).unwrap()
-            var job = Job(Context.new(), Context.new(), &a)
-            job.me = Context.start(s, &plain, &job)
+            val job: &Job = Job(Context.new(), Context.new(), &a)
+            job.me = Context.start(s, &plain, &*job)
             switch(&job.home, &job.me)
             print(a.v)
         """, "8\n")
@@ -189,8 +187,8 @@ flo_generic_wrapper_marked()
 
         main()
             val s = Stack.reserve(65536).unwrap()
-            var job = Job(Context.new(), Context.new(), &a)
-            job.me = begin(s, &body, &job)
+            val job: &Job = Job(Context.new(), Context.new(), &a)
+            job.me = begin(s, &body, &*job)
             switch(&job.home, &job.me)
             print(last.v)
         """, "7\n")
@@ -202,8 +200,8 @@ flo_generic_wrapper_unmarked()
 
         main()
             val s = Stack.reserve(65536).unwrap()
-            var job = Job(Context.new(), Context.new(), &a)
-            job.me = begin(s, &plain, &job)
+            val job: &Job = Job(Context.new(), Context.new(), &a)
+            job.me = begin(s, &plain, &*job)
             switch(&job.home, &job.me)
             print(a.v)
         """, "8\n")

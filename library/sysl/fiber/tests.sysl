@@ -33,9 +33,9 @@ private pong(p: *Pong)
 @test("two contexts switch a million times each way, and every switch lands")
 fbr_ping_pong_a_million()
     val s = Stack.reserve(64 * 1024).unwrap()
-    var p = Pong(Context.new(), Context.new(), 0)
+    val p: &Pong = Pong(Context.new(), Context.new(), 0)
 
-    p.me = Context.start(s, &pong, &p)
+    p.me = Context.start(s, &pong, &*p)
     assert(p.me.is_ready())
     assert(!p.home.is_ready())
 
@@ -54,22 +54,22 @@ fbr_ping_pong_a_million()
 @test("a context started but never switched to is dropped with its stack, and runs nothing")
 fbr_never_entered()
     val s = Stack.reserve(16 * 1024).unwrap()
-    var p = Pong(Context.new(), Context.new(), 0)
+    val p: &Pong = Pong(Context.new(), Context.new(), 0)
 
-    p.me = Context.start(s, &pong, &p)
+    p.me = Context.start(s, &pong, &*p)
     assert_eq(p.n, 0)
 
 @test("one stack is started a second time once its first fiber is finished with")
 fbr_stack_reused()
     val s = Stack.reserve(16 * 1024).unwrap()
-    var a = Pong(Context.new(), Context.new(), 0)
+    val a: &Pong = Pong(Context.new(), Context.new(), 0)
 
-    a.me = Context.start(s, &pong, &a)
+    a.me = Context.start(s, &pong, &*a)
     switch(&a.home, &a.me)
 
-    var b = Pong(Context.new(), Context.new(), 0)
+    val b: &Pong = Pong(Context.new(), Context.new(), 0)
 
-    b.me = Context.start(s, &pong, &b)
+    b.me = Context.start(s, &pong, &*b)
     switch(&b.home, &b.me)
     switch(&b.home, &b.me)
     assert_eq(a.n, 1)
@@ -97,10 +97,10 @@ private ring_b(r: *Ring)
 fbr_ring_of_three()
     val sa = Stack.reserve(32 * 1024).unwrap()
     val sb = Stack.reserve(32 * 1024).unwrap()
-    var r = Ring(Context.new(), Context.new(), Context.new(), buf())
+    val r: &Ring = Ring(Context.new(), Context.new(), Context.new(), buf())
 
-    r.a = Context.start(sa, &ring_a, &r)
-    r.b = Context.start(sb, &ring_b, &r)
+    r.a = Context.start(sa, &ring_a, &*r)
+    r.b = Context.start(sb, &ring_b, &*r)
 
     for _ in 0..<3
         switch(&r.home, &r.a)
@@ -146,14 +146,14 @@ fbr_migrates_between_threads()
     carrier_tag = 1
 
     val s = Stack.reserve(256 * 1024).unwrap()
-    var h = Hop(Context.new(), Context.new(), Context.new(), 0, 0, 0, 0, 0)
+    val h: &Hop = Hop(Context.new(), Context.new(), Context.new(), 0, 0, 0, 0, 0)
+    val ph = &*h
 
-    h.me = Context.start(s, &hop, &h)
+    h.me = Context.start(s, &hop, ph)
     switch(&h.home, &h.me)
     assert_eq(h.first, current().id)
     assert_eq(h.first_tag, 1)
 
-    val ph = &h
     var slots: [1]ScopeSlot = [ScopeSlot.new(); 1]
 
     scope_in(slots[..], (s) -> s.start(&on_another_thread, ph))
@@ -195,13 +195,12 @@ fbr_thread_locals_follow_the_carrier()
     carrier_tag = 1
 
     val s = Stack.reserve(64 * 1024).unwrap()
-    var r = Rounds(Context.new(), Context.new(), [0; 3], [0; 3], 1)
+    val r: &Rounds = Rounds(Context.new(), Context.new(), [0; 3], [0; 3], 1)
+    val pr = &*r
 
-    r.me = Context.start(s, &rounds, &r)
+    r.me = Context.start(s, &rounds, pr)
     switch(&r.back, &r.me)
     assert_eq(carrier_tag, 11)
-
-    val pr = &r
 
     for k in 2..<4
         r.next = k
@@ -251,9 +250,9 @@ fbr_commits_lazily()
     assert(s.len() >= 64 * 1024 * 1024)
     assert(s.committed() <= 64 * 1024, s"${s.committed()} before anything ran")
 
-    var d = Dig(Context.new(), Context.new(), 1024, 0)
+    val d: &Dig = Dig(Context.new(), Context.new(), 1024, 0)
 
-    d.me = Context.start(s, &dig_body, &d)
+    d.me = Context.start(s, &dig_body, &*d)
     switch(&d.home, &d.me)
 
     val got = s.committed()
@@ -288,11 +287,11 @@ fbr_ten_thousand_stacks()
     for _ in 0..<10000
         stacks.push(Stack.reserve(16 * 1024).unwrap())
 
-    var p = Pong(Context.new(), Context.new(), 0)
+    val p: &Pong = Pong(Context.new(), Context.new(), 0)
 
     for i in 0..<stacks.len()
         if i % 1000 == 0
-            p.me = Context.start(stacks[i], &pong, &p)
+            p.me = Context.start(stacks[i], &pong, &*p)
             switch(&p.home, &p.me)
 
     assert_eq(p.n, 10)
@@ -322,9 +321,9 @@ fbr_rounding_mode_is_saved()
     set_rounding(Downward)
 
     val s = Stack.reserve(32 * 1024).unwrap()
-    var m = Modes(Context.new(), Context.new(), NearestEven, NearestEven)
+    val m: &Modes = Modes(Context.new(), Context.new(), NearestEven, NearestEven)
 
-    m.me = Context.start(s, &modes, &m)
+    m.me = Context.start(s, &modes, &*m)
     set_rounding(TowardZero)
     switch(&m.home, &m.me)
 
@@ -382,9 +381,9 @@ end trample
 @test("floats live across a switch survive the other side writing d8 to d15")
 fbr_live_floats_survive()
     val s = Stack.reserve(32 * 1024).unwrap()
-    var f = Floats(Context.new(), Context.new())
+    val f: &Floats = Floats(Context.new(), Context.new())
 
-    f.me = Context.start(s, &trample, &f)
+    f.me = Context.start(s, &trample, &*f)
 
     val x0 = black_box(0.25)
     val x1 = black_box(1.25)
@@ -440,9 +439,9 @@ end busy
 @test("integers and floats live across a switch survive, on both sides of it, round after round")
 fbr_live_values_survive()
     val s = Stack.reserve(32 * 1024).unwrap()
-    var b = Busy(Context.new(), Context.new(), 0)
+    val b: &Busy = Busy(Context.new(), Context.new(), 0)
 
-    b.me = Context.start(s, &busy, &b)
+    b.me = Context.start(s, &busy, &*b)
 
     val a0 = black_box(11i64)
     val a1 = black_box(22i64)
@@ -470,10 +469,10 @@ fbr_live_values_survive()
 @test("a switch called through a function value goes out of line, and lands where the inline one does")
 fbr_switch_through_a_function_value()
     val s = Stack.reserve(32 * 1024).unwrap()
-    var p = Pong(Context.new(), Context.new(), 0)
+    val p: &Pong = Pong(Context.new(), Context.new(), 0)
     val go: &Fn(*Context, *Context) -> unit = switch
 
-    p.me = Context.start(s, &pong, &p)
+    p.me = Context.start(s, &pong, &*p)
     go(&p.home, &p.me)
     switch(&p.home, &p.me)
     go(&p.home, &p.me)
@@ -501,9 +500,9 @@ private walk(w: *Walk)
 @test("a backtrace taken on a fiber stops at the fiber's entry")
 fbr_backtrace_ends_at_the_entry()
     val s = Stack.reserve(32 * 1024).unwrap()
-    var w = Walk(Context.new(), Context.new(), 0)
+    val w: &Walk = Walk(Context.new(), Context.new(), 0)
 
-    w.me = Context.start(s, &walk, &w)
+    w.me = Context.start(s, &walk, &*w)
     switch(&w.home, &w.me)
 
     // `frames_here`, `walk` and the frame `walk` was called from, and nothing below it.
@@ -517,10 +516,10 @@ fbr_backtrace_ends_at_the_entry()
 private fbr_program(body: string, size: int) -> string =
     "import sysl.fiber.{Context, Stack, switch}\n\n" +
     "struct S\n    home: Context\n    me: Context\n\n" + body + "\n" +
-    s"main()\n    val st = Stack.reserve($size).unwrap()\n" +
-    "    var s = S(Context.new(), Context.new())\n\n" +
-    "    s.me = Context.start(st, &run, &s)\n" +
-    "    switch(&s.home, &s.me)\n" +
+    "var state = S(Context.new(), Context.new())\n\n" +
+    s"main()\n    val st = Stack.reserve($size).unwrap()\n\n" +
+    "    state.me = Context.start(st, &run, &state)\n" +
+    "    switch(&state.home, &state.me)\n" +
     "    print(\"back home\")\n"
 
 private struct Ran
@@ -666,9 +665,9 @@ fbr_bounds_above_guard()
 @test("a running fiber's locals and both ends of its stack lie inside its bounds")
 fbr_bounds_hold_for_running_fiber()
     val s = Stack.reserve(256 * 1024).unwrap()
-    var p = Probe(Context.new(), Context.new(), s, false, false)
+    val p: &Probe = Probe(Context.new(), Context.new(), s, false, false)
 
-    p.me = Context.start(s, &probe_body, &p)
+    p.me = Context.start(s, &probe_body, &*p)
     switch(&p.home, &p.me)
 
     assert(p.local_in)
