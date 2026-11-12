@@ -133,10 +133,14 @@ private check_ref_calls(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal])
     // ends the program -- `unwrap`'s panic, a failed bounds check -- reports why through them, and
     // `quiet_callees` trusts them only once it has seen every one of them. Left out, every such path
     // is a call to something unknown, and every `unwrap` would be taken to write what a view reads.
-    val p = TProgram(buf(), buf(), buf(), reached_externs(a), buf(), funcs, buf(), None, buf(), true,
-                     false, buf(), buf(), "", buf(), buf(), buf(), buf(), buf(), buf(), buf(), None,
+    //
+    // **A whole program's tables are read too** (`Analysis.closed`): a call through a trait object is
+    // then a call to what that slot holds in each table the program has for the trait, judged as a
+    // direct call is. A library's build keeps such a call opaque.
+    val p = TProgram(buf(), buf(), reached_vtables(a), reached_externs(a), buf(), funcs, buf(), None, buf(),
+                     true, false, buf(), buf(), "", buf(), buf(), buf(), buf(), buf(), buf(), buf(), None,
                      buf(), false, false, false, true, map())
-    var u = untouched_summary(p, dropping_reached(a))
+    var u = untouched_summary(p, dropping_reached(a), set(), a.closed)
     val reach = reacher(a, p, &u)
     var known: Set[string] = set()
     val sink: &ErasedSink = ErasedSink(buf())
@@ -740,10 +744,11 @@ private note_erased(out: &ErasedSink, e: TExpr) = *e.kind match
 private ref_call(a: &Analysis, u: *Untouched, reach: &Reacher, known: Set[string], globals: Buf[(string, Type)],
                  erased: Buf[(string, Type)], scope: Scope,
                  mine: Buf[RefWatch], holders: Map[string, Buf[string]], confined: Set[string], e: TExpr)
+    // Each body the call may run, and what it is handed; `""` is a body no name says.
     val callee = *e.kind match
-        TCall(name, args, ty, _) -> if ty == Never then None else Some((name, args))
-        TCallPtr(_, args, _, _) -> Some(("", args))
-        TVCall(_, _, args, _, _) -> Some(("", args))
+        TCall(name, args, ty, _) -> if ty == Never then None else Some((only_body(name), args))
+        TCallPtr(_, args, _, _) -> Some((only_body(""), args))
+        TVCall(recv, slot, args, _, _) -> Some(slot_bodies(a, recv, slot, args))
         _ -> None
 
     if callee.is_none() then return
@@ -772,23 +777,28 @@ private ref_call(a: &Analysis, u: *Untouched, reach: &Reacher, known: Set[string
             return
         end if
 
-        val name = callee.unwrap().0
+        val names = callee.unwrap().0
         val args = callee.unwrap().1
 
         for t in w.types
-            var cleared = false
-
             // **A copy of a handle is the same buffer**: where a `@relocates` member moves the
             // storage behind a `t`, an argument holding a `t` by value hands the callee the storage
             // a `ref` stands in, not a copy of it.
             val moving = w.view_of == "" && relocated(u, t)
+            var name = ""
+            var cleared = true
 
-            if name != ""
+            for item in names
+                name = item
+
                 // **The question is what comes back**: a path through the callee that ends the
                 // program never resumes this frame, so nothing reads through the name afterwards.
-                cleared = unreachable_to(u, reach.answer_of(a, u, name), globals, erased, args, t, moving) ||
-                          (known.has(name) && untouched_by(u, t, w.lent, moving, true).has(name))
-            end if
+                cleared = item != "" &&
+                    (unreachable_to(u, reach.answer_of(a, u, item), globals, erased, args, t, moving) ||
+                     (known.has(item) && untouched_by(u, t, w.lent, moving, true).has(item)))
+
+                if !cleared then break
+            end for
 
             if !cleared
                 var what = "a call through a pointer or a trait names no body to ask"
@@ -816,6 +826,54 @@ private ref_call(a: &Analysis, u: *Untouched, reach: &Reacher, known: Set[string
                 return
             end if
 end ref_call
+
+private only_body(name: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    out.push(name)
+    out
+
+// The bodies a call through slot `slot` of a trait object may run, and what each is handed: the
+// receiver's object, as each table's own type, as well as the arguments. **A whole program names every
+// one** -- the method in
+// that slot of each table it has for the trait, and none where it has no table at all, since then no
+// such object exists. Anything else, or a receiver whose trait cannot be named, is a body no name says.
+//
+// **A closure stays a body no name says.** What a trait object can reach is what the program erased to
+// its trait (`type_reaches`), but a closure's captures are put behind `Fn` by no erasure, so the
+// object's type would hide every one of them: naming the closure's body would clear a call that
+// releases what a capture holds.
+private slot_bodies(a: &Analysis, recv: TExpr, slot: int, args: Buf[TExpr]) -> (Buf[string], Buf[TExpr])
+    var handed: Buf[TExpr] = buf()
+
+    handed.push(recv)
+
+    for item in args
+        handed.push(item)
+
+    val trait_name = erased_trait(texpr_type(recv)) match
+        Some(Trait(n, _, _)) -> n
+        _ -> ""
+
+    if !a.closed || trait_name == "" || slot < 0 || is_call_trait(module_bare(trait_name))
+        return (only_body(""), handed)
+
+    var out: Buf[string] = buf()
+    val tables = a.tables.members.vtables
+
+    for i in 0..<tables.len()
+        val vt = tables.at(i)
+
+        if vt.trait_name != trait_name then continue
+        if usize(slot) >= vt.slots.len() then return (only_body(""), handed)
+        if !holds_string(out, vt.slots[usize(slot)].target) then out.push(vt.slots[usize(slot)].target)
+
+        // The method is handed the object itself, through a pointer, whatever the trait hides of it.
+        handed.push(TExpr(recv.span, TZero(Ptr(vt.for_type))))
+    end for
+
+    (out, handed)
+end slot_bodies
 
 // Whether a callee handed `args`, which can run what `r` says, has no way to get hold of a value of
 // type `t` held anywhere else. Where `shared` is set, an argument holding a `t` by value is one: a
