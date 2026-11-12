@@ -12,8 +12,10 @@ import sysl.process.capture
 // every erasure counts -- one into a module value, an argument, a struct's field, another module's
 // storage, or a module value's own initializer -- and a callee that calls through such an object,
 // whose values can write the buffer a view stands on, is refused exactly as the same call through
-// the concrete type is. An object whose values touch no such buffer is still accepted, and so is one
-// whose only writing value was put behind a different trait and held where the callee cannot reach.
+// the concrete type is. An object whose values touch no such buffer is still accepted. In a whole
+// program's build the call runs only the methods in its trait's tables (`tests_tvc_trait_call_reach`), so a
+// writing value put behind a different trait is not asked of unless one of those methods calls through
+// it; a library's build may be handed tables it never saw, so there every erasure still counts.
 
 private ebh_ready() -> bool
     if std_root().is_err()
@@ -124,16 +126,56 @@ ebh_module_initializer_refused()
                 "static var bus: Option[&Bus] = Some(Cells(buf()))\n\n" + ebh_peek() + ebh_run("", "peek()") +
                 "var x = Board(buf())\nx.sram.push(5)\nprint(run(&x))\n", "peek")
 
-@test("an object over another trait in module storage counts, since a call through an object counts all of it")
-ebh_other_trait_in_storage_refused()
+// The Bus slot's method touches no buffer itself, but calls through a Log object whose value writes one.
+private ebh_relay_log() -> string =
+    "trait Log\n    note(*self)\n\nimpl Log for Ram\n    note(*self)\n" +
+    "        for i in 0..<100000 do self.board.sram.push(1)\n\n"
+
+@test("a Bus value whose method calls through a Log object in module storage reaches what that object's value writes")
+ebh_slot_calls_stored_object_refused()
     if !ebh_ready() then return
 
-    ebh_refused("trait Log\n    note(*self)\n\nimpl Log for Ram\n    note(*self)\n        self.board.sram.push(1)\n\n" +
-                "struct Tick\n    count: int\n\nimpl Bus for Tick\n    wipe(*self)\n        self.count += 1\n\n" +
+    ebh_refused(ebh_relay_log() + "struct Tick\n    count: int\n\nimpl Bus for Tick\n    wipe(*self)\n" +
+                "        self.count += 1\n        log match\n            Some(l) -> l.note()\n            None -> ()\n\n" +
                 "static var bus: Option[&Bus] = None\nstatic var log: Option[&Log] = None\n\n" + ebh_peek() +
                 ebh_run("", "peek()") +
                 "var x = Board(buf())\nx.sram.push(5)\nbus = Some(Tick(0))\nlog = Some(Ram(&x))\nprint(run(&x))\n",
                 "peek")
+
+@test("a Bus value whose method calls through a Log object in its own field reaches what that object's value writes")
+ebh_slot_calls_field_object_refused()
+    if !ebh_ready() then return
+
+    ebh_refused(ebh_relay_log() + "struct Relay\n    inner: &Log\n\nimpl Bus for Relay\n    wipe(*self)\n" +
+                "        self.inner.note()\n\nstatic var bus: Option[&Bus] = None\n\n" + ebh_peek() +
+                ebh_run("", "peek()") +
+                "var x = Board(buf())\nx.sram.push(5)\nbus = Some(Relay(Ram(&x)))\nprint(run(&x))\n", "peek")
+
+// A writing value behind another trait, in module storage the callee could reach but never calls through.
+private ebh_other_trait_stored() -> string =
+    "trait Log\n    note(*self)\n\nimpl Log for Ram\n    note(*self)\n        self.board.sram.push(1)\n\n" +
+    "struct Tick\n    count: int\n\nimpl Bus for Tick\n    wipe(*self)\n        self.count += 1\n\n"
+
+@test("a library's build counts an object over another trait in its storage, since a table it never saw may arrive")
+ebh_other_trait_in_storage_library_refused()
+    if !ebh_ready() then return
+
+    val root = make_temp_dir("sysl-ebh").unwrap()
+
+    make_dir_all(s"$root/m").unwrap()
+    write_text(s"$root/m/a.sysl", "module m\n\n" + ebh_head() + ebh_other_trait_stored() +
+               "var bus: Option[&Bus] = None\nvar log: Option[&Log] = None\n\n" +
+               "plug(b: *Board)\n    bus = Some(Tick(0))\n    log = Some(Ram(b))\n\n" + ebh_peek() +
+               ebh_run("", "peek()")).unwrap()
+
+    val out = build_library_of(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(_) -> "ok"
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert(out.contains("'m.peek' may write a 'Buf[byte]'"), s"expected a refusal naming 'm.peek', got: $out")
+end ebh_other_trait_in_storage_library_refused
 
 @test("the trait, its impl, the erasure and the object's storage all in another module")
 ebh_other_module_refused()
@@ -157,6 +199,16 @@ ebh_untouched_accepted()
     ebh_accepted("struct Tick\n    count: int\n\nimpl Bus for Tick\n    wipe(*self)\n        self.count += 1\n\n" +
                  "static var bus: Option[&Bus] = None\n\n" + ebh_peek() + ebh_run("", "peek()") +
                  "var x = Board(buf())\nx.sram.push(5)\nbus = Some(Tick(0))\nprint(run(&x))\n", "5\n")
+
+@test("a whole program's call through a Bus object runs only Bus's tables, so a writing Log value in storage is not asked of")
+ebh_other_trait_in_storage_accepted()
+    if !ebh_ready() then return
+
+    ebh_accepted(ebh_other_trait_stored() +
+                 "static var bus: Option[&Bus] = None\nstatic var log: Option[&Log] = None\n\n" + ebh_peek() +
+                 ebh_run("", "peek()") +
+                 "var x = Board(buf())\nx.sram.push(5)\nbus = Some(Tick(0))\nlog = Some(Ram(&x))\nprint(run(&x))\n" +
+                 "print(x.sram.len())\n", "5\n1\n")
 
 @test("a writing value behind another trait, held only by a local the callee cannot reach, is not asked of")
 ebh_other_trait_local_accepted()
