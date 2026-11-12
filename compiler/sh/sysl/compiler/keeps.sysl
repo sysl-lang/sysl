@@ -4214,7 +4214,7 @@ private captures_let_out(ft: &FrameTrack, evs: &EvBuf, st: &StructType, args: Bu
             for item in read_path_of(ft.cx, body, 0, h.0, s".$field${h.2}").locs
                 val loc = outlasting_loc(item.loc, item.how)
 
-                if loc.is_none() then continue
+                if loc.is_none() || put_back_by_reference(ft, st, args, body, c, item) then continue
 
                 val said = s"a closure lets its capture '$field' outlive the call (${item.how}), and '$field' " +
                     s"holds ${h.1} — capture the value itself, or storage that lasts"
@@ -4249,6 +4249,99 @@ private held_in_capture(ft: &FrameTrack, held: *Buf[(int, string, string)], arg:
 
     if held.len() == start then held.push((1, core, ""))
 end held_in_capture
+
+// **A closure that runs within the call is judged as the frame is**: a capture it holds by reference
+// is the frame's own variable, so a body handing `&c` (or `&c.f`) to a callee hands exactly the address
+// the frame's own `put(&c)` would, and what the callee puts back into storage reached through it stays
+// where the frame's call would leave it (`frame_read_locs`, `frame_closed`) -- `c.mem` pointing at
+// another local of the frame, written through, is that local written. The body's own walk cannot say
+// so, since a capture held by reference is named as nowhere there (`by_reference_capture`). A capture
+// held by value -- a closure that is stored, or escapes -- is a copy, and stays judged by the body. A
+// closure written in the body, capturing the capture by reference in turn, is asked the same of its own
+// body, along its own field.
+private put_back_by_reference(ft: &FrameTrack, st: &StructType, args: Buf[TExpr], body: string, c: usize,
+                              item: KeptAt) -> bool =
+    local_root(ft.refs, args[c]).is_some() && lent_capture_put_back(ft, st, body, c, args[c], item, 0)
+
+private lent_capture_put_back(ft: &FrameTrack, st: &StructType, body: string, c: usize, local: TExpr,
+                              item: KeptAt, depth: int) -> bool
+    if item.site == 0 || depth > 4 then return false
+
+    val by_ref = ft.cx.an.closure_refs.get(st.base) match
+        Some(refs) -> c < refs.len() && refs[c]
+        None -> false
+
+    if !by_ref then return false
+
+    val f = ft.cx.find(body)
+
+    if f.is_none() then return false
+
+    // The one node the item was let out at: an argument of a call, or a capture of a closure literal.
+    var calls: Buf[(string, usize, TExpr)] = buf()
+    var inner: Buf[(&StructType, usize, TExpr)] = buf()
+    val call_sink = &calls
+    val inner_sink = &inner
+
+    walk_block_stmts(f.unwrap().body, expr_walk(true, x -> *x.kind match
+        TCall(callee, cargs, _, _) ->
+            for k in 0..<cargs.len()
+                if node_id(cargs[k]) == item.site then call_sink.push((callee, k, cargs[k]))
+        TStructNew(ist, iargs) ->
+            if is_closure_literal(Struct(ist))
+                for k in 0..<iargs.len()
+                    if node_id(iargs[k]) == item.site then inner_sink.push((ist, k, iargs[k]))
+        _ -> ()))
+
+    if calls.len() + inner.len() != 1 then return false
+
+    if inner.len() == 1
+        val ist = inner[0].0
+        val k = inner[0].1
+
+        if k >= ist.fields.len() then return false
+
+        val there = in_frame_terms(inner[0].2, c, local)
+
+        if there.is_none() then return false
+
+        val inner_body = s"${ist.base}.call"
+
+        for next in read_path_of(ft.cx, inner_body, 0, 1, s".${ist.fields[k].0}").locs
+            if outlasting_loc(next.loc, next.how).is_none() then continue
+            if !lent_capture_put_back(ft, ist, inner_body, k, there.unwrap(), next, depth + 1) then return false
+
+        return true
+    end if
+
+    val name = calls[0].0
+    val j = calls[0].1
+
+    val handed = *calls[0].2.kind match
+        TAddrOf(place, ty) -> in_frame_terms(place, c, local) match
+            Some(p) -> TExpr(calls[0].2.span, TAddrOf(p, ty))
+            None -> return false
+        _ -> return false
+
+    if !frame_closed(ft, handed) then return false
+
+    for kept in keeps_of(ft.cx, name, j).locs
+        if !put_back(kept.loc, j) then return false
+
+    frame_read_locs(ft, name, j, handed).is_empty()
+end lent_capture_put_back
+
+// A place in a closure's body that lies along its capture `c`, said in the terms of the frame that wrote
+// the closure, where the capture is `local`: `(*self).c.mem` is `local.mem`.
+private in_frame_terms(place: TExpr, c: usize, local: TExpr) -> Option[TExpr] = *place.kind match
+    TField(r, index, ty) -> *r.kind match
+        TDeref(x, _) ->
+            if is_environment_load(x) then (if index >= 0 && usize(index) == c then Some(local) else None)
+            else None
+        _ -> in_frame_terms(r, c, local) match
+            Some(inner) -> Some(TExpr(place.span, TField(inner, index, ty)))
+            None -> None
+    _ -> None
 
 // **A body that lets the address of a capture it holds by value out is judged at the literal too**:
 // such a capture is a field of the closure, so `&x` in the body is the address of the closure's own
