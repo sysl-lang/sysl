@@ -42,6 +42,7 @@ print(maybe.unwrap_or(0), "— and not one import above this line")
 | operators | `Add`, `Sub`, `Mul`, `Div`, `Rem`, `BitAnd`, `BitOr`, `BitXor`, `Shl`, `Shr`, `Neg`, `Not`, `Eq`, `Ord` | [expressions](/reference/expressions/) |
 | their identities | `Zero`, `One` | [expressions](/reference/expressions/), and [math](/library/math/) |
 | storage whose every bit pattern is a value | `AnyBits` | below |
+| crossing a concurrency domain | `Send`, `Share` | [the memory model](/reference/memory/#send-and-share-the-rule-given-a-name) |
 | conversion between two types | `From` | [errors and contracts](/reference/errors/#a-converts-through-from) |
 | a range as a value | `Range` | [expressions](/reference/expressions/), and [seq](/library/seq/) |
 | subscripting and walking | `Index`, `IndexSet`, `Iterate`, `Walk` | below |

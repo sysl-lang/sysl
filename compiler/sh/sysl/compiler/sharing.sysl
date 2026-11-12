@@ -1,6 +1,6 @@
 module sh.sysl.compiler
 
-import sh.sysl.parsing.Span
+import sh.sysl.parsing.{Span, source_of}
 import sysl.buf.{Buf, buf}
 import sysl.container.{Map, map, Set}
 import sysl.text.Search
@@ -33,37 +33,56 @@ struct Unshareable
 end Unshareable
 
 // The part of a type that may not be shared, or nothing where every count it reaches is atomic.
-unshareable(t: Type) -> Option[Unshareable] = share_walk(t, buf(), None, false, false)
+unshareable(t: Type) -> Option[Unshareable] = share_walk(t, buf(), None, false, false, false)
 
 // The same question of a value **handed over as a copy** (a `@crossing` parameter taken by value): every view in it,
 // at any depth, is copied into storage with a count of its own, so a view and a string are not in the
 // way -- what their elements hold still is. A guarded field and a frozen buffer's elements are not
 // copied, so they are asked as they always are.
-copied_unshareable(t: Type) -> Option[Unshareable] = share_walk(t, buf(), None, false, true)
+copied_unshareable(t: Type) -> Option[Unshareable] = share_walk(t, buf(), None, false, true, false)
 
 // The same question of storage **laid down as data**, whose every view and string is a literal's
 // and whose every reference is its type's empty one: no owner, so no count to keep. What can still come to hold one is a view written through -- a
 // `[]T` in a `val` -- since a store into it puts there whatever the program made, so its elements
 // are asked as ordinary values are.
-laid_unshareable(t: Type) -> Option[Unshareable] = share_walk(t, buf(), None, true, false)
+laid_unshareable(t: Type) -> Option[Unshareable] = share_walk(t, buf(), None, true, false, false)
+
+// **`sysl.Send` and `sysl.Share` are these two walks given a name** (`reference/memory.md § Send and
+// Share`): a type is `Send` where a value of it may be handed over by value, and `Share` where an
+// object of it may be reached from two domains at once. One question, one walk -- the bound is its
+// verdict, never a second rule.
+//
+// **Asked by a bound, a type parameter is an answer rather than a postponement.** The crossing checks
+// let one through because the instantiation asks again; a bound is asked once, where it is written,
+// so a parameter is a member only where its own bounds say so.
+send_refusal(t: Type) -> Option[Unshareable] = share_walk(t, buf(), None, false, true, true)
+
+share_refusal(t: Type) -> Option[Unshareable] = share_walk(t, buf(), None, false, false, true)
 
 private share_walk(t: Type, path: Buf[string], holder: Option[Type],
-                   laid: bool, copied: bool) -> Option[Unshareable] = t match
+                   laid: bool, copied: bool, named: bool) -> Option[Unshareable] = t match
     Ref(_, sync) -> if sync || laid then None else Some(Unshareable(path, t, holder))
     Ptr(_) -> None
     Weak(_) -> if laid then None else Some(Unshareable(path, t, holder))
     Slice(elem, read_only) ->
-        if copied then share_walk(*elem, path, holder, false, true)
+        if copied then share_walk(*elem, path, holder, false, true, named)
         else if !laid then Some(Unshareable(path, t, holder))
         else if read_only then None
-        else share_walk(*elem, path, holder, false, false)
+        else share_walk(*elem, path, holder, false, false, named)
     Str -> if laid || copied then None else Some(Unshareable(path, t, holder))
 
     // An array *is* its elements, so sharing one shares each of them; the path stops at the field,
     // since naming the element is what the reported type already does.
-    Array(_, elem) -> share_walk(*elem, path, holder, laid, copied)
+    Array(_, elem) -> share_walk(*elem, path, holder, laid, copied, named)
 
-    Constrained(d) -> share_walk(d.base, path, holder, laid, copied)
+    Constrained(d) -> share_walk(d.base, path, holder, laid, copied, named)
+
+    // A parameter asked by a bound promises what its own bounds say: `Share` covers both questions,
+    // `Send` the copy.
+    Abstract(_, bounds) ->
+        if !named || bound_promises_crossing(bounds, copied) then None
+        else Some(Unshareable(path, t, holder))
+    Pack(elems) -> if named then share_walk_each(elems, path, holder, laid, copied, named) else None
 
     // **A guarded field is not shared by sharing its struct**: `@guards(value)` promises that the
     // struct's own members are the only way to it, and those hold whatever leaves through them to
@@ -73,19 +92,50 @@ private share_walk(t: Type, path: Buf[string], holder: Option[Type],
     // count that is not atomic, and the library keeps that count out of every reader's reach: only
     // the destructor of the one atomically counted box touches it, once. So the walk asks the
     // element type in place of the fields, and nothing about the storage.
+    //
+    // **A struct that promises to cross is taken at its word** (`@unchecked(Send)`,
+    // `@unchecked(Share)`, `promises.sysl`): the promise is the program's, made where the fields are
+    // declared, and it stands for every one of them.
     Struct(d) ->
-        if d.base == frozen_base() && d.targs.len() == 1 then share_walk(d.targs[0], path, Some(t), laid, false)
-        else if !laid && !copied && is_lending_closure(d) then lent_walk_fields(d.fields, path, t)
-        else share_walk_fields(unguarded(d), path, "", t, laid, copied)
+        if promised_crossing(d.promised, copied) then None
+        else if d.base == frozen_base() && d.targs.len() == 1 then share_walk(d.targs[0], path, Some(t), laid, false, named)
+        else if !laid && !copied && !named && is_lending_closure(d) then lent_walk_fields(d.fields, path, t)
+        else share_walk_fields(unguarded(d), path, "", t, laid, copied, named)
 
     // A data enum shares one payload region, so every variant's fields are reachable from it.
-    Enum(d) -> share_walk_variants(d.variants, path, t, laid, copied)
+    Enum(d) -> share_walk_variants(d.variants, path, t, laid, copied, named)
 
-    // A type parameter promises nothing about its counts, and nothing is decided here: the
-    // instantiation resolves this type again with an argument in its place, and that is where the
-    // question has an answer. A trait object is the same case one step further -- the type it forgot
-    // is known where a value is erased into one, and that is where it is asked.
+    // A type parameter the crossing checks meet (above) promises nothing about its counts, and
+    // nothing is decided there: the instantiation resolves this type again with an argument in its
+    // place, and that is where the question has an answer. A trait object is the same case one step
+    // further -- the type it forgot is known where a value is erased into one, and that is where it
+    // is asked.
     _ -> None
+
+// Whether a type parameter's own bounds promise what the walk asks: `Share` answers both questions,
+// and `Send` the one about a value handed over as a copy.
+private bound_promises_crossing(bounds: Buf[Bound], copied: bool) -> bool
+    for b in bounds
+        val spelling = library_spelling(b.name)
+
+        if spelling == Some("Share") || (copied && spelling == Some("Send")) then return true
+
+    false
+end bound_promises_crossing
+
+// Whether a struct's `@unchecked(...)` promise answers what the walk asks, by the same rule.
+promised_crossing(promised: Buf[string], copied: bool) -> bool
+    holds_string(promised, "Share") || (copied && holds_string(promised, "Send"))
+
+private share_walk_each(ts: Buf[Type], path: Buf[string], holder: Option[Type],
+                        laid: bool, copied: bool, named: bool) -> Option[Unshareable]
+    for item in ts
+        val found = share_walk(item, path, holder, laid, copied, named)
+
+        if found.is_some() then return found
+
+    None
+end share_walk_each
 
 // The library's frozen buffer (`library/sysl/buf/frozen.sysl`), whose elements are what it shares.
 frozen_base() -> string = module_qualify("sysl.buf", "Frozen")
@@ -110,20 +160,21 @@ check_shared_result(cx: &Analyzer, span: Span, ret: Type)
 end check_shared_result
 
 private share_walk_fields(fields: Buf[(string, Type)], path: Buf[string],
-                          prefix: string, holder: Type, laid: bool, copied: bool) -> Option[Unshareable]
+                          prefix: string, holder: Type, laid: bool, copied: bool,
+                          named: bool) -> Option[Unshareable]
     for item in fields
         // An anonymous member's fields are named as the holder's own, so the step into it is not
         // a step of the path a reader would write.
         if is_anonymous_field(item.0)
-            val inner = share_walk(item.1, path, Some(holder), laid, copied)
+            val inner = share_walk(item.1, path, Some(holder), laid, copied, named)
 
             if inner.is_some() then return inner
 
             continue
         end if
 
-        val named = if prefix == "" then item.0 else s"$prefix(${item.0})"
-        val found = share_walk(item.1, extended_path(path, named), Some(holder), laid, copied)
+        val step = if prefix == "" then item.0 else s"$prefix(${item.0})"
+        val found = share_walk(item.1, extended_path(path, step), Some(holder), laid, copied, named)
 
         if found.is_some() then return found
 
@@ -168,8 +219,8 @@ private lent_walk(t: Type, path: Buf[string], holder: Type) -> Option[Unshareabl
     Constrained(d) -> lent_walk(d.base, path, holder)
     Struct(d) ->
         if holds_lent_view(t) then lent_walk_fields(d.fields, path, t)
-        else share_walk(t, path, Some(holder), false, false)
-    _ -> share_walk(t, path, Some(holder), false, false)
+        else share_walk(t, path, Some(holder), false, false, false)
+    _ -> share_walk(t, path, Some(holder), false, false, false)
 
 // The part of a guarded field that may not be shared, or nothing where every guarded field of `d`
 // reaches only atomic counts -- in which case nothing a member hands out of it can carry one.
@@ -185,7 +236,7 @@ guarded_unshareable(d: &StructType) -> Option[Unshareable]
                 _ -> None
 
             val found = if nested.is_some() then guarded_unshareable(nested.unwrap())
-            else share_walk(item.1, just_field(item.0), None, false, false)
+            else share_walk(item.1, just_field(item.0), None, false, false, false)
 
             if found.is_some() then return found
 
@@ -199,9 +250,9 @@ private just_field(name: string) -> Buf[string]
     out
 
 private share_walk_variants(variants: Buf[EnumVariant], path: Buf[string],
-                            holder: Type, laid: bool, copied: bool) -> Option[Unshareable]
+                            holder: Type, laid: bool, copied: bool, named: bool) -> Option[Unshareable]
     for item in variants
-        val found = share_walk_fields(item.fields, path, item.name, holder, laid, copied)
+        val found = share_walk_fields(item.fields, path, item.name, holder, laid, copied, named)
 
         if found.is_some() then return found
 
@@ -376,6 +427,51 @@ private complaint_about(subject: string, crossed: Type, part: Option[Unshareable
 
     Some(share_remedy(head + s"${share_where(p, crossed)}, ", p.ty))
 end complaint_about
+
+// Why a type is not `sysl.Send` or `sysl.Share` (`bound` is the trait's spelling), or nothing where it
+// is: the sentence the crossing check says, with the bound's question at its head, so a generic's
+// caller is told what the facility it reaches would have told it.
+crossing_bound_refusal(a: &Analysis, bound: string, t: Type) -> Option[string]
+    val part = if bound == "Share" then share_refusal(t) else send_refusal(t)
+
+    if part.is_none() then return None
+
+    val p = part.unwrap()
+    val head = (if bound == "Share" then "an object of it may be reached from two domains at once"
+                else "a value of it handed over reaches another concurrency domain") +
+               ", so every count inside it has to be atomic — "
+
+    // A parameter is in the way because it promises nothing; what it would take is its own bound.
+    p.ty match
+        Abstract(n, _) ->
+            val at = if p.path.is_empty() then "but it is" else s"but its '${joined(p.path, ".")}' is"
+
+            return Some(head + s"$at '$n', a type parameter that promises nothing about its counts. " +
+                        s"Bound it '[$n: $bound]'")
+        _ -> ()
+
+    // A container whose core the library keeps private is named by the container, as the crossing
+    // checks name it; a type of the program's own is reachable to the program, whatever its file.
+    val sealed = sealed_library_holder(a, p)
+
+    if sealed.is_some() then return Some(head + sealed_where(p, sealed.unwrap(), t, false))
+
+    Some(share_remedy(head + s"${share_where(p, t)}, ", p.ty))
+end crossing_bound_refusal
+
+// `sealed_holder` asked from outside the library, about a count the library declares.
+private sealed_library_holder(a: &Analysis, p: Unshareable) -> Option[Type]
+    val key = p.ty match
+        Ref(inner, _) -> (*inner) match
+            Struct(d) -> d.base
+            Enum(d) -> d.base
+            _ -> ""
+        _ -> ""
+
+    if key == "" || library_spelling(key).is_none() then return None
+
+    sealed_holder(p, a, Scope("", no_imports(), source_of("", ""), no_packaging()))
+end sealed_library_holder
 
 // Which part is in the way, said three ways: the object itself, something it holds directly, and
 // something a named path inside it reaches.

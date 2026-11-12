@@ -1,0 +1,454 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+
+// **`sysl.Send`, `sysl.Share` and the `@unchecked(...)` promise** (`reference/memory.md § Send and
+// Share`). The two bounds are the crossing walk given names (`sharing.sysl`), so every cell here asks
+// the walk through a bound and checks the answer is the one the crossing checks give: the members,
+// the refusals naming the part in the way, a type parameter asked once where its bound is written,
+// and the promise with its private-field rule.
+//
+// Axes and cells. Kind of type: scalar, raw pointer, `&sync`, `&T`, string, slice, array, tuple,
+// struct (nested path), enum (variant path), `Buf` (a sealed count), `Frozen`, a trait object, a
+// struct the program promised. Where the bound is asked: a free generic, a method's generic, a
+// generic struct's field, a bound handed through a second generic, a generic whose body reaches a
+// `@crossing` parameter, a closure crossing to a scoped thread, a `--lib` root. Name lookup: a type
+// and a variant the program names `Share` / `Send`. Skipped: separate compilation by `.syslib`
+// (the library is read from source beside it, so the promise is the declaration's in either form);
+// bare metal (nothing is emitted); trait defaults (the bound is checked by the same `unmet_bound`
+// at every generic call).
+
+private snd_ready() -> bool = std_root().is_ok() && clang_available()
+
+private snd_run(text: string) -> (Status, string, string)
+    val root = make_temp_dir("sysl-snd").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, "0", Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (Status.Exited(-1), "", failure_text(why))
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> (Status.Exited(-1), "", "the program that was built could not be run")
+        Ok(out) -> (out.status, out.text, out.err.unwrap_or(""))
+end snd_run
+
+private snd_prints(text: string, printed: string)
+    if !snd_ready() then return
+
+    val (state, out, err) = snd_run(text)
+
+    assert_eq(err, "")
+    assert_eq(out, printed)
+    assert(state == Status.Exited(0), s"stopped with $state")
+end snd_prints
+
+// Refused with exactly one error, which says `message`, at `line` of the program where it is not 0.
+private snd_refused(text: string, message: string, line: int)
+    if !snd_ready() then return
+
+    val (_, _, err) = snd_run(text)
+
+    assert(err.contains(s"error: $message"), s"expected\n$message\nin\n$err")
+    assert_eq(err.count_of("error: "), 1)
+
+    if line > 0 then assert(err.contains(s"/main.sysl:$line:"), s"expected line $line in\n$err")
+end snd_refused
+
+// The bounds to ask through, and the types every cell is built from. Fourteen lines, so a program's
+// first line of its own is line 15.
+private val snd_probe: string = raw"""
+    needs_send[T: Send](x: T) -> int = 1
+    needs_share[T: Share](x: T) -> int = 2
+
+    struct Cell
+        n: int
+
+    struct Inner
+        cell: &Cell
+
+    struct Outer
+        b: Inner
+
+    enum Job
+        Fill(code: int, cell: &Cell)
+    """
+
+private val snd_send_why: string =
+    "'needs_send' requires its type parameter 'T' to implement 'Send', but "
+
+private val snd_share_why: string =
+    "'needs_share' requires its type parameter 'T' to implement 'Share', but "
+
+private val snd_handed: string =
+    "a value of it handed over reaches another concurrency domain, so every count inside it has to be atomic — "
+
+private val snd_reached: string =
+    "an object of it may be reached from two domains at once, so every count inside it has to be atomic — "
+
+// -- membership -----------------------------------------------------------------------------------
+
+@test("scalars, pointers, '&sync', strings, slices, arrays, tuples and enums of them are Send")
+snd_send_members()
+    snd_prints(snd_probe + raw"""
+        enum Msg
+            Quit
+            Code(n: int)
+
+        var x = 5
+        val p: *int = &x
+        val s: &sync Cell = Cell(1)
+        var arr = [1, 2]
+
+        print(needs_send(1) + needs_send(1.5) + needs_send(p) + needs_send(s) + needs_send("hi") +
+              needs_send(arr[..]) + needs_send([1, 2]) + needs_send(Msg.Code(3)) + needs_send((1, "a")))
+        """, "9\n")
+
+@test("scalars, pointers, '&sync', arrays and enums of them are Share")
+snd_share_members()
+    snd_prints(snd_probe + raw"""
+        enum Msg
+            Quit
+            Code(n: int)
+
+        var x = 5
+        val p: *int = &x
+        val s: &sync Cell = Cell(1)
+
+        print(needs_share(1) + needs_share(p) + needs_share(s) + needs_share([1, 2]) + needs_share(Msg.Quit))
+        """, "10\n")
+
+@test("a frozen buffer of members and a Mutex over a Buf are Share")
+snd_frozen_and_guarded_members()
+    snd_prints(snd_probe + raw"""
+        import sysl.buf.{Buf, buf}
+        import sysl.threads.Mutex
+
+        var b: Buf[int] = buf()
+
+        b.push(1)
+
+        val f = b.freeze()
+        val m: Mutex[Buf[int]] = Mutex.new(buf())
+
+        print(needs_share(f) + needs_share(m) + needs_send(m))
+        """, "5\n")
+
+@test("a '&sync' trait object is Share, and a plain one is not")
+snd_trait_objects()
+    snd_prints(snd_probe + raw"""
+        trait Show
+            show(self) -> int
+
+        impl Show for Cell
+            show(self) -> int = self.n
+
+        val o: &sync Show = &sync Cell(3)
+
+        print(needs_share(o))
+        """, "2\n")
+    snd_refused(snd_probe + raw"""
+        trait Show
+            show(self) -> int
+
+        impl Show for Cell
+            show(self) -> int = self.n
+
+        val o: &Show = Cell(3)
+
+        print(needs_send(o))
+        """, snd_send_why + "&Show does not — " + snd_handed + "but it is a '&Show'", 23)
+
+// -- refusals name the part in the way ------------------------------------------------------------
+
+@test("a plain reference is not Send, and the refusal says what to hold instead")
+snd_ref_refused()
+    snd_refused(snd_probe + "val c: &Cell = Cell(1)\nprint(needs_send(c))\n",
+                snd_send_why + "&Cell does not — " + snd_handed + "but it is a '&Cell', whose count " +
+                "is not. Hold it as a '&sync Cell' ('06')", 16)
+
+@test("a reference two fields down is named by its path")
+snd_nested_path_refused()
+    snd_refused(snd_probe + "val c: &Cell = Cell(1)\nprint(needs_send(Outer(Inner(c))))\n",
+                snd_send_why + "Outer does not — " + snd_handed + "but its 'b.cell' reaches a " +
+                "'&Cell', whose count is not. Hold it as a '&sync Cell' ('06')", 16)
+
+@test("an enum is refused by the variant whose field is in the way, whatever value is passed")
+snd_enum_variant_refused()
+    snd_refused(snd_probe + "print(needs_send(Job.Fill(1, Cell(1))))\n",
+                snd_send_why + "Job does not — " + snd_handed + "but its 'Fill(cell)' reaches a '&Cell'", 15)
+
+@test("a Buf is not Send, and the refusal names the buffer rather than its private core")
+snd_buf_refused()
+    snd_refused(snd_probe + "import sysl.buf.{Buf, buf}\n\nval b: Buf[int] = buf()\nprint(needs_send(b))\n",
+                snd_send_why + "Buf[int] does not — " + snd_handed + "but a 'Buf[int]' is shared " +
+                "through a count that is not atomic", 18)
+
+@test("a string and a slice are Send but not Share: sharing one shares its count")
+snd_views_not_share()
+    snd_refused(snd_probe + "print(needs_share(\"hi\"))\n",
+                snd_share_why + "string does not — " + snd_reached + "but it is a 'string', which " +
+                "owns its bytes through a count that is not atomic", 15)
+    snd_refused(snd_probe + "var a = [1, 2]\nprint(needs_share(a[..]))\n",
+                snd_share_why + "[]int does not — " + snd_reached + "but it is a '[]int'", 16)
+
+// -- generics -------------------------------------------------------------------------------------
+
+@test("an unbounded parameter is refused where it reaches the bound, and told the bound to write")
+snd_unbounded_parameter_refused()
+    snd_refused(snd_probe + "relay[U](x: U) -> int = needs_send(x)\n\nprint(relay(1))\n",
+                snd_send_why + "U does not — " + snd_handed + "but it is 'U', a type parameter that " +
+                "promises nothing about its counts. Bound it '[U: Send]'", 15)
+
+@test("a bounded parameter passes the bound on, at every instantiation")
+snd_bounded_relay()
+    snd_prints(snd_probe + raw"""
+        relay[U: Send](x: U) -> int = needs_send(x) + 10
+
+        val s: &sync Cell = Cell(1)
+
+        print(relay(1), relay("a"), relay(s))
+        """, "11 11 11\n")
+
+@test("a bounded parameter's caller is refused at the call, once, with the path")
+snd_bounded_relay_refused_at_the_call()
+    snd_refused(snd_probe + raw"""
+        relay[U: Send](x: U) -> int = needs_send(x)
+
+        val c: &Cell = Cell(1)
+
+        print(relay(Outer(Inner(c))))
+        """, "'relay' requires its type parameter 'U' to implement 'Send', but Outer does not — " +
+        snd_handed + "but its 'b.cell' reaches a '&Cell'", 19)
+
+@test("Share is Send: a Share parameter meets a Send bound, and a Send one does not meet Share")
+snd_share_implies_send()
+    snd_prints(snd_probe + "relay[U: Share](x: U) -> int = needs_send(x)\n\nprint(relay(4))\n", "1\n")
+    snd_refused(snd_probe + "relay[U: Send](x: U) -> int = needs_share(x)\n\nprint(relay(4))\n",
+                snd_share_why + "U does not — " + snd_reached + "but it is 'U', a type parameter " +
+                "that promises nothing about its counts. Bound it '[U: Share]'", 15)
+
+@test("a generic struct is Send where its parameter's bound says so, and not where nothing does")
+snd_generic_struct_field()
+    snd_prints(snd_probe + raw"""
+        struct Box[V]
+            v: V
+
+        wrap[U: Send](x: U) -> int = needs_send(Box(x))
+
+        print(wrap(7), needs_send(Box(Box(3))))
+        """, "1 1\n")
+    snd_refused(snd_probe + raw"""
+        struct Box[V]
+            v: V
+
+        wrap[U](x: U) -> int = needs_send(Box(x))
+
+        print(wrap(7))
+        """, snd_send_why + "Box[U] does not — " + snd_handed + "but its 'v' is 'U', a type " +
+        "parameter that promises nothing about its counts. Bound it '[U: Send]'", 18)
+
+@test("a bounded generic reaching a crossing parameter is refused at its caller only")
+snd_bound_over_crossing()
+    snd_prints(snd_probe + raw"""
+        @crossing(x)
+        take[V](x: V) -> int = 5
+
+        relay[U: Send](x: U) -> int = take(x)
+
+        val s: &sync Cell = Cell(1)
+
+        print(relay(s))
+        """, "5\n")
+    snd_refused(snd_probe + raw"""
+        @crossing(x)
+        take[V](x: V) -> int = 5
+
+        relay[U: Send](x: U) -> int = take(x)
+
+        val c: &Cell = Cell(1)
+
+        print(relay(c))
+        """, "'relay' requires its type parameter 'U' to implement 'Send', but &Cell does not", 22)
+
+@test("a method's own bound is asked at the call")
+snd_method_bound()
+    snd_refused(snd_probe + raw"""
+        struct Post
+            n: int
+
+            put[U: Send](self, x: U) -> int = self.n
+
+        val c: &Cell = Cell(1)
+
+        print(Post(1).put(c))
+        """, "'put' requires its type parameter 'U' to implement 'Send', but &Cell does not", 22)
+
+// -- nothing implements them ----------------------------------------------------------------------
+
+@test("nothing implements Send or Share: the promise is the way")
+snd_impl_refused()
+    snd_refused("struct B\n    n: int\n\nimpl Send for B\n\nprint(1)\n",
+                "'Send' is the compiler's answer to whether a type crosses to another concurrency " +
+                "domain, so nothing implements it — a type whose own members keep what it holds safe " +
+                "promises it with '@unchecked(Send)' above its declaration", 4)
+    snd_refused("struct B\n    n: int\n\nimpl Share for B\n\nprint(1)\n",
+                "'Share' is the compiler's answer to whether a type crosses", 4)
+
+@test("a program's own type or variant named Share or Send is its own")
+snd_names_are_the_programs()
+    snd_prints(raw"""
+        struct Share
+            n: int
+
+        enum Input
+            Send(bytes: int)
+            Stop
+
+        said(i: Input) -> int = i match
+            Send(b) -> b
+            Stop -> 0
+
+        print(Share(3).n, said(Input.Send(4)))
+        """, "3 4\n")
+
+// -- the promise ----------------------------------------------------------------------------------
+
+private val snd_handle: string = raw"""
+    @unchecked(Send)
+    struct Handle
+        private c: &Cell
+        id: int
+
+        get(self) -> int = self.c.n
+    """
+
+@test("@unchecked(Send) makes a struct Send and lets it through a crossing parameter")
+snd_promise_send()
+    snd_prints(snd_probe + snd_handle + raw"""
+        @crossing(x)
+        take[V](x: V) -> int = 5
+
+        val h = Handle(Cell(4), 1)
+
+        print(needs_send(h), take(h), h.get())
+        """, "1 5 4\n")
+
+@test("@unchecked(Send) does not promise Share, and the refusal names the field")
+snd_promise_send_not_share()
+    snd_refused(snd_probe + snd_handle + "val h = Handle(Cell(4), 1)\nprint(needs_share(h))\n",
+                snd_share_why + "Handle does not — " + snd_reached + "but its 'c' reaches a '&Cell'", 22)
+
+@test("@unchecked(Share) makes a struct Share and Send, forms a '&sync', and crosses to a thread")
+snd_promise_share()
+    snd_prints(snd_probe + raw"""
+        import sysl.threads.scope
+
+        @unchecked(Share)
+        struct Gate
+            private c: &Cell
+
+            get(self) -> int = self.c.n
+
+        val g = Gate(Cell(6))
+        val shared: &sync Gate = Gate(Cell(7))
+
+        print(needs_share(g), needs_send(g), shared.get())
+        scope((s) -> s.spawn(() -> print(g.get())))
+        """, "2 1 7\n6\n")
+
+@test("without the promise the same struct may not form a '&sync' or cross to a thread")
+snd_unpromised_refused()
+    snd_refused(snd_probe + raw"""
+        struct Gate
+            c: &Cell
+
+        val shared: &sync Gate = Gate(Cell(7))
+        """, "'&sync Gate' may be reached from two domains at once", 0)
+
+@test("a promise over a field visible beyond its file is refused")
+snd_promise_public_field_refused()
+    snd_refused(snd_probe + "@unchecked(Send)\nstruct Leaky\n    c: &Cell\n\nprint(1)\n",
+                "'@unchecked(Send)' promises that 'Leaky''s own members keep its 'c' safe across a " +
+                "concurrency domain, and a field visible beyond this file is a way round them — " +
+                "declare it 'private'", 0)
+
+@test("a promise the fields already keep is refused")
+snd_promise_redundant_refused()
+    snd_refused("@unchecked(Share)\nstruct Plain\n    private n: int\n\nprint(1)\n",
+                "'@unchecked(Share)' promises what 'Plain''s fields already show — every count they " +
+                "reach is atomic, so 'Plain' is 'Share' without it. Remove the promise", 0)
+
+@test("a generic struct's promise covers its parameter's field, which has to be private")
+snd_promise_generic()
+    snd_prints(snd_probe + raw"""
+        @unchecked(Send)
+        struct Slot[V]
+            private v: V
+
+        val c: &Cell = Cell(1)
+
+        print(needs_send(Slot(c)))
+        """, "1\n")
+    snd_refused(snd_probe + "@unchecked(Send)\nstruct Slot[V]\n    v: V\n\nprint(1)\n",
+                "'@unchecked(Send)' promises that 'Slot''s own members keep its 'v' safe", 0)
+
+@test("the promise marks only a struct, and names only Send or Share, once")
+snd_promise_shape_refused()
+    snd_refused("@unchecked(Send)\nenum E\n    A\n\nprint(1)\n",
+                "'@unchecked(Send)' and '@unchecked(Share)' promise that a struct's own members keep " +
+                "what its fields hold safe", 0)
+    snd_refused("struct C\n    n: &int\n\n@unchecked(Sync)\nstruct H\n    private c: &C\n\nprint(1)\n",
+                "'@unchecked(Sync)' names nothing it can promise", 0)
+    snd_refused("struct C\n    n: int\n\n@unchecked(Send, Share)\nstruct H\n    private c: &C\n\nprint(1)\n",
+                "'@unchecked(Share)' already promises 'Send'", 0)
+    snd_refused("@unchecked()\nstruct H\n    private n: int\n\nprint(1)\n",
+                "'@unchecked(...)' above a struct names what it promises", 0)
+
+@test("'@unchecked' over a block is still a block")
+snd_unchecked_block_untouched()
+    snd_prints("var a = [1, 2, 3]\nvar t = 0\n\n@unchecked\n    t = a[2]\n\nprint(t)\n", "3\n")
+
+// -- a library root -------------------------------------------------------------------------------
+
+@test("a library's bound and promise are asked of a program the same way")
+snd_library_root()
+    if !snd_ready() then return
+
+    val lib = lbr_tree(lbr_one("chan/chan.sysl", raw"""
+        module chan
+
+        struct Cell
+            n: int
+
+        @unchecked(Send)
+        struct Ticket
+            private c: &Cell
+
+            get(self) -> int = self.c.n
+
+        ticket(n: int) -> Ticket = Ticket(Cell(n))
+
+        post[T: Send](x: T) -> int = 1
+        """))
+    val good = lbr_program("import chan.*\n\nprint(post(ticket(3)), ticket(3).get())\n")
+    val bad = lbr_program("import chan.*\n\nval c: &Cell = Cell(1)\nprint(post(c))\n")
+    val ran = lbr_run(good, [lib])
+    val said = lbr_run(bad, [lib])
+
+    lbr_drop([lib, good, bad])
+    assert_eq(ran, "1 3\n")
+    assert(said.contains("'chan.post' requires its type parameter 'T' to implement 'Send', but " +
+                         "&chan.Cell does not"), said)
