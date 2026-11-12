@@ -141,9 +141,8 @@ private check_ref_calls(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal])
                      true, false, buf(), buf(), "", buf(), buf(), buf(), buf(), buf(), buf(), buf(), None,
                      buf(), false, false, false, true, map())
     var u = untouched_summary(p, dropping_reached(a), set(), a.closed)
-    val reach = reacher(a, p, &u)
     var known: Set[string] = set()
-    val sink: &ErasedSink = ErasedSink(buf())
+    val sink: &ErasedSink = ErasedSink(buf(), buf())
 
     var consts: Set[string] = set()
 
@@ -153,7 +152,12 @@ private check_ref_calls(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal])
         if f.const_fn then consts.add(f.name)
         walk_block_stmts(f.body, expr_walk(false, e -> note_erased(sink, e)))
 
+    // A module value's initializer may put a value behind a trait too.
+    for item in vals
+        if item.init.is_some() then walk_texpr(item.init.unwrap(), expr_walk(false, e -> note_erased(sink, e)))
+
     val erased = sink.items
+    val reach = reacher(a, p, &u, globals, sink.behind)
 
     for f in funcs
         var mine: Buf[RefWatch] = buf()
@@ -187,7 +191,6 @@ private struct Reach
     reads: Set[string]
     all_reads: bool
     all: bool
-    releases: bool
 
 // Each callee's `Reach`, worked out from the bodies' summary the first time a call to it is judged.
 // `answering` holds the same question asked only of the paths that come back (`answer_of`).
@@ -196,7 +199,9 @@ private struct Reacher
     foreign: Set[string]
     trusted: Set[string]
     entered: Buf[string]
-    drops: Buf[string]
+    drops: Buf[(string, Type)]
+    globals: Buf[(string, Type)]
+    erased: Buf[(string, Type)]
     known: Map[string, Reach]
     answering: Map[string, Reach]
 
@@ -225,43 +230,77 @@ private struct Reacher
         out
     end answer_of
 
-    // **A destructor is reached only through a body that can let go of a value that may run one**
-    // (`Untouched.releases`): a callee holding no such value, and calling only bodies that hold none,
-    // runs no destructor, so what the program's destructors reach is no part of what it can run.
-    // Where one does, every destructor is reached, as is everything C can enter.
+    // **A destructor is run by letting go of a value it is the destructor of**, so a callee can run
+    // only the destructors of what the bodies on its walk can let go of (`Untouched.releases`: their
+    // parameters, and the values they make, read or write), of the module storage they name and of
+    // the types their casts make pointers to -- each followed through what it holds, and through every
+    // value the program erased to a trait it holds (`lets_go`). A destructor reached brings its own
+    // body, and with it what that body can let go of, so the walk goes round until no destructor is
+    // added. C may call back into whatever it can enter and hand back anything at all, so a walk that
+    // reaches a foreign function takes in every entry, all module storage, and every destructor.
     walk(*self, a: &Analysis, u: *Untouched, name: string, ending: bool) -> Reach
-        var out = Reach(buf(), set(), false, false, false)
+        var out = Reach(buf(), set(), false, false)
         var seen: Set[string] = set()
         var todo: Buf[string] = buf()
+        var held: Buf[Type] = buf()
 
         todo.push(name)
 
-        var called_c = self.gather(a, u, &todo, &seen, &out, ending)
+        var called_c = self.gather(a, u, &todo, &seen, &out, &held, ending)
 
-        if (out.releases || called_c) && !out.all
-            for item in self.drops
-                todo.push(item)
+        while !out.all
+            if called_c && !out.all_reads
+                out.all_reads = true
 
-            if self.gather(a, u, &todo, &seen, &out, ending) then called_c = true
+                for item in self.entered
+                    todo.push(item)
+            end if
 
-        // C may call back into whatever it can enter, and each of those may reach another foreign
-        // function: the second walk's answer adds nothing, since every entry is already on it.
-        if called_c && !out.all
-            out.all_reads = true
+            for d in self.drops
+                if !seen.has(d.0) && (out.all_reads || self.lets_go(held, out, d.1)) then todo.push(d.0)
 
-            for item in self.entered
-                todo.push(item)
-
-            val _ = self.gather(a, u, &todo, &seen, &out, ending)
+            if todo.is_empty() then break
+            if self.gather(a, u, &todo, &seen, &out, &held, ending) then called_c = true
+        end while
 
         out
     end walk
 
-    // Walks every body reached from `todo` into `out`, and answers whether one of them calls a
-    // foreign function that is not the standard library's. Where `ending` is unset, the calls on
-    // paths that end the program are left out.
+    // Whether the destructor for values of type `dropped` may run on a walk that can let go of values
+    // of the types `held`, and reaches what `out` says: one of those values, the module storage the
+    // walk names, or an object behind a pointer one of its casts makes, holds a `dropped`. A
+    // destructor whose type cannot be told is taken to run.
+    lets_go(self, held: Buf[Type], out: Reach, dropped: Type) -> bool
+        dropped match
+            Struct(_) -> ()
+            Enum(_) -> ()
+            _ -> return true
+
+        for item in held
+            var seen: Set[string] = set()
+
+            if type_reaches(item, dropped, true, self.erased, &seen) then return true
+
+        for item in self.globals
+            if !out.reads.has(item.0) then continue
+
+            var seen: Set[string] = set()
+
+            if type_reaches(item.1, dropped, true, self.erased, &seen) then return true
+
+        for item in out.casts
+            var seen: Set[string] = set()
+
+            if type_reaches(item, dropped, true, self.erased, &seen) then return true
+
+        false
+    end lets_go
+
+    // Walks every body reached from `todo` into `out`, gathering the types of what they can let go of
+    // into `held`, and answers whether one of them calls a foreign function that is not the standard
+    // library's. Where `ending` is unset, the calls on paths that end the program are left out.
     gather(*self, a: &Analysis, u: *Untouched, todo: *Buf[string], seen: *Set[string], out: *Reach,
-           ending: bool) -> bool
+           held: *Buf[Type], ending: bool) -> bool
         var called_c = false
 
         while !todo.is_empty() && !out.all
@@ -277,7 +316,14 @@ private struct Reacher
                         out.all = true
                         break
 
-                    if u.releases[i] then out.releases = true
+                    for item in u.releases[i]
+                        var had = false
+
+                        for j in 0..<held.len()
+                            if held[j] == item then had = true
+
+                        if !had then held.push(item)
+                    end for
 
                     for item in u.casts[i]
                         out.casts.push(item)
@@ -301,7 +347,8 @@ private struct Reacher
     end gather
 end Reacher
 
-private reacher(a: &Analysis, p: TProgram, u: *Untouched) -> &Reacher
+private reacher(a: &Analysis, p: TProgram, u: *Untouched, globals: Buf[(string, Type)],
+                erased: Buf[(string, Type)]) -> &Reacher
     var index: Map[string, usize] = map()
 
     for i in 0..<u.names.len()
@@ -316,12 +363,17 @@ private reacher(a: &Analysis, p: TProgram, u: *Untouched) -> &Reacher
         if home.is_some() && std_module(home.unwrap().scope.module_name) then trusted.add(item.name)
         else foreign.add(item.name)
 
-    var drops: Buf[string] = buf()
+    // Each destructor, with the type it is run for: its receiver's object.
+    var drops: Buf[(string, Type)] = buf()
 
     for f in p.funcs
-        if module_bare(f.name) == "drop" || f.name.ends_with(".drop") then drops.push(f.name)
+        if module_bare(f.name) == "drop" || f.name.ends_with(".drop")
+            val dropped = if f.params.is_empty() then Unknown else pointee(f.params[0].1).unwrap_or(f.params[0].1)
 
-    Reacher(index, foreign, trusted, c_entered(p), drops, map(), map())
+            drops.push((f.name, underlying(dropped)))
+        end if
+
+    Reacher(index, foreign, trusted, c_entered(p), drops, globals, erased, map(), map())
 end reacher
 
 // -- a local no callee can reach --------------------------------------------------------------------
@@ -727,9 +779,12 @@ private closure_writes_under(a: &Analysis, bases: Buf[string], keys: Buf[string]
     None
 end closure_writes_under
 
-// Every value the program puts behind a trait, by the trait's name.
+// Every value the program puts behind a trait, by the trait's name: `items` where the erasure's type
+// is the trait itself, and `behind` for every erasure, a `&Trait` or `*Trait` among them, which is
+// what a destructor's reach is asked against (`Reacher.lets_go`).
 private struct ErasedSink
     items: Buf[(string, Type)]
+    behind: Buf[(string, Type)]
 end ErasedSink
 
 private note_erased(out: &ErasedSink, e: TExpr) = *e.kind match
@@ -738,6 +793,10 @@ private note_erased(out: &ErasedSink, e: TExpr) = *e.kind match
 
         tr match
             Trait(name, _, _) -> out.items.push((name, texpr_type(operand)))
+            _ -> ()
+
+        repr(erased_trait(ty).unwrap_or(tr)) match
+            Trait(name, _, _) -> out.behind.push((name, texpr_type(operand)))
             _ -> ()
     _ -> ()
 
