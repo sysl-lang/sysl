@@ -415,3 +415,130 @@ cwo_ref_harmless()
             plain()
             after()
         """, "1 1\n9\n5\n1\n2\n")
+
+// -- a closure handed to a call is asked by its own captures, not by every closure behind 'Fn' -------
+
+@test("no hazard: a closure handed to 'Fn', held in a local, beside another's writing closure, or taking a plain field's address")
+cwo_ref_handed_closure_harmless()
+    cwo_prints(cwo_holder + raw"""
+        go(f: &Fn() -> unit) = f()
+
+        bump(p: *int) = *p += 1
+
+        other()
+            var k = H(Node(3), 0)
+            call(() -> k = H(Node(4), 1))
+            print(k.count)
+
+        handed()
+            var h = H(Node(1), 0)
+            ref r = h.node.v
+            go(() -> h.count += 1)
+            print(r, h.count)
+
+        quiet()
+            var h = H(Node(1), 0)
+            ref r = h.node.v
+            call(() -> print(7))
+            print(r)
+
+        local()
+            var h = H(Node(1), 0)
+            var g = () -> h.count += 1
+            ref r = h.node.v
+            call(g)
+            print(r, h.count)
+
+        addressed()
+            var h = H(Node(1), 0)
+            ref r = h.node.v
+            call(() -> bump(&h.count))
+            print(r, h.count)
+
+        main()
+            other()
+            handed()
+            quiet()
+            local()
+            addressed()
+        """, "1\n1 1\n7\n1\n1 1\n1 1\n")
+
+@test("the hazard: a closure handed to 'Fn' writing the owning field, handing the variable's address on, or a '&Fn' parameter handed on")
+cwo_ref_handed_closure_hazard()
+    cwo_refused(cwo_holder + raw"""
+        go(f: &Fn() -> unit) = f()
+
+        main()
+            var h = H(Node(1), 0)
+            ref r = h.node.v
+            go(() -> h.node = Node(2))
+            print(r)
+        """, [cwo_hazard])
+    cwo_refused(cwo_holder + raw"""
+        clobber(p: *H) = p.node = Node(2)
+
+        main()
+            var h = H(Node(1), 0)
+            ref r = h.node.v
+            call(() -> clobber(&h))
+            print(r)
+        """, [cwo_hazard])
+    cwo_refused(cwo_holder + raw"""
+        go(f: &Fn() -> unit) = f()
+
+        fx(p: *H, g: &Fn() -> unit)
+            ref r = p.node.v
+            go(g)
+            print(r)
+
+        main()
+            var h = H(Node(1), 0)
+            fx(&h, () -> h = H(Node(2), 0))
+        """, ["'r' is a 'ref' standing on storage held in a 'H', and 'go' may write a 'H'"])
+end cwo_ref_handed_closure_hazard
+
+@test("a closure in module storage, called by the callee: refused where it writes an 'H', accepted where it writes a counter")
+cwo_ref_stored_closure()
+    val head = cwo_holder + "var hook: Option[&Fn() -> unit] = None\nvar held = H(Node(1), 0)\n" +
+               "var hits = 0\n\nfire() = hook match\n    Some(f) -> f()\n    None -> ()\n\n"
+
+    cwo_refused(head + raw"""
+        main()
+            var h = H(Node(1), 0)
+            hook = Some(() -> held = H(Node(2), 0))
+            ref r = h.node.v
+            fire()
+            print(r)
+        """, ["'r' is a 'ref' standing on storage held in a 'H', and 'fire' may write a 'H'"])
+    cwo_prints(head + raw"""
+        main()
+            var h = H(Node(1), 0)
+            hook = Some(() -> hits += 1)
+            ref r = h.node.v
+            fire()
+            print(r, hits)
+            hook = None
+        """, "1 1\n")
+end cwo_ref_stored_closure
+
+@test("a trait object writing only a plain field beside the 'ref' is refused: an object is asked by the types it reaches")
+cwo_ref_object_plain_field()
+    cwo_refused(cwo_holder + raw"""
+        trait Bump
+            bump(*self)
+
+        struct Counter
+            h: *H
+
+        impl Bump for Counter
+            bump(*self) = self.h.count += 1
+
+        poke(b: &Bump) = b.bump()
+
+        main()
+            var h = H(Node(1), 0)
+            val c: &Bump = Counter(&h)
+            ref r = h.node.v
+            poke(c)
+            print(r, h.count)
+        """, ["'r' is a 'ref' standing on storage held in a 'H', and 'poke' may write a 'H'"])

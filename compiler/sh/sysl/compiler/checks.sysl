@@ -833,6 +833,13 @@ private ref_call(a: &Analysis, u: *Untouched, reach: &Reacher, known: Set[string
 
         val names = callee.unwrap().0
         val args = callee.unwrap().1
+        var plain: Buf[TExpr] = buf()
+        var envs: Buf[Type] = buf()
+
+        for item in args
+            val env = closure_handed(item)
+
+            if env.is_some() then envs.push(env.unwrap()) else plain.push(item)
 
         for t in w.types
             // **A copy of a handle is the same buffer**: where a `@relocates` member moves the
@@ -848,7 +855,8 @@ private ref_call(a: &Analysis, u: *Untouched, reach: &Reacher, known: Set[string
                 // **The question is what comes back**: a path through the callee that ends the
                 // program never resumes this frame, so nothing reads through the name afterwards.
                 cleared = item != "" &&
-                    (unreachable_to(u, reach.answer_of(a, u, item), globals, erased, args, t, moving) ||
+                    ((unreachable_to(u, reach.answer_of(a, u, item), globals, erased, plain, t, moving) &&
+                      !env_reaches(a, envs, w.keys, erased, t, moving)) ||
                      (known.has(item) && untouched_by(u, t, w.lent, moving, true).has(item)))
 
                 if !cleared then break
@@ -886,6 +894,63 @@ private only_body(name: string) -> Buf[string]
 
     out.push(name)
     out
+
+// **A closure handed to a call is asked by its own captures, not by `Fn`.** Erased, its type is a
+// `&Fn`, and a `&Fn` reaches what every closure the program erased reaches (`type_reaches`), which
+// would refuse a call for a capture of some other closure entirely. Where the argument is the closure
+// itself -- built there, or a local of its own type, through an erasure, a box or an address -- its
+// type says exactly what it holds: the closure literal's struct, which this answers.
+private closure_handed(x: TExpr) -> Option[Type]
+    if is_closure_literal(texpr_type(x)) then return Some(texpr_type(x))
+
+    *x.kind match
+        TErase(inner, _, _) -> closure_handed(inner)
+        TBox(inner, _) -> closure_handed(inner)
+        TAddrOf(inner, _) -> closure_handed(inner)
+        _ -> None
+end closure_handed
+
+// Whether a closure handed to a call reaches a slot of type `t` that is somebody else's, as an
+// argument would: each capture is read as an argument of its own type. **A capture held by reference
+// of the variable a `ref` stands through is that variable itself, not another name for it**: what
+// the closure writes of it is asked by its keys (`closure_writes_under`), so only what the variable's
+// value holds behind a reference or pointer counts, exactly as for the variable handed by value.
+private env_reaches(a: &Analysis, envs: Buf[Type], keys: Buf[string], erased: Buf[(string, Type)], t: Type,
+                    moving: bool) -> bool
+    val want = underlying(t)
+
+    for env in envs
+        env match
+            Struct(d) ->
+                val writes = a.closure_write_keys.get(d.base)
+                val by_ref = a.by_ref_closures.has(d.base)
+
+                for i in 0..<d.fields.len()
+                    var held = d.fields[i].1
+
+                    if by_ref && writes.is_some() && i < writes.unwrap().captures.len() &&
+                       stands_through(keys, writes.unwrap().captures[i])
+                        held = pointee(held).unwrap_or(held)
+
+                    var seen: Set[string] = set()
+
+                    if type_reaches(held, want, moving, erased, &seen) then return true
+                end for
+            _ -> return true
+    end for
+
+    false
+end env_reaches
+
+// Whether a `ref`'s owning steps go through the variable a capture's key names.
+private stands_through(keys: Buf[string], capture: string) -> bool
+    if capture == "" then return false
+
+    for k in keys
+        if k == capture || k.starts_with(s"$capture/") then return true
+
+    false
+end stands_through
 
 // The bodies a call through slot `slot` of a trait object may run, and what each is handed: the
 // receiver's object, as each table's own type, as well as the arguments. **A whole program names every
