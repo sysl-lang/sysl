@@ -1,0 +1,255 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.{Search, Text, replace_all}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A call made while a view or a `ref` is held is asked what it can run (`checks.sysl`'s `ref_call`).
+// **A whole program's build sees every table a trait object can carry** (`Analysis.closed`), so a call
+// through one -- in the callee, or in the frame holding the view -- runs what that slot holds in each
+// table the program has for the trait, and is judged as calls to those methods are. A library's build
+// may be handed an object whose table it never saw, so there the call stays one that could run
+// anything (`reference/memory.md § Edge cases`).
+//
+// The axes: where the trait call is (deep in a callee -- `Display` through `*Writer` under
+// `map_err`, a module `&Bus` -- or in the frame itself), what the tables hold (every method reads, one
+// writes a `Buf[u8]`, no table at all), how the slot is reached (a method call, a rendering through
+// `&Display`), what is held (a view in an array of regions, a view in a local, a `ref`), and the build
+// (one file, two modules, `build-lib`). Left out: `build-c`, which is the same not-closed answer as
+// `build-lib` (`has_entry_point` false); a generic or default method in a slot, which is a name in the
+// table like any other.
+
+private tvc_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end tvc_ready
+
+private tvc_tree(files: []const (string, string, string)) -> string
+    val root = make_temp_dir("sysl-trait-call-reach").unwrap()
+
+    make_dir_all(root).unwrap()
+
+    for f in files
+        val dir = if f.0 == "" then root else s"$root/${f.0}"
+
+        make_dir_all(dir).unwrap()
+        write_text(s"$dir/${f.1}", f.2).unwrap()
+
+    root
+end tvc_tree
+
+// What a program of these files printed, or what the compiler said instead.
+private tvc_ran_in(files: []const (string, string, string)) -> string
+    val root = tvc_tree(files)
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text + out.err.unwrap_or("")
+end tvc_ran_in
+
+private tvc_ran(text: string) -> string = tvc_ran_in([("", "main.sysl", text)])
+
+private tvc_has(out: string, part: string) = assert(out.contains(part), s"expected '$part' in: $out")
+
+// A board whose SRAM a view is taken of, and module storage holding a `Buf[u8]`, so that a callee
+// able to run anything could reach one.
+private const TvcBoard: string =
+    "import sysl.buf.{Buf, buf}\n\n" +
+    "struct Board\n    sram: Buf[u8]\n\n" +
+    "static var keep: Buf[u8] = buf()\n\n"
+
+// A bus behind a trait, whose one implementation only reads.
+private const TvcBus: string =
+    "trait Bus\n    read(*self, at: usize) -> u8\n\n" +
+    "struct Ram\n    cells: Buf[u8]\n\n" +
+    "impl Bus for Ram\n    read(*self, at: usize) -> u8 = self.cells[at]\n\n"
+
+// A second implementation, which writes a `Buf[u8]`.
+private const TvcScribble: string =
+    "struct Scribble\n    n: int\n\n" +
+    "impl Bus for Scribble\n    read(*self, at: usize) -> u8\n        keep = buf()\n        0\n\n"
+
+// The bus held in module storage, and a callee that reads through it.
+private const TvcPeek: string =
+    "static var bus: Option[&Bus] = None\n\n" +
+    "attach()\n    var cells: Buf[u8] = buf()\n    cells.push(7)\n    bus = Some(Ram(cells))\n\n" +
+    "peek() -> u8 = bus match\n    Some(d) -> d.read(0)\n    None -> 0\n\n"
+
+private const TvcMain: string = "attach()\nvar x = Board(buf())\nx.sram.push(0)\n"
+
+// The same declarations in a module of their own, where module storage needs no `static`.
+private tvc_module(text: string) -> string = replace_all(text, "static var", "var")
+
+// -- deep in a callee ---------------------------------------------------------------------------------
+
+@test("tvc: map_err rendering a Display error through *Writer is cleared while regions are held")
+tvc_map_err_render_cleared()
+    if !tvc_ready() then return
+
+    val out = tvc_ran(TvcBoard +
+                      "enum Fault\n    Short\n\n" +
+                      "impl Display for Fault\n    display(self, out: *Writer, fmt: FormatSpec)\n" +
+                      "        out.write(\"short\".bytes)\n\n" +
+                      "struct Region\n    base: u64\n    mem: []u8\n\n" +
+                      "load(rs: []Region) -> Result[int, Fault]\n    rs[0].mem[0] = 9\n" +
+                      "    if rs.len > 1 then Ok(1) else Err(Fault.Short)\n\n" +
+                      "run(b: *Board) -> Result[int, string]\n    val n =\n" +
+                      "        var regions = [Region(0, b.sram.view_mut())]\n" +
+                      "        load(regions[..]).map_err(why -> s\"load: $why\")?\n    Ok(n + 1)\n\n" +
+                      "var x = Board(buf())\nx.sram.push(0)\nprint(run(&x), x.sram[0])\n")
+
+    assert_eq(out, "Err(load: short) 9\n")
+end tvc_map_err_render_cleared
+
+@test("tvc: a callee reading through a module trait object whose every table reads is cleared")
+tvc_callee_reads_cleared()
+    if !tvc_ready() then return
+
+    val out = tvc_ran(TvcBoard + TvcBus + TvcPeek +
+                      "run(b: *Board) -> int\n    var v = b.sram.view_mut()\n    val k = peek()\n" +
+                      "    v[0] = k\n    int(k)\n\n" + TvcMain + "print(run(&x), x.sram[0])\n")
+
+    assert_eq(out, "7 7\n")
+end tvc_callee_reads_cleared
+
+@test("tvc: the same callee is refused once one table of the trait holds a method writing a Buf[u8]")
+tvc_callee_one_writer_refused()
+    if !tvc_ready() then return
+
+    val out = tvc_ran(TvcBoard + TvcBus + TvcScribble + TvcPeek +
+                      "run(b: *Board) -> int\n    var v = b.sram.view_mut()\n    val k = peek()\n" +
+                      "    v[0] = k\n    int(k)\n\n" + TvcMain +
+                      "val s: &Bus = Scribble(0)\nprint(run(&x), s.read(0))\n")
+
+    tvc_has(out, "'v' is a view borrowed from 'b', held in a 'Buf[byte]', and 'peek' may write a 'Buf[byte]'")
+end tvc_callee_one_writer_refused
+
+@test("tvc: a 'ref' standing in the buffer clears the same callee")
+tvc_ref_cleared()
+    if !tvc_ready() then return
+
+    val out = tvc_ran(TvcBoard + TvcBus + TvcPeek +
+                      "run(b: *Board) -> int\n    ref e = b.sram[0]\n    val k = peek()\n" +
+                      "    e = k\n    int(k)\n\n" + TvcMain + "print(run(&x), x.sram[0])\n")
+
+    assert_eq(out, "7 7\n")
+end tvc_ref_cleared
+
+@test("tvc: a callee calling through a trait the program never erases to runs nothing there")
+tvc_no_table_cleared()
+    if !tvc_ready() then return
+
+    val out = tvc_ran(TvcBoard +
+                      "trait Probe\n    poke(*self) -> u8\n\n" +
+                      "struct Wipe\n    n: int\n\n" +
+                      "impl Probe for Wipe\n    poke(*self) -> u8\n        keep = buf()\n        1\n\n" +
+                      "maybe(p: Option[&Probe]) -> u8 = p match\n    Some(q) -> q.poke()\n    None -> 2\n\n" +
+                      "run(b: *Board) -> int\n    var v = b.sram.view_mut()\n    val k = maybe(None)\n" +
+                      "    v[0] = k\n    int(k)\n\n" +
+                      "var x = Board(buf())\nx.sram.push(0)\nprint(run(&x), x.sram[0], Wipe(3).n)\n")
+
+    assert_eq(out, "2 2 3\n")
+end tvc_no_table_cleared
+
+@test("tvc: a callee rendering a &Display held in module storage is cleared")
+tvc_render_through_table_cleared()
+    if !tvc_ready() then return
+
+    val out = tvc_ran(TvcBoard +
+                      "enum Fault\n    Short\n\n" +
+                      "impl Display for Fault\n    display(self, out: *Writer, fmt: FormatSpec)\n" +
+                      "        out.write(\"short\".bytes)\n\n" +
+                      "static var last: Option[&Display] = None\n\n" +
+                      "note()\n    last = Some(Fault.Short)\n\n" +
+                      "said() -> string = last match\n    Some(d) -> s\"<$d>\"\n    None -> \"none\"\n\n" +
+                      "run(b: *Board) -> string\n    var v = b.sram.view_mut()\n    val k = said()\n" +
+                      "    v[0] = 4\n    k\n\n" +
+                      "note()\nvar x = Board(buf())\nx.sram.push(0)\nprint(run(&x), x.sram[0])\n")
+
+    assert_eq(out, "<short> 4\n")
+end tvc_render_through_table_cleared
+
+// -- in the frame holding the view ------------------------------------------------------------------
+
+@test("tvc: a call through a trait object in the frame is cleared where every table's method reads")
+tvc_frame_call_cleared()
+    if !tvc_ready() then return
+
+    val out = tvc_ran(TvcBoard + TvcBus +
+                      "run(b: *Board, d: &Bus) -> int\n    var v = b.sram.view_mut()\n    val k = d.read(0)\n" +
+                      "    v[0] = k\n    int(k)\n\n" +
+                      "var cells: Buf[u8] = buf()\ncells.push(7)\nvar x = Board(buf())\nx.sram.push(0)\n" +
+                      "print(run(&x, Ram(cells)), x.sram[0])\n")
+
+    assert_eq(out, "7 7\n")
+end tvc_frame_call_cleared
+
+@test("tvc: the frame's call is refused naming the table's method that writes a Buf[u8]")
+tvc_frame_call_writer_refused()
+    if !tvc_ready() then return
+
+    val out = tvc_ran(TvcBoard + TvcBus + TvcScribble +
+                      "run(b: *Board, d: &Bus) -> int\n    var v = b.sram.view_mut()\n    val k = d.read(0)\n" +
+                      "    v[0] = k\n    int(k)\n\n" +
+                      "var cells: Buf[u8] = buf()\ncells.push(7)\nvar x = Board(buf())\nx.sram.push(0)\n" +
+                      "val s: &Bus = Scribble(0)\nprint(run(&x, Ram(cells)), s.read(0))\n")
+
+    tvc_has(out, "'v' is a view borrowed from 'b', held in a 'Buf[byte]', and 'Scribble.read' may write a 'Buf[byte]'")
+end tvc_frame_call_writer_refused
+
+// -- the build ------------------------------------------------------------------------------------------
+
+@test("tvc: a program of two modules, the trait and its table in one, is cleared as one file is")
+tvc_two_modules_cleared()
+    if !tvc_ready() then return
+
+    val out = tvc_ran_in([("dev", "dev.sysl",
+                           "module dev\n\n" + tvc_module(TvcBoard + TvcBus + TvcPeek) +
+                           "run(b: *Board) -> int\n    var v = b.sram.view_mut()\n    val k = peek()\n" +
+                           "    v[0] = k\n    int(k)\n"),
+                          ("", "main.sysl",
+                           "import sysl.buf.{Buf, buf}\nimport dev.{Board, attach, run}\n\n" + TvcMain +
+                           "print(run(&x), x.sram[0])\n")])
+
+    assert_eq(out, "7 7\n")
+end tvc_two_modules_cleared
+
+@test("tvc: a library's build may be handed a table it never saw, so both calls stay refused there")
+tvc_library_refused()
+    if !tvc_ready() then return
+
+    val root = tvc_tree([("m", "a.sysl",
+                          "module m\n\n" + tvc_module(TvcBoard + TvcBus + TvcPeek) +
+                          "run(b: *Board) -> int\n    var v = b.sram.view_mut()\n    val k = peek()\n" +
+                          "    v[0] = k\n    int(k)\n\n" +
+                          "direct(b: *Board, d: &Bus) -> int\n    var v = b.sram.view_mut()\n" +
+                          "    val k = d.read(0)\n    v[0] = k\n    int(k)\n")])
+
+    val out = build_library_of(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(_) -> "ok"
+
+    remove_dir_all(root).unwrap_or(())
+
+    tvc_has(out, "'m.peek' may write a 'Buf[byte]'")
+    tvc_has(out, "a call through a pointer or a trait names no body to ask")
+end tvc_library_refused
