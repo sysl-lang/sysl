@@ -910,11 +910,11 @@ private closure_handed(x: TExpr) -> Option[Type]
         _ -> None
 end closure_handed
 
-// Whether a closure handed to a call reaches a slot of type `t` that is somebody else's, as an
-// argument would: each capture is read as an argument of its own type. **A capture held by reference
-// of the variable a `ref` stands through is that variable itself, not another name for it**: what
-// the closure writes of it is asked by its keys (`closure_writes_under`), so only what the variable's
-// value holds behind a reference or pointer counts, exactly as for the variable handed by value.
+// Whether a closure handed to a call reaches a slot of type `t` that is somebody else's. A capture
+// held by value is the closure's own copy, read as an argument of its type is. A capture held by
+// reference is another name for the variable, so the variable's whole value counts -- **except the
+// variable a `ref` stands through**: what the closure writes of that one is asked by its keys
+// (`closure_writes_under`), so only what its value holds behind a reference or pointer counts.
 private env_reaches(a: &Analysis, envs: Buf[Type], keys: Buf[string], erased: Buf[(string, Type)], t: Type,
                     moving: bool) -> bool
     val want = underlying(t)
@@ -923,18 +923,23 @@ private env_reaches(a: &Analysis, envs: Buf[Type], keys: Buf[string], erased: Bu
         env match
             Struct(d) ->
                 val writes = a.closure_write_keys.get(d.base)
-                val by_ref = a.by_ref_closures.has(d.base)
+                val refs = if a.by_ref_closures.has(d.base) then a.closure_refs.get(d.base).unwrap_or(buf())
+                           else buf()
 
                 for i in 0..<d.fields.len()
-                    var held = d.fields[i].1
-
-                    if by_ref && writes.is_some() && i < writes.unwrap().captures.len() &&
-                       stands_through(keys, writes.unwrap().captures[i])
-                        held = pointee(held).unwrap_or(held)
-
                     var seen: Set[string] = set()
+                    val field = d.fields[i].1
 
-                    if type_reaches(held, want, moving, erased, &seen) then return true
+                    if i >= refs.len() || !refs[i]
+                        if type_reaches(field, want, moving, erased, &seen) then return true
+                        continue
+
+                    // Held by reference: the field is the variable's address once emission turns it.
+                    val held = pointee(field).unwrap_or(field)
+                    val own = writes.is_some() && i < writes.unwrap().captures.len() &&
+                              stands_through(keys, writes.unwrap().captures[i])
+
+                    if type_reaches(held, want, moving || !own, erased, &seen) then return true
                 end for
             _ -> return true
     end for
