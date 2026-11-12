@@ -1,0 +1,198 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A closure capturing a local by value is asked what its body lets out of that capture FIELD BY FIELD,
+// as a call in the frame handed the local's address is (`keeps.sysl`'s `held_in_capture`,
+// `hand_path`, `capture_rest`): a body handing `&a` to a callee that lets out what it reads along
+// `.reg` lets out nothing of the address `a.other` holds. `scope`'s body is the case that found it --
+// it runs inside the call, and a local of the frame around it outlives that call -- but the rule is
+// the closure's, so a plain callee taking a bare arrow, a nested closure and a loop are asked the same
+// way, and a body letting out the very field that holds the address is refused in every one of them.
+// `reference/memory.md § A closure is judged where it is written` is the specification.
+//
+// Skipped cells, and why: a `s.spawn` closure capturing `a` here is refused by the crossing rule
+// before this one is asked (`Cpu` holds a `&Mem`, whose count is not atomic); a capture held by
+// reference is asked through the variable's address, which this change does not narrow; and a callee
+// that only writes into storage the frame owns (`c.mem` pointing at another local) is still refused in a
+// closure, where the frame's own call is let through (`frame_closed`), since the body's walk cannot
+// tell whose storage `c.mem` points at.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private cfp_outcome(text: string) -> (string, int)
+    val root = make_temp_dir("sysl-cfp").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end cfp_outcome
+
+private cfp_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = cfp_outcome(text)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+end cfp_prints
+
+private cfp_refused(text: string, part: string)
+    if xvr_no_library() then return
+
+    val out = cfp_outcome(text)
+
+    assert_eq(out.1, -1, out.0)
+    assert(out.0.index_of(part).is_some(), out.0)
+end cfp_refused
+
+// A core whose `other` holds the address of a local, a memory on the heap, and two callees: `poke`
+// lets out what it reads along `.reg`, `leak` what it reads along `.other`.
+private cfp_head() -> string = raw"""
+    import sysl.threads.scope
+
+    struct Mem
+        last: *int
+        cpu: *Cpu
+
+    struct Cpu
+        mem: &Mem
+        reg: *int
+        other: *Cpu
+
+    poke(c: *Cpu) = c.mem.last = c.reg
+    leak(c: *Cpu) = c.mem.cpu = c.other
+    via(c: *Cpu) = poke(c)
+    run(f: () -> unit) = f()
+
+    """
+
+private cfp_lets_out(how: string) -> string =
+    s"a closure lets its capture 'a' outlive the call ($how), and 'a' holds the address of a local of 'main'"
+
+// -- accepted: the field let out holds no address of the frame ------------------------------------
+
+@test("a scope body hands a captured local's address to a callee letting out a field that holds no frame address")
+cfp_scope_body_accepted()
+    cfp_prints(cfp_head() + raw"""
+        main()
+            var a = Cpu(Mem(null, null), null, null)
+            var b = Cpu(a.mem, null, null)
+            a.other = &b
+            poke(&a)
+            scope((s) -> poke(&a))
+            print(a.mem.last == null)
+        """, "true\n")
+
+@test("the same closure handed to a plain callee that runs it")
+cfp_plain_call_accepted()
+    cfp_prints(cfp_head() + raw"""
+        main()
+            var a = Cpu(Mem(null, null), null, null)
+            var b = Cpu(a.mem, null, null)
+            a.other = &b
+            run(() -> poke(&a))
+            print(1)
+        """, "1\n")
+
+@test("a scope body handing the address on through a relay")
+cfp_relay_accepted()
+    cfp_prints(cfp_head() + raw"""
+        main()
+            var a = Cpu(Mem(null, null), null, null)
+            var b = Cpu(a.mem, null, null)
+            a.other = &b
+            scope((s) -> via(&a))
+            print(2)
+        """, "2\n")
+
+@test("a closure nested in the scope body captures the outer one's copy")
+cfp_nested_accepted()
+    cfp_prints(cfp_head() + raw"""
+        main()
+            var a = Cpu(Mem(null, null), null, null)
+            var b = Cpu(a.mem, null, null)
+            a.other = &b
+            scope((s) -> scope((t) -> poke(&a)))
+            run(() -> run(() -> poke(&a)))
+            print(3)
+        """, "3\n")
+
+@test("a scope body calling the callee in a loop, and counting in a captured var")
+cfp_loop_accepted()
+    cfp_prints(cfp_head() + raw"""
+        main()
+            var a = Cpu(Mem(null, null), null, null)
+            var b = Cpu(a.mem, null, null)
+            a.other = &b
+            var n = 0
+            scope((s) ->
+                for i in 0..<3
+                    poke(&a)
+                    n += 1)
+            print(n)
+        """, "3\n")
+
+// -- refused: the field let out is the one holding the frame's address ----------------------------
+
+@test("a scope body handing the address to a callee letting out the field that holds a local's address")
+cfp_scope_body_refused()
+    cfp_refused(cfp_head() + raw"""
+        main()
+            var a = Cpu(Mem(null, null), null, null)
+            var b = Cpu(a.mem, null, null)
+            a.other = &b
+            scope((s) -> leak(&a))
+        """, cfp_lets_out("it is passed to 'leak', which lets what it reads through it out"))
+
+@test("the same through a plain callee, a loop, and a relay")
+cfp_plain_loop_refused()
+    cfp_refused(cfp_head() + raw"""
+        relay(c: *Cpu) = leak(c)
+
+        main()
+            var a = Cpu(Mem(null, null), null, null)
+            var b = Cpu(a.mem, null, null)
+            a.other = &b
+            scope((s) -> for i in 0..<3 do relay(&a))
+        """, cfp_lets_out("it is passed to 'relay', which lets what it reads through it out"))
+
+@test("a closure nested in the scope body letting out the field that holds a local's address")
+cfp_nested_refused()
+    cfp_refused(cfp_head() + raw"""
+        main()
+            var a = Cpu(Mem(null, null), null, null)
+            var b = Cpu(a.mem, null, null)
+            a.other = &b
+            scope((s) -> scope((t) -> leak(&a)))
+        """, cfp_lets_out("it is captured by a closure, which lets it out (it is passed to 'leak', which lets what it " +
+            "reads through it out)"))
+
+@test("a closure over the local stored in module storage is refused whatever its body lets out")
+cfp_stored_refused()
+    cfp_refused(cfp_head() + raw"""
+        var idle: &Fn() -> unit = () -> ()
+
+        main()
+            var a = Cpu(Mem(null, null), null, null)
+            var b = Cpu(a.mem, null, null)
+            a.other = &b
+            idle = () -> poke(&a)
+        """, "holds the address of a local of 'main', and it is stored in 'idle', which outlives 'main'")
