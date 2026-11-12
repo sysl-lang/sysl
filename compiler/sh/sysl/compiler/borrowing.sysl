@@ -895,6 +895,9 @@ inert_leaf(x: TExpr) -> bool = *x.kind match
 // storage it names (`reads`), and whether it holds a node that may run code no call names (`opaque`):
 // a call through a pointer or a trait's table, a rendering through a table, a place another task may
 // run (`touch_node`). `open_answering` is `open` with the calls on paths that end the program let by (`untouched_by`).
+// `releases` is whether the body can let go of a value that may run a destructor (`may_run_drop`): a
+// body that never holds one runs no destructor of its own, so a destructor is reached only through a
+// body that does.
 //
 // **A `@relocates` member moves the storage behind its receiver** (`moves`: the receiver's type), and
 // that write lands in an object the receiver reaches through a reference -- a `Buf`'s core -- which no
@@ -919,17 +922,20 @@ struct Untouched
     opaque: Buf[bool]
     moves: Buf[Option[Type]]
     open_answering: Buf[bool]
+    releases: Buf[bool]
 end Untouched
 
 // An empty summary, for an emitter that has not read a program yet.
 untouched_none() -> Untouched =
-    Untouched(buf(), buf(), buf(), buf(), buf(), no_casts(), buf(), map(), buf(), buf(), buf(), buf(), buf(), buf())
+    Untouched(buf(), buf(), buf(), buf(), buf(), no_casts(), buf(), map(), buf(), buf(), buf(), buf(), buf(), buf(),
+              buf())
 
 // What one body's walk gathers for the `Untouched` lists that say what it can run: the module storage
 // it names, and whether it holds a node that may run code no call names.
 private struct ReachSink
     reads: Set[string]
     opaque: bool
+    releases: bool
 
     read(*self, symbol: string)
         self.reads.add(symbol)
@@ -1055,7 +1061,12 @@ untouched_summary(p: TProgram, dropping: Buf[Type], owning: Set[string] = set(),
         val ending = exit_kinds(f.body)
         val gives = type_sink()
         val own = cast_sink()
-        val reach: &ReachSink = ReachSink(set(), false)
+        val reach: &ReachSink = ReachSink(set(), false, false)
+
+        // A parameter is let go of at the return, or handed on, whether or not the body names it.
+        for item in f.params
+            if may_run_drop(item.1, dropping) then reach.releases = true
+
         val walk = TWalk(true, x -> touch_node(v, calls, exits, ending, roots, gives, own, reach, dropping,
                                                locals, tables, x),
                          w -> touch_write(v, calls, roots, gives, locals, w),
@@ -1092,6 +1103,7 @@ untouched_summary(p: TProgram, dropping: Buf[Type], owning: Set[string] = set(),
         u.exits.push(exits.names)
         u.reads.push(reach.reads)
         u.opaque.push(reach.opaque)
+        u.releases.push(reach.releases)
 
         val moved = f.marks.relocates && !f.params.is_empty()
 
@@ -1304,6 +1316,7 @@ private touch_node(v: &Verdict, calls: &CallSink, exits: &CallSink, ending: &Kin
     note_laundered(laundered, x)
 
     if makes_dropping(x, dropping) then v.refuse()
+    if !reach.releases && may_run_drop(texpr_type(x), dropping) then reach.releases = true
 
     *x.kind match
         TGlobal(symbol, _, _) -> reach.read(symbol)
@@ -1589,6 +1602,67 @@ private holds_dropping(t: Type, dropping: Buf[Type], seen: *Set[string]) -> bool
             false
         _ -> false
 end holds_dropping
+
+// Whether letting go of a value of `t` may run a destructor: it holds a type with one
+// (`holds_dropping`), or something whose type does not say what it holds -- an object behind a trait,
+// a closure's environment, a type not settled -- which may hold anything.
+private may_run_drop(t: Type, dropping: Buf[Type]) -> bool
+    var seen: Set[string] = set()
+
+    if holds_dropping(t, dropping, &seen) then return true
+
+    var opened: Set[string] = set()
+
+    holds_erased(t, &opened)
+end may_run_drop
+
+private holds_erased(t: Type, seen: *Set[string]) -> bool = t match
+    Trait(_, _, _) -> true
+    Abstract(_, _) -> true
+    Unknown -> true
+    Array(_, elem) -> holds_erased(*elem, seen)
+    Ref(inner, _) -> holds_erased(*inner, seen)
+    Slice(elem, _) -> holds_erased(*elem, seen)
+    Constrained(d) -> holds_erased(d.base, seen)
+    Volatile(inner) -> holds_erased(*inner, seen)
+    Pack(elems) ->
+        for item in elems
+            if holds_erased(item, seen) then return true
+
+        false
+    Results(parts) -> holds_erased(Struct(parts), seen)
+    Struct(d) ->
+        val k = mangle(t)
+
+        if seen.has(k) then return false
+
+        seen.add(k)
+
+        if is_closure_literal(t) then return true
+
+        for item in d.fields
+            if holds_erased(item.1, seen) then return true
+
+        for item in d.targs
+            if holds_erased(item, seen) then return true
+
+        false
+    Enum(d) ->
+        val k = mangle(t)
+
+        if seen.has(k) then return false
+
+        seen.add(k)
+
+        for item in d.variants
+            for field in item.fields
+                if holds_erased(field.1, seen) then return true
+
+        for item in d.targs
+            if holds_erased(item, seen) then return true
+
+        false
+    _ -> false
 
 // -- the callee: which large parameters it reads where the caller put them ---------------------------
 

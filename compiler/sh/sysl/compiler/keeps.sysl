@@ -2622,7 +2622,7 @@ private captures_kept(t: &Track, evs: &EvBuf, st: &StructType, args: Buf[TExpr])
 
         if !carries(t, arg) then continue
 
-        for item in read_path_of(t.cx, body, 0, capture_steps(arg), s".${st.fields[c].0}").locs
+        for item in read_path_of(t.cx, body, 0, capture_steps(arg), s".${st.fields[c].0}${capture_rest(t, arg)}").locs
             val loc = outlasting_loc(item.loc, item.how)
 
             if loc.is_some()
@@ -2647,6 +2647,20 @@ end handed_closures_kept
 private capture_steps(arg: TExpr) -> int = *arg.kind match
     TAddrOf(_, _) -> 2
     _ -> 1
+
+// **A capture copied by value from a field the walk asks inside of is asked along what is left of it**
+// (`hand_path`'s rule for a closure): a closure inside a closure capturing the outer one's `a`, where
+// the walk asks about `.a.other`, is asked what it lets out along its own field and then `.other`.
+private capture_rest(t: &Track, arg: TExpr) -> string
+    if t.path == "" || capture_steps(arg) != 1 then return ""
+
+    first_path(t, arg) match
+        Some(p) -> if p != "" && !p.ends_with("#") && t.path.bytes.len > p.bytes.len && path_within(t.path, p)
+            return t.path[p.bytes.len..<t.path.bytes.len]
+        None -> ()
+
+    ""
+end capture_rest
 
 // Where a closure's body holds a capture, as its maker says it: module storage, or anywhere nobody can
 // name. One through its environment (`p0:`) is somewhere the closure's maker decides, and is asked
@@ -2938,10 +2952,23 @@ private path_within(inner: string, outer: string) -> bool
     next == u8('.') || next == u8('[')
 end path_within
 
-// The field a callee handed `arg` is asked about, for a walk asking about one: the same, where the
-// argument is the parameter itself and the callee is asked the walk's own steps; every field otherwise.
-private hand_path(t: &Track, arg: TExpr, left: int) -> string =
-    if t.path != "" && left == t.steps && param_load(t, arg) then t.path else ""
+// The field a callee handed `arg` is asked about, for a walk asking about one, where the callee is
+// asked the walk's own steps: the same, where the argument is the parameter itself; what is left of it
+// past a field, where the argument is that field's address (`&c.inner` handed on, the walk asking
+// about `.inner.bus`, asks the callee about `.bus`); every field otherwise.
+private hand_path(t: &Track, arg: TExpr, left: int) -> string
+    if t.path == "" || left != t.steps then return ""
+    if param_load(t, arg) then return t.path
+
+    *arg.kind match
+        TAddrOf(place, _) -> first_path(t, place) match
+            Some(p) -> if p != "" && !p.ends_with("#") && t.path.bytes.len > p.bytes.len && path_within(t.path, p)
+                return t.path[p.bytes.len..<t.path.bytes.len]
+            None -> ()
+        _ -> ()
+
+    ""
+end hand_path
 
 // A store: into this frame's own storage it binds the local (`track_locals`); anywhere else it is
 // held at the location the place names.
@@ -4169,24 +4196,25 @@ private captures_let_out(ft: &FrameTrack, evs: &EvBuf, st: &StructType, args: Bu
         val arg = args[c]
         val field = st.fields[c].0
 
-        // The capture's field, and for one held by reference the variable it points at.
-        var held: Buf[(int, string)] = buf()
+        // The capture's field, and for one held by reference the variable it points at: the steps
+        // through the closure's environment, what is held there, and the field of the capture it sits in.
+        var held: Buf[(int, string, string)] = buf()
 
         rule_core(ft, arg) match
-            Some(core) -> held.push((1, core))
+            Some(core) -> held_in_capture(ft, &held, arg, core)
             None -> ()
 
         *arg.kind match
             TAddrOf(place, _) -> local_root(ft.refs, place) match
-                Some(n) -> if ft.core_of(n).is_some() then held.push((2, ft.core_of(n).unwrap()))
+                Some(n) -> if ft.core_of(n).is_some() then held.push((2, ft.core_of(n).unwrap(), ""))
                 None -> ()
             _ -> ()
 
         for h in held
-            for item in read_path_of(ft.cx, body, 0, h.0, s".$field").locs
+            for item in read_path_of(ft.cx, body, 0, h.0, s".$field${h.2}").locs
                 val loc = outlasting_loc(item.loc, item.how)
 
-                if loc.is_none() then continue
+                if loc.is_none() || put_back_by_reference(ft, st, args, body, c, item) then continue
 
                 val said = s"a closure lets its capture '$field' outlive the call (${item.how}), and '$field' " +
                     s"holds ${h.1} — capture the value itself, or storage that lasts"
@@ -4203,6 +4231,117 @@ private captures_let_out(ft: &FrameTrack, evs: &EvBuf, st: &StructType, args: Bu
 
     if ft.faults.items.len() + evs.items.len() == told then environment_let_out(ft, evs, st, args, body)
 end captures_let_out
+
+// **A local captured by value is asked field by field, as a call handed its address is**
+// (`read_cores_along`): the closure's copy of `a` sits one step through its environment, along the
+// capture's own field, so a body handing `&a` to a callee that lets out what it reads along `.reg`
+// lets out nothing of the address `a.peer` holds. Where the local's fields cannot be told apart, the
+// capture is asked whole.
+private held_in_capture(ft: &FrameTrack, held: *Buf[(int, string, string)], arg: TExpr, core: string)
+    val start = held.len()
+
+    *arg.kind match
+        TLoad(_, ty) ->
+            if local_root(ft.refs, arg).is_some()
+                for r in read_cores_along(ft, TExpr(arg.span, TAddrOf(arg, Ptr(ty))))
+                    if r.0 == 1 then held.push((1, r.1, r.2))
+        _ -> ()
+
+    if held.len() == start then held.push((1, core, ""))
+end held_in_capture
+
+// **A closure that runs within the call is judged as the frame is**: a capture it holds by reference
+// is the frame's own variable, so a body handing `&c` (or `&c.f`) to a callee hands exactly the address
+// the frame's own `put(&c)` would, and what the callee puts back into storage reached through it stays
+// where the frame's call would leave it (`frame_read_locs`, `frame_closed`) -- `c.mem` pointing at
+// another local of the frame, written through, is that local written. The body's own walk cannot say
+// so, since a capture held by reference is named as nowhere there (`by_reference_capture`). A capture
+// held by value -- a closure that is stored, or escapes -- is a copy, and stays judged by the body. A
+// closure written in the body, capturing the capture by reference in turn, is asked the same of its own
+// body, along its own field.
+private put_back_by_reference(ft: &FrameTrack, st: &StructType, args: Buf[TExpr], body: string, c: usize,
+                              item: KeptAt) -> bool =
+    local_root(ft.refs, args[c]).is_some() && lent_capture_put_back(ft, st, body, c, args[c], item, 0)
+
+private lent_capture_put_back(ft: &FrameTrack, st: &StructType, body: string, c: usize, local: TExpr,
+                              item: KeptAt, depth: int) -> bool
+    if item.site == 0 || depth > 4 then return false
+
+    val by_ref = ft.cx.an.closure_refs.get(st.base) match
+        Some(refs) -> c < refs.len() && refs[c]
+        None -> false
+
+    if !by_ref then return false
+
+    val f = ft.cx.find(body)
+
+    if f.is_none() then return false
+
+    // The one node the item was let out at: an argument of a call, or a capture of a closure literal.
+    var calls: Buf[(string, usize, TExpr)] = buf()
+    var inner: Buf[(&StructType, usize, TExpr)] = buf()
+    val call_sink = &calls
+    val inner_sink = &inner
+
+    walk_block_stmts(f.unwrap().body, expr_walk(true, x -> *x.kind match
+        TCall(callee, cargs, _, _) ->
+            for k in 0..<cargs.len()
+                if node_id(cargs[k]) == item.site then call_sink.push((callee, k, cargs[k]))
+        TStructNew(ist, iargs) ->
+            if is_closure_literal(Struct(ist))
+                for k in 0..<iargs.len()
+                    if node_id(iargs[k]) == item.site then inner_sink.push((ist, k, iargs[k]))
+        _ -> ()))
+
+    if calls.len() + inner.len() != 1 then return false
+
+    if inner.len() == 1
+        val ist = inner[0].0
+        val k = inner[0].1
+
+        if k >= ist.fields.len() then return false
+
+        val there = in_frame_terms(inner[0].2, c, local)
+
+        if there.is_none() then return false
+
+        val inner_body = s"${ist.base}.call"
+
+        for next in read_path_of(ft.cx, inner_body, 0, 1, s".${ist.fields[k].0}").locs
+            if outlasting_loc(next.loc, next.how).is_none() then continue
+            if !lent_capture_put_back(ft, ist, inner_body, k, there.unwrap(), next, depth + 1) then return false
+
+        return true
+    end if
+
+    val name = calls[0].0
+    val j = calls[0].1
+
+    val handed = *calls[0].2.kind match
+        TAddrOf(place, ty) -> in_frame_terms(place, c, local) match
+            Some(p) -> TExpr(calls[0].2.span, TAddrOf(p, ty))
+            None -> return false
+        _ -> return false
+
+    if !frame_closed(ft, handed) then return false
+
+    for kept in keeps_of(ft.cx, name, j).locs
+        if !put_back(kept.loc, j) then return false
+
+    frame_read_locs(ft, name, j, handed).is_empty()
+end lent_capture_put_back
+
+// A place in a closure's body that lies along its capture `c`, said in the terms of the frame that wrote
+// the closure, where the capture is `local`: `(*self).c.mem` is `local.mem`.
+private in_frame_terms(place: TExpr, c: usize, local: TExpr) -> Option[TExpr] = *place.kind match
+    TField(r, index, ty) -> *r.kind match
+        TDeref(x, _) ->
+            if is_environment_load(x) then (if index >= 0 && usize(index) == c then Some(local) else None)
+            else None
+        _ -> in_frame_terms(r, c, local) match
+            Some(inner) -> Some(TExpr(place.span, TField(inner, index, ty)))
+            None -> None
+    _ -> None
 
 // **A body that lets the address of a capture it holds by value out is judged at the literal too**:
 // such a capture is a field of the closure, so `&x` in the body is the address of the closure's own

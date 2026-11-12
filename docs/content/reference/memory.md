@@ -3043,7 +3043,11 @@ What a compiler maintainer needs and a program rarely meets:
   pointer's type reaches itself past eight steps, the callee is asked what it lets out of anything it
   reads through the pointer, and is refused if it lets out anything read there.
 - **What a callee with no body can run, for the one rule.** A callee's reach is its body, every body it
-  calls, and every destructor. A call through a pointer or a trait object anywhere in that could run
+  calls, and — where one of those can let go of a value that may run a destructor (a type with one, an
+  object behind a trait, a closure) — every destructor. A maker such as `blank() -> Buf[u8] =
+  buf_filled(n, u8(0))` lets go of nothing, so a destructor elsewhere that calls through a pointer does
+  not stop a local it fills from being the only name for its buffer, and a call not handed that local
+  may write other `Buf[u8]`s while a view of it is held. A call through a pointer or a trait object anywhere in that could run
   anything, so every cast and all module storage count. A foreign function may call back into whatever
   C can enter — an `@export`, a `@section` function, one whose address is taken, one with a foreign
   convention — so it reaches those and all module storage. The standard library's own `extern`s are
