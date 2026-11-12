@@ -3052,8 +3052,11 @@ What a compiler maintainer needs and a program rarely meets:
   run anything, so every cast and all module storage count. **A call through a trait object, in a
   program's own build** (`sysl build`, `run`, `test`), runs the method in that slot of each table the
   program has for the trait — one per type it put behind the trait, and none where it put none — so
-  its reach is those methods' reach; that holds of a call in the frame holding the ref or view as much
-  as of one deep in a callee (a `Display` rendered through `*Writer` under `map_err`). **A library's
+  its reach is those methods' reach, each handed the object as its own type, so a field the trait
+  hides (a `Clearer` holding a `&Keep` of owners) counts as an argument would. That holds of a call
+  in the frame holding the ref or view as much as of one deep in a callee (a `Display` rendered
+  through `*Writer` under `map_err`). A call through a closure names no body even there, since nothing
+  in its type says what it captured. **A library's
   build** (`build-lib`, `build-c`) may be handed an object whose table it never saw, so there such a
   call could run anything, as a call through a pointer. A foreign function may call back into whatever
   C can enter — an `@export`, a `@section` function, one whose address is taken, one with a foreign

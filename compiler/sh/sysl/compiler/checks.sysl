@@ -834,9 +834,15 @@ private only_body(name: string) -> Buf[string]
     out
 
 // The bodies a call through slot `slot` of a trait object may run, and what each is handed: the
-// receiver's object as well as the arguments. **A whole program names every one** -- the method in
+// receiver's object, as each table's own type, as well as the arguments. **A whole program names every
+// one** -- the method in
 // that slot of each table it has for the trait, and none where it has no table at all, since then no
 // such object exists. Anything else, or a receiver whose trait cannot be named, is a body no name says.
+//
+// **A closure stays a body no name says.** What a trait object can reach is what the program erased to
+// its trait (`type_reaches`), but a closure's captures are put behind `Fn` by no erasure, so the
+// object's type would hide every one of them: naming the closure's body would clear a call that
+// releases what a capture holds.
 private slot_bodies(a: &Analysis, recv: TExpr, slot: int, args: Buf[TExpr]) -> (Buf[string], Buf[TExpr])
     var handed: Buf[TExpr] = buf()
 
@@ -849,7 +855,8 @@ private slot_bodies(a: &Analysis, recv: TExpr, slot: int, args: Buf[TExpr]) -> (
         Some(Trait(n, _, _)) -> n
         _ -> ""
 
-    if !a.closed || trait_name == "" || slot < 0 then return (only_body(""), handed)
+    if !a.closed || trait_name == "" || slot < 0 || is_call_trait(module_bare(trait_name))
+        return (only_body(""), handed)
 
     var out: Buf[string] = buf()
     val tables = a.tables.members.vtables
@@ -860,6 +867,10 @@ private slot_bodies(a: &Analysis, recv: TExpr, slot: int, args: Buf[TExpr]) -> (
         if vt.trait_name != trait_name then continue
         if usize(slot) >= vt.slots.len() then return (only_body(""), handed)
         if !holds_string(out, vt.slots[usize(slot)].target) then out.push(vt.slots[usize(slot)].target)
+
+        // The method is handed the object itself, through a pointer, whatever the trait hides of it.
+        handed.push(TExpr(recv.span, TZero(Ptr(vt.for_type))))
+    end for
 
     (out, handed)
 end slot_bodies

@@ -14,7 +14,8 @@ import sysl.process.capture
 //
 // The axes: where the trait call is (deep in a callee -- `Display` through `*Writer` under
 // `map_err`, a module `&Bus` -- or in the frame itself), what the tables hold (every method reads, one
-// writes a `Buf[u8]`, no table at all), how the slot is reached (a method call, a rendering through
+// writes a `Buf[u8]`, no table at all, the object itself reaching the owner through a field the trait
+// hides), what the object is (a trait's, or a closure's, which stays unnamed), how the slot is reached (a method call, a rendering through
 // `&Display`), what is held (a view in an array of regions, a view in a local, a `ref`), and the build
 // (one file, two modules, `build-lib`). Left out: `build-c`, which is the same not-closed answer as
 // `build-lib` (`has_entry_point` false); a generic or default method in a slot, which is a name in the
@@ -215,6 +216,65 @@ tvc_frame_call_writer_refused()
 
     tvc_has(out, "'v' is a view borrowed from 'b', held in a 'Buf[byte]', and 'Scribble.read' may write a 'Buf[byte]'")
 end tvc_frame_call_writer_refused
+
+// An owner whose destructor frees what its view reads, and a holder that can let go of owners.
+private const TvcOwner: string =
+    "import sysl.buf.{Buf, buf}\n\n" +
+    "extern \"malloc\" c_malloc(n: usize) -> *u8\nextern \"free\" c_free(p: *u8)\n\n" +
+    "struct Owner\n    p: *u8\n    n: usize\n\n" +
+    "    @views(self)\n    view(&self) -> []const u8 = self.p[0..<self.n]\n\n" +
+    "impl Drop for Owner\n    drop(self)\n        print(\"freed\")\n        c_free(self.p)\n\n" +
+    "open(n: usize) -> &Owner\n    val p = c_malloc(n)\n\n    for i in 0..<n do p[i] = u8(65 + i)\n\n" +
+    "    Owner(p, n)\n\n" +
+    "struct Keep\n    all: Buf[&Owner]\n\n" +
+    "trait Act\n    act(*self) -> usize\n\n"
+
+// The object behind the trait reaches the owners through a field of its own, which the trait object's
+// type does not show: the table's type is what the method is handed.
+@test("tvc: a table whose object holds what the view reads is refused though the trait hides the field")
+tvc_frame_call_object_field_refused()
+    if !tvc_ready() then return
+
+    val out = tvc_ran(TvcOwner +
+                      "struct Clearer\n    k: &Keep\n\n" +
+                      "impl Act for Clearer\n    act(*self) -> usize\n        self.k.all.clear()\n        0\n\n" +
+                      "wrap(k: &Keep) -> &Act = Clearer(k)\n\n" +
+                      "run(o: &Owner, f: &Act)\n    val v = o.view()\n\n    print(f.act())\n    print(v[0])\n\n" +
+                      "val k = Keep(buf())\nk.all.push(open(3))\nrun(k.all[0], wrap(k))\n")
+
+    tvc_has(out, "'v' is a view borrowed from 'o', held in a 'Owner', and 'Clearer.act' may write a 'Owner'")
+end tvc_frame_call_object_field_refused
+
+@test("tvc: a table whose object holds owners through a field and only reads them is cleared")
+tvc_frame_call_object_field_cleared()
+    if !tvc_ready() then return
+
+    val out = tvc_ran(TvcOwner +
+                      "struct Counter\n    k: &Keep\n\n" +
+                      "impl Act for Counter\n    act(*self) -> usize = self.k.all.len()\n\n" +
+                      "wrap(k: &Keep) -> &Act = Counter(k)\n\n" +
+                      "run(o: &Owner, f: &Act)\n    val v = o.view()\n\n    print(f.act())\n    print(v[0])\n\n" +
+                      "val k = Keep(buf())\nk.all.push(open(3))\nrun(k.all[0], wrap(k))\n")
+
+    assert_eq(out, "1\n65\nfreed\n")
+end tvc_frame_call_object_field_cleared
+
+// A closure's captures are behind `Fn` by no erasure the program makes, so its body is not named: the
+// call stays one that could run anything, in a whole program too.
+@test("tvc: a call of a closure in the frame stays refused, since its captures are not in its type")
+tvc_frame_closure_refused()
+    if !tvc_ready() then return
+
+    val out = tvc_ran(TvcOwner +
+                      "clear(k: &Keep) -> usize\n    k.all.clear()\n    0\n\n" +
+                      "make(k: &Keep) -> &Fn() -> usize = () -> clear(k)\n\n" +
+                      "run(o: &Owner, f: &Fn() -> usize)\n    val v = o.view()\n\n    print(f())\n" +
+                      "    print(v[0])\n\n" +
+                      "val k = Keep(buf())\nk.all.push(open(3))\nrun(k.all[0], make(k))\n")
+
+    tvc_has(out, "'v' is a view borrowed from 'o', held in a 'Owner', and a call through a pointer or a " +
+            "trait names no body to ask")
+end tvc_frame_closure_refused
 
 // -- the build ------------------------------------------------------------------------------------------
 
