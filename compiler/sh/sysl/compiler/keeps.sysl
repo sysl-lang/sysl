@@ -3030,7 +3030,9 @@ private pointee_or(t: Type) -> Type = t match
 
 private place_path(scope: Scope, place: TExpr) -> string = *place.kind match
     TGlobal(symbol, _, _) -> bare_name(qualified_name(symbol))
-    TDeref(x, _) -> place_path(scope, x)
+    // A field of a captured local (`holder.f` in a nested function) is reached through the address
+    // the environment holds, and the reader wrote the local's name, not the environment's.
+    TDeref(x, _) -> capture_name(x).unwrap_or(place_path(scope, x))
     TField(r, index, _) -> texpr_type(r) match
         Struct(d) ->
             // A closure's capture is read out of its environment, and the reader wrote its name.
@@ -6502,9 +6504,10 @@ end refuse_spread
 
 // **A `@bounded` promise is trusted, but two ways of breaking it are in plain sight**: a body that
 // answers the callable hands it to a caller who may run it at any time after the call, and one that
-// stores it in module storage leaves it where anything may run it later. Everything else the body does
-// with it -- a scope it spawns on, a field of its receiver it clears before returning, another
-// `@bounded` callee -- is the promise's to answer for.
+// stores it in module storage -- or in a top-level `var` of the entry file, which lasts as long --
+// leaves it where anything may run it later. Everything else the body does with it -- a scope it
+// spawns on, a field of its receiver it clears before returning, another `@bounded` callee -- is the
+// promise's to answer for.
 private refuse_unbounded(cx: &KeepsCx, faults: &KeepFaults, f: TFunc)
     if f.marks.bounded.is_empty() || cx.mistaken.has(f.name) then return
 
@@ -6529,14 +6532,62 @@ private refuse_unbounded(cx: &KeepsCx, faults: &KeepFaults, f: TFunc)
         if !w.kept then continue
 
         for at in w.locs
-            if at.loc.starts_with("g:")
-                faults.items.push((scope, at.at, lead + s"but it stores '$pname' in module storage " +
+            val lasting = lasting_storage(cx, f, at.loc)
+
+            if lasting != ""
+                faults.items.push((scope, at.at, lead + s"but it stores '$pname' in $lasting " +
                                    s"(${at.how}), where anything may run it after the call has returned — " +
                                    "keep it in a local, or in a field of the receiver cleared before returning"))
                 break
             end if
     end for
 end refuse_unbounded
+
+// **What storage that lasts as long as the program something kept at `loc` is in**, said for a
+// refusal, or nothing: module storage, or one of the entry file's top-level bindings, which the
+// program's outermost block holds until it exits (`reference/memory.md § The entry file's statements
+// are the outermost block`).
+private lasting_storage(cx: &KeepsCx, f: TFunc, loc: string) -> string
+    if loc.starts_with("g:") then return "module storage"
+    if entry_binding_loc(cx, f, loc) then return "a top-level 'var' of the file the program starts in"
+
+    ""
+end lasting_storage
+
+// Whether `loc` is one of the entry file's top-level bindings. A function declared in the entry file
+// reaches one through its environment, its first parameter, so the location is named after that
+// parameter (`p0:.saved`, or `d:p0:.saved>{…}` for what the field points at); the environment's field
+// is the binding's address (`nested.sysl`'s `entry_slot_of`).
+private entry_binding_loc(cx: &KeepsCx, f: TFunc, loc: string) -> bool
+    if f.params.is_empty() then return false
+
+    var rest = ""
+
+    if loc.starts_with("d:p0:.") then rest = loc[6..<loc.bytes.len]
+    else if loc.starts_with("p0:.") then rest = loc[4..<loc.bytes.len]
+    else return false
+
+    f.params[0].1 match
+        Ptr(env) -> *env match
+            Struct(st) ->
+                for field in st.fields
+                    val label = field.0
+
+                    if !rest.starts_with(label) then continue
+
+                    val after = rest[label.bytes.len..<rest.bytes.len]
+
+                    if after != "" && !after.starts_with(".") && !after.starts_with("[") &&
+                       !after.starts_with(">")
+                        continue
+
+                    if cx.an.tables.entry_env_slots.has(s"${st.base}.$label") then return true
+                end for
+
+                false
+            _ -> false
+        _ -> false
+end entry_binding_loc
 
 private promise_broken(cx: &KeepsCx, f: TFunc, pname: string, how: string, closure: bool,
                        trait_name: Option[string]) -> string
