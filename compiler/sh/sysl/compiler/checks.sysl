@@ -139,7 +139,7 @@ private check_ref_calls(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal])
     var u = untouched_summary(p, dropping_reached(a))
     val reach = reacher(a, p, &u)
     var known: Set[string] = set()
-    val sink: &ErasedSink = ErasedSink(buf())
+    val sink: &ErasedSink = ErasedSink(buf(), buf())
 
     var consts: Set[string] = set()
 
@@ -149,7 +149,13 @@ private check_ref_calls(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal])
         if f.const_fn then consts.add(f.name)
         walk_block_stmts(f.body, expr_walk(false, e -> note_erased(sink, e)))
 
-    val erased = sink.items
+    // A module value's initializer may put a value behind a trait too.
+    for item in vals
+        if item.init.is_some() then walk_texpr(item.init.unwrap(), expr_walk(false, e -> note_erased(sink, e)))
+
+    // **A trait object reaches what every value the program put behind its trait reaches**, whether
+    // the object is the trait itself, a `&Trait` or a `*Trait`, so every erasure is asked of.
+    val erased = sink.behind
 
     for f in funcs
         var mine: Buf[RefWatch] = buf()
@@ -723,9 +729,12 @@ private closure_writes_under(a: &Analysis, bases: Buf[string], keys: Buf[string]
     None
 end closure_writes_under
 
-// Every value the program puts behind a trait, by the trait's name.
+// Every value the program puts behind a trait, by the trait's name: `items` where the erasure's type
+// is the trait itself, and `behind` for every erasure, a `&Trait` or `*Trait` among them, which is
+// what a trait object's reach is asked against (`type_reaches`).
 private struct ErasedSink
     items: Buf[(string, Type)]
+    behind: Buf[(string, Type)]
 end ErasedSink
 
 private note_erased(out: &ErasedSink, e: TExpr) = *e.kind match
@@ -734,6 +743,10 @@ private note_erased(out: &ErasedSink, e: TExpr) = *e.kind match
 
         tr match
             Trait(name, _, _) -> out.items.push((name, texpr_type(operand)))
+            _ -> ()
+
+        repr(erased_trait(ty).unwrap_or(tr)) match
+            Trait(name, _, _) -> out.behind.push((name, texpr_type(operand)))
             _ -> ()
     _ -> ()
 
