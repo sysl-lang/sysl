@@ -740,7 +740,7 @@ nextafter(x, y)     the closest value to x that is not x, on y's side of it
 ulp(x)              the gap from |x| to the next representable magnitude
 ```
 
-Both exist at `real` and at `f32`, and both are written on the bits rather than bound to libm, so
+Both exist at `real`, `f32` and `f16`, and both are written on the bits rather than bound to libm, so
 they answer the same on a freestanding target as on a hosted one.
 
 ```sysl
@@ -771,6 +771,46 @@ finite value there is no magnitude above to measure to, so it answers the gap be
 program holding a `long double` direction needs it taken at that width. sysl has no type wider than
 `real`, and an `f32` widens to `real` exactly, so the comparison `nexttoward` exists to make is
 already the one `nextafter` makes. A program porting a `nexttoward` call writes `nextafter`.
+
+## The special functions — `erf`, `tgamma`, the Bessel family
+
+```
+erf(x)  erfc(x)              the error function and its complement
+tgamma(x)                    the gamma function
+lgamma(x)  lgamma_sign(x)    log |gamma(x)|, and that with the sign of gamma(x)
+j0 j1 jn(n, x)               Bessel functions of the first kind
+y0 y1 yn(n, x)               Bessel functions of the second kind
+ilogb(x)                     the binary exponent, as an int
+scalbln(x, n)                x times 2 to the n, n an i64
+```
+
+Each exists at `real` and at `f32`. They are libm's, so like `sin` they are absent from a
+freestanding target. The edges follow C: `tgamma(0.0)` is infinity and `tgamma(-1.0)` a NaN, `y0(0.0)`
+is negative infinity, `erf` of an infinity is `±1`.
+
+```sysl
+import sysl.math.{erf, erfc, tgamma, lgamma_sign, jn, ilogb, scalbln, infinity}
+
+print(erf(1.0) > 0.8427 && erf(1.0) < 0.8428, erf(infinity()) == 1)
+print(tgamma(5.0), tgamma(0.0) == infinity(), tgamma(-1.0).is_nan())
+val (lg, sign) = lgamma_sign(-0.5)
+print(lg > 1.265 && lg < 1.266, sign)
+print(jn(2, 0.0), ilogb(8.0), scalbln(1.0, 10))
+```
+
+```output
+true true
+24 true true
+true -1
+0 3 1024
+```
+
+**`lgamma` never writes `signgam`.** C's `lgamma` leaves the sign of gamma in a global, which two
+threads race on. These call the reentrant `lgamma_r`; the sign is `lgamma_sign`'s second answer.
+**The `f32` Bessel functions compute at `real` and narrow**, because Apple's libm has no `j0f`.
+`ilogb` of a zero, an infinity or a NaN is the platform's sentinel, not a portable value, and
+`scalbln` saturates an exponent beyond any float's range, so `scalbln(1.0, 9223372036854775807)` is
+infinity and not a wrapped exponent.
 
 ## `Signed` and `Bits` — a different mechanism
 
