@@ -219,3 +219,40 @@ ebh_other_trait_local_accepted()
                  "static var bus: Option[&Bus] = None\n\n" + ebh_peek() + ebh_run("", "peek()") +
                  "var x = Board(buf())\nx.sram.push(5)\nbus = Some(Tick(0))\nprint(run(&x))\n\n" +
                  "val log: &Log = Ram(&x)\nlog.note()\nprint(x.sram.len())\n", "5\n2\n")
+
+// -- closures: one handed to a call is asked by its own captures --------------------------------------
+
+private ebh_go() -> string = "go(f: &Fn() -> unit) = f()\n\n"
+
+@test("a closure handed to a function taking 'Fn', capturing a pointer and writing the viewed buffer")
+ebh_closure_argument_refused()
+    if !ebh_ready() then return
+
+    ebh_refused(ebh_go() + ebh_run("", "go(() -> for i in 0..<100000 do b.sram.push(7))") +
+                "var x = Board(buf())\nx.sram.push(5)\nprint(run(&x))\n", "go")
+
+@test("a closure in module storage, capturing a pointer and writing the viewed buffer, called by the callee")
+ebh_closure_in_storage_refused()
+    if !ebh_ready() then return
+
+    ebh_refused("static var hook: Option[&Fn() -> unit] = None\n\nfire() = hook match\n    Some(f) -> f()\n" +
+                "    None -> ()\n\n" + ebh_run("", "fire()") +
+                "var x = Board(buf())\nx.sram.push(5)\nval p: *Board = &x\n" +
+                "hook = Some(() -> for i in 0..<100000 do p.sram.push(7))\nprint(run(&x))\n", "fire")
+
+@test("a closure holding the viewed local buffer by reference and replacing it, handed to a function taking 'Fn'")
+ebh_closure_by_reference_refused()
+    if !ebh_ready() then return
+
+    ebh_refused(ebh_go() + "local() -> int\n    var bytes: Buf[u8] = buf()\n    bytes.push(5)\n" +
+                "    var v = bytes.view_mut()\n    go(() -> bytes = buf())\n    int(v[0])\n\n" +
+                "print(local())\n", "go")
+
+@test("a closure that touches no buffer is accepted though another closure the program erases writes one")
+ebh_closure_argument_accepted()
+    if !ebh_ready() then return
+
+    ebh_accepted(ebh_go() + "spoil(b: *Board) = go(() -> b.sram.push(7))\n\n" +
+                 ebh_run("", "go(() -> print(1))") +
+                 "var x = Board(buf())\nx.sram.push(5)\nprint(run(&x))\nspoil(&x)\nprint(x.sram.len())\n",
+                 "1\n5\n2\n")

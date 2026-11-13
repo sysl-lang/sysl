@@ -9,7 +9,8 @@ import sysl.process.capture
 // holding one is a way to get hold of it -- but only for a callee that can run the code that casts:
 // its own body and everything that calls, and, once it calls a foreign function the program or a
 // package declared, everything C can enter. The standard library's own foreign functions never call
-// back into the program, so a callee reaching only those is not answerable for a cast elsewhere.
+// back into the program, so a callee reaching only those is not answerable for a cast elsewhere. A
+// destructor's cast counts against a callee that can let go of a value of its type.
 //
 // Module storage is counted the same way: a `*extern` function pointer reaches anything, so a
 // global holding one counts against a callee that names it or that calls such a foreign function,
@@ -196,16 +197,27 @@ crl_hook_global_named()
     crl_refused(crl_hook() + "\nhooked(s: string) -> int = hook(int(s.len)) + seen(s)\n",
                 "hooked(names[i])", "hooked")
 
-@test("a destructor that casts a pointer to a type holding the viewed buffer counts against a callee reaching only the standard library")
+// `Guard`'s destructor casts a pointer to a `Vm`; `back` makes one.
+private crl_guard() -> string =
+    "struct Guard\n    n: int\n\nimpl Drop for Guard\n    drop(self)\n" +
+    "        var spare = 0\n        val vm = ptr_cast[*Vm](ptr_cast[*u8](&spare))\n\n" +
+    "        if self.n > 1000 then *vm = Vm(buf())\n\n" +
+    "back(p: *u8) -> usize\n    val g = Guard(1)\n\n" +
+    "    ptr_cast[*Vm](p).names.len() + usize(g.n - 1)\n"
+
+@test("a destructor that casts a pointer to a type holding the viewed buffer counts against a callee that lets go of its type")
 crl_destructor_casts()
     if !crl_ready() then return
 
-    crl_refused("struct Guard\n    n: int\n\nimpl Drop for Guard\n    drop(self)\n" +
-                "        var spare = 0\n        val vm = ptr_cast[*Vm](ptr_cast[*u8](&spare))\n\n" +
-                "        if self.n > 1000 then *vm = Vm(buf())\n\n" +
-                "back(p: *u8) -> usize\n    val g = Guard(1)\n\n" +
-                "    ptr_cast[*Vm](p).names.len() + usize(g.n - 1)\n",
-                "seen(names[i])", "seen")
+    crl_refused(crl_guard() + "\nguarded(s: string) -> int\n    val g = Guard(int(s.len))\n\n" +
+                "    seen(s) + g.n - g.n\n",
+                "guarded(names[i])", "guarded")
+
+@test("a destructor that casts is not answerable for a callee reaching only the standard library, which cannot let go of its type")
+crl_destructor_casts_out_of_reach()
+    if !crl_ready() then return
+
+    crl_accepted(crl_guard(), "seen(names[i])")
 
 @test("a generic callee whose instance casts a pointer to a type holding the viewed buffer is refused")
 crl_generic_cast()

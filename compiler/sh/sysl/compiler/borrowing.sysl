@@ -895,9 +895,10 @@ inert_leaf(x: TExpr) -> bool = *x.kind match
 // storage it names (`reads`), and whether it holds a node that may run code no call names (`opaque`):
 // a call through a pointer or a trait's table, a rendering through a table, a place another task may
 // run (`touch_node`). `open_answering` is `open` with the calls on paths that end the program let by (`untouched_by`).
-// `releases` is whether the body can let go of a value that may run a destructor (`may_run_drop`): a
-// body that never holds one runs no destructor of its own, so a destructor is reached only through a
-// body that does.
+// `releases` is the types of the values the body can let go of that may run a destructor
+// (`may_run_drop`): its parameters', and those of every value it makes, reads or writes. A body that
+// holds none runs no destructor of its own, and one that does can run only a destructor such a value
+// reaches (`checks.sysl`'s `Reacher.lets_go`).
 //
 // **A `@relocates` member moves the storage behind its receiver** (`moves`: the receiver's type), and
 // that write lands in an object the receiver reaches through a reference -- a `Buf`'s core -- which no
@@ -922,7 +923,7 @@ struct Untouched
     opaque: Buf[bool]
     moves: Buf[Option[Type]]
     open_answering: Buf[bool]
-    releases: Buf[bool]
+    releases: Buf[Buf[Type]]
 end Untouched
 
 // An empty summary, for an emitter that has not read a program yet.
@@ -931,17 +932,21 @@ untouched_none() -> Untouched =
               buf())
 
 // What one body's walk gathers for the `Untouched` lists that say what it can run: the module storage
-// it names, and whether it holds a node that may run code no call names.
+// it names, whether it holds a node that may run code no call names, and the types of what it can let
+// go of that may run a destructor.
 private struct ReachSink
     reads: Set[string]
     opaque: bool
-    releases: bool
+    releases: Buf[Type]
 
     read(*self, symbol: string)
         self.reads.add(symbol)
 
     hide(*self)
         self.opaque = true
+
+    release(*self, t: Type, dropping: Buf[Type])
+        if !has_type(self.releases, t) && may_run_drop(t, dropping) then self.releases.push(t)
 end ReachSink
 
 // Whether a body that gives back the count of a value of type `given` -- the old value of a place it
@@ -1061,11 +1066,11 @@ untouched_summary(p: TProgram, dropping: Buf[Type], owning: Set[string] = set(),
         val ending = exit_kinds(f.body)
         val gives = type_sink()
         val own = cast_sink()
-        val reach: &ReachSink = ReachSink(set(), false, false)
+        val reach: &ReachSink = ReachSink(set(), false, buf())
 
         // A parameter is let go of at the return, or handed on, whether or not the body names it.
         for item in f.params
-            if may_run_drop(item.1, dropping) then reach.releases = true
+            reach.release(item.1, dropping)
 
         val walk = TWalk(true, x -> touch_node(v, calls, exits, ending, roots, gives, own, reach, dropping,
                                                locals, tables, x),
@@ -1316,7 +1321,7 @@ private touch_node(v: &Verdict, calls: &CallSink, exits: &CallSink, ending: &Kin
     note_laundered(laundered, x)
 
     if makes_dropping(x, dropping) then v.refuse()
-    if !reach.releases && may_run_drop(texpr_type(x), dropping) then reach.releases = true
+    reach.release(texpr_type(x), dropping)
 
     *x.kind match
         TGlobal(symbol, _, _) -> reach.read(symbol)

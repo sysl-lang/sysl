@@ -3179,8 +3179,12 @@ What a compiler maintainer needs and a program rarely meets:
   pointer's type reaches itself past eight steps, the callee is asked what it lets out of anything it
   reads through the pointer, and is refused if it lets out anything read there.
 - **What a callee with no body can run, for the one rule.** A callee's reach is its body, every body it
-  calls, and — where one of those can let go of a value that may run a destructor (a type with one, an
-  object behind a trait, a closure) — every destructor. A maker such as `blank() -> Buf[u8] =
+  calls, and the destructors of what those bodies can let go of: the values they are handed, make,
+  read or write, the module storage they name and the objects their casts point at, each followed
+  through what it holds — an object behind a trait through every type the program put behind that
+  trait, a closure through what it captured. A destructor reached brings what its own body can let go
+  of, so a destructor two deep is reached too. A walk that reaches a foreign function takes in every
+  destructor, since C can hand back anything. A maker such as `blank() -> Buf[u8] =
   buf_filled(n, u8(0))` lets go of nothing, so a destructor elsewhere that calls through a pointer does
   not stop a local it fills from being the only name for its buffer, and a call not handed that local
   may write other `Buf[u8]`s while a view of it is held. A call through a pointer anywhere in that could
@@ -3247,6 +3251,79 @@ print(copy_in(&sram, Ram(cells)), keep.len())
 
 ```output
 7 0
+```
+
+A callee that lets go of a `Quiet`, whose destructor only prints, may run while a view is held, though
+the program has another destructor that writes module storage holding a `Buf[u8]`:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+static var keep: Buf[u8] = buf()
+
+struct Tap
+    n: int
+
+impl Drop for Tap
+    drop(self)
+        keep = buf()
+
+struct Quiet
+    n: int
+
+impl Drop for Quiet
+    drop(self) = print("quiet", self.n)
+
+twice(n: int) -> int
+    val q: &Quiet = Quiet(n * 2)
+    q.n
+
+fill(sram: *Buf[u8]) -> u8
+    var v = sram.view_mut()
+    v[0] = u8(twice(3))
+    v[0]
+
+val t: &Tap = Tap(1)
+var sram: Buf[u8] = buf()
+sram.push(0)
+print(fill(&sram), t.n)
+```
+
+```output
+quiet 6
+6 1
+```
+
+One that lets go of a `Tap` is refused, since its destructor may write the buffer the view reads:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+static var keep: Buf[u8] = buf()
+
+struct Tap
+    n: int
+
+impl Drop for Tap
+    drop(self)
+        keep = buf()
+
+twice(n: int) -> int
+    val t: &Tap = Tap(n * 2)
+    t.n
+
+fill(sram: *Buf[u8]) -> u8
+    var v = sram.view_mut()
+    v[0] = u8(twice(3))
+    v[0]
+
+var sram: Buf[u8] = buf()
+sram.push(0)
+print(fill(&sram))
+```
+
+```error
+'v' is a view borrowed from 'sram', held in a 'Buf[byte]', and 'twice' may write a 'Buf[byte]'
 ```
 
 ## Hazard summary
