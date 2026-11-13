@@ -1,0 +1,136 @@
+module sysl.math
+@no_alloc
+
+import sysl.sys.*
+
+/** The special functions: the error function, the gamma family, the Bessel functions, and the two
+ * exponent operations `ilogb` and `scalbln`.
+ *
+ * **Each is libm's, so none exists on a freestanding machine** -- the same line `sin` is on. They
+ * are free functions at `real` and at `f32`, the way `nextafter` is, because a program asks for
+ * them by value rather than by receiver. Every edge follows C: `tgamma` of zero is an infinity and
+ * of a negative integer a NaN, `y0` at zero is negative infinity, a NaN in answers a NaN.
+ *
+ * **`lgamma` does not touch the global `signgam`.** C's `lgamma` stores the sign of the gamma
+ * function there, so two threads calling it race; this module binds the reentrant `lgamma_r`
+ * instead and gives the sign as the second half of `lgamma_sign`.
+ *
+ * **The `f32` Bessel functions compute at `real` and narrow.** Apple's libm has no `j0f`, `jnf` or
+ * the rest of that family, so one spelling that works everywhere widens the argument, which is
+ * exact, and rounds the answer once.
+ */
+
+/** The error function, `2/sqrt(pi)` times the integral of `exp(-t^2)` from 0 to `x`. It is odd,
+ * answers `1` at positive infinity and `-1` at negative infinity.
+ */
+erf(x: real) -> real = sysl_erf(x)
+
+/** The `f32` error function; see the `real` form. */
+erf(x: f32) -> f32 = sysl_erff(x)
+
+/** The complementary error function, `1 - erf(x)`, computed without the cancellation that the
+ * subtraction has for large `x`: `0` at positive infinity and `2` at negative infinity.
+ */
+erfc(x: real) -> real = sysl_erfc(x)
+
+/** The `f32` complementary error function; see the `real` form. */
+erfc(x: f32) -> f32 = sysl_erfcf(x)
+
+/** The gamma function, which is `(x - 1)!` at a positive integer. A zero answers an infinity of
+ * its own sign, a negative integer and negative infinity answer a NaN, and positive infinity
+ * answers positive infinity.
+ */
+tgamma(x: real) -> real = sysl_tgamma(x)
+
+/** The `f32` gamma function; see the `real` form. */
+tgamma(x: f32) -> f32 = sysl_tgammaf(x)
+
+/** The natural logarithm of the absolute value of the gamma function. It is infinite at zero and
+ * at every negative integer, and at both infinities. The sign of the gamma function itself is
+ * `lgamma_sign`'s second answer.
+ */
+lgamma(x: real) -> real
+    var sign: i32 = 0
+    sysl_lgamma_r(x, &sign)
+
+/** The `f32` log-gamma; see the `real` form. */
+lgamma(x: f32) -> f32
+    var sign: i32 = 0
+    sysl_lgammaf_r(x, &sign)
+
+/** `lgamma(x)` together with the sign of the gamma function there, `1` or `-1`: the gamma
+ * function is negative on `(-1, 0)`, positive on `(-2, -1)`, and alternates below.
+ */
+lgamma_sign(x: real) -> (real, int)
+    var sign: i32 = 0
+    val v = sysl_lgamma_r(x, &sign)
+    (v, int(sign))
+
+/** The `f32` log-gamma and the sign; see the `real` form. */
+lgamma_sign(x: f32) -> (f32, int)
+    var sign: i32 = 0
+    val v = sysl_lgammaf_r(x, &sign)
+    (v, int(sign))
+
+/** The Bessel function of the first kind of order 0. It is `1` at zero and even. */
+j0(x: real) -> real = sysl_j0(x)
+
+/** The `f32` Bessel function of order 0; computed at `real`. */
+j0(x: f32) -> f32 = f32(sysl_j0(real(x)))
+
+/** The Bessel function of the first kind of order 1. It is `0` at zero and odd. */
+j1(x: real) -> real = sysl_j1(x)
+
+/** The `f32` Bessel function of order 1; computed at `real`. */
+j1(x: f32) -> f32 = f32(sysl_j1(real(x)))
+
+/** The Bessel function of the first kind of order `n`. */
+jn(n: int, x: real) -> real = sysl_jn(i32(n), x)
+
+/** The `f32` Bessel function of order `n`; computed at `real`. */
+jn(n: int, x: f32) -> f32 = f32(sysl_jn(i32(n), real(x)))
+
+/** The Bessel function of the second kind of order 0. It is negative infinity at zero and a NaN
+ * below it.
+ */
+y0(x: real) -> real = sysl_y0(x)
+
+/** The `f32` second-kind Bessel function of order 0; computed at `real`. */
+y0(x: f32) -> f32 = f32(sysl_y0(real(x)))
+
+/** The Bessel function of the second kind of order 1. */
+y1(x: real) -> real = sysl_y1(x)
+
+/** The `f32` second-kind Bessel function of order 1; computed at `real`. */
+y1(x: f32) -> f32 = f32(sysl_y1(real(x)))
+
+/** The Bessel function of the second kind of order `n`. */
+yn(n: int, x: real) -> real = sysl_yn(i32(n), x)
+
+/** The `f32` second-kind Bessel function of order `n`; computed at `real`. */
+yn(n: int, x: f32) -> f32 = f32(sysl_yn(i32(n), real(x)))
+
+/** The binary exponent of `x`, as an integer: `ilogb(8.0)` is `3`, and the same exponent a
+ * subnormal would have if it were normalised. A zero, an infinity and a NaN answer the
+ * platform's own sentinels (`FP_ILOGB0`, `INT_MAX`, `FP_ILOGBNAN`), which are not portable
+ * values to compare with.
+ */
+ilogb(x: real) -> int = int(sysl_ilogb(x))
+
+/** The binary exponent of an `f32`; see the `real` form. */
+ilogb(x: f32) -> int = int(sysl_ilogbf(x))
+
+/** `x` times `2` to the power `n`, exactly unless the result overflows or underflows. The exponent
+ * is an `i64`; one beyond what any float can reach is saturated before the call, so the answer is
+ * the same infinity or zero (with `x`'s sign) the exact exponent would give.
+ */
+scalbln(x: real, n: i64) -> real = sysl_scalbn(x, i32(clamp_exponent(n)))
+
+/** The `f32` form of `scalbln`; see the `real` form. */
+scalbln(x: f32, n: i64) -> f32 = sysl_scalbnf(x, i32(clamp_exponent(n)))
+
+// Any exponent past this overflows or underflows every width, so the saturated one answers alike.
+private clamp_exponent(n: i64) -> i64
+    if n > 100000 then return 100000
+    if n < -100000 then return -100000
+    n

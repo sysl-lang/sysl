@@ -20,7 +20,7 @@ name, and each says in its own header why it is not part of this one.
 
 ## Index
 
-[`e`](#e) [`ln10`](#ln10) [`ln2`](#ln2) [`pi`](#pi) [`sqrt2`](#sqrt2) [`tau`](#tau) [`approx_eq`](#approx_eq) [`approx_eq_rel`](#approx_eq_rel) [`assert_approx_eq`](#assert_approx_eq) [`assert_approx_eq_rel`](#assert_approx_eq_rel) [`checked_add`](#checked_add) [`checked_mul`](#checked_mul) [`checked_sub`](#checked_sub) [`clamp`](#clamp) [`div_floor`](#div_floor) [`divmod`](#divmod) [`gcd`](#gcd) [`infinity`](#infinity) [`is_power_of_two`](#is_power_of_two) [`lcm`](#lcm) [`max`](#max) [`min`](#min) [`mod_floor`](#mod_floor) [`nan`](#nan) [`next_power_of_two`](#next_power_of_two) [`nextafter`](#nextafter) [`nextafter`](#nextafter-1) [`overflowing_add`](#overflowing_add) [`overflowing_mul`](#overflowing_mul) [`overflowing_sub`](#overflowing_sub) [`pow`](#pow) [`ulp`](#ulp) [`ulp`](#ulp-1) [`Bits`](#bits) [`ByteOrder`](#byteorder) [`Float`](#float) [`Magnitude`](#magnitude) [`MinMax`](#minmax) [`MulAdd`](#muladd) [`Signed`](#signed) [Float for bf16](#float-for-bf16) [Float for f16](#float-for-f16) [Float for f32](#float-for-f32) [Float for real](#float-for-real) [Magnitude for f32](#magnitude-for-f32) [Magnitude for real](#magnitude-for-real) [Magnitude for T](#magnitude-for-t) [MinMax for T](#minmax-for-t) [MulAdd for f32](#muladd-for-f32) [MulAdd for real](#muladd-for-real)
+[`e`](#e) [`ln10`](#ln10) [`ln2`](#ln2) [`pi`](#pi) [`sqrt2`](#sqrt2) [`tau`](#tau) [`approx_eq`](#approx_eq) [`approx_eq_rel`](#approx_eq_rel) [`assert_approx_eq`](#assert_approx_eq) [`assert_approx_eq_rel`](#assert_approx_eq_rel) [`checked_add`](#checked_add) [`checked_mul`](#checked_mul) [`checked_sub`](#checked_sub) [`clamp`](#clamp) [`div_floor`](#div_floor) [`divmod`](#divmod) [`erf`](#erf) [`erf`](#erf-1) [`erfc`](#erfc) [`erfc`](#erfc-1) [`gcd`](#gcd) [`ilogb`](#ilogb) [`ilogb`](#ilogb-1) [`infinity`](#infinity) [`is_power_of_two`](#is_power_of_two) [`j0`](#j0) [`j0`](#j0-1) [`j1`](#j1) [`j1`](#j1-1) [`jn`](#jn) [`jn`](#jn-1) [`lcm`](#lcm) [`lgamma`](#lgamma) [`lgamma`](#lgamma-1) [`lgamma_sign`](#lgamma_sign) [`lgamma_sign`](#lgamma_sign-1) [`max`](#max) [`min`](#min) [`mod_floor`](#mod_floor) [`nan`](#nan) [`next_power_of_two`](#next_power_of_two) [`nextafter`](#nextafter) [`nextafter`](#nextafter-1) [`nextafter`](#nextafter-2) [`overflowing_add`](#overflowing_add) [`overflowing_mul`](#overflowing_mul) [`overflowing_sub`](#overflowing_sub) [`pow`](#pow) [`scalbln`](#scalbln) [`scalbln`](#scalbln-1) [`tgamma`](#tgamma) [`tgamma`](#tgamma-1) [`ulp`](#ulp) [`ulp`](#ulp-1) [`ulp`](#ulp-2) [`y0`](#y0) [`y0`](#y0-1) [`y1`](#y1) [`y1`](#y1-1) [`yn`](#yn) [`yn`](#yn-1) [`Bits`](#bits) [`ByteOrder`](#byteorder) [`Float`](#float) [`Magnitude`](#magnitude) [`MinMax`](#minmax) [`MulAdd`](#muladd) [`Signed`](#signed) [Float for bf16](#float-for-bf16) [Float for f16](#float-for-f16) [Float for f32](#float-for-f32) [Float for real](#float-for-real) [Magnitude for f32](#magnitude-for-f32) [Magnitude for real](#magnitude-for-real) [Magnitude for T](#magnitude-for-t) [MinMax for T](#minmax-for-t) [MulAdd for f32](#muladd-for-f32) [MulAdd for real](#muladd-for-real)
 
 ## Constants
 
@@ -117,7 +117,7 @@ combined form always knew they did.
 ### `assert_approx_eq`
 
 ```sysl
-assert_approx_eq[F: Float + Debug](got: F, want: F, tol: F, msg: string = "", file: string = __FILE__, line: long = __LINE__)
+assert_approx_eq[F: Float + Debug](got: F, want: F, tol: F, msg: string = "", file: string = "", line: long = 0)
 ```
 
 The two above, written as assertions -- the float half of `sysl.assert_eq`, which floats cannot
@@ -137,7 +137,7 @@ costs a caller nothing and lets the report exist.
 ### `assert_approx_eq_rel`
 
 ```sysl
-assert_approx_eq_rel[F: Float + Debug](got: F, want: F, tol: F, msg: string = "", file: string = __FILE__, line: long = __LINE__)
+assert_approx_eq_rel[F: Float + Debug](got: F, want: F, tol: F, msg: string = "", file: string = "", line: long = 0)
 ```
 
 ### `checked_add`
@@ -217,6 +217,40 @@ dividend (`01`) -- `divmod(-17, 5)` is `-3` and `-2`. The reason to call this ra
 the two operators is that it says once what a reader would otherwise check twice: that the same
 two operands feed both.
 
+### `erf`
+
+```sysl
+erf(x: real) -> real
+```
+
+The error function, `2/sqrt(pi)` times the integral of `exp(-t^2)` from 0 to `x`. It is odd,
+answers `1` at positive infinity and `-1` at negative infinity.
+
+### `erf`
+
+```sysl
+erf(x: f32) -> f32
+```
+
+The `f32` error function; see the `real` form.
+
+### `erfc`
+
+```sysl
+erfc(x: real) -> real
+```
+
+The complementary error function, `1 - erf(x)`, computed without the cancellation that the
+subtraction has for large `x`: `0` at positive infinity and `2` at negative infinity.
+
+### `erfc`
+
+```sysl
+erfc(x: f32) -> f32
+```
+
+The `f32` complementary error function; see the `real` form.
+
 ### `gcd`
 
 ```sysl
@@ -233,6 +267,25 @@ right divisor carrying the wrong sign, and one comparison at the end fixes it. N
 
 `gcd(x, 0)` is `x`, which is the identity the loop already produces and the answer number theory
 gives: everything divides zero, so the largest divisor the pair has in common is `x`'s own.
+
+### `ilogb`
+
+```sysl
+ilogb(x: real) -> int
+```
+
+The binary exponent of `x`, as an integer: `ilogb(8.0)` is `3`, and the same exponent a
+subnormal would have if it were normalised. A zero, an infinity and a NaN answer the
+platform's own sentinels (`FP_ILOGB0`, `INT_MAX`, `FP_ILOGBNAN`), which are not portable
+values to compare with.
+
+### `ilogb`
+
+```sysl
+ilogb(x: f32) -> int
+```
+
+The binary exponent of an `f32`; see the `real` form.
 
 ### `infinity`
 
@@ -261,6 +314,54 @@ has a bit pattern with one bit set only at the most negative value of its width,
 `count_ones` answers one and the number is emphatically not a power of two; a comparison against
 zero costs nothing and is the whole of the difference.
 
+### `j0`
+
+```sysl
+j0(x: real) -> real
+```
+
+The Bessel function of the first kind of order 0. It is `1` at zero and even.
+
+### `j0`
+
+```sysl
+j0(x: f32) -> f32
+```
+
+The `f32` Bessel function of order 0; computed at `real`.
+
+### `j1`
+
+```sysl
+j1(x: real) -> real
+```
+
+The Bessel function of the first kind of order 1. It is `0` at zero and odd.
+
+### `j1`
+
+```sysl
+j1(x: f32) -> f32
+```
+
+The `f32` Bessel function of order 1; computed at `real`.
+
+### `jn`
+
+```sysl
+jn(n: int, x: real) -> real
+```
+
+The Bessel function of the first kind of order `n`.
+
+### `jn`
+
+```sysl
+jn(n: int, x: f32) -> f32
+```
+
+The `f32` Bessel function of order `n`; computed at `real`.
+
 ### `lcm`
 
 ```sysl
@@ -276,6 +377,41 @@ is not `sqrt(x*x + y*y)` in `float.sysl`.
 
 **A zero operand answers zero** rather than dividing by one: zero has no multiple that anything
 else also divides, and reaching `gcd(0, 0)`, which is zero, would otherwise be a division by it.
+
+### `lgamma`
+
+```sysl
+lgamma(x: real) -> real
+```
+
+The natural logarithm of the absolute value of the gamma function. It is infinite at zero and
+at every negative integer, and at both infinities. The sign of the gamma function itself is
+`lgamma_sign`'s second answer.
+
+### `lgamma`
+
+```sysl
+lgamma(x: f32) -> f32
+```
+
+The `f32` log-gamma; see the `real` form.
+
+### `lgamma_sign`
+
+```sysl
+lgamma_sign(x: real) -> (real, int)
+```
+
+`lgamma(x)` together with the sign of the gamma function there, `1` or `-1`: the gamma
+function is negative on `(-1, 0)`, positive on `(-2, -1)`, and alternates below.
+
+### `lgamma_sign`
+
+```sysl
+lgamma_sign(x: f32) -> (f32, int)
+```
+
+The `f32` log-gamma and the sign; see the `real` form.
 
 ### `max`
 
@@ -363,6 +499,15 @@ nextafter(x: f32, y: f32) -> f32
 
 The `f32` after `x` in the direction of `y`; see the `real` form for the edges.
 
+### `nextafter`
+
+```sysl
+nextafter(x: f16, y: f16) -> f16
+```
+
+The `f16` after `x` in the direction of `y`; see the `real` form for the edges. The largest
+finite `f16` is 65504, and stepping outward from it answers infinity.
+
 ### `overflowing_add`
 
 ```sysl
@@ -431,6 +576,42 @@ exponent has no answer among the integers, and saying so in the type is better t
 any other: a debug build stops at it and a release build wraps (`pow(2, 64)` at `int` is `0`). A
 program that needs to know writes the check it needs.
 
+### `scalbln`
+
+```sysl
+scalbln(x: real, n: i64) -> real
+```
+
+`x` times `2` to the power `n`, exactly unless the result overflows or underflows. The exponent
+is an `i64`; one beyond what any float can reach is saturated before the call, so the answer is
+the same infinity or zero (with `x`'s sign) the exact exponent would give.
+
+### `scalbln`
+
+```sysl
+scalbln(x: f32, n: i64) -> f32
+```
+
+The `f32` form of `scalbln`; see the `real` form.
+
+### `tgamma`
+
+```sysl
+tgamma(x: real) -> real
+```
+
+The gamma function, which is `(x - 1)!` at a positive integer. A zero answers an infinity of
+its own sign, a negative integer and negative infinity answer a NaN, and positive infinity
+answers positive infinity.
+
+### `tgamma`
+
+```sysl
+tgamma(x: f32) -> f32
+```
+
+The `f32` gamma function; see the `real` form.
+
 ### `ulp`
 
 ```sysl
@@ -451,6 +632,64 @@ ulp(x: f32) -> f32
 ```
 
 The value of the last place of an `f32`; see the `real` form for the edges.
+
+### `ulp`
+
+```sysl
+ulp(x: f16) -> f16
+```
+
+The value of the last place of an `f16`; see the `real` form for the edges. It is `2^-24` at zero
+and throughout the subnormals, and `32` at the largest finite value, 65504.
+
+### `y0`
+
+```sysl
+y0(x: real) -> real
+```
+
+The Bessel function of the second kind of order 0. It is negative infinity at zero and a NaN
+below it.
+
+### `y0`
+
+```sysl
+y0(x: f32) -> f32
+```
+
+The `f32` second-kind Bessel function of order 0; computed at `real`.
+
+### `y1`
+
+```sysl
+y1(x: real) -> real
+```
+
+The Bessel function of the second kind of order 1.
+
+### `y1`
+
+```sysl
+y1(x: f32) -> f32
+```
+
+The `f32` second-kind Bessel function of order 1; computed at `real`.
+
+### `yn`
+
+```sysl
+yn(n: int, x: real) -> real
+```
+
+The Bessel function of the second kind of order `n`.
+
+### `yn`
+
+```sysl
+yn(n: int, x: f32) -> f32
+```
+
+The `f32` second-kind Bessel function of order `n`; computed at `real`.
 
 ## Traits
 
