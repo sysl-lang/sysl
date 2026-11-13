@@ -1711,6 +1711,7 @@ conversions are implicit](#which-conversions-are-implicit)); writing it as a cal
 | fixed-point → fixed-point, float or integer, and back | `q31(x)`, `real(q)`, `int(q)` | rounds to nearest and saturates — see [fixed-point numbers](/reference/fixed-point/#conversions) |
 | `char` → integer | `u32(c)` | total — every `char` is an integer |
 | integer → `char` | `char(u)` | **partial** — traps on a value that is not a Unicode scalar value |
+| `bool` → integer | `int(b)`, `u8(b)` | total — `true` is `1` and `false` is `0`, at every width and signedness |
 | `char` → `string` | `string(c)` | total — the one character, UTF-8 encoded into a fresh string |
 | `*T` → integer | `usize(p)`, `isize(p)` | total — an address is a number |
 
@@ -1834,8 +1835,47 @@ print(i64(9223372036854775808))
 the literal 9223372036854775808 does not fit long
 ```
 
-Everything else is rejected. There is **no conversion to or from `bool`** — `int(true)` is an error
-and so is `bool(0)` — and **no number converts to or from a `string`**: `x.to_string()` renders one and the
+**A `bool` converts to every integer type, and only there.** `true` is `1` and `false` is `0` at
+any width and signedness — `i8(true)` is `1`, not the `-1` a one-bit sign would make of it — so a
+comparison counts directly, and a constant folds:
+
+```sysl
+const ONE = int(true)
+
+var above = 0
+var r = 7
+
+for p in [3, 9, 5, 7, 1]
+    above += int(r > p)
+
+print(ONE, above, i8(true), u8(false), u256(1 < 2))
+```
+
+```output
+1 3 1 0 1
+```
+
+It goes one way and is always written. Nothing becomes a `bool` by conversion — `x != 0` says what
+an integer's truth is — a `bool` is not a number to a float, and a position never converts one by
+itself, so `val n: int = flag` and `1 + flag` are type errors:
+
+```sysl
+print(bool(1))
+```
+
+```error
+cannot convert int to bool — write 'x != 0'
+```
+
+```sysl
+print(real(true))
+```
+
+```error
+cannot convert bool to real
+```
+
+Everything else is rejected. **No number converts to or from a `string`**: `x.to_string()` renders one and the
 `strconv` surface parses one, neither of them spelled as a conversion. The `char` → `string` row is
 the one exception, and a narrow one: a `char` is a single scalar value, so encoding it is total and
 cannot fail.
@@ -1866,6 +1906,7 @@ cost to make visible: the conversion is the one `T(x)` performs, done by the pos
 | fixed → fixed, integer → fixed | no fraction bit and no integer bit is lost (an integer has no fraction; unsigned → signed needs one more integer bit; signed → unsigned never) | `q15` → `i32q16`, `i8` → `i16q8` |
 | fixed → float | the significand holds every bit and the format reaches `2^-F` | `q15` → `f32`, `q31` → `real`; `q31` → `f32` never |
 | float → integer or fixed, fixed → integer | never | each rounds |
+| `bool` → integer | never | `int(b)` is written; `val n: int = b` is refused |
 
 **Nothing converts through anything else**: `bool`, a pointer (`usize(p)` stays written), a slice, a
 reference, an `Option`, a tuple or a function type converts as itself or not at all, so a `[]u8` is not

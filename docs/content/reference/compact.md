@@ -235,7 +235,8 @@ enclosing module and everything under it. The bracket takes a **simple name, not
 [patterns](/reference/patterns/).
 
 - **Conversions are calls and none is inferred**: `u16(n)`, `real(n)`, `int(x)`, `u32(c)`, `char(u)`
-  (traps), `string(c)`, `usize(p)`. There is **no** conversion to or from `bool`, and none between a
+  (traps), `string(c)`, `usize(p)`, `int(b)` (`true` is 1). Nothing converts **to** `bool` (write
+  `n != 0`), a `bool` converts to no float, and nothing converts between a
   number and a `string` — `x.to_string()` renders (every value has it), `sysl.text` parses. `ptr_cast` makes a pointer from an
   address; it, `str_cast` and `str_alias` are imported from `sysl.raw`, and the `va_` forms from
   `sysl.c`.
