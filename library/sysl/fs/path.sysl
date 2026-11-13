@@ -44,11 +44,24 @@ writable(path: string) -> bool = fsys.access(bytes_at(path), path.bytes.len, fsy
 /** Whether the path names a directory, asked of `stat` -- which follows a symbolic link, as every
  * other question here does. A directory the program may not read or search is still a directory;
  * only a path `stat` cannot reach (missing, dangling, under an unsearchable directory) answers
- * `false`.
+ * `false`. Where the target does not support `stat` at all, it asks whether the path opens as a
+ * directory instead.
  */
 is_dir(path: string) -> bool = metadata(path) match
     Ok(m) -> m.is_dir()
-    Err(_) -> false
+    Err(e) -> e == unsupported() && opens_as_dir(path)
+
+/** Whether the path opens as a directory. It is the fallback for a target whose `stat` is not
+ * supported, where a directory the program may not read cannot be told apart from a missing path.
+ */
+private opens_as_dir(path: string) -> bool
+    var d: usize = 0
+
+    if fsys.opendir(bytes_at(path), path.bytes.len, &d) != 0 then return false
+
+    fsys.closedir(d)
+    true
+end opens_as_dir
 
 /** Every name in a directory, with `.` and `..` left out.
  *
@@ -125,10 +138,12 @@ private[sysl] name_text(name: []const u8) -> Result[string, IoError]
 
 /** Whether the path names a regular file, asked of `stat` and so following a symbolic link. A
  * directory, a device, a socket and a FIFO answer `false`, as does a path `stat` cannot reach.
+ * Where the target does not support `stat` at all, it answers whether something is there that does
+ * not open as a directory.
  */
 is_file(path: string) -> bool = metadata(path) match
     Ok(m) -> m.is_file()
-    Err(_) -> false
+    Err(e) -> e == unsupported() && exists(path) && !opens_as_dir(path)
 
 /** How many bytes the file holds. It opens the file to ask, so it reports the same failures an open
  * does -- a missing file answers `NotFound` rather than zero, which is the distinction a caller

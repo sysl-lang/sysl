@@ -281,6 +281,8 @@ is_dir(path: string) -> bool
 
 Whether the path names a directory, asked of `stat` -- which follows a symbolic link, as every
 other question here does. A directory the program may not read or search is still a directory.
+Where the target does not support `stat` at all, it asks whether the path opens as a directory
+instead.
 
 ### `is_file`
 
@@ -290,6 +292,8 @@ is_file(path: string) -> bool
 
 Whether the path names a regular file, asked of `stat` and so following a symbolic link. A
 directory, a device, a socket and a FIFO answer `false`, as does a path `stat` cannot reach.
+Where the target does not support `stat` at all, it answers whether something is there that does
+not open as a directory.
 
 ### `is_link`
 
