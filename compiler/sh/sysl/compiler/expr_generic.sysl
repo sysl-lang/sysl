@@ -826,11 +826,16 @@ private typed_widening(cx: &Analyzer, e: Expr, want: Type, widen: bool) -> TExpr
 // `[]real`, a string at an `int`. Read again with nothing expected it is perfectly good -- so it said
 // nothing, the call came to nothing, and the body around it was dropped from the build with no
 // complaint at all: a missing `main`, or a call to a function never emitted.
+//
+// **A callable left unread for a refused argument (`Provisional.unread`) speaks last**, wherever it
+// stands, and only where the arguments before it said nothing: then nothing else is wrong with the
+// call, and what the closure takes really is unsaid.
 voice_unknown_args(cx: &Analyzer, slots: Buf[Option[Expr]], prov: Provisional)
     for i in 0..<slots.len()
         val kept = i < prov.kept.len() && prov.kept[i].is_some()
 
-        if !kept && slots[i].is_some() && i < prov.tys.len() && mentions_unknown(prov.tys[i])
+        if !kept && slots[i].is_some() && i < prov.tys.len() && mentions_unknown(prov.tys[i]) &&
+           !holds_index(prov.unread, i)
             val at = if i < prov.read_at.len() then prov.read_at[i] else None
 
             val said = cx.an.complaints()
@@ -842,6 +847,14 @@ voice_unknown_args(cx: &Analyzer, slots: Buf[Option[Expr]], prov: Provisional)
             // argument after it is the one that may (`Analysis.defers`).
             if cx.an.complaints() > said || !cx.an.defers(Unknown) then return
         end if
+
+    for i in prov.unread
+        if slots[i].is_some()
+            val said = cx.an.complaints()
+
+            type_expr(cx, slots[i].unwrap(), None)
+
+            if cx.an.complaints() > said || !cx.an.defers(Unknown) then return
 end voice_unknown_args
 
 // **An argument whose shape no type argument could make fit says so, rather than leaving the solve to
@@ -988,12 +1001,16 @@ end quoted_and
 //
 // `expected` is what the solve is to read the call's position as: the one the call was given, or the
 // `&T` box a callable turned out to yield where the position asked for its `T` (`boxed_result`).
+//
+// `unread` is the callables left unread because a written argument at a parameter still open was
+// refused: what they take is unsettled only because of that argument, which is what the call says.
 struct Provisional
     tys: Buf[Type]
     soft: Buf[bool]
     kept: Buf[Option[TExpr]]
     expected: Option[Type]
     read_at: Buf[Option[Type]]
+    unread: Buf[usize]
 end Provisional
 
 // Which positions a call left to a parameter's default -- the literals among them are the last thing
@@ -1081,7 +1098,7 @@ provisional_of(cx: &Analyzer, span: Span, scope: Scope, tparams: Buf[string], pa
 
             if box.is_some() then position = box
 
-        return Provisional(tys, soft, kept, position, read_at)
+        return Provisional(tys, soft, kept, position, read_at, buf())
     end if
 
     // What the first pass settles, in the three tiers `solve` reads: what carries a type of its own
@@ -1215,6 +1232,17 @@ provisional_of(cx: &Analyzer, span: Span, scope: Scope, tparams: Buf[string], pa
     // closure that states its own parameter types says what they settle, and one that states none is
     // told so at the closure, the leftmost first. Leaving it unread left the call with nothing to
     // lower and nothing said about why.
+    //
+    // **Where a written argument at a parameter still open was refused, the closure is not told
+    // anything.** `sort_by(es.view_mut(), (a, b) -> a.c > b.c)` over a `val` buffer leaves `T` open
+    // only because its first argument was refused, so "'a' has no type here" would send the reader
+    // to annotate a closure that was never the problem. The closure is left unread, so the type
+    // argument stays unsettled and the call says what the argument did wrong (`voice_unknown_args`,
+    // `voice_shape_clash`). It is not read at an unknown either: a closure lowered at one is a type
+    // of its own, which a second reading of the call would settle the parameter at.
+    if !pending.is_empty() && refused_at_open(cx, params, slots, held, tys, unsolved_names(tparams, sub))
+        return Provisional(tys, soft, kept, position, read_at, pending)
+
     for at in pending
         val reader = arg_reader(cx, span, scope, slots[at].is_none())
         val t = type_expr(reader, written[at].unwrap(), None)
@@ -1224,8 +1252,21 @@ provisional_of(cx: &Analyzer, span: Span, scope: Scope, tparams: Buf[string], pa
         unify(cx.an, scope, param_refs[at], texpr_type(t), tparams, &sub)
         solve_from_callables(cx.an, scope, tparams, bounds, &sub)
 
-    Provisional(tys, soft, kept, position, read_at)
+    Provisional(tys, soft, kept, position, read_at, buf())
 end provisional_of
+
+// Whether an argument the call wrote, standing at a parameter that names a type parameter still
+// open, was refused: read to nothing, or of a shape no type argument could make fit.
+private refused_at_open(cx: &Analyzer, params: Buf[Param], slots: Buf[Option[Expr]], held: Buf[usize],
+                        tys: Buf[Type], open: Buf[string]) -> bool
+    for i in 0..<slots.len()
+        if slots[i].is_some() && !holds_index(held, i) && i < tys.len() && i < params.len() &&
+           ref_mentions(params[i].typ, open) &&
+           (mentions_unknown(tys[i]) || shape_refuses(cx.an, params[i].typ, tys[i]))
+            return true
+
+    false
+end refused_at_open
 
 // **A result that is a bare type parameter, standing in a `&T`, is settled at the `&T`**, as rustc
 // settles it. That position reads the call at its `T` and boxes what comes back (`expr_coerce.sysl`),

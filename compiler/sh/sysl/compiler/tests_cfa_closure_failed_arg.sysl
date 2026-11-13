@@ -1,0 +1,147 @@
+module sh.sysl.compiler
+@tests
+
+// A closure handed to a generic call takes its parameter types from the type arguments the other
+// arguments settle. Where one of those arguments is refused, the type argument stays open only
+// because of it, and the call says what that argument did wrong -- not that the closure's parameter
+// has no type, which would send the reader to annotate a closure that was never the problem
+// (`provisional_of`, `voice_unknown_args`). A closure that nothing could have settled is still told
+// to write its types. The building is `tests_rng_impl_composed_run.sysl`'s.
+
+private val cfa_no_type = "has no type here"
+
+private cfa_refusal(text: string) -> string
+    rng_ran(text) match
+        Err(why) -> why
+        Ok(_) -> ""
+
+// The refusal names `root` and says nothing about the closure.
+private cfa_blames(text: string, root: string)
+    val said = cfa_refusal(text)
+
+    assert(said.contains(root), s"expected '$root' in: $said")
+    assert(!said.contains(cfa_no_type), s"expected no closure complaint, got: $said")
+
+private val cfa_sort_head = raw"""
+    import sysl.buf.{Buf, buf}
+    import sysl.slices.sort_by
+    struct E
+        c: int
+    """
+
+@test("view_mut on a val buffer handed to sort_by beside a closure names the val")
+cfa_view_mut_on_a_val()
+    if !rng_ready() then return
+
+    cfa_blames(cfa_sort_head + raw"""
+        val es: Buf[E] = buf()
+        es.push(E(2))
+        sort_by(es.view_mut(), (a, b) -> a.c > b.c)
+        print(es[0].c)
+        """,
+               "'view_mut' takes '*self', so it writes through what it is called on, and a 'val' is " +
+               "written once — write 'var es' if it is meant to change")
+
+@test("the same call over a var buffer infers the closure's parameters and sorts")
+cfa_view_mut_on_a_var()
+    if !rng_ready() then return
+
+    rng_prints(cfa_sort_head + raw"""
+        var es: Buf[E] = buf()
+        es.push(E(1))
+        es.push(E(3))
+        es.push(E(2))
+        sort_by(es.view_mut(), (a, b) -> a.c > b.c)
+        print(es[0].c, es[1].c, es[2].c)
+        """, "3 2 1\n")
+
+@test("an undefined name before a closure is what the call reports")
+cfa_unknown_name_before()
+    if !rng_ready() then return
+
+    cfa_blames(cfa_sort_head + raw"""
+        sort_by(nowhere, (a, b) -> a.c > b.c)
+        """, "undefined name 'nowhere'")
+
+@test("a Buf where a slice is asked, before a closure, is reported as the mismatch")
+cfa_shape_mismatch_before()
+    if !rng_ready() then return
+
+    cfa_blames(cfa_sort_head + raw"""
+        var es: Buf[E] = buf()
+        es.push(E(1))
+        sort_by(es, (a, b) -> a.c > b.c)
+        """, "'xs' of 'sysl.slices.sort_by' is []T, but Buf[E] was given")
+
+@test("a literal refused at its default type, before a closure, is reported")
+cfa_literal_refused_before()
+    if !rng_ready() then return
+
+    cfa_blames(raw"""
+        pick[T](x: T, f: (T) -> bool) -> bool = f(x)
+        print(pick(5000000000, (a) -> a > 0))
+        """, "the literal 5000000000 does not fit int")
+
+@test("a None that nothing settles, before a closure, is reported")
+cfa_none_before()
+    if !rng_ready() then return
+
+    cfa_blames(raw"""
+        pick[T](x: T, f: (T) -> bool) -> bool = f(x)
+        print(pick(None, (a) -> true))
+        """, "cannot infer the type argument 'T' of 'None' here — annotate the expected type")
+
+@test("a refused argument AFTER the closure is still what the call reports")
+cfa_refused_after()
+    if !rng_ready() then return
+
+    cfa_blames(raw"""
+        after[T](f: (T) -> bool, x: T) -> bool = f(x)
+        print(after((a) -> a > 0, nowhere))
+        """, "undefined name 'nowhere'")
+
+@test("two closures behind one refused argument: the argument alone is reported")
+cfa_two_closures()
+    if !rng_ready() then return
+
+    cfa_blames(raw"""
+        both[T](x: T, f: (T) -> bool, g: (T) -> bool) -> bool = f(x) && g(x)
+        print(both(nowhere, (a) -> a > 0, (b) -> b < 9))
+        """, "undefined name 'nowhere'")
+
+@test("a member's own type parameter behind a refused argument: the argument is reported")
+cfa_member_call()
+    if !rng_ready() then return
+
+    cfa_blames(raw"""
+        struct K
+            k: int
+        impl K
+            pick[T](self, x: T, f: (T) -> bool) -> bool = f(x)
+        print(K(1).pick(nowhere, (a) -> a > 0))
+        """, "undefined name 'nowhere'")
+
+@test("a closure nothing could settle is still told to write its types")
+cfa_closure_is_the_problem()
+    if !rng_ready() then return
+
+    val said = cfa_refusal(raw"""
+        apply[T](f: (T) -> bool) -> int = 0
+        print(apply((a) -> true))
+        """)
+
+    assert(said.contains("'a' has no type here — nothing says what this closure takes, so write it: " +
+                         "'(a: …) -> …'"), said)
+
+@test("a refused argument at a parameter naming no type parameter leaves the closure the problem")
+cfa_refused_at_a_fixed_parameter()
+    if !rng_ready() then return
+
+    // `n` says nothing about `T`, so the closure's parameter would have no type whatever `n` was.
+    val said = cfa_refusal(raw"""
+        fixed[T](n: int, f: (T) -> bool) -> int = n
+        print(fixed(nowhere, (a) -> true))
+        """)
+
+    assert(said.contains("'a' has no type here — nothing says what this closure takes, so write it: " +
+                         "'(a: …) -> …'"), said)
