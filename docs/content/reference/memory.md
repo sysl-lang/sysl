@@ -299,6 +299,56 @@ a weak reference does not keep Node alive, and nothing else here holds this one
 where the object is allocated. It is the only kind that may cross a concurrency domain
 ([below](#crossing-a-concurrency-domain)).
 
+**A field reached through a `&sync T` is read-only.** Every thread holding the reference reaches the
+same object at once, so a plain store races theirs: two `c.n += 1` lose updates, and two stores of a
+counted field release one value twice. An assignment, a compound assignment, a `*self` member called
+on the field or on the object itself, a writable view of an array field, and a write further down
+through a plain struct field are each refused, unless one of three things holds:
+
+- the field is an `Atomic`, written through its members — or a struct made only of atomics, locks
+  and guarded fields, whose `*self` members can write nothing else;
+- a [`@guards`](#a-guarded-value-crosses-with-its-lock) names the field, so a write holds the lock (a
+  `Mutex` field is one, and the library's locks — `SpinLock`, `SleepLock`, `Condvar`, `Barrier`,
+  `Channel` — are used through their own members);
+- the type is `@unchecked(Share)`, the program's promise that its writes are synchronised another
+  way.
+
+A field that is itself a `&sync U` may be read, and its own fields follow the same rule. A `*T`
+reached through one leads to storage the object does not hold, and is the raw tier's as everywhere. An
+`@unchecked` block licenses unchecked indexing, not a race, so a write inside one is refused all the
+same.
+
+```sysl
+struct Cell
+    n: int
+
+val c: &sync Cell = Cell(0)
+
+c.n += 1
+```
+
+```error
+this '+=' writes a field reached through a '&sync Cell', which is read-only: every thread holding the reference may reach it at once, and a plain write would race theirs. Make the field an 'Atomic', name it in a '@guards' so a write holds the lock, or write '@unchecked(Share)' above 'Cell' where its writes are synchronised another way
+```
+
+The counter that is meant to be shared is an `Atomic`:
+
+```sysl
+import sysl.sync.Atomic
+
+struct Hits
+    n: Atomic[int]
+
+val h: &sync Hits = Hits(Atomic(0))
+
+h.n.add(2)
+print(h.n.load())
+```
+
+```output
+2
+```
+
 **`*T` is C's pointer**: no length, no count, manual lifetime. The address of the frame's own storage
 is checked by the lifetime rules below; past that it is the [raw tier](#the-raw-tier), which carries
 C's whole surface because a subset would only mean a kernel that could not be written here.
@@ -1156,7 +1206,8 @@ closure or held by the callee is refused. The box must be reached through a bind
 holding it, in a body and in a module initializer alike — not a field of another box, a module
 `var`, or a local the body stores into
 ([arrays](/reference/arrays/)) — and the view may not be held in a local declared outside that
-binding's block, since the binding, and the box with it, ends there:
+binding's block, since the binding, and the box with it, ends there. Such a view is a `[]const T`,
+its elements being [read-only through the `&sync`](#sync-t-t-and-t):
 
 ```sysl
 struct Flash
@@ -1165,7 +1216,7 @@ struct Flash
 make(k: i32) -> &sync Flash = Flash([k, k, k, k, k, k, k, k])
 
 main()
-    var v: []i32 = []
+    var v: []const i32 = []
     if v.len == 0
         val b = make(7)
         v = b.data[0..<2]
@@ -2073,8 +2124,9 @@ print(send(c))
 Taking a share is a relaxed increment; giving one back is a release decrement, and the share reaching
 zero acquires before destroying, so the freeing thread sees every other thread's writes (a `fence
 acquire`, or an acquire load under `-fsanitize=thread`, which does not model a standalone fence).
-**`&sync T` makes the *reference* safe to share, not the object safe to mutate** — that wants a
-`Mutex`. A `&T` in `@thread_local` storage belongs to one thread and needs no `&sync`.
+**`&sync T` makes the *reference* safe to share, not the object safe to mutate**: its fields are
+[read-only through it](#sync-t-t-and-t) unless they are atomic, guarded by a lock, or the type promises
+`@unchecked(Share)`. A `&T` in `@thread_local` storage belongs to one thread and needs no `&sync`.
 
 ### Module storage reached from another domain
 
@@ -2341,8 +2393,10 @@ print(relay(1))
 fields do not show it — a struct whose own members keep a `&T` to one domain at a time. The walk takes
 the promise in place of the fields, for every check that asks: a bound, a `&sync T`, a `@crossing`
 parameter, a capture. It is held to `@guards`' rule: every field the walk would refuse is `private`,
-so the members are the only way to it. A promise the fields already keep is refused, and so is
-`impl Send`.
+so the members are the only way to it. `@unchecked(Share)` also promises that the struct's writes
+are synchronised, which lets its fields be [written through a `&sync`](#sync-t-t-and-t); no field
+shows that, so it is never redundant. An `@unchecked(Send)` the fields already keep is refused, and so
+is `impl Send`.
 
 ```sysl
 import sysl.threads.scope
@@ -3041,6 +3095,10 @@ value. Values, fixed arrays and `*T` buffers carry no header.
 
 **Teardown is iterative**: an object reaching zero is pushed onto a per-thread worklist through its
 dead count slot, and the first release to hit zero drains it, so any depth comes apart in O(1) stack.
+Inside the drain, a reference the object held is queued on that same list directly, and one whose
+object has nothing left to tear down — no counted field, no destructor, an enum variant that holds
+nothing, and no weak reference out — is freed on the spot, so the leaves of a tree never reach the
+list at all.
 **On a freestanding target the worklist is asked for**: a `&sync` release reaching zero fetches it
 through the weak symbol `__sysl_arc_reaper`, answering a `head` pointer and a `draining` flag of the
 running task. Define nothing and the single built-in slot serves a machine where nothing schedules; an

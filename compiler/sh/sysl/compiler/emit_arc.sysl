@@ -63,8 +63,11 @@ private arc_value(e: *Emit, ty: Type, v: Val, retain: bool) = ty match
 
         val subject = if is_trait(*inner) then erased_box(e, v) else v
 
-        arc_call(e, s"arc.${if retain then "retain" else "release"}${if sync then "_sync" else ""}",
-                 subject)
+        if e.draining && !retain && !sync
+            push_ref(e, *inner, subject)
+        else
+            arc_call(e, s"arc.${if retain then "retain" else "release"}${if sync then "_sync" else ""}",
+                     subject)
     Weak(inner) ->
         e.weak_heap = true
 
@@ -95,8 +98,16 @@ private arc_value(e: *Emit, ty: Type, v: Val, retain: bool) = ty match
 // the value as its argument, and `emit_large.sysl` puts the address the value was read from in its
 // place -- so the value-taking helper, whose parameter would be one LLVM value as wide as the type,
 // is never asked for.
+//
+// **Inside a drain the walk of a small value is written in place**, so the references in it are
+// queued on the drain's slot as the hook's own are: the shared helper is reached from releases
+// outside any drain too, and has no slot to queue on.
 private aggregate_arc(e: *Emit, ty: Type, v: Val, retain: bool)
     if contains_counted(ty)
+        if e.draining && !retain && !e.layout.indirect(ty)
+            walk_value(e, ty, v, false)
+            return
+
         val name = if e.layout.indirect(ty) then slot_helper(e, ty, retain) else value_helper(e, ty, retain)
 
         var args: Buf[IrArg] = buf()
@@ -266,8 +277,152 @@ hook_params() -> Buf[(string, LType)]
 
     out.push(("p", LPtr))
     out.push(("storage", l_i1()))
+    out.push(("slot", LPtr))
     out
 end hook_params
+
+// The reference and the drain's slot an `arc.push.<T>` takes.
+private push_params() -> Buf[(string, LType)]
+    var out: Buf[(string, LType)] = buf()
+
+    out.push(("p", LPtr))
+    out.push(("slot", LPtr))
+    out
+end push_params
+
+// -- letting go inside a drain ---------------------------------------------------------------------
+
+// How a hook's walk gives back one plain reference to a `T`: through `arc.push.<T>` where a box of
+// `T` can have nothing left in it to tear down, and through the runtime's `arc.push` otherwise.
+private push_ref(e: *Emit, payload: Type, p: Val)
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(LPtr, p))
+    args.push(ir_arg(LPtr, VReg("slot")))
+
+    val name = if !is_trait(payload) && empties(e, payload).is_some() then
+        request_helper(e, s"arc.push.${mangle(payload)}", HrPush(payload))
+    else "arc.push"
+
+    emit(e, ir_call(None, LVoid, VGlobal(name), args))
+end push_ref
+
+// When a box of `payload` holds nothing a teardown would let go of: always (`Some` of nothing),
+// in the variants whose tags are listed, or never (`None`). A type with a destructor is never empty,
+// since the destructor still has to run.
+private empties(e: *Emit, payload: Type) -> Option[Buf[Val]]
+    var tags: Buf[Val] = buf()
+
+    if destructor_of(e, payload).is_some() then return None
+    if !contains_counted(payload) then return Some(tags)
+
+    underlying(payload) match
+        Enum(d) ->
+            for variant in d.variants
+                if !fields_hold_counted(variant.fields) then tags.push(VInt(variant.tag))
+
+            if tags.is_empty() then None else Some(tags)
+        _ -> None
+end empties
+
+// The body of `arc.push.<T>`. At zero, **a box whose storage this module's own hook for `T` gives
+// back, that no weak reference holds, and that holds nothing counted, is freed on the spot**: tearing
+// it down through the drain would call that hook to walk nothing and then again to free exactly this.
+// Anything else -- a box laid in a frame, one another module made, one with a weak reference out, a
+// variant that holds a count -- is queued on the drain's slot, which is what `arc.reap` would have done
+// with it. Nothing about the order anything is torn down in changes: what is freed here runs no code.
+private gen_push(e: *Emit, payload: Type)
+    val tags = empties(e, payload).unwrap_or(buf())
+    val bn = box_lty(e, payload)
+    val word = word_lty(e)
+    val count = fresh_label(e, "arc.count")
+    val zero = fresh_label(e, "arc.zero")
+    val give = fresh_label(e, "arc.give")
+    val queue = fresh_label(e, "arc.queue")
+    val live = fresh_label(e, "arc.live")
+    val p = VReg("p")
+
+    val absent = fresh_reg(e)
+
+    emit(e, InIntCmp(absent, IEq, LPtr, p, VNull))
+    emit_term(e, InCondBr(absent, live, count))
+    emit_label(e, count)
+
+    val c = fresh_reg(e)
+    val n = fresh_reg(e)
+    val z = fresh_reg(e)
+
+    emit(e, InLoad(c, word, p, AccPlain, None))
+    emit(e, InBin(n, OpSub, word, c, VInt(from_int(1))))
+    emit(e, InStore(word, n, p, AccPlain, None))
+    emit(e, InIntCmp(z, IEq, word, n, VInt(from_int(0))))
+    emit_term(e, InCondBr(z, zero, live))
+    emit_label(e, zero)
+
+    val hook = fresh_reg(e)
+    val mine = fresh_reg(e)
+
+    emit(e, InLoad(hook, LPtr, header_word(e, bn, 1), AccPlain, None))
+    emit(e, InIntCmp(mine, IEq, LPtr, hook, drop_fn(e, payload)))
+
+    val weaks = fresh_reg(e)
+    val solo = fresh_reg(e)
+
+    emit(e, InLoad(weaks, word, header_word(e, bn, 2), AccPlain, None))
+    emit(e, InIntCmp(solo, IEq, word, weaks, VInt(from_int(1))))
+
+    var free_now = fresh_reg(e)
+
+    emit(e, InBin(free_now, OpAnd, l_i1(), mine, solo))
+
+    // A variant is its tag, the enum's first word; any of the empty ones will do.
+    if !tags.is_empty()
+        val tag = fresh_reg(e)
+        var empty = VInt(from_int(0))
+
+        emit(e, InLoad(tag, l_i32(), header_word(e, bn, box_payload_field(e, payload)), AccPlain, None))
+
+        for t in tags
+            val is = fresh_reg(e)
+            val either = fresh_reg(e)
+
+            emit(e, InIntCmp(is, IEq, l_i32(), tag, t))
+            emit(e, InBin(either, OpOr, l_i1(), empty, is))
+            empty = either
+
+        val both = fresh_reg(e)
+
+        emit(e, InBin(both, OpAnd, l_i1(), free_now, empty))
+        free_now = both
+    end if
+
+    emit_term(e, InCondBr(free_now, give, queue))
+    emit_label(e, give)
+    emit_free(e, payload)
+    emit_term(e, InRet(None, None))
+    emit_label(e, queue)
+
+    val head = fresh_reg(e)
+
+    emit(e, InLoad(head, LPtr, VReg("slot"), AccPlain, None))
+    emit(e, InStore(LPtr, head, p, AccPlain, None))
+    emit(e, InStore(LPtr, p, VReg("slot"), AccPlain, None))
+    emit_term(e, InRet(None, None))
+    emit_label(e, live)
+    emit_term(e, InRet(None, None))
+end gen_push
+
+// The address of field `i` of the box `bn` at `%p`.
+private header_word(e: *Emit, bn: LType, i: int) -> Val
+    val at = fresh_reg(e)
+
+    var idx: Buf[IrArg] = buf()
+
+    idx.push(ir_arg(l_i32(), VInt(from_int(0))))
+    idx.push(ir_arg(l_i32(), VInt(from_int(long(i)))))
+    emit(e, InGep(at, bn, VReg("p"), idx))
+    at
+end header_word
 
 // The owner, the slot and the value `arc.slotplace.<T>` takes.
 private slot_place_params(e: *Emit, elem: Type) -> Buf[(string, LType)]
@@ -551,6 +706,7 @@ gen_helper(e: *Emit, what: HelperReq, name: string) -> Option[IrFunc]
         HrDropBuf(_) -> helper_sig(name, hook_params())
         HrPlainDrop -> helper_sig(name, hook_params())
         HrFrameDrop(_) -> helper_sig(name, hook_params())
+        HrPush(_) -> helper_sig(name, push_params())
         HrTaskDrop(_) -> helper_sig(name, hook_params())
         HrSlotBuf(_) -> bound_sig(helper_sig(name, hook_params()) with { linkage = LinkWeakOdr }, binds_locally(e))
         HrSlotPlace(elem) -> helper_sig(name, slot_place_params(e, elem)) with { bare = rarely() }
@@ -575,6 +731,7 @@ gen_helper(e: *Emit, what: HelperReq, name: string) -> Option[IrFunc]
         HrDropBuf(elem) -> gen_drop_buf_hook(e, elem)
         HrPlainDrop -> gen_plain_hook(e)
         HrFrameDrop(payload) -> gen_drop_hook(e, payload, false)
+        HrPush(payload) -> gen_push(e, payload)
         HrTaskDrop(result) -> gen_task_hook(e, result)
         HrSlotBuf(elem) -> gen_drop_buf_hook(e, elem)
         HrSlotPlace(elem) -> gen_slot_place_rest(e, elem)
@@ -630,6 +787,31 @@ private gen_drop_hook(e: *Emit, payload: Type, frees: bool)
     idx.push(ir_arg(l_i32(), VInt(from_int(0))))
     idx.push(ir_arg(l_i32(), VInt(from_int(long(box_payload_field(e, payload))))))
     emit(e, InGep(pa, bn, VReg("p"), idx))
+
+    // **With no destructor, the walk queues what it lets go of on the drain's slot itself**, freeing
+    // on the spot whatever has nothing left in it to tear down (`push_ref`). Nothing but releases runs
+    // between the drain naming its slot and the walk using it, so the slot is still this thread's. A
+    // destructor is the program's own code, which may move the body to another thread
+    // (`fiber_switch.sysl`), so a walk after one releases as any other code does.
+    if destructor_of(e, payload).is_none()
+        e.draining = true
+
+        if e.layout.indirect(payload) then walk_slot(e, payload, pa, false)
+        else
+            val whole = fresh_reg(e)
+
+            emit(e, InLoad(whole, lty(e, payload), pa, AccPlain, None))
+            release_value(e, payload, whole)
+
+        e.draining = false
+        emit_term(e, InRet(None, None))
+        emit_label(e, give)
+
+        if frees then emit_free(e, payload)
+
+        emit_term(e, InRet(None, None))
+        return
+    end if
 
     val v = fresh_reg(e)
 
@@ -695,7 +877,12 @@ private gen_drop_buf_hook(e: *Emit, elem: Type)
     didx.push(ir_arg(l_i32(), VInt(from_int(0))))
     didx.push(ir_arg(l_i32(), VInt(from_int(long(buf_elems_field(e, elem))))))
     emit(e, InGep(data, bn, VReg("p"), didx))
+
+    // An element is a value, which runs no destructor of its own, so the walk queues on the drain's
+    // slot as `gen_drop_hook`'s does.
+    e.draining = true
     each_element_release(e, elem, data, n)
+    e.draining = false
     emit_term(e, InRet(None, None))
     emit_label(e, give)
     emit_free(e, elem)
