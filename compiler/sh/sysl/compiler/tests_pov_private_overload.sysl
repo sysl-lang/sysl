@@ -1,0 +1,116 @@
+module sh.sysl.compiler
+@tests
+
+// A private member is one overload among a type's members of its name, and it hides nothing: where it
+// cannot be named it is no candidate, so the public one of its name is reached; where it can, the
+// ordinary overload rules choose between them (`reference/declarations.md § Overloading a member`).
+// Two with parameters a call could not tell apart are one member declared twice, whatever the
+// modifiers.
+//
+// Each program is several files, because reach is the distance between a member and the file naming it.
+
+private pov_type() -> string = "struct E\n    n: int\n\n    f(self, x: int) -> int = x + self.n\n"
+
+private pov_impl() -> string =
+    "impl E\n    private f(self, s: string) -> int = int(s.len)\n" +
+    "    both(self) -> int = self.f(5) * 100 + self.f(\"abc\")\n"
+
+@test("pov: a private overload in another file leaves the public one reachable")
+pov_public_reachable_outside()
+    azc_prints([("a.sysl", pov_type()), ("b.sysl", pov_impl()),
+                ("main.sysl", "val e = E(1)\nprint(e.f(5))\n")], "6\n")
+
+@test("pov: inside the private file both overloads are candidates")
+pov_both_inside()
+    azc_prints([("a.sysl", pov_type()), ("b.sysl", pov_impl()),
+                ("main.sysl", "val e = E(1)\nprint(e.both())\n")], "603\n")
+
+@test("pov: the private signature is no candidate outside its file")
+pov_private_signature_not_a_candidate()
+    azc_says([("a.sysl", pov_type()), ("b.sysl", pov_impl()),
+              ("main.sysl", "val e = E(1)\nprint(e.f(\"abc\"))\n")], "main.sysl")
+
+@test("pov: the public overload declared second, in the impl")
+pov_public_declared_second()
+    azc_prints([("a.sysl", "struct E\n    n: int\n\n    private f(self, s: string) -> int = int(s.len)\n" +
+                           "    g(self) -> int = self.f(\"ab\")\n"),
+                ("b.sysl", "impl E\n    f(self, x: int) -> int = x + self.n\n"),
+                ("main.sysl", "val e = E(1)\nprint(e.f(5), e.g())\n")], "6 2\n")
+
+@test("pov: both in the type's own body, private first")
+pov_one_body_private_first()
+    azc_prints([("a.sysl", "struct E\n    n: int\n\n    private f(self, s: string) -> int = int(s.len)\n" +
+                           "    f(self, x: int) -> int = x + self.n\n"),
+                ("main.sysl", "val e = E(1)\nprint(e.f(5))\n")], "6\n")
+
+@test("pov: both in the type's own body, public first")
+pov_one_body_public_first()
+    azc_prints([("a.sysl", "struct E\n    n: int\n\n    f(self, x: int) -> int = x + self.n\n" +
+                           "    private f(self, s: string) -> int = int(s.len)\n"),
+                ("main.sysl", "val e = E(1)\nprint(e.f(5))\n")], "6\n")
+
+@test("pov: a private overload in the type's own file is no candidate in another")
+pov_one_body_private_refused_elsewhere()
+    azc_says([("a.sysl", "struct E\n    n: int\n\n    f(self, x: int) -> int = x + self.n\n" +
+                         "    private f(self, s: string) -> int = int(s.len)\n"),
+              ("main.sysl", "val e = E(1)\nprint(e.f(\"abc\"))\n")], "main.sysl")
+
+@test("pov: associated functions")
+pov_associated_functions()
+    azc_prints([("a.sysl", "struct E\n    n: int\n\n    make(n: int) -> E = E(n)\n"),
+                ("b.sysl", "impl E\n    private make(s: string) -> E = E(int(s.len))\n" +
+                           "    inside() -> int = E.make(\"abcd\").n\n"),
+                ("main.sysl", "print(E.make(7).n, E.inside())\n")], "7 4\n")
+
+@test("pov: a private associated function is refused outside its file")
+pov_associated_private_refused()
+    azc_says([("a.sysl", "struct E\n    n: int\n\n    make(n: int) -> E = E(n)\n"),
+              ("b.sysl", "impl E\n    private make(s: string) -> E = E(int(s.len))\n"),
+              ("main.sysl", "print(E.make(\"abcd\").n)\n")], "main.sysl")
+
+@test("pov: an enum")
+pov_enum()
+    azc_prints([("a.sysl", "enum Color\n    Red\n    Blue\n\n    f(self, x: int) -> int = x\n"),
+                ("b.sysl", "impl Color\n    private f(self, s: string) -> int = int(s.len)\n" +
+                           "    g(self) -> int = self.f(\"ab\")\n"),
+                ("main.sysl", "print(Color.Red.f(5), Color.Blue.g())\n")], "5 2\n")
+
+@test("pov: private[m] is a candidate only inside the module")
+pov_scoped()
+    azc_prints([("geom/a.sysl", "module geom\n\nstruct E\n    n: int\n\n    f(self, x: int) -> int = x + self.n\n"),
+                ("geom/b.sysl", "module geom\n\nimpl E\n    private[geom] f(self, s: string) -> int = int(s.len)\n"),
+                ("geom/c.sysl", "module geom\n\nuse_it(e: E) -> int = e.f(5) * 100 + e.f(\"abc\")\n"),
+                ("main.sysl", "val e = geom.E(1)\nprint(e.f(5), geom.use_it(e))\n")], "6 603\n")
+
+@test("pov: a private[m] overload is no candidate outside the module")
+pov_scoped_refused_outside()
+    azc_says([("geom/a.sysl", "module geom\n\nstruct E\n    n: int\n\n    f(self, x: int) -> int = x + self.n\n"),
+              ("geom/b.sysl", "module geom\n\nimpl E\n    private[geom] f(self, s: string) -> int = int(s.len)\n"),
+              ("main.sysl", "val e = geom.E(1)\nprint(e.f(\"abc\"))\n")], "main.sysl")
+
+@test("pov: a generic type")
+pov_generic()
+    azc_prints([("a.sysl", "struct Box[T]\n    v: T\n\n    put(self, x: T) -> int = 1\n"),
+                ("b.sysl", "impl[T] Box[T]\n    private put(self, x: string, y: int) -> int = 2\n" +
+                           "    both(self, x: T) -> int = self.put(x) * 10 + self.put(\"s\", 1)\n"),
+                ("main.sysl", "val b = Box(5)\nprint(b.put(3), b.both(4))\n")], "1 12\n")
+
+@test("pov: the same signature is a duplicate, not a hidden member")
+pov_same_signature_refused()
+    azc_says([("a.sysl", pov_type()),
+              ("b.sysl", "impl E\n    private f(self, y: int) -> int = y\n"),
+              ("main.sysl", "val e = E(1)\nprint(e.f(5))\n")],
+             "type 'E' already has a member named 'f' with parameters this one could not be told from")
+
+@test("pov: the same signature declared private first is refused at the second")
+pov_same_signature_private_first_refused()
+    azc_says([("a.sysl", "struct E\n    n: int\n\n    private f(self, x: int) -> int = x\n"),
+              ("b.sysl", "impl E\n    f(self, y: int) -> int = y\n"),
+              ("main.sysl", "print(1)\n")],
+             "type 'E' already has a member named 'f' with parameters this one could not be told from")
+
+@test("pov: a lone private member is still refused with its reason")
+pov_lone_private_refused()
+    azc_says([("a.sysl", "struct E\n    n: int\n\n    private f(self, x: int) -> int = x\n"),
+              ("main.sysl", "val e = E(1)\nprint(e.f(5))\n")],
+             "method 'f' of 'E' is private to")

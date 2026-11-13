@@ -653,8 +653,12 @@ record_impl_members_access(a: &Analysis, scope: Scope, key: string, written: str
     for m in methods
         m.vis match
             Public -> ()
-            _ -> record_member_access(a, scope, key, written, owner.unwrap().vis, m.name, m.vis,
-                                      m.span)
+            // A name the type already has a member of keeps that member's reach: this one is an
+            // overload (or a refused duplicate), and is filed under a name of its own.
+            _ ->
+                if !has_member_at(a, key, m.name) then
+                    record_member_access(a, scope, key, written, owner.unwrap().vis, m.name, m.vis,
+                                         m.span)
 end record_impl_members_access
 
 // One field's or member's reach. A written modifier may only NARROW: a member reachable where its
@@ -662,38 +666,62 @@ end record_impl_members_access
 // useless, and it is reported at the modifier rather than clamped in silence.
 private record_member_access(a: &Analysis, scope: Scope, owner: string, written: string,
                              owner_vis: Visibility, name: string, vis: Visibility, span: Span)
-    val at = member_access_key(owner, name)
+    file_member_access(a, scope, owner, written, owner_vis, name, name, vis, span, true)
+end record_member_access
+
+// **A member's reach is filed under the name the member is FILED under**, since a type's overloads of
+// one written name are separate members and each may say `private` for itself. The write that has
+// only the written name (`record_member_access`) is the reach of the first of them; this one is made
+// where the member is filed, so a private overload steps aside for the public one of its name rather
+// than hiding it, and a public one beside it does not make the private one reachable. The modifier
+// was already checked when the written name was recorded, so nothing is reported twice.
+record_filed_member_access(a: &Analysis, scope: Scope, owner: string, written: string,
+                           filed: string, vis: Visibility, span: Span)
+    val held = a.tables.access.get(owner)
+    val owner_vis = if held.is_some() then held.unwrap().vis else Public
+
+    file_member_access(a, scope, owner, written, owner_vis, filed, source_member_name(filed), vis,
+                       span, false)
+end record_filed_member_access
+
+private file_member_access(a: &Analysis, scope: Scope, owner: string, written: string,
+                           owner_vis: Visibility, filed: string, name: string, vis: Visibility,
+                           span: Span, report: bool)
+    val at = member_access_key(owner, filed)
     val label = s"$written.$name"
+    val own = a.tables.access.get(owner)
 
     vis match
         Public ->
-            a.tables.access.get(owner) match
-                Some(acc) -> a.tables.access.put(at, acc)
-                None -> ()
+            // Where nothing restricts the owner, a filed member still says so outright: the entry
+            // is what stands in for a stale one the written name may have left behind.
+            if own.is_some()
+                a.tables.access.put(at, own.unwrap())
+            else if !report
+                a.tables.access.put(at, Access(Public, scope.src.name, scope.module_name))
         File -> a.tables.access.put(at, Access(File, scope.src.name, scope.module_name))
         Scoped(m) ->
             val sub = widened_to(scope.module_name, m)
 
             if sub.is_none()
-                a.fault(scope, span, scope_names_nothing(m, scope.module_name))
+                if report then a.fault(scope, span, scope_names_nothing(m, scope.module_name))
                 return
             end if
 
             if wider_than_owner(scope, owner_vis, sub.unwrap())
-                a.fault(scope, span,
-                        s"'$label' is visible throughout module '${sub.unwrap()}', but " +
-                        s"'${qualified_name(owner)}' is ${out_of_reach_tail(scope, owner_vis)} — a " +
-                        "member cannot be more visible than the type it belongs to")
+                if report
+                    a.fault(scope, span,
+                            s"'$label' is visible throughout module '${sub.unwrap()}', but " +
+                            s"'${qualified_name(owner)}' is ${out_of_reach_tail(scope, owner_vis)} — a " +
+                            "member cannot be more visible than the type it belongs to")
 
-                a.tables.access.get(owner) match
-                    Some(acc) -> a.tables.access.put(at, acc)
-                    None -> ()
+                if own.is_some() then a.tables.access.put(at, own.unwrap())
 
                 return
             end if
 
             a.tables.access.put(at, Access(vis, scope.src.name, scope.module_name))
-end record_member_access
+end file_member_access
 
 // Whether a member widened to `sub` would reach past the type it belongs to.
 private wider_than_owner(scope: Scope, owner_vis: Visibility, sub: string) -> bool = owner_vis match
