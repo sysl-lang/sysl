@@ -2,7 +2,8 @@ module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
 
-// How a view `@disjoint` names reaches LLVM as `noalias` (`disjoint.sysl`).
+// How a view `@disjoint` names, and a `string` parameter whose bytes the body reads
+// (`read_string_params`), reach LLVM as `noalias` (`disjoint.sysl`).
 //
 // **LLVM says `noalias` of a pointer parameter only, and a view travels as one value** -- its owner,
 // the address of its first element, and its count, `{ ptr, ptr, i64 }` -- so the attribute has
@@ -30,6 +31,9 @@ split_disjoint(f: TFunc, built: IrFunc) -> Buf[IrFunc]
     for n in f.marks.disjoint
         for p in f.params
             if p.0 == n && is_view_param(p.1) then views.push(n)
+
+    for n in read_string_params(f)
+        if !has_name(views, n) then views.push(n)
 
     // A task's body runs after the call, a C-variadic one cannot be forwarded, and a function with a
     // convention of its own is entered by hardware or by C as it is.
@@ -125,10 +129,70 @@ split_disjoint(f: TFunc, built: IrFunc) -> Buf[IrFunc]
     out
 end split_disjoint
 
-// A view: the one parameter kind split here.
+// A view: the one parameter kind `@disjoint` splits here.
 private is_view_param(t: Type) -> bool = underlying(t) match
     Slice(_, _) -> true
     _ -> false
+
+// **A `string` parameter is unaliased without being asked**, because the language already promises
+// what `noalias` needs: nothing writes the bytes a string covers while the string is alive
+// (`reference/strings.md § A string that shares a buffer`), and a parameter is alive for the whole
+// call. LLVM's `noalias` constrains only memory that is written during the call, so other names
+// reading the same bytes -- the caller's, a second parameter holding the same string -- break nothing.
+// What it buys is a loop that reads a string's bytes and writes through a pointer keeping what it
+// writes in a register, since the two can no longer be the same memory.
+//
+// Only a parameter whose bytes the body subscripts is split: that is the read the promise helps, and
+// leaving every other function whole keeps its code exactly as it was.
+private read_string_params(f: TFunc) -> Buf[string]
+    var out: Buf[string] = buf()
+    var names: Buf[string] = buf()
+
+    for p in f.params
+        if is_string_param(p.1) then names.push(p.0)
+
+    if names.is_empty() then return out
+
+    val found: &SubscriptedStrings = SubscriptedStrings(buf())
+
+    walk_block_stmts(f.body, expr_walk(false, x -> note_string_subscript(names, found, x)))
+
+    for n in names
+        if has_name(found.names, n) then out.push(n)
+
+    out
+end read_string_params
+
+// What the walk has found, held behind a reference: a closure captures by value, so a `Buf` it were
+// handed could grow storage of its own that the caller never sees.
+private struct SubscriptedStrings
+    names: Buf[string]
+
+private has_name(names: Buf[string], n: string) -> bool
+    for item in names
+        if item == n then return true
+
+    false
+end has_name
+
+private is_string_param(t: Type) -> bool = underlying(t) match
+    Str -> true
+    _ -> false
+
+// Records the parameter a subscript reads the bytes of: `s[i]`, `s.bytes[i]`, and the same of a slice
+// of either.
+private note_string_subscript(names: Buf[string], found: &SubscriptedStrings, x: TExpr)
+    *x.kind match
+        TIndex(receiver, _, _) -> string_param_under(names, receiver) match
+            Some(n) -> if !has_name(found.names, n) then found.names.push(n)
+            None -> ()
+        _ -> ()
+
+private string_param_under(names: Buf[string], x: TExpr) -> Option[string] = *x.kind match
+    TLoad(name, _) -> if has_name(names, name) then Some(name) else None
+    TBytes(inner) -> string_param_under(names, inner)
+    TSlice(base, _, _, _, _) -> string_param_under(names, base)
+    _ -> None
 
 // Which named view a parameter of the emitted signature is, by the register it arrives in.
 private view_named(views: Buf[string], name: Option[Val]) -> Option[string]
