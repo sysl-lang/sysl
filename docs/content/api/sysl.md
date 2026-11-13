@@ -429,7 +429,7 @@ decode and every byte counts once.
 hash_u128(v: u128) -> u64
 ```
 
-Past 64 bits the two halves are mixed separately and combined, because the finalizer above is
+Past 64 bits the two halves are mixed separately and combined, because the mixer above is
 defined on a word and a wider integer has no single one.
 
 ### `hash_u64`
@@ -442,9 +442,20 @@ The mixers a built-in's `Hash` membership renders through. A built-in has no `im
 there is no lowered `int.hash` to call; what it has is one of these, chosen by type, and naming
 them is what lets a `Hash` written for a struct mix its own fields.
 
-This is splitmix64's finalizer: it is the one that turns a counter into something a table can
-bucket on, since consecutive integers are the input a hash table actually meets and the identity
-hash is what makes them collide in a row.
+This is a **folded multiply**: the value, xored with a constant so that zero does not hash to
+zero, is multiplied by the golden-ratio constant into all 128 bits of the product, and the two
+halves are xored together. It is what turns a counter into something a table can bucket on, since
+consecutive integers are the input a hash table actually meets and the identity hash is what makes
+them collide in a row. The low half carries the low input bits and the high half every input bit,
+so the low bits a table masks with depend on the whole key -- keys that differ only in their top
+bits spread as well as a counter does.
+
+It is one multiply (two instructions on a 64-bit machine, which run side by side) where a
+finalizer chain is two multiplies in series, and the hash is on the path of every lookup.
+
+**It is not seeded**, and neither is anything else here: the same key hashes to the same number in
+every run and on every machine. A table fed keys chosen by an adversary can be made to collide;
+one that must stand up to that wraps its key in a type whose `Hash` mixes in a secret.
 
 ### `os`
 

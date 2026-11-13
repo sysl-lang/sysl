@@ -1369,7 +1369,7 @@ for a struct mix its own fields:
 
 | mixer | for | what it is |
 |---|---|---|
-| `hash_u64` | every integer up to 64 bits | splitmix64's finalizer |
+| `hash_u64` | every integer up to 64 bits | a folded 64×64→128-bit multiply |
 | `hash_u128` | every integer above 64 bits | the two halves mixed separately, then combined |
 | `hash_bool` | `bool` | `hash_u64` of 1 or 0 |
 | `hash_str` | `string` | FNV-1a over the bytes |
@@ -1379,10 +1379,17 @@ a hash owes — equal values hash equal — and gives up only collision resistan
 agree in their low 128 bits. If something ever keys a table on values that wide, mixing in 128-bit
 chunks is the fix.
 
-**`hash_u64` is a finalizer and not the identity for a reason.** Consecutive integers are the input a
+**`hash_u64` is a mixer and not the identity for a reason.** Consecutive integers are the input a
 hash table actually meets — loop counters, row ids, sizes — and an identity hash makes them collide
-in a row rather than spreading them. A mixer costs three multiplies and turns a counter into
-something a table can bucket on.
+in a row rather than spreading them. The mixer xors the value with a constant, multiplies it by the
+golden-ratio constant into all 128 bits of the product, and xors the two halves together: the low
+half carries the low input bits and the high half every input bit, so the low bits a table masks
+with depend on the whole key. It is one multiply — two instructions on a 64-bit machine, side by
+side — because it is on the path of every lookup.
+
+**No hash here is seeded.** A key hashes to the same number in every run and on every machine, so a
+table fed keys chosen by an adversary can be made to collide. A table that must stand up to that
+wraps its key in a type whose `Hash` mixes in a secret.
 
 A `bool` gets its own mixer because one bit does not widen to a number in this language; a `string`
 gets FNV-1a over its bytes because a `string` **is** a validated `[]u8`, so there is nothing to
