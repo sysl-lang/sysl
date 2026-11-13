@@ -759,7 +759,7 @@ which is the one way it differs from the question it looks like it is asking. Th
 from absence without a second call whose answer would already be stale — and every caller that
 matters, one about to open the file, gets the truth from the open.
 
-**`is_dir` and `is_file` ask `stat`**, following a symbolic link. A directory the program may not read is still a directory, and `is_file` means a regular file: a directory, a device, a socket or a FIFO answers `false`, as does a missing or dangling path.
+**`is_dir` and `is_file` ask `stat`**, following a symbolic link. A directory the program may not read is still a directory, and `is_file` means a regular file: a directory, a device, a socket or a FIFO answers `false`, as does a missing or dangling path. On a target whose `stat` hook is unsupported, `is_dir` asks whether the path opens as a directory and `is_file` whether something is there that does not.
 
 **`remove_file` refuses a directory rather than removing it.** It is `unlink`, where C's own `remove`
 quietly does either; two names for two intentions is what lets a program that meant one of them find

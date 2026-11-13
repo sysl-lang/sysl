@@ -947,6 +947,64 @@ fsh_unsupported_hook_is_an_io_error()
     lbr_drop([p])
 end fsh_unsupported_hook_is_an_io_error
 
+@test("with stat UNSUPPORTED, is_dir and is_file fall back to opening the path")
+fsh_unsupported_stat_is_dir_and_is_file_fall_back()
+    if !lbr_ready() then return
+
+    val p = lbr_program(raw"""
+        import sysl.fs.{is_dir, is_file, make_temp_dir, write_text, remove_dir_all}
+        import sysl.fs.sys.Stat
+
+        @export("sysl_fs_stat")
+        no_stat(path: *u8, len: usize, follow: int, out: *Stat) -> int = -38
+
+        val d = make_temp_dir("fsh").unwrap()
+        val f = d + "/plain"
+        val gone = d + "/missing"
+
+        write_text(f, "x").unwrap()
+
+        print(s"dir: ${is_dir(d)} ${is_dir(f)} ${is_dir(gone)}")
+        print(s"file: ${is_file(f)} ${is_file(d)} ${is_file(gone)}")
+
+        remove_dir_all(d) match
+            Ok(_) -> print("cleaned")
+            Err(_) -> print("cleaned")
+        """)
+
+    assert_eq(lbr_run(p, []), "dir: true false false\nfile: true false false\ncleaned\n")
+    lbr_drop([p])
+end fsh_unsupported_stat_is_dir_and_is_file_fall_back
+
+@test("with stat answering not-found, is_dir and is_file are false everywhere, with no fallback")
+fsh_not_found_stat_is_dir_and_is_file_are_false()
+    if !lbr_ready() then return
+
+    val p = lbr_program(raw"""
+        import sysl.fs.{is_dir, is_file, make_temp_dir, write_text, remove_dir_all}
+        import sysl.fs.sys.Stat
+
+        @export("sysl_fs_stat")
+        no_stat(path: *u8, len: usize, follow: int, out: *Stat) -> int = -2
+
+        val d = make_temp_dir("fsh").unwrap()
+        val f = d + "/plain"
+        val gone = d + "/missing"
+
+        write_text(f, "x").unwrap()
+
+        print(s"dir: ${is_dir(d)} ${is_dir(f)} ${is_dir(gone)}")
+        print(s"file: ${is_file(f)} ${is_file(d)} ${is_file(gone)}")
+
+        remove_dir_all(d) match
+            Ok(_) -> print("cleaned")
+            Err(_) -> print("cleaned")
+        """)
+
+    assert_eq(lbr_run(p, []), "dir: false false false\nfile: false false false\ncleaned\n")
+    lbr_drop([p])
+end fsh_not_found_stat_is_dir_and_is_file_are_false
+
 // -- the words for an error number -----------------------------------------------------------------------
 //
 // `IoError.message` asks `sysl_fs_error_text` for a code no case names, and the library answers it on

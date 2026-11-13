@@ -1,0 +1,266 @@
+module sysl.math
+@tests
+@requires(heap)
+
+// The special functions and the f16 neighbours. Reference values are the ones tabulated in
+// Abramowitz & Stegun (chapters 7, 6, 9) and in DLMF, to the digits binary64 holds; each is held to
+// a stated number of ulps of the reference rather than to equality, since libm promises a bound and
+// not the correctly rounded answer. The bound is 4 ulps for erf, erfc and the gamma family and 16
+// for the Bessel family, whose libm routines are the least tight.
+
+near(got: real, want: real, ulps: int) -> bool = (got - want).abs() <= real(ulps) * ulp(want)
+near(got: f32, want: f32, ulps: int) -> bool = (got - want).abs() <= f32(ulps) * ulp(want)
+
+// -- erf and erfc -----------------------------------------------------------------------------------
+
+@test("erf and erfc at 1 match the tabulated values")
+erf_reference()
+    assert(near(erf(1.0), 0.8427007929497149, 4))
+    assert(near(erfc(1.0), 0.15729920705028513, 4))
+    assert(near(erf(-1.0), -0.8427007929497149, 4))
+    assert_eq(erf(0.0).bits(), 0)
+    assert_eq(erf(-0.0).bits(), 0x8000000000000000)
+
+@test("erf and erfc at the infinities and a NaN")
+erf_edges()
+    assert_eq(erf(infinity()), 1.0)
+    assert_eq(erf(-infinity()), -1.0)
+    assert_eq(erfc(infinity()), 0.0)
+    assert_eq(erfc(-infinity()), 2.0)
+    assert(erf(nan()).is_nan())
+    assert(erfc(nan()).is_nan())
+
+@test("erfc keeps the digits that 1 - erf throws away")
+erfc_tail()
+    // erfc(10) is 2.088487583762545e-45; 1 - erf(10) is exactly 0 in binary64.
+    assert(near(erfc(10.0), 2.088487583762545e-45, 4))
+    assert_eq(1.0 - erf(10.0), 0.0)
+
+@test("erf and erfc on f32")
+erf_f32()
+    assert(near(erf(1.0f32), 0.84270079f32, 4))
+    assert(near(erfc(1.0f32), 0.15729921f32, 4))
+    assert_eq(erf(1.0f32 / 0.0f32), 1.0f32)
+    assert_eq(erfc(-1.0f32 / 0.0f32), 2.0f32)
+    assert(erf(0.0f32 / 0.0f32).is_nan())
+
+// -- gamma ------------------------------------------------------------------------------------------
+
+@test("tgamma is the factorial at a positive integer and sqrt(pi) at one half")
+tgamma_reference()
+    assert_eq(tgamma(5.0), 24.0)
+    assert_eq(tgamma(1.0), 1.0)
+    assert(near(tgamma(0.5), 1.7724538509055159, 4))
+    assert(near(tgamma(-0.5), -3.5449077018110318, 4))
+
+@test("tgamma at a pole is an infinity or a NaN, and a NaN stays one")
+tgamma_poles()
+    assert_eq(tgamma(0.0), infinity())
+    assert_eq(tgamma(-0.0), -infinity())
+    assert(tgamma(-1.0).is_nan())
+    assert(tgamma(-2.0).is_nan())
+    assert(tgamma(-infinity()).is_nan())
+    assert_eq(tgamma(infinity()), infinity())
+    assert(tgamma(nan()).is_nan())
+
+@test("lgamma is the log of the absolute value and lgamma_sign says which side")
+lgamma_reference()
+    assert(near(lgamma(0.5), 0.5723649429247001, 4))
+    val (v, s) = lgamma_sign(-0.5)
+    assert(near(v, 1.2655121234846454, 4))
+    assert_eq(s, -1)
+    assert_eq(lgamma_sign(0.5).1, 1)
+    assert_eq(lgamma_sign(-1.5).1, 1)
+    assert_eq(lgamma_sign(-2.5).1, -1)
+    assert_eq(lgamma(1.0), 0.0)
+    assert_eq(lgamma(2.0), 0.0)
+
+@test("lgamma at its poles and at the infinities")
+lgamma_poles()
+    assert_eq(lgamma(0.0), infinity())
+    assert_eq(lgamma(-1.0), infinity())
+    assert_eq(lgamma(-2.0), infinity())
+    assert_eq(lgamma(infinity()), infinity())
+    assert_eq(lgamma(-infinity()), infinity())
+    assert(lgamma(nan()).is_nan())
+
+@test("the gamma family on f32")
+gamma_f32()
+    assert_eq(tgamma(5.0f32), 24.0f32)
+    assert(near(tgamma(0.5f32), 1.7724539f32, 4))
+    assert_eq(tgamma(0.0f32), 1.0f32 / 0.0f32)
+    assert(tgamma(-1.0f32).is_nan())
+    assert(near(lgamma(0.5f32), 0.5723649f32, 4))
+    val (v, s) = lgamma_sign(-0.5f32)
+    assert(near(v, 1.2655121f32, 4))
+    assert_eq(s, -1)
+    assert_eq(lgamma(-1.0f32), 1.0f32 / 0.0f32)
+
+// lgamma_r writes through a pointer the call owns, so alternating arguments of opposite sign each see
+// their own sign, which the global signgam of plain lgamma would not promise under threads.
+@test("lgamma_sign answers each call its own sign")
+lgamma_sign_per_call()
+    var wrong = 0
+    for i in 0..<2000
+        val a = lgamma_sign(-0.5).1
+        val b = lgamma_sign(0.5).1
+        if a != -1 || b != 1 then wrong += 1
+    assert_eq(wrong, 0)
+
+// -- Bessel -----------------------------------------------------------------------------------------
+
+@test("j0 and j1 at zero and at 1")
+bessel_j()
+    assert_eq(j0(0.0), 1.0)
+    assert_eq(j1(0.0), 0.0)
+    assert_eq(j1(-0.0).bits(), 0x8000000000000000)
+    assert(near(j0(1.0), 0.7651976865579666, 16))
+    assert(near(j1(1.0), 0.44005058574493355, 16))
+    assert(near(j0(-1.0), 0.7651976865579666, 16))
+    assert(near(j1(-1.0), -0.44005058574493355, 16))
+
+@test("jn and yn at order 2")
+bessel_order_two()
+    assert(near(jn(2, 1.0), 0.1149034849319005, 16))
+    assert(near(yn(2, 1.0), -1.6506826068162546, 16))
+    assert_eq(jn(0, 1.0), j0(1.0))
+    assert_eq(jn(1, 1.0), j1(1.0))
+    assert_eq(yn(0, 1.0), y0(1.0))
+    assert_eq(yn(1, 1.0), y1(1.0))
+    assert_eq(jn(2, 0.0), 0.0)
+
+@test("y0 and y1 at zero are negative infinity, below it a NaN")
+bessel_y_edges()
+    assert_eq(y0(0.0), -infinity())
+    assert_eq(y1(0.0), -infinity())
+    assert_eq(yn(2, 0.0), -infinity())
+    assert(y0(-1.0).is_nan())
+    assert(y1(-1.0).is_nan())
+    assert(near(y0(1.0), 0.08825696421567697, 16))
+    assert(near(y1(1.0), -0.7812128213002887, 16))
+
+@test("Bessel functions of a NaN and of infinity")
+bessel_nan_inf()
+    assert(j0(nan()).is_nan())
+    assert(j1(nan()).is_nan())
+    assert(jn(3, nan()).is_nan())
+    assert(y0(nan()).is_nan())
+    assert(yn(3, nan()).is_nan())
+    assert_eq(j0(infinity()), 0.0)
+    assert_eq(y0(infinity()), 0.0)
+
+@test("the Bessel family on f32 matches the real answer narrowed")
+bessel_f32()
+    assert_eq(j0(1.0f32), f32(j0(1.0)))
+    assert_eq(j1(1.0f32), f32(j1(1.0)))
+    assert_eq(jn(2, 1.0f32), f32(jn(2, 1.0)))
+    assert_eq(y0(1.0f32), f32(y0(1.0)))
+    assert_eq(y1(1.0f32), f32(y1(1.0)))
+    assert_eq(yn(2, 1.0f32), f32(yn(2, 1.0)))
+    assert_eq(j0(0.0f32), 1.0f32)
+    assert_eq(j1(0.0f32), 0.0f32)
+    assert_eq(y0(0.0f32), -1.0f32 / 0.0f32)
+    assert(y0(-1.0f32).is_nan())
+    assert(j0(0.0f32 / 0.0f32).is_nan())
+
+// -- ilogb and scalbln ------------------------------------------------------------------------------
+
+@test("ilogb is the binary exponent")
+ilogb_reference()
+    assert_eq(ilogb(8.0), 3)
+    assert_eq(ilogb(1.0), 0)
+    assert_eq(ilogb(0.75), -1)
+    assert_eq(ilogb(-8.0), 3)
+    assert_eq(ilogb(4.9406564584124654e-324), -1074)
+    assert_eq(ilogb(8.0f32), 3)
+    assert_eq(ilogb(1.4012985e-45f32), -149)
+
+@test("ilogb of zero, infinity and a NaN are sentinels outside any exponent")
+ilogb_sentinels()
+    assert(ilogb(0.0) < -100000)
+    assert(ilogb(infinity()) > 100000)
+    assert(ilogb(0.0f32) < -100000)
+    assert(ilogb(1.0f32 / 0.0f32) > 100000)
+    assert(ilogb(nan()) < -100000 || ilogb(nan()) > 100000)
+
+@test("scalbln scales by a power of two exactly")
+scalbln_reference()
+    assert_eq(scalbln(1.0, 10), 1024.0)
+    assert_eq(scalbln(1.0f32, 10), 1024.0f32)
+    assert_eq(scalbln(3.0, -1), 1.5)
+    assert_eq(scalbln(-3.0, 2), -12.0)
+    assert_eq(scalbln(1.0, -1074).bits(), 1)
+    assert_eq(scalbln(0.0, 5).bits(), 0)
+    assert_eq(scalbln(-0.0, 5).bits(), 0x8000000000000000)
+
+@test("scalbln overflows, underflows and saturates its exponent without trapping")
+scalbln_edges()
+    assert_eq(scalbln(1.0, 1024), infinity())
+    assert_eq(scalbln(-1.0, 1024), -infinity())
+    assert_eq(scalbln(1.0, -1075), 0.0)
+    assert_eq(scalbln(1.0, 9223372036854775807), infinity())
+    assert_eq(scalbln(1.0, -9223372036854775807), 0.0)
+    assert_eq(scalbln(-1.0, -9223372036854775807).bits(), 0x8000000000000000)
+    assert_eq(scalbln(1.0f32, 128), 1.0f32 / 0.0f32)
+    assert_eq(scalbln(1.0f32, -150), 0.0f32)
+    assert_eq(scalbln(infinity(), -5), infinity())
+    assert(scalbln(nan(), 3).is_nan())
+    assert(scalbln(0.0f32 / 0.0f32, 3).is_nan())
+
+// -- f16 nextafter and ulp --------------------------------------------------------------------------
+
+@test("nextafter on f16 steps one place toward the target, in either sign")
+nextafter_f16_steps()
+    assert_eq(nextafter(1.0f16, 2.0f16).bits(), 0x3c01)
+    assert_eq(nextafter(1.0f16, 0.0f16).bits(), 0x3bff)
+    assert_eq(nextafter(-1.0f16, -2.0f16).bits(), 0xbc01)
+    assert_eq(nextafter(-1.0f16, 0.0f16).bits(), 0xbbff)
+    assert_eq(nextafter(1.0f16, 60000.0f16).bits(), 0x3c01)
+
+@test("nextafter on f16 leaves a zero toward the sign of the target")
+nextafter_f16_zero()
+    assert_eq(nextafter(0.0f16, 1.0f16).bits(), 0x0001)
+    assert_eq(nextafter(0.0f16, -1.0f16).bits(), 0x8001)
+    assert_eq(nextafter(-0.0f16, 1.0f16).bits(), 0x0001)
+    assert_eq(nextafter(-0.0f16, 0.0f16).bits(), 0x0000)
+    assert_eq(nextafter(0.0f16, -0.0f16).bits(), 0x8000)
+    assert_eq(nextafter(2.0f16, 2.0f16).bits(), 0x4000)
+
+@test("nextafter on f16 crosses the subnormal edge and the ends of the range")
+nextafter_f16_edges()
+    assert_eq(nextafter(5.960464477539063e-8f16, 0.0f16).bits(), 0x0000)
+    assert_eq(nextafter(0.00006097555f16, 1.0f16).bits(), 0x0400)
+    assert_eq(nextafter(6.103515625e-5f16, 0.0f16).bits(), 0x03ff)
+    assert_eq(nextafter(65504.0f16, 1.0f16 / 0.0f16).bits(), 0x7c00)
+    assert_eq(nextafter(1.0f16 / 0.0f16, 0.0f16).bits(), 0x7bff)
+    assert_eq(nextafter(-1.0f16 / 0.0f16, 0.0f16).bits(), 0xfbff)
+    assert_eq(nextafter(-65504.0f16, -1.0f16 / 0.0f16).bits(), 0xfc00)
+    assert_eq(nextafter(65504.0f16, 0.0f16).bits(), 0x7bfe)
+
+@test("nextafter on f16 of a NaN in either argument is a NaN")
+nextafter_f16_nan()
+    assert(nextafter(0.0f16 / 0.0f16, 1.0f16).is_nan())
+    assert(nextafter(1.0f16, 0.0f16 / 0.0f16).is_nan())
+    assert(nextafter(0.0f16 / 0.0f16, 0.0f16 / 0.0f16).is_nan())
+
+@test("ulp on f16 is the gap to the next magnitude")
+ulp_f16()
+    assert_eq(ulp(1.0f16).bits(), 0x1400)
+    assert_eq(ulp(-1.0f16).bits(), 0x1400)
+    assert_eq(ulp(0.0f16).bits(), 0x0001)
+    assert_eq(ulp(-0.0f16).bits(), 0x0001)
+    assert_eq(ulp(5.960464477539063e-8f16).bits(), 0x0001)
+    assert_eq(ulp(6.103515625e-5f16).bits(), 0x0001)
+    assert_eq(ulp(1024.0f16).bits(), 0x3c00)
+    assert_eq(ulp(65504.0f16).bits(), 0x5000)
+    assert_eq(ulp(-65504.0f16).bits(), 0x5000)
+    assert_eq(ulp(1.0f16 / 0.0f16), 1.0f16 / 0.0f16)
+    assert_eq(ulp(-1.0f16 / 0.0f16), 1.0f16 / 0.0f16)
+    assert(ulp(0.0f16 / 0.0f16).is_nan())
+
+@test("ulp on f16 agrees with the stepping at every power of two")
+ulp_f16_agrees()
+    var x = 1.0f16
+    for i in 0..<15
+        assert_eq(nextafter(x, 1.0f16 / 0.0f16) - x, ulp(x))
+        x = x * 2.0f16
