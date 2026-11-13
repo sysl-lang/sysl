@@ -759,7 +759,15 @@ private converted(cx: &Analyzer, span: Span, v: Const, target: Type) -> Option[C
     ConstChar(c) -> target match
         Integer(bits, signed, _) -> Some(ConstInt(wrap(from_int(long(u32(c))), bits, signed)))
         _ -> None
+    ConstBool(b) -> target match
+        Integer(bits, signed, _) -> bool_as_int(b, bits, signed)
+        _ -> None
     _ -> None
+
+// A `bool` at an integer width: `1` or `0`, and nothing at `i1`, which holds no `1` (the conversion
+// is refused there, so no fold may give it the `-1` a wrapped `1` would be).
+bool_as_int(b: bool, bits: int, signed: bool) -> Option[Const] =
+    if bits == 1 && signed then None else Some(ConstInt(from_int(if b then 1 else 0)))
 
 // A float read as an integer while compiling, by the rule the running program follows: truncated
 // toward zero, clamped to the ends of the width, and zero for a NaN. A constant is the same
@@ -1428,7 +1436,10 @@ private typed_conversion(inner: TExpr, to: Type, m: FoldMachine) -> Option[Const
                 None -> None
             Floating(_, _) -> Some(ConstFloat(f))
             _ -> None
-        ConstBool(b) -> if to == Bool then Some(ConstBool(b)) else None
+        ConstBool(b) -> to match
+            Bool -> Some(ConstBool(b))
+            Integer(bits, signed, _) -> bool_as_int(b, bits, signed)
+            _ -> None
         ConstStr(s) -> if to == Str then Some(ConstStr(s)) else None
         ConstChar(_) -> None
         ConstQuad(_, _) -> None
@@ -1635,7 +1646,10 @@ run_convert(v: Const, from: Type, to: Type) -> Result[Const, string] = v match
         Floating(16, brain) -> Ok(ConstFloat(narrowed_half((hi, lo), brain)))
         Floating(bits, _) -> Ok(ConstFloat(narrowed_real((hi, lo), bits)))
         _ -> Err(s"a conversion from ${type_show(from)} to ${type_show(to)}")
-    ConstBool(_) -> if to == Bool then Ok(v) else Err(s"a conversion from bool to ${type_show(to)}")
+    ConstBool(b) -> to match
+        Bool -> Ok(v)
+        Integer(bits, signed, _) -> bool_as_int(b, bits, signed).ok_or(s"a conversion from bool to ${type_show(to)}")
+        _ -> Err(s"a conversion from bool to ${type_show(to)}")
     _ -> Err(s"a conversion from ${type_show(from)} to ${type_show(to)}")
 
 // An integer as the nearest float of a width, ties to even, rounded ONCE: a `f32` straight from the
