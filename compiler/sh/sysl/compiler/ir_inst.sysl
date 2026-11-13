@@ -252,6 +252,11 @@ enum Inst
     InLoad(dest: Val, ty: LType, ptr: Val, access: IrAccess, align: Option[int])
     InStore(ty: LType, value: Val, ptr: Val, access: IrAccess, align: Option[int])
     InGep(dest: Val, ty: LType, ptr: Val, indices: Buf[IrArg])
+    // A step the program has already proved stays inside its object -- an element whose index was
+    // checked against the length, of storage that holds that many -- written `inbounds`. What LLVM
+    // learns is that the index arithmetic does not wrap, which is what lets it tell `xs[i].a` from
+    // `xs[j].b` by their offsets modulo the stride (`emit_place.sysl`'s `element_gep`).
+    InGepInBounds(dest: Val, ty: LType, ptr: Val, indices: Buf[IrArg])
     InExtract(dest: Val, ty: LType, agg: Val, indices: Buf[int])
     InInsert(dest: Val, ty: LType, agg: Val, value_ty: LType, value: Val, indices: Buf[int])
     InSelect(dest: Val, cond: Val, ty: LType, a: Val, b: Val, cond_ty: LType)
@@ -321,6 +326,12 @@ inst_render(i: Inst) -> string = i match
             _ -> l_render(ty)
 
         s"${v_render(d)} = getelementptr $stepped, ptr ${v_render(p)}, ${arg_list(idx)}"
+    InGepInBounds(d, ty, p, idx) ->
+        val stepped = ty match
+            LVoid -> "{}"
+            _ -> l_render(ty)
+
+        s"${v_render(d)} = getelementptr inbounds $stepped, ptr ${v_render(p)}, ${arg_list(idx)}"
     InExtract(d, ty, agg, idx) ->
         s"${v_render(d)} = extractvalue ${l_render(ty)} ${v_render(agg)}, ${int_list(idx)}"
     InInsert(d, ty, agg, vty, v, idx) ->
