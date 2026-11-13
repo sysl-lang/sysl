@@ -113,7 +113,8 @@ everything that can affect its bytes:
 - the feature request (`--features`, `--no-default-features`, `--all-features`), `-D`,
   `--include-path` (and any path a package's `headers` variable supplied), `--link-path`, `--link`,
   `--lto`, `--profile-generate`, `--profile-use` (by the profile's bytes), `--no-bounds-locations`,
-  `--const-steps` and `--no-std-lib`;
+  `--const-steps`, `--cpu` (by the processor's name and, for `native`, its feature list) and
+  `--no-std-lib`;
 - the standard module, and the environment that reaches the toolchain: `SYSL_EXTRA_CFLAGS`,
   `SYSL_COUNT_ALLOCS`, `WASI_SDK_PATH` and the four Android variables.
 
@@ -1261,6 +1262,7 @@ grammars.
 | `--no-error-traces` | record no [error return trace](/reference/errors/#where-a-failure-came-from) — the [`error_traces` key](/reference/packages/#leaving-the-error-return-trace-out) for one build |
 | `--general-regs-only` | keep the code out of the floating-point and SIMD registers — the [`codegen` block](/reference/packages/#what-the-generated-code-may-use-of-the-machine) for one build |
 | `--strict-align` | make every access aligned — the [`codegen` block](/reference/packages/#what-the-generated-code-may-use-of-the-machine) for one build |
+| `--cpu native` or `--cpu <name>` | generate code for a processor: `native` is the machine running the build, and any other value is an LLVM processor name such as `apple-m4` or `skylake`. Every function carries the `"target-cpu"` attribute, and so does every clang the build drives; `clang --target=<triple> -print-supported-cpus` lists the names. `native` is refused beside a `--target` that is not this machine, and a name LLVM does not know is refused; the processor is part of every cache key |
 | `--error-limit <n>` | how many [errors a failed compilation shows](#how-many-errors-are-shown); defaults to 20, and `0` shows every one |
 | `-p <member>`, `--package <member>` | in a [workspace](/reference/packages/#workspaces), the member to build, test or run |
 | `-v`, `--verbose` | report what the build decided: the files read, the standard module and how it was reached, the search paths, the allocator, and the clang and linker command lines |

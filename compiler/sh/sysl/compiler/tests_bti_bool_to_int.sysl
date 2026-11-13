@@ -1,0 +1,149 @@
+module sh.sysl.compiler
+@tests
+
+// `int(b)`: a `bool` converts to every integer type, `true` as 1 and `false` as 0, and to nothing
+// else. The edges are the widths (one bit, a signed byte a sign-extend would make -1 of, past 128
+// bits), the folds (`const`, a module `val`), a type parameter, the lowering (one `zext`, never a
+// branch or a `select`), and every shape that stays refused.
+
+private bti_ran(text: string) -> string = xvr_ran([("main.sysl", text)])
+
+private bti_said(text: string) -> string = xvr_ir([("main.sysl", text)])
+
+private bti_refused(text: string, part: string)
+    val out = bti_said(text)
+
+    assert(out.contains(part), s"expected '$part' in: $out")
+
+@test("true and false convert to every width and signedness")
+bti_every_width()
+    if xvr_no_library() then return
+
+    val text = "var t = true\nvar f = false\n\n" +
+               "print(int(t), u8(t), i64(t), usize(t), u1(t), u256(t), i512(t), i128(t), isize(t))\n" +
+               "print(int(f), u8(f), i64(f), usize(f), u1(f), u256(f), i512(f), i128(f), isize(f))\n"
+
+    assert_eq(bti_ran(text), "1 1 1 1 1 1 1 1 1\n0 0 0 0 0 0 0 0 0\n")
+
+@test("a signed width gives +1, not the -1 a sign-extended bit would")
+bti_signed_is_plus_one()
+    if xvr_no_library() then return
+
+    val text = "var t = true\n\nprint(i8(t), i16(t), i32(t), i2(t), i8(t) + i8(t))\n"
+
+    assert_eq(bti_ran(text), "1 1 1 1 2\n")
+
+@test("a comparison is the operand, and a count adds it up in a loop")
+bti_comparison_counts()
+    if xvr_no_library() then return
+
+    val text = raw"""
+        above(r: int, xs: []const int) -> int
+            var n = 0
+
+            for p in xs
+                n += int(r > p)
+
+            n
+
+        main()
+            var r = 7
+            print(above(r, [3, 9, 5, 7, 1]), u8(r == 7) * 10, i64(r < 0) - 1)
+        """
+
+    assert_eq(bti_ran(text), "3 10 -1\n")
+
+@test("a const and a module val fold the conversion")
+bti_folds()
+    if xvr_no_library() then return
+
+    val text = raw"""
+        const ONE = int(true)
+        const ZERO: u8 = u8(false)
+        const WIDE = u256(3 > 2)
+        val SUM = i8(true) + i8(1 < 2)
+
+        main()
+            print(ONE, ZERO, WIDE, SUM)
+        """
+
+    assert_eq(bti_ran(text), "1 0 1 2\n")
+
+@test("a module val over a conversion is data, not a prologue")
+bti_module_val_is_data()
+    if xvr_no_library() then return
+
+    val out = cgz_ir("val FLAG: i32 = i32(true)\n\nmain()\n    print(FLAG)\n")
+    var found = false
+
+    for line in lines_of(out).view()
+        if line.starts_with("@") && line.contains("FLAG") && line.contains(" = ")
+            assert(line.ends_with("i32 1") || line.contains("i32 1,"), line)
+            found = true
+
+    assert(found, out)
+
+@test("a type parameter bound to an integer family converts at each width")
+bti_generic()
+    if xvr_no_library() then return
+
+    val text = raw"""
+        count[T: Integer](b: bool, like: T) -> T = T(b)
+
+        main()
+            print(count(true, 0u8), count(true, 0i8), count(false, 0i64), count(true, 0u256))
+        """
+
+    assert_eq(bti_ran(text), "1 1 0 1\n")
+
+@test("the conversion lowers to one zext of the i1, with no branch and no select")
+bti_lowers_to_zext()
+    if xvr_no_library() then return
+
+    val src = "f(r: int, p: int) -> int = int(r > p)\n\ng(b: bool) -> i8 = i8(b)\n\nprint(f(2, 1), g(true))\n"
+    val ir = cgz_ir(src)
+    val f = cgz_body(ir, "f$$sysl")
+    val g = cgz_body(ir, "g$$sysl")
+
+    assert(f.contains("zext i1"), f)
+    assert(!f.contains("select"), f)
+    assert(!f.contains("br "), f)
+    assert(g.contains("zext i1"), g)
+    assert(!g.contains("sext"), g)
+    assert(!g.contains("select"), g)
+    assert(!g.contains("br "), g)
+
+@test("an integer does not convert to bool, and the diagnostic says what does")
+bti_int_to_bool_refused()
+    if xvr_no_library() then return
+
+    bti_refused("print(bool(1))\n", "error: cannot convert int to bool — write 'x != 0'")
+    bti_refused("var n: u8 = 3\nprint(bool(n))\n", "error: cannot convert byte to bool — write 'x != 0'")
+    bti_refused("type Count = new u32\n\nvar c = Count(2)\nprint(bool(c))\n",
+                "error: cannot convert Count to bool — write 'x != 0'")
+
+@test("a signed one-bit width holds no 1, so a bool does not convert to i1, and u1 is the width that does")
+bti_i1_refused()
+    if xvr_no_library() then return
+
+    val said = "error: cannot convert bool to i1 — an i1 cannot hold 1; use u1"
+
+    bti_refused("print(i1(true))\n", said)
+    bti_refused("var b = 2 > 1\nprint(i1(b))\n", said)
+    bti_refused("const NEG = i1(true)\n\nprint(NEG)\n", said)
+    bti_refused("count[T: Integer](b: bool, like: T) -> T = T(b)\n\nprint(count(true, i1(0)))\n", said)
+    assert_eq(bti_ran("var b = 2 > 1\n\nprint(u1(b), u1(false), u1(true) == 1)\n"), "1 0 true\n")
+
+@test("a bool converts to no float")
+bti_bool_to_float_refused()
+    if xvr_no_library() then return
+
+    bti_refused("print(real(true))\n", "error: cannot convert bool to real\n")
+    bti_refused("print(f32(false))\n", "error: cannot convert bool to f32\n")
+
+@test("a bool never becomes an integer by position")
+bti_implicit_refused()
+    if xvr_no_library() then return
+
+    bti_refused("val x: int = true\nprint(x)\n", "error: cannot initialize 'x': declared int but the value is bool")
+    bti_refused("print(1 + true)\n", "error: '+' needs matching types, got int and bool")
