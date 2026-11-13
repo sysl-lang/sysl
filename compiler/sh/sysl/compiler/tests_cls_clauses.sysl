@@ -730,3 +730,167 @@ cls_multi_guard_falls_through()
             print(judge(Pair(Lf(9), Lf(2))), judge(Pair(Lf(4), Lf(4))), judge(Pair(Lf(1), Lf(5))))
             print(judge(Pair(Other, Lf(5))), judge(Solo(Lf(1))))
         """, "1 0 -1\n7 7\n")
+
+// Guards that call a function the optimizer cannot see through may write the memory a `&T`
+// parameter's patterns read. The patterns are still read once.
+private cls_effect_program(guards: string) -> string = raw"""
+    struct Cell
+        v: int
+        w: int
+
+    var calls: int = 0
+
+    @noinline
+    bump(c: &Cell, k: int) -> bool
+        calls += 1
+        c.v = c.v + k
+        calls % 3 == 0
+
+    @noinline
+    judge(c: &Cell) -> int
+    judge(Cell(a, b))
+    """ + guards + raw"""
+    judge(_) = 7
+
+    main()
+        val c = Cell(1, 2)
+        print(judge(c))
+    """
+
+@test("guards with effects on a '&T' parameter still test its patterns once")
+cls_effectful_guards_test_patterns_once()
+    val three = cls_judge_loads(cls_effect_program(raw"""
+        | bump(c, 1) = a + b
+        | bump(c, 2) = a - b
+        | a + b > 0 = a * b
+    """))
+    val one = cls_judge_loads(cls_effect_program(raw"""
+        | bump(c, 1) = a + b
+    """))
+
+    if three < 0 then return
+
+    assert(three > 0, "expected the function to read its argument, so the count can fail")
+    assert(three == one, s"expected 3 guards to read what 1 guard reads ($one loads), got $three")
+
+@test("a guard that changes what a pattern read does not change what a later guard binds")
+cls_guard_effect_does_not_rebind()
+    if !cls_runnable() then return
+
+    cls_prints(raw"""
+        struct Cell
+            v: int
+
+        poke(c: &Cell) -> bool
+            c.v = 100
+            false
+
+        judge(c: &Cell) -> int
+        judge(Cell(v))
+            | poke(c) = 0
+            | v == 1 = 11
+            | v == 100 = 22
+        judge(_) = 7
+
+        main()
+            val c = Cell(1)
+            print(judge(c))
+        """, "11\n")
+
+@test("a 'match' arm's guard that changes the referent does not change a later arm's bindings")
+cls_match_guard_effect_does_not_rebind()
+    if !cls_runnable() then return
+
+    cls_prints(raw"""
+        struct Cell
+            v: int
+
+        poke(c: &Cell) -> bool
+            c.v = 100
+            false
+
+        judge(c: &Cell) -> int
+            *c match
+                Cell(v) if poke(c) -> 0
+                Cell(v) if v == 1 -> 11
+                Cell(v) if v == 100 -> 22
+                _ -> 7
+
+        main()
+            val c = Cell(1)
+            print(judge(c))
+        """, "11\n")
+
+@test("every guard failing falls to an unguarded clause, and the bindings it made are given back")
+cls_guards_fall_to_unguarded_clause()
+    if !cls_runnable() then return
+
+    cls_prints(raw"""
+        struct Res
+            id: int
+
+        impl Drop for Res
+            drop(self) = print("drop", self.id)
+
+        enum Msg
+            Quit
+            Hold(r: &Res)
+
+        look(m: &Msg, n: int) -> int
+        look(Quit, _) = 0
+        look(Hold(r), n)
+            | n > 100 = r.id * 100
+            | n > 50 = r.id * 10
+        look(Hold(r), n) = r.id + n
+
+        main()
+            val m = Hold(Res(7))
+            print(look(m, 200), look(m, 60), look(m, 1), look(Quit, 1))
+        """, "700 70 8 0\ndrop 7\n")
+
+@test("a clause with several guards inside another's guard chain, and a guard that calls one")
+cls_nested_multi_guard_clauses()
+    if !cls_runnable() then return
+
+    cls_prints(raw"""
+        enum Pt
+            P(x: int, y: int)
+
+        sign(n: int) -> int
+        sign(n)
+            | n > 0 = 1
+            | n < 0 = -1
+            | _ = 0
+
+        quad(p: Pt) -> int
+        quad(P(x, y))
+            | sign(x) > 0 && sign(y) > 0 = 1
+            | sign(x) < 0 && sign(y) > 0 = 2
+            | sign(x) < 0 && sign(y) < 0 = 3
+        quad(P(x, _))
+            | x == 0 = 0
+            | x > 0 = 4
+            | _ = 5
+
+        main()
+            print(quad(P(1, 1)), quad(P(-1, 1)), quad(P(-1, -1)), quad(P(1, -1)), quad(P(0, 5)))
+        """, "1 2 3 4 0\n")
+
+@test("a clause with several guards and a pattern alone leaves a gap where no clause covers the rest")
+cls_multi_guard_gap_is_refused()
+    if !cls_runnable() then return
+
+    cls_refused(raw"""
+        enum Leaf
+            Lf(v: int)
+            Other
+
+        f(l: Leaf) -> int
+        f(Lf(a))
+            | a > 0 = 1
+            | a < 0 = 2
+
+        main()
+            print(f(Lf(1)))
+        """, "clauses of 'f' do not cover f(_) — add a clause for it, or end with one that " +
+             "matches every argument", "5:1")
