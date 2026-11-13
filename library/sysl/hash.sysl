@@ -52,17 +52,26 @@ trait Hash
  * there is no lowered `int.hash` to call; what it has is one of these, chosen by type, and naming
  * them is what lets a `Hash` written for a struct mix its own fields.
  *
- * This is splitmix64's finalizer: it is the one that turns a counter into something a table can
- * bucket on, since consecutive integers are the input a hash table actually meets and the identity
- * hash is what makes them collide in a row.
+ * This is a **folded multiply**: the value, xored with a constant so that zero does not hash to
+ * zero, is multiplied by the golden-ratio constant into all 128 bits of the product, and the two
+ * halves are xored together. It is what turns a counter into something a table can bucket on, since
+ * consecutive integers are the input a hash table actually meets and the identity hash is what makes
+ * them collide in a row. The low half carries the low input bits and the high half every input bit,
+ * so the low bits a table masks with depend on the whole key -- keys that differ only in their top
+ * bits spread as well as a counter does.
+ *
+ * It is one multiply (two instructions on a 64-bit machine, which run side by side) where a
+ * finalizer chain is two multiplies in series, and the hash is on the path of every lookup.
+ *
+ * **It is not seeded**, and neither is anything else here: the same key hashes to the same number in
+ * every run and on every machine. A table fed keys chosen by an adversary can be made to collide;
+ * one that must stand up to that wraps its key in a type whose `Hash` mixes in a secret.
  */
 hash_u64(v: u64) -> u64
-    var h = v +% 0x9e3779b97f4a7c15u64
-    h = (h ^ (h >> 30u64)) *% 0xbf58476d1ce4e5b9u64
-    h = (h ^ (h >> 27u64)) *% 0x94d049bb133111ebu64
-    h ^ (h >> 31)
+    val m = u128(v ^ 0x243f6a8885a308d3) * 0x9e3779b97f4a7c15
+    u64.wrap(m) ^ u64(m >> 64)
 
-/** Past 64 bits the two halves are mixed separately and combined, because the finalizer above is
+/** Past 64 bits the two halves are mixed separately and combined, because the mixer above is
  * defined on a word and a wider integer has no single one.
  */
 hash_u128(v: u128) -> u64 = hash_u64(u64(v & 0xffffffffffffffff)) *% 0x100000001b3u64 ^ hash_u64(u64(v >> 64))

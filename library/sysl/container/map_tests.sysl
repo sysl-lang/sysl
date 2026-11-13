@@ -1001,6 +1001,139 @@ map_while_compiling_both_forms()
     assert_eq(listed_while_compiling, 18040)
     assert_eq(hashed_while_compiling, 1558391)
 
+// -- the table's inlined probe: update in place, a tombstone on the way, growth -------------------
+//
+// `get` and `put` probe a table in the caller and leave the list, the growth and a probe that meets a
+// tombstone to calls of their own. These drive each of those exits through the public surface.
+
+/** A key every one of which hashes alike, so that all of them share one probe run and the order they
+ * were put is the order the run holds them in.
+ */
+struct Clump
+    n: int
+
+impl Eq for Clump
+    eq(self, rhs: Clump) -> bool = self.n == rhs.n
+
+impl Hash for Clump
+    hash(self) -> u64 = 7
+
+@test("a table's put replaces a value in place, and lets the old one go at the call")
+table_put_replaces_and_lets_go()
+    var m: Map[int, &MapProbe] = map()
+
+    for i in 0..<20 do m.put(i, MapProbe(i))
+
+    val old: weak MapProbe = m.get(5).unwrap()
+
+    assert(m.capacity() > 8)
+    assert(old.get().is_some())
+
+    m.put(5, MapProbe(50))
+
+    assert(old.get().is_none())
+    assert_eq(m.len(), 20)
+    assert_eq(m.get(5).map(p -> p.n), Some(50))
+    assert_eq(m.get_or(19, MapProbe(0)).n, 19)
+    assert_eq(m.get_or(20, MapProbe(-1)).n, -1)
+end table_put_replaces_and_lets_go
+
+@test("a put whose probe meets a tombstone before its key updates the key, not the tombstone")
+put_past_a_tombstone_updates_the_key()
+    var m: Map[Clump, int] = map()
+
+    for i in 0..<12 do m.put(Clump(i), i)
+
+    assert(m.remove(Clump(0)))
+    assert_eq(m.dead, 1)
+    assert_eq(m.get(Clump(5)), Some(5))
+
+    m.put(Clump(5), 500)
+
+    assert_eq(m.len(), 11)
+    assert_eq(m.dead, 1)
+    assert_eq(m.get(Clump(5)), Some(500))
+
+    var walked = 0
+
+    for (k, v) in m do walked += 1
+
+    assert_eq(walked, 11)
+end put_past_a_tombstone_updates_the_key
+
+@test("and a new key reclaims the first tombstone its probe passed")
+put_new_key_reclaims_a_tombstone()
+    var m: Map[Clump, int] = map()
+
+    for i in 0..<12 do m.put(Clump(i), i)
+
+    assert(m.remove(Clump(0)))
+    assert(m.remove(Clump(3)))
+    assert_eq(m.dead, 2)
+
+    m.put(Clump(100), 100)
+
+    assert_eq(m.len(), 11)
+    assert_eq(m.dead, 1)
+    assert_eq(m.get(Clump(100)), Some(100))
+    assert_eq(m.get(Clump(3)), None)
+    assert_eq(m.get(Clump(11)), Some(11))
+end put_new_key_reclaims_a_tombstone
+
+@test("a counter kept with get_or and put grows through every table size and stays exact")
+counting_through_growth()
+    val m: Map[u64, int] = map()
+    var key: u64 = 0
+
+    for _ in 0..<20000
+        key =(key *% 6364136223846793005 +% 1442695040888963407) & 0xfff
+        m.put(key, m.get_or(key, 0) + 1)
+
+    var total = 0
+
+    for (k, v) in m do total += v
+
+    assert_eq(total, 20000)
+    assert(m.len() <= 4096)
+    assert(m.capacity() >= m.len() * 4 / 3)
+end counting_through_growth
+
+@test("keys that differ only in their top bits fill a table without crowding one run")
+top_bit_keys_spread()
+    val m: Map[u64, u64] = map()
+
+    for i in 0..<1000u64 do m.put(i << 52, i)
+
+    assert_eq(m.len(), 1000)
+
+    for i in 0..<1000u64 do assert_eq(m.get(i << 52), Some(i))
+end top_bit_keys_spread
+
+/** The counter above, run while compiling, over integer keys -- the mixer's 128-bit multiply is
+ * evaluated by the compiler here, not by the machine.
+ */
+const counted_while_compiling(n: int) -> int
+    var m: Map[u64, int] = map()
+
+    for i in 0..<n
+        val k = u64(i % 37)
+
+        m.put(k, m.get_or(k, 0) + i)
+
+    var total = 0
+
+    for (k, v) in m do total += v
+
+    total * 100 + int(m.len())
+end counted_while_compiling
+
+private const integer_keys_while_compiling: int = counted_while_compiling(200)
+
+@test("an integer-keyed table built while compiling answers as one built running")
+integer_table_while_compiling()
+    assert_eq(integer_keys_while_compiling, counted_while_compiling(200))
+    assert_eq(integer_keys_while_compiling, 1990037)
+
 @test(should_trap)
 map_in_zeroed_storage_will_not_grow()
     var raw: [1]usize = [0]

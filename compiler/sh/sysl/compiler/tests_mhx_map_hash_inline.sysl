@@ -1,0 +1,189 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A `Map`'s `get` and `put` on a table are absorbed by the loop that calls them
+// (`library/container.md`): the probe and the integer mixer are inlined, the key is hashed once for
+// a `get` and a `put` of it side by side, and only the list, the growth and a probe that meets a
+// tombstone are calls. What survives the optimizer is the claim, so these ask clang's `-O2` output.
+
+private var mhx_library_cache: Buf[Program] = buf()
+private var mhx_library_read: bool = false
+
+private mhx_library() -> Buf[Program]
+    if mhx_library_read then return mhx_library_cache
+
+    mhx_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> mhx_library_cache = units
+
+    mhx_library_cache
+end mhx_library
+
+// The LLVM text of the whole module a source lowers to, or the first thing it was refused with.
+private mhx_ir(text: string) -> string
+    val parsed = parse(source_of("t.sysl", text))
+
+    if !parsed.ok() then return parsed.first().message
+
+    var units: Buf[Program] = buf()
+
+    for item in mhx_library() do units.push(item)
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if !done.reported.is_empty() then return done.reported[0].diag.message
+
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+    val said = errors_of(done.an.diagnostics())
+
+    if !said.is_empty() then return analysis_report(said)
+
+    val kept = prune(strip_tests(whole), program_own(units))
+
+    ir_print_module(codegen_with_gaps(kept, host_target(), promotions).0)
+end mhx_ir
+
+// What the optimizer leaves of a program, or `None` where there is no library or clang to ask.
+private mhx_optimized(text: string) -> Option[string]
+    if mhx_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return None
+    end if
+
+    if !clang_available()
+        print("skipped: clang is not installed, so there is no optimizer to ask")
+        return None
+    end if
+
+    val dir = make_temp_dir("sysl-mhx").unwrap()
+    val file = s"$dir/t.ll"
+
+    write_text(file, mhx_ir(text)).unwrap()
+
+    val got = capture("clang", ["-O2", "-S", "-emit-llvm", "-o", "-", file], "", [], true).unwrap()
+
+    remove_dir_all(dir).unwrap_or(())
+    assert(got.status.ok(), s"clang refused the emitted IR:\n${got.err.unwrap_or("")}")
+    Some(got.text)
+end mhx_optimized
+
+// The lines of the definition whose symbol holds `name`; a `}` alone on a line ends one.
+private mhx_body(out: string, name: string) -> string
+    var body = ""
+    var inside = false
+
+    for l in lines_of(out)
+        if !inside && l.starts_with("define") && l.contains(name) then inside = true
+
+        if inside
+            if l == "}" then return body
+
+            body = body + l + "\n"
+        end if
+
+    body
+end mhx_body
+
+// How many lines of `text` hold every one of `parts`.
+private mhx_count(text: string, parts: []string) -> int
+    var n = 0
+
+    for l in lines_of(text)
+        var all = true
+
+        for p in parts
+            if !l.contains(p) then all = false
+
+        if all then n += 1
+
+    n
+end mhx_count
+
+private mhx_calls(body: string, name: string) -> bool = mhx_count(body, ["call ", name]) > 0
+
+// The attribute group of the `define` of `name`, resolved from the `#N` it names.
+private mhx_attributes(out: string, name: string) -> string
+    var line = ""
+
+    for l in lines_of(out)
+        if line == "" && l.starts_with("define") && l.contains(name) then line = l
+
+    val hash = line.last_index_of("#")
+
+    if hash.is_none() then return ""
+
+    var end_at = hash.unwrap() + 1
+
+    while end_at < line.len && line.bytes[end_at] >= u8('0') && line.bytes[end_at] <= u8('9')
+        end_at += 1
+
+    val group = line[hash.unwrap()..<end_at]
+
+    for l in lines_of(out)
+        if l.starts_with(s"attributes $group = ") then return l
+
+    ""
+end mhx_attributes
+
+// knucleotide's loop: a count kept with `get_or` and `put` per key, the key type a parameter.
+private mhx_counter(key: string, value: string) -> string =
+    s"module demo\n\nimport sysl.container.*\n\n@export\ncount(xs: *$key, n: usize) -> usize\n" +
+    s"    val m: Map[$key, $value] = map()\n\n    for i in 0..<n\n" +
+    s"        m.put(xs[i], m.get_or(xs[i], 0) + 1)\n\n    m.len()\n"
+
+// The probe and the mixer are in the loop: no call to the map's `get`, `put` or `find`, nor to the
+// mixer, and only the cold paths called.
+private mhx_absorbed(body: string)
+    assert(!mhx_calls(body, "MapCore.get."), body)
+    assert(!mhx_calls(body, "MapCore.put."), body)
+    assert(!mhx_calls(body, "MapCore.find."), body)
+    assert(!mhx_calls(body, "Map.get"), body)
+    assert(!mhx_calls(body, "hash_u64"), body)
+    assert(mhx_calls(body, "MapCore.put_slow."), body)
+    assert(mhx_calls(body, "MapCore.list_get."), body)
+end mhx_absorbed
+
+@test("a counter over u64 keys holds the probe and the mixer, and calls only the list and the growth")
+mhx_u64_counter_is_absorbed()
+    mhx_optimized(mhx_counter("u64", "int")) match
+        None -> ()
+        Some(out) -> mhx_absorbed(mhx_body(out, "demo$count"))
+
+@test("and hashes the key once for the get and the put beside it, in one 128-bit multiply")
+mhx_u64_counter_hashes_once()
+    mhx_optimized(mhx_counter("u64", "int")) match
+        None -> ()
+        Some(out) -> assert_eq(mhx_count(mhx_body(out, "demo$count"), ["mul ", "i128"]), 1)
+
+@test("and the cold paths are kept out of line, so the absorbed probe stays small")
+mhx_cold_paths_are_noinline()
+    mhx_optimized(mhx_counter("u64", "int")) match
+        None -> ()
+        Some(out) ->
+            assert(mhx_attributes(out, "MapCore.put_slow.").contains("noinline"), out)
+            assert(mhx_attributes(out, "MapCore.list_get.").contains("noinline"), out)
+
+@test("as it does for narrower keys and a wider value")
+mhx_i32_counter_is_absorbed()
+    mhx_optimized(mhx_counter("i32", "i64")) match
+        None -> ()
+        Some(out) -> mhx_absorbed(mhx_body(out, "demo$count"))
+
+@test("and for a u8 key, which widens to the same mixer")
+mhx_u8_counter_is_absorbed()
+    mhx_optimized(mhx_counter("u8", "u32")) match
+        None -> ()
+        Some(out) -> mhx_absorbed(mhx_body(out, "demo$count"))

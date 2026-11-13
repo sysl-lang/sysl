@@ -229,6 +229,7 @@ struct Map[K: Hash + Eq, V]
     /** The value a key names, or the one the caller supplies where it names none. The common shape
      * of reading a counter or an accumulator that may not have been started yet.
      */
+    @inline
     const get_or(self, k: K, default: V) -> V = self.get(k).unwrap_or(default)
 
     @inline
@@ -236,8 +237,12 @@ struct Map[K: Hash + Eq, V]
 
     /** A key given a value: the entry it already had takes the new one, or a fresh entry is placed.
      * Every name for this map sees it.
+     *
+     * **Always inlined**: it is a null check in front of the core's `put`, and with that `put`'s
+     * probe absorbed into it a hint alone left it out of line for some key types (a `u8` key's), so
+     * the probe never reached the caller's loop.
      */
-    @inline
+    @inline(always)
     const put(self, k: K, v: V)
         if is_null(self.core) then unassigned(Unassigned.MapUnassigned)
         self.core.put(k, v)
@@ -338,22 +343,42 @@ private[container] struct MapCore[K: Hash + Eq, V]
             i = (i + 1) & mask
     end find
 
-    /** The value a key names. A list answers it from the scan itself, value and all, rather than
-     * finding an index and reading the slot a second time -- the lookup is the list's whole reason to
-     * exist, so it is the one path written out twice.
+    /** The value a key names, answered from the probe itself, value and all, rather than finding an
+     * index and reading the slot a second time.
+     *
+     * **The table's probe is written here and inlined into the caller**, and the list's scan is a
+     * call of its own: a lookup in a big map is the loop a program spends its time in, and inlined
+     * it shares the key's hash with a `put` of the same key beside it. The list is where a map
+     * starts, so it is short and called rather than copied into every caller.
      */
+    @inline
     get(self, k: K) -> Option[V]
-        if !self.hashed()
-            for i in 0..<self.count
-                self.cell[i] match
-                    Slot.Live(_, sk, v) -> if sk == k then return Some(v)
-                    _ -> ()
+        if !self.hashed() then return self.list_get(k)
 
-            return None
+        val h = k.hash()
+        val mask = self.cell.len - 1
+        var i = usize(h) & mask
 
-        self.find(k) match
-            None -> None
-            Some(i) -> self.cell[i].value()
+        loop
+            self.cell[i] match
+                Slot.Empty -> break None
+                Slot.Dead -> ()
+                Slot.Live(sh, sk, v) -> if sh == h && sk == k then break Some(v)
+
+            i = (i + 1) & mask
+    end get
+
+    /** `get` while the map is still a list: every entry compared, front to back. Never inlined, so
+     * that the probe `get` copies into its callers stays small.
+     */
+    @noinline
+    private list_get(self, k: K) -> Option[V]
+        for i in 0..<self.count
+            self.cell[i] match
+                Slot.Live(_, sk, v) -> if sk == k then return Some(v)
+                _ -> ()
+
+        None
 
     /** A key given a value: the entry it already had takes the new one, or a fresh entry is placed.
      *
@@ -366,8 +391,44 @@ private[container] struct MapCore[K: Hash + Eq, V]
      * **A list takes the key at its end**, after a scan has shown it is not already there; the first
      * `put` into a map with no storage has `rehash` make the list's eight slots. A list with no room
      * left is turned into a table by `rehash` too, and the key is then put into that like any other.
+     *
+     * **Only a table with room and no tombstone on the probe is inlined into the caller**, as
+     * `get`'s probe is. A list, and a table that must grow first, take the call to `put_slow`; a
+     * probe that meets a tombstone starts again in `insert`, which knows to reclaim it.
      */
+    @inline
     put(*self, k: K, v: V)
+        if !self.hashed() || (self.count + self.dead + 1) * load_den > self.cell.len * load_num
+            self.put_slow(k, v)
+            return
+
+        val h = k.hash()
+        val mask = self.cell.len - 1
+        var i = usize(h) & mask
+
+        loop
+            self.cell[i] match
+                Slot.Empty ->
+                    self.cell[i] = Slot.Live(h, k, v)
+                    self.count += 1
+                    break
+                Slot.Dead ->
+                    self.insert(h, k, v)
+                    break
+                Slot.Live(sh, sk, _) ->
+                    if sh == h && sk == k
+                        self.cell[i] = Slot.Live(h, k, v)
+                        break
+
+            i = (i + 1) & mask
+    end put
+
+    /** `put` into a list, or into a table that has to be rebuilt before the key goes in. Never
+     * inlined: absorbed into `put`, it would carry the rebuild into every caller and push `put` past
+     * what the optimizer will inline.
+     */
+    @noinline
+    private put_slow(*self, k: K, v: V)
         if !self.hashed()
             self.find(k) match
                 Some(i) ->
@@ -386,7 +447,13 @@ private[container] struct MapCore[K: Hash + Eq, V]
         else if (self.count + self.dead + 1) * load_den > self.cell.len * load_num
             self.rehash()
 
-        val h = k.hash()
+        self.insert(k.hash(), k, v)
+    end put_slow
+
+    /** A key whose hash is `h` given a value, in a table that has room for one more entry, probing
+     * past tombstones and placing a new key at the first one it passed.
+     */
+    private insert(*self, h: u64, k: K, v: V)
         val mask = self.cell.len - 1
         var i = usize(h) & mask
         var vacant: Option[usize] = None
@@ -412,7 +479,7 @@ private[container] struct MapCore[K: Hash + Eq, V]
                         break
 
             i = (i + 1) & mask
-    end put
+    end insert
 
     /** A key taken out, answering whether it was there.
      *
