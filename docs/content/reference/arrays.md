@@ -1598,7 +1598,10 @@ the optimizer exactly that, and nothing more**: every access the buffer's own me
 header is marked as one side, every access they make to an element as the other — and so is the read
 or write of `b[i]` itself, and of a field of it, through the address the subscript checks — and the
 optimizer may keep the header in registers across a loop that writes elements. A row operation over a matrix
-held in a `&Buf[real]` reads the length and the storage pointer once, not once per cell.
+held in a `&Buf[real]` reads the length and the storage pointer once, not once per cell. An append is
+an element write too, together with the live-slot count kept in the storage's own allocation, so a loop
+that pushes keeps the count and the capacity in registers, and reads them again only on the turn
+whose push grows the storage.
 
 A handle kept anywhere else, such as a field of a struct, is marked only as not being that record,
 since the record holds no handle: a `vm.stack.pop()` writes the count and the next one need not read
