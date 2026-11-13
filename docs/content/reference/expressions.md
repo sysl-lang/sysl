@@ -1711,7 +1711,7 @@ conversions are implicit](#which-conversions-are-implicit)); writing it as a cal
 | fixed-point → fixed-point, float or integer, and back | `q31(x)`, `real(q)`, `int(q)` | rounds to nearest and saturates — see [fixed-point numbers](/reference/fixed-point/#conversions) |
 | `char` → integer | `u32(c)` | total — every `char` is an integer |
 | integer → `char` | `char(u)` | **partial** — traps on a value that is not a Unicode scalar value |
-| `bool` → integer | `int(b)`, `u8(b)` | total — `true` is `1` and `false` is `0`, at every width and signedness |
+| `bool` → integer | `int(b)`, `u8(b)` | total — `true` is `1` and `false` is `0`, at every width and signedness but `i1`, which holds no `1` |
 | `char` → `string` | `string(c)` | total — the one character, UTF-8 encoded into a fresh string |
 | `*T` → integer | `usize(p)`, `isize(p)` | total — an address is a number |
 
@@ -1873,6 +1873,17 @@ print(real(true))
 
 ```error
 cannot convert bool to real
+```
+
+The one integer type a `bool` does not convert to is `i1`: a signed bit holds `0` and `-1`, and no
+`1` for `true` to be. `u1` is the one-bit width that does:
+
+```sysl
+print(i1(true))
+```
+
+```error
+cannot convert bool to i1 — an i1 cannot hold 1; use u1
 ```
 
 Everything else is rejected. **No number converts to or from a `string`**: `x.to_string()` renders one and the
