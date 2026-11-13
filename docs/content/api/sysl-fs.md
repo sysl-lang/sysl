@@ -279,8 +279,8 @@ to treat it as absent.
 is_dir(path: string) -> bool
 ```
 
-Whether the path names a directory, asked by opening it as one -- which follows a symbolic link,
-as every other question here does.
+Whether the path names a directory, asked of `stat` -- which follows a symbolic link, as every
+other question here does. A directory the program may not read or search is still a directory.
 
 ### `is_file`
 
@@ -288,9 +288,8 @@ as every other question here does.
 is_file(path: string) -> bool
 ```
 
-Whether the path names something that is not a directory. A device or a socket answers `true`
-here, which is right for what callers use it for: the question is whether opening it as a file
-could work.
+Whether the path names a regular file, asked of `stat` and so following a symbolic link. A
+directory, a device, a socket and a FIFO answer `false`, as does a path `stat` cannot reach.
 
 ### `is_link`
 

@@ -759,10 +759,7 @@ which is the one way it differs from the question it looks like it is asking. Th
 from absence without a second call whose answer would already be stale — and every caller that
 matters, one about to open the file, gets the truth from the open.
 
-**`is_dir` asks by opening the path as a directory.** `DIR *` is opaque, so it needs nothing about the
-platform beyond two symbols, which is what makes it the one question about a path's *kind* the module
-can answer honestly. `is_file` is then "exists and is not a directory" — a device or a socket answers
-true, which is right for what callers use it for: whether opening it as a file could work.
+**`is_dir` and `is_file` ask `stat`**, following a symbolic link. A directory the program may not read is still a directory, and `is_file` means a regular file: a directory, a device, a socket or a FIFO answers `false`, as does a missing or dangling path.
 
 **`remove_file` refuses a directory rather than removing it.** It is `unlink`, where C's own `remove`
 quietly does either; two names for two intentions is what lets a program that meant one of them find

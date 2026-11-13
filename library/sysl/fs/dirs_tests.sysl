@@ -586,3 +586,89 @@ remove_dir_on_a_full_one_is_named()
 
     ignore(remove_dir_all(dir))
 end remove_dir_on_a_full_one_is_named
+
+// -- is_dir and is_file ask stat ------------------------------------------------------------------
+
+@test("isd: a directory the program may not read is still a directory")
+isd_unreadable_directory()
+    val dir = scratch("isd-unreadable")
+    val locked = join(dir, "locked")
+
+    make_dir(locked).unwrap()
+    set_permissions(locked, 0o000).unwrap()
+
+    val dir_answer = is_dir(locked)
+    val file_answer = is_file(locked)
+
+    set_permissions(locked, 0o755).unwrap()
+    ignore(remove_dir_all(dir))
+
+    assert(dir_answer, "is_dir must come from stat, not from being able to open the directory")
+    assert(!file_answer, "a directory is not a file")
+end isd_unreadable_directory
+
+@test("isd: make_dir_all over a directory that already exists and cannot be read succeeds")
+isd_make_dir_all_over_unreadable()
+    val dir = scratch("isd-mka")
+    val locked = join(dir, "locked")
+
+    make_dir(locked).unwrap()
+    set_permissions(locked, 0o000).unwrap()
+
+    val answer = make_dir_all(locked)
+
+    set_permissions(locked, 0o755).unwrap()
+    ignore(remove_dir_all(dir))
+
+    assert_eq(answer, Ok(()))
+end isd_make_dir_all_over_unreadable
+
+@test("isd: a regular file is a file and not a directory")
+isd_regular_file()
+    val dir = scratch("isd-file")
+    val f = join(dir, "f")
+
+    write_text(f, "x").unwrap()
+
+    assert(is_file(f))
+    assert(!is_dir(f))
+
+    ignore(remove_dir_all(dir))
+end isd_regular_file
+
+@test("isd: a symlink is followed, to a directory and to a file")
+isd_symlinks_are_followed()
+    val dir = scratch("isd-links")
+
+    make_dir(join(dir, "d")).unwrap()
+    write_text(join(dir, "f"), "x").unwrap()
+    symlink(join(dir, "d"), join(dir, "to_d")).unwrap()
+    symlink(join(dir, "f"), join(dir, "to_f")).unwrap()
+
+    assert(is_dir(join(dir, "to_d")))
+    assert(!is_file(join(dir, "to_d")))
+    assert(is_file(join(dir, "to_f")))
+    assert(!is_dir(join(dir, "to_f")))
+
+    ignore(remove_dir_all(dir))
+end isd_symlinks_are_followed
+
+@test("isd: a dangling symlink and a missing path are neither")
+isd_dangling_and_missing()
+    val dir = scratch("isd-dangling")
+
+    symlink(join(dir, "nowhere"), join(dir, "dangling")).unwrap()
+
+    assert(!is_dir(join(dir, "dangling")))
+    assert(!is_file(join(dir, "dangling")))
+    assert(!is_dir(join(dir, "missing")))
+    assert(!is_file(join(dir, "missing")))
+
+    ignore(remove_dir_all(dir))
+end isd_dangling_and_missing
+
+@test("isd: a device is neither a file nor a directory")
+isd_device()
+    assert(!is_file("/dev/null"))
+    assert(!is_dir("/dev/null"))
+end isd_device
