@@ -215,12 +215,13 @@ print(<4>f32([1, 2, 3, 4])[3], <2>i64(<2>i8([-5, 100]))[0])
 
 Each lane follows the scalar's rules: a float becomes an integer toward zero, saturating at the
 width's ends with a NaN as zero; a narrower integer keeps the low bits; a wider one extends by the
-source's sign. The one difference is the debug build's check on a written narrowing, which is the
+source's sign; a mask lane becomes `1` or `0` at any integer width but `i1`. The one difference is the debug build's check on a written narrowing, which is the
 scalar's alone — a register traps as a whole or not at all, so a vector narrows by wrapping, as its
 arithmetic does.
 
 Where the scalar conversion is one machine instruction, **the vector's is one instruction over the
-whole register** — `<4>f64(counts)` is a single `sitofp <4 x i32>` — and never a loop over the
+whole register** — `<4>f64(counts)` is a single `sitofp <4 x i32>`, and `<4>u8(mask)` a single
+`zext` — and never a loop over the
 lanes. What has no instruction of its own (a fixed-point lane, which rescales and rounds, or an
 integer wider than 128 bits becoming a float) is converted one lane at a time, as the scalar is.
 
@@ -230,12 +231,12 @@ A literal argument is written at the vector, so `<4>f32([1, 2, 3, 4])` is four `
 to. The lane count never changes, since a lane has nowhere to go and none to come from otherwise:
 
 ```sysl
-val v: <4>i16 = [1, 2, 3, 4]
-val w = <2>f32(v)
+val v: <4>f32 = [1, 2, 3, 4]
+val w = <2>int(v)
 ```
 
 ```error
-a vector converts lane by lane only at one length: <4>i16 has 4 lanes and <2>f32 has 2 lanes
+a vector converts lane by lane only at one length: <4>f32 has 4 lanes and <2>int has 2 lanes
 ```
 
 Nothing converts without being written: `val w: <4>f64 = v` is still refused, as `val r: real = n`

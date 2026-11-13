@@ -82,6 +82,13 @@ private vcv_rows() -> Buf[VcvRow]
     // A fixed-point lane rescales and rounds, as its scalar does.
     rows.push(VcvRow("f32", ["0.5", "-0.25", "2", "-2", "0", "0.75", "0.125", "-1"], "q15",
                      ["0.5", "-0.25", "0.99997", "-1", "0", "0.75", "0.125", "-1"]))
+    // A mask lane is `1` or `0` at every integer width, a signed one included.
+    rows.push(VcvRow("bool", ["true", "false", "false", "true", "true", "false", "true", "false"], "i32",
+                     ["1", "0", "0", "1", "1", "0", "1", "0"]))
+    rows.push(VcvRow("bool", ["false", "true", "true", "false", "true", "false", "true", "true"], "u8",
+                     ["0", "1", "1", "0", "1", "0", "1", "1"]))
+    rows.push(VcvRow("bool", ["true", "false", "true", "true", "false", "false", "true", "false"], "u64",
+                     ["1", "0", "1", "1", "0", "0", "1", "0"]))
     // A `char` lane to an integer is its scalar value.
     rows.push(VcvRow("char", ["'a'", "'z'", "'0'", "'A'", "'b'", "'c'", "'d'", "'e'"], "u32",
                      ["97", "122", "48", "65", "98", "99", "100", "101"]))
@@ -229,18 +236,18 @@ vcv_a_module_constant()
 vcv_a_different_length()
     if !enm_ready() then return
 
-    val said = enm_err("val v: <4>i16 = [1, 2, 3, 4]\nval w = <2>f32(v)\n")
+    val said = enm_err("val v: <4>f32 = [1, 2, 3, 4]\nval w = <2>int(v)\n")
 
-    assert(said.contains("a vector converts lane by lane only at one length: <4>i16 has 4 lanes " +
-                         "and <2>f32 has 2 lanes"), said)
+    assert(said.contains("a vector converts lane by lane only at one length: <4>f32 has 4 lanes " +
+                         "and <2>int has 2 lanes"), said)
 
 @test("an array of a different length is refused, naming its elements")
 vcv_an_array_of_a_different_length()
     if !enm_ready() then return
 
-    val said = enm_err("val xs: [3]i16 = [1, 2, 3]\nval w = <4>f32(xs)\n")
+    val said = enm_err("val xs: [3]int = [1, 2, 3]\nval w = <4>f32(xs)\n")
 
-    assert(said.contains("a vector converts lane by lane only at one length: [3]i16 has 3 " +
+    assert(said.contains("a vector converts lane by lane only at one length: [3]int has 3 " +
                          "elements and <4>f32 has 4 lanes"), said)
 
 @test("a lane pair the scalar refuses is refused for the vector")
@@ -252,13 +259,26 @@ vcv_a_lane_the_scalar_refuses()
     assert(said.contains("cannot convert <4>f32 to <4>char — a lane of f32 does not convert to char"),
            said)
 
+@test("a mask converts to no float, and to no i1, as a bool does")
+vcv_the_bool_refusals()
+    if !enm_ready() then return
+
+    val float = enm_err("val m: <4>bool = [true, false, true, false]\nval w = <4>f32(m)\n")
+
+    assert(float.contains("cannot convert <4>bool to <4>f32 — a lane of bool does not convert to f32"),
+           float)
+
+    val narrow = enm_err("val m: <4>bool = [true, false, true, false]\nval w = <4>i1(m)\n")
+
+    assert(narrow.contains("cannot convert bool to i1 — an i1 cannot hold 1; use u1"), narrow)
+
 @test("a scalar is not converted into a vector")
 vcv_a_scalar_is_refused()
     if !enm_ready() then return
 
-    val said = enm_err("val x: i16 = 3\nval w = <4>f32(x)\n")
+    val said = enm_err("val x: f32 = 3\nval w = <4>int(x)\n")
 
-    assert(said.contains("cannot convert i16 to <4>f32"), said)
+    assert(said.contains("cannot convert f32 to <4>int"), said)
 
 @test("nothing converts without being written")
 vcv_implicit_stays_refused()
@@ -303,6 +323,7 @@ vcv_one_instruction()
     vcv_one_cast("val v: <8>i8 = [1, 2, 3, 4, 5, 6, 7, 8]\nprint(<8>i32(v).sum())\n", "sext <8 x i8>")
     vcv_one_cast("val v: <8>u8 = [1, 2, 3, 4, 5, 6, 7, 8]\nprint(<8>i32(v).sum())\n", "zext <8 x i8>")
     vcv_one_cast("val v: <2>i64 = [1, 2]\nprint(<2>u16(v).sum())\n", "trunc <2 x i64>")
+    vcv_one_cast("val v: <4>bool = [true, false, true, true]\nprint(<4>i32(v).sum())\n", "zext <4 x i1>")
     vcv_one_cast("val v: <4>f32 = [1, 2, 3, 4]\nprint(<4>f64(v).sum())\n", "fpext <4 x float>")
     vcv_one_cast("val v: <4>f64 = [1, 2, 3, 4]\nprint(<4>f32(v).sum())\n", "fptrunc <4 x double>")
     vcv_one_cast("val v: <4>f32 = [1, 2, 3, 4]\nprint(<4>i32(v).sum())\n", "@llvm.fptosi.sat.v4i32.v4f32")
