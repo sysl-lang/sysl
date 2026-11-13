@@ -389,6 +389,142 @@ private bfa_loops(body: string) -> Buf[string]
     found
 end bfa_loops
 
+// -- an append is an element write -----------------------------------------------------------------
+
+private bfa_appends() -> string = raw"""
+    module demo
+
+    import sysl.buf.{Buf, buf}
+
+    @noinline
+    bytes(out: Buf[u8], n: usize)
+        for j in 0..<n do out.push(u8(j))
+
+    @noinline
+    words(out: Buf[int], n: int)
+        for j in 0..<n do out.push(j)
+
+    @noinline
+    nested(out: Buf[Buf[int]]) = out.push(buf())
+
+    @noinline
+    own(n: usize) -> int
+        val s = slot_storage[int](n)
+
+        slot_place(s, 0, 7)
+        s[0]
+
+    @noinline
+    copy_into(seq: []const u8, out: Buf[u8])
+        for j in 0..<seq.len do out.push(seq[j])
+
+    @noinline
+    reversed_into(seq: []const u8, out: Buf[u8])
+        for j in 0..<seq.len do out.push(seq[seq.len - 1 - j])
+
+    main()
+        val b: Buf[u8] = buf()
+        val w: Buf[int] = buf()
+        val n: Buf[Buf[int]] = buf()
+
+        bytes(b, 3)
+        words(w, 3)
+        nested(n)
+        copy_into(b.view(), b)
+        reversed_into(b.view(), b)
+        print(b.len(), w.len(), n.len(), own(2))
+    """
+
+// `push` places its element with `slot_place` into the core's own storage, and that write is on the
+// elements' side whatever the element is: a byte, a word, and a handle that holds a count -- whose
+// placing also reads and raises the live prefix in the storage's own box, which is no header either.
+// A program's own `slot_place` into storage it made is nobody's buffer, and stays unmarked.
+@test("an append marks its element write, and the live prefix it moves, on the elements' side")
+bfa_append_marks_the_element()
+    if bfa_no_library() then return
+
+    val out = bfa_ir(bfa_appends())
+    val b = bfa_body(out, "@sysl.buf$BufCore.push.byte(")
+    val w = bfa_body(out, "@sysl.buf$BufCore.push.int(")
+    val n = bfa_body(out, "@sysl.buf$BufCore.push.sysl.buf$Buf.int.owned(")
+    val own = bfa_body(out, "@demo$own(")
+
+    assert(bfa_lines(b, ["store i8", element_mark()]).len() == 1, b)
+    assert(bfa_lines(b, ["store i8", header_mark()]).is_empty(), b)
+    assert(bfa_lines(w, ["store i32", element_mark()]).len() == 1, w)
+    assert(bfa_lines(n, ["store %struct.sysl.buf$Buf.int", element_mark()]).len() == 1, n)
+    assert(bfa_lines(n, ["load i64", element_mark()]).len() == 1, n)
+    assert(bfa_lines(n, ["store i64", element_mark()]).len() == 1, n)
+    assert(bfa_lines(n, ["load ptr", element_mark()]).len() == 1, n)
+
+    // The count `push` raises is still the header's.
+    assert(!bfa_lines(b, ["store i64", header_mark()]).is_empty(), b)
+    assert(own.contains("store i32 7"), own)
+    assert(!own.contains("sysl.buf"), own)
+
+// The point of the mark: a loop appending one buffer's elements to another keeps the count and the
+// capacity in registers. Off the growth path the loop reads neither, and the capacity is not read
+// again after the element is written to re-check the clause. The growth path is a call that rewrites
+// the header, so the loop reads both again there -- and the storage pointer, which that path does not
+// read, is read once per element, a load no store in the loop waits on.
+@test("at -O2 an append loop keeps the count and the capacity in registers off the growth path")
+bfa_append_loop_keeps_the_header()
+    if bfa_no_library() then return
+
+    bfa_optimized(bfa_appends()) match
+        None -> ()
+        Some(out) -> bfa_header_kept(bfa_body(out, "demo$copy_into"))
+
+// The same loop reading its source back to front -- revcomp's inner loop. The subscript's bounds check
+// is provably true here, but it is folded only after the pass that would carry the header around the
+// loop, and until then it is a branch out of the loop that stops that pass; so the count and the
+// capacity are still read for every element.
+@test("at -O2 an append loop reading its source back to front keeps the header in registers", ignore: "the bounds check of seq[seq.len - 1 - j] is folded after GVN, and blocks its load PRE")
+bfa_reversed_append_loop_keeps_the_header()
+    if bfa_no_library() then return
+
+    bfa_optimized(bfa_appends()) match
+        None -> ()
+        Some(out) -> bfa_header_kept(bfa_body(out, "demo$reversed_into"))
+
+// Every loop of an append body reads no count or capacity off the growth path.
+private bfa_header_kept(body: string)
+    val loops = bfa_loops(body)
+
+    assert(!loops.is_empty(), body)
+
+    for l in loops
+        val hot = bfa_off_growth(l)
+
+        assert(bfa_lines(hot, ["store i8"]).len() == 1, l)
+        assert(bfa_lines(hot, [" = load i64"]).is_empty(), l)
+        assert(bfa_lines(hot, [" = load ptr"]).len() <= 1, l)
+        assert(bfa_lines(l, ["call", "grow_store"]).len() == 1, l)
+        assert(bfa_lines(l, [" = load i64"]).len() == 2, l)
+end bfa_header_kept
+
+// The blocks of a loop's text other than the one that calls the growth.
+private bfa_off_growth(text: string) -> string
+    var kept = ""
+    var block = ""
+    var grows = false
+
+    for l in lines_of(text)
+        if l.len > 0 && !l.starts_with(" ") && l.contains(":")
+            if !grows then kept = kept + block
+
+            block = ""
+            grows = false
+
+        if l.contains("grow_store") then grows = true
+
+        block = block + l + "\n"
+
+    if !grows then kept = kept + block
+
+    kept
+end bfa_off_growth
+
 // -- the marks claim nothing that is not so ---------------------------------------------------------
 
 private bfa_runs(text: string) -> int
@@ -463,6 +599,72 @@ bfa_buffer_of_buffers()
                 for x in outer[i].view() do sum += x
 
             exit(if sum == 780 + 4 * 45 && outer[3][9] == 48 then 42 else 1)
+        """), 42)
+
+// The bytes appended spell little-endian words -- a count, a capacity -- which the marks must not
+// care about: they say where a write lands, never what it holds. The second append reads a view of
+// the very buffer it grows, so every growth moves the storage under the loop, and the count and the
+// storage it carries in registers have to be the ones the growth left.
+@test("at -O2 a Buf[u8] of header-like words, appended reversed and into itself from its own view, computes right")
+bfa_bytes_appended_reversed()
+    if !bfa_ready() then return
+
+    assert_eq(bfa_runs(raw"""
+        import sysl.buf.{Buf, buf}
+
+        @noinline
+        reversed_into(seq: []const u8, out: Buf[u8])
+            for j in 0..<seq.len do out.push(seq[seq.len - 1 - j])
+
+        main()
+            val seq: Buf[u8] = buf()
+            val out: Buf[u8] = buf()
+
+            for k in 0..<1000
+                seq.push(u8(k % 256))
+                seq.push(u8(k / 256))
+
+                for z in 0..<6 do seq.push(0)
+
+            reversed_into(seq.view(), out)
+            reversed_into(out.view(), out)
+
+            var same = out.len() == 16000
+
+            for j in 0..<8000
+                if out[j] != seq[7999 - j] || out[8000 + j] != seq[j] then same = false
+
+            exit(if same && out[7999] == 0 && out[8001] == 0 && out[8008] == 1 then 42 else 1)
+        """), 42)
+
+// Two buffers of handles appended in one loop, the second taking handles out of the first: each
+// append places a counted element, so it moves the live prefix in the storage's box as well as the
+// element, and a push into an inner buffer through one outer buffer is seen through the other.
+@test("at -O2 two Bufs of Bufs appended in one loop, sharing their handles, compute right")
+bfa_two_buffers_of_buffers()
+    if !bfa_ready() then return
+
+    assert_eq(bfa_runs(raw"""
+        import sysl.buf.{Buf, buf}
+
+        main()
+            val a: Buf[Buf[int]] = buf()
+            val b: Buf[Buf[int]] = buf()
+
+            for k in 0..<300
+                val inner: Buf[int] = buf()
+
+                inner.push(k)
+                a.push(inner)
+                b.push(a[usize(k / 2)])
+
+            b[0].push(7)
+
+            var sum = 0
+
+            for i in 0..<b.len() do sum += b[i][0]
+
+            exit(if a.len() == 300 && sum == 22350 && a[0].len() == 2 && a[0][1] == 7 then 42 else 1)
         """), 42)
 
 // A handle reached through a pointer among another buffer's elements is replaced by an element write,

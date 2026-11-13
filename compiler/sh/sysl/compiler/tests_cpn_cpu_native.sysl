@@ -1,0 +1,157 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.text.Search
+
+// `--cpu` (`codegen_features.sysl`): the processor every function is generated for, as `"target-cpu"`.
+
+private cpn_ready() -> bool = std_root().is_ok() && clang_available()
+
+// A processor name every LLVM of the host's architecture knows.
+private cpn_named() -> string = if host_target().cpu == X86_64 then "skylake" else "apple-m1"
+
+// The command `sysl <args> <project>` run over a one-file project: the status and everything said.
+private cpn_run(args: []const string) -> (int, string)
+    val root = make_temp_dir("sysl-cpn").unwrap()
+
+    write_text(s"$root/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(s"$root/main.sysl", "main()\n    print(1)\n").unwrap()
+
+    var full: Buf[string] = buf()
+
+    for a in args
+        full.push(a)
+
+    full.push(root)
+
+    var said: Buf[string] = buf()
+    val sink = &said
+    val code = run_cli(full.view(), piece -> sink.push(piece))
+    var text = ""
+
+    for item in said
+        text = text + item + "\n"
+
+    reset_search_paths()
+    use_codegen_features(no_codegen_features())
+    use_cpu("", buf())
+    remove_dir_all(root).unwrap_or(())
+    (code, text)
+end cpn_run
+
+@test("the default build names no target-cpu")
+cpn_default_is_generic()
+    if !cpn_ready() then return
+
+    val got = cpn_run(["sysl", "emit-llvm"])
+
+    assert_eq(got.0, 0)
+    assert(!got.1.contains("\"target-cpu\""), "a default build carries a target-cpu")
+end cpn_default_is_generic
+
+@test("--cpu native puts the host's processor on every definition")
+cpn_native_names_the_host_cpu()
+    if !cpn_ready() then return
+
+    val host = host_cpu(host_target(), find_clang(host_target(), None).unwrap()).unwrap()
+    val got = cpn_run(["sysl", "emit-llvm", "--cpu", "native"])
+
+    assert_eq(got.0, 0)
+    assert(got.1.contains(s"\"target-cpu\"=\"${host.0}\""), got.1)
+end cpn_native_names_the_host_cpu
+
+@test("--cpu=<name> passes an explicit processor through")
+cpn_explicit_name_is_carried()
+    if !cpn_ready() then return
+
+    val got = cpn_run(["sysl", "emit-llvm", s"--cpu=${cpn_named()}"])
+
+    assert_eq(got.0, 0)
+    assert(got.1.contains(s"\"target-cpu\"=\"${cpn_named()}\""), got.1)
+end cpn_explicit_name_is_carried
+
+@test("an unknown processor is refused, saying how to list the valid ones")
+cpn_unknown_name_refused()
+    if !cpn_ready() then return
+
+    val got = cpn_run(["sysl", "emit-llvm", "--cpu", "no-such-cpu"])
+    val back_end = cpu_symbol(host_target().cpu)
+
+    assert_eq(got.0, 1)
+    assert(got.1.contains(s"'--cpu no-such-cpu' names no processor the $back_end back end knows — " +
+                          s"'clang --target=${host_target().triple} -print-supported-cpus' lists the valid names"), got.1)
+end cpn_unknown_name_refused
+
+@test("--cpu native beside a target that is not this machine is refused")
+cpn_native_with_a_cross_target_refused()
+    if !cpn_ready() then return
+
+    val other = if host_target().cpu == X86_64 then "aarch64-linux" else "x86_64-linux"
+    val got = cpn_run(["sysl", "emit-llvm", "--cpu", "native", "--target", other])
+
+    assert_eq(got.0, 1)
+    assert(got.1.contains(s"'--cpu native' is this machine's processor and means nothing for '$other' — " +
+                          "name a processor for it ('--cpu <name>') or leave out '--target'"), got.1)
+end cpn_native_with_a_cross_target_refused
+
+@test("an explicit processor is allowed with a cross target")
+cpn_explicit_name_with_a_cross_target()
+    if !cpn_ready() then return
+
+    val got = cpn_run(["sysl", "emit-llvm", "--no-std-lib", "--cpu", "cortex-a53", "--target", "aarch64-linux"])
+
+    assert_eq(got.0, 0)
+    assert(got.1.contains("\"target-cpu\"=\"cortex-a53\""), got.1)
+end cpn_explicit_name_with_a_cross_target
+
+@test("--cpu with no operand is a usage error")
+cpn_missing_operand()
+    val got = cpn_run(["sysl", "emit-llvm", "--cpu"])
+
+    assert_eq(got.0, 2)
+end cpn_missing_operand
+
+@test("the processor is part of the cache key, native and named apart from each other and from generic")
+cpn_key_differs()
+    val generic = codegen_features_key()
+
+    use_cpu("apple-m4", buf())
+    val named = codegen_features_key()
+
+    var more: Buf[string] = buf()
+
+    more.push("+aes")
+    use_cpu("apple-m4", more)
+    val featured = codegen_features_key()
+
+    use_cpu("apple-m1", buf())
+    val other = codegen_features_key()
+
+    use_cpu("", buf())
+
+    assert_eq(generic, "")
+    assert(named != generic && featured != named && other != named, s"$generic|$named|$featured|$other")
+    assert_eq(codegen_features_key(), generic)
+end cpn_key_differs
+
+@test("the clang flag carries the processor, x86 as -march and the rest as -mcpu")
+cpn_clang_flag_spelling()
+    use_cpu("skylake", buf())
+
+    var x86 = ""
+
+    for f in codegen_feature_flags(target_resolved("x86_64-linux").unwrap())
+        x86 = x86 + f + " "
+
+    var arm = ""
+
+    for f in codegen_feature_flags(target_resolved("aarch64-linux").unwrap())
+        arm = arm + f + " "
+
+    use_cpu("", buf())
+
+    assert(x86.contains("-march=skylake"), x86)
+    assert(arm.contains("-mcpu=skylake"), arm)
+end cpn_clang_flag_spelling

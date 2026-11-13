@@ -628,12 +628,25 @@ sho_no_async_await_or_actor()
     assert_eq(sho_ran("var async = 1\nvar await = 2\nvar actor = 3\nprint(async + await + actor)"), "6\nexit 0")
 
 // "`&sync T` makes the reference safe to share, not the object safe to mutate" -- the chapter's own
-// most important sentence. A field of one is written exactly as any other field is.
-@test("an atomic reference does not make its object's fields any less writable")
-sho_an_atomic_reference_leaves_fields_writable()
+// most important sentence. A field of one is read-only unless the type says how its writes are
+// synchronised (`sync_writes.sysl`); a type that promises `Share` is written as any other is.
+@test("an atomic reference leaves its object's fields read-only, unless the type promises 'Share'")
+sho_an_atomic_reference_leaves_fields_read_only()
     if xvr_no_library() then return
 
+    val said = sho_ran(raw"""
+        struct Counter
+            n: int
+        var a: &sync Counter = Counter(1)
+        var b = a
+        b.n = 41
+        print(a.n + 1)
+        """)
+
+    assert(said.contains("writes a field reached through a '&sync Counter', which is read-only"), said)
+
     assert_eq(sho_ran(raw"""
+        @unchecked(Share)
         struct Counter
             n: int
         var a: &sync Counter = Counter(1)
@@ -641,6 +654,7 @@ sho_an_atomic_reference_leaves_fields_writable()
         b.n = 41
         print(a.n + 1)
         """), "42\nexit 0")
+end sho_an_atomic_reference_leaves_fields_read_only
 
 // A view records nothing about whether its owner's count is atomic, which is the same gap the string
 // rule above runs into, one level out -- so a view of a `&sync` array counts nothing of the box, and is
@@ -761,8 +775,8 @@ sho_what_takes_no_view_of_a_sync_box_is_allowed()
         for x in r.samples
             n += int(x)
         print(n + int(r.samples[2]) + int(r.inner.a[3]) + int(r.boxed.a[0]))
-        r.samples[0] = 10
-        val copy = r.samples
+        var copy = r.samples
+        copy[0] = 10
         print(total(copy[..]) + total(copy))
         var p: &Ring = Ring([1, 2, 3, 4, 5, 6, 7, 8], Inner([1, 2, 3, 4]), Inner([5, 6, 7, 8]))
         print(total(p.samples[1..<3]) + total(p.samples) + total(p.inner.a[..]))

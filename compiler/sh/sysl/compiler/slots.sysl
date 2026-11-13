@@ -271,7 +271,14 @@ private gen_slot_put(e: *Emit, at: TExpr, value: TExpr, elem: Type)
     emit(e, InStore(lty(e, elem), v, p, AccPlain, None))
 end gen_slot_put
 
+// **Placed into a `BufCore`'s own storage, every access is on the elements' side** of the buffer
+// (`emit_place.sysl`'s `buf_side`, `reference/arrays.md § Its elements are never its header`): the
+// slot, and the live prefix and hook words of the storage's own box, which is the allocation the
+// slots are in. None of them is the `BufCore` or the box a handle sits in, so the scope lets an
+// append in a loop keep the storage pointer, the count and the capacity in registers across the
+// element it writes -- which is what `push` is. Any other view says nothing, as its subscript does.
 private gen_slot_place(e: *Emit, xs: TExpr, index: TExpr, value: TExpr, elem: Type)
+    val side = if is_core_elems(xs) then AccBufElement else AccPlain
     val view = slot_view(e, xs)
     val i = widen_index(e, index, index.span)
 
@@ -283,7 +290,7 @@ private gen_slot_place(e: *Emit, xs: TExpr, index: TExpr, value: TExpr, elem: Ty
     if zero_sized(elem) then return
 
     if !contains_counted(elem)
-        emit(e, InStore(lty(e, elem), v, p, AccPlain, None))
+        emit(e, InStore(lty(e, elem), v, p, side, None))
         return
 
     // **Only the first free slot is placed in line.** It is the case a container appending to its own
@@ -304,13 +311,13 @@ private gen_slot_place(e: *Emit, xs: TExpr, index: TExpr, value: TExpr, elem: Ty
     val done_l = fresh_label(e, "slot.done")
 
     retain_moving(e, value, elem, v)
-    buffer_test(e, elem, view.0, buffer_l, rest_l)
+    buffer_test(e, elem, view.0, buffer_l, rest_l, side)
     emit_label(e, buffer_l)
 
     val lp = slot_header(e, elem, view.0, header_fields())
     val live = fresh_reg(e)
 
-    emit(e, InLoad(live, word_lty(e), lp, AccPlain, None))
+    emit(e, InLoad(live, word_lty(e), lp, side, None))
 
     val edge = slot_at(e, elem, slot_header(e, elem, view.0, buf_elems_field(e, elem)), live)
     val at_edge = fresh_reg(e)
@@ -320,12 +327,12 @@ private gen_slot_place(e: *Emit, xs: TExpr, index: TExpr, value: TExpr, elem: Ty
 
     // The first free slot: nothing is there to give back, and the prefix now covers it.
     emit_label(e, fresh_l)
-    emit(e, InStore(lty(e, elem), v, p, AccPlain, None))
+    emit(e, InStore(lty(e, elem), v, p, side, None))
 
     val grown = fresh_reg(e)
 
     emit(e, InBin(grown, OpAdd, word_lty(e), live, VInt(from_int(1))))
-    emit(e, InStore(word_lty(e), grown, lp, AccPlain, None))
+    emit(e, InStore(word_lty(e), grown, lp, side, None))
     emit_term(e, InBr(done_l))
 
     emit_label(e, rest_l)
@@ -355,7 +362,7 @@ gen_slot_place_rest(e: *Emit, elem: Type)
     val buffer_l = fresh_label(e, "slot.buffer")
     val held_l = fresh_label(e, "slot.held")
 
-    buffer_test(e, elem, owner, buffer_l, held_l)
+    buffer_test(e, elem, owner, buffer_l, held_l, AccPlain)
     emit_label(e, buffer_l)
 
     val live = fresh_reg(e)
@@ -402,7 +409,7 @@ private gen_slot_vacate(e: *Emit, xs: TExpr, from: TExpr, elem: Type)
     val drop_l = fresh_label(e, "slot.drop")
     val kept_l = fresh_label(e, "slot.kept")
 
-    buffer_test(e, elem, view.0, buffer_l, kept_l)
+    buffer_test(e, elem, view.0, buffer_l, kept_l, AccPlain)
     emit_label(e, buffer_l)
 
     // The strong count is the box's first word. Anything above one is a view or a second container
@@ -462,8 +469,8 @@ private slot_view(e: *Emit, xs: TExpr) -> (Val, Val, Val)
 end slot_view
 
 // Branches to `yes` where `owner` is a buffer of `elem` -- non-null, and released through this element
-// type's buffer hook -- and to `no` otherwise.
-private buffer_test(e: *Emit, elem: Type, owner: Val, yes: string, no: string)
+// type's buffer hook -- and to `no` otherwise. The hook word is read as `side` says the storage is.
+private buffer_test(e: *Emit, elem: Type, owner: Val, yes: string, no: string, side: IrAccess)
     val owned_l = fresh_label(e, "slot.owned")
     val present = fresh_reg(e)
 
@@ -473,7 +480,7 @@ private buffer_test(e: *Emit, elem: Type, owner: Val, yes: string, no: string)
 
     val hook = fresh_reg(e)
 
-    emit(e, InLoad(hook, LPtr, slot_header(e, elem, owner, 1), AccPlain, None))
+    emit(e, InLoad(hook, LPtr, slot_header(e, elem, owner, 1), side, None))
 
     val mine = fresh_reg(e)
 

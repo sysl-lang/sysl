@@ -667,6 +667,8 @@ print(n, xs[1])
 
 `true` and `false`. Nothing converts to `bool` implicitly, so `if x = 0` is a **type error**: `if`
 requires a `bool`, and an assignment yields the assigned value. No integer is ever a condition.
+The other way is a written conversion: `int(b)` is `1` for `true` and `0` for `false`, at any integer
+width (§ [Conversions](/reference/expressions/#conversions-are-calls)).
 
 ## `char`
 
