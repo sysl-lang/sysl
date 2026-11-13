@@ -1,0 +1,390 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// **A field reached through a `&sync T` is read-only** unless it is an `Atomic`, a `@guards` names
+// it, or the type promised `@unchecked(Share)` (`sync_writes.sysl`, `reference/memory.md § &sync T,
+// *T and []T`). Two threads doing `c.n += 1` lose updates, and two storing a counted field release one
+// value twice, so every form that writes is refused at the line that wrote it.
+//
+// Axes and cells. The form that writes: assignment, compound assignment, a `*self` member called on
+// the field, a `*self` member called on the object itself, a whole-object store, a view taken of an
+// array field, a nested path through a plain struct field, an array field's element, a `&sync [N]T`'s
+// element, a `ref` bound to the field. Where the `&sync` is: a local, a capture in a closure, a
+// `&sync self` receiver, a parameter of a generic over `T: Share`, a `&sync` field of a shared object
+// (whose own fields follow the rule again). The exemptions: an `Atomic` field, an array of them, a
+// `@guards` field, a `Mutex` field, a `SpinLock` field (the library's locks promise `Share`), a struct
+// promising `@unchecked(Share)`. The neighbours that stay as they were: a read, a plain `&T`, a `*T`
+// field reached through the `&sync`, a `*self` member of the object reached through a raw pointer.
+// `@unchecked` blocks license unchecked indexing, not races, so a write inside one is still refused.
+// Skipped: bare metal (the refusal is analysis, before any target is asked).
+
+private swr_says(text: string, part: string)
+    val said = azd_err(text)
+
+    assert(said.contains(part), said)
+    assert_eq(said.count_of("which is read-only:"), 1)
+end swr_says
+
+private swr_accepts(text: string)
+    val said = azd_err(text)
+
+    assert_eq(said, "")
+end swr_accepts
+
+// The refusal's whole text, for a form, the `&sync` type it was reached through, and the struct the
+// promise would go above.
+private swr_message(head: string, through: string, owner: string) -> string =
+    s"$head a field reached through a '$through', which is read-only: every thread holding the " +
+    "reference may reach it at once, and a plain write would race theirs. Make the field an " +
+    s"'Atomic', name it in a '@guards' so a write holds the lock, or write '@unchecked(Share)' above " +
+    s"'$owner' where its writes are synchronised another way"
+
+private val swr_cell: string = raw"""
+    struct Cell
+        n: int
+
+        bump(*self)
+            self.n += 1
+
+    struct Inner
+        n: int
+
+        bump(*self)
+            self.n += 1
+
+    """
+
+// -- each form that writes is refused ---------------------------------------------------------------
+
+@test("an assignment to a field of a '&sync' is refused, naming the three cures")
+swr_assignment()
+    if !azd_ready() then return
+
+    val said = azd_err("struct Cell\n    n: int\n\nval c: &sync Cell = Cell(0)\nc.n = 1\nprint(c.n)\n")
+
+    assert(said.contains(swr_message("this assignment writes", "&sync Cell", "Cell")), said)
+    assert(said.contains("main.sysl:5:"), said)
+end swr_assignment
+
+@test("a compound assignment is refused: the lost-update counter")
+swr_compound()
+    if azd_ready() then
+        swr_says(swr_cell + "val c: &sync Cell = Cell(0)\nc.n += 1\n",
+                 swr_message("this '+=' writes", "&sync Cell", "Cell"))
+
+@test("a '*self' member called on a field is refused, as it is on a 'val'")
+swr_self_member_on_field()
+    if azd_ready() then
+        swr_says(swr_cell + raw"""
+            struct Holder
+                inner: Inner
+
+            val h: &sync Holder = Holder(Inner(0))
+            h.inner.bump()
+            """, swr_message("'bump' takes '*self', so it writes", "&sync Holder", "Holder"))
+
+@test("a '*self' member called on the shared object itself is refused")
+swr_self_member_on_object()
+    if azd_ready() then
+        swr_says(swr_cell + "val c: &sync Cell = Cell(0)\nc.bump()\n",
+                 swr_message("'bump' takes '*self', so it writes", "&sync Cell", "Cell"))
+
+@test("a store of the whole object is refused")
+swr_whole_object()
+    if azd_ready() then
+        swr_says(swr_cell + "val c: &sync Cell = Cell(0)\n*c = Cell(2)\n",
+                 swr_message("this assignment writes", "&sync Cell", "Cell"))
+
+@test("a write through a nested plain struct field is refused")
+swr_nested_path()
+    if azd_ready() then
+        swr_says(swr_cell + raw"""
+            struct Holder
+                inner: Inner
+
+            val h: &sync Holder = Holder(Inner(0))
+            h.inner.n = 1
+            """, swr_message("this assignment writes", "&sync Holder", "Holder"))
+
+@test("an element of an array field is refused")
+swr_array_element()
+    if azd_ready() then
+        swr_says(swr_cell + raw"""
+            struct Holder
+                arr: [4]int
+
+            val h: &sync Holder = Holder([0; 4])
+            h.arr[1] = 5
+            """, swr_message("this assignment writes", "&sync Holder", "Holder"))
+
+@test("an element of a '&sync [N]T' is refused")
+swr_sync_array_element()
+    if azd_ready() then
+        swr_says("val a: &sync [4]int = [0; 4]\na[0] = 1\n", "a field reached through a '&sync [4]int'")
+
+@test("a view of an array field is read-only, so a writable one is refused and a write through it too")
+swr_view_of_field()
+    if !azd_ready() then return
+
+    val holder = swr_cell + "struct Holder\n    arr: [4]int\n\nval h: &sync Holder = Holder([0; 4])\n"
+    val wants = azd_err(holder + "fill(xs: []int)\n    xs[0] = 1\n\nfill(h.arr[..])\n")
+
+    assert(wants.contains("[]const int"), wants)
+
+    val through = azd_err(holder + "val v = h.arr[..]\nv[0] = 1\n")
+
+    assert(through.contains("which views elements it may not write"), through)
+    swr_accepts(holder + "val v = h.arr[..]\nprint(v[0])\n")
+end swr_view_of_field
+
+@test("a 'ref' bound to a shared field is a second name for it, and writing it is refused")
+swr_ref_binding()
+    if azd_ready() then
+        swr_says(swr_cell + "val c: &sync Cell = Cell(0)\nref r = c.n\nr = 2\n",
+                 swr_message("this assignment writes", "&sync Cell", "Cell"))
+
+@test("a counted reference field is refused: the racing store that released one value twice")
+swr_reference_field()
+    if azd_ready() then
+        swr_says(swr_cell + raw"""
+            struct Holder
+                c: &sync Cell
+
+            val h: &sync Holder = Holder(Cell(0))
+            h.c = Cell(1)
+            """, swr_message("this assignment writes", "&sync Holder", "Holder"))
+
+@test("a '&sync' field may be read, and its own fields follow the rule again")
+swr_sync_field_of_sync()
+    if !azd_ready() then return
+
+    val holder = swr_cell + "struct Holder\n    c: &sync Cell\n\nval h: &sync Holder = Holder(Cell(0))\n"
+
+    swr_says(holder + "h.c.n = 1\n", swr_message("this assignment writes", "&sync Cell", "Cell"))
+    swr_accepts(holder + "print(h.c.n)\n")
+end swr_sync_field_of_sync
+
+// -- where the `&sync` is -----------------------------------------------------------------------------
+
+@test("a closure capturing the '&sync' is refused the same write")
+swr_closure_capture()
+    if azd_ready() then
+        swr_says(swr_cell + "val c: &sync Cell = Cell(0)\nval f = () -> c.n += 1\nf()\n",
+                 swr_message("this '+=' writes", "&sync Cell", "Cell"))
+
+@test("a '&sync self' receiver is read-only too")
+swr_sync_self_receiver()
+    if azd_ready() then
+        swr_says(raw"""
+            struct Tally
+                n: int
+
+                bump(&sync self)
+                    self.n += 1
+
+            val t: &sync Tally = Tally(0)
+            t.bump()
+            """, swr_message("this '+=' writes", "&sync Tally", "Tally"))
+
+@test("a generic body over 'T: Share' is refused a write to its shared box")
+swr_generic_share()
+    if azd_ready() then
+        swr_says(raw"""
+            struct Slot[T]
+                v: T
+
+            put[T: Share](s: &sync Slot[T], x: T)
+                s.v = x
+
+            val s: &sync Slot[int] = Slot(0)
+            put(s, 3)
+            """, "this assignment writes a field reached through a '&sync Slot[")
+
+@test("an '@unchecked' block licenses unchecked indexing, not a race, so the write is still refused")
+swr_unchecked_block()
+    if azd_ready() then
+        swr_says(swr_cell + "val c: &sync Cell = Cell(0)\n@unchecked\n    c.n = 1\n",
+                 swr_message("this assignment writes", "&sync Cell", "Cell"))
+
+// -- each exemption ----------------------------------------------------------------------------------
+
+@test("an 'Atomic' field is written through its members")
+swr_atomic_field()
+    if azd_ready() then
+        swr_accepts(raw"""
+            import sysl.sync.Atomic
+
+            struct Hits
+                n: Atomic[int]
+                each: [2]Atomic[int]
+
+            val h: &sync Hits = Hits(Atomic(0), [Atomic(0), Atomic(0)])
+            h.n.add(1)
+            h.n.store(5)
+            h.each[1].add(2)
+            print(h.n.load() + h.each[1].load())
+            """)
+
+@test("a field a '@guards' names may be written, and the struct's other fields may not")
+swr_guarded_field()
+    if !azd_ready() then return
+
+    val shelf = raw"""
+        @guards(value)
+        struct Shelf
+            private value: int
+            other: int
+
+        val s: &sync Shelf = Shelf(0, 0)
+        """
+
+    swr_accepts(shelf + "s.value = 3\nprint(s.value)\n")
+    swr_says(shelf + "s.other = 3\n", swr_message("this assignment writes", "&sync Shelf", "Shelf"))
+end swr_guarded_field
+
+@test("a 'Mutex' or a 'SpinLock' field is used through its own members")
+swr_lock_fields()
+    if azd_ready() then
+        swr_accepts(raw"""
+            import sysl.sync.SpinLock
+            import sysl.threads.Mutex
+
+            struct Shared
+                m: Mutex[int]
+                lock: SpinLock
+
+            val s: &sync Shared = Shared(Mutex.new(1), SpinLock(0))
+            s.lock.lock()
+            s.lock.unlock()
+            print(s.m.with((v) -> *v))
+            """)
+
+@test("a struct made only of atomics and locks is synchronised by them, and its '*self' members are its own")
+swr_struct_of_atomics()
+    if !azd_ready() then return
+
+    val latch = raw"""
+        import sysl.sync.Atomic
+        import sysl.threads.{Condvar, SleepLock}
+
+        struct Latch
+            count: Atomic[int]
+            lock: SleepLock
+            cv: Condvar
+
+            release(*self)
+                self.count.sub(1)
+
+        struct Slot
+            done: Latch
+            value: int
+
+        val s: &sync Slot = Slot(Latch(Atomic(1), SleepLock.new(), Condvar.new()), 0)
+        """
+
+    swr_accepts(latch + "s.done.release()\nprint(s.done.count.load())\n")
+    swr_says(latch + "s.value = 1\n", swr_message("this assignment writes", "&sync Slot", "Slot"))
+end swr_struct_of_atomics
+
+@test("a struct with one plain field among its atomics is not, and its '*self' members are refused")
+swr_struct_of_atomics_and_a_plain_field()
+    if azd_ready() then
+        swr_says(raw"""
+            import sysl.sync.Atomic
+
+            struct Gate
+                open: Atomic[int]
+                seen: int
+
+                pass(*self)
+                    self.seen += 1
+
+            val g: &sync Gate = Gate(Atomic(0), 0)
+            g.pass()
+            """, swr_message("'pass' takes '*self', so it writes", "&sync Gate", "Gate"))
+
+@test("a struct promising '@unchecked(Share)' may be written through a '&sync'")
+swr_promised_share()
+    if azd_ready() then
+        swr_accepts(raw"""
+            @unchecked(Share)
+            struct Slot
+                private n: int
+                private me: Option[&sync Slot]
+
+            val s: &sync Slot = Slot(0, None)
+            s.n = 1
+            s.me = Some(s)
+            s.me = None
+            print(s.n)
+            """)
+
+@test("an '@unchecked(Send)' promise is not a 'Share' one, and licenses no write")
+swr_send_promise_is_not_share()
+    if azd_ready() then
+        swr_says(raw"""
+            @unchecked(Send)
+            struct Slot
+                private c: &Slot
+                n: int
+
+            write(s: &sync Slot)
+                s.n = 1
+
+            print(1)
+            """, swr_message("this assignment writes", "&sync Slot", "Slot"))
+
+// -- the neighbours that stay as they were --------------------------------------------------------------
+
+@test("a read through a '&sync' is accepted")
+swr_read()
+    if azd_ready() then
+        swr_accepts(swr_cell + "val c: &sync Cell = Cell(4)\nval k = c.n + 1\nprint(k)\n")
+
+@test("a plain '&T' path is still writable")
+swr_plain_ref()
+    if azd_ready() then
+        swr_accepts(swr_cell + "val c: &Cell = Cell(0)\nc.n = 1\nc.n += 1\nc.bump()\nprint(c.n)\n")
+
+@test("a raw pointer reached through a '&sync' writes storage the object does not hold")
+swr_pointer_field()
+    if azd_ready() then
+        swr_accepts(raw"""
+            struct Cell
+                n: int
+
+            struct Holder
+                p: *Cell
+
+            var target = Cell(0)
+            val h: &sync Holder = Holder(&target)
+            h.p.n = 1
+            print(target.n)
+            """)
+
+// -- the probe, run --------------------------------------------------------------------------------------
+
+@test("the cured counter, two threads of 100000 'add's on an 'Atomic' field, gives exactly 200000")
+swr_cured_counter_runs()
+    if azd_ready() then
+        twp_prints(raw"""
+            import sysl.sync.Atomic
+            import sysl.threads.scope
+
+            struct Cell
+                n: Atomic[int]
+
+            val c: &sync Cell = Cell(Atomic(0))
+
+            scope((s) ->
+                s.spawn(() ->
+                    for i in 0..<100000
+                        c.n.add(1))
+                s.spawn(() ->
+                    for i in 0..<100000
+                        c.n.add(1)))
+
+            print(c.n.load())
+            """, "200000\n")

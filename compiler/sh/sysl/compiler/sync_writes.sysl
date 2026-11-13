@@ -1,0 +1,157 @@
+module sh.sysl.compiler
+
+import sysl.buf.Buf
+
+// **A field reached through a `&sync T` is read-only** (`reference/memory.md § &sync T, *T and []T`).
+// Every thread holding the reference reaches the same object at once, so an ordinary store races
+// theirs: two `c.n += 1` lose updates, and two stores of a counted field release one value twice.
+// Three things make a write safe, and each is written where the type is declared:
+//
+// - the field is an `Atomic`, whose members are the synchronised writes;
+// - the field is named by its struct's `@guards`, whose members take the lock before reaching it;
+// - the type promises `@unchecked(Share)`, the program's word that its writes are synchronised some
+//   other way.
+//
+// **The walk is the one a place makes out to its storage**: through a field of a value, an array's
+// own elements and the place a `ref` stands for, and it stops where a step reaches storage held by
+// address. A step through a `&sync` is the boundary, and a step through any other address -- a `*T`,
+// a plain `&T` -- leads to storage the write does not take from the shared object. A `&sync` field
+// read on the way is a reference like any other, and the write is asked again of its own object.
+// **The written place's own type counts as a step**, so `s.lock.lock()` on a `SpinLock` field is
+// the lock's own synchronised member, and `c.bump()` on the object itself is a write to every field.
+
+// What a write to `t` is refused for, or nothing: the `&sync` type it is reached through, and the
+// struct whose declaration would carry the promise.
+sync_write_refusal(cx: &Analyzer, t: TExpr) -> Option[(Type, Type)]
+    if exempt_from_sync(texpr_type(t)) then return None
+
+    var cur = t
+
+    loop
+        *cur.kind match
+            TField(recv, idx, fty) ->
+                val rt = texpr_type(recv)
+                val own = underlying(pointee(rt).unwrap_or(rt))
+
+                if exempt_from_sync(fty) || promised_share(own) || guarded_field(own, idx) then
+                    return None
+
+                if is_sync_ref(rt) then return Some((rt, own))
+
+                *recv.kind match
+                    TDeref(op, _) -> if ref_call_place(cx, recv).is_none()
+                        return if is_sync_ref(texpr_type(op)) then Some((texpr_type(op), own)) else None
+                    _ -> ()
+
+                if holds_address(rt) then return None
+
+                cur = recv
+            TIndex(recv, _, _) ->
+                val rt = texpr_type(recv)
+
+                if is_sync_ref(rt) then return Some((rt, underlying(pointee(rt).unwrap_or(rt))))
+                if !owns_elements(rt) then return None
+
+                cur = recv
+            TDeref(op, _) -> ref_call_place(cx, cur) match
+                Some(v) -> cur = v
+                None ->
+                    val ot = texpr_type(op)
+
+                    return if is_sync_ref(ot) then Some((ot, underlying(pointee(ot).unwrap_or(ot)))) else None
+            TLoad(name, _) -> ref_place(cx, name) match
+                Some(p) -> cur = p
+                None -> return None
+            _ -> return None
+end sync_write_refusal
+
+// Whether the elements a view of `t` would see are reached through a `&sync`, so the view is a
+// `[]const T`: an array field of a shared object, or a `&sync [N]T` itself. An array of `Atomic`s, or
+// of anything else synchronised by its declaration, keeps a view that may be written.
+sync_shared_elements(cx: &Analyzer, t: TExpr) -> bool
+    val ty = texpr_type(t)
+
+    repr(ty) match
+        Ref(inner, sync) -> return sync && owns_elements(*inner) && !exempt_from_sync(element_of(*inner))
+        _ -> ()
+
+    owns_elements(ty) && !exempt_from_sync(element_of(ty)) && sync_write_refusal(cx, t).is_some()
+end sync_shared_elements
+
+// What a refusal of a read-only view adds where the view is read-only because its elements are
+// reached through a `&sync`: the reason, and the three cures. Empty for any other view.
+sync_view_note(cx: &Analyzer, t: TExpr) -> string = *t.kind match
+    TSlice(base, _, _, _, _) ->
+        if !sync_shared_elements(cx, base) then return ""
+
+        val ty = texpr_type(base)
+
+        repr(ty) match
+            Ref(inner, _) -> " — " + sync_write_message("and it views", ty, *inner)
+            _ -> sync_write_refusal(cx, base) match
+                Some((through, owner)) -> " — " + sync_write_message("and it views", through, owner)
+                None -> ""
+    _ -> ""
+
+private element_of(t: Type) -> Type = repr(t) match
+    Array(_, e) -> *e
+    Vector(_, e) -> *e
+    _ -> Unknown
+
+// The refusal, said the same way for every form that writes: what is refused, why, and the three
+// cures, the last naming the declaration it goes above.
+sync_write_message(head: string, through: Type, owner: Type) -> string
+    val name = type_show(owner)
+    val promise = underlying(owner) match
+        Struct(_) -> s"'@unchecked(Share)' above '$name' where its writes are synchronised another way"
+        _ -> "'@unchecked(Share)' above the type where its writes are synchronised another way"
+
+    s"$head a field reached through a '${type_show(through)}', which is read-only: every thread " +
+        "holding the reference may reach it at once, and a plain write would race theirs. Make the " +
+        "field an 'Atomic', name it in a '@guards' so a write holds the lock, or write " + promise
+end sync_write_message
+
+// Whether a value of this type is synchronised by its own declaration: an `Atomic`, a struct whose
+// `@guards` makes its members the only way to what it protects (`Mutex`, `Guarded`), or one that
+// promised `Share`. Asked of the field written and of the place itself, so a member of one of these
+// called on a shared field is that type's own synchronised write.
+//
+// **A struct made only of such fields is one too** -- a latch of two `Atomic`s, a lock and a `Condvar`
+// -- since every write its members can make goes through one of them. An array of them is as well.
+private exempt_from_sync(t: Type) -> bool = underlying(t) match
+    Struct(d) ->
+        if qualified_name(d.base) == "sysl.sync.Atomic" || !d.guarded.is_empty() ||
+           holds_string(d.promised, "Share") then return true
+
+        if d.fields.is_empty() || d.union_layout then return false
+
+        for item in d.fields
+            if !exempt_from_sync(item.1) then return false
+
+        true
+    Array(_, e) -> exempt_from_sync(*e)
+    _ -> false
+
+// Whether the struct a field belongs to promised `Share`, which covers every field it declares.
+private promised_share(own: Type) -> bool = own match
+    Struct(d) -> holds_string(d.promised, "Share")
+    _ -> false
+
+private guarded_field(own: Type, idx: int) -> bool = own match
+    Struct(d) -> idx >= 0 && usize(idx) < d.fields.len() && holds_string(d.guarded, d.fields[usize(idx)].0)
+    _ -> false
+
+private is_sync_ref(t: Type) -> bool = repr(t) match
+    Ref(_, sync) -> sync
+    _ -> false
+
+private holds_address(t: Type) -> bool = repr(t) match
+    Ref(_, _) -> true
+    Weak(_) -> true
+    Ptr(_) -> true
+    _ -> false
+
+private owns_elements(t: Type) -> bool = repr(t) match
+    Array(_, _) -> true
+    Vector(_, _) -> true
+    _ -> false
