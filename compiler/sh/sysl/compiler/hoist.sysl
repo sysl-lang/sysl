@@ -656,10 +656,31 @@ record_impl_members_access(a: &Analysis, scope: Scope, key: string, written: str
             // A name the type already has a member of keeps that member's reach: this one is an
             // overload (or a refused duplicate), and is filed under a name of its own.
             _ ->
-                if !has_member_at(a, key, m.name) then
+                if has_member_at(a, key, m.name)
+                    check_member_modifier(a, scope, key, written, owner.unwrap().vis, m.name, m.vis,
+                                          m.span)
+                else
                     record_member_access(a, scope, key, written, owner.unwrap().vis, m.name, m.vis,
                                          m.span)
 end record_impl_members_access
+
+// The refusals `file_member_access` reports for a written modifier, without filing anything: the
+// check a member that keeps an earlier overload's reach still owes.
+private check_member_modifier(a: &Analysis, scope: Scope, owner: string, written: string,
+                              owner_vis: Visibility, name: string, vis: Visibility, span: Span)
+    vis match
+        Scoped(m) ->
+            val sub = widened_to(scope.module_name, m)
+
+            if sub.is_none()
+                a.fault(scope, span, scope_names_nothing(m, scope.module_name))
+            else if wider_than_owner(scope, owner_vis, sub.unwrap())
+                a.fault(scope, span,
+                        s"'$written.$name' is visible throughout module '${sub.unwrap()}', but " +
+                        s"'${qualified_name(owner)}' is ${out_of_reach_tail(scope, owner_vis)} — a " +
+                        "member cannot be more visible than the type it belongs to")
+        _ -> ()
+end check_member_modifier
 
 // One field's or member's reach. A written modifier may only NARROW: a member reachable where its
 // type is not is a member nothing can name anyway, so the claim would be false rather than merely

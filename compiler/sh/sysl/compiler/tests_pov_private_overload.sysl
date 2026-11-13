@@ -28,7 +28,8 @@ pov_both_inside()
 @test("pov: the private signature is no candidate outside its file")
 pov_private_signature_not_a_candidate()
     azc_says([("a.sysl", pov_type()), ("b.sysl", pov_impl()),
-              ("main.sysl", "val e = E(1)\nprint(e.f(\"abc\"))\n")], "main.sysl")
+              ("main.sysl", "val e = E(1)\nprint(e.f(\"abc\"))\n")],
+             "error: 'x' of 'E.f' is int, but string was given")
 
 @test("pov: the public overload declared second, in the impl")
 pov_public_declared_second()
@@ -53,7 +54,8 @@ pov_one_body_public_first()
 pov_one_body_private_refused_elsewhere()
     azc_says([("a.sysl", "struct E\n    n: int\n\n    f(self, x: int) -> int = x + self.n\n" +
                          "    private f(self, s: string) -> int = int(s.len)\n"),
-              ("main.sysl", "val e = E(1)\nprint(e.f(\"abc\"))\n")], "main.sysl")
+              ("main.sysl", "val e = E(1)\nprint(e.f(\"abc\"))\n")],
+             "error: 'x' of 'E.f' is int, but string was given")
 
 @test("pov: associated functions")
 pov_associated_functions()
@@ -66,7 +68,8 @@ pov_associated_functions()
 pov_associated_private_refused()
     azc_says([("a.sysl", "struct E\n    n: int\n\n    make(n: int) -> E = E(n)\n"),
               ("b.sysl", "impl E\n    private make(s: string) -> E = E(int(s.len))\n"),
-              ("main.sysl", "print(E.make(\"abcd\").n)\n")], "main.sysl")
+              ("main.sysl", "print(E.make(\"abcd\").n)\n")],
+             "error: 'n' of 'E.make' is int, but string was given")
 
 @test("pov: an enum")
 pov_enum()
@@ -86,7 +89,8 @@ pov_scoped()
 pov_scoped_refused_outside()
     azc_says([("geom/a.sysl", "module geom\n\nstruct E\n    n: int\n\n    f(self, x: int) -> int = x + self.n\n"),
               ("geom/b.sysl", "module geom\n\nimpl E\n    private[geom] f(self, s: string) -> int = int(s.len)\n"),
-              ("main.sysl", "val e = geom.E(1)\nprint(e.f(\"abc\"))\n")], "main.sysl")
+              ("main.sysl", "val e = geom.E(1)\nprint(e.f(\"abc\"))\n")],
+             "error: 'x' of 'geom.E.f' is int, but string was given")
 
 @test("pov: a generic type")
 pov_generic()
@@ -114,3 +118,29 @@ pov_lone_private_refused()
     azc_says([("a.sysl", "struct E\n    n: int\n\n    private f(self, x: int) -> int = x\n"),
               ("main.sysl", "val e = E(1)\nprint(e.f(5))\n")],
              "method 'f' of 'E' is private to")
+
+// -- a modifier that names nothing is refused on every overload, wherever it stands ------------------
+
+private pov_bad_scope() -> string =
+    "'other' is not 'geom' or one of its ancestors, and 'private[M]' widens to a module the " +
+    "declaration is already inside"
+
+@test("pov: a bad private[m] on the first overload of an impl is refused")
+pov_bad_scope_first_overload()
+    azc_says([("geom/a.sysl", "module geom\n\nstruct E\n    n: int\n"),
+              ("geom/b.sysl", "module geom\n\nimpl E\n    private[other] g(self, s: string) -> int = 1\n" +
+                              "    g(self, x: int) -> int = x\n"),
+              ("main.sysl", "print(1)\n")], pov_bad_scope())
+
+@test("pov: a bad private[m] on a later overload of an impl is refused")
+pov_bad_scope_later_overload()
+    azc_says([("geom/a.sysl", "module geom\n\nstruct E\n    n: int\n"),
+              ("geom/b.sysl", "module geom\n\nimpl E\n    g(self, x: int) -> int = x\n" +
+                              "    private[other] g(self, s: string) -> int = 1\n"),
+              ("main.sysl", "print(1)\n")], pov_bad_scope())
+
+@test("pov: a bad private[m] on an impl overload of a name the type's body already has is refused")
+pov_bad_scope_overload_of_body_member()
+    azc_says([("geom/a.sysl", "module geom\n\nstruct E\n    n: int\n\n    g(self, x: int) -> int = x\n"),
+              ("geom/b.sysl", "module geom\n\nimpl E\n    private[other] g(self, s: string) -> int = 1\n"),
+              ("main.sysl", "print(1)\n")], pov_bad_scope())
