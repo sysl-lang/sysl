@@ -383,6 +383,21 @@ private nud(t: Spanned[Tok], p: *Parser) -> Expr
             expr(at, Bad)
 end nud
 
+// `<4>f32(v)` -- a vector type in call position, which converts its argument lane by lane. **Nothing
+// else begins an expression with a `<`**, so the type is read here and its call is left to the call
+// operator after it; a vector type with no call is not a value, and is told what it is for.
+private parse_vector_conversion(p: *Parser, at: Span) -> Expr
+    val t = parse_vector_after_open(p, at)
+
+    if !p.at_kw("(")
+        p.fault(t.span, s"'(' expected — a vector type in an expression converts a value, as " +
+                s"'${type_text(t)}(v)'")
+        return expr(t.span, Bad)
+    end if
+
+    expr(t.span, TypeArg(t))
+end parse_vector_conversion
+
 // Whether the `await` just taken is the prefix rather than a name. **The word is contextual**, so a
 // program may still call a variable `await`: it is the prefix only where an operand follows on the
 // same line, starting with something no name is ever followed by -- another name, `self`, or a
@@ -435,6 +450,7 @@ private nud_word(p: *Parser, at: Span, w: string) -> Expr
     end if
 
     if w == "." then return parse_implicit_member(p, at)
+    if w == "<" then return parse_vector_conversion(p, at)
     // **An `if` may be any operand, and its last branch runs to the end of the expression**, as in
     // Rust, Scala and Kotlin: `1 + if c then 2 else 3 * 4` is `1 + (if c then 2 else (3 * 4))`,
     // and `-if c then 1 else 2` negates the whole `if`. Nothing further right can belong to the
