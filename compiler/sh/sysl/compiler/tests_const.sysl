@@ -298,6 +298,119 @@ cst_floating_point_arithmetic()
 
     assert_eq(cst_ran("const half: real = 1.0 / 4.0 + 0.25\nprint(half.to_string())"), "0.5\n")
 
+// -- an integer beside a float folds as the program reads it --------------------------------------
+//
+// A constant's value is folded, not run, so the fold has to read an integer literal beside a float
+// exactly as the typing does: as the float. Every operator kind, and both orders, since each side is
+// folded on its own and the pair is met from either end.
+
+@test("an integer literal beside a float constant is the float, in either order, under every operator")
+cst_an_integer_literal_beside_a_float_constant()
+    if !cst_ready() then return
+
+    assert_eq(cst_ran(raw"""
+        const h = 0.5
+        const a = 4 * h
+        const b = h * 4
+        const c = 3 + h
+        const d = h - 3
+        const e = 1 / h
+        const f = h / 4
+        const g = (1 + 3) * h
+        const lt = 3 < h
+        const ge = h >= 0
+        const eq = h == 1
+        const ne = 1 != h
+
+        print(a, b, c, d, e, f, g, lt, ge, eq, ne)
+        """), "2 2 3.5 -2.5 2 0.125 2 false true false true\n")
+
+@test("and through constants written in terms of each other")
+cst_and_through_constants_written_in_terms_of_each_other()
+    if !cst_ready() then return
+
+    assert_eq(cst_ran(raw"""
+        const n3 = (n2 - 1) * 3
+        const n2 = n1 + 1
+        const n1 = 2 * h
+        const h = 0.5
+        const pi = 3.14159265358979
+        const tau = 2 * pi
+        const area = pi * 2 * 2
+
+        print(n1, n2, n3, tau, area, 4 * pi == tau * 2)
+        """), "1 2 3 6.28318530717958 12.56637061435916 true\n")
+
+@test("at the float's own width")
+cst_at_the_floats_own_width()
+    if !cst_ready() then return
+
+    assert_eq(cst_ran(raw"""
+        const q: f32 = 1.5
+        const r = 2 * q
+        const s: f64 = 0.25
+        const t = s * 8
+        const w: real = 4 * s
+
+        print(r, t, w)
+        """), "3 2 1\n")
+
+@test("inside a body, beside a constant that is an array's length")
+cst_inside_a_body_beside_an_array_length()
+    if !cst_ready() then return
+
+    assert_eq(cst_ran(raw"""
+        const pi = 3.14159265358979
+        const len = 3
+
+        main()
+            const k = 4 * pi
+            var cells: [len * 2]u8
+
+            print(k > 12, k, cells.len)
+        """), "true 12.56637061435916 6\n")
+
+// The integer half of the same reading: a literal beside an integer constant takes its width.
+@test("an integer literal beside an integer constant takes its width, at every width")
+cst_an_integer_literal_takes_the_constants_width()
+    if !cst_ready() then return
+
+    assert_eq(cst_ran(raw"""
+        const a: u8 = 200
+        const b: i8 = -100
+        const c: i16 = 1000
+        const d: u16 = 60000
+        const e: i32 = 100000
+        const f: u32 = 4000000000
+        const g: i64 = 5
+        const h: u64 = 18000000000000000000
+        const i: usize = 60
+        const j: isize = -60
+
+        print(a + 50, b - 28, c * 3, d + 5000, e * 2, f + 1, g * 7, h + 1, i + 1, j - 1)
+        """), "250 -128 3000 65000 200000 4000000001 35 18000000000000000001 61 -61\n")
+
+@test("and a value the width does not hold is refused where the constant is declared")
+cst_a_value_the_width_does_not_hold_is_refused()
+    if !cst_ready() then return
+
+    cst_refuses(cst_ran("const b: u8 = 200\nconst c = b + 100\n\nprint(c)\n"), "'c' does not fit byte: 300")
+
+// `reference/modules.md § const — a value`: a constant written with no type is an `int`, and is not
+// read at the type a place wants. So it is refused where a value of another width is wanted, a
+// declared type governing in the same way.
+@test("an integer constant is an int where a value of another width is wanted")
+cst_an_integer_constant_is_an_int_where_another_width_is_wanted()
+    if !cst_ready() then return
+
+    cst_refuses(cst_ran("const big = 300\n\nmain()\n    val x: u8 = big\n    print(x)\n"),
+                "cannot initialize 'x': declared u8 but the value is int")
+    cst_refuses(cst_ran("const n: int = 60\n\nmain()\n    val x: usize = n\n    print(x)\n"),
+                "cannot initialize 'x': declared usize but the value is int")
+    cst_refuses(cst_ran("import sysl.math.min\n\nconst line_len = 60\n\nmain()\n    val n: usize = 100\n" +
+                        "    print(min(n, line_len))\n"),
+                "'b' of 'sysl.math.min' is usize, but int was given")
+
 // -- a constant may be an array bound -------------------------------------------------------------
 
 @test("which is the whole reason for the declaration")

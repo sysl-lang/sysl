@@ -460,6 +460,65 @@ array_hash_is_ordered()
 
     assert(a.hash() != b.hash())
 
+// -- the integer mixer spreads every shape of key over a table's low bits -------------------------
+//
+// A table indexes by the hash's low bits, so what is asserted is how many of 1024 buckets 1024 keys
+// of one shape reach. Thrown at random they reach about 647; a mixer whose low bits ignore part of
+// the key reaches a handful. The shapes are a counter, a counter in a middle field, keys that differ
+// only in their top bits, and a counter scaled by the table's own size.
+
+private buckets_reached(shift: u64, stride: u64) -> int
+    var seen: [1024]bool = [false; 1024]
+    var reached = 0
+
+    for i in 0..<1024u64
+        val b = usize(hash_u64((i * stride) << shift) & 1023)
+
+        if !seen[b]
+            seen[b] = true
+            reached += 1
+
+    reached
+
+@test("consecutive integers spread over a table's low bits")
+hash_spreads_a_counter()
+    assert(buckets_reached(0, 1) >= 600)
+
+@test("and so do keys that differ only in a middle field")
+hash_spreads_a_middle_field()
+    assert(buckets_reached(20, 1) >= 600)
+    assert(buckets_reached(32, 1) >= 600)
+
+@test("and keys that differ only in their top bits, which a low-half multiply would bucket together")
+hash_spreads_the_top_bits()
+    assert(buckets_reached(48, 1) >= 600)
+    assert(buckets_reached(54, 1) >= 600)
+
+@test("and a counter scaled by the table's own size")
+hash_spreads_a_scaled_counter()
+    assert(buckets_reached(0, 1024) >= 600)
+    assert(buckets_reached(0, 4096) >= 600)
+
+@test("zero and one do not hash to themselves, nor to a multiple of a small table")
+hash_of_zero_and_one_is_mixed()
+    assert(hash_u64(0) != 0)
+    assert(hash_u64(0) % 8 != 0)
+    assert(hash_u64(1) != 1)
+    assert(hash_u64(0) != hash_u64(1))
+
+@test("integers up to 64 bits hash alike across widths, and a 128-bit one by both halves")
+hash_widths_agree()
+    assert_eq(300u16.hash(), 300i64.hash())
+    assert_eq(7u8.hash(), hash_u64(7))
+    assert(u128(1).hash() != (u128(1) << 64).hash())
+    assert(u128(1).hash() != u128(2).hash())
+
+private const hashed_while_compiling: u64 = hash_u64(0xdeadbeef)
+
+@test("the mixer answers the same while compiling as running")
+hash_while_compiling()
+    assert_eq(hashed_while_compiling, hash_u64(0xdeadbeef))
+
 // `assert_eq` is what the whole block is for: a bare `bool` says a comparison failed and neither of
 // the two sequences that disagreed, which is most of what the assertion is worth.
 @test("a sequence is what assert_eq takes now, and it renders on failure")

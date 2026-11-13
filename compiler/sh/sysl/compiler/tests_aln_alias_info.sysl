@@ -1,0 +1,472 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// What the emitted IR tells LLVM about which memory can be the same, where the language already knows.
+//
+// - **A checked element is `inbounds`** (`emit_place.sysl`'s `element_gep`): the check has shown the
+//   index is inside storage that really has that many elements, so the arithmetic cannot wrap, and
+//   LLVM can tell `xs[i].a` from `xs[j].b` by their offsets modulo the stride. An `@unchecked`
+//   subscript and a `*T`'s, which has no length, say nothing.
+// - **A field of an element, or of what a pointer points at, is read where it lies** (`gen_field`):
+//   one `double`, not the whole struct with the field lifted out.
+// - **A `string` parameter whose bytes the body subscripts is `noalias`** (`emit_disjoint.sysl`'s
+//   `read_string_params`): nothing writes a string's bytes while it is alive, so a write through a
+//   pointer in the same loop is not a write to them.
+//
+// The text shows the marks; clang's `-O2` shows what they buy; a run shows nothing else changed.
+
+private var aln_library_cache: Buf[Program] = buf()
+private var aln_library_read: bool = false
+
+private aln_library() -> Buf[Program]
+    if aln_library_read then return aln_library_cache
+
+    aln_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> aln_library_cache = units
+
+    aln_library_cache
+end aln_library
+
+private aln_no_library() -> bool
+    if aln_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end aln_no_library
+
+// The LLVM text of the whole module a source lowers to, or the first thing it was refused with.
+private aln_ir(text: string) -> string
+    val parsed = parse(source_of("t.sysl", text))
+
+    if !parsed.ok() then return parsed.first().message
+
+    var units: Buf[Program] = buf()
+
+    for item in aln_library()
+        units.push(item)
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if !done.reported.is_empty() then return done.reported[0].diag.message
+
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+    val said = errors_of(done.an.diagnostics())
+
+    if !said.is_empty() then return analysis_report(said)
+
+    val kept = prune(strip_tests(whole), program_own(units))
+    val lowered = codegen_with_gaps(kept, host_target(), promotions)
+
+    ir_print_module(lowered.0)
+end aln_ir
+
+// What clang's `-O2` leaves of a program, or `None` where there is no clang to ask.
+private aln_optimized(text: string) -> Option[string]
+    if !clang_available()
+        print("skipped: clang is not installed, so there is no optimizer to ask")
+        return None
+    end if
+
+    val dir = make_temp_dir("sysl-aln").unwrap()
+    val file = s"$dir/t.ll"
+
+    write_text(file, aln_ir(text)).unwrap()
+
+    val got = capture("clang", ["-O2", "-S", "-emit-llvm", "-o", "-", file], "", [], true).unwrap()
+
+    remove_dir_all(dir).unwrap_or(())
+    assert(got.status.ok(), s"clang refused the emitted IR:\n${got.err.unwrap_or("")}")
+    Some(got.text)
+end aln_optimized
+
+// The `define` line holding `name`, or the empty string.
+private aln_define(out: string, name: string) -> string
+    for l in lines_of(out)
+        if l.starts_with("define") && l.contains(name) then return l
+
+    ""
+end aln_define
+
+// The bodies of every function whose `define` line holds `name`.
+private aln_bodies(out: string, name: string) -> Buf[string]
+    var found: Buf[string] = buf()
+    var body = ""
+    var inside = false
+
+    for l in lines_of(out)
+        if !inside && l.starts_with("define") && l.contains(name) then inside = true
+
+        if inside
+            if l == "}"
+                found.push(body)
+                body = ""
+                inside = false
+            else
+                body = body + l + "\n"
+        end if
+
+    found
+end aln_bodies
+
+// The body of the first function whose `define` line holds `name`.
+private aln_body(out: string, name: string) -> string
+    val all = aln_bodies(out, name)
+
+    if all.is_empty() then "" else all[0]
+end aln_body
+
+// How many times `part` occurs in `text`.
+private aln_count(text: string, part: string) -> int
+    var n = 0
+
+    for l in lines_of(text)
+        if l.contains(part) then n += 1
+
+    n
+end aln_count
+
+// The kernels as a module, for the IR; a program run from a file at a project's root names no module.
+private aln_kernels() -> string = "module demo\n\n" + aln_kernel_text()
+
+private aln_kernel_text() -> string = raw"""
+    struct Body
+        x: real
+        y: real
+        mass: real
+
+    struct Cell
+        n: int
+
+    @noinline
+    pull(bodies: []Body, dt: real)
+        for i in 0..<bodies.len
+            for j in i + 1..<bodies.len
+                val d = bodies[i].x - bodies[j].x
+
+                bodies[i].y -= d * bodies[j].mass * dt
+                bodies[j].y += d * bodies[i].mass * dt
+
+    @noinline
+    pick(xs: []const int, i: usize) -> int = xs[i]
+
+    @noinline
+    pick_byte(xs: []const u8, i: usize) -> u8 = xs[i]
+
+    @noinline
+    pick_float(xs: []const f32, i: usize) -> f32 = xs[i]
+
+    @noinline
+    pick_char(s: string, i: usize) -> u8 = s.bytes[i]
+
+    @noinline
+    pick_grid(xs: []const [4]i16, i: usize, j: usize) -> i16 = xs[i][j]
+
+    @noinline
+    pick_raw(p: *int, i: usize) -> int = p[i]
+
+    @noinline
+    pick_unchecked(xs: []const int, i: usize) -> int
+        var r = 0
+
+        @unchecked
+            r = xs[i]
+
+        r
+
+    @noinline
+    put(bodies: []Body, i: usize, v: real)
+        bodies[i].y = v
+
+    @noinline
+    first[T](xs: []const T) -> T = xs[0]
+
+    @noinline
+    through(c: *Cell) -> int = c.n
+
+    @noinline
+    fold(s: string, n: *int)
+        for i in 0..<s.len
+            *n = *n *% 31 +% int(s.bytes[i])
+
+    @noinline
+    fold_bytes(s: []const u8, n: *int)
+        for i in 0..<s.len
+            *n = *n *% 31 +% int(s[i])
+
+    @noinline
+    measure(s: string) -> usize = s.len
+
+    main()
+        var bodies = [Body(0.0, 0.0, 1.0), Body(1.0, 0.0, 2.0), Body(3.0, 0.0, 4.0)]
+        val ints = [10, 20, 30]
+        val bytes: [3]u8 = [1, 2, 3]
+        val floats: [2]f32 = [1.5, 2.5]
+        val grid: [2][4]i16 = [[1, 2, 3, 4], [5, 6, 7, 8]]
+        var cell = Cell(9)
+        var held = 5
+        var n = 0
+        var m = 0
+
+        pull(bodies, 0.5)
+        put(bodies, 2, 7.0)
+        fold("abc", &n)
+        fold_bytes("abc".bytes, &m)
+        print(bodies[0].y, bodies[1].y, bodies[2].y)
+        print(pick(ints, 1), pick_byte(bytes[..], 2), pick_float(floats[..], 1), pick_char("xyz", 2))
+        print(pick_grid(grid[..], 1, 2), pick_raw(&held, 0), pick_unchecked(ints, 2))
+        print(first(ints), first(floats[..]), through(&cell), n, m, measure("four"))
+    """
+
+// -- `inbounds` ----------------------------------------------------------------------------------------
+
+@test("a checked element of a view is an 'inbounds' step, at every element width")
+aln_checked_element_is_inbounds()
+    if aln_no_library() then return
+
+    val out = aln_ir(aln_kernels())
+
+    assert(aln_body(out, "demo$pick(").contains("getelementptr inbounds i"), out)
+    assert(aln_body(out, "demo$pick_byte(").contains("getelementptr inbounds i8, ptr"), out)
+    assert(aln_body(out, "demo$pick_float(").contains("getelementptr inbounds float, ptr"), out)
+    // A string's bytes are read in the body its parameter is split into (below).
+    assert(aln_body(out, "demo$pick_char.disjoint(").contains("getelementptr inbounds i8, ptr"), out)
+end aln_checked_element_is_inbounds
+
+@test("an element of a struct view is 'inbounds' whether it is read or written")
+aln_struct_elements_are_inbounds()
+    if aln_no_library() then return
+
+    val out = aln_ir(aln_kernels())
+    val pull = aln_body(out, "demo$pull(")
+    val put = aln_body(out, "demo$put(")
+
+    assert(aln_count(pull, "getelementptr inbounds %struct.") >= 6, pull)
+    assert(put.contains("getelementptr inbounds %struct."), put)
+
+    // Every plain step left is a field's, `0` then the field: no element step is plain.
+    for l in lines_of(pull + put)
+        if l.contains("= getelementptr %struct.") then assert(l.contains(", i32 0, i32 "), l)
+end aln_struct_elements_are_inbounds
+
+@test("both steps into an array held in a view are 'inbounds'")
+aln_nested_array_is_inbounds()
+    if aln_no_library() then return
+
+    val out = aln_ir(aln_kernels())
+    val grid = aln_body(out, "demo$pick_grid(")
+
+    assert(aln_count(grid, "getelementptr inbounds ") >= 2, grid)
+end aln_nested_array_is_inbounds
+
+@test("every instantiation of a generic indexes 'inbounds'")
+aln_generic_is_inbounds()
+    if aln_no_library() then return
+
+    val out = aln_ir(aln_kernels())
+    val firsts = aln_bodies(out, "demo$first")
+
+    assert(firsts.len() == 2, out)
+
+    for item in firsts
+        assert(item.contains("getelementptr inbounds "), item)
+end aln_generic_is_inbounds
+
+@test("an unchecked subscript and a raw pointer's say nothing: their steps are plain")
+aln_unchecked_is_plain()
+    if aln_no_library() then return
+
+    val out = aln_ir(aln_kernels())
+    val raw_body = aln_body(out, "demo$pick_raw(")
+    val unchecked = aln_body(out, "demo$pick_unchecked(")
+
+    assert(raw_body.contains("getelementptr i"), raw_body)
+    assert(!raw_body.contains("inbounds"), raw_body)
+    assert(unchecked.contains("getelementptr i"), unchecked)
+    assert(!unchecked.contains("inbounds"), unchecked)
+    assert(!unchecked.contains("sysl_bounds_fail"), unchecked)
+end aln_unchecked_is_plain
+
+// -- a field read where it lies ----------------------------------------------------------------------
+
+@test("a field of an element, or of what a pointer points at, is loaded alone, never the whole struct")
+aln_field_is_loaded_alone()
+    if aln_no_library() then return
+
+    val out = aln_ir(aln_kernels())
+    val pull = aln_body(out, "demo$pull(")
+    val through = aln_body(out, "demo$through(")
+
+    assert(!pull.contains("load %struct."), pull)
+    assert(pull.contains("load double, ptr"), pull)
+    assert(!through.contains("load %struct."), through)
+    assert(through.contains("load i"), through)
+end aln_field_is_loaded_alone
+
+@test("at -O2 the fields of the outer element are read once per outer step, not after every write")
+aln_outer_element_is_hoisted()
+    if aln_no_library() then return
+
+    aln_optimized(aln_kernels()) match
+        None -> ()
+        Some(opt) ->
+            val pull = aln_body(opt, "@\"demo$pull\"(")
+
+            // Without `inbounds` every read of `bodies[i].mass` and `bodies[j].mass` sits after a
+            // write to a `y` the optimizer could not tell apart from it, so each is loaded again; with
+            // it, `bodies[i]`'s `x` and `mass` are loaded once ahead of the inner loop, and the inner
+            // loop loads `bodies[j]`'s two fields and the `y` it updates of each.
+            assert(aln_count(pull, "load double") <= 6, pull)
+end aln_outer_element_is_hoisted
+
+// -- a `string` parameter ----------------------------------------------------------------------------
+
+@test("a string parameter whose bytes are subscripted is split, its element address 'noalias'")
+aln_read_string_is_noalias()
+    if aln_no_library() then return
+
+    val out = aln_ir(aln_kernels())
+    val outer = aln_define(out, "demo$fold(")
+    val inner = aln_define(out, "demo$fold.disjoint(")
+
+    assert(outer.contains("({ ptr, ptr, i64 } %s.param, ptr %n.param)"), out)
+    assert(inner.starts_with("define internal void "), inner)
+    assert(inner.contains("(ptr %s.part.0, ptr noalias %s.part.1, i64 %s.part.2, ptr %n.param)"), inner)
+    assert(inner.contains("alwaysinline"), inner)
+end aln_read_string_is_noalias
+
+@test("a string parameter the body never subscripts, and a view of bytes, are left whole")
+aln_other_parameters_left_whole()
+    if aln_no_library() then return
+
+    val out = aln_ir(aln_kernels())
+
+    assert(!out.contains("measure.disjoint"), out)
+    assert(!out.contains("fold_bytes.disjoint"), out)
+    assert(!aln_define(out, "demo$fold_bytes(").contains("noalias"), out)
+end aln_other_parameters_left_whole
+
+@test("at -O2 a state kept through a pointer stays in a register across the string's bytes")
+aln_string_loop_keeps_the_state()
+    if aln_no_library() then return
+
+    aln_optimized(aln_kernels()) match
+        None -> ()
+        Some(opt) ->
+            val marked = aln_body(opt, "@\"demo$fold\"(")
+            val plain = aln_body(opt, "@\"demo$fold_bytes\"(")
+
+            // The state is stored once, when the loop is done; through a byte view that may be the
+            // state's own bytes, it is stored at every step, inside the loop.
+            assert(aln_count(marked, "store i32") == 1, marked)
+            assert(!aln_stores_in_a_loop(marked), marked)
+            assert(aln_stores_in_a_loop(plain), plain)
+end aln_string_loop_keeps_the_state
+
+// Whether a block holding a `store` branches back to itself: a store made at every step of a loop.
+private aln_stores_in_a_loop(body: string) -> bool
+    var label = ""
+    var stores = false
+
+    for l in lines_of(body)
+        if !l.starts_with(" ") && l.contains(":")
+            label = l[0..<l.index_of(":").unwrap()]
+            stores = false
+        else if l.contains("store ")
+            stores = true
+        else if stores && l.contains("br ") && l.contains(s"label %$label")
+            return true
+        end if
+
+    false
+end aln_stores_in_a_loop
+
+// -- nothing else changed ----------------------------------------------------------------------------
+
+private struct AlnRun
+    ok: bool
+    out: string
+    err: string
+
+private aln_run(text: string, level: string) -> AlnRun
+    val root = make_temp_dir("sysl-aln").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val built = build_native_program(s"$root/main.sysl", None, None, level, Some(s"$root/built"))
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return AlnRun(false, failure_text(why), "")
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> AlnRun(false, "could not be started", "")
+        Ok(o) -> AlnRun(o.status.ok(), o.text, o.err.unwrap_or(""))
+end aln_run
+
+@test("every kernel answers the same at -O0 and -O2")
+aln_kernels_run()
+    val want = "7 3.5 7\n20 3 2.5 122\n7 5 30\n10 1.5 9 96354 96354 4\n"
+
+    for level in ["0", "2"]
+        val got = aln_run(aln_kernel_text(), level)
+
+        assert(got.ok, s"-O$level: ${got.out}${got.err}")
+        assert(got.out == want, s"-O$level: ${got.out}")
+end aln_kernels_run
+
+@test("an element past the end still stops the program with its report, at -O2")
+aln_past_the_end_still_traps()
+    val got = aln_run(raw"""
+        @noinline
+        pick(xs: []const real, i: usize) -> real = xs[i]
+
+        main(args: []string)
+            val xs = [1.0, 2.0, 3.0]
+
+            print(pick(xs, args.len + 4))
+        """, "2")
+
+    assert(!got.ok, got.out)
+    assert(got.err.contains("index 5 out of bounds for length 3"), got.out + got.err)
+end aln_past_the_end_still_traps
+
+@test("a string parameter read past its end still stops the program, at -O2")
+aln_string_past_the_end_still_traps()
+    val got = aln_run(raw"""
+        @noinline
+        last(s: string, n: *int)
+            for i in 0..s.len
+                if s.bytes[i] == 97 then *n += 1
+
+        main()
+            var n = 0
+
+            last("abc", &n)
+            print(n)
+        """, "2")
+
+    assert(!got.ok, got.out)
+    assert(got.err.contains("index 3 out of bounds for length 3"), got.err)
+end aln_string_past_the_end_still_traps

@@ -272,19 +272,30 @@ element_addr(e: *Emit, receiver: TExpr, index: TExpr, site: Span) -> Val
     val i = widen_index(e, index, site)
 
     // Inside `@unchecked` the subscript is the address and nothing else (`unchecked.sysl`).
-    if !unchecked_index(index)
-        parts.1 match
-            Some(l) -> bounds_check(e, i, l, signed_index(index), site)
-            None -> ()
+    val checked = !unchecked_index(index) && parts.1.is_some()
 
+    if checked then bounds_check(e, i, parts.1.unwrap(), signed_index(index), site)
+
+    element_gep(e, parts.2, parts.0, i, checked)
+end element_addr
+
+// The address of element `i` of the storage at `base`. **A checked element is `inbounds`**: the check
+// has just shown `i` is below a length the storage really has, so the step stays inside one object
+// and its arithmetic cannot wrap -- which is what lets LLVM see that `xs[i].a` and `xs[j].b` are
+// different bytes whatever `i` and `j` are, and keep one in a register across a write to the other.
+// An unchecked one -- `@unchecked`, or a `*T`, which has no length -- says nothing.
+element_gep(e: *Emit, elem: Type, base: Val, i: Val, checked: bool) -> Val
     val r = fresh_reg(e)
 
     var idx: Buf[IrArg] = buf()
 
     idx.push(ir_arg(word_lty(e), i))
-    emit(e, InGep(r, stride_lty(e, parts.2), parts.0, idx))
+
+    if checked then emit(e, InGepInBounds(r, stride_lty(e, elem), base, idx))
+    else emit(e, InGep(r, stride_lty(e, elem), base, idx))
+
     r
-end element_addr
+end element_gep
 
 // The address a run of `lanes` elements starts at, after checking that the whole run exists.
 //
@@ -880,15 +891,12 @@ address_owned(e: *Emit, place: TExpr) -> (Val, Val)
                 emit(e, InExtract(l, wty, v, index_list(2)))
 
                 val i = widen_index(e, index, root.unwrap().span)
+                val checked = !unchecked_index(index)
 
-                if !unchecked_index(index) then bounds_check(e, i, l, signed_index(index), root.unwrap().span)
+                if checked then bounds_check(e, i, l, signed_index(index), root.unwrap().span)
 
-                val at = fresh_reg(e)
+                val at = element_gep(e, texpr_type(root.unwrap()), p, i, checked)
 
-                var idx: Buf[IrArg] = buf()
-
-                idx.push(ir_arg(word_lty(e), i))
-                emit(e, InGep(at, stride_lty(e, texpr_type(root.unwrap())), p, idx))
                 return (o, address_under(e, place, root.unwrap(), at))
             _ -> ()
 
@@ -921,17 +929,11 @@ private address_under(e: *Emit, place: TExpr, root: TExpr, at: Val) -> Val
                 _ -> (long(0), int_type())
             val base = address_under(e, r, root, at)
             val i = widen_index(e, index, place.span)
+            val checked = !unchecked_index(index)
 
-            if !unchecked_index(index) then
-                bounds_check(e, i, VInt(from_int(parts.0)), signed_index(index), place.span)
+            if checked then bounds_check(e, i, VInt(from_int(parts.0)), signed_index(index), place.span)
 
-            val x = fresh_reg(e)
-
-            var idx: Buf[IrArg] = buf()
-
-            idx.push(ir_arg(word_lty(e), i))
-            emit(e, InGep(x, stride_lty(e, parts.1), base, idx))
-            x
+            element_gep(e, parts.1, base, i, checked)
 
         _ -> address(e, place)
 end address_under
