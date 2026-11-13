@@ -1377,7 +1377,12 @@ end rounding_mode
 
 private refusal(asked: Option[string], from: Type, to: Type) -> string = asked match
     Some(name) -> s"cannot make $name from ${type_show(from)}"
-    None -> s"cannot convert ${type_show(from)} to ${type_show(to)}"
+    None -> s"cannot convert ${type_show(from)} to ${type_show(to)}${truth_hint(from, to)}"
+
+// An integer has no truth of its own to convert; the comparison that gives it one is the fix.
+private truth_hint(from: Type, to: Type) -> string = (underlying(from), underlying(to)) match
+    (Integer(_, _, _), Bool) -> " — write 'x != 0'"
+    _ -> ""
 
 private converts(cx: &Analyzer, span: Span, from: Type, to: Type) -> bool
     // **A type parameter standing in for itself admits every conversion, and the check is not
@@ -1412,6 +1417,15 @@ private converts(cx: &Analyzer, span: Span, from: Type, to: Type) -> bool
         Char -> to match
             Integer(_, _, _) -> return true
             Char -> return true
+            _ -> return false
+        // A `bool` is `1` or `0` at every integer width, and is no number to anything else. The way
+        // back is a comparison, `n != 0`, never a conversion.
+        Bool -> to match
+            Integer(bits, signed, _) ->
+                if bits == 1 && signed then
+                    cx.fault(span, s"cannot convert bool to ${type_show(to)} — an i1 cannot hold 1; use u1")
+
+                return true
             _ -> return false
         // Enum to integer is total: every enum value is one of its declared discriminants. Only a
         // simple enum has an integer value to give; a data enum is a tagged union, not a number.

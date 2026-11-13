@@ -1013,6 +1013,29 @@ target_for(path: string, named_target: Option[string]) -> Result[Target, Refusal
 
     use_codegen_features(features)
 
+    // **The processor** (`--cpu`): `native` is this machine's and so only for this machine; a name is
+    // asked of the back end that will compile it.
+    use_cpu("", buf())
+
+    cpu_flag() match
+        None -> ()
+        Some(asked) ->
+            val clang = find_clang(t, named_cc()) match
+                Err(why) -> return Err(Refusal(s"cannot check '--cpu': $why"))
+                Ok(found) -> found
+
+            if asked == "native"
+                if t.triple != host_target().triple then return Err(Refusal(cpu_native_cross_refusal(t)))
+
+                host_cpu(t, clang) match
+                    Err(why) -> return Err(Refusal(why))
+                    Ok(found) -> use_cpu(found.0, found.1)
+            else
+                cpu_name_refusal(t, clang, asked) match
+                    Some(why) -> return Err(Refusal(why))
+                    None -> use_cpu(asked, buf())
+            end if
+
     // The machine as the project describes it, which is what the analysis holds a module to.
     Ok(as_declared(manifest, t))
 end target_for
