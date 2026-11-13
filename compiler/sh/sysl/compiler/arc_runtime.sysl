@@ -25,6 +25,10 @@ module sh.sysl.compiler
 // hit zero drains the list in a loop: each destructor it runs pushes more work rather than
 // recursing, so teardown depth is constant regardless of structure depth.
 //
+// **A hook is handed the drain's slot**, as its third argument, and its walk queues what it lets go
+// of there itself (`arc.push`), or frees on the spot a box with nothing in it left to tear down
+// (`emit_arc.sysl`'s `gen_push`). The free phase, reached from `arc.unshare`, is handed none.
+//
 // **The worklist is per thread, because it is scratch space and not shared state.** Two threads
 // releasing the last reference to two unrelated `&sync` structures at the same moment both reach
 // `arc.reap`, and one list between them would have each overwrite the other's head. So the head and
@@ -101,14 +105,14 @@ arc_core(t: Target, reaper_exported: bool, switches: bool = false) -> string
     "  ret void\n" +
     "}\n" +
     "\n" +
-    "define private void @arc.destroy(ptr %p) {\n" +
+    "define private void @arc.destroy(ptr %p, ptr %s) {\n" +
     "entry:\n" +
     "  %h = getelementptr %arc.header, ptr %p, i32 0, i32 1\n" +
     "  %f = load ptr, ptr %h\n" +
     "  %none = icmp eq ptr %f, null\n" +
     "  br i1 %none, label %after, label %run\n" +
     "run:\n" +
-    "  call void %f(ptr %p, i1 false)\n" +
+    "  call void %f(ptr %p, i1 false, ptr %s)\n" +
     "  br label %after\n" +
     "after:\n" +
     "  call void @arc.unshare(ptr %p)\n" +
@@ -129,7 +133,7 @@ arc_core(t: Target, reaper_exported: bool, switches: bool = false) -> string
     "  %none = icmp eq ptr %f, null\n" +
     "  br i1 %none, label %kept, label %give\n" +
     "give:\n" +
-    "  call void %f(ptr %p, i1 true)\n" +
+    "  call void %f(ptr %p, i1 true, ptr null)\n" +
     "  ret void\n" +
     "kept:\n" +
     "  ret void\n" +
@@ -159,7 +163,7 @@ arc_core(t: Target, reaper_exported: bool, switches: bool = false) -> string
     "  %next = load ptr, ptr %q\n" +
     "  store ptr %next, ptr %head\n" +
     s"  store $word 0, ptr %q\n" +
-    "  call void @arc.destroy(ptr %q)\n" +
+    s"  call void @arc.destroy(ptr %q, ptr $slot)\n" +
     "  %h0 = load ptr, ptr %head\n" +
     "  br label %turn\n" +
     // **What one teardown pushed is turned around before the next is popped**, so the list gives
@@ -198,6 +202,28 @@ arc_core(t: Target, reaper_exported: bool, switches: bool = false) -> string
     "  br i1 %z, label %reap, label %live\n" +
     "reap:\n" +
     "  call void @arc.reap(ptr %p)\n" +
+    "  ret void\n" +
+    "live:\n" +
+    "  ret void\n" +
+    "}\n" +
+    "\n" +
+    // **A release made by a hook's own walk is queued on the slot the drain handed the hook.** The
+    // drain is running -- that is the only place a hook's walk runs -- so `arc.reap` would find the
+    // flag set and do nothing but this push, after asking for the thread's slot again.
+    "define private void @arc.push(ptr %p, ptr %s) {\n" +
+    "entry:\n" +
+    "  %null = icmp eq ptr %p, null\n" +
+    "  br i1 %null, label %live, label %count\n" +
+    "count:\n" +
+    s"  %c = load $word, ptr %p\n" +
+    s"  %n = sub $word %c, 1\n" +
+    s"  store $word %n, ptr %p\n" +
+    s"  %z = icmp eq $word %n, 0\n" +
+    "  br i1 %z, label %queue, label %live\n" +
+    "queue:\n" +
+    "  %w = load ptr, ptr %s\n" +
+    "  store ptr %w, ptr %p\n" +
+    "  store ptr %p, ptr %s\n" +
     "  ret void\n" +
     "live:\n" +
     "  ret void\n" +

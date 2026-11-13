@@ -1665,7 +1665,7 @@ a module `var`, or a local the body stores into. A `val` holding the box is the 
 struct Ring
     samples: [8]i16
 
-recent(r: &sync Ring) -> []i16 = r.samples[2..<5]
+recent(r: &sync Ring) -> []const i16 = r.samples[2..<5]
 
 val r: &sync Ring = Ring([1, 2, 3, 4, 5, 6, 7, 8])
 print(recent(r).len)
@@ -1675,14 +1675,15 @@ print(recent(r).len)
 a view of storage inside a '&sync Ring' is returned, but such a view takes no count of the box — a count update through it would not be atomic — so it may only be lent: handed to a call that borrows it, or held in a local of this body. Copy the elements into an array of their own to keep them
 ```
 
-An index and a walk take no view at all, so both work through the same box anywhere:
+An index and a walk take no view at all, so both work through the same box anywhere. Such a view is
+a `[]const T`, and an element is not written through the box, since a field reached through a `&sync`
+is [read-only](/reference/memory/#sync-t-t-and-t):
 
 ```sysl
 struct Ring
     samples: [8]i16
 
 val r: &sync Ring = Ring([1, 2, 3, 4, 5, 6, 7, 8])
-r.samples[3] = 40
 
 var sum = 0
 for x in r.samples
@@ -1692,7 +1693,7 @@ print(r.samples[3], sum)
 ```
 
 ```output
-40 72
+4 36
 ```
 
 A bit like the read-only one could not make such a view counted, because the two properties are
