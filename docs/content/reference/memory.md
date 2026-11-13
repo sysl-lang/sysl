@@ -3041,6 +3041,10 @@ value. Values, fixed arrays and `*T` buffers carry no header.
 
 **Teardown is iterative**: an object reaching zero is pushed onto a per-thread worklist through its
 dead count slot, and the first release to hit zero drains it, so any depth comes apart in O(1) stack.
+Inside the drain, a reference the object held is queued on that same list directly, and one whose
+object has nothing left to tear down — no counted field, no destructor, an enum variant that holds
+nothing, and no weak reference out — is freed on the spot, so the leaves of a tree never reach the
+list at all.
 **On a freestanding target the worklist is asked for**: a `&sync` release reaching zero fetches it
 through the weak symbol `__sysl_arc_reaper`, answering a `head` pointer and a `draining` flag of the
 running task. Define nothing and the single built-in slot serves a machine where nothing schedules; an

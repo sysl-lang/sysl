@@ -194,15 +194,17 @@ akr_a_parameter_is_free_and_a_result_is_counted()
     assert_eq(entry, "")
 
 // The hook is asked which of its two jobs is wanted: walking the payload and giving the storage back
-// happen at different moments, so the walk ends in `ret void` and the free is the other arm.
+// happen at different moments, so the walk ends in `ret void` and the free is the other arm. The walk
+// is written in the hook itself and queues on the drain's slot it is handed.
 @test("a destructor lets go of what the payload held, and leaves the storage to whoever is last")
 akr_a_destructor_walks_and_leaves_the_storage()
     if akr_no_library() then return
 
     val out = akr_ir(akr_linked() + "var n: &Node = Node(1, None)")
 
-    akr_has(out, "define private void @arc.drop.Node(ptr %p, i1 %storage) {")
-    akr_has(out, "  call void @arc.dispose.Node(%struct.Node %t2)\n  ret void\n")
+    akr_has(out, "define private void @arc.drop.Node(ptr %p, i1 %storage, ptr %slot) {")
+    akr_has(out, "  %t2 = load %struct.Node, ptr %t1\n  %t3 = extractvalue %struct.Node %t2, 1\n")
+    akr_has(out, ", ptr %slot)\n  br label %arc.done")
     akr_has(out, "call void @free(ptr %p)")
     akr_has(out, "store ptr @arc.drop.Node, ptr")
 
@@ -222,7 +224,7 @@ akr_copying_an_aggregate_shares_its_references()
 akr_a_data_enum_walks_behind_a_tag_test()
     if akr_no_library() then return
 
-    val out = akr_ir(akr_linked() + "var n: &Node = Node(1, None)")
+    val out = akr_ir(akr_linked() + "var n: &Node = Node(1, None)\nvar o: Option[&Node] = Some(n)\n\no = None\n")
 
     akr_has(out, "define private void @arc.dispose.sysl$Option.ref.Node(%enum.sysl$Option.ref.Node %v) {")
     akr_has(out, "  %t1 = extractvalue %enum.sysl$Option.ref.Node %v, 0\n  %t2 = icmp eq i32 %t1, 1\n")
