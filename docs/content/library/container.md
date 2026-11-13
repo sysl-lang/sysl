@@ -107,6 +107,34 @@ true false
 `get` answers an `Option` because a missing key is an ordinary question rather than a mistake, and
 `remove` answers whether the key was there — so the second call reports `false` without failing.
 
+**`upsert(key, init, f)` changes a value in place**: the key is given `f` of the value it had, or
+`f(init)` where it had none. It is `put(key, f(get_or(key, init)))` in one probe of the table rather
+than two, which is what a counter or an accumulator wants:
+
+```sysl
+import sysl.container.{Map, map}
+
+main()
+    val counts: Map[string, int] = map()
+    val totals: Map[string, int] = map()
+
+    for (word, n) in [("ada", 3), ("alan", 5), ("ada", 4)]
+        counts.upsert(word, 0, _ + 1)
+        totals.upsert(word, 0, _ + n)
+
+    print(counts.get("ada"), counts.get("alan"))
+    print(totals.get("ada"), totals.get("alan"))
+```
+
+```output
+Some(2) Some(1)
+Some(7) Some(5)
+```
+
+`f` is asked exactly once, and must not change the map itself: the slot the probe found is written
+after `f` answers. Where the value is a reference type, the old value is let go as a `put` over it
+would let it go.
+
 **The annotation on `var ages` is required.** `map()` is a nullary generic, so its type arguments come
 from what receives it, and there is nothing else in that line to take them from.
 
