@@ -187,3 +187,118 @@ mhx_u8_counter_is_absorbed()
     mhx_optimized(mhx_counter("u8", "u32")) match
         None -> ()
         Some(out) -> mhx_absorbed(mhx_body(out, "demo$count"))
+
+// --- upsert: the counter in one probe ----------------------------------------------------------------
+
+// knucleotide's loop written with `upsert`, the key and value types parameters.
+private mhx_upserter(key: string, value: string) -> string =
+    s"module demo\n\nimport sysl.container.*\n\n@export\ncount(xs: *$key, n: usize) -> usize\n" +
+    s"    val m: Map[$key, $value] = map()\n\n    for i in 0..<n\n" +
+    s"        m.upsert(xs[i], 0, _ + 1)\n\n    m.len()\n"
+
+// The probe, the mixer and the closure are in the loop, which hashes once: the only call left is to
+// the slow path, for a list, the growth and a tombstone.
+private mhx_upsert_absorbed(body: string)
+    assert(!mhx_calls(body, "MapCore.upsert."), body)
+    assert(!mhx_calls(body, "Map.upsert"), body)
+    assert(!mhx_calls(body, "MapCore.find."), body)
+    assert(!mhx_calls(body, "MapCore.get."), body)
+    assert(!mhx_calls(body, "MapCore.put"), body)
+    assert(!mhx_calls(body, "hash_u64"), body)
+    assert(mhx_calls(body, "MapCore.upsert_slow."), body)
+    // The closure is specialised into the slow path's name; the only calls naming it are that path.
+    assert_eq(mhx_count(body, ["call ", "closure"]), mhx_count(body, ["call ", "MapCore.upsert_slow."]))
+    assert_eq(mhx_count(body, ["mul ", "i128"]), 1)
+end mhx_upsert_absorbed
+
+@test("a counter kept with upsert is one inlined probe, hashing once, calling only the slow path")
+mhx_u64_upsert_is_absorbed()
+    mhx_optimized(mhx_upserter("u64", "int")) match
+        None -> ()
+        Some(out) ->
+            mhx_upsert_absorbed(mhx_body(out, "demo$count"))
+            assert(mhx_attributes(out, "MapCore.upsert_slow.").contains("noinline"), out)
+
+@test("as it is for a narrower key and a wider value, and for a u8 key")
+mhx_narrow_upsert_is_absorbed()
+    mhx_optimized(mhx_upserter("i32", "i64")) match
+        None -> ()
+        Some(out) -> mhx_upsert_absorbed(mhx_body(out, "demo$count"))
+
+    mhx_optimized(mhx_upserter("u8", "u32")) match
+        None -> ()
+        Some(out) -> mhx_upsert_absorbed(mhx_body(out, "demo$count"))
+
+// The program built on the counted heap and run: what it printed and said, or the compiler's complaint.
+private mhx_counted(text: string) -> string
+    val root = make_temp_dir("sysl-mhx").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+    force_alloc_counting(true)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(s"$root/built"))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(o) -> o.text + o.err.unwrap_or("")
+end mhx_counted
+
+@test("upsert over a reference-type value gives every value back once, on every path, on the counted heap")
+mhx_upsert_drop_counted()
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return
+    end if
+
+    val text = raw"""
+        import sysl.container.*
+
+        struct Probe
+            n: int
+
+        struct Clump
+            n: int
+
+        impl Eq for Clump
+            eq(self, rhs: Clump) -> bool = self.n == rhs.n
+
+        impl Hash for Clump
+            hash(self) -> u64 = 7
+
+        main()
+            val m: Map[int, &Probe] = map()
+
+            for i in 0..<5 do m.upsert(i, Probe(0), p -> Probe(p.n + i))
+            for i in 0..<40 do m.upsert(i % 20, Probe(0), p -> Probe(p.n + 1))
+            m.upsert(3, Probe(0), p -> p)
+
+            val c: Map[Clump, &Probe] = map()
+
+            for i in 0..<12 do c.put(Clump(i), Probe(i))
+            c.remove(Clump(0))
+            c.upsert(Clump(5), Probe(0), p -> Probe(p.n * 10))
+            c.upsert(Clump(50), Probe(1), p -> Probe(p.n + 1))
+
+            var total = 0
+
+            for (k, v) in m do total += v.n
+
+            print(total, m.len(), c.get(Clump(5)).map(p -> p.n).unwrap_or(-1), c.get(Clump(50)).map(p -> p.n).unwrap_or(-1))
+        """
+    val out = mhx_counted(text)
+
+    assert(out.starts_with("50 20 50 2\n"), out)
+    assert_eq(alloc_count_reported(out), 0)
+end mhx_upsert_drop_counted

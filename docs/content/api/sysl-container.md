@@ -386,6 +386,7 @@ entry the other's count never learned of.
 | `get_or` | `const get_or(self, k: K, default: V) -> V` | The value a key names, or the one the caller supplies where it names none. |
 | `has` | `const has(self, k: K) -> bool` |  |
 | `put` | `const put(self, k: K, v: V)` | A key given a value: the entry it already had takes the new one, or a fresh entry is placed. |
+| `upsert` | `const upsert(self, k: K, init: V, f: V -> V)` | A key given `f` of the value it had, or `f(init)` where it had none -- a counter's `m.upsert(k, 0, _ + 1)`, an accumulator's `m.upsert(k, 0, _ + x)`. |
 | `remove` | `const remove(self, k: K) -> bool` | A key taken out, answering whether it was there. |
 | `clear` | `const clear(self)` | Every entry dropped and the table let go entirely; see `MapCore.clear`. |
 | `copy` | `const copy(self) -> Map[K, V]` | A second map holding the same entries, its table sized to them -- the one way to get a map that is not this one, every other way of handing a `Map` on handing on this one. |

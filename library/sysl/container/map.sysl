@@ -247,6 +247,21 @@ struct Map[K: Hash + Eq, V]
         if is_null(self.core) then unassigned(Unassigned.MapUnassigned)
         self.core.put(k, v)
 
+    /** A key given `f` of the value it had, or `f(init)` where it had none -- a counter's
+     * `m.upsert(k, 0, _ + 1)`, an accumulator's `m.upsert(k, 0, _ + x)`. It is `put(k, f(get_or(k,
+     * init)))` in one probe of the table rather than two. `f` is asked exactly once.
+     *
+     * **`f` must not change this map.** The slot the probe found is written after `f` answers, so a
+     * `put` or `remove` made from inside it may be lost or overwritten; like changing a map under a
+     * cursor, it is memory-safe and nothing more.
+     *
+     * **Always inlined**, for the reason `put` is.
+     */
+    @inline(always)
+    const upsert(self, k: K, init: V, f: V -> V)
+        if is_null(self.core) then unassigned(Unassigned.MapUnassigned)
+        self.core.upsert(k, init, f)
+
     /** A key taken out, answering whether it was there. */
     const remove(self, k: K) -> bool = !is_null(self.core) && self.core.remove(k)
 
@@ -449,6 +464,56 @@ private[container] struct MapCore[K: Hash + Eq, V]
 
         self.insert(k.hash(), k, v)
     end put_slow
+
+    /** A key given `f` of the value it had, or `f(init)` where it had none, in one probe.
+     *
+     * The shape is `put`'s, and so is what is inlined: a table with room, probed to the key's entry
+     * or to the empty slot that ends its chain, with the value `f` answers written where the probe
+     * stopped. A list, a table that must grow first, and a probe that meets a tombstone take the call
+     * to `upsert_slow`, before anything is written.
+     *
+     * The old value is read out of the slot and handed to `f`; the slot is then overwritten, which
+     * lets go of the map's own hold on the old value exactly as a `put` over it does.
+     */
+    @inline
+    upsert(*self, k: K, init: V, f: V -> V)
+        if !self.hashed() || (self.count + self.dead + 1) * load_den > self.cell.len * load_num
+            self.upsert_slow(k, init, f)
+            return
+
+        val h = k.hash()
+        val mask = self.cell.len - 1
+        var i = usize(h) & mask
+
+        loop
+            self.cell[i] match
+                Slot.Empty ->
+                    self.cell[i] = Slot.Live(h, k, f(init))
+                    self.count += 1
+                    break
+                Slot.Dead ->
+                    self.upsert_slow(k, init, f)
+                    break
+                Slot.Live(sh, sk, old) ->
+                    if sh == h && sk == k
+                        self.cell[i] = Slot.Live(h, k, f(old))
+                        break
+
+            i = (i + 1) & mask
+    end upsert
+
+    /** `upsert` into a list, into a table that has to grow, or past a tombstone: the old value found
+     * by `find`, `f` asked once, and the answer placed by `put_slow`, which grows the table or
+     * reclaims the tombstone. Never inlined, for the reason `put_slow` is not.
+     */
+    @noinline
+    private upsert_slow(*self, k: K, init: V, f: V -> V)
+        val v = self.find(k) match
+            Some(i) -> f(self.cell[i].value().unwrap_or(init))
+            None -> f(init)
+
+        self.put_slow(k, v)
+    end upsert_slow
 
     /** A key whose hash is `h` given a value, in a table that has room for one more entry, probing
      * past tombstones and placing a new key at the first one it passed.

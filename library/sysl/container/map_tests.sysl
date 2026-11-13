@@ -1,6 +1,7 @@
 module sysl.container
 @tests
 
+import sysl.buf.{Buf, buf}
 import sysl.raw.ptr_cast
 
 /** What the map promises, asserted in sysl rather than beside it in Scala.
@@ -1133,6 +1134,185 @@ private const integer_keys_while_compiling: int = counted_while_compiling(200)
 integer_table_while_compiling()
     assert_eq(integer_keys_while_compiling, counted_while_compiling(200))
     assert_eq(integer_keys_while_compiling, 1990037)
+
+// -- upsert: f of the old value, or of init, in one probe -------------------------------------------
+
+@test("upsert places f(init) for an absent key and f(old) for a present one, as a list and as a table")
+upsert_absent_and_present()
+    val m: Map[int, int] = map()
+
+    m.upsert(1, 10, _ + 1)
+    m.upsert(1, 10, _ + 1)
+    m.upsert(2, 10, _ * 3)
+
+    assert_eq(m.get(1), Some(12))
+    assert_eq(m.get(2), Some(30))
+    assert_eq(m.len(), 2)
+    assert(m.capacity() <= 8)
+
+    for i in 0..<40 do m.put(i + 100, i)
+
+    m.upsert(105, 0, _ + 1000)
+    m.upsert(7, 5, _ - 1)
+
+    assert(m.capacity() > 8)
+    assert_eq(m.get(105), Some(1005))
+    assert_eq(m.get(7), Some(4))
+    assert_eq(m.len(), 43)
+end upsert_absent_and_present
+
+@test("an upsert asks f exactly once, on every path")
+upsert_asks_once()
+    val m: Map[int, int] = map()
+    val asked: Buf[int] = buf()
+
+    for i in 0..<200
+        m.upsert(i % 50, 0, v ->
+            asked.push(i)
+            v + 1)
+
+    assert_eq(asked.len(), 200)
+    assert_eq(m.get(0), Some(4))
+    assert_eq(m.get(49), Some(4))
+end upsert_asks_once
+
+@test("a counter kept with upsert grows through every table size and stays exact")
+upsert_counting_through_growth()
+    val m: Map[u64, int] = map()
+    var key: u64 = 0
+
+    for _ in 0..<20000
+        key =(key *% 6364136223846793005 +% 1442695040888963407) & 0xfff
+        m.upsert(key, 0, _ + 1)
+
+    var total = 0
+
+    for (k, v) in m do total += v
+
+    assert_eq(total, 20000)
+    assert(m.len() <= 4096)
+    assert(m.capacity() >= m.len() * 4 / 3)
+end upsert_counting_through_growth
+
+@test("the upsert that crosses the load line grows the table and keeps every entry")
+upsert_triggers_growth()
+    val m: Map[int, int] = map_with_capacity(16)
+    var n = 0
+
+    while m.capacity() == 16
+        m.upsert(n, 0, _ + n)
+        n += 1
+
+    assert(m.capacity() > 16)
+    assert_eq(m.len(), usize(n))
+
+    for i in 0..<n do assert_eq(m.get(i), Some(i))
+end upsert_triggers_growth
+
+@test("an upsert whose probe meets a tombstone updates the key past it, and a new key reclaims it")
+upsert_past_a_tombstone()
+    val m: Map[Clump, int] = map()
+
+    for i in 0..<12 do m.put(Clump(i), i)
+
+    assert(m.remove(Clump(0)))
+    assert(m.remove(Clump(3)))
+    assert_eq(m.dead, 2)
+
+    m.upsert(Clump(5), 0, _ + 500)
+
+    assert_eq(m.get(Clump(5)), Some(505))
+    assert_eq(m.len(), 10)
+    assert_eq(m.dead, 2)
+
+    m.upsert(Clump(100), 7, _ * 2)
+
+    assert_eq(m.get(Clump(100)), Some(14))
+    assert_eq(m.len(), 11)
+    assert_eq(m.dead, 1)
+    assert_eq(m.get(Clump(3)), None)
+end upsert_past_a_tombstone
+
+@test("an upsert over a reference-type value lets the old value go and keeps the new one")
+upsert_lets_the_old_value_go()
+    val m: Map[int, &MapProbe] = map()
+
+    for i in 0..<20 do m.put(i, MapProbe(i))
+
+    val old: weak MapProbe = m.get(5).unwrap()
+    val small: Map[int, &MapProbe] = map()
+
+    small.put(1, MapProbe(1))
+
+    val in_list: weak MapProbe = small.get(1).unwrap()
+
+    m.upsert(5, MapProbe(0), p -> MapProbe(p.n * 10))
+    small.upsert(1, MapProbe(0), p -> MapProbe(p.n + 1))
+
+    assert(old.get().is_none())
+    assert(in_list.get().is_none())
+    assert_eq(m.get(5).map(p -> p.n), Some(50))
+    assert_eq(small.get(1).map(p -> p.n), Some(2))
+
+    m.upsert(99, MapProbe(-1), p -> p)
+
+    assert_eq(m.get(99).map(p -> p.n), Some(-1))
+
+    val kept: weak MapProbe = m.get(7).unwrap()
+
+    m.upsert(7, MapProbe(0), p -> p)
+
+    assert(kept.get().is_some())
+    assert_eq(m.get(7).map(p -> p.n), Some(7))
+end upsert_lets_the_old_value_go
+
+struct UpsertKey derives Eq, Hash
+    name: string
+    n: int
+
+@test("a struct key and a captured accumulator: upsert sums per key")
+upsert_struct_key_with_a_capture()
+    val m: Map[UpsertKey, int] = map()
+    val weights = [3, 5, 7]
+
+    for i in 0..<30
+        val w = weights[i % 3]
+
+        m.upsert(UpsertKey(if i % 2 == 0 then "even" else "odd", i % 5), 0, _ + w)
+
+    var total = 0
+
+    for (k, v) in m do total += v
+
+    assert_eq(total, 150)
+    assert_eq(m.len(), 10)
+    assert_eq(m.get(UpsertKey("even", 0)), Some(3 + 5 + 7))
+end upsert_struct_key_with_a_capture
+
+/** A generic counter over any key, to see `upsert` instantiated through a type parameter. */
+private tally[K: Hash + Eq](keys: []K) -> Map[K, int]
+    val m: Map[K, int] = map()
+
+    for k in keys do m.upsert(k, 0, _ + 1)
+
+    m
+
+@test("upsert through a generic function counts any key type")
+upsert_generic()
+    val words = tally(["a", "b", "a", "c", "a"])
+    val ids = tally([UpsertKey("x", 1), UpsertKey("x", 1), UpsertKey("y", 1)])
+
+    assert_eq(words.get("a"), Some(3))
+    assert_eq(words.get("c"), Some(1))
+    assert_eq(ids.get(UpsertKey("x", 1)), Some(2))
+    assert_eq(ids.len(), 2)
+
+@test(should_trap)
+upsert_into_zeroed_storage_will_not_grow()
+    var raw: [1]usize = [0]
+    val m: *Map[string, int] = ptr_cast(&raw[0])
+
+    m.upsert("a", 0, _ + 1)
 
 @test(should_trap)
 map_in_zeroed_storage_will_not_grow()
