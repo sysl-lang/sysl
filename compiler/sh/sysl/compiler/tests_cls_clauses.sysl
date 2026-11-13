@@ -629,3 +629,104 @@ cls_bodiless_signature_unchanged()
         main()
             print(h(0))
         """, "indent expected", "3:1")
+
+// A clause with several guards is a link for each, every one re-testing the clause's patterns. The
+// optimizer folds the repeats: the nested pattern's tests are made once however many guards follow,
+// so three guards read exactly the memory one guard does.
+private cls_probe_enums() -> string = raw"""
+    enum Leaf
+        Lf(v: int)
+        Other
+
+    enum Node
+        Pair(l: Leaf, r: Leaf)
+        Solo(l: Leaf)
+
+    @export("cls_probe")
+    cls_probe(n: *Node) -> int = judge(*n)
+
+    main()
+        print(judge(Pair(Lf(3), Lf(4))))
+    """
+
+// The `load` instructions of `judge` in what clang's `-O2` leaves of the program, or -1 where there
+// is no clang to ask.
+private cls_judge_loads(program: string) -> int
+    if !clang_available()
+        print("skipped: clang is not installed, so there is no optimizer to ask")
+        return -1
+    end if
+
+    val dir = make_temp_dir("sysl-cls").unwrap()
+    val file = s"$dir/t.ll"
+
+    write_text(file, cls_report(program)).unwrap()
+
+    val got = capture("clang", ["-O2", "-S", "-emit-llvm", "-o", "-", file], "", [], true).unwrap()
+
+    remove_dir_all(dir).unwrap_or(())
+    assert(got.status.ok(), s"clang refused the emitted IR:\n${got.err.unwrap_or("")}")
+
+    var inside = false
+    var loads = 0
+
+    for l in lines_of(got.text)
+        if !inside && l.starts_with("define") && l.contains("judge$$sysl") then inside = true
+
+        if inside
+            if l == "}" then return loads
+
+            if l.contains(" = load ") then loads += 1
+        end if
+    end for
+
+    assert(false, s"expected judge's definition, got: ${got.text}")
+    -1
+end cls_judge_loads
+
+@test("the patterns of a clause with three guards are tested once, as with one guard")
+cls_multi_guard_tests_patterns_once()
+    val three = cls_judge_loads(cls_probe_enums() + raw"""
+        judge(n: Node) -> int
+        judge(Pair(Lf(a), Lf(b)))
+            | a > b = 1
+            | a == b = 0
+            | a < b = -1
+        judge(_) = 7
+        """)
+    val one = cls_judge_loads(cls_probe_enums() + raw"""
+        judge(n: Node) -> int
+        judge(Pair(Lf(a), Lf(b)))
+            | a > b = 1
+        judge(_) = 7
+        """)
+
+    if three < 0 then return
+
+    assert(three > 0, "expected the function to read its argument, so the count can fail")
+    assert(three == one, s"expected 3 guards to read what 1 guard reads ($one loads), got $three")
+
+@test("a clause with several guards falls through guard by guard to the next clause")
+cls_multi_guard_falls_through()
+    if !cls_runnable() then return
+
+    cls_prints(raw"""
+        enum Leaf
+            Lf(v: int)
+            Other
+
+        enum Node
+            Pair(l: Leaf, r: Leaf)
+            Solo(l: Leaf)
+
+        judge(n: Node) -> int
+        judge(Pair(Lf(a), Lf(b)))
+            | a > b = 1
+            | a == b = 0
+            | a < b = -1
+        judge(_) = 7
+
+        main()
+            print(judge(Pair(Lf(9), Lf(2))), judge(Pair(Lf(4), Lf(4))), judge(Pair(Lf(1), Lf(5))))
+            print(judge(Pair(Other, Lf(5))), judge(Solo(Lf(1))))
+        """, "1 0 -1\n7 7\n")
