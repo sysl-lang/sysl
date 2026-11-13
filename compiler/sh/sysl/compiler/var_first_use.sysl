@@ -148,10 +148,13 @@ open_binding(cx: &Analyzer, span: Span, typ: Option[TypeRef], init: Expr, unique
     cx.open_vars.push(OpenVar(unique, span.start, init, cx.var_fix_log.len(), false))
 
 // Whether a range's bounds are both bare integer literals, so the variable of a `for` over it is
-// open: its first use that fixes a type decides the range's.
-counted_open(lo: Expr, hi: Expr) -> bool =
-    literal_default(lo).map(t -> type_eq(t, int_type())).unwrap_or(false) &&
-        literal_default(hi).map(t -> type_eq(t, int_type())).unwrap_or(false)
+// open: its first use that fixes a type decides the range's. An untyped integer constant is the
+// literal it stands for (`untyped_const_read`), so `0..<N` is open as `0..<1000` is.
+counted_open(cx: &Analyzer, lo: Expr, hi: Expr) -> bool = counted_bound(cx, lo) && counted_bound(cx, hi)
+
+private counted_bound(cx: &Analyzer, e: Expr) -> bool =
+    literal_default(e).map(t -> type_eq(t, int_type())).unwrap_or(false) ||
+        untyped_const_read(cx, e) && untyped_int_const(cx, e)
 
 // Reads a `for` over a range whose bounds are both bare integer literals -- `read(None)` binds the
 // variable at `int` as one waiting for its first use, filed under `at` -- and reads it again at the

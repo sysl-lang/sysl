@@ -55,15 +55,18 @@ private made_new(span: Span, lit: TExpr, target: Type) -> TExpr =
 // **The expected type is consulted through `repr`**, which is the same identity `disagree` uses --
 // a qualifier says how a place is reached and never what is in it, so the value a literal denotes
 // is not `volatile` even where the field it is about to fill is.
+//
+// `named` is the untyped constant the literal stands for, where it stands for one, which a refusal
+// names beside the value.
 int_literal(cx: &Analyzer, span: Span, value: BigInt, suffix: string,
-            expected: Option[Type]) -> TExpr
+            expected: Option[Type], named: string = "") -> TExpr
     val made = if suffix == "" then new_type_wanted(expected) else None
 
     // A literal the base would not take stays what it is, so the position refuses it as it would at
     // the base: `300` is no more a `Slot` over `u8` than it is a `u8`.
     if made.is_some()
         val base = base_of_new(made.unwrap())
-        val at_base = int_literal(cx, span, value, suffix, Some(base))
+        val at_base = int_literal(cx, span, value, suffix, Some(base), named)
 
         if disagree(texpr_type(at_base), base) then return at_base
 
@@ -79,18 +82,23 @@ int_literal(cx: &Analyzer, span: Span, value: BigInt, suffix: string,
 
     val float_at = if suffix == "" then float_wanted(expected) else None
 
-    if float_at.is_some() then return int_as_float(cx, span, value, float_at.unwrap())
+    if float_at.is_some() then return int_as_float(cx, span, value, float_at.unwrap(), named)
 
     val ty = if suffix != "" then suffixed_int(cx, span, suffix) else expected_int(cx, expected)
 
     ty match
         Integer(bits, signed, _) ->
             if !fits(value, bits, signed) then
-                return cx.err(span, s"the literal ${to_string(value)} does not fit ${declared_show(cx, ty)}")
+                return cx.err(span, s"${literal_named(value, named)} does not fit ${declared_show(cx, ty)}")
         _ -> ()
 
     TExpr(span, TIntLit(value, ty))
 end int_literal
+
+// A refused literal as its refusal shows it: `the literal 300`, or `the constant 'N' (300)` where an
+// untyped constant stood for it.
+private literal_named(value: BigInt, named: string) -> string =
+    if named == "" then s"the literal ${to_string(value)}" else s"the constant '$named' (${to_string(value)})"
 
 // The floating-point type a position wants an unsuffixed integer literal to be, where it wants one
 // -- seen through a vector, as the literal's integer type is.
@@ -104,9 +112,9 @@ private float_wanted(expected: Option[Type]) -> Option[Type] = expected match
 // `val r: real = 2` is two, and so is the `2` of `r / 2`. One the format would round is refused, as
 // a literal too wide for an integer type is -- the written number is what the program means, and a
 // rounded one is a different number.
-private int_as_float(cx: &Analyzer, span: Span, value: BigInt, ty: Type) -> TExpr
+private int_as_float(cx: &Analyzer, span: Span, value: BigInt, ty: Type, named: string) -> TExpr
     if !exactly_float(value, ty) then
-        return cx.err(span, s"the literal ${to_string(value)} is not exactly ${float_named(ty)}")
+        return cx.err(span, s"${literal_named(value, named)} is not exactly ${float_named(ty)}")
 
     val text = to_string(value)
 
