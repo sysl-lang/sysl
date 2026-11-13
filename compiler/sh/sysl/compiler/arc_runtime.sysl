@@ -59,7 +59,16 @@ reaper_slot_symbol() -> string = "__sysl_arc_reaper"
 //
 // `reaper_exported` says the module defines `__sysl_arc_reaper` itself, so the slot is still asked
 // for but the weak default answering it is left out.
-arc_core(t: Target, reaper_exported: bool) -> string
+//
+// **A drain asks for this thread's slot once, on the way in, and keeps the address.** A thread-local
+// global named at each use is worked out again at each use, and on a machine whose thread-locals are
+// reached through a call (Darwin's `tlv_get_addr`) every touch of the head or the flag was a call:
+// four or five per object a drain tore down, against one push and one pop of real work. The address
+// is the thread's own for the whole call, so asking once changes nothing a drain does. `switches`
+// says the program may resume a body on another thread (`fiber_switch.sysl`): there the slot is
+// still named at each use, as it always was, so nothing about a fiber that moves changes either.
+// The module that declares the intrinsic is told by `arc_core_intrinsic`.
+arc_core(t: Target, reaper_exported: bool, switches: bool = false) -> string
     val tls = if t.thread_local_storage() then "thread_local " else ""
     val supplied = !t.thread_local_storage()
     val word = word_llvm(t)
@@ -67,8 +76,10 @@ arc_core(t: Target, reaper_exported: bool) -> string
     val supplier = if !supplied || reaper_exported then "" else
         s"\ndefine weak ${t.preemption()}ptr @${reaper_slot_symbol()}() {\nentry:\n  ret ptr @arc.reaper.self\n}"
 
-    val fetch_slot = if !supplied then "" else s"  %s = call ptr @${reaper_slot_symbol()}()\n"
-    val slot = if supplied then "%s" else "@arc.reaper.self"
+    val asked = s"  %s = call ptr @${reaper_slot_symbol()}()\n"
+    val hoisted = s"  %s = call ptr @${trace_address_intrinsic()}(ptr @arc.reaper.self)\n"
+    val fetch_slot = if supplied then asked else if arc_core_intrinsic(t, switches) then hoisted else ""
+    val slot = if fetch_slot != "" then "%s" else "@arc.reaper.self"
 
     s"%arc.header = type { $word, ptr, $word }\n" +
     "\n" +
@@ -193,6 +204,10 @@ arc_core(t: Target, reaper_exported: bool) -> string
     "}\n" +
     "\n"
 end arc_core
+
+// Whether `arc_core` asks `llvm.threadlocal.address` for the reaper's slot, so the module has to
+// declare it: where the slot is a thread-local and no body may move to another thread under it.
+arc_core_intrinsic(t: Target, switches: bool) -> bool = t.thread_local_storage() && !switches
 
 // The three functions a `weak T` needs, emitted only into a module that holds one.
 //
