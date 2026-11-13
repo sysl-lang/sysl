@@ -1,0 +1,426 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// The reaper's slot, asked for once per drain (`arc_runtime.sysl`'s `arc_core`).
+//
+// `arc.reap` pushes an object whose count reached zero onto this thread's worklist and, unless a drain
+// is already running further up the stack, drains it. The list's head and flag are a thread-local. A
+// thread-local global named at each use is worked out at each use, and on Darwin each working-out is a
+// call through `tlv_get_addr`: binarytrees spent a fifth of its time there, four or five calls for
+// every node it freed. Now the drain asks `llvm.threadlocal.address` once, on the way in, and works on
+// the address it was given.
+//
+// The cells: the emitted text (one ask, every touch of the head and the flag through it); the text
+// after clang's `-O2` (still one); the intrinsic declared once beside the error trace's own use of it;
+// a program that switches fibers (the slot is still named at each use, as before, since a body may
+// resume on another thread); a freestanding machine (still the hook, and no intrinsic). Then the
+// behaviour at `-O2`, where the optimizer has the most room: teardown order, a weak reference still
+// naming an object, a chain long enough that recursion would overflow, and several threads draining
+// their own trees at once while the last share of a `&sync` chain is dropped on whichever finishes
+// last -- each on a counted heap, so a leak or an object freed twice is a failure.
+//
+// Cells skipped, with the reason: x86_64 and Linux machine code -- their thread pointer is a register,
+// so asking once saves a load, not a call, and the emitted text is the same on every hosted machine
+// (the text cells cover it); `Frozen` -- a frozen buffer's release is the atomic one and reaches this
+// same `arc.reap`, which the `&sync` cell already drives across threads.
+
+private val rsh_tree: string = raw"""
+    enum Tree
+        Leaf
+        Node(left: &Tree, right: &Tree)
+
+    make(depth: int) -> &Tree
+        if depth == 0 then Leaf else Node(make(depth - 1), make(depth - 1))
+
+    check(t: &Tree) -> int
+        *t match
+            Leaf -> 1
+            Node(l, r) -> 1 + check(l) + check(r)
+
+    main()
+        var total = 0
+
+        for _ in 0..<4 do total += check(make(5))
+
+        print(total)
+    """
+
+private var rsh_library_names: Buf[string] = buf()
+private var rsh_library_units: Buf[Buf[Program]] = buf()
+
+private rsh_library(t: Target) -> Buf[Program]
+    for i in 0..<rsh_library_names.len()
+        if rsh_library_names[i] == t.name then return rsh_library_units[i]
+
+    var out: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, t) match
+            Err(_) -> ()
+            Ok(units) -> out = units
+
+    rsh_library_names.push(t.name)
+    rsh_library_units.push(out)
+    out
+end rsh_library
+
+private rsh_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the standard module's source or clang is not on this machine")
+        return false
+
+    true
+end rsh_ready
+
+// The LLVM text a program lowers to on `machine`.
+private rsh_ir(text: string, machine: string) -> string
+    val t = target_named(machine).unwrap()
+    var units: Buf[Program] = buf()
+
+    for item in rsh_library(t)
+        units.push(item)
+
+    val parsed = parse(source_of("main.sysl", text), t)
+
+    if !parsed.ok() then assert(false, parsed.first().message)
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, t)
+
+    assert(done.reported.is_empty(), s"refused on $machine")
+
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+
+    assert(errors_of(done.an.diagnostics()).is_empty(), s"refused on $machine")
+    ir_print_module(codegen_with_gaps(prune(strip_tests(whole), program_own(units)), t, promotions).0)
+end rsh_ir
+
+// The text clang's `-O2` makes of `ir` for `machine`'s triple.
+private rsh_optimized(ir: string, machine: string) -> string
+    val dir = make_temp_dir("sysl-rsh").unwrap()
+    val file = s"$dir/t.ll"
+
+    write_text(file, ir).unwrap()
+
+    val triple = "--target=" + target_named(machine).unwrap().triple
+    val got = capture("clang", [triple, "-O2", "-S", "-emit-llvm", "-Wno-override-module", file, "-o", "-"],
+                      "", [], true).unwrap()
+
+    remove_dir_all(dir).unwrap_or(())
+    assert(got.status.ok(), s"clang refused the emitted IR for $machine:\n${got.err.unwrap_or("")}")
+    got.text
+end rsh_optimized
+
+// The lines of the definition of `@name`, up to its closing brace.
+private rsh_body(text: string, name: string) -> string
+    var body = ""
+    var inside = false
+
+    for l in lines_of(text)
+        if !inside && l.starts_with("define") && l.contains(s"@$name(") then inside = true
+
+        if inside
+            if l == "}" then return body
+
+            body = body + l + "\n"
+        end if
+
+    body
+end rsh_body
+
+private rsh_count(text: string, what: string) -> int
+    var n = 0
+
+    for l in lines_of(text)
+        if l.contains(what) then n += 1
+
+    n
+end rsh_count
+
+private val rsh_ask: string = "call ptr @llvm.threadlocal.address.p0(ptr @arc.reaper.self)"
+
+// -- the emitted text ------------------------------------------------------------------------------------
+
+@test("a drain asks for this thread's slot once, and reaches the head and the flag through the answer")
+rsh_one_ask_in_the_text()
+    if !rsh_ready() then return
+
+    val reap = rsh_body(rsh_ir(rsh_tree, "aarch64-macos"), "arc.reap")
+
+    assert(reap != "", "no arc.reap in the module")
+    assert_eq(rsh_count(reap, rsh_ask), 1, reap)
+    assert_eq(rsh_count(reap, "@arc.reaper.self"), 1, reap)
+    assert(reap.contains("getelementptr %arc.reaper, ptr %s, i32 0, i32 0"), reap)
+    assert(reap.contains("getelementptr %arc.reaper, ptr %s, i32 0, i32 1"), reap)
+end rsh_one_ask_in_the_text
+
+@test("every machine with thread-locals asks once, and clang takes the text for each")
+rsh_one_ask_everywhere_hosted()
+    if !rsh_ready() then return
+
+    for machine in ["x86_64-linux", "aarch64-linux", "x86_64-macos", "x86_64-windows", "wasm32-wasi"]
+        val out = rsh_ir(rsh_tree, machine)
+        val reap = rsh_body(out, "arc.reap")
+
+        assert_eq(rsh_count(reap, rsh_ask), 1, s"$machine:\n$reap")
+        assert_eq(rsh_count(reap, "@arc.reaper.self"), 1, s"$machine:\n$reap")
+        assert_eq(rsh_count(rsh_body(rsh_optimized(out, machine), "arc.reap"), "@arc.reaper.self"), 1, machine)
+end rsh_one_ask_everywhere_hosted
+
+@test("after clang's -O2 the drain still names the slot once")
+rsh_one_ask_after_o2()
+    if !rsh_ready() then return
+
+    val reap = rsh_body(rsh_optimized(rsh_ir(rsh_tree, "aarch64-macos"), "aarch64-macos"), "arc.reap")
+
+    assert(reap != "", "no arc.reap after -O2")
+    assert_eq(rsh_count(reap, "@arc.reaper.self"), 1, reap)
+end rsh_one_ask_after_o2
+
+@test("the intrinsic is declared once where the error trace asks it too")
+rsh_declared_once_beside_the_trace()
+    if !rsh_ready() then return
+
+    val traced = raw"""
+        enum Bad
+            Worse
+
+        struct Node
+            v: int
+
+        fails(n: int) -> Result[&Node, Bad] = if n > 0 then Ok(Node(n)) else Err(Worse)
+
+        passes(n: int) -> Result[int, Bad]
+            val k = fails(n)?
+            Ok(k.v + 1)
+
+        main()
+            print(passes(3).unwrap_or(0), passes(0).unwrap_or(0))
+        """
+    val out = rsh_ir(traced, "aarch64-macos")
+
+    assert(out.contains("@sysl_error_trace_live"), "the program records no error trace")
+    assert_eq(rsh_count(out, "declare ptr @llvm.threadlocal.address.p0("), 1, out)
+    assert_eq(rsh_count(rsh_body(out, "arc.reap"), rsh_ask), 1, out)
+    assert(rsh_optimized(out, "aarch64-macos") != "")
+end rsh_declared_once_beside_the_trace
+
+// A program that switches stacks may resume a body on another thread, so its drain keeps naming the
+// slot at each use, exactly as it did before.
+private val rsh_switching: string = raw"""
+    import sysl.fiber.{Context, Stack, switch}
+
+    struct Hop
+        back: Context
+        me: Context
+
+    hop(h: *Hop)
+        loop
+            switch(&h.me, &h.back)
+
+    main()
+        val s = Stack.reserve(64 * 1024).unwrap()
+        var h = Hop(Context.new(), Context.new())
+
+        h.me = Context.start(s, &hop, &h)
+        switch(&h.back, &h.me)
+        print("back")
+    """
+
+@test("a program that switches fibers keeps naming the slot at each use")
+rsh_switching_program_unchanged()
+    if !rsh_ready() then return
+
+    val out = rsh_ir(rsh_switching, "aarch64-macos")
+    val reap = rsh_body(out, "arc.reap")
+
+    assert(reap != "", "the switching program has no counted heap")
+    assert_eq(rsh_count(reap, rsh_ask), 0, reap)
+    assert(reap.contains("getelementptr %arc.reaper, ptr @arc.reaper.self, i32 0, i32 0"), reap)
+    assert(rsh_optimized(out, "aarch64-macos") != "")
+end rsh_switching_program_unchanged
+
+@test("a freestanding machine still asks the hook for its slot, and declares no intrinsic for it")
+rsh_freestanding_asks_the_hook()
+    if !rsh_ready() then return
+
+    val out = rsh_ir(rsh_tree, "aarch64-freestanding")
+    val reap = rsh_body(out, "arc.reap")
+
+    assert(reap.contains(s"%s = call ptr @${reaper_slot_symbol()}()"), reap)
+    assert(!out.contains("llvm.threadlocal.address"), out)
+end rsh_freestanding_asks_the_hook
+
+// -- the behaviour at -O2 ---------------------------------------------------------------------------------
+
+private struct RshRun
+    out: string
+    err: string
+    code: int
+
+// What a program prints at `-O2` on a counted heap: its output, its standard error (where a leak or a
+// second release is reported) and its status.
+private rsh_run(program: string) -> RshRun
+    val root = make_temp_dir("sysl-rsh-run").unwrap()
+
+    write_text(s"$root/main.sysl", program).unwrap()
+
+    val exe = s"$root/built"
+
+    force_alloc_counting(true)
+
+    val made = build_native_program(s"$root/main.sysl", None, None, "2", Some(exe))
+
+    force_alloc_counting(false)
+
+    made match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return RshRun(failure_text(why), "", -1)
+        Ok(_) -> ()
+
+    val ran = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    ran match
+        Err(_) -> RshRun("the program that was built could not be run", "", -1)
+        Ok(o) -> RshRun(o.text, o.err.unwrap_or(""), shell_status(o.status))
+end rsh_run
+
+private rsh_prints(program: string, want: string)
+    if !rsh_ready() then return
+
+    val got = rsh_run(program)
+
+    assert_eq(got.out, want)
+    assert_eq(got.err, "")
+    assert_eq(got.code, 0)
+end rsh_prints
+
+@test("at -O2 a tree is torn down depth first, each field whole before the next")
+rsh_order_at_o2()
+    rsh_prints(raw"""
+        struct Res
+            name: string
+
+        impl Drop for Res
+            drop(self) = print("drop " + self.name)
+
+        struct Two
+            x: &Res
+            y: &Res
+
+        struct Outer
+            a: &Two
+            b: &Res
+            c: &Two
+
+        run()
+            val o: &Outer = Outer(Two(Res("a.x"), Res("a.y")), Res("b"), Two(Res("c.x"), Res("c.y")))
+            print("made")
+
+        run()
+        """, "made\ndrop a.x\ndrop a.y\ndrop b\ndrop c.x\ndrop c.y\n")
+
+@test("at -O2 an object a weak reference still names is torn down, and the weak reads as gone")
+rsh_weak_at_o2()
+    rsh_prints(raw"""
+        struct Res
+            name: string
+
+        impl Drop for Res
+            drop(self) = print("drop " + self.name)
+
+        struct Two
+            x: &Res
+            y: &Res
+
+        run() -> weak Two
+            val t: &Two = Two(Res("x"), Res("y"))
+            val w: weak Two = t
+
+            print("made")
+            w
+
+        val w = run()
+
+        print(if w.get() == None then "gone" else "alive")
+        """, "made\ndrop x\ndrop y\ngone\n")
+
+@test("at -O2 a chain of a million links comes apart without a stack overflow")
+rsh_long_chain_at_o2()
+    rsh_prints(raw"""
+        struct Link
+            n: int
+            next: Option[&Link]
+
+        run()
+            var head: Option[&Link] = None
+
+            for i in 0..<1000000 do head = Some(Link(i, head))
+
+            print("built")
+
+        run()
+        print("done")
+        """, "built\ndone\n")
+
+@test("at -O2 four threads drain their own trees at once, and the last share of a &sync chain goes with one")
+rsh_threads_at_o2()
+    rsh_prints(raw"""
+        import sysl.threads.*
+
+        enum Tree
+            Leaf
+            Node(left: &Tree, right: &Tree)
+
+        make(depth: int) -> &Tree
+            if depth == 0 then Leaf else Node(make(depth - 1), make(depth - 1))
+
+        check(t: &Tree) -> int
+            *t match
+                Leaf -> 1
+                Node(l, r) -> 1 + check(l) + check(r)
+
+        struct Shared
+            n: int
+            next: Option[&sync Shared]
+
+        struct Job
+            depth: int
+            total: int
+            held: Option[&sync Shared]
+
+        work(j: *Job)
+            for _ in 0..<200 do j.total += check(make(j.depth))
+            j.held = None
+
+        var chain: Option[&sync Shared] = None
+
+        for i in 0..<1000 do chain = Some(Shared(i, chain))
+
+        var jobs: [4]Job = [Job(6, 0, chain), Job(7, 0, chain), Job(8, 0, chain), Job(9, 0, chain)]
+
+        chain = None
+
+        var t0 = spawn(&work, &jobs[0]).unwrap()
+        var t1 = spawn(&work, &jobs[1]).unwrap()
+        var t2 = spawn(&work, &jobs[2]).unwrap()
+        var t3 = spawn(&work, &jobs[3]).unwrap()
+
+        t0.join()
+        t1.join()
+        t2.join()
+        t3.join()
+        print(jobs[0].total, jobs[1].total, jobs[2].total, jobs[3].total)
+        """, "25400 51000 102200 204600\n")
