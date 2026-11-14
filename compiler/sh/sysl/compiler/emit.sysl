@@ -83,6 +83,9 @@ struct Emit
     // result slot to store into.
     loops: Buf[GenLoop]
 
+    // The enclosing `if` branches a clause's guard chain may fall out of, innermost last.
+    falls: Buf[GenFall]
+
     // One stack slot per LLVM type per function, for the type punning a union needs: a value goes in
     // written as one type and comes back out read as another.
     scratch: Buf[(string, Val)]
@@ -539,6 +542,15 @@ struct GenLoop
     trace_depth: usize
 end GenLoop
 
+// Where a `TFallthrough` goes: the `else` of the `if` whose branch it is in, once everything that
+// branch's condition bound has been given back. The depths are those of the ownership regions when
+// the `if` began, as a loop's are for a `break`.
+struct GenFall
+    label: string
+    owned_depth: usize
+    temp_depth: usize
+end GenFall
+
 // An emitter for one module, with no function open, and no program behind it -- which is what a
 // test asserting on one instruction wants.
 emitter(t: Target) -> Emit
@@ -556,6 +568,7 @@ emitter_for(t: Target, destructors: Buf[(string, string)]) -> Emit
     var current: Buf[Inst] = buf()
     var reached: Buf[string] = buf()
     var loops: Buf[GenLoop] = buf()
+    var falls: Buf[GenFall] = buf()
     var scratch: Buf[(string, Val)] = buf()
     var symbols: Buf[(string, string)] = buf()
     var foreigns: Buf[string] = buf()
@@ -587,7 +600,7 @@ emitter_for(t: Target, destructors: Buf[(string, string)]) -> Emit
 
     Emit(t, memo_layout_for(t), int(t.pointer_bits()), globals, 0, 0, sat_decls, false, false, false,
          false, false, false, false, 0,
-         prologue, blocks, current, None, "entry", 0, 0, false, reached, map(), loops, scratch, symbols,
+         prologue, blocks, current, None, "entry", 0, 0, false, reached, map(), loops, falls, scratch, symbols,
          foreigns, variadics, variadic_types, export_symbols, ensures, None, "", tail_calls, tail_params,
          "", self_params, None, ghost_funcs, destructors, false, false, false,
          false, boxes, bufs, requested, requested_set, queue, temps, temp_marks, owned_slots, owned_marks, defers,
@@ -635,6 +648,7 @@ start_function(e: *Emit)
     e.reached.clear()
     e.reached_at.clear()
     e.loops.clear()
+    e.falls.clear()
     e.scratch.clear()
     e.ensures.clear()
     e.result_ssa = None

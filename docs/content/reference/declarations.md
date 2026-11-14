@@ -19,10 +19,13 @@ where it lives.
 | `val name = v` | no, written once | **required** | optional |
 | `const Name = v` | no, and known while compiling | required | optional |
 
-**A `const` takes its type exactly as a `val` does**: left off, the type is the value's own —
-`const Step = 2` is an `int`, `const Greeting = "hello"` a `string`, `const Area = sq(3)` whatever
-`sq` answers. Written, `const Name: T = v`, the type governs: the value is read at `T`, and refused
-where `T` does not hold it. A `val` or a `const` with no value is not a declaration of anything.
+**A `const` takes its type as a `val` does**: left off, the type is the value's own —
+`const Greeting = "hello"` is a `string`, `const Area = sq(3)` whatever `sq` answers — except that
+a value with no type of its own leaves the constant **untyped**: `const Step = 2` is the literal `2`,
+read at whatever type each use's position gives it, and an `int` where nothing does
+([untyped and typed constants](/reference/modules/#untyped-and-typed-constants)). Written,
+`const Name: T = v`, the type governs: the value is read at `T`, and refused where `T` does not hold
+it. A `val` or a `const` with no value is not a declaration of anything.
 
 ```sysl
 const Step = 2
@@ -169,7 +172,8 @@ print(Limit)
 
 ### A literal binding takes its type from its first use
 
-A local `var` or `val` with no type written whose value is a bare number — `0`, `-1`, `2.5` — takes
+A local `var` or `val` with no type written whose value is a bare number — `0`, `-1`, `2.5`, or an
+[untyped constant](/reference/modules/#untyped-and-typed-constants), the number it stands for — takes
 its type from its **first use that fixes one**: a comparison or arithmetic with an operand that has
 a type of its own, an assignment of such a value or into a typed place, an argument, a `return` or
 the body's result. A counter compared with a length is a `usize`, and an index read with it needs no

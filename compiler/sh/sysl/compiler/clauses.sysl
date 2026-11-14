@@ -12,8 +12,8 @@ import sysl.text.from_utf8_unchecked
 // clauses become the `if` chain whose conditions are those tests, an `is` term per parameter and the
 // guard after them, which is what the emitter lowers an `if x is P` to already: the pattern's test,
 // then its bindings, then the guard. A clause whose guards all fail goes on to the next clause, as
-// the next link of the chain. A clause with several guards is a link for each, every one testing the
-// same patterns and binding the same names.
+// the next link of the chain. A clause with several guards tests its patterns once and tries the
+// guards in order inside, the last falling out to the next clause (`chain_of`).
 //
 // **The clauses must cover every argument list**, as a `match`'s arms cover its scrutinee: the check
 // is the same matrix with a column per parameter (`clauses_gap`). Past the last link is therefore a
@@ -37,9 +37,10 @@ clauses_expr(cx: &Analyzer, span: Span, group: ClauseGroup, expected: Option[Typ
         tys.push(texpr_type(s))
 
     val said = cx.an.complaints()
-    var links: Buf[(Buf[TCondTerm], TBlock)] = buf()
+    var links: Buf[ClauseLink] = buf()
     var rows_of: Buf[Buf[Buf[TPattern]]] = buf()
     var covering: Buf[bool] = buf()
+    var clause_no: usize = 0
 
     for c in group.clauses
         cx.enter()
@@ -74,23 +75,21 @@ clauses_expr(cx: &Analyzer, span: Span, group: ClauseGroup, expected: Option[Typ
                 continue
             end if
 
-            var cond: Buf[TCondTerm] = buf()
-
-            for t in terms
-                cond.push(t)
+            var guard: Option[TExpr] = None
 
             if b.guard.is_some()
-                cond.push(TCondTest(analyze_bool(cx, b.guard.unwrap(), b.span)))
+                guard = Some(analyze_bool(cx, b.guard.unwrap(), b.span))
             else
                 covers = true
                 always = true
             end if
 
-            links.push((cond, type_value_block(cx, b.body, expected, discarded)))
+            links.push(ClauseLink(clause_no, terms, guard, type_value_block(cx, b.body, expected, discarded)))
 
         cx.leave()
         rows_of.push(spread_rows(columns))
         covering.push(covers)
+        clause_no += 1
     end for
 
     // A pattern that was refused stands as a wildcard, so the clauses are read for coverage only when
@@ -286,35 +285,96 @@ private check_clauses_cover(cx: &Analyzer, group: ClauseGroup, tys: Buf[Type],
              "— add a clause for it, or end with one that matches every argument")
 end check_clauses_cover
 
-// The links read, as the chain they make: each an `if` whose `else` is the rest, and past the last
-// the point no call reaches. A last link that tests nothing is the chain's own `else`.
-private chain_of(cx: &Analyzer, span: Span, links: Buf[(Buf[TCondTerm], TBlock)]) -> TExpr
+// One body of a clause: the patterns its clause tests (shared by the clause's bodies), the guard it
+// is under, and what it does.
+private struct ClauseLink
+    clause: usize
+    terms: Buf[TCondTerm]
+    guard: Option[TExpr]
+    block: TBlock
+end ClauseLink
+
+// A block that is one `if` and yields what it does.
+private if_block(span: Span, cond: Buf[TCondTerm], then_block: TBlock, rest: TBlock, ty: Type) -> TBlock
+    TBlock(buf(), Some(TExpr(span, TIf(cond, then_block, Some(rest), ty))), ty)
+
+private one_test(guard: TExpr) -> Buf[TCondTerm]
+    var cond: Buf[TCondTerm] = buf()
+
+    cond.push(TCondTest(guard))
+    cond
+
+// The links read, as the chain they make: each clause an `if` whose `else` is the rest, and past the
+// last the point no call reaches. A clause that tests nothing is its guards in order, and a last
+// body with no guard is the chain's own `else`.
+//
+// **A clause with several guards tests its patterns once**: the `if` is on the patterns alone, and
+// inside it the guards are tried in order, the last of them falling out to the rest
+// (`TFallthrough`) where every one has failed. The patterns are not read again between guards, so a
+// guard that changes what they read cannot change what a later guard sees.
+private chain_of(cx: &Analyzer, span: Span, links: Buf[ClauseLink]) -> TExpr
     var tys: Buf[Type] = buf()
 
     for item in links
-        tys.push(item.1.ty)
+        tys.push(item.block.ty)
 
     val to = widest_branch(tys)
     var blocks: Buf[TBlock] = buf()
 
     for item in links
-        blocks.push(if to.is_some() then widened_block(item.1, to.unwrap()) else item.1)
+        blocks.push(if to.is_some() then widened_block(item.block, to.unwrap()) else item.block)
 
     val ty = chain_type(cx, span, blocks)
     var k = links.len()
     var rest = TBlock(buf(), Some(TExpr(span, TUnreachable)), Never)
 
-    if k > 0 && links[k - 1].0.is_empty()
-        k -= 1
-        rest = blocks[k]
-    end if
-
     while k > 0
-        k -= 1
+        // The bodies of one clause share the one patterns buffer.
+        var start = k - 1
 
-        val link = TExpr(span, TIf(links[k].0, blocks[k], Some(rest), ty))
+        while start > 0 && links[start - 1].clause == links[k - 1].clause
+            start -= 1
 
-        rest = TBlock(buf(), Some(link), ty)
+        val terms = links[start].terms
+
+        if terms.is_empty()
+            var j = k
+
+            while j > start
+                j -= 1
+
+                if links[j].guard.is_none()
+                    rest = blocks[j]
+                else
+                    rest = if_block(span, one_test(links[j].guard.unwrap()), blocks[j], rest, ty)
+                end if
+        else if k - start == 1
+            var cond: Buf[TCondTerm] = buf()
+
+            for t in terms
+                cond.push(t)
+
+            if links[start].guard.is_some() then cond.push(TCondTest(links[start].guard.unwrap()))
+
+            rest = if_block(span, cond, blocks[start], rest, ty)
+        else
+            var inner = TBlock(buf(), Some(TExpr(span, TFallthrough)), Never)
+            var j = k
+
+            if links[k - 1].guard.is_none()
+                j -= 1
+                inner = blocks[j]
+            end if
+
+            while j > start
+                j -= 1
+                inner = if_block(span, one_test(links[j].guard.unwrap()), blocks[j], inner, ty)
+
+            rest = if_block(span, terms, inner, rest, ty)
+        end if
+
+        k = start
+    end while
 
     // A chain of one link that tests nothing is that link's body, which may hold statements.
     if rest.stmts.is_empty() && rest.result.is_some() then rest.result.unwrap()

@@ -3689,6 +3689,10 @@ private cast(r: &EvRun, at: Span, operand: TExpr, ty: Type) -> Flow
         ConstPun(addr, as_was) -> return punned(r, at, *addr, *as_was, ty)
         _ -> ()
 
+    (repr(texpr_type(operand)), repr(ty)) match
+        (Vector(_, a), Vector(_, b)) -> return lanes_converted(r, at, v, *a, *b)
+        _ -> ()
+
     // A bare enum converts as the integer its variant's tag is, at the enum's underlying type.
     val (held, from) = (v, underlying(texpr_type(operand))) match
         (ConstRecord(i, _), Enum(d)) -> (ConstInt(d.variants[usize(i)].tag), underlying(d.underlying))
@@ -3702,6 +3706,24 @@ private cast(r: &EvRun, at: Span, operand: TExpr, ty: Type) -> Flow
             if is_trap_text(message) then trap(r, at, message)
             else refuse_form(r, at, s"$message is not evaluated while compiling yet")
 end cast
+
+// `<4>f32(v)`: each lane converted as the scalar conversion converts one value.
+private lanes_converted(r: &EvRun, at: Span, v: Const, from: Type, to: Type) -> Flow
+    var out: Buf[Const] = buf()
+
+    for lane in lanes_of(v)
+        val converted = fixed_eval_convert(lane, from, to).unwrap_or(run_convert(lane, underlying(from), underlying(to)))
+
+        converted match
+            Ok(x) -> out.push(x)
+            Err(message) ->
+                if is_trap_text(message) then return trap(r, at, message)
+
+                return refuse_form(r, at, s"$message is not evaluated while compiling yet")
+    end for
+
+    EvGave(ConstArray(out))
+end lanes_converted
 
 // An address the run owns, taken at `from` and converted to `ty`.
 private punned(r: &EvRun, at: Span, addr: Const, from: Type, ty: Type) -> Flow =

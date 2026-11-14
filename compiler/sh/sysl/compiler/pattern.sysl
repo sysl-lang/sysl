@@ -331,17 +331,19 @@ end eq_pattern
 
 // A constant in a pattern, folded to the literal it stands for and matched as one.
 //
-// **It is read at the type the *scrutinee* has**, not at the one the constant was declared with,
-// which is what makes a `const` written as an `int` match a `u8` value exactly as the literal it
-// stands for would. The expression is read in the declaration's own terms, since that is where its
-// names mean what they meant.
+// **An untyped one is read at the type the *scrutinee* has** (`untyped_const_read`), which is what
+// makes `const L = 3` match a `u8` value exactly as the literal `3` would. **A typed one is read at
+// its own type**, a value of it as a `val` is, so `const M: i32 = 3` against a `u8` is a mismatch.
+// The expression is read in the declaration's own terms, since that is where its names mean what
+// they meant.
 private const_pattern(cx: &Analyzer, span: Span, key: string, ty: Type) -> TPattern
     val d = cx.an.tables.consts.get(key).unwrap()
 
     if d.init.is_none() then return TWildPattern(ty)
 
     val inner = analyzer_for(cx.an, d.scope)
-    val t = type_expr(inner, d.init.unwrap(), Some(ty))
+    val at = if d.typ.is_some() then const_type(inner, d) else ty
+    val t = untyped_pattern_value(cx, span, key, ty).unwrap_or_else(() -> type_expr(inner, d.init.unwrap(), Some(at)))
 
     if disagree(texpr_type(t), ty) then
         cx.fault(span, s"pattern is ${type_show(texpr_type(t))} but the value is ${type_show(ty)}")
@@ -360,8 +362,9 @@ end const_pattern
 
 // A `const` the body declared, matched as the literal it came to; nothing where the name is not one.
 //
-// **An integer is read at the scrutinee's type where it fits there**, as one at the top of a file is
-// (`const_pattern`), so `const L = 3` matches a `u8` exactly as the literal `3` would.
+// **An untyped integer is read at the scrutinee's type where it fits there**, as one at the top of a
+// file is (`const_pattern`), so `const L = 3` matches a `u8` exactly as the literal `3` would, and a
+// character one matches a byte as `';'` would; a typed one is the value of its own type.
 private local_const_pattern(cx: &Analyzer, span: Span, name: string, ty: Type) -> Option[TPattern]
     val local = cx.lookup(name)
 
@@ -371,7 +374,11 @@ private local_const_pattern(cx: &Analyzer, span: Span, name: string, ty: Type) -
 
     if konst.is_none() then return None
 
-    val t = at_scrutinee_type(cx, TExpr(span, konst.unwrap().0.kind), ty)
+    val held = TExpr(span, konst.unwrap().0.kind)
+    val lc = cx.local_const(local.unwrap().unique).unwrap()
+    val t = if lc.untyped then at_scrutinee_type(cx, held, ty)
+            else if lc.character && wants_byte(Some(ty)) then local_char_at(cx, span, lc, Some(ty))
+            else held
 
     if disagree(texpr_type(t), ty)
         cx.fault(span, s"pattern is ${type_show(texpr_type(t))} but the value is ${type_show(ty)}")
