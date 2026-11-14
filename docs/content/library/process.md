@@ -595,6 +595,59 @@ true
 has), with `NotPermitted` for one the program may not look at, and for a pid of zero or less. A target with no way to ask fails with
 `UNSUPPORTED`'s error.
 
+## What a child cost
+
+**`Spawned.wait_usage()` is `wait` answering, beside the `Status`, what the child cost**: a `Usage`
+holding `user` and `system`, the processor time it spent in its own code and in the kernel's on its
+behalf, as `sysl.time.Duration`s, and `peak_resident`, the most memory it held at once, in bytes.
+`cpu()` is the two times together. **Both times count every descendant the child waited for
+itself**, as POSIX's `wait4` counts them, so a shell's cost includes the programs it ran:
+
+```sysl
+import sysl.process.{Status, spawn}
+import sysl.time.whole_millis
+
+val s = spawn("sh", ["-c", "yes > /dev/null & p=$!; sleep 0.2; kill $p; wait"]).unwrap()
+val (status, cost) = s.wait_usage().unwrap()
+
+print(status)
+print(whole_millis(cost.cpu()) > 50, cost.peak_resident > 0)
+
+val (slept, idle) = spawn("sleep", ["0.1"]).unwrap().wait_usage().unwrap()
+
+print(slept, whole_millis(idle.cpu()) < 50)
+```
+
+```output
+exited
+true true
+exited true
+```
+
+A descendant the child left running, or one that ended without being waited for, is not counted —
+it was never the child's to account for. **`try_wait_usage()` is `try_wait` the same way**: `Ok(None)`
+while the child runs, then `Some((status, cost))`.
+
+**It is one wait, not two**: `wait`, `try_wait` and the two that answer a cost all reap through the
+same `wait4`, keep `timeout` as `wait` keeps it (a child stopped at its deadline is `TimedOut`, with
+what it had cost by then), and answer the first answer again when asked again. What a plain `wait`
+reaped it did not keep the cost of, so `wait_usage` on that child fails with `Other(10)` (`ECHILD`):
+
+```sysl
+import sysl.fs.IoError
+import sysl.process.spawn
+
+val s = spawn("true").unwrap()
+
+print(s.wait().unwrap())
+print(s.wait_usage().unwrap_err() == IoError.Other(10))
+```
+
+```output
+exited
+true
+```
+
 ## Who is in a group, and whose child a process is
 
 **`group_members(pgid)` lists the live processes in a process group, and `children(pid)` the live
@@ -854,8 +907,8 @@ true
 
 ## On a target with no C library
 
-Everything the module asks of the machine goes through fourteen hooks in `sysl.process.sys` — start a
-program, make a pipe, wait for it or ask whether it has ended, send it a signal, become one in place of
+Everything the module asks of the machine goes through sixteen hooks in `sysl.process.sys` — start a
+program, make a pipe, wait for it or ask whether it has ended (and what it cost), send it a signal, become one in place of
 this program, name a file for a captured stream, read or change who the program is, say which process
 group it is in and which group has its terminal, and move it to a group or a session of its own. On a
 hosted POSIX target
@@ -869,6 +922,8 @@ with an `@export`**, over whatever its kernel provides, and `run`, `capture`, `s
 | `sysl_proc_pipe(read_end, write_end) -> int` | zero, having written the two descriptors, each closing when a program is started |
 | `sysl_proc_wait(pid, started, timeout_ms, how, value) -> int` | zero, having written how it ended |
 | `sysl_proc_poll(pid, how, value) -> int` | zero while the child runs, without waiting; one once it has ended, having reaped it and written how |
+| `sysl_proc_wait_usage(pid, started, timeout_ms, how, value, usage) -> int` | what `wait` answers, having also written what the child cost into `usage` |
+| `sysl_proc_poll_usage(pid, how, value, usage) -> int` | what `poll` answers, having also written what the child cost into `usage` once it has ended |
 | `sysl_proc_kill(pid, signal) -> int` | zero |
 | `sysl_proc_temp_path(into, room) -> isize` | the length of the path it wrote |
 | `sysl_proc_get_id(which) -> i64` | the id: `which` is `id_user` 0 or `id_group` 1 (effective), `id_real_user` 2 or `id_real_group` 3 |
@@ -893,7 +948,10 @@ target with no process groups answers the five group and session hooks with `UNS
 `process_group()` is then 0); **they are reached only by a program that asks about groups, sessions or
 the terminal**, so a kernel without them answers nothing it does not have. `poll` is reached only by
 `try_wait`, and writes `how` and `value` as `wait` does, never `2`; a supplier that cannot ask without
-blocking answers `UNSUPPORTED`.
+blocking answers `UNSUPPORTED`. `wait_usage` and `poll_usage` are reached only by `wait_usage` and
+`try_wait_usage`; `usage` points at a `sysl.process.sys.Usage` — `user_us` and `system_us`, the
+processor time in microseconds counting the descendants the child reaped, and `peak_resident` in
+bytes — and a supplier that cannot measure one writes zero there.
 **`kill` and `wait` are reached by any program that reaches the module**, `Child`'s destructor being
 kept wherever `sysl.process` is, so a program asking only who it is answers those two as well.
 `sysl.process.sys`'s own comments say the rest.

@@ -58,7 +58,7 @@ the vector as it is given, so a path is a path whatever is in it.
 
 ## Index
 
-[`capture`](#capture) [`exec`](#exec) [`foreground_group`](#foreground_group) [`group`](#group) [`hostname`](#hostname) [`new_session`](#new_session) [`pid`](#pid) [`pipe`](#pipe) [`process_group`](#process_group) [`real_group`](#real_group) [`real_user`](#real_user) [`run`](#run) [`set_foreground_group`](#set_foreground_group) [`set_group`](#set_group) [`set_process_group`](#set_process_group) [`set_user`](#set_user) [`spawn`](#spawn) [`start`](#start) [`user`](#user) [`Child`](#child) [`Group`](#group-1) [`Output`](#output) [`Spawned`](#spawned) [`Status`](#status) [`Stdio`](#stdio) [`Var`](#var) [Display for Status](#display-for-status) [Drop for Child](#drop-for-child) [Drop for Spawned](#drop-for-spawned) [Eq for Status](#eq-for-status)
+[`capture`](#capture) [`children`](#children) [`exec`](#exec) [`foreground_group`](#foreground_group) [`group`](#group) [`group_members`](#group_members) [`hostname`](#hostname) [`new_session`](#new_session) [`pid`](#pid) [`pipe`](#pipe) [`process_group`](#process_group) [`real_group`](#real_group) [`real_user`](#real_user) [`resident_bytes`](#resident_bytes) [`run`](#run) [`set_foreground_group`](#set_foreground_group) [`set_group`](#set_group) [`set_process_group`](#set_process_group) [`set_user`](#set_user) [`spawn`](#spawn) [`start`](#start) [`total_memory`](#total_memory) [`try_wait_pid`](#try_wait_pid) [`user`](#user) [`wait_pid`](#wait_pid) [`Child`](#child) [`Group`](#group-1) [`Output`](#output) [`Spawned`](#spawned) [`Status`](#status) [`Stdio`](#stdio) [`Usage`](#usage) [`Var`](#var) [Display for Status](#display-for-status) [Drop for Child](#drop-for-child) [Drop for Spawned](#drop-for-spawned) [Eq for Status](#eq-for-status)
 
 ## Functions
 
@@ -99,6 +99,20 @@ the process group the child starts in, and whether it is given the terminal (`Gr
 
 It is `start` followed at once by `wait`, and is written as exactly that, so the two can never
 come to answer differently.
+
+### `children`
+
+```sysl
+children(pid: int) -> Result[Buf[int], IoError]
+```
+
+The live processes whose parent is `pid`, as pids, found as `group_members` finds a group's. This
+program's own children are `children(int(pid()))`, one per `start`, `spawn` or `run` not yet waited
+for, and not the children's own children.
+
+**A parent with no children, or one that is gone, answers `Ok` with an empty buffer.** **A `pid` of zero
+or less fails** with `Other(22)`. The answer is a snapshot, and a target with no processes fails with
+`UNSUPPORTED`'s error.
 
 ### `exec`
 
@@ -147,6 +161,21 @@ group() -> u32
 ```
 
 The group the program acts as: the effective group id, compared with `sysl.fs.Meta.group`.
+
+### `group_members`
+
+```sysl
+group_members(pgid: int) -> Result[Buf[int], IoError]
+```
+
+The live processes whose process group is `pgid`, as pids: macOS's `proc_listpids` with
+`PROC_PGRP_ONLY`, Linux's `/proc/<n>/stat` scanned for the group field. A child that has exited but
+has not been waited for yet is still listed, as `ps` lists it; once `wait_pid` has reaped it, it is not.
+
+**A group nothing is in, or one that has ended, answers `Ok` with an empty buffer**, and so does a
+group the program may not see. **A `pgid` of zero or less fails** with `Other(22)` (`EINVAL`). The
+answer is a snapshot: a process may have exited or started by the time it is read. A target with no
+processes fails with `UNSUPPORTED`'s error.
 
 ### `hostname`
 
@@ -233,6 +262,20 @@ real_user() -> u32
 
 The user who started the program: the real user id. It is `user()` unless the program changed
 who it acts as -- it is set-user-ID, or it called `set_user`.
+
+### `resident_bytes`
+
+```sysl
+resident_bytes(pid: int) -> Result[u64, IoError]
+```
+
+The resident memory of the process `pid`, in bytes: the pages it has in RAM now. macOS reads
+`pti_resident_size` through `proc_pidinfo`; Linux reads field 2 of `/proc/<pid>/statm` times the
+page size. `resident_bytes(child.pid())` is a child's, and `resident_bytes(int(pid()))` this program's own.
+
+**Fails** for a process that is not there (a reaped child, a number nothing has; `NotFound`), for one
+the program may not look at (`NotPermitted`), and for a `pid` of zero or less, which names no process.
+A target with no processes fails with `UNSUPPORTED`'s error.
 
 ### `run`
 
@@ -384,6 +427,28 @@ child to hand back, and no files left behind for one.
 `timeout` bounds the child's whole life from this call, but it is kept by `wait`: a child is only
 stopped for outstaying it while somebody is waiting for it, or when its `Child` is dropped.
 
+### `total_memory`
+
+```sysl
+total_memory() -> Result[u64, IoError]
+```
+
+The physical memory the machine has, in bytes: macOS's `hw.memsize`, Linux's `sysinfo` total
+(`totalram` times `mem_unit`). It is what is installed, not what is free.
+
+**A target with no way to ask** (`UNSUPPORTED` from its supplier) fails with that error.
+
+### `try_wait_pid`
+
+```sysl
+try_wait_pid(pid: int) -> Result[Option[Status], IoError]
+```
+
+Whether the child numbered `pid` has ended, **without waiting for it**, as `Spawned.try_wait` asks:
+`Ok(None)` while it runs and `Some` of how it ended once it has, the child reaped at that moment.
+The errors are `wait_pid`'s: a pid that is not this program's child, or already reaped, is `Other(10)`,
+and `pid` of zero or less is `Other(22)`.
+
 ### `user`
 
 ```sysl
@@ -393,6 +458,21 @@ user() -> u32
 The user the program acts as: the effective user id, the one a filesystem checks a permission
 against and makes a new file's owner. Compare it with `sysl.fs.Meta.owner` to ask whether a file is
 the program's own.
+
+### `wait_pid`
+
+```sysl
+wait_pid(pid: int) -> Result[Status, IoError]
+```
+
+Waits for the child numbered `pid` to end and says how it ended, exactly as `Spawned.wait` does --
+for a child nobody holds a `Spawned` for: one `detach` let go of, or one a previous image of this
+program started before it became this one.
+
+There is no `timeout`: it waits for as long as it takes. **The child is reaped**, so a second wait
+on the same pid is an error -- the pid is no longer this program's child, and `Other(10)` (`ECHILD`)
+is what says so, as it is for any pid that never was. `pid` of zero or less is `Other(22)` rather
+than waitpid's process-group meanings, which are not offered.
 
 ## Types
 
@@ -484,6 +564,8 @@ struct Spawned
     private timeout: int
     private answer: Option[Result[Status, IoError]]
     private pgid: i64
+    private released: bool
+    private cost: Option[Usage]
 ```
 
 A child that `spawn` started and that nothing has waited for yet.
@@ -503,7 +585,10 @@ no zombie and no stage running on.
 | `pid` | `pid(self) -> int` | The process id of this stage: the number `kill` and a wait by pid name. |
 | `wait` | `wait(*self) -> Result[Status, IoError]` | Waits for the child to end and says how it ended, as `run` would have. |
 | `try_wait` | `try_wait(*self) -> Result[Option[Status], IoError]` | Whether the child has ended, **without waiting for it** -- what a shell asks of every background job before it prints a prompt. |
+| `wait_usage` | `wait_usage(*self) -> Result[(Status, Usage), IoError]` | `wait`, answering beside the `Status` what the child cost: its processor time, its own and that of every descendant it waited for, and the most memory it held (`Usage`). |
+| `try_wait_usage` | `try_wait_usage(*self) -> Result[Option[(Status, Usage)], IoError]` | `try_wait`, answering beside the `Status` what the child cost once it has ended: `Ok(None)` while it runs, then `Some` of what `wait_usage` would have said. |
 | `kill` | `kill(*self, signal: int = 15) -> Result[unit, IoError]` | Sends the child the signal numbered `signal`, as `Child.kill` does: 15 asks it to stop and 9 makes it, and a child already waited for is not signalled. |
+| `detach` | `detach(*self) -> int` | Lets go of the child without ending it: dropping this handle afterwards sends no signal and waits for nothing, so the child outlives it -- a daemon a command line program starts and leaves running. |
 
 ### `Status`
 
@@ -567,6 +652,31 @@ meant to read, and `FromPath` as an output would open one it cannot write.
 **A `ToFile` or `FromFile` file stays open and stays the caller's to close**, the child having a copy
 of its own by the time the call returns; a file this module opened for a path is closed again. Both
 output streams may be pointed at one file, and then they share it as a shell's `>f 2>&1` does.
+
+### `Usage`
+
+```sysl
+struct Usage
+    user: Duration
+    system: Duration
+    peak_resident: u64
+```
+
+What a child cost the machine, once it has ended and been reaped -- what `Spawned.wait_usage`
+answers beside its `Status`.
+
+`user` is the processor time it spent running its own code and `system` the time the kernel spent
+on its behalf. **Both count every descendant the child waited for itself**, as POSIX's `wait4`
+counts them: a shell that ran three compilers reports the compilers' time as well as its own. A
+descendant it left running, or that ended unwaited-for after it, is not counted -- it was never
+the child's to account for. `peak_resident` is the most memory, in bytes, that it -- or the largest
+of those descendants -- held in RAM at once.
+
+A target that cannot measure one of the three answers zero for it.
+
+| Member | Signature | Description |
+|---|---|---|
+| `cpu` | `cpu(self) -> Duration` | All the processor time the child cost: `user` and `system` together. |
 
 ### `Var`
 

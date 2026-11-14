@@ -9,7 +9,7 @@ requires: "requires { libc }, requires { posix }"
 
 ## Index
 
-[`proc_exec`](#proc_exec) [`proc_get_id`](#proc_get_id) [`proc_getpgrp`](#proc_getpgrp) [`proc_hostname`](#proc_hostname) [`proc_kill`](#proc_kill) [`proc_pipe`](#proc_pipe) [`proc_poll`](#proc_poll) [`proc_set_id`](#proc_set_id) [`proc_setpgid`](#proc_setpgid) [`proc_setsid`](#proc_setsid) [`proc_spawn`](#proc_spawn) [`proc_tcgetpgrp`](#proc_tcgetpgrp) [`proc_tcsetpgrp`](#proc_tcsetpgrp) [`proc_temp_path`](#proc_temp_path) [`proc_wait`](#proc_wait)
+[`proc_exec`](#proc_exec) [`proc_get_id`](#proc_get_id) [`proc_getpgrp`](#proc_getpgrp) [`proc_hostname`](#proc_hostname) [`proc_kill`](#proc_kill) [`proc_list`](#proc_list) [`proc_pipe`](#proc_pipe) [`proc_poll`](#proc_poll) [`proc_poll_usage`](#proc_poll_usage) [`proc_resident`](#proc_resident) [`proc_set_id`](#proc_set_id) [`proc_setpgid`](#proc_setpgid) [`proc_setsid`](#proc_setsid) [`proc_spawn`](#proc_spawn) [`proc_tcgetpgrp`](#proc_tcgetpgrp) [`proc_tcsetpgrp`](#proc_tcsetpgrp) [`proc_temp_path`](#proc_temp_path) [`proc_total_memory`](#proc_total_memory) [`proc_wait`](#proc_wait) [`proc_wait_usage`](#proc_wait_usage)
 
 ## Functions
 
@@ -43,6 +43,12 @@ proc_hostname(into: *u8, room: usize) -> isize
 proc_kill(pid: i64, signal: int) -> int
 ```
 
+### `proc_list`
+
+```sysl
+proc_list(which: int, id: i64, into: *int, room: usize) -> isize
+```
+
 ### `proc_pipe`
 
 ```sysl
@@ -53,6 +59,18 @@ proc_pipe(read_end: *int, write_end: *int) -> int
 
 ```sysl
 proc_poll(pid: i64, how: *int, value: *int) -> int
+```
+
+### `proc_poll_usage`
+
+```sysl
+proc_poll_usage(pid: i64, how: *int, value: *int, usage: *Usage) -> int
+```
+
+### `proc_resident`
+
+```sysl
+proc_resident(pid: i64, bytes: *u64) -> int
 ```
 
 ### `proc_set_id`
@@ -97,8 +115,20 @@ proc_tcsetpgrp(pgid: i64) -> int
 proc_temp_path(into: *u8, room: usize) -> isize
 ```
 
+### `proc_total_memory`
+
+```sysl
+proc_total_memory(bytes: *u64) -> int
+```
+
 ### `proc_wait`
 
 ```sysl
 proc_wait(pid: i64, started: i64, timeout_ms: i64, how: *int, value: *int) -> int
+```
+
+### `proc_wait_usage`
+
+```sysl
+proc_wait_usage(pid: i64, started: i64, timeout_ms: i64, how: *int, value: *int, usage: *Usage) -> int
 ```

@@ -1,0 +1,218 @@
+module sh.sysl.compiler
+@tests
+
+// **What a reaped child cost, through `sysl.process.sys`.**
+//
+// `Spawned.wait_usage` and `try_wait_usage` reach two hooks of their own, `sysl_proc_wait_usage` and
+// `sysl_proc_poll_usage`, which write a `sysl.process.sys.Usage` beside how the child ended. A
+// program that only `wait`s reaches neither, so a kernel that answers `sysl_proc_wait` answers
+// nothing new (`tests_ppe_process_pipes.sysl` pins the hooks a plain pipeline is refused for). On a
+// hosted POSIX target `sysl.process.hosted` answers all four under `weak` exports, every one of them
+// over the one `wait4` reaper in `spawn.c`. What the answers say at run time is
+// `library/sysl/process/usage_tests.sysl`'s.
+
+private val wus_target: string = "aarch64-freestanding"
+
+private val wus_script: string =
+    "ENTRY(kstart)\nSECTIONS\n{\n    . = 0x40080000;\n    .text : { KEEP(*(.text.boot)) *(.text .text.*) }\n" +
+    "    .rodata : { *(.rodata .rodata.*) }\n    .data : { *(.data .data.*) }\n" +
+    "    .bss (NOLOAD) : { *(.bss .bss.*) *(COMMON) }\n}\n"
+
+private val wus_manifest: string =
+    "package { name = \"img\", version = \"0.0.1\" }\n" +
+    "allocator {\n  alloc = \"img_alloc\"\n  free  = \"img_free\"\n}\n" +
+    s"targets {\n  $wus_target {\n    linker_script = \"link.ld\"\n    entry = \"kstart\"\n  }\n}\n"
+
+private val wus_wait_program: string = raw"""
+    import sysl.process.spawn
+    import sysl.process.sys.{Text, Usage}
+
+    go() -> int
+        val s = spawn("/bin/true") match
+            Ok(c) -> c
+            Err(_) -> return 1
+
+        s.wait_usage() match
+            Ok((_, cost)) -> int(cost.cpu().us)
+            Err(_) -> 2
+    end go
+    """
+
+private val wus_poll_program: string = raw"""
+    import sysl.process.spawn
+    import sysl.process.sys.{Text, Usage}
+
+    go() -> int
+        val s = spawn("/bin/true") match
+            Ok(c) -> c
+            Err(_) -> return 1
+
+        s.try_wait_usage() match
+            Ok(Some((_, cost))) -> int(cost.cpu().us)
+            _ -> 2
+    end go
+    """
+
+// The image's start, its heap, `putchar`, `exit`, and the `sysl.fs.sys` hooks a child's streams reach.
+private val wus_runtime: string = raw"""
+    @export("kstart")
+    kstart() -> never
+        val n = go()
+
+        loop
+            ()
+
+    @export("img_alloc")
+    img_alloc(n: usize) -> *u8 = ptr_cast(usize(0x4100_0000))
+
+    @export("img_free")
+    img_free(p: *u8) = ()
+
+    @export("putchar")
+    k_putchar(c: int) -> int = c
+
+    @export("exit")
+    k_exit(code: int) -> never
+        loop
+            ()
+
+    @export("sysl_fs_open")
+    k_open(path: *u8, len: usize, flags: u32, mode: u32, fd: *int) -> int = -38
+
+    @export("sysl_fs_read")
+    k_read(fd: int, into: *u8, room: usize, got: *usize) -> int = -38
+
+    @export("sysl_fs_write")
+    k_write(fd: int, from: *u8, len: usize, put: *usize) -> int = -38
+
+    @export("sysl_fs_close")
+    k_close(fd: int) -> int = 0
+
+    @export("sysl_fs_seek")
+    k_seek(fd: int, offset: long, whence: int, at: *long) -> int = -29
+
+    @export("sysl_fs_unlink")
+    k_unlink(path: *u8, len: usize) -> int = -38
+
+    @export("sysl_proc_spawn")
+    k_spawn(path: *u8, path_len: usize, argv: *Text, argc: usize, envp: *Text, envc: usize,
+            inherit_env: int, dir: *u8, dir_len: usize, stdin_fd: int, stdout_fd: int,
+            stderr_fd: int, started: *i64, pgid: i64, foreground: int) -> i64 = 7
+
+    @export("sysl_proc_wait")
+    k_wait(pid: i64, started: i64, timeout_ms: i64, how: *int, value: *int) -> int = 0
+
+    @export("sysl_proc_kill")
+    k_kill(pid: i64, signal: int) -> int = 0
+    """
+
+private val wus_usage_hooks: string = raw"""
+    @export("sysl_proc_wait_usage")
+    k_wait_usage(pid: i64, started: i64, timeout_ms: i64, how: *int, value: *int,
+                 usage: *Usage) -> int
+        usage[0] = Usage(3, 4, 4096)
+        0
+
+    @export("sysl_proc_poll_usage")
+    k_poll_usage(pid: i64, how: *int, value: *int, usage: *Usage) -> int
+        usage[0] = Usage(3, 4, 4096)
+        1
+    """
+
+private wus_tree(program: string) -> string
+    var files = lbr_two("main.sysl", program, "package.hocon", wus_manifest)
+
+    files.push(("link.ld", wus_script))
+    lbr_tree(files)
+end wus_tree
+
+private wus_emit(p: string) -> (int, string)
+    lbr_cli(["sysl", "emit-llvm", "-O0", "--target", wus_target, p])
+
+private val wus_refusal_head: string = "so the program answers it: define "
+
+@test("a freestanding wait_usage that answers wait but not wait_usage is refused for that hook alone")
+wus_wait_usage_hook_is_named()
+    if !lbr_ready() then return
+
+    val p = wus_tree(wus_wait_program + wus_runtime)
+    val said = wus_emit(p)
+
+    lbr_drop([p])
+    assert(said.0 != 0, "built with the wait_usage hook unanswered")
+    assert(said.1.contains(wus_refusal_head + "'sysl_proc_wait_usage' with '@export'"), said.1)
+end wus_wait_usage_hook_is_named
+
+@test("a freestanding try_wait_usage is refused for the poll_usage hook alone, not wait_usage")
+wus_poll_usage_hook_is_named()
+    if !lbr_ready() then return
+
+    val p = wus_tree(wus_poll_program + wus_runtime)
+    val said = wus_emit(p)
+
+    lbr_drop([p])
+    assert(said.0 != 0, "built with the poll_usage hook unanswered")
+    assert(said.1.contains(wus_refusal_head + "'sysl_proc_poll_usage' with '@export'"), said.1)
+    assert(!said.1.contains("'sysl_proc_wait_usage'"), said.1)
+end wus_poll_usage_hook_is_named
+
+@test("a freestanding program answering the usage hooks itself is accepted, its answers its own")
+wus_answered_usage_hooks()
+    if !lbr_ready() then return
+
+    for program in [wus_wait_program, wus_poll_program]
+        val p = wus_tree(program + wus_runtime + wus_usage_hooks)
+        val said = wus_emit(p)
+
+        lbr_drop([p])
+        assert(said.0 == 0, said.1)
+        assert(said.1.contains("@sysl_proc_wait_usage(") || said.1.contains("@sysl_proc_poll_usage("),
+               said.1)
+        assert(!said.1.contains("sysl_proc_posix_"), "a hosted answer came along")
+end wus_answered_usage_hooks
+
+// The definition line of `symbol` in an LLVM listing, or "".
+private wus_defined(listing: string, symbol: string) -> string
+    for line in lines_of(listing)
+        if line.starts_with("define ") && line.contains(s" @$symbol(") then return line
+
+    ""
+end wus_defined
+
+@test("on a hosted target the library answers wait, poll and both usage hooks weakly, over one shim")
+wus_hosted_usage_hooks_are_weak()
+    if !lbr_ready() then return
+
+    val p = lbr_program(raw"""
+        import sysl.process.spawn
+
+        val a = spawn("true").unwrap()
+        val b = spawn("true").unwrap()
+
+        print(a.wait_usage().is_ok(), a.wait().is_ok())
+        print(b.try_wait_usage().is_ok(), b.try_wait().is_ok())
+        """)
+    val said = lbr_cli(["sysl", "emit-llvm", "--no-std-lib", "--target", "x86_64-linux", p])
+
+    lbr_drop([p])
+    assert(said.0 == 0, said.1)
+
+    for hook in ["sysl_proc_wait", "sysl_proc_wait_usage", "sysl_proc_poll", "sysl_proc_poll_usage"]
+        val defined = wus_defined(said.1, hook)
+
+        assert(defined.starts_with("define weak "), s"$hook: $defined")
+
+    // One reaper: the plain hooks have no shim call of their own -- they go through the usage ones.
+    assert_eq(wus_calls(said.1, "sysl_proc_posix_wait"), 1)
+    assert_eq(wus_calls(said.1, "sysl_proc_posix_poll"), 1)
+end wus_hosted_usage_hooks_are_weak
+
+// How many lines of an LLVM listing call `symbol`.
+private wus_calls(listing: string, symbol: string) -> int
+    var n = 0
+
+    for line in lines_of(listing)
+        if line.contains("call ") && line.contains(s" @$symbol(") then n += 1
+
+    n
+end wus_calls

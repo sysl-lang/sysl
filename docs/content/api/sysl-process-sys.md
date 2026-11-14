@@ -8,7 +8,7 @@ module: sysl.process.sys
 
 ## Index
 
-[`ended_exited`](#ended_exited) [`ended_signalled`](#ended_signalled) [`ended_timed_out`](#ended_timed_out) [`group_inherit`](#group_inherit) [`group_new`](#group_new) [`id_group`](#id_group) [`id_process`](#id_process) [`id_real_group`](#id_real_group) [`id_real_user`](#id_real_user) [`id_user`](#id_user) [`Text`](#text)
+[`ended_exited`](#ended_exited) [`ended_signalled`](#ended_signalled) [`ended_timed_out`](#ended_timed_out) [`group_inherit`](#group_inherit) [`group_new`](#group_new) [`id_group`](#id_group) [`id_process`](#id_process) [`id_real_group`](#id_real_group) [`id_real_user`](#id_real_user) [`id_user`](#id_user) [`list_children`](#list_children) [`list_group`](#list_group) [`Text`](#text) [`Usage`](#usage)
 
 ## Constants
 
@@ -101,6 +101,20 @@ const id_user: int = 0
 What `get_id` and `set_id` are asked about: the user the program acts as -- the **effective** user,
 the one a filesystem checks a permission against and makes a new file's owner.
 
+### `list_children`
+
+```sysl
+const list_children: int = 1
+```
+
+### `list_group`
+
+```sysl
+const list_group: int = 0
+```
+
+`list_group` asks for the processes in the group `id`; `list_children` for those whose parent is `id`.
+
 ## Types
 
 ### `Text`
@@ -113,3 +127,18 @@ struct Text
 
 A run of bytes, lent: where it starts and how many there are. Laid out as C lays out a pointer
 followed by a `size_t`, which is what a supplier written in C reads it as.
+
+### `Usage`
+
+```sysl
+struct Usage
+    user_us: i64
+    system_us: i64
+    peak_resident: u64
+```
+
+What a reaped child cost, as `wait_usage` and `poll_usage` write it: the processor time it spent
+running its own code (`user_us`) and the kernel's on its behalf (`system_us`), in microseconds, each
+counting every descendant it reaped itself -- what POSIX's `wait4` answers in its `rusage` -- and
+the most memory it held at once (`peak_resident`), in bytes. Laid out as C lays out two `int64_t`s
+and a `uint64_t`. A supplier that cannot measure one writes zero there.

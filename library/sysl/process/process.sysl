@@ -8,6 +8,7 @@ import sysl.process.sys as psys
 import sysl.process.sys.Text
 import sysl.slices.{as_ptr, as_mut_ptr}
 import sysl.text.from_utf8
+import sysl.time.{Duration, micros}
 import sysl.fs.{adopted, open}
 
 /** Starting another program and waiting for what it does.
@@ -233,6 +234,39 @@ private begun(program: string, args: []const string, env: []const Var, inherit_e
     Ok((i32(pid), at))
 end begun
 
+/** What a child cost the machine, once it has ended and been reaped -- what `Spawned.wait_usage`
+ * answers beside its `Status`.
+ *
+ * `user` is the processor time it spent running its own code and `system` the time the kernel spent
+ * on its behalf. **Both count every descendant the child waited for itself**, as POSIX's `wait4`
+ * counts them: a shell that ran three compilers reports the compilers' time as well as its own. A
+ * descendant it left running, or that ended unwaited-for after it, is not counted -- it was never
+ * the child's to account for. `peak_resident` is the most memory, in bytes, that it -- or the largest
+ * of those descendants -- held in RAM at once.
+ *
+ * A target that cannot measure one of the three answers zero for it.
+ */
+struct Usage
+    user: Duration
+    system: Duration
+    peak_resident: u64
+
+    /** All the processor time the child cost: `user` and `system` together. */
+    cpu(self) -> Duration = self.user + self.system
+
+/** How a child ended, as a wait or poll hook wrote it into `how` and `value`. */
+private told(how: int, value: int) -> Status
+    // A child stopped for running too long ended by a signal, and the hook says so separately --
+    // which is the very confusion `TimedOut` exists to prevent.
+    if how == psys.ended_timed_out then return Status.TimedOut
+    if how == psys.ended_signalled then return Status.Signalled(value)
+
+    Status.Exited(value)
+end told
+
+/** What a hook wrote into a `psys.Usage`, as the durations and bytes `Usage` holds. */
+private spent(u: psys.Usage) -> Usage = Usage(micros(u.user_us), micros(u.system_us), u.peak_resident)
+
 /** Wait for a child `begun` started, for at most `timeout` milliseconds of its life. */
 private ended(pid: i32, at: i64, timeout: int) -> Result[Status, IoError]
     var how = 0
@@ -240,15 +274,19 @@ private ended(pid: i32, at: i64, timeout: int) -> Result[Status, IoError]
 
     val e = psys.wait(i64(pid), at, i64(timeout), &how, &value)
 
-    if e != 0 then return Err(failure(i64(e)))
-
-    // A child stopped for running too long ended by a signal, and the hook says so separately --
-    // which is the very confusion `TimedOut` exists to prevent.
-    if how == psys.ended_timed_out then return Ok(Status.TimedOut)
-    if how == psys.ended_signalled then return Ok(Status.Signalled(value))
-
-    Ok(Status.Exited(value))
+    if e != 0 then Err(failure(i64(e))) else Ok(told(how, value))
 end ended
+
+/** `ended`, also answering what the child cost. */
+private ended_usage(pid: i32, at: i64, timeout: int) -> Result[(Status, Usage), IoError]
+    var how = 0
+    var value = 0
+    var u = psys.Usage(0, 0, 0)
+
+    val e = psys.wait_usage(i64(pid), at, i64(timeout), &how, &value, &u)
+
+    if e != 0 then Err(failure(i64(e))) else Ok((told(how, value), spent(u)))
+end ended_usage
 
 /** Whether a child `begun` started has ended, without waiting for it: `None` while it runs, and how
  * it ended -- the child reaped -- once it has.
@@ -260,11 +298,22 @@ private polled(pid: i32) -> Result[Option[Status], IoError]
     val e = psys.poll(i64(pid), &how, &value)
 
     if e < 0 then return Err(failure(i64(e)))
-    if e == 0 then return Ok(None)
-    if how == psys.ended_signalled then return Ok(Some(Status.Signalled(value)))
 
-    Ok(Some(Status.Exited(value)))
+    if e == 0 then Ok(None) else Ok(Some(told(how, value)))
 end polled
+
+/** `polled`, also answering what the child cost once it has ended. */
+private polled_usage(pid: i32) -> Result[Option[(Status, Usage)], IoError]
+    var how = 0
+    var value = 0
+    var u = psys.Usage(0, 0, 0)
+
+    val e = psys.poll_usage(i64(pid), &how, &value, &u)
+
+    if e < 0 then return Err(failure(i64(e)))
+
+    if e == 0 then Ok(None) else Ok(Some((told(how, value), spent(u))))
+end polled_usage
 
 /** End a child nobody is going to wait for, and reap it.
  *
@@ -287,6 +336,11 @@ end stop
  * argument that is not one a call can take.
  */
 private const misdirected: int = 22
+
+/** `ECHILD`: what `wait_usage` answers for a child a plain `wait` or `try_wait` already reaped -- by
+ * then it is no longer this program's child to ask, and what it cost went with it.
+ */
+private const unaccounted: int = 10
 
 /** The descriptor `s` names for one of a child's streams, `-1` for "this program's own". `input` says
  * whether it is standard input. A file opened here for a path is pushed onto `made`, for the caller to
@@ -649,6 +703,7 @@ struct Spawned
     private answer: Option[Result[Status, IoError]]
     private pgid: i64
     private released: bool
+    private cost: Option[Usage]
 
     /** The process group the child was started in, as `Child.group` answers it: what a later stage of
      * a pipeline `Join`s, and what `set_foreground_group` hands the terminal to.
@@ -699,6 +754,63 @@ struct Spawned
 
         Ok(r)
     end try_wait
+
+    /** `wait`, answering beside the `Status` what the child cost: its processor time, its own and
+     * that of every descendant it waited for, and the most memory it held (`Usage`).
+     *
+     *     val (status, cost) = spawn("make", ["-j8"]).unwrap().wait_usage()?
+     *
+     * The deadline is kept as `wait` keeps it, and a child stopped at it is `TimedOut` with what it
+     * had cost by then. **It is the same wait as `wait`**, the child reaped once: waiting again --
+     * either way -- answers the first answer, and `wait_usage` again answers the same `Usage`. A
+     * child a plain `wait` or `try_wait` already reaped is `Other(10)` (`ECHILD`) here, its cost gone
+     * with it; ask this way from the start to have both.
+     */
+    @blocks
+    wait_usage(*self) -> Result[(Status, Usage), IoError]
+        self.answer match
+            Some(r) -> return self.recalled(r)
+            None -> ()
+
+        val r = ended_usage(self.id, self.began, self.timeout)
+
+        r match
+            Ok((s, u)) ->
+                self.answer = Some(Ok(s))
+                self.cost = Some(u)
+            Err(x) -> self.answer = Some(Err(x))
+
+        r
+    end wait_usage
+
+    /** `try_wait`, answering beside the `Status` what the child cost once it has ended: `Ok(None)`
+     * while it runs, then `Some` of what `wait_usage` would have said. Like `try_wait` it reaps the
+     * child at that moment and does not enforce `timeout`.
+     */
+    try_wait_usage(*self) -> Result[Option[(Status, Usage)], IoError]
+        self.answer match
+            Some(r) -> return self.recalled(r).map((t) -> Some(t))
+            None -> ()
+
+        val r = polled_usage(self.id)?
+
+        r match
+            Some((s, u)) ->
+                self.answer = Some(Ok(s))
+                self.cost = Some(u)
+            None -> ()
+
+        Ok(r)
+    end try_wait_usage
+
+    // What an earlier wait answered, with the cost it recorded -- none if a plain wait reaped it.
+    private recalled(self, r: Result[Status, IoError]) -> Result[(Status, Usage), IoError]
+        val s = r?
+
+        self.cost match
+            Some(u) -> Ok((s, u))
+            None -> Err(IoError.Other(unaccounted))
+    end recalled
 
     /** Sends the child the signal numbered `signal`, as `Child.kill` does: 15 asks it to stop and 9
      * makes it, and a child already waited for is not signalled.
@@ -793,7 +905,7 @@ spawn(program: string, args: []const string = [], dir: string = "", env: []const
     val (pid, at) = begun_to(program, args, env, inherit_env, dir, stdin, stdout, stderr, pgid,
                              foreground)?
 
-    Ok(Spawned(pid, at, timeout, None, pgid, false))
+    Ok(Spawned(pid, at, timeout, None, pgid, false, None))
 end spawn
 
 /** A file nothing else holds, made empty, for a child to write one of its streams into. */

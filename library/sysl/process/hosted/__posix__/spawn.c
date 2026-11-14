@@ -23,6 +23,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
+#include <sys/time.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <time.h>
@@ -242,10 +244,14 @@ static int child_setup(const char *const *names, const char *const *values, cons
  * Answers 1 for ended, 0 for still running, and -1 for a failure whose `errno` is left in `*err`.
  * `EINTR` is retried rather than reported, for the reason the blocking wait below retries it: a
  * signal arriving here is not the child's doing and must not turn it into a failure.
+ *
+ * **Every reap in this file is a `wait4`**, here and in `wait_out`, so the kernel's account of what
+ * the child cost lands in `*ru` whichever way it was waited for -- a plain wait and one that asks for
+ * the cost are the same wait. `ru` may be NULL, and `wait4` then keeps nothing.
  */
-static int reaped(pid_t pid, int *status, int *err) {
+static int reaped(pid_t pid, int *status, int *err, struct rusage *ru) {
     for (;;) {
-        pid_t ended = waitpid(pid, status, WNOHANG);
+        pid_t ended = wait4(pid, status, WNOHANG, ru);
 
         if (ended == pid) return 1;
 
@@ -272,9 +278,26 @@ static void decoded(int status, int *code, int *sig) {
     }
 }
 
+/* What a reaped child cost, out of `wait4`'s account, into the three words `sysl.process.sys.Usage`
+ * is laid out as: processor time in its own code and in the kernel's, in microseconds, then the most
+ * memory it held at once, in bytes. Both times count the descendants the child reaped itself.
+ *
+ * `ru_maxrss` is the one field whose unit differs: bytes on Darwin, kibibytes on Linux and the other
+ * BSDs, so it is made bytes here rather than leaving every caller to know which host it is on.
+ */
+static void accounted(const struct rusage *ru, long long *usage) {
+    usage[0] = (long long) ru->ru_utime.tv_sec * 1000000 + (long long) ru->ru_utime.tv_usec;
+    usage[1] = (long long) ru->ru_stime.tv_sec * 1000000 + (long long) ru->ru_stime.tv_usec;
+#if defined(__APPLE__)
+    usage[2] = (long long) ru->ru_maxrss;
+#else
+    usage[2] = (long long) ru->ru_maxrss * 1024;
+#endif
+}
+
 /* Wait for the child for as long as it takes. Answers 0, or an `errno`. */
-static int wait_out(pid_t pid, int *status) {
-    while (waitpid(pid, status, 0) < 0) {
+static int wait_out(pid_t pid, int *status, struct rusage *ru) {
+    while (wait4(pid, status, 0, ru) < 0) {
         if (errno != EINTR) return errno;
     }
 
@@ -291,11 +314,11 @@ static int wait_out(pid_t pid, int *status) {
  * not on macOS in any case. A `WNOHANG` loop asks the kernel a question and leaves nothing behind,
  * and what it costs is a wake-up every few milliseconds while a child runs.
  */
-static int wait_until(pid_t pid, int *status, long long deadline, int *err) {
+static int wait_until(pid_t pid, int *status, long long deadline, int *err, struct rusage *ru) {
     long long step = 1;
 
     for (;;) {
-        int ended = reaped(pid, status, err);
+        int ended = reaped(pid, status, err, ru);
 
         if (ended != 0) return ended;
 
@@ -323,19 +346,19 @@ static int wait_until(pid_t pid, int *status, long long deadline, int *err) {
  * is that a child which forked grandchildren of its own leaves them behind -- for which the answer
  * is to run the program rather than a shell that runs it, which is what this module does anyway.
  */
-static int stop(pid_t pid, int *status) {
+static int stop(pid_t pid, int *status, struct rusage *ru) {
     int wait_errno = 0;
 
     kill(pid, SIGTERM);
 
-    int in_time = wait_until(pid, status, now_ms() + SYSL_PROC_GRACE_MS, &wait_errno);
+    int in_time = wait_until(pid, status, now_ms() + SYSL_PROC_GRACE_MS, &wait_errno, ru);
 
     if (in_time < 0) return wait_errno;
 
     if (in_time == 1) return 0;
 
     kill(pid, SIGKILL);
-    return wait_out(pid, status);
+    return wait_out(pid, status, ru);
 }
 
 /* Whether `entry` (`NAME=value`) sets the variable `name`. */
@@ -625,7 +648,7 @@ static int start_forked(const char *program, char *const *argv,
          * here is what makes "could not be started" leave nothing behind for anybody to wait on. */
         int status = 0;
 
-        (void) wait_out(pid, &status);
+        (void) wait_out(pid, &status, NULL);
 
         if (tty >= 0 && had > 0) (void) handed_terminal(tty, had);
 
@@ -946,25 +969,30 @@ int sysl_proc_posix_start(const char *program, size_t program_len,
  * **A deadline already past is how a child nobody is going to wait for is ended**: one that has
  * ended is only reaped -- it is a zombie until somebody asks, and asking is the whole of the cure --
  * and one still running is stopped the way a timeout stops one.
+ *
+ * What the child cost is written into `usage` as `accounted` writes it, whichever way it ended.
  */
 int sysl_proc_posix_wait(int pid, long long started_ms, long long timeout_ms,
-                         int *code, int *sig, int *timed_out) {
+                         int *code, int *sig, int *timed_out, long long *usage) {
     *timed_out = 0;
 
     int status = 0;
+    struct rusage ru;
+
+    memset(&ru, 0, sizeof ru);
 
     if (timeout_ms <= 0) {
-        int e = wait_out(pid, &status);
+        int e = wait_out(pid, &status, &ru);
 
         if (e != 0) return e;
     } else {
         int wait_errno = 0;
-        int in_time = wait_until(pid, &status, started_ms + timeout_ms, &wait_errno);
+        int in_time = wait_until(pid, &status, started_ms + timeout_ms, &wait_errno, &ru);
 
         if (in_time < 0) return wait_errno;
 
         if (in_time == 0) {
-            int e = stop(pid, &status);
+            int e = stop(pid, &status, &ru);
 
             if (e != 0) return e;
 
@@ -973,18 +1001,23 @@ int sysl_proc_posix_wait(int pid, long long started_ms, long long timeout_ms,
     }
 
     decoded(status, code, sig);
+    accounted(&ru, usage);
 
     return 0;
 }
 
 /* Whether the child `pid` has ended, without waiting for it: `*ended` is 1 once it has -- reaped, how
- * it ended decoded into `*code` and `*sig` as the wait above decodes it -- and 0 while it still runs.
- * Answers zero or an `errno`.
+ * it ended decoded into `*code` and `*sig` as the wait above decodes it, what it cost into `usage` --
+ * and 0 while it still runs, `usage` then all zeros. Answers zero or an `errno`.
  */
-int sysl_proc_posix_poll(int pid, int *ended, int *code, int *sig) {
+int sysl_proc_posix_poll(int pid, int *ended, int *code, int *sig, long long *usage) {
     int status = 0;
     int err = 0;
-    int r = reaped(pid, &status, &err);
+    struct rusage ru;
+
+    memset(&ru, 0, sizeof ru);
+
+    int r = reaped(pid, &status, &err, &ru);
 
     if (r < 0) return err;
 
@@ -996,6 +1029,8 @@ int sysl_proc_posix_poll(int pid, int *ended, int *code, int *sig) {
     } else {
         decoded(status, code, sig);
     }
+
+    accounted(&ru, usage);
 
     return 0;
 }

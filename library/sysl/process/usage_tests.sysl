@@ -1,0 +1,164 @@
+module sysl.process
+@requires(posix)
+@tests
+
+import sysl.fs.IoError
+import sysl.posix.time.monotonic
+import sysl.time.{millis, sleep, whole_millis}
+
+// What a reaped child cost, asserted against real children: `Spawned.wait_usage` and `try_wait_usage`
+// answer the same `Status` as `wait` and `try_wait` with a `Usage` beside it, counting the
+// descendants the child waited for itself.
+
+private extern "kill" ut_signal(pid: i32, sig: int) -> int
+
+// A shell that runs three `yes` in turn, a tenth of a second each, reaping each one: nearly all the
+// processor time is the descendants', and the shell's own is a few milliseconds.
+private val ut_three_yes: string = "for i in 1 2 3; do yes > /dev/null & p=$!; sleep 0.1; kill $p; done"
+
+@test("wait_usage counts the descendants a child reaped, and no more than the wall clock allows")
+ut_descendants_counted()
+    val t0 = monotonic()
+    val s = spawn("sh", ["-c", ut_three_yes + "; wait"]).unwrap()
+    val (status, cost) = s.wait_usage().unwrap()
+    val wall = whole_millis(monotonic() - t0)
+    val cpu = whole_millis(cost.cpu())
+
+    assert_eq(status, Status.Exited(0))
+    assert(cpu >= 50, s"three yes for 0.1 s each cost only $cpu ms: the descendants were not counted")
+    // One `yes` runs at a time, so the processor time cannot outrun the wall clock by more than the
+    // clock's own granularity.
+    assert(cpu <= wall + 100, s"$cpu ms of processor time in $wall ms of wall clock")
+    assert_eq(whole_millis(cost.user + cost.system), cpu)
+    assert(cost.peak_resident > 0, "a child that ran held no memory")
+end ut_descendants_counted
+
+@test("the reported shape -- three background yes killed in turn -- reports CPU through wait_usage")
+ut_reported_reproducer()
+    val s = spawn("sh", ["-c", ut_three_yes]).unwrap()
+    val (status, cost) = s.wait_usage().unwrap()
+
+    assert_eq(status, Status.Exited(0))
+    assert(cost.cpu().us > 0, "the reproducer reported no processor time")
+end ut_reported_reproducer
+
+@test("a child that only sleeps costs nearly no processor time")
+ut_sleeper_is_cheap()
+    val s = spawn("sleep", ["0.2"]).unwrap()
+    val (status, cost) = s.wait_usage().unwrap()
+
+    assert_eq(status, Status.Exited(0))
+    assert(whole_millis(cost.cpu()) < 50, s"sleep 0.2 cost ${whole_millis(cost.cpu())} ms")
+    assert(cost.user.us >= 0 && cost.system.us >= 0, "a negative time")
+end ut_sleeper_is_cheap
+
+@test("try_wait_usage is None while the child runs, then its status and cost, remembered after")
+ut_try_wait_usage_before_and_after()
+    val s = spawn("sh", ["-c", "sleep 0.2; exit 4"]).unwrap()
+
+    assert(s.try_wait_usage().unwrap().is_none(), "a running child answered Some")
+
+    var got = s.try_wait_usage().unwrap()
+    var rounds = 0
+
+    while got.is_none() && rounds < 500
+        sleep(millis(10))
+        got = s.try_wait_usage().unwrap()
+        rounds += 1
+
+    assert(got.is_some(), "the child never ended")
+
+    val (status, cost) = got.unwrap()
+
+    assert_eq(status, Status.Exited(4))
+    // Remembered: every way of asking now answers what the poll found, at once.
+    assert_eq(s.wait().unwrap(), Status.Exited(4))
+    assert_eq(s.try_wait().unwrap().unwrap(), Status.Exited(4))
+
+    val (again, cost2) = s.wait_usage().unwrap()
+
+    assert_eq(again, Status.Exited(4))
+    assert_eq(cost2.user.us, cost.user.us)
+    assert_eq(cost2.system.us, cost.system.us)
+    assert_eq(cost2.peak_resident, cost.peak_resident)
+
+    val (polled, cost3) = s.try_wait_usage().unwrap().unwrap()
+
+    assert_eq(polled, Status.Exited(4))
+    assert_eq(cost3.cpu().us, cost.cpu().us)
+end ut_try_wait_usage_before_and_after
+
+@test("wait and wait_usage answer the same exit code, signal and timeout")
+ut_same_status_either_way()
+    assert_eq(spawn("sh", ["-c", "exit 3"]).unwrap().wait().unwrap(), Status.Exited(3))
+    assert_eq(spawn("sh", ["-c", "exit 3"]).unwrap().wait_usage().unwrap().0, Status.Exited(3))
+
+    val a = spawn("sleep", ["5"]).unwrap()
+    val b = spawn("sleep", ["5"]).unwrap()
+
+    a.kill(9).unwrap()
+    b.kill(9).unwrap()
+    assert_eq(a.wait().unwrap(), Status.Signalled(9))
+    assert_eq(b.wait_usage().unwrap().0, Status.Signalled(9))
+
+    val t0 = monotonic()
+    val (status, cost) = spawn("sleep", ["5"], timeout = 100).unwrap().wait_usage().unwrap()
+
+    assert_eq(status, Status.TimedOut)
+    assert(whole_millis(monotonic() - t0) < 3000, "the deadline was not kept")
+    assert(whole_millis(cost.cpu()) < 50, "a sleeper stopped at its deadline cost processor time")
+end ut_same_status_either_way
+
+@test("waiting again answers the first answer; a plain wait first leaves no cost to ask for")
+ut_second_waits()
+    val s = spawn("sh", ["-c", "exit 2"]).unwrap()
+    val (first, cost) = s.wait_usage().unwrap()
+    val (second, again) = s.wait_usage().unwrap()
+
+    assert_eq(first, Status.Exited(2))
+    assert_eq(second, Status.Exited(2))
+    assert_eq(again.cpu().us, cost.cpu().us)
+    assert_eq(s.wait().unwrap(), Status.Exited(2))
+    assert(s.kill(9).is_ok(), "a child already waited for answers Ok and is not signalled")
+
+    val plain = spawn("sh", ["-c", "exit 5"]).unwrap()
+
+    assert_eq(plain.wait().unwrap(), Status.Exited(5))
+    assert(plain.wait_usage().unwrap_err() == IoError.Other(10))
+    assert(plain.try_wait_usage().unwrap_err() == IoError.Other(10))
+    // The refusal changes nothing the plain answers say.
+    assert_eq(plain.wait().unwrap(), Status.Exited(5))
+
+    val polled = spawn("sh", ["-c", "exit 6"]).unwrap()
+
+    while polled.try_wait().unwrap().is_none() do sleep(millis(10))
+
+    assert(polled.wait_usage().unwrap_err() == IoError.Other(10))
+end ut_second_waits
+
+@test("a child killed by a signal still reports the processor time it spent")
+ut_signalled_child_has_usage()
+    val s = spawn("sh", ["-c", "while :; do :; done"]).unwrap()
+
+    sleep(millis(200))
+    assert_eq(ut_signal(i32(s.pid()), 9), 0)
+
+    val (status, cost) = s.wait_usage().unwrap()
+
+    assert_eq(status, Status.Signalled(9))
+    assert(whole_millis(cost.cpu()) >= 20, s"a spinning shell cost ${whole_millis(cost.cpu())} ms")
+end ut_signalled_child_has_usage
+
+@test("a wait_usage on a child the kernel no longer has fails as wait does, and stays failed")
+ut_reaped_elsewhere_fails()
+    val s = spawn("sh", ["-c", "exit 0"]).unwrap()
+
+    // Reaped behind the handle's back, by pid: the handle's own wait then finds no child.
+    assert_eq(wait_pid(s.pid()).unwrap(), Status.Exited(0))
+
+    val r = s.wait_usage()
+
+    assert(r.unwrap_err() == IoError.Other(10))
+    assert(s.wait_usage().unwrap_err() == IoError.Other(10))
+    assert(s.wait().unwrap_err() == IoError.Other(10))
+end ut_reaped_elsewhere_fails

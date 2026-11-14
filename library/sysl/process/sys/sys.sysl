@@ -23,7 +23,7 @@ module sysl.process.sys
 // **A hook answers one integer: what it did, or what went wrong** -- the contract of every `*.sys`
 // module (`sysl.fs.sys`, `sysl.io.sys`).
 // Zero or more is success: a process id for `spawn` and `setsid`, a length for `temp_path`, a user or
-// group id for `get_id`, one or zero for `poll`, zero for the others -- except `exec`, whose success is never seen, the program that would
+// group id for `get_id`, one or zero for `poll` and `poll_usage`, zero for the others -- except `exec`, whose success is never seen, the program that would
 // have read it being gone.
 // A negative answer is the code of the failure negated -- the `IoError` code `sysl.fs` uses, which on
 // a POSIX host is the `errno` -- so a kernel's system call that already answers a negative error
@@ -122,6 +122,32 @@ private[sysl] extern "sysl_proc_wait" wait(pid: i64, started: i64, timeout_ms: i
  * cannot ask without blocking answers `UNSUPPORTED`, and does not block.
  */
 private[sysl] extern "sysl_proc_poll" poll(pid: i64, how: *int, value: *int) -> int
+
+/** What a reaped child cost, as `wait_usage` and `poll_usage` write it: the processor time it spent
+ * running its own code (`user_us`) and the kernel's on its behalf (`system_us`), in microseconds, each
+ * counting every descendant it reaped itself -- what POSIX's `wait4` answers in its `rusage` -- and
+ * the most memory it held at once (`peak_resident`), in bytes. Laid out as C lays out two `int64_t`s
+ * and a `uint64_t`. A supplier that cannot measure one writes zero there.
+ */
+struct Usage
+    user_us: i64
+    system_us: i64
+    peak_resident: u64
+
+/** `wait`, also writing what the child cost into `usage`: the same deadline, the same `how` and
+ * `value`, the same answer. Reached only by `Spawned.wait_usage`, so a supplier that never measures a
+ * child answers only `wait`.
+ */
+@blocks
+private[sysl] extern "sysl_proc_wait_usage" wait_usage(pid: i64, started: i64, timeout_ms: i64,
+                                                       how: *int, value: *int,
+                                                       usage: *Usage) -> int
+
+/** `poll`, also writing what the child cost into `usage` once it has ended. Reached only by
+ * `Spawned.try_wait_usage`.
+ */
+private[sysl] extern "sysl_proc_poll_usage" poll_usage(pid: i64, how: *int, value: *int,
+                                                       usage: *Usage) -> int
 
 /** Sends the child `pid` the signal numbered `signal` -- POSIX's numbers: 15 asks it to stop and 9
  * makes it -- answering zero or the failure's code, negated.

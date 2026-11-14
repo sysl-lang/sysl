@@ -1,7 +1,7 @@
 module sysl.process.hosted
 @requires(posix, libc)
 
-import sysl.process.sys.{Text, ended_exited, ended_signalled, ended_timed_out, id_group,
+import sysl.process.sys.{Text, Usage, ended_exited, ended_signalled, ended_timed_out, id_group,
                          id_process, id_real_group, id_real_user, id_user}
 import sysl.slices.as_mut_ptr
 import sysl.sys.host_status
@@ -43,7 +43,8 @@ private extern "sysl_proc_posix_start" c_start(program: *u8, program_len: usize,
                                                pgid: i32, foreground: int) -> int
 
 private extern "sysl_proc_posix_wait" c_wait(pid: i32, started_ms: i64, timeout_ms: i64,
-                                             code: *i32, sig: *i32, timed_out: *i32) -> int
+                                             code: *i32, sig: *i32, timed_out: *i32,
+                                             usage: *Usage) -> int
 
 private extern "sysl_proc_posix_temp_path" c_temp_path(into: *u8, n: usize) -> int
 
@@ -62,12 +63,21 @@ proc_spawn(path: *u8, path_len: usize, argv: *Text, argc: usize, envp: *Text, en
     if e != 0 then i64(host_status(int(e))) else i64(pid)
 end proc_spawn
 
+// `wait` and `wait_usage` are one wait: the shim reaps with `wait4` either way, and `wait` only
+// leaves the cost where nobody reads it.
 @export("sysl_proc_wait")
 proc_wait(pid: i64, started: i64, timeout_ms: i64, how: *int, value: *int) -> int
+    var unread = Usage(0, 0, 0)
+
+    proc_wait_usage(pid, started, timeout_ms, how, value, &unread)
+
+@export("sysl_proc_wait_usage")
+proc_wait_usage(pid: i64, started: i64, timeout_ms: i64, how: *int, value: *int,
+                usage: *Usage) -> int
     var code: i32 = 0
     var sig: i32 = 0
     var expired: i32 = 0
-    val e = c_wait(i32(pid), started, timeout_ms, &code, &sig, &expired)
+    val e = c_wait(i32(pid), started, timeout_ms, &code, &sig, &expired, usage)
 
     if e != 0 then return host_status(int(e))
 
@@ -85,16 +95,23 @@ proc_wait(pid: i64, started: i64, timeout_ms: i64, how: *int, value: *int) -> in
     end if
 
     0
-end proc_wait
+end proc_wait_usage
 
-private extern "sysl_proc_posix_poll" c_poll(pid: i32, ended: *i32, code: *i32, sig: *i32) -> int
+private extern "sysl_proc_posix_poll" c_poll(pid: i32, ended: *i32, code: *i32, sig: *i32,
+                                             usage: *Usage) -> int
 
 @export("sysl_proc_poll")
 proc_poll(pid: i64, how: *int, value: *int) -> int
+    var unread = Usage(0, 0, 0)
+
+    proc_poll_usage(pid, how, value, &unread)
+
+@export("sysl_proc_poll_usage")
+proc_poll_usage(pid: i64, how: *int, value: *int, usage: *Usage) -> int
     var ended: i32 = 0
     var code: i32 = 0
     var sig: i32 = 0
-    val e = c_poll(i32(pid), &ended, &code, &sig)
+    val e = c_poll(i32(pid), &ended, &code, &sig, usage)
 
     if e != 0 then return host_status(e)
     if ended == 0 then return 0
@@ -108,7 +125,7 @@ proc_poll(pid: i64, how: *int, value: *int) -> int
     end if
 
     1
-end proc_poll
+end proc_poll_usage
 
 @export("sysl_proc_kill")
 proc_kill(pid: i64, signal: int) -> int
