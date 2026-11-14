@@ -1631,11 +1631,12 @@ In Go two slices can agree until one of them grows, because one representation h
 roles. Held by reference, a `Buf` behaves as any `&T` does; held by value it is a value. Neither is a
 rule specific to growable arrays.
 
-**A buffer that is done growing can be frozen.** `b.freeze()` takes its elements and answers a `&sync
-Frozen[T]` — one atomic count on the whole buffer, indexed, walked and viewed as a `[]const T`, and
-never written — which every thread may read at once without a lock; `b` is left empty. An index
-past its length traps, as a `Buf`'s does. What it may
-hold, and why, is in [A frozen buffer crosses](/reference/memory/#a-frozen-buffer-crosses):
+**A buffer that is done growing can be frozen.** `b.freeze()` takes its elements and answers a
+`&Frozen[T]` — one count on the whole buffer, indexed, walked and viewed as a `[]const T`, and never
+written; `b` is left empty. An index past its length traps, as a `Buf`'s does. Where the position
+expects a `&sync Frozen[T]`, the count is atomic and every thread may read it at once without a lock;
+what that one may hold, and why, is in
+[A frozen buffer crosses](/reference/memory/#a-frozen-buffer-crosses):
 
 ```sysl
 import sysl.buf.{Buf, buf}
