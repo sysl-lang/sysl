@@ -1988,16 +1988,47 @@ build_receiver(cx: &Analyzer, span: Span, mode: RecvMode, tr: TExpr,
     // fresh construction -- has none. Boxing a copy here would hand the method a share of something
     // the caller never sees again. So the refusal names the binding, which is where the box is made,
     // and the call comes to `Unknown` so nothing downstream of it says more.
-    ByRef(_) -> texpr_type(tr) match
-        Ref(_, _) -> tr
+    //
+    // **The receiver's kind is the method's kind**: `&T` and `&sync T` are distinct types, so a
+    // `&self` method is not called on a `&sync T`, nor a `&sync self` one on a `&T`
+    // (`receiver_kind_refusal`).
+    ByRef(sync) -> texpr_type(tr) match
+        Ref(inner, held) ->
+            if held != sync then return receiver_kind_refusal(cx, span, member, *inner, sync)
+
+            tr
         Unknown -> tr
         _ ->
             val shown = type_show(texpr_type(tr))
+            val kind = if sync then "&sync " else "&"
 
-            cx.err(span, s"'&self' needs a counted reference, and this receiver is a $shown on the " +
-                   "stack — a '&self' method may keep hold of what it is called on, so what it wants " +
-                   "is a share of a box rather than an address. Bind the value into one and call it " +
-                   s"on that: 'var r: &$shown = …'")
+            cx.err(span, s"'${kind}self' needs a counted reference, and this receiver is a $shown on " +
+                   s"the stack — a '${kind}self' method may keep hold of what it is called on, so what " +
+                   "it wants is a share of a box rather than an address. Bind the value into one and " +
+                   s"call it on that: 'var r: $kind$shown = …'")
+
+// A `&self` method called on a `&sync T`, or a `&sync self` one on a `&T`.
+//
+// **The two directions are refused for two reasons.** A `&self` method may retain or release its
+// receiver with an ordinary count, or hand it to code that does, while another thread holds the same
+// object: a lost update on the count, and the object freed under a live reference. A `&sync self`
+// method may hand its receiver to another thread, which a `&T` may not reach. The cure names both
+// ends: the method's receiver, or where the object is allocated.
+receiver_kind_refusal(cx: &Analyzer, span: Span, member: string, inner: Type, wants_sync: bool) -> TExpr
+    val t = type_show(inner)
+
+    if wants_sync then
+        return cx.err(span, s"'$member' takes '&sync self', and this receiver is a '&$t' — '&$t' and " +
+                      s"'&sync $t' are distinct types, and neither converts to the other: a " +
+                      s"'&sync self' method may hand its receiver to another thread, and a '&$t' may " +
+                      s"not leave its domain. Allocate $t as a '&sync $t' where it is constructed, or " +
+                      s"declare '$member' with '&self'")
+
+    cx.err(span, s"'$member' takes '&self', and this receiver is a '&sync $t' — '&$t' and " +
+           s"'&sync $t' are distinct types, and neither converts to the other: a '&self' method may " +
+           "retain or release its receiver with an ordinary count while another thread holds the same " +
+           s"object. Declare '$member' with '&sync self', or with 'self' where it only reads")
+end receiver_kind_refusal
 
 // The name the lowered member goes under. A member of a concrete type was lowered eagerly; a member
 // of a generic type is instantiated here, from the receiver's own type arguments, and its body
@@ -3191,6 +3222,14 @@ end member_argument_told
 // which is what an object writes its bindings down for.
 private erased_call(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, slot: int,
                     tr: Bound, m: MethodDecl, args: Buf[Expr]) -> TExpr
+    // A trait object's kind is its receiver's, as a type's is (`receiver_kind_refusal`).
+    m.recv_mode() match
+        Some(ByRef(sync)) -> texpr_type(receiver) match
+            Ref(inner, held) ->
+                if held != sync then return receiver_kind_refusal(cx, span, m.name, *inner, sync)
+            _ -> ()
+        _ -> ()
+
     val scope = trait_scope_of(cx.an, tr.name)
     val d = trait_decl_at(cx.an, tr.name)
     var subst = self_binding(rty)
