@@ -3610,8 +3610,10 @@ private holds_pointer_within(t: Type, seen: *Buf[string]) -> bool = t match
     // **A closure literal with captures may hold the address of each `var` it captures** (`closure_mode.sysl`),
     // and whether it does is what this analysis is asked to decide -- so its value is followed
     // wherever it goes, whatever its fields say before the decision.
-    Struct(d) -> (is_closure_literal(t) && !d.fields.is_empty()) ||
-        (first_visit(t, seen) && fields_hold_pointer(d.fields, seen))
+    Struct(d) -> frozen_element(t) match
+        Some(elem) -> holds_pointer_within(elem, seen)
+        None -> (is_closure_literal(t) && !d.fields.is_empty()) ||
+            (first_visit(t, seen) && fields_hold_pointer(d.fields, seen))
     Enum(d) -> first_visit(t, seen) && variants_hold_pointer(d.variants, seen)
     _ -> false
 
@@ -3633,6 +3635,10 @@ private holds_raw_pointer(t: Type, depth: int) -> bool
         Struct(d) ->
             if is_closure_literal(t) then return false
 
+            frozen_element(t) match
+                Some(elem) -> return holds_raw_pointer(elem, depth + 1)
+                None -> ()
+
             for item in d.fields
                 if holds_raw_pointer(item.1, depth + 1) then return true
 
@@ -3645,6 +3651,15 @@ private holds_raw_pointer(t: Type, depth: int) -> bool
             false
         _ -> false
 end holds_raw_pointer
+
+// **A frozen buffer holds an address only where its elements do** (`library/sysl/buf/frozen.sysl`),
+// as a view does: its `*T` names the storage `freeze()` took out of a buffer, which is the heap's and
+// is owned through the frozen buffer's own count, never anybody's frame. Its private fields are set
+// by the library alone, so the element type is all a value of it can lend. The element type, or
+// nothing for any other type.
+private frozen_element(t: Type) -> Option[Type] = t match
+    Struct(d) -> if d.base == frozen_base() && d.targs.len() == 1 then Some(d.targs[0]) else None
+    _ -> None
 
 private first_visit(t: Type, seen: *Buf[string]) -> bool
     val key = type_show(t)
