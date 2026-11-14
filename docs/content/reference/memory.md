@@ -299,6 +299,47 @@ a weak reference does not keep Node alive, and nothing else here holds this one
 where the object is allocated. It is the only kind that may cross a concurrency domain
 ([below](#crossing-a-concurrency-domain)).
 
+**A method's reference receiver is one kind or the other**, as its parameters are: a `&self` method
+is called on a `&T`, and a `&sync self` method on a `&sync T`. A `&self` body retains and releases
+its receiver with an ordinary count, which would race another thread's on the same object; a
+`&sync self` body may hand its receiver to another thread, where a `&T` may not go. The rule holds
+for a field reached through a reference, a capture, `self` inside another method, a bound of a
+generic, and a trait object's slot alike, and `@unchecked(Share)` does not lift it, since it promises
+the writes, not the counts. A method that only reads is written `self`, which either kind reaches.
+
+```sysl
+struct Cell
+    n: int
+
+impl Cell
+    get(&self) -> int = self.n
+
+val c: &sync Cell = Cell(2)
+
+print(c.get())
+```
+
+```error
+'get' takes '&self', and this receiver is a '&sync Cell' — '&Cell' and '&sync Cell' are distinct types, and neither converts to the other: a '&self' method may retain or release its receiver with an ordinary count while another thread holds the same object. Declare 'get' with '&sync self', or with 'self' where it only reads
+```
+
+```sysl
+struct Cell
+    n: int
+
+impl Cell
+    get(self) -> int = self.n
+    keep(&sync self) -> &sync Cell = self
+
+val c: &sync Cell = Cell(2)
+
+print(c.get() + c.keep().n)
+```
+
+```output
+4
+```
+
 **A field reached through a `&sync T` is read-only.** Every thread holding the reference reaches the
 same object at once, so a plain store races theirs: two `c.n += 1` lose updates, and two stores of a
 counted field release one value twice. An assignment, a compound assignment, a `*self` member called

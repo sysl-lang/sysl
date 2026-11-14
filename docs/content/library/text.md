@@ -946,6 +946,7 @@ parse_uint(s: string) -> Result[uint, ParseError]
 parse_ulong(s: string) -> Result[ulong, ParseError]
 parse_real(s: string) -> Result[real, ParseError]
 parse_f32(s: string) -> Result[f32, ParseError]
+parse_f16(s: string) -> Result[f16, ParseError]
 
 parse_int_base(s: string, base: int) -> Result[int, ParseError]
 parse_long_base(s: string, base: int) -> Result[long, ParseError]
@@ -958,6 +959,7 @@ parse_uint(b: []const u8) -> Result[uint, ParseError]
 parse_ulong(b: []const u8) -> Result[ulong, ParseError]
 parse_real(b: []const u8) -> Result[real, ParseError]
 parse_f32(b: []const u8) -> Result[f32, ParseError]
+parse_f16(b: []const u8) -> Result[f16, ParseError]
 
 parse_int_base(b: []const u8, base: int) -> Result[int, ParseError]
 parse_long_base(b: []const u8, base: int) -> Result[long, ParseError]
@@ -1049,22 +1051,25 @@ read as the policy they are.
 
 `parse_real` returns **the `real` nearest the decimal, half way to the even one, however many digits
 it has** — and `parse_f32` the nearest `f32`, rounded once rather than through a `real`, which could
-leave a value lying near half way between two `f32`s on the wrong side. Both are written in sysl,
-with integer arithmetic only, so they allocate nothing, copy nothing and need no C library.
+leave a value lying near half way between two `f32`s on the wrong side; `parse_f16` the same for an
+`f16`. All are written in sysl, with integer arithmetic only, so they allocate nothing, copy nothing
+and need no C library.
 
 ```sysl
-import sysl.text.{parse_f32, parse_real}
+import sysl.text.{parse_f16, parse_f32, parse_real}
 
 print(parse_real("0.1").unwrap() + parse_real("0.2").unwrap())
 print(parse_real("2.2250738585072011e-308").unwrap().bits() == 0x000fffffffffffff)
 print(parse_real("1e400").unwrap(), parse_real("-1e-400").unwrap())
 print(parse_f32("1.00000005960464477550").unwrap().bits() == 0x3f800001)
+print(parse_f16("1.00048828125000000000000000000000000000001").unwrap().bits() == 0x3c01)
 ```
 
 ```output
 0.30000000000000004
 true
 inf -0
+true
 true
 ```
 
@@ -1084,7 +1089,8 @@ infinity and one below half the smallest is a zero, each of the sign written, as
 
 **`real_prefix` and `f32_prefix` are `strtod` and `strtof` themselves** — the value of the longest
 prefix that reads as a float and how many bytes it took, zero where none does — for a reader that
-has more than a number in front of it, and for a C library written in sysl:
+has more than a number in front of it, and for a C library written in sysl. `f16_prefix` and
+`f128_prefix` read the same text at their own widths:
 
 ```sysl
 import sysl.text.real_prefix

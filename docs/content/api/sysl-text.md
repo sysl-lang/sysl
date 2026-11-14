@@ -19,7 +19,7 @@ that `ẞ` lower-cases to `ß`, and it is the other module that does.
 
 ## Index
 
-[`char_columns`](#char_columns) [`char_from_u32`](#char_from_u32) [`char_indices`](#char_indices) [`chars_of`](#chars_of) [`cluster_columns`](#cluster_columns) [`columns`](#columns) [`contains_fold`](#contains_fold) [`cstring`](#cstring) [`ends_with_fold`](#ends_with_fold) [`eq_fold`](#eq_fold) [`f128_prefix`](#f128_prefix) [`f32_prefix`](#f32_prefix) [`fields`](#fields) [`from_cstring`](#from_cstring) [`from_utf8`](#from_utf8) [`from_utf8_lossy`](#from_utf8_lossy) [`from_utf8_unchecked`](#from_utf8_unchecked) [`grapheme_columns`](#grapheme_columns) [`is_char_boundary`](#is_char_boundary) [`join`](#join) [`lines`](#lines) [`parse_bool`](#parse_bool) [`parse_bool`](#parse_bool-1) [`parse_f128`](#parse_f128) [`parse_f128`](#parse_f128-1) [`parse_f32`](#parse_f32) [`parse_f32`](#parse_f32-1) [`parse_int`](#parse_int) [`parse_int`](#parse_int-1) [`parse_int_base`](#parse_int_base) [`parse_int_base`](#parse_int_base-1) [`parse_long`](#parse_long) [`parse_long`](#parse_long-1) [`parse_long_base`](#parse_long_base) [`parse_long_base`](#parse_long_base-1) [`parse_real`](#parse_real) [`parse_real`](#parse_real-1) [`parse_uint`](#parse_uint) [`parse_uint`](#parse_uint-1) [`parse_ulong`](#parse_ulong) [`parse_ulong`](#parse_ulong-1) [`parse_ulong_base`](#parse_ulong_base) [`parse_ulong_base`](#parse_ulong_base-1) [`real_prefix`](#real_prefix) [`repeat`](#repeat) [`replace_all`](#replace_all) [`split`](#split) [`starts_with_fold`](#starts_with_fold) [`str_builder`](#str_builder) [`str_builder_with_capacity`](#str_builder_with_capacity) [`str_view`](#str_view) [`to_lower`](#to_lower) [`to_upper`](#to_upper) [`CharIndices`](#charindices) [`Chars`](#chars) [`CString`](#cstring-1) [`ParseError`](#parseerror) [`StrBuilder`](#strbuilder) [`Utf8Error`](#utf8error) [`Ascii`](#ascii) [`Join`](#join-1) [`Search`](#search) [`Text`](#text) [Ascii for char](#ascii-for-char) [Ascii for u8](#ascii-for-u8) [Display for ParseError](#display-for-parseerror) [Iterate for CharIndices](#iterate-for-charindices) [Iterate for Chars](#iterate-for-chars) [Join for []const T](#join-for-const-t) [Join for [N]T](#join-for-nt) [Join for Buf[T]](#join-for-buft) [Search for []const u8](#search-for-const-u8) [Search for string](#search-for-string) [Text for string](#text-for-string)
+[`char_columns`](#char_columns) [`char_from_u32`](#char_from_u32) [`char_indices`](#char_indices) [`chars_of`](#chars_of) [`cluster_columns`](#cluster_columns) [`columns`](#columns) [`contains_fold`](#contains_fold) [`cstring`](#cstring) [`ends_with_fold`](#ends_with_fold) [`eq_fold`](#eq_fold) [`f128_prefix`](#f128_prefix) [`f16_prefix`](#f16_prefix) [`f32_prefix`](#f32_prefix) [`fields`](#fields) [`from_cstring`](#from_cstring) [`from_utf8`](#from_utf8) [`from_utf8_lossy`](#from_utf8_lossy) [`from_utf8_unchecked`](#from_utf8_unchecked) [`grapheme_columns`](#grapheme_columns) [`is_char_boundary`](#is_char_boundary) [`join`](#join) [`lines`](#lines) [`parse_bool`](#parse_bool) [`parse_bool`](#parse_bool-1) [`parse_f128`](#parse_f128) [`parse_f128`](#parse_f128-1) [`parse_f16`](#parse_f16) [`parse_f16`](#parse_f16-1) [`parse_f32`](#parse_f32) [`parse_f32`](#parse_f32-1) [`parse_int`](#parse_int) [`parse_int`](#parse_int-1) [`parse_int_base`](#parse_int_base) [`parse_int_base`](#parse_int_base-1) [`parse_long`](#parse_long) [`parse_long`](#parse_long-1) [`parse_long_base`](#parse_long_base) [`parse_long_base`](#parse_long_base-1) [`parse_real`](#parse_real) [`parse_real`](#parse_real-1) [`parse_uint`](#parse_uint) [`parse_uint`](#parse_uint-1) [`parse_ulong`](#parse_ulong) [`parse_ulong`](#parse_ulong-1) [`parse_ulong_base`](#parse_ulong_base) [`parse_ulong_base`](#parse_ulong_base-1) [`real_prefix`](#real_prefix) [`repeat`](#repeat) [`replace_all`](#replace_all) [`split`](#split) [`starts_with_fold`](#starts_with_fold) [`str_builder`](#str_builder) [`str_builder_with_capacity`](#str_builder_with_capacity) [`str_view`](#str_view) [`to_lower`](#to_lower) [`to_upper`](#to_upper) [`CharIndices`](#charindices) [`Chars`](#chars) [`CString`](#cstring-1) [`ParseError`](#parseerror) [`StrBuilder`](#strbuilder) [`Utf8Error`](#utf8error) [`Ascii`](#ascii) [`Join`](#join-1) [`Search`](#search) [`Text`](#text) [Ascii for char](#ascii-for-char) [Ascii for u8](#ascii-for-u8) [Display for ParseError](#display-for-parseerror) [Iterate for CharIndices](#iterate-for-charindices) [Iterate for Chars](#iterate-for-chars) [Join for []const T](#join-for-const-t) [Join for [N]T](#join-for-nt) [Join for Buf[T]](#join-for-buft) [Search for []const u8](#search-for-const-u8) [Search for string](#search-for-string) [Text for string](#text-for-string)
 
 ## Functions
 
@@ -168,6 +168,16 @@ power of ten another, and their ratio is divided out bit by bit to one bit past 
 the remainder saying whether anything is left below it. Up to 11,600 significant digits are read
 into the integer -- more than the 11,563 the longest half-way point between two binary128 values
 has -- and any digit past them that is not a zero is remembered, which is all a tie needs to know.
+
+### `f16_prefix`
+
+```sysl
+f16_prefix(b: []const u8) -> (f16, usize)
+```
+
+The same for an `f16`, rounded once to the nearest `f16` -- never through a `real` or an `f128`,
+either of which leaves a long decimal lying a hair from half way between two `f16`s on the half
+way point itself, and so on the even side whichever side it was on.
 
 ### `f32_prefix`
 
@@ -365,6 +375,22 @@ reads back as the same `f128`.
 
 ```sysl
 parse_f128(s: string) -> Result[f128, ParseError]
+```
+
+### `parse_f16`
+
+```sysl
+parse_f16(b: []const u8) -> Result[f16, ParseError]
+```
+
+An `f16`, read as `parse_real` reads a `real` and rounded once, to the nearest `f16` -- never
+through a wider float, whose rounding could leave a value on the wrong side of half way. Every text
+`str` writes for an `f16` reads back as the same `f16`.
+
+### `parse_f16`
+
+```sysl
+parse_f16(s: string) -> Result[f16, ParseError]
 ```
 
 ### `parse_f32`
@@ -750,7 +776,7 @@ mistake rather than the input's.
 
 ```sysl
 struct StrBuilder
-    bytes: &Buf[u8]
+    private[text] bytes: &Buf[u8]
 ```
 
 Text gathered a piece at a time, handed back as one string.
@@ -766,6 +792,7 @@ piece once and grows geometrically.
 
 | Member | Signature | Description |
 |---|---|---|
+| `as_bytes` | `as_bytes -> []const u8` | The bytes gathered so far, read-only. |
 | `len` | `len -> usize` |  |
 | `is_empty` | `is_empty -> bool` |  |
 | `push` | `const push(*self, s: string)` |  |

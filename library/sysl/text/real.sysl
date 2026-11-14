@@ -21,11 +21,12 @@ import sysl.{bits_of64, bits_of128}
 // two doubles can be, and one more stands for anything non-zero after them) against the halfway
 // point's significand, each side scaled by the powers of two and five that make both integers.
 
-/** The limits of one binary format: the explicit significand's bits, the exponent bias, the biased
- * exponent of an infinity, the powers of ten past which every `w` is zero or infinite, and the narrow
- * range of powers in which a product can land exactly half way.
+/** The limits of one binary format: its width in bits, the explicit significand's bits, the exponent
+ * bias, the biased exponent of an infinity, the powers of ten past which every `w` is zero or
+ * infinite, and the narrow range of powers in which a product can land exactly half way.
  */
 private struct Format
+    width: int
     significand: int
     bias: int
     infinite: int
@@ -34,9 +35,13 @@ private struct Format
     even_low: int
     even_high: int
 
-private double_format() -> Format = Format(52, 1023, 0x7ff, -342, 308, -4, 23)
+private double_format() -> Format = Format(64, 52, 1023, 0x7ff, -342, 308, -4, 23)
 
-private single_format() -> Format = Format(23, 127, 0xff, -64, 38, -17, 10)
+private single_format() -> Format = Format(32, 23, 127, 0xff, -64, 38, -17, 10)
+
+// Every `w` below 2^64 times 10^-28 is under half the smallest subnormal, 2^-25, and every one times
+// 10^5 is past the largest finite value, 65504.
+private half_format() -> Format = Format(16, 10, 15, 0x1f, -27, 4, -22, 5)
 
 /** The longest prefix of `b` that reads as a `real`, the value it reads as, and how many bytes it is
  * -- zero, and a zero value, where no prefix reads as one. This is C's `strtod`, reading what it
@@ -62,10 +67,18 @@ f32_prefix(b: []const u8) -> (f32, usize)
 
     (f32.from_bits(u32(got.0)), got.1)
 
+/** The same for an `f16`, rounded once to the nearest `f16` -- never through a `real` or an `f128`,
+ * either of which leaves a long decimal lying a hair from half way between two `f16`s on the half
+ * way point itself, and so on the even side whichever side it was on.
+ */
+f16_prefix(b: []const u8) -> (f16, usize)
+    val got = scan(b, half_format())
+
+    (f16.from_bits(u16(got.0)), got.1)
+
 // The bits of the value and the length of the prefix, the sign bit at the format's top.
 private scan(b: []const u8, f: Format) -> (u64, usize)
-    val width = if f.bias == 1023 then 64 else 32
-    val sign_bit = u64(1) << (width - 1)
+    val sign_bit = u64(1) << (f.width - 1)
     val infinity = u64(f.infinite) << f.significand
     var i: usize = 0
 
@@ -219,6 +232,13 @@ private scan_decimal(b: []const u8, start: usize, f: Format) -> (u64, usize)
 
     if truncated && eisel_lemire(w + 1, q, f) != bits
         bits = settle(b, usize(first), whole_end, digits_end, written, bits, f)
+    elif q >= -27 && bits > 0 && bits <= (u64(1) << f.significand)
+        // Below the normal range Eisel-Lemire rounds a tie up. A tie is a decimal lying exactly on a
+        // binary fraction, which needs `w` a multiple of 5^-q and so `q` no lower than -27, as 5^28
+        // passes 2^64; only an `f16` has subnormals that high. Its answer or the float below it is
+        // the right one, and comparing against the point between them says which.
+        bits = settle(b, usize(first), whole_end, digits_end, written, bits - 1, f)
+    end if
 
     (bits, i)
 end scan_decimal
