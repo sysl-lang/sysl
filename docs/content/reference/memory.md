@@ -2272,8 +2272,44 @@ whose initializer is not constant is refused there, with the reason).
 
 ### A frozen buffer crosses
 
-**`buf.freeze()` takes a buffer's elements and answers a `&sync Frozen[T]`**: one atomic count, and
-nothing that writes it. It goes wherever a `&sync` reference goes:
+**`buf.freeze()` takes a buffer's elements and answers a `&Frozen[T]`**: one count on the whole
+buffer, nothing that writes it, and any element type. A program that stays in one domain holds it as
+it holds any `&T` — a tree whose nodes keep their children frozen, say:
+
+```sysl
+import sysl.buf.{Buf, buf, Frozen}
+
+struct Node
+    id: int
+    children: &Frozen[&Node]
+
+leaf(id: int) -> &Node
+    var none: Buf[&Node] = buf()
+
+    Node(id, none.freeze())
+
+var b: Buf[&Node] = buf()
+
+b.push(leaf(1))
+b.push(leaf(2))
+
+val root = Node(0, b.freeze())
+var ids = 0
+
+for c in root.children
+    ids += c.id
+
+print(root.children.len(), root.children[1].id, ids)
+```
+
+```output
+2 2 3
+```
+
+**Its count is chosen the way a construction's is.** Where the position expects a `&sync Frozen[T]`
+— an annotation, a parameter, a field — the frozen buffer is allocated with an atomic count, and it
+goes wherever a `&sync` reference goes. The two are distinct types, and neither converts to the other,
+exactly as [`&T` and `&sync T`](#sync-t-t-and-t) are:
 
 ```sysl
 import sysl.buf.{Buf, buf, Frozen}
@@ -2307,30 +2343,54 @@ print(b.len())
 ```
 
 - **The buffer is left empty**, through every name: the elements are copied once into storage sized to
-  them. A frozen buffer offers `len`, `is_empty`, a checked `f[i]`, `for x in f`, and `view()`, a
-  `[]const T` that holds one atomic share through a small box of its own. Nothing writes one.
+  them. A frozen buffer offers `len`, `is_empty`, a checked `f[i]`, `get`, `for x in f`, and `view()`,
+  a `[]const T`. Nothing writes one. A view of a `&Frozen[T]` holds a share of the storage itself; a
+  view of a `&sync Frozen[T]` holds one atomic share of the buffer through a small box of its own.
 - **Reading a local after `freeze` is refused**: `freeze` is
   [`@consumes`](/reference/attributes/). A field or module storage is not followed, and reads empty.
-- **A frozen buffer shares exactly what its elements share**, so the element type is held to a `&sync`
-  struct's rule: a scalar, a `&sync U`, a raw pointer, another frozen buffer, arrays and structs of
-  those. A `Buf[string]` or a `Buf[Buf[u8]]` is refused for each element's count.
+- **A shared frozen buffer shares exactly what its elements share**, so where the position asks for a
+  `&sync Frozen[T]` the element type is held to a `&sync` struct's rule: a scalar, a `&sync U`, a raw
+  pointer, another shared frozen buffer, arrays and structs of those. A `string`, a `Buf` or a `&T`
+  element is refused there for its count; a `&Frozen[T]` holds any of them.
+- **`buf().freeze()` handed to a parameter or a field** takes its element type from there, in either
+  kind.
 - **Freezing allocates**, so a `@no_alloc` module may not call it.
 
 ```sysl
-import sysl.buf.{Buf, buf}
+import sysl.buf.{Buf, buf, Frozen}
 
 struct Cell
     n: int
 
+share(f: &sync Frozen[&Cell]) = print(f.len())
+
 var b: Buf[&Cell] = buf()
 
 b.push(Cell(1))
-
-val f = b.freeze()
+share(b.freeze())
 ```
 
 ```error
 '&sync Frozen[&Cell]' may be reached from two domains at once, so every count inside it has to be atomic — but it holds a '&Cell', whose count is not. Hold it as a '&sync Cell' ('06')
+```
+
+A `&Frozen[T]` is a `&T`, so it stays in the domain that made it:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+var b: Buf[int] = buf()
+
+b.push(1)
+
+val f = b.freeze()
+val job: &sync Fn() -> unit = () -> print(f[0])
+
+job()
+```
+
+```error
+a closure shared between two domains may be called from either, so every count it captures has to be atomic — but the 'f' it captures reaches a '&Frozen[int]', whose count is not. Hold it as a '&sync Frozen[int]' ('06')
 ```
 
 ### `@crossing` — where the rule is asked

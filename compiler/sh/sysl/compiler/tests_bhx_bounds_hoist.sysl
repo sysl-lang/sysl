@@ -1,0 +1,412 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+import sysl.text.{replace_all, Search}
+
+// A counted loop whose subscripts can be proved in range before it starts runs a copy with their
+// checks left out, chosen by a test in front of the loop, and the loop as written otherwise
+// (`bounds_hoist.sysl`, `reference/arrays.md § A loop's subscripts are checked once`). The text shows
+// which loops are copied and which subscripts lose their check; programs that fail the test -- an
+// index past the end, an empty view, a view or an offset the body changes, a sum that wraps -- show
+// the loop as written still runs and still stops exactly where it did.
+
+// The lowered text of the function whose `define` line holds `name`, out of a one-file program.
+private bhx_body(text: string, name: string) -> string
+    var body = ""
+    var inside = false
+
+    for l in lines_of(xvr_ir([("main.sysl", text)]))
+        if !inside && l.starts_with("define") && l.contains(name) then inside = true
+
+        if inside
+            body = body + l + "\n"
+
+            if l == "}" then return body
+        end if
+
+    body
+end bhx_body
+
+private bhx_count(body: string, part: string) -> int
+    var n = 0
+
+    for l in lines_of(body)
+        if l.contains(part) then n += 1
+
+    n
+end bhx_count
+
+// The function was copied, and the copy's subscripts carry no check: one failure call is left, the
+// loop as written's.
+private bhx_hoisted(text: string, name: string, checks: int)
+    if !std_root().is_ok() then return
+
+    val body = bhx_body(text, name)
+
+    assert_eq(bhx_count(body, "for.proven"), 2)
+    assert_eq(bhx_count(body, "@sysl_bounds_fail("), checks)
+end bhx_hoisted
+
+// The loop was not copied, and every subscript keeps its check.
+private bhx_kept(text: string, name: string, checks: int)
+    if !std_root().is_ok() then return
+
+    val body = bhx_body(text, name)
+
+    assert_eq(bhx_count(body, "for.proven"), 0)
+    assert_eq(bhx_count(body, "@sysl_bounds_fail("), checks)
+end bhx_kept
+
+// -- the shapes that are copied ----------------------------------------------------------------------
+
+@test("a view read back to front by its own length is copied, its check left out of the copy")
+bhx_reversed_by_length()
+    bhx_hoisted(raw"""
+        @noinline
+        rev(seq: []const u8) -> int
+            var sum = 0
+
+            for j in 0..<seq.len do sum += int(seq[seq.len - 1 - j])
+
+            sum
+
+        print(rev("abc".bytes))
+        """, "@rev$", 1)
+
+@test("revcomp's loop, reading below a var the outer loop moves, is copied")
+bhx_revcomp_shape()
+    bhx_hoisted(raw"""
+        @noinline
+        widths(seq: []const u8) -> int
+            var i = seq.len
+            var sum = 0
+
+            while i > 0
+                val width = if i > 60 then 60 else i
+
+                for j in 0..<width do sum += int(seq[i - 1 - j])
+
+                i -= width
+
+            sum
+
+        print(widths("abc".bytes))
+        """, "@widths$", 1)
+
+@test("an offset from a parameter, a val and an enclosing loop's variable is copied")
+bhx_offsets()
+    bhx_hoisted(raw"""
+        @noinline
+        offs(xs: []const int, k: usize) -> int
+            val m: usize = 2
+            var sum = 0
+
+            for r in 0..<2
+                for j in 1..<4 do sum += xs[k + j + m - 1 + r]
+
+            sum
+
+        print(offs([1, 2, 3, 4, 5, 6, 7, 8], 0))
+        """, "@offs$", 1)
+
+@test("an array's subscript and a signed index are copied, an inclusive range too")
+bhx_array_signed_inclusive()
+    bhx_hoisted(raw"""
+        @noinline
+        arr(n: int) -> int
+            var a: [10]int
+            var sum = 0
+
+            for j in 0..n
+                a[9 - j] = j
+                sum += a[9 - j]
+
+            sum
+
+        print(arr(9))
+        """, "@arr$", 2)
+
+@test("two subscripts of two views are proved together, and an unprovable third keeps its check")
+bhx_two_views_and_one_not()
+    bhx_hoisted(raw"""
+        @noinline
+        mix(a: []const int, b: []const int, c: []const int) -> int
+            var sum = 0
+
+            for j in 0..<a.len do sum += a[a.len - 1 - j] + b[j + 1] + c[j * 2]
+
+            sum
+
+        print(mix([1, 2], [3, 4, 5], [6, 7, 8]))
+        """, "@mix$", 4)
+
+// -- the shapes that are not -------------------------------------------------------------------------
+
+@test("xs[j] below xs.len is not copied: the check is the loop's own condition")
+bhx_plain_walk_not_copied()
+    bhx_kept(raw"""
+        @noinline
+        walk(xs: []const int) -> int
+            var sum = 0
+
+            for j in 0..<xs.len do sum += xs[j]
+
+            sum
+
+        print(walk([1, 2, 3]))
+        """, "@walk$", 1)
+
+@test("a view the body reassigns, an offset it writes, and one written through a pointer are not proved")
+bhx_written_not_copied()
+    bhx_kept(raw"""
+        @noinline
+        shrink(xs: []const int) -> int
+            var s = xs
+            var sum = 0
+
+            for j in 0..<3
+                sum += s[s.len - 1 - j]
+                s = s[0..<s.len - 1]
+
+            sum
+
+        print(shrink([1, 2, 3, 4]))
+        """, "@shrink$", 3)
+    bhx_kept(raw"""
+        @noinline
+        moved(xs: []const int) -> int
+            var k: usize = 0
+            var sum = 0
+
+            for j in 0..<3
+                sum += xs[k + j]
+                k += 1
+
+            sum
+
+        print(moved([1, 2, 3, 4, 5, 6]))
+        """, "@moved$", 1)
+    bhx_kept(raw"""
+        @noinline
+        pointed(xs: []const int) -> int
+            var k: usize = 0
+            val p: *usize = &k
+            var sum = 0
+
+            for j in 0..<3
+                sum += xs[k + j]
+                *p += 1
+
+            sum
+
+        print(pointed([1, 2, 3, 4, 5, 6]))
+        """, "@pointed$", 1)
+
+@test("an offset a nested function writes is not proved")
+bhx_nested_writer_not_copied()
+    bhx_kept(raw"""
+        @noinline
+        bumped(xs: []const int) -> int
+            var k: usize = 0
+            var sum = 0
+
+            bump() = k += 1
+
+            for j in 0..<3
+                sum += xs[k + j]
+                bump()
+
+            sum
+
+        print(bumped([1, 2, 3, 4, 5, 6]))
+        """, "@bumped$", 1)
+
+@test("an index reading the variable twice, a body with a loop, and one that returns are not copied")
+bhx_shapes_not_copied()
+    bhx_kept(raw"""
+        @noinline
+        twice(xs: []const int) -> int
+            var sum = 0
+
+            for j in 0..<3 do sum += xs[j + j]
+
+            sum
+
+        print(twice([1, 2, 3, 4, 5]))
+        """, "@twice$", 1)
+    bhx_kept(raw"""
+        @noinline
+        inner(xs: []const int) -> int
+            var sum = 0
+
+            for j in 0..<2
+                sum += xs[j + 1]
+
+                for q in 0..<2 do sum += q
+
+            sum
+
+        print(inner([1, 2, 3]))
+        """, "@inner$", 1)
+    bhx_kept(raw"""
+        @noinline
+        early(xs: []const int) -> int
+            for j in 0..<3
+                if xs[j + 1] == 0 then return int(j)
+
+            -1
+
+        print(early([1, 2, 0, 4]))
+        """, "@early$", 1)
+
+// -- a test that fails runs the loop as written -------------------------------------------------------
+
+private bhx_ready() -> bool = std_root().is_ok() && clang_available()
+
+// The program built at `level` and run: its status, what it printed and what it wrote to standard
+// error.
+private bhx_run(text: string, level: string) -> (Status, string, string)
+    val root = make_temp_dir("sysl-bhx").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, level, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (Status.Exited(-1), "", failure_text(why))
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> (Status.Exited(-1), "", "the program that was built could not be run")
+        Ok(out) -> (out.status, out.text, out.err.unwrap_or(""))
+end bhx_run
+
+// At both levels, the program prints `printed` and stops on SIGTRAP having said `said`.
+private bhx_traps(text: string, printed: string, said: string)
+    if !bhx_ready() then return
+
+    for level in ["0", DefaultOptimization, "3"]
+        val (state, out, err) = bhx_run(text, level)
+
+        assert_eq(out, printed)
+        assert_eq(err, said)
+        assert(state == Status.Signalled(5), s"-O$level stopped with $state")
+end bhx_traps
+
+// At every level, the program prints `printed` and ends normally.
+private bhx_prints(text: string, printed: string)
+    if !bhx_ready() then return
+
+    for level in ["0", DefaultOptimization, "3"]
+        val (state, out, err) = bhx_run(text, level)
+
+        assert_eq(out, printed)
+        assert(state == Status.Exited(0), s"-O$level stopped with $state: $err")
+end bhx_prints
+
+@test("an offset running past the end still stops at the first index past it")
+bhx_runs_past_the_end()
+    bhx_traps(raw"""
+        show(xs: []const int, k: usize)
+            for j in 0..<5 do print(xs[j + k])
+
+        show([1, 2, 3, 4], 1)
+        """, "2\n3\n4\n", "index 4 out of bounds for length 4 (main.sysl:2:31)\n")
+
+@test("an empty view read back to front stops at its first turn, and a loop of no turns passes")
+bhx_empty_view()
+    bhx_traps(raw"""
+        show(xs: []const int, n: usize)
+            for j in 0..<n do print(xs[xs.len - 1 - j])
+
+        val xs = [1, 2, 3]
+
+        show(xs[0..<3], 0)
+        print("none")
+        show(xs[1..<1], 1)
+        """, "none\n", "index 18446744073709551615 out of bounds for length 0 (main.sysl:2:31)\n")
+
+@test("a signed index that goes below zero stops there, with its sign")
+bhx_signed_below_zero()
+    bhx_traps(raw"""
+        show(xs: []const int, n: int)
+            for j in 0..<n do print(xs[n - 2 - j])
+
+        show([10, 20, 30], 3)
+        """, "20\n10\n", "index -1 out of bounds for length 3 (main.sysl:2:31)\n")
+
+@test("a view the body shortens is checked each turn against the length it has then")
+bhx_view_shortened()
+    bhx_traps(raw"""
+        show(xs: []const int)
+            var s = xs
+
+            for j in 0..<3
+                print(s[s.len - 1 - j])
+                s = s[0..<s.len - 2]
+
+        show([1, 2, 3, 4, 5])
+        """, "5\n2\n", "index 18446744073709551614 out of bounds for length 1 (main.sysl:5:16)\n")
+
+@test("an offset the body moves, directly, through a pointer or from a nested function, stops where it did")
+bhx_offset_moved()
+    val text = raw"""
+        show(xs: []const int)
+            var k: usize = 0
+            val p: *usize = &k
+
+            bump() = k += 1
+
+            for j in 0..<3
+                print(xs[k + j])
+                MOVE
+
+        show([1, 2, 3, 4])
+        """
+
+    for how in ["k += 1", "*p += 1", "bump()"]
+        bhx_traps(replace_all(text, "MOVE", how), "1\n3\n",
+                  "index 4 out of bounds for length 4 (main.sysl:8:17)\n")
+
+@test("an index whose sum wraps the word into range fails the test and reads what the loop as written reads")
+bhx_wrapped_sum()
+    bhx_prints(raw"""
+        show(xs: []const int, k: usize)
+            for j in 1..<3 do print(xs[j + k])
+
+        show([10, 20, 30], 18446744073709551615)
+        """, "10\n20\n")
+
+@test("revcomp's loop computes the reversed lines, over widths that do and do not divide the length")
+bhx_revcomp_computes()
+    bhx_prints(raw"""
+        import sysl.buf.{Buf, buf}
+
+        write_reversed(seq: []const u8, out: Buf[u8], line: usize)
+            var i = seq.len
+
+            while i > 0
+                val width = if i > line then line else i
+
+                for j in 0..<width do out.push(seq[i - 1 - j])
+
+                out.push(u8('|'))
+                i -= width
+
+        val out: Buf[u8] = buf()
+
+        write_reversed("abcdefg".bytes, out, 3)
+        write_reversed("abcdef".bytes, out, 3)
+        write_reversed("".bytes, out, 3)
+        print(out.len())
+        print(out[0], out[4], out[8], out[out.len() - 2])
+        """, "18\n103 100 97 97\n")
