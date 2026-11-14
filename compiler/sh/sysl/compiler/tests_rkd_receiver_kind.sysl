@@ -1,0 +1,267 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// **A method's receiver kind is the reference kind it is called on** (`member_call.sysl §
+// receiver_kind_refusal`, `reference/memory.md § &sync T, *T and []T`). `&T` and `&sync T` are
+// distinct types with no conversion either way, so a `&self` method is not called on a `&sync T` --
+// its body retains and releases with an ordinary count, which races another thread's on the same
+// object -- and a `&sync self` method is not called on a `&T`, which may not leave its domain.
+//
+// Axes and cells. The receiver the method declares: `&self`, `&sync self`, `self`, `*self`. The
+// reference it is called on: `&T`, `&sync T`, a value on the stack. The call shape: a local, a field
+// reached through a reference (`o.b.m()`), a capture in a closure, `self` inside another method, a
+// generic function over a bound, a method of a generic type, a trait object (`&Show`, `&sync Show`),
+// a type promising `@unchecked(Share)`. Every refusal is pinned by its whole text and its line; every
+// accepted cell compiles clean, and the one that matters at run time -- a `&sync self` method keeping
+// its receiver from two threads at once -- runs and drops its object exactly once. `*self` through a
+// `&sync T` is the read-only rule's (`tests_swr_sync_write_readonly.sysl`), named here only so the
+// matrix is whole. Skipped: bare metal (the refusal is analysis, before any target is asked).
+
+private val rkd_cell: string = raw"""
+    struct Cell
+        n: int
+
+    impl Cell
+        get(&self) -> int = self.n
+        sget(&sync self) -> int = self.n
+        peek(self) -> int = self.n
+        bump(*self)
+            self.n += 1
+
+    """
+
+// The refusal of a `&self` method called on a `&sync T`.
+private rkd_plain(member: string, t: string) -> string =
+    s"'$member' takes '&self', and this receiver is a '&sync $t' — '&$t' and '&sync $t' are distinct " +
+    "types, and neither converts to the other: a '&self' method may retain or release its receiver " +
+    "with an ordinary count while another thread holds the same object. " +
+    s"Declare '$member' with '&sync self', or with 'self' where it only reads"
+
+// The refusal of a `&sync self` method called on a `&T`.
+private rkd_sync(member: string, t: string) -> string =
+    s"'$member' takes '&sync self', and this receiver is a '&$t' — '&$t' and '&sync $t' are distinct " +
+    "types, and neither converts to the other: a '&sync self' method may hand its receiver to " +
+    s"another thread, and a '&$t' may not leave its domain. Allocate $t as a '&sync $t' where it is " +
+    s"constructed, or declare '$member' with '&self'"
+
+private rkd_says(text: string, message: string, at: string)
+    val said = azd_err(text)
+
+    assert(said.contains(s"error: $message\n"), said)
+    assert(said.contains(s"main.sysl:$at"), said)
+    assert_eq(said.count_of("error: "), 1)
+end rkd_says
+
+private rkd_accepts(text: string) = assert_eq(azd_err(text), "")
+
+// -- the four receivers through the two kinds, on a local ---------------------------------------------
+
+@test("a '&self' method on a '&T' and a '&sync self' method on a '&sync T' are accepted")
+rkd_matching_kinds()
+    if azd_ready() then
+        rkd_accepts(rkd_cell + "val a: &Cell = Cell(1)\nval b: &sync Cell = Cell(2)\n" +
+                    "print(a.get() + b.sget())\n")
+
+@test("a '&self' method on a '&sync T' is refused, naming both kinds and both cures")
+rkd_plain_on_sync()
+    if azd_ready() then
+        rkd_says(rkd_cell + "val b: &sync Cell = Cell(2)\nprint(b.get())\n", rkd_plain("get", "Cell"),
+                 "12:")
+
+@test("a '&sync self' method on a '&T' is refused, naming both kinds and both cures")
+rkd_sync_on_plain()
+    if azd_ready() then
+        rkd_says(rkd_cell + "val a: &Cell = Cell(1)\nprint(a.sget())\n", rkd_sync("sget", "Cell"),
+                 "12:")
+
+@test("a 'self' method reads through either kind")
+rkd_value_through_both()
+    if azd_ready() then
+        rkd_accepts(rkd_cell + "val a: &Cell = Cell(1)\nval b: &sync Cell = Cell(2)\n" +
+                    "print(a.peek() + b.peek())\n")
+
+@test("a '*self' method writes through a '&T'; through a '&sync T' the read-only rule refuses it")
+rkd_pointer_through_both()
+    if !azd_ready() then return
+
+    rkd_accepts(rkd_cell + "val a: &Cell = Cell(1)\na.bump()\nprint(a.n)\n")
+
+    val said = azd_err(rkd_cell + "val b: &sync Cell = Cell(2)\nb.bump()\n")
+
+    assert(said.contains("which is read-only:"), said)
+    assert(!said.contains("distinct types"), said)
+end rkd_pointer_through_both
+
+@test("a '&sync self' method on a value on the stack names the '&sync' box it wants")
+rkd_sync_on_stack()
+    if azd_ready() then
+        rkd_says(rkd_cell + "var v = Cell(1)\nprint(v.sget())\n",
+                 "'&sync self' needs a counted reference, and this receiver is a Cell on the stack — " +
+                 "a '&sync self' method may keep hold of what it is called on, so what it wants is a " +
+                 "share of a box rather than an address. Bind the value into one and call it on that: " +
+                 "'var r: &sync Cell = …'", "12:")
+
+// -- the call shapes ------------------------------------------------------------------------------------
+
+@test("a field reached through a reference is asked as its own kind")
+rkd_field_chain()
+    if !azd_ready() then return
+
+    val outer = rkd_cell + "struct Outer\n    b: &sync Cell\n\nval o: &Outer = Outer(Cell(3))\n"
+
+    rkd_accepts(outer + "print(o.b.sget())\n")
+    rkd_says(outer + "print(o.b.get())\n", rkd_plain("get", "Cell"), "15:")
+end rkd_field_chain
+
+@test("a closure's capture keeps the kind it was captured as")
+rkd_closure_capture()
+    if !azd_ready() then return
+
+    rkd_accepts(rkd_cell + "val b: &sync Cell = Cell(2)\nval f: &sync Fn() -> int = () -> b.sget()\nprint(f())\n")
+    rkd_says(rkd_cell + "val b: &sync Cell = Cell(2)\nval f = () -> b.get()\nprint(f())\n",
+             rkd_plain("get", "Cell"), "12:")
+    rkd_says(rkd_cell + "val a: &Cell = Cell(1)\nval f = () -> a.sget()\nprint(f())\n",
+             rkd_sync("sget", "Cell"), "12:")
+end rkd_closure_capture
+
+@test("'self' inside a '&sync self' method may call only the '&sync self' and 'self' members")
+rkd_self_inside()
+    if !azd_ready() then return
+
+    val head = "struct Cell\n    n: int\n\nimpl Cell\n    get(&self) -> int = self.n\n    peek(self) -> int = self.n\n"
+
+    rkd_accepts(head + "    twice(&sync self) -> int = self.peek() * 2\n\nval b: &sync Cell = Cell(2)\nprint(b.twice())\n")
+    rkd_says(head + "    twice(&sync self) -> int = self.get() * 2\n\nval b: &sync Cell = Cell(2)\nprint(b.twice())\n",
+             rkd_plain("get", "Cell"), "7:")
+    rkd_says("struct Cell\n    n: int\n\nimpl Cell\n    sget(&sync self) -> int = self.n\n" +
+             "    twice(&self) -> int = self.sget() * 2\n\nval a: &Cell = Cell(2)\nprint(a.twice())\n",
+             rkd_sync("sget", "Cell"), "6:")
+end rkd_self_inside
+
+@test("a generic function over a bound is asked at the kind it was handed")
+rkd_generic_bound()
+    if !azd_ready() then return
+
+    val head = "trait Look\n    look(&self) -> int\n\nstruct Cell\n    n: int\n\nimpl Look for Cell\n" +
+               "    look(&self) -> int = self.n\n\n"
+
+    rkd_accepts(head + "see[T: Look](x: &T) -> int = x.look()\n\nval a: &Cell = Cell(1)\nprint(see(a))\n")
+    rkd_says(head + "see[T: Look](x: &sync T) -> int = x.look()\n\nval b: &sync Cell = Cell(1)\nprint(see(b))\n",
+             rkd_plain("look", "Cell"), "10:")
+end rkd_generic_bound
+
+@test("a method of a generic type is asked as a concrete type's is")
+rkd_generic_type()
+    if !azd_ready() then return
+
+    val head = "struct Box[T]\n    v: T\n\nimpl[T] Box[T]\n    get(&self) -> T = self.v\n" +
+               "    sget(&sync self) -> T = self.v\n\n"
+
+    rkd_accepts(head + "val a: &Box[int] = Box(1)\nval b: &sync Box[int] = Box(2)\nprint(a.get() + b.sget())\n")
+    rkd_says(head + "val b: &sync Box[int] = Box(2)\nprint(b.get())\n", rkd_plain("get", "Box[int]"), "9:")
+    rkd_says(head + "val a: &Box[int] = Box(1)\nprint(a.sget())\n", rkd_sync("sget", "Box[int]"), "9:")
+end rkd_generic_type
+
+@test("a trait object's slot is asked at the object's kind")
+rkd_trait_object()
+    if !azd_ready() then return
+
+    val plain = "trait Show\n    show(&self) -> int\n\nstruct P\n    v: int\n\nimpl Show for P\n" +
+                "    show(&self) -> int = self.v\n\n"
+    val shared = "trait Show\n    show(&sync self) -> int\n\nstruct P\n    v: int\n\nimpl Show for P\n" +
+                 "    show(&sync self) -> int = self.v\n\n"
+    val by_value = "trait Show\n    show(self) -> int\n\nstruct P\n    v: int\n\nimpl Show for P\n" +
+                   "    show(self) -> int = self.v\n\n"
+
+    rkd_accepts(plain + "val s: &Show = P(1)\nprint(s.show())\n")
+    rkd_accepts(shared + "val s: &sync Show = P(1)\nprint(s.show())\n")
+    rkd_accepts(by_value + "val s: &Show = P(1)\nval t: &sync Show = P(2)\nprint(s.show() + t.show())\n")
+    rkd_says(plain + "val s: &sync Show = P(1)\nprint(s.show())\n", rkd_plain("show", "Show"), "11:")
+    rkd_says(shared + "val s: &Show = P(1)\nprint(s.show())\n", rkd_sync("show", "Show"), "11:")
+end rkd_trait_object
+
+@test("'@unchecked(Share)' promises the writes, not the counts, so it is refused all the same")
+rkd_unchecked_share()
+    if azd_ready() then
+        rkd_says("@unchecked(Share)\nstruct Cell\n    n: int\n\nimpl Cell\n    get(&self) -> int = self.n\n\n" +
+                 "val b: &sync Cell = Cell(2)\nprint(b.get())\n", rkd_plain("get", "Cell"), "9:")
+
+// `view()` is written once and made to the member the receiver's count calls for (`frozen_count.sysl`),
+// so the kind asked is that member's: `view(&self)` on a `&Frozen`, `view_shared(&sync self)` on a
+// `&sync Frozen`.
+@test("a frozen buffer's 'view()' is accepted through either kind, as the member its count calls for")
+rkd_frozen_view_routed()
+    if azd_ready() then
+        rkd_accepts("import sysl.buf.{Buf, buf, Frozen}\n\nvar b: Buf[int] = buf()\nb.push(1)\n" +
+                    "val a: &Frozen[int] = b.freeze()\nvar c: Buf[int] = buf()\nc.push(2)\n" +
+                    "val s: &sync Frozen[int] = c.freeze()\nprint(a.view()[0] + s.view()[0])\n")
+
+// -- what the refusal protects ---------------------------------------------------------------------------
+
+// A `&sync self` method keeping its receiver from two threads at once: every share it takes is atomic,
+// so the object outlives both threads and is dropped exactly once, after them. The same body
+// declared `&self` and reached through the `&sync` -- the call the refusal stops -- faults or frees
+// early under the race.
+@test("a '&sync self' method keeping its receiver from two threads drops it once, after both")
+rkd_two_threads_keep()
+    if !azd_ready() then return
+
+    val root = make_temp_dir("sysl-rkd").unwrap()
+
+    write_text(s"$root/main.sysl", raw"""
+        import sysl.threads.scope
+        import sysl.buf.{Buf, buf}
+
+        struct Cell
+            n: int
+
+        impl Drop for Cell
+            drop(self)
+                print("dropped")
+
+        impl Cell
+            keep(&sync self, into: *Buf[&sync Cell])
+                into.push(self)
+
+        churn(c: &sync Cell) -> usize
+            var s: usize = 0
+            for i in 0..<20
+                var held: Buf[&sync Cell] = buf()
+                for j in 0..<5000
+                    c.keep(&held)
+                s += held.len()
+            s
+
+        run()
+            val c: &sync Cell = Cell(1)
+
+            scope((sc) ->
+                val t1 = sc.spawn(() -> churn(c))
+                val t2 = sc.spawn(() -> churn(c))
+                print(t1.join() + t2.join()))
+            print("joined")
+
+        run()
+        """).unwrap()
+
+    val exe = s"$root/built"
+    val built = build_native_program(root, None, None, DefaultOptimization, Some(exe))
+
+    assert(built.is_ok(), if built.is_err() then failure_text(built.unwrap_err()) else "")
+
+    val said = capture(exe, [], "", [], true, 20000)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> assert(false, "the program that was built could not be run")
+        Ok(out) ->
+            assert_eq(out.text, "200000\njoined\ndropped\n")
+            out.status match
+                Exited(code) -> assert_eq(code, 0)
+                _ -> assert(false, out.text)
+end rkd_two_threads_keep
