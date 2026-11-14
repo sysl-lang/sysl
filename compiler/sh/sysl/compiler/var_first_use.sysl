@@ -5,7 +5,8 @@ import sysl.buf.{Buf, buf}
 
 // A local `var` or `val` whose initial value is a bare literal takes its type from its first use
 // that fixes one (`reference/declarations.md § A literal binding takes its type from its first
-// use`).
+// use`). **So does one whose value is an untyped constant**, the literal it stands for
+// (`untyped_const_read`): `val n = N` is open exactly as `val n = 7` is.
 //
 // **A use fixes a type where it stands at one**: compared with a typed operand, assigned a typed
 // value with `=`, handed to a parameter, returned -- every position that reads the name at a type it
@@ -32,12 +33,14 @@ import sysl.buf.{Buf, buf}
 // fixes was when it was bound -- only a fix after that is about this reading of it. `counted` marks
 // the variable of a `for` over a range whose bounds are both bare literals: it is fixed only at an
 // integer type, and the bounds are read at that type, so one that does not fit is told at itself.
+// `fallback` is the type it has where no use fixes one, `int` or `real`.
 struct OpenVar
     unique: string
     at: usize
     init: Expr
     since: usize
     counted: bool
+    fallback: Type
 end OpenVar
 
 // How far a scope's bindings and imports reached when a reading began.
@@ -48,10 +51,12 @@ struct ScopeMark
     wildcards: usize
     levels: usize
 
-// A use that fixed the type of the binding declared at `at`.
+// A use that fixed the type of the binding declared at `at`, whose type with no use to fix it is
+// `fallback`.
 struct VarFix
     at: usize
     ty: Type
+    fallback: Type
 
 // A type a block is being read again with, for the binding `name` declared at `at`.
 struct KnownFix
@@ -62,7 +67,7 @@ struct KnownFix
 // Reads a run of statements -- a block, a loop's body, an arm's -- once, and again for as long as a
 // reading finds a binding the run declares fixed by a use at something other than its default.
 first_use_read[T](cx: &Analyzer, stmts: Buf[Stmt], read: () -> T) -> T
-    if !declares_open(stmts) then return read()
+    if !declares_open(cx, stmts) then return read()
 
     val open_mark = cx.open_vars.len()
     val known_mark = cx.var_fixes.len()
@@ -90,50 +95,66 @@ first_use_read[T](cx: &Analyzer, stmts: Buf[Stmt], read: () -> T) -> T
 end first_use_read
 
 // Whether a run of statements declares a binding whose type its first use fixes.
-private declares_open(stmts: Buf[Stmt]) -> bool
+//
+// A value that names a constant counts where the constant may be untyped: one in scope now, or one
+// the run itself declares, which is in scope only once the reading reaches it.
+private declares_open(cx: &Analyzer, stmts: Buf[Stmt]) -> bool
     for s in stmts
-        if open_declaration(s).is_some() then return true
+        val value = *s.kind match
+            VarDecl(_, typ, init, _, _, _, _, _) -> if typ.is_none() then init else None
+            ValDecl(_, typ, v, _, _, _, _, _) -> if typ.is_none() then Some(v) else None
+            _ -> None
+
+        if value.is_some() && may_open(cx, value.unwrap(), stmts) then return true
 
     false
 end declares_open
 
-// The name a statement binds where it is a `var` or `val` with no type written and a bare literal
-// for its value.
-private open_declaration(s: Stmt) -> Option[string] = *s.kind match
-    VarDecl(name, typ, init, _, _, _, _, _) ->
-        if typ.is_none() && init.is_some() && literal_default(init.unwrap()).is_some() then Some(name) else None
-    ValDecl(name, typ, value, _, _, _, _, _) ->
-        if typ.is_none() && literal_default(value).is_some() then Some(name) else None
-    _ -> None
+private may_open(cx: &Analyzer, e: Expr, stmts: Buf[Stmt]) -> bool =
+    literal_default(e).is_some() || untyped_const_read(cx, e) || declared_const(e, stmts)
+
+// Whether `e` names a `const` with no type written that the run declares.
+private declared_const(e: Expr, stmts: Buf[Stmt]) -> bool
+    val name = *e.kind match
+        Ident(n) -> n
+        _ -> return false
+
+    for s in stmts
+        *s.kind match
+            ConstDecl(n, typ, _, _) -> if n == name && typ.is_none() then return true
+            _ -> ()
+
+    false
+end declared_const
 
 // The fixes a reading logged since `from` for bindings the run declares, at a type other than the
-// literal's default -- one fixed at its default reads the same either way.
+// binding's fallback -- one fixed at its fallback reads the same either way.
 private fixes_of(cx: &Analyzer, stmts: Buf[Stmt], from: usize) -> Buf[KnownFix]
     var out: Buf[KnownFix] = buf()
 
     for k in from..<cx.var_fix_log.len()
         val f = cx.var_fix_log[k]
 
+        if type_eq(f.ty, f.fallback) then continue
+
         for s in stmts
             if s.span.start != f.at then continue
 
-            val name = open_declaration(s)
-
-            if name.is_some() && !type_eq(f.ty, literal_default(bound_literal(s)).unwrap()) then
-                out.push(KnownFix(name.unwrap(), f.at, f.ty))
+            *s.kind match
+                VarDecl(name, _, _, _, _, _, _, _) -> out.push(KnownFix(name, f.at, f.ty))
+                ValDecl(name, _, _, _, _, _, _, _) -> out.push(KnownFix(name, f.at, f.ty))
+                _ -> ()
     out
 end fixes_of
 
-// The literal an open declaration binds.
-private bound_literal(s: Stmt) -> Expr = *s.kind match
-    VarDecl(_, _, init, _, _, _, _, _) -> init.unwrap()
-    ValDecl(_, _, value, _, _, _, _, _) -> value
-    _ -> Expr(s.span, Bad)
-
 // The type a declaration is read at where an earlier reading found it fixed, and nothing where it is
-// not one whose type a use fixes or no use has fixed it yet.
+// not one whose type a use fixes or no use has fixed it yet. Only an open binding is ever fixed, so
+// for a value that may be one -- a literal, or a name that may be an untyped constant's -- a fix
+// filed under the declaration is the answer.
 fixed_type(cx: &Analyzer, span: Span, name: string, typ: Option[TypeRef], init: Expr) -> Option[Type]
-    if typ.is_some() || literal_default(init).is_none() then return None
+    if typ.is_some() || cx.var_fixes.is_empty() then return None
+
+    if literal_default(init).is_none() && !names_something(init) then return None
 
     for f in cx.var_fixes
         if f.at == span.start && f.name == name then return Some(f.ty)
@@ -141,17 +162,42 @@ fixed_type(cx: &Analyzer, span: Span, name: string, typ: Option[TypeRef], init: 
     None
 end fixed_type
 
-// Records a binding just made as one waiting for its first use, where it is one.
-open_binding(cx: &Analyzer, span: Span, typ: Option[TypeRef], init: Expr, unique: string)
-    if typ.is_some() || literal_default(init).is_none() then return
+private names_something(e: Expr) -> bool = *e.kind match
+    Ident(_) -> true
+    Field(_, _, _) -> true
+    _ -> false
 
-    cx.open_vars.push(OpenVar(unique, span.start, init, cx.var_fix_log.len(), false))
+// Records a binding just made as one waiting for its first use, where it is one: its value a bare
+// literal or an untyped constant.
+open_binding(cx: &Analyzer, span: Span, typ: Option[TypeRef], init: Expr, unique: string)
+    if typ.is_some() then return
+
+    val fallback = open_fallback(cx, init)
+
+    if fallback.is_none() then return
+
+    cx.open_vars.push(OpenVar(unique, span.start, init, cx.var_fix_log.len(), false, fallback.unwrap()))
+
+// The type a binding of `e` has where no use fixes one: a bare literal's default, or an untyped
+// numeric constant's, `int` or `real`. Nothing for anything else.
+private open_fallback(cx: &Analyzer, e: Expr) -> Option[Type]
+    val own = literal_default(e)
+
+    if own.is_some() || !untyped_const_read(cx, e) then return own
+
+    val ty = untyped_const_type(cx, e)
+
+    if type_eq(ty, int_type()) || type_eq(ty, real_type()) then Some(ty) else None
+end open_fallback
 
 // Whether a range's bounds are both bare integer literals, so the variable of a `for` over it is
-// open: its first use that fixes a type decides the range's.
-counted_open(lo: Expr, hi: Expr) -> bool =
-    literal_default(lo).map(t -> type_eq(t, int_type())).unwrap_or(false) &&
-        literal_default(hi).map(t -> type_eq(t, int_type())).unwrap_or(false)
+// open: its first use that fixes a type decides the range's. An untyped integer constant is the
+// literal it stands for (`untyped_const_read`), so `0..<N` is open as `0..<1000` is.
+counted_open(cx: &Analyzer, lo: Expr, hi: Expr) -> bool = counted_bound(cx, lo) && counted_bound(cx, hi)
+
+private counted_bound(cx: &Analyzer, e: Expr) -> bool =
+    literal_default(e).map(t -> type_eq(t, int_type())).unwrap_or(false) ||
+        untyped_const_read(cx, e) && type_eq(untyped_const_type(cx, e), int_type())
 
 // Reads a `for` over a range whose bounds are both bare integer literals -- `read(None)` binds the
 // variable at `int` as one waiting for its first use, filed under `at` -- and reads it again at the
@@ -185,7 +231,7 @@ end counted_first_use_read
 
 // Records a counted `for`'s variable, just bound at `int`, as one waiting for its first use.
 open_counted(cx: &Analyzer, at: usize, lo: Expr, unique: string) =
-    cx.open_vars.push(OpenVar(unique, at, lo, cx.var_fix_log.len(), true))
+    cx.open_vars.push(OpenVar(unique, at, lo, cx.var_fix_log.len(), true, int_type()))
 
 // A name read where a type is expected of it: the use that fixes an open binding's type, unless the
 // name is an operand.
@@ -219,11 +265,11 @@ note_var_fix(cx: &Analyzer, unique: string, fixing: Type, beside: bool = false)
         for k in o.since..<cx.var_fix_log.len()
             if cx.var_fix_log[k].at == o.at then return
 
-        val unfitting_told = beside && integer_literal(o.init) && integer_scalar(ty)
+        val unfitting_told = beside && type_eq(o.fallback, int_type()) && integer_scalar(ty)
 
         if !o.counted && !literal_fits(cx, o.init, ty) && !unfitting_told then return
 
-        cx.var_fix_log.push(VarFix(o.at, ty))
+        cx.var_fix_log.push(VarFix(o.at, ty, o.fallback))
         return
 end note_var_fix
 
@@ -242,10 +288,6 @@ private numeric_scalar(t: Type) -> bool = repr(t) match
 private integer_scalar(t: Type) -> bool = repr(t) match
     Integer(_, _, _) -> true
     _ -> false
-
-private integer_literal(e: Expr) -> bool = literal_default(e) match
-    Some(t) -> t == int_type()
-    None -> false
 
 // A name or arithmetic read as an operand, or where an open binding's own assignment reads it, is
 // one whose position fixes nothing: whatever its operator settles on is not a type it was used at.
@@ -281,7 +323,7 @@ private opens_of(cx: &Analyzer, e: Expr) -> Buf[string]
     if undecided(cx, e, found) then found else buf()
 
 private undecided(cx: &Analyzer, e: Expr, into: Buf[string]) -> bool
-    if literal_default(e).is_some() then return true
+    if literal_default(e).is_some() || untyped_const_read(cx, e) then return true
 
     val open = open_name(cx, e)
 
@@ -376,9 +418,10 @@ private reads_open(cx: &Analyzer, t: TExpr) -> bool
 end reads_open
 
 // Whether an operand's own reading is a type that fixes a neighbour: one the program gave it, not a
-// literal's and not an open binding's.
+// literal's, an untyped constant's or an open binding's.
 private fixes_a_neighbour(cx: &Analyzer, e: Expr, t: TExpr) -> bool =
-    texpr_type(t) != Unknown && !adaptable(e, t) && open_name(cx, e).is_none() && !reads_open(cx, t)
+    texpr_type(t) != Unknown && !adaptable(cx, e, t) && !untyped_const_read(cx, e) && open_name(cx, e).is_none() &&
+        !reads_open(cx, t)
 
 // A comparison, or arithmetic other than a shift: an undecided operand beside an operand of a type of
 // its own is that type, so each open binding it waits on is fixed at it -- `i < xs.len`,
@@ -459,4 +502,4 @@ end assigned_fix
 // The inner analyzer files its fixes in the outer's log.
 carry_open(outer: &Analyzer, inner: &Analyzer, outer_unique: string, inner_unique: string)
     for o in outer.open_vars
-        if o.unique == outer_unique then inner.open_vars.push(OpenVar(inner_unique, o.at, o.init, o.since, o.counted))
+        if o.unique == outer_unique then inner.open_vars.push(OpenVar(inner_unique, o.at, o.init, o.since, o.counted, o.fallback))

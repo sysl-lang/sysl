@@ -1848,10 +1848,12 @@ print(Sq.scaled[i64, Two](5))
 ```
 
 An integer constant is read at the parameter's type wherever it is handed to the parameter itself,
-and refused only where its value does not fit, so `const Base = 2`, an `int`, still makes `Ring[Base]`
-and `Ring[Base + 1]`. Inside the expression the ordinary rules hold: a function's parameter takes
-what any call to it takes, and an `int` is not converted to a `usize` implicitly. That argument is
-refused at the part that does not read, as the same call would be anywhere else:
+and refused only where its value does not fit, so `const Base: int = 2` still makes `Ring[Base]` and
+`Ring[Base + 1]`. Inside the expression the ordinary rules hold: a function's parameter takes what
+any call to it takes, and an `int` is not converted to a `usize` implicitly. That argument is refused
+at the part that does not read, as the same call would be anywhere else — where an
+[untyped constant](/reference/modules/#untyped-and-typed-constants), `const Base = 2`, would be the
+literal `2` and read as a `usize`:
 
 ```sysl
 struct Ring[const N: usize]
@@ -1859,7 +1861,7 @@ struct Ring[const N: usize]
 
 double(n: usize) -> usize = n * 2
 
-const Base = 2
+const Base: int = 2
 
 var r: Ring[double(Base) + 1] = Ring([0; 5])
 

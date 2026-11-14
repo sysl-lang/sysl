@@ -1,0 +1,303 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.testing.skip
+
+// An untyped `const` is the literal it stands for, and a typed one is a value of its type
+// (`reference/modules.md § const — a value`; `untyped_const_read` in expr.sysl). Every context a
+// literal takes its type from is run for both halves: arithmetic, comparison, an argument, an
+// initializer and an assignment, an index, a range bound, a return, an array length and a pattern.
+// The untyped half is also run from another module, inside a generic body, over a constant
+// expression, a local `const`, a float and a value out of range; the typed half is held to the
+// mismatch a `val` of its type gets, word for word. A binding of an untyped constant is fixed by its
+// first use, a character constant is the byte its literal is beside a `u8`, and a float constant is
+// read at a fixed-point or `f128` format -- each from a module, a local and another module.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private cad_ready() -> bool = std_root().is_ok() && clang_available()
+
+// What a program prints, or why it did not build or run -- with module `lib` beside it, where given.
+private cad_ran(text: string, lib: string = "") -> string
+    val root = make_temp_dir("sysl-cad").unwrap()
+    val exe = s"$root/built"
+
+    cad_write(root, text, lib)
+
+    val said = build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) -> s"did not build: ${failure_text(why)}"
+        Ok(_) ->
+            capture(exe, [], "", [], true) match
+                Err(_) -> "the program that was built could not be run"
+                Ok(out) -> if out.status.ok() then out.text else s"exited badly: ${out.text}"
+
+    remove_dir_all(root).unwrap_or(())
+    said
+end cad_ran
+
+// The analysis report of a program, empty where it compiled.
+private cad_report(text: string, lib: string = "") -> string
+    val root = make_temp_dir("sysl-cad").unwrap()
+
+    cad_write(root, text, lib)
+
+    val out = emit_llvm_text(root, None, DefaultOptimization, buf(), Some(buf())) match
+        Err(why) -> failure_text(why)
+        Ok(e) -> analysis_report(e.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end cad_report
+
+private cad_write(root: string, text: string, lib: string)
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    if lib != ""
+        make_dir_all(s"$root/lib").unwrap()
+        write_text(s"$root/lib/lib.sysl", lib).unwrap()
+    end if
+end cad_write
+
+private cad_prints(text: string, printed: string, lib: string = "")
+    if !cad_ready() then skip("the standard module's source or clang is not on this machine")
+
+    assert_eq(cad_ran(text, lib), printed)
+
+// A program refused with a diagnostic containing `said`.
+private cad_refused(text: string, said: string, lib: string = "")
+    if std_root().is_err() then skip("the standard module's source is not on this machine")
+
+    val got = cad_report(text, lib)
+
+    assert(got.contains(said), s"wanted '$said', got: $got")
+
+// -- the untyped half: every context ---------------------------------------------------------------
+
+@test("an untyped constant beside a byte is read at the byte, so the sum is one")
+cad_untyped_arithmetic()
+    cad_prints("const N = 5\nval b: u8 = 250\nval r: u8 = b + N\nprint(r, N - b + 245, b * 1 + N)\n",
+               "255 0 255\n")
+
+@test("an untyped constant compares with a usize, a u64 and a signed byte as a literal does")
+cad_untyped_comparison()
+    cad_prints("const N = 10\nval i: usize = 3\nval w: u64 = 10\nval s: i8 = -3\nprint(i < N, w == N, s > -N, N >= i)\n",
+               "true true true true\n")
+
+@test("an untyped constant is an argument of the parameter's type")
+cad_untyped_argument()
+    cad_prints("const N = 1000\ntake(x: u32) -> u32 = x + 1\nwide(x: u64, y: i16) -> u64 = x + u64(y)\nprint(take(N), wide(N, N))\n",
+               "1001 2000\n")
+
+@test("an untyped constant initializes and is assigned to a place of any integer type")
+cad_untyped_initializer_and_assignment()
+    cad_prints("const N = 1000\nval k: usize = N\nvar m: u16 = 0\nm = N\nm += N\nval l: i64 = -N\nprint(k, m, l)\n",
+               "1000 2000 -1000\n")
+
+@test("an untyped constant indexes, alone and beside a usize")
+cad_untyped_index()
+    cad_prints("const K = 2\nval a: [4]u8 = [10, 20, 30, 40]\nval i: usize = 1\nprint(a[K], a[i + K], a[K - 1])\n",
+               "30 40 20\n")
+
+@test("a range bounded by an untyped constant counts at the type its variable's first use fixes")
+cad_untyped_range_bound()
+    cad_prints("const N = 4\nval want: usize = 2\nval a: [4]u8 = [1, 2, 3, 4]\nfor j in 0..<N\n    if j == want then print(j)\nprint(a[0..<N].len, a[1..N - 1].len)\n",
+               "2\n4 3\n")
+
+@test("an untyped constant is returned at the function's result type")
+cad_untyped_return()
+    cad_prints("const N = 40000\nf() -> u16 = N\ng() -> f32 = N\nprint(f(), g())\n", "40000 40000\n")
+
+@test("an untyped constant is an array length and a fill count")
+cad_untyped_array_length()
+    cad_prints("const N = 3\nval a: [N]u8 = [7; N]\nval b: [N * 2]i64 = [0; N * 2]\nprint(a.len, b.len, a[N - 1])\n",
+               "3 6 7\n")
+
+@test("an untyped constant is a pattern of the scrutinee's type")
+cad_untyped_pattern()
+    cad_prints("const N = 7\nkind(b: u8) -> string = b match\n    N -> \"seven\"\n    _ -> \"other\"\nprint(kind(7), kind(8))\n",
+               "seven other\n")
+
+// -- the untyped half: where it comes from ---------------------------------------------------------
+
+@test("an untyped constant from another module adapts, imported by name and read through the module")
+cad_untyped_from_another_module()
+    cad_prints("import lib.Limit\nimport lib\nval n: usize = Limit\nval b: u8 = 1\nval c: u16 = lib.Limit\nprint(n, b + lib.Small, c)\n",
+               "1000 4 1000\n", "module lib\n\nconst Limit = 1000\nconst Small = 3\n")
+
+@test("an untyped constant in a generic body is read at the type parameter")
+cad_untyped_generic_body()
+    cad_prints("const N = 5\nbump[T: Integer](x: T) -> T = x +| N\nless[T: Integer](x: T) -> bool = x < N\nprint(bump(u8(253)), bump(i64(-5)), less(u16(4)))\n",
+               "255 0 true\n")
+    cad_refused("const Big = 300\nbump[T: Integer](x: T) -> T = x +| Big\nprint(bump(u8(1)))\n",
+                "the constant 'Big' (300) does not fit byte")
+
+@test("an untyped constant holding a constant expression is that expression's literal")
+cad_untyped_constant_expression()
+    cad_prints("const K = 3 * 4\nconst J = K + 1\nconst S = 1 << 4\nval b: u8 = 1\nval r: u8 = b + K + J + S\nval i: usize = J\nprint(r, i)\n",
+               "42 13\n")
+
+@test("a local untyped constant adapts as a module one does")
+cad_untyped_local()
+    cad_prints("main()\n    const L = 9\n    val i: usize = L\n    val b: u8 = 1\n    print(i, b + L, b < L)\n",
+               "9 10 true\n")
+
+@test("an untyped float constant is the float its position wants, and an integer one meets a float")
+cad_untyped_float()
+    cad_prints("const P = 1.5\nconst Four = 4\nval f: f32 = 2.0\nval g: f32 = f * P\nval h: f32 = f * Four\nval x: real = Four * P\nprint(g, h, x)\n",
+               "3 8 6\n")
+
+@test("an untyped constant beside a wrapping or saturating operator is read at its operand's type")
+cad_untyped_wrap_sat()
+    cad_prints("const K = 10\nval y: u8 = 250\nprint(y +| K, y +% K, K *| y)\n", "255 4 255\n")
+
+// -- the untyped half: a binding of one takes its type from its first use --------------------------
+
+@test("a binding of an untyped constant is fixed by its first use, as a binding of its literal is")
+cad_binding_first_use()
+    cad_prints("const N = 7\nconst P = 1.5\ntake(x: u8) -> u8 = x\ntake32(x: f32) -> f32 = x\n" +
+               "val n = N\nval x = P\nvar m = N\nval w: u16 = 1000\nm = 3\nprint(take(n), take32(x), m < w)\n",
+               "7 1.5 true\n")
+
+@test("a binding of an untyped constant fixed beside a byte is a byte, and its sum wraps a byte")
+cad_binding_beside_byte()
+    cad_prints("const N = 7\nval b: u8 = 250\nval n = N\nprint(b +% n)\n", "1\n")
+    cad_prints("const N = 7\nval n = N\nprint(n + 1000000)\n", "1000007\n")
+
+@test("a binding of a local, an imported or a dotted untyped constant is fixed by its first use")
+cad_binding_neighbours()
+    cad_prints("take(x: u8) -> u8 = x\nmain()\n    const L = 9\n    val n = L\n    var t = L\n    val b: u8 = 1\n" +
+               "    t += b\n    print(take(n), t +% 250)\n",
+               "9 4\n")
+    cad_prints("import lib.Limit\nimport lib\nwide(x: u16) -> u16 = x\nval n = Limit\nval k = lib.Small\nval b: u8 = 1\n" +
+               "print(wide(n), b + k)\n",
+               "1000 4\n", "module lib\n\nconst Limit = 1000\nconst Small = 3\n")
+
+@test("a binding of an untyped constant in a generic body is fixed at the type parameter's instance")
+cad_binding_generic_body()
+    cad_prints("const N = 5\nbump[T: Integer](x: T) -> T\n    val k = N\n    x +| k\nprint(bump(u8(253)), bump(i64(-5)))\n",
+               "255 0\n")
+
+@test("a binding of an untyped constant fixed where its value does not fit is refused at the constant")
+cad_binding_out_of_range()
+    cad_refused("const Big = 300\nval n = Big\nval b: u8 = 1\nprint(b + n)\n", "the constant 'Big' (300) does not fit byte")
+
+@test("a binding of a typed constant is that type, which no use changes")
+cad_binding_typed()
+    cad_refused("const M: i32 = 7\ntake(x: u8) -> u8 = x\nval m = M\nprint(take(m))\n", "'x' of 'take' is u8, but int was given")
+
+// -- the untyped half: a character constant is its character literal -------------------------------
+
+@test("a character constant is the byte beside a byte, an argument, an initializer, a result and a pattern")
+cad_char_positions()
+    cad_prints("const Semi = ';'\nconst Sep = Semi\ntake(x: u8) -> u8 = x\nf() -> u8 = Semi\n" +
+               "kind(b: u8) -> string = b match\n    Semi -> \"semi\"\n    _ -> \"other\"\n" +
+               "val b: u8 = 59\nval c: u8 = Semi\nvar d: u8 = 0\nd = Sep\n" +
+               "print(b == Semi, Semi == b, u8(Semi), Semi, b == Sep)\nprint(take(Semi), c, d, f(), kind(59), kind(1))\n",
+               "true true 59 ; true\n59 59 59 59 semi other\n")
+
+@test("a local or an imported character constant is the byte beside a byte and in a pattern")
+cad_char_local_and_imported()
+    cad_prints("main()\n    const S = ';'\n    val b: u8 = 59\n    print(b == S, u8(S), S)\n    b match\n" +
+               "        S -> print(\"semi\")\n        _ -> print(\"other\")\n",
+               "true 59 ;\nsemi\n")
+    cad_prints("import lib\nval b: u8 = 59\nprint(b == lib.Semi, lib.Semi)\n", "true ;\n", "module lib\n\nconst Semi = ';'\n")
+
+@test("a character constant is refused where its literal is: past ASCII at a byte, and at a wider integer")
+cad_char_refusals()
+    cad_refused("const E = '\u{e9}'\nval b: u8 = 1\nprint(b == E)\n", "the character U+00E9 is not ASCII")
+    cad_refused("const Semi = ';'\nval w: u16 = Semi\n", "cannot initialize 'w': declared u16 but the value is char")
+    cad_refused("main()\n    const E = '\u{e9}'\n    val b: u8 = E\n", "the character U+00E9 is not ASCII")
+
+@test("a character constant given a type is a char, which a byte does not compare with")
+cad_char_typed()
+    cad_refused("const S: char = ';'\nval b: u8 = 59\nprint(b == S)\n", "cannot compare byte with char")
+    cad_refused("main()\n    const S: char = ';'\n    val b: u8 = 59\n    print(b == S)\n", "cannot compare byte with char")
+
+// -- the untyped half: a float constant at a fixed-point or f128 position --------------------------
+
+@test("a float constant at a fixed-point or f128 position is read from its text as its literal is")
+cad_float_fixed_and_quad()
+    cad_prints("const Half = 0.5\nconst Neg = -0.5\nconst Q = 0.25 * 2.0\nconst Tenth = 0.1\nconst Two = 2\n" +
+               "val a: q15 = 0.25\nval q: q15 = Half\nval r: q15 = Neg\nval s: q15 = Q\nval w: f128 = Tenth\n" +
+               "val lit: f128 = 0.1\nval t: i32q16 = Two\nprint(q, r, s, a + Half, w == lit, t)\n",
+               "0.5 -0.5 0.5 0.75 true 2\n")
+
+@test("a local or an imported float constant is read at f32, fixed point and f128")
+cad_float_local_and_imported()
+    cad_prints("main()\n    const H = 0.5\n    val f: f32 = 2.0\n    val q: q15 = H\n    val w: f128 = H\n" +
+               "    val lit: f128 = 0.5\n    print(f * H, q, w == lit)\n",
+               "1 0.5 true\n")
+    cad_prints("import lib\nval q: q15 = lib.Half\nval w: f128 = lib.Tenth\nval lit: f128 = 0.1\nprint(q, w == lit)\n",
+               "0.5 true\n", "module lib\n\nconst Half = 0.5\nconst Tenth = 0.1\n")
+
+@test("a float constant a fixed-point type does not hold is refused, naming the constant")
+cad_float_fixed_out_of_range()
+    cad_refused("const Big = 1.5\nval q: q15 = Big\n", "the constant 'Big' (1.5) does not fit q15, whose range is -1 to 0.99997")
+    cad_refused("main()\n    const H = 1.5\n    val q: q15 = H\n", "the constant 'H' (1.5) does not fit q15")
+    cad_refused("const Two = 2\nval q: q15 = Two\n", "the constant 'Two' (2) does not fit q15")
+    cad_refused("const Q = 0.75 * 2.0\nval q: q15 = Q\n", "the constant 'Q' (1.5) does not fit q15")
+
+@test("a typed float constant is not read at another format")
+cad_float_typed()
+    cad_refused("const H: real = 0.5\nval q: q15 = H\n", "cannot initialize 'q': declared q15 but the value is real")
+
+// -- the untyped half: refusals --------------------------------------------------------------------
+
+@test("an untyped constant out of range is refused as its literal is, naming the constant")
+cad_untyped_out_of_range()
+    cad_refused("const Big = 300\nval b: u8 = Big\n", "the constant 'Big' (300) does not fit u8")
+    cad_refused("const Big = 300\nval b: u8 = 1\nprint(b + Big)\n", "the constant 'Big' (300) does not fit u8")
+    cad_refused("const Big = 300\ntake(x: u8) -> u8 = x\nprint(take(Big))\n", "the constant 'Big' (300) does not fit u8")
+    cad_refused("const Neg = -1\nval i: usize = Neg\n", "the constant 'Neg' (-1) does not fit usize")
+    cad_refused("const Big = 300\nkind(b: u8) -> int = b match\n    Big -> 1\n    _ -> 0\nprint(kind(1))\n",
+                "the constant 'Big' (300) does not fit byte")
+    cad_refused("const Odd = 16777217\nval f: f32 = Odd\n", "the constant 'Odd' (16777217) is not exactly an f32")
+    cad_refused("const Big = 300\nf() -> u8 = Big\n", "the constant 'Big' (300) does not fit byte")
+
+@test("an untyped constant is still refused where its literal is: a string, and a float at an integer")
+cad_untyped_still_refused()
+    cad_refused("const N = 3\nval s: string = N\n", "cannot initialize 's': declared string but the value is int")
+    cad_refused("const P = 1.5\nval i: int = P\n", "cannot initialize 'i': declared int but the value is real")
+
+@test("an untyped constant whose value has a type of its own is that type, and does not adapt")
+cad_untyped_value_with_its_own_type()
+    cad_refused("const B = u8(3)\nval i: i8 = B\n", "cannot initialize 'i': declared i8 but the value is byte")
+    cad_refused("const W = 3i64\nval s: u16 = W\n", "cannot initialize 's': declared u16 but the value is long")
+
+// -- the typed half: a value of its type, as a `val` is -------------------------------------------
+
+@test("a typed constant beside another integer type is the mismatch a val of its type is")
+cad_typed_arithmetic_and_comparison()
+    cad_refused("const M: i32 = 5\nval w: u64 = 1\nprint(w + M)\n", "'+' needs matching types, got ulong and int")
+    cad_refused("const M: i32 = 5\nval w: u64 = 1\nprint(w == M)\n", "cannot compare ulong with int")
+    cad_refused("const M: i32 = 5\nval b: u8 = 1\nval r: u8 = b + M\n", "cannot initialize 'r': declared u8 but the value is int")
+    cad_refused("const M: i32 = 5\nval b: u8 = 1\nprint(b +% M)\n", "'+%' takes two values of one type, got byte and int")
+
+@test("a typed constant is not an argument, an initializer, an assignment or a result of another type")
+cad_typed_positions()
+    cad_refused("const M: i32 = 5\ntake(x: u32) -> u32 = x\nprint(take(M))\n", "'x' of 'take' is u32, but int was given")
+    cad_refused("const M: i32 = 5\nval k: usize = M\n", "cannot initialize 'k': declared usize but the value is int")
+    cad_refused("const M: i32 = 5\nvar m: u16 = 0\nm = M\nprint(m)\n", "u16")
+    cad_refused("const M: i32 = 5\nf() -> u16 = M\nprint(f())\n", "int")
+
+@test("a range bounded by a typed constant is a range of its type")
+cad_typed_range_bound()
+    cad_refused("const M: i32 = 4\nval want: usize = 2\nfor j in 0..<M\n    if j == want then print(j)\n",
+                "cannot compare int with usize")
+
+@test("a typed constant in a pattern is a value of its own type, refused against another")
+cad_typed_pattern()
+    cad_refused("const M: i32 = 7\nkind(b: u8) -> int = b match\n    M -> 1\n    _ -> 0\nprint(kind(7))\n",
+                "pattern is int but the value is byte")
+    cad_refused("main()\n    const L: i32 = 7\n    val b: u8 = 7\n    b match\n        L -> print(1)\n        _ -> print(0)\n",
+                "pattern is int but the value is byte")
+
+@test("a typed constant is still everything a value of its type is")
+cad_typed_at_its_own_type()
+    cad_prints("const M: u8 = 250\nconst Len: usize = 3\nval b: u8 = 5\nval a: [Len]u8 = [1, 2, 3]\nval w: u64 = 1\n" +
+               "kind(x: u8) -> string = x match\n    M -> \"top\"\n    _ -> \"no\"\nprint(b + M, a[Len - 1], w + M, kind(250))\n",
+               "255 3 251 top\n")

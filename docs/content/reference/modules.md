@@ -1833,9 +1833,111 @@ print(table.len, window, capacity)
 bound is a compile-time constant and a call is not. Without `const`, a program carries `[512]u8` next
 to a `capacity()` function and a comment asking the reader to keep the two in step.
 
-**The type may be left to the value**, as a [binding's](/reference/declarations/#bindings) may:
-`const window = 1 << 15` is an `int`. Written, it fixes the literal's type, so `const capacity: usize
-= 512` needs no suffix on the `512`.
+**The type may be left to the value**, as a [binding's](/reference/declarations/#bindings) may.
+Written, it fixes the literal's type, so `const capacity: usize = 512` needs no suffix on the `512`.
+
+### Untyped and typed constants
+
+**A constant whose type is left to a value with no type of its own is untyped, and is the literal
+it stands for.** `const window = 1 << 15` is the number 32768 written wherever the name is: beside a
+`u16` it is a `u16`, as an argument it is the parameter's type, as an index or a range bound a
+`usize`, and where nothing says otherwise an `int`. That holds in every place a literal takes its
+type from — arithmetic, a comparison, an argument, an initializer or an assignment, an index, a
+range bound, a `return`, an array length and a pattern. "No type of its own" means a literal,
+arithmetic or a shift over literals, an `if` or a `match` of them, or another untyped constant;
+`const K = 3 * 4` is untyped and `const B = u8(3)` is a byte. A float constant is the float format
+its position wants -- an `f32`, an `f128` or a fixed-point type, read from its text as the literal
+would be -- and an integer one meets a float as an integer literal does. A binding of one, `val n =
+N`, [takes its type from its first use](/reference/declarations/#a-literal-binding-takes-its-type-from-its-first-use) exactly as `val n = 7`
+does.
+
+```sysl
+const limit = 1000
+const lanes = 4
+
+take(n: u32) -> u32 = n + 1
+
+val i: usize = 3
+val b: u8 = 250
+val scale: f32 = 0.5
+
+for j in 0..<lanes
+    if j == i then print(j)
+
+print(take(limit), i < limit, b + lanes, scale * lanes)
+```
+
+```output
+3
+1001 true 254 2
+```
+
+**A constant left to a character literal is that literal too**: `const Semi = ';'` is a `char` where
+nothing says otherwise, and beside a `u8`, as one's argument, initializer, result or pattern, the
+byte 59 — as `';'` is. Given a type, `const Semi: char = ';'`, it is a `char` everywhere. A float
+constant at a fixed-point or `f128` position is read from its text, so `Tenth` below is exactly the
+`f128` the literal `0.1` is, not a double's 53 bits of it.
+
+```sysl
+const Semi = ';'
+const Half = 0.5
+const Tenth = 0.1
+
+val line = "a;b;c"
+val q: q15 = Half
+val w: f128 = Tenth
+val exact: f128 = 0.1
+var count = 0
+
+for b in line.bytes
+    if b == Semi then count += 1
+
+print(count, Semi, q, w == exact)
+```
+
+```output
+2 ; 0.5 true
+```
+
+**It is refused where its literal would be**, and the refusal names it:
+
+```sysl
+const limit = 1000
+
+val b: u8 = limit
+```
+
+```error
+the constant 'limit' (1000) does not fit u8
+```
+
+and so is a float constant a fixed-point type does not hold:
+
+```sysl
+const gain = 1.5
+
+val g: q15 = gain
+```
+
+```error
+the constant 'gain' (1.5) does not fit q15, whose range is -1 to 0.99997
+```
+
+**A constant written with a type is a value of that type**, as a `val` of it is, and never adapts:
+`const step: i32 = 5` beside a `u64` is the mismatch an `i32` variable would be, and so is the same
+constant as a pattern over a byte.
+
+```sysl
+const step: i32 = 5
+
+val w: u64 = 1
+
+print(w + step)
+```
+
+```error
+'+' needs matching types, got ulong and int
+```
 
 **And the type is a scalar, or a transparent subtype of one.** The first half is the shape of what a
 constant expression can produce rather than a restriction anybody chose — there is no aggregate
