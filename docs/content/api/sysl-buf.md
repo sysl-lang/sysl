@@ -15,7 +15,7 @@ sink is `x.to_string()`, and that goes through storage the compiler lays out rat
 
 ## Index
 
-[`buf`](#buf) [`buf_filled`](#buf_filled) [`buf_with_capacity`](#buf_with_capacity) [`byte_sink`](#byte_sink) [`freeze_buf`](#freeze_buf) [`Buf`](#buf-1) [`ByteSink`](#bytesink) [`Frozen`](#frozen) [`FrozenWalk`](#frozenwalk) [Buf[T]](#buft) [Debug for Buf[T]](#debug-for-buft) [Debug for Frozen[T]](#debug-for-frozent) [Display for Buf[T]](#display-for-buft) [Display for Frozen[T]](#display-for-frozent) [Drop for Frozen[T]](#drop-for-frozent) [Eq for Buf[T]](#eq-for-buft) [Fallible for ByteSink](#fallible-for-bytesink) [Index for Buf[T]](#index-for-buft) [Index for Frozen[T]](#index-for-frozent) [IndexPlace for Buf[T]](#indexplace-for-buft) [IndexSet for Buf[T]](#indexset-for-buft) [Iterate for FrozenWalk[T]](#iterate-for-frozenwalkt) [Walk for Buf[T]](#walk-for-buft) [Walk for Frozen[T]](#walk-for-frozent) [Writer for ByteSink](#writer-for-bytesink)
+[`buf`](#buf) [`buf_filled`](#buf_filled) [`buf_with_capacity`](#buf_with_capacity) [`buffer`](#buffer) [`byte_sink`](#byte_sink) [`Buf`](#buf-1) [`ByteSink`](#bytesink) [`Frozen`](#frozen) [`FrozenWalk`](#frozenwalk) [`Buffer`](#buffer-1) [Buf[T]](#buft) [Debug for Buf[T]](#debug-for-buft) [Debug for Frozen[T]](#debug-for-frozent) [Display for Buf[T]](#display-for-buft) [Display for Frozen[T]](#display-for-frozent) [Drop for Frozen[T]](#drop-for-frozent) [Eq for Buf[T]](#eq-for-buft) [Fallible for ByteSink](#fallible-for-bytesink) [Index for Buf[T]](#index-for-buft) [Index for Frozen[T]](#index-for-frozent) [IndexPlace for Buf[T]](#indexplace-for-buft) [IndexSet for Buf[T]](#indexset-for-buft) [Iterate for FrozenWalk[T]](#iterate-for-frozenwalkt) [Walk for Buf[T]](#walk-for-buft) [Walk for Frozen[T]](#walk-for-frozent) [Writer for ByteSink](#writer-for-bytesink)
 
 ## Functions
 
@@ -52,22 +52,19 @@ is the one cost a growable sequence has that an exactly-sized array does not.
 is not kept alive by the room it would once have been repeated into. The parameter stays because
 callers write it, and because it is what lets a call say the element type without brackets.
 
+### `buffer`
+
+```sysl
+const buffer[T]() -> Buf[T]
+```
+
+`buffer()` is `buf()` under its longer name.
+
 ### `byte_sink`
 
 ```sysl
 byte_sink() -> ByteSink
 ```
-
-### `freeze_buf`
-
-```sysl
-freeze_buf[T](b: Buf[T]) -> &sync Frozen[T]
-```
-
-The buffer's elements, taken: copied once into storage of their own, sized to them, and the
-buffer left empty -- for this name and every other name of the same buffer, which is what makes the
-result immutable. A view taken of the buffer earlier still reads the old storage, which the frozen
-one shares nothing with.
 
 ## Types
 
@@ -135,8 +132,10 @@ the caller's line.
 | `reserve` | `const reserve(self, more: usize)` | Room for at least `more` elements past `len()`, so that many pushes -- or that many slots written through `spare()` -- need no growth. |
 | `remove` | `const remove(self, i: usize) -> T` |  |
 | `copy` | `const copy(self) -> Buf[T]` | A second buffer holding the same elements, sized to them -- the one way to get a buffer that is not this one, every other way of handing a `Buf` on handing on this one. |
-| `freeze` | `const freeze(self) -> &sync Frozen[T]` | The elements, frozen: a `&sync Frozen[T]` every thread may read at once, and this buffer -- through this name and every other -- left empty (`Frozen`). |
-| `view` | `const view(self) -> []T` | The elements as a slice, which is what everything reading a `Buf` in bulk goes through. |
+| `freeze` | `const freeze(self) -> &Frozen[T]` | The elements, frozen: a `&Frozen[T]` nothing writes, and this buffer -- through this name and every other -- left empty (`Frozen`). |
+| `view` | `const view(self) -> []const T` | The elements as a read-only slice, which is what everything reading a `Buf` in bulk goes through. |
+| `view_mut` | `view_mut(*self) -> []T` | The elements as a slice that may be written, the same storage `view()` gives -- so a write through it is seen through the buffer. |
+| `into_view` | `const into_view(self) -> []T` | The buffer given up and its elements handed over as an owned slice: for a function that builds a local buffer and returns what it holds. |
 | `release` | `release(*self)` | This name's share of the buffer given back, and the handle left naming nothing -- the state zeroed storage starts in, where every reader answers as an empty buffer does. |
 
 ### `ByteSink`
@@ -167,32 +166,36 @@ struct Frozen[T]
     private n: usize
 ```
 
-A buffer that will never change again, shared by every thread that holds it.
+A buffer that will never change again.
 
-`Buf.freeze()` makes one: it takes the buffer's elements and answers a `&sync Frozen[T]`, which
-is one atomic count on the whole buffer. A `&sync` object may hold it, and a `&sync Fn` may
-capture it, so read-only heap data -- decoded pixels, a list of shapes -- is read by every thread
-at once with no lock and no count per element (`reference/memory.md § A frozen buffer crosses`).
+`Buf.freeze()` makes one: it takes the buffer's elements and answers a `&Frozen[T]`, one count on
+the whole buffer, of any element type. **Where the position expects a `&sync Frozen[T]`** -- an
+annotation, a parameter or a field -- the box is allocated with an atomic count instead, as a
+construction's is. A `&sync` object may hold that one, and a `&sync Fn` may capture it, so
+read-only heap data -- decoded pixels, a list of shapes -- is read by every thread at once with no
+lock and no count per element (`reference/memory.md § A frozen buffer crosses`). The two are
+distinct types, and neither converts to the other.
 
 **Nothing writes it.** There is no `push`, no `set`, no subscript assignment and no writable view;
 what it has is `len`, `f[i]`, `for x in f` and `view()`, a `[]const T`.
 
-**A frozen buffer shares exactly what its elements share**, so a `&sync Frozen[T]` is formed only
-where a `&sync T` could hold a `T`: scalars, `&sync U`, raw pointers, other frozen buffers, and the
-structs and arrays built of them. The compiler asks that of the type argument where the reference
-is formed, as it asks a struct's fields.
+**A shared frozen buffer shares exactly what its elements share**, so a `&sync Frozen[T]` is
+formed only where a `&sync T` could hold a `T`: scalars, `&sync U`, raw pointers, other shared
+frozen buffers, and the structs and arrays built of them. The compiler asks that of the type
+argument where the reference is formed, as it asks a struct's fields.
 
-**Its fields carry no count**, and that is what makes it safe to read from every thread: the
-storage is owned through a count that is not atomic, held here as the bare words of the slice that
-owns it, so copying the struct -- as a `(self)` member does -- takes no share of anything. Only the
-destructor touches that count, once, run by whichever thread lets go of the box's last share.
+**Its fields carry no count**, and that is what makes the shared form safe to read from every
+thread: the storage is owned through a count that is not atomic, held here as the bare words of the
+slice that owns it, so copying the struct -- as a `(self)` member does -- takes no share of
+anything. In the shared form only the destructor touches that count, once, run by whichever thread
+lets go of the box's last share.
 
 | Member | Signature | Description |
 |---|---|---|
 | `len` | `const len(self) -> usize` |  |
 | `is_empty` | `const is_empty(self) -> bool` |  |
 | `get` | `const get[I: Integer](self, i: I) -> Option[T]` | The element at `i`, or `None` where there is none -- `i` at or past the length, or negative. |
-| `view` | `const view(&sync self) -> []const T` | The elements as a read-only slice. |
+| `view` | `const view(&self) -> []const T` | The elements as a read-only slice, which keeps them alive however long it is kept. |
 
 ### `FrozenWalk`
 
@@ -205,6 +208,17 @@ struct FrozenWalk[T]
 
 The cursor a `for` over a frozen buffer walks: the storage's address and length, read while the
 frozen buffer the `for` was handed keeps it alive.
+
+## Aliases
+
+### `Buffer`
+
+```sysl
+type Buffer[T] = Buf[T]
+```
+
+`Buffer[T]` is `Buf[T]` under its longer name: the same type, so the two are written
+interchangeably in parameters, fields, impls and generic arguments.
 
 ## Implementations
 

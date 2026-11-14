@@ -7,9 +7,10 @@ import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
 import sysl.process.capture
 import sysl.text.Search
 
-// `Buf.freeze()` and `&sync Frozen[T]` -- read-only heap data every thread reads at once
-// (`reference/memory.md § A frozen buffer crosses`). The sharing rule asks a frozen buffer's ELEMENT
-// type where a `&sync` struct's fields would be asked, and asks it at the call that froze it; and a
+// `Buf.freeze()`, `&Frozen[T]` and `&sync Frozen[T]` -- read-only heap data, which every thread reads
+// at once where the position asked for the shared form (`reference/memory.md § A frozen buffer
+// crosses`). The sharing rule asks a shared frozen buffer's ELEMENT type where a `&sync` struct's
+// fields would be asked, and asks it at the call that froze it; and a
 // generic type's destructor is made real for every type of its family the program makes, which a
 // frozen buffer's storage depends on and which no generic type had before.
 
@@ -289,7 +290,7 @@ fzb_captured()
 
         b.push(5)
 
-        val f = b.freeze()
+        val f: &sync Frozen[int] = b.freeze()
         val job: &sync Fn() -> unit = () -> print(f[0], f.len())
 
         job()
@@ -297,7 +298,7 @@ fzb_captured()
 
 // -- what is refused ---------------------------------------------------------------------------------
 
-@test("freezing plain references is refused at the call, naming the element")
+@test("freezing plain references where a shared frozen buffer is expected is refused, naming the element")
 fzb_plain_reference_refused()
     if !fzb_ready() then return
 
@@ -305,29 +306,42 @@ fzb_plain_reference_refused()
         struct Cell
             n: int
 
+        take(f: &sync Frozen[&Cell]) -> usize = f.len()
+
         var b: Buf[&Cell] = buf()
 
         b.push(Cell(1))
-
-        val f = b.freeze()
+        print(take(b.freeze()))
         """)
 
     assert(out.contains("'&sync Frozen[&Cell]' may be reached from two domains at once, " +
                         "so every count inside it has to be atomic — but it holds a '&Cell', whose " +
                         "count is not. Hold it as a '&sync Cell' ('06')"), out)
-    assert(out.contains("main.sysl:10:11"), out)
     assert(!out.contains("buf.sysl"), out)
 
-@test("freezing strings or buffers is refused for the count each carries")
+// The annotation is what is refused there, where the reader wrote it -- once, the freeze that
+// answers it being the same choice rather than a second one.
+@test("a binding annotated as a shared frozen buffer of plain references is refused at the annotation")
+fzb_annotated_reference_refused()
+    if !fzb_ready() then return
+
+    val out = fzb_err("struct Cell\n    n: int\n\nvar b: Buf[&Cell] = buf()\n\nb.push(Cell(1))\n\n" +
+                      "val f: &sync Frozen[&Cell] = b.freeze()\n")
+
+    assert(out.contains("'&sync Frozen[&Cell]' may be reached from two domains at once"), out)
+    assert(out.contains("main.sysl:10:8"), out)
+    assert_eq(out.index_of("may be reached from two domains"), out.last_index_of("may be reached from two domains"))
+
+@test("freezing strings or buffers where a shared frozen buffer is expected is refused for each count")
 fzb_strings_and_bufs_refused()
     if !fzb_ready() then return
 
-    val strings = fzb_err("var b: Buf[string] = buf()\nval f = b.freeze()\n")
+    val strings = fzb_err("shared(f: &sync Frozen[string]) = ()\nvar b: Buf[string] = buf()\nshared(b.freeze())\n")
 
     assert(strings.contains("but it holds a 'string', which owns its bytes through a count that is not atomic"),
            strings)
 
-    val bufs = fzb_err("var b: Buf[Buf[u8]] = buf()\nval f = b.freeze()\n")
+    val bufs = fzb_err("shared(f: &sync Frozen[Buf[u8]]) = ()\nvar b: Buf[Buf[u8]] = buf()\nshared(b.freeze())\n")
 
     assert(bufs.contains("but it holds a 'Buf[byte]', which is shared through a count that " +
                          "is not atomic. Hold its elements as a '&sync Frozen[byte]', built with " +
@@ -360,7 +374,7 @@ fzb_no_alloc_refused()
     if !fzb_ready() then return
 
     val out = fzb_outcome([("main.sysl", "@no_alloc\n\nimport sysl.buf.{Buf, Frozen}\n\n" +
-                            "freeze_it(b: Buf[int]) -> &sync Frozen[int] = b.freeze()\n\nprint(1)\n")])
+                            "freeze_it(b: Buf[int]) -> &Frozen[int] = b.freeze()\n\nprint(1)\n")])
 
     assert(!out.1, out.0)
     assert(out.0.contains("this reaches 'sysl.buf.Buf.freeze.int', which makes heap storage through " +
@@ -393,3 +407,393 @@ fzb_generic_drop()
         do_it()
         print("after")
         """), "s 3\ngone 3\ngone s\nafter\n")
+
+// -- the count kind follows the position ------------------------------------------------------------
+
+// `freeze()` answers a `&Frozen[T]` for any `T`, and allocates the shared form only where the position
+// expects a `&sync Frozen[T]` -- as a construction does (`frozen_count.sysl`). Each cell below reads,
+// measures, indexes, walks and views one element kind, on the counted heap, and must give back every
+// allocation it took.
+
+// What a program built on the counted heap printed, where it ran to the end and gave everything back.
+private fzb_counted(text: string) -> string
+    force_alloc_counting(true)
+
+    val out = fzb_outcome([("main.sysl", fzb_importing() + text)])
+
+    force_alloc_counting(false)
+
+    if !out.1 then return s"it did not run to the end: ${out.0}"
+
+    if alloc_count_reported(out.0) != 0 then return s"it did not give back everything it took: ${out.0}"
+
+    out.0
+end fzb_counted
+
+@test("an unannotated freeze of a scalar is a '&Frozen', read every way, and let go of entirely")
+fzb_local_scalar()
+    if !fzb_ready() then return
+
+    assert_eq(fzb_counted(raw"""
+        var b: Buf[int] = buf()
+
+        for i in 0..<4
+            b.push(i * 3)
+
+        val f = b.freeze()
+        val same: &Frozen[int] = f
+        var sum = 0
+
+        for x in f
+            sum += x
+
+        print(f[1], f.len(), f.get(3).unwrap(), f.get(4).is_none(), sum, f.view(), same.len())
+        """), "3 4 9 true 18 [0, 3, 6, 9] 4\n")
+
+@test("a '&Frozen' of strings holds each string's count, and gives each back")
+fzb_local_strings()
+    if !fzb_ready() then return
+
+    assert_eq(fzb_counted(raw"""
+        var b: Buf[string] = buf()
+
+        b.push("ab")
+        b.push("cde")
+
+        val f = b.freeze()
+        var n = 0
+
+        for s in f
+            n += s.len
+
+        print(f[1], f.len(), n, f.view())
+        """), "cde 2 5 [ab, cde]\n")
+
+// The tekton shape: a tree whose node holds its children as a frozen buffer of plain references, in a
+// single-threaded program. Each node goes once, after the last read.
+@test("a struct field '&Frozen[&Node]' holds plain references, read, viewed and dropped once each")
+fzb_local_references_tree()
+    if !fzb_ready() then return
+
+    assert_eq(fzb_counted(raw"""
+        struct Node
+            id: int
+            children: &Frozen[&Node]
+
+        impl Drop for Node
+            drop(self) = print("drop", self.id)
+
+        leaf(id: int) -> &Node
+            var none: Buf[&Node] = buf()
+
+            Node(id, none.freeze())
+
+        run()
+            var b: Buf[&Node] = buf()
+
+            b.push(leaf(1))
+            b.push(leaf(2))
+
+            val n = Node(0, b.freeze())
+            var ids = 0
+
+            for c in n.children
+                ids += c.id
+
+            val v = n.children.view()
+
+            print(n.children.len(), n.children[1].id, n.children.get(2).is_none(), ids, v.len, v[0].id)
+
+        run()
+        print("after")
+        """), "2 2 true 3 2 1\ndrop 0\ndrop 1\ndrop 2\nafter\n")
+
+// A view of a `&Frozen` holds the storage itself: it outlives every name of the frozen buffer, and
+// the elements go when it does.
+@test("a view of a '&Frozen' of references outlives the frozen buffer, and its elements go with it")
+fzb_local_view_outlives()
+    if !fzb_ready() then return
+
+    assert_eq(fzb_counted(raw"""
+        struct Cell
+            n: int
+
+        impl Drop for Cell
+            drop(self) = print("drop", self.n)
+
+        view_of() -> []const &Cell
+            var b: Buf[&Cell] = buf()
+
+            for i in 1..3
+                b.push(Cell(i))
+
+            val f = b.freeze()
+
+            f.view()
+
+        run()
+            val v = view_of()
+
+            print("held", v.len, v[2].n)
+
+        run()
+        print("after")
+        """), "held 3 3\ndrop 1\ndrop 2\ndrop 3\nafter\n")
+
+@test("a '&Frozen' of a struct holding '&T' walks, views and drops each member once")
+fzb_local_struct_of_references()
+    if !fzb_ready() then return
+
+    assert_eq(fzb_counted(raw"""
+        struct Cell
+            n: int
+
+        impl Drop for Cell
+            drop(self) = print("drop", self.n)
+
+        struct Pair
+            tag: int
+            cell: &Cell
+
+        run()
+            var b: Buf[Pair] = buf()
+
+            b.push(Pair(1, Cell(10)))
+            b.push(Pair(2, Cell(20)))
+
+            val f = b.freeze()
+            var s = 0
+
+            for p in f
+                s += p.tag * p.cell.n
+
+            print(f.len(), f[1].cell.n, s, f.view().len)
+
+        run()
+        print("after")
+        """), "2 20 50 2\ndrop 10\ndrop 20\nafter\n")
+
+// Every allocation the cells above make is given back: the storage, the box, a view's share.
+@test("freezing, viewing and dropping either kind leaves the counted heap balanced")
+fzb_counted_heap_balanced()
+    if !fzb_ready() then return
+
+    val out = fzb_counted(raw"""
+        struct Cell
+            n: int
+
+        run()
+            var a: Buf[&Cell] = buf()
+
+            a.push(Cell(1))
+
+            val f = a.freeze()
+            val v = f.view()
+            var b: Buf[int] = buf()
+
+            b.push(2)
+
+            val g: &sync Frozen[int] = b.freeze()
+            val w = g.view()
+            var s: Buf[string] = buf()
+
+            s.push("x")
+
+            val h = s.freeze()
+
+            print(v[0].n, w[0], h.view())
+
+        run()
+        """)
+
+    assert_eq(out, "1 2 [x]\n")
+
+// -- the position chooses the shared form ----------------------------------------------------------
+
+@test("an annotation, a parameter, a field and a return each allocate the shared form, read across threads")
+fzb_shared_positions()
+    if !fzb_ready() then return
+
+    assert_eq(fzb_counted(raw"""
+        import sysl.threads.spawn
+
+        struct Hold
+            f: &sync Frozen[int]
+
+        struct Work
+            hold: &sync Hold
+            sum: int
+
+        work(w: *Work)
+            for x in w.hold.f
+                w.sum += x
+
+            w.sum += w.hold.f.view()[0]
+
+        made(n: int) -> &sync Frozen[int]
+            var b: Buf[int] = buf()
+
+            for i in 0..<n
+                b.push(i + 1)
+
+            b.freeze()
+
+        count(f: &sync Frozen[int]) -> usize = f.len()
+
+        var b: Buf[int] = buf()
+
+        b.push(4)
+
+        val a: &sync Frozen[int] = b.freeze()
+        val hold: &sync Hold = Hold(made(3))
+        var w = Work(hold, 0)
+
+        spawn(&work, &w).unwrap().join()
+
+        var c: Buf[int] = buf()
+
+        print(a[0], w.sum, count(c.freeze()), count(made(2)))
+        """), "4 7 0 2\n")
+
+@test("a branch, an 'Option' payload and a block tail take the shared form from the position")
+fzb_shared_through_branches()
+    if !fzb_ready() then return
+
+    assert_eq(fzb_counted(raw"""
+        either(c: bool) -> &sync Frozen[int]
+            var b: Buf[int] = buf()
+            var d: Buf[int] = buf()
+
+            b.push(7)
+
+            if c then b.freeze() else d.freeze()
+
+        maybe() -> Option[&sync Frozen[int]]
+            var b: Buf[int] = buf()
+
+            b.push(3)
+
+            Some(b.freeze())
+
+        val job: &sync Fn() -> unit = () -> print(either(true).len(), either(false).len(), maybe().unwrap()[0])
+
+        job()
+        """), "1 0 3\n")
+
+// A module `val` made while compiling is laid down as data, in either kind.
+@test("a module 'val' frozen while compiling is data, as a '&Frozen' and as a '&sync Frozen'")
+fzb_module_values()
+    if !fzb_ready() then return
+
+    assert_eq(fzb_counted(raw"""
+        squares(n: int) -> &Frozen[int]
+            var b: Buf[int] = buf()
+
+            for i in 0..<n
+                b.push(i * i)
+
+            b.freeze()
+
+        cubes(n: int) -> &sync Frozen[int]
+            var b: Buf[int] = buf()
+
+            for i in 0..<n
+                b.push(i * i * i)
+
+            b.freeze()
+
+        val SQ: &Frozen[int] = squares(4)
+        val CU: &sync Frozen[int] = cubes(3)
+
+        print(SQ[3], SQ.view(), CU[2], CU.view())
+        """), "9 [0, 1, 4, 9] 8 [0, 1, 8]\n")
+
+// -- inference ---------------------------------------------------------------------------------------
+
+@test("'buf().freeze()' as an argument takes its element from the parameter, in either kind")
+fzb_infers_from_parameter()
+    if !fzb_ready() then return
+
+    assert_eq(fzb_counted(raw"""
+        struct Holder
+            f: &Frozen[string]
+
+        shared(f: &sync Frozen[int]) -> usize = f.len()
+        local(f: &Frozen[u8]) -> usize = f.len()
+
+        val h = Holder(buf().freeze())
+
+        print(shared(buf().freeze()), local(buf().freeze()), h.f.len())
+        """), "0 0 0\n")
+
+@test("'buf().freeze()' with nothing to say what it holds is still asked for its element")
+fzb_infers_nothing_unexpected()
+    if !fzb_ready() then return
+
+    assert(fzb_err("val f = buf().freeze()\n").contains("cannot infer the type argument 'T' of 'sysl.buf.buf'"))
+
+// -- what is refused ---------------------------------------------------------------------------------
+
+@test("a '&Frozen' captured by a '&sync Fn' is refused, naming the count and the shared form")
+fzb_local_capture_refused()
+    if !fzb_ready() then return
+
+    val out = fzb_err("var b: Buf[int] = buf()\nb.push(1)\nval f = b.freeze()\n" +
+                      "val job: &sync Fn() -> unit = () -> print(f[0])\njob()\n")
+
+    assert(out.contains("a closure shared between two domains may be called from either, so every count it " +
+                        "captures has to be atomic — but the 'f' it captures reaches a '&Frozen[int]', whose " +
+                        "count is not. Hold it as a '&sync Frozen[int]' ('06')"), out)
+
+@test("a '&Frozen' sent to another thread is refused at the crossing")
+fzb_local_send_refused()
+    if !fzb_ready() then return
+
+    val out = fzb_err(raw"""
+        import sysl.threads.spawn
+
+        struct W
+            f: &Frozen[int]
+
+        work(w: *W) = print(w.f[0])
+
+        var b: Buf[int] = buf()
+
+        b.push(1)
+
+        var w = W(b.freeze())
+
+        spawn(&work, &w).unwrap().join()
+        """)
+
+    assert(out.contains("reaches another concurrency domain, so every count inside it has to be atomic — but " +
+                        "its 'f' reaches a '&Frozen[int]', whose count is not. Hold it as a " +
+                        "'&sync Frozen[int]' ('06')"), out)
+
+@test("'&Frozen' and '&sync Frozen' do not convert, either way")
+fzb_kinds_do_not_convert()
+    if !fzb_ready() then return
+
+    val up = fzb_err("var b: Buf[int] = buf()\nval f = b.freeze()\nval g: &sync Frozen[int] = f\n")
+
+    assert(up.contains("'&Frozen[int]' and '&sync Frozen[int]' are distinct types, and neither converts to " +
+                       "the other"), up)
+    assert(up.contains("Allocate Frozen[int] as a '&sync Frozen[int]' where it is constructed"), up)
+
+    val down = fzb_err("var b: Buf[int] = buf()\nval f: &sync Frozen[int] = b.freeze()\nval g: &Frozen[int] = f\n")
+
+    assert(down.contains("'&Frozen[int]' and '&sync Frozen[int]' are distinct types"), down)
+    assert(down.contains("Allocate Frozen[int] as a '&Frozen[int]' where it is constructed"), down)
+
+    val handed = fzb_err("take(f: &sync Frozen[int]) = ()\nvar b: Buf[int] = buf()\nval f = b.freeze()\ntake(f)\n")
+
+    assert(handed.contains("'&Frozen[int]' and '&sync Frozen[int]' are distinct types"), handed)
+
+@test("the shared twins the compiler calls are not the program's to name")
+fzb_twins_private()
+    if !fzb_ready() then return
+
+    assert(fzb_err("var b: Buf[int] = buf()\nval f = b.freeze_shared()\n")
+           .contains("method 'freeze_shared' of 'Buf' is private to module 'sysl.buf'"))
+    assert(fzb_err("var b: Buf[int] = buf()\nval f: &sync Frozen[int] = b.freeze()\nval v = f.view_shared()\n")
+           .contains("method 'view_shared' of 'Frozen' is private to module 'sysl.buf'"))

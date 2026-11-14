@@ -3,25 +3,29 @@ module sysl.buf
 import sysl.index_past
 import sysl.raw.ptr_cast
 
-/** A buffer that will never change again, shared by every thread that holds it.
+/** A buffer that will never change again.
  *
- * `Buf.freeze()` makes one: it takes the buffer's elements and answers a `&sync Frozen[T]`, which
- * is one atomic count on the whole buffer. A `&sync` object may hold it, and a `&sync Fn` may
- * capture it, so read-only heap data -- decoded pixels, a list of shapes -- is read by every thread
- * at once with no lock and no count per element (`reference/memory.md § A frozen buffer crosses`).
+ * `Buf.freeze()` makes one: it takes the buffer's elements and answers a `&Frozen[T]`, one count on
+ * the whole buffer, of any element type. **Where the position expects a `&sync Frozen[T]`** -- an
+ * annotation, a parameter or a field -- the box is allocated with an atomic count instead, as a
+ * construction's is. A `&sync` object may hold that one, and a `&sync Fn` may capture it, so
+ * read-only heap data -- decoded pixels, a list of shapes -- is read by every thread at once with no
+ * lock and no count per element (`reference/memory.md § A frozen buffer crosses`). The two are
+ * distinct types, and neither converts to the other.
  *
  * **Nothing writes it.** There is no `push`, no `set`, no subscript assignment and no writable view;
  * what it has is `len`, `f[i]`, `for x in f` and `view()`, a `[]const T`.
  *
- * **A frozen buffer shares exactly what its elements share**, so a `&sync Frozen[T]` is formed only
- * where a `&sync T` could hold a `T`: scalars, `&sync U`, raw pointers, other frozen buffers, and the
- * structs and arrays built of them. The compiler asks that of the type argument where the reference
- * is formed, as it asks a struct's fields.
+ * **A shared frozen buffer shares exactly what its elements share**, so a `&sync Frozen[T]` is
+ * formed only where a `&sync T` could hold a `T`: scalars, `&sync U`, raw pointers, other shared
+ * frozen buffers, and the structs and arrays built of them. The compiler asks that of the type
+ * argument where the reference is formed, as it asks a struct's fields.
  *
- * **Its fields carry no count**, and that is what makes it safe to read from every thread: the
- * storage is owned through a count that is not atomic, held here as the bare words of the slice that
- * owns it, so copying the struct -- as a `(self)` member does -- takes no share of anything. Only the
- * destructor touches that count, once, run by whichever thread lets go of the box's last share.
+ * **Its fields carry no count**, and that is what makes the shared form safe to read from every
+ * thread: the storage is owned through a count that is not atomic, held here as the bare words of the
+ * slice that owns it, so copying the struct -- as a `(self)` member does -- takes no share of
+ * anything. In the shared form only the destructor touches that count, once, run by whichever thread
+ * lets go of the box's last share.
  */
 struct Frozen[T]
     private owner: usize
@@ -40,12 +44,29 @@ struct Frozen[T]
 
         Some(self.data[usize(i)])
 
-    /** The elements as a read-only slice. It keeps the frozen buffer alive through a box of its own,
-     * made here and counted the ordinary way, so the slice is as safe to keep and hand on as any
-     * other: the box holds one atomic share of the buffer and gives it back when the last copy of the
-     * slice goes. That box is the one allocation a view costs; `f[i]` and `for` cost none.
+    /** The elements as a read-only slice, which keeps them alive however long it is kept. A view of a
+     * `&Frozen[T]` holds a share of the storage itself, and allocates nothing.
+     *
+     * A view of a `&sync Frozen[T]` is taken in one thread while others read the same storage, so it
+     * keeps the frozen buffer alive through a box of its own instead, made then and counted the
+     * ordinary way: the box holds one atomic share of the buffer and gives it back when the last copy
+     * of the slice goes. That box is the one allocation such a view costs; `f[i]` and `for` cost none.
      */
-    const view(&sync self) -> []const T
+    const view(&self) -> []const T
+        if self.n == 0 then return []
+
+        // Reading the words out as a slice takes a share of the storage they name, which is the
+        // count only this domain touches.
+        var words: [3]usize = [self.owner, usize(self.data), self.n]
+        val shaped: *[]const T = ptr_cast(&words[0])
+
+        *shaped
+    end view
+
+    /** `view()` called on a `&sync Frozen[T]`, which is the call the compiler makes there in its
+     * place: the storage's own count is not atomic, so the view holds the buffer through a box.
+     */
+    private[buf] const view_shared(&sync self) -> []const T
         if self.n == 0 then return []
 
         var pin: &FrozenPin[T] = FrozenPin(self)
@@ -54,7 +75,7 @@ struct Frozen[T]
         val shaped: *[]const T = ptr_cast(&words[0])
 
         *shaped
-    end view
+    end view_shared
 end Frozen
 
 /** The storage given back: the slice the words describe is rebuilt in a local, without a share being
@@ -136,15 +157,28 @@ private frozen_span[T](data: *T, n: usize) -> []const T
     *shaped
 end frozen_span
 
+/** `Buf.freeze()`, answering the frozen buffer with an ordinary count. */
+private[buf] freeze_buf[T](b: Buf[T]) -> &Frozen[T]
+    val (owner, data, n) = taken_storage(b)
+
+    Frozen(owner, data, n)
+
+/** `Buf.freeze()` where a `&sync Frozen[T]` is expected, answering it with an atomic count. */
+private[buf] freeze_buf_shared[T](b: Buf[T]) -> &sync Frozen[T]
+    val (owner, data, n) = taken_storage(b)
+
+    Frozen(owner, data, n)
+
 /** The buffer's elements, taken: copied once into storage of their own, sized to them, and the
  * buffer left empty -- for this name and every other name of the same buffer, which is what makes the
  * result immutable. A view taken of the buffer earlier still reads the old storage, which the frozen
- * one shares nothing with.
+ * one shares nothing with. The answer is the storage's owner word, its first element and the count;
+ * the one share of the storage is the owner word's, for the frozen buffer to hold.
  */
-freeze_buf[T](b: Buf[T]) -> &sync Frozen[T]
+private taken_storage[T](b: Buf[T]) -> (usize, *T, usize)
     val n = b.len()
 
-    if n == 0 then return Frozen(0, null, 0)
+    if n == 0 then return (0, null, 0)
 
     var items: []T = slot_storage(n)
 
@@ -160,5 +194,5 @@ freeze_buf[T](b: Buf[T]) -> &sync Frozen[T]
     val owner = (*raw)[0]
 
     *raw = [0, 0, 0]
-    Frozen(owner, data, n)
-end freeze_buf
+    (owner, data, n)
+end taken_storage
