@@ -27,15 +27,22 @@ import sysl.math.bigint.{cmp, from_int}
 // The guard's fact is also said again as an `llvm.assume` at the start of the fall-through, so it
 // survives the optimizer splitting the guard into copies -- which the inlined count handling of a
 // retained view does -- where no single copy dominates the loop any longer.
+//
+// One more guard proves no add but is kept the same way: `if xs.len != ys.len then <leave>` (or a
+// `||` with that comparison among its sides). Past it the two views are one length, so a subscript
+// `ys[j]` with `j` running below `xs.len` is checked by the loop's own condition as surely as `xs[j]`
+// is, and `bounds_hoist.sysl` copies no loop for it.
 
 // One guard in force: the operand `a`, the length `b` and the view `x` whose length bounds their sum,
-// the order it was established in, and whether a write since has ended it.
+// the order it was established in, and whether a write since has ended it. A `same` guard is the
+// equal-length one instead: `a` and `b` are the two views, and `x` is `b` again.
 struct NoWrapGuard
     a: string
     b: string
     x: string
     id: int
     live: bool
+    same: bool
 end NoWrapGuard
 
 // One counted loop being lowered: its variable, its upper bound, and the guard count at its entry
@@ -223,7 +230,7 @@ nowrap_before(e: *Emit, st: TStmt)
         val g = e.nowrap.guards[i]
 
         if g.live && (nw_touches(w, g.a) || nw_touches(w, g.b) || nw_touches(w, g.x))
-            e.nowrap.guards[i] = NoWrapGuard(g.a, g.b, g.x, g.id, false)
+            e.nowrap.guards[i] = NoWrapGuard(g.a, g.b, g.x, g.id, false, g.same)
     end for
 end nowrap_before
 
@@ -233,7 +240,10 @@ nowrap_after(e: *Emit, st: TStmt)
         TVarDecl(name, ty, init, _) ->
             if e.nowrap.once.has(name) && nw_word_unsigned(e, ty) && nw_half(e, init, e.word_bits)
                 e.nowrap.bounded.add(name)
-        TExprStmt(x) -> if !e.terminated then nw_guard(e, x)
+        TExprStmt(x) ->
+            if !e.terminated
+                nw_guard(e, x)
+                nw_same_guard(e, x)
         _ -> ()
 end nowrap_after
 
@@ -324,7 +334,7 @@ nowrap_add(e: *Emit, l: TExpr, r: TExpr, ty: Type) -> bool
     if p.is_none() || q.is_none() then return false
 
     for g in e.nowrap.guards
-        if g.live
+        if g.live && !g.same
             if (p.unwrap() == g.a && q.unwrap() == g.b) || (p.unwrap() == g.b && q.unwrap() == g.a)
                 return true
 
@@ -450,6 +460,65 @@ private nw_guard(e: *Emit, x: TExpr)
     args.push(ir_arg(l_i1(), fits))
     emit(e, ir_call(None, LVoid, VGlobal(llvm_assume()), args))
     pop_temps(e)
-    e.nowrap.guards.push(NoWrapGuard(a.unwrap(), b.unwrap(), view.unwrap(), e.nowrap.next_id, true))
+    e.nowrap.guards.push(NoWrapGuard(a.unwrap(), b.unwrap(), view.unwrap(), e.nowrap.next_id, true,
+                                     false))
     e.nowrap.next_id += 1
 end nw_guard
+
+// `x.len != y.len` over two views, alone or as a side of an `||` chain: the two views.
+private nw_unequal_lens(c: TExpr) -> Option[(string, string)]
+    *c.kind match
+        TCompare(operands, cmps) ->
+            if operands.len() != 2 || cmps.len() != 1 || cmps[0].dispatch.is_some() then return None
+            if cmps[0].op != "!=" then return None
+
+            val x = nw_len_of(operands[0])
+            val y = nw_len_of(operands[1])
+
+            if x.is_none() || y.is_none() || x.unwrap() == y.unwrap() then return None
+
+            Some((x.unwrap(), y.unwrap()))
+        TLogical(op, l, r) ->
+            if op != "||" then return None
+
+            val left = nw_unequal_lens(l)
+
+            if left.is_some() then left else nw_unequal_lens(r)
+        _ -> None
+end nw_unequal_lens
+
+// `if xs.len != ys.len then <leave>`, just lowered: records that the two views are one length, for as
+// long as neither is written. Both must be a parameter or a local, whose length nothing behind the
+// body's back can change.
+private nw_same_guard(e: *Emit, x: TExpr)
+    if !e.nowrap.ready || e.nowrap.suspended > 0 then return
+
+    val c = *x.kind match
+        TIf(cond, then_block, else_block, _) ->
+            if else_block.is_some() || cond.len() != 1 || !nw_leaves(then_block) then return
+
+            cond[0] match
+                TCondTest(t) -> t
+                _ -> return
+        _ -> return
+
+    nw_unequal_lens(c) match
+        Some(views) ->
+            val (xs, ys) = views
+            val plain = e.nowrap.plain
+            val esc = e.nowrap.escaped
+
+            if !plain.has(xs) || !plain.has(ys) || esc.has(xs) || esc.has(ys) then return
+
+            e.nowrap.guards.push(NoWrapGuard(xs, ys, ys, e.nowrap.next_id, true, true))
+            e.nowrap.next_id += 1
+        None -> ()
+end nw_same_guard
+
+// Whether a guard in force has shown the views `xs` and `ys` to be one length.
+nowrap_same_len(e: *Emit, xs: string, ys: string) -> bool
+    for g in e.nowrap.guards
+        if g.live && g.same && ((g.a == xs && g.b == ys) || (g.a == ys && g.b == xs)) then return true
+
+    false
+end nowrap_same_len
