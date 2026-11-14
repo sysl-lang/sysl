@@ -1,0 +1,577 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// A hook's walk lets go of what it holds on the drain's own slot (`emit_arc.sysl`'s `gen_drop_hook`,
+// `push_ref` and `gen_push`; `arc_runtime.sysl`'s `arc.push`).
+//
+// A hook's walk runs only inside the reaper's drain, and the drain now hands the hook its slot. A
+// plain reference the walk lets go of is queued there directly, where it used to go through
+// `arc.release` and `arc.reap` -- a call, and a thread-local ask, per object, to find the flag set and
+// do nothing but the same push. And where a box of the referenced type has nothing in it to tear down
+// -- no count, no destructor, or an empty variant of an enum -- **the box is freed on the spot**, as
+// long as its hook is the one this module installs for that type's heap boxes and no weak reference
+// holds it. binarytrees frees every leaf that way.
+//
+// The cells. The text: the hook takes the slot and queues on it; the per-type push frees under the
+// three conditions and queues otherwise; a payload with nothing counted compares against the shared
+// plain hook and reads no tag; an enum with several empty variants tests each; the walk of a value
+// field (`Option[&T]`, a struct) is written in place and queues too; a buffer's hook queues its
+// elements; a type with a destructor is never freed on the spot, and its own hook's walk -- after the
+// destructor, which is the program's code -- releases as any code does; a `&sync`, a view, a weak and
+// a trait object keep their own release; the drain hands its slot to `arc.destroy` on a hosted, a
+// switching and a freestanding machine, and clang takes the text on every machine. The behaviour at
+// `-O2` on a counted heap, where a leak or a second free is a failure: trees with empty leaves;
+// destructors on leaves and on an enum's empty variant still running, in order; a weak reference to an
+// empty box that outlives its last strong share; boxes made by the standard module's code (a buffer
+// inside a struct); a `Frozen` and a `&sync` chain held in a tree; trait objects; a generic payload; a
+// `Buf` of trees; a chain of a million links and a degenerate tree a million deep.
+//
+// Cells skipped, with the reason: a box laid in a frame -- one is only made for a `&Fn` that never
+// escapes its frame, so no heap object's walk reaches one, and the hook comparison would send one to
+// the drain anyway; an object crossing `build-c` -- an archive carries the runtime of the compiler that
+// built it, and the hook's slot is passed between the drain and the hooks of one compilation.
+
+private val hpu_tree: string = raw"""
+    enum Tree
+        Leaf
+        Node(left: &Tree, right: &Tree)
+
+    make(depth: int) -> &Tree
+        if depth == 0 then Leaf else Node(make(depth - 1), make(depth - 1))
+
+    check(t: &Tree) -> int
+        *t match
+            Leaf -> 1
+            Node(l, r) -> 1 + check(l) + check(r)
+
+    main()
+        var total = 0
+
+        for _ in 0..<4 do total += check(make(5))
+
+        print(total)
+    """
+
+private var hpu_library_names: Buf[string] = buf()
+private var hpu_library_units: Buf[Buf[Program]] = buf()
+
+private hpu_library(t: Target) -> Buf[Program]
+    for i in 0..<hpu_library_names.len()
+        if hpu_library_names[i] == t.name then return hpu_library_units[i]
+
+    var out: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, t) match
+            Err(_) -> ()
+            Ok(units) -> out = units
+
+    hpu_library_names.push(t.name)
+    hpu_library_units.push(out)
+    out
+end hpu_library
+
+private hpu_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the standard module's source or clang is not on this machine")
+        return false
+
+    true
+end hpu_ready
+
+// The LLVM text a program lowers to on `machine`.
+private hpu_ir(text: string, machine: string) -> string
+    val t = target_named(machine).unwrap()
+    var units: Buf[Program] = buf()
+
+    for item in hpu_library(t)
+        units.push(item)
+
+    val parsed = parse(source_of("main.sysl", text), t)
+
+    if !parsed.ok() then assert(false, parsed.first().message)
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, t)
+
+    assert(done.reported.is_empty(), s"refused on $machine")
+
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+
+    assert(errors_of(done.an.diagnostics()).is_empty(), s"refused on $machine")
+    ir_print_module(codegen_with_gaps(prune(strip_tests(whole), program_own(units)), t, promotions).0)
+end hpu_ir
+
+// Whether clang's `-O2` takes `ir` for `machine`'s triple.
+private hpu_clang_takes(ir: string, machine: string)
+    val dir = make_temp_dir("sysl-hpu").unwrap()
+    val file = s"$dir/t.ll"
+
+    write_text(file, ir).unwrap()
+
+    val triple = "--target=" + target_named(machine).unwrap().triple
+    val got = capture("clang", [triple, "-O2", "-S", "-emit-llvm", "-Wno-override-module", file, "-o", "-"],
+                      "", [], true).unwrap()
+
+    remove_dir_all(dir).unwrap_or(())
+    assert(got.status.ok(), s"clang refused the emitted IR for $machine:\n${got.err.unwrap_or("")}")
+end hpu_clang_takes
+
+// The lines of the definition of `@name`, up to its closing brace.
+private hpu_body(text: string, name: string) -> string
+    var body = ""
+    var inside = false
+
+    for l in lines_of(text)
+        if !inside && l.starts_with("define") && l.contains(s"@$name(") then inside = true
+
+        if inside
+            if l == "}" then return body
+
+            body = body + l + "\n"
+        end if
+
+    body
+end hpu_body
+
+private hpu_count(text: string, what: string) -> int
+    var n = 0
+
+    for l in lines_of(text)
+        if l.contains(what) then n += 1
+
+    n
+end hpu_count
+
+// -- the emitted text ------------------------------------------------------------------------------------
+
+@test("a tree's hook takes the drain's slot and hands it to the push of each child")
+hpu_hook_queues_on_the_slot()
+    if !hpu_ready() then return
+
+    val out = hpu_ir(hpu_tree, "aarch64-macos")
+    val hook = hpu_body(out, "arc.drop.Tree")
+
+    assert(hook.contains("define private void @arc.drop.Tree(ptr %p, i1 %storage, ptr %slot)"), hook)
+    assert_eq(hpu_count(hook, "call void @arc.push.Tree("), 2, hook)
+    // The two pushes, and the hook's own parameter list.
+    assert_eq(hpu_count(hook, ", ptr %slot)"), 3, hook)
+    assert_eq(hpu_count(hook, "@arc.release"), 0, hook)
+    assert_eq(hpu_count(hook, "@arc.dispose."), 0, hook)
+end hpu_hook_queues_on_the_slot
+
+@test("a tree's push frees an empty leaf this module's hook made and no weak holds, and queues the rest")
+hpu_push_frees_an_empty_leaf()
+    if !hpu_ready() then return
+
+    val push = hpu_body(hpu_ir(hpu_tree, "aarch64-macos"), "arc.push.Tree")
+
+    assert(push.contains("icmp eq ptr %p, null"), push)
+    assert(push.contains("sub i64"), push)
+    assert(push.contains(", @arc.drop.Tree"), push)
+    assert(push.contains("getelementptr %arc.Tree, ptr %p, i32 0, i32 2"), push)
+    assert(push.contains("load i32, ptr"), push)
+    assert(push.contains("icmp eq i32 %"), push)
+    assert(push.contains(", 0\n"), push)
+    assert_eq(hpu_count(push, "call void @free(ptr %p)"), 1, push)
+    assert(push.contains("load ptr, ptr %slot"), push)
+    assert(push.contains("store ptr %p, ptr %slot"), push)
+    assert_eq(hpu_count(push, "@arc.reap"), 0, push)
+end hpu_push_frees_an_empty_leaf
+
+@test("the drain hands its slot to arc.destroy, which hands it to the hook; arc.unshare hands none")
+hpu_drain_passes_the_slot()
+    if !hpu_ready() then return
+
+    val out = hpu_ir(hpu_tree, "aarch64-macos")
+
+    assert(hpu_body(out, "arc.reap").contains("call void @arc.destroy(ptr %q, ptr %s)"), out)
+    assert(hpu_body(out, "arc.destroy").contains("call void %f(ptr %p, i1 false, ptr %s)"), out)
+    assert(hpu_body(out, "arc.unshare").contains("call void %f(ptr %p, i1 true, ptr null)"), out)
+    assert(hpu_body(out, "arc.push").contains("store ptr %p, ptr %s"), out)
+end hpu_drain_passes_the_slot
+
+private val hpu_kinds: string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct Point
+        x: int
+        y: int
+
+    struct Res
+        name: string
+
+    impl Drop for Res
+        drop(self) = print("drop " + self.name)
+
+    struct Link
+        n: int
+        next: Option[&Link]
+
+    struct Pair
+        a: &Point
+        b: &Point
+
+    struct Holder
+        point: &Point
+        res: &Res
+        pair: Pair
+        link: Option[&Link]
+        shared: &sync Point
+        weakly: weak Point
+        text: string
+
+    struct Guarded
+        point: &Point
+
+    impl Drop for Guarded
+        drop(self) = print("guarded", self.point.x)
+
+    enum Shape
+        Dot
+        Blank
+        Both(a: &Shape, b: &Shape)
+
+    main()
+        val p: &Point = Point(1, 2)
+        val s: &sync Point = Point(3, 4)
+        val h: &Holder = Holder(p, Res("r"), Pair(p, p), Some(Link(1, None)), s, p, "t")
+        val g: &Guarded = Guarded(p)
+        val sh: &Shape = Both(Dot, Blank)
+        var bs: Buf[&Point] = buf()
+        val k = *sh match
+            Both(_, _) -> 2
+            _ -> 0
+
+        bs.push(p)
+        print(h.point.x, g.point.x, bs.len(), k)
+    """
+
+@test("a payload holding nothing is compared with the shared plain hook and has no tag read")
+hpu_plain_payload()
+    if !hpu_ready() then return
+
+    val push = hpu_body(hpu_ir(hpu_kinds, "aarch64-macos"), "arc.push.Point")
+
+    assert(push.contains(", @arc.drop.plain"), push)
+    assert_eq(hpu_count(push, "load i32"), 0, push)
+    assert_eq(hpu_count(push, "call void @free(ptr %p)"), 1, push)
+end hpu_plain_payload
+
+@test("an enum with two empty variants frees either of them")
+hpu_two_empty_variants()
+    if !hpu_ready() then return
+
+    val push = hpu_body(hpu_ir(hpu_kinds, "aarch64-macos"), "arc.push.Shape")
+
+    assert(push.contains(", @arc.drop.Shape"), push)
+    assert_eq(hpu_count(push, "icmp eq i32"), 2, push)
+end hpu_two_empty_variants
+
+@test("a hook writes the walk of a value field in place and queues what is in it")
+hpu_value_fields_in_place()
+    if !hpu_ready() then return
+
+    val hook = hpu_body(hpu_ir(hpu_kinds, "aarch64-macos"), "arc.drop.Holder")
+
+    // Two plain points in `pair`, one in `point`: each a push of a Point. The link inside the
+    // `Option` is reached in place too, and queued, since a `Link` holds a count of its own.
+    assert_eq(hpu_count(hook, "call void @arc.push.Point("), 3, hook)
+    assert(hook.contains("icmp eq i32"), hook)
+    assert_eq(hpu_count(hook, "@arc.dispose."), 0, hook)
+end hpu_value_fields_in_place
+
+@test("a reference to a type holding a count, or with a destructor, is queued, never freed on the spot")
+hpu_holders_are_queued()
+    if !hpu_ready() then return
+
+    val out = hpu_ir(hpu_kinds, "aarch64-macos")
+    val hook = hpu_body(out, "arc.drop.Holder")
+
+    // `res` (a destructor) and the link (a count): the runtime's push, which only queues.
+    assert_eq(hpu_count(hook, "call void @arc.push(ptr"), 2, hook)
+    assert(!out.contains("@arc.push.Res("), out)
+    assert(!out.contains("@arc.push.Link("), out)
+end hpu_holders_are_queued
+
+@test("a &sync, a view and a weak reference in a hook keep their own release")
+hpu_other_kinds_keep_their_release()
+    if !hpu_ready() then return
+
+    val hook = hpu_body(hpu_ir(hpu_kinds, "aarch64-macos"), "arc.drop.Holder")
+
+    assert_eq(hpu_count(hook, "call void @arc.release_sync("), 1, hook)
+    assert_eq(hpu_count(hook, "call void @arc.release_maybe("), 1, hook)
+    assert_eq(hpu_count(hook, "call void @arc.weak_release("), 1, hook)
+end hpu_other_kinds_keep_their_release
+
+@test("the walk after a destructor is the program's code's, and releases as any code does")
+hpu_after_a_destructor()
+    if !hpu_ready() then return
+
+    val hook = hpu_body(hpu_ir(hpu_kinds, "aarch64-macos"), "arc.drop.Guarded")
+
+    assert(hook.contains("call void @Guarded.drop("), hook)
+    assert(hook.contains("call void @arc.dispose.Guarded("), hook)
+    assert_eq(hpu_count(hook, "@arc.push"), 0, hook)
+end hpu_after_a_destructor
+
+@test("a buffer's hook, and slot storage's, queue their elements on the slot")
+hpu_buffer_hook_queues()
+    if !hpu_ready() then return
+
+    val out = hpu_ir(hpu_kinds, "aarch64-macos")
+
+    for name in ["arc.dropbuf.ref.Point", "arc.slotbuf.ref.Point"]
+        val hook = hpu_body(out, name)
+
+        assert(hook.contains("ptr %p, i1 %storage, ptr %slot)"), s"$name:\n$out")
+        assert(hook.contains("call void @arc.push.Point(ptr %"), hook)
+        assert(hook.contains(", ptr %slot)\n"), hook)
+end hpu_buffer_hook_queues
+
+@test("clang takes the text on every hosted machine, a freestanding one, and a switching program")
+hpu_clang_takes_every_machine()
+    if !hpu_ready() then return
+
+    for machine in ["aarch64-macos", "x86_64-linux", "aarch64-linux", "x86_64-windows", "wasm32-wasi"]
+        hpu_clang_takes(hpu_ir(hpu_kinds, machine), machine)
+
+    val bare = hpu_ir(hpu_tree, "aarch64-freestanding")
+
+    assert(hpu_body(bare, "arc.reap").contains("call void @arc.destroy(ptr %q, ptr %s)"), bare)
+    hpu_clang_takes(bare, "aarch64-freestanding")
+
+    val switching = hpu_ir(raw"""
+        import sysl.fiber.{Context, Stack, switch}
+
+        enum Tree
+            Leaf
+            Node(left: &Tree, right: &Tree)
+
+        struct Hop
+            back: Context
+            me: Context
+
+        hop(h: *Hop)
+            loop
+                switch(&h.me, &h.back)
+
+        main()
+            val s = Stack.reserve(64 * 1024).unwrap()
+            val h: &Hop = Hop(Context.new(), Context.new())
+            val t: &Tree = Node(Leaf, Leaf)
+
+            h.me = Context.start(s, &hop, &*h)
+            switch(&h.back, &h.me)
+            print("back")
+        """, "aarch64-macos")
+
+    assert(hpu_body(switching, "arc.reap").contains("call void @arc.destroy(ptr %q, ptr @arc.reaper.self)"),
+           switching)
+    hpu_clang_takes(switching, "aarch64-macos")
+end hpu_clang_takes_every_machine
+
+// -- the behaviour at -O2 ---------------------------------------------------------------------------------
+
+private struct HpuRun
+    out: string
+    err: string
+    code: int
+
+// What a program prints at `-O2` on a counted heap: its output, its standard error (where a leak is
+// reported) and its status.
+private hpu_run(program: string) -> HpuRun
+    val root = make_temp_dir("sysl-hpu-run").unwrap()
+
+    write_text(s"$root/main.sysl", program).unwrap()
+
+    val exe = s"$root/built"
+
+    force_alloc_counting(true)
+
+    val made = build_native_program(s"$root/main.sysl", None, None, "2", Some(exe))
+
+    force_alloc_counting(false)
+
+    made match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return HpuRun(failure_text(why), "", -1)
+        Ok(_) -> ()
+
+    val ran = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    ran match
+        Err(_) -> HpuRun("the program that was built could not be run", "", -1)
+        Ok(o) -> HpuRun(o.text, o.err.unwrap_or(""), shell_status(o.status))
+end hpu_run
+
+private hpu_prints(program: string, want: string)
+    if !hpu_ready() then return
+
+    val got = hpu_run(program)
+
+    assert_eq(got.out, want)
+    assert_eq(got.err, "")
+    assert_eq(got.code, 0)
+end hpu_prints
+
+@test("at -O2 trees with empty leaves come apart with nothing left over")
+hpu_trees_at_o2()
+    hpu_prints(hpu_tree, "252\n")
+
+@test("at -O2 leaves with destructors, and an enum's empty variant with one, still run them in order")
+hpu_destructors_at_o2()
+    hpu_prints(raw"""
+        struct Res
+            name: string
+
+        impl Drop for Res
+            drop(self) = print("drop " + self.name)
+
+        enum Tree
+            Leaf(r: &Res)
+            Node(left: &Tree, right: &Tree)
+
+        enum Marked
+            Plain
+            Pair(a: &Marked, b: &Marked)
+
+        impl Drop for Marked
+            drop(self) = self match
+                Plain -> print("plain")
+                Pair(_, _) -> print("pair")
+
+        run()
+            val t: &Tree = Node(Node(Leaf(Res("a")), Leaf(Res("b"))), Leaf(Res("c")))
+            val m: &Marked = Pair(Plain, Pair(Plain, Plain))
+
+            print("made")
+
+        run()
+        """, "made\npair\nplain\npair\nplain\nplain\ndrop a\ndrop b\ndrop c\n")
+
+@test("at -O2 a weak reference to an empty leaf outlives the tree, and reads as gone after")
+hpu_weak_leaf_at_o2()
+    hpu_prints(raw"""
+        enum Tree
+            Leaf
+            Node(left: &Tree, right: &Tree)
+
+        run() -> weak Tree
+            val leaf: &Tree = Leaf
+            val t: &Tree = Node(leaf, Leaf)
+            val w: weak Tree = leaf
+
+            w
+
+        val w = run()
+
+        print(if w.get() == None then "gone" else "alive")
+        """, "gone\n")
+
+@test("at -O2 boxes the standard module's code made, a Frozen, a &sync chain and trait objects come apart")
+hpu_other_makers_at_o2()
+    hpu_prints(raw"""
+        import sysl.buf.{Buf, Frozen, buf}
+
+        trait Shape
+            area(self) -> int
+
+        struct Rect
+            w: int
+            h: int
+
+        impl Shape for Rect
+            area(self) -> int = self.w * self.h
+
+        struct Shared
+            n: int
+            next: Option[&sync Shared]
+
+        struct Cell[T]
+            v: T
+
+        struct Bag
+            items: Buf[int]
+            frozen: &sync Frozen[int]
+            chain: Option[&sync Shared]
+            shape: &Shape
+            cell: &Cell[int]
+            name: string
+
+        run() -> int
+            var items: Buf[int] = buf()
+            var more: Buf[int] = buf()
+            var chain: Option[&sync Shared] = None
+
+            for i in 0..<100
+                items.push(i)
+                more.push(i * 2)
+                chain = Some(Shared(i, chain))
+
+            val b: &Bag = Bag(items, more.freeze(), chain, Rect(2, 3), Cell(7), "bag" + "!")
+
+            int(b.items.len() + b.frozen.len()) + b.shape.area() + b.cell.v
+
+        print(run())
+        """, "213\n")
+
+@test("at -O2 a Buf of trees comes apart, every tree in it")
+hpu_buf_of_trees_at_o2()
+    hpu_prints(raw"""
+        import sysl.buf.{Buf, buf}
+
+        enum Tree
+            Leaf
+            Node(left: &Tree, right: &Tree)
+
+        make(depth: int) -> &Tree
+            if depth == 0 then Leaf else Node(make(depth - 1), make(depth - 1))
+
+        run() -> int
+            var trees: Buf[&Tree] = buf()
+
+            for i in 0..<300 do trees.push(make(i % 6))
+
+            int(trees.len())
+
+        print(run())
+        """, "300\n")
+
+@test("at -O2 a chain of a million links and a tree a million deep come apart without a stack overflow")
+hpu_deep_at_o2()
+    hpu_prints(raw"""
+        enum Tree
+            Leaf
+            Node(left: &Tree, right: &Tree)
+
+        struct Link
+            n: int
+            next: Option[&Link]
+
+        run()
+            var head: Option[&Link] = None
+            var t: &Tree = Leaf
+
+            for i in 0..<1000000
+                head = Some(Link(i, head))
+                t = Node(t, Leaf)
+
+            print("built")
+
+        run()
+        print("done")
+        """, "built\ndone\n")

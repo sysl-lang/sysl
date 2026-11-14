@@ -87,6 +87,73 @@ gen_lanes_as(e: *Emit, value: TExpr, ty: Type) -> Val
     acc
 end gen_lanes_as
 
+// `<4>f32(v)`: every lane converted as `convert` converts one scalar, and **as ONE instruction over
+// the whole register** wherever the scalar's is one LLVM instruction -- `sitofp`, `uitofp`, `zext`,
+// `sext` (a mask's `zext` among them), `trunc`, `fpext`, `fptrunc`, or the `.sat` intrinsic a float becomes an integer through,
+// which is what makes a NaN zero and an out-of-range lane the width's end rather than poison. An
+// integer narrowed wraps at the lane width, as vector arithmetic does: a register traps as a whole or
+// not at all, so the debug build's check on a written narrowing is the scalar's alone.
+//
+// What has no instruction of its own is converted lane by lane by the scalar path: an integer past
+// 128 bits to or from a float, a fixed-point lane (which rescales, rounds and saturates), and a
+// `char` checked as it is made.
+gen_lane_convert(e: *Emit, from: Type, to: Type, v: Val) -> Val
+    val (n, a) = from match
+        Vector(k, x) -> (k, underlying(*x))
+        _ -> (0, Unknown)
+    val b = to match
+        Vector(_, x) -> underlying(*x)
+        _ -> Unknown
+
+    if type_eq(a, b) then return v
+
+    (a, b) match
+        (Integer(a_bits, a_signed, _), Integer(b_bits, _, _)) ->
+            if a_bits == b_bits then return v
+
+            val op = if b_bits < a_bits then CastTrunc else if a_signed then CastSExt else CastZExt
+
+            return cast_to(e, op, from, to, v)
+        // A mask lane is an `i1` read as unsigned, so `true` is `1` at a signed width too.
+        (Bool, Integer(b_bits, _, _)) ->
+            if b_bits == 1 then return v
+
+            return cast_to(e, CastZExt, from, to, v)
+        (Char, Integer(b_bits, _, _)) ->
+            if b_bits == 32 then return v
+
+            return cast_to(e, if b_bits < 32 then CastTrunc else CastZExt, from, to, v)
+        (Integer(a_bits, a_signed, _), Floating(_, _)) ->
+            if a_bits <= 128 then return cast_to(e, if a_signed then CastSIToFP else CastUIToFP, from, to, v)
+        (Floating(_, _), Integer(b_bits, b_signed, _)) ->
+            if b_bits <= 128 then return saturating_to_int(e, from, to, b_signed, v)
+        // `f16` and `bf16` are the one pair neither of which is wider, so the pair goes through `f32`,
+        // which holds both exactly, as the scalar's does.
+        (Floating(a_bits, _), Floating(b_bits, _)) ->
+            if a_bits == b_bits
+                val wide = Vector(n, Floating(32, false))
+
+                return gen_lane_convert(e, wide, to, gen_lane_convert(e, from, wide, v))
+            end if
+
+            return cast_to(e, if b_bits > a_bits then CastFPExt else CastFPTrunc, from, to, v)
+        _ -> ()
+
+    val (fty, tty) = (lty(e, from), lty(e, to))
+    var acc: Val = VPoison
+
+    for i in 0..<n
+        val lane = fresh_reg(e)
+        val r = fresh_reg(e)
+        val at = ir_arg(l_i32(), VInt(from_int(long(i))))
+
+        emit(e, InExtractElement(lane, fty, v, at))
+        emit(e, InInsertElement(r, tty, acc, lty(e, b), convert(e, a, b, lane), at))
+        acc = r
+
+    acc
+end gen_lane_convert
+
 // One lane, read straight out of the register. There is no address and so no bounds test: the index
 // was held to a constant in range where it was written.
 gen_lane(e: *Emit, receiver: TExpr, lane: int) -> Val

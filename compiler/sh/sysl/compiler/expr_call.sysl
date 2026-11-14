@@ -95,6 +95,14 @@ private call_read(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
                 if holds_string(cx.refused_nested, name) then return bad_expr(span)
 
             named_call(cx, span, callee, name, args, expected)
+        // `<4>f32(v)` -- a vector type in call position converts lane by lane, as `f32(x)` converts
+        // one scalar. The parser reads a `<` that begins an expression as this form and no other.
+        TypeArg(written) ->
+            val to = resolve_type(cx.an, cx.scope, written, cx.subst)
+
+            if to == Unknown then return bad_expr(span)
+
+            convert_call(cx, span, type_show(to), to, args)
         // `f[A, B](x)` -- the instantiation the reader named, which is what brackets mean in a
         // **type** and what a call borrows them for.
         TypeArgs(head, targs, open) ->
@@ -1212,6 +1220,11 @@ end convert_call
 // it always had, from `int` -- `u8(300)` is `44` and `u64(-1)` is the largest `u64` -- and one that
 // fits neither is refused at the target, which is the type the line names.
 private literal_target(arg: Expr, to: Type) -> Option[Type]
+    // **A literal converted to a vector is written at the vector**: `<4>f32([1, 2, 3, 4])` is the
+    // literal of four `f32` lanes and `<4>f32(0.5)` the splat, rather than an `[4]int` or a `real`
+    // that has nothing to convert from.
+    if is_vector(repr(to)) then return if written_literal(arg) then Some(to) else None
+
     val value = integer_literal_value(arg)
 
     if value.is_none() then return None
@@ -1223,6 +1236,14 @@ private literal_target(arg: Expr, to: Type) -> Option[Type]
             if fits(v, bits, signed) || !fits_int(v) then Some(to) else None
         _ -> None
 end literal_target
+
+private written_literal(arg: Expr) -> bool = *arg.kind match
+    IntLit(_, _, _) -> true
+    FloatLit(_, _) -> true
+    ArrayLit(_) -> true
+    ArrayFill(_, _) -> true
+    Unary(op, operand) -> op == "-" && written_literal(operand)
+    _ -> false
 
 private fits_int(v: BigInt) -> bool = int_type() match
     Integer(bits, signed, _) -> fits(v, bits, signed)
@@ -1250,6 +1271,8 @@ convert_to(cx: &Analyzer, span: Span, t: TExpr, to: Type, asked: Option[string])
 
     val from = underlying(texpr_type(t))
 
+    if is_vector(repr(from)) || is_vector(repr(to)) then return convert_lanes(cx, span, t, to)
+
     if !converts(cx, span, from, to) then
         return cx.err(span, refusal(asked, texpr_type(t), to))
 
@@ -1266,6 +1289,41 @@ convert_to(cx: &Analyzer, span: Span, t: TExpr, to: Type, asked: Option[string])
 
     TExpr(span, TCast(t, to))
 end convert_to
+
+// `<4>f32(v)` -- a vector converted lane by lane. **Each lane converts exactly as the scalar does**,
+// so the lane pair is asked of the scalar rule itself and nothing here lists conversions of its own.
+// An array of the lanes converts too, being the same values in the same order (`lanes_as`): it is
+// gathered into a vector of its own element first. The two must agree in length, since a lane has
+// nowhere to go and none to come from otherwise; a count over a value parameter stands at zero while
+// a generic body is read in its own terms, and each instantiation is asked again.
+private convert_lanes(cx: &Analyzer, span: Span, t: TExpr, to: Type) -> TExpr
+    val got = texpr_type(t)
+    val source = repr(got) match
+        Array(n, a) ->
+            if can_be_lane(*a) && !is_quad(*a) then Some((n, *a, TExpr(t.span, TLanesAs(t, Vector(n, *a)))))
+            else None
+        Vector(n, a) -> Some((n, *a, t))
+        _ -> None
+    val target = repr(to) match
+        Vector(m, b) -> Some((m, *b))
+        _ -> None
+
+    if source.is_none() || target.is_none() then return cx.err(span, refusal(None, got, to))
+
+    val (n, a, lanes) = source.unwrap()
+    val (m, b) = target.unwrap()
+
+    if n != m && n != 0 && m != 0 then
+        return cx.err(span, s"a vector converts lane by lane only at one length: ${type_show(got)} " +
+                      s"has $n ${if is_vector(repr(got)) then "lanes" else "elements"} and " +
+                      s"${type_show(to)} has $m lanes")
+
+    if !converts(cx, span, underlying(a), underlying(b)) then
+        return cx.err(span, s"cannot convert ${type_show(got)} to ${type_show(to)} — a lane of " +
+                      s"${type_show(a)} does not convert to ${type_show(b)}")
+
+    TExpr(span, TCast(lanes, to))
+end convert_lanes
 
 // `q15(x, Floor)` -- a conversion told how to settle the bits it drops, the mode a `sysl.Rounding`
 // variant written at the call. **Only a conversion into or out of a fixed-point type reads one**, and
