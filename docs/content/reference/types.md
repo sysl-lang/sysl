@@ -510,6 +510,26 @@ direction rounds, since seven bits cannot hold ten: `bf16(h)`, with `h` the `f16
 is `bf16`'s own tenth (`0.10009765625` widened) rather than `h`'s `0.0999755859375`, because that
 value has no exact seven-bit representation.
 
+The `f16` text round-trips: `sysl.text.parse_f16` reads a decimal rounded once to the nearest `f16`,
+so every `to_string` of an `f16` parses to the same `f16`, and a long decimal a hair from half way
+between two of them goes to the nearer one rather than through a wider float to the even one.
+
+```sysl
+import sysl.text.parse_f16
+
+val h: f16 = 0.1
+
+print(parse_f16(h.to_string()).unwrap().bits() == h.bits())
+print(parse_f16("65519.99").unwrap(), parse_f16("65520").unwrap())
+print(parse_f16("1.00048828125000000000000000000000000000001").unwrap().bits() == 0x3c01)
+```
+
+```output
+true
+65500 inf
+true
+```
+
 `sysl.math`'s [`Float`](/library/math/) trait covers both, so `sqrt`, `floor`, `pi` and the rest are
 called the same way as for `real`. libm has no sixteen-bit entry points, so those functions widen to
 `f32`, compute, and narrow back; the widening is exact, so the only rounding is to the destination.
