@@ -540,7 +540,23 @@ name_expr(cx: &Analyzer, span: Span, name: string, expected: Option[Type]) -> TE
     if local.is_some()
         val konst = cx.const_local(local.unwrap().unique)
 
-        if konst.is_some() then return TExpr(span, konst.unwrap().0.kind)
+        if konst.is_some()
+            val lc = cx.local_const(local.unwrap().unique).unwrap()
+
+            if lc.untyped
+                val at = untyped_literal(cx, span, name, lc.folded, expected)
+
+                if at.is_some() then return at.unwrap()
+
+                val float_at = untyped_float(cx, span, name, lc.init, lc.folded, texpr_type(lc.image), expected)
+
+                if float_at.is_some() then return float_at.unwrap()
+            end if
+
+            if lc.character && wants_byte(expected) then return local_char_at(cx, span, lc, expected)
+
+            return TExpr(span, konst.unwrap().0.kind)
+        end if
     end if
 
     if local.is_some()
@@ -591,10 +607,12 @@ name_expr(cx: &Analyzer, span: Span, name: string, expected: Option[Type]) -> TE
 
     if stands_for.is_some() then return stands_for.unwrap()
 
-    // A constant is folded into its use and analyzed as the expression it stands for, at the type
-    // it was declared with rather than the one the context asked for. That is what makes it behave
-    // like the value it names: `const n: usize = 5` used where an `int` belongs is the same
-    // mismatch a `usize` variable would be, not a silent adaptation.
+    // A constant is folded into its use and analyzed as the expression it stands for. **A typed one
+    // is read at the type it was declared with** rather than the one the context asked for: that is
+    // what makes it behave like the value it names, so `const n: usize = 5` used where an `int`
+    // belongs is the same mismatch a `usize` variable would be, not a silent adaptation. **An untyped
+    // one is the literal it stands for** and takes the context's type as that literal would
+    // (`untyped_const_read`).
     val ck = lookup_value_key(cx, a_consts(cx), name)
 
     // A constant another file made file-private is still found by its spelling, so the reader is
@@ -603,7 +621,7 @@ name_expr(cx: &Analyzer, span: Span, name: string, expected: Option[Type]) -> TE
         if !reachable_key(cx.an, ck.unwrap(), cx.scope) && !refused_at_import(cx.scope, name, ck.unwrap())
             return cx.err(span, out_of_reach(cx.an, ck.unwrap()))
 
-        return const_expr(cx, span, ck.unwrap())
+        return const_expr(cx, span, ck.unwrap(), name, expected)
     end if
 
     val c_rivals = ambiguous_storage(cx, span, a_consts(cx), name)
@@ -946,12 +964,14 @@ value_type(cx: &Analyzer, d: ValueDecl) -> Type =
 //
 // **The cycle is reported at the DECLARATION and named in the order the walk followed it**, which is
 // the same account a cycle between modules gets.
-private const_expr(cx: &Analyzer, span: Span, key: string) -> TExpr
+private const_expr(cx: &Analyzer, span: Span, key: string, name: string, expected: Option[Type]) -> TExpr
     if const_cycle_at(cx, key) then return bad_expr(span)
+
+    val untyped = untyped_const_key(cx.an, key) || wants_byte(expected) && char_const_key(cx.an, key)
 
     cx.an.consts_in_progress.push(key)
 
-    val out = const_value_expr(cx, span, key)
+    val out = const_value_expr(cx, span, key, if untyped then Some((name, expected)) else None)
 
     cx.an.consts_in_progress.truncate(cx.an.consts_in_progress.len() - 1)
     out
@@ -1026,7 +1046,177 @@ const_type(cx: &Analyzer, d: ValueDecl) -> Type =
     if d.typ.is_some() || d.init.is_none() then value_type(cx, d)
     else texpr_type(type_expr(analyzer_for(cx.an, d.scope), d.init.unwrap(), None))
 
-private const_value_expr(cx: &Analyzer, span: Span, key: string) -> TExpr
+// -- an untyped constant is the literal it stands for ---------------------------------------------
+
+// **A constant whose type is left to a value with none of its own is that value's literal**: `const
+// N = 1000` used as a `usize` bound, a `u32` argument, an index or beside a byte is the 1000 written
+// there, read at the type the position gives it -- and refused where that literal would be, the
+// refusal naming the constant. A constant given a type, `const M: i32 = 5`, is a value of that type
+// as a `val` is, and never adapts.
+//
+// "A value with none of its own" is what `literal_valued` says of the initializer: a bare literal,
+// arithmetic and shifts over such, an `if` or a `match` of them, and another untyped constant -- so
+// `const K = 3 * 4` is untyped and `const B = u8(3)` is a byte. The name is read where it is written:
+// a local of the spelling, a value parameter or a nearer declaration is what it means instead.
+untyped_const_read(cx: &Analyzer, e: Expr) -> bool = named_const_read(cx, e, false)
+
+// **A constant whose type is left to a character literal is that literal** too: `const Semi = ';'`
+// is a `char` where nothing says otherwise and the byte 59 beside a `u8`, as `';'` is. One given a
+// type, `const Semi: char = ';'`, is a `char` everywhere.
+char_const_read(cx: &Analyzer, e: Expr) -> bool = named_const_read(cx, e, true)
+
+// Whether an expression is a character literal or the name of a constant that stands for one.
+char_valued(cx: &Analyzer, e: Expr) -> bool = is_char_literal(e) || char_const_read(cx, e)
+
+private named_const_read(cx: &Analyzer, e: Expr, character: bool) -> bool = *e.kind match
+    Ident(name) -> named_const(cx, name, character)
+    Field(receiver, name, _) ->
+        val dotted = through_module(cx, receiver, name)
+
+        dotted.is_some() && named_const(cx, dotted.unwrap(), character)
+    _ -> false
+
+private named_const(cx: &Analyzer, name: string, character: bool) -> bool
+    if reserved_shape(name) then return false
+
+    val local = cx.lookup(name)
+
+    if local.is_some()
+        val unique = local.unwrap().unique
+
+        return if character then cx.char_const_local(unique) else cx.untyped_const_local(unique)
+    end if
+
+    if bound_type(cx.subst, name).is_some() || outranked(cx, a_consts(cx), name) then return false
+
+    val key = value_key_of(cx, a_consts(cx), name)
+
+    if key.is_none() then return false
+
+    if character then char_const_key(cx.an, key.unwrap()) else untyped_const_key(cx.an, key.unwrap())
+end named_const
+
+// The type an untyped constant's value has read alone -- `int` or `real` -- with every trace of the
+// reading put back.
+untyped_const_type(cx: &Analyzer, e: Expr) -> Type
+    val tried = begin_trial(cx)
+    val t = type_expr(cx, e, None)
+
+    discard_trial(cx, tried)
+    texpr_type(t)
+end untyped_const_type
+
+// Whether a module constant is untyped. A constant met again while its own initializer is being
+// asked about is not -- the loop is told where the value is read (`const_cycle_at`).
+untyped_const_key(a: &Analysis, key: string) -> bool
+    val d = a.tables.consts.get(key).unwrap()
+
+    if d.typ.is_some() || d.init.is_none() || holds_string(a.consts_in_progress, key) then return false
+
+    a.consts_in_progress.push(key)
+
+    val out = literal_valued(analyzer_for(a, d.scope), d.init.unwrap())
+
+    a.consts_in_progress.truncate(a.consts_in_progress.len() - 1)
+    out
+end untyped_const_key
+
+// Whether a module constant's type is left to a character literal, written there or through another
+// such constant.
+char_const_key(a: &Analysis, key: string) -> bool
+    val d = a.tables.consts.get(key).unwrap()
+
+    if d.typ.is_some() || d.init.is_none() || holds_string(a.consts_in_progress, key) then return false
+
+    a.consts_in_progress.push(key)
+
+    val out = char_valued(analyzer_for(a, d.scope), d.init.unwrap())
+
+    a.consts_in_progress.truncate(a.consts_in_progress.len() - 1)
+    out
+end char_const_key
+
+// An untyped integer constant's value, read as its literal at the position's type -- a float where
+// the float holds it exactly, a fixed-point value, a `new` type over the base -- with the refusal a
+// literal there would get, naming the constant. Nothing where the value is not an integer.
+private untyped_literal(cx: &Analyzer, span: Span, name: string, value: Option[Const],
+                        expected: Option[Type]) -> Option[TExpr] = value match
+    Some(ConstInt(n)) -> Some(int_literal(cx, span, n, "", expected, name))
+    _ -> None
+
+// A local character constant where `expected` wants a byte: its initializer -- the literal, or
+// another such constant -- read there, so it is the byte the literal is and refused where it would be.
+local_char_at(cx: &Analyzer, span: Span, lc: LocalConst, expected: Option[Type]) -> TExpr =
+    TExpr(span, *type_expr(cx, lc.init, expected).kind)
+
+// A character constant where a byte is wanted: the byte its literal is there, refused where that
+// literal would be. Nothing for any other constant or position.
+private char_at_byte(cx: &Analyzer, span: Span, value: Option[Const], expected: Option[Type]) -> Option[TExpr] =
+    value match
+        Some(ConstChar(c)) -> if wants_byte(expected) then Some(char_literal(cx, span, c, expected)) else None
+        _ -> None
+
+// An untyped integer module constant as a pattern reads it: its literal at the scrutinee's type,
+// refused where that literal would be, naming the constant. Nothing for any other constant.
+untyped_pattern_value(cx: &Analyzer, span: Span, key: string, ty: Type) -> Option[TExpr]
+    if !untyped_const_key(cx.an, key) then return None
+
+    val d = a_consts(cx).get(key).unwrap()
+    val inner = analyzer_for(cx.an, d.scope)
+
+    untyped_literal(cx, span, d.name, const_decl_value(inner, d.init.unwrap(), const_type(inner, d)), Some(ty))
+end untyped_pattern_value
+
+// An untyped float constant where its position wants another float format -- `f32`, `f16`, `f128`
+// or a fixed-point type: its initializer read at that format, as the literal written there would be,
+// so a fixed-point or `f128` value is read from the literal's text, exactly, and never through a
+// double. A literal the format does not hold is refused, naming the constant. **An initializer
+// written as arithmetic is its value at a fixed-point type** -- `const Q = 0.25 * 2.0` is the 0.5 it
+// comes to, not a product whose `2.0` no `q15` holds -- and is computed at the format elsewhere, as a
+// typed constant's is. Nothing where the position wants no float, or `real`, which the constant
+// already is.
+private untyped_float(inner: &Analyzer, span: Span, name: string, init: Expr, value: Option[Const], ty: Type,
+                      expected: Option[Type]) -> Option[TExpr]
+    if underlying(ty) != real_type() || expected.is_none() then return None
+
+    val at = scalar_wanted(expected.unwrap())
+
+    val wanted = at match
+        Floating(_, _) -> at != real_type()
+        Fixed(_, _, _) -> true
+        _ -> false
+
+    if !wanted then return None
+
+    val text = float_text(init)
+
+    if text.is_some() then return Some(float_literal(inner, span, text.unwrap(), "", Some(at), name))
+
+    if is_fixed(at)
+        value match
+            Some(ConstFloat(f)) ->
+                val shown = s"$f"
+
+                return Some(fixed_literal(inner, span, shown, exact_of_text(shown), at, name))
+            _ -> ()
+    end if
+
+    Some(TExpr(span, *type_expr(inner, init, Some(at)).kind))
+end untyped_float
+
+// An unsuffixed float literal's text, signed where it is negated.
+private float_text(e: Expr) -> Option[string] = *e.kind match
+    FloatLit(text, suffix) -> if suffix == "" then Some(text) else None
+    Unary(op, operand) -> *operand.kind match
+        FloatLit(text, suffix) -> if op == "-" && suffix == "" then Some(s"-$text") else None
+        _ -> None
+    _ -> None
+
+//
+// `untyped` carries, for an untyped constant, the name it was written as and the type its position
+// asks for, at which the value is read as its literal would be.
+private const_value_expr(cx: &Analyzer, span: Span, key: string,
+                         untyped: Option[(string, Option[Type])]) -> TExpr
     val d = a_consts(cx).get(key).unwrap()
     val ty = const_type(cx, d)
 
@@ -1034,6 +1224,22 @@ private const_value_expr(cx: &Analyzer, span: Span, key: string) -> TExpr
 
     // Read in the declaration's own terms, since that is where its names mean what they meant.
     val inner = analyzer_for(cx.an, d.scope)
+
+    if untyped.is_some()
+        val (name, expected) = untyped.unwrap()
+        val value = const_decl_value(inner, d.init.unwrap(), ty)
+        val at = untyped_literal(cx, span, name, value, expected)
+
+        if at.is_some() then return at.unwrap()
+
+        val float_at = untyped_float(inner, span, name, d.init.unwrap(), value, ty, expected)
+
+        if float_at.is_some() then return float_at.unwrap()
+
+        val byte_at = char_at_byte(cx, span, value, expected)
+
+        if byte_at.is_some() then return byte_at.unwrap()
+    end if
 
     // **A `const` IS ITS VALUE, so a use of one is the value and not the arithmetic that wrote it.**
     // `(1 << 23) - 1` is a way of saying 8388607 that a reader can check, and every use of the name
@@ -2230,7 +2436,7 @@ analyze_operands(cx: &Analyzer, operands: Buf[Expr], expected: Option[Type],
                     // operand beside it declared it.
                     val saved = cx.declared
 
-                    if soft[i] then cx.declared = declared_by(cx, typed_beside(operands, firm, ty), ty.unwrap())
+                    if soft[i] then cx.declared = declared_by(cx, typed_beside(cx, operands, firm, ty), ty.unwrap())
 
                     val again = reread(cx, t, operands[i], ty.unwrap(), widens)
 
@@ -2244,7 +2450,7 @@ analyze_operands(cx: &Analyzer, operands: Buf[Expr], expected: Option[Type],
 
                     cx.declared = saved
                 else out.push(t)
-            None -> out.push(held_literal(cx, operands[i], ty, held, typed_beside(operands, firm, ty)))
+            None -> out.push(held_literal(cx, operands[i], ty, held, typed_beside(cx, operands, firm, ty)))
 
     out
 end analyze_operands
@@ -2274,9 +2480,9 @@ read_all_beside_deferred(cx: &Analyzer, parts: Buf[Expr])
 
 // Whether the operands of a wrapping or saturating operator that have a type of their own agree on
 // it, refusing the pair where they do not: `u8 +| u16` widens to nothing, as Rust's
-// `u8::saturating_add(u16)` is a mismatch. **A named constant is a typed value** of its declared or
-// default type (`const K = 300` is an `int`), so it is held to this as a variable is; only a bare
-// literal, or an expression that comes to one, adapts to its neighbour.
+// `u8::saturating_add(u16)` is a mismatch. **A typed constant is a typed value** (`const K: int = 3`),
+// so it is held to this as a variable is; only a bare literal, an untyped constant, or an expression
+// that comes to one, adapts to its neighbour.
 private one_type_held(cx: &Analyzer, operands: Buf[Expr], told: Buf[Option[TExpr]], soft: Buf[bool],
                       held: string) -> bool
     var first: Option[Type] = None
@@ -2284,7 +2490,7 @@ private one_type_held(cx: &Analyzer, operands: Buf[Expr], told: Buf[Option[TExpr
     for i in 0..<operands.len()
         told[i] match
             Some(t) ->
-                if !soft[i] && !adaptable(operands[i], t) && texpr_type(t) != Unknown
+                if !soft[i] && !adaptable(cx, operands[i], t) && texpr_type(t) != Unknown
                     val ty = repr(texpr_type(t))
 
                     if first.is_none() then first = Some(ty)
@@ -2338,13 +2544,13 @@ private int_literal_text(e: Expr) -> bool = *e.kind match
 // The operand with a type of its own that a literal beside it is held to: the first of the pair's
 // type, else the first typed one; none where every operand is open, and the literals are read at what
 // the position asked for.
-private typed_beside(operands: Buf[Expr], told: Buf[Option[TExpr]], ty: Option[Type]) -> Option[TExpr]
+private typed_beside(cx: &Analyzer, operands: Buf[Expr], told: Buf[Option[TExpr]], ty: Option[Type]) -> Option[TExpr]
     var first: Option[TExpr] = None
 
     for i in 0..<operands.len()
         told[i] match
             Some(t) ->
-                if !adaptable(operands[i], t)
+                if !adaptable(cx, operands[i], t)
                     if ty.is_some() && type_eq(texpr_type(t), ty.unwrap()) then return Some(t)
 
                     if first.is_none() then first = Some(t)
@@ -2376,7 +2582,7 @@ private held_text(e: Expr) -> Option[string] = *e.kind match
 private literal_widened(cx: &Analyzer, operands: Buf[Expr], firm: Buf[Option[TExpr]],
                         told: Buf[Option[TExpr]], settled: Option[Type], expected: Option[Type],
                         widen: bool, rescales: bool) -> Option[Type]
-    if !widen || settled.is_none() || !any_typed(operands, firm) then return settled
+    if !widen || settled.is_none() || !any_typed(cx, operands, firm) then return settled
 
     var ty = settled.unwrap()
 
@@ -2445,10 +2651,10 @@ private reaches_position(own: Type, expected: Option[Type]) -> bool =
 
 // Whether any operand has a type of its own -- with none, there is nothing to widen, and the literals
 // are read at what the position asked for.
-private any_typed(operands: Buf[Expr], told: Buf[Option[TExpr]]) -> bool
+private any_typed(cx: &Analyzer, operands: Buf[Expr], told: Buf[Option[TExpr]]) -> bool
     for i in 0..<operands.len()
         told[i] match
-            Some(t) -> if !adaptable(operands[i], t) then return true
+            Some(t) -> if !adaptable(cx, operands[i], t) then return true
             None -> ()
 
     false
@@ -2526,7 +2732,7 @@ reread(cx: &Analyzer, t: TExpr, src: Expr, want: Type, widen: bool = true) -> TE
     // A character literal beside a byte is that byte or a mistake with its own name, so its reading
     // at `u8` is the one kept either way -- `b == 'é'` is told the character is not ASCII, rather
     // than that a `u8` cannot be compared with a `char`.
-    if is_char_literal(src) && wants_byte(Some(want)) then return analyze_expected(cx, src, Some(want))
+    if char_valued(cx, src) && wants_byte(Some(want)) then return analyze_expected(cx, src, Some(want))
 
     val tried = begin_trial(cx)
     val again = if widen then analyze_expected(cx, src, Some(want))
@@ -2560,7 +2766,7 @@ private firmest(cx: &Analyzer, operands: Buf[Expr], read: Buf[Option[TExpr]], wi
             Some(t) ->
                 if any.is_none() then any = Some(repr(texpr_type(t)))
 
-                if taken.is_none() && !adaptable(operands[i], t) then
+                if taken.is_none() && !adaptable(cx, operands[i], t) then
                     taken = Some(repr(texpr_type(t)))
             None -> ()
 
@@ -2589,7 +2795,7 @@ private widest_operand(cx: &Analyzer, operands: Buf[Expr], read: Buf[Option[TExp
             Some(t) ->
                 val ty = repr(texpr_type(t))
 
-                if !adaptable(operands[i], t) && !type_eq(ty, chosen) &&
+                if !adaptable(cx, operands[i], t) && !type_eq(ty, chosen) &&
                         holds_every_operand(cx, operands, read, ty, rescales) then return ty
             None -> ()
 
@@ -2605,7 +2811,7 @@ private holds_every_operand(cx: &Analyzer, operands: Buf[Expr], read: Buf[Option
 
                 if other == Unknown then return false
                 if rescales && is_fixed(other) && is_fixed(ty) && !type_eq(other, ty) then return false
-                if !adaptable(operands[i], t) && !type_eq(other, ty) &&
+                if !adaptable(cx, operands[i], t) && !type_eq(other, ty) &&
                         (other == Char || !implicitly_widens(other, ty)) &&
                         !points_at_conformer(cx, other, ty) then return false
             None -> ()
