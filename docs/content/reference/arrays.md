@@ -584,6 +584,73 @@ larger than `isize::MAX`, a narrower unsigned value widened, a `&` with one of t
 right shift or a division by a literal, or a local never written after its declaration, or a loop
 variable, bounded by one of them.
 
+### A loop's subscripts are checked once
+
+A check inside a loop is a branch out of it on every turn, and that branch costs more than its
+compare: it stops the optimizer carrying values from one turn to the next, so a loop that appends
+`seq[i - 1 - j]` to a `Buf` reads the buffer's count and capacity again for every element. So where a
+`for` loop's subscripts can be checked **for the whole loop before it starts**, the compiler lowers
+the loop twice: once with those checks left out, and once as written, with a test in front that picks
+the first only where every index the loop will reach is in range. A loop that fails the test runs as
+written, and stops at the same index, with the same message, as it always did.
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+// `seq` back to front, `width` bytes to a line.
+reversed(seq: []const u8, width: usize)
+    val out: Buf[u8] = buf()
+    var i = seq.len
+
+    while i > 0
+        val n = if i > width then width else i
+
+        for j in 0..<n do out.push(seq[i - 1 - j])
+
+        out.push(u8('/'))
+        i -= n
+
+    out.push(u8('\n'))
+    putbytes(out.view())
+
+reversed("abcdefg".bytes, 3)
+```
+
+```output
+gfe/dcb/a/
+```
+
+The test is made each time the loop is entered — here once per line, against the `i` of that line.
+What it can prove is a subscript of an array, or of a view held in a local the loop leaves alone,
+whose index is built with `+` and `-` from the loop variable (once at most), literals, the `.len` of
+such a view, and locals the loop neither writes nor reaches by address. Such an index moves by one
+each time the variable does, so the test works out its value at the first turn and at the last, in
+arithmetic wide enough to be exact, and asks that both are in range and fit the index's type; every
+turn between is then in range too. A loop that runs no turn passes it.
+
+Anything else keeps its check on every turn, in both copies: an index with a `*`, one reading the
+variable twice, one through a call. A loop is not copied at all where its body writes its variable or
+reaches it by address, holds a loop of its own, returns, uses `?` or `defer`, is in an `async`
+function, or is long; nor where the only subscript is `xs[j]` with `j` running below `xs.len`, whose
+check is the loop's own condition and is folded anyway. An index the body moves is checked where it
+is read:
+
+```sysl
+show(xs: []const int)
+    var k: usize = 0
+
+    for j in 0..<3
+        print(xs[k + j])
+        k += 1
+
+show([1, 2, 3, 4])
+```
+
+```output trap
+1
+3
+```
+
 ### A raw pointer is indexed anyway
 
 A `*T` is the one receiver with nothing to check against, and it can be subscripted anyway: that is

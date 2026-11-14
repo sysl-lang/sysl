@@ -1,0 +1,324 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.from_int
+
+// **A counted loop whose subscripts can be proved in range before it starts is lowered twice**: once
+// with those subscripts' bounds checks left out, and once exactly as written, and a test in front of
+// the loop picks which copy runs. Every check is still made -- for the whole run of the loop at once,
+// where it can be, and one subscript at a time where it cannot.
+//
+// The point is not the compare the check costs. **A check is a branch out of the loop**, and LLVM's
+// load PRE will not carry a value around a loop past a block with another way out, so a loop that
+// appends `seq[i - 1 - j]` to a `Buf` reads the buffer's count, capacity and storage again for every
+// element (`reference/arrays.md § A loop's subscripts are checked once`). With no check in the loop,
+// the header lives in registers.
+//
+// **What is proved.** A subscript `xs[f]` of an array, or of a view held by a local, whose index `f`
+// is built with `+` and `-` from the loop's variable (at most once), integer literals, `.len` of such
+// a view, and locals that keep one value for the whole loop (`nowrap.sysl`'s `nowrap_steady`). Every
+// node of `f` is of the index's one integer type, at most a word wide. Such an `f` moves by exactly
+// one each time the variable does, in one direction or the other, so it takes every value between
+// its value at the first turn and its value at the last, and no other. The test works the two out in
+// arithmetic twice the word's width -- exact, since nothing in `f` is wider than the word and it has
+// a handful of terms -- and asks that both lie at or above zero, below the length, and within the
+// index's type. Then every value between does too, and the value the program computes, which differs
+// from the exact one only by a multiple of the type's range, is the exact one. A loop that does not
+// run at all passes.
+//
+// **What keeps it sound.** The loop variable is neither written nor reached by address in the body,
+// so it takes exactly the values its range gives it; every name the test reads is steady for the
+// whole loop; a view's length cannot change while the local holding it does not. A body that leaves
+// the function (`return`, `?`, `become`), defers a statement, holds a loop of its own, or is longer
+// than `HoistBodyLimit` nodes is not copied, and neither is an `async` body.
+//
+// **Where LLVM can already prove the check** -- `xs[j]` with `j` running below `xs.len` -- nothing is
+// copied for it: the check is the loop's own condition, and folds before anything else runs.
+
+// The largest body, in expression nodes, worth a second copy.
+const HoistBodyLimit: int = 400
+
+// The most terms an index may have.
+private const HoistTerms: int = 16
+
+// A subscript the test in front of the loop proves: the index, the view or array it indexes, and the
+// index's type.
+struct HoistSub
+    index: TExpr
+    receiver: TExpr
+    bits: int
+    signed: bool
+
+// What a walk over a candidate body found: its subscripts, as receiver and index, whether anything in
+// it rules a copy out, and how many expressions it holds.
+private struct HoistScan
+    subs: Buf[(TExpr, TExpr)]
+    refused: bool
+    nodes: int
+
+private hoist_scan() -> &HoistScan = HoistScan(buf(), false, 0)
+
+private hoist_on_expr(s: &HoistScan, x: TExpr)
+    s.nodes += 1
+
+    *x.kind match
+        TIndex(receiver, index, _) -> s.subs.push((receiver, index))
+        TFor(_, _, _, _, _, _, _, _) -> s.refused = true
+        TWhile(_, _, _, _) -> s.refused = true
+        TDoWhile(_, _, _, _) -> s.refused = true
+        TLoop(_, _) -> s.refused = true
+        TCFor(_, _, _, _, _, _) -> s.refused = true
+        TForEach(_, _, _, _, _, _) -> s.refused = true
+        TIterate(_, _, _, _, _, _, _, _) -> s.refused = true
+        TCheckedLoop(_, _, _) -> s.refused = true
+        TTry(_, _, _, _, _, _, _) -> s.refused = true
+        TAwait(_, _) -> s.refused = true
+        TBlockOn(_, _) -> s.refused = true
+        TYieldNow -> s.refused = true
+        TStep(_, _) -> s.refused = true
+        TPark(_) -> s.refused = true
+        _ -> ()
+end hoist_on_expr
+
+private hoist_on_stmt(s: &HoistScan, st: TStmt)
+    st match
+        TReturn(_) -> s.refused = true
+        TBecome(_) -> s.refused = true
+        TDefer(_, _) -> s.refused = true
+        TAsm(_, _, _, _) -> s.refused = true
+        TRefDecl(_, _, _) -> s.refused = true
+        _ -> ()
+end hoist_on_stmt
+
+// The subscripts of a counted loop's body that a test in front of it can prove, or none where the
+// body is not one to copy or holds nothing worth copying it for.
+hoist_plan(e: *Emit, name: string, var_ty: Type, hi: TExpr, inclusive: bool,
+           body: Buf[TStmt]) -> Option[Buf[HoistSub]]
+    if !e.nowrap.ready || e.coro.is_some() then return None
+    if !nowrap_untouched(e, name, body) then return None
+
+    val s = hoist_scan()
+
+    walk_stmts(body, TWalk(true, x -> hoist_on_expr(s, x), w -> (), st -> hoist_on_stmt(s, st)))
+
+    if s.refused || s.nodes > HoistBodyLimit || s.subs.is_empty() then return None
+
+    var found: Buf[HoistSub] = buf()
+    var worth = false
+
+    for sub in s.subs
+        val (receiver, index) = sub
+
+        hoist_sub(e, name, receiver, index, body) match
+            Some(h) ->
+                if !hoist_folds_alone(name, hi, inclusive, receiver, index) then worth = true
+
+                found.push(h)
+            None -> ()
+
+    if !worth then None else Some(found)
+end hoist_plan
+
+// A subscript the test can prove, or none.
+private hoist_sub(e: *Emit, name: string, receiver: TExpr, index: TExpr,
+                  body: Buf[TStmt]) -> Option[HoistSub]
+    if unchecked_index(index) then return None
+
+    val (bits, signed) = underlying(texpr_type(index)) match
+        Integer(b, sg, _) -> (b, sg)
+        _ -> return None
+
+    if bits > e.word_bits then return None
+
+    nameless(texpr_type(receiver)) match
+        Array(_, _) -> ()
+        Slice(_, _) -> if !hoist_steady_view(e, receiver, body) then return None
+        _ -> return None
+
+    if !hoist_affine(e, name, index, bits, signed, body) then return None
+    if hoist_uses(index, name) > 1 || hoist_terms(index) > HoistTerms then return None
+
+    Some(HoistSub(index, receiver, bits, signed))
+end hoist_sub
+
+// How many times an index reads the loop variable.
+private hoist_uses(x: TExpr, name: string) -> int = *x.kind match
+    TLoad(n, _) -> if n == name then 1 else 0
+    TBinary(_, l, r, _) -> hoist_uses(l, name) + hoist_uses(r, name)
+    _ -> 0
+
+// How many terms an index has.
+private hoist_terms(x: TExpr) -> int = *x.kind match
+    TBinary(_, l, r, _) -> hoist_terms(l) + hoist_terms(r)
+    _ -> 1
+
+// A view held by a local the loop leaves alone.
+private hoist_steady_view(e: *Emit, x: TExpr, body: Buf[TStmt]) -> bool = *x.kind match
+    TLoad(n, _) -> nowrap_steady(e, n, body)
+    _ -> false
+
+// Whether `x` is of the index's type, built only of what the test can work out: the loop variable,
+// literals, steady locals and the lengths of steady views, under `+` and `-`.
+private hoist_affine(e: *Emit, name: string, x: TExpr, bits: int, signed: bool,
+                     body: Buf[TStmt]) -> bool
+    val same = underlying(texpr_type(x)) match
+        Integer(b, sg, _) -> b == bits && sg == signed
+        _ -> false
+
+    if !same then return false
+
+    *x.kind match
+        TIntLit(_, _) -> true
+        TLoad(n, _) -> n == name || nowrap_steady(e, n, body)
+        TLen(r, _) -> nameless(texpr_type(r)) match
+            Array(_, _) -> true
+            Slice(_, _) -> hoist_steady_view(e, r, body)
+            _ -> false
+        TBinary(op, l, r, _) ->
+            (op == "+" || op == "-") && hoist_affine(e, name, l, bits, signed, body) &&
+                hoist_affine(e, name, r, bits, signed, body)
+        _ -> false
+end hoist_affine
+
+// `xs[j]` in a loop `for j in lo..<xs.len`: the check is the loop's own condition, which LLVM folds
+// with nothing copied.
+private hoist_folds_alone(name: string, hi: TExpr, inclusive: bool, receiver: TExpr,
+                          index: TExpr) -> bool
+    if inclusive then return false
+
+    val j = *index.kind match
+        TLoad(n, _) -> n == name
+        _ -> false
+
+    if !j then return false
+
+    val unsigned = underlying(texpr_type(index)) match
+        Integer(_, sg, _) -> !sg
+        _ -> false
+
+    val view = *receiver.kind match
+        TLoad(n, _) -> Some(n)
+        _ -> None
+
+    val bound = *hi.kind match
+        TLen(r, _) -> *r.kind match
+            TLoad(n, _) -> Some(n)
+            _ -> None
+        _ -> None
+
+    unsigned && view.is_some() && bound.is_some() && view.unwrap() == bound.unwrap()
+end hoist_folds_alone
+
+// The test in front of the loop: true where the loop runs no turn, or where every subscript of the
+// plan is in range at its first turn and its last.
+hoist_test(e: *Emit, plan: Buf[HoistSub], name: string, var_ty: Type, lo_v: Val, hi_v: Val,
+           inclusive: bool) -> Val
+    push_temps(e)
+
+    val w = lty(e, var_ty)
+    val wide = LInt(2 * e.word_bits)
+    val (vbits, vsigned) = underlying(var_ty) match
+        Integer(b, sg, _) -> (b, sg)
+        _ -> (e.word_bits, false)
+
+    val empty = fresh_reg(e)
+
+    emit(e, InIntCmp(empty, int_pred(e, if inclusive then ">" else ">=", underlying(var_ty)), w, lo_v,
+                     hi_v))
+
+    val first = hoist_widen(e, lo_v, vbits, vsigned)
+    var last = hoist_widen(e, hi_v, vbits, vsigned)
+
+    if !inclusive
+        val l = fresh_reg(e)
+
+        emit(e, InBin(l, OpSub, wide, last, VInt(from_int(1))))
+        last = l
+    end if
+
+    var all = empty
+    var any = false
+
+    for sub in plan
+        val len = hoist_length(e, sub.receiver)
+        val a = hoist_within(e, hoist_value(e, sub.index, name, first), len, sub.bits, sub.signed)
+        val b = hoist_within(e, hoist_value(e, sub.index, name, last), len, sub.bits, sub.signed)
+        val ab = fresh_reg(e)
+
+        emit(e, InBin(ab, OpAnd, l_i1(), a, b))
+
+        if !any
+            all = ab
+            any = true
+        else
+            val both = fresh_reg(e)
+
+            emit(e, InBin(both, OpAnd, l_i1(), all, ab))
+            all = both
+    end for
+
+    val pass = fresh_reg(e)
+
+    emit(e, InBin(pass, OpOr, l_i1(), empty, all))
+    pop_temps(e)
+    pass
+end hoist_test
+
+// An integer of `bits` bits, brought exactly to twice the word.
+private hoist_widen(e: *Emit, v: Val, bits: int, signed: bool) -> Val
+    val r = fresh_reg(e)
+
+    emit(e, InCast(r, if signed then CastSExt else CastZExt, LInt(bits), v, LInt(2 * e.word_bits)))
+    r
+end hoist_widen
+
+// The receiver's length, at twice the word.
+private hoist_length(e: *Emit, receiver: TExpr) -> Val = nameless(texpr_type(receiver)) match
+    Array(n, _) -> VInt(from_int(long(n)))
+    _ -> hoist_widen(e, gen_len(e, receiver), e.word_bits, false)
+
+// The exact value of an index at twice the word, with the loop variable at `at`.
+private hoist_value(e: *Emit, x: TExpr, name: string, at: Val) -> Val
+    val (bits, signed) = underlying(texpr_type(x)) match
+        Integer(b, sg, _) -> (b, sg)
+        _ -> (e.word_bits, false)
+
+    *x.kind match
+        TIntLit(v, _) -> VInt(v)
+        TLoad(n, _) -> if n == name then at else hoist_widen(e, gen_expr(e, x), bits, signed)
+        TLen(r, _) -> hoist_length(e, r)
+        TBinary(op, l, r, _) ->
+            val a = hoist_value(e, l, name, at)
+            val b = hoist_value(e, r, name, at)
+            val out = fresh_reg(e)
+
+            emit(e, InBin(out, if op == "+" then OpAdd else OpSub, LInt(2 * e.word_bits), a, b))
+            out
+        _ -> VUndef
+end hoist_value
+
+// Whether an exact index names an element of a run of `len`, and is a value its type holds.
+private hoist_within(e: *Emit, v: Val, len: Val, bits: int, signed: bool) -> Val
+    val wide = LInt(2 * e.word_bits)
+    val low = fresh_reg(e)
+    val below = fresh_reg(e)
+    val fits = fresh_reg(e)
+    val a = fresh_reg(e)
+    val b = fresh_reg(e)
+
+    emit(e, InIntCmp(low, ISge, wide, v, VInt(from_int(0))))
+    emit(e, InIntCmp(below, ISlt, wide, v, len))
+    emit(e, InIntCmp(fits, ISle, wide, v, VInt(max_of(bits, signed))))
+    emit(e, InBin(a, OpAnd, l_i1(), low, below))
+    emit(e, InBin(b, OpAnd, l_i1(), a, fits))
+    b
+end hoist_within
+
+// Whether the copy being lowered has proved this subscript's index in range.
+hoist_proven(e: *Emit, index: TExpr) -> bool = e.nowrap.proven.has(node_id(index))
+
+// Marks a plan's subscripts proved, for the copy about to be lowered, or clears them after it.
+hoist_mark(e: *Emit, plan: Buf[HoistSub], on: bool)
+    for sub in plan
+        if on then e.nowrap.proven.add(node_id(sub.index)) else e.nowrap.proven.remove(node_id(sub.index))
+end hoist_mark

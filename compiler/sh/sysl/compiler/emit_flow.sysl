@@ -650,9 +650,61 @@ gen_for(e: *Emit, name: string, var_ty: Type, lo: TExpr, hi: TExpr, inclusive: b
     val else_l = if else_block.is_some() then fresh_label(e, "for.else") else end_l
     val slot = result_slot(e, ty)
     val home = local_alloca(e, name, w)
+    val at = ForTurns(name, var_ty, w, lo_v, hi, hi_v, inclusive, slot, !no_value(ty), home, else_l,
+                      end_l)
 
-    emit(e, InStore(w, lo_v, home, AccPlain, None))
-    e.loops.push(GenLoop(end_l, step_l, slot, !no_value(ty), e.owned_marks.len(),
+    // A loop whose subscripts a test in front of it can prove runs a copy with their checks left out
+    // where the test passes, and the loop as written where it does not (`bounds_hoist.sysl`).
+    hoist_plan(e, name, var_ty, hi, inclusive, body) match
+        Some(plan) ->
+            val proven_l = fresh_label(e, "for.proven")
+            val checked_l = fresh_label(e, "for.checked")
+
+            emit_term(e, InCondBr(hoist_test(e, plan, name, var_ty, lo_v, hi_v, inclusive), proven_l,
+                                  checked_l))
+            emit_label(e, proven_l)
+            hoist_mark(e, plan, true)
+            gen_for_turns(e, at, body, fresh_label(e, "for.cond"), fresh_label(e, "for.body"),
+                          fresh_label(e, "for.step"))
+            hoist_mark(e, plan, false)
+            emit_label(e, checked_l)
+        None -> ()
+
+    gen_for_turns(e, at, body, cond_l, body_l, step_l)
+    gen_loop_result(e, slot, ty, else_l, end_l, else_block)
+end gen_for
+
+// What every copy of one counted loop shares: its variable and that variable's slot, the range, the
+// result's slot, and where it leaves to.
+private struct ForTurns
+    name: string
+    var_ty: Type
+    w: LType
+    lo_v: Val
+    hi: TExpr
+    hi_v: Val
+    inclusive: bool
+    slot: Val
+    valued: bool
+    home: Val
+    else_l: string
+    end_l: string
+end ForTurns
+
+// One copy of a counted loop, from setting its variable to the branch back to its test.
+private gen_for_turns(e: *Emit, at: ForTurns, body: Buf[TStmt], cond_l: string, body_l: string,
+                      step_l: string)
+    val name = at.name
+    val var_ty = at.var_ty
+    val w = at.w
+    val hi = at.hi
+    val hi_v = at.hi_v
+    val inclusive = at.inclusive
+    val home = at.home
+    val else_l = at.else_l
+
+    emit(e, InStore(w, at.lo_v, home, AccPlain, None))
+    e.loops.push(GenLoop(at.end_l, step_l, at.slot, at.valued, e.owned_marks.len(),
                          e.temp_marks.len(), e.trace_marks.len()))
     emit_term(e, InBr(cond_l))
     emit_label(e, cond_l)
@@ -697,8 +749,7 @@ gen_for(e: *Emit, name: string, var_ty: Type, lo: TExpr, hi: TExpr, inclusive: b
     emit(e, InStore(w, nxt, home, AccPlain, None))
     emit_term(e, InBr(cond_l))
     e.loops.pop()
-    gen_loop_result(e, slot, ty, else_l, end_l, else_block)
-end gen_for
+end gen_for_turns
 
 // The three-clause loop: the counted loop's shape with both fixed parts opened up. `continue`
 // targets the **step** block, which is the whole point of the form.
