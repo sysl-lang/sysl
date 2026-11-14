@@ -172,7 +172,8 @@ print(Limit)
 
 ### A literal binding takes its type from its first use
 
-A local `var` or `val` with no type written whose value is a bare number — `0`, `-1`, `2.5` — takes
+A local `var` or `val` with no type written whose value is a bare number — `0`, `-1`, `2.5`, or an
+[untyped constant](/reference/modules/#untyped-and-typed-constants), the number it stands for — takes
 its type from its **first use that fixes one**: a comparison or arithmetic with an operand that has
 a type of its own, an assignment of such a value or into a typed place, an argument, a `return` or
 the body's result. A counter compared with a length is a `usize`, and an index read with it needs no

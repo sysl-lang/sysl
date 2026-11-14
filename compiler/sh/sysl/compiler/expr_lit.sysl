@@ -78,7 +78,7 @@ int_literal(cx: &Analyzer, span: Span, value: BigInt, suffix: string,
     val fixed = if suffix != "" then fixed_suffixed(cx, span, suffix) else fixed_wanted(expected)
 
     if fixed.is_some() then
-        return fixed_literal(cx, span, to_string(value), Some((value, 0)), fixed.unwrap())
+        return fixed_literal(cx, span, to_string(value), Some((value, 0)), fixed.unwrap(), named)
 
     val float_at = if suffix == "" then float_wanted(expected) else None
 
@@ -97,8 +97,11 @@ end int_literal
 
 // A refused literal as its refusal shows it: `the literal 300`, or `the constant 'N' (300)` where an
 // untyped constant stood for it.
-private literal_named(value: BigInt, named: string) -> string =
-    if named == "" then s"the literal ${to_string(value)}" else s"the constant '$named' (${to_string(value)})"
+private literal_named(value: BigInt, named: string) -> string = literal_shown(to_string(value), named)
+
+// A refused literal, shown as `shown`, as its refusal names it.
+literal_shown(shown: string, named: string) -> string =
+    if named == "" then s"the literal $shown" else s"the constant '$named' ($shown)"
 
 // The floating-point type a position wants an unsuffixed integer literal to be, where it wants one
 // -- seen through a vector, as the literal's integer type is.
@@ -204,14 +207,14 @@ private expected_int(cx: &Analyzer, expected: Option[Type]) -> Type
 end expected_int
 
 // A float literal takes its type from its suffix, else from the expected type when that is a
-// float, else `real`.
+// float, else `real`. `named` is the untyped constant it stands for, as `int_literal`'s is.
 float_literal(cx: &Analyzer, span: Span, text: string, suffix: string,
-              expected: Option[Type]) -> TExpr
+              expected: Option[Type], named: string = "") -> TExpr
     val made = if suffix == "" then new_type_wanted(expected) else None
 
     if made.is_some()
         val base = base_of_new(made.unwrap())
-        val at_base = float_literal(cx, span, text, suffix, Some(base))
+        val at_base = float_literal(cx, span, text, suffix, Some(base), named)
 
         if disagree(texpr_type(at_base), base) then return at_base
 
@@ -227,7 +230,7 @@ float_literal(cx: &Analyzer, span: Span, text: string, suffix: string,
         if refused.is_some() then return cx.err(span, refused.unwrap())
     end if
 
-    if fixed.is_some() then return fixed_literal(cx, span, text, exact_of_text(text), fixed.unwrap())
+    if fixed.is_some() then return fixed_literal(cx, span, text, exact_of_text(text), fixed.unwrap(), named)
 
     val ty = if suffix != "" then suffixed_float(cx, span, suffix) else expected_float(cx, expected)
 
@@ -355,8 +358,10 @@ constructed(t: TExpr) -> bool = *t.kind match
 // **A character literal is adaptable too, though it is not a bare literal**: it has a type of its
 // own, `char`, and keeps it wherever nothing else is said, but beside a `u8` it is that byte -- so
 // `';' == b[i]` takes the byte's type rather than imposing its own.
-adaptable(e: Expr, t: TExpr) -> bool =
-    is_literal(e) || is_char_literal(e) || literal_shaped(e) && constructed(t)
+//
+// **A constant that stands for a character literal is one too** (`char_const_read`).
+adaptable(cx: &Analyzer, e: Expr, t: TExpr) -> bool =
+    is_literal(e) || char_valued(cx, e) || literal_shaped(e) && constructed(t)
 
 // Whether an expression is a character literal, as written.
 is_char_literal(e: Expr) -> bool = *e.kind match

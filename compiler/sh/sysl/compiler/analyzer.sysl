@@ -97,6 +97,20 @@ struct LoopMiss
     else_ty: Option[Type]
 end LoopMiss
 
+// A local `const`: its unique name, the literal its value came to while compiling (what each use of
+// the name is), and the scalar the fold reads it as. `untyped` marks one whose type was left to a
+// literal-valued initializer and `character` one left to a character literal -- each the literal it
+// stands for, read at each use's type (`untyped_const_read`, `char_const_read`). `init` is the
+// initializer as written, which a float is read again from at another float or fixed-point format.
+struct LocalConst
+    unique: string
+    image: TExpr
+    folded: Option[Const]
+    untyped: bool
+    character: bool
+    init: Expr
+end LocalConst
+
 // Everything typing one expression needs.
 struct Analyzer
     an: &Analysis
@@ -373,10 +387,8 @@ struct Analyzer
     // (`consumes.sysl`).
     consume_calls: Buf[ConsumeCall]
 
-    // Every local `const` in scope or out of it, by unique name: the literal its value came to while
-    // compiling, which is what each use of the name is, the scalar the fold reads it as, and whether
-    // it is untyped -- the literal it stands for, read at each use's type (`untyped_const_read`).
-    local_consts: Buf[(string, TExpr, Option[Const], bool)]
+    // Every local `const` in scope or out of it, by unique name (`LocalConst`).
+    local_consts: Buf[LocalConst]
 
     // Where each name in `used` stands, so asking whether one is taken is one lookup; an entry is
     // believed only while `used` still holds that name there, which lets a rewind truncate `used`
@@ -526,18 +538,24 @@ struct Analyzer
     // The literal a local `const` came to, where `unique` names one.
     const_local(self, unique: string) -> Option[(TExpr, Option[Const])]
         for item in self.local_consts
-            if item.0 == unique then return Some((item.1, item.2))
+            if item.unique == unique then return Some((item.image, item.folded))
 
         None
     end const_local
 
-    // Whether `unique` names a local `const` whose type was left to a literal-valued initializer.
-    untyped_const_local(self, unique: string) -> bool
+    // The local `const` `unique` names, where it names one.
+    local_const(self, unique: string) -> Option[LocalConst]
         for item in self.local_consts
-            if item.0 == unique then return item.3
+            if item.unique == unique then return Some(item)
 
-        false
-    end untyped_const_local
+        None
+    end local_const
+
+    // Whether `unique` names a local `const` whose type was left to a literal-valued initializer.
+    untyped_const_local(self, unique: string) -> bool = self.local_const(unique).map(c -> c.untyped).unwrap_or(false)
+
+    // Whether `unique` names a local `const` whose type was left to a character literal.
+    char_const_local(self, unique: string) -> bool = self.local_const(unique).map(c -> c.character).unwrap_or(false)
 
     // Takes the nearest value-argument binding of a local `const` out of the substitution.
     private unbind_const(*self, name: string)

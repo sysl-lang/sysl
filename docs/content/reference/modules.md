@@ -1846,7 +1846,10 @@ type from — arithmetic, a comparison, an argument, an initializer or an assign
 range bound, a `return`, an array length and a pattern. "No type of its own" means a literal,
 arithmetic or a shift over literals, an `if` or a `match` of them, or another untyped constant;
 `const K = 3 * 4` is untyped and `const B = u8(3)` is a byte. A float constant is the float format
-its position wants, and an integer one meets a float as an integer literal does.
+its position wants -- an `f32`, an `f128` or a fixed-point type, read from its text as the literal
+would be -- and an integer one meets a float as an integer literal does. A binding of one, `val n =
+N`, [takes its type from its first use](/reference/declarations/#a-literal-binding-takes-its-type-from-its-first-use) exactly as `val n = 7`
+does.
 
 ```sysl
 const limit = 1000
@@ -1869,6 +1872,33 @@ print(take(limit), i < limit, b + lanes, scale * lanes)
 1001 true 254 2
 ```
 
+**A constant left to a character literal is that literal too**: `const Semi = ';'` is a `char` where
+nothing says otherwise, and beside a `u8`, as one's argument, initializer, result or pattern, the
+byte 59 — as `';'` is. Given a type, `const Semi: char = ';'`, it is a `char` everywhere. A float
+constant at a fixed-point or `f128` position is read from its text, so `Tenth` below is exactly the
+`f128` the literal `0.1` is, not a double's 53 bits of it.
+
+```sysl
+const Semi = ';'
+const Half = 0.5
+const Tenth = 0.1
+
+val line = "a;b;c"
+val q: q15 = Half
+val w: f128 = Tenth
+val exact: f128 = 0.1
+var count = 0
+
+for b in line.bytes
+    if b == Semi then count += 1
+
+print(count, Semi, q, w == exact)
+```
+
+```output
+2 ; 0.5 true
+```
+
 **It is refused where its literal would be**, and the refusal names it:
 
 ```sysl
@@ -1879,6 +1909,18 @@ val b: u8 = limit
 
 ```error
 the constant 'limit' (1000) does not fit u8
+```
+
+and so is a float constant a fixed-point type does not hold:
+
+```sysl
+const gain = 1.5
+
+val g: q15 = gain
+```
+
+```error
+the constant 'gain' (1.5) does not fit q15, whose range is -1 to 0.99997
 ```
 
 **A constant written with a type is a value of that type**, as a `val` of it is, and never adapts:
