@@ -793,6 +793,41 @@ run() -> *int
 'field(&s)' is returned, but it holds the address of a local of 'run', whose storage ends when 'run' returns
 ```
 
+**What a value is built of goes wherever any part of it is read out**: a field of a struct or a
+tuple, and an element of an array, a literal's or a local's, is the value it was built from. So
+`[&y][0]` is `&y`, and a closure placed in an array literal and read back out of it is the same closure
+— one that a callee keeps lives on the heap, as it would if it had never been in the array:
+
+```sysl
+leak(n: int) -> *int
+    var y = n
+    [&y][0]
+```
+
+```error
+'[&y][0]' is returned, but it holds the address of a local of 'leak', whose storage ends when 'leak' returns
+```
+
+```sysl
+struct Owner
+    n: int
+
+struct Holder
+    act: &Fn() -> int
+
+kept(run: &Fn(int) -> int) -> &Holder = Holder(() -> run(1))
+
+make(o: &Owner) -> &Holder = [kept(k -> k + o.n)][0]
+
+main()
+    val h = make(Owner(41))
+    print((h.act)())
+```
+
+```output
+42
+```
+
 A pointer the callee **read out of** what it was handed — `q.first()` answering `self.head` — is
 somebody else's address, and is the caller's to keep.
 
