@@ -775,6 +775,7 @@ easy. While any copy lives the descriptor stays open.
 | `size` | `size(*self) -> Result[long, IoError]` | How many bytes the file holds. |
 | `at_end` | `at_end(*self) -> bool` | Whether a read has already run off the end. |
 | `truncate` | `truncate(*self, length: long) -> Result[unit, IoError]` | The file cut to a length, or extended to one with zeroes -- the one thing this surface could not do, having `seek` and `size` and no way to change what is there. |
+| `read_failure` | `read_failure(*self) -> Option[IoError]` | What the file latched when a read failed, as the same `IoError` -- the system's own wording and `errno` -- that a whole-file read answers, or `None` while `failed` is false. |
 
 ### `FileState`
 

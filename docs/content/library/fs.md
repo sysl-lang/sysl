@@ -597,6 +597,46 @@ close it too early. So `got.len` is 0 **and** `failed()` is true, and the two to
 A failure from `close` is a real one, incidentally: the flush it performs is where a full disk finally
 reports. A program that cares about its output checks the close and not only the writes.
 
+### Why a read came back empty
+
+`read` hands back an empty slice for the end of the input and for a failure alike, and `failed` says
+only that something went wrong. **`read_failure` says what**: the same `IoError` — the system's words
+and its `errno` — that a whole-file read answers for the same cause, or `None` while nothing has failed.
+
+```sysl
+import sysl.fs.{IoError, open}
+import sysl.io.Reader
+
+var f = open("/tmp").unwrap()
+
+print(f.read_failure().is_none())
+
+var window: [8]u8
+var got = f.read(window)
+
+print(got.len, f.failed())
+
+val why = f.read_failure().unwrap()
+
+print(why.code(), why == IoError.IsADirectory)
+print(f.read(window).len, f.read_failure().unwrap().code())
+```
+
+```output
+true
+0 true
+21 true
+0 21
+```
+
+It is `None` before any read and after a clean read to the end, since the end of the input is not a
+failure. Once a read has failed the answer stays, and a later read that fails again replaces it with its
+own. Reading a file opened write-only reports what the system says (`EBADF`); reading a closed file
+reports `NotOpen`, while closing a file that had failed on nothing leaves it `None`. A failure that
+arrives after some bytes were already read is held back until those are handed out, so it shows here
+once the read that tells it has returned. `failed` is one latch for reads and writes, so a failed write
+is answered here as well.
+
 ### Copies share one handle
 
 A `File` is a struct and therefore a value, so passing one to a function makes a second `File`. It
