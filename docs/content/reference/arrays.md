@@ -631,9 +631,10 @@ turn between is then in range too. A loop that runs no turn passes it.
 Anything else keeps its check on every turn, in both copies: an index with a `*`, one reading the
 variable twice, one through a call. A loop is not copied at all where its body writes its variable or
 reaches it by address, holds a loop of its own, returns, uses `?` or `defer`, is in an `async`
-function, or is long; nor where the only subscript is `xs[j]` with `j` running below `xs.len`, whose
-check is the loop's own condition and is folded anyway. An index the body moves is checked where it
-is read:
+function, or is long; nor where the only subscripts are `xs[j]` with `j` running below `xs.len`, whose
+check is the loop's own condition and is folded anyway, and `ys[j]` past an
+`if xs.len != ys.len then return …` that made the two one length, which folds the same way. An index
+the body moves is checked where it is read:
 
 ```sysl
 show(xs: []const int)

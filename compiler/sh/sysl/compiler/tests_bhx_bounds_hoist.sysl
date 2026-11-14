@@ -159,6 +159,71 @@ bhx_plain_walk_not_copied()
         print(walk([1, 2, 3]))
         """, "@walk$", 1)
 
+// `sysl.crypto.verify`'s loop: past `if a.len != b.len then return`, `b[i]` below `a.len` folds as
+// `a[i]` does, so the loop is lowered once, both checks in it.
+private const bhx_verify: string = raw"""
+    @noinline
+    differ(a: []const u8, b: []const u8) -> u8
+        GUARD
+
+        var diff: u8 = 0
+
+        for i in 0..<a.len do diff |= a[i] ^ b[i]
+
+        diff
+
+    print(differ("ab".bytes, "ab".bytes))
+    """
+
+@test("a second view a guard made the loop's length is not copied, in either order and inside an ||")
+bhx_same_length_not_copied()
+    for guard in ["if a.len != b.len then return 1", "if b.len != a.len then return 1",
+                  "if a.len == 0 || a.len != b.len then return 1",
+                  "if a.len != b.len || a.len == 0 then return 1"]
+        bhx_kept(replace_all(bhx_verify, "GUARD", guard), "@differ$", 2)
+
+@test("unguarded, or past a guard that stays, shows no equal length or has ended, the loop is copied")
+bhx_same_length_unproved_copied()
+    for guard in ["print(0)", "if a.len != b.len then print(1)", "if a.len != 2 then return 1",
+                  "if a.len == b.len then return 1", "if a.len < b.len then return 1"]
+        bhx_hoisted(replace_all(bhx_verify, "GUARD", guard), "@differ$", 2)
+
+    // A guard inside a block that has ended says nothing past it.
+    bhx_hoisted(raw"""
+        @noinline
+        differ(a: []const u8, b: []const u8, strict: bool) -> u8
+            if strict
+                if a.len != b.len then return 1
+
+            var diff: u8 = 0
+
+            for i in 0..<a.len do diff |= a[i] ^ b[i]
+
+            diff
+
+        print(differ("ab".bytes, "ab".bytes, true))
+        """, "@differ$", 2)
+
+    // A view written after the guard is no longer known to be the other's length, whatever it is
+    // given.
+    bhx_hoisted(raw"""
+        @noinline
+        differ(a: []const u8, b: []const u8, c: []const u8) -> u8
+            var y = b
+
+            if a.len != y.len then return 1
+
+            y = c
+
+            var diff: u8 = 0
+
+            for i in 0..<a.len do diff |= a[i] ^ y[i]
+
+            diff
+
+        print(differ("ab".bytes, "ab".bytes, "ac".bytes))
+        """, "@differ$", 2)
+
 @test("a view the body reassigns, an offset it writes, and one written through a pointer are not proved")
 bhx_written_not_copied()
     bhx_kept(raw"""
@@ -410,3 +475,29 @@ bhx_revcomp_computes()
         print(out.len())
         print(out[0], out[4], out[8], out[out.len() - 2])
         """, "18\n103 100 97 97\n")
+
+@test("two views a guard made one length are walked together and compared, whatever their lengths")
+bhx_same_length_computes()
+    bhx_prints(raw"""
+        differ(a: []const u8, b: []const u8) -> u8
+            if a.len != b.len then return 255
+
+            var diff: u8 = 0
+
+            for i in 0..<a.len do diff |= a[i] ^ b[i]
+
+            diff
+
+        print(differ("abc".bytes, "abc".bytes), differ("abc".bytes, "abd".bytes))
+        print(differ("abc".bytes, "ab".bytes), differ("".bytes, "".bytes))
+        """, "0 7\n255 0\n")
+
+@test("past a guard that does not leave, the shorter second view stops at its own length")
+bhx_guard_that_stays_traps()
+    bhx_traps(raw"""
+        show(a: []const u8, b: []const u8)
+            if a.len != b.len then print("differ")
+            for i in 0..<a.len do print(a[i] ^ b[i])
+
+        show("ab".bytes, "a".bytes)
+        """, "differ\n0\n", "index 1 out of bounds for length 1 (main.sysl:3:41)\n")

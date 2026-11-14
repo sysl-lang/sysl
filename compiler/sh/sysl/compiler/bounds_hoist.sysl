@@ -33,7 +33,10 @@ import sysl.math.bigint.from_int
 // than `HoistBodyLimit` nodes is not copied, and neither is an `async` body.
 //
 // **Where LLVM can already prove the check** -- `xs[j]` with `j` running below `xs.len` -- nothing is
-// copied for it: the check is the loop's own condition, and folds before anything else runs.
+// copied for it: the check is the loop's own condition, and folds before anything else runs. The same
+// holds of `ys[j]` where a guard in force has shown `ys` and `xs` one length
+// (`if xs.len != ys.len then return …`, `nowrap.sysl`): the comparison `sysl.crypto.verify` makes
+// before walking two views together, whose loop stays one copy with no test in front.
 
 // The largest body, in expression nodes, worth a second copy.
 const HoistBodyLimit: int = 400
@@ -111,7 +114,7 @@ hoist_plan(e: *Emit, name: string, var_ty: Type, hi: TExpr, inclusive: bool,
 
         hoist_sub(e, name, receiver, index, body) match
             Some(h) ->
-                if !hoist_folds_alone(name, hi, inclusive, receiver, index) then worth = true
+                if !hoist_folds_alone(e, name, hi, inclusive, receiver, index) then worth = true
 
                 found.push(h)
             None -> ()
@@ -180,9 +183,9 @@ private hoist_affine(e: *Emit, name: string, x: TExpr, bits: int, signed: bool,
         _ -> false
 end hoist_affine
 
-// `xs[j]` in a loop `for j in lo..<xs.len`: the check is the loop's own condition, which LLVM folds
-// with nothing copied.
-private hoist_folds_alone(name: string, hi: TExpr, inclusive: bool, receiver: TExpr,
+// `xs[j]` in a loop `for j in lo..<xs.len`, or `ys[j]` there past a guard that made `ys` and `xs` one
+// length: the check is the loop's own condition, which LLVM folds with nothing copied.
+private hoist_folds_alone(e: *Emit, name: string, hi: TExpr, inclusive: bool, receiver: TExpr,
                           index: TExpr) -> bool
     if inclusive then return false
 
@@ -206,7 +209,9 @@ private hoist_folds_alone(name: string, hi: TExpr, inclusive: bool, receiver: TE
             _ -> None
         _ -> None
 
-    unsigned && view.is_some() && bound.is_some() && view.unwrap() == bound.unwrap()
+    if !unsigned || view.is_none() || bound.is_none() then return false
+
+    view.unwrap() == bound.unwrap() || nowrap_same_len(e, view.unwrap(), bound.unwrap())
 end hoist_folds_alone
 
 // The test in front of the loop: true where the loop runs no turn, or where every subscript of the
