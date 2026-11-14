@@ -68,9 +68,17 @@ struct NoWrap
     // Whether the body was scanned. One that was not (an entry point, a synthesised body) proves
     // nothing beyond what its operands' own forms say.
     ready: bool
+
+    // The parameters and the locals a `val` or `var` declares: the names a read of which is the
+    // value in the name's own slot, and nothing behind it (`bounds_hoist.sysl`).
+    plain: Set[string]
+
+    // The subscripts, by `node_id` of the index, that the copy of a counted loop being lowered has
+    // proved in range before the loop began (`bounds_hoist.sysl`).
+    proven: Set[usize]
 end NoWrap
 
-no_wrap_none() -> NoWrap = NoWrap(set(), set(), set(), buf(), buf(), 0, 0, false)
+no_wrap_none() -> NoWrap = NoWrap(set(), set(), set(), buf(), buf(), 0, 0, false, set(), set())
 
 // What a walk over a body found.
 private struct NwScan
@@ -155,7 +163,42 @@ nowrap_begin(e: *Emit, f: TFunc)
 
     for d in s.decls
         if !s.twice.has(d) && !s.written.has(d) && !s.escaped.has(d) then e.nowrap.once.add(d)
+
+        e.nowrap.plain.add(d)
+
+    for p in f.params
+        e.nowrap.plain.add(p.0)
 end nowrap_begin
+
+// Whether `name` holds one value for the whole of a loop whose body is `body`: a parameter or a
+// declared local, or the variable of a counted loop around this one, that nothing reaches by address
+// and that the body neither writes nor declares.
+nowrap_steady(e: *Emit, name: string, body: Buf[TStmt]) -> bool
+    if !e.nowrap.ready || e.nowrap.escaped.has(name) then return false
+
+    var known = e.nowrap.plain.has(name)
+
+    for f in e.nowrap.fors
+        if f.name == name then known = true
+
+    if !known then return false
+
+    for st in body
+        if nw_touches(nw_writes(st), name) then return false
+
+    true
+end nowrap_steady
+
+// Whether a counted loop's own variable runs untouched by its body, so takes exactly the values its
+// range gives it.
+nowrap_untouched(e: *Emit, name: string, body: Buf[TStmt]) -> bool
+    if !e.nowrap.ready || e.nowrap.escaped.has(name) then return false
+
+    for st in body
+        if nw_touches(nw_writes(st), name) then return false
+
+    true
+end nowrap_untouched
 
 // What one statement writes, declares or takes the address of, anywhere inside it.
 private nw_writes(st: TStmt) -> &NwScan

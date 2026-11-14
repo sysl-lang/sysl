@@ -1,0 +1,91 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+
+// **A frozen buffer's count is chosen the way a construction's is** (`reference/memory.md § A frozen
+// buffer crosses`). `freeze()` answers a `&Frozen[T]` of any element; where its position expects a
+// `&sync Frozen[T]` -- an annotation, a parameter, a field -- the call is made to the member that
+// allocates the box with an atomic count instead, and that call's answer is asked the sharing rule as
+// any `&sync Frozen[T]` is. `view()`, which keeps the buffer alive past the call, is likewise the
+// member its receiver's count calls for. The library declares each pair (`library/sysl/buf/`); a
+// program writes only the first name of it, and is only ever told of that one.
+
+private frozen_buf_base() -> string = module_qualify("sysl.buf", "Buf")
+
+// The member a call written as `chosen` on `base` is made to, at the receiver it is called on and the
+// type its position expects.
+counted_member(cx: &Analyzer, base: string, chosen: string, receiver: Type, expected: Option[Type]) -> string
+    if base == frozen_buf_base() && chosen == "freeze" && expects_shared_frozen(cx, expected) then return "freeze_shared"
+
+    if base == frozen_base() && chosen == "view" && shared_receiver(receiver) then return "view_shared"
+
+    chosen
+end counted_member
+
+// The reference a position expects. **A position expecting a `&T` reads what is written there at the
+// `T`**, with the box it wants beside it (`Analyzer.boxing`), since that is how a construction is read
+// into one -- so the box is the answer where the expectation is its payload.
+private expected_reference(cx: &Analyzer, expected: Option[Type]) -> Option[Type]
+    if expected.is_none() then return None
+
+    val t = expected.unwrap()
+
+    underlying(t) match
+        Ref(_, _) -> return Some(t)
+        _ -> ()
+
+    if cx.boxing.is_none() then return None
+
+    cx.boxing.unwrap() match
+        Ref(inner, _) -> if type_eq(*inner, t) then cx.boxing else None
+        _ -> None
+end expected_reference
+
+// Whether a position expects a frozen buffer with an atomic count.
+private expects_shared_frozen(cx: &Analyzer, expected: Option[Type]) -> bool =
+    expected_reference(cx, expected) match
+        Some(t) -> underlying(t) match
+            Ref(inner, sync) -> sync && frozen_element(*inner).is_some()
+            _ -> false
+        None -> false
+
+// Whether a receiver is reached through a `&sync` reference.
+private shared_receiver(t: Type) -> bool = underlying(t) match
+    Ref(_, sync) -> sync
+    _ -> false
+
+// The element type of a frozen buffer's struct, or `None` for any other type.
+private frozen_element(t: Type) -> Option[Type] = underlying(t) match
+    Struct(d) -> if d.base == frozen_base() && d.targs.len() == 1 then Some(d.targs[0]) else None
+    _ -> None
+
+// **`buf().freeze()` where a frozen buffer is expected** reads its receiver as the buffer of that
+// element, which is what lets the element be inferred from the parameter or the field the frozen
+// buffer is handed to. Only a receiver that cannot settle its type alone is read so: one that can is
+// left to say what it is.
+frozen_receiver(cx: &Analyzer, receiver: Expr, member: string, args: Buf[Expr],
+                expected: Option[Type]) -> Option[TExpr]
+    if member != "freeze" || !args.is_empty() then return None
+
+    val position = expected_reference(cx, expected)
+
+    if position.is_none() then return None
+
+    val elem = underlying(position.unwrap()) match
+        Ref(inner, _) -> frozen_element(*inner)
+        _ -> None
+
+    if elem.is_none() || mentions_unknown(elem.unwrap()) then return None
+
+    if texpr_type(sandboxed_read(cx, receiver, None)) != Unknown then return None
+
+    var targs: Buf[Type] = buf()
+
+    targs.push(elem.unwrap())
+
+    val want = reinstantiate_at(cx.an, cx.scope, receiver.span, frozen_buf_base(), targs)
+
+    if want == Unknown then return None
+
+    Some(type_expr(cx, receiver, Some(want)))
+end frozen_receiver

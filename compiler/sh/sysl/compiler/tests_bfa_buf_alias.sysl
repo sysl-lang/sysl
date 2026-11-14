@@ -422,6 +422,18 @@ private bfa_appends() -> string = raw"""
     reversed_into(seq: []const u8, out: Buf[u8])
         for j in 0..<seq.len do out.push(seq[seq.len - 1 - j])
 
+    @noinline
+    reversed_lines(seq: []const u8, out: Buf[u8])
+        var i = seq.len
+
+        while i > 0
+            val width = if i > 60 then 60 else i
+
+            for j in 0..<width do out.push(seq[i - 1 - j])
+
+            out.push(u8('\n'))
+            i -= width
+
     main()
         val b: Buf[u8] = buf()
         val w: Buf[int] = buf()
@@ -432,6 +444,7 @@ private bfa_appends() -> string = raw"""
         nested(n)
         copy_into(b.view(), b)
         reversed_into(b.view(), b)
+        reversed_lines(b.view(), b)
         print(b.len(), w.len(), n.len(), own(2))
     """
 
@@ -475,17 +488,40 @@ bfa_append_loop_keeps_the_header()
         None -> ()
         Some(out) -> bfa_header_kept(bfa_body(out, "demo$copy_into"))
 
-// The same loop reading its source back to front -- revcomp's inner loop. The subscript's bounds check
-// is provably true here, but it is folded only after the pass that would carry the header around the
-// loop, and until then it is a branch out of the loop that stops that pass; so the count and the
-// capacity are still read for every element.
-@test("at -O2 an append loop reading its source back to front keeps the header in registers", ignore: "the bounds check of seq[seq.len - 1 - j] is folded after GVN, and blocks its load PRE")
+// The same loop reading its source back to front. A subscript's bounds check is a branch out of the
+// loop, which stops the pass that would carry the header around it; this one is proved by a test in
+// front of the loop instead (`bounds_hoist.sysl`), which LLVM folds to true, so the one loop left has
+// no check in it.
+@test("at -O2 an append loop reading its source back to front keeps the header in registers")
 bfa_reversed_append_loop_keeps_the_header()
     if bfa_no_library() then return
 
     bfa_optimized(bfa_appends()) match
         None -> ()
-        Some(out) -> bfa_header_kept(bfa_body(out, "demo$reversed_into"))
+        Some(out) ->
+            val body = bfa_body(out, "demo$reversed_into")
+
+            bfa_header_kept(body)
+            assert(!body.contains("sysl_bounds_fail"), body)
+
+// revcomp's own loop: the index reads below `i`, which the loop around it moves, so the test in front
+// of the loop is made each time it is entered, and the loop as written stays beside the copy for when
+// it fails. The copy keeps the header in registers.
+@test("at -O2 revcomp's append loop, proved before it starts, keeps the header in registers")
+bfa_reversed_lines_keep_the_header()
+    if bfa_no_library() then return
+
+    bfa_optimized(bfa_appends()) match
+        None -> ()
+        Some(out) ->
+            val body = bfa_body(out, "demo$reversed_lines")
+            var kept = 0
+
+            for l in bfa_loops(body)
+                if bfa_keeps(l) then kept += 1
+
+            assert(kept >= 1, body)
+            assert(body.contains("sysl_bounds_fail"), body)
 
 // Every loop of an append body reads no count or capacity off the growth path.
 private bfa_header_kept(body: string)
@@ -494,14 +530,17 @@ private bfa_header_kept(body: string)
     assert(!loops.is_empty(), body)
 
     for l in loops
-        val hot = bfa_off_growth(l)
-
-        assert(bfa_lines(hot, ["store i8"]).len() == 1, l)
-        assert(bfa_lines(hot, [" = load i64"]).is_empty(), l)
-        assert(bfa_lines(hot, [" = load ptr"]).len() <= 1, l)
-        assert(bfa_lines(l, ["call", "grow_store"]).len() == 1, l)
-        assert(bfa_lines(l, [" = load i64"]).len() == 2, l)
+        assert(bfa_keeps(l), l)
 end bfa_header_kept
+
+// Whether a loop of an append body reads no count or capacity off the growth path.
+private bfa_keeps(l: string) -> bool
+    val hot = bfa_off_growth(l)
+
+    bfa_lines(hot, ["store i8"]).len() == 1 && bfa_lines(hot, [" = load i64"]).is_empty() &&
+        bfa_lines(hot, [" = load ptr"]).len() <= 1 && bfa_lines(l, ["call", "grow_store"]).len() == 1 &&
+        bfa_lines(l, [" = load i64"]).len() == 2
+end bfa_keeps
 
 // The blocks of a loop's text other than the one that calls the growth.
 private bfa_off_growth(text: string) -> string
