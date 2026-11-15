@@ -1830,8 +1830,11 @@ private eval_rest(r: &EvRun, e: TExpr) -> Flow
         TShuffle(receiver, second, lanes, _) -> shuffle_lanes(r, receiver, second, lanes)
         TLaneSet(receiver, lanes, value, _) -> lane_set(r, receiver, lanes, value)
         TReduce(op, receiver, ty) -> reduce(r, e.span, op, receiver, ty)
-        TVecOp(op, _, _) -> refuse_form(r, e.span, s"a vector's lane-wise '${vec_op_method(op)}' is " +
-                                        "known only where the program runs")
+        TVecOp(op, operands, ty) ->
+            if op == "bits" || op == "lookup" || op == "compress" || op == "gather" || op == "gather_unchecked" then
+                lane_moves(r, e.span, op, operands, ty)
+            else refuse_form(r, e.span, s"a vector's lane-wise '${vec_op_method(op)}' is " +
+                             "known only where the program runs")
         TVecLoad(receiver, index, vec_ty) -> vector_load(r, receiver, index, vec_ty)
         TVecStore(receiver, index, value) -> vector_store(r, receiver, index, value)
         TForEach(name, _, items, body, else_block, _) -> ev_for_each(r, e.span, name, items, body, else_block)
@@ -2652,6 +2655,86 @@ private reduce(r: &EvRun, at: Span, op: string, receiver: TExpr, ty: Type) -> Fl
 
     EvGave(acc)
 end reduce
+
+// The lane moves a `const` function can follow exactly, since none of them depends on the machine:
+// `m.bits()`, lane `i` at bit `i`; `table.lookup(idx)`, zero past the table's end; `v.compress(m)`,
+// the kept lanes first and zeros after; `xs.gather(idx)`, each position checked as a subscript is.
+@noinline
+private lane_moves(r: &EvRun, at: Span, op: string, operands: Buf[TExpr], ty: Type) -> Flow
+    val first = eval_value(r, operands[0]) match
+        Ok(v) -> v
+        Err(f) -> return f
+
+    if op == "bits"
+        val xs = lanes_of(first)
+        var acc = from_int(0)
+        var i = xs.len()
+
+        while i > 0
+            i -= 1
+            acc = add(acc, acc)
+
+            xs[i] match
+                ConstBool(true) -> acc = add(acc, from_int(1))
+                _ -> ()
+
+        return EvGave(ConstInt(acc))
+    end if
+
+    val second = eval_value(r, operands[1]) match
+        Ok(v) -> lanes_of(v)
+        Err(f) -> return f
+
+    val zero = zero_value(r, at, element(repr(ty)).unwrap_or(Unknown)) match
+        EvGave(z) -> z
+        other -> return other
+
+    var out: Buf[Const] = buf()
+
+    if op == "compress"
+        val xs = lanes_of(first)
+
+        for k in 0..<xs.len()
+            second[k] match
+                ConstBool(true) -> out.push(copied(xs[k]))
+                _ -> ()
+
+        while out.len() < xs.len()
+            out.push(copied(zero))
+
+        return EvGave(ConstArray(out))
+    end if
+
+    // A lookup reads the table's lanes; a gather the elements the receiver holds.
+    var xs = lanes_of(first)
+    var lo = usize(0)
+    var len = xs.len()
+
+    if op != "lookup"
+        first match
+            ConstView(found, from, count, _) ->
+                xs = found
+                lo = from
+                len = count
+            ConstArray(_) -> ()
+            _ -> return refuse_form(r, operands[0].span, s"a gather from a " +
+                                    s"'${type_show(texpr_type(operands[0]))}' while compiling")
+    end if
+
+    for k in 0..<second.len()
+        val i = second[k] match
+            ConstInt(v) -> v
+            _ -> return refuse_form(r, at, "a position that is not an integer")
+
+        val inside = cmp(i, from_int(0)) >= 0 && cmp(i, from_int(long(len))) < 0
+
+        if inside then out.push(copied(xs[lo + usize(i.to_long().unwrap_or(0))]))
+        else if op == "lookup" then out.push(copied(zero))
+        else return trap(r, operands[1].span, s"index ${to_string(i)} out of bounds for length $len")
+    end for
+
+    EvGave(ConstArray(out))
+end lane_moves
 
 // The method a lane-wise vector operation was written as, for a refusal.
 private vec_op_method(op: string) -> string = op match

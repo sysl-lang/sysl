@@ -4,8 +4,9 @@ import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.math.bigint.{BigInt, from_int, to_string}
 
-// The ten methods a vector answers to (the lane-wise ones, `abs`, `mul_add`, `maximum` and `minimum`,
-// among them), the two a run of them in memory does, and the comparison that yields a mask.
+// The fourteen methods a vector answers to (the lane-wise ones, `abs`, `mul_add`, `maximum` and
+// `minimum`, among them, and `bits`, `lookup` and `compress`), the three a run of them in memory does,
+// and the comparison that yields a mask.
 //
 // None of it is a *lookup*: nothing declares `select` or `sum`, so there is no member to find and no
 // overload set to narrow -- the name is recognised, the lanes are checked, and one node is built.
@@ -18,12 +19,12 @@ import sysl.math.bigint.{BigInt, from_int, to_string}
 is_vector_method(name: string) -> bool =
     name == "select" || name == "shuffle" || name == "sum" || name == "min" || name == "max" ||
         name == "any" || name == "all" || name == "abs" || name == "mul_add" || name == "maximum" ||
-        name == "minimum"
+        name == "minimum" || name == "bits" || name == "lookup" || name == "compress"
 
-// The two names a slice or an array answers with a vector's lanes. They are the *receiver's* methods
-// and not the vector's, because what a load needs is an address and a length and a vector has
-// neither.
-is_vector_memory(name: string) -> bool = name == "load" || name == "store"
+// The three names a slice or an array answers with a vector's lanes. They are the *receiver's*
+// methods and not the vector's, because what a load or a gather needs is an address and a length and
+// a vector has neither.
+is_vector_memory(name: string) -> bool = name == "load" || name == "store" || name == "gather"
 
 // Whether the type is a vector, asked of a representation.
 is_vector(t: Type) -> bool = t match
@@ -137,6 +138,21 @@ vector_method(cx: &Analyzer, span: Span, v: Type, tr: TExpr, name: string,
     val is_mask = lane == Bool
 
     if name == "shuffle" then return vector_shuffle(cx, span, v, parts.0, elem, tr, args)
+    if name == "lookup" then return vector_lookup(cx, span, v, parts.0, elem, tr, args)
+    if name == "compress" then return vector_compress(cx, span, v, parts.0, tr, args)
+
+    if name == "bits"
+        if !is_mask then
+            return cx.err(span, s"'bits' reads a mask's lanes as the bits of an integer, so it is read " +
+                          s"off a mask — the '<${parts.0}>bool' a comparison yields, as in " +
+                          s"'(a == b).bits()'. ${type_show(v)} is not one")
+
+        if !args.is_empty() then
+            cx.fault(span, s"'bits' takes no arguments — it reads the lanes of the ${type_show(v)} it is " +
+                     "read off")
+
+        return TExpr(span, TVecOp("bits", one_operand(tr), Integer(parts.0, false, false)))
+    end if
 
     if name == "select"
         if !is_mask then
@@ -434,6 +450,96 @@ private vector_shuffle(cx: &Analyzer, span: Span, v: Type, n: int, elem: Type, t
     TExpr(span, TShuffle(tr, second, lanes.unwrap(), Vector(int(lanes.unwrap().len()), elem)))
 end vector_shuffle
 
+// The vector of positions a `lookup` or a `gather` reads at: an integer vector, read as itself. A
+// position is a number computed at run time -- that is the whole difference from a `shuffle` -- so a
+// written list is refused toward the `shuffle` it should have been, and a form whose type its position
+// supplies (`xs.load(i)`) is told by the `load`'s own complaint that nothing here says how wide.
+// Answers the positions and their lane count, or nothing where a complaint has been made.
+private lane_positions(cx: &Analyzer, span: Span, name: string, form: string,
+                       args: Buf[Expr]) -> Option[(TExpr, int)]
+    if args.len() != 1
+        cx.fault(span, s"'$name' takes one argument, the vector of positions to read at — '$form', " +
+                 s"and ${quantity(args.len(), "argument")} were given")
+        return None
+    end if
+
+    val tx = type_expr(cx, args[0], None)
+    val xt = repr(texpr_type(tx))
+
+    if xt == Unknown then return None
+
+    val parts = xt match
+        Vector(n, e) -> (n, underlying(*e))
+        _ -> (0, Unknown)
+
+    val integral = parts.1 match
+        Integer(_, _, _) -> true
+        _ -> false
+
+    if !integral
+        val instead = xt match
+            Array(_, _) -> " — positions known while compiling are a 'shuffle', and positions computed " +
+                           "at run time are a vector of them, such as '<16>u8'"
+            _ -> ""
+
+        cx.fault(args[0].span, s"'$name' reads at a vector of integer positions, and this is " +
+                 s"${type_show(texpr_type(tx))}$instead")
+        return None
+    end if
+
+    Some((tx, parts.0))
+end lane_positions
+
+// `table.lookup(idx)` -- every lane of `idx` names a lane of `table`, read at run time: the dynamic
+// byte shuffle (`tbl` on AArch64, `pshufb` on x86). **A position outside the table answers zero**, as
+// `tbl` does, rather than trapping: a register traps as a whole or not at all, and the instruction's
+// own answer for an index out of range is the one every table-driven kernel (a byte-class lookup, a
+// nibble table) is written against. A negative position is out of range. The answer is as wide as
+// `idx` and holds the table's lanes.
+private vector_lookup(cx: &Analyzer, span: Span, v: Type, n: int, elem: Type, tr: TExpr,
+                      args: Buf[Expr]) -> TExpr
+    val found = lane_positions(cx, span, "lookup", "table.lookup(idx)", args)
+
+    if found.is_none() then return bad_expr(span)
+
+    val (idx, m) = found.unwrap()
+
+    var ops: Buf[TExpr] = buf()
+
+    ops.push(tr)
+    ops.push(idx)
+    TExpr(span, TVecOp("lookup", ops, Vector(m, elem)))
+end vector_lookup
+
+// `v.compress(m)` -- the lanes of `v` where `m` is true, in order, packed into the low lanes, and
+// zero in the rest. The count kept is `m.bits().count_ones()`. **The other lanes are zero rather than
+// left unspecified**: a register has no lane that holds nothing, and a defined answer is what lets
+// the whole vector be stored at the end of a selection and the next one overwrite its tail.
+private vector_compress(cx: &Analyzer, span: Span, v: Type, n: int, tr: TExpr,
+                        args: Buf[Expr]) -> TExpr
+    if args.len() != 1 then
+        return cx.err(span, s"'compress' takes the mask of lanes to keep — 'v.compress(m)', and " +
+                      s"${quantity(args.len(), "argument")} were given")
+
+    val tm = type_expr(cx, args[0], None)
+    val mt = repr(texpr_type(tm))
+
+    if mt == Unknown then return bad_expr(span)
+
+    val want = Vector(n, Bool)
+
+    if !type_eq(mt, want) then
+        return cx.err(args[0].span, s"'compress' keeps the lanes a mask says to, so it takes the " +
+                      s"'<$n>bool' a comparison of ${type_show(v)} yields, and this is " +
+                      s"${type_show(texpr_type(tm))}")
+
+    var ops: Buf[TExpr] = buf()
+
+    ops.push(tr)
+    ops.push(tm)
+    TExpr(span, TVecOp("compress", ops, v))
+end vector_compress
+
 // The lanes a swizzle names: one to four of `x y z w`, lanes 0 to 3. A name with any other letter
 // is an ordinary member, which is what keeps `len` and every trait's names where they were.
 swizzle_lanes(name: string) -> Option[Buf[int]]
@@ -646,6 +752,7 @@ vector_memory(cx: &Analyzer, span: Span, rty: Type, tr: TExpr, name: string, arg
                       "to move")
 
     if name == "load" then return vector_load(cx, span, rty, tr, elem, args, expected)
+    if name == "gather" then return vector_gather(cx, span, rty, tr, elem, args)
 
     vector_store(cx, span, rty, tr, elem, args)
 end vector_memory
@@ -718,6 +825,28 @@ private vector_load(cx: &Analyzer, span: Span, rty: Type, tr: TExpr, elem: Type,
 
     TExpr(span, TVecLoad(tr, run_start(cx, tr, args[0]), v))
 end vector_load
+
+// `xs.gather(idx)` -- one element per lane of `idx`, from wherever each names, into a vector as wide
+// as `idx`. **Every position is bounds-checked, as a subscript is**, and a failed one names the lane's
+// index; inside `@unchecked` the checks are left out, as a subscript's is, and the op says so
+// (`gather_unchecked`), since the positions are a vector and no scalar index wrapper can mark them.
+private vector_gather(cx: &Analyzer, span: Span, rty: Type, tr: TExpr, elem: Type,
+                      args: Buf[Expr]) -> TExpr
+    val found = lane_positions(cx, span, "gather", "xs.gather(idx)", args)
+
+    if found.is_none() then return bad_expr(span)
+
+    val (idx, m) = found.unwrap()
+    val v = Vector(m, elem)
+
+    if !lanes_or_err(cx, span, rty, elem, v) then return bad_expr(span)
+
+    var ops: Buf[TExpr] = buf()
+
+    ops.push(tr)
+    ops.push(idx)
+    TExpr(span, TVecOp(if cx.unchecked > 0 then "gather_unchecked" else "gather", ops, v))
+end vector_gather
 
 private vector_store(cx: &Analyzer, span: Span, rty: Type, tr: TExpr, elem: Type,
                      args: Buf[Expr]) -> TExpr
