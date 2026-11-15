@@ -665,7 +665,10 @@ private never_type(t: Type) -> bool = t match
 // What one body's pointers point into: each local by the location its value was made from, worked
 // out from every value it is given. A local given two different ones points nowhere this can name.
 struct Origins
-    cx: &KeepsCx
+    // The context these were worked out in, which keeps every body's origins for the round
+    // (`KeepsCx.origins`), so the edge back to it is weak: a strong one would close a cycle that
+    // keeps the context, its analysis and every typed body alive after the compilation.
+    owner: weak KeepsCx
     params: Buf[(string, Type)]
     refs: Buf[(string, TExpr)]
     locals: Map[string, string]
@@ -688,6 +691,9 @@ struct Origins
     // What each local was bound to, which says what it is only where it is bound once and never
     // written (`stable_name`): `val run = self.elems[a..<b]` is that storage for as long as it lives.
     inits: Map[string, TExpr]
+
+    // The context, which is alive for as long as anything asks these origins a question.
+    cx(self) -> &KeepsCx = self.owner.get().unwrap()
 end Origins
 
 origins_of(cx: &KeepsCx, f: TFunc) -> &Origins
@@ -807,7 +813,7 @@ private handed_address(o: &Origins, benign: &Spans, e: TExpr)
 
                 if held.is_none() then continue
 
-                if writes_of(o.cx, name, k) || raw_answers_of(o.cx, name, k) || keeps_of(o.cx, name, k).kept
+                if writes_of(o.cx(), name, k) || raw_answers_of(o.cx(), name, k) || keeps_of(o.cx(), name, k).kept
                     repoint(o, held.unwrap())
                 else
                     benign.items.push(arg.span)
@@ -819,7 +825,7 @@ end handed_address
 private loose_address(o: &Origins, benign: &Spans, e: TExpr)
     *e.kind match
         TStructNew(st, args) ->
-            o.cx.an.closure_refs.get(st.base) match
+            o.cx().an.closure_refs.get(st.base) match
                 Some(refs) ->
                     for i in 0..<args.len()
                         if i >= refs.len() || !refs[i] then continue
@@ -871,7 +877,7 @@ end local_at
 
 // A pointer given up at once; an integer from the first address it is given (`origin_assign`).
 private repoint(o: &Origins, held: (string, Type))
-    if may_hold_pointer(o.cx, held.1) then o.locals.put(held.0, "")
+    if may_hold_pointer(o.cx(), held.1) then o.locals.put(held.0, "")
     else if is_integer_type(held.1) then o.exposed.put(held.0, true)
 end repoint
 
@@ -983,7 +989,7 @@ end is_param
 // the computed address KEEPS anything is the other question, and an integer keeps nothing.
 origin_of(o: &Origins, x: TExpr) -> string
     val ty = texpr_type(x)
-    val ptrish = may_hold_pointer(o.cx, ty)
+    val ptrish = may_hold_pointer(o.cx(), ty)
 
     if !ptrish && !is_integer_type(ty) then return "-"
 
@@ -1032,7 +1038,7 @@ end origin_of
 // read straight out of a local or a parameter none of whose fields the body writes, since a written
 // field, a rebinding or a taken address may name another box.
 private handle_origin(o: &Origins, r: TExpr, fty: Type) -> string
-    val other = if may_hold_pointer(o.cx, fty) then "" else "-"
+    val other = if may_hold_pointer(o.cx(), fty) then "" else "-"
     val is_ref = fty match
         Ref(_, _) -> true
         _ -> false
@@ -1081,7 +1087,7 @@ private call_origin(o: &Origins, name: string, args: Buf[TExpr], ty: Type) -> st
     for k in 0..<args.len()
         val ak = origin_of(o, args[k])
 
-        if ak == "-" || !answers_arg(o.cx, name, args, k, ty, true) then continue
+        if ak == "-" || !answers_arg(o.cx(), name, args, k, ty, true) then continue
 
         val at = unknown_offset(ak)
 
@@ -1135,7 +1141,7 @@ private by_reference_capture(o: &Origins, r: TExpr, index: int) -> bool
     if index < 0 || !is_closure_literal(ty) then return false
 
     ty match
-        Struct(st) -> o.cx.an.closure_refs.get(st.base) match
+        Struct(st) -> o.cx().an.closure_refs.get(st.base) match
             Some(refs) -> usize(index) < refs.len() && refs[usize(index)]
             None -> false
         _ -> false
@@ -1329,7 +1335,7 @@ private module_slots(o: &Origins, arg: TExpr, loc: string) -> string
 
     if at.starts_with("g:") then return at
 
-    if !entry_slot_of(o.cx.an.tables, arg) then return ""
+    if !entry_slot_of(o.cx().an.tables, arg) then return ""
 
     *arg.kind match
         TDeref(field, _) -> *field.kind match
