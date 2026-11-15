@@ -1,7 +1,7 @@
 module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
-import sysl.math.bigint.from_int
+import sysl.math.bigint.{BigInt, from_int}
 
 // **Putting something on the heap**: the box a `&T` is, the buffer a sized run of elements is, and
 // the view of one.
@@ -547,6 +547,63 @@ gen_upgrade(e: *Emit, value: TExpr, opt_ty: Type, some: EnumVariant, none: EnumV
     emit(e, InLoad(r, lty(e, opt_ty), slot, AccPlain, None))
     own_temp(e, r, opt_ty)
 end gen_upgrade
+
+// `o.as[T]()` -- compares the identity the object's table begins with against `T`'s, and on a match
+// hands back the object's box as a `&T`. The data word of a `&Trait` is the very box the `&T` it was
+// erased from pointed at, so nothing is rebuilt: the answer is that word with a count taken for the
+// caller, which makes what the `Some` carries an ordinary owned reference and the `None` arm own
+// nothing at all.
+gen_downcast(e: *Emit, value: TExpr, id: BigInt, ref_ty: Type, opt_ty: Type, some: EnumVariant,
+             none: EnumVariant) -> Val
+    val v = gen_expr(e, value)
+    val d = enum_decl(opt_ty)
+
+    if d.is_none() then return gap_at(e, "a downcast whose option is not an enum")
+
+    val table = fresh_reg(e)
+
+    emit(e, InExtract(table, l_fat(), v, index_list(0)))
+
+    val held = fresh_reg(e)
+
+    emit(e, InLoad(held, word_lty(e), table, AccPlain, None))
+
+    val hit = fresh_reg(e)
+
+    emit(e, InIntCmp(hit, IEq, word_lty(e), held, VInt(id)))
+
+    val slot = alloca(e, fresh_reg(e), lty(e, opt_ty))
+    val some_l = fresh_label(e, "as.hit")
+    val none_l = fresh_label(e, "as.miss")
+    val end_l = fresh_label(e, "as.end")
+
+    emit_term(e, InCondBr(hit, some_l, none_l))
+    emit_label(e, some_l)
+
+    val box = erased_box(e, v)
+
+    retain_value(e, ref_ty, box)
+
+    var carried: Buf[Val] = buf()
+
+    carried.push(box)
+    emit(e, InStore(lty(e, opt_ty), enum_value(e, opt_ty, d.unwrap(), some, carried), slot, AccPlain,
+                    None))
+    emit_term(e, InBr(end_l))
+    emit_label(e, none_l)
+
+    var empty: Buf[Val] = buf()
+
+    emit(e, InStore(lty(e, opt_ty), enum_value(e, opt_ty, d.unwrap(), none, empty), slot, AccPlain,
+                    None))
+    emit_term(e, InBr(end_l))
+    emit_label(e, end_l)
+
+    val r = fresh_reg(e)
+
+    emit(e, InLoad(r, lty(e, opt_ty), slot, AccPlain, None))
+    own_temp(e, r, opt_ty)
+end gen_downcast
 
 private weak_inner(ty: Type) -> Option[Type] = underlying(ty) match
     Weak(inner) -> Some(*inner)

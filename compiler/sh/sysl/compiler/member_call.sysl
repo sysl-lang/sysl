@@ -980,7 +980,9 @@ call_member(cx: &Analyzer, span: Span, receiver: TExpr, name: string, args: Buf[
         Abstract(_, bounds) -> call_bound_method(cx, span, receiver, rty, name, bounds, args, targs)
         // A trait object has forgotten which type it holds, and what it wrote down in its place is
         // the table -- so a call on one is an index into that table rather than a name.
-        Trait(_, _, _) -> call_erased(cx, span, receiver, rty, name, args, expected)
+        Trait(_, _, _) ->
+            if downcast_named(cx, rty, name) then object_downcast(cx, span, receiver, rty, name, args, targs)
+            else call_erased(cx, span, receiver, rty, name, args, expected)
         // Everything about a weak reference is behind `get()`, including whether there still is one.
         Weak(inner) -> weak_get(cx, span, receiver, *inner, name, args)
         // The operation that stops a substring holding its parent buffer alive: the bytes are copied
@@ -2783,7 +2785,9 @@ method_written(cx: &Analyzer, recv: Expr, name: string) -> bool
             val found = licensed_member(cx, rty, bounds, name)
 
             return found.is_some() && found.unwrap().2.recv_mode().is_some()
-        Trait(_, _, _) -> return false
+        // `o.is[T]()` and `o.as[T]()`, the two members every trait object offers, are the only ones
+        // a list may be written on: a member with type parameters of its own has no slot.
+        Trait(_, _, _) -> return downcast_named(cx, rty, name)
         Weak(_) -> return false
         _ -> ()
 
@@ -3154,6 +3158,139 @@ private call_erased(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, name:
 
     erased_call(cx, span, receiver, rty, slot.unwrap().0, slot.unwrap().2, m, args)
 end call_erased
+
+// Whether `o.name` on a trait object is one of the two members the compiler supplies for asking
+// which type the object holds. **A member the trait declares wins**, as a user name beats a special
+// form everywhere: `is` is no reserved word, and a trait may have a member of that name.
+private downcast_named(cx: &Analyzer, rty: Type, name: string) -> bool
+    (name == "is" || name == "as") && !unslotted_member(cx, rty, name)
+
+// `o.is[T]()` and `o.as[T]()` (`reference/traits.md § Asking an object which type it holds`).
+//
+// **Both read the identity the object's table begins with**, the one `o::Id` answers, against the
+// identity of `T`: `is` is that comparison and nothing more, and `as` is the comparison with the
+// object's box handed back, counted, as a `&T` where it holds. The box is the same one the `&T` the
+// object was erased from pointed at, so the answer shares the object rather than copying it, and
+// the destructor of a type with one still runs once, when the last reference of either kind goes.
+private object_downcast(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, name: string,
+                        args: Buf[Expr], targs: Buf[Expr]) -> TExpr
+    val obj = texpr_type(receiver)
+    val shown = type_show(obj)
+
+    if targs.len() != 1 then
+        return cx.err(span, s"'$name' asks a $shown about one type, written in its brackets — " +
+                      s"'o.$name[T]()'")
+
+    if !args.is_empty() then
+        cx.fault(span, s"'$name' takes no arguments — the type it asks about is written in its " +
+                 "brackets")
+
+    // A trait written in the brackets is told why it can never be the answer before the type grammar
+    // refuses it for having no layout, which would send the reader to `&Shape` -- no answer either.
+    val trait_written = names_a_trait(cx, targs[0])
+
+    if trait_written.is_some() then
+        return cx.err(targs[0].span, downcast_to_trait(shown, trait_written.unwrap(), name))
+
+    val target = written_type_arg(cx, targs[0])
+
+    if target == Unknown then return bad_expr(span)
+
+    val refusal = downcast_refusal(cx, obj, rty, target, name)
+
+    if refusal.is_some() then return cx.err(span, refusal.unwrap())
+
+    val word = usize_type(word_bits(cx))
+    val id = type_identity(member_symbol(target), word_bits(cx))
+
+    if name == "is"
+        var operands: Buf[TExpr] = buf()
+        var cmps: Buf[TCmp] = buf()
+
+        operands.push(TExpr(span, TTypeId(receiver, word)))
+        operands.push(TExpr(span, TIntLit(id, word)))
+        cmps.push(TCmp("==", None, 0))
+        return TExpr(span, TCompare(operands, cmps))
+    end if
+
+    val ref_ty = obj match
+        Ref(_, sync) -> Ref(target, sync)
+        _ -> return bad_expr(span)
+
+    var opt_args: Buf[Type] = buf()
+
+    opt_args.push(ref_ty)
+
+    val opt = reinstantiate(cx.an, library_key("Option"), opt_args)
+
+    opt match
+        Enum(d) ->
+            val some = d.variant("Some")
+            val none = d.variant("None")
+
+            if some.is_none() || none.is_none() then return bad_expr(span)
+
+            TExpr(span, TDowncast(receiver, id, ref_ty, opt, some.unwrap(), none.unwrap()))
+        _ -> bad_expr(span)
+end object_downcast
+
+// Why `o.name[target]()` may not be asked of an object of type `obj`, if it may not.
+//
+// **What an object holds is a concrete type**: the one erased from a `&T`, which is never a trait
+// and never a reference, and asking for either could never be answered yes. A concrete type that
+// does not implement the trait could never be in the object either, so asking for one is a mistake
+// rather than a question. A generic body's parameter is asked about at each instantiation, where it
+// is a type.
+private downcast_refusal(cx: &Analyzer, obj: Type, rty: Type, target: Type, name: string) -> Option[string]
+    val bound = trait_bound_of(rty)
+    val shown = type_show(obj)
+    val asked = type_show(target)
+
+    if is_trait(target) then return Some(downcast_to_trait(shown, asked, name))
+
+    target match
+        Ref(_, _) | Ptr(_) | Weak(_) ->
+            return Some(s"a $shown holds the value a reference was erased from, never a reference " +
+                        s"itself, so '$asked' is never what it holds — ask for the type it points at")
+        _ -> ()
+
+    obj match
+        Ptr(_) ->
+            if name == "as" then
+                return Some(s"a $shown points at a value no count is kept for, so there is no " +
+                            s"counted '&$asked' to hand back — 'o.is[$asked]()' asks the question " +
+                            "without one")
+        _ -> ()
+
+    if mentions_abstract(target) then return None
+
+    if !conforms(cx.an, bound, target) then
+        return Some(s"'$asked' does not implement '${bound.show()}', so no $shown can hold one and " +
+                    s"'o.$name[$asked]()' could never be ${if name == "is" then "true" else "Some"}")
+
+    None
+end downcast_refusal
+
+private downcast_to_trait(shown: string, asked: string, name: string) -> string
+    s"'$asked' is a trait, and what a $shown holds is the concrete type its value was made as, so " +
+        s"'o.$name[T]()' asks for that type — an object is not cast to another trait"
+
+// The trait a type argument names, as written, where it names one: `Shape`, or `Get[int]`.
+private names_a_trait(cx: &Analyzer, e: Expr) -> Option[string]
+    val instance = written_trait_instance(cx, e)
+
+    if instance.is_some() then return Some(type_show(instance.unwrap()))
+
+    val written = written_name_of(cx, e)
+
+    if written.is_none() || cx.lookup(written.unwrap()).is_some() then return None
+
+    val key = lookup_type_key(cx.an, cx.scope, written.unwrap())
+
+    if key.is_none() || trait_decl_at(cx.an, key.unwrap()).is_none() then return None
+
+    written
+end names_a_trait
 
 // A property read through a trait object, which is the same slot with no arguments.
 private read_erased(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, name: string) -> TExpr
