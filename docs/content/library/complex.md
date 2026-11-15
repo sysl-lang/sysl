@@ -11,7 +11,9 @@ weight: 62
 and because `sysl.math` is mathematics *on* the floating-point types — which is not a sentence a type
 belongs in.
 
-It requires no capability, so a freestanding target has it — and **rendering one allocates nothing
+It requires no capability, so a freestanding target has it — the arithmetic, `conj` and `norm_sqr`,
+that is; `abs`, `arg` and the elementary functions are libm's sines, logarithms and `hypot`, and like
+`sin` itself they [need `libc`](/library/math/) — and **rendering one allocates nothing
 either**, which used to be the exception here. A specifier describes the field the *whole* value
 lands in, so the four pieces of `a+bi` are padded once between them rather than each in turn; but the
 width they came to is *measured* with [`Counting`](/library/core/) and never gathered into a string.

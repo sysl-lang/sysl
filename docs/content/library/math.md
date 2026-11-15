@@ -11,7 +11,25 @@ them are written the same way** — because the types they cover are different s
 the family is what decides how a trait can reach it.
 Above them sit the free functions, which are not members of anything and say in a bound what they
 need. It requires no capability at all: every name here is reachable under `no alloc` and on a target
-with no operating system.
+with no operating system. **The one thing it asks of a machine is a C library, and only for what libm
+answers** — the transcendentals, `cbrt`, `fmod` and the special functions, each bound `@needs(libc)`.
+Everything written in sysl needs nothing, nor does `mul_add`, which `sysl.softfloat` answers where the
+machine has no fused instruction; the roots, roundings and sign operations are the machine's own
+instructions where it has them. A libm function referenced on a freestanding target is refused at the
+reference, before any C:
+
+```sysl target=thumb-freestanding-softfp
+@export("heading")
+heading(y: f64, x: f64) -> f64 = y.atan2(x)
+```
+
+```error
+this reaches 'real.atan2', which needs 'libc' through 'sysl.sys.sysl_atan2', and 'thumb-freestanding-softfp' does not provide it
+```
+
+A board whose C library is newlib or picolibc says so in its manifest, `capabilities { libc = true }`
+in the target's block, and reaches them all; `sysl build-c` then names `m` among the libraries the C
+link has to carry.
 
 ```sysl
 @no_alloc
@@ -785,7 +803,7 @@ scalbln(x, n)                x times 2 to the n, n an i64
 ```
 
 Each exists at `real` and at `f32`. They are libm's, so like `sin` they are absent from a
-freestanding target. The edges follow C: `tgamma(0.0)` is infinity and `tgamma(-1.0)` a NaN, `y0(0.0)`
+freestanding target, and refused there unless its manifest grants `libc`. The edges follow C: `tgamma(0.0)` is infinity and `tgamma(-1.0)` a NaN, `y0(0.0)`
 is negative infinity, `erf` of an infinity is `±1`.
 
 ```sysl
