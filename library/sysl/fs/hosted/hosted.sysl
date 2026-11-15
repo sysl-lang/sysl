@@ -152,6 +152,10 @@ private extern "sysl_fs_host_ftruncate" c_ftruncate(fd: int, length: long) -> in
 private extern "sysl_fs_host_truncate" c_truncate(path: *u8, length: long) -> int
 private extern "sysl_fs_host_stat" c_stat(path: *u8, follow: int, out: *long) -> int
 private extern "sysl_fs_host_fstat" c_fstat(fd: int, out: *long) -> int
+private extern "sysl_fs_host_dir_open" c_dir_open(path: *u8) -> int
+private extern "sysl_fs_host_open_beneath" c_open_beneath(dir: int, path: *u8, flags: u32, mode: u32) -> int
+private extern "sysl_fs_host_stat_beneath" c_stat_beneath(dir: int, path: *u8, out: *long) -> int
+private extern "sysl_fs_host_unlink_beneath" c_unlink_beneath(dir: int, path: *u8) -> int
 // The name it answers lives in the directory stream's own storage, until the next call on it.
 @answers(d)
 private extern "sysl_fs_host_readdir" c_readdir(d: *u8) -> *u8
@@ -490,6 +494,54 @@ supply_temp_dir(prefix: *u8, len: usize, into: *u8, room: usize, got: *usize) ->
     UNSUPPORTED
 #endif
 end supply_temp_dir
+
+// -- beneath a directory -----------------------------------------------------------------------------
+
+@export("sysl_fs_dir_open")
+supply_dir_open(path: *u8, len: usize, fd: *int) -> int
+    var c: [path_room]u8
+
+    if !terminated(path, len, c[..]) then return name_too_long
+
+    val opened = c_dir_open(&c[0])
+
+    if opened < 0 then return failed()
+
+    *fd = opened
+    0
+end supply_dir_open
+
+@export("sysl_fs_open_beneath")
+supply_open_beneath(dir: int, path: *u8, len: usize, flags: u32, mode: u32, fd: *int) -> int
+    var c: [path_room]u8
+
+    if !terminated(path, len, c[..]) then return name_too_long
+
+    val opened = c_open_beneath(dir, &c[0], flags, mode)
+
+    if opened < 0 then return failed()
+
+    *fd = opened
+    0
+end supply_open_beneath
+
+@export("sysl_fs_stat_beneath")
+supply_stat_beneath(dir: int, path: *u8, len: usize, out: *Stat) -> int
+    var c: [path_room]u8
+
+    if !terminated(path, len, c[..]) then return name_too_long
+
+    status(c_stat_beneath(dir, &c[0], ptr_cast(out)))
+end supply_stat_beneath
+
+@export("sysl_fs_unlink_beneath")
+supply_unlink_beneath(dir: int, path: *u8, len: usize) -> int
+    var c: [path_room]u8
+
+    if !terminated(path, len, c[..]) then return name_too_long
+
+    status(c_unlink_beneath(dir, &c[0]))
+end supply_unlink_beneath
 
 // -- links -------------------------------------------------------------------------------------------
 

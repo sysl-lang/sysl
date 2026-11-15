@@ -1,0 +1,447 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Var}
+import sysl.text.{cstring, Search}
+
+// `Buf.extend` places each element into a run it cuts once from its own storage
+// (`val run = self.elems[count..<need]`), and a slot placed through that cut is held by the buffer
+// that owns the storage, exactly as one placed through `self.elems` is. When the analysis saw only a
+// field as owned storage, every `extend` let what it was handed out anywhere at all: a callee that
+// copied a view into a buffer of its own (`row(kids) = { b.extend(kids); Row(b) }`) kept its
+// argument, so a trait method that only called a method on such an answer
+// (`measure(&self) = self.bar().measure()`) was refused for keeping `self` -- syslui's menu bar.
+//
+// The cells: the answer called, handed on, held in a local and dropped, returned, pushed into a Buf
+// that is answered; the same through free functions; and, with a frame address, the shapes that must
+// still be refused (the element answered, the buffer answered out of the frame, a parameter's buffer
+// extended). A closure extended into a callee's own buffer is followed both ways: answered, it
+// outlives the frame; only called there, it stays in the frame.
+//
+// Skipped cells, and why: a call through an object or a function pointer answers "anywhere" before
+// any slot is placed, so `extend` changes nothing there; a run cut from a local's own array is not a
+// parameter's storage and stays a hard keep, as a field of one is.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private extern "setenv" kac_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" kac_c_unsetenv(name: *u8) -> int
+
+private struct KacRun
+    out: string
+    err: string
+    hooks: usize
+end KacRun
+
+// The program built and run: on the counted heap, or with `flags` handed to clang.
+private kac_run(text: string, counted: bool, flags: string) -> KacRun
+    val root = make_temp_dir("sysl-kac").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    val exe = s"$root/built"
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+        val v = cstring(flags)
+
+        kac_c_setenv(n.ptr, v.ptr, 1)
+    end if
+
+    force_alloc_counting(counted)
+
+    val made = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe))
+
+    force_alloc_counting(false)
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+
+        kac_c_unsetenv(n.ptr)
+    end if
+
+    made match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return KacRun(failure_text(why), "", 0)
+        Ok(_) -> ()
+
+    val hooks = capture("nm", ["-u", exe], "", [], true) match
+        Ok(o) -> o.text.count_of("__asan_report")
+        Err(_) -> 0
+
+    val ran = capture(exe, [], "", [Var("ASAN_OPTIONS", "detect_stack_use_after_return=1")], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    ran match
+        Err(_) -> KacRun("could not be started", "", hooks)
+        Ok(o) -> KacRun(o.text, o.err.unwrap_or(""), hooks)
+end kac_run
+
+// The program printed `want` on the counted heap, with nothing left over and nothing given twice.
+private kac_prints(text: string, want: string)
+    if !enm_ready() then return
+
+    val got = kac_run(text, true, "")
+
+    assert_eq(got.out, want)
+    assert_eq(got.err, "")
+end kac_prints
+
+// The program printed `want` under AddressSanitizer, instrumented, and nothing was reported.
+private kac_asan(text: string, want: string)
+    if !enm_ready() then return
+
+    val got = kac_run(text, false, "-fsanitize=address -g")
+
+    assert(got.hooks > 0, s"not instrumented: ${got.out}")
+    assert_eq(got.out, want)
+    assert_eq(got.err, "")
+end kac_asan
+
+// The IR of a program, or its analysis report where it was refused.
+private kac_ir(text: string) -> string
+    val root = make_temp_dir("sysl-kac").unwrap()
+
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    val ir = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    ir
+end kac_ir
+
+// The program was refused, with `want` in what was said.
+private kac_refused(text: string, want: string)
+    if xvr_no_library() then return
+
+    val ir = kac_ir(text)
+
+    assert(ir.contains(want), ir)
+end kac_refused
+
+// How many closure boxes the IR of a program lays in a frame.
+private kac_frame_boxes(text: string) -> int
+    var n = 0
+
+    for line in lines_of(kac_ir(text)).view()
+        if line.contains("= alloca %arc.$closure") then n += 1
+
+    n
+end kac_frame_boxes
+
+// syslui's menu bar: a signal whose type may hold a closure, a view per title built round it, the
+// views pushed into a buffer the body owns, and that buffer's view copied into a row's own buffer.
+private const kac_base: string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    trait View
+        measure(&self) -> int
+
+    struct Sig
+        n: int
+        deps: Buf[weak Fn() -> unit]
+
+    struct Tap
+        act: &Fn() -> int
+
+    impl View for Tap
+        measure(&self) -> int = (self.act)()
+
+    tap(s: &Sig) -> &View = Tap(() -> s.n)
+
+    struct Row
+        kids: Buf[&View]
+
+    impl View for Row
+        measure(&self) -> int
+            var n = 0
+
+            for k in self.kids.view()
+                n += k.measure()
+
+            n
+        end measure
+
+    row(kids: []const &View) -> &View
+        var b: Buf[&View] = buf()
+
+        b.extend(kids)
+        Row(b)
+
+    struct Bar
+        open: &Sig
+
+        bar(&self) -> &View
+            var titles: Buf[&View] = buf()
+
+            titles.push(tap(self.open))
+            titles.push(tap(self.open))
+            row(titles.view())
+        end bar
+
+    twice(v: &View) -> int = v.measure() * 2
+
+    bar_of(b: &Bar) -> &View
+        var titles: Buf[&View] = buf()
+
+        titles.push(tap(b.open))
+        row(titles.view())
+    end bar_of
+
+    total(b: &Bar) -> int = b.bar().measure()
+    """
+
+private const kac_main: string = raw"""
+    main()
+        val s: &Sig = Sig(7, buf())
+        val x: &View = Bar(s)
+
+        print(x.measure())
+    """
+
+private kac_view(body: string) -> string = kac_base + "\nimpl View for Bar\n    measure(&self) -> int" + body + kac_main
+
+// -- the regression -------------------------------------------------------------------------------
+
+@test("a trait method calling a method on an answer that carries what it reads through self")
+kac_answer_called()
+    kac_prints(kac_view(" = self.bar().measure()\n"), "14\n")
+
+@test("and under AddressSanitizer")
+kac_answer_called_under_asan()
+    kac_asan(kac_view(" = self.bar().measure()\n"), "14\n")
+
+@test("the row built from an array literal rather than a buffer's view")
+kac_array_literal()
+    kac_prints(kac_view(" = row([tap(self.open)]).measure()\n"), "7\n")
+
+// -- what the answer meets ------------------------------------------------------------------------
+
+@test("the answer handed straight to another call")
+kac_answer_handed_on()
+    kac_prints(kac_view(" = twice(self.bar())\n"), "28\n")
+
+@test("the answer held in a local and dropped")
+kac_answer_in_local()
+    kac_prints(kac_view("\n        val v = self.bar()\n\n        3\n"), "3\n")
+
+@test("the answer built by a free function")
+kac_free_function_answer()
+    kac_prints(kac_view(" = bar_of(self).measure()\n"), "7\n")
+
+@test("the answer called inside a free function the trait method calls")
+kac_free_function_caller()
+    kac_prints(kac_view(" = total(self)\n"), "14\n")
+
+@test("the answer returned from a trait method, as a counted reference read through self is")
+kac_answer_returned()
+    kac_asan(kac_base + raw"""
+        trait Wrap
+            wrap(&self) -> &View
+
+        impl Wrap for Bar
+            wrap(&self) -> &View = self.bar()
+
+        main()
+            val s: &Sig = Sig(7, buf())
+            val x: &Wrap = Bar(s)
+
+            print(x.wrap().measure())
+        """, "14\n")
+
+@test("the answer pushed into a Buf the trait method answers")
+kac_answer_pushed_and_answered()
+    kac_asan(kac_base + raw"""
+        trait All
+            all(&self) -> Buf[&View]
+
+        impl All for Bar
+            all(&self) -> Buf[&View]
+                var b: Buf[&View] = buf()
+
+                b.push(self.bar())
+                b
+
+        main()
+            val s: &Sig = Sig(7, buf())
+            val x: &All = Bar(s)
+
+            print(x.all()[0].measure())
+        """, "14\n")
+
+// -- a frame address extended into a buffer -------------------------------------------------------
+
+@test("a frame address extended into a callee's own Buf and only read there is not refused")
+kac_frame_address_read_only()
+    kac_prints(raw"""
+        import sysl.buf.{Buf, buf}
+
+        peek(p: *int) -> int
+            var b: Buf[*int] = buf()
+
+            b.extend([p])
+            *b[0] + 1
+
+        make() -> int
+            var y = 41
+
+            peek(&y)
+
+        main()
+            print(make())
+        """, "42\n")
+
+@test("a frame address extended into a callee's Buf and answered back out is refused where it leaves")
+kac_frame_address_answered()
+    kac_refused(raw"""
+        import sysl.buf.{Buf, buf}
+
+        via(p: *int) -> *int
+            var b: Buf[*int] = buf()
+
+            b.extend([p])
+            b[0]
+
+        make() -> *int
+            var y = 1
+
+            via(&y)
+
+        main()
+            print(*make())
+        """, "'via(&y)' is returned, but it holds the address of a local of 'make'")
+
+@test("the callee's Buf answered and read in the frame that made the address is not refused")
+kac_frame_buffer_read_in_frame()
+    kac_prints(raw"""
+        import sysl.buf.{Buf, buf}
+
+        via(p: *int) -> Buf[*int]
+            var b: Buf[*int] = buf()
+
+            b.extend([p])
+            b
+
+        make() -> int
+            var y = 1
+            val b = via(&y)
+
+            *b[0] + 1
+
+        main()
+            print(make())
+        """, "2\n")
+
+@test("the callee's Buf answered out of the frame that made the address is refused")
+kac_frame_buffer_answered_out()
+    kac_refused(raw"""
+        import sysl.buf.{Buf, buf}
+
+        via(p: *int) -> Buf[*int]
+            var b: Buf[*int] = buf()
+
+            b.extend([p])
+            b
+
+        make() -> Buf[*int]
+            var y = 1
+
+            via(&y)
+
+        main()
+            print(*make()[0])
+        """, "'via(&y)' is returned, but it holds the address of a local of 'make'")
+
+@test("a frame address extended into a parameter's Buf is refused")
+kac_frame_address_into_parameter()
+    kac_refused(raw"""
+        import sysl.buf.{Buf, buf}
+
+        into(dst: Buf[*int], p: *int) = dst.extend([p])
+
+        make(dst: Buf[*int])
+            var y = 1
+
+            into(dst, &y)
+
+        main()
+            var d: Buf[*int] = buf()
+
+            make(d)
+            print(*d[0])
+        """, "'into' keeps its parameter 'p'")
+
+// -- a closure extended into a buffer -------------------------------------------------------------
+
+// One closure only called where it was extended, one answered inside a node; `main` scribbles over
+// the stack `make` used before it fires what came back.
+private const kac_closures: string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    trait Node
+        fire(&self) -> int
+
+    struct Tap
+        act: &Fn() -> int
+
+    impl Node for Tap
+        fire(&self) = (self.act)()
+
+    struct Owner
+        n: int
+
+    scribble(depth: int) -> int
+        var a: [64]int = [0; 64]
+
+        for i in 0..<64
+            a[i] = i * depth + 77
+
+        if depth > 0 then a[3] + scribble(depth - 1) else a[5]
+    end scribble
+
+    handed(run: &Fn() -> int) -> &Node
+        var fs: Buf[&Fn() -> int] = buf()
+
+        fs.extend([run])
+        Tap(fs[0])
+    end handed
+
+    count(run: &Fn() -> int) -> int
+        var fs: Buf[&Fn() -> int] = buf()
+
+        fs.extend([run])
+        fs[0]() + int(fs.len())
+    end count
+
+    make(o: &Owner) -> &Node
+        val k = count(() -> o.n)
+
+        handed(() -> o.n + k)
+    end make
+
+    main()
+        val o: &Owner = Owner(40)
+        val h = make(o)
+        print(scribble(8))
+        print(h.fire())
+    """
+
+@test("a closure extended into a callee's Buf and answered outlives the frame")
+kac_closure_extended_answered()
+    kac_prints(kac_closures, "801\n81\n")
+
+@test("and under AddressSanitizer")
+kac_closure_extended_answered_under_asan()
+    kac_asan(kac_closures, "801\n81\n")
+
+@test("only the closure the callee calls and lets go stays boxed in the frame")
+kac_closure_extended_called_in_frame()
+    if xvr_no_library() then return
+
+    assert_eq(kac_frame_boxes(kac_closures), 1)
