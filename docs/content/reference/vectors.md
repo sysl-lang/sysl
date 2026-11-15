@@ -687,6 +687,94 @@ f() -> unit
 'mul_add' rounds the product and the sum once, which only a float of 32 or 64 bits can promise
 ```
 
+## Square roots and roundings
+
+**`v.sqrt()`, `v.floor()`, `v.ceil()`, `v.round()` and `v.trunc()`** are the scalar
+[`Float` methods](/library/math/#rounding-sign-and-the-rest) of the same names in every lane, each one
+instruction over the register where the target has one. The square root is correctly rounded, so each
+lane is bit for bit what `x.sqrt()` answers for it; the four roundings are exact. **`round` is the
+scalar's `round`**: a half goes away from zero, so `2.5` rounds to `3` and `-2.5` to `-3`, as C's
+`round` does.
+
+```sysl
+val v: <4>f32 = [2.5, -2.5, 0.5, -0.0]
+
+val r = v.round()
+val f = v.floor()
+val c = v.ceil()
+val t = v.trunc()
+
+print(r[0], r[1], r[2], 1.0 / r[3])
+print(f[0], f[1], c[0], c[1], t[1])
+print(<4>f32([9, 2, 0.25, -1]).sqrt()[0], <4>f32([9, 2, 0.25, -1]).sqrt()[3])
+```
+
+```output
+3 -3 1 -inf
+2 -3 3 -2 -2
+3 NaN
+```
+
+A NaN lane stays a NaN, an infinity stays an infinity, a negative zero keeps its sign, and the square
+root of a negative lane is a NaN, as the scalar's is. Inside a `@strict_fp` body each is the
+constrained operation, as the scalar method is. They are defined for `f32` and `f64` lanes; the
+scalar methods compute a half-width value at `f32`, and so does a vector, once it is widened:
+
+```sysl
+val h: <4>f16 = [f16(1.5), f16(2.5), f16(3.5), f16(4.5)]
+
+f() -> unit
+    val r = h.round()
+```
+
+```error
+'round' is defined for f32 and f64 lanes, and <4>f16 is not one — widen the lanes to f32 first
+```
+
+## A float's encoding, lane by lane
+
+**`v.bits()`** is every lane's IEEE 754 encoding as the unsigned integer of its width: a `<4>f32`
+gives a `<4>u32`, a `<2>f64` a `<2>u64`, and an `f16` or `bf16` lane a `u16`, exactly as the scalar
+[`x.bits()`](/library/core/#a-float-s-encoding-bits-and-from-bits) does. **`<4>f32.from_bits(b)`** goes the other way, taking the
+`<4>u32` and answering the floats whose encodings it holds. Both are a **reinterpretation, not a
+conversion** — one register read as the other type, so nothing is rounded and a negative zero, an
+infinity and a NaN's payload all come through as their bits. A conversion that keeps the *value* is
+[`<4>u32(v)`](#converting-lanes).
+
+```sysl
+val v: <4>f32 = [1.0, -0.0, 0.5, -2.0]
+val b = v.bits()
+
+print(f"${b[0]}%x ${b[1]}%x ${b[2]}%x ${b[3]}%x")
+
+// Clear every sign bit: the magnitude, written on the encoding.
+val m = <4>f32.from_bits(b & 0x7fffffff)
+
+print(m[0], 1.0 / m[1], m[2], m[3])
+```
+
+```output
+3f800000 80000000 3f000000 c0000000
+1 inf 0.5 2
+```
+
+That is the step a vector `exp` or `log` is built from: the exponent of a float is a field of its
+encoding, and setting it is a shift and an add on the `<N>u32`.
+
+`from_bits` takes exactly the unsigned vector `bits()` answers, of the same lane count and width; a
+signed or a narrower one is refused, as the scalar's `Word` is the only integer it takes:
+
+```sysl
+val i: <4>i32 = [0, 1, 2, 3]
+
+f() -> unit
+    val v = <4>f32.from_bits(i)
+```
+
+```error
+'from_bits' of <4>f32 takes the <4>uint 'bits()' answers, and <4>int was given
+```
+
 ## NaN-propagating maximum and minimum
 
 **`a.maximum(b)` and `a.minimum(b)`** are IEEE 754-2019's maximum and minimum in every lane: **a NaN

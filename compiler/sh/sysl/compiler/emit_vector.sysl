@@ -360,12 +360,26 @@ private vector_lanes(t: Type) -> int = repr(t) match
     _ -> 0
 
 // A lane-wise operation that is one intrinsic over the whole register: `fabs`, `abs`, `fma`,
-// `maximum` or `minimum`. The suffix is the vector's type, so the machine's own instruction is
+// `maximum`, `minimum`, `sqrt` or one of the four roundings. The suffix is the vector's type, so the machine's own instruction is
 // selected -- there is no loop over the lanes. `llvm.abs` is told the most negative lane is *not*
 // poison, so it answers itself, which is what the scalar `abs` answers in every build.
 gen_vec_op(e: *Emit, op: string, operands: Buf[TExpr], ty: Type) -> Val
     val lt = lty(e, ty)
-    val fn = if op == "fma" then llvm_fma_entry().at([lt])
+
+    // `bits()` and `from_bits` are one `bitcast` of the register between its floats and the unsigned
+    // integers of their width -- the same number of bits, so no lane moves and none is converted.
+    if op == "bits" || op == "from_bits"
+        val from = lty(e, texpr_type(operands[0]))
+        val v = gen_expr(e, operands[0])
+        val r = fresh_reg(e)
+
+        emit(e, InCast(r, CastBitCast, from, v, lt))
+        return r
+    end if
+
+    val lane_float = llvm_lane_float_entry(op)
+    val fn = if lane_float.is_ok() then lane_float.unwrap().at([lt])
+             else if op == "fma" then llvm_fma_entry().at([lt])
              else if op == "fabs" then llvm_fabs_entry().at([lt])
              else if op == "maximum" then llvm_maximum_entry().at([lt])
              else if op == "minimum" then llvm_minimum_entry().at([lt])
