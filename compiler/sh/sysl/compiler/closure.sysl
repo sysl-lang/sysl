@@ -758,6 +758,12 @@ end hand_up_copy_writes
 // itself: a refusal owed for writes that all come through inner closures is said only where every one
 // of them holds the capture by reference -- however deep the nesting, said once, for the nearest
 // closure that holds a copy.
+//
+// **A local of the body bound to a capture's copy** (`locals`) carries the write on: an address of
+// it (`val p = &k`), a writable view of it (`val v = out[0..<2]`), a view of such a view, a `ref`
+// naming a part of it, and any of those bound again. A write through the local, or the local handed
+// to a call, is a write of the copy, asked the same two questions a write of the capture is. A
+// mention of the local is a mention of the capture, so the one in the binding is not counted twice.
 private struct CopyScan
     slots: Buf[int]
     uses: Buf[int]
@@ -766,10 +772,25 @@ private struct CopyScan
     at: Buf[Span]
     form: Buf[string]
     via: Buf[Buf[(string, usize)]]
+    locals: Buf[CopyLocal]
 end CopyScan
 
+// A local of a closure body that reaches the closure's copy of the capture in `slot`, and how.
+private struct CopyLocal
+    name: string
+    slot: int
+    reach: CopyReach
+
+private enum CopyReach
+    // `val p = &k` -- written through as `*p`, `p.n`, `p[i]`, and handed on as an address.
+    CopyAddress
+    // `val v = out[0..<2]` -- written through as `v[i]`, and handed on as a view.
+    CopyView
+    // `ref r = k` -- the place itself, written as `r = 5`.
+    CopyRef
+
 private scan_copy_writes(a: &Analysis, st: &StructType, n: usize, body: TBlock, span: Span) -> &CopyScan
-    val scan: &CopyScan = CopyScan(buf(), buf(), buf(), buf(), buf(), buf(), buf())
+    val scan: &CopyScan = CopyScan(buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf())
 
     for i in 0..<n
         scan.slots.push(int(st.slot(i)))
@@ -784,25 +805,101 @@ private scan_copy_writes(a: &Analysis, st: &StructType, n: usize, body: TBlock, 
     // `a, b = b, a` is the one write that is not an expression: each of its places is a write of
     // its own, said as the assignment it is.
     walk_block_stmts(body, TWalk(true, e -> note_copy_use(a, scan, e),
-                                 w -> note_copy_write(scan, w.place, "assignment", w.place.span), s -> ()))
+                                 w -> note_copy_write(scan, w.place, "assignment", w.place.span),
+                                 s -> note_copy_local(scan, s)))
     scan
 end scan_copy_writes
+
+// A local bound in the body: one reaching a capture's copy is followed (`CopyLocal`), and one that
+// does not forgets any earlier binding of the name. The walk reaches the statement before what it
+// binds from, whose mention of the capture is the binding's, not a use of its own.
+private note_copy_local(scan: &CopyScan, s: TStmt)
+    s match
+        TVarDecl(name, _, init, _) -> bind_copy_local(scan, name, copy_local_of(scan, init))
+        TRefDecl(name, _, place) ->
+            val slot = written_root(scan, place)
+
+            bind_copy_local(scan, name, if slot.is_some() then Some((slot.unwrap(), CopyRef)) else None)
+        _ -> ()
+end note_copy_local
+
+// What a local bound from `init` reaches of a capture's copy: an address of a part of it, a writable
+// view of it, or a local that already does.
+private copy_local_of(scan: &CopyScan, init: TExpr) -> Option[(int, CopyReach)] = *init.kind match
+    TAddrOf(place, _) -> written_root(scan, place) match
+        Some(slot) -> Some((slot, CopyAddress))
+        None -> None
+    TSlice(_, _, _, _, _) -> view_root(scan, init) match
+        Some(slot) -> Some((slot, CopyView))
+        None -> None
+    TLoad(name, _) -> copy_local(scan, name) match
+        Some(l) -> if l.reach == CopyRef then None else Some((l.slot, l.reach))
+        None -> None
+    _ -> None
+
+private bind_copy_local(scan: &CopyScan, name: string, reach: Option[(int, CopyReach)])
+    var i: usize = 0
+
+    while i < scan.locals.len()
+        if scan.locals[i].name == name
+            scan.locals.remove(i)
+            continue
+        end if
+
+        i += 1
+    end while
+
+    if reach.is_none() then return
+
+    val (slot, how) = reach.unwrap()
+
+    scan.locals.push(CopyLocal(name, slot, how))
+    // The capture named in what the local is bound from is counted by the walk as it reaches it.
+    bump_down(scan.uses, scan.slots, slot)
+end bind_copy_local
+
+private copy_local(scan: &CopyScan, name: string) -> Option[CopyLocal]
+    for l in scan.locals
+        if l.name == name then return Some(l)
+
+    None
+end copy_local
 
 // One node of the body: a mention of a capture, a write, or neither.
 private note_copy_use(a: &Analysis, scan: &CopyScan, e: TExpr)
     *e.kind match
         TField(recv, slot, _) -> if env_root(recv) then bump_at(scan.uses, scan.slots, slot)
-        TStore(place, _, _, _) -> note_copy_write(scan, place, "assignment", e.span)
+        TLoad(name, _) -> copy_local(scan, name) match
+            Some(l) -> bump_at(scan.uses, scan.slots, l.slot)
+            None -> ()
+        TStore(place, value, _, _) -> *place.kind match
+            // A local of the body given a new value is bound again, unless it is a `ref`, whose
+            // assignment writes the place it names.
+            TLoad(name, _) ->
+                val l = copy_local(scan, name)
+
+                if l.is_some() && l.unwrap().reach == CopyRef
+                    note_copy_write(scan, place, "assignment", e.span)
+                else if l.is_some() || copy_local_of(scan, value).is_some()
+                    bind_copy_local(scan, name, copy_local_of(scan, value))
+
+                    // The local named as the place is bound, not a mention of what it reaches.
+                    val now = copy_local(scan, name)
+
+                    if now.is_some() then bump_down(scan.uses, scan.slots, now.unwrap().slot)
+                end if
+            _ -> note_copy_write(scan, place, "assignment", e.span)
         TUpdate(place, op, _, _, _, _, _) -> note_copy_write(scan, place, s"'$op'", e.span)
         TIncDec(place, op, _, _, _) -> note_copy_write(scan, place, s"'$op'", e.span)
         TVecStore(recv, _, _) -> if run_in_place(recv) then note_copy_write(scan, recv, "assignment", e.span)
         TCall(name, _, ty, _) ->
             val place = self_receiver(a, e)
 
-            if place.is_some() && note_copy_write(scan, place.unwrap(), self_call_form(a, name), e.span)
+            if place.is_some() && !shares_its_storage(texpr_type(place.unwrap())) &&
+                    note_copy_write(scan, place.unwrap(), self_call_form(a, name), e.span)
                 // The answer is what the method read of the copy, so the copy is read back.
                 if answers_a_value(ty) then
-                    bump_at(scan.uses, scan.slots, written_root(place.unwrap()).unwrap())
+                    bump_at(scan.uses, scan.slots, written_root(scan, place.unwrap()).unwrap())
             end if
 
             note_handed_addresses(a, scan, e, name)
@@ -815,6 +912,9 @@ private note_copy_use(a: &Analysis, scan: &CopyScan, e: TExpr)
 // call is refused only where the enclosing body uses the variable after the closure, as though the
 // callee's writes had reached it. The receiver a `*self` call takes for itself has the call's own
 // span and is `self_receiver`'s.
+//
+// **A local holding such an address or view, handed on** (`val p = &k; bump(p)`), hands the copy
+// out the same way, said as the address or the view it holds.
 private note_handed_addresses(a: &Analysis, scan: &CopyScan, e: TExpr, name: string)
     val args = *e.kind match
         TCall(_, args, _, _) -> args
@@ -826,9 +926,19 @@ private note_handed_addresses(a: &Analysis, scan: &CopyScan, e: TExpr, name: str
         *arg.kind match
             TAddrOf(place, _) ->
                 if note_copy_write(scan, place, handed_form(a, name), arg.span) then
-                    bump_at(scan.uses, scan.slots, written_root(place).unwrap())
+                    bump_at(scan.uses, scan.slots, written_root(scan, place).unwrap())
+            TLoad(local, _) -> copy_local(scan, local) match
+                Some(l) ->
+                    val form = l.reach match
+                        CopyAddress -> handed_form(a, name)
+                        CopyView -> viewed_form(a, name)
+                        CopyRef -> continue
+
+                    if note_slot_write(scan, Some(l.slot), form, arg.span) then
+                        bump_at(scan.uses, scan.slots, l.slot)
+                None -> ()
             TSlice(_, _, _, _, _) ->
-                val slot = view_root(arg)
+                val slot = view_root(scan, arg)
 
                 if note_slot_write(scan, slot, viewed_form(a, name), arg.span) then
                     bump_at(scan.uses, scan.slots, slot.unwrap())
@@ -905,7 +1015,7 @@ end lowered_closure
 
 // Whether the write landed on a capture's copy.
 private note_copy_write(scan: &CopyScan, place: TExpr, form: string, at: Span) -> bool =
-    note_slot_write(scan, written_root(place), form, at)
+    note_slot_write(scan, written_root(scan, place), form, at)
 
 // Whether a write of the capture in `slot`, when there is one, landed on a capture's copy.
 private note_slot_write(scan: &CopyScan, slot: Option[int], form: string, at: Span) -> bool
@@ -970,6 +1080,26 @@ private bump_at(counts: Buf[int], slots: Buf[int], slot: int)
     for i in 0..<slots.len()
         if slots[i] == slot then counts[i] = counts[i] + 1
 
+private bump_down(counts: Buf[int], slots: Buf[int], slot: int)
+    for i in 0..<slots.len()
+        if slots[i] == slot then counts[i] = counts[i] - 1
+
+// **A handle**: a struct whose every field is a counted reference, as a `Buf`, a `Map` and a `Deque`
+// are. A copy of one names the same storage, so a `*self` method called on a captured handle
+// (`b.view_mut()`) reaches what both sides share rather than writing the closure's copy.
+private shares_its_storage(t: Type) -> bool = t match
+    Struct(st) ->
+        if st.fields.is_empty() then return false
+
+        for (_, ft) in st.fields
+            ft match
+                Ref(_, _) -> ()
+                _ -> return false
+        end for
+
+        true
+    _ -> false
+
 // The capture a place writes the closure's own copy of: the capture itself, or a field or an
 // element of it reached without passing through anything that refers elsewhere.
 private copy_root(place: TExpr) -> Option[int] = *place.kind match
@@ -982,25 +1112,39 @@ private copy_root(place: TExpr) -> Option[int] = *place.kind match
 
 // The capture a write lands in the closure's own copy of: a place `copy_root` follows, or a part of
 // an element of a writable view taken of one (`out[0..<2][0] = 7`, `cs[1..][0].n = 5`), since the
-// view is of the copy too.
-private written_root(place: TExpr) -> Option[int] = copy_root(place) match
+// view is of the copy too -- or a place reached through a local of the body that holds the copy's
+// address (`*p`, `p.n`, `p[0]`), a view of it (`v[0]`), or that names a part of it (`ref r`).
+private written_root(scan: &CopyScan, place: TExpr) -> Option[int] = copy_root(place) match
     Some(slot) -> Some(slot)
     None -> *place.kind match
-        TField(recv, _, _) -> if held_by_value(texpr_type(recv)) then written_root(recv) else None
-        TIndex(recv, _, _) -> if run_in_place(recv) then written_root(recv) else view_root(recv)
+        TField(recv, _, _) -> if held_by_value(texpr_type(recv)) then written_root(scan, recv) else None
+        TIndex(recv, _, _) ->
+            if run_in_place(recv) then written_root(scan, recv) else view_root(scan, recv)
+        TDeref(inner, _) -> local_root(scan, inner, CopyAddress)
+        TLoad(_, _) -> local_root(scan, place, CopyRef)
         _ -> None
 
 // The capture a writable view is taken of, where what it views is the closure's own copy: `out[a..<b]`,
-// `out[..]`, an array taken where a `[]T` is wanted, and a view of such a view. A `[]const T` only
-// reads, and a view of a `Buf`, a `&[N]T` or a `*T` reaches storage the closure shares.
-private view_root(view: TExpr) -> Option[int] = *view.kind match
+// `out[..]`, an array taken where a `[]T` is wanted, a view of such a view, and a local holding one.
+// A `[]const T` only reads, and a view of a `Buf`, a `&[N]T` or a `*T` reaches storage the closure
+// shares -- unless the `*T` is a local holding the copy's address.
+private view_root(scan: &CopyScan, view: TExpr) -> Option[int] = *view.kind match
     TSlice(base, _, _, _, ty) -> ty match
         Slice(_, true) -> None
         Slice(_, false) -> texpr_type(base) match
-            Array(_, _) -> written_root(base)
-            Slice(_, _) -> view_root(base)
+            Array(_, _) -> written_root(scan, base)
+            Slice(_, _) -> view_root(scan, base)
+            Ptr(_) -> local_root(scan, base, CopyAddress)
             _ -> None
         _ -> None
+    TLoad(_, _) -> local_root(scan, view, CopyView)
+    _ -> None
+
+// The capture a local of the body reaches the copy of, where it does so as `reach` says.
+private local_root(scan: &CopyScan, e: TExpr, reach: CopyReach) -> Option[int] = *e.kind match
+    TLoad(name, _) -> copy_local(scan, name) match
+        Some(l) -> if l.reach == reach then Some(l.slot) else None
+        None -> None
     _ -> None
 
 private held_by_value(t: Type) -> bool = t match
