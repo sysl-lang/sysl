@@ -1,0 +1,185 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// **`unit` is a value the evaluator holds.** A `const` function may answer `Ok(())`, an `Option[()]`, a
+// struct with a `unit` field, or end in a call answering `unit`, and the declaration check accepts
+// each; the evaluator used to refuse every one of them with "a value was wanted and nothing was
+// produced", so a `const` asking for one failed to compile and a module `val` built from one was
+// quietly filled at startup, which shuts it out of a freestanding image.
+//
+// Every positive case prints the same calls twice -- once as constants, once made at run time -- and
+// the two lines must agree.
+
+private cun_ready() -> bool = enm_ready()
+
+// A freestanding archive's LLVM text, or the first thing the compilation said.
+private cun_archive(text: string) -> string
+    val t = target_named("thumbv6m-freestanding").unwrap()
+    var units: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> return "skipped"
+        Ok(root) -> std_units(root, t) match
+            Err(_) -> return "skipped"
+            Ok(read) -> units = read
+
+    val parsed = parse(source_of("main.sysl", forms_imported(text)), t)
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    units.push(parsed.program)
+
+    val done = analyze_produced(units, t, buf(), false)
+
+    for item in done.reported
+        if !item.src.name.starts_with("library/") then return item.diag.message
+
+    val whole = program_of(done, done.main_module) with { entry_point = false, c_artifact = true }
+    var own: Buf[string] = buf()
+
+    own.push("")
+
+    val pr = post_analysis_checks(done.an, whole, own)
+
+    for item in done.an.diagnostics()
+        if !item.src.name.starts_with("library/") then return item.diag.message
+
+    ir_print_module(codegen_with_gaps(prune(strip_tests(whole), own), t, pr).0)
+end cun_archive
+
+// The storage is the constant the object file carries, and nothing runs before `main` to fill it.
+private cun_laid_down(out: string, global: string)
+    if out == "skipped" then return
+
+    assert(out.contains(global), out)
+    assert(!out.contains("llvm.global_ctors"), out)
+end cun_laid_down
+
+// Both lines a differential program prints, which must be the same line.
+private cun_agree(text: string, expected: string)
+    assert_eq(enm_ran(text), s"$expected\n$expected\n")
+
+@test("'Ok(())' from a 'const' function is held, and matched while compiling")
+cun_ok_of_unit()
+    if !cun_ready() then return
+
+    cun_agree("const done(x: int) -> Result[(), string] = if x > 0 then Ok(()) else Err(\"no\")\n\n" +
+              "const seen(x: int) -> int\n    done(x) match\n        Ok(()) -> 1\n        Err(_) -> 2\n\n" +
+              "const A = seen(3)\nconst B = seen(-3)\n\nprint(A, B)\nprint(seen(3), seen(-3))\n", "1 2")
+end cun_ok_of_unit
+
+@test("a module 'val' of it is laid down as data for a freestanding archive")
+cun_ok_of_unit_laid_down()
+    if !cun_ready() then return
+
+    cun_laid_down(cun_archive("const done(x: int) -> Result[(), string] = if x > 0 then Ok(()) else Err(\"no\")\n\n" +
+                              "const seen(x: int) -> int\n    done(x) match\n        Ok(()) -> 5\n        Err(_) -> 6\n\n" +
+                              "val SEEN = seen(1)\n\n@export(\"main\")\nmain_entry() -> int = SEEN\n"),
+                  "@SEEN = private constant i32 5\n")
+end cun_ok_of_unit_laid_down
+
+@test("a 'Result[(), E]' module 'val' is itself laid down, whichever side it holds")
+cun_result_val_laid_down()
+    if !cun_ready() then return
+
+    val out = cun_archive("const done(x: int) -> Result[(), int] = if x > 0 then Ok(()) else Err(x)\n\n" +
+                          "val GOOD = done(1)\nval BAD = done(-4)\n\n" +
+                          "@export(\"main\")\nmain_entry() -> int = (GOOD match\n    Ok(()) -> 1\n    Err(e) -> e) + " +
+                          "(BAD match\n    Ok(()) -> 0\n    Err(e) -> e)\n")
+
+    if out == "skipped" then return
+
+    assert(!out.contains("llvm.global_ctors"), out)
+end cun_result_val_laid_down
+
+@test("an 'Option[()]', present and absent")
+cun_option_of_unit()
+    if !cun_ready() then return
+
+    cun_agree("const some(x: int) -> Option[()] = if x > 0 then Some(()) else None\n\n" +
+              "const seen(x: int) -> int\n    some(x) match\n        Some(()) -> 1\n        None -> 2\n\n" +
+              "const A = seen(1)\nconst B = seen(0)\n\nprint(A, B)\nprint(seen(1), seen(0))\n", "1 2")
+end cun_option_of_unit
+
+@test("a struct with a 'unit' field is built, read and compared while compiling")
+cun_struct_with_a_unit_field()
+    if !cun_ready() then return
+
+    cun_agree("struct Tagged\n    n: int\n    nothing: ()\n\n" +
+              "const make(n: int) -> Tagged = Tagged(n, ())\n\n" +
+              "const read(n: int) -> int\n    val t = make(n)\n    val u = t.nothing\n    t.n + 1\n\n" +
+              "const A = read(4)\n\nprint(A)\nprint(read(4))\n", "5")
+end cun_struct_with_a_unit_field
+
+@test("a struct with a 'unit' field made by its zero")
+cun_zero_of_a_struct_with_a_unit_field()
+    if !cun_ready() then return
+
+    cun_agree("struct Tagged\n    n: int\n    nothing: ()\n\n" +
+              "const zero() -> int\n    var t: Tagged\n    t.n\n\n" +
+              "const A = zero()\n\nprint(A)\nprint(zero())\n", "0")
+end cun_zero_of_a_struct_with_a_unit_field
+
+@test("a struct with a 'unit' field as a module 'val' is laid down for a freestanding archive")
+cun_struct_val_laid_down()
+    if !cun_ready() then return
+
+    cun_laid_down(cun_archive("struct Tagged\n    n: int\n    nothing: ()\n\n" +
+                              "const make(n: int) -> Tagged = Tagged(n, ())\n\n" +
+                              "val T = make(7)\n\n@export(\"main\")\nmain_entry() -> int = T.n\n"),
+                  "@T = private constant")
+end cun_struct_val_laid_down
+
+@test("a 'Result[(), E]' through '?' hands the failure back or goes on")
+cun_question_mark_over_unit()
+    if !cun_ready() then return
+
+    cun_agree("const step(x: int) -> Result[(), string] = if x > 0 then Ok(()) else Err(\"no\")\n\n" +
+              "const chain(x: int) -> Result[int, string]\n    step(x)?\n    step(x + 1)?\n    Ok(x)\n\n" +
+              "const score(x: int) -> int\n    chain(x) match\n        Ok(n) -> n\n        Err(_) -> -1\n\n" +
+              "const A = score(3)\nconst B = score(-3)\n\nprint(A, B)\nprint(score(3), score(-3))\n", "3 -1")
+end cun_question_mark_over_unit
+
+@test("a 'const' function whose body ends in a call answering 'unit'")
+cun_body_ends_in_a_unit_call()
+    if !cun_ready() then return
+
+    cun_agree("const nop(x: int)\n    _ = x\n\nconst outer(x: int) = nop(x)\n\n" +
+              "const wrapped(x: int) -> Result[(), string]\n    Ok(outer(x))\n\n" +
+              "const seen(x: int) -> int\n    wrapped(x) match\n        Ok(()) -> 9\n        Err(_) -> 0\n\n" +
+              "const A = seen(2)\n\nprint(A)\nprint(seen(2))\n", "9")
+end cun_body_ends_in_a_unit_call
+
+@test("a 'unit' bound to a local, passed on and returned")
+cun_unit_through_a_local()
+    if !cun_ready() then return
+
+    cun_agree("const pass[T](x: T) -> T = x\n\n" +
+              "const seen() -> int\n    val u = ()\n    val v = pass(u)\n    Some(v) match\n        Some(()) -> 3\n" +
+              "        None -> 4\n\n" +
+              "const A = seen()\n\nprint(A)\nprint(seen())\n", "3")
+end cun_unit_through_a_local
+
+@test("a 'const' function answering a 'unit' is still refused for what it does besides")
+cun_still_refused()
+    if !cun_ready() then return
+
+    val out = enm_outcome("const f() -> Result[(), int]\n    print(1)\n    Ok(())\n\nconst X = 1\n\nprint(X)\n")
+
+    assert(!out.1, out.0)
+    assert(out.0.contains("'f' is 'const', so it runs while compiling, and it prints"), out.0)
+    assert(!out.0.contains("a value was wanted"), out.0)
+end cun_still_refused
+
+@test("a 'unit' field beside a 'Buf' the run made is filled at startup, as before")
+cun_unit_field_beside_storage()
+    if !cun_ready() then return
+
+    assert_eq(enm_ran("import sysl.buf.{Buf, buf}\n\nstruct Holder\n    items: Buf[int]\n    nothing: ()\n\n" +
+                      "const make() -> Holder\n    var b: Buf[int] = buf()\n    b.push(1)\n    Holder(b, ())\n\n" +
+                      "val H = make()\n\nprint(H.items.len())\n"), "1\n")
+end cun_unit_field_beside_storage
