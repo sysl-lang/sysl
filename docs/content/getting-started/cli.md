@@ -481,6 +481,12 @@ own, with a temporary directory or a port the system picks, or be listed in its 
 alongside. The manifest's `test` block can also set the run's `jobs` and `timeout`, and the flags
 override it.
 
+**The same count bounds the build.** A large tree's link compiles its code in several pieces at once,
+and `--jobs <n>` keeps at most `n` of those compiles running too. The suite is compiled by a second
+`sysl` process, which exits before the first test starts. A long run therefore holds only what its
+tests need, not what the compile needed. Its notes and errors appear exactly as they would from one
+process.
+
 **`--features <list>` and `--option <name=value>`** choose what the package's own suite is built
 with. The `test` block's `features` and `options` are the defaults, `--features` replaces the block's
 list, and each `--option` overrides one key (it may be repeated). They are the same flags and the

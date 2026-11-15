@@ -1244,18 +1244,16 @@ end own_box
 // Hands a statement to the scope being emitted. Nothing is emitted here -- the `defer` itself costs
 // no instruction, and the statement is laid down at each edge that leaves the block.
 //
-// An `errdefer` is held whole, so that the way out laying it down can tell it from a `defer`.
+// **The statement is held whole**, as the `TDefer` it arrived in. One written statement can be
+// analyzed into several -- `_ = f()` declares its hidden local, writes it and empties it again --
+// and a scope lays what it holds last-first, so held one by one they would run backwards: the
+// emptying store before the declaration, reading storage nothing has written. Held whole, they run
+// in the order they were written, and an `errdefer` is told from a `defer` by the same entry.
 defer_stmts(e: *Emit, stmts: Buf[TStmt], when: TDeferWhen)
     if e.defer_marks.is_empty() then return
 
-    when match
-        TEveryExit ->
-            for stmt in stmts
-                e.defers.push(stmt)
-                e.defer_at.push(e.owned_slots.len())
-        TFailureExit(_) ->
-            e.defers.push(TDefer(stmts, when))
-            e.defer_at.push(e.owned_slots.len())
+    e.defers.push(TDefer(stmts, when))
+    e.defer_at.push(e.owned_slots.len())
 end defer_stmts
 
 // Emits the releases for the innermost scope without popping it -- the guard-failure path out of a
@@ -1385,11 +1383,28 @@ private lay_deferred(e: *Emit, run: Buf[TStmt])
 
     e.exit = Leaving
 
-    if on_failure(run[0]) then failure_run(e, exit, run) else gen_stmt(e, run[0])
+    if on_failure(run[0]) then failure_run(e, exit, run) else lay_in_order(e, run[0])
 
     e.exit = exit
     nowrap_resume(e)
 end lay_deferred
+
+// A `defer`'s statements, first written first, **in a scope of their own**. A local the statement
+// declares -- the hidden one of `_ = f()` -- is owned by that scope and given back as the laying
+// ends. Owned by the scope being left instead, it would outlive the laying: a `?` that lays the
+// statement down on its way out would leave the local registered with the function's scope, and the
+// function's ordinary end would release it before its own laying had written it.
+private lay_in_order(e: *Emit, held: TStmt)
+    push_owned(e)
+
+    held match
+        TDefer(stmts, _) ->
+            for stmt in stmts
+                gen_stmt(e, stmt)
+        _ -> gen_stmt(e, held)
+
+    pop_owned(e)
+end lay_in_order
 
 // Whether a scheduled statement is an `errdefer`, which a scope holds whole -- with its binder --
 // rather than as the statements it schedules.
@@ -1443,8 +1458,13 @@ private lay_failure_run(e: *Emit, run: Buf[TStmt], v: Val, ty: Type)
                     emit(e, InStore(lty(e, bty), payload[0], slot, AccPlain, None))
                 end if
 
+                // Its own scope, as a `defer`'s laying has (`lay_in_order`).
+                push_owned(e)
+
                 for stmt in stmts
                     gen_stmt(e, stmt)
+
+                pop_owned(e)
             _ -> ()
 end lay_failure_run
 
