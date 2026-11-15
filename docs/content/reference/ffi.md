@@ -1222,6 +1222,7 @@ load, which is what makes this work on Android.
 |---|---|
 | `sysl build`, `sysl test` | its own entry point, before the first statement — a library's storage included, since a library joins the program as source |
 | `sysl build-c` | a constructor the platform runs before the C project's `main` |
+| `sysl build-c --shared` | the same constructor, run by the loader when the library is opened |
 
 **A `val` whose initializer is constant data is not in the question at all**, because nothing runs to
 fill it — the constant is written straight into the object file, which is the rule C already has for
@@ -1889,6 +1890,23 @@ about what *your* image contains, and an image that never reaches the module has
 That reading is at its strongest where the attributes matter most: a vector table slot and a
 RAM-resident `.ramfunc` region are the scarcest things on the parts they exist for, so gaining every
 unimported module's silently is the worse way to be wrong.
+
+### A shared library, and what crosses between two
+
+`sysl build-c --shared` links a module into a `.dylib` or `.so` instead of an archive
+([the CLI](/getting-started/cli/#a-shared-library) has the flags). **What the library exports is
+exactly what its header declares**: the public `@export` functions and storage. A private export
+stays inside the library, as it stays inside an archive's image, and every other symbol the runtime
+defines is local to it.
+
+**Each library carries its own copy of the runtime**, and that sets the rule for two of them in one
+process: **a sysl object crosses between two sysl shared libraries only through their C API.** A
+reference count, a `Buf`'s storage, a closure's environment and a trait object's table all belong to
+the library that made them; the other library's code would read them with a runtime that is not
+theirs. What crosses is what crosses between two C libraries: scalars, pointers, structs of those, and
+handles each library creates, hands out and takes back through its own exports. Both libraries
+allocate through the C heap, so memory is not the problem — ownership is. A runtime shared between
+libraries is not built.
 
 ## A module may supply another module's `extern`
 

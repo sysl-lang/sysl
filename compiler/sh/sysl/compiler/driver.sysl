@@ -1449,8 +1449,19 @@ end settle_image_link
 build_c_archive(path: string, named_target: Option[string], cc: Option[string], level: string,
                 out: Option[string], header_at: Option[string],
                 say: string -> unit, lto: Option[string] = None,
-                ll_at: Option[string] = None) -> Result[(string, string), Failure]
+                ll_at: Option[string] = None,
+                shared: Option[SharedLib] = None) -> Result[(string, string), Failure]
     val t = target_for(path, named_target).map_err(said)?
+
+    // **A shared library is this ending with a link in place of `ar`** (`shared_library.sysl`), and
+    // what it cannot be built for is said before anything is compiled -- before the toolchain is
+    // asked for, since a machine with no loader needs none.
+    shared match
+        Some(s) ->
+            shared_refusal(s, t, out, lto) match
+                Some(why) -> return Err(Said(Refusal(why)))
+                None -> ()
+        None -> ()
 
     if !t.builds_with_clang() then return Err(Said(Refusal(t.no_toolchain())))
 
@@ -1469,7 +1480,7 @@ build_c_archive(path: string, named_target: Option[string], cc: Option[string], 
 
     val archive_at = out match
         Some(named) -> named
-        None -> s"${default_executable(path)}.a"
+        None -> s"${default_executable(path)}${if shared.is_some() then shared_suffix(t) else ".a"}"
 
     val header_out = header_at match
         Some(named) -> named
@@ -1495,7 +1506,8 @@ build_c_archive(path: string, named_target: Option[string], cc: Option[string], 
                 Ok(_) -> say(s"wrote $ll")
         None -> ()
 
-    val probed = supplied_or_refused(path, t).map_err(said)?
+    // A shared library is linked here, so what the packages link with is this build's to find.
+    val probed = supplied_or_refused(path, t, true, shared.is_some()).map_err(said)?
 
     val staging = make_temp_dir("sysl-c-") match
         Err(_) -> return Err(Said(Refusal("cannot make a directory to build the archive in")))
@@ -1503,13 +1515,23 @@ build_c_archive(path: string, named_target: Option[string], cc: Option[string], 
 
     var members: Buf[string] = buf()
 
-    val made = build_c_members(clang, archiver, staging, path, archive_at, lowered.emitted.text,
-                               &members, t, level, probed, lto)
+    // ELF code in a shared library is position-independent, and only there: the lever is put back
+    // whichever way the build ends, since this compiler drives more than one build in a process.
+    set_position_independent(shared.is_some() && shared_elf(t))
 
+    var finished = build_c_members(clang, archiver, staging, path, archive_at, lowered.emitted.text,
+                                   &members, t, level, probed, lto, shared.is_none())
+
+    if finished.is_ok()
+        shared match
+            Some(s) -> finished = link_shared(clang, staging, members, archive_at, t, level, lowered, probed, s)
+            None -> ()
+
+    set_position_independent(false)
     discard_objects(members)
     _ = remove_dir_all(staging)
 
-    made match
+    finished match
         Err(why) -> return Err(Said(why))
         Ok(_) -> ()
 
@@ -1528,8 +1550,11 @@ build_c_archive(path: string, named_target: Option[string], cc: Option[string], 
     // certainly meant to mark something. It is a warning rather than a refusal because an archive of
     // pure C shims is a real thing to want, and because the header says the same on its face.
     if lowered.exports.is_empty() && lowered.storage.is_empty()
-        say("sysl: warning: nothing in this module is marked '@export', so the archive has no C " +
-            "entry point")
+        say(s"sysl: warning: nothing in this module is marked '@export', so the " +
+            s"${if shared.is_some() then "library" else "archive"} has no C entry point")
+
+    // **A shared library is already linked**: what it needs it names itself, and the loader finds it.
+    if shared.is_some() then return Ok((archive_at, header_out))
 
     // The libraries this object still needs, which the C project's link line has to carry. Said here
     // because nothing downstream will say it: an unresolved sysl symbol at that link reads as a
@@ -1614,7 +1639,8 @@ end c_header_of
 // discarded whichever step failed.
 private build_c_members(clang: string, archiver: string, staging: string, path: string,
                         out: string, ir: string, members: *Buf[string], t: Target, level: string,
-                        probed: PkgAnswer, lto: Option[string]) -> Result[unit, Refusal]
+                        probed: PkgAnswer, lto: Option[string],
+                        archived: bool = true) -> Result[unit, Refusal]
     val code = s"$staging/$SyslibCodeMember"
 
     // A bitcode archive is one module: its units would be merged by a relocatable link, which reads
@@ -1671,6 +1697,9 @@ private build_c_members(clang: string, archiver: string, staging: string, path: 
             for j in 0..<kept.len()
                 members.push(kept[j])
 
+    // A shared library's members are linked by the caller rather than archived.
+    if !archived then return Ok(())
+
     directory_refusal(parent_of(out).unwrap_or(".")) match
         Some(why) -> return Err(Refusal(why))
         None -> ()
@@ -1682,6 +1711,58 @@ private build_c_members(clang: string, archiver: string, staging: string, path: 
         Err(why) -> Err(Refusal(why))
         Ok(_) -> Ok(())
 end build_c_members
+
+// The members linked into the shared library `out` (`shared_library.sysl`), told to export the
+// header's functions and storage and nothing else.
+//
+// **The library is linked under a pending name and published onto `out`**, so the file at `out` is
+// always a whole library, and a new one is a new file rather than the old one written over. A host
+// that has the previous build open keeps the pages it mapped -- writing into them in place is what
+// takes a running process down -- and a host watching for a new build never opens half of one.
+private link_shared(clang: string, staging: string, members: Buf[string], out: string, t: Target,
+                    level: string, lowered: LoweredForC, probed: PkgAnswer,
+                    s: SharedLib) -> Result[unit, Refusal]
+    var symbols: Buf[string] = buf()
+
+    for f in lowered.exports
+        symbols.push(f.exported.unwrap_or(""))
+
+    for v in lowered.storage
+        symbols.push(v.exported.unwrap_or(""))
+
+    val list = s"$staging/exports.${if shared_elf(t) then "map" else "txt"}"
+
+    write_text(list, shared_export_list(symbols, t)) match
+        Err(e) -> return Err(Refusal(io_refusal(list, e)))
+        Ok(_) -> ()
+
+    directory_refusal(parent_of(out).unwrap_or(".")) match
+        Some(why) -> return Err(Refusal(why))
+        None -> ()
+
+    val pending = pending_name(out)
+    val command = shared_link_command(clang, members, pending, t, level, lowered.emitted.links, probed, s,
+                                      list, out)
+
+    trace(s"link: ${join(command.view(), " ")}")
+
+    var args: Buf[string] = buf()
+
+    for i in 1..<command.len()
+        args.push(command[i])
+
+    told(command[0], args) match
+        Err(f) ->
+            _ = remove_file(pending)
+            return Err(Refusal(link_failure(clang, command, f)))
+        Ok(_) -> ()
+
+    publish_file(pending, out) match
+        Err(e) ->
+            _ = remove_file(pending)
+            Err(Refusal(io_refusal(out, e)))
+        Ok(_) -> Ok(())
+end link_shared
 
 // The standard module's C objects the program can reach (`c_reach.sysl`). Where the symbols of an
 // object cannot be read, every object is kept: an archive with too much in it links, one with too

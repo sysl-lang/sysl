@@ -16,7 +16,7 @@ alone. The [modules reference](/reference/modules/) describes the rule in full.
 | `sysl run [<path>]` | compile and execute |
 | `sysl build [<path>] -o <exe>` | compile to a native executable |
 | `sysl build-lib <path>` | check a library for one machine, writing nothing |
-| `sysl build-c <path> -o <archive>` | compile to a static archive and a C header, for a C project |
+| `sysl build-c <path> -o <archive>` | compile to a static archive and a C header, for a C project; with `--shared`, a shared library |
 | `sysl test [<path>]` | run the `@test` functions |
 | `sysl emit-llvm <path>` | print the generated LLVM IR |
 | `sysl emit-ast <path>` | print one file's untyped parse tree, as deterministic text |
@@ -333,6 +333,78 @@ handed, carrying the target's `target datalayout` as well as its `target triple`
 optimization: it is the same at every `-O` level and under `--lto`. The file is written before clang
 runs, so a module clang rejects can still be read; a directory that is not there is made, as it is for
 the archive and the header, and given twice the last `--emit-llvm` is the one written.
+
+#### A shared library
+
+```bash
+sysl build-c mylib --shared -o libmylib.dylib
+sysl build-c mylib --shared -o libmylib.so --target x86_64-linux --soname libmylib.so.1
+```
+
+`--shared` links what the archive would hold into a **shared library** for a host that opens it with
+`dlopen`, or links against it: a plugin, the reloadable half of a game, a JNI or Python extension. It
+is a Mach-O `.dylib` on macOS and an ELF `.so` on Linux and Android; without `-o` it is named for the
+project, with the platform's suffix. The header is written as it is for an archive, beside the
+library with `.h` appended unless `--header` names another path. What the library needs — `libm`,
+what `@link` named, what the packages' `pkg_config` modules link with — is linked into it, so the
+loader finds it when the host opens the library and nothing is left for the host's link line.
+
+**Each library is self-contained**: it carries its own copy of the standard library code it reaches,
+its own module storage, and its own copy of the runtime. **Only the `@export` functions and storage
+are exported** — the symbols the header declares. The runtime's own C-named symbols
+(`sysl_bounds_fail`, `sysl_stdout_write`) are global inside the library, where its own objects find
+them, and are not offered to the loader. Two sysl libraries opened by one process therefore never bind
+to each other's code, which is also why **a sysl object crosses between two of them only through
+their C API**: a `&T`, a `Buf` or a closure made by one is owned by that library's runtime, and the
+other library cannot take a share of it or free it. Pass data as C does — scalars, pointers, structs
+of those, and handles each library hands out and takes back itself. One runtime shared between
+libraries is not built.
+
+Module storage with a computed initializer is filled by a constructor the loader runs when the
+library is opened, before `dlopen` returns. A `@thread_local` in the library is reached the way a
+library opened with `dlopen` has to reach one: ELF code is compiled position-independent, which gives
+its thread-locals the general dynamic model, and Mach-O reaches every thread-local through its
+descriptor.
+
+The library's own name and version are settable, each for the object format that has it:
+
+| flag | format | what it sets | without it |
+|---|---|---|---|
+| `--install-name <name>` | Mach-O | the install name a program linked against the library records, and so where the loader looks | `@rpath/` and the file's name |
+| `--current-version <v>` | Mach-O | the library's current version, `X[.Y[.Z]]` | the linker's, `0` |
+| `--compatibility-version <v>` | Mach-O | the oldest version it stands in for, `X[.Y[.Z]]` | the linker's, `0` |
+| `--soname <name>` | ELF | the soname | the file's name |
+| `--version-script <file>` | ELF | the version script the link uses | one that exports the `@export` symbols and makes everything else local |
+
+A version script given with `--version-script` **replaces** the one the compiler writes, so it decides
+what the library exports; end its last node with `local: *;` to keep the runtime's symbols in. A
+setting of the other object format is refused rather than ignored, and so is any of them without
+`--shared`:
+
+```text
+$ sysl build-c mylib --shared --soname libmylib.so.1 -o libmylib.dylib
+sysl: error: '--soname' is an ELF setting, and aarch64-macos links Mach-O: its library's own name is given with '--install-name'
+$ sysl build-c mylib --soname libmylib.so.1 -o libmylib.a
+sysl: error: '--soname' is a setting of a shared library, and is given with '--shared'
+```
+
+A version ld64 cannot hold — more than three parts, a first part over 65535 or another over 255 — is
+refused before anything is built, and so is `-o` naming a static archive (`.a`, `.lib`) beside
+`--shared`, and `--lto`, whose bitcode is for a host's link to optimize when this link is the
+compiler's own. A Windows DLL is not built yet; a freestanding target has no loader to open one.
+
+**The library is written under a temporary name and moved onto the path `-o` names**, so the file
+there is always a whole library, and a rebuild is a new file rather than the old one written over: a
+process that has the previous build open keeps running it, and a host watching the path never opens
+half of one. That is what makes a **hot reload** work — close the library, rebuild it, open the same
+path again, and the new build's code is what runs, with whatever state the host owns kept. On macOS
+the closed image stays mapped, because macOS never unloads a library that has thread-local storage,
+and every sysl library that uses the heap has some (the runtime keeps a per-thread list for tearing
+structures down). The loader still opens the new file as a new library, so each reload leaves the
+previous build in memory, not in charge. **A build copied over the old file in place is not a
+reload**: the loader does not see a new file, so opening the path answers with the old code, and on
+macOS a process with the old pages mapped can be killed outright for running a file whose signature
+no longer matches. Move a new build into place, as `build-c` does; never copy it over.
 
 Like `build-lib`, `build-c` needs `llvm-ar` as well as `clang`. [FFI](/reference/ffi/) covers
 `@export` itself: what may be exported, how a symbol is named, and how module storage with a computed
