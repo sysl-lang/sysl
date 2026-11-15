@@ -320,6 +320,42 @@ sll_returns_take_none()
     assert(got.contains(s"%e = load i64, ptr %s\n  ret void"), got)
     assert(got.contains(s"%v = load i64, ptr %s\n  ${sll_end("s")}\n  br label %done"), got)
 
+@test("an arm whose last block a guarded enum walk split ends on the split's far side, past the walk")
+sll_guarded_walk_tail()
+    var entry: Buf[Inst] = buf()
+
+    entry.push(sll_slot("s"))
+
+    var head: Buf[Inst] = buf()
+
+    head.push(sll_store("s"))
+    head.push(sll_load("tag", "s"))
+
+    var blocks: Buf[IrBlock] = buf()
+
+    blocks.push(sll_block("entry", entry, InBr("arm")))
+    blocks.push(sll_block("arm", head, InCondBr(VReg("holds"), "arc.held1", "arc.walked2")))
+    blocks.push(sll_block("arc.held1", sll_one(sll_call("arc.dispose_at.Big", VReg("s"), false)),
+                          InBr("arc.walked2")))
+    blocks.push(sll_block("arc.walked2", sll_one(sll_load("v", "s")), InBr("done")))
+    blocks.push(sll_block("done", sll_none(), InRet(None, None)))
+
+    // The region was recorded before the split, when `arm` was its last block.
+    var regions: Buf[SlotRegion] = buf()
+
+    regions.push(SlotRegion("arm", "arm", -1))
+
+    var made_in: Map[string, int] = map()
+
+    made_in.put("s", 0)
+
+    val got = sll_run(blocks, regions, made_in)
+
+    assert(got.contains(s"arm:\n  ${sll_start("s")}"), got)
+    assert(got.contains(s"%v = load i64, ptr %s\n  ${sll_end("s")}\n  br label %done"), got)
+    assert(!got.contains(s"${sll_end("s")}\n  br i1 %holds"), got)
+end sll_guarded_walk_tail
+
 @test("a function that may suspend or return twice keeps every slot alive throughout")
 sll_suspending_functions_are_whole()
     for callee in ["llvm.coro.suspend", "setjmp"]

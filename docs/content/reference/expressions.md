@@ -2579,6 +2579,43 @@ print(*k, n)
 7 7
 ```
 
+**A writable view of a captured array is a view of the copy**, so handing one to a call is handing
+out the copy's address: `fill(out[0..<2])`, `fill(out[..])` and `fill(out)` where a `[]T` is wanted
+are asked the same questions `bump(&k)` is, and a write through one in the closure itself
+(`out[0..<2][0] = 7`) is a write of the copy as `out[0] = 7` is. A `[]const T` view only reads, and
+a view of a captured `Buf` or `&[N]T` is of storage both sides share.
+
+```sysl
+import sysl.threads.scope
+
+fill(dst: []u8) = dst[0] = 7
+
+var out = [0u8; 4]
+scope((s) -> s.spawn(() -> fill(out[0..<2])).join())
+print(out)
+```
+
+```error
+so it holds a copy of 'out' — so 'fill', which is handed a view of it, would reach that copy rather than the variable it came from, and the variable is used afterwards as though it had. Where you mean to change 'out', take the view outside the closure, hold it as a '&[4]byte' and view that, or have the closure return the value
+```
+
+A view taken outside the closure is a view of the variable, and crosses to the scoped thread:
+
+```sysl
+import sysl.threads.scope
+
+fill(dst: []u8) = dst[0] = 7
+
+var out = [0u8; 4]
+val v = out[0..<2]
+scope((s) -> s.spawn(() -> fill(v)).join())
+print(out)
+```
+
+```output
+[7, 0, 0, 0]
+```
+
 A call answering a value hands back what it read of the copy, so `() -> it.next()` reads its copy
 back and is a generator of its own. Where such a closure holds that capture by value it can no longer
 be held in a `val`, for the reason an escaping counter cannot: calling it writes its environment.

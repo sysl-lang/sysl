@@ -1,0 +1,122 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.from_int
+
+// **A walk of an enum whose variant holds no count costs a test, not a call.**
+//
+// Copying or letting go of a data enum calls its helper (`arc.copy.T`, `arc.dispose.T` and their
+// address forms), which tests the tag once per variant that holds a count. Where only some variants
+// hold one, a value of any other variant goes through the call and every test only to find nothing
+// to do -- and with thousands of call sites LLVM leaves the helper out of line. So each such call is
+// guarded here by one test of the tag, written in line: the call is made only where the variant holds
+// a count, and that arm is marked unlikely, so the fall-through is the variant that needs nothing.
+//
+// The test is chosen once per enum (`emit_arc.sysl`'s `tag_test`). An enum where every variant holds
+// a count, or none does, is left alone: the test would decide nothing.
+//
+// **The pass runs on a finished function**, after the retain / release pairs are cancelled -- which
+// looks for both halves in one block, and a guard puts the call in a block of its own -- and after a
+// large value's walk has been turned into the one that takes its address.
+
+// The test that says a value holds a count: its tag is this one; its bit is set in this mask, of an
+// integer this wide; or it lies in this run of tags.
+enum TagTest
+    TagIs(tag: long)
+    TagAmong(mask: long, bits: int)
+    TagWithin(low: long, count: long)
+
+// The blocks, with every guarded walk's call moved into an arm of its own.
+guard_enum_walks(e: *Emit, blocks: Buf[IrBlock]) -> Buf[IrBlock]
+    if e.tag_tests.is_empty() then return blocks
+
+    var out: Buf[IrBlock] = buf()
+
+    for b in blocks
+        guard_block(e, b, &out)
+
+    out
+end guard_enum_walks
+
+// One block, split at each guarded call: the test ends the part before it, the call is the unlikely
+// arm, and both arms meet where the rest of the block goes on. The function has no `phi` to update,
+// since nothing here writes one.
+private guard_block(e: *Emit, b: IrBlock, out: *Buf[IrBlock])
+    var label = b.label
+    var instrs: Buf[Inst] = buf()
+
+    for inst in b.instrs
+        val guard = guarded_walk(e, inst)
+
+        if guard.is_none()
+            instrs.push(inst)
+        else
+            val g = guard.unwrap()
+            val holds = tag_holds(e, g.0, g.1, g.2, &instrs)
+            val slow = fresh_label(e, "arc.held")
+            val after = fresh_label(e, "arc.walked")
+            var call: Buf[Inst] = buf()
+
+            call.push(inst)
+            out.push(IrBlock(label, instrs, Some(InCondBr(holds, slow, after))))
+            out.push(IrBlock(slow, call, Some(InBr(after))))
+            label = after
+            instrs = buf()
+
+    out.push(IrBlock(label, instrs, b.terminator))
+end guard_block
+
+// The test a call is guarded by, whether it is the address form, and the argument it walks -- where
+// the call is a walk of an enum that has one.
+private guarded_walk(e: *Emit, inst: Inst) -> Option[(TagTest, bool, IrArg)] = inst match
+    InCall(None, _, VGlobal(h), args, _, _, _, _) ->
+        if args.len() != 1 then None
+        else e.tag_tests.get(h) match
+            Some(t) -> Some((t.0, t.1, args[0]))
+            None -> None
+    _ -> None
+
+// Writes the test into `into`, and answers the `i1` that is true where the value holds a count --
+// already passed through `llvm.expect` as unlikely.
+private tag_holds(e: *Emit, test: TagTest, at: bool, arg: IrArg, into: *Buf[Inst]) -> Val
+    val tag = fresh_reg(e)
+
+    if at then into.push(InLoad(tag, l_i32(), arg.value, AccPlain, None))
+    else into.push(InExtract(tag, arg.ty, arg.value, index_list(0)))
+
+    val held = fresh_reg(e)
+
+    test match
+        TagIs(k) -> into.push(InIntCmp(held, IEq, l_i32(), tag, VInt(from_int(k))))
+        TagWithin(low, n) ->
+            val off = fresh_reg(e)
+
+            into.push(InBin(off, OpSub, l_i32(), tag, VInt(from_int(low))))
+            into.push(InIntCmp(held, IUlt, l_i32(), off, VInt(from_int(n))))
+        TagAmong(mask, bits) ->
+            val w = LInt(bits)
+            var shift = tag
+
+            if bits != 32
+                shift = fresh_reg(e)
+                into.push(InCast(shift, CastZExt, l_i32(), tag, w))
+
+            val bit = fresh_reg(e)
+            val hit = fresh_reg(e)
+
+            into.push(InBin(bit, OpShl, w, VInt(from_int(1)), shift))
+            into.push(InBin(hit, OpAnd, w, bit, VInt(from_int(mask))))
+            into.push(InIntCmp(held, INe, w, hit, VInt(from_int(0))))
+
+    val hinted = fresh_reg(e)
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(l_i1(), held))
+    args.push(ir_arg(l_i1(), VInt(from_int(0))))
+    into.push(ir_call(Some(hinted), l_i1(), VGlobal(llvm_expect_i1()), args))
+    e.uses_expect = true
+    hinted
+end tag_holds
+
+// The hint's name at the one width a condition has.
+llvm_expect_i1() -> string = llvm_expect_entry().base + ".i1"

@@ -313,7 +313,7 @@ private region_ranges(blocks: Buf[IrBlock], regions: Buf[SlotRegion], index: Map
 
         if lo.is_some() && hi.is_some()
             val a = lo.unwrap()
-            val z = hi.unwrap()
+            val z = walked_tail(blocks, hi.unwrap())
 
             if a >= 1 && a <= z
                 var sealed = true
@@ -330,6 +330,27 @@ private region_ranges(blocks: Buf[IrBlock], regions: Buf[SlotRegion], index: Map
 
     out
 end region_ranges
+
+// The block a region's last block ends in once the enum walks are guarded (`arc_fastpath.sysl`): a
+// block split at a guarded walk is the part before the test, the walk's own arm, and the part after,
+// laid one after another, and the last of them holds the terminator the region's last block had.
+private walked_tail(blocks: Buf[IrBlock], at: usize) -> usize
+    var z = at
+
+    while z + 2 < blocks.len()
+        val held = blocks[z + 1].label
+        val after = blocks[z + 2].label
+
+        if !held.starts_with("arc.held") || !after.starts_with("arc.walked") then return z
+
+        blocks[z].terminator match
+            Some(InCondBr(_, t, f)) -> if t != held || f != after then return z
+            _ -> return z
+
+        z += 2
+
+    z
+end walked_tail
 
 // The labels a block's terminator may send control to.
 private successors(t: Option[Inst]) -> Buf[string]

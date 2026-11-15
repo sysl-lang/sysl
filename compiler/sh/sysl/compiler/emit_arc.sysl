@@ -229,14 +229,79 @@ end walk_at
 private value_helper(e: *Emit, ty: Type, retain: bool) -> string
     val name = s"arc.${if retain then "copy" else "dispose"}.${mangle(ty)}"
 
+    note_tag_test(e, ty)
     request_helper(e, name, HrValue(ty, retain))
 end value_helper
 
 private slot_helper(e: *Emit, ty: Type, retain: bool) -> string
     val name = s"arc.${if retain then "copy_at" else "dispose_at"}.${mangle(ty)}"
 
+    note_tag_test(e, ty)
     request_helper(e, name, HrSlot(ty, retain))
 end slot_helper
+
+// Where some of an enum's variants hold a count and some do not, every call of its walk is guarded by
+// a test of the tag written in line (`arc_fastpath.sysl`). All four helpers are noted at once: a large
+// value's call is turned from the value form into the address form after it is written.
+private note_tag_test(e: *Emit, ty: Type)
+    val test = underlying(ty) match
+        Enum(d) -> tag_test(d)
+        _ -> None
+
+    if test.is_none() then return
+
+    val m = mangle(ty)
+
+    e.tag_tests.put(s"arc.copy.$m", (test.unwrap(), false))
+    e.tag_tests.put(s"arc.dispose.$m", (test.unwrap(), false))
+    e.tag_tests.put(s"arc.copy_at.$m", (test.unwrap(), true))
+    e.tag_tests.put(s"arc.dispose_at.$m", (test.unwrap(), true))
+end note_tag_test
+
+// The test that says a value of the enum holds a count, where some of its variants hold one and some
+// do not; nothing where every variant does, or none does, since then the tag decides nothing.
+//
+// One counted variant is an equality. Otherwise, where every tag is below 63, a counted variant is a
+// bit of a constant mask; past that, a run of consecutive counted tags is a range. Anything else is
+// left to the helper.
+tag_test(d: &EnumType) -> Option[TagTest]
+    if d.simple then return None
+
+    var counted: Buf[long] = buf()
+    var high: long = 0
+    var small = true
+
+    for variant in d.variants
+        if variant.tag.to_long().is_none() then return None
+
+        val tag = variant.tag.to_long().unwrap()
+
+        if tag < 0 || tag > 62 then small = false
+        else if tag > high then high = tag
+
+        if fields_hold_counted(variant.fields) then counted.push(tag)
+
+    if counted.is_empty() || counted.len() == d.variants.len() then return None
+
+    if counted.len() == 1 then return Some(TagIs(counted[0]))
+
+    if small
+        var mask: long = 0
+
+        for tag in counted
+            mask = mask | (long(1) << tag)
+
+        return Some(TagAmong(mask, if high < 32 then 32 else 64))
+
+    var low = counted[0]
+    var top = counted[0]
+
+    for tag in counted
+        if tag < low then low = tag
+        if tag > top then top = tag
+
+    if top - low + 1 == long(counted.len()) then Some(TagWithin(low, top - low + 1)) else None
+end tag_test
 
 // Asks for a helper once, and hands back the name -- which is what a caller wants, since it asked in
 // order to call the thing. Generating one may ask for another, so it is a queue rather than a

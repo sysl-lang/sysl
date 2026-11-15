@@ -1181,6 +1181,7 @@ private value_text(v: Const, t: Type) -> string = v match
         _ -> s"&${link_key(image)}"
     ConstPtr(xs, at, _) -> s"&${value_text(xs[at], pointee(t).unwrap_or(Unknown))}"
     ConstUnset -> "nothing"
+    ConstUnit -> "()"
     ConstPun(addr, as_was) -> value_text(*addr, *as_was)
     ConstErased(_, _) -> s"a '${type_show(t)}'"
 
@@ -1333,6 +1334,7 @@ private value_literal(span: Span, v: Const, t: Type) -> Option[TExpr] = v match
     ConstStr(s) -> Some(TExpr(span, TStrLit(s)))
     ConstFloat(f) -> Some(TExpr(span, TFloatLit(float_pattern(f), underlying(t))))
     ConstQuad(hi, lo) -> Some(TExpr(span, TQuadLit(hi, lo, underlying(t))))
+    ConstUnit -> Some(TExpr(span, TUnitLit))
     ConstArray(xs) -> underlying(t) match
         Vector(_, _) -> vector_literal(span, xs, t)
         _ -> array_literal(span, xs, t)
@@ -2148,6 +2150,8 @@ private eval_value(r: &EvRun, e: TExpr) -> Result[Const, Flow]
 
     f match
         EvGave(v) -> Ok(v)
+        // What answers `unit` is a step that produced nothing, and `unit` is the value that stands for it.
+        EvNone if underlying(texpr_type(e)) == Unit -> Ok(ConstUnit)
         _ -> Err(passed(r, e.span, f))
 end eval_value
 
@@ -2167,7 +2171,7 @@ private zero_value(r: &EvRun, at: Span, ty: Type) -> Flow = underlying(ty) match
     Floating(_, _) -> EvGave(ConstFloat(0.0))
     Fixed(_, _, _) -> EvGave(ConstInt(from_int(0)))
     Bool -> EvGave(ConstBool(false))
-    Unit -> EvNone
+    Unit -> EvGave(ConstUnit)
     Str -> EvGave(ConstStr(""))
     Slice(_, _) -> EvGave(ConstView(buf(), 0, 0, -1))
     // A pointer's zero is null.
@@ -2208,7 +2212,7 @@ private record_holds_zero(d: &StructType) -> bool
     if d.opaque then return false
 
     for f in d.fields
-        if !holds_zero(f.1) || underlying(f.1) == Unit then return false
+        if !holds_zero(f.1) then return false
 
         // A union's zero is its first field's; the rest stand in.
         if d.union_layout then return true
@@ -2241,7 +2245,6 @@ private zero_record(r: &EvRun, at: Span, d: &StructType) -> Flow
 
         zero_value(r, at, f.1) match
             EvGave(v) -> out.push(v)
-            EvNone -> return refuse_form(r, at, "a 'unit' field is not evaluated while compiling yet")
             other -> return other
 
     EvGave(ConstRecord(if d.union_layout then union_variant(0) else -1, out))
@@ -4627,6 +4630,7 @@ private key_part(v: Const) -> string = v match
     // Never part of a key: a call handed a pointer reads, and may write, wherever it points.
     ConstPtr(_, _, _) -> "p"
     ConstUnset -> "u"
+    ConstUnit -> "()"
     ConstPun(_, _) -> "p"
     ConstErased(_, _) -> "e"
 
