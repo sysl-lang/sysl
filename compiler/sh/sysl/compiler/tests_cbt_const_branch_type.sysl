@@ -1,0 +1,140 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.buf
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.testing.skip
+
+// An untyped `const` in a branch of an `if` or an arm of a `match` is the literal it stands for, so
+// it takes the type its sibling knows exactly as the literal would (`reference/declarations.md`;
+// `guesses` in expr_flow.sysl). Run for the constant second and first, through an `elif` chain, a
+// match of several arms, a float and a character constant, inside a tuple, an array literal and an
+// `Option`, and against the cases that must still be refused: a value that does not fit, a typed
+// constant, and a name a branch of several lines declares for itself. A match whose arms disagree is
+// reported once, not again by whatever reads its value.
+
+private cbt_ready() -> bool = std_root().is_ok() && clang_available()
+
+private cbt_ran(text: string) -> string
+    val root = make_temp_dir("sysl-cbt").unwrap()
+    val exe = s"$root/built"
+
+    cbt_write(root, text)
+
+    val said = build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) -> s"did not build: ${failure_text(why)}"
+        Ok(_) ->
+            capture(exe, [], "", [], true) match
+                Err(_) -> "the program that was built could not be run"
+                Ok(out) -> if out.status.ok() then out.text else s"exited badly: ${out.text}"
+
+    remove_dir_all(root).unwrap_or(())
+    said
+end cbt_ran
+
+private cbt_report(text: string) -> string
+    val root = make_temp_dir("sysl-cbt").unwrap()
+
+    cbt_write(root, text)
+
+    val out = emit_llvm_text(root, None, DefaultOptimization, buf(), Some(buf())) match
+        Err(why) -> failure_text(why)
+        Ok(e) -> analysis_report(e.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end cbt_report
+
+private cbt_write(root: string, text: string)
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+private cbt_prints(text: string, printed: string)
+    if !cbt_ready() then skip("the standard module's source or clang is not on this machine")
+
+    assert_eq(cbt_ran(text), printed)
+
+private cbt_refused(text: string, said: string)
+    if std_root().is_err() then skip("the standard module's source is not on this machine")
+
+    val got = cbt_report(text)
+
+    assert(got.contains(said), s"wanted '$said', got: $got")
+
+private cbt_not_said(text: string, said: string, unsaid: string)
+    if std_root().is_err() then skip("the standard module's source is not on this machine")
+
+    val got = cbt_report(text)
+
+    assert(got.contains(said), s"wanted '$said', got: $got")
+    assert(!got.contains(unsaid), s"did not want '$unsaid', got: $got")
+
+// Each program ends by adding the branch's value to a `usize`, which only a `usize` value can be.
+private cbt_usize(body: string) -> string =
+    s"const KC = 256\nconst KD = 7\npick(k: usize, c: bool) -> usize\n$body\nprint(pick(3, true), pick(900, false))\n"
+
+// -- the constant takes its sibling's type ---------------------------------------------------------
+
+@test("an untyped constant in an if branch takes the other branch's usize, second or first")
+cbt_if_branch()
+    cbt_prints(cbt_usize("    val named = if k < KC then k else KC\n    named + k"), "6 1156\n")
+    cbt_prints(cbt_usize("    val named = if c then KC else k\n    named + k"), "259 1800\n")
+    cbt_prints(cbt_usize("    val both = if c then KC else KD\n    usize(both) + k"), "259 907\n")
+
+@test("an untyped constant in a match arm takes the other arms' usize, and the sum reads it")
+cbt_match_arm()
+    cbt_prints(cbt_usize("    val a: usize = if c then k else KC\n    val b = c match\n        true -> k\n" +
+                         "        false -> KC\n    a + b"), "6 512\n")
+    cbt_prints(cbt_usize("    val b = c match\n        true -> KC\n        false -> k\n    b + k"), "259 1800\n")
+
+@test("an untyped constant in an elif chain and among several match arms takes the knowing one's type")
+cbt_chains()
+    cbt_prints(cbt_usize("    val v = if k < 5 then KC elif c then k else KD\n    v + k"), "259 907\n")
+    cbt_prints(cbt_usize("    val v = if k < 5 then k elif c then KC else KD\n    v + k"), "6 907\n")
+    cbt_prints(cbt_usize("    val v = k match\n        3 -> KC\n        4 -> 5\n        5 -> k\n        _ -> KD\n    v + k"),
+               "259 907\n")
+
+@test("an untyped float constant takes an f32 branch's type, and a character constant a byte's")
+cbt_float_and_char()
+    cbt_prints("const P = 1.5\npick(f: f32, c: bool) -> f32\n    val g = if c then f else P\n    val h: f32 = g\n    h\n" +
+               "print(pick(2.0, true), pick(2.0, false))\n", "2 1.5\n")
+    cbt_prints("const Semi = ';'\npick(b: u8, c: bool) -> u8\n    val v = if c then b else Semi\n    val w: u8 = v\n    w\n" +
+               "print(pick(1, true), pick(1, false))\n", "1 59\n")
+
+@test("an untyped constant inside a tuple, an array literal and a Some takes the sibling's type")
+cbt_inside_constructions()
+    cbt_prints(cbt_usize("    val t = if c then (k, KC) else (KD, k)\n    t.0 + t.1"), "259 907\n")
+    cbt_prints(cbt_usize("    val xs = if c then [k, KC] else [KD, KD]\n    xs[0] + xs[1] + k"), "262 914\n")
+    cbt_prints(cbt_usize("    val o = if c then Some(k) else Some(KC)\n    o.unwrap() + k"), "6 1156\n")
+    cbt_prints(cbt_usize("    val xs = [k, KC]\n    xs[1] + k"), "259 1156\n")
+
+// -- what is still refused -------------------------------------------------------------------------
+
+@test("an untyped constant that does not fit its sibling's type is refused, naming the constant")
+cbt_does_not_fit()
+    cbt_refused("const Big = 300\npick(b: u8, c: bool) -> u8\n    val v = if c then b else Big\n    v\nprint(pick(1, true))\n",
+                "the constant 'Big' (300) does not fit")
+    cbt_refused("const Big = 300\npick(b: u8, c: bool) -> u8\n    val v = c match\n        true -> b\n        false -> Big\n" +
+                "    v\nprint(pick(1, true))\n", "the constant 'Big' (300) does not fit")
+
+@test("a typed constant in a branch is a value of its type, which no sibling changes")
+cbt_typed_constant()
+    cbt_refused("const M: i32 = 5\npick(k: usize, c: bool) -> usize\n    val v = if c then k else M\n    v\nprint(pick(1, true))\n",
+                "if branches have different types: usize and int")
+    cbt_refused("const M: i32 = 5\npick(k: usize, c: bool) -> usize\n    val v = c match\n        true -> k\n" +
+                "        false -> M\n    v\nprint(pick(1, true))\n", "match arms have different types: usize and int")
+
+@test("a name a branch of several lines declares for itself is that declaration, not the constant")
+cbt_branch_declares_the_name()
+    cbt_refused("const KC = 256\npick(k: usize, c: bool) -> usize\n    val v = if c then k else\n        val KC = \"s\"\n" +
+                "        KC\n    v\nprint(pick(1, true))\n", "if branches have different types: usize and string")
+
+@test("a match whose arms disagree is reported once, not again by the sum that reads it")
+cbt_match_no_cascade()
+    cbt_not_said("pick(k: usize, c: bool) -> usize\n    val b = c match\n        true -> k\n        false -> \"s\"\n" +
+                 "    b + k\nprint(pick(1, true))\n", "match arms have different types: usize and string",
+                 "'+' needs matching types")
+    cbt_not_said("const M: i32 = 5\npick(k: usize, c: bool) -> usize\n    val b = c match\n        true -> k\n" +
+                 "        false -> M\n    b + k\nprint(pick(1, true))\n", "match arms have different types: usize and int",
+                 "'+' needs matching types")
