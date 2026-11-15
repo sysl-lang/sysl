@@ -1,0 +1,344 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{canonicalize, current_dir, exists, make_dir_all, make_temp_dir, read_text, remove_dir_all,
+                set_current_dir, write_text}
+import sysl.process.{capture, Status}
+import sysl.text.Search
+
+// The include guard of the header `build-c` and `emit-header` write, and the name `-o` may give the
+// archive.
+//
+// **A guard is only worth anything if two headers in one C file have different ones.** A project
+// with no manifest used to be named for the path as typed, so `.` -- the way a person standing in
+// their project names it -- gave `SYSL___H`, and so did every other such header: the second one
+// included came out empty and its functions undeclared. A manifest's name is still the guard as it
+// stands; a project without one is named for where it really is, a fingerprint of its canonical path
+// beside the name. The tests that settle it are the ones clang judges: two headers in one `main.c`.
+//
+// Every test works in a directory of its own (and a process of its own, so moving the working
+// directory goes no further), and removes it.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+// A fresh directory, canonical, under which the test makes its projects.
+private hgd_scratch() -> string = canonicalize(make_temp_dir("sysl-hgd-").unwrap()).unwrap()
+
+// A headerless file with one export in `<dir>/lib.sysl`, no module line and no manifest -- the shape
+// the bug was found in.
+private hgd_lib(dir: string, symbol: string, value: int)
+    make_dir_all(dir).unwrap()
+    write_text(s"$dir/lib.sysl", s"@export(\"$symbol\")\nvalue() -> i32 = $value\n").unwrap()
+end hgd_lib
+
+private hgd_named(dir: string, name: string) =
+    write_text(s"$dir/sysl.hocon", s"package {\n  name = \"$name\"\n}\n").unwrap()
+
+// `body` run with `dir` as the working directory. The library root is named outright first, since
+// the one found from the starting directory would not be found from there.
+private hgd_from(dir: string, body: () -> unit)
+    val here = current_dir().unwrap()
+
+    pkc_set_env("SYSL_LIB", absolute_path(std_root().unwrap()))
+    set_current_dir(dir).unwrap()
+    body()
+    set_current_dir(here).unwrap()
+end hgd_from
+
+// The guard of the header `emit-header <target>` prints, from wherever the caller stands.
+private hgd_guard_of(target: string) -> string
+    val got = clx_ran(["sysl", "emit-header", target, "--no-std-lib"])
+
+    assert(got.0 == Fine, got.2)
+    hgd_guard(got.1)
+end hgd_guard_of
+
+// The macro a header's `#ifndef` line tests, and the header must define and close the same one.
+private hgd_guard(header: string) -> string
+    val start = header.index_of("#ifndef SYSL_").unwrap() + 8
+    var stop = start
+
+    while stop < header.bytes.len && header.bytes[stop] != u8('\n')
+        stop += 1
+
+    val guard = header[start..<stop]
+
+    assert(header.contains(s"#define $guard\n"), header)
+    assert(header.contains(s"#endif /* $guard */"), header)
+    guard
+end hgd_guard
+
+// `SYSL_<NAME>_<8 hex digits>_H`, the shape a project without a manifest is given.
+private hgd_fingerprinted(guard: string, name: string) -> bool
+    val head = s"SYSL_${name}_"
+
+    if !guard.starts_with(head) || !guard.ends_with("_H") then return false
+
+    if guard.bytes.len != head.bytes.len + 8 + 2 then return false
+
+    for i in head.bytes.len..<head.bytes.len + 8
+        val b = guard.bytes[i]
+
+        if !((b >= u8('0') && b <= u8('9')) || (b >= u8('A') && b <= u8('F'))) then return false
+
+    true
+end hgd_fingerprinted
+
+private hgd_exited_zero(s: Status) -> bool = s match
+    Exited(code) -> code == 0
+    _ -> false
+
+// -- the guard ------------------------------------------------------------------------------------
+
+@test("a project built as '.' is named for its directory, never for the dot")
+hgd_dot_is_the_directory()
+    if !clx_ready() then return
+
+    val scratch = hgd_scratch()
+
+    hgd_lib(s"$scratch/alpha", "a_one", 1)
+    hgd_from(s"$scratch/alpha", () ->
+        val guard = hgd_guard_of(".")
+
+        assert(guard != "SYSL___H", guard)
+        assert(hgd_fingerprinted(guard, "ALPHA"), guard))
+    remove_dir_all(scratch).unwrap_or(())
+end hgd_dot_is_the_directory
+
+// One project, one guard: the name and the fingerprint come off where it is, not off how it was typed.
+@test("and '.', './', the path, a trailing separator and a '..' detour all give the same guard")
+hgd_every_spelling_agrees()
+    if !clx_ready() then return
+
+    val scratch = hgd_scratch()
+    val dir = s"$scratch/alpha"
+
+    hgd_lib(dir, "a_one", 1)
+    make_dir_all(s"$scratch/other").unwrap()
+
+    val want = hgd_guard_of(dir)
+
+    assert(hgd_fingerprinted(want, "ALPHA"), want)
+    assert_eq(hgd_guard_of(s"$dir/"), want)
+    assert_eq(hgd_guard_of(s"$scratch/other/../alpha"), want)
+
+    hgd_from(dir, () ->
+        assert_eq(hgd_guard_of("."), want)
+        assert_eq(hgd_guard_of("./"), want))
+    hgd_from(scratch, () -> assert_eq(hgd_guard_of("alpha"), want))
+    remove_dir_all(scratch).unwrap_or(())
+end hgd_every_spelling_agrees
+
+@test("a bare file is named for its stem, fingerprinted, never for the dot of its directory")
+hgd_bare_file_is_its_stem()
+    if !clx_ready() then return
+
+    val scratch = hgd_scratch()
+
+    hgd_lib(s"$scratch/beta", "b_two", 2)
+    hgd_from(s"$scratch/beta", () ->
+        val guard = hgd_guard_of("lib.sysl")
+
+        assert(hgd_fingerprinted(guard, "LIB"), guard)
+        assert_eq(hgd_guard_of("./lib.sysl"), guard))
+    remove_dir_all(scratch).unwrap_or(())
+end hgd_bare_file_is_its_stem
+
+// Every probe directory is called `lib` somewhere: the name alone cannot tell two of them apart.
+@test("two same-named directories in different places get different guards")
+hgd_same_names_differ()
+    if !clx_ready() then return
+
+    val scratch = hgd_scratch()
+
+    hgd_lib(s"$scratch/x/lib", "x_one", 1)
+    hgd_lib(s"$scratch/y/lib", "y_two", 2)
+
+    val x = hgd_guard_of(s"$scratch/x/lib")
+    val y = hgd_guard_of(s"$scratch/y/lib")
+
+    assert(hgd_fingerprinted(x, "LIB"), x)
+    assert(hgd_fingerprinted(y, "LIB"), y)
+    assert(x != y, x)
+
+    // And the two files themselves, each named bare from where it is.
+    var bare: Buf[string] = buf()
+    val sink = &bare
+
+    hgd_from(s"$scratch/x/lib", () -> sink.push(hgd_guard_of("lib.sysl")))
+    hgd_from(s"$scratch/y/lib", () -> sink.push(hgd_guard_of("lib.sysl")))
+    assert(hgd_fingerprinted(bare[0], "LIB"), bare[0])
+    assert(bare[0] != bare[1], bare[0])
+    remove_dir_all(scratch).unwrap_or(())
+end hgd_same_names_differ
+
+// The project's own identity, and so the guard it had before: unchanged however the project is named.
+@test("a manifest's name is the guard as it stands, from '.', from the path and from a bare file")
+hgd_manifest_name_unchanged()
+    if !clx_ready() then return
+
+    val scratch = hgd_scratch()
+    val dir = s"$scratch/whatever"
+
+    hgd_lib(dir, "t_one", 1)
+    hgd_named(dir, "terndb")
+
+    assert_eq(hgd_guard_of(dir), "SYSL_TERNDB_H")
+    assert_eq(hgd_guard_of(s"$dir/lib.sysl"), "SYSL_TERNDB_H")
+    hgd_from(dir, () ->
+        assert_eq(hgd_guard_of("."), "SYSL_TERNDB_H")
+        assert_eq(hgd_guard_of("lib.sysl"), "SYSL_TERNDB_H"))
+    remove_dir_all(scratch).unwrap_or(())
+end hgd_manifest_name_unchanged
+
+@test("the guard build-c writes for '.' is the one emit-header prints")
+hgd_build_c_agrees()
+    if !clx_ready() then return
+
+    val scratch = hgd_scratch()
+    val dir = s"$scratch/alpha"
+
+    hgd_lib(dir, "a_one", 1)
+    hgd_from(dir, () ->
+        val printed = hgd_guard_of(".")
+        val got = clx_ran(["sysl", "build-c", ".", "-o", "liba.a"])
+
+        assert(got.0 == Fine, got.2)
+        assert_eq(hgd_guard(read_text("liba.a.h").unwrap()), printed))
+    remove_dir_all(scratch).unwrap_or(())
+end hgd_build_c_agrees
+
+// The reduction itself: `build-c .` in one directory, `build-c lib.sysl` in another, both headers in
+// one C file, both functions called. Before the fix both guards were `SYSL___H` and clang refused the
+// second call as an undeclared function.
+@test("two headers built as '.' and as a bare file are both seen by one C file")
+hgd_two_headers_in_one_c_file()
+    if !clx_ready() then return
+
+    val scratch = hgd_scratch()
+
+    hgd_lib(s"$scratch/a", "a_one", 1)
+    hgd_lib(s"$scratch/b", "b_two", 2)
+    hgd_from(s"$scratch/a", () ->
+        val got = clx_ran(["sysl", "build-c", ".", "-o", "liba.a"])
+
+        assert(got.0 == Fine, got.2))
+    hgd_from(s"$scratch/b", () ->
+        val got = clx_ran(["sysl", "build-c", "lib.sysl", "-o", "libb.a"])
+
+        assert(got.0 == Fine, got.2))
+
+    write_text(s"$scratch/main.c",
+        "#include <stdio.h>\n#include \"a/liba.a.h\"\n#include \"b/libb.a.h\"\n" +
+        "int main(void) { printf(\"%d %d\\n\", a_one(), b_two()); return 0; }\n").unwrap()
+
+    val built = capture("clang", ["-Werror=implicit-function-declaration", s"-I$scratch",
+                        s"$scratch/main.c", s"$scratch/a/liba.a", s"$scratch/b/libb.a", "-o",
+                        s"$scratch/caller"], "", [], true).unwrap()
+
+    assert(hgd_exited_zero(built.status), built.err.unwrap_or(built.text))
+
+    val ran = capture(s"$scratch/caller", [], "", [], true, 20000).unwrap()
+
+    assert(hgd_exited_zero(ran.status), ran.err.unwrap_or(ran.text))
+    assert_eq(ran.text.trim(), "1 2")
+    remove_dir_all(scratch).unwrap_or(())
+end hgd_two_headers_in_one_c_file
+
+// And the same for the commonest collision of all: two `lib` directories, named by their paths.
+@test("two same-named directories' headers are both seen by one C file")
+hgd_same_named_headers_in_one_c_file()
+    if !clx_ready() then return
+
+    val scratch = hgd_scratch()
+
+    hgd_lib(s"$scratch/x/lib", "x_one", 3)
+    hgd_lib(s"$scratch/y/lib", "y_two", 4)
+
+    for side in ["x", "y"]
+        val got = clx_ran(["sysl", "build-c", s"$scratch/$side/lib", "-o", s"$scratch/$side/lib.a"])
+
+        assert(got.0 == Fine, got.2)
+
+    write_text(s"$scratch/main.c",
+        "#include <stdio.h>\n#include \"x/lib.a.h\"\n#include \"y/lib.a.h\"\n" +
+        "int main(void) { printf(\"%d %d\\n\", x_one(), y_two()); return 0; }\n").unwrap()
+
+    val built = capture("clang", ["-Werror=implicit-function-declaration", s"-I$scratch",
+                        s"$scratch/main.c", s"$scratch/x/lib.a", s"$scratch/y/lib.a", "-o",
+                        s"$scratch/caller"], "", [], true).unwrap()
+
+    assert(hgd_exited_zero(built.status), built.err.unwrap_or(built.text))
+
+    val ran = capture(s"$scratch/caller", [], "", [], true, 20000).unwrap()
+
+    assert_eq(ran.text.trim(), "3 4")
+    remove_dir_all(scratch).unwrap_or(())
+end hgd_same_named_headers_in_one_c_file
+
+// -- '-o' with a shared library's name -------------------------------------------------------------
+
+// Refused before anything is built, so nothing is written under the name, and the diagnostic names
+// what to call it.
+@test("'-o' naming a shared library is refused, saying build-c writes a static archive")
+hgd_shared_names_refused()
+    if !clx_ready() then return
+
+    val scratch = hgd_scratch()
+
+    hgd_lib(scratch, "s_one", 1)
+
+    val cases = [("libterndb.dylib", "libterndb.a"), ("libterndb.so", "libterndb.a"),
+                 ("libterndb.so.1", "libterndb.a"), ("libterndb.so.1.2", "libterndb.a"),
+                 ("terndb.dll", "terndb.a")]
+
+    for i in 0..<cases.len
+        val named = s"$scratch/${cases[i].0}"
+        val got = clx_ran(["sysl", "build-c", scratch, "-o", named])
+
+        assert(got.0 == Failed, got.2)
+        assert(got.2.contains(s"'-o $named' names a shared library"), got.2)
+        assert(got.2.contains("build-c writes a static archive"), got.2)
+        assert(got.2.contains(s"'$scratch/${cases[i].1}'"), got.2)
+        assert(!exists(named), got.2)
+        assert(!exists(s"$named.h"), got.2)
+
+    remove_dir_all(scratch).unwrap_or(())
+end hgd_shared_names_refused
+
+// A name that merely holds the letters is not a shared library's: only the suffix decides.
+@test("and an archive name that only looks like one is still written")
+hgd_lookalike_names_written()
+    if !clx_ready() then return
+
+    val scratch = hgd_scratch()
+
+    hgd_lib(scratch, "s_one", 1)
+
+    for name in ["libsolo.a", "terndb.lib", "libdll.a"]
+        val got = clx_ran(["sysl", "build-c", scratch, "-o", s"$scratch/$name"])
+
+        assert(got.0 == Fine, got.2)
+        assert(exists(s"$scratch/$name"), got.2)
+        assert(exists(s"$scratch/$name.h"), got.2)
+
+    remove_dir_all(scratch).unwrap_or(())
+end hgd_lookalike_names_written
+
+// The default name is an archive's, and is not touched by the refusal.
+@test("and with no '-o' the archive takes its default '.a' name")
+hgd_default_name_written()
+    if !clx_ready() then return
+
+    val scratch = hgd_scratch()
+    val dir = s"$scratch/gamma"
+
+    hgd_lib(dir, "g_one", 1)
+
+    val got = clx_ran(["sysl", "build-c", dir])
+
+    assert(got.0 == Fine, got.2)
+    assert(exists(s"$dir/gamma.a"), got.2)
+    remove_dir_all(scratch).unwrap_or(())
+end hgd_default_name_written

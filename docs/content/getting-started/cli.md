@@ -310,8 +310,15 @@ can request it on the command line: `--lto thin` (or `full`) makes the archive L
 compiled as `sysl build` compiles its own objects in that mode, so the host's link optimizes across
 the boundary. `build-c` then notes on stderr that the archive must be linked with `-fuse-ld=lld`.
 
+The archive is always a static one, so `-o` may not give it a shared library's name: `-o
+libmylib.dylib` (or `.so`, `.so.1`, `.dll`) is refused, and the refusal names the `.a` to use
+instead. Without `-o` the archive is named for the project, with `.a`.
+
 The header is written beside the archive, with `.h` appended, unless `--header` names another path.
-Both paths are reported on stderr, together with the libraries the C project's link line still
+Its include guard is `SYSL_<NAME>_H` for a project whose manifest names it. A project without one is
+named for where it is — its directory's own name, resolved even when it was given as `.`, or a bare
+file's stem — with eight hex digits of its canonical path's fingerprint after the name
+(`SYSL_LIB_3F09A1C2_H`), so two such headers included in one C file never hide each other. Both paths are reported on stderr, together with the libraries the C project's link line still
 needs: what `@link` named, and the `pkg_config` modules the packages in the build require, given as
 the `pkg-config --libs …` command that produces their flags. A missing library shows up on the C
 side as an unresolved sysl symbol, which looks like a missing definition rather than a missing
