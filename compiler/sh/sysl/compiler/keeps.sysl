@@ -2357,13 +2357,21 @@ private kept_hard(evs: &EvBuf, how: string, by: TExpr) = evs.items.push(kept_ev(
 // storage of a slice held in what a parameter points at (`slot_place(self.elems, n, v)`) is held
 // through that parameter, at an element nobody can name (`SlotsMark`) -- and the caller says what
 // the parameter is: a buffer its own frame made, module storage, or its own parameter's
-// (`keeps_vessel.sysl`). Storage reached any other way is held anywhere at all.
+// (`keeps_vessel.sysl`). **A run cut from that storage is the same slots** -- `extend` cuts
+// `self.elems[count..<need]` once into a `val` and places into the cut -- whether written in place or
+// through a local bound once to the cut and never written. Storage reached any other way is held
+// anywhere at all.
 private slot_loc(o: &Origins, storage: TExpr) -> string
-    val owned = *storage.kind match
-        TField(_, _, _) -> true
-        _ -> false
+    *storage.kind match
+        TField(_, _, _) -> ()
+        TSlice(base, _, _, _, _) -> return slot_loc(o, base)
+        TLoad(n, _) ->
+            if stable_name(o, n) == "" then return ""
 
-    if !owned then return ""
+            return o.inits.get(n) match
+                Some(init) -> slot_loc(o, init)
+                None -> ""
+        _ -> return ""
 
     val loc = place_loc(o, storage)
 
