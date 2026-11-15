@@ -684,6 +684,10 @@ struct Origins
     // The integer locals whose address leaves the body's sight (`repoint_exposed`): one that holds an
     // address may be handed another one there.
     exposed: Map[string, bool]
+
+    // What each local was bound to, which says what it is only where it is bound once and never
+    // written (`stable_name`): `val run = self.elems[a..<b]` is that storage for as long as it lives.
+    inits: Map[string, TExpr]
 end Origins
 
 origins_of(cx: &KeepsCx, f: TFunc) -> &Origins
@@ -697,7 +701,7 @@ origins_of(cx: &KeepsCx, f: TFunc) -> &Origins
 
     val logged = cx.reads.len()
     val cuts = cx.cuts
-    val o: &Origins = Origins(cx, f.params, buf(), map(), false, map(), map(), map(), map())
+    val o: &Origins = Origins(cx, f.params, buf(), map(), false, map(), map(), map(), map(), map())
 
     walk_block_stmts(f.body, stmt_walk(false, s -> s match
         TRefDecl(n, _, place) -> o.refs.push((n, place))
@@ -873,7 +877,9 @@ end repoint
 
 private binding_stmt(o: &Origins, s: TStmt)
     s match
-        TVarDecl(n, _, _, _) -> bound(o, n)
+        TVarDecl(n, _, init, _) ->
+            bound(o, n)
+            o.inits.put(n, init)
         TRefDecl(n, _, place) ->
             o.unstable.put(n, true)
 
