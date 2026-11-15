@@ -1,0 +1,484 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+
+// **Inside `@packed`, an integer field occupies exactly its declared width** -- a `u24` three bytes,
+// a `u40` five, a `u48` six, a `u56` seven (`reference/attributes.md § Bitfields`). LLVM gives such an
+// integer the room of the next power of two even inside `<{ }>`, so the field is held as its bytes
+// (`ir_lower.sysl`'s `held_int_bytes`), and so is a bitfield struct's container of such a width.
+// Before, `{u24, u8}` was five bytes, its `u8` at byte 4, and an HTTP/2 frame header overlaid on its
+// nine bytes read the wrong fields and past its end.
+//
+// The axes crossed: the width (24, 40, 48, 56; signed; a simple enum on a `u24`); the position
+// (first, middle, last); the byte order (the machine's, `@byte_order(big)`); the access (a field read
+// of a value, a write through a place, a pointer overlay on a byte buffer, a destructuring, an
+// element of an array, `.bits` and `T::Bits`); module storage (a constant image); the C boundary (by
+// value both ways, against clang's bytes); a bitfield container of three bytes, alone, held in
+// another struct, held in a bitfield struct, in an array. Each at `-O0` and the default level.
+// Skipped: a big-endian machine -- no target sysl builds for is one, so the byte order of a constant
+// held as bytes has only the little-endian answer to check.
+
+private pkw_ready() -> bool = std_root().is_ok() && clang_available()
+
+private pkw_run(text: string, c: string, level: string) -> (Status, string, string)
+    val root = make_temp_dir("sysl-pkw").unwrap()
+
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    if !c.is_empty() then write_text(s"$root/probe.c", c).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, level, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (Status.Exited(-1), "", failure_text(why))
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> (Status.Exited(-1), "", "the program that was built could not be run")
+        Ok(out) -> (out.status, out.text, out.err.unwrap_or(""))
+end pkw_run
+
+// At both levels, the program exits cleanly having printed `printed` and nothing on standard error.
+private pkw_prints_with(text: string, c: string, printed: string)
+    if !pkw_ready() then return
+
+    for level in ["0", DefaultOptimization]
+        val (state, out, err) = pkw_run(text, c, level)
+
+        assert_eq(err, "")
+        assert_eq(out, printed)
+        assert(state == Status.Exited(0), s"-O$level stopped with $state")
+end pkw_prints_with
+
+private pkw_prints(text: string, printed: string) = pkw_prints_with(text, "", printed)
+
+// The bytes of a value, written out, which every test below reads its layout through.
+private val pkw_dump: string = raw"""
+    import sysl.raw.ptr_cast
+
+    dump(p: *u8, n: usize)
+        var s = ""
+
+        for i in 0..<n
+            s = s + s"${p[i]} "
+
+        print(s)
+    """
+
+// -- the finding ----------------------------------------------------------------------------------------
+
+@test("a packed u24 or u48 takes its declared width: {u24,u8} is 4 bytes, {u8,u24,u8} 5, {u48,u8} 7")
+pkw_the_finding()
+    pkw_prints(pkw_dump + raw"""
+        @packed
+        struct A
+            len: u24
+            kind: u8
+
+        @packed
+        @byte_order(big)
+        struct B
+            len: u24
+            kind: u8
+
+        @packed
+        struct C
+            kind: u8
+            len: u24
+            tail: u8
+
+        @packed
+        struct D
+            a: u48
+            b: u8
+
+        main()
+            print(sizeof(A), sizeof(B), sizeof(C), sizeof(D))
+            var a = A(0x010203, 9)
+            dump(ptr_cast(&a), 4)
+            var c = C(7, 0x010203, 9)
+            dump(ptr_cast(&c), 5)
+            print(c.tail, offsetof(C, tail), offsetof(D, b))
+        end main
+        """, "4 4 5 7\n3 2 1 9 \n7 3 2 1 9 \n9 4 6\n")
+end pkw_the_finding
+
+// -- every width, at every position ---------------------------------------------------------------------
+
+@test("u24, u40, u48 and u56 first, in the middle and last: sizes, offsets and the bytes stored")
+pkw_every_width_every_position()
+    pkw_prints(pkw_dump + raw"""
+        @packed
+        struct F24
+            a: u24
+            b: u8
+            c: u16
+
+        @packed
+        struct M40
+            a: u8
+            b: u40
+            c: u8
+
+        @packed
+        struct L48
+            a: u16
+            b: u48
+
+        @packed
+        struct M56
+            a: u8
+            b: u56
+            c: u8
+
+        main()
+            print(sizeof(F24), sizeof(M40), sizeof(L48), sizeof(M56))
+            print(offsetof(F24, b), offsetof(F24, c), offsetof(M40, b), offsetof(M40, c), offsetof(L48, b),
+                  offsetof(M56, c))
+            var f = F24(0x010203, 4, 0x0506)
+            dump(ptr_cast(&f), sizeof(F24))
+            print(f.a, f.b, f.c)
+            var m = M40(1, 0x0203040506, 7)
+            dump(ptr_cast(&m), sizeof(M40))
+            m.b = m.b + 1
+            print(m.a, m.b, m.c)
+            var l = L48(0x0102, 0x030405060708)
+            dump(ptr_cast(&l), sizeof(L48))
+            var s = M56(1, 0x02030405060708, 9)
+            dump(ptr_cast(&s), sizeof(M56))
+            s.c = 10
+            print(s.a, s.b, s.c)
+        end main
+        """, "6 7 8 9\n3 4 1 6 2 8\n3 2 1 4 6 5 \n66051 4 1286\n1 6 5 4 3 2 7 \n1 8640529671 7\n" +
+             "2 1 8 7 6 5 4 3 \n1 8 7 6 5 4 3 2 9 \n1 566265752454920 10\n")
+end pkw_every_width_every_position
+
+@test("a signed i24 and a simple enum on a u24 are three bytes in a packed struct, and read back")
+pkw_signed_and_enum()
+    pkw_prints(pkw_dump + raw"""
+        @packed
+        struct S24
+            a: i24
+            b: i8
+
+        enum K: u24
+            Lo = 1
+            Hi = 0x800000
+
+        @packed
+        struct E24
+            k: K
+            n: u8
+
+        main()
+            var s = S24(-2, -3)
+            dump(ptr_cast(&s), sizeof(S24))
+            print(s.a, s.b)
+            var e = E24(K.Hi, 3)
+            dump(ptr_cast(&e), sizeof(E24))
+            print(e.k == K.Hi, e.n)
+        end main
+        """, "254 255 255 253 \n-2 -3\n0 0 128 3 \ntrue 3\n")
+end pkw_signed_and_enum
+
+// -- the byte order ----------------------------------------------------------------------------------------
+
+@test("under @byte_order(big) a u24, u40, u48 and u56 keep their declared width and their stated order")
+pkw_byte_order_big()
+    pkw_prints(pkw_dump + raw"""
+        @packed
+        @byte_order(big)
+        struct B
+            a: u24
+            b: u40
+            c: u8
+            d: u48
+            e: u56
+
+        main()
+            print(sizeof(B), offsetof(B, b), offsetof(B, c), offsetof(B, d), offsetof(B, e))
+            var b = B(0x010203, 0x0405060708, 9, 0x0A0B0C0D0E0F, 0x10111213141516)
+            dump(ptr_cast(&b), sizeof(B))
+            print(b.a, b.b, b.c, b.d, b.e)
+            b.d = 1
+            dump(ptr_cast(&b), sizeof(B))
+        end main
+        """, "22 3 8 9 15\n1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 \n" +
+             "66051 17264150280 9 11042563100175 4522368954537238\n" +
+             "1 2 3 4 5 6 7 8 9 0 0 0 0 0 1 16 17 18 19 20 21 22 \n")
+end pkw_byte_order_big
+
+// -- through a pointer over a byte buffer -------------------------------------------------------------------
+
+@test("an HTTP/2 frame header overlaid on its nine bytes reads and writes the right ones")
+pkw_overlay_frame_header()
+    pkw_prints(pkw_dump + raw"""
+        @packed
+        @byte_order(big)
+        struct FrameHeader
+            len: u24
+            kind: u8
+            flags: u8
+            stream: u32
+
+        main()
+            print(sizeof(FrameHeader))
+            var frame: [11]u8 = [0, 0, 18, 1, 4, 0, 0, 0, 3, 0xEE, 0xEE]
+            val h: *FrameHeader = ptr_cast(&frame)
+            print(h.len, h.kind, h.flags, h.stream)
+            h.len = 0x0A0B0C
+            h.stream = 5
+            h.flags = h.flags + 1
+            dump(&frame[0], 11)
+        end main
+        """, "9\n18 1 4 3\n10 11 12 1 5 0 0 0 5 238 238 \n")
+end pkw_overlay_frame_header
+
+@test("a native-order u40 overlaid at an odd offset of a buffer, read and written")
+pkw_overlay_native()
+    pkw_prints(pkw_dump + raw"""
+        @packed
+        struct R
+            tag: u8
+            n: u40
+            last: u8
+
+        main()
+            var buf: [9]u8 = [0xAA, 1, 1, 2, 3, 4, 5, 6, 0xBB]
+            val r: *R = ptr_cast(&buf[1])
+            print(r.tag, r.n, r.last)
+            r.n = 0x1122334455
+            dump(&buf[0], 9)
+        end main
+        """, "1 21542142465 6\n170 1 85 68 51 34 17 6 187 \n")
+end pkw_overlay_native
+
+// -- arrays, destructuring, module storage -------------------------------------------------------------------
+
+@test("an array of a packed struct holding a u40 steps by its declared size, and its elements write")
+pkw_array_of_structs()
+    pkw_prints(pkw_dump + raw"""
+        @packed
+        struct M40
+            a: u8
+            b: u40
+            c: u8
+
+        main()
+            var arr: [3]M40 = [M40(1, 2, 3), M40(4, 5, 6), M40(7, 8, 9)]
+            print(sizeof([3]M40))
+            dump(ptr_cast(&arr), sizeof([3]M40))
+            arr[1].b = 0xFFFFFFFFFF
+            print(arr[1].a, arr[1].b, arr[1].c, arr[2].a, arr[2].b)
+        end main
+        """, "21\n1 2 0 0 0 0 3 4 5 0 0 0 0 6 7 8 0 0 0 0 9 \n4 1099511627775 6 7 8\n")
+end pkw_array_of_structs
+
+@test("a module val of packed structs holding a u24 is laid down as its declared bytes")
+pkw_module_storage()
+    pkw_prints(pkw_dump + raw"""
+        @packed
+        struct F24
+            a: u24
+            b: u8
+            c: u16
+
+        @packed
+        @byte_order(big)
+        struct B48
+            a: u48
+            b: u8
+
+        val table: [2]F24 = [F24(0x010203, 4, 0x0506), F24(0x0A0B0C, 0x0D, 0x0E0F)]
+        val big: B48 = B48(0x010203040506, 7)
+
+        main()
+            print(table[1].a, table[1].b, table[1].c, big.a, big.b)
+            var t = table
+            dump(ptr_cast(&t), sizeof([2]F24))
+            var g = big
+            dump(ptr_cast(&g), sizeof(B48))
+        end main
+        """, "658188 13 3599 1108152157446 7\n3 2 1 4 6 5 12 11 10 13 15 14 \n1 2 3 4 5 6 7 \n")
+end pkw_module_storage
+
+@test("a packed struct holding a u24 and a u56 destructures in a match")
+pkw_destructure()
+    pkw_prints(raw"""
+        @packed
+        struct P
+            a: u24
+            b: u8
+            c: u56
+
+        main()
+            P(0x010203, 4, 0x05060708090A0B) match
+                P(a, b, c) -> print(a, b, c)
+        end main
+        """, "66051 4 1414002152901131\n")
+end pkw_destructure
+
+// -- `.bits` and `T::Bits` ------------------------------------------------------------------------------------
+
+@test("a whole-byte packed struct with a u24 converts to its integer and back, in either byte order")
+pkw_bits_conversion()
+    pkw_prints(pkw_dump + raw"""
+        @packed
+        struct W
+            a: u24
+            b: u8
+
+        @packed
+        @byte_order(big)
+        struct WB
+            a: u24
+            b: u16
+
+        main()
+            val w = W::Bits(0xAABBCCDD)
+            print(w.a, w.b, W(0x112233, 0x44).bits)
+            val wb = WB::Bits(0x1122334455)
+            print(wb.a, wb.b, WB(0x010203, 0x0405).bits)
+            var v = WB(0x010203, 0x0405)
+            dump(ptr_cast(&v), sizeof(WB))
+        end main
+        """, "12307677 170 1141973555\n3359829 4386 17263821315\n1 2 3 4 5 \n")
+end pkw_bits_conversion
+
+// -- a bitfield container of three bytes -------------------------------------------------------------------------
+
+@test("a bitfield struct of 24 bits is three bytes alone, held in another, in a bitfield struct and in an array")
+pkw_three_byte_container()
+    pkw_prints(pkw_dump + raw"""
+        @packed
+        struct T3
+            lo: u4
+            hi: u20
+
+        @packed
+        @byte_order(big)
+        struct TB
+            lo: u4
+            hi: u20
+
+        @packed
+        struct Outer
+            t: T3
+            k: u8
+
+        @packed
+        struct Nest
+            a: u1
+            inner: T3
+            b: u7
+
+        val ct: T3 = T3(0xA, 0x12345)
+        val cb: TB = TB(0xA, 0x12345)
+        val co: Outer = Outer(T3(1, 2), 3)
+
+        main()
+            print(sizeof(T3), sizeof(TB), sizeof(Outer), sizeof(Nest), sizeof([4]T3), offsetof(Outer, k))
+            var t = ct
+            dump(ptr_cast(&t), 3)
+            var tb = cb
+            print(tb.lo, tb.hi)
+            tb.hi = 0xFEDCB
+            dump(ptr_cast(&tb), 3)
+            var o = co
+            dump(ptr_cast(&o), 4)
+            o.t.hi = 0x54321
+            print(o.t.lo, o.t.hi, o.k)
+            dump(ptr_cast(&o), 4)
+            var n = Nest(1, T3(0xF, 0xABCDE), 0x55)
+            n.inner.lo = 3
+            print(n.a, n.inner.lo, n.inner.hi, n.b)
+            print(T3::Bits(0x123456).hi, T3(1, 2).bits)
+            var arr: [3]T3 = [T3(1, 1), T3(2, 2), T3(3, 3)]
+            dump(ptr_cast(&arr), 9)
+            T3(9, 0x777) match
+                T3(lo, hi) -> print(lo, hi)
+        end main
+        """, "3 3 4 4 12 3\n90 52 18 \n10 74565\n254 220 186 \n33 0 0 3 \n1 344865 3\n17 50 84 3 \n" +
+             "1 3 703710 85\n74565 33\n17 0 0 34 0 0 51 0 0 \n9 1911\n")
+end pkw_three_byte_container
+
+// -- what was right before stays so ------------------------------------------------------------------------------
+
+@test("power-of-two fields and an unpacked u24 keep their layout: {u8,u32,u16} packed is 7, {u24,u8} plain 8")
+pkw_unchanged_neighbours()
+    pkw_prints(raw"""
+        @packed
+        struct P
+            a: u8
+            b: u32
+            c: u16
+
+        struct U
+            a: u24
+            b: u8
+
+        @packed
+        struct Ctrl
+            enable: u1
+            mode: u3
+            prescale: u4
+
+        main()
+            print(sizeof(P), offsetof(P, c), sizeof(U), offsetof(U, b), alignof(U), sizeof([2]u24))
+            print(sizeof(Ctrl), Ctrl(1, 5, 9).prescale)
+        end main
+        """, "7 5 8 4 4 8\n1 9\n")
+end pkw_unchanged_neighbours
+
+// -- the C boundary -----------------------------------------------------------------------------------------------
+
+private val pkw_c: string = raw"""
+    #include <stdint.h>
+
+    struct __attribute__((packed)) W { uint8_t a[3]; uint8_t b; };
+    struct __attribute__((packed)) M { uint8_t a; uint8_t b[5]; uint8_t c; };
+
+    uint32_t c_sum(struct W w) {
+        return (uint32_t)w.a[0] | ((uint32_t)w.a[1] << 8) | ((uint32_t)w.a[2] << 16) | ((uint32_t)w.b << 24);
+    }
+
+    struct W c_make(void) { struct W w = { {1, 2, 3}, 4 }; return w; }
+
+    struct M c_bump(struct M m) { m.b[0] += 1; m.c += 1; return m; }
+    """
+
+@test("a packed struct holding a u24 or a u40 crosses to C by value both ways as its declared bytes")
+pkw_c_by_value()
+    pkw_prints_with(raw"""
+        @packed
+        struct W
+            a: u24
+            b: u8
+
+        @packed
+        struct M
+            a: u8
+            b: u40
+            c: u8
+
+        extern c_sum(w: W) -> u32
+        extern c_make() -> W
+        extern c_bump(m: M) -> M
+
+        main()
+            print(c_sum(W(0x030201, 4)))
+            val w = c_make()
+            print(w.a, w.b)
+            val m = c_bump(M(1, 0x0504030201, 9))
+            print(m.a, m.b, m.c)
+        end main
+        """, pkw_c, "67305985\n197121 4\n1 21542142466 10\n")
+end pkw_c_by_value

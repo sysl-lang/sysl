@@ -2,6 +2,7 @@ module sysl.fs
 @requires(os)
 
 import sysl.fs.sys as fsys
+import sysl.text.from_utf8
 
 // A directory held open, and the files beneath it reached through it and through nothing else.
 //
@@ -61,6 +62,24 @@ struct Dir
 
     create_update(self, path: string) -> Result[File, IoError] =
         self.opened(path, fsys.open_read | fsys.open_write | fsys.open_create | fsys.open_truncate)
+
+    /** The whole-file functions, as `sysl.fs.read_bytes`, `read_text`, `write_bytes` and `write_text`
+     * do them and with the same errors (the OS's reason for a failed write included), with `path`
+     * beneath this directory and refused exactly as `open` and `create` refuse it.
+     */
+    read_bytes(self, path: string) -> Result[[]u8, IoError] = read_all(self.open(path)?)
+
+    read_text(self, path: string) -> Result[string, IoError]
+        var b = self.read_bytes(path)?
+
+        from_utf8(b) match
+            Ok(s) -> Ok(s)
+            Err(e) -> Err(InvalidUtf8(e.offset))
+    end read_text
+
+    write_bytes(self, path: string, bytes: []const u8) -> Result[unit, IoError] = put(self.create(path)?, bytes)
+
+    write_text(self, path: string, text: string) -> Result[unit, IoError] = self.write_bytes(path, text.bytes)
 
     /** What is at `path`, described as `sysl.fs.link_metadata` describes it: a link as the last
      * component is reported as a link (`is_link()`), never followed. A link above it is refused.

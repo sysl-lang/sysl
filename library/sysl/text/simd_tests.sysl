@@ -1,0 +1,273 @@
+module sysl.text
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.rand.rng
+
+// `from_utf8` and the byte search go sixteen bytes at a time and finish with a scalar walk, so the
+// answers that could change are the ones at the seams: an input shorter than a block, a block that
+// is not aligned to the buffer's start, a tail of every length, a match or a bad byte in every lane,
+// and a character that straddles two blocks. Each test below sets the vector path against a plain
+// scalar answer over all of those at once.
+
+/** The byte search as one byte at a time, which is the answer the vector path must give. */
+private scalar_find(h: []const u8, b: u8, from: usize) -> Option[usize]
+    var i = from
+
+    while i < h.len
+        if h[i] == b then return Some(i)
+
+        i += 1
+
+    None
+
+/** The well-formedness walk one character at a time, the answer `from_utf8` must give. */
+private scalar_utf8(b: []const u8) -> Option[Utf8Error]
+    var i: usize = 0
+
+    while i < b.len
+        val c = b[i]
+        var need: usize = 1
+        var lo: u8 = 128
+        var hi: u8 = 191
+
+        if c >= 128 && c < 194 || c >= 245 then return Some(Utf8Error(i, false))
+
+        if c >= 240 then
+            need = 4
+            if c == 240 then lo = 144
+            if c == 244 then hi = 143
+        elif c >= 224 then
+            need = 3
+            if c == 224 then lo = 160
+            if c == 237 then hi = 159
+        elif c >= 194 then
+            need = 2
+
+        for k in 1..<need
+            if i + k >= b.len then return Some(Utf8Error(i, true))
+
+            val t = b[i + k]
+
+            if t < (if k == 1 then lo else 128) || t > (if k == 1 then hi else 191) then
+                return Some(Utf8Error(i, false))
+
+        i += need
+
+    None
+
+private utf8_error_of(b: []const u8) -> Option[Utf8Error] = from_utf8(b) match
+    Ok(_) -> None
+    Err(e) -> Some(e)
+
+private filler(n: usize) -> Buf[u8]
+    var b: Buf[u8] = buf()
+
+    for i in 0..<n do b.push(u8(97 + i % 26))
+    b
+
+@test("the byte search finds a lone byte at every position of every length up to 80")
+sbf_every_position()
+    for n in 0..<81
+        var b = filler(n)
+
+        assert(b.view().index_of_byte(u8('!')).is_none(), "absent")
+
+        for p in 0..<n
+            b[p] = u8('!')
+            assert_eq(b.view().index_of_byte(u8('!')), Some(p))
+            b[p] = u8(97 + p % 26)
+
+@test("the byte search from every start and over every unaligned slice agrees with a scalar search")
+sbf_from_and_offsets()
+    var b = filler(100)
+
+    b[3] = 0
+    b[17] = 0
+    b[18] = 0
+    b[47] = 0
+    b[63] = 0
+    b[64] = 0
+    b[99] = 0
+
+    for start in 0..<20
+        val h = b.view()[start..<b.len()]
+
+        for end in 0..<(h.len + 1)
+            val s = h[0..<end]
+
+            for from in 0..<(end + 2)
+                assert_eq(s.index_of_byte_from(0, from), scalar_find(s, 0, from))
+
+@test("a block where every lane matches answers its first lane, and every later lane wins in turn")
+sbf_match_every_lane()
+    var b: Buf[u8] = buf()
+
+    for _ in 0..<48 do b.push(255)
+    assert_eq(b.view().index_of_byte(255), Some(0))
+    assert_eq(b.view().index_of_byte_from(255, 5), Some(5))
+    assert_eq(b.view().index_of_byte_from(255, 16), Some(16))
+
+    // Lane k and every lane after it match, so the answer is lane k: the lowest set bit decides.
+    for k in 0..<16
+        var c = filler(32)
+
+        for j in k..<32 do c[j] = 0
+        assert_eq(c.view().index_of_byte(0), Some(usize(k)))
+
+@test("the byte search looks for the byte and not its neighbours, at both ends of the byte range")
+sbf_near_misses()
+    for needle in [u8(0), 1, 127, 128, 254, 255]
+        var b: Buf[u8] = buf()
+
+        for i in 0..<40 do b.push(needle ^ u8(1 + i % 3))
+        assert(b.view().index_of_byte(needle).is_none())
+        b[37] = needle
+        assert_eq(b.view().index_of_byte(needle), Some(37))
+
+@test("a start past the end answers None, however far past")
+sbf_from_far_past_end()
+    val b = filler(40)
+
+    assert(b.view().index_of_byte_from(u8('a'), 41).is_none())
+    assert(b.view().index_of_byte_from(u8('a'), 0xFFFFFFFFFFFFFFF0).is_none())
+    assert(b.view().index_of_byte_from(u8('a'), 0xFFFFFFFFFFFFFFFF).is_none())
+
+@test("a string's byte search and a one-byte needle go the same way")
+sbf_string_receiver()
+    val s = "the quick brown fox jumps over the lazy dog -- the quick brown fox!"
+
+    assert_eq(s.index_of_byte(u8('!')), Some(s.len - 1))
+    assert_eq(s.index_of("!"), Some(s.len - 1))
+    assert_eq(s.index_of_byte_from(u8('q'), 5), Some(51))
+    assert_eq(s[1..<s.len].index_of_byte(u8('t')), Some(30))
+    assert(s.contains("!"))
+
+@test("random haystacks: the byte search agrees with a scalar search")
+sbf_random()
+    var g = rng(20261114, 3)
+
+    for _ in 0..<400
+        var b: Buf[u8] = buf()
+        val n = g.below(130)
+
+        for _ in 0..<n do b.push(u8(g.below(8)))
+
+        val h = b.view()
+        val from = usize(g.below(n + 2))
+
+        assert_eq(h.index_of_byte_from(7, from), scalar_find(h, 7, from))
+
+@test("ASCII of every length up to 80, from every unaligned start, is valid and is itself")
+sut_ascii_lengths()
+    val b = filler(100)
+
+    for start in 0..<17
+        for n in 0..<81
+            val s = b.view()[start..<start + n]
+
+            assert(from_utf8(s).is_ok())
+            assert_eq(from_utf8(s).unwrap().len, n)
+
+    assert_eq(from_utf8(b.view()[0..<5]).unwrap(), "abcde")
+
+@test("a bad byte at every position of every length up to 70 is reported at its own offset")
+sut_bad_byte_everywhere()
+    for bad in [u8(0x80), 0xBF, 0xC0, 0xC1, 0xF5, 0xFF]
+        for n in 1..<71
+            var b = filler(n)
+
+            for p in 0..<n
+                b[p] = bad
+                assert_eq(utf8_error_of(b.view()), Some(Utf8Error(p, false)))
+                b[p] = u8(97 + p % 26)
+
+@test("a sequence cut off by the end of the input is truncated at its lead byte, at every length")
+sut_truncated_tail()
+    for n in 1..<70
+        var b = filler(n)
+
+        b[n - 1] = 0xE2
+        assert_eq(utf8_error_of(b.view()), Some(Utf8Error(n - 1, true)))
+
+        if n >= 2 then
+            b[n - 2] = 0xE2
+            b[n - 1] = 0x82
+            assert_eq(utf8_error_of(b.view()), Some(Utf8Error(n - 2, true)))
+
+        if n >= 3 then
+            b[n - 3] = 0xF0
+            b[n - 2] = 0x9F
+            b[n - 1] = 0x98
+            assert_eq(utf8_error_of(b.view()), Some(Utf8Error(n - 3, true)))
+
+@test("an overlong, a surrogate and a value past U+10FFFF are refused at every offset")
+sut_ill_formed_sequences()
+    var forms: Buf[[4]u8] = buf()
+
+    forms.push([0xE0, 0x80, 0x80, 97])
+    forms.push([0xED, 0xA0, 0x80, 97])
+    forms.push([0xF4, 0x90, 0x80, 0x80])
+    forms.push([0xF0, 0x80, 0x80, 0x80])
+    forms.push([0xE2, 0x41, 0x80, 97])
+
+    for f in forms.view()
+        for p in 0..<40
+            var b = filler(48)
+
+            for k in 0..<4 do b[p + k] = f[k]
+            assert_eq(utf8_error_of(b.view()), Some(Utf8Error(p, false)))
+
+@test("a multi-byte character straddling every block boundary is valid, and a bad byte after it is found")
+sut_straddle()
+    val chars = ["é", "€", "😀"]
+
+    for c in chars
+        for p in 0..<40
+            var b = filler(56)
+
+            for k in 0..<c.len do b[p + k] = c.bytes[k]
+            assert(from_utf8(b.view()).is_ok())
+
+            for q in (p + c.len)..<56
+                val keep = b[q]
+
+                b[q] = 0xFF
+                assert_eq(utf8_error_of(b.view()), Some(Utf8Error(q, false)))
+                b[q] = keep
+
+@test("random bytes: from_utf8 agrees with a scalar walk on every input")
+sut_random()
+    var g = rng(20261114, 11)
+
+    for _ in 0..<3000
+        var b: Buf[u8] = buf()
+        val n = g.below(140)
+        val rate = g.below(40)
+
+        for _ in 0..<n
+            val r = g.below(1000)
+
+            // Mostly ASCII, with lead and continuation bytes often enough to make whole characters.
+            if r < rate then
+                b.push(u8(0xE2 + g.below(3)))
+            elif r < 2 * rate then
+                b.push(u8(0x80 + g.below(64)))
+            elif r < 2 * rate + 3 then
+                b.push(u8(g.below(256)))
+            else
+                b.push(u8(32 + g.below(95)))
+
+        val s = b.view()
+
+        assert_eq(utf8_error_of(s), scalar_utf8(s))
+
+@test("valid mixed text of every length agrees with a scalar walk")
+sut_mixed_valid()
+    val text = "plain ascii, then héllo wörld → 日本語 😀 and back to ascii for a while longer".bytes
+
+    for start in 0..<text.len
+        for end in start..<(text.len + 1)
+            val s = text[start..<end]
+
+            assert_eq(utf8_error_of(s), scalar_utf8(s))

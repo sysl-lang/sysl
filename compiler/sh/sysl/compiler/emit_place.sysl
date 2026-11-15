@@ -495,10 +495,9 @@ private container_at(e: *Emit, ranges: Buf[BitRange], receiver: TExpr, addr: Val
     if bit_place(receiver).is_none() then return load_container(e, ranges, receiver, addr)
 
     val inner = load_place(e, receiver, addr)
-    val t = fresh_reg(e)
+    val rt = texpr_type(receiver)
 
-    emit(e, InExtract(t, lty(e, texpr_type(receiver)), inner, index_list(0)))
-    t
+    extract_held(e, lty(e, rt), inner, 0, container_lty(ranges), container_held_of(rt))
 end container_at
 
 private load_container(e: *Emit, ranges: Buf[BitRange], receiver: TExpr, addr: Val) -> Val
@@ -523,10 +522,16 @@ store_over(e: *Emit, place: TExpr, p: Val, v: Val, cur: Option[Val]) -> unit = b
         if bit_place(b.0).is_some()
             val rty = lty(e, texpr_type(b.0))
             val c = container_at(e, b.1, b.0, p)
-            val inner = fresh_reg(e)
+            val held = container_held_of(texpr_type(b.0))
+            val inner =
+                if held == 0
+                    val r = fresh_reg(e)
 
-            emit(e, InInsert(inner, rty, VUndef, container_lty(b.1), write_bits(e, b.1, b.2, c, v),
-                             index_list(0)))
+                    emit(e, InInsert(r, rty, VUndef, container_lty(b.1), write_bits(e, b.1, b.2, c, v),
+                                     index_list(0)))
+                    r
+                else insert_held(e, rty, VUndef, container_lty(b.1), write_bits(e, b.1, b.2, c, v), 0, held)
+
             store_over(e, b.0, p, inner, None)
             return
 
@@ -602,6 +607,68 @@ end clear_mask
 // The container type a bitfield struct's fields are ranges of.
 container_lty(ranges: Buf[BitRange]) -> LType = LInt(bitfield_bits(ranges))
 
+// The bytes the container of a bitfield struct of type `t` is held in, or `0` (`held_int_bytes`).
+container_held_of(t: Type) -> int = bitfield_ranges_of(t) match
+    Some(ranges) -> container_held_bytes(ranges)
+    None -> 0
+
+// The bytes the `index`th field of a receiver of type `rty` is held in, or `0`.
+field_held_of(rty: Type, index: int) -> int = underlying(rty) match
+    Struct(d) -> field_held_bytes(d, d.fields[usize(index)].1)
+    _ -> 0
+
+// -- an integer held as bytes inside an aggregate value (`held_int_bytes`) ----------------------------
+//
+// The bytes are the integer's as storage has them, in the machine's own order, so the two turn into
+// each other through a slot: the bytes stored and the integer loaded, or the other way round. LLVM
+// turns the pair into shifts.
+
+// The `it` that `n` bytes held as `[n x i8]` are.
+held_value(e: *Emit, n: int, it: LType, bytes: Val) -> Val
+    val slot = alloca(e, fresh_reg(e), it)
+    val r = fresh_reg(e)
+
+    emit(e, InStore(LArr(n, LInt(8)), bytes, slot, AccPlain, None))
+    emit(e, InLoad(r, it, slot, AccPlain, None))
+    r
+end held_value
+
+// The `[n x i8]` an integer `v` of type `it` is held as.
+held_bytes(e: *Emit, n: int, it: LType, v: Val) -> Val
+    val slot = alloca(e, fresh_reg(e), it)
+    val r = fresh_reg(e)
+
+    emit(e, InStore(it, v, slot, AccPlain, None))
+    emit(e, InLoad(r, LArr(n, LInt(8)), slot, AccPlain, None))
+    r
+end held_bytes
+
+// Element `at` of the aggregate value `v`, of type `agg`, as the `it` it holds -- through its bytes
+// where it is held in `n` of them.
+extract_held(e: *Emit, agg: LType, v: Val, at: int, it: LType, n: int) -> Val
+    val r = fresh_reg(e)
+
+    emit(e, InExtract(r, agg, v, index_list(at)))
+    if n > 0 then held_value(e, n, it, r) else r
+end extract_held
+
+// The aggregate value `acc`, of type `agg`, with element `at` replaced by `x`, an `it` -- written as
+// its bytes where it is held in `n` of them.
+insert_held(e: *Emit, agg: LType, acc: Val, it: LType, x: Val, at: int, n: int) -> Val
+    if n == 0
+        val r = fresh_reg(e)
+
+        emit(e, InInsert(r, agg, acc, it, x, index_list(at)))
+        return r
+    end if
+
+    val bytes = held_bytes(e, n, it, x)
+    val r = fresh_reg(e)
+
+    emit(e, InInsert(r, agg, acc, LArr(n, LInt(8)), bytes, index_list(at)))
+    r
+end insert_held
+
 // A field's value at the container's own width, which a field occupying the whole of it already is.
 private widened_to(e: *Emit, ranges: Buf[BitRange], r: BitRange, v: Val, ct: LType) -> Val
     if r.width == bitfield_bits(ranges) then return v
@@ -630,9 +697,7 @@ private range_of(e: *Emit, r: BitRange, v: Val) -> Val = bitfield_ranges_of(r.ty
         None -> v
     Some(inner) ->
         val bits = bitfield_bits(inner)
-        val c = fresh_reg(e)
-
-        emit(e, InExtract(c, lty(e, r.ty), v, index_list(0)))
+        val c = extract_held(e, lty(e, r.ty), v, 0, LInt(bits), container_held_bytes(inner))
 
         if bits == r.width then return c
 
@@ -656,10 +721,7 @@ private field_of(e: *Emit, r: BitRange, raw: Val) -> Val = bitfield_ranges_of(r.
 
                 emit(e, InCast(t, CastZExt, LInt(r.width), raw, LInt(bits)))
                 t
-        val out = fresh_reg(e)
-
-        emit(e, InInsert(out, lty(e, r.ty), VUndef, LInt(bits), wide, index_list(0)))
-        out
+        insert_held(e, lty(e, r.ty), VUndef, LInt(bits), wide, 0, container_held_bytes(inner))
 
 // A field's value widened to the container and shifted to where it belongs.
 place_bits(e: *Emit, ranges: Buf[BitRange], r: BitRange, v: Val) -> Val
@@ -760,9 +822,8 @@ whole_bits(e: *Emit, t: Type, d: &StructType, v: Val) -> Val
 
     for i in 0..<ranges.len()
         val r = ranges[i]
-        val f = fresh_reg(e)
+        val f = extract_held(e, agg, v, int(i), lty(e, r.ty), field_held_bytes(d, r.ty))
 
-        emit(e, InExtract(f, agg, v, index_list(int(i))))
         vals.push(reordered(e, reversed_width(d, r.ty, little), f))
 
     build_bits(e, ranges, vals)
@@ -779,10 +840,8 @@ whole_from_bits(e: *Emit, t: Type, d: &StructType, c: Val) -> Val
     for i in 0..<ranges.len()
         val r = ranges[i]
         val f = reordered(e, reversed_width(d, r.ty, little), read_bits(e, ranges, r, c))
-        val next = fresh_reg(e)
 
-        emit(e, InInsert(next, agg, out, lty(e, r.ty), f, index_list(int(i))))
-        out = next
+        out = insert_held(e, agg, out, lty(e, r.ty), f, int(i), field_held_bytes(d, r.ty))
 
     out
 end whole_from_bits

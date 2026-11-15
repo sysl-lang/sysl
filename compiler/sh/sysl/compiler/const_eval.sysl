@@ -1855,8 +1855,142 @@ private eval_rest(r: &EvRun, e: TExpr) -> Flow
                 Err(f) -> f
             else if is_checked_member(op) then checked_member(r, e.span, op, operand, amount, width, ty)
             else bit_operation(r, e.span, op, operand, amount, width)
+        TTry(operand, ok, _, ret_enum, ret_fail, _, convert) -> tried(r, e.span, operand, ok, ret_enum, ret_fail, convert)
+        TEnumFromInt(value, en) -> enum_from_int(r, e.span, value, en, None)
+        TEnumTry(value, en, opt_ty, some, none) -> enum_from_int(r, e.span, value, en, Some((opt_ty, some, none)))
+        TEnumAttr(kind, en, arg, _) -> enum_attr(r, e.span, kind, en, arg)
         _ -> refuse_form(r, e.span, s"'${texpr_kind_name(e)}' is not evaluated while compiling yet")
 end eval_rest
+
+// `e?`: the success's payload, or the function returning the failure's, re-wrapped in its own return
+// type -- through the conversion the analyzer chose, called as any other function is.
+@noinline
+private tried(r: &EvRun, at: Span, operand: TExpr, ok: EnumVariant, ret_enum: Type, ret_fail: EnumVariant,
+              convert: Option[string]) -> Flow
+    val (variant, fields) = eval_value(r, operand) match
+        Ok(ConstRecord(v, fs)) -> (v, fs)
+        Ok(_) -> return refuse_form(r, at, "'?' on something that is not an enum")
+        Err(f) -> return f
+
+    if variant == variant_position(texpr_type(operand), ok)
+        return if fields.is_empty() then EvNone else EvGave(fields[0])
+
+    var carried: Buf[Const] = buf()
+
+    if convert.is_none()
+        for v in fields
+            carried.push(v)
+    else
+        call_with(r, at, convert.unwrap(), fields) match
+            EvGave(v) -> carried.push(v)
+            EvNone -> ()
+            other -> return other
+    end if
+
+    EvReturn(Some(ConstRecord(variant_position(ret_enum, ret_fail), carried)))
+end tried
+
+// -- a simple enum and its integers ------------------------------------------------------------------
+//
+// **A simple enum's value is held as its variant's position** (`ConstRecord(i, [])`), and its tag is
+// read off the declaration, so a cast and every attribute is a walk over the variant list -- the
+// chain the lowering emits (`emit_enum_attr.sysl`), and the traps where it would trap.
+
+// `E(n)` -- a miss traps -- and `E.try(n)`, where a miss is `None` (`opt` the option's type and
+// variants).
+@noinline
+private enum_from_int(r: &EvRun, at: Span, value: TExpr, en: Type,
+                      opt: Option[(Type, EnumVariant, EnumVariant)]) -> Flow
+    val n = eval_value(r, value) match
+        Ok(ConstInt(x)) -> x
+        Ok(_) -> return refuse_form(r, at, "an enum read out of something that is not an integer")
+        Err(f) -> return f
+
+    val d = underlying(en) match
+        Enum(found) -> found
+        _ -> return refuse_form(r, at, "an enum read out of an integer, into something that is not an enum")
+
+    var found = -1
+
+    for i in 0..<d.variants.len()
+        if found < 0 && cmp(d.variants[i].tag, n) == 0 then found = int(i)
+
+    if opt.is_none()
+        if found < 0 then return trap(r, at, s"no variant of '${type_show(en)}' has the value ${to_string(n)}")
+
+        return EvGave(ConstRecord(found, buf()))
+    end if
+
+    val (opt_ty, some, none) = opt.unwrap()
+
+    if found < 0 then return EvGave(ConstRecord(variant_position(opt_ty, none), buf()))
+
+    var inner: Buf[Const] = buf()
+
+    inner.push(ConstRecord(found, buf()))
+    EvGave(ConstRecord(variant_position(opt_ty, some), inner))
+end enum_from_int
+
+// `E::Pos`, `E::Val`, `E::Succ`, `E::Pred`, `E::Image` and `E::Value`.
+@noinline
+private enum_attr(r: &EvRun, at: Span, kind: string, en: Type, arg: TExpr) -> Flow
+    val d = underlying(en) match
+        Enum(found) -> found
+        _ -> return refuse_form(r, at, s"the enum attribute '$kind' of something that is not an enum")
+
+    val v = eval_value(r, arg) match
+        Ok(x) -> x
+        Err(f) -> return f
+
+    val count = int(d.variants.len())
+    val shown = type_show(en)
+
+    if kind == "Val"
+        val n = v match
+            ConstInt(x) -> x.to_long().unwrap_or(-1)
+            _ -> return refuse_form(r, at, s"'$shown::Val' of something that is not an integer")
+
+        if n < 0 || n >= long(count) then
+            return trap(r, at, s"'$shown' has no variant at position $n — it has $count")
+
+        return EvGave(ConstRecord(int(n), buf()))
+    end if
+
+    if kind == "Value"
+        val s = v match
+            ConstStr(x) -> x
+            _ -> return refuse_form(r, at, s"'$shown::Value' of something that is not a string")
+
+        for i in 0..<d.variants.len()
+            if d.variants[i].name == s then return EvGave(ConstRecord(int(i), buf()))
+
+        return trap(r, at, s"no variant of '$shown' is named \"$s\"")
+    end if
+
+    val pos = v match
+        ConstRecord(p, _) if p >= 0 && p < count -> p
+        _ -> return refuse_form(r, at, s"'$shown::$kind' of something that is not one of its variants")
+
+    if kind == "Pos" then return EvGave(ConstInt(from_int(long(pos))))
+
+    if kind == "Image" then return EvGave(ConstStr(d.variants[usize(pos)].name))
+
+    if kind == "Succ"
+        if pos + 1 >= count then
+            return trap(r, at, s"there is no variant after '${d.variants[usize(pos)].name}' in '$shown'")
+
+        return EvGave(ConstRecord(pos + 1, buf()))
+    end if
+
+    if kind == "Pred"
+        if pos == 0 then
+            return trap(r, at, s"there is no variant before '${d.variants[usize(pos)].name}' in '$shown'")
+
+        return EvGave(ConstRecord(pos - 1, buf()))
+    end if
+
+    refuse_form(r, at, s"the enum attribute '$kind' is not evaluated while compiling yet")
+end enum_attr
 
 // A call through a function's address: the address is the function it was taken of, so the call is
 // that function's, run as a call by name is. Null is a trap, as it is where the program runs.
@@ -2049,7 +2183,47 @@ private zero_value(r: &EvRun, at: Span, ty: Type) -> Flow = underlying(ty) match
     Struct(d) -> zero_record(r, at, d)
     // An enum's zero is its variant written `= 0`, which carries nothing.
     Enum(d) if d.zero_variant().is_some() -> EvGave(ConstRecord(int(d.zero_variant().unwrap()), buf()))
-    _ -> refuse_form(r, at, unheld(ty).unwrap_or(s"the zero of '${type_show(ty)}' is not evaluated while compiling yet"))
+    _ -> no_zero(r, at, ty)
+
+private no_zero(r: &EvRun, at: Span, ty: Type) -> Flow =
+    refuse_form(r, at, unheld(ty).unwrap_or(s"the zero of '${type_show(ty)}' is not evaluated while compiling yet"))
+
+// Whether `zero_value` makes a value of `ty`, rather than refusing one.
+private holds_zero(ty: Type) -> bool = underlying(ty) match
+    Integer(_, _, _) -> true
+    Char -> true
+    Floating(_, _) -> true
+    Fixed(_, _, _) -> true
+    Bool -> true
+    Unit -> true
+    Str -> true
+    Slice(_, _) -> true
+    Ptr(_) -> true
+    Array(_, elem) -> holds_zero(*elem)
+    Struct(d) -> record_holds_zero(d)
+    Enum(d) -> d.zero_variant().is_some()
+    _ -> false
+
+private record_holds_zero(d: &StructType) -> bool
+    if d.opaque then return false
+
+    for f in d.fields
+        if !holds_zero(f.1) || underlying(f.1) == Unit then return false
+
+        // A union's zero is its first field's; the rest stand in.
+        if d.union_layout then return true
+
+    true
+end record_holds_zero
+
+// **A local emptied to a zero the evaluation has no value for is left holding nothing**
+// (`ConstUnset`), and is refused only where it is read. The zero is what the program's storage holds
+// between uses -- a discarded value's hidden local before and after the statement, a place `release`
+// gave back -- so a run that writes the local again before reading it, as every such use does, needs
+// no value for it.
+private zeroless_init(e: TExpr) -> bool = *e.kind match
+    TZero(ty) -> !holds_zero(ty)
+    _ -> false
 
 // A struct whose every field is its own zero.
 @noinline
@@ -3260,7 +3434,12 @@ end fixed_bits
 private load(r: &EvRun, at: Span, name: string, ty: Type) -> Flow
     val cell = running(r).locals.get(name)
 
-    if cell.is_some() then return EvGave(cell.unwrap()[0])
+    if cell.is_some()
+        // Emptied to a zero the evaluation does not hold (`zeroless_init`), and read before written.
+        return cell.unwrap()[0] match
+            ConstUnset -> no_zero(r, at, ty)
+            v -> EvGave(v)
+    end if
 
     if underlying(ty) == Unit then return EvNone
 
@@ -4515,6 +4694,11 @@ private var_decl_stmt(r: &EvRun, s: TStmt) -> Flow
 
             if why.is_some() then return refuse_form(r, init.span, why.unwrap())
 
+            if zeroless_init(init)
+                assign(r, name, ConstUnset)
+                return EvNone
+            end if
+
             val f = eval(r, init)
 
             f match
@@ -4757,6 +4941,15 @@ private store(r: &EvRun, at: Span, place: TExpr, value: TExpr) -> Flow
     val slot = slot_of(r, place) match
         Ok(s) -> s
         Err(f) -> return f
+
+    val local = *place.kind match
+        TLoad(_, _) -> true
+        _ -> false
+
+    if local && zeroless_init(value)
+        slot_write(r, slot, ConstUnset)
+        return EvNone
+    end if
 
     val v = eval_value(r, value) match
         Ok(x) -> x
