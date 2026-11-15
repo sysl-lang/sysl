@@ -2028,9 +2028,12 @@ decides what that becomes:
 | does not have it at all | nothing | a freestanding build has no libc, so nothing can be passed for one |
 
 The last two both put nothing on the command line and are still written apart, because they are
-different facts and a target added to the registry has to answer them separately. A freestanding
-program that then calls `sqrt` fails at the link naming `sqrt`, which is the honest report: what is
-missing is the function, and no `-l` would have supplied it.
+different facts and a target added to the registry has to answer them separately. What a
+freestanding program cannot then do is call libm, and it is told so before any link: every libm
+function `sysl.math` binds is `@needs(libc)`, so `x.sin()` on a bare machine is
+[refused at the reference](/reference/packages/#libc-the-one-a-freestanding-target-starts-without).
+A board whose manifest grants `libc` — newlib, picolibc — has its mathematics beside it, and there
+`sysl build-c` names `m` among the libraries to link.
 
 **The set the compiler knows is deliberately small** — the C runtime and the mathematics, the two
 whose placement actually differs. An unrecognized name is passed straight through rather than
