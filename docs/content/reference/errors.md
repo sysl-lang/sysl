@@ -190,14 +190,15 @@ unwrap(self) -> T = self match
     None -> unwrap_failed("unwrap of a None value")
 ```
 
-`unwrap_failed` prints `panic:`, the words and `caller_location()`, and calls `exit(1)`. The
+`unwrap_failed` writes `panic:`, the words and `caller_location()` to standard error, and calls
+`abort()` ([what stopping looks like](#what-stopping-looks-like)). The
 [`@track_caller`](/reference/attributes/#track-caller-a-function-that-reports-its-caller-s-line) on
 both is what makes the location the line that called `unwrap`.
 
 So "a bug stops the program" does not require the compiler to know every way of stopping. Two
-ordinary features make it work. A diverging arm has a type, [`never`](/reference/types/), so
-`exit(1)` can sit beside `Some(v) -> v` and the `match` still has the payload's type. And stopping is
-an `extern` call: the library declares `exit(code: int) -> never`.
+ordinary features make it work. A diverging arm has a type, [`never`](/reference/types/), so a call
+that does not come back can sit beside `Some(v) -> v` and the `match` still has the payload's type.
+And stopping is an `extern` call: the library declares `abort() -> never`.
 
 None of this costs a program that does not use it. The enums are generic, so a member exists only
 where a call uses it, and an `extern` that nothing reaches is never declared in the output.
@@ -833,7 +834,7 @@ inside the region the task may touch.
 ### `unwrap` and `expect` show the error, then the trace
 
 `unwrap` and `expect` of an `Err` say the error after the panic line, in its `Debug` form, and then
-print the trace on standard error before the program exits with status 1. **`Debug` rather than
+print the trace, both on standard error, before the program aborts. **`Debug` rather than
 `Display`** because every type has one that writes straight into the stream, while a `Display` may
 build a string — and an `unwrap` has to stay callable from an [`@no_alloc`
 module](/reference/modules/):
@@ -993,9 +994,18 @@ you debug one:
 
 | stopped by | what you see | exit status |
 |---|---|---|
-| a **bounds check** — an index, a range, a substring cut inside a character, an index past a container's count — or an **integer overflow** check | everything the program printed before it, and one line on stderr saying what failed and where | the platform's signal status for a trap instruction |
-| any other **compiler-inserted check** — a cast, a constrained range, a contract — or `trap()` | everything the program printed before it, and nothing more | the same |
-| a **library forcing member** — `unwrap`, `expect` | `panic: <message> (file:line:column)` on stdout, naming the line that called it, after everything the program printed before it | 1 |
+| a **compiler-inserted check** — a bounds check, an integer overflow, a cast, a constrained range or predicate, a contract | everything the program printed before it, and one line on stderr saying what failed and where | the platform's signal status for a trap instruction (133 on macOS and Linux) |
+| `trap()` | everything the program printed before it, and nothing more | the same |
+| a **panic** — `panic`, `assert`, `assert_eq`, `unwrap`, `expect` | everything the program printed before it, then `panic: <message> (file:line:column)` on stderr, naming the line that called it | `abort`'s: SIGABRT, 134 |
+
+**A panic aborts; it does not exit.** `exit(1)` would run every `atexit` handler and every C++
+static destructor in the process against a state the panic has just said is wrong — the reason a
+trap runs no `defer` — and in a library built with `sysl build-c` those handlers are the host's. So
+a panic flushes what the program printed, writes its report to standard error, and calls `abort`,
+in an executable, a test and a library alike: one behaviour, whatever was built, so the panic a
+library's tests see is the one its host gets. `exit` is still how a program *finishes* with a
+status of its own choosing. On a freestanding target a panic writes its report through `putchar`
+and calls the board's `exit(1)`.
 
 **A trap flushes standard output before it stops the program.** Standard output is buffered (fully
 buffered when it goes to a file or a pipe rather than a terminal), so what a program printed may
@@ -1063,10 +1073,9 @@ as an array's report gives it.
 The location is the bracket's line and column, with the file named by its path inside the build (a
 fetched package's file by its coordinate), so no build directory appears in it. The exit status is
 still the trap's, so a [`should_trap`](/reference/attributes/#a-test-passes-by-returning) test
-recognises it, and can also check the message. Every failure goes through one weak function,
-`sysl_bounds_fail`, which a program may replace with an `@export` of its own, for example on a board
-that writes the report to a UART; the trap still follows whatever it does. On a freestanding target
-the default writes nothing and returns, so the trap is what stops the program. The locations cost
+recognises it, and can also check the message. The report goes through a weak function a program
+may replace ([below](#reporting-a-failure-to-an-embedder-sysl-trap)); the trap still follows
+whatever it does. The locations cost
 one string per check in the image; `bounds_locations = false` in the manifest, or
 `--no-bounds-locations` on the command line, leaves them out and keeps the values:
 
@@ -1074,7 +1083,76 @@ one string per check in the image; `bounds_locations = false` in the manifest, o
 index 5 out of bounds for length 3
 ```
 
-Whether every other check should also report why it stopped is an open design question.
+**Every other check the compiler inserts reports too**, in the same one line, before the same trap:
+
+```sysl
+type Slot = new int within 0..<8
+
+f(x: int) -> int
+    require x > 0
+    x
+
+main()
+    print(int(Slot(3)))
+    print(f(2))
+    print(f(-1))
+```
+
+```output trap
+3
+2
+```
+
+The run above writes `'require' does not hold (main.sysl:4:13)` to standard error — the clause,
+not the call, since the clause is what failed. The other checks say, each followed by its location:
+
+```text
+'ensure' does not hold
+'invariant' does not hold
+'variant' did not decrease
+value outside the range of 'Slot'
+value refused by the 'where' predicate of 'Even'
+'Succ' past the last value of 'Slot'
+integer division by zero
+value is not one of the variants
+value is not a Unicode scalar value
+union field holds no valid value
+out of memory
+```
+
+A range or a predicate names the expression whose value it refused — `Slot(9)` above would say
+`value outside the range of 'Slot' (main.sysl:8:15)` — and an overflow names the operation, as
+above. Inside a `@track_caller` function a check names the caller's line.
+
+### Reporting a failure to an embedder: `sysl_trap`
+
+**Every failure goes through one weak function, `sysl_trap`, before the program stops** — every
+check in the table above, from the program's code and the standard library's alike, and every
+panic. A program, a host linking a `sysl build-c` library, or a board's firmware replaces it by
+defining the symbol, in sysl with an `@export` or in C, for example to write the report to a UART
+or to a crash log before the process ends:
+
+```c
+void sysl_trap(uint32_t kind, size_t a, size_t b, size_t length, const char *at);
+```
+
+`at` is the location, `file:line:column`, NUL-terminated, or null where the build left locations
+out. `kind` says what failed, in its low byte, and the numbers are part of the C surface: 0 to 15
+are the bounds forms above, 16 an integer overflow, 17 a contract (`require`, `ensure`, an
+`invariant`, a loop's `variant`), 18 a constrained type's range (and `Succ`/`Pred` off its end), 19
+its `where` predicate, 20 any other check, and 21 a panic. Bits 8 and 9 say `a` or `b` holds a
+signed value. For 16 to 20, `a` is the address of the NUL-terminated sentence the default would
+print. For a panic, `a` is the address of the message's bytes and `b` their count — the message is
+**not** NUL-terminated — and the report is already written: the default does nothing more, and the
+panic aborts when the hook returns. **Whatever an override does, the program still stops**: a trap
+follows the call, so an override that only counts or logs and then returns stops the program where
+it was. On a freestanding target the default writes nothing and returns.
+
+**`sysl_bounds_fail` is the older, narrower hook, and it still works.** A bounds or overflow check
+calls `sysl_bounds_fail` (same signature, forms 0 to 16), whose weak default hands its arguments on
+to `sysl_trap`. So an override of `sysl_trap` alone sees every failure, and a program that already
+overrides `sysl_bounds_fail` keeps receiving exactly the forms it was written for, while the new
+forms go to `sysl_trap`.
 
 ### Running out of stack, which is the third shape
 

@@ -3,6 +3,7 @@ module sh.sysl.compiler
 import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
 import sysl.math.bigint.from_int
+import sysl.raw.str_cast
 import sysl.text.{replace_all, Search, split}
 
 // **What a failed bounds check says before it stops the program.**
@@ -40,8 +41,26 @@ import sysl.text.{replace_all, Search, split}
 // `--no-bounds-locations` -- which leaves `at` null and lays down no `file:line:column` strings at
 // all; the message keeps its values.
 
-// The symbol a failed check reports through, and the one an override defines.
+// **Every other failure reports through `sysl_trap`, which has the same signature**, and so does
+// every bounds failure in the end: the weak default of `sysl_bounds_fail` hands its arguments on to
+// `sysl_trap` and returns, so a program that overrides `sysl_trap` alone sees every stop -- a bounds
+// check, an overflow, a contract, a constrained type's range or predicate, every other check the
+// compiler inserts, and a `panic` -- while one that overrides `sysl_bounds_fail` keeps seeing exactly
+// what it always did. `sysl_bounds_fail` is not widened to carry the new forms, since a supplier
+// written against its table (a kernel's, a board's) would be handed numbers it has no words for.
+//
+// **The default `sysl_trap` is the renderer**: on a hosted target it writes the form's message and the
+// location to standard error and stops through `@sysl.trap`; on a freestanding one it returns, and the
+// trap at the call site stops the program. **A panic is the one form it neither writes nor stops**:
+// the library has already written the panic's report, which may hold values no form could carry, and
+// stops the program itself; the hook is told of it so that an override can log it, `a` the address
+// of the message's bytes and `b` their count (the message is not NUL-terminated).
+
+// The symbol a failed bounds check reports through, and the one an override of it defines.
 bounds_fail_symbol() -> string = "sysl_bounds_fail"
+
+// The symbol every failure reaches, and the one an override of it defines.
+trap_hook_symbol() -> string = "sysl_trap"
 
 // The forms a failure takes. The number is what an override is handed, so it is part of the C
 // surface and does not move. **The standard library reports through the same function**: an index
@@ -66,6 +85,14 @@ const BoundsNegative: int = 13
 const BoundsInsertPastLength: int = 14
 const BoundsFieldUnset: int = 15
 const BoundsOverflow: int = 16
+
+// The forms only `sysl_trap` is handed. Each carries its whole sentence as one text in `a`, composed
+// at the check, so the number classifies the failure and the text says it.
+const TrapContract: int = 17
+const TrapRange: int = 18
+const TrapPredicate: int = 19
+const TrapCheck: int = 20
+const TrapPanic: int = 21
 
 // Or-ed into the form where the value in `a` -- or `b` -- is a signed integer's, widened with its
 // sign, so the message prints `-1` rather than eighteen quintillion.
@@ -92,7 +119,11 @@ private val BoundsForms: []const (string, string) = [
     ("index %s is negative", "a"),
     ("insertion index %s is past length %s", "an"),
     ("'%s' was made from a partial value whose field '%s' is None", "AB"),
-    ("integer overflow: %s", "A")]
+    ("integer overflow: %s", "A"),
+    ("%s", "A"),
+    ("%s", "A"),
+    ("%s", "A"),
+    ("%s", "A")]
 
 // -- whether locations are laid down --------------------------------------------------------------
 
@@ -175,6 +206,87 @@ bounds_unless(e: *Emit, ok: Val, what: string, kind: int, a: Val, b: Val, n: Val
     emit_term(e, InUnreachable)
     emit_label(e, ok_l)
 end bounds_unless
+
+// **Every other check the compiler inserts reports too** -- a contract, a constrained type's range
+// or predicate, a division by zero, a checked cast -- through `sysl_trap`, with the sentence saying
+// which check it was (`check_said`) and where: the expression being lowered when the check was made,
+// or the clause itself for a contract. Called in the failure block, before the trap.
+//
+// **The call is to a small private helper per sentence**, `sysl.check.<n>`, taking only the
+// location: the helper holds the sentence and the form and makes the call to `sysl_trap`. So what a
+// check adds to the body it is in is one call with one constant argument -- no register, and the
+// body's own numbering is what it was.
+report_check(e: *Emit, what: string, subject: string)
+    e.traps = true
+    e.bounds_fails = true
+
+    val said = check_said(what, subject)
+    val name = llvm_safe(s"sysl.check.${said.0}.${mangle_text(said.1)}")
+
+    request_text(e, name, check_helper_text(name, said.0, said.1, e.word_bits))
+
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(LPtr, check_location(e)))
+    emit(e, ir_call(None, LVoid, VGlobal(name), args))
+end report_check
+
+// A sentence as a name: what is not a letter or a digit becomes `_`.
+private mangle_text(text: string) -> string
+    var out: Buf[u8] = buf()
+
+    for b in text.bytes
+        val keep = (b >= u8('a') && b <= u8('z')) || (b >= u8('A') && b <= u8('Z')) ||
+            (b >= u8('0') && b <= u8('9'))
+
+        out.push(if keep then b else u8('_'))
+
+    str_cast(out.view())
+end mangle_text
+
+// The helper: the sentence, laid down beside it, handed to `sysl_trap` as its address.
+private check_helper_text(name: string, kind: int, text: string, word_bits: int) -> string
+    val word = s"i$word_bits"
+
+    cstring_global(s"$name.said", text) +
+        s"define private void @$name(ptr %at) cold noinline {\nentry:\n" +
+        s"  call void @${trap_hook_symbol()}(i32 $kind, $word ptrtoint (ptr @$name.said to $word), " +
+        s"$word 0, $word 0, ptr %at)\n" +
+        "  ret void\n}\n"
+end check_helper_text
+
+// Where a check without a site of its own was made: the expression being lowered, or nowhere.
+private check_location(e: *Emit) -> Val = e.trap_site match
+    Some(s) -> location_of(e, s)
+    None -> if e.in_tracked then caller_param() else VNull
+
+// The form and the sentence for each check `trap_unless` is asked for, by the word it labels its
+// blocks with. `subject` is the constrained type or enum a check belongs to, where the check knows it.
+check_said(what: string, subject: string) -> (int, string)
+    val of = if subject.is_empty() then "" else s" of '$subject'"
+
+    what match
+        "require" -> (TrapContract, "'require' does not hold")
+        "ensure" -> (TrapContract, "'ensure' does not hold")
+        "invariant" -> (TrapContract, "'invariant' does not hold")
+        "variant" -> (TrapContract, "'variant' did not decrease")
+        "within" -> (TrapRange, s"value outside the range$of")
+        "succ" -> (TrapRange, s"'Succ' past the last value$of")
+        "pred" -> (TrapRange, s"'Pred' before the first value$of")
+        "where" -> (TrapPredicate, s"value refused by the 'where' predicate$of")
+        "div" -> (TrapCheck, "integer division by zero")
+        "overflow" -> (BoundsOverflow, if subject.is_empty() then "a shift or a division" else subject)
+        "char" -> (TrapCheck, "value is not a Unicode scalar value")
+        "enum" -> (TrapCheck, s"value is not one of the variants$of")
+        "val" -> (TrapCheck, s"position is not one of the variants$of")
+        "value" -> (TrapCheck, s"text names none of the variants$of")
+        "union" -> (TrapCheck, "union field holds no valid value")
+        "alloc" -> (TrapCheck, "out of memory")
+        "size" -> (TrapCheck, "allocation size does not fit in usize")
+        "slot" -> (TrapCheck, "slot is outside the buffer's storage")
+        "bounds" -> (TrapCheck, "count is past the buffer's length")
+        _ -> (TrapCheck, s"'$what' check failed")
+end check_said
 
 // **`x.(c)` reached with a value holding another variant** reports through the same function, the
 // two variants' names handed over as the addresses of NUL-terminated texts laid down with the
@@ -452,15 +564,32 @@ end bounds_location_globals
 // Whether the default writes a message, which is whether the target has somewhere to write it.
 bounds_default_prints(t: Target) -> bool = t.os != Freestanding
 
-// The weak default, as the text the module carries.
-bounds_runtime(t: Target) -> string
+// The weak defaults, as the text the module carries: `sysl_bounds_fail` handing on to `sysl_trap`,
+// and `sysl_trap` itself -- each left out where this module's own `@export` is that symbol, since
+// the default would then be a second definition of it.
+bounds_runtime(t: Target, bounds_overridden: bool, trap_overridden: bool) -> string
     val word = s"i${t.pointer_bits()}"
     val params = s"(i32 %kind, $word %a, $word %b, $word %n, ptr %at)"
 
-    if !bounds_default_prints(t)
-        return s"define weak ${t.preemption()}void @${bounds_fail_symbol()}$params {\nentry:\n  ret void\n}\n\n"
+    val forward =
+        if bounds_overridden then ""
+        else
+            s"define weak ${t.preemption()}void @${bounds_fail_symbol()}$params {\nentry:\n" +
+                s"  call void @${trap_hook_symbol()}(i32 %kind, $word %a, $word %b, $word %n, ptr %at)\n" +
+                "  ret void\n}\n\n"
 
-    var text = cstring_global("sysl.bounds.open", " (") + cstring_global("sysl.bounds.close", ")")
+    if trap_overridden then return forward
+
+    if !bounds_default_prints(t)
+        return forward + s"define weak ${t.preemption()}void @${trap_hook_symbol()}$params {\nentry:\n  ret void\n}\n\n"
+
+    forward + trap_renderer(t, word, params)
+end bounds_runtime
+
+// The hosted `sysl_trap`: the form's message and the location on standard error, then the stop. A
+// panic's report is the library's, so that form returns at once.
+private trap_renderer(t: Target, word: string, params: string) -> string
+    var text =cstring_global("sysl.bounds.open", " (") + cstring_global("sysl.bounds.close", ")")
 
     // Each form's text, cut at its holes: piece `j` is written, then the `j`th value it names.
     for k in 0..<BoundsForms.len
@@ -470,7 +599,7 @@ bounds_runtime(t: Target) -> string
             if !pieces[j].is_empty() then text = text + cstring_global(s"sysl.bounds.f${k}.${j}", pieces[j])
 
     text = text + "\n" + bounds_put(word) + bounds_digits(word) +
-        s"define weak ${t.preemption()}void @${bounds_fail_symbol()}$params {\n" +
+        s"define weak ${t.preemption()}void @${trap_hook_symbol()}$params {\n" +
         "entry:\n" +
         "  %msg = alloca [512 x i8]\n" +
         s"  %lim = getelementptr i8, ptr %msg, $word 510\n" +
@@ -484,7 +613,7 @@ bounds_runtime(t: Target) -> string
     for k in 1..<BoundsForms.len
         text = text + s" i32 $k, label %k$k"
 
-    text = text + " ]\n"
+    text = text + s" i32 $TrapPanic, label %quiet ]\nquiet:\n  ret void\n"
 
     var arrivals = ""
 
@@ -539,7 +668,7 @@ bounds_runtime(t: Target) -> string
         "  call void @sysl.trap()\n" +
         "  unreachable\n" +
         "}\n\n"
-end bounds_runtime
+end trap_renderer
 
 // Copies a NUL-terminated text to `d`, stopping at `lim`, and answers where it stopped.
 private bounds_put(word: string) -> string =

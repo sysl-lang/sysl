@@ -1868,8 +1868,8 @@ Both are ordinary functions in the standard module:
 
 ```sysl
 panic(msg: string) -> never
-    print("panic:", msg)
-    exit(1)
+    eprints("panic: " + msg + "\n")
+    abort()
 
 assert(cond: bool, msg: string)
     if !cond then panic(msg)
@@ -1879,9 +1879,11 @@ They exist because `require` is a promise about a **call**, checked on entry, an
 statement has no contract to hang a claim on — the contract was about the arguments, four statements
 ago.
 
-They stop the program the way `unwrap` does — a line naming what happened, then the hosted exit —
+They stop the program the way `unwrap` does — a line on standard error naming what happened and
+where, then `abort` ([what stopping looks like](/reference/errors/#what-stopping-looks-like)) —
 rather than through the trap instruction, because **a check a program makes is one the compiler
-cannot see, and the message is the whole point of it.** The message is required rather than
+cannot see, and the message is the whole point of it.** (The library's own version streams the
+message rather than building a string, so it is callable from a `@no_alloc` module.) The message is required rather than
 defaulted, because the condition's source is not available to print and a failure saying only
 "assertion failed" sends its reader looking for which one.
 

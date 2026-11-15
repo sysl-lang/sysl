@@ -34,9 +34,10 @@ llvm_with_overflow(op: string, signed: bool, ty: LType) -> string =
 
 // -- stopping the program ------------------------------------------------------------------------
 
-// Traps unless `ok` holds. The stop has no message: what the check was is in the source line, which
-// is more than anything emitted here could say.
-trap_unless(e: *Emit, ok: Val, what: string)
+// Traps unless `ok` holds, having first reported which check failed, and where, through `sysl_trap`
+// (`bounds_fail.sysl`'s `report_check`). `what` names the check -- it labels the blocks and picks the
+// sentence -- and `subject` is the type it belongs to, where there is one to name.
+trap_unless(e: *Emit, ok: Val, what: string, subject: string = "")
     e.traps = true
 
     val ok_l = fresh_label(e, s"$what.ok")
@@ -44,6 +45,7 @@ trap_unless(e: *Emit, ok: Val, what: string)
 
     emit_term(e, InCondBr(ok, ok_l, bad_l))
     emit_label(e, bad_l)
+    report_check(e, what, subject)
     emit(e, ir_call(None, LVoid, VGlobal(trap_symbol(e)), no_ir_args()))
     emit_term(e, InUnreachable)
     emit_label(e, ok_l)
@@ -127,7 +129,7 @@ arith(e: *Emit, op: string, ty: Type, lv: Val, rv: Val) -> Val
                         val ok = fresh_reg(e)
 
                         emit(e, InBin(ok, OpXor, l_i1(), ovf, VBool(true)))
-                        trap_unless(e, ok, "overflow")
+                        trap_unless(e, ok, "overflow", "the least value divided by -1")
                     else
                         val safe = fresh_reg(e)
 
@@ -659,7 +661,7 @@ checked_shl(e: *Emit, bits: int, signed: bool, lv: Val, sh: Val) -> Val
     val amt_ok = fresh_reg(e)
 
     emit(e, InIntCmp(amt_ok, IUlt, ity, sh, VInt(from_int(long(bits)))))
-    trap_unless(e, amt_ok, "overflow")
+    trap_unless(e, amt_ok, "overflow", "a shift by the width or more")
 
     val r = fresh_reg(e)
 
@@ -672,7 +674,7 @@ checked_shl(e: *Emit, bits: int, signed: bool, lv: Val, sh: Val) -> Val
     val ok = fresh_reg(e)
 
     emit(e, InIntCmp(ok, IEq, ity, back, lv))
-    trap_unless(e, ok, "overflow")
+    trap_unless(e, ok, "overflow", "a left shift")
     r
 end checked_shl
 

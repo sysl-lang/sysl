@@ -339,13 +339,14 @@ visible:
 
 | stopped by | what you see | exit status |
 |---|---|---|
-| a compiler-inserted check (a bounds test, a broken contract) | nothing at all — a trap instruction, and buffered output is lost | the platform's signal status |
-| `panic`, `assert`, `unwrap`, `expect` | `panic: <message>` on stdout, after everything printed before it | 1 |
+| a compiler-inserted check (a bounds test, a broken contract) | everything printed before it, then one line on stderr naming the check and where it was | the platform's signal status for a trap (133) |
+| `panic`, `assert`, `unwrap`, `expect` | everything printed before it, then `panic: <message>` on stderr | `abort`'s (134) |
 
 That is not an inconsistency. A trap is for a check the *language* makes, where the source line
-already says everything a message could; `panic` is for a check a *program* makes, about something it
-knows and the compiler does not, where the message is the entire point. The full account is on
-[errors and contracts](/reference/errors/).
+already says the rest, so its line only says which check failed; `panic` is for a check a *program*
+makes, about something it knows and the compiler does not, where the message is the entire point.
+Both are reported through the `sysl_trap` hook before the program stops, which a host or a board
+may replace. The full account is on [errors and contracts](/reference/errors/#what-stopping-looks-like).
 
 ### Choosing an exit status
 

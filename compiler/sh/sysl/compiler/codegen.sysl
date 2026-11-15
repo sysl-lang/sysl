@@ -365,6 +365,7 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
     // is settled only once every helper has been written -- a helper is as much a reason to hold the
     // runtime as a body is.
     var helpers = runtime_bundles(e, t, emits_export(p, bounds_fail_symbol()),
+                                  emits_export(p, trap_hook_symbol()),
                                   emits_export(p, reaper_slot_symbol()))
 
     for built_helper in built_helpers
@@ -506,7 +507,7 @@ end box_defs
 // The reaper's slot hook is the same arrangement as the bounds report: a module whose own `@export`
 // defines `__sysl_arc_reaper` gets the runtime without the weak default, and every drain calls the
 // program's definition.
-private runtime_bundles(e: *Emit, t: Target, bounds_overridden: bool,
+private runtime_bundles(e: *Emit, t: Target, bounds_overridden: bool, trap_overridden: bool,
                         reaper_overridden: bool) -> Buf[IrRuntime]
     var out: Buf[IrRuntime] = buf()
 
@@ -523,10 +524,10 @@ private runtime_bundles(e: *Emit, t: Target, bounds_overridden: bool,
     if e.maybe_heap then out.push(RtTemplate("arc.maybe", arc_maybe()))
     if e.weak_heap then out.push(RtTemplate("arc.weak", arc_weak(t)))
 
-    // The weak default a failed bounds check reports through -- unless this module's own `@export`
-    // is the override, which would make the default a second definition of the one symbol.
-    if e.bounds_fails && !bounds_overridden
-        out.push(RtTemplate("sysl.bounds", bounds_runtime(t)))
+    // The weak defaults a failure reports through -- each unless this module's own `@export` is
+    // its override, which would make the default a second definition of the one symbol.
+    if e.bounds_fails && !(bounds_overridden && trap_overridden)
+        out.push(RtTemplate("sysl.bounds", bounds_runtime(t, bounds_overridden, trap_overridden)))
 
     // The stop every trap goes through, where there is output to flush first (`trap_stop.sysl`).
     if e.traps && trap_flushes(t) then out.push(RtTemplate("sysl.trap", trap_runtime()))
@@ -905,7 +906,7 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
 
     // The bounds default renders its own digits and writes with `write`, where it prints at all.
     val bounds_prints = e.bounds_fails && bounds_default_prints(e.target) &&
-        !emits_export(p, bounds_fail_symbol())
+        !emits_export(p, trap_hook_symbol())
 
     if e.traps then out.push(declared_sig(e,llvm_trap(), ir_fn_type(LVoid, no_params())))
 
@@ -1090,7 +1091,10 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
 
     // The library's `extern "sysl_bounds_fail"` names the weak default this module defines whenever
     // it reports a failure at all; an override this module exports is pushed below with the exports.
-    if e.bounds_fails then seen.push(bounds_fail_symbol())
+    if e.bounds_fails
+        seen.push(bounds_fail_symbol())
+        seen.push(trap_hook_symbol())
+
     if trap_flushes_here then seen.push(trap_flush_symbol())
 
     for i in 0..<p.funcs.len()

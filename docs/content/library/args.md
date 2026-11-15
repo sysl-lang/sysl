@@ -482,10 +482,9 @@ That program prints
 panic: command-line argument 0 is not UTF-8 at byte 0
 ```
 
-and exits with status 1. It is not a checked program on this page for that reason — a non-zero exit
-is a failure to the harness — but the message is what a real one prints, and note that it *does*
-print, unlike the [trap](/library/sync/) a violated contract lowers to. This one is an ordinary
-`print` and `exit`, so the text reaches the terminal.
+on standard error, and aborts, as every [panic](/reference/errors/#what-stopping-looks-like) does. It
+is not a checked program on this page for that reason — a non-zero exit is a failure to the harness
+— but the message is what a real one prints.
 
 Putting the check here is deliberate: validation belongs **at the boundary**, so that everything
 above it can treat a `string` as well-formed without asking. An argument vector is a boundary.
