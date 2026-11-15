@@ -1,0 +1,151 @@
+module sysl.fs
+@requires(os)
+
+import sysl.fs.sys as fsys
+
+// A directory held open, and the files beneath it reached through it and through nothing else.
+//
+// **It is the shape a sandbox needs**: a program is given one directory and may read and write only
+// beneath it, and no symbolic link and no `..` may lead it out. Checking a path and then opening it is
+// a race -- a directory can be swapped for a link between the two -- so the refusing is done by the
+// kernel, in the call that opens (`sysl.fs.sys § beneath a directory`): `openat2` with
+// `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS` on Linux, `openat` with `O_NOFOLLOW_ANY` on macOS. What is
+// refused before the call -- an absolute path, a `..` -- is refused so that the error says why.
+
+/** `ELOOP`, which the kernel answers for a link it was told not to follow: 62 on a BSD, 40 on Linux. */
+#if bsd
+private const eloop: int = 62
+#else
+private const eloop: int = 40
+#endif
+
+/** `EXDEV`, which the kernel answers for a way out of the directory (the hosted supplier turns
+ * Darwin's `ENOTCAPABLE` into it).
+ */
+private const exdev: int = 18
+
+/** The permission bits a file created beneath a directory asks for, as `create` asks. */
+private const created_mode: u32 = 0o666
+
+/** A directory open for reaching what is beneath it, and only that.
+ *
+ * **Every path handed to it is relative to it and stays inside it.** A symbolic link at any component
+ * is refused -- the last one or one above it, pointing out of the directory or back into it -- and so
+ * is any `..` component, even one that would come back inside: between resolving `a` and resolving
+ * `a/..` the directory `a` can be moved somewhere else, and its `..` with it. An absolute path is
+ * refused too. Each refusal is an `IoError` that `refused_link()` or `escaped()` recognises; every
+ * other failure is the ordinary one (`NotFound`, `PermissionDenied`, ...).
+ *
+ * **It closes itself** when its last reference goes. A `File` opened through it is a descriptor of its
+ * own, and stays open after the directory is gone.
+ */
+struct Dir
+    private handle: int
+
+    /** The descriptor, lent for a call this module does not make; the directory still closes it. */
+    fd(self) -> int = self.handle
+
+    /** The five ways a file is opened, as `sysl.fs.open`, `create`, `append`, `open_update` and
+     * `create_update` open one, with `path` beneath this directory.
+     */
+    open(self, path: string) -> Result[File, IoError] = self.opened(path, fsys.open_read)
+
+    create(self, path: string) -> Result[File, IoError] =
+        self.opened(path, fsys.open_write | fsys.open_create | fsys.open_truncate)
+
+    append(self, path: string) -> Result[File, IoError] =
+        self.opened(path, fsys.open_write | fsys.open_create | fsys.open_append)
+
+    open_update(self, path: string) -> Result[File, IoError] =
+        self.opened(path, fsys.open_read | fsys.open_write)
+
+    create_update(self, path: string) -> Result[File, IoError] =
+        self.opened(path, fsys.open_read | fsys.open_write | fsys.open_create | fsys.open_truncate)
+
+    /** What is at `path`, described as `sysl.fs.link_metadata` describes it: a link as the last
+     * component is reported as a link (`is_link()`), never followed. A link above it is refused.
+     */
+    link_metadata(self, path: string) -> Result[Meta, IoError]
+        confined(path)?
+
+        var st = fsys.Stat(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        val code = fsys.stat_beneath(self.handle, bytes_at(path), path.bytes.len, &st)
+
+        if code != 0 then return Err(refusal(code))
+
+        Ok(meta_of(st))
+    end link_metadata
+
+    /** Whether anything is at `path`, a link included. A path the directory refuses is not there. */
+    exists(self, path: string) -> bool = self.link_metadata(path).is_ok()
+
+    /** Removes the file at `path`. A link there is the link removed, never what it names. */
+    remove_file(self, path: string) -> Result[unit, IoError]
+        confined(path)?
+
+        val code = fsys.unlink_beneath(self.handle, bytes_at(path), path.bytes.len)
+
+        if code != 0 then Err(refusal(code)) else Ok(())
+    end remove_file
+
+    private opened(self, path: string, flags: u32) -> Result[File, IoError]
+        confined(path)?
+
+        var fd = 0
+        val code = fsys.open_beneath(self.handle, bytes_at(path), path.bytes.len, flags, created_mode, &fd)
+
+        if code != 0 then return Err(refusal(code))
+
+        Ok(adopted(fd))
+    end opened
+end Dir
+
+/** The descriptor closed when the last reference goes. A failure closing it has nobody to tell. */
+impl Drop for Dir
+    drop(self)
+        _ = fsys.close(self.handle)
+
+/** The directory at `path`, held open to reach what is beneath it.
+ *
+ * A link as the last component of `path` is refused (`refused_link()`), and what is not a directory
+ * is `NotADirectory`. The components above it are the caller's own path and are followed as any path
+ * is -- `/tmp` is a link on macOS.
+ */
+open_dir(path: string) -> Result[&Dir, IoError]
+    var fd = 0
+    val code = fsys.dir_open(bytes_at(path), path.bytes.len, &fd)
+
+    if code != 0 then return Err(refusal(code))
+
+    Ok(Dir(fd))
+end open_dir
+
+/** `Ok` for a path that is relative and has no `..` component; the escape it would be otherwise. The
+ * kernel refuses both as well -- this is what makes the error say so.
+ */
+private confined(path: string) -> Result[unit, IoError]
+    val b = path.bytes
+
+    if b.len > 0 && b[0] == u8('/') then return Err(Other(escape_code))
+
+    var start: usize = 0
+
+    for i in 0..b.len
+        if i == b.len || b[i] == u8('/')
+            if i - start == 2 && b[start] == u8('.') && b[start + 1] == u8('.') then return Err(Other(escape_code))
+
+            start = i + 1
+
+    Ok(())
+end confined
+
+/** A failure status as the error a caller sees: the kernel's link and escape refusals as the two
+ * codes `refused_link` and `escaped` recognise, and everything else as it always is.
+ */
+private refusal(status: int) -> IoError =
+    if status == -eloop then
+        Other(link_refused_code)
+    elif status == -exdev then
+        Other(escape_code)
+    else
+        from_status(status)

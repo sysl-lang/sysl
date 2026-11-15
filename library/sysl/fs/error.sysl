@@ -120,7 +120,24 @@ enum IoError
         NotPermitted      -> "operation not permitted"
         InvalidUtf8(at)  -> s"not UTF-8 at byte $at"
         Other(c)          -> system_text(c)
+
+    /** Whether a `Dir` refused this path because a component of it is a symbolic link -- the last one
+     * or any above it, whether the link points inside the directory or out of it.
+     */
+    refused_link(self) -> bool = self.code() == link_refused_code
+
+    /** Whether a `Dir` refused this path because it leads out of the directory: an absolute path, a
+     * `..` component, or the kernel finding a way out.
+     */
+    escaped(self) -> bool = self.code() == escape_code
 end IoError
+
+/** The two codes a `Dir`'s refusals carry in `Other`. Like `UNSUPPORTED`, they are negative, which no
+ * platform's `errno` is, so neither can be mistaken for an ordinary failure; `refused_link` and
+ * `escaped` are how a caller asks.
+ */
+private[sysl] const link_refused_code: int = -39
+private[sysl] const escape_code: int = -40
 
 /** What the words for `code` are, where no case names it: the supplier's (`sysl.fs.sys`'s
  * `sysl_fs_error_text` -- the C library's `strerror_r` on a POSIX host, or a program's own on a target
@@ -130,6 +147,8 @@ end IoError
  */
 private system_text(code: int) -> string
     if code == unsupported_code then return "not supported on this target"
+    if code == link_refused_code then return "the path goes through a symbolic link"
+    if code == escape_code then return "the path leads out of its directory"
 
     var into: [256]u8 = [0; 256]
     var got: usize = 0
