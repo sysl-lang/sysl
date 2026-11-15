@@ -1,0 +1,313 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{join, replace_all, split}
+import sysl.fs.{exists, make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A root, a rounding or an extremum on a board links with nothing left for a libm to answer. LLVM
+// lowers `llvm.sqrt`, `llvm.floor`, `llvm.maxnum` and the rest to C's function of the same name where
+// the machine has no instruction at that width, and a freestanding image has no libm: so
+// `sysl.softfloat.libm` exports them, weak, and `reachability.sysl` keeps them where a reached body
+// computes with a float. A 64-bit RISC-V board with no F extension gets `sysl.softfloat.binary64`'s
+// generic routines too (`__adddf3`, ...), and the machines without a fused instruction `fma`.
+
+private flm_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    if !exists("/usr/bin/nm")
+        print("skipped: the archive is read with nm, which this machine does not have")
+        return false
+    end if
+
+    true
+end flm_ready
+
+// Every freestanding target `sysl build-c` drives, each with its own float unit and ABI.
+private val flm_boards: []string = ["thumb-freestanding", "thumb-freestanding-softfp", "thumb-freestanding-soft",
+    "thumbv6m-freestanding", "thumbv7m-freestanding", "thumbv7em-freestanding", "thumbv7em-freestanding-soft",
+    "thumbv7em-freestanding-dp", "riscv32-freestanding", "riscv64-freestanding", "aarch64-freestanding",
+    "x86_64-freestanding", "wasm32-freestanding"]
+
+// What a libm would answer, of what LLVM calls for an intrinsic.
+private val flm_libm: []string = ["sqrt", "sqrtf", "floor", "floorf", "ceil", "ceilf", "trunc", "truncf", "round",
+    "roundf", "rint", "rintf", "nearbyint", "nearbyintf", "fmax", "fmaxf", "fmin", "fminf", "fma", "fmaf",
+    "roundeven", "roundevenf", "fmaximum", "fmaximumf", "fminimum", "fminimumf"]
+
+// `sysl build-c` of `text` for `target`: what was said where it failed, else the archive's undefined
+// symbols, one per entry.
+private flm_undefined(text: string, target: string) -> Result[Buf[string], string]
+    val root = replace_all(make_temp_dir("sysl-flm").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(["sysl", "build-c", root, "--target", target, "-o", s"$root/app.a"], (line) -> sink.push(line))
+
+    if code != Fine
+        remove_dir_all(root).unwrap_or(())
+        return Err(s"$target: " + replace_all(join(lines.view(), "\n"), root, "@"))
+    end if
+
+    val listed = capture("/usr/bin/nm", ["-u", s"$root/app.a"], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    var names: Buf[string] = buf()
+
+    for line in split(listed.unwrap().text, "\n")
+        val word = line.trim()
+        if word.starts_with("U ") then names.push(word[2..<word.len].trim())
+
+    Ok(names)
+end flm_undefined
+
+// Undefined symbols other than memory's, which a board's startup supplies, and wasm's stack pointer,
+// which its linker defines.
+private flm_strays(names: Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for name in names
+        if name != "memcpy" && name != "memset" && name != "memmove" && name != "__stack_pointer" then out.push(name)
+
+    out
+end flm_strays
+
+private val flm_externs: string = raw"""
+    extern "llvm.sqrt" sqrt64(x: f64) -> f64
+    extern "llvm.sqrt" sqrt32(x: f32) -> f32
+    extern "llvm.floor" floor64(x: f64) -> f64
+    extern "llvm.floor" floor32(x: f32) -> f32
+    extern "llvm.ceil" ceil64(x: f64) -> f64
+    extern "llvm.ceil" ceil32(x: f32) -> f32
+    extern "llvm.trunc" trunc64(x: f64) -> f64
+    extern "llvm.trunc" trunc32(x: f32) -> f32
+    extern "llvm.round" round64(x: f64) -> f64
+    extern "llvm.round" round32(x: f32) -> f32
+    extern "llvm.rint" rint64(x: f64) -> f64
+    extern "llvm.rint" rint32(x: f32) -> f32
+    extern "llvm.nearbyint" nearbyint64(x: f64) -> f64
+    extern "llvm.nearbyint" nearbyint32(x: f32) -> f32
+    extern "llvm.maxnum" max64(x: f64, y: f64) -> f64
+    extern "llvm.maxnum" max32(x: f32, y: f32) -> f32
+    extern "llvm.minnum" min64(x: f64, y: f64) -> f64
+    extern "llvm.minnum" min32(x: f32, y: f32) -> f32
+    extern "llvm.fma" fma64(a: f64, b: f64, c: f64) -> f64
+    extern "llvm.fma" fma32(a: f32, b: f32, c: f32) -> f32
+
+    @export
+    wide(x: f64, y: f64) -> f64 =
+        sqrt64(x) + floor64(x) + ceil64(y) + trunc64(x) + round64(y) + rint64(x) + nearbyint64(y) +
+        max64(x, y) + min64(x, y) + fma64(x, y, x)
+
+    @export
+    narrow(x: f32, y: f32) -> f32 =
+        sqrt32(x) + floor32(x) + ceil32(y) + trunc32(x) + round32(y) + rint32(x) + nearbyint32(y) +
+        max32(x, y) + min32(x, y) + fma32(x, y, x)
+    """
+
+@test("every float intrinsic, at both widths, leaves nothing undefined on any freestanding target")
+flm_intrinsics_every_board()
+    if !flm_ready() then return
+
+    for target in flm_boards
+        flm_undefined(flm_externs, target) match
+            Err(why) -> assert(false, why)
+            Ok(names) ->
+                val strays = flm_strays(names)
+                assert(strays.is_empty(), s"$target leaves undefined: ${join(strays.view(), " ")}")
+    end for
+end flm_intrinsics_every_board
+
+@test("so does every method that is an intrinsic, the binary64 arithmetic included")
+flm_methods_every_board()
+    if !flm_ready() then return
+
+    val body = "x.sqrt() + x.floor() + x.ceil() + x.round() + x.trunc() + x.round_even() + x.nearbyint() + " +
+               "x.rint() + x.max_num(y) + x.min_num(y) + x.maximum(y) + x.minimum(y) + x.abs() + " +
+               "x.copysign(y) + x.mul_add(y, z) + x.max(y) + x.min(y) + x.signum()"
+    val program = s"@export(\"p64\")\np64(x: real, y: real, z: real) -> real =\n    $body\n\n" +
+                  s"@export(\"p32\")\np32(x: f32, y: f32, z: f32) -> f32 =\n    $body\n"
+
+    for target in flm_boards
+        flm_undefined(program, target) match
+            Err(why) -> assert(false, why)
+            Ok(names) ->
+                val strays = flm_strays(names)
+                assert(strays.is_empty(), s"$target leaves undefined: ${join(strays.view(), " ")}")
+    end for
+end flm_methods_every_board
+
+@test("a float only at f32, or only at a sixteen-bit width, still keeps the routines it needs")
+flm_one_width_only()
+    if !flm_ready() then return
+
+    // A Cortex-M4's single-precision unit has no rounding instruction, so `floorf` is a call there,
+    // although no binary64 value is anywhere in the program.
+    val single = "@export(\"f\")\nf(x: f32) -> f32 = x.floor() + x.round() + x.sqrt() + x.max_num(x)\n"
+    val half = "@export(\"h\")\nh(x: f16) -> f16 = x.floor() + x.sqrt()\n"
+
+    for target in ["thumbv7em-freestanding", "thumbv6m-freestanding", "riscv32-freestanding", "riscv64-freestanding",
+                   "x86_64-freestanding", "wasm32-freestanding"]
+        flm_undefined(single, target) match
+            Err(why) -> assert(false, why)
+            Ok(names) ->
+                val strays = flm_strays(names)
+                assert(strays.is_empty(), s"$target leaves undefined: ${join(strays.view(), " ")}")
+    end for
+
+    for target in ["thumbv7em-freestanding", "thumbv6m-freestanding", "riscv32-freestanding", "riscv64-freestanding"]
+        flm_undefined(half, target) match
+            Err(why) -> assert(false, why)
+            Ok(names) ->
+                val strays = flm_strays(names)
+                assert(strays.is_empty(), s"$target leaves undefined: ${join(strays.view(), " ")}")
+    end for
+end flm_one_width_only
+
+// An `f16` is widened to `f32` and narrowed back at every store, and on x86-64 and WebAssembly LLVM
+// calls `__extendhfsf2` and `__truncsfhf2` for it, which no freestanding runtime of sysl's answers.
+@test(ignore: "x86-64 and wasm32 freestanding have no binary16 conversions")
+flm_half_on_x86_and_wasm()
+    if !flm_ready() then return
+
+    for target in ["x86_64-freestanding", "wasm32-freestanding"]
+        flm_undefined("@export(\"k\")\nk(x: f16) -> f16 = x + x\n", target) match
+            Err(why) -> assert(false, why)
+            Ok(names) ->
+                val strays = flm_strays(names)
+                assert(strays.is_empty(), s"$target leaves undefined: ${join(strays.view(), " ")}")
+    end for
+end flm_half_on_x86_and_wasm
+
+@test("a program with no float keeps none of the libm routines")
+flm_no_float_no_routines()
+    if !flm_ready() then return
+
+    val root = replace_all(make_temp_dir("sysl-flm").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", "@export(\"twice\")\ntwice(x: i32) -> i32 = x * 2\n").unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(["sysl", "build-c", root, "--target", "thumbv6m-freestanding", "-o", s"$root/app.a"],
+                       (line) -> sink.push(line))
+    val listed = capture("/usr/bin/nm", [s"$root/app.a"], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+    assert(code == Fine, join(lines.view(), "\n"))
+
+    for line in split(listed.unwrap().text, "\n")
+        val word = line.trim()
+
+        for name in flm_libm
+            assert(!word.ends_with(s" W $name") && !word.ends_with(s" T $name"), s"defines '$name': $word")
+    end for
+end flm_no_float_no_routines
+
+// The defined symbols of `text` built for `target`, one per entry.
+private flm_defined(text: string, target: string) -> Buf[string]
+    val root = replace_all(make_temp_dir("sysl-flm").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(["sysl", "build-c", root, "--target", target, "-o", s"$root/app.a"], (line) -> sink.push(line))
+    val listed = capture("/usr/bin/nm", ["-g", "--defined-only", s"$root/app.a"], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+    assert(code == Fine, join(lines.view(), "\n"))
+
+    var names: Buf[string] = buf()
+
+    for line in split(listed.unwrap().text, "\n")
+        val words = split(line.trim(), " ")
+        if words.len == 3 then names.push(words[2])
+
+    names
+end flm_defined
+
+private flm_defines(names: Buf[string], name: string) -> bool
+    for each in names
+        if each == name then return true
+    false
+end flm_defines
+
+// C's functions are kept a width at a time. A Cortex-M4's unit computes `f32` itself, so an `f32`-only
+// program there must keep `floorf` and nothing that asks for binary64 -- not `floor`, whose operand is
+// read through `real.from_bits`, and not the `__aeabi_d*` runtime that would bring.
+@test("an f32-only program keeps the f32 functions and neither the f64 ones nor the binary64 runtime")
+flm_single_keeps_single_only()
+    if !flm_ready() then return
+
+    val names = flm_defined("@export(\"f\")\nf(x: f32) -> f32 = x.floor() + x.sqrt()\n", "thumbv7em-freestanding")
+
+    assert(flm_defines(names, "floorf") && flm_defines(names, "sqrtf"), join(names.view(), " "))
+    assert(!flm_defines(names, "floor") && !flm_defines(names, "sqrt"), join(names.view(), " "))
+    assert(!flm_defines(names, "__aeabi_dadd") && !flm_defines(names, "__aeabi_dmul"), join(names.view(), " "))
+
+    // An `f64`-only one on a board with no unit needs both runtimes, and keeps both.
+    val wide = flm_defined("@export(\"g\")\ng(x: real) -> real = x.floor()\n", "thumbv6m-freestanding")
+
+    assert(flm_defines(wide, "floor") && flm_defines(wide, "__aeabi_dadd"), join(wide.view(), " "))
+
+    // A single-precision unit with an `f64` program keeps the f64 functions beside the binary64 runtime.
+    val both = flm_defined("@export(\"h\")\nh(x: real) -> real = x.sqrt()\n", "thumbv7em-freestanding")
+
+    assert(flm_defines(both, "sqrt") && flm_defines(both, "__aeabi_dmul"), join(both.view(), " "))
+end flm_single_keeps_single_only
+
+// The routines are left out where they would compete with a real libm: a hosted build defines none.
+@test("a hosted archive defines none of them, and still calls the host's libm")
+flm_hosted_defines_none()
+    if !flm_ready() then return
+
+    val root = replace_all(make_temp_dir("sysl-flm").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", flm_externs).unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(["sysl", "build-c", root, "-o", s"$root/app.a"], (line) -> sink.push(line))
+    val listed = capture("/usr/bin/nm", [s"$root/app.a"], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+    assert(code == Fine, join(lines.view(), "\n"))
+
+    for line in split(listed.unwrap().text, "\n")
+        val word = line.trim()
+
+        for name in flm_libm
+            assert(!word.ends_with(s" W $name") && !word.ends_with(s" W _$name") && !word.ends_with(s" T $name") &&
+                   !word.ends_with(s" T _$name"), s"defines '$name': $word")
+    end for
+end flm_hosted_defines_none
+
+@test("a package's own strong sqrt is the one the link keeps")
+flm_strong_definition_wins()
+    if !flm_ready() then return
+
+    val program = "@export(\"sqrt\")\nmine(x: real) -> real = x\n\n" +
+                  "@export(\"r\")\nr(x: real) -> real = x.sqrt() + x.floor()\n"
+
+    for target in ["thumbv6m-freestanding", "riscv32-freestanding", "x86_64-freestanding"]
+        flm_undefined(program, target) match
+            Err(why) -> assert(false, why)
+            Ok(names) -> assert(flm_strays(names).is_empty(), s"$target: ${join(names.view(), " ")}")
+    end for
+end flm_strong_definition_wins
