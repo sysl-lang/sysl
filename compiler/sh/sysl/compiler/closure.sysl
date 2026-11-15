@@ -664,6 +664,9 @@ private lost_write_owed(cx: &Analyzer, at: Span, name: string, form: string, sho
         if form.ends_with(handed_suffix) then
             s"hold it as a '&$shown' (a '&sync $shown' where another thread runs the closure) and " +
                 s"hand the callee '&*$name'"
+        // A view taken outside the closure views the variable, and crosses to a scoped thread.
+        else if form.ends_with(viewed_suffix) then
+            s"take the view outside the closure, hold it as a '&$shown' and view that"
         else s"hold it as a '&$shown' and write through it"
 
     cx.an.lost_writes.push(OwedWrite(cx.scope, at, if via.is_empty() then here else around, ", since ",
@@ -799,7 +802,7 @@ private note_copy_use(a: &Analysis, scan: &CopyScan, e: TExpr)
             if place.is_some() && note_copy_write(scan, place.unwrap(), self_call_form(a, name), e.span)
                 // The answer is what the method read of the copy, so the copy is read back.
                 if answers_a_value(ty) then
-                    bump_at(scan.uses, scan.slots, copy_root(place.unwrap()).unwrap())
+                    bump_at(scan.uses, scan.slots, written_root(place.unwrap()).unwrap())
             end if
 
             note_handed_addresses(a, scan, e, name)
@@ -823,7 +826,12 @@ private note_handed_addresses(a: &Analysis, scan: &CopyScan, e: TExpr, name: str
         *arg.kind match
             TAddrOf(place, _) ->
                 if note_copy_write(scan, place, handed_form(a, name), arg.span) then
-                    bump_at(scan.uses, scan.slots, copy_root(place).unwrap())
+                    bump_at(scan.uses, scan.slots, written_root(place).unwrap())
+            TSlice(_, _, _, _, _) ->
+                val slot = view_root(arg)
+
+                if note_slot_write(scan, slot, viewed_form(a, name), arg.span) then
+                    bump_at(scan.uses, scan.slots, slot.unwrap())
             _ -> ()
     end for
 end note_handed_addresses
@@ -832,6 +840,13 @@ end note_handed_addresses
 private handed_form(a: &Analysis, name: string) -> string = s"'${shown_name(a, name)}'$handed_suffix"
 
 private const handed_suffix: string = ", which is handed its address,"
+
+// **A writable view of a capture handed to a call** (`fill(out[0..<2])`, `fill(out)` where a `[]T`
+// is wanted, `out[..].sort()`) views the closure's own copy, so the callee writes the copy exactly as
+// one handed its address does, and is asked the same two questions.
+private viewed_form(a: &Analysis, name: string) -> string = s"'${shown_name(a, name)}'$viewed_suffix"
+
+private const viewed_suffix: string = ", which is handed a view of it,"
 
 // **A closure built here from this closure's captures**: each capture it is handed that it writes is
 // a write of this closure's copy where it holds that capture by reference, and one it also reads is
@@ -889,9 +904,11 @@ private lowered_closure(a: &Analysis, fname: string) -> Option[TFunc]
 end lowered_closure
 
 // Whether the write landed on a capture's copy.
-private note_copy_write(scan: &CopyScan, place: TExpr, form: string, at: Span) -> bool
-    val slot = copy_root(place)
+private note_copy_write(scan: &CopyScan, place: TExpr, form: string, at: Span) -> bool =
+    note_slot_write(scan, written_root(place), form, at)
 
+// Whether a write of the capture in `slot`, when there is one, landed on a capture's copy.
+private note_slot_write(scan: &CopyScan, slot: Option[int], form: string, at: Span) -> bool
     if slot.is_none() then return false
 
     for i in 0..<scan.slots.len()
@@ -909,7 +926,7 @@ private note_copy_write(scan: &CopyScan, place: TExpr, form: string, at: Span) -
     end for
 
     false
-end note_copy_write
+end note_slot_write
 
 // **The place a `*self` call writes through**, when the call is one: its receiver is an address the
 // call itself took (`build_receiver` gives it the call's own span, where a written `&x` has its own),
@@ -961,6 +978,29 @@ private copy_root(place: TExpr) -> Option[int] = *place.kind match
         else if held_by_value(texpr_type(recv)) then copy_root(recv)
         else None
     TIndex(recv, _, _) -> if run_in_place(recv) then copy_root(recv) else None
+    _ -> None
+
+// The capture a write lands in the closure's own copy of: a place `copy_root` follows, or a part of
+// an element of a writable view taken of one (`out[0..<2][0] = 7`, `cs[1..][0].n = 5`), since the
+// view is of the copy too.
+private written_root(place: TExpr) -> Option[int] = copy_root(place) match
+    Some(slot) -> Some(slot)
+    None -> *place.kind match
+        TField(recv, _, _) -> if held_by_value(texpr_type(recv)) then written_root(recv) else None
+        TIndex(recv, _, _) -> if run_in_place(recv) then written_root(recv) else view_root(recv)
+        _ -> None
+
+// The capture a writable view is taken of, where what it views is the closure's own copy: `out[a..<b]`,
+// `out[..]`, an array taken where a `[]T` is wanted, and a view of such a view. A `[]const T` only
+// reads, and a view of a `Buf`, a `&[N]T` or a `*T` reaches storage the closure shares.
+private view_root(view: TExpr) -> Option[int] = *view.kind match
+    TSlice(base, _, _, _, ty) -> ty match
+        Slice(_, true) -> None
+        Slice(_, false) -> texpr_type(base) match
+            Array(_, _) -> written_root(base)
+            Slice(_, _) -> view_root(base)
+            _ -> None
+        _ -> None
     _ -> None
 
 private held_by_value(t: Type) -> bool = t match
