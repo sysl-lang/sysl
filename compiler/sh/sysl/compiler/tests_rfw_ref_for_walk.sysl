@@ -1,0 +1,303 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `for x in b` over a `Buf` calls `Buf.walk`, which only reads: it takes a view of the elements the
+// buffer holds when the loop begins. It used to take that view through `into_view()`, the member that
+// gives its receiver up and so is `@relocates` -- and a callee reaching a `@relocates` member on a
+// buffer of a `ref`'s type counts as writing one (`checks.sysl`'s `ref_call`, `borrowing.sysl`'s
+// `moves`). Every function that looped over a buffer, and every loop in the ref's own body, was then
+// refused while a `ref` or a pointer into a buffer of that type was live.
+//
+// Accepted now: a callee that loops reading the buffer (with a `break` and an `else`), one reached
+// through a `match` arm over a recursive enum holding the buffer, one that recurses through the loop,
+// a loop over the ref's own buffer in the ref's own body, and a pointer used after such a call. Each
+// is built and run at `-O0` with the heap counted (net zero), at `-O1` and at `-O2`.
+//
+// Still refused: a callee that loops and then pushes, one that pushes inside its loop, one that gives
+// its parameter up with `into_view()` (which stays `@relocates`), a push inside a loop in the ref's
+// own body, and a pointer across a callee that loops and pushes.
+//
+// Not crossed: bare metal and the layout axes (the change is to which library member a loop calls,
+// whose emitted code is the same), and separate compilation (a callee with no body in the program is
+// judged by what it can reach, which this does not change).
+
+private rfw_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end rfw_ready
+
+private rfw_root(text: string) -> string
+    val root = make_temp_dir("sysl-ref-for-walk").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+
+private rfw_said(text: string) -> string
+    val root = rfw_root(text)
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end rfw_said
+
+private rfw_ran(text: string, level: string, counted: bool) -> string
+    val root = rfw_root(text)
+    val exe = s"$root/built"
+
+    force_alloc_counting(counted)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, level, Some(exe))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text + out.err.unwrap_or("")
+end rfw_ran
+
+private rfw_accepted(text: string, printed: string)
+    val out = rfw_said(text)
+
+    assert(!out.contains("error"), s"expected no complaint, got: $out")
+    assert_eq(rfw_ran(text, "0", true), printed)
+    assert_eq(rfw_ran(text, "1", false), printed)
+    assert_eq(rfw_ran(text, "2", false), printed)
+end rfw_accepted
+
+private rfw_refused(text: string, said: string)
+    val out = rfw_said(text)
+
+    assert(out.contains(said), s"expected '$said' in: $out")
+
+private rfw_writes(name: string, callee: string, ty: string) -> string =
+    s"'$name' is a 'ref' standing on storage held in a '$ty', and '$callee' may write a '$ty' — " +
+    "another name for the same object would leave the 'ref' pointing at freed memory"
+
+// A `ref e = b[0]` into a `Buf[string]` live across `call`, after `decls`.
+private rfw_string_ref(decls: string, call: string) -> string = """
+    import sysl.buf.{Buf, buf}
+
+    """ + decls + """
+
+    main()
+        var b: Buf[string] = buf()
+
+        b.push("one")
+        b.push("three")
+
+        ref e = b[0]
+
+    """ + s"    print($call, e.len)\n"
+
+// -- accepted: a loop that only reads ------------------------------------------------------------------
+
+@test("a ref into a recursive enum's buffer is kept across a match that loops over the buffer")
+rfw_survey_shape()
+    if !rfw_ready() then return
+
+    rfw_accepted("""
+        import sysl.buf.{Buf, buf}
+
+        enum V
+            I(n: int)
+            L(items: Buf[V])
+
+        w(v: V) -> int = v match
+            I(n) -> n
+            L(items) -> total(items)
+
+        total(items: Buf[V]) -> int
+            var t = 0
+            for x in items do t += 1
+            t
+
+        var b: Buf[V] = buf()
+        b.push(I(4))
+
+        ref x = b[0]
+        print(w(x))
+        """, "4\n")
+
+@test("a ref is kept across a callee that recurses through a loop over the buffer")
+rfw_recursive_walk()
+    if !rfw_ready() then return
+
+    rfw_accepted("""
+        import sysl.buf.{Buf, buf}
+
+        enum V
+            I(n: int)
+            L(items: Buf[V])
+
+        w(v: V) -> int = v match
+            I(n) -> n
+            L(items) -> total(items)
+
+        total(items: Buf[V]) -> int
+            var t = 0
+            for x in items do t += w(x)
+            t
+
+        var inner: Buf[V] = buf()
+        inner.push(I(3))
+        inner.push(I(5))
+
+        var b: Buf[V] = buf()
+        b.push(L(inner))
+        b.push(I(4))
+
+        ref x = b[0]
+        print(w(x), w(b[1]))
+        """, "8 4\n")
+
+@test("a ref is kept across a callee whose loop over the buffer breaks or runs its else")
+rfw_break_else()
+    if !rfw_ready() then return
+
+    val decls = "count(items: Buf[string]) -> usize\n    var n: usize = 0\n\n    for s in items\n" +
+                "        if s.len == 0 then break\n        n += s.len\n    else\n        n += 100\n\n    n\n"
+
+    rfw_accepted(rfw_string_ref(decls, "count(b)"), "108 3\n")
+
+@test("a loop over the ref's own buffer in the ref's own body is accepted")
+rfw_own_body_loop()
+    if !rfw_ready() then return
+
+    rfw_accepted("""
+        import sysl.buf.{Buf, buf}
+
+        main()
+            var b: Buf[string] = buf()
+
+            b.push("one")
+            b.push("three")
+
+            ref e = b[0]
+            var here: usize = 0
+
+            for s in b do here += s.len
+
+            print(here, e.len)
+        """, "8 3\n")
+
+@test("a pointer into a buffer is used after a callee that loops over the buffer")
+rfw_pointer_after_walk()
+    if !rfw_ready() then return
+
+    rfw_accepted("""
+        import sysl.buf.{Buf, buf}
+
+        count(items: Buf[int]) -> int
+            var n = 0
+
+            for x in items do n += x
+
+            n
+
+        main()
+            var b: Buf[int] = buf()
+
+            b.push(41)
+            b.push(1)
+
+            val p = &b[0]
+            val n = count(b)
+
+            print(n, *p + 1)
+        """, "42 42\n")
+
+// -- refused: a body that really moves the buffer --------------------------------------------------
+
+@test("a callee that loops over the buffer and then pushes into it is still refused")
+rfw_loop_then_push()
+    if !rfw_ready() then return
+
+    val decls = "count(items: Buf[string]) -> usize\n    var n: usize = 0\n\n" +
+                "    for s in items do n += s.len\n\n    items.push(\"more\")\n    n\n"
+
+    rfw_refused(rfw_string_ref(decls, "count(b)"), rfw_writes("e", "count", "Buf[string]"))
+
+@test("a callee that pushes inside its loop over the buffer is still refused")
+rfw_push_in_loop()
+    if !rfw_ready() then return
+
+    val decls = "grow(items: Buf[string]) -> usize\n    for s in items do items.push(s)\n\n    items.len()\n"
+
+    rfw_refused(rfw_string_ref(decls, "grow(b)"), rfw_writes("e", "grow", "Buf[string]"))
+
+@test("a callee that gives its buffer up with into_view is still refused")
+rfw_into_view_param()
+    if !rfw_ready() then return
+
+    val decls = "gone(items: Buf[string]) -> usize\n    val v = items.into_view()\n\n    v.len\n"
+
+    rfw_refused(rfw_string_ref(decls, "gone(b)"), rfw_writes("e", "gone", "Buf[string]"))
+
+@test("a push inside a loop in the ref's own body is still refused by the mark")
+rfw_own_body_push()
+    if !rfw_ready() then return
+
+    rfw_refused("""
+        import sysl.buf.{Buf, buf}
+
+        main()
+            var b: Buf[string] = buf()
+
+            b.push("one")
+
+            ref e = b[0]
+
+            for s in b do b.push(s)
+
+            print(e.len)
+        """, "'e' is a 'ref' standing on an element whose storage 'push' could move or give up")
+
+@test("a pointer used after a callee that loops and pushes is still refused")
+rfw_pointer_after_push()
+    if !rfw_ready() then return
+
+    rfw_refused("""
+        import sysl.buf.{Buf, buf}
+
+        count(items: Buf[int]) -> int
+            var n = 0
+
+            for x in items do n += x
+
+            items.push(n)
+            n
+
+        main()
+            var b: Buf[int] = buf()
+
+            b.push(41)
+
+            val p = &b[0]
+            val n = count(b)
+
+            print(n, *p + 1)
+        """, "'p' is a pointer into storage 'count' could move or give up")

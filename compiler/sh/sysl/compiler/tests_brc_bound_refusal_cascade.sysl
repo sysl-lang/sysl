@@ -1,0 +1,142 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.text.str_builder
+
+// A type argument a bound refused is refused ONCE, where it was written (`reference/generics.md §
+// Bounds`). The value still has its type, so a call on it makes the type's members real at the
+// refused argument; their bodies, read there, would answer every use of the bound with a complaint
+// about a line that is right. Each program here earns exactly the use site's refusal, and nothing
+// from inside the generic -- a struct's member, an enum's, an `impl`'s, a member with parameters of
+// its own, a generic reached through another, and the standard library's `Map`.
+
+private brc_ready() -> bool
+    std_root() match
+        Ok(_) -> true
+        Err(_) ->
+            print("skipped: the standard module's source is not on this machine")
+            false
+
+// Every diagnostic a one-file program earns, one to a line in source order, each with the line it
+// points at.
+private brc_diags(text: string) -> string
+    val root = make_temp_dir("sysl-brc").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    var b = str_builder()
+
+    emit_llvm_text(src, None) match
+        Err(why) -> b.push(s"refused: ${why.message}")
+        Ok(made) ->
+            val ordered = in_source_order(made.report)
+
+            for i in 0..<ordered.len()
+                if i > 0 then b.push("\n")
+
+                b.push(if ordered[i].is_error() then "error: " else "warning: ")
+                b.push(ordered[i].diag.message)
+                b.push(s" @ ${ordered[i].src.name.ends_with("main.sysl")}:" +
+                       s"${line_of(text, ordered[i].diag.span.start)}")
+
+    remove_dir_all(root).unwrap_or(())
+    b.finish()
+end brc_diags
+
+// The 1-based line an offset into the program falls on.
+private line_of(text: string, at: usize) -> usize
+    var line: usize = 1
+
+    for i in 0..<at
+        if i < text.len && text[i] == u8('\n') then line += 1
+
+    line
+end line_of
+
+private brc_says(text: string, expected: string)
+    if !brc_ready() then return
+
+    assert_eq(brc_diags(text), expected)
+
+private brc_bag() -> string = "struct Bag[K: Hash]\n    k: K\n\n    key_hash(self) -> u64 = self.k.hash()\n\n"
+
+@test("a struct made at a refused argument does not read its member's body there")
+brc_struct_constructor()
+    brc_says(brc_bag() + "main()\n    val b = Bag(1.5)\n    print(b.key_hash())\n",
+             "error: 'Bag' requires its type parameter 'K' to implement 'Hash', but real does not @ true:7")
+
+@test("a refused type written in a binding does not read its member's body either")
+brc_struct_written()
+    brc_says(brc_bag() + "main()\n    val b: Bag[real] = Bag(1.5)\n    print(b.key_hash())\n",
+             "error: 'Bag' requires its type parameter 'K' to implement 'Hash', but real does not @ true:7")
+
+@test("a refused type in a signature is refused there and its member's body says nothing")
+brc_struct_in_signature()
+    brc_says(brc_bag() + "use(b: Bag[real]) -> u64 = b.key_hash()\n\nmain()\n    print(1)\n",
+             "error: 'Bag' requires its type parameter 'K' to implement 'Hash', but real does not @ true:6")
+
+@test("a member with parameters of its own, on a refused receiver, adds nothing")
+brc_member_own_params()
+    brc_says("struct Bag[K: Hash]\n    k: K\n\n    with_own[U: Hash](self, u: U) -> u64 = " +
+             "self.k.hash() + u.hash()\n\nmain()\n    val b = Bag(1.5)\n    print(b.with_own(2))\n",
+             "error: 'Bag' requires its type parameter 'K' to implement 'Hash', but real does not @ true:7")
+
+@test("an enum made at a refused argument does not read its member's body there")
+brc_enum()
+    brc_says("enum Opt[K: Hash]\n    Has(value: K)\n    Not\n\n    key_hash(self) -> u64 = self match\n" +
+             "        Has(k) -> k.hash()\n        Not -> 0\n\nmain()\n    val o: Opt[real] = Has(1.5)\n" +
+             "    print(o.key_hash())\n",
+             "error: 'Opt' requires its type parameter 'K' to implement 'Hash', but real does not @ true:10")
+
+@test("a trait's impl over a refused type neither reads its body nor refuses the call again")
+brc_trait_impl()
+    brc_says("trait Tag\n    tag(self) -> u64\n\nstruct Bag[K: Hash]\n    k: K\n\n" +
+             "impl[K: Hash] Tag for Bag[K]\n    tag(self) -> u64 = self.k.hash()\n\n" +
+             "main()\n    val b = Bag(1.5)\n    print(b.tag())\n",
+             "error: 'Bag' requires its type parameter 'K' to implement 'Hash', but real does not @ true:11")
+
+@test("an impl naming no trait still refuses its own condition at the call, once")
+brc_inherent_block()
+    brc_says("struct Bag[K]\n    k: K\n\nimpl[K: Hash] Bag[K]\n    key_hash(self) -> u64 = self.k.hash()\n\n" +
+             "main()\n    val b = Bag(1.5)\n    print(b.key_hash())\n",
+             "error: 'Bag.key_hash' requires its type parameter 'K' to implement 'Hash', but real does not @ true:9")
+
+@test("a generic reached through another refused type says nothing from either body")
+brc_nested_generic()
+    brc_says(brc_bag() + "struct Outer[T: Hash]\n    inner: Bag[T]\n\n    h(self) -> u64 = self.inner.key_hash()\n\n" +
+             "main()\n    val o = Outer(Bag(1.5))\n    print(o.h())\n",
+             "error: 'Outer' requires its type parameter 'T' to implement 'Hash', but real does not @ true:12")
+
+@test("a library Map keyed by a type that is not Hash is refused once, at the program's line")
+brc_library_map()
+    brc_says("import sysl.buf.{Buf, buf}\nimport sysl.container.{Map, map}\n\nmain()\n" +
+             "    var ids: Map[Buf[u32], u32] = map()\n" +
+             "    var s: Buf[u32] = buf()\n    s.push(3)\n    ids.put(s, 0)\n    print(ids.len())\n",
+             "error: 'Map' requires its type parameter 'K' to implement 'Hash', but Buf[uint] does not @ true:5")
+
+@test("a free generic function at a refused argument is refused once")
+brc_free_function()
+    brc_says("keyed[K: Hash](k: K) -> u64 = k.hash()\n\nmain()\n    print(keyed(1.5))\n",
+             "error: 'keyed' requires its type parameter 'K' to implement 'Hash', but real does not @ true:4")
+
+@test("a mistake elsewhere in the program is still reported beside the refusal")
+brc_other_mistake_kept()
+    brc_says(brc_bag() + "main()\n    val b = Bag(1.5)\n    print(b.key_hash())\n    val bad: int = \"x\"\n",
+             "error: 'Bag' requires its type parameter 'K' to implement 'Hash', but real does not @ true:7\n" +
+             "error: cannot initialize 'bad': declared int but the value is string @ true:9")
+
+@test("a body wrong at its definition is still told so, whatever it is later made real at")
+brc_definition_mistake_kept()
+    brc_says("struct Bag[K: Hash]\n    k: K\n\n    nope(self) -> u64 = self.k.missing()\n\n" +
+             "main()\n    val b = Bag(1.5)\n    print(b.nope())\n",
+             "error: no trait declares a method 'missing', so no bound on 'K' could license this call @ true:4\n" +
+             "error: 'Bag' requires its type parameter 'K' to implement 'Hash', but real does not @ true:7")
+
+@test("an argument that meets the bound makes the member real and builds")
+brc_met_bound_builds()
+    brc_says(brc_bag() + "main()\n    val b = Bag(3)\n    print(b.key_hash())\n    val o = Bag(\"s\")\n" +
+             "    print(o.key_hash())\n", "")

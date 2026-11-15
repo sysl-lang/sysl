@@ -416,6 +416,12 @@ struct Emit
     // (`emit_arc.sysl`'s `gen_drop_hook`): a plain reference it lets go of is queued on that slot
     // directly rather than through `arc.release`.
     draining: bool
+
+    // The tag test each enum walk's call is guarded by, by helper name, with whether the helper takes
+    // the value's address (`arc_fastpath.sysl`); and whether any call was, which is what
+    // `llvm.expect` is declared for.
+    tag_tests: Map[string, (TagTest, bool)]
+    uses_expect: bool
 end Emit
 
 // What a runtime helper is built from. A helper is asked for by name while a body is being written
@@ -609,7 +615,7 @@ emitter_for(t: Target, destructors: Buf[(string, string)]) -> Emit
          None, false, buf(), map(), map(), map(), set(), buf(), set(), set(), set(), false, untouched_none(), set(),
          no_wrap_none(), map(), buf(), Leaving, false, "", set(), buf(), map(), map(), 0, moves_none(), set(), set(), set(), set(),
          set(), map(), 0, map(), set(), map(), false, set(), map(), set(), false, false, false, buf(), set(),
-          "", set(), false)
+          "", set(), false, map(), false)
 end emitter_for
 
 // -- what a body could not say --------------------------------------------------------------------
@@ -966,7 +972,8 @@ finish_func(e: *Emit, sig: IrFuncSig) -> IrFunc
 
     // The pairs are cancelled while every value is still a register, and only then is a large one
     // turned into the bytes it is copied as.
-    IrFunc(sig, lower_large_values(e, elide_arc_pairs(out, e.inert_symbols)))
+    // The enum walks are guarded by their tag tests last, once a large value's walk takes its address.
+    IrFunc(sig, guard_enum_walks(e, lower_large_values(e, elide_arc_pairs(out, e.inert_symbols))))
 end finish_func
 
 // -- the constants a body folds against ------------------------------------------------------------

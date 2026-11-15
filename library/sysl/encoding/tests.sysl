@@ -240,6 +240,93 @@ binary_refuses_a_short_slice()
     assert(!put_u64_be(seven, 1))
 end binary_refuses_a_short_slice
 
+// Every getter and putter at every start offset of a 16-byte window, so the slice a call sees begins
+// at each alignment and ends at each distance from the end. The fixture bytes are distinct.
+@test("every getter and putter agrees with a hand-built value at every offset, and refuses a slice too short")
+binary_every_offset()
+    var data: []u8 = [0; 16]
+
+    for i in 0..<16
+        data[i] = u8(0x10 + i * 7)
+
+    for off in 0..<16
+        val rest = data[off..]
+        val left = 16 - off
+
+        val e16: u16 = if left >= 2 then u16(rest[0]) | u16(rest[1]) << 8 else 0
+        val e16b: u16 = if left >= 2 then u16(rest[0]) << 8 | u16(rest[1]) else 0
+
+        assert_eq(get_u16_le(rest).is_some(), left >= 2)
+        assert_eq(get_u16_be(rest).is_some(), left >= 2)
+
+        if left >= 2
+            assert_eq(get_u16_le(rest).unwrap(), e16)
+            assert_eq(get_u16_be(rest).unwrap(), e16b)
+
+        assert_eq(get_u32_le(rest).is_some(), left >= 4)
+        assert_eq(get_u32_be(rest).is_some(), left >= 4)
+
+        if left >= 4
+            var le: u32 = 0
+            var be: u32 = 0
+
+            for k in 0..<4
+                le = le | u32(rest[k]) << (k * 8)
+                be = be << 8 | u32(rest[k])
+
+            assert_eq(get_u32_le(rest).unwrap(), le)
+            assert_eq(get_u32_be(rest).unwrap(), be)
+
+        assert_eq(get_u64_le(rest).is_some(), left >= 8)
+        assert_eq(get_u64_be(rest).is_some(), left >= 8)
+
+        if left >= 8
+            var le: u64 = 0
+            var be: u64 = 0
+
+            for k in 0..<8
+                le = le | u64(rest[k]) << (k * 8)
+                be = be << 8 | u64(rest[k])
+
+            assert_eq(get_u64_le(rest).unwrap(), le)
+            assert_eq(get_u64_be(rest).unwrap(), be)
+
+        // Writers: the bytes land where the reader finds them, the bytes outside the window are untouched,
+        // and a slice too short is refused without writing anything.
+        var out: []u8 = [0xaa; 16]
+        val window = out[off..]
+
+        assert_eq(put_u16_le(window, 0x1234), left >= 2)
+        assert_eq(put_u16_be(window, 0x1234), left >= 2)
+        assert_eq(put_u32_le(window, 0x12345678), left >= 4)
+        assert_eq(put_u32_be(window, 0x12345678), left >= 4)
+        assert_eq(put_u64_le(window, 0x0102030405060708), left >= 8)
+        assert_eq(put_u64_be(window, 0x0102030405060708), left >= 8)
+
+        for j in 0..<off
+            assert_eq(out[j], 0xaa)
+
+        if left >= 8
+            assert_eq(get_u64_be(window).unwrap(), 0x0102030405060708)
+
+        var fresh: []u8 = [0xaa; 16]
+        val w2 = fresh[off..]
+
+        if left >= 4
+            assert(put_u32_le(w2, 0xa1b2c3d4))
+            assert_eq(fresh[off], 0xd4)
+            assert_eq(fresh[off + 3], 0xa1)
+            assert(put_u32_be(w2, 0xa1b2c3d4))
+            assert_eq(fresh[off], 0xa1)
+            assert_eq(fresh[off + 3], 0xd4)
+        else
+            assert(!put_u32_le(w2, 0xa1b2c3d4))
+            assert(!put_u32_be(w2, 0xa1b2c3d4))
+
+            for j in 0..<16
+                assert_eq(fresh[j], 0xaa)
+end binary_every_offset
+
 // -- UUIDs ----------------------------------------------------------------------------------------
 //
 // The version and variant bits are the whole of what makes sixteen bytes a UUID, and getting one of
