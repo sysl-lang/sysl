@@ -21,7 +21,7 @@ handling away from every program with no operating system to ask. Deciding what 
 
 ## Index
 
-[`append`](#append) [`append_bytes`](#append_bytes) [`append_text`](#append_text) [`cache_dir`](#cache_dir) [`canonicalize`](#canonicalize) [`config_dir`](#config_dir) [`copy_dir_all`](#copy_dir_all) [`copy_file`](#copy_file) [`create`](#create) [`create_update`](#create_update) [`current_dir`](#current_dir) [`data_dir`](#data_dir) [`entries`](#entries) [`entry_bytes`](#entry_bytes) [`exists`](#exists) [`from_errno`](#from_errno) [`hard_link`](#hard_link) [`home_dir`](#home_dir) [`is_dir`](#is_dir) [`is_file`](#is_file) [`is_link`](#is_link) [`link_metadata`](#link_metadata) [`make_dir`](#make_dir) [`make_dir_all`](#make_dir_all) [`make_temp_dir`](#make_temp_dir) [`map_file`](#map_file) [`metadata`](#metadata) [`open`](#open) [`open_update`](#open_update) [`page_size`](#page_size) [`pending_name`](#pending_name) [`publish_dir`](#publish_dir) [`publish_file`](#publish_file) [`read_bytes`](#read_bytes) [`read_link`](#read_link) [`read_text`](#read_text) [`readable`](#readable) [`remove_dir`](#remove_dir) [`remove_dir_all`](#remove_dir_all) [`remove_file`](#remove_file) [`rename`](#rename) [`set_current_dir`](#set_current_dir) [`set_modified`](#set_modified) [`set_owner`](#set_owner) [`set_permissions`](#set_permissions) [`size_of`](#size_of) [`symlink`](#symlink) [`truncate`](#truncate) [`walk`](#walk) [`writable`](#writable) [`write_bytes`](#write_bytes) [`write_bytes_atomic`](#write_bytes_atomic) [`write_text`](#write_text) [`write_text_atomic`](#write_text_atomic) [`Advice`](#advice) [`Entry`](#entry) [`File`](#file) [`FileState`](#filestate) [`IoError`](#ioerror) [`Kind`](#kind) [`Mapped`](#mapped) [`Matching`](#matching) [`Meta`](#meta) [`Walk`](#walk-1) [Display for IoError](#display-for-ioerror) [Display for Kind](#display-for-kind) [Drop for FileState](#drop-for-filestate) [Drop for Mapped](#drop-for-mapped) [Eq for IoError](#eq-for-ioerror) [Eq for Kind](#eq-for-kind) [Fallible for File](#fallible-for-file) [Iterate for Matching](#iterate-for-matching) [Iterate for Walk](#iterate-for-walk) [Positioned for File](#positioned-for-file) [ReadAt for File](#readat-for-file) [Reader for File](#reader-for-file) [WriteAt for File](#writeat-for-file) [Writer for File](#writer-for-file)
+[`append`](#append) [`append_bytes`](#append_bytes) [`append_text`](#append_text) [`cache_dir`](#cache_dir) [`canonicalize`](#canonicalize) [`config_dir`](#config_dir) [`copy_dir_all`](#copy_dir_all) [`copy_file`](#copy_file) [`create`](#create) [`create_update`](#create_update) [`current_dir`](#current_dir) [`data_dir`](#data_dir) [`entries`](#entries) [`entry_bytes`](#entry_bytes) [`exists`](#exists) [`from_errno`](#from_errno) [`hard_link`](#hard_link) [`home_dir`](#home_dir) [`is_dir`](#is_dir) [`is_file`](#is_file) [`is_link`](#is_link) [`link_metadata`](#link_metadata) [`make_dir`](#make_dir) [`make_dir_all`](#make_dir_all) [`make_temp_dir`](#make_temp_dir) [`map_file`](#map_file) [`metadata`](#metadata) [`open`](#open) [`open_dir`](#open_dir) [`open_update`](#open_update) [`page_size`](#page_size) [`pending_name`](#pending_name) [`publish_dir`](#publish_dir) [`publish_file`](#publish_file) [`read_bytes`](#read_bytes) [`read_link`](#read_link) [`read_text`](#read_text) [`readable`](#readable) [`remove_dir`](#remove_dir) [`remove_dir_all`](#remove_dir_all) [`remove_file`](#remove_file) [`rename`](#rename) [`set_current_dir`](#set_current_dir) [`set_modified`](#set_modified) [`set_owner`](#set_owner) [`set_permissions`](#set_permissions) [`size_of`](#size_of) [`symlink`](#symlink) [`truncate`](#truncate) [`walk`](#walk) [`writable`](#writable) [`write_bytes`](#write_bytes) [`write_bytes_atomic`](#write_bytes_atomic) [`write_text`](#write_text) [`write_text_atomic`](#write_text_atomic) [`Advice`](#advice) [`Dir`](#dir) [`Entry`](#entry) [`File`](#file) [`FileState`](#filestate) [`IoError`](#ioerror) [`Kind`](#kind) [`Mapped`](#mapped) [`Matching`](#matching) [`Meta`](#meta) [`Walk`](#walk-1) [Display for IoError](#display-for-ioerror) [Display for Kind](#display-for-kind) [Drop for Dir](#drop-for-dir) [Drop for FileState](#drop-for-filestate) [Drop for Mapped](#drop-for-mapped) [Eq for IoError](#eq-for-ioerror) [Eq for Kind](#eq-for-kind) [Fallible for File](#fallible-for-file) [Iterate for Matching](#iterate-for-matching) [Iterate for Walk](#iterate-for-walk) [Positioned for File](#positioned-for-file) [ReadAt for File](#readat-for-file) [Reader for File](#reader-for-file) [WriteAt for File](#writeat-for-file) [Writer for File](#writer-for-file)
 
 ## Functions
 
@@ -400,6 +400,18 @@ The three ways a program opens a file, named for what it means rather than for t
 becomes. `open` reads an existing file; `create` makes one, or empties one that was there;
 `append` writes at the end of whatever is there, making the file if it is not.
 
+### `open_dir`
+
+```sysl
+open_dir(path: string) -> Result[&Dir, IoError]
+```
+
+The directory at `path`, held open to reach what is beneath it.
+
+A link as the last component of `path` is refused (`refused_link()`), and what is not a directory
+is `NotADirectory`. The components above it are the caller's own path and are followed as any path
+is -- `/tmp` is a link on macOS.
+
 ### `open_update`
 
 ```sysl
@@ -719,6 +731,37 @@ enum Advice
 
 How a mapped range is about to be read, for `Mapped.advise`.
 
+### `Dir`
+
+```sysl
+struct Dir
+    private handle: int
+```
+
+A directory open for reaching what is beneath it, and only that.
+
+**Every path handed to it is relative to it and stays inside it.** A symbolic link at any component
+is refused -- the last one or one above it, pointing out of the directory or back into it -- and so
+is any `..` component, even one that would come back inside: between resolving `a` and resolving
+`a/..` the directory `a` can be moved somewhere else, and its `..` with it. An absolute path is
+refused too. Each refusal is an `IoError` that `refused_link()` or `escaped()` recognises; every
+other failure is the ordinary one (`NotFound`, `PermissionDenied`, ...).
+
+**It closes itself** when its last reference goes. A `File` opened through it is a descriptor of its
+own, and stays open after the directory is gone.
+
+| Member | Signature | Description |
+|---|---|---|
+| `fd` | `fd(self) -> int` | The descriptor, lent for a call this module does not make; the directory still closes it. |
+| `open` | `open(self, path: string) -> Result[File, IoError]` | The five ways a file is opened, as `sysl.fs.open`, `create`, `append`, `open_update` and `create_update` open one, with `path` beneath this directory. |
+| `create` | `create(self, path: string) -> Result[File, IoError]` |  |
+| `append` | `append(self, path: string) -> Result[File, IoError]` |  |
+| `open_update` | `open_update(self, path: string) -> Result[File, IoError]` |  |
+| `create_update` | `create_update(self, path: string) -> Result[File, IoError]` |  |
+| `link_metadata` | `link_metadata(self, path: string) -> Result[Meta, IoError]` | What is at `path`, described as `sysl.fs.link_metadata` describes it: a link as the last component is reported as a link (`is_link()`), never followed. |
+| `exists` | `exists(self, path: string) -> bool` | Whether anything is at `path`, a link included. |
+| `remove_file` | `remove_file(self, path: string) -> Result[unit, IoError]` | Removes the file at `path`. |
+
 ### `Entry`
 
 ```sysl
@@ -775,6 +818,7 @@ easy. While any copy lives the descriptor stays open.
 | `size` | `size(*self) -> Result[long, IoError]` | How many bytes the file holds. |
 | `at_end` | `at_end(*self) -> bool` | Whether a read has already run off the end. |
 | `truncate` | `truncate(*self, length: long) -> Result[unit, IoError]` | The file cut to a length, or extended to one with zeroes -- the one thing this surface could not do, having `seek` and `size` and no way to change what is there. |
+| `read_failure` | `read_failure(*self) -> Option[IoError]` | What the file latched when a read failed, as the same `IoError` -- the system's own wording and `errno` -- that a whole-file read answers, or `None` while `failed` is false. |
 
 ### `FileState`
 
@@ -833,6 +877,8 @@ Why a filesystem operation did not happen.
 |---|---|---|
 | `code` | `code(self) -> int` | The number this came from, so a program can report or compare one the set does not name. |
 | `message` | `message(self) -> string` | A sentence, in the terms the operation was asked in rather than in C's. |
+| `refused_link` | `refused_link(self) -> bool` | Whether a `Dir` refused this path because a component of it is a symbolic link -- the last one or any above it, whether the link points inside the directory or out of it. |
+| `escaped` | `escaped(self) -> bool` | Whether a `Dir` refused this path because it leads out of the directory: an absolute path, a `..` component, or the kernel finding a way out. |
 
 ### `Kind`
 
@@ -994,6 +1040,14 @@ impl Display for Kind
 So that a kind prints as the word rather than as a number, and `Special` says what it is carrying:
 a program reporting what it found in a directory has one thing to print, and the alternative is a
 `match` at every such site.
+
+### Drop for Dir
+
+```sysl
+impl Drop for Dir
+```
+
+The descriptor closed when the last reference goes. A failure closing it has nobody to tell.
 
 ### Drop for FileState
 

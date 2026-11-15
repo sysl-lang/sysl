@@ -1,0 +1,300 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A frozen buffer is held like any other box (`reference/memory.md § A frozen buffer crosses`), so a
+// struct with a `&Frozen[T]` field is kept, pushed and answered exactly as one with a `Buf[T]` field
+// is. The keeps analysis asks of a type whether it may hold an address (`keeps.sysl`'s
+// `may_hold_pointer`), and it read the library's `Frozen` by its fields: the `*T` naming the storage
+// `freeze()` took made every value reaching a frozen buffer look like one that may hold somebody's
+// address. Pushing `self.root` into `self.undos` -- a box read out of the receiver -- was then said
+// to keep the receiver, and a closure at `&Fn(&Doc)` calling it was refused. A frozen buffer now
+// holds an address only where its elements may (`frozen_element`), as a view does.
+//
+// The matrix crosses the field the stored box reaches (`&Frozen[int]`, a frozen buffer of frozen
+// buffers, `Buf[int]`, a plain `&Leaf`) with where it is stored (the receiver's own `Buf`, another
+// parameter's `Buf`, returned and pushed by the caller) and with the call (direct, and through a
+// `&Fn`). A closure keeping the `&Doc` itself is judged as it is with a `Buf[int]` field: it keeps a
+// share of a box. Every keep that genuinely happens is still refused: a frozen buffer whose elements
+// are raw pointers, and a raw pointer held beside a frozen buffer.
+//
+// Skipped cells, and why: a `&sync Frozen[T]` is the same type to this question (the `&sync` is on
+// the box, not the frozen buffer); separate compilation reads the same typed tree.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private fzk_outcome(text: string) -> (string, int)
+    val root = make_temp_dir("sysl-fzk").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end fzk_outcome
+
+private fzk_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = fzk_outcome(text)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+end fzk_prints
+
+private fzk_refused(text: string, part: string)
+    if xvr_no_library() then return
+
+    val out = fzk_outcome(text)
+
+    assert_eq(out.1, -1, out.0)
+    assert(out.0.index_of(part).is_some(), out.0)
+end fzk_refused
+
+private const fzk_prelude: string = raw"""
+    import sysl.buf.{Buf, buf, Frozen}
+
+    struct Leaf
+        n: int
+
+    ints() -> &Frozen[int]
+        var b: Buf[int] = buf()
+
+        b.push(4)
+        b.freeze()
+
+    nested() -> &Frozen[&Frozen[int]]
+        var b: Buf[&Frozen[int]] = buf()
+
+        b.push(ints())
+        b.freeze()
+
+    """
+
+// A program whose `Item` has `field`, made with `make`, and whose `main` does `call` then prints how
+// many items were stored.
+private fzk_cell(field: string, make: string, call: string) -> string =
+    fzk_prelude + s"struct Item\n    children: $field\n\n" + raw"""
+        struct Log
+            items: Buf[&Item]
+
+        struct Doc
+            root: &Item
+            undos: Buf[&Item]
+
+            record(&self) = self.undos.push(self.root)
+            record_into(&self, log: &Log) = log.items.push(self.root)
+            top(&self) -> &Item = self.root
+
+        """ + s"main()\n    var doc: &Doc = Doc(Item($make), buf())\n    var log: &Log = Log(buf())\n" + call +
+        "    print(doc.undos.len() + log.items.len())\n"
+
+private val fzk_own_direct = "    doc.record()\n"
+private val fzk_own_fn = "    val f: &Fn(&Doc) -> unit = d -> d.record()\n    f(doc)\n"
+private val fzk_other_direct = "    doc.record_into(log)\n"
+private val fzk_other_fn = "    val f: &Fn(&Doc, &Log) -> unit = (d, l) -> d.record_into(l)\n    f(doc, log)\n"
+private val fzk_answer_direct = "    log.items.push(doc.top())\n"
+private val fzk_answer_fn = "    val f: &Fn(&Doc) -> &Item = d -> d.top()\n    log.items.push(f(doc))\n"
+
+// Every store and call, for one field type.
+private fzk_row(field: string, make: string)
+    fzk_prints(fzk_cell(field, make, fzk_own_direct), "1\n")
+    fzk_prints(fzk_cell(field, make, fzk_own_fn), "1\n")
+    fzk_prints(fzk_cell(field, make, fzk_other_direct), "1\n")
+    fzk_prints(fzk_cell(field, make, fzk_other_fn), "1\n")
+    fzk_prints(fzk_cell(field, make, fzk_answer_direct), "1\n")
+    fzk_prints(fzk_cell(field, make, fzk_answer_fn), "1\n")
+end fzk_row
+
+// -- the reduction ---------------------------------------------------------------------------------
+
+@test("a closure at &Fn(&Doc) calls a method pushing a box that holds a frozen buffer")
+fzk_reduction()
+    fzk_prints(raw"""
+        import sysl.buf.{Buf, buf, Frozen}
+
+        struct Item
+            children: &Frozen[int]
+
+        struct Doc
+            root: &Item
+            undos: Buf[&Item]
+
+            record(&self) = self.undos.push(self.root)
+
+        val doc = Doc(Item(buf().freeze()), buf())
+        val f: &Fn(&Doc) -> unit = d -> d.record()
+
+        f(doc)
+        print(doc.undos.len())
+        """, "1\n")
+
+// -- the matrix ------------------------------------------------------------------------------------
+
+@test("a box holding a &Frozen[int] is stored, handed on and answered, directly and through &Fn")
+fzk_frozen_row()
+    fzk_row("&Frozen[int]", "ints()")
+
+@test("a box holding a frozen buffer of frozen buffers is stored, handed on and answered")
+fzk_nested_row()
+    fzk_row("&Frozen[&Frozen[int]]", "nested()")
+
+@test("a box holding a Buf[int] is stored, handed on and answered, as it was")
+fzk_buf_row()
+    fzk_row("Buf[int]", "buf()")
+
+@test("a box holding a plain box is stored, handed on and answered, as it was")
+fzk_plain_row()
+    fzk_row("&Leaf", "Leaf(4)")
+
+@test("what is stored still reads the frozen elements afterwards")
+fzk_reads_after()
+    fzk_prints(fzk_prelude + raw"""
+        struct Item
+            children: &Frozen[&Frozen[int]]
+
+        struct Doc
+            root: &Item
+            undos: Buf[&Item]
+
+            record(&self) = self.undos.push(self.root)
+
+        main()
+            var doc: &Doc = Doc(Item(nested()), buf())
+            val f: &Fn(&Doc) -> unit = d -> d.record()
+
+            f(doc)
+            f(doc)
+            print(doc.undos.len(), doc.undos[1].children[0][0])
+        """, "2 4\n")
+
+// -- judged as a Buf field is ----------------------------------------------------------------------
+
+// A `&T` whose `T` holds no address is a box wherever it comes from -- a value handed where one is
+// expected is copied into a fresh one -- so a closure keeping it keeps a share, not a caller's
+// storage, and the rule asks nothing of it (`keeps.sysl`'s `refuse_promised`). A frozen buffer of
+// numbers is that kind of field now, as a `Buf[int]` always was: each program is run with both.
+private fzk_both(text_after_item: string, want: string)
+    for field in ["&Frozen[int]", "Buf[int]"]
+        val make = if field == "Buf[int]" then "buf()" else "ints()"
+
+        fzk_prints(fzk_prelude + s"struct Item\n    children: $field\n\nmade() -> &Item = Item($make)\n\n" +
+                   text_after_item, want)
+    end for
+end fzk_both
+
+@test("a closure at &Fn(&Doc) keeping the Doc itself keeps a share, with either field")
+fzk_keeps_parameter_share()
+    fzk_both(raw"""
+        struct Doc
+            root: &Item
+
+        var saved: Buf[&Doc] = buf()
+
+        main()
+            var doc: &Doc = Doc(made())
+            val f: &Fn(&Doc) -> unit = d -> saved.push(d)
+
+            f(doc)
+            f(doc)
+            print(saved.len())
+        """, "2\n")
+
+@test("a method keeping its receiver, called by a closure at &Fn(&Doc), keeps a share, with either field")
+fzk_keeps_receiver_share()
+    fzk_both(raw"""
+        var saved: Buf[&Doc] = buf()
+
+        struct Doc
+            root: &Item
+
+            remember(&self) = saved.push(self)
+
+        main()
+            var doc: &Doc = Doc(made())
+            val f: &Fn(&Doc) -> unit = d -> d.remember()
+
+            f(doc)
+            print(saved.len())
+        """, "1\n")
+
+// -- what is still kept ----------------------------------------------------------------------------
+
+private val fzk_kept_d = "a closure borrows what it is handed for the call, and this one keeps its parameter 'd'"
+
+@test("a Doc holding a frozen buffer and a raw pointer, kept by a closure at &Fn(&Doc), is refused")
+fzk_keeps_pointer_beside_frozen_refused()
+    fzk_refused(fzk_prelude + raw"""
+        struct Doc
+            children: &Frozen[int]
+            at: *int
+
+        var saved: Buf[&Doc] = buf()
+        var spot = 3
+
+        main()
+            var doc: &Doc = Doc(ints(), &spot)
+            val f: &Fn(&Doc) -> unit = d -> saved.push(d)
+
+            f(doc)
+            print(saved.len())
+        """, fzk_kept_d)
+
+@test("a frozen buffer of raw pointers is still followed as what may hold an address")
+fzk_pointer_elements_refused()
+    fzk_refused(fzk_prelude + raw"""
+        struct Item
+            children: &Frozen[*int]
+
+        struct Doc
+            root: &Item
+            undos: Buf[&Item]
+
+            record(&self) = self.undos.push(self.root)
+
+        main()
+            var b: Buf[*int] = buf()
+            var doc: &Doc = Doc(Item(b.freeze()), buf())
+            val f: &Fn(&Doc) -> unit = d -> d.record()
+
+            f(doc)
+            print(doc.undos.len())
+        """, fzk_kept_d)
+
+// -- a value handed where a &T is expected ---------------------------------------------------------
+
+// A `T` where a `&T` is expected goes on the heap (the reference's memory page says so where it
+// introduces counted references), so a plain struct value handed to a `&Fn(&Doc)` is a copy in a fresh box and the write
+// lands there; a `var` declared `&Doc` is the box itself, and the write is seen.
+@test("a method writing a field through a closure at &Fn(&Doc) writes the box it is handed")
+fzk_write_through_box()
+    fzk_prints(raw"""
+        struct Doc
+            root: int
+
+            set(&self) = self.root = 1
+
+        main()
+            var boxed: &Doc = Doc(0)
+            val value = Doc(0)
+            val f: &Fn(&Doc) -> unit = d -> d.set()
+
+            f(boxed)
+            f(value)
+            print(boxed.root, value.root)
+        """, "1 0\n")
