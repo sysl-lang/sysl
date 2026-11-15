@@ -2818,11 +2818,27 @@ private gather_steps(t: &Track, e: TExpr, out: *Buf[int], depth: int)
         TMatch(_, arms, _) ->
             for arm in arms
                 if arm.body.result.is_some() then gather_steps(t, arm.body.result.unwrap(), out, depth + 1)
-        TCall(name, args, ty, _) -> if may_hold_pointer(t.cx, ty) then call_steps(t, name, args, ty, out, depth)
+        TCall(name, args, ty, _) ->
+            if may_hold_pointer(t.cx, ty) then call_steps(t, name, args, ty, out, depth)
+            if slots_address(t, args, ty) then push_step(out, t.steps - 1)
         TVCall(recv, _, args, ty, _) -> if may_hold_pointer(t.cx, ty) then any_steps(t, with_receiver(recv, args), out, depth)
         TCallPtr(_, args, _, ty) -> if may_hold_pointer(t.cx, ty) then any_steps(t, args, out, depth)
         _ -> ()
 end gather_steps
+
+// **A view or a pointer read out of a buffer holding what is tracked is the address of its slots**, as
+// a view of a literal is the address of its elements: `group(b.view())`, `b` holding a copy of the
+// parameter, hands `group` a pointer through which it reads that copy one step in.
+private slots_address(t: &Track, args: Buf[TExpr], ty: Type) -> bool
+    if !value_walk(t) then return false
+
+    val addressed = ty match
+        Slice(_, _) -> true
+        Ptr(_) -> true
+        _ -> false
+
+    addressed && reads_vessel(t, args)
+end slots_address
 
 // An element of a literal is held one step through it, as a place is through its address.
 private element_steps(t: &Track, v: TExpr, out: *Buf[int], depth: int)
@@ -3408,7 +3424,8 @@ private carries(t: &Track, e: TExpr) -> bool = *e.kind match
     // read through what carries it is what is followed.
     TField(r, _, ty) -> may_hold_pointer(t.cx, ty) && path_ok(t, e) && carries(t, r)
     TDeref(x, ty) ->
-        may_hold_pointer(t.cx, ty) && (steps_in(t, x) || boxed(texpr_type(x)) || at_the_value(t, x)) && carries(t, x)
+        may_hold_pointer(t.cx, ty) &&
+            (steps_in(t, x) || boxed(texpr_type(x)) || at_the_value(t, x) || vessel_slot(t, x)) && carries(t, x)
     TIndex(r, _, ty) ->
         may_hold_pointer(t.cx, ty) && (steps_in(t, r) || is_array_type(texpr_type(r)) || at_the_value(t, r)) &&
             path_ok(t, e) && carries(t, r)
@@ -3524,6 +3541,17 @@ private reads_vessel(t: &Track, args: Buf[TExpr]) -> bool
 
     false
 end reads_vessel
+
+// **A slot read out of a buffer holding what is tracked is what was put in it**: `b[0]` is
+// `*b.index_place(0)`, the address of one of `b`'s slots, and the value in that slot may be the very
+// value a `push` stored there. So a walk of the value itself follows the element out, into an answer
+// (`through(h) = { b.push(h); b[0] }`) or into another keep, as it follows `pop()`. A buffer that is
+// itself what carries it -- a callee's answer, `handed(f)[0]` -- is read the same way.
+private vessel_slot(t: &Track, x: TExpr) -> bool = *x.kind match
+    TCall(name, args, _, _) ->
+        value_walk(t) && (reads_vessel(t, args) ||
+            (!args.is_empty() && name.starts_with(module_qualify("sysl.buf", "Buf") + ".") && carries(t, args[0])))
+    _ -> false
 
 // Whether an argument is the address of a buffer holding what is tracked.
 // `&work`, or -- in a body lent one (`walk_vessel`) -- the pointer itself handed on.
@@ -5206,7 +5234,8 @@ private probe_text(ft: &FrameTrack, e: TExpr) -> string = *e.kind match
         var all = ""
 
         for i in 0..<args.len()
-            if answers_arg(ft.cx, name, args, i, ty, false) || probe_answers_through(ft, name, args[i], i)
+            if answers_arg(ft.cx, name, args, i, ty, false) || probe_answers_through(ft, name, args[i], i) ||
+               (i == 0 && reads_buffer_slots(ft, name, ty))
                 all = all + probe_text(ft, args[i])
         end for
 
@@ -5237,6 +5266,12 @@ private probe_text(ft: &FrameTrack, e: TExpr) -> string = *e.kind match
 
         all
     _ -> ""
+
+// **What a `Buf`'s own member answers out of its slots may be what was put in them** (for a probe):
+// `handed(f)[0]` is `*index_place(handed(f), 0)`, and the closure the answered buffer holds is in
+// that slot.
+private reads_buffer_slots(ft: &FrameTrack, name: string, ty: Type) -> bool =
+    may_hold_pointer(ft.cx, ty) && name.starts_with(module_qualify("sysl.buf", "Buf") + ".")
 
 // **A call answering with a value it read through a pointer or a view it was handed answers with the
 // closures that argument reaches** (for a probe): `first([f, g])`, `get(&s)`.
