@@ -2357,13 +2357,21 @@ private kept_hard(evs: &EvBuf, how: string, by: TExpr) = evs.items.push(kept_ev(
 // storage of a slice held in what a parameter points at (`slot_place(self.elems, n, v)`) is held
 // through that parameter, at an element nobody can name (`SlotsMark`) -- and the caller says what
 // the parameter is: a buffer its own frame made, module storage, or its own parameter's
-// (`keeps_vessel.sysl`). Storage reached any other way is held anywhere at all.
+// (`keeps_vessel.sysl`). **A run cut from that storage is the same slots** -- `extend` cuts
+// `self.elems[count..<need]` once into a `val` and places into the cut -- whether written in place or
+// through a local bound once to the cut and never written. Storage reached any other way is held
+// anywhere at all.
 private slot_loc(o: &Origins, storage: TExpr) -> string
-    val owned = *storage.kind match
-        TField(_, _, _) -> true
-        _ -> false
+    *storage.kind match
+        TField(_, _, _) -> ()
+        TSlice(base, _, _, _, _) -> return slot_loc(o, base)
+        TLoad(n, _) ->
+            if stable_name(o, n) == "" then return ""
 
-    if !owned then return ""
+            return o.inits.get(n) match
+                Some(init) -> slot_loc(o, init)
+                None -> ""
+        _ -> return ""
 
     val loc = place_loc(o, storage)
 
@@ -2818,11 +2826,27 @@ private gather_steps(t: &Track, e: TExpr, out: *Buf[int], depth: int)
         TMatch(_, arms, _) ->
             for arm in arms
                 if arm.body.result.is_some() then gather_steps(t, arm.body.result.unwrap(), out, depth + 1)
-        TCall(name, args, ty, _) -> if may_hold_pointer(t.cx, ty) then call_steps(t, name, args, ty, out, depth)
+        TCall(name, args, ty, _) ->
+            if may_hold_pointer(t.cx, ty) then call_steps(t, name, args, ty, out, depth)
+            if slots_address(t, args, ty) then push_step(out, t.steps - 1)
         TVCall(recv, _, args, ty, _) -> if may_hold_pointer(t.cx, ty) then any_steps(t, with_receiver(recv, args), out, depth)
         TCallPtr(_, args, _, ty) -> if may_hold_pointer(t.cx, ty) then any_steps(t, args, out, depth)
         _ -> ()
 end gather_steps
+
+// **A view or a pointer read out of a buffer holding what is tracked is the address of its slots**, as
+// a view of a literal is the address of its elements: `group(b.view())`, `b` holding a copy of the
+// parameter, hands `group` a pointer through which it reads that copy one step in.
+private slots_address(t: &Track, args: Buf[TExpr], ty: Type) -> bool
+    if !value_walk(t) then return false
+
+    val addressed = ty match
+        Slice(_, _) -> true
+        Ptr(_) -> true
+        _ -> false
+
+    addressed && reads_vessel(t, args)
+end slots_address
 
 // An element of a literal is held one step through it, as a place is through its address.
 private element_steps(t: &Track, v: TExpr, out: *Buf[int], depth: int)
@@ -3408,7 +3432,8 @@ private carries(t: &Track, e: TExpr) -> bool = *e.kind match
     // read through what carries it is what is followed.
     TField(r, _, ty) -> may_hold_pointer(t.cx, ty) && path_ok(t, e) && carries(t, r)
     TDeref(x, ty) ->
-        may_hold_pointer(t.cx, ty) && (steps_in(t, x) || boxed(texpr_type(x)) || at_the_value(t, x)) && carries(t, x)
+        may_hold_pointer(t.cx, ty) &&
+            (steps_in(t, x) || boxed(texpr_type(x)) || at_the_value(t, x) || vessel_slot(t, x)) && carries(t, x)
     TIndex(r, _, ty) ->
         may_hold_pointer(t.cx, ty) && (steps_in(t, r) || is_array_type(texpr_type(r)) || at_the_value(t, r)) &&
             path_ok(t, e) && carries(t, r)
@@ -3525,6 +3550,17 @@ private reads_vessel(t: &Track, args: Buf[TExpr]) -> bool
     false
 end reads_vessel
 
+// **A slot read out of a buffer holding what is tracked is what was put in it**: `b[0]` is
+// `*b.index_place(0)`, the address of one of `b`'s slots, and the value in that slot may be the very
+// value a `push` stored there. So a walk of the value itself follows the element out, into an answer
+// (`through(h) = { b.push(h); b[0] }`) or into another keep, as it follows `pop()`. A buffer that is
+// itself what carries it -- a callee's answer, `handed(f)[0]` -- is read the same way.
+private vessel_slot(t: &Track, x: TExpr) -> bool = *x.kind match
+    TCall(name, args, _, _) ->
+        value_walk(t) && (reads_vessel(t, args) ||
+            (!args.is_empty() && name.starts_with(module_qualify("sysl.buf", "Buf") + ".") && carries(t, args[0])))
+    _ -> false
+
 // Whether an argument is the address of a buffer holding what is tracked.
 // `&work`, or -- in a body lent one (`walk_vessel`) -- the pointer itself handed on.
 private lends_vessel(t: &Track, arg: TExpr) -> bool = *arg.kind match
@@ -3610,8 +3646,10 @@ private holds_pointer_within(t: Type, seen: *Buf[string]) -> bool = t match
     // **A closure literal with captures may hold the address of each `var` it captures** (`closure_mode.sysl`),
     // and whether it does is what this analysis is asked to decide -- so its value is followed
     // wherever it goes, whatever its fields say before the decision.
-    Struct(d) -> (is_closure_literal(t) && !d.fields.is_empty()) ||
-        (first_visit(t, seen) && fields_hold_pointer(d.fields, seen))
+    Struct(d) -> frozen_element(t) match
+        Some(elem) -> holds_pointer_within(elem, seen)
+        None -> (is_closure_literal(t) && !d.fields.is_empty()) ||
+            (first_visit(t, seen) && fields_hold_pointer(d.fields, seen))
     Enum(d) -> first_visit(t, seen) && variants_hold_pointer(d.variants, seen)
     _ -> false
 
@@ -3633,6 +3671,10 @@ private holds_raw_pointer(t: Type, depth: int) -> bool
         Struct(d) ->
             if is_closure_literal(t) then return false
 
+            frozen_element(t) match
+                Some(elem) -> return holds_raw_pointer(elem, depth + 1)
+                None -> ()
+
             for item in d.fields
                 if holds_raw_pointer(item.1, depth + 1) then return true
 
@@ -3645,6 +3687,15 @@ private holds_raw_pointer(t: Type, depth: int) -> bool
             false
         _ -> false
 end holds_raw_pointer
+
+// **A frozen buffer holds an address only where its elements do** (`library/sysl/buf/frozen.sysl`),
+// as a view does: its `*T` names the storage `freeze()` took out of a buffer, which is the heap's and
+// is owned through the frozen buffer's own count, never anybody's frame. Its private fields are set
+// by the library alone, so the element type is all a value of it can lend. The element type, or
+// nothing for any other type.
+private frozen_element(t: Type) -> Option[Type] = t match
+    Struct(d) -> if d.base == frozen_base() && d.targs.len() == 1 then Some(d.targs[0]) else None
+    _ -> None
 
 private first_visit(t: Type, seen: *Buf[string]) -> bool
     val key = type_show(t)
@@ -5206,7 +5257,8 @@ private probe_text(ft: &FrameTrack, e: TExpr) -> string = *e.kind match
         var all = ""
 
         for i in 0..<args.len()
-            if answers_arg(ft.cx, name, args, i, ty, false) || probe_answers_through(ft, name, args[i], i)
+            if answers_arg(ft.cx, name, args, i, ty, false) || probe_answers_through(ft, name, args[i], i) ||
+               (i == 0 && reads_buffer_slots(ft, name, ty))
                 all = all + probe_text(ft, args[i])
         end for
 
@@ -5237,6 +5289,12 @@ private probe_text(ft: &FrameTrack, e: TExpr) -> string = *e.kind match
 
         all
     _ -> ""
+
+// **What a `Buf`'s own member answers out of its slots may be what was put in them** (for a probe):
+// `handed(f)[0]` is `*index_place(handed(f), 0)`, and the closure the answered buffer holds is in
+// that slot.
+private reads_buffer_slots(ft: &FrameTrack, name: string, ty: Type) -> bool =
+    may_hold_pointer(ft.cx, ty) && name.starts_with(module_qualify("sysl.buf", "Buf") + ".")
 
 // **A call answering with a value it read through a pointer or a view it was handed answers with the
 // closures that argument reaches** (for a probe): `first([f, g])`, `get(&s)`.

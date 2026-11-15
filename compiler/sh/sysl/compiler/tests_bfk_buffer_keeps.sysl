@@ -1,0 +1,566 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Var}
+import sysl.text.{cstring, Search}
+
+// A value pushed into a `Buf` a body made is in that buffer's slots, and an element read back out of
+// it -- `b[0]`, which is `*b.index_place(0)` -- may be that very value. A callee that wraps the
+// closure it is handed, pushes the wrapper into a buffer of its own and answers an element
+// (`handed(run) = { cells.push(Tap(run)); cells[0] }`) answers what holds the closure. When the
+// answer summary lost the value at the slot read, the caller judged its closure literal not to
+// outlive its frame, laid its box there, and the answer called it after the frame was gone.
+//
+// Every program runs on the counted heap after scribbling over the stack the maker used (the right
+// value, nothing left over, nothing given back twice); the reduction also under AddressSanitizer and
+// at -O0 and -O2.
+//
+// Skipped cells, and why: a call through an object or a pointer to a function already answers
+// "anywhere", so it boxes whatever the buffer holds; what a body made the buffer of decides nothing
+// once the buffer is a parameter's, which is a keep of that parameter (`bfk_into_parameter_buffer`).
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private extern "setenv" bfk_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" bfk_c_unsetenv(name: *u8) -> int
+
+private struct BfkRun
+    out: string
+    err: string
+    hooks: usize
+end BfkRun
+
+// The program built at `level` and run: on the counted heap, or with `flags` handed to clang.
+private bfk_run(text: string, counted: bool, flags: string, level: string) -> BfkRun
+    val root = make_temp_dir("sysl-bfk").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    val exe = s"$root/built"
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+        val v = cstring(flags)
+
+        bfk_c_setenv(n.ptr, v.ptr, 1)
+    end if
+
+    force_alloc_counting(counted)
+
+    val made = build_native_program(s"$root/main.sysl", None, None, level, Some(exe))
+
+    force_alloc_counting(false)
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+
+        bfk_c_unsetenv(n.ptr)
+    end if
+
+    made match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return BfkRun(failure_text(why), "", 0)
+        Ok(_) -> ()
+
+    val hooks = capture("nm", ["-u", exe], "", [], true) match
+        Ok(o) -> o.text.count_of("__asan_report")
+        Err(_) -> 0
+
+    val ran = capture(exe, [], "", [Var("ASAN_OPTIONS", "detect_stack_use_after_return=1")], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    ran match
+        Err(_) -> BfkRun("could not be started", "", hooks)
+        Ok(o) -> BfkRun(o.text, o.err.unwrap_or(""), hooks)
+end bfk_run
+
+private bfk_prints_at(text: string, want: string, level: string)
+    if !enm_ready() then return
+
+    val got = bfk_run(text, true, "", level)
+
+    assert_eq(got.out, want)
+    assert_eq(got.err, "")
+end bfk_prints_at
+
+private bfk_prints(text: string, want: string) = bfk_prints_at(text, want, DefaultOptimization)
+
+// The program printed `want` under AddressSanitizer, instrumented, and nothing was reported.
+private bfk_asan(text: string, want: string)
+    if !enm_ready() then return
+
+    val got = bfk_run(text, false, "-fsanitize=address -g", DefaultOptimization)
+
+    assert(got.hooks > 0, s"not instrumented: ${got.out}")
+    assert_eq(got.out, want)
+    assert_eq(got.err, "")
+end bfk_asan
+
+// The IR of a program, or its analysis report where it was refused.
+private bfk_ir(text: string) -> string
+    val root = make_temp_dir("sysl-bfk").unwrap()
+
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    val ir = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    ir
+end bfk_ir
+
+// How many closure boxes the IR of a program lays in a frame.
+private bfk_frame_boxes(text: string) -> int
+    var n = 0
+
+    for line in lines_of(bfk_ir(text)).view()
+        if line.contains("= alloca %arc.$closure") then n += 1
+
+    n
+end bfk_frame_boxes
+
+// What every program below shares: a node that runs the closure it holds, and a `main` that calls
+// `make`, scribbles over the stack `make` used, and only then fires what it made.
+private const bfk_base: string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    trait Node
+        fire(&self) -> int
+
+    struct Tap
+        act: &Fn() -> int
+
+    impl Node for Tap
+        fire(&self) = (self.act)()
+
+    struct Owner
+        n: int
+
+    scribble(depth: int) -> int
+        var a: [64]int = [0; 64]
+
+        for i in 0..<64
+            a[i] = i * depth + 77
+
+        if depth > 0 then a[3] + scribble(depth - 1) else a[5]
+    end scribble
+
+    main()
+        val o: &Owner = Owner(41)
+        val h = make(o)
+        print(scribble(8))
+        print(h.fire())
+    """
+
+private bfk_program(rest: string) -> string = bfk_base + rest
+
+// tekton's: the closure handed down is wrapped, coerced to the trait object, pushed, and an element
+// answered.
+private const bfk_reduction: string = raw"""
+    handed(run: &Fn() -> int) -> &Node
+        var cells: Buf[&Node] = buf()
+
+        cells.push(Tap(() -> run()))
+        cells[0]
+    end handed
+
+    make(o: &Owner) -> &Node = handed(() -> o.n + 1)
+    """
+
+// -- the regression -------------------------------------------------------------------------------
+
+@test("a closure handed to a callee that answers an element of a Buf of trait objects outlives the frame")
+bfk_trait_buffer_element()
+    bfk_prints(bfk_program(bfk_reduction), "801\n42\n")
+
+@test("and under AddressSanitizer: instrumented, and no read of a returned frame")
+bfk_trait_buffer_element_under_asan()
+    bfk_asan(bfk_program(bfk_reduction), "801\n42\n")
+
+@test("and at -O0")
+bfk_trait_buffer_element_o0()
+    bfk_prints_at(bfk_program(bfk_reduction), "801\n42\n", "0")
+
+@test("and at -O2")
+bfk_trait_buffer_element_o2()
+    bfk_prints_at(bfk_program(bfk_reduction), "801\n42\n", "2")
+
+@test("its IR lays no closure box in the frame")
+bfk_trait_buffer_element_no_frame_box()
+    if xvr_no_library() then return
+
+    assert_eq(bfk_frame_boxes(bfk_program(bfk_reduction)), 0)
+
+// -- the wrapper ----------------------------------------------------------------------------------
+
+@test("the closure parameter itself in the wrapper, coerced to the trait object")
+bfk_parameter_in_wrapper()
+    bfk_asan(bfk_program(raw"""
+        handed(run: &Fn() -> int) -> &Node
+            var cells: Buf[&Node] = buf()
+
+            cells.push(Tap(run))
+            cells[0]
+        end handed
+
+        make(o: &Owner) -> &Node = handed(() -> o.n + 1)
+        """), "801\n42\n")
+
+@test("a Buf of the struct itself, no trait object in the callee")
+bfk_struct_buffer_element()
+    bfk_asan(bfk_program(raw"""
+        handed(run: &Fn() -> int) -> &Tap
+            var cells: Buf[&Tap] = buf()
+
+            cells.push(Tap(run))
+            cells[0]
+        end handed
+
+        make(o: &Owner) -> &Node = handed(() -> o.n + 1)
+        """), "801\n42\n")
+
+@test("a nested wrapper: the element's field is answered")
+bfk_nested_wrapper()
+    bfk_asan(bfk_program(raw"""
+        struct Wrap
+            tap: &Tap
+
+        handed(run: &Fn() -> int) -> &Tap
+            var cells: Buf[&Wrap] = buf()
+
+            cells.push(Wrap(Tap(run)))
+            cells[0].tap
+        end handed
+
+        make(o: &Owner) -> &Node = handed(() -> o.n + 1)
+        """), "801\n42\n")
+
+@test("the closure itself is the element")
+bfk_closure_element()
+    bfk_asan(bfk_program(raw"""
+        handed(run: &Fn() -> int) -> &Node
+            var fs: Buf[&Fn() -> int] = buf()
+
+            fs.push(run)
+            Tap(fs[0])
+        end handed
+
+        make(o: &Owner) -> &Node = handed(() -> o.n + 1)
+        """), "801\n42\n")
+
+// -- the container --------------------------------------------------------------------------------
+
+@test("an array the callee made, answered as an element")
+bfk_array_element()
+    bfk_asan(bfk_program(raw"""
+        handed(run: &Fn() -> int) -> &Node
+            val cells: [1]&Node = [Tap(run)]
+
+            cells[0]
+        end handed
+
+        make(o: &Owner) -> &Node = handed(() -> o.n + 1)
+        """), "801\n42\n")
+
+@test("an Option the callee made, answered unwrapped")
+bfk_option_unwrapped()
+    bfk_asan(bfk_program(raw"""
+        handed(run: &Fn() -> int) -> &Node
+            val cell: Option[&Node] = Some(Tap(run))
+
+            cell.unwrap()
+        end handed
+
+        make(o: &Owner) -> &Node = handed(() -> o.n + 1)
+        """), "801\n42\n")
+
+@test("the element read back with a loop over the buffer")
+bfk_buffer_loop()
+    bfk_asan(bfk_program(raw"""
+        handed(run: &Fn() -> int) -> &Node
+            var cells: Buf[&Node] = buf()
+
+            cells.push(Tap(run))
+
+            var last: Option[&Node] = None
+
+            for c in cells
+                last = Some(c)
+
+            last.unwrap()
+        end handed
+
+        make(o: &Owner) -> &Node = handed(() -> o.n + 1)
+        """), "801\n42\n")
+
+// -- the exit -------------------------------------------------------------------------------------
+
+@test("the buffer itself answered, and its element read by the caller")
+bfk_buffer_answered()
+    bfk_asan(bfk_program(raw"""
+        handed(run: &Fn() -> int) -> Buf[&Node]
+            var cells: Buf[&Node] = buf()
+
+            cells.push(Tap(run))
+            cells
+        end handed
+
+        make(o: &Owner) -> &Node = handed(() -> o.n + 1)[0]
+        """), "801\n42\n")
+
+@test("the element stored into a buffer the caller handed in")
+bfk_into_parameter_buffer()
+    bfk_asan(bfk_program(raw"""
+        handed(run: &Fn() -> int, out: Buf[&Node])
+            var cells: Buf[&Node] = buf()
+
+            cells.push(Tap(run))
+            out.push(cells[0])
+        end handed
+
+        make(o: &Owner) -> &Node
+            var out: Buf[&Node] = buf()
+
+            handed(() -> o.n + 1, out)
+            out[0]
+        end make
+        """), "801\n42\n")
+
+@test("the element popped back out")
+bfk_popped()
+    bfk_asan(bfk_program(raw"""
+        handed(run: &Fn() -> int) -> &Node
+            var cells: Buf[&Node] = buf()
+
+            cells.push(Tap(run))
+            cells.pop().unwrap()
+        end handed
+
+        make(o: &Owner) -> &Node = handed(() -> o.n + 1)
+        """), "801\n42\n")
+
+// -- a view of the buffer handed on ---------------------------------------------------------------
+
+// amber's: rows built round the closure are pushed into one buffer, handed on as its view, and the
+// callee copies them out of the view into a buffer of its own (`extend`) that its answer holds.
+private const bfk_extend: string = raw"""
+    struct Group
+        kids: Buf[&Node]
+
+    impl Node for Group
+        fire(&self) -> int
+            var sum = 0
+
+            for k in self.kids.view()
+                sum += k.fire()
+
+            sum
+        end fire
+
+    group(kids: []const &Node) -> &Node
+        var b: Buf[&Node] = buf()
+
+        b.extend(kids)
+        Group(b)
+    end group
+
+    rows(run: &Fn() -> int) -> &Node
+        var b: Buf[&Node] = buf()
+
+        b.push(Tap(run))
+        group(b.view())
+    end rows
+
+    make(o: &Owner) -> &Node = rows(() -> o.n + 1)
+    """
+
+@test("a view of the Buf handed to a callee that extends its own Buf from it and answers that")
+bfk_view_extended()
+    bfk_prints(bfk_program(bfk_extend), "801\n42\n")
+
+@test("and under AddressSanitizer")
+bfk_view_extended_under_asan()
+    bfk_asan(bfk_program(bfk_extend), "801\n42\n")
+
+@test("a view of the Buf handed to a callee that answers an element of it")
+bfk_view_element()
+    bfk_asan(bfk_program(raw"""
+        first(kids: []const &Node) -> &Node = kids[0]
+
+        rows(run: &Fn() -> int) -> &Node
+            var b: Buf[&Node] = buf()
+
+            b.push(Tap(run))
+            first(b.view())
+        end rows
+
+        make(o: &Owner) -> &Node = rows(() -> o.n + 1)
+        """), "801\n42\n")
+
+// -- a frame address through the buffer -----------------------------------------------------------
+
+@test("a frame address pushed into a callee's Buf and answered back out is refused where it leaves")
+bfk_frame_address_refused()
+    if xvr_no_library() then return
+
+    val ir = bfk_ir(raw"""
+        import sysl.buf.{Buf, buf}
+
+        via(p: *int) -> *int
+            var b: Buf[*int] = buf()
+
+            b.push(p)
+            b[0]
+        end via
+
+        make() -> *int
+            var y = 1
+
+            via(&y)
+        end make
+
+        main()
+            print(*make())
+        """)
+
+    assert(ir.contains("'via(&y)' is returned, but it holds the address of a local of 'make'"), ir)
+end bfk_frame_address_refused
+
+@test("a frame address pushed into a callee's Buf and only read there is not refused")
+bfk_frame_address_read_only()
+    bfk_prints(raw"""
+        import sysl.buf.{Buf, buf}
+
+        peek(p: *int) -> int
+            var b: Buf[*int] = buf()
+
+            b.push(p)
+            *b[0] + 1
+        end peek
+
+        make() -> int
+            var y = 41
+
+            peek(&y)
+        end make
+
+        main()
+            print(make())
+        """, "42\n")
+
+// -- what is kept ---------------------------------------------------------------------------------
+
+@test("a var the closure captures is held by value once the element leaves")
+bfk_captured_local()
+    bfk_prints(bfk_program(raw"""
+        handed(run: &Fn() -> int) -> &Node
+            var cells: Buf[&Node] = buf()
+
+            cells.push(Tap(run))
+            cells[0]
+        end handed
+
+        make(o: &Owner) -> &Node
+            var n = o.n
+            val h = handed(() -> n + 1)
+
+            n = 0
+            h
+        end make
+        """), "801\n42\n")
+
+@test("a counted reference parameter wrapped and answered through the buffer stays alive")
+bfk_reference_parameter()
+    bfk_prints(bfk_program(raw"""
+        struct Read
+            from: &Owner
+
+        impl Node for Read
+            fire(&self) = self.from.n + 1
+
+        handed(from: &Owner) -> &Node
+            var cells: Buf[&Node] = buf()
+
+            cells.push(Read(from))
+            cells[0]
+        end handed
+
+        make(o: &Owner) -> &Node = handed(Owner(o.n))
+        """), "801\n42\n")
+
+// -- the call -------------------------------------------------------------------------------------
+
+@test("a generic callee answering an element of the Buf it pushed into")
+bfk_generic_callee()
+    bfk_asan(bfk_program(raw"""
+        first[T](x: T) -> T
+            var b: Buf[T] = buf()
+
+            b.push(x)
+            b[0]
+        end first
+
+        make(o: &Owner) -> &Node = first(Tap(() -> o.n + 1))
+        """), "801\n42\n")
+
+@test("a call through a function value of the callee")
+bfk_through_function_value()
+    bfk_asan(bfk_program(raw"""
+        handed(run: &Fn() -> int) -> &Node
+            var cells: Buf[&Node] = buf()
+
+            cells.push(Tap(run))
+            cells[0]
+        end handed
+
+        make(o: &Owner) -> &Node
+            val f: &Fn(&Fn() -> int) -> &Node = r -> handed(r)
+
+            f(() -> o.n + 1)
+        end make
+        """), "801\n42\n")
+
+@test("a chain: the caller's callee hands the closure to the one that pushes it")
+bfk_chain()
+    bfk_asan(bfk_program(raw"""
+        handed(run: &Fn() -> int) -> &Node
+            var cells: Buf[&Node] = buf()
+
+            cells.push(Tap(run))
+            cells[0]
+        end handed
+
+        relay(run: &Fn() -> int) -> &Node = handed(run)
+
+        make(o: &Owner) -> &Node = relay(() -> o.n + 1)
+        """), "801\n42\n")
+
+// -- what stays in the frame ----------------------------------------------------------------------
+
+@test("a closure a callee pushes into its own Buf and only calls there stays boxed in the frame")
+bfk_called_only_stays_in_frame()
+    if xvr_no_library() then return
+
+    val text = bfk_program(raw"""
+        count(run: &Fn() -> int) -> int
+            var fs: Buf[&Fn() -> int] = buf()
+
+            fs.push(run)
+            fs[0]() + int(fs.len())
+        end count
+
+        make(o: &Owner) -> &Node
+            val k = count(() -> o.n)
+
+            Tap(() -> k)
+        end make
+        """)
+
+    assert_eq(bfk_frame_boxes(text), 1)
+    bfk_prints(text, "801\n42\n")
+end bfk_called_only_stays_in_frame
