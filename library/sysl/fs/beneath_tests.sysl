@@ -1,0 +1,310 @@
+module sysl.fs
+@requires(posix)
+@tests
+
+import sysl.fs.sys as fsys
+import sysl.text.from_utf8
+
+// A `Dir`: what is reached beneath it, and every way out of it refused.
+//
+// Each test makes a directory of its own with `make_temp_dir` and a sibling of it to stand for
+// "outside", so a refusal is checked against a file that really is there to be reached.
+
+// A fresh directory, holding `inside/` and `outside/`, each with a file in it.
+private oat_tree() -> string
+    val root = make_temp_dir("oat-").unwrap()
+
+    make_dir(s"$root/inside").unwrap()
+    make_dir(s"$root/inside/sub").unwrap()
+    make_dir(s"$root/outside").unwrap()
+    write_text(s"$root/inside/sub/f.txt", "inside").unwrap()
+    write_text(s"$root/outside/secret", "outside").unwrap()
+    root
+end oat_tree
+
+private oat_done(root: string) = oat_ignore(remove_dir_all(root))
+
+private oat_ignore(r: Result[unit, IoError]) = ()
+
+// Whether `fd` names an open descriptor.
+private oat_open(fd: int) -> bool
+    var st = fsys.Stat(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+
+    fsys.fstat(fd, &st) == 0
+end oat_open
+
+private oat_text(r: Result[File, IoError]) -> string
+    var f = r.unwrap()
+    var into: [64]u8 = [0; 64]
+
+    from_utf8(f.read(into[..])).unwrap()
+end oat_text
+
+private oat_link_refused(r: Result[File, IoError]) -> bool
+    r match
+        Ok(_) -> false
+        Err(e) -> e.refused_link() && !e.escaped()
+
+private oat_escape_refused(r: Result[File, IoError]) -> bool
+    r match
+        Ok(_) -> false
+        Err(e) -> e.escaped() && !e.refused_link()
+
+@test("oat_ a file is created, written, opened, read, described and removed beneath a directory")
+oat_happy_path()
+    val root = oat_tree()
+    val d = open_dir(s"$root/inside").unwrap()
+    var f = d.create("sub/new.txt").unwrap()
+
+    f.write("made".bytes)
+    f.close().unwrap()
+
+    assert_eq(read_text(s"$root/inside/sub/new.txt").unwrap(), "made")
+    assert_eq(oat_text(d.open("sub/new.txt")), "made")
+
+    val m = d.link_metadata("sub/new.txt").unwrap()
+
+    assert(m.is_file())
+    assert_eq(m.size, 4)
+    assert(d.link_metadata("sub").unwrap().is_dir())
+    assert(d.exists("sub/new.txt"))
+
+    d.remove_file("sub/new.txt").unwrap()
+
+    assert(!d.exists("sub/new.txt"))
+    assert(!exists(s"$root/inside/sub/new.txt"))
+    oat_done(root)
+
+@test("oat_ append, open_update and create_update beneath a directory act as their sysl.fs namesakes")
+oat_modes()
+    val root = oat_tree()
+    val d = open_dir(s"$root/inside").unwrap()
+    var a = d.append("log").unwrap()
+
+    a.write("one ".bytes)
+    a.close().unwrap()
+
+    var b = d.append("log").unwrap()
+
+    b.write("two".bytes)
+    b.close().unwrap()
+
+    assert_eq(read_text(s"$root/inside/log").unwrap(), "one two")
+
+    var u = d.open_update("log").unwrap()
+
+    u.write("ONE".bytes)
+    u.close().unwrap()
+
+    assert_eq(read_text(s"$root/inside/log").unwrap(), "ONE two")
+
+    var c = d.create_update("log").unwrap()
+
+    c.write("x".bytes)
+    c.close().unwrap()
+
+    assert_eq(read_text(s"$root/inside/log").unwrap(), "x")
+    assert(d.open_update("missing").unwrap_err() == NotFound)
+    oat_done(root)
+
+@test("oat_ a symbolic link as the last component is refused with the link error, wherever it points")
+oat_link_last()
+    val root = oat_tree()
+
+    symlink(s"$root/outside/secret", s"$root/inside/out").unwrap()
+    symlink("sub/f.txt", s"$root/inside/in").unwrap()
+    symlink(s"$root/outside/fresh", s"$root/inside/dangling").unwrap()
+
+    val d = open_dir(s"$root/inside").unwrap()
+
+    assert(oat_link_refused(d.open("out")), "a link out was followed")
+    assert(oat_link_refused(d.open("in")), "a link pointing inside was followed")
+    assert(oat_link_refused(d.open_update("in")))
+    assert(oat_link_refused(d.append("out")))
+
+    // Creating through a dangling link would make a file outside; it is refused, and nothing is made.
+    assert(oat_link_refused(d.create("dangling")))
+    assert(!exists(s"$root/outside/fresh"), "a file was created through a link")
+    assert_eq(read_text(s"$root/outside/secret").unwrap(), "outside")
+    oat_done(root)
+
+@test("oat_ a symbolic link above the last component is refused by open, link_metadata and remove_file")
+oat_link_middle()
+    val root = oat_tree()
+
+    symlink(s"$root/outside", s"$root/inside/away").unwrap()
+    symlink("sub", s"$root/inside/alias").unwrap()
+
+    val d = open_dir(s"$root/inside").unwrap()
+
+    assert(oat_link_refused(d.open("away/secret")))
+    assert(oat_link_refused(d.open("alias/f.txt")), "a link to a directory inside was followed")
+    assert(oat_link_refused(d.create("away/fresh")))
+    assert(!exists(s"$root/outside/fresh"))
+    assert(d.link_metadata("away/secret").unwrap_err().refused_link())
+    assert(d.link_metadata("alias/f.txt").unwrap_err().refused_link())
+    assert(!d.exists("away/secret"))
+    assert(d.remove_file("away/secret").unwrap_err().refused_link())
+    assert(d.remove_file("alias/f.txt").unwrap_err().refused_link())
+    assert(exists(s"$root/outside/secret"), "a file outside was removed")
+    assert(exists(s"$root/inside/sub/f.txt"))
+    oat_done(root)
+
+@test("oat_ link_metadata describes a link as the last component, and remove_file removes the link only")
+oat_link_itself()
+    val root = oat_tree()
+
+    symlink(s"$root/outside/secret", s"$root/inside/out").unwrap()
+
+    val d = open_dir(s"$root/inside").unwrap()
+
+    assert(d.link_metadata("out").unwrap().is_link())
+    assert(d.exists("out"))
+
+    d.remove_file("out").unwrap()
+
+    assert(!d.exists("out"))
+    assert_eq(read_text(s"$root/outside/secret").unwrap(), "outside")
+    oat_done(root)
+
+@test("oat_ every .. component is refused as an escape, whether it would leave the directory or not")
+oat_dot_dot()
+    val root = oat_tree()
+    val d = open_dir(s"$root/inside").unwrap()
+
+    assert(oat_escape_refused(d.open("../outside/secret")))
+    assert(oat_escape_refused(d.open("..")))
+    assert(oat_escape_refused(d.open("sub/../../outside/secret")))
+
+    // Inside all the way, and still refused: `sub` could be moved out between the two lookups.
+    assert(oat_escape_refused(d.open("sub/../sub/f.txt")))
+    assert(oat_escape_refused(d.open("sub/..")))
+    assert(oat_escape_refused(d.create("../outside/fresh")))
+    assert(!exists(s"$root/outside/fresh"))
+    assert(d.link_metadata("../outside/secret").unwrap_err().escaped())
+    assert(d.remove_file("../outside/secret").unwrap_err().escaped())
+    assert(exists(s"$root/outside/secret"))
+    oat_done(root)
+
+@test("oat_ names that only contain dots, and . components, are ordinary names")
+oat_dotted_names()
+    val root = oat_tree()
+    val d = open_dir(s"$root/inside").unwrap()
+
+    for name in ["..x", "x..", "...", ".hidden"]
+        write_text(s"$root/inside/sub/$name", name).unwrap()
+
+        assert_eq(oat_text(d.open(s"sub/$name")), name)
+
+    assert_eq(oat_text(d.open("./sub/./f.txt")), "inside")
+    assert(d.link_metadata(".").unwrap().is_dir())
+    assert(d.link_metadata("sub/").unwrap().is_dir())
+    oat_done(root)
+
+@test("oat_ an absolute path is refused as an escape, even one naming a file inside")
+oat_absolute()
+    val root = oat_tree()
+    val d = open_dir(s"$root/inside").unwrap()
+
+    assert(oat_escape_refused(d.open(s"$root/outside/secret")))
+    assert(oat_escape_refused(d.open(s"$root/inside/sub/f.txt")))
+    assert(oat_escape_refused(d.open("/")))
+    assert(d.link_metadata("/etc").unwrap_err().escaped())
+    assert(d.remove_file(s"$root/outside/secret").unwrap_err().escaped())
+    assert(exists(s"$root/outside/secret"))
+    oat_done(root)
+
+@test("oat_ a missing file is the ordinary NotFound, and an ordinary failure is neither refusal")
+oat_missing()
+    val root = oat_tree()
+    val d = open_dir(s"$root/inside").unwrap()
+    val e = d.open("sub/missing").unwrap_err()
+
+    assert(e == NotFound)
+    assert(!e.refused_link() && !e.escaped())
+    assert(d.link_metadata("missing").unwrap_err() == NotFound)
+    assert(d.remove_file("missing").unwrap_err() == NotFound)
+    assert(d.open("missing/f").unwrap_err() == NotFound)
+    assert(d.open("sub/f.txt/x").unwrap_err() == NotADirectory)
+    assert(!d.exists("missing"))
+    oat_done(root)
+
+@test("oat_ open_dir refuses a file, a missing path and a link, each with its own error")
+oat_open_dir_errors()
+    val root = oat_tree()
+
+    symlink(s"$root/inside", s"$root/alias").unwrap()
+
+    assert(open_dir(s"$root/inside/sub/f.txt").unwrap_err() == NotADirectory)
+    assert(open_dir(s"$root/nowhere").unwrap_err() == NotFound)
+
+    val e = open_dir(s"$root/alias").unwrap_err()
+
+    assert(e.refused_link(), e.message())
+
+    // A link above the last component is the caller's own path, and is followed.
+    assert_eq(oat_text(open_dir(s"$root/alias/sub").unwrap().open("f.txt")), "inside")
+    oat_done(root)
+
+// A directory opened, a file opened through it, and the directory let go of; the file comes back.
+private oat_file_from_dropped(root: string) -> (File, int)
+    val d = open_dir(s"$root/inside").unwrap()
+
+    (d.open("sub/f.txt").unwrap(), d.fd())
+end oat_file_from_dropped
+
+@test("oat_ a file opened through a Dir stays open after the Dir is dropped")
+oat_file_outlives()
+    val root = oat_tree()
+    val (f, n) = oat_file_from_dropped(root)
+
+    assert(!oat_open(n), "the directory's descriptor outlived it")
+    assert(oat_open(f.fd().unwrap()))
+    assert_eq(oat_text(Ok(f)), "inside")
+    oat_done(root)
+
+private oat_dir_dropped(root: string) -> int
+    val d = open_dir(s"$root/inside").unwrap()
+    val n = d.fd()
+
+    assert(oat_open(n))
+    n
+end oat_dir_dropped
+
+@test("oat_ dropping a Dir closes its descriptor, and each Dir has one of its own")
+oat_drop_closes()
+    val root = oat_tree()
+    val n = oat_dir_dropped(root)
+
+    assert(n >= 0)
+    assert(!oat_open(n), "the descriptor outlived its Dir")
+
+    val a = open_dir(s"$root/inside").unwrap()
+    val b = open_dir(s"$root/inside").unwrap()
+
+    assert(a.fd() != b.fd())
+    oat_done(root)
+
+@test("oat_ the link refusal, the escape and the ordinary errors are told apart, by code and by message")
+oat_distinguishable()
+    val root = oat_tree()
+
+    symlink("sub", s"$root/inside/alias").unwrap()
+
+    val d = open_dir(s"$root/inside").unwrap()
+    val link = d.open("alias/f.txt").unwrap_err()
+    val escape = d.open("../outside/secret").unwrap_err()
+    val missing = d.open("nothing").unwrap_err()
+
+    assert(link.refused_link() && !link.escaped())
+    assert(escape.escaped() && !escape.refused_link())
+    assert(link != escape && link != missing && escape != missing)
+    assert(link.code() < 0 && escape.code() < 0, "a refusal took a platform's errno")
+    assert_eq(link.message(), "the path goes through a symbolic link")
+    assert_eq(escape.message(), "the path leads out of its directory")
+    assert_eq(s"$escape", "the path leads out of its directory")
+
+    // Not a refusal: the other platform-numbered errors keep their own words.
+    assert(!NotFound.refused_link() && !NotFound.escaped())
+    assert(!Other(18).escaped() && !Other(40).refused_link() && !Other(62).refused_link())
+    oat_done(root)

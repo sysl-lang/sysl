@@ -1,0 +1,117 @@
+module sysl.fs
+@requires(os)
+@tests
+
+import sysl.io.Reader
+
+// `File.read_failure` is the reason behind an empty read: `None` while nothing has failed, and the
+// system's own `IoError` once a read has.
+
+private rdf_path(name: string) -> string = "/tmp/sysl-fs-read-failure-" + name
+
+private rdf_ignore(r: Result[unit, IoError]) = ()
+
+@test("rdf: nothing has been read, so nothing has failed")
+rdf_none_before_any_read()
+    val p = rdf_path("fresh")
+    var w = create(p).unwrap()
+
+    w.write("abc".bytes)
+    w.close().unwrap()
+
+    var f = open(p).unwrap()
+
+    assert(f.read_failure().is_none())
+    assert(!f.failed())
+
+    rdf_ignore(remove_file(p))
+end rdf_none_before_any_read
+
+@test("rdf: a read to the end of a file is not a failure")
+rdf_none_after_a_clean_read()
+    val p = rdf_path("clean")
+    var w = create(p).unwrap()
+
+    w.write("abc".bytes)
+    w.close().unwrap()
+
+    var f = open(p).unwrap()
+    var window: [16]u8
+    val got = f.read(window)
+
+    assert_eq(got.len, 3)
+    assert(f.read(window).len == 0)
+    assert(f.at_end())
+    assert(f.read_failure().is_none())
+
+    rdf_ignore(remove_file(p))
+end rdf_none_after_a_clean_read
+
+@test("rdf: reading a directory answers EISDIR with the system's wording")
+rdf_directory_gives_eisdir()
+    var f = open("/tmp").unwrap()
+    var window: [16]u8
+    val got = f.read(window)
+
+    assert_eq(got.len, 0)
+    assert(f.failed())
+
+    val e = f.read_failure().unwrap()
+
+    assert_eq(e.code(), 21)
+    assert_eq(e, IsADirectory)
+    assert_eq(f"$e", f"${read_text("/tmp").unwrap_err()}")
+end rdf_directory_gives_eisdir
+
+@test("rdf: the failure is the one a whole-file read gives for the same path")
+rdf_matches_the_whole_file_error()
+    var f = open("/tmp").unwrap()
+    var window: [16]u8
+
+    f.read(window)
+
+    assert_eq(f.read_failure().unwrap(), read_text("/tmp").unwrap_err())
+end rdf_matches_the_whole_file_error
+
+@test("rdf: the failure persists across repeated reads")
+rdf_persists_across_reads()
+    var f = open("/tmp").unwrap()
+    var window: [16]u8
+
+    for i in 0..<3
+        assert_eq(f.read(window).len, 0)
+        assert_eq(f.read_failure().unwrap().code(), 21)
+
+    assert(f.failed())
+end rdf_persists_across_reads
+
+@test("rdf: a read of a write-only file reports what the system says")
+rdf_write_only_file_read()
+    val p = rdf_path("wronly")
+    var f = create(p).unwrap()
+    var window: [4]u8
+
+    assert(f.read_failure().is_none())
+    assert_eq(f.read(window).len, 0)
+    assert_eq(f.read_failure().unwrap().code(), 9)
+
+    f.close().unwrap()
+    rdf_ignore(remove_file(p))
+end rdf_write_only_file_read
+
+@test("rdf: closing is not a failure, and a read of a closed file is NotOpen")
+rdf_closed_file()
+    val p = rdf_path("closed")
+    var f = create(p).unwrap()
+
+    f.close().unwrap()
+
+    assert(f.read_failure().is_none())
+
+    var window: [4]u8
+
+    assert_eq(f.read(window).len, 0)
+    assert_eq(f.read_failure().unwrap(), NotOpen)
+
+    rdf_ignore(remove_file(p))
+end rdf_closed_file
