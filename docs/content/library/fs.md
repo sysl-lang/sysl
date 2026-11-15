@@ -1308,13 +1308,100 @@ owned would be far worse than the failure being reported. A caller needing the d
 whole or not at all copies into `make_temp_dir` and `rename`s the result into place, which is the only
 way to get atomicity from a filesystem.
 
+### Confined to one directory
+
+`open_dir` holds a directory open, and the `Dir` it answers reaches what is beneath it **and nothing
+else**. It is what a sandbox is built on: a script given one directory reads and writes through it,
+and no symbolic link and no `..` leads it out. Its calls are the module's own, with the path relative
+to the directory — `open`, `create`, `append`, `open_update`, `create_update`, `link_metadata`,
+`exists` and `remove_file`:
+
+```sysl
+import sysl.fs.{open_dir, make_dir_all, remove_dir_all, write_text, read_text}
+import sysl.process.pid
+
+var dir = s"/tmp/sysl-fs-doc-beneath-${pid()}"
+
+remove_dir_all(dir).unwrap()
+make_dir_all(dir + "/granted/notes").unwrap()
+
+val granted = open_dir(dir + "/granted").unwrap()
+var f = granted.create("notes/today").unwrap()
+
+f.write("written beneath".bytes)
+f.close().unwrap()
+
+print(read_text(dir + "/granted/notes/today").unwrap())
+print(granted.link_metadata("notes/today").unwrap().size, granted.exists("notes/today"))
+
+granted.remove_file("notes/today").unwrap()
+
+print(granted.exists("notes/today"))
+
+remove_dir_all(dir).unwrap()
+```
+
+```output
+written beneath
+15 true
+false
+```
+
+**A symbolic link at any component is refused**: the last one or one above it, and one pointing back
+inside as firmly as one pointing out. **So is every `..`, and every absolute path** — even `a/../b`,
+which never leaves, because between looking up `a` and looking up its `..` the directory `a` can be
+moved somewhere else. Each refusal is an `IoError` that `refused_link()` or `escaped()` recognises,
+and everything else fails as it always does:
+
+```sysl
+import sysl.fs.{open_dir, make_dir_all, remove_dir_all, write_text, symlink}
+import sysl.process.pid
+
+var dir = s"/tmp/sysl-fs-doc-refused-${pid()}"
+
+remove_dir_all(dir).unwrap()
+make_dir_all(dir + "/granted").unwrap()
+write_text(dir + "/secret", "not yours").unwrap()
+symlink(dir + "/secret", dir + "/granted/door").unwrap()
+
+val granted = open_dir(dir + "/granted").unwrap()
+
+for name in ["door", "../secret", dir + "/secret", "nothing"]
+    granted.open(name) match
+        Ok(_) -> print(s"$name: opened")
+        Err(e) -> print(s"${e.refused_link()} ${e.escaped()} $e")
+
+remove_dir_all(dir).unwrap()
+```
+
+```output
+true false the path goes through a symbolic link
+false true the path leads out of its directory
+false true the path leads out of its directory
+false false no such file or directory
+```
+
+**The kernel does the refusing**, in the call that opens, because a check made first and an open made
+after it is a race a swapped link wins: `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS` on
+Linux, `openat` with `O_NOFOLLOW_ANY` (and `O_RESOLVE_BENEATH` where the SDK has it) on macOS. The
+absolute path and the `..` are refused before the call as well, so that the error says why. A
+platform that cannot confine a path reports `unsupported()` rather than opening one it did not
+confine.
+
+`link_metadata` describes a link as the last component instead of following it, and `remove_file`
+there removes the link and never what it names; a link above the last component is refused by both.
+`open_dir` itself refuses a link as the directory's own last component, and follows the components
+above it, which are the caller's own path. A `File` opened through a `Dir` is a descriptor of its own
+and outlives it; the `Dir`'s descriptor is closed when its last reference goes.
+
 ## Answering the filesystem on a freestanding target
 
 **Everything above reaches the filesystem through `sysl.fs.sys` and through nothing else**: one
 `extern` per call — `sysl_fs_open`, `_read`, `_write`, `_pread`, `_pwrite`, `_sync`, `_close`, `_seek`, `_fstat`, `_ftruncate`, `_map`, `_unmap`, `_advise` and `_page_size` (the last two asked only by a program that advises a mapping; `_page_size` answers `usize`, zero meaning 4096),
 `_stat`, `_truncate`, `_mkdir`, `_rmdir`, `_unlink`, `_rename`, `_access`, `_chmod`, `_chown`, `_opendir`,
 `_readdir`, `_closedir`, `_getcwd`, `_chdir`, `_temp_dir`, `_symlink`, `_link`, `_readlink` and
-`_realpath`. Each answers an `int` by the contract every `*.sys` module has
+`_realpath`, and for a `Dir` `_dir_open`, `_open_beneath`, `_stat_beneath` and `_unlink_beneath`,
+which refuse a link with `ELOOP` and an escape with `EXDEV`. Each answers an `int` by the contract every `*.sys` module has
 (`sysl.io.sys`, `sysl.process.sys`, `sysl.net.sys` and `sysl.env.sys` too): zero or more is success, a negative answer is the `code()`
 of the `IoError` it failed with, **negated** as a system call answers it (so `-1` is `EPERM` and comes back as
 `NotPermitted`, where `-13`, `EACCES`, is `PermissionDenied`), and the one status `UNSUPPORTED` means the target cannot make that call at
