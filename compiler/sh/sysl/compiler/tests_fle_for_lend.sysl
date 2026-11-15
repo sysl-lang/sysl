@@ -1,0 +1,434 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{cstring, str_builder}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `for x in seq` over elements with counted parts LENDS each element to its variable where the body
+// can let go of nothing (`borrowing.sysl`'s `lent_element`, `emit_flow.sysl`'s `gen_for_each`): the
+// variable holds the bytes the storage holds, and the iteration takes no count and gives none back.
+// The loop already keeps the storage, so what could free an element under the variable is the body
+// writing the slot it is in, or calling something that might.
+//
+// What lends: a body that reads the element and hands it to calls that release nothing -- recursion
+// through the element's own payload among them -- or that cannot reach storage of its type; a struct
+// element read by field; the parts a pattern in the header binds; both
+// levels of a nested walk; and a body that keeps the element by a `break` or a `return`, which take the
+// count where they keep it, as a borrowed parameter's keep does.
+//
+// What keeps the count: a store of the element into module storage; a `push` (an owning callee); a
+// closure built in the body; a call that clears the buffer being walked; an assignment to the variable
+// or to a part the pattern bound; and a write to the frame array being walked. Each of those would read
+// a freed element if it were lent, so each runs on the counted heap and under AddressSanitizer.
+//
+// Cells not written: an `async` body -- a suspension is no inert node, so it refuses as a closure does,
+// by the same list; a `for` over a cursor (`TIterate`) -- its element is `next`'s answer, a temporary
+// of the iteration and not storage the sequence holds, and nothing here changes it; separate
+// compilation -- the loan is the body's own and nothing about a signature moves. A body that prints is
+// run (`shown`) but its shape is not pinned: the printing helpers end in a foreign call, which neither
+// `inert_callees` nor `untouched_by` clears, so that body still counts each element.
+
+private extern "setenv" fle_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" fle_c_unsetenv(name: *u8) -> int
+
+private struct FleRun
+    ok: bool
+    out: string
+    err: string
+    hooks: usize
+
+private fle_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end fle_ready
+
+private fle_ir(text: string, level: string) -> string
+    val root = make_temp_dir("sysl-fle").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None, level) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end fle_ir
+
+// One function's emitted text, from its `define` to the brace that closes it.
+private fle_body(out: string, name: string) -> string
+    var b = str_builder()
+    var inside = false
+
+    for line in lines_of(out)
+        if !inside && line.starts_with("define ") && line.contains("@" + name + "$$sysl") then inside = true
+
+        if inside
+            if line == "}" then return b.finish()
+
+            b.push(line)
+            b.push_char('\n')
+
+    if inside then b.finish() else s"no definition of '$name' in:\n$out"
+end fle_body
+
+// The calls that take and give back a count of a value of the type spelled `ty`.
+private fle_copies(body: string, ty: string) -> bool = body.contains(s"@arc.copy.$ty(")
+private fle_disposes(body: string, ty: string) -> bool = body.contains(s"@arc.dispose.$ty(")
+
+// Neither a copy nor a dispose of `ty` in `name`, at both ends of the optimizer.
+private fle_lent(text: string, name: string, ty: string)
+    if !fle_ready() then return
+
+    for level in ["0", "2"]
+        val f = fle_body(fle_ir(text, level), name)
+
+        assert(f.starts_with("define"), f)
+        assert(!fle_copies(f, ty) && !fle_disposes(f, ty), s"-O$level:\n$f")
+end fle_lent
+
+// The first call of the loop's body block a copy of `ty`, unoptimized: the iteration counts the
+// element as it binds it. What gives the count back is the iteration's end, or the keep it is handed
+// to -- a `push` and a closure take it over.
+private fle_counted(text: string, name: string, ty: string)
+    if !fle_ready() then return
+
+    val f = fle_body(fle_ir(text, "0"), name)
+
+    assert(f.starts_with("define"), f)
+    assert(fle_first_call(f).contains(s"@arc.copy.$ty("), f)
+end fle_counted
+
+// The first call after the label of the first `for` body, or empty.
+private fle_first_call(body: string) -> string
+    var inside = false
+
+    for line in lines_of(body)
+        if line.starts_with("each.body") then inside = true
+        if inside && line.contains("call ") then return line
+
+    ""
+end fle_first_call
+
+private fle_run(text: string, level: string, counted: bool, flags: string) -> FleRun
+    val root = make_temp_dir("sysl-fle").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    if counted then force_alloc_counting(true)
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+        val v = cstring(flags)
+
+        fle_c_setenv(n.ptr, v.ptr, 1)
+    end if
+
+    val built = build_native_program(s"$root/main.sysl", None, None, level, Some(exe))
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+
+        fle_c_unsetenv(n.ptr)
+
+    if counted then force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return FleRun(false, failure_text(why), "", 0)
+        Ok(_) -> ()
+
+    val hooks = capture("nm", ["-u", exe], "", [], true) match
+        Ok(o) -> o.text.count_of("__asan_report")
+        Err(_) -> 0
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> FleRun(false, "could not be started", "", 0)
+        Ok(o) -> FleRun(o.status.ok(), o.text, o.err.unwrap_or(""), hooks)
+end fle_run
+
+// Printed exactly `expected` at both ends of the optimizer on the counted heap, giving everything
+// back, and again under AddressSanitizer with the instrumentation in the binary.
+private fle_prints(text: string, expected: string)
+    if !fle_ready() then return
+
+    for level in ["0", "2"]
+        val run = fle_run(text, level, true, "")
+
+        assert(run.ok, s"-O$level: ${run.out}${run.err}")
+        assert_eq(run.out, expected)
+        assert(alloc_count_reported(run.err) == 0, s"-O$level: ${run.err}")
+
+    val asan = fle_run(text, "0", false, "-fsanitize=address -g")
+
+    assert(asan.hooks > 0, "the AddressSanitizer build carries no instrumentation")
+    assert(asan.ok, s"asan: ${asan.out}${asan.err}")
+    assert_eq(asan.out, expected)
+end fle_prints
+
+// -- what is lent -----------------------------------------------------------------------------------
+
+// A tree of values with buffers in it, and a record holding one: the database result set the loan
+// was asked for. `weight` and `sum` recurse through each other, reading only.
+private fle_lent_shapes() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    enum V
+        I(n: int)
+        L(items: Buf[V])
+
+    struct Field
+        name: string
+        value: V
+
+    weight(v: V) -> int = v match
+        I(n) -> n
+        L(items) -> sum(items)
+
+    sum(items: Buf[V]) -> int
+        var t = 0
+        for x in items do t += weight(x)
+        t
+
+    fields(fs: Buf[Field]) -> int
+        var t = 0
+        for f in fs do t += weight(f.value) + int(f.name.len)
+        t
+
+    pairs(ps: Buf[(int, V)]) -> int
+        var t = 0
+        for (k, v) in ps do t += k * weight(v)
+        t
+
+    indexed(ps: Buf[(int, Field)]) -> int
+        var t = 0
+        for (i, Field{name, value}) in ps
+            t = t + i + int(name.len) + weight(value)
+        t
+
+    nested(rows: Buf[Field]) -> int
+        var t = 0
+        for f in rows
+            f.value match
+                L(items) ->
+                    for x in items do t += weight(x)
+                I(n) -> t += n
+        t
+
+    shown(fs: Buf[Field])
+        for f in fs do print(f.name)
+
+    found(items: Buf[V]) -> int
+        val hit = for x in items
+            if weight(x) > 10 then break x
+        else I(0)
+        weight(hit)
+
+    first(items: Buf[V]) -> V
+        for x in items
+            if weight(x) > 10 then return x
+        I(0)
+
+    tree() -> Buf[V]
+        var inner: Buf[V] = buf()
+        inner.push(I(5))
+        inner.push(I(7))
+        var b: Buf[V] = buf()
+        b.push(I(4))
+        b.push(L(inner))
+        b
+
+    main()
+        val b = tree()
+        var fs: Buf[Field] = buf()
+        fs.push(Field("id", I(1)))
+        fs.push(Field("tags", L(tree())))
+        var ps: Buf[(int, V)] = buf()
+        ps.push((2, I(3)))
+        ps.push((3, L(tree())))
+        var qs: Buf[(int, Field)] = buf()
+        qs.push((1, Field("ab", I(2))))
+        print(sum(b), fields(fs), pairs(ps), indexed(qs), nested(fs))
+        shown(fs)
+        print(found(b), weight(first(b)))
+    """
+
+@test("a body that reads each element and hands it to calls that release nothing takes no count")
+fle_a_read_only_body_takes_no_count()
+    fle_lent(fle_lent_shapes(), "sum", "V")
+
+@test("a record element read by field takes no count")
+fle_a_record_read_by_field_takes_no_count()
+    fle_lent(fle_lent_shapes(), "fields", "Field")
+
+@test("a pattern in the header and the parts it binds take no count")
+fle_a_pattern_takes_no_count()
+    fle_lent(fle_lent_shapes(), "pairs", "$tuple2.int.V")
+    fle_lent(fle_lent_shapes(), "pairs", "V")
+
+@test("a nested pattern naming a record's fields takes no count")
+fle_a_nested_pattern_takes_no_count()
+    fle_lent(fle_lent_shapes(), "indexed", "$tuple2.int.Field")
+    fle_lent(fle_lent_shapes(), "indexed", "V")
+
+@test("both levels of a nested walk take no count")
+fle_a_nested_walk_takes_no_count()
+    fle_lent(fle_lent_shapes(), "nested", "Field")
+    fle_lent(fle_lent_shapes(), "nested", "V")
+
+@test("an element kept by a 'break' or a 'return' is counted where it is kept, and nowhere else")
+fle_a_kept_element_is_counted_at_the_keep()
+    if !fle_ready() then return
+
+    for name in ["found", "first"]
+        val f = fle_body(fle_ir(fle_lent_shapes(), "0"), name)
+
+        assert(f.starts_with("define"), f)
+        assert(fle_copies(f, "V"), f)
+        assert(!fle_first_call(f).contains("@arc.copy.V("), f)
+        assert(!fle_disposes(f, "V") || name == "found", f)
+
+@test("and every lent shape prints what the counted form printed, giving everything back")
+fle_lent_shapes_run()
+    fle_prints(fle_lent_shapes(), "16 23 54 5 17\nid\ntags\n12 12\n")
+
+// -- what keeps the count ---------------------------------------------------------------------------
+
+// Each body could free the element under a lent variable: by storing it where the next store
+// releases it, by handing it to an owning `push`, by capturing it, by clearing the buffer through a
+// call, by assigning the variable or a part, and by writing the frame array it is walking.
+private fle_kept_shapes() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    enum V
+        I(n: int)
+        L(items: Buf[V])
+
+    weight(v: V) -> int = v match
+        I(n) -> n
+        L(items) -> sum(items)
+
+    sum(items: Buf[V]) -> int
+        var t = 0
+        for x in items do t += weight(x)
+        t
+
+    var last: V = I(0)
+    var walked: Buf[V] = buf()
+
+    stores(items: Buf[V]) -> int
+        for x in items do last = x
+        weight(last)
+
+    pushes(items: Buf[V]) -> int
+        var out: Buf[V] = buf()
+        for x in items do out.push(x)
+        sum(out)
+
+    captures(items: Buf[V]) -> int
+        var fs: Buf[&Fn() -> int] = buf()
+        for x in items do fs.push(() -> weight(x))
+        var t = 0
+        for f in fs do t += f()
+        t
+
+    wipe() = walked.clear()
+
+    clears() -> int
+        var t = 0
+        for x in walked
+            wipe()
+            t += weight(x)
+        t
+
+    reassigns(items: Buf[V]) -> int
+        var t = 0
+        for x in items
+            t += weight(x)
+            x = I(1)
+            t += weight(x)
+        t
+
+    rebinds(ps: Buf[(int, V)]) -> int
+        var t = 0
+        for (k, v) in ps
+            t += weight(v)
+            v = I(k)
+            t += weight(v)
+        t
+
+    framed(b: Buf[V]) -> int
+        var arr = [L(b), I(2)]
+        var t = 0
+        for x in arr
+            arr[0] = I(0)
+            t += weight(x)
+        t
+
+    tree() -> Buf[V]
+        var inner: Buf[V] = buf()
+        inner.push(I(5))
+        inner.push(I(7))
+        var b: Buf[V] = buf()
+        b.push(I(4))
+        b.push(L(inner))
+        b
+
+    main()
+        print(stores(tree()), pushes(tree()), captures(tree()))
+        walked = tree()
+        print(clears(), walked.len())
+        var ps: Buf[(int, V)] = buf()
+        ps.push((2, L(tree())))
+        print(reassigns(tree()), rebinds(ps), framed(tree()))
+        last = I(0)
+        walked = buf()
+    """
+
+@test("an element stored in module storage keeps its count")
+fle_a_stored_element_keeps_its_count()
+    fle_counted(fle_kept_shapes(), "stores", "V")
+
+@test("an element pushed into another buffer keeps its count")
+fle_a_pushed_element_keeps_its_count()
+    fle_counted(fle_kept_shapes(), "pushes", "V")
+
+@test("an element captured by a closure kept past the iteration keeps its count")
+fle_a_captured_element_keeps_its_count()
+    fle_counted(fle_kept_shapes(), "captures", "V")
+
+@test("an element of a buffer a call in the body clears keeps its count")
+fle_a_cleared_buffer_keeps_its_count()
+    fle_counted(fle_kept_shapes(), "clears", "V")
+
+@test("a variable the body assigns to keeps its count")
+fle_an_assigned_variable_keeps_its_count()
+    fle_counted(fle_kept_shapes(), "reassigns", "V")
+
+@test("a part the body assigns to keeps the count of the element and of the part")
+fle_an_assigned_part_keeps_its_count()
+    fle_counted(fle_kept_shapes(), "rebinds", "$tuple2.int.V")
+
+@test("an element of a frame array the body writes keeps its count")
+fle_a_written_frame_array_keeps_its_count()
+    fle_counted(fle_kept_shapes(), "framed", "V")
+
+@test("and every one of them reads what it was given, giving everything back")
+fle_kept_shapes_run()
+    fle_prints(fle_kept_shapes(), "12 16 16\n16 0\n18 18 18\n")
