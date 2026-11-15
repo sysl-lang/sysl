@@ -5,7 +5,8 @@ import sysl.buf.{Buf, buf}
 import sysl.container.{Map, map}
 import sysl.env.{get as env_var}
 import sysl.fs.{IoError, remove_file, write_text}
-import sysl.process.{start, Child}
+import sysl.process.{start, Child, Output}
+import sysl.time.{millis, sleep}
 import sysl.text.{from_utf8_unchecked, str_builder, StrBuilder, Search}
 
 // **A program's LLVM text compiled as several modules at once** -- codegen units, as rustc has them.
@@ -829,7 +830,25 @@ end type_end
 
 // --- compiling the units at once ---------------------------------------------------------------
 
-// Compiles each of `parts` into an object beside `base`, as many at once as there are parts, and
+// How many units' clangs may be out at once, or zero for all of them. `sysl test` sets it to the run's
+// `--jobs` (`test_project`), so a suite asked to run four at a time links four at a time too: each
+// clang of a large unit holds a gigabyte or more, and eight at once was most of a run's peak. How many
+// units the text is cut into is not touched -- that decides the objects, and so the binary.
+private var unit_jobs: usize = 0
+
+limit_unit_jobs(n: usize)
+    unit_jobs = n
+
+// The limit `compile_units` keeps, for a test to read.
+unit_jobs_limit() -> usize = unit_jobs
+
+// The most clangs `compile_units` has had out at once in this process, for a test to read.
+private var units_most_at_once: usize = 0
+
+most_units_at_once() -> usize = units_most_at_once
+
+// Compiles each of `parts` into an object beside `base`, as many at once as there are parts or as
+// `limit_unit_jobs` allows, and
 // answers the objects in order. An object whose text was compiled before is taken from the cache.
 // Every clang started is waited for before anything is reported, and where one failed, the first
 // such unit in order is reported with what its clang said. `libcalls` is `defines_libcall` asked of
@@ -840,7 +859,7 @@ compile_units(cc: string, parts: Buf[string], base: string, target: Target,
     var objects: Buf[string] = buf()
     var keys: Buf[string] = buf()
     var todo: Buf[usize] = buf()
-    var children: Buf[Result[&Child, IoError]] = buf()
+    var lines: Buf[Buf[string]] = buf()
 
     for i in 0..<parts.len()
         val obj = s"$base.cgu$i.o"
@@ -872,18 +891,16 @@ compile_units(cc: string, parts: Buf[string], base: string, target: Target,
         line.push(obj)
 
         todo.push(i)
-        children.push(start(cc, line.view(), stderr = true))
+        lines.push(line)
 
+    val ran = units_ran(cc, lines)
     var failure = ""
 
+    // Read in order once every clang is in, so the first failure in order is the one reported.
     for j in 0..<todo.len()
-        val ran = children[j] match
-            Ok(child) -> child.wait()
-            Err(e) -> Err(e)
+        if failure != "" then break
 
-        if failure != "" then continue
-
-        told_by(cc, ran) match
+        told_by(cc, ran[j]) match
             Ok(_) -> ()
             Err(f) -> failure = if f.unrun then f.said else tool_failed(cc, f.code, f.said)
 
@@ -899,6 +916,58 @@ compile_units(cc: string, parts: Buf[string], base: string, target: Target,
 
     Ok(objects)
 end compile_units
+
+// Each command line run as a clang, with at most `unit_jobs` out at once (all of them where it is
+// zero), and what each came to, in the order given. **Whichever clang ends first frees its place**,
+// not the oldest: one long unit at the head would otherwise hold the rest of the window idle.
+private units_ran(cc: string, lines: Buf[Buf[string]]) -> Buf[Result[Output, IoError]]
+    val count = lines.len()
+    val most = if unit_jobs == 0 || unit_jobs > count then count else unit_jobs
+    var children: Buf[Option[&Child]] = buf()
+    var ran: Buf[Option[Result[Output, IoError]]] = buf()
+    var started: usize = 0
+    var landed: usize = 0
+
+    while landed < count
+        while started < count && started - landed < most
+            start(cc, lines[started].view(), stderr = true) match
+                Ok(child) ->
+                    children.push(Some(child))
+                    ran.push(None)
+                Err(e) ->
+                    children.push(None)
+                    ran.push(Some(Err(e)))
+                    landed += 1
+
+            started += 1
+
+            if started - landed > units_most_at_once then units_most_at_once = started - landed
+
+        var moved = false
+
+        for k in 0..<started
+            if ran[k].is_some() then continue
+
+            children[k].unwrap().try_wait() match
+                Ok(None) -> ()
+                Ok(Some(out)) ->
+                    ran[k] = Some(Ok(out))
+                    landed += 1
+                    moved = true
+                Err(e) ->
+                    ran[k] = Some(Err(e))
+                    landed += 1
+                    moved = true
+
+        if !moved && landed < count then sleep(millis(5))
+
+    var out: Buf[Result[Output, IoError]] = buf()
+
+    for item in ran
+        out.push(item.unwrap())
+
+    out
+end units_ran
 
 // A module's text compiled into the one object `obj`, the way `compile_object` compiles it -- in
 // several units where there are to be several, merged by a relocatable link into one object again.

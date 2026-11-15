@@ -80,6 +80,7 @@ private run_cli_command(args: []const string, say: string -> unit, note: string 
     clear_files_read()
     reset_manifest_warnings()
     use_resolution_machine(None)
+    limit_unit_jobs(0)
 
     // A flag that named a `.syslib` is refused by every command in one sentence, before any of them
     // reads its own flags -- none of them takes it, whatever it was handed.
@@ -1108,16 +1109,24 @@ private test_command(args: []const string, say: string -> unit, note: string -> 
     // build never compiles is code the suite would otherwise never see.
     set_feature_testing()
     remember_test_command_line()
+    remember_test_args(args)
+
+    // `jobs` and the limit are settled per project, where its manifest is read (`test_project`).
+    val opts = TestOptions(filter, fail_fast, 0, buf())
+    val asked = TestAsked(jobs, seconds)
+
+    // A build child builds the one project the runner named: a workspace's members are the runner's
+    // to go through, a child each.
+    test_build_child() match
+        Some(child) -> return test_project(child.1, named, cc, opts, asked, std, named_level, note,
+                                           report, within, keep)
+        None -> ()
 
     val projects = workspace_projects(file, picked) match
         Err(why) ->
             note(refused(why))
             return Failed
         Ok(found) -> found
-
-    // `jobs` and the limit are settled per project, where its manifest is read (`test_project`).
-    val opts = TestOptions(filter, fail_fast, 0, buf())
-    val asked = TestAsked(jobs, seconds)
 
     projects match
         None -> test_project(file, named, cc, opts, asked, std, named_level, note, report, within, keep)
@@ -1213,6 +1222,9 @@ end test_members
 private test_project(file: string, named: Option[string], cc: Option[string], given: TestOptions,
                      asked: TestAsked, std: bool, named_level: Option[string], note: string -> unit,
                      report: string -> unit, within: Buf[string], keep: Option[string]) -> int
+    // Built in a child, which does everything below up to the first test (`test_child.sysl`).
+    if tests_build_in_child() then return tested_in_child(file, note, report)
+
     // The package's own `test` block, under whatever the command line said.
     val settings = test_settings_of(file)
 
@@ -1236,6 +1248,9 @@ private test_project(file: string, named: Option[string], cc: Option[string], gi
     val seconds =asked.seconds.unwrap_or(settings.timeout.unwrap_or(DefaultTestSeconds))
     val opts = TestOptions(given.filter, given.fail_fast,
                            asked.jobs.unwrap_or(settings.jobs.unwrap_or(cpu_count())), settings.alone)
+
+    // The link's clangs are held to the same count as the tests, so `--jobs` bounds the build too.
+    limit_unit_jobs(opts.jobs)
 
     val level = build_level(file, named_level) match
         Err(why) ->
@@ -1387,16 +1402,12 @@ private tests_run(file: string, exe: string, all: Buf[TTest], opts: TestOptions,
         judged.push(refused_outcome(file, run.named, run.level, item))
 
     val filtered = all.len() - chosen.len() + run.files.len() - picked.len()
-    val outcomes = run_selected(exe, chosen, opts, filtered, report, seconds, judged)
+    val plan = TestPlan(exe, discard, opts, seconds, filtered, chosen, judged)
 
-    if discard then discard_test_binary(exe)
-
-    var failed: usize = 0
-
-    for outcome in outcomes
-        if !outcome.passed() then failed += 1
-
-    if failed == 0 then Fine else Failed
+    // A build child's part ends here: the runner that started it runs the plan (`tested_in_child`).
+    test_build_child() match
+        Some(child) -> plan_written(child.0, plan, note)
+        None -> plan_run(plan, report)
 end tests_run
 
 private test_usage() -> string = "usage: sysl test [--filter <text>] [--file <name>] [--keep-binary <dir>] [--fail-fast] [--jobs <n>] [--timeout <seconds>] [--std] " +
@@ -1817,7 +1828,15 @@ private said_to_terminal(line: string)
     else print(line)
 
 main(args: []string)
-    if args.len > 1 && args[1] == "test" then watch_for_stop()
+    // A `sysl test` builds in a child of its own (`test_child.sysl`), which leaves the stops to the
+    // runner that started it.
+    if args.len > 1 && args[1] == "test"
+        if test_build_child().is_some()
+            hold_stops()
+        else
+            watch_for_stop()
+            build_tests_with(executable_path())
+    end if
 
     val code = run_cli_noted(args,
         line ->
