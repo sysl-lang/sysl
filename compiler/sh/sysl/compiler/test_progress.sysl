@@ -1,7 +1,7 @@
 module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
-import sysl.signal.{watch, send, INT, TERM, KILL}
+import sysl.signal.{watch, send, Watch, INT, TERM, KILL}
 import sysl.sync.{Atomic, SpinLock}
 import sysl.threads.spawn
 import sysl.time.{monotonic, sleep, millis, whole_millis}
@@ -141,6 +141,20 @@ process_started(id: usize, file: string, name: string, pid: int)
     flying.push(InFlight(id, file, name, now_millis(), pid))
     guard.unlock()
 
+// The child building the suite (`tested_in_child`) is `pid`, which a stop kills with the tests; zero
+// where none is out.
+private var building_pid: int = 0
+
+builder_started(pid: int)
+    guard.lock()
+    building_pid = pid
+    guard.unlock()
+
+builder_ended()
+    guard.lock()
+    building_pid = 0
+    guard.unlock()
+
 // The process `id` has ended.
 process_ended(id: usize)
     guard.lock()
@@ -197,7 +211,27 @@ private stopped(signal_name: string, code: int)
     for item in flying
         _ = send(-i64(item.pid), KILL)
 
+    if building_pid != 0 then _ = send(i64(building_pid), KILL)
+
     exit(code)
+
+// The build child's hold on SIGTERM and SIGINT (`hold_stops`).
+private var held_stops: Buf[&Watch] = buf()
+
+/** In a build child: SIGTERM and SIGINT are taken and left, so a stop sent to the whole group is the
+ * runner's to report -- it says the compile was in flight, then kills this process. A child that died
+ * of the signal first would end the runner's wait before its watcher could say anything. A handler
+ * rather than an ignored disposition, so a clang started from here still stops on the signal.
+ */
+hold_stops()
+    watch(TERM) match
+        Ok(w) -> held_stops.push(w)
+        Err(_) -> ()
+
+    watch(INT) match
+        Ok(w) -> held_stops.push(w)
+        Err(_) -> ()
+end hold_stops
 
 /** Starts the thread that watches for SIGTERM and SIGINT. Called once, by the command-line program
  * when it is running `sysl test`; a compiler called from a test never starts one.

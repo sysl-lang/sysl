@@ -1,0 +1,81 @@
+module sh.sysl.compiler
+@tests
+
+// **A compilation lets go of what it made once its analysis is let go.** The whole-program analyses
+// keep per-body state that names the context it was worked out in: the keeps analysis keeps each
+// body's origins (`KeepsCx.origins`, `keeps_flow.sysl`'s `Origins`), the field-path analysis each
+// body's walk (`Fpa.bodies`, `fpa.sysl`'s `FBody`), and the analysis keeps the field-path analysis
+// (`Analysis.field_paths`). Each edge back is weak; a strong one closes a cycle that keeps the
+// analysis, its tables and every typed body alive for good -- in one build the whole compilation, and
+// in `sysl lsp` or the test runner, which compile again and again in one process, one more each time.
+//
+// Each cell holds a weak reference to what a compilation made and asserts it is empty once the
+// compilation is let go. The cells cross what is held (the analysis, the field-path analysis, the
+// keeps analysis) with how the compilation ended (cleanly, with a refusal) and how often it ran (once,
+// again and again in one process). Skipped, and why: the residue a recursive type's description
+// leaves (a struct type's field naming the struct type itself) is not an analysis and holds none of
+// these, so no cell here can tell it apart.
+
+// A pointer local walked through a loop, so the keeps analysis works out where it points and the
+// field-path analysis walks the body more than once.
+private val rlk_program: string = "var spare = 0\nvar held: *int = &spare\n\n" +
+    "struct Node\n    next: *Node\n    v: *int\n\n" +
+    "last_v(n: *Node)\n    var m = n\n    while m.next != null\n        m = m.next\n    held = m.v\n\n" +
+    "main()\n    var a = Node(null, &spare)\n    last_v(&a)\n"
+
+// The analysis of one compilation of `program`, held weakly, with whether it said anything.
+private rlk_analysis(program: string) -> (weak Analysis, bool)
+    val done = typed_of(program)
+
+    (done.an, !done.reported.is_empty())
+
+// The field-path analysis of one compilation of `rlk_program`, held weakly.
+private rlk_field_paths() -> weak Fpa
+    val done = typed_of(rlk_program)
+
+    assert(done.reported.is_empty(), if done.reported.is_empty() then "" else done.reported[0].diag.message)
+    assert(done.an.field_paths.is_some())
+
+    done.an.field_paths.unwrap()
+end rlk_field_paths
+
+// The settled keeps analysis of one compilation of `rlk_program`, held weakly, once it worked out
+// at least one body's origins -- the per-body state whose edge back closed the cycle.
+private rlk_keeps() -> weak KeepsCx
+    val done = typed_of(rlk_program)
+    val cx = settled_keeps(done.an, done.funcs, reached_vtables(done.an))
+
+    assert(!cx.origins.is_empty())
+
+    cx
+end rlk_keeps
+
+@test("an analysis is let go with the compilation that made it")
+rlk_analysis_released()
+    val (w, said) = rlk_analysis(rlk_program)
+
+    assert(!said)
+    assert(w.get().is_none())
+
+@test("an analysis that refused the program is let go too")
+rlk_refused_released()
+    val (w, said) = rlk_analysis("main()\n    val n: int = \"text\"\n    print(n)\n")
+
+    assert(said)
+    assert(w.get().is_none())
+
+@test("the field-path analysis is let go with the analysis that keeps it")
+rlk_field_paths_released()
+    assert(rlk_field_paths().get().is_none())
+
+@test("the keeps analysis is let go once its answers are read, with every body's origins")
+rlk_keeps_released()
+    assert(rlk_keeps().get().is_none())
+
+@test("compiling one program again and again in one process leaves no analysis behind")
+rlk_again_and_again()
+    for _ in 0..<4
+        val (w, said) = rlk_analysis(rlk_program)
+
+        assert(!said)
+        assert(w.get().is_none())

@@ -160,15 +160,15 @@ private struct_field(e: *Emit, d: &StructType, value: Val, i: usize) -> Val
 
     bitfield_ranges(d) match
         Some(ranges) ->
-            val c = fresh_reg(e)
+            val c = extract_held(e, struct_lty(d), value, 0, container_lty(ranges), container_held_bytes(ranges))
 
-            emit(e, InExtract(c, struct_lty(d), value, index_list(0)))
             read_bits(e, ranges, ranges[d.slot(i)], reordered(e, container_reversal(d, e.target.little_endian()), c))
         None ->
-            val fv = fresh_reg(e)
+            val ft = d.fields[i].1
+            val fv = extract_held(e, struct_lty(d), value, struct_field_index(e.layout, d, d.slot(i)), lty(e, ft),
+                                  field_held_bytes(d, ft))
 
-            emit(e, InExtract(fv, struct_lty(d), value, index_list(struct_field_index(e.layout, d, d.slot(i)))))
-            reordered(e, reversed_width(d, d.fields[i].1, e.target.little_endian()), fv)
+            reordered(e, reversed_width(d, ft, e.target.little_endian()), fv)
 end struct_field
 
 // Whether a pattern introduces a name.
@@ -616,11 +616,15 @@ private settle_owned(e: *Emit, j: usize, owned_n: *usize)
 // bind in blocks of their own (`bind_alternatives`), which is what lets one block serve several tags.
 private gen_arm_body(e: *Emit, arm: TArm, sv: Val, at: Option[Val], ty: Type, slot: Merge,
                      end_l: string)
+    // The arm is a region a slot's life is bounded by (`emit_lifetime.sysl`).
+    val region = open_region(e)
+
     push_owned(e)
 
     if rebuilt_whole(e, arm, sv, at, ty, slot)
         pop_owned(e)
         emit_term(e, InBr(end_l))
+        close_region(e, region)
         return
     end if
 
@@ -632,6 +636,7 @@ private gen_arm_body(e: *Emit, arm: TArm, sv: Val, at: Option[Val], ty: Type, sl
 
     pop_owned(e)
     emit_term(e, InBr(end_l))
+    close_region(e, region)
 end gen_arm_body
 
 // Every other `match`: each arm tested in turn, falling through to the next one when its pattern or
@@ -679,10 +684,15 @@ private gen_chain_arm(e: *Emit, arm: TArm, sv: Val, at: Option[Val], ty: Type, s
     // An arm that only hands a payload back has done all of its work once it is written.
     var moved = false
 
+    // The arm's body is a region a slot's life is bounded by (`emit_lifetime.sysl`). Where a guard
+    // runs first, its bindings were made before the body's block, and lie in the enclosing region.
+    var region: usize = 0
+
     arm.guard match
         None ->
             emit_term(e, InCondBr(arm_test(e, arm.patterns, sv), body_l, next_l))
             emit_label(e, body_l)
+            region = open_region(e)
             push_owned(e)
 
             moved = rebuilt_whole(e, arm, sv, at, ty, slot) || payload_move(e, arm, slot, at)
@@ -732,6 +742,7 @@ private gen_chain_arm(e: *Emit, arm: TArm, sv: Val, at: Option[Val], ty: Type, s
                 if j + 1 < tries then emit_label(e, fail_l)
 
             emit_label(e, body_l)
+            region = open_region(e)
 
     if !moved
         if no_value(ty) then gen_block_void(e, arm.body)
@@ -739,6 +750,7 @@ private gen_chain_arm(e: *Emit, arm: TArm, sv: Val, at: Option[Val], ty: Type, s
 
     pop_owned(e)
     emit_term(e, InBr(end_l))
+    close_region(e, region)
     emit_label(e, next_l)
 end gen_chain_arm
 

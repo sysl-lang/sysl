@@ -1,7 +1,7 @@
 module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
-import sysl.math.bigint.{BigInt, from_int}
+import sysl.math.bigint.{BigInt, from_int, mod_floor, or, pow, shl, shr}
 
 // **Module storage**, and the constant expressions that fill it.
 //
@@ -53,7 +53,8 @@ constant_image(e: *Emit, ty: Type, t: TExpr) -> IrArg
                     val part = constant_image(e, ft, args[i])
                     val bits = reversed_width(decl, ft, e.target.little_endian())
 
-                    fields.push(ir_arg(part.ty, reversed_constant(part.value, bits, ft)))
+                    fields.push(held_constant(e, field_held_bytes(decl, ft),
+                                              ir_arg(part.ty, reversed_constant(part.value, bits, ft))))
 
             literal_image(gapped_values(fields, struct_gaps(e.layout, decl)), decl.packed)
         TArrayLit(items, array_ty) ->
@@ -269,7 +270,7 @@ private bitfield_constant(e: *Emit, decl: &StructType, ranges: Buf[BitRange], ar
     for i in 0..<args.len()
         if !zero_sized(decl.fields[i].1)
             val r = ranges[k]
-            val n = constant_bits(constant_value(e, args[i])) match
+            val n = constant_bits(e, constant_value(e, args[i])) match
                 Some(found) -> found
                 None -> return gap_at(e, "a constant bitfield struct whose field is not an integer")
 
@@ -281,16 +282,51 @@ private bitfield_constant(e: *Emit, decl: &StructType, ranges: Buf[BitRange], ar
     val stored = if reversal > 0 then swapped_bytes(acc, reversal, false) else acc
     var parts: Buf[IrArg] = buf()
 
-    parts.push(ir_arg(LInt(bits), VInt(stored)))
+    parts.push(held_constant(e, container_held_bytes(ranges), ir_arg(LInt(bits), VInt(stored))))
     VPackedAgg(parts)
 end bitfield_constant
 
-// The integer a field's constant stands for inside a bitfield struct's container.
-private constant_bits(v: Val) -> Option[BigInt] = v match
+// The integer a field's constant stands for inside a bitfield struct's container -- a container
+// held as bytes (`held_constant`) read back in the machine's order.
+private constant_bits(e: *Emit, v: Val) -> Option[BigInt] = v match
     VInt(n) -> Some(n)
     VZero -> Some(from_int(0))
-    VPackedAgg(parts) -> if parts.len() == 1 then constant_bits(parts[0].value) else None
+    VPackedAgg(parts) -> if parts.len() == 1 then constant_bits(e, parts[0].value) else None
+    VArray(bytes) ->
+        val little = e.target.little_endian()
+        var acc = from_int(0)
+
+        for j in 0..<bytes.len()
+            val at = if little then j else bytes.len() - 1 - j
+            val b = constant_bits(e, bytes[j].value) match
+                Some(found) -> found
+                None -> return None
+
+            acc = or(acc, shl(b, at * 8))
+
+        Some(acc)
     _ -> None
+
+// A constant integer laid down as the `n` bytes it is held in (`held_int_bytes`), in the order the
+// machine keeps them, or the constant itself where `n` is `0`.
+private held_constant(e: *Emit, n: int, part: IrArg) -> IrArg
+    if n == 0 then return part
+
+    val t = LArr(n, LInt(8))
+    val image = part.value match
+        VInt(v) -> mod_floor(v, pow(from_int(2), usize(n * 8)))
+        VZero -> return ir_arg(t, VZero)
+        _ -> return ir_arg(t, gap_at(e, "a constant integer held as bytes that is not a number"))
+    val little = e.target.little_endian()
+    var bytes: Buf[IrArg] = buf()
+
+    for j in 0..<n
+        val at = if little then j else n - 1 - j
+
+        bytes.push(ir_arg(LInt(8), VInt(mod_floor(shr(image, usize(at) * 8), from_int(256)))))
+
+    ir_arg(t, VArray(bytes))
+end held_constant
 
 // Whether a constant's type is an address: a pointer or a function pointer.
 private is_word_address(t: Type) -> bool = underlying(t) match
@@ -396,7 +432,8 @@ constant_value(e: *Emit, t: TExpr) -> Val = *t.kind match
             if !zero_sized(ft)
                 val bits = reversed_width(decl, ft, e.target.little_endian())
 
-                fields.push(ir_arg(lty(e, ft), reversed_constant(constant_value(e, args[i]), bits, ft)))
+                fields.push(held_constant(e, field_held_bytes(decl, ft),
+                                          ir_arg(lty(e, ft), reversed_constant(constant_value(e, args[i]), bits, ft))))
 
         // A raised boundary's gaps are fields of the definition, so they are zeros here. A `@packed`
         // struct's type is LLVM's `<{ }>`, and a constant of it has to be written in the same brackets.

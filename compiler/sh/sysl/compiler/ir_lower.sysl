@@ -121,13 +121,13 @@ struct_type_def(d: &StructType, l: TargetLayout) -> Option[IrTypeDef]
     if d.union_layout then return Some(union_type_def(d, l))
 
     bitfield_ranges(d) match
-        Some(ranges) -> fields.push(LInt(bitfield_bits(ranges)))
+        Some(ranges) -> fields.push(held_lty(container_held_bytes(ranges), LInt(bitfield_bits(ranges))))
         None ->
             val stored = d.stored()
 
             for item in stored
                 type_lty(item.1, word_bits) match
-                    Some(t) -> fields.push(t)
+                    Some(t) -> fields.push(held_lty(field_held_bytes(d, item.1), t))
                     None -> return None
 
     val name = s"%struct.${mangled(d.base, d.targs)}"
@@ -136,6 +136,38 @@ struct_type_def(d: &StructType, l: TargetLayout) -> Option[IrTypeDef]
         Some(g) -> Some(IrTypeDef(name, gapped_fields(fields, g), d.packed))
         None -> Some(IrTypeDef(name, fields, d.packed))
 end struct_type_def
+
+// **An integer whose bytes are fewer than the room LLVM gives its type is held as those bytes**
+// wherever it is packed: a field of a `@packed` struct (`u24`, `u40`, `u48`, `u56`, ...) and a bitfield
+// struct's container of such a width. LLVM rounds an `i24` up to the boundary of an `i32` and takes
+// four bytes for it even inside `<{ }>`, so as an `i24` the field would push every field after it a
+// byte along and an array of the struct would step by the wrong amount. As `[3 x i8]` it is exactly
+// the three bytes `reference/attributes.md § Bitfields` says it occupies. A load or a store through
+// its address still names the integer, which touches only its bytes; only an aggregate *value* holds
+// the bytes, so taking the element out of one and putting it in goes through `held_value` and
+// `held_bytes` (`emit_place.sysl`), and a constant of one is written as its bytes.
+//
+// The bytes an integer of `bits` is held in, or `0` where LLVM's own integer takes exactly its bytes.
+held_int_bytes(bits: int) -> int = if bits % 8 == 0 && int_alloc(bits) != usize(bits / 8) then bits / 8 else 0
+
+// The same, for a type that is one integer: an integer, a fixed-point number, a simple enum.
+private held_type_bytes(t: Type) -> int = underlying(t) match
+    Integer(bits, _, _) -> held_int_bytes(bits)
+    Fixed(bits, _, _) -> held_int_bytes(bits)
+    Enum(d) -> if d.simple then held_type_bytes(d.underlying) else 0
+    _ -> 0
+
+// The bytes a stored field of type `t` is held in inside `d`, or `0` where it is held as itself. Only
+// a `@packed` struct of whole-byte fields has them; a union's fields all begin at its first byte and
+// a struct with C bitfields lays its bytes out itself.
+field_held_bytes(d: &StructType, t: Type) -> int =
+    if !d.packed || d.union_layout || !d.c_bits.is_empty() then 0 else held_type_bytes(t)
+
+// The bytes a bitfield struct's container is held in, or `0`.
+container_held_bytes(ranges: Buf[BitRange]) -> int = held_int_bytes(bitfield_bits(ranges))
+
+// The element type an integer `it` is held as: its bytes where there are any, itself otherwise.
+held_lty(n: int, it: LType) -> LType = if n > 0 then LArr(n, LInt(8)) else it
 
 // A union's definition, as clang writes one: the field with the widest boundary (the larger, where
 // two tie) and then bytes up to the union's size. LLVM's size and boundary for it are then the
@@ -345,20 +377,23 @@ struct_gaps(l: TargetLayout, d: &StructType) -> Option[Gaps]
 
     bitfield_ranges(d) match
         Some(ranges) ->
+            val held = container_held_bytes(ranges)
+
             offsets.push(0)
-            sizes.push(int_alloc(bitfield_bits(ranges)))
+            sizes.push(if held > 0 then usize(held) else int_alloc(bitfield_bits(ranges)))
         None ->
             val fields = d.stored()
             var at: usize = 0
 
             for item in fields
                 val ty = item.1
+                val n = l.stored_size(d, ty)
 
                 if !d.packed then at = round_up(at, l.align(ty))
 
                 offsets.push(at)
-                sizes.push(l.size(ty))
-                at += l.size(ty)
+                sizes.push(n)
+                at += n
 
     Some(Gaps(offsets, sizes, l.size(Struct(d))))
 end struct_gaps

@@ -176,6 +176,14 @@ private suppliers_reached(p: TProgram, live: &Live, exports: Buf[TFunc], extra: 
     if runtime_reached(p, live, exports, extra, DoubleArithmetic) then more = true
     if runtime_reached(p, live, exports, extra, WideDivision) then more = true
 
+    // **And so are C's roots, roundings and extrema**: `x.sqrt()` is `llvm.sqrt`, which a machine
+    // without the instruction turns into a call to `sqrt`. The module exists only on the freestanding
+    // machines that lack an instruction at some width, and each width's half is kept where a reached
+    // body computes with a float of that width -- the operation LLVM will turn into a call is not one
+    // this walk can see.
+    if runtime_reached(p, live, exports, extra, LibmDouble) then more = true
+    if runtime_reached(p, live, exports, extra, LibmSingle) then more = true
+
     more
 end suppliers_reached
 
@@ -199,16 +207,34 @@ const DoubleRuntimeModule: string = "sysl.softfloat.binary64"
 // relatives on Arm, `__udivdi3` and its relatives on RISC-V.
 const DivisionRuntimeModule: string = "sysl.softint"
 
+// The module whose `@export`s are C's roots, roundings and extrema -- `sqrt`, `floor`, `fmax` and the
+// rest -- which LLVM calls for an intrinsic a freestanding machine has no instruction for.
+const LibmRuntimeModule: string = "sysl.softfloat.libm"
+
 // The runtimes LLVM calls into on its own, each kept where a reached body computes what it answers.
+// C's functions are kept a width at a time: an `f64` one reads its operand through `real.from_bits`,
+// which on a single-precision unit would itself ask for the binary64 runtime that an `f32`-only
+// program has no use for.
 private enum Runtime
     QuadArithmetic
     DoubleArithmetic
     WideDivision
+    LibmDouble
+    LibmSingle
 
 private runtime_home(r: Runtime) -> string = r match
     QuadArithmetic -> QuadRuntimeModule
     DoubleArithmetic -> DoubleRuntimeModule
     WideDivision -> DivisionRuntimeModule
+    LibmDouble -> LibmRuntimeModule
+    LibmSingle -> LibmRuntimeModule
+
+// Whether `f`, an export of `r`'s module, is one `r` keeps: every one, except that C's functions are
+// split between their two widths by what they answer.
+private runtime_keeps(f: TFunc, r: Runtime) -> bool = r match
+    LibmDouble -> is_binary64(f.ret_ty)
+    LibmSingle -> !is_binary64(f.ret_ty)
+    _ -> true
 
 // Keeps every `@export` of `r`'s module, where this build has the module at all and something the
 // walk reached computes what it answers; true where one was new. The linker takes the routines the
@@ -216,14 +242,15 @@ private runtime_home(r: Runtime) -> string = r match
 private runtime_reached(p: TProgram, live: &Live, exports: Buf[TFunc], extra: *Buf[TFunc],
                         r: Runtime) -> bool
     val home = runtime_home(r)
+    val split = r == LibmDouble || r == LibmSingle
 
-    if !holds_runtime(exports, home) || holds_runtime(*extra, home) || !reaches_runtime(p, live, r)
+    if !holds_runtime(exports, home) || (!split && holds_runtime(*extra, home)) || !reaches_runtime(p, live, r)
         return false
 
     var more = false
 
     for f in exports
-        if f.declared_in == home && !holds_func(*extra, f.name)
+        if f.declared_in == home && runtime_keeps(f, r) && !holds_func(*extra, f.name)
             extra.push(f)
             more = true
 
@@ -293,6 +320,8 @@ private runtime_type(t: Type, r: Runtime, unit: Units) -> bool = r match
     DoubleArithmetic -> (!unit.binary64 && (is_binary64(t) || is_binary16(t))) ||
                         (!unit.binary32 && is_binary32(t))
     WideDivision -> false
+    LibmDouble -> is_binary64(t)
+    LibmSingle -> is_narrow_float(t)
 
 private note_runtime(sink: *Buf[Span], e: TExpr, r: Runtime, unit: Units)
     if sink.is_empty() && runtime_node(e, r, unit) then sink.push(e.span)
@@ -307,6 +336,7 @@ private note_runtime(sink: *Buf[Span], e: TExpr, r: Runtime, unit: Units)
 // `f32` value asks for it.
 private runtime_node(e: TExpr, r: Runtime, unit: Units) -> bool
     if r == QuadArithmetic then return is_quad(texpr_type(e))
+    if r == LibmDouble || r == LibmSingle then return runtime_type(texpr_type(e), r, unit)
 
     if r == DoubleArithmetic
         if runtime_type(texpr_type(e), r, unit) then return true
@@ -351,6 +381,12 @@ private is_binary16(t: Type) -> bool = underlying(t) match
 
 private is_binary32(t: Type) -> bool = underlying(t) match
     Floating(bits, brain) -> bits == 32 && !brain
+    _ -> false
+
+// Whether `t` is a float whose roots and roundings are `f32`'s C functions: `f32` itself, and the
+// sixteen-bit formats, which are computed in `f32`.
+private is_narrow_float(t: Type) -> bool = underlying(t) match
+    Floating(bits, _) -> bits <= 32
     _ -> false
 
 private holds_func(fs: Buf[TFunc], name: string) -> bool
@@ -1175,7 +1211,8 @@ private runtime_asm_kept(blocks: Buf[TModuleAsm], funcs: Buf[TFunc]) -> Buf[TMod
 end runtime_asm_kept
 
 private is_runtime_module(home: string) -> bool =
-    home == QuadRuntimeModule || home == DoubleRuntimeModule || home == DivisionRuntimeModule
+    home == QuadRuntimeModule || home == DoubleRuntimeModule || home == DivisionRuntimeModule ||
+    home == LibmRuntimeModule
 
 // **The same program lowered AS a test build: the tests kept, and the program's own entry point put
 // aside.**

@@ -2517,7 +2517,12 @@ and is accepted: a closure whose body is `n += 1` followed by `n` is a counter o
 handed the copy's address to write through. That holds for a captured struct, a field of one, an
 element of a captured array, and the first link of a chain such as `c.a().bump()`, and it is asked
 the same two questions. A `(self)` or `&self` call only reads, and a `*self` call on a captured `&T`
-or `*T` reaches the shared storage.
+or `*T` reaches the shared storage. So does one on a captured **handle** — a struct whose every field
+is a `&T`, as a `Buf`, a `Map` and a `Deque` are — since a copy of it names the same storage:
+`b.view_mut()` in a kept closure is a view of the buffer both sides hold. That holds for a method that
+writes only through those references. One that re-points the handle — assigns a field of `self`
+(`self.r = other`) or the whole of it (`*self = h`), or calls a `*self` method of its own that does —
+writes the copy, as a method on any other struct does.
 
 ```sysl
 struct Counter
@@ -2577,6 +2582,71 @@ print(*k, n)
 
 ```output
 7 7
+```
+
+**A writable view of a captured array is a view of the copy**, so handing one to a call is handing
+out the copy's address: `fill(out[0..<2])`, `fill(out[..])` and `fill(out)` where a `[]T` is wanted
+are asked the same questions `bump(&k)` is, and a write through one in the closure itself
+(`out[0..<2][0] = 7`) is a write of the copy as `out[0] = 7` is. A `[]const T` view only reads, and
+a view of a captured `Buf` or `&[N]T` is of storage both sides share.
+
+```sysl
+import sysl.threads.scope
+
+fill(dst: []u8) = dst[0] = 7
+
+var out = [0u8; 4]
+scope((s) -> s.spawn(() -> fill(out[0..<2])).join())
+print(out)
+```
+
+```error
+so it holds a copy of 'out' — so 'fill', which is handed a view of it, would reach that copy rather than the variable it came from, and the variable is used afterwards as though it had. Where you mean to change 'out', take the view outside the closure, hold it as a '&[4]byte' and view that, or have the closure return the value
+```
+
+A view taken outside the closure is a view of the variable, and crosses to the scoped thread:
+
+```sysl
+import sysl.threads.scope
+
+fill(dst: []u8) = dst[0] = 7
+
+var out = [0u8; 4]
+val v = out[0..<2]
+scope((s) -> s.spawn(() -> fill(v)).join())
+print(out)
+```
+
+```output
+[7, 0, 0, 0]
+```
+
+**A local the closure binds to the copy carries the write on**: an address of it (`val p = &k`), a
+writable view of it (`val v = out[0..<2]`), a view of such a view, a `ref` naming it, and any of
+those bound again. Writing through the local (`*p = 3`, `v[0] = 7`) is a write of the copy, and
+handing the local to a call (`bump(p)`, `fill(v)`) hands out the copy's address or a view of it, each
+asked the same two questions as the capture itself. So is a write through the local from a closure
+written inside this one (`run(() -> *p = 1)`), however deep and however that closure holds `p`, since
+what it holds still points at this closure's copy:
+
+```sysl
+bump(p: *int) = *p += 1
+
+var later: Option[&Fn() -> unit] = None
+
+install(f: &Fn() -> unit)
+    later = Some(f)
+    f()
+
+var k = 0
+install(() ->
+    val p = &k
+    bump(p))
+print(k)
+```
+
+```error
+so it holds a copy of 'k' — so 'bump', which is handed its address, would reach that copy rather than the variable it came from, and the variable is used afterwards as though it had
 ```
 
 A call answering a value hands back what it read of the copy, so `() -> it.next()` reads its copy

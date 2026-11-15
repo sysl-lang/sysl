@@ -3,7 +3,7 @@ module sh.sysl.compiler
 import sh.sysl.parsing.Source
 import sysl.buf.{Buf, buf}
 import sysl.text.{join, str_builder, Search}
-import sysl.fs.{exists, is_file, make_temp_dir, remove_dir_all, remove_file, make_dir_all, pending_name, publish_file, write_text}
+import sysl.fs.{canonicalize, exists, is_file, make_temp_dir, remove_dir_all, remove_file, make_dir_all, pending_name, publish_file, write_text}
 import sysl.process.{run as run_child, pid, Status, Var}
 import sysl.env.{get as env_var}
 
@@ -1450,6 +1450,15 @@ build_c_archive(path: string, named_target: Option[string], cc: Option[string], 
                 out: Option[string], header_at: Option[string],
                 say: string -> unit, lto: Option[string] = None,
                 ll_at: Option[string] = None) -> Result[(string, string), Failure]
+    // First, since nothing about the build can change the answer: an archive named as a shared
+    // library is an `ar` file a linker or a loader would misread under that name.
+    out match
+        Some(named) ->
+            shared_library_refusal(named) match
+                Some(why) -> return Err(Said(Refusal(why)))
+                None -> ()
+        None -> ()
+
     val t = target_for(path, named_target).map_err(said)?
 
     if !t.builds_with_clang() then return Err(Said(Refusal(t.no_toolchain())))
@@ -1569,15 +1578,60 @@ build_c_archive(path: string, named_target: Option[string], cc: Option[string], 
     Ok((archive_at, header_out))
 end build_c_archive
 
-// What a header's include guard is named for: the project's manifest name, and the directory it is
-// in where it has none.
+// **`build-c` writes a static archive whatever `-o` calls it**, so a name a linker reads as a shared
+// library (`.dylib`, `.so`, a versioned `.so.1`, `.dll`) is refused rather than written: an `ar` file
+// under that name fails later, at the C project's link or at load, naming neither sysl nor the
+// archive. The refusal says what to call it instead.
+shared_library_refusal(out: string) -> Option[string]
+    val name = basename(out)
+    var cut: Option[usize] = None
+
+    for suffix in [".dylib", ".so", ".dll"]
+        if cut.is_none() && name.ends_with(suffix) then cut = Some(out.bytes.len - suffix.bytes.len)
+
+    // A versioned shared object, `libx.so.1` or `libx.so.1.2`: the `.so.` is where the name stops.
+    if cut.is_none()
+        name.index_of(".so.") match
+            Some(at) -> cut = Some(out.bytes.len - name.bytes.len + at)
+            None -> ()
+
+    cut.map((at) -> s"'-o $out' names a shared library, and build-c writes a static archive: name it " +
+                    s"'${out[0..<at]}.a' (or '.lib' for an MSVC link)")
+end shared_library_refusal
+
+// **What a header's include guard is named for.** A manifest's name is the project's own identity and
+// is used as it stands. Without one, the name is read off where the project IS -- a directory's own
+// last segment with `.` and `..` resolved, or a bare file's stem -- never off the path as typed, which
+// for `.` would leave the guard nothing but punctuation. A name read off the filesystem is not unique,
+// though (every probe directory is called `lib` somewhere), so it carries the first eight hex digits of
+// a fingerprint of the canonical path: two headers included in one C file then cannot hide each other.
 private header_name(path: string) -> string
     val root = if is_directory(path) then path else parent_of(path).unwrap_or(".")
 
-    manifest_at(root) match
-        Ok(m) -> if m.name == "" then basename(root) else m.name
-        Err(_) -> basename(root)
+    val named = manifest_at(root) match
+        Ok(m) -> m.name
+        Err(_) -> ""
+
+    if named != "" then return named
+
+    val place = canonicalize(path) match
+        Ok(full) -> full
+        Err(_) -> absolute_path(path)
+
+    val stem = if is_directory(path) then directory_name(place) else file_stem(basename(place))
+
+    s"${stem}_${bytes_fingerprint(place.bytes)[0..<8]}"
 end header_name
+
+// A file's name without its last extension, and the whole name where cutting would leave nothing.
+private file_stem(name: string) -> string
+    var at = name.bytes.len
+
+    for i in 0..<name.bytes.len
+        if name.bytes[i] == u8('.') then at = i
+
+    if at == 0 then name else name[0..<at]
+end file_stem
 
 // Every `pkg_config` name the project, its packages and its `--lib` roots require, each once, in the
 // order met -- an archive carries a root's C as it does a package's.

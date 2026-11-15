@@ -3999,6 +3999,26 @@ No syntax was needed for this, which is why there is none: the open integer fami
 work C needs `int x : 3` for, so a five-bit field is written `u5` in a struct exactly as it is
 anywhere else.
 
+The rule is the same for a whole number of bytes that is not a power of two: a `u24` inside `@packed`
+is three bytes, a `u40` five, a `u48` six, where on its own each is rounded up to the next power of
+two. So a three-byte length overlays a wire format's three bytes:
+
+```sysl
+@packed
+@byte_order(big)
+struct FrameHeader
+    len: u24
+    kind: u8
+    flags: u8
+    stream: u32
+
+print(sizeof(FrameHeader), offsetof(FrameHeader, kind), offsetof(FrameHeader, stream), sizeof(u24))
+```
+
+```output
+9 3 5 4
+```
+
 Two things follow that C leaves to the implementation, and pinning them is the point of the feature
 rather than a detail of it — it is why portable embedded C avoids bitfields and writes the shifts out
 by hand. **The bits fill from the least significant upward in declaration order**, and **a field

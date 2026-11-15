@@ -1,0 +1,421 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.env.get as env_var
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, pid}
+import sysl.text.{cstring, from_utf8_unchecked, split, Search}
+
+// **`sysl test` from the command line builds in a child and runs the tests itself** (`test_child.sysl`).
+// The plan the child hands over is checked as text, both ways; the switch is checked in process; and
+// what the command line answers -- standard output, standard error and the status -- is compared with
+// the same command run in process, which builds where it always did, over a passing and failing suite,
+// a build error, a package with refused programs, and a workspace.
+//
+// The command line is the compiler under test (`SYSL`, which the runner hands every test); a run with
+// no such variable has nothing to compare and returns.
+
+private extern "setenv" tbc_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" tbc_c_unsetenv(name: *u8) -> int
+
+private tbc_compiler() -> Option[string] = env_var("SYSL")
+
+private tbc_ready() -> bool = std_root().is_ok() && clang_available() && tbc_compiler().is_some()
+
+private tbc_write(root: string, rel: string, text: string)
+    val slash = rel.last_index_of("/")
+
+    if slash.is_some() then make_dir_all(s"$root/${rel[0..<slash.unwrap()]}").unwrap()
+    write_text(s"$root/$rel", text).unwrap()
+end tbc_write
+
+private tbc_package(root: string, name: string)
+    tbc_write(root, "sysl.hocon", s"package { name = \"$name\", version = \"0.1.0\" }\n")
+
+// A suite with a pass, a failure that printed something, and an ignored test.
+private tbc_mixed() -> string
+    val root = make_temp_dir("sysl-tbc-mixed").unwrap()
+
+    tbc_package(root, "mixed")
+    tbc_write(root, "main.sysl",
+              "main()\n    print(\"hi\")\n\n@test(\"adds\")\nadds()\n    assert_eq(1 + 1, 2)\n\n" +
+              "@test(\"breaks\")\nbreaks()\n    print(\"said before\")\n    assert_eq(1 + 1, 3)\n\n" +
+              "@test(ignore: \"later\")\nlater()\n    assert_eq(1, 2)\n")
+    root
+end tbc_mixed
+
+// A tree that does not compile.
+private tbc_broken() -> string
+    val root = make_temp_dir("sysl-tbc-broken").unwrap()
+
+    tbc_package(root, "broken")
+    tbc_write(root, "main.sysl", "main()\n    val x: int = \"no\"\n\n@test(\"never\")\nnever()\n    assert_eq(1, 1)\n")
+    root
+end tbc_broken
+
+// A package with a test and two refused programs, one refused as it says and one not.
+private tbc_refusing() -> string
+    val root = make_temp_dir("sysl-tbc-refused").unwrap()
+
+    tbc_package(root, "refusing")
+    tbc_write(root, "lib.sysl", "private hidden() -> int = 1\n\n@test(\"visible\")\nvisible()\n    assert_eq(hidden(), 1)\n")
+    tbc_write(root, "tests/refused/right.sysl", "// error: cannot initialize 'x'\nmain()\n    val x: int = \"no\"\n")
+    tbc_write(root, "tests/refused/wrong.sysl", "// error: nothing like this\nmain()\n    val x: int = \"no\"\n")
+    root
+end tbc_refusing
+
+// Only refused programs: no `@test` function, so no binary to link.
+private tbc_only_refused() -> string
+    val root = make_temp_dir("sysl-tbc-only").unwrap()
+
+    tbc_package(root, "only")
+    tbc_write(root, "lib.sysl", "helper() -> int = 1\n")
+    tbc_write(root, "tests/refused/right.sysl", "// error: cannot initialize 'x'\nmain()\n    val x: int = \"no\"\n")
+    root
+end tbc_only_refused
+
+// A workspace of a passing member and a failing one.
+private tbc_workspace() -> string
+    val root = make_temp_dir("sysl-tbc-ws").unwrap()
+
+    tbc_write(root, "sysl.hocon", "workspace = [\"a\", \"b\"]\n")
+    tbc_write(root, "a/sysl.hocon", "package { name = \"a\", version = \"0.1.0\" }\n")
+    tbc_write(root, "a/main.sysl", "@test(\"a passes\")\napass()\n    assert_eq(1, 1)\n")
+    tbc_write(root, "b/sysl.hocon", "package { name = \"b\", version = \"0.1.0\" }\n")
+    tbc_write(root, "b/main.sysl", "@test(\"b fails\")\nbfail()\n    assert_eq(1, 2)\n")
+    root
+end tbc_workspace
+
+// What a run said, with every time (`123ms`) made `Nms` and the standard module's rebuild note, which
+// only the compiler that has no artifact yet says, dropped.
+private tbc_steady(text: string) -> string
+    var out = ""
+
+    for line in split(text, "\n")
+        if line.starts_with("building the standard module") then continue
+
+        out = out + tbc_untimed(line) + "\n"
+
+    out
+end tbc_steady
+
+private tbc_untimed(line: string) -> string
+    val b = line.bytes
+    var out: Buf[u8] = buf()
+    var i: usize = 0
+
+    while i < b.len
+        var j = i
+
+        while j < b.len && b[j] >= u8('0') && b[j] <= u8('9')
+            j += 1
+
+        if j > i && j + 1 < b.len && b[j] == u8('m') && b[j + 1] == u8('s')
+            out.push(u8('N'))
+            i = j
+        else if j > i
+            for k in i..<j
+                out.push(b[k])
+
+            i = j
+        else
+            out.push(b[i])
+            i += 1
+        end if
+
+    from_utf8_unchecked(out.view())
+end tbc_untimed
+
+// One answer to a command line: its status, standard output and standard error.
+private struct TbcAnswer
+    code: int
+    out: string
+    err: string
+
+// `sysl test <args>` in this process: `say` and the report on standard output, `note` on standard
+// error, as `main` routes them.
+private tbc_in_process(args: []const string) -> TbcAnswer
+    var out = ""
+    var err = ""
+    val o = &out
+    val e = &err
+    var line: Buf[string] = buf()
+
+    line.push("sysl")
+    line.push("test")
+
+    for item in args
+        line.push(item)
+
+    val code = run_cli_reported(line.view(),
+        said ->
+            if said.starts_with(RefusalLead) || said.starts_with(OptionLead) then *e = *e + said + "\n"
+            else *o = *o + said + "\n",
+        said -> *e = *e + said + "\n",
+        piece -> *o = *o + piece)
+
+    TbcAnswer(code, tbc_steady(out), tbc_steady(err))
+end tbc_in_process
+
+// The same command line run as the command-line program.
+private tbc_command_line(args: []const string) -> TbcAnswer
+    var line: Buf[string] = buf()
+
+    line.push("test")
+
+    for item in args
+        line.push(item)
+
+    val ran = capture(tbc_compiler().unwrap(), line.view(), stderr = true).unwrap()
+
+    TbcAnswer(shell_status(ran.status), tbc_steady(ran.text), tbc_steady(ran.err.unwrap_or("")))
+end tbc_command_line
+
+private tbc_same(root: string, args: []const string, code: int)
+    val here = tbc_in_process(args)
+
+    assert_eq(last_test_builder(), 0)
+
+    val there = tbc_command_line(args)
+
+    assert_eq(here.code, code)
+    assert_eq(there.code, here.code)
+    assert(there.out == here.out, s"standard output:\n${there.out}\nagainst, in process:\n${here.out}")
+    assert(there.err == here.err, s"standard error:\n${there.err}\nagainst, in process:\n${here.err}")
+    remove_dir_all(root).unwrap_or(())
+end tbc_same
+
+// --- the plan -------------------------------------------------------------------------------------
+
+private tbc_hook(kind: HookKind, func: string) -> Option[THook] = Some(THook(kind, func, "/a:b/m.sysl", 42))
+
+private tbc_plan() -> TestPlan
+    var tests: Buf[TTest] = buf()
+
+    tests.push(TTest("t$one", "a name: with a colon\nand a newline", false, Some("printed\n\0ends"), "/x/y.sysl",
+                     7, THooks(tbc_hook(Setup, "s"), None, tbc_hook(SetupAll, "sa"), tbc_hook(TeardownAll, "ta")),
+                     None, Some(30)))
+    tests.push(TTest("t2", "", true, None, "", 0, no_hooks(), Some("not yet — ünïcode"), None))
+
+    var refused: Buf[Outcome] = buf()
+
+    refused.push(Outcome(TTest("", "tests/refused/r.sysl", false, None, "/r.sysl", 1, no_hooks(), None, None),
+                         Some("refused, but no diagnostic contains \"x\""), "error: 12:34\n  | line\n", 1234, None))
+    refused.push(Outcome(TTest("", "tests/refused/s.sysl", false, None, "/s.sysl", 1, no_hooks(), None, None),
+                         None, "", 0, Some("skipped")))
+
+    var alone: Buf[string] = buf()
+
+    alone.push("slow one")
+    alone.push("")
+
+    TestPlan("/tmp/bin/t", true, TestOptions(Some("fil:ter"), true, 3, alone), 300, 5, tests, refused)
+end tbc_plan
+
+@test("tbc: a plan reads back as it was written, whatever its texts hold")
+tbc_plan_round_trips()
+    val p = tbc_plan()
+    val text = encode_test_plan(p)
+    val back = decode_test_plan(text).unwrap()
+
+    assert_eq(encode_test_plan(back), text)
+    assert_eq(back.exe, "/tmp/bin/t")
+    assert(back.discard, "discard")
+    assert_eq(back.opts.filter.unwrap(), "fil:ter")
+    assert(back.opts.fail_fast, "fail fast")
+    assert_eq(back.opts.jobs, 3)
+    assert_eq(back.opts.alone.len(), 2)
+    assert_eq(back.opts.alone[1], "")
+    assert_eq(back.seconds, 300)
+    assert_eq(back.filtered, 5)
+    assert_eq(back.tests.len(), 2)
+
+    val first = back.tests[0]
+
+    assert_eq(first.display, "a name: with a colon\nand a newline")
+    assert_eq(first.expected.unwrap(), "printed\n\0ends")
+    assert_eq(first.line, 7)
+    assert_eq(first.timeout.unwrap(), 30)
+    assert(first.hooks.teardown.is_none(), "no teardown")
+    assert_eq(first.hooks.setup_all.unwrap().func, "sa")
+    assert_eq(first.hooks.teardown_all.unwrap().line, 42)
+    assert(first.ignored.is_none(), "not ignored")
+
+    val second = back.tests[1]
+
+    assert(second.should_trap, "should trap")
+    assert(second.expected.is_none(), "no expected output")
+    assert(second.timeout.is_none(), "no timeout")
+    assert_eq(second.ignored.unwrap(), "not yet — ünïcode")
+    assert_eq(back.refused.len(), 2)
+    assert_eq(back.refused[0].millis, 1234)
+    assert_eq(back.refused[0].output, "error: 12:34\n  | line\n")
+    assert(!back.refused[0].passed(), "the first refused row failed")
+    assert_eq(back.refused[1].skipped.unwrap(), "skipped")
+end tbc_plan_round_trips
+
+@test("tbc: an empty plan reads back too -- no tests, no refused programs, no filter")
+tbc_empty_plan_round_trips()
+    val p = TestPlan("", false, TestOptions(None, false, 1, buf()), 0, 0, buf(), buf())
+    val back = decode_test_plan(encode_test_plan(p)).unwrap()
+
+    assert_eq(back.exe, "")
+    assert(back.opts.filter.is_none(), "no filter")
+    assert_eq(back.tests.len(), 0)
+    assert_eq(back.refused.len(), 0)
+end tbc_empty_plan_round_trips
+
+@test("tbc: a plan cut short, run on, or not a plan at all reads as none")
+tbc_damaged_plan_is_none()
+    val text = encode_test_plan(tbc_plan())
+
+    assert(decode_test_plan(text[0..<text.bytes.len - 1]).is_none(), "cut short by a byte")
+    assert(decode_test_plan(text[0..<text.bytes.len / 2]).is_none(), "cut in half")
+    assert(decode_test_plan(text + "1:x").is_none(), "a field too many")
+    assert(decode_test_plan("").is_none(), "empty")
+    assert(decode_test_plan("x:abc").is_none(), "a length that is not one")
+    assert(decode_test_plan("999:abc").is_none(), "a length past the end")
+end tbc_damaged_plan_is_none
+
+// --- the switch -----------------------------------------------------------------------------------
+
+@test("tbc: in process, with no switch, a suite is built here and no child is started")
+tbc_in_process_builds_here()
+    if !tbc_ready() then return
+
+    val root = tbc_mixed()
+    val got = tbc_in_process([root, "--filter", "adds"])
+
+    assert_eq(got.code, Fine)
+    assert(got.out.contains("1 passed, 0 failed"), got.out)
+    assert_eq(last_test_builder(), 0)
+    remove_dir_all(root).unwrap_or(())
+end tbc_in_process_builds_here
+
+@test("tbc: with the switch on, the suite is built by a child process and its report is the one built here")
+tbc_switch_builds_in_a_child()
+    if !tbc_ready() then return
+
+    val root = tbc_mixed()
+    val here = tbc_in_process([root, "--jobs", "2"])
+
+    build_tests_with(tbc_compiler())
+
+    val there = tbc_in_process([root, "--jobs", "2"])
+    val child = last_test_builder()
+
+    build_tests_with(None)
+
+    assert(child != 0, "a child was started")
+    assert(child != int(pid()), "and it was not this process")
+    assert_eq(there.code, Failed)
+    assert_eq(there.code, here.code)
+    assert(there.out == here.out, s"in a child:\n${there.out}\nagainst, here:\n${here.out}")
+
+    // Off again, the next suite is built here.
+    val after = tbc_in_process([root, "--filter", "adds"])
+
+    assert_eq(after.code, Fine)
+    assert_eq(last_test_builder(), 0)
+    remove_dir_all(root).unwrap_or(())
+end tbc_switch_builds_in_a_child
+
+@test("tbc: a suite run with --jobs 2 links its codegen units two at a time")
+tbc_jobs_bound_the_link()
+    if !tbc_ready() then return
+
+    val root = tbc_mixed()
+    val objects = make_temp_dir("sysl-tbc-cobj").unwrap()
+    val k = cstring("SYSL_CODEGEN_UNITS")
+    val v = cstring("6")
+
+    // Objects of the case's own, so no unit is taken from a cache rather than compiled.
+    use_c_object_cache_dir(Some(objects))
+    tbc_c_setenv(k.ptr, v.ptr, 1)
+
+    val got = tbc_in_process([root, "--jobs", "2", "--filter", "adds"])
+
+    tbc_c_unsetenv(k.ptr)
+    use_c_object_cache_dir(None)
+
+    assert_eq(got.code, Fine)
+    assert_eq(unit_jobs_limit(), 2)
+    assert_eq(most_units_at_once(), 2)
+    remove_dir_all(root).unwrap_or(())
+    remove_dir_all(objects).unwrap_or(())
+end tbc_jobs_bound_the_link
+
+// --- the command line against the same run in process ----------------------------------------------
+
+@test("tbc: the command line answers a passing and failing suite as a run in process does")
+tbc_same_for_a_failing_test()
+    if !tbc_ready() then return
+
+    val root = tbc_mixed()
+
+    tbc_same(root, [root, "--jobs", "2"], Failed)
+end tbc_same_for_a_failing_test
+
+@test("tbc: and a filtered run, with --fail-fast")
+tbc_same_for_a_filter()
+    if !tbc_ready() then return
+
+    val root = tbc_mixed()
+
+    tbc_same(root, [root, "--filter", "adds", "--fail-fast"], Fine)
+end tbc_same_for_a_filter
+
+@test("tbc: and a filter that matches nothing")
+tbc_same_for_no_match()
+    if !tbc_ready() then return
+
+    val root = tbc_mixed()
+
+    tbc_same(root, [root, "--filter", "no such test"], Fine)
+end tbc_same_for_no_match
+
+@test("tbc: and a build error, said the same way with the same status")
+tbc_same_for_a_build_error()
+    if !tbc_ready() then return
+
+    val root = tbc_broken()
+
+    tbc_same(root, [root], Failed)
+end tbc_same_for_a_build_error
+
+@test("tbc: and a package's refused programs, compiled in the child and reported by the runner")
+tbc_same_for_refused_programs()
+    if !tbc_ready() then return
+
+    val root = tbc_refusing()
+
+    tbc_same(root, [root, "--jobs", "2"], Failed)
+end tbc_same_for_refused_programs
+
+@test("tbc: and refused programs alone, with no test binary to link")
+tbc_same_for_refused_alone()
+    if !tbc_ready() then return
+
+    val root = tbc_only_refused()
+
+    tbc_same(root, [root], Fine)
+end tbc_same_for_refused_alone
+
+@test("tbc: and a workspace, each member built in a child of its own")
+tbc_same_for_a_workspace()
+    if !tbc_ready() then return
+
+    val root = tbc_workspace()
+
+    tbc_same(root, [root, "--jobs", "2"], Failed)
+end tbc_same_for_a_workspace
+
+@test("tbc: and a mistake in the command line, which no child is started for")
+tbc_same_for_a_misuse()
+    if !tbc_ready() then return
+
+    val root = tbc_mixed()
+
+    tbc_same(root, [root, "--jobs", "0"], Misused)
+end tbc_same_for_a_misuse
