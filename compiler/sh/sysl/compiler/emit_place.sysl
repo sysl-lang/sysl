@@ -353,6 +353,66 @@ run_addr(e: *Emit, receiver: TExpr, index: TExpr, lanes: int, site: Span) -> Val
     r
 end run_addr
 
+// `xs.gather(idx)`: one element per lane, each read where its lane of `idx` says. **Each position is
+// checked as a subscript is** -- a negative one, one wider than an address, one past the end -- and a
+// failure names that position, so `xs.gather(idx)` traps exactly where the lane-by-lane longhand
+// `xs[idx[k]]` would. `checked` is false inside `@unchecked`, where each read is the address alone.
+//
+// The reads are scalar loads into a register. No processor sysl compiles for by default has a gather
+// instruction (AVX2's and SVE's are extensions), and the loads are what such a machine would need
+// anyway; the SLP vectoriser is free to merge them where the target has one.
+gen_gather(e: *Emit, receiver: TExpr, idx: TExpr, vec_ty: Type, checked: bool, site: Span) -> Val
+    val parts = texpr_type(receiver) match
+        Array(n, elem) -> (address(e, receiver), VInt(from_int(long(n))), *elem)
+        Slice(elem, _) ->
+            val v = view_parts(e, receiver, *elem)
+
+            (v.0, v.1.unwrap_or(VZero), v.2)
+        other ->
+            gap_here(e, s"a gather from ${type_show(other)}")
+            (VUndef, VZero, int_type())
+
+    val it = texpr_type(idx)
+    val ivt = lty(e, it)
+    val vt = lty(e, vec_ty)
+    val ety = lty(e, parts.2)
+    val iv = gen_expr(e, idx)
+
+    val lane = element(repr(it)).map(t -> underlying(t)).unwrap_or(Unknown)
+    val (bits, signed) = lane match
+        Integer(b, s, _) -> (b, s)
+        _ -> (e.word_bits, false)
+
+    val n = repr(vec_ty) match
+        Vector(k, _) -> k
+        _ -> 0
+
+    var out = VPoison
+
+    for k in 0..<n
+        val raw = fresh_reg(e)
+
+        emit(e, InExtractElement(raw, ivt, iv, ir_arg(l_i32(), VInt(from_int(long(k))))))
+
+        val i = if checked then widen_index_val(e, raw, bits, signed, site, BoundsTooWide)
+                else convert_int(e, bits, signed, e.word_bits, raw)
+
+        if checked then bounds_check(e, i, parts.1, signed, site)
+
+        val p = element_gep(e, parts.2, parts.0, i, checked)
+        val x = fresh_reg(e)
+
+        emit(e, InLoad(x, ety, p, AccPlain, None))
+
+        val next = fresh_reg(e)
+
+        emit(e, InInsertElement(next, vt, out, ety, x, ir_arg(l_i32(), VInt(from_int(long(k))))))
+        out = next
+    end for
+
+    out
+end gen_gather
+
 // A view's pointer and its length, lifted out of the three words it is.
 private view_parts(e: *Emit, receiver: TExpr, elem: Type) -> (Val, Option[Val], Type)
     val wty = lty(e, texpr_type(receiver))

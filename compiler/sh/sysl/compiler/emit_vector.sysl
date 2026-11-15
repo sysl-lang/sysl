@@ -363,7 +363,13 @@ private vector_lanes(t: Type) -> int = repr(t) match
 // `maximum` or `minimum`. The suffix is the vector's type, so the machine's own instruction is
 // selected -- there is no loop over the lanes. `llvm.abs` is told the most negative lane is *not*
 // poison, so it answers itself, which is what the scalar `abs` answers in every build.
-gen_vec_op(e: *Emit, op: string, operands: Buf[TExpr], ty: Type) -> Val
+gen_vec_op(e: *Emit, op: string, operands: Buf[TExpr], ty: Type, site: Span) -> Val
+    if op == "bits" then return gen_mask_bits(e, operands[0], ty)
+    if op == "lookup" then return gen_lookup(e, operands[0], operands[1], ty)
+    if op == "compress" then return gen_compress(e, operands[0], operands[1], ty)
+    if op == "gather" || op == "gather_unchecked" then
+        return gen_gather(e, operands[0], operands[1], ty, op == "gather", site)
+
     val lt = lty(e, ty)
     val fn = if op == "fma" then llvm_fma_entry().at([lt])
              else if op == "fabs" then llvm_fabs_entry().at([lt])
@@ -390,3 +396,172 @@ gen_vec_op(e: *Emit, op: string, operands: Buf[TExpr], ty: Type) -> Val
     emit(e, ir_call(Some(r), lt, VGlobal(fn), args))
     r
 end gen_vec_op
+
+// The integer width of a lane, or 0 where it is not an integer.
+private lane_int_bits(t: Type) -> int = element(repr(t)) match
+    Some(x) -> underlying(x) match
+        Integer(bits, _, _) -> bits
+        Fixed(bits, _, _) -> bits
+        _ -> 0
+    None -> 0
+
+private lane_index(k: int) -> IrArg = ir_arg(l_i32(), VInt(from_int(long(k))))
+
+// `m.bits()`: a mask is `<N x i1>`, and **its bitcast to `iN` is the whole operation** -- the
+// back end selects `pmovmskb` on x86 and the narrow-and-add idiom on AArch64 for it. LLVM numbers a
+// vector's elements from the low end of the integer on a little-endian machine and from the high end
+// on a big-endian one, so there the bits are reversed, which keeps lane `i` at bit `i` on every target.
+gen_mask_bits(e: *Emit, mask: TExpr, ty: Type) -> Val
+    val m = gen_expr(e, mask)
+    val it = lty(e, ty)
+    val r = fresh_reg(e)
+
+    emit(e, InCast(r, CastBitCast, lty(e, texpr_type(mask)), m, it))
+
+    if e.target.little_endian() then return r
+
+    val fn = llvm_bits_entry("bitreverse").unwrap().at([it])
+    var params: Buf[IrParam] = buf()
+    var args: Buf[IrArg] = buf()
+
+    params.push(ir_param(it))
+    args.push(ir_arg(it, r))
+    request_intrinsic(e, ir_sig(fn, ir_fn_type(it, params)))
+
+    val turned = fresh_reg(e)
+
+    emit(e, ir_call(Some(turned), it, VGlobal(fn), args))
+    turned
+end gen_mask_bits
+
+// `table.lookup(idx)`: lane `k` of the answer is lane `idx[k]` of the table, or zero where `idx[k]`
+// is past the table's end.
+//
+// **Sixteen byte lanes on AArch64 are one `tbl`**, whose own answer out of range is zero, so nothing
+// is added around it. **Everywhere else it is the shape back ends recognise as a variable permute**:
+// the positions are clamped once over the register, each lane is an `extractelement` at a position
+// read out of that one vector, and one `select` zeroes the lanes that were out of range. x86 turns
+// that shape into `pshufb` wherever the processor has SSSE3; a machine with no such instruction gets
+// the lane moves it would have needed anyway.
+gen_lookup(e: *Emit, table: TExpr, idx: TExpr, ty: Type) -> Val
+    val tt = texpr_type(table)
+    val it = texpr_type(idx)
+    val n = vector_lanes(tt)
+    val m = vector_lanes(it)
+    val ib = lane_int_bits(it)
+    val tv = gen_expr(e, table)
+    val iv = gen_expr(e, idx)
+    val rt = lty(e, ty)
+
+    if e.target.cpu == Aarch64 && n == 16 && (m == 16 || m == 8) && ib == 8 && lane_int_bits(tt) == 8
+        val fn = llvm_aarch64_tbl1_entry().at([rt])
+        var params: Buf[IrParam] = buf()
+        var args: Buf[IrArg] = buf()
+
+        params.push(ir_param(lty(e, tt)))
+        params.push(ir_param(lty(e, it)))
+        args.push(ir_arg(lty(e, tt), tv))
+        args.push(ir_arg(lty(e, it), iv))
+        request_intrinsic(e, ir_sig(fn, ir_fn_type(rt, params)))
+
+        val r = fresh_reg(e)
+
+        emit(e, ir_call(Some(r), rt, VGlobal(fn), args))
+        return r
+    end if
+
+    val ivt = lty(e, it)
+    val tvt = lty(e, tt)
+    val ety = lty(e, element(repr(ty)).unwrap_or(Unknown))
+
+    // Only a position type that can name a lane past the end needs the test: a `<4>u1` index into a
+    // table of four has none.
+    val can_miss = ib >= 31 || (1 << ib) > n
+    var at = iv
+    var inside = VNothing
+
+    if can_miss
+        val ok = fresh_reg(e)
+
+        emit(e, InIntCmp(ok, IUlt, ivt, iv, VSplat(m, LInt(ib), VInt(from_int(long(n))))))
+
+        val clamped = fresh_reg(e)
+
+        emit(e, InSelect(clamped, ok, ivt, iv, VZero, LVec(m, l_i1())))
+        at = clamped
+        inside = ok
+    end if
+
+    var out = VZero
+
+    for k in 0..<m
+        val pos = fresh_reg(e)
+
+        emit(e, InExtractElement(pos, ivt, at, lane_index(k)))
+
+        val x = fresh_reg(e)
+
+        emit(e, InExtractElement(x, tvt, tv, ir_arg(LInt(ib), pos)))
+
+        val next = fresh_reg(e)
+
+        emit(e, InInsertElement(next, rt, out, ety, x, lane_index(k)))
+        out = next
+    end for
+
+    if !can_miss then return out
+
+    val r = fresh_reg(e)
+
+    emit(e, InSelect(r, inside, rt, out, VZero, LVec(m, l_i1())))
+    r
+end gen_lookup
+
+// `v.compress(m)`: the kept lanes written one after another from lane 0 into a register of zeros.
+// No machine sysl targets by default has the instruction (AVX-512's `vpcompress` and SVE's `compact`
+// are extensions), so it is a lane move per lane with no branch: each lane is inserted at the count
+// kept so far and the insertion kept only where the mask's lane is true. The position never passes
+// the lane being placed, so it is always a lane the register has.
+gen_compress(e: *Emit, value: TExpr, mask: TExpr, ty: Type) -> Val
+    val vt = lty(e, ty)
+    val mt = lty(e, texpr_type(mask))
+    val ety = lty(e, element(repr(ty)).unwrap_or(Unknown))
+    val n = vector_lanes(ty)
+    val v = gen_expr(e, value)
+    val m = gen_expr(e, mask)
+
+    var out = VZero
+    var pos = VInt(from_int(0))
+
+    for k in 0..<n
+        val x = fresh_reg(e)
+
+        emit(e, InExtractElement(x, vt, v, lane_index(k)))
+
+        val keep = fresh_reg(e)
+
+        emit(e, InExtractElement(keep, mt, m, lane_index(k)))
+
+        val put = fresh_reg(e)
+
+        emit(e, InInsertElement(put, vt, out, ety, x, ir_arg(l_i32(), pos)))
+
+        val chosen = fresh_reg(e)
+
+        emit(e, InSelect(chosen, keep, vt, put, out, l_i1()))
+        out = chosen
+
+        if k + 1 < n
+            val step = fresh_reg(e)
+
+            emit(e, InCast(step, CastZExt, l_i1(), keep, l_i32()))
+
+            val moved = fresh_reg(e)
+
+            emit(e, InBin(moved, OpAdd, l_i32(), pos, step))
+            pos = moved
+        end if
+    end for
+
+    out
+end gen_compress
