@@ -140,9 +140,9 @@ print(a[..] < b[..], b[..] < a[..])
 false true
 ```
 
-**A slice still has no `Hash`, and that is a decision rather than a gap.** A hash is a promise about
-a key and a view's storage stays writable by whoever owns it, so a slice used as a key can change
-under the table. An array copies, so it hashes; [`core`](/library/core/#hashing) has the reasoning.
+**A slice hashes by its contents**, the length first, agreeing with `==`. A view's storage stays
+writable by whoever owns it, so key a table on something that owns its elements, or leave the
+storage alone while it is a key; [`core`](/library/core/#hashing) has the reasoning.
 
 What `equal` still has is its **signature and its module**: it takes `[]const T` and it lives here,
 under `@no_alloc`, reachable from a freestanding target — so a caller holding two slices and wanting

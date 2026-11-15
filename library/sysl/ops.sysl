@@ -469,26 +469,33 @@ impl[const N: usize, T: PartialOrd] PartialOrd for [N]T
 impl[const N: usize, T: Ord] Ord for [N]T
 
 /** Mixed with the same FNV prime the tuple's hash uses, so that position matters: `[1, 2]` and
- * `[2, 1]` are different keys, where a plain XOR would make them one.
+ * `[2, 1]` are different keys, where a plain XOR would make them one. **The length is mixed in
+ * as well**, so `[1], [2]` and `[1, 2]` are different keys, and the empty sequence differs from a
+ * run of zeros.
  *
- * **An array is hashable and a SLICE IS NOT, which is a decision rather than an omission.** A hash
- * is a promise about a key, and a slice is a view: putting one in a table leaves the storage behind
- * it reachable and writable by whoever owns it, so the key can change under the table and the entry
- * is then unfindable. An array is a value and copies, so it has no such owner to be surprised by.
- * A caller holding a slice it means as a key hashes something it owns -- a `string`, or an array
- * built from the elements.
+ * It agrees with `Eq for []T`: equal contents give equal hashes. A `Buf` and a `Frozen` hash as
+ * their `view()` does, so wherever one compares equal to another's contents it hashes alike.
+ *
+ * **A slice hashes the elements it views right now.** A slice is a view, and a key whose storage
+ * its owner can still write can change under a table and leave its entry unfindable. Key on a `Buf`
+ * or an array, which own their elements, or leave the storage alone while it is a key.
+ * `[]T` and `[]const T` are one membership.
  */
+impl[T: Hash] Hash for []T
+    hash(self) -> u64 = hash_run(self)
+
+/** The fold the slice, the array, the `Buf` and the `Frozen` share. */
+hash_run[T: Hash](xs: []const T) -> u64
+    var h = hash_u64(u64(xs.len))
+
+    for i in 0..<xs.len
+        h = h *% 0x100000001b3u64 ^ xs[i].hash()
+
+    hash_u64(h)
+
+/** Every array of a hashable element, delegating to the slice as `Eq` does. */
 impl[const N: usize, T: Hash] Hash for [N]T
-    hash(self) -> u64
-        val xs = self[..]
-
-        var h = 0xcbf29ce484222325u64
-
-        for i in 0..<xs.len
-            h = h *% 0x100000001b3u64 ^ xs[i].hash()
-
-        hash_u64(h)
-    end hash
+    hash(self) -> u64 = hash_run(self[..])
 
 /** The elements between brackets, written straight through to wherever they are going. Each element
  * gets a plain specifier, because the field a specifier describes is the whole slice and not its

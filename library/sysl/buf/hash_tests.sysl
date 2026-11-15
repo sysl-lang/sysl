@@ -1,0 +1,142 @@
+module sysl.buf
+@tests
+
+// Hash for slices, `Buf`, `Option` and `Frozen`: equal contents hash alike, the length is part of
+// the key, and `derives Hash` and `Map` keys work over them.
+
+buf_of(xs: []const int) -> Buf[int]
+    var b: Buf[int] = buf()
+
+    for x in xs
+        b.push(x)
+
+    b
+
+struct Holder derives Eq, Hash
+    items: Buf[int]
+    tag: Option[int]
+
+enum Expr derives Eq, Hash
+    Num(n: int)
+    App(args: Buf[int])
+
+@test("equal slices hash alike, and a slice and a const slice are one membership")
+slice_hash_agrees()
+    val a: []const int = [1, 2, 3]
+    val b: []int = [1, 2, 3]
+
+    assert_eq(a.hash(), b.hash())
+    assert_eq(a.hash(), [1, 2, 3].hash())
+
+@test("slice order and length are part of the key")
+slice_hash_distinguishes()
+    val a: []const int = [1, 2]
+    val b: []const int = [2, 1]
+    val c: []const int = [1, 2, 0]
+    val e: []const int = []
+    val z: []const int = [0]
+
+    assert(a.hash() != b.hash())
+    assert(a.hash() != c.hash())
+    assert(e.hash() != z.hash())
+
+@test("two sequences end to end hash differently from the one they make")
+slice_hash_mixes_length()
+    val a: [][]const int = [[1], [2]]
+    val b: [][]const int = [[1, 2]]
+
+    assert(a.hash() != b.hash())
+
+@test("a Buf hashes as the view it compares equal to")
+buf_hash_agrees_with_view()
+    val b = buf_of([4, 5, 6])
+
+    assert_eq(b.hash(), b.view().hash())
+    assert_eq(b.hash(), buf_of([4, 5, 6]).hash())
+    assert(b.hash() != buf_of([4, 5]).hash())
+
+@test("a Buf's hash ignores capacity")
+buf_hash_ignores_capacity()
+    var a = buf_of([1, 2, 3, 4, 5, 6, 7, 8, 9])
+    a.set_len(3)
+
+    assert_eq(a.hash(), buf_of([1, 2, 3]).hash())
+
+@test("an empty Buf hashes like an empty slice")
+empty_buf_hash()
+    var b: Buf[int] = buf()
+    val e: []const int = []
+
+    assert_eq(b.hash(), e.hash())
+
+@test("Option: equal options hash alike, None differs from Some(0)")
+option_hash()
+    val a: Option[int] = Some(5)
+    val b: Option[int] = Some(5)
+    val n: Option[int] = None
+    val z: Option[int] = Some(0)
+
+    assert_eq(a.hash(), b.hash())
+    assert(a.hash() != n.hash())
+    assert(z.hash() != n.hash())
+    assert(a.hash() != Some(6).hash())
+
+@test("a nested Option of a Buf hashes")
+option_of_buf_hash()
+    val a: Option[Buf[int]] = Some(buf_of([1, 2]))
+    val b: Option[Buf[int]] = Some(buf_of([1, 2]))
+
+    assert_eq(a.hash(), b.hash())
+    assert(a == b)
+
+@test("a Buf of Bufs hashes by the contents of each")
+buf_of_buf_hash()
+    var a: Buf[Buf[int]] = buf()
+    a.push(buf_of([1]))
+    a.push(buf_of([2]))
+
+    var b: Buf[Buf[int]] = buf()
+    b.push(buf_of([1, 2]))
+
+    assert(a.hash() != b.hash())
+
+@test("Frozen is Eq and Hash by its elements")
+frozen_eq_hash()
+    val f = buf_of([1, 2, 3]).freeze()
+    val g = buf_of([1, 2, 3]).freeze()
+    val h = buf_of([1, 2]).freeze()
+
+    assert(f == g)
+    assert(f != h)
+    assert_eq(f.hash(), g.hash())
+    assert_eq(f.hash(), f.view().hash())
+    assert(f.hash() != h.hash())
+
+@test("an empty Frozen is equal to another and hashes like an empty slice")
+frozen_empty()
+    val f = buf_of([]).freeze()
+    val g = buf_of([]).freeze()
+    val e: []const int = []
+
+    assert(f == g)
+    assert_eq(f.hash(), e.hash())
+
+@test("a struct holding a Buf and an Option derives Hash")
+struct_derives_hash()
+    val a = Holder(buf_of([1, 2]), Some(3))
+    val b = Holder(buf_of([1, 2]), Some(3))
+    val c = Holder(buf_of([1, 2]), None)
+
+    assert(a == b)
+    assert_eq(a.hash(), b.hash())
+    assert(a.hash() != c.hash())
+
+@test("an enum whose variant holds a Buf derives Hash")
+enum_derives_hash()
+    val a = Expr.App(buf_of([1, 2]))
+    val b = Expr.App(buf_of([1, 2]))
+
+    assert(a == b)
+    assert_eq(a.hash(), b.hash())
+    assert(a.hash() != Expr.Num(1).hash())
+
