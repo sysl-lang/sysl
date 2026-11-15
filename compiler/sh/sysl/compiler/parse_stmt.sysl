@@ -861,8 +861,15 @@ parse_asm(p: *Parser, start: Span) -> Stmt
     loop
         if p.at(Dedent) || p.at(Eof) then break
 
+        val before = p.mark()
+
         arms.push(parse_asm_arm(p))
         p.skip_newlines()
+
+        // A line that is no arm -- an operand written at the arms' own depth -- leaves the cursor
+        // where it was, and the loop would ask for a '[' of the same token for ever. One token is
+        // dropped, as in an arm's own block below.
+        if p.mark() == before then p.bump()
 
     if !p.accept(Dedent) then p.want("dedent")
 
@@ -906,19 +913,24 @@ private parse_asm_body(p: *Parser) -> AsmBody
             None -> "")
     end if
 
-    p.peek() match
-        StrLit(v) ->
-            p.bump()
-
-            var one: Buf[string] = buf()
-
-            one.push(v)
-            return AsmCode(one, buf(), buf())
-        _ -> ()
-
     var lines: Buf[string] = buf()
     var operands: Buf[AsmOperand] = buf()
     var clobbers: Buf[string] = buf()
+
+    p.peek() match
+        StrLit(v) ->
+            val at = p.here()
+
+            p.bump()
+            lines.push(v)
+
+            if !p.block_ahead() then return AsmCode(lines, operands, clobbers)
+
+            // The block is still read, as though the instruction opened it, so what it declares is
+            // checked rather than lost to a cascade about the lines that follow.
+            p.fault(at, "an arm whose instruction is written beside its brackets has no block " +
+                    "under it. Move the instruction into the block, above its operands")
+        _ -> ()
 
     if !p.block_ahead() then return AsmCode(lines, operands, clobbers)
 
