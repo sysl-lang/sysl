@@ -304,6 +304,24 @@ private[buf] struct BufCore[T]
         gone
     end remove
 
+    /** The element at `i`, taken out in constant time by moving the last element into its place.
+     * Order is not kept -- that is the price of not shifting everything after the hole. Removing the
+     * last element moves nothing. The slot the last element came from is let go of by `truncate`, so
+     * the buffer holds exactly one count of every element it still has.
+     */
+    @track_caller
+    swap_remove(*self, i: usize) -> T
+        if i >= self.count then index_past(i, self.count)
+
+        val gone = self.elems[i]
+        val last = self.count - 1
+
+        if i != last then self.elems[i] = self.elems[last]
+
+        self.truncate(last)
+        gone
+    end swap_remove
+
     /** Room for at least `more` elements past the count, grown once now -- geometrically, as a push
      * grows it -- where there is not that much already.
      */
@@ -461,6 +479,16 @@ struct Buf[T]
     const remove(self, i: usize) -> T
         if is_null(self.core) then index_past(i, 0)
         self.core.remove(i)
+
+    /** The element at `i`, taken out by moving the last element into its place: constant time where
+     * `remove` shifts everything after `i`, and the order of the rest is not kept. `i` at or past
+     * `len()` traps, as `remove` does.
+     */
+    @relocates
+    @track_caller
+    const swap_remove(self, i: usize) -> T
+        if is_null(self.core) then index_past(i, 0)
+        self.core.swap_remove(i)
 
     /** A second buffer holding the same elements, sized to them -- the one way to get a buffer that
      * is not this one, every other way of handing a `Buf` on handing on this one.
@@ -717,6 +745,41 @@ const buf_filled[T](n: usize, value: T) -> Buf[T]
 
     out
 end buf_filled
+
+/** Storage for `n` elements whose first element is on an `alignment`-byte boundary, every byte zero --
+ * what a SIMD loop or a cache-line-sized block wants of a buffer whose length is known only while
+ * running. A `[0; n]` slice promises the allocator's boundary and no more (sixteen bytes on a 64-bit
+ * host), and a type's `@align` fixes the boundary at compile time; this is the runtime-sized form.
+ *
+ * **It is an ordinary `[]T`**: the slice is a view into storage `alignment` elements longer than
+ * asked for, and it keeps that storage alive, so the whole block goes back when the last view of it
+ * is gone -- nothing is freed by hand. Elements are `AnyBits` because zero bytes must be a value.
+ * `n` of zero answers an empty slice.
+ *
+ * **`alignment` must be a power of two**, and the element size must be able to reach it: a type of 12
+ * bytes has no element boundary at 64 from an address that is only 4-aligned, so the call traps
+ * rather than answering a slice off its boundary. Sizes that are a power of two always reach it.
+ */
+aligned[T: AnyBits](n: usize, alignment: usize) -> []T
+    if alignment == 0 || alignment & (alignment - 1) != 0 then bad_alignment(alignment)
+    if n == 0 then return []
+
+    val room = alignment
+    val raw: []T = slot_storage(n + room)
+    val bytes: *u8 = ptr_cast(&raw[0])
+
+    for i in 0..<(n + room) * sizeof(T) do bytes[i] = 0
+
+    for j in 0..<room
+        if usize(&raw[j]) % alignment == 0 then return raw[j..<j + n]
+
+    bad_alignment(alignment)
+end aligned
+
+private bad_alignment(alignment: usize) -> never
+    print("panic: no aligned start of", alignment, "bytes for this element size, or not a power of two")
+    exit(1)
+end bad_alignment
 
 /** A writer that gathers, and the reason it is supplied rather than left to each program is the rule
  * that a specifier describes the field the *whole* value occupies (`library/core.md § A specifier
