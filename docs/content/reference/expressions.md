@@ -2519,7 +2519,10 @@ element of a captured array, and the first link of a chain such as `c.a().bump()
 the same two questions. A `(self)` or `&self` call only reads, and a `*self` call on a captured `&T`
 or `*T` reaches the shared storage. So does one on a captured **handle** — a struct whose every field
 is a `&T`, as a `Buf`, a `Map` and a `Deque` are — since a copy of it names the same storage:
-`b.view_mut()` in a kept closure is a view of the buffer both sides hold.
+`b.view_mut()` in a kept closure is a view of the buffer both sides hold. That holds for a method that
+writes only through those references. One that re-points the handle — assigns a field of `self`
+(`self.r = other`) or the whole of it (`*self = h`), or calls a `*self` method of its own that does —
+writes the copy, as a method on any other struct does.
 
 ```sysl
 struct Counter
@@ -2622,7 +2625,9 @@ print(out)
 writable view of it (`val v = out[0..<2]`), a view of such a view, a `ref` naming it, and any of
 those bound again. Writing through the local (`*p = 3`, `v[0] = 7`) is a write of the copy, and
 handing the local to a call (`bump(p)`, `fill(v)`) hands out the copy's address or a view of it, each
-asked the same two questions as the capture itself:
+asked the same two questions as the capture itself. So is a write through the local from a closure
+written inside this one (`run(() -> *p = 1)`), however deep and however that closure holds `p`, since
+what it holds still points at this closure's copy:
 
 ```sysl
 bump(p: *int) = *p += 1
