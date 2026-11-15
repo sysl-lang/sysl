@@ -1314,7 +1314,9 @@ way to get atomicity from a filesystem.
 else**. It is what a sandbox is built on: a script given one directory reads and writes through it,
 and no symbolic link and no `..` leads it out. Its calls are the module's own, with the path relative
 to the directory — `open`, `create`, `append`, `open_update`, `create_update`, `link_metadata`,
-`exists` and `remove_file`:
+`exists` and `remove_file`, and the whole-file `read_bytes`, `read_text`, `write_bytes` and
+`write_text`, which answer exactly what the module-level functions of those names answer (a failed
+write carries the OS's reason) and refuse a `..`, an absolute path or a link exactly as `open` does:
 
 ```sysl
 import sysl.fs.{open_dir, make_dir_all, remove_dir_all, write_text, read_text}
@@ -1334,6 +1336,10 @@ f.close().unwrap()
 print(read_text(dir + "/granted/notes/today").unwrap())
 print(granted.link_metadata("notes/today").unwrap().size, granted.exists("notes/today"))
 
+granted.write_text("notes/plain", "whole file")
+
+print(granted.read_text("notes/plain").unwrap())
+
 granted.remove_file("notes/today").unwrap()
 
 print(granted.exists("notes/today"))
@@ -1344,6 +1350,7 @@ remove_dir_all(dir).unwrap()
 ```output
 written beneath
 15 true
+whole file
 false
 ```
 
