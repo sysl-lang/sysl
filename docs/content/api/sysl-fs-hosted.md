@@ -9,7 +9,7 @@ requires: "requires { libc }, requires { os }"
 
 ## Index
 
-[`supply_access`](#supply_access) [`supply_chdir`](#supply_chdir) [`supply_chmod`](#supply_chmod) [`supply_chown`](#supply_chown) [`supply_close`](#supply_close) [`supply_closedir`](#supply_closedir) [`supply_fstat`](#supply_fstat) [`supply_ftruncate`](#supply_ftruncate) [`supply_getcwd`](#supply_getcwd) [`supply_link`](#supply_link) [`supply_map`](#supply_map) [`supply_mkdir`](#supply_mkdir) [`supply_open`](#supply_open) [`supply_opendir`](#supply_opendir) [`supply_pread`](#supply_pread) [`supply_pwrite`](#supply_pwrite) [`supply_read`](#supply_read) [`supply_readdir`](#supply_readdir) [`supply_readlink`](#supply_readlink) [`supply_realpath`](#supply_realpath) [`supply_rename`](#supply_rename) [`supply_rmdir`](#supply_rmdir) [`supply_seek`](#supply_seek) [`supply_set_modified`](#supply_set_modified) [`supply_stat`](#supply_stat) [`supply_symlink`](#supply_symlink) [`supply_sync`](#supply_sync) [`supply_temp_dir`](#supply_temp_dir) [`supply_truncate`](#supply_truncate) [`supply_unlink`](#supply_unlink) [`supply_unmap`](#supply_unmap) [`supply_write`](#supply_write)
+[`supply_access`](#supply_access) [`supply_chdir`](#supply_chdir) [`supply_chmod`](#supply_chmod) [`supply_chown`](#supply_chown) [`supply_close`](#supply_close) [`supply_closedir`](#supply_closedir) [`supply_dir_open`](#supply_dir_open) [`supply_fstat`](#supply_fstat) [`supply_ftruncate`](#supply_ftruncate) [`supply_getcwd`](#supply_getcwd) [`supply_link`](#supply_link) [`supply_map`](#supply_map) [`supply_mkdir`](#supply_mkdir) [`supply_open`](#supply_open) [`supply_open_beneath`](#supply_open_beneath) [`supply_opendir`](#supply_opendir) [`supply_pread`](#supply_pread) [`supply_pwrite`](#supply_pwrite) [`supply_read`](#supply_read) [`supply_readdir`](#supply_readdir) [`supply_readlink`](#supply_readlink) [`supply_realpath`](#supply_realpath) [`supply_rename`](#supply_rename) [`supply_rmdir`](#supply_rmdir) [`supply_seek`](#supply_seek) [`supply_set_modified`](#supply_set_modified) [`supply_stat`](#supply_stat) [`supply_stat_beneath`](#supply_stat_beneath) [`supply_symlink`](#supply_symlink) [`supply_sync`](#supply_sync) [`supply_temp_dir`](#supply_temp_dir) [`supply_truncate`](#supply_truncate) [`supply_unlink`](#supply_unlink) [`supply_unlink_beneath`](#supply_unlink_beneath) [`supply_unmap`](#supply_unmap) [`supply_write`](#supply_write)
 
 ## Functions
 
@@ -47,6 +47,12 @@ supply_close(fd: int) -> int
 
 ```sysl
 supply_closedir(dir: usize) -> int
+```
+
+### `supply_dir_open`
+
+```sysl
+supply_dir_open(path: *u8, len: usize, fd: *int) -> int
 ```
 
 ### `supply_fstat`
@@ -89,6 +95,12 @@ supply_mkdir(path: *u8, len: usize, mode: u32) -> int
 
 ```sysl
 supply_open(path: *u8, len: usize, flags: u32, mode: u32, fd: *int) -> int
+```
+
+### `supply_open_beneath`
+
+```sysl
+supply_open_beneath(dir: int, path: *u8, len: usize, flags: u32, mode: u32, fd: *int) -> int
 ```
 
 ### `supply_opendir`
@@ -163,6 +175,12 @@ supply_set_modified(path: *u8, len: usize, micros: long) -> int
 supply_stat(path: *u8, len: usize, follow: int, out: *Stat) -> int
 ```
 
+### `supply_stat_beneath`
+
+```sysl
+supply_stat_beneath(dir: int, path: *u8, len: usize, out: *Stat) -> int
+```
+
 ### `supply_symlink`
 
 ```sysl
@@ -191,6 +209,12 @@ supply_truncate(path: *u8, len: usize, length: long) -> int
 
 ```sysl
 supply_unlink(path: *u8, len: usize) -> int
+```
+
+### `supply_unlink_beneath`
+
+```sysl
+supply_unlink_beneath(dir: int, path: *u8, len: usize) -> int
 ```
 
 ### `supply_unmap`
