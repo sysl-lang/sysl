@@ -758,6 +758,10 @@ own, and stays open after the directory is gone.
 | `append` | `append(self, path: string) -> Result[File, IoError]` |  |
 | `open_update` | `open_update(self, path: string) -> Result[File, IoError]` |  |
 | `create_update` | `create_update(self, path: string) -> Result[File, IoError]` |  |
+| `read_bytes` | `read_bytes(self, path: string) -> Result[[]u8, IoError]` | The whole-file functions, as `sysl.fs.read_bytes`, `read_text`, `write_bytes` and `write_text` do them and with the same errors (the OS's reason for a failed write included), with `path` beneath this directory and refused exactly as `open` and `create` refuse it. |
+| `read_text` | `read_text(self, path: string) -> Result[string, IoError]` |  |
+| `write_bytes` | `write_bytes(self, path: string, bytes: []const u8) -> Result[unit, IoError]` |  |
+| `write_text` | `write_text(self, path: string, text: string) -> Result[unit, IoError]` |  |
 | `link_metadata` | `link_metadata(self, path: string) -> Result[Meta, IoError]` | What is at `path`, described as `sysl.fs.link_metadata` describes it: a link as the last component is reported as a link (`is_link()`), never followed. |
 | `exists` | `exists(self, path: string) -> bool` | Whether anything is at `path`, a link included. |
 | `remove_file` | `remove_file(self, path: string) -> Result[unit, IoError]` | Removes the file at `path`. |

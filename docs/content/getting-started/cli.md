@@ -310,8 +310,15 @@ can request it on the command line: `--lto thin` (or `full`) makes the archive L
 compiled as `sysl build` compiles its own objects in that mode, so the host's link optimizes across
 the boundary. `build-c` then notes on stderr that the archive must be linked with `-fuse-ld=lld`.
 
+The archive is always a static one, so `-o` may not give it a shared library's name: `-o
+libmylib.dylib` (or `.so`, `.so.1`, `.dll`) is refused unless `--shared` is given, and the refusal names the `.a` to use
+instead. Without `-o` the archive is named for the project, with `.a`.
+
 The header is written beside the archive, with `.h` appended, unless `--header` names another path.
-Both paths are reported on stderr, together with the libraries the C project's link line still
+Its include guard is `SYSL_<NAME>_H` for a project whose manifest names it. A project without one is
+named for where it is — its directory's own name, resolved even when it was given as `.`, or a bare
+file's stem — with eight hex digits of its canonical path's fingerprint after the name
+(`SYSL_LIB_3F09A1C2_H`), so two such headers included in one C file never hide each other. Both paths are reported on stderr, together with the libraries the C project's link line still
 needs: what `@link` named, and the `pkg_config` modules the packages in the build require, given as
 the `pkg-config --libs …` command that produces their flags. A missing library shows up on the C
 side as an unresolved sysl symbol, which looks like a missing definition rather than a missing
@@ -545,6 +552,12 @@ own, with a temporary directory or a port the system picks, or be listed in its 
 [`test.alone`](/reference/packages/#how-a-package-s-suite-is-run), which runs it with nothing else
 alongside. The manifest's `test` block can also set the run's `jobs` and `timeout`, and the flags
 override it.
+
+**The same count bounds the build.** A large tree's link compiles its code in several pieces at once,
+and `--jobs <n>` keeps at most `n` of those compiles running too. The suite is compiled by a second
+`sysl` process, which exits before the first test starts. A long run therefore holds only what its
+tests need, not what the compile needed. Its notes and errors appear exactly as they would from one
+process.
 
 **`--features <list>` and `--option <name=value>`** choose what the package's own suite is built
 with. The `test` block's `features` and `options` are the defaults, `--features` replaces the block's

@@ -1,0 +1,704 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+import sysl.fs.{make_dir_all, make_temp_dir, read_text, remove_dir_all, write_text}
+import sysl.math.bigint.from_int
+import sysl.process.{capture, Var}
+import sysl.text.{cstring, parse_int, Search, split}
+
+// A stack slot's life bounded by the region of the body that made it (`emit_lifetime.sysl`). Every
+// slot is hoisted to the entry block, and with no `llvm.lifetime` markers LLVM kept every one apart:
+// a function whose twenty arms each held a large `Result` had a frame twenty results wide, and a
+// recursion through it overflowed an 8 MB stack at a twentieth of the depth one arm reached.
+//
+// Three kinds of claim. The pass on blocks built by hand, one rule at a time -- what keeps an
+// address in the frame, what a region's one way in is, where an end goes and where none may, the
+// functions left alone. The shapes it was written for, built and run: the recursion at a depth that
+// overflowed, its frame measured against one arm's, and a program crossing the axes a wrong end
+// would break (`?` leaving an arm, a `defer` on the way out, a loop's rounds with `break` and
+// `continue`, a nested `match`, a guard, an `if` inside a `for`) at -O0 and -O2 and under
+// AddressSanitizer with use-after-scope detection. And that a use past an end the pass laid is one
+// AddressSanitizer reports, so a wrong end could not go unseen.
+//
+// Skipped cells, and why: a slot whose address leaves the frame is never bounded, so a read of a
+// local through a raw pointer after its arm cannot be made to fault -- the pass's own test pins
+// that the marker is not laid; an `async` body and a call that returns twice are left whole, pinned
+// on blocks rather than built, since the function is untouched by construction.
+
+// -- the pass, on blocks built by hand ------------------------------------------------------------------
+
+private sll_slot(d: string) -> Inst = InAlloca(VReg(d), LArr(32, LInt(64)), None)
+
+private sll_store(slot: string) -> Inst = InStore(LInt(64), VInt(from_int(1)), VReg(slot), AccPlain, None)
+
+private sll_load(d: string, slot: string) -> Inst = InLoad(VReg(d), LInt(64), VReg(slot), AccPlain, None)
+
+private sll_call(name: string, v: Val, sret: bool) -> Inst
+    var args: Buf[IrArg] = buf()
+    var attrs: Buf[IrAttr] = buf()
+
+    if sret then attrs.push(AttrSRet(LArr(32, LInt(64))))
+
+    args.push(IrArg(LPtr, v, attrs))
+    ir_call(None, LVoid, VGlobal(name), args)
+end sll_call
+
+private sll_block(label: string, instrs: Buf[Inst], t: Inst) -> IrBlock = IrBlock(label, instrs, Some(t))
+
+private sll_none() -> Buf[Inst]
+    var out: Buf[Inst] = buf()
+
+    out
+end sll_none
+
+private sll_one(i: Inst) -> Buf[Inst]
+    var out: Buf[Inst] = buf()
+
+    out.push(i)
+    out
+end sll_one
+
+// The text of the blocks, one instruction a line.
+private sll_text(blocks: Buf[IrBlock]) -> string
+    var out = ""
+
+    for b in blocks
+        out = s"$out${b.label}:\n"
+
+        for i in b.instrs
+            out = s"$out  ${inst_render(i)}\n"
+
+        b.terminator match
+            Some(t) -> out = s"$out  ${inst_render(t)}\n"
+            None -> ()
+
+    out
+end sll_text
+
+private sll_run(blocks: Buf[IrBlock], regions: Buf[SlotRegion], made_in: Map[string, int]) -> string =
+    sll_text(place_slot_lives(blocks, regions, made_in).0)
+
+private sll_start(s: string) -> string = s"call void @llvm.lifetime.start.p0(i64 -1, ptr %$s)"
+
+private sll_end(s: string) -> string = s"call void @llvm.lifetime.end.p0(i64 -1, ptr %$s)"
+
+// entry -> arm -> done, the arm a region that made `s`, whatever `arm` does with it.
+private sll_arm(arm: Buf[Inst], made: int) -> string
+    var entry: Buf[Inst] = buf()
+
+    entry.push(sll_slot("s"))
+
+    var blocks: Buf[IrBlock] = buf()
+
+    blocks.push(sll_block("entry", entry, InBr("arm")))
+    blocks.push(sll_block("arm", arm, InBr("done")))
+    blocks.push(sll_block("done", sll_none(), InRet(None, None)))
+
+    var regions: Buf[SlotRegion] = buf()
+
+    regions.push(SlotRegion("arm", "arm", -1))
+
+    var made_in: Map[string, int] = map()
+
+    made_in.put("s", made)
+    sll_run(blocks, regions, made_in)
+end sll_arm
+
+@test("a slot an arm made and used only there starts at the arm's head and ends on its way out")
+sll_bounded_by_its_arm()
+    var arm: Buf[Inst] = buf()
+
+    arm.push(sll_store("s"))
+    arm.push(sll_load("v", "s"))
+
+    val got = sll_arm(arm, 0)
+
+    assert_eq(got, s"entry:\n  %s = alloca [32 x i64]\n  br label %arm\narm:\n  ${sll_start("s")}\n" +
+              s"  store i64 1, ptr %s\n  %v = load i64, ptr %s\n  ${sll_end("s")}\n  br label %done\n" +
+              "done:\n  ret void\n")
+
+@test("an address stepped from the slot, a copy, an ownership walk and an out-pointer all keep it in the frame")
+sll_frame_uses_keep_it()
+    var arm: Buf[Inst] = buf()
+    var steps: Buf[IrArg] = buf()
+
+    steps.push(ir_arg(LInt(32), VInt(from_int(0))))
+    steps.push(ir_arg(LInt(32), VInt(from_int(3))))
+    arm.push(sll_call("make", VReg("s"), true))
+    arm.push(InGep(VReg("f"), LArr(32, LInt(64)), VReg("s"), steps))
+    arm.push(sll_load("v", "f"))
+    arm.push(sll_call("arc.dispose_at.Big", VReg("s"), false))
+
+    var bytes: Buf[IrArg] = buf()
+
+    bytes.push(ir_arg(LPtr, VReg("f")))
+    bytes.push(ir_arg(LPtr, VReg("s")))
+    bytes.push(ir_arg(LInt(64), VInt(from_int(8))))
+    bytes.push(ir_arg(LInt(1), VBool(false)))
+    arm.push(ir_call(None, LVoid, VGlobal(memcpy_symbol()), bytes))
+
+    val got = sll_arm(arm, 0)
+
+    assert(got.contains(sll_start("s")), got)
+    assert(got.contains(sll_end("s")), got)
+
+@test("a slot whose address, or an address stepped from it, is stored or handed to a call is never bounded")
+sll_escapes_are_left_alone()
+    var stored: Buf[Inst] = buf()
+
+    stored.push(InStore(LPtr, VReg("s"), VReg("elsewhere"), AccPlain, None))
+    assert(!sll_arm(stored, 0).contains("lifetime"), sll_arm(stored, 0))
+
+    var handed: Buf[Inst] = buf()
+
+    handed.push(sll_call("keep", VReg("s"), false))
+    assert(!sll_arm(handed, 0).contains("lifetime"), sll_arm(handed, 0))
+
+    var stepped: Buf[Inst] = buf()
+    var steps: Buf[IrArg] = buf()
+
+    steps.push(ir_arg(LInt(32), VInt(from_int(1))))
+    stepped.push(InGep(VReg("f"), LInt(64), VReg("s"), steps))
+    stepped.push(InStore(LPtr, VReg("f"), VReg("elsewhere"), AccPlain, None))
+    assert(!sll_arm(stepped, 0).contains("lifetime"), sll_arm(stepped, 0))
+
+    var cast: Buf[Inst] = buf()
+
+    cast.push(InCast(VReg("a"), CastPtrToInt, LPtr, VReg("s"), LInt(64)))
+    assert(!sll_arm(cast, 0).contains("lifetime"), sll_arm(cast, 0))
+
+    var chosen: Buf[Inst] = buf()
+
+    chosen.push(InSelect(VReg("p"), VBool(true), LPtr, VReg("s"), VReg("other"), LInt(1)))
+    assert(!sll_arm(chosen, 0).contains("lifetime"), sll_arm(chosen, 0))
+
+@test("a slot made outside every region, or one whose life is unknown, is never bounded")
+sll_no_region_no_markers()
+    val arm = sll_one(sll_store("s"))
+
+    assert(!sll_arm(arm, -1).contains("lifetime"), sll_arm(arm, -1))
+    assert(!sll_arm(arm, -2).contains("lifetime"), sll_arm(arm, -2))
+
+@test("a slot the large-value pass made is bounded by the innermost region holding its uses")
+sll_large_copy_takes_the_innermost()
+    var entry: Buf[Inst] = buf()
+
+    entry.push(sll_slot("c"))
+
+    var blocks: Buf[IrBlock] = buf()
+
+    blocks.push(sll_block("entry", entry, InBr("outer")))
+    blocks.push(sll_block("outer", sll_none(), InBr("inner")))
+    blocks.push(sll_block("inner", sll_one(sll_store("c")), InBr("tail")))
+    blocks.push(sll_block("tail", sll_none(), InRet(None, None)))
+
+    var regions: Buf[SlotRegion] = buf()
+
+    regions.push(SlotRegion("outer", "tail", -1))
+    regions.push(SlotRegion("inner", "inner", 0))
+
+    val got = sll_run(blocks, regions, map())
+
+    assert(got.contains(s"inner:\n  ${sll_start("c")}"), got)
+    assert(got.contains(s"${sll_end("c")}\n  br label %tail"), got)
+    assert(!got.contains(s"outer:\n  ${sll_start("c")}"), got)
+
+@test("a slot used past its arm is bounded by the enclosing region that holds every use, or by none")
+sll_used_past_its_arm()
+    var entry: Buf[Inst] = buf()
+
+    entry.push(sll_slot("s"))
+
+    var blocks: Buf[IrBlock] = buf()
+
+    blocks.push(sll_block("entry", entry, InBr("outer")))
+    blocks.push(sll_block("outer", sll_none(), InBr("arm")))
+    blocks.push(sll_block("arm", sll_one(sll_store("s")), InBr("after")))
+    blocks.push(sll_block("after", sll_one(sll_load("v", "s")), InBr("done")))
+    blocks.push(sll_block("done", sll_none(), InRet(None, None)))
+
+    var regions: Buf[SlotRegion] = buf()
+
+    regions.push(SlotRegion("outer", "after", -1))
+    regions.push(SlotRegion("arm", "arm", 0))
+
+    var made_in: Map[string, int] = map()
+
+    made_in.put("s", 1)
+
+    val got = sll_run(blocks, regions, made_in)
+
+    assert(got.contains(s"outer:\n  ${sll_start("s")}"), got)
+    assert(got.contains(s"%v = load i64, ptr %s\n  ${sll_end("s")}\n  br label %done"), got)
+    assert(!got.contains(s"arm:\n  ${sll_start("s")}"), got)
+
+    // With no enclosing region, nothing holds both uses.
+    var alone: Buf[SlotRegion] = buf()
+
+    alone.push(SlotRegion("arm", "arm", -1))
+    made_in.put("s", 0)
+    assert(!sll_run(blocks, alone, made_in).contains("lifetime"), sll_run(blocks, alone, made_in))
+
+@test("a region branched into anywhere but its first block bounds nothing")
+sll_one_way_in()
+    var entry: Buf[Inst] = buf()
+
+    entry.push(sll_slot("s"))
+
+    var blocks: Buf[IrBlock] = buf()
+
+    blocks.push(sll_block("entry", entry, InCondBr(VBool(true), "arm", "side")))
+    blocks.push(sll_block("arm", sll_one(sll_store("s")), InBr("arm2")))
+    blocks.push(sll_block("arm2", sll_one(sll_load("v", "s")), InBr("done")))
+    blocks.push(sll_block("side", sll_none(), InBr("arm2")))
+    blocks.push(sll_block("done", sll_none(), InRet(None, None)))
+
+    var regions: Buf[SlotRegion] = buf()
+
+    regions.push(SlotRegion("arm", "arm2", -1))
+
+    var made_in: Map[string, int] = map()
+
+    made_in.put("s", 0)
+    assert(!sll_run(blocks, regions, made_in).contains("lifetime"), sll_run(blocks, regions, made_in))
+
+@test("a loop's round ends the slot before the branch back to its first block, and starts it again there")
+sll_each_round()
+    var entry: Buf[Inst] = buf()
+
+    entry.push(sll_slot("s"))
+
+    var blocks: Buf[IrBlock] = buf()
+
+    blocks.push(sll_block("entry", entry, InBr("body")))
+    blocks.push(sll_block("body", sll_one(sll_store("s")), InCondBr(VReg("c"), "more", "out")))
+    blocks.push(sll_block("more", sll_one(sll_load("v", "s")), InBr("body")))
+    blocks.push(sll_block("out", sll_none(), InRet(None, None)))
+
+    var regions: Buf[SlotRegion] = buf()
+
+    regions.push(SlotRegion("body", "more", -1))
+
+    var made_in: Map[string, int] = map()
+
+    made_in.put("s", 0)
+
+    val got = sll_run(blocks, regions, made_in)
+
+    assert(got.contains(s"body:\n  ${sll_start("s")}"), got)
+    assert(got.contains(s"%v = load i64, ptr %s\n  ${sll_end("s")}\n  br label %body"), got)
+
+    // The branch with one target inside the round and one outside it gets no end.
+    assert(got.contains("store i64 1, ptr %s\n  br i1 %c"), got)
+
+@test("a `ret` inside the region takes no end, and an exit through a block of its own does")
+sll_returns_take_none()
+    var entry: Buf[Inst] = buf()
+
+    entry.push(sll_slot("s"))
+
+    var blocks: Buf[IrBlock] = buf()
+
+    blocks.push(sll_block("entry", entry, InBr("arm")))
+    blocks.push(sll_block("arm", sll_one(sll_store("s")), InCondBr(VReg("c"), "fail", "ok")))
+    blocks.push(sll_block("fail", sll_one(sll_load("e", "s")), InRet(None, None)))
+    blocks.push(sll_block("ok", sll_one(sll_load("v", "s")), InBr("done")))
+    blocks.push(sll_block("done", sll_none(), InRet(None, None)))
+
+    var regions: Buf[SlotRegion] = buf()
+
+    regions.push(SlotRegion("arm", "ok", -1))
+
+    var made_in: Map[string, int] = map()
+
+    made_in.put("s", 0)
+
+    val got = sll_run(blocks, regions, made_in)
+
+    assert(got.contains(s"%e = load i64, ptr %s\n  ret void"), got)
+    assert(got.contains(s"%v = load i64, ptr %s\n  ${sll_end("s")}\n  br label %done"), got)
+
+@test("an arm whose last block a guarded enum walk split ends on the split's far side, past the walk")
+sll_guarded_walk_tail()
+    var entry: Buf[Inst] = buf()
+
+    entry.push(sll_slot("s"))
+
+    var head: Buf[Inst] = buf()
+
+    head.push(sll_store("s"))
+    head.push(sll_load("tag", "s"))
+
+    var blocks: Buf[IrBlock] = buf()
+
+    blocks.push(sll_block("entry", entry, InBr("arm")))
+    blocks.push(sll_block("arm", head, InCondBr(VReg("holds"), "arc.held1", "arc.walked2")))
+    blocks.push(sll_block("arc.held1", sll_one(sll_call("arc.dispose_at.Big", VReg("s"), false)),
+                          InBr("arc.walked2")))
+    blocks.push(sll_block("arc.walked2", sll_one(sll_load("v", "s")), InBr("done")))
+    blocks.push(sll_block("done", sll_none(), InRet(None, None)))
+
+    // The region was recorded before the split, when `arm` was its last block.
+    var regions: Buf[SlotRegion] = buf()
+
+    regions.push(SlotRegion("arm", "arm", -1))
+
+    var made_in: Map[string, int] = map()
+
+    made_in.put("s", 0)
+
+    val got = sll_run(blocks, regions, made_in)
+
+    assert(got.contains(s"arm:\n  ${sll_start("s")}"), got)
+    assert(got.contains(s"%v = load i64, ptr %s\n  ${sll_end("s")}\n  br label %done"), got)
+    assert(!got.contains(s"${sll_end("s")}\n  br i1 %holds"), got)
+end sll_guarded_walk_tail
+
+@test("a function that may suspend or return twice keeps every slot alive throughout")
+sll_suspending_functions_are_whole()
+    for callee in ["llvm.coro.suspend", "setjmp"]
+        var arm: Buf[Inst] = buf()
+
+        arm.push(sll_store("s"))
+
+        var fast: Buf[FastMath] = buf()
+
+        if callee == "setjmp" then fast.push(FmReturnsTwice)
+
+        arm.push(InCall(None, LVoid, VGlobal(callee), no_ir_args(), no_ir_attrs(), None, fast, false))
+        assert(!sll_arm(arm, 0).contains("lifetime"), sll_arm(arm, 0))
+
+@test("a region whose last block was never recorded, or that starts in the entry block, bounds nothing")
+sll_unclosed_regions()
+    var entry: Buf[Inst] = buf()
+
+    entry.push(sll_slot("s"))
+    entry.push(sll_store("s"))
+
+    var blocks: Buf[IrBlock] = buf()
+
+    blocks.push(sll_block("entry", entry, InBr("arm")))
+    blocks.push(sll_block("arm", sll_one(sll_store("s")), InBr("done")))
+    blocks.push(sll_block("done", sll_none(), InRet(None, None)))
+
+    var regions: Buf[SlotRegion] = buf()
+
+    regions.push(SlotRegion("entry", "arm", -1))
+    regions.push(SlotRegion("arm", "", -1))
+
+    var made_in: Map[string, int] = map()
+
+    made_in.put("s", 0)
+    assert(!sll_run(blocks, regions, made_in).contains("lifetime"), sll_run(blocks, regions, made_in))
+    made_in.put("s", 1)
+    assert(!sll_run(blocks, regions, made_in).contains("lifetime"), sll_run(blocks, regions, made_in))
+
+// -- what the markers are worth: a use past an end is reported ------------------------------------------
+
+// A function `main` made of `blocks`, with the two markers declared, built under AddressSanitizer and
+// run: what it said on stderr, or `None` where there is no clang.
+private sll_asan_ran(blocks: Buf[IrBlock]) -> Option[(bool, string)]
+    if !clang_available() then return None
+
+    val dir = make_temp_dir("sysl-sll-ir").unwrap()
+    val file = s"$dir/t.ll"
+    val exe = s"$dir/t"
+    val text = "declare void @llvm.lifetime.start.p0(i64, ptr)\n" +
+        "declare void @llvm.lifetime.end.p0(i64, ptr)\n\n" +
+        s"define i32 @main() sanitize_address {\n${sll_text(blocks)}}\n"
+
+    write_text(file, text).unwrap()
+
+    val built = capture("clang", ["-fsanitize=address", "-O1", "-Wno-override-module", file, "-o", exe], "",
+                        [], true).unwrap()
+
+    assert(built.status.ok(), s"clang refused:\n${built.err.unwrap_or("")}\n$text")
+
+    val ran = capture(exe, [], "", [Var("ASAN_OPTIONS", "detect_stack_use_after_scope=1")], true).unwrap()
+
+    remove_dir_all(dir).unwrap_or(())
+    Some((ran.status.ok(), ran.err.unwrap_or("")))
+end sll_asan_ran
+
+@test("a read of a slot after the end the pass laid is a stack-use-after-scope, and the same blocks without it run clean")
+sll_a_use_past_the_end_is_caught()
+    var entry: Buf[Inst] = buf()
+
+    entry.push(sll_slot("s"))
+
+    var blocks: Buf[IrBlock] = buf()
+
+    blocks.push(sll_block("entry", entry, InBr("arm")))
+    blocks.push(sll_block("arm", sll_one(sll_store("s")), InBr("done")))
+    blocks.push(sll_block("done", sll_none(), InRet(Some(LInt(32)), Some(VInt(from_int(0))))))
+
+    var regions: Buf[SlotRegion] = buf()
+
+    regions.push(SlotRegion("arm", "arm", -1))
+
+    var made_in: Map[string, int] = map()
+
+    made_in.put("s", 0)
+
+    val placed = place_slot_lives(blocks, regions, made_in)
+
+    assert(placed.1)
+
+    val clean = sll_asan_ran(placed.0) match
+        Some(r) -> r
+        None -> return
+
+    assert(clean.0, clean.1)
+
+    // The read a wrong end would leave behind: after the arm, of the slot the arm's end let go of.
+    var late: Buf[IrBlock] = buf()
+
+    late.push(placed.0[0])
+    late.push(placed.0[1])
+    late.push(sll_block("done", sll_one(InLoad(VReg("v"), LInt(64), VReg("s"), AccVolatile, None)),
+                        InRet(Some(LInt(32)), Some(VInt(from_int(0))))))
+
+    val caught = sll_asan_ran(late).unwrap()
+
+    assert(!caught.0, caught.1)
+    assert(caught.1.contains("stack-use-after-scope"), caught.1)
+end sll_a_use_past_the_end_is_caught
+
+// -- the shapes it was written for, built and run -----------------------------------------------------
+
+private extern "setenv" sll_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" sll_c_unsetenv(name: *u8) -> int
+
+// A recursion through `arms` arms, each holding a large `Result` and leaving by `?`, `depth` deep.
+private sll_recursion(arms: int, depth: int) -> string
+    var text = "enum Big\n    Leaf(a: [32]u64)\n    Wrap(inner: &Big)\n\n" +
+        "read(n: int) -> Result[Big, string]\n    if n == 0 then return Ok(Leaf([0; 32]))\n\n" +
+        s"    n % $arms match\n"
+
+    for i in 0..<(arms - 1)
+        text = text + s"        $i -> Ok(Wrap(read(n - 1)?))\n"
+
+    text + "        _ -> Ok(Wrap(read(n - 1)?))\nend read\n\n" +
+        "depth(b: &Big) -> int\n    var d = 0\n    var cur = b\n\n    loop\n        *cur match\n" +
+        "            Leaf(_) -> return d\n            Wrap(i) ->\n                d += 1\n                cur = i\nend depth\n\n" +
+        s"main()\n    read($depth) match\n        Ok(b) -> print(depth(b))\n        Err(m) -> print(m)\n"
+end sll_recursion
+
+// The program built at `level` (with `flags` handed to clang, where there are any) and run: what it
+// printed, what it said on stderr, and how many AddressSanitizer reports the binary can make.
+private sll_built(text: string, level: string, flags: string) -> (string, string, usize)
+    val root = make_temp_dir("sysl-sll").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    val exe = s"$root/built"
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+        val v = cstring(flags)
+
+        sll_c_setenv(n.ptr, v.ptr, 1)
+    end if
+
+    val made = build_native_program(s"$root/main.sysl", None, None, level, Some(exe))
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+
+        sll_c_unsetenv(n.ptr)
+    end if
+
+    made match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), "", 0)
+        Ok(_) -> ()
+
+    val hooks = capture("nm", ["-u", exe], "", [], true) match
+        Ok(o) -> o.text.count_of("__asan_report")
+        Err(_) -> 0
+
+    val ran = capture(exe, [], "", [Var("ASAN_OPTIONS", "detect_stack_use_after_scope=1")], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    ran match
+        Err(_) -> ("could not be started", "", hooks)
+        Ok(o) -> (o.text, o.err.unwrap_or(""), hooks)
+end sll_built
+
+@test("a recursion through twenty arms that each hold a large result reaches 800 and 2000 deep at -O2")
+sll_deep_recursion()
+    if xvr_no_library() || !clang_available() then return
+
+    assert_eq(sll_built(sll_recursion(20, 800), "2", "").0, "800\n")
+    assert_eq(sll_built(sll_recursion(20, 2000), "2", "").0, "2000\n")
+
+// The stack the optimized `read` takes, as clang's `-fstack-usage` reports it.
+private sll_frame(text: string) -> Option[int]
+    val dir = make_temp_dir("sysl-sll-su").unwrap()
+    val file = s"$dir/t.ll"
+
+    write_text(file, xvr_ir([("main.sysl", text)])).unwrap()
+
+    val got = capture("clang", ["-O2", "-c", "-fstack-usage", "-Wno-override-module", file, "-o", s"$dir/t.o"],
+                      "", [], true).unwrap()
+
+    assert(got.status.ok(), got.err.unwrap_or(""))
+
+    val su = read_text(s"$dir/t.su").unwrap_or("")
+
+    remove_dir_all(dir).unwrap_or(())
+
+    for l in lines_of(su)
+        if l.contains("read$$sysl\t")
+            val fields = split(l, "\t")
+
+            return parse_int(fields[1]).ok()
+    end for
+
+    None
+end sll_frame
+
+@test("the markers are emitted, and twenty arms' frame is close to one arm's rather than twenty times it")
+sll_frame_is_one_arm_wide()
+    if xvr_no_library() || !clang_available() then return
+
+    val ir = xvr_ir([("main.sysl", sll_recursion(20, 800))])
+
+    assert(ir.contains("call void @llvm.lifetime.start.p0(i64 -1, ptr %"), ir)
+    assert(ir.contains("call void @llvm.lifetime.end.p0(i64 -1, ptr %"), ir)
+    assert(ir.contains("declare void @llvm.lifetime.start.p0(i64, ptr)"), ir)
+
+    val one = sll_frame(sll_recursion(1, 800)).unwrap()
+    val twenty = sll_frame(sll_recursion(20, 800)).unwrap()
+
+    // A result is 272 bytes; twenty arms of them kept apart were over 15 KB.
+    assert(twenty <= 3 * one + 600, s"twenty arms take $twenty bytes, one takes $one")
+    assert(twenty < 2000, s"twenty arms take $twenty bytes")
+end sll_frame_is_one_arm_wide
+
+@test("a function with no region in it gets no marker, even on a slot it holds")
+sll_no_region_no_declaration()
+    if xvr_no_library() then return
+
+    val ir = xvr_ir([("main.sysl", "add(a: int, b: int) -> int\n    val big = [a; 64]\n    big[3] + b\n\nprint(add(1, 2))\n")])
+    var body = ""
+    var inside = false
+
+    for l in lines_of(ir)
+        if l.starts_with("define") && l.contains("@add$$sysl(") then inside = true
+
+        if inside
+            body = body + l + "\n"
+
+            if l == "}" then break
+    end for
+
+    assert(body.contains("alloca [64 x i32]"), body)
+    assert(!body.contains("llvm.lifetime"), body)
+
+// The axes a wrong end would break, in one program: `?` leaving an arm and a nested arm, a `defer`
+// run on every way out, a guard that says no, a `for` whose rounds each hold a large value and leave
+// by `?`, a `while` with `continue` and `break`, and an `if` holding a large temporary in a branch.
+private val sll_axes: string = raw"""
+    struct Pair
+        a: [16]u64
+        b: [16]u64
+
+    make(n: int) -> Result[Pair, string]
+        if n < 0 then return Err(s"negative $n")
+
+        var p = Pair([0; 16], [0; 16])
+
+        p.a[0] = u64(n)
+        p.b[15] = u64(n * 2)
+        Ok(p)
+    end make
+
+    total(p: Pair) -> u64 = p.a[0] + p.b[15]
+
+    step(n: int) -> Result[u64, string]
+        defer print(s"leave $n")
+
+        n % 5 match
+            0 -> Ok(total(make(n)?))
+            1 ->
+                val q = make(n - 10)?
+                Ok(total(q) + 1)
+            2 if n > 5 -> Ok(total(make(n)?) + 2)
+            3 ->
+                n % 3 match
+                    0 -> Ok(total(make(n)?) * 3)
+                    _ -> if n > 8 then Ok(total(make(n)?)) else Ok(total(make(-n)?))
+            _ ->
+                var acc: u64 = 0
+
+                for i in 0..<3
+                    val p = make(n + i)?
+
+                    if p.a[0] % 2 == 0 then acc += total(p) else acc += total(make(i)?)
+
+                Ok(acc)
+    end step
+
+    main()
+        var sum: u64 = 0
+
+        for i in 0..<16
+            step(i) match
+                Ok(v) -> sum += v
+                Err(m) -> print(m)
+
+        var k = 0
+
+        while k < 6
+            k += 1
+
+            if k == 2 then continue
+
+            val p = make(k).unwrap()
+
+            if total(p) > 12 then break
+
+            sum += total(p)
+
+        print(sum)
+    end main
+    """
+
+// What the program prints, read off the compiler before slots were bounded.
+private val sll_axes_out: string = "leave 0\nleave 1\nnegative -9\nleave 2\nleave 3\nleave 4\nleave 5\nleave 6\n" +
+    "negative -4\nleave 7\nleave 8\nnegative -8\nleave 9\nleave 10\nleave 11\nleave 12\nleave 13\nleave 14\n" +
+    "leave 15\n428\n"
+
+@test("`?` out of arms, a defer, a guard, loops with break and continue and nested matches run the same at -O0 and -O2")
+sll_axes_run_the_same()
+    if xvr_no_library() || !clang_available() then return
+
+    assert_eq(sll_built(sll_axes, "0", "").0, sll_axes_out)
+    assert_eq(sll_built(sll_axes, "2", "").0, sll_axes_out)
+
+    val ir = xvr_ir([("main.sysl", sll_axes)])
+
+    assert(ir.contains("llvm.lifetime.start"), ir)
+
+@test("the same program and the recursion run clean under AddressSanitizer at -O0 and -O2")
+sll_axes_under_asan()
+    if xvr_no_library() || !clang_available() then return
+
+    for level in ["0", "2"]
+        val got = sll_built(sll_axes, level, "-fsanitize=address -g")
+
+        assert(got.2 > 0, s"no AddressSanitizer report in the binary at -O$level")
+        assert_eq(got.0, sll_axes_out)
+        assert(!got.1.contains("AddressSanitizer"), got.1)
+
+        val deep = sll_built(sll_recursion(20, 300), level, "-fsanitize=address -g")
+
+        assert_eq(deep.0, "300\n")
+        assert(!deep.1.contains("AddressSanitizer"), deep.1)
+end sll_axes_under_asan

@@ -1,0 +1,350 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// An enum walk's call guarded by a test of the tag in line (`arc_fastpath.sysl`).
+//
+// **The lowering**: where some variants hold a count and some do not, every call of the enum's
+// `arc.copy` / `arc.dispose` (and their address forms) sits alone in a block entered only when the tag
+// says a count is held, behind an `llvm.expect` saying it is not; each of the three shapes the test
+// takes is pinned. An enum whose every variant holds a count is left calling its helper directly,
+// and one where none does has no helper at all.
+//
+// **The behaviour**: the counts stay exact -- each variant of a mixed enum copied and let go of, small
+// and large, and every destructor run exactly once.
+//
+// The axes: the test's shape (equality, a mask of 32 or 64 bits, a range, none); the walk's form (by
+// value, at an address -- a large enum's); copy and dispose; the enum the library declares
+// (`Option[&T]`) and one a program does. Not crossed: a draining release, which writes its walk in
+// place and calls no helper, so there is nothing to guard.
+
+private var aef_library_cache: Buf[Program] = buf()
+private var aef_library_read: bool = false
+
+private aef_library() -> Buf[Program]
+    if aef_library_read then return aef_library_cache
+
+    aef_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> aef_library_cache = units
+
+    aef_library_cache
+end aef_library
+
+private aef_no_library() -> bool
+    if aef_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end aef_no_library
+
+// The LLVM text of the whole module a source lowers to on this machine, or the first thing it was
+// refused with.
+private aef_ir(text: string) -> string
+    val parsed = parse(source_of("t.sysl", text))
+
+    if !parsed.ok() then return parsed.first().message
+
+    var units: Buf[Program] = buf()
+
+    for item in aef_library()
+        units.push(item)
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if !done.reported.is_empty() then return done.reported[0].diag.message
+
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+    val said = errors_of(done.an.diagnostics())
+
+    if !said.is_empty() then return analysis_report(said)
+
+    val kept = prune(strip_tests(whole), program_own(units))
+    val lowered = codegen_with_gaps(kept, host_target(), promotions)
+
+    ir_print_module(lowered.0)
+end aef_ir
+
+private aef_has(out: string, fragment: string) = assert(out.contains(fragment), s"missing:\n$fragment\nin:\n$out")
+
+// How many calls of the helper there are, and how many of them sit alone in a guarded arm: the
+// line before is an `arc.held` label, the line after the branch back to where the block goes on.
+private aef_calls(out: string, helper: string) -> (int, int)
+    val lines = out.lines()
+    val call = s"  call void @$helper("
+    var all = 0
+    var guarded = 0
+
+    for i in 1..<lines.len - 1
+        if lines[i].starts_with(call)
+            all += 1
+
+            if lines[i - 1].starts_with("arc.held") && lines[i + 1].starts_with("  br label %arc.walked")
+                guarded += 1
+
+    (all, guarded)
+end aef_calls
+
+// Every call of the helper is guarded, and there is at least one.
+private aef_all_guarded(out: string, helper: string)
+    val n = aef_calls(out, helper)
+
+    assert(n.0 > 0, s"no call of @$helper in:\n$out")
+    assert_eq(n.1, n.0)
+
+// There are calls of the helper, and none of them is guarded.
+private aef_none_guarded(out: string, helper: string)
+    val n = aef_calls(out, helper)
+
+    assert(n.0 > 0, s"no call of @$helper in:\n$out")
+    assert_eq(n.1, 0)
+
+private aef_res() -> string = "struct Res\n    id: int\n\nimpl Drop for Res\n    drop(self) = print(\"drop\", self.id)\n\n"
+
+// Five variants, two holding a count: tags 1 and 3, the mask 0b1010.
+private aef_mixed() -> string =
+    aef_res() +
+    "enum Mixed\n    MInt(n: int)\n    MRes(r: &Res)\n    MReal(x: real)\n    MPair(a: &Res, b: int)\n    MVoid\n\n"
+
+// What every walk test hands its enum through: a copy out of a buffer, and an assignment over it.
+private aef_walks(ty: string, made: string, other: string) -> string =
+    s"pick(b: Buf[$ty], i: usize) -> $ty = b[i]\n\n" +
+    s"run()\n    var all: Buf[$ty] = buf()\n\n    all.push($made)\n\n    var m = pick(all, 0)\n\n" +
+    s"    m = $other\n    print(all.len())\n\nrun()\n"
+
+// An enum of `n` variants named `V0`..., where the ones in `counted` hold a `&Res` and the rest an
+// `int`.
+private aef_wide(name: string, n: int, counted: []const int) -> string
+    var text = s"enum $name\n"
+
+    for i in 0..<n
+        var holds = false
+
+        for c in counted
+            if c == i then holds = true
+
+        text = text + s"    V$i(x: ${if holds then "&Res" else "int"})\n"
+
+    text + "\n"
+end aef_wide
+
+private aef_import() -> string = "import sysl.buf.{Buf, buf}\n\n"
+
+// -- the lowering ---------------------------------------------------------------------------------
+
+@test("a walk of Option of a reference is called only where the tag says Some")
+aef_option_is_one_equality()
+    if aef_no_library() then return
+
+    val out = aef_ir(aef_import() + aef_res() + aef_walks("Option[&Res]", "Some(Res(1))", "None"))
+
+    aef_all_guarded(out, "arc.dispose.sysl$Option.ref.Res")
+    aef_all_guarded(out, "arc.copy.sysl$Option.ref.Res")
+    aef_has(out, "icmp eq i32 %t")
+    aef_has(out, ", 1\n")
+    aef_has(out, "declare i1 @llvm.expect.i1(i1, i1)")
+
+@test("and a struct's walk of its Option field is guarded inside the struct's own helper")
+aef_option_field_in_a_helper()
+    if aef_no_library() then return
+
+    val out = aef_ir("struct Node\n    value: int\n    next: Option[&Node]\n" +
+                     "var n: &Node = Node(1, None)\nvar o: Option[&Node] = Some(n)\n\no = None\n")
+
+    aef_all_guarded(out, "arc.copy.sysl$Option.ref.Node")
+
+@test("and the helper itself still walks the variant behind its own test")
+aef_option_helper_is_unchanged()
+    if aef_no_library() then return
+
+    val out = aef_ir("struct Node\n    value: int\n    next: Option[&Node]\n" +
+                     "var n: &Node = Node(1, None)\nvar o: Option[&Node] = Some(n)\n\no = None\n")
+
+    aef_has(out, "define private void @arc.dispose.sysl$Option.ref.Node(%enum.sysl$Option.ref.Node %v) {")
+    aef_has(out, "  %t1 = extractvalue %enum.sysl$Option.ref.Node %v, 0\n  %t2 = icmp eq i32 %t1, 1\n")
+
+@test("a mixed enum's copy and dispose are guarded by a mask of the variants that hold a count")
+aef_mixed_is_a_mask()
+    if aef_no_library() then return
+
+    val out = aef_ir(aef_import() + aef_mixed() + aef_walks("Mixed", "MRes(Res(1))", "MVoid"))
+
+    aef_all_guarded(out, "arc.copy.Mixed")
+    aef_all_guarded(out, "arc.dispose.Mixed")
+    aef_has(out, " = shl i32 1, %t")
+    aef_has(out, ", 10\n")
+    aef_has(out, " = icmp ne i32 %t")
+    aef_has(out, " = call i1 @llvm.expect.i1(i1 %t")
+
+@test("the guard is the only test: the branch takes the hint, and the call's arm rejoins the block")
+aef_guard_shape()
+    if aef_no_library() then return
+
+    val out = aef_ir(aef_import() + aef_mixed() + aef_walks("Mixed", "MRes(Res(1))", "MVoid"))
+    val lines = out.lines()
+    var seen = false
+
+    for i in 1..<lines.len
+        if lines[i].starts_with("  br i1 %t") && lines[i].contains(", label %arc.held")
+            assert(lines[i - 1].contains(" = call i1 @llvm.expect.i1("), s"unhinted branch: ${lines[i]}")
+            assert(lines[i].contains(", label %arc.walked"), lines[i])
+            seen = true
+
+    assert(seen, s"no guarded branch in:\n$out")
+
+@test("a large enum's walk at its address is guarded by the tag loaded from the same address")
+aef_large_reads_the_tag_at_the_address()
+    if aef_no_library() then return
+
+    val big = aef_res() + "enum Big\n    BWide(a: [20]i64)\n    BRes(r: &Res)\n    BNone\n\n"
+    val out = aef_ir(aef_import() + big + aef_walks("Big", "BRes(Res(1))", "BNone"))
+    val copies = aef_calls(out, "arc.copy_at.Big")
+    val disposes = aef_calls(out, "arc.dispose_at.Big")
+
+    assert(copies.0 + disposes.0 > 0, s"no address walk of Big in:\n$out")
+    assert_eq(copies.1, copies.0)
+    assert_eq(disposes.1, disposes.0)
+    aef_has(out, " = load i32, ptr %")
+
+@test("a mask past the 32nd tag is taken at 64 bits")
+aef_wide_mask()
+    if aef_no_library() then return
+
+    val out = aef_ir(aef_import() + aef_res() + aef_wide("Wide", 40, [1, 35]) +
+                     aef_walks("Wide", "V35(Res(1))", "V0(0)"))
+
+    aef_all_guarded(out, "arc.copy.Wide")
+    aef_has(out, " = zext i32 %t")
+    aef_has(out, " to i64\n")
+    aef_has(out, ", 34359738370\n")
+
+@test("past the 63rd tag, consecutive counted variants are a range")
+aef_range()
+    if aef_no_library() then return
+
+    val out = aef_ir(aef_import() + aef_res() + aef_wide("Long", 66, [64, 65]) +
+                     aef_walks("Long", "V64(Res(1))", "V0(0)"))
+
+    aef_all_guarded(out, "arc.copy.Long")
+    aef_has(out, ", 64\n")
+    aef_has(out, " = icmp ult i32 %t")
+
+@test("counted variants past the 63rd tag and not consecutive keep the plain call")
+aef_scattered_is_unguarded()
+    if aef_no_library() then return
+
+    val out = aef_ir(aef_import() + aef_res() + aef_wide("Scat", 66, [0, 65]) +
+                     aef_walks("Scat", "V65(Res(1))", "V1(0)"))
+
+    aef_none_guarded(out, "arc.copy.Scat")
+    aef_none_guarded(out, "arc.dispose.Scat")
+
+@test("an enum whose every variant holds a count keeps the plain call")
+aef_all_counted_is_unguarded()
+    if aef_no_library() then return
+
+    val both = aef_res() + "enum Both\n    BA(r: &Res)\n    BB(r: &Res, n: int)\n\n"
+    val out = aef_ir(aef_import() + both + aef_walks("Both", "BA(Res(1))", "BB(Res(2), 3)"))
+
+    aef_none_guarded(out, "arc.copy.Both")
+    aef_none_guarded(out, "arc.dispose.Both")
+
+@test("and one where none does has no helper to call")
+aef_none_counted_has_no_helper()
+    if aef_no_library() then return
+
+    val plain = "enum Plain\n    PA(n: int)\n    PB(x: real)\n\n"
+    val out = aef_ir(aef_import() + plain + aef_walks("Plain", "PA(1)", "PB(2.0)"))
+
+    assert(!out.contains("@arc.copy.Plain"), out)
+    assert(!out.contains("@arc.dispose.Plain"), out)
+
+// -- the behaviour --------------------------------------------------------------------------------
+
+private aef_ready() -> bool
+    if aef_no_library() then return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end aef_ready
+
+// What a program prints, built and run.
+private aef_ran(text: string) -> string
+    val root = make_temp_dir("sysl-aef").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end aef_ran
+
+private aef_prints(text: string, expected: string)
+    if !aef_ready() then return
+
+    assert_eq(aef_ran(text), expected)
+
+// Each variant copied twice and every copy let go of before the originals: a share too few faults or
+// runs a destructor early, one too many never runs it.
+private aef_twice(ty: string, made: string, sum: string) -> string =
+    s"run()\n    var all: Buf[$ty] = buf()\n\n$made\n" +
+    s"    var copies: Buf[$ty] = buf()\n\n    for m in all\n        copies.push(m)\n        copies.push(m)\n\n" +
+    s"    var total = 0\n\n    for m in copies\n        total += $sum(m)\n\n" +
+    "    print(total)\n    copies.clear()\n    print(\"cleared\")\n\nrun()\nprint(\"done\")\n"
+
+@test("every variant of a mixed enum copied and let go of runs each destructor exactly once")
+aef_mixed_counts_stay_exact()
+    aef_prints(aef_import() + aef_mixed() +
+               "weight(m: Mixed) -> int = m match\n    MInt(n) -> n\n    MRes(r) -> r.id\n    MReal(_) -> -1\n" +
+               "    MPair(a, b) -> a.id + b\n    MVoid -> 0\n\n" +
+               aef_twice("Mixed", "    all.push(MInt(1))\n    all.push(MRes(Res(10)))\n    all.push(MReal(2.5))\n" +
+                                  "    all.push(MPair(Res(20), 3))\n    all.push(MVoid)\n", "weight"),
+               "66\ncleared\ndrop 10\ndrop 20\ndone\n")
+
+@test("and so does a large one, walked at its address")
+aef_large_counts_stay_exact()
+    aef_prints(aef_import() + aef_res() + "enum Big\n    BWide(a: [20]i64)\n    BRes(r: &Res)\n    BNone\n\n" +
+               "weight(m: Big) -> int = m match\n    BWide(a) -> int(a[19])\n    BRes(r) -> r.id\n    BNone -> 0\n\n" +
+               aef_twice("Big", "    var wide: [20]i64 = [0; 20]\n\n    wide[19] = 5\n    all.push(BWide(wide))\n" +
+                                "    all.push(BRes(Res(30)))\n    all.push(BNone)\n", "weight"),
+               "70\ncleared\ndrop 30\ndone\n")
+
+@test("and so does Option of a reference, and a range-tested enum")
+aef_option_and_range_counts_stay_exact()
+    aef_prints(aef_import() + aef_res() + aef_wide("Long", 66, [64, 65]) +
+               "weight(m: Long) -> int = m match\n    V64(r) -> r.id\n    V65(r) -> r.id\n    _ -> 1\n\n" +
+               "some(o: Option[&Res]) -> int = o match\n    Some(r) -> r.id\n    None -> 0\n\n" +
+               aef_twice("Long", "    all.push(V0(0))\n    all.push(V64(Res(40)))\n    all.push(V65(Res(50)))\n" +
+                                 "    all.push(V63(7))\n", "weight") +
+               "var opts: Buf[Option[&Res]] = buf()\n\nopts.push(None)\nopts.push(Some(Res(60)))\n" +
+               "var kept = opts[1]\n\nkept = opts[0]\nprint(some(kept), some(opts[1]))\nopts.clear()\nprint(\"end\")\n",
+               "184\ncleared\ndrop 40\ndrop 50\ndone\n0 60\ndrop 60\nend\n")

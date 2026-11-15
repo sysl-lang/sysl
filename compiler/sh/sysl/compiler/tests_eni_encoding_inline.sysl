@@ -1,0 +1,87 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **`sysl.encoding`'s getters and putters are marked `@inline`, so a program built at -O2 takes a
+// copy of each and the optimizer turns a call into one load or one store.** Their lowered bodies hold a
+// bounds check per byte or a loop, which a raw-size limit on small functions alone refuses.
+
+private eni_calls(text: string, part: string) -> bool
+    for line in lines_of(text)
+        if line.contains("call ") && line.contains(part) then return true
+
+    false
+end eni_calls
+
+private eni_count(text: string, part: string) -> int
+    var n = 0
+
+    for line in lines_of(text)
+        if line.contains(part) then n += 1
+
+    n
+end eni_count
+
+private eni_text(path: string, level: string) -> string
+    lbr_hand([])
+
+    val text = emit_llvm_text(path, None, level, buf(), None, true) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(emitted) -> emitted.text
+
+    reset_search_paths()
+    text
+end eni_text
+
+private eni_optimized(text: string) -> string
+    val dir = make_temp_dir("sysl-eni-opt").unwrap()
+    val file = s"$dir/t.ll"
+
+    write_text(file, text).unwrap()
+
+    val got = capture("clang", ["-O2", "-S", "-emit-llvm", "-o", "-", file], "", [], true).unwrap()
+
+    remove_dir_all(dir).unwrap_or(())
+    assert(got.status.ok(), s"clang refused the text:\n${got.err.unwrap_or("")}")
+    got.text
+end eni_optimized
+
+private eni_program() -> string =
+    lbr_program("import sysl.encoding.{get_u32_le, get_u64_le, put_u32_le}\n\n" +
+                "@noinline\nrd32(b: []const u8) -> u32 = get_u32_le(b).unwrap_or(0)\n\n" +
+                "@noinline\nrd64(b: []const u8) -> u64 = get_u64_le(b).unwrap_or(0)\n\n" +
+                "@noinline\nwr32(b: []u8, v: u32) -> bool = put_u32_le(b, v)\n\n" +
+                "var data: []u8 = [1, 2, 3, 4, 5, 6, 7, 8]\n\n" +
+                "print(rd32(data))\nprint(rd64(data))\nprint(wr32(data, 9))\n")
+
+@test("at -O2 a getter or putter used from another package is copied in and leaves no call")
+eni_copied_and_inlined()
+    if !lbr_ready() then return
+
+    val app = eni_program()
+    val text = eni_text(app, "2")
+
+    assert_eq(eni_count(text, "define available_externally ") >= 3, true)
+
+    val opt = eni_optimized(text)
+
+    assert(!eni_calls(opt, "sysl.encoding$"), "a getter or putter stayed a call")
+    assert(eni_count(opt, "load i32") >= 1, "no 32-bit load")
+    assert(eni_count(opt, "load i64") >= 1, "no 64-bit load")
+    assert(eni_count(opt, "store i32") >= 1, "no 32-bit store")
+    lbr_drop([app])
+end eni_copied_and_inlined
+
+@test("at -O0 they stay declarations, which nothing would inline")
+eni_declared_at_o0()
+    if !lbr_ready() then return
+
+    val app = eni_program()
+    val text = eni_text(app, "0")
+
+    assert_eq(eni_count(text, "define available_externally "), 0)
+    lbr_drop([app])
+end eni_declared_at_o0
