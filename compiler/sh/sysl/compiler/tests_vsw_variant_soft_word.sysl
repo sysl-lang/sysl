@@ -1,0 +1,400 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// `invariant` and `variant` are contextual words (`reference/lexical.md § contextual words`,
+// `reference/verification.md`): clauses at the head of a function's or a loop's body, and an
+// ordinary name everywhere else. A call to a function of either name, written as a statement where
+// no clause belongs -- a match arm, a loop body after some work, an `if` body -- is a call.
+//
+// The axes: the word (`variant`, `invariant`); where it stands (an inline match arm, an indented
+// arm, a loop body after work, an `if` body, a `val` initializer, a function body's trailing
+// expression, the head of a loop body); what follows it (`(`, `.`, `[`, an operator no expression
+// begins with). And the other side of each: a misplaced clause is still refused with its own
+// diagnostic, and a clause at the head -- a parenthesised measure included -- still runs.
+//
+// `require` and `ensure` are reserved keywords rather than contextual words, so they name nothing
+// and have no call shape to test.
+
+private var vsw_library_cache: Buf[Program] = buf()
+private var vsw_library_read: bool = false
+
+private vsw_library() -> Buf[Program]
+    if vsw_library_read then return vsw_library_cache
+
+    vsw_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> vsw_library_cache = units
+
+    vsw_library_cache
+end vsw_library
+
+private vsw_ready() -> bool
+    if vsw_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end vsw_ready
+
+// Builds a program and runs it, answering what it printed and whether it exited cleanly -- or why
+// it could not be built.
+private vsw_build_run(text: string) -> Result[(string, bool), string]
+    val root = make_temp_dir("sysl-variant-soft-word").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return Err(failure_text(why))
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> Err("the program that was built could not be run")
+        Ok(out) -> Ok((out.text + out.err.unwrap_or(""), out.status.ok()))
+end vsw_build_run
+
+// What a program PRINTS, where it runs to the end.
+private vsw_ran(text: string) -> string
+    vsw_build_run(text) match
+        Err(why) -> s"it did not build: $why"
+        Ok((out, clean)) -> if clean then out else s"it did not exit zero: $out"
+
+// That a program is REFUSED, with this message, anchored at this `line:column` of `main.sysl`.
+private vsw_refused(text: string, message: string, at: string)
+    vsw_build_run(text) match
+        Ok((out, _)) -> assert(false, s"it built and ran, saying: $out")
+        Err(said) ->
+            assert(said.contains(s"error: $message\n --> "), said)
+            assert(said.contains(s"/main.sysl:$at\n"), said)
+end vsw_refused
+
+private vsw_invariant_misplaced() -> string =
+    "an 'invariant' belongs at the head of a loop's body — it is a condition that holds on every " +
+    "entry to that body, and one written after some of the work has already been done is not that. " +
+    "A condition over a struct's fields is written in the struct, and one over a function's " +
+    "arguments is a 'require'"
+
+private vsw_variant_misplaced() -> string =
+    "a 'variant' belongs at the head of a loop's body, where it is what decreases from one " +
+    "iteration to the next, or in a function's contract block, where it is what decreases at each " +
+    "recursive call"
+
+// ---- a call in a match arm ----
+
+@test("a call to a function named variant in an inline match arm is a call")
+vsw_variant_match_arm_inline()
+    if !vsw_ready() then return
+
+    assert_eq(vsw_ran(raw"""
+        variant(n: int) -> int = n + 1
+
+        pick(b: bool) -> int = b match
+            true -> variant(1)
+            false -> 0
+
+        print(pick(true))
+        print(pick(false))
+        """), "2\n0\n")
+
+@test("a call to a function named invariant in an inline match arm is a call")
+vsw_invariant_match_arm_inline()
+    if !vsw_ready() then return
+
+    assert_eq(vsw_ran(raw"""
+        invariant(n: int) -> int = n * 3
+
+        pick(b: bool) -> int = b match
+            true -> invariant(2)
+            false -> 0
+
+        print(pick(true))
+        """), "6\n")
+
+@test("a call to variant or invariant heading an indented match arm is a call")
+vsw_match_arm_block()
+    if !vsw_ready() then return
+
+    assert_eq(vsw_ran(raw"""
+        variant(n: int) -> int = n + 1
+        invariant(n: int) -> int = n * 3
+
+        pick(k: int) -> int = k match
+            0 ->
+                variant(10)
+            _ ->
+                invariant(k)
+
+        print(pick(0))
+        print(pick(4))
+        """), "11\n12\n")
+
+// ---- a call as a statement where no clause belongs ----
+
+@test("a call to variant or invariant after work in a loop body is a call")
+vsw_call_in_loop_after_work()
+    if !vsw_ready() then return
+
+    assert_eq(vsw_ran(raw"""
+        variant(n: int)
+            print(s"v$n")
+
+        invariant(n: int)
+            print(s"i$n")
+
+        run()
+            var i = 0
+
+            while i < 2
+                i += 1
+                variant(i)
+                invariant(i)
+
+        run()
+        """), "v1\ni1\nv2\ni2\n")
+
+@test("a call to variant or invariant heading an if body is a call")
+vsw_call_heading_if_body()
+    if !vsw_ready() then return
+
+    assert_eq(vsw_ran(raw"""
+        variant(n: int)
+            print(s"v$n")
+
+        invariant(n: int)
+            print(s"i$n")
+
+        run(c: bool)
+            if c
+                variant(1)
+            else
+                invariant(2)
+
+        run(true)
+        run(false)
+        """), "v1\ni2\n")
+
+@test("a call to variant or invariant as a statement at the top of the program is a call")
+vsw_call_at_top_level()
+    if !vsw_ready() then return
+
+    assert_eq(vsw_ran(raw"""
+        variant(n: int)
+            print(s"v$n")
+
+        invariant(n: int)
+            print(s"i$n")
+
+        variant(7)
+        invariant(8)
+        """), "v7\ni8\n")
+
+// ---- a val initializer ----
+
+@test("a call to variant or invariant as a val initializer is a call")
+vsw_val_initializer()
+    if !vsw_ready() then return
+
+    assert_eq(vsw_ran(raw"""
+        variant(n: int) -> int = n + 1
+        invariant(n: int) -> int = n * 3
+
+        run() -> int
+            var s = 0
+
+            for k in 0..<2
+                val a = variant(k)
+                val b = invariant(k)
+
+                s += a + b
+
+            s
+
+        print(run())
+        """), "6\n")
+
+// ---- a value named variant or invariant ----
+
+@test("a parameter named variant or invariant is an ordinary operand")
+vsw_parameter_named()
+    if !vsw_ready() then return
+
+    assert_eq(vsw_ran(raw"""
+        f(variant: int, invariant: int) -> int
+            val k = 1
+
+            variant - k
+
+        g(variant: int, invariant: int) -> int
+            invariant + variant
+
+        print(f(5, 0))
+        print(g(3, 4))
+        """), "4\n7\n")
+
+@test("a local named variant or invariant may be indexed, called through and stepped after work")
+vsw_local_named()
+    if !vsw_ready() then return
+
+    assert_eq(vsw_ran(raw"""
+        import sysl.buf.{Buf, buf}
+
+        run()
+            var variant: Buf[int] = buf()
+            var invariant = 0
+
+            for x in 0..<3
+                variant.push(x)
+                invariant++
+                variant[0] = invariant
+
+            print(variant.len())
+            print(variant[0])
+
+        run()
+        """), "3\n3\n")
+
+// `.` begins no measure, so a method call on a value of either name may head a loop body.
+@test("a method call on a value named variant or invariant may head a loop body")
+vsw_method_call_heads_loop()
+    if !vsw_ready() then return
+
+    assert_eq(vsw_ran(raw"""
+        import sysl.buf.{Buf, buf}
+
+        run()
+            var variant: Buf[int] = buf()
+            var invariant: Buf[int] = buf()
+
+            for x in 0..<3
+                variant.push(x)
+                invariant.push(x * 2)
+
+            while variant.len() > 1
+                invariant.push(int(variant.len()))
+                variant.pop()
+
+            print(variant.len())
+            print(invariant.len())
+
+        run()
+        """), "1\n5\n")
+
+// ---- the clauses still work where they belong ----
+
+@test("a loop variant and invariant at the head still run, a parenthesised measure included")
+vsw_loop_clauses_run()
+    if !vsw_ready() then return
+
+    assert_eq(vsw_ran(raw"""
+        sum_to(n: int) -> int
+            var i = 0
+            var s = 0
+
+            while i < n
+                invariant (i >= 0 && i <= n)
+                variant (n - i)
+                s += i
+                i += 1
+
+            s
+
+        count(n: int) -> int
+            var i = 0
+
+            do
+                variant n - i
+                i += 1
+            while i < n
+
+            i
+
+        print(sum_to(5))
+        print(count(3))
+        """), "10\n3\n")
+
+@test("a parenthesised loop variant that stops decreasing still traps")
+vsw_loop_variant_traps()
+    if !vsw_ready() then return
+
+    vsw_build_run(raw"""
+        spins()
+            var i = 0
+
+            while i < 10
+                variant (10 - i)
+                if i == 3 then i -= 1
+                else i += 1
+
+            print(i)
+
+        spins()
+        """) match
+        Err(why) -> assert(false, s"it did not build: $why")
+        Ok((out, clean)) -> assert(!clean && out == "", s"it did not trap silently: $out")
+
+@test("a function's contract variant still runs, after a require and in parentheses")
+vsw_contract_variant_runs()
+    if !vsw_ready() then return
+
+    assert_eq(vsw_ran(raw"""
+        gcd(a: int, b: int) -> int
+            require b >= 0
+            variant (b)
+            if b == 0 then a
+            else gcd(b, a % b)
+
+        print(gcd(48, 18))
+        """), "6\n")
+
+// ---- the error path: a misplaced clause is still one ----
+
+@test("a variant after work in a loop body is still refused as a misplaced clause")
+vsw_misplaced_variant_refused()
+    if !vsw_ready() then return
+
+    vsw_refused("f() -> int\n    var i = 0\n\n    while i < 2\n        i += 1\n        variant 10 - i\n\n" +
+                "    i\n\nprint(f())\n", vsw_variant_misplaced(), "6:9")
+
+@test("an invariant after work in a loop body is still refused as a misplaced clause")
+vsw_misplaced_invariant_refused()
+    if !vsw_ready() then return
+
+    vsw_refused("f() -> int\n    var i = 0\n\n    while i < 2\n        i += 1\n        invariant i > 0\n\n" +
+                "    i\n\nprint(f())\n", vsw_invariant_misplaced(), "6:9")
+
+@test("a variant heading an if body is refused as a misplaced clause")
+vsw_variant_in_if_refused()
+    if !vsw_ready() then return
+
+    vsw_refused("f(n: int) -> int\n    if n > 0\n        variant n\n\n    n\n\nprint(f(1))\n",
+                vsw_variant_misplaced(), "3:9")
+
+@test("a variant in a match arm whose measure is not a call is refused as a misplaced clause")
+vsw_variant_in_arm_refused()
+    if !vsw_ready() then return
+
+    vsw_refused("f(n: int) -> int = n match\n    0 ->\n        variant n\n    _ -> 1\n\nprint(f(1))\n",
+                vsw_variant_misplaced(), "3:9")
