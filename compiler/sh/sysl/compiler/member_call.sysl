@@ -2810,6 +2810,11 @@ private check_impl_condition(cx: &Analyzer, span: Span, rty: Type, base: string,
 
     if unmet.is_none() then return true
 
+    // **A receiver whose own type was refused has been told so already**: `Bag(1.5)` over a
+    // `struct Bag[K: Hash]` with an `impl[K: Hash] Tag for Bag[K]` fails the block's condition for
+    // the very reason its type failed, and saying it again at the call is that mistake twice.
+    if cx.an.complaints() > 0 && receiver_type_refused(cx.an, rty) then return false
+
     val from = cx.an.tables.members.from_trait.get(member_key_of(base, filed)).unwrap_or("")
 
     cx.fault(span, s"'${source_member_name(unsuffixed_member(filed))}' is a member the 'impl' of " +
@@ -2817,6 +2822,28 @@ private check_impl_condition(cx: &Analyzer, span: Span, rty: Type, base: string,
              s"and ${unmet.unwrap()}")
     false
 end check_impl_condition
+
+// Whether a struct or an enum was made at arguments that fail what its own declaration asked of
+// them -- asked quietly, the refusal being the application's, made where it was written.
+private receiver_type_refused(a: &Analysis, rty: Type) -> bool
+    val (key, targs) = rty match
+        Struct(s) -> (s.base, s.targs)
+        Enum(e) -> (e.base, e.targs)
+        _ -> return false
+
+    val decl = a.tables.types.get(key)
+
+    if decl.is_none() then return false
+
+    decl.unwrap().kind match
+        StructOf(d) -> !check_param_bounds(a, decl.unwrap().scope, span_zero(), key, d.tparams,
+                                           d.bounds, targs, buf(), "type parameter",
+                                           decl.unwrap().scope, true)
+        EnumOf(d) -> !check_param_bounds(a, decl.unwrap().scope, span_zero(), key, d.tparams,
+                                         d.bounds, targs, buf(), "type parameter",
+                                         decl.unwrap().scope, true)
+        _ -> false
+end receiver_type_refused
 
 // What a receiver lacks for the condition of the `impl` that gave it a member, as the tail of a
 // refusal (`it asks 'Show' of T, which does not implement it`), or nothing where the condition holds
