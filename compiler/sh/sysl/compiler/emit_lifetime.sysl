@@ -1,0 +1,420 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map, Set, set}
+import sysl.math.bigint.from_int
+
+// **A stack slot's life is bounded by the region of the body that made it**, so that LLVM may give
+// two slots whose lives never meet the same bytes of the frame.
+//
+// Every slot is hoisted to the entry block (`emit_alloca`), which is right for a loop and wrong for
+// a frame: with nothing said about when a slot is in use, LLVM must keep all of them apart, and a
+// function with twenty arms that each hold a large result keeps twenty of them. A recursion through
+// such a function runs out of stack at a twentieth of the depth one arm would reach. LLVM's answer
+// is a pair of markers, `llvm.lifetime.start` and `llvm.lifetime.end`, around each slot's live
+// range; its stack colouring then lets slots share where the markers say they never overlap.
+//
+// **The emitter names the regions; this pass decides, over the finished blocks, which slot each one
+// bounds.** A region is an arm of a `match`, a branch of an `if`, or one round of a loop's body:
+// the block it opens at and the block open when it closes. Each slot made while a region is open
+// records it. Once the function is complete -- after the large-value pass, whose copies are bounded
+// with the rest -- a slot is bounded by the innermost region open when it was made that holds every
+// use of it, under three conditions, each of which leaves a slot unbounded where it fails:
+//
+// - **Its address stays in the frame.** Every use of it, or of an address stepped from it, is the
+//   address a load reads or a store writes, a step to a member, either end of a copy or a fill, the
+//   address an ownership walk takes, or a call's out-pointer or by-value argument. Anything else --
+//   the address stored, compared, cast, selected or handed to a call as a plain argument -- may
+//   outlive any region, and a slot whose address goes there is never bounded.
+// - **The region has one way in.** No block of it but the first is branched to from outside it, so
+//   the start, laid at the head of the first block, comes before every use.
+// - **The slot is dead each time the region is entered**, which is what being made inside it means:
+//   a temporary or a local of an arm or a round is written before it is read on every entry. A slot
+//   the large-value pass made is a copy written where it is made, so it is bounded by the innermost
+//   region holding its uses.
+//
+// **An end goes on an edge that leaves the region**: before each branch whose every target lies
+// outside it, or is its first block again (the next round of a loop's body). A branch with one
+// target inside and one outside gets none, nor does a `ret` -- a missing end only keeps a slot alive
+// longer, which costs frame and never correctness. A function that may suspend or return twice is
+// left as it was.
+
+// One region of a body, by the labels of its first and last blocks, and the region it lies in (-1
+// for none). A region whose last block was never recorded bounds nothing.
+struct SlotRegion
+    entry: string
+    last: string
+    parent: int
+end SlotRegion
+
+// Opens a region at the block being written, and answers what `close_region` is to be handed.
+open_region(e: *Emit) -> usize
+    val parent = if e.open_regions.is_empty() then -1 else int(e.open_regions[e.open_regions.len() - 1])
+    val at = e.regions.len()
+
+    e.regions.push(SlotRegion(e.current_label, "", parent))
+    e.open_regions.push(at)
+    at
+end open_region
+
+// Closes the region `open_region` answered `at` for, at the block being written -- and any opened
+// inside it and left open.
+close_region(e: *Emit, at: usize)
+    while !e.open_regions.is_empty() && e.open_regions[e.open_regions.len() - 1] >= at
+        e.open_regions.pop()
+
+    if at < e.regions.len() then e.regions[at] = e.regions[at] with { last = e.current_label }
+end close_region
+
+// The two markers, as the module declares and calls them.
+lifetime_start_symbol() -> string = llvm_lifetime_start_entry().at([LPtr])
+lifetime_end_symbol() -> string = llvm_lifetime_end_entry().at([LPtr])
+
+// The finished function's blocks with every slot that can be bounded bounded. `before` is every slot
+// the blocks held before the large-value pass ran.
+bound_slot_lives(e: *Emit, blocks: Buf[IrBlock], before: Set[string]) -> Buf[IrBlock]
+    if e.regions.is_empty() then return blocks
+
+    var made_in: Map[string, int] = map()
+
+    for i in 0..<e.prologue.len()
+        e.prologue[i] match
+            InAlloca(VReg(n), _, _) -> if i < e.slot_regions.len() then made_in.put(n, e.slot_regions[i])
+            _ -> ()
+
+    // A slot that was in the function before the large-value pass but not made by `emit_alloca` is
+    // one this pass knows nothing about the life of.
+    for n in before
+        if !made_in.has(n) then made_in.put(n, -2)
+
+    val placed = place_slot_lives(blocks, e.regions, made_in)
+
+    if placed.1 then e.uses_lifetime = true
+
+    placed.0
+end bound_slot_lives
+
+// The pass itself, over blocks and regions handed to it: `made_in` names the region open when each
+// slot was made (-1 for none, -2 for a slot whose life is unknown); a slot it does not name is a
+// copy the large-value pass made. Answers the blocks and whether any marker was laid.
+place_slot_lives(blocks: Buf[IrBlock], regions: Buf[SlotRegion], made_in: Map[string, int]) -> (Buf[IrBlock], bool)
+    if blocks.len() < 2 || regions.is_empty() || !may_bound(blocks) then return (blocks, false)
+
+    var index: Map[string, usize] = map()
+
+    for i in 0..<blocks.len()
+        if index.has(blocks[i].label) then return (blocks, false)
+
+        index.put(blocks[i].label, i)
+
+    val ranges = region_ranges(blocks, regions, index)
+
+    // Every address in the function stepped from a slot, by the slot it was stepped from.
+    var root: Map[string, string] = map()
+    var slots: Buf[string] = buf()
+
+    for inst in blocks[0].instrs
+        inst match
+            InAlloca(VReg(n), _, _) ->
+                root.put(n, n)
+                slots.push(n)
+            _ -> ()
+
+    var grew = true
+
+    while grew
+        grew = false
+
+        for b in blocks
+            for inst in b.instrs
+                val step = inst match
+                    InGep(VReg(d), _, VReg(p), _) -> Some((d, p))
+                    InGepInBounds(VReg(d), _, VReg(p), _) -> Some((d, p))
+                    _ -> None
+
+                step match
+                    Some(s) ->
+                        if !root.has(s.0)
+                            root.get(s.1) match
+                                Some(r) ->
+                                    root.put(s.0, r)
+                                    grew = true
+                                None -> ()
+                    None -> ()
+
+    // Where each slot is used, as the first and last block, and the slots whose address leaves.
+    var escaped: Set[string] = set()
+    var first: Map[string, usize] = map()
+    var last: Map[string, usize] = map()
+
+    for bi in 0..<blocks.len()
+        val b = blocks[bi]
+        var uses: Buf[(Val, bool)] = buf()
+
+        for inst in b.instrs
+            for u in address_uses(inst)
+                uses.push(u)
+
+        b.terminator match
+            Some(t) ->
+                for u in address_uses(t)
+                    uses.push(u)
+            None -> ()
+
+        for u in uses
+            u.0 match
+                VReg(n) ->
+                    root.get(n) match
+                        Some(r) ->
+                            if !u.1 then escaped.add(r)
+
+                            if !first.has(r) then first.put(r, bi)
+
+                            last.put(r, bi)
+                        None -> ()
+                _ -> ()
+
+    // The region each slot is bounded by.
+    var starts: Buf[Buf[string]] = buf()
+    var any = false
+
+    for _ in 0..<regions.len()
+        starts.push(buf())
+
+    for s in slots
+        if escaped.has(s) then continue
+
+        val lo = first.get(s) match
+            Some(x) -> x
+            None -> continue
+
+        val hi = last.get(s).unwrap()
+        var chosen = -1
+
+        made_in.get(s) match
+            Some(r0) ->
+                var r = r0
+
+                while r >= 0
+                    val ri = usize(r)
+
+                    if ranges[ri].0 >= 0 && usize(ranges[ri].0) <= lo && hi <= usize(ranges[ri].1)
+                        chosen = r
+                        break
+                    end if
+
+                    r = regions[ri].parent
+            None ->
+                var width = blocks.len()
+
+                for ri in 0..<regions.len()
+                    val rg = ranges[ri]
+
+                    if rg.0 >= 0 && usize(rg.0) <= lo && hi <= usize(rg.1) && usize(rg.1 - rg.0) < width
+                        width = usize(rg.1 - rg.0)
+                        chosen = int(ri)
+
+        if chosen >= 0
+            starts[usize(chosen)].push(s)
+            any = true
+    end for
+
+    if !any then return (blocks, false)
+
+    // The markers, laid.
+    var heads: Buf[Buf[string]] = buf()
+    var tails: Buf[Buf[string]] = buf()
+
+    for _ in 0..<blocks.len()
+        heads.push(buf())
+        tails.push(buf())
+
+    for ri in 0..<regions.len()
+        if starts[ri].is_empty() then continue
+
+        val lo = usize(ranges[ri].0)
+        val hi = usize(ranges[ri].1)
+
+        for s in starts[ri]
+            heads[lo].push(s)
+
+        for j in lo..hi
+            if leaves(blocks[j].terminator, index, lo, hi)
+                for s in starts[ri]
+                    tails[j].push(s)
+
+    var out: Buf[IrBlock] = buf()
+
+    for j in 0..<blocks.len()
+        val b = blocks[j]
+
+        if heads[j].is_empty() && tails[j].is_empty()
+            out.push(b)
+            continue
+        end if
+
+        var instrs: Buf[Inst] = buf()
+
+        for s in heads[j]
+            instrs.push(lifetime_marker(lifetime_start_symbol(), s))
+
+        for inst in b.instrs
+            instrs.push(inst)
+
+        for s in tails[j]
+            instrs.push(lifetime_marker(lifetime_end_symbol(), s))
+
+        out.push(IrBlock(b.label, instrs, b.terminator))
+    end for
+
+    (out, true)
+end place_slot_lives
+
+// A function that may suspend, or return from a call twice, keeps every slot alive throughout.
+private may_bound(blocks: Buf[IrBlock]) -> bool
+    for b in blocks
+        for inst in b.instrs
+            inst match
+                InCall(_, _, callee, _, _, _, fast, _) ->
+                    callee match
+                        VGlobal(h) -> if h.starts_with("llvm.coro.") then return false
+                        _ -> ()
+
+                    for f in fast
+                        f match
+                            FmReturnsTwice -> return false
+                            _ -> ()
+                _ -> ()
+
+    true
+end may_bound
+
+// Each region as the indices of its first and last blocks, or (-1, -1) where it bounds nothing: its
+// labels are not both blocks of the function, it starts in the entry block, it ends before it
+// starts, or a block of it other than the first is branched to from outside.
+private region_ranges(blocks: Buf[IrBlock], regions: Buf[SlotRegion], index: Map[string, usize]) -> Buf[(int, int)]
+    var preds: Buf[Buf[usize]] = buf()
+
+    for _ in 0..<blocks.len()
+        preds.push(buf())
+
+    for j in 0..<blocks.len()
+        for l in successors(blocks[j].terminator)
+            index.get(l) match
+                Some(k) -> preds[k].push(j)
+                None -> ()
+
+    var out: Buf[(int, int)] = buf()
+
+    for r in regions
+        val lo = index.get(r.entry)
+        val hi = if r.last == "" then None else index.get(r.last)
+        var range = (-1, -1)
+
+        if lo.is_some() && hi.is_some()
+            val a = lo.unwrap()
+            val z = hi.unwrap()
+
+            if a >= 1 && a <= z
+                var sealed = true
+
+                for k in (a + 1)..z
+                    for p in preds[k]
+                        if p < a || p > z then sealed = false
+
+                if sealed then range = (int(a), int(z))
+        end if
+
+        out.push(range)
+    end for
+
+    out
+end region_ranges
+
+// The labels a block's terminator may send control to.
+private successors(t: Option[Inst]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    t match
+        Some(InBr(l)) -> out.push(l)
+        Some(InCondBr(_, a, b)) ->
+            out.push(a)
+            out.push(b)
+        Some(InSwitch(_, _, d, cases)) ->
+            out.push(d)
+
+            for c in cases
+                out.push(c.1)
+        _ -> ()
+
+    out
+end successors
+
+// Whether a block ending in `t` leaves the region of blocks `lo` to `hi`: a branch every target of
+// which is outside it, or is its first block again.
+private leaves(t: Option[Inst], index: Map[string, usize], lo: usize, hi: usize) -> bool
+    val targets = successors(t)
+
+    if targets.is_empty() then return false
+
+    for l in targets
+        index.get(l) match
+            Some(k) -> if k > lo && k <= hi then return false
+            None -> ()
+
+    true
+end leaves
+
+// Every operand of `inst` that may be an address, each with whether this use of it keeps the
+// address in the frame.
+private address_uses(inst: Inst) -> Buf[(Val, bool)]
+    var out: Buf[(Val, bool)] = buf()
+
+    inst match
+        InLoad(_, _, p, _, _) -> out.push((p, true))
+        InStore(_, v, p, _, _) ->
+            out.push((v, false))
+            out.push((p, true))
+        InGep(_, _, p, idx) ->
+            out.push((p, true))
+
+            for a in idx
+                out.push((a.value, false))
+        InGepInBounds(_, _, p, idx) ->
+            out.push((p, true))
+
+            for a in idx
+                out.push((a.value, false))
+        InCall(_, _, callee, args, _, _, _, _) ->
+            out.push((callee, false))
+
+            val inert = callee match
+                VGlobal(h) -> h == memcpy_symbol() || h.starts_with(llvm_memset_entry().base + ".") ||
+                    h.starts_with("arc.copy_at.") || h.starts_with("arc.dispose_at.")
+                _ -> false
+
+            for a in args
+                var kept = inert
+
+                for at in a.attrs
+                    at match
+                        AttrSRet(_) -> kept = true
+                        AttrByVal(_) -> kept = true
+                        _ -> ()
+
+                out.push((a.value, kept))
+        _ ->
+            for v in escaping_operands(inst)
+                out.push((v, false))
+
+    out
+end address_uses
+
+// One marker over the whole of the slot named `slot`.
+private lifetime_marker(symbol: string, slot: string) -> Inst
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(LInt(64), VInt(from_int(-1))))
+    args.push(ir_arg(LPtr, VReg(slot)))
+    ir_call(None, LVoid, VGlobal(symbol), args)
+end lifetime_marker

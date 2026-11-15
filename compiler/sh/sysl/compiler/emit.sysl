@@ -416,6 +416,15 @@ struct Emit
     // (`emit_arc.sysl`'s `gen_drop_hook`): a plain reference it lets go of is queued on that slot
     // directly rather than through `arc.release`.
     draining: bool
+
+    // The stretches of a body a slot's life can be bounded by -- an arm, a branch, a loop's body --
+    // the ones open now, innermost last, and for each entry of `prologue` the region open when that
+    // slot was made, or -1. `emit_lifetime.sysl` reads them once the body is finished; `uses_lifetime`
+    // says whether any function needed the two markers declared.
+    regions: Buf[SlotRegion]
+    open_regions: Buf[usize]
+    slot_regions: Buf[int]
+    uses_lifetime: bool
 end Emit
 
 // What a runtime helper is built from. A helper is asked for by name while a body is being written
@@ -609,7 +618,7 @@ emitter_for(t: Target, destructors: Buf[(string, string)]) -> Emit
          None, false, buf(), map(), map(), map(), set(), buf(), set(), set(), set(), false, untouched_none(), set(),
          no_wrap_none(), map(), buf(), Leaving, false, "", set(), buf(), map(), map(), 0, moves_none(), set(), set(), set(), set(),
          set(), map(), 0, map(), set(), map(), false, set(), map(), set(), false, false, false, buf(), set(),
-          "", set(), false)
+          "", set(), false, buf(), buf(), buf(), false)
 end emitter_for
 
 // -- what a body could not say --------------------------------------------------------------------
@@ -638,6 +647,9 @@ start_function(e: *Emit)
     e.src = None
     e.in_tracked = false
     e.prologue.clear()
+    e.regions.clear()
+    e.open_regions.clear()
+    e.slot_regions.clear()
     e.blocks.clear()
     e.current.clear()
     e.current_end = None
@@ -709,6 +721,7 @@ emit(e: *Emit, i: Inst)
 // the widest member's.
 emit_alloca(e: *Emit, name: Val, ty: LType, align: Option[int]) -> Val
     e.prologue.push(InAlloca(name, ty, wider_align(align, slot_align(e, ty))))
+    e.slot_regions.push(if e.open_regions.is_empty() then -1 else int(e.open_regions[e.open_regions.len() - 1]))
     name
 end emit_alloca
 
@@ -966,7 +979,18 @@ finish_func(e: *Emit, sig: IrFuncSig) -> IrFunc
 
     // The pairs are cancelled while every value is still a register, and only then is a large one
     // turned into the bytes it is copied as.
-    IrFunc(sig, lower_large_values(e, elide_arc_pairs(out, e.inert_symbols)))
+    //
+    // A slot's life is bounded last, over the finished blocks, so the slots the large-value pass made
+    // are bounded with the rest.
+    val elided = elide_arc_pairs(out, e.inert_symbols)
+    var before: Set[string] = set()
+
+    for inst in elided[0].instrs
+        inst match
+            InAlloca(VReg(n), _, _) -> before.add(n)
+            _ -> ()
+
+    IrFunc(sig, bound_slot_lives(e, lower_large_values(e, elided), before))
 end finish_func
 
 // -- the constants a body folds against ------------------------------------------------------------
