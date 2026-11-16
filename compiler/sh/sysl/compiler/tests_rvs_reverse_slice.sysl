@@ -4,8 +4,9 @@ module sh.sysl.compiler
 import sysl.text.split
 
 // What `sysl.slices.reverse` lowers to at each element type: a slice of 8-, 16-, 32- or 64-bit
-// integers moves a 16-byte block from each end at a time, turned around by one `shufflevector`, and
-// every other element type -- an integer narrower than its storage, one wider than a register, a
+// integers moves a 16-byte block from each end at a time, turned around by one `shufflevector`, once
+// the slice holds 64 bytes (a shorter one takes the element loop, which costs less), and every other
+// element type -- an integer narrower than its storage, one wider than a register, a
 // counted value, a struct -- keeps the element loop. Each claim is read inside the instance it is
 // about. What the answers are, at every length and offset, is `library/sysl/slices/tests.sysl`'s.
 
@@ -43,6 +44,29 @@ rvs_wider_lanes()
 
         assert_eq(rvs_count(blocks, shape), 2)
 
+// Whether `body` asks the length for at least 64 bytes' worth of elements before the blocks: an
+// unsigned `>=` against the element count, which is either worked out as `64 / sizeof(T)` in the
+// body or already folded to `bound`.
+private rvs_guards_at(body: string, size: string, bound: string) -> bool
+    for line in split(body, "\n")
+        if line.contains("icmp uge ") && line.ends_with(s", $bound") then return true
+
+    body.contains(s"udiv i64 64, $size") && body.contains("icmp uge ")
+
+@test("a slice shorter than 64 bytes skips the blocks for the element loop, at every lane width")
+rvs_short_slices_take_the_loop()
+    if !enm_ready() then return
+
+    for (element, name, blocks, size, bound) in [("u8", "reverse.byte", "reverse_blocks.byte.c16(", "1", "64"),
+                                                 ("i16", "reverse.short", "reverse_blocks.short.c8(", "2", "32"),
+                                                 ("u32", "reverse.uint", "reverse_blocks.uint.c4(", "4", "16"),
+                                                 ("usize", "reverse.usize", "reverse_blocks.usize.c2(", "8", "8")]
+        val body = cgz_body(rvs_ir(element), name)
+
+        assert(body.contains(blocks), s"$element:\n$body")
+        assert(body.contains("reverse_ends."), s"$element:\n$body")
+        assert(rvs_guards_at(body, size, bound), s"$element:\n$body")
+
 @test("a width short of its storage, a width past a register, a counted value and a struct keep the loop")
 rvs_others_keep_the_loop()
     if !enm_ready() then return
@@ -50,7 +74,7 @@ rvs_others_keep_the_loop()
     for element in ["u12", "i24", "i56", "u128", "string", "bool", "f32", "Rgb"]
         val ir = rvs_ir(element)
 
-        assert(ir.contains("reverse_between"), s"$element:\n$ir")
+        assert(ir.contains("reverse_ends"), s"$element:\n$ir")
         assert(!ir.contains("reverse_blocks"), s"$element:\n$ir")
 
 @test("a reversal a constant asks for is still worked out while compiling, through the blocks")
