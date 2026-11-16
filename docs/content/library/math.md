@@ -591,6 +591,35 @@ answers a NaN, as the product alone would.
 half-width multiply-add at `f32` and narrowing rounds twice, and where `sqrt` at `f16` is an
 approximation either way, here the single rounding is the whole of what was asked for.
 
+## `VectorFloat` — `exp` and `tanh` across a register
+
+```sysl
+trait VectorFloat
+    exp(self) -> Self
+    tanh(self) -> Self
+```
+
+**The two `Float` methods a SIMD kernel reaches for most, for a whole vector at once.** It is
+implemented for `<N>f32` and `<N>f64` at every width `N`, one `impl` each, and its bodies are sysl
+rather than libm: there is no C entry point that takes a register, and calling `expf` once per lane
+would take the vector apart. Each lane is within one ulp of the scalar method, and exact at the zeros,
+the infinities and a NaN; a loop over them compiles to vector instructions with no call in it.
+[Vectors § The exponential and the hyperbolic
+tangent](/reference/vectors/#the-exponential-and-the-hyperbolic-tangent) has the edges and an example.
+
+```sysl
+val x: <2>f64 = [1.0, -0.5]
+
+print(x.exp()[0], x.tanh()[1])
+```
+
+```output
+2.7182818284590455 -0.46211715726000974
+```
+
+The `exp` lane is one ulp above `1.0.exp()`, which is `2.718281828459045` — the bound in practice,
+and why a program that must match the scalar bit for bit calls the scalar.
+
 ## `min`, `max` and `clamp` are not `Float`'s
 
 ```sysl

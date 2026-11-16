@@ -1,0 +1,249 @@
+module sysl.math
+@tests
+
+// The lane-wise `exp` and `tanh` of `VectorFloat`, held to the scalar `Float` method of the same name
+// (the C library's answer) lane by lane: within one ulp over a dense sweep of every exponent, and
+// exactly at the edges where the answer is not an approximation -- the zeros, the infinities, a NaN,
+// the overflow and underflow thresholds, a subnormal argument and a subnormal answer.
+
+// How many representable values lie between two floats of one width; two NaNs are none apart and a
+// NaN beside a number is as far apart as anything can be.
+vft_apart(x: f32, y: f32) -> i64
+    if x.is_nan() || y.is_nan() then return if x.is_nan() && y.is_nan() then 0 else 1 << 40
+
+    val d = vft_order(x.bits()) - vft_order(y.bits())
+
+    if d < 0 then -d else d
+end vft_apart
+
+vft_apart(x: real, y: real) -> i128
+    if x.is_nan() || y.is_nan() then return if x.is_nan() && y.is_nan() then 0 else 1 << 80
+
+    val d = vft_order(x.bits()) - vft_order(y.bits())
+
+    if d < 0 then -d else d
+end vft_apart
+
+// An encoding as a place on the number line: the positives count up from `+0` and the negatives down
+// from it, so `-0` and `+0` are one value apart and neighbours differ by one.
+vft_order(b: u32) -> i64 = if b < 0x80000000 then i64(b) else 0x80000000 - i64(b)
+
+vft_order(b: u64) -> i128 = if b < 0x8000000000000000 then i128(b) else 0x8000000000000000 - i128(b)
+
+// The worst disagreement of each method with the scalar over four lanes of f32.
+vft_worst(lanes: [4]f32, worst: *[2]i64)
+    val v = <4>f32(lanes)
+    val e = v.exp()
+    val t = v.tanh()
+
+    for const j in 0..<4
+        worst[0] = max(worst[0], vft_apart(e[j], lanes[j].exp()))
+        worst[1] = max(worst[1], vft_apart(t[j], lanes[j].tanh()))
+end vft_worst
+
+vft_worst(lanes: [4]real, worst: *[2]i128)
+    val v = <4>f64(lanes)
+    val e = v.exp()
+    val t = v.tanh()
+
+    for const j in 0..<4
+        worst[0] = max(worst[0], vft_apart(e[j], lanes[j].exp()))
+        worst[1] = max(worst[1], vft_apart(t[j], lanes[j].tanh()))
+end vft_worst
+
+@test("f32 exp and tanh are within one ulp of the scalar over a sweep of every encoding")
+vft_f32_sweep()
+    var worst: [2]i64 = [0, 0]
+    var b: u64 = 0
+
+    // Four encodings in every 4093: each exponent, both signs, the subnormals, the infinities and
+    // NaNs.
+    while b < 0x100000000
+        var lanes: [4]f32
+
+        for j in 0..<4
+            lanes[j] = f32.from_bits(u32((b + u64(j) * 1021) & 0xffffffff))
+
+        vft_worst(lanes, &worst)
+        b += 4093
+
+    assert(worst[0] <= 1,s"exp is ${worst[0]} ulps from the scalar")
+    assert(worst[1] <= 1, s"tanh is ${worst[1]} ulps from the scalar")
+end vft_f32_sweep
+
+@test("f32 exp and tanh are within one ulp of the scalar across the whole range exp is finite in")
+vft_f32_dense()
+    var worst: [2]i64 = [0, 0]
+    val count = 1 << 20
+
+    for i in 0..<count / 4
+        var lanes: [4]f32
+
+        for j in 0..<4
+            lanes[j] = -104.0 + 194.0 * f32(4 * i + j) / f32(count)
+
+        vft_worst(lanes, &worst)
+
+    assert(worst[0] <= 1, s"exp is ${worst[0]} ulps from the scalar")
+    assert(worst[1] <= 1, s"tanh is ${worst[1]} ulps from the scalar")
+end vft_f32_dense
+
+@test("f64 exp and tanh are within one ulp of the scalar over a sweep of every encoding")
+vft_f64_sweep()
+    var worst: [2]i128 = [0, 0]
+    var b: u64 = 0
+
+    loop
+        var lanes: [4]real
+
+        for j in 0..<4
+            lanes[j] = real.from_bits(b +% u64(j) * 0x10000000001)
+
+        vft_worst(lanes, &worst)
+
+        val next = b +% 0x00001fffffffff8b
+
+        if next < b then break
+
+        b = next
+
+    assert(worst[0] <= 1, s"exp is ${worst[0]} ulps from the scalar")
+    assert(worst[1] <= 1, s"tanh is ${worst[1]} ulps from the scalar")
+end vft_f64_sweep
+
+@test("f64 exp and tanh are within one ulp of the scalar across the whole range exp is finite in")
+vft_f64_dense()
+    var worst: [2]i128 = [0, 0]
+    val count = 1 << 20
+
+    for i in 0..<count / 4
+        var lanes: [4]real
+        var near: [4]real
+
+        for j in 0..<4
+            val u = real(4 * i + j) / real(count)
+
+            lanes[j] = -750.0 + 1462.0 * u
+            near[j] = -20.0 + 40.0 * u
+
+        vft_worst(lanes, &worst)
+        vft_worst(near, &worst)
+
+    assert(worst[0] <= 1, s"exp is ${worst[0]} ulps from the scalar")
+    assert(worst[1] <= 1, s"tanh is ${worst[1]} ulps from the scalar")
+end vft_f64_dense
+
+@test("exp at the f32 edges: the zeros, the infinities, a NaN, the overflow and the subnormal answers")
+vft_f32_exp_edges()
+    val big = 88.72283f32
+    val v: <8>f32 = [0.0, -0.0, f32.infinity(), -f32.infinity(), f32.nan(), big, nextafter(big, f32.infinity()), -103.97]
+    val e = v.exp()
+
+    assert_eq(e[0], 1.0)
+    assert_eq(e[1], 1.0)
+    assert_eq(e[2], f32.infinity())
+    assert_eq(e[3].bits(), 0)
+    assert(e[4].is_nan())
+    assert(e[5] < f32.infinity() && e[5] > 3.4e38)
+    assert_eq(e[6], f32.infinity())
+    assert_eq(e[7].bits(), 1)
+
+    val w: <4>f32 = [-87.33655, -95.0, -104.0, -1000.0]
+    val u = w.exp()
+
+    assert(vft_apart(u[0], w[0].exp()) <= 1)
+    assert(u[1] > 0.0 && u[1] < 1.17549435e-38)
+    assert(vft_apart(u[1], w[1].exp()) <= 1)
+    assert_eq(u[2].bits(), 0)
+    assert_eq(u[3].bits(), 0)
+end vft_f32_exp_edges
+
+@test("exp at the f64 edges: the zeros, the infinities, a NaN, the overflow and the subnormal answers")
+vft_f64_exp_edges()
+    val big = 709.782712893384
+    val v: <8>f64 = [0.0, -0.0, real.infinity(), -real.infinity(), real.nan(), big, nextafter(big, 800.0), -745.13]
+    val e = v.exp()
+
+    assert_eq(e[0], 1.0)
+    assert_eq(e[1], 1.0)
+    assert_eq(e[2], real.infinity())
+    assert_eq(e[3].bits(), 0)
+    assert(e[4].is_nan())
+    assert(e[5] < real.infinity() && e[5] > 1.79e308)
+    assert_eq(e[6], real.infinity())
+    assert_eq(e[7].bits(), 1)
+
+    val w: <4>f64 = [-708.4, -730.0, -746.0, -1.0e300]
+    val u = w.exp()
+
+    assert(vft_apart(u[0], w[0].exp()) <= 1)
+    assert(u[1] > 0.0 && u[1] < 2.2250738585072014e-308)
+    assert(vft_apart(u[1], w[1].exp()) <= 1)
+    assert_eq(u[2].bits(), 0)
+    assert_eq(u[3].bits(), 0)
+end vft_f64_exp_edges
+
+@test("tanh keeps a zero's sign, answers ±1 at the infinities and far out, a NaN for a NaN, and a subnormal itself")
+vft_tanh_edges()
+    val tiny = f32.from_bits(5)
+    val v: <8>f32 = [0.0, -0.0, f32.infinity(), -f32.infinity(), f32.nan(), 9.5, -9.5, tiny]
+    val t = v.tanh()
+
+    assert_eq(t[0].bits(), 0)
+    assert_eq(t[1].bits(), 0x80000000)
+    assert_eq(t[2], 1.0)
+    assert_eq(t[3], -1.0)
+    assert(t[4].is_nan())
+    assert_eq(t[5], 1.0)
+    assert_eq(t[6], -1.0)
+    assert_eq(t[7].bits(), tiny.bits())
+
+    val d: <4>f64 = [-0.0, -real.infinity(), 20.0, real.from_bits(3)]
+    val s = d.tanh()
+
+    assert_eq(s[0].bits(), 0x8000000000000000)
+    assert_eq(s[1], -1.0)
+    assert_eq(s[2], 1.0)
+    assert_eq(s[3].bits(), 3)
+end vft_tanh_edges
+
+@test("tanh is odd lane for lane, either side of where its two forms meet")
+vft_tanh_odd()
+    val v: <4>f32 = [0.6249999, 0.625, 0.6250001, 3.0]
+    val p = v.tanh()
+    val m = (-v).tanh()
+
+    for const j in 0..<4
+        assert_eq(m[j], -p[j])
+        assert(vft_apart(p[j], v[j].tanh()) <= 1)
+
+    val w: <2>f64 = [0.6249999999999999, 0.625]
+    val q = w.tanh()
+
+    assert_eq((-w).tanh()[0], -q[0])
+    assert(vft_apart(q[1], w[1].tanh()) <= 1)
+end vft_tanh_odd
+
+// A kernel generic in its width, as `reference/vectors.md § One kernel, every width` writes one.
+vft_softsign[const W: usize](v: <W>f32) -> <W>f32 = v.tanh() * v.exp()
+
+@test("one generic kernel calls exp and tanh at every width, odd ones included, each lane the 4-wide answer")
+vft_every_width()
+    val x: <4>f32 = [-2.5, 0.25, 1.0, 30.0]
+    val four = vft_softsign(x)
+    val single: <1>f32 = x[2]
+    val triple: <3>f32 = [x[0], x[1], x[2]]
+    val wide: <16>f32 = x[3]
+    val one = vft_softsign(single)
+    val three = vft_softsign(triple)
+    val sixteen = vft_softsign(wide)
+
+    assert_eq(one[0], four[2])
+    assert_eq(three[0], four[0])
+    assert_eq(three[1], four[1])
+    assert_eq(sixteen[15], four[3])
+
+    val y: <8>f64 = 0.5
+
+    assert_eq(y.exp()[7], <2>f64(0.5).exp()[1])
+end vft_every_width

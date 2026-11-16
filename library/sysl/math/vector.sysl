@@ -1,0 +1,133 @@
+module sysl.math
+@no_alloc
+
+/** The transcendentals a float vector computes lane by lane, written in sysl rather than called.
+ *
+ * `v.exp()` and `v.tanh()` are the scalar `Float` methods of the same names in every lane of an
+ * `<N>f32` or an `<N>f64`, at every width. **There is no libm entry point for a register**, so a
+ * lane-wise call to `expf` would take the vector apart, make N calls and put it back together; the
+ * bodies below are instead straight-line arithmetic on the whole register -- a range reduction, a
+ * polynomial and a scale written on the encoding -- so a loop over them stays a loop of vector
+ * instructions. Neither body has a branch: the edges (an overflow, an underflow, a NaN, an infinity,
+ * a negative zero) come out of the same arithmetic, or are chosen by a `select`, in every lane at once.
+ *
+ * **Each lane is within one ulp of the C library's scalar answer**, which the tests check over every
+ * `f32` and over a dense sweep of `f64`. That is as close as two good implementations of a function
+ * that is not correctly rounded can promise to agree; it is not bit for bit, so a program that needs
+ * the scalar's exact bits calls the scalar.
+ *
+ * They need no C library and allocate nothing, so they are there on a target with neither. A
+ * half-width lane has no impl: widen it to `f32` first, as the lane-wise square root asks.
+ */
+trait VectorFloat
+    /** `e` raised to each lane. An answer past the largest finite value is an infinity and one below
+     * the smallest subnormal is zero; a subnormal answer is rounded once. */
+    exp(self) -> Self
+
+    /** The hyperbolic tangent of each lane: odd, so a negative zero answers itself, and `±1` from
+     * where the answer rounds to it. */
+    tanh(self) -> Self
+
+/** binary32. `exp` reduces `x` to `r = x - k ln 2` with `|r| <= ln 2 / 2`, takes `e^r` from Cephes's
+ * degree-seven minimax polynomial, and multiplies by `2^k` in two halves, so a `k` too small for one
+ * normal power of two still scales a normal number and the subnormal answer is rounded only by the
+ * last multiply. `ln 2` is split in two so that `k ln 2` is subtracted without losing `r`'s digits.
+ *
+ * The input is first clamped to `[-104, 89]`: past either end the answer is already zero or an
+ * infinity, and the clamp keeps `k` inside the exponent field. A NaN passes through the clamp, since
+ * no comparison is true of it, and every step after it answers a NaN.
+ */
+impl[const N: usize] VectorFloat for <N>f32
+    exp(self) -> Self
+        val x = (self > 89.0).select(89.0, (self < -104.0).select(-104.0, self))
+        val k = (x * 1.44269504088896341).round()
+        val r = (-k).mul_add(-2.12194440e-4, (-k).mul_add(0.693359375, x))
+
+        var p = r.mul_add(1.9875691500e-4, 1.3981999507e-3)
+
+        p = p.mul_add(r, 8.3334519073e-3)
+        p = p.mul_add(r, 4.1665795894e-2)
+        p = p.mul_add(r, 1.6666665459e-1)
+        p = p.mul_add(r, 5.0000001201e-1)
+        p = (p * r).mul_add(r, r) + 1.0
+
+        val n = <N>i32(k)
+        val half = n >> 1
+
+        p * two_to_f32(half) * two_to_f32(n - half)
+    end exp
+
+    /** Below `0.625` an odd polynomial in `x` (Cephes's `tanhf`), where `1 - 2 / (e^2x + 1)` would
+     * cancel; above it that form, which reaches exactly one once `e^2x` is large and stays there at an
+     * infinity. Both are computed on the magnitude and the sign put back on the encoding. */
+    tanh(self) -> Self
+        val bits = self.bits()
+        val a = <N>f32.from_bits(bits & 0x7fffffff)
+        val z = a * a
+
+        var p = z.mul_add(-5.70498872745e-3, 2.06390887954e-2)
+
+        p = p.mul_add(z, -5.37397155531e-2)
+        p = p.mul_add(z, 1.33314422036e-1)
+        p = p.mul_add(z, -3.33332819422e-1)
+
+        val t = (a < 0.625).select((p * z).mul_add(a, a), 1.0 - 2.0 / ((a + a).exp() + 1.0))
+
+        <N>f32.from_bits(t.bits() | bits & 0x80000000)
+    end tanh
+end <N>f32
+
+// Two to each lane's power, written as the encoding: the biased exponent in the exponent field and a
+// zero significand. Every power `exp` asks for is a normal number.
+private two_to_f32[const N: usize](e: <N>i32) -> <N>f32 = <N>f32.from_bits(<N>u32((e + 127) << 23))
+
+private two_to_f64[const N: usize](e: <N>i64) -> <N>f64 = <N>f64.from_bits(<N>u64((e + 1023) << 52))
+
+/** binary64: the same reduction and scale, with `e^r` from its Taylor polynomial to the thirteenth
+ * power (whose remainder is below a hundredth of an ulp on `|r| <= ln 2 / 2`), fdlibm's split of
+ * `ln 2`, and a clamp of `[-746, 710]`. `tanh` below `0.625` is Cephes's rational form. */
+impl[const N: usize] VectorFloat for <N>f64
+    exp(self) -> Self
+        val x = (self > 710.0).select(710.0, (self < -746.0).select(-746.0, self))
+        val k = (x * 1.4426950408889634).round()
+        val r = (-k).mul_add(1.90821492927058770002e-10, (-k).mul_add(6.93147180369123816490e-01, x))
+
+        var p = r.mul_add(1.6059043836821613e-10, 2.08767569878681e-09)
+
+        p = p.mul_add(r, 2.505210838544172e-08)
+        p = p.mul_add(r, 2.755731922398589e-07)
+        p = p.mul_add(r, 2.7557319223985893e-06)
+        p = p.mul_add(r, 2.48015873015873e-05)
+        p = p.mul_add(r, 0.0001984126984126984)
+        p = p.mul_add(r, 0.001388888888888889)
+        p = p.mul_add(r, 0.008333333333333333)
+        p = p.mul_add(r, 0.041666666666666664)
+        p = p.mul_add(r, 0.16666666666666666)
+        p = p.mul_add(r, 0.5)
+        p = (p * r).mul_add(r, r) + 1.0
+
+        val n = <N>i64(k)
+        val half = n >> 1
+
+        p * two_to_f64(half) * two_to_f64(n - half)
+    end exp
+
+    tanh(self) -> Self
+        val bits = self.bits()
+        val a = <N>f64.from_bits(bits & 0x7fffffffffffffff)
+        val z = a * a
+
+        var p = z.mul_add(-9.64399179425052238628e-1, -9.92877231001918586564e1)
+
+        p = p.mul_add(z, -1.61468768441708447952e3)
+
+        var q = z + 1.12811678491632931402e2
+
+        q = q.mul_add(z, 2.23548839060100448583e3)
+        q = q.mul_add(z, 4.84406305325125486048e3)
+
+        val t = (a < 0.625).select((p * z / q).mul_add(a, a), 1.0 - 2.0 / ((a + a).exp() + 1.0))
+
+        <N>f64.from_bits(t.bits() | bits & 0x8000000000000000)
+    end tanh
+end <N>f64
