@@ -2157,6 +2157,27 @@ print(xs[0], xs[1], xs[2])
 10 20 30
 ```
 
+**A function type with no `->` yields `unit`**, as a declaration with no `->` does: `*extern(*u8)` is
+`*extern(*u8) -> unit`, and `Fn(int)` is `Fn(int) -> unit`. The two spellings are one type, so a value
+of either is assigned to the other, and a diagnostic prints the long form.
+
+```sysl
+extern malloc(n: usize) -> *u8
+extern free(p: *u8)
+
+val release: *extern(*u8) = &free
+val same: *extern(*u8) -> unit = release
+
+val p = malloc(8)
+
+same(p)
+print("freed")
+```
+
+```output
+freed
+```
+
 **`&f` is the address**, and the `&` is the same one the [memory model](/reference/memory/) gives
 every other address. A bare `f` keeps its ordinary meaning — the capture-free closure — because a
 spelling that meant a sysl callable in one slot and a C address in another would be choosing

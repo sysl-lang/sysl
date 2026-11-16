@@ -1,0 +1,193 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A function type written with no `->` yields `unit`, as a declaration with no `->` does:
+// `*extern(*u8)` is `*extern(*u8) -> unit` and `Fn(int)` is `Fn(int) -> unit` (`parse_type.sysl`'s
+// `parse_arrow_result`).
+
+private efu_outcome(text: string) -> (string, int)
+    val root = make_temp_dir("sysl-efu").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end efu_outcome
+
+private efu_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = efu_outcome(text)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+end efu_prints
+
+private efu_refused(text: string, part: string)
+    if xvr_no_library() then return
+
+    val out = efu_outcome(text)
+
+    assert_eq(out.1, -1, out.0)
+    assert(out.0.index_of(part).is_some(), out.0)
+end efu_refused
+
+@test("a '*extern(*u8)' field holds free and is called")
+efu_extern_pointer_to_free_through_a_field()
+    efu_prints(raw"""
+extern malloc(n: usize) -> *u8
+extern free(p: *u8)
+
+struct Owner
+    release: *extern(*u8)
+
+main()
+    val o = Owner(&free)
+    val p = malloc(16)
+
+    o.release(p)
+    print("freed")
+""", "freed\n")
+
+@test("a function type names no parameters, with or without an arrow")
+efu_named_parameter_is_refused()
+    efu_refused(raw"""
+extern free(p: *u8)
+
+val release: *extern(p: *u8) = &free
+
+main()
+    print("ok")
+""", "')' expected")
+
+private efu_trampoline() -> string = raw"""
+var seen = 0
+
+@export
+bump(n: i32)
+    seen += n
+
+"""
+
+@test("an exported function is called through the short form")
+efu_a_trampoline_called_through_the_pointer()
+    efu_prints(efu_trampoline() + raw"""
+main()
+    val f: *extern(i32) = &bump
+
+    f(3)
+    f(4)
+    print(seen)
+""", "7\n")
+
+@test("the short and long spellings are one type")
+efu_both_spellings_are_one_type()
+    efu_prints(efu_trampoline() + raw"""
+main()
+    var short: *extern(i32) = &bump
+    var long: *extern(i32) -> unit = short
+
+    short = long
+    long(5)
+    short(6)
+    print(seen)
+""", "11\n")
+
+@test("an array element and a parameter take the short form")
+efu_an_array_and_a_parameter_of_the_short_form()
+    efu_prints(efu_trampoline() + raw"""
+call_twice(f: *extern(i32), n: i32)
+    f(n)
+    f(n)
+
+main()
+    val table: [2]*extern(i32) = [&bump, &bump]
+
+    call_twice(table[1], 2)
+    print(seen)
+""", "4\n")
+
+@test("'*extern()' with nothing at all")
+efu_empty_parameter_list()
+    efu_prints(raw"""
+var hits = 0
+
+@export
+hit()
+    hits += 1
+
+main()
+    val f: *extern() = &hit
+
+    f()
+    print(hits)
+""", "1\n")
+
+@test("'Fn(int)' with no arrow is 'Fn(int) -> unit'")
+efu_a_plain_function_type_with_no_arrow()
+    efu_prints(raw"""
+var total = 0
+
+apply(f: &Fn(int), n: int)
+    f(n)
+
+main()
+    val g: &Fn(int) -> unit = n -> total += n
+
+    apply(g, 4)
+    apply(n -> total += n, 5)
+    print(total)
+""", "9\n")
+
+@test("a written result type still wins")
+efu_a_result_type_still_wins()
+    efu_prints(raw"""
+@export
+twice(n: i32) -> i32 = n * 2
+
+main()
+    val f: *extern(i32) -> i32 = &twice
+
+    print(f(4))
+""", "8\n")
+
+@test("a mismatch diagnostic prints the unit result")
+efu_diagnostic_prints_the_unit_result()
+    efu_refused(raw"""
+@export
+twice(n: i32) -> i32 = n * 2
+
+main()
+    val f: *extern(i32) = &twice
+""", "*extern(i32) -> unit")
+
+@test("a type after the parameter list with no arrow is still refused")
+efu_garbage_after_the_parameter_list_is_still_refused()
+    efu_refused(raw"""
+main()
+    val f: *extern(i32) i32 = null
+""", "expected")
+
+@test("an arrow with no result is still refused")
+efu_a_bare_arrow_still_needs_its_result()
+    efu_refused(raw"""
+main()
+    val f: *extern(i32) -> = null
+""", "")
