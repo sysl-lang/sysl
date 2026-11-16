@@ -419,6 +419,49 @@ print(unix(long).is_err(), unix(long[0..<max_unix_path]).is_ok(), unix("").is_er
 true true true
 ```
 
+## Who is on the other end
+
+**`Socket.peer_credentials()` answers the user and group of the process at the other end of a Unix
+domain connection, and its process id where the system gives it** — so a server can authenticate the
+operating-system user talking to it without a password. The ids are the `u32`s `sysl.process.user()` and
+`group()` answer, so a peer is compared with `==`, and `sysl.process.user_name` turns an id into a
+name:
+
+```sysl
+import sysl.fs.{make_temp_dir, remove_dir_all}
+import sysl.net.{unix, unix_connect, unix_listen}
+import sysl.path.join
+import sysl.process.{group, pid, user, user_name}
+
+val dir = make_temp_dir("net-doc-peer-").unwrap()
+val at = unix(join(dir, "peer.sock")).unwrap()
+var server = unix_listen(at).unwrap()
+var client = unix_connect(at).unwrap()
+var accepted = server.accept().unwrap()
+val peer = accepted.peer_credentials().unwrap()
+
+print(peer.uid == user(), peer.gid == group())
+print(peer.pid == Some(pid()))
+print(user_name(peer.uid).unwrap() == user_name(user()).unwrap())
+
+accepted.close().unwrap()
+client.close().unwrap()
+server.close().unwrap()
+remove_dir_all(dir).unwrap()
+```
+
+```output
+true true
+true
+true
+```
+
+**Only a Unix domain socket has credentials.** A TCP socket answers the *not supported on this target*
+error rather than a made-up user, and a closed socket answers `NotOpen`. **`pid` is an `Option`**: Linux
+(`SO_PEERCRED`) and macOS (`LOCAL_PEERPID`) give it, and a system that gives only the user and group
+answers `None`. The hook beneath is `sysl_net_peer_credentials(fd, out) -> int`, writing a
+`sysl.net.sys.Credentials` (`uid`, `gid`, and `pid` as an `i64`, -1 for unknown).
+
 ## An address is a sysl value
 
 `Address` is an IP address and a port: four bytes or sixteen, a port, and — for a link-local IPv6
@@ -471,6 +514,7 @@ hooks, each an `extern` no module of the library defines.
 | `sysl_net_send_to(fd, from, len, to) -> isize`, `sysl_net_recv_from(fd, into, room, from) -> isize` | a count of bytes, the sender written into `from` |
 | `sysl_net_shutdown(fd, how) -> int`, `sysl_net_close(fd) -> int` | zero |
 | `sysl_net_option(fd, which, value) -> int` | zero; `read_timeout`, `write_timeout` (milliseconds), `reuse_address`, `non_blocking`, `send_buffer` or `recv_buffer` (bytes, positive); `send_buffer_size` and `recv_buffer_size` ignore `value` and answer the size in bytes |
+| `sysl_net_peer_credentials(fd, out) -> int` | zero, a Unix domain peer's user, group and process id (-1 if unknown) written into `out` |
 | `sysl_net_resolve(host, host_len, port, passive, out, room) -> int` | how many addresses it wrote |
 
 **Each answers zero or more for success and the `IoError` code negated for a failure** — the contract
