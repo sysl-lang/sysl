@@ -3,6 +3,7 @@ module sysl.slices
 
 import sysl.raw.ptr_cast
 import sysl.sys.sysl_memmove
+import sysl.vectors
 
 /** Operations over a built-in slice, and the pointer a C binding needs to hand one across.
  *
@@ -213,11 +214,52 @@ const swap[T](xs: []T, i: usize, j: usize)
  *
  * Walks from both ends toward the middle, so each element is written once and an odd middle element
  * is left alone rather than swapped with itself.
+ *
+ * **A slice of 8-, 16-, 32- or 64-bit integers moves a vector register's worth from each end at a
+ * time**, turning each block's lanes around on the way, and finishes the middle one element at a
+ * time. LLVM leaves a two-ended swap scalar at every element type -- clang does the same with the C
+ * loop -- so the blocks are written out rather than left to the optimiser. Every other element type
+ * takes the element loop, a counted one included, so what is written and in what order is the same
+ * as before for it. The answer is the same either way, and both paths fold where a constant asks for
+ * one.
  */
 const reverse[T](xs: []T)
-    if xs.len > 1
-        var i: usize = 0
-        var j = xs.len - 1
+    if const in_lanes[T]()
+        reverse_blocks[T, 16 / sizeof(T)](xs)
+    else
+        reverse_between(xs, 0, xs.len)
+
+// Whether `T` is an integer of 8, 16, 32 or 64 bits, so that a vector of it is laid out exactly as
+// the slice is. A width short of its storage (`u12`, `i24`) loses the storage's top bit when wrapped
+// into the type, and a full one keeps it at either signedness.
+private const in_lanes[T]() -> bool
+    if const T: Integer
+        sizeof(T) <= 8 && u64.wrap(T.wrap(u64(1) << (sizeof(T) * 8 - 1))) != 0
+    else
+        false
+
+// The two ends exchanged a block of `W` lanes at a time, each block turned around as it moves, while
+// at least two blocks remain; what is left in the middle goes one element at a time.
+private const reverse_blocks[T: Integer, const W: usize](xs: []T)
+    var i: usize = 0
+    var j = xs.len
+
+    while j - i >= 2 * W
+        val lo: <W>T = xs.load(i)
+        val hi: <W>T = xs.load(j - W)
+
+        xs.store(i, hi.shuffle(vectors.reverse[W]()))
+        xs.store(j - W, lo.shuffle(vectors.reverse[W]()))
+        i += W
+        j -= W
+
+    reverse_between(xs, i, j)
+
+// The elements from `from` up to `to` turned around, walking in from both ends.
+private const reverse_between[T](xs: []T, from: usize, to: usize)
+    if to - from > 1
+        var i = from
+        var j = to - 1
 
         while i < j
             swap(xs, i, j)
