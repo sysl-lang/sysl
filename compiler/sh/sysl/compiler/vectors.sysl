@@ -4,9 +4,9 @@ import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.math.bigint.{BigInt, from_int, to_string}
 
-// The fourteen methods a vector answers to (the lane-wise ones, `abs`, `mul_add`, `maximum` and
-// `minimum`, among them, and `bits`, `lookup` and `compress`), the three a run of them in memory does,
-// and the comparison that yields a mask.
+// The methods a vector answers to (the lane-wise ones -- `abs`, `mul_add`, `maximum`, `minimum`, the
+// square root and the four roundings -- among them, and `bits`, `lookup` and `compress`), the three a
+// run of them in memory does, the associated `from_bits`, and the comparison that yields a mask.
 //
 // None of it is a *lookup*: nothing declares `select` or `sum`, so there is no member to find and no
 // overload set to narrow -- the name is recognised, the lanes are checked, and one node is built.
@@ -19,7 +19,13 @@ import sysl.math.bigint.{BigInt, from_int, to_string}
 is_vector_method(name: string) -> bool =
     name == "select" || name == "shuffle" || name == "sum" || name == "min" || name == "max" ||
         name == "any" || name == "all" || name == "abs" || name == "mul_add" || name == "maximum" ||
-        name == "minimum" || name == "bits" || name == "lookup" || name == "compress"
+        name == "minimum" || is_lane_float_op(name) || name == "bits" || name == "lookup" ||
+        name == "compress"
+
+// The lane-wise float operations that are one LLVM intrinsic each and are named as the scalar
+// `Float` methods are: `v.sqrt()` is `llvm.sqrt` over the register, as `x.sqrt()` is over one lane.
+is_lane_float_op(name: string) -> bool =
+    name == "sqrt" || name == "floor" || name == "ceil" || name == "round" || name == "trunc"
 
 // The three names a slice or an array answers with a vector's lanes. They are the *receiver's*
 // methods and not the vector's, because what a load or a gather needs is an address and a length and
@@ -141,12 +147,9 @@ vector_method(cx: &Analyzer, span: Span, v: Type, tr: TExpr, name: string,
     if name == "lookup" then return vector_lookup(cx, span, v, parts.0, elem, tr, args)
     if name == "compress" then return vector_compress(cx, span, v, parts.0, tr, args)
 
-    if name == "bits"
-        if !is_mask then
-            return cx.err(span, s"'bits' reads a mask's lanes as the bits of an integer, so it is read " +
-                          s"off a mask — the '<${parts.0}>bool' a comparison yields, as in " +
-                          s"'(a == b).bits()'. ${type_show(v)} is not one")
+    if name == "bits" && !is_mask then return vector_bits(cx, span, v, parts.0, lane, tr, args)
 
+    if name == "bits"
         if !args.is_empty() then
             cx.fault(span, s"'bits' takes no arguments — it reads the lanes of the ${type_show(v)} it is " +
                      "read off")
@@ -164,6 +167,7 @@ vector_method(cx: &Analyzer, span: Span, v: Type, tr: TExpr, name: string,
     end if
 
     if name == "abs" then return vector_abs(cx, span, v, lane, tr, args)
+    if is_lane_float_op(name) then return vector_lane_float(cx, span, v, lane, tr, name, args)
     if name == "mul_add" then return vector_mul_add(cx, span, v, elem, lane, tr, args)
     if name == "maximum" || name == "minimum" then
         return vector_maximum(cx, span, v, elem, lane, tr, name, args)
@@ -239,6 +243,120 @@ private one_operand(x: TExpr) -> Buf[TExpr]
     out.push(x)
     out
 end one_operand
+
+// `v.sqrt()`, `v.floor()`, `v.ceil()`, `v.round()` and `v.trunc()` -- the scalar `Float` method of
+// the same name in every lane, one `llvm.sqrt`, `llvm.floor`, `llvm.ceil`, `llvm.round` or
+// `llvm.trunc` over the register. **`round` is the scalar's `round`**: a half goes away from zero,
+// as C's `round` does, and not to even. The square root is correctly rounded in each lane, so every
+// lane is bit for bit the scalar answer; the other four are exact.
+//
+// The widths are `mul_add`'s and `maximum`'s, `f32` and `f64`: a half-width lane is computed at
+// `f32` by the scalar methods and is widened first here too, which the refusal says.
+private vector_lane_float(cx: &Analyzer, span: Span, v: Type, lane: Type, tr: TExpr, name: string,
+                          args: Buf[Expr]) -> TExpr
+    val wide = lane match
+        Floating(bits, brain) -> !brain && (bits == 32 || bits == 64)
+        _ -> false
+
+    if !wide
+        val instead = lane match
+            Floating(_, _) -> " — widen the lanes to f32 first, as the scalar method does"
+            _ -> ""
+
+        return cx.err(span, s"'$name' is defined for f32 and f64 lanes, and ${type_show(v)} is not " +
+                      s"one$instead")
+    end if
+
+    if !args.is_empty() then
+        cx.fault(span, s"'$name' takes no arguments — it works on each lane of the ${type_show(v)} " +
+                 "it is read off")
+
+    TExpr(span, TVecOp(name, one_operand(tr), v))
+end vector_lane_float
+
+// Whether a `bits` node reads a mask (its lanes packed into an integer) rather than a float vector
+// (its lanes' encodings, one bitcast).
+is_mask_bits(operands: Buf[TExpr]) -> bool = texpr_type(operands[0]) match
+    Vector(_, elem) -> underlying(*elem) == Bool
+    _ -> false
+
+// The unsigned integer of a float lane's own width: what `FloatBits` calls its `Word`.
+private float_word(lane: Type) -> Option[Type] = lane match
+    Floating(bits, _) -> if bits == 128 then None else Some(Integer(bits, false, false))
+    _ -> None
+
+// `v.bits()` -- every lane's IEEE 754 encoding as the unsigned integer of its width, `<4>f32` to
+// `<4>u32`, as the scalar `x.bits()` is. **A reinterpretation, not a conversion**: one `bitcast` of
+// the register, so a negative zero, an infinity and a NaN's payload all come through as their bits.
+private vector_bits(cx: &Analyzer, span: Span, v: Type, n: int, lane: Type, tr: TExpr,
+                    args: Buf[Expr]) -> TExpr
+    val word = float_word(lane)
+
+    if word.is_none() then
+        return cx.err(span, s"'bits' is a float lane's encoding, and ${type_show(v)} has no float " +
+                      s"lanes — '<$n>U(v)' converts lanes to another type; a mask's lanes as an " +
+                      s"integer are read off a mask, as in '(a == b).bits()'")
+
+    if !args.is_empty() then
+        cx.fault(span, s"'bits' takes no arguments — it reads the encoding of each lane of the " +
+                 s"${type_show(v)} it is read off")
+
+    TExpr(span, TVecOp("bits", one_operand(tr), Vector(n, word.unwrap())))
+end vector_bits
+
+// Where `<4>f32.from_bits` was written: the parser reads the dot as part of a qualified lane name, so
+// the vector type and the associated function's name are taken back apart here. A name that is a
+// type somewhere -- `<4>geometry.Small` -- is left alone, and so is one whose last part is not
+// written as a function's name is.
+vector_selection(cx: &Analyzer, written: TypeRef) -> Option[(TypeRef, string)]
+    val (lanes, elem) = *written.kind match
+        VectorType(l, e) -> (l, e)
+        _ -> return None
+
+    val name = *elem.kind match
+        NamedType(n, targs) -> if targs.is_empty() then n else return None
+        _ -> return None
+
+    val cut = last_dot_in(name)
+
+    if cut.is_none() || lookup_type_key(cx.an, cx.scope, name).is_some() then return None
+
+    val at = cut.unwrap()
+    val member = name[at + 1..<name.bytes.len]
+
+    if member.bytes.len == 0 || member.bytes[0] < u8('a') || member.bytes[0] > u8('z') then return None
+
+    val on = type_ref(written.span, VectorType(lanes, named_type(elem.span, name[0..<at])))
+
+    Some((on, member))
+end vector_selection
+
+// An associated function called through a vector type: `<4>f32.from_bits(b)` is the float register
+// whose lanes have the encodings `b` holds, as `f32.from_bits(x)` is for one. It takes the unsigned
+// vector `bits()` answers and nothing else, as the scalar takes its `Word`.
+vector_static(cx: &Analyzer, span: Span, v: Type, name: string, args: Buf[Expr]) -> TExpr
+    val parts = repr(v) match
+        Vector(n, e) -> (n, underlying(*e))
+        _ -> (0, Unknown)
+    val word = float_word(parts.1)
+
+    if name != "from_bits" || word.is_none() then
+        return cx.err(span, s"${type_show(v)} has no associated function '$name'")
+
+    if args.len() != 1 then
+        return cx.err(span, s"'from_bits' takes the encodings, one vector of them — " +
+                      s"'${type_show(v)}.from_bits(b)', and ${quantity(args.len(), "argument")} " +
+                      s"${if args.len() == 1 then "was" else "were"} given")
+
+    val want = Vector(parts.0, word.unwrap())
+    val b = type_expr(cx, args[0], Some(want))
+
+    if !type_eq(repr(texpr_type(b)), want) then
+        return cx.err(args[0].span, s"'from_bits' of ${type_show(v)} takes the ${type_show(want)} " +
+                      s"'bits()' answers, and ${type_show(texpr_type(b))} was given")
+
+    TExpr(span, TVecOp("from_bits", one_operand(b), v))
+end vector_static
 
 // `a.mul_add(b, c)` -- `a * b + c` in every lane with the product never rounded on its own, one
 // `llvm.fma` over the register. The name and meaning are the scalar `mul_add`'s, and the widths are

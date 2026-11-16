@@ -1,0 +1,455 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{Search, join, split}
+
+// A float vector's square root, its four roundings and its encoding (`reference/vectors.md § Square
+// roots and roundings`, `§ A float's encoding, lane by lane`). Each rounding is one intrinsic over the
+// register, so the IR is checked for the single call and for the absence of a scalar one; the values
+// are checked lane by lane against the scalar method of the same name over the inputs where a
+// lane-wise rewrite would differ -- a NaN, both zeros, both infinities, subnormals, the halfway cases
+// of `round`, and the largest values that still have a fraction.
+
+private vlm_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end vlm_ready
+
+private vlm_ran(text: string) -> string
+    val root = make_temp_dir("sysl-vlm").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+    var out = ""
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) -> out = failure_text(why)
+        Ok(_) -> capture(exe, [], "", [], true) match
+            Err(_) -> out = "the program that was built could not be run"
+            Ok(said) -> out = said.text
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end vlm_ran
+
+private vlm_says(text: string, want: string)
+    val said = enm_err(text)
+
+    assert(said.contains(want), s"expected it to say: $want\nit said: $said")
+
+// How many lines of `text` contain `needle`.
+private vlm_count(text: string, needle: string) -> int
+    var n = 0
+
+    for line in split(text, "\n")
+        if line.contains(needle) then n += 1
+
+    n
+end vlm_count
+
+// -- the values, against the scalar method --------------------------------------------------------
+
+// The comparison every value test makes: each lane's bits equal the scalar method's, except that a
+// NaN need only be a NaN (a payload is the machine's to choose for an operation that makes one).
+private vlm_agree_prelude() -> string = raw"""
+    import sysl.hint.black_box
+
+    same32(x: f32, y: f32) -> bool = if x != x then y != y else x.bits() == y.bits()
+
+    same64(x: real, y: real) -> bool = if x != x then y != y else x.bits() == y.bits()
+    """
+
+@test("every f32 lane is the scalar method's answer, over NaN, zeros, infinities, subnormals and halves")
+vlm_f32_against_scalar()
+    if !vlm_ready() then return
+
+    assert_eq(vlm_ran(vlm_agree_prelude() + raw"""
+        main()
+            val xs: [32]f32 = [0.0, -0.0, f32(infinity), -f32(infinity), f32(nan), -f32(nan),
+                               f32.from_bits(1), -f32.from_bits(1), f32.from_bits(0x007fffff),
+                               f32.from_bits(0x00800000), 0.5, -0.5, 1.5, -1.5, 2.5, -2.5,
+                               0.49999997, -0.49999997, 8388607.5, -8388607.5, 8388608.0, 16777215.0,
+                               1.0e30, -1.0e30, 3.4028235e38, -3.4028235e38, 2.0, 3.0, 0.1, -7.25,
+                               1.0e-40, 4.0]
+            var bad = 0
+            var i: usize = 0
+
+            while i < xs.len
+                val v: <8>f32 = black_box(xs[..]).load(i)
+                val s = v.sqrt()
+                val f = v.floor()
+                val c = v.ceil()
+                val r = v.round()
+                val t = v.trunc()
+
+                for const k in 0..<8
+                    val x = xs[i + k]
+
+                    if !same32(s[k], x.sqrt()) then bad += 1
+                    if !same32(f[k], x.floor()) then bad += 1
+                    if !same32(c[k], x.ceil()) then bad += 1
+                    if !same32(r[k], x.round()) then bad += 1
+                    if !same32(t[k], x.trunc()) then bad += 1
+
+                i += 8
+
+            print(bad)
+        """), "0\n")
+
+@test("every f64 lane is the scalar method's answer, over the same edges at binary64")
+vlm_f64_against_scalar()
+    if !vlm_ready() then return
+
+    assert_eq(vlm_ran(vlm_agree_prelude() + raw"""
+        main()
+            val xs: [24]real = [0.0, -0.0, infinity, -infinity, nan, -nan, real.from_bits(1),
+                                -real.from_bits(1), real.from_bits(0x000fffffffffffff), 0.5, -0.5,
+                                2.5, -2.5, 0.49999999999999994, -0.49999999999999994,
+                                4503599627370495.5, -4503599627370495.5, 4503599627370496.0, 1.0e300,
+                                -1.0e300, 2.0, 0.1, -7.25, 1.7976931348623157e308]
+            var bad = 0
+            var i: usize = 0
+
+            while i < xs.len
+                val v: <4>real = black_box(xs[..]).load(i)
+                val s = v.sqrt()
+                val f = v.floor()
+                val c = v.ceil()
+                val r = v.round()
+                val t = v.trunc()
+
+                for const k in 0..<4
+                    val x = xs[i + k]
+
+                    if !same64(s[k], x.sqrt()) then bad += 1
+                    if !same64(f[k], x.floor()) then bad += 1
+                    if !same64(c[k], x.ceil()) then bad += 1
+                    if !same64(r[k], x.round()) then bad += 1
+                    if !same64(t[k], x.trunc()) then bad += 1
+
+                i += 4
+
+            print(bad)
+        """), "0\n")
+
+@test("round goes away from zero at a half, as the scalar round does, and keeps a zero's sign")
+vlm_round_halves()
+    if !vlm_ready() then return
+
+    assert_eq(vlm_ran(raw"""
+        import sysl.hint.black_box
+
+        main()
+            val v: <8>f32 = black_box([0.5, 1.5, 2.5, -0.5, -2.5, 0.49999997, 8388607.5, -0.25])
+            val r = v.round()
+
+            print(r[0], r[1], r[2], r[3], r[4], r[5], r[6], 1.0 / r[7])
+
+            val w: <2>f64 = black_box([-0.5, 4503599627370495.5])
+            val q = w.round()
+
+            print(q[0], q[1], 1.0 / w.trunc()[0])
+        """), "1 2 3 -1 -3 0 8388608 -inf\n-1 4503599627370496 -inf\n")
+
+@test("the square root of a negative lane is a NaN and of an infinity is an infinity, the others exact")
+vlm_sqrt_edges()
+    if !vlm_ready() then return
+
+    assert_eq(vlm_ran(raw"""
+        import sysl.hint.black_box
+
+        main()
+            val v: <4>f32 = black_box([-1.0, f32(infinity), -0.0, 6.25])
+            val s = v.sqrt()
+
+            print(s[0] != s[0], s[1], 1.0 / s[2], s[3])
+        """), "true inf -inf 2.5\n")
+
+@test("a lane-wise sqrt in a generic kernel works at every width it is instantiated at")
+vlm_generic_kernel()
+    if !vlm_ready() then return
+
+    assert_eq(vlm_ran(raw"""
+        lens[const W: usize](xs: <W>f32, ys: <W>f32) -> <W>f32 = xs.mul_add(xs, ys * ys).sqrt()
+
+        main()
+            val a = lens(<4>f32([3, 5, 8, 7]), <4>f32([4, 12, 15, 24]))
+            val b = lens(<8>f32(3), <8>f32(4))
+            val c = <2>f64([2.7, -2.7]).floor() + <2>f64([2.2, -2.2]).ceil()
+
+            print(a[0], a[1], a[2], a[3], b[7], c[0], c[1])
+        """), "5 13 17 25 5 5 -5\n")
+
+// -- the encoding ---------------------------------------------------------------------------------
+
+@test("bits() is each lane's encoding, the scalar bits() lane by lane, NaN payloads included")
+vlm_bits_against_scalar()
+    if !vlm_ready() then return
+
+    assert_eq(vlm_ran(raw"""
+        import sysl.hint.black_box
+
+        main()
+            val v: <8>f32 = black_box([0.0, -0.0, f32(infinity), f32.from_bits(0x7fc00001),
+                                       f32.from_bits(0xffbfffff), f32.from_bits(1), -1.5, 3.4028235e38])
+            val b = v.bits()
+            var bad = 0
+
+            for const k in 0..<8
+                if b[k] != v[k].bits() then bad += 1
+
+            val back = <8>f32.from_bits(b)
+
+            for const k in 0..<8
+                if back[k].bits() != v[k].bits() then bad += 1
+
+            val d: <2>f64 = black_box([-0.0, real.from_bits(0x7ff0000000000001)])
+            val e = d.bits()
+
+            for const k in 0..<2
+                if e[k] != d[k].bits() || <2>f64.from_bits(e)[k].bits() != d[k].bits() then bad += 1
+
+            print(bad, f"${b[1]}%x ${b[3]}%x ${e[1]}%x")
+        """), "0 80000000 7fc00001 7ff0000000000001\n")
+
+@test("bits() of a half or a brain-float lane is a u16, and from_bits takes it back")
+vlm_half_bits()
+    if !vlm_ready() then return
+
+    assert_eq(vlm_ran(raw"""
+        main()
+            val h: <4>f16 = [f16(1.0), f16(-2.0), f16(-0.0), f16(65504.0)]
+            val g: <4>bf16 = [bf16(1.0), bf16(-2.0), bf16(-0.0), bf16(0.5)]
+            val hb = h.bits()
+            val gb = g.bits()
+            val back = <4>bf16.from_bits(gb)
+
+            print(f"${hb[0]}%x ${hb[1]}%x ${hb[2]}%x ${hb[3]}%x")
+            print(f"${gb[0]}%x ${gb[1]}%x ${gb[3]}%x", f32(back[1]), f32(<4>f16.from_bits(hb)[3]))
+        """), "3c00 c000 8000 7bff\n3f80 c000 3f00 -2 65504\n")
+
+@test("from_bits reads a literal at the unsigned vector, and the encoding is worked on as integers")
+vlm_from_bits_literal()
+    if !vlm_ready() then return
+
+    assert_eq(vlm_ran(raw"""
+        main()
+            val x = <4>f32.from_bits([0x3f800000, 0x40000000, 0, 0x80000000])
+            val v: <4>f32 = [-1.0, 2.0, -0.5, -0.0]
+            val m = <4>f32.from_bits(v.bits() & 0x7fffffff)
+
+            print(x[0], x[1], x[2], 1.0 / x[3])
+            print(m[0], m[1], m[2], 1.0 / m[3])
+        """), "1 2 0 -inf\n1 2 0.5 inf\n")
+
+@test("a module-qualified lane type still converts, and a vector type's own function is still found")
+vlm_qualified_lane_type()
+    if !vlm_ready() then return
+
+    val ir = cgz_ir_files([("geo.sysl", "module geo\n\ntype Small = int within 0..100\n"),
+                           ("main.sysl", "import geo\n\nval v: <4>int = [1, 2, 3, 4]\n" +
+                            "val w = <4>geo.Small(v)\nval x = <4>f32.from_bits(<4>u32(7))\n" +
+                            "print(w[3], x[0])\n")])
+
+    assert(ir.contains("define"), ir)
+    assert(!ir.contains("unknown type"), ir)
+
+private cgz_ir_files(files: []const (string, string)) -> string = xvr_ir(files)
+
+// -- the IR -----------------------------------------------------------------------------------------
+
+@test("each of the five is one vector intrinsic and no scalar call, at f32 and f64")
+vlm_ir_one_intrinsic()
+    if !vlm_ready() then return
+
+    for op in ["sqrt", "floor", "ceil", "round", "trunc"]
+        val main = cgz_main(s"val a: <4>f32 = [1.0, 2.0, 3.0, 4.0]\nprint(a.$op()[0])\n")
+
+        assert_eq(vlm_count(main, s"call <4 x float> @llvm.$op.v4f32(<4 x float> %"), 1, main)
+        assert_eq(vlm_count(main, s"@llvm.$op.f32"), 0, main)
+        assert_eq(vlm_count(main, s"@${op}f"), 0, main)
+
+        val wide = cgz_main(s"val a: <8>f64 = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]\nprint(a.$op()[0])\n")
+
+        assert_eq(vlm_count(wide, s"call <8 x double> @llvm.$op.v8f64(<8 x double> %"), 1, wide)
+        assert_eq(vlm_count(wide, s"@llvm.$op.f64"), 0, wide)
+
+@test("bits() and from_bits are one bitcast of the register each way")
+vlm_ir_bitcast()
+    if !vlm_ready() then return
+
+    val main = cgz_main("val a: <4>f32 = [1.0, 2.0, 3.0, 4.0]\nval b = a.bits()\n" +
+                        "val c = <4>f32.from_bits(b)\nprint(b[0], c[1])\n")
+
+    assert_eq(vlm_count(main, "bitcast <4 x float> %"), 1, main)
+    assert(main.contains("to <4 x i32>"), main)
+    assert_eq(vlm_count(main, "bitcast <4 x i32> %"), 1, main)
+    assert(main.contains("to <4 x float>"), main)
+    assert_eq(vlm_count(main, "@f32.bits"), 0, main)
+
+    val wide = cgz_main("val a: <2>f64 = [1.0, 2.0]\nprint(a.bits()[0])\n")
+
+    assert(wide.contains("bitcast <2 x double> %"), wide)
+    assert(wide.contains("to <2 x i64>"), wide)
+
+@test("in a @strict_fp body the square root and the roundings are the constrained ones")
+vlm_strict()
+    if !vlm_ready() then return
+
+    val program = raw"""
+        @strict_fp
+        roots(a: <4>f32) -> <4>f32 = a.sqrt() + a.floor() + a.round()
+
+        main()
+            val r = roots([4.0, 9.0, 2.5, 16.0])
+
+            print(r[0], r[1], r[3])
+        """
+
+    assert_eq(vlm_ran(program), "10 21 36\n")
+
+    val ir = cgz_ir(program)
+
+    assert(ir.contains("@llvm.experimental.constrained.sqrt.v4f32("), ir)
+    assert(ir.contains("@llvm.experimental.constrained.floor.v4f32("), ir)
+    assert(ir.contains("@llvm.experimental.constrained.round.v4f32("), ir)
+    assert(!ir.contains("call <4 x float> @llvm.sqrt."), ir)
+
+// -- what is refused --------------------------------------------------------------------------------
+
+@test("the five refuse a half-width lane, saying to widen it, and a non-float lane")
+vlm_refused_lanes()
+    if !enm_ready() then return
+
+    vlm_says("val a: <4>f16 = [f16(1.0), f16(2.0), f16(3.0), f16(4.0)]\nprint(f32(a.sqrt()[0]))\n",
+             "'sqrt' is defined for f32 and f64 lanes, and <4>f16 is not one — widen the lanes to f32 first")
+    vlm_says("val a: <4>bf16 = [bf16(1.0), bf16(2.0), bf16(3.0), bf16(4.0)]\nprint(f32(a.floor()[0]))\n",
+             "'floor' is defined for f32 and f64 lanes, and <4>bf16 is not one")
+    vlm_says("val a: <4>int = [1, 2, 3, 4]\nprint(a.round()[0])\n",
+             "'round' is defined for f32 and f64 lanes, and <4>int is not one")
+    vlm_says("val a: <4>f32 = [1.0, 2.0, 3.0, 4.0]\nprint((a < a).ceil()[0])\n",
+             "'ceil' is defined for f32 and f64 lanes, and <4>bool is not one")
+    vlm_says("val a: <2>q15 = [q15(0.5), q15(-0.5)]\nprint(a.trunc()[0])\n",
+             "'trunc' is defined for f32 and f64 lanes")
+
+@test("the five and bits() take no arguments")
+vlm_refused_arguments()
+    if !enm_ready() then return
+
+    vlm_says("val a: <4>f32 = [1.0, 2.0, 3.0, 4.0]\nprint(a.sqrt(2)[0])\n", "'sqrt' takes no arguments")
+    vlm_says("val a: <4>f32 = [1.0, 2.0, 3.0, 4.0]\nprint(a.bits(2)[0])\n", "'bits' takes no arguments")
+
+@test("bits() is refused on a vector with no float lanes")
+vlm_bits_refused()
+    if !enm_ready() then return
+
+    vlm_says("val a: <4>u32 = [1, 2, 3, 4]\nprint(a.bits()[0])\n",
+             "'bits' is a float lane's encoding, and <4>uint has no float lanes")
+
+@test("from_bits takes exactly the unsigned vector bits() answers, once")
+vlm_from_bits_refused()
+    if !enm_ready() then return
+
+    vlm_says("val i: <4>i32 = [0, 1, 2, 3]\nprint(<4>f32.from_bits(i)[0])\n",
+             "'from_bits' of <4>f32 takes the <4>uint 'bits()' answers, and <4>int was given")
+    vlm_says("val i: <2>u32 = [0, 1]\nprint(<4>f32.from_bits(i)[0])\n",
+             "'from_bits' of <4>f32 takes the <4>uint 'bits()' answers, and <2>uint was given")
+    vlm_says("val i: <2>u32 = [0, 1]\nprint(<2>f64.from_bits(i)[0])\n",
+             "'from_bits' of <2>real takes the <2>ulong 'bits()' answers")
+    vlm_says("val i: <4>u32 = [0, 1, 2, 3]\nprint(<4>f32.from_bits(i, i)[0])\n",
+             "'from_bits' takes the encodings, one vector of them")
+    vlm_says("val i: <4>u32 = [0, 1, 2, 3]\nprint(<4>u32.from_bits(i)[0])\n",
+             "<4>uint has no associated function 'from_bits'")
+    vlm_says("val i: <4>u32 = [0, 1, 2, 3]\nprint(<4>f32.frobnicate(i)[0])\n",
+             "<4>f32 has no associated function 'frobnicate'")
+
+@test("the five and bits() are not evaluated while compiling, and the refusal names the method")
+vlm_const_refused()
+    if !enm_ready() then return
+
+    val said = enm_outcome(raw"""
+        root(x: f32) -> f32
+            val v: <4>f32 = [x, 1.0, x, 1.0]
+
+            v.sqrt()[0]
+
+        const R: f32 = root(4.0)
+
+        print(R)
+        """).0
+
+    assert(said.contains("a vector's lane-wise 'sqrt' is known only where the program runs"), said)
+
+    val bits_said = enm_outcome(raw"""
+        enc(x: f32) -> u32
+            val v: <4>f32 = [x, 1.0, x, 1.0]
+
+            v.bits()[0]
+
+        const B: u32 = enc(4.0)
+
+        print(B)
+        """).0
+
+    assert(bits_said.contains("a vector's lane-wise 'bits' is known only where the program runs"), bits_said)
+
+// -- a board target ---------------------------------------------------------------------------------
+
+// On a core with a single-precision unit the f32 lanes are instructions, so no libm name is left for
+// them; the f64 lanes and every lane of a soft-float build become the libm calls the scalar methods
+// make there too, which is what a freestanding image supplies for the scalar ones.
+@test("all of them build for thumb, with and without a floating-point unit, and f32 lanes are instructions on one")
+vlm_thumb_build()
+    if !vlm_ready() then return
+
+    val root = make_temp_dir("sysl-vlm-thumb").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", raw"""
+        @export("vlm_run")
+        vlm_run(x: f32, y: real) -> f32
+            val a: <4>f32 = [x, -x, 2.5, -3.5]
+            val d: <2>f64 = [y, -y]
+            val r = a.sqrt() + a.floor() + a.ceil() + a.round() + a.trunc()
+            val s = d.sqrt() + d.floor() + d.ceil() + d.round() + d.trunc()
+            val b = <4>f32.from_bits(r.bits() & 0x7fffffff)
+            val e = <2>f64.from_bits(s.bits())
+
+            b[0] + b[3] + f32(e[1])
+        """).unwrap()
+
+    for target in ["thumb-freestanding", "thumb-freestanding-softfp", "thumb-freestanding-soft"]
+        var lines: Buf[string] = buf()
+        val sink = &lines
+        val archive = s"$root/$target.a"
+        val code = run_cli(["sysl", "build-c", root, "--target", target, "-o", archive],
+                           (line) -> sink.push(line))
+
+        assert_eq(code, Fine, s"$target: ${join(lines.view(), "\n")}")
+
+        if target == "thumb-freestanding"
+            val listed = capture("nm", ["-u", archive], "", [], true) match
+                Err(_) -> ""
+                Ok(o) -> o.text
+
+            for name in ["sqrtf", "floorf", "ceilf", "roundf", "truncf"]
+                for line in split(listed, "\n")
+                    assert(line.trim() != name && !line.ends_with(s" $name"), s"$name is a call: $listed")
+        end if
+
+    remove_dir_all(root).unwrap_or(())
+end vlm_thumb_build
