@@ -229,14 +229,79 @@ end walk_at
 private value_helper(e: *Emit, ty: Type, retain: bool) -> string
     val name = s"arc.${if retain then "copy" else "dispose"}.${mangle(ty)}"
 
+    note_tag_test(e, ty)
     request_helper(e, name, HrValue(ty, retain))
 end value_helper
 
 private slot_helper(e: *Emit, ty: Type, retain: bool) -> string
     val name = s"arc.${if retain then "copy_at" else "dispose_at"}.${mangle(ty)}"
 
+    note_tag_test(e, ty)
     request_helper(e, name, HrSlot(ty, retain))
 end slot_helper
+
+// Where some of an enum's variants hold a count and some do not, every call of its walk is guarded by
+// a test of the tag written in line (`arc_fastpath.sysl`). All four helpers are noted at once: a large
+// value's call is turned from the value form into the address form after it is written.
+private note_tag_test(e: *Emit, ty: Type)
+    val test = underlying(ty) match
+        Enum(d) -> tag_test(d)
+        _ -> None
+
+    if test.is_none() then return
+
+    val m = mangle(ty)
+
+    e.tag_tests.put(s"arc.copy.$m", (test.unwrap(), false))
+    e.tag_tests.put(s"arc.dispose.$m", (test.unwrap(), false))
+    e.tag_tests.put(s"arc.copy_at.$m", (test.unwrap(), true))
+    e.tag_tests.put(s"arc.dispose_at.$m", (test.unwrap(), true))
+end note_tag_test
+
+// The test that says a value of the enum holds a count, where some of its variants hold one and some
+// do not; nothing where every variant does, or none does, since then the tag decides nothing.
+//
+// One counted variant is an equality. Otherwise, where every tag is below 63, a counted variant is a
+// bit of a constant mask; past that, a run of consecutive counted tags is a range. Anything else is
+// left to the helper.
+tag_test(d: &EnumType) -> Option[TagTest]
+    if d.simple then return None
+
+    var counted: Buf[long] = buf()
+    var high: long = 0
+    var small = true
+
+    for variant in d.variants
+        if variant.tag.to_long().is_none() then return None
+
+        val tag = variant.tag.to_long().unwrap()
+
+        if tag < 0 || tag > 62 then small = false
+        else if tag > high then high = tag
+
+        if fields_hold_counted(variant.fields) then counted.push(tag)
+
+    if counted.is_empty() || counted.len() == d.variants.len() then return None
+
+    if counted.len() == 1 then return Some(TagIs(counted[0]))
+
+    if small
+        var mask: long = 0
+
+        for tag in counted
+            mask = mask | (long(1) << tag)
+
+        return Some(TagAmong(mask, if high < 32 then 32 else 64))
+
+    var low = counted[0]
+    var top = counted[0]
+
+    for tag in counted
+        if tag < low then low = tag
+        if tag > top then top = tag
+
+    if top - low + 1 == long(counted.len()) then Some(TagWithin(low, top - low + 1)) else None
+end tag_test
 
 // Asks for a helper once, and hands back the name -- which is what a caller wants, since it asked in
 // order to call the thing. Generating one may ask for another, so it is a queue rather than a
@@ -1179,18 +1244,16 @@ end own_box
 // Hands a statement to the scope being emitted. Nothing is emitted here -- the `defer` itself costs
 // no instruction, and the statement is laid down at each edge that leaves the block.
 //
-// An `errdefer` is held whole, so that the way out laying it down can tell it from a `defer`.
+// **The statement is held whole**, as the `TDefer` it arrived in. One written statement can be
+// analyzed into several -- `_ = f()` declares its hidden local, writes it and empties it again --
+// and a scope lays what it holds last-first, so held one by one they would run backwards: the
+// emptying store before the declaration, reading storage nothing has written. Held whole, they run
+// in the order they were written, and an `errdefer` is told from a `defer` by the same entry.
 defer_stmts(e: *Emit, stmts: Buf[TStmt], when: TDeferWhen)
     if e.defer_marks.is_empty() then return
 
-    when match
-        TEveryExit ->
-            for stmt in stmts
-                e.defers.push(stmt)
-                e.defer_at.push(e.owned_slots.len())
-        TFailureExit(_) ->
-            e.defers.push(TDefer(stmts, when))
-            e.defer_at.push(e.owned_slots.len())
+    e.defers.push(TDefer(stmts, when))
+    e.defer_at.push(e.owned_slots.len())
 end defer_stmts
 
 // Emits the releases for the innermost scope without popping it -- the guard-failure path out of a
@@ -1320,11 +1383,28 @@ private lay_deferred(e: *Emit, run: Buf[TStmt])
 
     e.exit = Leaving
 
-    if on_failure(run[0]) then failure_run(e, exit, run) else gen_stmt(e, run[0])
+    if on_failure(run[0]) then failure_run(e, exit, run) else lay_in_order(e, run[0])
 
     e.exit = exit
     nowrap_resume(e)
 end lay_deferred
+
+// A `defer`'s statements, first written first, **in a scope of their own**. A local the statement
+// declares -- the hidden one of `_ = f()` -- is owned by that scope and given back as the laying
+// ends. Owned by the scope being left instead, it would outlive the laying: a `?` that lays the
+// statement down on its way out would leave the local registered with the function's scope, and the
+// function's ordinary end would release it before its own laying had written it.
+private lay_in_order(e: *Emit, held: TStmt)
+    push_owned(e)
+
+    held match
+        TDefer(stmts, _) ->
+            for stmt in stmts
+                gen_stmt(e, stmt)
+        _ -> gen_stmt(e, held)
+
+    pop_owned(e)
+end lay_in_order
 
 // Whether a scheduled statement is an `errdefer`, which a scope holds whole -- with its binder --
 // rather than as the statements it schedules.
@@ -1378,8 +1458,13 @@ private lay_failure_run(e: *Emit, run: Buf[TStmt], v: Val, ty: Type)
                     emit(e, InStore(lty(e, bty), payload[0], slot, AccPlain, None))
                 end if
 
+                // Its own scope, as a `defer`'s laying has (`lay_in_order`).
+                push_owned(e)
+
                 for stmt in stmts
                     gen_stmt(e, stmt)
+
+                pop_owned(e)
             _ -> ()
 end lay_failure_run
 

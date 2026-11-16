@@ -1868,8 +1868,8 @@ Both are ordinary functions in the standard module:
 
 ```sysl
 panic(msg: string) -> never
-    print("panic:", msg)
-    exit(1)
+    eprints("panic: " + msg + "\n")
+    abort()
 
 assert(cond: bool, msg: string)
     if !cond then panic(msg)
@@ -1879,9 +1879,11 @@ They exist because `require` is a promise about a **call**, checked on entry, an
 statement has no contract to hang a claim on — the contract was about the arguments, four statements
 ago.
 
-They stop the program the way `unwrap` does — a line naming what happened, then the hosted exit —
+They stop the program the way `unwrap` does — a line on standard error naming what happened and
+where, then `abort` ([what stopping looks like](/reference/errors/#what-stopping-looks-like)) —
 rather than through the trap instruction, because **a check a program makes is one the compiler
-cannot see, and the message is the whole point of it.** The message is required rather than
+cannot see, and the message is the whole point of it.** (The library's own version streams the
+message rather than building a string, so it is callable from a `@no_alloc` module.) The message is required rather than
 defaulted, because the condition's source is not available to print and a failure saying only
 "assertion failed" sends its reader looking for which one.
 
@@ -2485,7 +2487,7 @@ this reaches 'c_usleep', which blocks, and 'nap' declared '@no_block'
 **The standard library marks its own waiting operations**: `sysl.posix.time`'s `sleep` and
 `nanosleep`, `Mutex.with` and `Mutex.lock_raw`, `Thread.join`, `Channel.send` and
 `Channel.receive`, `sysl.net`'s `Socket.connect`, `accept`, `send`, `send_all` and `recv` and
-`UdpSocket.send`, `send_to`, `recv` and `recv_from`, `Child.wait`, and the hooks a blocking read or
+`UdpSocket.send`, `send_to`, `recv` and `recv_from`, `resolve` and `resolve_passive` (a name waits on DNS), the opening of a file (a FIFO waits for its other end), `Child.wait`, and the hooks a blocking read or
 write of a descriptor, a file or a socket goes through — so a promised body reaches none of them,
 however many calls away. `block_on`, which drives a task to its end on the calling thread, has no
 declaration to mark and counts as blocking all the same. A generic is named as it was declared, since the type argument says nothing about
@@ -3996,6 +3998,26 @@ print(sizeof(Ctrl), c.enable, c.mode, c.prescale)
 No syntax was needed for this, which is why there is none: the open integer family already does the
 work C needs `int x : 3` for, so a five-bit field is written `u5` in a struct exactly as it is
 anywhere else.
+
+The rule is the same for a whole number of bytes that is not a power of two: a `u24` inside `@packed`
+is three bytes, a `u40` five, a `u48` six, where on its own each is rounded up to the next power of
+two. So a three-byte length overlays a wire format's three bytes:
+
+```sysl
+@packed
+@byte_order(big)
+struct FrameHeader
+    len: u24
+    kind: u8
+    flags: u8
+    stream: u32
+
+print(sizeof(FrameHeader), offsetof(FrameHeader, kind), offsetof(FrameHeader, stream), sizeof(u24))
+```
+
+```output
+9 3 5 4
+```
 
 Two things follow that C leaves to the implementation, and pinning them is the point of the feature
 rather than a detail of it — it is why portable embedded C avoids bitfields and writes the shifts out

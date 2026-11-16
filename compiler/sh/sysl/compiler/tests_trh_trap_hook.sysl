@@ -1,0 +1,384 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+import sysl.text.Search
+
+// Every way a program stops says why, and goes through one hook first (`bounds_fail.sysl`'s
+// `report_check`, `check.sysl`'s `panic_stop`).
+//
+// - A compiler-inserted check -- a contract, a constrained type's range or predicate, a division by
+//   zero, a checked cast -- writes one line on standard error naming the check and where, then traps
+//   as before (SIGTRAP, 133 under a shell).
+// - A panic writes its report on standard error, not standard output, and aborts (SIGABRT, 134)
+//   rather than calling `exit(1)`, so a C host's `atexit` handlers do not run.
+// - Every one of them reaches the weak `sysl_trap(kind, a, b, length, at)` first, which a program or
+//   a C host may override; `sysl_bounds_fail`'s default hands on to it, and an override of
+//   `sysl_bounds_fail` alone still sees just its own forms.
+//
+// The cells: each check kind (hosted, at -O0 and the default level); the location on and off; a
+// tracked body's check naming its caller; panic, assert, unwrap, expect and an unwrap of an `Err`;
+// the hook overridden in sysl and in C, by a hook that returns; an override of the old hook only; a
+// `build-c` library inside a C host with an `atexit`; and a freestanding archive holding the weak
+// defaults and no `abort`. Not covered here: the main-thread check (it has its own report,
+// `tests_mtg_`) and the coroutine runtime's internal stops, which no program can reach on purpose.
+
+private trh_ready() -> bool = std_root().is_ok() && clang_available()
+
+// The tree built at `level` and run: its status, standard output, and standard error.
+private trh_run(files: []const (string, string), level: string) -> (Status, string, string)
+    val root = make_temp_dir("sysl-trh").unwrap()
+
+    for i in 0..<files.len
+        val at = s"$root/${files[i].0}"
+
+        make_dir_all(parent_of(at).unwrap()).unwrap()
+        write_text(at, files[i].1).unwrap()
+
+    val exe = s"$root/built"
+
+    // Built as `sysl run` builds, in debug, so a plain operator's overflow is checked too.
+    use_command_mode("run")
+
+    val built = build_native_program(root, None, None, level, Some(exe))
+
+    use_command_mode("")
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (Status.Exited(-1), "", failure_text(why))
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> (Status.Exited(-1), "", "the program that was built could not be run")
+        Ok(out) -> (out.status, out.text, out.err.unwrap_or(""))
+end trh_run
+
+// At both levels, the program stops by `signal`, having printed `printed` and written `said`.
+private trh_stops(files: []const (string, string), signal: int, printed: string, said: string)
+    if !trh_ready() then return
+
+    for level in ["0", DefaultOptimization]
+        val (state, out, err) = trh_run(files, level)
+
+        assert_eq(err, said, s"-O$level")
+        assert_eq(out, printed, s"-O$level")
+        assert(state == Status.Signalled(signal), s"-O$level stopped with $state")
+end trh_stops
+
+private trh_traps(text: string, said: string) = trh_stops([("main.sysl", text)], 5, "", said)
+
+private trh_panics(text: string, printed: string, said: string) =
+    trh_stops([("main.sysl", text)], 6, printed, said)
+
+// -- each check says which it was ------------------------------------------------------------------
+
+@test("a failed require names the clause")
+trh_require()
+    trh_traps("f(x: int) -> int\n    require x > 0\n    x\n\nprint(f(-1))\n",
+              "'require' does not hold (main.sysl:2:13)\n")
+
+@test("a failed ensure names the clause")
+trh_ensure()
+    trh_traps("f(x: int) -> int\n    ensure result > 0\n    x - 5\n\nprint(f(1))\n",
+              "'ensure' does not hold (main.sysl:2:12)\n")
+
+@test("a broken struct invariant says so")
+trh_struct_invariant()
+    trh_traps("struct Span\n    lo: int\n    hi: int\n    invariant lo <= hi\n\nvar hi = 1\n" +
+              "val s = Span(3, hi)\nprint(s.lo)\n",
+              "'invariant' does not hold (main.sysl:7:9)\n")
+
+@test("a loop invariant that stops holding says so")
+trh_loop_invariant()
+    trh_traps("var i = 0\nwhile i < 5\n    invariant i < 3\n    i += 1\nprint(i)\n",
+              "'invariant' does not hold (main.sysl:3:15)\n")
+
+@test("a value outside a within range names the type and the expression")
+trh_within()
+    trh_traps("type Slot = new int within 0..<8\nval n = 9\nprint(int(Slot(n)))\n",
+              "value outside the range of 'Slot' (main.sysl:3:11)\n")
+
+@test("a float range refusing a NaN says so")
+trh_float_within()
+    trh_traps("type Rate = new f64 within -10.0..10.0\nvar z = 0.0\nprint(f64(Rate(z / z)))\n",
+              "value outside the range of 'Rate' (main.sysl:3:11)\n")
+
+@test("a value the where predicate refuses names the type")
+trh_where()
+    trh_traps("type Even = new int where value % 2 == 0\nval n = 3\nprint(int(Even(n)))\n",
+              "value refused by the 'where' predicate of 'Even' (main.sysl:3:11)\n")
+
+@test("an integer division by zero says so")
+trh_division()
+    trh_traps("var d = 0\nprint(10 / d)\n", "integer division by zero (main.sysl:2:7)\n")
+
+@test("a checked enum cast of a value no variant has says so")
+trh_enum_cast()
+    trh_traps("enum Color\n    Red\n    Green\n\nvar n = 7\nprint(Color(n))\n",
+              "value is not one of the variants (main.sysl:6:7)\n")
+
+@test("a check in a tracked function names the line that called it")
+trh_tracked_names_the_caller()
+    trh_stops([("main.sysl", "type Slot = new int within 0..<8\n\n@track_caller\nslot(n: int) -> Slot = Slot(n)\n\n" +
+                             "print(int(slot(3)))\nprint(int(slot(9)))\n")], 5, "3\n",
+              "value outside the range of 'Slot' (main.sysl:7:11)\n")
+
+@test("with the locations left out, a check still says which it was")
+trh_no_locations()
+    if !trh_ready() then return
+
+    val (state, _, err) = trh_run([("package.hocon", "package {\n  name = \"probe\"\n}\n\nbounds_locations = false\n"),
+                                   ("main.sysl", "f(x: int) -> int\n    require x > 0\n    x\n\nprint(f(-1))\n")],
+                                  DefaultOptimization)
+
+    assert_eq(err, "'require' does not hold\n")
+    assert(state == Status.Signalled(5), s"stopped with $state")
+
+// -- a panic writes standard error and aborts --------------------------------------------------------
+
+@test("a panic writes standard error after what was printed, and aborts")
+trh_panic()
+    trh_panics("print(\"before\")\npanic(\"bad code\")\n", "before\n", "panic: bad code (main.sysl:2)\n")
+
+@test("a failed assert aborts the same way")
+trh_assert()
+    trh_panics("var n = 2\nassert(n == 3, \"n is three\")\n", "", "panic: n is three (main.sysl:2)\n")
+
+@test("a failed assert_eq shows its values on standard error")
+trh_assert_eq()
+    trh_panics("var n = 2\nassert_eq(n, 3)\n", "", "panic: got 2, want 3 (main.sysl:2)\n")
+
+@test("an unwrap of None aborts naming its line")
+trh_unwrap()
+    trh_panics("var o: Option[int] = None\nprint(o.unwrap())\n", "",
+               "panic: unwrap of a None value (main.sysl:2:9)\n")
+
+@test("an expect of an Err shows the error and the trace on standard error, and aborts")
+trh_expect_err()
+    if !trh_ready() then return
+
+    for level in ["0", DefaultOptimization]
+        val (state, out, err) = trh_run([("main.sysl", "parse(s: string) -> Result[int, string] = " +
+                                          "if s == \"\" then Err(\"empty\") else Ok(1)\n\n" +
+                                          "print(parse(\"\").expect(\"a number\"))\n")], level)
+
+        assert_eq(out, "")
+        assert(err.starts_with("panic: a number: \"empty\" (main.sysl:3:"), err)
+        assert(state == Status.Signalled(6), s"stopped with $state")
+
+// -- the hook ------------------------------------------------------------------------------------------
+
+// A program whose `report` module overrides `sysl_trap`, writing what it was handed and returning.
+private trh_hooked(main: string) -> [2](string, string) = [
+    ("main.sysl", "import report\n\n" + main),
+    ("report/report.sysl",
+     "module report\n\nimport sysl.raw.ptr_cast\nimport sysl.text.from_cstring\n\n" +
+     "@export(\"sysl_trap\")\n" +
+     "on_trap(kind: u32, a: usize, b: usize, n: usize, at: *u8)\n" +
+     "    val place = if usize(at) == 0 then \"-\" else from_cstring(at).unwrap_or(\"?\")\n" +
+     "    val text = if kind >= 16 && kind <= 20 then from_cstring(ptr_cast(a)).unwrap_or(\"?\") else \"\"\n\n" +
+     "    eprints(s\"hook $kind $place $text|$b\\n\")\n")]
+
+@test("an exported sysl_trap sees a contract's kind, sentence and location, and the trap still follows")
+trh_hook_sees_a_contract()
+    trh_stops(trh_hooked("f(x: int) -> int\n    require x > 0\n    x\n\nprint(f(-1))\n")[..], 5, "",
+              "hook 17 main.sysl:4:13 'require' does not hold|0\n")
+
+@test("an exported sysl_trap sees a range failure as its own kind")
+trh_hook_sees_a_range()
+    trh_stops(trh_hooked("type Slot = new int within 0..<8\nval n = 9\nprint(int(Slot(n)))\n")[..], 5, "",
+              "hook 18 main.sysl:5:11 value outside the range of 'Slot'|0\n")
+
+@test("an exported sysl_trap sees a bounds failure through sysl_bounds_fail's default")
+trh_hook_sees_bounds()
+    trh_stops(trh_hooked("val xs = [1, 2, 3]\nvar i = 5\nprint(xs[i])\n")[..], 5, "",
+              "hook 256 main.sysl:5:9 |0\n")
+
+@test("an exported sysl_trap sees an overflow with the operation's text")
+trh_hook_sees_overflow()
+    trh_stops(trh_hooked("var level: u8 = 250\nlevel += 10\nprint(level)\n")[..], 5, "",
+              "hook 16 main.sysl:4:1 u8 += u8|0\n")
+
+@test("an exported sysl_trap is told of a panic after its report, and the panic still aborts")
+trh_hook_sees_a_panic()
+    trh_stops(trh_hooked("panic(\"bad code\")\n")[..], 6, "",
+              "panic: bad code (main.sysl:3)\nhook 21 main.sysl:3:1 |8\n")
+
+@test("an override of sysl_bounds_fail alone keeps its forms, and a contract goes to the default")
+trh_old_hook_keeps_its_forms()
+    val report = "module report\n\n@export(\"sysl_bounds_fail\")\n" +
+        "on_bounds(kind: u32, a: usize, b: usize, n: usize, at: *u8)\n" +
+        "    eprints(s\"old hook $kind\\n\")\n"
+
+    trh_stops([("main.sysl", "import report\n\nval xs = [1, 2, 3]\nvar i = 5\nprint(xs[i])\n"),
+               ("report/report.sysl", report)], 5, "", "old hook 256\n")
+    trh_stops([("main.sysl", "import report\n\nf(x: int) -> int\n    require x > 0\n    x\n\nprint(f(-1))\n"),
+               ("report/report.sysl", report)], 5, "", "'require' does not hold (main.sysl:4:13)\n")
+
+// -- a library inside a C host -------------------------------------------------------------------------
+
+private val trh_host_library: string = raw"""
+    module terndb
+
+    val table = [10, 20, 30, 40]
+
+    @export("terndb_at")
+    at(i: usize) -> i32 = table[i]
+
+    @export("terndb_fail")
+    fail(code: i32) -> i32
+        if code != 0 then panic("terndb: bad code")
+        0
+
+    @export("terndb_need")
+    need(x: i32) -> i32
+        require x > 0
+        x
+    """
+
+private val trh_host_main: string = raw"""
+    #include <stdio.h>
+    #include <stdlib.h>
+    #include <stdint.h>
+    #include <stddef.h>
+
+    int32_t terndb_at(size_t);
+    int32_t terndb_fail(int32_t);
+    int32_t terndb_need(int32_t);
+
+    static void bye(void) { puts("atexit ran"); }
+
+    #ifdef HOOK
+    void sysl_trap(uint32_t kind, size_t a, size_t b, size_t n, const char *at) {
+        fprintf(stderr, "hook %u %s", kind & 0xff, at ? at : "-");
+        if ((kind & 0xff) == 21) fprintf(stderr, " %.*s", (int)b, (const char *)a);
+        else if ((kind & 0xff) >= 16) fprintf(stderr, " %s", (const char *)a);
+        fprintf(stderr, "\n");
+    }
+    #endif
+
+    int main(int argc, char **argv) {
+        atexit(bye);
+        int which = atoi(argv[1]);
+        printf("start\n");
+        if (which == 0) printf("%d\n", terndb_at(7));
+        else if (which == 1) printf("%d\n", terndb_fail(3));
+        else printf("%d\n", terndb_need(-1));
+        puts("after");
+        return 0;
+    }
+    """
+
+// The library archived with `sysl build-c`, the host linked against it with `defines`, and run with
+// `which`: status, standard output, standard error.
+private trh_host_run(root: string, defines: []const string, which: string) -> (Status, string, string)
+    var args: Buf[string] = buf()
+
+    args.push(s"$root/main.c")
+    args.push(s"$root/terndb.a")
+
+    for d in defines
+        args.push(d)
+
+    args.push("-o")
+    args.push(s"$root/host")
+
+    val linked = capture("clang", args.view(), "", [], true) match
+        Err(_) -> return (Status.Exited(-1), "", "clang could not be run")
+        Ok(o) -> o
+
+    if !linked.status.ok() then return (Status.Exited(-1), "", linked.err.unwrap_or(linked.text))
+
+    capture(s"$root/host", [which], "", [], true) match
+        Err(_) -> (Status.Exited(-1), "", "the host could not be run")
+        Ok(o) -> (o.status, o.text, o.err.unwrap_or(""))
+end trh_host_run
+
+private trh_host() -> Option[string]
+    if !trh_ready() then return None
+
+    val root = absolute_path(make_temp_dir("sysl-trh-host").unwrap())
+
+    make_dir_all(s"$root/lib/terndb").unwrap()
+    write_text(s"$root/lib/sysl.hocon", "package {\n  name = terndb\n}\n").unwrap()
+    write_text(s"$root/lib/terndb/terndb.sysl", trh_host_library).unwrap()
+    write_text(s"$root/main.c", trh_host_main).unwrap()
+
+    val (code, out, err) = clx_ran(["sysl", "build-c", s"$root/lib", "-o", s"$root/terndb.a"])
+
+    assert(code == Fine, s"build-c failed:\n$out$err")
+    Some(root)
+end trh_host
+
+@test("a panic in an export called by a C host aborts without running atexit, on standard error")
+trh_host_panic_aborts()
+    val root = trh_host() match
+        Some(r) -> r
+        None -> return
+
+    val (state, out, err) = trh_host_run(root, [], "1")
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(out, "start\n")
+    assert_eq(err, "panic: terndb: bad code (terndb/terndb.sysl:10)\n")
+    assert(state == Status.Signalled(6), s"stopped with $state")
+
+@test("a C host's own sysl_trap sees the kind, the file and the line of every failure")
+trh_host_hook()
+    val root = trh_host() match
+        Some(r) -> r
+        None -> return
+
+    val bounds = trh_host_run(root, ["-DHOOK"], "0")
+    val panicked = trh_host_run(root, ["-DHOOK"], "1")
+    val contract = trh_host_run(root, ["-DHOOK"], "2")
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(bounds.2, "hook 0 terndb/terndb.sysl:6:28\n")
+    assert(bounds.0 == Status.Signalled(5), s"stopped with ${bounds.0}")
+    assert_eq(panicked.2, "panic: terndb: bad code (terndb/terndb.sysl:10)\n" +
+              "hook 21 terndb/terndb.sysl:10:23 terndb: bad code\n")
+    assert(panicked.0 == Status.Signalled(6), s"stopped with ${panicked.0}")
+    assert_eq(contract.2, "hook 17 terndb/terndb.sysl:15:13 'require' does not hold\n")
+    assert(contract.0 == Status.Signalled(5), s"stopped with ${contract.0}")
+
+    for r in [bounds, panicked, contract]
+        assert(!r.1.contains("atexit ran") && !r.1.contains("after"), r.1)
+
+// -- a freestanding archive --------------------------------------------------------------------------
+
+@test("a freestanding archive holds both weak defaults and asks nothing of abort")
+trh_freestanding_weak_defaults()
+    if !trh_ready() then return
+
+    val root = absolute_path(make_temp_dir("sysl-trh-thumb").unwrap())
+
+    make_dir_all(s"$root/terndb").unwrap()
+    write_text(s"$root/sysl.hocon", "package {\n  name = terndb\n}\n").unwrap()
+    write_text(s"$root/terndb/terndb.sysl", trh_host_library).unwrap()
+
+    val (code, out, err) = clx_ran(["sysl", "build-c", root, "--target", "thumb-freestanding", "-o",
+                                    s"$root/thumb.a"])
+
+    assert(code == Fine, s"build-c failed:\n$out$err")
+
+    val listed = capture("nm", [s"$root/thumb.a"], "", [], true) match
+        Err(_) -> ""
+        Ok(o) -> o.text
+
+    remove_dir_all(root).unwrap_or(())
+
+    // `nm` is the host's, which may not read a Thumb object: what it could not list says nothing.
+    if listed.is_empty() then return
+
+    assert(listed.contains("W sysl_trap"), listed)
+    assert(listed.contains("W sysl_bounds_fail"), listed)
+    assert(!listed.contains(" abort"), listed)

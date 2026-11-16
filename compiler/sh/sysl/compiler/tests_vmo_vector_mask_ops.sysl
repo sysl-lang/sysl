@@ -1,0 +1,536 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{is_file, make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{Search, join, replace_all, split}
+
+// A mask read as an integer and lanes moved by numbers computed at run time
+// (`reference/vectors.md` § "Masks as bits" and "Lanes picked at run time"): `m.bits()`,
+// `table.lookup(idx)`, `v.compress(m)` and `xs.gather(idx)`. Each is checked for its answer at the
+// edges a lane-by-lane rewrite would get wrong -- the last lane, a position one past the end, a
+// negative one, nothing kept and everything kept -- for the IR it lowers to, for what a `const`
+// function makes of it, and for every refusal.
+
+private vmo_ran(text: string) -> string = enm_ran(text)
+
+private vmo_says(text: string, want: string)
+    val said = enm_err(text)
+
+    assert(said.contains(want), s"expected it to say: $want\nit said: $said")
+
+private vmo_count(hay: string, needle: string) -> usize = split(hay, needle).len - 1
+
+// One function's emitted text, whatever suffix the module's naming gives its symbol.
+private vmo_body(ir: string, name: string) -> string
+    val lines = split(ir, "\n")
+    var out = ""
+    var inside = false
+
+    for i in 0..<lines.len
+        val line = lines[i]
+        val names = line.contains("@" + name + "(") || line.contains("@" + name + "$") ||
+            line.contains("$" + name + "(") || line.contains("$" + name + "$")
+
+        if !inside && line.starts_with("define ") && names then inside = true
+
+        if inside
+            if line == "}" then return out
+
+            out = out + line + "\n"
+    end for
+
+    s"no definition of '$name' in:\n$ir"
+end vmo_body
+
+// The LLVM text a named machine lowers a one-file program to.
+private vmo_ir_for(machine: string, text: string) -> string
+    val root = replace_all(make_temp_dir("sysl-vmo").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val out = emit_llvm_text(s"$root/main.sysl", Some(machine)) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end vmo_ir_for
+
+// -- bits ------------------------------------------------------------------------------------------
+
+@test("bits puts lane i at bit i of a uN, at sixteen lanes and at the last one")
+vmo_bits_values()
+    if !enm_ready() then return
+
+    assert_eq(vmo_ran(raw"""
+        val a: <16>u8 = [1; 16]
+        val b: <16>u8 = [1, 1, 1, 9, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 7]
+        val m = (a != b).bits()
+        val none = (a == a + 1).bits()
+        val all = (a == a).bits()
+
+        print(m, m.trailing_zeros(), none, all)
+        """), "32776 3 0 65535\n")
+
+@test("bits answers a uN as wide as the mask: four lanes are a u4, sixty-four a u64")
+vmo_bits_widths()
+    if !enm_ready() then return
+
+    assert_eq(vmo_ran(raw"""
+        val v: <4>f32 = [1, 5, 3, 7]
+        val m = (v > 2).bits()
+        val wide: <64>u8 = [3; 64]
+        val w = (wide == 3).bits()
+        val one: <1>int = [4]
+        val u: u4 = m
+
+        print(u, w.count_ones(), w.trailing_zeros(), (one == 4).bits())
+        """), "14 64 0 1\n")
+
+@test("bits is one bitcast of the <N x i1> to iN")
+vmo_bits_ir()
+    if !enm_ready() then return
+
+    val main = cgz_body(enm_ir(raw"""
+        val a: <16>u8 = [1; 16]
+        val b: <16>u8 = [1; 16]
+        print((a == b).bits())
+        """), "main")
+
+    assert(main.contains("bitcast <16 x i1> %"), main)
+    assert(main.contains(" to i16"), main)
+    assert(!main.contains("llvm.vector.reduce"), main)
+
+@test("bits in a const function is the value the program computes")
+vmo_bits_const()
+    if !enm_ready() then return
+
+    assert_eq(vmo_ran(raw"""
+        const marks() -> u8
+            val a: <8>int = [1, 2, 3, 4, 5, 6, 7, 8]
+
+            ((a & 1) == 0).bits()
+
+        const M: u8 = marks()
+
+        print(M)
+        """), "170\n")
+
+@test("bits in a body generic in its width answers that width's integer")
+vmo_bits_generic()
+    if !enm_ready() then return
+
+    assert_eq(vmo_ran(raw"""
+        first[const W: usize](a: <W>u8, b: <W>u8) -> u32 = (a != b).bits().trailing_zeros()
+
+        val x: <8>u8 = [1, 2, 3, 4, 5, 6, 7, 8]
+        val y: <8>u8 = [1, 2, 3, 4, 0, 6, 7, 8]
+        val p: <16>u8 = [0; 16]
+        var q: <16>u8 = [0; 16]
+
+        q[13] = 1
+        print(first(x, y), first(p, q))
+        """), "4 13\n")
+
+@test("bits is refused on a vector that is not a mask, and takes no arguments")
+vmo_bits_refusals()
+    if !enm_ready() then return
+
+    vmo_says("val v: <4>int = [1, 2, 3, 4]\nval b = v.bits()\n",
+             "a mask's lanes as an integer are read off a mask, as in '(a == b).bits()'")
+    vmo_says("val v: <4>int = [1, 2, 3, 4]\nval b = (v > 1).bits(3)\n", "'bits' takes no arguments")
+
+// -- lookup ----------------------------------------------------------------------------------------
+
+private vmo_nibbles() -> string = raw"""
+    val table: <16>u8 = [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0]
+    val v: <16>u8 = [97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 10]
+    """
+
+@test("lookup reads each lane of the table its position names, and zero past the end")
+vmo_lookup_bytes()
+    if !enm_ready() then return
+
+    assert_eq(vmo_ran(vmo_nibbles() + raw"""
+        val c = table.lookup(v & 15)
+        val far = table.lookup(v)
+        val idx: <8>u8 = [10, 1, 16, 255, 0, 10, 15, 17]
+        val half = table.lookup(idx)
+
+        print(c[0], c[1], c[9], c[15], far[0], far[15])
+        print(half[0], half[1], half[2], half[3], half[7], half.len)
+        """), "1 0 2 2 0 2\n2 1 0 0 0 8\n")
+
+@test("lookup of sixteen bytes is one tbl on AArch64, with nothing around it")
+vmo_lookup_tbl_ir()
+    if !enm_ready() then return
+
+    val ir = vmo_tbl_ir()
+    val body = vmo_body(ir, "classify")
+
+    assert(body.contains("call <16 x i8> @llvm.aarch64.neon.tbl1.v16i8(<16 x i8> %"), body)
+    assert(!body.contains("extractelement"), body)
+    assert(!body.contains("select"), body)
+    assert(vmo_body(ir, "half").contains("call <8 x i8> @llvm.aarch64.neon.tbl1.v8i8(<16 x i8> %"), ir)
+
+    // Any other shape on AArch64 is the general lowering, with no `tbl`.
+    val wide = vmo_body(ir, "wide")
+
+    assert(!wide.contains("tbl1"), wide)
+    assert(wide.contains("select <16 x i1>"), wide)
+
+// The AArch64 module of a program with a lookup of every shape `tbl` covers, and one it does not.
+vmo_tbl_ir() -> string = vmo_ir_for("aarch64-macos", vmo_nibbles() + vmo_kernel() + raw"""
+    @noinline
+    half(t: <16>u8, i: <8>u8) -> <8>u8 = t.lookup(i)
+
+    @noinline
+    wide(t: <16>u8, i: <16>u16) -> <16>u8 = t.lookup(i)
+
+    val i: <8>u8 = [1, 2, 3, 4, 5, 6, 7, 8]
+    print(half(table, i)[3], wide(table, <16>u16(v))[3])
+    """)
+
+private vmo_kernel() -> string = raw"""
+    @noinline
+    classify(t: <16>u8, v: <16>u8) -> <16>u8 = t.lookup(v)
+
+    print(classify(table, v)[3])
+    """
+
+@test("lookup elsewhere is the variable-permute shape: one clamp, a lane read per lane, one select")
+vmo_lookup_generic_ir()
+    if !enm_ready() then return
+
+    val body = vmo_body(vmo_ir_for("x86_64-macos", vmo_nibbles() + vmo_kernel()), "classify")
+
+    assert(!body.contains("llvm.aarch64"), body)
+    assert(body.contains("icmp ult <16 x i8> %"), body)
+    assert_eq(vmo_count(body, "insertelement <16 x i8>"), 16)
+    assert_eq(vmo_count(body, "select <16 x i1> %"), 2)
+
+@test("lookup at any lanes: a float table, signed positions with a negative one, a narrow index")
+vmo_lookup_generic_values()
+    if !enm_ready() then return
+
+    assert_eq(vmo_ran(raw"""
+        val t: <4>f32 = [1.5, 2.5, 3.5, 4.5]
+        val i: <4>i32 = [3, -1, 4, 0]
+        val r = t.lookup(i)
+        val w: <8>u16 = [10, 20, 30, 40, 50, 60, 70, 80]
+        val j: <4>u8 = [7, 0, 8, 2]
+        val s = w.lookup(j)
+        val n: <4>u2 = [3, 2, 1, 0]
+        val q = t.lookup(n)
+
+        print(r[0], r[1], r[2], r[3])
+        print(s[0], s[1], s[2], s[3], s.len)
+        print(q[0], q[3])
+        """), "4.5 0 0 1.5\n80 10 0 30 4\n4.5 1.5\n")
+
+@test("a position type that cannot name a lane past the end has no range test")
+vmo_lookup_no_test_ir()
+    if !enm_ready() then return
+
+    val ir = enm_ir(raw"""
+        @noinline
+        narrow(t: <4>f32, n: <4>u2) -> <4>f32 = t.lookup(n)
+
+        @noinline
+        wide(t: <4>f32, n: <4>u8) -> <4>f32 = t.lookup(n)
+
+        val t: <4>f32 = [1.5, 2.5, 3.5, 4.5]
+        val n: <4>u2 = [3, 2, 1, 0]
+        print(narrow(t, n)[0], wide(t, <4>u8(n))[0])
+        """)
+    val narrow = vmo_body(ir, "narrow")
+    val wide = vmo_body(ir, "wide")
+
+    assert(narrow.contains("extractelement <4 x float>"), narrow)
+    assert(!narrow.contains("icmp"), narrow)
+    assert(!narrow.contains("select"), narrow)
+    assert(wide.contains("icmp ult <4 x i8>"), wide)
+    assert_eq(vmo_count(wide, "select <4 x i1>"), 2)
+
+@test("lookup in a const function answers zero past the end, as the instruction does")
+vmo_lookup_const()
+    if !enm_ready() then return
+
+    assert_eq(vmo_ran(raw"""
+        const picked() -> int
+            val t: <4>int = [10, 20, 30, 40]
+            val i: <4>u8 = [3, 9, 0, 1]
+
+            t.lookup(i).sum()
+
+        const P: int = picked()
+
+        print(P)
+        """), "70\n")
+
+@test("lookup is refused a list, a float vector and the wrong number of arguments")
+vmo_lookup_refusals()
+    if !enm_ready() then return
+
+    val pre = "val t: <4>int = [1, 2, 3, 4]\n"
+
+    vmo_says(pre + "val r = t.lookup([3, 2, 1, 0])\n", "positions known while compiling are a 'shuffle'")
+    vmo_says(pre + "val f: <4>f32 = [0, 1, 2, 3]\nval r = t.lookup(f)\n",
+             "'lookup' reads at a vector of integer positions, and this is <4>f32")
+    vmo_says(pre + "val i: <4>u8 = [0, 1, 2, 3]\nval r = t.lookup(i, i)\n",
+             "'lookup' takes one argument, the vector of positions to read at")
+    vmo_says(pre + "val r = t.lookup(1 < 2)\n", "'lookup' reads at a vector of integer positions")
+
+// -- compress --------------------------------------------------------------------------------------
+
+@test("compress packs the kept lanes into the low ones, in order, and zeros the rest")
+vmo_compress_values()
+    if !enm_ready() then return
+
+    assert_eq(vmo_ran(raw"""
+        val v: <4>i64 = [5, 50, 7, 70]
+        val k = v.compress(v > 6)
+        val none = v.compress(v > 100)
+        val all = v.compress(v > 0)
+        val last = v.compress(v == 70)
+        val f: <8>f32 = [1, -2, 3, -4, 5, -6, 7, -8]
+        val neg = f.compress(f < 0)
+
+        print(k[0], k[1], k[2], k[3], (v > 6).bits().count_ones())
+        print(none[0], none[3], all[0], all[3], last[0], last[1])
+        print(neg[0], neg[3], neg[4], neg[7])
+        """), "50 7 70 0 3\n0 0 5 70 70 0\n-2 -8 0 0\n")
+
+@test("compress is branch-free: no lane of it is a branch")
+vmo_compress_ir()
+    if !enm_ready() then return
+
+    val ir = enm_ir(raw"""
+        @noinline
+        pack(v: <4>i32, m: <4>bool) -> <4>i32 = v.compress(m)
+
+        val v: <4>i32 = [1, 2, 3, 4]
+        print(pack(v, v > 2)[0])
+        """)
+    val body = vmo_body(ir, "pack")
+
+    assert(!body.contains("br i1"), body)
+    assert_eq(vmo_count(body, "insertelement <4 x i32>"), 4)
+
+@test("compress in a const function keeps the same lanes")
+vmo_compress_const()
+    if !enm_ready() then return
+
+    assert_eq(vmo_ran(raw"""
+        const kept() -> int
+            val v: <4>int = [1, 2, 3, 4]
+            val c = v.compress((v & 1) == 0)
+
+            c[0] * 100 + c[1] * 10 + c[2]
+
+        const K: int = kept()
+
+        print(K)
+        """), "240\n")
+
+@test("compress takes a mask of the receiver's width and nothing else")
+vmo_compress_refusals()
+    if !enm_ready() then return
+
+    val pre = "val v: <4>int = [1, 2, 3, 4]\nval w: <8>int = [0; 8]\n"
+
+    vmo_says(pre + "val c = v.compress(w > 0)\n",
+             "'compress' keeps the lanes a mask says to, so it takes the '<4>bool'")
+    vmo_says(pre + "val c = v.compress(v)\n", "and this is <4>int")
+    vmo_says(pre + "val c = v.compress()\n", "'compress' takes the mask of lanes to keep")
+
+// -- gather ----------------------------------------------------------------------------------------
+
+@test("gather reads one element per lane from an array and from a slice")
+vmo_gather_values()
+    if !enm_ready() then return
+
+    assert_eq(vmo_ran(raw"""
+        var col: [10]i64 = [5, 50, 7, 70, 9, 90, 11, 110, 13, 130]
+        val idx: <4>u32 = [9, 0, 3, 3]
+        val g = col.gather(idx)
+        val view = col[2..<6]
+        val s = view.gather(idx & 3)
+        val names: [3]f32 = [0.5, 1.5, 2.5]
+        val i: <2>usize = [2, 0]
+        val f = names.gather(i)
+
+        print(g[0], g[1], g[2], g[3])
+        print(s[0], s[1], s[3], f[0], f[1])
+        """), "130 5 70 70\n70 7 90 2.5 0.5\n")
+
+@test("a gather past the end traps naming the position, as the subscript would")
+vmo_gather_past_end()
+    if !enm_ready() then return
+
+    val said = enm_panic_text(raw"""
+        val xs: [4]int = [1, 2, 3, 4]
+        val idx: <4>usize = [0, 1, 4, 2]
+        print(xs.gather(idx)[0])
+        """)
+
+    assert(said.contains("index 4 out of bounds for length 4"), said)
+
+@test("a negative position traps as a negative subscript does")
+vmo_gather_negative()
+    if !enm_ready() then return
+
+    val said = enm_panic_text(raw"""
+        val xs: [4]int = [1, 2, 3, 4]
+        val idx: <2>i32 = [1, -1]
+        print(xs.gather(idx)[0])
+        """)
+
+    assert(said.contains("-1"), said)
+
+@test("inside @unchecked a gather tests nothing; outside it each lane is tested")
+vmo_gather_unchecked_ir()
+    if !enm_ready() then return
+
+    val checked = vmo_body(enm_ir(raw"""
+        @noinline
+        pick(xs: []const int, i: <4>u32) -> <4>int = xs.gather(i)
+
+        val xs: [4]int = [1, 2, 3, 4]
+        val i: <4>u32 = [0, 1, 2, 3]
+        print(pick(xs, i)[0])
+        """), "pick")
+    val bare = vmo_body(enm_ir(raw"""
+        @noinline
+        pick(xs: []const int, i: <4>u32) -> <4>int
+            @unchecked
+                xs.gather(i)
+
+        val xs: [4]int = [1, 2, 3, 4]
+        val i: <4>u32 = [0, 1, 2, 3]
+        print(pick(xs, i)[0])
+        """), "pick")
+
+    assert_eq(vmo_count(checked, "call void @sysl_bounds_fail("), 4)
+    assert_eq(vmo_count(checked, "load i32, ptr"), 4)
+    assert(!bare.contains("bounds"), bare)
+    assert_eq(vmo_count(bare, "load i32, ptr"), 4)
+
+@test("gather in a const function reads the elements, and traps past the end while compiling")
+vmo_gather_const()
+    if !enm_ready() then return
+
+    assert_eq(vmo_ran(raw"""
+        const picked() -> int
+            val xs: [5]int = [10, 20, 30, 40, 50]
+            val i: <2>u8 = [4, 1]
+
+            xs.gather(i).sum()
+
+        const P: int = picked()
+
+        print(P)
+        """), "70\n")
+
+    vmo_says(raw"""
+        const picked() -> int
+            val xs: [2]int = [10, 20]
+            val i: <2>u8 = [4, 1]
+
+            xs.gather(i).sum()
+
+        const P: int = picked()
+        """, "index 4 out of bounds for length 2")
+
+@test("gather is refused a pointer, volatile elements, a list and a float vector")
+vmo_gather_refusals()
+    if !enm_ready() then return
+
+    vmo_says("f(p: *int, i: <4>u8) -> <4>int = p.gather(i)\n", "carries no length")
+    vmo_says("f(r: []volatile u32, i: <4>u8) -> <4>u32 = r.gather(i)\n", "the qualifier cannot be kept")
+    vmo_says("val xs: [4]int = [1, 2, 3, 4]\nval g = xs.gather([0, 1])\n",
+             "'gather' reads at a vector of integer positions")
+    vmo_says("val xs: [4]int = [1, 2, 3, 4]\nval i: <2>f32 = [0, 1]\nval g = xs.gather(i)\n",
+             "and this is <2>f32")
+
+@test("a gather of a type's own declares wins over the built-in one")
+vmo_gather_declared_wins()
+    if !enm_ready() then return
+
+    assert_eq(vmo_ran(raw"""
+        trait Gather
+            gather(self, at: int) -> int
+
+        impl Gather for []const int
+            gather(self, at: int) -> int = self[at] * 100
+
+        val xs: [3]int = [1, 2, 3]
+        val view: []const int = xs[..]
+
+        print(view.gather(2))
+        """), "300\n")
+
+// -- the instructions ------------------------------------------------------------------------------
+
+private vmo_objdump() -> Option[string]
+    val candidates = ["/opt/homebrew/opt/llvm/bin/llvm-objdump", "/usr/local/opt/llvm/bin/llvm-objdump"]
+
+    for i in 0..<candidates.len
+        if is_file(candidates[i]) then return Some(candidates[i])
+
+    None
+end vmo_objdump
+
+// The host archive's disassembly, or nothing where the host is not AArch64.
+private[compiler] vmo_host_code(program: string) -> Option[string]
+    if !host_target().name.starts_with("aarch64-")
+        print("skipped: the instructions asserted are AArch64's and this machine is not one")
+        return None
+    end if
+
+    val tool = vmo_objdump()
+
+    assert(tool.is_some(), "this test reads the host's code and there is no llvm-objdump on this machine")
+
+    val root = replace_all(make_temp_dir("sysl-vmo").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", program).unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(["sysl", "build-c", root, "-o", s"$root/app.a"], (line) -> sink.push(line))
+
+    assert_eq(code, Fine, join(lines.view(), "\n"))
+
+    val dis = capture(tool.unwrap(), ["-d", "--no-show-raw-insn", "--no-leading-addr", s"$root/app.a"], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    dis match
+        Ok(out) -> Some(out.text)
+        Err(_) -> None
+end vmo_host_code
+
+@test("on AArch64 a lookup of sixteen bytes is a tbl, and a mask's bits never branch per lane")
+vmo_aarch64_code()
+    if !enm_ready() then return
+
+    val dis = vmo_host_code(raw"""
+        @export("classify")
+        classify(t: *<16>u8, v: *<16>u8, out: *<16>u8) = *out = (*t).lookup(*v & 15)
+        @export("first")
+        first(a: *<16>u8, b: *<16>u8) -> u32 = ((*a) == (*b)).bits().trailing_zeros()
+
+        print(1)
+        """)
+
+    if dis.is_none() then return
+
+    val text = dis.unwrap()
+
+    assert(text.contains("tbl.16b"), text)
+    assert(text.contains("addv") || text.contains("addp"), text)

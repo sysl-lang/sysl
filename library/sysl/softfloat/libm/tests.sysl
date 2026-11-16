@@ -1,0 +1,229 @@
+module sysl.softfloat.libm
+@tests
+
+import sysl.rand.{Rng, rng}
+
+// C's roots, roundings and extrema, called on encodings.
+//
+// **The oracle is the host's own libm**, reached by C's names: a freestanding board runs these bodies
+// in place of a libm it does not have, so they must answer what a libm does, bit for bit, a NaN
+// matching a NaN. Random encodings cover every exponent, both signs, subnormals, infinities and NaNs;
+// the cases a rounding is chosen for -- halves, the ends of a binade, the two zeros -- are spelled out.
+
+private extern "sqrt" host_sqrt(x: real) -> real
+private extern "sqrtf" host_sqrtf(x: f32) -> f32
+private extern "floor" host_floor(x: real) -> real
+private extern "floorf" host_floorf(x: f32) -> f32
+private extern "ceil" host_ceil(x: real) -> real
+private extern "ceilf" host_ceilf(x: f32) -> f32
+private extern "trunc" host_trunc(x: real) -> real
+private extern "truncf" host_truncf(x: f32) -> f32
+private extern "round" host_round(x: real) -> real
+private extern "roundf" host_roundf(x: f32) -> f32
+private extern "rint" host_rint(x: real) -> real
+private extern "rintf" host_rintf(x: f32) -> f32
+private extern "nearbyint" host_nearbyint(x: real) -> real
+private extern "nearbyintf" host_nearbyintf(x: f32) -> f32
+private extern "fmax" host_fmax(x: real, y: real) -> real
+private extern "fmaxf" host_fmaxf(x: f32, y: f32) -> f32
+private extern "fmin" host_fmin(x: real, y: real) -> real
+private extern "fminf" host_fminf(x: f32, y: f32) -> f32
+
+private same(a: u64, b: real) -> bool = a == b.bits() || (real.from_bits(a) != real.from_bits(a) && b != b)
+
+private same_single(a: u64, b: f32) -> bool =
+    a == u64(b.bits()) || (f32.from_bits(u32(a)) != f32.from_bits(u32(a)) && b != b)
+
+// The six roundings of `x` against the host's, at binary64.
+private rounds_as_host(x: real)
+    val b = x.bits()
+
+    assert(same(integral(b, 64, 52, Floor), host_floor(x)), s"floor($x)")
+    assert(same(integral(b, 64, 52, Ceiling), host_ceil(x)), s"ceil($x)")
+    assert(same(integral(b, 64, 52, Zero), host_trunc(x)), s"trunc($x)")
+    assert(same(integral(b, 64, 52, AwayAtHalf), host_round(x)), s"round($x)")
+    assert(same(integral(b, 64, 52, EvenAtHalf), host_rint(x)), s"rint($x)")
+    assert(same(integral(b, 64, 52, EvenAtHalf), host_nearbyint(x)), s"nearbyint($x)")
+end rounds_as_host
+
+// And at binary32.
+private rounds_as_host_single(x: f32)
+    val b = u64(x.bits())
+
+    assert(same_single(integral(b, 32, 23, Floor), host_floorf(x)), s"floorf($x)")
+    assert(same_single(integral(b, 32, 23, Ceiling), host_ceilf(x)), s"ceilf($x)")
+    assert(same_single(integral(b, 32, 23, Zero), host_truncf(x)), s"truncf($x)")
+    assert(same_single(integral(b, 32, 23, AwayAtHalf), host_roundf(x)), s"roundf($x)")
+    assert(same_single(integral(b, 32, 23, EvenAtHalf), host_rintf(x)), s"rintf($x)")
+    assert(same_single(integral(b, 32, 23, EvenAtHalf), host_nearbyintf(x)), s"nearbyintf($x)")
+end rounds_as_host_single
+
+@test("the roundings of random doubles agree with the host's libm")
+random_double_roundings()
+    var g = rng(71, 7)
+
+    for step in 0..<40000
+        rounds_as_host(real.from_bits(g.next_u64()))
+
+        // An exponent where the units place falls inside the fraction, which is where rounding works.
+        rounds_as_host(real.from_bits((g.next_u64() & 0x803F_FFFF_FFFF_FFFF) | 0x3FC0_0000_0000_0000))
+
+@test("the roundings of random floats agree with the host's libm")
+random_single_roundings()
+    var g = rng(72, 7)
+
+    for step in 0..<40000
+        rounds_as_host_single(f32.from_bits(g.next_u32()))
+        rounds_as_host_single(f32.from_bits((g.next_u32() & 0x81FF_FFFF) | 0x3E00_0000))
+
+@test("the roundings at halves, at both widths: round away from zero, rint and nearbyint to even")
+halfway_roundings()
+    for k in -40..<40
+        val x = real(k) + 0.5
+
+        rounds_as_host(x)
+        rounds_as_host(real.from_bits(x.bits() + 1))
+        rounds_as_host(real.from_bits(x.bits() - 1))
+        rounds_as_host_single(f32(x))
+        rounds_as_host_single(f32.from_bits(f32(x).bits() + 1))
+        rounds_as_host_single(f32.from_bits(f32(x).bits() - 1))
+
+    // The values the rules differ at, written out.
+    assert(integral((2.5).bits(), 64, 52, AwayAtHalf) == (3.0).bits())
+    assert(integral((2.5).bits(), 64, 52, EvenAtHalf) == (2.0).bits())
+    assert(integral((-2.5).bits(), 64, 52, AwayAtHalf) == (-3.0).bits())
+    assert(integral((-2.5).bits(), 64, 52, EvenAtHalf) == (-2.0).bits())
+    assert(integral((3.5).bits(), 64, 52, EvenAtHalf) == (4.0).bits())
+    assert(integral((0.5).bits(), 64, 52, AwayAtHalf) == (1.0).bits())
+    assert(integral((0.5).bits(), 64, 52, EvenAtHalf) == (0.0).bits())
+    assert(integral((-0.5).bits(), 64, 52, EvenAtHalf) == (-0.0).bits())
+    assert(integral(u64((2.5f32).bits()), 32, 23, AwayAtHalf) == u64((3.0f32).bits()))
+    assert(integral(u64((2.5f32).bits()), 32, 23, EvenAtHalf) == u64((2.0f32).bits()))
+    assert(integral(u64((-0.5f32).bits()), 32, 23, AwayAtHalf) == u64((-1.0f32).bits()))
+
+    // The largest value with a fraction left, whose round goes up into the next binade.
+    rounds_as_host(4503599627370495.5)
+    rounds_as_host(-4503599627370495.5)
+    rounds_as_host_single(8388607.5f32)
+    rounds_as_host_single(-8388607.5f32)
+end halfway_roundings
+
+@test("the roundings at the edges: NaN, the zeros, the infinities, the subnormals, and below one")
+edge_roundings()
+    val edges = [nan, -nan, 0.0, -0.0, infinity, -infinity, 0.3, -0.3, 0.7, -0.7, 1.0, -1.0, 0.9999999999999999,
+                 -0.9999999999999999, 4.9e-324, -4.9e-324, 2.2250738585072014e-308, -2.2250738585072014e-308,
+                 1.7976931348623157e308, -1.7976931348623157e308, 4503599627370496.0, 9007199254740993.0]
+
+    for x in edges
+        rounds_as_host(x)
+        rounds_as_host_single(f32(x))
+
+    // A NaN comes back a NaN, quiet; a zero keeps its sign, and so does a result of zero.
+    assert(integral(0x7FF0_0000_0000_0001, 64, 52, Floor) == 0x7FF8_0000_0000_0001)
+    assert(integral(0x7F80_0001, 32, 23, Ceiling) == 0x7FC0_0001)
+    assert(integral((-0.0).bits(), 64, 52, Floor) == (-0.0).bits())
+    assert(integral((0.3).bits(), 64, 52, Floor) == (0.0).bits())
+    assert(integral((-0.3).bits(), 64, 52, Floor) == (-1.0).bits())
+    assert(integral((-0.3).bits(), 64, 52, Ceiling) == (-0.0).bits())
+    assert(integral((-0.3).bits(), 64, 52, Zero) == (-0.0).bits())
+    assert(integral(1, 64, 52, Ceiling) == (1.0).bits())
+    assert(integral(1, 32, 23, Ceiling) == u64((1.0f32).bits()))
+end edge_roundings
+
+// -- the extrema -------------------------------------------------------------------------------------
+
+private extrema_as_host(x: real, y: real)
+    assert(same(extremum(x.bits(), y.bits(), 64, 52, true), host_fmax(x, y)), s"fmax($x, $y)")
+    assert(same(extremum(x.bits(), y.bits(), 64, 52, false), host_fmin(x, y)), s"fmin($x, $y)")
+
+    val a = f32(x)
+    val b = f32(y)
+
+    assert(same_single(extremum(u64(a.bits()), u64(b.bits()), 32, 23, true), host_fmaxf(a, b)), s"fmaxf($a, $b)")
+    assert(same_single(extremum(u64(a.bits()), u64(b.bits()), 32, 23, false), host_fminf(a, b)), s"fminf($a, $b)")
+end extrema_as_host
+
+@test("fmax and fmin agree with the host's libm: one NaN loses, and +0 is the greater zero")
+extrema_agree_with_host()
+    val edges = [nan, 0.0, -0.0, 1.0, -1.0, infinity, -infinity, 4.9e-324, -4.9e-324]
+
+    for x in edges
+        for y in edges
+            extrema_as_host(x, y)
+
+    var g = rng(73, 7)
+
+    for step in 0..<20000
+        extrema_as_host(real.from_bits(g.next_u64()), real.from_bits(g.next_u64()))
+
+    // Written out: a NaN on either side loses, two NaNs are a NaN, and the zeros are ordered.
+    assert(extremum(nan.bits(), (2.0).bits(), 64, 52, true) == (2.0).bits())
+    assert(extremum((2.0).bits(), nan.bits(), 64, 52, false) == (2.0).bits())
+    assert(real.from_bits(extremum(nan.bits(), nan.bits(), 64, 52, true)) != real.from_bits(extremum(nan.bits(), nan.bits(), 64, 52, true)))
+    assert(extremum((-0.0).bits(), (0.0).bits(), 64, 52, true) == (0.0).bits())
+    assert(extremum((0.0).bits(), (-0.0).bits(), 64, 52, false) == (-0.0).bits())
+    assert(extremum(u64((-0.0f32).bits()), u64((0.0f32).bits()), 32, 23, true) == u64((0.0f32).bits()))
+    assert(extremum(u64(nan.bits() >> 32), u64((1.0f32).bits()), 32, 23, false) == u64((1.0f32).bits()))
+
+    // A signalling NaN is not missing data: it comes back quieted, on either side.
+    assert(extremum(0x7FF0_0000_0000_0001, (2.0).bits(), 64, 52, true) == 0x7FF8_0000_0000_0001)
+    assert(extremum(u64((2.0f32).bits()), 0x7F80_0001, 32, 23, false) == 0x7FC0_0001)
+end extrema_agree_with_host
+
+// -- the square root ---------------------------------------------------------------------------------
+
+@test("the square roots of random doubles are the host's, exactly rounded")
+random_double_roots()
+    var g = rng(74, 7)
+
+    for step in 0..<40000
+        val x = real.from_bits(g.next_u64() & 0x7FFF_FFFF_FFFF_FFFF)
+
+        assert(same(root(x.bits(), 64, 52), host_sqrt(x)), s"sqrt($x)")
+
+        // A subnormal operand, whose leading one is moved up before the root is taken.
+        val small = real.from_bits(g.next_u64() >> (12 + g.next_u32() % 52))
+
+        assert(same(root(small.bits(), 64, 52), host_sqrt(small)), s"sqrt($small)")
+
+@test("the square roots of random floats are the host's, exactly rounded")
+random_single_roots()
+    var g = rng(75, 7)
+
+    for step in 0..<40000
+        val x = f32.from_bits(g.next_u32() & 0x7FFF_FFFF)
+
+        assert(same_single(root(u64(x.bits()), 32, 23), host_sqrtf(x)), s"sqrtf($x)")
+
+        val small = f32.from_bits(g.next_u32() >> (9 + g.next_u32() % 23))
+
+        assert(same_single(root(u64(small.bits()), 32, 23), host_sqrtf(small)), s"sqrtf($small)")
+
+@test("the square roots at the edges: NaN, the zeros, the infinities, negatives, squares, and the ends of the range")
+edge_roots()
+    val edges = [nan, 0.0, -0.0, infinity, -infinity, -1.0, -4.9e-324, 4.9e-324, 2.2250738585072014e-308,
+                 1.7976931348623157e308, 1.0, 2.0, 4.0, 0.25, 9.0, 1.0000000000000002, 0.9999999999999999]
+
+    for x in edges
+        assert(same(root(x.bits(), 64, 52), host_sqrt(x)), s"sqrt($x)")
+
+        val y = f32(x)
+
+        assert(same_single(root(u64(y.bits()), 32, 23), host_sqrtf(y)), s"sqrtf($y)")
+
+    // Exact squares come back exactly, a zero keeps its sign, and a negative is a NaN.
+    assert(root((9.0).bits(), 64, 52) == (3.0).bits())
+    assert(root((-0.0).bits(), 64, 52) == (-0.0).bits())
+    assert(root(u64((0.25f32).bits()), 32, 23) == u64((0.5f32).bits()))
+    assert(root((-1.0).bits(), 64, 52) == 0x7FF8_0000_0000_0000)
+    assert(root(u64((-1.0f32).bits()), 32, 23) == 0x7FC0_0000)
+    assert(root(0x7FF0_0000_0000_0001, 64, 52) == 0x7FF8_0000_0000_0001)
+    assert(root(1, 64, 52) == (2.2227587494850775e-162).bits())
+
+    // Every float whose root lands between two floats at or near a half, read by squaring back: n² + n
+    // is the square of n + 1/2 less a quarter, so its root rounds down to n.
+    for n in 1..<3000
+        val m = real(n)
+
+        assert(root((m * m + m).bits(), 64, 52) == host_sqrt(m * m + m).bits(), s"sqrt(${m * m + m})")
+end edge_roots

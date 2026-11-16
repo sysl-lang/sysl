@@ -4766,6 +4766,18 @@ private old_call(cx: &Analyzer, span: Span, args: Buf[Expr]) -> TExpr
     if texpr_type(te) == Unit then
         return cx.err(span, "'old' needs a value to remember, but its argument is unit")
 
+    val late = clause_bound_read(cx, te)
+
+    if late.is_some() then
+        val (at, name) = late.unwrap()
+
+        if name == "" then
+            return cx.err(at, "'result' is the value the function returns, and 'old' is evaluated on " +
+                "entry, before 'result' exists")
+
+        return cx.err(at, s"'$name' is bound inside this 'ensure', and 'old' is evaluated on entry, " +
+            s"before '$name' exists")
+
     var held = cx.olds.unwrap()
     val idx = held.len()
 
@@ -4773,6 +4785,29 @@ private old_call(cx: &Analyzer, span: Span, args: Buf[Expr]) -> TExpr
     cx.olds = Some(held)
     TExpr(span, TOld(int(idx), texpr_type(te)))
 end old_call
+
+// The first read in an `old`'s argument of a name that does not exist on entry, with where it was
+// read: one the `ensure` around it bound -- a quantifier's variable, a `match` arm's name -- or
+// `result`, which is answered with an empty name. A name bound inside the argument itself is above the locals counted here, and is
+// evaluated on entry along with the rest of it.
+private clause_bound_read(cx: &Analyzer, te: TExpr) -> Option[(Span, string)]
+    var bound: Buf[(string, string)] = buf()
+
+    for i in cx.olds_base..<cx.locals.len()
+        bound.push((cx.locals[i].unique, cx.locals[i].name))
+
+    var found: Buf[(Span, string)] = buf()
+    val sink = &found
+
+    walk_texpr(te, expr_walk(true, x -> *x.kind match
+        TLoad(unique, _) ->
+            for b in bound
+                if b.0 == unique then sink.push((x.span, b.1))
+        TResult(_) -> sink.push((x.span, ""))
+        _ -> ()))
+
+    if found.is_empty() then None else Some(found[0])
+end clause_bound_read
 
 // A leading dot's call form: `.Circle(5)`, the qualified constructor with the enum's name left off,
 // and `.origin()`, an associated function with its type's name left off.

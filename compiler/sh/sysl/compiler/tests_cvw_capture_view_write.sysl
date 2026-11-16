@@ -1,0 +1,259 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A writable view of a capture, inside a closure that holds the array by value, views the closure's
+// own copy (`reference/expressions.md`), exactly as a written `&x` of it is the copy's address. Handed
+// to a call, the callee writes the copy and the variable never sees it; written through in the
+// closure, the write lands in the copy as `out[0] = 7` does. Each is asked the two questions every
+// write to the copy is: refused where nothing in the closure reads the copy back, or where the
+// enclosing body uses the variable afterwards -- through `sysl.threads.scope`, a closure a callee
+// keeps, a `&sync Fn`, and a closure written inside one of those, for `out[a..<b]`, `out[..]`, the
+// array handed where a `[]T` is wanted, a view of a view, a field of a captured struct, and an element
+// of a view of an array of structs.
+//
+// A `[]const T` view only reads, and is accepted. So are the ways out the refusal names -- a view
+// taken outside the closure, a `&[N]T` box viewed inside it -- a closure called in place, which holds
+// its captures by reference, and a captured `Buf`, whose view is of storage both sides share. A view
+// handed out with the variable outside left alone is also a read back, as an address is. Each accepted
+// cell runs at `-O0`, `-O1` and `-O2`.
+//
+// The helpers are `tests_enm_enum_run.sysl`'s.
+
+private const cvw_prelude: string = "import sysl.buf.{Buf, buf}\nimport sysl.threads.scope\n\nfill(dst: []u8) = dst[0] = 7\n\n" +
+    "show(v: []const u8) = print(v[0])\n\nrun(f: &Fn() -> unit) = f()\n\n" +
+    "var kept: Option[&Fn() -> unit] = None\n\ncall(f: &Fn() -> unit)\n    kept = Some(f)\n    f()\n\n" +
+    "var held: Option[&Fn() -> int] = None\n\nstash(f: &Fn() -> int)\n    held = Some(f)\n    print(f())\n\n" +
+    "struct Into\n    v: u8\n\n    into(self, dst: []u8) = dst[0] = self.v\n\n" +
+    "struct Holder\n    cells: [4]u8\n\nstruct P\n    n: int\n\n"
+
+// The words after the reason the closure holds its captures by value, for a capture `name` whose
+// view is handed to `callee`.
+private cvw_lost(name: string, callee: string) -> string =
+    s", so it holds a copy of '$name' — so '$callee', which is handed a view of it, would reach that " +
+    s"copy rather than the variable it came from, and the variable is used afterwards as though it " +
+    s"had. Where you mean to change '$name'"
+
+// The way out the refusal names, for a capture of a type shown as `shown`.
+private cvw_hint(name: string, shown: string) -> string =
+    s"Where you mean to change '$name', take the view outside the closure, hold it as a '&$shown' and " +
+    s"view that, or have the closure return the value"
+
+// What a refused program said, checked to hold `want` exactly once.
+private cvw_refused(text: string, want: string) -> string
+    val said = enm_err(cvw_prelude + text)
+
+    assert(enm_says(said, want), said)
+
+    val first = said.index_of(want).unwrap()
+
+    assert(said[first + want.bytes.len..<said.bytes.len].index_of(want).is_none(), said)
+    said
+end cvw_refused
+
+// What an accepted program printed, built at `level`.
+private cvw_ran_at(text: string, level: string) -> string
+    val root = make_temp_dir("sysl-cvw").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", forms_imported(cvw_prelude + text)).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, level, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> if out.status.ok() then out.text else s"it did not exit zero: ${out.text}"
+end cvw_ran_at
+
+// The same output at every optimization level.
+private cvw_runs(text: string, want: string)
+    for level in ["0", "1", "2"]
+        assert_eq(cvw_ran_at(text, level), want, s"at -O$level")
+
+// ---- refused: the callee writes the copy through the view, and the variable is read afterwards
+
+@test("a scoped thread handed 'out[0..<2]', read after the scope")
+cvw_scope_spawn_range()
+    if !enm_ready() then return
+
+    val said = cvw_refused("main()\n    var out = [0u8; 4]\n" +
+                           "    scope((s) -> s.spawn(() -> fill(out[0..<2])).join())\n    print(out)\n",
+                           cvw_lost("out", "fill"))
+
+    assert(enm_says(said, "'@scoped'"), said)
+    assert(enm_says(said, cvw_hint("out", "[4]byte")), said)
+
+@test("a closure a callee keeps, handed 'out[1..<3]'")
+cvw_kept_closure_range()
+    if !enm_ready() then return
+
+    val said = cvw_refused("main()\n    var out = [0u8; 4]\n    call(() -> fill(out[1..<3]))\n" +
+                           "    print(out)\n",
+                           cvw_lost("out", "fill"))
+
+    assert(enm_says(said, cvw_hint("out", "[4]byte")), said)
+
+@test("the whole array handed where a '[]u8' is wanted is a view of the copy")
+cvw_scope_spawn_whole_array()
+    if !enm_ready() then return
+
+    cvw_refused("main()\n    var out = [0u8; 4]\n    scope((s) -> s.spawn(() -> fill(out)).join())\n" +
+                "    print(out[0])\n",
+                cvw_lost("out", "fill"))
+
+@test("'out[..]' handed to a call")
+cvw_kept_closure_full_slice()
+    if !enm_ready() then return
+
+    cvw_refused("main()\n    var out = [0u8; 4]\n    call(() -> fill(out[..]))\n    print(out[0])\n",
+                cvw_lost("out", "fill"))
+
+@test("a view of a view of the copy")
+cvw_view_of_view()
+    if !enm_ready() then return
+
+    cvw_refused("main()\n    var out = [0u8; 4]\n    call(() -> fill(out[1..][0..<2]))\n    print(out[1])\n",
+                cvw_lost("out", "fill"))
+
+@test("a view of a captured struct's array field")
+cvw_view_of_field()
+    if !enm_ready() then return
+
+    val said = cvw_refused("main()\n    var h = Holder([0u8; 4])\n" +
+                           "    scope((s) -> s.spawn(() -> fill(h.cells[0..<2])).join())\n" +
+                           "    print(h.cells)\n",
+                           cvw_lost("h", "fill"))
+
+    assert(enm_says(said, cvw_hint("h", "Holder")), said)
+
+@test("a method handed the view as an argument")
+cvw_method_argument()
+    if !enm_ready() then return
+
+    cvw_refused("main()\n    var out = [0u8; 4]\n    val st = Into(9)\n" +
+                "    scope((s) -> s.spawn(() -> st.into(out[0..<1])).join())\n    print(out)\n",
+                cvw_lost("out", "into"))
+
+@test("a closure made a '&sync Fn', handed a view")
+cvw_sync_fn()
+    if !enm_ready() then return
+
+    cvw_refused("main()\n    var out = [0u8; 4]\n    val f: &sync Fn() -> unit = () -> fill(out[0..<2])\n" +
+                "    f()\n    print(out)\n",
+                cvw_lost("out", "fill"))
+
+@test("a closure written inside a scoped thread's, handed a view, reaches the copy the thread holds")
+cvw_nested_in_scoped()
+    if !enm_ready() then return
+
+    val said = cvw_refused("main()\n    var out = [0u8; 4]\n" +
+                           "    scope((s) -> s.spawn(() -> run(() -> fill(out[0..<2]))).join())\n" +
+                           "    print(out)\n",
+                           cvw_lost("out", "fill"))
+
+    assert(enm_says(said, "this closure writes through to a closure it is written in"), said)
+
+// ---- refused: written through the view in the closure itself
+
+@test("written through a view in a scoped thread that never reads its copy back")
+cvw_scope_direct_write()
+    if !enm_ready() then return
+
+    cvw_refused("main()\n    var out = [0u8; 4]\n" +
+                "    scope((s) -> s.spawn(() -> out[0..<2][0] = 7).join())\n    print(out)\n",
+                "so it holds a copy of 'out' — so assignment would reach that copy rather than the " +
+                "variable it came from, and nothing in the closure reads it back")
+
+@test("written through a view in a closure that reads its copy back, the variable used afterwards")
+cvw_direct_write_read_after()
+    if !enm_ready() then return
+
+    cvw_refused("main()\n    var out = [0u8; 4]\n" +
+                "    stash(() ->\n        out[0..<2][1] = 7\n        int(out[1]))\n    print(out)\n",
+                "so it holds a copy of 'out' — so assignment would reach that copy rather than the " +
+                "variable it came from, and the variable is used afterwards")
+
+@test("written through a view in a kept closure that never reads its copy back")
+cvw_kept_direct_write_never_read()
+    if !enm_ready() then return
+
+    cvw_refused("main()\n    var out = [0u8; 4]\n    call(() -> out[1..][0] += 3)\n",
+                "so it holds a copy of 'out' — so '+=' would reach that copy rather than the variable " +
+                "it came from, and nothing in the closure reads it back")
+
+@test("a field of an element of a view of a captured array of structs")
+cvw_field_of_view_element()
+    if !enm_ready() then return
+
+    cvw_refused("main()\n    var ps = [P(0), P(0)]\n    call(() -> ps[0..<1][0].n = 5)\n    print(ps[0].n)\n",
+                "so it holds a copy of 'ps' — so assignment would reach that copy")
+
+// ---- accepted: the view reaches the variable, only reads, or nothing reads the variable afterwards
+
+@test("a '[]const u8' view only reads: accepted with the variable read afterwards")
+cvw_read_only_view()
+    if !enm_ready() then return
+
+    cvw_runs("main()\n    var out = [5u8; 4]\n    call(() -> show(out[0..<2]))\n" +
+             "    scope((s) -> s.spawn(() -> show(out)).join())\n    print(out[0])\n",
+             "5\n5\n5\n")
+
+@test("the way out: the view taken outside the scope crosses to the scoped thread")
+cvw_view_taken_outside()
+    if !enm_ready() then return
+
+    cvw_runs("main()\n    var out = [0u8; 4]\n    val v = out[0..<2]\n" +
+             "    scope((s) -> s.spawn(() -> fill(v)).join())\n    print(out)\n",
+             "[7, 0, 0, 0]\n")
+
+@test("the way out for a kept closure: a '&[4]u8' box, viewed inside")
+cvw_box_viewed_inside()
+    if !enm_ready() then return
+
+    cvw_runs("main()\n    val out: &[4]u8 = [0u8; 4]\n    call(() -> fill(out[1..<3]))\n    print(*out)\n",
+             "[0, 7, 0, 0]\n")
+
+@test("a closure called in place holds its captures by reference: the view is the variable's")
+cvw_in_place()
+    if !enm_ready() then return
+
+    cvw_runs("main()\n    var out = [0u8; 4]\n    run(() -> fill(out[2..]))\n" +
+             "    run(() -> out[0..<1][0] = 9)\n    print(out)\n",
+             "[9, 0, 7, 0]\n")
+
+@test("a captured Buf is shared: its view is written through, and a kept closure's push is seen")
+cvw_buf_shared()
+    if !enm_ready() then return
+
+    cvw_runs("main()\n    var b: Buf[u8] = buf()\n    b.push(0)\n    b.push(0)\n" +
+             "    run(() -> fill(b.view_mut()))\n    run(() -> b.view_mut()[1] = 4)\n" +
+             "    call(() -> b.push(5))\n    print(b[0], b[1], b[2])\n",
+             "7 4 5\n")
+
+@test("a kept closure's view of a captured Buf is of the storage both share")
+cvw_buf_view_mut_kept()
+    if !enm_ready() then return
+
+    cvw_runs("main()\n    var b: Buf[u8] = buf()\n    b.push(0)\n    call(() -> fill(b.view_mut()))\n" +
+             "    print(b[0])\n",
+             "7\n")
+
+@test("a view handed out with the variable unused afterwards, and one read back: accepted")
+cvw_handed_out_and_read_back()
+    if !enm_ready() then return
+
+    cvw_runs("main()\n    var out = [0u8; 4]\n    var more = [0u8; 4]\n    call(() -> fill(out[0..<2]))\n" +
+             "    stash(() ->\n        fill(more[1..])\n        int(more[1]))\n",
+             "7\n")

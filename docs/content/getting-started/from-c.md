@@ -356,6 +356,30 @@ The first is for macOS, the second for Linux, Android and freestanding targets. 
 call a function needing the library still links it, and still needs it on the link line. `build-c`
 prints the flag for your target whenever the archive names a library other than `m`.
 
+**A host that loads code at run time gets a shared library instead.** `--shared` links the same
+module into a `.dylib` or `.so` that exports only what the header declares and carries its own copy
+of the runtime, so a plugin or a reloadable game library is opened with `dlopen` like any other:
+
+```text
+$ sysl build-c mylib --shared -o libmylib.dylib
+wrote libmylib.dylib
+wrote libmylib.dylib.h
+```
+
+```c
+#include <dlfcn.h>
+#include "libmylib.dylib.h"
+
+int main(void) {
+    void *lib = dlopen("./libmylib.dylib", RTLD_NOW);
+    int (*add)(int, int) = (int (*)(int, int))dlsym(lib, "mylib_add");
+    return add(2, 3);
+}
+```
+
+Two such libraries in one process each run their own copy, so what passes between them goes through
+their C functions, as it would between two C libraries.
+
 Exported signatures use C-compatible types — scalars, pointers, function pointers — because those
 are what a C prototype can express. The usual structure is a **boundary file**: one module that
 holds the handful of functions the C side calls, with everything behind it written in idiomatic

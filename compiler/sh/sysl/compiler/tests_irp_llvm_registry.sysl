@@ -70,6 +70,12 @@ private irp_programs() -> Buf[(string, string)]
               "    rint(f) + nearbyint(f) + minnum(f, a) + maxnum(f, b) + minimum(f, d) + maximum(f, e)\n\n" +
               "print(strict(3.0, 3, 4))\n"))
     out.push(("the cache prefetch", "import sysl.hint.prefetch\n\nvar x = 1\nprefetch(&x)\nprint(x)\n"))
+    // An enum some of whose variants hold a count: its walk's call is the unlikely arm of a tag test.
+    out.push(("a guarded enum walk",
+              "import sysl.buf.{Buf, buf}\n\nstruct Node\n    v: int\n\n" +
+              "pick(b: Buf[Option[&Node]]) -> Option[&Node] = b[0]\n\n" +
+              "run()\n    var all: Buf[Option[&Node]] = buf()\n\n    all.push(Some(Node(1)))\n\n" +
+              "    var m = pick(all)\n\n    m = None\n    print(all.len())\n\nrun()\n"))
     out
 end irp_programs
 
@@ -167,6 +173,9 @@ private irp_emitted() -> Buf[string]
 
     // A contracted multiply-add, emitted only where the target fuses, so built for AArch64.
     texts.push(fpc_every_form_ir())
+
+    // A vector lookup of sixteen bytes, which is `tbl` only on AArch64, so built for it.
+    texts.push(vmo_tbl_ir())
     texts.push(ex_archive_ir("module demo\n\nvar seed: i32 = 7\n\ncounter() -> i32 = seed\n\nval start: i32 = counter()\n\n" +
                              "@export\nbegin() -> i32 = start\n"))
 
@@ -278,7 +287,7 @@ irp_reg_every_family_reached()
                  llvm_reduce_entry("umin").unwrap().base, "llvm.sqrt", "llvm.fabs", llvm_global_ctors(),
                  llvm_used(), llvm_compiler_used(), llvm_metadata_section(),
                  llvm_sat_entry("sadd").unwrap().base, llvm_coro_entry("begin").unwrap().base,
-                 llvm_arm_dsp_entry("qadd16").unwrap().base, llvm_fma_entry().base]
+                 llvm_arm_dsp_entry("qadd16").unwrap().base, llvm_fma_entry().base, llvm_expect_entry().base]
     var missing = ""
 
     for i in 0..<bases.len

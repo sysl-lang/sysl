@@ -1,0 +1,824 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, read_text, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.testing.skip
+import sysl.raw.ptr_cast
+import sysl.text.{cstring, join, replace_all, split, Search}
+
+// `sysl build-c --shared`: a module linked into a `.dylib` or `.so` that a C host opens with
+// `dlopen`. Each library carries its own copy of the runtime and exports exactly what its header
+// declares, so the tests open one from C and call into it, read its export list back with `nm`, run
+// a thread-local from two threads of the host, open two libraries in one process, and reload one
+// that was rebuilt. The refusals are asked of any target, since each is said before anything is
+// compiled.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+// Whether a shared library can be built and opened here: the library's source, a clang, and a host
+// whose libraries this compiler links (macOS or Linux).
+private bsh_ready() -> bool = std_root().is_ok() && clang_available() && (host_os() == MacOS || host_os() == Linux)
+
+private bsh_suffix() -> string = if host_os() == MacOS then ".dylib" else ".so"
+
+// A project `name` under `root` holding `main.sysl` with `text`.
+private bsh_project(root: string, name: string, text: string) -> string
+    val dir = s"$root/$name"
+
+    make_dir_all(dir).unwrap()
+    write_text(s"$dir/sysl.hocon", s"package {\n  name = \"$name\"\n}\n").unwrap()
+    write_text(s"$dir/main.sysl", text).unwrap()
+    dir
+end bsh_project
+
+// `sysl build-c <dir> --shared -o <out>` with whatever else is asked: the status and what was said.
+private bsh_build(dir: string, out: string, more: []const string) -> (int, string)
+    var args: Buf[string] = buf()
+
+    for a in ["sysl", "build-c", dir, "--shared", "-o", out]
+        args.push(a)
+
+    for a in more
+        args.push(a)
+
+    val (code, said, err) = clx_ran(args.view())
+
+    (code, said + err)
+end bsh_build
+
+// `bsh_build`, which has to succeed: the library's path.
+private bsh_library(dir: string, out: string, more: []const string) -> string
+    val (code, said) = bsh_build(dir, out, more)
+
+    if code != Fine then panic(s"build-c --shared failed:\n$said")
+
+    out
+end bsh_library
+
+// The C host `host_c` compiled under `root` and run with `args`: what it printed, or why it was not.
+private bsh_host(root: string, host_c: string, args: []const string) -> string
+    write_text(s"$root/host.c", host_c).unwrap()
+
+    var cc: Buf[string] = buf()
+
+    for a in [s"$root/host.c", "-pthread", "-o", s"$root/host"]
+        cc.push(a)
+
+    if host_os() == Linux then cc.push("-ldl")
+
+    val built = capture("clang", cc.view(), "", [], true) match
+        Err(_) -> return "clang could not be run"
+        Ok(o) -> o
+
+    if !built.status.ok() then return s"the host failed to build:\n${built.text}${built.err.unwrap_or("")}"
+
+    capture(s"$root/host", args, "", [], true) match
+        Err(_) -> "the host could not be run"
+        Ok(o) -> o.text + o.err.unwrap_or("")
+end bsh_host
+
+// The symbols the library offers the loader, one name each, Mach-O's leading underscore taken off.
+private bsh_exported(lib: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    val flags = if host_os() == MacOS then bsh_buf(["-gU", lib]) else bsh_buf(["-D", "--defined-only", lib])
+
+    val listed = capture("nm", flags.view(), "", [], true) match
+        Err(_) -> return out
+        Ok(o) -> o.text
+
+    for line in split(listed, "\n")
+        val parts = split(line.trim(), " ")
+
+        if parts.len == 3
+            val name = parts[2]
+
+            out.push(if host_os() == MacOS && name.starts_with("_") then name[1..] else name)
+
+    out
+end bsh_exported
+
+private bsh_root() -> string = replace_all(make_temp_dir("sysl-bsh").unwrap(), "//", "/")
+
+// A library with an exported function that uses the heap, strings and `print`, exported storage with
+// a constant and with a computed initializer, and a private export.
+private val bsh_basic: string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    val squares: Buf[i32] = fill()
+
+    fill() -> Buf[i32]
+        var b: Buf[i32] = buf()
+
+        for i in 1..<4
+            b.push(i32(i * i))
+
+        b
+
+    @export("bsh_version")
+    val version: i32 = 7
+
+    @export("bsh_sum")
+    sum(n: i32) -> i32
+        var b: Buf[string] = buf()
+
+        for i in 0..<n
+            b.push(s"x$i")
+
+        print(s"sum sees ${b.len()} ${b[0]}")
+        var total = 0i32
+
+        for v in squares do total += v
+        total + n
+
+    @export("bsh_hidden_c")
+    private hidden(x: i32) -> i32 = x * 2
+
+    @export("bsh_twice")
+    twice(x: i32) -> i32 = hidden(x)
+    """
+
+// Opens the library, calls `bsh_sum` and `bsh_twice`, reads `bsh_version`, and asks for the private
+// export and a runtime symbol by name -- neither of which the loader should find.
+private val bsh_basic_host: string = raw"""
+    #include <dlfcn.h>
+    #include <stdio.h>
+
+    int main(int argc, char **argv) {
+        void *h = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
+        if (!h) { printf("dlopen: %s\n", dlerror()); return 1; }
+        int (*sum)(int) = (int (*)(int))dlsym(h, "bsh_sum");
+        int (*twice)(int) = (int (*)(int))dlsym(h, "bsh_twice");
+        const int *version = (const int *)dlsym(h, "bsh_version");
+        fflush(stdout);
+        int s = sum(3);
+        fflush(stdout);
+        printf("sum %d twice %d version %d\n", s, twice(21), *version);
+        printf("hidden %s, bounds %s\n", dlsym(h, "bsh_hidden_c") ? "found" : "absent",
+               dlsym(h, "sysl_bounds_fail") ? "found" : "absent");
+        return 0;
+    }
+    """
+
+// -- opening it from C ----------------------------------------------------------------------------
+
+@test("a shared library opened with dlopen answers its exports, its storage filled at load")
+bsh_dlopen_calls_an_export()
+    if !bsh_ready() then skip("no clang, no standard library, or a host this does not link for")
+
+    val root = bsh_root()
+    val lib = bsh_library(bsh_project(root, "basic", bsh_basic), s"$root/libbasic${bsh_suffix()}", [])
+
+    assert_eq(bsh_host(root, bsh_basic_host, [lib]),
+              "sum sees 3 x0\nsum 17 twice 42 version 7\nhidden absent, bounds absent\n")
+    remove_dir_all(root).unwrap_or(())
+
+@test("without -o a shared library is named for the project with the platform's suffix, its header beside it")
+bsh_default_name()
+    if !bsh_ready() then skip("no clang, no standard library, or a host this does not link for")
+
+    val root = bsh_root()
+    val dir = bsh_project(root, "named", bsh_basic)
+    var args: Buf[string] = buf()
+
+    for a in ["sysl", "build-c", dir, "--shared"]
+        args.push(a)
+
+    val (code, _, err) = clx_ran(args.view())
+
+    assert_eq(code, Fine)
+    assert(err.contains(s"wrote ${default_executable(dir)}${bsh_suffix()}\n"))
+    assert(err.contains(s"wrote ${default_executable(dir)}${bsh_suffix()}.h"))
+
+    // Linked already, so there is no link line to advise about.
+    assert(!err.contains("link this against"))
+    remove_dir_all(root).unwrap_or(())
+
+@test("the header a shared library is written with declares what the library exports and nothing else")
+bsh_header_matches_exports()
+    if !bsh_ready() then skip("no clang, no standard library, or a host this does not link for")
+
+    val root = bsh_root()
+    val lib = bsh_library(bsh_project(root, "hdr", bsh_basic), s"$root/libhdr${bsh_suffix()}",
+                          ["--header", s"$root/include/hdr.h"])
+    val header = read_text(s"$root/include/hdr.h").unwrap()
+
+    for name in ["bsh_sum", "bsh_twice", "bsh_version"]
+        assert(header.contains(name))
+
+    assert(!header.contains("bsh_hidden_c"))
+    assert(bsh_exported(lib).len() == 3)
+    remove_dir_all(root).unwrap_or(())
+
+// -- what it exports ------------------------------------------------------------------------------
+
+@test("only the public @export functions and storage are exported: not the runtime's C names, not a private export")
+bsh_export_list_is_exact()
+    if !bsh_ready() then skip("no clang, no standard library, or a host this does not link for")
+
+    val root = bsh_root()
+    val lib = bsh_library(bsh_project(root, "only", bsh_basic), s"$root/libonly${bsh_suffix()}", [])
+    val names = bsh_exported(lib)
+    var sorted: Buf[string] = buf()
+
+    for item in names
+        sorted.push(item)
+
+    assert_eq(join_sorted(sorted), "bsh_sum bsh_twice bsh_version")
+    remove_dir_all(root).unwrap_or(())
+
+// A library whose one export reaches as much of the runtime as a small body can: the heap, `print`
+// and its flush, a bounds check, an overflow check, a contract and a panic -- every one of which
+// reports through the runtime's hooks (`sysl_trap`, `sysl_bounds_fail`) and the standard library's
+// own C-named exports (`sysl_io_flush`, `sysl_io_write`).
+private val bsh_runtime_heavy: string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    @export("rt_pick")
+    pick(n: i32, at: usize) -> i32
+        require n >= 0
+        var b: Buf[i32] = buf()
+
+        for i in 0..<n do b.push(i * 2)
+        print(s"pick ${b.len()}")
+        if at > 100 then panic("too far")
+        b[at] + n * n
+    """
+
+// The names in `names` that belong to the runtime rather than to the module: the `sysl_` and
+// `__sysl_` C names, whichever of them a build happens to reach.
+private bsh_runtime_names(names: Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for name in names
+        if name.starts_with("sysl_") || name.starts_with("__sysl") then out.push(name)
+
+    out
+end bsh_runtime_names
+
+@test("no runtime symbol is exported or declared: every sysl_ name a library reaches stays inside it")
+bsh_no_runtime_symbol_exported()
+    if !bsh_ready() then skip("no clang, no standard library, or a host this does not link for")
+
+    val root = bsh_root()
+    val lib = bsh_library(bsh_project(root, "rt", bsh_runtime_heavy), s"$root/librt${bsh_suffix()}",
+                          ["--header", s"$root/rt.h"])
+
+    assert_eq(join_sorted(bsh_runtime_names(bsh_exported(lib))), "")
+    assert_eq(join_sorted(bsh_exported(lib)), "rt_pick")
+
+    // The archive's header is the same list: the module's API, not the runtime's.
+    val header = read_text(s"$root/rt.h").unwrap()
+
+    assert(header.contains("rt_pick"))
+    assert(!header.contains("sysl_"))
+
+    // The hooks are there, inside the library: what was hidden was the symbol, not the definition.
+    val all = capture("nm", [lib], "", [], true).map((o) -> o.text).unwrap_or("")
+
+    assert(all.contains("sysl_trap"))
+    remove_dir_all(root).unwrap_or(())
+
+@test("a library that exports nothing builds, warns, and offers the loader nothing")
+bsh_nothing_exported()
+    if !bsh_ready() then skip("no clang, no standard library, or a host this does not link for")
+
+    val root = bsh_root()
+    val dir = bsh_project(root, "none", "import sysl.buf.{Buf, buf}\n\nhelper(n: i32) -> i32 = n + 1\n")
+    val (code, said) = bsh_build(dir, s"$root/libnone${bsh_suffix()}", [])
+
+    assert_eq(code, Fine)
+    assert(said.contains("nothing in this module is marked '@export', so the library has no C entry point"))
+    assert_eq(bsh_exported(s"$root/libnone${bsh_suffix()}").len(), 0)
+    remove_dir_all(root).unwrap_or(())
+
+// The names in `names`, sorted and joined by spaces.
+private join_sorted(names: Buf[string]) -> string
+    for i in 1..<names.len()
+        var j = i
+
+        while j > 0 && names[j] < names[j - 1]
+            val held = names[j]
+
+            names[j] = names[j - 1]
+            names[j - 1] = held
+            j -= 1
+
+    var out = ""
+
+    for i in 0..<names.len()
+        out = if i == 0 then names[i] else s"$out ${names[i]}"
+
+    out
+end join_sorted
+
+// -- a thread-local -------------------------------------------------------------------------------
+
+private val bsh_tls: string = raw"""
+    @thread_local var tag = 0i32
+
+    @export("bsh_enter")
+    enter(n: i32)
+        tag = n
+
+    @export("bsh_tag")
+    current() -> i32 = tag
+    """
+
+// Two threads of the host each set the library's thread-local and read their own back; the main
+// thread, which set nothing, still reads zero.
+private val bsh_tls_host: string = raw"""
+    #include <dlfcn.h>
+    #include <pthread.h>
+    #include <stdio.h>
+
+    static void (*enter)(int);
+    static int (*tag)(void);
+
+    static void *worker(void *p) {
+        int n = (int)(long)p;
+        enter(n);
+        for (volatile int i = 0; i < 100000; i++) {}
+        return (void *)(long)tag();
+    }
+
+    int main(int argc, char **argv) {
+        void *h = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
+        if (!h) { printf("dlopen: %s\n", dlerror()); return 1; }
+        enter = (void (*)(int))dlsym(h, "bsh_enter");
+        tag = (int (*)(void))dlsym(h, "bsh_tag");
+        pthread_t a, b;
+        void *ra, *rb;
+        pthread_create(&a, 0, worker, (void *)5L);
+        pthread_create(&b, 0, worker, (void *)9L);
+        pthread_join(a, &ra);
+        pthread_join(b, &rb);
+        printf("a %ld b %ld main %d\n", (long)ra, (long)rb, tag());
+        return 0;
+    }
+    """
+
+@test("a @thread_local in a library opened with dlopen is one per thread of the host")
+bsh_thread_local_under_dlopen()
+    if !bsh_ready() then skip("no clang, no standard library, or a host this does not link for")
+
+    val root = bsh_root()
+    val lib = bsh_library(bsh_project(root, "tls", bsh_tls), s"$root/libtls${bsh_suffix()}", [])
+
+    assert_eq(bsh_host(root, bsh_tls_host, [lib]), "a 5 b 9 main 0\n")
+    remove_dir_all(root).unwrap_or(())
+
+// -- two libraries in one process -----------------------------------------------------------------
+
+// One library's code: strings, a `Buf`, `print`, and the log level -- module storage each library
+// keeps its own copy of. `helper` is a root function both define, with different bodies.
+private bsh_tagged(tag: string, body: string) -> string =
+    "import sysl.buf.{Buf, buf}\nimport sysl.log.{set_level, level, Level}\n\n" +
+    s"helper(n: i32) -> i32 = $body\n\n" +
+    s"@export(\"${tag}_run\")\n${tag}_run(n: i32) -> i32\n    var b: Buf[string] = buf()\n\n" +
+    s"    for i in 0..<n\n        b.push(s\"$tag$${i}\")\n\n" +
+    s"    print(s\"from $tag: $${b.len()} $${b[0]}\")\n    helper(n)\n\n" +
+    s"@export(\"${tag}_quiet\")\n${tag}_quiet() = set_level(Level.Error)\n\n" +
+    s"@export(\"${tag}_level\")\n${tag}_level() = print(s\"$tag sees $${level()}\")\n"
+
+private val bsh_two_host: string = raw"""
+    #include <dlfcn.h>
+    #include <stdio.h>
+
+    typedef int (*run_fn)(int);
+    typedef void (*void_fn)(void);
+
+    int main(int argc, char **argv) {
+        void *a = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
+        void *b = dlopen(argv[2], RTLD_NOW | RTLD_LOCAL);
+        if (!a || !b) { printf("dlopen: %s\n", dlerror()); return 1; }
+        run_fn a_run = (run_fn)dlsym(a, "a_run"), b_run = (run_fn)dlsym(b, "b_run");
+        int x = a_run(3);
+        fflush(stdout);
+        int y = b_run(4);
+        fflush(stdout);
+        ((void_fn)dlsym(a, "a_quiet"))();
+        ((void_fn)dlsym(a, "a_level"))();
+        fflush(stdout);
+        ((void_fn)dlsym(b, "b_level"))();
+        fflush(stdout);
+        printf("c: %d %d, a has b_run: %s\n", x, y, dlsym(a, "b_run") ? "yes" : "no");
+        return 0;
+    }
+    """
+
+@test("two sysl shared libraries in one process each run their own runtime, functions and module storage")
+bsh_two_libraries_one_process()
+    if !bsh_ready() then skip("no clang, no standard library, or a host this does not link for")
+
+    val root = bsh_root()
+    val a = bsh_library(bsh_project(root, "a", bsh_tagged("a", "n + 1")), s"$root/liba${bsh_suffix()}", [])
+    val b = bsh_library(bsh_project(root, "b", bsh_tagged("b", "n * 10")), s"$root/libb${bsh_suffix()}", [])
+
+    assert_eq(bsh_host(root, bsh_two_host, [a, b]),
+              "from a: 3 a0\nfrom b: 4 b0\na sees Error\nb sees Info\nc: 4 40, a has b_run: no\n")
+    remove_dir_all(root).unwrap_or(())
+
+// -- a hot reload ---------------------------------------------------------------------------------
+
+private bsh_game(gain: string) -> string =
+    "import sysl.buf.{Buf, buf}\n\nstruct State\n    frame: i64\n    score: i64\n\n" +
+    "@export(\"game_update\")\nupdate(s: *State) -> i64\n    s.frame += 1\n" +
+    "    val scratch: Buf[i64] = buf()\n\n    for i in 0..<4 do scratch.push(i)\n\n" +
+    s"    var sum = 0i64\n\n    for v in scratch do sum += v\n    s.score += sum * $gain\n    s.score\n"
+
+// The state a reloadable library updates, owned by the process that loads it: this test.
+private struct BshState
+    frame: i64
+    score: i64
+
+private extern "dlopen" bsh_dlopen(file: *u8, mode: i32) -> *u8
+private extern "dlsym" bsh_dlsym(h: *u8, name: *u8) -> *u8
+private extern "dlclose" bsh_dlclose(h: *u8) -> i32
+
+// `RTLD_NOW`, which is 2 on both systems this runs on.
+private const BshNow: i32 = 2
+
+// The library at `lib` opened in this very process, `game_update` called `times` times on `st`, and
+// the library closed again: the last answer.
+private bsh_updates(lib: string, st: *BshState, times: int) -> i64
+    val h = bsh_dlopen(cstring(lib).ptr, BshNow)
+
+    if h == null then panic(s"dlopen failed: $lib")
+
+    val update: *extern(*BshState) -> i64 = ptr_cast(bsh_dlsym(h, c"game_update"))
+    var last = 0i64
+
+    for _ in 0..<times
+        last = update(st)
+
+    bsh_dlclose(h)
+    last
+end bsh_updates
+
+@test("a hot reload: a library is used, closed, rebuilt at the same path, and the new build loaded, the state kept")
+bsh_hot_reload()
+    if !bsh_ready() then skip("no clang, no standard library, or a host this does not link for")
+
+    val root = bsh_root()
+    val dir = bsh_project(root, "game", bsh_game("1"))
+    val lib = s"$root/libgame${bsh_suffix()}"
+    var st = BshState(0, 0)
+
+    bsh_library(dir, lib, [])
+    assert_eq(bsh_updates(lib, &st, 2), 12)
+
+    write_text(s"$dir/main.sysl", bsh_game("100")).unwrap()
+    bsh_library(dir, lib, [])
+    assert_eq(bsh_updates(lib, &st, 1), 612)
+    assert_eq(st.frame, 3)
+    remove_dir_all(root).unwrap_or(())
+
+// -- Mach-O names and versions --------------------------------------------------------------------
+
+// What `otool -l` says of the library's own load command: name, current and compatibility version.
+private bsh_id(lib: string) -> string
+    val listed = capture("otool", ["-l", lib], "", [], true) match
+        Err(_) -> return ""
+        Ok(o) -> o.text
+
+    val lines = split(listed, "\n")
+    var out = ""
+
+    for i in 0..<lines.len
+        if lines[i].trim() == "cmd LC_ID_DYLIB"
+            for j in i + 2..<i + 6
+                if j < lines.len then out = out + lines[j].trim() + "\n"
+
+    out
+end bsh_id
+
+@test("a Mach-O library's install name defaults to @rpath and its name, and versions are what was given")
+bsh_macho_install_name_and_versions()
+    if !bsh_ready() || host_os() != MacOS then skip("not macOS, or no clang or standard library")
+
+    val root = bsh_root()
+    val dir = bsh_project(root, "ver", bsh_tls)
+    val plain = bsh_library(dir, s"$root/libver.dylib", [])
+
+    assert(bsh_id(plain).contains("name @rpath/libver.dylib (offset"))
+
+    val given = bsh_library(dir, s"$root/libver2.dylib",
+                            ["--install-name", "/opt/x/lib/libver.2.dylib", "--current-version", "2.1.3",
+                             "--compatibility-version", "2"])
+    val id = bsh_id(given)
+
+    assert(id.contains("name /opt/x/lib/libver.2.dylib (offset"))
+    assert(id.contains("current version 2.1.3"))
+    assert(id.contains("compatibility version 2.0.0"))
+    remove_dir_all(root).unwrap_or(())
+
+// -- what is refused ------------------------------------------------------------------------------
+
+// A refusal asked of `target` with `flags`: what was said, the status checked first.
+private bsh_refused(flags: []const string, target: string) -> string
+    val root = bsh_root()
+    val dir = bsh_project(root, "r", "@export(\"r_one\")\none() -> i32 = 1\n")
+    var args: Buf[string] = buf()
+
+    for a in ["sysl", "build-c", dir, "--target", target]
+        args.push(a)
+
+    for a in flags
+        args.push(a)
+
+    val (code, _, err) = clx_ran(args.view())
+
+    remove_dir_all(root).unwrap_or(())
+
+    if code == Fine then "built" else err
+end bsh_refused
+
+@test("a shared library's setting given without --shared is refused, naming the setting")
+bsh_setting_needs_shared()
+    for flag in ["--install-name", "--current-version", "--compatibility-version", "--soname", "--version-script"]
+        assert(bsh_refused([flag, "1", "-o", "/tmp/x.a"], "aarch64-macos")
+            .contains(s"'$flag' is a setting of a shared library, and is given with '--shared'"))
+
+@test("a setting given with nothing after it is a misused command line")
+bsh_setting_missing_value()
+    assert(bsh_refused(["--shared", "--soname"], "x86_64-linux").contains("--soname"))
+
+@test("an ELF setting on a Mach-O target and a Mach-O setting on an ELF target are refused, naming the other's flag")
+bsh_settings_of_the_other_format()
+    assert(bsh_refused(["--shared", "--soname", "libr.so.1"], "aarch64-macos")
+        .contains("'--soname' is an ELF setting, and aarch64-macos links Mach-O: its library's own name is given with '--install-name'"))
+    assert(bsh_refused(["--shared", "--version-script", "v.map"], "x86_64-macos")
+        .contains("'--version-script' is an ELF setting, and x86_64-macos links Mach-O"))
+    assert(bsh_refused(["--shared", "--install-name", "@rpath/libr.dylib"], "x86_64-linux")
+        .contains("'--install-name' is a Mach-O setting, and x86_64-linux links ELF: its library's own name is given with '--soname'"))
+    assert(bsh_refused(["--shared", "--current-version", "1.0"], "aarch64-android")
+        .contains("are Mach-O settings, and aarch64-android links ELF"))
+    assert(bsh_refused(["--shared", "--compatibility-version", "1.0"], "aarch64-linux")
+        .contains("are Mach-O settings, and aarch64-linux links ELF"))
+
+@test("a version ld64 cannot hold is refused before anything is built")
+bsh_bad_versions()
+    for bad in ["1.2.3.4", "65536", "1.256", "1..2", "", "1.x", "v1", "-1"]
+        assert(bsh_refused(["--shared", "--current-version", bad], "aarch64-macos")
+            .contains(s"'--current-version $bad' is not a Mach-O version"))
+
+    assert(bsh_refused(["--shared", "--compatibility-version", "1.2.300"], "aarch64-macos")
+        .contains("'--compatibility-version 1.2.300' is not a Mach-O version"))
+
+@test("macho_version takes one to three decimal parts within ld64's widths")
+bsh_macho_version_reads()
+    for good in ["1", "0", "1.2", "1.2.3", "65535.255.255", "007"]
+        assert(macho_version(good))
+
+    for bad in ["1.2.3.4", "65536", "1.256", "1.2.256", "1..2", "", ".", "1.", "a", "123456"]
+        assert(!macho_version(bad))
+
+@test("-o naming a static archive beside --shared is refused, naming the library to write")
+bsh_static_name_refused()
+    assert(bsh_refused(["--shared", "-o", "out/libr.a"], "aarch64-macos")
+        .contains("'-o out/libr.a' names a static archive, and '--shared' links a shared library: name it 'out/libr.dylib'"))
+    assert(bsh_refused(["--shared", "-o", "libr.lib"], "x86_64-linux")
+        .contains("name it 'libr.so'"))
+
+@test("--shared with --lto, for Windows and for a target with no loader is refused")
+bsh_targets_and_modes_refused()
+    assert(bsh_refused(["--shared", "--lto", "thin"], "aarch64-macos")
+        .contains("'--lto' makes an archive's members bitcode for the host's link to optimize, and '--shared' links here"))
+    assert(bsh_refused(["--shared"], "x86_64-windows").contains("a Windows DLL is not built yet"))
+    assert(bsh_refused(["--shared"], "thumb-freestanding")
+        .contains("'--shared' links a library a loader opens, and thumb-freestanding has no loader"))
+    assert(bsh_refused(["--shared"], "wasm32-wasi")
+        .contains("'--shared' links a library a loader opens, and wasm32-wasi has no loader"))
+    assert(bsh_refused(["--shared"], "wasm32-freestanding").contains("has no loader"))
+    assert(bsh_refused(["--shared"], "aarch64-freestanding").contains("has no loader"))
+
+@test("a version script that is not there is refused, naming it")
+bsh_missing_version_script()
+    assert(bsh_refused(["--shared", "--version-script", "/no/such/v.map"], "x86_64-linux")
+        .contains("'--version-script /no/such/v.map': there is no such file"))
+
+// -- the link line --------------------------------------------------------------------------------
+
+private bsh_target(name: string) -> Target = target_named(name).unwrap()
+
+private bsh_lib(soname: Option[string], script: Option[string]) -> SharedLib = SharedLib(None, None, None, soname, script)
+
+private bsh_buf(items: []const string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for item in items
+        out.push(item)
+
+    out
+
+private bsh_has(items: Buf[string], wanted: string) -> bool
+    for item in items
+        if item == wanted then return true
+
+    false
+
+private bsh_command(t: Target, s: SharedLib) -> string =
+    join(shared_link_command("clang", bsh_buf(["a.o", "b.o"]), "out/libx.so.pending", t, "2", bsh_buf(["m"]),
+                             no_probe(), s, "staging/exports.map", "out/libx.so").view(), " ")
+
+@test("an ELF link is -shared with the soname the file's name by default and the written version script")
+bsh_elf_link_line()
+    val line = bsh_command(bsh_target("x86_64-linux"), bsh_lib(None, None))
+
+    assert(line.contains("clang --target=x86_64-unknown-linux-gnu -shared -O2 "))
+    assert(line.contains(" a.o b.o -lm "))
+    assert(line.contains("-Wl,--gc-sections"))
+    assert(line.contains("-Wl,-soname,libx.so -Wl,--version-script,staging/exports.map -o out/libx.so.pending"))
+    assert(!line.contains("install_name"))
+
+@test("an ELF link takes the soname and the version script given, the script in place of the written one")
+bsh_elf_link_line_given()
+    val line = bsh_command(bsh_target("aarch64-linux"), bsh_lib(Some("libx.so.1"), Some("my.map")))
+
+    assert(line.contains("-Wl,-soname,libx.so.1 -Wl,--version-script,my.map -o"))
+    assert(!line.contains("exports.map"))
+
+@test("a Mach-O link is -dynamiclib with an @rpath install name and the exported symbols list")
+bsh_macho_link_line()
+    val line = bsh_command(bsh_target("aarch64-macos"), SharedLib(None, Some("1.2"), None, None, None))
+
+    assert(line.contains("clang --target=arm64-apple-macosx -dynamiclib -O2 "))
+    assert(line.contains("-Wl,-dead_strip"))
+    assert(line.contains("-Wl,-install_name,@rpath/libx.so -Wl,-current_version,1.2 " +
+                         "-Wl,-exported_symbols_list,staging/exports.map -o out/libx.so.pending"))
+    assert(!line.contains("compatibility_version"))
+    assert(!line.contains("soname"))
+
+@test("an ELF shared library's objects are position-independent, and the lever is off again after")
+bsh_position_independent_lever()
+    set_position_independent(true)
+
+    val on = pipeline_flags()
+    val key = pipeline_key()
+
+    set_position_independent(false)
+
+    assert(bsh_has(on, "-fPIC"))
+    assert(key.contains("-pic"))
+    assert(!bsh_has(pipeline_flags(), "-fPIC"))
+    assert(!pipeline_key().contains("-pic"))
+
+@test("the export list is ld64's underscored names, or an ELF script that makes everything else local")
+bsh_export_list_text()
+    val names = bsh_buf(["a_run", "a_seed"])
+
+    assert_eq(shared_export_list(names, bsh_target("aarch64-macos")), "_a_run\n_a_seed\n")
+    assert_eq(shared_export_list(names, bsh_target("x86_64-linux")),
+              "{\n  global:\n    a_run;\n    a_seed;\n  local:\n    *;\n};\n")
+    assert_eq(shared_export_list(buf(), bsh_target("x86_64-linux")), "{\n  local:\n    *;\n};\n")
+    assert_eq(shared_export_list(buf(), bsh_target("aarch64-macos")), "")
+
+// -- an ELF library, cross-linked ----------------------------------------------------------------
+
+// Where zig keeps the C library headers it cross-compiles with, or nothing where there is no zig.
+private bsh_zig_headers() -> Option[string]
+    val said = capture("zig", ["env"], "", [], true) match
+        Err(_) -> return None
+        Ok(o) -> o.text
+
+    for line in split(said, "\n")
+        val t = line.trim()
+
+        if t.starts_with(".lib_dir = \"")
+            val dir = t[12..<t.bytes.len - 2]
+
+            return if is_directory(s"$dir/libc/include/generic-glibc") then Some(s"$dir/libc/include") else None
+
+    None
+end bsh_zig_headers
+
+// A clang for an ELF link from this machine, which has no Linux sysroot: a compile is pointed at
+// zig's glibc headers, and the shared link is lld's with no C library -- an ELF shared object may
+// leave libc's symbols to the loader, so what the link checks is everything this compiler decides.
+private bsh_elf_clang(root: string, headers: string) -> string
+    val at = s"$root/elf-clang"
+
+    write_text(at, "#!/bin/zsh\n" +
+        s"I=$headers\n" +
+        "arch=x86\nfor a in \"$@\"; do case $a in --target=aarch64*) arch=aarch64;; esac; done\n" +
+        "args=(\"$@\")\n" +
+        "extra=(-nostdlibinc -isystem $I/$arch-linux-gnu -isystem $I/generic-glibc -isystem $I/$arch-linux-any " +
+        "-isystem $I/any-linux-any)\n" +
+        "if (( ${args[(Ie)-shared]} )); then extra=(-fuse-ld=lld -nostdlib); args=(${args:#-lm}); fi\n" +
+        "exec clang $args $extra\n").unwrap()
+    _ = capture("chmod", ["+x", at], "", [], true)
+    at
+end bsh_elf_clang
+
+// What `llvm-readelf` says with `flags` about `lib`.
+private bsh_readelf(readelf: string, flags: []const string, lib: string) -> string
+    var args: Buf[string] = buf()
+
+    for f in flags
+        args.push(f)
+
+    args.push(lib)
+
+    capture(readelf, args.view(), "", [], true) match
+        Err(_) -> ""
+        Ok(o) -> o.text
+end bsh_readelf
+
+// The symbols an ELF library offers the loader: its dynamic table's defined entries.
+private bsh_elf_exported(readelf: string, lib: string) -> Buf[string]
+    var exported: Buf[string] = buf()
+
+    for line in split(bsh_readelf(readelf, ["--dyn-syms", "--wide"], lib), "\n")
+        var words: Buf[string] = buf()
+
+        for p in split(line.trim(), " ")
+            if p != "" then words.push(p)
+
+        if words.len() == 8 && words[6] != "UND" && words[6] != "Ndx" then exported.push(words[7])
+
+    exported
+end bsh_elf_exported
+
+private bsh_llvm_readelf() -> string =
+    find_ar(None).map((ar) -> s"${parent_of(ar).unwrap_or(".")}/llvm-readelf").unwrap_or("llvm-readelf")
+
+@test("no runtime symbol is in an ELF library's dynamic table, for either machine")
+bsh_elf_no_runtime_symbol()
+    if std_root().is_err() || !clang_available() then skip("no clang or no standard library")
+
+    val headers = bsh_zig_headers() match
+        Some(dir) -> dir
+        None -> skip("no zig, whose glibc headers stand in for a Linux sysroot")
+
+    if capture("ld.lld", ["--version"], "", [], true).is_err() then skip("no ld.lld")
+
+    val root = bsh_root()
+    val cc = bsh_elf_clang(root, headers)
+    val dir = bsh_project(root, "rtelf", bsh_runtime_heavy)
+
+    for target in ["x86_64-linux", "aarch64-linux"]
+        val lib = bsh_library(dir, s"$root/librt-$target.so", ["--target", target, "--cc", cc])
+        val exported = bsh_elf_exported(bsh_llvm_readelf(), lib)
+
+        assert_eq(join_sorted(bsh_runtime_names(exported)), "")
+        assert_eq(join_sorted(exported), "rt_pick")
+
+        // Defined, and local: the library's own calls still find the hooks.
+        assert(bsh_readelf(bsh_llvm_readelf(), ["--syms", "--wide"], lib).contains("sysl_trap"))
+
+    remove_dir_all(root).unwrap_or(())
+
+@test("an ELF library exports only the @export symbols, carries its soname, and reaches thread-locals by a dynamic model")
+bsh_elf_cross_link()
+    if std_root().is_err() || !clang_available() then skip("no clang or no standard library")
+
+    val headers = bsh_zig_headers() match
+        Some(dir) -> dir
+        None -> skip("no zig, whose glibc headers stand in for a Linux sysroot")
+
+    val readelf = bsh_llvm_readelf()
+
+    if capture("ld.lld", ["--version"], "", [], true).is_err() then skip("no ld.lld")
+
+    val root = bsh_root()
+    val cc = bsh_elf_clang(root, headers)
+    val dir = bsh_project(root, "elf", "import sysl.buf.{Buf, buf}\n\n" + bsh_tls + raw"""
+
+        @export("e_sum")
+        sum(n: i32) -> i32
+            var b: Buf[string] = buf()
+
+            for i in 0..<n do b.push(s"x$i")
+            print(s"${b.len()}")
+            i32(b.len())
+        """)
+
+    for (target, tls) in [("x86_64-linux", "R_X86_64_DTPMOD64"), ("aarch64-linux", "R_AARCH64_TLSDESC")]
+        val lib = bsh_library(dir, s"$root/libelf-$target.so", ["--target", target, "--cc", cc, "--soname", "libelf.so.1"])
+
+        assert_eq(join_sorted(bsh_elf_exported(readelf, lib)), "bsh_enter bsh_tag e_sum")
+
+        val dynamic = bsh_readelf(readelf, ["-d"], lib)
+
+        assert(dynamic.contains("Library soname: [libelf.so.1]"))
+        assert(!dynamic.contains("STATIC_TLS"))
+        assert(!dynamic.contains("TEXTREL"))
+
+        val relocs = bsh_readelf(readelf, ["-r"], lib)
+
+        assert(relocs.contains(tls))
+        assert(!relocs.contains("TPOFF"))
+
+    // A version script given is the one the link uses, and its nodes name the exports.
+    write_text(s"$root/v.map", "ELF_1 {\n  global: e_sum; bsh_tag;\n  local: *;\n};\n").unwrap()
+
+    val versioned = bsh_library(dir, s"$root/libv.so", ["--target", "x86_64-linux", "--cc", cc,
+                                                         "--version-script", s"$root/v.map"])
+    val syms = bsh_readelf(readelf, ["--dyn-syms", "--wide"], versioned)
+
+    assert(syms.contains("e_sum@@ELF_1"))
+    assert(syms.contains("bsh_tag@@ELF_1"))
+    assert(!syms.contains("bsh_enter"))
+    remove_dir_all(root).unwrap_or(())

@@ -22,7 +22,16 @@ gen_expr(e: *Emit, x: TExpr) -> Val
         return VNothing
     end if
 
-    gen_expr_kind(e, x)
+    // The expression is where a check made while lowering it says it failed, and the one around
+    // it is again once it is done (`bounds_fail.sysl`'s `report_check`).
+    val outer = e.trap_site
+
+    e.trap_site = Some(x.span)
+
+    val v = gen_expr_kind(e, x)
+
+    e.trap_site = outer
+    v
 end gen_expr
 
 private gen_expr_kind(e: *Emit, x: TExpr) -> Val = *x.kind match
@@ -421,6 +430,7 @@ private gen_expr_kind(e: *Emit, x: TExpr) -> Val = *x.kind match
 
     TDowngrade(value, weak_ty) -> gen_downgrade(e, value, weak_ty)
     TUpgrade(value, opt_ty, some, none) -> gen_upgrade(e, value, opt_ty, some, none)
+    TDowncast(value, id, ref_ty, opt_ty, some, none) -> gen_downcast(e, value, id, ref_ty, opt_ty, some, none)
     TEnumAttr(kind, en, arg, _) -> gen_enum_attr(e, kind, en, arg)
     TIntOp(op, operand, amount, width, ty) -> gen_int_op(e, op, operand, amount, width, ty)
 
@@ -485,7 +495,7 @@ private gen_expr_kind(e: *Emit, x: TExpr) -> Val = *x.kind match
     TReduce(op, receiver, ty) -> fixed_dot_pair(e, x) match
         Some((a, b)) -> fixed_dot(e, a, b, None, None)
         None -> gen_reduce(e, op, receiver, ty)
-    TVecOp(op, operands, ty) -> gen_vec_op(e, op, operands, ty)
+    TVecOp(op, operands, ty) -> gen_vec_op(e, op, operands, ty, x.span)
     TVecLoad(receiver, index, vec_ty) -> gen_vec_load(e, receiver, index, vec_ty, x.span)
     TVecStore(receiver, index, value) -> gen_vec_store(e, receiver, index, value, x.span)
 
@@ -581,10 +591,8 @@ private gen_field(e: *Emit, x: TExpr, receiver: TExpr, index: int, ty: Type) -> 
         return r
 
     val v = gen_expr(e, receiver)
-    val r = fresh_reg(e)
 
-    emit(e, InExtract(r, lty(e, rty), v, index_list(field_index_of(e, rty, index))))
-    r
+    extract_held(e, lty(e, rty), v, field_index_of(e, rty, index), lty(e, ty), field_held_of(rty, index))
 end gen_field
 
 // Whether a place lies inside a parameter this body reads where its caller put it: the parameter
@@ -614,10 +622,8 @@ end loaded_container
 
 private extracted_container(e: *Emit, receiver: TExpr, rty: Type) -> Val
     val rv = gen_expr(e, receiver)
-    val t = fresh_reg(e)
 
-    emit(e, InExtract(t, lty(e, rty), rv, index_list(0)))
-    t
+    extract_held(e, lty(e, rty), rv, 0, container_lty(bitfield_ranges_of(rty).unwrap()), container_held_of(rty))
 end extracted_container
 
 // Whether a node names storage rather than a value, which is what says `address` can walk to it. A
@@ -1275,7 +1281,7 @@ emit_constraint_checks(e: *Emit, v: Val, c: Type)
                     d.lo match
                         Some(lo) ->
                             trap_unless(e, compare_value(e, ">=", wide, x, end_value(lo, quad)),
-                                        "within")
+                                        "within", d.name)
                         None -> ()
 
                     d.hi match
@@ -1283,7 +1289,7 @@ emit_constraint_checks(e: *Emit, v: Val, c: Type)
                             val op = if d.exclusive_hi then "<" else "<="
 
                             trap_unless(e, compare_value(e, op, wide, x, end_value(hi, quad)),
-                                        "within")
+                                        "within", d.name)
                         None -> ()
                 // A fixed-point range is compared on the raw value, each end brought to the scale
                 // inward -- the smallest raw value at or above the lower end, the largest at or below
@@ -1293,7 +1299,7 @@ emit_constraint_checks(e: *Emit, v: Val, c: Type)
                         Some(lo) ->
                             trap_unless(e, compare_value(e, ">=", base, v,
                                                          VInt(fixed_bound_raw(finite_end(lo), frac, FixCeil))),
-                                        "within")
+                                        "within", d.name)
                         None -> ()
 
                     d.hi match
@@ -1305,14 +1311,14 @@ emit_constraint_checks(e: *Emit, v: Val, c: Type)
 
                             trap_unless(e, compare_value(e, op, base, v,
                                                          VInt(fixed_bound_raw(finite_end(hi), frac, mode))),
-                                        "within")
+                                        "within", d.name)
                         None -> ()
                 _ ->
                     d.lo match
                         Some(lo) ->
                             trap_unless(e, compare_value(e, ">=", base, v,
                                                          VInt(decimal_int(finite_end(lo)))),
-                                        "within")
+                                        "within", d.name)
                         None -> ()
 
                     d.hi match
@@ -1321,7 +1327,7 @@ emit_constraint_checks(e: *Emit, v: Val, c: Type)
 
                             trap_unless(e, compare_value(e, op, base, v,
                                                          VInt(decimal_int(finite_end(hi)))),
-                                        "within")
+                                        "within", d.name)
                         None -> ()
 
             d.pred_fn match
@@ -1332,7 +1338,7 @@ emit_constraint_checks(e: *Emit, v: Val, c: Type)
 
                     args.push(ir_arg(lty(e, base), v))
                     emit(e, ir_call(Some(r), l_i1(), VGlobal(pf), args))
-                    trap_unless(e, r, "where")
+                    trap_unless(e, r, "where", d.name)
                 None -> ()
         _ -> ()
 end emit_constraint_checks
@@ -1372,13 +1378,13 @@ private gen_constrained_step(e: *Emit, value: TExpr, c: Type, up: bool) -> Val
                     None -> from_int(0)
                 val last = if d.exclusive_hi then big_sub(h, from_int(1)) else h
 
-                trap_unless(e, compare_value(e, "<", base, v, VInt(last)), "succ")
+                trap_unless(e, compare_value(e, "<", base, v, VInt(last)), "succ", d.name)
             else
                 val first = d.lo match
                     Some(x) -> decimal_int(finite_end(x))
                     None -> from_int(0)
 
-                trap_unless(e, compare_value(e, ">", base, v, VInt(first)), "pred")
+                trap_unless(e, compare_value(e, ">", base, v, VInt(first)), "pred", d.name)
 
             val r = fresh_reg(e)
 
@@ -1420,10 +1426,8 @@ private gen_struct_new(e: *Emit, at: Span, decl: &StructType, args: Buf[TExpr]) 
 
             val c = reordered(e, container_reversal(decl, e.target.little_endian()),
                               build_bits(e, ranges, vals))
-            val r = fresh_reg(e)
 
-            emit(e, InInsert(r, struct_lty(decl), VUndef, container_lty(ranges), c, index_list(0)))
-            return r
+            return insert_held(e, struct_lty(decl), VUndef, container_lty(ranges), c, 0, container_held_bytes(ranges))
         None -> ()
 
     var vals: Buf[Val] = buf()
@@ -1436,13 +1440,22 @@ private gen_struct_new(e: *Emit, at: Span, decl: &StructType, args: Buf[TExpr]) 
 
     for i in 0..<vals.len()
         if !zero_sized(decl.fields[i].1)
-            val r = fresh_reg(e)
-            val stored = reordered(e, reversed_width(decl, decl.fields[i].1, e.target.little_endian()),
-                                   vals[i])
+            val ft = decl.fields[i].1
+            val held = field_held_bytes(decl, ft)
 
-            emit(e, InInsert(r, struct_lty(decl), acc, lty(e, decl.fields[i].1), stored,
-                             index_list(struct_field_index(e.layout, decl, decl.slot(i)))))
-            acc = r
+            if held == 0
+                val r = fresh_reg(e)
+                val stored = reordered(e, reversed_width(decl, ft, e.target.little_endian()), vals[i])
+
+                emit(e, InInsert(r, struct_lty(decl), acc, lty(e, ft), stored,
+                                 index_list(struct_field_index(e.layout, decl, decl.slot(i)))))
+                acc = r
+            else
+                val stored = reordered(e, reversed_width(decl, ft, e.target.little_endian()), vals[i])
+
+                acc = insert_held(e, struct_lty(decl), acc, lty(e, ft), stored,
+                                  struct_field_index(e.layout, decl, decl.slot(i)), held)
+            end if
 
     note_parts(e, at, acc, vals)
     acc
@@ -1571,7 +1584,8 @@ private gen_call(e: *Emit, name: string, args: Buf[TExpr], ty: Type, span: Span)
         // **An `extern` of `sysl_bounds_fail` -- the library's container reports -- reaches the
         // function every compiler check reports through**, so the module holds the weak default as a
         // module with a check does, and the default is the declaration (`declares`).
-        if symbol == bounds_fail_symbol()
+        // `sysl_trap` -- the library's panic -- is held the same way.
+        if symbol == bounds_fail_symbol() || symbol == trap_hook_symbol()
             e.traps = true
             e.bounds_fails = true
 

@@ -46,15 +46,41 @@ struct Utf8Error derives Eq
  *
  * The validation is `scan_at` below, which is also what the lossy form walks -- one table, so that
  * the two can never come to disagree about which bytes are text.
+ *
+ * **Sixteen bytes with no high bit set are sixteen one-byte characters**, so a block of ASCII is
+ * passed over with one load and one compare. A block holding any other byte is passed over up to
+ * its first high byte, the trailing zeros of the mask's `bits()`, and from there goes to `scan_at`
+ * for a stretch of characters before the vector test is tried again; each failed test doubles that
+ * stretch (up to 4 KiB) while a passing one shrinks it back to sixteen bytes: ASCII is skipped a block
+ * at a time, and text that is mostly not ASCII stops paying for blocks that never pass. The inner
+ * walk is the plain scalar loop, so it keeps that loop's speed. The positions `scan_at` sees are the
+ * character starts either way, which is why an error's offset is the same as the scalar walk's.
  */
 from_utf8(b: []const u8) -> Result[string, Utf8Error]
     var i: usize = 0
+    var gap: usize = 16
 
     while i < b.len
-        scan_at(b, i) match
-            Valid(n) -> i += n
-            Truncated(_) -> return Err(Utf8Error(i, true))
-            Invalid(_) -> return Err(Utf8Error(i, false))
+        if b.len - i >= 16
+            val v: <16>u8 = b.load(i)
+            val high = (v >= 128).bits()
+
+            if high == 0 then
+                i += 16
+                gap = 16
+                continue
+
+            i += usize(high.trailing_zeros())
+
+        val stop = if b.len - i > gap then i + gap else b.len
+
+        if gap < 4096 then gap += gap
+
+        while i < stop
+            scan_at(b, i) match
+                Valid(n) -> i += n
+                Truncated(_) -> return Err(Utf8Error(i, true))
+                Invalid(_) -> return Err(Utf8Error(i, false))
 
     Ok(str_cast(b))
 end from_utf8

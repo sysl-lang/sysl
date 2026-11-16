@@ -1,0 +1,120 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.text.{Search, str_builder}
+
+// The library's byte search and UTF-8 validator compare sixteen bytes at once, and these ask the
+// emitted text that they still do: a rewrite of either body that went back to one byte at a time
+// would leave every answer the same and only be slower, so no test of results could see it. The
+// results themselves are `library/sysl/text/simd_tests.sysl`'s.
+
+private val lsx_program: string =
+    "import sysl.text.from_utf8\n\n" +
+    "val s = \"hello, world\"\n" +
+    "print(s.index_of_byte(u8(',')), from_utf8(s.bytes).is_ok())\n"
+
+@test("the byte search compares a sixteen-byte block and reads the lane from the mask")
+lsx_byte_search_is_vectorised()
+    if xvr_no_library() then return
+
+    val body = cgz_body(cgz_ir(lsx_program), "find_byte_from")
+
+    assert(body.contains("load <16 x i8>"), body)
+    assert(body.contains("icmp eq <16 x i8>"), body)
+    assert(body.contains("@llvm.vector.reduce.or.v16i1("), body)
+    assert(body.contains("bitcast <16 x i1> %"), body)
+    assert(body.contains("@llvm.cttz.i16("), body)
+
+// The lane is the mask's bits, not a sum of weights: a weighted sum widens every lane to 16 bits and
+// adds across the register, where `bits()` is one bitcast the back end lowers to its own idiom.
+@test("the byte search reads the matching lane as the mask's bits, with no weighted sum")
+lsx_byte_search_reads_bits()
+    if xvr_no_library() then return
+
+    val body = cgz_body(cgz_ir(lsx_program), "find_byte_from")
+
+    assert(!body.contains("@llvm.vector.reduce.add"), body)
+    assert(!body.contains("select <16 x i1>"), body)
+    assert(!body.contains("<16 x i16>"), body)
+
+@test("from_utf8 passes over a block of ASCII with one sixteen-byte compare")
+lsx_from_utf8_has_an_ascii_block()
+    if xvr_no_library() then return
+
+    val body = cgz_body(cgz_ir(lsx_program), "from_utf8")
+
+    assert(body.contains("load <16 x i8>"), body)
+    assert(body.contains("icmp uge <16 x i8>"), body)
+    assert(body.contains("icmp eq i16"), body)
+
+// A block that is not all ASCII still begins with the ASCII before its first high byte, so the
+// validator steps over that much at once: the first high lane is the mask's trailing zeros.
+@test("from_utf8 skips to the first high byte of a block by the mask's trailing zeros")
+lsx_from_utf8_skips_the_ascii_prefix()
+    if xvr_no_library() then return
+
+    val body = cgz_body(cgz_ir(lsx_program), "from_utf8")
+
+    assert(body.contains("bitcast <16 x i1> %"), body)
+    assert(body.contains("@llvm.cttz.i16("), body)
+    assert(!body.contains("@llvm.vector.reduce.add"), body)
+
+// The instructions of one routine of a disassembly, from its label to the blank line after it.
+private lsx_routine(dis: string, name: string) -> string
+    var b = str_builder()
+    var inside = false
+
+    for line in lines_of(dis).view()
+        if line == s"<_$name>:" || line == s"<$name>:" then inside = true
+        elif inside && line == "" then return b.finish()
+
+        if inside
+            b.push(line)
+            b.push_char('\n')
+
+    if inside then b.finish() else s"no routine '$name' in:\n$dis"
+
+// On AArch64 `any()` is a `umaxv` across the bytes, and `bits()` of sixteen bytes is the movemask
+// idiom: each lane masked by its own bit, the two halves interleaved and one `addv` across eight
+// halfwords. The weighted sum it replaced sign-extended both halves to halfwords first (`sshll`).
+@test("on AArch64 the byte search tests a block with umaxv and reads the lane with one addv")
+lsx_aarch64_byte_search_code()
+    if !enm_ready() then return
+
+    val dis = vmo_host_code("import sysl.text.Search\n\n" +
+                            "@export(\"probe_find\")\n" +
+                            "probe_find(p: *u8, n: usize) -> usize = p[0..<n].index_of_byte(u8('!')).unwrap_or(n)\n\n" +
+                            "print(1)\n")
+
+    if dis.is_none() then return
+
+    val code = lsx_routine(dis.unwrap(), "probe_find")
+
+    assert(code.contains("umaxv.16b"), code)
+    assert(code.contains("addv.8h"), code)
+    assert(code.contains("rbit"), code)
+    assert(!code.contains("sshll"), code)
+
+// Both bodies use a mask's `bits()` and nothing held in module storage, so a freestanding archive,
+// which has no entry point to run a module initializer, can call either one on a bare-metal target.
+@test("an archive for a bare machine may call the vector byte search and the validator")
+lsx_bare_metal_archive_builds()
+    if !clx_ready() then return
+
+    val root = make_temp_dir("sysl-lsx").unwrap()
+    val file = s"$root/probe.sysl"
+
+    write_text(file, "import sysl.text.from_utf8\n\n" +
+                     "@export(\"probe_find\")\n" +
+                     "probe_find(p: *u8, n: usize) -> usize\n" +
+                     "    val h = p[0..<n]\n\n" +
+                     "    h.index_of_byte(u8('!')).unwrap_or(n) + if from_utf8(h).is_ok() then 1 else 0\n").unwrap()
+
+    for target in ["thumb-freestanding-softfp", "thumbv7em-freestanding-dp"]
+        val (code, out, err) = clx_ran(["sysl", "build-c", file, "--target", target, "-O2", "-o", s"$root/$target.a"])
+
+        assert_eq(code, Fine, s"$target: $out$err")
+
+    remove_dir_all(root).unwrap_or(())
+end lsx_bare_metal_archive_builds

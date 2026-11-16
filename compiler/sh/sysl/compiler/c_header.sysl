@@ -138,8 +138,8 @@ private is_c_ident_byte(b: u8) -> bool =
 // project do not collide. Anything not a C identifier is replaced, since a guard is a macro name
 // and a project may be called what it likes.
 c_header_render(funcs: Buf[TFunc], name: string, vals: Buf[TVal] = buf()) -> string
-    val exports = exports_by_symbol(funcs)
-    val storage = storage_by_symbol(vals)
+    val exports = offered_exports(funcs)
+    val storage = offered_storage(vals)
     val guard = s"SYSL_${header_guard_name(name)}_H"
     var out = str_builder()
 
@@ -193,6 +193,35 @@ c_header_render(funcs: Buf[TFunc], name: string, vals: Buf[TVal] = buf()) -> str
     out.push(s"#endif /* $guard */\n")
     out.finish()
 end c_header_render
+
+// **What a C project is offered**: the module's own public exports, sorted as `exports_by_symbol`
+// sorts them -- the functions the header declares and a shared library exports, and nothing else.
+//
+// **The standard library's exports are never among them**, whichever it reaches and however many it
+// grows. Each one answers a seam inside the runtime (`sysl_io_flush`, `sysl_wall_us`, the `sysl_trap`
+// hook's default renderer) and is weak for exactly that reason (`emit_export.sysl`'s `exported_weak`):
+// it is found by the runtime's own objects within the image, not by the host. Declared in a header it
+// would read as the module's API; offered by a shared library it would publish one runtime's insides
+// to every other library a process opens. The test is the declaring module, not a list of names, so
+// a hook the library adds later is held back the same way.
+offered_exports(funcs: Buf[TFunc]) -> Buf[TFunc]
+    var out: Buf[TFunc] = buf()
+
+    for f in exports_by_symbol(funcs)
+        if !std_module(f.declared_in) then out.push(f)
+
+    out
+end offered_exports
+
+// The same for module storage, whose key is the declaring module's qualified name.
+offered_storage(vals: Buf[TVal]) -> Buf[TVal]
+    var out: Buf[TVal] = buf()
+
+    for v in storage_by_symbol(vals)
+        if !v.symbol.starts_with("sysl.") then out.push(v)
+
+    out
+end offered_storage
 
 // The exported functions of a compilation, in the order their C symbols sort. Sorted because the
 // header is an artifact two builds of one tree must agree on byte for byte, and the order
@@ -600,14 +629,21 @@ private c_base(t: Type) -> string = header_surface(t) match
     _ -> s"/* no C spelling for ${type_show(t)} */ void"
 
 // A project's name as an include guard's middle: upper case where it can be, and an underscore
-// wherever the name held something a macro may not.
+// wherever the name held something a macro may not. A name with no letter or digit in it says
+// nothing about whose header this is, so it is never the whole middle: `SYSL___H` is what every
+// such header would share.
 private header_guard_name(name: string) -> string
     var out: Buf[u8] = buf()
+    var named = false
 
     for i in 0..<name.bytes.len
         val b = name.bytes[i]
 
+        if is_c_ident_byte(b) && b != u8('_') then named = true
+
         out.push(if is_c_ident_byte(b) then upper_ascii(b) else u8('_'))
+
+    if !named then return s"UNNAMED${from_utf8_unchecked(out.view())}"
 
     from_utf8_unchecked(out.view())
 end header_guard_name

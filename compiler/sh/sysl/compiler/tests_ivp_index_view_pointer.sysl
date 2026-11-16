@@ -1,0 +1,344 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.cstring
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **A view taken through a value that only leads to its elements is not a view of the element's
+// storage**, so it is not taken through the container's `index_view` (`expr_coll.sysl`'s
+// `viewed_through_storage` stops there). `c[i].data[0..<n]` with `data: *u8` views the pointee, the
+// same view `val d = c[i].data` then `d[0..<n]` takes; it was refused as a view of part of the element
+// through the trait's default `index_view`.
+//
+// The axes: what the step leading away from the element is -- a raw-pointer field, one nested in a
+// struct field, a pointer element, a field read through a pointer field, a slice field, a string
+// field, a method answering a pointer, an `Option` unwrapped to one; checked and `@unchecked`; a read
+// and a write through the view. What is still refused: an inline array field, one nested in an
+// inline struct field, and an inline array reached by a subscript of an inline array field. A `Buf`
+// field is answered by the slicing diagnostic it gets anywhere, not the default's refusal. Every
+// runnable cell runs at -O0 and -O2 on the counted heap and once under AddressSanitizer.
+//
+// Cells not written: a `&[N]T` field -- a view of it is the box's, by the rule a slice field follows,
+// and the walk stops at it by the same arm; a weak reference cannot be sliced.
+
+private extern "setenv" ivp_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" ivp_c_unsetenv(name: *u8) -> int
+
+private struct IvpRun
+    ok: bool
+    out: string
+    err: string
+    hooks: usize
+
+private ivp_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end ivp_ready
+
+private ivp_ir(text: string) -> string
+    val root = make_temp_dir("sysl-ivp").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end ivp_ir
+
+// Refused saying `said` at `at`, and -- unless `said` is that refusal -- not refused the default
+// `index_view`.
+private ivp_refused(text: string, said: string, at: string)
+    if !ivp_ready() then return
+
+    val out = ivp_ir(text)
+
+    assert(out.contains(said), out)
+    assert(out.contains(at), out)
+    assert(!out.contains("owns nothing") || said.contains("the default 'index_view'"), out)
+end ivp_refused
+
+private ivp_run(text: string, level: string, counted: bool, flags: string) -> IvpRun
+    val root = make_temp_dir("sysl-ivp").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    if counted then force_alloc_counting(true)
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+        val v = cstring(flags)
+
+        ivp_c_setenv(n.ptr, v.ptr, 1)
+    end if
+
+    val built = build_native_program(s"$root/main.sysl", None, None, level, Some(exe))
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+
+        ivp_c_unsetenv(n.ptr)
+
+    if counted then force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return IvpRun(false, failure_text(why), "", 0)
+        Ok(_) -> ()
+
+    val hooks = capture("nm", ["-u", exe], "", [], true) match
+        Ok(o) -> o.text.count_of("__asan_report")
+        Err(_) -> 0
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> IvpRun(false, "could not be started", "", hooks)
+        Ok(o) -> IvpRun(o.status.ok(), o.text, o.err.unwrap_or(""), hooks)
+end ivp_run
+
+// Printed exactly `expected` at both ends of the optimizer on the counted heap, giving everything
+// back, and again under AddressSanitizer with the instrumentation in the binary.
+private ivp_prints(text: string, expected: string)
+    if !ivp_ready() then return
+
+    for level in ["0", "2"]
+        val run = ivp_run(text, level, true, "")
+
+        assert(run.ok, s"-O$level: ${run.out}${run.err}")
+        assert_eq(run.out, expected)
+        assert(alloc_count_reported(run.err) == 0, s"-O$level: ${run.err}")
+
+    val asan = ivp_run(text, "0", false, "-fsanitize=address -g")
+
+    assert(asan.hooks > 0, "the AddressSanitizer build carries no instrumentation")
+    assert(asan.ok, s"asan: ${asan.out}${asan.err}")
+    assert_eq(asan.out, expected)
+end ivp_prints
+
+// -- a view of what a step leads to is read as written ----------------------------------------------
+
+@test("a view through a raw-pointer field of an IndexPlace element views the pointee")
+ivp_pointer_field()
+    ivp_prints(raw"""
+        import sysl.slices.as_mut_ptr
+
+        struct Rec
+            data: *u8
+
+        struct Table
+            recs: [4]Rec
+
+        impl IndexPlace[usize, Rec] for Table
+            index_place(*self, i: usize) -> *Rec = &self.recs[i]
+
+        bytes(t: *Table, i: usize) -> []u8 = t[i].data[0..<4]
+
+        main()
+            var store = [1u8, 2, 3, 4]
+            var t = Table([Rec(as_mut_ptr(store[..])); 4])
+            val v = bytes(&t, 2)
+            v[0] = 9
+            print(v[3], store[0], t[1].data[1..<3].len)
+        """, "4 9 2\n")
+
+@test("a raw-pointer field nested in a struct field, and one inside @unchecked, view the pointee")
+ivp_nested_pointer_field()
+    ivp_prints(raw"""
+        import sysl.slices.as_mut_ptr
+
+        struct Inner
+            data: *u8
+
+        struct Rec
+            inner: Inner
+            tag: int
+
+        struct Table
+            recs: [4]Rec
+
+        impl IndexPlace[usize, Rec] for Table
+            index_place(*self, i: usize) -> *Rec = &self.recs[i]
+
+        bytes(t: *Table, i: usize) -> []u8 = t[i].inner.data[0..<4]
+
+        quick(t: *Table, i: usize) -> []u8
+            @unchecked
+                return t[i].inner.data[1..<4]
+
+        main()
+            var store = [1u8, 2, 3, 4]
+            var t = Table([Rec(Inner(as_mut_ptr(store[..])), 0); 4])
+            print(bytes(&t, 2)[3], quick(&t, 3)[0])
+        """, "4 2\n")
+
+@test("an element that is a pointer, and a field read through a pointer field, view the pointee")
+ivp_pointer_element_and_through_pointer()
+    ivp_prints(raw"""
+        import sysl.slices.as_mut_ptr
+
+        struct Ptrs
+            ps: [2]*u8
+
+        impl IndexPlace[usize, *u8] for Ptrs
+            index_place(*self, i: usize) -> **u8 = &self.ps[i]
+
+        struct Cells
+            v: [4]u8
+
+        struct Rec
+            p: *Cells
+
+        struct Table
+            recs: [4]Rec
+
+        impl IndexPlace[usize, Rec] for Table
+            index_place(*self, i: usize) -> *Rec = &self.recs[i]
+
+        main()
+            var store = [1u8, 2, 3, 4]
+            var q = Ptrs([as_mut_ptr(store[..]); 2])
+            var c = Cells([5u8, 6, 7, 8])
+            var t = Table([Rec(&c); 4])
+            print(q[1][0..<4][2], t[2].p.v[1..<4][2], t[0].p.v[..].len)
+        """, "3 8 4\n")
+
+@test("a slice field and a string field of an IndexPlace element are viewed as themselves")
+ivp_slice_and_string_fields()
+    ivp_prints(raw"""
+        struct Rec
+            data: []u8
+            name: string
+
+        struct Table
+            recs: [2]Rec
+
+        impl IndexPlace[usize, Rec] for Table
+            index_place(*self, i: usize) -> *Rec = &self.recs[i]
+
+        main()
+            var store = [1u8, 2, 3, 4]
+            var t = Table([Rec(store[..], "abcd"); 2])
+            print(t[1].data[1..<4][2], t[0].name[1..<3])
+        """, "4 bc\n")
+
+@test("a method answering a pointer and an Option unwrapped to one view the pointee")
+ivp_method_and_option()
+    ivp_prints(raw"""
+        import sysl.slices.as_mut_ptr
+
+        struct Rec
+            data: *u8
+            maybe: Option[*u8]
+
+        impl Rec
+            at(self) -> *u8 = self.data
+
+        struct Table
+            recs: [4]Rec
+
+        impl IndexPlace[usize, Rec] for Table
+            index_place(*self, i: usize) -> *Rec = &self.recs[i]
+
+        main()
+            var store = [1u8, 2, 3, 4]
+            val p = as_mut_ptr(store[..])
+            var t = Table([Rec(p, Some(p)); 4])
+            print(t[2].at()[0..<4][3], t[1].maybe.unwrap()[0..<4][1])
+        """, "4 2\n")
+
+// -- a view of the element's own storage is still taken through index_view ---------------------------
+
+@test("an inline array field of the element is still refused the default index_view")
+ivp_inline_field_refused()
+    ivp_refused(raw"""
+        struct Rec
+            data: [4]u8
+
+        struct Table
+            recs: [4]Rec
+
+        impl IndexPlace[usize, Rec] for Table
+            index_place(*self, i: usize) -> *Rec = &self.recs[i]
+
+        main()
+            var t = Table([Rec([1u8, 2, 3, 4]); 4])
+            print(t[2].data[0..<4][3])
+        """, "a view of part of an element of 'Table' is taken through the default 'index_view', " +
+        "which owns nothing", "main.sysl:12:")
+
+@test("an inline array in an inline struct field, or a row of an inline array field, is still refused")
+ivp_nested_inline_refused()
+    ivp_refused(raw"""
+        import sysl.slices.as_mut_ptr
+
+        struct Inner
+            p: *u8
+            cells: [4]u8
+
+        struct Rec
+            inner: Inner
+
+        struct Table
+            recs: [4]Rec
+
+        impl IndexPlace[usize, Rec] for Table
+            index_place(*self, i: usize) -> *Rec = &self.recs[i]
+
+        main()
+            var store = [1u8, 2, 3, 4]
+            var t = Table([Rec(Inner(as_mut_ptr(store[..]), [1u8, 2, 3, 4])); 4])
+            print(t[2].inner.cells[1..].len)
+        """, "a view of part of an element of 'Table' is taken through the default 'index_view'",
+        "main.sysl:19:")
+
+    ivp_refused(raw"""
+        struct Rec
+            rows: [2][4]u8
+
+        struct Table
+            recs: [4]Rec
+
+        impl IndexPlace[usize, Rec] for Table
+            index_place(*self, i: usize) -> *Rec = &self.recs[i]
+
+        main()
+            var t = Table([Rec([[1u8, 2, 3, 4], [5, 6, 7, 8]]); 4])
+            print(t[2].rows[1][1..].len)
+        """, "a view of part of an element of 'Table' is taken through the default 'index_view'",
+        "main.sysl:12:")
+
+@test("a Buf field is answered by the slicing diagnostic, not the default index_view's refusal")
+ivp_buf_field()
+    ivp_refused(raw"""
+        import sysl.buf.{Buf, buf}
+
+        struct Rec
+            data: Buf[u8]
+
+        struct Table
+            recs: [2]Rec
+
+        impl IndexPlace[usize, Rec] for Table
+            index_place(*self, i: usize) -> *Rec = &self.recs[i]
+
+        main()
+            var t = Table([Rec(buf()), Rec(buf())])
+            t.recs[1].data.push(1)
+            print(t[1].data[0..<1].len)
+        """, "but slicing through the trait is not built", "main.sysl:15:")

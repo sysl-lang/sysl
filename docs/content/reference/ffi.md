@@ -306,10 +306,11 @@ print((3.5f32).round_even(), (2.5).round_even())
 
 **Where the machine has no fused instruction, `llvm.fma` is a call to C's `fma` or `fmaf`**, and a
 freestanding machine has no C library to answer it — an Armv6-M at both widths, a Cortex-M4's
-single-precision unit at `f64`. So `sysl.softfloat` exports both on every Arm and 32-bit RISC-V
-target, correctly rounded and weak, as it does the binary64 arithmetic: a program that computes with
-`fma` links on a bare machine and asks nothing of it, and a C library linked beside it wins — a
-package exporting its own `fma` included, which is the one definition the link keeps. Whether
+single-precision unit at `f64`, x86-64's baseline, WebAssembly. So `sysl.softfloat` exports both on
+every freestanding target without the instruction, correctly rounded and weak, as it does the
+binary64 arithmetic: a program that computes with `fma` links on a bare machine and asks nothing of
+it, and a C library linked beside it wins — a package exporting its own `fma` included, which is the
+one definition the link keeps. Whether
 the width *is* an instruction is the `#if` symbols `fma` and `fma_dp` (C's `FP_FAST_FMAF` and
 `FP_FAST_FMA`; [attributes](/reference/attributes/#the-symbols-are-derived-from-the-target-and-the-set-is-closed)).
 
@@ -328,10 +329,14 @@ print(fma16(1.0f16, 2.0f16, 3.0f16))
 ```
 
 **What it is for is not only speed.** An intrinsic that lowers to an instruction leaves no symbol
-behind, so the operation needs no library at the link — which is what lets the standard module's
-roots, magnitudes, sign transfers and roundings work on a **freestanding** target, where there is no
-libm to ask. Where the machine has no instruction there is nothing to gain: `llvm.sin` exists and
-lowers to a call to the same `sin` an ordinary `extern` names, so the transcendentals stay linked.
+behind, so the operation needs no library at the link. Where the machine has no instruction for one
+of the roots, roundings and extrema — a Cortex-M4 rounding anything, an Armv6-M at all, x86-64's
+baseline rounding, WebAssembly's `round` — LLVM calls C's function of the same name, and
+`sysl.softfloat` exports `sqrt`, `floor`, `ceil`, `trunc`, `round`, `rint`, `nearbyint`, `fmax` and
+`fmin` at both widths on every such **freestanding** target, exactly rounded and weak as `fma` is. So
+the standard module's roots, magnitudes, sign transfers and roundings work on a board with no libm
+to ask. The transcendentals are another matter: `llvm.sin` exists and lowers to a call to the same
+`sin` an ordinary `extern` names, and nothing on a board answers it, so they stay linked.
 
 ### What crosses the boundary
 
@@ -1222,6 +1227,7 @@ load, which is what makes this work on Android.
 |---|---|
 | `sysl build`, `sysl test` | its own entry point, before the first statement — a library's storage included, since a library joins the program as source |
 | `sysl build-c` | a constructor the platform runs before the C project's `main` |
+| `sysl build-c --shared` | the same constructor, run by the loader when the library is opened |
 
 **A `val` whose initializer is constant data is not in the question at all**, because nothing runs to
 fill it — the constant is written straight into the object file, which is the rule C already has for
@@ -1890,6 +1896,23 @@ That reading is at its strongest where the attributes matter most: a vector tabl
 RAM-resident `.ramfunc` region are the scarcest things on the parts they exist for, so gaining every
 unimported module's silently is the worse way to be wrong.
 
+### A shared library, and what crosses between two
+
+`sysl build-c --shared` links a module into a `.dylib` or `.so` instead of an archive
+([the CLI](/getting-started/cli/#a-shared-library) has the flags). **What the library exports is
+exactly what its header declares**: the public `@export` functions and storage. A private export
+stays inside the library, as it stays inside an archive's image, and every other symbol the runtime
+defines is local to it.
+
+**Each library carries its own copy of the runtime**, and that sets the rule for two of them in one
+process: **a sysl object crosses between two sysl shared libraries only through their C API.** A
+reference count, a `Buf`'s storage, a closure's environment and a trait object's table all belong to
+the library that made them; the other library's code would read them with a runtime that is not
+theirs. What crosses is what crosses between two C libraries: scalars, pointers, structs of those, and
+handles each library creates, hands out and takes back through its own exports. Both libraries
+allocate through the C heap, so memory is not the problem — ownership is. A runtime shared between
+libraries is not built.
+
 ## A module may supply another module's `extern`
 
 The rule above has one exception, and it is not a relaxation of it: **an `@export` whose symbol
@@ -2028,9 +2051,12 @@ decides what that becomes:
 | does not have it at all | nothing | a freestanding build has no libc, so nothing can be passed for one |
 
 The last two both put nothing on the command line and are still written apart, because they are
-different facts and a target added to the registry has to answer them separately. A freestanding
-program that then calls `sqrt` fails at the link naming `sqrt`, which is the honest report: what is
-missing is the function, and no `-l` would have supplied it.
+different facts and a target added to the registry has to answer them separately. What a
+freestanding program cannot then do is call libm, and it is told so before any link: every libm
+function `sysl.math` binds is `@needs(libc)`, so `x.sin()` on a bare machine is
+[refused at the reference](/reference/packages/#libc-the-one-a-freestanding-target-starts-without).
+A board whose manifest grants `libc` — newlib, picolibc — has its mathematics beside it, and there
+`sysl build-c` names `m` among the libraries to link.
 
 **The set the compiler knows is deliberately small** — the C runtime and the mathematics, the two
 whose placement actually differs. An unrecognized name is passed straight through rather than

@@ -339,13 +339,14 @@ visible:
 
 | stopped by | what you see | exit status |
 |---|---|---|
-| a compiler-inserted check (a bounds test, a broken contract) | nothing at all — a trap instruction, and buffered output is lost | the platform's signal status |
-| `panic`, `assert`, `unwrap`, `expect` | `panic: <message>` on stdout, after everything printed before it | 1 |
+| a compiler-inserted check (a bounds test, a broken contract) | everything printed before it, then one line on stderr naming the check and where it was | the platform's signal status for a trap (133) |
+| `panic`, `assert`, `unwrap`, `expect` | everything printed before it, then `panic: <message>` on stderr | `abort`'s (134) |
 
 That is not an inconsistency. A trap is for a check the *language* makes, where the source line
-already says everything a message could; `panic` is for a check a *program* makes, about something it
-knows and the compiler does not, where the message is the entire point. The full account is on
-[errors and contracts](/reference/errors/).
+already says the rest, so its line only says which check failed; `panic` is for a check a *program*
+makes, about something it knows and the compiler does not, where the message is the entire point.
+Both are reported through the `sysl_trap` hook before the program stops, which a host or a board
+may replace. The full account is on [errors and contracts](/reference/errors/#what-stopping-looks-like).
 
 ### Choosing an exit status
 
@@ -1254,26 +1255,29 @@ print(lo < hi)
 true
 ```
 
-**An array hashes and a slice does not**, which is the one place the two part company:
-`impl[const N: usize, T: Hash] Hash for [N]T` folds the elements' hashes in order, so `[1, 2]` and
-`[2, 1]` are different keys. There is no matching block for `[]T`:
+**Arrays, slices, `Buf`, `Frozen` and `Option` hash by their contents.**
+`impl[T: Hash] Hash for []T` folds the elements' hashes in order, after the length, so `[1, 2]` and
+`[2, 1]` are different keys, and `[1], [2]` is a different key from `[1, 2]`. It agrees with `==`:
+equal contents give equal hashes. An array, a `Buf` and a `Frozen` hash as their slice does, and an
+`Option` hashes `None` as one key and `Some(v)` as `v`'s key after a variant tag. That is what lets
+`derives Hash` work on a struct or enum holding any of them, and lets them be `Map` keys:
 
 ```sysl
 val xs: [3]u32 = [1, 2, 3]
 val view = xs[..]
 
-print(view.hash())
+print(view.hash() == xs.hash())
 ```
 
-```error
-type '[]const uint' has no method 'hash'
+```output
+true
 ```
 
-**A hash is a promise about a key, and a slice is a view.** Putting one in a table leaves the storage
-reachable and writable by whoever owns it, so the key can change under the table and the entry
-becomes unfindable — a failure that surfaces as a lookup quietly missing rather than as anything
-going wrong where it was caused. An array is a value and copies, so it has no such owner, and a
-caller holding a slice it means as a key hashes something it owns.
+**A hash is a promise about a key, and a slice is a view.** A slice hashes the elements it views
+right now; if its owner writes the storage while it is a key, the entry becomes unfindable — a
+failure that surfaces as a lookup quietly missing rather than as anything going wrong where it was
+caused. Key on a `Buf` or an array, which own their elements, or leave the storage alone while it is
+a key.
 
 [`sysl.slices.equal`](/library/slices/#comparing-and-rearranging) answers the same question as a free function and is not
 going anywhere: it takes `[]const T`, it lives in an `@no_alloc` module a freestanding target can

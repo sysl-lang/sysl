@@ -82,6 +82,25 @@ set_group(id: u32) -> Result[unit, IoError] = changed(psys.set_id(psys.id_group,
 
 private changed(code: int) -> Result[unit, IoError] = if code >= 0 then Ok(()) else Err(from_status(code))
 
+/** The name the system's user database gives user `id`, as POSIX's `getpwuid_r`: `user_name(0)` is
+ * `"root"`, and `user_name(user())` is the program's own login name.
+ *
+ * **An id with no entry is `NotFound`**, which is a different answer from a lookup that failed (the
+ * system's own error) and from a name that is not valid UTF-8 (`InvalidUtf8`). **A target with no user
+ * database** (`UNSUPPORTED` from its supplier) fails with that error.
+ */
+user_name(id: u32) -> Result[string, IoError]
+    var raw: []u8 = [0; 1024]
+
+    val n = psys.user_name(id, as_mut_ptr(raw), raw.len)
+
+    if n < 0 then return Err(from_status(int(n)))
+
+    from_utf8(raw[0..<usize(n)]) match
+        Ok(s) -> Ok(s)
+        Err(e) -> Err(IoError.InvalidUtf8(e.offset))
+end user_name
+
 /** The name this machine calls itself, as POSIX's `gethostname`: `"build-7"`, or a fully qualified
  * `"build-7.example.org"`, whichever the host was configured with. It is whatever the host says and
  * is not looked up in any directory, so it need not resolve to an address.

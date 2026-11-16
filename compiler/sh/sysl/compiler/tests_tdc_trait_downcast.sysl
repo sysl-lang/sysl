@@ -1,0 +1,358 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `o.is[T]()` and `o.as[T]()` -- asking a trait object which type it holds (`reference/traits.md §
+// Asking an object which type it holds`). The axes: hit and miss; a concrete type against an
+// instantiation that differs only in an argument; the receiver as a local, a temporary, a parameter
+// and an element of a `Buf`; the answer kept, returned, discarded and matched; `&` against `&sync`
+// against `*`; a type with a destructor, whose drop must run exactly once; and the refusals.
+//
+// Every running program is built at `-O0` and `-O2` on the counted heap and must give back
+// everything, so a count the answer failed to take shows as a `drop` printed early and one taken
+// twice as a leak.
+
+private struct TdcRun
+    ok: bool
+    out: string
+    err: string
+
+private tdc_run_at(text: string, level: string) -> TdcRun
+    val root = make_temp_dir("sysl-tdc").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    force_alloc_counting(true)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, level, Some(s"$root/built"))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return TdcRun(false, failure_text(why), "")
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> TdcRun(false, "could not be started", "")
+        Ok(o) -> TdcRun(o.status.ok(), o.text, o.err.unwrap_or(""))
+end tdc_run_at
+
+// Printed exactly `expected` at both ends of the optimizer, exited cleanly, and gave everything back.
+private tdc_prints(text: string, expected: string)
+    if !enm_ready() then return
+
+    for level in ["0", "2"]
+        val run = tdc_run_at(text, level)
+
+        assert(run.ok, s"-O$level: ${run.out}${run.err}")
+        assert_eq(run.out, expected)
+        assert(alloc_count_reported(run.err) == 0, s"-O$level: ${run.err}")
+end tdc_prints
+
+private tdc_refused(text: string, part: string)
+    if !enm_ready() then return
+
+    val said = enm_err(text)
+
+    assert(said.contains(part), said)
+end tdc_refused
+
+private tdc_shapes() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    trait Shape
+        area(self) -> int
+
+    struct Rect
+        w: int
+        h: int
+
+    struct Sq
+        s: int
+
+    struct Circle
+        r: int
+
+    struct Lamp
+        n: int
+
+    impl Drop for Lamp
+        drop(self) = print("off", self.n)
+
+    struct Col[T]
+        v: T
+
+    impl Shape for Rect
+        area(self) -> int = self.w * self.h
+
+    impl Shape for Sq
+        area(self) -> int = self.s * self.s
+
+    impl Shape for Lamp
+        area(self) -> int = self.n
+
+    impl[T] Shape for Col[T]
+        area(self) -> int = 1
+
+    """
+
+// -- the question, and the answer ----------------------------------------------------------------------
+
+@test("is answers whether the object holds exactly that type")
+tdc_is_hit_and_miss()
+    tdc_prints(tdc_shapes() + raw"""
+        val s: &Shape = Rect(2, 3)
+        print(s.is[Rect](), s.is[Sq]())
+        """, "true false\n")
+
+@test("as hands back the object as the type it holds, and none for any other")
+tdc_as_hit_and_miss()
+    tdc_prints(tdc_shapes() + raw"""
+        val s: &Shape = Rect(2, 3)
+        if s.as[Rect]() is Some(r) then print("rect", r.w, r.h) else print("no")
+        if s.as[Sq]() is Some(q) then print("sq", q.s) else print("not a sq")
+        """, "rect 2 3\nnot a sq\n")
+
+@test("the answer takes apart in a match like any option")
+tdc_as_in_a_match()
+    tdc_prints(tdc_shapes() + raw"""
+        val xs: [3]&Shape = [Rect(1, 2), Sq(3), Sq(5)]
+
+        for x in xs
+            x.as[Sq]() match
+                Some(q) -> print("sq", q.s)
+                None -> print("area", x.area())
+        """, "area 2\nsq 3\nsq 5\n")
+
+@test("a temporary object is asked and given back once")
+tdc_a_temporary_receiver()
+    tdc_prints(tdc_shapes() + raw"""
+        make(n: int) -> &Shape = Lamp(n)
+
+        print(make(1).is[Lamp]())
+        print(make(2).as[Lamp]().map(l -> l.n).unwrap_or(0))
+        print(make(3).as[Rect]().is_some())
+        print("done")
+        """, "true\noff 1\n2\noff 2\nfalse\noff 3\ndone\n")
+
+// -- instantiations are types of their own -------------------------------------------------------------
+
+@test("two instantiations of one generic type are two answers")
+tdc_instantiations_differ()
+    tdc_prints(tdc_shapes() + raw"""
+        val c: &Shape = Col[int](4)
+        print(c.is[Col[int]](), c.is[Col[real]](), c.as[Col[int]]().unwrap().v)
+        """, "true false 4\n")
+
+@test("a generic body asks through its parameter, once per instantiation")
+tdc_through_a_parameter()
+    tdc_prints(tdc_shapes() + raw"""
+        column[T](o: &Shape) -> Option[&Col[T]] = o.as[Col[T]]()
+
+        val c: &Shape = Col[int](4)
+        print(column[int](c).is_some(), column[real](c).is_some(), column[int](c).unwrap().v)
+        """, "true false 4\n")
+
+@test("an object of a generic trait is asked the same way")
+tdc_a_generic_trait()
+    tdc_prints(raw"""
+        trait Get[V]
+            get(self) -> V
+
+        struct Box
+            v: int
+
+        struct Other
+            v: int
+
+        impl Get[int] for Box
+            get(self) -> int = self.v
+
+        impl Get[int] for Other
+            get(self) -> int = -self.v
+
+        val g: &Get[int] = Box(9)
+        print(g.is[Box](), g.is[Other](), g.as[Box]().unwrap().v)
+        """, "true false 9\n")
+
+// -- the answer shares the object ----------------------------------------------------------------------
+
+@test("the answer outlives the object it was read from, and the drop runs once")
+tdc_the_answer_keeps_the_object()
+    tdc_prints(tdc_shapes() + raw"""
+        grab(o: &Shape) -> Option[&Lamp] = o.as[Lamp]()
+
+        main()
+            var xs: Buf[&Shape] = buf()
+            xs.push(Rect(1, 1))
+            xs.push(Lamp(7))
+            val kept = grab(xs[1])
+            xs.clear()
+            print("cleared")
+            print(kept.unwrap().n)
+        """, "cleared\n7\noff 7\n")
+
+@test("the answer is the same object, not a copy of it")
+tdc_the_answer_is_the_object()
+    tdc_prints(raw"""
+        trait Counter
+            count(self) -> int
+
+        struct Tally
+            n: int
+
+        impl Counter for Tally
+            count(self) -> int = self.n
+
+        val o: &Counter = Tally(0)
+        val t = o.as[Tally]().unwrap()
+        t.n = 5
+        print(o.count())
+        """, "5\n")
+
+@test("an answer thrown away gives its count back")
+tdc_an_answer_discarded()
+    tdc_prints(tdc_shapes() + raw"""
+        main()
+            val s: &Shape = Lamp(1)
+            s.as[Lamp]()
+            s.as[Rect]()
+            print("still here")
+        """, "still here\noff 1\n")
+
+@test("a miss takes no count, so the object goes when its last holder does")
+tdc_a_miss_takes_nothing()
+    tdc_prints(tdc_shapes() + raw"""
+        show()
+            val s: &Shape = Lamp(2)
+            print(s.as[Rect]().is_none())
+
+        show()
+        print("done")
+        """, "true\noff 2\ndone\n")
+
+@test("inside a Buf of objects, each element is asked as it is reached")
+tdc_inside_a_buf()
+    tdc_prints(tdc_shapes() + raw"""
+        main()
+            var xs: Buf[&Shape] = buf()
+            xs.push(Sq(2))
+            xs.push(Rect(1, 1))
+            xs.push(Sq(3))
+            xs.push(Lamp(4))
+            var total = 0
+            var lamps = 0
+            for x in xs
+                if x.as[Sq]() is Some(q) then total += q.s
+                if x.is[Lamp]() then lamps += 1
+            print(total, lamps)
+        """, "5 1\noff 4\n")
+
+// -- the three sigils ----------------------------------------------------------------------------------
+
+@test("a &sync object answers a &sync reference")
+tdc_a_sync_object()
+    tdc_prints(tdc_shapes() + raw"""
+        main()
+            val s: &sync Shape = Lamp(3)
+            val l: Option[&sync Lamp] = s.as[Lamp]()
+            print(s.is[Lamp](), l.unwrap().n)
+        """, "true 3\noff 3\n")
+
+@test("a raw object may be asked which type it holds")
+tdc_a_raw_object_is()
+    tdc_prints(tdc_shapes() + raw"""
+        var r = Rect(1, 2)
+        val p: *Shape = &r
+        print(p.is[Rect](), p.is[Sq]())
+        """, "true false\n")
+
+@test("but has no counted reference to hand back")
+tdc_a_raw_object_as()
+    tdc_refused(tdc_shapes() + raw"""
+        var r = Rect(1, 2)
+        val p: *Shape = &r
+        print(p.as[Rect]())
+        """, "a *Shape points at a value no count is kept for, so there is no counted '&Rect' to " +
+             "hand back — 'o.is[Rect]()' asks the question without one")
+
+// -- a member the trait declares wins ------------------------------------------------------------------
+
+@test("a trait's own member named is is the one called")
+tdc_a_declared_is_wins()
+    tdc_prints(raw"""
+        trait Flag
+            is(self) -> bool
+
+        struct On
+            v: int
+
+        impl Flag for On
+            is(self) -> bool = true
+
+        val f: &Flag = On(1)
+        print(f.is())
+        """, "true\n")
+
+// -- the refusals --------------------------------------------------------------------------------------
+
+@test("a type that does not implement the trait could never be in the object")
+tdc_not_implementing()
+    tdc_refused(tdc_shapes() + "val s: &Shape = Rect(2, 3)\nprint(s.is[Circle]())\n",
+                "'Circle' does not implement 'Shape', so no &Shape can hold one and " +
+                "'o.is[Circle]()' could never be true")
+
+@test("and the same for as")
+tdc_not_implementing_as()
+    tdc_refused(tdc_shapes() + "val s: &Shape = Rect(2, 3)\nprint(s.as[Circle]())\n",
+                "'o.as[Circle]()' could never be Some")
+
+@test("a generic body's parameter is held to the trait at its instantiation")
+tdc_not_implementing_through_a_parameter()
+    tdc_refused(tdc_shapes() + raw"""
+        is_a[T](o: &Shape) -> bool = o.is[T]()
+
+        val s: &Shape = Rect(2, 3)
+        print(is_a[Rect](s), is_a[Circle](s))
+        """, "'Circle' does not implement 'Shape'")
+
+@test("a trait is never what an object holds")
+tdc_a_trait()
+    tdc_refused(tdc_shapes() + "val s: &Shape = Rect(2, 3)\nprint(s.as[Shape]())\n",
+                "'Shape' is a trait, and what a &Shape holds is the concrete type its value was made " +
+                "as, so 'o.as[T]()' asks for that type — an object is not cast to another trait")
+
+@test("nor is a reference")
+tdc_a_reference()
+    tdc_refused(tdc_shapes() + "val s: &Shape = Rect(2, 3)\nprint(s.as[&Rect]())\n",
+                "a &Shape holds the value a reference was erased from, never a reference itself, so " +
+                "'&Rect' is never what it holds")
+
+@test("a generic type needs its arguments to be a type at all")
+tdc_a_bare_generic()
+    tdc_refused(tdc_shapes() + "val s: &Shape = Rect(2, 3)\nprint(s.is[Col]())\n",
+                "type 'Col' takes 1 type argument, but 0 type arguments were given")
+
+@test("the type is written in the brackets")
+tdc_no_type_written()
+    tdc_refused(tdc_shapes() + "val s: &Shape = Rect(2, 3)\nprint(s.as())\n",
+                "'as' asks a &Shape about one type, written in its brackets — 'o.as[T]()'")
+
+@test("and nothing is passed in the parentheses")
+tdc_an_argument()
+    tdc_refused(tdc_shapes() + "val s: &Shape = Rect(2, 3)\nprint(s.is[Rect](1))\n",
+                "'is' takes no arguments — the type it asks about is written in its brackets")
+
+@test("a field named as still wants its backticks")
+tdc_a_field_named_as()
+    tdc_refused("struct P\n    `as`: int\n\nval p = P(1)\nprint(p.as)\n",
+                "'as' is a reserved word, so it is not a field name as written")

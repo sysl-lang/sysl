@@ -20,7 +20,7 @@ val Misused: int = 2
 
 // What `sysl --version` answers. Written here as well as in `package.hocon`, because a program is
 // handed nothing about its own manifest; the test beside this file keeps the two in step.
-const Version: string = "0.11.1"
+const Version: string = "0.11.7"
 
 // The answer to a command line: the lines to say, and the status to exit with. What
 // `--explain-escapes` reports is said on the same channel, in the order it was found.
@@ -80,6 +80,7 @@ private run_cli_command(args: []const string, say: string -> unit, note: string 
     clear_files_read()
     reset_manifest_warnings()
     use_resolution_machine(None)
+    limit_unit_jobs(0)
 
     // A flag that named a `.syslib` is refused by every command in one sentence, before any of them
     // reads its own flags -- none of them takes it, whatever it was handed.
@@ -689,6 +690,9 @@ private build_c_command(args: []const string, note: string -> unit) -> int
     var header: Option[string] = None
     var ll: Option[string] = None
     var level: Option[string] = None
+    var shared = false
+    var lib = SharedLib(None, None, None, None, None)
+    var setting = ""
     var file = ""
     var mistakes: Buf[string] = buf()
     var i: usize = 2
@@ -709,6 +713,25 @@ private build_c_command(args: []const string, note: string -> unit) -> int
             if took == 2 then i += 1
         else if featured > 0
             if featured == 2 then i += 1
+        else if args[i] == "--shared"
+            shared = true
+        else if shared_setting(args[i])
+            if i + 1 >= args.len
+                mistakes.push(missing_value(args[i]))
+                break
+            end if
+
+            setting = args[i]
+            i += 1
+
+            val given = Some(args[i])
+
+            lib = setting match
+                "--install-name" -> lib with { install_name = given }
+                "--current-version" -> lib with { current_version = given }
+                "--compatibility-version" -> lib with { compatibility_version = given }
+                "--soname" -> lib with { soname = given }
+                _ -> lib with { version_script = given }
         else if args[i] == "--target" || args[i] == "--cc" || args[i] == "-o" || args[i] == "--output" ||
                 args[i] == "--header" || args[i] == "--emit-llvm"
             if i + 1 >= args.len
@@ -754,6 +777,13 @@ private build_c_command(args: []const string, note: string -> unit) -> int
         return Misused
     end if
 
+    // **A shared library's settings say nothing about an archive**, which has no name of its own to
+    // record and no version to carry, so one given without `--shared` is refused rather than dropped.
+    if setting != "" && !shared
+        note(refused(s"'$setting' is a setting of a shared library, and is given with '--shared'"))
+        return Misused
+    end if
+
     if refused_features(note) then return Failed
 
     // **The manifest's `lto` is not this command's**: the key is how the project's own link is done,
@@ -765,17 +795,30 @@ private build_c_command(args: []const string, note: string -> unit) -> int
         Ok(resolved) -> resolved
 
     // The two paths written are said by the build, ahead of the advice about what to link them with.
-    build_c_archive(file, named, cc, at, out, header, note, lto_flag(), ll) match
+    build_c_archive(file, named, cc, at, out, header, note, lto_flag(), ll, if shared then Some(lib) else None) match
         Err(why) ->
             say_failure(why, note)
             Failed
         Ok(_) -> Fine
 end build_c_command
 
+// The settings that name or version a shared library, each taking a value.
+private shared_setting(flag: string) -> bool =
+    flag == "--install-name" || flag == "--current-version" || flag == "--compatibility-version" ||
+        flag == "--soname" || flag == "--version-script"
+
 private build_c_usage() -> string =
     "usage: sysl build-c [--target <name>] [--cc <path>] [-O<level>] [-o <archive>] " +
-    "[--header <path>] [--emit-llvm <out.ll>] [--lto thin|full] " + where_flags() + " " + feature_flags() +
+    "[--header <path>] [--emit-llvm <out.ll>] [--lto thin|full] [--shared [--install-name <name>] " +
+    "[--current-version <v>] [--compatibility-version <v>] [--soname <name>] [--version-script <file>]] " +
+    where_flags() + " " + feature_flags() +
     " <path>\n" +
+    "  --shared  link a shared library (.dylib, .so) instead of a static archive: it carries its own " +
+    "copy of the runtime and exports only the '@export' symbols\n" +
+    "  --install-name <name>  the Mach-O install name (default '@rpath/' and the file's name); " +
+    "--current-version and --compatibility-version set its versions\n" +
+    "  --soname <name>  the ELF soname (default the file's name); --version-script <file> replaces " +
+    "the script that exports the '@export' symbols\n" +
     "  --emit-llvm <out.ll>  also write the LLVM text the archive is compiled from, exactly as clang " +
     "is handed it, to <out.ll>; the archive and the header are still built\n" +
     "  --lto <mode>  make the archive's members LLVM bitcode for this mode of link-time " +
@@ -1108,16 +1151,24 @@ private test_command(args: []const string, say: string -> unit, note: string -> 
     // build never compiles is code the suite would otherwise never see.
     set_feature_testing()
     remember_test_command_line()
+    remember_test_args(args)
+
+    // `jobs` and the limit are settled per project, where its manifest is read (`test_project`).
+    val opts = TestOptions(filter, fail_fast, 0, buf())
+    val asked = TestAsked(jobs, seconds)
+
+    // A build child builds the one project the runner named: a workspace's members are the runner's
+    // to go through, a child each.
+    test_build_child() match
+        Some(child) -> return test_project(child.1, named, cc, opts, asked, std, named_level, note,
+                                           report, within, keep)
+        None -> ()
 
     val projects = workspace_projects(file, picked) match
         Err(why) ->
             note(refused(why))
             return Failed
         Ok(found) -> found
-
-    // `jobs` and the limit are settled per project, where its manifest is read (`test_project`).
-    val opts = TestOptions(filter, fail_fast, 0, buf())
-    val asked = TestAsked(jobs, seconds)
 
     projects match
         None -> test_project(file, named, cc, opts, asked, std, named_level, note, report, within, keep)
@@ -1213,6 +1264,9 @@ end test_members
 private test_project(file: string, named: Option[string], cc: Option[string], given: TestOptions,
                      asked: TestAsked, std: bool, named_level: Option[string], note: string -> unit,
                      report: string -> unit, within: Buf[string], keep: Option[string]) -> int
+    // Built in a child, which does everything below up to the first test (`test_child.sysl`).
+    if tests_build_in_child() then return tested_in_child(file, note, report)
+
     // The package's own `test` block, under whatever the command line said.
     val settings = test_settings_of(file)
 
@@ -1236,6 +1290,9 @@ private test_project(file: string, named: Option[string], cc: Option[string], gi
     val seconds =asked.seconds.unwrap_or(settings.timeout.unwrap_or(DefaultTestSeconds))
     val opts = TestOptions(given.filter, given.fail_fast,
                            asked.jobs.unwrap_or(settings.jobs.unwrap_or(cpu_count())), settings.alone)
+
+    // The link's clangs are held to the same count as the tests, so `--jobs` bounds the build too.
+    limit_unit_jobs(opts.jobs)
 
     val level = build_level(file, named_level) match
         Err(why) ->
@@ -1387,16 +1444,12 @@ private tests_run(file: string, exe: string, all: Buf[TTest], opts: TestOptions,
         judged.push(refused_outcome(file, run.named, run.level, item))
 
     val filtered = all.len() - chosen.len() + run.files.len() - picked.len()
-    val outcomes = run_selected(exe, chosen, opts, filtered, report, seconds, judged)
+    val plan = TestPlan(exe, discard, opts, seconds, filtered, chosen, judged)
 
-    if discard then discard_test_binary(exe)
-
-    var failed: usize = 0
-
-    for outcome in outcomes
-        if !outcome.passed() then failed += 1
-
-    if failed == 0 then Fine else Failed
+    // A build child's part ends here: the runner that started it runs the plan (`tested_in_child`).
+    test_build_child() match
+        Some(child) -> plan_written(child.0, plan, note)
+        None -> plan_run(plan, report)
 end tests_run
 
 private test_usage() -> string = "usage: sysl test [--filter <text>] [--file <name>] [--keep-binary <dir>] [--fail-fast] [--jobs <n>] [--timeout <seconds>] [--std] " +
@@ -1664,7 +1717,7 @@ usage() -> string = "usage: sysl --version | --help | emit-ast [--no-spans] <fil
     "emit-llvm [--target <name>] [-O<level>] <path> | " +
     "build [--target <name>] [--cc <path>] [-O<level>] [-o <exe>] <path> | " +
     "build-c [--target <name>] [--cc <path>] [-O<level>] [-o <archive>] [--header <path>] " +
-    "[--emit-llvm <out.ll>] [--lto thin|full] <path> | emit-header [--target <name>] <path> | " +
+    "[--emit-llvm <out.ll>] [--lto thin|full] [--shared] <path> | emit-header [--target <name>] <path> | " +
     "run [--target <name>] [--cc <path>] [-O<level>] <path> [-- <args>] | " +
     "test [--filter <text>] [--file <name>] [--fail-fast] [--jobs <n>] [--timeout <seconds>] [--target <name>] [--cc <path>] [-O<level>] <path> | " +
     "add <coordinate>[@<version>] [<path>] | config <command> [--dry-run] [-C <dir>] | deps <path> | vendor <path> | tidy [--check] [<path>] | init [<dir>] | " +
@@ -1817,7 +1870,15 @@ private said_to_terminal(line: string)
     else print(line)
 
 main(args: []string)
-    if args.len > 1 && args[1] == "test" then watch_for_stop()
+    // A `sysl test` builds in a child of its own (`test_child.sysl`), which leaves the stops to the
+    // runner that started it.
+    if args.len > 1 && args[1] == "test"
+        if test_build_child().is_some()
+            hold_stops()
+        else
+            watch_for_stop()
+            build_tests_with(executable_path())
+    end if
 
     val code = run_cli_noted(args,
         line ->

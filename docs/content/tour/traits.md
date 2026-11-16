@@ -242,8 +242,38 @@ because a `&Shape` was expected, and then erased. This is the ordinary rule that
 a `&T` is expected is allocated, with one more step. Because the coercion applies to each branch, an
 `if` or a `match` whose arms produce different concrete types can yield one trait object.
 
-A trait object offers the trait's methods and nothing else: no dereference, no fields, no comparison,
-and no way back to the concrete type.
+A trait object offers the trait's methods and nothing else: no dereference, no fields, no comparison.
+The one thing it can still be asked is **which type it holds**: `s.is[Rect]()` answers whether that
+type is exactly `Rect`, and `s.as[Rect]()` answers an `Option[&Rect]`, the same object as a `&Rect`
+when it is one:
+
+```sysl
+trait Shape
+    area(self) -> int
+
+struct Rect
+    w: int
+    h: int
+
+impl Shape for Rect
+    area(self) -> int = self.w * self.h
+
+struct Square
+    side: int
+
+impl Shape for Square
+    area(self) -> int = self.side * self.side
+
+var shapes: [2]&Shape = [Rect(3, 4), Square(5)]
+
+for s in shapes
+    if s.as[Rect]() is Some(r) then print("a rect", r.w, "wide") else print("not a rect")
+```
+
+```output
+a rect 3 wide
+not a rect
+```
 
 **Bounds and trait objects work together.** An object carries a table of the trait's members, which
 is exactly what a bound requires, so a `[T: Shape]` function accepts a `&Shape` as readily as a

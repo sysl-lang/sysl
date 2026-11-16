@@ -55,6 +55,9 @@ enum Const
     // A slot of storage `slot_storage` made that nothing has placed a value in yet: the bytes the
     // program would find there are whatever the allocator left, so reading one is refused.
     ConstUnset
+    // The one value of `unit`: what `()` is, a `unit` payload or field holds, and a block or call answering `unit`
+    // comes to once something asks for its value. Laid down as nothing.
+    ConstUnit
     // An address the run owns, converted to a pointer to another type: it may be compared and
     // converted back to the type it was taken at, `as_was`, but what it points at is a value of that
     // type, so reading or writing through it is refused.
@@ -348,6 +351,17 @@ end const_unary
 private const_binary(cx: &Analyzer, whole: Expr, op: string, l: Expr, r: Expr) -> Option[Const]
     val span = whole.span
     val a = const_fold(cx, l)
+
+    // **`&&` and `||` decide from their left operand where it settles the answer**, and the right is
+    // then not read at all -- as at run time, where it is not run. That is what lets an `if const`
+    // guard an operand with a test the operand depends on, `T: Integer && wide[T]()`, the way a
+    // nested `if const` guards its arm: at a `T` the test refuses, `wide[T]()` is never typed.
+    if op == "&&" || op == "||"
+        a match
+            Some(ConstBool(x)) -> if x == (op == "||") then return Some(ConstBool(x))
+            _ -> ()
+    end if
+
     val b = const_fold(cx, r)
 
     if a.is_none() || b.is_none() then return None
@@ -385,6 +399,7 @@ private const_binary(cx: &Analyzer, whole: Expr, op: string, l: Expr, r: Expr) -
         ConstLink(_) -> None
         ConstPtr(_, _, _) -> None
         ConstUnset -> None
+        ConstUnit -> None
         ConstPun(_, _) -> None
         ConstErased(_, _) -> None
 end const_binary
@@ -886,6 +901,7 @@ private const_text(v: Const) -> string = v match
     ConstLink(_) -> "an address"
     ConstPtr(_, _, _) -> "an address"
     ConstUnset -> "a slot nothing was placed in"
+    ConstUnit -> "a unit"
     ConstPun(_, _) -> "an address"
     ConstErased(_, _) -> "a trait object"
 
@@ -940,6 +956,7 @@ const_kind(v: Const) -> string = v match
     ConstLink(_) -> "an address"
     ConstPtr(_, _, _) -> "an address"
     ConstUnset -> "a slot nothing was placed in"
+    ConstUnit -> "a unit"
     ConstPun(_, _) -> "an address"
     ConstErased(_, _) -> "a trait object"
 
@@ -1270,6 +1287,7 @@ private held_at(v: Const, ty: Type) -> Option[Const] = v match
     ConstLink(_) -> None
     ConstPtr(_, _, _) -> None
     ConstUnset -> None
+    ConstUnit -> None
     ConstPun(_, _) -> None
     ConstErased(_, _) -> None
 
@@ -1327,6 +1345,7 @@ private typed_binary(op: string, l: TExpr, r: TExpr, m: FoldMachine) -> Option[C
         ConstLink(_) -> None
         ConstPtr(_, _, _) -> None
         ConstUnset -> None
+        ConstUnit -> None
         ConstPun(_, _) -> None
         ConstErased(_, _) -> None
 end typed_binary
@@ -1450,6 +1469,7 @@ private typed_conversion(inner: TExpr, to: Type, m: FoldMachine) -> Option[Const
         ConstLink(_) -> None
         ConstPtr(_, _, _) -> None
         ConstUnset -> None
+        ConstUnit -> None
         ConstPun(_, _) -> None
         ConstErased(_, _) -> None
 end typed_conversion

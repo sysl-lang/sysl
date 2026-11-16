@@ -96,9 +96,9 @@ private is_library_result(t: Type) -> bool = repr(t) match
 if_expr(cx: &Analyzer, span: Span, cond: Expr, then_body: Buf[Stmt],
         else_body: Option[Buf[Stmt]], expected: Option[Type], discarded: bool) -> TExpr
     val else_guesses = else_body.is_some() && guessing(cx, else_body.unwrap())
-    val then_guesses = guessing(cx, then_body)
+    val then_guesses = guessing_in(cx, then_body, then_scope(cond))
     val else_leans = else_body.is_some() && leaning(cx, else_body.unwrap())
-    val then_leans = leaning(cx, then_body)
+    val then_leans = leaning_in(cx, then_body, then_scope(cond))
 
     // The `else` leads when it is the branch that knows, which is the one case it is read before
     // the condition. It reads nothing the condition binds -- an `is` binding reaches the *then*
@@ -806,7 +806,8 @@ private analyze_arms(cx: &Analyzer, scrut: Type, arms: Buf[MatchArm], expected: 
     var own: Buf[Option[TArm]] = buf()
 
     for i in 0..<arms.len()
-        val held = guessing(cx, arms[i].body) || leaning(cx, arms[i].body)
+        val held = guessing_in(cx, arms[i].body, arm_scope(arms[i])) ||
+                   leaning_in(cx, arms[i].body, arm_scope(arms[i]))
 
         if held then own.push(None) else own.push(attempt_arm(cx, scrut, arms[i], None, discarded))
 
@@ -825,7 +826,7 @@ private analyze_arms(cx: &Analyzer, scrut: Type, arms: Buf[MatchArm], expected: 
     var read: Buf[Option[TArm]] = buf()
 
     for i in 0..<arms.len()
-        if leaning(cx, arms[i].body)
+        if leaning_in(cx, arms[i].body, arm_scope(arms[i]))
             read.push(offering(cx, want, () -> offered_arm(cx, scrut, arms[i], want, discarded)))
         else
             read.push(own[i])
@@ -850,7 +851,8 @@ private shared_arm_type(cx: &Analyzer, scrut: Type, arms: Buf[MatchArm], discard
     var shaped: Buf[MatchArm] = buf()
 
     for i in 0..<arms.len()
-        if leaning(cx, arms[i].body) && shaped_value(arms[i].body) then shaped.push(arms[i])
+        if leaning_in(cx, arms[i].body, arm_scope(arms[i])) && shaped_value(arms[i].body) then
+            shaped.push(arms[i])
 
     if shaped.len() < 2 then return None
 
@@ -1084,16 +1086,18 @@ private match_result_type(cx: &Analyzer, span: Span, scrut: Type, arms: Buf[TArm
     end if
 
     val values = if merged then met else yielded
+    val disagreed = values.len() > 1
 
-    if values.len() > 1 then
-        cx.fault(span, s"match arms have different types: ${joined_types(values)}")
+    if disagreed then cx.fault(span, s"match arms have different types: ${joined_types(values)}")
 
     val value_ty = met_value_type(settled)
     val checked = is_enum(scrut) || value_ty != Unit || cx.binding_alts
 
     if checked && scrut != Unknown then check_coverage(cx, span, scrut, arms)
 
-    value_ty
+    // Arms that disagree have been reported, so the match is a mistake already told rather than a
+    // `unit` for whatever reads its value to complain about a second time.
+    if disagreed then Unknown else value_ty
 end match_result_type
 
 // The one type the arms that finish came to, or `unit` where they did not agree on a value and
@@ -2013,12 +2017,27 @@ const_if_expr(cx: &Analyzer, span: Span, cond: Expr, then_body: Buf[Stmt], else_
                           "has to be known then — a 'const', a value parameter, or a call whose body " +
                           "can run. A test made while the program runs is a plain 'if'")
 
+    // An instance's arm was never read with the generic, so what a `const` function promises is
+    // checked of it per instance, and this is how the check finds it.
+    if cx.an.tables.members.func_origin.has(cx.body) then note_const_arm(cx.an, cx.body, span)
+
     if taken then return TExpr(span, TBlockExpr(type_value_block(cx, then_body, expected, discarded)))
 
     else_body match
         Some(b) -> TExpr(span, TBlockExpr(type_value_block(cx, b, expected, discarded)))
         None -> TExpr(span, TBlockExpr(TBlock(buf(), None, Unit)))
 end const_if_expr
+
+// Files the span of an `if const` read in an instance under the instance's name, once.
+private note_const_arm(a: &Analysis, body: string, span: Span)
+    var arms = a.tables.const_arms.get(body).unwrap_or(buf())
+
+    for s in arms
+        if s == span then return
+
+    arms.push(span)
+    a.tables.const_arms.put(body, arms)
+end note_const_arm
 
 // The most copies a `for const` over a range is unrolled to -- a bound rather than no bound, because
 // the cost is in the emitted program and not in a number a reader can see: `for const i in 0..<100000`
@@ -2042,8 +2061,11 @@ end const_int_of
 // A branch is a block, so what is asked about is the expression it ends in: `then 1` is a `1` and
 // nothing else, and a `1` is worth what the position it stands in says it is worth. Everything else
 // knows what it is before anything asks, and is therefore what the pair takes its type *from*.
-guessing(cx: &Analyzer, stmts: Buf[Stmt]) -> bool = block_value(stmts) match
-    Some(e) -> guesses(cx, e)
+guessing(cx: &Analyzer, stmts: Buf[Stmt]) -> bool = guessing_in(cx, stmts, nothing_bound())
+
+// The same, for a branch whose own scope binds `bound` (`branch_scope`).
+private guessing_in(cx: &Analyzer, stmts: Buf[Stmt], bound: Option[Buf[string]]) -> bool = block_value(stmts) match
+    Some(e) -> guesses(cx, e, branch_scope(stmts, bound))
     None -> false
 
 // Whether a value block's value knows its type only **in part**: a construction with a guessing
@@ -2052,8 +2074,13 @@ guessing(cx: &Analyzer, stmts: Buf[Stmt]) -> bool = block_value(stmts) match
 // Such a branch is not told its sibling's type outright, as a guessing one is, because the part
 // that knows may disagree with it. It is *offered* the type: read against it where it takes it, and
 // read on its own where it does not, so the complaint is the one about the branches disagreeing.
-leaning(cx: &Analyzer, stmts: Buf[Stmt]) -> bool = block_value(stmts) match
-    Some(e) -> !guesses(cx, e) && leans(cx, e)
+leaning(cx: &Analyzer, stmts: Buf[Stmt]) -> bool = leaning_in(cx, stmts, nothing_bound())
+
+private leaning_in(cx: &Analyzer, stmts: Buf[Stmt], bound: Option[Buf[string]]) -> bool = block_value(stmts) match
+    Some(e) ->
+        val open = branch_scope(stmts, bound)
+
+        !guesses(cx, e, open) && leans(cx, e, open)
     None -> false
 
 // The expression a value block ends in, which is what a branch's type is asked of.
@@ -2145,43 +2172,90 @@ end trial
 // Whether an expression has no type of its own. A tuple or an array literal made of nothing but
 // such parts has none either, element by element and however deeply nested: `(0, 0)` is a pair of
 // whatever its sibling says, exactly as `0` is a number of whatever its sibling says.
-private guesses(cx: &Analyzer, e: Expr) -> bool
-    if is_literal(e) || typed_by_position(cx, e) || every_branch_guesses(cx, e) then return true
+//
+// **An untyped constant is the literal it stands for** (`untyped_const_read`, `char_const_read`), so
+// its name guesses as the literal does: `if k < N then k else N` over a `usize` is a `usize`, as it
+// is with `256` written for `N`. The name is believed only where `open` says the branch's own scope
+// cannot have rebound it (`branch_scope`).
+private guesses(cx: &Analyzer, e: Expr, open: Option[Buf[string]]) -> bool
+    if is_literal(e) || typed_by_position(cx, e) || every_branch_guesses(cx, e, open) then return true
+    if untyped_name(cx, e, open) then return true
 
     *e.kind match
-        Tuple(parts) -> all_guess(cx, parts)
-        ArrayLit(parts) -> all_guess(cx, parts)
-        ArrayFill(v, _) -> guesses(cx, v)
+        Tuple(parts) -> all_guess(cx, parts, open)
+        ArrayLit(parts) -> all_guess(cx, parts, open)
+        ArrayFill(v, _) -> guesses(cx, v, open)
         _ -> false
 end guesses
 
-private all_guess(cx: &Analyzer, parts: Buf[Expr]) -> bool
+private all_guess(cx: &Analyzer, parts: Buf[Expr], open: Option[Buf[string]]) -> bool
     if parts.is_empty() then return false
 
     for part in parts
-        if !guesses(cx, part) then return false
+        if !guesses(cx, part, open) then return false
 
     true
 end all_guess
 
+// Whether an expression names an untyped constant that the scope around it has not rebound.
+private untyped_name(cx: &Analyzer, e: Expr, open: Option[Buf[string]]) -> bool
+    if open.is_none() then return false
+
+    val root = root_name(e)
+
+    if root.is_none() then return false
+
+    for bound in open.unwrap()
+        if bound == root.unwrap() then return false
+
+    untyped_const_read(cx, e) || char_const_read(cx, e)
+end untyped_name
+
+// The name a read of a value or of a module's member starts from: `N` in `N`, `m` in `m.N`.
+private root_name(e: Expr) -> Option[string] = *e.kind match
+    Ident(name) -> Some(name)
+    Field(receiver, _, _) -> root_name(receiver)
+    _ -> None
+
+// The names a branch's own scope may bind that the reading of its guess cannot yet see: none for a
+// branch alone (`Some` of nothing), what an arm's patterns bind, and `None` -- believe no name --
+// where a block of several lines, a condition's `is` test or a guard's may declare any.
+private branch_scope(stmts: Buf[Stmt], bound: Option[Buf[string]]) -> Option[Buf[string]] =
+    if stmts.len() == 1 then bound else None
+
+private nothing_bound() -> Option[Buf[string]] = Some(buf())
+
+private then_scope(cond: Expr) -> Option[Buf[string]] = if tests_pattern(cond) then None else nothing_bound()
+
+private arm_scope(arm: MatchArm) -> Option[Buf[string]]
+    if arm.guard.is_some() && tests_pattern(arm.guard.unwrap()) then return None
+
+    var names: Buf[string] = buf()
+
+    for p in arm.patterns
+        pattern_names(&names, p)
+
+    Some(names)
+end arm_scope
+
 // Whether a guessing part stands anywhere inside a construction -- a tuple, an array literal, or
 // the arguments of a call, which is how a variant and a struct are built.
-private leans(cx: &Analyzer, e: Expr) -> bool
-    if guesses(cx, e) then return true
+private leans(cx: &Analyzer, e: Expr, open: Option[Buf[string]]) -> bool
+    if guesses(cx, e, open) then return true
 
     *e.kind match
-        Tuple(parts) -> any_leans(cx, parts)
-        ArrayLit(parts) -> any_leans(cx, parts)
-        ArrayFill(v, _) -> leans(cx, v)
-        Call(_, args) -> any_leans(cx, args)
-        NamedArg(_, v) -> leans(cx, v)
-        IfExpr(_, _, _, _) -> every_branch_leans(cx, e)
+        Tuple(parts) -> any_leans(cx, parts, open)
+        ArrayLit(parts) -> any_leans(cx, parts, open)
+        ArrayFill(v, _) -> leans(cx, v, open)
+        Call(_, args) -> any_leans(cx, args, open)
+        NamedArg(_, v) -> leans(cx, v, open)
+        IfExpr(_, _, _, _) -> every_branch_leans(cx, e, open)
         _ -> false
 end leans
 
-private any_leans(cx: &Analyzer, parts: Buf[Expr]) -> bool
+private any_leans(cx: &Analyzer, parts: Buf[Expr], open: Option[Buf[string]]) -> bool
     for part in parts
-        if leans(cx, part) then return true
+        if leans(cx, part, open) then return true
 
     false
 end any_leans
@@ -2195,14 +2269,16 @@ end any_leans
 // guessing: `if c then 0 else continue` is a `0` of whatever its position says, exactly as the `if`
 // with a `1` in place of the `continue` is. One branch still has to be a guess -- an `if` that never
 // finishes on either side is `never`, which is a type of its own.
-private every_branch_guesses(cx: &Analyzer, e: Expr) -> bool = *e.kind match
-    IfExpr(_, then_body, else_body, _) ->
+private every_branch_guesses(cx: &Analyzer, e: Expr, open: Option[Buf[string]]) -> bool = *e.kind match
+    IfExpr(cond, then_body, else_body, _) ->
         if else_body.is_none() then return false
 
         val eb = else_body.unwrap()
+        val inner = if tests_pattern(cond) then None else open
+        val then_guesses = guessing_in(cx, then_body, inner)
+        val else_guesses = guessing_in(cx, eb, open)
 
-        guessing(cx, then_body) && (guessing(cx, eb) || stops(cx, eb)) ||
-            guessing(cx, eb) && stops(cx, then_body)
+        then_guesses && (else_guesses || stops(cx, eb)) || else_guesses && stops(cx, then_body)
     _ -> false
 
 // Whether an expression comes to a bare literal on every path that finishes: a literal, or an `if`,
@@ -2363,13 +2439,15 @@ end declared_never
 // Whether an `if` is a chain of branches each of which knows its type only in part or not at all --
 // `if a then (n, 0) elif b then (0, n) else (n, 1)` -- which, like its branches, is read against
 // the type its siblings settle.
-private every_branch_leans(cx: &Analyzer, e: Expr) -> bool = *e.kind match
-    IfExpr(_, then_body, else_body, _) ->
-        else_body.is_some() && branch_leans(cx, then_body) && branch_leans(cx, else_body.unwrap())
+private every_branch_leans(cx: &Analyzer, e: Expr, open: Option[Buf[string]]) -> bool = *e.kind match
+    IfExpr(cond, then_body, else_body, _) ->
+        val inner = if tests_pattern(cond) then None else open
+
+        else_body.is_some() && branch_leans(cx, then_body, inner) && branch_leans(cx, else_body.unwrap(), open)
     _ -> false
 
-private branch_leans(cx: &Analyzer, stmts: Buf[Stmt]) -> bool = block_value(stmts) match
-    Some(e) -> leans(cx, e)
+private branch_leans(cx: &Analyzer, stmts: Buf[Stmt], open: Option[Buf[string]]) -> bool = block_value(stmts) match
+    Some(e) -> leans(cx, e, branch_scope(stmts, open))
     None -> false
 
 // What a branch or an arm **settles** for whichever of its siblings is guessing, or nothing where

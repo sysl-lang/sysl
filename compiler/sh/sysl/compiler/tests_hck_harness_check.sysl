@@ -1,0 +1,296 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// A `check` from `sysl.harness` made inside a `@test`, outside any harness `run`. It records a failure
+// and runs on, so the test's process returns with status zero -- which `sysl test` used to read as a
+// pass, so a package whose `@test`s used `check` had checks that could fail without anyone being told.
+// The protocol now is `test_runner.sysl`'s `check_mark`: the harness writes the byte ahead of each
+// such failure (`library/sysl/harness/harness.sysl`'s `failing_outside`), and the runner counts them.
+//
+// The axes: how many checks fail (none, one, several with passes between), what else ends the test (a
+// return, a panic, a `skip`, a teardown), where the check is made (the test, a `@setup`, a helper),
+// whether `quiet` is set, whether the checks sit inside a harness `run` (whose verdict is the harness
+// program's own), how many tests run at once, and the standalone program the harness exists for.
+// Skipped: a board target, since nothing there reads an exit status or a mark; that build is
+// `tests_qmu_qemu_harness.sysl`'s, and its suites call `check` only inside a `run`.
+
+// -- the pieces -------------------------------------------------------------------------------------
+
+@test("a run's failed checks are counted one mark each, and the marks are not shown")
+hck_the_marks_are_counted_and_taken_out()
+    assert_eq(failed_checks(""), 0)
+    assert_eq(failed_checks("no marks here\n"), 0)
+    assert_eq(failed_checks("\u{4}a:1::FAIL: x\n\u{4}a:2::FAIL: y\n"), 2)
+    assert_eq(unmarked_output("\u{4}a:1::FAIL: x\n"), "a:1::FAIL: x\n")
+
+@test("failed checks are the whole verdict alone, and a clause after anything else")
+hck_failed_checks_join_the_verdict()
+    assert(with_failed_checks(None, "clean\n").is_none(), "no marks, no failure")
+    assert_eq(with_failed_checks(None, "\u{4}").unwrap(), "failed 1 check")
+    assert_eq(with_failed_checks(None, "\u{4}\u{4}\u{4}").unwrap(), "failed 3 checks")
+    assert_eq(with_failed_checks(Some("did not return — exit status 1"), "\u{4}").unwrap(),
+              "did not return — exit status 1, and failed 1 check")
+    assert_eq(with_failed_checks(Some("did not return — exit status 1"), "").unwrap(),
+              "did not return — exit status 1")
+
+// -- a tree built and run ---------------------------------------------------------------------------
+
+// A one-file tree holding `text` after an import of the harness, built as a test binary and run with
+// `jobs` processes at once; the report it streamed and the outcomes, or nothing where the library or
+// a toolchain is not here.
+private hck_run(text: string, jobs: usize = 1,
+                imports: string = "import sysl.harness.*\n\n") -> Option[(string, Buf[Outcome])]
+    if std_root().is_err() || !clang_available() then return None
+
+    val root = runner_project("main.sysl", imports + text)
+    val file = s"$root/main.sysl"
+
+    val build = test_build_of(file, None) match
+        Err(refusal) ->
+            remove_dir_all(root).unwrap_or(())
+            assert(false, refusal.message)
+            return None
+        Ok(made) -> made
+
+    if !build.emitted.report.is_empty()
+        remove_dir_all(root).unwrap_or(())
+        assert(false, analysis_report(build.emitted.report))
+        return None
+    end if
+
+    val exe = build_test_binary(file, build, None, DefaultOptimization) match
+        Err(refusal) ->
+            remove_dir_all(root).unwrap_or(())
+            assert(false, refusal.message)
+            return None
+        Ok(built) -> built
+
+    var said: Buf[string] = buf()
+    val sink = &said
+    val outcomes = run_selected(exe, build.tests, TestOptions(None, false, jobs, buf()), 0, piece -> sink.push(piece))
+
+    discard_test_binary(exe)
+    remove_dir_all(root).unwrap_or(())
+
+    var streamed = ""
+
+    for item in said
+        streamed = streamed + item
+
+    Some((streamed, outcomes))
+end hck_run
+
+@test("a test with one failing check fails, and shows the check's line")
+hck_one_failing_check_fails()
+    val (text, ran) = hck_run("@test\nfails() =\n    check(1 > 2, \"one is more than two\")\n") match
+        None -> return
+        Some(r) -> r
+
+    assert_eq(ran.len(), 1)
+    assert(!ran[0].passed(), "the check failed, so the test did")
+    assert_eq(ran[0].detail.unwrap(), "failed 1 check")
+    assert(ran[0].output.contains(":5::FAIL: one is more than two\n"), ran[0].output)
+    assert(!ran[0].output.contains("\u{4}"), "the mark is the runner's, not the reader's")
+    assert(runner_timeless(text).contains("  FAIL  fails  Nms\n        failed 1 check\n"), text)
+    assert(runner_timeless(text).ends_with("\n0 passed, 1 failed — Nms\n"), text)
+
+@test("a test whose checks all hold passes")
+hck_all_passing_checks_pass()
+    val (text, ran) = hck_run("@test\nholds()\n    check(1 < 2, \"one is less than two\")\n" +
+                              "    check_eq(2 + 2, 4)\n    check_slice_eq([1, 2, 3][..], [1, 2, 3][..])\n") match
+        None -> return
+        Some(r) -> r
+
+    assert(ran[0].passed(), ran[0].detail.unwrap_or(""))
+    assert(runner_timeless(text).ends_with("\n1 passed, 0 failed — Nms\n"), text)
+
+// The first-failure rule is a harness test's; a `@test` owes its reader every failure, in order.
+@test("a failing check followed by passing ones still fails, and every failure is shown")
+hck_every_failure_is_shown()
+    val (_, ran) = hck_run("@test\nmixed()\n    check(false, \"the first\")\n    check(true)\n" +
+                           "    check_eq(3, 4)\n    check(true, \"holds\")\n" +
+                           "    check_slice_eq([1, 2][..], [1, 9][..])\n    check(1 == 1)\n") match
+        None -> return
+        Some(r) -> r
+
+    assert_eq(ran[0].detail.unwrap(), "failed 3 checks")
+
+    val out = ran[0].output
+
+    assert(out.contains(":5::FAIL: the first\n"), out)
+    assert(out.contains(":7::FAIL: got 3, want 4\n"), out)
+    assert(out.contains(":9::FAIL: got 2, want 9 at index 1\n"), out)
+    assert(out.index_of("the first").unwrap() < out.index_of("got 3").unwrap(), out)
+    assert(out.index_of("got 3").unwrap() < out.index_of("at index 1").unwrap(), out)
+
+@test("a check that failed before a panic is reported beside it")
+hck_a_check_and_a_panic()
+    val (_, ran) = hck_run("@test\nboth()\n    check(false, \"before\")\n    assert(false, \"then a panic\")\n") match
+        None -> return
+        Some(r) -> r
+
+    val detail = ran[0].detail.unwrap()
+
+    assert(detail.starts_with("did not return — exit status "), detail)
+    assert(detail.ends_with(", and failed 1 check"), detail)
+    assert(ran[0].output.contains("::FAIL: before\n"), ran[0].output)
+    assert(ran[0].output.contains("then a panic"), ran[0].output)
+
+// A panic alone is the verdict it always was, with no clause added for checks that never failed.
+@test("a test that only panics is reported as before")
+hck_a_panic_alone()
+    val (_, ran) = hck_run("@test\npanics()\n    check(true)\n    assert(false, \"a panic\")\n") match
+        None -> return
+        Some(r) -> r
+
+    val detail = ran[0].detail.unwrap()
+
+    assert(detail.starts_with("did not return — exit status "), detail)
+    assert(!detail.contains("check"), detail)
+
+@test("quiet silences the lines and not the verdict")
+hck_quiet_still_fails()
+    val (_, ran) = hck_run("@test\nhushed()\n    quiet = true\n    check(false, \"unsaid\")\n") match
+        None -> return
+        Some(r) -> r
+
+    assert_eq(ran[0].detail.unwrap(), "failed 1 check")
+    assert(!ran[0].output.contains("unsaid"), ran[0].output)
+
+@test("a check a helper makes on the test's behalf is the test's")
+hck_a_helper_checks_for_the_test()
+    val (_, ran) = hck_run("positive(n: int) = check(n > 0, s\"$n is not positive\")\n\n" +
+                           "@test\nuses() =\n    positive(-3)\n") match
+        None -> return
+        Some(r) -> r
+
+    assert_eq(ran[0].detail.unwrap(), "failed 1 check")
+    assert(ran[0].output.contains("::FAIL: -3 is not positive\n"), ran[0].output)
+
+@test("a check that fails in '@setup' fails the test it brackets")
+hck_a_setup_check_fails_the_test()
+    val (_, ran) = hck_run("@setup\nup() =\n    check(false, \"no fixture\")\n\n" +
+                           "@test\nt() =\n    check(true)\n") match
+        None -> return
+        Some(r) -> r
+
+    assert_eq(ran[0].detail.unwrap(), "failed 1 check")
+    assert(ran[0].output.contains("::FAIL: no fixture\n"), ran[0].output)
+
+@test("a check that failed before 'skip' is the failure, not a skip")
+hck_a_check_before_skip_fails()
+    val (_, ran) = hck_run("@test\nt()\n    check(false, \"first\")\n    skip(\"no device\")\n",
+                           imports = "import sysl.harness.check\nimport sysl.testing.skip\n\n") match
+        None -> return
+        Some(r) -> r
+
+    assert(ran[0].skipped.is_none(), "a failed check is not a skip")
+    assert_eq(ran[0].detail.unwrap(), "failed 1 check")
+
+// The harness's own tests are written this way: a suite of `run`s inside a `@test`, read back through
+// the counters. Its failures are the harness program's, and must not fail the host's test.
+@test("a failing check inside a harness 'run' keeps the harness's verdict and not the test's")
+hck_inside_a_run_is_the_harness_verdict()
+    val (_, ran) = hck_run("fails() = check(false, \"inside\")\n\n" +
+                           "@test\nsuite()\n    run(\"fails\", &fails)\n" +
+                           "    assert(failures() == 1, \"the harness counted it\")\n") match
+        None -> return
+        Some(r) -> r
+
+    assert(ran[0].passed(), ran[0].detail.unwrap_or(""))
+
+// The same test with a check of its own after the suite: that one, and only that one, is the test's.
+@test("a check after a harness 'run' is the test's again")
+hck_after_a_run_is_the_test_again()
+    val (_, ran) = hck_run("fails() = check(false, \"inside\")\n\n" +
+                           "@test\nsuite()\n    quiet = true\n    run(\"fails\", &fails)\n" +
+                           "    check(false, \"outside\")\n") match
+        None -> return
+        Some(r) -> r
+
+    assert_eq(ran[0].detail.unwrap(), "failed 1 check")
+
+// Each test has a process of its own, so one test's failed checks are not another's. Run four at
+// once with different counts, so a leak in either direction shows as a wrong number.
+@test("tests run in parallel keep their own failed checks")
+hck_parallel_tests_keep_their_own()
+    val text = "@test\none() =\n    check(false, \"one\")\n\n" +
+               "@test\nclean() =\n    check(true)\n\n" +
+               "@test\ntwo()\n    check(false, \"a\")\n    check(false, \"b\")\n\n" +
+               "@test\nalso_clean() =\n    check_eq(1, 1)\n\n" +
+               "@test\nthree()\n    check(false, \"a\")\n    check(false, \"b\")\n    check(false, \"c\")\n\n" +
+               "@test\nlast_clean() =\n    check(true)\n"
+    val (report, ran) = hck_run(text, 4) match
+        None -> return
+        Some(r) -> r
+
+    assert_eq(ran.len(), 6)
+    assert_eq(ran[0].detail.unwrap(), "failed 1 check")
+    assert(ran[1].passed(), "clean")
+    assert_eq(ran[2].detail.unwrap(), "failed 2 checks")
+    assert(ran[3].passed(), "also clean")
+    assert_eq(ran[4].detail.unwrap(), "failed 3 checks")
+    assert(ran[5].passed(), "the last is clean")
+    assert(runner_timeless(report).ends_with("\n3 passed, 3 failed — Nms\n"), report)
+
+@test("'sysl test' over a failing check exits with a failure")
+hck_the_command_fails()
+    if std_root().is_err() || !clang_available() then return
+
+    val root = runner_project("main.sysl", "import sysl.harness.*\n\n@test\nt() =\n    check(false)\n")
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(["sysl", "test", s"$root/main.sysl"], (line) -> sink.push(line))
+
+    remove_dir_all(root).unwrap_or(())
+    assert(code != 0, "a failed check is a failed run")
+
+// -- the standalone program -------------------------------------------------------------------------
+
+// What the harness is for: a program of its own that runs its suite and reports it. Its lines, its
+// tally and its verdict are what they were, and no mark is written, since every check is inside a
+// `run`.
+@test("a standalone harness program reports as it always has")
+hck_the_standalone_program_is_unchanged()
+    if std_root().is_err() || !clang_available() then return
+
+    val root = make_temp_dir("sysl-hck").unwrap()
+
+    write_text(s"$root/main.sysl", "import sysl.harness.*\n\n" +
+                                   "adds()\n    check_eq(2 + 2, 5)\n    check(false, \"not shown\")\n\n" +
+                                   "holds()\n    check(1 < 2, \"one is less than two\")\n\n" +
+                                   "run(\"adds\", &adds)\nrun(\"holds\", &holds)\nskip(\"later\", \"no part\")\n" +
+                                   "exit(finish())\n").unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            assert(false, failure_text(why))
+            return
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    val out = said match
+        Err(_) ->
+            assert(false, "the program did not run")
+            return
+        Ok(o) -> o
+
+    assert_eq(shell_status(out.status), 1)
+    assert(out.text.contains(":4:adds:FAIL: got 4, want 5\n"), out.text)
+    assert(!out.text.contains("not shown"), out.text)
+    assert(out.text.contains(":11:holds:PASS\n"), out.text)
+    assert(out.text.contains(":12:later:SKIP: no part\n"), out.text)
+    assert(out.text.ends_with("2 tests, 1 failed, 1 skipped\n"), out.text)
+    assert(!out.text.contains("\u{4}"), "no check was made outside a run")
+end hck_the_standalone_program_is_unchanged

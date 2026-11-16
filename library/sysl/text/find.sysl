@@ -449,8 +449,22 @@ private scan_from(h: []const u8, n: []const u8, from: usize, t: []const u8) -> O
     None
 end scan_from
 
+/** Sixteen bytes are compared at once while sixteen remain, and the scalar loop finishes the tail.
+ *
+ * The lane a match is in is the trailing zeros of the mask read as a 16-bit number, which is one
+ * move of the mask to a register (`pmovmskb` on x86) and a count. Every block before the one that
+ * holds the answer is a load, a compare and an `any`.
+ */
 private find_byte_from(h: []const u8, b: u8, from: usize) -> Option[usize]
     var i = from
+
+    while i < h.len && h.len - i >= 16
+        val v: <16>u8 = h.load(i)
+        val hit = v == b
+
+        if hit.any() then return Some(i + usize(hit.bits().trailing_zeros()))
+
+        i += 16
 
     while i < h.len
         if h[i] == b then return Some(i)

@@ -49,6 +49,12 @@ private gen_stmt_body(e: *Emit, s: TStmt) = s match
             // and that storage is a slot of this frame nothing else will ever name -- so it is `p`'s
             // storage.
             gen_in_place_decl(e, name, ty, init, match_in_place(e, ty, init).unwrap())
+        else if e.lent_decls.has(name) && !e.frame_slots.has(name)
+            // A part of a lent loop variable is lent with it (`borrowing.sysl`'s `lent_element`):
+            // the bytes the element's storage holds, with no count taken and none to give back.
+            val slot = named_alloca(e, s"$name.addr", lty(e, ty), None)
+
+            emit(e, InStore(lty(e, ty), gen_expr(e, init), slot, AccPlain, None))
         else
             // The slot is laid down **before** the initializer runs, because a large one is written
             // into it rather than handed to it.
@@ -881,7 +887,13 @@ emit_contract(e: *Emit, cond: TExpr, kind: string)
     val ok = gen_expr(e, cond)
 
     pop_temps(e)
+
+    // A failed clause names the clause, wherever the call or the return that checked it was.
+    val outer = e.trap_site
+
+    e.trap_site = Some(cond.span)
     trap_unless(e, ok, kind)
+    e.trap_site = outer
 end emit_contract
 
 // Runs every postcondition with `result` bound to the value about to be returned.
@@ -927,7 +939,12 @@ private gen_variant_check(e: *Emit, slot: string, var_ty: Type, expr: TExpr)
     val ok = fresh_reg(e)
 
     emit(e, InIntCmp(ok, int_pred(e, "<", underlying(var_ty)), w, cur, prev))
+
+    val outer = e.trap_site
+
+    e.trap_site = Some(expr.span)
     trap_unless(e, ok, "variant")
+    e.trap_site = outer
     emit_term(e, InBr(set_l))
     emit_label(e, set_l)
     emit(e, InStore(w, cur, prev_at, AccPlain, None))
@@ -946,9 +963,9 @@ emit_inv_check(e: *Emit, v: Val, d: &StructType, inv_fn: string)
     val container =
         if ranges.is_none() then VNothing
         else
-            val c = fresh_reg(e)
+            val rs = ranges.unwrap()
+            val c = extract_held(e, struct_lty(d), v, 0, container_lty(rs), container_held_bytes(rs))
 
-            emit(e, InExtract(c, struct_lty(d), v, index_list(0)))
             reordered(e, container_reversal(d, e.target.little_endian()), c)
 
     var args: Buf[IrArg] = buf()
@@ -961,9 +978,9 @@ emit_inv_check(e: *Emit, v: Val, d: &StructType, inv_fn: string)
                 Some(rs) -> read_bits(e, rs, rs[d.slot(i)], container)
                 None if d.c_bit(i).is_some() -> c_bit_of_value(e, d, i, v)
                 None ->
-                    val t = fresh_reg(e)
+                    val t = extract_held(e, struct_lty(d), v, struct_field_index(e.layout, d, d.slot(i)), lty(e, ft),
+                                         field_held_bytes(d, ft))
 
-                    emit(e, InExtract(t, struct_lty(d), v, index_list(struct_field_index(e.layout, d, d.slot(i)))))
                     reordered(e, reversed_width(d, ft, e.target.little_endian()), t)
 
             // A field the boundary takes by address -- a union, a large aggregate -- crosses as a

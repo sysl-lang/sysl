@@ -1,0 +1,499 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A fact repeated after a call (`contract_assume.sysl`) that puts an index below a view's length also
+// says the view has storage: its pointer compared with null is assumed beside it. What that buys is
+// the storage pointer read again on the arm of `Buf.push` that grows, so an append loop keeps it in a
+// register with the count and the capacity instead of loading it for every element.
+//
+// The text shows which clauses carry the fact and which do not; clang's `-O2` shows the append loops
+// it pays for; and programs run at `-O2` show it claims nothing that is not so.
+
+private var spk_library_cache: Buf[Program] = buf()
+private var spk_library_read: bool = false
+
+private spk_library() -> Buf[Program]
+    if spk_library_read then return spk_library_cache
+
+    spk_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> spk_library_cache = units
+
+    spk_library_cache
+end spk_library
+
+private spk_no_library() -> bool
+    if spk_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end spk_no_library
+
+// The LLVM text of the whole module a source lowers to; a refused source stops the test with what it
+// was refused with.
+private spk_ir(text: string) -> string = spk_lowered(text) match
+    Ok(ir) -> ir
+    Err(said) -> panic(s"the fixture was refused: $said")
+
+private spk_lowered(text: string) -> Result[string, string]
+    val parsed = parse(source_of("t.sysl", forms_imported(text)))
+
+    if !parsed.ok() then return Err(parsed.first().message)
+
+    var units: Buf[Program] = buf()
+
+    for item in spk_library()
+        units.push(item)
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if !done.reported.is_empty() then return Err(done.reported[0].diag.message)
+
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+    val said = errors_of(done.an.diagnostics())
+
+    if !said.is_empty() then return Err(analysis_report(said))
+
+    val kept = prune(strip_tests(whole), program_own(units))
+    val lowered = codegen_with_gaps(kept, host_target(), promotions)
+
+    Ok(ir_print_module(lowered.0))
+end spk_lowered
+
+// What clang's `-O2` leaves of a program, or `None` where there is no clang to ask.
+private spk_optimized(text: string) -> Option[string]
+    if !clang_available()
+        print("skipped: clang is not installed, so there is no optimizer to ask")
+        return None
+    end if
+
+    val dir = make_temp_dir("sysl-spk").unwrap()
+    val file = s"$dir/t.ll"
+
+    write_text(file, spk_ir(text)).unwrap()
+
+    val got = capture("clang", ["-O2", "-S", "-emit-llvm", "-o", "-", file], "", [], true).unwrap()
+
+    remove_dir_all(dir).unwrap_or(())
+    assert(got.status.ok(), s"clang refused the emitted IR:\n${got.err.unwrap_or("")}")
+    Some(got.text)
+end spk_optimized
+
+// The body of the function whose `define` line holds `name`.
+private spk_body(out: string, name: string) -> string
+    var body = ""
+    var inside = false
+
+    for l in lines_of(out)
+        if !inside && l.starts_with("define") && l.contains(name) then inside = true
+
+        if inside
+            body = body + l + "\n"
+
+            if l == "}" then return body
+        end if
+
+    assert(inside, s"nothing defines a function named '$name':\n$out")
+    body
+end spk_body
+
+// How many of a body's assumes are of a pointer compared with null: the storage facts.
+private spk_storage_facts(body: string) -> int
+    var n = 0
+
+    for item in lines_of(body)
+        val l = item.trim()
+        val at = l.index_of(" = icmp ne ptr ")
+
+        if at.is_some() && l.starts_with("%") && l.ends_with(", null")
+            val reg = l[0..<at.unwrap()]
+
+            if body.contains(s"@llvm.assume(i1 $reg)") then n += 1
+        end if
+
+    n
+end spk_storage_facts
+
+// How many assumes a body makes at all.
+private spk_assumes(body: string) -> int
+    var n = 0
+
+    for l in lines_of(body)
+        if l.contains("call void @llvm.assume(i1 ") then n += 1
+
+    n
+end spk_assumes
+
+// -- which clauses say the storage is there ----------------------------------------------------------
+
+// Growth behind a name that is not inlined, with `clause` as its promise, and a store after the call.
+private grower(clause: string) -> string =
+    "struct Store\n    elems: []i32\n    count: usize\n\n    @noinline\n    @cold\n    private grow(*self)\n" +
+    "        ensure " + clause + "\n        self.elems = [0; self.count + 8usize]\n\n" +
+    "    @noinline\n    store(*self, v: i32)\n        self.grow()\n\n        self.elems[self.count] = v\n\n" +
+    "var s = Store([0; 4], 0usize)\ns.store(7)\nprint(s.count)\n"
+
+@test("an index below a view's length says the view's storage is there")
+spk_index_below_length()
+    if spk_no_library() then return
+
+    val body = spk_body(spk_ir(grower("self.count < self.elems.len")), "Store.store")
+
+    assert(spk_storage_facts(body) == 1, body)
+
+@test("and so does the length written on the left")
+spk_length_on_the_left()
+    if spk_no_library() then return
+
+    val body = spk_body(spk_ir(grower("self.elems.len > self.count")), "Store.store")
+
+    assert(spk_storage_facts(body) == 1, body)
+
+@test("a clause that allows an empty view is repeated without it")
+spk_empty_allowed()
+    if spk_no_library() then return
+
+    for clause in ["self.count <= self.elems.len", "self.elems.len >= self.count"]
+        val body = spk_body(spk_ir(grower(clause)), "Store.store")
+
+        assert(spk_assumes(body) == 1, body)
+        assert(spk_storage_facts(body) == 0, body)
+
+@test("a clause comparing two numbers says nothing about storage")
+spk_numbers_only()
+    if spk_no_library() then return
+
+    val body = spk_body(spk_ir(grower("self.count < self.count + 1usize")), "Store.store")
+
+    assert(spk_assumes(body) == 1, body)
+    assert(spk_storage_facts(body) == 0, body)
+
+@test("a string's length is not a view's")
+spk_string_length()
+    if spk_no_library() then return
+
+    val text = "struct Named\n    name: string\n    k: usize\n\n    @noinline\n    @cold\n" +
+        "    private settle(*self)\n        ensure self.k < self.name.len\n" +
+        "        self.name = \"abcdef\"\n        self.k = 0usize\n\n" +
+        "    @noinline\n    first(*self) -> usize\n        self.settle()\n\n        self.k\n\n" +
+        "var n = Named(\"\", 3usize)\nprint(n.first())\n"
+    val body = spk_body(spk_ir(text), "Named.first")
+
+    assert(spk_assumes(body) == 1, body)
+    assert(spk_storage_facts(body) == 0, body)
+
+// A struct's invariant is said at every member's entry by the same lowering. A strict one says the
+// storage is there; `Buf`'s own, `count <= elems.len`, allows an empty buffer and does not.
+private ring(clause: string) -> string =
+    "struct Ring\n    elems: []i32\n    count: usize\n    invariant " + clause + "\n\n" +
+    "    @noinline\n    at(self) -> i32 = self.elems[self.count]\n\n" +
+    "val r = Ring([5, 6, 7], 1usize)\nprint(r.at())\n"
+
+@test("a strict invariant says the storage is there at a member's entry")
+spk_strict_invariant()
+    if spk_no_library() then return
+
+    val body = spk_body(spk_ir(ring("count < elems.len")), "Ring.at")
+
+    assert(spk_storage_facts(body) == 1, body)
+
+@test("and an invariant that allows an empty view does not")
+spk_loose_invariant()
+    if spk_no_library() then return
+
+    val body = spk_body(spk_ir(ring("count <= elems.len")), "Ring.at")
+
+    assert(spk_assumes(body) == 1, body)
+    assert(spk_storage_facts(body) == 0, body)
+
+// -- what it buys: append loops keep the storage pointer ---------------------------------------------
+
+private spk_appends() -> string = raw"""
+    module demo
+
+    import sysl.buf.{Buf, buf}
+
+    struct Wide
+        a: int
+        b: int
+        c: int
+
+    @noinline
+    copy_into(seq: []const u8, out: Buf[u8])
+        for j in 0..<seq.len do out.push(seq[j])
+
+    @noinline
+    words(seq: []const int, out: Buf[int])
+        for j in 0..<seq.len do out.push(seq[j] * 3)
+
+    @noinline
+    wides(n: int, out: Buf[Wide])
+        for j in 0..<n do out.push(Wide(j, j + 1, j + 2))
+
+    @noinline
+    own_read(b: Buf[int], n: int)
+        for j in 0..<n do b.push(b[b.len() - 1] + j)
+
+    @noinline
+    reversed_lines(seq: []const u8, out: Buf[u8])
+        var i = seq.len
+
+        while i > 0
+            val width = if i > 60 then 60 else i
+
+            for j in 0..<width do out.push(seq[i - 1 - j])
+
+            out.push(u8('\n'))
+            i -= width
+
+    main()
+        val b: Buf[u8] = buf()
+        val w: Buf[int] = buf()
+        val v: Buf[Wide] = buf()
+
+        b.push(1)
+        copy_into(b.view(), b)
+        words([1, 2, 3], w)
+        wides(4, v)
+        own_read(w, 5)
+        reversed_lines(b.view(), b)
+        print(b.len(), w.len(), v.len())
+    """
+
+// The loops of a body: the text from each label to the branch that jumps back to it.
+private spk_loops(body: string) -> Buf[string]
+    var found: Buf[string] = buf()
+    var labels: Buf[(string, usize)] = buf()
+    val lines = lines_of(body)
+
+    for n in 0..<lines.len()
+        val l = lines[n]
+
+        if l.len > 0 && !l.starts_with(" ") && l.contains(":")
+            labels.push((l[0..<l.index_of(":").unwrap()], n))
+
+        if l.contains("br ")
+            for item in labels
+                if l.contains(s"label %${item.0},") || l.ends_with(s"label %${item.0}") ||
+                   l.contains(s"label %${item.0} ")
+                    var text = ""
+
+                    for k in item.1..n
+                        text = text + lines[k] + "\n"
+
+                    found.push(text)
+
+    found
+end spk_loops
+
+// The blocks of a loop's text other than the one that calls the growth.
+private spk_off_growth(text: string) -> string
+    var kept = ""
+    var block = ""
+    var grows = false
+
+    for l in lines_of(text)
+        if l.len > 0 && !l.starts_with(" ") && l.contains(":")
+            if !grows then kept = kept + block
+
+            block = ""
+            grows = false
+
+        if l.contains("grow_store") then grows = true
+
+        block = block + l + "\n"
+
+    if !grows then kept = kept + block
+
+    kept
+end spk_off_growth
+
+// Whether an append loop reads nothing of its buffer's header off the growth path -- no count, no
+// capacity and no storage pointer -- and reads the storage pointer again on it.
+private spk_keeps(l: string) -> bool
+    val hot = spk_off_growth(l)
+
+    l.contains("grow_store") && !hot.contains(" = load ptr") && !hot.contains(" = load i64") &&
+        l.contains(" = load ptr")
+end spk_keeps
+
+@test("at -O2 append loops of a byte, a word, a struct and a buffer read back keep the storage pointer")
+spk_append_loops_keep_the_pointer()
+    if spk_no_library() then return
+
+    spk_optimized(spk_appends()) match
+        None -> ()
+        Some(out) ->
+            for name in ["demo$copy_into", "demo$words", "demo$wides", "demo$own_read"]
+                val body = spk_body(out, name)
+                val loops = spk_loops(body)
+
+                assert(!loops.is_empty(), body)
+
+                for l in loops
+                    assert(spk_keeps(l), s"$name:\n$l")
+
+// revcomp's loop: the copy proved before it starts keeps the pointer; the loop as written beside it,
+// for when the test fails, has a bounds check branching out on every element and reads it again.
+@test("at -O2 revcomp's append loop keeps the storage pointer")
+spk_revcomp_keeps_the_pointer()
+    if spk_no_library() then return
+
+    spk_optimized(spk_appends()) match
+        None -> ()
+        Some(out) ->
+            val body = spk_body(out, "demo$reversed_lines")
+            var kept = 0
+
+            for l in spk_loops(body)
+                if spk_keeps(l) then kept += 1
+
+            assert(kept >= 1, body)
+
+// -- it claims nothing that is not so ----------------------------------------------------------------
+
+private spk_runs(text: string) -> int
+    val root = runner_project("main.sysl", forms_imported(text))
+    val cache = make_temp_dir("sysl-spk-cache").unwrap()
+
+    use_run_cache_dir(Some(cache))
+
+    var said: Buf[string] = buf()
+    val sink = &said
+    val code = run_cli(["sysl", "run", s"$root/main.sysl", "-O2"], piece -> sink.push(piece))
+
+    use_run_cache_dir(None)
+    remove_dir_all(root).unwrap_or(())
+    remove_dir_all(cache).unwrap_or(())
+    code
+end spk_runs
+
+private spk_ready() -> bool = std_root().is_ok() && clang_available()
+
+@test("at -O2 revcomp's loop, growing the buffer many times, writes every byte where it belongs")
+spk_revcomp_computes_right()
+    if !spk_ready() then return
+
+    assert_eq(spk_runs(raw"""
+        import sysl.buf.{Buf, buf}
+
+        @noinline
+        reversed_lines(seq: []const u8, out: Buf[u8])
+            var i = seq.len
+
+            while i > 0
+                val width = if i > 60 then 60 else i
+
+                for j in 0..<width do out.push(seq[i - 1 - j])
+
+                out.push(u8('\n'))
+                i -= width
+
+        main()
+            var seq: [1000]u8 = [0; 1000]
+
+            for i in 0..<1000 do seq[i] = u8(65 + i % 26)
+
+            val out: Buf[u8] = buf()
+
+            reversed_lines(seq[0..<1000], out)
+
+            var same = out.len() == 1017
+            var k = 0usize
+            var i = 1000
+
+            while i > 0
+                val width = if i > 60 then 60 else i
+
+                for j in 0..<width
+                    if out[k] != seq[i - 1 - j] then same = false
+
+                    k += 1
+
+                if out[k] != u8('\n') then same = false
+
+                k += 1
+                i -= width
+
+            exit(if same then 42 else 1)
+        """), 42)
+
+@test("at -O2 two Bufs appended in one loop, both growing, compute right")
+spk_two_buffers()
+    if !spk_ready() then return
+
+    assert_eq(spk_runs(raw"""
+        import sysl.buf.{Buf, buf}
+
+        @noinline
+        split(n: int, a: Buf[int], b: Buf[int])
+            for j in 0..<n
+                a.push(j)
+                b.push(n - j)
+
+        main()
+            val a: Buf[int] = buf()
+            val b: Buf[int] = buf()
+
+            split(500, a, b)
+
+            var same = a.len() == 500 && b.len() == 500
+
+            for j in 0..<500
+                if a[usize(j)] != j || b[usize(j)] != 500 - j then same = false
+
+            exit(if same then 42 else 1)
+        """), 42)
+
+@test("at -O2 a Buf of structs and a Buf pushed from its own last element compute right")
+spk_wide_and_own_read()
+    if !spk_ready() then return
+
+    assert_eq(spk_runs(raw"""
+        import sysl.buf.{Buf, buf}
+
+        struct Wide
+            a: int
+            b: int
+            c: int
+
+        @noinline
+        wides(n: int, out: Buf[Wide])
+            for j in 0..<n do out.push(Wide(j, j + 1, j + 2))
+
+        @noinline
+        own_read(b: Buf[int], n: int)
+            for j in 0..<n do b.push(b[b.len() - 1] + j)
+
+        main()
+            val v: Buf[Wide] = buf()
+            val w: Buf[int] = buf()
+
+            wides(300, v)
+            w.push(1)
+            own_read(w, 300)
+
+            var same = v.len() == 300 && w.len() == 301
+
+            for j in 0..<300
+                val x = v[usize(j)]
+
+                if x.a != j || x.b != j + 1 || x.c != j + 2 then same = false
+                if w[usize(j + 1)] != w[usize(j)] + j then same = false
+
+            exit(if same then 42 else 1)
+        """), 42)

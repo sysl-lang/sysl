@@ -329,10 +329,13 @@ end bfm_the_fast_path_is_unchanged
 
 @test("the hosted default renders its own digits, writes once to standard error, and is weak")
 bfm_the_hosted_default()
-    val text = bounds_runtime(host_target())
+    val text = bounds_runtime(host_target(), false, false)
 
-    assert(text.contains("define weak void @sysl_bounds_fail(i32 %kind, i64 %a, i64 %b, i64 %n, ptr %at)"),
-           text)
+    // `sysl_bounds_fail` hands on to `sysl_trap`, which is the renderer.
+    assert(text.contains("define weak void @sysl_bounds_fail(i32 %kind, i64 %a, i64 %b, i64 %n, ptr %at) {\n" +
+                         "entry:\n  call void @sysl_trap(i32 %kind, i64 %a, i64 %b, i64 %n, ptr %at)\n" +
+                         "  ret void\n}\n"), text)
+    assert(text.contains("define weak void @sysl_trap(i32 %kind, i64 %a, i64 %b, i64 %n, ptr %at)"), text)
     assert(text.contains("@write(i32 2, ptr %msg"), text)
     // It stops through the one flushing stop rather than the bare instruction (`trap_stop.sysl`).
     assert(text.contains("call void @sysl.trap()"), text)
@@ -351,9 +354,18 @@ end bfm_the_hosted_default
 bfm_the_freestanding_default()
     val t = target_resolved("thumbv7em-freestanding").unwrap()
 
-    assert_eq(bounds_runtime(t),
+    assert_eq(bounds_runtime(t, false, false),
               "define weak dso_local void @sysl_bounds_fail(i32 %kind, i32 %a, i32 %b, i32 %n, ptr %at) {\n" +
+              "entry:\n  call void @sysl_trap(i32 %kind, i32 %a, i32 %b, i32 %n, ptr %at)\n" +
+              "  ret void\n}\n\n" +
+              "define weak dso_local void @sysl_trap(i32 %kind, i32 %a, i32 %b, i32 %n, ptr %at) {\n" +
               "entry:\n  ret void\n}\n\n")
+
+    // Each default is left out where the module defines that symbol itself.
+    assert(!bounds_runtime(t, true, false).contains("@sysl_bounds_fail("))
+    assert(bounds_runtime(t, true, false).contains("define weak dso_local void @sysl_trap("))
+    assert(!bounds_runtime(t, false, true).contains("define weak dso_local void @sysl_trap("))
+    assert(bounds_runtime(t, false, true).contains("call void @sysl_trap("))
 end bfm_the_freestanding_default
 
 @test("a module exporting sysl_bounds_fail carries no default beside it")

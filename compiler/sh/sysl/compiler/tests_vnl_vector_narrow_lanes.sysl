@@ -1,0 +1,342 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **A vector `load` or `store` of a lane narrower than its element's storage moves the storage**
+// (`emit_vector.sysl`'s `storage_lane`). An array of `u12` gives each element two bytes, but LLVM
+// packs a `<8 x i12>` twelve bits to a lane, so a load emitted as the vector type read the padding
+// as lanes: a `[40]u12` reversed eight lanes at a time came back with 57575 in its first slot, which
+// is no `u12` at all, and an `i24` run read differently in debug and release. The run is now read as
+// `<N x i16>` (the element's storage) and truncated, and written back zero-extended.
+//
+// The cells: every width that is not a whole power-of-two number of bytes, signed and unsigned (1, 7,
+// 12, 24, 48, 56, 63, 72, 100) and `bool`, with `u128` beside them as the width that was always
+// right; 2, 4, 8 and 16 lanes; runs starting at element 0, 1 and 2 (the run's start is never the
+// vector's own alignment); debug and release; a `[N]u12` and a `[]u12` view of the middle of one;
+// an `@unchecked` run; a narrow vector through a parameter, a return, a struct field and an array of
+// those structs, which are spilled and reloaded as the vector type and were never wrong; and lane
+// arithmetic, which wraps at the lane's width (12 bits, not 16) before it is stored. Every lane is
+// compared with an element-wise read of the array.
+
+private vnl_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end vnl_ready
+
+// The program built in debug (overflow checked) or release, run, and what it printed.
+private vnl_ran(text: string, debug: bool) -> string
+    val root = make_temp_dir("sysl-vnl").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+    val was = overflow_checks()
+
+    use_overflow_checks(debug)
+
+    val made = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe))
+
+    use_overflow_checks(was)
+
+    made match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> if out.status.ok() then out.text else s"it stopped: ${out.text}"
+end vnl_ran
+
+// Each run is loaded at `k`, compared lane by lane with the elements it came from, stored at `k + 1`
+// of a zeroed array, and every element of that array compared with what should be there -- so a
+// store that wrote a neighbour's bytes is caught as well as one that wrote the wrong lanes.
+private vnl_checker() -> string = raw"""
+check[T: Eq, const N: usize](name: string, xs: []T, zero: T)
+    var bad = 0
+
+    for k in 0..<3
+        val v: <N>T = xs.load(k)
+
+        for const j in 0..<N
+            if v[j] != xs[k + j] then bad += 1
+
+        var ys: [40]T = [zero; 40]
+        ys.store(k + 1, v)
+
+        for j in 0..<40
+            val want = if j > k && j <= k + N then xs[j - 1] else zero
+            if ys[j] != want then bad += 1
+
+    print(name, N, if bad == 0 then "ok" else s"BAD $bad")
+end check
+
+all[T: Eq](name: string, xs: []T, zero: T)
+    check[T, 2](name, xs, zero)
+    check[T, 4](name, xs, zero)
+    check[T, 8](name, xs, zero)
+    check[T, 16](name, xs, zero)
+
+"""
+
+private vnl_all_ok(names: []string) -> string
+    var out = ""
+
+    for n in names
+        for w in [2, 4, 8, 16]
+            out = out + s"$n $w ok\n"
+
+    out
+end vnl_all_ok
+
+private vnl_narrow() -> string = vnl_checker() + raw"""
+main()
+    var a1: [40]u1 = [0; 40]
+    var a7: [40]u7 = [0; 40]
+    var b7: [40]i7 = [0; 40]
+    var a12: [40]u12 = [0; 40]
+    var b12: [40]i12 = [0; 40]
+
+    for i in 0..<40
+        val h = long(i) * 1103515245 + 12345
+        a1[i] = u1.wrap(h >> 7)
+        a7[i] = u7.wrap(h >> 3)
+        b7[i] = i7.wrap(h >> 5)
+        a12[i] = u12.wrap(h >> 2)
+        b12[i] = i12.wrap(h >> 4)
+
+    all("u1", a1, 0)
+    all("u7", a7, 0)
+    all("i7", b7, 0)
+    all("u12", a12, 0)
+    all("i12", b12, 0)
+"""
+
+private vnl_middle() -> string = vnl_checker() + raw"""
+main()
+    var b24: [40]i24 = [0; 40]
+    var a24: [40]u24 = [0; 40]
+    var a48: [40]u48 = [0; 40]
+    var b56: [40]i56 = [0; 40]
+    var b63: [40]i63 = [0; 40]
+
+    for i in 0..<40
+        val h = long(i) * 1103515245 + 12345
+        b24[i] = i24.wrap(h)
+        a24[i] = u24.wrap(h >> 1)
+        a48[i] = u48.wrap(h * 7919)
+        b56[i] = i56.wrap(h * 104729)
+        b63[i] = i63.wrap(h * 15485863)
+
+    all("i24", b24, 0)
+    all("u24", a24, 0)
+    all("u48", a48, 0)
+    all("i56", b56, 0)
+    all("i63", b63, 0)
+"""
+
+private vnl_wide() -> string = vnl_checker() + raw"""
+main()
+    var b72: [40]i72 = [0; 40]
+    var a100: [40]u100 = [0; 40]
+    var a128: [40]u128 = [0; 40]
+    var bo: [40]bool = [false; 40]
+
+    for i in 0..<40
+        val h = long(i) * 1103515245 + 12345
+        b72[i] = -(i72(i) << 60) - i72(h)
+        a100[i] = u100(u64.wrap(h * 15485863)) << 36 | u100(i)
+        a128[i] = u128(u64.wrap(h * 7)) << 64 | u128(i)
+        bo[i] = (h >> 9) & 1 == 1
+
+    all("i72", b72, 0)
+    all("u100", a100, 0)
+    all("u128", a128, 0)
+    all("bool", bo, false)
+"""
+
+// ---- the case that found it ----
+
+private vnl_reverse() -> string = raw"""
+main()
+    var xs: [40]u12 = [0; 40]
+    for i in 0..<40 do xs[i] = u12(i * 100)
+    var ys: [40]u12 = [0; 40]
+
+    for i in 0..<5
+        val v: <8>u12 = xs.load(i * 8)
+        ys.store(32 - i * 8, v.shuffle([7, 6, 5, 4, 3, 2, 1, 0]))
+
+    var bad = 0
+    for i in 0..<40
+        if ys[i] != xs[39 - i] then bad += 1
+    print(ys[0], ys[1], ys[39], bad)
+"""
+
+@test("a [40]u12 reversed eight lanes at a time keeps every element, in debug")
+vnl_a_u12_array_reversed_by_lanes_in_debug()
+    if !vnl_ready() then return
+
+    assert_eq(vnl_ran(vnl_reverse(), true), "3900 3800 0 0\n")
+
+@test("a [40]u12 reversed eight lanes at a time keeps every element, in release")
+vnl_a_u12_array_reversed_by_lanes_in_release()
+    if !vnl_ready() then return
+
+    assert_eq(vnl_ran(vnl_reverse(), false), "3900 3800 0 0\n")
+
+// ---- the widths ----
+
+@test("u1, u7, i7, u12 and i12 runs load and store at every lane count, in debug")
+vnl_narrow_widths_in_debug()
+    if !vnl_ready() then return
+
+    assert_eq(vnl_ran(vnl_narrow(), true), vnl_all_ok(["u1", "u7", "i7", "u12", "i12"]))
+
+@test("u1, u7, i7, u12 and i12 runs load and store at every lane count, in release")
+vnl_narrow_widths_in_release()
+    if !vnl_ready() then return
+
+    assert_eq(vnl_ran(vnl_narrow(), false), vnl_all_ok(["u1", "u7", "i7", "u12", "i12"]))
+
+@test("i24, u24, u48, i56 and i63 runs load and store at every lane count, in debug")
+vnl_middle_widths_in_debug()
+    if !vnl_ready() then return
+
+    assert_eq(vnl_ran(vnl_middle(), true), vnl_all_ok(["i24", "u24", "u48", "i56", "i63"]))
+
+@test("i24, u24, u48, i56 and i63 runs load and store at every lane count, in release")
+vnl_middle_widths_in_release()
+    if !vnl_ready() then return
+
+    assert_eq(vnl_ran(vnl_middle(), false), vnl_all_ok(["i24", "u24", "u48", "i56", "i63"]))
+
+@test("i72, u100, u128 and bool runs load and store at every lane count, in debug")
+vnl_wide_widths_and_bool_in_debug()
+    if !vnl_ready() then return
+
+    assert_eq(vnl_ran(vnl_wide(), true), vnl_all_ok(["i72", "u100", "u128", "bool"]))
+
+@test("i72, u100, u128 and bool runs load and store at every lane count, in release")
+vnl_wide_widths_and_bool_in_release()
+    if !vnl_ready() then return
+
+    assert_eq(vnl_ran(vnl_wide(), false), vnl_all_ok(["i72", "u100", "u128", "bool"]))
+
+// ---- where the run comes from and goes ----
+
+@test("a []u12 view of the middle of an array loads and stores the same lanes as the array")
+vnl_a_u12_view_loads_and_stores_like_the_array()
+    if !vnl_ready() then return
+
+    assert_eq(vnl_ran(raw"""
+        @noinline
+        from_slice(xs: []u12, at: int) -> <4>u12 = xs.load(at)
+
+        main()
+            var xs: [12]u12 = [4095, 1, 2048, 7, 4000, 5, 6, 3333, 8, 9, 10, 11]
+            val a = from_slice(xs, 0)
+            val b = from_slice(xs[1..<11], 3)
+            val c: <4>u12 = xs.load(4)
+            print(a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3], c[3])
+
+            var out: [12]u12 = [0; 12]
+            val d: []u12 = out[2..<12]
+            d.store(1, a)
+            print(out[2], out[3], out[4], out[5], out[6], out[7], out[8])
+        """, false), "4095 1 2048 7 4000 5 6 3333 3333\n0 4095 1 2048 7 0 0\n")
+
+@test("an @unchecked u12 run loads and stores the elements")
+vnl_an_unchecked_u12_run()
+    if !vnl_ready() then return
+
+    assert_eq(vnl_ran(raw"""
+        main()
+            var xs: [6]u12 = [4095, 1, 2048, 7, 4000, 5]
+            var ys: [6]u12 = [0; 6]
+
+            @unchecked
+                val v: <4>u12 = xs.load(1)
+                ys.store(2, v)
+
+            print(ys[0], ys[1], ys[2], ys[3], ys[4], ys[5])
+        """, true), "0 0 1 2048 7 4000\n")
+
+@test("a narrow vector through a parameter, a return, a struct field and an array of structs")
+vnl_a_narrow_vector_through_memory()
+    if !vnl_ready() then return
+
+    assert_eq(vnl_ran(raw"""
+        struct Holder
+            tag: u8
+            v: <4>u12
+            after: u12
+
+        @noinline
+        twice(v: <4>u12) -> <4>u12 = v + v
+
+        @noinline
+        reversed(v: <4>i24) -> <4>i24 = v.shuffle([3, 2, 1, 0])
+
+        main()
+            var xs: [4]u12 = [4095, 1, 2048, 7]
+            val a: <4>u12 = xs.load(0)
+            var h = Holder(9, a, 77)
+            h.v = twice(h.v)
+            print(h.tag, h.v[0], h.v[1], h.v[2], h.v[3], h.after)
+
+            var holders: [3]Holder = [h; 3]
+            holders[1].v = a
+            print(holders[0].v[0], holders[1].v[0], holders[1].after, holders[2].v[3])
+
+            var ws: [6]i24 = [-8388608, 8388607, -1, 1, 0, -5]
+            val w: <4>i24 = ws.load(1)
+            ws.store(2, reversed(w))
+            print(ws[0], ws[1], ws[2], ws[3], ws[4], ws[5])
+        """, true), "9 4094 2 0 14 77\n4094 4095 77 14\n-8388608 8388607 0 1 -1 8388607\n")
+
+// ---- the lanes' own arithmetic ----
+
+@test("u12 and i12 lanes wrap at twelve bits, and the wrapped lanes are what a store writes")
+vnl_narrow_lanes_wrap_at_their_width()
+    if !vnl_ready() then return
+
+    val text = raw"""
+        main()
+            val o: <4>u12 = [4095, 4000, 0, 2048]
+            val sum = o + o
+            val dif = <4>u12(0) - o
+            val prod = o * o
+            print(sum[0], sum[1], sum[3], dif[0], dif[2], prod[1])
+
+            var back: [4]u12 = [0; 4]
+            back.store(0, sum)
+            print(back[0], back[1], back[2], back[3])
+
+            val io: <4>i12 = [2047, -2048, 1, -1]
+            var iback: [4]i12 = [0; 4]
+            iback.store(0, io + io)
+            print(iback[0], iback[1], iback[2], iback[3])
+        """
+    val want = "4094 3904 0 1 0 1024\n4094 3904 0 0\n-2 0 2 -2\n"
+
+    assert_eq(vnl_ran(text, true), want)
+    assert_eq(vnl_ran(text, false), want)
+end vnl_narrow_lanes_wrap_at_their_width

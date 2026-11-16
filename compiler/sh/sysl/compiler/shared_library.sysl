@@ -1,0 +1,248 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.is_file
+import sysl.text.split
+
+// **`sysl build-c --shared` links what an archive would hold into a shared library**: a Mach-O
+// `.dylib` or an ELF `.so`, for a host that opens it with `dlopen` -- a plugin, a reloadable half of a
+// game, a JNI or Python extension.
+//
+// **Each library is self-contained.** What goes into the link is exactly what the archive would
+// carry: the module, its private copy of every piece of the standard library it reaches, and the C
+// of every tree the build walked. Every sysl definition is already internal to it
+// (`archive_linkage.sysl`), so two such libraries in one process each run their own runtime and
+// neither can bind to the other's. A sysl object therefore crosses between two of them only through
+// their C API, as it would between two C libraries.
+//
+// **Only the `@export` symbols are offered to the loader.** The runtime's C-named hooks
+// (`sysl_bounds_fail`, `__sysl_arc_reaper`) and the standard library's C (`sysl_stdout_write`) are
+// global inside the link, which is where they have to be found, and would be exported by default. So
+// the link is handed the list of exports: `-exported_symbols_list` to ld64, a version script whose
+// `local: *` hides everything else to an ELF linker. A version script the author gives replaces the
+// one written here, and then decides what is exported itself. The list is the module's own exports
+// (`c_header.sysl`'s `offered_exports`): the standard library's `@export`s answer seams of the
+// runtime (`sysl_io_flush`) and are held back with it, `sysl_trap` among the hooks.
+//
+// **ELF code is compiled position-independent** (`set_position_independent`), which is also what
+// makes its thread-locals take the general dynamic model a library opened with `dlopen` needs: the
+// IR names no TLS model, so the back end chooses by the relocation model. Mach-O code is always
+// position-independent and reaches every thread-local through its descriptor.
+
+// What `--shared` and the settings that travel with it said. Each is `None` where it was not given,
+// and then the linker's own default is what the library carries -- except the names, which default
+// to the file's own (`shared_install_name`, `shared_soname`).
+struct SharedLib
+    install_name: Option[string]
+    current_version: Option[string]
+    compatibility_version: Option[string]
+    soname: Option[string]
+    version_script: Option[string]
+end SharedLib
+
+// Whether `t` links ELF shared objects: Linux, and Android, whose applications are `.so` files.
+shared_elf(t: Target) -> bool = t.os == Linux || t.os == Android
+
+// The suffix a shared library for `t` is written under where `-o` names none.
+shared_suffix(t: Target) -> string = if t.os == MacOS then ".dylib" else ".so"
+
+// The Mach-O install name -- the name a program linked against the library records, and so where
+// the loader looks for it. Given none, `@rpath/` and the file's own name, which a host finds through
+// its own run-path rather than through the directory the library happened to be built in.
+shared_install_name(s: SharedLib, out: string) -> string = s.install_name.unwrap_or(s"@rpath/${basename(out)}")
+
+// The ELF soname, which plays the same part: given none, the file's own name.
+shared_soname(s: SharedLib, out: string) -> string = s.soname.unwrap_or(basename(out))
+
+// Why this request for a shared library cannot be built, or nothing where it can. Asked before
+// anything is compiled, since nothing the build does changes the answer.
+//
+// **A setting of the other object format is refused, not ignored**: an install name given to an ELF
+// link would be dropped silently, and the author would meet a library that does not carry it at load.
+shared_refusal(s: SharedLib, t: Target, out: Option[string], lto: Option[string]) -> Option[string]
+    if t.os == Windows
+        return Some(s"'--shared' links a Mach-O or ELF shared library, and ${t.name} uses neither: " +
+                    "a Windows DLL is not built yet, so link the static archive into one")
+
+    // WASI is hosted, but has no loader that opens a library either.
+    if t.os != MacOS && !shared_elf(t)
+        return Some(s"'--shared' links a library a loader opens, and ${t.name} has no loader")
+
+    if lto.is_some()
+        return Some("'--lto' makes an archive's members bitcode for the host's link to optimize, and " +
+                    "'--shared' links here: the two are not given together")
+
+    val elf = shared_elf(t)
+
+    if elf
+        if s.install_name.is_some()
+            return Some(s"'--install-name' is a Mach-O setting, and ${t.name} links ELF: its library's own " +
+                        "name is given with '--soname'")
+
+        for v in [s.current_version, s.compatibility_version]
+            if v.is_some()
+                return Some(s"'--current-version' and '--compatibility-version' are Mach-O settings, and " +
+                            s"${t.name} links ELF, whose libraries carry a version in the soname or in a " +
+                            "version script")
+    else
+        if s.soname.is_some()
+            return Some(s"'--soname' is an ELF setting, and ${t.name} links Mach-O: its library's own " +
+                        "name is given with '--install-name'")
+
+        if s.version_script.is_some()
+            return Some(s"'--version-script' is an ELF setting, and ${t.name} links Mach-O, which exports " +
+                        "exactly the '@export' symbols with none")
+    end if
+
+    for (flag, v) in [("--current-version", s.current_version), ("--compatibility-version", s.compatibility_version)]
+        val given = v.unwrap_or("")
+
+        if v.is_some() && !macho_version(given)
+            return Some(s"'$flag $given' is not a Mach-O version: it is one to three numbers, " +
+                        "'X[.Y[.Z]]', X at most 65535 and Y and Z at most 255")
+
+    val script = s.version_script.unwrap_or("")
+
+    if s.version_script.is_some() && !is_file(script)
+        return Some(s"'--version-script $script': there is no such file")
+
+    val named = out.unwrap_or("")
+    val cut: usize = if named.ends_with(".a") then 2 else if named.ends_with(".lib") then 4 else 0
+
+    if cut > 0
+        return Some(s"'-o $named' names a static archive, and '--shared' links a shared library: " +
+                    s"name it '${named[0..<named.bytes.len - cut]}${shared_suffix(t)}'")
+
+    None
+end shared_refusal
+
+// Whether `v` is a version ld64 takes: `X`, `X.Y` or `X.Y.Z`, decimal, X at most 65535 and the others
+// at most 255 -- the fields of the packed 32-bit number a load command carries.
+macho_version(v: string) -> bool
+    val parts = split(v, ".")
+
+    if parts.len == 0 || parts.len > 3 then return false
+
+    for i in 0..<parts.len
+        val part = parts[i]
+
+        if part.bytes.len == 0 || part.bytes.len > 5 then return false
+
+        var n = 0
+
+        for b in part.bytes
+            if b < u8('0') || b > u8('9') then return false
+            n = n * 10 + int(b - u8('0'))
+
+        if n > (if i == 0 then 65535 else 255) then return false
+
+    true
+end macho_version
+
+// The file the link is told what to export by: ld64's list of symbols, each with Mach-O's leading
+// underscore, or an ELF version script that names them global and everything else local. An ELF
+// script with nothing to name is still a script, `local: *` alone.
+shared_export_list(symbols: Buf[string], t: Target) -> string
+    var out = ""
+
+    if !shared_elf(t)
+        for item in symbols
+            out = out + s"_$item\n"
+
+        return out
+
+    out = "{\n"
+
+    if !symbols.is_empty()
+        out = out + "  global:\n"
+
+        for item in symbols
+            out = out + s"    $item;\n"
+
+    out + "  local:\n    *;\n};\n"
+end shared_export_list
+
+// The clang command that links `objects` into the shared library `out`, told what to export by the
+// file at `list` (`shared_export_list`) unless the author gave a version script of their own.
+//
+// The link line is a program's (`link_command`) with a different ending: the same level, pipeline,
+// extra flags, machine, search paths, libraries and run-paths, so a library a package binds is
+// linked into the shared library as it would be into a program -- the loader then finds it when the
+// host opens this one.
+shared_link_command(cc: string, objects: Buf[string], out: string, t: Target, level: string,
+                    links: Buf[string], probed: PkgAnswer, s: SharedLib, list: string,
+                    named: string) -> Buf[string]
+    var cmd: Buf[string] = buf()
+
+    cmd.push(cc)
+    cmd.push(s"--target=${t.triple}")
+    cmd.push(if shared_elf(t) then "-shared" else "-dynamiclib")
+    cmd.push(s"-O$level")
+
+    val piped = pipeline_flags()
+
+    for item in piped
+        cmd.push(item)
+
+    val extra = extra_cflags()
+
+    for item in extra
+        cmd.push(item)
+
+    cmd.push(dead_strip(t))
+
+    val machine = machine_flags(t)
+
+    for item in machine
+        cmd.push(item)
+
+    val given = link_search_flags()
+
+    for item in given
+        cmd.push(item)
+
+    val search = probed_search_flags(probed)
+
+    for item in search
+        cmd.push(item)
+
+    for item in objects
+        cmd.push(item)
+
+    var tail = library_flags(links, t)
+    val libs = probed_link_flags(probed)
+
+    for lib in libs
+        tail.push(lib)
+
+    val linked = static_rewrite(tail, probed.archives)
+
+    for item in linked
+        cmd.push(item)
+
+    val rpaths = rpath_flags(t)
+
+    for rpath in rpaths
+        cmd.push(rpath)
+
+    if shared_elf(t)
+        cmd.push(s"-Wl,-soname,${shared_soname(s, named)}")
+        cmd.push(s"-Wl,--version-script,${s.version_script.unwrap_or(list)}")
+    else
+        cmd.push(s"-Wl,-install_name,${shared_install_name(s, named)}")
+
+        s.current_version match
+            Some(v) -> cmd.push(s"-Wl,-current_version,$v")
+            None -> ()
+
+        s.compatibility_version match
+            Some(v) -> cmd.push(s"-Wl,-compatibility_version,$v")
+            None -> ()
+
+        cmd.push(s"-Wl,-exported_symbols_list,$list")
+    end if
+
+    cmd.push("-o")
+    cmd.push(out)
+    cmd
+end shared_link_command

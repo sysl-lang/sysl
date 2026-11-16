@@ -331,9 +331,10 @@ private struct Schedule
                 if self.fail_fast && !outcome.passed() then self.stopped = true
             SetupAll ->
                 val h = lane.hooks.setup_all.unwrap()
+                val row = self.hook_row(h, ran, took)
 
-                self.settle(f.row, self.hook_row(h, ran, took))
-                lane.booted = ran.state == 0
+                lane.booted = row.is_none()
+                self.settle(f.row, row)
                 lane.phase = Testing
             TeardownAll ->
                 val h = lane.hooks.teardown_all.unwrap()
@@ -344,14 +345,16 @@ private struct Schedule
         self.lanes[f.lane] = lane
     end take
 
-    // A module hook's slot: a row where it did not come back, and nothing where it did.
+    // A module hook's slot: a row where it did not come back or failed a check, and nothing where it
+    // came back clean.
     private hook_row(*self, h: THook, ran: BoundedRun, took: long) -> Option[Outcome]
-        if ran.state == 0 then return None
+        val failure = hook_failure(ran, self.seconds) match
+            None -> return None
+            Some(said) -> said
 
         if self.fail_fast then self.stopped = true
 
-        Some(hook_outcome(h, HookRun(ran.state, unmarked_output(ran.raw), took,
-                                     ending_of(ran.state, ran.timed_out, self.seconds))))
+        Some(hook_outcome(h, HookRun(ran.state, unmarked_output(ran.raw), took, failure)))
     end hook_row
 
     // One entry point of the test binary, started for the slot `row`, in a **process group of its
@@ -572,7 +575,9 @@ private test_landed(exe: string, t: TTest, ran: BoundedRun, took: long, limit: i
     // A skip is the mark AND a clean exit: a test that failed before it called `skip` never wrote the
     // mark, and one that wrote it and then died did not skip. Asked first, since a `@setup` that
     // skips leaves no setup mark behind it and is the module saying none of its tests can run here.
-    val skipped = if state == 0 && !ran.timed_out then skip_reason(raw) else None
+    // A check that failed before the skip is still the failure, as an assertion would have been.
+    val clean = state == 0 && !ran.timed_out && failed_checks(raw) == 0
+    val skipped = if clean then skip_reason(raw) else None
 
     var detail: Option[string] = None
 
@@ -589,6 +594,11 @@ private test_landed(exe: string, t: TTest, ran: BoundedRun, took: long, limit: i
         detail = Some(timed_out_after(limit))
     else
         detail = test_verdict(t, state, output)
+
+    // Checks from `sysl.harness` that failed outside any harness `run` are this test's own: each one
+    // printed its line and carried on, so the process may well have returned, and only the marks say
+    // the test did not pass. They join whatever else went wrong rather than replacing it.
+    if skipped.is_none() then detail = with_failed_checks(detail, raw)
 
     // The teardown the process could not reach. Its own output joins the test's, since a reader
     // following one failure should not have to run the suite again to see the other.
@@ -635,9 +645,23 @@ private run_test_hook(exe: string, h: THook, seconds: int) -> HookRun
     val started = monotonic()
     val ran = run_bounded(exe, h.func, seconds)
 
-    HookRun(ran.state, unmarked_output(ran.raw), whole_millis(monotonic() - started),
-            ending_of(ran.state, ran.timed_out, seconds))
+    val failure = hook_failure(ran, seconds)
+
+    // A hook that came back having failed a check is a failed hook, so its status says so: the one
+    // reader of a hook's own process asks only whether the status is zero.
+    HookRun(if failure.is_some() && ran.state == 0 then 1 else ran.state, unmarked_output(ran.raw),
+            whole_millis(monotonic() - started),
+            failure.unwrap_or(ending_of(ran.state, ran.timed_out, seconds)))
 end run_test_hook
+
+// How a hook's run failed, where it did: it did not come back, or it came back having failed a
+// check, or both.
+private hook_failure(ran: BoundedRun, seconds: int) -> Option[string]
+    val came_back = ran.state == 0 && !ran.timed_out
+    val ended = if came_back then None else Some(ending_of(ran.state, ran.timed_out, seconds))
+
+    with_failed_checks(ended, ran.raw)
+end hook_failure
 
 // What one run of the test binary came to: the status a shell would report, everything it printed on
 // either stream, and whether it was stopped for outlasting its limit -- which a status cannot say,
@@ -967,6 +991,43 @@ skip_mark() -> string = "\u{3}"
 
 private skip_byte() -> u8 = skip_mark().bytes[0]
 
+// The byte `sysl.harness` writes ahead of a check that failed outside any harness `run` -- in a
+// `@test`, a hook, or a helper either one calls. **Such a check belongs to the `@test` around it**,
+// and it does not stop the test: the harness records a failure and runs on, as it does on a board. So
+// the process returns, its status is zero, and the mark is the only thing that says it failed. Like
+// `skip_mark` it is the library's rather than the dispatcher's, so this is one place that states it
+// and `library/sysl/harness/harness.sysl`'s `check_mark` is the other. A check inside a harness `run`
+// writes none: there the harness's own program keeps the verdict, through `finish`.
+check_mark() -> string = "\u{4}"
+
+private check_byte() -> u8 = check_mark().bytes[0]
+
+// How many checks a run reported failing, one mark each.
+failed_checks(output: string) -> usize
+    val mark = check_byte()
+
+    var n: usize = 0
+
+    for b in output.bytes
+        if b == mark then n += 1
+
+    n
+end failed_checks
+
+// What a run's failed checks add to whatever else is said about how it went: the whole verdict where
+// nothing else went wrong, and a clause after it where something did.
+with_failed_checks(said: Option[string], output: string) -> Option[string]
+    val n = failed_checks(output)
+
+    if n == 0 then return said
+
+    val checks = if n == 1 then "failed 1 check" else s"failed $n checks"
+
+    said match
+        None -> Some(checks)
+        Some(s) -> Some(s"$s, and $checks")
+end with_failed_checks
+
 // The reason a run gave `skip`, where it gave one: what follows the mark, up to the end of its line.
 skip_reason(output: string) -> Option[string]
     val mark = skip_byte()
@@ -991,15 +1052,17 @@ unmarked_output(output: string) -> string
     val setup = setup_byte()
     val test = test_byte()
     val skip = skip_byte()
+    val failed = check_byte()
+    val marked = output.has_byte(setup) || output.has_byte(test) || output.has_byte(skip) || output.has_byte(failed)
 
-    if !output.has_byte(setup) && !output.has_byte(test) && !output.has_byte(skip) then return output
+    if !marked then return output
 
     var out: Buf[u8] = buf()
 
     for i in 0..<output.bytes.len
         val b = output.bytes[i]
 
-        if b != setup && b != test && b != skip then out.push(b)
+        if b != setup && b != test && b != skip && b != failed then out.push(b)
 
     from_utf8_unchecked(out.view())
 end unmarked_output
