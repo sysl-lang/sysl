@@ -101,14 +101,33 @@ private akr_linked() -> string = "struct Node\n    value: int\n    next: Option[
 
 // -- the lowering ---------------------------------------------------------------------------------
 
+// A point something weakens: its box keeps the hook and the weak count (`compact_box.sysl`). The weak
+// reference is declared after everything the tests below read, so it moves no register they name.
+private akr_weakened_point() -> string = akr_point() + "var p: &Point = Point(1, 2)\nvar w: weak Point = p\n"
+
 @test("a box is the strong count, the deallocation hook, the weak count, and the payload")
 akr_a_box_is_four_fields()
     if akr_no_library() then return
 
-    val out = akr_ir(akr_point() + "var p: &Point = Point(1, 2)")
+    val out = akr_ir(akr_weakened_point())
 
     akr_has(out, "%arc.Point = type { i64, ptr, i64, %struct.Point }")
     akr_has(out, "declare ptr @malloc(i64)")
+    akr_has(out, "declare void @free(ptr)")
+
+// Nothing reaches a box of a point nobody weakens, shares or makes an object of without its type, so
+// the box is the count and the payload, and its release is the point's own.
+@test("a box nothing reaches without its type is the strong count and the payload")
+akr_a_compact_box_is_two_fields()
+    if akr_no_library() then return
+
+    val out = akr_ir(akr_point() + "var p: &Point = Point(1, 2)")
+
+    akr_has(out, "%arc.Point = type { i64, %struct.Point }")
+    akr_has(out, "alloc.ok1:\n  store i64 1, ptr %t5\n  %t7 = getelementptr %arc.Point, ptr %t5, i32 0, i32 1\n" +
+                 "  store %struct.Point %t2, ptr %t7\n")
+    akr_has(out, "  call void @arc.release.Point(ptr %t8)\n")
+    akr_lacks(out, "@arc.drop.plain")
     akr_has(out, "declare void @free(ptr)")
 
 // A payload holding nothing has no contents to walk and still has storage to give back, so the hook
@@ -117,7 +136,7 @@ akr_a_box_is_four_fields()
 akr_a_wanted_reference_goes_on_the_heap()
     if akr_no_library() then return
 
-    val out = akr_ir(akr_point() + "var p: &Point = Point(1, 2)")
+    val out = akr_ir(akr_weakened_point())
 
     akr_has(out, "  %t5 = call ptr @malloc(i64 %t4)\n  %t6 = icmp ne ptr %t5, null\n")
     akr_has(out, "alloc.bad2:\n  call void @sysl.check.20.out_of_memory(ptr @.loc0)\n  call void @sysl.trap()\n" +
@@ -130,7 +149,7 @@ akr_a_wanted_reference_goes_on_the_heap()
 akr_the_weak_count_starts_at_one()
     if akr_no_library() then return
 
-    val out = akr_ir(akr_point() + "var p: &Point = Point(1, 2)")
+    val out = akr_ir(akr_weakened_point())
 
     akr_has(out, "  %t8 = getelementptr %arc.Point, ptr %t5, i32 0, i32 2\n  store i64 1, ptr %t8\n")
 
@@ -152,9 +171,9 @@ akr_a_local_holds_a_count_for_its_scope()
 
     val out = akr_ir(akr_point() + "var p: &Point = Point(1, 2)\nprint(p.x)")
 
-    akr_has(out, "  store %struct.Point %t2, ptr %t9\n  store ptr %t5, ptr %p.addr\n")
+    akr_has(out, "  store %struct.Point %t2, ptr %t7\n  store ptr %t5, ptr %p.addr\n")
     akr_lacks(out, "@arc.retain(ptr %t5)")
-    akr_has(out, "  %t15 = load ptr, ptr %p.addr\n  call void @arc.release(ptr %t15)\n  ret i32 0\n")
+    akr_has(out, "  %t13 = load ptr, ptr %p.addr\n  call void @arc.release.Point(ptr %t13)\n  ret i32 0\n")
 
 @test("assignment stores the new reference before releasing the old one")
 akr_assignment_retains_before_it_releases()
@@ -162,10 +181,10 @@ akr_assignment_retains_before_it_releases()
 
     val out = akr_ir(akr_point() + "var p: &Point = Point(1, 2)\np = Point(3, 4)")
 
-    akr_has(out, "  %t19 = load ptr, ptr %p.addr\n" +
-                 "  store ptr %t14, ptr %p.addr\n" +
-                 "  call void @arc.release(ptr %t19)\n")
-    akr_lacks(out, "@arc.retain(ptr %t14)")
+    akr_has(out, "  %t15 = load ptr, ptr %p.addr\n" +
+                 "  store ptr %t12, ptr %p.addr\n" +
+                 "  call void @arc.release.Point(ptr %t15)\n")
+    akr_lacks(out, "@arc.retain(ptr %t12)")
 
 // A by-value parameter the function only reads is read through the count its caller holds for the
 // length of the call, so nothing is taken at entry. One it returns is kept, so it is owned
@@ -201,7 +220,7 @@ akr_a_parameter_is_free_and_a_result_is_counted()
 akr_a_destructor_walks_and_leaves_the_storage()
     if akr_no_library() then return
 
-    val out = akr_ir(akr_linked() + "var n: &Node = Node(1, None)")
+    val out = akr_ir(akr_linked() + "var n: &Node = Node(1, None)\nvar w: weak Node = n\n")
 
     akr_has(out, "define private void @arc.drop.Node(ptr %p, i1 %storage, ptr %slot) {")
     akr_has(out, "  %t2 = load %struct.Node, ptr %t1\n  %t3 = extractvalue %struct.Node %t2, 1\n")
@@ -231,7 +250,7 @@ akr_a_data_enum_walks_behind_a_tag_test()
     akr_has(out, "  %t1 = extractvalue %enum.sysl$Option.ref.Node %v, 0\n  %t2 = icmp eq i32 %t1, 1\n")
     akr_has(out, "  %t4 = getelementptr %enum.sysl$Option.ref.Node, ptr %t3, i32 0, i32 1\n" +
                  "  %t5 = load %sysl$Option.ref.Node.Some, ptr %t4\n")
-    akr_has(out, "  %t6 = extractvalue %sysl$Option.ref.Node.Some %t5, 0\n  call void @arc.release(ptr %t6)\n")
+    akr_has(out, "  %t6 = extractvalue %sysl$Option.ref.Node.Some %t5, 0\n  call void @arc.release.Node(ptr %t6)\n")
 
 @test("an ordinary reference counts with a plain load and store")
 akr_an_ordinary_reference_counts_plainly()
@@ -264,13 +283,24 @@ akr_the_two_modes_share_one_box()
     akr_has(out, "define private void @arc.release(ptr %p) {")
     akr_has(out, "define private void @arc.release_sync(ptr %p) {")
 
-// The payload sits behind the three header words, so the field is the box's fourth member and then
-// the struct's second.
+// The payload sits behind the header -- the count alone here, nothing weakening a point -- so the
+// field is the box's second member and then the struct's second.
 @test("a field through a reference reaches past the header")
 akr_a_field_reaches_past_the_header()
     if akr_no_library() then return
 
     val out = akr_ir(akr_point() + "var p: &Point = Point(1, 2)\np.y = 9")
+
+    akr_has(out, "  %t9 = getelementptr %arc.Point, ptr %t8, i32 0, i32 1\n" +
+                 "  %t10 = getelementptr %struct.Point, ptr %t9, i32 0, i32 1\n" +
+                 "  store i32 9, ptr %t10\n")
+
+// Behind the three words of a box something weakens, it is the box's fourth member.
+@test("a field of a weakened box reaches past all three header words")
+akr_a_field_reaches_past_the_full_header()
+    if akr_no_library() then return
+
+    val out = akr_ir(akr_point() + "var p: &Point = Point(1, 2)\np.y = 9\nvar w: weak Point = p\n")
 
     akr_has(out, "  %t11 = getelementptr %arc.Point, ptr %t10, i32 0, i32 3\n" +
                  "  %t12 = getelementptr %struct.Point, ptr %t11, i32 0, i32 1\n" +

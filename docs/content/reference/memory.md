@@ -3221,13 +3221,26 @@ value** (`struct Wrap[T]` with a field `x: T`) closes the cycle, and the refusal
 None of this section changes what a program prints or when a destructor runs; it is where counts are
 **not** taken.
 
-**Every heap object carries three header words**: the strong count, a pointer to the function that
+**A heap object carries three header words**: the strong count, a pointer to the function that
 destroys it, and a weak count. Release decrements the strong count and at zero calls through the hook,
 which releases the payload and returns the storage to the heap it came from
 ([one heap for the program](/reference/packages/#one-heap-and-the-package-that-names-it)). The hook
 makes release **type-erased** — what a view's owner word needs — so ARC works the same in a module
 that never allocates, several heaps coexist, and ownership crosses an allocator-free edge like any
 value. Values, fixed arrays and `*T` buffers carry no header.
+
+**A box no code can reach without its type carries the strong count alone.** The hook and the weak
+count are there for the releases that have forgotten what they hold — the drain, a trait object, a
+view's owner word — and for weak references. Where a build sees the whole program (a program with an
+entry point, not a library or a C archive, and not one linking a precompiled `--lib` root), the
+compiler leaves both words out of the boxes of each type the program declared that is never made into a
+`weak T`, a `&sync T` or a trait object, holds no fixed array in place a view could own, and has no
+destructor in it or anywhere its teardown reaches. Letting go of such a box calls its type's own
+release, which tears it down as the drain would — a reference of the same type on a list of its own,
+anything else released as usual — so a tree of them still comes apart in constant stack, and with no
+destructor anywhere the order it is freed in is not something a program can see. The binary-trees
+node — an enum of `Leaf` and `Node(left: &Tree, right: &Tree)` — is a 32-byte box instead of 48.
+Nothing about this is written in the program, and nothing it prints changes.
 
 **Teardown is iterative**: an object reaching zero is pushed onto a per-thread worklist through its
 dead count slot, and the first release to hit zero drains it, so any depth comes apart in O(1) stack.

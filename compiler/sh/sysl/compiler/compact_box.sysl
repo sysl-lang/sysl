@@ -1,0 +1,320 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.container.{Set, set}
+
+// **Which boxes are the strong count and nothing more.**
+//
+// A box carries three header words because two kinds of code reach it without knowing what it holds:
+// the reaper's drain and every release that has forgotten the type -- a trait object, a view's owner
+// word -- find the destructor through the hook word, and a weak reference keeps the storage alive
+// through the weak count. A payload no such code can ever reach needs neither word. Its release is a
+// function of its own type (`emit_arc.sysl`'s `gen_compact_release`), which lets go of what the payload
+// holds and frees the storage, iteratively, as the drain would have: a tree of these nodes comes apart
+// in constant stack.
+//
+// **Whether a payload is reached that way is a fact about the whole program, so it is decided only
+// where the whole program is in sight**: a build with an entry point, every body of which is lowered
+// here or belongs to the standard module. The standard module is compiled once, with every box it
+// makes laid out in full, and a type it declares keeps that layout; it cannot name a type of the
+// program's, so nothing it compiled ever holds one. A precompiled `--lib` root may name a package's
+// types, so a build that links one keeps every layout full, as does a library or a C archive, whose
+// callers are compiled elsewhere.
+//
+// A payload `T` is compact when all of these hold:
+//
+//   - the program declared it -- not the standard module, and not a form the compiler makes (a closure,
+//     a tuple, a task's frame);
+//   - nothing is torn down when it is: no destructor in it or anywhere its teardown reaches, and no
+//     trait object or callable in it, which could hold one. The release below frees in a different
+//     order from the drain's, and with no destructor anywhere that order is not something a program can
+//     see;
+//   - no weak reference to it is made, no `&sync T` is, and no trait object is made of it -- the three
+//     ways a box is let go of without its type;
+//   - it holds no fixed array by value, which a view could take its owner word from;
+//   - it asks for no boundary beyond the heap's, whose storage goes back through the aligned pair;
+//   - no other compact payload it holds in place holds it back, so the release of one never waits on
+//     the release of another that waits on it -- that alone would grow the stack with the depth.
+
+// The payloads, by mangled name, whose boxes in this program are compact.
+compact_boxes(e: *Emit, p: TProgram) -> Set[string]
+    var out: Set[string] = set()
+
+    if !p.entry_point || p.c_artifact then return out
+
+    // A precompiled sysl function is named under its module -- a blanket implementation's under
+    // `bound.` and then its module (`hoist_impl.sysl`) -- and a C function the standard module's object
+    // half defines is named under none; the project's own root module is never precompiled.
+    for name in p.precompiled
+        val m = module_of(if name.starts_with("bound.") then name[6..<name.bytes.len] else name)
+
+        if m != "" && !std_module(m) then return out
+
+    var facts = BoxFacts(set(), set(), set())
+
+    gather_box_facts(&facts, p)
+
+    var candidates: Buf[Type] = buf()
+    var keys: Set[string] = set()
+
+    for t in p.structs
+        if compact_candidate(e, &facts, t)
+            candidates.push(t)
+            keys.add(mangle(t))
+
+    for t in p.enums
+        if compact_candidate(e, &facts, t)
+            candidates.push(t)
+            keys.add(mangle(t))
+
+    for t in candidates
+        if !holds_itself_back(t, keys) then out.add(mangle(t))
+
+    out
+end compact_boxes
+
+// Whether a box of `payload` is the strong count alone.
+is_compact(e: *Emit, payload: Type) -> bool = !e.compact.is_empty() && e.compact.has(mangle(payload))
+
+// -- what the program does with its boxes ---------------------------------------------------------------
+
+// The payloads some code reaches without its type, by mangled name: weakened, shared across domains,
+// made into a trait object.
+private struct BoxFacts
+    weakened: Set[string]
+    shared: Set[string]
+    erased: Set[string]
+end BoxFacts
+
+// Every type the program writes down or computes with, looked through for the three uses: each
+// function's signature and body, each module value, the statements of `main`, and every struct and
+// enum laid out -- whose fields carry the uses no expression shows. Every struct and enum a value has
+// is laid out, so it is in the program's lists, and a type is looked into only there.
+private gather_box_facts(f: *BoxFacts, p: TProgram)
+    for t in p.structs
+        note_declared(f, t)
+
+    for t in p.enums
+        note_declared(f, t)
+
+    for vt in p.vtables
+        note_erased(f, vt.for_type)
+
+    for ext in p.externs
+        for t in ext.params
+            note_type(f, t)
+
+        note_type(f, ext.ret_ty)
+
+    val v: &TWalk = TWalk(true, x -> note_expr(f, x), w -> (), s -> note_stmt(f, s))
+
+    for func in p.funcs
+        for param in func.params
+            note_type(f, param.1)
+
+        note_type(f, func.ret_ty)
+        walk_block_stmts(func.body, v)
+
+    for item in p.vals
+        note_type(f, item.ty)
+
+        if item.init.is_some() then walk_texpr(item.init.unwrap(), v)
+
+    walk_stmts(p.main, v)
+end gather_box_facts
+
+private note_expr(f: *BoxFacts, x: TExpr)
+    *x.kind match
+        TErase(operand, _, _) -> note_erased(f, texpr_type(operand))
+        _ -> ()
+
+    note_type(f, texpr_type(x))
+end note_expr
+
+private note_stmt(f: *BoxFacts, s: TStmt) = s match
+    TVarDecl(_, ty, _, _) -> note_type(f, ty)
+    TRefDecl(_, ty, _) -> note_type(f, ty)
+    _ -> ()
+
+// A value a trait object was made from: the payload of the box, where it is one, and the type itself.
+private note_erased(f: *BoxFacts, t: Type)
+    f.erased.add(mangle(t))
+
+    underlying(t) match
+        Ref(inner, _) -> f.erased.add(mangle(*inner))
+        _ -> ()
+end note_erased
+
+// The weak and shared references a type is, or holds anywhere inside it.
+private note_type(f: *BoxFacts, t: Type) -> unit = t match
+    Ref(inner, sync) ->
+        if sync then f.shared.add(mangle(*inner))
+
+        note_type(f, *inner)
+    Weak(inner) ->
+        f.weakened.add(mangle(*inner))
+        note_type(f, *inner)
+    Ptr(inner) -> note_type(f, *inner)
+    Volatile(inner) -> note_type(f, *inner)
+    Array(_, elem) -> note_type(f, *elem)
+    Vector(_, elem) -> note_type(f, *elem)
+    Slice(elem, _) -> note_type(f, *elem)
+    Pack(elems) -> note_types(f, elems)
+    Trait(_, args, assocs) ->
+        note_types(f, args)
+
+        for item in assocs
+            note_type(f, item.1)
+    CFn(params, ret, _) ->
+        note_types(f, params)
+        note_type(f, *ret)
+    Constrained(d) -> note_type(f, d.base)
+    Results(parts) -> note_declared(f, Struct(parts))
+    _ -> ()
+
+// What a struct or enum holds: its type arguments and its fields. A field of a struct or enum type is
+// that type's own entry in the program's lists, so this goes no deeper than one level.
+private note_declared(f: *BoxFacts, t: Type) = t match
+    Struct(d) ->
+        note_types(f, d.targs)
+
+        for item in d.fields
+            note_type(f, item.1)
+    Enum(d) ->
+        note_types(f, d.targs)
+
+        for variant in d.variants
+            for item in variant.fields
+                note_type(f, item.1)
+    _ -> ()
+
+private note_types(f: *BoxFacts, ts: Buf[Type])
+    for t in ts
+        note_type(f, t)
+end note_types
+
+// -- what a payload is ----------------------------------------------------------------------------------
+
+private compact_candidate(e: *Emit, f: *BoxFacts, t: Type) -> bool
+    val declared = underlying(t) match
+        Struct(d) -> if d.union_layout || d.opaque then "" else d.base
+        Enum(d) -> d.base
+        _ -> ""
+
+    if declared == "" || declared.starts_with("$") || std_module(module_of(declared)) then return false
+
+    val key = mangle(t)
+
+    if f.weakened.has(key) || f.shared.has(key) || f.erased.has(key) then return false
+    if e.layout.beyond_heap(t) then return false
+
+    var seen: Set[string] = set()
+
+    !tears_down(e, t, &seen) && !holds_array(t)
+end compact_candidate
+
+// Whether letting go of a value of `t` can run code: a destructor of its own or of anything its
+// teardown reaches, or a trait object or task, whose teardown is not in sight.
+private tears_down(e: *Emit, t: Type, seen: *Set[string]) -> bool = underlying(t) match
+    Ref(inner, _) -> is_trait(*inner) || tears_down(e, *inner, seen)
+    Weak(_) -> false
+    Array(_, elem) -> tears_down(e, *elem, seen)
+    Slice(elem, _) -> tears_down(e, *elem, seen)
+    Pack(elems) ->
+        for item in elems
+            if tears_down(e, item, seen) then return true
+
+        false
+    Results(parts) -> tears_down(e, Struct(parts), seen)
+    Struct(d) ->
+        if d.base == TaskBase || destructor_of(e, t).is_some() then return true
+        if !seen.add(mangle(t)) then return false
+
+        for item in d.fields
+            if tears_down(e, item.1, seen) then return true
+
+        false
+    Enum(d) ->
+        if destructor_of(e, t).is_some() then return true
+        if !seen.add(mangle(t)) then return false
+
+        for variant in d.variants
+            for item in variant.fields
+                if tears_down(e, item.1, seen) then return true
+
+        false
+    Trait(_, _, _) -> true
+    _ -> false
+
+// Whether a value of `t` holds a fixed array in its own storage, at any depth a field or a variant
+// reaches without going through a reference.
+private holds_array(t: Type) -> bool = underlying(t) match
+    Array(_, _) -> true
+    Pack(elems) ->
+        for item in elems
+            if holds_array(item) then return true
+
+        false
+    Results(parts) -> holds_array(Struct(parts))
+    Struct(d) ->
+        for item in d.fields
+            if holds_array(item.1) then return true
+
+        false
+    Enum(d) ->
+        for variant in d.variants
+            for item in variant.fields
+                if holds_array(item.1) then return true
+
+        false
+    _ -> false
+
+// Whether `t` reaches itself through another candidate it holds in place: a reference to a second
+// candidate, held in a field or a variant, whose own references in place lead back to `t`.
+private holds_itself_back(t: Type, keys: Set[string]) -> bool
+    val me = mangle(t)
+    var seen: Set[string] = set()
+    var todo: Buf[Type] = buf()
+
+    for item in held_in_place(t)
+        if mangle(item) != me && keys.has(mangle(item)) then todo.push(item)
+
+    while !todo.is_empty()
+        val next = todo.pop().unwrap()
+
+        if !seen.add(mangle(next)) then continue
+
+        for item in held_in_place(next)
+            val k = mangle(item)
+
+            if k == me then return true
+            if keys.has(k) then todo.push(item)
+    end while
+
+    false
+end holds_itself_back
+
+// The payloads of the references a value of `t` holds in its own storage.
+private held_in_place(t: Type) -> Buf[Type]
+    var out: Buf[Type] = buf()
+
+    refs_in_place(t, &out)
+    out
+end held_in_place
+
+private refs_in_place(t: Type, out: *Buf[Type]) -> unit = underlying(t) match
+    Ref(inner, _) -> if !is_trait(*inner) then out.push(*inner)
+    Pack(elems) ->
+        for item in elems
+            refs_in_place(item, out)
+    Results(parts) -> refs_in_place(Struct(parts), out)
+    Struct(d) ->
+        if d.base == TaskBase then return
+
+        for item in d.fields
+            refs_in_place(item.1, out)
+    Enum(d) ->
+        for variant in d.variants
+            for item in variant.fields
+                refs_in_place(item.1, out)
+    _ -> ()

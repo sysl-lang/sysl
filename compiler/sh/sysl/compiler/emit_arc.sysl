@@ -17,12 +17,16 @@ import sysl.math.bigint.from_int
 // its elements one further on.
 header_fields() -> int = 3
 
+// The header words of a box of `payload`: the three, or the strong count alone where no code reaches
+// the box without its type (`compact_box.sysl`).
+box_header_fields(e: *Emit, payload: Type) -> int = if is_compact(e, payload) then 1 else header_fields()
+
 // The bytes laid between a box's header and its payload, so the payload begins on its type's
 // boundary: none where LLVM's own reading of the type already puts it there. A raised `@align(n)` is
 // a boundary LLVM's type does not carry, and one beyond what the allocating pair promises is one the
 // block is aligned to only through the aligned hook -- either way the payload's offset from the
 // block's start has to be a multiple of it, said here as a run of bytes.
-box_pad(e: *Emit, payload: Type) -> usize = header_pad(e, payload, usize(header_fields()))
+box_pad(e: *Emit, payload: Type) -> usize = header_pad(e, payload, usize(box_header_fields(e, payload)))
 
 // The same for a buffer, whose header is one word longer -- the element count.
 buf_pad(e: *Emit, elem: Type) -> usize = header_pad(e, elem, usize(header_fields() + 1))
@@ -38,7 +42,7 @@ end header_pad
 // The field of a box's LLVM type its payload is: after the header, and after the padding where
 // there is any.
 box_payload_field(e: *Emit, payload: Type) -> int =
-    if box_pad(e, payload) > 0 then header_fields() + 1 else header_fields()
+    if box_pad(e, payload) > 0 then box_header_fields(e, payload) + 1 else box_header_fields(e, payload)
 
 // The field of a buffer's LLVM type its elements begin at.
 buf_elems_field(e: *Emit, elem: Type) -> int =
@@ -63,7 +67,11 @@ private arc_value(e: *Emit, ty: Type, v: Val, retain: bool) = ty match
 
         val subject = if is_trait(*inner) then erased_box(e, v) else v
 
-        if e.draining && !retain && !sync
+        // **A compact box is let go of through its own type's release**, wherever that happens: it
+        // has no hook for the drain to call, so it is never queued on the drain's slot.
+        if !retain && !sync && is_compact(e, *inner)
+            release_compact(e, *inner, subject)
+        else if e.draining && !retain && !sync
             push_ref(e, *inner, subject)
         else
             arc_call(e, s"arc.${if retain then "retain" else "release"}${if sync then "_sync" else ""}",
@@ -101,10 +109,11 @@ private arc_value(e: *Emit, ty: Type, v: Val, retain: bool) = ty match
 //
 // **Inside a drain the walk of a small value is written in place**, so the references in it are
 // queued on the drain's slot as the hook's own are: the shared helper is reached from releases
-// outside any drain too, and has no slot to queue on.
+// outside any drain too, and has no slot to queue on. A compact box's release has a list of its own
+// (`self_drain`) and writes it in place for the same reason.
 private aggregate_arc(e: *Emit, ty: Type, v: Val, retain: bool)
     if contains_counted(ty)
-        if e.draining && !retain && !e.layout.indirect(ty)
+        if (e.draining || e.self_drain.is_some()) && !retain && !e.layout.indirect(ty)
             walk_value(e, ty, v, false)
             return
 
@@ -208,6 +217,13 @@ release_at(e: *Emit, ty: Type, p: Val) = walk_at(e, ty, p, false)
 
 private walk_at(e: *Emit, ty: Type, p: Val, retain: bool)
     if !contains_counted(ty) then return
+
+    // The release of a compact box walks a large field in place too, so a reference of its own type
+    // inside one is queued on its list rather than released through a helper that would start a list
+    // of its own -- one stack frame per level of the structure.
+    if e.self_drain.is_some() && !retain && e.layout.indirect(ty)
+        walk_slot(e, ty, p, false)
+        return
 
     if e.layout.indirect(ty)
         val name = slot_helper(e, ty, retain)
@@ -476,6 +492,208 @@ private gen_push(e: *Emit, payload: Type)
     emit_label(e, live)
     emit_term(e, InRet(None, None))
 end gen_push
+
+// -- compact boxes ---------------------------------------------------------------------------------
+
+// How a reference to a compact box (`compact_box.sysl`) is let go of: queued on the list of the
+// release being written where it is a box of that release's own payload, and through its payload's
+// release everywhere else -- a hook's walk included, since there is no hook for the drain to call.
+private release_compact(e: *Emit, payload: Type, p: Val)
+    val m = mangle(payload)
+    val own = e.self_drain.is_some() && e.self_drain.unwrap().0 == m
+
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(LPtr, p))
+
+    if own
+        args.push(ir_arg(LPtr, e.self_drain.unwrap().1))
+        emit(e, ir_call(None, LVoid, VGlobal(request_helper(e, s"arc.cpush.$m", HrCompactPush(payload))), args))
+    else
+        emit(e, ir_call(None, LVoid, VGlobal(request_helper(e, s"arc.release.$m", HrCompactRelease(payload))),
+                        args))
+end release_compact
+
+// The body of `arc.release.<T>` for a compact `T`: a count given back, and at zero the teardown the
+// drain would have made, found by the type rather than through a hook.
+//
+// **It is the drain over a list of its own.** The box reaching zero is the list's first entry, linked
+// through its dead count word as the drain links what it holds. Each one taken off is walked -- a
+// reference of the same payload queued on the list (`gen_compact_push`), anything else let go of as
+// any code lets go of it -- then freed, and what the walk queued is turned round before the next is
+// taken, so the order is the drain's: fields in declaration order, each torn down whole before the
+// next. Any depth comes apart in constant stack. The list lives in this frame, so the release asks no
+// thread for anything.
+//
+// Nothing a compact payload holds runs a destructor (`compact_box.sysl`), so the walk's own releases
+// -- a string, a box with a hook, which may start or join the reaper's drain -- run no program code
+// between the walk and the free.
+private gen_compact_release(e: *Emit, payload: Type)
+    val word = word_lty(e)
+    val bn = box_lty(e, payload)
+    val list = alloca(e, fresh_reg(e), LPtr)
+    val prev_at = alloca(e, fresh_reg(e), LPtr)
+    val cur_at = alloca(e, fresh_reg(e), LPtr)
+    val count = fresh_label(e, "arc.count")
+    val zero = fresh_label(e, "arc.zero")
+    val take = fresh_label(e, "arc.take")
+    val step = fresh_label(e, "arc.step")
+    val turn = fresh_label(e, "arc.turn")
+    val turned = fresh_label(e, "arc.turned")
+    val spliced = fresh_label(e, "arc.spliced")
+    val live = fresh_label(e, "arc.live")
+    val p = VReg("p")
+
+    val absent = fresh_reg(e)
+
+    emit(e, InIntCmp(absent, IEq, LPtr, p, VNull))
+    emit_term(e, InCondBr(absent, live, count))
+    emit_label(e, count)
+
+    val c = fresh_reg(e)
+    val n = fresh_reg(e)
+    val z = fresh_reg(e)
+
+    emit(e, InLoad(c, word, p, AccPlain, None))
+    emit(e, InBin(n, OpSub, word, c, VInt(from_int(1))))
+    emit(e, InStore(word, n, p, AccPlain, None))
+    emit(e, InIntCmp(z, IEq, word, n, VInt(from_int(0))))
+    emit_term(e, InCondBr(z, zero, live))
+    emit_label(e, zero)
+    emit(e, InStore(LPtr, VNull, p, AccPlain, None))
+    emit(e, InStore(LPtr, p, list, AccPlain, None))
+    emit_term(e, InBr(take))
+    emit_label(e, take)
+
+    val q = fresh_reg(e)
+    val done = fresh_reg(e)
+
+    emit(e, InLoad(q, LPtr, list, AccPlain, None))
+    emit(e, InIntCmp(done, IEq, LPtr, q, VNull))
+    emit_term(e, InCondBr(done, live, step))
+    emit_label(e, step)
+
+    val next = fresh_reg(e)
+
+    emit(e, InLoad(next, LPtr, q, AccPlain, None))
+    emit(e, InStore(LPtr, next, list, AccPlain, None))
+
+    val pa = fresh_reg(e)
+
+    var idx: Buf[IrArg] = buf()
+
+    idx.push(ir_arg(l_i32(), VInt(from_int(0))))
+    idx.push(ir_arg(l_i32(), VInt(from_int(long(box_payload_field(e, payload))))))
+    emit(e, InGep(pa, bn, q, idx))
+
+    e.self_drain = Some((mangle(payload), list))
+    walk_slot(e, payload, pa, false)
+    e.self_drain = None
+    free_at(e, payload, q)
+
+    // The run the walk pushed sits between the list's head and `next`, last first.
+    val h0 = fresh_reg(e)
+
+    emit(e, InLoad(h0, LPtr, list, AccPlain, None))
+    emit(e, InStore(LPtr, next, prev_at, AccPlain, None))
+    emit(e, InStore(LPtr, h0, cur_at, AccPlain, None))
+    emit_term(e, InBr(turn))
+    emit_label(e, turn)
+
+    val cur = fresh_reg(e)
+    val ended = fresh_reg(e)
+
+    emit(e, InLoad(cur, LPtr, cur_at, AccPlain, None))
+    emit(e, InIntCmp(ended, IEq, LPtr, cur, next))
+    emit_term(e, InCondBr(ended, spliced, turned))
+    emit_label(e, turned)
+
+    val after = fresh_reg(e)
+    val prev = fresh_reg(e)
+
+    emit(e, InLoad(after, LPtr, cur, AccPlain, None))
+    emit(e, InLoad(prev, LPtr, prev_at, AccPlain, None))
+    emit(e, InStore(LPtr, prev, cur, AccPlain, None))
+    emit(e, InStore(LPtr, cur, prev_at, AccPlain, None))
+    emit(e, InStore(LPtr, after, cur_at, AccPlain, None))
+    emit_term(e, InBr(turn))
+    emit_label(e, spliced)
+
+    val first = fresh_reg(e)
+
+    emit(e, InLoad(first, LPtr, prev_at, AccPlain, None))
+    emit(e, InStore(LPtr, first, list, AccPlain, None))
+    emit_term(e, InBr(take))
+    emit_label(e, live)
+    emit_term(e, InRet(None, None))
+end gen_compact_release
+
+// The body of `arc.cpush.<T>`: a reference of a compact release's own payload let go of by its walk.
+// At zero a box with nothing in it left to tear down -- no count at all, or an enum variant that holds
+// none -- is freed on the spot; anything else is queued on the release's list.
+private gen_compact_push(e: *Emit, payload: Type)
+    val tags = empties(e, payload)
+    val bn = box_lty(e, payload)
+    val word = word_lty(e)
+    val count = fresh_label(e, "arc.count")
+    val zero = fresh_label(e, "arc.zero")
+    val give = fresh_label(e, "arc.give")
+    val queue = fresh_label(e, "arc.queue")
+    val live = fresh_label(e, "arc.live")
+    val p = VReg("p")
+
+    val absent = fresh_reg(e)
+
+    emit(e, InIntCmp(absent, IEq, LPtr, p, VNull))
+    emit_term(e, InCondBr(absent, live, count))
+    emit_label(e, count)
+
+    val c = fresh_reg(e)
+    val n = fresh_reg(e)
+    val z = fresh_reg(e)
+
+    emit(e, InLoad(c, word, p, AccPlain, None))
+    emit(e, InBin(n, OpSub, word, c, VInt(from_int(1))))
+    emit(e, InStore(word, n, p, AccPlain, None))
+    emit(e, InIntCmp(z, IEq, word, n, VInt(from_int(0))))
+    emit_term(e, InCondBr(z, zero, live))
+    emit_label(e, zero)
+
+    tags match
+        None -> emit_term(e, InBr(queue))
+        Some(listed) ->
+            if listed.is_empty()
+                emit_term(e, InBr(give))
+            else
+                val tag = fresh_reg(e)
+                var empty = VInt(from_int(0))
+
+                emit(e, InLoad(tag, l_i32(), header_word(e, bn, box_payload_field(e, payload)), AccPlain, None))
+
+                for t in listed
+                    val is = fresh_reg(e)
+                    val either = fresh_reg(e)
+
+                    emit(e, InIntCmp(is, IEq, l_i32(), tag, t))
+                    emit(e, InBin(either, OpOr, l_i1(), empty, is))
+                    empty = either
+
+                emit_term(e, InCondBr(empty, give, queue))
+
+    emit_label(e, give)
+    free_at(e, payload, p)
+    emit_term(e, InRet(None, None))
+    emit_label(e, queue)
+
+    val head = fresh_reg(e)
+
+    emit(e, InLoad(head, LPtr, VReg("slot"), AccPlain, None))
+    emit(e, InStore(LPtr, head, p, AccPlain, None))
+    emit(e, InStore(LPtr, p, VReg("slot"), AccPlain, None))
+    emit_term(e, InRet(None, None))
+    emit_label(e, live)
+    emit_term(e, InRet(None, None))
+end gen_compact_push
 
 // The address of field `i` of the box `bn` at `%p`.
 private header_word(e: *Emit, bn: LType, i: int) -> Val
@@ -772,6 +990,8 @@ gen_helper(e: *Emit, what: HelperReq, name: string) -> Option[IrFunc]
         HrPlainDrop -> helper_sig(name, hook_params())
         HrFrameDrop(_) -> helper_sig(name, hook_params())
         HrPush(_) -> helper_sig(name, push_params())
+        HrCompactRelease(_) -> helper_sig(name, one_param("p", LPtr))
+        HrCompactPush(_) -> helper_sig(name, push_params())
         HrTaskDrop(_) -> helper_sig(name, hook_params())
         HrSlotBuf(_) -> bound_sig(helper_sig(name, hook_params()) with { linkage = LinkWeakOdr }, binds_locally(e))
         HrSlotPlace(elem) -> helper_sig(name, slot_place_params(e, elem)) with { bare = rarely() }
@@ -797,6 +1017,8 @@ gen_helper(e: *Emit, what: HelperReq, name: string) -> Option[IrFunc]
         HrPlainDrop -> gen_plain_hook(e)
         HrFrameDrop(payload) -> gen_drop_hook(e, payload, false)
         HrPush(payload) -> gen_push(e, payload)
+        HrCompactRelease(payload) -> gen_compact_release(e, payload)
+        HrCompactPush(payload) -> gen_compact_push(e, payload)
         HrTaskDrop(result) -> gen_task_hook(e, result)
         HrSlotBuf(elem) -> gen_drop_buf_hook(e, elem)
         HrSlotPlace(elem) -> gen_slot_place_rest(e, elem)
@@ -954,19 +1176,22 @@ private gen_drop_buf_hook(e: *Emit, elem: Type)
     emit_term(e, InRet(None, None))
 end gen_drop_buf_hook
 
-// The one place `free` is **called**. It sits inside a hook, so it reaches a module only where that
-// module builds a box -- which is a module that has already called `malloc`, and therefore has an
-// allocator to give the bytes back to. Storage of a type the aligned pair made goes back through
-// that pair's free (`emit_box.sysl`'s `heap_call`).
-private emit_free(e: *Emit, held: Type)
+// Where `free` is **called**: inside a hook, or a compact box's release (`gen_compact_release`), so it
+// reaches a module only where that module builds a box -- which is a module that has already called
+// `malloc`, and therefore has an allocator to give the bytes back to. Storage of a type the aligned
+// pair made goes back through that pair's free (`emit_box.sysl`'s `heap_call`).
+private emit_free(e: *Emit, held: Type) = free_at(e, held, VReg("p"))
+
+// The same for the storage at `p`.
+private free_at(e: *Emit, held: Type, p: Val)
     var args: Buf[IrArg] = buf()
 
-    args.push(ir_arg(LPtr, VReg("p")))
+    args.push(ir_arg(LPtr, p))
 
     val sym = if e.layout.beyond_heap(held) then aligned_free_symbol() else free_symbol()
 
     emit(e, ir_call(None, LVoid, VGlobal(sym), args))
-end emit_free
+end free_at
 
 // -- elements a buffer holds --------------------------------------------------------------------------
 

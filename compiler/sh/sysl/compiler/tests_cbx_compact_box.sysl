@@ -1,0 +1,747 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// A box no code reaches without its type is the strong count alone (`compact_box.sysl`; the layout in
+// `emit_arc.sysl`'s `box_header_fields`, the release in `gen_compact_release` and `gen_compact_push`).
+//
+// The cells. The text: the binary-trees node is `{ count, payload }`, has no hook, and is freed by its
+// own release, which walks a list of its own and frees an empty leaf on the spot; the allocation is 32
+// bytes at -O2 on a 64-bit machine and 16 on a 32-bit one. Each thing that keeps the full header keeps
+// it: a weak reference made anywhere, a `&sync` anywhere, a trait object made of the type, a destructor
+// on it or anywhere its teardown reaches (through a field, a variant, a `Buf`, a callable), a fixed
+// array in place, and two candidates holding each other; a one-way pair is compact and one calls the
+// other's release. A generic payload is decided per instantiation. A hook's walk calls a compact
+// child's release rather than queueing it. The build modes: a library, a C archive and a program
+// linking a precompiled root keep every header; the standard module's precompiled functions (a blanket
+// implementation's among them) and its C do not. A box laid into the object file carries a count no
+// run gives back. The elision passes pair a plain retain with a compact release. clang takes the text
+// on hosted, 32-bit, freestanding and switching machines. The behaviour at -O2 on a counted heap,
+// where a leak or a second free is a failure: trees; a million-deep chain and tree; a payload holding
+// a string, a `Buf` of its own kind and a box with a hook; a destructor in a hooked parent of compact
+// children; generic payloads; a `Buf` of compact boxes beside a `Frozen` and a `&sync` chain; a
+// laid-down box read from.
+//
+// Cells skipped, with the reason: a box laid in a frame -- only a closure's is, and a closure is a form
+// the compiler makes, never compact; a real `--lib` root and a `build-lib` artifact -- the decision
+// reads `entry_point`, `c_artifact` and `precompiled` alone, and each is set here directly; threads --
+// a compact box cannot cross a domain, since a `&sync` of its type keeps the full header.
+
+private val cbx_tree: string = raw"""
+    enum Tree
+        Leaf
+        Node(left: &Tree, right: &Tree)
+
+    make(depth: int) -> &Tree
+        if depth == 0 then Leaf else Node(make(depth - 1), make(depth - 1))
+
+    check(t: &Tree) -> int
+        *t match
+            Leaf -> 1
+            Node(l, r) -> 1 + check(l) + check(r)
+
+    main()
+        var total = 0
+
+        for _ in 0..<4 do total += check(make(5))
+
+        print(total)
+    """
+
+private var cbx_library_names: Buf[string] = buf()
+private var cbx_library_units: Buf[Buf[Program]] = buf()
+
+private cbx_library(t: Target) -> Buf[Program]
+    for i in 0..<cbx_library_names.len()
+        if cbx_library_names[i] == t.name then return cbx_library_units[i]
+
+    var out: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, t) match
+            Err(_) -> ()
+            Ok(units) -> out = units
+
+    cbx_library_names.push(t.name)
+    cbx_library_units.push(out)
+    out
+end cbx_library
+
+private cbx_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the standard module's source or clang is not on this machine")
+        return false
+
+    true
+end cbx_ready
+
+// How the build is told what it is: a program, a library, a C archive, or one linking precompiled
+// functions of these names.
+private struct CbxMode
+    entry: bool
+    c: bool
+    precompiled: Buf[string]
+end CbxMode
+
+private cbx_program() -> CbxMode = CbxMode(true, false, buf())
+
+// The LLVM text a program lowers to on `machine`, built as `mode` says.
+private cbx_ir_as(text: string, machine: string, mode: CbxMode) -> string
+    val t = target_named(machine).unwrap()
+    var units: Buf[Program] = buf()
+
+    for item in cbx_library(t)
+        units.push(item)
+
+    val parsed = parse(source_of("main.sysl", text), t)
+
+    if !parsed.ok() then assert(false, parsed.first().message)
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, t)
+
+    assert(done.reported.is_empty(), s"refused on $machine")
+
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+
+    assert(errors_of(done.an.diagnostics()).is_empty(), s"refused on $machine")
+
+    val pruned = prune(strip_tests(whole), program_own(units))
+    val kept = pruned with { entry_point = mode.entry, c_artifact = mode.c, precompiled = mode.precompiled }
+
+    ir_print_module(codegen_with_gaps(kept, t, promotions).0)
+end cbx_ir_as
+
+private cbx_ir(text: string) -> string = cbx_ir_as(text, "aarch64-macos", cbx_program())
+
+// The text clang's `-O2` makes of `ir` for `machine`'s triple, which it must take.
+private cbx_clang(ir: string, machine: string) -> string
+    val dir = make_temp_dir("sysl-cbx").unwrap()
+    val file = s"$dir/t.ll"
+
+    write_text(file, ir).unwrap()
+
+    val triple = "--target=" + target_named(machine).unwrap().triple
+    val got = capture("clang", [triple, "-O2", "-S", "-emit-llvm", "-Wno-override-module", file, "-o", "-"],
+                      "", [], true).unwrap()
+
+    remove_dir_all(dir).unwrap_or(())
+    assert(got.status.ok(), s"clang refused the emitted IR for $machine:\n${got.err.unwrap_or("")}")
+    got.text
+end cbx_clang
+
+// The lines of the definition of `@name`, up to its closing brace.
+private cbx_body(text: string, name: string) -> string
+    var body = ""
+    var inside = false
+
+    for l in lines_of(text)
+        if !inside && l.starts_with("define") && l.contains(s"@$name(") then inside = true
+
+        if inside
+            if l == "}" then return body
+
+            body = body + l + "\n"
+        end if
+
+    body
+end cbx_body
+
+private cbx_count(text: string, what: string) -> int
+    var n = 0
+
+    for l in lines_of(text)
+        if l.contains(what) then n += 1
+
+    n
+end cbx_count
+
+// Whether a box of the type named `name` is the count alone in `ir`.
+private cbx_compact(ir: string, name: string) -> bool =
+    ir.contains(s"%arc.$name = type { i64, %") && !ir.contains(s"%arc.$name = type { i64, ptr, i64")
+
+private cbx_full(ir: string, name: string) -> bool = ir.contains(s"%arc.$name = type { i64, ptr, i64, ")
+
+// -- the binary-trees node ---------------------------------------------------------------------------------
+
+@test("the binary-trees node is the count and the payload, and its release needs no hook")
+cbx_tree_is_the_count()
+    if !cbx_ready() then return
+
+    val out = cbx_ir(cbx_tree)
+
+    assert(out.contains("%arc.Tree = type { i64, %enum.Tree }"), out)
+    assert(!out.contains("@arc.drop.Tree"), out)
+    assert(!out.contains("@arc.push.Tree"), out)
+
+    val release = cbx_body(out, "arc.release.Tree")
+
+    assert(release.contains("define private void @arc.release.Tree(ptr %p)"), out)
+    assert_eq(cbx_count(release, "call void @arc.cpush.Tree("), 2, release)
+    assert_eq(cbx_count(release, "call void @free("), 1, release)
+    assert_eq(cbx_count(release, "@arc.reap"), 0, release)
+    assert_eq(cbx_count(release, "@arc.release("), 0, release)
+    assert_eq(cbx_count(release, "threadlocal"), 0, release)
+end cbx_tree_is_the_count
+
+@test("a compact child of the same type frees an empty leaf on the spot and queues a node")
+cbx_push_frees_a_leaf()
+    if !cbx_ready() then return
+
+    val push = cbx_body(cbx_ir(cbx_tree), "arc.cpush.Tree")
+
+    assert(push.contains("define private void @arc.cpush.Tree(ptr %p, ptr %slot)"), push)
+    assert(push.contains("icmp eq i32 %"), push)
+    assert_eq(cbx_count(push, "call void @free(ptr %p)"), 1, push)
+    assert(push.contains("store ptr %p, ptr %slot"), push)
+    // No hook to compare and no weak count to read.
+    assert_eq(cbx_count(push, "@arc.drop"), 0, push)
+    assert_eq(cbx_count(push, "i32 0, i32 2"), 0, push)
+end cbx_push_frees_a_leaf
+
+@test("the node is allocated in 32 bytes at -O2 on a 64-bit machine, and 16 on a 32-bit one")
+cbx_allocation_size()
+    if !cbx_ready() then return
+
+    val o2 = cbx_clang(cbx_ir(cbx_tree), "aarch64-macos")
+
+    assert(o2.contains("@malloc(i64 noundef 32)") || o2.contains("@malloc(i64 32)"), o2)
+    assert(!o2.contains("@malloc(i64 noundef 48)") && !o2.contains("@malloc(i64 48)"), o2)
+
+    val small = cbx_ir_as(cbx_tree, "wasm32-wasi", cbx_program())
+
+    assert(small.contains("%arc.Tree = type { i32, %enum.Tree }"), small)
+end cbx_allocation_size
+
+// -- what keeps the full header ------------------------------------------------------------------------------
+
+private val cbx_kinds: string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    trait Area
+        area(self) -> int
+
+    struct Plain
+        n: int
+
+    struct Weakened
+        n: int
+
+    struct Shared
+        n: int
+
+    struct Erased
+        n: int
+
+    impl Area for Erased
+        area(self) -> int = self.n
+
+    struct Bound
+        n: int
+
+    impl Area for Bound
+        area(self) -> int = self.n
+
+    struct Res
+        name: string
+
+    impl Drop for Res
+        drop(self) = print("drop " + self.name)
+
+    struct HoldsRes
+        r: &Res
+
+    enum InVariant
+        Empty
+        Has(r: &Res)
+
+    struct InBuf
+        rs: Buf[&Res]
+
+    struct Calls
+        f: &Fn() -> int
+
+    struct Fixed
+        a: [4]int
+
+    struct Named
+        name: string
+        next: Option[&Named]
+
+    struct Ping
+        pong: Option[&Pong]
+
+    struct Pong
+        ping: Option[&Ping]
+
+    struct Up
+        down: &Down
+
+    struct Down
+        n: int
+
+    struct Cell[T]
+        v: T
+        next: Option[&Cell[T]]
+
+    main()
+        val p: &Plain = Plain(1)
+        val w: &Weakened = Weakened(2)
+        val ww: weak Weakened = w
+        val s: &sync Shared = Shared(3)
+        val e: &Area = Erased(4)
+        val b: &Bound = Bound(5)
+        val h: &HoldsRes = HoldsRes(Res("h"))
+        val v: &InVariant = Has(Res("v"))
+        var rs: Buf[&Res] = buf()
+        val ib: &InBuf = InBuf(rs)
+        val c: &Calls = Calls(() -> 6)
+        val f: &Fixed = Fixed([1, 2, 3, 4])
+        val n: &Named = Named("a", Some(Named("b", None)))
+        val pi: &Ping = Ping(Some(Pong(None)))
+        val u: &Up = Up(Down(7))
+        val ci: &Cell[int] = Cell(8, None)
+        val cr: &Cell[&Res] = Cell(Res("c"), None)
+
+        print(p.n, s.n, e.area(), b.area(), c.f(), f.a[0], n.name, u.down.n, ci.v, cr.v.name)
+        print(if ww.get() == None then 0 else 1)
+    """
+
+@test("a plain payload, one bound by a trait but never an object, and a string holder are compact")
+cbx_plain_kinds_are_compact()
+    if !cbx_ready() then return
+
+    val out = cbx_ir(cbx_kinds)
+
+    assert(cbx_compact(out, "Plain"), out)
+    assert(cbx_compact(out, "Bound"), out)
+    assert(cbx_compact(out, "Named"), out)
+    assert(cbx_compact(out, "Down"), out)
+end cbx_plain_kinds_are_compact
+
+@test("a weak reference, a &sync, and a trait object made of a type keep its full header")
+cbx_untyped_releases_keep_the_header()
+    if !cbx_ready() then return
+
+    val out = cbx_ir(cbx_kinds)
+
+    assert(cbx_full(out, "Weakened"), out)
+    assert(cbx_full(out, "Shared"), out)
+    assert(cbx_full(out, "Erased"), out)
+end cbx_untyped_releases_keep_the_header
+
+@test("a destructor on the type, or reached through a field, a variant, a Buf or a callable, keeps it")
+cbx_teardown_keeps_the_header()
+    if !cbx_ready() then return
+
+    val out = cbx_ir(cbx_kinds)
+
+    assert(cbx_full(out, "Res"), out)
+    assert(cbx_full(out, "HoldsRes"), out)
+    assert(cbx_full(out, "InVariant"), out)
+    assert(cbx_full(out, "InBuf"), out)
+    assert(cbx_full(out, "Calls"), out)
+end cbx_teardown_keeps_the_header
+
+@test("a fixed array in place, which a view could own, keeps the full header")
+cbx_array_keeps_the_header()
+    if !cbx_ready() then return
+
+    assert(cbx_full(cbx_ir(cbx_kinds), "Fixed"), "Fixed")
+end cbx_array_keeps_the_header
+
+@test("two payloads holding each other keep the header; a one-way pair is compact and calls down")
+cbx_cycles_and_chains()
+    if !cbx_ready() then return
+
+    val out = cbx_ir(cbx_kinds)
+
+    assert(cbx_full(out, "Ping"), out)
+    assert(cbx_full(out, "Pong"), out)
+    assert(cbx_compact(out, "Up"), out)
+
+    val up = cbx_body(out, "arc.release.Up")
+
+    assert_eq(cbx_count(up, "call void @arc.release.Down("), 1, up)
+    assert_eq(cbx_count(up, "@arc.cpush"), 0, up)
+end cbx_cycles_and_chains
+
+@test("a generic payload is decided per instantiation")
+cbx_generic_per_instantiation()
+    if !cbx_ready() then return
+
+    val out = cbx_ir(cbx_kinds)
+
+    assert(out.contains("%arc.Cell.int = type { i64, %"), out)
+    assert(out.contains("%arc.Cell.ref.Res = type { i64, ptr, i64, "), out)
+end cbx_generic_per_instantiation
+
+@test("a hook's walk calls a compact child's release rather than queueing it on the drain")
+cbx_hooked_parent_calls_the_release()
+    if !cbx_ready() then return
+
+    val out = cbx_ir(raw"""
+        struct Child
+            n: int
+            next: Option[&Child]
+
+        struct Parent
+            child: &Child
+            name: string
+
+        main()
+            val p: &Parent = Parent(Child(1, Some(Child(2, None))), "p")
+            val w: weak Parent = p
+
+            print(p.child.n, if w.get() == None then 0 else 1)
+        """)
+
+    assert(cbx_full(out, "Parent"), out)
+    assert(cbx_compact(out, "Child"), out)
+
+    val hook = cbx_body(out, "arc.drop.Parent")
+
+    assert_eq(cbx_count(hook, "call void @arc.release.Child("), 1, hook)
+    assert_eq(cbx_count(hook, "@arc.push"), 0, hook)
+end cbx_hooked_parent_calls_the_release
+
+// -- the build modes ----------------------------------------------------------------------------------------
+
+@test("a library, a C archive and a program linking a precompiled root keep every header")
+cbx_modes_without_the_whole_program()
+    if !cbx_ready() then return
+
+    assert(cbx_full(cbx_ir_as(cbx_tree, "aarch64-macos", CbxMode(false, false, buf())), "Tree"), "library")
+    assert(cbx_full(cbx_ir_as(cbx_tree, "aarch64-macos", CbxMode(true, true, buf())), "Tree"), "C archive")
+
+    var root: Buf[string] = buf()
+
+    root.push("sysl$print")
+    root.push("geometry$area")
+
+    assert(cbx_full(cbx_ir_as(cbx_tree, "aarch64-macos", CbxMode(true, false, root)), "Tree"), "root")
+end cbx_modes_without_the_whole_program
+
+@test("the standard module's precompiled functions, a blanket one's and its C's, leave the program whole")
+cbx_standard_module_is_not_a_root()
+    if !cbx_ready() then return
+
+    var std: Buf[string] = buf()
+
+    std.push("sysl.text$parse_int")
+    std.push("bound.sysl$Integer.debug.long")
+    std.push("sysl_stdout_write")
+
+    assert(cbx_compact(cbx_ir_as(cbx_tree, "aarch64-macos", CbxMode(true, false, std)), "Tree"), "std")
+end cbx_standard_module_is_not_a_root
+
+@test("a compact box laid into the object file carries a count no run gives back")
+cbx_laid_down_box()
+    if !cbx_ready() then return
+
+    val out = cbx_ir(raw"""
+        struct Link
+            n: int
+            next: Option[&Link]
+
+        val chain: &Link = Link(1, Some(Link(2, None)))
+
+        main()
+            print(chain.n)
+        """)
+
+    assert(cbx_compact(out, "Link"), out)
+    assert(out.contains("%arc.Link { i64 4611686018427387904, "), out)
+    assert(!out.contains("%arc.Link { i64 1, "), out)
+end cbx_laid_down_box
+
+@test("the elision passes pair a plain retain with a compact box's release")
+cbx_elision_pairs()
+    assert(is_release("arc.release.Tree"))
+    assert(releases_as("arc.release", "arc.release.Tree"))
+    assert(releases_as("arc.release", "arc.release"))
+    assert(!releases_as("arc.release_sync", "arc.release.Tree"))
+    assert(!releases_as("arc.release_maybe", "arc.release.Tree"))
+    assert(!releases_as("arc.dispose.Tree", "arc.release.Tree"))
+end cbx_elision_pairs
+
+@test("clang takes the text on hosted, 32-bit, freestanding and switching machines")
+cbx_clang_takes_every_machine()
+    if !cbx_ready() then return
+
+    for machine in ["aarch64-macos", "x86_64-linux", "x86_64-windows", "wasm32-wasi", "aarch64-freestanding"]
+        val out = cbx_ir_as(cbx_kinds, machine, cbx_program())
+
+        assert(out.contains("define private void @arc.release.Plain(ptr %p)"), s"$machine:\n$out")
+        cbx_clang(out, machine)
+
+    val switching = cbx_ir(raw"""
+        import sysl.fiber.{Context, Stack, switch}
+
+        enum Tree
+            Leaf
+            Node(left: &Tree, right: &Tree)
+
+        struct Hop
+            back: Context
+            me: Context
+
+        hop(h: *Hop)
+            loop
+                switch(&h.me, &h.back)
+
+        main()
+            val s = Stack.reserve(64 * 1024).unwrap()
+            val h: &Hop = Hop(Context.new(), Context.new())
+            val t: &Tree = Node(Leaf, Leaf)
+
+            h.me = Context.start(s, &hop, &*h)
+            switch(&h.back, &h.me)
+            print("back")
+        """)
+
+    assert(cbx_compact(switching, "Tree"), switching)
+    cbx_clang(switching, "aarch64-macos")
+end cbx_clang_takes_every_machine
+
+// -- the behaviour at -O2 ---------------------------------------------------------------------------------
+
+private struct CbxRun
+    out: string
+    err: string
+    code: int
+end CbxRun
+
+// What a program prints at `-O2` on a counted heap: its output, its standard error (where a leak is
+// reported) and its status.
+private cbx_run(program: string) -> CbxRun
+    val root = make_temp_dir("sysl-cbx-run").unwrap()
+
+    write_text(s"$root/main.sysl", program).unwrap()
+
+    val exe = s"$root/built"
+
+    force_alloc_counting(true)
+
+    val made = build_native_program(s"$root/main.sysl", None, None, "2", Some(exe))
+
+    force_alloc_counting(false)
+
+    made match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return CbxRun(failure_text(why), "", -1)
+        Ok(_) -> ()
+
+    val ran = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    ran match
+        Err(_) -> CbxRun("the program that was built could not be run", "", -1)
+        Ok(o) -> CbxRun(o.text, o.err.unwrap_or(""), shell_status(o.status))
+end cbx_run
+
+private cbx_prints(program: string, want: string)
+    if !cbx_ready() then return
+
+    val got = cbx_run(program)
+
+    assert_eq(got.out, want)
+    assert_eq(got.err, "")
+    assert_eq(got.code, 0)
+end cbx_prints
+
+@test("at -O2 compact trees come apart with nothing left over")
+cbx_trees_at_o2()
+    cbx_prints(cbx_tree, "252\n")
+
+@test("at -O2 a compact chain and tree a million deep come apart without a stack overflow")
+cbx_deep_at_o2()
+    cbx_prints(raw"""
+        enum Tree
+            Leaf
+            Node(left: &Tree, right: &Tree)
+
+        struct Link
+            n: int
+            next: Option[&Link]
+
+        run()
+            var head: Option[&Link] = None
+            var t: &Tree = Leaf
+            var r: &Tree = Leaf
+
+            for i in 0..<1000000
+                head = Some(Link(i, head))
+                t = Node(t, Leaf)
+                r = Node(Leaf, r)
+
+            print("built")
+
+        run()
+        print("done")
+        """, "built\ndone\n")
+
+@test("at -O2 a compact payload holding a string, a Buf of its kind and a hooked box comes apart")
+cbx_mixed_holders_at_o2()
+    cbx_prints(raw"""
+        import sysl.buf.{Buf, buf}
+
+        struct Leafy
+            n: int
+
+        struct Node
+            name: string
+            kids: Buf[&Node]
+            next: Option[&Node]
+            leafy: &Leafy
+
+        make(depth: int) -> &Node
+            var kids: Buf[&Node] = buf()
+
+            if depth > 0
+                kids.push(make(depth - 1))
+                kids.push(make(depth - 1))
+
+            Node(s"n$depth", kids, if depth > 1 then Some(make(depth - 2)) else None, Leafy(depth))
+
+        count(n: &Node) -> int
+            var total = 1
+
+            for k in n.kids do total += count(k)
+
+            n.next match
+                Some(m) -> total + count(m)
+                None -> total
+
+        weakened() -> weak Leafy
+            val l: &Leafy = Leafy(0)
+
+            l
+
+        main()
+            val w = weakened()
+            var total = 0
+
+            for _ in 0..<20 do total += count(make(6))
+
+            print(total, if w.get() == None then "gone" else "alive")
+        """, "5760 gone\n")
+
+@test("at -O2 a hooked parent's destructor runs and its compact children are freed")
+cbx_destructor_parent_at_o2()
+    cbx_prints(raw"""
+        struct Link
+            n: int
+            next: Option[&Link]
+
+        struct Owner
+            name: string
+            chain: &Link
+
+        impl Drop for Owner
+            drop(self) = print("drop", self.name, self.chain.n)
+
+        run()
+            val a: &Owner = Owner("a", Link(1, Some(Link(2, None))))
+            val b: &Owner = Owner("b", Link(3, None))
+
+            print("made")
+
+        run()
+        print("done")
+        """, "made\ndrop b 3\ndrop a 1\ndone\n")
+
+@test("at -O2 generic compact payloads come apart at every instantiation")
+cbx_generic_at_o2()
+    cbx_prints(raw"""
+        struct Cell[T]
+            v: T
+            next: Option[&Cell[T]]
+
+        chain[T](v: T, n: int) -> &Cell[T]
+            var head: &Cell[T] = Cell(v, None)
+
+            for _ in 0..<n do head = Cell(v, Some(head))
+
+            head
+
+        length[T](c: &Cell[T]) -> int
+            var n = 1
+            var at = c.next
+
+            loop
+                at match
+                    Some(x) ->
+                        n += 1
+                        at = x.next
+                    None -> return n
+
+        main()
+            print(length(chain(1, 1000)), length(chain("s" + "t", 1000)), length(chain(2.5, 10)))
+        """, "1001 1001 11\n")
+
+@test("at -O2 a Buf of compact boxes, a Frozen and a &sync chain beside them come apart")
+cbx_frozen_and_sync_at_o2()
+    cbx_prints(raw"""
+        import sysl.buf.{Buf, Frozen, buf}
+
+        struct Point
+            x: int
+            y: int
+
+        struct Shared
+            n: int
+            next: Option[&sync Shared]
+
+        run() -> int
+            var pts: Buf[&Point] = buf()
+            var ns: Buf[int] = buf()
+            var chain: Option[&sync Shared] = None
+            var total = 0
+
+            for i in 0..<100
+                pts.push(Point(i, i))
+                ns.push(i)
+                chain = Some(Shared(i, chain))
+                total += pts[i].x
+
+            val frozen = ns.freeze()
+
+            total + int(frozen.len())
+
+        print(run())
+        """, "5050\n")
+
+@test("at -O2 a laid-down compact box is read and never freed")
+cbx_laid_down_at_o2()
+    cbx_prints(raw"""
+        struct Link
+            n: int
+            next: Option[&Link]
+
+        val chain: &Link = Link(1, Some(Link(2, None)))
+
+        sum(l: &Link) -> int
+            l.next match
+                Some(m) -> l.n + sum(m)
+                None -> l.n
+
+        main()
+            var total = 0
+
+            for _ in 0..<1000
+                val c = chain
+                total += sum(c)
+
+            print(total)
+        """, "3000\n")

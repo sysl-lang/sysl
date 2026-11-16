@@ -61,6 +61,9 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
     e.framed_closures = pr.framed_closures
     note_type_shapes(e, p)
 
+    // Which boxes carry the strong count alone, which every box's layout below is read from.
+    e.compact = compact_boxes(e, p)
+
     for v in p.vals
         if v.per_cpu then e.per_cpu.add(v.symbol)
         if v.main_thread then e.main_thread.add(v.symbol)
@@ -462,6 +465,9 @@ end has_computed_val
 // very fields through that type, so a disagreement is not a type error anywhere, it is a count read
 // at the wrong width.
 //
+// A compact box (`compact_box.sysl`) is the strong count and the payload: nothing reaches it but code
+// that knows its type.
+//
 // A buffer is the same box with the element count in front of elements there may be any number of,
 // so the hook -- which is reached with no static type -- can still find them all.
 private box_defs(e: *Emit, word_bits: int) -> Buf[IrTypeDef]
@@ -471,8 +477,10 @@ private box_defs(e: *Emit, word_bits: int) -> Buf[IrTypeDef]
         var fields: Buf[LType] = buf()
 
         fields.push(LInt(word_bits))
-        fields.push(LPtr)
-        fields.push(LInt(word_bits))
+
+        if !is_compact(e, boxe.1)
+            fields.push(LPtr)
+            fields.push(LInt(word_bits))
 
         val pad = box_pad(e, boxe.1)
 

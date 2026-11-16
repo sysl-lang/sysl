@@ -46,6 +46,11 @@ private opm_takes(ir: string) -> int
     opm_count(ir, "call void @arc.retain(") + opm_count(ir, "call void @arc.copy.")
 end opm_takes
 
+// How many references a body gives back: through the runtime's release, or through a node's own --
+// a node is a compact box, nothing weakening it (`compact_box.sysl`).
+private opm_releases(ir: string) -> int =
+    opm_count(ir, "call void @arc.release(") + opm_count(ir, "call void @arc.release.Node(")
+
 // Neither half of a count: no call of a retain, release, copy or dispose helper of any kind.
 private opm_no_traffic(ir: string)
     assert(ir.starts_with("define"), ir)
@@ -101,7 +106,7 @@ opm_not_last_use_retains()
 
     assert(ir.contains("@wrap$$sysl-zero("), ir)
     assert_eq(opm_takes(ir), 0)
-    assert_eq(opm_count(ir, "call void @arc.release("), 1)
+    assert_eq(opm_releases(ir), 1)
 
 // The same function, handed a local at its last use, takes the owned body: the count moves over for
 // nothing, where the +0 entry would take one for the answer and give the local's back.
@@ -123,7 +128,7 @@ opm_passed_twice()
                     "both(v: int) -> (W, W)\n    val x: &Node = Node(v)\n    two(x, x)\n", "both")
 
     assert_eq(opm_count(ir, "call void @arc.retain("), 2)
-    assert_eq(opm_count(ir, "call void @arc.release("), 1)
+    assert_eq(opm_releases(ir), 1)
 
 @test("a parameter handed on to another owned parameter is owned, and the hand-on moves it")
 opm_handed_on()
@@ -153,7 +158,7 @@ opm_aggregates_move()
 
     for ir in [bag, opt, tup]
         assert_eq(opm_takes(ir), 0)
-        assert_eq(opm_count(ir, "call void @arc.release("), 0)
+        assert_eq(opm_releases(ir), 0)
         assert_eq(opm_count(ir, "call void @arc.dispose."), 1)
 
 // Not at its last use, so it is not handed over; `keep_bag` answering its parameter itself, the call
@@ -196,7 +201,7 @@ opm_branch_hand_in()
                     "    else\n        W(Node(0))\n", "go")
 
     assert_eq(opm_takes(ir), 0)
-    assert_eq(opm_count(ir, "call void @arc.release("), 1)
+    assert_eq(opm_releases(ir), 1)
 
 @test("a call that is not a last use inside a loop body lends the local every round")
 opm_loop_outer_local_retains()
@@ -298,7 +303,7 @@ opm_push_moves()
 
     assert(ir.contains("@sysl.buf$Buf.push.ref.Node.owned("), ir)
     assert_eq(opm_count(ir, "call void @arc.retain("), 0)
-    assert_eq(opm_count(ir, "call void @arc.release("), 0)
+    assert_eq(opm_releases(ir), 0)
 
 // The append's owned body hands its element on in both arms: to the growth (whose contract names only
 // `self`, so it owns the element too) and to `arc.slotplace`, which keeps the count it is handed. So
@@ -330,7 +335,7 @@ opm_loop_push_moves()
 
         assert(ir.contains("@sysl.buf$Buf.push.ref.Node.owned("), ir)
         assert_eq(opm_count(ir, "call void @arc.retain("), 0)
-        assert_eq(opm_count(ir, "call void @arc.release("), 0)
+        assert_eq(opm_releases(ir), 0)
 
 private val opm_indirect: string = raw"""
     struct Node
