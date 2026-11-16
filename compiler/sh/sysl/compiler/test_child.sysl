@@ -1,0 +1,354 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.env.get as env_var
+import sysl.fs.{make_temp_dir, read_text, remove_dir_all, write_text_atomic}
+import sysl.process.{spawn, Var}
+import sysl.text.{str_builder, StrBuilder}
+
+// `sysl test` from the command line **builds in a child process of its own and runs the tests in
+// itself.**
+//
+// A compile of a large tree leaves gigabytes behind it: blocks no reference reaches any more that are
+// never given back, and the small regions the allocator keeps dirty once they are freed. A runner that
+// compiled in its own process carried all of it through every test it then ran, so a suite's footprint
+// was its compile's, not its heaviest test's. So the runner starts itself again (`test_builder`) to do
+// everything up to the first test -- read the manifest, compile, link, compile the refused programs and
+// judge them -- and that process writes what is to be run (`TestPlan`) and exits, handing every byte
+// of the compile back to the system. The runner reads the plan and runs it.
+//
+// **The child says what it says itself**, on the streams it shares with the runner: every note, a
+// build error, a refusal, the `instrumented:` and `kept:` lines, each written and flushed before the
+// child exits, so the reader sees what one process would have shown, in the order it would have shown
+// it. A child that ends with no plan written ended the run, and its exit status is the run's.
+//
+// **The switch is explicit**: `main` turns it on (`build_tests_with`), and nothing else does unless a
+// test means to. A compiler running inside a test binary -- where its own executable is the test
+// binary, not a compiler -- builds in process, as it always has.
+
+// The variables that make a `sysl test` the build child: where it writes the plan, and the project (a
+// workspace member, or the path the command line named) it builds.
+private const PlanVariable: string = "SYSL_TEST_PLAN"
+private const ProjectVariable: string = "SYSL_TEST_PROJECT"
+
+// The compiler a test run starts to build in, or empty to build in this process.
+private var test_builder: string = ""
+
+// The command line the run was given, which the child is started with.
+private var test_args: Buf[string] = buf()
+
+// The build child of the last suite this process ran, or zero where it built in process.
+private var last_builder: int = 0
+
+// Build every suite from here on in a child running `exe`, or in this process with `None`.
+build_tests_with(exe: Option[string])
+    test_builder = exe.unwrap_or("")
+
+// The process id of the last build child, or zero where the last suite was built in process.
+last_test_builder() -> int = last_builder
+
+// The command line `sysl test` was given, kept for the child: its arguments, the program's own name
+// being the one thing the child is not handed. A new command line has started no child yet.
+remember_test_args(args: []const string)
+    last_builder = 0
+    test_args = buf()
+
+    for i in 1..<args.len
+        test_args.push(args[i])
+end remember_test_args
+
+// Whether a suite is to be built in a child rather than here.
+tests_build_in_child() -> bool = test_builder != "" && test_build_child().is_none()
+
+// Where this process is a build child: the plan it is to write, and the project it is to build.
+test_build_child() -> Option[(string, string)]
+    val plan = env_var(PlanVariable).unwrap_or("")
+
+    if plan == "" then return None
+
+    Some((plan, env_var(ProjectVariable).unwrap_or(".")))
+end test_build_child
+
+// What a build child hands the runner: the binary, whether it is the runner's to remove afterwards,
+// how to run it, and the rows to run and report -- the chosen tests, how many were filtered out, and
+// the refused programs, already compiled and judged.
+struct TestPlan
+    exe: string
+    discard: bool
+    opts: TestOptions
+    seconds: int
+    filtered: usize
+    tests: Buf[TTest]
+    refused: Buf[Outcome]
+end TestPlan
+
+// The plan, written where the runner named; a plan that cannot be written is said and fails the run.
+plan_written(at: string, p: TestPlan, note: string -> unit) -> int =
+    write_text_atomic(at, encode_test_plan(p)) match
+        Ok(_) -> Fine
+        Err(_) ->
+            note(refused(s"cannot write the test plan at $at"))
+            Failed
+
+// `file`'s suite built in a child, then run here.
+tested_in_child(file: string, note: string -> unit, report: string -> unit) -> int
+    val dir = make_temp_dir("sysl-test-plan") match
+        Err(_) ->
+            note(refused("cannot make a directory for the test build"))
+            return Failed
+        Ok(made) -> made
+
+    val plan = s"$dir/plan"
+    val env = [Var(PlanVariable, plan), Var(ProjectVariable, file)]
+
+    // What this process holds is written before the child writes anything, so nothing comes out of order.
+    flush_report()
+    compiling_started(file)
+
+    val code = spawn(test_builder, test_args.view(), "", env) match
+        Err(_) ->
+            compiling_done()
+            remove_dir_all(dir).unwrap_or(())
+            note(refused(s"$test_builder could not be run to build the tests"))
+            return Failed
+        Ok(child) ->
+            last_builder = child.pid()
+            builder_started(child.pid())
+
+            val ended = child.wait()
+
+            builder_ended()
+            ended match
+                Ok(state) -> shell_status(state)
+                Err(_) -> Failed
+
+    compiling_done()
+
+    val text = if code == Fine then read_text(plan).ok() else None
+
+    remove_dir_all(dir).unwrap_or(())
+
+    // No plan is a run that ended in the child: what it said is said, and its status is the run's.
+    val written = text match
+        None -> return code
+        Some(t) -> t
+
+    decode_test_plan(written) match
+        None ->
+            note(refused("the test build's plan could not be read"))
+            Failed
+        Some(p) -> plan_run(p, report)
+end tested_in_child
+
+// A plan, run and reported: the binary removed afterwards where it is not the cache's, and the run's
+// status from its verdicts.
+plan_run(p: TestPlan, report: string -> unit) -> int
+    val outcomes = run_selected(p.exe, p.tests, p.opts, p.filtered, report, p.seconds, p.refused)
+
+    if p.discard then discard_test_binary(p.exe)
+
+    for outcome in outcomes
+        if !outcome.passed() then return Failed
+
+    Fine
+end plan_run
+
+// --- the plan as text -----------------------------------------------------------------------------
+
+// Every field is its length in bytes, a colon, and its bytes, so no text a test carries -- a newline in
+// an expected output, a NUL in a name -- can be read as the end of it.
+encode_test_plan(p: TestPlan) -> string
+    var b = str_builder()
+
+    plan_field(&b, p.exe)
+    plan_flag(&b, p.discard)
+    plan_optional(&b, p.opts.filter)
+    plan_flag(&b, p.opts.fail_fast)
+    plan_field(&b, s"${p.opts.jobs}")
+    plan_field(&b, s"${p.opts.alone.len()}")
+
+    for item in p.opts.alone
+        plan_field(&b, item)
+
+    plan_field(&b, s"${p.seconds}")
+    plan_field(&b, s"${p.filtered}")
+    plan_field(&b, s"${p.tests.len()}")
+
+    for t in p.tests
+        plan_test(&b, t)
+
+    plan_field(&b, s"${p.refused.len()}")
+
+    for o in p.refused
+        plan_test(&b, o.test)
+        plan_optional(&b, o.detail)
+        plan_field(&b, o.output)
+        plan_field(&b, s"${o.millis}")
+        plan_optional(&b, o.skipped)
+
+    b.finish()
+end encode_test_plan
+
+private plan_field(b: *StrBuilder, text: string)
+    b.push(s"${text.bytes.len}:")
+    b.push(text)
+
+private plan_flag(b: *StrBuilder, on: bool) = plan_field(b, if on then "1" else "0")
+
+private plan_optional(b: *StrBuilder, text: Option[string])
+    plan_flag(b, text.is_some())
+    plan_field(b, text.unwrap_or(""))
+
+private plan_test(b: *StrBuilder, t: TTest)
+    plan_field(b, t.func)
+    plan_field(b, t.display)
+    plan_flag(b, t.should_trap)
+    plan_optional(b, t.expected)
+    plan_field(b, t.file)
+    plan_field(b, s"${t.line}")
+    plan_hook(b, t.hooks.setup)
+    plan_hook(b, t.hooks.teardown)
+    plan_hook(b, t.hooks.setup_all)
+    plan_hook(b, t.hooks.teardown_all)
+    plan_optional(b, t.ignored)
+
+    t.timeout match
+        Some(n) -> plan_optional(b, Some(s"$n"))
+        None -> plan_optional(b, None)
+end plan_test
+
+private plan_hook(b: *StrBuilder, hook: Option[THook])
+    plan_flag(b, hook.is_some())
+
+    hook match
+        Some(h) ->
+            plan_field(b, h.func)
+            plan_field(b, h.file)
+            plan_field(b, s"${h.line}")
+        None -> ()
+end plan_hook
+
+// The plan read back, or nothing where any field will not read.
+decode_test_plan(text: string) -> Option[TestPlan]
+    var r = PlanReader(text, 0, true)
+    val exe = r.next()
+    val discard = r.flag()
+    val filter = r.optional()
+    val fail_fast = r.flag()
+    val jobs = usize(r.number())
+    var alone: Buf[string] = buf()
+
+    for _ in 0..<r.number()
+        alone.push(r.next())
+
+    val seconds = int(r.number())
+    val filtered = usize(r.number())
+    var tests: Buf[TTest] = buf()
+
+    for _ in 0..<r.number()
+        tests.push(r.test())
+
+    var refused: Buf[Outcome] = buf()
+
+    for _ in 0..<r.number()
+        val t = r.test()
+        val detail = r.optional()
+        val output = r.next()
+        val millis = r.number()
+
+        refused.push(Outcome(t, detail, output, millis, r.optional()))
+
+    if !r.ok || r.at != text.bytes.len then return None
+
+    Some(TestPlan(exe, discard, TestOptions(filter, fail_fast, jobs, alone), seconds, filtered, tests,
+                  refused))
+end decode_test_plan
+
+// A cursor over a plan's fields. **A field that will not read stops the reading**: `ok` goes false and
+// every field after it reads as empty, so a damaged plan is one refusal rather than a wrong run.
+private struct PlanReader
+    text: string
+    at: usize
+    ok: bool
+
+    next(*self) -> string
+        if !self.ok then return ""
+
+        val b = self.text.bytes
+        var i = self.at
+        var n: usize = 0
+
+        while i < b.len && b[i] != u8(':')
+            if b[i] < u8('0') || b[i] > u8('9') || n > 1000000000
+                self.ok = false
+                return ""
+            end if
+
+            n = n * 10 + usize(b[i] - u8('0'))
+            i += 1
+
+        if i >= b.len || n > b.len - i - 1
+            self.ok = false
+            return ""
+        end if
+
+        val from = i + 1
+
+        self.at = from + n
+        self.text[from..<self.at]
+    end next
+
+    flag(*self) -> bool = self.next() == "1"
+
+    optional(*self) -> Option[string]
+        val present = self.flag()
+        val text = self.next()
+
+        if present then Some(text) else None
+
+    // A whole number, or zero -- and the reading stopped -- where the field is not one.
+    number(*self) -> long
+        val text = self.next()
+        var n: long = 0
+
+        if text.bytes.len == 0 || text.bytes.len > 18 then self.ok = false
+
+        for c in text.bytes
+            if c < u8('0') || c > u8('9')
+                self.ok = false
+                return 0
+            end if
+
+            n = n * 10 + long(c - u8('0'))
+
+        n
+    end number
+
+    hook(*self, kind: HookKind) -> Option[THook]
+        if !self.flag() then return None
+
+        val func = self.next()
+        val file = self.next()
+
+        Some(THook(kind, func, file, int(self.number())))
+    end hook
+
+    test(*self) -> TTest
+        val func = self.next()
+        val display = self.next()
+        val should_trap = self.flag()
+        val expected = self.optional()
+        val file = self.next()
+        val line = int(self.number())
+        val hooks = THooks(self.hook(Setup), self.hook(Teardown), self.hook(SetupAll), self.hook(TeardownAll))
+        val ignored = self.optional()
+        val timeout: Option[int] = if self.flag() then Some(int(self.number())) else self.skipped()
+
+        TTest(func, display, should_trap, expected, file, line, hooks, ignored, timeout)
+    end test
+
+    // The empty field an absent number is written with, read past.
+    skipped(*self) -> Option[int]
+        _ = self.next()
+        None
+end PlanReader

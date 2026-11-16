@@ -306,10 +306,11 @@ print((3.5f32).round_even(), (2.5).round_even())
 
 **Where the machine has no fused instruction, `llvm.fma` is a call to C's `fma` or `fmaf`**, and a
 freestanding machine has no C library to answer it — an Armv6-M at both widths, a Cortex-M4's
-single-precision unit at `f64`. So `sysl.softfloat` exports both on every Arm and 32-bit RISC-V
-target, correctly rounded and weak, as it does the binary64 arithmetic: a program that computes with
-`fma` links on a bare machine and asks nothing of it, and a C library linked beside it wins — a
-package exporting its own `fma` included, which is the one definition the link keeps. Whether
+single-precision unit at `f64`, x86-64's baseline, WebAssembly. So `sysl.softfloat` exports both on
+every freestanding target without the instruction, correctly rounded and weak, as it does the
+binary64 arithmetic: a program that computes with `fma` links on a bare machine and asks nothing of
+it, and a C library linked beside it wins — a package exporting its own `fma` included, which is the
+one definition the link keeps. Whether
 the width *is* an instruction is the `#if` symbols `fma` and `fma_dp` (C's `FP_FAST_FMAF` and
 `FP_FAST_FMA`; [attributes](/reference/attributes/#the-symbols-are-derived-from-the-target-and-the-set-is-closed)).
 
@@ -328,10 +329,14 @@ print(fma16(1.0f16, 2.0f16, 3.0f16))
 ```
 
 **What it is for is not only speed.** An intrinsic that lowers to an instruction leaves no symbol
-behind, so the operation needs no library at the link — which is what lets the standard module's
-roots, magnitudes, sign transfers and roundings work on a **freestanding** target, where there is no
-libm to ask. Where the machine has no instruction there is nothing to gain: `llvm.sin` exists and
-lowers to a call to the same `sin` an ordinary `extern` names, so the transcendentals stay linked.
+behind, so the operation needs no library at the link. Where the machine has no instruction for one
+of the roots, roundings and extrema — a Cortex-M4 rounding anything, an Armv6-M at all, x86-64's
+baseline rounding, WebAssembly's `round` — LLVM calls C's function of the same name, and
+`sysl.softfloat` exports `sqrt`, `floor`, `ceil`, `trunc`, `round`, `rint`, `nearbyint`, `fmax` and
+`fmin` at both widths on every such **freestanding** target, exactly rounded and weak as `fma` is. So
+the standard module's roots, magnitudes, sign transfers and roundings work on a board with no libm
+to ask. The transcendentals are another matter: `llvm.sin` exists and lowers to a call to the same
+`sin` an ordinary `extern` names, and nothing on a board answers it, so they stay linked.
 
 ### What crosses the boundary
 

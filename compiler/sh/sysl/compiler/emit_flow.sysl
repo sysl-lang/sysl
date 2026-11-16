@@ -42,6 +42,10 @@ gen_if(e: *Emit, cond: Buf[TCondTerm], then_block: TBlock, else_block: Option[TB
     // A clause's guards may leave the branch for the `else` (`TFallthrough`).
     e.falls.push(GenFall(target, owned_depth, temp_depth))
 
+    // Each branch is a region a slot's life is bounded by (`emit_lifetime.sysl`); the condition's
+    // bindings were made before it, in the enclosing one.
+    val then_region = open_region(e)
+
     if no_value(ty) then gen_block_void(e, then_block, handed)
     else store_merged(e, then_block, ty, slot, handed)
 
@@ -51,15 +55,19 @@ gen_if(e: *Emit, cond: Buf[TCondTerm], then_block: TBlock, else_block: Option[TB
     // that yields what it destructured has taken its own count by the time this runs.
     release_cond(e, paths)
     emit_term(e, InBr(end_l))
+    close_region(e, then_region)
     emit_cond_cleanups(e, paths)
 
     else_block match
         Some(eb) ->
             emit_label(e, else_l)
 
+            val else_region = open_region(e)
+
             if no_value(ty) then gen_block_void(e, eb, handed) else store_merged(e, eb, ty, slot, handed)
 
             emit_term(e, InBr(end_l))
+            close_region(e, else_region)
         None -> ()
 
     emit_label(e, end_l)
@@ -302,6 +310,9 @@ gen_while(e: *Emit, cond: Buf[TCondTerm], body: Buf[TStmt], else_block: Option[T
     emit_label(e, cond_l)
     val paths = gen_cond(e, cond, body_l, else_l)
 
+    // One round of the body is a region a slot's life is bounded by (`emit_lifetime.sysl`).
+    val region = open_region(e)
+
     push_owned(e)
     gen_body(e, body)
     pop_owned(e)
@@ -310,6 +321,7 @@ gen_while(e: *Emit, cond: Buf[TCondTerm], body: Buf[TStmt], else_block: Option[T
     // next round's test, so nothing accumulates across a loop that runs a million times.
     release_cond(e, paths)
     emit_term(e, InBr(cond_l))
+    close_region(e, region)
     emit_cond_cleanups(e, paths)
     e.loops.pop()
     gen_loop_result(e, slot, ty, else_l, end_l, else_block)
@@ -328,10 +340,14 @@ gen_do_while(e: *Emit, body: Buf[TStmt], cond: TExpr, else_block: Option[TBlock]
                          e.temp_marks.len(), e.trace_marks.len()))
     emit_term(e, InBr(body_l))
     emit_label(e, body_l)
+
+    val region = open_region(e)
+
     push_owned(e)
     gen_body(e, body)
     pop_owned(e)
     emit_term(e, InBr(cond_l))
+    close_region(e, region)
     emit_label(e, cond_l)
 
     // Re-evaluated every round, so what the test borrows is let go before the branch rather than
@@ -357,10 +373,14 @@ gen_loop(e: *Emit, body: Buf[TStmt], ty: Type) -> Val
                          e.temp_marks.len(), e.trace_marks.len()))
     emit_term(e, InBr(body_l))
     emit_label(e, body_l)
+
+    val region = open_region(e)
+
     push_owned(e)
     gen_body(e, body)
     pop_owned(e)
     emit_term(e, InBr(body_l))
+    close_region(e, region)
     e.loops.pop()
     gen_loop_result(e, slot, ty, end_l, end_l, None)
 end gen_loop
@@ -405,6 +425,8 @@ gen_for_each(e: *Emit, name: string, elem_ty: Type, seq: TExpr, body: Buf[TStmt]
     emit(e, InIntCmp(more, IUlt, w, iv, parts.1))
     emit_term(e, InCondBr(more, body_l, else_l))
     emit_label(e, body_l)
+
+    val region = open_region(e)
 
     // **A sequence of a type with no values is empty**, so its body is reached by no run and there
     // is no element to load -- a `Buf[never]`'s.
@@ -452,6 +474,7 @@ gen_for_each(e: *Emit, name: string, elem_ty: Type, seq: TExpr, body: Buf[TStmt]
         emit_term(e, InBr(step_l))
     end if
 
+    close_region(e, region)
     emit_label(e, step_l)
 
     val nxt = fresh_reg(e)

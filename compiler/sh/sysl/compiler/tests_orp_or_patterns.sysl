@@ -371,11 +371,97 @@ orp_one_slot()
         print(size(Dot))
         """)
 
-    // One slot, written by three stores -- one in each alternative's block -- and the blocks meeting
-    // at one label before the body.
+    // One slot, written by three stores -- one in each alternative's block -- read once, and the
+    // blocks meeting at one label before the body.
     assert_eq(ir.count_of("%sz.addr = alloca"), 1)
-    assert_eq(ir.count_of(", ptr %sz.addr"), 4)
+    assert_eq(orp_stores_to(ir, "sz.addr"), 3)
+    assert_eq(ir.count_of("load i32, ptr %sz.addr\n"), 1)
     assert(ir.count_of("match.bound") >= 1, ir)
+
+// How many instructions of `ir` store to the slot `%slot`, whatever the stored value's type.
+private orp_stores_to(ir: string, slot: string) -> int
+    var n = 0
+
+    for l in lines_of(ir)
+        if l.starts_with("  store ") && l.ends_with(s", ptr %$slot") then n += 1
+
+    n
+
+// Where the first line of `ir` containing `text` is, or -1.
+private orp_line_of(ir: string, text: string) -> int
+    var at = 0
+
+    for l in lines_of(ir)
+        if l.contains(text) then return at
+
+        at += 1
+
+    -1
+
+// Where the last line of `ir` containing `text` is, or -1.
+private orp_last_line_of(ir: string, text: string) -> int
+    var at = 0
+    var last = -1
+
+    for l in lines_of(ir)
+        if l.contains(text) then last = at
+
+        at += 1
+
+    last
+
+// Where the first store to the slot `%slot` is, or -1.
+private orp_first_store(ir: string, slot: string) -> int
+    var at = 0
+
+    for l in lines_of(ir)
+        if l.starts_with("  store ") && l.ends_with(s", ptr %$slot") then return at
+
+        at += 1
+
+    -1
+
+@test("a name every alternative binds and a slot of the arm's body each live across the whole arm")
+orp_slot_lives_cross_the_arm()
+    if !orp_ready() then return
+
+    val program = orp_shape() + raw"""
+        size(s: Shape) -> int = s match
+            Circle(sz) | Square(sz) | Rect(sz, _) ->
+                val big = [sz; 64]
+                big[3] + big[63] + sz
+            Dot -> 0
+
+        print(size(Circle(1)), size(Square(2)), size(Rect(3, 9)), size(Dot))
+        """
+
+    orp_prints(program, "3 6 9 0\n")
+
+    val ir = orp_ir(program)
+    val start_sz = "call void @llvm.lifetime.start.p0(i64 -1, ptr %sz.addr)"
+    val end_sz = "call void @llvm.lifetime.end.p0(i64 -1, ptr %sz.addr)"
+    val start_big = "call void @llvm.lifetime.start.p0(i64 -1, ptr %big.addr)"
+    val end_big = "call void @llvm.lifetime.end.p0(i64 -1, ptr %big.addr)"
+
+    assert_eq(ir.count_of("%sz.addr = alloca"), 1)
+    assert_eq(ir.count_of("%big.addr = alloca"), 1)
+    assert_eq(orp_stores_to(ir, "sz.addr"), 3)
+
+    // One start and one end each, not one per alternative: the start comes before any alternative
+    // writes the name, and the end after the body's last read of either slot.
+    assert_eq(ir.count_of(start_sz), 1)
+    assert_eq(ir.count_of(end_sz), 1)
+    assert_eq(ir.count_of(start_big), 1)
+    assert_eq(ir.count_of(end_big), 1)
+
+    val first_store = orp_first_store(ir, "sz.addr")
+
+    assert(first_store >= 0, ir)
+    assert(orp_line_of(ir, start_sz) < first_store, ir)
+    assert(orp_line_of(ir, start_big) < first_store, ir)
+    assert(orp_line_of(ir, end_sz) > orp_last_line_of(ir, "load i32, ptr %sz.addr"), ir)
+    assert(orp_line_of(ir, end_big) > orp_last_line_of(ir, "ptr %big.addr, i64 63"), ir)
+end orp_slot_lives_cross_the_arm
 
 // -- the refusals ---------------------------------------------------------------------------------
 

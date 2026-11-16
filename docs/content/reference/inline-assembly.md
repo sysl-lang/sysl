@@ -230,6 +230,37 @@ exception to a hidden default.
 **The `:` here is not a type annotation.** An operand names a variable that already has a type, so
 there is nothing to declare; the slot holds a class or a register.
 
+### An operand is spelled at its width
+
+`{name}` becomes the register the operand landed in, named at the operand's own width. On AArch64,
+where every register has a 64-bit name and a 32-bit one, an operand of 32 bits or fewer is its `w`
+register and a 64-bit one or a pointer its `x` register. On x86-64 the width picks among `%rax`,
+`%eax`, `%ax` and `%al` the same way. RISC-V and Thumb registers have one name each. So the
+instruction's operand sizes follow the types written, and a `u32` byte swap is the 32-bit `rev`:
+
+```sysl
+swap(n: u32) -> u32
+    var v: u32 = 0
+    asm
+        [aarch64, thumb]
+            "rev {v}, {n}"
+            in n : reg
+            out v : reg
+        [x86_64]
+            "movl {n}, {v}"
+            "bswapl {v}"
+            in n : reg
+            out v : reg
+        [riscv64, riscv32, craft, wasm32] unavailable "no single byte-reverse instruction"
+    v
+
+print(swap(0x11223344) == 0x44332211)
+```
+
+```output
+true
+```
+
 ### What an operand may be
 
 An operand must be a plain variable whose type fits a general-purpose register: an integer, a

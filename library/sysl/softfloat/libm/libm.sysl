@@ -1,0 +1,296 @@
+module sysl.softfloat.libm
+
+import sysl.softfloat.binary64.{fused, fused_single}
+
+// C's roots, roundings and extrema in software: the functions LLVM calls for `llvm.sqrt`,
+// `llvm.floor`, `llvm.ceil`, `llvm.trunc`, `llvm.round`, `llvm.rint`, `llvm.nearbyint`,
+// `llvm.maxnum` and `llvm.minnum` -- and `llvm.fma` -- where the machine has no instruction at that
+// width. Each is one instruction on AArch64 and on an Arm unit holding doubles, so those machines never
+// call them; a Cortex-M4's single-precision unit has no rounding instruction at all, an Armv6-M and a
+// RISC-V board with no F extension have no unit, x86-64's baseline has no rounding instruction (that
+// is SSE4.1) and no fused one, and WebAssembly has neither C's `round` nor a minimum that lets a
+// number beat a NaN. A freestanding image has no libm to find them in, so the standard module carries
+// them, as `sysl.softfloat.binary64` carries `fma` on Arm and 32-bit RISC-V.
+//
+// **Every one is exported WEAK**, as every `@export` the library defines is: a C library or a program
+// that defines the symbol too is the one definition the link keeps. They take and answer the floating
+// types, in the program's own convention, because they are C's functions and not a run-time ABI's.
+//
+// **They compute on the encoding, with integers only**: a float operation in here would be the very
+// call it answers, and a body that never holds a float in a register is what a soft-float build needs.
+// Every answer is exact -- a rounding to an integral value loses nothing it is not asked to lose, and a
+// root is rounded once, to nearest with ties to even -- so they agree with any correct libm bit for
+// bit. The arithmetic below has no `#if`, so the host checks it against its own libm (`tests.sysl`);
+// only the exports are per machine.
+//
+// One routine serves both widths: an encoding travels in a `u64`, and `width` (64 or 32) and
+// `fraction` (52 or 23) say which format it is in.
+
+// -- the encoding ------------------------------------------------------------------------------------
+
+private sign_bit(width: int) -> u64 = u64(1) << (width - 1)
+
+private bias_of(width: int, fraction: int) -> int = (1 << (width - 2 - fraction)) - 1
+
+private infinity_of(width: int, fraction: int) -> u64 = u64(2 * bias_of(width, fraction) + 1) << fraction
+
+private quiet_bit(fraction: int) -> u64 = u64(1) << (fraction - 1)
+
+// -- rounding to an integral value -------------------------------------------------------------------
+
+/** Which integral value a rounding picks: C's `floor`, `ceil`, `trunc`, `round` (a half goes away from
+ * zero) and `rint`/`nearbyint` (a half goes to the even one; sysl never changes the mode). */
+private[libm] enum Toward
+    Floor
+    Ceiling
+    Zero
+    AwayAtHalf
+    EvenAtHalf
+
+/** `b` rounded to an integral value of its own format by `mode`. A NaN comes back quieted; an infinity,
+ * a zero and a value whose exponent leaves no fraction bits come back as they are; and a result of zero
+ * keeps the operand's sign, as C's do (`floor(0.5)` is `+0`, `ceil(-0.5)` is `-0`). */
+private[libm] integral(b: u64, width: int, fraction: int, mode: Toward) -> u64
+    val sign = sign_bit(width)
+    val bias = bias_of(width, fraction)
+    val abs = b & (sign - 1)
+    val negative = b & sign != 0
+
+    if abs > infinity_of(width, fraction) then return b | quiet_bit(fraction)
+
+    val e = int(abs >> fraction)
+
+    if e >= bias + fraction || abs == 0 then return b
+
+    // Below one the answer is a zero or a one, of the operand's sign; a half is exactly `bias - 1`
+    // over a zero fraction.
+    if e < bias
+        val up = mode match
+            Floor -> negative
+            Ceiling -> !negative
+            Zero -> false
+            AwayAtHalf -> e == bias - 1
+            EvenAtHalf -> e == bias - 1 && abs != (u64(bias - 1) << fraction)
+
+        return if up then (b & sign) | (u64(bias) << fraction) else b & sign
+    end if
+
+    // Otherwise the bits below the units place are cut away, and the magnitude raised by one unit where
+    // the mode asks: a carry out of the fraction lands in the exponent, which is the next power of two.
+    val unit = u64(1) << (bias + fraction - e)
+    val rem = b & (unit - 1)
+    val base = b - rem
+    val half = unit >> 1
+
+    if rem == 0 then return b
+
+    val up = mode match
+        Floor -> negative
+        Ceiling -> !negative
+        Zero -> false
+        AwayAtHalf -> rem >= half
+        EvenAtHalf -> rem > half || (rem == half && base & unit != 0)
+
+    if up then base + unit else base
+end integral
+
+// -- the extrema -------------------------------------------------------------------------------------
+
+// An encoding as a signed key that orders as the values do, `-0` just below `+0`.
+private ordered(b: u64, width: int) -> i64
+    val sign = sign_bit(width)
+    val abs = i64(b & (sign - 1))
+
+    if b & sign != 0 then -abs - 1 else abs
+end ordered
+
+/** C's `fmax` (`greater`) or `fmin` on encodings: a quiet NaN loses to a number, a signalling one is
+ * answered quieted, two quiet NaNs answer the first, and of two zeros `+0` is the greater -- what
+ * AArch64's `fmaxnm` and `fminnm` and IEEE 754-2008's maxNum and minNum answer. */
+private[libm] extremum(a: u64, b: u64, width: int, fraction: int, greater: bool) -> u64
+    val sign = sign_bit(width)
+    val infinity = infinity_of(width, fraction)
+    val quiet = quiet_bit(fraction)
+    val a_nan = a & (sign - 1) > infinity
+    val b_nan = b & (sign - 1) > infinity
+
+    // A signalling NaN is an invalid operand rather than a missing one, and answers itself quieted.
+    if a_nan && a & quiet == 0 then return a | quiet
+    if b_nan && b & quiet == 0 then return b | quiet
+    if a_nan then return if b_nan then a else b
+    if b_nan then return a
+
+    val first = ordered(a, width) >= ordered(b, width)
+
+    if first == greater then a else b
+end extremum
+
+// -- the square root ---------------------------------------------------------------------------------
+
+/** C's `sqrt` on an encoding, rounded once to nearest with ties to even. A NaN comes back quieted, a
+ * zero and `+inf` as they are, and anything below zero is the quiet NaN.
+ *
+ * The value is made `m × 2^e` with `m` in [1, 4) and `e` even, so the root is `√m × 2^(e/2)` with `√m`
+ * in [1, 2). Its bits are found one at a time, from the units place down to one past the format's
+ * last, keeping `s` at twice the root so far and `r` the remainder, doubled at each step: a bit is one
+ * where twice the root so far plus that bit still fits in what is left. The extra bit and whether
+ * anything remains round the answer. A root is never out of range: it halves the exponent. Every
+ * quantity stays under 2^(fraction + 4), so a word holds it at both widths. */
+private[libm] root(b: u64, width: int, fraction: int) -> u64
+    val sign = sign_bit(width)
+    val bias = bias_of(width, fraction)
+    val infinity = infinity_of(width, fraction)
+    val abs = b & (sign - 1)
+
+    if abs > infinity then return b | quiet_bit(fraction)
+    if abs == 0 then return b
+    if b & sign != 0 then return infinity | quiet_bit(fraction)
+    if abs == infinity then return b
+
+    val implicit = u64(1) << fraction
+    var r = abs & (implicit - 1)
+    var e = int(abs >> fraction)
+
+    if e == 0
+        // A subnormal: its leading one moves up to the implicit bit.
+        val shift = int(r.leading_zeros()) - int(implicit.leading_zeros())
+
+        r <<= shift
+        e = 1 - shift
+    else
+        r |= implicit
+
+    e -= bias
+
+    if e & 1 != 0
+        r <<= 1
+        e -= 1
+
+    // `r` is `m` scaled by 2^fraction; doubled once more, it is the remainder before the first bit.
+    r <<= 1
+
+    var q: u64 = 0
+    var s: u64 = 0
+    var bit = implicit << 1
+
+    while bit != 0
+        val t = s + bit
+
+        if t <= r
+            s = t + bit
+            r -= t
+            q += bit
+
+        r <<= 1
+        bit >>= 1
+    end while
+
+    // `q` is the root to one bit past the format's; the last of them and the remainder round it.
+    var sig = q >> 1
+
+    if q & 1 != 0 && (r != 0 || sig & 1 != 0)
+        sig += 1
+
+    if sig == implicit << 1
+        sig >>= 1
+        e += 2
+
+    // `e` is even, so the shift halves it exactly, below zero too, and asks no machine for a division.
+    (u64((e >> 1) + bias) << fraction) | (sig & (implicit - 1))
+end root
+
+// -- the exports -------------------------------------------------------------------------------------
+//
+// Where every width is an instruction -- AArch64, and an Arm unit holding doubles -- nothing calls
+// these, and they are left out; so is a hosted machine, whose libm has them.
+
+#if freestanding && !aarch64 && !(thumb && fpu_dp)
+
+/** C's `sqrt`, rounded once. */
+@export("sqrt")
+sqrt(x: real) -> real = real.from_bits(root(x.bits(), 64, 52))
+
+/** C's `sqrtf`, rounded once. */
+@export("sqrtf")
+sqrtf(x: f32) -> f32 = f32.from_bits(u32(root(u64(x.bits()), 32, 23)))
+
+/** C's `floor`: the largest integral value not above `x`. */
+@export("floor")
+floor(x: real) -> real = real.from_bits(integral(x.bits(), 64, 52, Floor))
+
+/** C's `floorf`. */
+@export("floorf")
+floorf(x: f32) -> f32 = f32.from_bits(u32(integral(u64(x.bits()), 32, 23, Floor)))
+
+/** C's `ceil`: the smallest integral value not below `x`. */
+@export("ceil")
+ceil(x: real) -> real = real.from_bits(integral(x.bits(), 64, 52, Ceiling))
+
+/** C's `ceilf`. */
+@export("ceilf")
+ceilf(x: f32) -> f32 = f32.from_bits(u32(integral(u64(x.bits()), 32, 23, Ceiling)))
+
+/** C's `trunc`: `x` toward zero. */
+@export("trunc")
+trunc(x: real) -> real = real.from_bits(integral(x.bits(), 64, 52, Zero))
+
+/** C's `truncf`. */
+@export("truncf")
+truncf(x: f32) -> f32 = f32.from_bits(u32(integral(u64(x.bits()), 32, 23, Zero)))
+
+/** C's `round`: the nearest integral value, a half away from zero. */
+@export("round")
+round(x: real) -> real = real.from_bits(integral(x.bits(), 64, 52, AwayAtHalf))
+
+/** C's `roundf`. */
+@export("roundf")
+roundf(x: f32) -> f32 = f32.from_bits(u32(integral(u64(x.bits()), 32, 23, AwayAtHalf)))
+
+/** C's `rint`: the nearest integral value, a half to the even one. */
+@export("rint")
+rint(x: real) -> real = real.from_bits(integral(x.bits(), 64, 52, EvenAtHalf))
+
+/** C's `rintf`. */
+@export("rintf")
+rintf(x: f32) -> f32 = f32.from_bits(u32(integral(u64(x.bits()), 32, 23, EvenAtHalf)))
+
+/** C's `nearbyint`: `rint`, which in the one rounding mode sysl uses it is. */
+@export("nearbyint")
+nearbyint(x: real) -> real = real.from_bits(integral(x.bits(), 64, 52, EvenAtHalf))
+
+/** C's `nearbyintf`. */
+@export("nearbyintf")
+nearbyintf(x: f32) -> f32 = f32.from_bits(u32(integral(u64(x.bits()), 32, 23, EvenAtHalf)))
+
+/** C's `fmax`: the greater, a NaN losing to a number. */
+@export("fmax")
+fmax(x: real, y: real) -> real = real.from_bits(extremum(x.bits(), y.bits(), 64, 52, true))
+
+/** C's `fmaxf`. */
+@export("fmaxf")
+fmaxf(x: f32, y: f32) -> f32 = f32.from_bits(u32(extremum(u64(x.bits()), u64(y.bits()), 32, 23, true)))
+
+/** C's `fmin`: the lesser, a NaN losing to a number. */
+@export("fmin")
+fmin(x: real, y: real) -> real = real.from_bits(extremum(x.bits(), y.bits(), 64, 52, false))
+
+/** C's `fminf`. */
+@export("fminf")
+fminf(x: f32, y: f32) -> f32 = f32.from_bits(u32(extremum(u64(x.bits()), u64(y.bits()), 32, 23, false)))
+
+#endif
+
+// Arm and 32-bit RISC-V have `fma` and `fmaf` from `sysl.softfloat.binary64`; the other freestanding
+// machines without a fused instruction at both widths -- x86-64's baseline, WebAssembly, a RISC-V
+// board with no F extension -- have them here.
+#if freestanding && !aarch64 && !thumb && !riscv32
+
+/** C's `fma`: `a * b + c` rounded once. */
+@export("fma")
+fma(a: real, b: real, c: real) -> real = real.from_bits(fused(a.bits(), b.bits(), c.bits(), false))
+
+/** C's `fmaf`: `a * b + c` rounded once. */
+@export("fmaf")
+fmaf(a: f32, b: f32, c: f32) -> f32 = f32.from_bits(fused_single(a.bits(), b.bits(), c.bits()))
+
+#endif

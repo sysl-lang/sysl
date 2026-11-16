@@ -14,7 +14,7 @@ import sysl.text.str_builder
 gen_asm(e: *Emit, lines: Buf[string], operands: Buf[TAsmOperand], clobbers: Buf[string])
     val ins = operands_by(operands, false)
     val outs = operands_by(operands, true)
-    val slots = asm_numbering(operands)
+    val slots = asm_numbering(e, operands)
 
     var loaded: Buf[IrArg] = buf()
 
@@ -77,20 +77,36 @@ private asm_is_out(d: AsmDir) -> bool = d match
     Out -> true
     In -> false
 
-// The operand numbers a template's names stand for, outputs first, matching the constraint string.
-private asm_numbering(operands: Buf[TAsmOperand]) -> Buf[(string, int)]
-    var out: Buf[(string, int)] = buf()
+// What each of a template's names becomes: its operand number, outputs first to match the
+// constraint string, spelled the way the operand's width needs.
+private asm_numbering(e: *Emit, operands: Buf[TAsmOperand]) -> Buf[(string, string)]
+    var out: Buf[(string, string)] = buf()
 
     for item in operands
-        if asm_is_out(item.dir) then out.push((item.name, int(out.len())))
+        if asm_is_out(item.dir) then out.push((item.name, asm_spelling(e, item, int(out.len()))))
 
     for item in operands
-        if !asm_is_out(item.dir) then out.push((item.name, int(out.len())))
+        if !asm_is_out(item.dir) then out.push((item.name, asm_spelling(e, item, int(out.len()))))
 
     out
 end asm_numbering
 
-private slot_of(slots: Buf[(string, int)], name: string) -> Option[int]
+// **An AArch64 register has two names, and LLVM prints the 64-bit one unless told otherwise** --
+// `x8` for a `u32` it allocated as `w8`, so `crc32cx {out}, {crc}, {word}` reached the assembler as
+// `crc32cx x8, x0, x1` and was refused there. The operand's width is known here and nowhere in the
+// text, so an operand of 32 bits or fewer is printed through the `w` modifier. x86-64 needs nothing:
+// LLVM already names `%eax`, `%ax` or `%al` by the operand's type, and RISC-V and Thumb registers
+// have one name each.
+private asm_spelling(e: *Emit, o: TAsmOperand, n: int) -> string
+    if e.target.cpu == Aarch64
+        lty(e, o.ty) match
+            LInt(bits) -> if bits <= 32 then return s"$${$n:w}"
+            _ -> ()
+
+    s"$$$n"
+end asm_spelling
+
+private slot_of(slots: Buf[(string, string)], name: string) -> Option[string]
     for item in slots
         if item.0 == name then return Some(item.1)
 
@@ -164,7 +180,7 @@ private asm_place(o: TAsmOperand) -> string = o.reg match
 
 // The whole template as one line, with the labels made this site's own and every name replaced by
 // the operand number it stands for.
-private asm_text(lines: Buf[string], site: int, slots: Buf[(string, int)]) -> string
+private asm_text(lines: Buf[string], site: int, slots: Buf[(string, string)]) -> string
     val unique = uniquify_labels(lines, site)
 
     var b = str_builder()
@@ -250,7 +266,7 @@ end collapse_braces
 // -- is doubled *here* rather than in the source, where doubling it would be the language's syntax
 // leaking into a place the reader thinks is assembly. Doubled braces collapse to single ones for the
 // same reason, at the same time, so the text a program wrote is the text the assembler sees.
-private asm_render(line: string, slots: Buf[(string, int)]) -> string
+private asm_render(line: string, slots: Buf[(string, string)]) -> string
     var b = str_builder()
     var i: usize = 0
 
@@ -279,7 +295,7 @@ private asm_render(line: string, slots: Buf[(string, int)]) -> string
                 // A name with no slot has already been reported by the analysis; leaving the text as
                 // it stands keeps the emitter from inventing an operand number that indexes nothing.
                 slot_of(slots, name) match
-                    Some(n) -> b.push(s"$$$n")
+                    Some(spelled) -> b.push(spelled)
                     None -> b.push(line[i..(at)])
 
                 i = at + 1
