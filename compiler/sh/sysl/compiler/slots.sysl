@@ -17,6 +17,10 @@ import sysl.math.bigint.from_int
 // - `slot_place(xs, i, v)` puts `v` in slot `i`. The first slot past the live prefix is filled
 //   without letting go of anything, and the prefix grows by one; a live slot is an ordinary
 //   assignment; a slot further on would leave a gap the hook cannot see past, so it traps.
+// - `slot_place_run(xs, at, src)` is `slot_place(xs, at + k, src[k])` for every `k` of the run `src`,
+//   which is what a container's append of a whole slice and its growth's copy are. An element that
+//   holds no count has nothing to place one at a time -- a place of one is a store -- so the run is
+//   one `memmove`; one that holds a count is placed slot by slot, exactly as the loop would be.
 // - `slot_vacate(xs, n)` lets go of every live slot from `n` on and shortens the prefix to `n` --
 //   **but only where the storage has no other holder**. A view handed out earlier, or a second copy
 //   of the container, still reads those slots, and releasing them under it would be a read of freed
@@ -53,10 +57,10 @@ import sysl.math.bigint.from_int
 // Both are unchecked: the caller promises that a taken slot is live and a put one is empty. Rust's
 // `ptr::read` and `ptr::write` are the same pair.
 
-// The five names, whatever claims them.
+// The six names, whatever claims them.
 slot_form_word(name: string) -> bool =
-    name == "slot_storage" || name == "slot_place" || name == "slot_vacate" ||
-        name == "slot_take" || name == "slot_put"
+    name == "slot_storage" || name == "slot_place" || name == "slot_place_run" ||
+        name == "slot_vacate" || name == "slot_take" || name == "slot_put"
 
 // Whether a name in call position is one of these forms. Like the atomics, a function or a local of
 // the name is what a call reaches, and the form applies only where nothing else claims it.
@@ -147,14 +151,17 @@ private slot_storage_call(cx: &Analyzer, span: Span, args: Buf[Expr],
     TExpr(span, TSlots("slot_storage", one_texpr(n), elem, Slice(elem, false)))
 end slot_storage_call
 
-// `slot_place(xs, i, v)` and `slot_vacate(xs, n)`.
+// `slot_place(xs, i, v)`, `slot_place_run(xs, at, src)` and `slot_vacate(xs, n)`.
 private slot_write_call(cx: &Analyzer, span: Span, name: string, args: Buf[Expr]) -> TExpr
     val place = name == "slot_place"
-    val want: usize = if place then 3 else 2
+    val run = name == "slot_place_run"
+    val want: usize = if place || run then 3 else 2
+    val what = if place then "a buffer, a slot and a value"
+               else if run then "a buffer, a slot and a run of values"
+               else "a buffer and a slot"
 
     if args.len() != want then
-        return cx.err(span, s"'$name' takes ${quantity(want, "argument")} — " +
-                      s"${if place then "a buffer, a slot and a value" else "a buffer and a slot"}" +
+        return cx.err(span, s"'$name' takes ${quantity(want, "argument")} — $what" +
                       s" — but ${supplied(args.len(), "argument")}")
 
     val xs = type_expr_bare(cx, args[0])
@@ -189,8 +196,46 @@ private slot_write_call(cx: &Analyzer, span: Span, name: string, args: Buf[Expr]
         all.push(v)
     end if
 
+    if run then all.push(slot_run(cx, args[2], elem, xt))
+
     TExpr(span, TSlots(name, all, elem, Unit))
 end slot_write_call
+
+// The run `slot_place_run` fills from: a view of the element type, read-only or not, or anything
+// that becomes one where a `[]const T` is expected.
+private slot_run(cx: &Analyzer, e: Expr, elem: Type, xt: Type) -> TExpr
+    val want = Slice(elem, true)
+    val src = coerce(cx, type_expr(cx, e, Some(want)), want)
+    val st = texpr_type(src)
+
+    if st == Unknown then return src
+
+    val fits = underlying(st) match
+        Slice(el, _) -> type_eq(*el, elem) || type_eq(underlying(*el), underlying(elem))
+        _ -> false
+
+    if !fits then
+        cx.fault(e.span, s"'slot_place_run' fills slots of ${type_show(xt)} from a run of " +
+                 s"${type_show(elem)}, a '${type_show(want)}', and this is a ${type_show(st)}")
+
+    src
+end slot_run
+
+// **What a slot form puts in a slot, for the analyses that follow a value into storage**: the value
+// of a `slot_place`, and for a `slot_place_run` one element of its run, read as `src[0]` -- every slot
+// the run fills is filled with such a read, so the run keeps exactly what the loop of `slot_place`s
+// it stands for keeps, and the analyses need say nothing of their own about it.
+slot_value(op: string, args: Buf[TExpr], elem: Type) -> Option[TExpr]
+    if op == "slot_place" && args.len() == 3 then return Some(args[2])
+
+    if op == "slot_place_run" && args.len() == 3
+        val src = args[2]
+        val first = TExpr(src.span, TIntLit(from_int(0), texpr_type(args[1])))
+
+        return Some(TExpr(src.span, TIndex(src, first, elem)))
+
+    None
+end slot_value
 
 // A slot index or a count, read as an index is.
 private slot_count(cx: &Analyzer, e: Expr) -> TExpr
@@ -222,6 +267,7 @@ gen_slots(e: *Emit, op: string, args: Buf[TExpr], elem: Type, ty: Type) -> Val
 
     if op == "slot_put" then gen_slot_put(e, args[0], args[1], elem)
     else if op == "slot_place" then gen_slot_place(e, args[0], args[1], args[2], elem)
+    else if op == "slot_place_run" then gen_slot_place_run(e, args[0], args[1], args[2], elem)
     else gen_slot_vacate(e, args[0], args[1], elem)
 
     VNothing
@@ -305,21 +351,27 @@ private gen_slot_place(e: *Emit, xs: TExpr, index: TExpr, value: TExpr, elem: Ty
     // temporary or a local at its last use -- an owned parameter handed to `push` among them
     // (`emit_moves.sysl`) -- and one taken otherwise. The first free slot keeps it as it is, and the
     // rest hands it to `arc.slotplace.<T>`, which keeps it too.
+    retain_moving(e, value, elem, v)
+    place_counted(e, elem, view.0, p, v, side)
+end gen_slot_place
+
+// `v`, which already holds the count the slot keeps, placed at `p` in storage owned by `owner`: the
+// first free slot in line, and every other case through `arc.slotplace.<T>`.
+private place_counted(e: *Emit, elem: Type, owner: Val, p: Val, v: Val, side: IrAccess)
     val buffer_l = fresh_label(e, "slot.buffer")
     val fresh_l = fresh_label(e, "slot.fresh")
     val rest_l = fresh_label(e, "slot.rest")
     val done_l = fresh_label(e, "slot.done")
 
-    retain_moving(e, value, elem, v)
-    buffer_test(e, elem, view.0, buffer_l, rest_l, side)
+    buffer_test(e, elem, owner, buffer_l, rest_l, side)
     emit_label(e, buffer_l)
 
-    val lp = slot_header(e, elem, view.0, header_fields())
+    val lp = slot_header(e, elem, owner, header_fields())
     val live = fresh_reg(e)
 
     emit(e, InLoad(live, word_lty(e), lp, side, None))
 
-    val edge = slot_at(e, elem, slot_header(e, elem, view.0, buf_elems_field(e, elem)), live)
+    val edge = slot_at(e, elem, slot_header(e, elem, owner, buf_elems_field(e, elem)), live)
     val at_edge = fresh_reg(e)
 
     emit(e, InIntCmp(at_edge, IEq, LPtr, p, edge))
@@ -339,13 +391,156 @@ private gen_slot_place(e: *Emit, xs: TExpr, index: TExpr, value: TExpr, elem: Ty
 
     var args: Buf[IrArg] = buf()
 
-    args.push(ir_arg(LPtr, view.0))
+    args.push(ir_arg(LPtr, owner))
     args.push(ir_arg(LPtr, p))
     args.push(ir_arg(lty(e, elem), v))
     emit(e, ir_call(None, LVoid, slot_place_fn(e, elem), args))
     emit_term(e, InBr(done_l))
     emit_label(e, done_l)
-end gen_slot_place
+end place_counted
+
+// **`slot_place_run(xs, at, src)` is the loop `slot_place(xs, at + k, src[k])` over the run**, with
+// one bounds test for all of it: the slots `at ..< at + src.len` must exist, so `at` may be the
+// storage's length only where the run is empty, as a cut's bounds may.
+//
+// **An element that holds no count is one `memmove`** of the run's bytes. A place of one is a store
+// that lets go of nothing and moves no live prefix, so the run is the bytes and nothing else, and one
+// call is what moves them a word or a vector at a time where the loop moved one element -- a run of
+// bytes shorter than the vectorizer's stride was a byte loop. `memmove` rather than `memcpy`, so a run
+// read from the storage it is written into still arrives whole. A freestanding machine has no C
+// library to call, so the move is the loop there, except on Thumb, where the standard module carries
+// `__aeabi_memmove` (`sysl.softint.aeabi`) and the back end calls that.
+//
+// **An element that holds a count is placed slot by slot**, each taking a count of its own and each
+// placed exactly as `slot_place` places it -- the first free slot in line, everything else out of line
+// -- so the counts a program makes and the order it lets go of them are what the loop's were.
+private gen_slot_place_run(e: *Emit, xs: TExpr, at: TExpr, src: TExpr, elem: Type)
+    val side = if is_core_elems(xs) then AccBufElement else AccPlain
+    val view = slot_view(e, xs)
+    val i = widen_index(e, at, at.span)
+    val from = slot_view(e, src)
+    val n = from.2
+    val fits = fresh_reg(e)
+
+    emit(e, InIntCmp(fits, IUle, word_lty(e), n, view.2))
+    trap_unless(e, fits, "bounds")
+
+    val room = fresh_reg(e)
+
+    emit(e, InBin(room, OpSub, word_lty(e), view.2, n))
+
+    val inside = fresh_reg(e)
+
+    emit(e, InIntCmp(inside, IUle, word_lty(e), i, room))
+    trap_unless(e, inside, "bounds")
+
+    if zero_sized(elem) then return
+
+    val first = slot_at(e, elem, view.1, i)
+
+    if !contains_counted(elem) && moves_bytes(e)
+        val bytes = fresh_reg(e)
+
+        emit(e, InBin(bytes, OpMul, word_lty(e), n, element_size(e, elem)))
+        emit_memmove(e, first, from.1, bytes, int(e.layout.align(elem)))
+        return
+    end if
+
+    // **The loop runs back to front only where the run overlaps the slots it fills from below**, so
+    // each element is read before it is written over, as `memmove` reads them. Every other run goes
+    // front to back, so a counted run fills the first free slot each time, as the loop of places does.
+    val src_end = slot_at(e, elem, from.1, n)
+    val below = fresh_reg(e)
+
+    emit(e, InIntCmp(below, IUlt, LPtr, from.1, first))
+
+    val within = fresh_reg(e)
+
+    emit(e, InIntCmp(within, IUlt, LPtr, first, src_end))
+
+    val back = fresh_reg(e)
+
+    emit(e, InBin(back, OpAnd, l_i1(), below, within))
+
+    val last = fresh_reg(e)
+
+    emit(e, InBin(last, OpSub, word_lty(e), n, VInt(from_int(1))))
+
+    val k_slot = alloca(e, fresh_reg(e), word_lty(e))
+    val test_l = fresh_label(e, "slot.run")
+    val body_l = fresh_label(e, "slot.each")
+    val done_l = fresh_label(e, "slot.ran")
+
+    emit(e, InStore(word_lty(e), VInt(from_int(0)), k_slot, AccPlain, None))
+    emit_term(e, InBr(test_l))
+    emit_label(e, test_l)
+
+    val k = fresh_reg(e)
+
+    emit(e, InLoad(k, word_lty(e), k_slot, AccPlain, None))
+
+    val more = fresh_reg(e)
+
+    emit(e, InIntCmp(more, IUlt, word_lty(e), k, n))
+    emit_term(e, InCondBr(more, body_l, done_l))
+    emit_label(e, body_l)
+
+    val down = fresh_reg(e)
+
+    emit(e, InBin(down, OpSub, word_lty(e), last, k))
+
+    val j = fresh_reg(e)
+
+    emit(e, InSelect(j, back, word_lty(e), down, k, l_i1()))
+
+    val v = fresh_reg(e)
+
+    emit(e, InLoad(v, lty(e, elem), slot_at(e, elem, from.1, j), AccPlain, None))
+
+    val p = slot_at(e, elem, first, j)
+
+    if contains_counted(elem)
+        retain_value(e, elem, v)
+        place_counted(e, elem, view.0, p, v, side)
+    else
+        emit(e, InStore(lty(e, elem), v, p, side, None))
+
+    val next = fresh_reg(e)
+
+    emit(e, InBin(next, OpAdd, word_lty(e), k, VInt(from_int(1))))
+    emit(e, InStore(word_lty(e), next, k_slot, AccPlain, None))
+    emit_term(e, InBr(test_l))
+    emit_label(e, done_l)
+end gen_slot_place_run
+
+// Whether a run of bytes may be handed to `llvm.memmove`: where a C library is under the program,
+// and on Thumb, whose every image carries the run-time ABI's move.
+private moves_bytes(e: *Emit) -> bool = lays_bytes(e) || e.target.cpu == Thumb
+
+// `bytes` bytes moved from `src` to `dst`, which may overlap, both aligned to `align`.
+private emit_memmove(e: *Emit, dst: Val, src: Val, bytes: Val, align: int)
+    val fn = llvm_memmove_entry().at([LPtr, LPtr, word_lty(e)])
+
+    var params: Buf[IrParam] = buf()
+
+    params.push(ir_param(LPtr))
+    params.push(ir_param(LPtr))
+    params.push(ir_param(word_lty(e)))
+    params.push(ir_param(l_i1()))
+    request_intrinsic(e, ir_sig(fn, ir_fn_type(LVoid, params)))
+
+    var args: Buf[IrArg] = buf()
+    var dst_attrs: Buf[IrAttr] = buf()
+    var src_attrs: Buf[IrAttr] = buf()
+
+    dst_attrs.push(AttrAlign(align))
+    src_attrs.push(AttrAlign(align))
+    args.push(IrArg(LPtr, dst, dst_attrs))
+    args.push(IrArg(LPtr, src, src_attrs))
+    args.push(ir_arg(word_lty(e), bytes))
+    args.push(ir_arg(LInt(1), VBool(false)))
+    emit(e, InCall(None, LVoid, VGlobal(fn), args, no_ir_attrs(), None, no_fast_math(), false))
+end emit_memmove
 
 // The out-of-line rest of a `slot_place` of an element that holds a count.
 private slot_place_fn(e: *Emit, elem: Type) -> Val =

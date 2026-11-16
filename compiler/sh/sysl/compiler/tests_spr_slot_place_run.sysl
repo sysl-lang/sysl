@@ -1,0 +1,758 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text, is_file}
+import sysl.process.capture
+import sysl.testing.skip
+import sysl.text.{Search, split}
+
+// `slot_place_run(xs, at, src)` (`slots.sysl`): the loop `slot_place(xs, at + k, src[k])` over a run,
+// as one form. An element that holds no count is one `memmove` of the run's bytes; one that holds a
+// count is placed slot by slot, as the loop was. `Buf.extend` and a Buf's growth are written with it.
+//
+// The axes, and the cells:
+// - the element: a byte, a word, a bool, a bare enum and a pointer-free struct (a move), and a
+//   string, a `&T`, a `Buf[u8]` and a struct holding a `&T` (slot by slot) -- the output, the IR's
+//   shape, and the counted heap's balance;
+// - the run's length: 0, 1, 15, 16, 17, 63, 64, 65 and 4099, at slot 0 and at an odd slot;
+// - where the run comes from: a `[]T`, a `[]const T`, a cut, and the very slots it fills, from below
+//   and from above, for a moved element and a placed one;
+// - the rules `slot_place` has: a live slot is an assignment, a gap is a trap, the slots must exist;
+//   and every refusal the form shares with it, plus the run's own;
+// - the build: `-O0` and the default level, while compiling (`const`), and the bare-metal targets --
+//   Thumb, whose image carries `__aeabi_memmove`, and RV32, which has no `memmove` and walks the run.
+//
+// Skipped: a counted run that overlaps slots past the live prefix, which reads slots nothing holds and
+// is the caller's to keep out of, exactly as a `slot_place` of such a read is.
+
+// -- the harness ------------------------------------------------------------------------------------
+
+// What a program prints, built at `level` and run; a trap says so after whatever did come out.
+private spr_ran_at(text: string, level: string) -> string
+    val root = make_temp_dir("sysl-spr").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, level, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.status match
+            Signalled(n) -> s"${out.text}signal $n\n"
+            _ -> out.text
+end spr_ran_at
+
+// The program prints `want` unoptimized and optimized alike.
+private spr_both(text: string, want: string)
+    assert_eq(spr_ran_at(text, "0"), want)
+    assert_eq(spr_ran_at(text, DefaultOptimization), want)
+
+// The program traps before printing `never`, at both levels.
+private spr_traps(text: string, never: string)
+    for level in ["0", DefaultOptimization]
+        val said = spr_ran_at(text, level)
+
+        assert(said.ends_with("signal 5\n") && !said.contains(never), said)
+
+// The program is refused, saying `message`.
+private spr_refused(text: string, message: string)
+    val said = spr_ran_at(text, DefaultOptimization)
+
+    assert(said.contains(message), said)
+
+// The body of the function whose `define` line names `name`, up to its closing brace.
+private spr_body(ir: string, name: string) -> string
+    val lines = split(ir, "\n")
+    var out = ""
+    var inside = false
+
+    for i in 0..<lines.len
+        val line = lines[i]
+
+        if !inside && line.starts_with("define") && line.contains(name) then inside = true
+
+        if inside
+            out = out + line + "\n"
+
+            if line == "}" then return out
+    end for
+
+    out
+end spr_body
+
+// How many lines of `body` call `llvm.memmove`.
+private spr_moves(body: string) -> int
+    val lines = split(body, "\n")
+    var n = 0
+
+    for i in 0..<lines.len
+        if lines[i].contains("call void @llvm.memmove") then n += 1
+
+    n
+end spr_moves
+
+// A value whose destructor says when it ran.
+private spr_noisy() -> string = raw"""
+    struct N
+        v: int
+
+    impl Drop for N
+        drop(self) = print(f"dropped ${self.v}")
+
+    """
+
+// -- what a run leaves in the slots ---------------------------------------------------------------
+
+// Every element kind that moves as bytes, at every edge length, at slot 0 and at an odd slot, from a
+// `[]T` and through `Buf.extend` -- whose growth moves the run already there as well.
+private spr_moved_kinds() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    enum Dir
+        North
+        South
+        East
+
+    struct P derives Eq
+        x: i32
+        y: i16
+
+    same_run[T: Eq](src: []const T, at: usize) -> bool
+        val xs = slot_storage[T](at + src.len + 1)
+
+        slot_place_run(xs, at, src)
+
+        for i in 0..<src.len
+            if xs[at + i] != src[i] then return false
+
+        true
+
+    twice[T: Eq](b: Buf[T]) -> bool
+        var c: Buf[T] = buf()
+
+        c.extend(b.view())
+        c.extend(b.view())
+
+        if c.len() != 2 * b.len() then return false
+
+        for i in 0..<b.len()
+            if c[i] != b[i] || c[b.len() + i] != b[i] then return false
+
+        true
+
+    for n in [0, 1, 15, 16, 17, 63, 64, 65, 4099]
+        var b: Buf[u8] = buf()
+        var w: Buf[int] = buf()
+        var t: Buf[bool] = buf()
+        var d: Buf[Dir] = buf()
+        var p: Buf[P] = buf()
+
+        for i in 0..<n
+            b.push(u8(i % 251))
+            w.push(i * 7)
+            t.push(i % 3 == 0)
+            d.push(if i % 2 == 0 then Dir.North else Dir.East)
+            p.push(P(i32(i), i16(i % 100)))
+
+        val run = same_run(b.view(), 0) && same_run(b.view(), 3) && same_run(w.view(), 1) &&
+            same_run(t.view(), 5) && same_run(d.view(), 2) && same_run(p.view(), 7)
+        val ext = twice(b) && twice(w) && twice(t) && twice(d) && twice(p)
+
+        print(n, run, ext)
+    """
+
+@test("a run of an element holding no count fills its slots at every edge length, and Buf.extend with it")
+spr_moved_kinds_fill()
+    if xvr_no_library() then return
+
+    spr_both(spr_moved_kinds(),
+             "0 true true\n1 true true\n15 true true\n16 true true\n17 true true\n63 true true\n" +
+             "64 true true\n65 true true\n4099 true true\n")
+end spr_moved_kinds_fill
+
+// Every element kind placed slot by slot: each slot takes a count of its own, so the run and its
+// source both hold every value, and both let go.
+private spr_placed_kinds() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct N
+        v: int
+
+    struct Holder
+        n: &N
+        tag: int
+
+    for n in [0, 1, 15, 16, 17, 63, 64, 65, 4099]
+        var s: Buf[string] = buf()
+        var r: Buf[&N] = buf()
+        var bb: Buf[Buf[u8]] = buf()
+        var h: Buf[Holder] = buf()
+
+        for i in 0..<n
+            s.push(f"s${i}")
+            r.push(N(i))
+
+            var one: Buf[u8] = buf()
+
+            one.push(u8(i % 200))
+            bb.push(one)
+            h.push(Holder(N(i * 2), i))
+
+        var s2: Buf[string] = buf()
+        var r2: Buf[&N] = buf()
+        var bb2: Buf[Buf[u8]] = buf()
+        var h2: Buf[Holder] = buf()
+
+        s2.extend(s.view())
+        r2.extend(r.view())
+        bb2.extend(bb.view())
+        h2.extend(h.view())
+        s2.extend(s.view())
+        r2.extend(r.view())
+        bb2.extend(bb.view())
+        h2.extend(h.view())
+
+        var good = int(s2.len()) == 2 * n && int(r2.len()) == 2 * n && int(bb2.len()) == 2 * n &&
+            int(h2.len()) == 2 * n
+
+        for i in 0..<n
+            good = good && s2[n + i] == f"s${i}" && r2[i].v == i && r2[n + i].v == i &&
+                bb2[n + i][0] == u8(i % 200) && h2[i].n.v == i * 2 && h2[n + i].tag == i
+
+        val xs = slot_storage[&N](n + 2)
+
+        slot_place(xs, 0, N(-1))
+        slot_place_run(xs, 1, r.view())
+        slot_place(xs, n + 1, N(-2))
+        print(n, good, xs[0].v + xs[n + 1].v, if n > 0 then xs[n].v == n - 1 else true)
+    """
+
+@test("a run of an element holding a count is placed slot by slot at every edge length")
+spr_placed_kinds_fill()
+    if xvr_no_library() then return
+
+    spr_both(spr_placed_kinds(),
+             "0 true -3 true\n1 true -3 true\n15 true -3 true\n16 true -3 true\n17 true -3 true\n" +
+             "63 true -3 true\n64 true -3 true\n65 true -3 true\n4099 true -3 true\n")
+end spr_placed_kinds_fill
+
+@test("a placed run is released exactly once, when the storage goes, in the order the loop's was")
+spr_placed_run_releases_with_the_storage()
+    if xvr_no_library() then return
+
+    spr_both(spr_noisy() + raw"""
+        hold()
+            val two = [N(1), N(2)]
+            var s: []&N = slot_storage(4)
+
+            slot_place_run(s, 0, two[..])
+            slot_place_run(s, 2, two[..])
+            print("placed", s[0].v + s[1].v + s[2].v + s[3].v)
+
+        hold()
+        print("gone")
+        """, "placed 6\ndropped 1\ndropped 2\ngone\n")
+end spr_placed_run_releases_with_the_storage
+
+@test("a run over live slots lets go of what was there, slot by slot, as the loop does")
+spr_run_over_live_slots_assigns()
+    if xvr_no_library() then return
+
+    spr_both(spr_noisy() + raw"""
+        hold()
+            var s: []&N = slot_storage(3)
+
+            slot_place(s, 0, N(1))
+            slot_place(s, 1, N(2))
+            slot_place_run(s, 0, [N(3), N(4), N(5)])
+            print("replaced", s[0].v, s[1].v, s[2].v)
+
+        hold()
+        print("gone")
+        """, "dropped 1\ndropped 2\nreplaced 3 4 5\ndropped 3\ndropped 4\ndropped 5\ngone\n")
+end spr_run_over_live_slots_assigns
+
+// The run read out of the very slots it fills arrives whole either way it overlaps them: from below,
+// which a forward copy would smear, and from above.
+@test("a run of moved elements read out of the slots it fills arrives whole, from below and from above")
+spr_moved_overlap()
+    if xvr_no_library() then return
+
+    spr_both(raw"""
+        val s = slot_storage[int](6)
+
+        slot_place_run(s, 0, [1, 2, 3, 4, 5, 6][..])
+        slot_place_run(s, 2, s[0..<4])
+        print(s[0], s[1], s[2], s[3], s[4], s[5])
+        slot_place_run(s, 0, s[2..<6])
+        print(s[0], s[1], s[2], s[3], s[4], s[5])
+        """, "1 2 1 2 3 4\n1 2 3 4 3 4\n")
+end spr_moved_overlap
+
+@test("a run of placed elements read out of its own live slots arrives whole, from below and from above")
+spr_placed_overlap()
+    if xvr_no_library() then return
+
+    spr_both(spr_noisy() + raw"""
+        hold()
+            var s: []&N = slot_storage(4)
+
+            slot_place_run(s, 0, [N(1), N(2), N(3), N(4)])
+            slot_place_run(s, 1, s[0..<3])
+            print("below", s[0].v, s[1].v, s[2].v, s[3].v)
+            slot_place_run(s, 0, s[1..<4])
+            print("above", s[0].v, s[1].v, s[2].v, s[3].v)
+
+        hold()
+        print("gone")
+        """, "dropped 4\nbelow 1 1 2 3\nabove 1 2 3 3\ndropped 1\ndropped 2\ndropped 3\ngone\n")
+end spr_placed_overlap
+
+@test("an empty run may start at the storage's length, as a cut's bounds may")
+spr_empty_run_at_the_end()
+    if xvr_no_library() then return
+
+    spr_both(raw"""
+        val s = slot_storage[int](2)
+        val none = slot_storage[int](0)
+
+        slot_place_run(s, 2, none)
+        print(s.len)
+        """, "2\n")
+end spr_empty_run_at_the_end
+
+@test("the form yields to a function of its name")
+spr_a_declaration_takes_the_name()
+    if xvr_no_library() then return
+
+    spr_both("slot_place_run(x: int) -> int = x + 1\n\nprint(slot_place_run(2))\n", "3\n")
+end spr_a_declaration_takes_the_name
+
+// -- the traps it shares with slot_place --------------------------------------------------------------
+
+@test("a counted run starting past the first free slot traps, since the release would never reach it")
+spr_gap_traps()
+    if xvr_no_library() then return
+
+    spr_traps(spr_noisy() + raw"""
+        var s: []&N = slot_storage(4)
+
+        slot_place_run(s, 1, [N(1)])
+        print("after")
+        """, "after")
+end spr_gap_traps
+
+@test("a run running past the storage's length is a bounds trap")
+spr_run_past_the_end_traps()
+    if xvr_no_library() then return
+
+    spr_traps("var s: []int = slot_storage(4)\n\nslot_place_run(s, 2, [1, 2, 3])\nprint(\"after\")\n",
+              "after")
+    spr_traps(spr_noisy() + "var s: []&N = slot_storage(1)\n\nslot_place_run(s, 0, [N(1), N(2)])\n" +
+              "print(\"after\")\n", "after")
+end spr_run_past_the_end_traps
+
+@test("an empty run starting past the storage's length is a bounds trap")
+spr_empty_run_past_the_end_traps()
+    if xvr_no_library() then return
+
+    spr_traps("var s: []int = slot_storage(2)\nval none = slot_storage[int](0)\n\n" +
+              "slot_place_run(s, 3, none)\nprint(\"after\")\n", "after")
+end spr_empty_run_past_the_end_traps
+
+// -- refusals ----------------------------------------------------------------------------------------
+
+@test("slot_place_run into a read-only view is refused")
+spr_read_only_is_refused()
+    if xvr_no_library() then return
+
+    spr_refused("f(xs: []const int) = slot_place_run(xs, 0, [1])\nf([1])\n",
+                "'slot_place_run' writes into the slots of a buffer, and []const int is a read-only view of one")
+end spr_read_only_is_refused
+
+@test("slot_place_run into something that is not a slice is refused")
+spr_needs_a_slice()
+    if xvr_no_library() then return
+
+    spr_refused("val n = 3\nslot_place_run(n, 0, [1])\n",
+                "'slot_place_run' works on the slots of a buffer, which is a '[]T' — this is int")
+end spr_needs_a_slice
+
+@test("a run of another element type is refused, a narrower integer and a string alike")
+spr_run_of_another_type_is_refused()
+    if xvr_no_library() then return
+
+    spr_refused("val s: []int = slot_storage(2)\nslot_place_run(s, 0, \"x\")\n",
+                "'slot_place_run' fills slots of []int from a run of int, a '[]const int', and this is a string")
+    spr_refused("val s: []int = slot_storage(2)\nval r = slot_storage[i64](1)\nslot_place_run(s, 0, r)\n",
+                "'slot_place_run' fills slots of []int from a run of int, a '[]const int', and this is a []long")
+end spr_run_of_another_type_is_refused
+
+@test("slot_place_run given the wrong number of arguments is refused")
+spr_wrong_arity_is_refused()
+    if xvr_no_library() then return
+
+    spr_refused("val s: []int = slot_storage(2)\nslot_place_run(s, 0)\n",
+                "'slot_place_run' takes 3 arguments — a buffer, a slot and a run of values — but 2 arguments were given")
+end spr_wrong_arity_is_refused
+
+@test("a slot counted by something that is not an integer is refused")
+spr_slot_must_be_an_integer()
+    if xvr_no_library() then return
+
+    spr_refused("val s: []int = slot_storage(2)\nslot_place_run(s, \"a\", [1])\n",
+                "a slot is counted by an integer, not string")
+end spr_slot_must_be_an_integer
+
+@test("slot_place_run in a '@pure' function is refused")
+spr_pure_is_refused()
+    if xvr_no_library() then return
+
+    spr_refused("@pure\nf(xs: []int) -> int\n    slot_place_run(xs, 0, [1])\n    0\n\nprint(f([2]))\n",
+                "writes a buffer's slots with 'slot_place_run'")
+end spr_pure_is_refused
+
+// -- while compiling ---------------------------------------------------------------------------------
+
+@test("a run is placed while compiling: Buf.extend and its growth in a const function, and an overlap")
+spr_const_runs()
+    if xvr_no_library() then return
+
+    spr_both(raw"""
+        import sysl.buf.{Buf, buf}
+
+        const doubled(xs: []const int) -> Buf[int]
+            var out = buf[int]()
+
+            out.extend(xs)
+            out.extend(xs)
+
+            for i in 0..<20
+                out.push(i)
+
+            out
+
+        const shifted() -> int
+            val s = slot_storage[int](6)
+
+            slot_place_run(s, 0, [1, 2, 3, 4])
+            slot_place_run(s, 2, s[0..<4])
+            s[2] * 1000 + s[3] * 100 + s[4] * 10 + s[5]
+
+        const FOURTH: int = doubled([1, 2, 3][..])[4]
+        const LAST: int = doubled([1, 2, 3][..])[25]
+        const SHIFTED: int = shifted()
+
+        print(FOURTH, LAST, SHIFTED, shifted())
+        """, "2 19 1234 1234\n")
+end spr_const_runs
+
+@test("a run past the storage's length while compiling is refused with the trap's reason")
+spr_const_run_past_the_end()
+    if xvr_no_library() then return
+
+    spr_refused(raw"""
+        const over() -> int
+            val s = slot_storage[int](4)
+
+            slot_place_run(s, 2, [1, 2, 3])
+            s[0]
+
+        const OVER: int = over()
+
+        print(OVER)
+        """, "a run of 3 elements from slot 2 is out of bounds for a slice of 4 elements")
+end spr_const_run_past_the_end
+
+// -- the counted heap -----------------------------------------------------------------------------
+
+@test("runs and Buf.extend of every element kind give back everything they took")
+spr_counted_heap_balances()
+    if xvr_no_library() || !clang_available() then return
+
+    for text in [spr_moved_kinds(), spr_placed_kinds()]
+        val root = make_temp_dir("sysl-spr").unwrap()
+
+        make_dir_all(root).unwrap()
+        write_text(s"$root/main.sysl", text).unwrap()
+        force_alloc_counting(true)
+
+        val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization,
+                                         Some(s"$root/built"))
+
+        force_alloc_counting(false)
+
+        built match
+            Err(why) ->
+                remove_dir_all(root).unwrap_or(())
+                assert(false, failure_text(why))
+                return
+            Ok(_) -> ()
+
+        val said = capture(s"$root/built", [], "", [], true).unwrap()
+
+        remove_dir_all(root).unwrap_or(())
+        assert(said.status.ok(), said.text)
+        assert(alloc_count_reported(said.err.unwrap_or("")) == 0, said.err.unwrap_or(""))
+    end for
+end spr_counted_heap_balances
+
+// -- the shape it lowers to --------------------------------------------------------------------------
+
+private spr_shapes() -> string = raw"""
+    module demo
+
+    import sysl.buf.{Buf, buf}
+
+    enum Dir
+        North
+        South
+
+    struct P
+        x: i32
+        y: i16
+
+    struct N
+        v: int
+
+    struct Holder
+        n: &N
+        tag: int
+
+    @noinline
+    bytes(xs: []u8, src: []const u8) = slot_place_run(xs, 0, src)
+
+    @noinline
+    flags(xs: []bool, src: []const bool) = slot_place_run(xs, 0, src)
+
+    @noinline
+    dirs(xs: []Dir, src: []const Dir) = slot_place_run(xs, 0, src)
+
+    @noinline
+    points(xs: []P, src: []const P) = slot_place_run(xs, 0, src)
+
+    @noinline
+    texts(xs: []string, src: []const string) = slot_place_run(xs, 0, src)
+
+    @noinline
+    nested(xs: []Buf[u8], src: []const Buf[u8]) = slot_place_run(xs, 0, src)
+
+    @noinline
+    holders(xs: []Holder, src: []const Holder) = slot_place_run(xs, 0, src)
+
+    main()
+        bytes(slot_storage(1), slot_storage[u8](1))
+        flags(slot_storage(1), slot_storage[bool](1))
+        dirs(slot_storage(1), slot_storage[Dir](1))
+        points(slot_storage(1), slot_storage[P](1))
+        texts(slot_storage(1), slot_storage[string](0))
+        nested(slot_storage(1), slot_storage[Buf[u8]](0))
+        holders(slot_storage(1), slot_storage[Holder](0))
+
+        var b: Buf[u8] = buf()
+        var nb: Buf[Buf[u8]] = buf()
+
+        b.extend("ab".bytes)
+        nb.extend([b][..])
+        print(b.len(), nb.len())
+    """
+
+@test("a run of a byte, a bool, a bare enum and a pointer-free struct is one memmove, and no loop")
+spr_moved_kinds_are_one_memmove()
+    if xvr_no_library() then return
+
+    val ir = xvr_ir([("main.sysl", spr_shapes())])
+
+    for name in ["@demo$bytes(", "@demo$flags(", "@demo$dirs(", "@demo$points("]
+        val body = spr_body(ir, name)
+
+        assert(spr_moves(body) == 1, s"$name:\n$body")
+        assert(!body.contains("slot.each") && !body.contains("arc.slotplace"), s"$name:\n$body")
+end spr_moved_kinds_are_one_memmove
+
+@test("a run of a string, a Buf and a struct holding a reference is placed slot by slot, with no memmove")
+spr_placed_kinds_are_placed_one_by_one()
+    if xvr_no_library() then return
+
+    val ir = xvr_ir([("main.sysl", spr_shapes())])
+
+    for name in ["@demo$texts(", "@demo$nested(", "@demo$holders("]
+        val body = spr_body(ir, name)
+
+        assert(spr_moves(body) == 0, s"$name:\n$body")
+        assert(body.contains("slot.each") && body.contains("arc.slotplace"), s"$name:\n$body")
+end spr_placed_kinds_are_placed_one_by_one
+
+@test("Buf.extend of bytes is one memmove, and of a Buf of Bufs is placed slot by slot")
+spr_extend_shapes()
+    if xvr_no_library() then return
+
+    val ir = xvr_ir([("main.sysl", spr_shapes())])
+    val bytes = spr_body(ir, "@sysl.buf$BufCore.extend.byte(")
+    val nested = spr_body(ir, "@sysl.buf$BufCore.extend.sysl.buf$Buf.byte")
+    val grow = spr_body(ir, "@sysl.buf$BufCore.grow.byte(")
+
+    assert(spr_moves(bytes) == 1 && !bytes.contains("slot.each"), bytes)
+    assert(spr_moves(grow) == 1 && !grow.contains("slot.each"), grow)
+    assert(spr_moves(nested) == 0 && nested.contains("slot.each"), nested)
+end spr_extend_shapes
+
+// -- bare metal ------------------------------------------------------------------------------------
+
+private val SprNm: string = "/opt/homebrew/opt/llvm/bin/llvm-nm"
+
+// A Buf of bytes extended, and a run of words, reached through a pointer so no heap is needed to
+// compile it.
+private val SprBare: string = raw"""
+    import sysl.buf.Buf
+    import sysl.raw.ptr_cast
+
+    @export("main")
+    entry(n: usize) -> int
+        var raw: [1]usize = [0]
+        val p: *Buf[u8] = ptr_cast(&raw[0])
+        val src: [5]u8 = [1, 2, 3, 4, 5]
+        var words: [8]u32 = [0; 8]
+        val from: [3]u32 = [7, 8, 9]
+
+        p.extend(src[..])
+        slot_place_run(words[..], n, from[..])
+        int(p.len()) + int(words[n])
+    """
+
+// What `src` compiled for `name` at `-O2` leaves undefined, one `U name` line each.
+private spr_undefined(name: string, src: string) -> Result[(string, Buf[string]), string]
+    val t = target_named(name).unwrap()
+    val cc = find_backend_clang(t)?
+    val dir = make_temp_dir("sysl-spr").unwrap()
+
+    write_text(s"$dir/main.sysl", src).unwrap()
+
+    val text = emit_llvm_text(dir, Some(name), DefaultOptimization, buf(), Some(buf())) match
+        Err(why) -> s"did not compile: ${failure_text(why)}"
+        Ok(e) -> if e.report.is_empty() then e.text else s"did not compile: ${analysis_report(e.report)}"
+
+    if text.starts_with("did not compile")
+        remove_dir_all(dir).unwrap_or(())
+        return Err(s"$name: $text")
+
+    val obj = s"$dir/probe.o"
+
+    compile_object(cc, text, obj, t, "2") match
+        Err(why) ->
+            remove_dir_all(dir).unwrap_or(())
+            return Err(s"$name: $why")
+        Ok(_) -> ()
+
+    val listing = capture(SprNm, ["-u", obj]).map((o) -> o.text).unwrap_or("llvm-nm could not be run")
+    val lines = split(listing, "\n")
+
+    var out: Buf[string] = buf()
+
+    for i in 0..<lines.len
+        val line = lines[i].trim()
+
+        if line != "" then out.push(line)
+
+    remove_dir_all(dir).unwrap_or(())
+    Ok((text, out))
+end spr_undefined
+
+@test("on Thumb a run is llvm.memmove, met by the image's own __aeabi_memmove; on RV32 it walks the run")
+spr_bare_metal_closes()
+    if xvr_no_library() then return
+    if !is_file(SprNm) then skip(s"there is no llvm-nm at $SprNm to read the object")
+
+    for name in ["thumb-freestanding-softfp", "thumbv6m-freestanding", "thumbv7em-freestanding",
+                 "riscv32-freestanding"]
+        find_backend_clang(target_named(name).unwrap()) match
+            Err(why) ->
+                skip(why)
+                return
+            Ok(_) -> ()
+
+        spr_undefined(name, SprBare) match
+            Err(why) -> assert(false, why)
+            Ok(got) ->
+                val thumb = name.starts_with("thumb")
+
+                assert(got.0.contains("@llvm.memmove") == thumb, s"$name:\n${got.0}")
+
+                for n in got.1
+                    assert(n != "U memmove" && n != "U __aeabi_memmove" && n != "U __aeabi_memmove4" &&
+                           n != "U __aeabi_memmove8", s"$name leaves $n undefined; all: ${joined(got.1, ", ")}")
+    end for
+end spr_bare_metal_closes
+
+// The moves themselves, run: bytes overlapping from below and from above, and words at every edge,
+// over module storage, which no heap is needed for. Thumb moves with `__aeabi_memmove`; RV32 walks.
+private val SprBoardBody: string = raw"""
+    var cells: [80]u8 = [0; 80]
+    var words: [40]u32 = [0; 40]
+    var wrong = 0
+
+    for i in 0..<80
+        cells[i] = u8(i)
+
+    slot_place_run(cells[..], black_box(10usize), cells[0..<40])
+
+    for k in 0..<40
+        if cells[10 + k] != u8(k) then wrong += 1
+
+    for i in 0..<80
+        cells[i] = u8(i)
+
+    slot_place_run(cells[..], black_box(0usize), cells[7..<70])
+
+    for k in 0..<63
+        if cells[k] != u8(k + 7) then wrong += 1
+
+    for n in [0, 1, 15, 16, 17]
+        for i in 0..<40
+            words[i] = u32(i * 3)
+
+        slot_place_run(words[..], black_box(20usize), words[1..<1 + n])
+
+        for k in 0..<n
+            if words[20 + k] != u32((k + 1) * 3) then wrong += 1
+
+    w.write("spr ".bytes)
+    wrong.display(w, FormatSpec(0, -1, false))
+    w.write(" done".bytes)
+    """
+
+@test("a run moves whole on every board, overlapping either way, at every edge")
+spr_runs_on_the_boards()
+    var bad: Buf[string] = buf()
+    var ran: usize = 0
+
+    for b in qemu_boards()
+        ran += 1
+
+        var files: Buf[(string, string)] = buf()
+
+        files.push(("p.sysl", "import board.*\nimport sysl.hint.black_box\n\nval w = console()\n\n" +
+                    SprBoardBody))
+        files.push(("board/board.sysl", qemu_board_module(b)))
+
+        qemu_boot(b, files) match
+            Err(why) -> bad.push(s"${b.name} (${b.target}): $why")
+            Ok(r) ->
+                if !r.status.ok() || !r.out.contains("spr 0 done") then
+                    bad.push(s"${b.name} (${b.target}): ${qemu_said(b, r)}")
+    end for
+
+    assert(ran > 0, "no board was booted")
+    assert(bad.is_empty(), joined(bad, "\n"))
+end spr_runs_on_the_boards
