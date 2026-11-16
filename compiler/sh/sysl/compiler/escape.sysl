@@ -368,7 +368,8 @@ private note_promotions(into: *Buf[(string, string)], home: Scope, w: EscapeWalk
         if site.name != ""
             val at = home.src.locate(site.at.start)
             val line = s"${home.src.name}:${at.line}:${at.col + literate_shift(home.src)}: " +
-                s"'${site.name}' is promoted to the heap, because this view of it ${site.how}"
+                s"'${shown_block_local(site.name)}' is promoted to the heap, because this view of it " +
+                s"${site.how}"
 
             into.push((home.src.name, line))
 end note_promotions
@@ -443,8 +444,15 @@ private fresh_walk(stmts: Buf[TStmt]) -> &EscapeWalk
                None)
 end fresh_walk
 
+// **A body's value is walked as one more statement of it.** A body that ends in an expression -- a
+// trailing `for`, `if` or `match`, whatever its type -- declares locals in that expression's blocks
+// exactly as it does in its statements, so the scans of what the body declares and the fixpoint that
+// binds its locals have to see it too: an array declared there is one this body may move, and a
+// view bound there is one whose escape has to be caught. Only what is left once the value is walked
+// is the value's own: whether it is returned holding a view.
 private walk_body(p: TProgram, keeps: &KeptParams, stmts: Buf[TStmt], result: Option[TExpr]) -> EscapeWalk
-    val w = fresh_walk(stmts)
+    val whole = with_result(stmts, result)
+    val w = fresh_walk(whole)
     val prog = p
     val kp = keeps
     var changed = true
@@ -452,23 +460,33 @@ private walk_body(p: TProgram, keeps: &KeptParams, stmts: Buf[TStmt], result: Op
     while changed
         val before: &Counted = Counted(0)
 
-        walk_stmts(stmts, TWalk(false, e -> bind_stored(prog, kp, w, before, e), x -> (),
+        walk_stmts(whole, TWalk(false, e -> bind_stored(prog, kp, w, before, e), x -> (),
                                 s -> bind_one(prog, kp, w, before, s)))
         changed = before.n > 0
 
-    walk_stmts(stmts, stmt_walk(false, s -> check_one(prog, kp, w, s)))
-    walk_stmts(stmts, expr_walk(false, x -> check_sync_root(w, x)))
+    walk_stmts(whole, stmt_walk(false, s -> check_one(prog, kp, w, s)))
+    walk_stmts(whole, expr_walk(false, x -> check_sync_root(w, x)))
 
     result match
-        Some(r) -> walk_texpr(r, expr_walk(false, x -> check_sync_root(w, x)))
-        None -> ()
-
-    result match
-        Some(r) -> returned(prog, kp, w, r)
+        Some(r) -> if views(prog, kp, w, r).non_empty() then gets_out(prog, kp, w, r, "is returned")
         None -> ()
 
     *w
 end walk_body
+
+// The statements of a body, and its value as a statement after them where it has one.
+private with_result(stmts: Buf[TStmt], result: Option[TExpr]) -> Buf[TStmt]
+    var out: Buf[TStmt] = buf()
+
+    for s in stmts
+        out.push(s)
+
+    result match
+        Some(r) -> out.push(TExprStmt(r))
+        None -> ()
+
+    out
+end with_result
 
 // One statement's bindings: a local views whatever it was given, and a `ref` name views whatever its
 // place views.
@@ -590,7 +608,7 @@ private check_one(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, s: TStmt) = s
 // Neither is an escape from the frame, so a parameter summary is not told about it.
 private kept_in_local(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, name: string, v: TExpr)
     val seen = views(p, keeps, w, v)
-    val how = s"is kept in '$name', which outlives it"
+    val how = s"is kept in '${shown_block_local(name)}', which outlives it"
 
     for item in seen.named
         if !holds_string(w.promoted, item) && !outlives(w, item, name)
@@ -1146,12 +1164,13 @@ private array_root(w: &EscapeWalk, base: TExpr) -> EView = *base.kind match
             // taken through it is not counted (`promoted_owner`) and stays the frame's.
             Some(place) ->
                 if spine_root(place).is_some()
-                    unnamed_view(s"'$name' is a 'ref' to an element or a field reached through a " +
-                                 "view, a 'Buf' or a reference, and a view taken through a 'ref' " +
-                                 "carries no owner of the storage")
+                    unnamed_view(s"'${shown_block_local(name)}' is a 'ref' to an element or a field " +
+                                 "reached through a view, a 'Buf' or a reference, and a view taken " +
+                                 "through a 'ref' carries no owner of the storage")
                 else array_root(w, place)
-            None -> unnamed_view(s"'$name' is an array this body holds by value without having " +
-                                 "declared it, such as a parameter, so there is no declaration to move")
+            None -> unnamed_view(s"'${shown_block_local(name)}' is an array this body holds by value " +
+                                 "without having declared it, such as a parameter, so there is no " +
+                                 "declaration to move")
 
     // **Module storage is not this frame's and never dies with it**, so a slice of one views nothing
     // here: it is static for the whole run, and both answers this pass could otherwise give are
@@ -1173,7 +1192,7 @@ private array_root(w: &EscapeWalk, base: TExpr) -> EView = *base.kind match
     _ -> unnamed_view("it is storage this body did not declare, so there is no declaration to move")
 
 private struct_value_named(r: TExpr) -> string = *r.kind match
-    TLoad(name, _) -> s"'$name', a struct value"
+    TLoad(name, _) -> s"'${shown_block_local(name)}', a struct value"
     _ -> "a struct value"
 
 // -- an element in a container's own bytes ------------------------------------------------------------
@@ -1211,7 +1230,7 @@ private container_storage(w: &EscapeWalk, place: TExpr) -> EView
     *place.kind match
         TLoad(name, _) -> ref_place(w, name) match
             Some(bound) -> container_storage(w, bound)
-            None -> unnamed_view(own_bytes_why(s"'$name'"))
+            None -> unnamed_view(own_bytes_why(s"'${shown_block_local(name)}'"))
         _ -> unnamed_view(own_bytes_why("a container this body reached"))
 end container_storage
 
@@ -1462,12 +1481,16 @@ end ExprList
 // the caller's to keep alive. Module storage is never the frame's. `&` of a value with no storage of
 // its own makes a slot in this frame, so it is refused the same way. A pointer stored somewhere else
 // than the result is not asked about here.
+//
+// A `return` or a `ref` inside the body's own value -- a trailing `if` or loop -- is found as one in
+// its statements is (`with_result`).
 private refuse_dangling(a: &Analysis, scope: Scope, f: TFunc)
-    val refs = ref_bindings(f.body.stmts)
+    val whole = with_result(f.body.stmts, f.body.result)
+    val refs = ref_bindings(whole)
     val params = f.params
     val an = a
 
-    walk_stmts(f.body.stmts, stmt_walk(false, s -> s match
+    walk_stmts(whole, stmt_walk(false, s -> s match
         TReturn(v) -> v match
             Some(x) -> dangling_tail(an, scope, refs, params, x)
             None -> ()
@@ -1607,7 +1630,7 @@ private refuse_no_alloc(a: &Analysis, p: TProgram, scope: Scope, who: Option[str
     else s"'${a.tables.target.name}' provides no allocator"
 
     for site in w.sites
-        val subject = if site.name == "" then site.what else s"'${site.name}'"
+        val subject = if site.name == "" then site.what else s"'${shown_block_local(site.name)}'"
 
         a.fault(scope, site.at,
             s"this view of $subject ${site.how}, so the array would move to the heap to outlive " +
@@ -1635,9 +1658,11 @@ private refuse_aligned(a: &Analysis, scope: Scope, w: EscapeWalk)
 
         if asked.is_none() then continue
 
+        val shown = shown_block_local(site.name)
+
         a.fault(scope, site.at,
-            s"this view of '${site.name}' ${site.how}, so the array would move to the heap to " +
-            s"outlive the frame — and '${site.name}' asked to begin on a ${asked.unwrap()}-byte " +
+            s"this view of '$shown' ${site.how}, so the array would move to the heap to " +
+            s"outlive the frame — and '$shown' asked to begin on a ${asked.unwrap()}-byte " +
             "boundary, which is the allocator's to answer there rather than this declaration's. " +
             "Keep the view inside the frame, or put the boundary on a struct with '@align', which " +
             "every value of that type carries wherever its storage is")
