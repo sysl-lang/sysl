@@ -45,8 +45,8 @@ enum Option[T]                 enum Result[T, E]
 
 - **`Option[T]` represents absence**: a value that may or may not be there, with no reason attached,
   such as a missing key, the `next` of a list's last node, or the result of a search. It is also what
-  a [`weak` reference](/reference/memory/) yields when read, and what a fallible constructor like
-  `char.try` returns.
+  a [`weak` reference](/reference/memory/) yields when read, and what a fallible conversion like
+  `sysl.text.char_from_u32` returns.
 - **`Result[T, E]` represents failure with a reason**: parsing, I/O, validation. `E` is whatever
   carries the reason: a string, an error enum, a `&Fail`.
 
