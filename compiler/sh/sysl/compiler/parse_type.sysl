@@ -49,6 +49,15 @@ parse_type(p: *Parser) -> TypeRef
             type_ref(at, FnType(params, ret, true))
 end parse_type
 
+// The `-> R` after a parameter list in a function type. Without one the type yields `unit`, as a
+// declaration with no `->` does: `Fn(int)` is `Fn(int) -> unit` and `*extern(*u8)` is
+// `*extern(*u8) -> unit`.
+private parse_arrow_result(p: *Parser) -> TypeRef
+    if p.accept_kw("->") then return parse_type(p)
+
+    named_type(p.here(), "unit")
+end parse_arrow_result
+
 // A type with no bare arrow over it.
 parse_core_type(p: *Parser) -> TypeRef
     val start = p.here()
@@ -62,11 +71,8 @@ parse_core_type(p: *Parser) -> TypeRef
         val params = parse_type_list(p, ")")
 
         p.expect_kw(")")
-        p.expect_kw("->")
 
-        val ret = parse_type(p)
-
-        return type_ref(start.to(p.just_taken()), FnType(params, ret, false))
+        return type_ref(start.to(p.just_taken()), FnType(params, parse_arrow_result(p), false))
     end if
 
     // `() -> R` -- a callable of no arguments. Empty parentheses are not a type, so this is the one
@@ -215,11 +221,8 @@ private parse_pointer_type(p: *Parser, start: Span) -> TypeRef
     val params = parse_type_list(p, ")")
 
     p.expect_kw(")")
-    p.expect_kw("->")
 
-    val ret = parse_type(p)
-
-    type_ref(start.to(p.just_taken()), CFnType(params, ret))
+    type_ref(start.to(p.just_taken()), CFnType(params, parse_arrow_result(p)))
 end parse_pointer_type
 
 // `&T` and `&sync T`. `sync` is soft, so `&sync` on its own is a reference to a type called `sync`.
