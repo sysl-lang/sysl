@@ -3344,6 +3344,64 @@ growing a `Buf[Value]` cannot touch a `Machine`. An `await` keeps the count, as 
 returning, capturing or keeping the value; a tuple built on the spot for a keeping call is handed over
 whole.
 
+### A loop lends each element to a body that lets go of nothing
+
+**`for x in seq` over elements with counted parts takes no count per element where the body cannot
+free one**: the loop already holds the sequence's storage, so `x` reads the element where it lies,
+as a borrowed parameter does, and an iteration costs no retain and no release. The body qualifies when
+everything in it could sit in a function that releases nothing — reads, arithmetic, a `match`, nested
+loops, and calls to functions that release nothing and write only their own locals, or that cannot
+reach storage of the element's type or of the sequence's — and its writes land only in `var`s of the
+function's own. The parts a pattern in the header binds, and a `val` copying a field of `x` held by
+value, are lent with it.
+
+Keeping `x` is not a reason to count it: a `break x`, a `return x` or a copy into a `var` takes the
+count where it keeps the value. A count per element stays where the body could free an element under
+the name — storing `x` in module storage or another value's field, a `push`, a closure built in the
+body, an assignment to `x` or to a part, a write to the array being walked, or a call that may write
+the buffer or anything holding an element.
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+enum Value
+    Int(v: int)
+    List(items: Buf[Value])
+
+struct Field
+    name: string
+    value: Value
+
+weight(v: Value) -> int = v match
+    Int(n) -> n
+    List(items) -> sum(items)
+
+sum(items: Buf[Value]) -> int
+    var t = 0
+    for x in items do t += weight(x)
+    t
+
+fields(fs: Buf[Field]) -> int
+    var t = 0
+    for Field{name, value} in fs do t += int(name.len) + weight(value)
+    t
+
+var tags: Buf[Value] = buf()
+
+tags.push(Int(1))
+tags.push(Int(2))
+
+var row: Buf[Field] = buf()
+
+row.push(Field("id", Int(7)))
+row.push(Field("tags", List(tags)))
+print(sum(tags), fields(row))
+```
+
+```output
+3 16
+```
+
 ### A method's answer borrowed from its receiver
 
 **A function whose answer is read out of a parameter's storage is called so that the caller reads it
