@@ -228,6 +228,58 @@ bsh_export_list_is_exact()
     assert_eq(join_sorted(sorted), "bsh_sum bsh_twice bsh_version")
     remove_dir_all(root).unwrap_or(())
 
+// A library whose one export reaches as much of the runtime as a small body can: the heap, `print`
+// and its flush, a bounds check, an overflow check, a contract and a panic -- every one of which
+// reports through the runtime's hooks (`sysl_trap`, `sysl_bounds_fail`) and the standard library's
+// own C-named exports (`sysl_io_flush`, `sysl_io_write`).
+private val bsh_runtime_heavy: string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    @export("rt_pick")
+    pick(n: i32, at: usize) -> i32
+        require n >= 0
+        var b: Buf[i32] = buf()
+
+        for i in 0..<n do b.push(i * 2)
+        print(s"pick ${b.len()}")
+        if at > 100 then panic("too far")
+        b[at] + n * n
+    """
+
+// The names in `names` that belong to the runtime rather than to the module: the `sysl_` and
+// `__sysl_` C names, whichever of them a build happens to reach.
+private bsh_runtime_names(names: Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for name in names
+        if name.starts_with("sysl_") || name.starts_with("__sysl") then out.push(name)
+
+    out
+end bsh_runtime_names
+
+@test("no runtime symbol is exported or declared: every sysl_ name a library reaches stays inside it")
+bsh_no_runtime_symbol_exported()
+    if !bsh_ready() then skip("no clang, no standard library, or a host this does not link for")
+
+    val root = bsh_root()
+    val lib = bsh_library(bsh_project(root, "rt", bsh_runtime_heavy), s"$root/librt${bsh_suffix()}",
+                          ["--header", s"$root/rt.h"])
+
+    assert_eq(join_sorted(bsh_runtime_names(bsh_exported(lib))), "")
+    assert_eq(join_sorted(bsh_exported(lib)), "rt_pick")
+
+    // The archive's header is the same list: the module's API, not the runtime's.
+    val header = read_text(s"$root/rt.h").unwrap()
+
+    assert(header.contains("rt_pick"))
+    assert(!header.contains("sysl_"))
+
+    // The hooks are there, inside the library: what was hidden was the symbol, not the definition.
+    val all = capture("nm", [lib], "", [], true).map((o) -> o.text).unwrap_or("")
+
+    assert(all.contains("sysl_trap"))
+    remove_dir_all(root).unwrap_or(())
+
 @test("a library that exports nothing builds, warns, and offers the loader nothing")
 bsh_nothing_exported()
     if !bsh_ready() then skip("no clang, no standard library, or a host this does not link for")
@@ -674,6 +726,50 @@ private bsh_readelf(readelf: string, flags: []const string, lib: string) -> stri
         Ok(o) -> o.text
 end bsh_readelf
 
+// The symbols an ELF library offers the loader: its dynamic table's defined entries.
+private bsh_elf_exported(readelf: string, lib: string) -> Buf[string]
+    var exported: Buf[string] = buf()
+
+    for line in split(bsh_readelf(readelf, ["--dyn-syms", "--wide"], lib), "\n")
+        var words: Buf[string] = buf()
+
+        for p in split(line.trim(), " ")
+            if p != "" then words.push(p)
+
+        if words.len() == 8 && words[6] != "UND" && words[6] != "Ndx" then exported.push(words[7])
+
+    exported
+end bsh_elf_exported
+
+private bsh_llvm_readelf() -> string =
+    find_ar(None).map((ar) -> s"${parent_of(ar).unwrap_or(".")}/llvm-readelf").unwrap_or("llvm-readelf")
+
+@test("no runtime symbol is in an ELF library's dynamic table, for either machine")
+bsh_elf_no_runtime_symbol()
+    if std_root().is_err() || !clang_available() then skip("no clang or no standard library")
+
+    val headers = bsh_zig_headers() match
+        Some(dir) -> dir
+        None -> skip("no zig, whose glibc headers stand in for a Linux sysroot")
+
+    if capture("ld.lld", ["--version"], "", [], true).is_err() then skip("no ld.lld")
+
+    val root = bsh_root()
+    val cc = bsh_elf_clang(root, headers)
+    val dir = bsh_project(root, "rtelf", bsh_runtime_heavy)
+
+    for target in ["x86_64-linux", "aarch64-linux"]
+        val lib = bsh_library(dir, s"$root/librt-$target.so", ["--target", target, "--cc", cc])
+        val exported = bsh_elf_exported(bsh_llvm_readelf(), lib)
+
+        assert_eq(join_sorted(bsh_runtime_names(exported)), "")
+        assert_eq(join_sorted(exported), "rt_pick")
+
+        // Defined, and local: the library's own calls still find the hooks.
+        assert(bsh_readelf(bsh_llvm_readelf(), ["--syms", "--wide"], lib).contains("sysl_trap"))
+
+    remove_dir_all(root).unwrap_or(())
+
 @test("an ELF library exports only the @export symbols, carries its soname, and reaches thread-locals by a dynamic model")
 bsh_elf_cross_link()
     if std_root().is_err() || !clang_available() then skip("no clang or no standard library")
@@ -682,7 +778,7 @@ bsh_elf_cross_link()
         Some(dir) -> dir
         None -> skip("no zig, whose glibc headers stand in for a Linux sysroot")
 
-    val readelf = find_ar(None).map((ar) -> s"${parent_of(ar).unwrap_or(".")}/llvm-readelf").unwrap_or("llvm-readelf")
+    val readelf = bsh_llvm_readelf()
 
     if capture("ld.lld", ["--version"], "", [], true).is_err() then skip("no ld.lld")
 
@@ -701,18 +797,8 @@ bsh_elf_cross_link()
 
     for (target, tls) in [("x86_64-linux", "R_X86_64_DTPMOD64"), ("aarch64-linux", "R_AARCH64_TLSDESC")]
         val lib = bsh_library(dir, s"$root/libelf-$target.so", ["--target", target, "--cc", cc, "--soname", "libelf.so.1"])
-        var exported: Buf[string] = buf()
 
-        for line in split(bsh_readelf(readelf, ["--dyn-syms", "--wide"], lib), "\n")
-            val parts = split(line.trim(), " ")
-            var words: Buf[string] = buf()
-
-            for p in parts
-                if p != "" then words.push(p)
-
-            if words.len() == 8 && words[6] != "UND" && words[6] != "Ndx" then exported.push(words[7])
-
-        assert_eq(join_sorted(exported), "bsh_enter bsh_tag e_sum")
+        assert_eq(join_sorted(bsh_elf_exported(readelf, lib)), "bsh_enter bsh_tag e_sum")
 
         val dynamic = bsh_readelf(readelf, ["-d"], lib)
 

@@ -1148,6 +1148,12 @@ panic aborts when the hook returns. **Whatever an override does, the program sti
 follows the call, so an override that only counts or logs and then returns stops the program where
 it was. On a freestanding target the default writes nothing and returns.
 
+**A shared library's `sysl_trap` is its own.** `sysl build-c --shared` offers the loader only the
+module's public exports, and the hook is part of the runtime each library carries, so it is not
+among them: a host's definition replaces the hook of a program or an archive it links, never the one
+inside a `.dylib` or `.so` it opens. A library that wants its failures reported differently defines
+`sysl_trap` itself, as a program would.
+
 **`sysl_bounds_fail` is the older, narrower hook, and it still works.** A bounds or overflow check
 calls `sysl_bounds_fail` (same signature, forms 0 to 16), whose weak default hands its arguments on
 to `sysl_trap`. So an override of `sysl_trap` alone sees every failure, and a program that already

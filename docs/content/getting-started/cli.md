@@ -359,7 +359,8 @@ loader finds it when the host opens the library and nothing is left for the host
 **Each library is self-contained**: it carries its own copy of the standard library code it reaches,
 its own module storage, and its own copy of the runtime. **Only the `@export` functions and storage
 are exported** — the symbols the header declares. The runtime's own C-named symbols
-(`sysl_bounds_fail`, `sysl_stdout_write`) are global inside the library, where its own objects find
+(`sysl_bounds_fail`, the `sysl_trap` hook, the standard library's own `@export`s such as
+`sysl_io_flush`) are global inside the library, where its own objects find
 them, and are not offered to the loader. Two sysl libraries opened by one process therefore never bind
 to each other's code, which is also why **a sysl object crosses between two of them only through
 their C API**: a `&T`, a `Buf` or a closure made by one is owned by that library's runtime, and the
