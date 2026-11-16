@@ -182,7 +182,8 @@ private[buf] struct BufCore[T]
      * for carries them.
      *
      * **The new storage's slots start out empty** (`slot_storage`), and the elements already here
-     * are placed into it one by one, each taking a count of its own. Nothing fills the rest: a
+     * are placed into it as one run (`slot_place_run`): one block move for an element that holds no
+     * count, and one by one, each taking a count of its own, for one that does. Nothing fills the rest: a
      * repeated fill value would hold a count in every spare slot, keeping whatever it refers to alive
      * until the storage itself goes. The old storage is not emptied, since a view handed out earlier
      * may still be reading it; it lets go of its elements when its last holder does.
@@ -210,16 +211,15 @@ private[buf] struct BufCore[T]
 
         var bigger: []T = slot_storage(bigger_len)
 
-        for i in 0..<self.count
-            slot_place(bigger, i, self.elems[i])
-
+        slot_place_run(bigger, 0, self.elems[0..<self.count])
         self.elems = bigger
     end grow
 
     /** Every element of a slice appended at once, which is what `push` in a loop was costing more
      * than it looked like. A run of n elements pushed one at a time asks the capacity question n
      * times and may reallocate several times along the way; this asks once, grows once to a size
-     * that fits the whole run, and copies.
+     * that fits the whole run, and places the run with one `slot_place_run` -- which, for an element
+     * holding no count, is one block move rather than a loop of stores.
      *
      * The empty case leaves early because `grow` promises more room than the count, and a run of
      * no elements asks for none -- which costs nothing, since it has nothing to append either.
@@ -227,17 +227,11 @@ private[buf] struct BufCore[T]
     extend(*self, xs: []const T)
         if xs.len == 0 then return
 
-        var need = self.count + xs.len
+        val need = self.count + xs.len
 
         if need > self.elems.len then self.grow(need)
 
-        // The run is cut once, so each place is tested against its length -- which is `xs.len`, the
-        // loop's own bound -- and the cut's own test is what settles the count's re-check below.
-        val run = self.elems[self.count..<need]
-
-        for i in 0..<xs.len
-            slot_place(run, i, xs[i])
-
+        slot_place_run(self.elems, self.count, xs)
         self.count = need
     end extend
 
