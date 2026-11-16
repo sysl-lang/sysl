@@ -734,14 +734,38 @@ wkr_only_the_callee_held_reads_empty_at_the_caller()
 
 // -- what the box carries, and who pays for it ----------------------------------------------------
 
-// The third word is in every box whether or not the program holds a weak reference, because
-// releasing one is type-erased and two layouts would need a word to tell them apart
-// (`reference/memory.md § What a count costs`).
-@test("every box carries the weak count, weak reference or not")
+// The third word is in the box of every type the program weakens. A type it never weakens, shares or
+// makes an object of carries neither it nor the hook, since nothing lets go of one without its type
+// (`reference/memory.md § What a count costs`); one made into a trait object keeps both, weak
+// reference or not, since releasing that is type-erased.
+@test("a weakened box carries the weak count, and one nothing weakens or erases does not")
 wkr_every_box_carries_the_weak_count()
     if !wkr_ready() then return
 
-    assert(wkr_llvm(wkr_unheld()).contains("\n%arc.Node = type { i64, ptr, i64, %struct.Node }\n"))
+    assert(wkr_llvm(wkr_unheld()).contains("\n%arc.Node = type { i64, %struct.Node }\n"))
+
+    val weakened = wkr_llvm(raw"""
+        struct Node
+            value: int
+        var r: &Node = Node(1)
+        var w: weak Node = r
+        print(r.value)
+        """)
+
+    assert(weakened.contains("\n%arc.Node = type { i64, ptr, i64, %struct.Node }\n"), weakened)
+
+    val erased = wkr_llvm(raw"""
+        trait Valued
+            value_of(self) -> int
+        struct Node
+            value: int
+        impl Valued for Node
+            value_of(self) -> int = self.value
+        var r: &Valued = Node(1)
+        print(r.value_of())
+        """)
+
+    assert(erased.contains("\n%arc.Node = type { i64, ptr, i64, %struct.Node }\n"), erased)
 
 @test("and so does a buffer, whose elements come after it")
 wkr_so_does_a_buffer()

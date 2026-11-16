@@ -9,7 +9,8 @@ import sysl.math.bigint.{BigInt, from_int}
 // Both are the same header -- a strong count, the hook that destroys the object, and a weak count --
 // so the runtime works the same whatever it is holding and an object frees itself into whichever
 // heap made it. A buffer adds the element count in front of the elements, because the hook is what
-// destroys them and the hook is reached with no static type in sight.
+// destroys them and the hook is reached with no static type in sight. A box no code reaches without
+// its type keeps the strong count alone (`compact_box.sysl`).
 
 // Puts a value on the heap: one count for the reference this yields, the hook that will destroy it,
 // and a copy of the payload -- whose own references the box now holds a share of.
@@ -203,11 +204,13 @@ private open_box_zeroed(e: *Emit, inner: Type, zeroed: bool) -> (Val, Val)
     val p = allocate_box(e, bn, inner, zeroed)
 
     emit(e, InStore(word_lty(e), VInt(from_int(1)), p, AccPlain, None))
-    store_header_word(e, bn, p, 1, LPtr, drop_fn(e, inner))
 
     // One weak share stands for every strong reference together, so the storage outlives the object
-    // exactly as long as some weak reference is still asking about it.
-    store_header_word(e, bn, p, 2, word_lty(e), VInt(from_int(1)))
+    // exactly as long as some weak reference is still asking about it. A compact box has neither word
+    // (`compact_box.sysl`).
+    if !is_compact(e, inner)
+        store_header_word(e, bn, p, 1, LPtr, drop_fn(e, inner))
+        store_header_word(e, bn, p, 2, word_lty(e), VInt(from_int(1)))
 
     val slot = fresh_reg(e)
 
