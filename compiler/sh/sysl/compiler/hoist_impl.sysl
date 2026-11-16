@@ -279,16 +279,26 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
                         s"'${qualified_name(key.unwrap())}', and this 'impl' would implement it for " +
                         s"${every_shape(h)} — including that one")
                 return Impl(block, span, scope, im.joined)
-        else
-            if !impls_of(a, key.unwrap(), h).is_empty() && !block.overrides
-                a.fault(scope, span, s"${every_shape(h)} already implements " +
-                        s"'${qualified_name(key.unwrap())}', so '${home.label}' has an implementation " +
-                        "and cannot be given a second one — write 'override impl' to say that " +
-                        "replacing it for this one type is what was meant")
-                return Impl(block, span, scope, im.joined)
 
-            a.tables.members.written_shapes.put(impl_key_of(key.unwrap(), h),
-                                                (home.label, block.overrides))
+            if unordered_array_shapes(a, scope, span, key.unwrap(), h, array_subject(block, home.label)) then
+                return Impl(block, span, scope, im.joined)
+        else
+            // The shapes that fix all but one argument of the type are the ones asked: an array has
+            // two, `[3]T` and `[N]u8`, where every other type has its first. A shape fixing less
+            // (`[N]T`, `(..A)`) is the general case a type written out is expected to stand beside.
+            val shapes = nearest_shapes(ty, h)
+
+            for s in shapes
+                if !impls_of(a, key.unwrap(), s).is_empty() && !block.overrides
+                    a.fault(scope, span, s"${every_shape(s)} already implements " +
+                            s"'${qualified_name(key.unwrap())}', so '${home.label}' has an " +
+                            "implementation and cannot be given a second one — write 'override impl' " +
+                            "to say that replacing it for this one type is what was meant")
+                    return Impl(block, span, scope, im.joined)
+
+            for s in shapes
+                a.tables.members.written_shapes.put(impl_key_of(key.unwrap(), s),
+                                                    (home.label, block.overrides))
 
     // Last of the checks about the block as a whole, because every one above it is more specific: a
     // block with no home is often also one the library has already written, and being told which
@@ -1468,7 +1478,16 @@ private impl_shape(a: &Analysis, block: ImplDecl, ty: Type) -> Option[string]
                 return ty match
                     Vector(_, lane) -> Some(lanes_shape(*lane))
                     _ -> None
-            _ -> return Some(ArrayShape)
+            // An array whose length is the block's only parameter keeps its element written out:
+            // `[N]u8` is every array of `u8`. An element mentioning any other parameter is the
+            // every-array shape, where the element is checked to be a parameter of its own.
+            _ ->
+                if block.tparams.len() == 1 && block.tpacks.is_empty()
+                    return ty match
+                        Array(_, elem) -> Some(elements_shape(*elem))
+                        _ -> None
+
+                return Some(ArrayShape)
 
     if pack_param(block).is_some() then return Some(PackShape)
 
@@ -1513,6 +1532,80 @@ private fixed_lane_count(a: &Analysis, scope: Scope, span: Span, block: ImplDecl
         _ -> false
 end fixed_lane_count
 
+// The shapes a block for a type written out in full overlaps closely enough to need `override`
+// beside: the type's most specific shape, and for an array also every array of its element -- the
+// two shapes of an array that each drop one argument.
+private nearest_shapes(ty: Type, head: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    out.push(head)
+
+    ty match
+        Array(_, elem) -> if elements_shape(*elem) != head then out.push(elements_shape(*elem))
+        _ -> ()
+
+    out
+end nearest_shapes
+
+// Whether this block over arrays of one length (`[3]T`) or of one element (`[N]u8`) meets a block of
+// the other kind for the same trait, which is refused: both would cover a `[3]u8`, and neither is
+// more specific than the other, so no order between them could be the right one. Said once, on the
+// second block.
+private unordered_array_shapes(a: &Analysis, scope: Scope, span: Span, trait_key: string,
+                               head: string, label: string) -> bool
+    val length = is_length_shape(head)
+
+    if !length && !is_elements_shape(head) then return false
+
+    val mine = if length then "length" else "element"
+    val theirs = if length then "element" else "length"
+    val other = a.tables.members.array_shapes.get(impl_key_of(trait_key, theirs))
+
+    if other.is_none()
+        if !a.tables.members.array_shapes.has(impl_key_of(trait_key, mine)) then
+            a.tables.members.array_shapes.put(impl_key_of(trait_key, mine), label)
+
+        return false
+    end if
+
+    val by_length = if length then label else other.unwrap()
+    val by_element = if length then other.unwrap() else label
+    val both = written_length(by_length) + written_element(by_element)
+
+    a.fault(scope, span, s"'$by_length' and '$by_element' would both implement " +
+            s"'${qualified_name(trait_key)}' for '$both', with neither more specific than the " +
+            "other — a trait's blocks over arrays may fix the length or fix the element type, not " +
+            "some of each")
+    true
+end unordered_array_shapes
+
+// An array subject as the block wrote it. The written text shows a length that is an expression as
+// `…`, and a length that is the block's own parameter reads better by its name: `[N]u8`.
+private array_subject(block: ImplDecl, label: string) -> string
+    val len_param = length_param(block)
+
+    if len_param.is_none() then return label
+
+    s"[${len_param.unwrap()}]${written_element(label)}"
+
+// `[3]` of `[3]T`, and `u8` of `[N]u8`: the halves of two subjects as written, put together into the
+// one array both would cover.
+private written_length(subject: string) -> string
+    val b = subject.bytes
+
+    for i in 0..<b.len
+        if b[i] == u8(']') then return subject[0..<i + 1]
+
+    subject
+
+private written_element(subject: string) -> string
+    val b = subject.bytes
+
+    for i in 0..<b.len
+        if b[i] == u8(']') then return subject[i + 1..]
+
+    subject
+
 // Whether the block's subject has a length that refused to be one -- `impl[N, T] Tag for [N]T`,
 // where `N` is a type -- which the reading of the subject says, at the length itself. It is the
 // same reading `structural_target` opens with, made here so that a subject with no type ends the
@@ -1555,7 +1648,10 @@ end pack_param
 // two blocks' members under one name and the second reads the first's parameters.
 private shape_symbol(ty: Type, shape: string) -> string = ty match
     Slice(_, _) -> "slice"
-    Array(n, _) -> if shape == ArrayShape then "arr" else s"arr$n"
+    Array(n, elem) ->
+        if shape == ArrayShape then "arr"
+        else if is_elements_shape(shape) then s"arrs.${mangle(*elem)}"
+        else s"arr$n"
     Struct(d) -> if shape == PackShape then "tuple" else s"tuple${d.targs.len()}"
     Vector(_, lane) -> if shape == VectorShape then "vec" else s"vecs.${mangle(*lane)}"
     _ -> "tuple"

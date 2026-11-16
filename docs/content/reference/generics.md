@@ -2038,6 +2038,60 @@ and the written-out one is more specific, so it is found first. A block for `[2]
 over a block for `[N]T` on arrays of two, the same "written out before a parameter" ordering that
 `override` uses.
 
+A block may instead keep the **element** written out and leave the length as its one parameter:
+`impl[const N: usize] Checksum for [N]u8` covers every array of `u8`, whatever its length, and `N`
+is a value in its body as anywhere else:
+
+```sysl
+trait Checksum
+    checksum(self) -> int
+
+impl[const N: usize] Checksum for [N]u8
+    checksum(self) -> int
+        var total = 0
+
+        for b in self
+            total += int(b)
+
+        total * int(N)
+
+sum_of[T: Checksum](v: T) -> int = v.checksum()
+
+val header: [4]u8 = [1, 2, 3, 4]
+val empty: [0]u8 = []
+
+print(header.checksum(), sum_of(header), empty.checksum())
+```
+
+```output
+40 40 0
+```
+
+So an array has three shapes, found most specific first after the array written out in full:
+every array of one length, `[2]T`; every array of one element, `[N]u8`; and every array, `[N]T`.
+The first two each drop one argument, and a `[2]u8` is covered by both with neither more specific
+than the other, so **one trait may have blocks of one kind or the other, not both**:
+
+```sysl
+trait Tag
+    tag(self) -> string
+
+impl[T] Tag for [2]T
+    tag(self) -> string = "pair"
+
+impl[const N: usize] Tag for [N]u8
+    tag(self) -> string = "bytes"
+```
+
+```error
+'[2]T' and '[N]u8' would both implement 'Tag' for '[2]u8', with neither more specific than the other — a trait's blocks over arrays may fix the length or fix the element type, not some of each
+```
+
+An array written out in full beside either of those two shapes is an overlap, and the written-out
+block says `override`, as for [any other shape](/reference/traits/#a-shape-is-covered-the-same-way).
+An element mentioning another of the block's parameters is the every-array shape, where the element
+must be a parameter of its own.
+
 A vector's lane count is a value parameter on the same terms, so `impl[const N: usize] LaneMath for
 <N>f32` is one block covering every vector of `f32`, and `<N>T` every vector. A vector keeps its
 *lane* written out where an array keeps its length: `<N>f32` is found before `<N>T`, and `<4>T` is

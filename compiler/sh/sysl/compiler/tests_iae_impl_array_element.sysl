@@ -1,0 +1,357 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{Search, str_builder}
+
+// An `impl` for **every array of one element type** (`reference/generics.md § What it is for: a fixed
+// array renders`). An array has three shapes, most specific first: every array of one length, `[3]T`;
+// every array of one element, `[N]u8`; and every array, `[N]T`. The first two each drop one argument,
+// so a trait may have blocks of one kind or the other and not both: `[3]T` and `[N]u8` would cover a
+// `[3]u8` with neither more specific than the other.
+//
+// The axes: the subject's spelling (in full, one element, one length, every array), the receiver (a
+// concrete length, the empty array, a length a generic function stands for, a bounded type parameter),
+// the element (a scalar, a string, a near miss of another width), the overlap between the shapes (an
+// override, the refusal in both orders, two traits, two elements), the members (the length read as a
+// value, a member writing through the receiver, the compiler's own `len`), and the neighbours (a
+// vector of the same element, a slice). Not covered: an element mentioning a second parameter of the
+// block (`[N][M]u8`), which is the every-array shape's question and refused there.
+
+private iae_ready() -> bool
+    std_root() match
+        Ok(_) -> true
+        Err(_) ->
+            print("skipped: the standard module's source is not on this machine")
+            false
+
+// Every diagnostic a one-file program earns, one message to a line in source order.
+private iae_diags(text: string) -> string
+    val root = make_temp_dir("sysl-iae").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    var b = str_builder()
+
+    emit_llvm_text(src, None) match
+        Err(why) -> b.push(s"refused: ${why.message}")
+        Ok(made) ->
+            val ordered = in_source_order(made.report)
+
+            for i in 0..<ordered.len()
+                if i > 0 then b.push("\n")
+
+                b.push(if ordered[i].is_error() then "error: " else "warning: ")
+                b.push(ordered[i].diag.message)
+
+    remove_dir_all(root).unwrap_or(())
+    b.finish()
+end iae_diags
+
+// What a program prints, or why it did not build or run.
+private iae_run(text: string) -> string
+    if !clang_available() then return "skipped"
+
+    val root = make_temp_dir("sysl-iae").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return s"did not build: ${failure_text(why)}"
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text + out.err.unwrap_or("")
+end iae_run
+
+private iae_ran(text: string, expected: string)
+    if !iae_ready() then return
+
+    val got = iae_run(text)
+
+    if got != "skipped" then assert_eq(got, expected)
+
+private iae_tag() -> string = "trait Tag\n    tag(self) -> string\n"
+
+private iae_block(subject: string, said: string) -> string =
+    s"impl$subject\n    tag(self) -> string = \"$said\"\n"
+
+// The refusal of a length's block beside an element's, whichever was written second.
+private iae_unordered(by_length: string, by_element: string, both: string) -> string =
+    s"error: '$by_length' and '$by_element' would both implement 'Tag' for '$both', with neither " +
+    "more specific than the other — a trait's blocks over arrays may fix the length or fix the " +
+    "element type, not some of each"
+
+// -- every array of one element ---------------------------------------------------------------------
+
+@test("impl array element: every length of u8 carries a method, at four, sixteen and zero")
+iae_every_length_of_one_element()
+    iae_ran(raw"""
+        trait Width
+            width(self) -> usize
+        impl[const N: usize] Width for [N]u8
+            width(self) -> usize = N
+        val a: [4]u8 = [1, 2, 3, 4]
+        var b: [16]u8
+        val z: [0]u8 = []
+        print(a.width(), b.width(), z.width())
+        """, "4 16 0\n")
+
+@test("impl array element: the length is a value the body computes with, beside the elements")
+iae_the_length_is_a_value()
+    iae_ran(raw"""
+        trait Sum
+            sum(self) -> int
+        impl[const N: usize] Sum for [N]u8
+            sum(self) -> int
+                var total = 0
+                for i in 0..<N
+                    total += int(self[i])
+                total * int(N)
+        val a: [3]u8 = [1, 2, 3]
+        print(a.sum())
+        """, "18\n")
+
+@test("impl array element: a generic function bound by the trait calls it at every length")
+iae_through_a_bound()
+    iae_ran(raw"""
+        trait Width
+            width(self) -> usize
+        impl[const N: usize] Width for [N]u8
+            width(self) -> usize = N
+        twice[T: Width](v: T) -> usize = v.width() * 2
+        val a: [4]u8 = [1, 2, 3, 4]
+        val b: [16]u8 = [0; 16]
+        print(twice(a), twice(b))
+        """, "8 32\n")
+
+@test("impl array element: a function generic over the length calls it at the length it stands for")
+iae_through_a_generic_length()
+    iae_ran(raw"""
+        trait Width
+            width(self) -> usize
+        impl[const N: usize] Width for [N]u8
+            width(self) -> usize = N
+        measure[const W: usize](v: [W]u8) -> usize = v.width() + 1
+        val a: [5]u8 = [0; 5]
+        print(measure(a))
+        """, "6\n")
+
+@test("impl array element: a member taking *self writes through the array")
+iae_a_member_writes_through()
+    iae_ran(raw"""
+        trait Fill
+            fill(*self, b: u8)
+        impl[const N: usize] Fill for [N]u8
+            fill(*self, b: u8)
+                for i in 0..<N
+                    self[i] = b
+        var a: [3]u8 = [1, 2, 3]
+        a.fill(7)
+        print(a[0], a[2])
+        """, "7 7\n")
+
+@test("impl array element: the element may be a string")
+iae_a_string_element()
+    iae_ran(iae_tag() + raw"""
+        impl[const N: usize] Tag for [N]string
+            tag(self) -> string = if N == 0 then "none" else self[0]
+        val a = ["x", "y"]
+        print(a.tag())
+        """, "x\n")
+
+@test("impl array element: an array of another element does not satisfy the bound")
+iae_another_element_does_not_satisfy()
+    if !iae_ready() then return
+
+    assert_eq(iae_diags(raw"""
+        trait Width
+            width(self) -> usize
+        impl[const N: usize] Width for [N]u8
+            width(self) -> usize = N
+        twice[T: Width](v: T) -> usize = v.width() * 2
+        val a: [4]u16 = [1, 2, 3, 4]
+        print(twice(a))
+        """),
+        "error: 'twice' requires its type parameter 'T' to implement 'Width', but [4]ushort does not")
+
+@test("impl array element: an array of another element has no such member")
+iae_another_element_has_no_member()
+    if !iae_ready() then return
+
+    val got = iae_diags(raw"""
+        trait Width
+            width(self) -> usize
+        impl[const N: usize] Width for [N]u8
+            width(self) -> usize = N
+        val a: [4]u16 = [1, 2, 3, 4]
+        print(a.width())
+        """)
+
+    assert(got.starts_with("error: ") && got.contains("width"), got)
+
+@test("impl array element: a vector of the same element is not an array")
+iae_a_vector_is_not_covered()
+    if !iae_ready() then return
+
+    val got = iae_diags(raw"""
+        trait Width
+            width(self) -> usize
+        impl[const N: usize] Width for [N]u8
+            width(self) -> usize = N
+        twice[T: Width](v: T) -> usize = v.width() * 2
+        val v: <4>u8 = 1
+        print(twice(v))
+        """)
+
+    assert(got.contains("to implement 'Width', but <4>byte does not"), got)
+
+// -- the order between the shapes -------------------------------------------------------------------
+
+@test("impl array element: an override for one array beats every array of its element")
+iae_override_beats_the_element()
+    iae_ran(iae_tag() + raw"""
+        impl[const N: usize] Tag for [N]u8
+            tag(self) -> string = "bytes"
+        override impl Tag for [4]u8
+            tag(self) -> string = "four bytes"
+        val a: [4]u8 = [0; 4]
+        val b: [8]u8 = [0; 8]
+        print(a.tag(), b.tag())
+        """, "four bytes bytes\n")
+
+@test("impl array element: and the override may come first")
+iae_override_written_first()
+    iae_ran(iae_tag() + raw"""
+        override impl Tag for [4]u8
+            tag(self) -> string = "four bytes"
+        impl[const N: usize] Tag for [N]u8
+            tag(self) -> string = "bytes"
+        val a: [4]u8 = [0; 4]
+        val b: [2]u8 = [0; 2]
+        print(a.tag(), b.tag())
+        """, "four bytes bytes\n")
+
+@test("impl array element: every array of one element is found before every array")
+iae_element_before_every_array()
+    iae_ran(iae_tag() + raw"""
+        impl[const N: usize, T] Tag for [N]T
+            tag(self) -> string = "any"
+        impl[const N: usize] Tag for [N]u8
+            tag(self) -> string = "bytes"
+        override impl Tag for [2]u8
+            tag(self) -> string = "two bytes"
+        val a: [4]u8 = [0; 4]
+        val b: [4]u16 = [0; 4]
+        val c: [2]u8 = [0; 2]
+        print(a.tag(), b.tag(), c.tag())
+        """, "bytes any two bytes\n")
+
+@test("impl array element: two elements are two blocks of one trait")
+iae_two_elements_one_trait()
+    iae_ran(iae_tag() + raw"""
+        impl[const N: usize] Tag for [N]u8
+            tag(self) -> string = "u8"
+        impl[const N: usize] Tag for [N]u16
+            tag(self) -> string = "u16"
+        val a: [4]u8 = [0; 4]
+        val b: [4]u16 = [0; 4]
+        print(a.tag(), b.tag())
+        """, "u8 u16\n")
+
+@test("impl array element: one array written after every array of its element needs override")
+iae_one_array_after_the_shape()
+    if !iae_ready() then return
+
+    assert_eq(iae_diags(iae_tag() + iae_block("[const N: usize] Tag for [N]u8", "a") +
+                        iae_block(" Tag for [4]u8", "b")),
+              "error: every array of byte already implements 'Tag', so '[4]byte' has an implementation " +
+              "and cannot be given a second one — write 'override impl' to say that replacing it " +
+              "for this one type is what was meant")
+
+@test("impl array element: and every array of an element written after one array of it is refused")
+iae_the_shape_after_one_array()
+    if !iae_ready() then return
+
+    assert_eq(iae_diags(iae_tag() + iae_block(" Tag for [4]u8", "b") +
+                        iae_block("[const N: usize] Tag for [N]u8", "a")),
+              "error: '[4]byte' already implements 'Tag', and this 'impl' would implement it for every " +
+              "array of byte — including that one")
+
+// -- a length's block and an element's block in one trait --------------------------------------------
+
+@test("impl array element: one length's block then one element's block is refused")
+iae_length_then_element_refused()
+    if !iae_ready() then return
+
+    assert_eq(iae_diags(iae_tag() + iae_block("[T] Tag for [4]T", "a") +
+                        iae_block("[const N: usize] Tag for [N]u8", "b")),
+              iae_unordered("[4]T", "[N]u8", "[4]u8"))
+
+@test("impl array element: one element's block then one length's block is refused")
+iae_element_then_length_refused()
+    if !iae_ready() then return
+
+    assert_eq(iae_diags(iae_tag() + iae_block("[const N: usize] Tag for [N]u16", "b") +
+                        iae_block("[T] Tag for [3]T", "a")),
+              iae_unordered("[3]T", "[N]u16", "[3]u16"))
+
+@test("impl array element: the refusal is said once, against the first block of the other kind")
+iae_refused_once()
+    if !iae_ready() then return
+
+    assert_eq(iae_diags(iae_tag() + iae_block("[T] Tag for [4]T", "a") +
+                        iae_block("[T] Tag for [8]T", "b") +
+                        iae_block("[const N: usize] Tag for [N]u8", "c")),
+              iae_unordered("[4]T", "[N]u8", "[4]u8"))
+
+@test("impl array element: the refusal names the length parameter the block declared")
+iae_refused_by_its_own_name()
+    if !iae_ready() then return
+
+    assert_eq(iae_diags(iae_tag() + iae_block("[const L: usize] Tag for [L]u8", "c") +
+                        iae_block("[T] Tag for [2]T", "a")),
+              iae_unordered("[2]T", "[L]u8", "[2]u8"))
+
+@test("impl array element: a length's block and an element's block of two traits both stand")
+iae_two_traits_both_stand()
+    iae_ran(iae_tag() + raw"""
+        trait Width
+            width(self) -> usize
+        impl[T] Tag for [4]T
+            tag(self) -> string = "four"
+        impl[const N: usize] Width for [N]u8
+            width(self) -> usize = N
+        val a: [4]u8 = [0; 4]
+        print(a.tag(), a.width())
+        """, "four 4\n")
+
+// -- what the block may declare ---------------------------------------------------------------------
+
+@test("impl array element: a member named len is the compiler's")
+iae_len_is_the_compilers()
+    if !iae_ready() then return
+
+    assert_eq(iae_diags(raw"""
+        trait Size
+            len(self) -> usize
+        impl[const N: usize] Size for [N]u8
+            len(self) -> usize = N
+        print(1)
+        """),
+        "error: 'len' is a member the compiler provides for every array of byte — a member of " +
+        "this name would hide it")

@@ -944,9 +944,10 @@ Two rules are specific to shapes. **A composed type is recorded under its whole 
 nothing under the type's own key falls back to the shape's. And a shape with a type parameter keeps
 the array's length written out: `[2]T` and `[3]T` are two shapes, each covering every element type
 at its own length. (A block covering every length takes a value parameter, `[N]T`, as described on
-[generics](/reference/generics/#what-it-is-for-a-fixed-array-renders).) A vector is the one shape
-that may keep its element written out, `<N>f32` beside `<N>T`, since its lane count is what a block
-over vectors is generic over; [vectors](/reference/vectors/#a-trait-for-every-width) has the rules.
+[generics](/reference/generics/#what-it-is-for-a-fixed-array-renders).) A shape whose length is a
+value parameter may keep its element written out instead: `[N]u8` is every array of `u8` and
+`<N>f32` every vector of `f32`, beside `[N]T` and `<N>T`; generics has the array's rules and
+[vectors](/reference/vectors/#a-trait-for-every-width) the vector's.
 
 **A `string` is not covered by `[]T`.** It is a view of bytes that are valid UTF-8, and that
 invariant is what distinguishes it from a `[]u8`; a block written for every slice says nothing about
