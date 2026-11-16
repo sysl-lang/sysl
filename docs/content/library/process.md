@@ -567,8 +567,25 @@ set_group(100)?
 set_user(1000)?
 ```
 
-Mapping a number to a name — `/etc/passwd`, `/etc/group` — is not here: that is a system database, and
-a program that reads one reads the system's own.
+**`user_name(id)` is the name the system's user database gives an id** (POSIX's `getpwuid_r`):
+
+```sysl
+import sysl.fs.IoError
+import sysl.process.{user, user_name}
+
+print(user_name(0).unwrap())
+print(user_name(user()).unwrap().len > 0)
+print(user_name(4_000_000_001).unwrap_err() == IoError.NotFound)
+```
+
+```output
+root
+true
+true
+```
+
+An id with no entry is `NotFound`, and a name that is not valid UTF-8 is `InvalidUtf8`. Group names
+(`/etc/group`) are not here.
 
 ## How much memory
 
@@ -926,6 +943,7 @@ with an `@export`**, over whatever its kernel provides, and `run`, `capture`, `s
 | `sysl_proc_poll_usage(pid, how, value, usage) -> int` | what `poll` answers, having also written what the child cost into `usage` once it has ended |
 | `sysl_proc_kill(pid, signal) -> int` | zero |
 | `sysl_proc_temp_path(into, room) -> isize` | the length of the path it wrote |
+| `sysl_proc_user_name(id, into, room) -> isize` | the length of the user's name written to `into`; `ENOENT` negated for an id with no entry |
 | `sysl_proc_get_id(which) -> i64` | the id: `which` is `id_user` 0 or `id_group` 1 (effective), `id_real_user` 2 or `id_real_group` 3 |
 | `sysl_proc_set_id(which, id: u32) -> int` | zero, having made the program act as user or group `id` (`which` 0 or 1) |
 | `sysl_proc_exec(path, path_len, argv, argc, envp, envc, inherit_env) -> int` | only a failure: a success does not return |

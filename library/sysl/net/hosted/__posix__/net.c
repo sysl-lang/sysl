@@ -307,6 +307,57 @@ int sysl_net_posix_local(int fd, struct sysl_endpoint *at) {
     return 0;
 }
 
+/* Who is at the other end of a connected Unix domain socket, written as `sysl.net.sys.Credentials`.
+ *
+ * The two platforms ask differently: Linux has `SO_PEERCRED`, a `struct ucred` with all three; Darwin
+ * and the BSDs have `getpeereid` for the user and group, and Darwin's `LOCAL_PEERPID` for the process.
+ * Where the process id cannot be had it is -1 rather than a guess. A socket that is not a Unix domain
+ * one is `ENOTSUP`, checked first because `getpeereid` on a TCP socket answers an error that says
+ * nothing about why.
+ */
+struct sysl_credentials {
+    uint32_t uid;
+    uint32_t gid;
+    int64_t pid;
+};
+
+_Static_assert(sizeof(struct sysl_credentials) == 16, "sysl.net.sys.Credentials is 16 bytes");
+
+int sysl_net_posix_peer_credentials(int fd, struct sysl_credentials *out) {
+    struct sockaddr_storage here;
+    socklen_t n = sizeof here;
+
+    if (getsockname(fd, (struct sockaddr *) &here, &n) != 0) return failed(fd);
+    if (here.ss_family != AF_UNIX) return ENOTSUP;
+
+#if defined(SO_PEERCRED)
+    struct ucred cred;
+    socklen_t len = sizeof cred;
+
+    if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) != 0) return failed(fd);
+
+    out->uid = (uint32_t) cred.uid;
+    out->gid = (uint32_t) cred.gid;
+    out->pid = (int64_t) cred.pid;
+#else
+    uid_t uid;
+    gid_t gid;
+
+    if (getpeereid(fd, &uid, &gid) != 0) return failed(fd);
+
+    out->uid = (uint32_t) uid;
+    out->gid = (uint32_t) gid;
+    out->pid = -1;
+#if defined(LOCAL_PEERPID)
+    pid_t pid;
+    socklen_t plen = sizeof pid;
+
+    if (getsockopt(fd, SOL_LOCAL, LOCAL_PEERPID, &pid, &plen) == 0) out->pid = (int64_t) pid;
+#endif
+#endif
+    return 0;
+}
+
 /* The four that move bytes answer a count, which is a `ssize_t` and not an error code -- so the count
  * goes out by address and the answer stays an `errno` like everything else here.
  */

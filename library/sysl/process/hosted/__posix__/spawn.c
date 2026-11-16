@@ -19,6 +19,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <pwd.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1394,4 +1395,26 @@ int sysl_proc_posix_list(int which, long long id, int *into, unsigned long long 
     (void)which; (void)into; (void)room;
     return ENOSYS;
 #endif
+}
+
+/* The name the user database gives user `id`, written to `into` (`room` bytes, not terminated) with
+ * its length in `*len`. `getpwuid_r` answers zero and a null result for an id nobody has, which is
+ * `ENOENT` here, so "no such user" is told apart from a failed lookup. A name longer than `room` is
+ * `ENAMETOOLONG`, never a cut-short success. */
+int sysl_proc_posix_user_name(unsigned int id, unsigned char *into, size_t room, size_t *len) {
+    struct passwd entry;
+    struct passwd *found = NULL;
+    char scratch[16384];
+    int e = getpwuid_r((uid_t) id, &entry, scratch, sizeof scratch, &found);
+
+    if (e != 0) return e;
+    if (found == NULL || found->pw_name == NULL) return ENOENT;
+
+    size_t n = strlen(found->pw_name);
+
+    if (n > room) return ENAMETOOLONG;
+
+    memcpy(into, found->pw_name, n);
+    *len = n;
+    return 0;
 }
