@@ -1,0 +1,247 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A bare literal on the right of a dispatched operator selects among the implementations of its
+// trait as a literal argument selects an overload (`reference/expressions.md § Operator dispatch`):
+// it reaches every implementation whose right-hand type it can be read at, not only those its
+// default type widens to. `V(1) * 2` over `impl Mul for V` and `impl Mul[f32] for V` is the `f32`
+// one, exactly as `V(1).mul(2)` is -- no `int` widens to an `f32`, but a `2` is one.
+
+private olo_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end olo_ready
+
+// What a program PRINTS, built and run.
+private olo_ran(text: string) -> string
+    val root = make_temp_dir("sysl-olo").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end olo_ran
+
+// Everything a source has to say for itself, taken through the lowering.
+private olo_err(text: string) -> string
+    val root = make_temp_dir("sysl-olo").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end olo_err
+
+// A vector over `f32`, multiplied by another and scaled by an `f32`: the raylib shape.
+private olo_vec() -> string = raw"""
+    struct V
+        x: f32
+    impl Mul for V
+        mul(self, o: V) -> V = V(self.x * o.x)
+    impl Mul[f32] for V
+        mul(self, k: f32) -> V = V(self.x * k)
+    """
+
+// Three implementations naming which one ran.
+private olo_three() -> string = raw"""
+    struct V
+        x: f32
+    impl Mul[V, string] for V
+        mul(self, o: V) -> string = "V"
+    impl Mul[f32, string] for V
+        mul(self, k: f32) -> string = "f32"
+    impl Mul[i32, string] for V
+        mul(self, k: i32) -> string = "i32"
+    """
+
+@test("an integer literal reaches the implementation it can be read at")
+olo_an_integer_literal_reaches_the_f32_implementation()
+    if !olo_ready() then return
+
+    assert_eq(olo_ran(olo_vec() + "print((V(1) * 2).x)\nprint(V(1).mul(2).x)\n"), "2\n2\n")
+
+@test("a float literal and a negative literal do the same")
+olo_float_and_negative_literals()
+    if !olo_ready() then return
+
+    assert_eq(olo_ran(olo_vec() + "print((V(7) * 2.5).x, (V(7) * -2).x, (V(7) * -0.5).x)\n"),
+              "17.5 -14 -3.5\n")
+
+@test("every arithmetic operator trait selects the same way")
+olo_every_arithmetic_trait()
+    if !olo_ready() then return
+
+    assert_eq(olo_ran(raw"""
+        struct V
+            x: f32
+        impl Add for V
+            add(self, o: V) -> V = V(self.x + o.x)
+        impl Add[f32] for V
+            add(self, k: f32) -> V = V(self.x + k)
+        impl Sub for V
+            sub(self, o: V) -> V = V(self.x - o.x)
+        impl Sub[f32] for V
+            sub(self, k: f32) -> V = V(self.x - k)
+        impl Mul for V
+            mul(self, o: V) -> V = V(self.x * o.x)
+        impl Mul[f32] for V
+            mul(self, k: f32) -> V = V(self.x * k)
+        impl Div for V
+            div(self, o: V) -> V = V(self.x / o.x)
+        impl Div[f32] for V
+            div(self, k: f32) -> V = V(self.x / k)
+        impl Rem for V
+            rem(self, o: V) -> V = V(o.x)
+        impl Rem[f32] for V
+            rem(self, k: f32) -> V = V(k + 100)
+        print((V(7) + 2).x, (V(7) - 2).x, (V(7) * 2).x, (V(7) / 2).x, (V(7) % 2).x)
+        var v = V(3)
+        v *= 2
+        v += 1
+        v -= 0.5
+        v /= 2
+        print(v.x)
+        """), "9 5 14 3.5 102\n3.25\n")
+
+@test("a typed operand still selects exactly, and the other implementation is still reached")
+olo_typed_operand_is_exact()
+    if !olo_ready() then return
+
+    assert_eq(olo_ran(olo_vec() + "val k: f32 = 4\nprint((V(7) * k).x, (V(7) * V(3)).x)\n"), "28 21\n")
+
+@test("of three, an integer literal picks i32 and a float literal f32, as the method call does")
+olo_three_implementations()
+    if !olo_ready() then return
+
+    assert_eq(olo_ran(olo_three() + raw"""
+        print(V(1) * 2, V(1) * 2.0, V(1) * -2, V(1) * -2.5)
+        print(V(1).mul(2), V(1).mul(2.0), V(1).mul(-2), V(1).mul(-2.5))
+        """), "i32 f32 i32 f32\ni32 f32 i32 f32\n")
+
+// Between `f32` and `f64` an integer literal takes the implementation at its default float type,
+// `real`, as `V(1).mul(2)` does; a typed operand at either still means that one.
+@test("between f32 and f64 an integer literal takes the f64 one, as the method call does")
+olo_f32_beside_f64()
+    if !olo_ready() then return
+
+    assert_eq(olo_ran(raw"""
+        struct V
+            x: f32
+        impl Mul[f32, string] for V
+            mul(self, k: f32) -> string = "f32"
+        impl Mul[f64, string] for V
+            mul(self, k: f64) -> string = "f64"
+        val a: f32 = 2
+        val b: f64 = 2
+        val c: u8 = 2
+        print(V(1) * 2, V(1) * a, V(1) * b, V(1) * c, V(1) * 2.0)
+        print(V(1).mul(2), V(1).mul(a), V(1).mul(b), V(1).mul(c), V(1).mul(2.0))
+        """), "f64 f32 f64 f32 f64\nf64 f32 f64 f32 f64\n")
+
+// `u32` beside `u64` offers nothing signed and neither is the literal's default, so an integer
+// literal says nothing about which is meant: the method call is refused, and so is the operator.
+@test("a literal the rule cannot place is refused, by the operator as by the method call")
+olo_ambiguous_literal_is_refused()
+    if !olo_ready() then return
+
+    val unsigned = raw"""
+        struct V
+            x: int
+        impl Mul[u32, string] for V
+            mul(self, k: u32) -> string = "u32"
+        impl Mul[u64, string] for V
+            mul(self, k: u64) -> string = "u64"
+        """
+    val by_name = olo_err(unsigned + "print(V(1).mul(2))\n")
+    val by_op = olo_err(unsigned + "print(V(1) * 2)\n")
+    val by_update = olo_err(unsigned + "var v = V(1)\nv *= 2\n")
+
+    assert(by_name.contains("'mul' comes from 2 implementations of one trait on V, and the arguments do not say " +
+                            "which was meant"), by_name)
+    assert(by_op.contains("'*' between V and int comes from 2 implementations of one trait on V, and the " +
+                          "operands do not say which was meant — it implements 'Mul[uint, string]' and " +
+                          "'Mul[ulong, string]'"), by_op)
+    assert(by_update.contains("'*' between V and int comes from 2 implementations of one trait on V"), by_update)
+
+@test("a literal that fits none of them keeps the refusal naming what is implemented")
+olo_literal_fitting_none()
+    if !olo_ready() then return
+
+    val e = olo_err(raw"""
+        struct V
+            x: int
+        impl Mul for V
+            mul(self, o: V) -> V = V(self.x * o.x)
+        impl Mul[u8] for V
+            mul(self, k: u8) -> V = V(self.x * int(k))
+        print((V(1) * 300).x)
+        """)
+
+    assert(e.contains("'*' between V and int needs 'Mul[int]'"), e)
+
+@test("a generic type selects the same way at each instantiation")
+olo_generic_type()
+    if !olo_ready() then return
+
+    assert_eq(olo_ran(raw"""
+        struct Vec[T]
+            x: T
+            y: T
+        impl[T: Mul] Mul for Vec[T]
+            mul(self, o: Vec[T]) -> Vec[T] = Vec(self.x * o.x, self.y * o.y)
+        impl[T: Mul] Mul[T] for Vec[T]
+            mul(self, k: T) -> Vec[T] = Vec(self.x * k, self.y * k)
+        val v: Vec[f32] = Vec(1, 2)
+        val w = v * 3
+        val u = v * 0.5
+        var z = v
+        z *= 2
+        val q = v * v
+        val m = Vec(2, 3) * 4
+        print(w.x, w.y, u.x, u.y, z.x, z.y, q.x, q.y, m.x, m.y)
+        """), "3 6 0.5 1 2 4 1 4 8 12\n")
+
+@test("a literal on the left picks among scalar subjects by the same rule")
+olo_literal_on_the_left()
+    if !olo_ready() then return
+
+    assert_eq(olo_ran(raw"""
+        struct P
+            x: f32
+        impl Mul[P, P] for f32
+            mul(self, p: P) -> P = P(self * p.x)
+        impl Mul[P, string] for i32
+            mul(self, p: P) -> string = "i32"
+        print(2 * P(3), (2.5 * P(2)).x, (-0.5 * P(2)).x)
+        """), "i32 5 -1\n")
