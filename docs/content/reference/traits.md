@@ -3648,8 +3648,8 @@ A reference is never the answer either (`as[&Rect]` is refused), and inside a ge
 same checks are made of each instantiation's type.
 
 **The sigil carries over.** A `&sync Shape` answers an `Option[&sync Rect]`, counted atomically as
-the object is. A `*Shape` may be asked `is`, but it points at a value with no count to take a share
-of, so it has no `as`:
+the object is. A `*Shape` is asked the same two questions, and its `as` answers an `Option[*Rect]`:
+the object's own address, borrowed, with no count taken because none is kept for it:
 
 ```sysl
 trait Shape
@@ -3665,11 +3665,13 @@ var r = Rect(2)
 val p: *Shape = &r
 
 print(p.is[Rect]())
-print(p.as[Rect]())
+
+if p.as[Rect]() is Some(q) then print(q.w)
 ```
 
-```error
-a *Shape points at a value no count is kept for, so there is no counted '&Rect' to hand back — 'o.is[Rect]()' asks the question without one
+```output
+true
+2
 ```
 
 **A member the trait declares wins.** `is` is not a reserved word, so a trait may declare a member

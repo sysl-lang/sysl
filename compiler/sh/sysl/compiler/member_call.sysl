@@ -3169,7 +3169,8 @@ private downcast_named(cx: &Analyzer, rty: Type, name: string) -> bool
 //
 // **Both read the identity the object's table begins with**, the one `o::Id` answers, against the
 // identity of `T`: `is` is that comparison and nothing more, and `as` is the comparison with the
-// object's box handed back, counted, as a `&T` where it holds. The box is the same one the `&T` the
+// object's box handed back, counted, as a `&T` where it holds (a `*Trait` hands back its address as a
+// `*T`, borrowing, with no count taken). The box is the same one the `&T` the
 // object was erased from pointed at, so the answer shares the object rather than copying it, and
 // the destructor of a type with one still runs once, when the last reference of either kind goes.
 private object_downcast(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, name: string,
@@ -3215,6 +3216,7 @@ private object_downcast(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, n
 
     val ref_ty = obj match
         Ref(_, sync) -> Ref(target, sync)
+        Ptr(_) -> Ptr(target)
         _ -> return bad_expr(span)
 
     var opt_args: Buf[Type] = buf()
@@ -3252,14 +3254,6 @@ private downcast_refusal(cx: &Analyzer, obj: Type, rty: Type, target: Type, name
         Ref(_, _) | Ptr(_) | Weak(_) ->
             return Some(s"a $shown holds the value a reference was erased from, never a reference " +
                         s"itself, so '$asked' is never what it holds — ask for the type it points at")
-        _ -> ()
-
-    obj match
-        Ptr(_) ->
-            if name == "as" then
-                return Some(s"a $shown points at a value no count is kept for, so there is no " +
-                            s"counted '&$asked' to hand back — 'o.is[$asked]()' asks the question " +
-                            "without one")
         _ -> ()
 
     if mentions_abstract(target) then return None
