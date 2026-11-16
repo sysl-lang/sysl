@@ -44,7 +44,7 @@ The module is seven files, and the boundaries between them are arguments rather 
 
 | file | holds | why it is a file |
 |---|---|---|
-| `utf8.sysl` | `from_utf8`, `from_utf8_lossy`, `Utf8Error`, `char_from_u32`, `from_cstring`, `is_char_boundary`, `Chars`, `CharIndices` | the validity seam — what turns bytes into text |
+| `utf8.sysl` | `from_utf8`, `from_utf8_lossy`, `is_utf8`, `validate_utf8`, `Utf8Error`, `char_from_u32`, `from_cstring`, `is_char_boundary`, `Chars`, `CharIndices` | the validity seam — what turns bytes into text |
 | `ascii.sysl` | trait `Ascii`, implemented for `u8` **and** `char` | classification, **named for the range it answers over** |
 | `find.sysl` | trait `Search`, implemented for `string` **and** `[]const u8` | everything that makes **no new bytes** |
 | `edit.sysl` | `split`, `fields`, `lines`, `join` (and trait `Join`, the same as a member of `[]const string`), `repeat`, `replace_all`, `to_upper`, `to_lower` | everything that **does** — so it needs an allocator |
@@ -198,11 +198,34 @@ and no copy.
 from_utf8(b: []const u8) -> Result[string, Utf8Error]
 from_utf8_lossy(b: []const u8) -> string
 from_cstring(p: *u8) -> Result[string, Utf8Error]
+is_utf8(b: []const u8) -> bool
+validate_utf8(b: []const u8) -> Option[int]
 char_from_u32(u: u32) -> Option[char]
 
 struct Utf8Error
     offset: usize
     truncated: bool
+```
+
+**`is_utf8` and `validate_utf8` answer the question without building anything.** `validate_utf8`
+gives the offset of the first byte that keeps the input from being UTF-8, or `None` when all of it
+is; a sequence cut off by the end is reported at its lead byte. They run the same vectorised scan as
+`from_utf8`, so the offset is the one its `Utf8Error` carries, and neither allocates.
+
+```sysl
+import sysl.text.{is_utf8, validate_utf8}
+
+var bad: [4]u8 = [104, 105, 255, 106]
+
+print(is_utf8("héllo".bytes))
+print(validate_utf8(bad))
+print(validate_utf8("héllo".bytes))
+```
+
+```output
+true
+Some(2)
+None
 ```
 
 **The compiler supplies exactly one primitive here — `str_cast`, which takes a `[]u8` as a `string`

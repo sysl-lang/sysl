@@ -57,6 +57,29 @@ struct Utf8Error derives Eq
  * character starts either way, which is why an error's offset is the same as the scalar walk's.
  */
 from_utf8(b: []const u8) -> Result[string, Utf8Error]
+    first_fault(b) match
+        Some(e) -> Err(e)
+        None -> Ok(str_cast(b))
+
+/** Whether every byte of `b` is well-formed UTF-8. It is `validate_utf8` with the offset dropped,
+ * and like it allocates nothing.
+ */
+is_utf8(b: []const u8) -> bool = first_fault(b).is_none()
+
+/** The offset of the first byte that keeps `b` from being well-formed UTF-8, or `None` when all of it
+ * is. It is the offset `from_utf8` reports in its `Utf8Error`, from the same scan, so the two cannot
+ * disagree; a sequence cut off by the end of the input is reported at its lead byte. Nothing is
+ * allocated and nothing is converted, which is what a caller that only needs to know (a database
+ * checking a column, a parser gating its input) wants in place of a `Result` it throws away.
+ */
+validate_utf8(b: []const u8) -> Option[int] = first_fault(b) match
+    Some(e) -> Some(int(e.offset))
+    None -> None
+
+/** The scan the three public forms share: the vector test over sixteen-byte blocks and the table
+ * walk described on `from_utf8`.
+ */
+private first_fault(b: []const u8) -> Option[Utf8Error]
     var i: usize = 0
     var gap: usize = 16
 
@@ -79,11 +102,11 @@ from_utf8(b: []const u8) -> Result[string, Utf8Error]
         while i < stop
             scan_at(b, i) match
                 Valid(n) -> i += n
-                Truncated(_) -> return Err(Utf8Error(i, true))
-                Invalid(_) -> return Err(Utf8Error(i, false))
+                Truncated(_) -> return Some(Utf8Error(i, true))
+                Invalid(_) -> return Some(Utf8Error(i, false))
 
-    Ok(str_cast(b))
-end from_utf8
+    None
+end first_fault
 
 /** The same conversion with the validation left out -- the bytes become a `string` and nothing looks
  * at them.
