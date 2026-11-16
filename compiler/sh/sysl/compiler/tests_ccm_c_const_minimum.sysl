@@ -1,0 +1,146 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `c const` at the minimum and maximum of every integer width (`reference/ffi.md § A library may
+// carry C`). The probe reads a negative by negating its magnitude, and the magnitude of `i64`'s
+// minimum is not an `i64`: every value here is built and run, and printed.
+
+private ccm_ready() -> bool
+    if std_root().is_err() then return false
+    clang_available()
+
+private ccm_says(text: string, part: string) -> bool = text.index_of(part).is_some()
+
+private ccm_ran(text: string) -> string
+    val root = make_temp_dir("sysl-cconst-min").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end ccm_ran
+
+private ccm_err(text: string) -> string
+    val root = make_temp_dir("sysl-cconst-min").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val made = emit_llvm_text(s"$root/main.sysl", None)
+
+    remove_dir_all(root).unwrap_or(())
+
+    made match
+        Err(why) -> failure_text(why)
+        Ok(m) -> if m.report.is_empty() then "" else analysis_report(m.report)
+end ccm_err
+
+@test("the minimum of i64, which was refused as not fitting")
+ccm_the_i64_minimum()
+    if !ccm_ready() then return
+
+    assert_eq(ccm_ran("@include(\"<stdint.h>\")\nc const\n    LOW: i64 = \"INT64_MIN\"\n\nprint(LOW)\n"),
+              "-9223372036854775808\n")
+
+@test("the minimum and maximum of every signed width, at its own type")
+ccm_signed_extremes_at_their_own_type()
+    if !ccm_ready() then return
+
+    val text = "@include(\"<stdint.h>\")\n" +
+               "c const\n" +
+               "    A: i8 = \"INT8_MIN\"\n    B: i8 = \"INT8_MAX\"\n" +
+               "    C: i16 = \"INT16_MIN\"\n    D: i16 = \"INT16_MAX\"\n" +
+               "    E: i32 = \"INT32_MIN\"\n    F: i32 = \"INT32_MAX\"\n" +
+               "    G: i64 = \"INT64_MIN\"\n    H: i64 = \"INT64_MAX\"\n\n" +
+               "print(A)\nprint(B)\nprint(C)\nprint(D)\nprint(E)\nprint(F)\nprint(G)\nprint(H)\n"
+
+    assert_eq(ccm_ran(text),
+              "-128\n127\n-32768\n32767\n-2147483648\n2147483647\n-9223372036854775808\n" +
+              "9223372036854775807\n")
+
+@test("the maximum of every unsigned width, at its own type")
+ccm_unsigned_maxima_at_their_own_type()
+    if !ccm_ready() then return
+
+    val text = "@include(\"<stdint.h>\")\n" +
+               "c const\n" +
+               "    A: u8 = \"UINT8_MAX\"\n    B: u16 = \"UINT16_MAX\"\n" +
+               "    C: u32 = \"UINT32_MAX\"\n    D: u64 = \"UINT64_MAX\"\n" +
+               "    E: u64 = \"INT64_MAX + 1ull\"\n\n" +
+               "print(A)\nprint(B)\nprint(C)\nprint(D)\nprint(E)\n"
+
+    assert_eq(ccm_ran(text), "255\n65535\n4294967295\n18446744073709551615\n9223372036854775808\n")
+
+@test("a narrow extreme at a wider type")
+ccm_narrow_extremes_at_a_wider_type()
+    if !ccm_ready() then return
+
+    val text = "@include(\"<stdint.h>\")\n" +
+               "c const\n" +
+               "    A: i64 = \"INT8_MIN\"\n    B: i64 = \"INT16_MIN\"\n    C: i64 = \"INT32_MIN\"\n" +
+               "    D: i32 = \"INT8_MIN\"\n    E: i64 = \"INT32_MAX\"\n" +
+               "    F: u64 = \"UINT8_MAX\"\n    G: u64 = \"UINT32_MAX\"\n    H: u32 = \"UINT16_MAX\"\n\n" +
+               "print(A)\nprint(B)\nprint(C)\nprint(D)\nprint(E)\nprint(F)\nprint(G)\nprint(H)\n"
+
+    assert_eq(ccm_ran(text),
+              "-128\n-32768\n-2147483648\n-128\n2147483647\n255\n4294967295\n65535\n")
+
+@test("a minimum written the way Lua's header writes it")
+ccm_a_minimum_written_as_an_expression()
+    if !ccm_ready() then return
+
+    val text = "c const\n" +
+               "    A: i64 = \"(-0x7fffffffffffffffLL - 1)\"\n" +
+               "    B: i64 = \"-9223372036854775807LL - 1\"\n" +
+               "    C: i64 = \"-0x7fffffffffffffffLL\"\n\n" +
+               "print(A)\nprint(B)\nprint(C)\n"
+
+    assert_eq(ccm_ran(text), "-9223372036854775808\n-9223372036854775808\n-9223372036854775807\n")
+
+@test("the minimum is usable as a value, not only printed")
+ccm_the_minimum_is_usable()
+    if !ccm_ready() then return
+
+    val text = "@include(\"<stdint.h>\")\n" +
+               "c const\n    LOW: i64 = \"INT64_MIN\"\n\n" +
+               "val x: i64 = LOW + 1\nprint(x)\nprint(LOW < 0)\n"
+
+    assert_eq(ccm_ran(text), "-9223372036854775807\ntrue\n")
+
+@test("a value that really does not fit is still refused, naming both ends")
+ccm_a_value_that_does_not_fit_is_refused()
+    if !ccm_ready() then return
+
+    val a = ccm_err("@include(\"<stdint.h>\")\nc const\n    N: i32 = \"INT64_MIN\"\n\nprint(N)\n")
+
+    assert(ccm_says(a, "is -9223372036854775808 here, which 'i32' cannot hold — it holds " +
+                       "-2147483648 to 2147483647"), a)
+
+    val b = ccm_err("@include(\"<stdint.h>\")\nc const\n    N: i8 = \"INT8_MAX + 1\"\n\nprint(N)\n")
+
+    assert(ccm_says(b, "is 128 here, which 'i8' cannot hold — it holds -128 to 127"), b)
+
+    val c = ccm_err("@include(\"<stdint.h>\")\nc const\n    N: u8 = \"INT8_MIN\"\n\nprint(N)\n")
+
+    assert(ccm_says(c, "which 'u8' cannot hold"), c)
+
+    val d = ccm_err("@include(\"<stdint.h>\")\nc const\n    N: u32 = \"UINT32_MAX + 1ull\"\n\nprint(N)\n")
+
+    assert(ccm_says(d, "is 4294967296 here, which 'u32' cannot hold — it holds 0 to 4294967295"), d)

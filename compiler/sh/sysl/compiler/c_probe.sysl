@@ -747,9 +747,18 @@ private trimmed_comma(word: string) -> string =
 // One decimal operand as a number. LLVM prints an `i64` as a signed decimal whatever the C type was,
 // so an unsigned value past the signed ceiling comes back negative and is reinterpreted where it is
 // read rather than here.
+//
+// A negative is accumulated downward, because the magnitude of `i64`'s minimum is not an `i64`.
 private decimal_of(text: string) -> i64
-    if text.starts_with("-") then -number_of(text[1..<text.bytes.len], 10)
-    else number_of(text, 10)
+    if !text.starts_with("-") then return number_of(text, 10)
+
+    val digits = text[1..<text.bytes.len]
+    var out: i64 = 0
+
+    for i in 0..<digits.bytes.len
+        out = out * 10 - i64(digits.bytes[i] - u8('0'))
+
+    out
 
 // -- what a line was declared at -------------------------------------------------------------
 
@@ -915,7 +924,8 @@ private whole(a: &Analysis, at: Scope, c: CConstDecl, bits: int, signed: bool, n
             if printed < low || printed > high
                 return out_of_range(a, at, c, s"$printed", name, s"$low", s"$high")
 
-        val digits = if printed < 0 then s"${-printed}" else s"$printed"
+        // The magnitude is taken as a `u64`, which holds `i64`'s minimum where `-printed` would not.
+        val digits = if printed < 0 then s"${0 -% u64.wrap(printed)}" else s"$printed"
         val lit = expr(c.span, IntLit(digits, 10, ""))
 
         return held(c, if printed < 0 then expr(c.span, Unary("-", lit)) else lit)
