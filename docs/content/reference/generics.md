@@ -2038,6 +2038,11 @@ and the written-out one is more specific, so it is found first. A block for `[2]
 over a block for `[N]T` on arrays of two, the same "written out before a parameter" ordering that
 `override` uses.
 
+A vector's lane count is a value parameter on the same terms, so `impl[const N: usize] LaneMath for
+<N>f32` is one block covering every vector of `f32`, and `<N>T` every vector. A vector keeps its
+*lane* written out where an array keeps its length: `<N>f32` is found before `<N>T`, and `<4>T` is
+not a shape at all. [Vectors](/reference/vectors/#a-trait-for-every-width) has the rules.
+
 ### A member declares its own
 
 A method's parameter list is its own, exactly as a function's is, so it may take a value parameter

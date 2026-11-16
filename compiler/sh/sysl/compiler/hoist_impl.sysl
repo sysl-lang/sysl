@@ -1362,6 +1362,8 @@ private structural_target(a: &Analysis, scope: Scope, span: Span, block: ImplDec
     else if head.is_none()
         not_generic(a, scope, span, subject)
         symbol = shape_symbol(ty, shape)
+    else if fixed_lane_count(a, scope, span, block)
+        symbol = shape_symbol(ty, shape)
     else
         order = shape_args(a, scope, span, block, ty, shape)
         symbol = shape_symbol(ty, shape)
@@ -1456,7 +1458,18 @@ end closed_bound
 // type it resolved to: a value parameter stands at zero for the walk that checks the block's body, so
 // `[N]T` and `[0]T` resolve to the same array and only the syntax says which was written.
 private impl_shape(a: &Analysis, block: ImplDecl, ty: Type) -> Option[string]
-    if length_param(block).is_some() then return Some(ArrayShape)
+    if length_param(block).is_some()
+        // A vector's lane type decides between its two shapes: one of the block's own parameters
+        // makes it every vector, and a lane written out makes it every vector of that lane.
+        *block.for_type.kind match
+            VectorType(_, elem) ->
+                if lane_param(block, elem) then return Some(VectorShape)
+
+                return ty match
+                    Vector(_, lane) -> Some(lanes_shape(*lane))
+                    _ -> None
+            _ -> return Some(ArrayShape)
+
     if pack_param(block).is_some() then return Some(PackShape)
 
     val shapes = shape_owners(ty)
@@ -1464,18 +1477,41 @@ private impl_shape(a: &Analysis, block: ImplDecl, ty: Type) -> Option[string]
     if shapes.is_empty() then None else Some(shapes[0].0)
 end impl_shape
 
-// The block's own **value** parameter standing for an array's length, where the subject is an array
-// whose length was written as one.
+// The block's own **value** parameter standing for an array's length or a vector's lane count, where
+// the subject was written with one there.
 private length_param(block: ImplDecl) -> Option[string]
     *block.for_type.kind match
         ArrayType(length, _, _) ->
             if length.is_none() then return None
 
-            *length.unwrap().kind match
-                Ident(n) -> if has_binding(block.tvalues, n) then Some(n) else None
-                _ -> None
+            value_param_named(block, length.unwrap())
+        VectorType(lanes, _) -> value_param_named(block, lanes)
         _ -> None
 end length_param
+
+private value_param_named(block: ImplDecl, e: Expr) -> Option[string] = *e.kind match
+    Ident(n) -> if has_binding(block.tvalues, n) then Some(n) else None
+    _ -> None
+
+// Whether a vector subject's lane is written as one of the block's own type parameters.
+private lane_param(block: ImplDecl, elem: TypeRef) -> bool = *elem.kind match
+    NamedType(n, args) -> args.is_empty() && holds_string(block.tparams, n) && !has_binding(block.tvalues, n)
+    _ -> false
+
+// A vector written with its lane count spelled out, under a block that declares parameters: the one
+// vector shape not offered. `<4>T` and `<N>f32` would both cover a `<4>f32` with neither more specific
+// than the other, so the count is what a block over vectors is generic over.
+private fixed_lane_count(a: &Analysis, scope: Scope, span: Span, block: ImplDecl) -> bool
+    if block.tparams.is_empty() || length_param(block).is_some() then return false
+
+    *block.for_type.kind match
+        VectorType(_, _) ->
+            a.fault(scope, span, s"'${type_text(block.for_type)}' fixes the lane count, and an 'impl' " +
+                    "over vectors is generic over that count — write the block's own value parameter " +
+                    "for it, as '<N>T' or '<N>f32', or write the vector out in full with no parameters")
+            true
+        _ -> false
+end fixed_lane_count
 
 // Whether the block's subject has a length that refused to be one -- `impl[N, T] Tag for [N]T`,
 // where `N` is a type -- which the reading of the subject says, at the length itself. It is the
@@ -1485,11 +1521,19 @@ private target_length_refused(a: &Analysis, scope: Scope, block: ImplDecl) -> bo
     if block.tparams.is_empty() then return false
 
     val refusals = a.const_refusals
+    val read = resolve_type(a, scope, block.for_type,
+                            abstract_subst(a, scope, block.tparams, block.bounds, block.tvalues,
+                                           block.tpacks, buf()))
 
-    resolve_type(a, scope, block.for_type,
-                 abstract_subst(a, scope, block.tparams, block.bounds, block.tvalues, block.tpacks,
-                                buf()))
-    const_refused_since(a, refusals)
+    // A vector that resolved to nothing was refused for its lane or its count, said here once; read
+    // on, its count would be read again with nothing standing for it and refused a second time.
+    val vector_refused = *block.for_type.kind match
+        VectorType(_, _) -> read match
+            Unknown -> true
+            _ -> false
+        _ -> false
+
+    vector_refused || const_refused_since(a, refusals)
 end target_length_refused
 
 // The block's own **pack** parameter, where the subject is `(..A)` and `A` is one.
@@ -1513,6 +1557,7 @@ private shape_symbol(ty: Type, shape: string) -> string = ty match
     Slice(_, _) -> "slice"
     Array(n, _) -> if shape == ArrayShape then "arr" else s"arr$n"
     Struct(d) -> if shape == PackShape then "tuple" else s"tuple${d.targs.len()}"
+    Vector(_, lane) -> if shape == VectorShape then "vec" else s"vecs.${mangle(*lane)}"
     _ -> "tuple"
 
 // The block's own parameters in the order a generic type applies them.
@@ -1617,7 +1662,14 @@ private shape_args(a: &Analysis, scope: Scope, span: Span, block: ImplDecl, ty: 
         val shapes = shape_owners(ty)
 
         if !shapes.is_empty()
-            val matched = shapes[0].1
+            // The arguments of the shape the block was filed under, which for a vector is not always
+            // the first: `<N>T` is the second of a vector's two.
+            var matched = shapes[0].1
+
+            for item in shapes
+                if item.0 == shape
+                    matched = item.1
+                    break
 
             for item in matched
                 item match
@@ -1648,9 +1700,12 @@ private not_generic(a: &Analysis, scope: Scope, span: Span, subject: TypeRef)
         NamedType(n, _) ->
             a.fault(scope, span, s"'$n' takes no type arguments, so an 'impl' for it has nothing " +
                     "to be generic over")
+        // A vector always has a shape, so one with none was refused for its lane, which is said
+        // where the lane is.
+        VectorType(_, _) -> ()
         _ ->
             a.fault(scope, span, s"'${type_text(subject)}' has no shape for an 'impl' to match — a " +
-                    "slice and an array do, and a generic struct or enum has a name of its own to " +
+                    "slice, an array and a vector do, and a generic struct or enum has a name of its own to " +
                     "be generic over")
 end not_generic
 
