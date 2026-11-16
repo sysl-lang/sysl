@@ -96,7 +96,8 @@ a failure is read in.
 **A failing check does not stop the test.** Unity aborts with `longjmp`; sysl has none, and an unwind
 that skipped a scope would skip the releases that scope owes. So a failure is recorded and the test
 runs on — and only the **first** failure in each test is reported, because the ones after it are
-usually the same failure seen again through worse state.
+usually the same failure seen again through worse state. (A check outside any `run` is reported every
+time; [a check inside a `@test`](#a-check-inside-a-test) says why.)
 
 ### The checks
 
@@ -243,6 +244,37 @@ number back and the board signals it however it signals things.
 
 `reset` deliberately leaves the sink alone. A board attaches once at startup, and a reset that undid
 that would send the second pass of a looping self-test to a console the board does not have.
+
+## A check inside a `@test`
+
+A check made **outside any `run`** belongs to whatever called it, and under `sysl test` that is the
+`@test` around it:
+
+```
+import sysl.harness.*
+
+@test
+adds()
+    check_eq(2 + 2, 5)
+    check(1 < 2, "one is less than two")
+    check(2 < 1, "two is less than one")
+```
+
+That test **fails**, with both of its failed checks shown under its row and `failed 2 checks` as what
+happened. Two things differ from a check inside a `run`, and both follow from there being no harness
+test to report on:
+
+- **Every failure has its line**, not only the first. The first-failure rule is how a harness test
+  says once that it failed; a `@test` making ten checks and failing three owes its reader all three.
+  The line's test field is empty, since `sysl test`'s own row names the test.
+- **The test does not stop at a failure**, as it does not inside a `run` either, so the process
+  returns with a clean status. What fails it is a byte the check writes ahead of its line, which the
+  runner counts and takes out of what it shows. It is written even under `quiet`, which silences the
+  lines and not the verdict.
+
+A suite of `run`s called from inside a `@test` keeps its own verdict: its failures are counted by the
+harness and read through `failures()` and `finish()`, as on a board, and they do not fail the
+`@test`. That is how the harness's own tests check that a failing check is counted.
 
 ## What it is not
 
