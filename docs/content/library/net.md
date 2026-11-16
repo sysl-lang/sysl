@@ -351,6 +351,61 @@ loop; with 4 MB buffers on both ends the same transfer takes 48 turns, limited t
 reader takes per turn. Set the receiver's buffer too: the sender's buffer alone does not bound the
 turns.
 
+## Several writes as one: `send_vectored`
+
+`send_vectored(parts)` takes a slice of byte slices and writes them as one gather write
+(`sendmsg`), so a header and a body go out in one system call without being copied into a buffer
+first. It answers the total number of bytes that went, and **a short write is not an error and may
+stop partway through a piece**, exactly as for `send`. Empty pieces are skipped; no pieces, or only
+empty ones, answers zero without asking the system. A platform limit on pieces per call (`IOV_MAX`)
+sends the first of them: come back for the rest.
+
+```sysl
+import sysl.net.{resolve, socket}
+
+val here = resolve("127.0.0.1", 0).unwrap()[0]
+val server = socket(here).unwrap()
+
+server.reuse_address().unwrap()
+server.bind(here).unwrap()
+server.listen().unwrap()
+
+val at = server.local().unwrap()
+val client = socket(at).unwrap()
+
+client.connect(at).unwrap()
+
+val (accepted, _) = server.accept().unwrap()
+
+val parts: []const []const u8 = [[72, 105], [], [33]]
+
+print(client.send_vectored(parts).unwrap())
+
+var into: []u8 = [0; 8]
+
+print(accepted.recv(into).unwrap())
+```
+
+```output
+3
+3
+```
+
+## Options: `set_no_delay`, `set_reuse_port`, keepalive
+
+Each is a setter that takes `on = true` and a getter of the same name that reads it back from the
+kernel: `set_no_delay` / `no_delay` (`TCP_NODELAY`, send small writes at once), `set_reuse_port` /
+`reuse_port` (`SO_REUSEPORT`, several sockets bind one port, set before `bind`; also on `UdpSocket`),
+and `set_keepalive` / `keepalive` (`SO_KEEPALIVE`). The keepalive timing is
+`set_keepalive_idle(seconds)`, `set_keepalive_interval(seconds)` and `set_keepalive_count(probes)`,
+each positive and read back by the same name without `set_`. **The idle time is `TCP_KEEPIDLE` on
+Linux and `TCP_KEEPALIVE` on Darwin**; the library picks. A closed socket answers `NotOpen`, a
+target without an option answers the "not supported" error, and a socket that is not TCP answers the
+system's refusal of the TCP options.
+
+**Every `Socket` and `UdpSocket` method takes `self`**, so a socket bound with `val` can be used
+without first copying it into a `var`; a copy shares one descriptor either way.
+
 ## Unix domain sockets
 
 A Unix domain socket is a stream between two processes on one machine, addressed by a path in the
@@ -513,7 +568,8 @@ hooks, each an `extern` no module of the library defines.
 | `sysl_net_send(fd, from, len) -> isize`, `sysl_net_recv(fd, into, room) -> isize` | a count of bytes |
 | `sysl_net_send_to(fd, from, len, to) -> isize`, `sysl_net_recv_from(fd, into, room, from) -> isize` | a count of bytes, the sender written into `from` |
 | `sysl_net_shutdown(fd, how) -> int`, `sysl_net_close(fd) -> int` | zero |
-| `sysl_net_option(fd, which, value) -> int` | zero; `read_timeout`, `write_timeout` (milliseconds), `reuse_address`, `non_blocking`, `send_buffer` or `recv_buffer` (bytes, positive); `send_buffer_size` and `recv_buffer_size` ignore `value` and answer the size in bytes |
+| `sysl_net_option(fd, which, value) -> int` | zero; `read_timeout`, `write_timeout` (milliseconds), `reuse_address`, `non_blocking`, `send_buffer` or `recv_buffer` (bytes, positive), `no_delay`, `reuse_port`, `keepalive` (1 or 0), `keepalive_idle`, `keepalive_interval`, `keepalive_count` (seconds or probes, positive); `send_buffer_size` and `recv_buffer_size`, and each of the six above plus `read_back` (14 to 19), ignore `value` and answer the setting |
+| `sysl_net_send_vectored(fd, pieces, count) -> isize` | a count of bytes; `pieces` is `count` `Piece`s, a base pointer and a length each, laid out as C's `struct iovec` |
 | `sysl_net_peer_credentials(fd, out) -> int` | zero, a Unix domain peer's user, group and process id (-1 if unknown) written into `out` |
 | `sysl_net_resolve(host, host_len, port, passive, out, room) -> int` | how many addresses it wrote |
 
@@ -564,9 +620,9 @@ so a freestanding program that builds an `Address` and never makes a socket is a
 ## What is deliberately absent
 
 Multicast, broadcast, Unix datagram sockets, Linux's abstract namespace, and every socket option
-beyond the two timeouts, the two buffer sizes, `non_blocking` and `reuse_address`, which is here because a listener that has just been stopped cannot
-otherwise be started again until `TIME_WAIT` runs out — a minute or two, during which the program
-looks broken.
+beyond the two timeouts, the two buffer sizes, `non_blocking`, `reuse_address` (here because a
+listener that has just been stopped cannot otherwise be started again until `TIME_WAIT` runs out — a
+minute or two, during which the program looks broken), `reuse_port`, `no_delay` and keepalive.
 
 **All of them are additive**, so leaving them out costs a later release nothing, and guessing at them
 now would fix a shape before anybody has used one. Each would be a hook in `sysl.net.sys` and a call

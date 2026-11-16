@@ -1,0 +1,281 @@
+module sysl.net
+@requires(posix)
+@tests
+
+import sysl.fs.IoError
+
+// The TCP and socket options beyond timeouts and buffers, and the gather write. Each option is set
+// and read back from the kernel, both ways, and on a socket already closed; the gather write goes
+// over a loopback pair with none, one and many pieces, empty ones among them.
+
+private listener() -> (Socket, Address)
+    val addrs = resolve("127.0.0.1", 0).unwrap()
+    var s = socket(addrs[0]).unwrap()
+
+    s.reuse_address().unwrap()
+    s.bind(addrs[0]).unwrap()
+    s.listen().unwrap()
+
+    (s, s.local().unwrap())
+end listener
+
+private client(to: Address) -> Socket
+    var c = socket(to).unwrap()
+
+    c.connect(to).unwrap()
+    c
+end client
+
+/** A connected pair: the client and the accepted end. */
+private pair() -> (Socket, Socket)
+    val (server, at) = listener()
+    val c = client(at)
+    val (a, _) = server.accept().unwrap()
+
+    (c, a)
+end pair
+
+/** Every byte of the stream until `n` have arrived. */
+private read_n(s: Socket, n: usize) -> []u8
+    var out: []u8 = [0; 70000]
+    var got: usize = 0
+
+    while got < n
+        got += s.recv(out[got..<n]).unwrap()
+
+    out[0..<n]
+end read_n
+
+// ## Flags
+
+@test("no_delay is off, then on, then off, as the kernel reads it back")
+no_delay_round_trip()
+    val (c, a) = pair()
+
+    assert_eq(c.no_delay().unwrap(), false)
+    c.set_no_delay().unwrap()
+    assert_eq(c.no_delay().unwrap(), true)
+    c.set_no_delay(false).unwrap()
+    assert_eq(c.no_delay().unwrap(), false)
+    a.close().unwrap()
+
+@test("keepalive is off, then on, then off")
+keepalive_round_trip()
+    val (c, a) = pair()
+
+    assert_eq(c.keepalive().unwrap(), false)
+    c.set_keepalive().unwrap()
+    assert_eq(c.keepalive().unwrap(), true)
+    c.set_keepalive(false).unwrap()
+    assert_eq(c.keepalive().unwrap(), false)
+    a.close().unwrap()
+
+@test("the keepalive idle time, interval and count are read back as set")
+keepalive_times_round_trip()
+    val (c, a) = pair()
+
+    c.set_keepalive_idle(61).unwrap()
+    c.set_keepalive_interval(7).unwrap()
+    c.set_keepalive_count(4).unwrap()
+    assert_eq(c.keepalive_idle().unwrap(), 61)
+    assert_eq(c.keepalive_interval().unwrap(), 7)
+    assert_eq(c.keepalive_count().unwrap(), 4)
+
+    // Each is independent of the others and of the flag.
+    c.set_keepalive_idle(90).unwrap()
+    assert_eq(c.keepalive_interval().unwrap(), 7)
+    assert_eq(c.keepalive_count().unwrap(), 4)
+    assert_eq(c.keepalive().unwrap(), false)
+    a.close().unwrap()
+
+@test("a keepalive time that is not positive is refused")
+keepalive_times_refuse_nonpositive()
+    val (c, a) = pair()
+
+    assert(c.set_keepalive_idle(0).is_err(), "zero idle")
+    assert(c.set_keepalive_interval(-1).is_err(), "negative interval")
+    assert(c.set_keepalive_count(0).is_err(), "zero count")
+    a.close().unwrap()
+
+@test("reuse_port is read back on a TCP socket and on a UDP one")
+reuse_port_round_trip()
+    val addrs = resolve("127.0.0.1", 0).unwrap()
+    val s = socket(addrs[0]).unwrap()
+
+    assert_eq(s.reuse_port().unwrap(), false)
+    s.set_reuse_port().unwrap()
+    assert_eq(s.reuse_port().unwrap(), true)
+    s.set_reuse_port(false).unwrap()
+    assert_eq(s.reuse_port().unwrap(), false)
+    s.close().unwrap()
+
+    val u = udp_socket(ipv4(127, 0, 0, 1, 0)).unwrap()
+
+    assert_eq(u.reuse_port().unwrap(), false)
+    u.set_reuse_port().unwrap()
+    assert_eq(u.reuse_port().unwrap(), true)
+    u.close().unwrap()
+
+@test("two listeners with reuse_port may bind one port, and without it the second is refused")
+reuse_port_shares_a_port()
+    val addrs = resolve("127.0.0.1", 0).unwrap()
+    val first = socket(addrs[0]).unwrap()
+
+    first.set_reuse_port().unwrap()
+    first.bind(addrs[0]).unwrap()
+    first.listen().unwrap()
+
+    val at = first.local().unwrap()
+    val second = socket(addrs[0]).unwrap()
+
+    second.set_reuse_port().unwrap()
+    second.bind(at).unwrap()
+
+    val third = socket(addrs[0]).unwrap()
+
+    assert(third.bind(at).is_err(), "a socket without reuse_port took a shared port")
+
+    third.close().unwrap()
+    second.close().unwrap()
+    first.close().unwrap()
+
+@test("every option on a closed socket answers NotOpen")
+options_on_a_closed_socket()
+    val (c, a) = pair()
+
+    c.close().unwrap()
+    a.close().unwrap()
+
+    assert_eq(c.set_no_delay(), Err(NotOpen))
+    assert_eq(c.no_delay(), Err(NotOpen))
+    assert_eq(c.set_reuse_port(), Err(NotOpen))
+    assert_eq(c.reuse_port(), Err(NotOpen))
+    assert_eq(c.set_keepalive(), Err(NotOpen))
+    assert_eq(c.keepalive(), Err(NotOpen))
+    assert_eq(c.set_keepalive_idle(5), Err(NotOpen))
+    assert_eq(c.keepalive_idle(), Err(NotOpen))
+    assert_eq(c.set_keepalive_interval(5), Err(NotOpen))
+    assert_eq(c.keepalive_interval(), Err(NotOpen))
+    assert_eq(c.set_keepalive_count(5), Err(NotOpen))
+    assert_eq(c.keepalive_count(), Err(NotOpen))
+
+// ## Receivers
+
+// `self`, not `*self`: a socket bound with `val` is usable, no `var s = s` first.
+@test("a val socket can be driven through every method")
+val_socket_is_usable()
+    val addrs = resolve("127.0.0.1", 0).unwrap()
+    val s = socket(addrs[0]).unwrap()
+
+    s.reuse_address().unwrap()
+    s.non_blocking().unwrap()
+    s.set_recv_buffer(65536).unwrap()
+    s.bind(addrs[0]).unwrap()
+    s.listen().unwrap()
+    s.close().unwrap()
+
+// ## The gather write
+
+@test("send_vectored with no pieces sends nothing")
+vectored_none()
+    val (c, a) = pair()
+    val none: []const []const u8 = []
+
+    assert_eq(c.send_vectored(none).unwrap(), 0)
+    a.close().unwrap()
+
+@test("send_vectored with only empty pieces sends nothing")
+vectored_only_empty()
+    val (c, a) = pair()
+    val parts: []const []const u8 = [[], []]
+
+    assert_eq(c.send_vectored(parts).unwrap(), 0)
+    a.close().unwrap()
+
+@test("send_vectored of one piece is that piece")
+vectored_one()
+    val (c, a) = pair()
+    val parts: []const []const u8 = [[104, 101, 108, 108, 111]]
+
+    assert_eq(c.send_vectored(parts).unwrap(), 5)
+
+    val got = read_n(a, 5)
+
+    assert_eq(got[0], u8('h'))
+    assert_eq(got[4], u8('o'))
+    c.close().unwrap()
+
+@test("send_vectored of many pieces, empty ones among them, arrives in order as one stream")
+vectored_many()
+    val (c, a) = pair()
+    val parts: []const []const u8 = [[1, 2], [], [3], [4, 5, 6], [], [], [7]]
+
+    assert_eq(c.send_vectored(parts).unwrap(), 7)
+
+    val got = read_n(a, 7)
+
+    for i in 0..<7 do assert_eq(got[i], u8(i + 1))
+    c.close().unwrap()
+
+// A buffer the kernel will not take whole makes the write short; the count must be what went, and
+// the rest of the stream must be exactly the bytes after it.
+@test("a short vectored write counts the bytes that went, and the rest follows on a retry")
+vectored_partial_is_accounted()
+    val (c, a) = pair()
+
+    c.set_send_buffer(4096).unwrap()
+    c.non_blocking().unwrap()
+
+    var big: []u8 = [0; 1000000]
+
+    for i in 0..<big.len do big[i] = u8(i % 251)
+
+    val parts: []const []const u8 = [big[0..<400000], big[400000..<1000000]]
+    val first = c.send_vectored(parts).unwrap()
+
+    assert(first > 0, "nothing was sent")
+    assert(first < 1000000, "the whole megabyte went through a 4 KB buffer")
+
+    // The reader drains and the receiver sees the stream from the start, unbroken.
+    var seen: usize = 0
+    var chunk: []u8 = [0; 65536]
+
+    a.non_blocking().unwrap()
+
+    while seen < first
+        a.recv(chunk[0..<min_of(chunk.len, first - seen)]) match
+            Ok(n) ->
+                for i in 0..<n do assert_eq(chunk[i], u8((seen + i) % 251))
+                seen += n
+            Err(_) -> ()
+
+    assert_eq(seen, first)
+    c.close().unwrap()
+    a.close().unwrap()
+
+private min_of(a: usize, b: usize) -> usize = if a < b then a else b
+
+@test("send_vectored on a closed socket answers NotOpen")
+vectored_closed()
+    val (c, a) = pair()
+    val parts: []const []const u8 = [[1, 2, 3]]
+
+    c.close().unwrap()
+    assert_eq(c.send_vectored(parts), Err(NotOpen))
+    a.close().unwrap()
+
+@test("send_vectored to a peer that has gone is an error, not a signal")
+vectored_to_a_gone_peer()
+    val (c, a) = pair()
+    val parts: []const []const u8 = [[1, 2, 3], [4]]
+
+    a.close().unwrap()
+
+    // The first write after the peer closed may succeed; the reset arrives on a later one.
+    var failed = false
+
+    for _ in 0..<50
+        if c.send_vectored(parts).is_err() then failed = true
+
+    assert(failed, "writes to a closed peer never failed")
+    c.close().unwrap()

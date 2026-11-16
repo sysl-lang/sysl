@@ -27,12 +27,15 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
+#include <limits.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <stdint.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -370,6 +373,29 @@ int sysl_net_posix_send(int fd, const unsigned char *buf, size_t n, size_t *sent
     return 0;
 }
 
+/* One `sendmsg` over `count` (base, length) pairs laid out as `struct iovec` is, answering how many
+ * bytes went -- a short count is not an error, as for `send`. More pairs than the platform's
+ * `IOV_MAX` send the first `IOV_MAX` of them: the caller comes back for the rest.
+ */
+#ifndef IOV_MAX
+#define IOV_MAX 1024
+#endif
+
+int sysl_net_posix_send_vectored(int fd, const struct iovec *iov, size_t count, size_t *sent) {
+    struct msghdr m;
+
+    memset(&m, 0, sizeof m);
+    m.msg_iov = (struct iovec *) iov;
+    m.msg_iovlen = count > IOV_MAX ? IOV_MAX : count;
+
+    ssize_t k = sendmsg(fd, &m, SEND_FLAGS);
+
+    if (k < 0) return failed(fd);
+
+    *sent = (size_t) k;
+    return 0;
+}
+
 int sysl_net_posix_recv(int fd, unsigned char *buf, size_t n, size_t *got) {
     ssize_t k = recv(fd, buf, n, 0);
 
@@ -422,6 +448,33 @@ int sysl_net_posix_shutdown(int fd, int how) {
 int sysl_net_posix_close(int fd) {
     if (close(fd) != 0) return failed(fd);
     return 0;
+}
+
+/* The level and name of option `k` of the flags `sysl_net_posix_option` sets: 0 `TCP_NODELAY`,
+ * 1 `SO_REUSEPORT`, 2 `SO_KEEPALIVE`, 3 the keepalive idle time, 4 its probe interval, 5 its probe
+ * count. **The idle time is `TCP_KEEPALIVE` on Darwin and `TCP_KEEPIDLE` everywhere else**; the other
+ * two are `TCP_KEEPINTVL` and `TCP_KEEPCNT` on both. Answers 0 where the platform has no such option.
+ */
+static int flag_option(int k, int *level, int *name) {
+    switch (k) {
+    case 0: *level = IPPROTO_TCP; *name = TCP_NODELAY; return 1;
+#ifdef SO_REUSEPORT
+    case 1: *level = SOL_SOCKET; *name = SO_REUSEPORT; return 1;
+#endif
+    case 2: *level = SOL_SOCKET; *name = SO_KEEPALIVE; return 1;
+#if defined(TCP_KEEPIDLE)
+    case 3: *level = IPPROTO_TCP; *name = TCP_KEEPIDLE; return 1;
+#elif defined(TCP_KEEPALIVE)
+    case 3: *level = IPPROTO_TCP; *name = TCP_KEEPALIVE; return 1;
+#endif
+#ifdef TCP_KEEPINTVL
+    case 4: *level = IPPROTO_TCP; *name = TCP_KEEPINTVL; return 1;
+#endif
+#ifdef TCP_KEEPCNT
+    case 5: *level = IPPROTO_TCP; *name = TCP_KEEPCNT; return 1;
+#endif
+    default: return 0;
+    }
 }
 
 /* A timeout in milliseconds (`which` 0 for receiving, 1 for sending; zero is none), the address
@@ -477,7 +530,46 @@ int sysl_net_posix_option(int fd, int which, long long value) {
         return 0;
     }
 
+    /* The TCP and socket flags, numbered as `sysl.net.sys` numbers them: `TCP_NODELAY` (8),
+     * `SO_REUSEPORT` (9), `SO_KEEPALIVE` (10), and the keepalive idle time (11, seconds), probe
+     * interval (12, seconds) and probe count (13). A platform without the option answers `ENOTSUP`.
+     */
+    if (which >= 8 && which <= 13) {
+        int level = 0, name = 0;
+
+        if (!flag_option(which - 8, &level, &name)) return ENOTSUP;
+
+        int v;
+
+        if (which <= 10)
+            v = value ? 1 : 0;
+        else {
+            if (value <= 0 || value > 2147483647LL) return EINVAL;
+            v = (int) value;
+        }
+
+        if (setsockopt(fd, level, name, &v, sizeof v) != 0) return failed(fd);
+        return 0;
+    }
+
     return EINVAL;
+}
+
+/* A flag or a count read back (`which` 0 to 5, as `which` 8 to 13 of `sysl_net_posix_option`). A
+ * flag is 0 or 1.
+ */
+int sysl_net_posix_flag(int fd, int which, long long *out) {
+    int level = 0, name = 0;
+
+    if (!flag_option(which, &level, &name)) return ENOTSUP;
+
+    int got = 0;
+    socklen_t n = sizeof got;
+
+    if (getsockopt(fd, level, name, &got, &n) != 0) return failed(fd);
+
+    *out = which <= 2 ? (got != 0) : got;
+    return 0;
 }
 
 /* The send (`which` 0) or receive (`which` 1) buffer the kernel granted, in bytes. */
