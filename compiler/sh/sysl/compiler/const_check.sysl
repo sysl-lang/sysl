@@ -34,7 +34,7 @@ private const_outside() -> string = "nothing outside the program exists while co
 
 // Holds every `const` function to what the compiler can run: its signature where it is typed
 // (`check_const_signature`), and here its body and its clauses. An instantiation of a generic one is
-// passed over, the generic having been read at its definition.
+// asked only about the `if const` arms it took, the generic having read the rest at its definition.
 check_const_fns(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal])
     var marked = false
 
@@ -59,15 +59,32 @@ check_const_fns(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal])
         bodies.put(funcs[i].name, i)
 
     val cx: &ConstSeen = ConstSeen(ghosts, vals, outside_storage(a), Skipped(buf()), funcs, bodies, map(),
-                                   false, buf(), false)
+                                   false, buf(), false, buf())
 
     for i in 0..<funcs.len()
         val f = funcs[i]
 
         // A routine the evaluator runs itself (`const_eval.sysl`) keeps its promise there, whatever
         // its body does with the addresses the program has.
-        if f.const_fn && !a.tables.members.func_origin.has(f.name) && !run_by_evaluator(a, f.name) then
+        if !f.const_fn || run_by_evaluator(a, f.name) then continue
+
+        if !a.tables.members.func_origin.has(f.name)
             const_body(a, cx, f)
+            continue
+        end if
+
+        // **An instance is asked about the `if const` arms it took**, and nothing else: the generic
+        // read the rest of the body at its definition, and neither arm, so an arm that cannot run
+        // would otherwise keep the promise unchecked -- and a `val` over the call would quietly be
+        // computed when the program starts. The refusal names the declaration, as the source does.
+        val arms = a.tables.const_arms.get(f.name)
+
+        if arms.is_some()
+            val within: &ConstSeen = ConstSeen(cx.ghosts, cx.vals, cx.outside, cx.said, cx.funcs, cx.bodies,
+                                               cx.unmarked, false, buf(), false, arms.unwrap())
+
+            const_body(a, within, f)
+        end if
 
     for f in a.tables.abstracts
         if f.const_fn && !run_by_evaluator(a, f.name) then const_body(a, cx, f)
@@ -101,6 +118,10 @@ private struct ConstSeen
     // Where the walk judges one frame an evaluation has reached: its calls are passed over, each to be
     // judged in turn if the evaluation reaches it.
     lazy: bool
+    // Where the walk is over an instance of a generic: the `if const` arms the instance took, which
+    // are all it is asked about -- the rest of its body was read with the generic. Empty everywhere
+    // else, where the whole body is asked about.
+    arms: Buf[Span]
 end ConstSeen
 
 // The variables the `extern` declarations name: storage outside the program.
@@ -139,7 +160,7 @@ private unmarked_refusal(a: &Analysis, cx: &ConstSeen, name: string) -> Option[s
     end if
 
     val inner: &ConstSeen = ConstSeen(cx.ghosts, cx.vals, cx.outside, Skipped(buf()), cx.funcs, cx.bodies,
-                                      cx.unmarked, true, buf(), cx.lazy)
+                                      cx.unmarked, true, buf(), cx.lazy, buf())
 
     const_body(a, inner, body.unwrap())
 
@@ -158,7 +179,7 @@ evaluable_refusal(a: &Analysis, name: string) -> Option[string]
     if a.tables.const_fns.has(name) then return None
 
     val cx: &ConstSeen = ConstSeen(buf(), buf(), outside_storage(a), Skipped(buf()), buf(), map(),
-                                   a.evaluation.unmarked, true, buf(), false)
+                                   a.evaluation.unmarked, true, buf(), false, buf())
 
     unmarked_refusal(a, cx, name)
 end evaluable_refusal
@@ -178,7 +199,7 @@ reached_refusal(a: &Analysis, name: string) -> Option[string]
         return Some(printing())
 
     val cx: &ConstSeen = ConstSeen(buf(), buf(), outside_storage(a), Skipped(buf()), buf(), map(),
-                                   a.evaluation.reached, true, buf(), true)
+                                   a.evaluation.reached, true, buf(), true, buf())
 
     unmarked_refusal(a, cx, name)
 end reached_refusal
@@ -215,7 +236,7 @@ end const_body
 
 private const_refuse(a: &Analysis, cx: &ConstSeen, scope: Scope, f: string, at: Span,
                      what: string)
-    if cx.said.covers(at) then return
+    if !in_arms(cx, at) || cx.said.covers(at) then return
 
     cx.said.cover(at)
 
@@ -225,8 +246,20 @@ private const_refuse(a: &Analysis, cx: &ConstSeen, scope: Scope, f: string, at: 
         return
     end if
 
-    a.fault(scope, at, s"${const_opening(f)} $what")
+    // An instance is named as the declaration it was made from, which is what a reader wrote.
+    a.fault(scope, at, s"${const_opening(a.tables.members.func_origin.get(f).unwrap_or(f))} $what")
 end const_refuse
+
+// Whether a stretch of source is one the walk is asked about: anywhere, except over an instance,
+// where only what lies inside an arm it took is.
+private in_arms(cx: &ConstSeen, at: Span) -> bool
+    if cx.arms.is_empty() then return true
+
+    for arm in cx.arms
+        if at.start >= arm.start && at.end <= arm.end then return true
+
+    false
+end in_arms
 
 private const_stmt(a: &Analysis, cx: &ConstSeen, scope: Scope, f: string, s: TStmt)
     s match
@@ -259,7 +292,7 @@ private const_write(a: &Analysis, cx: &ConstSeen, scope: Scope, f: string, w: TW
 end const_write
 
 private const_expr(a: &Analysis, cx: &ConstSeen, scope: Scope, f: string, e: TExpr)
-    if cx.said.covers(e.span) then return
+    if !in_arms(cx, e.span) || cx.said.covers(e.span) then return
 
     // `&bus` reads nothing from `bus`: the address of module storage is a constant the linker fills
     // in, so the storage it names is not reached, whenever it is filled.

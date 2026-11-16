@@ -351,6 +351,17 @@ end const_unary
 private const_binary(cx: &Analyzer, whole: Expr, op: string, l: Expr, r: Expr) -> Option[Const]
     val span = whole.span
     val a = const_fold(cx, l)
+
+    // **`&&` and `||` decide from their left operand where it settles the answer**, and the right is
+    // then not read at all -- as at run time, where it is not run. That is what lets an `if const`
+    // guard an operand with a test the operand depends on, `T: Integer && wide[T]()`, the way a
+    // nested `if const` guards its arm: at a `T` the test refuses, `wide[T]()` is never typed.
+    if op == "&&" || op == "||"
+        a match
+            Some(ConstBool(x)) -> if x == (op == "||") then return Some(ConstBool(x))
+            _ -> ()
+    end if
+
     val b = const_fold(cx, r)
 
     if a.is_none() || b.is_none() then return None
