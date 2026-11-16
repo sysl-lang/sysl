@@ -87,8 +87,11 @@ private dcd_outcome(main: string) -> (string, int)
         Ok(out) -> (out.text, shell_status(out.status))
 end dcd_outcome
 
-// Every symbol a line of this form names: `define` (but not `define private`, the compiler's own
-// table adapters and runtime helpers) or `declare`.
+// Every symbol a line of this form names: `define` or `declare`. Two kinds of `define` are the
+// runtime's, not the program's, and are skipped: `define private`, the compiler's own table adapters
+// and runtime helpers, and the weak defaults of the runtime's C-named hooks (`sysl_bounds_fail`,
+// `sysl_trap`), which any program with a runtime check carries. A library `@export` is weak too, so
+// the hooks are told apart by their `sysl_` names.
 private dcd_named(ir: string, form: string) -> Buf[string]
     var out: Buf[string] = buf()
     val lines = lines_of(ir)
@@ -100,11 +103,14 @@ private dcd_named(ir: string, form: string) -> Buf[string]
                 Some(at) ->
                     val rest = line[(at + 1)..<line.bytes.len]
                     val stop = rest.index_of("(").unwrap_or(rest.bytes.len)
+                    val name = rest[0..<stop]
 
-                    out.push(rest[0..<stop].copy())
+                    if !(line.starts_with("define weak") && dcd_runtime_hook(name)) then out.push(name.copy())
 
     out
 end dcd_named
+
+private dcd_runtime_hook(name: string) -> bool = name.starts_with("sysl_") || name.starts_with("__sysl_")
 
 private dcd_has(names: Buf[string], name: string) -> bool
     for item in names
