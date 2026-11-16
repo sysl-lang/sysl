@@ -2439,10 +2439,42 @@ private slots(r: &EvRun, at: Span, op: string, args: Buf[TExpr]) -> Flow
                 written_over(xs, lo + usize(i), vals[2])
                 EvNone
             _ -> refuse_form(r, at, "'slot_place' over something that is not a slice")
+        "slot_place_run" -> (vals[0], vals[1]) match
+            (ConstView(xs, lo, n, _), ConstInt(k)) -> place_run(r, args, xs, lo, n, k, vals[2])
+            _ -> refuse_form(r, at, "'slot_place_run' over something that is not a slice")
         "slot_take" -> raw_move(r, at, op)
         "slot_put" -> raw_move(r, at, op)
         _ -> EvNone
 end slots
+
+// `slot_place_run`: the run `src` written over the slots `k ..< k + src.len` of `xs[lo ..< lo + n]`.
+// The whole run is read before any slot is written, so a run that overlaps the slots it fills moves
+// as `memmove` would, which is what the lowering does for an element holding no count.
+private place_run(r: &EvRun, args: Buf[TExpr], xs: Buf[Const], lo: usize, n: usize, k: BigInt,
+                  src: Const) -> Flow
+    val (from, first, count) = src match
+        ConstArray(found) -> (found, usize(0), found.len())
+        ConstView(found, start, len, _) -> (found, start, len)
+        _ -> return refuse_form(r, args[2].span, "'slot_place_run' from something that is not a slice")
+
+    val i = k.to_long().unwrap_or(-1)
+
+    if i < 0 || i > long(n) || long(count) > long(n) - i then
+        return trap(r, args[1].span, s"a run of $count elements from slot $i is out of bounds for a " +
+                    s"slice of $n elements")
+
+    var run: Buf[Const] = buf()
+
+    for j in 0..<count
+        placed(r, args[2].span, from[first + j]) match
+            EvGave(v) -> run.push(v)
+            other -> return other
+
+    for j in 0..<count
+        written_over(xs, lo + usize(i) + j, run[j])
+
+    EvNone
+end place_run
 
 private raw_move(r: &EvRun, at: Span, op: string) -> Flow =
     refuse_form(r, at, s"'$op' moves a value through a raw pointer, which is not evaluated while compiling")
