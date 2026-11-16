@@ -915,6 +915,24 @@ handle it.
 about where a run begins, so the vector's own alignment cannot be assumed. On every machine sysl
 targets, an unaligned vector load of aligned data costs the same as an aligned one.
 
+**A lane narrower than its element's room moves element by element all the same.** A `[]u12` gives
+each element two bytes, so a run of `u12` is read as two-byte elements and narrowed in the register,
+and a store writes each lane back into its own two bytes. Every width does this — `u12`, `i24`,
+`u100`, `bool` — so a run reads exactly what subscripting each element reads.
+
+```sysl
+val xs: [6]u12 = [4095, 1, 2048, 7, 4000, 5]
+var ys: [6]u12 = [0; 6]
+val v: <4>u12 = xs.load(1)
+ys.store(2, v + v)
+
+print(ys[2], ys[3], ys[4], ys[5])
+```
+
+```output
+2 0 14 3904
+```
+
 **`volatile` elements are refused rather than widened.** A single instruction cannot preserve one
 ordered access per element. `volatile <4>u32` qualifies the whole register instead.
 

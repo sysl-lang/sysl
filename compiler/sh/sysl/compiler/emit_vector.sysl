@@ -332,14 +332,41 @@ private neg_zero_bits() -> long = signed_bits(parse_real("-0.0").unwrap_or(0.0).
 // promise the type does not make, and an over-aligned `load` is not a slow load but undefined
 // behaviour the moment it is wrong. Every machine sysl targets has an unaligned vector load that
 // costs the same as the aligned one on aligned data, so the honest number is also the free one.
+//
+// **A lane narrower than its element's storage is moved as the storage and converted in the
+// register.** An array of `u12` gives each element two bytes, but LLVM packs a `<8 x i12>` into
+// twelve contiguous bits per lane, so loading the run as the vector type would read the padding as
+// lanes. The run is read as `<N x i16>` and truncated; a store widens with `zext`, whatever the
+// lane's signedness, because a scalar `i12` store leaves its padding bits zero and a scalar load
+// relies on that. `bool` (an `i1` in a byte) and every width that is not a whole power-of-two
+// number of bytes (`u24`, `i56`, `u100`) take the same path.
 gen_vec_load(e: *Emit, receiver: TExpr, index: TExpr, vec_ty: Type, site: Span) -> Val
     val elem = element(repr(vec_ty)).unwrap_or(Unknown)
-    val p = run_addr(e, receiver, index, vector_lanes(vec_ty), site)
+    val n = vector_lanes(vec_ty)
+    val p = run_addr(e, receiver, index, n, site)
     val r = fresh_reg(e)
+    val align = Some(int(e.layout.align(elem)))
 
-    emit(e, InLoad(r, lty(e, vec_ty), p, AccPlain, Some(int(e.layout.align(elem)))))
+    storage_lane(e, elem) match
+        None -> emit(e, InLoad(r, lty(e, vec_ty), p, AccPlain, align))
+        Some(st) ->
+            val wide = fresh_reg(e)
+
+            emit(e, InLoad(wide, LVec(n, st), p, AccPlain, align))
+            emit(e, InCast(r, CastTrunc, LVec(n, st), wide, lty(e, vec_ty)))
+
     r
 end gen_vec_load
+
+// The integer a lane is stored as in an array when that differs from the lane's own type: `i16`
+// for a `u12`, `i8` for a `bool`, `i32` for an `i24`. `None` when the element fills its storage
+// exactly, which is every float, `char` and power-of-two integer.
+private storage_lane(e: *Emit, elem: Type) -> Option[LType] = lty(e, elem) match
+    LInt(bits) ->
+        val stored = int(e.layout.size(elem)) * 8
+
+        if stored != bits && stored > 0 then Some(LInt(stored)) else None
+    _ -> None
 
 // The value first and the address second, which is the order an assignment uses -- this *is* an
 // assignment to a run of elements, and the two spellings must not differ in when a side effect in
@@ -348,9 +375,18 @@ gen_vec_store(e: *Emit, receiver: TExpr, index: TExpr, value: TExpr, site: Span)
     val vec_ty = texpr_type(value)
     val elem = element(repr(vec_ty)).unwrap_or(Unknown)
     val v = gen_expr(e, value)
-    val p = run_addr(e, receiver, index, vector_lanes(vec_ty), site)
+    val n = vector_lanes(vec_ty)
+    val p = run_addr(e, receiver, index, n, site)
+    val align = Some(int(e.layout.align(elem)))
 
-    emit(e, InStore(lty(e, vec_ty), v, p, AccPlain, Some(int(e.layout.align(elem)))))
+    storage_lane(e, elem) match
+        None -> emit(e, InStore(lty(e, vec_ty), v, p, AccPlain, align))
+        Some(st) ->
+            val wide = fresh_reg(e)
+
+            emit(e, InCast(wide, CastZExt, lty(e, vec_ty), v, LVec(n, st)))
+            emit(e, InStore(LVec(n, st), wide, p, AccPlain, align))
+
     VNothing
 end gen_vec_store
 
