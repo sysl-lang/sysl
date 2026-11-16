@@ -1,0 +1,102 @@
+module sysl.net
+@requires(posix)
+@tests
+
+import sysl.fs.{IoError, make_temp_dir, remove_dir_all}
+import sysl.path.join
+import sysl.process.{group, pid, user}
+import sysl.sys.UNSUPPORTED
+
+// `Socket.peer_credentials`: who is at the other end of a Unix domain connection.
+//
+// Both ends of a connection made inside one process are this process, so the answer to either end is
+// the program's own effective user and group and its own process id.
+
+private ends(name: string) -> (Socket, Socket, string)
+    val dir = make_temp_dir(f"sysl-peer-${pid()}-${name}-").unwrap()
+    val at = unix(join(dir, "s.sock")).unwrap()
+    var l = unix_listen(at).unwrap()
+    val c = unix_connect(at).unwrap()
+    val a = l.accept().unwrap()
+
+    l.close().unwrap()
+    (c, a, dir)
+end ends
+
+// `ENOTSUP` is the host's "no such call here", which the hosted answer turns into `UNSUPPORTED`: the
+// error reads "not supported on this target", and its code is the same on every platform.
+private not_supported() -> int = UNSUPPORTED
+
+@test("pcr_ both ends of a Unix connection report this process as the peer")
+pcr_both_ends_are_this_process()
+    var (c, a, dir) = ends("both")
+    val from_client = c.peer_credentials().unwrap()
+    val from_server = a.peer_credentials().unwrap()
+
+    assert_eq(from_client.uid, user())
+    assert_eq(from_client.gid, group())
+    assert_eq(from_server.uid, user())
+    assert_eq(from_server.gid, group())
+    assert(from_client.pid == Some(pid()), "the client end's peer is not this process")
+    assert(from_server.pid == Some(pid()), "the server end's peer is not this process")
+    assert(from_client == from_server)
+
+    c.close().unwrap()
+    a.close().unwrap()
+    remove_dir_all(dir).unwrap()
+end pcr_both_ends_are_this_process
+
+@test("pcr_ a TCP socket has no credentials: an error, never a user")
+pcr_tcp_is_an_error()
+    val addrs = resolve("127.0.0.1", 0).unwrap()
+    var l = socket(addrs[0]).unwrap()
+
+    l.bind(addrs[0]).unwrap()
+    l.listen().unwrap()
+
+    val at = l.local().unwrap()
+    var c = socket(at).unwrap()
+
+    c.connect(at).unwrap()
+
+    val (a, _) = l.accept().unwrap()
+    val from_client = c.peer_credentials()
+    val from_server = a.peer_credentials()
+    val from_listener = l.peer_credentials()
+
+    assert(from_client.is_err(), "a TCP client reported credentials")
+    assert(from_server.is_err(), "an accepted TCP connection reported credentials")
+    assert(from_listener.is_err(), "a TCP listener reported credentials")
+    assert_eq(from_client.unwrap_err().code(), not_supported())
+    assert_eq(from_server.unwrap_err().code(), not_supported())
+
+    c.close().unwrap()
+    l.close().unwrap()
+end pcr_tcp_is_an_error
+
+@test("pcr_ a closed socket is NotOpen, through every copy")
+pcr_closed_socket_is_not_open()
+    var (c, a, dir) = ends("closed")
+    val copy = c
+
+    c.close().unwrap()
+    assert_eq(c.peer_credentials().unwrap_err(), IoError.NotOpen)
+    assert_eq(copy.peer_credentials().unwrap_err(), IoError.NotOpen)
+
+    a.close().unwrap()
+    assert_eq(a.peer_credentials().unwrap_err(), IoError.NotOpen)
+    remove_dir_all(dir).unwrap()
+end pcr_closed_socket_is_not_open
+
+@test("pcr_ the peer a connection reports is still answered after the other end shuts down")
+pcr_after_peer_shutdown()
+    var (c, a, dir) = ends("shut")
+
+    c.shutdown(Both).unwrap()
+
+    assert_eq(a.peer_credentials().unwrap().uid, user())
+
+    c.close().unwrap()
+    a.close().unwrap()
+    remove_dir_all(dir).unwrap()
+end pcr_after_peer_shutdown

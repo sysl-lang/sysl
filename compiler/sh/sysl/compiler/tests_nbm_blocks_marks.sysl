@@ -1,0 +1,111 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+
+// The library's file opening and name resolution are marked as waiting (`reference/attributes.md §
+// @no_block and @blocks`): opening a FIFO waits for the other end, a network filesystem waits for its
+// server, and a name waits on DNS. A neighbour that cannot wait -- a path test, a directory made, an
+// address built directly, a bind -- stays accepted.
+
+private var nbm_checked: bool = false
+private var nbm_there: bool = false
+
+private nbm_ready() -> bool
+    if !nbm_checked
+        nbm_checked = true
+        nbm_there = std_root().is_ok()
+
+    if !nbm_there
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end nbm_ready
+
+private nbm_says(text: string, part: string) -> bool = text.index_of(part).is_some()
+
+private nbm_check(said: string, part: string) = assert(nbm_says(said, part), said)
+
+private nbm_err(thing: string, main: string) -> string
+    val root = make_temp_dir("sysl-blocks-marks").unwrap()
+
+    make_dir_all(s"$root/thing").unwrap()
+    write_text(s"$root/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(s"$root/thing/a.sysl", s"module thing\n\n$thing").unwrap()
+    write_text(s"$root/main.sysl", main).unwrap()
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end nbm_err
+
+@test("opening a file is marked, so a '@no_block' function may not reach it")
+nbm_open_is_marked()
+    if !nbm_ready() then return
+
+    val said = nbm_err("import sysl.fs.open\n\n@no_block\nf(p: string) -> bool = open(p).is_ok()\n",
+                       "print(thing.f(\"x\"))\n")
+
+    nbm_check(said, "this reaches 'sysl.fs.open', which blocks through 'sysl.fs.sys.open', and " +
+                    "'thing.f' declared '@no_block'")
+
+@test("the other ways of opening a file are marked too")
+nbm_open_variants_are_marked()
+    if !nbm_ready() then return
+
+    val said = nbm_err("import sysl.fs.{create, append}\n\n@no_block\nf(p: string) -> bool = create(p).is_ok()\n\n" +
+                       "@no_block\ng(p: string) -> bool = append(p).is_ok()\n",
+                       "print(thing.f(\"x\"), thing.g(\"x\"))\n")
+
+    nbm_check(said, "this reaches 'sysl.fs.create', which blocks through 'sysl.fs.sys.open', and " +
+                    "'thing.f' declared '@no_block'")
+    nbm_check(said, "this reaches 'sysl.fs.append', which blocks through 'sysl.fs.sys.open', and " +
+                    "'thing.g' declared '@no_block'")
+
+@test("opening beneath a directory is marked")
+nbm_open_beneath_is_marked()
+    if !nbm_ready() then return
+
+    val said = nbm_err("import sysl.fs.Dir\n\n@no_block\nf(d: *Dir) -> bool = d.open(\"x\").is_ok()\n",
+                       "print(1)\n")
+
+    nbm_check(said, "this reaches 'sysl.fs.Dir.open', which blocks through 'sysl.fs.sys.open_beneath', and " +
+                    "'thing.f' declared '@no_block'")
+
+@test("a name lookup is marked, and so is the listener's")
+nbm_resolve_is_marked()
+    if !nbm_ready() then return
+
+    val said = nbm_err("import sysl.net.{resolve, resolve_passive}\n\n" +
+                       "@no_block\nf() -> bool = resolve(\"example.com\", 80).is_ok()\n\n" +
+                       "@no_block\ng() -> bool = resolve_passive(80).is_ok()\n",
+                       "print(thing.f(), thing.g())\n")
+
+    nbm_check(said, "this reaches 'sysl.net.resolve', which blocks through 'sysl.net.sys.resolve', and " +
+                    "'thing.f' declared '@no_block'")
+    nbm_check(said, "this reaches 'sysl.net.resolve_passive', which blocks through 'sysl.net.sys.resolve', " +
+                    "and 'thing.g' declared '@no_block'")
+
+@test("what cannot wait stays accepted beside them")
+nbm_neighbours_are_free()
+    if !nbm_ready() then return
+
+    val said = nbm_err("import sysl.fs.{exists, make_dir, metadata}\nimport sysl.net.{ipv4, Socket}\n\n" +
+                       "@no_block\nf(p: string) -> bool = exists(p)\n\n" +
+                       "@no_block\ng(p: string) -> bool = make_dir(p).is_ok()\n\n" +
+                       "@no_block\nh(p: string) -> bool = metadata(p).is_ok()\n\n" +
+                       "@no_block\nk() -> bool\n    val a = ipv4(127, 0, 0, 1, 80)\n    true\n\n" +
+                       "@no_block\nm(s: *Socket) -> bool = s.listen().is_ok()\n",
+                       "print(thing.f(\"x\"))\n")
+
+    assert(!nbm_says(said, "declared '@no_block'"), said)

@@ -197,6 +197,22 @@ struct Socket
      */
     local(self) -> Result[Address, IoError] = local_of(self.inner.fd.load())
 
+    /** Who is at the other end of this Unix domain connection: the user and group the peer process
+     * had, and its process id where the system gives it. It is what a server asks to learn which
+     * operating-system user is talking to it, without a password.
+     *
+     * **Only a Unix domain socket has credentials**: a TCP socket answers the "not supported on this
+     * target" error (`sysl.sys.UNSUPPORTED`, which is what the host's `ENOTSUP` becomes), never a made-up user, and a closed one answers `NotOpen`.
+     */
+    peer_credentials(self) -> Result[PeerCredentials, IoError]
+        var c = nsys.Credentials(0, 0, -1)
+        val e = nsys.peer_credentials(int(self.inner.fd.load()), &c)
+
+        if e < 0 then return Err(failure(e))
+
+        Ok(PeerCredentials(c.uid, c.gid, if c.pid < 0 then None else Some(u32(c.pid))))
+    end peer_credentials
+
     /** Write some of `bytes`, and say how many.
      *
      * **A short write is not an error**: a stream moves what it can and the caller comes back for the
@@ -310,6 +326,15 @@ struct Socket
     /** The receive buffer the kernel gave this socket, in bytes. */
     recv_buffer(self) -> Result[int, IoError] = sized(nsys.option(int(self.inner.fd.load()), nsys.recv_buffer_size, 0))
 end Socket
+
+/** The process at the other end of a Unix domain connection, as `Socket.peer_credentials` reports it.
+ * `uid` and `gid` are the ids `sysl.process.user` and `group` answer, so a peer is compared with
+ * `== user()`; `pid` is `None` where the system does not say.
+ */
+struct PeerCredentials derives Eq
+    uid: u32
+    gid: u32
+    pid: Option[u32]
 
 /** A stream socket of the family an address belongs to, ready to be connected or bound.
  *

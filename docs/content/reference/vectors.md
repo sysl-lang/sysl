@@ -189,7 +189,8 @@ a vector converts to an array, and an array to a vector, only at one length: <4>
 
 An operator does not mix the two, in either order: two operands meeting is not a position that names
 the type it wants, so `v + a` with `a` an array is refused as two different vector types are.
-Convert one side first, with a declared `val`.
+Convert one side first, with a declared `val`. A bracket list written beside the vector, `v + [1,
+2]`, is not an array but the vector's own literal (see [the operators](#what-the-operators-do)).
 
 ### Converting lanes
 
@@ -253,6 +254,21 @@ same vector, or one side a scalar that broadcasts:
 | a float | `+` `-` `*` `/`, and unary `-` |
 | a fixed-point type | `+` `-` `*`, and unary `-` — saturating and rounding as the scalar does |
 | `bool` (a mask) | `&` <code>&#124;</code> `^` |
+
+The scalar may stand on either side, and so may a bracket list written in place, which is read as
+the vector beside it rather than as an array:
+
+```sysl
+val dt = 6.0
+val v: <2>real = [2, 3]
+val m = dt / v + [1, 2] * v
+
+print(m[0], m[1])
+```
+
+```output
+5 8
+```
 
 **Integer `/` and `%` are refused.** Scalar integer division traps on a zero divisor and on signed
 overflow, but a register traps as a whole or not at all, so a vector divide would either drop the
@@ -1024,6 +1040,24 @@ handle it.
 **The alignment assumed is the element's.** A `[]f32` guarantees four-byte alignment and nothing
 about where a run begins, so the vector's own alignment cannot be assumed. On every machine sysl
 targets, an unaligned vector load of aligned data costs the same as an aligned one.
+
+**A lane narrower than its element's room moves element by element all the same.** A `[]u12` gives
+each element two bytes, so a run of `u12` is read as two-byte elements and narrowed in the register,
+and a store writes each lane back into its own two bytes. Every width does this — `u12`, `i24`,
+`u100`, `bool` — so a run reads exactly what subscripting each element reads.
+
+```sysl
+val xs: [6]u12 = [4095, 1, 2048, 7, 4000, 5]
+var ys: [6]u12 = [0; 6]
+val v: <4>u12 = xs.load(1)
+ys.store(2, v + v)
+
+print(ys[2], ys[3], ys[4], ys[5])
+```
+
+```output
+2 0 14 3904
+```
 
 **`volatile` elements are refused rather than widened.** A single instruction cannot preserve one
 ordered access per element. `volatile <4>u32` qualifies the whole register instead.

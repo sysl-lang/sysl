@@ -1,0 +1,141 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `old(e)` is `e` evaluated on entry (`reference/errors.md`), so `e` may read only what exists then.
+// A name the `ensure` itself binds -- a `for all` or `for some` variable, at any depth of nesting, or
+// a `match` arm's name -- does not exist on entry, and neither does `result`; an `old` reading one is
+// refused at the read. A name bound inside the `old`'s own argument, and a parameter read under a
+// quantifier, are evaluated on entry with the rest of it and stay accepted.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private obn_root(main: string) -> string
+    val root = make_temp_dir("sysl-obn").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(root + "/main.sysl", main).unwrap()
+    root
+end obn_root
+
+// The program prints exactly this and leaves with this status; a failure to build is its message and
+// `-1`. Returns at once without the library.
+private obn_leaves(main: string, want: string, code: int)
+    if xvr_no_library() then return
+
+    val root = obn_root(main)
+    val exe = root + "/built"
+
+    val out = build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) -> (failure_text(why), -1)
+        Ok(_) -> capture(exe, [], "", [], true) match
+            Err(_) -> ("the program that was built could not be run", -1)
+            Ok(o) -> (o.text + o.err.unwrap_or(""), shell_status(o.status))
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(out.0, want)
+    assert_eq(out.1, code)
+end obn_leaves
+
+// The program is refused with exactly this message, first, at this line and column of `main.sysl`.
+private obn_refused(main: string, message: string, at: string)
+    if xvr_no_library() then return
+
+    val root = obn_root(main)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    assert(out.starts_with(s"error: $message\n --> "), s"expected 'error: $message' first, got: $out")
+    assert(out.index_of(s"/main.sysl:$at\n").is_some(), s"expected it at main.sysl:$at, got: $out")
+end obn_refused
+
+private obn_said(name: string) -> string =
+    s"'$name' is bound inside this 'ensure', and 'old' is evaluated on entry, before '$name' exists"
+
+private obn_reverse() -> string =
+    "reverse(xs: []int)\n" +
+    "    ensure for all k in 0..<xs.len do xs[k] == old(xs[xs.len - 1 - k])\n\n" +
+    "    var i = 0\n    var j = xs.len - 1\n\n" +
+    "    while i < j\n        val t = xs[i]\n        xs[i] = xs[j]\n        xs[j] = t\n" +
+    "        i += 1\n        j -= 1\n\n" +
+    "var a = [1, 2, 3]\nreverse(a[..])\nprint(a[0])\n"
+
+// -- refused: a name the clause binds -------------------------------------------------------------
+
+// The reversal compiled before, snapshotting `xs[xs.len - 1 - k]` on entry with no `k`, and a
+// correct reversal then trapped.
+@test("old reading a 'for all' variable is refused")
+obn_old_reading_a_for_all_variable_is_refused() =
+    obn_refused(obn_reverse(), obn_said("k"), "2:68")
+
+@test("old reading a 'for some' variable is refused")
+obn_old_reading_a_for_some_variable_is_refused() =
+    obn_refused("zero(xs: []int)\n    ensure for some k in 0..<xs.len do old(xs[k]) == 0\n\n" +
+                "    xs[0] = 0\n\nvar a = [1, 0, 3]\nzero(a[..])\nprint(a[0])\n", obn_said("k"), "2:47")
+
+@test("old reading the inner variable of nested quantifiers is refused")
+obn_old_reading_the_inner_variable_is_refused() =
+    obn_refused("f(n: int) -> int\n    ensure for all i in 0..<n do for all j in 0..<n do old(n - j) > 0\n\n" +
+                "    n\n\nprint(f(3))\n", obn_said("j"), "2:64")
+
+// The outer quantifier is an enclosing clause of the same `ensure`; its variable is no more there
+// on entry than the inner one's.
+@test("old reading the outer variable of nested quantifiers is refused")
+obn_old_reading_the_outer_variable_is_refused() =
+    obn_refused("f(n: int) -> int\n    ensure for all i in 0..<n do for all j in 0..<n do old(n - i) > 0\n\n" +
+                "    n\n\nprint(f(3))\n", obn_said("i"), "2:64")
+
+@test("old reading a name a match arm in the ensure binds is refused")
+obn_old_reading_a_match_arm_name_is_refused() =
+    obn_refused("f(o: Option[int]) -> int\n    ensure o match\n        Some(v) -> result == old(v)\n" +
+                "        None -> result == 0\n\n    o.unwrap_or(0)\n\nprint(f(Some(4)))\n",
+                obn_said("v"), "3:34")
+
+// `result` is not there on entry either. This one used to pass analysis and fail inside clang.
+@test("old reading result is refused")
+obn_old_reading_result_is_refused() =
+    obn_refused("f(n: int) -> int\n    ensure result > old(result)\n\n    n\n\nprint(f(3))\n",
+                "'result' is the value the function returns, and 'old' is evaluated on entry, " +
+                "before 'result' exists", "2:25")
+
+// A clause-bound name shadowing a parameter is still the clause's.
+@test("a quantifier variable shadowing a parameter is still refused inside old")
+obn_a_shadowing_quantifier_variable_is_refused() =
+    obn_refused("f(n: int, k: int) -> int\n    ensure for all k in 0..<n do old(k) >= 0\n\n" +
+                "    n\n\nprint(f(3, 1))\n", obn_said("k"), "2:38")
+
+// -- accepted: what exists on entry ---------------------------------------------------------------
+
+@test("old of a parameter inside a quantifier is accepted and snapshotted on entry")
+obn_old_of_a_parameter_inside_a_quantifier_runs() =
+    obn_leaves("grow(n: int) -> int\n    ensure for all k in 0..<n do result > old(n) + k - k\n\n" +
+               "    n = n + 1\n    n\n\nprint(grow(3))\n", "4\n", 0)
+
+// The snapshot is taken on entry, not at the check: `n` was 3 then, so `result > old(n)` with a
+// result of 3 fails even though the body raised `n` first.
+@test("old of a parameter inside a quantifier still traps when the clause fails")
+obn_old_of_a_parameter_inside_a_quantifier_traps() =
+    obn_leaves("same(n: int) -> int\n    ensure for all k in 0..<n do result > old(n) + k - k\n\n" +
+               "    val r = n\n    n = n + 1\n    r\n\nprint(same(3))\n", "", 133)
+
+// A quantifier written INSIDE the `old` binds its variable inside the snapshot, which is evaluated
+// whole on entry.
+@test("a quantifier inside old's own argument is accepted")
+obn_a_quantifier_inside_old_runs() =
+    obn_leaves("clear(xs: []int) -> bool\n" +
+               "    ensure result == old(for all j in 0..<xs.len do xs[j] > 0)\n\n" +
+               "    var ok = true\n\n    for x in xs\n        if x <= 0 then ok = false\n\n" +
+               "    xs[0] = 0\n    ok\n\nvar a = [1, 2, 3]\nprint(clear(a[..]), a[0])\n", "true 0\n", 0)
+
+// `old` is an `ensure`'s alone; a loop `invariant` refuses it the way a `require` does.
+@test("old in a loop invariant is refused as undefined")
+obn_old_in_a_loop_invariant_is_refused() =
+    obn_refused("f(n: int) -> int\n    var i = 0\n\n    while i < n\n        invariant i >= old(n) - n\n" +
+                "        i += 1\n\n    i\n\nprint(f(3))\n", "undefined function 'old'", "5:24")

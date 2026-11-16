@@ -45,8 +45,8 @@ enum Option[T]                 enum Result[T, E]
 
 - **`Option[T]` represents absence**: a value that may or may not be there, with no reason attached,
   such as a missing key, the `next` of a list's last node, or the result of a search. It is also what
-  a [`weak` reference](/reference/memory/) yields when read, and what a fallible constructor like
-  `char.try` returns.
+  a [`weak` reference](/reference/memory/) yields when read, and what a fallible conversion like
+  `sysl.text.char_from_u32` returns.
 - **`Result[T, E]` represents failure with a reason**: parsing, I/O, validation. `E` is whatever
   carries the reason: a string, an error enum, a `&Fail`.
 
@@ -2654,6 +2654,29 @@ print(c.n, c.m)
 
 Contracts work the same way on a **method**, including one with a `*self` receiver, where they are
 most useful: `ensure result > old(self.n)` on a mutating method states what the method is *for*.
+
+Because `old(e)` is evaluated on entry, `e` may read only what exists then. A name the clause itself
+binds — a [quantifier's](/reference/verification/#for-all-and-for-some) variable, a `match` arm's
+name — does not, and neither does `result`, so an `old` that reads one is refused:
+
+```sysl
+reverse(xs: []int)
+    ensure for all k in 0..<xs.len do xs[k] == old(xs[xs.len - 1 - k])
+
+    var i = 0
+    var j = xs.len - 1
+
+    while i < j
+        val t = xs[i]
+        xs[i] = xs[j]
+        xs[j] = t
+        i += 1
+        j -= 1
+```
+
+```error
+'k' is bound inside this 'ensure', and 'old' is evaluated on entry, before 'k' exists
+```
 
 Like a constraint, a violated contract **traps**, and contracts are checked in **every** build. There
 is no release mode that drops them, since one would make a program's meaning depend on how it was

@@ -2707,6 +2707,12 @@ sandboxed_read(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr
     t
 end sandboxed_read
 
+// Whether an operand is a bracket list written where it stands, `[a, b]` or `[x; 4]`.
+private written_list(e: Expr) -> bool = *e.kind match
+    ArrayLit(_) -> true
+    ArrayFill(_, _) -> true
+    _ -> false
+
 // Whether one of two types is a vector and the other an array.
 private storage_beside_register(a: Type, b: Type) -> bool = (a, b) match
     (Vector(_, _), Array(_, _)) -> true
@@ -2727,7 +2733,11 @@ reread(cx: &Analyzer, t: TExpr, src: Expr, want: Type, widen: bool = true) -> TE
     // its lanes convert where a position names the one it wants (`expr_coerce.sysl`'s `lanes_as`),
     // but two operands meeting is not such a position: `v + a` would compute lane-wise or fail to
     // according to which side was the vector.
-    if storage_beside_register(repr(texpr_type(t)), repr(want)) then return t
+    //
+    // **A bracket list written in place is not storage, though**: it has no type of its own until a
+    // position gives it one, and beside a vector its brackets are the vector's, as they are at
+    // `val v: <2>real = [a, b]` -- so `v * [2.0, 3.0]` and `[dt, 1.0] * v` are lane-wise.
+    if storage_beside_register(repr(texpr_type(t)), repr(want)) && !written_list(src) then return t
 
     // A character literal beside a byte is that byte or a mistake with its own name, so its reading
     // at `u8` is the one kept either way -- `b == 'é'` is told the character is not ASCII, rather
@@ -2813,11 +2823,20 @@ private holds_every_operand(cx: &Analyzer, operands: Buf[Expr], read: Buf[Option
                 if rescales && is_fixed(other) && is_fixed(ty) && !type_eq(other, ty) then return false
                 if !adaptable(cx, operands[i], t) && !type_eq(other, ty) &&
                         (other == Char || !implicitly_widens(other, ty)) &&
-                        !points_at_conformer(cx, other, ty) then return false
+                        !points_at_conformer(cx, other, ty) && !broadcasts_into(other, ty) &&
+                        !(written_list(operands[i]) && is_vector(ty)) then return false
             None -> ()
 
     true
 end holds_every_operand
+
+// Whether a scalar is the lane of a vector, and so is held by it as the same value in every lane.
+// This is what makes `dt * v` the vector product `v * dt` is: the pair is read at the vector on
+// whichever side it stands, and the scalar is splatted where it is re-read there. A bracket list
+// written beside the vector is held by it the same way (`reread`).
+private broadcasts_into(scalar: Type, vec: Type) -> bool = vec match
+    Vector(_, lane) -> !is_vector(scalar) && type_eq(scalar, repr(*lane))
+    _ -> false
 
 // Whether a pointer to a concrete type meets a pointer to a trait it implements: the pair is read at
 // the trait pointer, to which the concrete one converts, so `rect_ptr == shape_ptr` and
