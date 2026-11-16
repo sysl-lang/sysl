@@ -17,6 +17,19 @@ void *sysl_fs_host_map(int fd, size_t len) {
     return at == MAP_FAILED ? (void *) 0 : at;
 }
 
+// The same, readable and writable and shared, for `sysl_fs_map_shared`. Null with `errno` set.
+void *sysl_fs_host_map_shared(int fd, size_t len) {
+    void *at = mmap((void *) 0, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, (off_t) 0);
+
+    return at == MAP_FAILED ? (void *) 0 : at;
+}
+
+// `msync` of a range inside a shared mapping: `MS_SYNC` where `wait` is non-zero, `MS_ASYNC`
+// otherwise. Zero, or -1 with `errno` set.
+int sysl_fs_host_msync(void *at, size_t len, int wait) {
+    return msync(at, len, wait ? MS_SYNC : MS_ASYNC);
+}
+
 // Zero, or -1 with `errno` set.
 int sysl_fs_host_unmap(void *at, size_t len) {
     return munmap(at, len);

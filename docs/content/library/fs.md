@@ -694,10 +694,10 @@ true true
 
 Four rules are in it.
 
-**It is read-only and private**, so nothing can write the file through it. A writable mapping is
-absent on purpose: a store into a shared mapping reaches the file with no `Result` to say it failed —
-a full disk is a signal, not an error — and a private writable one is a copy of the file in memory,
-which `read_bytes` already is.
+**It is read-only and private**, so nothing can write the file through it. The writable kind is a
+different type, `MappedMut` from `File.map_mut`, [below](#durability-and-a-writable-mapping): a store
+into a shared mapping reaches the file with no `Result` to say it failed — a full disk is a signal,
+not an error — which is why it is asked for by name and flushed with a call that does answer.
 
 **It outlives the file and the name.** The descriptor is closed before `map_file` answers, and the
 file removed above is still readable through `m` until `m` goes — which is what lets an editor that
@@ -763,6 +763,84 @@ mapping's pages, which keeps the resident size small through a long scan; **macO
 file mapping**, so the call succeeds and the pages stay. On a freestanding target a program that calls
 `advise` supplies `sysl_fs_advise` (a build that calls it without is refused, naming it), and
 `sysl_fs_page_size` if its pages are not 4096 bytes.
+
+### Durability, and a writable mapping
+
+```sysl
+File.sync_data(*self) -> Result[unit, IoError]
+File.full_sync(*self) -> Result[unit, IoError]
+File.map_mut(*self, len: usize = usize::Max) -> Result[&MappedMut, IoError]
+open_uncached(path: string, create: bool = false) -> Result[File, IoError]
+
+struct MappedMut
+    len(self) -> usize
+    is_empty(self) -> bool
+    @views(self)
+    bytes(&self) -> []u8
+    flush(self, from: usize = 0, len: usize = usize::Max) -> Result[unit, IoError]
+    flush_async(self, from: usize = 0, len: usize = usize::Max) -> Result[unit, IoError]
+```
+
+What a database asks of its files. **There are three strengths of "it is written"**, and each hands
+over what the `File` still buffers first. `sync` is `fsync`. `sync_data` is the same without the
+metadata a reader does not need: `fdatasync` on Linux; on macOS, where there is nothing cheaper, plain
+`fsync`. `full_sync` is the one that survives a power cut: `fcntl(F_FULLFSYNC)` on macOS, which makes
+the drive empty its own write cache (plain `fsync` there stops at the drive), and `fsync` elsewhere,
+where it already is the full one. All three are `NotOpen` on a closed file.
+
+**`open_uncached` bypasses the page cache** — `O_DIRECT` on Linux, `fcntl(F_NOCACHE)` on macOS — for
+a program with its own buffer pool. It opens for reading and writing, and `create` makes a missing
+file without emptying an existing one. It is used through `read_at` and `write_at`. **Linux holds it
+to alignment**: the buffer's address, the offset and the length of each transfer are multiples of the
+device's block size (use 4096), or the call is `Other(22)` (`EINVAL`); macOS has no such rule, and a
+program that wants to run on both aligns for Linux.
+
+**`map_mut` is a shared, writable mapping**: a store through `bytes()` is a store to the file. The file
+must be open for update (a read-only one is `PermissionDenied`). The mapping is never longer than the
+file, since a page past the end is a signal when touched rather than an error, so a `len` above the
+file's size is `Other(22)`; a program that wants more `truncate`s first. `flush` writes a range back
+and returns when it is there (`msync(MS_SYNC)`), `flush_async` only schedules it, and a range past the
+mapping is `Other(22)`. **`flush` puts the bytes in the file, not on the device**: follow it with
+`sync_data` or `full_sync` where a power cut matters.
+
+```sysl
+import sysl.fs.{File, create_update, open_update, open, read_text, remove_file, PermissionDenied}
+import sysl.process.pid
+
+var path = s"/tmp/sysl-fs-doc-dur-${pid()}.txt"
+var f = create_update(path).unwrap()
+
+f.write("0123456789".bytes)
+f.sync_data().unwrap()
+f.full_sync().unwrap()
+f.close().unwrap()
+
+put(f: File)
+    val m = f.map_mut().unwrap()
+    val v = m.bytes()
+
+    v[0] = u8('X')
+    v[9] = u8('Z')
+    m.flush().unwrap()
+end put
+
+var g = open_update(path).unwrap()
+
+put(g)
+g.close().unwrap()
+print(read_text(path).unwrap())
+
+var ro = open(path).unwrap()
+
+print(ro.map_mut().unwrap_err() == PermissionDenied)
+ro.close().unwrap()
+remove_file(path).unwrap()
+```
+
+```output
+X12345678Z
+true
+```
 
 ## The path tier
 
@@ -1404,7 +1482,7 @@ and outlives it; the `Dir`'s descriptor is closed when its last reference goes.
 ## Answering the filesystem on a freestanding target
 
 **Everything above reaches the filesystem through `sysl.fs.sys` and through nothing else**: one
-`extern` per call — `sysl_fs_open`, `_read`, `_write`, `_pread`, `_pwrite`, `_sync`, `_close`, `_seek`, `_fstat`, `_ftruncate`, `_map`, `_unmap`, `_advise` and `_page_size` (the last two asked only by a program that advises a mapping; `_page_size` answers `usize`, zero meaning 4096),
+`extern` per call — `sysl_fs_open`, `_read`, `_write`, `_pread`, `_pwrite`, `_sync`, `_close`, `_seek`, `_fstat`, `_ftruncate`, `_map`, `_unmap`, `_advise` and `_page_size` (the last two asked only by a program that advises a mapping; `_page_size` answers `usize`, zero meaning 4096; `_sync_data`, `_full_sync`, `_map_shared` and `_msync` asked only by a program that calls `sync_data`, `full_sync`, `map_mut` or a flush, and the `open` flags carry an uncached bit),
 `_stat`, `_truncate`, `_mkdir`, `_rmdir`, `_unlink`, `_rename`, `_access`, `_chmod`, `_chown`, `_opendir`,
 `_readdir`, `_closedir`, `_getcwd`, `_chdir`, `_temp_dir`, `_symlink`, `_link`, `_readlink` and
 `_realpath`, and for a `Dir` `_dir_open`, `_open_beneath`, `_stat_beneath` and `_unlink_beneath`,

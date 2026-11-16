@@ -20,8 +20,14 @@ enum {
     SYSL_FS_OPEN_WRITE = 2,
     SYSL_FS_OPEN_CREATE = 4,
     SYSL_FS_OPEN_TRUNCATE = 8,
-    SYSL_FS_OPEN_APPEND = 16
+    SYSL_FS_OPEN_APPEND = 16,
+    SYSL_FS_OPEN_UNCACHED = 32
 };
+
+// glibc shows `O_DIRECT` only to `_GNU_SOURCE`, under its own name `__O_DIRECT` otherwise.
+#if defined(__linux__) && !defined(O_DIRECT) && defined(__O_DIRECT)
+#define O_DIRECT __O_DIRECT
+#endif
 
 // The interface's flags turned into this C library's `O_*`, whose values differ between the C
 // libraries -- `O_CREAT` is 0x200 on Darwin and 0x40 on Linux -- and are only written down in a header.
@@ -35,14 +41,63 @@ static int sysl_fs_host_how(unsigned flags) {
     if (flags & SYSL_FS_OPEN_CREATE) how |= O_CREAT;
     if (flags & SYSL_FS_OPEN_TRUNCATE) how |= O_TRUNC;
     if (flags & SYSL_FS_OPEN_APPEND) how |= O_APPEND;
+#ifdef O_DIRECT
+    if (flags & SYSL_FS_OPEN_UNCACHED) how |= O_DIRECT;
+#endif
 
     return how;
 }
 
 // `open` with the interface's flags. A descriptor, or -1 with `errno` set.
+//
+// An uncached open is `O_DIRECT` where the C library has it (Linux). Darwin has no such flag: the
+// same effect is `fcntl(F_NOCACHE)` on the descriptor afterwards. A C library with neither refuses
+// the open with `ENOTSUP` rather than quietly handing back a cached file.
 int sysl_fs_host_open(const char *path, unsigned flags, unsigned mode) {
+#if !defined(O_DIRECT) && !defined(F_NOCACHE)
+    if (flags & SYSL_FS_OPEN_UNCACHED) {
+        errno = ENOTSUP;
+        return -1;
+    }
+#endif
+
     /* Close-on-exec, so a child started by `sysl.process` does not inherit the file. */
-    return open(path, sysl_fs_host_how(flags) | O_CLOEXEC, (mode_t) mode);
+    int fd = open(path, sysl_fs_host_how(flags) | O_CLOEXEC, (mode_t) mode);
+
+#if !defined(O_DIRECT) && defined(F_NOCACHE)
+    if (fd >= 0 && (flags & SYSL_FS_OPEN_UNCACHED) && fcntl(fd, F_NOCACHE, 1) != 0) {
+        int why = errno;
+
+        close(fd);
+        errno = why;
+        return -1;
+    }
+#endif
+
+    return fd;
+}
+
+// What `File.sync_data` asks: the file's contents on the device, and the metadata only where reading
+// them back needs it. `fdatasync` on Linux; elsewhere, where the C library has no cheaper call, plain
+// `fsync` -- which on Darwin hands the data to the drive without forcing the drive's own cache.
+int sysl_fs_host_sync_data(int fd) {
+#if defined(__linux__) || defined(__wasi__)
+    return fdatasync(fd);
+#else
+    return fsync(fd);
+#endif
+}
+
+// What `File.full_sync` asks: the bytes on the platter or the flash, whatever the drive's write cache
+// holds. Darwin's `fsync` stops at the drive, so it takes `fcntl(F_FULLFSYNC)`; a filesystem that does
+// not know that request (some network and FUSE ones) answers `ENOTSUP` or `EINVAL`, and `fsync` is
+// then the strongest call there is. Elsewhere `fsync` already is the full one.
+int sysl_fs_host_full_sync(int fd) {
+#ifdef F_FULLFSYNC
+    if (fcntl(fd, F_FULLFSYNC) == 0) return 0;
+    if (errno != ENOTSUP && errno != EINVAL && errno != ENOTTY) return -1;
+#endif
+    return fsync(fd);
 }
 
 // The five calls that take or answer an `off_t`, whose width is the platform's: 64 bits on every

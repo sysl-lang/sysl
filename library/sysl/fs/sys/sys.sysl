@@ -76,6 +76,12 @@ const open_create: u32 = 4
 const open_truncate: u32 = 8
 const open_append: u32 = 16
 
+/** Bypass the operating system's page cache: `O_DIRECT` on Linux, `fcntl(F_NOCACHE)` on Darwin. A
+ * supplier with neither refuses the open rather than hand back a cached file. Linux then requires the
+ * buffer, the offset and the length of every transfer to be multiples of the device's block size.
+ */
+const open_uncached: u32 = 32
+
 /** Where `sysl_fs_seek` counts from: the start of the file, the current position, or the end. */
 const seek_start: int = 0
 const seek_current: int = 1
@@ -129,6 +135,22 @@ private[fs] extern "sysl_fs_pwrite" pwrite(fd: int, from: *u8, len: usize, offse
 @needs(os)
 private[fs] extern "sysl_fs_sync" sync(fd: int) -> int
 
+/** Hands what was written to the device, without insisting on metadata a reader does not need
+ * (`fdatasync`). Where the platform has nothing cheaper than `sync`, it is `sync`. Asked only by a
+ * program that calls `File.sync_data`.
+ */
+@blocks
+@needs(os)
+private[fs] extern "sysl_fs_sync_data" sync_data(fd: int) -> int
+
+/** Hands what was written to the device and makes the device empty its own write cache
+ * (`F_FULLFSYNC` on Darwin); `sync` where that is all there is. Asked only by a program that calls
+ * `File.full_sync`.
+ */
+@blocks
+@needs(os)
+private[fs] extern "sysl_fs_full_sync" full_sync(fd: int) -> int
+
 /** Releases a descriptor. The descriptor is gone afterwards whether or not this succeeded. */
 @needs(os)
 private[fs] extern "sysl_fs_close" close(fd: int) -> int
@@ -151,6 +173,20 @@ private[fs] extern "sysl_fs_ftruncate" ftruncate(fd: int, length: long) -> int
  */
 @needs(os)
 private[fs] extern "sysl_fs_map" map(fd: int, len: usize, at: **u8) -> int
+
+/** Like `map`, but readable AND writable, and shared: a write through the address reaches the file.
+ * The descriptor must have been opened for update. Asked only by a program that calls `File.map_mut`.
+ */
+@needs(os)
+private[fs] extern "sysl_fs_map_shared" map_shared(fd: int, len: usize, at: **u8) -> int
+
+/** Starts the `len` bytes at `at` -- inside a shared mapping, `at` on a page boundary -- on their way
+ * to the file. `wait` non-zero returns once they are there (`MS_SYNC`); zero only schedules them
+ * (`MS_ASYNC`). Asked only by a program that flushes a writable mapping.
+ */
+@blocks
+@needs(os)
+private[fs] extern "sysl_fs_msync" msync(at: *u8, len: usize, wait: int) -> int
 
 /** Gives back what `map` made: `at` and `len` are exactly what it was asked for and answered. */
 @needs(os)
