@@ -450,12 +450,36 @@ private ic_member_shown(f: IcField, m: *IcModel) -> string
         Some(k) -> if m.records[k].is_union then "an anonymous union" else "an anonymous struct"
         None -> "an anonymous member"
 
+// A type with the typedefs on its outside read through to what they name, so a bitfield declared
+// `Flags b : 8` over `typedef uint32_t Flags` is judged by the integer under it. A typedef over a
+// record or an enum is left as it is: it is no integer either way.
+private ic_through_typedefs(t: IcType, m: *IcModel) -> IcType
+    var cur = t
+
+    for _ in 0..<32
+        if cur.kind != IcNamed then break
+
+        ic_find_typedef(m, cur.name) match
+            Some(k) ->
+                val under = ic_parse(m.typedefs[k].qual)
+
+                if under.kind != IcNamed then break
+
+                val (kind, _) = ic_tagged(under.name)
+
+                if kind == "struct" || kind == "union" || kind == "enum" then break
+
+                cur = under
+            None -> break
+
+    cur
+
 // **A C bitfield as sysl declares it**: `T name : W` is `name: uW in T` (or `iW` where `T` is signed),
 // an unnamed one `_: uW in T`, a zero-width one `_: in T`, and `_Bool b : 1` is `bool in bool`. Its
 // unit has to be an integer of 8, 16, 32 or 64 bits, or `bool` (`attributes.md § C bitfields`).
 private ic_bit_type(f: IcField, m: *IcModel) -> Result[string, string]
     val shown = ic_member_shown(f, m)
-    val unit = ic_map(ic_parse(f.qual), IcAtField, m, 0) match
+    val unit = ic_map(ic_through_typedefs(ic_parse(f.qual), m), IcAtField, m, 0) match
         Ok(t) -> t
         Err(why) -> return Err(s"has a bitfield ($shown) that is $why")
 
@@ -857,17 +881,39 @@ ic_render(m: *IcModel, spelled: string, opts: IcOptions, macros: Buf[string], ba
                 wrappers.push(c)
             Err(why) -> refused.push(s"${f.name}: $why")
 
+    // A `static const` number has no symbol, so it is a `c const` read from the header, never an
+    // extern; a `static` variable of any other kind has none either, and is said not to be generated.
+    var used_consts: Buf[string] = buf()
+    var static_lines = str_builder()
+
     for v in m.vars
-        ic_map(ic_parse(v.1), IcAtField, m, 0) match
+        val (vname, vqual, vstorage) = v
+        val vt = ic_parse(vqual)
+
+        if vstorage == "static"
+            val ty = ic_map(vt, IcAtField, m, 0).unwrap_or("")
+            val bare = ic_map(ic_through_typedefs(vt, m), IcAtField, m, 0).unwrap_or("")
+
+            if !vqual.starts_with("const ") || vt.kind != IcNamed || !ic_numeric(bare)
+                refused.push(s"$vname: a 'static' variable has no symbol, and only a 'static const' number is read from the header")
+                continue
+            end if
+
+            val cname = ic_unique(&used_consts, ic_const_name(vname, m.prefix))
+
+            static_lines.push(s"    $cname: $ty = \"$vname\"\n")
+            continue
+        end if
+
+        ic_map(vt, IcAtField, m, 0) match
             Ok(ty) ->
-                val name = ic_ident(ic_value_name(v.0, m.prefix))
-                val linked = if name == v.0 then "" else s"\"${v.0}\" "
+                val name = ic_ident(ic_value_name(vname, m.prefix))
+                val linked = if name == vname then "" else s"\"$vname\" "
 
                 externs.push(s"extern $linked$name: $ty\n")
-            Err(why) -> refused.push(s"${v.0}: the variable is $why")
+            Err(why) -> refused.push(s"$vname: the variable is $why")
 
     // The numbers: each enum's constants at its own `c type`, then the macros.
-    var used_consts: Buf[string] = buf()
     var ctypes = str_builder()
 
     for e in m.enums
@@ -1039,7 +1085,7 @@ ic_render(m: *IcModel, spelled: string, opts: IcOptions, macros: Buf[string], ba
 
     if ctype_text != "" then out.push(s"c type\n$ctype_text\n")
 
-    val parts = [consts.finish(), macro_lines.finish(), layout.finish()]
+    val parts = [consts.finish(), static_lines.finish(), macro_lines.finish(), layout.finish()]
     var first = true
 
     for p in parts
