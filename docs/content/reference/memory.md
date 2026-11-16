@@ -3070,13 +3070,15 @@ true
 ### Slot storage: room that holds no value yet
 
 A growable container needs a spare end that holds **nothing**, not a fill value that would keep what
-it names alive. Three forms give the raw tier that, and [`sysl.buf.Buf`](/library/buf/) is written
+it names alive. Four forms give the raw tier that, and [`sysl.buf.Buf`](/library/buf/) is written
 with them:
 
 - **`slot_storage(n)`** (or `slot_storage[T](n)`) is a `[]T` of `n` slots of which **none is live**;
   the element type comes from the position, and with none it is refused.
 - **`slot_place(xs, i, v)`** fills the first slot past the live run without letting go of anything; a
   live slot is an ordinary assignment; a slot further on would leave a gap, and **traps**.
+- **`slot_place_run(xs, at, src)`** is `slot_place(xs, at + k, src[k])` for every element of the view
+  `src`, under the same rules; the slots `at ..< at + src.len` must exist, or it is a bounds trap.
 - **`slot_vacate(xs, n)`** lets go of every live slot from `n` on — only where nothing else holds the
   storage; while a view handed out earlier exists it does nothing, and the next vacate catches up.
 
@@ -3105,7 +3107,35 @@ print(xs[0].n + xs[1].n)
 **The live run is the storage's own**: the buffer's box counts the live slots, and its destructor
 releases exactly those; the view's `len` is still the whole room. **The caller owes the one check the
 compiler cannot make**: nothing reads a slot past the live run. On storage `slot_storage` did not make,
-the two writing forms are an assignment and nothing.
+the writing forms are an assignment and nothing.
+
+**A run costs what its element does.** Where the element holds no count, placing it is a store that
+lets go of nothing, so `slot_place_run` is one `memmove` of the run's bytes — which is what
+`Buf.extend` and a `Buf`'s growth are, whatever the run's length. Where it holds one, the run is placed
+slot by slot, each taking a count of its own, exactly as the loop would be: the same counts, let go of
+in the same order. Either way a run read out of the slots it fills arrives whole, as `memmove`'s does.
+
+```sysl
+struct Node
+    n: int
+
+var bytes: []u8 = slot_storage(6)
+
+slot_place_run(bytes, 0, "abc".bytes)
+slot_place_run(bytes, 3, "xyz".bytes)
+print(bytes[0], bytes[5])
+
+var nodes: []&Node = slot_storage(4)
+
+slot_place_run(nodes, 0, [Node(1), Node(2)])
+slot_place_run(nodes, 2, nodes[0..<2])
+print(nodes[0].n + nodes[1].n + nodes[2].n + nodes[3].n)
+```
+
+```output
+97 122
+6
+```
 
 ### Moving one value through a raw pointer
 

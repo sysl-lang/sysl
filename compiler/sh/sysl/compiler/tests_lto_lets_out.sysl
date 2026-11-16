@@ -421,6 +421,120 @@ lto_twice_refused()
             val r: Odd = &roots
         """, "'@lets_out' is written twice on one parameter, and a parameter is marked '@lets_out' or it is not")
 
+// -- the shape matrix: what a body taken at the type stores, and where ----------------------------
+//
+// A pool worker's shape: a body taken at a function pointer type stores something it reaches from
+// its parameter into module storage. The cells cross the function's visibility (`pub_`, `priv_`),
+// what is stored (`direct`: the parameter itself; `field`: a pointer read through it; `elem`: an array
+// element read through it) and where (`g`: a global; `t`: a private `@thread_local`), each taken at
+// the unmarked type and at the `@lets_out` one. Under either type the parameter itself is kept, so
+// every `direct` cell is refused; a read let out is refused unmarked and accepted marked, and neither
+// visibility nor the storage's kind changes the answer. The caller hands an element of a module array
+// (`&cells[1]`), as a pool hands `&p.workers[i]`.
+
+private const lto_shapes: string = raw"""
+    struct Cell
+        own: *Cell
+        many: [2]*Cell
+
+    var cells = [Cell(null, [null, null]), Cell(null, [null, null])]
+    var g_cell: *Cell = null
+    @thread_local private var t_cell: *Cell = null
+
+    pub_field_g(w: *Cell)
+        g_cell = w.own
+
+    pub_field_t(w: *Cell)
+        t_cell = w.own
+
+    pub_elem_g(w: *Cell)
+        g_cell = w.many[1]
+
+    pub_elem_t(w: *Cell)
+        t_cell = w.many[0]
+
+    private priv_field_g(w: *Cell)
+        g_cell = w.own
+
+    private priv_field_t(w: *Cell)
+        t_cell = w.own
+
+    private priv_elem_g(w: *Cell)
+        g_cell = w.many[1]
+
+    private priv_elem_t(w: *Cell)
+        t_cell = w.many[0]
+
+    """
+
+private const lto_direct_shapes: string = raw"""
+    pub_direct_g(w: *Cell)
+        g_cell = w
+
+    pub_direct_t(w: *Cell)
+        t_cell = w
+
+    private priv_direct_g(w: *Cell)
+        g_cell = w
+
+    private priv_direct_t(w: *Cell)
+        t_cell = w
+
+    """
+
+private val lto_read_names = ["pub_field_g", "pub_field_t", "pub_elem_g", "pub_elem_t",
+    "priv_field_g", "priv_field_t", "priv_elem_g", "priv_elem_t"]
+
+private val lto_direct_names = ["pub_direct_g", "pub_direct_t", "priv_direct_g",
+    "priv_direct_t"]
+
+// `main` taking each named function at `ty` and calling it on `&cells[1]`.
+private lto_shape_main(names: []const string, ty: string) -> string
+    var out = s"take(f: $ty, w: *Cell)\n    f(w)\n\nmain()\n"
+
+    out += "    cells[1].own = &cells[0]\n    cells[1].many = [&cells[0], &cells[0]]\n"
+
+    for name in names
+        out += s"    take(&$name, &cells[1])\n"
+
+    out += "    print(g_cell == &cells[0] && t_cell == &cells[0])\n"
+    out
+end lto_shape_main
+
+// Every name in `names` refused with `says` in one build of `text`.
+private lto_all_refused(text: string, names: []const string, says: string)
+    if xvr_no_library() then return
+
+    val out = lto_outcome(text)
+
+    assert_eq(out.1, -1, out.0)
+
+    for name in names
+        assert(out.0.index_of(s"'$name' $says").is_some(), s"$name\n${out.0}")
+
+@test("every shape that lets a read out is accepted at the @lets_out type, and runs")
+lto_shapes_marked()
+    lto_prints(lto_shapes + lto_shape_main(lto_read_names, "*extern(@lets_out *Cell) -> unit"), "true\n")
+
+@test("every shape that lets a read out is refused at the unmarked type, and is told the mark")
+lto_shapes_unmarked_refused()
+    lto_all_refused(lto_shapes + lto_shape_main(lto_read_names, "*extern(*Cell) -> unit"),
+        lto_read_names, "lets what it reads through its parameter 'w' outlive the call (it is stored in ")
+    lto_refused(lto_shapes + lto_shape_main(["priv_elem_t"], "*extern(*Cell) -> unit"),
+        "or let it by marking the parameter '@lets_out' in the function pointer type its address is " +
+        "taken at: '*extern(@lets_out *Cell) -> unit'")
+
+@test("every shape that keeps the parameter itself is refused at the @lets_out type")
+lto_shapes_direct_marked_refused()
+    lto_all_refused(lto_shapes + lto_direct_shapes +
+        lto_shape_main(lto_direct_names, "*extern(@lets_out *Cell) -> unit"),
+        lto_direct_names, "keeps its parameter 'w' (it is stored in ")
+
+@test("every shape that keeps the parameter itself is refused at the unmarked type")
+lto_shapes_direct_unmarked_refused()
+    lto_all_refused(lto_shapes + lto_direct_shapes + lto_shape_main(lto_direct_names, "*extern(*Cell) -> unit"),
+        lto_direct_names, "keeps its parameter 'w' (it is stored in ")
+
 @test("@lets_out outside a callable's parameters is refused")
 lto_misplaced_refused()
     lto_refused(raw"""
