@@ -1,0 +1,183 @@
+module sysl.text
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.rand.rng
+
+// `validate_utf8` and `is_utf8` share one scan with `from_utf8`, which goes sixteen bytes at a time
+// and finishes with a scalar walk. The answers that could change are at the seams, so each test below
+// puts the fault at every offset of every length around the block size.
+
+/** The first bad offset by decode-then-range-check, a different route from the table the library
+ * walks: decode the value, then refuse an overlong form, a surrogate or a value past U+10FFFF.
+ */
+private oracle(b: []const u8) -> Option[int]
+    val n = int(b.len)
+    var i: int = 0
+
+    while i < n
+        val c = int(b[usize(i)])
+        var need = 1
+        var min = 0
+        var v = c
+
+        if c < 0x80 then
+            need = 1
+        elif c >= 0xC2 && c < 0xE0 then
+            need = 2
+            v = c & 0x1F
+            min = 0x80
+        elif c >= 0xE0 && c < 0xF0 then
+            need = 3
+            v = c & 0x0F
+            min = 0x800
+        elif c >= 0xF0 && c < 0xF5 then
+            need = 4
+            v = c & 0x07
+            min = 0x10000
+        else
+            return Some(i)
+
+        if i + need > n then return Some(i)
+
+        for k in 1..<need
+            val t = int(b[usize(i + k)])
+
+            if t < 0x80 || t > 0xBF then return Some(i)
+
+            v = v * 64 + (t & 0x3F)
+
+        if need > 1 && (v < min || v > 0x10FFFF || (v >= 0xD800 && v <= 0xDFFF)) then return Some(i)
+
+        i += need
+
+    None
+
+private filler(n: usize) -> Buf[u8]
+    var b: Buf[u8] = buf()
+
+    for i in 0..<n do b.push(u8(97 + i % 26))
+    b
+
+@test("valid ASCII and 2-, 3- and 4-byte text is accepted")
+vu8_valid()
+    assert(is_utf8("".bytes))
+    assert(is_utf8("plain ascii".bytes))
+    assert(is_utf8("é".bytes))
+    assert(is_utf8("€".bytes))
+    assert(is_utf8("😀".bytes))
+    assert(is_utf8("a é € 😀 z".bytes))
+    assert_eq(validate_utf8("".bytes), None)
+    assert_eq(validate_utf8("a é € 😀 z".bytes), None)
+
+@test("each way of being ill-formed is refused at its lead byte")
+vu8_invalid_classes()
+    refused([0xC0, 0x80])
+    refused([0xC1, 0xBF])
+    refused([0xE0, 0x80, 0x80])
+    refused([0xE0, 0x9F, 0xBF])
+    refused([0xF0, 0x80, 0x80, 0x80])
+    refused([0xF0, 0x8F, 0xBF, 0xBF])
+    refused([0xED, 0xA0, 0x80])
+    refused([0xED, 0xBF, 0xBF])
+    refused([0xF4, 0x90, 0x80, 0x80])
+    refused([0xF5, 0x80, 0x80, 0x80])
+    refused([0x80])
+    refused([0xBF])
+    refused([0xFE])
+    refused([0xFF])
+    refused([0xE2, 0x41, 0x80])
+    refused([0xF0, 0x9F, 0x41, 0x80])
+
+private refused(s: []const u8)
+    assert(!is_utf8(s))
+    assert_eq(validate_utf8(s), Some(0))
+    assert_eq(validate_utf8(s), oracle(s))
+
+@test("a sequence cut off by the end of the input is reported at its lead byte")
+vu8_truncated()
+    assert_eq(validate_utf8([0xC3]), Some(0))
+    assert_eq(validate_utf8([97, 0xE2, 0x82]), Some(1))
+    assert_eq(validate_utf8([97, 98, 0xF0, 0x9F, 0x98]), Some(2))
+
+@test("the first bad offset is exact for every position of every length up to 70")
+vu8_every_offset()
+    for bad in [u8(0x80), 0xBF, 0xC0, 0xC1, 0xF5, 0xFE, 0xFF]
+        for n in 0..<71
+            var b = filler(n)
+
+            assert_eq(validate_utf8(b.view()), None)
+
+            for p in 0..<n
+                b[p] = bad
+                assert_eq(validate_utf8(b.view()), Some(int(p)))
+                assert(!is_utf8(b.view()))
+
+                // A second fault after the first never moves the answer.
+                if p + 1 < n
+                    b[n - 1] = 0xFF
+                    assert_eq(validate_utf8(b.view()), Some(int(p)))
+                    b[n - 1] = u8(97 + (n - 1) % 26)
+
+                b[p] = u8(97 + p % 26)
+
+@test("an ill-formed sequence at, before and after a block boundary is found at its start")
+vu8_sequences_at_seams()
+    var forms: Buf[[4]u8] = buf()
+
+    forms.push([0xE0, 0x80, 0x80, 97])
+    forms.push([0xED, 0xA0, 0x80, 97])
+    forms.push([0xF4, 0x90, 0x80, 0x80])
+    forms.push([0xF0, 0x80, 0x80, 0x80])
+
+    for f in forms.view()
+        for p in 0..<60
+            var b = filler(70)
+
+            for k in 0..<4 do b[p + k] = f[k]
+            assert_eq(validate_utf8(b.view()), Some(int(p)))
+
+    for c in ["é", "€", "😀"]
+        for p in 0..<60
+            var b = filler(70)
+
+            for k in 0..<c.len do b[p + k] = c.bytes[k]
+            assert_eq(validate_utf8(b.view()), None)
+            assert(is_utf8(b.view()))
+
+@test("validate_utf8 agrees with from_utf8 on the offset")
+vu8_agrees_with_from_utf8()
+    val s: []const u8 = [104, 195, 169, 0xFF, 97]
+
+    assert_eq(validate_utf8(s), Some(3))
+    val from = from_utf8(s) match
+        Ok(_) -> -1
+        Err(e) -> int(e.offset)
+
+    assert_eq(from, 3)
+
+@test("random bytes: validate_utf8 and is_utf8 agree with a decode-and-range-check oracle")
+vu8_random()
+    var g = rng(20261116, 5)
+
+    for _ in 0..<4000
+        var b: Buf[u8] = buf()
+        val n = g.below(140)
+        val rate = g.below(60)
+
+        for _ in 0..<n
+            val r = g.below(1000)
+
+            if r < rate then
+                b.push(u8(0xC0 + g.below(64)))
+            elif r < 2 * rate then
+                b.push(u8(0x80 + g.below(64)))
+            elif r < 2 * rate + 3 then
+                b.push(u8(g.below(256)))
+            else
+                b.push(u8(32 + g.below(95)))
+
+        val s = b.view()
+
+        assert_eq(validate_utf8(s), oracle(s))
+        assert_eq(is_utf8(s), oracle(s).is_none())
