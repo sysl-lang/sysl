@@ -2485,7 +2485,7 @@ this reaches 'c_usleep', which blocks, and 'nap' declared '@no_block'
 **The standard library marks its own waiting operations**: `sysl.posix.time`'s `sleep` and
 `nanosleep`, `Mutex.with` and `Mutex.lock_raw`, `Thread.join`, `Channel.send` and
 `Channel.receive`, `sysl.net`'s `Socket.connect`, `accept`, `send`, `send_all` and `recv` and
-`UdpSocket.send`, `send_to`, `recv` and `recv_from`, `Child.wait`, and the hooks a blocking read or
+`UdpSocket.send`, `send_to`, `recv` and `recv_from`, `resolve` and `resolve_passive` (a name waits on DNS), the opening of a file (a FIFO waits for its other end), `Child.wait`, and the hooks a blocking read or
 write of a descriptor, a file or a socket goes through — so a promised body reaches none of them,
 however many calls away. `block_on`, which drives a task to its end on the calling thread, has no
 declaration to mark and counts as blocking all the same. A generic is named as it was declared, since the type argument says nothing about
