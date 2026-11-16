@@ -478,7 +478,7 @@ clamp.sysl
   ok    clamps below the low bound   6ms
   ok    clamps above the high bound  5ms
   FAIL  leaves a value in range      5ms
-        did not return — exit status 1
+        did not return — exit status 134
         at clamp.sysl:31
         > panic: clamp(4, 1, 3) should be 3
   ok    is idempotent                5ms

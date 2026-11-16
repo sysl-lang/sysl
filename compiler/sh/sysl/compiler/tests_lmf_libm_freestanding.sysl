@@ -1,0 +1,340 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.is_file
+import sysl.process.capture
+import sysl.testing.skip
+import sysl.text.{split, Search}
+
+// **The mathematics C's libm answers is a C library's, and a freestanding target starts without
+// one.** Every `extern` in `sysl.sys.math` that resolves to a libm symbol -- the transcendentals, the
+// cube root, the remainder, the special functions -- is `@needs(libc)`, so a program reaching one on
+// a bare machine is refused at the reference, in the words every `libc` refusal uses, rather than
+// handed an archive whose link fails on `sin`. The operations that are an instruction, or that the
+// library writes in sysl, or that `sysl.softfloat` answers (`mul_add`), need no C library and stay.
+// A board whose manifest grants `libc` has a libm beside it, and `build-c` then says to link it.
+
+private val lmf_nm: string = "/opt/homebrew/opt/llvm/bin/llvm-nm"
+
+private val lmf_package: string = "package { name = \"probe\", version = \"0.1.0\" }\n"
+
+// Every libm-backed operation `sysl.math` offers, as a term of a `real` sum, beside the binding it
+// reaches. `x` is a `real`, `s` an `f32`; the `f32` forms reach the `f`-suffixed binding except where
+// libm has no `float` entry point and the library widens (the Bessel family).
+private lmf_terms() -> Buf[(string, string)]
+    var out: Buf[(string, string)] = buf()
+    val unary = ["cbrt", "exp", "exp2", "expm1", "sin", "cos", "tan", "asin", "acos", "atan", "sinh",
+                 "cosh", "tanh", "asinh", "acosh", "atanh"]
+
+    for name in unary
+        out.push((s"x.$name()", s"sysl_$name"))
+        out.push((s"real(s.$name())", s"sysl_${name}f"))
+
+    // The logarithms are spelled apart from C's names.
+    out.push(("x.ln()", "sysl_log"))
+    out.push(("real(s.ln())", "sysl_logf"))
+    out.push(("x.ln1p()", "sysl_log1p"))
+    out.push(("real(s.ln1p())", "sysl_log1pf"))
+    out.push(("x.log2()", "sysl_log2"))
+    out.push(("real(s.log2())", "sysl_log2f"))
+    out.push(("x.log10()", "sysl_log10"))
+    out.push(("real(s.log10())", "sysl_log10f"))
+
+    val binary = ["pow", "hypot", "atan2", "fmod"]
+
+    for name in binary
+        out.push((s"x.$name(x)", s"sysl_$name"))
+        out.push((s"real(s.$name(s))", s"sysl_${name}f"))
+
+    val special = ["erf", "erfc", "tgamma"]
+
+    for name in special
+        out.push((s"$name(x)", s"sysl_$name"))
+        out.push((s"real($name(s))", s"sysl_${name}f"))
+
+    out.push(("lgamma(x)", "sysl_lgamma_r"))
+    out.push(("real(lgamma(s))", "sysl_lgammaf_r"))
+    out.push(("lgamma_sign(x).0", "sysl_lgamma_r"))
+    out.push(("real(ilogb(x))", "sysl_ilogb"))
+    out.push(("real(ilogb(s))", "sysl_ilogbf"))
+    out.push(("scalbln(x, 3)", "sysl_scalbn"))
+    out.push(("real(scalbln(s, 3))", "sysl_scalbnf"))
+
+    for name in ["j0", "j1", "y0", "y1"]
+        out.push((s"$name(x)", s"sysl_$name"))
+        out.push((s"real($name(s))", s"sysl_$name"))
+
+    out.push(("jn(2, x)", "sysl_jn"))
+    out.push(("yn(2, x)", "sysl_yn"))
+    out
+end lmf_terms
+
+private val lmf_imports: string =
+    "import sysl.math.{erf, erfc, tgamma, lgamma, lgamma_sign, j0, j1, jn, y0, y1, yn, ilogb, scalbln}\n\n"
+
+// One export summing every term, one per line, so each refusal points at its own line.
+private lmf_every_term() -> string
+    var text = lmf_imports + "@export(\"probe\")\nprobe(x: real, s: f32) -> real\n    var t = 0.0\n"
+
+    for term in lmf_terms()
+        text = text + s"    t += ${term.0}\n"
+
+    text + "    t\n"
+end lmf_every_term
+
+// What `sysl build-c` answers for a program and its manifest on `target`, and the archive's
+// undefined symbols where it wrote one.
+private lmf_build(program: string, manifest: string, target: string) -> (int, string, Buf[string])
+    val p = lbr_tree(lbr_two("main.sysl", program, "sysl.hocon", manifest))
+    // Every term of the full program is its own refusal, more than the default limit shows.
+    val said = lbr_cli(["sysl", "build-c", "--error-limit", "500", "--target", target, "-o", s"$p/probe.a", p])
+    val undefined = if said.0 == 0 && is_file(lmf_nm) then lmf_undefined(s"$p/probe.a") else buf()
+
+    lbr_drop([p])
+    (said.0, said.1, undefined)
+end lmf_build
+
+private lmf_undefined(archive: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    capture(lmf_nm, ["-u", archive]) match
+        Err(_) -> assert(false, "llvm-nm could not be run")
+        Ok(o) ->
+            val lines = split(o.text, "\n")
+
+            for i in 0..<lines.len
+                val line = lines[i].trim()
+
+                if line.starts_with("U ") then out.push(line[2..])
+
+    out
+end lmf_undefined
+
+private lmf_has(names: Buf[string], name: string) -> bool
+    for item in names
+        if item == name then return true
+
+    false
+end lmf_has
+
+private lmf_listed(names: Buf[string]) -> string
+    var text = ""
+
+    for item in names
+        text = text + item + " "
+
+    text
+end lmf_listed
+
+private lmf_advice(binding: string, target: string) -> string =
+    s"which needs 'libc' through 'sysl.sys.$binding', and '$target' does not provide it — a " +
+    "freestanding target starts without a C library, so either this reference cannot be made on " +
+    "this machine or 'sysl.hocon' grants one with 'capabilities { libc = true }'"
+
+// Every term refused on `target`, each at its own line and naming the binding it reached.
+private lmf_every_term_refused(target: string)
+    val said = lmf_build(lmf_every_term(), lmf_package, target)
+    val terms = lmf_terms()
+
+    assert(said.0 != 0, s"built every libm function for $target")
+
+    for i in 0..<terms.len()
+        val (term, binding) = terms[i]
+
+        // The import, a blank line, the export's two lines and `var t`: the first term is line 6.
+        assert(said.1.contains(lmf_advice(binding, target)), s"$term on $target: ${said.1}")
+        assert(said.1.contains(s"main.sysl:${i + 6}:"), s"$term on $target, line ${i + 6}: ${said.1}")
+
+    // Told before any C, so no archive and no link.
+    assert(!said.1.contains("wrote "), said.1)
+end lmf_every_term_refused
+
+// -- refused where there is no C library -----------------------------------------------------------
+
+@test("every libm function is refused at its reference on a soft-float freestanding target")
+lmf_refused_soft_float()
+    if !lbr_ready() then return
+
+    lmf_every_term_refused("thumb-freestanding-softfp")
+end lmf_refused_soft_float
+
+// A double-precision unit makes the roots and roundings instructions, and a sine is still libm's.
+@test("every libm function is refused on a hard-float freestanding target with a double unit")
+lmf_refused_hard_float()
+    if !lbr_ready() then return
+
+    lmf_every_term_refused("thumbv7em-freestanding-dp")
+end lmf_refused_hard_float
+
+@test("and on a freestanding target that is not Arm")
+lmf_refused_aarch64()
+    if !lbr_ready() then return
+
+    lmf_every_term_refused("aarch64-freestanding")
+end lmf_refused_aarch64
+
+// The survey's reduction: the refusal is at the two transcendentals and not at the root.
+@test("a heading computed with atan2, sin and sqrt is refused at atan2 and sin only")
+lmf_heading_refused_at_the_transcendentals()
+    if !lbr_ready() then return
+
+    val program = "@export(\"heading\")\nheading(y: f64, x: f64) -> f64 = y.atan2(x) + y.sin() + x.sqrt()\n"
+    val said = lmf_build(program, lmf_package, "thumb-freestanding-softfp")
+
+    assert(said.0 != 0, "built atan2 and sin with no C library")
+    assert(said.1.contains("error: this reaches 'real.atan2', which needs 'libc' through 'sysl.sys.sysl_atan2'"), said.1)
+    assert(said.1.contains("error: this reaches 'real.sin', which needs 'libc' through 'sysl.sys.sysl_sin'"), said.1)
+    assert(!said.1.contains("'real.sqrt'") && !said.1.contains("sysl_sqrt"), said.1)
+end lmf_heading_refused_at_the_transcendentals
+
+// `sysl build` compiles against the standard module's artifact for the target rather than from
+// source, so the artifact has to build for a bare machine with every libm binding in it -- a build of
+// the library is held to no target's capabilities -- and the refusal still lands at the program's call.
+@test("sysl build against the freestanding artifact refuses the program's sine, the artifact itself building")
+lmf_artifact_builds_and_refuses()
+    if !lbr_ready() then return
+
+    val target = "thumb-freestanding-softfp"
+    val p = lbr_tree(lbr_two("main.sysl", "@export(\"wave\")\nwave(x: f64) -> f64 = x.sin() + x.ln()\n",
+                             "sysl.hocon", lmf_package))
+    val said = lbr_cli(["sysl", "build", "--target", target, "-o", s"$p/probe.elf", p])
+
+    lbr_drop([p])
+
+    assert(said.0 != 0, "built a sine with no C library")
+    assert(!said.1.contains("cannot find or build the standard module"), said.1)
+    assert(said.1.contains(lmf_advice("sysl_sin", target)), said.1)
+    assert(said.1.contains(lmf_advice("sysl_log", target)), said.1)
+end lmf_artifact_builds_and_refuses
+
+// The reference is refused whether or not an export reaches it, as every `@needs` is.
+@test("a libm call in a function no export reaches is refused all the same")
+lmf_unreached_still_refused()
+    if !lbr_ready() then return
+
+    val program = "helper(x: f64) -> f64 = x.cos()\n\n@export(\"twice\")\ntwice(x: f64) -> f64 = x + x\n"
+    val said = lmf_build(program, lmf_package, "thumbv7em-freestanding")
+
+    assert(said.0 != 0, "built a cosine with no C library")
+    assert(said.1.contains("this reaches 'real.cos', which needs 'libc' through 'sysl.sys.sysl_cos'"), said.1)
+    assert(said.1.contains("main.sysl:1:"), said.1)
+end lmf_unreached_still_refused
+
+// A half-width float widens to the `float` entry point, and a generic library type reaches libm from
+// inside an instantiation: both are charged to the reader's own call.
+@test("an f16 sine and a complex magnitude are refused at the reader's call")
+lmf_widened_and_generic_refused()
+    if !lbr_ready() then return
+
+    val program = "import sysl.math.complex.Complex\n\n@export(\"probe\")\n" +
+        "probe(h: f16, a: f64, b: f64) -> f64 = real(h.sin()) + Complex(a, b).abs()\n"
+    val said = lmf_build(program, lmf_package, "thumb-freestanding-softfp")
+
+    assert(said.0 != 0, "built an f16 sine and a hypot with no C library")
+    assert(said.1.contains("through 'sysl.sys.sysl_sinf'"), said.1)
+    assert(said.1.contains("through 'sysl.sys.sysl_hypot'"), said.1)
+    assert(said.1.contains("main.sysl:4:"), said.1)
+end lmf_widened_and_generic_refused
+
+// A hosted target whose manifest takes the C library away has no libm either.
+@test("a hosted target whose manifest takes libc away refuses a sine in the plain words")
+lmf_hosted_libc_taken_away()
+    if !lbr_ready() then return
+
+    val program = "@export(\"wave\")\nwave(x: f64) -> f64 = x.sin()\n"
+    val said = lmf_build(program, lmf_package + "capabilities { libc = false }\n", host_target().name)
+
+    assert(said.0 != 0, "built a sine with libc taken away")
+    assert(said.1.contains(s"this reaches 'real.sin', which needs 'libc' through 'sysl.sys.sysl_sin', " +
+        s"and '${host_target().name}' does not provide it — a target's capabilities are what " +
+        "'sysl.hocon' declares"), said.1)
+end lmf_hosted_libc_taken_away
+
+// -- accepted where there is one -------------------------------------------------------------------
+
+@test("every libm function builds hosted, and build-c says to link libm")
+lmf_hosted_accepted()
+    if !lbr_ready() then return
+
+    val said = lmf_build(lmf_every_term(), lmf_package, host_target().name)
+
+    assert(said.0 == 0, said.1)
+    assert(said.1.contains("sysl: link this against: m"), said.1)
+end lmf_hosted_accepted
+
+// A board with newlib grants `libc` in its target block, and its libm comes with it: the archive
+// calls libm by symbol, so `build-c` names the library the C project's link has to carry.
+@test("a freestanding target whose manifest grants libc builds them, and build-c names libm")
+lmf_granted_libc_accepted()
+    if !lbr_ready() then return
+
+    val target = "thumb-freestanding-softfp"
+    val manifest = lmf_package + s"targets {\n  $target { capabilities { libc = true } }\n}\n"
+    val said = lmf_build(lmf_every_term(), manifest, target)
+
+    assert(said.0 == 0, said.1)
+    assert(said.1.contains("sysl: link this against: m"), said.1)
+
+    if is_file(lmf_nm)
+        assert(lmf_has(said.2, "sin") && lmf_has(said.2, "atan2f") && lmf_has(said.2, "lgamma_r"),
+               lmf_listed(said.2))
+end lmf_granted_libc_accepted
+
+// Without the grant nothing in the archive calls libm, so a hint to link it is one the C project
+// could not act on.
+@test("a freestanding archive that reaches no libm is not told to link one")
+lmf_no_grant_no_hint()
+    if !lbr_ready() then return
+
+    val said = lmf_build("@export(\"twice\")\ntwice(x: f64) -> f64 = x + x\n", lmf_package,
+                         "thumb-freestanding-softfp")
+
+    assert(said.0 == 0, said.1)
+    assert(!said.1.contains("link this against"), said.1)
+end lmf_no_grant_no_hint
+
+// -- what needs no C library stays ---------------------------------------------------------------
+
+// Each of these is an instruction on the target, a body `sysl.sys.math` writes in sysl (ties to even
+// and the IEEE 754-2019 maximum on Arm), a comparison `sysl.math` writes (`signum`, `clamp`), or the
+// weak `fma` `sysl.softfloat` exports -- so on a soft-float core nothing is left for a libm to answer.
+private val lmf_bodied: string =
+    "@export(\"d\")\nd(x: f64, y: f64) -> f64 =\n" +
+    "    x.round_even() + x.abs() + x.copysign(y) + x.maximum(y) + x.minimum(y) + x.mul_add(y, x) +\n" +
+    "        x.signum() + x.clamp(0.0, 1.0)\n\n" +
+    "@export(\"f\")\nf(x: f32, y: f32) -> f32 =\n" +
+    "    x.round_even() + x.abs() + x.copysign(y) + x.maximum(y) + x.minimum(y) + x.mul_add(y, x) +\n" +
+    "        x.signum() + x.clamp(0.0, 1.0)\n"
+
+private lmf_no_libm_left(undefined: Buf[string], target: string)
+    for name in undefined
+        assert(name == "memcpy" || name == "memset" || name == "memmove" || name.starts_with("__aeabi_"),
+               s"$target left undefined: ${lmf_listed(undefined)}")
+end lmf_no_libm_left
+
+@test("the operations with a body of their own build on a soft-float freestanding target and call no libm")
+lmf_bodied_soft_float()
+    if !lbr_ready() then return
+    if !is_file(lmf_nm) then skip(s"there is no llvm-nm at $lmf_nm to read the archive")
+
+    val said = lmf_build(lmf_bodied, lmf_package, "thumb-freestanding-softfp")
+
+    assert(said.0 == 0, said.1)
+    lmf_no_libm_left(said.2, "thumb-freestanding-softfp")
+end lmf_bodied_soft_float
+
+// With a double-precision unit the root and the four roundings are instructions too.
+@test("the roots and roundings build on a double-unit freestanding target and call no libm")
+lmf_instructions_hard_float()
+    if !lbr_ready() then return
+    if !is_file(lmf_nm) then skip(s"there is no llvm-nm at $lmf_nm to read the archive")
+
+    val program = lmf_bodied + "\n@export(\"r\")\nr(x: f64, y: f32) -> f64 =\n" +
+        "    x.sqrt() + x.floor() + x.ceil() + x.round() + x.trunc() + x.nearbyint() + x.rint() +\n" +
+        "        x.max_num(x) + real(y.sqrt() + y.floor() + y.trunc())\n"
+    val said = lmf_build(program, lmf_package, "thumbv7em-freestanding-dp")
+
+    assert(said.0 == 0, said.1)
+    lmf_no_libm_left(said.2, "thumbv7em-freestanding-dp")
+end lmf_instructions_hard_float

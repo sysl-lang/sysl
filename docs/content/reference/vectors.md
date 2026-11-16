@@ -353,6 +353,55 @@ f() -> unit
 compare two vectors at a time and combine the masks with '&'
 ```
 
+### A mask as bits
+
+**`bits()` reads a mask as an unsigned integer as wide as it has lanes**, lane `i` at bit `i`: a
+`<16>bool` is a `u16`, a `<4>bool` a `u4`. It is what a search does once `any()` has said a lane
+matched, since the first matching lane is the integer's `trailing_zeros()` and how many matched is
+its `count_ones()`:
+
+```sysl
+first_byte(hay: []const u8, needle: u8) -> Option[usize]
+    var i: usize = 0
+
+    while i + 16 <= hay.len
+        val v: <16>u8 = hay.load(i)
+        val m = v == needle
+
+        if m.any() then return Some(i + usize(m.bits().trailing_zeros()))
+        i += 16
+
+    while i < hay.len
+        if hay[i] == needle then return Some(i)
+        i += 1
+
+    None
+
+val s = "the quick brown fox jumps over the lazy dog"
+val a: <4>f32 = [1, 5, 3, 7]
+
+print(first_byte(s.bytes, u8('z')), first_byte(s.bytes, u8('!')))
+print((a > 2).bits(), (a > 2).bits().count_ones())
+```
+
+```output
+Some(37) None
+14 3
+```
+
+It is **one `bitcast`** of the `<N x i1>` to an `iN`, which the back end turns into the machine's
+own idiom: `pmovmskb` on x86, a narrowing and an add across the register on AArch64. A vector that is
+not a mask has no `bits()`:
+
+```sysl
+val v: <4>int = [1, 2, 3, 4]
+val b = v.bits()
+```
+
+```error
+'bits' reads a mask's lanes as the bits of an integer, so it is read off a mask
+```
+
 ## Rearranging lanes
 
 **`shuffle` picks lanes by number.** Given a list, it builds a vector whose lane `i` is the lane the
@@ -419,8 +468,8 @@ a shuffle's lanes are part of the instruction, so the list has to be a constant
 ```
 
 Picking lanes by numbers computed at run time is a different instruction (`tbl` on AArch64,
-`pshufb` on x86), with its own rules for an index out of range. Where the indices are only known at
-run time, keep the values in an array and index it.
+`pshufb` on x86), with its own rules for an index out of range, and so a different method:
+[`lookup`](#lanes-picked-at-run-time).
 
 A lane outside the vectors is refused while compiling, with both ranges named:
 
@@ -504,6 +553,83 @@ false true
 It is correct, but not free. On AArch64 a comparison's lanes are narrowed to be shuffled and widened
 again afterwards, so `(a < b).shuffle(lanes)` costs several instructions more than
 `a.shuffle(lanes) < b.shuffle(lanes)`. The two are the same mask; prefer shuffling the operands.
+
+### Lanes picked at run time
+
+**`table.lookup(idx)` reads lane `idx[k]` of `table` into lane `k`**, with positions computed while
+the program runs. The positions are a vector of integers, and the answer is as wide as they are and
+holds the table's lanes. **A position past the table's end answers zero**, as AArch64's `tbl` does,
+and so does a negative one: a lookup never traps, so a byte-class table can be read with whatever
+bytes the input holds.
+
+```sysl
+val classes: <16>u8 = [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0]
+val text: <16>u8 = [97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 10]
+
+val by_nibble = classes.lookup(text & 15)
+val by_byte = classes.lookup(text)
+
+val t: <4>f32 = [1.5, 2.5, 3.5, 4.5]
+val i: <4>i32 = [3, -1, 4, 0]
+val r = t.lookup(i)
+
+print(by_nibble[0], by_nibble[9], by_byte[0], by_byte[15])
+print(r[0], r[1], r[2], r[3])
+```
+
+```output
+1 2 0 2
+4.5 0 0 1.5
+```
+
+**A table of sixteen bytes read at sixteen or eight byte positions is one `tbl` on AArch64.** Any
+other lookup is written as the shape back ends recognise as a variable permute — the positions
+clamped once, a lane read at each, and one `select` that zeroes the lanes out of range — which x86
+turns into `pshufb` on a processor with SSSE3, and a machine with no such instruction into the lane
+moves it would have needed anyway. A position type that cannot name a lane past the end, such as a
+`<4>u2` into a table of four, has no range test at all.
+
+A list of positions known while compiling is a `shuffle`, which is the cheaper instruction, so a
+written list is refused here:
+
+```sysl
+val t: <4>int = [1, 2, 3, 4]
+val r = t.lookup([3, 2, 1, 0])
+```
+
+```error
+positions known while compiling are a 'shuffle'
+```
+
+**`v.compress(m)` packs the lanes of `v` where `m` is true into the low lanes**, in order, and
+fills the rest with zero. How many it kept is `m.bits().count_ones()`. It is the step that turns a
+filter's mask into a list of what passed:
+
+```sysl
+val v: <4>i64 = [5, 50, 7, 70]
+val m = v > 6
+val kept = v.compress(m)
+
+print(kept[0], kept[1], kept[2], kept[3], m.bits().count_ones())
+```
+
+```output
+50 7 70 0 3
+```
+
+No processor sysl compiles for by default has a compress instruction (AVX-512's `vpcompress` and
+SVE's `compact` are extensions), so it is a lane move per lane, with no branch. The mask must be the
+receiver's width:
+
+```sysl
+val v: <4>int = [1, 2, 3, 4]
+val w: <8>int = [0; 8]
+val c = v.compress(w > 0)
+```
+
+```error
+'compress' keeps the lanes a mask says to, so it takes the '<4>bool'
+```
 
 ### Swizzles
 
@@ -915,6 +1041,43 @@ the qualifier cannot be kept
 
 A `*T` is refused for a different reason: it carries no length to check the run against. Take a
 slice of the elements first.
+
+### Gathering
+
+**`xs.gather(idx)` reads one element per lane, from wherever each lane of `idx` says**, into a
+vector as wide as `idx`. Like `load`, it belongs to the array or slice. Its width comes from the
+positions, so nothing needs annotating:
+
+```sysl
+var col: [10]i64 = [5, 50, 7, 70, 9, 90, 11, 110, 13, 130]
+val rows: <4>u32 = [9, 0, 3, 3]
+
+val g = col.gather(rows)
+val s = col[2..<6].gather(rows & 3)
+
+print(g[0], g[1], g[2], g[3], s[0], s[3])
+```
+
+```output
+130 5 70 70 70 90
+```
+
+**Every position is bounds-checked as a subscript is**, and a failure names that position, so
+`xs.gather(idx)` traps exactly where the longhand `xs[idx[k]]` would:
+
+```sysl
+val xs: [4]int = [1, 2, 3, 4]
+val idx: <4>usize = [0, 1, 4, 2]
+
+print(xs.gather(idx)[0])
+```
+
+```output trap
+```
+
+Inside `@unchecked` the tests are left out, as a subscript's are. The reads are scalar loads into
+one register: no processor sysl compiles for by default has a gather instruction (AVX2's and SVE's
+are extensions), and those loads are what such a machine needs anyway.
 
 ## One kernel, every width
 

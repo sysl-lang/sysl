@@ -1440,3 +1440,157 @@ into_view_drops_once()
     hold_tracked()
 
     assert_eq(dropped_count, 3)
+
+// -- swap_remove ----------------------------------------------------------------------------------
+
+@test("swap_remove of the first element moves the last into its place")
+swap_remove_first()
+    var b: Buf[int] = buf()
+
+    b.extend([1, 2, 3, 4])
+
+    assert_eq(b.swap_remove(0), 1)
+    assert_slice_eq(b.view(), [4, 2, 3])
+
+@test("swap_remove of a middle element moves the last into its place")
+swap_remove_middle()
+    var b: Buf[int] = buf()
+
+    b.extend([1, 2, 3, 4])
+
+    assert_eq(b.swap_remove(1), 2)
+    assert_slice_eq(b.view(), [1, 4, 3])
+
+@test("swap_remove of the last element moves nothing")
+swap_remove_last()
+    var b: Buf[int] = buf()
+
+    b.extend([1, 2, 3])
+
+    assert_eq(b.swap_remove(2), 3)
+    assert_slice_eq(b.view(), [1, 2])
+
+@test("swap_remove of the only element leaves the buffer empty and usable")
+swap_remove_single()
+    var b: Buf[int] = buf()
+
+    b.push(7)
+
+    assert_eq(b.swap_remove(0), 7)
+    assert(b.is_empty())
+    b.push(8)
+    assert_slice_eq(b.view(), [8])
+
+@test(should_trap)
+swap_remove_past_the_count_traps()
+    var b: Buf[int] = buf()
+
+    b.push(1)
+    b.swap_remove(1)
+
+@test(should_trap)
+swap_remove_of_an_empty_buffer_traps()
+    var b: Buf[int] = buf()
+
+    b.swap_remove(0)
+
+@test(should_trap)
+swap_remove_of_a_handle_naming_nothing_traps()
+    var raw = zeroed_word()
+    val p: *Buf[int] = ptr_cast(&raw[0])
+
+    p.swap_remove(0)
+
+@test("swap_remove keeps exactly one count of each element the buffer still holds")
+swap_remove_drop_counts()
+    dropped_count = 0
+
+    var b: Buf[&Dropped] = buf()
+
+    for i in 0..<4 do b.push(Dropped(i))
+
+    val gone = b.swap_remove(1)
+
+    assert_eq(gone.n, 1)
+    assert_eq(dropped_count, 0)
+    assert_eq(b[1].n, 3)
+    assert_eq(b.len(), 3)
+
+    val last = b.swap_remove(2)
+
+    assert_eq(last.n, 2)
+    assert_eq(dropped_count, 0)
+
+@test("swap_remove's result, once let go, runs its destructor exactly once")
+swap_remove_result_dropped_once()
+    dropped_count = 0
+
+    var b: Buf[&Dropped] = buf()
+
+    for i in 0..<3 do b.push(Dropped(i))
+
+    swap_remove_drop_it(b)
+    assert_eq(dropped_count, 1)
+    b.clear()
+    assert_eq(dropped_count, 3)
+
+private swap_remove_drop_it(b: Buf[&Dropped])
+    val gone = b.swap_remove(0)
+
+    assert_eq(gone.n, 0)
+
+// -- aligned --------------------------------------------------------------------------------------
+
+@test("aligned storage is on the boundary asked for, for several boundaries and lengths")
+aligned_holds_the_boundary()
+    for a in [16, 64, 4096]
+        for n in [1, 2, 3, 7, 16, 37, 100, 1000]
+            val xs: []f32 = aligned(usize(n), usize(a))
+
+            assert_eq(xs.len, usize(n))
+            assert_eq(usize(&xs[0]) % usize(a), 0)
+
+@test("aligned storage of wider elements is on the boundary too")
+aligned_wide_elements()
+    val xs: []u64 = aligned(33, 64)
+    val ys: []u8 = aligned(33, 4096)
+
+    assert_eq(usize(&xs[0]) % 64, 0)
+    assert_eq(usize(&ys[0]) % 4096, 0)
+
+@test("aligned of zero elements is empty")
+aligned_zero_is_empty()
+    val xs: []int = aligned(0, 64)
+
+    assert_eq(xs.len, 0)
+
+@test("aligned storage is zeroed over its whole length and writable")
+aligned_is_zeroed()
+    for round in 0..<5
+        val xs: []u32 = aligned(usize(50 + round), 64)
+
+        for x in xs do assert_eq(x, 0)
+
+        for i in 0..<xs.len do xs[i] = u32(i + 1)
+
+        assert_eq(xs[xs.len - 1], u32(xs.len))
+
+@test("aligned storage is freed with its last view, over many rounds")
+aligned_is_freed()
+    for _ in 0..<1000
+        val xs: []u8 = aligned(4096, 4096)
+
+        xs[0] = 1
+        assert_eq(usize(&xs[0]) % 4096, 0)
+
+@test(should_trap)
+aligned_non_power_of_two_traps()
+    val xs: []u8 = aligned(4, 48)
+
+    xs[0] = 1
+
+@test(should_trap)
+aligned_zero_boundary_traps()
+    val xs: []u8 = aligned(4, 0)
+
+    xs[0] = 1

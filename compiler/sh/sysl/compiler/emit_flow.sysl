@@ -389,7 +389,8 @@ end gen_loop
 //
 // **The sequence is evaluated once, into the statement's own region**, so a slice temporary stays
 // alive for the whole walk; the loop variable is a copy of the element, taking a count of its own
-// and giving it back at the end of each iteration.
+// and giving it back at the end of each iteration -- unless the body can let go of nothing, and then
+// it takes none.
 gen_for_each(e: *Emit, name: string, elem_ty: Type, seq: TExpr, body: Buf[TStmt],
              else_block: Option[TBlock], ty: Type) -> Val
     val parts = texpr_type(seq) match
@@ -434,6 +435,17 @@ gen_for_each(e: *Emit, name: string, elem_ty: Type, seq: TExpr, body: Buf[TStmt]
     else
         // An element that occupies nothing is not read or kept: the body runs `len` times and the
         // variable is the one value its type has.
+        //
+        // **An element the body cannot let go of is lent** (`borrowing.sysl`'s `lent_element`): the
+        // variable holds the bytes the storage holds, with no count of its own to take or give back,
+        // and whatever keeps it takes one there, as it would of a borrowed parameter. So are the
+        // bindings that copy a part of it, which a pattern in the header makes.
+        val loan = if zero_sized(elem_ty) then None else lent_element(e, name, elem_ty, seq, body)
+        val lent = loan.is_some()
+        val outer = e.lent_decls
+
+        e.lent_decls = loan.unwrap_or(set())
+
         if !zero_sized(elem_ty)
             val ep = fresh_reg(e)
 
@@ -448,14 +460,17 @@ gen_for_each(e: *Emit, name: string, elem_ty: Type, seq: TExpr, body: Buf[TStmt]
 
             val home = local_alloca(e, name, lty(e, elem_ty))
 
-            retain_value(e, elem_ty, ev)
+            if !lent then retain_value(e, elem_ty, ev)
+
             emit(e, InStore(lty(e, elem_ty), ev, home, AccPlain, None))
         end if
 
         push_owned(e)
-        own_slot(e, name, elem_ty)
+
+        if !lent then own_slot(e, name, elem_ty)
         gen_body(e, body)
         pop_owned(e)
+        e.lent_decls = outer
         emit_term(e, InBr(step_l))
     end if
 

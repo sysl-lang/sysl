@@ -85,6 +85,7 @@ struct Buf[T]
 
     insert(self, i: usize, v: T)
     remove(self, i: usize) -> T
+    swap_remove(self, i: usize) -> T
     truncate(self, n: usize)
     clear(self)
 
@@ -181,6 +182,27 @@ count, and does nothing where `n` is a length the buffer does not have — a len
 no element, so unlike an index there is nothing for it to read and nothing to stop the program about.
 `clear()` is `truncate(0)`. `remove(i)` shifts the survivors down over element `i`, hands that element
 back, and ends at `truncate`; an `i` that names no element is `b[i]`'s trap, for `b[i]`'s reason.
+
+**`swap_remove(i)` is `remove` in constant time, at the price of the order.** It hands element `i`
+back and moves the last element into the hole instead of shifting everything after it — the removal
+an entity table or a column of components wants, where the rows carry no order. Removing the last
+element moves nothing; an `i` that names no element traps, as `remove`'s does.
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+var b: Buf[int] = buf()
+
+b.extend([10, 20, 30, 40])
+
+print(b.swap_remove(1))
+print(b.view())
+```
+
+```output
+20
+[10, 40, 30]
+```
 
 **`insert(i, v)` is `remove`'s other half**, putting an element at `i` and moving everything from
 there on up one. Inserting at `len` is a `push` and is allowed for that reason — a loop inserting at
@@ -708,6 +730,32 @@ function 'sysl.buf.buf_with_capacity' takes 2 arguments, but 1 argument was give
 **The fill is not stored anywhere.** The spare slots come from
 [`slot_storage`](/reference/memory/#slot-storage-room-that-holds-no-value-yet) and hold no value at
 all, so a `Buf[&T]` given a capacity of 1024 keeps nothing alive but the elements it was pushed.
+
+### Storage on a boundary
+
+`aligned(n, alignment)` is a `[]T` of `n` zeroed elements whose first element is on an
+`alignment`-byte boundary, for a length known only while running — a SIMD loop's rows, a cache line,
+a page. A plain `[0; n]` promises only the allocator's boundary, and `@align` on a struct fixes one
+at compile time; this is the runtime-sized form, with no struct and no `ptr_cast`:
+
+```sysl
+import sysl.buf.aligned
+
+val xs: []f32 = aligned(100, 64)
+
+xs[3] = 1.5
+
+print(usize(&xs[0]) % 64, xs.len, xs[3], xs[4])
+```
+
+```output
+0 100 1.5 0
+```
+
+It is an ordinary slice, so it is freed with its last view and needs no call to give it back. The
+element type must be `AnyBits` (zero bytes are a value), `alignment` must be a power of two, and the
+element size must be able to reach the boundary — a size that is a power of two always can. Anything
+else traps rather than answering storage off its boundary. An `n` of zero is the empty slice.
 
 ### A buffer filled to a length
 

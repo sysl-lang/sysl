@@ -119,8 +119,8 @@ end link_complaint
 // heard of takes. **The target already links what holds it** -- Darwin keeps libc and libm in
 // `libSystem` and Windows keeps them in the CRT, both of which the driver passes unasked. **The
 // target does not have it at all** -- a freestanding build has no libc, so nothing can be passed for
-// one, and a program that then calls `sqrt` fails at the link naming `sqrt`, which is the honest
-// report.
+// one; the libm functions `sysl.math` binds are `@needs(libc)`, so a program reaching one there is
+// refused at the reference rather than at this link.
 //
 // The set is deliberately small: it holds what the compiler can *defend* rather than every library a
 // platform might bundle. Guessing about `pthread` or `dl` would mean guessing wrong for some platform
@@ -139,11 +139,19 @@ end library_flags
 // freestanding target has no libc, libm or threads library to name, so listing `m` there (which every
 // program is handed, because `sysl.math` is in the standard module) is a hint the C project could not
 // act on. Every other target keeps the whole list: an unused `-l` costs a linker nothing.
+//
+// **A board whose manifest grants `libc` has one** -- newlib, picolibc -- and its mathematics with it,
+// so there `c` and `m` are named again: the libm functions `sysl.math` binds are reachable only under
+// that grant, and the archive then calls them by symbol. A threads or loader library is still the
+// operating system's, which a grant of `libc` does not supply.
 link_hint(links: Buf[string], t: Target) -> Buf[string]
     var out: Buf[string] = buf()
 
     for item in links
-        if !(t.os == Freestanding && hosted_only(item)) then out.push(item)
+        val absent = t.os == Freestanding && hosted_only(item) &&
+            !(t.provides_libc() && (item == "c" || item == "m"))
+
+        if !absent then out.push(item)
 
     out
 end link_hint

@@ -71,6 +71,12 @@ struct Parser
     // `T: Trait` test stands as an operand.
     deciding: bool
 
+    // Whether the statement about to be read stands at the head of a function's or a loop's body,
+    // with nothing but clauses before it -- the one place `invariant` and `variant` are clauses
+    // whatever follows them. Set by `parse_stmts` for each statement and taken by the statement as
+    // it begins, so a block or an inline body read inside it starts from false.
+    clause_head: bool
+
     // The kind of the next token. `Eof` where there is none, so that no caller unwraps.
     //
     // **Read out of the token list in place**, with no `Option` around a copy of the whole token: the
@@ -381,7 +387,7 @@ end Parsed
 // report: everything after an unterminated literal is being read in the wrong language, so a second
 // complaint about it is noise at best and a wrong line number at worst.
 parser_over(src: Source) -> Result[Parser, Diagnostic] =
-    Ok(Parser(tokens_of(lex(src)?), src, report(), 0, 0, 0, 0, 0, Span(0, 0), openers(), false))
+    Ok(Parser(tokens_of(lex(src)?), src, report(), 0, 0, 0, 0, 0, Span(0, 0), openers(), false, false))
 
 // One expression, read from text.
 //
@@ -403,7 +409,7 @@ parse_expr_within(src: Source, from: usize, to: usize) -> ParsedExpr
         Ok(ts) -> ts
         Err(d) -> return one_expr(src, Err(d))
 
-    one_expr(src, Ok(Parser(tokens_of(toks), src, report(), 0, 0, 0, 0, 0, Span(0, 0), openers(), false)))
+    one_expr(src, Ok(Parser(tokens_of(toks), src, report(), 0, 0, 0, 0, 0, Span(0, 0), openers(), false, false)))
 end parse_expr_within
 
 private one_expr(src: Source, over: Result[Parser, Diagnostic]) -> ParsedExpr
@@ -478,8 +484,12 @@ end parse_pattern_text
 // -- which is the whole of what an editor asking about line 3 needs when line 1 is unreadable. The
 // skip stays inside the block it began in, because the block's `Dedent` stops it: without that the
 // statement after the block is read as though it were part of it.
-parse_stmts(p: *Parser, in_block: bool) -> Buf[Stmt]
+//
+// **`clauses` says the block is a function's or a loop's body**, whose leading statements may be the
+// clauses that body carries; `head` stays true until the first statement that is not one.
+parse_stmts(p: *Parser, in_block: bool, clauses: bool = false) -> Buf[Stmt]
     var stmts: Buf[Stmt] = buf()
+    var head = clauses
 
     p.skip_newlines()
 
@@ -504,7 +514,13 @@ parse_stmts(p: *Parser, in_block: bool) -> Buf[Stmt]
 
         val before = p.report.len()
         val dropped_before = p.dropped
+
+        p.clause_head = head
+
         val s = parse_stmt(p)
+
+        p.clause_head = false
+        head = head && is_head_clause(s)
 
         if p.report.len() == before
             if p.end_of_statement()
@@ -534,6 +550,15 @@ parse_stmts(p: *Parser, in_block: bool) -> Buf[Stmt]
 
     stmts
 end parse_stmts
+
+// A clause a function's or a loop's body may open with, which leaves the statement after it at the
+// head of that body too.
+private is_head_clause(s: Stmt) -> bool = *s.kind match
+    Require(_, _) -> true
+    Ensure(_, _) -> true
+    Invariant(_, _) -> true
+    Variant(_) -> true
+    _ -> false
 
 // **An `asm` block at the top of a file is the module's, in every file** -- the one a program starts
 // in as much as any other. There it is not inside a function, so nothing would run it as a statement:
@@ -582,8 +607,8 @@ skip_line(p: *Parser)
 end skip_line
 
 // An indented block: the lexer's `Newline` `Indent` pair, statements, and the `Dedent` that closes
-// them.
-parse_suite(p: *Parser) -> Buf[Stmt]
+// them. `clauses` marks a function's or a loop's body (`parse_stmts`).
+parse_suite(p: *Parser, clauses: bool = false) -> Buf[Stmt]
     if !p.accept(Newline)
         p.want("newline")
         return buf()
@@ -598,7 +623,7 @@ parse_suite(p: *Parser) -> Buf[Stmt]
 
     p.nest = 0
 
-    val body = parse_stmts(p, true)
+    val body = parse_stmts(p, true, clauses)
 
     p.nest = outer
     p.depth -= 1
@@ -769,10 +794,12 @@ end parse_inline_body
 
 // The body of a control-flow construct: the introducer word (`then`, `do`) is required for a
 // one-line body and optional before an indented block, a following `Newline` `Indent` already
-// marking the block unambiguously.
+// marking the block unambiguously. A `do` body is a loop's, whose head may carry its clauses.
 parse_body(p: *Parser, word: string) -> Buf[Stmt]
+    val loop_body = word == "do"
+
     if p.accept_kw(word)
-        if p.block_ahead() then parse_suite(p) else parse_inline_body(p)
+        if p.block_ahead() then parse_suite(p, loop_body) else parse_inline_body(p)
     else
-        parse_suite(p)
+        parse_suite(p, loop_body)
 end parse_body

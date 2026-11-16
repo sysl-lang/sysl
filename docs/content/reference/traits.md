@@ -3486,11 +3486,196 @@ the same one indirect call as the trait's own methods. What is missing is a *nam
 slots. Flattening gives up the upcast in exchange for one indirection instead of two on every call
 through a `&Shape`.
 
-### There is no way back to the type
+### Asking an object which type it holds
 
-An object cannot recover its erased type. There is no cast and no type test, and the form a reader
-might try first is not one either: a type is not a pattern, so `s is Rect` reads `Rect` as an
-ordinary binding, which matches anything:
+An object has forgotten its type, but it can still be **asked about one**. Every trait object has two
+members the compiler supplies: `o.is[T]()` answers whether the type inside it is exactly `T`, and
+`o.as[T]()` answers an `Option[&T]`, which is the object itself as a `&T` when it holds a `T` and
+`None` when it holds anything else:
+
+```sysl
+trait Shape
+    area(self) -> int
+
+struct Rect
+    w: int
+    h: int
+
+struct Sq
+    s: int
+
+impl Shape for Rect
+    area(self) -> int = self.w * self.h
+
+impl Shape for Sq
+    area(self) -> int = self.s * self.s
+
+var xs: [3]&Shape = [Rect(2, 3), Sq(4), Rect(1, 5)]
+var wide = 0
+
+for x in xs
+    if x.as[Rect]() is Some(r) then wide += r.w
+    if x.is[Sq]() then print("a square of", x.area())
+
+print(wide)
+```
+
+```output
+a square of 16
+3
+```
+
+**Both read the identity the object already carries**, the [`::Id`](#the-identity-is-readable) its
+table begins with, so `is` costs one load and one comparison, and `as` the same plus a count on a
+hit.
+
+**The answer is the object, not a copy of it.** The data word of a `&Shape` is the very box the
+`&Rect` it was made from pointed at, so `as` hands that box back with a count taken for the caller.
+A write through the answer is seen through the object, and a type with a destructor is still
+destroyed once, when the last reference of either kind goes:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+trait Shape
+    area(self) -> int
+
+struct Lamp
+    n: int
+
+impl Drop for Lamp
+    drop(self) = print("off", self.n)
+
+impl Shape for Lamp
+    area(self) -> int = self.n
+
+main()
+    var xs: Buf[&Shape] = buf()
+
+    xs.push(Lamp(7))
+
+    val kept = xs[0].as[Lamp]()
+
+    xs.clear()
+    print("cleared")
+    print(kept.unwrap().n)
+```
+
+```output
+cleared
+7
+off 7
+```
+
+**The test is for exactly one type, fully instantiated.** `Col[int]` and `Col[real]` are two types,
+so an object holding one is not the other. A generic body asks through its parameter, and the type
+asked about is the one each instantiation names — the shape a table of type-erased columns needs:
+
+```sysl
+trait Column
+    len(self) -> int
+
+struct Col[T]
+    items: [4]T
+
+impl[T] Column for Col[T]
+    len(self) -> int = 4
+
+column[T](c: &Column) -> Option[&Col[T]] = c.as[Col[T]]()
+
+var c: &Column = Col[int]([1, 2, 3, 4])
+
+print(c.is[Col[int]](), c.is[Col[real]]())
+print(column[int](c).unwrap().items[2], column[real](c).is_none())
+```
+
+```output
+true false
+3 true
+```
+
+**What an object holds is a concrete type**, the one erased from a `&T`, so a trait is never the
+answer, and an object is not cast from one trait to another:
+
+```sysl
+trait Shape
+    area(self) -> int
+
+struct Rect
+    w: int
+
+impl Shape for Rect
+    area(self) -> int = self.w
+
+var s: &Shape = Rect(2)
+
+print(s.as[Shape]())
+```
+
+```error
+'Shape' is a trait, and what a &Shape holds is the concrete type its value was made as, so 'o.as[T]()' asks for that type — an object is not cast to another trait
+```
+
+A type that does not implement the trait could never be inside one of its objects, so asking for
+it is a mistake rather than a question whose answer is always no:
+
+```sysl
+trait Shape
+    area(self) -> int
+
+struct Rect
+    w: int
+
+struct Circle
+    r: int
+
+impl Shape for Rect
+    area(self) -> int = self.w
+
+var s: &Shape = Rect(2)
+
+print(s.is[Circle]())
+```
+
+```error
+'Circle' does not implement 'Shape', so no &Shape can hold one and 'o.is[Circle]()' could never be true
+```
+
+A reference is never the answer either (`as[&Rect]` is refused), and inside a generic body the
+same checks are made of each instantiation's type.
+
+**The sigil carries over.** A `&sync Shape` answers an `Option[&sync Rect]`, counted atomically as
+the object is. A `*Shape` may be asked `is`, but it points at a value with no count to take a share
+of, so it has no `as`:
+
+```sysl
+trait Shape
+    area(self) -> int
+
+struct Rect
+    w: int
+
+impl Shape for Rect
+    area(self) -> int = self.w
+
+var r = Rect(2)
+val p: *Shape = &r
+
+print(p.is[Rect]())
+print(p.as[Rect]())
+```
+
+```error
+a *Shape points at a value no count is kept for, so there is no counted '&Rect' to hand back — 'o.is[Rect]()' asks the question without one
+```
+
+**A member the trait declares wins.** `is` is not a reserved word, so a trait may declare a member
+of that name, and then `o.is()` calls it; the compiler's `is` is the fallback, as every form the
+compiler supplies is.
+
+**A type is not a pattern**, so the form a reader might try first does not test anything: `s is Rect`
+reads `Rect` as an ordinary binding, which matches every object. The test is written `s.is[Rect]()`,
+and the test that binds is `s.as[Rect]() is Some(r)`:
 
 ```sysl
 trait Shape
@@ -3512,12 +3697,7 @@ if s is Rect then print("yes") else print("no")
 this pattern matches every &Shape, so the test is always true — take the value apart with 'match', or bind it with 'var'
 ```
 
-**This is deliberate.** A downcast would undo erasure: every other rule here says an object offers
-the trait's members and nothing else, and a type test would also expose its concrete type, which the
-object type deliberately does not provide. Languages that offer downcasts need a separate mechanism
-for them, which is a substantial addition rather than a small extension of this one.
-
-### The identity is readable, and it is not a way back
+### The identity is readable
 
 **`o::Id` gives the identity of the type inside an object**, as a `usize`. It is the one fact about
 the erased type that an object still carries, because the method table it points at begins with
@@ -3548,14 +3728,14 @@ print(a::Id == Rect::Id, a::Id == Sq::Id)
 true false
 ```
 
-**This is not the downcast the section above refuses.** The id can only be **compared**: two values
-with the same id hold the same type. There is no map from an id back to a type, no test that changes
-what an object offers, and no `Any`. It supports the two things a collection of erased values
-typically needs, neither of which is a cast: **a key**, for asking whether the node here is the same
-*kind* as the node that was here before, and the first half of a **memo table's** key.
+**It is what [`is` and `as`](#asking-an-object-which-type-it-holds) compare**, and on its own it
+can only be **compared**: two values with the same id hold the same type. There is no map from an id
+back to a type and no `Any`. Read directly it serves the two things a collection of erased values
+typically needs beside a test: **a key**, for asking whether the node here is the same *kind* as the
+node that was here before, and the first half of a **memo table's** key.
 
-A program that counts one kind of shape in a collection therefore needs no hand-maintained `kind`
-property returning a constant in every implementation; it compares the ids directly:
+Two objects can therefore be asked whether they hold the same type without naming it, and a count
+of one kind needs no hand-maintained `kind` property returning a constant in every implementation:
 
 ```sysl
 trait Shape
