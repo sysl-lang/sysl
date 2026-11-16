@@ -860,6 +860,118 @@ inert_leaf(x: TExpr) -> bool = *x.kind match
 
     _ -> false
 
+// -- a loop variable read through the sequence's own count ------------------------------------------
+
+// Whether `for x in seq` may LEND each element to its variable: load it out of the sequence's storage
+// and take no count for it, so that an iteration costs no retain and no release.
+//
+// **The element is alive for as long as its storage holds it**, and the loop already keeps the storage:
+// the sequence is evaluated once, into the statement's region, with a count of its own. So the one
+// thing that could free an element under the variable is the body letting go of it -- writing the slot
+// it is in, or a call that might. The body is judged by the rule an inert function body is
+// (`inert_node`): every node off the `inert_leaf` list refuses, and so does every write but one to a
+// `var` of the function's own; plain assignment statements, which a function body is refused for, are
+// judged by where they land the same way. A write to a local the sequence names is refused, since an
+// array walked in place is that local's storage, and so is a write to the variable itself, which is no
+// `var` of the function's own and whose old value the assignment would give back.
+//
+// **Each call must release nothing** (`inert_callees`), **or reach no storage a value of the element's
+// type, or of any type the sequence is made of, could be in** (`untouched_by`) -- the second is what
+// clears the printing helpers, which end in a foreign call, and a library's compiled functions.
+//
+// **Keeping the variable is no reason to refuse.** A variable that holds no count is what a borrowed
+// parameter is, and everything that keeps one -- a store, a `push`, a `return`, a `break` with it, a
+// copy into a `var` -- takes the count there (`retain_moving` finds no slot of the frame's to take it
+// over from). A closure built in the body refuses, and so does every owning callee, since neither is
+// an inert node or call.
+//
+// **A binding of the body that copies a part of the variable is lent with it** -- `val (k, v) = x`,
+// which is what `for (k, v) in seq` desugars to, or a `val f = x.field` written out -- where the part
+// is reached by fields held by value, so it lives in the element's own storage. Such a binding is no
+// longer a `var` a write may land in, and a write to one refuses the loan as a write to the variable
+// does. The answer is those bindings' names, or nothing where the element is not lent.
+lent_element(e: *Emit, name: string, elem_ty: Type, seq: TExpr, body: Buf[TStmt]) -> Option[Set[string]]
+    if !contains_counted(elem_ty) || e.body_func.is_none() then return None
+
+    if e.body_locals.is_none() then e.body_locals = Some(own_locals(e.body_func.unwrap()))
+
+    var roots: Set[string] = set()
+    var parts: Set[string] = set()
+
+    roots.add(name)
+
+    for s in body
+        s match
+            TVarDecl(n, ty, init, align) ->
+                if align.is_none() && contains_counted(ty) && !e.layout.indirect(ty) && part_of(init, roots)
+                    roots.add(n)
+                    parts.add(n)
+                end if
+            _ -> ()
+
+    var locals: Set[string] = set()
+    val named = name_sink()
+
+    walk_texpr(seq, expr_walk(true, x -> note_load(named, x)))
+
+    for item in e.body_locals.unwrap()
+        if !named.names.has(item) && !parts.has(item) then locals.add(item)
+
+    val v: &Verdict = Verdict(true)
+    val calls: &CallSink = CallSink(buf())
+    val q: &QuietSink = QuietSink(true, buf(), buf(), buf())
+    val none: &KindSink = KindSink(buf())
+    val b = Body(buf(), locals, set(), none)
+
+    walk_stmts(body, TWalk(true, x -> inert_node(v, calls, calls, q, b, x),
+                           w -> lent_write(v, calls, locals, w),
+                           s -> if !lent_stmt(s) then v.refuse()))
+
+    if !v.ok then return None
+
+    // The types whose storage could hold the element: its own, and every type the sequence's
+    // expression is made of -- the `Buf` a view of it was taken from among them.
+    val types = type_sink()
+
+    types.add(elem_ty)
+    walk_texpr(seq, expr_walk(true, x -> if contains_counted(texpr_type(x)) then types.add(texpr_type(x))))
+
+    for callee in calls.names
+        if e.inert.has(callee) then continue
+
+        for t in types.types
+            if !untouched_by(&e.untouched, t).has(callee) then return None
+
+    Some(parts)
+end lent_element
+
+// Whether `x` reads a part of one of `roots` held in its own storage: the name itself, or a field of
+// one reached by fields of values, never through a reference or a pointer, whose target is storage
+// of its own.
+private part_of(x: TExpr, roots: Set[string]) -> bool = *x.kind match
+    TLoad(n, _) -> roots.has(n)
+    TField(r, _, _) -> repr(texpr_type(r)) match
+        Struct(_) -> part_of(r, roots)
+        _ -> false
+    _ -> false
+
+private note_load(into: &NameSink, x: TExpr) = *x.kind match
+    TLoad(n, _) -> into.add(n)
+    _ -> ()
+
+// A write a lent loop's body makes: to a `var` of the function's own, through no operator but one the
+// loop can also call, and with no invariant to re-establish.
+private lent_write(v: &Verdict, calls: &CallSink, locals: Set[string], w: TWrite)
+    if !own_place(w.place, locals) || !w.check.is_empty() then v.refuse()
+    if w.dispatch.is_some() then calls.add(w.dispatch.unwrap().name)
+
+// The statements a lent loop's body may hold: an inert function body's, and an assignment, whose write
+// is judged on its own (`lent_write`).
+private lent_stmt(s: TStmt) -> bool = s match
+    TWriteStmt(_) -> true
+    TMultiAssign(_) -> true
+    _ -> inert_stmt(s)
+
 // -- the callee: a body that cannot reach a value of one type ---------------------------------------
 
 // What each body of the program can do to memory that is not its own, read once, and the functions
