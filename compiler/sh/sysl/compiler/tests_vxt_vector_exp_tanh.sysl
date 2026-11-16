@@ -1,0 +1,161 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{Search, split}
+
+// The lane-wise `exp` and `tanh` of `sysl.math.VectorFloat` (`reference/vectors.md § Exponential and
+// hyperbolic tangent`). They are library code rather than a compiler intrinsic, so what is checked here
+// is the shape a loop over them lowers to: the vector method is called once per register and never
+// the C library's scalar `expf` or `tanhf` once per lane, its body is straight-line vector arithmetic
+// with no branch, and once optimized the loop body has inlined every step of it. Their values are checked in
+// `library/sysl/math/vector_tests.sysl`, against the scalar methods.
+
+private vxt_ready() -> bool
+    if xvr_no_library() then return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end vxt_ready
+
+// A kernel over whole registers, with no scalar tail to call the scalar method.
+private vxt_kernel(lane: string, width: int, method: string) -> string =
+    s"each(xs: []const $lane, out: []$lane)\n    var i: usize = 0\n\n" +
+    s"    while i + $width <= xs.len\n        val v: <$width>$lane = xs.load(i)\n\n" +
+    s"        out.store(i, v.$method())\n        i += $width\n\n" +
+    s"var src: [16]$lane\nvar dst: [16]$lane\n\neach(src[..], dst[..])\nprint(dst[3])\n"
+
+// How many lines of `text` contain `needle`.
+private vxt_count(text: string, needle: string) -> int
+    var n = 0
+
+    for line in split(text, "\n")
+        if line.contains(needle) then n += 1
+
+    n
+end vxt_count
+
+@test("a loop of exp or tanh calls the vector method once a register and no scalar libm entry point")
+vxt_loop_calls_the_vector_method()
+    if !vxt_ready() then return
+
+    // An f64 lane is spelled `real` in a symbol, as the type is.
+    for (lane, sym, width, ty, scalar) in [("f32", "f32", 4, "<4 x float>", "f"),
+                                           ("f64", "real", 2, "<2 x double>", ""),
+                                           ("f32", "f32", 8, "<8 x float>", "f")]
+        for method in ["exp", "tanh"]
+            val ir = cgz_ir(vxt_kernel(lane, width, method))
+            val body = cgz_body(ir, "each$$sysl")
+            val vector = s"vecs.$sym.$method.c$width"
+
+            assert(body.starts_with("define "), body)
+            assert_eq(vxt_count(body, s"call $ty @$vector("), 1, body)
+            assert_eq(vxt_count(ir, s"@sysl_$method$scalar("), 0, ir)
+            assert_eq(vxt_count(ir, s"@$method$scalar("), 0, ir)
+            assert_eq(vxt_count(ir, s"@llvm.$method."), 0, ir)
+end vxt_loop_calls_the_vector_method
+
+@test("the vector exp and tanh are straight-line: no branch, and no call but intrinsics and themselves")
+vxt_bodies_have_no_branch()
+    if !vxt_ready() then return
+
+    for (lane, sym, width) in [("f32", "f32", 4), ("f64", "real", 2)]
+        for method in ["exp", "tanh"]
+            val ir = cgz_ir(vxt_kernel(lane, width, method))
+            val body = cgz_body(ir, s"vecs.$sym.$method.c$width")
+
+            assert(body.starts_with("define "), body)
+
+            assert(body.contains("@llvm.fma."), body)
+            assert_eq(vxt_count(body, "br "), 0, body)
+
+            for line in split(body, "\n")
+                if line.contains(" call ")
+                    val ok = line.contains("@llvm.") || line.contains("@sysl.math$two_to_") ||
+                             line.contains(s"@vecs.$sym.exp.c$width(")
+
+                    assert(ok, s"an unexpected call in the body: $line")
+end vxt_bodies_have_no_branch
+
+@test("optimized, the loop body is vector arithmetic with every call inlined away")
+vxt_optimized_loop_has_no_call()
+    if !vxt_ready() then return
+
+    val dir = make_temp_dir("sysl-vxt").unwrap()
+
+    for method in ["exp", "tanh"]
+        val file = s"$dir/$method.ll"
+
+        write_text(file, cgz_ir(vxt_kernel("f32", 4, method))).unwrap()
+
+        val got = capture("clang", ["-O2", "-S", "-emit-llvm", "-o", "-", file], "", [], true).unwrap()
+
+        assert(got.status.ok(), s"clang refused the emitted IR:\n${got.err.unwrap_or("")}")
+
+        // The kernel itself may be inlined into `main`, so the claim is about every call left in the
+        // module: none reaches the vector method, its helper, or a scalar entry point.
+        val ir = got.text
+
+        assert(ir.contains("@llvm.fma.v4f32("), ir)
+
+        for line in split(ir, "\n")
+            if line.contains("call ")
+                assert(!line.contains("@vecs."), s"the vector method is still called: $line")
+                assert(!line.contains("two_to_"), s"the scaling helper is still called: $line")
+
+        assert_eq(vxt_count(ir, s"@${method}f("), 0, ir)
+        assert_eq(vxt_count(ir, s"@sysl_${method}f("), 0, ir)
+
+    remove_dir_all(dir).unwrap_or(())
+end vxt_optimized_loop_has_no_call
+
+// What `build-c` says of a one-file package for a target, and its status.
+private vxt_build_c(text: string, target: string) -> (int, string)
+    val root = make_temp_dir("sysl-vxt-c").unwrap()
+
+    write_text(s"$root/sysl.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    var said: Buf[string] = buf()
+    val sink = &said
+    var args: [7]string = ["sysl", "build-c", "--target", target, "-o", s"$root/probe.a", root]
+    val code = run_cli(args[..], piece -> sink.push(piece))
+
+    reset_search_paths()
+    remove_dir_all(root).unwrap_or(())
+
+    var out = ""
+
+    for piece in said
+        out = out + piece
+
+    (code, out)
+end vxt_build_c
+
+@test("exp and tanh need no C library: they build for a bare target, where a libm reference is refused")
+vxt_builds_bare()
+    if !vxt_ready() then return
+
+    val program = "@export(\"squash\")\nsquash(xs: *f32, ys: *real)\n" +
+                  "    val v = <4>f32([xs[0], xs[1], xs[2], xs[3]])\n" +
+                  "    val w = <2>f64([ys[0], ys[1]])\n" +
+                  "    xs[0] = (v.tanh() + v.exp())[0]\n    ys[0] = (w.tanh() + w.exp())[1]\n"
+
+    val (code, said) = vxt_build_c(program, "thumb-freestanding-softfp")
+
+    assert(!said.contains("error"), said)
+    assert_eq(code, 0)
+
+    // The same program through the scalar method is the one the target refuses.
+    val (scalar, refused) = vxt_build_c("@export(\"squash\")\nsquash(x: f32) -> f32 = x.exp()\n",
+                                        "thumb-freestanding-softfp")
+
+    assert(scalar != 0, refused)
+    assert(refused.contains("libc"), refused)
+end vxt_builds_bare

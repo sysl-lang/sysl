@@ -20,7 +20,7 @@ name, and each says in its own header why it is not part of this one.
 
 ## Index
 
-[`e`](#e) [`ln10`](#ln10) [`ln2`](#ln2) [`pi`](#pi) [`sqrt2`](#sqrt2) [`tau`](#tau) [`approx_eq`](#approx_eq) [`approx_eq_rel`](#approx_eq_rel) [`assert_approx_eq`](#assert_approx_eq) [`assert_approx_eq_rel`](#assert_approx_eq_rel) [`checked_add`](#checked_add) [`checked_mul`](#checked_mul) [`checked_sub`](#checked_sub) [`clamp`](#clamp) [`div_floor`](#div_floor) [`divmod`](#divmod) [`erf`](#erf) [`erf`](#erf-1) [`erfc`](#erfc) [`erfc`](#erfc-1) [`gcd`](#gcd) [`ilogb`](#ilogb) [`ilogb`](#ilogb-1) [`infinity`](#infinity) [`is_power_of_two`](#is_power_of_two) [`j0`](#j0) [`j0`](#j0-1) [`j1`](#j1) [`j1`](#j1-1) [`jn`](#jn) [`jn`](#jn-1) [`lcm`](#lcm) [`lgamma`](#lgamma) [`lgamma`](#lgamma-1) [`lgamma_sign`](#lgamma_sign) [`lgamma_sign`](#lgamma_sign-1) [`max`](#max) [`min`](#min) [`mod_floor`](#mod_floor) [`nan`](#nan) [`next_power_of_two`](#next_power_of_two) [`nextafter`](#nextafter) [`nextafter`](#nextafter-1) [`nextafter`](#nextafter-2) [`overflowing_add`](#overflowing_add) [`overflowing_mul`](#overflowing_mul) [`overflowing_sub`](#overflowing_sub) [`pow`](#pow) [`scalbln`](#scalbln) [`scalbln`](#scalbln-1) [`tgamma`](#tgamma) [`tgamma`](#tgamma-1) [`ulp`](#ulp) [`ulp`](#ulp-1) [`ulp`](#ulp-2) [`y0`](#y0) [`y0`](#y0-1) [`y1`](#y1) [`y1`](#y1-1) [`yn`](#yn) [`yn`](#yn-1) [`Bits`](#bits) [`ByteOrder`](#byteorder) [`Float`](#float) [`Magnitude`](#magnitude) [`MinMax`](#minmax) [`MulAdd`](#muladd) [`Signed`](#signed) [Float for bf16](#float-for-bf16) [Float for f16](#float-for-f16) [Float for f32](#float-for-f32) [Float for real](#float-for-real) [Magnitude for f32](#magnitude-for-f32) [Magnitude for real](#magnitude-for-real) [Magnitude for T](#magnitude-for-t) [MinMax for T](#minmax-for-t) [MulAdd for f32](#muladd-for-f32) [MulAdd for real](#muladd-for-real)
+[`e`](#e) [`ln10`](#ln10) [`ln2`](#ln2) [`pi`](#pi) [`sqrt2`](#sqrt2) [`tau`](#tau) [`approx_eq`](#approx_eq) [`approx_eq_rel`](#approx_eq_rel) [`assert_approx_eq`](#assert_approx_eq) [`assert_approx_eq_rel`](#assert_approx_eq_rel) [`checked_add`](#checked_add) [`checked_mul`](#checked_mul) [`checked_sub`](#checked_sub) [`clamp`](#clamp) [`div_floor`](#div_floor) [`divmod`](#divmod) [`erf`](#erf) [`erf`](#erf-1) [`erfc`](#erfc) [`erfc`](#erfc-1) [`gcd`](#gcd) [`ilogb`](#ilogb) [`ilogb`](#ilogb-1) [`infinity`](#infinity) [`is_power_of_two`](#is_power_of_two) [`j0`](#j0) [`j0`](#j0-1) [`j1`](#j1) [`j1`](#j1-1) [`jn`](#jn) [`jn`](#jn-1) [`lcm`](#lcm) [`lgamma`](#lgamma) [`lgamma`](#lgamma-1) [`lgamma_sign`](#lgamma_sign) [`lgamma_sign`](#lgamma_sign-1) [`max`](#max) [`min`](#min) [`mod_floor`](#mod_floor) [`nan`](#nan) [`next_power_of_two`](#next_power_of_two) [`nextafter`](#nextafter) [`nextafter`](#nextafter-1) [`nextafter`](#nextafter-2) [`overflowing_add`](#overflowing_add) [`overflowing_mul`](#overflowing_mul) [`overflowing_sub`](#overflowing_sub) [`pow`](#pow) [`scalbln`](#scalbln) [`scalbln`](#scalbln-1) [`tgamma`](#tgamma) [`tgamma`](#tgamma-1) [`ulp`](#ulp) [`ulp`](#ulp-1) [`ulp`](#ulp-2) [`y0`](#y0) [`y0`](#y0-1) [`y1`](#y1) [`y1`](#y1-1) [`yn`](#yn) [`yn`](#yn-1) [`Bits`](#bits) [`ByteOrder`](#byteorder) [`Float`](#float) [`Magnitude`](#magnitude) [`MinMax`](#minmax) [`MulAdd`](#muladd) [`Signed`](#signed) [`VectorFloat`](#vectorfloat) [Float for bf16](#float-for-bf16) [Float for f16](#float-for-f16) [Float for f32](#float-for-f32) [Float for real](#float-for-real) [Magnitude for f32](#magnitude-for-f32) [Magnitude for real](#magnitude-for-real) [Magnitude for T](#magnitude-for-t) [MinMax for T](#minmax-for-t) [MulAdd for f32](#muladd-for-f32) [MulAdd for real](#muladd-for-real) [VectorFloat for <N>f32](#vectorfloat-for-nf32) [VectorFloat for <N>f64](#vectorfloat-for-nf64)
 
 ## Constants
 
@@ -1057,6 +1057,37 @@ reason stated where they begin.
 | `abs` | `abs(self) -> Self` | The magnitude, with the sign discarded. |
 | `signum` | `signum(self) -> Self` | Which side of zero the value is on, as a value of its own type: `-1`, `0`, or `1`. |
 
+### `VectorFloat`
+
+```sysl
+trait VectorFloat
+    exp(self) -> Self
+    tanh(self) -> Self
+```
+
+The transcendentals a float vector computes lane by lane, written in sysl rather than called.
+
+`v.exp()` and `v.tanh()` are the scalar `Float` methods of the same names in every lane of an
+`<N>f32` or an `<N>f64`, at every width. **There is no libm entry point for a register**, so a
+lane-wise call to `expf` would take the vector apart, make N calls and put it back together; the
+bodies below are instead straight-line arithmetic on the whole register -- a range reduction, a
+polynomial and a scale written on the encoding -- so a loop over them stays a loop of vector
+instructions. Neither body has a branch: the edges (an overflow, an underflow, a NaN, an infinity,
+a negative zero) come out of the same arithmetic, or are chosen by a `select`, in every lane at once.
+
+**Each lane is within one ulp of the C library's scalar answer**, which the tests check over every
+`f32` and over a dense sweep of `f64`. That is as close as two good implementations of a function
+that is not correctly rounded can promise to agree; it is not bit for bit, so a program that needs
+the scalar's exact bits calls the scalar.
+
+They need no C library and allocate nothing, so they are there on a target with neither. A
+half-width lane has no impl: widen it to `f32` first, as the lane-wise square root asks.
+
+| Member | Signature | Description |
+|---|---|---|
+| `exp` | `exp(self) -> Self` | `e` raised to each lane. |
+| `tanh` | `tanh(self) -> Self` | The hyperbolic tangent of each lane: odd, so a negative zero answers itself, and `±1` from where the answer rounds to it. |
+
 ## Implementations
 
 ### Float for bf16
@@ -1179,3 +1210,28 @@ impl MulAdd for f32
 ```sysl
 impl MulAdd for real
 ```
+
+### VectorFloat for <N>f32
+
+```sysl
+impl[const N: usize] VectorFloat for <N>f32
+```
+
+binary32. `exp` reduces `x` to `r = x - k ln 2` with `|r| <= ln 2 / 2`, takes `e^r` from Cephes's
+degree-seven minimax polynomial, and multiplies by `2^k` in two halves, so a `k` too small for one
+normal power of two still scales a normal number and the subnormal answer is rounded only by the
+last multiply. `ln 2` is split in two so that `k ln 2` is subtracted without losing `r`'s digits.
+
+The input is first clamped to `[-104, 89]`: past either end the answer is already zero or an
+infinity, and the clamp keeps `k` inside the exponent field. A NaN passes through the clamp, since
+no comparison is true of it, and every step after it answers a NaN.
+
+### VectorFloat for <N>f64
+
+```sysl
+impl[const N: usize] VectorFloat for <N>f64
+```
+
+binary64: the same reduction and scale, with `e^r` from its Taylor polynomial to the thirteenth
+power (whose remainder is below a hundredth of an ulp on `|r| <= ln 2 / 2`), fdlibm's split of
+`ln 2`, and a clamp of `[-746, 710]`. `tanh` below `0.625` is Cephes's rational form.

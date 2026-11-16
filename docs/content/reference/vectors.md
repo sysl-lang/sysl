@@ -901,7 +901,8 @@ print(m[0], 1.0 / m[1], m[2], m[3])
 ```
 
 That is the step a vector `exp` or `log` is built from: the exponent of a float is a field of its
-encoding, and setting it is a shift and an add on the `<N>u32`.
+encoding, and setting it is a shift and an add on the `<N>u32`. [The library's own
+`exp`](#the-exponential-and-the-hyperbolic-tangent) is built that way.
 
 `from_bits` takes exactly the unsigned vector `bits()` answers, of the same lane count and width; a
 signed or a narrower one is refused, as the scalar's `Word` is the only integer it takes:
@@ -915,6 +916,61 @@ f() -> unit
 
 ```error
 'from_bits' of <4>f32 takes the <4>uint 'bits()' answers, and <4>int was given
+```
+
+## The exponential and the hyperbolic tangent
+
+**`v.exp()` and `v.tanh()`** are the scalar [`Float` methods](/library/math/#float) of the same
+names in every lane of an `<N>f32` or an `<N>f64`, at any width. No machine has an instruction for
+either and no C library has an entry point that takes a register, so they are not the compiler's:
+they are [`sysl.math.VectorFloat`](/library/math/#vectorfloat-exp-and-tanh-across-a-register), an
+`impl` [for every width](#a-trait-for-every-width) written in sysl. Each body is straight-line
+arithmetic on the whole register — a range reduction, a polynomial, and a power of two set on the
+encoding — with no branch and no call per lane, so a loop over them stays a loop of vector
+instructions:
+
+```sysl
+val x: <4>f32 = [0.0, 1.0, -1.0, 100.0]
+val e = x.exp()
+val t = x.tanh()
+
+print(e[0], e[1], e[2], e[3])
+print(t[0], t[1], t[2], t[3])
+
+// The logistic function, at whatever width the caller has.
+sigmoid[const W: usize](v: <W>f32) -> <W>f32 = 0.5 + 0.5 * (0.5 * v).tanh()
+
+val s = sigmoid(<8>f32([-2.0, 0.0, 2.0, 4.0, 0.0, 0.0, 0.0, 0.0]))
+
+print(s[0], s[1], s[2], s[3])
+```
+
+```output
+1 2.7182817 0.36787945 inf
+0 0.7615942 -0.7615942 1
+0.11920291 0.5 0.8807971 0.9820138
+```
+
+**Each lane is within one ulp of the scalar method's answer** — checked over every `f32` and over a
+dense sweep of `f64` — and is exact wherever the answer is: `exp` of either zero is `1`, of `inf` is
+`inf` and of `-inf` is `0`; an answer past the largest finite value is an infinity and one below the
+smallest subnormal is zero, with a subnormal answer rounded once; `tanh` of either zero is that zero,
+of a subnormal is the subnormal, and of an infinity is `±1`; a NaN lane answers a NaN. Where a
+program needs the scalar's exact bits, it calls the scalar; two good implementations of a function
+that is not correctly rounded agree only to the last bit.
+
+Being sysl rather than libm, they need no C library and are there on a target without one. A
+half-width lane has no `impl`, as it has no lane-wise square root: widen it to `f32` first.
+
+```sysl
+val h: <4>f16 = [f16(1.0), f16(2.0), f16(3.0), f16(4.0)]
+
+f() -> unit
+    val e = h.exp()
+```
+
+```error
+type '<4>f16' has no method 'exp'
 ```
 
 ## NaN-propagating maximum and minimum
