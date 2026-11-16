@@ -22,7 +22,16 @@ gen_expr(e: *Emit, x: TExpr) -> Val
         return VNothing
     end if
 
-    gen_expr_kind(e, x)
+    // The expression is where a check made while lowering it says it failed, and the one around
+    // it is again once it is done (`bounds_fail.sysl`'s `report_check`).
+    val outer = e.trap_site
+
+    e.trap_site = Some(x.span)
+
+    val v = gen_expr_kind(e, x)
+
+    e.trap_site = outer
+    v
 end gen_expr
 
 private gen_expr_kind(e: *Emit, x: TExpr) -> Val = *x.kind match
@@ -1272,7 +1281,7 @@ emit_constraint_checks(e: *Emit, v: Val, c: Type)
                     d.lo match
                         Some(lo) ->
                             trap_unless(e, compare_value(e, ">=", wide, x, end_value(lo, quad)),
-                                        "within")
+                                        "within", d.name)
                         None -> ()
 
                     d.hi match
@@ -1280,7 +1289,7 @@ emit_constraint_checks(e: *Emit, v: Val, c: Type)
                             val op = if d.exclusive_hi then "<" else "<="
 
                             trap_unless(e, compare_value(e, op, wide, x, end_value(hi, quad)),
-                                        "within")
+                                        "within", d.name)
                         None -> ()
                 // A fixed-point range is compared on the raw value, each end brought to the scale
                 // inward -- the smallest raw value at or above the lower end, the largest at or below
@@ -1290,7 +1299,7 @@ emit_constraint_checks(e: *Emit, v: Val, c: Type)
                         Some(lo) ->
                             trap_unless(e, compare_value(e, ">=", base, v,
                                                          VInt(fixed_bound_raw(finite_end(lo), frac, FixCeil))),
-                                        "within")
+                                        "within", d.name)
                         None -> ()
 
                     d.hi match
@@ -1302,14 +1311,14 @@ emit_constraint_checks(e: *Emit, v: Val, c: Type)
 
                             trap_unless(e, compare_value(e, op, base, v,
                                                          VInt(fixed_bound_raw(finite_end(hi), frac, mode))),
-                                        "within")
+                                        "within", d.name)
                         None -> ()
                 _ ->
                     d.lo match
                         Some(lo) ->
                             trap_unless(e, compare_value(e, ">=", base, v,
                                                          VInt(decimal_int(finite_end(lo)))),
-                                        "within")
+                                        "within", d.name)
                         None -> ()
 
                     d.hi match
@@ -1318,7 +1327,7 @@ emit_constraint_checks(e: *Emit, v: Val, c: Type)
 
                             trap_unless(e, compare_value(e, op, base, v,
                                                          VInt(decimal_int(finite_end(hi)))),
-                                        "within")
+                                        "within", d.name)
                         None -> ()
 
             d.pred_fn match
@@ -1329,7 +1338,7 @@ emit_constraint_checks(e: *Emit, v: Val, c: Type)
 
                     args.push(ir_arg(lty(e, base), v))
                     emit(e, ir_call(Some(r), l_i1(), VGlobal(pf), args))
-                    trap_unless(e, r, "where")
+                    trap_unless(e, r, "where", d.name)
                 None -> ()
         _ -> ()
 end emit_constraint_checks
@@ -1369,13 +1378,13 @@ private gen_constrained_step(e: *Emit, value: TExpr, c: Type, up: bool) -> Val
                     None -> from_int(0)
                 val last = if d.exclusive_hi then big_sub(h, from_int(1)) else h
 
-                trap_unless(e, compare_value(e, "<", base, v, VInt(last)), "succ")
+                trap_unless(e, compare_value(e, "<", base, v, VInt(last)), "succ", d.name)
             else
                 val first = d.lo match
                     Some(x) -> decimal_int(finite_end(x))
                     None -> from_int(0)
 
-                trap_unless(e, compare_value(e, ">", base, v, VInt(first)), "pred")
+                trap_unless(e, compare_value(e, ">", base, v, VInt(first)), "pred", d.name)
 
             val r = fresh_reg(e)
 
@@ -1575,7 +1584,8 @@ private gen_call(e: *Emit, name: string, args: Buf[TExpr], ty: Type, span: Span)
         // **An `extern` of `sysl_bounds_fail` -- the library's container reports -- reaches the
         // function every compiler check reports through**, so the module holds the weak default as a
         // module with a check does, and the default is the declaration (`declares`).
-        if symbol == bounds_fail_symbol()
+        // `sysl_trap` -- the library's panic -- is held the same way.
+        if symbol == bounds_fail_symbol() || symbol == trap_hook_symbol()
             e.traps = true
             e.bounds_fails = true
 

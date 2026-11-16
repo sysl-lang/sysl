@@ -8,12 +8,12 @@ module sysl
  * where the moment is. A function whose fifth statement has just computed something it can verify has
  * no contract to hang that on -- the contract was about the arguments, four statements ago.
  *
- * Both stop the program the way `unwrap` does: a line naming what happened, then the hosted exit that
- * `11-error-handling.md` gives a trap under the `os` capability. That is deliberately not
- * `llvm.trap`. A trap is what the compiler emits for a check the *language* makes -- a bounds
- * violation, a broken contract -- and it stops with a signal and no message, because there is nothing
- * it could say that the source line does not already. These are checks a *program* makes, about
- * things it knows and the compiler does not, so the message is the whole point of them.
+ * Both stop the program the way `unwrap` does: a line on standard error naming what happened and
+ * where, then `abort` (below, at `panic_begin`). That is deliberately not `llvm.trap`. A trap is
+ * what the compiler emits for a check the *language* makes -- a bounds violation, a broken contract
+ * -- and its one line says which check it was, since the source line says the rest. These are checks
+ * a *program* makes, about things it knows and the compiler does not, so the message is the whole
+ * point of them. Every one of them, trap or panic, is reported through the `sysl_trap` hook first.
  *
  * **`trap` is that same instruction, for a program that wants it.** Use it where there is nothing
  * to say or nowhere to say it -- a bare-metal `abort`, a fault handler that must not print, a path
@@ -91,9 +91,88 @@ private extern "sysl_bounds_fail" bounds_report(kind: u32, a: usize, b: usize, n
  */
 @track_caller
 panic(msg: string, file: string = "", line: long = 0) -> never
-    prints("panic: ")
-    prints(msg)
-    report_tail(file, line)
+    panic_begin()
+    panic_says(msg)
+    report_tail(file, line, msg)
+
+// -- how a panic is written, and how it stops --------------------------------------------------------
+//
+// **A panic is written to standard error and stops the program with `abort`**, on a hosted target,
+// whatever was built -- a program, a test, or a library a C host links (`sysl build-c`). Standard
+// error because a panic is a diagnostic, and a program whose output another reads must not have one
+// land in the middle of its answer. `abort` rather than `exit(1)` because a failure is not a way of
+// finishing: `exit` runs every `atexit` handler and every C++ static destructor in the process --
+// the host's, where sysl is a library inside it -- against a state the panic has just said is wrong,
+// which is the reason a trap runs no `defer` (`reference/errors.md § Traps`). What the program had
+// printed is flushed first, so it still comes out before the panic line; the process then ends by
+// SIGABRT, which a shell reports as status 134.
+//
+// **Before it stops, the panic is reported through `sysl_trap`**, the hook every compiler check
+// reports through, with the message's bytes and count and the location: a host or a board that
+// overrides the hook to log failures logs panics too. The default does nothing with a panic, whose
+// report is already written. A target with no operating system writes the report through `putchar`,
+// as everything it prints goes, and stops with `exit(1)`, which its board supplies.
+
+// The hook, as the compiler's checks call it (`bounds_fail.sysl`); a panic is its form 21.
+private extern "sysl_trap" trap_report(kind: u32, a: usize, b: usize, n: usize, at: *u8)
+
+private const TrapPanic: u32 = 21
+
+private extern "abort" c_abort() -> never
+
+// The start of every panic's report: what the program printed so far, out first, then the word.
+private[sysl] panic_begin()
+#if hosted
+    flush()
+#endif
+    panic_says("panic: ")
+end panic_begin
+
+// Where a panic's report is written: standard error, or `putchar` where there is no operating system.
+private[sysl] panic_put(b: []const u8)
+#if hosted
+    eputbytes(b)
+#else
+    putbytes(b)
+#endif
+end panic_put
+
+private[sysl] panic_says(s: string) = panic_put(s.bytes)
+
+private[sysl] panic_int(n: long)
+    var buf: [24]u8
+    val at = digits_long(n, buf[0..<24])
+    panic_put(buf[at..<24])
+
+private[sysl] panic_uint(n: ulong)
+    var buf: [24]u8
+    val at = digits_ulong(n, buf[0..<24])
+    panic_put(buf[at..<24])
+
+// The same stream as a `Writer`, for a value a report shows through its own `Debug`.
+private[sysl] panic_out() -> *Writer
+#if hosted
+    stderr()
+#else
+    stdout()
+#endif
+end panic_out
+
+/** The end of every panic, its report written: the hook told, then the stop. `msg` is the panic's
+ * own words, which an override is handed, and `at` the location, or null.
+ */
+@noinline
+@cold
+private[sysl] panic_stop(msg: string, at: *u8) -> never
+    val text = if msg.len == 0 then usize(0) else usize(&msg.bytes[0])
+
+    trap_report(TrapPanic, text, msg.len, 0, at)
+#if hosted
+    c_abort()
+#else
+    exit(1)
+#endif
+end panic_stop
 
 /** The condition is checked and nothing else is: a false one names where it was written, and the
  * message if it was given one.
@@ -125,41 +204,61 @@ assert(cond: bool, msg: string = "", file: string = "", line: long = 0)
  * building one.
  */
 private[sysl] report_head(msg: string)
-    prints("panic: ")
+    panic_begin()
 
     if msg.len > 0 then
-        prints(msg)
-        prints(": ")
+        panic_says(msg)
+        panic_says(": ")
 
 //
 // The tail names `file:line` where the caller gave one, and otherwise the line that called the
-// tracked assertion -- nothing at all where the build laid no location down.
+// tracked assertion -- nothing at all where the build laid no location down. The hook is handed the
+// same place: the caller's own `file:line`, composed into storage on the stack, which lasts until
+// the program stops.
 @track_caller
-private[sysl] report_tail(file: string, line: long) -> never
+private[sysl] report_tail(file: string, line: long, msg: string) -> never
     if file.len > 0
-        prints(" (")
-        prints(file)
-        prints(":")
-        printi(line)
-        prints(")")
-    else
-        val loc = caller_location()
+        var place: [256]u8
+        var n: usize = 0
 
-        if loc.known()
-            prints(" (")
-            putbytes(loc.file_bytes())
-            prints(":")
-            printu(ulong(loc.line()))
-            prints(")")
+        for b in file.bytes
+            if n < 230
+                place[n] = b
+                n += 1
+
+        place[n] = u8(':')
+        n += 1
+
+        var digits: [24]u8
+        val at = digits_long(line, digits[0..<24])
+
+        for i in at..<24
+            place[n] = digits[i]
+            n += 1
+
+        place[n] = 0
+        panic_says(" (")
+        panic_put(place[0..<n])
+        panic_says(")\n")
+        panic_stop(msg, &place[0])
     end if
 
-    prints("\n")
-    exit(1)
+    val loc = caller_location()
+
+    if loc.known()
+        panic_says(" (")
+        panic_put(loc.file_bytes())
+        panic_says(":")
+        panic_uint(ulong(loc.line()))
+        panic_says(")")
+
+    panic_says("\n")
+    panic_stop(msg, loc.at)
 end report_tail
 
 // Each side of a failed comparison is shown through its `Debug`, which every type has: a string
 // keeps its quotes, so `got "1", want 1` cannot read as two equal values.
-private[sysl] show[T: Debug](v: T) = v.debug(stdout(), FormatSpec(0, -1, false))
+private[sysl] show[T: Debug](v: T) = v.debug(panic_out(), FormatSpec(0, -1, false))
 
 /** `got` and `want` in that order, which is Go's and the order a failure is read in: what happened,
  * then what was meant to.
@@ -168,11 +267,11 @@ private[sysl] show[T: Debug](v: T) = v.debug(stdout(), FormatSpec(0, -1, false))
 assert_eq[T: Eq + Debug](got: T, want: T, msg: string = "", file: string = "", line: long = 0)
     if got != want then
         report_head(msg)
-        prints("got ")
+        panic_says("got ")
         show(got)
-        prints(", want ")
+        panic_says(", want ")
         show(want)
-        report_tail(file, line)
+        report_tail(file, line, msg)
 
 /** The same for a slice, which needs more than `==` to be useful: a report saying two slices differ
  * sends its reader to find out where, and finding out where is a loop nobody wants to write at each
@@ -183,19 +282,19 @@ assert_slice_eq[T: Eq + Debug](got: []const T, want: []const T, msg: string = ""
                                file: string = "", line: long = 0)
     if got.len != want.len then
         report_head(msg)
-        prints("got ")
-        printu(ulong(got.len))
-        prints(" elements, want ")
-        printu(ulong(want.len))
-        report_tail(file, line)
+        panic_says("got ")
+        panic_uint(ulong(got.len))
+        panic_says(" elements, want ")
+        panic_uint(ulong(want.len))
+        report_tail(file, line, msg)
 
     for i in 0..<got.len
         if got[i] != want[i] then
             report_head(msg)
-            prints("got ")
+            panic_says("got ")
             show(got[i])
-            prints(", want ")
+            panic_says(", want ")
             show(want[i])
-            prints(" at index ")
-            printu(ulong(i))
-            report_tail(file, line)
+            panic_says(" at index ")
+            panic_uint(ulong(i))
+            report_tail(file, line, msg)

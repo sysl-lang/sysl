@@ -165,13 +165,15 @@ Because they are written in sysl, the compiler does not need to know every way a
 unwrap(self) -> T = self match
     Some(v) -> v
     None ->
-        print("panic: unwrap of a None value")
-        exit(1)
+        eprints("panic: unwrap of a None value\n")
+        abort()
 ```
 
-Two features make this ordinary code. A diverging arm has the type `never`, so `exit(1)` can sit
+Two features make this ordinary code. A diverging arm has the type `never`, so `abort()` can sit
 beside `Some(v) -> v` and the `match` still has the payload's type. And stopping is a plain call: the
-library declares `exit(code: int) -> never` as an `extern`.
+library declares C's `abort() -> never` as an `extern`. (The library's own version also names the
+line that called `unwrap`, and tells the [`sysl_trap`
+hook](/reference/errors/#reporting-a-failure-to-an-embedder-sysl-trap) first.)
 
 ## `defer`: releasing what reference counting does not
 
