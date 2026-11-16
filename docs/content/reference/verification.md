@@ -531,6 +531,14 @@ is a slot in the callee's frame. Nor is an argument the call can change under th
 read out of a global, or a local whose address the same call was handed, is not the value the promise
 was made about.
 
+**A clause that puts an index below a view's length also says the view has storage.** `i < xs.len`
+cannot hold of an empty view, and a view of one element or more points into a buffer, an array or a
+literal, never at address zero, so the view's storage pointer is assumed not to be null beside the
+clause. What that buys is the pointer read again after the call: `Buf.push` grows behind a call whose
+promise is `count < elems.len`, so an append loop keeps the storage pointer in a register with the
+count and the capacity rather than loading it for every element. A clause written with `<=` or `>=`
+allows an empty view and says nothing about its storage.
+
 **A precondition is not assumed at a function's own entry, because there is nothing to add.** A
 `require` traps before the body runs, so its branch dominates everything below it and the optimizer
 already reads it as a fact about the values it tested; a subscript that the precondition covers folds
