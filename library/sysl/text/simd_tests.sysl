@@ -236,6 +236,36 @@ sut_straddle()
                 assert_eq(utf8_error_of(b.view()), Some(Utf8Error(q, false)))
                 b[q] = keep
 
+// A block that fails the ASCII test is entered at its first high byte, so the walk's starting point
+// moves by the block's ASCII prefix. Text with an accent every few bytes fails nearly every block
+// and grows the stretch walked between tests; a long accented run before ASCII grows it further.
+@test("accent-dense text, and ASCII after a long accented run, report a bad byte at every offset")
+sut_accent_dense()
+    val dense = "Größere Bäume über die Straße fühlen sich schön an, für Müller. ".bytes
+    var b: Buf[u8] = buf()
+
+    for _ in 0..<3 do for c in dense do b.push(c)
+    for _ in 0..<40 do for c in "ü".bytes do b.push(c)
+    for _ in 0..<40 do b.push(u8('a'))
+    for c in "é".bytes do b.push(c)
+    for _ in 0..<20 do b.push(u8('z'))
+
+    assert(from_utf8(b.view()).is_ok())
+
+    for q in 0..<b.len()
+        val keep = b[q]
+
+        b[q] = 0xFF
+        assert(utf8_error_of(b.view()).is_some())
+        assert_eq(utf8_error_of(b.view()), scalar_utf8(b.view()))
+        b[q] = keep
+
+        // Cut just after a lead byte, the character is truncated where it starts.
+        if keep >= 0xC0 then
+            val s = b.view()[0..<(q + 1)]
+
+            assert_eq(utf8_error_of(s), Some(Utf8Error(q, true)))
+
 @test("random bytes: from_utf8 agrees with a scalar walk on every input")
 sut_random()
     var g = rng(20261114, 11)
