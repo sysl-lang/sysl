@@ -2334,7 +2334,10 @@ an 'if const' is decided while compiling, so its condition has to be known then
 ```
 
 A generic body is also checked once before any instance, for what does not depend on its parameters.
-That check reads neither arm of an `if const`; each instance reads the arm it takes.
+That check reads neither arm of an `if const`; each instance reads the arm it takes. A
+[`const` function](/reference/declarations/)'s promise is held the same way: the arm an instance
+takes is refused there if it cannot run while compiling, and an arm no instance takes may hold
+anything.
 
 ### Every constant position reads the same expressions
 

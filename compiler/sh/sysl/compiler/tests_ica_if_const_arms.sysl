@@ -1,0 +1,419 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+
+// **What an `if const` condition reads, and what a `const` function promises of the arm an instance
+// takes.** `&&` and `||` decide from their left operand where it settles the answer, so the right is
+// not typed at an instance the left already rules out -- the guard a nested `if const` gives its arm.
+// And a generic `const` function's arms are read per instance, never with the generic, so the arm
+// an instance takes is held to the promise there: a non-const operation in it is refused with the
+// diagnostic a plain body gets, the arm it does not take may hold anything, and a `val` over a call
+// that does run is laid down as data. Each accepted program is built and run.
+
+private ica_outcome(text: string) -> (string, bool) = enm_outcome(text)
+
+// A refusal carries this message, anchored at this `line:column` of `main.sysl`.
+private ica_refused(text: string, message: string, at: string)
+    val out = ica_outcome(text)
+
+    assert(!out.1, out.0)
+    assert(out.0.contains(s"error: $message\n"), out.0)
+    assert(out.0.contains(s"/main.sysl:$at\n"), out.0)
+end ica_refused
+
+private ica_g(rest: string) -> string = s"'g' is 'const', so it runs while compiling, and $rest"
+
+private ica_outside() -> string = "nothing outside the program exists while compiling"
+
+private ica_prints() -> string = s"it prints, which is outside the program — ${ica_outside()}"
+
+private ica_bound(f: string, ty: string) -> string =
+    s"'$f' requires its type parameter 'T' to implement 'Integer', but $ty does not"
+
+// A function bounded `T: Integer`, which an `if const` operand may call only behind the test.
+private ica_wide() -> string = "wide[T: Integer]() -> bool = sizeof(T) > 4\n\n"
+
+// -- `&&`, `||` and `!` in the condition -------------------------------------------------------------
+
+@test("the reduction: 'T: Integer && f[T]()' is not typed past the test at a T it refuses")
+ica_and_guards_its_right()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        f[T: Integer]() -> bool = true
+        g[T]() -> bool = if const T: Integer && f[T]() then true else false
+
+        main()
+            print(g[bool](), g[int](), g[u8]())
+        """), "false true true\n")
+end ica_and_guards_its_right
+
+@test("'||' decides from a true left, '!' turns the test round, and the right is read where it decides")
+ica_or_and_not()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(ica_wide() + raw"""
+        a[T]() -> int = if const !(T: Integer) || wide[T]() then 1 else 2
+        b[T]() -> int = if const T: Display || wide[T]() then 1 else 2
+        c[T]() -> int = if const !(T: Integer && wide[T]()) then 1 else 2
+
+        struct Pin
+            on: bool
+
+        main()
+            print(a[bool](), a[u64](), a[u8]())
+            print(b[int](), b[string]())
+            print(c[Pin](), c[u64](), c[u16]())
+        """), "1 1 2\n1 1\n1 2 1\n")
+end ica_or_and_not
+
+@test("nested '&&' and '||', and an 'elif const' guarded the same way")
+ica_nested_combinations()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(ica_wide() + raw"""
+        narrow[T: Integer]() -> bool = sizeof(T) == 1
+
+        d[T]() -> int = if const T: Integer && (wide[T]() || narrow[T]()) then 1 else 2
+        e[T]() -> int = if const (T: Integer && wide[T]()) || (T: Integer && narrow[T]()) then 1 else 2
+
+        f[T]() -> string
+            if const T: Integer && wide[T]()
+                "wide"
+            elif const T: Integer && narrow[T]()
+                "narrow"
+            elif const !(T: Integer) || false
+                "other"
+            else
+                "mid"
+
+        main()
+            print(d[bool](), d[u64](), d[u8](), d[u16]())
+            print(e[bool](), e[i64](), e[i8](), e[i32]())
+            print(f[u64](), f[u8](), f[bool](), f[u16]())
+        """), "2 1 1 2\n2 1 1 2\nwide narrow other mid\n")
+end ica_nested_combinations
+
+@test("where the left does not settle it the right is typed, and a call it cannot make is still refused")
+ica_the_right_is_read_where_it_decides()
+    if !enm_ready() then return
+
+    ica_refused(raw"""
+        f[T: Integer]() -> bool = true
+        g[T]() -> bool = if const T: Display && f[T]() then true else false
+
+        main()
+            print(g[bool]())
+        """, ica_bound("f", "bool"), "2:42")
+
+    ica_refused(raw"""
+        f[T: Integer]() -> bool = true
+        g[T]() -> bool = if const false || f[T]() then true else false
+
+        main()
+            print(g[bool]())
+        """, ica_bound("f", "bool"), "2:37")
+end ica_the_right_is_read_where_it_decides
+
+// -- the arm an instance takes keeps the promise -----------------------------------------------------
+
+@test("the reduction: an arm the instance takes that prints is refused, as a plain body's would be")
+ica_the_taken_arm_is_checked()
+    if !enm_ready() then return
+
+    ica_refused(raw"""
+        const g[T](x: int) -> int
+            if const sizeof(T) == 4
+                print(x)
+                x
+            else
+                x + 1
+
+        main()
+            print(g[u32](1))
+        """, ica_g(ica_prints()), "3:9")
+end ica_the_taken_arm_is_checked
+
+@test("an arm no instance takes may hold what cannot run, and the program runs")
+ica_the_arm_not_taken_is_not_checked()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        extern "abs" c_abs(x: i32) -> i32
+
+        const g[T](x: i32) -> i32
+            if const sizeof(T) == 4
+                print(x)
+                c_abs(x)
+            else
+                x + 1
+
+        main()
+            print(g[u8](1), g[u16](-3))
+        """), "2 -2\n")
+end ica_the_arm_not_taken_is_not_checked
+
+// The three-arm chain with `bad` in arm `k` (0 the `if`, 1 the `elif`, 2 the `else`), called at `ty`.
+private ica_chain(k: int, bad: string, ty: string) -> string
+    val arms = [if k == 0 then bad else "x + 1", if k == 1 then bad else "x + 2", if k == 2 then bad else "x + 3"]
+
+    "extern \"abs\" c_abs(x: i32) -> i32\n\n" +
+    "const g[T](x: i32) -> i32\n" +
+    "    if const sizeof(T) == 1\n        " + arms[0] + "\n" +
+    "    elif const sizeof(T) == 2\n        " + arms[1] + "\n" +
+    "    else\n        " + arms[2] + "\n\n" +
+    "main()\n    print(g[" + ty + "](1))\n"
+end ica_chain
+
+@test("the 'if', the 'elif' and the 'else' arm are each checked where an instance takes them")
+ica_every_arm_of_a_chain()
+    if !enm_ready() then return
+
+    val takes = ["u8", "u16", "u32"]
+    val other = ["u32", "u8", "u16"]
+    val shown = ["2", "3", "4"]
+    val lines = ["5:9", "7:9", "9:9"]
+
+    for k in 0..<3
+        ica_refused(ica_chain(k, "c_abs(x)", takes[k]),
+                    ica_g(s"it calls 'c_abs', which is outside the program — ${ica_outside()}"), lines[k])
+
+        // The same program at an instance that takes another arm builds and runs.
+        assert_eq(enm_ran(ica_chain(k, "c_abs(x)", other[k])), shown[(k + 2) % 3] + "\n")
+end ica_every_arm_of_a_chain
+
+@test("a pointer read as a number, and an 'asm' block, in the arm taken are refused in the plain body's words")
+ica_other_refusals_in_an_arm()
+    if !enm_ready() then return
+
+    ica_refused(raw"""
+        const g[T](p: *int) -> usize
+            if const sizeof(T) == 1
+                usize(p)
+            else
+                0
+
+        main()
+            var x = 1
+            print(g[u8](&x))
+        """, ica_g("it converts a pointer — an address exists only when the program runs"), "3:9")
+
+    ica_refused(raw"""
+        const g[T](x: int) -> int
+            if const sizeof(T) == 1
+                asm
+                    [aarch64, x86_64, riscv64, riscv32, thumb] "nop"
+                x
+            else
+                x
+
+        main()
+            print(g[u8](1))
+        """, ica_g(s"it holds an 'asm' block, which is outside the program — ${ica_outside()}"), "3:9")
+end ica_other_refusals_in_an_arm
+
+@test("an unmarked function the arm calls is followed down to what stops it")
+ica_an_unmarked_callee_in_the_arm()
+    if !enm_ready() then return
+
+    ica_refused(raw"""
+        noisy(x: int) -> int
+            print(x)
+            x
+
+        const g[T](x: int) -> int
+            if const T: Integer
+                noisy(x)
+            else
+                x
+
+        main()
+            print(g[int](1))
+        """, ica_g("it calls 'noisy', which prints, which is outside the program — " + ica_outside()), "7:9")
+end ica_an_unmarked_callee_in_the_arm
+
+@test("a const function reaching another through an 'if const' holds each to its own promise")
+ica_const_calls_const_through_an_arm()
+    if !enm_ready() then return
+
+    // The inner one's arm is refused in its own name, where the outer's instance reaches it.
+    ica_refused(raw"""
+        const inner[T](x: int) -> int
+            if const sizeof(T) == 4
+                print(x)
+                x
+            else
+                x * 2
+
+        const g[T](x: int) -> int
+            if const T: Integer
+                inner[T](x) + 1
+            else
+                0
+
+        main()
+            print(g[int](1))
+        """, "'inner' is 'const', so it runs while compiling, and " + ica_prints(), "3:9")
+
+    // Where both arms reached can run, both instances run, and fold.
+    assert_eq(enm_ran(raw"""
+        const inner[T](x: int) -> int
+            if const sizeof(T) == 4
+                x * 10
+            else
+                print(x)
+                x
+
+        const g[T](x: int) -> int
+            if const T: Integer
+                inner[T](x) + 1
+            else
+                0
+
+        val K: int = g[int](4)
+
+        main()
+            print(K, g[bool](4))
+        """), "41 0\n")
+end ica_const_calls_const_through_an_arm
+
+@test("a generic method marked 'const' is held to the arm its instance takes")
+ica_a_const_method()
+    if !enm_ready() then return
+
+    ica_refused(raw"""
+        struct Box
+            n: int
+
+            const get[T](self) -> int
+                if const sizeof(T) == 1
+                    print(self.n)
+                    self.n
+                else
+                    self.n + 1
+
+        main()
+            print(Box(3).get[u8]())
+        """, "'Box.get' is 'const', so it runs while compiling, and " + ica_prints(), "6:13")
+end ica_a_const_method
+
+@test("a body with no generic decides its 'if const' once, as before: the arm taken is checked, the other not")
+ica_a_plain_body_is_unchanged()
+    if !enm_ready() then return
+
+    ica_refused(raw"""
+        const K: int = 3
+
+        const f(x: int) -> int
+            if const K > 2
+                print(x)
+                x
+            else
+                x + 1
+
+        main()
+            print(f(1))
+        """, "'f' is 'const', so it runs while compiling, and " + ica_prints(), "5:9")
+
+    assert_eq(enm_ran(raw"""
+        const K: int = 1
+
+        const f(x: int) -> int
+            if const K > 2
+                print(x)
+                x
+            else
+                x + 1
+
+        main()
+            print(f(1))
+        """), "2\n")
+end ica_a_plain_body_is_unchanged
+
+// -- what folds stays data ---------------------------------------------------------------------------
+
+// An archive for a machine, as `build-c` makes one: the first thing the compilation had to say, or the
+// LLVM text it lowered to (`tests_cfe_const_eval.sysl`'s harness).
+private ica_archive(text: string, target: string) -> string
+    val t = target_named(target)
+
+    if t.is_none() then return s"there is no target '$target'"
+
+    var units: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> return "skipped"
+        Ok(root) -> std_units(root, t.unwrap()) match
+            Err(_) -> return "skipped"
+            Ok(read) -> units = read
+
+    val parsed = parse(source_of("main.sysl", forms_imported(text)), t.unwrap())
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    units.push(parsed.program)
+
+    val done = analyze_produced(units, t.unwrap(), buf(), false)
+
+    for item in done.reported
+        if !item.src.name.starts_with("library/") then return item.diag.message
+
+    val whole = program_of(done, done.main_module) with { entry_point = false, c_artifact = true }
+    var own: Buf[string] = buf()
+
+    own.push("")
+
+    val pr = post_analysis_checks(done.an, whole, own)
+
+    for item in done.an.diagnostics()
+        if !item.src.name.starts_with("library/") then return item.diag.message
+
+    ir_print_module(codegen_with_gaps(prune(strip_tests(whole), own), t.unwrap(), pr).0)
+end ica_archive
+
+private ica_folds() -> string = raw"""
+    extern "abs" c_abs(x: i32) -> i32
+
+    const pick[T](x: i32) -> i32
+        if const sizeof(T) == 1
+            x + 1
+        elif const sizeof(T) == 2
+            c_abs(x)
+        else
+            x * 3
+
+    val A: i32 = pick[u8](4)
+    val B: i32 = pick[u32](5)
+
+    """
+
+@test("two instances taking different arms each fold, and a freestanding archive lays both down as data")
+ica_two_instances_fold_to_data()
+    if !enm_ready() then return
+
+    val out = ica_archive(ica_folds() + "@export(\"main\")\nmain_entry() -> i32 = A + B\n",
+                          "thumb-freestanding-softfp")
+
+    if out == "skipped" then return
+
+    assert(out.contains("@A = private constant i32 5\n"), out)
+    assert(out.contains("@B = private constant i32 15\n"), out)
+    assert(!out.contains("llvm.global_ctors"), out)
+
+    assert_eq(enm_ran(ica_folds() + "main()\n    print(A, B)\n"), "5 15\n")
+end ica_two_instances_fold_to_data
+
+@test("and the instance taking the arm that cannot run is refused at the arm, not computed at startup")
+ica_the_arm_that_cannot_run_is_refused_for_the_archive()
+    if !enm_ready() then return
+
+    val out = ica_archive(ica_folds() + "val C: i32 = pick[u16](6)\n\n" +
+                          "@export(\"main\")\nmain_entry() -> i32 = A + B + C\n", "thumb-freestanding-softfp")
+
+    if out == "skipped" then return
+
+    assert_eq(out, "'pick' is 'const', so it runs while compiling, and it calls 'c_abs', which is outside " +
+                   s"the program — ${ica_outside()}")
+end ica_the_arm_that_cannot_run_is_refused_for_the_archive

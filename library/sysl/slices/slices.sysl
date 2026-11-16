@@ -218,16 +218,20 @@ const swap[T](xs: []T, i: usize, j: usize)
  * **A slice of 8-, 16-, 32- or 64-bit integers moves a vector register's worth from each end at a
  * time**, turning each block's lanes around on the way, and finishes the middle one element at a
  * time. LLVM leaves a two-ended swap scalar at every element type -- clang does the same with the C
- * loop -- so the blocks are written out rather than left to the optimiser. Every other element type
- * takes the element loop, a counted one included, so what is written and in what order is the same
- * as before for it. The answer is the same either way, and both paths fold where a constant asks for
- * one.
+ * loop -- so the blocks are written out rather than left to the optimiser. They start at 64 bytes,
+ * where the block loop runs at least twice; a shorter slice costs less by elements than the blocks'
+ * setup saves. Every other element type takes the element loop, a counted one included, so what is
+ * written and in what order is the same as before for it. The answer is the same either way, and
+ * both paths fold where a constant asks for one.
  */
 const reverse[T](xs: []T)
     if const in_lanes[T]()
-        reverse_blocks[T, 16 / sizeof(T)](xs)
+        if xs.len >= 64 / sizeof(T)
+            reverse_blocks[T, 16 / sizeof(T)](xs)
+        else
+            reverse_ends(xs)
     else
-        reverse_between(xs, 0, xs.len)
+        reverse_ends(xs)
 
 // Whether `T` is an integer of 8, 16, 32 or 64 bits, so that a vector of it is laid out exactly as
 // the slice is. A width short of its storage (`u12`, `i24`) loses the storage's top bit when wrapped
@@ -253,13 +257,14 @@ private const reverse_blocks[T: Integer, const W: usize](xs: []T)
         i += W
         j -= W
 
-    reverse_between(xs, i, j)
+    reverse_ends(xs[i..<j])
 
-// The elements from `from` up to `to` turned around, walking in from both ends.
-private const reverse_between[T](xs: []T, from: usize, to: usize)
-    if to - from > 1
-        var i = from
-        var j = to - 1
+// The elements turned around, walking in from both ends. Counted from the slice's own start and
+// length, so the optimiser sees every index in range from the one comparison the loop makes.
+private const reverse_ends[T](xs: []T)
+    if xs.len > 1
+        var i: usize = 0
+        var j = xs.len - 1
 
         while i < j
             swap(xs, i, j)

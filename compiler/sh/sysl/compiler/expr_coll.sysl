@@ -702,15 +702,59 @@ end slice_expr
 // drop of the container -- the rule a view of part of an element of a view already has. The walk
 // follows the steps a view of an array can sit at the end of, a field and a subscript, down to the
 // first subscript `IndexPlace` reads; `None` where there is none, and the receiver is read as written.
-private viewed_through_storage(cx: &Analyzer, receiver: Expr) -> Option[Expr] = *receiver.kind match
-    Field(r, name, at) -> viewed_through_storage(cx, r).map(x -> expr(receiver.span, Field(x, name, at)))
+//
+// **The walk stops where a step leaves the element's storage.** A view of a `*T`, a `&[N]T`, a slice
+// or a string views what that value leads to, not the bytes of the element holding it, so
+// `c[i].data[0..<n]` with `data: *u8` is read as written; so is a step through a pointer field
+// (`c[i].p.cells[..]`), whose field lives in the pointee.
+private viewed_through_storage(cx: &Analyzer, receiver: Expr) -> Option[Expr]
+    if !steps_to_subscript(receiver) || !stored_in_place(cx, receiver, true) then return None
+
+    storage_walk(cx, receiver)
+
+// Whether the receiver is a chain of fields and subscripts with a subscript (not a range) in it --
+// the only shape the walk can rewrite, asked before anything is typed.
+private steps_to_subscript(e: Expr) -> bool = *e.kind match
+    Field(r, _, _) -> steps_to_subscript(r)
+    Index(_, index, _) -> *index.kind match
+        RangeExpr(_, _, _) -> false
+        _ -> true
+    _ -> false
+
+// Whether a value of `e`'s type is held in the storage `e` is read from, so a view of it (`whole`) or a
+// step into it is a view of that storage. A pointer, a reference, a view and a string hold only the
+// way to their elements; a struct is a step's storage but is not itself what a view is taken of. A
+// type not settled is left to the walk, as it was.
+private stored_in_place(cx: &Analyzer, e: Expr, whole: bool) -> bool
+    val tried = begin_trial(cx)
+    val t = type_expr_bare(cx, e)
+
+    discard_trial(cx, tried)
+
+    repr(texpr_type(t)) match
+        Ptr(_) -> false
+        Ref(_, _) -> false
+        Weak(_) -> false
+        Slice(_, _) -> false
+        Str -> false
+        Struct(_) -> !whole
+        _ -> true
+end stored_in_place
+
+private storage_walk(cx: &Analyzer, receiver: Expr) -> Option[Expr] = *receiver.kind match
+    Field(r, name, at) ->
+        if !stored_in_place(cx, r, false) then return None
+
+        storage_walk(cx, r).map(x -> expr(receiver.span, Field(x, name, at)))
     Index(r, index, open) ->
         *index.kind match
             RangeExpr(_, _, _) -> return None
             _ -> ()
 
         if !subscripted_in_place(cx, r)
-            return viewed_through_storage(cx, r).map(x -> expr(receiver.span, Index(x, index, open)))
+            if !stored_in_place(cx, r, false) then return None
+
+            return storage_walk(cx, r).map(x -> expr(receiver.span, Index(x, index, open)))
 
         var one: Buf[Expr] = buf()
 

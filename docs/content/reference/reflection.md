@@ -799,6 +799,23 @@ print(describe[int](), describe[string](), describe[Pin]())
 named displayable plain
 ```
 
+**`&&` and `||` decide from their left operand where it settles the answer, and the right is then
+not read**, as at run time it is not run. So a test guards an operand that depends on it, the way a
+nested `if const` guards its arm: at a type the test refuses, a call that needs the bound is never
+checked.
+
+```sysl
+wide[T: Integer]() -> bool = sizeof(T) > 4
+
+size[T]() -> string = if const T: Integer && wide[T]() then "wide" else "narrow or not a number"
+
+print(size[u64](), size[u8](), size[bool]())
+```
+
+```output
+wide narrow or not a number narrow or not a number
+```
+
 ## Annotations
 
 **A program may declare an annotation: a struct written under `@annotation`**, whose fields are the

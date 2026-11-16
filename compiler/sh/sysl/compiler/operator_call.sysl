@@ -473,7 +473,8 @@ end agreed_operand
 // `a * b` is `Mul::mul(a, b)`, so the operand is an argument and selects the way an argument does,
 // by the one rule a method call's argument is chosen by (`expr_call.sysl`'s `narrowed_at`): an
 // implementation written at its own type is meant where there is one; otherwise, among those it
-// reaches by widening, a bare integer literal prefers the narrowest signed integer at least as wide as
+// reaches -- by widening, or for a bare literal by being readable at the type, as `2` is an `f32`
+// that no `int` widens to -- a bare integer literal prefers the narrowest signed integer at least as wide as
 // `int`, a typed operand the narrowest right-hand type, and a literal failing both the implementation
 // at its default type (`literal_default_at`). Where none is reached the operand is handed back as it
 // came, for the dispatch to diagnose. **Where several are reached and the rule leaves more than one,
@@ -500,12 +501,13 @@ widened_operand(cx: &Analyzer, span: Span, op: string, subject: Type, t: TExpr,
     val heads = subject match
         Abstract(_, bounds) -> bound_heads(a, tr_name, subject, bounds, d.unwrap())
         _ -> impl_heads(a, tr_name, subject, d.unwrap())
+    val literal = written.is_some() && is_literal(written.unwrap())
     var reached: Buf[Type] = buf()
 
     for h in heads
         if type_eq(h, got) then return t
 
-        if implicitly_widens(got, h)
+        if implicitly_widens(got, h) || (literal && literal_fits(cx, written.unwrap(), h))
             var seen = false
 
             for r in reached
@@ -515,7 +517,7 @@ widened_operand(cx: &Analyzer, span: Span, op: string, subject: Type, t: TExpr,
         end if
 
     if reached.is_empty() then return t
-    if reached.len() == 1 then return widened(t, Some(reached[0]))
+    if reached.len() == 1 then return operand_at(cx, t, written, literal, reached[0])
 
     var declared: Buf[usize] = buf()
     var generic: Buf[bool] = buf()
@@ -537,7 +539,7 @@ widened_operand(cx: &Analyzer, span: Span, op: string, subject: Type, t: TExpr,
 
     val chosen = narrowed_at(declared, generic, fitted, args, natural)
 
-    if chosen.len() == 1 then return widened(t, Some(reached[chosen[0]]))
+    if chosen.len() == 1 then return operand_at(cx, t, written, literal, reached[chosen[0]])
 
     var shown: Buf[string] = buf()
 
@@ -549,6 +551,12 @@ widened_operand(cx: &Analyzer, span: Span, op: string, subject: Type, t: TExpr,
              s"and the operands do not say which was meant — it implements ${conjoin(shown)}")
     bad_expr(t.span)
 end widened_operand
+
+// The operand read at the right-hand type of the implementation it selected: a bare literal is read
+// at that type afresh, as an argument would be -- `2` over `Mul[f32]` is an `f32` two, where no
+// widening reaches from the `int` it was first read as -- and a typed operand is converted to it.
+private operand_at(cx: &Analyzer, t: TExpr, written: Option[Expr], literal: bool, at: Type) -> TExpr =
+    if literal then type_expr(cx, written.unwrap(), Some(at)) else widened(t, Some(at))
 
 // Whether an operator's trait takes the right-hand type as an argument, so that the right operand
 // selects among implementations -- the arithmetic traits, and not `Eq`, `Ord` or the prefix ones.
