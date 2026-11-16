@@ -1,0 +1,427 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.cstring
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **A body's own value is walked by escape analysis as one more of its statements.** A body that ends
+// in a `for`, an `if` or a `match` declares locals in that expression's blocks exactly as it does in
+// its statements, so an array declared there is one the body may move to the heap, and a view bound
+// there is one whose escape is caught. Before, the scans of what a body declares and the fixpoint
+// that binds its locals read only the statements before the value: an array declared in a trailing
+// loop and handed to a callee that keeps it was refused as storage "held by value without having
+// declared it" -- while the same loop with any statement after it compiled -- and a view of an
+// array of the frame, bound in a trailing block and kept, was not seen at all, so the array stayed
+// in the frame and the kept view dangled. A `return` inside the value was not seen by the dangling
+// address check either.
+//
+// Each accepted shape is run against its twin with a statement after it, at -O0 and -O2 on the
+// counted heap and under AddressSanitizer. Where the refusal is right -- storage the body really
+// holds by value, such as an array bound by a pattern -- it names the binding as its reader wrote
+// it, never the `.N` a second binding of one name in a frame carries.
+//
+// Cells not written: separate compilation and bare metal -- no emission changed, only which arrays
+// the analysis promotes, and promotion is emitted as before; a generic twin -- the walk is over the
+// instantiated body, the same as a concrete one; a closure body -- a closure is a function of its
+// own and its body's value is walked by this same path.
+
+private extern "setenv" fts_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" fts_c_unsetenv(name: *u8) -> int
+
+private struct FtsRun
+    ok: bool
+    out: string
+    err: string
+    hooks: usize
+
+private fts_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end fts_ready
+
+// Every error the analysis of a one-file program reported, or its LLVM text where there were none.
+private fts_ir(text: string) -> string
+    val root = make_temp_dir("sysl-fts").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end fts_ir
+
+private fts_refused(text: string, said: string)
+    if !fts_ready() then return
+
+    val out = fts_ir(text)
+
+    assert(out.contains(said), out)
+end fts_refused
+
+// The promotion notes of a one-file program, which `--explain-escapes` prints.
+private fts_notes(text: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    if !fts_ready() then return out
+
+    val root = make_temp_dir("sysl-fts").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val program = packaged_compilation_of(root, host_target()) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            assert(false, failure_text(why))
+            return out
+        Ok(read) -> read
+
+    val done = analyze_bodies(program.units, program.target)
+    val whole = program_of(done, done.main_module)
+    val moved = post_analysis_checks(done.an, whole, program.own)
+
+    remove_dir_all(root).unwrap_or(())
+    assert(errors_of(done.an.diagnostics()).is_empty())
+
+    for item in moved.notes
+        if item.0.ends_with("main.sysl") then out.push(item.1)
+
+    out
+end fts_notes
+
+private fts_run(text: string, level: string, counted: bool, flags: string) -> FtsRun
+    val root = make_temp_dir("sysl-fts").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    if counted then force_alloc_counting(true)
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+        val v = cstring(flags)
+
+        fts_c_setenv(n.ptr, v.ptr, 1)
+    end if
+
+    val built = build_native_program(s"$root/main.sysl", None, None, level, Some(exe))
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+
+        fts_c_unsetenv(n.ptr)
+
+    if counted then force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return FtsRun(false, failure_text(why), "", 0)
+        Ok(_) -> ()
+
+    val hooks = capture("nm", ["-u", exe], "", [], true) match
+        Ok(o) -> o.text.count_of("__asan_report")
+        Err(_) -> 0
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> FtsRun(false, "could not be started", "", hooks)
+        Ok(o) -> FtsRun(o.status.ok(), o.text, o.err.unwrap_or(""), hooks)
+end fts_run
+
+// Printed exactly `expected` at both ends of the optimizer on the counted heap, giving everything
+// back, and again under AddressSanitizer with the instrumentation in the binary.
+private fts_prints(text: string, expected: string)
+    if !fts_ready() then return
+
+    for level in ["0", "2"]
+        val run = fts_run(text, level, true, "")
+
+        assert(run.ok, s"-O$level: ${run.out}${run.err}")
+        assert_eq(run.out, expected)
+        assert(alloc_count_reported(run.err) == 0, s"-O$level: ${run.err}")
+
+    val asan = fts_run(text, "0", false, "-fsanitize=address -g")
+
+    assert(asan.hooks > 0, "the AddressSanitizer build carries no instrumentation")
+    assert(asan.ok, s"asan: ${asan.out}${asan.err}")
+    assert_eq(asan.out, expected)
+end fts_prints
+
+// A callee that keeps the slice it is handed, `done`, which lets it go before the run ends, and
+// `scribble`, which lays a frame of its own over the one the kept slice would view if its array had
+// not moved.
+private fts_prelude() -> string = raw"""
+    var kept: []const i32 = []
+
+    keep(xs: []const i32) = kept = xs
+
+    done() = kept = []
+
+    make(k: i32) -> [1]i32 = [k]
+
+    scribble(n: i32) -> i32
+        val junk = [n, n, n, n, n, n, n, n]
+        var s = 0
+
+        for x in junk
+            s += x
+
+        s
+    end scribble
+
+    """
+
+// -- the finding: an array declared in a body's trailing loop ---------------------------------------
+
+@test("an array declared in a body's trailing loop and kept by the callee is promoted, not refused")
+fts_trailing_loop_promotes()
+    fts_prints(fts_prelude() + raw"""
+        fill()
+            for k in [1, 2]
+                val f = make(k)
+                keep(f)
+
+        main()
+            fill()
+            print(scribble(9), kept[0])
+            done()
+        """, "72 2\n")
+
+@test("the twin with a statement after the loop is promoted the same way")
+fts_loop_with_a_statement_after_promotes()
+    fts_prints(fts_prelude() + raw"""
+        fill()
+            for k in [1, 2]
+                val f = make(k)
+                keep(f)
+
+            print("filled")
+
+        main()
+            fill()
+            print(scribble(9), kept[0])
+            done()
+        """, "filled\n72 2\n")
+
+@test("the promotion note names the array declared in the trailing loop")
+fts_trailing_loop_is_noted()
+    val notes = fts_notes(fts_prelude() + raw"""
+        fill()
+            for k in [1, 2]
+                val f = make(k)
+                keep(f)
+
+        main()
+            fill()
+            print(kept[0])
+            done()
+        """)
+
+    if !fts_ready() then return
+
+    assert_eq(notes.len(), 1)
+    assert(notes[0].contains("'f' is promoted to the heap, because this view of it is passed to 'keep', " +
+                             "which holds on to it"), notes[0])
+
+@test("a second loop declaring the same name is promoted too, and noted under the name as written")
+fts_second_binding_of_a_name_promotes()
+    val src = fts_prelude() + raw"""
+        fill()
+            for k in [1, 2]
+                val f = make(k)
+                keep(f)
+
+            for k in [3, 4]
+                val f = make(k)
+                keep(f)
+
+        main()
+            fill()
+            print(scribble(9), kept[0])
+            done()
+        """
+
+    fts_prints(src, "72 4\n")
+
+    val notes = fts_notes(src)
+
+    if !fts_ready() then return
+
+    assert_eq(notes.len(), 2)
+    assert(!notes[1].contains("f.1"), notes[1])
+    assert(notes[1].contains("'f' is promoted to the heap"), notes[1])
+
+// -- the same through the neighbouring shapes -------------------------------------------------------
+
+@test("a trailing loop over tuples, destructured, promotes the array its body declares")
+fts_trailing_tuple_loop_promotes()
+    fts_prints(fts_prelude() + raw"""
+        fill()
+            for (k, j) in [(1, 10), (2, 20)]
+                val f = make(k + j)
+                keep(f)
+
+        main()
+            fill()
+            print(scribble(9), kept[0])
+            done()
+        """, "72 22\n")
+
+@test("arrays bound by a destructuring 'val' in a trailing loop are promoted as a plain 'val' is")
+fts_trailing_destructured_arrays_promote()
+    fts_prints(fts_prelude() + raw"""
+        fill()
+            for k in [1, 2]
+                val (f, g) = (make(k), make(k * 10))
+                keep(g)
+
+        main()
+            fill()
+            print(scribble(9), kept[0])
+            done()
+        """, "72 20\n")
+
+@test("an array declared in an arm of a trailing 'match' and kept is promoted")
+fts_trailing_match_arm_promotes()
+    fts_prints(fts_prelude() + raw"""
+        fill(o: Option[i32])
+            o match
+                Some(k) ->
+                    val f = make(k)
+                    keep(f)
+                None -> ()
+
+        main()
+            fill(Some(5))
+            print(scribble(9), kept[0])
+            done()
+        """, "72 5\n")
+
+@test("an array declared in a trailing 'if' and kept is promoted")
+fts_trailing_if_promotes()
+    fts_prints(fts_prelude() + raw"""
+        fill(c: bool)
+            if c
+                val f = make(6)
+                keep(f)
+
+        main()
+            fill(true)
+            print(scribble(9), kept[0])
+            done()
+        """, "72 6\n")
+
+@test("a call's answer handed straight to the keeping callee in a trailing loop is promoted")
+fts_trailing_direct_argument_promotes()
+    fts_prints(fts_prelude() + raw"""
+        fill()
+            for k in [1, 2]
+                keep(make(k))
+
+        main()
+            fill()
+            print(scribble(9), kept[0])
+            done()
+        """, "72 2\n")
+
+// -- what was missed: a view bound in a trailing block --------------------------------------------------
+
+@test("a view of the frame's array bound in a trailing 'if' and kept moves the array")
+fts_view_bound_in_a_trailing_if_moves_the_array()
+    val src = fts_prelude() + raw"""
+        fill()
+            val xs = [7, 8]
+
+            if xs[0] > 0
+                val v = xs[..]
+                val w = v
+                keep(w)
+
+        main()
+            fill()
+            print(scribble(9), kept[0], kept[1])
+            done()
+        """
+
+    fts_prints(src, "72 7 8\n")
+
+    val notes = fts_notes(src)
+
+    if !fts_ready() then return
+
+    assert_eq(notes.len(), 1)
+    assert(notes[0].contains("'xs' is promoted to the heap"), notes[0])
+
+@test("a view bound in a trailing loop and stored in a module var moves the array")
+fts_view_bound_in_a_trailing_loop_stored_moves_the_array()
+    fts_prints(fts_prelude() + raw"""
+        fill()
+            val xs = [3, 4]
+
+            for k in [0, 1]
+                val v = xs[k..]
+                kept = v
+
+        main()
+            fill()
+            print(scribble(9), kept[0])
+            done()
+        """, "72 4\n")
+
+@test("the address of a local returned from inside a trailing 'if' is refused as one returned last is")
+fts_address_returned_from_a_trailing_if_is_refused()
+    fts_refused(raw"""
+        pick(c: bool, p: *i32) -> *i32
+            var x = 1
+
+            if c
+                x = 2
+                return &x
+            else p
+
+        main()
+            var y = 3
+
+            print(*pick(false, &y))
+        """, "'x' is a local of this function")
+
+// -- what stays refused, under the name its reader wrote ------------------------------------------------
+
+@test("an array bound by a pattern in a trailing 'match' and kept is refused, named as written")
+fts_pattern_bound_array_is_refused_by_its_written_name()
+    fts_refused(fts_prelude() + raw"""
+        fill(a: Option[[1]i32], b: Option[[1]i32])
+            a match
+                Some(f) -> print(f[0])
+                None -> ()
+
+            b match
+                Some(f) -> keep(f)
+                None -> ()
+
+        main()
+            fill(Some([1]), Some([2]))
+            print(kept[0])
+            done()
+        """, "a slice of an array this frame owns is passed to 'keep', which holds on to it, so it " +
+             "would outlive the array, and the storage is not this body's to move — 'f' is an array " +
+             "this body holds by value without having declared it, such as a parameter, so there is " +
+             "no declaration to move. Declare it as a '[]T', which makes a buffer of its own and owns " +
+             "it, or as a '&[N]T' where the length is fixed")
