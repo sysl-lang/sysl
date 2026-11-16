@@ -49,7 +49,7 @@ so leaving them out costs a later release nothing.
 
 ## Index
 
-[`max_unix_path`](#max_unix_path) [`ipv4`](#ipv4) [`ipv6`](#ipv6) [`peer_closed`](#peer_closed) [`resolve`](#resolve) [`resolve_passive`](#resolve_passive) [`socket`](#socket) [`timed_out`](#timed_out) [`udp_socket`](#udp_socket) [`unix`](#unix) [`unix_connect`](#unix_connect) [`unix_listen`](#unix_listen) [`would_block`](#would_block) [`Address`](#address) [`Family`](#family) [`Shutdown`](#shutdown) [`Socket`](#socket-1) [`UdpSocket`](#udpsocket) [`UnixAddress`](#unixaddress) [`UnixListener`](#unixlistener) [Display for Address](#display-for-address) [Display for UnixAddress](#display-for-unixaddress) [Drop for SocketState](#drop-for-socketstate)
+[`max_unix_path`](#max_unix_path) [`ipv4`](#ipv4) [`ipv6`](#ipv6) [`peer_closed`](#peer_closed) [`resolve`](#resolve) [`resolve_passive`](#resolve_passive) [`socket`](#socket) [`timed_out`](#timed_out) [`udp_socket`](#udp_socket) [`unix`](#unix) [`unix_connect`](#unix_connect) [`unix_listen`](#unix_listen) [`would_block`](#would_block) [`Address`](#address) [`Family`](#family) [`PeerCredentials`](#peercredentials) [`Shutdown`](#shutdown) [`Socket`](#socket-1) [`UdpSocket`](#udpsocket) [`UnixAddress`](#unixaddress) [`UnixListener`](#unixlistener) [Display for Address](#display-for-address) [Display for UnixAddress](#display-for-unixaddress) [Drop for SocketState](#drop-for-socketstate)
 
 ## Constants
 
@@ -235,6 +235,19 @@ enum Family
 
 Which version of the protocol an address is for.
 
+### `PeerCredentials`
+
+```sysl
+struct PeerCredentials
+    uid: u32
+    gid: u32
+    pid: Option[u32]
+```
+
+The process at the other end of a Unix domain connection, as `Socket.peer_credentials` reports it.
+`uid` and `gid` are the ids `sysl.process.user` and `group` answer, so a peer is compared with
+`== user()`; `pid` is `None` where the system does not say.
+
 ### `Shutdown`
 
 ```sysl
@@ -262,28 +275,45 @@ and `defer s.close()` remains correct without being needed. **Every copy shares 
 closing one closes them all, a second `close` answers `NotOpen` and closes nothing, and the
 descriptor stays open while any copy lives. `into_raw_fd` takes the descriptor away from the socket altogether.
 
+Every member reaches the descriptor through its atomic state and writes nothing else, so a socket
+reached through a `&sync` is used through its members like a lock is: `@unchecked(Share)` says so.
+
 | Member | Signature | Description |
 |---|---|---|
-| `connect` | `connect(*self, to: Address) -> Result[unit, IoError]` | Connect to somewhere. |
-| `bind` | `bind(*self, to: Address) -> Result[unit, IoError]` | Take a local address, which is what a listener does before it listens. |
-| `listen` | `listen(*self, backlog: int = 128) -> Result[unit, IoError]` | Start accepting connections, with `backlog` of them allowed to queue. |
-| `accept` | `accept(*self) -> Result[(Socket, Address), IoError]` | Wait for a connection, and answer it together with where it came from. |
+| `connect` | `connect(self, to: Address) -> Result[unit, IoError]` | Connect to somewhere. |
+| `bind` | `bind(self, to: Address) -> Result[unit, IoError]` | Take a local address, which is what a listener does before it listens. |
+| `listen` | `listen(self, backlog: int = 128) -> Result[unit, IoError]` | Start accepting connections, with `backlog` of them allowed to queue. |
+| `accept` | `accept(self) -> Result[(Socket, Address), IoError]` | Wait for a connection, and answer it together with where it came from. |
 | `local` | `local(self) -> Result[Address, IoError]` | Where this socket is, which is how a listener that asked for port 0 learns which port it got. |
-| `send` | `send(*self, bytes: []const u8) -> Result[usize, IoError]` | Write some of `bytes`, and say how many. |
-| `send_all` | `send_all(*self, bytes: []const u8) -> Result[unit, IoError]` | Every byte of `bytes`, however many calls that takes. |
-| `recv` | `recv(*self, into: []u8) -> Result[usize, IoError]` | Read into `into`, and say how many bytes arrived. |
-| `shutdown` | `shutdown(*self, how: Shutdown = Both) -> Result[unit, IoError]` | Stop reading, stop writing, or stop both -- while the descriptor stays open. |
-| `close` | `close(*self) -> Result[unit, IoError]` | Give the descriptor back now, rather than when the last copy goes, and say whether that worked. |
+| `peer_credentials` | `peer_credentials(self) -> Result[PeerCredentials, IoError]` | Who is at the other end of this Unix domain connection: the user and group the peer process had, and its process id where the system gives it. |
+| `send` | `send(self, bytes: []const u8) -> Result[usize, IoError]` | Write some of `bytes`, and say how many. |
+| `send_all` | `send_all(self, bytes: []const u8) -> Result[unit, IoError]` | Every byte of `bytes`, however many calls that takes. |
+| `recv` | `recv(self, into: []u8) -> Result[usize, IoError]` | Read into `into`, and say how many bytes arrived. |
+| `shutdown` | `shutdown(self, how: Shutdown = Both) -> Result[unit, IoError]` | Stop reading, stop writing, or stop both -- while the descriptor stays open. |
+| `close` | `close(self) -> Result[unit, IoError]` | Give the descriptor back now, rather than when the last copy goes, and say whether that worked. |
 | `fd` | `fd(self) -> Result[int, IoError]` | The descriptor, lent: the socket still closes it, explicitly or when its last copy goes, so a number kept past that names nothing. |
-| `into_raw_fd` | `into_raw_fd(*self) -> Result[int, IoError]` | The descriptor, given rather than lent: the socket lets go of it and closing it is from now on the caller's to do -- Rust's `into_raw_fd`. |
-| `read_timeout` | `read_timeout(*self, ms: int) -> Result[unit, IoError]` | How long a `recv` may wait before giving up, in milliseconds. |
-| `write_timeout` | `write_timeout(*self, ms: int) -> Result[unit, IoError]` | How long a `send` may wait before giving up, in milliseconds. |
-| `reuse_address` | `reuse_address(*self, on: bool = true) -> Result[unit, IoError]` | Let a listener take a port that a recently stopped one was using, so that a server just stopped can be started again without waiting out `TIME_WAIT`. |
-| `non_blocking` | `non_blocking(*self, on: bool = true) -> Result[unit, IoError]` | Put this socket in non-blocking mode, or take it out again. |
-| `set_send_buffer` | `set_send_buffer(*self, bytes: int) -> Result[unit, IoError]` | Ask the kernel for a send buffer of `bytes`. |
-| `set_recv_buffer` | `set_recv_buffer(*self, bytes: int) -> Result[unit, IoError]` | Ask the kernel for a receive buffer of `bytes`; see `set_send_buffer`. |
+| `into_raw_fd` | `into_raw_fd(self) -> Result[int, IoError]` | The descriptor, given rather than lent: the socket lets go of it and closing it is from now on the caller's to do -- Rust's `into_raw_fd`. |
+| `read_timeout` | `read_timeout(self, ms: int) -> Result[unit, IoError]` | How long a `recv` may wait before giving up, in milliseconds. |
+| `write_timeout` | `write_timeout(self, ms: int) -> Result[unit, IoError]` | How long a `send` may wait before giving up, in milliseconds. |
+| `reuse_address` | `reuse_address(self, on: bool = true) -> Result[unit, IoError]` | Let a listener take a port that a recently stopped one was using, so that a server just stopped can be started again without waiting out `TIME_WAIT`. |
+| `non_blocking` | `non_blocking(self, on: bool = true) -> Result[unit, IoError]` | Put this socket in non-blocking mode, or take it out again. |
+| `set_send_buffer` | `set_send_buffer(self, bytes: int) -> Result[unit, IoError]` | Ask the kernel for a send buffer of `bytes`. |
+| `set_recv_buffer` | `set_recv_buffer(self, bytes: int) -> Result[unit, IoError]` | Ask the kernel for a receive buffer of `bytes`; see `set_send_buffer`. |
 | `send_buffer` | `send_buffer(self) -> Result[int, IoError]` | The send buffer the kernel gave this socket, in bytes. |
 | `recv_buffer` | `recv_buffer(self) -> Result[int, IoError]` | The receive buffer the kernel gave this socket, in bytes. |
+| `send_vectored` | `send_vectored(self, parts: []const []const u8) -> Result[usize, IoError]` | Write the pieces of `parts` as one gather write -- `writev`'s job, one system call and no copying them into a buffer first -- and say how many bytes went in all. |
+| `set_no_delay` | `set_no_delay(self, on: bool = true) -> Result[unit, IoError]` | Send small writes at once (`TCP_NODELAY`) rather than waiting to coalesce them -- what a request/response protocol wants. |
+| `no_delay` | `no_delay(self) -> Result[bool, IoError]` | Whether `set_no_delay` is on. |
+| `set_reuse_port` | `set_reuse_port(self, on: bool = true) -> Result[unit, IoError]` | Let several sockets bind one port (`SO_REUSEPORT`), the kernel spreading incoming connections among them -- how a server runs one listener per thread or process. |
+| `reuse_port` | `reuse_port(self) -> Result[bool, IoError]` | Whether `set_reuse_port` is on. |
+| `set_keepalive` | `set_keepalive(self, on: bool = true) -> Result[unit, IoError]` | Probe an idle connection (`SO_KEEPALIVE`), so one whose peer vanished without a word is found out rather than held for ever. |
+| `keepalive` | `keepalive(self) -> Result[bool, IoError]` | Whether `set_keepalive` is on. |
+| `set_keepalive_idle` | `set_keepalive_idle(self, seconds: int) -> Result[unit, IoError]` | How many `seconds` a connection idles before the first keepalive probe (`TCP_KEEPIDLE`, which Darwin spells `TCP_KEEPALIVE`). |
+| `keepalive_idle` | `keepalive_idle(self) -> Result[int, IoError]` | The idle seconds before the first probe. |
+| `set_keepalive_interval` | `set_keepalive_interval(self, seconds: int) -> Result[unit, IoError]` | The `seconds` between keepalive probes (`TCP_KEEPINTVL`). |
+| `keepalive_interval` | `keepalive_interval(self) -> Result[int, IoError]` | The seconds between probes. |
+| `set_keepalive_count` | `set_keepalive_count(self, probes: int) -> Result[unit, IoError]` | How many unanswered keepalive probes (`TCP_KEEPCNT`) end the connection. |
+| `keepalive_count` | `keepalive_count(self) -> Result[int, IoError]` | The number of probes. |
 
 ### `UdpSocket`
 
@@ -300,27 +330,29 @@ rest, one sent may never arrive, and two may arrive in either order. What UDP is
 the exchanges that can live with that -- a query and its answer, a heartbeat, a sample -- and the
 calls here say nothing more than that.
 
-It closes itself when its last copy goes, exactly as `Socket` does.
+It closes itself when its last copy goes, exactly as `Socket` does, and is shared as `Socket` is.
 
 | Member | Signature | Description |
 |---|---|---|
-| `bind` | `bind(*self, to: Address) -> Result[unit, IoError]` | Take a local address: the port this socket receives on. |
-| `connect` | `connect(*self, to: Address) -> Result[unit, IoError]` | Fix where this socket talks to: `send` then goes there without naming it, and `recv` takes datagrams from there and from nowhere else. |
-| `send_to` | `send_to(*self, bytes: []const u8, to: Address) -> Result[usize, IoError]` | Send `bytes` as one datagram to `to`, and say how many went -- all of them, or an error. |
-| `recv_from` | `recv_from(*self, into: []u8) -> Result[(usize, Address), IoError]` | Wait for one datagram, read as much of it as `into` holds, and answer how many bytes that was together with who sent it. |
-| `send` | `send(*self, bytes: []const u8) -> Result[usize, IoError]` | Send `bytes` as one datagram to where `connect` pointed this socket. |
-| `recv` | `recv(*self, into: []u8) -> Result[usize, IoError]` | Wait for one datagram from where `connect` pointed this socket, and answer how many of its bytes `into` held. |
+| `bind` | `bind(self, to: Address) -> Result[unit, IoError]` | Take a local address: the port this socket receives on. |
+| `connect` | `connect(self, to: Address) -> Result[unit, IoError]` | Fix where this socket talks to: `send` then goes there without naming it, and `recv` takes datagrams from there and from nowhere else. |
+| `send_to` | `send_to(self, bytes: []const u8, to: Address) -> Result[usize, IoError]` | Send `bytes` as one datagram to `to`, and say how many went -- all of them, or an error. |
+| `recv_from` | `recv_from(self, into: []u8) -> Result[(usize, Address), IoError]` | Wait for one datagram, read as much of it as `into` holds, and answer how many bytes that was together with who sent it. |
+| `send` | `send(self, bytes: []const u8) -> Result[usize, IoError]` | Send `bytes` as one datagram to where `connect` pointed this socket. |
+| `recv` | `recv(self, into: []u8) -> Result[usize, IoError]` | Wait for one datagram from where `connect` pointed this socket, and answer how many of its bytes `into` held. |
 | `local` | `local(self) -> Result[Address, IoError]` | Where this socket is bound. |
-| `read_timeout` | `read_timeout(*self, ms: int) -> Result[unit, IoError]` | How long a receive may wait before giving up, in milliseconds. |
-| `write_timeout` | `write_timeout(*self, ms: int) -> Result[unit, IoError]` | How long a send may wait before giving up, in milliseconds. |
-| `non_blocking` | `non_blocking(*self, on: bool = true) -> Result[unit, IoError]` | Put this socket in non-blocking mode, or take it out again: a receive with no datagram waiting then answers an error `would_block` recognises instead of waiting. |
-| `set_send_buffer` | `set_send_buffer(*self, bytes: int) -> Result[unit, IoError]` | Ask the kernel for a send buffer of `bytes`; see `Socket.set_send_buffer`. |
-| `set_recv_buffer` | `set_recv_buffer(*self, bytes: int) -> Result[unit, IoError]` | Ask the kernel for a receive buffer of `bytes`; see `Socket.set_send_buffer`. |
+| `read_timeout` | `read_timeout(self, ms: int) -> Result[unit, IoError]` | How long a receive may wait before giving up, in milliseconds. |
+| `write_timeout` | `write_timeout(self, ms: int) -> Result[unit, IoError]` | How long a send may wait before giving up, in milliseconds. |
+| `non_blocking` | `non_blocking(self, on: bool = true) -> Result[unit, IoError]` | Put this socket in non-blocking mode, or take it out again: a receive with no datagram waiting then answers an error `would_block` recognises instead of waiting. |
+| `set_send_buffer` | `set_send_buffer(self, bytes: int) -> Result[unit, IoError]` | Ask the kernel for a send buffer of `bytes`; see `Socket.set_send_buffer`. |
+| `set_recv_buffer` | `set_recv_buffer(self, bytes: int) -> Result[unit, IoError]` | Ask the kernel for a receive buffer of `bytes`; see `Socket.set_send_buffer`. |
 | `send_buffer` | `send_buffer(self) -> Result[int, IoError]` | The send buffer the kernel gave this socket, in bytes. |
 | `recv_buffer` | `recv_buffer(self) -> Result[int, IoError]` | The receive buffer the kernel gave this socket, in bytes. |
-| `close` | `close(*self) -> Result[unit, IoError]` | Give the descriptor back now, closing every copy; a second `close` answers `NotOpen` and closes nothing. |
+| `set_reuse_port` | `set_reuse_port(self, on: bool = true) -> Result[unit, IoError]` | Let several datagram sockets bind one port; see `Socket.set_reuse_port`. |
+| `reuse_port` | `reuse_port(self) -> Result[bool, IoError]` | Whether `set_reuse_port` is on. |
+| `close` | `close(self) -> Result[unit, IoError]` | Give the descriptor back now, closing every copy; a second `close` answers `NotOpen` and closes nothing. |
 | `fd` | `fd(self) -> Result[int, IoError]` | The descriptor, lent; see `Socket.fd`. |
-| `into_raw_fd` | `into_raw_fd(*self) -> Result[int, IoError]` | The descriptor, given rather than lent; see `Socket.into_raw_fd`. |
+| `into_raw_fd` | `into_raw_fd(self) -> Result[int, IoError]` | The descriptor, given rather than lent; see `Socket.into_raw_fd`. |
 
 ### `UnixAddress`
 
@@ -348,7 +380,7 @@ struct UnixListener
 ```
 
 A Unix domain socket listening for connections. It closes itself when its last copy goes, exactly
-as `Socket` does; the socket file stays where it is either way.
+as `Socket` does; the socket file stays where it is either way. It is shared as `Socket` is.
 
 | Member | Signature | Description |
 |---|---|---|
