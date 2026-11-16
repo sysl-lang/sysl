@@ -80,6 +80,26 @@ private var skip_count: int = 0
 // consequence.
 private var reported: bool = false
 
+// Whether a `run` is calling a test body now. **A check made outside one belongs to whatever called
+// it** -- under `sysl test`, the `@test` around it -- and is reported differently: every failure has
+// its line rather than only the first, since there is no test of the harness's own to say it once
+// for, and each line is preceded by `check_mark`, which is how the host's runner learns that a test
+// which returned had failed.
+private var in_run: bool = false
+
+/** The byte written ahead of a check that failed outside any `run`, for `sysl test` to count.
+ *
+ * **A failed check does not stop anything**, so a `@test` that called `check` and got `false` still
+ * returns, with status zero -- and status zero is what `sysl test` reads as a pass. The mark is what
+ * turns that run into a failure, and the runner counts the marks it finds to say how many checks
+ * failed. It is a control character no source text holds, it rides the report's own channel, and the
+ * runner takes it out of what it shows. `compiler/…/test_runner.sysl`'s `check_mark` is the other
+ * statement of it.
+ *
+ * It is written even when `quiet` is set: quiet silences the lines, and the verdict is not the lines.
+ */
+private check_mark() -> string = "\u{4}"
+
 /** Silence the per-test lines, leaving the counters and `finish`'s verdict untouched.
  *
  * It is public because this module's own tests need it -- they call `check` with a false condition on
@@ -129,6 +149,8 @@ private head(file: string, line: long, verdict: string)
  * suppression are in one place rather than repeated in every check.
  */
 private failing(file: string, line: long) -> bool
+    if !in_run then return failing_outside(file, line)
+
     if reported then return false
 
     reported = true
@@ -136,6 +158,23 @@ private failing(file: string, line: long) -> bool
 
     if quiet then return false
 
+    head(file, line, "FAIL: ")
+    true
+
+/** A failure outside any `run`: counted, marked for `sysl test`, and reported every time.
+ *
+ * Every time, because the first-failure rule is a rule about a harness test, which says once that it
+ * failed. Outside a `run` there is no such test, and a `@test` that makes ten checks and fails three
+ * owes its reader all three lines. The line names no test -- `sysl test`'s own row names it -- so the
+ * test field is empty.
+ */
+private failing_outside(file: string, line: long) -> bool
+    fail_count += 1
+    puts(check_mark())
+
+    if quiet then return false
+
+    name_len = 0
     head(file, line, "FAIL: ")
     true
 
@@ -169,7 +208,13 @@ run(name: string, body: *extern() -> unit, file: string = __FILE__, line: long =
     reported = false
     ran_count += 1
 
+    // Restored rather than cleared, so that a `run` reached from inside another one hands the outer
+    // test back its own reading.
+    val outer = in_run
+
+    in_run = true
     body()
+    in_run = outer
 
     if !reported && !quiet then
         head(file, line, "PASS")
