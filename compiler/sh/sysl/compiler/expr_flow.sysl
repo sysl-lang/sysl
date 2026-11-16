@@ -2017,12 +2017,27 @@ const_if_expr(cx: &Analyzer, span: Span, cond: Expr, then_body: Buf[Stmt], else_
                           "has to be known then — a 'const', a value parameter, or a call whose body " +
                           "can run. A test made while the program runs is a plain 'if'")
 
+    // An instance's arm was never read with the generic, so what a `const` function promises is
+    // checked of it per instance, and this is how the check finds it.
+    if cx.an.tables.members.func_origin.has(cx.body) then note_const_arm(cx.an, cx.body, span)
+
     if taken then return TExpr(span, TBlockExpr(type_value_block(cx, then_body, expected, discarded)))
 
     else_body match
         Some(b) -> TExpr(span, TBlockExpr(type_value_block(cx, b, expected, discarded)))
         None -> TExpr(span, TBlockExpr(TBlock(buf(), None, Unit)))
 end const_if_expr
+
+// Files the span of an `if const` read in an instance under the instance's name, once.
+private note_const_arm(a: &Analysis, body: string, span: Span)
+    var arms = a.tables.const_arms.get(body).unwrap_or(buf())
+
+    for s in arms
+        if s == span then return
+
+    arms.push(span)
+    a.tables.const_arms.put(body, arms)
+end note_const_arm
 
 // The most copies a `for const` over a range is unrolled to -- a bound rather than no bound, because
 // the cost is in the emitted program and not in a number a reader can see: `for const i in 0..<100000`
