@@ -1296,3 +1296,29 @@ fsh_advise_hook_unanswered_refused()
 
     lbr_drop([p, out])
 end fsh_advise_hook_unanswered_refused
+
+// The durability calls are hooks of their own: a program that calls `sync_data` reaches
+// `sysl_fs_sync_data` and not `sysl_fs_sync`, and one that maps writably reaches `sysl_fs_map_shared`.
+private val fsh_syncs_data: string = raw"""
+    import sysl.fs.open
+
+    run() -> int
+        open("/hello.txt") match
+            Ok(f) -> if f.sync_data().is_ok() then 1 else 0
+            Err(_) -> 0
+    end run
+    """
+
+@test("a freestanding program calling sync_data with it unanswered is refused naming it, and not sync")
+fsh_sync_data_hook_unanswered_refused()
+    if !lbr_ready() then return
+
+    val p = fsh_tree(fsh_syncs_data + fsh_runtime + fsh_hooks([]))
+    val (said, out) = fsh_build(p)
+
+    assert(said.0 != 0, "built with the sync_data hook unanswered")
+    assert(said.1.contains("'sysl_fs_sync_data'"), said.1)
+    assert(!said.1.contains("'sysl_fs_sync'"), said.1)
+
+    lbr_drop([p, out])
+end fsh_sync_data_hook_unanswered_refused

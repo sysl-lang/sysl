@@ -151,6 +151,56 @@ struct File
         mapped_from(self.inner.fd)
     end map
 
+    /** The file's bytes mapped readable and writable and shared, so a write through `bytes()`
+     * reaches the file. The file must be open for update (`open_update`, `create_update`,
+     * `open_uncached`), or the answer is `PermissionDenied`.
+     *
+     * `len` left out maps the whole file. The mapping is never longer than the file -- a page past
+     * the end has nothing behind it, and touching one is a signal, not an error -- so a `len` above
+     * the file's size is `Other(22)` (`EINVAL`), and a program that wants a larger mapping `truncate`s
+     * the file up first. Buffered writes are handed over first. See `MappedMut`.
+     */
+    map_mut(*self, len: usize = usize::Max) -> Result[&MappedMut, IoError]
+        if self.inner.shut then return Err(NotOpen)
+
+        val written = drain(self.inner)
+
+        if written != 0 then return Err(from_status(written))
+
+        mapped_mut_from(self.inner.fd, len)
+    end map_mut
+
+    /** Hands what is buffered over and asks the device to keep the file's contents, returning once
+     * it has -- `sync` without the metadata a reader does not need (`fdatasync` on Linux, which
+     * skips an unchanged modification time). Where the platform has nothing cheaper, it is `sync`:
+     * on macOS that is `fsync`, which reaches the drive but not the drive's own write cache; see
+     * `full_sync`.
+     */
+    sync_data(*self) -> Result[unit, IoError]
+        if self.inner.shut then return Err(NotOpen)
+
+        val written = drain(self.inner)
+
+        if written != 0 then return Err(from_status(written))
+
+        answered(fsys.sync_data(self.inner.fd))
+    end sync_data
+
+    /** The strongest durability the platform offers: what is buffered is handed over and the device
+     * is made to empty its own write cache. `fcntl(F_FULLFSYNC)` on macOS, where `sync` stops at the
+     * drive (and plain `fsync` for a filesystem that does not know the request); `fsync` elsewhere,
+     * where it already is the full one. It is the slow one -- on macOS milliseconds, not microseconds.
+     */
+    full_sync(*self) -> Result[unit, IoError]
+        if self.inner.shut then return Err(NotOpen)
+
+        val written = drain(self.inner)
+
+        if written != 0 then return Err(from_status(written))
+
+        answered(fsys.full_sync(self.inner.fd))
+    end full_sync
+
     /** Hands over what is buffered.
      *
      * **Every member below asks whether the file is closed first, and none of them may be dropped.**
@@ -597,6 +647,24 @@ open_update(path: string) -> Result[File, IoError] = opened(path, fsys.open_read
 
 create_update(path: string) -> Result[File, IoError] =
     opened(path, fsys.open_read | fsys.open_write | fsys.open_create | fsys.open_truncate)
+
+/** A file opened for reading and writing that **bypasses the operating system's page cache**:
+ * `O_DIRECT` on Linux, `fcntl(F_NOCACHE)` on macOS. A database that keeps its own buffer pool opens
+ * its files this way so a page is not held twice. `create` makes the file where it is missing and
+ * never empties one that exists.
+ *
+ * **Use it through `read_at` and `write_at`.** The buffered `read` and `write` move odd amounts
+ * and so do not suit it. On Linux every transfer must have its buffer address, its offset and its
+ * length at a multiple of the device's block size (512, in practice 4096), and a transfer that does
+ * not is `Other(22)` (`EINVAL`); macOS has no such rule. A filesystem that refuses the mode (tmpfs
+ * on older Linux kernels) answers `Other(22)` at the open. A target whose C library has neither
+ * mechanism answers "not supported on this target".
+ */
+open_uncached(path: string, create: bool = false) -> Result[File, IoError]
+    val how = fsys.open_read | fsys.open_write | fsys.open_uncached
+
+    opened(path, if create then how | fsys.open_create else how)
+end open_uncached
 
 /** The flags are a constant at every call above, which is also why this is private: a program wanting
  * a combination the five names do not cover is asking for the platform's `open`, and that is a good

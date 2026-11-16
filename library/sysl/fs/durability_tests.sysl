@@ -1,0 +1,234 @@
+module sysl.fs
+@requires(os)
+@tests
+
+import sysl.path.parent
+import sysl.slices.align_up
+
+// `File.sync_data`, `File.full_sync`, `open_uncached` and the writable mapping `File.map_mut`.
+
+private dur_path(name: string) -> string = s"${make_temp_dir("sysl-fs-dur-").unwrap()}/$name"
+
+private dur_done(path: string) = dur_ignore(remove_dir_all(parent(path).unwrap()))
+
+private dur_ignore(r: Result[unit, IoError]) = ()
+
+// -- sync_data and full_sync -------------------------------------------------------------------------
+
+@test("dur_fs sync_data hands over what is buffered, and it reads back")
+dur_fs_sync_data()
+    val path = dur_path("data")
+    var f = create_update(path).unwrap()
+
+    f.write("durable".bytes)
+    f.sync_data().unwrap()
+
+    assert_eq(read_text(path).unwrap(), "durable")
+
+    // Nothing buffered, and a second call: still fine.
+    f.sync_data().unwrap()
+    dur_ignore(f.close())
+    dur_done(path)
+end dur_fs_sync_data
+
+@test("dur_fs full_sync hands over what is buffered, and it reads back")
+dur_fs_full_sync()
+    val path = dur_path("full")
+    var f = create_update(path).unwrap()
+
+    f.write("on the platter".bytes)
+    f.full_sync().unwrap()
+
+    assert_eq(read_text(path).unwrap(), "on the platter")
+
+    dur_ignore(f.close())
+    dur_done(path)
+end dur_fs_full_sync
+
+@test("dur_fs both syncs work on a read-only file, and answer NotOpen once closed")
+dur_fs_sync_closed_and_read_only()
+    val path = dur_path("ro")
+
+    write_text(path, "x").unwrap()
+
+    var f = open(path).unwrap()
+
+    // fsync of a descriptor opened read-only is legal.
+    f.sync_data().unwrap()
+    f.full_sync().unwrap()
+    dur_ignore(f.close())
+
+    assert(f.sync_data() == Err(NotOpen))
+    assert(f.full_sync() == Err(NotOpen))
+    assert(f.map_mut().unwrap_err() == NotOpen)
+
+    dur_done(path)
+end dur_fs_sync_closed_and_read_only
+
+// -- open_uncached -----------------------------------------------------------------------------------
+
+@test("dur_fs open_uncached reads and writes aligned blocks")
+dur_fs_uncached_blocks()
+    val path = dur_path("direct")
+    var f = open_uncached(path, true).unwrap()
+
+    // Linux O_DIRECT wants the buffer, the offset and the length block-aligned; 4096 satisfies it.
+    var storage: [8192]u8 = [0; 8192]
+    val block = align_up(&storage[0], 4096)
+    val out = block[0..<4096]
+
+    for i in 0..<4096 do out[i] = u8(i % 251)
+
+    assert_eq(f.write_at(0, out).unwrap(), 4096)
+    assert_eq(f.write_at(4096, out).unwrap(), 4096)
+    f.sync_data().unwrap()
+    assert_eq(f.size().unwrap(), 8192)
+
+    for i in 0..<4096 do out[i] = 0
+
+    val got = f.read_at(4096, out).unwrap()
+
+    assert_eq(got.len, 4096)
+    assert_eq(got[0], 0)
+    assert_eq(got[250], 250)
+    assert_eq(got[251], 0)
+    assert_eq(got[4095], u8(4095 % 251))
+
+    dur_ignore(f.close())
+
+    // The ordinary read sees the same bytes.
+    assert_eq(read_bytes(path).unwrap().len, 8192)
+
+    dur_done(path)
+end dur_fs_uncached_blocks
+
+@test("dur_fs open_uncached without create is NotFound on a missing file, and create keeps what exists")
+dur_fs_uncached_create()
+    val path = dur_path("keep")
+
+    assert(open_uncached(path).unwrap_err() == NotFound)
+
+    write_text(path, "kept").unwrap()
+
+    var f = open_uncached(path, true).unwrap()
+
+    dur_ignore(f.close())
+    assert_eq(read_text(path).unwrap(), "kept")
+
+    dur_done(path)
+end dur_fs_uncached_create
+
+// -- map_mut -----------------------------------------------------------------------------------------
+
+@test("dur_fs a write through map_mut, flushed, is read back through a reopened File")
+dur_fs_map_mut_roundtrip()
+    val path = dur_path("map")
+
+    write_text(path, "0123456789").unwrap()
+
+    var f = open_update(path).unwrap()
+    val m = f.map_mut().unwrap()
+
+    assert_eq(m.len(), 10)
+    assert(!m.is_empty())
+
+    dur_poke(m, 2, u8('X'))
+    dur_poke(m, 9, u8('Z'))
+
+    m.flush().unwrap()
+    m.flush_async().unwrap()
+    dur_ignore(f.close())
+
+    assert_eq(read_text(path).unwrap(), "01X345678Z")
+
+    var g = open(path).unwrap()
+    var one: [1]u8 = [0; 1]
+
+    assert_eq(g.read_at(2, one).unwrap()[0], u8('X'))
+    dur_ignore(g.close())
+    dur_done(path)
+end dur_fs_map_mut_roundtrip
+
+// The view is taken and written inside a function of its own, so it is gone before the caller goes on.
+private dur_poke(m: &MappedMut, at: usize, b: u8)
+    val v = m.bytes()
+
+    v[at] = b
+end dur_poke
+
+@test("dur_fs map_mut over a prefix, and flush of a sub-range")
+dur_fs_map_mut_prefix_and_range()
+    val path = dur_path("prefix")
+
+    write_text(path, "abcdefghij").unwrap()
+
+    var f = open_update(path).unwrap()
+    val m = f.map_mut(4).unwrap()
+
+    assert_eq(m.len(), 4)
+
+    dur_poke(m, 3, u8('!'))
+    m.flush(2, 2).unwrap()
+    m.flush_async(1).unwrap()
+    m.flush(0, 0).unwrap()
+
+    dur_ignore(f.close())
+    assert_eq(read_text(path).unwrap(), "abc!efghij")
+
+    dur_done(path)
+end dur_fs_map_mut_prefix_and_range
+
+@test("dur_fs buffered writes are handed over before the mapping is made")
+dur_fs_map_mut_sees_buffered()
+    val path = dur_path("buffered")
+    var f = create_update(path).unwrap()
+
+    f.write("hello".bytes)
+
+    val m = f.map_mut().unwrap()
+
+    assert_eq(m.len(), 5)
+    assert_eq(m.bytes()[0], u8('h'))
+
+    dur_ignore(f.close())
+    dur_done(path)
+end dur_fs_map_mut_sees_buffered
+
+@test("dur_fs map_mut errors: read-only file, past the end, empty file, directory, bad flush range")
+dur_fs_map_mut_errors()
+    val path = dur_path("errs")
+
+    write_text(path, "abcd").unwrap()
+
+    var ro = open(path).unwrap()
+
+    assert(ro.map_mut().unwrap_err() == PermissionDenied)
+    dur_ignore(ro.close())
+
+    var f = open_update(path).unwrap()
+
+    // Past the end of the file: refused, not a mapping that signals when touched.
+    assert(f.map_mut(5).unwrap_err() == Other(22))
+
+    val m = f.map_mut().unwrap()
+
+    assert(m.flush(5) == Err(Other(22)))
+    assert(m.flush(0, 5) == Err(Other(22)))
+    assert(m.flush(2, 3) == Err(Other(22)))
+    assert(m.flush_async(9) == Err(Other(22)))
+    m.flush(4, 0).unwrap()
+    dur_ignore(f.close())
+
+    // An empty file maps nothing and flushes nothing.
+    write_text(path, "").unwrap()
+
+    var e = open_update(path).unwrap()
+    val none = e.map_mut().unwrap()
+
+    assert(none.is_empty())
+    assert_eq(none.bytes().len, 0)
+    none.flush().unwrap()
+    dur_ignore(e.close())
+
+    dur_done(path)
+end dur_fs_map_mut_errors

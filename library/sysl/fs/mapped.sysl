@@ -82,6 +82,82 @@ struct Mapped
     end advise
 end Mapped
 
+/** A file's bytes mapped shared and writable, from `File.map_mut`: a write through `bytes()` is a
+ * write to the file.
+ *
+ * **Nothing is promised to be on the device until `flush`.** The system writes dirty pages back when
+ * it chooses, and a program that exits or drops the mapping loses nothing the system has accepted
+ * (it stays in the page cache and reaches the file), but only `flush` -- and `File.sync_data` or
+ * `full_sync` after it, for power-loss durability -- says the bytes are out. The mapping is as long
+ * as the file was when it was made and does not follow it: cutting the file shorter underneath makes
+ * a read of a page past the new end a signal. Dropping the last reference unmaps it; hold it as a
+ * `&MappedMut`.
+ */
+struct MappedMut
+    private at: *u8
+    private n: usize
+
+    len(self) -> usize = self.n
+
+    is_empty(self) -> bool = self.n == 0
+
+    /** The whole mapping, writable. */
+    @views(self)
+    bytes(&self) -> []u8 = if self.n == 0 then [] else self.at[0..<self.n]
+
+    /** Writes `len` bytes from offset `from` (`len` left out: to the end) to the file and returns
+     * once they are there -- `msync(MS_SYNC)`. The range is widened to whole pages. A range past the
+     * end of the mapping is `Other(22)` (`EINVAL`); an empty mapping or range does nothing.
+     */
+    flush(self, from: usize = 0, len: usize = usize::Max) -> Result[unit, IoError] = self.sync_range(from, len, 1)
+
+    /** Schedules the same write-back and returns at once (`msync(MS_ASYNC)`). On Linux this
+     * is a no-op the kernel already honours; on macOS it starts the write. Use `flush` to know it is done.
+     */
+    flush_async(self, from: usize = 0, len: usize = usize::Max) -> Result[unit, IoError] = self.sync_range(from, len, 0)
+
+    private sync_range(self, from: usize, len: usize, wait: int) -> Result[unit, IoError]
+        if self.n == 0 then return Ok(())
+        if from > self.n then return Err(Other(einval))
+
+        val room = self.n - from
+        val count = if len == usize::Max then room else len
+
+        if count > room then return Err(Other(einval))
+        if count == 0 then return Ok(())
+
+        val page = page_size()
+        val start = from - from % page
+
+        answered(fsys.msync(&self.at[start], from + count - start, wait))
+    end sync_range
+end MappedMut
+
+impl Drop for MappedMut
+    drop(self)
+        if self.n > 0 then fsys.unmap(self.at, self.n)
+
+/** The descriptor `fd`'s file, mapped shared and writable over `len` bytes (`usize::Max`: all of it). */
+private[fs] mapped_mut_from(fd: int, len: usize) -> Result[&MappedMut, IoError]
+    var st = fsys.Stat(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    val code = fsys.fstat(fd, &st)
+
+    if code != 0 then return Err(from_status(code))
+    if (st.mode & kind_mask) == kind_dir then return Err(IsADirectory)
+    if u64(st.size) > u64(usize::Max) then return Err(Other(too_big))
+
+    val size = usize(st.size)
+    val n = if len == usize::Max then size else len
+
+    if n > size then return Err(Other(einval))
+    if n == 0 then return Ok(MappedMut(null, 0))
+
+    var at: *u8 = null
+    val mapped = fsys.map_shared(fd, n, &at)
+
+    if mapped != 0 then Err(from_status(mapped)) else Ok(MappedMut(at, n))
+end mapped_mut_from
+
 /** How a mapped range is about to be read, for `Mapped.advise`. */
 enum Advice
     /** No special treatment: the default. */
