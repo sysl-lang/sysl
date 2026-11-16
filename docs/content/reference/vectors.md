@@ -189,7 +189,8 @@ a vector converts to an array, and an array to a vector, only at one length: <4>
 
 An operator does not mix the two, in either order: two operands meeting is not a position that names
 the type it wants, so `v + a` with `a` an array is refused as two different vector types are.
-Convert one side first, with a declared `val`.
+Convert one side first, with a declared `val`. A bracket list written beside the vector, `v + [1,
+2]`, is not an array but the vector's own literal (see [the operators](#what-the-operators-do)).
 
 ### Converting lanes
 
@@ -253,6 +254,21 @@ same vector, or one side a scalar that broadcasts:
 | a float | `+` `-` `*` `/`, and unary `-` |
 | a fixed-point type | `+` `-` `*`, and unary `-` — saturating and rounding as the scalar does |
 | `bool` (a mask) | `&` <code>&#124;</code> `^` |
+
+The scalar may stand on either side, and so may a bracket list written in place, which is read as
+the vector beside it rather than as an array:
+
+```sysl
+val dt = 6.0
+val v: <2>real = [2, 3]
+val m = dt / v + [1, 2] * v
+
+print(m[0], m[1])
+```
+
+```output
+5 8
+```
 
 **Integer `/` and `%` are refused.** Scalar integer division traps on a zero divisor and on signed
 overflow, but a register traps as a whole or not at all, so a vector divide would either drop the
