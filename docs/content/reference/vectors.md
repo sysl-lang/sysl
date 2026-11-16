@@ -1283,6 +1283,99 @@ print(four[0], four[9], eight[0], eight[9])
 Ten elements is not a multiple of either width, so both instantiations run the tail loop, and the two
 results agree.
 
+## A trait for every width
+
+An `impl` may be written for a vector, and the lane count is what it is generic over. **`<N>f32`
+with `N` a value parameter is every vector of `f32`**, whatever its width, so one block gives every
+width the trait's members, and a kernel generic over its width calls them:
+
+```sysl
+trait LaneMath
+    twice(self) -> Self
+
+impl[const N: usize] LaneMath for <N>f32
+    twice(self) -> Self = self + self
+
+quad[const W: usize](v: <W>f32) -> <W>f32 = v.twice().twice()
+
+again[T: LaneMath](v: T) -> T = v.twice()
+
+val four: <4>f32 = [1, 2, 3, 4]
+val eight: <8>f32 = 1
+
+print(four.twice()[3], quad(eight)[7], again(four)[0])
+```
+
+```output
+8 4 2
+```
+
+A vector has three subjects an `impl` may name, and they are found most specific first:
+
+- **the vector written out in full**, `<4>f32`, which is one type like any other and takes no
+  parameters;
+- **every vector of one lane type**, `<N>f32`;
+- **every vector**, `<N>T`, where the lane is a parameter of the block too.
+
+```sysl
+trait Tag
+    tag(self) -> string
+
+impl[const N: usize, T] Tag for <N>T
+    tag(self) -> string = s"$N lanes"
+
+impl[const N: usize] Tag for <N>f32
+    tag(self) -> string = "f32"
+
+override impl Tag for <4>f32
+    tag(self) -> string = "four f32"
+
+val a: <4>f32 = 1
+val b: <8>f32 = 1
+val c: <2>u8 = 1
+
+print(a.tag(), b.tag(), c.tag())
+```
+
+```output
+four f32 f32 2 lanes
+```
+
+The two shapes need no marking between them, as an array's `[2]T` and `[N]T` need none. A vector
+written out in full and a shape covering it are an overlap, and the written-out one says `override`,
+exactly as for [any other shape](/reference/traits/#a-shape-is-covered-the-same-way).
+
+**The lane count is not a shape on its own.** A block for `<4>T` and one for `<N>f32` would both
+cover a `<4>f32` with neither more specific than the other, so a count written out under a block
+with parameters is refused:
+
+```sysl
+trait Tag
+    tag(self) -> string
+
+impl[T] Tag for <4>T
+    tag(self) -> string = "four"
+```
+
+```error
+'<4>T' fixes the lane count, and an 'impl' over vectors is generic over that count
+```
+
+A block may not declare a member named like one of the vector's own methods — `sum`, `select`,
+`len` and the rest — since a call reaches those before it asks any `impl`:
+
+```sysl
+trait Total
+    sum(self) -> f32
+
+impl[const N: usize] Total for <N>f32
+    sum(self) -> f32 = self[0]
+```
+
+```error
+'sum' is a member the compiler provides for every vector of f32 — a member of this name would hide it
+```
+
 **`by` is a vector, and that is where `W` comes from.** A kernel whose parameters are all slices
 has nothing to infer the width from, so the call writes it, and a scalar `by` broadcasts across the
 lanes where it meets a vector:

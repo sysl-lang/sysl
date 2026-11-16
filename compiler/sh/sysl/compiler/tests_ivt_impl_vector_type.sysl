@@ -1,0 +1,386 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{Search, str_builder}
+
+// An `impl` for a **vector** (`reference/vectors.md § A trait for every width`). A vector has two
+// shapes, most specific first: every vector of one lane type, `<N>f32`, and every vector, `<N>T`. A
+// vector written out in full, `<4>f32`, is a type like any other. The lane count is what a block over
+// vectors is generic over; `<4>T` is refused, since it and `<N>f32` would both cover a `<4>f32`
+// with neither more specific than the other.
+//
+// The axes: the subject's spelling (in full, every width of one lane, every vector), the call's
+// receiver (a concrete width, a width a generic kernel stands for, a bounded type parameter), the
+// overlap between the three (an override, two shapes), the neighbours that share the machinery
+// (arrays, slices, the `Integer` blanket), and the refusals. Not covered: a vector erased to a trait
+// object, which is the erasure's question rather than the shape's.
+
+private ivt_ready() -> bool
+    std_root() match
+        Ok(_) -> true
+        Err(_) ->
+            print("skipped: the standard module's source is not on this machine")
+            false
+
+// Every diagnostic a one-file program earns, one message to a line in source order.
+private ivt_diags(text: string) -> string
+    val root = make_temp_dir("sysl-ivt").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    var b = str_builder()
+
+    emit_llvm_text(src, None) match
+        Err(why) -> b.push(s"refused: ${why.message}")
+        Ok(made) ->
+            val ordered = in_source_order(made.report)
+
+            for i in 0..<ordered.len()
+                if i > 0 then b.push("\n")
+
+                b.push(if ordered[i].is_error() then "error: " else "warning: ")
+                b.push(ordered[i].diag.message)
+
+    remove_dir_all(root).unwrap_or(())
+    b.finish()
+end ivt_diags
+
+// What a program prints, or why it did not build or run.
+private ivt_run(text: string) -> string
+    if !clang_available() then return "skipped"
+
+    val root = make_temp_dir("sysl-ivt").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return s"did not build: ${failure_text(why)}"
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text + out.err.unwrap_or("")
+end ivt_run
+
+private ivt_ran(text: string, expected: string)
+    if !ivt_ready() then return
+
+    val got = ivt_run(text)
+
+    if got != "skipped" then assert_eq(got, expected)
+
+private ivt_lane_math() -> string = "trait LaneMath\n    twice(self) -> Self\n"
+
+private ivt_tag() -> string = "trait Tag\n    tag(self) -> string\n"
+
+// -- every vector of one lane type ------------------------------------------------------------------
+
+@test("impl vector: every width of f32 carries a method, at four lanes and at eight")
+ivt_every_width_of_one_lane()
+    ivt_ran(ivt_lane_math() + raw"""
+        impl[const N: usize] LaneMath for <N>f32
+            twice(self) -> Self = self + self
+        val four: <4>f32 = [1, 2, 3, 4]
+        val eight: <8>f32 = [1, 2, 3, 4, 5, 6, 7, 8]
+        print(four.twice()[3], eight.twice()[7])
+        """, "8 16\n")
+
+@test("impl vector: the block reads its lane count as a value")
+ivt_the_count_is_a_value()
+    ivt_ran(raw"""
+        trait Width
+            width(self) -> usize
+        impl[const N: usize] Width for <N>i32
+            width(self) -> usize = N
+        val a: <4>i32 = 1
+        val b: <16>i32 = 2
+        print(a.width(), b.width())
+        """, "4 16\n")
+
+@test("impl vector: a generic kernel calls the method at the width it stands for")
+ivt_through_a_generic_kernel()
+    ivt_ran(ivt_lane_math() + raw"""
+        impl[const N: usize] LaneMath for <N>f32
+            twice(self) -> Self = self + self
+        quad[const W: usize](v: <W>f32) -> <W>f32 = v.twice().twice()
+        val four: <4>f32 = [1, 2, 3, 4]
+        val eight: <8>f32 = 1
+        print(quad(four)[1], quad(eight)[7])
+        """, "8 4\n")
+
+@test("impl vector: a vector satisfies a bound, at every width")
+ivt_satisfies_a_bound()
+    ivt_ran(ivt_lane_math() + raw"""
+        impl[const N: usize] LaneMath for <N>f32
+            twice(self) -> Self = self + self
+        again[T: LaneMath](v: T) -> T = v.twice()
+        val four: <4>f32 = [1, 2, 3, 4]
+        val two: <2>f32 = [5, 6]
+        print(again(four)[0], again(two)[1])
+        """, "2 12\n")
+
+@test("impl vector: a vector of another lane type does not satisfy it")
+ivt_another_lane_does_not_satisfy()
+    if !ivt_ready() then return
+
+    val got = ivt_diags(ivt_lane_math() + raw"""
+        impl[const N: usize] LaneMath for <N>f32
+            twice(self) -> Self = self + self
+        again[T: LaneMath](v: T) -> T = v.twice()
+        val v: <4>f64 = 1
+        print(again(v)[0])
+        """)
+
+    assert_eq(got, "error: 'again' requires its type parameter 'T' to implement 'LaneMath', but <4>real does not")
+
+// -- a vector written out in full -------------------------------------------------------------------
+
+@test("impl vector: a vector written out in full carries a method and satisfies a bound")
+ivt_one_vector_in_full()
+    ivt_ran(ivt_lane_math() + raw"""
+        impl LaneMath for <4>f32
+            twice(self) -> Self = self + self
+        again[T: LaneMath](v: T) -> T = v.twice()
+        val v: <4>f32 = [1, 2, 3, 4]
+        print(v.twice()[3], again(v)[0])
+        """, "8 2\n")
+
+@test("impl vector: one vector's block does not reach another width")
+ivt_one_vector_is_one_width()
+    if !ivt_ready() then return
+
+    val got = ivt_diags(ivt_lane_math() + raw"""
+        impl LaneMath for <4>f32
+            twice(self) -> Self = self + self
+        val v: <8>f32 = 1
+        print(v.twice()[0])
+        """)
+
+    assert_eq(got.contains("twice"), true)
+
+// -- overlap ----------------------------------------------------------------------------------------
+
+@test("impl vector: an override for one width beats every width of its lane")
+ivt_override_beats_the_lanes_shape()
+    ivt_ran(ivt_tag() + raw"""
+        impl[const N: usize] Tag for <N>f32
+            tag(self) -> string = "any width"
+        override impl Tag for <4>f32
+            tag(self) -> string = "four"
+        val a: <4>f32 = 1
+        val b: <8>f32 = 1
+        print(a.tag(), b.tag())
+        """, "four any width\n")
+
+@test("impl vector: and the override may come first")
+ivt_override_written_first()
+    ivt_ran(ivt_tag() + raw"""
+        override impl Tag for <4>f32
+            tag(self) -> string = "four"
+        impl[const N: usize] Tag for <N>f32
+            tag(self) -> string = "any width"
+        val a: <4>f32 = 1
+        val b: <2>f32 = 1
+        print(a.tag(), b.tag())
+        """, "four any width\n")
+
+// The overlap is asked of the nearest shape, as an array's `[3]int` is asked only of `[3]T`: a
+// vector in full beside every vector stands without a mark, and the one in full is found first.
+@test("impl vector: one vector in full beside every vector is found first")
+ivt_in_full_beside_every_vector()
+    ivt_ran(ivt_tag() + raw"""
+        impl[const N: usize, T] Tag for <N>T
+            tag(self) -> string = "any"
+        impl Tag for <4>f32
+            tag(self) -> string = "four"
+        val a: <4>f32 = 1
+        val b: <4>i32 = 1
+        print(a.tag(), b.tag())
+        """, "four any\n")
+
+@test("impl vector: one width written after every width of its lane is refused without override")
+ivt_one_width_after_the_shape()
+    if !ivt_ready() then return
+
+    assert_eq(ivt_diags(ivt_tag() + "impl[const N: usize] Tag for <N>f32\n    tag(self) -> string = \"a\"\n" +
+                        "impl Tag for <4>f32\n    tag(self) -> string = \"b\"\n"),
+              "error: every vector of f32 already implements 'Tag', so '<4>f32' has an implementation " +
+              "and cannot be given a second one — write 'override impl' to say that replacing it " +
+              "for this one type is what was meant")
+
+@test("impl vector: and every width written after one width is refused too")
+ivt_the_shape_after_one_width()
+    if !ivt_ready() then return
+
+    assert_eq(ivt_diags(ivt_tag() + "impl Tag for <4>f32\n    tag(self) -> string = \"b\"\n" +
+                        "impl[const N: usize] Tag for <N>f32\n    tag(self) -> string = \"a\"\n"),
+              "error: '<4>f32' already implements 'Tag', and this 'impl' would implement it for " +
+              "every vector of f32 — including that one")
+
+@test("impl vector: two blocks for every width of one lane collide")
+ivt_two_blocks_for_one_lane()
+    if !ivt_ready() then return
+
+    assert_eq(ivt_diags(ivt_tag() + "impl[const N: usize] Tag for <N>f32\n    tag(self) -> string = \"a\"\n" +
+                        "impl[const M: usize] Tag for <M>f32\n    tag(self) -> string = \"b\"\n"),
+              "error: '<M>f32' already implements 'Tag'")
+
+@test("impl vector: blocks for two lane types are two implementations, not a collision")
+ivt_two_lane_types()
+    ivt_ran(ivt_tag() + raw"""
+        impl[const N: usize] Tag for <N>f32
+            tag(self) -> string = "f32"
+        impl[const N: usize] Tag for <N>i32
+            tag(self) -> string = "i32"
+        val a: <4>f32 = 1
+        val b: <4>i32 = 1
+        print(a.tag(), b.tag())
+        """, "f32 i32\n")
+
+// -- every vector -----------------------------------------------------------------------------------
+
+@test("impl vector: every vector, whatever its lane, through one block")
+ivt_every_vector()
+    ivt_ran(raw"""
+        trait Lanes
+            lanes(self) -> usize
+            first(self) -> string
+        impl[const N: usize, T: Display] Lanes for <N>T
+            lanes(self) -> usize = N
+            first(self) -> string = self[0].to_string()
+        val a: <4>f32 = [1.5, 2, 3, 4]
+        val b: <2>int = [7, 8]
+        val c: <8>bool = true
+        print(a.lanes(), a.first(), b.lanes(), b.first(), c.lanes(), c.first())
+        """, "4 1.5 2 7 8 true\n")
+
+@test("impl vector: every vector of one lane is found before every vector")
+ivt_lanes_shape_before_every_vector()
+    ivt_ran(ivt_tag() + raw"""
+        impl[const N: usize, T] Tag for <N>T
+            tag(self) -> string = "any"
+        impl[const N: usize] Tag for <N>f32
+            tag(self) -> string = "f32"
+        val a: <4>f32 = 1
+        val b: <4>i64 = 1
+        print(a.tag(), b.tag())
+        """, "f32 any\n")
+
+@test("impl vector: every vector satisfies a bound through a kernel generic over both")
+ivt_every_vector_in_a_kernel()
+    ivt_ran(ivt_tag() + raw"""
+        impl[const N: usize, T] Tag for <N>T
+            tag(self) -> string = s"$N lanes"
+        told[const W: usize, L](v: <W>L) -> string = v.tag()
+        bound[T: Tag](v: T) -> string = v.tag()
+        val a: <4>f32 = 1
+        val b: <2>u8 = 1
+        print(told(a), told(b), bound(a))
+        """, "4 lanes 2 lanes 4 lanes\n")
+
+// -- refusals ---------------------------------------------------------------------------------------
+
+@test("impl vector: a lane count written out under a block with parameters is refused")
+ivt_a_fixed_lane_count_is_refused()
+    if !ivt_ready() then return
+
+    assert_eq(ivt_diags(ivt_tag() + "impl[T] Tag for <4>T\n    tag(self) -> string = \"a\"\n"),
+              "error: '<4>T' fixes the lane count, and an 'impl' over vectors is generic over that " +
+              "count — write the block's own value parameter for it, as '<N>T' or '<N>f32', or " +
+              "write the vector out in full with no parameters")
+
+@test("impl vector: a parameter the subject does not use is refused")
+ivt_an_unused_parameter_is_refused()
+    if !ivt_ready() then return
+
+    assert_eq(ivt_diags(ivt_tag() + "impl[const N: usize, T] Tag for <N>f32\n    tag(self) -> string = \"a\"\n"),
+              "error: 'T' is declared by this 'impl' but does not appear in '<N>f32', so nothing " +
+              "would ever fix it")
+
+@test("impl vector: a lane that is not a scalar is refused as it is anywhere")
+ivt_a_struct_lane_is_refused()
+    if !ivt_ready() then return
+
+    val got = ivt_diags(ivt_tag() + "struct P\n    x: int\nimpl[const N: usize] Tag for <N>P\n" +
+                        "    tag(self) -> string = \"a\"\n")
+
+    assert_eq(got, "error: a vector's lanes are scalars, and P is not one — an integer, a fixed-point " +
+              "type, a float, 'bool' or 'char' may be a lane, and anything else has no lane-wise " +
+              "arithmetic to give")
+
+@test("impl vector: a member may not hide one of the vector's own methods")
+ivt_a_member_may_not_hide_sum()
+    if !ivt_ready() then return
+
+    assert_eq(ivt_diags("trait Total\n    sum(self) -> f32\n" +
+                        "impl[const N: usize] Total for <N>f32\n    sum(self) -> f32 = self[0]\n"),
+              "error: 'sum' is a member the compiler provides for every vector of f32 — a member of " +
+              "this name would hide it")
+
+@test("impl vector: nor may one vector's block hide its length")
+ivt_a_member_may_not_hide_len()
+    if !ivt_ready() then return
+
+    assert_eq(ivt_diags("trait Sized2\n    len(self) -> usize\n" +
+                        "impl Sized2 for <4>f32\n    len(self) -> usize = 4\n"),
+              "error: 'len' is a member the compiler provides for <4>f32 — a member of this name " +
+              "would hide it")
+
+@test("impl vector: nor every vector's block one of the lane-wise methods")
+ivt_every_vector_may_not_hide_select()
+    if !ivt_ready() then return
+
+    assert_eq(ivt_diags("trait Pick\n    select(self) -> int\n" +
+                        "impl[const N: usize, T] Pick for <N>T\n    select(self) -> int = 0\n"),
+              "error: 'select' is a member the compiler provides for every vector — a member of " +
+              "this name would hide it")
+
+// -- the neighbours ---------------------------------------------------------------------------------
+
+@test("impl vector: an array and a vector of the same lanes reach their own blocks")
+ivt_array_and_vector_apart()
+    ivt_ran(ivt_tag() + raw"""
+        impl[const N: usize, T] Tag for [N]T
+            tag(self) -> string = "array"
+        impl[const N: usize] Tag for <N>f32
+            tag(self) -> string = "vector"
+        impl[T] Tag for []T
+            tag(self) -> string = "slice"
+        val a: [4]f32 = [1, 2, 3, 4]
+        val v: <4>f32 = 1
+        print(a.tag(), v.tag(), a[..].tag())
+        """, "array vector slice\n")
+
+@test("impl vector: an array still may not fix its element type")
+ivt_an_array_still_may_not_fix_its_element()
+    if !ivt_ready() then return
+
+    assert_eq(ivt_diags(ivt_tag() + "impl[const N: usize] Tag for [N]u8\n    tag(self) -> string = \"a\"\n"),
+              "error: 'byte' fixes the element type, and an 'impl' with type parameters covers every " +
+              "array — write one of the block's own parameters here")
+
+@test("impl vector: a vector is not covered by the Integer blanket, so both blocks stand")
+ivt_beside_the_integer_blanket()
+    ivt_ran(ivt_tag() + raw"""
+        impl[T: Integer] Tag for T
+            tag(self) -> string = "integer"
+        impl[const N: usize] Tag for <N>i32
+            tag(self) -> string = "vector"
+        val v: <4>i32 = 1
+        val n: i32 = 1
+        print(n.tag(), v.tag())
+        """, "integer vector\n")

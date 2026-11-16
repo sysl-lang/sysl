@@ -129,6 +129,21 @@ shape_owners(t: Type) -> Buf[(string, Buf[Type])]
             open.push(ConstArg(from_int(long(n)), usize_marker(), false))
             open.push(*elem)
             out.push((ArrayShape, open))
+        // A vector's two shapes drop the lane count first and the lane type second, so a block for
+        // every vector of `f32` is found before one for every vector. The lane count is the argument
+        // both hand back, as an array's length is; there is no shape keeping the count and dropping
+        // the lane, since `<4>T` and `<N>f32` would both cover a `<4>f32` with neither more specific.
+        Vector(n, elem) ->
+            var count: Buf[Type] = buf()
+
+            count.push(ConstArg(from_int(long(n)), usize_marker(), false))
+            out.push((lanes_shape(*elem), count))
+
+            var open: Buf[Type] = buf()
+
+            open.push(ConstArg(from_int(long(n)), usize_marker(), false))
+            open.push(*elem)
+            out.push((VectorShape, open))
         Struct(d) ->
             if is_tuple(d)
                 // A tuple has **two** shapes, and the order between them is what makes a block
@@ -275,6 +290,7 @@ end viewed_const
 builtin_member(t: Type, name: string) -> bool = t match
     Array(_, _) -> name == "len"
     Slice(_, _) -> name == "len"
+    Vector(_, _) -> name == "len" || is_vector_method(name)
     Str -> name == "len" || name == "bytes" || name == "chars" || name == "copy"
     Weak(_) -> name == "get"
     _ -> false
@@ -283,9 +299,11 @@ builtin_member(t: Type, name: string) -> bool = t match
 //
 // A block matching every slice or every array at once has no `Self` to ask the type-keyed test about
 // -- the element is still a parameter when the members are hoisted -- so the one block that most
-// needs asking is the one it cannot see. `len` is the whole list: it is the only member the compiler
-// provides for a sequence, and the shapes that have one are the two written with brackets.
+// needs asking is the one it cannot see. `len` is the only member the compiler provides for a
+// sequence, and the shapes that have one are those written with brackets; a vector's shapes also
+// answer to the vector's own methods, which are reached before any table is asked.
 builtin_shape_member(head: string, name: string) -> bool
+    if head.starts_with(VectorShape) then return name == "len" || is_vector_method(name)
     if name != "len" then return false
 
     val b = head.bytes
