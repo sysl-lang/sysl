@@ -176,6 +176,7 @@ private assume_clause(e: *Emit, clause: TExpr)
     push_temps(e)
 
     val ok = gen_expr(e, clause)
+    val held = storage_held(e, clause)
 
     pop_temps(e)
 
@@ -191,11 +192,10 @@ private assume_clause(e: *Emit, clause: TExpr)
             VNothing -> ()
             _ ->
                 e.uses_assume = true
+                emit_assume(e, ok)
 
-                var args: Buf[IrArg] = buf()
-
-                args.push(ir_arg(l_i1(), ok))
-                emit(e, ir_call(None, LVoid, VGlobal(llvm_assume()), args))
+                for there in held
+                    emit_assume(e, there)
         return
     end if
 
@@ -227,6 +227,70 @@ private assume_clause(e: *Emit, clause: TExpr)
 
     if !gapped then e.gap = None
 end assume_clause
+
+private emit_assume(e: *Emit, fact: Val)
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(l_i1(), fact))
+    emit(e, ir_call(None, LVoid, VGlobal(llvm_assume()), args))
+
+// **What a clause says about storage beside what it says about numbers.** A clause that puts an index
+// below a view's length -- `i < xs.len`, or `xs.len > i` -- says the view holds at least one element,
+// and a view that holds one has storage behind it: every view the language makes of one or more
+// elements points into a buffer, an array or a literal, none of them at address zero. So each such
+// link also yields `xs`'s storage pointer compared with null, assumed beside the clause.
+//
+// **What it buys is the storage pointer read again after the call.** A fact is the only thing a caller
+// reads after a call it was told nothing else about, and a clause naming only the length is lowered to
+// a read of the length alone. `Buf.push` after its growth call is the case: the count and the capacity
+// are read there for the promise and so stay in registers around an append loop, while the storage
+// pointer -- read nowhere on that arm -- had to be loaded again for every element, since the optimizer
+// carries a value around a loop only where every way back into it has the value in hand.
+//
+// The test is an unsigned one by construction: a length is a `usize`, and both sides of a comparison
+// have one type, so `i < xs.len` cannot hold of an empty view. `<=` and `>=` allow an empty view and
+// say nothing here. A clause joined by `&&` or `||`, or a chain of comparisons, lowers to branches
+// and is not repeated at all, so the comparison asked about is the whole clause. A view a program
+// cut out of a raw pointer itself (`p[0..<n]`) is the unchecked tier's, and its pointer the
+// program's promise.
+private storage_held(e: *Emit, clause: TExpr) -> Buf[Val]
+    var held: Buf[Val] = buf()
+
+    *clause.kind match
+        TCompare(operands, cmps) ->
+            for i in 0..<cmps.len()
+                if cmps[i].dispatch.is_some() then continue
+
+                val side = cmps[i].op match
+                    "<" -> Some(operands[i + 1])
+                    ">" -> Some(operands[i])
+                    _ -> None
+
+                if side.is_some()
+                    storage_of_len(e, side.unwrap()) match
+                        Some(there) -> held.push(there)
+                        None -> ()
+        _ -> ()
+
+    held
+end storage_held
+
+// The storage pointer of the view whose length `x` reads, compared with null -- or nothing where `x`
+// is not the length of a view.
+private storage_of_len(e: *Emit, x: TExpr) -> Option[Val] = *x.kind match
+    TLen(recv, _) -> underlying(texpr_type(recv)) match
+        Slice(_, _) ->
+            val view = gen_expr(e, recv)
+            val data = fresh_reg(e)
+
+            emit(e, InExtract(data, lty(e, texpr_type(recv)), view, index_list(1)))
+
+            val there = fresh_reg(e)
+
+            emit(e, InIntCmp(there, INe, LPtr, data, VNull))
+            Some(there)
+        _ -> None
+    _ -> None
 
 // Whether an instruction computes a value and does nothing else.
 //
