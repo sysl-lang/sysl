@@ -1,0 +1,80 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.split
+
+// What `sysl.slices.reverse` lowers to at each element type: a slice of 8-, 16-, 32- or 64-bit
+// integers moves a 16-byte block from each end at a time, turned around by one `shufflevector`, and
+// every other element type -- an integer narrower than its storage, one wider than a register, a
+// counted value, a struct -- keeps the element loop. Each claim is read inside the instance it is
+// about. What the answers are, at every length and offset, is `library/sysl/slices/tests.sysl`'s.
+
+private rvs_count(hay: string, needle: string) -> usize = split(hay, needle).len - 1
+
+private rvs_program(element: string) -> string =
+    s"import sysl.slices.reverse\n\nstruct Rgb\n    r: u8\n    g: u8\n    b: u8\n    a: u8\n\n" +
+    s"flip(xs: []$element)\n    reverse(xs)\n\nmain()\n    var a: [4]$element\n    flip(a[..])\n    print(1)\n"
+
+// The module for a program that reverses a slice of `element`.
+private rvs_ir(element: string) -> string = cgz_ir(rvs_program(element))
+
+@test("a slice of bytes is reversed sixteen at a time from each end, each block one shufflevector")
+rvs_bytes_take_blocks()
+    if !enm_ready() then return
+
+    val ir = rvs_ir("u8")
+    val blocks = cgz_body(ir, "reverse_blocks.byte.c16")
+
+    assert(cgz_body(ir, "reverse.byte").contains("reverse_blocks.byte.c16("), cgz_body(ir, "reverse.byte"))
+    assert_eq(rvs_count(blocks, "load <16 x i8>, ptr %t"), 2)
+    assert(blocks.contains("<16 x i32> <i32 15, i32 14, i32 13, i32 12, i32 11, i32 10, i32 9, i32 8, " +
+                           "i32 7, i32 6, i32 5, i32 4, i32 3, i32 2, i32 1, i32 0>"), blocks)
+    assert_eq(rvs_count(blocks, "shufflevector <16 x i8>"), 2)
+
+@test("16-, 32- and 64-bit integers fill the same sixteen bytes with eight, four and two lanes")
+rvs_wider_lanes()
+    if !enm_ready() then return
+
+    for (element, name, shape) in [("i16", "reverse_blocks.short.c8", "shufflevector <8 x i16>"),
+                                   ("u32", "reverse_blocks.uint.c4", "shufflevector <4 x i32>"),
+                                   ("i64", "reverse_blocks.long.c2", "shufflevector <2 x i64>"),
+                                   ("usize", "reverse_blocks.usize.c2", "shufflevector <2 x i64>")]
+        val blocks = cgz_body(rvs_ir(element), name)
+
+        assert_eq(rvs_count(blocks, shape), 2)
+
+@test("a width short of its storage, a width past a register, a counted value and a struct keep the loop")
+rvs_others_keep_the_loop()
+    if !enm_ready() then return
+
+    for element in ["u12", "i24", "i56", "u128", "string", "bool", "f32", "Rgb"]
+        val ir = rvs_ir(element)
+
+        assert(ir.contains("reverse_between"), s"$element:\n$ir")
+        assert(!ir.contains("reverse_blocks"), s"$element:\n$ir")
+
+@test("a reversal a constant asks for is still worked out while compiling, through the blocks")
+rvs_folds()
+    if !enm_ready() then return
+
+    val ir = cgz_ir(raw"""
+        import sysl.slices.reverse
+
+        const turned() -> [40]u8
+            var a: [40]u8
+
+            for k in 0..<40
+                a[k] = u8(k)
+
+            reverse(a[..])
+            a
+
+        val F = turned()
+
+        main()
+            print(F[0], F[39])
+        """)
+
+    assert(ir.contains("@F = private constant [40 x i8] [i8 39, i8 38, i8 37, "), ir)
+    assert(ir.contains("i8 17, i8 16, i8 15, i8 14, "), ir)
+    assert(ir.contains(", i8 1, i8 0]"), ir)

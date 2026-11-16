@@ -279,6 +279,103 @@ reverse_turns_around()
     assert_eq(one[..], [1])
 end reverse_turns_around
 
+// Lengths either side of each place the block path changes course -- under two blocks, exactly one
+// and two, one past, a whole number of them and a remainder -- for any width of lane.
+private val REVERSE_LENGTHS: [14]usize = [0, 1, 2, 7, 15, 16, 17, 31, 32, 33, 63, 64, 65, 257]
+
+// Whether reversing `n` elements of a longer run, starting `off` in, turns exactly those around and
+// leaves every element either side alone. Element `k` is told apart from every other by its value.
+private reversed_in_place[T: Integer + Eq](n: usize, off: usize) -> bool
+    var a: [300]T
+
+    for k in 0..<a.len
+        a[k] = T.wrap(k * 7 + 3)
+
+    reverse(a[off..<off + n])
+
+    for k in 0..<a.len
+        val was = if k >= off && k < off + n then 2 * off + n - 1 - k else k
+
+        if a[k] != T.wrap(was * 7 + 3) then return false
+
+    true
+end reversed_in_place
+
+// Every length at an aligned start and at two unaligned ones.
+private reverses_everywhere[T: Integer + Eq]() -> bool
+    val offsets: [3]usize = [0, 1, 3]
+
+    for n in REVERSE_LENGTHS
+        for off in offsets
+            if !reversed_in_place[T](n, off) then return false
+
+    true
+
+@test("reverse at every lane width, every length around a block and an unaligned start")
+reverse_by_blocks()
+    assert(reverses_everywhere[u8]())
+    assert(reverses_everywhere[i8]())
+    assert(reverses_everywhere[u16]())
+    assert(reverses_everywhere[i16]())
+    assert(reverses_everywhere[u32]())
+    assert(reverses_everywhere[i32]())
+    assert(reverses_everywhere[u64]())
+    assert(reverses_everywhere[i64]())
+    assert(reverses_everywhere[usize]())
+    assert(reverses_everywhere[int]())
+
+@test("reverse of an integer narrower than its storage, or wider than a register, by elements")
+reverse_odd_widths()
+    assert(reverses_everywhere[u12]())
+    assert(reverses_everywhere[i24]())
+    assert(reverses_everywhere[u48]())
+    assert(reverses_everywhere[i7]())
+    assert(reverses_everywhere[u128]())
+
+private struct Rgb
+    r: u8
+    g: u8
+    b: u8
+    a: u8
+
+@test("reverse of a struct with no pointers, of strings and of floats keeps the element order right")
+reverse_other_elements()
+    for n in REVERSE_LENGTHS
+        var px: [300]Rgb
+        var ws: [300]string
+        var fs: [300]f32
+
+        for k in 0..<n
+            px[k] = Rgb(u8.wrap(k), u8.wrap(k + 1), 0, 255)
+            ws[k] = s"w$k"
+            fs[k] = f32(k)
+
+        reverse(px[..<n])
+        reverse(ws[..<n])
+        reverse(fs[..<n])
+
+        for k in 0..<n
+            assert_eq(px[k].r, u8.wrap(n - 1 - k))
+            assert_eq(px[k].g, u8.wrap(n - k))
+            assert_eq(ws[k], s"w${n - 1 - k}")
+            assert_eq(fs[k], f32(n - 1 - k))
+
+private const turned() -> [40]u8
+    var a: [40]u8
+
+    for k in 0..<a.len
+        a[k] = u8(k)
+
+    reverse(a[..])
+    a
+
+private val TURNED = turned()
+
+@test("a module value worked out through the blocks holds the reversal")
+reverse_folds()
+    for k in 0..<TURNED.len
+        assert_eq(TURNED[k], u8(39 - k))
+
 @test("fill writes one value everywhere")
 fill_writes_everywhere()
     var xs = [1, 2, 3]
