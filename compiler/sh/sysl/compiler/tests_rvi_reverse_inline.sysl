@@ -1,0 +1,106 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **`sysl.slices.reverse` is absorbed by its caller, at every element type.** The function is a
+// length test in front of two loops: the element loop a short slice takes, and the 16-byte blocks a
+// long slice of 8- to 64-bit integers takes. The blocks are kept out of line (`@noinline`) and the
+// function itself is marked `@inline`, so what a caller takes in is the test and the element loop,
+// and a short reversal -- the flip of a permutation, a few elements long -- costs no call. Without
+// both marks the blocks' body made the function too large to inline, and every reversal of a
+// handful of elements paid a call around a loop the optimizer had unrolled for no caller in
+// particular. What the answers are is `library/sysl/slices/tests.sysl`'s; how each path lowers is
+// `tests_rvs_reverse_slice.sysl`'s.
+
+private rvi_program(element: string) -> string =
+    s"import sysl.slices.reverse\n\nstruct Rgb\n    r: u8\n    g: u8\n    b: u8\n    a: u8\n\n" +
+    s"@noinline\nflip(xs: []$element)\n    reverse(xs)\n\n" +
+    s"@noinline\nflip_front(xs: []$element, k: usize)\n    reverse(xs[0..k])\n\n" +
+    s"main()\n    var a: [4]$element\n    flip(a[..])\n    flip_front(a[..], 2)\n    print(1)\n"
+
+// The `define` line of the instance whose name holds `name`.
+private rvi_define(ir: string, name: string) -> string
+    for line in lines_of(ir)
+        if line.starts_with("define") && line.contains(name) then return line
+
+    ""
+
+// What clang's `-O2` leaves of `ir`. `None` where there is no clang to ask.
+private rvi_optimized(ir: string) -> Option[string]
+    if !clang_available()
+        print("skipped: clang is not installed, so there is no optimizer to ask")
+        return None
+
+    val dir = make_temp_dir("sysl-rvi").unwrap()
+    val file = s"$dir/t.ll"
+
+    write_text(file, ir).unwrap()
+
+    val got = capture("clang", ["-O2", "-S", "-emit-llvm", "-o", "-", file], "", [], true).unwrap()
+
+    remove_dir_all(dir).unwrap_or(())
+    assert(got.status.ok(), s"clang refused the emitted IR:\n${got.err.unwrap_or("")}")
+    Some(got.text)
+
+// Whether `body` calls a function whose name holds `name`.
+private rvi_calls(body: string, name: string) -> bool
+    for line in lines_of(body)
+        if line.contains("call ") && line.contains(name) then return true
+
+    false
+
+// The two callers, spelled as LLVM quotes a name holding `$`.
+private rvi_callers() -> [2]string = ["\"flip$$sysl\"", "\"flip_front$$sysl\""]
+
+private rvi_lanes() ->[4](string, string, string) =
+    [("u8", "reverse.byte", "reverse_blocks.byte.c16"),
+     ("i16", "reverse.short", "reverse_blocks.short.c8"),
+     ("u32", "reverse.uint", "reverse_blocks.uint.c4"),
+     ("usize", "reverse.usize", "reverse_blocks.usize.c2")]
+
+@test("reverse is marked for inlining and its blocks are kept out of line, at every lane width")
+rvi_marks_at_every_lane_width()
+    if !enm_ready() then return
+
+    for (element, name, blocks) in rvi_lanes()
+        val ir = cgz_ir(rvi_program(element))
+
+        assert(rvi_define(ir, s"$name(").contains(" inlinehint "), s"$element:\n${rvi_define(ir, name)}")
+        assert(rvi_define(ir, blocks).contains(" noinline "), s"$element:\n${rvi_define(ir, blocks)}")
+
+@test("at -O2 a caller takes reverse in and calls only the blocks, at every lane width")
+rvi_absorbed_at_every_lane_width()
+    if !enm_ready() then return
+
+    for (element, name, blocks) in rvi_lanes()
+        val opt = rvi_optimized(cgz_ir(rvi_program(element))) match
+            Some(text) -> text
+            None -> return
+
+        for caller in rvi_callers()
+            val body = cgz_body(opt, caller)
+
+            assert(body.starts_with("define "), s"$element: $body")
+            assert(!rvi_calls(body, s"$name("),s"$element: $caller still calls reverse:\n$body")
+            assert(rvi_calls(body, blocks), s"$element: $caller lost the blocks:\n$body")
+
+@test("an element type with no blocks takes reverse in too: a narrow width, a counted value, a struct")
+rvi_absorbed_without_blocks()
+    if !enm_ready() then return
+
+    for element in ["u12", "u128", "string", "f32", "Rgb"]
+        val ir = cgz_ir(rvi_program(element))
+
+        assert(!ir.contains("reverse_blocks"), s"$element:\n$ir")
+
+        val opt = rvi_optimized(ir) match
+            Some(text) -> text
+            None -> return
+
+        for caller in rvi_callers()
+            val body = cgz_body(opt, caller)
+
+            assert(body.starts_with("define "), s"$element: $body")
+            assert(!rvi_calls(body, "sysl.slices$reverse"), s"$element: $caller still calls reverse:\n$body")
