@@ -276,14 +276,82 @@ tdc_a_raw_object_is()
         print(p.is[Rect](), p.is[Sq]())
         """, "true false\n")
 
-@test("but has no counted reference to hand back")
+@test("a raw object answers a *T on a hit and None on a miss")
 tdc_a_raw_object_as()
-    tdc_refused(tdc_shapes() + raw"""
+    tdc_prints(tdc_shapes() + raw"""
+        var r = Rect(1, 2)
+        var s = Sq(5)
+        val p: *Shape = &r
+        val q: *Shape = &s
+        val hit: Option[*Rect] = p.as[Rect]()
+
+        print(hit.is_some(), p.as[Sq]().is_none())
+        print(hit.unwrap().w, q.as[Sq]().unwrap().s)
+        print(q.as[Rect]().is_none(), q.as[Lamp]().is_none())
+        """, "true true\n1 5\ntrue true\n")
+
+@test("the *T a raw object answers is the object itself, so a write through it is seen")
+tdc_a_raw_object_as_aliases()
+    tdc_prints(tdc_shapes() + raw"""
         var r = Rect(1, 2)
         val p: *Shape = &r
-        print(p.as[Rect]())
-        """, "a *Shape points at a value no count is kept for, so there is no counted '&Rect' to " +
-             "hand back — 'o.is[Rect]()' asks the question without one")
+
+        if p.as[Rect]() is Some(q)
+            q.w = 10
+        print(r.w, p.area())
+        """, "10 20\n")
+
+@test("raw objects in an array are each asked, and the answer is kept in a local")
+tdc_raw_objects_in_an_array()
+    tdc_prints(tdc_shapes() + raw"""
+        var a = Rect(1, 2)
+        var b = Sq(3)
+        var c = Rect(4, 5)
+        val xs: [3]*Shape = [&a, &b, &c]
+        var rects = 0
+        var sides = 0
+
+        for x in xs
+            if x.as[Rect]() is Some(r) then rects += r.w
+            if x.as[Sq]() is Some(q) then sides += q.s
+        print(rects, sides)
+        """, "5 3\n")
+
+@test("a raw object asked about a generic parameter and an instantiation")
+tdc_a_raw_object_as_generic()
+    tdc_prints(tdc_shapes() + raw"""
+        pick[T](p: *Shape) -> bool = p.as[T]().is_some()
+
+        main()
+            var c = Col[int](4)
+            val p: *Shape = &c
+            print(pick[Col[int]](p), pick[Col[bool]](p), pick[Rect](p))
+        """, "true false false\n")
+
+@test("a raw object and a counted one answer alike")
+tdc_raw_and_counted_agree()
+    tdc_prints(tdc_shapes() + raw"""
+        main()
+            var r = Rect(2, 3)
+            val p: *Shape = &r
+            val s: &Shape = Rect(2, 3)
+            val a = p.as[Rect]()
+            val b = s.as[Rect]()
+            print(a.is_some() == b.is_some(), p.as[Sq]().is_some() == s.as[Sq]().is_some())
+            print(a.unwrap().w * a.unwrap().h, b.unwrap().w * b.unwrap().h)
+        """, "true true\n6 6\n")
+
+@test("a raw object is refused a type that does not implement the trait, as a counted one is")
+tdc_a_raw_object_as_refused()
+    tdc_refused(tdc_shapes() + raw"""
+        struct Col2
+            v: int
+
+        var r = Rect(1, 2)
+        val p: *Shape = &r
+        print(p.as[Col2]())
+        """, "'Col2' does not implement 'Shape', so no *Shape can hold one and 'o.as[Col2]()' could " +
+             "never be Some")
 
 // -- a member the trait declares wins ------------------------------------------------------------------
 
