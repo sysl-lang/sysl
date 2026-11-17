@@ -450,10 +450,15 @@ const_val_image(cx: &Analyzer, name: string, init: TExpr) -> Option[TExpr] = con
 // `"hello"[1..<3]`, a payload a `match` binds -- since a field, an element or a slice of constant data
 // is constant data. Where such a run stops at something it does not hold, the initializer is left to
 // the parts below exactly as before, with nothing added to say why.
+//
+// **A vector is run too**, whatever it is built from -- a splat, arithmetic over literals, a
+// shuffle, a conversion -- and so is anything worked out from one (a lane, a reduction, its lanes as
+// an array), since the evaluator holds every vector operator lane by lane as the program's run does,
+// and the lanes it comes to are laid down as the vector's constant.
 const_val_run(cx: &Analyzer, name: string, init: TExpr) -> Result[Option[TExpr], unit]
     val runs = calls_const_fn(cx.an, init)
 
-    if !runs && !projects(init) then return Ok(None)
+    if !runs && !projects(init) && !holds_vector(init) then return Ok(None)
 
     evaluate(cx.an, cx.scope, s"'$name'", init) match
         EvValue(Some(v)) ->
@@ -597,6 +602,16 @@ end calls_anything
 // Whether a typed tree takes a part of a value -- a field, a tuple's part, an element, a slice, a
 // length, or the payload a `match` binds -- which the fold of scalars does not reach, and the
 // evaluator does.
+// Whether any part of a typed tree is a vector.
+private holds_vector(t: TExpr) -> bool
+    var found: Buf[bool] = buf()
+    val sink = &found
+
+    walk_texpr(t, expr_walk(true, x -> if is_vector(underlying(texpr_type(x))) then sink.push(true)))
+
+    !found.is_empty()
+end holds_vector
+
 private projects(t: TExpr) -> bool
     var found: Buf[bool] = buf()
     val sink = &found
@@ -3523,9 +3538,11 @@ private global_value(r: &EvRun, at: Span, symbol: string, ty: Type, writable: bo
 end global_value
 
 // Whether module storage of this type is read by running its initializer rather than by folding it.
+// A vector is: the untyped fold reads a splat's scalar (`val s: <4>u16 = 7`) as the scalar itself.
 private held_whole(t: Type) -> bool = t match
     Str -> true
     Array(_, _) -> true
+    Vector(_, _) -> true
     Struct(_) -> true
     Enum(_) -> true
     _ -> false
