@@ -477,6 +477,44 @@ gen_downgrade(e: *Emit, value: TExpr, weak_ty: Type) -> Val
     own_temp(e, v, weak_ty)
 end gen_downgrade
 
+// `r.into_raw()` -- the payload's address, with one count of the object taken for the pointer and
+// never given back here. A reference this frame was about to give back hands its own count over, so
+// `d.into_raw()` at `d`'s last use takes no count and gives none back.
+gen_into_raw(e: *Emit, value: TExpr, ptr_ty: Type) -> Val
+    val ref_ty = texpr_type(value)
+    val v = gen_expr(e, value)
+
+    retain_moving(e, value, ref_ty, v)
+    box_payload_addr(e, v, ref_ty)
+end gen_into_raw
+
+// `from_raw(p)` -- the box a payload address `into_raw` answered sits in: the header lies a fixed
+// distance before the payload, the same distance `box_payload_addr` steps forward, whichever header
+// the payload's box has. **The distance is the box type's own**, read off the payload field's address
+// in a box at null, so it is what LLVM laid out -- an over-aligned payload's padding included -- and
+// folds to a constant. The count the pointer carried is the reference's now, so it is owned here as a
+// fresh box is, and nothing is retained.
+gen_from_raw(e: *Emit, ptr: TExpr, ref_ty: Type) -> Val
+    val p = gen_expr(e, ptr)
+    val word = word_lty(e)
+    val field = box_payload_addr(e, VNull, ref_ty)
+    val offset = fresh_reg(e)
+
+    emit(e, InCast(offset, CastPtrToInt, LPtr, field, word))
+
+    val back = fresh_reg(e)
+
+    emit(e, InBin(back, OpSub, word, VInt(from_int(0)), offset))
+
+    val at = fresh_reg(e)
+
+    var idx: Buf[IrArg] = buf()
+
+    idx.push(ir_arg(word, back))
+    emit(e, InGep(at, LInt(8), p, idx))
+    own_temp(e, at, ref_ty)
+end gen_from_raw
+
 // `w.get()` -- asks the box whether the object is still there. A live one comes back with a count
 // taken for the caller, so what the `Some` carries is an ordinary owned reference; a dead one gives
 // a null address, which is the `None`.

@@ -3146,6 +3146,72 @@ holding a count). **`slot_put(p, v)`** moves `v` into an **empty** slot, giving 
 slot must be live, a put slot empty, and nothing reads an empty slot — the caller's to keep. Both
 refuse what is not a `*T`.
 
+### A counted reference given up as a pointer
+
+**`r.into_raw()` gives up a `&T` as a `*T`** — the address of the object itself, so its fields read and
+write through it — and **the pointer carries one count of the object away**: the count is not given
+back, so the object lives until something adopts it. **`from_raw(p)`**, imported from `sysl.raw`,
+**adopts that count back**: it answers the `&T` the pointer was given up from, which owns the count
+and gives it back where any reference would. This is Rust's `Box::into_raw` and `from_raw`, and it is
+how an object is handed to code that holds a plain pointer — a C caller above all
+([`ffi.md`](/reference/ffi/#handing-c-an-object-to-hold)).
+
+```sysl
+import sysl.raw.from_raw
+
+struct Db
+    n: int
+
+impl Drop for Db
+    drop(self) = print("closed", self.n)
+
+open(n: int) -> *Db
+    val d: &Db = Db(n)
+    d.into_raw()
+
+close(p: *Db)
+    val d: &Db = from_raw(p)
+
+val p = open(5)
+
+p.n += 1
+print(p.n)
+close(p)
+print("done")
+```
+
+```output
+6
+closed 6
+done
+```
+
+`d.into_raw()` at `d`'s last use hands `d`'s own count over; one still used after takes a second, so
+the object then has two owners until both are gone. A `&sync T` gives up and adopts back the same way —
+a position wanting a `&sync T` makes `from_raw` answer one — and `from_raw[T](p)` names the type where
+no position does. **`into_raw` is the reference's**, so a value (`T`) and a plain pointer have none,
+and a type's own member of the name is what a call reaches first. A trait object is refused: it is two
+words, and the table would be lost.
+
+**`from_raw` is in the raw tier, which is why it is imported.** Nothing can check its pointer: it has to
+be one `into_raw` answered for a reference of that kind — `&T` or `&sync T` — and it is adopted **once**.
+A pointer from anywhere else is read as a box header that is not there, and adopting one twice gives
+the count back twice. The header sits a fixed distance before the payload whichever header the type's
+box has — the count alone, or the count, the destructor and the weak count beside a `weak` — so a type
+that is weakened, destroyed or neither round-trips the same.
+
+```sysl
+struct Db
+    n: int
+
+val d = Db(1)
+val p = d.into_raw()
+```
+
+```error
+'into_raw' gives up a counted reference, so hold the value as a '&Db'
+```
+
 ### Device memory
 
 An optimizer may assume that reading storage twice yields one value, that a store nobody reads is not
