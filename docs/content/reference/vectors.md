@@ -228,7 +228,9 @@ integer wider than 128 bits becoming a float) is converted one lane at a time, a
 
 An array of the lanes converts too, since it holds the same values: `<4>f64(xs)` over a `[4]i32`.
 A literal argument is written at the vector, so `<4>f32([1, 2, 3, 4])` is four `f32` lanes and
-`<4>f32(0.5)` the splat. Inside a generic body `<N>T(v)` converts to whatever `T` and `N` are bound
+`<4>f32(0.5)` the splat. **A scalar of the lane's own type splats too**, whatever it is held in:
+`<4>f32(x)` with `x: f32` is `x` in every lane, and a scalar of any other type is refused, as it is at
+a binding. Inside a generic body `<N>T(v)` converts to whatever `T` and `N` are bound
 to. The lane count never changes, since a lane has nowhere to go and none to come from otherwise:
 
 ```sysl
@@ -970,7 +972,7 @@ f() -> unit
 ```
 
 ```error
-type '<4>f16' has no method 'exp'
+type '<4>f16' has no method 'exp' — 'exp' is defined for f32 and f64 lanes, and <4>f16 is not one — widen the lanes to f32 first
 ```
 
 ## NaN-propagating maximum and minimum
