@@ -109,15 +109,23 @@ end Abandoning
 check_abandons(a: &Analysis, funcs: Buf[TFunc], externs: Buf[TExtern], vtables: Buf[TVtable])
     val names = abandoning_names(funcs, externs)
 
-    // A program that declares nothing `@abandons` -- almost all of them -- pays for no walk at all.
-    if names.is_empty() then return
+    // A program that declares nothing `@abandons` and writes no `@abandons *extern` -- almost all of
+    // them -- pays for no walk at all.
+    if names.is_empty() && !a.abandoning_pointers then return
 
     var seeds: Set[string] = set()
 
+    // A call through an `@abandons *extern` is reached as a call to an abandoning function is, but it
+    // is no seed: what it calls may come back, so its caller keeps its frame and holds nothing across.
+    var reached: Buf[string] = buf()
+
+    reached.push(AbandoningCallKey)
+
     for item in names
         seeds.add(item)
+        reached.push(item)
 
-    val cx: &Abandoning = Abandoning(seeds, may_abandon(funcs, names), vtables, empty_scope(), false,
+    val cx: &Abandoning = Abandoning(seeds, may_abandon(funcs, reached), vtables, empty_scope(), false,
                                      set())
 
     for f in funcs
@@ -376,8 +384,10 @@ end args_bind_counted
 
 private check_node(a: &Analysis, cx: &Abandoning, e: TExpr, held: string)
     *e.kind match
-        TFuncAddr(name, _, _) ->
-            if cx.reach.has(name) then say(a, cx, e.span, made_a_value(cx, name))
+        // **Taken as an `@abandons *extern` the address is the call's own mark**: every call through
+        // it is reached as an abandoning one, and its caller held to holding nothing across.
+        TFuncAddr(name, _, ty) ->
+            if cx.reach.has(name) && !abandoning_pointer(ty) then say(a, cx, e.span, made_a_value(cx, name, ty))
             return
         TErase(_, vtable, _) ->
             val reached = erased_reach(cx, vtable)
@@ -410,14 +420,25 @@ private erased_reach(cx: &Abandoning, vtable: string) -> Option[string]
     None
 end erased_reach
 
-private held_refusal(name: string, held: string) -> string =
-    s"'${qualified_name(name)}' can reach a call that abandons every frame below it and never comes back, and this frame holds ${held} across the call — its count would never be given back. Give it back first: hold it in a function that returns before this call is made, or as a '*T'"
+private held_refusal(name: string, held: string) -> string
+    val callee = if name == AbandoningCallKey then "a call through an '@abandons *extern' pointer"
+    else s"'${qualified_name(name)}'"
 
-private made_a_value(cx: &Abandoning, name: string) -> string
+    s"$callee can reach a call that abandons every frame below it and never comes back, and this frame holds ${held} across the call — its count would never be given back. Give it back first: hold it in a function that returns before this call is made, or as a '*T'"
+end held_refusal
+
+// The refusal of an address taken at a type that does not say a call through it may abandon, naming
+// the type that does.
+private made_a_value(cx: &Abandoning, name: string, ty: Type) -> string
+    val marked = underlying(ty) match
+        CFn(ps, r, marks) -> s", or take its address as '${type_show(CFn(ps, *r, with_abandons(marks, true)))}'"
+        _ -> ""
+
     if cx.seeds.has(name)
-        return s"'${qualified_name(name)}' is '@abandons', and a call through a value cannot be followed to it, so its caller would not give its frame back first — call it by name"
+        return s"'${qualified_name(name)}' is '@abandons', and a call through a value cannot be followed to it, so its caller would not give its frame back first — call it by name$marked"
 
-    s"'${qualified_name(name)}' can reach a call that abandons every frame below it, and a call through a value cannot be followed there, so whoever calls this value could hold a count across it unseen — call it by name"
+    s"'${qualified_name(name)}' can reach a call that abandons every frame below it, and a call through a value cannot be followed there, so whoever calls this value could hold a count across it unseen — call it by name$marked"
+end made_a_value
 
 // A closure is erased into a `&Fn` the same way a type is erased into its trait, and its name is a
 // counter nobody wrote, so it is said in the closure's own words.

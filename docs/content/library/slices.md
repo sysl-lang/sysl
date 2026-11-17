@@ -1,6 +1,6 @@
 ---
 title: The slices module
-summary: "`sysl.slices` — the operations over a built-in slice: searching, comparing, reversing, a copy that is right where the two slices overlap, two sorts that neither of them allocates, a binary search that answers where a missing value belongs, and the pointer a C binding hands across."
+summary: "`sysl.slices` — the operations over a built-in slice: searching, comparing, reversing, a copy that is right where the two slices overlap, two sorts that neither of them allocates, a binary search that answers where a missing value belongs, a sum and a dot product whose float order is the back end's, and the pointer a C binding hands across."
 weight: 55
 ---
 
@@ -357,6 +357,35 @@ is unspecified rather than wrong in some particular way.
 reach for on a slice ordered by anything but `<` — searching with an order the slice was not sorted
 by is the mistake the paragraph above describes, and it is easiest to make when the sort took a
 comparison and the search did not.
+
+## Adding a slice up
+
+`sum` adds every element, starting from the type's zero, and `dot` adds the products of the elements
+two slices hold at the same index — over the pairs they have in common, as a zip is, so the longer
+slice's tail is not read. Both take any element type with `+` and a zero (`dot` with `*` as well):
+
+```sysl
+import sysl.slices.{sum, dot}
+
+var xs = [1.5, 2.5, 3.0, 0.25]
+var ys = [2.0, 4.0, 0.5, 8.0]
+var counts = [3, 1, 4]
+var none: []real = []
+
+print(sum(xs), dot(xs, ys), sum(counts), sum(none))
+```
+
+```output
+7.25 16.5 8 0
+```
+
+**Over floats the order is the back end's, and the result may differ from a left-to-right sum in
+the last bits.** Both are [`@reassociate`](/reference/attributes/#reassociate-float-sums-the-back-end-may-regroup)
+functions, which is what lets the optimizer split the sum over the lanes of a vector register and
+add them together at the end instead of making each addition wait for the one before — and in
+`dot`, fuse each product into its sum where the machine has the instruction. Every partial sum above
+is exact, so any grouping gives the same answer; a sum that must be the written one is a loop
+written out, which keeps its order. Integers are associative already, so over them nothing changes.
 
 ## Handing a slice to C
 
