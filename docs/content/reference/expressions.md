@@ -2335,6 +2335,45 @@ Nothing is written for either: the compiler works it out from the bodies, as it 
 pointer a function is handed. **A `val` is copied either way**, since nothing can tell a copy of it
 from the variable, and so are a pattern's binding and a by-name parameter.
 
+**The choice is made where the closure goes, never by what the body does to that place later.** A
+closure handed to a parameter its function keeps, or stored in module storage, holds a copy even
+where a later statement overwrites the place it was kept in — a second call storing another closure
+there, an assignment of `None`, a `defer` that clears it. So a line in a closure means the same thing
+wherever it stands:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+var kept: Option[&Fn() -> unit] = None
+
+keep(f: &Fn() -> unit)
+    kept = Some(f)
+    f()
+
+var a: Buf[u8] = buf()
+a.push(1)
+keep(() -> a.release())
+
+var b: Buf[u8] = buf()
+b.push(1)
+keep(() -> b.release())
+kept = None
+
+print(a.len(), b.len())
+```
+
+```output
+1 1
+```
+
+Each closure releases its own copy of the handle, and both variables keep their element, though the
+second call overwrites `kept` and the program then clears it. A write that only the variable could show is
+refused where it would reach the copy, and the refusal says which way the closure captures and why
+(below). `--explain-escapes` says it for every closure that holds a `var`: *a closure holds 'a' by
+value, because it is handed to 'keep' on line 11, which keeps its parameter 'f' (it is stored in
+'kept')*, or *a closure holds 'n' by reference, because nothing it is handed to or stored in keeps
+it*.
+
 **The copy of a `val` is read-only exactly as the `val` is**: the closure may read it, index it and
 view it as a `[]const T`, but a write to it, a `*self` method called on it, or a `[]T` view of an
 array it holds is refused, since every such write would reach only the closure's copy.

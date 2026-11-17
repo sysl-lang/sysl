@@ -19,6 +19,13 @@ import sysl.container.{Map, map, Set, set}
 // nothing reaches a signature: the callee is handed a value it calls, whatever that value's fields
 // hold.
 //
+// **The mode is decided where the closure goes, never by what the body does to that place later**: a
+// keep the rule would let a later overwrite take back -- a second call storing over the same static, a
+// `defer` clearing it -- still decides the mode when what was kept is a closure literal
+// (`keeps_flow.sysl`'s `note_taken_back`, `keeps.sysl`'s `probe_frame`). Otherwise the same line in a
+// closure would write the variable or only a copy depending on code written after it. The box is
+// decided by where the closure is at a way out, as before: nothing reaches a box taken back.
+//
 // The mode is a property of the literal, and of each capture: a `val`, a pattern's binding, a
 // by-name parameter and a value with no storage are copied whatever the literal's mode, since
 // nothing can tell a copy of them from the variable (`closure.sysl`'s `referable_captures`).
@@ -49,6 +56,9 @@ decide_closure_modes(cx: &KeepsCx, funcs: Buf[TFunc], vals: Buf[TVal])
     var unframed: Map[string, string] = map()
     var boxes: Buf[BoxSite] = buf()
 
+    // Where each closure literal is written, for `--explain-escapes`.
+    var sites: Buf[ClosureSite] = buf()
+
     for f in funcs
         gather_boxes(a, f, &boxes)
 
@@ -56,6 +66,8 @@ decide_closure_modes(cx: &KeepsCx, funcs: Buf[TFunc], vals: Buf[TVal])
         val here = closures_built_in(walk_body_of(f))
 
         if here.is_empty() then continue
+
+        closure_sites(f, &sites)
 
         var probing = false
 
@@ -66,11 +78,17 @@ decide_closure_modes(cx: &KeepsCx, funcs: Buf[TFunc], vals: Buf[TVal])
 
         if !probing then continue
 
-        for item in probe_frame(cx, f)
+        val frame = probe_frame(cx, f)
+
+        for item in frame.0
             if is_probe_candidate(a, item.0) then escape(escaped, item.0, item.1)
 
             escape(unframed, item.0, item.1)
         end for
+
+        // Kept, and taken back later: the capture mode is the keep's, and the box may stay.
+        for item in frame.1
+            if is_probe_candidate(a, item.0) then escape(escaped, item.0, item.1)
 
         val blocks = probe_blocks(cx, f)
 
@@ -108,7 +126,7 @@ decide_closure_modes(cx: &KeepsCx, funcs: Buf[TFunc], vals: Buf[TVal])
             continue
         end if
 
-        for item in probe_frame(cx, f)
+        for item in probe_frame(cx, f).0
             escape(unframed, item.0, item.1)
 
         val blocks = probe_blocks(cx, f)
@@ -137,9 +155,89 @@ decide_closure_modes(cx: &KeepsCx, funcs: Buf[TFunc], vals: Buf[TVal])
     for base in built
         if is_probe_candidate(a, base) && !escaped.has(base) then a.by_ref_closures.add(base)
 
+    explain_modes(a, sites, escaped)
     frame_boxes(a, boxes, unframed)
     say_lost_writes(a, built, escaped)
 end decide_closure_modes
+
+// -- what `--explain-escapes` says of each closure ----------------------------------------------------
+
+// A closure literal as written: its struct, the function that builds it, where, and its captures.
+private struct ClosureSite
+    base: string
+    func: string
+    at: Span
+    fields: Buf[string]
+end ClosureSite
+
+// Every closure literal a body builds, where it is written.
+private closure_sites(f: TFunc, out: *Buf[ClosureSite])
+    val into = out
+
+    walk_texpr(walk_body_of(f), expr_walk(true, x -> *x.kind match
+        TStructNew(st, _) ->
+            if is_closure_literal(Struct(st))
+                var fields: Buf[string] = buf()
+
+                for fd in st.fields
+                    fields.push(fd.0)
+
+                into.push(ClosureSite(st.base, f.name, x.span, fields))
+            end if
+        _ -> ()))
+end closure_sites
+
+// **Each closure that could hold a `var` by reference says which way it holds them, and why**: by
+// reference where nothing it is handed to or stored in keeps it, by value with the first keep found.
+// A closure whose every capture is copied whatever its mode -- a `val`, a pattern's binding -- has
+// no choice to explain. A generic body built twice says it once. The lines are in source order.
+private explain_modes(a: &Analysis, sites: Buf[ClosureSite], escaped: Map[string, string])
+    var said: Buf[(string, usize, string)] = buf()
+
+    for s in sites
+        if !is_probe_candidate(a, s.base) then continue
+
+        val refs = a.closure_refs.get(s.base).unwrap()
+        var names: Buf[string] = buf()
+
+        for i in 0..<s.fields.len()
+            if i < refs.len() && refs[i] then names.push(s.fields[i])
+
+        val why = if a.by_ref_closures.has(s.base) then by_reference_why else escaped.get(s.base) match
+            Some(w) -> s"by value, because $w"
+            None -> "by value"
+
+        val scope = func_home(a, s.func)
+        val at = scope.src.locate(s.at.start)
+        val line = s"${scope.src.name}:${at.line}:${at.col + literate_shift(scope.src)}: a closure holds " +
+            s"${quoted_and(names)} $why"
+
+        var again = false
+
+        for s2 in said
+            if s2.2 == line then again = true
+
+        if again then continue
+
+        // Each line goes after every one before it in its file.
+        val item = (scope.src.name, s.at.start, line)
+        var j = said.len()
+
+        said.push(item)
+
+        while j > 0 && said[j - 1].0 == item.0 && said[j - 1].1 > item.1
+            said[j] = said[j - 1]
+            j -= 1
+        end while
+
+        said[j] = item
+    end for
+
+    for s in said
+        a.closure_box_notes.push((s.0, s.2))
+end explain_modes
+
+private const by_reference_why: string = "by reference, because nothing it is handed to or stored in keeps it"
 
 // -- the box of a `&Fn` -----------------------------------------------------------------------------
 
