@@ -3405,6 +3405,41 @@ Four more refusals go with it: a header that is not there, a value the declared 
 (naming the value and both ends of the range), a type that is not a number, and a block written
 inside a body, which has no file's headers to be compiled against.
 
+**A whole number is C's own value, read at its own C type and width**, whatever the line is
+declared at — so the range check is made against the number the header means. `UINT64_MAX` is
+18446744073709551615 at any width that holds it, an `unsigned __int128` reads whole into a `u128`, and
+C's rules for a negative in an unsigned type are C's: `-1u` is the `unsigned int` 4294967295.
+
+```sysl
+@include("<stdint.h>")
+
+c const
+    TOP: u64   = "UINT64_MAX"
+    WIDE: u128 = "(unsigned __int128)UINT64_MAX << 8"
+    LOW: i128  = "(__int128)INT64_MIN * 4"
+    MASK: u32  = "-1u"
+
+print(s"$TOP $WIDE $LOW $MASK")
+```
+
+```output
+18446744073709551615 4722366482869645213440 -36893488147419103232 4294967295
+```
+
+Read at a type that cannot hold it, the same number is refused rather than wrapped into one that
+fits — `UINT64_MAX` is not the `i64` -1, and `-1` (an `int`) is no `u64`:
+
+```sysl
+@include("<stdint.h>")
+
+c const
+    N: i64 = "UINT64_MAX"
+```
+
+```error
+'UINT64_MAX' is 18446744073709551615 here, which 'i64' cannot hold
+```
+
 **A `string` from C is not written this way.** A number is a number in the compiler's output and
 reads straight off; a string constant is a block of storage and a different job, and it would have to
 be written `"\"foo\""` — two quotings for one value, which is a form nobody would guess. The refusal
