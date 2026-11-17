@@ -61,6 +61,13 @@ print(zero[0], ones[3], half(ones)[0])
 
 **A declaration with no initializer** starts every lane at the lane type's zero.
 
+**A module vector over constants is constant data**, as an array literal is: a literal, a splat, the
+operators, a shuffle, a `select`, a conversion and a vector worked out from another such `val` are
+computed while compiling and laid into the object file, alone or inside a struct, an array or an enum's
+payload. So a package holding a table of weights builds for a freestanding target, where nothing runs
+before `main` to fill storage in. One that reads a module `var`, or calls `abs` or `mul_add`, is
+computed when the program starts, and a freestanding build refuses it, saying which.
+
 **A lane is read by a constant index.** This is the one subscript in sysl that is not checked at run
 time: a vector has no address, and an out-of-range lane read has no defined result at the machine
 level. The index must therefore be a literal or a `const`, and it is checked at compile time:
