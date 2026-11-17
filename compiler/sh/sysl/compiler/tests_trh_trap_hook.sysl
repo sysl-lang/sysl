@@ -83,23 +83,23 @@ private trh_panics(text: string, printed: string, said: string) =
 @test("a failed require names the clause")
 trh_require()
     trh_traps("f(x: int) -> int\n    require x > 0\n    x\n\nprint(f(-1))\n",
-              "'require' does not hold (main.sysl:2:13)\n")
+              "require failed (main.sysl:2:13)\n")
 
 @test("a failed ensure names the clause")
 trh_ensure()
     trh_traps("f(x: int) -> int\n    ensure result > 0\n    x - 5\n\nprint(f(1))\n",
-              "'ensure' does not hold (main.sysl:2:12)\n")
+              "ensure failed (main.sysl:2:12)\n")
 
 @test("a broken struct invariant says so")
 trh_struct_invariant()
     trh_traps("struct Span\n    lo: int\n    hi: int\n    invariant lo <= hi\n\nvar hi = 1\n" +
               "val s = Span(3, hi)\nprint(s.lo)\n",
-              "'invariant' does not hold (main.sysl:7:9)\n")
+              "invariant of 'Span' failed (main.sysl:7:9)\n")
 
 @test("a loop invariant that stops holding says so")
 trh_loop_invariant()
     trh_traps("var i = 0\nwhile i < 5\n    invariant i < 3\n    i += 1\nprint(i)\n",
-              "'invariant' does not hold (main.sysl:3:15)\n")
+              "invariant failed (main.sysl:3:15)\n")
 
 @test("a value outside a within range names the type and the expression")
 trh_within()
@@ -139,7 +139,7 @@ trh_no_locations()
                                    ("main.sysl", "f(x: int) -> int\n    require x > 0\n    x\n\nprint(f(-1))\n")],
                                   DefaultOptimization)
 
-    assert_eq(err, "'require' does not hold\n")
+    assert_eq(err, "require failed\n")
     assert(state == Status.Signalled(5), s"stopped with $state")
 
 // -- a panic writes standard error and aborts --------------------------------------------------------
@@ -190,7 +190,15 @@ private trh_hooked(main: string) -> [2](string, string) = [
 @test("an exported sysl_trap sees a contract's kind, sentence and location, and the trap still follows")
 trh_hook_sees_a_contract()
     trh_stops(trh_hooked("f(x: int) -> int\n    require x > 0\n    x\n\nprint(f(-1))\n")[..], 5, "",
-              "hook 17 main.sysl:4:13 'require' does not hold|0\n")
+              "hook 17 main.sysl:4:13 require failed|0\n")
+
+// The message is part of the sentence the hook is handed, and two messages that differ only in
+// punctuation each keep their own words.
+@test("an exported sysl_trap sees a contract's message in its sentence")
+trh_hook_sees_a_contract_message()
+    trh_stops(trh_hooked("f(x: int) -> int\n    require x > 0, \"x > 0\"\n    require x < 9, \"x < 9\"\n    x\n\n" +
+                         "print(f(3))\nprint(f(10))\n")[..], 5, "3\n",
+              "hook 17 main.sysl:5:13 require failed: x < 9|0\n")
 
 @test("an exported sysl_trap sees a range failure as its own kind")
 trh_hook_sees_a_range()
@@ -221,7 +229,7 @@ trh_old_hook_keeps_its_forms()
     trh_stops([("main.sysl", "import report\n\nval xs = [1, 2, 3]\nvar i = 5\nprint(xs[i])\n"),
                ("report/report.sysl", report)], 5, "", "old hook 256\n")
     trh_stops([("main.sysl", "import report\n\nf(x: int) -> int\n    require x > 0\n    x\n\nprint(f(-1))\n"),
-               ("report/report.sysl", report)], 5, "", "'require' does not hold (main.sysl:4:13)\n")
+               ("report/report.sysl", report)], 5, "", "require failed (main.sysl:4:13)\n")
 
 // -- a library inside a C host -------------------------------------------------------------------------
 
@@ -347,7 +355,7 @@ trh_host_hook()
     assert_eq(panicked.2, "panic: terndb: bad code (terndb/terndb.sysl:10)\n" +
               "hook 21 terndb/terndb.sysl:10:23 terndb: bad code\n")
     assert(panicked.0 == Status.Signalled(6), s"stopped with ${panicked.0}")
-    assert_eq(contract.2, "hook 17 terndb/terndb.sysl:15:13 'require' does not hold\n")
+    assert_eq(contract.2, "hook 17 terndb/terndb.sysl:15:13 require failed\n")
     assert(contract.0 == Status.Signalled(5), s"stopped with ${contract.0}")
 
     for r in [bounds, panicked, contract]
