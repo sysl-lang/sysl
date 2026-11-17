@@ -400,3 +400,39 @@ const ends_with[T: Eq](xs: []const T, suffix: []const T) -> bool
     if suffix.len > xs.len then return false
 
     equal(xs[(xs.len - suffix.len)..], suffix)
+
+/** Every element added together, starting from `T.zero()` -- which is what an empty slice answers.
+ *
+ * **Over floats the order is the back end's: the result may differ from a left-to-right sum in the
+ * last bits.** The function is `@reassociate`, so the optimizer may split the sum over several
+ * accumulators, held in vector registers, and add them together at the end -- which is what lets the
+ * additions overlap instead of each waiting for the one before. A sum that must be the written one
+ * is a loop written out.
+ * Integers are associative already, so over them nothing changes.
+ */
+@reassociate
+const sum[T: Add + Zero](xs: []const T) -> T
+    var total = T.zero()
+
+    for x in xs do total = total + x
+
+    total
+
+/** The sum of the products of the elements the two slices have at the same index -- over the pairs
+ * they have in common, as a zip is, so the longer slice's tail is not read.
+ *
+ * Over floats it is `@reassociate` as `sum` is, and each product meets its sum as one fused
+ * multiply-add where the machine has one: the result may differ from the left-to-right
+ * `a[0] * b[0] + a[1] * b[1] + …` in the last bits.
+ */
+@reassociate
+const dot[T: Add + Mul + Zero](a: []const T, b: []const T) -> T
+    val n = if a.len < b.len then a.len else b.len
+    var total = T.zero()
+
+    // Every index is below both lengths.
+    @unchecked
+        for i in 0..<n do total = total + a[i] * b[i]
+
+    total
+end dot
