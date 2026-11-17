@@ -182,7 +182,7 @@ private lower_unit(a: &Analysis, unit: Program, t: Target) -> Program
     var aliases: Buf[Stmt] = buf()
 
     for i in 0..<types.len()
-        aliases.push(measured_type(a, at, types[i], answers.1[i], answers.2))
+        aliases.push(spelled_as(measured_type(a, at, types[i], answers.1[i], answers.2), types[i].c, unit))
 
     var body: Buf[Stmt] = buf()
     var next_const: usize = 0
@@ -646,7 +646,7 @@ private const LongDoubleKind: int = 1000
 // A header as C spells it. A name already carrying its own `<…>` or `"…"` is passed through, so
 // `@include("<stdint.h>")` reaches a system header and `@include("qcbor.h")` reaches one beside the
 // module -- which is the same choice a C file makes and is not sysl's to make for it.
-private quoted_header(header: string) -> string =
+quoted_header(header: string) -> string =
     if header.starts_with("<") || header.starts_with("\"") then header else s"\"$header\""
 
 // -- reading the answers back ----------------------------------------------------------------
@@ -898,7 +898,7 @@ end measured_const
 // The declaration a measured line becomes, which is an ordinary constant holding an ordinary
 // literal -- the same shape whichever carrier the value crossed on.
 private held(c: CConstDecl, value: Expr) -> Stmt =
-    stmt(c.span, ConstDecl(c.name, Some(c.typ), value, c.vis))
+    stmt(c.span, ConstDecl(c.name, Some(c.typ), value, c.vis, None))
 
 // One measured whole number, held to the range of the type it was asked for.
 //
@@ -1292,7 +1292,20 @@ end measured_type
 
 private alias_to(t: CTypeDecl, name: string) -> Stmt =
     stmt(t.span, TypeDecl(TypeDecl(t.name, type_ref(t.span, NamedType(name, buf())), false, None,
-                                   None, t.vis, true, None, None, no_type_params(), buf(), buf())))
+                                   None, t.vis, true, None, None, no_type_params(), buf(), buf(),
+                                   None)))
+
+// A measured type's declaration, told the C name it was measured from and the headers that declare
+// it, which is what a generated header spells it by.
+private spelled_as(s: Stmt, c: string, unit: Program) -> Stmt = *s.kind match
+    TypeDecl(d) ->
+        var headers: Buf[string] = buf()
+
+        for item in unit.includes
+            headers.push(item.header)
+
+        stmt(s.span, TypeDecl(d with { c_spelling = Some(CSpelling(c, headers)) }))
+    _ -> s
 
 // Which integer a measurement is, and how wide. Nothing covers the two answers that are not one: a
 // `_Bool`, which a `c type` resolves and a constant cannot be read as, and the `default` arm, which

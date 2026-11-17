@@ -36,7 +36,7 @@ subst_params(a: &Analysis, t: Type, subst: Buf[Binding]) -> Type
         Enum(d) -> if d.targs.is_empty() then t else reinstantiate(a, d.base, subst_list(a, d.targs, subst))
         Constrained(d) ->
             if d.targs.is_empty() then t else reinstantiate(a, d.generic, subst_list(a, d.targs, subst))
-        Ptr(inner) -> Ptr(subst_params(a, *inner, subst))
+        Ptr(inner, ro) -> Ptr(subst_params(a, *inner, subst), ro)
         Ref(inner, sync) -> Ref(subst_params(a, *inner, subst), sync)
         Weak(inner) -> Weak(subst_params(a, *inner, subst))
         Array(n, elem) -> Array(n, subst_params(a, *elem, subst))
@@ -160,8 +160,8 @@ unify(a: &Analysis, scope: Scope, want: TypeRef, actual: Type, tparams: Buf[stri
 private unify_nameless(a: &Analysis, scope: Scope, want: TypeRef, actual: Type, tparams: Buf[string],
                        sub: *Buf[Binding])
     *want.kind match
-        PtrType(inner) -> actual match
-            Ptr(t) -> if !binds_object(inner, *t, tparams, sub) then unify(a, scope, inner, *t, tparams, sub)
+        PtrType(inner, _) -> actual match
+            Ptr(t, _) -> if !binds_object(inner, *t, tparams, sub) then unify(a, scope, inner, *t, tparams, sub)
             _ -> ()
 
         // A `&T` parameter also accepts a bare `T`, which the call boxes, so the payload type is
@@ -773,7 +773,7 @@ instantiate_nested(a: &Analysis, base: string, g: &NestedGeneric, solved: Buf[Ty
 
     var params: Buf[(string, Type)] = buf()
 
-    params.push(("self", Ptr(Struct(g.frame.env))))
+    params.push(("self", Ptr(Struct(g.frame.env), false)))
 
     for p in g.decl.params
         params.push((p.name, resolve_type(a, g.frame.scope, p.typ, subst)))
@@ -791,7 +791,7 @@ end instantiate_nested
 
 // A receiver's type with its view made read-only, through whatever mode the sigil asked for.
 private const_receiver(t: Type) -> Type = t match
-    Ptr(inner) -> Ptr(const_receiver(*inner))
+    Ptr(inner, ro) -> Ptr(const_receiver(*inner), ro)
     other -> const_view(other)
 
 // The key of the overload set filed under `base` that holds `f` itself -- the declaration written

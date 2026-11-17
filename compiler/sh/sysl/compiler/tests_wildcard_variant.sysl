@@ -151,3 +151,116 @@ wcv_struct_and_variant()
 
     assert_eq(wcv_out(fs), "7\n")
 end wcv_struct_and_variant
+
+// -- the payload's shape, against the offers ---------------------------------------------------------
+//
+// **The offer refusal fires only where neither the expected type nor the payload's shape picks one**
+// (`reference/modules.md § Resolution`, `reference/types.md § A variant belongs to its enum`). `m`
+// and `m2` above offer `Hit` and `Gone` at one shape, so every refusal above stands; `m3` offers them
+// at other shapes, and `m4` a `Hit` whose payload an int literal fits as well as `m`'s.
+
+private wcv_m3() -> string = "module m3\n\nenum O\n    Hit(s: string)\n    Gone(code: int)\n"
+
+private wcv_m4() -> string = "module m4\n\nenum P\n    Hit(n: i64)\n"
+
+// `main` beside `m` and the given other modules.
+private wcv_with(main: string, others: Buf[(string, string, string)]) -> Buf[(string, string, string)]
+    var fs: Buf[(string, string, string)] = buf()
+
+    fs.push(("", "main.sysl", main))
+    fs.push(("m", "m.sysl", wcv_m()))
+
+    for o in others
+        fs.push(o)
+
+    fs
+end wcv_with
+
+// The one module `dir`, in a file of its name.
+private wcv_one(dir: string, src: string) -> Buf[(string, string, string)]
+    var fs: Buf[(string, string, string)] = buf()
+
+    fs.push((dir, dir + ".sysl", src))
+    fs
+
+@test("two wildcards at different shapes: a call takes the one its payload fits, by type")
+wcv_shape_by_type()
+    if wcv_can_run() then return
+
+    val main = "import m.*\nimport m3.*\n\nval x = Hit(1)\nval y = Hit(\"a\")\n" +
+               "print(x match\n    m.M.Hit(n) -> n\n    _ -> 0)\n" +
+               "print(y match\n    m3.O.Hit(s) -> s\n    _ -> \"?\")\n"
+
+    assert_eq(wcv_out(wcv_with(main, wcv_one("m3", wcv_m3()))), "1\na\n")
+end wcv_shape_by_type
+
+@test("a bare name is the one that carries nothing, and a call of it the one that carries something")
+wcv_shape_bare_and_called()
+    if wcv_can_run() then return
+
+    val main = "import m.*\nimport m3.*\n\nval x = Gone\nval y = Gone(5)\n" +
+               "print(x match\n    m.M.Gone -> \"gone\"\n    _ -> \"?\")\n" +
+               "print(y match\n    m3.O.Gone(c) -> c\n    _ -> 0)\n"
+
+    assert_eq(wcv_out(wcv_with(main, wcv_one("m3", wcv_m3()))), "gone\n5\n")
+end wcv_shape_bare_and_called
+
+@test("a payload that fits neither offer is the offer refusal, not a guess")
+wcv_shape_fits_neither()
+    if wcv_can_run() then return
+
+    val said = wcv_out(wcv_with("import m.*\nimport m3.*\n\nval x = Hit(true)\nprint(1)\n",
+                                wcv_one("m3", wcv_m3())))
+
+    assert(said.contains(wcv_offered("Hit", "'m.*' and 'm3.*'")), said)
+end wcv_shape_fits_neither
+
+@test("a literal both payloads take is the offer refusal, though the declared types differ")
+wcv_shape_literal_fits_both()
+    if wcv_can_run() then return
+
+    val said = wcv_out(wcv_with("import m.*\nimport m4.*\n\nval x = Hit(1)\nprint(1)\n",
+                                wcv_one("m4", wcv_m4())))
+
+    assert(said.contains(wcv_offered("Hit", "'m.*' and 'm4.*'")), said)
+end wcv_shape_literal_fits_both
+
+@test("three wildcards: the payload only one fits resolves, one that two fit names all three")
+wcv_shape_three_wildcards()
+    if wcv_can_run() then return
+
+    var others = wcv_one("m2", wcv_m2())
+
+    others.push(("m3", "m3.sysl", wcv_m3()))
+
+    val ok = "import m.*\nimport m2.*\nimport m3.*\n\nval y = Hit(\"b\")\n" +
+             "print(y match\n    m3.O.Hit(s) -> s\n    _ -> \"?\")\n"
+
+    assert_eq(wcv_out(wcv_with(ok, others)), "b\n")
+
+    val said = wcv_out(wcv_with("import m.*\nimport m2.*\nimport m3.*\n\nval x = Hit(1)\nprint(1)\n",
+                                others))
+
+    assert(said.contains(wcv_offered("Hit", "'m.*' and 'm2.*' and 'm3.*'")), said)
+end wcv_shape_three_wildcards
+
+@test("at one shape, the expected type still picks between two wildcards' offers")
+wcv_same_shape_expected()
+    if wcv_can_run() then return
+
+    val main = "import m.*\nimport m2.*\n\nval x: m2.N = Hit(2)\nval y: m.M = Gone\n" +
+               "print(x match\n    Hit(n) -> n\n    _ -> 0)\n" +
+               "print(y match\n    Gone -> \"gone\"\n    _ -> \"?\")\n"
+
+    assert_eq(wcv_out(wcv_pair(main)), "2\ngone\n")
+end wcv_same_shape_expected
+
+@test("the program's own enum of the variant shadows both wildcards' offers, at any shape")
+wcv_own_enum_shadows()
+    if wcv_can_run() then return
+
+    val main = "import m.*\nimport m2.*\n\nenum L\n    Hit(n: int)\n\nval x = Hit(3)\n" +
+               "print(x match\n    L.Hit(n) -> n)\n"
+
+    assert_eq(wcv_out(wcv_pair(main)), "3\n")
+end wcv_own_enum_shadows

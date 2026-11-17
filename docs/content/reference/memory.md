@@ -2887,6 +2887,64 @@ print(one(null))
 'null' takes its type from its context, and there is none here
 ```
 
+### `*const T` — a pointer that is read through and not written
+
+The `const` sits after the `*`, where it sits after a slice's `[]`, and for the same reason: it is a
+property of the **pointer** — what may be done through it — and not of what it points at. It is the
+signature a function that only reads through a pointer should have, and it is what C writes
+`const T *`:
+
+```sysl
+struct P
+    x: int
+    ys: [2]int
+
+total(p: *const int, n: int) -> int
+    var s = 0
+    for i in 0..<n do s += p[i]
+    s
+
+field(p: *const P) -> int = p.x + p.ys[1]
+
+var xs = [1, 2, 3]
+var q = P(4, [5, 6])
+
+print(total(&xs[0], 3), *(&xs[1]), field(&q))
+```
+
+```output
+6 2 10
+```
+
+**Every road to a write through one is refused alike** — `*p = v`, `p[i] = v`, `p.f = v`, a part of
+any of them, a `ref` bound through it, and a `*self` method called through it:
+
+```sysl
+set(p: *const int) = *p = 1
+```
+
+```error
+this is reached through a '*const int', which may be read and not written, so there is nothing to assign through. A pointer that writes is a '*int'
+```
+
+**It is one type with a bit**, as the two views are: the same address, passed and stored alike. So a
+`*T` is accepted wherever a `*const T` is wanted — an argument, a binding, a result, an `extern`'s
+parameter — and never the other way round:
+
+```sysl
+writes(p: *int) = *p = 1
+reads(p: *const int) = writes(p)
+```
+
+```error
+a '*const int' may be read through and not written, and a '*int' is a licence to write
+```
+
+Where the two have to agree — the branches of an `if`, the operands of `==` — they meet at the
+read-only pointer, and a view taken of a `*const T` is a `[]const T`. What it does not reach is
+storage behind an address it leads to: a `*T` field of the pointee is written exactly as that pointer
+allows. `ptr_cast` reaches between the two, as it reaches between any two pointers.
+
 ### Arithmetic: two directions, one spelling each
 
 **`p - q` between two pointers of one pointee is an `isize` counting elements** — C's `ptrdiff_t`, the
@@ -3145,6 +3203,72 @@ result's, **no count is taken or given back**, and the slot is left **empty** (z
 holding a count). **`slot_put(p, v)`** moves `v` into an **empty** slot, giving nothing back. A taken
 slot must be live, a put slot empty, and nothing reads an empty slot — the caller's to keep. Both
 refuse what is not a `*T`.
+
+### A counted reference given up as a pointer
+
+**`r.into_raw()` gives up a `&T` as a `*T`** — the address of the object itself, so its fields read and
+write through it — and **the pointer carries one count of the object away**: the count is not given
+back, so the object lives until something adopts it. **`from_raw(p)`**, imported from `sysl.raw`,
+**adopts that count back**: it answers the `&T` the pointer was given up from, which owns the count
+and gives it back where any reference would. This is Rust's `Box::into_raw` and `from_raw`, and it is
+how an object is handed to code that holds a plain pointer — a C caller above all
+([`ffi.md`](/reference/ffi/#handing-c-an-object-to-hold)).
+
+```sysl
+import sysl.raw.from_raw
+
+struct Db
+    n: int
+
+impl Drop for Db
+    drop(self) = print("closed", self.n)
+
+open(n: int) -> *Db
+    val d: &Db = Db(n)
+    d.into_raw()
+
+close(p: *Db)
+    val d: &Db = from_raw(p)
+
+val p = open(5)
+
+p.n += 1
+print(p.n)
+close(p)
+print("done")
+```
+
+```output
+6
+closed 6
+done
+```
+
+`d.into_raw()` at `d`'s last use hands `d`'s own count over; one still used after takes a second, so
+the object then has two owners until both are gone. A `&sync T` gives up and adopts back the same way —
+a position wanting a `&sync T` makes `from_raw` answer one — and `from_raw[T](p)` names the type where
+no position does. **`into_raw` is the reference's**, so a value (`T`) and a plain pointer have none,
+and a type's own member of the name is what a call reaches first. A trait object is refused: it is two
+words, and the table would be lost.
+
+**`from_raw` is in the raw tier, which is why it is imported.** Nothing can check its pointer: it has to
+be one `into_raw` answered for a reference of that kind — `&T` or `&sync T` — and it is adopted **once**.
+A pointer from anywhere else is read as a box header that is not there, and adopting one twice gives
+the count back twice. The header sits a fixed distance before the payload whichever header the type's
+box has — the count alone, or the count, the destructor and the weak count beside a `weak` — so a type
+that is weakened, destroyed or neither round-trips the same.
+
+```sysl
+struct Db
+    n: int
+
+val d = Db(1)
+val p = d.into_raw()
+```
+
+```error
+'into_raw' gives up a counted reference, so hold the value as a '&Db'
+```
 
 ### Device memory
 

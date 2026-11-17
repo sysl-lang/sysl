@@ -1,0 +1,428 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, read_text, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// **The spellings a generated header gives what a C API needs to say** (`reference/ffi.md § What the
+// compiler hands the C project`): `const T *` for a `*const T`, `void *` for a `*unit`, `size_t` and
+// `ptrdiff_t` for `usize` and `isize`, `uint8_t d[32]` for a `*[32]u8` parameter, a `c type` by its C
+// name, an include guard the build names, and a `#define` per exported constant and enum variant.
+//
+// **C is the oracle.** Each case is a C file written in the spelling a C API's own documentation
+// uses -- the allocator as `void *(*)(size_t)`, a digest as `uint8_t digest[32]` -- compiled by clang
+// against the header with `-Werror`, so a header that merely declares something compatible-looking
+// is caught by the warning it would have cost its users. One case links and runs the archive.
+
+private chs_ready() -> bool = std_root().is_ok() && clang_available()
+
+// `sysl <args>` as the command line answers it: the status, and everything it said.
+private chs_cli(args: []const string) -> (int, string)
+    var said: Buf[string] = buf()
+    val sink = &said
+    val code = run_cli(args, piece -> sink.push(piece))
+    var text = ""
+
+    for item in said
+        text = text + item + "\n"
+
+    reset_search_paths()
+    (code, text)
+end chs_cli
+
+// A project named `probe` holding nothing but `mylib`, as an archive project is.
+private chs_project(lib: string) -> string
+    val root = make_temp_dir("sysl-chs").unwrap()
+
+    write_text(s"$root/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    make_dir_all(s"$root/mylib").unwrap()
+    write_text(s"$root/mylib/mylib.sysl", s"module mylib\n\n$lib").unwrap()
+    root
+end chs_project
+
+// The header `emit-header` prints for `lib`, which must have been written.
+private chs_header(lib: string, extra: []const string = []) -> string
+    val root = chs_project(lib)
+    var args: Buf[string] = buf()
+
+    args.push("sysl")
+    args.push("emit-header")
+
+    for item in extra
+        args.push(item)
+
+    args.push(root)
+
+    val got = chs_cli(args.view())
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(got.0, 0, got.1)
+    got.1
+end chs_header
+
+// clang reading `c` beside `header`, warnings as errors: whether it compiled, and what it said.
+private chs_clang(header: string, c: string, dir: string = "") -> (bool, string)
+    val root = make_temp_dir("sysl-chs-c").unwrap()
+
+    write_text(s"$root/probe.h", header).unwrap()
+    write_text(s"$root/probe.c", s"#include \"probe.h\"\n\n$c").unwrap()
+
+    val cc = find_clang(host_target(), None).unwrap()
+    var args: Buf[string] = buf()
+
+    args.push("-std=c11")
+    args.push("-Wall")
+    args.push("-Wextra")
+    args.push("-Werror")
+    args.push("-fsyntax-only")
+    args.push(s"-I$root")
+
+    if dir != "" then args.push(s"-I$dir")
+
+    args.push(s"$root/probe.c")
+
+    val ran = capture(cc, args.view(), "", [], true).unwrap()
+
+    remove_dir_all(root).unwrap_or(())
+    (ran.status.ok(), ran.text + ran.err.unwrap_or(""))
+end chs_clang
+
+private chs_compiles(header: string, c: string, dir: string = "")
+    val compiled = chs_clang(header, c, dir)
+
+    assert(compiled.0, s"${compiled.1}\n$header")
+end chs_compiles
+
+private chs_has(header: string, line: string) = assert(header.contains(line), s"no '$line' in:\n$header")
+
+// -- the spellings ---------------------------------------------------------------------------------
+
+// What TernDB's C API spec writes, as a sysl module: an allocator, a context, a callback over a size,
+// a digest, a read-only key and text, and the two address-wide integers.
+private chs_spec_lib() -> string =
+    "@export(\"t_alloc_fn\")\ntype AllocFn = *extern(usize) -> *unit\n\n" +
+    "@export(\"t_size_cb\")\ntype SizeCb = *extern(usize) -> bool\n\n" +
+    "@export(\"t_set_alloc\")\nset_alloc(a: AllocFn, ctx: *unit) = ()\n\n" +
+    "@export(\"t_each\")\neach(cb: SizeCb, n: usize) -> bool = cb(n)\n\n" +
+    "@export(\"t_digest\")\ndigest(text: *const u8, len: usize, out: *[32]u8, key: *const [32]u8) -> isize = 0\n\n" +
+    "@export(\"t_ctx\")\nctx(c: *const unit) -> *unit = null\n"
+
+private chs_spec_c() -> string =
+    "#include <stdlib.h>\n" +
+    "static void *my_alloc(size_t n) { return malloc(n); }\n" +
+    "static bool on_size(size_t n) { return n > 0; }\n" +
+    "int use(void) {\n" +
+    "    int context = 0;\n" +
+    "    const uint8_t text[3] = {1, 2, 3};\n" +
+    "    const uint8_t key[32] = {0};\n" +
+    "    uint8_t digest[32];\n" +
+    "    const void *c = &context;\n" +
+    "    t_set_alloc(my_alloc, &context);\n" +
+    "    ptrdiff_t d = t_digest(text, sizeof text, digest, key);\n" +
+    "    void *back = t_ctx(c);\n" +
+    "    return (int)d + t_each(on_size, 4) + (back == NULL);\n" +
+    "}\n"
+
+@test("a C file written in a C API's own spellings compiles against the header with -Werror")
+chs_spec_spellings_compile()
+    if !chs_ready() then return
+
+    chs_compiles(chs_header(chs_spec_lib()), chs_spec_c())
+
+@test("'*const T' is 'const T *', '*unit' is 'void *', usize and isize are size_t and ptrdiff_t")
+chs_scalar_and_pointer_spellings()
+    if !chs_ready() then return
+
+    val h = chs_header(chs_spec_lib())
+
+    chs_has(h, "typedef void * (*t_alloc_fn)(size_t);")
+    chs_has(h, "typedef bool (*t_size_cb)(size_t);")
+    chs_has(h, "void t_set_alloc(t_alloc_fn a, void * ctx);")
+    chs_has(h, "bool t_each(t_size_cb cb, size_t n);")
+    chs_has(h, "ptrdiff_t t_digest(const uint8_t * text, size_t len, uint8_t out[32], const uint8_t key[32]);")
+    chs_has(h, "void * t_ctx(const void * c);")
+
+@test("a pointer to a pointer puts the 'const' where C reads it as the pointee's")
+chs_const_through_levels()
+    if !chs_ready() then return
+
+    val lib = "@export(\"t_handle\")\nopaque struct Handle\n    n: i64\n\n" +
+        "@export(\"t_levels\")\nlevels(a: *const *u8, b: **const u8, c: *const *const u8, h: *const Handle, " +
+        "f: *const *extern(i32) -> i32) -> *const i16 = null\n\n" +
+        "@export(\"t_table\")\nvar table: *const [4]u8 = null\n"
+    val h = chs_header(lib)
+
+    chs_has(h, "const int16_t * t_levels(uint8_t * const * a, const uint8_t * * b, const uint8_t * const * c, " +
+               "const t_handle * h, int32_t (*const (*f))(int32_t));")
+    chs_has(h, "extern const uint8_t (*t_table)[4];")
+    chs_compiles(h, "int use(const uint8_t *const *a, const uint8_t **b, const t_handle *h) {\n" +
+                    "    return *t_levels((uint8_t *const *)a, b, a, h, NULL) + (*t_table)[0];\n}\n")
+
+@test("a pointer to an array is the array as a parameter, and stays a pointer to one everywhere else")
+chs_array_parameter()
+    if !chs_ready() then return
+
+    val lib = "@export(\"t_cb\")\ntype Cb = *extern(*[16]u8) -> unit\n\n" +
+        "@export(\"t_grid\")\ngrid(g: *[4][2]u8, cb: Cb) -> *[8]u8 = null\n\n" +
+        "@export(\"t_block\")\nvar block: *[8]u8 = null\n"
+    val h = chs_header(lib)
+
+    chs_has(h, "typedef void (*t_cb)(uint8_t [16]);")
+    chs_has(h, "uint8_t (*t_grid(uint8_t g[4][2], t_cb cb))[8];")
+    chs_has(h, "extern uint8_t (*t_block)[8];")
+    chs_compiles(h, "static void each(uint8_t b[16]) { b[0] = 1; }\n" +
+                    "int use(void) { uint8_t g[4][2] = {{0}}; return (*t_grid(g, each))[0] + (*t_block)[1]; }\n")
+
+@test("a 'c type' is spelled by its C name, and its file's headers are included")
+chs_c_type_names()
+    if !chs_ready() then return
+
+    val dir = make_temp_dir("sysl-chs-tick").unwrap()
+
+    write_text(s"$dir/tick.h", "typedef unsigned short my_tick_t;\n").unwrap()
+
+    val lib = "@include(\"<stddef.h>\")\n@include(\"tick.h\")\n\nc type\n    Size = \"size_t\"\n    Tick = \"my_tick_t\"\n\n" +
+        "@export(\"t_wait\")\nwait(n: Size, t: Tick, p: *const Tick) -> Size = n\n"
+    val root = chs_project(lib)
+    val got = chs_cli(["sysl", "emit-header", "--include-path", dir, root])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(got.0, 0, got.1)
+    chs_has(got.1, "#include <stddef.h>\n#include \"tick.h\"\n\n")
+    assert(!got.1.contains("#include <stddef.h>\n#include <stddef.h>"), got.1)
+    chs_has(got.1, "size_t t_wait(size_t n, my_tick_t t, const my_tick_t * p);")
+    chs_compiles(got.1, "int use(void) { my_tick_t t = 1; return (int)t_wait(2, t, &t); }\n", dir)
+    remove_dir_all(dir).unwrap_or(())
+
+// -- the include guard -----------------------------------------------------------------------------
+
+@test("'--header-guard' names the guard emit-header and build-c write")
+chs_guard_named()
+    if !chs_ready() then return
+
+    val h = chs_header("@export(\"t_one\")\none() -> i32 = 1\n", ["--header-guard", "TERNDB_H"])
+
+    chs_has(h, "#ifndef TERNDB_H\n#define TERNDB_H\n")
+    chs_has(h, "#endif /* TERNDB_H */")
+    assert(!h.contains("SYSL_"), h)
+
+    val root = chs_project("@export(\"t_one\")\none() -> i32 = 1\n")
+    val built = chs_cli(["sysl", "build-c", root, "-o", s"$root/lib.a", "--header", s"$root/t.h",
+                         "--header-guard", "MY_API_H"])
+
+    assert_eq(built.0, 0, built.1)
+
+    val written = read_text(s"$root/t.h").unwrap()
+
+    remove_dir_all(root).unwrap_or(())
+    chs_has(written, "#ifndef MY_API_H\n#define MY_API_H\n")
+
+@test("and a guard that is not a C identifier is refused, by both commands")
+chs_guard_refused()
+    if !chs_ready() then return
+
+    val root = chs_project("@export(\"t_one\")\none() -> i32 = 1\n")
+
+    for bad in ["1ABC", "MY-API", ""]
+        val e = chs_cli(["sysl", "emit-header", "--header-guard", bad, root])
+
+        assert(e.0 != 0, e.1)
+        assert(e.1.contains("a macro name is a C identifier"), e.1)
+
+    val b = chs_cli(["sysl", "build-c", root, "--header-guard", "MY API"])
+
+    assert(b.0 != 0, b.1)
+    assert(b.1.contains("a macro name is a C identifier"), b.1)
+    remove_dir_all(root).unwrap_or(())
+
+// -- constants -------------------------------------------------------------------------------------
+
+private chs_const_lib() -> string =
+    "@export(\"T_LIMIT\")\nconst LIMIT: u32 = 7\n\n" +
+    "@export(\"T_DIGEST_LEN\")\nconst DIGEST_LEN: usize = 32\n\n" +
+    "@export(\"T_FLOOR\")\nconst FLOOR: i32 = -5\n\n" +
+    "@export(\"T_BIG\")\nconst BIG: i64 = 5000000000\n\n" +
+    "@export(\"T_NEG_BIG\")\nconst NEG_BIG: i64 = -5000000000\n\n" +
+    "@export(\"T_MIN\")\nconst MIN: i64 = -9223372036854775807 - 1\n\n" +
+    "@export(\"T_MAX\")\nconst MAX: u64 = 18446744073709551615\n\n" +
+    "@export(\"T_ON\")\nconst ON = true\n\n" +
+    "@export(\"T_HALF\")\nconst HALF: f32 = 1.5\n\n" +
+    "@export(\"T_TENTH\")\nconst TENTH: f64 = 0.1\n\n" +
+    "@export(\"T_WHOLE\")\nconst WHOLE: f64 = 2.0\n\n" +
+    "@export(\"T_LETTER\")\nconst LETTER = 'A'\n\n" +
+    "@export(\"T_NAME\")\nconst NAME = \"tern \\\"db\\\"\\n\\u{e9}\"\n\n" +
+    "@export\nconst DERIVED = LIMIT * 2\n\n" +
+    "@export(\"T_ISOLATION\")\nenum Isolation\n    Serializable\n    Snapshot\n    ReadCommitted\n\n" +
+    "@export\nenum HttpStatus\n    Ok = 200\n    NotFound = 404\n\n" +
+    "@export(\"t_get\")\nget(i: Isolation) -> u32 = LIMIT\n"
+
+@test("an exported 'const' and enum are '#define's, in a fixed order, under the includes")
+chs_defines_written()
+    if !chs_ready() then return
+
+    val h = chs_header(chs_const_lib())
+
+    chs_has(h, "#include <stddef.h>\n\n" +
+               "#define DERIVED 14\n" +
+               "#define T_BIG INT64_C(5000000000)\n" +
+               "#define T_DIGEST_LEN 32\n" +
+               "#define T_FLOOR (-5)\n" +
+               "#define T_HALF 1.5f\n" +
+               "#define T_LETTER 65\n" +
+               "#define T_LIMIT 7\n" +
+               "#define T_MAX UINT64_C(18446744073709551615)\n" +
+               "#define T_MIN (-INT64_C(9223372036854775807) - 1)\n" +
+               "#define T_NAME \"tern \\\"db\\\"\\012\\303\\251\"\n" +
+               "#define T_NEG_BIG (-INT64_C(5000000000))\n" +
+               "#define T_ON true\n" +
+               "#define T_TENTH 0.1\n" +
+               "#define T_WHOLE 2.0\n" +
+               "#define HTTP_STATUS_OK 200\n" +
+               "#define HTTP_STATUS_NOT_FOUND 404\n" +
+               "#define T_ISOLATION_SERIALIZABLE 0\n" +
+               "#define T_ISOLATION_SNAPSHOT 1\n" +
+               "#define T_ISOLATION_READ_COMMITTED 2\n\n")
+    chs_has(h, "uint32_t t_get(int32_t i);")
+
+@test("and C reads each macro back as the value sysl folded")
+chs_defines_agree_with_c()
+    if !chs_ready() then return
+
+    chs_compiles(chs_header(chs_const_lib()),
+                 "#include <string.h>\n" +
+                 "_Static_assert(T_LIMIT == 7 && T_DIGEST_LEN == 32 && T_FLOOR == -5, \"ints\");\n" +
+                 "_Static_assert(T_BIG == 5000000000LL && T_NEG_BIG == -5000000000LL, \"wide\");\n" +
+                 "_Static_assert(T_MIN == INT64_MIN && T_MAX == UINT64_MAX, \"ends\");\n" +
+                 "_Static_assert(T_ON && T_LETTER == 'A' && DERIVED == 14, \"others\");\n" +
+                 "double floats(void) { float h = T_HALF; return h + T_TENTH + T_WHOLE; }\n" +
+                 "_Static_assert(sizeof(T_NAME) == 13, \"string\");\n" +
+                 "_Static_assert(T_ISOLATION_READ_COMMITTED == 2 && HTTP_STATUS_NOT_FOUND == 404, \"enums\");\n" +
+                 "#if T_LIMIT != 7 || T_MAX != UINT64_MAX\n#error \"not usable in #if\"\n#endif\n" +
+                 "int use(void) { return (int)t_get(T_ISOLATION_SNAPSHOT) + (int)strlen(T_NAME); }\n")
+
+@test("a header of nothing but constants is still written, and says nothing about missing exports")
+chs_constants_only()
+    if !chs_ready() then return
+
+    val h = chs_header("@export(\"ONLY\")\nconst ONLY: u8 = 3\n")
+
+    chs_has(h, "#define ONLY 3\n")
+    assert(!h.contains("exports nothing"), h)
+
+@test("a constant C has no literal for, a carrying enum and a generic one are refused at '@export'")
+chs_defines_refused()
+    if !chs_ready() then return
+
+    val half = chs_cli_err("@export(\"H\")\nconst H: f16 = 1.5\n")
+
+    assert(half.contains("'H' is exported as a macro, and it is f16, which has no C literal"), half)
+
+    val wide = chs_cli_err("@export(\"W\")\nconst W: u128 = 340282366920938463463374607431768211455\n")
+
+    assert(wide.contains("which is wider than any C integer literal"), wide)
+
+    val carrying = chs_cli_err("@export(\"S\")\nenum Shape\n    Dot\n    Circle(r: f64)\n")
+
+    assert(carrying.contains("'Shape' has a variant that carries fields"), carrying)
+
+    val generic = chs_cli_err("@export(\"G\")\nenum G[T]\n    A\n    B\n")
+
+    assert(generic.contains("'G' takes type parameters"), generic)
+
+@test("'@export' above an 'extern' is still refused, naming what it marks")
+chs_export_over_extern()
+    if !chs_ready() then return
+
+    val said = chs_cli_err("@export(\"x\")\nextern foo() -> i32\n")
+
+    assert(said.contains("or the macro a 'const' or a simple enum's variants are defined as there"), said)
+
+// What emit-header says about `lib`, which must have refused it.
+private chs_cli_err(lib: string) -> string
+    val root = chs_project(lib)
+    val got = chs_cli(["sysl", "emit-header", root])
+
+    remove_dir_all(root).unwrap_or(())
+    assert(got.0 != 0, got.1)
+    got.1
+end chs_cli_err
+
+// -- the rest stays as it was ----------------------------------------------------------------------
+
+private chs_pin_lib() -> string =
+    "@export(\"pin_point\")\nstruct Point\n    x: i32\n    y: f64\n\n" +
+    "@export(\"pin_handle\")\nopaque struct Handle\n    n: i64\n\n" +
+    "@export(\"pin_cb\")\ntype Cb = *extern(i32, *u8) -> bool\n\n" +
+    "@export(\"pin_count\")\nvar count: u32 = 0\n\n" +
+    "@export(\"pin_banner\")\nval banner: *u8 = null\n\n" +
+    "@export(\"pin_make\")\nmake(p: Point, h: *Handle, cb: Cb, raw: *u8, pp: **i16, f: *extern(*Point) -> *u8) -> *Handle = h\n\n" +
+    "@export(\"pin_stop\")\nstop(code: i32) -> never\n    loop\n        ()\n\n" +
+    "@export(\"pin_sum\")\nsum(n: i32, ...) -> i64 = 0\n\n" +
+    "@export(\"pin_unit\")\nnothing() = ()\n"
+
+// The header the compiler before these spellings wrote for `chs_pin_lib`, byte for byte.
+@test("a header naming none of the new spellings is byte for byte what it was")
+chs_unchanged_header_pinned()
+    if !chs_ready() then return
+
+    assert_eq(chs_header(chs_pin_lib()),
+              "/* Generated by sysl. The declarations a C project needs to call into this module. */\n" +
+              "#ifndef SYSL_PROBE_H\n#define SYSL_PROBE_H\n\n" +
+              "#include <stdbool.h>\n#include <stdint.h>\n#include <stddef.h>\n\n" +
+              "#ifndef SYSL_NORETURN\n" +
+              "#if defined(__cplusplus) && __cplusplus >= 201103L\n" +
+              "#define SYSL_NORETURN [[noreturn]]\n" +
+              "#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L\n" +
+              "#define SYSL_NORETURN _Noreturn\n" +
+              "#else\n#define SYSL_NORETURN\n#endif\n#endif\n\n" +
+              "#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n" +
+              "typedef struct {\n\tint32_t x;\n\tdouble y;\n} pin_point;\n\n" +
+              "typedef struct pin_handle pin_handle;\n\n" +
+              "typedef bool (*pin_cb)(int32_t, uint8_t *);\n\n" +
+              "extern uint8_t * const pin_banner;\nextern uint32_t pin_count;\n\n" +
+              "pin_handle * pin_make(pin_point p, pin_handle * h, pin_cb cb, uint8_t * raw, int16_t * * pp, " +
+              "uint8_t * (*f)(pin_point *));\n" +
+              "SYSL_NORETURN void pin_stop(int32_t code);\n" +
+              "int64_t pin_sum(int32_t n, ...);\n" +
+              "void pin_unit(void);\n\n" +
+              "#ifdef __cplusplus\n}\n#endif\n\n" +
+              "#endif /* SYSL_PROBE_H */\n")
+
+// -- across the boundary ---------------------------------------------------------------------------
+
+@test("an archive called through the spec's spellings runs: the allocator, the digest and the key")
+chs_archive_runs()
+    if !chs_ready() then return
+
+    val lib = "@export(\"t_alloc_fn\")\ntype AllocFn = *extern(usize) -> *unit\n\n" +
+        "@export(\"t_fill\")\nfill(a: AllocFn, n: usize, out: *[4]u8, key: *const [4]u8) -> usize\n" +
+        "    val p = a(n)\n\n    if p == null then return 0\n\n" +
+        "    for i in 0..<4 do out[i] = key[i] + 1\n\n    n\n\n" +
+        "@export(\"T_WIDTH\")\nconst WIDTH: usize = 4\n"
+    val root = chs_project(lib)
+    val built = chs_cli(["sysl", "build-c", root, "-o", s"$root/lib.a", "--header", s"$root/probe.h"])
+
+    assert_eq(built.0, 0, built.1)
+    write_text(s"$root/main.c",
+               "#include <stdio.h>\n#include <stdlib.h>\n#include \"probe.h\"\n" +
+               "static size_t asked;\n" +
+               "static void *my_alloc(size_t n) { asked = n; return malloc(n); }\n" +
+               "int main(void) {\n" +
+               "    const uint8_t key[T_WIDTH] = {1, 2, 3, 4};\n" +
+               "    uint8_t out[T_WIDTH];\n" +
+               "    size_t got = t_fill(my_alloc, 24, out, key);\n" +
+               "    printf(\"%zu %zu %d %d\\n\", got, asked, out[0], out[3]);\n" +
+               "    return 0;\n}\n").unwrap()
+
+    val cc = find_clang(host_target(), None).unwrap()
+    val linked = capture(cc, ["-std=c11", "-Wall", "-Werror", s"-I$root", s"$root/main.c", s"$root/lib.a",
+                              "-o", s"$root/main"], "", [], true).unwrap()
+
+    assert(linked.status.ok(), linked.text + linked.err.unwrap_or(""))
+
+    val ran = capture(s"$root/main", [], "", [], true).unwrap()
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(ran.text, "24 24 2 5\n")

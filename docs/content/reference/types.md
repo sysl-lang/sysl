@@ -831,6 +831,31 @@ parameter is never inferred from one: `id(exit(1))` is refused, as `val x = exit
 storage whose type is `never` — the payload an `Err` arm binds out of a `Result[T, never]`, or a
 parameter of a body instantiated at `never` — is not refused: no run reaches it.
 
+## Raw pointers
+
+| type | what it is |
+|---|---|
+| `*T` | an address of a `T`, which promises nothing about what is there |
+| `*const T` | the same address, which may be read through and not written |
+
+`*const T` is `[]const T`'s rule for a pointer: one type with a bit, a `*T` accepted wherever a
+`*const T` is wanted and never the other way round. A C header spells it `const T *`.
+
+```sysl
+first(p: *const int) -> int = *p
+
+var n = 41
+
+print(first(&n) + 1)
+```
+
+```output
+42
+```
+
+[The raw tier](/reference/memory/#const-t-a-pointer-that-is-read-through-and-not-written) covers both
+in full.
+
 ## `string`
 
 A validated UTF-8 string, three words wide. It is immutable; indexing it by byte position gives

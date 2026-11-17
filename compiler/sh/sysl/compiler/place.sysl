@@ -99,6 +99,17 @@ require_place(cx: &Analyzer, t: TExpr, target: Expr, what: string, writes: bool,
         return t
     end if
 
+    // The same for storage reached through a `*const T`: the pointer is a licence to read, and
+    // every write through it -- `*p`, `p[i]`, `p.f`, a part of any of them -- is refused alike.
+    val pointer = if writes then const_pointer_of(cx, t) else None
+
+    if pointer.is_some()
+        cx.fault(at, s"this is reached through a '${type_show(pointer.unwrap())}', which may be read " +
+                 "and not written, so there is nothing to assign through. A pointer that writes is " +
+                 s"a '*${type_show(pointee_of(pointer.unwrap()))}'")
+        return t
+    end if
+
     if !writable_place(t)
         cx.fault(at, s"$what needs a variable, a field, an element, or a dereference — " +
                  "something with an address")
@@ -170,7 +181,7 @@ writable_place(t: TExpr) -> bool = *t.kind match
     TIndex(recv, _, _) -> texpr_type(recv) match
         Slice(_, _) -> true
         Str -> false
-        Ptr(_) -> true
+        Ptr(_, _) -> true
         _ -> writable_place(recv)
     _ -> false
 
@@ -219,6 +230,14 @@ refuse_written_once_receiver(cx: &Analyzer, span: Span, place: TExpr, member: st
 
     val root = root_local(cx, place)
     val writes = s"'$member' takes '*self', so it writes through what it is called on"
+    val pointer = const_pointer_of(cx, place)
+
+    if pointer.is_some()
+        cx.fault(span, s"$writes, and this is reached through a '${type_show(pointer.unwrap())}', " +
+                 "which may be read and not written")
+        return
+    end if
+
     var head = s"$writes, and a 'val' is written once"
     var lead = " — this closure captures by value, since "
     var tail = var_fix(place)
@@ -362,12 +381,45 @@ const_view_of(cx: &Analyzer, t: TExpr) -> Option[Type] = *t.kind match
         None -> None
     _ -> None
 
+// The `*const T` a place is reached through, where it is one: `*p`, `p[i]`, `p.f` and any part of
+// those -- a field of the pointee, an element of an array it holds -- and a `ref` name bound to one.
+// The walk is `const_view_of`'s, and it stops at the first address it steps through: a writable
+// pointer, or a `&T` or `*T` field of the pointee, leads to storage the read-only pointer does not
+// speak for.
+const_pointer_of(cx: &Analyzer, t: TExpr) -> Option[Type] = *t.kind match
+    TIndex(recv, _, _) ->
+        val rt = texpr_type(recv)
+
+        repr(rt) match
+            Ptr(_, ro) -> if ro then Some(rt) else None
+            _ -> if owns_its_elements(rt) then const_pointer_of(cx, recv) else None
+    TField(recv, _, _) ->
+        val rt = texpr_type(recv)
+
+        repr(rt) match
+            Ptr(_, ro) -> if ro then Some(rt) else None
+            _ -> if holds_an_address(rt) then None else const_pointer_of(cx, recv)
+    TLoad(name, _) -> ref_place(cx, name) match
+        Some(p) -> const_pointer_of(cx, p)
+        None -> None
+    TDeref(p, _) -> repr(texpr_type(p)) match
+        Ptr(_, ro) -> if ro then Some(texpr_type(p)) else None
+        _ -> ref_call_place(cx, t) match
+            Some(v) -> const_pointer_of(cx, v)
+            None -> None
+    _ -> None
+
+// What a pointer type points at.
+private pointee_of(t: Type) -> Type = repr(t) match
+    Ptr(inner, _) -> *inner
+    _ -> Unknown
+
 // Whether a value of this type is an address of storage kept elsewhere -- a counted box, a weak
 // reference, a raw pointer. A step through one leaves the binding behind.
 private holds_an_address(t: Type) -> bool = repr(t) match
     Ref(_, _) -> true
     Weak(_) -> true
-    Ptr(_) -> true
+    Ptr(_, _) -> true
     _ -> false
 
 // The `&sync` box an array lives inside, where a view of it would be a view into that box: a
@@ -673,7 +725,7 @@ private encloses_hazard(cx: &Analyzer, place: TExpr, key: string) -> bool
         if owning_step(ty) || (through_call && holds_storage(ty)) then below = true
 
         repr(ty) match
-            Ptr(_) -> below = false
+            Ptr(_, _) -> below = false
             _ -> ()
 
         through_call = placed_by(cx, step).is_some()
@@ -838,7 +890,7 @@ end holders_have
 
 private indirect_type(t: Type) -> bool = repr(t) match
     Ref(_, _) -> true
-    Ptr(_) -> true
+    Ptr(_, _) -> true
     Slice(_, _) -> true
     Str -> true
     _ -> false
@@ -967,7 +1019,7 @@ note_counted_address(cx: &Analyzer, span: Span, place: TExpr)
         val step = at.unwrap()
         val ty = texpr_type(step)
         val pointer = repr(ty) match
-            Ptr(_) -> true
+            Ptr(_, _) -> true
             _ -> false
 
         if pointer
@@ -1046,6 +1098,8 @@ expr_try(e: TExpr) -> bool = *e.kind match
     TDowngrade(v, _) -> expr_try(v)
     TUpgrade(v, _, _, _) -> expr_try(v)
     TDowncast(v, _, _, _, _, _) -> expr_try(v)
+    TIntoRaw(v, _) -> expr_try(v)
+    TFromRaw(v, _) -> expr_try(v)
     TArrayLit(xs, _) -> any_expr_try(xs)
     TArrayFill(v, _) -> expr_try(v)
     TVectorLit(xs, _) -> any_expr_try(xs)

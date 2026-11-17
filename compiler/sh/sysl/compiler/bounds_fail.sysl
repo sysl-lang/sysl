@@ -266,9 +266,6 @@ check_said(what: string, subject: string) -> (int, string)
     val of = if subject.is_empty() then "" else s" of '$subject'"
 
     what match
-        "require" -> (TrapContract, "'require' does not hold")
-        "ensure" -> (TrapContract, "'ensure' does not hold")
-        "invariant" -> (TrapContract, "'invariant' does not hold")
         "variant" -> (TrapContract, "'variant' did not decrease")
         "within" -> (TrapRange, s"value outside the range$of")
         "succ" -> (TrapRange, s"'Succ' past the last value$of")
@@ -374,6 +371,56 @@ overflow_unless(e: *Emit, ok: Val, what: string, site: Span)
     two_texts_fail(e, BoundsOverflow, c_text_of(e, trap_name(file, site, what)), VNull, site)
     emit_label(e, ok_l)
 end overflow_unless
+
+// **A contract clause that does not hold** -- a `require`, an `ensure` or a loop's `invariant` --
+// reports through `sysl_trap` as `TrapContract`, its sentence composed here from the clause's word
+// and the message it was written with (`require failed: x must be non-negative`), or the word alone
+// where it was written with none (`ensure failed`), and stops the program. A struct's `invariant`
+// reports the same way, its word naming the struct (`invariant of 'Window' failed`). `label` names
+// the two blocks; `site` is the clause, or the write that broke a struct's invariant. Traps unless
+// `ok` holds.
+//
+// The sentence is the program's own text, so it is laid down as a constant (`c_text_of`) and handed
+// to ONE private helper, `sysl.contract`, with the location: the failure block is one call with two
+// constant arguments, and no two messages can share a helper by spelling.
+contract_unless(e: *Emit, ok: Val, label: string, kind: string, msg: Option[string], site: Span)
+    e.traps = true
+    e.bounds_fails = true
+
+    val ok_l = fresh_label(e, s"$label.ok")
+    val bad_l = fresh_label(e, s"$label.bad")
+
+    emit_term(e, InCondBr(ok, ok_l, bad_l))
+    emit_label(e, bad_l)
+
+    val said = msg match
+        Some(m) -> s"$kind failed: $m"
+        None -> s"$kind failed"
+
+    request_text(e, contract_helper_symbol(), contract_helper_text(e.word_bits))
+
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(LPtr, c_text_of(e, said)))
+    args.push(ir_arg(LPtr, location_of(e, site)))
+    emit(e, ir_call(None, LVoid, VGlobal(contract_helper_symbol()), args))
+    emit(e, ir_call(None, LVoid, VGlobal(trap_symbol(e)), no_ir_args()))
+    emit_term(e, InUnreachable)
+    emit_label(e, ok_l)
+end contract_unless
+
+private contract_helper_symbol() -> string = "sysl.contract"
+
+// The helper: the sentence's address handed to `sysl_trap` as `a`, with the location.
+private contract_helper_text(word_bits: int) -> string
+    val word = s"i$word_bits"
+    val name = contract_helper_symbol()
+
+    s"define private void @$name(ptr %said, ptr %at) cold noinline {\nentry:\n" +
+        s"  %a = ptrtoint ptr %said to $word\n" +
+        s"  call void @${trap_hook_symbol()}(i32 $TrapContract, $word %a, $word 0, $word 0, ptr %at)\n" +
+        "  ret void\n}\n"
+end contract_helper_text
 
 // A failure whose two values are the addresses of NUL-terminated texts.
 private two_texts_fail(e: *Emit, kind: int, first: Val, second: Val, site: Span) -> Val

@@ -177,6 +177,9 @@ private call_read(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
 
                 if form == "ptr_cast" then return ptr_cast_call(cx, span, args, targ)
 
+                // `from_raw[T](p)` names the pointee, as `into_raw` answered a `*T`.
+                if form == "from_raw" then return from_raw_call(cx, span, args, targ.map(t -> Ref(t, false)))
+
                 // `slot_storage[T](n)` names the ELEMENT; the position the form fills is a view.
                 if written == "slot_storage" then
                     return slot_call(cx, span, written, args, targ.map(t -> Slice(t, false)))
@@ -949,6 +952,7 @@ private special_form(cx: &Analyzer, span: Span, written: string, args: Buf[Expr]
             _ -> ()
 
     if form == "ptr_cast" then return Some(ptr_cast_call(cx, span, args, expected))
+    if form == "from_raw" then return Some(from_raw_call(cx, span, args, expected))
 
     if null_test_form(cx, name) then return Some(null_test_call(cx, span, args))
 
@@ -982,7 +986,7 @@ private null_test_call(cx: &Analyzer, span: Span, args: Buf[Expr]) -> TExpr
 
     if fault.is_some() then return cx.err(span, fault.unwrap())
 
-    val raw = Ptr(byte_type())
+    val raw = Ptr(byte_type(), false)
     var operands: Buf[TExpr] = buf()
     var cmps: Buf[TCmp] = buf()
 
@@ -1085,6 +1089,46 @@ private ptr_cast_call(cx: &Analyzer, span: Span, args: Buf[Expr], expected: Opti
     TExpr(span, TCast(t, to))
 end ptr_cast_call
 
+// `from_raw(p)` and `from_raw[T](p)` -- a pointer `into_raw` answered, adopted back as the counted
+// reference it was given up from, which owns the count the pointer carried. The pointee names the
+// reference's `T`, and a position wanting a `&sync T` makes it that; nothing else is asked of the
+// position, so a reference to another type is the ordinary mismatch.
+//
+// **It is the raw tier's**, as `ptr_cast` is, and imported from `sysl.raw` for the same reason: the
+// pointer has to be one `into_raw` answered for a reference of that kind, adopted once, and nothing
+// here can check either -- a pointer to anything else is a box header read out of storage that holds
+// none.
+private from_raw_call(cx: &Analyzer, span: Span, args: Buf[Expr], expected: Option[Type]) -> TExpr
+    if args.len() != 1 then
+        return cx.err(span, "'from_raw' takes exactly one value, the pointer 'into_raw' answered")
+
+    val wanted = expected.map(underlying).unwrap_or(Unknown)
+    val t = wanted match
+        Ref(inner, _) -> type_expr(cx, args[0], Some(Ptr(inner, false)))
+        _ -> type_expr_bare(cx, args[0])
+    val ty = texpr_type(t)
+
+    if ty == Unknown then return bad_expr(span)
+
+    underlying(ty) match
+        Ptr(inner, _) ->
+            if is_trait_type(*inner) then
+                return cx.err(span, "'from_raw' adopts a reference given up as one address, and a " +
+                              "pointer to a trait is two words — 'into_raw' never answers one")
+
+            val sync = wanted match
+                Ref(_, s) -> s
+                _ -> false
+
+            TExpr(span, TFromRaw(t, Ref(inner, sync)))
+        Ref(_, _) ->
+            cx.err(span, s"'from_raw' adopts a pointer 'into_raw' answered, and ${type_show(ty)} is a " +
+                   "counted reference already — use it as it is")
+        other ->
+            cx.err(span, s"'from_raw' adopts a pointer 'into_raw' answered, and the value has type " +
+                   s"${type_show(other)}")
+end from_raw_call
+
 // The address `ptr_cast` is handed, analyzed. **The operand is an address-width position**, as the
 // initializer of a `val a: usize` is: a bare integer literal, or an expression made of nothing but
 // bare integer literals (`0x4000 + 16`, `1 << 20`), is read at the target's `usize`, and one too large
@@ -1110,7 +1154,7 @@ private integer_operator(op: string) -> bool =
 // What a reinterpreted address may NOT be read as, named by what the type promises that an address
 // cannot supply. A function pointer is an address like any other.
 private ptr_cast_target_fault(to: Type) -> Option[string] = underlying(to) match
-    Ptr(inner) ->
+    Ptr(inner, _) ->
         if !is_trait_type(*inner) then return None
 
         Some("'ptr_cast' produces a plain pointer, and a pointer to a trait is two words — the " +
@@ -1133,7 +1177,7 @@ private ptr_cast_view_fault(v: Type) -> string =
 // What an address may NOT be read out of. An integer narrower than an address would be read with its
 // top bits invented -- the one mistake here that makes a wild pointer silently.
 private ptr_cast_source_fault(from: Type) -> Option[string] = underlying(from) match
-    Ptr(inner) ->
+    Ptr(inner, _) ->
         if !is_trait_type(*inner) then return None
 
         Some("'ptr_cast' takes a plain pointer, and a pointer to a trait is two words — select " +
@@ -1166,14 +1210,15 @@ private special_form_name(cx: &Analyzer, name: string) -> bool =
 special_form_word(name: string) -> bool =
     name == "print" || name == "str_cast" ||
     name == "str_alias" || name == "va_start" || name == "va_end" || name == "va_arg" ||
-    name == "va_copy" || name == "ptr_cast"
+    name == "va_copy" || name == "ptr_cast" || name == "from_raw"
 
 // **The forms a file has to import**, and the module each one is imported from. They are still
 // answered by the compiler -- nothing in `sysl.raw` or `sysl.c` declares them -- but their names are
 // not in scope everywhere: a file names the reinterpreting casts and the C variadic forms it uses, so
 // a reader finds them by its imports.
 imported_form_home(name: string) -> Option[string] =
-    if name == "ptr_cast" || name == "str_cast" || name == "str_alias" then Some("sysl.raw")
+    if name == "ptr_cast" || name == "str_cast" || name == "str_alias" || name == "from_raw" then
+        Some("sysl.raw")
     else if name == "va_start" || name == "va_end" || name == "va_arg" || name == "va_copy" then
         Some("sysl.c")
     else None
@@ -1208,17 +1253,17 @@ private imported_form(cx: &Analyzer, written: string) -> Option[string]
     None
 end imported_form
 
-// Whether a callee stands for the `ptr_cast` form, under whatever name this file's imports give it:
-// an alias, a path through `sysl.raw`, or the bare spelling (which, unimported, is then told where the
-// form lives). A name of the program's own is never the form.
-calls_ptr_cast(cx: &Analyzer, callee: Expr) -> bool = *callee.kind match
+// Whether a callee stands for the `form` named (`ptr_cast`, `from_raw`), under whatever name this
+// file's imports give it: an alias, a path through `sysl.raw`, or the bare spelling (which, unimported,
+// is then told where the form lives). A name of the program's own is never the form.
+calls_raw_form(cx: &Analyzer, callee: Expr, form: string) -> bool = *callee.kind match
     Ident(name) ->
         if cx.lookup(name).is_some() || names_a_reachable_function(cx, name) then false
-        else name == "ptr_cast" || imported_form(cx, name).unwrap_or("") == "ptr_cast"
+        else name == form || imported_form(cx, name).unwrap_or("") == form
     Field(receiver, member, _) ->
         val dotted = module_path_of(cx, receiver, member)
 
-        dotted.is_some() && imported_form(cx, dotted.unwrap()).unwrap_or("") == "ptr_cast"
+        dotted.is_some() && imported_form(cx, dotted.unwrap()).unwrap_or("") == form
     _ -> false
 
 // The form a key names, where the key is a form's own module and its name.
@@ -1543,7 +1588,7 @@ private converts(cx: &Analyzer, span: Span, from: Type, to: Type) -> bool
             _ -> return false
         // A pointer to an integer is total: an address *is* a number of `usize`'s width. It goes
         // only this way; making a pointer out of an integer is `ptr_cast`.
-        Ptr(inner) -> to match
+        Ptr(inner, _) -> to match
             Integer(_, _, pw) ->
                 if is_trait(*inner) then
                     cx.fault(span, "a pointer to a trait is two words — the address and the table " +
@@ -4007,7 +4052,7 @@ private holds_index(items: Buf[usize], i: usize) -> bool
 // argument is checked as a `*va_list`, and whether the callee receives the walk's value, its
 // address or a copy's is `TVaPass`'s business (`hoist.sysl`'s `check_va_list_positions`).
 walk_wanted(p: Param, declared: Type) -> Type =
-    if written_va_list(p.typ) then Ptr(VaList) else declared
+    if written_va_list(p.typ) then Ptr(VaList, false) else declared
 
 // The argument a by-value `va_list` parameter is handed, once every argument is known to be what
 // its parameter wanted -- the check reads the argument's own type.
@@ -4358,7 +4403,7 @@ private extern_call(cx: &Analyzer, span: Span, written: string, key: string,
         val p = d.params[i]
         val by_value = written_va_list(p.typ)
         val declared = signature_type(cx.an, d.needs, scope, p.typ, no_bindings())
-        val want = if by_value then Ptr(VaList) else declared
+        val want = if by_value then Ptr(VaList, false) else declared
 
         wants.push(want)
 
@@ -4415,7 +4460,7 @@ variadic_extra(cx: &Analyzer, a: Expr, foreign: bool) -> TExpr
             t
         Floating(bits, _) -> if bits < 64 then TExpr(a.span, TCast(t, real_type())) else t
         Char -> t
-        Ptr(_) -> t
+        Ptr(_, _) -> t
         CFn(_, _, _) -> t
         // Already told, or settled where the instantiation reads the body again at a real type.
         Unknown -> t
@@ -4442,7 +4487,7 @@ private tail_scalar(t: Type) -> bool = tail_peeled(t) match
     Integer(_, _, _) -> true
     Floating(_, _) -> true
     Char -> true
-    Ptr(_) -> true
+    Ptr(_, _) -> true
     CFn(_, _, _) -> true
     _ -> false
 
