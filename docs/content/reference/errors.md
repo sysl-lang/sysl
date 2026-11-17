@@ -993,8 +993,8 @@ you debug one:
 
 | stopped by | what you see | exit status |
 |---|---|---|
-| a **bounds check** — an index, a range, a substring cut inside a character, an index past a container's count — or an **integer overflow** check | everything the program printed before it, and one line on stderr saying what failed and where | the platform's signal status for a trap instruction |
-| any other **compiler-inserted check** — a cast, a constrained range, a contract — or `trap()` | everything the program printed before it, and nothing more | the same |
+| a **bounds check** — an index, a range, a substring cut inside a character, an index past a container's count — an **integer overflow** check, or a **contract** — a `require`, an `ensure`, a loop or struct `invariant` | everything the program printed before it, and one line on stderr saying what failed and where | the platform's signal status for a trap instruction |
+| any other **compiler-inserted check** — a cast, a constrained range — or `trap()` | everything the program printed before it, and nothing more | the same |
 | a **library forcing member** — `unwrap`, `expect` | `panic: <message> (file:line:column)` on stdout, naming the line that called it, after everything the program printed before it | 1 |
 
 **A trap flushes standard output before it stops the program.** Standard output is buffered (fully
@@ -1049,7 +1049,11 @@ value with a field still `None`: `'P' was made from a partial value whose field 
 (main.sysl:8:8)`. So does an integer overflow, naming the operation and its types — `integer
 overflow: int * int (main.sysl:3:13)`, `integer overflow: -i8`, `integer overflow: u8(int)`; inside
 a [`@track_caller`](/reference/attributes/#track-caller-a-function-that-reports-its-caller-s-line)
-function it names the caller's line, as a bounds check there does. On a freestanding target the
+function it names the caller's line, as a bounds check there does. So does a contract clause that
+does not hold, naming the clause and the message it was written with — `require failed: x must be
+non-negative (main.sysl:2:13)`, at the condition's line and column, or `ensure failed
+(main.sysl:2:12)` for a clause written without one; a struct's invariant names the struct and the
+write that broke it, `invariant of 'Window' failed (main.sysl:8:1)`. On a freestanding target the
 report needs no allocator and no formatter: the text is a constant, and the trap follows.
 
 **The standard containers report through it too.** An index past a `Buf`'s, `Frozen`'s, `Deque`'s or
@@ -1074,7 +1078,8 @@ one string per check in the image; `bounds_locations = false` in the manifest, o
 index 5 out of bounds for length 3
 ```
 
-Whether every other check should also report why it stopped is an open design question.
+Whether the remaining checks — a cast, a constrained range — should also report why they stopped is
+an open design question.
 
 ### Running out of stack, which is the third shape
 
@@ -2596,7 +2601,9 @@ reverse(xs: []int)
 
 Like a constraint, a violated contract **traps**, and contracts are checked in **every** build. There
 is no release mode that drops them, since one would make a program's meaning depend on how it was
-compiled.
+compiled. Before it traps, a failed clause writes what it was, its message if it has one, and where
+to standard error — `require failed: x must be non-negative (main.sysl:2:13)` — so a
+[`should_trap`](/reference/attributes/#a-test-passes-by-returning) test can ask for the message.
 
 ## The third shape: a latch
 

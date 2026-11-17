@@ -62,7 +62,8 @@ private ctc_prints(main: string, want: string) = ctc_leaves(main, want, 0)
 
 private ctc_traps(main: string) = ctc_leaves(main, "", 133)
 
-// The same where the trap is the debug build's overflow check, which writes its report first.
+// The same where the trap writes its report first: the debug build's overflow check, or a contract
+// clause that does not hold.
 private ctc_traps_reporting(main: string, report: string) = ctc_leaves(main, report, 133)
 
 // The program is refused with exactly this message, first, at this line and column of `main.sysl`.
@@ -91,7 +92,7 @@ ctc_a_satisfied_precondition_lets_the_body_run() = ctc_prints(ctc_half() + "prin
 ctc_the_boundary_value_passes() = ctc_prints(ctc_half() + "print(half(0))", "0\n")
 
 @test("a violated precondition traps before the body runs")
-ctc_a_violated_precondition_traps() = ctc_traps(ctc_half() + "print(half(-2))")
+ctc_a_violated_precondition_traps() = ctc_traps_reporting(ctc_half() + "print(half(-2))", "require failed (main.sysl:2:13)\n")
 
 // -- ensure, and `result` -------------------------------------------------------------------------
 
@@ -103,7 +104,8 @@ ctc_a_satisfied_postcondition_returns_normally() =
 // The trailing expression is an exit like any other: a negative input comes back negative.
 @test("a violated postcondition on the fall-through path traps")
 ctc_a_violated_postcondition_on_the_fall_through_path_traps() =
-    ctc_traps("bad(x: int) -> int\n    ensure result >= 0\n    x\nprint(bad(-1))")
+    ctc_traps_reporting("bad(x: int) -> int\n    ensure result >= 0\n    x\nprint(bad(-1))",
+                        "ensure failed (main.sysl:2:12)\n")
 
 // An early `return` is its own exit site, so the postcondition is checked there too.
 @test("the early-return path that satisfies it passes")
@@ -113,8 +115,8 @@ ctc_the_early_return_path_that_satisfies_it_passes() =
 
 @test("the early-return path that violates it traps")
 ctc_the_early_return_path_that_violates_it_traps() =
-    ctc_traps("f(x: int) -> int\n    ensure result >= 10\n    if x < 0 then return 0\n    x + 100\n" +
-              "print(f(-5))")
+    ctc_traps_reporting("f(x: int) -> int\n    ensure result >= 10\n    if x < 0 then return 0\n    x + 100\n" +
+                        "print(f(-5))", "ensure failed (main.sysl:2:12)\n")
 
 @test("require and ensure both hold across every path")
 ctc_both_hold_across_every_path() =
@@ -124,8 +126,8 @@ ctc_both_hold_across_every_path() =
 
 @test("the precondition is what fails when the caller breaks it")
 ctc_the_precondition_is_what_fails_when_the_caller_breaks_it() =
-    ctc_traps("clamp(x: int, hi: int) -> int\n    require hi >= 0\n    ensure result <= hi\n" +
-              "    if x > hi then return hi\n    x\nprint(clamp(5, -1))")
+    ctc_traps_reporting("clamp(x: int, hi: int) -> int\n    require hi >= 0\n    ensure result <= hi\n" +
+                        "    if x > hi then return hi\n    x\nprint(clamp(5, -1))", "require failed (main.sysl:2:13)\n")
 
 // `result` is contextual: a real binding of that name wins, so ordinary code using it is unaffected.
 @test("a local named result shadows the contract keyword")
@@ -146,7 +148,8 @@ ctc_old_compares_against_the_entry_value() =
 // Naming `x` would read the mutated value and pass; `old(x)` reads the entry value, so this traps.
 @test("comparing the mutated value against the entry snapshot traps")
 ctc_comparing_the_mutated_value_against_the_entry_snapshot_traps() =
-    ctc_traps("bad(x: int) -> int\n    ensure result == old(x)\n    x = x + 5\n    x\nprint(bad(100))")
+    ctc_traps_reporting("bad(x: int) -> int\n    ensure result == old(x)\n    x = x + 5\n    x\nprint(bad(100))",
+                        "ensure failed (main.sysl:2:12)\n")
 
 @test("multiple old snapshots are independent")
 ctc_multiple_old_snapshots_are_independent() =
@@ -170,7 +173,7 @@ ctc_a_call_that_satisfies_both_runs() =
 
 @test("one that breaks the precondition traps")
 ctc_one_that_breaks_the_precondition_traps() =
-    ctc_traps(ctc_counter() + "var c = Counter(1)\nprint(c.bump(0))")
+    ctc_traps_reporting(ctc_counter() + "var c = Counter(1)\nprint(c.bump(0))", "require failed (main.sysl:5:17)\n")
 
 @test("'ensure' reads 'result' and 'old' of the receiver's own field")
 ctc_ensure_reads_result_and_old_of_the_receivers_field() =
