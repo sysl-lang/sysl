@@ -2398,6 +2398,11 @@ print(make()())
 the closure past it, and on the heap otherwise (below). A reading closure in a `val` is how
 freestanding code binds a closure to an immutable name without asking that question.
 
+**A parameter of a function type may be named**: `&Fn(x: int, y: int) -> int`. The names document
+the type and are ignored by it, so `&Fn(x: int) -> int` and `&Fn(int) -> int` are one type. Named
+and unnamed parameters may be mixed, and a name written twice in one type is refused. (The bare
+arrow `(int, int) -> int` takes no names; write `Fn(x: int, y: int) -> int` for that.)
+
 ### A closure handed on as a `&Fn` is boxed in the frame
 
 A closure erased to `&Fn` is a counted reference, so it has a box: the counts, the hook that lets go

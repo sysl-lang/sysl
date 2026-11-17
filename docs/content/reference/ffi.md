@@ -2178,6 +2178,26 @@ print("freed")
 freed
 ```
 
+**A parameter may carry a name**, as in Rust, C and Swift: `*extern(ud: *u8, len: usize) -> int` and
+`Fn(x: int) -> int`. The names are documentation, so they are ignored by the type —
+`*extern(a: i32)`, `*extern(b: i32)` and `*extern(i32)` are one type, assigned to each other freely,
+and a diagnostic prints the type without its names. Named and unnamed parameters may be mixed, and a
+name written twice in one type is refused.
+
+```sysl
+@export
+add(a: i32, b: i32) -> i32 = a + b
+
+val f: *extern(left: i32, right: i32) -> i32 = &add
+val g: *extern(i32, i32) -> i32 = f
+
+print(g(2, 3))
+```
+
+```output
+5
+```
+
 **`&f` is the address**, and the `&` is the same one the [memory model](/reference/memory/) gives
 every other address. A bare `f` keeps its ordinary meaning — the capture-free closure — because a
 spelling that meant a sysl callable in one slot and a C address in another would be choosing

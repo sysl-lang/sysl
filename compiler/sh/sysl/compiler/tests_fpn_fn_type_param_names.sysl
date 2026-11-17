@@ -1,0 +1,209 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A function type's parameters may be named, `Fn(x: int) -> int` and
+// `*extern(ud: *u8, len: usize) -> int`. The names document the type and are ignored by it
+// (`parse_type.sysl`'s `parse_fn_param_types`).
+
+private fpn_outcome(text: string) -> (string, int)
+    val root = make_temp_dir("sysl-fpn").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end fpn_outcome
+
+private fpn_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = fpn_outcome(text)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+end fpn_prints
+
+private fpn_refused(text: string, part: string)
+    if xvr_no_library() then return
+
+    val out = fpn_outcome(text)
+
+    assert_eq(out.1, -1, out.0)
+    assert(out.0.index_of(part).is_some(), out.0)
+end fpn_refused
+
+@test("a named '*extern' parameter list is called")
+fpn_named_extern_parameters()
+    fpn_prints(raw"""
+@export
+add(a: i32, b: i32) -> i32 = a + b
+
+main()
+    val f: *extern(left: i32, right: i32) -> i32 = &add
+
+    print(f(2, 3))
+""", "5\n")
+
+@test("a named 'Fn' parameter list takes a closure")
+fpn_named_fn_parameters()
+    fpn_prints(raw"""
+apply(f: &Fn(x: int) -> int, n: int) -> int = f(n)
+
+main()
+    print(apply(x -> x * 3, 4))
+""", "12\n")
+
+@test("a named 'Fn' with no arrow yields unit")
+fpn_named_fn_with_no_arrow()
+    fpn_prints(raw"""
+var total = 0
+
+apply(f: &Fn(n: int), n: int)
+    f(n)
+
+main()
+    apply(k -> total += k, 6)
+    print(total)
+""", "6\n")
+
+@test("names are ignored by identity: three spellings are one type")
+fpn_names_do_not_change_the_type()
+    fpn_prints(raw"""
+@export
+bump(n: i32) -> i32 = n + 1
+
+main()
+    var a: *extern(x: i32) -> i32 = &bump
+    var b: *extern(y: i32) -> i32 = a
+    var c: *extern(i32) -> i32 = b
+
+    a = c
+    b = a
+    print(c(1) + b(2) + a(3))
+""", "9\n")
+
+@test("names are ignored by identity for 'Fn' as well")
+fpn_fn_names_do_not_change_the_type()
+    fpn_prints(raw"""
+main()
+    val a: &Fn(x: int) -> int = n -> n + 1
+    val b: &Fn(int) -> int = a
+    val c: &Fn(y: int) -> int = b
+
+    print(c(4))
+""", "5\n")
+
+@test("named and unnamed parameters may be mixed")
+fpn_mixed_named_and_unnamed()
+    fpn_prints(raw"""
+@export
+sub(a: i32, b: i32) -> i32 = a - b
+
+main()
+    val f: *extern(a: i32, i32) -> i32 = &sub
+    val g: *extern(i32, b: i32) -> i32 = f
+
+    print(g(9, 4))
+""", "5\n")
+
+@test("a struct field carries a named function type")
+fpn_struct_field()
+    fpn_prints(raw"""
+extern malloc(n: usize) -> *u8
+extern free(p: *u8)
+
+struct Owner
+    release: *extern(p: *u8)
+    on_done: &Fn(code: int) -> int
+
+main()
+    val o = Owner(&free, c -> c + 1)
+
+    o.release(malloc(8))
+    print(o.on_done(1))
+""", "2\n")
+
+@test("an extern function takes a named callback and a parameter names a type")
+fpn_extern_taking_a_callback()
+    fpn_prints(raw"""
+extern qsort(base: *u8, n: usize, size: usize, cmp: *extern(a: *u8, b: *u8) -> i32)
+
+@export
+cmp_bytes(a: *u8, b: *u8) -> i32 = i32(*a) - i32(*b)
+
+main()
+    var xs: [3]u8 = [3, 1, 2]
+
+    qsort(&xs[0], 3, 1, &cmp_bytes)
+    print(xs[0])
+    print(xs[2])
+""", "1\n3\n")
+
+@test("a trailing comma follows a named parameter")
+fpn_trailing_comma()
+    fpn_prints(raw"""
+@export
+one(n: i32) -> i32 = n
+
+main()
+    val f: *extern(n: i32,) -> i32 = &one
+
+    print(f(7))
+""", "7\n")
+
+@test("a name written twice in one function type is refused")
+fpn_duplicate_name_is_refused()
+    fpn_refused(raw"""
+main()
+    val f: &Fn(x: int, x: int) -> int = (a, b) -> a + b
+""", "'x' is written twice")
+
+@test("a name written twice in an '*extern' is refused")
+fpn_duplicate_extern_name_is_refused()
+    fpn_refused(raw"""
+main()
+    val f: *extern(p: i32, p: i32) -> i32 = null
+""", "'p' is written twice")
+
+@test("a name with no type is refused")
+fpn_name_without_a_type_is_refused()
+    fpn_refused(raw"""
+main()
+    val f: *extern(p: ) -> i32 = null
+""", "")
+
+@test("a mismatch diagnostic prints the unnamed form")
+fpn_diagnostic_prints_the_types()
+    fpn_refused(raw"""
+@export
+twice(n: i32) -> i32 = n * 2
+
+main()
+    val f: *extern(x: i32) = &twice
+""", "*extern(i32) -> unit")
+
+@test("a bare-arrow type is undisturbed and still takes no names")
+fpn_bare_arrow_forms_still_parse()
+    fpn_prints(raw"""
+use2(f: (int, int) -> int, g: int -> int) -> int = f(1, 2) + g(3)
+
+main()
+    print(use2((a, b) -> a + b, (x) -> x + 1))
+""", "7\n")
