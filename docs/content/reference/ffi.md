@@ -871,6 +871,41 @@ Every refusal names the shape to write instead, because there always is one — 
 pointer and length C's own buffer functions already take, an array becomes a struct holding it. That
 is what makes the boundary writable rather than merely restricted.
 
+### A trap inside an export
+
+**A check that fails inside an exported function ends the process, and nothing after it runs.** A
+bounds check, an overflow check in a debug build, a `require` or other contract, an index past a
+container's count and `trap()` all stop exactly as they do in a sysl program
+([errors](/reference/errors/#what-stopping-looks-like)): the line the check reports goes to standard
+error, C's open output streams are flushed, and the trap instruction ends the process — status 133
+in a shell on AArch64, where the instruction raises SIGTRAP, and 132 on x86-64, where `ud2` raises
+SIGILL. Nothing is unwound: the statement of the C caller after the call never runs, no `defer` of
+the sysl frames between runs, a C frame sitting between two of them (a callback that calls back in)
+is never returned to, and no `atexit` handler runs. Since the stop is the process's, it is the same
+whether the C project linked the `build-c` archive statically or made a shared library of it:
+
+```c
+#include <stdio.h>
+#include "libmylib.a.h"
+
+int main(void) {
+    printf("before\n");          /* printed: the trap flushes stdout first */
+    mylib_lookup(5);             /* an index past the end: the process ends here */
+    printf("after\n");           /* never runs */
+}
+```
+
+**A C program that defines `sysl_bounds_fail` itself replaces the report, not the stop.** Its
+definition is called with the failure in place of the default line, and when it returns the check
+traps as it would have, so an embedder may log a bounds failure its own way but cannot make the
+export return. An overflow wraps rather than trapping in a release build, so there the export returns
+the wrapped answer like any other.
+
+`panic` and the forcing members built on it (`unwrap`, `expect`, `assert`) are the one difference,
+as they are in a program: they print their line on standard output and exit with status 1 through
+C's `exit`, so the caller's `atexit` handlers do run — and the caller still never sees the call
+return.
+
 ### A variadic export
 
 **An exported function may end in `...`**, which is what a C library written in sysl needs to define

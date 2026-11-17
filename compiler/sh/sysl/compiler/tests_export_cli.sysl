@@ -39,7 +39,7 @@ end ecl_ready
 private ecl_has(said: string, part: string) -> bool = said.index_of(part).is_some()
 
 // What one command line came to: the status the shell hears, and every line the driver said.
-private ecl_run(args: []string) -> (int, string)
+private ecl_run(args: []const string) -> (int, string)
     var lines: Buf[string] = buf()
     val sink = &lines
     val code = run_cli(args, (line) -> sink.push(line))
@@ -1102,3 +1102,296 @@ ecl_a_variadic_export_called_from_c_on_x86_64()
     assert_eq(ran.text.trim(), "60 6.5 11 42")
     remove_dir_all(root).unwrap_or(())
 end ecl_a_variadic_export_called_from_c_on_x86_64
+
+// -- a trap inside an export ----------------------------------------------------------------------
+//
+// **A trap inside an exported function ends the process, and nothing after it runs**
+// (`reference/ffi.md § A trap inside an export`): no line of the C caller after the call, no `defer`
+// of the sysl frames, no C frame between them, no `atexit` handler. The process ends by the trap
+// instruction's own signal -- SIGTRAP from AArch64's `brk`, status 133 in a shell; SIGILL from
+// x86-64's `ud2`, 132 -- and the line the check prints, if any, is on standard error. The trap flushes
+// C's streams first, so what the caller printed before the call is kept. `panic` is the exception
+// the reference names: it exits 1 through C's `exit`, which runs `atexit` and still never returns.
+//
+// Each cell is run from a static archive and from a shared library made of the whole archive, the
+// two ways a C project takes the library in.
+
+private ecl_trap_lib() -> string = raw"""
+    module mylib
+
+    import sysl.buf.{Buf, buf}
+
+    val table: [3]i32 = [1, 2, 3]
+
+    @export("t_bounds")
+    bounds(i: i32) -> i32 = table[i]
+
+    @export("t_overflow")
+    overflow(a: i32) -> i32 = a + 2147483647
+
+    @export("t_trap")
+    stop(a: i32) -> i32
+        if a > 0 then trap()
+        a
+
+    @export("t_require")
+    half(x: i32) -> i32
+        require x >= 0, "x must be non-negative"
+        x / 2
+
+    @export("t_container")
+    container(i: i32) -> i32
+        var b: Buf[i32] = buf()
+
+        b.push(1)
+        b.push(2)
+        b[i]
+
+    @export("t_defer")
+    deferred(i: i32) -> i32
+        defer print("deferred")
+        table[i]
+
+    @export("t_via")
+    via(cb: *extern(i32) -> i32, i: i32) -> i32
+        defer print("via deferred")
+        cb(i) + 1
+
+    @export("t_panic")
+    gives_up(a: i32) -> i32
+        if a > 0 then panic("given up")
+        a
+    """
+
+// The caller: `before`, the one call its argument names, then `after` and the answer. `back` is the C
+// frame `t_via` calls into, which calls the trapping export in turn.
+private ecl_trap_caller() -> string = raw"""
+    #include <stdio.h>
+    #include <stdint.h>
+    #include <stdlib.h>
+    #include <string.h>
+    #include "libmylib.a.h"
+
+    static void bye(void) { fprintf(stderr, "atexit ran\n"); }
+
+    static int32_t back(int32_t i) {
+        int32_t r = t_bounds(i);
+        printf("callback after\n");
+        return r;
+    }
+
+    int main(int argc, char **argv) {
+        atexit(bye);
+        const char *k = argv[1];
+        int32_t r = -1;
+        printf("before\n");
+        if (!strcmp(k, "bounds")) r = t_bounds(5);
+        else if (!strcmp(k, "overflow")) r = t_overflow(5);
+        else if (!strcmp(k, "trap")) r = t_trap(1);
+        else if (!strcmp(k, "require")) r = t_require(-1);
+        else if (!strcmp(k, "container")) r = t_container(5);
+        else if (!strcmp(k, "defer")) r = t_defer(5);
+        else if (!strcmp(k, "via")) r = t_via(back, 5);
+        else if (!strcmp(k, "panic")) r = t_panic(1);
+        printf("after %d\n", r);
+        return 0;
+    }
+    """
+
+// An embedder's own report of a failed bounds check, which returns.
+private ecl_trap_hook() -> string = raw"""
+    #include <stdio.h>
+    #include <stdint.h>
+    #include <stddef.h>
+
+    void sysl_bounds_fail(uint32_t kind, size_t a, size_t b, size_t length, const char *at) {
+        fprintf(stderr, "host hook: index %zu length %zu\n", a, length);
+    }
+    """
+
+private ecl_clang(args: []const string)
+    val built = capture("clang", args, "", [], true).unwrap()
+
+    assert(ecl_exited_zero(built.status), built.err.unwrap_or(built.text))
+
+// The trapping library archived with `build` on build-c's command line, and the caller linked
+// against it with `cc` in front of clang's: statically, or through a shared library holding every
+// member of the archive; with the embedder's hook beside the caller when `hook` says so.
+private ecl_trap_host(build: []string, cc: []string, shared: bool, hook: bool) -> string
+    val root = ecl_project(ecl_trap_lib())
+    var line: Buf[string] = buf()
+
+    for word in ["sysl", "build-c", root, "-o", s"$root/libmylib.a"] do line.push(word)
+    for word in build do line.push(word)
+
+    val got = ecl_run(line.view())
+
+    assert(got.0 == 0, got.1)
+    write_text(s"$root/main.c", ecl_trap_caller()).unwrap()
+
+    var link: Buf[string] = buf()
+
+    for word in cc do link.push(word)
+    link.push(s"$root/main.c")
+
+    if hook
+        write_text(s"$root/hook.c", ecl_trap_hook()).unwrap()
+        link.push(s"$root/hook.c")
+
+    if shared
+        val lib = s"$root/libmylib.dylib"
+
+        ecl_clang(["-dynamiclib", "-Wl,-all_load", s"$root/libmylib.a", "-o", lib, "-install_name", lib])
+        link.push(lib)
+    else
+        link.push(s"$root/libmylib.a")
+    end if
+
+    link.push("-o")
+    link.push(s"$root/caller")
+    ecl_clang(link.view())
+    root
+end ecl_trap_host
+
+// One run of the caller: how it ended, its standard output and its standard error. The timeout is
+// long enough for Rosetta's first translation.
+private ecl_trap_run(root: string, kind: string) -> (Status, string, string)
+    val ran = capture(s"$root/caller", [kind], "", [], true, 60000).unwrap()
+
+    (ran.status, ran.text, ran.err.unwrap_or(""))
+
+// The signal this machine's trap instruction raises.
+private ecl_trap_signal() -> int = if host_cpu() == Aarch64 then 5 else 4
+
+// What a trapping cell owes: ended by `signal`, standard output exactly the `before` the trap flushed
+// -- no `after`, no `defer`'s line, no line of the C callback -- and standard error exactly the check's
+// line, or nothing for `trap()`. No `atexit` handler ran.
+private ecl_traps(root: string, kind: string, signal: int, said: string)
+    val got = ecl_trap_run(root, kind)
+
+    assert(got.0 == Status.Signalled(signal), s"$kind ended with ${got.0}: '${got.1}' '${got.2}'")
+    assert_eq(got.1, "before\n", kind)
+
+    if said.len == 0
+        assert_eq(got.2, "", kind)
+    else
+        assert(got.2.starts_with(said), s"$kind said '${got.2}'")
+        assert_eq(got.2.index_of("\n"), Some(got.2.len - 1), kind)
+end ecl_traps
+
+// Every trapping kind, then `panic`: exit 1 through C's `exit`, so `atexit` runs, its line on
+// standard output, and still nothing of the caller after the call.
+private ecl_every_stop(root: string)
+    val signal = ecl_trap_signal()
+
+    ecl_traps(root, "bounds", signal, "index 5 out of bounds for length 3 (mylib/lib.sysl:")
+    ecl_traps(root, "overflow", signal, "integer overflow: i32 + i32 (mylib/lib.sysl:")
+    ecl_traps(root, "trap", signal, "")
+    ecl_traps(root, "require", signal, "require failed: x must be non-negative (mylib/lib.sysl:")
+    ecl_traps(root, "container", signal, "index 5 out of bounds for length 2 (mylib/lib.sysl:")
+    ecl_traps(root, "defer", signal, "index 5 out of bounds for length 3 (mylib/lib.sysl:")
+    ecl_traps(root, "via", signal, "index 5 out of bounds for length 3 (mylib/lib.sysl:")
+
+    val panicked = ecl_trap_run(root, "panic")
+
+    assert(panicked.0 == Status.Exited(1), s"panic ended with ${panicked.0}")
+    assert(panicked.1.starts_with("before\npanic: given up (mylib/lib.sysl:"), panicked.1)
+    assert(!ecl_has(panicked.1, "after"), panicked.1)
+    assert_eq(panicked.2, "atexit ran\n")
+end ecl_every_stop
+
+// A shared library is made here only as macOS makes one; elsewhere the cell is named and skipped.
+private ecl_shared_ready() -> bool
+    if host_os() == MacOS then return true
+
+    print("skipped: the shared-library link here is macOS's")
+    false
+
+@test("a trap inside an export ends a C program linked against the archive by the trap signal, and nothing after it runs")
+ecl_a_trap_in_an_export_from_an_archive()
+    if !ecl_ready() then return
+
+    val root = ecl_trap_host(["--debug"], [], false, false)
+
+    ecl_every_stop(root)
+    remove_dir_all(root).unwrap_or(())
+
+@test("and the same from a shared library made of the archive")
+ecl_a_trap_in_an_export_from_a_shared_library()
+    if !ecl_ready() || !ecl_shared_ready() then return
+
+    val root = ecl_trap_host(["--debug"], [], true, false)
+
+    ecl_every_stop(root)
+    remove_dir_all(root).unwrap_or(())
+
+// A release build drops only the overflow check: the rest trap as before, and an overflow wraps and
+// returns to C like any answer.
+@test("in a release archive every check but overflow still traps, and an overflow wraps back to C")
+ecl_a_trap_in_a_release_export()
+    if !ecl_ready() then return
+
+    val root = ecl_trap_host(["--release"], [], false, false)
+    val signal = ecl_trap_signal()
+
+    ecl_traps(root, "bounds", signal, "index 5 out of bounds for length 3 (mylib/lib.sysl:")
+    ecl_traps(root, "trap", signal, "")
+    ecl_traps(root, "require", signal, "require failed: x must be non-negative (mylib/lib.sysl:")
+    ecl_traps(root, "container", signal, "index 5 out of bounds for length 2 (mylib/lib.sysl:")
+    ecl_traps(root, "via", signal, "index 5 out of bounds for length 3 (mylib/lib.sysl:")
+
+    val wrapped = ecl_trap_run(root, "overflow")
+
+    assert(wrapped.0 == Status.Exited(0), s"overflow ended with ${wrapped.0}")
+    assert_eq(wrapped.1, "before\nafter -2147483644\n")
+    assert_eq(wrapped.2, "atexit ran\n")
+    remove_dir_all(root).unwrap_or(())
+end ecl_a_trap_in_a_release_export
+
+// The embedder's `sysl_bounds_fail` replaces the default report -- its line, not the default's -- and
+// returning from it does not return to C: the check traps after it.
+private ecl_hooked(root: string)
+    val signal = ecl_trap_signal()
+
+    ecl_traps(root, "bounds", signal, "host hook: index 5 length 3")
+    ecl_traps(root, "container", signal, "host hook: index 5 length 2")
+    ecl_traps(root, "via", signal, "host hook: index 5 length 3")
+
+@test("a C program's own sysl_bounds_fail runs instead of the default, and when it returns the export still traps")
+ecl_a_trap_after_the_embedders_hook()
+    if !ecl_ready() then return
+
+    val root = ecl_trap_host(["--debug"], [], false, true)
+
+    ecl_hooked(root)
+    remove_dir_all(root).unwrap_or(())
+
+@test("and the same when the export is in a shared library and the hook in the program")
+ecl_a_trap_after_the_embedders_hook_shared()
+    if !ecl_ready() || !ecl_shared_ready() then return
+
+    val root = ecl_trap_host(["--debug"], [], true, true)
+
+    ecl_hooked(root)
+    remove_dir_all(root).unwrap_or(())
+
+// x86-64's trap instruction is `ud2`, which raises SIGILL: the same stop, under the other signal.
+@test("on x86-64 a trap inside an export ends the C program by SIGILL, and nothing after it runs")
+ecl_a_trap_in_an_export_on_x86_64()
+    if !ecl_ready() then return
+
+    val rosetta = capture("arch", ["-x86_64", "/usr/bin/true"], "", [], true)
+
+    if rosetta.is_err() || !ecl_exited_zero(rosetta.unwrap().status)
+        print("skipped: this machine cannot run an x86-64 program")
+        return
+    end if
+
+    val root = ecl_trap_host(["--debug", "--target", "x86_64-macos"], ["-arch", "x86_64"], false, false)
+
+    ecl_traps(root, "bounds", 4, "index 5 out of bounds for length 3 (mylib/lib.sysl:")
+    ecl_traps(root, "trap", 4, "")
+    ecl_traps(root, "require", 4, "require failed: x must be non-negative (mylib/lib.sysl:")
+    ecl_traps(root, "via", 4, "index 5 out of bounds for length 3 (mylib/lib.sysl:")
+    remove_dir_all(root).unwrap_or(())
+end ecl_a_trap_in_an_export_on_x86_64
