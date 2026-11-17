@@ -1579,6 +1579,11 @@ print(1)
 'leave' is '@abandons', and a call through a value cannot be followed to it
 ```
 
+**The one value that may hold one is a C function pointer that says so**, `@abandons *extern(int) ->
+never`: a call through it is held to what a call to an abandoning function is, and a C function
+taking one is the catch point that `lua_pcall` and libpng's `setjmp` are. It is how a callback that
+raises is handed to C — see [`@abandons *extern`](/reference/ffi/#abandons-extern-a-callback-that-may-jump-past-c).
+
 ### Clauses
 
 A function may be **given by clauses**: its signature on a line with no body, then one clause per

@@ -482,6 +482,13 @@ true
 The fused instruction is asked for exactly, never left to the optimizer to choose site by site, so a
 program prints the same bits at `-O0` and at `-O3`, vectorized loops included.
 
+**Every float `+`, `-` and `*` is computed in the order it is written**, so a sum of many terms is a
+chain the optimizer keeps in that order. A function or block marked
+[`@reassociate`](/reference/attributes/#reassociate-float-sums-the-back-end-may-regroup) gives the
+order up — its sums may be regrouped, and vectorized, at the cost of the last bits — and there a
+product meeting a sum is one the back end may fuse or not, site by site. Everywhere else the rules
+above hold exactly.
+
 #### An arithmetic operator is read as its body
 
 **A call of an `Add`, `Sub`, `Mul`, `Div` or `Neg` method whose body is one expression is read, for

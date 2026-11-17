@@ -1,0 +1,571 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, replace_all}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `@reassociate` (`reference/attributes.md § @reassociate`, `reassociate.sysl`): the float `+`, `-`
+// and `*` written inside a marked function, method or block carry LLVM's `reassoc` flag, and a
+// product meeting a sum there is `llvm.fmuladd` carrying it; everything written elsewhere is exact.
+// The axes: where it is written (function, method, generic, block, entry statements, closure inside,
+// function called from inside), which operation (`+ - *` against `/`, an update, a contraction, a
+// lane-wise vector op, an integer), what clang's `-O3` does with a reduction, what compile-time
+// evaluation computes, what a run prints, and every refusal.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private var rsc_library_cache: Buf[Program] = buf()
+private var rsc_library_read: bool = false
+
+private rsc_library() -> Buf[Program]
+    if rsc_library_read then return rsc_library_cache
+
+    rsc_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> rsc_library_cache = units
+
+    rsc_library_cache
+end rsc_library
+
+private rsc_no_library() -> bool
+    if rsc_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end rsc_no_library
+
+// The LLVM text of the whole module a source lowers to, or the first thing it was refused with.
+private rsc_ir(text: string) -> string
+    val parsed = parse(source_of("t.sysl", text))
+
+    if !parsed.ok() then return parsed.first().message
+
+    var units: Buf[Program] = buf()
+
+    for item in rsc_library()
+        units.push(item)
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if !done.reported.is_empty() then return done.reported[0].diag.message
+
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+    val said = errors_of(done.an.diagnostics())
+
+    if !said.is_empty() then return analysis_report(said)
+
+    val kept = prune(strip_tests(whole), program_own(units))
+    val lowered = codegen_with_gaps(kept, host_target(), promotions)
+
+    ir_print_module(lowered.0)
+end rsc_ir
+
+// What clang's `-O3` leaves of a program, or `None` where there is no clang to ask.
+private rsc_optimized(text: string) -> Option[string]
+    if !clang_available()
+        print("skipped: clang is not installed, so there is no optimizer to ask")
+        return None
+    end if
+
+    val dir = make_temp_dir("sysl-rsc").unwrap()
+    val file = s"$dir/t.ll"
+
+    write_text(file, rsc_ir(text)).unwrap()
+
+    val got = capture("clang", ["-O3", "-S", "-emit-llvm", "-o", "-", file], "", [], true).unwrap()
+
+    remove_dir_all(dir).unwrap_or(())
+    assert(got.status.ok(), s"clang refused the emitted IR:\n${got.err.unwrap_or("")}")
+    Some(got.text)
+end rsc_optimized
+
+// What a program prints, built at `level`, or why it did not build.
+private rsc_ran(text: string, level: string) -> string
+    val root = replace_all(make_temp_dir("sysl-rsc").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, level, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end rsc_ran
+
+// That a program prints `expected` unoptimized and at `-O3` alike.
+private rsc_prints(text: string, expected: string)
+    if rsc_no_library() || !clang_available() then return
+
+    for level in ["0", "3"]
+        assert_eq(rsc_ran(text, level), expected)
+end rsc_prints
+
+// The body of the first function whose `define` line holds `name`.
+private rsc_body(out: string, name: string) -> string
+    var body = ""
+    var inside = false
+
+    for l in lines_of(out)
+        if !inside && l.starts_with("define") && l.contains(name) then inside = true
+
+        if inside
+            if l == "}" then return body
+
+            body = body + l + "\n"
+        end if
+
+    assert(false, s"no function '$name' in:\n$out")
+    ""
+end rsc_body
+
+private rsc_says(text: string, part: string) = assert(text.contains(part), s"expected '$part' in:\n$text")
+
+private rsc_lacks(text: string, part: string) = assert(!text.contains(part), s"did not expect '$part' in:\n$text")
+
+// That a program is refused with a diagnostic holding `part`.
+private rsc_refused(text: string, part: string)
+    if rsc_no_library() then return
+
+    val said = rsc_ir(text)
+
+    assert(said.contains(part), s"expected a refusal holding\n$part\nin\n$said")
+end rsc_refused
+
+// Whether this machine fuses a binary64 multiply-add, which decides what a contraction is.
+private rsc_fuses() -> bool = fusing_of(host_target()).double
+
+// -- where the flag is ------------------------------------------------------------------------------
+
+@test("a '@reassociate' function's float +, - and * carry 'reassoc'; its '/' and an unmarked neighbour's do not")
+rsc_function_ops()
+    if rsc_no_library() then return
+
+    val ir = rsc_ir(raw"""
+        @reassociate
+        @noinline
+        mixed(a: real, b: real, c: real) -> real
+            val s = a + b
+            val d = s - c
+            val p = d * a
+
+            p / b
+
+        @noinline
+        plain(a: real, b: real, c: real) -> real
+            val s = a + b
+            val d = s - c
+            val p = d * a
+
+            p / b
+
+        print(mixed(1.0, 2.0, 3.0), plain(1.0, 2.0, 3.0))
+        """)
+
+    val marked = rsc_body(ir, "mixed")
+
+    rsc_says(marked, "fadd reassoc double")
+    rsc_says(marked, "fsub reassoc double")
+    rsc_says(marked, "fmul reassoc double")
+    rsc_says(marked, "fdiv double")
+    rsc_lacks(marked, "fdiv reassoc")
+    rsc_lacks(rsc_body(ir, "plain"), "reassoc")
+end rsc_function_ops
+
+@test("an update, a method, a generic's instance and a vector's lanes are regrouped too")
+rsc_shapes()
+    if rsc_no_library() then return
+
+    val ir = rsc_ir(raw"""
+        struct Acc
+            total: f32
+
+        impl Acc
+            @reassociate
+            @noinline
+            take(*self, x: f32)
+                self.total += x
+
+        @reassociate
+        @noinline
+        twice[T: Add](x: T) -> T = x + x
+
+        @reassociate
+        @noinline
+        lanes(a: <4>f32, b: <4>f32) -> <4>f32 = a + b
+
+        @noinline
+        use(a: <4>f32) -> real
+            var acc = Acc(0.0f32)
+
+            acc.take(1.5f32)
+            twice(2.5) + real(acc.total) + real(lanes(a, a).sum())
+
+        print(use(<4>f32(1.0f32)))
+        """)
+
+    rsc_says(rsc_body(ir, "take"), "fadd reassoc float")
+    rsc_says(rsc_body(ir, "twice"), "fadd reassoc double")
+    rsc_says(rsc_body(ir, "lanes"), "fadd reassoc <4 x float>")
+end rsc_shapes
+
+@test("integer arithmetic in a '@reassociate' body is unchanged")
+rsc_integers_untouched()
+    if rsc_no_library() then return
+
+    val ir = rsc_ir(raw"""
+        @reassociate
+        @noinline
+        mix(a: int, b: int) -> int = a +% b *% a
+
+        print(mix(2, 3))
+        """)
+
+    rsc_lacks(rsc_body(ir, "mix"), "reassoc")
+end rsc_integers_untouched
+
+@test("a '@reassociate' block regroups what is written inside it and nothing before or after it")
+rsc_block_scope()
+    if rsc_no_library() then return
+
+    val ir = rsc_ir(raw"""
+        @noinline
+        part(xs: []const real) -> real
+            var before = xs[0] * 3.0
+            var total = 0.0
+
+            @reassociate
+                for x in xs do total = total + x
+
+            total - before
+
+        print(part([1.0, 2.0]))
+        """)
+
+    val body = rsc_body(ir, "part")
+
+    rsc_says(body, "fadd reassoc double")
+    rsc_says(body, "fmul double")
+    rsc_says(body, "fsub double")
+    rsc_lacks(body, "fmul reassoc")
+    rsc_lacks(body, "fsub reassoc")
+end rsc_block_scope
+
+@test("a block among the entry file's statements is regrouped, and the statements around it are not")
+rsc_block_in_entry()
+    if rsc_no_library() then return
+
+    val ir = rsc_ir(raw"""
+        var xs = [1.5, 2.5, 3.0]
+        var total = 0.0
+        var exact = 0.0
+
+        @reassociate
+            for x in xs do total = total + x
+
+        for x in xs do exact = exact - x
+
+        print(total, exact)
+        """)
+
+    rsc_says(ir, "fadd reassoc double")
+    rsc_says(ir, "fsub double")
+    rsc_lacks(ir, "fsub reassoc")
+end rsc_block_in_entry
+
+@test("a closure written inside is regrouped; a function called from inside, written elsewhere, is not")
+rsc_lexical()
+    if rsc_no_library() then return
+
+    val ir = rsc_ir(raw"""
+        @noinline
+        helper(a: real, b: real) -> real = a + b
+
+        @reassociate
+        @noinline
+        outer(xs: []const real) -> real
+            val add = (a: real, b: real) -> a + b
+            var t = 0.0
+
+            for x in xs do t = add(t, x)
+
+            helper(t, 1.0)
+
+        print(outer([1.0, 2.0]))
+        """)
+
+    rsc_lacks(rsc_body(ir, "helper"), "reassoc")
+    // The closure's body is a function of its own, and it is the one adding.
+    rsc_says(ir, "fadd reassoc double")
+    rsc_lacks(rsc_body(ir, "outer"), "fadd")
+end rsc_lexical
+
+@test("a block written inside a closure in an unmarked function reaches only that closure's operations")
+rsc_block_inside_closure()
+    if rsc_no_library() then return
+
+    val ir = rsc_ir(raw"""
+        @noinline
+        outer(xs: []const real) -> real
+            val f = (v: []const real) ->
+                var t = 0.0
+
+                @reassociate
+                    for x in v do t = t + x
+
+                t
+
+            f(xs) * 2.0
+
+        print(outer([1.0, 2.0]))
+        """)
+
+    rsc_says(ir, "fadd reassoc double")
+    rsc_says(rsc_body(ir, "outer"), "fmul double")
+    rsc_lacks(rsc_body(ir, "outer"), "reassoc")
+end rsc_block_inside_closure
+
+@test("a product meeting a sum is llvm.fmuladd carrying reassoc inside, and llvm.fma outside")
+rsc_contraction()
+    if rsc_no_library() then return
+
+    if !rsc_fuses()
+        print("skipped: this machine does not fuse a binary64 multiply-add")
+        return
+    end if
+
+    val ir = rsc_ir(raw"""
+        @reassociate
+        @noinline
+        loose(a: real, b: real, c: real) -> real = a * b + c
+
+        @noinline
+        exact(a: real, b: real, c: real) -> real = a * b + c
+
+        @noinline
+        update(xs: []const real, ys: []const real) -> real
+            var s = 0.0
+
+            @reassociate
+                for i in 0..<xs.len do s += xs[i] * ys[i]
+
+            s
+
+        print(loose(1.0, 2.0, 3.0), exact(1.0, 2.0, 3.0), update([1.0], [2.0]))
+        """)
+
+    rsc_says(rsc_body(ir, "loose"), "call reassoc double @llvm.fmuladd.f64")
+    rsc_says(rsc_body(ir, "exact"), "call double @llvm.fma.f64")
+    rsc_lacks(rsc_body(ir, "exact"), "fmuladd")
+    rsc_says(rsc_body(ir, "update"), "call reassoc double @llvm.fmuladd.f64")
+end rsc_contraction
+
+@test("a strict function written inside a '@reassociate' one keeps its own promise")
+rsc_strict_inside()
+    if rsc_no_library() then return
+
+    if host_target().cpu != Aarch64
+        print("skipped: '@strict_fp' at f64 is asserted on AArch64")
+        return
+    end if
+
+    val ir = rsc_ir(raw"""
+        @reassociate
+        @noinline
+        outer(a: real, b: real) -> real
+            @strict_fp
+            inner(x: real, y: real) -> real = x + y
+
+            inner(a, b) + a
+
+        print(outer(1.0, 2.0))
+        """)
+
+    rsc_says(ir, "llvm.experimental.constrained.fadd")
+    rsc_says(rsc_body(ir, "outer"), "fadd reassoc double")
+end rsc_strict_inside
+
+// -- what the optimizer makes of it ---------------------------------------------------------------
+
+@test("a reduction under '@reassociate' vectorizes at -O3, and the same loop unmarked keeps one ordered accumulator")
+rsc_vectorizes()
+    if rsc_no_library() then return
+
+    val got = rsc_optimized(raw"""
+        @reassociate
+        @noinline
+        loose_sum(xs: []const real) -> real
+            var t = 0.0
+
+            for x in xs do t = t + x
+
+            t
+
+        @noinline
+        exact_sum(xs: []const real) -> real
+            var t = 0.0
+
+            for x in xs do t = t + x
+
+            t
+
+        @reassociate
+        @noinline
+        loose_dot(xs: []const real, ys: []const real) -> real
+            var t = 0.0
+
+            @unchecked
+                for i in 0..<xs.len do t += xs[i] * ys[i]
+
+            t
+
+        val xs = [1.0, 2.0]
+
+        print(loose_sum(xs), exact_sum(xs), loose_dot(xs, xs))
+        """)
+
+    if got.is_none() then return
+
+    val out = got.unwrap()
+
+    // Regrouped, the accumulator is a vector of partial sums added lane by lane. In the written
+    // order the vectorizer may still load lanes together, but it folds them into one scalar
+    // accumulator in order (`llvm.vector.reduce.fadd` from it), so the chain is as long as before.
+    rsc_says(rsc_body(out, "loose_sum"), "= phi <")
+    rsc_says(rsc_body(out, "loose_sum"), "fadd reassoc <")
+    rsc_lacks(rsc_body(out, "exact_sum"), "= phi <")
+    rsc_lacks(rsc_body(out, "exact_sum"), "fadd reassoc")
+    rsc_says(rsc_body(out, "loose_dot"), "= phi <")
+    rsc_says(rsc_body(out, "loose_dot"), "fmuladd.v")
+end rsc_vectorizes
+
+// -- what a run computes ------------------------------------------------------------------------
+
+@test("sysl.slices.sum and dot answer exactly where every partial sum is exact, at -O0 and -O3")
+rsc_library_exact()
+    rsc_prints(raw"""
+        import sysl.slices.{sum, dot}
+
+        var xs = [1.5, 2.5, 3.0, 0.25]
+        var ys = [2.0, 4.0, 0.5, 8.0]
+        var ints = [1, 2, 3, 4, 5]
+        var none: []real = []
+        var short = [1.0, 2.0]
+
+        print(sum(xs), dot(xs, ys), sum(ints), dot(ints, ints))
+        print(sum(none), dot(none, xs), dot(short, ys), dot(ys, short))
+        """, "7.25 16.5 15 55\n0 0 10 10\n")
+end rsc_library_exact
+
+@test("a regrouped sum of ten thousand terms stays within 1e-12 of the written order")
+rsc_tolerance()
+    rsc_prints(raw"""
+        import sysl.slices.sum
+
+        var xs: []real = [0.0; 10000]
+
+        for i in 0..<xs.len do xs[i] = 1.0 / real(i + 1)
+
+        var exact = 0.0
+
+        for x in xs do exact = exact + x
+
+        val loose = sum(xs)
+        val off = (loose - exact).abs() / exact
+
+        print(off < 1e-12, loose > 9.78 && loose < 9.79)
+        """, "true true\n")
+end rsc_tolerance
+
+@test("the library's sum and dot carry reassoc at a float and nothing at an integer")
+rsc_library_ir()
+    if rsc_no_library() then return
+
+    val ir = rsc_ir(raw"""
+        import sysl.slices.{sum, dot}
+
+        var xs = [1.5, 2.5]
+        var ns = [1, 2]
+
+        print(sum(xs), dot(xs, xs), sum(ns))
+        """)
+
+    rsc_says(ir, "fadd reassoc double")
+
+    for l in lines_of(ir)
+        if l.contains(" add ") || l.contains(" add nsw") then rsc_lacks(l, "reassoc")
+end rsc_library_ir
+
+@test("a value worked out while compiling is the written order's, whatever the mark")
+rsc_const_order()
+    rsc_prints(raw"""
+        @reassociate
+        const three(a: real, b: real, c: real) -> real = a + b + c
+
+        const folded = three(1e16, 1.0, -1e16)
+
+        var a = 1e16
+        var b = 1.0
+        var c = -1e16
+
+        print(folded, (a + b) + c)
+        """, "0 0\n")
+end rsc_const_order
+
+// -- what is refused ------------------------------------------------------------------------------
+
+@test("'@reassociate' above a struct, an extern or a binding is refused, naming what it marks")
+rsc_not_a_body()
+    rsc_refused("@reassociate\nstruct P\n    x: real\nprint(P(1.0).x)\n",
+                "'@reassociate' lets the back end regroup the float sums and products written in a body, so it marks a function, a method, or — on a line of its own — the block indented under it")
+    rsc_refused("@reassociate\nextern \"sqrt\" c_sqrt(x: real) -> real\nprint(c_sqrt(4.0))\n",
+                "An 'extern''s operations are compiled by whoever compiled it")
+    rsc_refused("@reassociate\nval k = 1.0 + 2.0\nprint(k)\n",
+                "'@reassociate' lets the back end regroup")
+end rsc_not_a_body
+
+@test("'@reassociate' with an argument, or written twice, is refused")
+rsc_arguments()
+    rsc_refused("@reassociate(fast)\nf(x: real) -> real = x + x\nprint(f(1.0))\n",
+                "the order a regrouped sum is computed in is the back end's to choose")
+    rsc_refused("@reassociate\n@reassociate\nf(x: real) -> real = x + x\nprint(f(1.0))\n",
+                "'@reassociate' is written twice above one declaration")
+end rsc_arguments
+
+@test("'@reassociate' beside '@strict_fp', and a block inside a strict body, are refused")
+rsc_beside_strict()
+    rsc_refused("@reassociate\n@strict_fp\nf(x: f32) -> f32 = x + x\nprint(f(1.0f32))\n",
+                "'@strict_fp' keeps every floating-point operation exactly where and how it is written, and '@reassociate' lets the back end regroup them")
+
+    if host_target().cpu != Aarch64 then return
+
+    rsc_refused("@strict_fp\nf(x: real) -> real\n    var t = x\n\n    @reassociate\n        t = t + x\n\n    t\n\nprint(f(1.0))\n",
+                "a '@reassociate' block lets the back end regroup its float sums and products, and this one is inside a '@strict_fp' body")
+end rsc_beside_strict
+
+@test("'@reassociate' in front of a closure is refused, naming the function or block to mark")
+rsc_closure_refused()
+    rsc_refused("main(args: []string)\n    val f = @reassociate (x: real) -> x + x\n    print(f(1.0))\n",
+                "a closure takes no annotations, and '@reassociate' reaches one through the function or the block it is written in")
+end rsc_closure_refused
