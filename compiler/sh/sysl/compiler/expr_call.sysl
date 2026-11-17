@@ -3371,6 +3371,10 @@ narrowed_at(declared: Buf[usize], generic: Buf[bool], fitted: Buf[Buf[Type]], ar
         val defaulted = literal_default_preference(fitted, ranked, args)
 
         if defaulted.len() == 1 then return defaulted
+
+        val following = literal_follows_typed(fitted, ranked, args, natural)
+
+        if following.len() == 1 then return following
     end if
 
     var pool: Buf[usize] = buf()
@@ -3519,6 +3523,40 @@ private literal_default_preference(fitted: Buf[Buf[Type]], ranked: Buf[usize], a
 
     winners
 end literal_default_preference
+
+// **A bare literal beside a typed argument takes the type of the candidate that argument matches.**
+// Where every argument with a type of its own is exactly the parameter of one candidate, and every
+// other argument is a numeric literal with no suffix, that candidate wins and the literals are read
+// at its parameters: `nextafter(x, 100.0)` at an `f32` `x` is the `f32` one, as `x * 100.0` is at
+// `f32`. A typed argument that no candidate takes exactly stays ambiguous, and so do two candidates
+// that both match every typed argument. Empty where the rule does not apply.
+private literal_follows_typed(fitted: Buf[Buf[Type]], ranked: Buf[usize], args: Buf[Expr],
+                              natural: Buf[Option[Type]]) -> Buf[usize]
+    var winners: Buf[usize] = buf()
+    var typed = 0
+    var literals = 0
+
+    for j in 0..<args.len()
+        if literal_default(args[j]).is_some() then literals += 1 else typed += 1
+
+    if typed == 0 || literals == 0 || natural.len() != args.len() then return winners
+
+    for r in 0..<ranked.len()
+        val here = fitted[ranked[r]]
+        var all = here.len() == args.len()
+
+        for j in 0..<args.len()
+            if !all then break
+            if literal_default(args[j]).is_some() then continue
+
+            natural[j] match
+                Some(t) -> if !type_eq(here[j], t) then all = false
+                None -> all = false
+
+        if all then winners.push(ranked[r])
+
+    winners
+end literal_follows_typed
 
 // The type a bare numeric literal defaults to at a parameter: `real` for a float literal, and for
 // an integer literal `real` at a float parameter and `int` anywhere else.
