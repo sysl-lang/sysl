@@ -1942,6 +1942,104 @@ its manifest and may say `@link` nowhere.
 `sysl emit-header` prints the same declarations without building anything, for a project that
 generates its headers as a build step.
 
+### The spellings a C API is written in
+
+The header spells each type the way a C API's own documentation would, because a callback or a
+buffer declared one C type away from what its caller wrote is a hard error in the caller's compiler,
+not a warning:
+
+| sysl | in the header |
+|---|---|
+| `usize`, `isize` | `size_t`, `ptrdiff_t` — not `uint64_t`, which is a different C type of the same width where `size_t` is `unsigned long` |
+| `*const T` | `const T *`, and `uint8_t * const *` for a `*const *u8` |
+| `*unit` | `void *` — the opaque pointer an allocator or a context argument is |
+| a `*[N]T` parameter | `T name[N]`, the array C's caller passes by name; `const T name[N]` for `*const [N]T` |
+| a [`c type`](#c-type-a-width-only-the-c-compiler-can-work-out) | its C name, with the headers its file `@include`s included |
+
+```sysl build=c
+module terndb
+
+@export("terndb_alloc_fn")
+type AllocFn = *extern(usize) -> *unit
+
+@export("terndb_digest")
+digest(alloc: AllocFn, text: *const u8, len: usize, out: *[32]u8) -> isize = 0
+```
+
+```c
+typedef void * (*terndb_alloc_fn)(size_t);
+
+ptrdiff_t terndb_digest(terndb_alloc_fn alloc, const uint8_t * text, size_t len, uint8_t out[32]);
+```
+
+A pointer to an array stays one everywhere but a parameter — a field, a result, exported storage —
+since only a parameter is where C reads an array as the pointer it decays to.
+
+### Constants in the header
+
+**`@export` above a `const` defines it as a macro**, which is how C states a fixed number. A
+constant has no storage, so a macro is the one thing it can be exported as; the value is the one
+every use folds to, written as its type's C literal — `32`, `(-5)`, `UINT64_C(…)` past a C `int`,
+`1.5f`, `true`, a string with its bytes escaped. **Above a simple enum it defines one per variant**,
+`PREFIX_VARIANT` with the variant's name in capitals and an underscore between its words, the
+prefix being what `@export` named (the enum's own name in capitals where it named nothing). The
+enum itself is still spelled as its integer, so the constants are the values a parameter of that
+type takes:
+
+```sysl build=c
+module terndb
+
+@export("TERNDB_DIGEST_LEN")
+const DIGEST_LEN: usize = 32
+
+@export("TERNDB_ISOLATION")
+enum Isolation
+    Serializable
+    Snapshot
+    ReadCommitted
+
+@export("terndb_begin")
+begin(level: Isolation) -> bool = true
+```
+
+```c
+#define TERNDB_DIGEST_LEN 32
+
+#define TERNDB_ISOLATION_SERIALIZABLE 0
+#define TERNDB_ISOLATION_SNAPSHOT 1
+#define TERNDB_ISOLATION_READ_COMMITTED 2
+
+bool terndb_begin(int32_t level);
+```
+
+The macros sit under the includes, constants sorted by name and each enum's variants in the order
+they were declared. A constant C has no literal for is refused at its `@export`, and so is an enum
+whose variants carry fields:
+
+```sysl
+module mylib
+
+@export("HALF")
+const HALF: f16 = 1.5
+```
+
+```error
+'HALF' is exported as a macro, and it is f16, which has no C literal
+```
+
+### Naming the include guard
+
+The guard is built from the project's name — `SYSL_TERNDB_H` for a package called `terndb`. A C API
+that already has a header has a guard its users' code may test, and **`--header-guard <NAME>`**, to
+`build-c` or `emit-header`, names it instead:
+
+```text
+$ sysl build-c terndb -o libterndb.a --header terndb.h --header-guard TERNDB_H
+```
+
+A name that is not a C identifier is refused, since it would make the header's first line a syntax
+error in every file that includes it.
+
 ### What a dependency's module contributes
 
 **A module a dependency supplied contributes to your build only where your program reaches that

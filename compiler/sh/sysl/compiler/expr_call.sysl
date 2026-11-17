@@ -986,7 +986,7 @@ private null_test_call(cx: &Analyzer, span: Span, args: Buf[Expr]) -> TExpr
 
     if fault.is_some() then return cx.err(span, fault.unwrap())
 
-    val raw = Ptr(byte_type())
+    val raw = Ptr(byte_type(), false)
     var operands: Buf[TExpr] = buf()
     var cmps: Buf[TCmp] = buf()
 
@@ -1154,7 +1154,7 @@ private integer_operator(op: string) -> bool =
 // What a reinterpreted address may NOT be read as, named by what the type promises that an address
 // cannot supply. A function pointer is an address like any other.
 private ptr_cast_target_fault(to: Type) -> Option[string] = underlying(to) match
-    Ptr(inner) ->
+    Ptr(inner, _) ->
         if !is_trait_type(*inner) then return None
 
         Some("'ptr_cast' produces a plain pointer, and a pointer to a trait is two words — the " +
@@ -1177,7 +1177,7 @@ private ptr_cast_view_fault(v: Type) -> string =
 // What an address may NOT be read out of. An integer narrower than an address would be read with its
 // top bits invented -- the one mistake here that makes a wild pointer silently.
 private ptr_cast_source_fault(from: Type) -> Option[string] = underlying(from) match
-    Ptr(inner) ->
+    Ptr(inner, _) ->
         if !is_trait_type(*inner) then return None
 
         Some("'ptr_cast' takes a plain pointer, and a pointer to a trait is two words — select " +
@@ -1588,7 +1588,7 @@ private converts(cx: &Analyzer, span: Span, from: Type, to: Type) -> bool
             _ -> return false
         // A pointer to an integer is total: an address *is* a number of `usize`'s width. It goes
         // only this way; making a pointer out of an integer is `ptr_cast`.
-        Ptr(inner) -> to match
+        Ptr(inner, _) -> to match
             Integer(_, _, pw) ->
                 if is_trait(*inner) then
                     cx.fault(span, "a pointer to a trait is two words — the address and the table " +
@@ -4052,7 +4052,7 @@ private holds_index(items: Buf[usize], i: usize) -> bool
 // argument is checked as a `*va_list`, and whether the callee receives the walk's value, its
 // address or a copy's is `TVaPass`'s business (`hoist.sysl`'s `check_va_list_positions`).
 walk_wanted(p: Param, declared: Type) -> Type =
-    if written_va_list(p.typ) then Ptr(VaList) else declared
+    if written_va_list(p.typ) then Ptr(VaList, false) else declared
 
 // The argument a by-value `va_list` parameter is handed, once every argument is known to be what
 // its parameter wanted -- the check reads the argument's own type.
@@ -4403,7 +4403,7 @@ private extern_call(cx: &Analyzer, span: Span, written: string, key: string,
         val p = d.params[i]
         val by_value = written_va_list(p.typ)
         val declared = signature_type(cx.an, d.needs, scope, p.typ, no_bindings())
-        val want = if by_value then Ptr(VaList) else declared
+        val want = if by_value then Ptr(VaList, false) else declared
 
         wants.push(want)
 
@@ -4460,7 +4460,7 @@ variadic_extra(cx: &Analyzer, a: Expr, foreign: bool) -> TExpr
             t
         Floating(bits, _) -> if bits < 64 then TExpr(a.span, TCast(t, real_type())) else t
         Char -> t
-        Ptr(_) -> t
+        Ptr(_, _) -> t
         CFn(_, _, _) -> t
         // Already told, or settled where the instantiation reads the body again at a real type.
         Unknown -> t
@@ -4487,7 +4487,7 @@ private tail_scalar(t: Type) -> bool = tail_peeled(t) match
     Integer(_, _, _) -> true
     Floating(_, _) -> true
     Char -> true
-    Ptr(_) -> true
+    Ptr(_, _) -> true
     CFn(_, _, _) -> true
     _ -> false
 

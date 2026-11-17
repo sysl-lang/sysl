@@ -209,8 +209,12 @@ analyze_unwidened(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr
         // the trait is what goes into one. Only that shape is asked about here: every other pointer
         // position is an exact match already, and reading one through this would put a coercion
         // where a mismatch belongs.
-        Ptr(inner) ->
+        // A pointer is also asked about where the two differ only in the `const`, which is the one
+        // conversion between pointers a position performs (`coerce`).
+        Ptr(inner, _) ->
             if is_trait(*inner) then return coerce(cx, analyze_value(cx, e, expected), want)
+
+            return coerce(cx, held_by_reference(cx, analyze_value(cx, e, expected), expected), want)
         // A function pointer is taken at a type that differs only in its `@keeps` marks
         // (`pointer_retyped`); any other mismatch is handed back for the position to diagnose.
         CFn(_, _, _) -> return coerce(cx, analyze_value(cx, e, expected), want)
@@ -229,6 +233,7 @@ private converts(want: Type) -> bool
         Ref(_, _) -> true
         Weak(_) -> true
         Slice(_, ro) -> ro
+        Ptr(_, ro) -> ro
         _ -> false
 end converts
 
@@ -348,6 +353,19 @@ coerce(cx: &Analyzer, t: TExpr, expected: Type) -> TExpr
     if erased(expected) then return erase_to(cx, t, expected)
 
     expected match
+        // **A `*T` is accepted where a `*const T` is wanted, and never the other way round**, as
+        // with the two views: a holder may give up the licence to write, and gaining it is what
+        // the type exists to prevent. The two are one pointer, so the conversion is a retyping.
+        Ptr(want, read_only) ->
+            if read_only && type_eq(got, Ptr(*want, false)) then return TExpr(t.span, TConstView(t))
+
+            if !read_only && type_eq(got, Ptr(*want, true)) then
+                return cx.err(t.span, s"a '*const ${type_show(*want)}' may be read through and not " +
+                              s"written, and a '*${type_show(*want)}' is a licence to write — so the one " +
+                              "does not become the other. Take the parameter as " +
+                              s"'*const ${type_show(*want)}' if it is only read")
+
+            t
         Ref(inner, sync) ->
             if type_eq(got, *inner)
                 // A task it holds is asked about once the body that made it is typed.

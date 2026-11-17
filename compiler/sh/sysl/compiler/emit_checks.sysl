@@ -50,6 +50,8 @@ private checks_before_lowering(a: &Analysis, p: TProgram, own: Buf[string],
     check_done("pinning")
     check_exports_emitted(a, emitted, own)
     check_done("exports_emitted")
+    check_exported_constants(a)
+    check_done("exported_constants")
     check_quad_externs(a, emitted)
     check_done("quad_externs")
     check_general_regs(a, emitted, own, pruned)
@@ -351,7 +353,7 @@ private export_against_extern(a: &Analysis, f: TFunc, key: string)
     var wants: Buf[(string, Type)] = buf()
 
     for p in d.params
-        wants.push((p.name, if written_va_list(p.typ) then Ptr(VaList)
+        wants.push((p.name, if written_va_list(p.typ) then Ptr(VaList, false)
                             else resolve_type(a, scope, p.typ, no_bindings())))
 
     var answer = Unit
@@ -913,7 +915,7 @@ private is_c_int(t: Type) -> bool = nameless(t) match
     _ -> false
 
 private is_raw_pointer(t: Type) -> bool = nameless(t) match
-    Ptr(_) -> true
+    Ptr(_, _) -> true
     _ -> false
 
 private extern_shape(x: TExtern) -> string
@@ -1433,7 +1435,7 @@ export_carried(t: Type) -> bool = repr(t) match
     Bool -> true
     Char -> true
     CFn(_, _, _) -> true
-    Ptr(_) -> !erased(repr(t))
+    Ptr(_, _) -> !erased(repr(t))
     Constrained(d) -> export_carried(d.base)
     Struct(d) -> all_carried(d.stored())
     Array(_, elem) -> export_carried(*elem)
@@ -1459,7 +1461,7 @@ export_advice(t: Type) -> string = repr(t) match
     Weak(_) -> counted_advice()
     Trait(_, _, _) -> "A trait object is a value and a method table together. Export one function " +
                       "per implementation, or take a function pointer"
-    Ptr(_) ->
+    Ptr(_, _) ->
         if erased(repr(t))
             "A pointer to a trait is the value and its method table together, so it is two words " +
             "rather than the one every other pointer is. Point at the concrete type instead"
@@ -1527,7 +1529,7 @@ typedefable(t: Type) -> bool = t match
         Bool -> true
         Char -> true
         Constrained(d) -> typedefable(d.base)
-        Ptr(_) -> !erased(repr(t))
+        Ptr(_, _) -> !erased(repr(t))
         CFn(_, _, _) -> true
         _ -> false
 

@@ -2887,6 +2887,64 @@ print(one(null))
 'null' takes its type from its context, and there is none here
 ```
 
+### `*const T` — a pointer that is read through and not written
+
+The `const` sits after the `*`, where it sits after a slice's `[]`, and for the same reason: it is a
+property of the **pointer** — what may be done through it — and not of what it points at. It is the
+signature a function that only reads through a pointer should have, and it is what C writes
+`const T *`:
+
+```sysl
+struct P
+    x: int
+    ys: [2]int
+
+total(p: *const int, n: int) -> int
+    var s = 0
+    for i in 0..<n do s += p[i]
+    s
+
+field(p: *const P) -> int = p.x + p.ys[1]
+
+var xs = [1, 2, 3]
+var q = P(4, [5, 6])
+
+print(total(&xs[0], 3), *(&xs[1]), field(&q))
+```
+
+```output
+6 2 10
+```
+
+**Every road to a write through one is refused alike** — `*p = v`, `p[i] = v`, `p.f = v`, a part of
+any of them, a `ref` bound through it, and a `*self` method called through it:
+
+```sysl
+set(p: *const int) = *p = 1
+```
+
+```error
+this is reached through a '*const int', which may be read and not written, so there is nothing to assign through. A pointer that writes is a '*int'
+```
+
+**It is one type with a bit**, as the two views are: the same address, passed and stored alike. So a
+`*T` is accepted wherever a `*const T` is wanted — an argument, a binding, a result, an `extern`'s
+parameter — and never the other way round:
+
+```sysl
+writes(p: *int) = *p = 1
+reads(p: *const int) = writes(p)
+```
+
+```error
+a '*const int' may be read through and not written, and a '*int' is a licence to write
+```
+
+Where the two have to agree — the branches of an `if`, the operands of `==` — they meet at the
+read-only pointer, and a view taken of a `*const T` is a `[]const T`. What it does not reach is
+storage behind an address it leads to: a `*T` field of the pointee is written exactly as that pointer
+allows. `ptr_cast` reaches between the two, as it reaches between any two pointers.
+
 ### Arithmetic: two directions, one spelling each
 
 **`p - q` between two pointers of one pointee is an `isize` counting elements** — C's `ptrdiff_t`, the

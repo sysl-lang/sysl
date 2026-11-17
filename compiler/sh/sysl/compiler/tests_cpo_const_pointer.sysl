@@ -1,0 +1,352 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.{Search, replace_all}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `*const T` -- a raw pointer that may be read through and not written (`reference/types.md § Raw
+// pointers`). It is `[]const T`'s rule for a pointer: one type with a bit, a `*T` accepted wherever a
+// `*const T` is wanted and never the other way round, and every road to a write through it -- a
+// dereference, a subscript, a field, a part of any of them, a `*self` method, a `ref` -- refused alike.
+// The cells below are those roads, the conversions in both directions, and the places the type meets
+// the rest of the language: a generic parameter, an `extern`, a branch, `null`, a view, a symbol.
+
+private cpo_skipped() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return true
+
+    false
+end cpo_skipped
+
+private cpo_write(text: string) -> string
+    val root = make_temp_dir("sysl-const-pointer").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+end cpo_write
+
+private cpo_prints(text: string, printed: string)
+    val root = cpo_write(text)
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            assert_eq(s"did not build: ${failure_text(why)}", printed)
+            return
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> assert(false, "the program that was built could not be run")
+        Ok(out) ->
+            assert_eq(out.text, printed)
+            assert_eq(shell_status(out.status), 0)
+end cpo_prints
+
+private cpo_err(text: string) -> string
+    val root = cpo_write(text)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    replace_all(out, replace_all(root, "//", "/") + "/", "")
+end cpo_err
+
+private cpo_refused(text: string, words: string)
+    val said = cpo_err(text)
+
+    assert(said.contains(words), said)
+end cpo_refused
+
+// -- reading through one ---------------------------------------------------------------------------
+
+@test("a '*const T' is read through by '*p', 'p[i]' and 'p.f', and a '*T' becomes one implicitly")
+cpo_reads_and_converts()
+    if cpo_skipped() then return
+
+    cpo_prints(raw"""
+        struct P
+            x: int
+            ys: [2]int
+
+        total(p: *const int, n: int) -> int
+            var s = 0
+            for i in 0..<n do s += p[i]
+            s
+
+        first(p: *const int) -> int = *p
+        field(p: *const P) -> int = p.x + p.ys[1]
+
+        var xs = [1, 2, 3]
+        var q = P(4, [5, 6])
+
+        print(total(&xs[0], 3), first(&xs[1]), field(&q))
+        """, "6 2 10\n")
+
+@test("a '*const T' bound by a 'val' or a 'var', returned, and stored in a field reads the same storage")
+cpo_bindings_and_results()
+    if cpo_skipped() then return
+
+    cpo_prints(raw"""
+        struct Holder
+            p: *const int
+
+        view(p: *int) -> *const int = p
+
+        var n = 7
+        val a: *const int = &n
+        var b: *const int = view(&n)
+        val h = Holder(&n)
+
+        n = 8
+        print(*a, *b, *h.p)
+        b = a
+        print(*b)
+        """, "8 8 8\n8\n")
+
+@test("a '*const T' and a '*T' compare by address, in either order")
+cpo_compare_either_order()
+    if cpo_skipped() then return
+
+    cpo_prints(raw"""
+        var n = 1
+        var m = 2
+        val w: *int = &n
+        val r: *const int = &n
+        val o: *const int = &m
+
+        print(w == r, r == w, r == o, r != o)
+        """, "true true false true\n")
+
+@test("an 'if' over a '*T' and a '*const T' meets at the read-only pointer")
+cpo_branches_meet_read_only()
+    if cpo_skipped() then return
+
+    cpo_prints(raw"""
+        var n = 3
+        val w: *int = &n
+        val r: *const int = &n
+
+        val k = if n > 0 then w else r
+        val j = if n > 0 then r else w
+
+        print(*k + *j)
+        """, "6\n")
+
+@test("and what they meet at is read-only, so the branch is not a way to write")
+cpo_branches_meet_is_not_a_licence()
+    if cpo_skipped() then return
+
+    cpo_refused(raw"""
+        var n = 3
+        val w: *int = &n
+        val r: *const int = &n
+
+        val k = if n > 0 then w else r
+
+        *k = 4
+        """, "which may be read and not written, so there is nothing to assign through")
+
+@test("'null' is a '*const T', and a slice of one is a '[]const T'")
+cpo_null_and_slicing()
+    if cpo_skipped() then return
+
+    cpo_prints(raw"""
+        sum(xs: []const int) -> int
+            var s = 0
+            for x in xs do s += x
+            s
+
+        var xs = [1, 2, 3, 4]
+        val p: *const int = &xs[0]
+        val none: *const int = null
+
+        print(sum(p[1..<3]), none == null, p == null)
+        """, "5 true false\n")
+
+@test("a slice of a '*const T' may not be written through")
+cpo_slice_of_const_pointer_is_read_only()
+    if cpo_skipped() then return
+
+    cpo_refused(raw"""
+        var xs = [1, 2, 3, 4]
+        val p: *const int = &xs[0]
+        var v = p[0..<2]
+
+        v[0] = 9
+        """, "views elements it may not write")
+
+@test("a generic parameter written '*const T' is settled from a '*T' argument")
+cpo_generic_parameter()
+    if cpo_skipped() then return
+
+    cpo_prints(raw"""
+        peek[T](p: *const T) -> T = *p
+
+        var n = 41
+        var b = true
+
+        print(peek(&n) + 1, peek(&b))
+        """, "42 true\n")
+
+@test("a generic body instantiated at '*int' and at '*const int' is two bodies, named apart")
+cpo_two_instantiations()
+    if cpo_skipped() then return
+
+    cpo_prints(raw"""
+        same[T](x: T) -> T = x
+
+        var n = 5
+        val w: *int = &n
+        val r: *const int = &n
+
+        print(*same(w), *same(r))
+        """, "5 5\n")
+
+@test("an 'extern' taking a '*const u8' is handed a '*u8' and a '*const u8' alike")
+cpo_extern_parameter()
+    if cpo_skipped() then return
+
+    cpo_prints(raw"""
+        extern strlen(s: *const u8) -> usize
+
+        var bytes: [4]u8 = [104, 105, 33, 0]
+        val w: *u8 = &bytes[0]
+        val r: *const u8 = w
+
+        print(strlen(w), strlen(r))
+        """, "3 3\n")
+
+@test("'ptr_cast' reaches from a '*const T' to a '*T', the escape every raw pointer has")
+cpo_ptr_cast_escape()
+    if cpo_skipped() then return
+
+    cpo_prints(raw"""
+        import sysl.raw.ptr_cast
+
+        var n = 1
+        val r: *const int = &n
+        val w: *int = ptr_cast(r)
+
+        *w = 2
+        print(n)
+        """, "2\n")
+
+@test("a '*const volatile u32' is read through")
+cpo_const_volatile()
+    if cpo_skipped() then return
+
+    cpo_prints(raw"""
+        import sysl.raw.ptr_cast
+
+        var n: u32 = 9
+        val r: *const volatile u32 = ptr_cast(&n)
+
+        print(*r)
+        """, "9\n")
+
+// -- writing through one -------------------------------------------------------------------------
+
+@test("'*p = v' through a '*const T' is refused")
+cpo_deref_write_refused()
+    if cpo_skipped() then return
+
+    cpo_refused(raw"""
+        set(p: *const int) = *p = 1
+        """, "this is reached through a '*const int', which may be read and not written, so there is " +
+             "nothing to assign through. A pointer that writes is a '*int'")
+
+@test("'p[i] = v', 'p[i] += v' and 'p[i]++' through a '*const T' are refused")
+cpo_index_write_refused()
+    if cpo_skipped() then return
+
+    cpo_refused("set(p: *const int) = p[1] = 1\n", "reached through a '*const int'")
+    cpo_refused("set(p: *const int) = p[1] += 1\n", "reached through a '*const int'")
+    cpo_refused("set(p: *const int)\n    p[1]++\n", "reached through a '*const int'")
+
+@test("a field, a field's array element and a nested field through a '*const T' are refused")
+cpo_field_write_refused()
+    if cpo_skipped() then return
+
+    val decls = "struct In\n    v: int\n\nstruct P\n    x: int\n    ys: [2]int\n    i: In\n\n"
+
+    cpo_refused(decls + "set(p: *const P) = p.x = 1\n", "reached through a '*const P'")
+    cpo_refused(decls + "set(p: *const P) = p.ys[1] = 1\n", "reached through a '*const P'")
+    cpo_refused(decls + "set(p: *const P) = p.i.v = 1\n", "reached through a '*const P'")
+    cpo_refused(decls + "set(p: *const P) = (*p).x = 1\n", "reached through a '*const P'")
+
+@test("a '*self' method called through a '*const T' is refused, and a '(self)' one is not")
+cpo_self_method()
+    if cpo_skipped() then return
+
+    val decls = "struct C\n    n: int\n\nimpl C\n    bump(*self) = self.n += 1\n    get(self) -> int = self.n\n\n"
+
+    cpo_refused(decls + "tally(p: *const C) = p.bump()\n",
+                "'bump' takes '*self', so it writes through what it is called on, and this is reached " +
+                "through a '*const C', which may be read and not written")
+    cpo_prints(decls + "var c = C(4)\nval p: *const C = &c\nprint(p.get())\n", "4\n")
+
+@test("a 'ref' bound through a '*const T' is read, and refused as a place to write")
+cpo_ref_binding()
+    if cpo_skipped() then return
+
+    cpo_prints("var n = 6\nval p: *const int = &n\nref r = *p\nprint(r)\n", "6\n")
+    cpo_refused("var n = 6\nval p: *const int = &n\nref r = *p\nr = 7\n", "reached through a '*const int'")
+
+@test("a '*const T' is not accepted where a '*T' is asked for, in any position")
+cpo_no_licence_gained()
+    if cpo_skipped() then return
+
+    val words = "a '*const int' may be read through and not written, and a '*int' is a licence to write"
+
+    cpo_refused("w(p: *int) = *p = 1\nr(p: *const int) = w(p)\n", words)
+    cpo_refused("r(p: *const int) -> *int = p\n", words)
+    cpo_refused("var n = 1\nval c: *const int = &n\nval w: *int = c\n", words)
+
+@test("a write through a '*T' stored in what a '*const T' points at is the inner pointer's to allow")
+cpo_inner_pointer_is_its_own()
+    if cpo_skipped() then return
+
+    cpo_prints(raw"""
+        struct Cell
+            p: *int
+
+        poke(c: *const Cell) = *c.p = 9
+
+        var n = 1
+        var cell = Cell(&n)
+
+        poke(&cell)
+        print(n)
+        """, "9\n")
+
+// -- the spelling -----------------------------------------------------------------------------------
+
+@test("'*const' is shown as written, in a diagnostic about a mismatched type")
+cpo_shown_as_written()
+    if cpo_skipped() then return
+
+    val said = cpo_err("val p: *const int = 5\n")
+
+    assert(said.contains("*const int"), said)
+
+@test("'*const extern' is not a type: a function pointer is code, and 'const' has nothing to refuse")
+cpo_const_extern_refused()
+    if cpo_skipped() then return
+
+    val said = cpo_err("val f: *const extern(int) -> int = null\n")
+
+    assert(!said.is_empty(), "a '*const extern' was accepted")
