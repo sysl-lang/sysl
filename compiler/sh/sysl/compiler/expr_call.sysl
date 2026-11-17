@@ -745,6 +745,14 @@ private named_call(cx: &Analyzer, span: Span, callee: Expr, name: string, args: 
 
         if wanted.is_some() then
             return variant_call(cx, span, wanted.unwrap().0, wanted.unwrap().1, args)
+
+        // **A module value beside a variant of its name is called through only where it holds
+        // something callable**: a constant `Limit` cannot be called, so `Limit(3)` is the variant
+        // wherever the position does not ask for the variant's enum, as it is where it does.
+        val both = value_beside_variant(cx, name)
+
+        if both.is_some() && value_callable(cx, both.unwrap().0) then
+            return call_value(cx, span, callee, args, expected)
     end if
 
     var tkey = if shadowed then None else lookup_type_key(cx.an, cx.scope, name)
@@ -817,6 +825,15 @@ private named_call(cx: &Analyzer, span: Span, callee: Expr, name: string, args: 
         val v = variant_of(cx, name, expected)
 
         if v.is_some()
+            // **Where several enums declare the name, the payload written may fit only one** --
+            // `Interval(0, -1, 0)` beside an `Interval` that carries two values. Each candidate's
+            // construction is read and thrown away, and the one that stands alone is the reading.
+            val shaped = variant_by_shape(cx, name, expected, args.len(),
+                                          (en, sv) -> payload_fits(cx, span, en, sv, args))
+
+            if shaped.is_some() then
+                return variant_call(cx, span, shaped.unwrap().0, shaped.unwrap().1, args)
+
             val clash = ambiguous_variant(cx, span, name, expected)
 
             if clash.is_some() then return clash.unwrap()
@@ -2504,6 +2521,21 @@ private subtype_from(cx: &Analyzer, span: Span, t: TExpr, target: Type, written:
 end subtype_from
 
 // A variant with what it carries.
+// Whether constructing the variant `v` of `en` from these values is a reading that stands alone --
+// the count, the field names and every value's type -- tried and thrown away whole.
+private payload_fits(cx: &Analyzer, span: Span, en: Type, v: EnumVariant, written: Buf[Expr]) -> bool
+    if written.len() != v.fields.len() then return false
+
+    val tried = begin_trial(cx)
+
+    val _ = variant_call(cx, span, en, v, written)
+    val refused = refused_since(cx, tried)
+
+    discard_trial(cx, tried)
+
+    !refused
+end payload_fits
+
 private variant_call(cx: &Analyzer, span: Span, en: Type, v: EnumVariant,
                      written: Buf[Expr]) -> TExpr
     // A variant that carries nothing is a name, not a call, so the mistake is the parentheses rather

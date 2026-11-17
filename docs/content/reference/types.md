@@ -1548,6 +1548,54 @@ print(1)
 That line should be `Shape.Circle(1)`. The qualified form works at a construction exactly as it
 [works in a pattern](/reference/patterns/#the-bare-name-rule).
 
+**Where no type is expected, a neighbour or the variant's own payload can still say which enum is
+meant.** A branch of an `if`, an arm of a `match` or an element of an array literal whose variant
+belongs to one enum alone settles its siblings, and a construction whose payload fits only one of the
+candidates — by the number of values, their names or their types — is that candidate's. A bare name
+fits only a variant that carries nothing:
+
+```sysl
+enum Value
+    Null
+    Bool(b: bool)
+    Int(n: int)
+
+enum Expr
+    Null
+    Bool(b: bool)
+    Interval(lo: int, hi: int)
+
+enum Span
+    Interval(lo: int, hi: int, step: int)
+    Point(at: int)
+
+name(v: Value) -> string = v match
+    Null    -> "null"
+    Bool(b) -> "bool"
+    Int(n)  -> "int"
+
+steps(s: Span) -> int = s match
+    Interval(lo, hi, step) -> (hi - lo) / step
+    Point(_)               -> 0
+
+val c = true
+val v = if c then Null else Int(1)
+val vs = [Bool(true), Null, Int(2)]
+val spans = [Interval(0, 10, 2)]
+
+print(name(v), name(vs[1]), steps(spans[0]))
+```
+
+```output
+null null 5
+```
+
+`Int` is `Value`'s alone, so `Null` beside it is `Value`'s too; `Interval(0, 10, 2)` carries three
+values, which only `Span`'s `Interval` holds. Each rule answers only where exactly one enum fits, so
+adding an enum that fits as well brings the refusal back rather than changing what a line means.
+Where every candidate fits — `if c then Null else Bool(true)` here, since both enums have both — the
+refusal names them all.
+
 **The expected type works across modules too, so a program may declare a variant whose name the
 library also uses.** `Result` and `Option` are in the prelude, so `Ok`, `Err`, `Some` and `None` are
 the names most likely to collide with your own enums, and a module that declares its own `Ok` can
@@ -1599,9 +1647,39 @@ meaning, and an enum the file has not imported contributes no bare names; `sysl.
 is the spelling that needs no import.
 
 As in Rust, a variant is namespaced under its enum; unlike Rust, a use site does not need
-`Shape::Circle` or a `use Shape::*`. A variant still may not share a name with a constant, a `val`, a
-module `var` or an `extern` variable: two variants with one name are distinguished by their enums,
-but a variant and a constant could not be distinguished.
+`Shape::Circle` or a `use Shape::*`.
+
+**A variant may share its name with a constant, a `val`, a module `var` or an `extern` variable.**
+The two are separate lookups: the name is the variant where the position expects the variant's enum
+— a pattern included, whose scrutinee is the expected type — and the value everywhere else, a
+position that expects no type at all among them. A call is the variant wherever the value could not
+be called:
+
+```sysl
+enum Clause
+    Limit(n: int)
+    Top
+    Where
+
+const Limit: int = 10
+const Top = 5
+
+pick(c: Clause) -> int = c match
+    Limit(n) -> n
+    Top      -> 1
+    Where    -> 0
+
+val c: Clause = Top
+val k: int = Top
+
+print(pick(c), k, Limit + 1, pick(Limit(3)), c is Top)
+```
+
+```output
+1 5 11 3 true
+```
+
+`Clause.Top` is the variant wherever the position does not ask for a `Clause`.
 
 ## Type aliases
 

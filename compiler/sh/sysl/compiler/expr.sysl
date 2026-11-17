@@ -613,6 +613,10 @@ name_expr(cx: &Analyzer, span: Span, name: string, expected: Option[Type]) -> TE
     // belongs is the same mismatch a `usize` variable would be, not a silent adaptation. **An untyped
     // one is the literal it stands for** and takes the context's type as that literal would
     // (`untyped_const_read`).
+    val beside = variant_beside_value(cx, span, name, expected)
+
+    if beside.is_some() then return beside.unwrap()
+
     val ck = lookup_value_key(cx, a_consts(cx), name)
 
     // A constant another file made file-private is still found by its spelling, so the reader is
@@ -802,6 +806,56 @@ private const_parameter(cx: &Analyzer, span: Span, name: string,
         Some(Descriptor(owner, v, f)) -> Some(descriptor_value(cx, span, Descriptor(*owner, v, f)))
         _ -> None
 end const_parameter
+
+// The module value -- a constant, a `val`, a `var` or an `extern` variable -- this name reaches,
+// where the module that declares it also declares an enum with a variant of the spelling.
+//
+// **A variant and a value of one name are two lookups, and the expected type chooses between them**
+// (`reference/types.md § A variant belongs to its enum`): the variant where the position asks for
+// its enum, the value where it asks for anything else.
+value_beside_variant(cx: &Analyzer, name: string) -> Option[(string, string)]
+    for from in [a_consts(cx), a_vals(cx), a_extern_vars(cx)]
+        val key = lookup_value_key(cx, from, name)
+
+        if key.is_some()
+            val owner = enum_of_variant(cx.an, module_qualify(module_of(key.unwrap()), name))
+
+            if owner.is_some() && reachable_key(cx.an, owner.unwrap(), cx.scope) then
+                return Some((key.unwrap(), owner.unwrap()))
+
+            return None
+        end if
+
+    None
+end value_beside_variant
+
+// A bare name that is both a variant and a module value, read as the variant where the position asks
+// for the variant's enum. Nothing anywhere else: the value is what the name means wherever a variant
+// of that enum could not stand, and where no type is asked for at all -- which is the reading a value
+// beside a variant of a DIFFERENT module's enum always had.
+private variant_beside_value(cx: &Analyzer, span: Span, name: string,
+                             expected: Option[Type]) -> Option[TExpr]
+    if value_beside_variant(cx, name).is_none() then return None
+
+    val asked = variant_from_expected(cx, name, expected)
+
+    if asked.is_none() then return None
+    if asked.unwrap().1.carries then return Some(carries_data(cx, span, name))
+
+    Some(TExpr(span, TEnumNew(asked.unwrap().0, asked.unwrap().1, buf())))
+end variant_beside_value
+
+// Whether the module value `key` holds something a call can go through -- which a constant never
+// does.
+value_callable(cx: &Analyzer, key: string) -> bool
+    if a_consts(cx).has(key) then return false
+
+    val ty = if a_vals(cx).has(key) then
+                 storage_type(cx.an, key, a_vals(cx).get(key).unwrap(), is_writable_key(cx, key))
+             else value_type(cx, a_extern_vars(cx).get(key).unwrap())
+
+    callable_signature(cx.an, ty).is_some()
+end value_callable
 
 private a_consts(cx: &Analyzer) -> &Table[ValueDecl] = cx.an.tables.consts
 private a_vals(cx: &Analyzer) -> &Table[ValueDecl] = cx.an.tables.vals
@@ -1389,6 +1443,12 @@ variant_expr(cx: &Analyzer, span: Span, name: string, expected: Option[Type]) ->
 
         return cx.err_whatever_the_types(span, s"undefined name '${qualified_name(module_qualify(cx.scope.module_name, name))}'")
 
+    // A name written on its own is a variant that carries nothing, so where only one of the enums
+    // declaring it has such a variant, that is the one meant.
+    val shaped = variant_by_shape(cx, name, expected, 0, (_, sv) -> !sv.carries)
+
+    if shaped.is_some() then return TExpr(span, TEnumNew(shaped.unwrap().0, shaped.unwrap().1, buf()))
+
     val clash = ambiguous_variant(cx, span, name, expected)
 
     if clash.is_some() then return clash.unwrap()
@@ -1664,6 +1724,74 @@ ambiguous_variant(cx: &Analyzer, span: Span, name: string,
     Some(cx.err(span, s"'$name' is a variant of ${named_series(homes)}, and nothing here says " +
                 s"which — qualify it, as '${qualified_name(homes[0])}.$name'"))
 end ambiguous_variant
+
+// **The one enum among several declaring a bare variant whose payload this use has the shape of**,
+// where nothing else chose: `Interval(0, -1, 0)` is the `Interval` that carries three values when the
+// other carries two, and a bare `Null` is the variant that carries nothing when the other carries
+// something. `fits` is asked of each candidate; `arity` is how many values the use supplies.
+//
+// It is asked only where the name would otherwise be refused as ambiguous, so nothing that resolves
+// today resolves differently, and it answers only where exactly one candidate fits -- a second enum
+// added later that fits too brings the refusal back rather than changing what the line means. **A
+// generic enum's variant of the right arity is a candidate it cannot judge**, its type arguments
+// being unknown here, so it declines rather than guess.
+variant_by_shape(cx: &Analyzer, name: string, expected: Option[Type], arity: usize,
+                 fits: &Fn(Type, EnumVariant) -> bool) -> Option[(Type, EnumVariant)]
+    if variant_from_expected(cx, name, expected).is_some() then return None
+    if imported_variant_enum(cx, name).is_some() then return None
+
+    val homes = variant_homes(cx, name)
+
+    if homes.len() < 2 then return None
+
+    var fit: Option[(Type, EnumVariant)] = None
+
+    for key in homes
+        val one = plain_enum_variant(cx, key, name)
+
+        if one.is_none()
+            if declares_arity(cx, key, name, arity) then return None
+        elif fits(one.unwrap().0, one.unwrap().1)
+            if fit.is_some() then return None
+
+            fit = one
+        end if
+
+    fit
+end variant_by_shape
+
+// The variant `name` of the enum `key`, at the enum's own type, where the enum takes no type
+// arguments.
+private plain_enum_variant(cx: &Analyzer, key: string, name: string) -> Option[(Type, EnumVariant)]
+    cx.an.tables.types.get(key).unwrap().kind match
+        EnumOf(e) -> if !e.tparams.is_empty() then return None
+        _ -> return None
+
+    for i in 0..<cx.an.tables.enum_insts.len()
+        val t = cx.an.tables.enum_insts.at(i)
+
+        t match
+            Enum(d) ->
+                if d.base == key
+                    val v = d.variant(name)
+
+                    return if v.is_none() then None else Some((t, v.unwrap()))
+            _ -> ()
+
+    None
+end plain_enum_variant
+
+// Whether the enum `key`, as declared, has a variant `name` with a payload of `arity` values -- or,
+// at 0, one that carries nothing.
+private declares_arity(cx: &Analyzer, key: string, name: string, arity: usize) -> bool
+    cx.an.tables.types.get(key).unwrap().kind match
+        EnumOf(e) ->
+            for item in e.variants
+                if item.name == name && item.fields.len() == arity then return true
+        _ -> ()
+
+    false
+end declares_arity
 
 // The type parameter a bare variant name leaves open, where the enum declaring it is generic and
 // nothing here settles it.

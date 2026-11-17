@@ -199,6 +199,32 @@ constant is a diagnostic rather than a new local.
 A `const` declared inside a function body is a constant here too, and is nearer than one at the top
 of a file: it is compared against, not bound.
 
+**A name that is both a variant and a constant is the variant against its enum and the constant
+against anything else** — the scrutinee's type is what the pattern expects, as
+[an expected type chooses](/reference/types/#a-variant-belongs-to-its-enum) at a construction:
+
+```sysl
+enum Level
+    High
+    Low
+
+const High = 9
+
+describe(l: Level) -> string = l match
+    High -> "high"
+    Low  -> "low"
+
+rank(n: int) -> string = n match
+    High -> "nine"
+    _    -> "other"
+
+print(describe(High), rank(9), rank(3))
+```
+
+```output
+high nine other
+```
+
 ### A backticked name references rather than binds
 
 The rule above resolves a bare name against a narrow set — the scrutinee's nullary variants, then the

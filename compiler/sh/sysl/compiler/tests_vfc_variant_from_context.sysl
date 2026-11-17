@@ -1,0 +1,494 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, replace_all}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// Where several enums in reach declare one variant name, a bare use of it resolves
+// (`reference/types.md § A variant belongs to its enum`):
+//
+// 1. from the type the position expects -- a parameter, a field, an annotation, a return type, a
+//    match scrutinee for a pattern, through `Option[Value]` and `Result[Value, E]` alike;
+// 2. failing that, from a sibling branch, arm or element whose own variant settles the enum, or from
+//    the use's own payload where only one candidate's payload fits it (count, names, types) -- a
+//    bare name fits only a variant that carries nothing;
+// 3. else it is refused, the refusal naming every candidate.
+//
+// A variant and a module value of one spelling are separate lookups: the variant where the position
+// asks for its enum, the value everywhere else, and a call goes to the variant where the value cannot
+// be called.
+//
+// The axes: the resolution source (expected / sibling / own payload / none); the position (bare name,
+// call, pattern in a `match`, an `is`, a binding); nesting (a payload inside a payload, an `Option`);
+// where the enums live (one module, two modules through wildcards); generic candidates; the variant
+// against a constant, a `val` and a callable `val`, in both directions. The cells that compiled before
+// this rule are pinned too, so their meaning is seen not to move.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private vfc_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end vfc_ready
+
+// **What a program of these files PRINTS** -- each file a module directory, a name and a text -- or
+// what the build had to say about it instead, with the project root written as `@`.
+private vfc_out(files: Buf[(string, string, string)]) -> string
+    val root = replace_all(make_temp_dir("sysl-vfc").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+
+    for f in files
+        val dir = if f.0 == "" then root else root + "/" + replace_all(f.0, ".", "/")
+
+        make_dir_all(dir).unwrap()
+        write_text(dir + "/" + f.1, f.2).unwrap()
+
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = replace_all(failure_text(why), root, "@")
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end vfc_out
+
+// One file, as the whole program.
+private vfc_ran(text: string) -> string
+    var fs: Buf[(string, string, string)] = buf()
+
+    fs.push(("", "main.sysl", text))
+    vfc_out(fs)
+
+private vfc_refuses(said: string, part: string) =
+    assert(said.index_of(part).is_some(), s"expected '$part', got: $said")
+
+// `Expr` and `Value` share `Null` and `Bool`; `Int` is `Value`'s alone and `Lit` `Expr`'s.
+private vfc_enums() -> string = raw"""
+    enum Expr
+        Null
+        Bool(b: bool)
+        Lit(n: int)
+
+    enum Value
+        Null
+        Bool(b: bool)
+        Int(n: int)
+
+    name(v: Value) -> string = v match
+        Null    -> "null"
+        Bool(b) -> s"bool $b"
+        Int(n)  -> s"int $n"
+
+    what(e: Expr) -> string = e match
+        Null    -> "null"
+        Bool(b) -> s"bool $b"
+        Lit(n)  -> s"lit $n"
+
+    """
+
+// `Span.Interval` carries three ints, `Window.Interval` two; `Pt` differs by its payload's type.
+private vfc_shapes() -> string = raw"""
+    enum Span
+        Interval(lo: int, hi: int, step: int)
+        Point(at: int)
+
+    enum Window
+        Interval(lo: int, hi: int)
+        All
+
+    enum Key
+        Pt(n: int)
+        Nil
+
+    enum Label
+        Pt(s: string)
+        Nil(why: string)
+
+    span_of(s: Span) -> string = s match
+        Interval(lo, hi, step) -> s"span $lo $hi $step"
+        Point(at)              -> s"point $at"
+
+    window_of(w: Window) -> string = w match
+        Interval(lo, hi) -> s"window $lo $hi"
+        All              -> "all"
+
+    """
+
+// -- 1. the expected type: what compiled before still means what it meant --------------------------
+
+@test("a parameter, a field, an annotation and a return type each settle the enum")
+vfc_expected_type_positions()
+    if !vfc_ready() then return
+
+    assert_eq(vfc_ran(vfc_enums() + raw"""
+        struct Cell
+            v: Value
+
+        mk() -> Value = Bool(true)
+
+        val c = Cell(Null)
+        val e: Expr = Bool(false)
+
+        print(name(Null), name(c.v), what(e), name(mk()), what(Lit(4)))
+        """), "null null bool false bool true lit 4\n")
+
+@test("an Option and a Result of the enum pass the expected type to their payload")
+vfc_expected_through_generics()
+    if !vfc_ready() then return
+
+    assert_eq(vfc_ran(vfc_enums() + raw"""
+        val o: Option[Value] = Some(Null)
+        val r: Result[Expr, string] = Ok(Bool(true))
+        val n: Option[Value] = None
+
+        print(name(o.unwrap()), what(r.unwrap()), n.is_none())
+        """), "null bool true true\n")
+
+@test("a pattern takes the scrutinee's enum, in a match, an 'is' and a binding's alternatives")
+vfc_patterns_from_the_scrutinee()
+    if !vfc_ready() then return
+
+    assert_eq(vfc_ran(vfc_enums() + raw"""
+        nested(o: Option[Value]) -> string = o match
+            Some(Null)    -> "some null"
+            Some(Bool(b)) -> s"some $b"
+            Some(Int(n))  -> s"some int $n"
+            None          -> "none"
+
+        enum Reading
+            Celsius(v: int)
+            Fahrenheit(v: int)
+
+        enum Temp
+            Celsius(v: int)
+            Kelvin(v: int)
+
+        raw_of(r: Reading) -> int
+            val (Celsius(v) | Fahrenheit(v)) = r
+            v
+
+        val v: Value = Null
+        val tested = if v is Null then "is null" else "not null"
+
+        print(nested(Some(Null)), nested(Some(Int(2))), nested(None), tested, raw_of(Fahrenheit(9)))
+        """), "some null some int 2 none is null 9\n")
+
+// -- 2. a sibling, or the use's own payload --------------------------------------------------------
+
+@test("an 'if' takes the enum from the branch whose variant only one enum has, either way round")
+vfc_sibling_if()
+    if !vfc_ready() then return
+
+    assert_eq(vfc_ran(vfc_enums() + raw"""
+        val c = true
+        val a = if c then Null else Int(3)
+        val b = if !c then Int(3) else Null
+        val d = if c then Lit(1) else Null
+
+        print(name(a), name(b), what(d))
+        """), "null null lit 1\n")
+
+@test("a match's arms and an array's elements do the same")
+vfc_sibling_arms_and_elements()
+    if !vfc_ready() then return
+
+    assert_eq(vfc_ran(vfc_enums() + raw"""
+        val k = 2
+        val m = k match
+            1 -> Null
+            2 -> Bool(true)
+            _ -> Int(k)
+        val xs = [Null, Bool(false), Int(2)]
+        val ys = [Lit(1), Null]
+
+        print(name(m), name(xs[0]), name(xs[2]), what(ys[1]))
+        """), "bool true null int 2 null\n")
+
+@test("a call takes the one enum whose payload has the count written")
+vfc_shape_by_count()
+    if !vfc_ready() then return
+
+    assert_eq(vfc_ran(vfc_shapes() + raw"""
+        val xs = [Interval(0, -1, 0)]
+        val w = Interval(1, 2)
+
+        print(span_of(xs[0]), window_of(w))
+        """), "span 0 -1 0 window 1 2\n")
+
+@test("by the payload's types, and by its field names")
+vfc_shape_by_type_and_name()
+    if !vfc_ready() then return
+
+    assert_eq(vfc_ran(vfc_shapes() + raw"""
+        val a = Pt("x")
+        val b = Pt(7)
+        val c = Pt(s = "named")
+        val ka: Label = a
+        val kb: Key = b
+        val kc: Label = c
+
+        print(ka is Pt("x"), kb is Pt(7), kc is Pt("named"))
+        """), "true true true\n")
+
+@test("a bare name is the variant that carries nothing, where the other carries something")
+vfc_shape_bare_name()
+    if !vfc_ready() then return
+
+    assert_eq(vfc_ran(vfc_shapes() + raw"""
+        val n = Nil
+        val k: Key = n
+
+        print(k is Nil, Nil("why") is Nil(_))
+        """), "true true\n")
+
+@test("a payload resolved by its shape settles its sibling, and a nested payload resolves inside it")
+vfc_shape_then_sibling_and_nested()
+    if !vfc_ready() then return
+
+    assert_eq(vfc_ran(vfc_shapes() + raw"""
+        enum Wrap
+            Spanned(s: Span)
+
+        inner(w: Wrap) -> string = w match
+            Spanned(s) -> span_of(s)
+
+        val c = true
+        val a = if c then All else Interval(1, 2)
+        val b = Spanned(Interval(4, 5, 6))
+        val d = Some(Interval(7, 8, 9))
+
+        print(window_of(a), inner(b), span_of(d.unwrap()))
+        """), "all span 4 5 6 span 7 8 9\n")
+
+@test("a closure in a payload tried against two candidates is lowered once")
+vfc_shape_trial_with_a_closure()
+    if !vfc_ready() then return
+
+    assert_eq(vfc_ran(raw"""
+        enum Task
+            Job(run: &Fn() -> int)
+            Idle
+
+        enum Plan
+            Job(n: int, m: int)
+            Done
+
+        go(t: Task) -> int = t match
+            Job(run) -> run() + 1
+            Idle     -> 0
+
+        val t = Job(() -> 41)
+
+        print(go(t))
+        """), "42\n")
+
+@test("enums in two modules reached through two wildcards resolve the same ways")
+vfc_two_modules()
+    if !vfc_ready() then return
+
+    var fs: Buf[(string, string, string)] = buf()
+
+    fs.push(("a", "a.sysl", raw"""
+        module a
+
+        enum Value
+            Null
+            Int(n: int)
+            Interval(lo: int, hi: int)
+
+        name(v: Value) -> string = v match
+            Null             -> "null"
+            Int(n)           -> s"int $n"
+            Interval(lo, hi) -> s"interval $lo $hi"
+        """))
+    fs.push(("b", "b.sysl", raw"""
+        module b
+
+        enum Expr
+            Null
+            Lit(n: int)
+            Interval(lo: int, hi: int, step: int)
+        """))
+    fs.push(("", "main.sysl", raw"""
+        import a.*
+        import b.*
+
+        val x = if true then Null else Int(1)
+        val y = Interval(3, 4)
+
+        print(name(Null), name(x), name(y))
+        """))
+
+    assert_eq(vfc_out(fs), "null null interval 3 4\n")
+
+@test("a generic enum's variant of the right count is not judged, and a wrong count does not block")
+vfc_generic_candidates()
+    if !vfc_ready() then return
+
+    val enums = raw"""
+        enum Tri[T]
+            Interval(a: T, b: T, c: T)
+            Empty
+
+        enum Window
+            Interval(lo: int, hi: int)
+            All
+
+        """
+
+    assert_eq(vfc_ran(enums + "val w = Interval(1, 2)\nprint(w is Interval(1, 2))\n"), "true\n")
+
+    vfc_refuses(vfc_ran(enums + "val t = Interval(1, 2, 3)\nprint(1)\n"),
+                "'Interval' is a variant of 'Tri' and 'Window', and nothing here says which")
+
+// -- 3. still ambiguous, and the refusal names every candidate -------------------------------------
+
+@test("two variants of one shape and no sibling to tell them apart are refused")
+vfc_still_ambiguous_same_shape()
+    if !vfc_ready() then return
+
+    vfc_refuses(vfc_ran(vfc_enums() + "val c = true\nval b = if c then Null else Bool(true)\nprint(1)\n"),
+                "'Null' is a variant of 'Expr' and 'Value', and nothing here says which — qualify " +
+                "it, as 'Expr.Null'")
+    vfc_refuses(vfc_ran(vfc_enums() + "val xs = [Bool(true)]\nprint(1)\n"),
+                "'Bool' is a variant of 'Expr' and 'Value', and nothing here says which")
+
+@test("three candidates are all named")
+vfc_still_ambiguous_three()
+    if !vfc_ready() then return
+
+    vfc_refuses(vfc_ran(raw"""
+        enum A
+            Record(n: int)
+        enum B
+            Record(n: int)
+        enum C
+            Record(n: int)
+
+        val f = (x: int) -> Record(x)
+        print(1)
+        """), "'Record' is a variant of 'A', 'B' and 'C', and nothing here says which")
+
+@test("a payload that fits no candidate is still the ambiguity, not a guess")
+vfc_no_candidate_fits()
+    if !vfc_ready() then return
+
+    vfc_refuses(vfc_ran(vfc_shapes() + "val x = Interval(1)\nprint(1)\n"),
+                "'Interval' is a variant of 'Span' and 'Window', and nothing here says which")
+
+// -- a variant and a module value of one spelling -------------------------------------------------
+
+private vfc_limit() -> string = raw"""
+    enum Clause
+        Limit(n: int)
+        Top
+        Where
+
+    const Limit: int = 10
+    const Top = 5
+
+    pick(c: Clause) -> int = c match
+        Limit(n) -> n
+        Top      -> 1
+        Where    -> 0
+
+    """
+
+@test("the variant where the position asks for its enum, the constant where it asks for an int")
+vfc_value_and_variant_by_expected()
+    if !vfc_ready() then return
+
+    assert_eq(vfc_ran(vfc_limit() + raw"""
+        val c: Clause = Top
+        val k: int = Top
+
+        print(pick(c), k, pick(Limit(3)), pick(Top), c is Top)
+        """), "1 5 3 1 true\n")
+
+@test("with no type asked for, a bare name is the value, and a call of a constant is the variant")
+vfc_value_and_variant_unasked()
+    if !vfc_ready() then return
+
+    assert_eq(vfc_ran(vfc_limit() + raw"""
+        val bare = Top
+        val l = Limit(4)
+
+        print(bare + 1, Limit + 1, pick(l))
+        """), "6 11 4\n")
+
+@test("a pattern is the variant on the enum and the constant on an int")
+vfc_value_and_variant_in_patterns()
+    if !vfc_ready() then return
+
+    assert_eq(vfc_ran(vfc_limit() + raw"""
+        rank(n: int) -> string = n match
+            Top   -> "top"
+            Limit -> "limit"
+            _     -> "other"
+
+        val c: Clause = Top
+
+        print(rank(5), rank(10), rank(1), c is Top, pick(Where))
+        """), "top limit other true 0\n")
+
+@test("a module 'val' and a callable 'val' beside a variant, in a module of its own")
+vfc_value_and_variant_in_a_module()
+    if !vfc_ready() then return
+
+    var fs: Buf[(string, string, string)] = buf()
+
+    fs.push(("m", "m.sysl", raw"""
+        module m
+
+        enum Step
+            Scale(n: int)
+            Base
+
+        val Base: int = 100
+        val Scale: &Fn(int) -> int = (n: int) -> n * 2
+
+        size(s: Step) -> int = s match
+            Scale(n) -> n
+            Base     -> -1
+
+        called() -> int = Scale(21)
+        made() -> int = size(Scale(3))
+        bare() -> int = Base
+        asked() -> int = size(Base)
+        unasked() -> int
+            val r = Scale(5)
+            r
+        """))
+    fs.push(("", "main.sysl", "print(m.called(), m.made(), m.bare(), m.asked(), m.unasked())\n"))
+
+    assert_eq(vfc_out(fs), "42 3 100 -1 10\n")
+
+@test("a variant that carries data, asked for bare at its enum, is told to construct it")
+vfc_value_and_carrying_variant()
+    if !vfc_ready() then return
+
+    vfc_refuses(vfc_ran(vfc_limit() + "val c: Clause = Limit\nprint(1)\n"),
+                "variant 'Limit' carries data — construct it with 'Limit(…)'")
