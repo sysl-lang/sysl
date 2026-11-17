@@ -1,0 +1,70 @@
+module sh.sysl.compiler
+@tests
+
+// Every compiler form -- the task forms, the atomics, the slot forms, `is_null`, `release`, the
+// system-register forms -- answers a call only where nothing the reader can see claims its word, and
+// an `extern` is such a thing: a binding that names its C function `step` calls that function.
+// Before, a local or a function of the name beat the form and an `extern` did not, so a declared
+// `step` was refused as the task form's call ("'step' takes the task it resumes…") and a literal
+// argument was typed against the form rather than the declaration.
+
+private fye_ran(text: string) -> string = xvr_ran([("main.sysl", text)])
+
+@test("an extern named like a task form is the call, public or file-private")
+fye_task_forms()
+    if xvr_no_library() then return
+
+    assert_eq(fye_ran("extern \"abs\" step(x: int) -> int\n" +
+                      "private extern \"abs\" block_on(x: int) -> int\n" +
+                      "extern \"abs\" park(x: int) -> int\n" +
+                      "extern \"abs\" yield_now(x: int) -> int\n\n" +
+                      "print(step(-3), block_on(-4), park(-5), yield_now(-6))\n"), "3 4 5 6\n")
+
+@test("an extern named like an atomic, a slot form, is_null, release or a register form is the call")
+fye_other_forms()
+    if xvr_no_library() then return
+
+    assert_eq(fye_ran("extern \"abs\" atomic_add(x: int) -> int\n" +
+                      "extern \"abs\" slot_take(x: int) -> int\n" +
+                      "extern \"abs\" is_null(x: int) -> int\n" +
+                      "extern \"abs\" release(x: int) -> int\n" +
+                      "extern \"abs\" read_sysreg(x: int) -> int\n" +
+                      "extern \"abs\" nop(x: int) -> int\n\n" +
+                      "print(atomic_add(-1), slot_take(-2), is_null(-3), release(-4), read_sysreg(-5), nop(-6))\n"),
+              "1 2 3 4 5 6\n")
+
+// The literal is typed against the declaration's parameter: an unsigned 32-bit one takes 0xffffffff,
+// which C's `abs` reads back as the `int` -1.
+@test("a literal argument to such an extern takes the declaration's parameter type")
+fye_literal_takes_the_parameter()
+    if xvr_no_library() then return
+
+    assert_eq(fye_ran("extern \"abs\" step(x: int) -> int\n" +
+                      "private extern \"abs\" park(x: u32) -> u32\n\n" +
+                      "print(step(-2), park(0xffffffff))\n"), "2 1\n")
+
+@test("an extern another module declares, imported, claims the word too")
+fye_imported_extern()
+    if xvr_no_library() then return
+
+    assert_eq(xvr_ran([("bind/bind.sysl", "module bind\n\nextern \"abs\" step(x: int) -> int\n"),
+                       ("main.sysl", "import bind.step\n\nprint(step(-7))\n")]), "7\n")
+
+// A scalar's name in call position is a conversion only where no declaration claims it, and a
+// function always did; an `extern` is a declaration too.
+@test("an extern named like a scalar type is the call, not a conversion")
+fye_scalar_names()
+    if xvr_no_library() then return
+
+    assert_eq(fye_ran("extern \"abs\" byte(x: int) -> int\n" +
+                      "private extern \"abs\" uint(x: int) -> int\n\n" +
+                      "print(byte(-300), uint(-5), u8(7))\n"), "300 5 7\n")
+
+// The neighbour that must not move: with nothing declared, the word is still the form.
+@test("with no declaration of the word, the form still answers")
+fye_form_still_answers()
+    if xvr_no_library() then return
+
+    val said = xvr_ir([("main.sysl", "print(step(3))\n")])
+
+    assert(said.contains("'step' takes the task it resumes and the waker its parks are to call"), said)

@@ -6041,14 +6041,15 @@ disturbs nothing.
 | processor | `aarch64`, `x86_64`, `riscv64`, `riscv32`, `thumb`, `x86`, `wasm32`, `craft` |
 | derived | `hosted` (not `freestanding`), `posix` (`macos`, `linux` or `android`), `bsd` (`macos`) |
 | floating point | `fpu` (the machine has floating-point registers), `fpu_dp` (they hold a double), `hardfloat` / `softfp` (the float ABI), `fma` (a fused multiply-add is one instruction at `f32`), `fma_dp` (and at `f64`) |
+| instructions | `crc32c` (the CRC-32C instructions are there: AArch64's `crc32c*`, SSE 4.2's `crc32`) |
 | storage | `thread_local` (a `@thread_local` is accepted on this build) |
 | address width | `ptr16` (an address is 16 bits), `ptr32` (it is 32 bits), `ptr64` (it is 64 bits) |
 | instrumentation | `sanitize_address` (the build is instrumented for AddressSanitizer), `sanitize_thread` (for ThreadSanitizer) |
 | build mode | `debug` (a debug build: plain integer overflow is checked) |
 
-That is the whole vocabulary. There is **no `#define`** and nothing a project can add, and only one
-symbol depends on a project config: `thread_local`, which also reads the root manifest's
-`codegen.thread_pointer` (below). The two instrumentation symbols are facts of the build rather
+That is the whole vocabulary. There is **no `#define`** and nothing a project can add, and only two
+symbols depend on a project config: `thread_local`, which also reads the root manifest's
+`codegen.thread_pointer`, and `crc32c`, which also reads `codegen.extensions` and `--cpu` (below). The two instrumentation symbols are facts of the build rather
 than of the machine, and read `SYSL_EXTRA_CFLAGS` (below). A condition is a symbol, `!`, `&&`, `||`, and parentheses; `&&` binds tighter
 than `||`.
 
@@ -6084,6 +6085,16 @@ every hosted machine, and on bare AArch64 when the root manifest says which regi
 pointer (`codegen { thread_pointer = "tpidr_el0" }`). It is false on a board and on bare AArch64 with
 no such setting. It is the one symbol the target alone does not settle, because the register is the
 program's to name; the compiler reads it before the first condition, a dependency's `if` included.
+
+**`crc32c` is true exactly where an `extern` naming a CRC-32C instruction is accepted**
+([ffi](/reference/ffi/)). The instructions are optional on both machines that have them: AArch64
+makes them mandatory only from Armv8.1, and SSE 4.2 is past the x86-64 baseline the x86 rows ask for.
+So the symbol is true on `aarch64-macos`, whose every processor has them, and elsewhere only where the
+build promises them: `codegen { extensions = ["crc"] }` on an AArch64 row, `["sse4.2"]` on an x86-64
+one, or `--cpu native` on a machine that has them. A processor named with `--cpu` does not count by
+itself, since the compiler does not know its features — name the extension beside it. Under
+`general_regs_only` an x86-64 build has no SSE, and so no `crc32c`. `sysl.checksum`'s `crc32c`
+reads this symbol to choose the instruction over its table.
 
 That distinction is worth making before it is needed rather than after. macOS is the only BSD sysl
 targets today, so `#if macos` and `#if bsd` select identically — and a second BSD would route into
@@ -6276,7 +6287,7 @@ print(say())
 ```
 
 ```error
-'darwin' is not something a target says about itself — sysl knows aarch64, android, bsd, craft, debug, fma, fma_dp, fpu, fpu_dp, freestanding, hardfloat, hosted, linux, macos, posix, ptr16, ptr32, ptr64, riscv32, riscv64, sanitize_address, sanitize_thread, softfp, thread_local, thumb, wasi, wasm32, windows, x86, x86_64
+'darwin' is not something a target says about itself — sysl knows aarch64, android, bsd, craft, crc32c, debug, fma, fma_dp, fpu, fpu_dp, freestanding, hardfloat, hosted, linux, macos, posix, ptr16, ptr32, ptr64, riscv32, riscv64, sanitize_address, sanitize_thread, softfp, thread_local, thumb, wasi, wasm32, windows, x86, x86_64
 ```
 
 The set is closed, so a name outside it is a mistake rather than a fact this build happens not to
