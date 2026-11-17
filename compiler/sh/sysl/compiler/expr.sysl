@@ -2446,11 +2446,19 @@ private compare_expr(cx: &Analyzer, span: Span, operands: Buf[Expr], ops: Buf[st
     TExpr(span, TCompare(ts, cmps))
 end compare_expr
 
-// The operands of `===` or `!==`: two references, or two pointers, of one type. A trait object is
-// two words and has no single address to compare; anything else has no identity apart from its
-// value, and `==` is the comparison it has.
+// The operands of `===` or `!==`: two references, or two pointers, of one type; anything else has no
+// identity apart from its value, and `==` is the comparison it has.
+//
+// **A trait object's identity is the object's**, the data word beside its table, so two objects over
+// one value are identical whichever trait each was made against (`reference/memory.md § References
+// compare through their referent`). An object therefore also meets an object over another trait, and
+// a reference of the very kind it was made from -- a `&Shape` and a `&Circle`, a `*Shape` and a
+// `*Circle` -- where the concrete type implements the trait, since otherwise the two never name one
+// value. The emitter compares the two addresses (`identity_link`).
 private identity_operands(cx: &Analyzer, span: Span, op: string, a: Type, b: Type)
-    val addressed = underlying(a) match
+    val ua = underlying(a)
+    val ub = underlying(b)
+    val addressed = ua match
         Ref(_, _) -> true
         Ptr(_, _) -> true
         _ -> false
@@ -2458,13 +2466,32 @@ private identity_operands(cx: &Analyzer, span: Span, op: string, a: Type, b: Typ
     if !addressed
         cx.fault(span, s"'$op' compares the identity of two references or pointers, and " +
                  s"${type_show(a)} is neither — '${if op == "===" then "==" else "!="}' compares its value")
-    else if erased(underlying(a))
-        cx.fault(span, s"'$op' is not defined for the trait object ${type_show(a)}, which is two words " +
-                 "rather than one address")
-    else if !type_eq(repr(a), repr(b))
+    else if type_eq(repr(a), repr(b))
+        return
+    else if (erased(ua) || erased(ub)) && same_handle_kind(ua, ub)
+        val concrete = if erased(ua) then ub else ua
+        val object = if erased(ua) then ua else ub
+
+        if !erased(concrete) && !conforms(cx.an, trait_bound_of(erased_trait(object).unwrap()),
+                                          pointee(concrete).unwrap())
+            cx.fault(span, s"'$op' compares a ${type_show(object)} with a ${type_show(concrete)}, and " +
+                     s"${show_bare(pointee(concrete).unwrap())} does not implement " +
+                     s"${trait_bound_of(erased_trait(object).unwrap()).show()}, so the two never name one value")
+    else
         cx.fault(span, s"'$op' compares two references or pointers of one type, got ${type_show(a)} " +
                  s"and ${type_show(b)}")
 end identity_operands
+
+// Two references of one sharing, or two pointers: the handles a trait object and the value it was
+// made from are both of.
+private same_handle_kind(a: Type, b: Type) -> bool = a match
+    Ref(_, sa) -> b match
+        Ref(_, sb) -> sa == sb
+        _ -> false
+    Ptr(_, _) -> b match
+        Ptr(_, _) -> true
+        _ -> false
+    _ -> false
 
 // -- the tiering a pair of operands is read in ---------------------------------------------------
 

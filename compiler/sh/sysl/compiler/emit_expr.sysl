@@ -1002,7 +1002,8 @@ private gen_compare(e: *Emit, operands: Buf[TExpr], cmps: Buf[TCmp]) -> Val
     if cmps.len() == 1
         val lv = gen_part(e, operands[0], written)
 
-        return comparison(e, cmps[0], texpr_type(operands[0]), lv, gen_part(e, operands[1], written))
+        return identity_link(e, cmps[0], texpr_type(operands[0]), texpr_type(operands[1]), lv,
+                             gen_part(e, operands[1], written))
 
     val slot = alloca(e, fresh_reg(e), l_i1())
 
@@ -1027,7 +1028,8 @@ private gen_compare(e: *Emit, operands: Buf[TExpr], cmps: Buf[TCmp]) -> Val
         if k == 0 then left = gen_part(e, operands[0], written)
 
         val right = gen_part(e, operands[k + 1], written)
-        val c = comparison(e, cmps[k], texpr_type(operands[k]), left, right)
+        val c = identity_link(e, cmps[k], texpr_type(operands[k]), texpr_type(operands[k + 1]), left,
+                              right)
 
         emit(e, InStore(l_i1(), c, slot, AccPlain, None))
 
@@ -1055,6 +1057,33 @@ private gen_compare(e: *Emit, operands: Buf[TExpr], cmps: Buf[TCmp]) -> Val
     emit(e, InLoad(res, l_i1(), slot, AccPlain, None))
     res
 end gen_compare
+
+// **A link between a trait object and a handle of another type is `===` or `!==`** -- an object over
+// another trait, or a reference or pointer of the concrete type -- since no other comparison accepts
+// two operand types (`identity_operands`). Each side comes to the one address it names, an object's
+// being its data word, and the two addresses are compared. Every other link is `comparison`'s.
+private identity_link(e: *Emit, c: TCmp, ta: Type, tb: Type, av: Val, bv: Val) -> Val
+    val a = underlying(ta)
+    val b = underlying(tb)
+
+    if c.through > 0 || c.dispatch.is_some() || !(erased(a) || erased(b)) || type_eq(repr(a), repr(b))
+        return comparison(e, c, ta, av, bv)
+
+    val r = fresh_reg(e)
+
+    emit(e, InIntCmp(r, int_pred(e, c.op, a), LPtr, address_word(e, a, av), address_word(e, b, bv)))
+    r
+end identity_link
+
+// The address a handle names: a thin one is it, and a trait object's is its data word.
+private address_word(e: *Emit, t: Type, v: Val) -> Val
+    if !erased(t) then return v
+
+    val d = fresh_reg(e)
+
+    emit(e, InExtract(d, l_fat(), v, index_list(1)))
+    d
+end address_word
 
 // One comparison over two values the caller is holding: an instruction where the operand type has
 // one, the method its `Eq`/`Ord` supplies otherwise.
