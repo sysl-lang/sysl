@@ -200,6 +200,37 @@ ert_closure_and_method_names()
         "  main.sysl:5:31 in Config.check\n  main.sysl:9:34 in main.<closure>\n" +
         "  main.sysl:12:19 in main\n")
 
+private ert_generic_closure(calls: string) -> string = raw"""
+    check(n: int) -> Result[int, string] = if n < 0 then Err("negative") else Ok(n)
+
+    wrap[T](x: T, n: int) -> Result[int, string]
+        val read: &Fn(int) -> Result[int, string] = (k) ->
+            val p = check(k)?
+            Ok(p)
+        val r = read(n)?
+        Ok(r)
+
+    main() -> Result[unit, string]
+    """ + calls + "    Ok(())\n"
+
+// The closure is not in the body's last statement, so only the instantiation's whole span holds it.
+@test("a closure written in a generic made real once is named after that instantiation")
+ert_closure_in_a_generic()
+    ert_says(ert_main(ert_generic_closure("    print(wrap(7, -1)?)\n")), Status.Exited(1), "",
+        "error: negative\nerror return trace (origin first):\n" +
+        "  main.sysl:1:54 in check\n  main.sysl:5:25 in wrap.int.<closure>\n" +
+        "  main.sysl:7:20 in wrap.int\n  main.sysl:11:22 in main\n")
+
+// Every instantiation holds the one closure, and which of them lowered this copy is not something a
+// span says: no owner rather than the wrong one.
+@test("a closure written in a generic made real more than once names no owner")
+ert_closure_in_a_generic_made_real_twice()
+    ert_says(ert_main(ert_generic_closure("    print(wrap(1.5, 2)?)\n    print(wrap(7, -1)?)\n")),
+        Status.Exited(1), "2\n",
+        "error: negative\nerror return trace (origin first):\n" +
+        "  main.sysl:1:54 in check\n  main.sysl:5:25 in <closure>\n" +
+        "  main.sysl:7:20 in wrap.int\n  main.sysl:12:22 in main\n")
+
 // -- what leaves it -------------------------------------------------------------------------------------
 
 @test("an error handled by a statement leaves the trace, so the next failure's is its own")

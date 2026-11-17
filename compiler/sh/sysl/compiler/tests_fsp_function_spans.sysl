@@ -1,0 +1,200 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// A typed function's span is its declaration's, head to the end of its body, whatever made the
+// function: a free function, a member, and an instantiation of either, which shares its generic's
+// span with every other instantiation of it. An `@unchecked` block's form runs from its `@` to the
+// end of its block, and its head is the whole word.
+//
+// Every position here is checked against the declaration a reader wrote: an instantiation used to
+// carry its body's last statement, so a borrow note, a diagnostic and the closures written in it
+// were placed by that line instead.
+
+private var fsp_library_cache: Buf[Program] = buf()
+private var fsp_library_read: bool = false
+
+private fsp_library() -> Buf[Program]
+    if fsp_library_read then return fsp_library_cache
+
+    fsp_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> fsp_library_cache = units
+
+    fsp_library_cache
+end fsp_library
+
+private fsp_analysed(text: string) -> TypedBodies
+    var units: Buf[Program] = buf()
+
+    for item in fsp_library()
+        units.push(item)
+
+    units.push(parse(source_of("t.sysl", text)).program)
+    analyze_bodies(units, host_target())
+end fsp_analysed
+
+// Each function of `t.sysl`, one per line: its name and its span as `line:col-line:col`.
+private fsp_spans(text: string) -> string
+    var out = ""
+
+    for f in fsp_analysed(text).funcs
+        if f.src.is_none() || f.src.unwrap().name != "t.sysl" then continue
+
+        val src = f.src.unwrap()
+        val from = src.locate(f.span.start)
+        val to = src.locate(f.span.end)
+
+        out = out + s"${f.name} ${from.line}:${from.col}-${to.line}:${to.col}\n"
+
+    out
+end fsp_spans
+
+private fsp_has(spans: string, line: string) = assert(spans.contains(line), s"no '$line' in:\n$spans")
+
+private fsp_skipped() -> bool
+    if !fsp_library().is_empty() then return false
+
+    print("skipped: the standard module's source is not on this machine")
+    true
+end fsp_skipped
+
+private val fsp_shapes: string = raw"""
+    /** Doc. */
+    @inline
+    const s1(xs: []const int) -> int
+        var t = 0
+        for x in xs do t += x
+        t
+
+    /** Doc over a generic. */
+    const s2[T: Add + Zero](xs: []const T) -> T
+        var t = T.zero()
+        for x in xs do t = t + x
+        t
+
+    @inline
+    s3[T](x: T) -> T
+        val y = x
+        y
+
+    one[T](x: T) -> T = x
+
+    main()
+        print(s1([1, 2]), s2([1, 2]), s2([1.5]), s3(4), one(2), one("s"))
+    """
+
+@test("an instantiation carries its generic's span, head to end of body, as a plain function does")
+fsp_instantiation_covers_the_declaration()
+    if fsp_skipped() then return
+
+    val spans = fsp_spans(fsp_shapes)
+
+    // The plain function, and the generic beside it with a doc comment, `const` and a multi-line body.
+    // A body ends where the next token begins, and a doc comment is not one.
+    fsp_has(spans, "s1 2:1-9:1")
+    fsp_has(spans, "s2.int 9:1-14:1")
+    fsp_has(spans, "s2.real 9:1-14:1")
+
+    // An attribute above it is where it begins; a one-line body ends the line.
+    fsp_has(spans, "s3.int 14:1-19:1")
+    fsp_has(spans, "one.int 19:1-19:22")
+    fsp_has(spans, "one.string 19:1-19:22")
+end fsp_instantiation_covers_the_declaration
+
+@test("a generic member and a member of a generic type carry the member's span")
+fsp_member_instantiations()
+    if fsp_skipped() then return
+
+    val spans = fsp_spans(raw"""
+        struct Box[T]
+            v: T
+
+            /// Doubled.
+            twice(self) -> (T, T)
+                val a = self.v
+                (a, a)
+
+            map[U](self, f: &Fn(T) -> U) -> U
+                val r = f(self.v)
+                r
+
+        main()
+            val b = Box(3)
+            print(b.twice().0, b.map((x) -> x + 1), Box("q").twice().1)
+        """)
+
+    fsp_has(spans, "Box.twice.int 5:5-9:5")
+    fsp_has(spans, "Box.twice.string 5:5-9:5")
+    fsp_has(spans, "Box.map.int.int 9:5-13:1")
+end fsp_member_instantiations
+
+// A refusal about an instantiation as a whole points where one about a plain function does -- the
+// declaration's first line, its annotation -- not at the body's last line.
+private fsp_disjoint_report(head: string) -> string
+    val done = fsp_analysed("@disjoint(a, b)\n" + head + "\n    val first = a\n    first\n\n" +
+                            "main()\n    print(pick(1, 2))\n")
+
+    analysis_report(errors_of(done.an.diagnostics()))
+end fsp_disjoint_report
+
+@test("a refusal placed at an instantiation underlines what it does for a plain function")
+fsp_refusal_at_an_instantiation()
+    if fsp_skipped() then return
+
+    val generic = fsp_disjoint_report("pick[T](a: T, b: T) -> T")
+    val plain = fsp_disjoint_report("pick(a: int, b: int) -> int")
+    val caret = " --> t.sysl:1:1\n  |\n1 | @disjoint(a, b)\n  | ^^^^^^^^^^^^^^^"
+
+    assert(generic.contains(caret), generic)
+    assert(plain.contains(caret), plain)
+    assert(!generic.contains("t.sysl:4:"), generic)
+end fsp_refusal_at_an_instantiation
+
+// -- `@unchecked` ----------------------------------------------------------------------------------------
+
+private fsp_tree(text: string, extents: bool) -> string =
+    if extents then emit_ast_extents(parse(source_of("t.sysl", text)).program)
+    else emit_ast(parse(source_of("t.sysl", text)).program, true)
+
+private fsp_tree_has(text: string, extents: bool, line: string)
+    val tree = fsp_tree(text, extents)
+
+    assert(tree.contains(line), s"no '$line' in:\n$tree")
+
+@test("an '@unchecked' block's form runs from the '@' to the end of its block")
+fsp_unchecked_extent()
+    val text = "f(xs: []int) -> int\n    @unchecked\n        xs[0] = 1\n        xs[1] = 2\n    xs[0]\n"
+
+    fsp_tree_has(text, true, "- ExprStmt 2:5-5:5")
+    fsp_tree_has(text, true, "expr: Call 2:5-5:5")
+    fsp_tree_has(text, true, "- Block 2:5-5:5")
+
+@test("and to the end of the file where its block is the last thing in it")
+fsp_unchecked_extent_at_the_end_of_the_file()
+    val text = "f(xs: []int)\n    @unchecked\n        xs[0] = 1\n"
+
+    fsp_tree_has(text, true, "expr: Call 2:5-4:1")
+    fsp_tree_has(text, true, "- FuncDecl 1:1-4:1")
+
+@test("an '@unchecked' block's head, where a diagnostic about the form points, is the whole word")
+fsp_unchecked_head()
+    val text = "f(xs: []int) -> int\n    @unchecked\n        xs[0] = 1\n    xs[0]\n"
+
+    fsp_tree_has(text, false, "expr: Call 2:5-2:15")
+    fsp_tree_has(text, false, "callee: Ident 2:5-2:15")
+    fsp_tree_has(text, true, "callee: Ident 2:5-2:15")
+
+@test("an '@unchecked' block nested in another block is placed the same way")
+fsp_unchecked_nested()
+    val text = "f(xs: []int)\n    if xs.len > 1\n        @unchecked\n            xs[0] = 1\n    print(1)\n"
+
+    fsp_tree_has(text, false, "callee: Ident 3:9-3:19")
+    fsp_tree_has(text, true, "expr: Call 3:9-5:5")
