@@ -232,7 +232,7 @@ const_run(cx: &Analyzer, e: Expr, whole: bool) -> Option[Const]
         TCall(name, _, _, _) -> if !runs_while_compiling(cx.an, name) then return None
         _ -> if !whole then return None
 
-    evaluate(cx.an, cx.scope, subject_of(cx.an), typed.unwrap()) match
+    evaluate(cx.an, cx.scope, subject_of(cx.an), typed.unwrap(), no_fuse_here(cx)) match
         // An array is storage, not a constant's value: it is laid down only as a `val`'s data.
         EvValue(Some(ConstArray(_))) -> None
         EvValue(Some(ConstView(_, _, _, _))) -> None
@@ -300,7 +300,7 @@ private constant_message(cx: &Analyzer, span: Span, e: Expr, head: string) -> Op
         return None
     end if
 
-    evaluate(cx.an, cx.scope, head, t) match
+    evaluate(cx.an, cx.scope, head, t, no_fuse_here(cx)) match
         EvValue(Some(ConstStr(v))) -> Some(v)
         EvFail(message, _) ->
             cx.fault(span, message)
@@ -323,7 +323,7 @@ const_lanes_of_call(cx: &Analyzer, e: Expr) -> Option[(Buf[Const], Type)]
 
     if typed.is_none() then return None
 
-    evaluate(cx.an, cx.scope, "this shuffle's list", typed.unwrap()) match
+    evaluate(cx.an, cx.scope, "this shuffle's list", typed.unwrap(), no_fuse_here(cx)) match
         EvValue(Some(ConstArray(xs))) -> Some((xs, texpr_type(typed.unwrap())))
         EvFail(message, _) ->
             cx.fault(e.span, message)
@@ -356,7 +356,7 @@ const_byte_order(cx: &Analyzer, e: Expr) -> Option[Const]
     if typed.is_none() then return None
 
     *typed.unwrap().kind match
-        TIntOp(_, _, _, _, _) -> const_fold_typed(typed.unwrap(), fold_machine(cx.an.tables))
+        TIntOp(_, _, _, _, _) -> const_fold_typed(typed.unwrap(), fold_machine_in(cx))
         _ -> None
 end const_byte_order
 
@@ -384,7 +384,7 @@ const_float_bits(cx: &Analyzer, e: Expr) -> Option[Const]
         TCall(name, args, _, _) ->
             if !float_bits_routine(name) || args.len() != 1 then return None
 
-            const_fold_typed(args[0], fold_machine(cx.an.tables))
+            const_fold_typed(args[0], fold_machine_in(cx))
                 .and_then(c -> float_bits_folded(name, c))
         _ -> None
 end const_float_bits
@@ -394,7 +394,7 @@ end const_float_bits
 // target fuses it (`fp_contract.sysl`). The untyped fold holds every float as a `real` and knows
 // neither, so it asks this first and keeps its own answer only where this has none.
 const_float_operator(cx: &Analyzer, e: Expr) -> Option[Const] =
-    typed_call(cx, e, None).and_then(t -> const_fold_typed(t, fold_machine(cx.an.tables)))
+    typed_call(cx, e, None).and_then(t -> const_fold_typed(t, fold_machine_in(cx)))
 
 // A float constant whose initializer calls a `const` function, evaluated over the tree typed at the
 // constant's own type -- so a `f32` is rounded at every operation, as it would be at run time, rather
@@ -407,7 +407,7 @@ const_float_value(cx: &Analyzer, e: Expr, ty: Type) -> Option[real]
 
     if typed.is_none() then return None
 
-    evaluate(cx.an, cx.scope, subject_of(cx.an), typed.unwrap()) match
+    evaluate(cx.an, cx.scope, subject_of(cx.an), typed.unwrap(), no_fuse_here(cx)) match
         EvValue(Some(ConstFloat(f))) -> Some(f)
         _ -> None
 end const_float_value
@@ -417,7 +417,7 @@ end const_float_value
 // saturate at, so `const K: u8 = 250 +| 10` is read here, at `u8`, and is 255. `None` where the
 // reading complained or the value is not one the typed fold holds.
 const_wrap_sat(cx: &Analyzer, e: Expr, ty: Option[Type]) -> Option[Const] =
-    typed_call(cx, e, ty).and_then(t -> const_fold_typed(t, fold_machine(cx.an.tables)))
+    typed_call(cx, e, ty).and_then(t -> const_fold_typed(t, fold_machine_in(cx)))
 
 // The same for an `f128` constant, whose value is its encoding: computed at binary128 at every step,
 // as the program would compute it, and never through a `real`.
@@ -428,7 +428,7 @@ const_quad_value(cx: &Analyzer, e: Expr, ty: Type) -> Option[(u64, u64)]
 
     if typed.is_none() then return None
 
-    evaluate(cx.an, cx.scope, subject_of(cx.an), typed.unwrap()) match
+    evaluate(cx.an, cx.scope, subject_of(cx.an), typed.unwrap(), no_fuse_here(cx)) match
         EvValue(Some(ConstQuad(hi, lo))) -> Some((hi, lo))
         _ -> None
 end const_quad_value
@@ -455,7 +455,7 @@ const_val_run(cx: &Analyzer, name: string, init: TExpr) -> Result[Option[TExpr],
 
     if !runs && !projects(init) then return Ok(None)
 
-    evaluate(cx.an, cx.scope, s"'$name'", init) match
+    evaluate(cx.an, cx.scope, s"'$name'", init, no_fuse_here(cx)) match
         EvValue(Some(v)) ->
             // What the run made on its heap is frozen into the object file only through a type that
             // says nothing writes it, or as a box the storage holds; anything else stays code,
@@ -497,7 +497,7 @@ end const_val_run
 // a variable, a parameter, anything read only when the program runs. Nothing is reported: the form
 // asking says in its own words why it needed one.
 const_argument(cx: &Analyzer, subject: string, t: TExpr) -> Option[Const] =
-    evaluate(cx.an, cx.scope, subject, t) match
+    evaluate(cx.an, cx.scope, subject, t, no_fuse_here(cx)) match
         EvValue(Some(v)) -> Some(v)
         _ -> None
 
@@ -506,7 +506,7 @@ const_argument(cx: &Analyzer, subject: string, t: TExpr) -> Option[Const] =
 const_local_image(cx: &Analyzer, name: string, init: TExpr) -> Result[TExpr, string]
     val subject = s"'$name'"
 
-    evaluate(cx.an, cx.scope, subject, init) match
+    evaluate(cx.an, cx.scope, subject, init, no_fuse_here(cx)) match
         EvValue(Some(v)) ->
             val refused = answer_refusal(v, texpr_type(init))
 
@@ -552,7 +552,7 @@ annotation_image(cx: &Analyzer, written: string, call: Expr, ty: Type, about: st
     val stopped = s"what an annotation says is settled while compiling, so '@$written' takes constants — " +
                   "this reads something that holds a value only once the program runs"
 
-    evaluate(cx.an, cx.scope, s"'@$written'", init) match
+    evaluate(cx.an, cx.scope, s"'@$written'", init, no_fuse_here(cx)) match
         EvValue(Some(v)) ->
             val image = if answer_refusal(v, texpr_type(init)).is_some() then None
                         else value_literal(call.span, v, texpr_type(init))
@@ -944,6 +944,8 @@ private struct EvFrame
     olds: Buf[Const]
     result: Option[Const]
     slots: Map[string, Const]
+    // Whether the body being run keeps its multiplies apart from the adds they feed (`no_fuse.sysl`).
+    no_fuse: bool
 end EvFrame
 
 // One evaluation.
@@ -964,12 +966,12 @@ end EvRun
 
 // Runs one typed expression standing in a constant: `subject` is what a refusal names, `base` the
 // file it was written in.
-private evaluate(a: &Analysis, base: Scope, subject: string, t: TExpr) -> EvOutcome
+private evaluate(a: &Analysis, base: Scope, subject: string, t: TExpr, no_fuse: bool) -> EvOutcome
     val r: &EvRun = EvRun(a, subject, base, 0, step_limit(base), buf(), buf(), EvRunning, "", buf())
 
     // The expression itself is read in a frame of its own, which names no call: what it binds -- a
     // pattern in a `match` -- lands there.
-    r.frames.push(EvFrame("", "", t.span, base, base, map(), buf(), None, map()))
+    r.frames.push(EvFrame("", "", t.span, base, base, map(), buf(), None, map(), no_fuse))
 
     val f = eval(r, t)
 
@@ -991,6 +993,10 @@ private here(r: &EvRun) -> Scope = r.frames[r.frames.len() - 1].home
 
 // The call being run, where one is: the outermost frame is the expression's own.
 private running(r: &EvRun) -> &EvFrame = r.frames[r.frames.len() - 1]
+
+// The widths a multiply-add is fused at in the body being run: none in a `@no_fuse` one, which the
+// lowering leaves apart too (`no_fuse.sysl`), so a value is the same however it was worked out.
+private ev_fusing(r: &EvRun) -> Fusing = fusing_for(r.a.tables.target, running(r).no_fuse)
 
 // A place in a file, as a reader finds it: the file's own name, the line and the column.
 @noinline
@@ -1653,7 +1659,7 @@ private ev_expansion(r: &EvRun, e: TExpr) -> Option[TExpr]
 
     val drops = drops_declared(r.a)
 
-    val found = operator_expansion(fusing_of(r.a.tables.target), body_of, t -> holds_string(drops, owner_key(t)), 0, e)
+    val found = operator_expansion(ev_fusing(r), body_of, t -> holds_string(drops, owner_key(t)), 0, e)
 
     found.map(p -> p.0)
 end ev_expansion
@@ -1671,7 +1677,9 @@ private ev_operator(r: &EvRun, at: Span, name: string) -> Option[TFunc]
 
     if r.a.evaluation.bodies.get(name).is_none() && reached_refusal(r.a, name).is_some() then return None
 
-    callee(r, at, name).map(b -> *b)
+    // A `@no_fuse` operator keeps its multiplies apart wherever it is called from, so it stays a call
+    // (`no_fuse.sysl`).
+    callee(r, at, name).and_then(b -> if b.marks.no_fuse then None else Some(*b))
 end ev_operator
 
 // Whether `name` is a method an `impl` lowered to a function of its own -- where every method of a
@@ -3652,7 +3660,7 @@ private whole_value(a: &Analysis, d: ValueDecl, shown: string, ty: Type) -> Opti
 
     if typed.is_none() then return None
 
-    evaluate(a, d.scope, s"'$shown'", typed.unwrap()) match
+    evaluate(a, d.scope, s"'$shown'", typed.unwrap(), no_fuse_in(a, d.scope)) match
         EvValue(Some(v)) -> if answer_refusal(v, ty).is_some() then None else Some(v)
         _ -> None
 end whole_value
@@ -3713,7 +3721,7 @@ end unary_value
 
 @noinline
 private binary(r: &EvRun, at: Span, op: string, l: TExpr, rt: TExpr, ty: Type) -> Flow
-    contracted_binary(fusing_of(r.a.tables.target), op, l, rt, ty) match
+    contracted_binary(ev_fusing(r), op, l, rt, ty) match
         Some((k, addend)) -> return ev_contracted(r, at, k, Some(addend), ConstUnset, ty)
         None -> ()
 
@@ -4617,7 +4625,8 @@ private entered(r: &EvRun, at: Span, name: string, vals: Buf[Const], f: &TFunc,
     if r.frames.len() > EvDepthLimit then
         return Err(refuse_form(r, at, s"the calls nest more than 512 deep, at '$shown'"))
 
-    val frame: &EvFrame = EvFrame(name, shown, at, here(r), func_home(r.a, name), map(), buf(), None, map())
+    val frame: &EvFrame = EvFrame(name, shown, at, here(r), func_home(r.a, name), map(), buf(), None, map(),
+                                  f.marks.no_fuse)
 
     for i in 0..<f.params.len()
         frame.locals.put(f.params[i].0, cell_of(copied(vals[i])))
@@ -5149,7 +5158,7 @@ end update
 @noinline
 private updated_value(r: &EvRun, at: Span, op: string, ty: Type, value: TExpr, cur: Const,
                       check: Option[Type]) -> Flow
-    contracted_update(fusing_of(r.a.tables.target), op, ty, value) match
+    contracted_update(ev_fusing(r), op, ty, value) match
         Some(k) -> return held_to(r, at, ev_contracted(r, at, k, None, cur, ty), check)
         None -> ()
 
@@ -5219,7 +5228,7 @@ private ev_multi_assign(r: &EvRun, writes: Buf[TWrite]) -> Flow
 
         // A contracted arm reads its place, then the product's factors, as the lowering does.
         val k = if w.op == "=" || w.dispatch.is_some() then None
-        else contracted_update(fusing_of(r.a.tables.target), w.op, texpr_type(w.place), w.value)
+        else contracted_update(ev_fusing(r), w.op, texpr_type(w.place), w.value)
 
         if k.is_some()
             val cur = slot_value(r, w.place.span, slot) match

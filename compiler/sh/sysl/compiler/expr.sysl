@@ -555,6 +555,15 @@ name_expr(cx: &Analyzer, span: Span, name: string, expected: Option[Type]) -> TE
 
             if lc.character && wants_byte(expected) then return local_char_at(cx, span, lc, expected)
 
+            // Read in a body whose fusing differs from the one it was declared in, it is the value it
+            // came to there (`no_fuse.sysl`).
+            if lc.no_fuse != no_fuse_here(cx)
+                lc.folded match
+                    Some(ConstFloat(f)) ->
+                        return TExpr(span, TFloatLit(float_pattern(f), underlying(texpr_type(lc.image))))
+                    _ -> ()
+            end if
+
             return TExpr(span, konst.unwrap().0.kind)
         end if
     end if
@@ -1293,6 +1302,22 @@ private const_value_expr(cx: &Analyzer, span: Span, key: string,
         val byte_at = char_at_byte(cx, span, value, expected)
 
         if byte_at.is_some() then return byte_at.unwrap()
+    end if
+
+    // **A float constant used where fusing is not what it is where it was declared** -- one of a
+    // `@no_fuse` module read by a module that fuses, or the other way round -- is the value its own
+    // module computes, folded there, rather than its arithmetic lowered under the reader's rule
+    // (`no_fuse.sysl`).
+    val floating = underlying(ty) match
+        Floating(_, _) -> true
+        _ -> false
+
+    if floating && no_fuse_here(inner) != no_fuse_here(cx)
+        val folded = const_fold_typed(type_expr(inner, d.init.unwrap(), Some(ty)), fold_machine_in(inner))
+
+        folded match
+            Some(ConstFloat(f)) -> return TExpr(span, TFloatLit(float_pattern(f), underlying(ty)))
+            _ -> ()
     end if
 
     // **A `const` IS ITS VALUE, so a use of one is the value and not the arithmetic that wrote it.**
