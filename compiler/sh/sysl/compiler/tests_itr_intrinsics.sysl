@@ -105,10 +105,10 @@ itr_magnitude_at_negative_zero()
 itr_supported_names_are_in_the_namespace()
     val names = supported_intrinsics()
 
-    assert(names.len > 0)
+    assert(names.len() > 0)
 
-    for i in 0..<names.len
-        assert(is_intrinsic_name(names[i]), names[i])
+    for name in names
+        assert(is_intrinsic_name(name), name)
 end itr_supported_names_are_in_the_namespace
 
 // Two declarations may share one symbol under different sysl names, and the derived suffix does not
@@ -186,7 +186,10 @@ itr_an_unsupported_intrinsic_is_refused_by_name()
     itr_refused(itr_ir("private extern \"llvm.frobnicate\" f(x: f64) -> f64\n\nprint(f(1.0))\n"),
                 "'llvm.frobnicate' is not an intrinsic sysl supports — it has llvm.ceil, " +
                 "llvm.copysign, llvm.fabs, llvm.floor, llvm.fma, llvm.maximum, llvm.maxnum, " +
-                "llvm.minimum, llvm.minnum, llvm.nearbyint, llvm.rint, llvm.round, llvm.roundeven, llvm.sqrt, llvm.trunc")
+                "llvm.minimum, llvm.minnum, llvm.nearbyint, llvm.rint, llvm.round, llvm.roundeven, llvm.sqrt, llvm.trunc, " +
+                "llvm.aarch64.crc32cb, llvm.aarch64.crc32ch, llvm.aarch64.crc32cw, llvm.aarch64.crc32cx, " +
+                "llvm.x86.sse42.crc32.32.8, llvm.x86.sse42.crc32.32.16, llvm.x86.sse42.crc32.32.32, " +
+                "llvm.x86.sse42.crc32.64.64")
 
 @test("the wrong number of arguments")
 itr_the_wrong_number_of_arguments()
@@ -244,3 +247,221 @@ itr_storage_refused_unread()
                 "'llvm.sqrt' is in the namespace the back end's own operations live in, and those " +
                 "are code rather than storage — an 'extern' variable names a symbol the linker " +
                 "resolves")
+
+// -- the CRC-32C instructions -----------------------------------------------------------------------
+
+// `#if crc32c`, the refusal of an `extern` naming one of the instructions, and `sysl.checksum`'s
+// choice all read `crc32c_instruction`; these pin what it answers and what each reader does with it.
+
+private itr_with_extensions(names: []const string)
+    var xs: Buf[string] = buf()
+
+    for name in names
+        xs.push(name)
+
+    use_codegen_features(CodegenFeatures(false, false, xs))
+end itr_with_extensions
+
+private itr_reset()
+    use_codegen_features(no_codegen_features())
+    use_cpu("", buf())
+
+private itr_holds(items: Buf[string], word: string) -> bool
+    for item in items
+        if item == word then return true
+
+    false
+
+private itr_says_crc32c(t: Target) -> bool = itr_holds(defined(t), "crc32c")
+
+// Measured against clang for each row's own triple: `crc32cx` assembles under `arm64-apple-macosx`
+// (its default processor is the M1) and is "Cannot select" under `aarch64-unknown-linux-gnu`,
+// `aarch64-none-elf` and `aarch64-linux-android24`; SSE 4.2's `crc32` under neither x86-64 triple.
+@test("crc32c is true on aarch64-macos alone until the build promises the instruction")
+itr_crc32c_symbol_per_target()
+    itr_reset()
+
+    for t in all_targets()
+        assert_eq(itr_says_crc32c(t), t.name == "aarch64-macos", t.name)
+        assert_eq(crc32c_instruction(t), itr_says_crc32c(t), t.name)
+
+    var crc: [1]string = ["crc"]
+
+    itr_with_extensions(crc[..])
+
+    for t in all_targets()
+        assert_eq(itr_says_crc32c(t), t.cpu == Aarch64, s"${t.name} with crc")
+
+    var sse: [1]string = ["sse4.2"]
+
+    itr_with_extensions(sse[..])
+
+    for t in all_targets()
+        assert_eq(itr_says_crc32c(t), t.cpu == X86_64 || t.name == "aarch64-macos", s"${t.name} with sse4.2")
+
+    // No SSE at all under general_regs_only, and SSE 4.2 is part of it.
+    var xs: Buf[string] = buf()
+
+    xs.push("sse4.2")
+    use_codegen_features(CodegenFeatures(true, false, xs))
+    assert(!itr_says_crc32c(target_named("x86_64-linux").unwrap()), "general_regs_only")
+    itr_reset()
+
+    assert(itr_holds(symbols(), "crc32c"), "the vocabulary has it on every machine")
+    assert(!itr_holds(directory_symbols(), "crc32c"), "a directory has no processor to ask")
+end itr_crc32c_symbol_per_target
+
+@test("crc32c follows --cpu: a named processor alone does not promise it, native's feature list does")
+itr_crc32c_follows_the_processor()
+    val mac = target_named("aarch64-macos").unwrap()
+    val linux = target_named("aarch64-linux").unwrap()
+
+    use_cpu("apple-m4", buf())
+    assert(!itr_says_crc32c(mac), "a named processor's features are not known here")
+
+    var features: Buf[string] = buf()
+
+    features.push("+neon")
+    features.push("+crc")
+    use_cpu("apple-m4", features)
+    assert(itr_says_crc32c(mac), "native, with +crc")
+    assert(itr_says_crc32c(linux), "native's list on a linux row")
+
+    var without: Buf[string] = buf()
+
+    without.push("+neon")
+    use_cpu("cortex-a53", without)
+    assert(!itr_says_crc32c(linux), "a list that lacks it")
+    itr_reset()
+end itr_crc32c_follows_the_processor
+
+private itr_crc_program() -> string =
+    "private extern \"llvm.aarch64.crc32cx\" step(crc: u32, w: u64) -> u32\n" +
+    "private extern \"llvm.aarch64.crc32cb\" byte(crc: u32, b: u32) -> u32\n\n" +
+    "print(step(0xffffffff, 0x3837363534333231), byte(0, 7))\n"
+
+@test("a CRC-32C instruction is emitted under its own name, unsuffixed, where the row has it")
+itr_crc32c_reaches_the_text()
+    if xvr_no_library() then return
+
+    itr_reset()
+
+    val out = itr_for(target_named("aarch64-macos").unwrap(), itr_crc_program())
+
+    assert(out.contains("declare i32 @llvm.aarch64.crc32cx(i32, i64)"), out)
+    assert(out.contains("declare i32 @llvm.aarch64.crc32cb(i32, i32)"), out)
+    assert(out.contains("call i32 @llvm.aarch64.crc32cx("), out)
+end itr_crc32c_reaches_the_text
+
+@test("SSE 4.2's forms take the value at its own width, and the 64-bit one a 64-bit remainder")
+itr_crc32c_x86_forms()
+    if xvr_no_library() then return
+
+    var sse: [1]string = ["sse4.2"]
+
+    itr_with_extensions(sse[..])
+
+    val out = itr_for(target_named("x86_64-linux").unwrap(),
+        "private extern \"llvm.x86.sse42.crc32.32.8\" b8(crc: u32, b: u8) -> u32\n" +
+        "private extern \"llvm.x86.sse42.crc32.32.16\" b16(crc: u32, b: u16) -> u32\n" +
+        "private extern \"llvm.x86.sse42.crc32.32.32\" b32(crc: u32, b: u32) -> u32\n" +
+        "private extern \"llvm.x86.sse42.crc32.64.64\" b64(crc: u64, b: u64) -> u64\n\n" +
+        "print(b8(0, 1), b16(0, 1), b32(0, 1), b64(0, 1))\n")
+
+    itr_reset()
+    assert(out.contains("@llvm.x86.sse42.crc32.32.8(i32"), out)
+    assert(out.contains("@llvm.x86.sse42.crc32.32.16(i32"), out)
+    assert(out.contains("@llvm.x86.sse42.crc32.32.32(i32"), out)
+    assert(out.contains("declare i64 @llvm.x86.sse42.crc32.64.64(i64, i64)"), out)
+end itr_crc32c_x86_forms
+
+@test("a CRC-32C instruction is refused where the row does not promise it, naming the extension")
+itr_crc32c_refused_without_the_feature()
+    if xvr_no_library() then return
+
+    itr_reset()
+
+    val arm = itr_for(target_named("aarch64-linux").unwrap(), itr_crc_program())
+
+    assert(arm.contains("'llvm.aarch64.crc32cx' is an instruction 'aarch64-linux' does not promise, so " +
+        "the back end could not select it — guard the declaration and its uses with '#if crc32c', or " +
+        "name the extension in sysl.hocon: 'codegen { extensions = [\"crc\"] }'"), arm)
+
+    val x86 = itr_for(target_named("x86_64-macos").unwrap(),
+        "private extern \"llvm.x86.sse42.crc32.32.8\" b8(crc: u32, b: u8) -> u32\n\nprint(b8(0, 1))\n")
+
+    assert(x86.contains("'llvm.x86.sse42.crc32.32.8' is an instruction 'x86_64-macos' does not promise"), x86)
+    assert(x86.contains("extensions = [\"sse4.2\"]"), x86)
+end itr_crc32c_refused_without_the_feature
+
+@test("the same declaration under #if crc32c builds where the row lacks it, and its #else is used")
+itr_crc32c_guarded_builds_everywhere()
+    if xvr_no_library() then return
+
+    itr_reset()
+
+    val text = "#if crc32c\nprivate extern \"llvm.aarch64.crc32cx\" step(crc: u32, w: u64) -> u32\n" +
+               "#else\nprivate step(crc: u32, w: u64) -> u32 = crc\n#endif\n\nprint(step(1, 2))\n"
+    val linux = itr_for(target_named("aarch64-linux").unwrap(), text)
+    val mac = itr_for(target_named("aarch64-macos").unwrap(), text)
+
+    assert(!linux.contains("error") && !linux.contains("crc32cx"), linux)
+    assert(mac.contains("@llvm.aarch64.crc32cx("), mac)
+end itr_crc32c_guarded_builds_everywhere
+
+@test("an instruction for the other processor is refused, whatever the build promises")
+itr_crc32c_wrong_processor()
+    if xvr_no_library() then return
+
+    var both: [2]string = ["crc", "sse4.2"]
+
+    itr_with_extensions(both[..])
+
+    val x86 = itr_for(target_named("x86_64-linux").unwrap(), itr_crc_program())
+    val arm = itr_for(target_named("aarch64-macos").unwrap(),
+        "private extern \"llvm.x86.sse42.crc32.32.32\" b32(crc: u32, b: u32) -> u32\n\nprint(b32(0, 1))\n")
+    val board = itr_for(target_named("thumb-freestanding").unwrap(), itr_crc_program())
+
+    itr_reset()
+    assert(x86.contains("'llvm.aarch64.crc32cx' is an AArch64 instruction, and this build is for 'x86_64-linux'"), x86)
+    assert(arm.contains("'llvm.x86.sse42.crc32.32.32' is an x86-64 instruction, and this build is for 'aarch64-macos'"), arm)
+    assert(board.contains("is an AArch64 instruction, and this build is for 'thumb-freestanding'"), board)
+end itr_crc32c_wrong_processor
+
+@test("each CRC-32C instruction has exactly one signature, and a different one is refused")
+itr_crc32c_signature()
+    if xvr_no_library() then return
+
+    itr_reset()
+
+    val mac = target_named("aarch64-macos").unwrap()
+    val narrow = itr_for(mac, "private extern \"llvm.aarch64.crc32cx\" f(crc: u32, w: u32) -> u32\n\nprint(f(0, 1))\n")
+    val word = itr_for(mac, "private extern \"llvm.aarch64.crc32cx\" f(crc: u32, w: usize) -> u32\n\nprint(f(0, 1))\n")
+    val signed = itr_for(mac, "private extern \"llvm.aarch64.crc32cb\" f(crc: i32, b: u32) -> u32\n\nprint(f(0, 1))\n")
+    val short = itr_for(mac, "private extern \"llvm.aarch64.crc32cw\" f(crc: u32) -> u32\n\nprint(f(0))\n")
+    val byte = itr_for(mac, "private extern \"llvm.aarch64.crc32cb\" f(crc: u32, b: u8) -> u32\n\nprint(f(0, 1))\n")
+
+    // Types are written as diagnostics write them: `u32` is `uint`, `u64` is `ulong`.
+    val w = type_show(Integer(32, false, false))
+    val x = type_show(Integer(64, false, false))
+    val i = type_show(Integer(32, true, false))
+    val b = type_show(Integer(8, false, false))
+
+    assert(narrow.contains(s"'llvm.aarch64.crc32cx' is '($w, $x) -> $w', and this declaration states '($w, $w) -> $w'"), narrow)
+    assert(word.contains(s"and this declaration states '($w, usize) -> $w'"), word)
+    assert(signed.contains(s"'llvm.aarch64.crc32cb' is '($w, $w) -> $w', and this declaration states '($i, $w) -> $w'"), signed)
+    assert(short.contains(s"'llvm.aarch64.crc32cw' is '($w, $w) -> $w', and this declaration states '($w) -> $w'"), short)
+    assert(byte.contains(s"and this declaration states '($w, $b) -> $w'"), byte)
+end itr_crc32c_signature
+
+@test("an instruction's name holds no address, as every intrinsic's does not")
+itr_crc32c_has_no_address()
+    if xvr_no_library() then return
+
+    itr_reset()
+
+    val out = itr_for(target_named("aarch64-macos").unwrap(),
+        "private extern \"llvm.aarch64.crc32cw\" f(crc: u32, w: u32) -> u32\n\nval p = &f\nprint(p(0, 1))\n")
+
+    assert(out.contains("is an intrinsic, which the back end lowers to an instruction"), out)
+end itr_crc32c_has_no_address
