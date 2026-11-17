@@ -131,7 +131,11 @@ private assume_invariant_of(e: *Emit, at: Span, recv: TExpr, s: StructType)
     if !inv.body.stmts.is_empty() || inv.params.len() != s.fields.len() then return
     if inv.body.result.is_none() then return
 
-    val clause = inv.body.result.unwrap()
+    val found_clause = all_clauses(inv.body.result.unwrap())
+
+    if found_clause.is_none() then return
+
+    val clause = found_clause.unwrap()
 
     if ghostly(e, clause) then return
 
@@ -147,6 +151,35 @@ private assume_invariant_of(e: *Emit, at: Span, recv: TExpr, s: StructType)
 
     if ported.is_some() then assume_clause(e, ported.unwrap())
 end assume_invariant_of
+
+// The clauses of a struct's `invariant` as their conjunction, out of the `if`s they lowered to
+// (`first_broken`): each clause the condition of one, as a block holding just the clause, and the
+// next `if` its branch for a clause that holds, down to the empty answer. Nothing where the body is
+// not that shape.
+private all_clauses(answer: TExpr) -> Option[TExpr]
+    var out: Option[TExpr] = None
+    var at = answer
+
+    loop
+        val (cond, held) = *at.kind match
+            TStrLit(_) -> return out
+            TIf(conds, then_block, Some(_), _) if conds.len() == 1 && then_block.stmts.is_empty() ->
+                val clause = conds[0] match
+                    TCondTest(c) -> *c.kind match
+                        TBlockExpr(b) if b.stmts.is_empty() && b.result.is_some() -> b.result.unwrap()
+                        _ -> return None
+                    _ -> return None
+
+                if then_block.result.is_none() then return None
+
+                (clause, then_block.result.unwrap())
+            _ -> return None
+
+        out = out match
+            Some(sofar) -> Some(TExpr(sofar.span, TLogical("&&", sofar, cond)))
+            None -> Some(cond)
+        at = held
+end all_clauses
 
 // -- lowering a clause that may do nothing -------------------------------------------------------------
 

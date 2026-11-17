@@ -1052,8 +1052,9 @@ a [`@track_caller`](/reference/attributes/#track-caller-a-function-that-reports-
 function it names the caller's line, as a bounds check there does. So does a contract clause that
 does not hold, naming the clause and the message it was written with — `require failed: x must be
 non-negative (main.sysl:2:13)`, at the condition's line and column, or `ensure failed
-(main.sysl:2:12)` for a clause written without one; a struct's invariant names the struct and the
-write that broke it, `invariant of 'Window' failed (main.sysl:8:1)`. On a freestanding target the
+(main.sysl:2:12)` for a clause written without one; a struct's invariant names the struct, the
+clause that does not hold and where it is written, and the write that broke it, `invariant of
+'Window' failed: clause 'lo <= hi' at main.sysl:4:15 (main.sysl:8:1)`. On a freestanding target the
 report needs no allocator and no formatter: the text is a constant, and the trap follows.
 
 **The standard containers report through it too.** An index past a `Buf`'s, `Frozen`'s, `Deque`'s or
