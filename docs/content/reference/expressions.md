@@ -3043,6 +3043,49 @@ print(c.re, c.im)
 13.5 -18
 ```
 
+A literal is read at the implementation it selects, never at its `int` default first, so one too wide
+for `int` is the `long` or the `ulong` an implementation takes, and a literal's arithmetic chooses as
+the literal it comes to:
+
+```sysl
+struct Big
+    n: long
+
+impl Add[long, string] for Big
+    add(self, v: long) -> string = s"long ${self.n + v}"
+
+impl Add[ulong, string] for Big
+    add(self, v: ulong) -> string = s"ulong $v"
+
+val b = Big(1)
+
+print(b + 4567890123)
+print(b + 18446744073709551615)
+print(b + 60 * 52)
+```
+
+```output
+long 4567890124
+ulong 18446744073709551615
+long 3121
+```
+
+A literal no implementation's right-hand type holds is refused naming what is implemented:
+
+```sysl
+struct Big
+    n: long
+
+impl Add[long, string] for Big
+    add(self, v: long) -> string = "long"
+
+print(Big(1) + 36893488147419103232)
+```
+
+```error
+'+' on Big has no right-hand type this literal fits — it implements 'Add[long, string]'
+```
+
 Two implementations neither of which is the narrower leave the operand saying nothing about which is
 meant. On a 64-bit target `isize` and `i64` each widen to the other, so an `int` reaches both
 equally, and `s * n`, `s *= n` and `s.mul(n)` are all refused; an operand at either type exactly

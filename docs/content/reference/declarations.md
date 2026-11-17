@@ -2154,8 +2154,8 @@ different one are ambiguous, and saying so beats a ladder of precedences nobody 
 the source.
 
 **The one exception is a bare integer literal, which prefers the signed widening.** Where the
-candidates differ only at positions holding an integer literal with no suffix, negated or not, and
-none takes it at `int`, a candidate whose parameter there is a signed integer at least as wide as `int` beats an
+candidates differ only at positions holding an integer literal with no suffix, negated or not, or
+arithmetic over such literals (`60 * 52`, which is in the literal's tier), and none takes it at `int`, a candidate whose parameter there is a signed integer at least as wide as `int` beats an
 unsigned, a narrower signed or a float one, and among several the narrowest wins. Two unsigned
 candidates offer nothing signed and stay ambiguous. The rule is the same for a member several
 implementations of one trait answer, so `BigInt.from(3)` is its `From[long]`:
@@ -2166,11 +2166,13 @@ pick(x: u64) -> string = "u64"
 
 print(pick(3))
 print(pick(3u64))
+print(pick(60 * 52))
 ```
 
 ```output
 long
 u64
+long
 ```
 
 **Candidates tied only by bare literals take each literal at its default type.** Where every
@@ -2317,6 +2319,28 @@ print(s.f(1), s.f("abc"), s.f(3, 4), S.make(2).n)
 
 ```output
 11 3 12 2
+```
+
+**A literal, a literal's arithmetic and a measured `c type` choose between a type's own overloads as
+they choose between functions'**: `B.of(1234567890123)` reads the literal at whichever parameter
+holds it, preferring the signed one, and a `c type` over `unsigned long` is the `ulong` it was
+measured as.
+
+```sysl
+c type
+    Ulong = "unsigned long"
+
+struct B
+    n: int
+
+    of(v: long) -> string = "long"
+    of(v: ulong) -> string = "ulong"
+
+print(B.of(1234567890123), B.of(18446744073709551615), B.of(60 * 52), B.of(Ulong(5)))
+```
+
+```output
+long ulong long ulong
 ```
 
 **On a generic type the choice is made at the receiver's instantiation**, so a member taking `T`
