@@ -91,11 +91,14 @@ struct FlowWalk
     // may run past its own return (`keeps.sysl`'s `walk_kept_endless`). Otherwise such a loop ends
     // nothing, and what it holds is never held past a call whose frame outlasts it.
     endless: bool
+
+    // Every closure literal stored somewhere that a later overwrite took back (`note_taken_back`).
+    taken_back: Buf[KeptAt]
 end FlowWalk
 
 flow_walk(org: &Origins, stmt_events: &Fn(TStmt) -> Buf[FlowEv], expr_events: &Fn(TExpr) -> Buf[FlowEv],
           arm_events: &Fn(TExpr, TPattern, bool) -> Buf[FlowEv]) -> &FlowWalk =
-    FlowWalk(stmt_events, expr_events, arm_events, buf(), buf(), buf(), buf(), false, buf(), org, false)
+    FlowWalk(stmt_events, expr_events, arm_events, buf(), buf(), buf(), buf(), false, buf(), org, false, buf())
 
 // Walks a function's body from its entry to every way out.
 flow_body(w: &FlowWalk, body: TBlock)
@@ -224,7 +227,17 @@ clears_loc(clear: string, loc: string) -> bool
     loc == clear || loc.starts_with(clear + ".") || loc.starts_with(clear + "[")
 end clears_loc
 
-private apply_event(st: &PathState, ev: FlowEv)
+// **A closure literal a clear takes back was still kept**, and is remembered in `taken_back`: a
+// closure's capture mode is decided where it is handed over or stored (`closure_mode.sysl`), so a
+// keep a later statement takes back must not turn it into one holding its variables by reference.
+// Its box is another matter -- nothing reaches it after the frame, so the frame may hold it. A probe
+// names each closure it follows by its marker (`keeps.sysl`'s `closure_marker`), which no keep of
+// the rule's own holds.
+private holds_closure(k: KeptAt) -> bool = k.how.index_of("«").is_some()
+
+private note_taken_back(w: &FlowWalk, k: KeptAt) = if holds_closure(k) then add_kept(&w.taken_back, k)
+
+private apply_event(w: &FlowWalk, st: &PathState, ev: FlowEv)
     if st.dead then return
 
     if ev.clear && ev.loc.starts_with(">")
@@ -243,7 +256,7 @@ private apply_event(st: &PathState, ev: FlowEv)
         var kept: Buf[KeptAt] = buf()
 
         for p in st.pending
-            if !clears_loc(ev.loc, p.loc) then kept.push(p)
+            if clears_loc(ev.loc, p.loc) then note_taken_back(w, p) else kept.push(p)
 
         st.pending = kept
 
@@ -290,7 +303,7 @@ private flow_exit(w: &FlowWalk, st: &PathState)
     if st.dead then return
 
     for p in st.pending
-        if !covered_by(w.deferred_clears, p.loc) then add_kept(&w.out_pending, p)
+        if covered_by(w.deferred_clears, p.loc) then note_taken_back(w, p) else add_kept(&w.out_pending, p)
 
     for p in w.deferred_keeps
         add_kept(&w.out_pending, p)
@@ -386,22 +399,22 @@ end flow_stmt
 private flow_piece(w: &FlowWalk, evs: Buf[FlowEv], st: &PathState, jumps: &Jumps)
     if !jumps.exits && !jumps.loops
         for ev in evs
-            apply_event(st, ev)
+            apply_event(w, st, ev)
 
         return
     end if
 
     for ev in evs
-        if !ev.clear && !ev.loc.starts_with("j:") then apply_event(st, ev)
+        if !ev.clear && !ev.loc.starts_with("j:") then apply_event(w, st, ev)
 
     if jumps.exits then flow_exit(w, st)
     if jumps.loops then flow_jump_any(w, st)
 
     for ev in evs
-        if !ev.clear && ev.loc.starts_with("j:") then apply_event(st, ev)
+        if !ev.clear && ev.loc.starts_with("j:") then apply_event(w, st, ev)
 
     for ev in evs
-        if ev.clear then apply_event(st, ev)
+        if ev.clear then apply_event(w, st, ev)
 end flow_piece
 
 // What the ways through a pattern overwrite, on the way that matched it or the one that did not.
@@ -409,7 +422,7 @@ private flow_arm(w: &FlowWalk, subject: TExpr, patterns: Buf[TPattern], matched:
     if patterns.len() != 1 then return
 
     for ev in w.arm_events(subject, patterns[0], matched)
-        apply_event(st, ev)
+        apply_event(w, st, ev)
 end flow_arm
 
 // The ways an `if` whose condition is one `is` test splits by.
@@ -537,7 +550,7 @@ private in_bounds_clears(w: &FlowWalk, cond: Buf[TCondTerm], block: TBlock, take
 
     for c in taken.cleared
         if c.ends_with(s"[$key]") && !holds_string(skipped.cleared, c)
-            apply_event(skipped, cleared_ev(c, span_zero()))
+            apply_event(w, skipped, cleared_ev(c, span_zero()))
         end if
 end in_bounds_clears
 

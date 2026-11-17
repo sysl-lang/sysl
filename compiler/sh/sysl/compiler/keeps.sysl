@@ -3802,7 +3802,8 @@ end FrameTrack
 // **The entry file's statements are the one body passed over**: their frame is the program's, laid
 // down before anything else runs and given back only as the program ends, so nothing kept from it can
 // outlive it.
-private check_calls(cx: &KeepsCx, faults: &KeepFaults, f: TFunc) = frame_walk(cx, faults, f, false)
+private check_calls(cx: &KeepsCx, faults: &KeepFaults, f: TFunc)
+    frame_walk(cx, faults, f, false)
 
 // Where each closure literal a body builds may be reached after the frame, or a block, it was built
 // in: the closures whose value the rule would refuse to let out if each held the address of the
@@ -3817,28 +3818,39 @@ private check_calls(cx: &KeepsCx, faults: &KeepFaults, f: TFunc) = frame_walk(cx
 //
 // **Each closure comes back with the reason it escapes**, in words that follow "since": what a probe
 // gathers is the closures it followed, each by its marker, and then the reason (`probe_why`).
-probe_frame(cx: &KeepsCx, f: TFunc) -> Buf[(string, string)]
+//
+// **What a later overwrite took back comes back apart**, the second list: the closure was still
+// stored where something else may run it, so it holds its captures by value
+// (`closure_mode.sysl`), but nothing reaches its box after the frame, which may hold it.
+probe_frame(cx: &KeepsCx, f: TFunc) -> (Buf[(string, string)], Buf[(string, string)])
     val faults: &KeepFaults = KeepFaults(buf())
-
-    frame_walk(cx, faults, f, true)
-
+    val taken = frame_walk(cx, faults, f, true)
     var out: Buf[(string, string)] = buf()
 
     for item in faults.items
-        val why = probe_reason(item.2)
+        probe_gather(&out, item.2)
 
-        for base in closure_markers_in(item.2)
-            var again = false
+    var back: Buf[(string, string)] = buf()
 
-            for o in out
-                if o.0 == base then again = true
+    for item in taken
+        probe_gather(&back, item.how)
 
-            if !again then out.push((base, why))
-        end for
-    end for
-
-    out
+    (out, back)
 end probe_frame
+
+// Each closure a probe's text names, once, with the reason it gives.
+private probe_gather(out: *Buf[(string, string)], text: string)
+    val why = probe_reason(text)
+
+    for base in closure_markers_in(text)
+        var again = false
+
+        for o in *out
+            if o.0 == base then again = true
+
+        if !again then out.push((base, why))
+    end for
+end probe_gather
 
 // How a probe names a closure literal in what it gathers: brackets no identifier can hold.
 closure_marker(base: string) -> string = s"«$base»"
@@ -3875,8 +3887,9 @@ closure_markers_in(text: string) -> Buf[string]
     end loop
 end closure_markers_in
 
-private frame_walk(cx: &KeepsCx, faults: &KeepFaults, f: TFunc, probe: bool)
-    if !probe && module_bare(f.name) == "entry file" then return
+// Answers every closure literal a probe found stored somewhere a later overwrite took back.
+private frame_walk(cx: &KeepsCx, faults: &KeepFaults, f: TFunc, probe: bool) -> Buf[KeptAt]
+    if !probe && module_bare(f.name) == "entry file" then return buf()
 
     val org = origins_of(cx, f)
     val ft: &FrameTrack = FrameTrack(cx, faults, func_home(cx.an, f.name), shown_name(cx.an, f.name),
@@ -3926,13 +3939,15 @@ private frame_walk(cx: &KeepsCx, faults: &KeepFaults, f: TFunc, probe: bool)
     // **Only an answer that can hold an address hands one back**: a body whose last expression is a
     // call answering a pointer, in a function that answers nothing, throws the pointer away. An
     // address answered as an integer is a number.
-    if !may_hold_pointer(cx, f.ret_ty) then return
+    if may_hold_pointer(cx, f.ret_ty)
+        walk_block_stmts(f.body, stmt_walk(false, s -> s match
+            TReturn(v) -> if v.is_some() then returned_frame(ft, v.unwrap())
+            _ -> ()))
 
-    walk_block_stmts(f.body, stmt_walk(false, s -> s match
-        TReturn(v) -> if v.is_some() then returned_frame(ft, v.unwrap())
-        _ -> ()))
+        if f.body.result.is_some() then returned_frame(ft, f.body.result.unwrap())
+    end if
 
-    if f.body.result.is_some() then returned_frame(ft, f.body.result.unwrap())
+    w.taken_back
 end frame_walk
 
 // **A pointer handed back is lent for as long as what it was made of**, so a function may not hand
