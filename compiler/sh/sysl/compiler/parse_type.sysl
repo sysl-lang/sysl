@@ -68,7 +68,7 @@ parse_core_type(p: *Parser) -> TypeRef
         p.bump()
         p.bump()
 
-        val params = parse_type_list(p, ")")
+        val params = parse_fn_param_types(p)
 
         p.expect_kw(")")
 
@@ -218,7 +218,7 @@ private parse_pointer_type(p: *Parser, start: Span) -> TypeRef
 
     p.bump()
 
-    val params = parse_type_list(p, ")")
+    val params = parse_fn_param_types(p)
 
     p.expect_kw(")")
 
@@ -503,6 +503,43 @@ parse_type_list(p: *Parser, close: string) -> Buf[TypeRef]
 
     out
 end parse_type_list
+
+private at_param_name(t: Tok) -> bool = t match
+    Ident(_) -> true
+    QuotedIdent(_) -> true
+    _ -> false
+
+// The parameter list of `Fn(...)` and `*extern(...)`, up to (but not taking) the `)`. Each parameter
+// may carry a name -- `Fn(x: int) -> int`, `*extern(ud: *u8, len: usize) -> int` -- which documents
+// it and is dropped here: a function type's identity is its parameter types, so `*extern(a: i32)`,
+// `*extern(b: i32)` and `*extern(i32)` are one type. Named and unnamed parameters may be mixed, as
+// Rust's function-pointer types allow; a name written twice is refused.
+private parse_fn_param_types(p: *Parser) -> Buf[TypeRef]
+    var out: Buf[TypeRef] = buf()
+    var seen: Buf[string] = buf()
+
+    if p.at_kw(")") then return out
+
+    loop
+        if p.kw_at(1, ":") && at_param_name(p.peek())
+            val at = p.here()
+            val name = parse_bound_name(p)
+
+            p.bump()
+
+            for s in seen
+                if s == name then p.fault(at, s"the parameter name '${name}' is written twice in this function type")
+
+            seen.push(name)
+        end if
+
+        out.push(parse_type(p))
+
+        if !p.accept_kw(",") then break
+        if p.at_kw(")") then break
+
+    out
+end parse_fn_param_types
 
 // A trait named as a bound: `Display`, `Add[int]`.
 parse_bound_ref(p: *Parser) -> BoundRef

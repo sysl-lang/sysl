@@ -2147,7 +2147,9 @@ print(max(a, b))
 **Between overloads, an exact match beats any widening, and among widenings the narrowest wins** —
 the candidate each of whose parameters converts to the other's. Where neither is narrower at every
 position, the call is ambiguous — except where the candidates are tied only by bare literals, which
-then take their default types ([Overloading](/reference/declarations/#overloading)).
+then take their default types, or are tied only by bare literals beside typed arguments that one
+candidate takes exactly, which then read the literals at that candidate's parameter types
+([Overloading](/reference/declarations/#overloading)).
 
 ```sysl
 f(x: int) -> string = "int"
@@ -2397,6 +2399,11 @@ print(make()())
 `&Fn(int) -> int` holds a closure behind a reference, a box — built in the frame where nothing keeps
 the closure past it, and on the heap otherwise (below). A reading closure in a `val` is how
 freestanding code binds a closure to an immutable name without asking that question.
+
+**A parameter of a function type may be named**: `&Fn(x: int, y: int) -> int`. The names document
+the type and are ignored by it, so `&Fn(x: int) -> int` and `&Fn(int) -> int` are one type. Named
+and unnamed parameters may be mixed, and a name written twice in one type is refused. (The bare
+arrow `(int, int) -> int` takes no names; write `Fn(x: int, y: int) -> int` for that.)
 
 ### A closure handed on as a `&Fn` is boxed in the frame
 

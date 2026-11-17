@@ -1327,6 +1327,15 @@ private convert_lanes(cx: &Analyzer, span: Span, t: TExpr, to: Type) -> TExpr
         Vector(m, b) -> Some((m, *b))
         _ -> None
 
+    // A scalar of the lane's own type is the splat the language writes implicitly at a binding or an
+    // operator, here said outright: `<4>f32(x)` with `x: f32` is `x` in every lane. Any other scalar
+    // has no lane to be, as it has none at a binding either.
+    if source.is_none() && target.is_some()
+        val lane = target.unwrap().1
+
+        if can_be_lane(lane) && !is_vector(repr(got)) && type_eq(repr(got), repr(lane))
+            return TExpr(span, TSplat(t, to))
+
     if source.is_none() || target.is_none() then return cx.err(span, refusal(None, got, to))
 
     val (n, a, lanes) = source.unwrap()
@@ -3367,6 +3376,10 @@ narrowed_at(declared: Buf[usize], generic: Buf[bool], fitted: Buf[Buf[Type]], ar
         val defaulted = literal_default_preference(fitted, ranked, args)
 
         if defaulted.len() == 1 then return defaulted
+
+        val following = literal_follows_typed(fitted, ranked, args, natural)
+
+        if following.len() == 1 then return following
     end if
 
     var pool: Buf[usize] = buf()
@@ -3515,6 +3528,40 @@ private literal_default_preference(fitted: Buf[Buf[Type]], ranked: Buf[usize], a
 
     winners
 end literal_default_preference
+
+// **A bare literal beside a typed argument takes the type of the candidate that argument matches.**
+// Where every argument with a type of its own is exactly the parameter of one candidate, and every
+// other argument is a numeric literal with no suffix, that candidate wins and the literals are read
+// at its parameters: `nextafter(x, 100.0)` at an `f32` `x` is the `f32` one, as `x * 100.0` is at
+// `f32`. A typed argument that no candidate takes exactly stays ambiguous, and so do two candidates
+// that both match every typed argument. Empty where the rule does not apply.
+private literal_follows_typed(fitted: Buf[Buf[Type]], ranked: Buf[usize], args: Buf[Expr],
+                              natural: Buf[Option[Type]]) -> Buf[usize]
+    var winners: Buf[usize] = buf()
+    var typed = 0
+    var literals = 0
+
+    for j in 0..<args.len()
+        if literal_default(args[j]).is_some() then literals += 1 else typed += 1
+
+    if typed == 0 || literals == 0 || natural.len() != args.len() then return winners
+
+    for r in 0..<ranked.len()
+        val here = fitted[ranked[r]]
+        var all = here.len() == args.len()
+
+        for j in 0..<args.len()
+            if !all then break
+            if literal_default(args[j]).is_some() then continue
+
+            natural[j] match
+                Some(t) -> if !type_eq(here[j], t) then all = false
+                None -> all = false
+
+        if all then winners.push(ranked[r])
+
+    winners
+end literal_follows_typed
 
 // The type a bare numeric literal defaults to at a parameter: `real` for a float literal, and for
 // an integer literal `real` at a float parameter and `int` anywhere else.
