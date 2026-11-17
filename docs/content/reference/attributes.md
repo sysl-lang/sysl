@@ -3551,6 +3551,103 @@ operations are refused there. On a vector, lane-wise operations are strict, but 
 `v.sum()`, `v.min()` — combines the lanes in an order the target chooses and has no strict form, so
 inside a strict body it is refused, and the lanes are read and combined one by one instead.
 
+## `@reassociate` — float sums the back end may regroup
+
+**A float `+`, `-` or `*` is computed in the order it is written**, and floating-point addition is
+not associative, so a loop adding into one accumulator is a chain of dependent additions that the
+optimizer may not reorder. It stays scalar, one addition waiting for the one before, however many
+lanes the machine's vector registers have.
+
+`@reassociate` on a function or a method gives that order up for every float `+`, `-` and `*` written
+in its body: the back end may regroup them, so a sum is split over several accumulators — lanes of a
+vector register — that are added together at the end. **The result may differ from the written
+order's in the last bits**, and that is the whole of what changes:
+
+```sysl
+@reassociate
+total(xs: []const real) -> real
+    var t = 0.0
+
+    for x in xs do t = t + x
+
+    t
+
+var xs = [0.5, 1.25, 2.0, 4.25]
+
+print(total(xs))
+```
+
+```output
+8
+```
+
+Every partial sum there is exact, so any grouping gives 8. Nothing else is relaxed: NaNs,
+infinities and signed zeros mean what they always do, `/` is untouched, integers are associative
+already, and a product meets a sum as one fused multiply-add exactly where it would
+[anyway](/reference/expressions/#a-multiply-feeding-an-add-is-fused-where-the-machine-fuses) — though
+one the back end may also keep as two operations, which is how a reduction of products vectorizes.
+[`sysl.slices`](/library/slices/#adding-a-slice-up)' `sum` and `dot` are `@reassociate` functions.
+
+**Written on a line of its own above an indented block, it marks the block instead**, and only what
+is written inside it is regrouped:
+
+```sysl
+var xs = [0.5, 1.25, 2.0, 4.25]
+var total = 0.0
+
+@reassociate
+    for x in xs do total = total + x
+
+print(total * 2.0)
+```
+
+```output
+16
+```
+
+The multiply after the block keeps its written order, as everything outside does.
+
+### What it covers
+
+The region is **lexical**: the operations written in the function or the block, and in any closure
+or nested function written inside it. A function *called* from inside but written elsewhere keeps
+its own order, inlined or not.
+
+**A value worked out while compiling is the written order's.** A `const`, a module `val` laid down
+as data and a `const` function's result are each computed left to right, as everywhere, so a
+`@reassociate` `const` function folds to the same value it would unmarked, and the same call made
+while the program runs may differ from it in the last bits.
+
+It takes no argument, and it marks a function, a method or a block — nothing else:
+
+```sysl
+@reassociate
+struct P
+    x: real
+```
+
+```error
+'@reassociate' lets the back end regroup the float sums and products written in a body, so it marks a function, a method, or — on a line of its own — the block indented under it
+```
+
+A closure takes no annotations; it is regrouped when it is written inside a marked function or
+block.
+
+**It contradicts [`@strict_fp`](#strict-fp-floating-point-that-follows-the-environment-it-runs-in)**,
+which keeps every operation where and how it is written, so the two above one function are refused,
+and so is a `@reassociate` block inside a strict body. A strict function written inside a
+`@reassociate` one keeps its own promise:
+
+```sysl
+@reassociate
+@strict_fp
+twice(x: f32) -> f32 = x + x
+```
+
+```error
+'@strict_fp' keeps every floating-point operation exactly where and how it is written, and '@reassociate' lets the back end regroup them
+```
+
 ## `@unchecked` — a block whose subscripts are not bounds-checked
 
 `@unchecked` is the one annotation that marks a **block** rather than a declaration: written on a

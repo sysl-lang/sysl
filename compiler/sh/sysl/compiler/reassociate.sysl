@@ -1,0 +1,157 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.container.Set
+
+// `@reassociate`: float sums and products the back end may regroup
+// (`reference/attributes.md § @reassociate`).
+//
+// **A float `+`, `-` or `*` is exact by default**: it is computed in the order it is written, so a
+// loop that adds into one accumulator is a chain the optimizer may not reorder, and a reduction stays
+// scalar. `@reassociate` above a function or a member, or on a line of its own above an indented
+// block, gives that order up for the operations **written** there: each is emitted with LLVM's
+// `reassoc` flag, which lets the vectorizer split a sum over several accumulators and the back end
+// rebalance a chain. Nothing else is relaxed -- no `nnan`, `ninf`, `nsz` or `arcp`, so NaNs,
+// infinities and signed zeros mean what they always do -- and no new contraction is licensed: a
+// product meets a sum as one fused operation exactly where it would anyway (`fp_contract.sysl`),
+// though as `llvm.fmuladd` rather than `llvm.fma`, the one form a reduction is vectorized through.
+//
+// **The region is lexical, and it is a stretch of source**: the function's span, or the block's,
+// in its file. An operation is regrouped where its own expression lies inside one, so a closure or a
+// nested function written inside is inside, and a function called from inside but written elsewhere
+// is not -- inlined or not, since the flag sits on each instruction and travels with it. Its
+// recorded spans reach codegen (`reassoc_regions`), and the lowering asks of each float operation
+// (`reassoc_at`).
+//
+// **Compile-time evaluation is unchanged.** A `const`, a module `val` laid down as data and a `const`
+// function's result are computed in the written order, as everywhere: the order the back end would
+// choose is not one the compiler can know, so the folded value is the left-to-right one, and the same
+// call made while the program runs may differ from it in the last bits -- which is what the
+// annotation says it may do.
+//
+// **It contradicts `@strict_fp`**, which keeps every operation where and how it is written: the two
+// above one function are refused, and so is a block inside a strict body. A strict function written
+// inside a `@reassociate` one keeps its own promise, the stronger of the two.
+
+// The form a `@reassociate` block is parsed into: a call no program can spell, its one argument the
+// block.
+const ReassociateBlock: string = "reassociate block"
+
+// -- parsing ------------------------------------------------------------------------------------------
+
+// `@reassociate` and the block indented under it. The `@` is the cursor, and the block is known to
+// follow (`parse_at_stmt`).
+parse_reassociate_block(p: *Parser, start: Span) -> Stmt
+    p.bump()
+    p.bump()
+
+    val body = parse_suite(p)
+    // The block's extent is what decides which operations are regrouped, so it runs to the end of
+    // its last statement -- the token taken last is the dedent, which carries no extent of its own.
+    val span = if body.is_empty() then start else start.to(body[body.len() - 1].span)
+    var one: Buf[Expr] = buf()
+
+    one.push(expr(span, Block(body)))
+    stmt(span, ExprStmt(expr(span, Call(expr(start, Ident(ReassociateBlock)), one))))
+end parse_reassociate_block
+
+// The refusal for `@reassociate` above anything that has no body of sysl.
+reassociate_not_a_body() -> string =
+    "'@reassociate' lets the back end regroup the float sums and products written in a body, so it " +
+    "marks a function, a method, or — on a line of its own — the block indented under it, and this " +
+    "is none of them. An 'extern''s operations are compiled by whoever compiled it"
+
+reassociate_beside_strict() -> string =
+    "'@strict_fp' keeps every floating-point operation exactly where and how it is written, and " +
+    "'@reassociate' lets the back end regroup them, so the two cannot both hold — mark the body with " +
+    "the one it means"
+
+// Whether a call's head is the form a `@reassociate` block was parsed into.
+is_reassociate_block(head: Expr) -> bool = *head.kind match
+    Ident(n) -> n == ReassociateBlock
+    _ -> false
+
+// -- reading ------------------------------------------------------------------------------------------
+
+// The block, read as a block written bare would be, and recorded by file and span.
+reassociate_block_form(cx: &Analyzer, span: Span, args: Buf[Expr], expected: Option[Type]) -> TExpr
+    if args.len() != 1 then return cx.err(span, reassociate_not_a_body())
+
+    // The block's own extent, which the parser gave the argument; the form's is the annotation's.
+    cx.an.tables.reassoc_blocks.push((cx.scope.src.name, args[0].span))
+    cx.tail_carry = cx.unit_tail
+    type_expr(cx, args[0], expected)
+end reassociate_block_form
+
+// A `@reassociate` block inside a `@strict_fp` body, refused at the block: the strict promise covers
+// every operation the body holds.
+refuse_reassociate_in_strict(a: &Analysis, funcs: Buf[TFunc], strict: Set[string])
+    if a.tables.reassoc_blocks.is_empty() then return
+
+    for f in funcs
+        if !strict.has(f.name) || f.src.is_none() then continue
+
+        for block in a.tables.reassoc_blocks
+            if block.0 == f.src.unwrap().name && encloses_span(f.span, block.1)
+                a.fault(func_home(a, f.name), block.1, "a '@reassociate' block lets the back end regroup its float sums and products, and this one is inside a '@strict_fp' body, which keeps every one of them exactly where and how it is written — move the block out of the strict function, or drop one of the two")
+                return
+end refuse_reassociate_in_strict
+
+// -- lowering -----------------------------------------------------------------------------------------
+
+// Every stretch of source whose float operations may be regrouped: each block, and each function
+// marked `@reassociate` -- every lowered copy of one has its declaration's span and file.
+reassoc_regions(p: TProgram) -> Buf[(string, Span)]
+    var out: Buf[(string, Span)] = buf()
+
+    for item in p.reassoc_blocks do out.push(item)
+
+    for f in p.funcs
+        if f.marks.reassociate && f.src.is_some() then out.push((f.src.unwrap().name, f.span))
+
+    out
+end reassoc_regions
+
+// The regions that touch a body written in `src` over `span` -- every one in that file where the
+// body has no span of its own, as the entry file's statements have none.
+reassoc_within(all: Buf[(string, Span)], src: Option[Source], span: Option[Span]) -> Buf[Span]
+    var out: Buf[Span] = buf()
+
+    if src.is_none() then return out
+
+    val file = src.unwrap().name
+
+    for region in all
+        if region.0 != file then continue
+
+        val at = region.1
+
+        span match
+            Some(s) -> if at.start < s.end && s.start < at.end then out.push(at)
+            None -> out.push(at)
+
+    out
+end reassoc_within
+
+// The regions a function's body is lowered under -- none in a strict body, which keeps its own
+// promise, and every region of its file that touches it -- and whether the whole body is regrouped,
+// which a function marked itself is, whichever copy of it is being lowered.
+enter_reassoc(e: *Emit, f: TFunc)
+    val strict = e.strict_fns.has(f.name)
+
+    e.reassoc_whole = !strict && f.marks.reassociate
+    e.reassoc_here = if strict then buf() else reassoc_within(e.reassoc_all, f.src, Some(f.span))
+end enter_reassoc
+
+// Whether an operation written at `at` in the body being lowered may be regrouped.
+reassoc_at(e: *Emit, at: Span) -> bool
+    if e.reassoc_whole then return true
+
+    for region in e.reassoc_here
+        if encloses_span(region, at) then return true
+
+    false
+end reassoc_at
+
+private encloses_span(outer: Span, inner: Span) -> bool = outer.start <= inner.start && inner.end <= outer.end
