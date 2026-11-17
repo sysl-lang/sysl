@@ -1,0 +1,125 @@
+module sh.sysl.compiler
+@tests
+
+// **A box's pad is every byte between its header and its payload** (`emit_arc.sysl`'s `box_pad`): the
+// header's words plus the pad ARE the payload's offset, on every target, never a sum LLVM's struct
+// layout silently adds to. Before, the pad was laid only for a raised `@align(n)` or a boundary past
+// the heap's, and LLVM filled the natural gaps itself -- a `u128` behind a count landed at 16 while
+// the sum said 8. Every access went through a GEP, so nothing misread; the pad now says the offset
+// outright, so a hand-summed one (`into_raw`'s step back, a header read) cannot disagree with it.
+//
+// The axes: the header (compact, full because a `weak` is taken), the payload's boundary (`u128`,
+// `i256`, an enum carrying a `u128`, a struct with no gap, a raised `@align`), where the box lives (the
+// heap, a module `val`'s static image, a buffer's header), and the word (64-bit, 32-bit Arm). Each
+// heap cell also runs: the payload's address on its boundary, the value read back, a round trip
+// through `into_raw`/`from_raw` on the counted heap.
+//
+// Skipped cells, and why: a frame box (`gen_frame_box`) lays the same named box type, so its layout is
+// the heap cell's; a payload past the heap's boundary already had its pad (`tests_aah_aligned_alloc`).
+
+private bxp_lowered_for(text: string, target_name: string) -> string
+    val t = target_named(target_name).unwrap()
+    val done = typed_of_target(text, t)
+
+    if !done.reported.is_empty() then return done.reported[0].diag.message
+
+    val p = strip_tests(program_of(done, done.main_module))
+
+    ir_print_module(codegen_with_gaps(p, t, check_escapes(done.an, p)).0)
+end bxp_lowered_for
+
+private bxp_wide() -> string = "struct W\n    x: u128\n\n"
+
+@test("a u128 behind a compact box's count is padded to sixteen, and round trips")
+bxp_u128_compact()
+    if !enm_ready() then return
+
+    val src = "import sysl.raw.from_raw\n\n" + bxp_wide() +
+        "main()\n    val b: &W = W(1u128 << 100)\n    val p = b.into_raw()\n" +
+        "    print(usize(p) % 16, p.x == 1u128 << 100)\n    val c: &W = from_raw(p)\n    print(c.x == 1u128 << 100)\n"
+    val ir = enm_ir(src)
+
+    assert(enm_says(ir, "%arc.W = type { i64, [8 x i8], %struct.W }"), ir)
+    assert_eq(enm_ran(src), "0 true\ntrue\n")
+
+@test("a u128 behind a full header of three words is padded to thirty-two, and round trips")
+bxp_u128_full()
+    if !enm_ready() then return
+
+    val src = "import sysl.raw.from_raw\n\n" + bxp_wide() + "var keep: weak W = None\n\n" +
+        "main()\n    val b: &W = W(5)\n    keep = b\n    val p = b.into_raw()\n" +
+        "    print(usize(p) % 16, p.x)\n    val c: &W = from_raw(p)\n    print(c.x, keep.get().is_some())\n"
+    val ir = enm_ir(src)
+
+    assert(enm_says(ir, "%arc.W = type { i64, ptr, i64, [8 x i8], %struct.W }"), ir)
+    assert_eq(enm_ran(src), "0 5\n5 true\n")
+
+@test("an i256 payload sits on its sixteen past a compact count")
+bxp_i256_compact()
+    if !enm_ready() then return
+
+    val src = "struct V\n    x: i256\n    y: u8\n\nmain()\n    val b: &V = V(-5, 9)\n" +
+        "    print(usize(&*b) % 16, b.x, b.y)\n"
+    val ir = enm_ir(src)
+
+    assert(enm_says(ir, "%arc.V = type { i64, [8 x i8], %struct.V }"), ir)
+    assert_eq(enm_ran(src), "0 -5 9\n")
+
+@test("an enum carrying a u128 is padded past a compact count to its region's boundary")
+bxp_enum_carrying_u128()
+    if !enm_ready() then return
+
+    val src = "enum C\n    A(v: u128)\n    B(n: int)\n\nmain()\n    val b: &C = C.A(1u128 << 70)\n" +
+        "    print(usize(&*b) % 16)\n    *b match\n        A(v) -> print(v == 1u128 << 70)\n" +
+        "        B(n) -> print(n)\n"
+    val ir = enm_ir(src)
+
+    assert(enm_says(ir, "%arc.C = type { i64, [8 x i8], %enum.C }"), ir)
+    assert_eq(enm_ran(src), "0\ntrue\n")
+
+@test("a payload already on its boundary after the header gets no pad")
+bxp_no_gap_no_pad()
+    if !enm_ready() then return
+
+    val src = "struct P\n    x: u64\n\nstruct Q\n    x: u128\n\nvar keep: weak P = None\n\n" +
+        "main()\n    val p: &P = P(1)\n    keep = p\n    val qs: []Q = [Q(2), Q(3)]\n    print(p.x, qs[1].x)\n"
+    val ir = enm_ir(src)
+
+    assert(enm_says(ir, "%arc.P = type { i64, ptr, i64, %struct.P }"), ir)
+    // A buffer's header is four words, already a multiple of sixteen.
+    assert(enm_says(ir, "%arc.buf.Q = type { i64, ptr, i64, i64, [0 x %struct.Q] }"), ir)
+    assert_eq(enm_ran(src), "1 3\n")
+
+@test("a module val's static box lays the same pad as a heap box of its type")
+bxp_static_box()
+    if !enm_ready() then return
+
+    val src = bxp_wide() + "val w: &W = W(7)\n\nmain()\n    print(usize(&*w) % 16, w.x)\n"
+    val ir = enm_ir(src)
+
+    assert(enm_says(ir, "%arc.W = type { i64, [8 x i8], %struct.W }"), ir)
+    assert(enm_says(ir, "[8 x i8] zeroinitializer, %struct.W { i128 7 } }"), ir)
+    assert_eq(enm_ran(src), "0 7\n")
+
+@test("a raised @align payload keeps the pad it always had")
+bxp_raised_unchanged()
+    if !enm_ready() then return
+
+    val src = "@align(64)\nstruct B\n    a: u8\n    b: u128\n\nmain()\n    val b: &B = B(3, 4)\n" +
+        "    print(usize(&*b) % 64, b.a, b.b)\n"
+    val ir = enm_ir(src)
+
+    // Past the heap's boundary, so never compact: the three words, then forty bytes to 64.
+    assert(enm_says(ir, "%arc.B = type { i64, ptr, i64, [40 x i8], %struct.B }"), ir)
+    assert_eq(enm_ran(src), "0 3 4\n")
+
+// On a 32-bit word the count is four bytes and a `u64` asks for eight: the pad says the four bytes
+// LLVM's `i64:64` would otherwise have put there unasked.
+@test("on a 32-bit Arm a u64 behind a compact count and behind a full header is padded to eight")
+bxp_thumb_u64()
+    val ir = bxp_lowered_for("struct E\n    x: u64\n\nstruct F\n    x: u64\n\n" +
+        "keep(n: u64) -> u64\n    val e: &E = E(n)\n    val f: &F = F(n)\n" +
+        "    val w: weak F = f\n    e.x + f.x\n", "thumb-freestanding")
+
+    assert(ir.contains("%arc.E = type { i32, [4 x i8], %struct.E }"), ir)
+    assert(ir.contains("%arc.F = type { i32, ptr, i32, [4 x i8], %struct.F }"), ir)
