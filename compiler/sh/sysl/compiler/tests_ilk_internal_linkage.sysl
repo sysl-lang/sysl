@@ -135,7 +135,7 @@ private ilk_program_files() -> Buf[(string, string)]
         var ps: Buf[P] = buf()
 
         ps.push(P(4))
-        print(walk(2), m.step(3), ps[0].read(), same(9), apply(n -> n + 1), twice(4), soft(1))
+        for _ in 0..<1 do print(walk(2), m.step(3), ps[0].read(), same(9), apply(n -> n + 1), twice(4), soft(1))
         """))
     files.push(("m/m.sysl", "module m\n\nstep(n: int) -> int = n - 1\n"))
     files
@@ -232,7 +232,7 @@ ilk_section_and_asm_stay_external()
                 "b _named$$sysl"
             [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "an arm64 probe"
 
-        print(placed(1), named(1), plain(1))
+        for _ in 0..<1 do print(placed(1), named(1), plain(1))
         """)], true)
 
     assert(ilk_define(text, "placed$$sysl").starts_with("define i"), ilk_define(text, "placed$$sysl"))
@@ -347,7 +347,8 @@ ilk_a_library_half()
 
 // -- codegen units -----------------------------------------------------------------------------------
 
-// Eight functions large enough not to be copied (`CopyCost`), each called once from the entry.
+// Eight functions large enough not to be copied (`CopyCost`), each called from a loop of the entry, so
+// each is sealed.
 private ilk_large_program() -> string
     var text = ""
 
@@ -359,10 +360,10 @@ private ilk_large_program() -> string
 
         text = text + "    t\n\n"
 
-    text = text + "var sum = 0\n"
+    text = text + "var sum = 0\n\nfor _ in 0..<1\n"
 
     for i in 0..<8
-        text = text + s"sum += big$i($i)\n"
+        text = text + s"    sum += big$i($i)\n"
 
     text + "print(sum)\n"
 end ilk_large_program
@@ -522,3 +523,188 @@ ilk_a_profile_names_it_once()
     assert(merged.status.ok(), merged.text)
     assert_eq(named.len(), 1, shown)
     assert(named[0].starts_with("sysl;"), shown)
+
+// -- what runs once ----------------------------------------------------------------------------------
+//
+// A function that runs at most once keeps the linkage it was written with (`seal_linkage.sysl`'s
+// `run_once`), so LLVM does not fold a hot loop into a `main` that goes on to format its results
+// (fannkuchredux: fifteen shuffle masks spilled and reloaded on every flip). Crossed: where the call
+// sits in the entry (straight line, a `for`, a `while`, a `loop` it breaks out of, after a loop, in a
+// branch, in a branch inside a loop), how often (once, twice outside loops, once outside and once
+// inside), down a chain (what a once-run function calls once, and what a looped one calls), a
+// function also taken as a value, the root-file entry and `main()`, and one unit against four.
+// Skipped, with the reason: an entry other than `main` and a test binary have no `$$main`, so nothing
+// there runs once (`ilk_a_bare_metal_image` and `ilk_a_test_binary` still find their functions
+// sealed); a closure is reached through its address, never a direct call, so it stays sealed.
+
+private ilk_where_files() -> Buf[(string, string)]
+    var files: Buf[(string, string)] = buf()
+
+    files.push(("main.sysl", raw"""
+        once(n: int) -> int = n + 1
+        twice(n: int) -> int = n + 2
+        in_for(n: int) -> int = n + 3
+        in_while(n: int) -> int = n + 4
+        in_loop(n: int) -> int = n + 5
+        after(n: int) -> int = n + 6
+        branch(n: int) -> int = n + 7
+        mixed(n: int) -> int = n + 8
+        in_nested(n: int) -> int = n + 9
+
+        main()
+            var t = once(0) + twice(0) + twice(1)
+
+            for i in 0..<2 do t += in_for(i)
+
+            var k = 0
+
+            while k < 2
+                t += in_while(k)
+                k += 1
+
+            loop
+                t += in_loop(t)
+
+                if t > 0 then break
+
+            t += after(t)
+
+            if t > 3 then t += branch(t)
+
+            t += mixed(1)
+
+            for i in 0..<2
+                if i == 1 then t += mixed(i) + in_nested(i)
+
+            print(t)
+        """))
+    files
+end ilk_where_files
+
+private val ilk_where: Buf[(string, string)] = ilk_where_files()
+
+@test("a function main calls only outside every loop keeps its linkage; one it calls from a loop is sealed")
+ilk_once_keeps_its_linkage()
+    if !ilk_ready() then return
+
+    val text = ilk_text(ilk_where.view(), true)
+
+    for name in ["once", "twice", "after", "branch"]
+        val line = ilk_define(text, name + "$$sysl")
+
+        assert(line.starts_with("define i") && !line.contains("sysl-sealed"), line)
+
+    for name in ["in_for", "in_while", "in_loop", "mixed", "in_nested"]
+        assert(ilk_internal(text, name + "$$sysl"), ilk_define(text, name + "$$sysl"))
+
+    assert(ilk_internal(text, "$$main"), ilk_define(text, "$$main"))
+
+@test("and the program prints the same under one unit and four")
+ilk_once_runs()
+    if !ilk_ready() then return
+
+    assert_eq(ilk_ran(ilk_where.view()), "243\n")
+    ilk_units("4")
+
+    val four = ilk_ran(ilk_where.view())
+
+    ilk_units_default()
+    assert_eq(four, "243\n")
+
+@test("what a once-run function calls once runs once too; what a looped one calls stays sealed")
+ilk_once_down_a_chain()
+    if !ilk_ready() then return
+
+    val files = [("main.sysl", raw"""
+        inner(n: int) -> int = n * 2
+        hot(n: int) -> int = n + 1
+        leaf(n: int) -> int = n - 1
+        step(n: int) -> int = leaf(n) + 1
+
+        run(n: int) -> int
+            var t = inner(n)
+
+            for i in 0..<n do t += hot(i)
+
+            t
+
+        main()
+            var t = run(3)
+
+            for i in 0..<2 do t += step(i)
+
+            print(t)
+        """)]
+    val text = ilk_text(files, true)
+
+    assert(ilk_define(text, "run$$sysl").starts_with("define i"), ilk_define(text, "run$$sysl"))
+    assert(ilk_define(text, "inner$$sysl").starts_with("define i"), ilk_define(text, "inner$$sysl"))
+    assert(ilk_internal(text, "hot$$sysl"), ilk_define(text, "hot$$sysl"))
+    assert(ilk_internal(text, "step$$sysl"), ilk_define(text, "step$$sysl"))
+    assert(ilk_internal(text, "leaf$$sysl"), ilk_define(text, "leaf$$sysl"))
+    assert_eq(ilk_ran(files), "13\n")
+
+@test("a function called once and also passed as a value keeps its linkage and is still called through it")
+ilk_once_and_a_value()
+    if !ilk_ready() then return
+
+    val files = [("main.sysl", raw"""
+        seen(n: int) -> int = n + 1
+
+        apply(f: (int) -> int, n: int) -> int = f(n)
+
+        main()
+            var t = seen(1)
+
+            for _ in 0..<3 do t = apply(seen, t)
+
+            print(t)
+        """)]
+    val text = ilk_text(files, true)
+
+    assert(ilk_define(text, "seen$$sysl").starts_with("define i"), ilk_define(text, "seen$$sysl"))
+    assert_eq(ilk_ran(files), "5\n")
+
+@test("a root file's statements are the entry as main() is: what they call once keeps its linkage")
+ilk_once_from_root_statements()
+    if !ilk_ready() then return
+
+    val text = ilk_text([("main.sysl", "walk(n: int) -> int = n * 3\n\nprint(walk(2))\n")], true)
+
+    assert(ilk_define(text, "walk$$sysl").starts_with("define i"), ilk_define(text, "walk$$sysl"))
+
+// The shape that was slower sealed: a kernel of loops `main` calls once and then formats the result of.
+private val ilk_kernel: string = raw"""
+    kernel(n: usize) -> (usize, usize)
+        var a = 0
+        var b = 1
+
+        for i in 0..<n
+            for j in 0..<n
+                a = (a + i * j + b) % 1000003
+                b = (b * 3 + a) % 999983
+
+        (a, b)
+
+    main(args: []string)
+        val n = 40 * args.len
+        val (a, b) = kernel(n)
+
+        print(a)
+        print(f"kernel($n) = $b")
+    """
+
+@test("the kernel main calls once and then formats keeps its linkage, so LLVM keeps it apart, and the program prints")
+ilk_once_kernel()
+    if !ilk_ready() then return
+
+    val files = [("main.sysl", ilk_kernel)]
+    val text = ilk_text(files, true)
+
+    assert(ilk_define(text, "kernel$$sysl").starts_with("define "), text)
+    assert(!ilk_internal(text, "kernel$$sysl"), ilk_define(text, "kernel$$sysl"))
+    assert(!ilk_define(text, "kernel$$sysl").contains("sysl-sealed"), ilk_define(text, "kernel$$sysl"))
+
+    val said = ilk_ran(files)
+
+    assert(said.contains("\nkernel(40) = "), said)

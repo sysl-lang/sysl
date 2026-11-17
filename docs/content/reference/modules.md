@@ -86,7 +86,9 @@ case is the wordier one.
 not, as rustc does for a binary crate and `static` does for C: nothing outside the image can call
 one, so the optimizer may inline a function called from one place and drop its out-of-line copy. The
 exceptions are what something outside the module names — an `@export`, a function placed in a
-`@section`, one a module-level `asm` block names. A library build (`build-lib`), a C archive and the
+`@section`, one a module-level `asm` block names — and a function that runs at most once, one `main`
+calls outside every loop (and so on down from it), which gains nothing from being inlined and keeps
+its loops apart from everything else `main` does. A library build (`build-lib`), a C archive and the
 text `emit-llvm` prints keep the linkage the declaration wrote, which is where `private` is what
 makes a function `internal`.
 

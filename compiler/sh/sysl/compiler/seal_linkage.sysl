@@ -1,7 +1,7 @@
 module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
-import sysl.container.Set
+import sysl.container.{Map, map, Set, set}
 
 // **An executable keeps its own functions to itself.** A program function that is not `private` is
 // written with ordinary external linkage, which is right for every module that is linked INTO
@@ -43,6 +43,113 @@ note_sealed(funcs: Buf[IrFunc], from: usize, asm_lines: Buf[string], sealed: *Se
 
         if !named then sealed.add(name)
 end note_sealed
+
+// **What runs once is not sealed.** A sealed function with one call is one LLVM inlines whatever its
+// size (the single caller pays nothing for a body it no longer keeps), which is the point where the
+// call sits in a loop: nbody's `advance` runs fifty million times from `main`. Where the call runs
+// ONCE the inlining saves one call and costs a merge: the callee's loops are register-allocated
+// together with everything else the caller does, and a caller that goes on to format and print its
+// results has been seen to spill a hot loop's invariants into memory the separate function kept in
+// registers (fannkuchredux's fifteen shuffle masks, reloaded on every flip, 8% slower). So a
+// function that runs at most once per run of the program keeps the external linkage it was written
+// with, and the optimizer treats it exactly as it did before sealing.
+//
+// The functions that run at most once are the entry and, from it, every sealed function whose every
+// call is made from a block of one of them that no loop reaches again. A function whose address is
+// taken as well may be called again through it; leaving such a one external costs only what sealing
+// would have gained. The entry itself stays sealed: only the platform's `main` calls it.
+//
+// Returns the names among `sealed` that run once.
+run_once(funcs: Buf[IrFunc], sealed: Set[string]) -> Buf[string]
+    var once: Buf[string] = buf()
+    var index: Map[string, usize] = map()
+
+    for i in 0..<funcs.len()
+        if funcs[i].sig.linkage == LinkDefault then index.put(funcs[i].sig.name, i)
+
+    val entry = index.get(entry_symbol()) match
+        Some(i) -> i
+        None -> return once
+
+    // How many calls name each sealed function, and how many of them run once.
+    var calls: Map[string, int] = map()
+    var once_calls: Map[string, int] = map()
+
+    for f in funcs
+        for b in f.blocks
+            for inst in b.instrs
+                sealed_callee(inst, sealed) match
+                    Some(c) -> calls.put(c, calls.get(c).unwrap_or(0) + 1)
+                    None -> ()
+
+    var todo: Buf[usize] = buf()
+    var done: Set[string] = set()
+
+    todo.push(entry)
+    done.add(entry_symbol())
+
+    while todo.pop() is Some(at)
+        val blocks = funcs[at].blocks
+        var labels: Map[string, usize] = map()
+
+        for j in 0..<blocks.len()
+            labels.put(blocks[j].label, j)
+
+        for j in 0..<blocks.len()
+            var looped: Option[bool] = None
+
+            for inst in blocks[j].instrs
+                val c = sealed_callee(inst, sealed) match
+                    Some(c) -> c
+                    None -> continue
+
+                if looped.is_none() then looped = Some(on_a_loop(blocks, j, labels))
+
+                if looped == Some(true) then continue
+
+                val n = once_calls.get(c).unwrap_or(0) + 1
+
+                once_calls.put(c, n)
+
+                if n == calls.get(c).unwrap_or(0) && !done.has(c)
+                    done.add(c)
+                    once.push(c)
+
+                    index.get(c) match
+                        Some(i) -> todo.push(i)
+                        None -> ()
+
+    once
+end run_once
+
+// The sealed function a direct call names, if it names one.
+private sealed_callee(inst: Inst, sealed: Set[string]) -> Option[string] = inst match
+    InCall(_, _, VGlobal(name), _, _, _, _, _) -> if sealed.has(name) then Some(name) else None
+    _ -> None
+
+// Whether control can come back to block `at` once it has left it: whether `at` is on a loop.
+private on_a_loop(blocks: Buf[IrBlock], at: usize, labels: Map[string, usize]) -> bool
+    var seen: Buf[bool] = buf()
+    var todo: Buf[usize] = buf()
+
+    for _ in 0..<blocks.len() do seen.push(false)
+
+    todo.push(at)
+
+    while todo.pop() is Some(j)
+        for l in successors(blocks[j].terminator)
+            val k = labels.get(l) match
+                Some(k) -> k
+                None -> continue
+
+            if k == at then return true
+
+            if !seen[k]
+                seen[k] = true
+                todo.push(k)
+
+    false
+end on_a_loop
 
 // `funcs` with every external definition `sealed` names made `internal`. One already `internal`, or a
 // copy of a body defined elsewhere, is left as it is.
