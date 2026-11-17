@@ -1103,12 +1103,14 @@ main()
 2
 ```
 
-The run above writes `'require' does not hold (main.sysl:4:13)` to standard error — the clause,
-not the call, since the clause is what failed. The other checks say, each followed by its location:
+The run above writes `require failed (main.sysl:4:13)` to standard error — the clause, not the
+call, since the clause is what failed. A clause written with a message adds it: `require x > 0, "x
+must be positive"` says `require failed: x must be positive (main.sysl:4:13)`. An `ensure` and a
+loop's `invariant` say `ensure failed` and `invariant failed` the same way, and a struct's invariant
+names the struct and the write that broke it, `invariant of 'Window' failed (main.sysl:8:1)`. The
+other checks say, each followed by its location:
 
 ```text
-'ensure' does not hold
-'invariant' does not hold
 'variant' did not decrease
 value outside the range of 'Slot'
 value refused by the 'where' predicate of 'Even'
@@ -2680,7 +2682,9 @@ reverse(xs: []int)
 
 Like a constraint, a violated contract **traps**, and contracts are checked in **every** build. There
 is no release mode that drops them, since one would make a program's meaning depend on how it was
-compiled.
+compiled. Before it traps, a failed clause writes what it was, its message if it has one, and where
+to standard error — `require failed: x must be non-negative (main.sysl:2:13)` — so a
+[`should_trap`](/reference/attributes/#a-test-passes-by-returning) test can ask for the message.
 
 ## The third shape: a latch
 

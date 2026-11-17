@@ -1,0 +1,198 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+
+// A contract clause that does not hold reports what failed before it traps (`contract_unless`): its
+// word, the message it was written with where it has one, and the condition's line and column --
+// `require failed: x must be non-negative (main.sysl:2:13)` -- through the same `sysl_bounds_fail` a
+// bounds check reports through, so the exit status is still SIGTRAP's and a `should_trap` test can
+// ask for the message. A struct's `invariant` names the struct and the write that broke it. Every
+// cell is built in both modes, since a contract is checked in every build, and at `-O0` and the
+// default level, since an optimizer that folded a check to its outcome must still make the call.
+
+private rqm_ready() -> bool = std_root().is_ok() && clang_available()
+
+// `text` as `main.sysl`, built in the mode `flag` names at `level`, and run: its status, its standard
+// output and its standard error.
+private rqm_run(text: string, flag: string, level: string) -> (Status, string, string)
+    val root = make_temp_dir("sysl-rqm").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    var flags: [1]string = [flag]
+
+    assert_eq(took_search_flag(flags[..], 0), 1)
+
+    val exe = s"$root/built"
+    val built = build_native_program(root, None, None, level, Some(exe))
+
+    reset_search_paths()
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (Status.Exited(-1), "", failure_text(why))
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> (Status.Exited(-1), "", "the program that was built could not be run")
+        Ok(out) -> (out.status, out.text, out.err.unwrap_or(""))
+end rqm_run
+
+// In both modes and at both levels, the program prints `before` and then stops on SIGTRAP having
+// written exactly `report` to standard error.
+private rqm_traps_saying(text: string, before: string, report: string)
+    if !rqm_ready() then return
+
+    for flag in ["--debug", "--release"]
+        for level in ["0", DefaultOptimization]
+            val (state, printed, err) = rqm_run(text, flag, level)
+
+            assert_eq(err, report)
+            assert_eq(printed, before)
+            assert(state == Status.Signalled(5), s"$flag -O$level stopped with $state, having printed '$printed'")
+end rqm_traps_saying
+
+private rqm_half() -> string = "half(x: int) -> int\n    require x >= 0, \"x must be non-negative\"\n    x / 2\n\n"
+
+// -- what each clause says ------------------------------------------------------------------------------
+
+@test("a failed require with a message prints the message and the condition's line and column")
+rqm_require_with_a_message()
+    rqm_traps_saying(rqm_half() + "print(half(4))\nprint(half(-1))\n", "2\n",
+                     "require failed: x must be non-negative (main.sysl:2:13)\n")
+
+@test("a failed require with no message still says it was a require, and where")
+rqm_require_without_a_message()
+    rqm_traps_saying("half(x: int) -> int\n    require x >= 0\n    x / 2\n\nprint(half(-1))\n", "",
+                     "require failed (main.sysl:2:13)\n")
+
+@test("a failed ensure with a message prints the message")
+rqm_ensure_with_a_message()
+    rqm_traps_saying("f(x: int) -> int\n    ensure result > 100, \"result too small\"\n    x\n\nprint(f(1))\n", "",
+                     "ensure failed: result too small (main.sysl:2:12)\n")
+
+@test("a failed ensure with no message says it was an ensure, and where, at an early return too")
+rqm_ensure_without_a_message()
+    rqm_traps_saying("f(x: int) -> int\n    ensure result > 0\n    if x < 0 then return x\n    x\n\n" +
+                     "print(f(3))\nprint(f(-3))\n", "3\n",
+                     "ensure failed (main.sysl:2:12)\n")
+
+@test("a loop invariant's message is printed when it stops holding")
+rqm_loop_invariant_with_a_message()
+    rqm_traps_saying("main()\n    var i = 0\n    while i < 5\n        invariant i < 3, \"i stays small\"\n" +
+                     "        print(i)\n        i += 1\n", "0\n1\n2\n",
+                     "invariant failed: i stays small (main.sysl:4:19)\n")
+
+@test("a struct invariant broken by a write names the struct and the write")
+rqm_struct_invariant()
+    rqm_traps_saying("struct Window\n    lo: int\n    hi: int\n    invariant lo <= hi\n\n" +
+                     "var w = Window(2, 10)\nprint(w.hi)\nw.hi = 1\nprint(w.hi)\n", "10\n",
+                     "invariant of 'Window' failed (main.sysl:8:1)\n")
+
+@test("a require on a method reports its message")
+rqm_require_on_a_method()
+    rqm_traps_saying("struct C\n    n: int\n\n    take(*self, k: int)\n        require k > 0, \"k must be positive\"\n" +
+                     "        self.n += k\n\nvar c = C(0)\nc.take(2)\nprint(c.n)\nc.take(0)\n", "2\n",
+                     "require failed: k must be positive (main.sysl:5:17)\n")
+
+@test("a require on a generic function reports its message from the instantiation")
+rqm_require_on_a_generic_function()
+    rqm_traps_saying("first[T](xs: []const T) -> T\n    require xs.len > 0, \"xs must not be empty\"\n    xs[0]\n\n" +
+                     "print(first([7, 8][..]))\nprint(first([1, 2][0..<0]))\n", "7\n",
+                     "require failed: xs must not be empty (main.sysl:2:13)\n")
+
+@test("a message holding a percent sign and quotes is printed as written")
+rqm_message_is_printed_verbatim()
+    rqm_traps_saying("f(x: int) -> int\n    require x > 0, \"x was %s, \\\"not\\\" 100%\"\n    x\n\nprint(f(0))\n", "",
+                     "require failed: x was %s, \"not\" 100% (main.sysl:2:13)\n")
+
+@test("clauses that hold report nothing, in either mode")
+rqm_clauses_that_hold_say_nothing()
+    if !rqm_ready() then return
+
+    for flag in ["--debug", "--release"]
+        val (state, printed, err) = rqm_run(rqm_half() + "print(half(8))\n", flag, DefaultOptimization)
+
+        assert_eq(err, "")
+        assert_eq(printed, "4\n")
+        assert(state.ok(), s"$flag stopped with $state")
+
+// -- while compiling ------------------------------------------------------------------------------------
+
+@test("a require that fails while a constant is evaluated carries its message into the error")
+rqm_const_require_carries_its_message()
+    if !enm_ready() then return
+
+    assert_eq(isc_diags("const half(x: int) -> int\n    require x >= 0, \"x must be non-negative\"\n    x / 2\n\n" +
+                        "const h = half(-1)\n\nprint(h)\n"),
+              "5:11 'h' traps while it is being compiled: a 'require' of 'half' failed: x must be non-negative " +
+              "(main.sysl:2:13) — inside 'half(-1)', called at main.sysl:5:11\n")
+
+@test("an ensure that fails while a constant is evaluated carries its message into the error")
+rqm_const_ensure_carries_its_message()
+    if !enm_ready() then return
+
+    assert_eq(isc_diags("const f(x: int) -> int\n    ensure result > 100, \"too small\"\n    x\n\n" +
+                        "const h = f(1)\n\nprint(h)\n"),
+              "5:11 'h' traps while it is being compiled: an 'ensure' of 'f' failed: too small " +
+              "(main.sysl:2:12) — inside 'f(1)', called at main.sysl:5:11\n")
+
+// -- under the test runner ------------------------------------------------------------------------------
+
+// The tests of a one-file project, built and run as `sysl test` runs them.
+private rqm_outcomes(text: string) -> Option[Buf[Outcome]]
+    if !rqm_ready() then return None
+
+    val root = make_temp_dir("sysl-rqm").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val build = test_build_of(root, None) match
+        Err(refusal) ->
+            remove_dir_all(root).unwrap_or(())
+            assert(false, failure_text(refusal))
+            return None
+        Ok(made) -> made
+
+    val exe = build_test_binary(root, build, None, DefaultOptimization) match
+        Err(refusal) ->
+            remove_dir_all(root).unwrap_or(())
+            assert(false, refusal.message)
+            return None
+        Ok(built) -> built
+
+    val ran = run_selected(exe, build.tests, TestOptions(None, false, 1, buf()), 0, piece -> ())
+
+    discard_test_binary(exe)
+    remove_dir_all(root).unwrap_or(())
+    Some(ran)
+end rqm_outcomes
+
+@test("should_trap can ask for a require's message, and a different text is not satisfied")
+rqm_should_trap_reads_the_message()
+    val ran = rqm_outcomes(rqm_half() +
+                           "@test(should_trap: \"x must be non-negative\")\nright()\n    print(half(-1))\n\n" +
+                           "@test(should_trap: \"require failed (\")\nbare()\n    print(half(-1))\n\n" +
+                           "@test(should_trap: \"x must be positive\")\nwrong()\n    print(half(-1))\n")
+
+    if ran.is_none() then return
+
+    val outcomes = ran.unwrap()
+
+    assert_eq(outcomes.len(), 3)
+
+    var passed = 0
+
+    for item in outcomes
+        if item.passed() then passed += 1
+
+    assert_eq(passed, 1)
+end rqm_should_trap_reads_the_message

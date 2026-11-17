@@ -1249,9 +1249,10 @@ error return trace (origin first):
 `should_trap` inverts the reading, for a test whose subject *is* the check. With a string it
 additionally requires that the run printed it, which is what tells a trap from the **right** trap. A
 bounds check says what failed before it traps — `@test(should_trap: "out of bounds for length 3")`
-asks for exactly that — while every other compiler-inserted check raises a signal and says nothing,
-so it satisfies `should_trap` and can satisfy no string — see
-[what stopping looks like](/reference/errors/#what-stopping-looks-like).
+asks for exactly that — and so does every other compiler-inserted check, a contract clause with its
+message: `@test(should_trap: "x must be non-negative")` matches `require x >= 0, "x must be
+non-negative"`. Only `trap()` itself says nothing, so it satisfies `should_trap` and can satisfy no
+string — see [what stopping looks like](/reference/errors/#what-stopping-looks-like).
 
 ### A test may be written and not run
 
