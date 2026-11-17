@@ -2147,7 +2147,9 @@ print(max(a, b))
 **Between overloads, an exact match beats any widening, and among widenings the narrowest wins** —
 the candidate each of whose parameters converts to the other's. Where neither is narrower at every
 position, the call is ambiguous — except where the candidates are tied only by bare literals, which
-then take their default types ([Overloading](/reference/declarations/#overloading)).
+then take their default types, or are tied only by bare literals beside typed arguments that one
+candidate takes exactly, which then read the literals at that candidate's parameter types
+([Overloading](/reference/declarations/#overloading)).
 
 ```sysl
 f(x: int) -> string = "int"
