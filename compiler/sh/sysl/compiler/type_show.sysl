@@ -157,7 +157,8 @@ private canonical_name(t: Type) -> string = t match
     Ptr(inner, ro) -> s"*${if ro then "const " else ""}${type_show(*inner)}"
     Ref(inner, sync) -> s"&${if sync then "sync " else ""}${type_show(*inner)}"
     Weak(inner) -> s"weak ${type_show(*inner)}"
-    CFn(ps, r, k) -> s"*extern(${marked_list(ps, k)}) -> ${type_show(*r)}"
+    CFn(ps, r, k) ->
+        s"${if marks_abandon(k) then "@abandons " else ""}*extern(${marked_list(ps, k)}) -> ${type_show(*r)}"
     Array(n, elem) -> s"[$n]${type_show(*elem)}"
     Vector(n, elem) -> s"<$n>${type_show(*elem)}"
     Slice(elem, ro) -> s"[]${if ro then "const " else ""}${type_show(*elem)}"
@@ -225,6 +226,31 @@ end marked_list
 // and every symbol stay the one the unmarked type names (`mangled` reads no associated type). Nothing
 // that looks an associated type up by its name can find one of these.
 fn_keeps_assoc(i: usize) -> (string, Type) = (s"@keeps:$i", Unit)
+
+// **A function pointer's `@abandons` mark rides with its parameters' marks**, last, under a name no
+// program can write: `@abandons *extern(A) -> R` and `*extern(A) -> R` are two types to `type_eq`,
+// laid out, passed and named in a symbol alike. Nothing that asks about a parameter's mark finds it.
+abandons_mark() -> (string, Type) = ("@abandons", Unit)
+
+// Whether a function pointer's marks say a call through it may abandon every frame below it.
+marks_abandon(marks: Buf[(string, Type)]) -> bool = has_mark(marks, abandons_mark().0)
+
+// Whether a type is a function pointer a call through which may abandon every frame below it.
+abandoning_pointer(t: Type) -> bool = underlying(t) match
+    CFn(_, _, marks) -> marks_abandon(marks)
+    _ -> false
+
+// A function pointer's marks with the `@abandons` mark set as `on` says, every other mark kept.
+with_abandons(marks: Buf[(string, Type)], on: bool) -> Buf[(string, Type)]
+    var out: Buf[(string, Type)] = buf()
+
+    for item in marks
+        if item.0 != abandons_mark().0 then out.push(item)
+
+    if on then out.push(abandons_mark())
+
+    out
+end with_abandons
 
 // The mark of a parameter the callable may let out what it reads through, but not keep.
 fn_lets_out_assoc(i: usize) -> (string, Type) = (s"@lets_out:$i", Unit)

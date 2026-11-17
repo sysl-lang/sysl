@@ -58,7 +58,10 @@ end trap_unless
 // A **vector** picks its instruction from the lane and emits at the whole register: LLVM spells both
 // widths of the word with one mnemonic, so lane-wise arithmetic needs no operation of its own, only
 // the type it is written at.
-arith(e: *Emit, op: string, ty: Type, lv: Val, rv: Val) -> Val
+//
+// `reassoc` is whether the operation is written inside a `@reassociate` body or block
+// (`reassociate.sysl`): a float `+`, `-` or `*` there carries LLVM's `reassoc` flag.
+arith(e: *Emit, op: string, ty: Type, lv: Val, rv: Val, reassoc: bool) -> Val
     val lane = underlying(ty) match
         Vector(_, elem) -> underlying(*elem)
         other -> other
@@ -86,9 +89,9 @@ arith(e: *Emit, op: string, ty: Type, lv: Val, rv: Val) -> Val
                 gap_here(e, s"mask arith '$op'")
                 OpAnd
         Floating(_, _) -> op match
-            "+" -> OpFAdd
-            "-" -> OpFSub
-            "*" -> OpFMul
+            "+" -> if reassoc then OpFAddReassoc else OpFAdd
+            "-" -> if reassoc then OpFSubReassoc else OpFSub
+            "*" -> if reassoc then OpFMulReassoc else OpFMul
             "/" -> OpFDiv
             _ ->
                 gap_here(e, s"float arith '$op'")
@@ -682,9 +685,13 @@ end checked_shl
 // (`fp_contract.sysl`), reached only at a width the target fuses. It is the exactly specified `fma`
 // rather than `llvm.fmuladd`, which the back end may split per site (Arm's always does, and an
 // AArch64 vectorized loop does for some lanes), so every `-O` level rounds the same as compile time.
-fused_mul_add(e: *Emit, ty: Type, a: Val, b: Val, c: Val) -> Val
+//
+// **Where the sum may be regrouped (`reassoc`) it is `llvm.fmuladd` carrying `reassoc`** instead: the
+// loop vectorizer folds a reduction only through that intrinsic, never through `llvm.fma`, and a
+// regrouped sum has given up the exact rounding the `fma` form exists to keep.
+fused_mul_add(e: *Emit, ty: Type, a: Val, b: Val, c: Val, reassoc: bool) -> Val
     val lt = lty(e, ty)
-    val fn = llvm_fma_entry().at([lt])
+    val fn = (if reassoc then llvm_fmuladd_entry() else llvm_fma_entry()).at([lt])
 
     var params: Buf[IrParam] = buf()
 
@@ -700,8 +707,11 @@ fused_mul_add(e: *Emit, ty: Type, a: Val, b: Val, c: Val) -> Val
     args.push(ir_arg(lt, c))
 
     val r = fresh_reg(e)
+    var fast: Buf[FastMath] = buf()
 
-    emit(e, ir_call(Some(r), lt, VGlobal(fn), args))
+    if reassoc then fast.push(FmReassoc)
+
+    emit(e, InCall(Some(r), lt, VGlobal(fn), args, no_ir_attrs(), None, fast, false))
     r
 end fused_mul_add
 

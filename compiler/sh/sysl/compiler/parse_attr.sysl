@@ -49,6 +49,11 @@ parse_at_stmt(p: *Parser, start: Span) -> Stmt
 
     if word == "assert" then return parse_assert_decl(p, start)
 
+    // `@reassociate` on a line of its own over an indented block marks the block (`reassociate.sysl`);
+    // above a declaration it marks the function.
+    if word == "reassociate" && p.peek_at(2) == Newline && p.peek_at(3) == Indent then
+        return parse_reassociate_block(p, start)
+
     // `@unchecked` marks the block under it rather than a declaration (`unchecked.sysl`) -- unless
     // parentheses follow it, where it is a struct's promise to cross (`promises.sysl`).
     if word == "unchecked" && !p.kw_at(2, "(") then return parse_unchecked_block(p, start)
@@ -97,6 +102,7 @@ parse_attr_list(p: *Parser) -> Buf[Attr]
 
     refuse_duplicates(p, out, "declaration")
     refuse_blocks_beside_no_block(p, out)
+    refuse_reassociate_beside_strict(p, out)
     out
 end parse_attr_list
 
@@ -158,6 +164,7 @@ parse_member_attrs(p: *Parser, in_trait: bool) -> Buf[Attr]
 
     refuse_duplicates(p, out, "member")
     refuse_blocks_beside_no_block(p, out)
+    refuse_reassociate_beside_strict(p, out)
     out
 end parse_member_attrs
 
@@ -209,7 +216,7 @@ private member_attr_word(w: string) -> bool
 
     for word in ["crossing", "reads", "writes", "noinline", "inline", "cold", "blocks",
                  "relocates", "views", "consumes", "disjoint", "scoped", "bounded", "joined", "strict_fp",
-                 "track_caller"]
+                 "reassociate", "track_caller"]
         if word == w then return true
 
     false
@@ -232,6 +239,12 @@ end refuse_duplicates
 private refuse_blocks_beside_no_block(p: *Parser, attrs: Buf[Attr])
     if any_is(attrs, "blocks") && any_is(attrs, "no_block") then
         p.fault(p.here(), "'@blocks' says this definition may wait and '@no_block' that it never does, so the two cannot both be true — a definition that waits is marked '@blocks', and one that promises not to keeps to the promise")
+
+// `@strict_fp` keeps every float operation exactly where and how it was written, and `@reassociate`
+// lets the back end regroup them, so the two above one body contradict each other.
+private refuse_reassociate_beside_strict(p: *Parser, attrs: Buf[Attr])
+    if any_is(attrs, "reassociate") && any_is(attrs, "strict_fp") then
+        p.fault(p.here(), reassociate_beside_strict())
 
 private refuse_hash_attr(p: *Parser, at: Span)
     p.bump()
@@ -260,7 +273,7 @@ builtin_attr_word(w: string) -> bool
                  "section", "crossing", "domain", "keeps", "answers", "disjoint", "guards", "needs",
                  "noinline", "inline", "cold", "thread_local", "abandons", "per_cpu", "main_thread",
                  "pinned", "pins", "relocates", "views", "consumes", "blocks", "scoped", "bounded", "joined",
-                 "strict_fp", "track_caller", "returns_twice", "renamed", "removed", "unchecked"]
+                 "strict_fp", "reassociate", "track_caller", "returns_twice", "renamed", "removed", "unchecked"]
         if word == w then return true
 
     false
@@ -436,6 +449,8 @@ parse_attribute(p: *Parser) -> Option[Attr]
     // `@strict_fp` takes none: which rounding mode and which exceptions are the ones in force when
     // the code runs, and naming one here would be the static environment this exists to give up.
     if word == "strict_fp" then return no_inlining_args(p, StrictFp, "the rounding mode and the exceptions are whatever the floating-point environment holds when the body runs, which is what the annotation says to follow")
+    // `@reassociate` takes none: the order is the back end's to choose, so there is nothing to name.
+    if word == "reassociate" then return no_inlining_args(p, Reassociate, "the order a regrouped sum is computed in is the back end's to choose, so there is no order to name")
     // `@track_caller` takes none: the location it hands on is the call's, which is not something a
     // declaration could name.
     if word == "track_caller" then return no_inlining_args(p, TrackCaller, "the location it hands on is the line of each call, which the call supplies")
@@ -1013,6 +1028,7 @@ apply_func_attrs(f: *FuncDecl, attrs: Buf[Attr])
             Forgoes(cap) -> f.marks.forgoes.push(cap)
             Blocks -> f.marks.blocks = true
             StrictFp -> f.marks.strict_fp = true
+            Reassociate -> f.marks.reassociate = true
             TrackCaller -> f.marks.track_caller = true
             Scoped(ns) -> f.marks.scoped = ns
             Bounded(ns) -> f.marks.bounded = ns
@@ -1040,6 +1056,7 @@ apply_member_attrs(m: *MethodDecl, attrs: Buf[Attr])
             Forgoes(cap) -> m.marks.forgoes.push(cap)
             Blocks -> m.marks.blocks = true
             StrictFp -> m.marks.strict_fp = true
+            Reassociate -> m.marks.reassociate = true
             TrackCaller -> m.marks.track_caller = true
             Relocates -> m.marks.relocates = true
             Views(_) -> m.marks.views = true
@@ -1312,6 +1329,8 @@ private attributed_refusal(attrs: Buf[Attr]) -> string
     // call: the definition is the linked object's, and only its own compiler can inline it.
     if any_is(attrs, "strict_fp")
         return "'@strict_fp' says how a body's floating-point operations are compiled, so it marks a function or a method, whose body is sysl — and this declares neither. An 'extern''s operations are compiled by whoever compiled it"
+
+    if any_is(attrs, "reassociate") then return reassociate_not_a_body()
 
     if any_is(attrs, "inline(always)")
         return "'@inline(always)' puts a function's body in place of every call to it, so it marks a function or a method — and this declares neither. An 'extern' has no body in this program to put anywhere: its definition is in the object it is linked from"

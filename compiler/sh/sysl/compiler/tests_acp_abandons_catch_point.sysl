@@ -1,0 +1,362 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `@abandons *extern(A) -> R` (`reference/declarations.md § A catch point in C`): the type a function
+// that may abandon is addressed at, so it can be handed to C that catches the jump -- Lua's
+// `lua_pcall`, a libpng or libjpeg error handler. Taking such a function's address at any other type
+// stays refused; a call through the marked type is reached as an abandoning call is; and the frame
+// that makes the jump itself is given back before it, which the counted heap proves.
+
+private struct AcpRun
+    ok: bool
+    out: string
+    err: string
+
+private acp_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end acp_ready
+
+// The C side, as `lua_pcall` and `lua_error` are: `acp_protected` saves a context and calls the
+// callback; `acp_raise` jumps back to the innermost saved context, past every frame in between.
+private acp_c() -> string = raw"""
+    #include <setjmp.h>
+    #include <stdint.h>
+
+    static jmp_buf *acp_catcher;
+
+    int32_t acp_protected(int32_t (*f)(int32_t), int32_t arg) {
+        jmp_buf here;
+        jmp_buf *outer = acp_catcher;
+        volatile int32_t r = -1;
+
+        acp_catcher = &here;
+        if (setjmp(here) == 0) r = f(arg);
+        acp_catcher = outer;
+        return r;
+    }
+
+    void acp_raise(void) {
+        longjmp(*acp_catcher, 1);
+    }
+    """
+
+// The externs of the C side, the callback type marked as `mark` says.
+private acp_externs(mark: string) -> string = s"""
+    @abandons
+    extern acp_raise() -> never
+
+    extern acp_protected(f: $mark*extern(i32) -> i32, arg: i32) -> i32
+    """
+
+// A project whose module `p` carries the C side and `sysl`, and whose `main.sysl` prints `p.check()`,
+// built on the counted heap and run.
+private acp_run(sysl: string) -> AcpRun
+    val root = make_temp_dir("sysl-acp").unwrap()
+
+    make_dir_all(s"$root/p").unwrap()
+    write_text(s"$root/main.sysl", "print(p.check())\n").unwrap()
+    write_text(s"$root/p/p.sysl", s"module p\n\n$sysl").unwrap()
+    write_text(s"$root/p/probe.c", acp_c()).unwrap()
+    force_alloc_counting(true)
+
+    val built = build_native_program(root, None, None, DefaultOptimization, Some(s"$root/built"))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return AcpRun(false, failure_text(why), "")
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> AcpRun(false, "could not be started", "")
+        Ok(o) -> AcpRun(o.status.ok(), o.text, o.err.unwrap_or(""))
+end acp_run
+
+private acp_ir(text: string) -> string = xvr_ir([("main.sysl", text)])
+
+// A callback holding a node with a destructor and a string made at run time, two counted blocks, that
+// raises when handed more than 1.
+private acp_callback() -> string = """
+    struct Node
+        v: i32
+
+    impl Drop for Node
+        drop(self)
+            print("dropped", self.v)
+
+    raising(n: i32) -> i32
+        val node: &Node = Node(n)
+        val tag = n.to_string() + "!"
+
+        if n > 1 then acp_raise()
+
+        i32(tag.bytes.len) + node.v
+    """
+
+@test("a raising callback taken as '@abandons *extern' runs under a C catch point and gives its frame back before the jump")
+acp_the_callback_frame_is_given_back()
+    if !acp_ready() then return
+
+    val run = acp_run(acp_externs("@abandons ") + acp_callback() + """
+
+        check() -> string
+            val calm = acp_protected(&raising, 1)
+            val raised = acp_protected(&raising, 5)
+
+            s"$calm $raised"
+        """)
+
+    assert(run.ok, run.out)
+    assert_eq(run.out, "dropped 1\ndropped 5\n3 -1\n")
+    assert_eq(alloc_count_reported(run.err), 0)
+
+@test("without '@abandons' on the raising extern the jump strands the callback's counts, which is the control")
+acp_without_the_mark_the_frame_leaks()
+    if !acp_ready() then return
+
+    val plain = """
+        extern acp_raise() -> never
+
+        extern acp_protected(f: @abandons *extern(i32) -> i32, arg: i32) -> i32
+        """
+
+    val run = acp_run(plain + acp_callback() + """
+
+        check() -> string
+            val raised = acp_protected(&raising, 5)
+
+            s"$raised"
+        """)
+
+    assert(run.ok, run.out)
+    assert_eq(run.out, "-1\n")
+    assert(alloc_count_reported(run.err) > 0, run.err)
+
+@test("a function that never abandons stands where an '@abandons *extern' is asked for")
+acp_a_calm_function_fits()
+    if !acp_ready() then return
+
+    val run = acp_run(acp_externs("@abandons ") + """
+        twice(n: i32) -> i32 = n * 2
+
+        check() -> string
+            val p: @abandons *extern(i32) -> i32 = &twice
+
+            s"${acp_protected(&twice, 4)} ${acp_protected(p, 5)}"
+        """)
+
+    assert(run.ok, run.out)
+    assert_eq(run.out, "8 10\n")
+
+@test("an address taken as a plain '*extern' is still refused, and the refusal names the '@abandons' type")
+acp_refused_into_a_plain_pointer()
+    val said = acp_ir(acp_externs("") + acp_callback() + """
+
+        print(acp_protected(&raising, 1))
+        """)
+
+    assert(said.contains("'raising' can reach a call that abandons every frame below it, and a call through a value cannot be followed there"), said)
+    // `i32` is shown as `int`, the one type it is on this target.
+    assert(said.contains("call it by name, or take its address as '@abandons *extern(int) -> int'"), said)
+
+    val direct = acp_ir(acp_externs("") + """
+
+        val p: *extern() -> never = &acp_raise
+
+        print(1)
+        """)
+
+    assert(direct.contains("'acp_raise' is '@abandons', and a call through a value cannot be followed to it"), direct)
+    assert(direct.contains("call it by name, or take its address as '@abandons *extern() -> never'"), direct)
+
+@test("an '@abandons' function's own address may be taken as '@abandons *extern'")
+acp_the_abandoning_function_itself()
+    val said = acp_ir(acp_externs("@abandons ") + """
+
+        val p: @abandons *extern() -> never = &acp_raise
+
+        print(1)
+        """)
+
+    assert(!said.contains("error:"), said)
+
+@test("an '@abandons *extern' value does not become a plain '*extern'")
+acp_the_mark_is_not_dropped()
+    val said = acp_ir(acp_externs("@abandons ") + acp_callback() + """
+
+        val p: @abandons *extern(i32) -> i32 = &raising
+        val q: *extern(i32) -> i32 = p
+
+        print(1)
+        """)
+
+    assert(said.contains("a call through a '@abandons *extern(int) -> int' may abandon every frame below it, so it cannot become a '*extern(int) -> int'"), said)
+
+@test("a call through an '@abandons *extern' holds the frame to holding nothing across it")
+acp_a_call_through_holds_nothing()
+    // Nothing here is declared `@abandons`: the marked type alone is what the walk is run for.
+    val said = acp_ir("""
+        twice(n: i32) -> i32 = n * 2
+
+        run(f: @abandons *extern(i32) -> i32)
+            val s = 1.to_string() + "x"
+
+            print(f(1))
+            print(s)
+
+        run(&twice)
+        """)
+
+    assert(said.contains("a call through an '@abandons *extern' pointer can reach a call that abandons every frame below it and never comes back, and this frame holds 's' across the call"), said)
+
+    val clean = acp_ir("""
+        twice(n: i32) -> i32 = n * 2
+
+        run(f: @abandons *extern(i32) -> i32)
+            print(f(1))
+
+            val s = 1.to_string() + "x"
+
+            print(s)
+
+        run(&twice)
+        """)
+
+    assert(!clean.contains("error:"), clean)
+
+@test("a function that calls through an '@abandons *extern' can reach an abandoning call itself")
+acp_the_caller_is_marked_transitively()
+    val said = acp_ir("""
+        twice(n: i32) -> i32 = n * 2
+
+        relay(f: @abandons *extern(i32) -> i32, n: i32) -> i32 = f(n)
+
+        outer(f: @abandons *extern(i32) -> i32)
+            val s = 1.to_string() + "x"
+
+            print(relay(f, 2))
+            print(s)
+
+        outer(&twice)
+        """)
+
+    assert(said.contains("'relay' can reach a call that abandons every frame below it and never comes back, and this frame holds 's' across the call"), said)
+
+    val addressed = acp_ir("""
+        relay(f: @abandons *extern(i32) -> i32, n: i32) -> i32 = f(n)
+
+        val p: *extern(@abandons *extern(i32) -> i32, i32) -> i32 = &relay
+
+        print(1)
+        """)
+
+    assert(addressed.contains("'relay' can reach a call that abandons every frame below it, and a call through a value cannot be followed there"), addressed)
+
+@test("a frame between the catch point and the jump that holds something across it is still refused")
+acp_an_outer_frame_is_still_refused()
+    val said = acp_ir(acp_externs("@abandons ") + """
+        fail_if(n: i32)
+            if n > 1 then acp_raise()
+
+        raising(n: i32) -> i32
+            val s = 1.to_string() + "x"
+
+            fail_if(n)
+
+            i32(s.bytes.len)
+
+        print(acp_protected(&raising, 1))
+        """)
+
+    assert(said.contains("'fail_if' can reach a call that abandons every frame below it and never comes back, and this frame holds 's' across the call"), said)
+
+@test("a generic function's instance and a member function are taken as '@abandons *extern' alike")
+acp_generic_and_member_addresses()
+    val generic = acp_ir(acp_externs("@abandons ") + """
+        raising[T](n: T) -> T
+            acp_raise()
+
+        print(acp_protected(&raising[i32], 1))
+        """)
+
+    assert(!generic.contains("error:"), generic)
+
+    val generic_plain = acp_ir(acp_externs("") + """
+        raising[T](n: T) -> T
+            acp_raise()
+
+        print(acp_protected(&raising[i32], 1))
+        """)
+
+    assert(generic_plain.contains("or take its address as '@abandons *extern(int) -> int'"), generic_plain)
+
+    val member = acp_ir(acp_externs("@abandons ") + """
+        struct Lib
+        end Lib
+
+        impl Lib
+            raising(n: i32) -> i32
+                if n > 1 then acp_raise()
+
+                n
+
+        print(acp_protected(&Lib.raising, 1))
+        """)
+
+    assert(!member.contains("error:"), member)
+
+@test("a closure calling through an '@abandons *extern' is not erased into a callable object")
+acp_a_closure_is_still_refused()
+    val said = acp_ir("""
+        twice(n: i32) -> i32 = n * 2
+
+        run(g: &Fn() -> unit)
+            g()
+
+        go(f: @abandons *extern(i32) -> i32)
+            run(() -> print(f(1)))
+
+        go(&twice)
+        """)
+
+    assert(said.contains("this closure can reach a call that abandons every frame below it"), said)
+
+@test("'@abandons' on a type marks only a C function pointer, and the mark is spelled in a type alias and a field")
+acp_the_type_spelling()
+    assert(acp_ir("f(x: @abandons int) = ()\n").contains("'@abandons' marks a C function pointer a call through which may never come back"))
+
+    val said = acp_ir(acp_externs("@abandons ") + acp_callback() + """
+
+        type Raiser = @abandons *extern(i32) -> i32
+
+        struct Hook
+            run: Raiser
+
+        val h = Hook(&raising)
+
+        print(acp_protected(h.run, 1))
+        """)
+
+    assert(!said.contains("error:"), said)
+
+    val shown = acp_ir("""
+        val p: @abandons *extern(i32) -> i32 = 3
+
+        print(1)
+        """)
+
+    assert(shown.contains("declared @abandons *extern(i32) -> i32 but the value is int"), shown)

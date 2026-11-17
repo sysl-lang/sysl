@@ -2588,6 +2588,109 @@ print(1)
 'pick' has type parameters of its own, so '&Sq.pick' does not say which copy of it is meant — write them, as '&Sq.pick[U]'
 ```
 
+### `@abandons *extern` — a callback that may jump past C
+
+Lua's `lua_error`, a libpng or libjpeg error handler: C that reports a failure by jumping back to a
+context its caller saved — `lua_pcall`, `setjmp(png_jmpbuf(png))` — past every frame in between.
+Declared [`@abandons`](/reference/declarations/), such a function gives its caller's frame back before
+the call. A callback that calls it is a function that **can reach** an abandoning call, and an
+ordinary `*extern` of one is refused, since a call through a plain pointer is not known to leave.
+
+**`@abandons *extern(A) -> R` is the type it is addressed at**: a pointer a call through which may
+never come back. A C function taking one is the catch point — the jump lands in C, which saved the
+context — so the declaration is all a binding writes:
+
+```sysl build=c
+module halving
+
+@abandons
+extern lua_error(L: *u8) -> never
+
+extern lua_tointegerx(L: *u8, index: i32, isnum: *i32) -> i64
+extern lua_pushinteger(L: *u8, n: i64)
+extern lua_pushcclosure(L: *u8, f: @abandons *extern(*u8) -> i32, upvalues: i32)
+
+halve(L: *u8) -> i32
+    var whole: i32 = 0
+    val n = lua_tointegerx(L, 1, &whole)
+
+    if whole == 0 || n % 2 != 0 then lua_error(L)
+
+    lua_pushinteger(L, n / 2)
+    1
+
+@export("luaopen_halving")
+open(L: *u8) -> i32
+    lua_pushcclosure(L, &halve, 0)
+    1
+```
+
+`halve`'s own frame is given back before `lua_error`, as at any `@abandons` call, so a `Buf` or a
+`&T` it held is released before the jump. What stays refused is a frame **between** the catch point
+and the jump holding something across it — a helper `halve` calls that raises, with `halve` holding a
+string across the call — because that frame may also come back.
+
+At a plain `*extern`, the refusal names the marked type:
+
+```sysl
+@abandons
+leave(code: int) -> never
+    exit(code)
+
+run(f: *extern(int) -> never)
+    f(1)
+
+run(&leave)
+```
+
+```error
+call it by name, or take its address as '@abandons *extern(int) -> never'
+```
+
+Taken at the marked type, the same address is a value like any other, and a function that never
+abandons stands there too:
+
+```sysl
+@abandons
+leave(code: int) -> never
+    exit(code)
+
+run(f: @abandons *extern(int) -> never)
+    print("leaving")
+    f(0)
+
+run(&leave)
+```
+
+```output
+leaving
+```
+
+**A call through one from sysl is held to what a call to an abandoning function is**: what it calls
+may come back, so the frame making it is not given back first, and is refused if it holds anything
+across the call. The function making it can reach an abandoning call itself, so its own callers are
+held to the same:
+
+```sysl
+twice(n: int) -> int = n * 2
+
+run(f: @abandons *extern(int) -> int)
+    val s = 1.to_string() + "x"
+
+    print(f(1))
+    print(s)
+
+run(&twice)
+```
+
+```error
+a call through an '@abandons *extern' pointer can reach a call that abandons every frame below it and never comes back, and this frame holds 's' across the call
+```
+
+The mark is never dropped: an `@abandons *extern` value does not go where a plain `*extern` is asked
+for. It marks nothing but a C function pointer — a callable object that can reach an abandoning call
+is refused as before.
+
 ### What has no address, and why
 
 Each of these is refused because the address would not be an address of what its type says, and
