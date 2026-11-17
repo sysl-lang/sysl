@@ -3500,7 +3500,7 @@ private signed_literal_preference(fitted: Buf[Buf[Type]], ranked: Buf[usize],
                 differs = true
 
         if differs
-            if !bare_int_literal(args[j]) then return none
+            if !int_literal_valued(args[j]) then return none
 
             for r in 0..<ranked.len()
                 val here = fitted[ranked[r]]
@@ -3586,7 +3586,7 @@ private literal_default_preference(fitted: Buf[Buf[Type]], ranked: Buf[usize], a
                 differs = true
 
         if differs
-            if literal_default(args[j]).is_none() then return none
+            if literal_arith_default(args[j]).is_none() then return none
 
             differ.push(j)
         end if
@@ -3644,7 +3644,7 @@ end literal_follows_typed
 // The type a bare numeric literal defaults to at a parameter: `real` for a float literal, and for
 // an integer literal `real` at a float parameter and `int` anywhere else.
 literal_default_at(e: Expr, param: Type) -> Type
-    val own = literal_default(e).unwrap()
+    val own = literal_arith_default(e).unwrap()
     val float_param = param match
         Floating(_, _) -> true
         _ -> false
@@ -3671,6 +3671,53 @@ private bare_int_literal(e: Expr) -> bool = *e.kind match
     IntLit(_, _, suffix) -> suffix == ""
     Unary(op, operand) -> op == "-" && bare_int_literal(operand)
     _ -> false
+
+// **Arithmetic over bare integer literals is in the literal's tier** (`reference/expressions.md §
+// Which conversions are implicit`): `60 * 52` takes its position's type exactly as `3120` does, so
+// between overloads it prefers what the single literal prefers -- `f(60 * 52)` over `f(x: long)`
+// and `f(x: ulong)` is the `long` one, as `f(3120)` is. A shift is its left operand's value
+// whatever the count; a comparison or a logical operator yields a `bool` and is not one.
+private int_literal_valued(e: Expr) -> bool
+    if bare_int_literal(e) then return true
+
+    *e.kind match
+        Unary(op, operand) -> (op == "-" || op == "~") && int_literal_valued(operand)
+        Binary(op, l, r) ->
+            if op == "<<" || op == ">>" then int_literal_valued(l)
+            else literal_arith_op(op) && int_literal_valued(l) && int_literal_valued(r)
+        _ -> false
+end int_literal_valued
+
+// The default type of a bare numeric literal, or of arithmetic over bare numeric literals: `real`
+// where a float literal takes part (`1.5 * 2` is a `real` as `1 + 2.0` is), `int` where only integer
+// ones do, and nothing for anything else.
+literal_arith_default(e: Expr) -> Option[Type]
+    val own = literal_default(e)
+
+    if own.is_some() then return own
+
+    *e.kind match
+        Unary(op, operand) ->
+            if op == "-" then literal_arith_default(operand)
+            else if op == "~" && int_literal_valued(operand) then Some(int_type())
+            else None
+        Binary(op, l, r) ->
+            if op == "<<" || op == ">>"
+                if int_literal_valued(l) then Some(int_type()) else None
+            else if literal_arith_op(op)
+                val a = literal_arith_default(l)
+                val b = literal_arith_default(r)
+
+                if a.is_none() || b.is_none() then None
+                else if type_eq(a.unwrap(), real_type()) || type_eq(b.unwrap(), real_type()) then Some(real_type())
+                else Some(int_type())
+            else None
+        _ -> None
+end literal_arith_default
+
+// An operator whose result over two numbers is a number of their type.
+private literal_arith_op(op: string) -> bool =
+    op == "+" || op == "-" || op == "*" || op == "/" || op == "%" || op == "&" || op == "|" || op == "^"
 
 // The width of a signed integer parameter at a position, and 0 for anything else.
 private signed_bits(params: Buf[Type], j: usize) -> int
