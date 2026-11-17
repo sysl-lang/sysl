@@ -887,7 +887,7 @@ private read_depth(cx: &KeepsCx, t: Type, seen: *Buf[string], depth: int) -> int
     if depth > 32 then return -1
 
     t match
-        Ptr(inner) -> if is_opaque_struct(*inner) then 0 else deeper(read_depth(cx, *inner, seen, depth + 1))
+        Ptr(inner, _) -> if is_opaque_struct(*inner) then 0 else deeper(read_depth(cx, *inner, seen, depth + 1))
         Slice(elem, _) -> deeper(read_depth(cx, *elem, seen, depth + 1))
         Ref(inner, _) -> deeper(read_depth(cx, *inner, seen, depth + 1))
         Weak(inner) -> deeper(read_depth(cx, *inner, seen, depth + 1))
@@ -1492,7 +1492,7 @@ read_through(t: Type, depth: int) -> bool
     if depth > 6 then return false
 
     t match
-        Ptr(inner) -> !is_opaque_struct(*inner)
+        Ptr(inner, _) -> !is_opaque_struct(*inner)
         Slice(_, _) -> true
         Volatile(inner) -> read_through(*inner, depth + 1)
         Array(_, elem) -> read_through(*elem, depth + 1)
@@ -1517,7 +1517,7 @@ end read_through
 asks_through(cx: &KeepsCx, t: Type) -> bool = read_through(t, 0) && reads_an_address(cx, t)
 
 private reads_an_address(cx: &KeepsCx, t: Type) -> bool = t match
-    Ptr(inner) -> may_hold_pointer(cx, *inner)
+    Ptr(inner, _) -> may_hold_pointer(cx, *inner)
     Slice(elem, _) -> may_hold_pointer(cx, *elem)
     _ -> true
 
@@ -1869,7 +1869,7 @@ private scopes_a_call(f: TFunc) -> bool
 end scopes_a_call
 
 private is_raw_pointer(t: Type) -> bool = t match
-    Ptr(_) -> true
+    Ptr(_, _) -> true
     _ -> false
 
 // A closure, or an object behind a trait: a body somebody may run later, holding what it captured.
@@ -1896,7 +1896,7 @@ is_closure_body(f: TFunc) -> bool =
     !f.params.is_empty() && is_closure_literal(env_type(f.params[0].1)) && f.name.ends_with(".call")
 
 private env_type(t: Type) -> Type = t match
-    Ptr(inner) -> *inner
+    Ptr(inner, _) -> *inner
     _ -> t
 
 // Whether a body holds an expression its reading refused: the node a complaint leaves where the value
@@ -2301,7 +2301,7 @@ private value_moves(cx: &KeepsCx, evs: &EvBuf, t: Type)
     if !may_hold_pointer(cx, t) then return
 
     t match
-        Ptr(_) -> moved(evs, s"{${type_show(t)}}")
+        Ptr(_, _) -> moved(evs, s"{${type_show(t)}}")
         _ -> moved(evs, "*")
 end value_moves
 
@@ -2844,7 +2844,7 @@ private slots_address(t: &Track, args: Buf[TExpr], ty: Type) -> bool
 
     val addressed = ty match
         Slice(_, _) -> true
-        Ptr(_) -> true
+        Ptr(_, _) -> true
         _ -> false
 
     addressed && reads_vessel(t, args)
@@ -3079,7 +3079,7 @@ private is_environment(t: Type) -> bool = t match
     _ -> false
 
 private pointee_or(t: Type) -> Type = t match
-    Ptr(inner) -> *inner
+    Ptr(inner, _) -> *inner
     _ -> t
 
 private place_path(scope: Scope, place: TExpr) -> string = *place.kind match
@@ -3487,7 +3487,7 @@ private into_pointee(t: &Track, place: TExpr) -> bool = *place.kind match
     // whatever storage that points at, which is not the pointee's.
     TIndex(r, _, _) -> texpr_type(r) match
         Array(_, _) -> into_pointee(t, r)
-        Ptr(_) -> carries(t, r)
+        Ptr(_, _) -> carries(t, r)
         _ -> false
     _ -> false
 
@@ -3573,7 +3573,7 @@ private lends_vessel(t: &Track, arg: TExpr) -> bool = *arg.kind match
     _ -> false
 
 private is_ptr_type(ty: Type) -> bool = ty match
-    Ptr(_) -> true
+    Ptr(_, _) -> true
     _ -> false
 
 private answers_read(t: &Track, name: string, args: Buf[TExpr], i: usize) -> bool
@@ -3612,7 +3612,7 @@ end loop_carries
 // no layout cannot be a local, a field or an element, so the storage it points at is C's. Making one
 // out of a local's address takes a `ptr_cast`, which is unchecked.
 may_hold_pointer(cx: &KeepsCx, t: Type) -> bool = t match
-    Ptr(inner) -> !is_opaque_struct(*inner)
+    Ptr(inner, _) -> !is_opaque_struct(*inner)
     Trait(_, _, _) -> true
     Ref(inner, _) -> may_hold_pointer(cx, *inner)
     Weak(inner) -> may_hold_pointer(cx, *inner)
@@ -3638,7 +3638,7 @@ end aggregate_holds
 // The same, with the structs and enums already being asked about, which a type reaching itself
 // through a box answers nothing new for.
 private holds_pointer_within(t: Type, seen: *Buf[string]) -> bool = t match
-    Ptr(inner) -> !is_opaque_struct(*inner)
+    Ptr(inner, _) -> !is_opaque_struct(*inner)
     Trait(_, _, _) -> true
     Ref(inner, _) -> holds_pointer_within(*inner, seen)
     Weak(inner) -> holds_pointer_within(*inner, seen)
@@ -3666,7 +3666,7 @@ private holds_raw_pointer(t: Type, depth: int) -> bool
     if depth > 6 then return false
 
     t match
-        Ptr(inner) -> !is_opaque_struct(*inner)
+        Ptr(inner, _) -> !is_opaque_struct(*inner)
         Volatile(inner) -> holds_raw_pointer(*inner, depth + 1)
         Array(_, elem) -> holds_raw_pointer(*elem, depth + 1)
         Slice(elem, _) -> holds_raw_pointer(*elem, depth + 1)
@@ -4326,7 +4326,7 @@ private held_in_capture(ft: &FrameTrack, held: *Buf[(int, string, string)], arg:
     *arg.kind match
         TLoad(_, ty) ->
             if local_root(ft.refs, arg).is_some()
-                for r in read_cores_along(ft, TExpr(arg.span, TAddrOf(arg, Ptr(ty))))
+                for r in read_cores_along(ft, TExpr(arg.span, TAddrOf(arg, Ptr(ty, false))))
                     if r.0 == 1 then held.push((1, r.1, r.2))
         _ -> ()
 
@@ -6111,7 +6111,7 @@ private arg_bases(ft: &FrameTrack, arg: TExpr) -> Option[Buf[(string, string)]]
         _ -> ()
 
     val pointee = texpr_type(arg) match
-        Ptr(inner) -> type_show(*inner)
+        Ptr(inner, _) -> type_show(*inner)
         _ -> return None
 
     var level: Buf[(string, string)] = buf()
@@ -6668,7 +6668,7 @@ private entry_binding_loc(cx: &KeepsCx, f: TFunc, loc: string) -> bool
     else return false
 
     f.params[0].1 match
-        Ptr(env) -> *env match
+        Ptr(env, _) -> *env match
             Struct(st) ->
                 for field in st.fields
                     val label = field.0
@@ -6899,7 +6899,7 @@ private c_callable(p: Param) -> bool = *p.typ.kind match
     _ -> false
 
 private param_is_pointer(p: Param) -> bool = *p.typ.kind match
-    PtrType(_) -> true
+    PtrType(_, _) -> true
     _ -> false
 
 // What is wrong with a scoped member's receiver, as the end of a sentence, or nothing where it is the
@@ -6908,7 +6908,7 @@ private scoped_receiver(ps: Buf[Param]) -> string
     if ps.is_empty() || ps[0].name != "self" then return "has no receiver"
 
     *ps[0].typ.kind match
-        PtrType(_) -> ""
+        PtrType(_, _) -> ""
         RefType(_, _) -> "takes '&self', a share of a value rather than the pointer a call lends"
         _ -> "takes 'self' by value, a copy rather than the pointer a call lends"
 end scoped_receiver

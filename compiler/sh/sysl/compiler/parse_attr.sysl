@@ -1069,7 +1069,7 @@ names_pointer_param(ps: Buf[Param], name: string) -> bool
     for item in ps
         if item.name == name
             return *item.typ.kind match
-                PtrType(_) -> true
+                PtrType(_, _) -> true
                 _ -> false
 
     false
@@ -1139,11 +1139,21 @@ private parse_attributed_decl(p: *Parser, start: Span) -> Stmt
         return from_first(start, laid_out(p, at, parse_struct_decl(p, at, vis, false, a_union), attrs))
     end if
 
-    // An enum takes the annotations a program declares and nothing else: its layout is the
-    // compiler's, and it names no symbol.
-    if p.at_kw("enum") && any_user(attrs)
+    // An enum takes the annotations a program declares, and `@export("PREFIX")`, which defines its
+    // variants as constants in a generated header. Its layout is the compiler's, and it names no
+    // symbol.
+    if p.at_kw("enum") && (any_user(attrs) || has_export(attrs))
         refuse_unless(p, at, attrs, "enum")
+        refuse_weak_export(p, attrs, "an enum's '@export' defines constants in a generated header, which is no definition the link could replace")
         return from_first(start, annotated_enum(parse_enum_decl(p, at, vis), attrs))
+    end if
+
+    // `@export` above a `const` defines it as a macro in a generated header -- the way C states a
+    // fixed number. A constant is folded into every use, so this is the one thing it may be exported
+    // as: there is no storage behind it for a symbol to name.
+    if p.at_kw("const") && all_are(attrs, "export")
+        refuse_weak_export(p, attrs, "a constant's '@export' defines a macro in a generated header, which is no definition the link could replace")
+        return from_first(start, exported_const(parse_stmt_at(p, false), attrs, vis))
     end if
 
     // A layout beside `@export` marks a struct and only a struct: a `type` takes `@export` alone,
@@ -1258,7 +1268,7 @@ private may_carry(form: string, a: Attr) -> bool
             attr_word(a) == "pinned" || is_user(a) || is_annotation_mark(a)
     end if
 
-    if form == "enum" then return is_user(a)
+    if form == "enum" then return is_user(a) || attr_word(a) == "export"
     if form == "type" then return is_user(a) || attr_word(a) == "export"
 
     if form == "binding" then return is_storage(a) || attr_word(a) == "export"
@@ -1358,7 +1368,7 @@ private attributed_refusal(attrs: Buf[Attr]) -> string
         return "'@section(\"...\")' places one object in a linker section, so it marks a 'var', a 'val' or a function — a 'const' is folded into every use and has no storage to place, and an 'extern' names something this program does not define"
 
     if all_are(attrs, "export")
-        return "'@export' names what C sees — a function's symbol, a module 'var' or 'val''s symbol, or the name a struct's or a type's 'typedef' carries in a generated header — and this declares none of them. A 'const' is folded into every use and has no storage to name, a simple enum is spelled as the integer it is, so it has no name in the header to choose, and an 'extern' names something this program does not define"
+        return "'@export' names what C sees — a function's symbol, a module 'var' or 'val''s symbol, the name a struct's or a type's 'typedef' carries in a generated header, or the macro a 'const' or a simple enum's variants are defined as there — and this declares none of them. An 'extern' names something this program does not define"
 
     // The layout pair beside the name settles which kind was meant: `@packed` cannot mark a function,
     // so the group together can only be about a struct and the refusal need not offer the function
@@ -1771,11 +1781,27 @@ private annotated_enum(s: Stmt, attrs: Buf[Attr]) -> Stmt
             for attr in attrs
                 attr match
                     User(u) -> decl.annots.push(u)
+                    Export(e) -> decl.export = Some(e)
                     _ -> ()
 
             stmt(s.span, EnumDecl(decl))
         _ -> s
 end annotated_enum
+
+// `@export` folded onto the `const` below it. The visibility was read before the keyword, as for a
+// binding (`placed`), so it is handed in and put back.
+private exported_const(s: Stmt, attrs: Buf[Attr], written: Visibility) -> Stmt
+    var export: Option[ExportAttr] = None
+
+    for attr in attrs
+        attr match
+            Export(e) -> export = Some(e)
+            _ -> ()
+
+    *s.kind match
+        ConstDecl(n, t, v, vis, _) -> stmt(s.span, ConstDecl(n, t, v, either_vis(written, vis), export))
+        _ -> s
+end exported_const
 
 // The fields `@guards(...)` names, each held to being one the struct declares and keeps `private`.
 //

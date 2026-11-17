@@ -353,7 +353,7 @@ index_expr(cx: &Analyzer, span: Span, receiver: Expr, index: Expr,
     // own -- an array, or a container indexed through a trait -- is indexed as that thing, so `p[i]`
     // means what `p.at(i)` and `(*p)[i]` mean rather than the `i`th container along.
     val tr = repr(texpr_type(raw)) match
-        Ptr(inner) -> if pointee_indexes(cx, *inner) then auto_deref(cx, raw) else raw
+        Ptr(inner, _) -> if pointee_indexes(cx, *inner) then auto_deref(cx, raw) else raw
         _ -> auto_deref(cx, raw)
 
     repr(texpr_type(tr)) match
@@ -540,7 +540,7 @@ private index_non_vector(cx: &Analyzer, span: Span, raw: TExpr, tr: TExpr, index
                 _ -> ()
 
             return repr(texpr_type(call)) match
-                Ptr(inner) -> TExpr(span, TDeref(call, *inner))
+                Ptr(inner, _) -> TExpr(span, TDeref(call, *inner))
                 _ -> call
         end if
 
@@ -559,7 +559,7 @@ private index_non_vector(cx: &Analyzer, span: Span, raw: TExpr, tr: TExpr, index
                     val call = call_member(cx, span, raw, place_member(cx), args, None)
 
                     return repr(texpr_type(call)) match
-                        Ptr(inner) -> TExpr(span, TDeref(call, *inner))
+                        Ptr(inner, _) -> TExpr(span, TDeref(call, *inner))
                         _ -> call
                 end if
 
@@ -573,7 +573,7 @@ private index_non_vector(cx: &Analyzer, span: Span, raw: TExpr, tr: TExpr, index
     // before `p` exactly as C's does, and a literal index takes `isize` to say so. Everything with a
     // length counts from its start, so its literal stays a `usize` and a negative one is refused.
     val index_type = repr(texpr_type(tr)) match
-        Ptr(_) -> isize_type(word_bits(cx))
+        Ptr(_, _) -> isize_type(word_bits(cx))
         _ -> usize_type(word_bits(cx))
 
     // Any integer indexes, so an index is not a use that fixes a literal binding's type
@@ -685,8 +685,11 @@ private slice_expr(cx: &Analyzer, span: Span, receiver: Expr, lo: Option[Expr], 
     //
     // **A raw pointer, a `&[N]T` and a slice own nothing**, so the binding that holds one being
     // written once says nothing about the elements it leads to -- the same answer `p[i] = v` gets.
+    // **A `*const T` gives a `[]const T`**, the view keeping the pointer's promise -- or the
+    // brackets would be the way around the `const`.
     val view_ty = view_of(rt, elem.unwrap(),
-                          want_const || read_only_view(rt) || read_only_elements(cx, tr))
+                          want_const || read_only_view(rt) || read_only_elements(cx, tr) ||
+                              read_only_pointer(rt))
 
     // A view that may be written is an alias like any other, so it is refused where a `&` would be:
     // over storage inside a struct whose invariant reads it.
@@ -732,7 +735,7 @@ private stored_in_place(cx: &Analyzer, e: Expr, whole: bool) -> bool
     discard_trial(cx, tried)
 
     repr(texpr_type(t)) match
-        Ptr(_) -> false
+        Ptr(_, _) -> false
         Ref(_, _) -> false
         Weak(_) -> false
         Slice(_, _) -> false
@@ -876,7 +879,7 @@ private slice_elem(cx: &Analyzer, span: Span, rt: Type, hi: Option[Expr]) -> Opt
         // **A pointee a type parameter stands for is decided by the parameter**, as a subscript's is
         // (`pointee_indexes`): the body was read with `*T` a region of `T`s, so an instantiation at
         // `T = [4]int` views `[4]int`s rather than the first one's `int`s.
-        Ptr(inner) ->
+        Ptr(inner, _) ->
             pointee_array(cx, *inner) match
                 Some(e) -> return Some(e)
                 None ->

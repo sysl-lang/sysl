@@ -71,7 +71,7 @@ resolve_type(a: &Analysis, scope: Scope, t: TypeRef, subst: Buf[Binding]) -> Typ
     NamedType(name, args) -> resolve_named(a, scope, t.span, name, args, subst, "")
     // **A hop is what makes a cycle finite**, so the four forms that point rather than hold are
     // counted -- and the count is what a type reached again is judged against.
-    PtrType(inner) -> resolve_ptr(a, scope, t.span, inner, subst)
+    PtrType(inner, read_only) -> resolve_ptr(a, scope, t.span, inner, read_only, subst)
     RefType(inner, sync) -> resolve_ref(a, scope, t.span, inner, sync, subst)
     WeakType(inner) ->
         Weak(under_indirection(a, () -> resolve_pointee(a, scope, inner, subst, "weak")))
@@ -256,7 +256,7 @@ end volatile_admits
 
 // The rest of the refusals, by shape; empty where the shape is admitted.
 private volatile_refusal(t: Type, shown: string) -> string = t match
-    Ptr(_) -> ""
+    Ptr(_, _) -> ""
     CFn(_, _, _) -> ""
     Ref(_, _) -> volatile_counted()
     Weak(_) -> volatile_counted()
@@ -303,12 +303,13 @@ private resolve_ref(a: &Analysis, scope: Scope, span: Span, inner: TypeRef, sync
 end resolve_ref
 
 // `*T` — and where `T` is a trait, a raw object, asked about as the counted one is.
-private resolve_ptr(a: &Analysis, scope: Scope, span: Span, inner: TypeRef, subst: Buf[Binding]) -> Type
+private resolve_ptr(a: &Analysis, scope: Scope, span: Span, inner: TypeRef, read_only: bool,
+                    subst: Buf[Binding]) -> Type
     val ty = under_indirection(a, () -> resolve_pointee(a, scope, inner, subst, "*"))
 
     if check_object_written(a, scope, inner, ty, "*", subst) then return Unknown
 
-    Ptr(ty)
+    Ptr(ty, read_only)
 end resolve_ptr
 
 // Every type of a list, in order.
@@ -2705,7 +2706,7 @@ instantiate_named_subtype(a: &Analysis, scope: Scope, span: Span, written: strin
 
     if !is_plain_alias(d) then
         made = constrained_exported(key, base, d.derived, lo, hi, exclusive, pred, cname,
-                                    d.wrapping.is_some())
+                                    d.wrapping.is_some(), d.c_spelling)
 
     a.tables.constrained_insts.put(key, made)
 

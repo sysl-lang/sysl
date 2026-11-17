@@ -231,7 +231,17 @@ struct ConstrainedType
     // can spell the arguments. Empty for a declaration that takes no parameters.
     generic: string
     targs: Buf[Type]
+    // A `c type`'s C name, `size_t` for `Size = "size_t"`: what a generated header spells it by.
+    // It takes no part in equality -- the type is the integer it was measured as.
+    c_spelling: Option[CSpelling]
 end ConstrainedType
+
+// The C name a `c type` was measured from, and the headers its file named with `@include` -- which a
+// generated header includes in turn, since the name means nothing to C without them.
+struct CSpelling
+    name: string
+    headers: Buf[string]
+end CSpelling
 
 // One end of a `within` range: a number, or -- over a float base only -- one of the two infinities,
 // which no decimal is. `real within 0.0..infinity` is bounded below and open above, and the end that
@@ -314,8 +324,11 @@ enum Type
     // types that were written out.
     Trait(name: string, args: Buf[Type], assocs: Buf[(string, Type)])
 
-    // `*T` -- a raw pointer, which promises nothing about what it points at.
-    Ptr(inner: &Type)
+    // `*T`, `*const T` -- a raw pointer, which promises nothing about what it points at.
+    // `read_only` is the `const`: like a slice's, it is a property of the pointer rather than of the
+    // pointee, so the two are one type with a bit -- laid out, passed and emitted alike -- and the
+    // bit changes only what may be done through it.
+    Ptr(inner: &Type, read_only: bool)
 
     // `*extern(int) -> int` -- a pointer to a function under the C convention. `keeps` carries the
     // parameters written `@keeps` -- `*extern(@keeps *Heap) -> unit` -- the way a callable's trait
@@ -496,8 +509,8 @@ type_eq(a: Type, b: Type) -> bool = a match
     Trait(an, aargs, aassocs) -> b match
         Trait(bn, bargs, bassocs) -> an == bn && types_eq(aargs, bargs) && assocs_eq(aassocs, bassocs)
         _ -> false
-    Ptr(ai) -> b match
-        Ptr(bi) -> type_eq(*ai, *bi)
+    Ptr(ai, aro) -> b match
+        Ptr(bi, bro) -> aro == bro && type_eq(*ai, *bi)
         _ -> false
     CFn(aps, ar, ak) -> b match
         CFn(bps, br, bk) -> types_eq(aps, bps) && type_eq(*ar, *br) && assocs_eq(ak, bk)
@@ -554,7 +567,7 @@ private constrained_eq(a: &ConstrainedType, b: &ConstrainedType) -> bool =
 constrained(name: string, base: Type, derived: bool, lo: Option[Decimal], hi: Option[Decimal],
             exclusive_hi: bool, pred_fn: Option[string]) -> Type =
     Constrained(ConstrainedType(name, base, derived, finite_at(lo), finite_at(hi), exclusive_hi,
-                                pred_fn, None, false, "", buf()))
+                                pred_fn, None, false, "", buf(), None))
 
 // A written end that is a number, as the end it is.
 private finite_at(d: Option[Decimal]) -> Option[RangeEnd] = d match
@@ -564,14 +577,15 @@ private finite_at(d: Option[Decimal]) -> Option[RangeEnd] = d match
 // The same, carrying the name a C header gives it.
 constrained_exported(name: string, base: Type, derived: bool, lo: Option[RangeEnd],
                      hi: Option[RangeEnd], exclusive_hi: bool, pred_fn: Option[string],
-                     cname: Option[string], wrapping: bool) -> Type =
+                     cname: Option[string], wrapping: bool, c_spelling: Option[CSpelling] = None) -> Type =
     Constrained(ConstrainedType(name, base, derived, lo, hi, exclusive_hi, pred_fn, cname, wrapping,
-                                "", buf()))
+                                "", buf(), c_spelling))
 
 // A `new` type declared with parameters, at the arguments `generic` was applied to: a type of its
 // own, checking nothing, laid out as its base.
 constrained_applied(name: string, generic: string, targs: Buf[Type], base: Type) -> Type =
-    Constrained(ConstrainedType(name, base, true, None, None, false, None, None, false, generic, targs))
+    Constrained(ConstrainedType(name, base, true, None, None, false, None, None, false, generic, targs,
+                                None))
 
 // Two lists of types, element for element.
 types_eq(xs: Buf[Type], ys: Buf[Type]) -> bool

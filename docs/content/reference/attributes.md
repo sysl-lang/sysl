@@ -20,6 +20,7 @@ has a name and a spelling of its own:
 | `@export("...")` on a `struct` | an **annotation** — the name the type carries in a generated C header | the grammar |
 | `@renamed("...", "...")`, `@removed("...", "...")` | an **annotation** — the declaration under it is a tombstone, a name that is gone; see [`@renamed` and `@removed`](#renamed-and-removed-a-name-that-is-gone-and-what-became-of-it) | the grammar |
 | `@export("...")` on a module `var` or `val` | an **annotation** — the C symbol the storage is published under | the grammar |
+| `@export("...")` on a `const` or a simple `enum` | an **annotation** — the macro a generated C header defines for the value, or the prefix of one per variant; see [constants in the header](/reference/ffi/#constants-in-the-header) | the grammar |
 | `@no_alloc`, `@requires`, `@link`, `@include`, `@tests` | an **annotation** — a fact about the whole file, in its header | the grammar |
 | `@assert` | an **annotation** that describes nothing but itself — a condition settled while compiling | the analyzer, once |
 | `#if` | a **directive** — a gate on lines | a pass before the lexer |

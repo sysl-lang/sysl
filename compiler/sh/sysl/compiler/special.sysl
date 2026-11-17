@@ -248,7 +248,7 @@ end shows
 // (`reference/traits.md § Any type may carry an impl` refuses a memory mode as a subject), and every
 // value `debug_by_rule` names.
 private shown_by_rule(ty: Type) -> bool = ty match
-    Ptr(inner) -> !is_trait(*inner) || slotless_debug(trait_bound_of(*inner).name)
+    Ptr(inner, _) -> !is_trait(*inner) || slotless_debug(trait_bound_of(*inner).name)
     Ref(inner, _) -> is_trait(*inner) && slotless_debug(trait_bound_of(*inner).name)
     // A `volatile` value a program prints is read and printed as it always was; only a structure
     // shown around one leaves it unread (`debugger`).
@@ -371,7 +371,7 @@ private debugger(cx: &Analyzer, span: Span, t: TExpr, asked: string,
 
     if shown_by_rule(vt)
         vt match
-            Ptr(inner) ->
+            Ptr(inner, _) ->
                 if !is_trait(*inner) then
                     return (TExpr(span, TCast(t, usize_type(word_bits(cx)))),
                             lib_fn(cx, "debug_address"), None)
@@ -460,7 +460,7 @@ callable_debug(cx: &Analyzer, span: Span, rty: Type, args: Buf[Expr]) -> TExpr
 
     var all: Buf[TExpr] = buf()
 
-    all.push(shown_text(span, slotless_text(Ptr(rty))))
+    all.push(shown_text(span, slotless_text(Ptr(rty, false))))
     all.push(type_expr_bare(cx, args[0]))
     all.push(type_expr_bare(cx, args[1]))
     TExpr(span, TCall(lib_fn(cx, "display_str"), all, Unit, false))
@@ -480,7 +480,7 @@ placeholder_of(cx: &Analyzer, ty: Type) -> Option[(string, string)]
 
     if shown_by_rule(ty)
         ty match
-            Ptr(inner) -> if !is_trait(*inner) then return None
+            Ptr(inner, _) -> if !is_trait(*inner) then return None
             Weak(_) -> return None
             Unit -> return None
             _ -> ()
@@ -910,11 +910,11 @@ private va_list_arg(cx: &Analyzer, span: Span, what: string, arg: Expr) -> TExpr
     val t = type_expr_bare(cx, arg)
 
     texpr_type(t) match
-        Ptr(inner) ->
+        Ptr(inner, _) ->
             if *inner == VaList then t
             else cx.err(span, s"'$what' needs a va_list, not ${type_show(texpr_type(t))}")
         VaList ->
-            TExpr(span, TAddrOf(require_place(cx, t, arg, s"'$what'", false), Ptr(VaList)))
+            TExpr(span, TAddrOf(require_place(cx, t, arg, s"'$what'", false), Ptr(VaList, false)))
         other -> cx.err(span, s"'$what' needs a va_list, not ${type_show(other)}")
 end va_list_arg
 
@@ -963,7 +963,7 @@ private va_readable(cx: &Analyzer, span: Span, ty: Type, written: Type)
             cx.fault(span, s"a variadic argument is promoted to double, so it cannot be read as " +
                      s"${va_shown(ty, written)} — read it as 'real' and convert")
         Char -> return
-        Ptr(_) -> return
+        Ptr(_, _) -> return
         CFn(_, _, _) -> return
         other ->
             cx.fault(span, s"a variadic argument cannot be read as ${va_shown(other, written)} — it " +
