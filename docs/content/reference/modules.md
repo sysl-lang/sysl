@@ -508,11 +508,30 @@ print(needed(e), flag(Short('v')))
 4 v
 ```
 
-With nothing expected, the two offers are still the compile error the table names:
+With nothing expected, what the call carries may still settle it, as it does between two enums of
+one module: `sysl.args`'s `Short` carries a `char` and `sysl.encoding`'s a `usize`, so `Short(4)`
+fits only the second.
 
 ```sysl
 import sysl.args.*
 import sysl.encoding.*
+
+val e = Short(4)
+
+print(e)
+```
+
+```output
+the output needs 4 bytes
+```
+
+**The two offers are the compile error the table names only where neither the expected type nor
+the payload's shape picks one.** `sysl.encoding` and `sysl.fmt` both have a `Short(needed: usize)`,
+and nothing in `Short(4)` tells them apart:
+
+```sysl
+import sysl.encoding.*
+import sysl.fmt.*
 
 var s = Short(4)
 
@@ -520,7 +539,7 @@ print(1)
 ```
 
 ```error
-'Short' is offered by 'sysl.args.*' and 'sysl.encoding.*' — import it selectively, or write the module it comes from
+'Short' is offered by 'sysl.encoding.*' and 'sysl.fmt.*' — import it selectively, or write the module it comes from
 ```
 
 **Every step is filtered by visibility, the library's included.** A member the library keeps to itself
