@@ -1,0 +1,81 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.container.Set
+
+// **An executable keeps its own functions to itself.** A program function that is not `private` is
+// written with ordinary external linkage, which is right for every module that is linked INTO
+// something -- a library half, a C archive -- and wrong for the one that becomes the image: a symbol
+// the linker could resolve from another object is one the optimizer must assume another object calls,
+// so it never inlines a function called from a single site and keeps its out-of-line copy besides.
+// rustc gives a binary crate's functions internal linkage, and a C program gets the same from
+// `static`; `sysl build`, `sysl run` and the binary `sysl test` builds do it here.
+//
+// **What is sealed is what no other object can name**:
+//
+// - only a function of the program's OWN modules. A library or package body compiled into the
+//   program -- a function its half deferred because it reads module storage, a generic instance --
+//   is one a linked half may call by name, so it keeps its linkage;
+// - never an `@export` (its definition is what C or a weak seam names), a function placed in a
+//   section (a linker script gathers it), or one with a calling convention of its own (an interrupt
+//   handler a vector names);
+// - never one module-level `asm` names, which the optimizer cannot see calling it.
+//
+// A C file cannot spell any other sysl symbol (`codegen.sysl`'s `record_symbols`), and a function
+// whose address is handed to C is named only inside this module, where taking it is. The entry point
+// and the test runner's tables are in this module too. Codegen units promote what one partition
+// shares with another to hidden (`codegen_units.sysl`), as they do for a `private` function.
+
+// Whether `f` is a function of one of the `sealing` modules that nothing outside the module names.
+sealable(f: TFunc, sealing: Buf[string]) -> bool =
+    !sealing.is_empty() && holds_string(sealing, f.declared_in) && f.exported.is_none() &&
+        f.section.is_none() && f.conv.is_none() && !f.ghost
+
+// Notes the definitions `funcs` holds from `from` on -- one sealable function's body and the parts it
+// was split into -- unless a line of module `asm` names one.
+note_sealed(funcs: Buf[IrFunc], from: usize, asm_lines: Buf[string], sealed: *Set[string])
+    for i in from..<funcs.len()
+        val name = funcs[i].sig.name
+        var named = false
+
+        for line in asm_lines
+            if holds_text(line, name) then named = true
+
+        if !named then sealed.add(name)
+end note_sealed
+
+// `funcs` with every external definition `sealed` names made `internal`. One already `internal`, or a
+// copy of a body defined elsewhere, is left as it is.
+//
+// **A sealed definition carries `SealedAttr`**, which LLVM ignores and the codegen units read
+// (`codegen_units.sysl`): it is placed by a hash of its name, as it was while it was external, rather
+// than following its first user as a `private` function does. Followed, every sealed function the
+// entry reaches would land in the entry's partition, and a large program would compile in one clang.
+sealed_funcs(funcs: Buf[IrFunc], sealed: Set[string]) -> Buf[IrFunc]
+    var out: Buf[IrFunc] = buf()
+
+    for f in funcs
+        if f.sig.linkage == LinkDefault && sealed.has(f.sig.name)
+            var attrs: Buf[(string, string)] = buf()
+
+            for kv in f.sig.attrs
+                attrs.push(kv)
+
+            attrs.push((SealedAttr, ""))
+            out.push(f with { sig = f.sig with { linkage = LinkInternal, hidden = false, attrs = attrs } })
+        else
+            out.push(f)
+
+    out
+end sealed_funcs
+
+// The string attribute a sealed definition is written with.
+const SealedAttr: string = "sysl-sealed"
+
+// **The `source_filename` an executable's module names.** A profile (`--profile-generate`) records
+// an `internal` function as `<source file>;<symbol>`, and LLVM's default source file is the path of
+// the text clang reads -- `<output>.ll`, or a unit's object beside it. Built to one output and
+// optimized to another, the two builds would name every sealed function differently, and
+// `--profile-use` would find none of them. One fixed name keeps the profile's names what they were
+// while the functions were external: the symbol alone fixes which function each is.
+const SealedSource: string = "sysl"

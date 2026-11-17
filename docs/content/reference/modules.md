@@ -81,6 +81,15 @@ at which a declaration can be fully inferred and LLVM `internal` linkage applies
 the everyday module-internal helper is `private[arch]` rather than a bare `private`, so the common
 case is the wordier one.
 
+**An executable keeps all of its own functions to itself.** `sysl build`, `sysl run` and the binary
+`sysl test` builds give every function of the program's own modules `internal` linkage, `private` or
+not, as rustc does for a binary crate and `static` does for C: nothing outside the image can call
+one, so the optimizer may inline a function called from one place and drop its out-of-line copy. The
+exceptions are what something outside the module names — an `@export`, a function placed in a
+`@section`, one a module-level `asm` block names. A library build (`build-lib`), a C archive and the
+text `emit-llvm` prints keep the linkage the declaration wrote, which is where `private` is what
+makes a function `internal`.
+
 **There is no `pub` keyword.** Rust makes a declaration private until `pub`; Scala and Kotlin make it
 public until restricted, and that is the precedent here. The low-ceremony common case — a small module
 whose declarations are meant to be used — writes no modifier, and encapsulation is the deliberate act.

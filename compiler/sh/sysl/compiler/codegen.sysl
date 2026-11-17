@@ -40,19 +40,26 @@ end codegen_module
 //
 // `watched` is set for a program `sysl run` is about to start, whose entry then watches its runner
 // (`gen_runner_watch`).
+//
+// `sealing` names the program's own modules where this module becomes an EXECUTABLE (`sysl build`,
+// `sysl run`, a test binary): every function of theirs that nothing outside the module names is
+// defined `internal` (`seal_linkage.sysl`). Empty, nothing is sealed -- a library half, a C archive,
+// the text `emit-llvm` prints.
 codegen_with_gaps(p: TProgram, t: Target, pr: Promotions,
                   imports: bool = false,
                   only: Option[Set[string]] = None,
-                  watched: bool = false) -> (IrModule, Buf[(string, string)])
+                  watched: bool = false,
+                  sealing: Buf[string] = buf()) -> (IrModule, Buf[(string, string)])
     var e = emitter_for(t, p.destructors)
 
-    codegen_into(&e, p, t, pr, imports, only, watched)
+    codegen_into(&e, p, t, pr, imports, only, watched, sealing)
 end codegen_with_gaps
 
 private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
                      imports: bool = false,
                      only: Option[Set[string]] = None,
-                     watched: bool = false) -> (IrModule, Buf[(string, string)])
+                     watched: bool = false,
+                     sealing: Buf[string] = buf()) -> (IrModule, Buf[(string, string)])
     val layout = e.layout
     val word_bits = int(t.pointer_bits())
 
@@ -154,6 +161,10 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
     var gaps: Buf[(string, string)] = buf()
     var imported: Set[string] = set()
 
+    // The symbols of the definitions an executable keeps to itself (`seal_linkage.sysl`).
+    var sealed: Set[string] = set()
+    val asm_lines = module_asm_lines(p.module_asm)
+
     // An owning function's borrowing entry, in a program, waits for something to name it
     // (`owned_params.sysl`); an artifact emits every one.
     val lazy = p.entry_point
@@ -178,10 +189,14 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
 
             gen_function(e, f) match
                 Some(built) ->
+                    val from = funcs.len()
+
                     for whole in owned_split(e, f, built, lazy, false, pending)
                         for item in split_disjoint(f, whole)
                             for part in split_self(e, f, item, self_bodies)
                                 funcs.push(part)
+
+                    if sealable(f, sealing) then note_sealed(funcs, from, asm_lines, &sealed)
                 None -> gaps.push((f.name, gap_text(e)))
 
             // Its +0 entry beside it, where it has one.
@@ -361,8 +376,12 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
             if item.copy
                 push_copy(funcs, parts)
             else
+                val from = funcs.len()
+
                 for part in parts
                     funcs.push(part)
+
+                if sealable(item.f, sealing) then note_sealed(funcs, from, asm_lines, &sealed)
 
         made = drain_helpers(e, made, built_helpers, gaps)
     end if
@@ -410,9 +429,12 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
     for i in 0..<vtables.len()
         globals.push(vtables[i])
 
+    if !sealed.is_empty() then funcs = sealed_funcs(funcs, sealed)
+
     val m = IrModule(t.triple, declares(e, p), struct_defs(p, layout), enum_defs(p, layout),
                      box_defs(e, word_bits), imported_sigs(e, p, imported), globals, helpers, funcs, thunks,
-                     entry, used_of(e, p, funcs), init, module_asm_lines(p.module_asm))
+                     entry, used_of(e, p, funcs), init, asm_lines,
+                     if sealing.is_empty() then "" else SealedSource)
 
     (if bf16_as_bits(t) then soft_bf16_lower(m) else m, gaps)
 end codegen_into

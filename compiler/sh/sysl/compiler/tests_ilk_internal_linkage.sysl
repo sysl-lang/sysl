@@ -1,0 +1,524 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{cstring, join, replace_all, split, Search}
+
+// **An executable keeps its own functions to itself** (`seal_linkage.sysl`). `sysl build`, `sysl run`
+// and the binary `sysl test` builds define every function of the program's own modules `internal`,
+// unless something outside the module names it: an `@export`, a function placed in a section, one
+// module-level `asm` names. The text `emit-llvm` prints, a library half and a C archive keep the
+// linkage the declaration wrote. Asserted on the text a build hands clang (`emit_llvm_text` with
+// `linking`), on the symbols of the image (`nm`), and on what the image does -- one unit and four, a
+// callback C calls, a test binary, a profile, a bare-metal target, and the one way of reaching a
+// sealed function that no longer links.
+//
+// Not here: a variadic `@export` (excluded by the same `exported` rule as any export; its own file is
+// `tests_vwe_variadic_weak_export.sysl`), and the sanitizer's symbolization, which reads local
+// symbols as it reads global ones (`tests_san_sanitizer.sysl` is run beside this file).
+
+private ilk_ready() -> bool = std_root().is_ok() && clang_available()
+
+private extern "setenv" ilk_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" ilk_c_unsetenv(name: *u8) -> int
+
+private ilk_units(n: string)
+    val k = cstring("SYSL_CODEGEN_UNITS")
+    val v = cstring(n)
+
+    ilk_c_setenv(k.ptr, v.ptr, 1)
+end ilk_units
+
+private ilk_units_default()
+    val k = cstring("SYSL_CODEGEN_UNITS")
+
+    ilk_c_unsetenv(k.ptr)
+end ilk_units_default
+
+private ilk_root(files: []const (string, string)) -> string
+    val root = absolute_path(replace_all(make_temp_dir("sysl-ilk").unwrap(), "//", "/"))
+
+    for i in 0..<files.len
+        val dir = files[i].0.last_index_of("/")
+
+        if dir.is_some() then make_dir_all(s"$root/${files[i].0[0..<dir.unwrap()]}").unwrap()
+
+        write_text(s"$root/${files[i].0}", files[i].1).unwrap()
+
+    root
+end ilk_root
+
+// The text a build of these files hands clang (`sealed`), or the text `emit-llvm` prints.
+private ilk_text(files: []const (string, string), sealed: bool, target: Option[string] = None) -> string
+    val root = ilk_root(files)
+
+    val out = emit_llvm_text(root, target, DefaultOptimization, buf(), None, sealed) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end ilk_text
+
+// The `define` line of `symbol` in `text`, or `""` where nothing defines it.
+private ilk_define(text: string, symbol: string) -> string
+    for line in lines_of(text)
+        if line.starts_with("define ") && (line.contains(s"@$symbol(") || line.contains(s"@\"$symbol\"("))
+            return line
+
+    ""
+end ilk_define
+
+private ilk_internal(text: string, symbol: string) -> bool =
+    ilk_define(text, symbol).starts_with("define internal ")
+
+// What the program these files make prints at `level`, or what stopped the build, with the root
+// spelled `<root>`.
+private ilk_ran(files: []const (string, string), level: string = DefaultOptimization) -> string
+    val root = ilk_root(files)
+    val exe = s"$root/built"
+
+    val said = build_native_program(root, None, None, level, Some(exe)) match
+        Err(why) -> s"refused: ${replace_all(failure_text(why), root, "<root>")}"
+        Ok(_) ->
+            capture(exe, [], "", [], true) match
+                Err(_) -> "the program that was built could not be run"
+                Ok(out) -> out.text
+
+    remove_dir_all(root).unwrap_or(())
+    said
+end ilk_ran
+
+// `nm` of a binary, all symbols or (`globals`) the defined external ones alone.
+private ilk_nm(file: string, globals: bool) -> string =
+    capture("nm", if globals then ["-gU", file] else [file]).unwrap().text
+
+// Whether an `nm` listing has `symbol` (Mach-O's `_` in front) as a symbol of the kind `kind`.
+private ilk_lists(listing: string, kind: string, symbol: string) -> bool
+    for line in lines_of(listing)
+        if line.ends_with(s" $kind _$symbol") || line.ends_with(s" $kind $symbol") then return true
+
+    false
+end ilk_lists
+
+// -- the program the cells read ---------------------------------------------------------------------
+
+// A root function, a module's function, a method, a closure and a generic instance of the program's
+// own, an export and a weak one, and a value of a library generic at a program type.
+private ilk_program_files() -> Buf[(string, string)]
+    var files: Buf[(string, string)] = buf()
+
+    files.push(("main.sysl", raw"""
+        import m
+        import sysl.buf.{Buf, buf}
+
+        struct P
+            x: int
+
+        impl P
+            read(self) -> int = self.x * 2
+
+        walk(n: int) -> int = n * 3 + 1
+
+        same[T](x: T) -> T = x
+
+        apply(f: (int) -> int) -> int = f(5)
+
+        @export("ilk_twice")
+        twice(n: i32) -> i32 = n * 2
+
+        @export("ilk_soft", weak)
+        soft(n: i32) -> i32 = n + 1
+
+        var ps: Buf[P] = buf()
+
+        ps.push(P(4))
+        print(walk(2), m.step(3), ps[0].read(), same(9), apply(n -> n + 1), twice(4), soft(1))
+        """))
+    files.push(("m/m.sysl", "module m\n\nstep(n: int) -> int = n - 1\n"))
+    files
+end ilk_program_files
+
+private val ilk_files: Buf[(string, string)] = ilk_program_files()
+
+private ilk_program() -> []const (string, string) = ilk_files.view()
+
+private val ilk_said: string = "7 2 8 9 6 8 2\n"
+
+// -- the text a build hands clang -------------------------------------------------------------------
+
+@test("an executable defines its own root function, module function, method, closure and generic instance internal")
+ilk_own_functions_are_internal()
+    if !ilk_ready() then return
+
+    val text = ilk_text(ilk_program(), true)
+
+    assert(ilk_internal(text, "walk$$sysl"), ilk_define(text, "walk$$sysl"))
+    assert(ilk_internal(text, "m$step"), ilk_define(text, "m$step"))
+    assert(ilk_internal(text, "P.read"), ilk_define(text, "P.read"))
+    assert(ilk_internal(text, "same.int"), ilk_define(text, "same.int"))
+
+    var closures = 0
+
+    for line in lines_of(text)
+        if line.starts_with("define ") && line.contains("$closure")
+            closures += 1
+            assert(line.starts_with("define internal "), line)
+
+    assert(closures > 0, text)
+    assert(ilk_define(text, "walk$$sysl").contains("\"sysl-sealed\""), ilk_define(text, "walk$$sysl"))
+    assert(text.contains("source_filename = \"sysl\"\n"), text)
+
+@test("the text emit-llvm prints keeps every one of them external, with no attribute and no source name")
+ilk_emit_llvm_is_unchanged()
+    if !ilk_ready() then return
+
+    val text = ilk_text(ilk_program(), false)
+
+    assert(ilk_define(text, "walk$$sysl").starts_with("define i"), ilk_define(text, "walk$$sysl"))
+    assert(ilk_define(text, "m$step").starts_with("define i"), ilk_define(text, "m$step"))
+    assert(ilk_define(text, "P.read").starts_with("define i"), ilk_define(text, "P.read"))
+    assert(!text.contains("sysl-sealed"), text)
+    assert(!text.contains("source_filename"), text)
+
+@test("an export's entry, a weak export and the platform's main stay external in an executable")
+ilk_exports_and_the_entry_stay_external()
+    if !ilk_ready() then return
+
+    val text = ilk_text(ilk_program(), true)
+
+    assert(ilk_define(text, "ilk_twice").starts_with("define i32 @ilk_twice("), ilk_define(text, "ilk_twice"))
+    assert(ilk_define(text, "ilk_soft").starts_with("define weak "), ilk_define(text, "ilk_soft"))
+    assert(ilk_define(text, "main").starts_with("define i32 @main("), ilk_define(text, "main"))
+
+    // The body behind an export keeps its linkage too: a library half declares it under that symbol,
+    // and a weak one's body is what a strong export displaces.
+    assert(ilk_define(text, "twice$$sysl").starts_with("define i"), ilk_define(text, "twice$$sysl"))
+
+@test("a library generic's instance at a program type is compiled into the program and keeps its linkage")
+ilk_library_bodies_stay_external()
+    if !ilk_ready() then return
+
+    val text = ilk_text(ilk_program(), true)
+    var library_defined = 0
+
+    for line in lines_of(text)
+        if line.starts_with("define ") && line.contains("sysl-sealed")
+            assert(!line.contains("@sysl.") && !line.contains("@\"sysl."), line)
+
+        if line.starts_with("define i") || line.starts_with("define void ") || line.starts_with("define ptr ")
+            if line.contains("@sysl.") || line.contains("@\"sysl.") then library_defined += 1
+
+    assert(library_defined > 0, text)
+
+@test("a function placed in a section, and one module-level asm names, stay external; their neighbour does not")
+ilk_section_and_asm_stay_external()
+    if !ilk_ready() then return
+
+    val text = ilk_text([("main.sysl", raw"""
+        @section("__TEXT,__ilk")
+        placed(n: int) -> int = n + 1
+
+        named(n: int) -> int = n + 2
+
+        plain(n: int) -> int = n + 3
+
+        asm
+            [aarch64]
+                ".globl _ilk_asm_probe"
+                "_ilk_asm_probe:"
+                "b _named$$sysl"
+            [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "an arm64 probe"
+
+        print(placed(1), named(1), plain(1))
+        """)], true)
+
+    assert(ilk_define(text, "placed$$sysl").starts_with("define i"), ilk_define(text, "placed$$sysl"))
+    assert(ilk_define(text, "named$$sysl").starts_with("define i"), ilk_define(text, "named$$sysl"))
+    assert(ilk_internal(text, "plain$$sysl"), ilk_define(text, "plain$$sysl"))
+
+@test("a thumb-freestanding image seals its own functions as a host executable does")
+ilk_a_bare_metal_image()
+    if !ilk_ready() then return
+
+    val text = ilk_text([("main.sysl", raw"""
+        helper(n: i32) -> i32 = n * 3 + 1
+
+        @export("main")
+        start() -> i32 = helper(4)
+        """)], true, Some("thumb-freestanding"))
+
+    assert(ilk_internal(text, "helper$$sysl"), text)
+    assert(ilk_define(text, "main").starts_with("define "), text)
+    assert(!ilk_define(text, "main").starts_with("define internal "), ilk_define(text, "main"))
+
+// -- the image -------------------------------------------------------------------------------------
+
+@test("the program runs, and at -O0 its own functions are local symbols while main and the exports are global")
+ilk_the_image_symbols()
+    if !ilk_ready() then return
+
+    assert_eq(ilk_ran(ilk_program()), ilk_said)
+
+    val root = ilk_root(ilk_program())
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, "0", Some(exe)).unwrap()
+
+    val all = ilk_nm(exe, false)
+    val globals = ilk_nm(exe, true)
+
+    remove_dir_all(root).unwrap_or(())
+    assert(ilk_lists(all, "t", "walk$$sysl"), all)
+    assert(ilk_lists(all, "t", "m$step"), all)
+    assert(!globals.contains("walk$$sysl") && !globals.contains("m$step"), globals)
+    assert(ilk_lists(globals, "T", "main"), globals)
+
+    // An export's entry nothing in the image calls is left out by the link's dead stripping, sealed
+    // or not; the body behind it keeps its linkage.
+    assert(ilk_lists(globals, "T", "twice$$sysl"), globals)
+    assert(ilk_lists(globals, "T", "soft$$sysl"), globals)
+
+@test("a function whose address goes to C is called back through it, and C still reaches an export")
+ilk_c_calls_back()
+    if !ilk_ready() then return
+
+    val files = [
+        ("main.sysl", raw"""
+            import sysl.raw.ptr_cast
+
+            extern qsort(base: *u8, n: usize, size: usize, cmp: *extern(*u8, *u8) -> i32)
+            extern shim_quad(n: i32) -> i32
+
+            descending(a: *u8, b: *u8) -> i32
+                val pa: *i32 = ptr_cast(a)
+                val pb: *i32 = ptr_cast(b)
+
+                *pb - *pa
+
+            @export("ilk_double")
+            double(n: i32) -> i32 = n * 2
+
+            var xs = [10, 30, 20]
+
+            qsort(ptr_cast(&xs[0]), 3, 4, &descending)
+            print(xs[0], xs[1], xs[2], shim_quad(5))
+            """),
+        ("shim.c", "int ilk_double(int);\nint shim_quad(int n) { return ilk_double(ilk_double(n)); }\n")]
+
+    assert_eq(ilk_ran(files), "30 20 10 20\n")
+    assert_eq(ilk_ran(files, "0"), "30 20 10 20\n")
+
+// The error path: a sysl function was never C's to name but through `@export`, and the one way
+// round that -- an assembler label spelling the compiler's symbol -- linked while the symbol was
+// global. It is now a link that fails, naming the symbol.
+@test("C reaching a sealed function through an assembler label spelling its symbol is a link that fails")
+ilk_c_spelling_a_sealed_symbol()
+    if !ilk_ready() then return
+
+    val said = ilk_ran([
+        ("main.sysl", "extern shim_walk(n: i32) -> i32\n\nwalk(n: i32) -> i32 = n + 1\n\nprint(walk(1), shim_walk(2))\n"),
+        ("shim.c", "int sneak(int) __asm__(\"_walk$$sysl\");\nint shim_walk(int n) { return sneak(n); }\n")])
+
+    assert(said.starts_with("refused: "), said)
+    assert(said.contains("walk$$sysl"), said)
+
+// -- a library half --------------------------------------------------------------------------------
+
+// A `--lib` root is compiled to a half of its own, which keeps its linkage: the program declares the
+// root's function and the link finds it there. A half that sealed it would leave the call unresolved.
+// The root's own function that reads its module storage is deferred to the program, which compiles
+// it beside its own and keeps it external too.
+@test("a --lib root's half keeps its functions global, so the sealed program links against them")
+ilk_a_library_half()
+    if !ilk_ready() then return
+
+    val lib = lbr_tree(lbr_one("demo/lib.sysl",
+        "module demo\n\nval base: int = 40\n\ntriple(n: int) -> int = n * 3\n\nfrom_base(n: int) -> int = base + n\n"))
+    val prog = lbr_program("import demo\n\nown(n: int) -> int = demo.triple(n) + 1\n\nprint(own(2), demo.from_base(2))\n")
+    val said = lbr_run(prog, [lib])
+    val text = lbr_text(prog, [lib])
+
+    lbr_drop([lib, prog])
+    assert_eq(said, "7 42\n")
+    assert(!ilk_internal(text, "demo$triple") && !ilk_internal(text, "demo$from_base"), text)
+
+// -- codegen units -----------------------------------------------------------------------------------
+
+// Eight functions large enough not to be copied (`CopyCost`), each called once from the entry.
+private ilk_large_program() -> string
+    var text = ""
+
+    for i in 0..<8
+        text = text + s"big$i(n: int) -> int\n    var t = n\n"
+
+        for j in 0..<12
+            text = text + s"    t = t * ${j + 3} % 1000 + ${i + j}\n"
+
+        text = text + "    t\n\n"
+
+    text = text + "var sum = 0\n"
+
+    for i in 0..<8
+        text = text + s"sum += big$i($i)\n"
+
+    text + "print(sum)\n"
+end ilk_large_program
+
+@test("a program whose sealed functions are spread over four units prints what one unit prints, and links")
+ilk_four_units()
+    if !ilk_ready() then return
+
+    val cache = make_temp_dir("sysl-ilk-cache").unwrap()
+
+    use_c_object_cache_dir(Some(cache))
+    clear_unit_object_counts()
+    ilk_units("1")
+
+    val one = ilk_ran([("main.sysl", ilk_large_program())])
+
+    ilk_units("4")
+
+    val four = ilk_ran([("main.sysl", ilk_large_program())])
+    val units = unit_object_counts().1
+
+    ilk_units_default()
+    use_c_object_cache_dir(None)
+    remove_dir_all(cache).unwrap_or(())
+    assert(!one.starts_with("refused"), one)
+    assert_eq(four, one)
+    assert(units >= 2, s"units compiled: $units")
+
+@test("and so does the program of every other cell, under the default count and under four")
+ilk_four_units_the_program()
+    if !ilk_ready() then return
+
+    assert_eq(ilk_ran(ilk_program()), ilk_said)
+    ilk_units("4")
+
+    val four = ilk_ran(ilk_program())
+
+    ilk_units_default()
+    assert_eq(four, ilk_said)
+
+// A hand-written module: `main` and eight large internal functions it calls.
+private ilk_module(sealed: bool) -> string
+    val mark = if sealed then " \"sysl-sealed\"=\"\"" else ""
+    var text = "target triple = \"arm64-apple-macosx\"\n\n"
+
+    for i in 0..<8
+        text = text + s"define internal i32 @s$i(i32 %a)$mark {\nentry:\n"
+
+        for j in 0..<40
+            val from = if j == 0 then "%a" else s"%v${j - 1}"
+
+            text = text + s"  %v$j = mul i32 $from, ${j + 3}\n"
+
+        text = text + "  ret i32 %v39\n}\n\n"
+
+    text = text + "define i32 @main() {\nentry:\n"
+
+    for i in 0..<8
+        text = text + s"  %r$i = call i32 @s$i(i32 $i)\n"
+
+    text + "  ret i32 %r7\n}\n"
+end ilk_module
+
+// How many of `parts` define one of the eight, under its own name or a promoted one.
+private ilk_homes(parts: Buf[string]) -> int
+    var n = 0
+
+    for part in parts
+        var defines = false
+
+        for line in lines_of(part)
+            if line.starts_with("define ") && !line.contains("@main(") then defines = true
+
+        if defines then n += 1
+
+    n
+end ilk_homes
+
+@test("the units place a sealed function by its name, as an external one, and a caller elsewhere reaches it hidden")
+ilk_units_place_sealed_by_name()
+    val parts = split_module(ilk_module(true), 4)
+
+    assert(parts.is_some(), "a module of sealed functions is cut")
+    assert(ilk_homes(parts.unwrap()) >= 2, join(parts.unwrap().view(), "\n;----\n"))
+
+    var hidden = false
+
+    for part in parts.unwrap()
+        if part.contains("define hidden ") && part.contains("sysl.cgu:s") then hidden = true
+
+    assert(hidden, join(parts.unwrap().view(), "\n;----\n"))
+
+@test("while a large private function still follows its caller, so the same module unsealed is one unit")
+ilk_units_private_follows()
+    assert(split_module(ilk_module(false), 4).is_none(), "every private function lives with main")
+
+// -- a test binary -----------------------------------------------------------------------------------
+
+@test("the binary sysl test builds seals the project's functions and its tests still run")
+ilk_a_test_binary()
+    if !ilk_ready() then return
+
+    val root = ilk_root([
+        ("sysl.hocon", "package { name = \"ilk\" }\n"),
+        ("main.sysl", "walk(n: int) -> int = n + 1\n\n@test(\"walk adds one\")\nwalks() = assert(walk(1) == 2)\n\n" +
+                      "@test(\"walk adds one again\")\nwalks_again() = assert(walk(2) == 3)\n")])
+    val keep = s"$root/kept"
+    val (code, out, err) = clx_ran(["sysl", "test", root, "--keep-binary", keep])
+    val listed = capture("ls", [keep]).unwrap().text.trim()
+    val globals = if listed == "" then "" else ilk_nm(s"$keep/$listed", true)
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(code, Fine, s"$out$err")
+    assert(out.contains("2 passed, 0 failed"), s"$out$err")
+    assert(listed != "", "a binary was kept")
+    assert(!globals.contains("walk$$sysl") && !globals.contains("walks"), globals)
+    assert(ilk_lists(globals, "T", "main"), globals)
+
+// -- a profile ---------------------------------------------------------------------------------------
+
+private ilk_profdata() -> Option[string] =
+    capture("xcrun", ["--find", "llvm-profdata"]) match
+        Ok(out) -> if out.status.ok() && out.text.trim() != "" then Some(out.text.trim()) else None
+        Err(_) -> None
+
+// A profile records an `internal` function under its module's source name, so two builds of one
+// program to two outputs would otherwise name it twice, and a profile of one would miss the other.
+@test("a sealed function is profiled under one name whatever output the instrumented build wrote")
+ilk_a_profile_names_it_once()
+    if !ilk_ready() then return
+
+    val tool = ilk_profdata() match
+        Some(found) -> found
+        None ->
+            print("skipped: llvm-profdata is not on this machine")
+            return
+
+    val root = ilk_root([("main.sysl", "@noinline\nwalk(n: int) -> int = n + 1\n\nprint(walk(1))\n")])
+    val raw = s"$root/raw"
+
+    for name in ["a", "b"]
+        val made = run_cli(["sysl", "build", s"$root/main.sysl", "-o", s"$root/$name", "--profile-generate", raw],
+                           (line) -> ())
+
+        reset_search_paths()
+        assert_eq(made, Fine)
+        assert_eq(capture(s"$root/$name", []).unwrap().text, "2\n")
+
+    val merged = capture(tool, ["merge", "-o", s"$root/m.profdata", raw]).unwrap()
+    val shown = capture(tool, ["show", "--all-functions", s"$root/m.profdata"]).unwrap().text
+    var named: Buf[string] = buf()
+
+    for line in lines_of(shown)
+        if line.contains("walk$$sysl") then named.push(line.trim())
+
+    remove_dir_all(root).unwrap_or(())
+    assert(merged.status.ok(), merged.text)
+    assert_eq(named.len(), 1, shown)
+    assert(named[0].starts_with("sysl;"), shown)
