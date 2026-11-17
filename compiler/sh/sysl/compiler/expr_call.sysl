@@ -751,8 +751,9 @@ private named_call(cx: &Analyzer, span: Span, callee: Expr, name: string, args: 
     // `unit`, `int` and `byte` would be words a module could take for a type and not for a
     // function, and a nullary `unit()` would be told *"a 'unit' conversion takes exactly one
     // value"* about a built-in the reader never reached for. The conversion is still what the name
-    // means wherever no declaration of it is in reach.
-    if !shadowed && tkey.is_none() && !function_in_scope(cx, name) then
+    // means wherever no declaration of it is in reach. **So does a declared `extern`**: a binding
+    // naming its C function `byte` calls it.
+    if !shadowed && tkey.is_none() && !function_in_scope(cx, name) && extern_key(cx, name).is_none() then
         val scalar = scalar_type_named(cx, span, name)
 
         if scalar.is_some() then return convert_call(cx, span, name, scalar.unwrap(), args)
@@ -931,8 +932,13 @@ end special_form
 // struct of handles some other allocator zeroed, where a `&T` field reads as null until it is
 // assigned. Like the slot forms, a function or a local of the name is what a call reaches, and the
 // form applies only where nothing else claims it.
-null_test_form(cx: &Analyzer, name: string) -> bool =
-    name == "is_null" && cx.lookup(name).is_none() && function_keys(cx, name).is_empty()
+null_test_form(cx: &Analyzer, name: string) -> bool = name == "is_null" && form_unclaimed(cx, name)
+
+// Whether nothing the reader can see claims a form's word: no local, no function and no `extern` of
+// that spelling. **Every compiler form yields to a declaration of its name**, and an `extern` is one --
+// a binding that names its C function `step` or `release` calls that function, never the form.
+form_unclaimed(cx: &Analyzer, name: string) -> bool =
+    cx.lookup(name).is_none() && function_keys(cx, name).is_empty() && extern_key(cx, name).is_none()
 
 // **The reference is read as an address and compared with null, and nothing else is done to it**: no
 // share is taken and none given back, so the test is one compare wherever it is written -- a member
@@ -975,8 +981,7 @@ private null_test_fault(t: Type) -> Option[string] = t match
 // storage the language did not initialise has to be emptied before the storage is freed or reused,
 // and assigning a fresh value would make one only to lose it. A function or a local of the name is
 // what a call reaches, and the form applies only where nothing else claims it.
-release_form(cx: &Analyzer, name: string) -> bool =
-    name == "release" && cx.lookup(name).is_none() && function_keys(cx, name).is_empty()
+release_form(cx: &Analyzer, name: string) -> bool = name == "release" && form_unclaimed(cx, name)
 
 // **It is an assignment of the empty reference and nothing else**, so everything an assignment owes
 // is owed here too: the place is held to being writable, the share it held is given back -- running
@@ -1309,6 +1314,15 @@ private convert_lanes(cx: &Analyzer, span: Span, t: TExpr, to: Type) -> TExpr
     val target = repr(to) match
         Vector(m, b) -> Some((m, *b))
         _ -> None
+
+    // A scalar of the lane's own type is the splat the language writes implicitly at a binding or an
+    // operator, here said outright: `<4>f32(x)` with `x: f32` is `x` in every lane. Any other scalar
+    // has no lane to be, as it has none at a binding either.
+    if source.is_none() && target.is_some()
+        val lane = target.unwrap().1
+
+        if can_be_lane(lane) && !is_vector(repr(got)) && type_eq(repr(got), repr(lane))
+            return TExpr(span, TSplat(t, to))
 
     if source.is_none() || target.is_none() then return cx.err(span, refusal(None, got, to))
 
