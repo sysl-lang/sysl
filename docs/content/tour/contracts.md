@@ -190,7 +190,10 @@ belongs at the top because that is where a reader looks for what the function gu
 that is when it runs.
 
 `require` is checked on entry. `ensure` is checked before **every** return, including early ones.
-Both accept an optional message.
+Both accept an optional message. A clause that does not hold stops the program, and first writes
+what failed, the message, and where to standard error: `half(-1)` above says `require failed: x
+must be non-negative (main.sysl:2:13)`, and a clause with no message says `require failed` and the
+place.
 
 Two names exist only inside a contract. `result` is the value being returned, available only in an
 `ensure`. `old(expr)` is `expr` evaluated on entry, which lets a postcondition describe what a

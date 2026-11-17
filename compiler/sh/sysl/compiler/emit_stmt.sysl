@@ -1,5 +1,6 @@
 module sh.sysl.compiler
 
+import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
 import sysl.container.Set
 import sysl.math.bigint.from_int
@@ -143,7 +144,7 @@ private gen_stmt_body(e: *Emit, s: TStmt) = s match
     // A loop's `invariant` is a condition that traps on false, which is every other clause the
     // verification chapter states -- unless it names a `@ghost` function, in which case it states a
     // proof obligation and there is nothing to lay down.
-    TInvariant(cond, _) -> if !ghostly(e, cond) then emit_contract(e, cond, "invariant")
+    TInvariant(cond, msg) -> if !ghostly(e, cond) then emit_contract(e, cond, "invariant", msg)
 
     TVariantCheck(slot, var_ty, expr) ->
         if !ghostly(e, expr) then gen_variant_check(e, slot, var_ty, expr)
@@ -553,7 +554,7 @@ private gen_multi_assign(e: *Emit, writes: Buf[TWrite])
         for k in 0..<checks.len()
             val c = checks[k]
 
-            if not_seen(&done, c) then emit_inv_check(e, gen_expr(e, c.value), c.decl, c.inv_fn)
+            if not_seen(&done, c) then emit_inv_check(e, gen_expr(e, c.value), c.decl, c.inv_fn, c.value.span)
 end gen_multi_assign
 
 // Whether this is the first time the check has been asked for, recording it either way.
@@ -879,9 +880,11 @@ gen_variant_at_call(e: *Emit, staged: Buf[(int, Val)])
     trap_unless(e, ok, "variant")
 end gen_variant_at_call
 
-// A clause that traps on false, which is what every contract clause is at run time. The condition's
-// own temporaries are given back before the trap, so the checked path stays leak-free.
-emit_contract(e: *Emit, cond: TExpr, kind: string)
+// A clause that traps on false, which is what every contract clause is at run time, saying which
+// kind of clause failed, its message where it was written with one, and where (`contract_unless`).
+// The condition's own temporaries are given back before the trap, so the checked path stays
+// leak-free.
+emit_contract(e: *Emit, cond: TExpr, kind: string, msg: Option[string])
     push_temps(e)
 
     val ok = gen_expr(e, cond)
@@ -889,11 +892,7 @@ emit_contract(e: *Emit, cond: TExpr, kind: string)
     pop_temps(e)
 
     // A failed clause names the clause, wherever the call or the return that checked it was.
-    val outer = e.trap_site
-
-    e.trap_site = Some(cond.span)
-    trap_unless(e, ok, kind)
-    e.trap_site = outer
+    contract_unless(e, ok, kind, kind, msg, cond.span)
 end emit_contract
 
 // Runs every postcondition with `result` bound to the value about to be returned.
@@ -903,7 +902,7 @@ emit_ensures(e: *Emit, result: Option[Val])
     e.result_ssa = result
 
     for item in e.ensures
-        emit_contract(e, item.cond, "ensure")
+        emit_contract(e, item.cond, "ensure", item.msg)
 
     e.result_ssa = None
 end emit_ensures
@@ -958,7 +957,10 @@ end gen_variant_check
 // **A bitfield struct's fields are ranges of one container rather than slots of an aggregate**, so
 // they are read out of it once it has been lifted out, which is the same one read whether the
 // invariant relates one field or all of them.
-emit_inv_check(e: *Emit, v: Val, d: &StructType, inv_fn: string)
+//
+// A failure reports through `contract_unless`, naming the struct and `site`, the write or the
+// construction that broke it.
+emit_inv_check(e: *Emit, v: Val, d: &StructType, inv_fn: string, site: Span)
     val ranges = bitfield_ranges(d)
     val container =
         if ranges.is_none() then VNothing
@@ -990,5 +992,5 @@ emit_inv_check(e: *Emit, v: Val, d: &StructType, inv_fn: string)
     val ok = fresh_reg(e)
 
     emit(e, ir_call(Some(ok), l_i1(), VGlobal(symbol_of(e, inv_fn)), args))
-    trap_unless(e, ok, "invariant")
+    contract_unless(e, ok, "invariant", s"invariant of '${d.name()}'", None, site)
 end emit_inv_check

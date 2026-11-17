@@ -4672,7 +4672,8 @@ private preconditions(r: &EvRun, at: Span, f: &TFunc, measured: bool, before: Op
             eval_bool(r, clause) match
                 Ok(true) -> ()
                 Ok(false) ->
-                    return Some(trap(r, clause.span, s"a 'require' of '${qualified_name(f.name)}' failed"))
+                    return Some(trap(r, clause.span, s"a 'require' of '${qualified_name(f.name)}' failed" +
+                                     clause_said(item.msg)))
                 Err(fl) -> return Some(fl)
 
     for item in f.olds
@@ -4695,11 +4696,17 @@ private postconditions(r: &EvRun, f: &TFunc, result: Option[Const]) -> Option[Fl
             eval_bool(r, clause) match
                 Ok(true) -> ()
                 Ok(false) ->
-                    return Some(trap(r, clause.span, s"an 'ensure' of '${qualified_name(f.name)}' failed"))
+                    return Some(trap(r, clause.span, s"an 'ensure' of '${qualified_name(f.name)}' failed" +
+                                     clause_said(item.msg)))
                 Err(fl) -> return Some(fl)
 
     None
 end postconditions
+
+// What a failed clause adds to its report: the message it was written with, where it has one.
+private clause_said(msg: Option[string]) -> string = msg match
+    Some(said) -> s": $said"
+    None -> ""
 
 // Whether one measure is below another.
 private below(a: Const, b: Const) -> bool = (a, b) match
@@ -4875,12 +4882,12 @@ end break_stmt
 @noinline
 private stmt_rest(r: &EvRun, s: TStmt) -> Flow
     s match
-        TInvariant(cond, _) ->
+        TInvariant(cond, msg) ->
             if names_ghost(r.a, cond) then return EvNone
 
             eval_bool(r, cond) match
                 Ok(true) -> EvNone
-                Ok(false) -> trap(r, cond.span, "a loop 'invariant' failed")
+                Ok(false) -> trap(r, cond.span, "a loop 'invariant' failed" + clause_said(msg))
                 Err(f) -> f
         TVariantCheck(slot, _, e) ->
             if names_ghost(r.a, e) then return EvNone
