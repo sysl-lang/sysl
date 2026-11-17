@@ -451,6 +451,60 @@ lays it out in is marked [`@pinned`](/reference/attributes/#pinned-on-a-struct-a
 kept in module storage or a `&T` box, and passed to C as `&fs`. The compiler then refuses every copy of
 it.
 
+### Handing C an object to hold
+
+A C API that hands out a handle — `db_open` answering a `Db *` that the caller passes back to every
+call and finally to `db_close` — is written with **`into_raw`** and **`from_raw`**
+([`memory.md`](/reference/memory/#a-counted-reference-given-up-as-a-pointer)). `r.into_raw()` gives up a
+`&T` as the address of the object, carrying one count of it to C; `from_raw(p)` adopts the count back,
+and the object goes when that reference does. In between, the pointer is a `*T`, so a call C makes
+reads and writes the fields directly, and a C program that knows the layout can too:
+
+```sysl
+import sysl.raw.from_raw
+
+struct Db
+    n: i32
+    hits: i32
+
+impl Drop for Db
+    drop(self) = print("closed", self.n, self.hits)
+
+@export("db_open")
+open(n: i32) -> *Db
+    val d: &Db = Db(n, 0)
+    d.into_raw()
+
+@export("db_hit")
+hit(p: *Db) -> i32
+    p.hits += 1
+    p.hits
+
+@export("db_close")
+close(p: *Db)
+    val d: &Db = from_raw(p)
+
+val p = open(5)
+
+hit(p)
+print(hit(p))
+close(p)
+```
+
+```output
+2
+closed 5 2
+```
+
+The C side holds nothing but the pointer, and owes what `from_raw` owes: hand back only a pointer
+`db_open` answered, and hand it back once.
+
+```c
+Db *d = db_open(5);
+db_hit(d);
+db_close(d);
+```
+
 ### A union at the boundary
 
 A [`union`](/reference/types/#unions) crosses to C by value as C's own union does, in either

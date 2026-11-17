@@ -964,6 +964,14 @@ call_member(cx: &Analyzer, span: Span, receiver: TExpr, name: string, args: Buf[
         if member.is_some() then return member.unwrap()
     end if
 
+    // **`into_raw` is every counted reference's** -- a generic `&T` and a trait object's included,
+    // which reach no table of members -- unless the referent's own type has a member of the name.
+    if name == "into_raw" && !owns_member(cx, rty, name)
+        held match
+            Ref(_, _) -> return into_raw_call(cx, span, receiver, args)
+            _ -> ()
+    end if
+
     // **Every value answers `to_string()` and `debug_string()`**, by the compiler, where its type has
     // no member of that name: the string its `Display` writes (its `Debug`, else `<T>`, where it has
     // none) and the string its `Debug` writes -- the same code `str(x)` and `debug(x)` become.
@@ -2956,6 +2964,38 @@ private no_such_member(cx: &Analyzer, span: Span, rty: Type, name: string) -> TE
         _ -> cx.err(span, s"cannot read field '$name' of ${type_show(rty)}${data_pointer_hint(rty, name)}")
 end no_such_member
 
+// `r.into_raw()` -- a counted reference given up as the address of its payload, a `*T` that carries
+// one count of the object away with it (`from_raw` in `sysl.raw` adopts it back). It is asked of the
+// reference as written, so a `&T` is what has it and the `T` inside does not. A trait object is two
+// words and its table would be lost, so it is refused, as are a value and a plain pointer, which hold
+// no count to carry.
+private into_raw_call(cx: &Analyzer, span: Span, receiver: TExpr, args: Buf[Expr]) -> TExpr
+    val ty = texpr_type(receiver)
+
+    if ty == Unknown then return bad_expr(span)
+
+    if !args.is_empty() then
+        return cx.err(span, "'into_raw' takes no arguments — it gives up the reference it is called on")
+
+    underlying(ty) match
+        Ref(inner, _) ->
+            if is_trait(*inner) then
+                return cx.err(span, s"'into_raw' gives up a reference as one address, and a " +
+                              s"'${type_show(ty)}' is two words — the address and the table of the type " +
+                              "it was erased from — so give up the '&T' it was made from instead")
+
+            TExpr(span, TIntoRaw(receiver, Ptr(inner, false)))
+        Ptr(inner, _) ->
+            cx.err(span, s"type '${type_show(ty)}' has no method 'into_raw' — 'into_raw' gives up a " +
+                   s"counted reference, and a '*' pointer holds no count; '&${type_show(*inner)}' has it")
+        Weak(inner) ->
+            cx.err(span, s"a weak ${type_show(*inner)} has no method 'into_raw' — take a counted " +
+                   "reference with 'get()' first")
+        other ->
+            cx.err(span, s"type '${type_show(ty)}' has no method 'into_raw' — 'into_raw' gives up a " +
+                   s"counted reference, so hold the value as a '&${type_show(other)}'")
+end into_raw_call
+
 // What a refusal of a data-pointer name (`ptr`, `data`, `as_ptr`) on a slice or an array adds: the
 // capability is the library's `as_ptr` / `as_mut_ptr`, not a member. Nothing for any other type or name.
 private data_pointer_hint(rty: Type, name: string) -> string
@@ -2971,6 +3011,10 @@ private val data_pointer_sentence: string = " — its data pointer is `as_ptr(xs
 
 private no_such_method(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, base: string,
                        name: string, args: Buf[Expr]) -> TExpr
+    // `into_raw` is every counted reference's, and a type's own member of the name is what a call
+    // reaches first.
+    if name == "into_raw" then return into_raw_call(cx, span, receiver, args)
+
     val provided = builtin_method(cx, span, receiver, rty, name, args)
 
     if provided.is_some() then return provided.unwrap()
