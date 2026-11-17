@@ -54,7 +54,10 @@ handed a copy of every view in it, and one a body shows is inferred — and is o
 function may also carry, holds that one definition to making no heap storage and is below; and
 `@abandons` says a call to the function never comes back while the program goes on, so the caller's
 frame is given back first — it marks an `extern` too, and is on the
-[declarations](/reference/declarations/) page beside `become`.
+[declarations](/reference/declarations/) page beside `become`. On an `extern` that answers something
+other than `never` it says a call **may** abandon — Lua's `lua_call` comes back, or passes a
+`lua_error` up past its caller — so the caller keeps its frame and may hold nothing counted across
+the call; see [an `extern` that may abandon](/reference/ffi/#an-extern-that-may-abandon-and-also-come-back).
 
 **On a type, or on storage** there are four, and three of them are about *where* rather than about
 what the declaration does. `@packed` and `@align(n)` lay out a struct — no interior padding, and the

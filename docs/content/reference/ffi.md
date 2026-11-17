@@ -2691,6 +2691,69 @@ The mark is never dropped: an `@abandons *extern` value does not go where a plai
 for. It marks nothing but a C function pointer — a callable object that can reach an abandoning call
 is refused as before.
 
+### An `extern` that may abandon, and also come back
+
+Lua's `lua_call` and `lua_callk` are unprotected: they run a function and come back, or, when that
+function raises, pass the `lua_error` up past their caller to whatever `lua_pcall` caught it. That is
+**`@abandons` on an `extern` whose result is not `never`**: a call to it may abandon. Since it may also
+come back, the caller's frame is not given back first; it is held to what a call through an
+`@abandons *extern` is — nothing counted across the call — and every function that calls it can reach
+an abandoning call in turn:
+
+```sysl build=c
+module relaying
+
+@abandons
+extern lua_call(L: *u8, nargs: i32, nresults: i32)
+
+extern lua_pushvalue(L: *u8, index: i32)
+extern lua_tointegerx(L: *u8, index: i32, isnum: *i32) -> i64
+extern lua_pushinteger(L: *u8, n: i64)
+extern lua_pushcclosure(L: *u8, f: @abandons *extern(*u8) -> i32, upvalues: i32)
+
+// relay(f, x): calls f(x) and answers twice what f answers.
+relay(L: *u8) -> i32
+    lua_pushvalue(L, 1)
+    lua_pushvalue(L, 2)
+    lua_call(L, 1, 1)
+
+    var whole: i32 = 0
+    val n = lua_tointegerx(L, -1, &whole)
+
+    lua_pushinteger(L, n * 2)
+    1
+
+@export("luaopen_relaying")
+open(L: *u8) -> i32
+    lua_pushcclosure(L, &relay, 0)
+    1
+```
+
+`relay` calls `lua_call` directly, so it can reach an abandoning call, and its address is taken as
+`@abandons *extern` as a raising callback's is. A frame holding something counted across the call is
+refused:
+
+```sysl
+@abandons
+extern lua_call(L: *u8, nargs: i32, nresults: i32)
+
+relay(L: *u8)
+    val s = 1.to_string() + "x"
+
+    lua_call(L, 0, 0)
+    print(s)
+
+relay(null)
+```
+
+```error
+'lua_call' is '@abandons', so a call to it may abandon every frame below it and never come back, and this frame holds 's' across the call
+```
+
+The address of such an `extern` is taken as `@abandons *extern` too, never as a plain one. On a sysl
+function, `@abandons` still means the call never comes back and the result must be `never`: whether
+a sysl function may abandon is read from its body, so there is nothing for a mark to add.
+
 ### What has no address, and why
 
 Each of these is refused because the address would not be an address of what its type says, and
