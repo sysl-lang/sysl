@@ -120,13 +120,84 @@ olt_typed_argument_stays_ambiguous()
         val s: i16 = 1
         print(k(s, 2))
         print(k(2, s))
-        print(k(1.5f32, 2))
         """)
 
     assert(e.contains("'k' is ambiguous here — 2 of its declarations take these arguments:"), e)
     assert(e.contains("main.sysl:4:"), e)
     assert(e.contains("main.sysl:5:"), e)
-    assert(e.contains("main.sysl:6:"), e)
+
+@test("a literal beside an f32 argument is read at f32, in either position")
+olt_literal_follows_the_typed_argument()
+    if !olt_ready() then return
+
+    assert_eq(olt_ran(olt_floats() + raw"""
+        import sysl.math.nextafter
+        val a = 1.5f32
+        val d = 1.5
+        print(k(a, 2.0), k(2.0, a), k(a, 2), k(-2, a), k(1.5f32, 2))
+        print(k(d, 2.0), k(2.0, d), k(2.0, 3.0), k(2, 3))
+        print(nextafter(a, 100.0).bits() == nextafter(a, 100.0f32).bits())
+        print(nextafter(100.0, a).bits() == nextafter(100.0f32, a).bits())
+        print(nextafter(a, 100.0) > a)
+        """), "f32 f32 f32 f32 f32\nreal real real real\ntrue\ntrue\ntrue\n")
+
+@test("a literal beside typed arguments in a three-argument call and in a method follows them")
+olt_literal_follows_typed_arguments_in_more_shapes()
+    if !olt_ready() then return
+
+    assert_eq(olt_ran(raw"""
+        t(a: f32, b: f32, c: f32) -> string = "f32"
+        t(a: real, b: real, c: real) -> string = "real"
+        struct S
+            n: int
+        impl S
+            m(self, a: f32, b: f32) -> string = "f32"
+            m(self, a: real, b: real) -> string = "real"
+        val a = 1.5f32
+        val d = 1.5
+        val s = S(0)
+        print(t(a, 2.0, a), t(1.0, 2.0, d), t(1.0, a, 2.0))
+        print(s.m(a, 2.0), s.m(2.0, a), s.m(d, 2.0), s.m(2.0, 3.0))
+        """), "f32 real f32\nf32 f32 real real\n")
+
+@test("a generic caller's f32 argument settles the literal beside it")
+olt_literal_follows_a_generic_callers_typed_argument()
+    if !olt_ready() then return
+
+    assert_eq(olt_ran(olt_floats() + raw"""
+        both[T](x: T) -> string = k(x, 2.0)
+        print(both(1.5f32), both(1.5))
+        """), "f32 real\n")
+
+@test("typed arguments of two widths, or no exact match, keep the call refused or widen as before")
+olt_literal_beside_typed_arguments_unmatched_stays_refused()
+    if !olt_ready() then return
+
+    val e = olt_err(olt_floats() + raw"""
+        val a = 1.5f32
+        val d = 1.5
+        val s: i16 = 1
+        print(k(a, d, 2.0))
+        print(k(s, 2.0))
+        """)
+
+    assert(e.contains("no 'k' takes these arguments") || e.contains("'k' is ambiguous here"), e)
+    assert(e.contains("main.sysl:6:") || e.contains("main.sysl:7:"), e)
+    assert(e.contains("main.sysl:7:"), e)
+
+@test("two candidates that both match the typed argument stay ambiguous")
+olt_two_matching_the_typed_argument_stay_ambiguous()
+    if !olt_ready() then return
+
+    val e = olt_err(raw"""
+        q(x: f32, y: f32) -> string = "f32 f32"
+        q(x: f32, y: f128) -> string = "f32 f128"
+        val a = 1.5f32
+        print(q(a, 2.0))
+        """)
+
+    assert(e.contains("'q' is ambiguous here — 2 of its declarations take these arguments:"), e)
+    assert(e.contains("main.sysl:4:"), e)
 
 @test("no candidate at the defaults stays ambiguous")
 olt_no_candidate_at_the_defaults_stays_ambiguous()

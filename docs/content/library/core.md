@@ -1394,7 +1394,9 @@ side — because it is on the path of every lookup.
 
 **No hash here is seeded.** A key hashes to the same number in every run and on every machine, so a
 table fed keys chosen by an adversary can be made to collide. A table that must stand up to that
-wraps its key in a type whose `Hash` mixes in a secret.
+wraps its key in a type whose `Hash` mixes in a secret — [`sysl.checksum`'s
+`hash64`](/library/checksum/#hash64-a-seeded-hash-for-tables) is a seeded hash over bytes to mix it
+with.
 
 A `bool` gets its own mixer because one bit does not widen to a number in this language; a `string`
 gets FNV-1a over its bytes because a `string` **is** a validated `[]u8`, so there is nothing to

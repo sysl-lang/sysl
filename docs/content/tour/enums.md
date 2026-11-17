@@ -100,6 +100,34 @@ A variant is constructed by calling it, as in `Circle(3)`, with no `Shape.` pref
 variant name is in scope as a constructor of its enum. A variant with no payload, like `Empty`, is
 allowed in either kind of enum and is written the same way in both.
 
+Two enums may share a variant name, which an interpreter's `Expr` and `Value` usually do. The bare
+name is still the usual spelling, because the context says which enum is meant: the type a parameter
+or an annotation expects, or else a neighbouring branch or element whose variant only one enum has:
+
+```sysl
+enum Expr
+    Null
+    Lit(n: int)
+
+enum Value
+    Null
+    Int(n: int)
+
+show(v: Value) -> string = v match
+    Null   -> "null"
+    Int(n) -> n.to_string()
+
+val folded = [Int(3), Null]
+
+print(show(Null), show(folded[1]))
+```
+
+```output
+null null
+```
+
+Only where nothing in the context decides is `Value.Null` needed.
+
 The memory mode follows the ordinary rule from the [memory chapter](/tour/memory/): a data enum is a
 **value**, sized for its widest variant plus a tag, and it is placed on the heap only where a
 `&Shape` is expected. An enum is a struct-shaped value with a tag, and the three modes apply to it

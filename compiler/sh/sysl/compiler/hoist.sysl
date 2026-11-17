@@ -777,12 +777,12 @@ private hoist_type_name(a: &Analysis, scope: Scope, span: Span, name: string, vi
 
     a.tables.types.put(key, Decl(kind, span, scope))
 
+    // **A variant may share its spelling with a module value**: the two are separate lookups, and the
+    // type a position expects chooses between them (`expr.sysl`'s `variant_beside_value`).
     kind match
         EnumOf(d) ->
             for item in d.variants
                 a.tables.variant_names.put(item.name, true)
-
-            check_variants_free(a, scope, span, d)
         _ -> ()
 
     record_access(a, scope, span, key, vis)
@@ -809,27 +809,6 @@ private check_no_module_of_that_name(a: &Analysis, scope: Scope, span: Span, key
     a.fault(scope, span, s"'$shown' is also a module, so '$shown.<$reachable>' would name two things — " +
             s"rename the module or '$written'")
 end check_no_module_of_that_name
-
-// The other order of a variant meeting a value of its spelling: the value was registered first, so
-// the enum is the declaration that gives the name its second meaning, and the refusal is its own.
-// The first variant that clashes is the one reported.
-private check_variants_free(a: &Analysis, scope: Scope, span: Span, d: EnumDecl)
-    for item in d.variants
-        val v = item.name
-        val holder = variant_value_holder(a, module_qualify(scope.module_name, v))
-
-        if holder.is_some()
-            a.fault(scope, span, s"variant name '$v' is already used by ${holder.unwrap()}")
-            return
-        end if
-end check_variants_free
-
-// What holds a spelling a variant wants, told apart the way the reference tells them: a module `var`
-// is storage the program may write, and says so.
-private variant_value_holder(a: &Analysis, key: string) -> Option[string]
-    if a.tables.vals.has(key) && holds_string(a.tables.writable, key) then return Some("a module 'var'")
-
-    value_name_holder(a, key)
 
 // What a second declaration of a type name is told, in the reference's words: a trait says "the
 // name", a trait being a set of requirements rather than a type, and everything else -- a struct, an
@@ -868,15 +847,6 @@ private hoist_value(a: &Analysis, scope: Scope, span: Span, name: string, typ: O
     // constant meeting a name something else holds is told what holds it.
     if holder.is_some() then
         a.fault(scope, span, value_taken_message(a, key, name, what))
-        return
-    end if
-
-    // **A bare variant is a value in its module's scope**, so any value spelled like one registered
-    // before it would give the name two meanings. The other order is the enum's to report.
-    val owner = enum_of_variant(a, plain)
-
-    if owner.is_some()
-        a.fault(scope, span, s"'$name' is already used by enum '${qualified_name(owner.unwrap())}'")
         return
     end if
 

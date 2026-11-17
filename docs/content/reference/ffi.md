@@ -235,7 +235,7 @@ print(bogus(1.0))
 ```
 
 ```error
-'llvm.nosuchthing' is not an intrinsic sysl supports — it has llvm.ceil, llvm.copysign, llvm.fabs, llvm.floor, llvm.fma, llvm.maximum, llvm.maxnum, llvm.minimum, llvm.minnum, llvm.nearbyint, llvm.rint, llvm.round, llvm.roundeven, llvm.sqrt, llvm.trunc
+'llvm.nosuchthing' is not an intrinsic sysl supports — it has llvm.ceil, llvm.copysign, llvm.fabs, llvm.floor, llvm.fma, llvm.maximum, llvm.maxnum, llvm.minimum, llvm.minnum, llvm.nearbyint, llvm.rint, llvm.round, llvm.roundeven, llvm.sqrt, llvm.trunc, llvm.aarch64.crc32cb, llvm.aarch64.crc32ch, llvm.aarch64.crc32cw, llvm.aarch64.crc32cx, llvm.x86.sse42.crc32.32.8, llvm.x86.sse42.crc32.32.16, llvm.x86.sse42.crc32.32.32, llvm.x86.sse42.crc32.64.64
 ```
 
 **`llvm.fma` is `a * b + c` rounded once.** The product is never rounded on its own, so the
@@ -337,6 +337,46 @@ baseline rounding, WebAssembly's `round` — LLVM calls C's function of the same
 the standard module's roots, magnitudes, sign transfers and roundings work on a board with no libm
 to ask. The transcendentals are another matter: `llvm.sin` exists and lowers to a call to the same
 `sin` an ordinary `extern` names, and nothing on a board answers it, so they stay linked.
+
+**The CRC-32C instructions are the other family**, and they are not overloaded: each name has one
+signature, written exactly. AArch64's `llvm.aarch64.crc32cb`, `crc32ch` and `crc32cw` are `(u32, u32)
+-> u32` and `crc32cx` is `(u32, u64) -> u32`; SSE 4.2's `llvm.x86.sse42.crc32.32.8`, `.32.16` and
+`.32.32` take the value at its own width, and `.64.64` is `(u64, u64) -> u64`. Each folds one value
+into a running remainder over the Castagnoli polynomial, with no inversion either side — that is
+`sysl.checksum`'s `crc32c` to add. **They are optional on both machines**, and a back end asked for
+one the build does not promise has no instruction to emit, so a declaration is accepted only where
+the `#if` symbol `crc32c` holds
+([attributes](/reference/attributes/#the-symbols-are-derived-from-the-target-and-the-set-is-closed)) —
+which is how a declaration is written, inside the condition:
+
+```sysl
+#if crc32c && aarch64
+extern "llvm.aarch64.crc32cx" step(crc: u32, word: u64) -> u32
+#elif crc32c && x86_64
+extern "llvm.x86.sse42.crc32.64.64" step64(crc: u64, word: u64) -> u64
+step(crc: u32, word: u64) -> u32 = u32(step64(u64(crc), word))
+#else
+step(crc: u32, word: u64) -> u32 = crc
+#endif
+
+print(step(0, 0) == 0)
+```
+
+```output
+true
+```
+
+Outside the condition the declaration is refused, naming the way to promise the instruction:
+
+```sysl target=x86_64-freestanding
+extern "llvm.x86.sse42.crc32.32.8" byte(crc: u32, b: u8) -> u32
+
+print(byte(0, 1))
+```
+
+```error
+'llvm.x86.sse42.crc32.32.8' is an instruction 'x86_64-freestanding' does not promise, so the back end could not select it
+```
 
 ### What crosses the boundary
 
@@ -2176,6 +2216,26 @@ print("freed")
 
 ```output
 freed
+```
+
+**A parameter may carry a name**, as in Rust, C and Swift: `*extern(ud: *u8, len: usize) -> int` and
+`Fn(x: int) -> int`. The names are documentation, so they are ignored by the type —
+`*extern(a: i32)`, `*extern(b: i32)` and `*extern(i32)` are one type, assigned to each other freely,
+and a diagnostic prints the type without its names. Named and unnamed parameters may be mixed, and a
+name written twice in one type is refused.
+
+```sysl
+@export
+add(a: i32, b: i32) -> i32 = a + b
+
+val f: *extern(left: i32, right: i32) -> i32 = &add
+val g: *extern(i32, i32) -> i32 = f
+
+print(g(2, 3))
+```
+
+```output
+5
 ```
 
 **`&f` is the address**, and the `&` is the same one the [memory model](/reference/memory/) gives

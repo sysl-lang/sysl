@@ -3020,8 +3020,26 @@ private no_such_method(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, ba
 
         if written.is_some() && written.unwrap().text != type_show(rty) then shown = spelled_show(rty, written)
 
-    cx.err(span, hinted(cx, rty, s"type '$shown' has no method '$name'" + removed_accessor_hint(rty, name)))
+    cx.err(span, hinted(cx, rty, s"type '$shown' has no method '$name'" + removed_accessor_hint(rty, name) +
+                      half_lane_hint(rty, name)))
 end no_such_method
+
+// `exp` and `tanh` asked of a half-width float vector: they are the lane-wise methods of the `f32` and
+// `f64` vectors, and a half-width lane is widened first, as the built-in lane methods say.
+private half_lane_hint(rty: Type, name: string) -> string
+    if name != "exp" && name != "tanh" then return ""
+
+    repr(rty) match
+        Vector(_, elem) ->
+            underlying(*elem) match
+                Floating(bits, brain) ->
+                    if brain || bits == 16 then
+                        s" — '$name' is defined for f32 and f64 lanes, and ${type_show(rty)} is not one — " +
+                        "widen the lanes to f32 first"
+                    else ""
+                _ -> ""
+        _ -> ""
+end half_lane_hint
 
 // What a refusal adds where `at` or `set` is asked of a sequence container, which answers a subscript
 // instead: the two members it once had are `b[i]` and `b[i] = v`, and `get(i)` is the total read.

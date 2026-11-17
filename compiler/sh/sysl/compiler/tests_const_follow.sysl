@@ -6,15 +6,14 @@ import sysl.text.{Search, replace_all}
 import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
 import sysl.process.capture
 
-// Two refusals `const` shares with the other module-level values -- `val`, a module `var` and an
-// `extern` variable -- which the reference's `ConstTests` states for a constant alone:
+// Two rules `const` shares with the other module-level values -- `val`, a module `var` and an
+// `extern` variable:
 //
 // - **a file-private value is private to its FILE**, so a sibling file of its own module reading or
 //   writing it is refused exactly as another module naming it in full is;
-// - **a bare variant is a value in its module's scope**, so a value and a variant of one spelling
-//   clash in whichever order they were written, and the later of the two is the one refused.
+// - **a value and a variant of one spelling are two lookups**, in whichever order they were written:
+//   the variant where the position asks for its enum, the value everywhere else.
 //
-// **Every string quoted here was read out of the reference compiler** (0.0.149) on the same input.
 // A path is shown relative to the project root, which is a temporary directory.
 
 // -- the harness ----------------------------------------------------------------------------------
@@ -103,13 +102,13 @@ private cfw_private(said: string, at: string) =
     cfw_refuses(said, "error: 'limits.width' is private to '@/limits/a.sysl', the file that declares it\n" +
                 s" --> @/$at")
 
-private cfw_variant(said: string, file: string, line: string, holder: string) =
-    cfw_refuses(said, s"error: variant name 'Red' is already used by $holder\n --> @/$file:$line:1")
-
-private cfw_enum(said: string, file: string, line: string, owner: string) =
-    cfw_refuses(said, s"error: 'Red' is already used by enum '$owner'\n --> @/$file:$line:1")
-
 private cfw_colour() -> string = "enum Colour\n    Red\n    Green\n"
+
+// Two readings of `Red` in module `m`: the value at an `int`, the variant at a `Colour`.
+private cfw_both_readings() -> string =
+    "v() -> int = Red\nc() -> Colour = Red\nis_red(k: Colour) -> bool = k == Red\n"
+
+private cfw_both_main() -> string = "print(m.v(), int(m.c()), m.is_red(m.c()))\n"
 
 // -- a file-private value is its file's -----------------------------------------------------------
 
@@ -193,22 +192,36 @@ cfw_private_var_its_own_file()
     assert_eq(said, "42\n")
 
 // -- a variant and a value of one spelling, in either order ---------------------------------------
+//
+// The two are separate lookups, and the type a position expects chooses: the value at an `int`, the
+// variant at a `Colour` (`reference/types.md § A variant belongs to its enum`). Each kind of value,
+// in each order and in each file arrangement, is held to both readings.
 
-@test("a constant declared before an enum is the variant's clash")
+// Module `m` of the given files, with `main.sysl` reading both meanings of `Red` through it.
+private cfw_both(files: Buf[(string, string)]) -> string
+    var fs = cfw_files()
+
+    for item in files
+        fs.push(("m", item.0, "module m\n" + item.1))
+
+    fs.push(("", "main.sysl", cfw_both_main()))
+    cfw_out(fs)
+
+@test("a constant declared before an enum is read beside the variant")
 cfw_constant_before_the_enum()
     if !cfw_ready() then return
 
     var fs: Buf[(string, string)] = buf()
 
-    fs.push(("m.sysl", "const Red: int = 1\n" + cfw_colour()))
-    cfw_variant(cfw_module(fs), "m/m.sysl", "3", "a constant")
+    fs.push(("m.sysl", "const Red: int = 7\n" + cfw_colour() + cfw_both_readings()))
+    assert_eq(cfw_both(fs), "7 0 true\n")
 
 @test("and so in the program's first file")
 cfw_constant_before_the_enum_in_main()
     if !cfw_ready() then return
 
-    cfw_variant(cfw_ran("const Red: int = 1\n" + cfw_colour() + "print(1)\n"), "main.sysl", "2",
-                "a constant")
+    assert_eq(cfw_ran("const Red: int = 7\n" + cfw_colour() + "val k: int = Red\nval c: Colour = Red\n" +
+                      "print(k, int(c), c == Red)\n"), "7 0 true\n")
 
 @test("a 'val' before it")
 cfw_val_before_the_enum()
@@ -216,8 +229,8 @@ cfw_val_before_the_enum()
 
     var fs: Buf[(string, string)] = buf()
 
-    fs.push(("m.sysl", "val Red: int = 1\n" + cfw_colour()))
-    cfw_variant(cfw_module(fs), "m/m.sysl", "3", "a 'val'")
+    fs.push(("m.sysl", "val Red: int = 7\n" + cfw_colour() + cfw_both_readings()))
+    assert_eq(cfw_both(fs), "7 0 true\n")
 
 @test("a module 'var' before it")
 cfw_var_before_the_enum()
@@ -225,49 +238,44 @@ cfw_var_before_the_enum()
 
     var fs: Buf[(string, string)] = buf()
 
-    fs.push(("m.sysl", "var Red: int = 1\n" + cfw_colour()))
-    cfw_variant(cfw_module(fs), "m/m.sysl", "3", "a module 'var'")
+    fs.push(("m.sysl", "var Red: int = 7\n" + cfw_colour() + cfw_both_readings()))
+    assert_eq(cfw_both(fs), "7 0 true\n")
 
-@test("an 'extern' variable before it")
+@test("an 'extern' variable before it is declared without a clash")
 cfw_extern_before_the_enum()
     if !cfw_ready() then return
 
-    cfw_variant(cfw_ran("extern Red: int\n" + cfw_colour() + "print(1)\n"), "main.sysl", "2",
-                "an 'extern' variable")
+    assert_eq(cfw_ran("extern Red: int\n" + cfw_colour() + "val c: Colour = Red\nprint(int(c))\n"), "0\n")
 
-@test("a value in an earlier file of the module, even a private one")
+@test("a value in an earlier file of the module, a private one included")
 cfw_value_in_an_earlier_file()
     if !cfw_ready() then return
 
     var fs: Buf[(string, string)] = buf()
 
-    fs.push(("a.sysl", "private const Red: int = 1\n"))
-    fs.push(("b.sysl", "enum Colour\n    Red\n"))
-    cfw_variant(cfw_module(fs), "m/b.sysl", "2", "a constant")
+    fs.push(("a.sysl", "private const Red: int = 7\n" + cfw_both_readings()))
+    fs.push(("b.sysl", cfw_colour()))
+    assert_eq(cfw_both(fs), "7 0 true\n")
 
-@test("of two clashing variants, the first is the one reported, and the enum still stands")
-cfw_first_clash_and_the_enum_stands()
+@test("two variants beside two values both read both ways, and the enum stands")
+cfw_two_pairs_and_the_enum_stands()
     if !cfw_ready() then return
 
-    var fs: Buf[(string, string)] = buf()
+    var fs = cfw_files()
 
-    fs.push(("m.sysl", "const Red: int = 1\nval Green: int = 2\n" + cfw_colour() +
-                       "f(c: Colour) -> int = 1\n"))
+    fs.push(("m", "m.sysl", "module m\nconst Red: int = 7\nval Green: int = 8\n" + cfw_colour() +
+                            cfw_both_readings() + "g() -> int = Green\nh() -> Colour = Green\n"))
+    fs.push(("", "main.sysl", "print(m.v(), int(m.c()), m.g(), int(m.h()))\n"))
+    assert_eq(cfw_out(fs), "7 0 8 1\n")
 
-    val said = cfw_module(fs)
-
-    cfw_variant(said, "m/m.sysl", "4", "a constant")
-    assert(said.index_of("'Green'").is_none(), said)
-    assert(said.index_of("unknown type").is_none(), said)
-
-@test("a 'val' declared after an enum is its own clash")
+@test("a 'val' declared after an enum")
 cfw_val_after_the_enum()
     if !cfw_ready() then return
 
     var fs: Buf[(string, string)] = buf()
 
-    fs.push(("m.sysl", cfw_colour() + "val Red: int = 1\n"))
-    cfw_enum(cfw_module(fs), "m/m.sysl", "5", "m.Colour")
+    fs.push(("m.sysl", cfw_colour() + "val Red: int = 7\n" + cfw_both_readings()))
+    assert_eq(cfw_both(fs), "7 0 true\n")
 
 @test("a module 'var' after it")
 cfw_var_after_the_enum()
@@ -275,14 +283,14 @@ cfw_var_after_the_enum()
 
     var fs: Buf[(string, string)] = buf()
 
-    fs.push(("m.sysl", cfw_colour() + "var Red: int = 1\n"))
-    cfw_enum(cfw_module(fs), "m/m.sysl", "5", "m.Colour")
+    fs.push(("m.sysl", cfw_colour() + "var Red: int = 7\n" + cfw_both_readings()))
+    assert_eq(cfw_both(fs), "7 0 true\n")
 
 @test("an 'extern' variable after it")
 cfw_extern_after_the_enum()
     if !cfw_ready() then return
 
-    cfw_enum(cfw_ran(cfw_colour() + "extern Red: int\nprint(1)\n"), "main.sysl", "4", "Colour")
+    assert_eq(cfw_ran(cfw_colour() + "extern Red: int\nval c: Colour = Red\nprint(int(c))\n"), "0\n")
 
 @test("a value in a later file of the module")
 cfw_value_in_a_later_file()
@@ -290,9 +298,9 @@ cfw_value_in_a_later_file()
 
     var fs: Buf[(string, string)] = buf()
 
-    fs.push(("a.sysl", "enum Colour\n    Red\n"))
-    fs.push(("b.sysl", "val Red: int = 1\n"))
-    cfw_enum(cfw_module(fs), "m/b.sysl", "2", "m.Colour")
+    fs.push(("a.sysl", cfw_colour()))
+    fs.push(("b.sysl", "val Red: int = 7\n" + cfw_both_readings()))
+    assert_eq(cfw_both(fs), "7 0 true\n")
 
 @test("while in the program's first file a 'val' and a 'var' are locals, and clash with nothing")
 cfw_main_locals_clash_with_nothing()

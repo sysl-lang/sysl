@@ -586,3 +586,55 @@ cgf_lse_makes_one_instruction()
     assert(lse_text.contains("ldaddal"), lse_text)
     assert(!lse_text.contains("ldaxr") && !lse_text.contains("stlxr"), lse_text)
 end cgf_lse_makes_one_instruction
+
+// Everything `build-c` laid down for `extra` and `main` on a bare AArch64 machine, disassembled.
+private cgf_whole_disassembly(objdump: string, extra: string, main: string) -> string
+    val root = cgf_project(extra, main)
+    val archive = s"$root/probe.a"
+    var args: [7]string = ["sysl", "build-c", "--target", "aarch64-freestanding", "-o", archive, root]
+    val built = cgf_cli(args[..])
+
+    assert_eq(built.0, 0)
+
+    val text = capture(objdump, ["-d", "--no-show-raw-insn", "--no-leading-addr", archive]) match
+        Err(_) -> ""
+        Ok(dis) -> dis.text
+
+    remove_dir_all(root).unwrap_or(())
+    text
+end cgf_whole_disassembly
+
+// The bytes come through a pointer, so the optimizer cannot know them and fold the reads away.
+private cgf_checksum() -> string =
+    "import sysl.checksum.crc32c\n\n@export(\"sum\")\nsum(p: *u8, n: usize) -> u32 = crc32c(p[0..<n])\n"
+
+@test("sysl.checksum's crc32c is the table on bare AArch64, and crc32cx under extensions = [crc]")
+cgf_crc_extension_chooses_the_instruction()
+    if !cgf_ready() then return
+
+    val objdump = cgf_objdump() match
+        Some(p) -> p
+        None -> return
+
+    val plain = cgf_whole_disassembly(objdump, "", cgf_checksum())
+    val crc = cgf_whole_disassembly(objdump, "codegen {\n  extensions = [\"crc\"]\n}\n", cgf_checksum())
+
+    assert(plain.contains("<sum>:") && !plain.contains("crc32cx") && !plain.contains("crc32cb\t"), plain)
+    assert(crc.contains("crc32cx\t") && crc.contains("crc32cb\t"), crc)
+
+    // The word each `crc32cx` folds is one load, not eight byte loads each behind its own bounds test:
+    // a `ldr`/`ldur` of an x register within the few instructions before it, and no byte load there.
+    val lines = split(crc, "\n")
+
+    for i in 3..<lines.len
+        if lines[i].contains("crc32cx\t")
+            var word = false
+            var bytes = false
+
+            for k in i - 3..<i
+                if lines[k].contains("ldr\tx") || lines[k].contains("ldur\tx") then word = true
+                if lines[k].contains("ldrb") then bytes = true
+
+            assert(word && !bytes, s"${lines[i - 3]}\n${lines[i - 2]}\n${lines[i - 1]}\n${lines[i]}")
+        end if
+end cgf_crc_extension_chooses_the_instruction

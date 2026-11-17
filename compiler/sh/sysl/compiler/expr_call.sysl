@@ -745,6 +745,14 @@ private named_call(cx: &Analyzer, span: Span, callee: Expr, name: string, args: 
 
         if wanted.is_some() then
             return variant_call(cx, span, wanted.unwrap().0, wanted.unwrap().1, args)
+
+        // **A module value beside a variant of its name is called through only where it holds
+        // something callable**: a constant `Limit` cannot be called, so `Limit(3)` is the variant
+        // wherever the position does not ask for the variant's enum, as it is where it does.
+        val both = value_beside_variant(cx, name)
+
+        if both.is_some() && value_callable(cx, both.unwrap().0) then
+            return call_value(cx, span, callee, args, expected)
     end if
 
     var tkey = if shadowed then None else lookup_type_key(cx.an, cx.scope, name)
@@ -762,9 +770,10 @@ private named_call(cx: &Analyzer, span: Span, callee: Expr, name: string, args: 
     // **A declared FUNCTION claims the name too**, exactly as a declared type does: otherwise
     // `unit`, `int` and `byte` would be words a module could take for a type and not for a
     // function, and a nullary `unit()` would be told *"a 'unit' conversion takes exactly one
-    // value"* about a built-in the reader never reached for. The conversion is still what the name
-    // means wherever no declaration of it is in reach.
-    if !shadowed && tkey.is_none() && !function_in_scope(cx, name) then
+    // value"* about a built-in the reader never reached for. **So does a declared `extern`**: a
+    // binding naming its C function `byte` calls it. The conversion is still what the name means
+    // wherever no declaration of it is in reach.
+    if !shadowed && tkey.is_none() && !function_in_scope(cx, name) && extern_key(cx, name).is_none() then
         val scalar = scalar_type_named(cx, span, name)
 
         if scalar.is_some() then return convert_call(cx, span, name, scalar.unwrap(), args)
@@ -817,6 +826,15 @@ private named_call(cx: &Analyzer, span: Span, callee: Expr, name: string, args: 
         val v = variant_of(cx, name, expected)
 
         if v.is_some()
+            // **Where several enums declare the name, the payload written may fit only one** --
+            // `Interval(0, -1, 0)` beside an `Interval` that carries two values. Each candidate's
+            // construction is read and thrown away, and the one that stands alone is the reading.
+            val shaped = variant_by_shape(cx, name, expected, args.len(),
+                                          (en, sv) -> payload_fits(cx, span, en, sv, args))
+
+            if shaped.is_some() then
+                return variant_call(cx, span, shaped.unwrap().0, shaped.unwrap().1, args)
+
             val clash = ambiguous_variant(cx, span, name, expected)
 
             if clash.is_some() then return clash.unwrap()
@@ -944,8 +962,13 @@ end special_form
 // struct of handles some other allocator zeroed, where a `&T` field reads as null until it is
 // assigned. Like the slot forms, a function or a local of the name is what a call reaches, and the
 // form applies only where nothing else claims it.
-null_test_form(cx: &Analyzer, name: string) -> bool =
-    name == "is_null" && cx.lookup(name).is_none() && function_keys(cx, name).is_empty()
+null_test_form(cx: &Analyzer, name: string) -> bool = name == "is_null" && form_unclaimed(cx, name)
+
+// Whether nothing the reader can see claims a form's word: no local, no function and no `extern` of
+// that spelling. **Every compiler form yields to a declaration of its name**, and an `extern` is one --
+// a binding that names its C function `step` or `release` calls that function, never the form.
+form_unclaimed(cx: &Analyzer, name: string) -> bool =
+    cx.lookup(name).is_none() && function_keys(cx, name).is_empty() && extern_key(cx, name).is_none()
 
 // **The reference is read as an address and compared with null, and nothing else is done to it**: no
 // share is taken and none given back, so the test is one compare wherever it is written -- a member
@@ -988,8 +1011,7 @@ private null_test_fault(t: Type) -> Option[string] = t match
 // storage the language did not initialise has to be emptied before the storage is freed or reused,
 // and assigning a fresh value would make one only to lose it. A function or a local of the name is
 // what a call reaches, and the form applies only where nothing else claims it.
-release_form(cx: &Analyzer, name: string) -> bool =
-    name == "release" && cx.lookup(name).is_none() && function_keys(cx, name).is_empty()
+release_form(cx: &Analyzer, name: string) -> bool = name == "release" && form_unclaimed(cx, name)
 
 // **It is an assignment of the empty reference and nothing else**, so everything an assignment owes
 // is owed here too: the place is held to being writable, the share it held is given back -- running
@@ -1322,6 +1344,15 @@ private convert_lanes(cx: &Analyzer, span: Span, t: TExpr, to: Type) -> TExpr
     val target = repr(to) match
         Vector(m, b) -> Some((m, *b))
         _ -> None
+
+    // A scalar of the lane's own type is the splat the language writes implicitly at a binding or an
+    // operator, here said outright: `<4>f32(x)` with `x: f32` is `x` in every lane. Any other scalar
+    // has no lane to be, as it has none at a binding either.
+    if source.is_none() && target.is_some()
+        val lane = target.unwrap().1
+
+        if can_be_lane(lane) && !is_vector(repr(got)) && type_eq(repr(got), repr(lane))
+            return TExpr(span, TSplat(t, to))
 
     if source.is_none() || target.is_none() then return cx.err(span, refusal(None, got, to))
 
@@ -2505,6 +2536,21 @@ private subtype_from(cx: &Analyzer, span: Span, t: TExpr, target: Type, written:
 end subtype_from
 
 // A variant with what it carries.
+// Whether constructing the variant `v` of `en` from these values is a reading that stands alone --
+// the count, the field names and every value's type -- tried and thrown away whole.
+private payload_fits(cx: &Analyzer, span: Span, en: Type, v: EnumVariant, written: Buf[Expr]) -> bool
+    if written.len() != v.fields.len() then return false
+
+    val tried = begin_trial(cx)
+
+    val _ = variant_call(cx, span, en, v, written)
+    val refused = refused_since(cx, tried)
+
+    discard_trial(cx, tried)
+
+    !refused
+end payload_fits
+
 private variant_call(cx: &Analyzer, span: Span, en: Type, v: EnumVariant,
                      written: Buf[Expr]) -> TExpr
     // A variant that carries nothing is a name, not a call, so the mistake is the parentheses rather
@@ -3363,6 +3409,10 @@ narrowed_at(declared: Buf[usize], generic: Buf[bool], fitted: Buf[Buf[Type]], ar
         val defaulted = literal_default_preference(fitted, ranked, args)
 
         if defaulted.len() == 1 then return defaulted
+
+        val following = literal_follows_typed(fitted, ranked, args, natural)
+
+        if following.len() == 1 then return following
     end if
 
     var pool: Buf[usize] = buf()
@@ -3511,6 +3561,40 @@ private literal_default_preference(fitted: Buf[Buf[Type]], ranked: Buf[usize], a
 
     winners
 end literal_default_preference
+
+// **A bare literal beside a typed argument takes the type of the candidate that argument matches.**
+// Where every argument with a type of its own is exactly the parameter of one candidate, and every
+// other argument is a numeric literal with no suffix, that candidate wins and the literals are read
+// at its parameters: `nextafter(x, 100.0)` at an `f32` `x` is the `f32` one, as `x * 100.0` is at
+// `f32`. A typed argument that no candidate takes exactly stays ambiguous, and so do two candidates
+// that both match every typed argument. Empty where the rule does not apply.
+private literal_follows_typed(fitted: Buf[Buf[Type]], ranked: Buf[usize], args: Buf[Expr],
+                              natural: Buf[Option[Type]]) -> Buf[usize]
+    var winners: Buf[usize] = buf()
+    var typed = 0
+    var literals = 0
+
+    for j in 0..<args.len()
+        if literal_default(args[j]).is_some() then literals += 1 else typed += 1
+
+    if typed == 0 || literals == 0 || natural.len() != args.len() then return winners
+
+    for r in 0..<ranked.len()
+        val here = fitted[ranked[r]]
+        var all = here.len() == args.len()
+
+        for j in 0..<args.len()
+            if !all then break
+            if literal_default(args[j]).is_some() then continue
+
+            natural[j] match
+                Some(t) -> if !type_eq(here[j], t) then all = false
+                None -> all = false
+
+        if all then winners.push(ranked[r])
+
+    winners
+end literal_follows_typed
 
 // The type a bare numeric literal defaults to at a parameter: `real` for a float literal, and for
 // an integer literal `real` at a float parameter and `int` anywhere else.

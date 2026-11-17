@@ -472,7 +472,10 @@ private linked_symbol(a: &Analysis, home: ExternHome, d: ExternDecl, params: Buf
         a.fault(home.scope, home.span, "an intrinsic takes a fixed argument list, so it may not " +
                 "be declared with '...'")
 
-    resolve_intrinsic(written, params, ret) match
+    val resolved = if is_crc32c_intrinsic(written) then resolve_crc32c(a.tables.target, written, params, ret)
+                   else resolve_intrinsic(written, params, ret)
+
+    resolved match
         Ok(mangled) -> mangled
         Err(why) ->
             a.fault(home.scope, home.span, why)
@@ -664,15 +667,26 @@ private intrinsic_arity(base: string) -> Option[usize] = base match
     "llvm.maximum" -> Some(2)
     _ -> None
 
-// The ones there are, in the order a refusal lists them: the registry's library floats.
-supported_intrinsics() -> []const string = llvm_library_floats()
+// The ones there are, in the order a refusal lists them: the registry's library floats, then the
+// CRC-32C instructions.
+supported_intrinsics() -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for name in llvm_library_floats()
+        out.push(name)
+
+    for name in llvm_crc32c_intrinsics()
+        out.push(name)
+
+    out
+end supported_intrinsics
 
 // The same list as a refusal writes it.
 private intrinsics_supported() -> string
     val names = supported_intrinsics()
     var out = ""
 
-    for i in 0..<names.len
+    for i in 0..<names.len()
         if i > 0 then out = out + ", "
         out = out + names[i]
 
@@ -743,6 +757,70 @@ private resolve_trap(params: Buf[Type], ret: Type) -> Result[string, string]
         _ -> Err(s"'llvm.trap' never returns, so a declaration of it answers 'never' — this one " +
                  s"answers '${type_show(ret)}'")
 end resolve_trap
+
+// Whether `base` is one of the CRC-32C instructions (`llvm_registry.sysl`).
+private is_crc32c_intrinsic(base: string) -> bool
+    for name in llvm_crc32c_intrinsics()
+        if name == base then return true
+
+    false
+end is_crc32c_intrinsic
+
+// A CRC-32C instruction, held to three things the back end would otherwise fail on with no line to
+// point at: **the processor** -- an AArch64 instruction on an x86 machine is no instruction at all --
+// **the feature**, since the back end cannot select one where the build does not promise it (`#if
+// crc32c`, which reads the same `crc32c_instruction`), and **the signature**, which is not
+// overloaded: each name has exactly one, so the name is emitted as written.
+private resolve_crc32c(t: Target, base: string, params: Buf[Type], ret: Type) -> Result[string, string]
+    val aarch64 = base.starts_with("llvm.aarch64.")
+    val machine = if aarch64 then "AArch64" else "x86-64"
+
+    if (aarch64 && t.cpu != Aarch64) || (!aarch64 && t.cpu != X86_64)
+        return Err(s"'$base' is an $machine instruction, and this build is for '${t.name}'")
+
+    if !crc32c_instruction(t)
+        val ext = if aarch64 then "crc" else "sse4.2"
+
+        return Err(s"'$base' is an instruction '${t.name}' does not promise, so the back end could not " +
+                   s"select it — guard the declaration and its uses with '#if crc32c', or name the " +
+                   s"extension in sysl.hocon: 'codegen { extensions = [\"$ext\"] }'")
+
+    val shape = crc32c_shape(base)
+    val wanted = s"(${type_show(shape.0)}, ${type_show(shape.1)}) -> ${type_show(shape.2)}"
+    val stated = crc32c_stated(params, ret)
+
+    if stated != wanted
+        return Err(s"'$base' is '$wanted', and this declaration states '$stated'")
+
+    Ok(base)
+end resolve_crc32c
+
+// The one signature each CRC-32C instruction has: the running remainder, the value folded in, and
+// the remainder after. AArch64 takes every narrow value in a 32-bit register; SSE 4.2 takes it at its
+// own width, and its 64-bit form carries the remainder in a 64-bit register.
+private crc32c_shape(base: string) -> (Type, Type, Type)
+    val w = Integer(32, false, false)
+
+    base match
+        "llvm.aarch64.crc32cx" -> (w, Integer(64, false, false), w)
+        "llvm.x86.sse42.crc32.32.8" -> (w, Integer(8, false, false), w)
+        "llvm.x86.sse42.crc32.32.16" -> (w, Integer(16, false, false), w)
+        "llvm.x86.sse42.crc32.64.64" -> (Integer(64, false, false), Integer(64, false, false),
+                                         Integer(64, false, false))
+        _ -> (w, w, w)
+end crc32c_shape
+
+// A declaration's signature as the refusal writes it.
+private crc32c_stated(params: Buf[Type], ret: Type) -> string
+    var out = "("
+
+    for i in 0..<params.len()
+        if i > 0 then out = out + ", "
+
+        out = out + type_show(params[i])
+
+    out + s") -> ${type_show(ret)}"
+end crc32c_stated
 
 // The distinct types a declaration named, as the refusal lists them.
 private intrinsic_states(params: Buf[Type], ret: Type) -> string
