@@ -1,0 +1,493 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `@abandons` on an `extern` that answers something other than `never` (`reference/ffi.md § An extern
+// that may abandon`): Lua's `lua_call`, which comes back, or passes a `lua_error` up past its caller.
+// A direct call to one is reached as a call through an `@abandons *extern` is -- the frame making it
+// holds nothing counted across it, and every caller is marked in turn -- and the frame is NOT given
+// back before it, since the call may come back. `@abandons extern … -> never` is unchanged.
+//
+// The axes: the call's own frame (a local, a `&T`, a closure value, a temporary), the frames above it
+// (a caller, a generic caller, a member, a closure body), the address (into an `@abandons *extern`, into
+// a plain one), and the two forms side by side. Skipped: an `async` caller, which is held to what the
+// `@abandons *extern` call is (`tests_acp_`), the walk being the same; a `--lib` split, since the mark
+// is read from the declaration the program reaches, as `-> never`'s is (`tests_nfc_`).
+
+private struct MyaRun
+    ok: bool
+    out: string
+    err: string
+
+private mya_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end mya_ready
+
+// The C side: `mya_protected` is `lua_pcall` (it catches), `mya_raise` is `lua_error` (it jumps to
+// the innermost catch), and `mya_call` is `lua_call` -- it calls and comes back, unless what it calls
+// raises, when the jump passes it and its caller by.
+private mya_c() -> string = raw"""
+    #include <setjmp.h>
+    #include <stdint.h>
+
+    static jmp_buf *mya_catcher;
+
+    int32_t mya_protected(int32_t (*f)(int32_t), int32_t arg) {
+        jmp_buf here;
+        jmp_buf *outer = mya_catcher;
+        volatile int32_t r = -1;
+
+        mya_catcher = &here;
+        if (setjmp(here) == 0) r = f(arg);
+        mya_catcher = outer;
+        return r;
+    }
+
+    void mya_raise(void) {
+        longjmp(*mya_catcher, 1);
+    }
+
+    int32_t mya_call(int32_t (*f)(int32_t), int32_t arg) {
+        return f(arg) + 1;
+    }
+    """
+
+// The externs of the C side, `mya_call` marked as `mark` says.
+private mya_externs(mark: string) -> string = s"""
+    @abandons
+    extern mya_raise() -> never
+
+    $mark
+    extern mya_call(f: @abandons *extern(i32) -> i32, arg: i32) -> i32
+
+    extern mya_protected(f: @abandons *extern(i32) -> i32, arg: i32) -> i32
+    """
+
+// A callback holding a node with a destructor and a string made at run time, that raises when handed
+// more than 1.
+private mya_callback() -> string = """
+    struct Node
+        v: i32
+
+    impl Drop for Node
+        drop(self)
+            print("dropped", self.v)
+
+    raising(n: i32) -> i32
+        val node: &Node = Node(n)
+        val tag = n.to_string() + "!"
+
+        if n > 1 then mya_raise()
+
+        i32(tag.bytes.len) + node.v
+    """
+
+// A project whose module `p` carries the C side and `sysl`, and whose `main.sysl` prints `p.check()`,
+// built on the counted heap and run.
+private mya_run(sysl: string) -> MyaRun
+    val root = make_temp_dir("sysl-mya").unwrap()
+
+    make_dir_all(s"$root/p").unwrap()
+    write_text(s"$root/main.sysl", "print(p.check())\n").unwrap()
+    write_text(s"$root/p/p.sysl", s"module p\n\n$sysl").unwrap()
+    write_text(s"$root/p/probe.c", mya_c()).unwrap()
+    force_alloc_counting(true)
+
+    val built = build_native_program(root, None, None, DefaultOptimization, Some(s"$root/built"))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return MyaRun(false, failure_text(why), "")
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> MyaRun(false, "could not be started", "")
+        Ok(o) -> MyaRun(o.status.ok(), o.text, o.err.unwrap_or(""))
+end mya_run
+
+private mya_ir(text: string) -> string = xvr_ir([("main.sysl", text)])
+
+// The refusal of a frame holding `held` across a direct call to `mya_call`.
+private mya_held(held: string) -> string =
+    s"'mya_call' is '@abandons', so a call to it may abandon every frame below it and never come back, and this frame holds $held across the call — its count would never be given back"
+
+// -- running through a real catch point ---------------------------------------------------------------
+
+@test("a direct call to an '@abandons' extern that answers 'i32' comes back, or is jumped past, and the counted heap nets 0")
+mya_the_call_comes_back_or_is_jumped_past()
+    if !mya_ready() then return
+
+    // `body` runs under the catch point and calls `mya_call` directly, holding nothing across it; what
+    // it makes after the call is its own to give back, which it does when the call comes back.
+    val run = mya_run(mya_externs("@abandons") + mya_callback() + """
+
+        body(n: i32) -> i32
+            val r = mya_call(&raising, n)
+            val t = r.to_string() + "?"
+
+            i32(t.bytes.len) + r
+
+        check() -> string
+            val calm = mya_protected(&body, 1)
+            val raised = mya_protected(&body, 5)
+
+            s"$calm $raised"
+        """)
+
+    assert(run.ok, run.out)
+    // raising(1) = 2 + 1, mya_call adds 1: r = 4, "4?" is 2 long.
+    assert_eq(run.out, "dropped 1\ndropped 5\n6 -1\n")
+    assert_eq(alloc_count_reported(run.err), 0)
+
+@test("a caller two frames above the call, holding nothing across, runs and nets 0 through a jump")
+mya_a_transitive_caller_runs_clean()
+    if !mya_ready() then return
+
+    val run = mya_run(mya_externs("@abandons") + mya_callback() + """
+
+        relay(n: i32) -> i32 = mya_call(&raising, n)
+
+        body(n: i32) -> i32
+            val r = relay(n)
+            val t = r.to_string() + "?"
+
+            i32(t.bytes.len) + r
+
+        check() -> string
+            val calm = mya_protected(&body, 1)
+            val raised = mya_protected(&body, 5)
+
+            s"$calm $raised"
+        """)
+
+    assert(run.ok, run.out)
+    assert_eq(run.out, "dropped 1\ndropped 5\n6 -1\n")
+    assert_eq(alloc_count_reported(run.err), 0)
+
+@test("without the mark a frame holding a string across the call strands it when the call is jumped past, which is the control")
+mya_without_the_mark_the_frame_leaks()
+    if !mya_ready() then return
+
+    val run = mya_run(mya_externs("") + mya_callback() + """
+
+        body(n: i32) -> i32
+            val s = n.to_string() + "x"
+            val r = mya_call(&raising, n)
+
+            i32(s.bytes.len) + r
+
+        check() -> string
+            val raised = mya_protected(&body, 5)
+
+            s"$raised"
+        """)
+
+    assert(run.ok, run.out)
+    assert_eq(run.out, "dropped 5\n-1\n")
+    assert(alloc_count_reported(run.err) > 0, run.err)
+
+@test("'@abandons extern … -> never' still gives the frame back before the jump, beside an extern that may come back")
+mya_the_never_form_is_unchanged()
+    if !mya_ready() then return
+
+    // `raising` holds a node and a string and calls `mya_raise` directly: the `-> never` form gives
+    // both back before the jump, as it did before the returning form existed.
+    val run = mya_run(mya_externs("@abandons") + mya_callback() + """
+
+        check() -> string
+            val raised = mya_protected(&raising, 5)
+
+            s"$raised"
+        """)
+
+    assert(run.ok, run.out)
+    assert_eq(run.out, "dropped 5\n-1\n")
+    assert_eq(alloc_count_reported(run.err), 0)
+
+    // A `-> never` extern still may not take a parameter that carries a count; one that may come back
+    // may, its caller holding the count for as long as the call runs.
+    val never = mya_ir("""
+        @abandons
+        extern "abort" finish(why: string) -> never
+
+        print(1)
+        """)
+
+    assert(never.contains("'finish' is '@abandons', so its caller's frame is given back before the call and nothing is left to give back the count its parameter 'why' holds"), never)
+
+// -- what the frame making the call may hold ----------------------------------------------------------
+
+@test("a frame holding a string across a direct call is refused, and one that makes it after is not")
+mya_a_string_across_is_refused()
+    val said = mya_ir(mya_externs("@abandons") + """
+        twice(n: i32) -> i32 = n * 2
+
+        run()
+            val s = 1.to_string() + "x"
+
+            print(mya_call(&twice, 1))
+            print(s)
+
+        run()
+        """)
+
+    assert(said.contains(mya_held("'s'")), said)
+
+    val clean = mya_ir(mya_externs("@abandons") + """
+        twice(n: i32) -> i32 = n * 2
+
+        run()
+            print(mya_call(&twice, 1))
+
+            val s = 1.to_string() + "x"
+
+            print(s)
+
+        run()
+        """)
+
+    assert(!clean.contains("error:"), clean)
+
+@test("a frame holding a '&T' across a direct call is refused")
+mya_a_reference_across_is_refused()
+    val said = mya_ir(mya_externs("@abandons") + """
+        struct Node
+            v: i32
+
+        twice(n: i32) -> i32 = n * 2
+
+        run()
+            val node: &Node = Node(3)
+
+            print(mya_call(&twice, node.v))
+
+        run()
+        """)
+
+    assert(said.contains(mya_held("'node'")), said)
+
+@test("a frame holding a closure that captured a string across a direct call is refused")
+mya_a_closure_capture_across_is_refused()
+    val said = mya_ir(mya_externs("@abandons") + """
+        twice(n: i32) -> i32 = n * 2
+
+        run()
+            val s = 1.to_string() + "x"
+            val g = () -> print(s)
+
+            print(mya_call(&twice, 1))
+            g()
+
+        run()
+        """)
+
+    assert(said.contains(mya_held("'s'")), said)
+
+@test("a counted temporary of the enclosing expression is held across a direct call, and refused")
+mya_a_temporary_across_is_refused()
+    val said = mya_ir(mya_externs("@abandons") + """
+        twice(n: i32) -> i32 = n * 2
+
+        pair(a: string, b: i32) -> i32 = i32(a.bytes.len) + b
+
+        print(pair(1.to_string() + "x", mya_call(&twice, 1)))
+        """)
+
+    assert(said.contains("'mya_call' is '@abandons', so a call to it may abandon every frame below it and never come back, and this frame holds"), said)
+
+// -- the frames above it ------------------------------------------------------------------------------
+
+@test("a function that calls the extern directly can reach an abandoning call itself, and so can its caller")
+mya_the_callers_are_marked_transitively()
+    val said = mya_ir(mya_externs("@abandons") + """
+        twice(n: i32) -> i32 = n * 2
+
+        relay(n: i32) -> i32 = mya_call(&twice, n)
+
+        middle(n: i32) -> i32 = relay(n) + 1
+
+        outer()
+            val s = 1.to_string() + "x"
+
+            print(middle(2))
+            print(s)
+
+        outer()
+        """)
+
+    assert(said.contains("'middle' can reach a call that abandons every frame below it and never comes back, and this frame holds 's' across the call"), said)
+
+    val addressed = mya_ir(mya_externs("@abandons") + """
+        twice(n: i32) -> i32 = n * 2
+
+        relay(n: i32) -> i32 = mya_call(&twice, n)
+
+        val p: *extern(i32) -> i32 = &relay
+
+        print(1)
+        """)
+
+    assert(addressed.contains("'relay' can reach a call that abandons every frame below it, and a call through a value cannot be followed there"), addressed)
+    assert(addressed.contains("or take its address as '@abandons *extern(int) -> int'"), addressed)
+
+@test("a generic caller and a member function that call the extern are marked as a plain caller is")
+mya_generic_and_member_callers()
+    val generic = mya_ir(mya_externs("@abandons") + """
+        twice(n: i32) -> i32 = n * 2
+
+        relay[T](x: T) -> i32 = mya_call(&twice, 1)
+
+        outer()
+            val s = 1.to_string() + "x"
+
+            print(relay(true))
+            print(relay(2))
+            print(s)
+
+        outer()
+        """)
+
+    assert(generic.contains("can reach a call that abandons every frame below it and never comes back, and this frame holds 's' across the call"), generic)
+
+    val member = mya_ir(mya_externs("@abandons") + """
+        struct Lib
+            k: i32
+
+        impl Lib
+            relay(self) -> i32 = mya_call(&twice, self.k)
+
+        twice(n: i32) -> i32 = n * 2
+
+        outer()
+            val s = 1.to_string() + "x"
+
+            print(Lib(1).relay())
+            print(s)
+
+        outer()
+        """)
+
+    assert(member.contains("can reach a call that abandons every frame below it and never comes back, and this frame holds 's' across the call"), member)
+
+    val clean = mya_ir(mya_externs("@abandons") + """
+        struct Lib
+            k: i32
+
+        impl Lib
+            relay(self) -> i32 = mya_call(&twice, self.k)
+
+        twice(n: i32) -> i32 = n * 2
+
+        relay[T](x: T) -> i32 = mya_call(&twice, 1)
+
+        print(Lib(1).relay() + relay(true))
+        """)
+
+    assert(!clean.contains("error:"), clean)
+
+@test("a closure whose body calls the extern is not erased into a callable object")
+mya_a_closure_body_is_refused()
+    val said = mya_ir(mya_externs("@abandons") + """
+        twice(n: i32) -> i32 = n * 2
+
+        run(g: &Fn() -> unit)
+            g()
+
+        run(() -> print(mya_call(&twice, 1)))
+        """)
+
+    assert(said.contains("this closure can reach a call that abandons every frame below it"), said)
+
+// -- its address --------------------------------------------------------------------------------------
+
+@test("the extern's address may be taken as '@abandons *extern', and a call through it is held as a direct one")
+mya_its_address_as_an_abandoning_pointer()
+    val said = mya_ir(mya_externs("@abandons") + """
+        twice(n: i32) -> i32 = n * 2
+
+        val p: @abandons *extern(@abandons *extern(i32) -> i32, i32) -> i32 = &mya_call
+
+        print(p(&twice, 1))
+        """)
+
+    assert(!said.contains("error:"), said)
+
+    val held = mya_ir(mya_externs("@abandons") + """
+        twice(n: i32) -> i32 = n * 2
+
+        run(p: @abandons *extern(@abandons *extern(i32) -> i32, i32) -> i32)
+            val s = 1.to_string() + "x"
+
+            print(p(&twice, 1))
+            print(s)
+
+        run(&mya_call)
+        """)
+
+    assert(held.contains("a call through an '@abandons *extern' pointer can reach a call that abandons every frame below it and never comes back, and this frame holds 's' across the call"), held)
+
+@test("the extern's address taken as a plain '*extern' is refused, and the refusal names the '@abandons' type")
+mya_its_address_as_a_plain_pointer()
+    val said = mya_ir(mya_externs("@abandons") + """
+        val p: *extern(@abandons *extern(i32) -> i32, i32) -> i32 = &mya_call
+
+        print(1)
+        """)
+
+    assert(said.contains("'mya_call' is '@abandons', so a call to it may abandon every frame below it, and a call through a value cannot be followed there"), said)
+    assert(said.contains("call it by name, or take its address as '@abandons *extern(@abandons *extern(int) -> int, int) -> int'"), said)
+
+// -- the declaration ------------------------------------------------------------------------------------
+
+@test("'@abandons' on a sysl function that answers anything but 'never' is still refused, in words that leave the extern out")
+mya_a_sysl_function_must_answer_never()
+    val said = mya_ir("""
+        @abandons
+        call_it(n: i32) -> unit
+            print(n)
+
+        call_it(1)
+        """)
+
+    assert(said.contains("'@abandons' on a sysl function says a call to 'call_it' never comes back, so 'call_it' answers 'never' — this one answers 'unit'. Whether a call to it may abandon is read from its body; only an 'extern' may say it may abandon and also come back"), said)
+
+    // An extern answering `unit` is the `lua_call` shape itself, and is accepted.
+    val accepted = mya_ir("""
+        @abandons
+        extern lua_call(l: *u8, n: i32, r: i32)
+
+        print(1)
+        """)
+
+    assert(!accepted.contains("error:"), accepted)
+
+@test("an extern that may abandon takes a parameter that carries a count, and its caller still holds nothing across")
+mya_a_counted_parameter_is_the_callers()
+    val said = mya_ir("""
+        @abandons
+        extern "puts" say(s: string) -> i32
+
+        run()
+            val s = 1.to_string() + "x"
+
+            print(say(s))
+
+        run()
+        """)
+
+    assert(said.contains("'say' is '@abandons', so a call to it may abandon every frame below it and never come back, and this frame holds 's' across the call"), said)
+    assert(!said.contains("nothing is left to give back the count its parameter"), said)
