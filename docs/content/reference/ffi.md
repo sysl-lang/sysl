@@ -451,6 +451,60 @@ lays it out in is marked [`@pinned`](/reference/attributes/#pinned-on-a-struct-a
 kept in module storage or a `&T` box, and passed to C as `&fs`. The compiler then refuses every copy of
 it.
 
+### Handing C an object to hold
+
+A C API that hands out a handle — `db_open` answering a `Db *` that the caller passes back to every
+call and finally to `db_close` — is written with **`into_raw`** and **`from_raw`**
+([`memory.md`](/reference/memory/#a-counted-reference-given-up-as-a-pointer)). `r.into_raw()` gives up a
+`&T` as the address of the object, carrying one count of it to C; `from_raw(p)` adopts the count back,
+and the object goes when that reference does. In between, the pointer is a `*T`, so a call C makes
+reads and writes the fields directly, and a C program that knows the layout can too:
+
+```sysl
+import sysl.raw.from_raw
+
+struct Db
+    n: i32
+    hits: i32
+
+impl Drop for Db
+    drop(self) = print("closed", self.n, self.hits)
+
+@export("db_open")
+open(n: i32) -> *Db
+    val d: &Db = Db(n, 0)
+    d.into_raw()
+
+@export("db_hit")
+hit(p: *Db) -> i32
+    p.hits += 1
+    p.hits
+
+@export("db_close")
+close(p: *Db)
+    val d: &Db = from_raw(p)
+
+val p = open(5)
+
+hit(p)
+print(hit(p))
+close(p)
+```
+
+```output
+2
+closed 5 2
+```
+
+The C side holds nothing but the pointer, and owes what `from_raw` owes: hand back only a pointer
+`db_open` answered, and hand it back once.
+
+```c
+Db *d = db_open(5);
+db_hit(d);
+db_close(d);
+```
+
 ### A union at the boundary
 
 A [`union`](/reference/types/#unions) crosses to C by value as C's own union does, in either
@@ -1888,6 +1942,104 @@ its manifest and may say `@link` nowhere.
 `sysl emit-header` prints the same declarations without building anything, for a project that
 generates its headers as a build step.
 
+### The spellings a C API is written in
+
+The header spells each type the way a C API's own documentation would, because a callback or a
+buffer declared one C type away from what its caller wrote is a hard error in the caller's compiler,
+not a warning:
+
+| sysl | in the header |
+|---|---|
+| `usize`, `isize` | `size_t`, `ptrdiff_t` — not `uint64_t`, which is a different C type of the same width where `size_t` is `unsigned long` |
+| `*const T` | `const T *`, and `uint8_t * const *` for a `*const *u8` |
+| `*unit` | `void *` — the opaque pointer an allocator or a context argument is |
+| a `*[N]T` parameter | `T name[N]`, the array C's caller passes by name; `const T name[N]` for `*const [N]T` |
+| a [`c type`](#c-type-a-width-only-the-c-compiler-can-work-out) | its C name, with the headers its file `@include`s included |
+
+```sysl build=c
+module terndb
+
+@export("terndb_alloc_fn")
+type AllocFn = *extern(usize) -> *unit
+
+@export("terndb_digest")
+digest(alloc: AllocFn, text: *const u8, len: usize, out: *[32]u8) -> isize = 0
+```
+
+```c
+typedef void * (*terndb_alloc_fn)(size_t);
+
+ptrdiff_t terndb_digest(terndb_alloc_fn alloc, const uint8_t * text, size_t len, uint8_t out[32]);
+```
+
+A pointer to an array stays one everywhere but a parameter — a field, a result, exported storage —
+since only a parameter is where C reads an array as the pointer it decays to.
+
+### Constants in the header
+
+**`@export` above a `const` defines it as a macro**, which is how C states a fixed number. A
+constant has no storage, so a macro is the one thing it can be exported as; the value is the one
+every use folds to, written as its type's C literal — `32`, `(-5)`, `UINT64_C(…)` past a C `int`,
+`1.5f`, `true`, a string with its bytes escaped. **Above a simple enum it defines one per variant**,
+`PREFIX_VARIANT` with the variant's name in capitals and an underscore between its words, the
+prefix being what `@export` named (the enum's own name in capitals where it named nothing). The
+enum itself is still spelled as its integer, so the constants are the values a parameter of that
+type takes:
+
+```sysl build=c
+module terndb
+
+@export("TERNDB_DIGEST_LEN")
+const DIGEST_LEN: usize = 32
+
+@export("TERNDB_ISOLATION")
+enum Isolation
+    Serializable
+    Snapshot
+    ReadCommitted
+
+@export("terndb_begin")
+begin(level: Isolation) -> bool = true
+```
+
+```c
+#define TERNDB_DIGEST_LEN 32
+
+#define TERNDB_ISOLATION_SERIALIZABLE 0
+#define TERNDB_ISOLATION_SNAPSHOT 1
+#define TERNDB_ISOLATION_READ_COMMITTED 2
+
+bool terndb_begin(int32_t level);
+```
+
+The macros sit under the includes, constants sorted by name and each enum's variants in the order
+they were declared. A constant C has no literal for is refused at its `@export`, and so is an enum
+whose variants carry fields:
+
+```sysl
+module mylib
+
+@export("HALF")
+const HALF: f16 = 1.5
+```
+
+```error
+'HALF' is exported as a macro, and it is f16, which has no C literal
+```
+
+### Naming the include guard
+
+The guard is built from the project's name — `SYSL_TERNDB_H` for a package called `terndb`. A C API
+that already has a header has a guard its users' code may test, and **`--header-guard <NAME>`**, to
+`build-c` or `emit-header`, names it instead:
+
+```text
+$ sysl build-c terndb -o libterndb.a --header terndb.h --header-guard TERNDB_H
+```
+
+A name that is not a C identifier is refused, since it would make the header's first line a syntax
+error in every file that includes it.
+
 ### What a dependency's module contributes
 
 **A module a dependency supplied contributes to your build only where your program reaches that
@@ -2592,6 +2744,69 @@ a call through an '@abandons *extern' pointer can reach a call that abandons eve
 The mark is never dropped: an `@abandons *extern` value does not go where a plain `*extern` is asked
 for. It marks nothing but a C function pointer — a callable object that can reach an abandoning call
 is refused as before.
+
+### An `extern` that may abandon, and also come back
+
+Lua's `lua_call` and `lua_callk` are unprotected: they run a function and come back, or, when that
+function raises, pass the `lua_error` up past their caller to whatever `lua_pcall` caught it. That is
+**`@abandons` on an `extern` whose result is not `never`**: a call to it may abandon. Since it may also
+come back, the caller's frame is not given back first; it is held to what a call through an
+`@abandons *extern` is — nothing counted across the call — and every function that calls it can reach
+an abandoning call in turn:
+
+```sysl build=c
+module relaying
+
+@abandons
+extern lua_call(L: *u8, nargs: i32, nresults: i32)
+
+extern lua_pushvalue(L: *u8, index: i32)
+extern lua_tointegerx(L: *u8, index: i32, isnum: *i32) -> i64
+extern lua_pushinteger(L: *u8, n: i64)
+extern lua_pushcclosure(L: *u8, f: @abandons *extern(*u8) -> i32, upvalues: i32)
+
+// relay(f, x): calls f(x) and answers twice what f answers.
+relay(L: *u8) -> i32
+    lua_pushvalue(L, 1)
+    lua_pushvalue(L, 2)
+    lua_call(L, 1, 1)
+
+    var whole: i32 = 0
+    val n = lua_tointegerx(L, -1, &whole)
+
+    lua_pushinteger(L, n * 2)
+    1
+
+@export("luaopen_relaying")
+open(L: *u8) -> i32
+    lua_pushcclosure(L, &relay, 0)
+    1
+```
+
+`relay` calls `lua_call` directly, so it can reach an abandoning call, and its address is taken as
+`@abandons *extern` as a raising callback's is. A frame holding something counted across the call is
+refused:
+
+```sysl
+@abandons
+extern lua_call(L: *u8, nargs: i32, nresults: i32)
+
+relay(L: *u8)
+    val s = 1.to_string() + "x"
+
+    lua_call(L, 0, 0)
+    print(s)
+
+relay(null)
+```
+
+```error
+'lua_call' is '@abandons', so a call to it may abandon every frame below it and never come back, and this frame holds 's' across the call
+```
+
+The address of such an `extern` is taken as `@abandons *extern` too, never as a plain one. On a sysl
+function, `@abandons` still means the call never comes back and the result must be `never`: whether
+a sysl function may abandon is read from its body, so there is nothing for a mark to add.
 
 ### What has no address, and why
 

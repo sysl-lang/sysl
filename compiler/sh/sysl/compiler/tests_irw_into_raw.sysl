@@ -1,0 +1,590 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.replace_all
+
+// `r.into_raw()` and `from_raw(p)` (`reference/memory.md § A counted reference given up as a pointer`,
+// `reference/ffi.md § Handing C an object to hold`): a `&T` given up as the address of its payload, a
+// `*T` carrying one count of the object away, and that pointer adopted back as the `&T` that owns the
+// count. The header sits a fixed distance before the payload, and that distance depends on the box:
+// three words, or the count alone for a compact box (`compact_box.sysl`), plus the padding an
+// over-aligned payload needs. Each layout is crossed with the round trip, on the counted heap, so a
+// count lost or kept too many shows as a leak or a double free, and a wrong header offset as a crash.
+//
+// The axes: the box's header (compact, full because a `weak` is taken, full because of a destructor,
+// a payload over-aligned past the header), the count's kind (`&T`, `&sync T`), what is given up (a
+// local at its last use, one still used after, a temporary, a parameter, a generic `&T`), how the
+// pointer travels (as it is, through a `*u8` and back, through a C program), and how it comes back
+// (annotated, `from_raw[T]`). The refusals: each near miss on both forms, the import, and a type's own
+// `into_raw` reached first.
+//
+// Skipped cells, and why: separate compilation leaves a box's layout to the type's own program -- a
+// `build-c` archive is never compact, which the C round trip covers; a bare-metal target lays the same
+// header with its own word, which `box_pad`'s arithmetic already serves for every box.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private struct IrwRun
+    out: string
+    err: string
+    failed: string
+end IrwRun
+
+// The program built on the counted heap and run: what it printed, what the heap said at exit, or why
+// it was not built.
+private irw_run(text: string) -> IrwRun
+    val root = make_temp_dir("sysl-irw").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    force_alloc_counting(true)
+
+    val made = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe))
+
+    force_alloc_counting(false)
+
+    made match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return IrwRun("", "", failure_text(why))
+        Ok(_) -> ()
+
+    val ran = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    ran match
+        Err(_) -> IrwRun("", "", "could not be started")
+        Ok(o) -> IrwRun(o.text, o.err.unwrap_or(""), if o.status.ok() then "" else s"status: ${o.text}")
+end irw_run
+
+// The program printed `want`, and the heap took back everything it gave.
+private irw_prints(text: string, want: string)
+    if !enm_ready() then return
+
+    val got = irw_run(text)
+
+    assert_eq(got.failed, "")
+    assert_eq(got.out, want)
+    assert_eq(got.err, "")
+end irw_prints
+
+// The program is refused with a diagnostic containing `part`.
+private irw_refused(text: string, part: string)
+    if !enm_ready() then return
+
+    val got = irw_run(text)
+
+    assert(got.failed.contains(part), s"wanted '$part', got: ${got.failed}${got.out}")
+end irw_refused
+
+// The program's whole LLVM text.
+private irw_ir(text: string) -> string
+    val root = make_temp_dir("sysl-irw").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val (code, out, err) = clx_ran(["sysl", "emit-llvm", s"$root/main.sysl"])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(code, Fine, err)
+    out
+end irw_ir
+
+// A type that prints when it goes, so a drop that runs twice or never shows in the output.
+private const irw_db: string = raw"""
+    import sysl.raw.from_raw
+
+    struct Db
+        n: int
+
+    impl Drop for Db
+        drop(self) = print("drop", self.n)
+
+    """
+
+// -- the round trip, per header ---------------------------------------------------------------------
+
+@test("a reference given up and adopted back is dropped once, at the adopting scope's end")
+irw_round_trip_drops_once()
+    irw_prints(irw_db + raw"""
+        open(n: int) -> *Db
+            val d: &Db = Db(n)
+            d.into_raw()
+
+        close(p: *Db)
+            val d: &Db = from_raw(p)
+            print("closing", d.n)
+
+        val p = open(5)
+        print("open", p.n)
+        close(p)
+        print("after")
+        """, "open 5\nclosing 5\ndrop 5\nafter\n")
+end irw_round_trip_drops_once
+
+@test("a write through the pointer lands in the object the adopted reference reaches")
+irw_write_through_pointer()
+    irw_prints(irw_db + raw"""
+        var d: &Db = Db(1)
+        val p = d.into_raw()
+
+        p.n = 42
+        print(d.n)
+        d = from_raw(p)
+        print(d.n)
+        """, "42\n42\ndrop 42\n")
+end irw_write_through_pointer
+
+// The local is read after the pointer is taken, so its own count stays with it and the pointer's is a
+// second one: two references until the end, one object, one drop.
+@test("a reference still used after into_raw keeps its own count beside the pointer's")
+irw_still_used_after()
+    irw_prints(irw_db + raw"""
+        run()
+            val d: &Db = Db(7)
+            val p = d.into_raw()
+
+            print(d.n, p.n)
+
+            val back: &Db = from_raw(p)
+
+            print(back.n, back == d)
+
+        run()
+        print("done")
+        """, "7 7\n7 true\ndrop 7\ndone\n")
+end irw_still_used_after
+
+@test("a temporary given up straight away is not dropped at the statement's end")
+irw_temporary()
+    irw_prints(irw_db + raw"""
+        make(n: int) -> &Db = Db(n)
+
+        val p = make(3).into_raw()
+        val q: *Db = Db(4).into_raw()
+
+        print(p.n, q.n)
+
+        val a: &Db = from_raw(p)
+        val b: &Db = from_raw(q)
+
+        print(a.n + b.n)
+        """, "3 4\n7\ndrop 4\ndrop 3\n")
+end irw_temporary
+
+// A parameter is borrowed by the callee, so the count the pointer carries is one the callee takes.
+@test("a parameter given up takes a count of its own, and the caller's reference keeps its")
+irw_parameter()
+    irw_prints(irw_db + raw"""
+        give(d: &Db) -> *Db = d.into_raw()
+        take(p: *Db) -> int
+            val d: &Db = from_raw(p)
+            d.n
+
+        run()
+            val d: &Db = Db(9)
+            val p = give(d)
+
+            print(take(p))
+            print("still", d.n)
+
+        run()
+        """, "9\nstill 9\ndrop 9\n")
+end irw_parameter
+
+@test("a generic function gives up and adopts back a reference of its parameter's type")
+irw_generic()
+    irw_prints(irw_db + raw"""
+        leak[T](r: &T) -> *T = r.into_raw()
+        adopt[T](p: *T) -> &T = from_raw(p)
+
+        val p = leak(Db(2))
+        val back = adopt(p)
+
+        print(back.n)
+
+        val n: &int = 41
+        val q = leak(n)
+
+        print(*q + 1, *adopt(q))
+        """, "2\n42 41\ndrop 2\n")
+end irw_generic
+
+@test("from_raw[T] names the pointee where nothing else says the reference's type")
+irw_bracket_form()
+    irw_prints(irw_db + raw"""
+        val p = Db(6).into_raw()
+        val d = from_raw[Db](p)
+
+        print(d.n)
+        """, "6\ndrop 6\n")
+end irw_bracket_form
+
+// The C `void *userdata` shape: the pointer travels as bytes' address and is cast back.
+@test("the pointer travels as a *u8 and is cast back before it is adopted")
+irw_through_u8()
+    irw_prints(irw_db + raw"""
+        import sysl.raw.ptr_cast
+
+        val user: *u8 = ptr_cast(Db(8).into_raw())
+        val p: *Db = ptr_cast(user)
+        val d: &Db = from_raw(p)
+
+        print(d.n)
+        """, "8\ndrop 8\n")
+end irw_through_u8
+
+// No destructor, no `weak`, no trait object: a compact box, whose header is the count alone.
+private const irw_compact: string = raw"""
+    import sysl.raw.from_raw
+
+    struct Cell
+        n: int
+        next: Option[&Cell]
+
+    val made: &Cell = Cell(1, Some(Cell(2, None)))
+    var p = made.into_raw()
+
+    print(p.n)
+
+    val c: &Cell = from_raw(p)
+
+    c.next match
+        Some(x) -> print(c.n, x.n)
+        None -> print("none")
+    """
+
+@test("a compact box round trips, its header found a count's width before its payload")
+irw_compact_box()
+    irw_prints(irw_compact, "1\n1 2\n")
+end irw_compact_box
+
+@test("the compact round trip's type really is compact: its release is its own")
+irw_compact_box_is_compact()
+    if !enm_ready() then return
+
+    val text = irw_ir(irw_compact)
+
+    assert(text.contains("arc.release.") && text.contains("Cell"), text)
+end irw_compact_box_is_compact
+
+// A `weak` taken of the type keeps the full three-word header.
+@test("a full-header box round trips, and a weak reference sees it alive and then gone")
+irw_full_header_weak()
+    irw_prints(raw"""
+        import sysl.raw.from_raw
+
+        struct Node
+            v: int
+
+        var w: weak Node = None
+        var p: *Node = null
+
+        make()
+            val n: &Node = Node(11)
+
+            w = n
+            p = n.into_raw()
+
+        make()
+        print(p.v, w.get().is_some())
+
+        drop_it()
+            val n: &Node = from_raw(p)
+
+            print(n.v)
+
+        drop_it()
+        print(w.get().is_some())
+        """, "11 true\n11\nfalse\n")
+end irw_full_header_weak
+
+// A payload aligned past the header leaves padding between them, which the step back has to count.
+@test("an over-aligned payload round trips in a compact box and in a full one")
+irw_over_aligned()
+    irw_prints(raw"""
+        import sysl.raw.from_raw
+
+        struct Wide
+            x: u128
+            y: int
+
+        struct Held
+            x: u128
+
+        var keep: weak Held = None
+
+        val w: &Wide = Wide(1u128 << 100, 3)
+        val p = w.into_raw()
+        val a: &Wide = from_raw(p)
+
+        print(a.x == 1u128 << 100, a.y)
+
+        val h: &Held = Held(5)
+
+        keep = h
+
+        val q = h.into_raw()
+        val b: &Held = from_raw(q)
+
+        print(b.x, keep.get().is_some())
+        """, "true 3\n5 true\n")
+end irw_over_aligned
+
+@test("an over-aligned payload's address is aligned for it")
+irw_over_aligned_address()
+    irw_prints(raw"""
+        import sysl.raw.from_raw
+
+        struct Wide
+            x: u128
+
+        val w: &Wide = Wide(1)
+        val p = w.into_raw()
+
+        print(usize(p) % 16)
+
+        val back: &Wide = from_raw(p)
+        """, "0\n")
+end irw_over_aligned_address
+
+@test("a &sync reference gives up its count and adopts it back as a &sync")
+irw_sync()
+    irw_prints(irw_db + raw"""
+        run()
+            val s: &sync Db = Db(12)
+            val p = s.into_raw()
+            val back: &sync Db = from_raw(p)
+
+            print(back.n, back == s)
+
+        run()
+        print("done")
+        """, "12 true\ndrop 12\ndone\n")
+end irw_sync
+
+@test("a reference given up twice carries two counts, and two adoptions give both back")
+irw_twice()
+    irw_prints(irw_db + raw"""
+        val d: &Db = Db(13)
+        val p = d.into_raw()
+        val q = d.into_raw()
+
+        print(p == q)
+
+        val a: &Db = from_raw(p)
+        val b: &Db = from_raw(q)
+
+        print(a.n + b.n)
+        """, "true\n26\ndrop 13\n")
+end irw_twice
+
+// -- refusals ---------------------------------------------------------------------------------------
+
+@test("from_raw unimported is told where it lives")
+irw_refuses_unimported()
+    irw_refused(raw"""
+        struct Db
+            n: int
+
+        val d: &Db = from_raw(Db(1).into_raw())
+        """, "'from_raw' is in sysl.raw: add 'import sysl.raw.from_raw'")
+end irw_refuses_unimported
+
+@test("from_raw of a pointer to another type is a type mismatch")
+irw_refuses_other_pointee()
+    irw_refused(irw_db + raw"""
+        struct Other
+            n: int
+
+        val p: *Other = Other(1).into_raw()
+        val d: &Db = from_raw(p)
+        """, "*Other")
+end irw_refuses_other_pointee
+
+@test("from_raw of a counted reference is refused: it is one already")
+irw_refuses_reference()
+    irw_refused(irw_db + raw"""
+        val r: &Db = Db(1)
+        val d = from_raw(r)
+        """, "is a counted reference already")
+end irw_refuses_reference
+
+@test("from_raw of a number is refused")
+irw_refuses_number()
+    irw_refused(irw_db + raw"""
+        val d = from_raw(5)
+        """, "'from_raw' adopts a pointer 'into_raw' answered, and the value has type")
+end irw_refuses_number
+
+@test("from_raw takes exactly one value")
+irw_refuses_arity()
+    irw_refused(irw_db + raw"""
+        val d: &Db = from_raw()
+        """, "'from_raw' takes exactly one value")
+end irw_refuses_arity
+
+@test("into_raw of a value is refused, naming the reference that has it")
+irw_refuses_value()
+    irw_refused(raw"""
+        struct Db
+            n: int
+
+        val d = Db(1)
+        val p = d.into_raw()
+        """, "type 'Db' has no method 'into_raw' — 'into_raw' gives up a counted reference, so hold the value as a '&Db'")
+end irw_refuses_value
+
+@test("into_raw of a plain pointer is refused: it holds no count")
+irw_refuses_pointer()
+    irw_refused(raw"""
+        struct Db
+            n: int
+
+        var d = Db(1)
+        val p = &d
+        val q = p.into_raw()
+        """, "a '*' pointer holds no count")
+end irw_refuses_pointer
+
+@test("into_raw of a trait object is refused: its table would be lost")
+irw_refuses_trait_object()
+    irw_refused(raw"""
+        trait Shape
+            area(self) -> int
+
+        struct Sq
+            s: int
+
+        impl Shape for Sq
+            area(self) -> int = self.s * self.s
+
+        val s: &Shape = Sq(2)
+        val p = s.into_raw()
+        """, "'into_raw' gives up a reference as one address")
+end irw_refuses_trait_object
+
+@test("into_raw of a weak reference is refused, pointing at get()")
+irw_refuses_weak()
+    irw_refused(raw"""
+        struct Db
+            n: int
+
+        val d: &Db = Db(1)
+        val w: weak Db = d
+        val p = w.into_raw()
+        """, "a weak Db has no method 'into_raw'")
+end irw_refuses_weak
+
+@test("into_raw takes no arguments")
+irw_refuses_arguments()
+    irw_refused(irw_db + raw"""
+        val d: &Db = Db(1)
+        val p = d.into_raw(1)
+        """, "'into_raw' takes no arguments")
+end irw_refuses_arguments
+
+@test("a type's own into_raw is what a call reaches")
+irw_own_member_first()
+    irw_prints(raw"""
+        struct Fd
+            n: int
+
+            into_raw(self) -> int = self.n
+
+        val f: &Fd = Fd(3)
+
+        print(f.into_raw())
+        """, "3\n")
+end irw_own_member_first
+
+// -- through C ---------------------------------------------------------------------------------------
+
+private const irw_c_lib: string = raw"""
+    import sysl.raw.from_raw
+
+    struct Db
+        n: i32
+        hits: i32
+
+    impl Drop for Db
+        drop(self) = print("drop", self.n, self.hits)
+
+    @export("db_open")
+    open(n: i32) -> *Db
+        val d: &Db = Db(n, 0)
+        d.into_raw()
+
+    @export("db_hit")
+    hit(p: *Db) -> i32
+        p.hits += 1
+        p.hits
+
+    @export("db_close")
+    close(p: *Db)
+        val d: &Db = from_raw(p)
+        print("closing", d.n)
+    """
+
+private const irw_c_main: string = raw"""
+    #include <stdio.h>
+    #include <stdlib.h>
+    #include <stdint.h>
+
+    static long live = 0;
+
+    void *irw_alloc(size_t n) { live++; return malloc(n); }
+    void irw_free(void *p) { if (p) live--; free(p); }
+
+    typedef struct { int32_t n; int32_t hits; } Db;
+
+    Db *db_open(int32_t n);
+    int32_t db_hit(Db *d);
+    void db_close(Db *d);
+
+    int main(void) {
+        Db *d = db_open(5);
+        db_hit(d);
+        db_hit(d);
+        d->hits += 10;
+        printf("c sees n=%d hits=%d live=%ld\n", d->n, d->hits, live);
+        db_close(d);
+        printf("live %ld\n", live);
+        return 0;
+    }
+    """
+
+@test("a C program holds an object through the pointer, reads its fields and hands it back once")
+irw_through_c()
+    if !enm_ready() then return
+
+    val root = make_temp_dir("sysl-irw").unwrap()
+    val dir = s"$root/lib"
+
+    make_dir_all(dir).unwrap()
+    write_text(s"$dir/sysl.hocon", "package {\n  name = \"lib\"\n}\n\n" +
+               "allocator {\n  alloc = \"irw_alloc\"\n  free = \"irw_free\"\n}\n").unwrap()
+    write_text(s"$dir/main.sysl", irw_c_lib).unwrap()
+
+    val archive = s"$root/lib.a"
+    val (code, out, err) = clx_ran(["sysl", "build-c", dir, "-o", archive])
+
+    assert_eq(code, Fine, s"$out$err")
+    write_text(s"$root/main.c", irw_c_main).unwrap()
+
+    val linked = capture("clang", [s"$root/main.c", archive, "-lm", "-o", s"$root/app"], "", [], true).unwrap()
+
+    assert(linked.status.ok(), linked.text + linked.err.unwrap_or(""))
+
+    val ran = capture(s"$root/app", [], "", [], true).unwrap()
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(replace_all(ran.text, s"$root/", ""),
+              "c sees n=5 hits=12 live=1\nclosing 5\ndrop 5 12\nlive 0\n")
+end irw_through_c

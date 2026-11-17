@@ -21,6 +21,7 @@ has a name and a spelling of its own:
 | `@export("...")` on a `struct` | an **annotation** — the name the type carries in a generated C header | the grammar |
 | `@renamed("...", "...")`, `@removed("...", "...")` | an **annotation** — the declaration under it is a tombstone, a name that is gone; see [`@renamed` and `@removed`](#renamed-and-removed-a-name-that-is-gone-and-what-became-of-it) | the grammar |
 | `@export("...")` on a module `var` or `val` | an **annotation** — the C symbol the storage is published under | the grammar |
+| `@export("...")` on a `const` or a simple `enum` | an **annotation** — the macro a generated C header defines for the value, or the prefix of one per variant; see [constants in the header](/reference/ffi/#constants-in-the-header) | the grammar |
 | `@no_alloc`, `@requires`, `@link`, `@include`, `@tests` | an **annotation** — a fact about the whole file, in its header | the grammar |
 | `@assert` | an **annotation** that describes nothing but itself — a condition settled while compiling | the analyzer, once |
 | `#if` | a **directive** — a gate on lines | a pass before the lexer |
@@ -53,7 +54,10 @@ handed a copy of every view in it, and one a body shows is inferred — and is o
 function may also carry, holds that one definition to making no heap storage and is below; and
 `@abandons` says a call to the function never comes back while the program goes on, so the caller's
 frame is given back first — it marks an `extern` too, and is on the
-[declarations](/reference/declarations/) page beside `become`.
+[declarations](/reference/declarations/) page beside `become`. On an `extern` that answers something
+other than `never` it says a call **may** abandon — Lua's `lua_call` comes back, or passes a
+`lua_error` up past its caller — so the caller keeps its frame and may hold nothing counted across
+the call; see [an `extern` that may abandon](/reference/ffi/#an-extern-that-may-abandon-and-also-come-back).
 
 **On a type, or on storage** there are four, and three of them are about *where* rather than about
 what the declaration does. `@packed` and `@align(n)` lay out a struct — no interior padding, and the

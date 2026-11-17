@@ -842,8 +842,9 @@ private joined_names(a: Buf[string], b: Buf[string]) -> Buf[string]
 end joined_names
 
 // What `--explain-escapes` reports about the program's own files: one line per array the escape
-// analysis moved to the heap, then one per closure whose `&Fn` box is on the heap rather than in the
-// frame that built it (`closure_mode.sysl`'s `frame_boxes`). A program that failed to compile
+// analysis moved to the heap, then one per closure that could hold a `var` by reference, saying which
+// way it holds its captures and why, then one per closure whose `&Fn` box is on the heap rather than
+// in the frame that built it (`closure_mode.sysl`'s `explain_modes`, `frame_boxes`). A program that failed to compile
 // reports nothing, since it was never going to allocate anything.
 private explain_promotions(pr: Promotions, program: Compilation, an: &Analysis)
     if !errors_of(an.diagnostics()).is_empty() then return
@@ -1450,7 +1451,8 @@ build_c_archive(path: string, named_target: Option[string], cc: Option[string], 
                 out: Option[string], header_at: Option[string],
                 say: string -> unit, lto: Option[string] = None,
                 ll_at: Option[string] = None,
-                shared: Option[SharedLib] = None) -> Result[(string, string), Failure]
+                shared: Option[SharedLib] = None,
+                guard: Option[string] = None) -> Result[(string, string), Failure]
     // First, since nothing about the build can change the answer: an archive named as a shared
     // library is an `ar` file a linker or a loader would misread under that name. With `--shared`
     // the output is a real shared library, so the name is the one asked for.
@@ -1550,7 +1552,8 @@ build_c_archive(path: string, named_target: Option[string], cc: Option[string], 
         Some(why) -> return Err(Said(Refusal(why)))
         None -> ()
 
-    write_text(header_out, c_header_render(lowered.exports, header_name(path), lowered.storage)) match
+    write_text(header_out, c_header_render(lowered.exports, header_name(path), lowered.storage,
+                                           lowered.defines, guard)) match
         Err(e) -> return Err(Said(Refusal(io_refusal(header_out, e))))
         Ok(_) -> ()
 
@@ -1560,7 +1563,7 @@ build_c_archive(path: string, named_target: Option[string], cc: Option[string], 
     // A build that exported nothing produced an archive with no way in, and the author almost
     // certainly meant to mark something. It is a warning rather than a refusal because an archive of
     // pure C shims is a real thing to want, and because the header says the same on its face.
-    if lowered.exports.is_empty() && lowered.storage.is_empty()
+    if lowered.exports.is_empty() && lowered.storage.is_empty() && lowered.defines.is_empty()
         say(s"sysl: warning: nothing in this module is marked '@export', so the " +
             s"${if shared.is_some() then "library" else "archive"} has no C entry point")
 
@@ -1682,14 +1685,14 @@ private pkg_config_names(path: string) -> Buf[string]
 end pkg_config_names
 
 // `sysl emit-header <path>` -- the header `build-c` writes, with nothing compiled or archived.
-c_header_of(path: string, named_target: Option[string]) -> Result[string, Failure]
+c_header_of(path: string, named_target: Option[string], guard: Option[string] = None) -> Result[string, Failure]
     val t = target_for(path, named_target).map_err(said)?
     val lowered = lower_for_c(path, t)?
 
     if !lowered.emitted.report.is_empty()
         return Err(Reported(analysis_report(lowered.emitted.report)))
 
-    Ok(c_header_render(lowered.exports, header_name(path), lowered.storage))
+    Ok(c_header_render(lowered.exports, header_name(path), lowered.storage, lowered.defines, guard))
 end c_header_of
 
 // What the archive is made of, kept apart from the call above so that the staging members are
@@ -1905,6 +1908,7 @@ struct LoweredForC
     emitted: Emitted
     exports: Buf[TFunc]
     storage: Buf[TVal]
+    defines: Buf[HeaderDefine]
 end LoweredForC
 
 // The lowering an archive gets, which differs from a program's in exactly two places: there is no
@@ -1960,7 +1964,7 @@ private lower_for_c(path: string, t: Target) -> Result[LoweredForC, Failure]
 
     Ok(LoweredForC(Emitted(ir_print_module(archive_internalized(lowered.0)), report, lowered.1,
                            link_required(program.units), buf()),
-                   offered_exports(kept.funcs), offered_storage(kept.vals)))
+                   offered_exports(kept.funcs), offered_storage(kept.vals), done.an.header_defines))
 end lower_for_c
 
 // The tail every command that produces a binary shares: the clang, the tree's own C, the standard

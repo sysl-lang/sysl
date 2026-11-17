@@ -1,0 +1,352 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+// **A closure's capture mode is decided where it is written** (`closure_mode.sysl`): by what it is
+// handed to, or what it is stored in. A callee that keeps it, module storage, a return, a local of an
+// enclosing block -- each is a keep, and the closure holds a copy, **whatever the body does to that
+// storage afterwards**: a later call storing another closure over it, a `defer` clearing it, an
+// assignment of `None`. Before, a keep a later statement took back left the closure holding its
+// variables by reference, so the same `c.release()` emptied the variable or only a copy depending on
+// code written after it. A program that relied on the by-reference choice and would now lose a write
+// is refused, saying the closure captures by value and why (`tests_cwr_capture_write.sysl` has the
+// refusal's every form). `--explain-escapes` says which way each closure holds its `var`s, and why.
+//
+// The cells cross where the closure goes (handed to a callee that only calls it; to one that keeps
+// it, once and twice into one static; a static stored directly and cleared after; a `defer` clearing
+// it; a local called in its block; a return) with what it does (a `Buf` handle's `release`, a write
+// read back outside, a counter) and where it is written (a function, a loop body, a closure's own
+// body, a generic instantiated twice).
+//
+// Skipped cells, and why: a `@scoped`, `@crossing` or `@joined` parameter and a `&sync` conversion
+// were by value already and are no site the old flow took back (`tests_cwy_closure_why.sysl`); an
+// `async` body is decided as any other (`tests_cas_closure_async.sysl`); a closure kept in a local of
+// an enclosing block is a structural keep no clear takes back (`tests_crm_closure_ref_mode.sysl`).
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private const cms_keeper: string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    var kept: Option[&Fn() -> unit] = None
+
+    call(f: &Fn() -> unit)
+        kept = Some(f)
+        f()
+
+    run(f: &Fn() -> unit) = f()
+
+    """
+
+// What `--explain-escapes` says of each closure's mode for a program, with the directory taken out.
+private cms_modes(text: string) -> Buf[string]
+    var notes: Buf[string] = buf()
+
+    if xvr_no_library() then return notes
+
+    val root = make_temp_dir("sysl-cms").unwrap()
+
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val noted = &notes
+
+    run_cli_noted(["sysl", "emit-llvm", "--explain-escapes", s"$root/main.sysl"], (line) -> sink.push(line),
+                  (line) ->
+                      if line.index_of(": a closure holds ").is_some()
+                          noted.push(if line.starts_with(s"$root/") then line[s"$root/".bytes.len..<line.bytes.len] else line))
+
+    remove_dir_all(root).unwrap_or(())
+    notes
+end cms_modes
+
+// `--explain-escapes` says exactly `want` of the program's closures, in order.
+private cms_explains(text: string, want: []const string)
+    if xvr_no_library() then return
+
+    val got = cms_modes(text)
+
+    assert_eq(got.len(), want.len, got.join("\n"))
+
+    for i in 0..<want.len
+        assert_eq(got[i], want[i])
+end cms_explains
+
+// The program is refused, saying each of `parts`.
+private cms_refused(text: string, parts: []const string)
+    if !enm_ready() then return
+
+    val said = enm_err(text)
+
+    assert(said != "", "it was accepted")
+
+    for part in parts
+        assert(said.index_of(part).is_some(), s"$part\n--- in ---\n$said")
+end cms_refused
+
+private const cms_by_ref: string = "by reference, because nothing it is handed to or stored in keeps it"
+
+// -- the order a later statement comes in changes nothing -------------------------------------------
+
+@test("two closures handed to one keeper both hold copies: a 'release' empties neither variable")
+cms_two_keepers_overwrite()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(cms_keeper + raw"""
+        main()
+            var a: Buf[u8] = buf()
+            a.push(1)
+            call(() -> a.release())
+
+            var b: Buf[u8] = buf()
+            b.push(1)
+            call(() -> b.release())
+
+            print(a.len(), b.len())
+        """), "1 1\n")
+
+@test("a closure handed to a keeper holds a copy whether or not a later call overwrites the keep")
+cms_later_call_changes_nothing()
+    if !enm_ready() then return
+
+    val alone = enm_ran(cms_keeper + raw"""
+        main()
+            var c: Buf[u8] = buf()
+            c.push(1)
+            call(() -> c.release())
+            print(c.len())
+        """)
+
+    val overwritten = enm_ran(cms_keeper + raw"""
+        main()
+            var c: Buf[u8] = buf()
+            c.push(1)
+            call(() -> c.release())
+            call(() -> ())
+            print(c.len())
+        """)
+
+    assert_eq(alone, "1\n")
+    assert_eq(overwritten, alone)
+
+@test("a write a later overwrite used to let reach the variable is refused, naming the mode and the keep")
+cms_relied_on_by_reference_refused()
+    cms_refused(cms_keeper + raw"""
+        main()
+            var hit = false
+            call(() -> hit = true)
+            call(() -> ())
+            print(hit)
+        """, ["this closure captures by value, since it is handed to 'call' on line 13, which keeps its " +
+              "parameter 'f' (it is stored in 'kept'), so it holds a copy of 'hit'",
+              "and nothing in the closure reads it back"])
+
+@test("a compound assignment a later overwrite used to let reach the variable is refused too")
+cms_relied_compound_refused()
+    cms_refused(cms_keeper + raw"""
+        main()
+            var n = 0
+            call(() -> n += 1)
+            call(() -> ())
+            print(n)
+        """, ["this closure captures by value, since it is handed to 'call' on line 13", "so it holds a copy of 'n'"])
+
+@test("a closure a 'defer' takes back out of module storage still holds a copy")
+cms_defer_clear_refused()
+    cms_refused(cms_keeper + raw"""
+        main()
+            var hit = false
+            defer kept = None
+            call(() -> hit = true)
+            print(hit)
+        """, ["this closure captures by value, since it is handed to 'call' on line 14", "so it holds a copy of 'hit'"])
+
+@test("a closure stored directly in module storage and cleared after holds a copy")
+cms_direct_static_refused()
+    cms_refused(cms_keeper + raw"""
+        main()
+            var hit = false
+            kept = Some(() -> hit = true)
+            kept = None
+            print(hit)
+        """, ["this closure captures by value, since", "so it holds a copy of 'hit'"])
+
+// -- each site -------------------------------------------------------------------------------------
+
+@test("handed to a callee that only calls it, a local called in its block: by reference, beside a keep")
+cms_borrowed_sites_stay_by_reference()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(cms_keeper + raw"""
+        main()
+            var c: Buf[u8] = buf()
+            c.push(1)
+            call(() -> ())
+            run(() -> c.release())
+
+            var n = 0
+            val bump = () -> n += 1
+            bump()
+            bump()
+            call(() -> ())
+
+            print(c.len(), n)
+        """), "0 2\n")
+
+@test("a counter returned holds its own copy, as it always did")
+cms_returned_counter()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        make() -> &Fn() -> int
+            var n = 10
+
+            () ->
+                n += 1
+                n
+
+        main()
+            val next = make()
+            print(next(), next())
+        """), "11 12\n")
+
+// -- loops, nested closures, generics -----------------------------------------------------------------
+
+@test("a loop body: a closure each turn hands a keeper is refused, one each turn runs is by reference")
+cms_loop_bodies()
+    cms_refused(cms_keeper + raw"""
+        main()
+            var n = 0
+            for i in 0..<3
+                call(() -> n += i)
+            print(n)
+        """, ["this closure captures by value, since it is handed to 'call' on line 14", "so it holds a copy of 'n'"])
+
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(cms_keeper + raw"""
+        main()
+            var n = 0
+            for i in 0..<3
+                run(() -> n += i)
+                call(() -> ())
+            print(n)
+        """), "3\n")
+
+@test("a closure inside a closure is decided at its own site, not its outer closure's")
+cms_nested_sites()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(cms_keeper + raw"""
+        main()
+            var c: Buf[u8] = buf()
+            c.push(1)
+            var d: Buf[u8] = buf()
+            d.push(1)
+
+            run(() ->
+                call(() -> c.release())
+                run(() -> d.release()))
+
+            print(c.len(), d.len())
+        """), "1 0\n")
+
+@test("a closure handed to a generic function: kept is a copy, only called is by reference")
+cms_generic_callees()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        import sysl.buf.{Buf, buf}
+
+        var kept: Option[&Fn() -> unit] = None
+
+        hold[T](x: T, f: &Fn() -> unit) -> T
+            kept = Some(f)
+            x
+
+        apply[T](x: T, f: T -> unit) = f(x)
+
+        main()
+            var c: Buf[u8] = buf()
+            c.push(1)
+            hold(1, () -> c.release())
+            hold("a", () -> ())
+
+            var sum = 0
+            apply(4, k -> sum += k)
+            apply(5, k -> sum += k)
+
+            print(c.len(), sum)
+        """), "1 9\n")
+
+// -- what --explain-escapes says ---------------------------------------------------------------------
+
+@test("--explain-escapes says each closure's mode, and why: a keep, a later overwrite, a borrow")
+cms_explain_modes()
+    cms_explains(cms_keeper + raw"""
+        main()
+            var a: Buf[u8] = buf()
+            call(() -> a.release())
+            call(() -> ())
+
+            var n = 0
+            run(() -> n += 1)
+            print(a.len(), n)
+        """,
+        ["main.sysl:13:10: a closure holds 'a' by value, because it is handed to 'call' on line 13, which keeps its " +
+             "parameter 'f' (it is stored in 'kept')",
+         s"main.sysl:17:9: a closure holds 'n' $cms_by_ref"])
+
+@test("--explain-escapes names every 'var' a closure holds, and none it copies whatever its mode")
+cms_explain_names_vars_only()
+    cms_explains(raw"""
+        run(f: &Fn() -> unit) = f()
+
+        main()
+            var a = 0
+            val k = 2
+            var b = 0
+            run(() ->
+                a += k
+                b += a)
+            print(a, b)
+        """, [s"main.sysl:7:9: a closure holds 'a' and 'b' $cms_by_ref"])
+
+@test("--explain-escapes says a returned closure's mode, a nested one's at its own site, and a generic's once")
+cms_explain_returned_nested_generic()
+    cms_explains(cms_keeper + raw"""
+        make() -> &Fn() -> int
+            var n = 10
+            () -> n + 1
+
+        twice[T](x: T) -> int
+            var n = 0
+            run(() -> n += 1)
+            n
+
+        main()
+            var c: Buf[u8] = buf()
+            var d = 0
+            run(() ->
+                call(() -> c.release())
+                d += 1)
+
+            print(make()(), c.len(), d, twice(1), twice("x"))
+        """,
+        ["main.sysl:13:5: a closure holds 'n' by value, because it is returned from 'make' on line 13",
+         s"main.sysl:17:9: a closure holds 'n' $cms_by_ref",
+         s"main.sysl:23:9: a closure holds 'c' and 'd' $cms_by_ref",
+         "main.sysl:24:14: a closure holds 'c' by value, because it is handed to 'call' on line 24, which keeps its " +
+             "parameter 'f' (it is stored in 'kept')"])
+
+@test("--explain-escapes says nothing of a closure that captures only 'val's")
+cms_explain_quiet_without_vars()
+    cms_explains(raw"""
+        run(f: &Fn() -> int) -> int = f()
+
+        main()
+            val k = 3
+            print(run(() -> k + 1))
+        """, [])

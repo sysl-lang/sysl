@@ -30,7 +30,7 @@ import sysl.container.{Set, set}
 // `@abandons` function's address, not a function or closure that reaches one, and not a type whose
 // table for a trait object holds one.
 
-// The keys of every `@abandons` function and `extern` this program reaches.
+// The keys of every `@abandons` function and `extern` this program reaches that never comes back.
 private abandoning_names(funcs: Buf[TFunc], externs: Buf[TExtern]) -> Buf[string]
     var out: Buf[string] = buf()
 
@@ -38,19 +38,38 @@ private abandoning_names(funcs: Buf[TFunc], externs: Buf[TExtern]) -> Buf[string
         if f.marks.abandons then out.push(f.name)
 
     for x in externs
-        if x.abandons then out.push(x.name)
+        if leaves_for_good(x) then out.push(x.name)
 
     out
 end abandoning_names
+
+// The keys of every `@abandons` `extern` that answers something other than `never`: a call to one
+// may abandon or may come back (`lua_call`), exactly as a call through an `@abandons *extern` may.
+private may_abandon_names(externs: Buf[TExtern]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for x in externs
+        if x.abandons && !leaves_for_good(x) then out.push(x.name)
+
+    out
+end may_abandon_names
 
 // -- the declaration --------------------------------------------------------------------------------
 
 // What an `@abandons` declaration owes, asked where its signature is resolved: a result of `never`,
 // no type parameter, and no parameter that carries a count.
-check_abandons_signature(a: &Analysis, scope: Scope, at: Span, name: string, generic: bool,
-                         params: Buf[(string, Type)], result: Type)
+//
+// **An `extern` that answers anything else MAY abandon** (`lua_call`: it comes back, or C longjmps
+// past its caller) and owes none of it: its caller keeps its frame, so a parameter's count is the
+// caller's to hold, and the walk below refuses holding one across the call. **A sysl function may
+// not say it**: whether its body can arrive at an abandoning call is read from the body itself, so a
+// mark on one would claim what the compiler already knows, or claim what is false and go unchecked.
+check_abandons_signature(a: &Analysis, scope: Scope, at: Span, name: string, foreign: bool,
+                         generic: bool, params: Buf[(string, Type)], result: Type)
     if !(result == Never)
-        a.fault(scope, at, s"'@abandons' says a call to '${name}' never comes back, so '${name}' answers 'never' — this one answers '${type_show(result)}'")
+        if foreign then return
+
+        a.fault(scope, at, s"'@abandons' on a sysl function says a call to '${name}' never comes back, so '${name}' answers 'never' — this one answers '${type_show(result)}'. Whether a call to it may abandon is read from its body; only an 'extern' may say it may abandon and also come back")
         return
 
     if generic
@@ -95,9 +114,11 @@ private may_abandon(funcs: Buf[TFunc], seeds: Buf[string]) -> Set[string]
     out
 end may_abandon
 
-// What one body's walk needs: the two sets, where to report, and which places have been reported.
+// What one body's walk needs: the sets, where to report, and which places have been reported.
+// `maybe` holds the `@abandons` externs that may also come back.
 struct Abandoning
     seeds: Set[string]
+    maybe: Set[string]
     reach: Set[string]
     vtables: Buf[TVtable]
     scope: Scope
@@ -108,25 +129,32 @@ end Abandoning
 // Holds every body to what an abandoning call needs of it.
 check_abandons(a: &Analysis, funcs: Buf[TFunc], externs: Buf[TExtern], vtables: Buf[TVtable])
     val names = abandoning_names(funcs, externs)
+    val maybe = may_abandon_names(externs)
 
     // A program that declares nothing `@abandons` and writes no `@abandons *extern` -- almost all of
     // them -- pays for no walk at all.
-    if names.is_empty() && !a.abandoning_pointers then return
+    if names.is_empty() && maybe.is_empty() && !a.abandoning_pointers then return
 
     var seeds: Set[string] = set()
+    var mays: Set[string] = set()
 
-    // A call through an `@abandons *extern` is reached as a call to an abandoning function is, but it
-    // is no seed: what it calls may come back, so its caller keeps its frame and holds nothing across.
+    // A call through an `@abandons *extern`, or to an `@abandons extern` that answers something other
+    // than `never`, is reached as a call to an abandoning function is, but it is no seed: what it calls
+    // may come back, so its caller keeps its frame and holds nothing across.
     var reached: Buf[string] = buf()
 
     reached.push(AbandoningCallKey)
+
+    for item in maybe
+        mays.add(item)
+        reached.push(item)
 
     for item in names
         seeds.add(item)
         reached.push(item)
 
-    val cx: &Abandoning = Abandoning(seeds, may_abandon(funcs, reached), vtables, empty_scope(), false,
-                                     set())
+    val cx: &Abandoning = Abandoning(seeds, mays, may_abandon(funcs, reached), vtables, empty_scope(),
+                                     false, set())
 
     for f in funcs
         cx.scope = func_home(a, f.name)
@@ -400,7 +428,7 @@ private check_node(a: &Analysis, cx: &Abandoning, e: TExpr, held: string)
         if cx.seeds.has(name)
             if cx.is_async then say(a, cx, e.span, async_refusal(name))
         else if cx.reach.has(name) && held != ""
-            say(a, cx, e.span, held_refusal(name, held))
+            say(a, cx, e.span, held_refusal(cx, name, held))
 end check_node
 
 // A refusal said once per place, an instantiation of a generic body being the same lines again.
@@ -420,7 +448,10 @@ private erased_reach(cx: &Abandoning, vtable: string) -> Option[string]
     None
 end erased_reach
 
-private held_refusal(name: string, held: string) -> string
+private held_refusal(cx: &Abandoning, name: string, held: string) -> string
+    if cx.maybe.has(name)
+        return s"'${qualified_name(name)}' is '@abandons', so a call to it may abandon every frame below it and never come back, and this frame holds ${held} across the call — its count would never be given back. Give it back first: hold it in a function that returns before this call is made, or as a '*T'"
+
     val callee = if name == AbandoningCallKey then "a call through an '@abandons *extern' pointer"
     else s"'${qualified_name(name)}'"
 
@@ -436,6 +467,9 @@ private made_a_value(cx: &Abandoning, name: string, ty: Type) -> string
 
     if cx.seeds.has(name)
         return s"'${qualified_name(name)}' is '@abandons', and a call through a value cannot be followed to it, so its caller would not give its frame back first — call it by name$marked"
+
+    if cx.maybe.has(name)
+        return s"'${qualified_name(name)}' is '@abandons', so a call to it may abandon every frame below it, and a call through a value cannot be followed there, so whoever calls this value could hold a count across it unseen — call it by name$marked"
 
     s"'${qualified_name(name)}' can reach a call that abandons every frame below it, and a call through a value cannot be followed there, so whoever calls this value could hold a count across it unseen — call it by name$marked"
 end made_a_value
@@ -461,6 +495,8 @@ private kids(e: TExpr) -> Buf[TExpr]
         TDowngrade(value, _) -> out.push(value)
         TUpgrade(value, _, _, _) -> out.push(value)
         TDowncast(value, _, _, _, _, _) -> out.push(value)
+        TIntoRaw(value, _) -> out.push(value)
+        TFromRaw(ptr, _) -> out.push(ptr)
         TArrayLit(elems, _) -> push_all(&out, elems)
         TArrayFill(value, _) -> out.push(value)
         TVectorLit(lanes, _) -> push_all(&out, lanes)

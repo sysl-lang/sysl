@@ -434,7 +434,7 @@ private null_literal(cx: &Analyzer, span: Span, expected: Option[Type]) -> TExpr
     val want = expected.unwrap()
 
     want match
-        Ptr(_) -> TExpr(span, TNullLit(want))
+        Ptr(_, _) -> TExpr(span, TNullLit(want))
         CFn(_, _, _) -> TExpr(span, TNullLit(want))
         _ -> cx.err(span, s"'null' is a raw pointer, and ${type_show(want)} was expected here")
 end null_literal
@@ -1900,7 +1900,7 @@ private builtin(cx: &Analyzer, span: Span, name: string, expected: Option[Type])
     // written -- in a default, the call's. It stands at the call's span, which is what the lowering
     // names where it is not handed one. Module storage has no caller, so there it is null.
     if name == "__CALLER__"
-        if site.func == "" then return TExpr(span, TNullLit(Ptr(byte_type())))
+        if site.func == "" then return TExpr(span, TNullLit(Ptr(byte_type(), false)))
 
         return TExpr(at, TCStrLit(caller_sentinel()))
     end if
@@ -2069,7 +2069,7 @@ private address_expr(cx: &Analyzer, span: Span, operand: Expr) -> TExpr
         refuse_ref_call_address(cx, span, place)
         note_counted_address(cx, span, place)
 
-        return TExpr(span, TAddrOf(place, Ptr(place_type(place))))
+        return TExpr(span, TAddrOf(place, Ptr(place_type(place), false)))
 
     // A value nothing occupies has no storage to point at, and a pointer to it could only ever be
     // read through to produce nothing.
@@ -2080,7 +2080,7 @@ private address_expr(cx: &Analyzer, span: Span, operand: Expr) -> TExpr
     // An opaque type's shape is its module's, so there is no slot to lay one down in out here.
     if !value_layout_known(cx, span, ty) then return bad_expr(span)
 
-    TExpr(span, TTempAddr(t, Ptr(ty)))
+    TExpr(span, TTempAddr(t, Ptr(ty, false)))
 end address_expr
 
 private deref_expr(cx: &Analyzer, span: Span, operand: Expr) -> TExpr
@@ -2452,7 +2452,7 @@ end compare_expr
 private identity_operands(cx: &Analyzer, span: Span, op: string, a: Type, b: Type)
     val addressed = underlying(a) match
         Ref(_, _) -> true
-        Ptr(_) -> true
+        Ptr(_, _) -> true
         _ -> false
 
     if !addressed
@@ -2975,7 +2975,7 @@ private points_at_conformer(cx: &Analyzer, from: Type, to: Type) -> bool
     if tr.is_none() then return false
 
     (from, to) match
-        (Ptr(inner), Ptr(_)) -> !is_trait(*inner) && conforms(cx.an, trait_bound_of(tr.unwrap()), *inner)
+        (Ptr(inner, _), Ptr(_, _)) -> !is_trait(*inner) && conforms(cx.an, trait_bound_of(tr.unwrap()), *inner)
         _ -> false
 end points_at_conformer
 
@@ -2995,6 +2995,17 @@ private meet_views(taken: Type, read: Buf[Option[TExpr]]) -> Type
                 item match
                     Some(t) -> if type_eq(texpr_type(t), Slice(*elem, true)) then
                                    return Slice(*elem, true)
+                    None -> ()
+
+            taken
+        // A `*T` and a `*const T` meet at the read-only pointer for the same reason.
+        Ptr(inner, read_only) ->
+            if read_only then return taken
+
+            for item in read
+                item match
+                    Some(t) -> if type_eq(texpr_type(t), Ptr(*inner, true)) then
+                                   return Ptr(*inner, true)
                     None -> ()
 
             taken
@@ -3069,7 +3080,7 @@ end collection_expected
 
 private inner_of(t: Type) -> Type = t match
     Ref(inner, _) -> inner_of(*inner)
-    Ptr(inner) -> inner_of(*inner)
+    Ptr(inner, _) -> inner_of(*inner)
     Weak(inner) -> inner_of(*inner)
     Volatile(inner) -> inner_of(*inner)
     other -> other

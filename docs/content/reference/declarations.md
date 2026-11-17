@@ -1446,9 +1446,14 @@ declared:
 extern "leave_user" leave_user(kernel: *u64, status: u64) -> never
 ```
 
+An `extern` that answers anything else is one that **may** abandon, as Lua's `lua_call` may: its
+caller keeps its frame and holds nothing counted across the call — see
+[an `extern` that may abandon](/reference/ffi/#an-extern-that-may-abandon-and-also-come-back).
+
 #### What an `@abandons` function requires
 
-It answers `never`, since a call that comes back has left nothing:
+A sysl function answers `never`, since a call that comes back has left nothing (whether it may
+abandon is read from its body):
 
 ```sysl
 @abandons
@@ -1458,7 +1463,7 @@ print(finish())
 ```
 
 ```error
-'@abandons' says a call to 'finish' never comes back, so 'finish' answers 'never' — this one answers 'int'
+'@abandons' on a sysl function says a call to 'finish' never comes back, so 'finish' answers 'never' — this one answers 'int'
 ```
 
 **No parameter may carry a count.** The caller's frame is given back before the call, and the

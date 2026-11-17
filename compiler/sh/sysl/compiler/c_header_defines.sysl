@@ -1,0 +1,263 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.{BigInt, cmp, from_int, negate}
+import sysl.text.from_utf8_unchecked
+
+// **The macros a generated header defines** (`reference/ffi.md § Constants in the header`).
+//
+// C states a fixed number as a macro -- `#define TERNDB_DIGEST_LEN 32` -- and a C API's enumerated
+// values the same way, so that their width is the parameter's and not the one C picks for an `enum`.
+// `@export` above a `const` defines one, and above a simple enum one per variant. A constant has no
+// storage, so a macro is the only thing it can be exported as; the value is the one every use of the
+// constant folds to, written as the C literal of its type.
+
+// One macro: `#define <name> <value>`, the value already C text.
+struct HeaderDefine
+    name: string
+    value: string
+end HeaderDefine
+
+// Every exported constant and enum, settled into `a.header_defines` -- and what C has no literal
+// for, refused at the `@export` that asked for it. It runs in every build rather than only where a
+// header is written, so a refusal does not wait for the first `build-c` to be seen.
+check_exported_constants(a: &Analysis)
+    var consts: Buf[HeaderDefine] = buf()
+    var enums: Buf[(string, Buf[HeaderDefine])] = buf()
+
+    for i in 0..<a.tables.consts.len()
+        val d = a.tables.consts.at(i)
+
+        if d.export.is_none() || d.init.is_none() then continue
+
+        val key = a.tables.consts.key_at(i)
+
+        // The standard library's constants are its own, as its exported functions are
+        // (`offered_exports`).
+        if key.starts_with("sysl.") then continue
+        val name = d.export.unwrap().symbol.unwrap_or(d.name)
+
+        exported_const_value(a, key, d) match
+            Some(found) -> c_const_literal(found.0, found.1) match
+                Ok(text) -> consts.push(HeaderDefine(name, text))
+                Err(why) -> a.fault(d.scope, d.export.unwrap().span,
+                                    s"'${d.name}' is exported as a macro, and it is ${type_show(found.0)}, " +
+                                    s"which $why — a header defines a macro from an integer, a 'bool', " +
+                                    "a 'char', an 'f32' or 'f64', or a string")
+            None -> ()
+
+    for i in 0..<a.tables.types.len()
+        val decl = a.tables.types.at(i)
+
+        decl.kind match
+            EnumOf(e) ->
+                if e.export.is_some() && !a.tables.types.key_at(i).starts_with("sysl.")
+                    exported_enum_defines(a, a.tables.types.key_at(i), decl, e) match
+                        Some(group) -> enums.push(group)
+                        None -> ()
+            _ -> ()
+
+    // The header is an artifact two builds of one tree agree on byte for byte, and the tables are in
+    // the order the files happened to be read: constants sort by name, and an enum's group by its
+    // prefix with its variants in the order they were declared, which is the order a reader expects.
+    sort_defines(&consts)
+
+    var out: Buf[HeaderDefine] = buf()
+
+    for item in consts
+        out.push(item)
+
+    for i in 1..<enums.len()
+        var j = i
+
+        while j > 0 && enums[j].0 < enums[j - 1].0
+            val held = enums[j]
+
+            enums[j] = enums[j - 1]
+            enums[j - 1] = held
+            j -= 1
+
+    for group in enums
+        for item in group.1
+            out.push(item)
+
+    a.header_defines = out
+end check_exported_constants
+
+// The type a constant has and the value it folds to, or nothing where its own reading has already
+// been refused -- a mistake in the initializer is reported there, once.
+private exported_const_value(a: &Analysis, key: string, d: ValueDecl) -> Option[(Type, Const)]
+    val cx = analyzer_for(a, d.scope)
+
+    if const_cycle_at(cx, key) then return None
+
+    val ty = const_type(cx, d)
+
+    a.consts_in_progress.push(key)
+
+    val init = d.init.unwrap()
+    val value = if mentions_wrap_sat(init) then const_decl_value(cx, init, ty) else const_fold(cx, init)
+
+    a.consts_in_progress.truncate(a.consts_in_progress.len() - 1)
+    value.map(v -> (ty, v))
+end exported_const_value
+
+// One group of macros for an exported enum: `PREFIX_VARIANT` for each variant, the value its tag.
+//
+// The prefix is what `@export("...")` named, and the enum's own name in capitals where it named
+// nothing; each variant's name is written in capitals with an underscore between its words, which is
+// C's spelling of a constant: `ReadCommitted` under `TERNDB_ISOLATION` is
+// `TERNDB_ISOLATION_READ_COMMITTED`. **Only a simple enum is spelled this way**, since it is the one
+// whose value is a number -- one whose variants carry fields has no single integer to define.
+private exported_enum_defines(a: &Analysis, key: string, decl: Decl, e: EnumDecl) -> Option[(string, Buf[HeaderDefine])]
+    val at = e.export.unwrap().span
+    val prefix = e.export.unwrap().symbol.unwrap_or(upper_snake(e.name))
+
+    if !e.tparams.is_empty()
+        a.fault(decl.scope, at, s"'${e.name}' takes type parameters, so it is a family of enums rather " +
+                "than one, and a header has no single set of constants to define for it — export an " +
+                "enum that takes none")
+        return None
+    end if
+
+    instantiate_enum(a, decl.scope, decl.span, e.name, key, e, decl.scope, buf()) match
+        Enum(et) ->
+            if !et.simple
+                a.fault(decl.scope, at, s"'${e.name}' has a variant that carries fields, so its values " +
+                        "are not numbers, and a header defines a constant per variant only for a " +
+                        "simple enum — one whose every variant is a name and a value")
+                return None
+            end if
+
+            var out: Buf[HeaderDefine] = buf()
+
+            for v in et.variants
+                out.push(HeaderDefine(s"${prefix}_${upper_snake(v.name)}", c_integer_literal(v.tag, et.underlying)))
+
+            Some((prefix, out))
+        _ -> None
+end exported_enum_defines
+
+// A constant as C text, or why it has none.
+private c_const_literal(t: Type, v: Const) -> Result[string, string] = v match
+    ConstInt(n) -> underlying(t) match
+        Integer(bits, _, _) ->
+            if bits > 64 && !fits_int(n) then Err("is wider than any C integer literal")
+            else Ok(c_integer_literal(n, underlying(t)))
+        Char -> Ok(c_integer_literal(n, underlying(t)))
+        _ -> Err("has no C literal")
+    ConstChar(c) -> Ok(s"${u32(c)}")
+    ConstBool(b) -> Ok(if b then "true" else "false")
+    ConstStr(s) -> Ok(c_string_literal(s))
+    ConstFloat(x) -> underlying(t) match
+        Floating(32, false) -> c_float_literal(x).map(text -> s"${text}f")
+        Floating(64, _) -> c_float_literal(x)
+        _ -> Err("has no C literal")
+    _ -> Err("has no C literal")
+
+// An integer as C writes it. One that fits a C `int` is the plain number, as a C API writes its own
+// constants -- in parentheses where it is negative, so that `-X` and `X-1` mean what they say. Any
+// other is written through `<stdint.h>`'s `INT64_C` or `UINT64_C`, which give it the width it needs
+// and still read in an `#if`; the most negative 64-bit value has no literal and is written as the
+// expression C's own headers use.
+c_integer_literal(n: BigInt, t: Type) -> string
+    if fits_int(n) then return if n.sign() < 0 then s"(${n.to_string()})" else n.to_string()
+
+    val signed = t match
+        Integer(_, s, _) -> s
+        _ -> true
+
+    if !signed then return s"UINT64_C(${n.to_string()})"
+
+    if n.sign() >= 0 then return s"INT64_C(${n.to_string()})"
+
+    val magnitude = negate(n)
+
+    if cmp(magnitude, int64_min_magnitude()) == 0 then return "(-INT64_C(9223372036854775807) - 1)"
+
+    s"(-INT64_C(${magnitude.to_string()}))"
+end c_integer_literal
+
+private fits_int(n: BigInt) -> bool = cmp(n, from_int(-2147483648)) >= 0 && cmp(n, from_int(2147483647)) <= 0
+
+private int64_min_magnitude() -> BigInt = negate(from_int(-9223372036854775807 - 1))
+
+// A float as C reads it back exactly: the shortest decimal that names the value, with a point or an
+// exponent so that C reads a floating constant rather than an integer one. An infinity or a NaN has
+// no literal at all.
+private c_float_literal(x: real) -> Result[string, string]
+    if x != x || x - x != 0.0 then return Err("is not a finite number, and C has no literal for one")
+
+    val text = s"$x"
+
+    for i in 0..<text.bytes.len
+        val b = text.bytes[i]
+
+        if b == u8('.') || b == u8('e') || b == u8('E') then return Ok(text)
+
+    Ok(s"$text.0")
+end c_float_literal
+
+// A string as a C string literal: the bytes it holds, a quote, a backslash or anything that is not
+// printable ASCII written as an escape. The octal escape is the one used because it takes at most
+// three digits, where C's hex escape runs on into whatever digit follows it.
+private c_string_literal(s: string) -> string
+    var out: Buf[u8] = buf()
+
+    out.push(u8('"'))
+
+    for i in 0..<s.bytes.len
+        val b = s.bytes[i]
+
+        if b == u8('"') || b == u8('\\')
+            out.push(u8('\\'))
+            out.push(b)
+        else if b < 32 || b > 126
+            out.push(u8('\\'))
+            out.push(u8('0') + b / 64)
+            out.push(u8('0') + (b / 8) % 8)
+            out.push(u8('0') + b % 8)
+        else out.push(b)
+
+    out.push(u8('"'))
+    from_utf8_unchecked(out.view())
+end c_string_literal
+
+// `ReadCommitted` as C's constants spell it: `READ_COMMITTED`. An underscore goes in front of a
+// capital that follows a lower-case letter or a digit, and in front of the last capital of a run that
+// a lower-case letter follows (`HTTPServer` is `HTTP_SERVER`); a name already in snake case keeps its
+// underscores.
+upper_snake(name: string) -> string
+    var out: Buf[u8] = buf()
+    val bs = name.bytes
+
+    for i in 0..<bs.len
+        val b = bs[i]
+
+        if i > 0 && is_upper(b)
+            val before = bs[i - 1]
+            val after_lower = i + 1 < bs.len && is_lower(bs[i + 1])
+
+            if is_lower(before) || is_digit(before) || (is_upper(before) && after_lower) then out.push(u8('_'))
+        end if
+
+        out.push(if is_lower(b) then b - 32 else b)
+
+    from_utf8_unchecked(out.view())
+end upper_snake
+
+private is_upper(b: u8) -> bool = b >= u8('A') && b <= u8('Z')
+private is_lower(b: u8) -> bool = b >= u8('a') && b <= u8('z')
+private is_digit(b: u8) -> bool = b >= u8('0') && b <= u8('9')
+
+private sort_defines(xs: *Buf[HeaderDefine])
+    for i in 1..<xs.len()
+        var j = i
+
+        while j > 0 && xs[j].name < xs[j - 1].name
+            val held = xs[j]
+
+            xs[j] = xs[j - 1]
+            xs[j - 1] = held
+            j -= 1
+end sort_defines
