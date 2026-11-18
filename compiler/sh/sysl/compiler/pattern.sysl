@@ -128,7 +128,53 @@ private bind_once(cx: &Analyzer, span: Span, name: string, ty: Type) -> string
     unique
 end bind_once
 
-private pattern_in(cx: &Analyzer, p: Pattern, ty: Type) -> TPattern = *p.kind match
+// **A shape reaches through a reference** (`reference/patterns.md § Matching through a reference`):
+// `Node(Leaf(v), r)` over a `&Tree`, or with `&Tree` payloads, tests and binds what each reference
+// holds, at every depth, as `*x match` does at the top. A name, `_` and a literal still meet the
+// reference itself -- a name binds the reference, never a copy of what it holds.
+private pattern_in(cx: &Analyzer, p: Pattern, ty: Type) -> TPattern
+    val held = referent_matched(p, ty)
+
+    if held.is_some() then return TDerefPattern(ty, pattern_in(cx, p, held.unwrap()))
+
+    shape_in(cx, p, ty)
+end pattern_in
+
+// What a `&T` holds, where the pattern is a shape that matches it rather than the reference: a
+// variant, a struct or a tuple pattern, or a name that is one of the held enum's variants. Not a raw
+// pointer, which may point at nothing, and not a trait object, which has no shape to take apart.
+private referent_matched(p: Pattern, ty: Type) -> Option[Type]
+    val held = repr(ty) match
+        Ref(inner, _) -> *inner
+        _ -> return None
+
+    if erased(ty) || !reachable_shape(held) then return None
+
+    *p.kind match
+        VariantPattern(_, _) -> Some(held)
+        TuplePattern(_) -> Some(held)
+        StructPattern(_, _) -> Some(held)
+        IdentPattern(written) -> if names_held_variant(held, written) then Some(held) else None
+        EqPattern(written) -> if names_held_variant(held, written) then Some(held) else None
+        _ -> None
+end referent_matched
+
+// Whether what a reference holds -- through every further reference -- is a value a shape can take
+// apart, or one only an instantiation will settle.
+private reachable_shape(t: Type) -> bool = underlying(t) match
+    Ref(inner, _) -> !erased(t) && reachable_shape(*inner)
+    Enum(_) -> true
+    Struct(_) -> true
+    Abstract(_, _) -> true
+    Unknown -> true
+    _ -> false
+
+// Whether a name is a variant of the enum a reference holds, through every further reference.
+private names_held_variant(t: Type, written: string) -> bool = underlying(t) match
+    Ref(inner, _) -> names_held_variant(*inner, written)
+    _ -> variant_named(t, last_segment(written)).is_some()
+
+private shape_in(cx: &Analyzer, p: Pattern, ty: Type) -> TPattern = *p.kind match
     WildcardPattern -> TWildPattern(ty)
 
     // `n @ pat` -- the inner pattern against the same value, and the name bound to the whole of it.
@@ -720,18 +766,17 @@ every_field_visible(cx: &Analyzer, span: Span, d: &StructType, form: string, adv
 // What a "this pattern does not fit that value" complaint adds where the value is the right shape
 // held behind a memory mode.
 //
-// **Selection is the only implicit dereference**, and deliberately: `p.x` reaches through a `*T` or
-// a `&T` and a pattern does not, so a recursive type -- which has to be held behind one to exist at
-// all -- is matched by writing the dereference.
+// **A pattern reaches through a `&T` and not through a `*T`**: a raw pointer may point at nothing,
+// and a shape written over one would read it with no sign of the read, so its dereference is written.
 private held_behind(t: Type) -> string
-    val inner = pointee(t)
+    val inner = repr(t) match
+        Ptr(i, _) -> *i
+        _ -> return ""
 
-    if inner.is_none() then return ""
+    if !matchable(underlying(inner)) then return ""
 
-    if !matchable(inner.unwrap()) then return ""
-
-    " — a pattern does not reach through a memory mode the way a field selection does, so match " +
-        "what it holds: '*x match'"
+    " — a pattern reaches through a '&T' but not through a raw pointer, which may point at " +
+        "nothing, so match what it holds: '*x match'"
 end held_behind
 
 // A value a conversion of a literal can stand for: the numbers, `char` and `bool`.
@@ -793,6 +838,7 @@ refutable(p: TPattern) -> bool = p match
     // A binding never rules a value in or out, so `n @ pat` can fail exactly where `pat` can.
     TAtPattern(_, inner) -> refutable(*inner)
     TStructPattern(_, args) -> any_refutable(args)
+    TDerefPattern(_, inner) -> refutable(*inner)
     _ -> true
 
 private any_refutable(args: Buf[TPattern]) -> bool
@@ -808,6 +854,7 @@ pattern_binds(p: TPattern) -> bool = p match
     TAtPattern(_, _) -> true
     TVariantPattern(_, _, args) -> any_binds(args)
     TStructPattern(_, args) -> any_binds(args)
+    TDerefPattern(_, inner) -> pattern_binds(*inner)
     _ -> false
 
 private any_binds(args: Buf[TPattern]) -> bool
