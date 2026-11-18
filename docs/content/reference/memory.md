@@ -2034,8 +2034,9 @@ same storage: true
   for any trait's `(*self)` one ([traits](/reference/traits/)); neither form replaces the other.
 - **It is the same address wherever the object lives**: a box on the heap, one laid in a frame, one a
   module `var` holds, one a field of another object holds.
-- **A write through it is the object's own.** A field it replaces is released there and then, and the
-  fields are released as the destructor leaves them, not as they were when it was called.
+- **A write through it is the object's own.** A field it replaces is released once, as any
+  assignment's old value is, and the fields are released as the destructor leaves them, not as they
+  were when it was called.
 - **`drop(&self)` is refused**, as any receiver the trait does not declare: a `&self` would take a
   share of an object whose count has already reached zero.
 
