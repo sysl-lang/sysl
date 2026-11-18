@@ -1110,11 +1110,13 @@ end ecl_a_variadic_export_called_from_c_on_x86_64
 // of the sysl frames, no C frame between them, no `atexit` handler. The process ends by the trap
 // instruction's own signal -- SIGTRAP from AArch64's `brk`, status 133 in a shell; SIGILL from
 // x86-64's `ud2`, 132 -- and the line the check prints, if any, is on standard error. The trap flushes
-// C's streams first, so what the caller printed before the call is kept. `panic` is the exception
-// the reference names: it exits 1 through C's `exit`, which runs `atexit` and still never returns.
+// C's streams first, so what the caller printed before the call is kept. `panic` writes its line to
+// standard error and aborts (SIGABRT, 134), so it runs no `atexit` handler either.
 //
-// Each cell is run from a static archive and from a shared library made of the whole archive, the
-// two ways a C project takes the library in.
+// Each cell is run from a static archive, from a shared library made of the whole archive, and from
+// the shared library `build-c --shared` links, the three ways a C project takes the library in. The
+// `sysl_trap` hook is pinned on each: a host's definition replaces an archive's, never the one inside
+// a `--shared` library, and a library that exports its own is heard either way.
 
 private ecl_trap_lib() -> string = raw"""
     module mylib
@@ -1198,6 +1200,14 @@ private ecl_trap_caller() -> string = raw"""
     }
     """
 
+// The trapping library with its own `sysl_trap`, which reports and returns.
+private ecl_trap_lib_hooked() -> string = ecl_trap_lib() + raw"""
+
+    @export("sysl_trap")
+    on_trap(kind: u32, a: usize, b: usize, n: usize, at: *u8)
+        eprints(s"library hook ${kind & 255}\n")
+    """
+
 // An embedder's own report of a failed bounds check, which returns.
 private ecl_trap_hook() -> string = raw"""
     #include <stdio.h>
@@ -1209,19 +1219,50 @@ private ecl_trap_hook() -> string = raw"""
     }
     """
 
+// An embedder's own `sysl_trap`, which hears every failure and returns.
+private ecl_trap_trap_hook() -> string = raw"""
+    #include <stdio.h>
+    #include <stdint.h>
+    #include <stddef.h>
+
+    void sysl_trap(uint32_t kind, size_t a, size_t b, size_t length, const char *at) {
+        fprintf(stderr, "host trap hook: kind %u\n", kind & 0xff);
+    }
+    """
+
 private ecl_clang(args: []const string)
     val built = capture("clang", args, "", [], true).unwrap()
 
     assert(ecl_exited_zero(built.status), built.err.unwrap_or(built.text))
 
-// The trapping library archived with `build` on build-c's command line, and the caller linked
-// against it with `cc` in front of clang's: statically, or through a shared library holding every
-// member of the archive; with the embedder's hook beside the caller when `hook` says so.
-private ecl_trap_host(build: []string, cc: []string, shared: bool, hook: bool) -> string
-    val root = ecl_project(ecl_trap_lib())
+// How the caller takes the library in: the `build-c` archive linked statically, a shared library
+// made of every member of that archive, or the shared library `build-c --shared` links itself.
+private enum EclLinked
+    Archive
+    AllLoad
+    BuildShared
+
+// Whose hook stands beside the export: none, the host's C `sysl_bounds_fail` or `sysl_trap`, or the
+// library's own exported `sysl_trap`.
+private enum EclHook
+    NoHook
+    HostBounds
+    HostTrap
+    LibraryTrap
+
+// The trapping library built with `build` on build-c's command line, and the caller linked against it
+// as `linked` says with `cc` in front of clang's, with the hook `hook` names.
+private ecl_trap_host(build: []const string, cc: []const string, linked: EclLinked, hook: EclHook) -> string
+    val root = ecl_project(if hook == LibraryTrap then ecl_trap_lib_hooked() else ecl_trap_lib())
     var line: Buf[string] = buf()
 
-    for word in ["sysl", "build-c", root, "-o", s"$root/libmylib.a"] do line.push(word)
+    for word in ["sysl", "build-c", root] do line.push(word)
+
+    if linked == BuildShared
+        for word in ["--shared", "-o", s"$root/libmylib.dylib", "--header", s"$root/libmylib.a.h"] do line.push(word)
+    else
+        for word in ["-o", s"$root/libmylib.a"] do line.push(word)
+
     for word in build do line.push(word)
 
     val got = ecl_run(line.view())
@@ -1234,18 +1275,24 @@ private ecl_trap_host(build: []string, cc: []string, shared: bool, hook: bool) -
     for word in cc do link.push(word)
     link.push(s"$root/main.c")
 
-    if hook
+    if hook == HostBounds
         write_text(s"$root/hook.c", ecl_trap_hook()).unwrap()
         link.push(s"$root/hook.c")
-
-    if shared
-        val lib = s"$root/libmylib.dylib"
-
-        ecl_clang(["-dynamiclib", "-Wl,-all_load", s"$root/libmylib.a", "-o", lib, "-install_name", lib])
-        link.push(lib)
-    else
-        link.push(s"$root/libmylib.a")
+    else if hook == HostTrap
+        write_text(s"$root/hook.c", ecl_trap_trap_hook()).unwrap()
+        link.push(s"$root/hook.c")
     end if
+
+    linked match
+        Archive -> link.push(s"$root/libmylib.a")
+        AllLoad ->
+            val lib = s"$root/libmylib.dylib"
+
+            ecl_clang(["-dynamiclib", "-Wl,-all_load", s"$root/libmylib.a", "-o", lib, "-install_name", lib])
+            link.push(lib)
+        BuildShared ->
+            link.push(s"$root/libmylib.dylib")
+            link.push(s"-Wl,-rpath,$root")
 
     link.push("-o")
     link.push(s"$root/caller")
@@ -1279,8 +1326,8 @@ private ecl_traps(root: string, kind: string, signal: int, said: string)
         assert_eq(got.2.index_of("\n"), Some(got.2.len - 1), kind)
 end ecl_traps
 
-// Every trapping kind, then `panic`: exit 1 through C's `exit`, so `atexit` runs, its line on
-// standard output, and still nothing of the caller after the call.
+// Every trapping kind, then `panic`: its line on standard error and `abort`'s SIGABRT, so no `atexit`
+// handler runs and nothing of the caller after the call.
 private ecl_every_stop(root: string)
     val signal = ecl_trap_signal()
 
@@ -1291,14 +1338,28 @@ private ecl_every_stop(root: string)
     ecl_traps(root, "container", signal, "index 5 out of bounds for length 2 (mylib/lib.sysl:")
     ecl_traps(root, "defer", signal, "index 5 out of bounds for length 3 (mylib/lib.sysl:")
     ecl_traps(root, "via", signal, "index 5 out of bounds for length 3 (mylib/lib.sysl:")
+    ecl_traps(root, "panic", 6, "panic: given up (mylib/lib.sysl:")
+end ecl_every_stop
+
+// A `sysl_trap` that reports `heard` and the kind's low byte, then returns: it replaces every default
+// line, and the export still stops -- by the trap signal, or for a panic by SIGABRT after the panic's
+// own line, which is written before the hook is told.
+private ecl_trap_hook_heard(root: string, heard: string)
+    val signal = ecl_trap_signal()
+
+    ecl_traps(root, "bounds", signal, s"${heard}0\n")
+    ecl_traps(root, "overflow", signal, s"${heard}16\n")
+    ecl_traps(root, "require", signal, s"${heard}17\n")
+    ecl_traps(root, "container", signal, heard)
+    ecl_traps(root, "via", signal, s"${heard}0\n")
 
     val panicked = ecl_trap_run(root, "panic")
 
-    assert(panicked.0 == Status.Exited(1), s"panic ended with ${panicked.0}")
-    assert(panicked.1.starts_with("before\npanic: given up (mylib/lib.sysl:"), panicked.1)
-    assert(!ecl_has(panicked.1, "after"), panicked.1)
-    assert_eq(panicked.2, "atexit ran\n")
-end ecl_every_stop
+    assert(panicked.0 == Status.Signalled(6), s"panic ended with ${panicked.0}: '${panicked.2}'")
+    assert_eq(panicked.1, "before\n")
+    assert(panicked.2.starts_with("panic: given up (mylib/lib.sysl:"), panicked.2)
+    assert(panicked.2.ends_with(s")\n${heard}21\n"), panicked.2)
+end ecl_trap_hook_heard
 
 // A shared library is made here only as macOS makes one; elsewhere the cell is named and skipped.
 private ecl_shared_ready() -> bool
@@ -1311,7 +1372,7 @@ private ecl_shared_ready() -> bool
 ecl_a_trap_in_an_export_from_an_archive()
     if !ecl_ready() then return
 
-    val root = ecl_trap_host(["--debug"], [], false, false)
+    val root = ecl_trap_host(["--debug"], [], Archive, NoHook)
 
     ecl_every_stop(root)
     remove_dir_all(root).unwrap_or(())
@@ -1320,9 +1381,56 @@ ecl_a_trap_in_an_export_from_an_archive()
 ecl_a_trap_in_an_export_from_a_shared_library()
     if !ecl_ready() || !ecl_shared_ready() then return
 
-    val root = ecl_trap_host(["--debug"], [], true, false)
+    val root = ecl_trap_host(["--debug"], [], AllLoad, NoHook)
 
     ecl_every_stop(root)
+    remove_dir_all(root).unwrap_or(())
+
+@test("and the same from the shared library build-c --shared links")
+ecl_a_trap_in_an_export_from_build_c_shared()
+    if !ecl_ready() || !ecl_shared_ready() then return
+
+    val root = ecl_trap_host(["--debug"], [], BuildShared, NoHook)
+
+    ecl_every_stop(root)
+    remove_dir_all(root).unwrap_or(())
+
+@test("a C program's own sysl_trap hears every failure of an archive's export, and the export still stops")
+ecl_a_trap_after_the_hosts_sysl_trap()
+    if !ecl_ready() then return
+
+    val root = ecl_trap_host(["--debug"], [], Archive, HostTrap)
+
+    ecl_trap_hook_heard(root, "host trap hook: kind ")
+    remove_dir_all(root).unwrap_or(())
+
+// A `--shared` library offers the loader only its module's exports, so the runtime's `sysl_trap` inside
+// it is its own: the host's definition is never called, and every default line is said as before.
+@test("a C program's own sysl_trap does not replace the one inside a build-c --shared library")
+ecl_a_trap_beside_the_hosts_sysl_trap_shared()
+    if !ecl_ready() || !ecl_shared_ready() then return
+
+    val root = ecl_trap_host(["--debug"], [], BuildShared, HostTrap)
+
+    ecl_every_stop(root)
+    remove_dir_all(root).unwrap_or(())
+
+@test("a library's own exported sysl_trap hears every failure of its exports from an archive")
+ecl_a_trap_after_the_librarys_sysl_trap()
+    if !ecl_ready() then return
+
+    val root = ecl_trap_host(["--debug"], [], Archive, LibraryTrap)
+
+    ecl_trap_hook_heard(root, "library hook ")
+    remove_dir_all(root).unwrap_or(())
+
+@test("and from a build-c --shared library, and the export still stops")
+ecl_a_trap_after_the_librarys_sysl_trap_shared()
+    if !ecl_ready() || !ecl_shared_ready() then return
+
+    val root = ecl_trap_host(["--debug"], [], BuildShared, LibraryTrap)
+
+    ecl_trap_hook_heard(root, "library hook ")
     remove_dir_all(root).unwrap_or(())
 
 // A release build drops only the overflow check: the rest trap as before, and an overflow wraps and
@@ -1331,7 +1439,7 @@ ecl_a_trap_in_an_export_from_a_shared_library()
 ecl_a_trap_in_a_release_export()
     if !ecl_ready() then return
 
-    val root = ecl_trap_host(["--release"], [], false, false)
+    val root = ecl_trap_host(["--release"], [], Archive, NoHook)
     val signal = ecl_trap_signal()
 
     ecl_traps(root, "bounds", signal, "index 5 out of bounds for length 3 (mylib/lib.sysl:")
@@ -1361,7 +1469,7 @@ private ecl_hooked(root: string)
 ecl_a_trap_after_the_embedders_hook()
     if !ecl_ready() then return
 
-    val root = ecl_trap_host(["--debug"], [], false, true)
+    val root = ecl_trap_host(["--debug"], [], Archive, HostBounds)
 
     ecl_hooked(root)
     remove_dir_all(root).unwrap_or(())
@@ -1370,7 +1478,7 @@ ecl_a_trap_after_the_embedders_hook()
 ecl_a_trap_after_the_embedders_hook_shared()
     if !ecl_ready() || !ecl_shared_ready() then return
 
-    val root = ecl_trap_host(["--debug"], [], true, true)
+    val root = ecl_trap_host(["--debug"], [], AllLoad, HostBounds)
 
     ecl_hooked(root)
     remove_dir_all(root).unwrap_or(())
@@ -1387,7 +1495,7 @@ ecl_a_trap_in_an_export_on_x86_64()
         return
     end if
 
-    val root = ecl_trap_host(["--debug", "--target", "x86_64-macos"], ["-arch", "x86_64"], false, false)
+    val root = ecl_trap_host(["--debug", "--target", "x86_64-macos"], ["-arch", "x86_64"], Archive, NoHook)
 
     ecl_traps(root, "bounds", 4, "index 5 out of bounds for length 3 (mylib/lib.sysl:")
     ecl_traps(root, "trap", 4, "")

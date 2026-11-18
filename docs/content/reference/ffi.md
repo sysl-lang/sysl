@@ -976,7 +976,8 @@ in a shell on AArch64, where the instruction raises SIGTRAP, and 132 on x86-64, 
 SIGILL. Nothing is unwound: the statement of the C caller after the call never runs, no `defer` of
 the sysl frames between runs, a C frame sitting between two of them (a callback that calls back in)
 is never returned to, and no `atexit` handler runs. Since the stop is the process's, it is the same
-whether the C project linked the `build-c` archive statically or made a shared library of it:
+whether the C project linked the `build-c` archive statically, made a shared library of it, or
+opened the one `sysl build-c --shared` links:
 
 ```c
 #include <stdio.h>
@@ -989,16 +990,21 @@ int main(void) {
 }
 ```
 
-**A C program that defines `sysl_bounds_fail` itself replaces the report, not the stop.** Its
-definition is called with the failure in place of the default line, and when it returns the check
-traps as it would have, so an embedder may log a bounds failure its own way but cannot make the
-export return. An overflow wraps rather than trapping in a release build, so there the export returns
-the wrapped answer like any other.
+**A C program that defines `sysl_trap` itself replaces the report, not the stop**
+([`sysl_trap`](/reference/errors/#reporting-a-failure-to-an-embedder-sysl-trap)). Its definition is
+called with the failure in place of the default line, and when it returns the check traps as it
+would have, so an embedder may log a failure its own way but cannot make the export return. The
+older `sysl_bounds_fail` does the same for the bounds and overflow forms. A host's definition
+replaces the hook of an archive it links, statically or as a shared library it made of the archive,
+but never the one inside a library `sysl build-c --shared` linked, which offers the loader only its
+module's exports; such a library hears its failures by exporting `sysl_trap` itself. An overflow
+wraps rather than trapping in a release build, so there the export returns the wrapped answer like
+any other.
 
-`panic` and the forcing members built on it (`unwrap`, `expect`, `assert`) are the one difference,
-as they are in a program: they print their line on standard output and exit with status 1 through
-C's `exit`, so the caller's `atexit` handlers do run — and the caller still never sees the call
-return.
+`panic` and the forcing members built on it (`unwrap`, `expect`, `assert`) end the process the way
+they end a program: their line goes to standard error and the process aborts, SIGABRT, status 134.
+`abort` runs no `atexit` handler either, so the caller's handlers, which a panic has no reason to
+trust, are never run against the state it reported.
 
 ### A variadic export
 

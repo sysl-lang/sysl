@@ -2211,7 +2211,8 @@ true
 argument with a type of its own is exactly one candidate's parameter and every other argument is a
 numeric literal with no suffix, that candidate wins and the literals are read at its parameters, as
 `x * 2.0` is at `f32` for an `f32` `x`. So `nextafter(x, 100.0)` at an `f32` `x` is the `f32`
-declaration, in either argument order:
+declaration, in either argument order. Arithmetic over bare literals counts as a literal here, as it
+does in every rule above, so `scale(a, 2.0 * 3)` is the `f32` one too:
 
 ```sysl
 import sysl.math.nextafter
@@ -2223,17 +2224,19 @@ val a = 1.5f32
 val d = 1.5
 
 print(scale(a, 2.0), scale(2.0, a), scale(d, 2.0), scale(2.0, 3.0))
+print(scale(a, 2.0 * 3), scale(-(1.5 + 2), a))
 print(nextafter(a, 100.0) > a)
 ```
 
 ```output
 f32 f32 real real
+f32 f32
 true
 ```
 
 The call stays ambiguous where a typed argument is matched by no candidate exactly, where two
 candidates match every typed argument, where no candidate takes the literals at their defaults (`f32`
-beside `f128` at `2`), and where two do (`(int, real)` beside `(real, int)` at `(2, 2)`):
+beside `f128` at `2`, or at `2.0 * 3`), and where two do (`(int, real)` beside `(real, int)` at `(2, 2)`):
 
 ```sysl
 scale(x: f32, k: f32) -> string = "f32"
