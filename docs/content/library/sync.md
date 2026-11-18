@@ -6,7 +6,7 @@ weight: 70
 
 **Every declaration in `sysl.sync`, with its signature:** [the generated API page](/api/sysl-sync/#index). This page is the argument — what the module is for, and how its pieces fit; that one is the list.
 
-`sysl.sync` is two types and five names, and the most important thing about it is what it does
+`sysl.sync` is a handful of types and functions, and the most important thing about it is what it does
 **not** require. There is no `requires` clause on the module at all, so a program that has given up
 its allocator and its operating system can still reach every name in it:
 
@@ -46,6 +46,8 @@ anything to schedule.
 | `Lock` | the trait every lock implements — `acquire`, `try_acquire`, `release` — whatever it waits by |
 | `Guarded[L, T]` | one record and its own lock, inline: a table of them is locked record by record, and constant data even on a board ([memory](/reference/memory/#a-table-whose-every-record-has-its-own-lock)); `with`/`try_with` for a hold that is a block, `lock_raw`/`unlock_raw` for one that is not. `sysl.threads.Mutex[T]` is one over a `SleepLock` |
 | `spin_hint()` | the processor's own instruction for "this loop is waiting" |
+| `load_relaxed` / `store_relaxed` | a plain-data value copied a word at a time, each word a relaxed atomic: a copy another thread may be writing over without a race |
+| `SeqLock[T]` | a plain-data value readers copy without writing anything, retrying when a write lands under them |
 
 This is the `*T` tier of concurrency in the same sense `*T` is the unsafe tier of memory: nothing
 here is checked, everything is greppable, and it is how a kernel is written. What sits above it —
@@ -747,6 +749,112 @@ spin_hint(4)
 ```error
 function 'sysl.sync.spin_hint' takes 0 arguments, but 1 argument was given
 ```
+
+## `SeqLock[T]`
+
+A value read far more often than it is written — a clock's calibration, a sensor's latest sample, the
+state a frame is drawn from — wants readers that write nothing. A `Mutex` reader takes the lock, which
+is a write to the lock's line, so a hundred readers on a hundred cores fight over one cache line
+although none of them changes anything. A `SeqLock[T]` reader only reads:
+
+```sysl
+import sysl.sync.*
+
+struct Pos
+    x: i32
+    y: i32
+
+var spot = SeqLock.new(Pos(1, 2))
+
+spot.write(Pos(3, 4))
+
+val p = spot.read()
+
+print(p.x, p.y, spot.writes())
+```
+
+```output
+3 4 1
+```
+
+**The value sits beside a sequence number.** A writer makes the number odd, writes the value, and makes
+it even again. A reader notes the number, copies the value, and looks at the number again: if it was
+odd or has moved, a write landed under the copy, which may be torn, so the reader copies again. A copy
+the number did not move across is all of one write. `read()` retries until it has one; `try_read()`
+makes one attempt and answers `None` where a write was under way. Writers exclude each other — making
+the number odd is a compare-and-swap from an even value — so any number may write, though readers
+starve where writes never stop.
+
+### The copy is a relaxed atomic one, so a torn copy is not a race
+
+A reader copies the value while a writer may be writing it. A plain copy there would be a data race,
+which the C++ and LLVM memory model makes undefined behaviour however the result is used. So the copy
+is `load_relaxed`, which reads the value a word at a time with each word a relaxed atomic load, and the
+write is `store_relaxed`, its mirror. Two words of one copy may come from two writes — that is the torn
+copy the recheck catches — but each word is some value a write stored, and nothing is undefined. Both
+are ordinary functions a program may use on its own, around fences it places:
+
+```sysl
+import sysl.sync.*
+
+struct Sample
+    t: u64
+    v: real
+
+var shared = Sample(0, 0.0)
+
+store_relaxed(&shared, Sample(7, 2.5))
+
+val s = load_relaxed(&shared)
+
+print(s.t, s.v)
+```
+
+```output
+7 2.5
+```
+
+**A word is as wide as the type's alignment allows**, up to the machine's pointer, and the width is
+chosen while compiling: a struct of `u64`s is copied in 64-bit loads on a 64-bit machine and in 32-bit
+ones on a 32-bit one, a struct of bytes a byte at a time.
+
+The fences are the C++ model's, and they sit around the copies rather than in them:
+
+| side | in order |
+|---|---|
+| `try_read` | an acquire load of the number · the relaxed copy · `atomic_fence(Acquire)` · a relaxed load of the number |
+| `write` | a compare-and-swap of the number to odd (acquire) · `atomic_fence(Release)` · the relaxed copy · a release store of the number to even |
+
+A copy that saw any word of a write synchronises, through the writer's release fence and the reader's
+acquire fence, with that write's first step, so the recheck sees the odd number or a later one and
+throws the copy away. A reader whose first load sees an even number sees every word written before it.
+
+### `T` is plain data
+
+A reader holds a torn copy for a moment before it knows to throw it away, and a copy of a counted
+reference's bytes would be an owner nobody counted. So `T` is
+[`sysl.encoding.Plain`](/library/encoding/) — integers, floats, fixed-point numbers, `bool`s, simple
+enums, and arrays and structs of them — and a type holding a `&T`, a `string` or a slice, at any depth,
+is refused where the program names it:
+
+```sysl
+import sysl.sync.*
+
+struct Node
+    n: int
+
+struct Holder
+    id: u32
+    node: &Node
+
+var held = SeqLock.new(Holder(1, Node(2)))
+```
+
+```error
+Plain
+```
+
+`load_relaxed` and `store_relaxed` hold their type to the same bound, for the same reason.
 
 ## What is not here
 

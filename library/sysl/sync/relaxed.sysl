@@ -1,0 +1,73 @@
+module sysl.sync
+@no_alloc
+
+import sysl.encoding.Plain
+import sysl.raw.ptr_cast
+
+/** Reads the value at `src` a word at a time, each word one relaxed atomic load, and answers it.
+ *
+ * **This is the read another thread may be writing over while it runs**, and it is not a data race:
+ * every word is an atomic access, so the memory model gives each one some value a write stored
+ * there, and a plain copy of the same bytes would be undefined behaviour instead. What it does not
+ * give is a value **all of one write** -- two words may come from two different writes, which is a
+ * torn value. Something has to say whether that happened, and that is what a sequence number is for:
+ * `SeqLock[T]` is this read with the check around it, and the reason the read exists.
+ *
+ * **`T` is plain data** (`sysl.encoding.Plain`): integers, floats, fixed-point numbers, `bool`s,
+ * simple enums, and arrays and structs of them. Every byte of a torn value then still came from some
+ * value of its field, so holding one is harmless until it is thrown away. A counted reference, a
+ * string or a view is refused at the line that names the type: a copy of its bytes would be a second
+ * owner nobody counted.
+ *
+ * **A word is as wide as the type's alignment allows**, up to the machine's pointer: a struct of
+ * `u64`s is copied in 64-bit loads on a 64-bit machine and in 32-bit ones on a 32-bit one, and a
+ * struct of bytes a byte at a time. The width is chosen while compiling, so the copy is a straight
+ * run of loads.
+ *
+ * No ordering is offered, because none would be right: an acquire on every word orders the words
+ * against each other, which the caller cannot use, and costs a barrier per word on a weak machine.
+ * The ordering a copy needs is around it -- an `atomic_fence(Acquire)` after it, or a release fence
+ * before `store_relaxed` -- and `SeqLock` places both.
+ */
+load_relaxed[T: Plain](src: *T) -> T
+    var out: T
+
+    if const alignof(T) >= 8 && sizeof(usize) >= 8
+        load_words[u64](ptr_cast(&out), ptr_cast(src), sizeof(T) / 8)
+    elif const alignof(T) >= 4
+        load_words[u32](ptr_cast(&out), ptr_cast(src), sizeof(T) / 4)
+    elif const alignof(T) >= 2
+        load_words[u16](ptr_cast(&out), ptr_cast(src), sizeof(T) / 2)
+    else
+        load_words[u8](ptr_cast(&out), ptr_cast(src), sizeof(T))
+
+    out
+end load_relaxed
+
+/** Writes `v` to `dst` a word at a time, each word one relaxed atomic store.
+ *
+ * The other half of `load_relaxed`, with the same words, the same bound on `T`, and the same reason
+ * for being: a reader on another thread may be copying `dst` while this runs, and with every word an
+ * atomic store neither side races. A reader may see some words of `v` and some of what was there,
+ * which is the torn value a sequence number exists to catch.
+ */
+store_relaxed[T: Plain](dst: *T, v: T)
+    var held = v
+
+    if const alignof(T) >= 8 && sizeof(usize) >= 8
+        store_words[u64](ptr_cast(dst), ptr_cast(&held), sizeof(T) / 8)
+    elif const alignof(T) >= 4
+        store_words[u32](ptr_cast(dst), ptr_cast(&held), sizeof(T) / 4)
+    elif const alignof(T) >= 2
+        store_words[u16](ptr_cast(dst), ptr_cast(&held), sizeof(T) / 2)
+    else
+        store_words[u8](ptr_cast(dst), ptr_cast(&held), sizeof(T))
+end store_relaxed
+
+// The shared side is `src` here and `dst` below; the other side is the caller's own storage, which no
+// other thread can see, so it is read or written plainly.
+private load_words[W](dst: *W, src: *W, n: usize)
+    for i in 0..<n do dst[i] = atomic_load(&src[i], Relaxed)
+
+private store_words[W](dst: *W, src: *W, n: usize)
+    for i in 0..<n do atomic_store(&dst[i], src[i], Relaxed)

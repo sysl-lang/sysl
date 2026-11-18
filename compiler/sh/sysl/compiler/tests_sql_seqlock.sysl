@@ -1,0 +1,398 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `sysl.sync.load_relaxed` / `store_relaxed` (a value copied a word at a time, each word a relaxed
+// atomic) and `SeqLock[T]` built on them.
+//
+// The axes: the word width the copy picks (an alignment of 1, 2, 4 and 8, an array, a nested struct,
+// a 32-bit machine), the payload's own kinds (`bool`, a simple enum, a float), the lock's states (no
+// write under way, a write under way, several writers), and the bound (a `&T`, a `string`, a slice,
+// a reference two structs deep, and the free functions as well as the type). Not covered: a payload
+// over a cache line (nothing in the copy depends on the size beyond the word count).
+
+private sql_ready() -> bool = std_root().is_ok() && clang_available()
+
+// What `text` (as `main.sysl`) prints, or the refusal prefixed with `!`.
+private sql_run(text: string) -> string
+    val root = make_temp_dir("sysl-sql").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+    val built = build_native_program(root, None, None, DefaultOptimization, Some(exe))
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return s"!${failure_text(why)}"
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "!could not run"
+        Ok(out) -> out.text.trim()
+end sql_run
+
+// The LLVM text a named machine lowers a one-file program to, or the refusal.
+private sql_ir(machine: Option[string], text: string) -> string
+    val root = make_temp_dir("sysl-sql-ir").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val out = emit_llvm_text(s"$root/main.sysl", machine) match
+        Err(why) -> s"did not compile: ${failure_text(why)}"
+        Ok(made) ->
+            if !made.report.is_empty() then s"did not compile: ${analysis_report(made.report)}"
+            else made.text
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end sql_ir
+
+private sql_says(text: string, part: string) = assert(text.contains(part), s"expected '$part' in:\n$text")
+
+// -- the copy -------------------------------------------------------------------------------------
+
+@test("sql: a relaxed copy round-trips a struct at every word width")
+sql_round_trip_widths()
+    if !sql_ready() then return
+
+    assert_eq(sql_run(raw"""
+        import sysl.sync.*
+
+        struct Bytes
+            a: u8
+            b: u8
+            c: u8
+
+        struct Halves
+            a: u16
+            b: u8
+
+        struct Words
+            a: u32
+            b: f32
+            c: i32
+
+        struct Wide
+            a: u64
+            b: real
+            c: i8
+
+        var b = Bytes(1, 2, 3)
+        var h = Halves(4, 5)
+        var w = Words(6, 7.5, -8)
+        var d = Wide(9, 10.25, -11)
+
+        store_relaxed(&b, Bytes(11, 12, 13))
+        store_relaxed(&h, Halves(400, 5))
+        store_relaxed(&w, Words(60, 70.5, -80))
+        store_relaxed(&d, Wide(90, 100.25, -110))
+
+        val b2 = load_relaxed(&b)
+        val h2 = load_relaxed(&h)
+        val w2 = load_relaxed(&w)
+        val d2 = load_relaxed(&d)
+
+        print(b2.a, b2.b, b2.c, h2.a, h2.b)
+        print(w2.a, w2.b, w2.c)
+        print(d2.a, d2.b, d2.c)
+        """), "11 12 13 400 5\n60 70.5 -80\n90 100.25 -110")
+end sql_round_trip_widths
+
+@test("sql: a relaxed copy carries arrays, nested structs, bools and simple enums")
+sql_round_trip_kinds()
+    if !sql_ready() then return
+
+    assert_eq(sql_run(raw"""
+        import sysl.sync.*
+
+        enum Mode
+            Idle
+            Busy
+
+        struct Inner
+            on: bool
+            mode: Mode
+
+        struct Outer
+            xs: [3]u16
+            inner: Inner
+
+        var a = [1, 2, 3, 4]
+        var o = Outer([1, 2, 3], Inner(false, Idle))
+
+        store_relaxed(&a, [5, 6, 7, 8])
+        store_relaxed(&o, Outer([7, 8, 9], Inner(true, Busy)))
+
+        val a2 = load_relaxed(&a)
+        val o2 = load_relaxed(&o)
+
+        print(a2[0], a2[3], o2.xs[0], o2.xs[2], o2.inner.on, o2.inner.mode == Busy)
+        """), "5 8 7 9 true true")
+end sql_round_trip_kinds
+
+@test("sql: the copy is relaxed atomic loads and stores as wide as the alignment allows")
+sql_lowering_widths()
+    if !sql_ready() then return
+
+    val program = raw"""
+        import sysl.sync.*
+
+        struct Wide
+            a: u64
+            b: u64
+
+        struct Bytes
+            a: u8
+            b: u8
+
+        var w = Wide(1, 2)
+        var b = Bytes(3, 4)
+
+        store_relaxed(&w, Wide(5, 6))
+        store_relaxed(&b, Bytes(7, 8))
+        print(load_relaxed(&w).a, load_relaxed(&b).a)
+        """
+
+    val host = sql_ir(Some("aarch64-macos"), program)
+
+    sql_says(host, "load atomic i64")
+    sql_says(host, "store atomic i64")
+    sql_says(host, "load atomic i8")
+    sql_says(host, "monotonic")
+
+    // A 32-bit machine copies the same 8-aligned struct in 32-bit words, which it has an
+    // instruction for, rather than in 64-bit ones, which it may not.
+    val thumb = sql_ir(Some("thumb-freestanding-softfp"), raw"""
+        @no_os
+        import sysl.sync.*
+
+        struct Wide
+            a: u64
+            b: u64
+
+        @export("main")
+        main_c() -> i32
+            var w = Wide(1, 2)
+
+            store_relaxed(&w, Wide(5, 6))
+            i32(load_relaxed(&w).a)
+        """)
+
+    sql_says(thumb, "load atomic i32")
+    sql_says(thumb, "store atomic i32")
+    assert(thumb.index_of("atomic i64").is_none(), thumb)
+end sql_lowering_widths
+
+// -- the lock, on one thread ----------------------------------------------------------------------
+
+@test("sql: a SeqLock reads what was written, counts the writes, and refuses a read under a write")
+sql_api()
+    if !sql_ready() then return
+
+    assert_eq(sql_run(raw"""
+        import sysl.sync.*
+
+        struct Pos
+            x: i32
+            y: i32
+
+        var l = SeqLock.new(Pos(1, 2))
+
+        print(l.read().x, l.read().y, l.writes())
+
+        l.write(Pos(3, 4))
+        l.write(Pos(5, 6))
+
+        val p = l.read()
+
+        print(p.x, p.y, l.writes(), l.seq)
+        print(l.try_read().is_some())
+
+        // A write under way is an odd number: a reader then answers nothing rather than a copy.
+        l.seq = 5
+        print(l.try_read().is_none(), l.writes())
+
+        l.seq = 6
+        print(l.try_read().unwrap().x)
+        """), "1 2 0\n5 6 2 4\ntrue\ntrue 2\n5")
+end sql_api
+
+// -- the lock, across threads ---------------------------------------------------------------------
+
+// Two writers and three readers on one lock. Every value written carries its own check (`b`, `c` and
+// `check` are fixed multiples of `a`), so a reader handed a copy made of two writes sees it at once.
+// Breaking the recheck in `try_read` makes this report torn copies on the first run.
+@test("sql: readers on three threads never see a torn value while two threads write")
+sql_stress()
+    if !sql_ready() then return
+
+    assert_eq(sql_run(raw"""
+        import sysl.sync.*
+        import sysl.threads.*
+
+        struct Sample
+            a: u64
+            b: u64
+            c: u64
+            check: u64
+
+        sample(n: u64) -> Sample = Sample(n, n *% 3, n *% 7, n *% 11)
+
+        struct Shared
+            lock: SeqLock[Sample]
+            done: Atomic[int]
+            torn: Atomic[int]
+            reads: Atomic[int]
+
+        val rounds: u64 = 200000
+
+        writer_low(s: *Shared)
+            for n in 1..rounds do s.lock.write(sample(n))
+
+        writer_high(s: *Shared)
+            for n in rounds + 1..2 * rounds do s.lock.write(sample(n))
+
+        reader(s: *Shared)
+            var reads = 0
+
+            while s.done.load(Acquire) == 0
+                val v = s.lock.read()
+
+                if v.b != v.a *% 3 || v.c != v.a *% 7 || v.check != v.a *% 11 then s.torn.add(1)
+
+                reads += 1
+
+            s.reads.add(reads)
+
+        var shared = Shared(SeqLock.new(sample(0)), Atomic(0), Atomic(0), Atomic(0))
+
+        var r1 = spawn(&reader, &shared).unwrap()
+        var r2 = spawn(&reader, &shared).unwrap()
+        var r3 = spawn(&reader, &shared).unwrap()
+        var w1 = spawn(&writer_low, &shared).unwrap()
+        var w2 = spawn(&writer_high, &shared).unwrap()
+
+        print(w1.join(), w2.join())
+        shared.done.store(1, Release)
+        print(r1.join(), r2.join(), r3.join())
+
+        val last = shared.lock.read()
+
+        print(shared.torn.load(), shared.reads.load() > 0, shared.lock.writes() == 2 * rounds)
+        print(last.a == rounds || last.a == 2 * rounds, last.check == last.a *% 11)
+        """), "true true\ntrue true true\n0 true true\ntrue true")
+end sql_stress
+
+// -- the bound ------------------------------------------------------------------------------------
+
+@test("sql: a SeqLock over a type holding a reference is refused where the type is named")
+sql_refuses_reference()
+    if !sql_ready() then return
+
+    val said = sql_run(raw"""
+        import sysl.sync.*
+
+        struct Node
+            n: int
+
+        struct Holder
+            id: u32
+            node: &Node
+
+        var l = SeqLock.new(Holder(1, Node(2)))
+
+        print(l.read().id)
+        """)
+
+    sql_says(said, "!")
+    sql_says(said, "Plain")
+end sql_refuses_reference
+
+@test("sql: a string, a slice, a reference two structs down, and a bare &T are refused too")
+sql_refuses_every_counted_kind()
+    if !sql_ready() then return
+
+    val words = sql_run(raw"""
+        import sysl.sync.*
+
+        struct Named
+            name: string
+
+        var l = SeqLock.new(Named("a"))
+        """)
+
+    sql_says(words, "!")
+    sql_says(words, "Plain")
+
+    val view = sql_run(raw"""
+        import sysl.sync.*
+
+        struct View
+            xs: []const int
+
+        var l = SeqLock.new(View([1, 2]))
+        """)
+
+    sql_says(view, "!")
+    sql_says(view, "Plain")
+
+    val deep = sql_run(raw"""
+        import sysl.sync.*
+
+        struct Node
+            n: int
+
+        struct Inner
+            node: &Node
+
+        struct Outer
+            k: int
+            inner: Inner
+
+        var l = SeqLock.new(Outer(1, Inner(Node(2))))
+        """)
+
+    sql_says(deep, "!")
+    sql_says(deep, "Plain")
+
+    val bare = sql_run(raw"""
+        import sysl.sync.*
+
+        struct Node
+            n: int
+
+        val node: &Node = Node(2)
+        var l = SeqLock.new(node)
+        """)
+
+    sql_says(bare, "!")
+    sql_says(bare, "Plain")
+end sql_refuses_every_counted_kind
+
+@test("sql: the free copy functions hold their type to the same bound")
+sql_copy_refuses_reference()
+    if !sql_ready() then return
+
+    val said = sql_run(raw"""
+        import sysl.sync.*
+
+        struct Named
+            name: string
+
+        var n = Named("a")
+
+        print(load_relaxed(&n).name)
+        """)
+
+    sql_says(said, "!")
+    sql_says(said, "Plain")
+end sql_copy_refuses_reference
