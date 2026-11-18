@@ -448,6 +448,25 @@ refuse_ref_captures(cx: &Analyzer, span: Span, captured: Buf[string]) -> bool
     false
 end refuse_ref_captures
 
+// A closure that captures a `@unique` value would borrow it or take it, by whether the closure is
+// kept (`design/affine-values.md § 5`); neither is followed yet, so the capture is refused.
+private refuse_unique_captures(cx: &Analyzer, span: Span, captured: Buf[string]) -> bool
+    for name in captured
+        val local = cx.lookup(name)
+
+        if local.is_none() || !is_unique(cx.an, local.unwrap().ty) then continue
+
+        val held = type_show(local.unwrap().ty)
+
+        cx.fault(span, s"this closure captures '$name', and '$held' is '@unique' — a closure capturing " +
+                 "a '@unique' value is not supported yet. Pass it to the closure as a parameter, or " +
+                 s"capture a pointer to it ('val p = &$name')")
+        return true
+    end for
+
+    false
+end refuse_unique_captures
+
 // A capture held by value is a copy, so a local whose type is `@pinned` cannot be captured by a
 // closure that holds it so: the closure would carry a second value of it, which nothing C holds a
 // pointer into. **One held by reference is the variable itself**, so whether the capture is refused
@@ -492,6 +511,7 @@ lower_closure(cx: &Analyzer, span: Span, names: Buf[string], ptypes: Buf[Type],
     val captured = captures(cx, body, names)
 
     if refuse_ref_captures(cx, span, captured) then return bad_expr(span)
+    if refuse_unique_captures(cx, span, captured) then return bad_expr(span)
 
     var fields: Buf[(string, Type)] = buf()
 
@@ -1619,6 +1639,7 @@ private closure_body(cx: &Analyzer, span: Span, st: &StructType, fname: string,
     inner.try_shape = None
 
     check_consumes(inner, block)
+    check_unique_moves(inner, block, true)
     check_counted_pointers(inner, block)
     hand_up_copy_writes(cx, inner, span, captured)
 
@@ -2229,11 +2250,11 @@ with_struct_call_bounds(d: StructDecl) -> StructDecl
     StructDecl(d.name, d.tparams, d.fields, lowered_members(d.members), d.bounds, d.invariants,
                d.vis, d.tdefaults, d.opaque, d.tvalues, d.packed, d.alignment, d.cname, d.deriving,
                d.byte_order, d.guards, d.pinned, d.union_layout, d.anon, d.bits, d.annotation,
-               d.annots, d.promised)
+               d.annots, d.promised, d.unique)
 
 with_enum_call_bounds(d: EnumDecl) -> EnumDecl
     EnumDecl(d.name, d.tparams, d.underlying, d.variants, lowered_members(d.members), d.bounds,
-             d.vis, d.tdefaults, d.tvalues, d.deriving, d.annots)
+             d.vis, d.tdefaults, d.tvalues, d.deriving, d.annots, d.unique)
 
 private lowered_members(ms: Buf[MethodDecl]) -> Buf[MethodDecl]
     var out: Buf[MethodDecl] = buf()

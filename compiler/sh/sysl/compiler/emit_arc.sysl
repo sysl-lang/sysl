@@ -18,18 +18,30 @@ import sysl.math.bigint.from_int
 header_fields() -> int = 3
 
 // The bytes laid between a box's header and its payload, so the payload begins on its type's
-// boundary: none where LLVM's own reading of the type already puts it there. A raised `@align(n)` is
-// a boundary LLVM's type does not carry, and one beyond what the allocating pair promises is one the
-// block is aligned to only through the aligned hook -- either way the payload's offset from the
-// block's start has to be a multiple of it, said here as a run of bytes.
+// boundary, `layout.align` -- the boundary every access through the payload's address claims
+// (`claim`). **Every gap is said here as a run of bytes, never left to LLVM**, so the header's words
+// plus this pad ARE the payload's offset, on every target: LLVM's own boundary for a type is never
+// above `layout.align`, so it adds nothing after an explicit pad. Leaving the natural gaps to LLVM
+// would put a `u128` after a three-word header at 32 while the sum said 24, and where a target's
+// boundary is below `layout.align` (an `i128` on a 32-bit Arm, a `@align(n)` struct anywhere) LLVM
+// would lay the payload short of what its accesses claim.
 box_pad(e: *Emit, payload: Type) -> usize = header_pad(e, payload, usize(header_fields()))
+
+// **The boundary a box of `payload` laid anywhere but the heap is put on** -- a module `val`'s static
+// image, a closure's frame slot, a vtable adapter's slot -- where LLVM's own reading of the box type
+// may fall short of it: the pad above counts from a block on the payload's boundary, and LLVM's
+// boundary for the box is only its widest field's, which carries neither a raised `@align(n)` nor,
+// on a 32-bit Arm, an `i128`'s or a `<4>f32`'s sixteen. None where the header's words already put
+// the box on it. The heap needs no word of this: a block from the allocating pair is on `heap_align`,
+// and anything beyond it comes from the aligned hook.
+box_storage_align(e: *Emit, payload: Type) -> Option[int] =
+    if e.layout.align(payload) > e.layout.pointer_bytes() then Some(int(e.layout.align(payload))) else None
 
 // The same for a buffer, whose header is one word longer -- the element count.
 buf_pad(e: *Emit, elem: Type) -> usize = header_pad(e, elem, usize(header_fields() + 1))
 
+// The bytes from the end of `words` header words to the next multiple of `t`'s boundary.
 private header_pad(e: *Emit, t: Type, words: usize) -> usize
-    if !e.layout.holds_raised(t) && !e.layout.beyond_heap(t) then return 0
-
     val header = words * e.layout.pointer_bytes()
 
     round_up(header, e.layout.align(t)) - header
