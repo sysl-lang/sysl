@@ -209,7 +209,7 @@ private member_attr_word(w: string) -> bool
 
     for word in ["crossing", "reads", "writes", "noinline", "inline", "cold", "blocks",
                  "relocates", "views", "consumes", "disjoint", "scoped", "bounded", "joined", "strict_fp",
-                 "track_caller"]
+                 "track_caller", "frame_limit"]
         if word == w then return true
 
     false
@@ -260,7 +260,8 @@ builtin_attr_word(w: string) -> bool
                  "section", "crossing", "domain", "keeps", "answers", "disjoint", "guards", "needs",
                  "noinline", "inline", "cold", "thread_local", "abandons", "per_cpu", "main_thread",
                  "pinned", "pins", "unique", "relocates", "views", "consumes", "blocks", "scoped", "bounded", "joined",
-                 "strict_fp", "track_caller", "returns_twice", "renamed", "removed", "unchecked"]
+                 "strict_fp", "track_caller", "returns_twice", "renamed", "removed", "unchecked",
+                 "frame_limit"]
         if word == w then return true
 
     false
@@ -442,6 +443,7 @@ parse_attribute(p: *Parser) -> Option[Attr]
     // `@track_caller` takes none: the location it hands on is the call's, which is not something a
     // declaration could name.
     if word == "track_caller" then return no_inlining_args(p, TrackCaller, "the location it hands on is the line of each call, which the call supplies")
+    if word == "frame_limit" then return parse_frame_limit_attr(p)
     if word == "annotation" then return no_inlining_args(p, AnnotationMark, "what a use of the annotation says is written where it is used, as the values of the struct's fields")
     if word == "renamed" || word == "removed" then return parse_gone_attr(p, at, word)
 
@@ -780,6 +782,54 @@ private parse_byte_order_attr(p: *Parser) -> Option[Attr]
     Some(ByteOrder(word == "big"))
 end parse_byte_order_attr
 
+// `@frame_limit(32768)` or `@frame_limit(none)` -- the most bytes a function's stack frame may take,
+// or no limit (`frame_limit.sysl`). The number is a literal, as `@test(timeout: n)`'s is: it is read
+// before anything is typed, and a limit is a fact about one function rather than a value a program
+// computes.
+private parse_frame_limit_attr(p: *Parser) -> Option[Attr]
+    val bad = s"'@frame_limit' names the most bytes the function's stack frame may take, in parentheses " +
+        s"— '@frame_limit(32768)', a whole number from 1 to $MostFrameBytes — or '@frame_limit(none)' " +
+        "for no limit at all"
+
+    if !p.accept_kw("(")
+        p.fault(p.here(), bad)
+        skip_line(p)
+        return None
+    end if
+
+    val at = p.here()
+
+    val limit = p.peek() match
+        Ident(n) ->
+            if n != "none"
+                p.fault(at, bad)
+                skip_line(p)
+                return None
+            end if
+
+            p.bump()
+            None
+        IntLit(digits, base, suffix) ->
+            p.bump()
+
+            val bytes = literal_value(digits, base).to_long()
+
+            if suffix != "" || bytes.is_none() || bytes.unwrap() < 1 || bytes.unwrap() > MostFrameBytes
+                p.fault(at, bad)
+                skip_line(p)
+                return None
+            end if
+
+            bytes
+        _ ->
+            p.fault(at, bad)
+            skip_line(p)
+            return None
+
+    p.expect_kw(")")
+    Some(FrameLimit(limit))
+end parse_frame_limit_attr
+
 // `@export`, `@export("mylib_parse")` -- the symbol a function is visible under from C, or the name
 // a struct's `typedef` carries in a generated header. `weak` after the symbol, or alone
 // (`@export("write", weak)`, `@export(weak)`), publishes the function as a default any strong
@@ -1017,6 +1067,9 @@ apply_func_attrs(f: *FuncDecl, attrs: Buf[Attr])
             Blocks -> f.marks.blocks = true
             StrictFp -> f.marks.strict_fp = true
             TrackCaller -> f.marks.track_caller = true
+            FrameLimit(limit) -> limit match
+                Some(n) -> f.marks.frame_limit = n
+                None -> f.marks.frame_exempt = true
             Scoped(ns) -> f.marks.scoped = ns
             Bounded(ns) -> f.marks.bounded = ns
             _ -> ()
@@ -1044,6 +1097,9 @@ apply_member_attrs(m: *MethodDecl, attrs: Buf[Attr])
             Blocks -> m.marks.blocks = true
             StrictFp -> m.marks.strict_fp = true
             TrackCaller -> m.marks.track_caller = true
+            FrameLimit(limit) -> limit match
+                Some(n) -> m.marks.frame_limit = n
+                None -> m.marks.frame_exempt = true
             Relocates -> m.marks.relocates = true
             Views(_) -> m.marks.views = true
             Consumes -> m.marks.consumes = true
@@ -1305,6 +1361,10 @@ private attributed_refusal(attrs: Buf[Attr]) -> string
     // call: the definition is the linked object's, and only its own compiler can inline it.
     if any_is(attrs, "strict_fp")
         return "'@strict_fp' says how a body's floating-point operations are compiled, so it marks a function or a method, whose body is sysl — and this declares neither. An 'extern''s operations are compiled by whoever compiled it"
+
+    // An `extern`'s frame is laid out by whoever compiled it.
+    if any_is(attrs, "frame_limit")
+        return "'@frame_limit' bounds the stack frame of a body this build compiles, so it marks a function or a method — and this declares neither. An 'extern''s frame is laid out by whoever compiled it"
 
     if any_is(attrs, "inline(always)")
         return "'@inline(always)' puts a function's body in place of every call to it, so it marks a function or a method — and this declares neither. An 'extern' has no body in this program to put anywhere: its definition is in the object it is linked from"

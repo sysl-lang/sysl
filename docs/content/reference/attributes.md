@@ -2709,6 +2709,66 @@ print(count())
 is resumed) and a variadic function are refused the same way, and so is an `extern`, whose body is
 compiled elsewhere. It takes no arguments.
 
+## `@frame_limit(n)` — the most stack one call of a function may take
+
+A function marked `@frame_limit(n)` may not have a stack frame larger than `n` bytes, and a build in
+which it does fails, naming the function, its frame and the limit. The frame is laid out by LLVM,
+so the check is made where clang compiles the program — here an archive's (`sysl build-c`):
+
+```sysl build=c
+@frame_limit(2048)
+@export("deep")
+deep(n: usize) -> u8
+    var block: [65536]u8 = [0; 65536]
+    block[n % 65536] = u8(n)
+    block[(n * 7) % 65536]
+```
+
+```error
+'deep' needs a stack frame of
+```
+
+The whole message reads `'deep' needs a stack frame of 65584 bytes, over its limit of 2048 bytes, set
+by '@frame_limit(2048)' above 'deep'` on an AArch64 Mac at the default level, the size being whatever
+the machine and the optimization level lay the frame out at. The frame is what the function's
+prologue reserves — its locals, the registers it saves, what it passes on the stack — and not what
+the functions it calls take: a bound over a whole call chain is a different question, which this
+does not answer.
+
+**The limit is the emitted function's, as clang's is.** A function the optimizer inlines takes its
+frame into its caller and is held to the caller's limit there; a function called once with a
+constant may be folded away entirely, array and all. An `@export`ed function's C entry point is
+held to the function's own limit, since its body is inlined into it.
+
+**It is the one function's answer to a limit set for many.** A package's `frame_limit` key and the
+`--frame-limit` flag hold every function a build compiles ([a function's stack
+frame](/reference/packages/#a-function-s-stack-frame)), and the attribute is nearer than either: a
+kernel holding every function to 2 KiB gives its entry point what that one needs, and
+`@frame_limit(none)` takes the function out of every limit at all:
+
+```sysl
+@frame_limit(none)
+setup() -> int
+    var scratch: [8192]u8 = [0; 8192]
+    scratch[100] = 7
+    int(scratch[100])
+
+print(setup())
+```
+
+```output
+7
+```
+
+**A closure or nested function written inside a marked function takes its mark**, being part of the
+body the mark was written about; one written anywhere else takes the limit of its own package. Every
+instance of a generic function carries the mark its declaration was written with, and so does every
+lowered copy of a method.
+
+The number is a literal from 1 to 4294967295, which is the most LLVM's attribute holds; `none` is the
+one word it takes. A limit is a fact about the code LLVM lays out, so it marks a function or a
+method, and an `extern` — whose frame is laid out by whoever compiled it — is refused it.
+
 ## `@renamed` and `@removed` — a name that is gone, and what became of it
 
 A module that renames or removes a declaration leaves a **tombstone** where it was, so a program
