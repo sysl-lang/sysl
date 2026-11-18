@@ -512,7 +512,7 @@ literal_operand_head(cx: &Analyzer, op: string, subject: Type, e: Expr) -> Optio
     args.push(e)
     natural.push(None)
 
-    val chosen = narrowed_at(declared, generic, fitted, args, natural)
+    val chosen = narrowed_at(cx, declared, generic, fitted, args, natural)
 
     if chosen.len() == 1 then Some(reached[chosen[0]]) else None
 end literal_operand_head
@@ -532,7 +532,7 @@ literal_operand_misfit(cx: &Analyzer, op: string, subject: Type, e: Expr) -> Opt
         Abstract(_, _) -> return None
         _ -> ()
 
-    val own = literal_arith_default(e)
+    val own = literal_arith_default(literal_shape(cx, e))
 
     if own.is_none() || !literal_valued(cx, e) || literal_fits(cx, e, own.unwrap()) then return None
 
@@ -560,7 +560,7 @@ end literal_operand_misfit
 // instruction of its own: the scalars implementing the trait at that type are the candidates, and
 // the literal fits none of them nor its own default.
 literal_subject_misfit(cx: &Analyzer, op: string, rhs: Type, e: Expr, scalars: Buf[Type]) -> Option[string]
-    val own = literal_arith_default(e)
+    val own = literal_arith_default(literal_shape(cx, e))
 
     if scalars.is_empty() || own.is_none() || literal_fits(cx, e, own.unwrap()) then return None
 
@@ -633,8 +633,9 @@ widened_operand(cx: &Analyzer, span: Span, op: string, subject: Type, t: TExpr,
         Abstract(_, bounds) -> bound_heads(a, tr_name, subject, bounds, d.unwrap())
         _ -> impl_heads(a, tr_name, subject, d.unwrap())
     // Arithmetic over literals is the literal it comes to (`literal_arith_default`): `b + 60 * 52` is
-    // read at whichever implementation `b + 3120` is, and refused alike where that is ambiguous.
-    val literal = written.is_some() && literal_arith_default(written.unwrap()).is_some()
+    // read at whichever implementation `b + 3120` is, and refused alike where that is ambiguous -- and
+    // so is an untyped constant (`literal_shape`): `b + K` at `const K = 3120` is `b + 3120`.
+    val literal = written.is_some() && literal_arith_default(literal_shape(cx, written.unwrap())).is_some()
     var reached: Buf[Type] = buf()
 
     for h in heads
@@ -678,7 +679,7 @@ widened_operand(cx: &Analyzer, span: Span, op: string, subject: Type, t: TExpr,
     args.push(written.unwrap_or(expr(t.span, Ident(""))))
     natural.push(Some(got))
 
-    val chosen = narrowed_at(declared, generic, fitted, args, natural)
+    val chosen = narrowed_at(cx, declared, generic, fitted, args, natural)
 
     if chosen.len() == 1 then return operand_at(cx, t, written, literal, reached[chosen[0]])
 
@@ -819,7 +820,7 @@ chosen_scalar(cx: &Analyzer, span: Span, op: string, written: Expr, natural: Typ
     args.push(written)
     own.push(Some(natural))
 
-    val chosen = narrowed_at(declared, generic, fitted, args, own)
+    val chosen = narrowed_at(cx, declared, generic, fitted, args, own)
 
     if chosen.len() == 1 then return Some(reached[chosen[0]])
 

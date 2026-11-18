@@ -23,7 +23,9 @@ where it lives.
 `const Greeting = "hello"` is a `string`, `const Area = sq(3)` whatever `sq` answers — except that
 a value with no type of its own leaves the constant **untyped**: `const Step = 2` is the literal `2`,
 read at whatever type each use's position gives it, and an `int` where nothing does
-([untyped and typed constants](/reference/modules/#untyped-and-typed-constants)). Written,
+([untyped and typed constants](/reference/modules/#untyped-and-typed-constants)). It is that
+literal wherever an overload or an implementation is chosen too: `g(Step)` and `Step * 3` choose
+exactly as `g(2)` and `2 * 3` do ([Overloading](#overloading)). Written,
 `const Name: T = v`, the type governs: the value is read at `T`, and refused where `T` does not hold
 it. A `val` or a `const` with no value is not a declaration of anything.
 
@@ -2199,6 +2201,30 @@ const N: u32 = 3120
 
 print(g(N * 2), g(4567890123 * 2))
 print(g(60 * 52))
+```
+
+```error
+'g' is ambiguous here — 2 of its declarations take these arguments:
+    g(v: u32)
+    g(v: u64)
+```
+
+**An untyped constant is the literal it stands for at every one of these rules**, alone or in
+arithmetic, at a call, a method, either side of an operator and a new type's own `From[int]`. With
+`const K = 3120`, `g(K)` is as ambiguous as `g(3120)` and `pick(K)` is the `long` one as `pick(3120)`
+is; a float constant is a float literal. Naming the type — `u32(K)`, or `const K: u32 = 3120` —
+chooses:
+
+```sysl
+g(v: u32) -> string = "u32"
+g(v: u64) -> string = "u64"
+pick(x: long) -> string = "long"
+pick(x: u64) -> string = "u64"
+
+const K = 3120
+
+print(g(u32(K)), g(u64(K * 2)), pick(K), pick(-K))
+print(g(K))
 ```
 
 ```error

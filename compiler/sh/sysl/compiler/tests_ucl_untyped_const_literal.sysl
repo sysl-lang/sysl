@@ -1,0 +1,363 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **An untyped constant is the literal it stands for wherever an overload or an implementation is
+// chosen** (`reference/declarations.md § Constants` and `§ Overloading`): at `const K = 3120`,
+// `g(K)` over `g(v: u32)` and `g(v: u64)` is as ambiguous as `g(3120)`, where it once chose `u32` by
+// widening from an `int` it never was, and `K * 2` is arithmetic over literals as `3120 * 2` is.
+// Every test pins the constant against the literal it stands for, through a free function, an
+// associated function, a method and either side of an operator, and a new type's own `From[int]`.
+// A constant declared with a type keeps following its type.
+
+private ucl_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end ucl_ready
+
+// A project holding `main.sysl` and, where `consts` is not empty, a module `consts` beside it.
+private ucl_write(main: string, consts: string) -> string
+    val root = make_temp_dir("sysl-ucl").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/sysl.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(root + "/main.sysl", main).unwrap()
+
+    if !consts.is_empty()
+        make_dir_all(root + "/consts").unwrap()
+        write_text(root + "/consts/consts.sysl", "module consts\n\n" + consts).unwrap()
+    end if
+
+    root
+end ucl_write
+
+// What a program prints, built and run, or what the build had to say about it.
+private ucl_ran(main: string, consts: string) -> string
+    val root = ucl_write(main, consts)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end ucl_ran
+
+// The first line of everything the analysis had to say about a program: its first complaint.
+private ucl_first(main: string, consts: string) -> string
+    val root = ucl_write(main, consts)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+
+    val nl = out.index_of("\n")
+
+    if nl.is_some() then out[0..<nl.unwrap()] else out
+end ucl_first
+
+// The constant's program is refused with the very complaint the literal's is, and that complaint
+// says `says`.
+private ucl_refused_alike(src: string, literal: string, constant: string, says: string)
+    val lit = ucl_first(src + literal + "\n", "")
+    val con = ucl_first(src + constant + "\n", "")
+
+    assert(lit.contains(says), s"$literal: $lit")
+    assert_eq(con, lit)
+end ucl_refused_alike
+
+// The unsigned pair at every path, and the constants the tests read.
+private ucl_unsigned() -> string = raw"""
+    g(v: u32) -> string = "u32"
+    g(v: u64) -> string = "u64"
+
+    struct G
+        n: int
+
+        of(v: u32) -> string = "u32"
+        of(v: u64) -> string = "u64"
+        at(self, v: u32) -> string = "u32"
+        at(self, v: u64) -> string = "u64"
+
+    impl Add[u32, string] for G
+        add(self, v: u32) -> string = "u32"
+
+    impl Add[u64, string] for G
+        add(self, v: u64) -> string = "u64"
+
+    impl Add[G, string] for u32
+        add(self, v: G) -> string = "u32"
+
+    impl Add[G, string] for u64
+        add(self, v: G) -> string = "u64"
+
+    const K = 3120
+    const P = K * 2
+    const M = -5
+    const T: u32 = 3120
+    const U: u64 = 3120
+
+    val gv = G(0)
+    """
+
+// The signed/unsigned pair at every path, where a literal prefers the signed widening.
+private ucl_signed() -> string = raw"""
+    f(v: long) -> string = "long"
+    f(v: ulong) -> string = "ulong"
+
+    struct B
+        n: int
+
+        of(v: long) -> string = "long"
+        of(v: ulong) -> string = "ulong"
+        at(self, v: long) -> string = "long"
+        at(self, v: ulong) -> string = "ulong"
+
+    impl Add[long, string] for B
+        add(self, v: long) -> string = "long"
+
+    impl Add[ulong, string] for B
+        add(self, v: ulong) -> string = "ulong"
+
+    impl Add[B, string] for long
+        add(self, v: B) -> string = "long"
+
+    impl Add[B, string] for ulong
+        add(self, v: B) -> string = "ulong"
+
+    const K = 3120
+    const M = -5
+
+    val b = B(0)
+    """
+
+@test("an untyped constant over an unsigned pair is as ambiguous as its literal at a function, an associated function and a method")
+ucl_unsigned_pair_ambiguous()
+    if !ucl_ready() then return
+
+    for pair in [("3120", "K"), ("6240", "P"), ("3120 * 2", "K * 2"), ("3120 + 1", "1 + K"), ("3120 << 1", "K << 1"),
+                 ("(60 * 52) / 2", "K / 2")]
+        ucl_refused_alike(ucl_unsigned(), s"print(g(${pair.0}))", s"print(g(${pair.1}))",
+                          "'g' is ambiguous here — 2 of its declarations take these arguments")
+        ucl_refused_alike(ucl_unsigned(), s"print(G.of(${pair.0}))", s"print(G.of(${pair.1}))",
+                          "'G.of' is ambiguous here")
+        ucl_refused_alike(ucl_unsigned(), s"print(gv.at(${pair.0}))", s"print(gv.at(${pair.1}))",
+                          "'G.at' is ambiguous here")
+
+@test("an untyped constant on either side of an operator is as ambiguous as its literal")
+ucl_unsigned_pair_operator()
+    if !ucl_ready() then return
+
+    for pair in [("3120", "K"), ("6240", "P"), ("(3120 * 2)", "(K * 2)")]
+        ucl_refused_alike(ucl_unsigned(), s"print(gv + ${pair.0})", s"print(gv + ${pair.1})",
+                          "'+' between G and int comes from 2 implementations of one trait on G")
+        ucl_refused_alike(ucl_unsigned(), s"print(${pair.0} + gv)", s"print(${pair.1} + gv)",
+                          "'+' between int and G comes from 2 implementations of one trait on different scalars")
+
+@test("an untyped constant prefers the signed widening at every path, as its literal does")
+ucl_signed_preference()
+    if !ucl_ready() then return
+
+    val lit = ucl_ran(ucl_signed() + raw"""
+        print(f(3120), B.of(3120), b.at(3120), b + 3120, 3120 + b)
+        print(f(-5), B.of(6240), b.at(3120 - 1), b + -5, (3120 * 2) + b)
+        """, "")
+
+    assert_eq(lit, "long long long long long\nlong long long long long\n")
+    assert_eq(ucl_ran(ucl_signed() + raw"""
+        print(f(K), B.of(K), b.at(K), b + K, K + b)
+        print(f(M), B.of(K * 2), b.at(K - 1), b + M, (K * 2) + b)
+        """, ""), lit)
+
+@test("an untyped constant only the wider candidate holds chooses it at every path")
+ucl_only_wider_fits()
+    if !ucl_ready() then return
+
+    val src = raw"""
+        h(v: u8) -> string = "u8"
+        h(v: u16) -> string = "u16"
+
+        struct H
+            n: int
+
+            of(v: u8) -> string = "u8"
+            of(v: u16) -> string = "u16"
+            at(self, v: u8) -> string = "u8"
+            at(self, v: u16) -> string = "u16"
+
+        impl Add[u8, string] for H
+            add(self, v: u8) -> string = "u8"
+
+        impl Add[u16, string] for H
+            add(self, v: u16) -> string = "u16"
+
+        const Wide = 300
+        const Half = 200
+
+        val hv = H(0)
+        """
+
+    assert_eq(ucl_ran(src + "print(h(300), H.of(300), hv.at(300), hv + 300, h(200 * 2))\n", ""),
+              "u16 u16 u16 u16 u16\n")
+    assert_eq(ucl_ran(src + "print(h(Wide), H.of(Wide), hv.at(Wide), hv + Wide, h(Wide * 1))\n", ""),
+              "u16 u16 u16 u16 u16\n")
+    ucl_refused_alike(src, "print(h(200))", "print(h(Half))", "'h' is ambiguous here")
+
+    // Arithmetic with a name in it is not computed exactly (`reference/types.md § Arithmetic over
+    // literals is exact`), so `Half * 2` is ordinary `u8` arithmetic that fits `u8` as written, and
+    // both candidates take it. It is in the literal's tier all the same, so no narrowest widening
+    // picks `u8` for it: the call is refused rather than trapping when the `u8` overflows.
+    val half = ucl_first(src + "print(h(Half * 2))\n", "")
+
+    assert(half.contains("'h' is ambiguous here"), half)
+
+@test("a negative untyped constant is refused by unsigned candidates as a negative literal is")
+ucl_negative_against_unsigned()
+    if !ucl_ready() then return
+
+    for pair in [("-5", "M"), ("3 - 5", "M + 3"), ("-3120", "-K")]
+        ucl_refused_alike(ucl_unsigned(), s"print(g(${pair.0}))", s"print(g(${pair.1}))",
+                          "no 'g' takes these arguments")
+        ucl_refused_alike(ucl_unsigned(), s"print(G.of(${pair.0}))", s"print(G.of(${pair.1}))",
+                          "no 'G.of' takes these arguments")
+
+    ucl_refused_alike(ucl_unsigned(), "print(gv + -5)", "print(gv + M)", "'+' between G and int needs 'Add[int]'")
+
+@test("a constant declared with a type, and a constant converted, keep their own type")
+ucl_typed_stays_typed()
+    if !ucl_ready() then return
+
+    assert_eq(ucl_ran(ucl_unsigned() + raw"""
+        print(g(T), G.of(T), gv.at(T * 2), gv + T, T + gv)
+        print(g(U), G.of(U), gv.at(U - 1), gv + U, U + gv)
+        print(g(u32(K)), g(u64(K)), G.of(u32(K * 2)), gv.at(u64(P)), gv + u32(K), u64(K) + gv)
+        """, ""), "u32 u32 u32 u32 u32\nu64 u64 u64 u64 u64\nu32 u64 u32 u64 u32 u64\n")
+
+@test("a float constant is a float literal: no narrowest widening, it follows a typed argument, and reaches a float implementation")
+ucl_float_constant()
+    if !ucl_ready() then return
+
+    val pair = "k(v: f32) -> string = \"f32\"\nk(v: f128) -> string = \"f128\"\nconst F = 1.5\n"
+
+    for p in [("1.5", "F"), ("1.5 * 2", "F * 2"), ("-(0.5 + 1)", "-F")]
+        ucl_refused_alike(pair, s"print(k(${p.0}))", s"print(k(${p.1}))", "'k' is ambiguous here")
+
+    val src = raw"""
+        n(a: f32, c: f32) -> string = "f32"
+        n(a: real, c: real) -> string = "real"
+
+        struct P
+            v: f32
+
+        impl Mul[f32] for P
+            mul(self, k: f32) -> P = P(self.v * k)
+
+        const F = 1.5
+        const I = 2
+
+        val y: f32 = 1.0
+        val p = P(2.0)
+        """
+
+    val lit = ucl_ran(src + "print(n(y, 1.5), n(y, 1.5 * 2), n(1.5, 2), (p * 1.5).v, (p * 2).v, (p * (1.5 * 2)).v)\n", "")
+
+    assert_eq(lit, "f32 f32 real 3 4 6\n")
+    assert_eq(ucl_ran(src + "print(n(y, F), n(y, F * 2), n(F, I), (p * F).v, (p * I).v, (p * (F * I)).v)\n", ""), lit)
+
+@test("an untyped constant converted to a new type runs that type's own From[int], as its literal does")
+ucl_own_from()
+    if !ucl_ready() then return
+
+    val src = raw"""
+        type Phase = new real
+
+        impl From[int] for Phase
+            from(n: int) -> Phase = Phase(n) * 2.0
+
+        const Three = 3
+        const Neg = -3
+        const Half = 1.5
+        """
+
+    assert_eq(ucl_ran(src + "print(real(Phase(3)), real(Phase(1 + 2)), real(Phase(-3)), real(Phase(1.5 * 2)))\n", ""),
+              "6 6 -6 3\n")
+    assert_eq(ucl_ran(src + "print(real(Phase(Three)), real(Phase(Three - 2 + 2)), real(Phase(Neg)), real(Phase(Half * 2)))\n", ""),
+              "6 6 -6 3\n")
+
+@test("an untyped constant from another module is its literal there too, by its own name or through the module")
+ucl_other_module()
+    if !ucl_ready() then return
+
+    val src = raw"""
+        import consts
+        import consts.K
+
+        f(v: long) -> string = "long"
+        f(v: ulong) -> string = "ulong"
+        g(v: u32) -> string = "u32"
+        g(v: u64) -> string = "u64"
+
+        """
+
+    assert_eq(ucl_ran(src + "print(f(K), f(consts.K), f(consts.K * 2), f(3120))\n", "const K = 3120\n"),
+              "long long long long\n")
+
+    val lit = ucl_first(src + "print(g(3120))\n", "const K = 3120\n")
+
+    assert(lit.contains("'g' is ambiguous here"), lit)
+    assert_eq(ucl_first(src + "print(g(K))\n", "const K = 3120\n"), lit)
+    assert_eq(ucl_first(src + "print(g(consts.K))\n", "const K = 3120\n"), lit)
+    assert_eq(ucl_ran(src + "print(g(consts.T), g(consts.U))\n", "const K = 3120\nconst T: u32 = 3120\nconst U: u64 = 1\n"),
+              "u32 u64\n")
+
+@test("an untyped constant in a generic body, and a local one, is its literal")
+ucl_generic_and_local()
+    if !ucl_ready() then return
+
+    val src = ucl_signed() + raw"""
+        pick[T](x: T) -> string = s"${f(K)} ${B(0).at(K * 2)} ${B(0) + K}"
+
+        local() -> string
+            const L = 3120
+
+            s"${f(L)} ${B.of(L - 1)} ${L + B(0)}"
+
+        """
+
+    assert_eq(ucl_ran(src + "print(pick(1), pick(\"a\"), local())\n", ""),
+              "long long long long long long long long long\n")
+
+    val unsigned = ucl_unsigned() + raw"""
+        gen[T](x: T) -> string = g(K)
+
+        """
+
+    val lit = ucl_first(ucl_unsigned() + "gen[T](x: T) -> string = g(3120)\n\nprint(gen(1))\n", "")
+
+    assert(lit.contains("'g' is ambiguous here"), lit)
+    assert_eq(ucl_first(unsigned + "print(gen(1))\n", ""), lit)
+
+    val local = ucl_first(ucl_unsigned() + "loc() -> string\n    const L = 3120\n\n    g(L)\n\nprint(loc())\n", "")
+
+    assert_eq(local, lit)
