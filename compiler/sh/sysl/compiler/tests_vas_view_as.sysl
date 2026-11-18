@@ -1,0 +1,388 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+
+// **`xs.view_as[T]()`** -- a view read at another plain-data element, keeping the source's owner, with
+// the boundary and the tail checked by the run where the layouts leave them open (`view_as.sysl`).
+// `reference/arrays.md § Reading a view as another element` is the spec.
+//
+// The axes: the source (a frame array, a `val` array, a heap view, a module array, a part of one, an
+// array behind a reference), the direction (narrow to wide, wide to narrow, equal size with a stricter
+// boundary, a struct), the build level, a generic instance, writes either way, the owner outliving
+// the scope it was made in, and every refusal. Skipped: a `&sync` array -- its view is lent by the
+// rule for every view of one (`arrays.md § Views of storage inside a '&sync' box`), which `TViewAs`
+// passes through unchanged as it does for fixed point's `.bits`.
+//
+// The numbers assume a little-endian machine, as every host the suite runs on is.
+
+private vas_ready() -> bool = std_root().is_ok() && clang_available()
+
+private vas_run(text: string, level: string) -> (Status, string, string)
+    val root = make_temp_dir("sysl-vas").unwrap()
+
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, level, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (Status.Exited(-1), "", failure_text(why))
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> (Status.Exited(-1), "", "the program that was built could not be run")
+        Ok(out) -> (out.status, out.text, out.err.unwrap_or(""))
+end vas_run
+
+// At both levels the program exits cleanly having printed `printed`.
+private vas_prints(text: string, printed: string)
+    if !vas_ready() then return
+
+    for level in ["0", DefaultOptimization]
+        val (state, out, err) = vas_run(text, level)
+
+        assert_eq(err, "")
+        assert_eq(out, printed)
+        assert(state == Status.Exited(0), s"-O$level stopped with $state")
+end vas_prints
+
+// At both levels the program stops on SIGTRAP, having printed `printed`, its report naming `said`.
+private vas_traps(text: string, printed: string, said: string)
+    if !vas_ready() then return
+
+    for level in ["0", DefaultOptimization]
+        val (state, out, err) = vas_run(text, level)
+
+        assert(state == Status.Signalled(5), s"-O$level stopped with $state, saying '$err'")
+        assert_eq(out, printed)
+        assert(err.contains(said), s"expected '$said' in '$err'")
+end vas_traps
+
+// The program is refused with exactly one diagnostic, saying `message` -- the whole of it or a part --
+// at this position.
+private vas_refused(text: string, message: string, line: int, col: int)
+    if !vas_ready() then return
+
+    val (_, _, err) = vas_run(text, "0")
+    val at = s"/main.sysl:$line:$col\n"
+
+    assert(err.contains(message), s"expected\n$message\nin\n$err")
+    assert(err.contains(at), s"expected\n$at\nin\n$err")
+    assert_eq(err.count_of("error: "), 1)
+end vas_refused
+
+// -- reading ---------------------------------------------------------------------------------------
+
+@test("view_as reads bytes as wider integers and back, at every kind of source")
+vas_every_source()
+    vas_prints(raw"""
+        @align(8)
+        var frame: [8]u8 = [1, 0, 0, 0, 2, 0, 0, 0]
+        val words = frame.view_as[u32]()
+        val part = frame[4..].view_as[u32]()
+        var heap: []u8 = [3, 0, 4, 0]
+        val r: &[4]u16 = [5, 6, 7, 8]
+
+        print(words.len, words[0], words[1], part.len, part[0])
+        print(heap.view_as[u16]().len, heap.view_as[u16]()[1], r.view_as[u64]()[0] == 0x0008_0007_0006_0005)
+
+        var total: u32 = 0
+
+        for w in words do total += w
+
+        print(total, words.view_as[u8]().len, words.view_as[u8]()[4])
+        """, "2 1 2 1 2\n2 4 true\n3 8 2\n")
+end vas_every_source
+
+@test("view_as reads a struct of plain fields, a union, a vector, a fixed point and a new type")
+vas_plain_elements()
+    vas_prints(raw"""
+        struct Rgba
+            r: u8
+            g: u8
+            b: u8
+            a: u8
+
+        struct Pair
+            lo: u16
+            hi: [2]u8
+
+        union Word
+            w: u32
+            b: [4]u8
+
+        type Metres = new u32
+
+        @align(8)
+        var b: [8]u8 = [1, 2, 3, 4, 5, 6, 7, 8]
+
+        print(b.view_as[Rgba]()[1].a, b.view_as[Pair]()[0].lo, b.view_as[Pair]()[1].hi[1])
+        print(b.view_as[Word]()[0].b[2], b.view_as[<4>u8]()[1][0], b.view_as[q15]().len)
+        print(int(b.view_as[Metres]()[0] == Metres(0x0403_0201)), b.view_as[f32]().len)
+        """, "8 513 8\n3 5 4\n1 2\n")
+end vas_plain_elements
+
+@test("a generic body reads view_as at each instance's types")
+vas_generic_instances()
+    vas_prints(raw"""
+        as_of[T, U](xs: []U) -> []T = xs.view_as[T]()
+
+        @align(8)
+        var b: [8]u8 = [1, 0, 0, 0, 2, 0, 0, 0]
+
+        print(as_of[u32, u8](b[..])[1], as_of[u8, u32](as_of[u32, u8](b[..])).len, as_of[u64, u8](b[..]).len)
+        """, "2 8 1\n")
+end vas_generic_instances
+
+// -- writing and owning ----------------------------------------------------------------------------
+
+@test("a write through the view is seen through the source, and one through the source through the view")
+vas_writes_both_ways()
+    vas_prints(raw"""
+        @align(8)
+        var b: [8]u8 = [0, 0, 0, 0, 0, 0, 0, 0]
+        val w = b.view_as[u32]()
+
+        w[1] = 0x0403_0201
+        b[0] = 9
+
+        print(b[4], b[7], w[0])
+
+        var heap: []u32 = [0, 0]
+        val bytes = heap.view_as[u8]()
+
+        bytes[4] = 1
+        bytes[5] = 1
+
+        print(heap[1])
+        """, "1 4 9\n257\n")
+end vas_writes_both_ways
+
+@test("a read-only source gives a read-only view, a val array's storage included")
+vas_read_only_source()
+    vas_refused(raw"""
+        val fixed: [4]u16 = [1, 2, 3, 4]
+        val ro = fixed.view_as[u8]()
+
+        ro[0] = 1
+        """, "this element belongs to a '[]const byte', which views elements it may not write, so " +
+        "there is nothing to assign through. Elements you may write are elements of your own: copy " +
+        "them into a '[]byte' first", 4, 1)
+
+    vas_refused(raw"""
+        take(xs: []const u8) -> []u32 = xs.view_as[u32]()
+        """, "a '[]const uint' views elements it may not write, and a '[]uint' is a licence to write " +
+        "them", 1, 43)
+
+    vas_prints(raw"""
+        val fixed: [4]u16 = [1, 2, 3, 4]
+        val ro: []const u8 = fixed.view_as[u8]()
+
+        print(ro.len, ro[2])
+        """, "8 2\n")
+end vas_read_only_source
+
+@test("the view keeps its owner alive past the scope it was made in, a promoted frame array's too")
+vas_owner_outlives_scope()
+    vas_prints(raw"""
+        from_heap() -> []u32
+            var xs: []u8 = [1, 2, 3, 4, 5, 6, 7, 8]
+
+            xs.view_as[u32]()
+
+        from_frame() -> []u16
+            var a: [4]u32 = [1, 2, 3, 0x0005_0004]
+
+            a.view_as[u16]()
+
+        scrub()
+            var z: [64]u8 = [0xFF; 64]
+
+            print(z[3])
+
+        val x = from_heap()
+        val y = from_frame()
+
+        scrub()
+        print(x.len, x[0] == 0x0403_0201, x[1] == 0x0807_0605, y.len, y[6], y[7])
+        """, "255\n2 true true 8 4 5\n")
+end vas_owner_outlives_scope
+
+// -- what the run checks ---------------------------------------------------------------------------
+
+@test("a view whose first element is off the new element's boundary traps")
+vas_misaligned_traps()
+    vas_traps(raw"""
+        @align(8)
+        var b: [12]u8 =[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+
+        print(b[4..<8].view_as[u32]().len)
+        print(b[1..<5].view_as[u32]().len)
+        """, "1\n", "view_as: the first element is not aligned for 'uint'")
+end vas_misaligned_traps
+
+@test("a view whose bytes are not a whole number of the new element traps")
+vas_tail_traps()
+    vas_traps(raw"""
+        @align(8)
+        var b: [8]u8 = [0, 0, 0, 0, 0, 0, 0, 0]
+
+        print(b[0..<8].view_as[u32]().len)
+        print(b[0..<6].view_as[u32]().len)
+        """, "2\n", "view_as: the bytes are not a whole number of 'uint'")
+
+    // Six bytes of `u16`s are three of them, but not a whole number of `u32`s.
+    vas_traps(raw"""
+        @align(8)
+        var h: [3]u16 = [1, 2, 3]
+
+        print(h.view_as[u8]().len)
+        print(h.view_as[u32]().len)
+        """, "6\n", "view_as: the bytes are not a whole number of 'uint'")
+end vas_tail_traps
+
+@test("an empty view is read as an empty view, whatever address it carries")
+vas_empty_view()
+    vas_prints(raw"""
+        var b: [8]u8 = [0, 0, 0, 0, 0, 0, 0, 0]
+        var none: []u8 = []
+
+        print(b[3..<3].view_as[u64]().len, none.view_as[u32]().len, b[1..<1].view_as[u16]().len)
+        """, "0 0 0\n")
+end vas_empty_view
+
+// -- what the analyzer refuses ---------------------------------------------------------------------
+
+@test("an element that is not plain data is refused, on either side")
+vas_not_plain_refused()
+    vas_refused(raw"""
+        var b: [8]u8 = [0, 0, 0, 0, 0, 0, 0, 0]
+        val x = b.view_as[bool]()
+        """, "'view_as' reads the storage as bool, which is not plain data — a 'bool' is valid only as 0 or 1",
+        2, 19)
+
+    vas_refused(raw"""
+        var b: [8]u8 = [0, 0, 0, 0, 0, 0, 0, 0]
+        val x = b.view_as[char]()
+        """, "a 'char' is valid only as a Unicode scalar value", 2, 19)
+
+    vas_refused(raw"""
+        var b: [8]u8 = [0, 0, 0, 0, 0, 0, 0, 0]
+        val x = b.view_as[*u8]()
+        """, "'view_as' reads the storage as *byte, which is not plain data — '*byte' is an address", 2, 19)
+
+    vas_refused(raw"""
+        var b: [8]u8 = [0, 0, 0, 0, 0, 0, 0, 0]
+        val x = b.view_as[u12]()
+        """, "a 'u12' is 12 bits stored in 2 bytes, and the rest are no part of it", 2, 19)
+
+    vas_refused(raw"""
+        type Small = u8 within 0..10
+
+        var b: [8]u8 = [0, 0, 0, 0, 0, 0, 0, 0]
+        val x = b.view_as[Small]()
+        """, "'Small' holds only the values its check allows", 4, 19)
+
+    vas_refused(raw"""
+        enum Dir
+            North
+            South
+
+        var b: [8]u8 = [0, 0, 0, 0, 0, 0, 0, 0]
+        val x = b.view_as[Dir]()
+        """, "'Dir' is valid only as one of its variants", 6, 19)
+
+    vas_refused(raw"""
+        var flags: [4]bool = [true, false, true, false]
+        val x = flags.view_as[u8]()
+        """, "'view_as' reads the storage of a '[]bool', and bool is not plain data", 2, 22)
+
+    vas_refused(raw"""
+        struct Node
+            n: int
+
+        var nodes: [2]&Node = [Node(1), Node(2)]
+        val x = nodes.view_as[u64]()
+        """, "'&Node' is a counted reference", 5, 22)
+end vas_not_plain_refused
+
+@test("a struct with padding, a destructor, or a field that is not plain data is refused")
+vas_struct_refused()
+    vas_refused(raw"""
+        struct Pad
+            a: u8
+            b: u32
+
+        var b: [8]u8 = [0, 0, 0, 0, 0, 0, 0, 0]
+        val x = b.view_as[Pad]()
+        """, "'Pad' has padding between or after its fields, bytes no value of it sets", 6, 19)
+
+    vas_refused(raw"""
+        struct Res
+            fd: int
+
+        impl Drop for Res
+            drop(self)
+                ()
+
+        var b: [8]u8 = [0, 0, 0, 0, 0, 0, 0, 0]
+        val x = b.view_as[Res]()
+        """, "'Res' has a destructor, which a copy of its bytes would skip", 9, 19)
+
+    vas_refused(raw"""
+        struct Flagged
+            on: bool
+            n: u8
+
+        var b: [8]u8 = [0, 0, 0, 0, 0, 0, 0, 0]
+        val x = b.view_as[Flagged]()
+        """, "its field 'on' is not, since a 'bool' is valid only as 0 or 1", 6, 19)
+
+    vas_refused(raw"""
+        union Mixed
+            w: u32
+            b: u8
+
+        var b: [8]u8 = [0, 0, 0, 0, 0, 0, 0, 0]
+        val x = b.view_as[Mixed]()
+        """, "union 'Mixed' has a field narrower than itself", 6, 19)
+end vas_struct_refused
+
+@test("a zero-sized element is refused on either side, and the call takes one type and no values")
+vas_shape_refused()
+    vas_refused(raw"""
+        var b: [8]u8 = [0, 0, 0, 0, 0, 0, 0, 0]
+        val x = b.view_as[()]()
+        """, "'view_as' cannot read a view as unit, which takes no room — no count of them names any bytes",
+        2, 19)
+
+    vas_refused(raw"""
+        var u: [2]() = [(), ()]
+        val x = u.view_as[u8]()
+        """, "'view_as' cannot read a view of unit, which takes no room — the view holds no bytes", 2, 18)
+
+    vas_refused(raw"""
+        var b: [8]u8 = [0, 0, 0, 0, 0, 0, 0, 0]
+        val x = b.view_as()
+        """, "'view_as' takes one type argument, the element to read the view as — 'xs.view_as[u32]()'",
+        2, 11)
+
+    vas_refused(raw"""
+        var b: [8]u8 = [0, 0, 0, 0, 0, 0, 0, 0]
+        val x = b.view_as[u32](1)
+        """, "'view_as' takes no arguments — it reads the view it is called on", 2, 18)
+
+    vas_refused(raw"""
+        as_of[T](xs: []u8) -> []T = xs.view_as[T]()
+
+        var b: [8]u8 = [0, 0, 0, 0, 0, 0, 0, 0]
+        val x = as_of[bool](b[..])
+        """, "'view_as' reads the storage as bool, which is not plain data", 1, 40)
+end vas_shape_refused
