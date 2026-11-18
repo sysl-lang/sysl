@@ -40,6 +40,34 @@ pattern_test(e: *Emit, p: TPattern, value: Val) -> Val = p match
 
         acc
 
+    TDerefPattern(ref_ty, inner) -> pattern_test(e, *inner, held_by_ref(e, ref_ty, *inner, value))
+
+// What a reference holds, read for a pattern matched through it: borrowed, the reference's own count
+// being the one that keeps it alive while the arm reads it, exactly as `*x match` reads it. A pattern
+// that tests only a tag reads only the tag.
+private held_by_ref(e: *Emit, ref_ty: Type, inner: TPattern, value: Val) -> Val
+    val held = ref_inner(ref_ty)
+
+    if zero_sized(held) then return VNothing
+
+    val at = box_payload_addr(e, value, ref_ty)
+    val r = fresh_reg(e)
+
+    enum_decl(held) match
+        Some(d) ->
+            if !d.simple && tag_only(inner)
+                val tag = fresh_reg(e)
+
+                emit(e, InLoad(tag, l_i32(), at, pointer_side(ref_ty), None))
+                emit(e, InInsert(r, enum_lty(d), VPoison, l_i32(), tag, index_list(0)))
+                return r
+            end if
+        None -> ()
+
+    emit(e, InLoad(r, lty(e, held), at, pointer_side(ref_ty), None))
+    r
+end held_by_ref
+
 private variant_test(e: *Emit, enum_ty: Type, variant: EnumVariant, args: Buf[TPattern],
                      value: Val) -> Val
     val d = enum_decl(enum_ty) match
@@ -135,6 +163,11 @@ pattern_bind(e: *Emit, p: TPattern, value: Val) -> unit = p match
             if binds_any(args[i])
                 pattern_bind(e, args[i], struct_field(e, decl, value, i))
 
+    // Only the names inside are counted: the reference is read, never retained, and each name takes
+    // its own share of what it is bound to, as one bound out of `*x match` does.
+    TDerefPattern(ref_ty, inner) ->
+        if binds_any(*inner) then pattern_bind(e, *inner, held_by_ref(e, ref_ty, *inner, value))
+
     _ -> ()
 
 // One field of a variant's payload, or nothing where the field is zero-sized -- the same skipping
@@ -177,6 +210,7 @@ binds_any(p: TPattern) -> bool = p match
     TAtPattern(_, _) -> true
     TVariantPattern(_, _, args) -> any_binds(args)
     TStructPattern(_, args) -> any_binds(args)
+    TDerefPattern(_, inner) -> binds_any(*inner)
     _ -> false
 
 private any_binds(args: Buf[TPattern]) -> bool
@@ -904,6 +938,7 @@ private payload_move(e: *Emit, arm: TArm, slot: Merge, at: Option[Val]) -> bool
             val opened = open_box(e, ref_inner(ref_ty))
 
             move_payload_into(e, m, src, opened.1)
+            shared_box_payload(e, ref_ty, ref_inner(ref_ty), opened.1)
 
             val b = own_temp(e, opened.0, ref_ty)
 

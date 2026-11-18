@@ -3687,6 +3687,160 @@ twice(x: f32) -> f32 = x + x
 '@strict_fp' keeps every floating-point operation exactly where and how it is written, and '@reassociate' lets the back end regroup them
 ```
 
+## `@extensions` — a body compiled for instructions the build does not promise
+
+A build uses what its machine guarantees: a row's architecture, plus whatever
+[`codegen.extensions`](/reference/packages/#a-processors-extensions) and `--cpu` add for the whole
+image. A CRC, an AES round or a dot product often has an instruction only some processors of that
+architecture have, and a library that wants it cannot make the whole program require it.
+`@extensions` compiles **one function** for them, as Rust's `#[target_feature(enable = "…")]` and
+clang's `__attribute__((target("…")))` do:
+
+```sysl
+#if aarch64
+extern "llvm.aarch64.crc32cx" crc_word(crc: u32, word: u64) -> u32
+
+@extensions("crc")
+crc_words(words: []u64) -> u32
+    var crc: u32 = 0xffffffff
+    for w in words
+        crc = crc_word(crc, w)
+    crc ^ 0xffffffff
+#endif
+
+print("compiled")
+```
+
+```output
+compiled
+```
+
+Each name is the extension as LLVM names the feature, the names `codegen.extensions` takes — `crc`,
+`aes`, `sha3`, `dotprod`, `lse` on AArch64, `sse4.2`, `avx2`, `bmi2` on x86-64 — and each is asked of
+the clang that will build the program, which would only warn about a name it does not know:
+
+```sysl target=aarch64-freestanding
+@extensions("crcc")
+step(x: u32) -> u32 = x
+
+@export("main")
+start() -> i32 = i32(step(1))
+```
+
+```error
+'@extensions' names 'crcc', which the aarch64 back end does not know — an extension is spelled as LLVM spells the feature
+```
+
+The body's `define` line carries LLVM's `"target-features"`: the processor's own list, the build's,
+then the function's. So the back end may select the extension's instructions there, an intrinsic it
+calls is one the back end can select, and an [`asm`](/reference/inline-assembly/) block in it may
+name them — the assembler refuses `aese` in a body that does not say `aes`. **A closure or a nested
+function written inside is compiled the same way**: it can only be reached by running the body that
+made it.
+
+### A call is the promise, so a call is what is checked
+
+On a processor without the extension, the body's first such instruction faults. So a call is
+accepted only where the code making it is known to run on a processor that has every extension the
+callee names:
+
+- **code compiled for them itself** — a function marked with them, or written inside one;
+- **code the build promises them to everywhere** — `codegen.extensions`, `--cpu`, or the row's own
+  processor (`aarch64-macos` is built for the M1, which has `crc`, `aes`, `sha3` and `dotprod`);
+- **code inside an `@unchecked("…")` block naming them**, which is the program's word that it has
+  asked the processor first.
+
+Anywhere else the call is refused, naming both ways to make it:
+
+```sysl target=aarch64-freestanding
+@extensions("crc")
+step(x: u32) -> u32 = x
+
+@export("main")
+start() -> i32 = i32(step(1))
+```
+
+```error
+'step' is called, and it is compiled for the processor's 'crc' extension, which 'aarch64-freestanding' does not promise and the code here is not compiled for — on a processor without it its first such instruction faults. Mark the caller '@extensions("crc")', or make the call inside '@unchecked("crc")' once the program has asked the processor
+```
+
+That is Rust's rule — a `#[target_feature]` function is an `unsafe` call from a function without the
+features — said in the word sysl's unchecked tier already uses. **The block checks nothing while the
+program runs**: how a program asks its processor is the system's (`sysctlbyname` on macOS,
+`getauxval(AT_HWCAP)` on Linux, `cpuid` on x86), and the answer goes in an ordinary `if` around the
+block. It relaxes nothing else either — a subscript inside it is bounds-checked as anywhere:
+
+```sysl
+#if aarch64
+@extensions("crc")
+twice(x: u32) -> u32 = x * 2
+
+val asked = true
+
+if asked
+    @unchecked("crc")
+        print(twice(21))
+#else
+print(42)
+#endif
+```
+
+```output
+42
+```
+
+The block is lexical, as `@unchecked`'s is: a closure written inside is inside it, and a call after
+its last line is not. A block naming `aes` does not cover a callee that needs `sha3` as well, and the
+refusal names only what is missing. **Taking the function's address is held to the same rule**,
+since a call through the address names no callee; and a marked method may not fill a trait's table,
+for the same reason.
+
+**The CRC-32C `extern`s are such functions.** `llvm.aarch64.crc32cx` and SSE 4.2's `crc32` are
+compiled for `crc` and `sse4.2` ([ffi](/reference/ffi/#a-link-name-in-the-llvm-namespace-names-an-instruction)),
+so a declaration is accepted on its own processor and each call is held to this rule.
+
+### Inlining follows the features
+
+LLVM puts a body inside a caller only where the caller's features hold the body's, as clang's and
+rustc's do. A marked body is absorbed by a caller marked the same and stays a call from any other, and
+an ordinary helper is absorbed by a marked body as by any other — its list starts with the
+processor's, so it holds everything an ordinary function's does. `@inline` is the hint it always was;
+`@inline(always)` is refused beside `@extensions`, being a promise the back end would break at every
+call from code without them:
+
+```sysl
+@inline(always)
+@extensions("crc")
+step(x: u32) -> u32 = x
+```
+
+```error
+'@inline(always)' puts the body in place of every call, and a body compiled for a processor's extensions is only ever put inside a caller that has them too
+```
+
+### Where it applies
+
+`@extensions` is accepted on aarch64 and x86_64, where a function's list is added to its processor's.
+On Thumb the build's list carries the unit `-mfpu` named, and on RISC-V the extensions its triple
+names, and LLVM *replaces* a build's list with a function's — so there the manifest says it, for the
+whole image:
+
+```sysl target=thumb-freestanding
+@extensions("dsp")
+step(x: u32) -> u32 = x
+
+@export("main")
+start() -> i32 = i32(step(1))
+```
+
+```error
+'@extensions' is accepted on aarch64 and x86_64, where a function's extensions add to its processor's, and this build is for 'thumb-freestanding'
+```
+
+It marks a function or a method, whose body is sysl; an `extern`'s instructions are its compiler's.
+A name is written alone, as `codegen.extensions` writes it: `"+crc"`, `"crc,aes"` and an empty list
+are refused.
+
 ## `@no_fuse` — multiplies and adds rounded apart
 
 **A float multiply feeding an add in the same expression is one fused multiply-add** wherever the
@@ -3829,8 +3983,11 @@ print(squares)
 ```
 
 The block is lexical: a closure or a nested function written inside it is inside it, and one called
-from inside but written elsewhere is not. It takes no argument, and it does not mark a function, a
-member or a single statement on the same line:
+from inside but written elsewhere is not. Bare, it takes no argument — with the names of processor
+extensions in parentheses, `@unchecked("crc")`, it is the other block, which lets a call of a
+function [compiled for them](#extensions-a-body-compiled-for-instructions-the-build-does-not-promise)
+be made and leaves every subscript checked. It does not mark a function, a member or a single
+statement on the same line:
 
 ```sysl
 @unchecked
@@ -6358,7 +6515,8 @@ pointer (`codegen { thread_pointer = "tpidr_el0" }`). It is false on a board and
 no such setting. It is the one symbol the target alone does not settle, because the register is the
 program's to name; the compiler reads it before the first condition, a dependency's `if` included.
 
-**`crc32c` is true exactly where an `extern` naming a CRC-32C instruction is accepted**
+**`crc32c` is true exactly where the build promises the CRC-32C instructions everywhere**, so a call
+of an `extern` naming one needs neither an `@extensions` caller nor an `@unchecked("crc")` block
 ([ffi](/reference/ffi/)). The instructions are optional on both machines that have them: AArch64
 makes them mandatory only from Armv8.1, and SSE 4.2 is past the x86-64 baseline the x86 rows ask for.
 So the symbol is true on `aarch64-macos`, whose every processor has them, and elsewhere only where the

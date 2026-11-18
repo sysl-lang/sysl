@@ -620,7 +620,8 @@ ceremony the language charges. A struct with no fields is the exception and **mu
   the call in something it built takes `&self`; a read-only accessor may take `self`.
 - Use a `weak T` for the edge back to a parent, or counting cannot collect the cycle.
 - A closure crossing a concurrency domain is a `&sync Fn`, and what it may capture is checked: a
-  scalar, an array, a `&sync T` and a `*T` yes; a `string`, a slice or an ordinary `&T` no. A named
+  scalar, an array, a `&sync T`, a `*T` and a `string` (copied into bytes with an atomic count where
+  the closure is made) yes; a slice or an ordinary `&T` no. A named
   function reads into one **bare** — `Job(no_job)`, never `&no_job`.
 
 **Traps to know before they bite.**

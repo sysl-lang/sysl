@@ -281,10 +281,22 @@ private one_write(cx: &Analyzer, op: string, target: Expr, place: TExpr, part: O
     end if
 
     val bin = op[0..<op.bytes.len - 1]
+
+    // `r op= v` on a `&T` is `r = r op v` (`expr_assign.sysl`'s `update_through`), a store of a new
+    // value rather than an update in place, which a write of several places at once does not make.
+    if reads_through(texpr_type(place)) && core_infix(bin).is_some()
+        cx.fault(written.span, s"'$op' on ${describe_target(target)}, held as " +
+                 s"${type_show(texpr_type(place))}, stores a new value rather than updating one in place " +
+                 s"— write it out as 'x = x $bin v'")
+
+        return TWrite(place, op, bad_expr(written.span), None, arm_checks(cx, place), None)
+    end if
+
     val want = scale_expectation(bin, texpr_type(place), written, update_expected_for(cx, bin, texpr_type(place), written))
     val read = arm_value_at(cx, part, written, want)
     val tv = updated_by_value(cx, bin, texpr_type(place),
-                              widened_operand(cx, written.span, bin, texpr_type(place), read,
+                              widened_operand(cx, written.span, bin, texpr_type(place),
+                                              update_operand(cx, bin, texpr_type(place), read),
                                               if part.is_none() then Some(written) else None))
 
     if operand_refused(read, tv) then return TWrite(place, op, tv, None, arm_checks(cx, place), None)
@@ -560,6 +572,15 @@ pattern_names(out: *Buf[string], p: Pattern)
 // descend into each.
 private bind_pattern(cx: &Analyzer, span: Span, p: Pattern, subject: TExpr,
                      mutable: bool) -> Buf[TStmt]
+    // A shape reaches through a `&T` here as in an arm: `val Point(x, y) = p` over a `&Point` takes
+    // apart what `p` holds, each part a copy, as `val Point(x, y) = *p` would.
+    val held = repr(texpr_type(subject)) match
+        Ref(inner, _) if !erased(texpr_type(subject)) && takes_apart(p) -> Some(*inner)
+        _ -> None
+
+    if held.is_some() then return bind_pattern(cx, span, p, TExpr(subject.span, TDeref(subject, held.unwrap())),
+                                               mutable)
+
     *p.kind match
         WildcardPattern -> buf()
 
@@ -611,6 +632,12 @@ private bind_pattern(cx: &Analyzer, span: Span, p: Pattern, subject: TExpr,
                      "declared, and a binding has no other arm to take when the value turns out " +
                      s"to differ; write '$n' to bind a new name")
             buf()
+
+private takes_apart(p: Pattern) -> bool = *p.kind match
+    TuplePattern(args) -> !args.is_empty()
+    StructPattern(_, _) -> true
+    VariantPattern(_, _) -> true
+    _ -> false
 
 private cannot_test(cx: &Analyzer, span: Span) -> Buf[TStmt]
     cx.fault(span, "a binding cannot test a value — this pattern matches only some values, and a " +

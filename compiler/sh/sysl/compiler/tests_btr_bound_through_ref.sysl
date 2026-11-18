@@ -12,7 +12,8 @@ import sysl.text.replace_all
 // referent's members exactly as a member call written on the reference does. The traits a call on a
 // reference does NOT reach through are refused, each with its reason: through a `*T`, `Eq` and
 // `Hash`, which a pointer meets by its address (a `&T` meets them through its referent:
-// `tests_req_reference_eq.sysl`); an operator's trait; a member naming `Self` away from its receiver; an associated
+// `tests_req_reference_eq.sysl`); through a `*T`, an operator's trait (a `&T` meets it through its
+// referent: `tests_otr_operators_through_ref.sysl`); a member naming `Self` away from its receiver; an associated
 // function; `&self` through a raw pointer; a compiler family; and a second level of reference.
 //
 // Skipped cells: bare metal and separate compilation, since nothing new is emitted -- the
@@ -367,33 +368,42 @@ btr_refused_two_levels()
         """, "but &&Buf[int] does not — Buf[int] does, two levels in — a bound sees " +
              "through one level of reference, as a member call does, so pass '*x'")
 
-@test("Ord is refused at a reference: it is an operator's, and '<' does not see through one")
-btr_refused_ord()
+@test("Ord is met at a reference through its referent, and refused at a pointer, whose order is its address's")
+btr_ord_through_reference()
     if !btr_ready() then return
 
-    btr_refused(btr_n() + raw"""
+    val ord = raw"""
         impl Ord for N
             lt(self, rhs: N) -> bool = self.v < rhs.v
 
         least[T: Ord](a: T, b: T) -> bool = a < b
+        """
 
+    btr_prints(btr_n() + ord + raw"""
         main()
             val n: &N = N(1)
-            print(least(n, n))
-        """, "but &N does not — N implements it, but 'PartialOrd' is an operator's, and an operator does " +
-             "not see through a reference")
+            val m: &N = N(2)
+            print(least(n, m), least(m, n))
+        """, "true false\n")
 
-@test("an operator trait at explicit arguments is refused at a reference too (Add[int] at &int)")
-btr_refused_add_and_family()
+    btr_refused(btr_n() + ord + raw"""
+        main()
+            val n: *N = null
+            print(least(n, n))
+        """, "but *N does not — N implements it, but 'PartialOrd' is an operator's, and an operator does " +
+             "not see through a pointer")
+
+@test("an operator trait at explicit arguments is met at a reference to a scalar (Add[int] at &int)")
+btr_add_and_family()
     if !btr_ready() then return
 
-    btr_refused(btr_n() + raw"""
-        plus[T: Add[int]](a: T) -> int = 0
+    btr_prints(btr_n() + raw"""
+        plus[T: Add[int, int]](a: T) -> int = a + 1
 
         main()
             val i: &int = 3
             print(plus(i))
-        """, "'plus' requires its type parameter 'T' to implement 'Add[int]', but &int does not")
+        """, "4\n")
 
     btr_refused(btr_n() + raw"""
         whole[T: Integer](a: T) -> int = 0
