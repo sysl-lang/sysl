@@ -1,0 +1,302 @@
+module sysl.math.bigint
+
+// Multiplication: schoolbook below a threshold, Karatsuba above it.
+//
+// **Schoolbook is one row per limb of the shorter operand**, each row an `addmul_1` over the longer
+// one -- quadratic, and the fastest there is for small operands because each step is a multiply and
+// two adds with nothing to set up.
+//
+// **Karatsuba** (Karatsuba and Ofman, 1962; Knuth, *The Art of Computer Programming* volume 2,
+// §4.3.3) splits each operand at `k` limbs, `a = a1 B^k + a0` and `b = b1 B^k + b0`, and gets the
+// product from THREE half-size products where schoolbook would take four:
+//
+//     z0 = a0 b0        z2 = a1 b1        z1 = (a0 + a1)(b0 + b1) - z0 - z2
+//     a b = z2 B^(2k) + z1 B^k + z0
+//
+// Applied recursively that is `n^log2(3)`, about `n^1.585`, against `n^2`. It costs additions and
+// temporaries that schoolbook does not, which is what the threshold is for: below it the three
+// products are each too small for the saving to pay for the sums.
+//
+// **An unbalanced pair is cut into balanced pieces first.** Karatsuba wants operands of similar
+// length; where the shorter would not reach past the longer's split, the longer is taken a
+// shorter-operand-sized piece at a time, each piece multiplied (by whichever route its size
+// chooses) and added in at its offset.
+
+/** The shorter operand's length at which Karatsuba starts to beat schoolbook. Measured on an Apple
+ * M-series core with 64-bit limbs; the crossover is broad, so the exact value matters little.
+ */
+private[bigint] val karatsuba_threshold: usize = 32
+
+/** The shorter operand's length at which Toom-3 takes over from Karatsuba. */
+private[bigint] val toom_threshold: usize = 160
+
+/** `a * b` as a magnitude. Allocates the product's limbs. */
+private[bigint] mul_mag(a: []const Limb, b: []const Limb) -> []const Limb
+    if a.len == 0 || b.len == 0 then return empty()
+    if a.len < b.len then return mul_mag(b, a)
+
+    var out = fresh(a.len + b.len)
+
+    mul_into(out, a, a.len, b, b.len)
+    finished(out, a.len + b.len)
+end mul_mag
+
+/** `r[0..<an + bn] = a[0..<an] * b[0..<bn]`, for `an >= bn >= 1`. Writes every limb of that run.
+ * `r` must not overlap `a` or `b`.
+ */
+private[bigint] mul_into(r: []Limb, a: []const Limb, an: usize, b: []const Limb, bn: usize)
+    if bn < karatsuba_threshold
+        schoolbook(r, a, an, b, bn)
+    elif bn * 2 <= an + 1
+        unbalanced(r, a, an, b, bn)
+    elif bn >= toom_threshold && bn > ((an + 2) / 3) * 2
+        toom3(r, a, an, b, bn)
+    else
+        karatsuba(r, a, an, b, bn)
+
+/** Schoolbook: the first row is a plain multiply, which is what saves zeroing `r` first. */
+private schoolbook(r: []Limb, a: []const Limb, an: usize, b: []const Limb, bn: usize)
+    r[an] = mul_1(r, a, an, b[0])
+
+    for j in 1..<bn
+        r[an + j] = addmul_1(r[j..], a, an, b[j])
+
+/** `a` taken `bn` limbs at a time, each piece multiplied by `b` and added in at its offset. Each
+ * piece's product reaches `bn` limbs past the end of the one before it, so the part it adds into is
+ * the previous product's top half and the rest is still the zeros it was cleared to.
+ */
+private unbalanced(r: []Limb, a: []const Limb, an: usize, b: []const Limb, bn: usize)
+    for i in 0..<(an + bn) do r[i] = 0
+
+    var t = fresh(bn * 2)
+    var at: usize = 0
+
+    while at < an
+        val c = if an - at < bn then an - at else bn
+
+        if c >= bn then mul_into(t, a[at..], c, b, bn) else mul_into(t, b, bn, a[at..], c)
+
+        // No carry comes out of the run: what it holds is `a[0..<at + c] * b`, which is less than
+        // `B^(at + c + bn)`.
+        add_n(r[at..], r[at..], t, c + bn)
+
+        at += c
+end unbalanced
+
+/** Karatsuba for `an >= bn > ceil(an / 2)`, split at `k = ceil(an / 2)`, so that `b` reaches past
+ * the split and both halves of each operand are non-empty.
+ */
+private karatsuba(r: []Limb, a: []const Limb, an: usize, b: []const Limb, bn: usize)
+    val k = (an + 1) / 2
+    val ah = an - k
+    val bh = bn - k
+
+    // z0 into the bottom `2k` limbs of `r` and z2 into the rest, which is exactly where they belong.
+    mul_into(r, a, k, b, k)
+
+    if ah >= bh
+        mul_into(r[k * 2..], a[k..], ah, b[k..], bh)
+    else
+        mul_into(r[k * 2..], b[k..], bh, a[k..], ah)
+
+    // The two sums, each `k` limbs plus a carry limb.
+    var sa = fresh(k + 1)
+    var sb = fresh(k + 1)
+
+    sa[k] = add_n(sa, a, a[k..], ah)
+    if ah < k then sa[k] = add_1(sa[ah..], a[ah..], k - ah, sa[k])
+    sb[k] = add_n(sb, b, b[k..], bh)
+    if bh < k then sb[k] = add_1(sb[bh..], b[bh..], k - bh, sb[k])
+
+    // The sum's top limb is 0 or 1. Multiplying the `k`-limb parts and adding the cross terms by
+    // hand keeps the recursion at `k` limbs instead of `k + 1`, which matters where `k` is just
+    // over a power of two.
+    val zn = k * 2 + 2
+    var z1 = fresh(zn)
+
+    mul_into(z1, sa, k, sb, k)
+    z1[k * 2] = 0
+    z1[k * 2 + 1] = 0
+
+    if sa[k] != 0
+        val c = add_n(z1[k..], z1[k..], sb, k)
+        z1[k * 2] += c
+    if sb[k] != 0
+        val c = add_n(z1[k..], z1[k..], sa, k)
+        z1[k * 2] += c
+    if sa[k] != 0 && sb[k] != 0 then z1[k * 2] += 1
+
+    // z1 - z0 - z2, which is non-negative: it is a0 b1 + a1 b0.
+    val zb = sub_n(z1, z1, r, k * 2)
+
+    sub_1(z1[k * 2..], z1[k * 2..], 2, zb)
+
+    val top = ah + bh
+    val zt = sub_n(z1, z1, r[k * 2..], top)
+
+    sub_1(z1[top..], z1[top..], zn - top, zt)
+
+    // Added in at `k`. Its true length is at most what is left of `r` above `k`.
+    val room = an + bn - k
+    val n = if zn < room then zn else room
+    val c = add_n(r[k..], r[k..], z1, n)
+
+    if n < room then add_1(r[k + n..], r[k + n..], room - n, c)
+end karatsuba
+
+// -- Toom-3 ----------------------------------------------------------------------------------------
+//
+// **Toom-Cook in three pieces** (Toom 1963, Cook 1966; Knuth §4.3.3) cuts each operand into thirds,
+// `a = a2 x^2 + a1 x + a0` at `x = B^k`, and gets the product -- a polynomial of degree four -- from
+// its values at five points, `0, 1, -1, -2` and infinity: FIVE products of a third the size where
+// Karatsuba would take nine. That is `n^log3(5)`, about `n^1.465`. Turning the five values back into
+// the five coefficients is a fixed sequence of additions, halvings and one exact division by three;
+// the one used here is Bodrato's ("Towards Optimal Toom-Cook Multiplication for Univariate and
+// Multivariate Polynomials in Characteristic 2 and 0", WAIFI 2007), which is GMP's.
+//
+// The values at `-1` and `-2` can be negative, so the evaluation and interpolation are done in
+// `BigInt`s, sign and all; the five products recurse through `mul` and so through whichever
+// algorithm their size chooses.
+
+/** Toom-3 for a balanced pair, `b` reaching into `a`'s top third. */
+private toom3(r: []Limb, a: []const Limb, an: usize, b: []const Limb, bn: usize)
+    val k = (an + 2) / 3
+    val a0 = piece(a, 0, k)
+    val a1 = piece(a, k, k * 2)
+    val a2 = piece(a, k * 2, an)
+    val b0 = piece(b, 0, k)
+    val b1 = piece(b, k, k * 2)
+    val b2 = piece(b, k * 2, bn)
+
+    // The values at the five points.
+    val ae = add(a0, a2)
+    val be = add(b0, b2)
+    val r0 = mul(a0, b0)
+    val r1 = mul(add(ae, a1), add(be, b1))
+    val rm1 = mul(sub(ae, a1), sub(be, b1))
+    // At -2 each operand is `4 a2 - 2 a1 + a0`, written `2 (2 a2 - a1) + a0`.
+    val rm2 = mul(add(shl(sub(shl(a2, 1), a1), 1), a0), add(shl(sub(shl(b2, 1), b1), 1), b0))
+    val rinf = mul(a2, b2)
+
+    // Bodrato's interpolation: every division in it is exact.
+    val (t3, _) = div_rem_long(sub(rm2, r1), 3)
+    val t1 = shr(sub(r1, rm1), 1)
+    var t2 = sub(rm1, r0)
+    val c3 = add(shr(sub(t2, t3), 1), shl(rinf, 1))
+
+    t2 = sub(add(t2, t1), rinf)
+
+    val c1 = sub(t1, c3)
+    val kb = k * limb_bits
+    val total = add(add(add(r0, shl(c1, kb)), add(shl(t2, kb * 2), shl(c3, kb * 3))), shl(rinf, kb * 4))
+
+    for i in 0..<(an + bn) do r[i] = 0
+
+    copy_n(r, total.mag, total.mag.len)
+end toom3
+
+/** The limbs of `x` from `lo` up to `hi` (or its end), as a non-negative value -- with the zeros at
+ * its top dropped, since a piece cut from the middle of a magnitude can have them and a `BigInt`
+ * with them would compare by the wrong length.
+ */
+private piece(x: []const Limb, lo: usize, hi: usize) -> BigInt
+    val top = if hi < x.len then hi else x.len
+
+    if lo >= top then return zero()
+
+    val run = x[lo..<top]
+
+    normalized(false, run[0..<top_of(run, run.len)])
+end piece
+
+// -- squaring --------------------------------------------------------------------------------------
+//
+// **A square is a product whose two operands are known to be equal**, and both algorithms have a
+// cheaper form for it. Schoolbook needs each cross product `a[i] a[j]` once rather than twice -- it is
+// summed once, doubled with a shift, and the diagonal `a[i]^2` added -- so about half the multiplies.
+// Karatsuba's three products are all squares themselves: `a0^2`, `a1^2` and `(a0 + a1)^2`. `pow`
+// and `mod_pow` square at every step, which is where this is taken.
+
+/** `a * a` as a magnitude. Allocates the square's limbs. */
+private[bigint] sqr_mag(a: []const Limb) -> []const Limb
+    if a.len == 0 then return empty()
+
+    var out = fresh(a.len * 2)
+
+    sqr_into(out, a, a.len)
+    finished(out, a.len * 2)
+end sqr_mag
+
+/** `r[0..<2n] = a[0..<n]^2`, for `n >= 1`. Writes every limb of that run; `r` must not overlap `a`. */
+private sqr_into(r: []Limb, a: []const Limb, n: usize)
+    if n < karatsuba_threshold
+        sqr_schoolbook(r, a, n)
+        return
+
+    val k = (n + 1) / 2
+    val h = n - k
+
+    sqr_into(r, a, k)
+    sqr_into(r[k * 2..], a[k..], h)
+
+    var s = fresh(k + 1)
+
+    s[k] = add_n(s, a, a[k..], h)
+    if h < k then s[k] = add_1(s[h..], a[h..], k - h, s[k])
+
+    // `(s' + t B^k)^2` for the sum's low `k` limbs `s'` and top limb `t` of 0 or 1:
+    // `s'^2 + 2 t s' B^k + t B^(2k)`.
+    val zn = k * 2 + 2
+    var z1 = fresh(zn)
+
+    sqr_into(z1, s, k)
+    z1[k * 2] = 0
+    z1[k * 2 + 1] = 0
+
+    if s[k] != 0
+        var c = add_n(z1[k..], z1[k..], s, k)
+
+        c += add_n(z1[k..], z1[k..], s, k)
+        z1[k * 2] = c + 1
+
+    // z1 - z0 - z2, which is `2 a0 a1`.
+    val zb = sub_n(z1, z1, r, k * 2)
+
+    sub_1(z1[k * 2..], z1[k * 2..], 2, zb)
+
+    val zt = sub_n(z1, z1, r[k * 2..], h * 2)
+
+    sub_1(z1[h * 2..], z1[h * 2..], zn - h * 2, zt)
+
+    val room = n * 2 - k
+    val m = if zn < room then zn else room
+    val c = add_n(r[k..], r[k..], z1, m)
+
+    if m < room then add_1(r[k + m..], r[k + m..], room - m, c)
+end sqr_into
+
+/** Schoolbook squaring: the cross products once each, doubled, then the diagonal added. */
+private sqr_schoolbook(r: []Limb, a: []const Limb, n: usize)
+    for i in 0..<(n * 2) do r[i] = 0
+
+    // Row `i` adds `a[i] a[j]` for every `j > i` at place `i + j`; its carry lands at `i + n`, which
+    // no earlier row reached.
+    for i in 0..<(n - 1)
+        r[n + i] = addmul_1(r[i * 2 + 1..], a[i + 1..], n - i - 1, a[i])
+
+    if n > 1 then lshift(r, r, n * 2, 1)
+
+    var carry: Wide = 0
+
+    @unchecked
+        for i in 0..<n
+            val p = Wide(a[i]) * Wide(a[i])
+            val s0 = Wide(r[i * 2]) + (p & limb_mask) + carry
+
+            r[i * 2] = low_limb(s0)
+
+            val s1 = Wide(r[i * 2 + 1]) + (p >> limb_bits) + (s0 >> limb_bits)
+
+            r[i * 2 + 1] = low_limb(s1)
+            carry = s1 >> limb_bits
+end sqr_schoolbook

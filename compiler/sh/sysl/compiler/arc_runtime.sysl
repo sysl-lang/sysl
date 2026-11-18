@@ -147,7 +147,9 @@ arc_core(t: Target, reaper_exported: bool, switches: bool = false) -> string
     // **`arc.reap` is kept out of line and declared rare**, which is what makes a release cheap
     // wherever one is emitted: a release is a decrement and a test, and only the test succeeding
     // reaches the worklist. Inlinable, the drain loop would be copied into every release site.
-    "define private void @arc.reap(ptr %p) noinline cold {\n" +
+    // **It is `internal`, not `private`, so that it has a symbol**: a private function is a temporary
+    // label in the object, and a profile charges its samples to whatever symbol precedes it.
+    "define internal void @arc.reap(ptr %p) noinline cold {\n" +
     "entry:\n" +
     s"$fetch_slot  %head = getelementptr %arc.reaper, ptr $slot, i32 0, i32 0\n" +
     s"  %flag = getelementptr %arc.reaper, ptr $slot, i32 0, i32 1\n" +
@@ -337,9 +339,121 @@ end arc_atomic
 
 // The null-tolerant pair, emitted only into a module that holds a view of something.
 //
-// Alone among the four blocks this one names no count, so it needs no width: it is a null check and
-// a delegation, and the two functions it calls are the ones that know how wide a count is.
-arc_maybe() -> string =
+// **A view's owner may be SHARED: its count's top bit set, and every change to it atomic.** A string
+// placed in an object two domains reach -- captured by a `&sync Fn`, a field of a `&sync T` -- is
+// copied there into bytes of its own whose count is marked so (`emit_cross.sysl`'s `share.copy`), and
+// every view of those bytes, a slice of the string included, shares that owner. The mark is set once,
+// before the object is published, and never cleared while the owner lives, so the test that reads it
+// needs no ordering: an unordered load, which is the plain load the count's change reads anyway. A
+// count that is not marked is changed as it always was. Taking a share of a marked one is a relaxed
+// increment, and giving one back a release decrement with an acquire before the teardown, exactly as a
+// `&sync T`'s (`arc_atomic`); the last share is the mark plus one.
+//
+// **Where the processor cannot change a word indivisibly (Armv6-M) nothing is ever marked**, so the
+// pair is the plain one and makes no call no board's runtime defines; `share.copy` still copies there.
+arc_maybe(t: Target, tsan: bool = thread_sanitized(extra_cflags())) -> string
+    val word = word_llvm(t)
+
+    if !marks_shared(t) then return arc_maybe_plain(word)
+
+    val align = t.pointer_bits() / 8
+    val mark = shared_mark(t.pointer_bits())
+    val last = shared_last(t.pointer_bits())
+    var acquire = "  fence acquire\n"
+
+    if tsan then acquire = s"  %a = load atomic $word, ptr %p acquire, align $align\n"
+
+    "define private void @arc.retain_maybe(ptr %p) {\n" +
+    "entry:\n" +
+    "  %null = icmp eq ptr %p, null\n" +
+    "  br i1 %null, label %done, label %live\n" +
+    "live:\n" +
+    s"  %c = load atomic $word, ptr %p unordered, align $align\n" +
+    s"  %shared = icmp slt $word %c, 0\n" +
+    "  br i1 %shared, label %atomic, label %plain\n" +
+    "plain:\n" +
+    s"  %n = add $word %c, 1\n" +
+    s"  store $word %n, ptr %p\n" +
+    "  ret void\n" +
+    "atomic:\n" +
+    s"  %o = atomicrmw add ptr %p, $word 1 monotonic\n" +
+    "  ret void\n" +
+    "done:\n" +
+    "  ret void\n" +
+    "}\n" +
+    "\n" +
+    "define private void @arc.release_maybe(ptr %p) {\n" +
+    "entry:\n" +
+    "  %null = icmp eq ptr %p, null\n" +
+    "  br i1 %null, label %done, label %live\n" +
+    "live:\n" +
+    s"  %c = load atomic $word, ptr %p unordered, align $align\n" +
+    s"  %shared = icmp slt $word %c, 0\n" +
+    "  br i1 %shared, label %atomic, label %plain\n" +
+    "plain:\n" +
+    s"  %n = sub $word %c, 1\n" +
+    s"  store $word %n, ptr %p\n" +
+    s"  %z = icmp eq $word %n, 0\n" +
+    "  br i1 %z, label %reap, label %done\n" +
+    "atomic:\n" +
+    s"  %o = atomicrmw sub ptr %p, $word 1 release\n" +
+    s"  %last = icmp eq $word %o, $last\n" +
+    "  br i1 %last, label %acquired, label %done\n" +
+    "acquired:\n" +
+    acquire +
+    "  br label %reap\n" +
+    "reap:\n" +
+    "  call void @arc.reap(ptr %p)\n" +
+    "  ret void\n" +
+    "done:\n" +
+    "  ret void\n" +
+    "}\n" +
+    "\n" +
+    "define private i1 @arc.share_wanted(ptr %p) {\n" +
+    "entry:\n" +
+    "  %null = icmp eq ptr %p, null\n" +
+    "  br i1 %null, label %no, label %live\n" +
+    "live:\n" +
+    s"  %c = load atomic $word, ptr %p unordered, align $align\n" +
+    s"  %plain = icmp sge $word %c, 0\n" +
+    "  ret i1 %plain\n" +
+    "no:\n" +
+    "  ret i1 false\n" +
+    "}\n" +
+    "\n" +
+    "define private void @arc.mark_shared(ptr %p) {\n" +
+    "entry:\n" +
+    "  %null = icmp eq ptr %p, null\n" +
+    "  br i1 %null, label %done, label %live\n" +
+    "live:\n" +
+    s"  %c = load $word, ptr %p\n" +
+    s"  %m = or $word %c, $mark\n" +
+    s"  store $word %m, ptr %p\n" +
+    "  ret void\n" +
+    "done:\n" +
+    "  ret void\n" +
+    "}\n" +
+    "\n"
+end arc_maybe
+
+// Whether a view's owner is ever marked shared on `t`: where a word can be changed indivisibly.
+marks_shared(t: Target) -> bool = t.atomic_rmw_bits() >= int(t.pointer_bits())
+
+// The mark, and the count a marked owner's last share leaves, as LLVM spells a word's constant:
+// signed, so the top bit alone is the most negative word.
+private shared_mark(bits: usize) -> string = bits match
+    16 -> "-32768"
+    32 -> "-2147483648"
+    _ -> "-9223372036854775808"
+
+private shared_last(bits: usize) -> string = bits match
+    16 -> "-32767"
+    32 -> "-2147483647"
+    _ -> "-9223372036854775807"
+
+// The pair where nothing is marked: a null check and a delegation. A copy `share.copy` makes is
+// wanted for every view with an owner, and is not marked.
+private arc_maybe_plain(word: string) -> string =
     "define private void @arc.retain_maybe(ptr %p) {\n" +
     "entry:\n" +
     "  %null = icmp eq ptr %p, null\n" +
@@ -359,6 +473,17 @@ arc_maybe() -> string =
     "  call void @arc.release(ptr %p)\n" +
     "  ret void\n" +
     "done:\n" +
+    "  ret void\n" +
+    "}\n" +
+    "\n" +
+    "define private i1 @arc.share_wanted(ptr %p) {\n" +
+    "entry:\n" +
+    "  %some = icmp ne ptr %p, null\n" +
+    "  ret i1 %some\n" +
+    "}\n" +
+    "\n" +
+    "define private void @arc.mark_shared(ptr %p) {\n" +
+    "entry:\n" +
     "  ret void\n" +
     "}\n" +
     "\n"

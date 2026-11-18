@@ -144,9 +144,12 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
     // Which function each closure was written in, for the error return trace's sites.
     trace_closure_owners(e, p)
 
-    // The operator methods a call may be read as (`fp_operators.sysl`).
+    // The operator methods a call may be read as (`fp_operators.sysl`) -- never a `@no_fuse` one, whose
+    // body keeps its multiplies apart wherever it is called from (`no_fuse.sysl`).
     for i in 0..<p.funcs.len()
-        if p.funcs[i].marks.operator then e.operators.put(p.funcs[i].name, p.funcs[i])
+        val f = p.funcs[i]
+
+        if f.marks.operator && !f.marks.no_fuse then e.operators.put(f.name, f)
 
     // The bodies whose floating point is strict, and what they call as an intrinsic
     // (`emit_strict_fp.sysl`).
@@ -558,7 +561,7 @@ private runtime_bundles(e: *Emit, t: Target, bounds_overridden: bool, trap_overr
         out.push(RtTemplate("arc.core", arc_core(t, reaper_overridden, switches)))
     end if
     if e.sync_heap then out.push(RtTemplate("arc.atomic", arc_atomic(t)))
-    if e.maybe_heap then out.push(RtTemplate("arc.maybe", arc_maybe()))
+    if e.maybe_heap then out.push(RtTemplate("arc.maybe", arc_maybe(t)))
     if e.weak_heap then out.push(RtTemplate("arc.weak", arc_weak(t)))
 
     // The weak defaults a failure reports through -- each unless this module's own `@export` is
@@ -676,7 +679,8 @@ private const ImportLimit: usize = 48
 // What a body longer than `ImportLimit` raw instructions may cost the optimizer (`body_cost`) and
 // still be copied: LLVM's `-O2` inline threshold (225) over its cost per instruction (5), which is
 // what its own inliner would admit of the same body once the stack slots are registers. A PCG step,
-// `Rng.next_u32`, costs 33 and is the case that a limit of the codegen units' 32 refused.
+// `Rng.next_u32`, is the case that a limit of the codegen units' 32 refused while its constant shifts
+// were charged their guards.
 private const ImportCost: usize = 45
 
 // A body longer than `ImportLimit` raw instructions is printed and costed (`body_cost`) only up to
@@ -1097,14 +1101,6 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
 
         fact_params.push(ir_param(l_i1()))
         out.push(declared_sig(e,llvm_assume(), ir_fn_type(LVoid, fact_params)))
-
-    // The hint an enum walk's tag test carries (`arc_fastpath.sysl`).
-    if e.uses_expect
-        var hint_params: Buf[IrParam] = buf()
-
-        hint_params.push(ir_param(l_i1()))
-        hint_params.push(ir_param(l_i1()))
-        out.push(declared_sig(e, llvm_expect_i1(), ir_fn_type(l_i1(), hint_params)))
 
     // **A symbol this module has already stated is not stated again**, whether the first statement
     // was a declaration or a definition: LLVM refuses a second `declare` of a name at a signature of
