@@ -140,8 +140,8 @@ struct Emit
 
     // The destructor each type that has one is filed under, read straight off the program. A hook
     // is built from a type with no call site anywhere near it, so this has to be here rather than
-    // handed down from a caller.
-    destructors: Buf[(string, string)]
+    // handed down from a caller. The third part is whether it takes `*self`.
+    destructors: Buf[(string, string, bool)]
 
     // Whether anything in this module put an object on the heap, took an atomic count, held a weak
     // reference, or counted against an owner that may be absent. Each decides one block of the
@@ -461,6 +461,10 @@ struct Emit
     reassoc_here: Buf[Span]
     reassoc_whole: bool
 
+    // Whether the body being written keeps every multiply apart from the add it feeds -- marked
+    // `@no_fuse`, written inside such a body, or in a module whose header says it (`no_fuse.sysl`).
+    fuse_off: bool
+
     // The extensions each function is compiled for, by key: every one marked `@extensions` and every
     // closure and nested function written inside one (`extensions.sysl`).
     ext_fns: Map[string, Buf[string]]
@@ -609,13 +613,13 @@ end GenFall
 // An emitter for one module, with no function open, and no program behind it -- which is what a
 // test asserting on one instruction wants.
 emitter(t: Target) -> Emit
-    var none: Buf[(string, string)] = buf()
+    var none: Buf[(string, string, bool)] = buf()
 
     emitter_for(t, none)
 end emitter
 
 // The same, over a program whose destructors a hook has to be able to ask about.
-emitter_for(t: Target, destructors: Buf[(string, string)]) -> Emit
+emitter_for(t: Target, destructors: Buf[(string, string, bool)]) -> Emit
     var globals: Buf[IrGlobal] = buf()
     var sat_decls: Buf[IrFuncSig] = buf()
     var prologue: Buf[Inst] = buf()
@@ -665,7 +669,7 @@ emitter_for(t: Target, destructors: Buf[(string, string)]) -> Emit
          no_wrap_none(), map(), buf(), Leaving, false, "", set(), buf(), map(), map(), 0, moves_none(), set(), set(), set(), set(),
          set(), map(), 0, map(), set(), map(), false, set(), map(), set(), false, false, false, buf(), set(),
           "", set(), false, None, None, set(), None, map(), false, buf(), buf(), buf(), false, set(), None,
-          buf(), buf(), false, map())
+          buf(), buf(), false, false, map())
 end emitter_for
 
 // -- what a body could not say --------------------------------------------------------------------
@@ -694,6 +698,7 @@ start_function(e: *Emit)
     e.src = None
     e.reassoc_here = buf()
     e.reassoc_whole = false
+    e.fuse_off = false
     e.in_tracked = false
     e.prologue.clear()
     e.regions.clear()

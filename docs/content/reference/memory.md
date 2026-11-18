@@ -179,7 +179,7 @@ true false false true
 ```
 
 **`===` and `!==` are identity**, always, and take two references or two pointers of one type and
-nothing else — an integer has no identity apart from its value, and a trait object is two words:
+nothing else — an integer has no identity apart from its value:
 
 ```sysl
 main()
@@ -189,6 +189,10 @@ main()
 ```error
 '===' compares the identity of two references or pointers, and int is neither — '==' compares its value
 ```
+
+A trait object's identity is the value it was made from, so it also meets an object over another
+trait, or a reference of the type it holds
+([traits](/reference/traits/#two-objects-compared-by-identity)).
 
 - **Where `T` has no `Eq`, a reference is its own identity**: `==` asks whether the two name one
   object, and the hash is the address's, so a `Map[&Node, V]` keys by identity — what a
@@ -204,7 +208,7 @@ main()
   than keyed wrongly. To key by identity where the referent defines equality, wrap the reference in
   `ByAddress`, whose `Eq` is `===` and whose `Hash` is the address's.
 - **A reference to a reference** compares as the inner reference does. **A trait object** (`&Shape`)
-  has no `==`. **A pointer compares and hashes by address**, whatever `T` defines. There is no ordering
+  has no `==`, and its `===` compares the objects. **A pointer compares and hashes by address**, whatever `T` defines. There is no ordering
   on a reference or a pointer. Its other bounds a reference meets through its referent
   ([generics](/reference/generics/#a-reference-meets-its-referent-s-bounds)).
 
@@ -1806,8 +1810,10 @@ print(halves())
 ## A destructor
 
 **`impl Drop for T` says what a type does when the last reference to one of its values goes.** It
-declares one member, `drop(self)`, answering nothing. It is for the resource the language does not
-manage — a descriptor, a mapped region, a handle a C library made — said once, beside the type:
+declares one member, `drop(*self)`, answering nothing, which an implementation writes `drop(self)`
+where a copy of the value will do ([below](#a-destructor-handed-its-own-storage)). It is for the
+resource the language does not manage — a descriptor, a mapped region, a handle a C library made —
+said once, beside the type:
 
 ```sysl
 struct Handle
@@ -1847,8 +1853,9 @@ the hooks it would call are not asked for.
 - **The order is Rust's**: locals in reverse order of declaration at the end of their block, each
   deferred statement in its written place among them; temporaries at the end of their statement;
   fields and elements in declaration and index order.
-- **`drop(self)` runs before the object's own fields are released**, sees `self` intact, and may not
-  resurrect it.
+- **`drop` runs before the object's own fields are released**, sees `self` intact, and may not
+  resurrect it. A `drop(*self)` is handed the object's own storage, and its fields are released as
+  it leaves them.
 - **A type with `Drop` is a reference type**, so only `&T` of it exists.
 - **A copy of a value retains its `&T` fields.**
 - **Cycles leak unless broken with `weak`.**
@@ -1989,6 +1996,53 @@ print(peek(Thing(2)))
   and the value it builds takes a share rather than becoming a second owner.
 - **It is not called for a value in a reference cycle**, nor **for module storage at exit**: there is
   no exit pass, so a buffered writer held in a static is flushed by the program.
+
+### A destructor handed its own storage
+
+**`drop(self)` is handed a copy; `drop(*self)` is handed the object itself.** A `(self)` method
+copies the value it is called on, and for a destructor that reads a field to close what it names, a
+copy is all it needs. A destructor that gives C back *the address of the object* — a node it linked
+into a C list, a key it registered, storage it must wipe before it is freed — needs the address every
+`(*self)` method saw while the object lived, and `drop(*self)` is handed exactly that:
+
+```sysl
+static var registered: usize = 0
+
+struct Key
+    bytes: [4]u8
+
+impl Key
+    register(*self)
+        registered = usize(self)
+
+impl Drop for Key
+    drop(*self)
+        print("same storage:", usize(self) == registered)
+        self.bytes = [0, 0, 0, 0]
+
+hold()
+    val k = Key([1, 2, 3, 4])
+
+    k.register()
+    print("holding", k.bytes[0])
+
+hold()
+```
+
+```output
+holding 1
+same storage: true
+```
+
+- **The trait declares `drop(*self)`, and a `drop(self)` stands for it** as a `(self)` member stands
+  for any trait's `(*self)` one ([traits](/reference/traits/)); neither form replaces the other.
+- **It is the same address wherever the object lives**: a box on the heap, one laid in a frame, one a
+  module `var` holds, one a field of another object holds.
+- **A write through it is the object's own.** A field it replaces is released once, as any
+  assignment's old value is, and the fields are released as the destructor leaves them, not as they
+  were when it was called.
+- **`drop(&self)` is refused**, as any receiver the trait does not declare: a `&self` would take a
+  share of an object whose count has already reached zero.
 
 ### When a value is dropped
 
@@ -2993,6 +3047,7 @@ none: `p[i]` and `p[0..<n]` are unchecked, as in C. A pointer to something with 
 | `usize(p)` | a pointer as a number | an ordinary conversion |
 | `ptr_cast(n)` | a number as a pointer | unsafe |
 | `ptr_cast(p)` | one pointee type as another | unsafe |
+| `xs.view_as[T]()` | a view's plain-data elements as other plain data, owner kept, boundary and tail checked | safe ([arrays](/reference/arrays/#reading-a-view-as-another-element)) |
 
 **`ptr_cast` is imported from `sysl.raw`**, beside `str_cast` and `str_alias`, so every
 reinterpretation is found by its imports; an alias, a wildcard and a module path reach it as they
@@ -3344,6 +3399,30 @@ wait_for(n: u64)
 - **`volatile` is not reserved** — special only before a type, as `sync` is after `&`. `[]const
   volatile u32` is a read-only register view: `const` is the view's property, `volatile` the
   element's.
+- **A `[]T` is accepted where a `[]volatile T` is wanted**, and an array where its view would be — the
+  same elements, every access through the new view an effect. It keeps the view's `const`: a
+  `[]const T`, a `val` array or a string's bytes reach only a `[]const volatile T`. It is never taken
+  away, and it goes one level only: a `[][]u8` is not a `[][]volatile u8`, whose slots could then be
+  handed a view of device memory that the `[][]u8` holder reads as ordinary memory. This is what
+  [`sysl.slices.zeroize`](/library/slices/#clearing-a-secret) is built on — a clearing of a buffer
+  nothing reads again, kept at `-O2`:
+
+```sysl
+clear(v: []volatile u8)
+    for i in 0..<v.len
+        v[i] = 0
+
+var key = [3u8, 1, 4]
+clear(key)
+print(key)
+```
+
+```output
+[0, 0, 0]
+```
+
+- **An array of qualified elements is filled from a literal** of the plain type, as a struct's
+  qualified field is from a constructor: `var bank: [4]volatile u32 = [1, 2, 3, 4]`.
 - **Memory a device reads by DMA is a library type**, [`sysl.dma`'s `Region`](/library/dma/), not a
   qualifier: it needs a device address and a cache-honest handover, neither a property of a place.
 

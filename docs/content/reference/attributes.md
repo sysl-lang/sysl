@@ -1,6 +1,6 @@
 ---
 title: Attributes, annotations, and compile time
-summary: `::` attributes a type answers, the nineteen annotations a function takes, the three that lay out or place what they mark, the five a file's header takes, `@assert` which stands on its own, and the `#if` directive that gates lines before the lexer sees them.
+summary: `::` attributes a type answers, the nineteen annotations a function takes, the three that lay out or place what they mark, the six a file's header takes, `@assert` which stands on its own, and the `#if` directive that gates lines before the lexer sees them.
 weight: 130
 ---
 
@@ -22,7 +22,7 @@ has a name and a spelling of its own:
 | `@renamed("...", "...")`, `@removed("...", "...")` | an **annotation** — the declaration under it is a tombstone, a name that is gone; see [`@renamed` and `@removed`](#renamed-and-removed-a-name-that-is-gone-and-what-became-of-it) | the grammar |
 | `@export("...")` on a module `var` or `val` | an **annotation** — the C symbol the storage is published under | the grammar |
 | `@export("...")` on a `const` or a simple `enum` | an **annotation** — the macro a generated C header defines for the value, or the prefix of one per variant; see [constants in the header](/reference/ffi/#constants-in-the-header) | the grammar |
-| `@no_alloc`, `@requires`, `@link`, `@include`, `@tests` | an **annotation** — a fact about the whole file, in its header | the grammar |
+| `@no_alloc`, `@requires`, `@link`, `@include`, `@tests`, `@no_fuse` | an **annotation** — a fact about the whole file, in its header | the grammar |
 | `@assert` | an **annotation** that describes nothing but itself — a condition settled while compiling | the analyzer, once |
 | `#if` | a **directive** — a gate on lines | a pass before the lexer |
 
@@ -67,15 +67,16 @@ three are below. The fourth is `@export`, which on a struct names the type in a 
 rather than placing it, and on a module `var` or `val` publishes the storage under a C symbol; both
 are on the [FFI](/reference/ffi/#exported-storage) page with the other half of themselves.
 
-**On the file** there are five, in its header directly below `module` and before everything else:
+**On the file** there are six, in its header directly below `module` and before everything else:
 `@no_alloc` and its siblings, `@requires(...)`, `@link("...")`, `@include("...")`, and `@tests`. The
 first two say what the whole module may do; `@link` says what its `extern`s need at the linker and
 `@include` what its `c const` and `c type` blocks need at the C compiler; the last says it is scaffolding
-for the module's tests. All five attach to the file rather than to any declaration in it — and
-writing one further down is refused with a message saying where it belongs, except `@no_alloc` above
-a function or a method, which holds that one definition instead (below). The first four are
-covered under [modules](/reference/modules/) and [FFI](/reference/ffi/), where what they *mean* is;
-`@tests` is below.
+for the module's tests; and `@no_fuse` says no multiply in the module is fused with the add it feeds.
+All six attach to the file rather than to any declaration in it — and writing one further down is
+refused with a message saying where it belongs, except `@no_alloc` and `@no_fuse` above a function
+or a method, which hold that one definition instead (below). The first four are covered under
+[modules](/reference/modules/) and [FFI](/reference/ffi/), where what they *mean* is; `@tests` and
+`@no_fuse` are below.
 
 **On nothing at all** there is one: `@assert`, which stands where a declaration stands and describes
 only itself. It attaches to nothing, declares no name, and nothing can refer to one — two saying the
@@ -734,7 +735,35 @@ main()
 **`@keeps(self)` lets an implementation hold the object the call went through** past the call — a
 view registering itself, say. The object may have been made in the caller's frame, so without the
 mark an implementation that keeps `self` is refused where it is written, and with it every call
-through an object hands over an object that may be kept:
+through an object hands over an object that may be kept. The refusal names the mark, because the
+trait's borrowed receiver is its whole cause — it says the same for what the method reads through
+`self` and keeps, and for `self` handed on to a function that keeps it:
+
+```sysl
+trait Widget
+    register(&self) -> int
+
+struct Label
+    f: &Fn() -> int
+
+impl Widget for Label
+    register(&self) -> int
+        shown = Some(self)
+        self.f()
+
+var shown: Option[&Label] = None
+
+main()
+    val w: &Widget = Label(() -> 1)
+
+    w.register()
+```
+
+```error
+or let every implementation keep it by writing '@keeps(self)' above the declaration of 'register' in 'Widget'
+```
+
+With the mark on the trait's method the same implementation is accepted:
 
 ```sysl
 trait Widget
@@ -3094,6 +3123,11 @@ the body across that wall** for:
 - every *small* function — a few statements' worth: an accessor, a comparison, a fixed-point
   multiply — whether marked or not.
 
+Small is measured by what the optimizer keeps of the body, not by its unoptimized length: the
+report and trap of a failed bounds or overflow check is a cold exit and does not count, and nor does
+the guard on a shift by a constant amount, which folds away. A getter that indexes an array and
+shifts the element is small.
+
 The calling module is given a copy of the body to inline (LLVM's `available_externally`) and never
 emits it, so the program still links the package's one definition, and a call the optimizer leaves
 out of line is the same call it always was. The copy is made from the package's source on every
@@ -3806,6 +3840,126 @@ start() -> i32 = i32(step(1))
 It marks a function or a method, whose body is sysl; an `extern`'s instructions are its compiler's.
 A name is written alone, as `codegen.extensions` writes it: `"+crc"`, `"crc,aes"` and an empty list
 are refused.
+
+## `@no_fuse` — multiplies and adds rounded apart
+
+**A float multiply feeding an add in the same expression is one fused multiply-add** wherever the
+machine fuses at that width ([expressions](/reference/expressions/#a-multiply-feeding-an-add-is-fused-where-the-machine-fuses)),
+rounded once. That is the more accurate answer, but not the one a program written for C's
+`-ffp-contract=off` checks its results against. `@no_fuse` on a function or a method turns fusing
+off for its body — C's `-ffp-contract=off`: every `a * b + c` there is a multiply, rounded, and then
+an add, rounded, at every optimization level:
+
+```sysl
+id(x: real) -> real = x
+
+@no_fuse
+apart(x: real, c: real) -> real = x * x + c
+
+fused(x: real, c: real) -> real = x * x + c
+
+var x = 1.0 + 1.0 / 1073741824.0
+var c = -(1.0 + 1.0 / 536870912.0)
+
+#if fma_dp
+val wanted = 1.0
+#else
+val wanted = 0.0
+#endif
+
+print(apart(x, c) * 1152921504606846976.0, fused(x, c) * 1152921504606846976.0 == wanted)
+```
+
+```output
+0 true
+```
+
+`x * x` is `1 + 2^-29 + 2^-60`, and `c` cancels all but the `2^-60`: fused, that is the answer;
+rounded first, it is gone. The function at the top is there for the header's reason below.
+
+**In a file's header it marks the whole module** — every function, method, closure and constant of
+it, and the initializers of its storage — and nothing outside it: a program using the module fuses
+its own arithmetic as before. Like a [capability](/reference/modules/), it is a property of the
+module, so every file of the module states it, and a file that does not is refused.
+
+```sysl
+module kernels
+@no_fuse
+
+advance(x: real, v: real, dt: real) -> real = x + v * dt
+```
+
+**The header is read first**, as it is for [`@no_alloc`](#no-alloc-on-a-function-one-entry-point-that-makes-no-heap-storage):
+`@no_fuse` on the first lines of a file is the module's clause even where a function follows it. A
+file whose first declaration is the one function it means writes something else above it — an
+`import`, another declaration — as the example at the top of this section does.
+
+### What it covers
+
+The region is the **body**, and everything the compiler makes of it:
+
+- **A closure or a nested function written inside** a marked body is unfused too; a function
+  *called* from inside but written elsewhere keeps its own rule.
+- **Every instantiation of a marked generic, and every copy of a marked member**, is unfused, and a
+  generic written in a `@no_fuse` module is unfused wherever it is instantiated.
+- **Inlined, the body stays unfused.** No operation in it carries anything that lets the optimizer
+  fuse it, so it stays two operations inside a caller that fuses; the caller's own sums around it are
+  fused as before.
+- **An [arithmetic operator](/reference/expressions/#an-arithmetic-operator-is-read-as-its-body)
+  marked `@no_fuse` is never read as its body** at a call: it stays a call, and its body is unfused.
+  A `@no_fuse` body reads no operator as its body either.
+- **A value worked out while compiling agrees.** A `const`, a module `val` laid down as data and a
+  `const` function's result are each computed with two roundings in a marked body or module, so the
+  value is the same whether the compiler or the program computed it.
+- **`x.mul_add(a, b)` is still one rounding.** It asks for the fused instruction by name, which is
+  not contraction; `@no_fuse` turns off only the fusing the compiler would choose on its own.
+
+```sysl
+id(x: real) -> real = x
+
+@no_fuse
+const apart(x: real, c: real) -> real = x * x + c
+
+const X = 1.0 + 1.0 / 1073741824.0
+const C = -(1.0 + 1.0 / 536870912.0)
+const A = apart(X, C)
+
+var x = X
+var c = C
+
+print(A == apart(x, c), A)
+```
+
+```output
+true 0
+```
+
+It composes with the other two float annotations. **Beside [`@reassociate`](#reassociate-float-sums-the-back-end-may-regroup)**
+— on one function, or a `@reassociate` block inside a `@no_fuse` body, or a `@no_fuse` function
+written inside a `@reassociate` one — sums are regrouped and every product is still rounded on its
+own: `@reassociate` licenses no fusing of its own. **Beside
+[`@strict_fp`](#strict-fp-floating-point-that-follows-the-environment-it-runs-in)** the body is its
+strict multiplies and strict adds, each following the environment, never a strict fused one.
+
+It takes no argument, and it marks a function, a method or a module — nothing else:
+
+```sysl
+id(x: real) -> real = x
+
+@no_fuse
+struct P
+    x: real
+```
+
+```error
+'@no_fuse' says how a body's multiplies and adds are compiled, so it marks a function or a method, whose body is sysl, or — in the file's header — the whole module
+```
+
+A closure takes no annotations; it is unfused when it is written inside a marked function.
+
+There is no per-build setting. Whether a body fuses is a fact about the arithmetic written in it —
+the results it is checked against — so it is said where that arithmetic is, as `@strict_fp` and
+`@reassociate` are, and a module that means it everywhere says it once in its header.
 
 ## `@unchecked` — a block whose subscripts are not bounds-checked
 
