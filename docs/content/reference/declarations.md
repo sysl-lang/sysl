@@ -2180,7 +2180,9 @@ position the candidates differ at holds a numeric literal with no suffix, and no
 chosen, the candidate whose parameter at each of those positions is the literal's default wins. A
 float literal's default is `real`. An integer literal's default is `int` at an integer parameter and
 `real` at a float one, since an integer literal is read as the float its position expects. So
-`nextafter(1.0, 2)`, which both the `real` and the `f32` declarations fit, means the `real` one:
+`nextafter(1.0, 2)`, which both the `real` and the `f32` declarations fit, means the `real` one.
+Arithmetic over bare literals counts as a literal here, as it does in the rule above, so
+`scale(2.0 * 3, 1)` is the `real` one too:
 
 ```sysl
 import sysl.math.nextafter
@@ -2189,17 +2191,33 @@ scale(x: f32, k: f32) -> string = "f32"
 scale(x: real, k: real) -> string = "real"
 
 print(scale(1.5, 2), scale(1, 2), scale(1.5f32, 2f32))
+print(scale(2.0 * 3, 1), scale(-(1.5 + 2), 1.0 / 4))
 print(nextafter(1.0, 2) > 1)
 ```
 
 ```output
 real real f32
+real real
 true
 ```
 
 The call stays ambiguous where an argument with a type of its own is part of the tie, where no
-candidate takes the literals at their defaults (`f32` beside `f128` at `2`), and where two do
-(`(int, real)` beside `(real, int)` at `(2, 2)`):
+candidate takes the literals at their defaults (`f32` beside `f128` at `2`, or at `2.0 * 3`), and
+where two do (`(int, real)` beside `(real, int)` at `(2, 2)`). Literal arithmetic beside a typed
+argument is no different from the literal: `scale(a, 2.0 * 3)` at an `f32` `a` is as ambiguous as
+`scale(a, 2.0)`:
+
+```sysl
+scale(x: f32, k: f32) -> string = "f32"
+scale(x: real, k: real) -> string = "real"
+
+val a = 1.5f32
+print(scale(a, 2.0 * 3))
+```
+
+```error
+'scale' is ambiguous here — 2 of its declarations take these arguments:
+```
 
 ```sysl
 scale(x: f32, k: f32) -> string = "f32"
