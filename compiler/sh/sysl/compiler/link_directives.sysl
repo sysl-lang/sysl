@@ -39,9 +39,9 @@ link_required(units: Buf[Program]) -> Buf[string]
         val links = item.links
 
         for j in 0..<links.len()
-            val name = links[j].name
+            val name = link_entry(links[j])
 
-            if link_complaint(name) == "" && !holds(out, name) then out.push(name)
+            if link_complaint(links[j].name) == "" && !holds(out, name) then out.push(name)
 
     out
 end link_required
@@ -56,6 +56,8 @@ end link_required
 // the files of a module it is not a repeat at all: each file states what its own `extern`s need, and
 // two files needing the same library is the ordinary case.
 read_link_directives(a: &Analysis, units: Buf[Program])
+    val os = a.tables.target.os
+
     for unit in units
         val scope = scope_of_unit(a, unit)
 
@@ -67,16 +69,33 @@ read_link_directives(a: &Analysis, units: Buf[Program])
 
             if why != "" then a.fault(scope, l.span, why)
 
+            // **A framework is a macOS thing.** Elsewhere there is no such linker flag, so it is
+            // refused rather than dropped: a binding that needs one says so inside `#if macos`,
+            // which loses nothing and leaves a Linux build of an unguarded one told why it cannot.
+            if l.framework && os != MacOS
+                a.fault(scope, l.span, s"'@link(framework: \"${l.name}\")' names a macOS framework, " +
+                        "and this target has none — gate it with '#if macos'")
+
             // Said once per name, at its second appearance -- a third says nothing a second did not.
             var earlier = 0
 
             for k in 0..<j
-                if unit.links[k].name == l.name then earlier += 1
+                if unit.links[k].name == l.name && unit.links[k].framework == l.framework
+                    earlier += 1
 
             if earlier == 1
                 a.fault(scope, l.span, s"'${l.name}' is already linked by this file, and asking " +
                         "twice links it once")
 end read_link_directives
+
+// What a directive is called in the list the command line is made from. **A framework is
+// `-framework <name>`**, which no library name can be, since a name beginning with a dash is refused.
+link_entry(l: LinkClause) -> string = if l.framework then s"-framework ${l.name}" else l.name
+
+// The two words a framework entry becomes, or None for a library's name.
+private framework_of(entry: string) -> Option[string]
+    if entry.starts_with("-framework ") then Some(entry[11..<entry.len]) else None
+end framework_of
 
 private holds(names: Buf[string], name: string) -> bool
     for item in names
@@ -130,7 +149,12 @@ library_flags(links: Buf[string], t: Target) -> Buf[string]
     var out: Buf[string] = buf()
 
     for item in links
-        if !target_provides(t.os, item) then out.push(s"-l${item}")
+        framework_of(item) match
+            Some(name) ->
+                if t.os == MacOS
+                    out.push("-framework")
+                    out.push(name)
+            None -> if !target_provides(t.os, item) then out.push(s"-l${item}")
 
     out
 end library_flags
@@ -148,6 +172,11 @@ link_hint(links: Buf[string], t: Target) -> Buf[string]
     var out: Buf[string] = buf()
 
     for item in links
+        if framework_of(item).is_some()
+            if t.os == MacOS then out.push(item)
+            continue
+        end if
+
         val absent = t.os == Freestanding && hosted_only(item) &&
             !(t.provides_libc() && (item == "c" || item == "m"))
 

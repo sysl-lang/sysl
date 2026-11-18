@@ -1107,8 +1107,9 @@ The run above writes `require failed (main.sysl:4:13)` to standard error — the
 call, since the clause is what failed. A clause written with a message adds it: `require x > 0, "x
 must be positive"` says `require failed: x must be positive (main.sysl:4:13)`. An `ensure` and a
 loop's `invariant` say `ensure failed` and `invariant failed` the same way, and a struct's invariant
-names the struct and the write that broke it, `invariant of 'Window' failed (main.sysl:8:1)`. The
-other checks say, each followed by its location:
+names the struct, the clause that does not hold and where it is written, and the write that broke
+it, `invariant of 'Window' failed: clause 'lo <= hi' at main.sysl:4:15 (main.sysl:8:1)`. The other
+checks say, each followed by its location:
 
 ```text
 'variant' did not decrease
