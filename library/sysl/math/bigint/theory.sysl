@@ -22,22 +22,152 @@ module sysl.math.bigint
  * dropped at the door rather than reasoned about. `gcd(x, 0)` is the magnitude of `x`, everything
  * dividing zero, and `gcd(0, 0)` is zero.
  *
- * The binary algorithm -- shifts and subtractions, no division -- is the faster one on a machine
- * whose divide is slow, and it is a fair amount more code for a constant factor. This is the one
- * that is obviously right.
+ * **It is Lehmer's form of it** (Knuth, *The Art of Computer Programming* volume 2, §4.5.2,
+ * algorithm L). Most of Euclid's quotients are small and depend only on the leading bits, so the
+ * steps are run on the top `w - 1` bits of the pair in machine arithmetic, recording what they did as a
+ * two-by-two matrix of cofactors, and the matrix is applied to the whole pair once -- one pass over
+ * the limbs for about sixty bits of progress, where plain Euclid makes a pass, and an allocation,
+ * per quotient. Where the leading bits cannot decide even one quotient, a full division step is
+ * taken instead. Below two limbs it is plain Euclid in machine words.
  */
 gcd(a: BigInt, b: BigInt) -> BigInt
     var x = a.mag
     var y = b.mag
 
-    while y.len > 0
-        val (_, r) = divmod_mag(x, y)
+    if cmp_mag(x, y) < 0
+        val t = x
 
         x = y
-        y = r
+        y = t
 
-    normalized(false, x)
+    while y.len > 1
+        val m = if x.len == y.len + 1 || x.len == y.len then lehmer_matrix(x, y) else Cofactors(1, 0, 0, 1)
+
+        if m.b == 0
+            val (_, r) = divmod_mag(x, y)
+
+            x = y
+            y = r
+        else
+            // `y` padded to `x`'s length once, for both rows.
+            var yp: []Limb = [0; x.len]
+
+            copy_n(yp, y, y.len)
+
+            val nx = combine(x, yp, m.a, m.b)
+            val ny = combine(x, yp, m.c, m.d)
+
+            x = nx
+            y = ny
+
+            if cmp_mag(x, y) < 0
+                val t = x
+
+                x = y
+                y = t
+
+    if y.len == 0 then return normalized(false, x)
+
+    // One limb left in `y`: one short division brings `x` under it, and the rest is machine words.
+    val (_, r) = short_divide(x, y[0])
+    var p = y[0]
+    var q: Limb = if r.len == 0 then 0 else r[0]
+
+    while q != 0
+        val t = p % q
+
+        p = q
+        q = t
+
+    normalized(false, mag_of_u64(u64(p)))
 end gcd
+
+/** The matrix `[[a, b], [c, d]]` that takes a pair `(x, y)` to `(a x + b y, c x + d y)`. Its entries
+ * alternate in sign, and each is under `2^(w - 1)` in magnitude for a `w`-bit limb, so a limb holds
+ * it.
+ */
+private struct Cofactors
+    a: long
+    b: long
+    c: long
+    d: long
+
+/** Lehmer's inner loop: Euclid on the top `w - 1` bits of `x` and the bits of `y` at the same places,
+ * for as long as the quotient the leading bits give is certainly the quotient of the whole --
+ * which Knuth's test checks by computing it from both ends of the interval the true values lie in.
+ * `b` of zero says not one step could be taken.
+ */
+private lehmer_matrix(x: []const Limb, y: []const Limb) -> Cofactors
+    val lead = usize(x[x.len - 1].leading_zeros())
+    val xh = i128(top_bits(x, x.len, lead))
+    val yh = i128(top_bits(y, x.len, lead))
+    var u = xh
+    var v = yh
+    var a: i128 = 1
+    var b: i128 = 0
+    var c: i128 = 0
+    var d: i128 = 1
+
+    loop
+        if v + c <= 0 || v + d <= 0 then break
+
+        val q = (u + a) / (v + c)
+
+        if q != (u + b) / (v + d) then break
+
+        val t1 = a - q * c
+
+        a = c
+        c = t1
+
+        val t2 = b - q * d
+
+        b = d
+        d = t2
+
+        val t3 = u - q * v
+
+        u = v
+        v = t3
+
+    Cofactors(long(a), long(b), long(c), long(d))
+end lehmer_matrix
+
+/** The `w - 1` bits of `x` that start `lead` bits below the top of limb `n - 1` -- the longer
+ * operand's top bit, so that both operands are read through the same window and their leading bits
+ * line up. One bit short of a limb keeps every cofactor the loop builds under `2^(w - 1)`. The window
+ * is 128 bits whatever a limb is, which holds a limb's width from anywhere in a limb.
+ */
+private top_bits(x: []const Limb, n: usize, lead: usize) -> u64
+    var window: u128 = 0
+
+    for i in 0..<(128 / limb_bits)
+        window = window << limb_bits
+
+        if i < n && n - 1 - i < x.len then window = window | u128(x[n - 1 - i])
+
+    u64((window << lead) >> (129 - limb_bits))
+end top_bits
+
+/** `p x + q y`, which is non-negative, where `p` and `q` have opposite signs (or one is zero) -- one
+ * row of a Lehmer matrix applied to the pair, `yp` being `y` padded to `x`'s length. One multiply
+ * pass and one multiply-and-subtract pass.
+ */
+private combine(x: []const Limb, yp: []const Limb, p: long, q: long) -> []const Limb
+    val n = x.len
+    var t: []Limb = [0; n + 1]
+
+    // The positive term goes in first, then the negative one comes off it. A zero entry is either
+    // sign, so the test is on `q`: where it is not positive, `p` is the one that is not negative.
+    if q <= 0
+        t[n] = mul_1(t, x, n, Limb(p))
+        t[n] -= submul_1(t, yp, n, Limb(-q))
+    else
+        t[n] = mul_1(t, yp, n, Limb(q))
+        t[n] -= submul_1(t, x, n, Limb(-p))
+
+    finished(t, n + 1)
+end combine
 
 /** The smallest non-negative value both divide: `lcm(4, 6)` is `12`.
  *
@@ -88,7 +218,7 @@ mod_pow(base: BigInt, exp: BigInt, m: BigInt) -> BigInt
 
         e = shr(e, 1)
 
-        if !e.is_zero() then b = rem(mul(b, b), modulus)
+        if !e.is_zero() then b = rem(square(b), modulus)
 
     if m.minus && !result.is_zero() then sub(result, modulus) else result
 end mod_pow
