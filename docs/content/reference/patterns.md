@@ -1205,18 +1205,86 @@ double free and no leak.
 
 ## Matching through a reference
 
-Selection auto-dereferences one level, but `match` does not: matching a `&Enum` or a `*Enum` against
-its variants is written **`*e match`**, an explicit one-level dereference, as Go requires on a type
-switch.
+**A shape reaches through a `&T`.** A variant, struct or tuple pattern matched against a `&Enum` or
+a `&Struct` matches what the reference holds, as field selection reads through one. It reaches at
+every depth: where a payload or a field is a `&T`, the pattern written in its place is matched
+against what that reference holds, so a recursive type is taken apart several levels at once. A
+`&sync T` is reached through the same way, and so is a reference to a reference.
 
-This keeps it visible whether the reference or the referenced value is being matched; it is the one
-place a reference to an enum needs the `*`.
+```sysl
+enum Tree
+    Leaf(v: int)
+    Node(l: &Tree, r: &Tree)
+
+sum(t: &Tree) -> int
+    t match
+        Leaf(v) -> v
+        Node(Leaf(a), r) -> a + sum(r)
+        Node(l, r) -> sum(l) + sum(r)
+
+describe(o: Option[&Tree]) -> string
+    o match
+        Some(Leaf(v)) -> s"a leaf holding $v"
+        Some(Node(_, _)) -> "a node"
+        None -> "nothing"
+
+val t: &Tree = Node(Node(Leaf(1), Leaf(2)), Node(Leaf(3), Leaf(4)))
+
+print(sum(t))
+print(describe(Some(t)), "/", describe(None))
+
+if t is Node(Node(Leaf(a), _), _) then print("leftmost:", a)
+```
+
+```output
+10
+a node / nothing
+leftmost: 1
+```
+
+Every place a pattern stands reaches through a reference the same way: an `is` test, a `while … is`
+loop, a [binding](#a-pattern-at-a-binding), a `for` header, [function
+clauses](/reference/declarations/#clauses), `|` alternatives and a guarded arm. Coverage is judged on
+what the reference holds, so the arms above cover a `&Tree` as they would cover a `Tree`.
+
+**What does not take a shape apart still meets the reference itself.** A name binds the reference
+— a second name for the same object, never a copy of what it holds — and so does the name in
+`n @ Node(…)`. `_` matches the reference, and a literal compares against it. A match may mix the two:
+an arm `Leaf(v)` reaches through and an arm `other` binds the reference.
+
+Reading through the reference costs nothing the written dereference does not. **The reference
+itself is neither copied nor counted**: the arms read what it holds while it is alive, and only a name
+the arm binds takes a share of what it is bound to (see [refcounts survive
+destructuring](#refcounts-survive-destructuring)). A match whose every arm reaches through is lowered
+exactly as `*t match` is: the referent read once, its tag switched on.
+
+**A raw pointer is not reached through.** A `*T` may point at nothing, and a shape over one would
+read it with no sign of the read, so its dereference is written:
+
+```sysl
+enum Slot
+    Empty
+    Full(n: int)
+
+var s = Full(1)
+val p: *Slot = &s
+
+p match
+    Full(n) -> print(n)
+    Empty -> print("empty")
+```
+
+```error
+a pattern reaches through a '&T' but not through a raw pointer, which may point at nothing, so match what it holds: '*x match'
+```
+
+`*p match` is the form, and `*t match` remains a correct spelling for a `&T` too.
 
 ### A payload binding is a copy
 
-The dereference determines *which value* is matched. It does not make the names bound in the arms
-into views of the payload: **a payload binding is initialized by copy, whether or not the match went
-through a reference.** Changing the copy leaves the enum unchanged.
+Reaching through a reference determines *which value* is matched. It does not make the names bound
+in the arms into views of the payload: **a payload binding is initialized by copy, whether or not the
+match went through a reference.** Changing the copy leaves the enum unchanged.
 
 The binding itself is [written once](#a-binding-a-match-makes-is-written-once), so the change is made
 to a `var` declared from it, which makes the copy explicit.
@@ -1232,13 +1300,13 @@ enum Slot
 
 var s: &Slot = Full(Reading(1, 10))
 
-*s match
+s match
     Full(r) ->
         var mine = r
         mine.value = 99
     Empty -> print("empty")
 
-*s match
+s match
     Full(r) -> print("through a reference:", r.value)
     Empty -> print("empty")
 

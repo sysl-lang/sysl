@@ -475,8 +475,19 @@ private cond_is(cx: &Analyzer, span: Span, subject: Expr, patterns: Buf[Pattern]
                  "one where it did not match, so there would be nothing for the name to hold. " +
                  "Write '_' for the parts you are not naming")
 
-    TCondIs(ts, tpats, negated)
+    // A test whose every alternative reaches through the reference is `*x is …`, as a `match` is.
+    repr(texpr_type(ts)) match
+        Ref(inner, _) if all_through(tpats) ->
+            TCondIs(TExpr(ts.span, TDeref(ts, *inner)), patterns_through(tpats, *inner).unwrap(), negated)
+        _ -> TCondIs(ts, tpats, negated)
 end cond_is
+
+private all_through(ps: Buf[TPattern]) -> bool
+    for p in ps
+        if p is not TDerefPattern(_, _) then return false
+
+    !ps.is_empty()
+end all_through
 
 private all_refutable(ps: Buf[TPattern]) -> bool
     for i in 0..<ps.len()
@@ -524,9 +535,57 @@ match_expr(cx: &Analyzer, span: Span, scrut: Expr, arms: Buf[MatchArm], expected
     // SCRUTINEE, as the reference's does: `Colour.Red match` is refused under `Red`, a selection's
     // own anchor being its member.
     val met = arms_widened(tarms)
+    val ty = match_result_type(cx, ts.span, texpr_type(ts), met)
 
-    TExpr(span, TMatch(ts, met, match_result_type(cx, ts.span, texpr_type(ts), met)))
+    matched_through(ts, met) match
+        Some(m) -> TExpr(span, TMatch(m.0, m.1, ty))
+        None -> TExpr(span, TMatch(ts, met, ty))
 end match_expr
+
+// **A `match` whose every arm reaches through the reference it is handed is `*x match`**, and is
+// lowered as one: the referent read once, its tag switched on, and every analysis asked of the
+// dereference it has always been asked of. Nothing where an arm names or tests the reference itself.
+private matched_through(ts: TExpr, arms: Buf[TArm]) -> Option[(TExpr, Buf[TArm])]
+    val held = repr(texpr_type(ts)) match
+        Ref(inner, _) -> *inner
+        _ -> return None
+
+    var reached = false
+    var out: Buf[TArm] = buf()
+
+    for arm in arms
+        val ps = patterns_through(arm.patterns, held)
+
+        if ps.is_none() then return None
+        if any_through(arm.patterns) then reached = true
+
+        out.push(TArm(ps.unwrap(), arm.guard, arm.body))
+
+    if !reached then return None
+
+    Some((TExpr(ts.span, TDeref(ts, held)), out))
+end matched_through
+
+// The patterns a reference's arm reads the referent with, or nothing where one meets the reference
+// itself. A `_` matches either.
+private patterns_through(ps: Buf[TPattern], held: Type) -> Option[Buf[TPattern]]
+    var out: Buf[TPattern] = buf()
+
+    for p in ps
+        p match
+            TDerefPattern(_, inner) -> out.push(*inner)
+            TWildPattern(_) -> out.push(TWildPattern(held))
+            _ -> return None
+
+    Some(out)
+end patterns_through
+
+private any_through(ps: Buf[TPattern]) -> bool
+    for p in ps
+        if p is TDerefPattern(_, _) then return true
+
+    false
+end any_through
 
 // **A pattern no value can reach is refused**, at the pattern, naming the earlier arms that match
 // everything it does -- Rust's `unreachable_patterns`, as an error. An arm that can never run is

@@ -572,6 +572,15 @@ pattern_names(out: *Buf[string], p: Pattern)
 // descend into each.
 private bind_pattern(cx: &Analyzer, span: Span, p: Pattern, subject: TExpr,
                      mutable: bool) -> Buf[TStmt]
+    // A shape reaches through a `&T` here as in an arm: `val Point(x, y) = p` over a `&Point` takes
+    // apart what `p` holds, each part a copy, as `val Point(x, y) = *p` would.
+    val held = repr(texpr_type(subject)) match
+        Ref(inner, _) if !erased(texpr_type(subject)) && takes_apart(p) -> Some(*inner)
+        _ -> None
+
+    if held.is_some() then return bind_pattern(cx, span, p, TExpr(subject.span, TDeref(subject, held.unwrap())),
+                                               mutable)
+
     *p.kind match
         WildcardPattern -> buf()
 
@@ -623,6 +632,12 @@ private bind_pattern(cx: &Analyzer, span: Span, p: Pattern, subject: TExpr,
                      "declared, and a binding has no other arm to take when the value turns out " +
                      s"to differ; write '$n' to bind a new name")
             buf()
+
+private takes_apart(p: Pattern) -> bool = *p.kind match
+    TuplePattern(args) -> !args.is_empty()
+    StructPattern(_, _) -> true
+    VariantPattern(_, _) -> true
+    _ -> false
 
 private cannot_test(cx: &Analyzer, span: Span) -> Buf[TStmt]
     cx.fault(span, "a binding cannot test a value — this pattern matches only some values, and a " +
