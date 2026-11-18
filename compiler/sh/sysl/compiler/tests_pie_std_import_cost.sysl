@@ -4,11 +4,12 @@ module sh.sysl.compiler
 import sysl.buf.{Buf, buf}
 import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
 import sysl.process.capture
+import sysl.text.repeat
 
 // **A small standard function is copied into the program that calls it by what its body costs the
 // optimizer, not by how many instructions its unoptimized text has** (`codegen.sysl`'s
 // `keeps_import`, `body_cost`). Unoptimized text spells every local as a stack slot, so a PCG step
-// (`Rng.next_u32`, a dozen statements) is ~54 lines and costs 33 once the slots are registers:
+// (`Rng.next_u32`, a dozen statements) is ~54 lines and a few dozen instructions once the slots are registers:
 // past the limit a raw count gave, and a hot call the program could not inline. The copy is
 // `available_externally`, so the link still takes the one definition the standard module defines.
 
@@ -142,11 +143,12 @@ end pie_large_body_stays_declared
 // -- the same rule over a `--lib` root's own functions -------------------------------------------------
 //
 // Every body below is longer than `ImportLimit` raw instructions, so the cost decides. `mix` is a PCG
-// step that writes through its parameter (raw ~71, cost 31). `at45` and `at46` are one `^ a` apart:
-// a chain of shifts and multiplies whose cost is exactly the limit, and one past it. The marked
-// copies of `mix` are refused by what they ask for before the cost is asked. A generic is not
-// precompiled (each instantiation is the program's own `define`) and a closure is not a function a
-// program calls by name, so neither has a cell here.
+// step that writes through its parameter (raw ~71, cost 16: its five shifts are by constants, whose
+// guards fold). `at45` and `at46` are one `^ a` apart: a chain of shifts and multiplies whose cost is
+// exactly the limit, and one past it, each constant shift costing the shift alone. The marked copies
+// of `mix` are refused by what they ask for before the cost is asked. A generic is not precompiled
+// (each instantiation is the program's own `define`) and a closure is not a function a program calls
+// by name, so neither has a cell here.
 
 private pie_mix_body() -> string =
     "    val old = m.s\n    val inc = m.t\n    m.s = old * 6364136223846793005 + inc\n" +
@@ -163,8 +165,8 @@ private pie_core() -> string =
     "@noinline\nmix_noinline(m: *Mix) -> u64\n" + pie_mix_body() +
     "@cold\nmix_cold(m: *Mix) -> u64\n" + pie_mix_body() +
     "@export(\"piel_mix\")\nmix_export(m: *Mix) -> u64\n" + pie_mix_body() +
-    "at45(x: u64) -> u64\n" + pie_chain(" ^ a ^ a ^ a") +
-    "at46(x: u64) -> u64\n" + pie_chain(" ^ a ^ a ^ a ^ a")
+    "at45(x: u64) -> u64\n" + pie_chain(repeat(" ^ a", 18)) +
+    "at46(x: u64) -> u64\n" + pie_chain(repeat(" ^ a", 19))
 
 // The same root with a type that has a destructor, and a function past the raw limit that reads one.
 private pie_root() -> string = lbr_tree(lbr_one("piel/piel.sysl", pie_core() +
