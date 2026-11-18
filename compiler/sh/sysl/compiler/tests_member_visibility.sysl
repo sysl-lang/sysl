@@ -654,6 +654,139 @@ ipv_a_scoped_impl_member_is_refused_from_outside_the_module()
 
     assert(out.contains("method 'twice' of 'geom.P' is private to module 'geom'"), out)
 
+// -- a member with type parameters of its own keeps its modifier ------------------------------------
+//
+// A generic member is made real from the call rather than looked up as a filed function, and that path
+// once skipped the reach check, so `p.twice(2)` built from outside the module while `p.twice()` of a
+// plain member was refused.
+
+private val pgm_geom = "module geom\nstruct P\n    n: int\n\nimpl P\n" +
+    "    private[geom] twice[T](self, t: T) -> int = self.n * 2\n" +
+    "    private[geom] make[T](t: T) -> P = P(3)\n" +
+    "    private[geom] put[T](self, t: T) -> int = 1\n" +
+    "    put(self, t: string) -> int = 2\n" +
+    "    private[geom] helper[T](self, t: T) -> int = self.n + 1\n\n" +
+    "struct Box[T]\n    v: T\n\nimpl[T] Box[T]\n    private[geom] map[U](self, u: U) -> int = 7\n\n" +
+    "impl[T: Eq] Box[T]\n    private[geom] same[U](self, o: T, u: U) -> bool = self.v == o\n\n" +
+    "private[geom] pick[T](t: T) -> T = t\n\n" +
+    "trait Shape\n    area(self) -> int\n\nimpl Shape for P\n    area(self) -> int = self.helper(self.n)\n"
+
+// The refusal one line of `main.sysl` gets, written after `import geom.{P, Box}` and a type of its own.
+private pgm_outside(line: string) -> string =
+    mv_err([("main.sysl", s"import geom.{P, Box}\nstruct Mine\n    k: int\n$line\nprint(1)\n"),
+            ("g.sysl", pgm_geom)])
+
+@test("a scoped generic method is refused from outside the module")
+pgm_a_scoped_generic_method_is_refused_from_outside()
+    if mv_no_library() then return
+
+    val out = pgm_outside("go(p: P) -> int = p.twice(2)")
+
+    assert(out.contains("error: method 'twice' of 'geom.P' is private to module 'geom'\n" +
+                        " --> main.sysl:4:21"), out)
+
+@test("and with its type argument written")
+pgm_a_scoped_generic_method_with_a_written_type_argument_is_refused()
+    if mv_no_library() then return
+
+    val out = pgm_outside("go(p: P) -> int = p.twice[int](2)")
+
+    assert(out.contains("error: method 'twice' of 'geom.P' is private to module 'geom'\n" +
+                        " --> main.sysl:4:26"), out)
+
+@test("and instantiated at the caller's own type")
+pgm_a_scoped_generic_method_at_an_outside_type_is_refused()
+    if mv_no_library() then return
+
+    val out = pgm_outside("go(p: P) -> int = p.twice(Mine(1))")
+
+    assert(out.contains("error: method 'twice' of 'geom.P' is private to module 'geom'\n" +
+                        " --> main.sysl:4:21"), out)
+
+@test("a scoped generic method of a generic type is refused")
+pgm_a_generic_types_scoped_generic_method_is_refused()
+    if mv_no_library() then return
+
+    val out = pgm_outside("go(b: Box[int]) -> int = b.map(\"s\")")
+
+    assert(out.contains("error: method 'map' of 'geom.Box' is private to module 'geom'\n" +
+                        " --> main.sysl:4:28"), out)
+
+@test("and one from a conditional impl")
+pgm_a_conditional_impls_scoped_generic_method_is_refused()
+    if mv_no_library() then return
+
+    val out = pgm_outside("go(b: Box[int]) -> bool = b.same(1, 2)")
+
+    assert(out.contains("error: method 'same' of 'geom.Box' is private to module 'geom'\n" +
+                        " --> main.sysl:4:29"), out)
+
+@test("a scoped generic helper a trait implementation calls is refused outside, its caller is not")
+pgm_a_trait_impls_generic_helper_is_refused_outside()
+    if mv_no_library() then return
+
+    val out = pgm_outside("go(p: P) -> int = p.helper(1) + p.area()")
+
+    assert(out.contains("error: method 'helper' of 'geom.P' is private to module 'geom'\n" +
+                        " --> main.sysl:4:21"), out)
+    assert(!out.contains("'area'") && !out.contains(":4:35"), out)
+
+@test("a scoped generic associated function is refused, its type argument written or not")
+pgm_a_scoped_generic_associated_function_is_refused()
+    if mv_no_library() then return
+
+    val out = pgm_outside("go() -> int = P.make(1).n + P.make[int](1).n")
+
+    assert(out.contains("error: associated function 'make' of 'geom.P' is private to module 'geom'\n" +
+                        " --> main.sysl:4:17"), out)
+    assert(out.contains("error: associated function 'make' of 'geom.P' is private to module 'geom'\n" +
+                        " --> main.sysl:4:31"), out)
+
+@test("a scoped generic free function is refused")
+pgm_a_scoped_generic_free_function_is_refused()
+    if mv_no_library() then return
+
+    val out = pgm_outside("go() -> int = geom.pick(1)")
+
+    assert(out.contains("error: 'geom.pick' is private to module 'geom'\n --> main.sysl:4:20"), out)
+
+@test("an overload set leaves its out-of-reach generic member out of the choice")
+pgm_an_out_of_reach_generic_overload_is_not_chosen()
+    if mv_no_library() then return
+
+    val out = pgm_outside("go(p: P) -> int = p.put(1)")
+
+    assert(out.contains("error: 't' of 'geom.P.put' is string, but int was given\n --> main.sysl:4:25"), out)
+
+@test("a file-private generic method is refused from a sibling file")
+pgm_a_file_private_generic_method_is_refused_from_a_sibling()
+    if mv_no_library() then return
+
+    val out = mv_pair_err("struct P\n    n: int\n\nimpl P\n    private twice[T](self, t: T) -> int = self.n * 2",
+                          "go(p: P) -> int = p.twice(2)")
+
+    assert(out.contains("error: method 'twice' of 'geom.P' is private to 'g.sysl', the file that declares " +
+                        "it\n --> h.sysl:2:21"), out)
+
+@test("a file-private generic method is called from its own file")
+pgm_a_file_private_generic_method_is_called_from_its_own_file()
+    if mv_no_library() then return
+
+    assert_eq(mv_one_ran("struct P\n    n: int\n\nimpl P\n    private twice[T](self, t: T) -> int = self.n * 2\n" +
+                         "    shown(self) -> int = self.twice(1) + self.twice[string](\"s\")\n\nprint(P(4).shown())\n"),
+              "16\n")
+
+@test("every scoped generic member is reached from inside the module, at a type from outside it")
+pgm_scoped_generic_members_are_reached_inside_at_an_outside_type()
+    if mv_no_library() then return
+
+    val inside = "\ngo[T](p: P, t: T) -> int = p.twice(t) + p.twice[T](t) + P.make(t).n + pick(1) + " +
+                 "Box(1).map(t) + (if Box(1).same(1, t) then 100 else 0) + p.area()\n"
+
+    assert_eq(mv_ran([("main.sysl", "import geom.{P, go}\nstruct Mine\n    k: int\nprint(go(P(5), Mine(1)))\n"),
+                      ("geom/g.sysl", pgm_geom),
+                      ("geom/h.sysl", s"module geom$inside")]), "137\n")
+
 @test("a conditional inherent impl takes one too")
 ipv_a_conditional_impl_member_may_be_private()
     if mv_no_library() then return
