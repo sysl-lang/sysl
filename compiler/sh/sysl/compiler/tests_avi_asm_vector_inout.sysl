@@ -1,0 +1,593 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, replace_all}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// The vector register class and `inout` operands (`reference/inline-assembly.md` § "A vector
+// register" and § "An operand both read and written").
+//
+// `vreg` is AArch64's `v` registers (constraint `w`) and x86-64's `xmm` (constraint `x`), and holds
+// a vector of exactly one register's width or an `f32`/`f64`. `inout x : c` is one early-clobber
+// output and an input tied to it by number; `inout a -> b : c` reads `a` and leaves the result in `b`,
+// which must be the same type. The running tests are checked against FIPS-197's worked example
+// (Appendix B), not against what the instructions happen to print.
+//
+// Cells skipped, with the reason: `general_regs_only` (a process-wide codegen setting, which a test
+// running beside others must not flip; probed by hand and refused with "without its floating-point
+// and vector registers"); 256- and 512-bit `ymm`/`zmm` (not in the class: a baseline x86-64 has
+// neither); separate compilation (an asm block has no cross-module surface -- it lowers inside the
+// one function that holds it).
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private avi_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end avi_ready
+
+// The run tests execute AArch64 instructions, so they need an AArch64 host.
+private avi_runs_here() -> bool
+    if !avi_ready() then return false
+
+    if host_cpu() != Aarch64
+        print("skipped: the instructions are AArch64's and this host is not")
+        return false
+    end if
+
+    true
+end avi_runs_here
+
+private avi_root(text: string) -> string
+    val root = replace_all(make_temp_dir("sysl-avi").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+end avi_root
+
+// What a one-file program prints on this machine, or why it did not build.
+private avi_ran(text: string) -> string
+    val root = avi_root(text)
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end avi_ran
+
+// The LLVM text a named machine lowers a one-file program to, or its refusal.
+private avi_ir(machine: string, text: string) -> string
+    val root = avi_root(text)
+
+    val out = emit_llvm_text(s"$root/main.sysl", Some(machine)) match
+        Err(why) -> failure_text(why)
+        Ok(made) ->
+            if made.report.is_empty() then made.text
+            else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end avi_ir
+
+private avi_says(text: string, part: string) = assert(text.contains(part), s"expected '$part' in:\n$text")
+
+private avi_never_says(text: string, part: string) =
+    assert(!text.contains(part), s"expected no '$part' in:\n$text")
+
+// One AArch64 block over `body`'s lines, every other processor answered.
+private avi_arm(head: string, body: string, tail: string) -> string =
+    s"$head\n    asm\n        [aarch64]\n$body" +
+    "        [x86_64, riscv64, riscv32, thumb, craft, wasm32] unavailable \"not this test's business\"\n" +
+    tail
+
+private val avi_aes: string = raw"""
+    aes_round(state: <16>u8, key: <16>u8) -> <16>u8
+        var s = state
+        asm
+            [aarch64]
+                "aese {s}.16b, {key}.16b"
+                "aesmc {s}.16b, {s}.16b"
+                inout s : vreg
+                in key : vreg
+            [x86_64, riscv64, riscv32, thumb, craft, wasm32] unavailable "AArch64's AES instructions"
+        s
+
+    val input: <16>u8 = [0x32, 0x43, 0xf6, 0xa8, 0x88, 0x5a, 0x30, 0x8d,
+                         0x31, 0x31, 0x98, 0xa2, 0xe0, 0x37, 0x07, 0x34]
+    val key: <16>u8 = [0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6,
+                       0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c]
+    val out = aes_round(input, key)
+
+    for const i in 0..<16
+        print(out[i])
+
+    print(input[0], key[0])
+    """
+
+// FIPS-197 Appendix B, round 1 after MixColumns: 04 66 81 e5 e0 cb 19 9a 48 f8 d3 7a 28 06 26 4c.
+private val avi_aes_round_one: string =
+    "4\n102\n129\n229\n224\n203\n25\n154\n72\n248\n211\n122\n40\n6\n38\n76\n50 43\n"
+
+// -- running on AArch64 ---------------------------------------------------------------------------
+
+@test("aese and aesmc on <16>u8 in vector registers give FIPS-197's first round")
+avi_aes_round_matches_fips_197()
+    if !avi_runs_here() then return
+
+    assert_eq(avi_ran(avi_aes), avi_aes_round_one)
+
+@test("the AES round lowers to a tied vector operand and a vector input")
+avi_aes_round_lowers_to_w_constraints()
+    if !avi_ready() then return
+
+    val ir = avi_ir("aarch64-macos", avi_aes)
+
+    avi_says(ir, "\"aese $0.16b, $2.16b\\0Aaesmc $0.16b, $0.16b\", \"=&w,0,w,~{memory},~{cc}\"(<16 x i8>")
+
+@test("a tied add reads one variable and leaves the sum in another, which the first keeps its value beside")
+avi_tied_add_into_another_variable()
+    if !avi_runs_here() then return
+
+    assert_eq(avi_ran(avi_arm("sum(x: int) -> int\n    var acc = 40\n    var total = 0",
+                              "            \"add {total}, {acc}, {x}\"\n" +
+                              "            inout acc -> total : reg\n            in x : reg\n",
+                              "    print(acc)\n    total\n\nprint(sum(2))\n")), "40\n42\n")
+
+@test("an inout read from a val may leave its result in a var")
+avi_tied_from_a_val()
+    if !avi_runs_here() then return
+
+    assert_eq(avi_ran(avi_arm("next(n: u64) -> u64\n    val start = n\n    var m: u64 = 0",
+                              "            \"add {m}, {start}, #1\"\n            inout start -> m : reg\n",
+                              "    m\n\nprint(next(41))\n")), "42\n")
+
+@test("an inout integer is read and written through one register, at its width")
+avi_inout_integer_in_place()
+    if !avi_runs_here() then return
+
+    val src = avi_arm("bump(n: u32) -> u32\n    var v = n",
+                      "            \"add {v}, {v}, #1\"\n            inout v : reg\n", "    v\n\nprint(bump(41))\n")
+
+    assert_eq(avi_ran(src), "42\n")
+    avi_says(avi_ir("aarch64-macos", src), "\"add ${0:w}, ${0:w}, #1\", \"=&r,0,~{memory},~{cc}\"(i32")
+
+@test("a tied vector add on <4>u32 adds every lane")
+avi_tied_vector_add()
+    if !avi_runs_here() then return
+
+    assert_eq(avi_ran(avi_arm("lanes(a: <4>u32, b: <4>u32) -> <4>u32\n    var r = a",
+                              "            \"add {r}.4s, {r}.4s, {b}.4s\"\n" +
+                              "            inout r : vreg\n            in b : vreg\n",
+                              "    r\n\nval l = lanes([1, 2, 3, 4], [10, 20, 30, 40])\nprint(l[0], l[1], l[2], l[3])\n")),
+              "11 22 33 44\n")
+
+@test("a 64-bit vector is a d-sized register and takes the .8b arrangement")
+avi_sixty_four_bit_vector()
+    if !avi_runs_here() then return
+
+    assert_eq(avi_ran(avi_arm("twice(a: <8>u8) -> <8>u8\n    var r = a",
+                              "            \"add {r}.8b, {r}.8b, {r}.8b\"\n            inout r : vreg\n",
+                              "    r\n\nval t = twice([1, 2, 3, 4, 5, 6, 7, 100])\nprint(t[0], t[7])\n")),
+              "2 200\n")
+
+@test("an f64 and an f32 in vector registers are spelled d and s")
+avi_floats_in_vector_registers()
+    if !avi_runs_here() then return
+
+    val src = avi_arm("mix(a: f64, b: f32) -> f64\n    var r = a\n    var w: f64 = 0",
+                      "            \"fcvt {w}, {b}\"\n            \"fadd {r}, {r}, {w}\"\n" +
+                      "            inout r : vreg\n            in b : vreg\n            out w : vreg\n",
+                      "    r\n\nprint(mix(1.25, 2.5))\n")
+
+    assert_eq(avi_ran(src), "3.75\n")
+    avi_says(avi_ir("aarch64-macos", src), "\"fcvt ${1:d}, ${3:s}\\0Afadd ${0:d}, ${0:d}, ${1:d}\", \"=&w,=&w,0,w,")
+
+@test("an empty block with an inout operand is a barrier the value survives")
+avi_empty_inout_is_a_barrier()
+    if !avi_ready() then return
+
+    val src = raw"""
+        hide(x: u64) -> u64
+            var v = x
+            asm
+                [aarch64, x86_64, riscv64, riscv32, thumb, craft]
+                    ""
+                    inout v : reg
+                [wasm32] unavailable "no registers"
+            v
+
+        var acc: u64 = 0
+
+        for i in 0..<5
+            acc += hide(i)
+
+        print(acc)
+        """
+
+    avi_says(avi_ir("x86_64-macos", src), "asm sideeffect \"\", \"=&r,0,~{memory},~{cc}\"(i64")
+
+    if avi_runs_here() then assert_eq(avi_ran(src), "10\n")
+
+@test("a generic function's inout vreg is instantiated at two vector types")
+avi_generic_inout_vreg()
+    if !avi_runs_here() then return
+
+    assert_eq(avi_ran(avi_arm("dup[T](a: T) -> T\n    var r = a",
+                              "            \"mov {r}.16b, {r}.16b\"\n            inout r : vreg\n",
+                              "    r\n\nval b: <16>u8 = 7\nval w: <4>u32 = 9\nprint(dup(b)[15], dup(w)[3])\n")),
+              "7 9\n")
+
+// -- the numbering ---------------------------------------------------------------------------------
+
+@test("an inout is numbered as an output, and its tied input takes a number nothing names")
+avi_numbering_with_outputs_and_inouts()
+    if !avi_ready() then return
+
+    val ir = avi_ir("x86_64-macos", raw"""
+        f(c: int) -> int
+            var a = 0
+            var b = 1
+            var d = 2
+            asm
+                [x86_64]
+                    "movl {c}, {a}"
+                    "addl {a}, {b}"
+                    "addl {b}, {d}"
+                    out a : reg
+                    inout b : reg
+                    in c : reg
+                    inout d : reg
+                [aarch64, riscv64, riscv32, thumb, craft, wasm32] unavailable "not this test's business"
+            a + b + d
+
+        print(f(5))
+        """)
+
+    avi_says(ir, "\"movl $4, $0\\0Aaddl $0, $1\\0Aaddl $1, $2\", \"=&r,=&r,=&r,1,r,2,~{memory},~{cc}\"")
+
+@test("both names of a tie are the output's number")
+avi_both_names_of_a_tie()
+    if !avi_ready() then return
+
+    val ir = avi_ir("x86_64-macos", raw"""
+        f(n: int) -> int
+            var m = 0
+            asm
+                [x86_64]
+                    "addl {n}, {m}"
+                    inout n -> m : reg
+                [aarch64, riscv64, riscv32, thumb, craft, wasm32] unavailable "not this test's business"
+            m
+
+        print(f(5))
+        """)
+
+    avi_says(ir, "\"addl $0, $0\", \"=&r,0,~{memory},~{cc}\"")
+
+// -- x86-64 ---------------------------------------------------------------------------------------
+
+@test("on x86-64 a vector and a float go in xmm registers")
+avi_x86_xmm()
+    if !avi_ready() then return
+
+    val ir = avi_ir("x86_64-macos", raw"""
+        enc(state: <16>u8, key: <16>u8) -> <16>u8
+            var s = state
+            asm
+                [x86_64]
+                    "aesenc {key}, {s}"
+                    inout s : vreg
+                    in key : vreg
+                [aarch64, riscv64, riscv32, thumb, craft, wasm32] unavailable "x86's AES-NI"
+            s
+
+        copy(a: f32) -> f32
+            var r: f32 = 0
+            asm
+                [x86_64]
+                    "movss {a}, {r}"
+                    in a : vreg
+                    out r : vreg
+                [aarch64, riscv64, riscv32, thumb, craft, wasm32] unavailable "not this test's business"
+            r
+
+        val k: <16>u8 = 3
+        print(enc(k, k)[0], copy(1.5))
+        """)
+
+    avi_says(ir, "\"aesenc $2, $0\", \"=&x,0,x,~{memory},~{cc}\"(<16 x i8>")
+    avi_says(ir, "\"movss $1, $0\", \"=&x,x,~{memory},~{cc}\"(float")
+
+@test("an inout pinned to a machine register is tied by number")
+avi_pinned_inout()
+    if !avi_ready() then return
+
+    avi_says(avi_ir("x86_64-macos", raw"""
+        f(n: int) -> int
+            var v = n
+            asm
+                [x86_64]
+                    "addl $1, {v}"
+                    inout v : "eax"
+                [aarch64, riscv64, riscv32, thumb, craft, wasm32] unavailable "not this test's business"
+            v
+
+        print(f(4))
+        """), "\"addl $$1, $0\", \"=&{eax},0,~{memory},~{cc}\"")
+
+@test("on x86-64 a 64-bit vector does not fit an xmm register as a whole")
+avi_x86_vector_width()
+    if !avi_ready() then return
+
+    avi_says(avi_ir("x86_64-macos", raw"""
+        f(a: <8>u8)
+            asm
+                [x86_64]
+                    "nop"
+                    in a : vreg
+                [aarch64, riscv64, riscv32, thumb, craft, wasm32] unavailable "not this test's business"
+
+        f(1)
+        """), "'a' is <8>byte, 64 bits, and a vector register here holds 128 bits")
+
+// -- the wrong class for the type -----------------------------------------------------------------
+
+@test("a vector in a general-purpose register is told to write vreg")
+avi_vector_in_reg()
+    if !avi_ready() then return
+
+    avi_says(avi_ir("aarch64-macos", avi_arm("f(v: <16>u8)", "            \"nop\"\n            in v : reg\n", "f(1)\n")),
+             "'v' is a vector, which lives in a vector register rather than a general-purpose one. Write 'vreg' for its class")
+
+@test("a float in a general-purpose register is told to write vreg where there is one")
+avi_float_in_reg()
+    if !avi_ready() then return
+
+    avi_says(avi_ir("aarch64-macos", avi_arm("f(v: f64)", "            \"nop\"\n            in v : reg\n", "f(1.0)\n")),
+             "'v' is a floating-point value, which lives in a vector register rather than a general-purpose one. Write 'vreg'")
+
+@test("an integer in a vector register is told to write reg")
+avi_integer_in_vreg()
+    if !avi_ready() then return
+
+    avi_says(avi_ir("aarch64-macos", avi_arm("f(v: int)", "            \"nop\"\n            in v : vreg\n", "f(1)\n")),
+             "'v' is int, which lives in a general-purpose register — 'vreg' holds vectors and floats. Write 'reg' for its class")
+
+@test("a pointer and a bool in a vector register are told to write reg")
+avi_pointer_and_bool_in_vreg()
+    if !avi_ready() then return
+
+    avi_says(avi_ir("aarch64-macos", avi_arm("f(p: *int, b: bool)", "            \"nop\"\n            in p : vreg\n            in b : vreg\n",
+                                             "var n = 1\nf(&n, true)\n")),
+             "'p' is *int, which lives in a general-purpose register")
+
+@test("a vector of 32 bits fits no AArch64 vector register")
+avi_vector_too_narrow()
+    if !avi_ready() then return
+
+    avi_says(avi_ir("aarch64-macos", avi_arm("f(a: <4>u8)", "            \"nop\"\n            in a : vreg\n", "f(1)\n")),
+             "'a' is <4>byte, 32 bits, and a vector register here holds 64 or 128 bits")
+
+@test("a vector of 256 bits fits no AArch64 vector register")
+avi_vector_too_wide()
+    if !avi_ready() then return
+
+    avi_says(avi_ir("aarch64-macos", avi_arm("f(a: <8>u32)", "            \"nop\"\n            in a : vreg\n", "f(1)\n")),
+             "256 bits, and a vector register here holds 64 or 128 bits")
+
+@test("a vector of bool lanes is not a register's lanes")
+avi_bool_lanes()
+    if !avi_ready() then return
+
+    avi_says(avi_ir("aarch64-macos", avi_arm("f(a: <16>bool)", "            \"nop\"\n            in a : vreg\n", "f(true)\n")),
+             "'a' is <16>bool, and a vector register's lanes are 8-, 16-, 32- or 64-bit integers or binary16, binary32 or binary64 floats")
+
+@test("an f16 scalar is not one of the vector register's floats")
+avi_f16_scalar()
+    if !avi_ready() then return
+
+    avi_says(avi_ir("aarch64-macos", avi_arm("f(a: f16)", "            \"nop\"\n            in a : vreg\n", "f(1)\n")),
+             "'a' is f16, and a vector register holds an 'f32' or an 'f64' as a scalar")
+
+@test("riscv64 has no vector register class")
+avi_riscv_has_no_vreg()
+    if !avi_ready() then return
+
+    avi_says(avi_ir("riscv64-freestanding", raw"""
+        f(a: f64)
+            asm
+                [riscv64]
+                    "nop"
+                    in a : vreg
+                [x86_64, aarch64, riscv32, thumb, craft, wasm32] unavailable "not this test's business"
+
+        @export("main")
+        boot() -> i32
+            f(1.0)
+            0
+        """), "'a' cannot be a 'vreg' operand: there is no vector register class on riscv64 — 'vreg' names AArch64's 'v' registers and x86-64's 'xmm' ones")
+
+@test("thumb has no vector register class")
+avi_thumb_has_no_vreg()
+    if !avi_ready() then return
+
+    avi_says(avi_ir("thumbv7em-freestanding", raw"""
+        f(a: f32)
+            asm
+                [thumb]
+                    "nop"
+                    in a : vreg
+                [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "not this test's business"
+
+        @export("main")
+        boot() -> i32
+            f(1.0)
+            0
+        """), "there is no vector register class on thumb")
+
+// -- ties ------------------------------------------------------------------------------------------
+
+@test("a tie to a variable of another type is refused, naming both types")
+avi_tie_type_mismatch()
+    if !avi_ready() then return
+
+    avi_says(avi_ir("aarch64-macos", avi_arm("f(a: <16>u8) -> <4>u32\n    var b: <4>u32 = 0",
+                                             "            \"nop\"\n            inout a -> b : vreg\n", "    b\n\nf(1)\n")),
+             "'a' is <16>byte and 'b' is <4>uint, but an 'inout' leaves its result in the register it read, so the two sides are one type")
+
+@test("a tie between integers of two widths is refused too")
+avi_tie_width_mismatch()
+    if !avi_ready() then return
+
+    avi_says(avi_ir("aarch64-macos", avi_arm("f(a: u32) -> u64\n    var b: u64 = 0",
+                                             "            \"nop\"\n            inout a -> b : reg\n", "    b\n\nf(1)\n")),
+             "'a' is uint and 'b' is ulong, but an 'inout' leaves its result")
+
+@test("an inout of a val is refused, pointing at the tie")
+avi_inout_of_a_val()
+    if !avi_ready() then return
+
+    avi_says(avi_ir("aarch64-macos", avi_arm("f()\n    val a = 1", "            \"nop\"\n            inout a : reg\n", "f()\n")),
+             "'a' cannot be written by this assembly, because it is a 'val'. Declare it 'var' if the instructions are meant to set it, or write 'inout a -> other' to leave the result in another variable")
+
+@test("a tie into a val is refused")
+avi_tie_into_a_val()
+    if !avi_ready() then return
+
+    avi_says(avi_ir("aarch64-macos", avi_arm("f()\n    var a = 1\n    val b = 2", "            \"nop\"\n            inout a -> b : reg\n", "f()\n")),
+             "'b' cannot be written by this assembly, because it is a 'val'. Declare it 'var'")
+
+@test("a tie into a name nothing declares is refused")
+avi_tie_into_undefined()
+    if !avi_ready() then return
+
+    avi_says(avi_ir("aarch64-macos", avi_arm("f()\n    var a = 1", "            \"nop\"\n            inout a -> zz : reg\n", "f()\n")),
+             "undefined name 'zz'")
+
+@test("a tie into a ref is refused")
+avi_tie_into_a_ref()
+    if !avi_ready() then return
+
+    avi_says(avi_ir("aarch64-macos", avi_arm("f()\n    var a = 1\n    var xs = [1, 2]\n    ref r = xs[0]",
+                                             "            \"nop\"\n            inout a -> r : reg\n", "f()\n")),
+             "'r' is bound by 'ref'")
+
+@test("a placeholder naming a tie's result is declared, and one naming nothing still is not")
+avi_placeholders_of_a_tie()
+    if !avi_ready() then return
+
+    val ok = avi_ir("aarch64-macos", avi_arm("f() -> int\n    var a = 1\n    var b = 0",
+                                             "            \"add {b}, {a}, #1\"\n            inout a -> b : reg\n",
+                                             "    b\n\nprint(f())\n"))
+
+    avi_says(ok, "\"add ${0:w}, ${0:w}, #1\"")
+
+    avi_says(avi_ir("aarch64-macos", avi_arm("f()\n    var a = 1\n    var b = 0",
+                                             "            \"add {c}, {a}, #1\"\n            inout a -> b : reg\n", "f()\n")),
+             "'{c}' names an operand this assembly does not declare")
+
+// -- one variable through two operands -------------------------------------------------------------
+
+@test("an inout and an in of one variable are refused as two registers")
+avi_inout_beside_in()
+    if !avi_ready() then return
+
+    avi_says(avi_ir("aarch64-macos", avi_arm("f()\n    var n = 1", "            \"nop\"\n            inout n : reg\n            in n : reg\n", "f()\n")),
+             "'n' is both read and written here, which is two operands and so possibly two registers — the instructions would read one and write another. Write 'inout n : reg' for one operand that does both")
+
+@test("two inouts of one variable are refused")
+avi_two_inouts()
+    if !avi_ready() then return
+
+    avi_says(avi_ir("aarch64-macos", avi_arm("f()\n    var n = 1", "            \"nop\"\n            inout n : reg\n            inout n : reg\n", "f()\n")),
+             "'n' is both read and written here")
+
+@test("a tie's result read by another operand is refused")
+avi_tie_result_read_elsewhere()
+    if !avi_ready() then return
+
+    avi_says(avi_ir("aarch64-macos", avi_arm("f()\n    var a = 1\n    var b = 2",
+                                             "            \"nop\"\n            inout a -> b : reg\n            in b : reg\n", "f()\n")),
+             "'b' is both read and written here")
+
+@test("a tie's source written by an out is refused")
+avi_tie_source_written_elsewhere()
+    if !avi_ready() then return
+
+    avi_says(avi_ir("aarch64-macos", avi_arm("f()\n    var a = 1\n    var b = 2",
+                                             "            \"nop\"\n            out a : reg\n            inout a -> b : reg\n", "f()\n")),
+             "'a' is both read and written here")
+
+@test("in and out of one variable now point at inout, in the operand's own class")
+avi_in_and_out_point_at_inout()
+    if !avi_ready() then return
+
+    avi_says(avi_ir("aarch64-macos", avi_arm("f()\n    var v: <16>u8 = 0", "            \"nop\"\n            in v : vreg\n            out v : vreg\n", "f()\n")),
+             "Write 'inout v : vreg' for one operand that does both")
+
+// -- the spelling ----------------------------------------------------------------------------------
+
+@test("a class slot holding neither class nor a quoted register is refused")
+avi_unknown_class()
+    if !avi_ready() then return
+
+    avi_says(avi_ir("aarch64-macos", avi_arm("f()\n    var n = 1", "            \"nop\"\n            inout n : freg\n", "f()\n")),
+             "'reg', 'vreg' or a quoted machine register expected")
+
+@test("only an inout takes an arrow")
+avi_arrow_only_on_inout()
+    if !avi_ready() then return
+
+    avi_says(avi_ir("aarch64-macos", avi_arm("f()\n    var n = 1\n    var m = 1", "            \"nop\"\n            in n -> m : reg\n", "f()\n")),
+             "':' expected")
+
+@test("an inout at the top of a file is refused like every other operand")
+avi_inout_at_module_level()
+    if !avi_ready() then return
+
+    avi_says(avi_ir("aarch64-macos", raw"""
+        asm
+            [aarch64]
+                "nop"
+                inout n : reg
+            [x86_64, riscv64, riscv32, thumb, craft, wasm32]
+
+        print(1)
+        """), "'n' cannot be an operand here")
+
+@test("vreg and inout stay ordinary names outside their positions")
+avi_words_are_contextual()
+    if !avi_runs_here() then return
+
+    assert_eq(avi_ran(raw"""
+        f() -> int
+            var vreg = 1
+            var inout = 2
+            vreg + inout
+
+        print(f())
+        """), "3\n")

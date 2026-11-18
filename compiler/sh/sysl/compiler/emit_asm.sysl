@@ -27,7 +27,7 @@ gen_asm(e: *Emit, lines: Buf[string], operands: Buf[TAsmOperand], clobbers: Buf[
     e.asm_site += 1
 
     val text = asm_text(lines, e.asm_site, slots)
-    val cons = asm_constraints(operands, clobbers)
+    val cons = asm_constraints(e, operands, clobbers)
 
     // `sideeffect` says the block matters even where nothing reads its result, which is true of
     // every assembly sysl can express: the instructions worth reaching for here are the ones whose
@@ -41,7 +41,7 @@ gen_asm(e: *Emit, lines: Buf[string], operands: Buf[TAsmOperand], clobbers: Buf[
         val r = fresh_reg(e)
 
         emit(e, InAsm(Some(r), lty(e, o.ty), text, cons, loaded))
-        emit(e, InStore(lty(e, o.ty), r, local_slot(e, o.slot), AccPlain, None))
+        emit(e, InStore(lty(e, o.ty), r, local_slot(e, o.into_slot), AccPlain, None))
         return
 
     // Several outputs come back as one anonymous structure, which is LLVM's shape rather than
@@ -61,35 +61,63 @@ gen_asm(e: *Emit, lines: Buf[string], operands: Buf[TAsmOperand], clobbers: Buf[
         val part = fresh_reg(e)
 
         emit(e, InExtract(part, shape, r, index_list(int(i))))
-        emit(e, InStore(lty(e, o.ty), part, local_slot(e, o.slot), AccPlain, None))
+        emit(e, InStore(lty(e, o.ty), part, local_slot(e, o.into_slot), AccPlain, None))
 end gen_asm
 
+// The operands that write (`out` and `inout`), or the ones that read (`in` and `inout`). An `inout`
+// is in both lists: it is one output and one input, tied to share a register.
 private operands_by(operands: Buf[TAsmOperand], out: bool) -> Buf[TAsmOperand]
     var got: Buf[TAsmOperand] = buf()
 
     for item in operands
-        if asm_is_out(item.dir) == out then got.push(item)
+        if (if out then asm_writes(item.dir) else asm_reads(item.dir)) then got.push(item)
 
     got
 end operands_by
 
-private asm_is_out(d: AsmDir) -> bool = d match
-    Out -> true
-    In -> false
+private asm_writes(d: AsmDir) -> bool = d != In
+
+private asm_reads(d: AsmDir) -> bool = d != Out
 
 // What each of a template's names becomes: its operand number, outputs first to match the
 // constraint string, spelled the way the operand's width needs.
+//
+// **An `inout` is named by its output's number**, both the name it reads and the one it leaves its
+// result in: the two are one register, and the output's number is the one the template's reader
+// has. Its input still takes a number of its own, after the outputs, which nothing names.
 private asm_numbering(e: *Emit, operands: Buf[TAsmOperand]) -> Buf[(string, string)]
     var out: Buf[(string, string)] = buf()
+    var n = 0
 
     for item in operands
-        if asm_is_out(item.dir) then out.push((item.name, asm_spelling(e, item, int(out.len()))))
+        if asm_writes(item.dir)
+            val spelled = asm_spelling(e, item, n)
+
+            out.push((item.name, spelled))
+
+            if item.into != item.name then out.push((item.into, spelled))
+
+            n += 1
+        end if
 
     for item in operands
-        if !asm_is_out(item.dir) then out.push((item.name, asm_spelling(e, item, int(out.len()))))
+        if asm_reads(item.dir)
+            if item.dir == In then out.push((item.name, asm_spelling(e, item, n)))
+
+            n += 1
+        end if
 
     out
 end asm_numbering
+
+// The output number the operand at `at` has: how many operands before it write.
+private output_number(operands: Buf[TAsmOperand], at: usize) -> int
+    var n = 0
+
+    for i in 0..<at
+        if asm_writes(operands[i].dir) then n += 1
+
+    n
 
 // **An AArch64 register has two names, and LLVM prints the 64-bit one unless told otherwise** --
 // `x8` for a `u32` it allocated as `w8`, so `crc32cx {out}, {crc}, {word}` reached the assembler as
@@ -97,10 +125,18 @@ end asm_numbering
 // text, so an operand of 32 bits or fewer is printed through the `w` modifier. x86-64 needs nothing:
 // LLVM already names `%eax`, `%ax` or `%al` by the operand's type, and RISC-V and Thumb registers
 // have one name each.
+//
+// **A vector register is printed the same way, by the type.** LLVM names a `v` register `v0`, which
+// is how a vector is written -- the arrangement follows it in the text, `{s}.16b` -- and a float in
+// one through its scalar name, `s0` for an `f32` and `d0` for an `f64`, which is how `fadd` is
+// written. x86-64 names an `xmm` register one way whatever it holds.
 private asm_spelling(e: *Emit, o: TAsmOperand, n: int) -> string
     if e.target.cpu == Aarch64
         lty(e, o.ty) match
             LInt(bits) -> if bits <= 32 then return s"$${$n:w}"
+            LFloat(bits, _) ->
+                if bits == 32 then return s"$${$n:s}"
+                if bits == 64 then return s"$${$n:d}"
             _ -> ()
 
     s"$$$n"
@@ -129,17 +165,25 @@ end slot_of
 // first output is written -- an ordering inside instruction text the compiler cannot see. Written
 // first and read after, the input is gone. The one output that is not early-clobber is one pinned to
 // the very machine register an input is pinned to: the programmer asked for the two to share it.
-private asm_constraints(operands: Buf[TAsmOperand], clobbers: Buf[string]) -> string
+//
+// **An `inout` is an early-clobber output and an input TIED to it** -- the input's constraint is the
+// output's number, LLVM's spelling of "arrives in the register the output leaves from". Early-clobber
+// still means what it says for it: the register is written before every OTHER input has been read,
+// so none of them may share it.
+private asm_constraints(e: *Emit, operands: Buf[TAsmOperand], clobbers: Buf[string]) -> string
     var parts: Buf[string] = buf()
 
     for item in operands
-        if asm_is_out(item.dir) then
+        if asm_writes(item.dir) then
             val early = if shares_input_register(operands, item) then "" else "&"
 
-            parts.push(s"=$early${asm_place(item)}")
+            parts.push(s"=$early${asm_place(e, item)}")
 
-    for item in operands
-        if !asm_is_out(item.dir) then parts.push(asm_place(item))
+    for i in 0..<operands.len()
+        val item = operands[i]
+
+        if item.dir == In then parts.push(asm_place(e, item))
+        elif item.dir == InOut then parts.push(s"${output_number(operands, i)}")
 
     for clobber in clobbers
         parts.push(s"~{${clobber}}")
@@ -159,24 +203,27 @@ end asm_constraints
 
 // Whether an output names the same machine register as some input, which early-clobber would make
 // impossible to allocate.
-private shares_input_register(operands: Buf[TAsmOperand], o: TAsmOperand) -> bool = o.reg match
-    Some(r) -> input_pinned_to(operands, r)
-    None -> false
+private shares_input_register(operands: Buf[TAsmOperand], o: TAsmOperand) -> bool = o.place match
+    PlaceAt(r) -> o.dir == Out && input_pinned_to(operands, r)
+    _ -> false
 
 private input_pinned_to(operands: Buf[TAsmOperand], register: string) -> bool
     for item in operands
-        if !asm_is_out(item.dir) && pinned_to(item, register) then return true
+        if item.dir == In && pinned_to(item, register) then return true
 
     false
 
-private pinned_to(o: TAsmOperand, register: string) -> bool = o.reg match
-    Some(r) -> r == register
-    None -> false
+private pinned_to(o: TAsmOperand, register: string) -> bool = o.place match
+    PlaceAt(r) -> r == register
+    _ -> false
 
-// Where one operand has to live: a named machine register, or any general-purpose one.
-private asm_place(o: TAsmOperand) -> string = o.reg match
-    Some(r) -> s"{$r}"
-    None -> "r"
+// Where one operand has to live: a named machine register, any general-purpose one, or any vector
+// one -- `w` on AArch64 (a `v` register, printed at the width the type asks) and `x` on x86-64 (an
+// `xmm`). The analyzer admitted a `vreg` only on those two.
+private asm_place(e: *Emit, o: TAsmOperand) -> string = o.place match
+    PlaceAt(r) -> s"{$r}"
+    PlaceReg -> "r"
+    PlaceVreg -> if e.target.cpu == Aarch64 then "w" else "x"
 
 // The whole template as one line, with the labels made this site's own and every name replaced by
 // the operand number it stands for.

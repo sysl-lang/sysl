@@ -735,7 +735,35 @@ main()
 **`@keeps(self)` lets an implementation hold the object the call went through** past the call — a
 view registering itself, say. The object may have been made in the caller's frame, so without the
 mark an implementation that keeps `self` is refused where it is written, and with it every call
-through an object hands over an object that may be kept:
+through an object hands over an object that may be kept. The refusal names the mark, because the
+trait's borrowed receiver is its whole cause — it says the same for what the method reads through
+`self` and keeps, and for `self` handed on to a function that keeps it:
+
+```sysl
+trait Widget
+    register(&self) -> int
+
+struct Label
+    f: &Fn() -> int
+
+impl Widget for Label
+    register(&self) -> int
+        shown = Some(self)
+        self.f()
+
+var shown: Option[&Label] = None
+
+main()
+    val w: &Widget = Label(() -> 1)
+
+    w.register()
+```
+
+```error
+or let every implementation keep it by writing '@keeps(self)' above the declaration of 'register' in 'Widget'
+```
+
+With the mark on the trait's method the same implementation is accepted:
 
 ```sysl
 trait Widget
