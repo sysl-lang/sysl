@@ -1,0 +1,348 @@
+module sysl.math.bigint
+
+// The loops every algorithm here is built from, over runs of limbs the caller has already sized.
+//
+// **Each one writes into storage it is handed rather than growing a buffer of its own**, which is the
+// whole difference from the obvious version: a `push` per limb is a length test, a capacity test and
+// a store, where these are the store alone. The run is fixed before the loop starts, so every
+// subscript inside is in range by construction, and the loops say so with `@unchecked` -- the
+// callers are what establish it, and each docstring names what it relies on.
+//
+// They are the same seven GMP's `mpn` layer is built on (`add_n`, `sub_n`, `mul_1`, `addmul_1`,
+// `submul_1`, `lshift`, `rshift`), and they answer the carry or borrow out of the top instead of
+// writing it, which is what lets a caller decide whether there is a limb for it.
+
+/** `r[0..<n] = a[0..<n] + b[0..<n]`, answering the carry out (0 or 1). `r` may be `a` or `b`.
+ *
+ * **Written with the two limbs' sum first and the carry added to it second**, each overflow read off
+ * as a comparison, rather than as one double-width sum. The two say the same thing, but in this
+ * order the limbs' sum does not wait for the carry, so the chain from one limb to the next is one
+ * add and one flag -- half what the double-width form leaves on it. **Four limbs a turn** lets the
+ * back end keep the carry in the flags between them, as an add-with-carry chain. (Measured on an
+ * M4, in C through the same back end: the double-width loop 0.78 ns a limb, this order 0.54, this
+ * order four at a time 0.41, GMP's assembly 0.25.)
+ */
+private[bigint] add_n(r: []Limb, a: []const Limb, b: []const Limb, n: usize) -> Limb
+    var carry: Limb = 0
+    var i: usize = 0
+
+    while i + 4 <= n
+        carry = add_step(r, a, b, i, carry)
+        carry = add_step(r, a, b, i + 1, carry)
+        carry = add_step(r, a, b, i + 2, carry)
+        carry = add_step(r, a, b, i + 3, carry)
+        i += 4
+
+    while i < n
+        carry = add_step(r, a, b, i, carry)
+        i += 1
+
+    carry
+end add_n
+
+/** One limb of `add_n`: `r[i] = a[i] + b[i] + carry`, answering the carry out. */
+private add_step(r: []Limb, a: []const Limb, b: []const Limb, i: usize, carry: Limb) -> Limb
+    @unchecked
+        val x = a[i]
+        val s1 = x +% b[i]
+        val s = s1 +% carry
+
+        r[i] = s
+
+        return Limb(s1 < x) | Limb(s < s1)
+end add_step
+
+/** `r[0..<n] = a[0..<n] + c`, `c` a carry or any single limb, answering the carry out. `r` may be
+ * `a`. The loop stops copying the moment the carry dies only where `r` is `a`; otherwise it copies
+ * the rest, which is what makes it the tail of an addition of unequal lengths.
+ */
+private[bigint] add_1(r: []Limb, a: []const Limb, n: usize, c: Limb) -> Limb
+    var carry = Wide(c)
+
+    @unchecked
+        for i in 0..<n
+            val s = Wide(a[i]) + carry
+
+            r[i] = low_limb(s)
+            carry = s >> limb_bits
+
+    Limb(carry)
+end add_1
+
+/** `r[0..<n] = a[0..<n] - b[0..<n]`, answering the borrow out (0 or 1). `r` may be `a` or `b`.
+ *
+ * The mirror of `add_n`, in the same order for the same reason: a difference that goes below zero
+ * wraps, and the wrap is what the comparison reads as a borrow.
+ */
+private[bigint] sub_n(r: []Limb, a: []const Limb, b: []const Limb, n: usize) -> Limb
+    var borrow: Limb = 0
+    var i: usize = 0
+
+    while i + 4 <= n
+        borrow = sub_step(r, a, b, i, borrow)
+        borrow = sub_step(r, a, b, i + 1, borrow)
+        borrow = sub_step(r, a, b, i + 2, borrow)
+        borrow = sub_step(r, a, b, i + 3, borrow)
+        i += 4
+
+    while i < n
+        borrow = sub_step(r, a, b, i, borrow)
+        i += 1
+
+    borrow
+end sub_n
+
+/** One limb of `sub_n`: `r[i] = a[i] - b[i] - borrow`, answering the borrow out. */
+private sub_step(r: []Limb, a: []const Limb, b: []const Limb, i: usize, borrow: Limb) -> Limb
+    @unchecked
+        val x = a[i]
+        val d1 = x -% b[i]
+        val d = d1 -% borrow
+
+        r[i] = d
+
+        return Limb(d1 > x) | Limb(d > d1)
+end sub_step
+
+/** `r[0..<n] = a[0..<n] - c`, answering the borrow out. `r` may be `a`. */
+private[bigint] sub_1(r: []Limb, a: []const Limb, n: usize, c: Limb) -> Limb
+    var borrow = Wide(c)
+
+    @unchecked
+        for i in 0..<n
+            val d = Wide(a[i]) -% borrow
+
+            r[i] = low_limb(d)
+            borrow = (d >> limb_bits) & 1
+
+    Limb(borrow)
+end sub_1
+
+/** `r[0..<n] = a[0..<n] * m + c`, answering the limb that carries out of the top. `r` may be `a`.
+ *
+ * This and the two below split the product into its halves and add to the LOW half as a limb, the
+ * overflow read off as a comparison, for the reason `add_n` gives: the product does not wait for the
+ * carry. Here the previous high half and a one-bit carry are kept apart, four limbs a turn, which
+ * measured 22% faster on an M4 than one carry of a limb. The high half plus the overflows cannot
+ * itself overflow: a product's high half is at most `2^w - 2`.
+ */
+private[bigint] mul_1(r: []Limb, a: []const Limb, n: usize, m: Limb, c: Limb = 0) -> Limb
+    val mw = Wide(m)
+
+    // The previous product's high half and the one-bit carry ride separately, so that each limb is
+    // `lo + hi + carry` -- the shape of `add_n`, which four at a time becomes an add-with-carry chain.
+    var hi = c
+    var cf: Limb = 0
+    var i: usize = 0
+
+    while i + 4 <= n
+        (hi, cf) = mul_step(r, a, i, mw, hi, cf)
+        (hi, cf) = mul_step(r, a, i + 1, mw, hi, cf)
+        (hi, cf) = mul_step(r, a, i + 2, mw, hi, cf)
+        (hi, cf) = mul_step(r, a, i + 3, mw, hi, cf)
+        i += 4
+
+    while i < n
+        (hi, cf) = mul_step(r, a, i, mw, hi, cf)
+        i += 1
+
+    hi + cf
+end mul_1
+
+/** One limb of `mul_1`: `r[i]` is the low half of `a[i] m` plus the high half before it plus the
+ * carry, answering this limb's high half and the carry out.
+ */
+private mul_step(r: []Limb, a: []const Limb, i: usize, mw: Wide, hi: Limb, cf: Limb) -> (Limb, Limb)
+    @unchecked
+        val p = Wide(a[i]) * mw
+        val lo = low_limb(p)
+        val s1 = lo +% hi
+        val s = s1 +% cf
+
+        r[i] = s
+
+        return (Limb(p >> limb_bits), Limb(s1 < lo) | Limb(s < s1))
+end mul_step
+
+/** `r[0..<n] += a[0..<n] * m`, answering the limb that carries out of the top -- one row of a
+ * schoolbook product. One carry, at most a limb: the step's total is at most `2^(2w) - 1`.
+ *
+ * (Unlike `mul_1`, splitting this into two one-bit chains four limbs at a time measured SLOWER --
+ * 30-limb products 47% slower on an M4 -- so it stays a single chain.)
+ */
+private[bigint] addmul_1(r: []Limb, a: []const Limb, n: usize, m: Limb) -> Limb
+    val mw = Wide(m)
+    var carry: Limb = 0
+
+    @unchecked
+        for i in 0..<n
+            val p = Wide(a[i]) * mw
+            val lo = low_limb(p)
+            val s1 = lo +% r[i]
+            val s = s1 +% carry
+
+            r[i] = s
+            carry = Limb(p >> limb_bits) + Limb(s1 < lo) + Limb(s < s1)
+
+    carry
+end addmul_1
+
+/** `r[0..<n] -= a[0..<n] * m`, answering what has to be taken from the limb above -- the
+ * multiply-and-subtract step of a long division. The product's high half and the two borrows are
+ * carried together, which is at most `m` and so never more than a limb's worth.
+ */
+private[bigint] submul_1(r: []Limb, a: []const Limb, n: usize, m: Limb) -> Limb
+    val mw = Wide(m)
+    var carry: Limb = 0
+
+    @unchecked
+        for i in 0..<n
+            val p = Wide(a[i]) * mw
+            val lo = low_limb(p)
+            val x = r[i]
+            val d1 = x -% lo
+            val d = d1 -% carry
+
+            r[i] = d
+            carry = Limb(p >> limb_bits) + Limb(d1 > x) + Limb(d > d1)
+
+    carry
+end submul_1
+
+/** `r[0..<n] = a[0..<n] << s` for `0 < s < limb_bits`, answering the bits shifted out of the top.
+ * Runs from the top down, so `r` may be `a`.
+ */
+private[bigint] lshift(r: []Limb, a: []const Limb, n: usize, s: usize) -> Limb
+    val back = limb_bits - s
+    var i = n
+
+    @unchecked
+        val out = a[n - 1] >> back
+
+        while i > 1
+            i -= 1
+            r[i] = a[i] << s | a[i - 1] >> back
+
+        r[0] = a[0] << s
+
+        return out
+end lshift
+
+/** `r[0..<n] = a[0..<n] >> s` for `0 < s < limb_bits`, the bits shifted out of the bottom dropped.
+ * Runs from the bottom up, so `r` may be `a`.
+ */
+private[bigint] rshift(r: []Limb, a: []const Limb, n: usize, s: usize)
+    val back = limb_bits - s
+
+    @unchecked
+        for i in 0..<(n - 1)
+            r[i] = a[i] >> s | a[i + 1] << back
+
+        r[n - 1] = a[n - 1] >> s
+end rshift
+
+/** `n` limbs of fresh storage that nothing has written: for a result every limb of which the caller
+ * is about to write, where `[0; n]` would clear the run only for it to be overwritten. A limb holds
+ * no count, so a slot of one is written by a plain store; the caller's promise is only that nothing
+ * reads a limb it has not written.
+ */
+private[bigint] fresh(n: usize) -> []Limb = slot_storage(n)
+
+/** `r[0..<n] = a[0..<n]`. */
+private[bigint] copy_n(r: []Limb, a: []const Limb, n: usize)
+    @unchecked
+        for i in 0..<n
+            r[i] = a[i]
+
+/** How many limbs of `a[0..<n]` are left once the zeros at the top are dropped. */
+private[bigint] top_of(a: []const Limb, n: usize) -> usize
+    var k = n
+
+    @unchecked
+        while k > 0 && a[k - 1] == 0
+            k -= 1
+
+    k
+end top_of
+
+/** The first `n` limbs of a fresh run, trimmed, as a magnitude -- the one place a result built in
+ * storage of a known size becomes a value. The view keeps the whole allocation alive, which is at
+ * most the few limbs the trim dropped.
+ */
+private[bigint] finished(out: []Limb, n: usize) -> []const Limb = out[0..<top_of(out, n)]
+
+// -- division by one limb, without a divide instruction -------------------------------------------
+//
+// **A two-limb by one-limb division is the step every conversion and every long division takes, and
+// no 64-bit machine has an instruction for it** -- `u128 / u128` is a call into the runtime, tens of
+// cycles each. Möller and Granlund ("Improved division by invariant integers", IEEE Transactions on
+// Computers, 2011, algorithm 4) replace it with two multiplies by a reciprocal computed once per
+// divisor. The divisor has to be NORMALIZED -- its top bit set -- for the reciprocal to fit a limb,
+// which is why a caller shifts first.
+
+/** The reciprocal of a normalized `d`: `floor((2^(2w) - 1) / d) - 2^w`, which fits a limb. */
+private[bigint] reciprocal(d: Limb) -> Limb
+    val all = (Wide(~d) << limb_bits) | limb_mask
+
+    Limb(all / Wide(d))
+
+/** `(q, r)` with `q = floor((u1 * 2^w + u0) / d)`, for a normalized `d` with `u1 < d` and its
+ * reciprocal `v`. Two multiplies and at most two corrections, both rare.
+ */
+private[bigint] div_2by1(u1: Limb, u0: Limb, d: Limb, v: Limb) -> (Limb, Limb)
+    // The sum is taken modulo `2^(2w)`, as the paper's is: only its two limbs are wanted.
+    val p = Wide(v) * Wide(u1) +% ((Wide(u1) << limb_bits) | Wide(u0))
+    var q1 = low_limb((p >> limb_bits) + 1)
+    val q0 = low_limb(p)
+    var r = u0 -% q1 *% d
+
+    if r > q0
+        q1 = q1 -% 1
+        r = r +% d
+
+    if r >= d
+        q1 += 1
+        r -= d
+
+    (q1, r)
+end div_2by1
+
+/** `q[0..<n] = a[0..<n] / d`, answering the remainder, for any non-zero `d`. `q` may be `a`.
+ *
+ * The divisor is normalized by shifting it, and the dividend is shifted by the same amount on the
+ * fly, one limb at a time, so nothing is copied; the remainder comes out shifted and is shifted back.
+ */
+private[bigint] divrem_1(q: []Limb, a: []const Limb, n: usize, d: Limb) -> Limb
+    val s = usize(d.leading_zeros())
+    val dn = d << s
+    val v = reciprocal(dn)
+    var r: Limb = 0
+    var i = n
+
+    @unchecked
+        if s == 0
+            while i > 0
+                i -= 1
+
+                val (qi, ri) = div_2by1(r, a[i], dn, v)
+
+                q[i] = qi
+                r = ri
+        else
+            val back = limb_bits - s
+
+            // The top limb's high bits start the remainder: shifted, it is two limbs, the upper of
+            // which is under the shifted divisor because the divisor is the larger.
+            r = a[n - 1] >> back
+
+            while i > 0
+                i -= 1
+
+                val next = if i > 0 then a[i - 1] >> back else 0
+                val (qi, ri) = div_2by1(r, a[i] << s | next, dn, v)
+
+                q[i] = qi
+                r = ri
+
+    r >> s
+end divrem_1
