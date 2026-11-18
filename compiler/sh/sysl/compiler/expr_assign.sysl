@@ -121,6 +121,9 @@ assign_expr(cx: &Analyzer, span: Span, written: string, target: Expr, value: Exp
 
     val bin = op[0..<op.bytes.len - 1]
 
+    if reads_through(texpr_type(place)) && core_infix(bin).is_some() then
+        return update_through(cx, span, written, op, bin, target, place, value, yields)
+
     // A compound assignment is arithmetic: its value's position fixes nothing, but the place and the
     // value fix each other where one of them is undecided and the other has a type of its own.
     not_fixing_at(cx, value)
@@ -149,7 +152,8 @@ assign_expr(cx: &Analyzer, span: Span, written: string, target: Expr, value: Exp
         return bad_expr(span)
     end if
 
-    val tv = widened_operand(cx, span, bin, texpr_type(place), read, Some(value))
+    val tv = widened_operand(cx, span, bin, texpr_type(place),
+                             update_operand(cx, bin, texpr_type(place), read), Some(value))
 
     if operand_refused(read, tv) then return bad_expr(span)
 
@@ -175,6 +179,51 @@ assign_expr(cx: &Analyzer, span: Span, written: string, target: Expr, value: Exp
               TExpr(span, TUpdate(place, op, tv, texpr_type(place), dispatch,
                                   constraint_of(texpr_type(place)), yields)))
 end assign_expr
+
+// **`r op= v` on a place held as a `&T` is `r = r op v`** (`reference/generics.md § Operators see
+// through a reference`): the operator reads the reference through to the `T` it reaches, and what it
+// gives back is stored into the place -- a new `T` boxed into it, or the `&T` an implementation
+// written for a type with a `Drop` hands back. The referent the place held before is not written,
+// so another reference to it keeps the value it had, exactly as for the spelled-out assignment.
+//
+// The place is read twice, once to read through and once to store, so it is held to a form whose
+// second reading is the first: a name, and fields and subscripts of one by a name or a literal.
+private update_through(cx: &Analyzer, span: Span, written: string, op: string, bin: string,
+                       target: Expr, place: TExpr, value: Expr, yields: bool) -> TExpr
+    val place_ty = texpr_type(place)
+
+    if !rereadable(target) then
+        return cx.err(span, s"'$written' on ${describe_target(target)}, held as ${type_show(place_ty)}, " +
+                      "reads the place and stores the result back, and this place would be worked out " +
+                      s"twice — write it out as 'x = x $bin v' over a place named once")
+
+    val sum = type_expr(cx, expr(span, Binary(bin, target, value)), Some(place_ty))
+
+    if texpr_type(sum) == Unknown then return bad_expr(span)
+
+    val stored = coerce(cx, sum, place_ty)
+
+    if disagree(texpr_type(stored), place_ty)
+        cx.fault(span, s"'$op' updates ${type_show(place_ty)} in place, but '$bin' gives " +
+                 s"${type_show(texpr_type(sum))} — write the assignment out to say where it goes")
+
+        return bad_expr(span)
+    end if
+
+    note_view_store(cx, span, place, stored)
+    rechecked(cx, span, place, TExpr(span, TStore(place, stored, place_ty, yields)))
+end update_through
+
+// Whether reading a place a second time names the same storage and does nothing else.
+private rereadable(e: Expr) -> bool = *e.kind match
+    Ident(_) -> true
+    Field(receiver, _, _) -> rereadable(receiver)
+    Index(receiver, index, _) -> rereadable(receiver) && (is_literal(index) || named(index))
+    _ -> false
+
+private named(e: Expr) -> bool = *e.kind match
+    Ident(_) -> true
+    _ -> false
 
 // The vector a lane write names: `v[2] = x` and `v.xy = e`, where the receiver is a vector. A
 // selection whose name is swizzle letters might as well be a field of a struct, so the receiver's

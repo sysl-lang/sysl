@@ -1038,8 +1038,9 @@ the reference does not, and the refusal says which:
   ([memory]({{< ref "memory" >}})), and a trait that requires either. A `&T` meets both through its
   referent where the referent has them and by its identity where it does not, so a trait requiring
   either is met through a `&T` like any other;
-- **an operator's trait** — `PartialOrd`, `Add` and the rest, and `Ord`, which requires `PartialOrd` —
-  since `a < b` and `a + b` do not see through a reference;
+- **through a `*T`, an operator's trait** — `PartialOrd`, `Add` and the rest, and `Ord`, which
+  requires `PartialOrd` — since a pointer's arithmetic is its address's. A `&T` meets them through its
+  referent, because [an operator sees through a reference](#operators-see-through-a-reference);
 - **a member naming `Self` away from its receiver**, such as `merge(self, other: Self)`, since `Self`
   would be the reference in the body and the referent in the implementation;
 - **an associated function or a static property**, which is reached through the type, and a
@@ -1057,18 +1058,99 @@ impl Ord for N
 least[T: Ord](a: T, b: T) -> bool = a < b
 
 main()
-    val n: &N = N(1)
+    val n: *N = null
     print(least(n, n))
 ```
 
 ```error
-'least' requires its type parameter 'T' to implement 'Ord', but &N does not — N implements it, but 'PartialOrd' is an operator's, and an operator does not see through a reference
+'least' requires its type parameter 'T' to implement 'Ord', but *N does not — N implements it, but 'PartialOrd' is an operator's, and an operator does not see through a pointer
 ```
 
 `Display` and `Debug` are reached through, so `v.display(…)` on a `T` at `*P` is `P`'s. What
 `v.to_string()` and `s"${v}"` render is decided by the rule for showing a value, and a raw
 pointer is shown as its address there ([traits]({{< ref "traits" >}})), at `T = *P` as on a `*P`
 local.
+
+### Operators see through a reference
+
+**An operator resolves through a `&T`.** An operand held as a counted reference — a `&T` or a
+`&sync T` — is read through to the `T` it reaches, one level, as a member call's receiver is, and the
+operator is `T`'s. That holds for every binary operator, `-` and `~`, the orderings, and the
+compound assignments. A reference has no arithmetic and no order of its own, so nothing is taken
+from it; `==` keeps its own rule, the referent's `Eq` where it has one and identity where it does
+not ([memory]({{< ref "memory" >}})).
+
+- **The forms mix**: `&T op &T`, `&T op T`, `T op &T`, a literal either side, and a `&T` beside a
+  `&sync T`. A literal beside a `&T` is read at what `T`'s implementations take, as beside a `T`.
+- **The right operand is the one the implementation was written to take.** Where `T` implements the
+  operator at the reference — `impl Add[&Big, &Big] for Big` — the right operand stays a reference;
+  otherwise it is read through as well.
+- **`r op= v` on a `&T` place is `r = r op v`**: the result is stored into the place, a `T` boxed
+  into it or the `&T` the implementation gives back. What the place held before is not written, so
+  another reference to it keeps its value. The place is read twice, so it is a name, or fields and
+  subscripts of one by a name or a literal; a place with a call in it is refused, as is a write of
+  several places at once.
+- **A bound on an operator's trait is met through a `&T`**: `[T: Add]` at `&V` is met by `V`'s `Add`,
+  whose `Rhs = Self` is `V` on both sides of the body's `a + b`, and a member of the trait named in
+  the body (`a.lt(b)`) reads through the same way. Through a `*T` it is not: a pointer's arithmetic
+  is its address's.
+- **One level**: a `& &T` reads through to the `&T`, which has no operators.
+
+So **a type with a `Drop`, held only as a `&T`, has operators**. Its implementations take `self` —
+the copy a method is handed — and name `&Big` where they take or give another value:
+
+```sysl
+struct Big
+    n: int
+
+impl Drop for Big
+    drop(self) = print("free", self.n)
+
+impl Add[&Big, &Big] for Big
+    add(self, rhs: &Big) -> &Big = Big(self.n + rhs.n)
+
+impl Add[int, &Big] for Big
+    add(self, rhs: int) -> &Big = Big(self.n + rhs)
+
+impl Ord for Big
+    lt(self, rhs: Big) -> bool = self.n < rhs.n
+
+total[T: Add](a: T, b: T) -> T = a + b
+
+run()
+    val a = Big(1)
+    val b = Big(2)
+    var acc = a + b
+
+    acc += 10
+    print(acc.n, a < b, total(a, b).n)
+
+run()
+```
+
+```output
+free 3
+13 true 3
+free 3
+free 13
+free 2
+free 1
+```
+
+A referent with no implementation is the one the refusal names:
+
+```sysl
+struct W
+    n: int
+
+main()
+    val a: &W = W(1)
+    print((a + a).n)
+```
+
+```error
+operator '+' is not defined for W
+```
 
 ### A trait object satisfies a bound on the trait it dispatches through
 

@@ -964,6 +964,19 @@ call_member(cx: &Analyzer, span: Span, receiver: TExpr, name: string, args: Buf[
         if member.is_some() then return member.unwrap()
     end if
 
+    // **An operator's member reached through a bound at a `&T` is the operator**, which reads both
+    // operands through (`operator_call.sysl`'s `through_reference`): `a.lt(b)` in a `[T: Ord]` body
+    // at `&V` compares two `V`s, as `a < b` there does, since the bound was met by `V`'s `Ord`.
+    val token = operator_member_token(name)
+
+    if token.is_some() && cx.at_definition then note_bound_site(cx, span, held)
+
+    if token.is_some() && reads_through(held) && reached_through_bound(cx, span, held, name)
+        val member = operator_member(cx, span, receiver, held, token.unwrap(), args)
+
+        if member.is_some() then return member.unwrap()
+    end if
+
     // **`into_raw` is every counted reference's** -- a generic `&T` and a trait object's included,
     // which reach no table of members -- unless the referent's own type has a member of the name.
     if name == "into_raw" && !owns_member(cx, rty, name)
@@ -1095,6 +1108,67 @@ private reference_member(cx: &Analyzer, span: Span, receiver: TExpr, held: Type,
     cmps.push(TCmp("==", compare_at(cx, span, "==", peeled(held, levels)), levels))
     Some(TExpr(span, TCompare(ts, cmps)))
 end reference_member
+
+// The operator an operator trait's member is written as, for the members a reference reaches by
+// reading its operands through.
+private operator_member_token(name: string) -> Option[string] = name match
+    "add" -> Some("+")
+    "sub" -> Some("-")
+    "mul" -> Some("*")
+    "div" -> Some("/")
+    "rem" -> Some("%")
+    "bitand" -> Some("&")
+    "bitor" -> Some("|")
+    "bitxor" -> Some("^")
+    "shl" -> Some("<<")
+    "shr" -> Some(">>")
+    "lt" -> Some("<")
+    "le" -> Some("<=")
+    "neg" -> Some("-")
+    "not" -> Some("~")
+    _ -> None
+
+// `a.add(b)`, `a.lt(b)`, `a.neg()` on a `&T` reached through a bound: the operator between what the
+// operands reach. Nothing where the call is not shaped as the member, which leaves it to the ordinary
+// call and its complaint.
+private operator_member(cx: &Analyzer, span: Span, receiver: TExpr, held: Type, token: string,
+                        args: Buf[Expr]) -> Option[TExpr]
+    val l = through_reference(cx, receiver)
+    val lty = texpr_type(l)
+
+    if args.is_empty()
+        val dispatched = prefix_call(cx, span, token, l)
+
+        if dispatched.is_some() then return dispatched
+
+        return Some(produced(TExpr(span, TUnary(token, l, unary_type(lty)))))
+    end if
+
+    if args.len() != 1 then return None
+
+    if token == "<" || token == "<="
+        val rhs = type_expr(cx, args[0], Some(held))
+        var ts: Buf[TExpr] = buf()
+        var cmps: Buf[TCmp] = buf()
+
+        ts.push(receiver)
+        ts.push(rhs)
+        cmps.push(TCmp(token, compare_at(cx, span, token, lty), 1))
+
+        return Some(TExpr(span, TCompare(ts, cmps)))
+    end if
+
+    val r = through_reference(cx, type_expr(cx, args[0], Some(held)))
+    val dispatched = operator_call(cx, span, token, l, r, args[0])
+
+    if dispatched.is_some() then return dispatched
+
+    val ty = arith_type(cx, span, token, lty, texpr_type(r), args[0].span)
+
+    if ty == Unknown then return Some(bad_expr(span))
+
+    Some(produced(TExpr(span, TBinary(token, l, r, ty))))
+end operator_member
 
 // Whether a member call on a reference was written through a bound rather than on a reference the
 // program named: inside a derivation, where every part is asked the trait being derived, or where the
