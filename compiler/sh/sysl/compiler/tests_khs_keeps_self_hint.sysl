@@ -1,0 +1,265 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.replace_all
+
+// **A refusal that has a trait's borrowed receiver for its cause names the fix**: a call through an
+// object sees no body, so the object it went through is borrowed for the call, and an implementation
+// that keeps it -- or keeps what it reads through it -- is told to mark the trait's method
+// `@keeps(self)` (`keeps.sysl`'s `keeps_hint`, reached from `refuse_promised`).
+//
+// The cells: every way an implementation keeps the receiver (stored, stored from a field of it, stored
+// from a field's field, handed to a function that keeps it, captured by a closure that is kept, kept
+// by a default method, kept through a `*self` receiver) is refused WITH the hint. Against them, the
+// refusals whose cause is not the receiver -- a parameter other than `self` (the hint names that
+// parameter), a closure's own parameter, a function whose address is taken -- say what they said, with
+// no word about a trait's declaration; and a trait that does say `@keeps(self)` refuses nothing.
+
+private val khs_hint ="writing '@keeps(self)' above the declaration of 'put' in 'Sink'"
+
+private khs_with(body: string, extra: string = "") -> string = replace_all(raw"""
+    trait Sink
+        put(&self) -> int
+
+    struct Inner
+        f: &Fn() -> int
+
+    struct Box
+        f: &Fn() -> int
+        inner: &Inner
+
+    impl Sink for Box
+        put(&self) -> int
+            BODY
+            self.f()
+
+    var held: Option[&Box] = None
+    var held_f: Option[&Fn() -> int] = None
+    var held_g: Option[&Fn() -> int] = None
+
+    keep_box(b: &Box)
+        held = Some(b)
+
+    main()
+        val s: &Sink = Box(() -> 3, Inner(() -> 4))
+
+        print(s.put())
+    """, "BODY", body)
+
+@test("a receiver an implementation stores is refused, and the hint names the trait's '@keeps(self)'")
+khs_stored_receiver()
+    if !enm_ready() then return
+
+    val said = enm_err(khs_with("held = Some(self)"))
+
+    assert(said.contains("'put' keeps its parameter 'self' (it is stored in 'held'), but a method of 'Sink' borrows"), said)
+    assert(said.contains(khs_hint), said)
+
+@test("what an implementation stores from a field of the receiver is refused with the same hint")
+khs_stored_through_field()
+    if !enm_ready() then return
+
+    val said = enm_err(khs_with("held_f = Some(self.inner.f)"))
+
+    assert(said.contains("'put' keeps its parameter 'self'"), said)
+    assert(said.contains(khs_hint), said)
+
+@test("a receiver handed to a function that keeps it is refused with the hint")
+khs_receiver_passed_on()
+    if !enm_ready() then return
+
+    val said = enm_err(khs_with("keep_box(self)"))
+
+    assert(said.contains("(it is passed to 'keep_box', which keeps it)"), said)
+    assert(said.contains(khs_hint), said)
+
+@test("a kept closure that captures the receiver is refused with the hint")
+khs_receiver_captured()
+    if !enm_ready() then return
+
+    val said = enm_err(khs_with("val g = () -> self.f()\n        held_g = Some(g)"))
+
+    assert(said.contains("'put' keeps its parameter 'self'"), said)
+    assert(said.contains(khs_hint), said)
+
+@test("a '*self' receiver an implementation stores is refused with the hint")
+khs_raw_receiver()
+    if !enm_ready() then return
+
+    val said = enm_err(raw"""
+        trait Sink
+            put(*self) -> int
+
+        struct Box
+            n: int
+
+        impl Sink for Box
+            put(*self) -> int
+                held = self
+                1
+
+        var held: *Box = null
+
+        main()
+            var b = Box(1)
+            val s: *Sink = &b
+
+            print(s.put())
+        """)
+
+    assert(said.contains("'put' keeps its parameter 'self'"), said)
+    assert(said.contains(khs_hint), said)
+
+@test("a default method that keeps the receiver is refused with the hint")
+khs_default_method()
+    if !enm_ready() then return
+
+    val said = enm_err(raw"""
+        trait Sink
+            put(&self) -> int
+                held = Some(self)
+                0
+
+            size(&self) -> int
+
+        struct Box
+            f: &Fn() -> int
+
+        impl Sink for Box
+            size(&self) -> int = self.f()
+
+        var held: Option[&Sink] = None
+
+        main()
+            val s: &Sink = Box(() -> 1)
+
+            print(s.put())
+        """)
+
+    assert(said.contains("'put' keeps its parameter 'self'"), said)
+    assert(said.contains(khs_hint), said)
+
+@test("a parameter other than 'self' is refused with a hint naming that parameter, never '@keeps(self)'")
+khs_other_parameter_is_not_self()
+    if !enm_ready() then return
+
+    val said = enm_err(raw"""
+        trait Sink
+            put(&self, x: &Fn() -> int) -> int
+
+        struct Box
+            n: int
+
+        impl Sink for Box
+            put(&self, x: &Fn() -> int) -> int
+                held = Some(x)
+                self.n
+
+        var held: Option[&Fn() -> int] = None
+
+        main()
+            val s: &Sink = Box(1)
+
+            print(s.put(() -> 4))
+        """)
+
+    assert(said.contains("'put' keeps its parameter 'x'"), said)
+    assert(said.contains("writing '@keeps(x)' above the declaration of 'put' in 'Sink'"), said)
+    assert(!said.contains("@keeps(self)"), said)
+
+@test("an implementation that keeps only a plain copy of what it reads is not refused, so it gets no hint")
+khs_copy_is_not_refused()
+    if !enm_ready() then return
+
+    assert_eq(enm_err(raw"""
+        trait Sink
+            put(&self) -> int
+
+        struct Box
+            n: int
+
+        impl Sink for Box
+            put(&self) -> int
+                held = self.n
+                1
+
+        var held: int = 0
+
+        main()
+            val s: &Sink = Box(3)
+
+            print(s.put())
+        """), "")
+
+@test("a closure that keeps its parameter is told to mark the callable type, with no word about a trait")
+khs_closure_gets_no_trait_hint()
+    if !enm_ready() then return
+
+    val said = enm_err(raw"""
+        var held: Option[&Fn() -> int] = None
+
+        main()
+            val g: &Fn(&Fn() -> int) -> int = (f) ->
+                held = Some(f)
+                1
+
+            print(g(() -> 4))
+        """)
+
+    assert(said.contains("a closure borrows what it is handed for the call"), said)
+    assert(said.contains("marking the parameter '@keeps' in the type it is made at"), said)
+    assert(!said.contains("above the declaration"), said)
+    assert(!said.contains("@keeps(self)"), said)
+
+@test("a function whose address is taken, and no trait's method, is not told about a trait's declaration")
+khs_function_pointer_gets_no_trait_hint()
+    if !enm_ready() then return
+
+    val said = enm_err(raw"""
+        var held: *int = null
+
+        keep(p: *int) -> int
+            held = p
+            1
+
+        main()
+            val f: *extern(*int) -> int = &keep
+            var n = 1
+
+            print(f(&n))
+        """)
+
+    assert(said.contains("'keep' keeps its parameter 'p' (it is stored in 'held'), and its address is taken"), said)
+    assert(!said.contains("above the declaration"), said)
+    assert(!said.contains("@keeps(self)"), said)
+
+@test("a method called directly, on a type with no trait in the way, is not refused at all")
+khs_direct_call_is_not_refused()
+    if !enm_ready() then return
+
+    assert_eq(enm_err(raw"""
+        struct Box
+            f: &Fn() -> int
+
+        impl Box
+            put(&self) -> int
+                held = Some(self)
+                self.f()
+
+        var held: Option[&Box] = None
+
+        main()
+            val b: &Box = Box(() -> 3)
+
+            print(b.put())
+        """), "")
+
+@test("with '@keeps(self)' on the trait's method the same implementation is accepted")
+khs_marked_trait_accepts()
+    if !enm_ready() then return
+
+    val text = khs_with("held = Some(self)")
+    val marked = replace_all(text, "trait Sink\n    put(&self) -> int", "trait Sink\n    @keeps(self)\n    put(&self) -> int")
+
+    assert(marked != text)
+    assert_eq(enm_err(marked), "")

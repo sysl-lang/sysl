@@ -55,7 +55,10 @@ print(id[int](7), id[string]("s"))
 **The list takes `()` and tuple types as the type grammar does**: `id[()](())` instantiates at
 `unit`, `id[(int, bool)]((1, true))` at a tuple, and either may sit inside an application
 (`Option[()]`, `Result[(), string]`). A subscript holding parentheses still subscripts: `a[(1)]`
-indexes, and `b[()]` and `g[(i, j)]` index a type with an `Index` for `()` or for a tuple.
+indexes, and `b[()]` and `g[(i, j)]` index a type with an `Index` for `()` or for a tuple. On such
+a value the parentheses may go: `g[i, j]` is a subscript with two indices
+([`reference/arrays.md`](/reference/arrays/#several-indices-in-one-subscript)), read so wherever the
+head is a value rather than a generic.
 
 ```sysl
 id[T](x: T) -> T = x
@@ -248,9 +251,10 @@ print(pick[int](1))
 'B' is in neither the parameters of 'pick' nor its result, so nothing in this call says what it should be
 ```
 
-**Two kinds of parameter are always inferred.** A **type pack** (`..A`) stands for a list of types
-rather than one and has no expression spelling, so its instantiation is always solved. A **bare
-arrow's own parameter** is the other, described below.
+**A type pack takes a run of the list.** A **type pack** (`..A`) stands for a list of types rather
+than one, so in a written list it takes every argument the other parameters leave
+([below](#a-written-list-spreads-over-a-pack)). **A bare arrow's own parameter is always inferred**,
+as described below.
 
 An associated function selected from the **plain** name of a generic type takes its type's
 parameters from the annotation on the binding. The annotation also reaches through an `unwrap()` or
@@ -2596,6 +2600,60 @@ print(o.take((1, "ab")))
 A `struct`, an `enum` and a `trait` may not take a pack, for a different reason: their parameters
 **are** their shape, and there is nothing to spread a list over. A member has no shape of its own, so
 that reason does not apply to it.
+
+### A written list spreads over a pack
+
+A pack is usually read off the tuple it is handed, but a declaration whose pack appears in no
+parameter has nothing to read it off, and a written list names it. **The pack takes every argument
+the other parameters leave**: those before it take the leading ones and those after it the trailing
+ones, one type each, and the pack the run between.
+
+```sysl
+struct Pos
+    x: int
+    y: int
+
+count[..A]() -> usize = A.len
+last[T, ..A](x: T) -> usize = A.len
+
+print(count[int, bool](), count[Pos](), count[(Pos, Pos)](), last[string, int, int]("s"))
+```
+
+```output
+2 1 1 2
+```
+
+**One type named for a pack is a pack of that one type**, never its parts: `count[Pos]` counts one,
+and a tuple named in the list is one type of the pack like any other. A pack bound to one type is a
+[tuple of one part](/reference/types/#a-tuple-of-one-part), `(Pos,)`, wherever `(..A)` is written.
+The same list is written at a member, through a bound, and at an address (`&count[int, bool]`), and
+the argument a pack's tuple parameter is handed is checked against the types the list named.
+
+A pack stands for **one type or more**, so the list names every parameter, with at least one type
+for the pack:
+
+```sysl
+last[T, ..A](x: T) -> usize = A.len
+
+print(last[string]("s"))
+```
+
+```error
+'last' takes 2 type arguments or more ('T', 'A'), 'A' being a type pack that stands for one type or more, and 1 was written
+```
+
+A declaration with **two** packs has no written list, since nothing in one says where the first pack
+ends; its arguments settle both:
+
+```sysl
+two[..A, ..B](a: (..A), b: (..B)) -> usize = A.len + B.len
+
+print(two[int, int, int]((1, 2), (3,)))
+```
+
+```error
+'two' takes two type packs, '..A' and '..B', so a written list cannot say where one ends and the next begins — let the arguments settle them
+```
 
 ### This is not variadic functions
 

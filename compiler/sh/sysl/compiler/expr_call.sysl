@@ -73,9 +73,13 @@ end pending_named
 // A method called on an element is read as a write through the subscript where it takes `*self`
 // (`write_target.sysl`).
 call_expr(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
-          expected: Option[Type]) -> TExpr =
+          expected: Option[Type]) -> TExpr
+    // `g[i, j](x)` calls an element, and `g[i, j].f()` calls a member on one (`multi_index.sysl`).
+    settle_written_path(cx, callee)
+
     if cx.an.tables.members.place_mut_blocks == 0 then call_read(cx, span, callee, args, expected)
     else type_write_call(cx, callee, () -> call_read(cx, span, callee, args, expected))
+end call_expr
 
 private call_read(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
                   expected: Option[Type]) -> TExpr
@@ -2533,8 +2537,9 @@ private into_subtype(cx: &Analyzer, span: Span, target: Type, written: string,
             // Read without widening: the conversion below is the one this call names, and a value
             // widened to the base first would never reach the type's own `From` for it. So is an
             // integer literal where the type has its own `From[int]`: read at a float base it would be
-            // that float, and wrapped rather than handed to the `from` the type wrote for it.
-            val own_int = d.derived && literal_default(args[0]).unwrap_or(Unknown) == int_type() &&
+            // that float, and wrapped rather than handed to the `from` the type wrote for it -- and
+            // arithmetic over integer literals is that literal (`Phase(1 + 2)` is `Phase(3)`).
+            val own_int = d.derived && literal_arith_default(args[0]).unwrap_or(Unknown) == int_type() &&
                           from_conversion(cx, int_type(), target).is_some()
 
             // A conversion's value is not used at the type it is converted to, so a literal binding

@@ -221,6 +221,11 @@ analyze_value(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr = *e.kind
     // `S.pair[int, string]` where a callable is wanted.
     TypeArgs(_, _, _) if member_function_wanted(cx, e, expected) ->
         member_function_value(cx, e, expected.unwrap())
+    // `t[i, j]` on a container indexed by a tuple or an array (`multi_index.sysl`), read as the
+    // subscript the node has been rewritten to.
+    TypeArgs(_, _, _) if settle_multi_index(cx, e) -> *e.kind match
+        Index(receiver, index, _) -> index_expr(cx, anchor_of(e), receiver, index, expected)
+        _ -> bad_expr(e.span)
     // A list in brackets reaches here only where it is neither a call's, an address's nor a callable's.
     TypeArgs(_, args, _) ->
         cx.err(anchor_of(e), s"a subscript takes one index, and ${args.len()} were written — a list of " +
@@ -345,7 +350,7 @@ private range_value(cx: &Analyzer, span: Span, lo: Option[Expr], hi: Option[Expr
 
     if disagree(texpr_type(tlo), texpr_type(thi)) then
         cx.fault(span, s"a range needs matching bounds, got ${type_show(texpr_type(tlo))} and " +
-                 s"${type_show(texpr_type(thi))}")
+                 s"${type_show(texpr_type(thi))}" + mixing_hint(texpr_type(tlo), texpr_type(thi)))
 
     val vty = texpr_type(tlo) match
         Integer(_, _, _) -> texpr_type(tlo)
@@ -2191,9 +2196,15 @@ private binary_expr(cx: &Analyzer, span: Span, op: string, l: Expr, r: Expr,
 
     if texpr_type(tl) == Unknown then return bad_expr(span)
 
-    val dispatched = operator_call(cx, span, op, tl, tr, r)
+    val scale = scale_at(op, literal_valued(cx, l), literal_valued(cx, r))
+    val before = cx.an.complaints()
+    val dispatched = if scales_derivation(op, texpr_type(tl), texpr_type(tr), scale) then None
+    else operator_call(cx, span, op, tl, tr, r)
 
     if dispatched.is_some() then return dispatched.unwrap()
+
+    if cx.an.complaints() == before && refuses_self_product(cx, span, op, texpr_type(tl), texpr_type(tr), scale) then
+        return bad_expr(span)
 
     // A fixed-point product or quotient takes its format from the position it is written in.
     val fixed = fixed_operator_type(cx, span, op, texpr_type(tl), texpr_type(tr), expected)
@@ -2481,7 +2492,7 @@ private compare_expr(cx: &Analyzer, span: Span, operands: Buf[Expr], ops: Buf[st
         // needs the type to have the comparison being asked of it.
         if a != Unknown && b != Unknown && dispatch.is_none() then
             if !type_eq(repr(a), repr(b)) then
-                cx.fault(span, s"cannot compare ${type_show(a)} with ${type_show(b)}")
+                cx.fault(span, s"cannot compare ${type_show(a)} with ${type_show(b)}" + mixing_hint(a, b))
             else
                 val equality = op == "==" || op == "!="
                 val ok = if equality then is_equatable(a) else is_ordered(a)
@@ -2611,7 +2622,14 @@ analyze_operands(cx: &Analyzer, operands: Buf[Expr], expected: Option[Type],
     // Where neither a typed operand nor the position settles the pair, the readings of the operands
     // in the literal's tier do, as they did before they had a tier: `(1 << usize(d)) + 1` with
     // nothing around it is the `usize` its shift was read at.
-    val settled = firmest(cx, operands, unless_soft(own, soft), widen, rescales).or_else(() -> expected)
+    //
+    // **An `int` beside a `usize` meets it where the value of one fits the other's type**
+    // (`mixing.sysl`), which no other pair of types does; a wrapping or saturating operator still
+    // takes two values of one type.
+    val mixes = widen && held == ""
+    val mixed_own = if mixes then mixed_meet(cx, operands, unless_soft(own, soft), expected) else None
+    val settled = if mixed_own.is_some() then mixed_own
+                  else firmest(cx, operands, unless_soft(own, soft), widen, rescales).or_else(() -> expected)
                       .or_else(() -> firmest(cx, operands, own, widen, rescales))
     val dispatched = dispatch != "" && held == "" && operands.len() == 2 && settled.is_some() &&
                      !is_literal(operands[0]) && !soft[0]
@@ -2648,8 +2666,9 @@ analyze_operands(cx: &Analyzer, operands: Buf[Expr], expected: Option[Type],
         return bad
 
     val firm = unless_soft(told, soft)
-    val ty = literal_widened(cx, operands, firm, told, firmest(cx, operands, firm, widen, rescales).or_else(() -> expected),
-                             expected, widen && held == "", rescales)
+    val mixed = if mixes then mixed_meet(cx, operands, firm, expected) else None
+    val met = if mixed.is_some() then mixed else firmest(cx, operands, firm, widen, rescales).or_else(() -> expected)
+    val ty = literal_widened(cx, operands, firm, told, met, expected, widen && held == "", rescales)
                  .or_else(() -> if widen then float_among(operands) else None)
                  .or_else(() -> firmest(cx, operands, told, widen, rescales))
     var out: Buf[TExpr] = buf()
@@ -2680,6 +2699,7 @@ analyze_operands(cx: &Analyzer, operands: Buf[Expr], expected: Option[Type],
                     // fit a byte, not that a byte and an `int` do not match.
                     if soft[i] && integer_operand(ty.unwrap()) && disagree(texpr_type(again), ty.unwrap())
                         out.push(analyze_expected(cx, operands[i], ty))
+                    else if mixed.is_some() then out.push(met_by_value(cx, again, ty.unwrap()))
                     else out.push(again)
 
                     cx.declared = saved
