@@ -482,6 +482,27 @@ true
 The fused instruction is asked for exactly, never left to the optimizer to choose site by site, so a
 program prints the same bits at `-O0` and at `-O3`, vectorized loops included.
 
+**[`@no_fuse`](/reference/attributes/#no-fuse-multiplies-and-adds-rounded-apart) turns fusing off**
+— C's `-ffp-contract=off` — for a function or a method, or, in a file's header, for a whole module.
+There every product is rounded before the sum, at every optimization level and in every constant,
+which is what a program checked against results computed that way needs:
+
+```sysl
+id(x: real) -> real = x
+
+@no_fuse
+apart(x: real, c: real) -> real = x * x + c
+
+var x = 1.0 + 1.0 / 1073741824.0
+var c = -(1.0 + 1.0 / 536870912.0)
+
+print(apart(x, c) * 1152921504606846976.0)
+```
+
+```output
+0
+```
+
 **Every float `+`, `-` and `*` is computed in the order it is written**, so a sum of many terms is a
 chain the optimizer keeps in that order. A function or block marked
 [`@reassociate`](/reference/attributes/#reassociate-float-sums-the-back-end-may-regroup) gives the
