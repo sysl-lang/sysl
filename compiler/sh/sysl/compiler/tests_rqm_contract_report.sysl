@@ -196,3 +196,58 @@ rqm_should_trap_reads_the_message()
 
     assert_eq(passed, 1)
 end rqm_should_trap_reads_the_message
+
+// -- a struct invariant written with a message ---------------------------------------------------------
+
+private rqm_window(clauses: string) -> string = "struct Window\n    lo: int\n    hi: int\n" + clauses + "\n"
+
+@test("a struct invariant with a message prints the message and the clause's own line and column")
+rqm_struct_invariant_with_a_message()
+    rqm_traps_saying(rqm_window("    invariant lo <= hi, \"lo must not pass hi\"\n") +
+                     "var w = Window(2, 10)\nprint(w.hi)\nw.hi = 1\nprint(w.hi)\n", "10\n",
+                     "invariant failed: lo must not pass hi (main.sysl:4:15)\n")
+
+@test("a struct made against an invariant with a message reports it at construction")
+rqm_struct_invariant_message_at_construction()
+    rqm_traps_saying(rqm_window("    invariant lo <= hi, \"lo must not pass hi\"\n") +
+                     "var n = 5\nprint(n)\nval w = Window(n, 1)\nprint(w.hi)\n", "5\n",
+                     "invariant failed: lo must not pass hi (main.sysl:4:15)\n")
+
+@test("of several messaged clauses the one that failed is the one reported")
+rqm_struct_invariant_several_messages()
+    val text = rqm_window("    invariant lo <= hi, \"lo must not pass hi\"\n    invariant hi - lo < 100, \"too wide\"\n") +
+               "var w = Window(2, 10)\nw.hi = 500\nprint(w.hi)\n"
+
+    rqm_traps_saying(text, "", "invariant failed: too wide (main.sysl:5:15)\n")
+
+@test("a messaged clause and a bare one mix: each reports as it was written")
+rqm_struct_invariant_mixed()
+    val head = rqm_window("    invariant lo >= 0\n    invariant lo <= hi, \"lo must not pass hi\"\n")
+
+    rqm_traps_saying(head + "var w = Window(2, 10)\nw.lo = -1\nprint(w.lo)\n", "",
+                     "invariant of 'Window' failed (main.sysl:8:1)\n")
+    rqm_traps_saying(head + "var w = Window(2, 10)\nw.hi = 1\nprint(w.hi)\n", "",
+                     "invariant failed: lo must not pass hi (main.sysl:5:15)\n")
+
+@test("a struct whose messaged clauses all hold runs on")
+rqm_struct_invariant_message_holds()
+    if !rqm_ready() then return
+
+    val (state, printed, _) = rqm_run(rqm_window("    invariant lo <= hi, \"lo must not pass hi\"\n") +
+                                      "var w = Window(2, 10)\nw.hi = 3\nprint(w.lo, w.hi)\n", "--debug", "0")
+
+    assert_eq(printed, "2 3\n")
+    assert_eq(state, Status.Exited(0))
+
+@test("a struct invariant's message may be a constant or an interpolation of constants, as a require's may")
+rqm_struct_invariant_computed_message()
+    rqm_traps_saying("const WHY: string = \"ordered\"\nconst CAP = 7\n\nstruct Window\n    lo: int\n    hi: int\n" +
+                     "    invariant lo <= hi, WHY\n    invariant hi < 100, s\"hi under ${CAP}00\"\n\n" +
+                     "var w = Window(2, 10)\nw.hi = 150\nprint(w.hi)\n", "",
+                     "invariant failed: hi under 700 (main.sysl:8:15)\n")
+
+@test("a generic struct's invariant reports its message")
+rqm_generic_struct_invariant_message()
+    rqm_traps_saying("struct Span[T: PartialOrd]\n    lo: T\n    hi: T\n    invariant lo <= hi, \"span runs upward\"\n\n" +
+                     "var s = Span(1, 5)\nprint(s.hi)\ns.hi = 0\nprint(s.hi)\n", "5\n",
+                     "invariant failed: span runs upward (main.sysl:4:15)\n")

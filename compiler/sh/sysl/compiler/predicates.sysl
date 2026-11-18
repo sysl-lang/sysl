@@ -54,7 +54,7 @@ register_predicate(a: &Analysis, scope: Scope, s: Stmt)
             // parameters, with its bounds -- so the body is checked once against the bounds by the
             // definition-time pass, as any generic body is, and made real per instantiation by the
             // check site (`inv_fn_for`).
-            var f = bool_func(inv_key(key), params, all_of(d.invariants), s.span)
+            var f = inv_func(inv_key(key), params, d, s.span)
 
             f.tparams = d.tparams
             f.bounds = d.bounds
@@ -72,6 +72,38 @@ private bool_func(name: string, params: Buf[Param], cond: Expr, span: Span) -> F
              buf(), buf(), None, None, None, false, false, false, None, None, None, None, buf(),
              buf(), no_marks(), span, false)
 end bool_func
+
+// A struct's clauses as one function. **A clause written with a message is a loop-head `invariant`
+// of a loop that runs once**, which is the one form that reports a failure with its message and its
+// own location; the clauses with none stay the function's answer, so a struct that writes no message
+// is exactly what it was.
+private inv_func(name: string, params: Buf[Param], d: StructDecl, span: Span) -> FuncDecl
+    var plain: Buf[Expr] = buf()
+    var said: Buf[Stmt] = buf()
+
+    for i in 0..<d.invariants.len()
+        val c = d.invariants[i]
+        val m = if i < d.invariant_msgs.len() then d.invariant_msgs[i] else None
+
+        if m.is_some()
+            said.push(stmt(c.span, Invariant(c, m)))
+        else
+            plain.push(c)
+
+    val answer = if plain.is_empty() then expr(span, BoolLit(true)) else all_of(plain)
+    var f = bool_func(name, params, answer, span)
+
+    if !said.is_empty()
+        said.push(stmt(span, Break(None, None)))
+
+        var body: Buf[Stmt] = buf()
+
+        body.push(stmt(span, ExprStmt(expr(span, Loop(None, said)))))
+        body.push(stmt(answer.span, ExprStmt(answer)))
+        f.body = body
+
+    f
+end inv_func
 
 // A run of clauses as the one condition they amount to.
 private all_of(clauses: Buf[Expr]) -> Expr

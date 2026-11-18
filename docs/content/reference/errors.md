@@ -1107,7 +1107,8 @@ The run above writes `require failed (main.sysl:4:13)` to standard error — the
 call, since the clause is what failed. A clause written with a message adds it: `require x > 0, "x
 must be positive"` says `require failed: x must be positive (main.sysl:4:13)`. An `ensure` and a
 loop's `invariant` say `ensure failed` and `invariant failed` the same way, and a struct's invariant
-names the struct and the write that broke it, `invariant of 'Window' failed (main.sysl:8:1)`. The
+names the struct and the write that broke it, `invariant of 'Window' failed (main.sysl:8:1)`, unless
+the clause was written with a message, which reports as a loop's does. The
 other checks say, each followed by its location:
 
 ```text
@@ -2204,6 +2205,14 @@ print(w.lo, w.hi, w.hi - w.lo)
 ```output
 2 15 13
 ```
+
+A clause takes a message after a comma, as a `require`, an `ensure` and a loop's `invariant` do:
+`invariant lo <= hi, "lo must not pass hi"`. The message is worked out while compiling, so it is any
+`string` the compiler can compute — a literal, a `const`, an interpolation of constants — and a
+generic struct's is read at each instantiation. A clause that fails with one stops the program with
+`invariant failed: lo must not pass hi (main.sysl:4:15)`, the location being the clause itself. A
+clause with none reports as before, naming the struct and the write that broke it. In a struct that
+mixes the two, the messaged clauses are checked first.
 
 An invariant may read a module constant. `invariant` is contextual here too, and the grammar
 distinguishes by shape: a **member** declaration has a parameter list or a `->`, an **invariant
