@@ -453,6 +453,46 @@ arith_type(cx: &Analyzer, span: Span, op: string, a: Type, b: Type, rhs: Span) -
         _ -> undefined_for(cx, span, op, a)
 end arith_type
 
+// **A `new` type does not multiply by itself** (`core_traits.sysl`'s `core_member`): `a * b` over two
+// `Meters` with no `impl Mul for Meters` is refused, naming that block as the fix, and so are `*=`,
+// `*%` and `*|`. Answers whether it refused.
+//
+// Three readings stay. A **scale** -- a literal on either side, `d * 2.0`, `d *= 3` -- is a number
+// with no unit, and the product is the type it scales. A pair the operands do not agree on is the
+// mismatch's own refusal, not this one. And the body of a generic read again at a type argument --
+// `[T: Integer]` at a `new u8` -- multiplies as the bound it was checked against promised.
+refuses_self_product(cx: &Analyzer, span: Span, op: string, a: Type, b: Type, scale: bool) -> bool
+    if op != "*" && op != "*%" && op != "*|" then return false
+    if scale || !is_derivation(a) || !computes_numerically(a) then return false
+    if !type_eq(repr(a), repr(b)) then return false
+
+    for item in cx.subst
+        if type_eq(item.ty, a) || type_eq(item.ty, b) then return false
+
+    cx.fault(span, self_product_refusal(op, a))
+    true
+end refuses_self_product
+
+// What a product of two values of one `new` type is told, naming the block that would make it mean
+// something -- and, for a wrapping or saturating one, which no block reaches, the base to compute at.
+// `op` is the spelling written: an operator, or `mul` for the method.
+self_product_refusal(op: string, t: Type) -> string
+    val name = type_show(t)
+    val base = type_show(underlying(t))
+    val fix = if op == "*%" || op == "*|" then
+        s"multiply at the base, '$base(a) $op $base(b)', or write 'impl Mul for $name' and use '*'"
+    else s"write 'impl Mul for $name' with the product it means, or scale by a literal"
+
+    s"'$op' over two $name is refused — a 'new' type does not multiply by itself, since a product of " +
+        s"two of its values is a different quantity. To multiply, $fix"
+end self_product_refusal
+
+// `d * 2.0` over a `new` type: a literal is a number with no unit, so the product is the base's
+// instruction scaling the value, whatever `impl Mul` a program wrote for two of them -- `impl
+// Mul[Meters, Area] for Meters` does not make `d * 2.0` an area. Answers whether the pair is that.
+scales_derivation(op: string, a: Type, b: Type, scale: bool) -> bool =
+    scale && op == "*" && is_derivation(a) && computes_numerically(a) && type_eq(repr(a), repr(b))
+
 // What a wrapping or saturating operator (`wrap_sat.sysl`) makes of two operands of one type: that
 // type, on an integer of any width or a fixed-point value. A float is refused for what it is -- its
 // arithmetic neither wraps nor saturates, it rounds and runs to infinity -- and a register of lanes

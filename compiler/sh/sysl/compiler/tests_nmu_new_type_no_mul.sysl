@@ -1,0 +1,282 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A `new` type is not `Mul` at itself (`reference/errors.md § A new type does not multiply by
+// itself`): two `Meters` multiplied are an area, so `a * b`, `a *= b`, `a *% b` and `a *| b` over two
+// values of one `new` type are refused, naming `impl Mul` as the fix, over every base. A literal is
+// a scale and still multiplies; every other operator is untouched; a written `impl Mul` is accepted
+// and dispatched to; a `[T: Mul]` bound refuses the type until one is written.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private nmu_root(main: string) -> string
+    val root = make_temp_dir("sysl-nmu").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/sysl.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(root + "/main.sysl", main).unwrap()
+    root
+end nmu_root
+
+private nmu_prints(main: string, want: string)
+    if xvr_no_library() then return
+
+    val root = nmu_root(main)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            assert(false, s"expected it to build, got: ${failure_text(why)}")
+            return
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> assert(false, "the program that was built could not be run")
+        Ok(out) ->
+            assert_eq(out.text + out.err.unwrap_or(""), want)
+            assert_eq(shell_status(out.status), 0)
+end nmu_prints
+
+// Everything the analysis said about the program, or its LLVM text where it said nothing.
+private nmu_said(main: string) -> string
+    val root = nmu_root(main)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end nmu_said
+
+// The program is refused with exactly this message, first, at this line and column of `main.sysl`.
+private nmu_refused(main: string, message: string, at: string)
+    if xvr_no_library() then return
+
+    val out = nmu_said(main)
+
+    assert(out.starts_with(s"error: $message\n --> "), s"expected 'error: $message' first, got: $out")
+    assert(out.index_of(s"/main.sysl:$at\n").is_some(), s"expected it at main.sysl:$at, got: $out")
+end nmu_refused
+
+// The refusal for `op` over two values of `name`.
+private nmu_why(op: string, name: string) -> string =
+    s"'$op' over two $name is refused — a 'new' type does not multiply by itself, since a product " +
+    s"of two of its values is a different quantity. To multiply, write 'impl Mul for $name' with the " +
+    "product it means, or scale by a literal"
+
+// The refusal for a wrapping or saturating `op` over two values of `name`, whose base is `base`.
+private nmu_why_ws(op: string, name: string, base: string) -> string =
+    s"'$op' over two $name is refused — a 'new' type does not multiply by itself, since a product " +
+    s"of two of its values is a different quantity. To multiply, multiply at the base, " +
+    s"'$base(a) $op $base(b)', or write 'impl Mul for $name' and use '*'"
+
+// -- refused over every base ----------------------------------------------------------------------
+
+@test("a new f64 does not multiply by itself, and the refusal names the impl")
+nmu_f64() = nmu_refused("type Meters = new f64\nval a = Meters(2.0)\nprint(f64(a * a))\n",
+                        nmu_why("*", "Meters"), "3:11")
+
+@test("nor does a new f32")
+nmu_f32() = nmu_refused("type M = new f32\nval a = M(2.0)\nprint(f32(a * a))\n", nmu_why("*", "M"), "3:11")
+
+@test("nor a new real")
+nmu_real() = nmu_refused("type M = new real\nval a = M(2.0)\nprint(f64(a * a))\n", nmu_why("*", "M"), "3:11")
+
+@test("nor a new signed integer")
+nmu_i32() = nmu_refused("type M = new i32\nval a = M(2)\nprint(i32(a * a))\n", nmu_why("*", "M"), "3:11")
+
+@test("nor a new integer of an odd width")
+nmu_u12() = nmu_refused("type M = new u12\nval a = M(2)\nprint(u16(a * a))\n", nmu_why("*", "M"), "3:11")
+
+@test("nor one wider than a machine word")
+nmu_i512() = nmu_refused("type M = new i512\nval a = M(2)\nval b = a * a\n", nmu_why("*", "M"), "3:9")
+
+@test("nor a new type with a range")
+nmu_range() = nmu_refused("type M = new u8 within 0..<8\nval a = M(2)\nprint(u8(a * a))\n",
+                          nmu_why("*", "M"), "3:10")
+
+@test("nor a new type with a predicate")
+nmu_where() = nmu_refused("type Even = new int where value % 2 == 0\nval a = Even(2)\nprint(int(a * a))\n",
+                          nmu_why("*", "Even"), "3:11")
+
+@test("nor a new fixed-point type")
+nmu_q15() = nmu_refused("type M = new q15\nval a = M(0.5)\nprint(f64(q15(a * a)))\n", nmu_why("*", "M"), "3:15")
+
+@test("nor a wrapping fixed-point one")
+nmu_fixed_wrapping() = nmu_refused("type M = new i64q61 wrapping\nval a = M(0.5)\nval b = a * a\n",
+                                   nmu_why("*", "M"), "3:9")
+
+@test("nor a new type with a phantom parameter")
+nmu_phantom() = nmu_refused("type P[T] = new u64\nval a = P[u8](2)\nprint(u64(a * a))\n",
+                            nmu_why("*", "P[byte]"), "3:11")
+
+@test("nor a transparent subtype that narrows a new type")
+nmu_subtype_of_new() = nmu_refused(
+    "type M = new int\ntype S = M within M(0)..M(9)\nval a = S(2)\nprint(int(a * a))\n", nmu_why("*", "S"), "4:11")
+
+// -- every spelling of a product ------------------------------------------------------------------
+
+@test("a compound product of two is refused at the statement")
+nmu_compound() = nmu_refused("type Meters = new f64\nvar a = Meters(2.0)\nval b = Meters(3.0)\na *= b\nprint(f64(a))\n",
+                             nmu_why("*", "Meters"), "4:1")
+
+@test("a wrapping product is refused, naming the base to multiply at")
+nmu_wrapping() = nmu_refused("type M = new u8\nval a = M(2)\nprint(u8(a *% a))\n", nmu_why_ws("*%", "M", "byte"), "3:10")
+
+@test("a saturating product is refused the same way")
+nmu_saturating() = nmu_refused("type M = new u8\nval a = M(2)\nprint(u8(a *| a))\n", nmu_why_ws("*|", "M", "byte"), "3:10")
+
+@test("the method spelling is not there either")
+nmu_method() = nmu_refused("type Meters = new f64\nval a = Meters(2.0)\nprint(f64(a.mul(a)))\n",
+                           nmu_why("mul", "Meters"), "3:11")
+
+@test("a module constant's product is refused as a body's is")
+nmu_const() = nmu_refused("type Meters = new f64\nconst A: Meters = Meters(2.0) * Meters(3.0)\nprint(f64(A))\n",
+                          nmu_why("*", "Meters"), "2:19")
+
+@test("a generic function's own product of a new type is refused at the body")
+nmu_generic_body() = nmu_refused("type Meters = new f64\nf[T](x: T, m: Meters) -> Meters = m * m\nprint(f64(f(1, Meters(2.0))))\n",
+                                 nmu_why("*", "Meters"), "2:35")
+
+// -- what still multiplies ------------------------------------------------------------------------
+
+@test("a literal is a scale, on either side, of any spelling, and in a compound")
+nmu_scale() = nmu_prints(raw"""
+    type Meters = new f64
+    type Slot = new u8 within 0..<100
+    type Tick = new u12
+
+    var d = Meters(1.5)
+    var s = Slot(3)
+    val c = s > Slot(1)
+    val t = Tick(7)
+
+    print(f64(d * 2.0), f64(2.0 * d), f64(d * 2), f64(2 * d), f64(-d * 2.0), f64(d * (if c then 2.0 else 3.0)))
+    print(u8(s * 2), u8(2 * s), u8(s *% 2), u8(s *| 2), u16(t * 3))
+    d *= 2.0
+    s *= 3
+    print(f64(d), u8(s))
+    """, "3 3 3 3 -3 3\n6 6 6 6 21\n3 9\n")
+
+@test("a fixed-point new type is scaled by an integer and by a literal of its format")
+nmu_fixed_scale() = nmu_prints(raw"""
+    type Gain = new q15
+
+    val g = Gain(0.25)
+
+    print(f64(q15(g * 2)), f64(q15(g * 0.5)))
+    """, "0.5 0.125\n")
+
+@test("every other operator of a new type is its base's, as before")
+nmu_others_stay() = nmu_prints(raw"""
+    type Meters = new f64
+    type Slot = new u8
+
+    var d = Meters(6.0)
+    var s = Slot(7)
+
+    print(f64(d + d), f64(d - d), f64(d / d), f64(-d), d < d, d == d)
+    print(u8(s % Slot(4)), u8(s & Slot(3)), u8(s | Slot(8)), u8(s ^ s), u8(s << 1), u8(~s))
+    d += Meters(1.0)
+    d /= Meters(7.0)
+    s++
+    print(f64(d), u8(s))
+    """, "12 0 1 -6 false true\n3 3 15 0 14 248\n1 8\n")
+
+@test("a transparent subtype is its base, and multiplies as its base does")
+nmu_transparent() = nmu_prints("type Small = u8 within 0..<100\nprint(Small(5) * Small(6))\n", "30\n")
+
+@test("a typed scalar was never an operand of a new type, and is still the mismatch")
+nmu_typed_scalar() = nmu_refused("type Meters = new f64\nval a = Meters(2.0)\nval k = 2.0\nprint(f64(a * k))\n",
+                                 "'*' needs matching types, got Meters and real", "4:15")
+
+// -- the impl a program writes --------------------------------------------------------------------
+
+@test("an impl Mul for a new type is accepted, '*' and '*=' reach it, and a literal is still a scale")
+nmu_impl_self() = nmu_prints(raw"""
+    type Ratio = new f64
+
+    impl Mul for Ratio
+        mul(self, other: Ratio) -> Ratio = Ratio(f64(self) * f64(other) + 1.0)
+
+    var r = Ratio(2.0)
+
+    print(f64(r * r))
+    r *= Ratio(3.0)
+    print(f64(r), f64(r * 2.0))
+    r *= 2.0
+    print(f64(r))
+    """, "5\n7 14\n14\n")
+
+@test("an impl Mul names its product, which may be another type")
+nmu_impl_area() = nmu_prints(raw"""
+    type Meters = new f64
+    type Area = new f64
+
+    impl Mul[Meters, Area] for Meters
+        mul(self, other: Meters) -> Area = Area(f64(self) * f64(other))
+
+    val w = Meters(3.0)
+    val a: Area = w * Meters(4.0)
+    val twice: Meters = w * 2.0
+    var v = w
+
+    v *= 2.0
+    print(f64(a), f64(twice), f64(v))
+    """, "12 6 6\n")
+
+@test("an impl Mul at another operand leaves the product of two still missing")
+nmu_impl_other_operand() = nmu_refused(raw"""
+    type Meters = new f64
+
+    impl Mul[f64] for Meters
+        mul(self, k: f64) -> Meters = Meters(f64(self) * k)
+
+    val a = Meters(2.0)
+    val k = 3.0
+
+    print(f64(a * k))
+    print(f64(a * a))
+    """, nmu_why("*", "Meters"), "10:11")
+
+@test("an impl of any other operator is still the compiler's to provide")
+nmu_impl_div_refused() = nmu_refused("type Meters = new f64\nimpl Div for Meters\n    div(self, o: Meters) -> Meters = self\n",
+                                     "'Meters' already implements 'Div' — the compiler provides it", "2:1")
+
+// -- bounds ---------------------------------------------------------------------------------------
+
+@test("a Mul bound refuses a new type with no impl")
+nmu_bound_refused() = nmu_refused("type Meters = new f64\nsq[T: Mul](x: T) -> T = x * x\nprint(f64(sq(Meters(2.0))))\n",
+                                  "'sq' requires its type parameter 'T' to implement 'Mul', but Meters does not", "3:11")
+
+@test("a Mul bound is met by the impl a program writes, and the bound's other operators stay")
+nmu_bound_met() = nmu_prints(raw"""
+    type Ratio = new f64
+
+    impl Mul for Ratio
+        mul(self, other: Ratio) -> Ratio = Ratio(f64(self) * f64(other))
+
+    sq[T: Mul](x: T) -> T = x * x
+    total[T: Add + Div](a: T, b: T) -> T = (a + b) / b
+
+    print(f64(sq(Ratio(3.0))), f64(total(Ratio(6.0), Ratio(2.0))))
+    """, "9 4\n")
+
+@test("a body generic over Integer multiplies a new integer, as the family promises its members")
+nmu_integer_family() = nmu_prints(raw"""
+    type Slot = new u8
+
+    twice[T: Integer](x: T) -> T = x * x
+
+    print(u8(twice(Slot(5))), Slot(7))
+    """, "25 7\n")

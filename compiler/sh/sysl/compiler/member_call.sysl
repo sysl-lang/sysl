@@ -1245,7 +1245,7 @@ private call_declared(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, nam
     end if
 
     val declaring = core_declaring(name)
-    val provided = declaring.is_some() && core_builtin(declaring.unwrap(), rty) && deriving.is_none()
+    val provided = declaring.is_some() && core_member(declaring.unwrap(), rty) && deriving.is_none()
     if refuse_bound_clash(cx, rty, found.0, name, span, via) then return bad_expr(span)
 
     val chosen = chosen_member(cx, rty, found.0, name, span, args, through, provided, Some(receiver))
@@ -3768,7 +3768,14 @@ private builtin_operator_method(cx: &Analyzer, span: Span, receiver: TExpr, rty:
     val declaring = core_declaring(name)
 
     if declaring.is_none() then return None
-    if !core_builtin(declaring.unwrap(), rty) then return None
+
+    // `a.mul(b)` over a `new` type is the product `a * b` is refused as, and is told the same fix.
+    if core_builtin(declaring.unwrap(), rty) && !core_member(declaring.unwrap(), rty)
+        cx.fault(span, self_product_refusal(name, rty))
+        return Some(bad_expr(span))
+    end if
+
+    if !core_member(declaring.unwrap(), rty) then return None
 
     val required = core_required(declaring.unwrap())
 
