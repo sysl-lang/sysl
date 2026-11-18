@@ -9,9 +9,10 @@ import sysl.process.{capture, Status}
 // word, the message it was written with where it has one, and the condition's line and column --
 // `require failed: x must be non-negative (main.sysl:2:13)` -- through the same `sysl_bounds_fail` a
 // bounds check reports through, so the exit status is still SIGTRAP's and a `should_trap` test can
-// ask for the message. A struct's `invariant` names the struct and the write that broke it. Every
-// cell is built in both modes, since a contract is checked in every build, and at `-O0` and the
-// default level, since an optimizer that folded a check to its outcome must still make the call.
+// ask for the message. A struct's `invariant` names the struct, the clause that failed and where it is
+// written, and the write that broke it. Every cell is built in both modes, since a contract is
+// checked in every build, and at `-O0` and the default level, since an optimizer that folded a check
+// to its outcome must still make the call.
 
 private rqm_ready() -> bool = std_root().is_ok() && clang_available()
 
@@ -91,11 +92,69 @@ rqm_loop_invariant_with_a_message()
                      "        print(i)\n        i += 1\n", "0\n1\n2\n",
                      "invariant failed: i stays small (main.sysl:4:19)\n")
 
-@test("a struct invariant broken by a write names the struct and the write")
+@test("a struct invariant broken by a write names the struct, the clause and where it is, and the write")
 rqm_struct_invariant()
     rqm_traps_saying("struct Window\n    lo: int\n    hi: int\n    invariant lo <= hi\n\n" +
                      "var w = Window(2, 10)\nprint(w.hi)\nw.hi = 1\nprint(w.hi)\n", "10\n",
-                     "invariant of 'Window' failed (main.sysl:8:1)\n")
+                     "invariant of 'Window' failed: clause 'lo <= hi' at main.sysl:4:15 (main.sysl:8:1)\n")
+
+// -- which of a struct's clauses failed ---------------------------------------------------------------
+
+private rqm_three_clauses() -> string =
+    "struct Window\n    lo: int\n    hi: int\n    invariant lo <= hi\n    invariant hi - lo < 10\n" +
+    "    invariant lo >= 0\n\n"
+
+@test("of several clauses, the first failing at construction is the one named")
+rqm_struct_invariant_first_clause_at_construction()
+    rqm_traps_saying(rqm_three_clauses() + "print(Window(1, 2).lo)\nprint(Window(5, 2).lo)\n", "1\n",
+                     "invariant of 'Window' failed: clause 'lo <= hi' at main.sysl:4:15 (main.sysl:9:7)\n")
+
+@test("of several clauses, a later one failing at a field write is the one named")
+rqm_struct_invariant_later_clause_at_a_write()
+    rqm_traps_saying(rqm_three_clauses() + "var w = Window(1, 2)\nw.hi += 20\nprint(w.hi)\n", "",
+                     "invariant of 'Window' failed: clause 'hi - lo < 10' at main.sysl:5:15 (main.sysl:9:1)\n")
+
+@test("where two clauses fail at once, the first written is the one named")
+rqm_struct_invariant_two_fail_first_named()
+    rqm_traps_saying(rqm_three_clauses() + "var w = Window(1, 2)\nw.lo = -20\nprint(w.lo)\n", "",
+                     "invariant of 'Window' failed: clause 'hi - lo < 10' at main.sysl:5:15 (main.sysl:9:1)\n")
+
+@test("the last clause failing is named, through a pointer")
+rqm_struct_invariant_last_clause_through_a_pointer()
+    rqm_traps_saying(rqm_three_clauses() + "var w = Window(1, 2)\nval p = &w\np.lo = -1\nprint(w.lo)\n", "",
+                     "invariant of 'Window' failed: clause 'lo >= 0' at main.sysl:6:15 (main.sysl:10:1)\n")
+
+@test("a clause written with '&&' and odd spacing is named whole, its spacing made single")
+rqm_struct_invariant_clause_text_as_written()
+    rqm_traps_saying("struct Pair\n    a: int\n    b: usize\n    invariant a  >=   0 && b != \"x\".len\n\n" +
+                     "var p = Pair(0, 0)\np.b = 1\nprint(p.b)\n", "",
+                     "invariant of 'Pair' failed: clause 'a >= 0 && b != \"x\".len' at main.sysl:4:15 " +
+                     "(main.sysl:7:1)\n")
+
+@test("a clause testing a variant with 'is' is named as written")
+rqm_struct_invariant_is_clause()
+    rqm_traps_saying("struct Held\n    o: Option[int]\n    a: int\n    invariant o is None || a > 0\n\n" +
+                     "var h = Held(None, 1)\nh.o = Some(3)\nh.a = 0\nprint(h.a)\n", "",
+                     "invariant of 'Held' failed: clause 'o is None || a > 0' at main.sysl:4:15 (main.sysl:8:1)\n")
+
+@test("a generic struct's clause is named from its instantiation")
+rqm_struct_invariant_generic()
+    rqm_traps_saying("struct Bounded[T: Ord]\n    v: T\n    cap: T\n    invariant v <= cap\n\n" +
+                     "var b = Bounded(1, 4)\nprint(b.v)\nb.v = 9\nprint(b.v)\n", "1\n",
+                     "invariant of 'Bounded[int]' failed: clause 'v <= cap' at main.sysl:4:15 (main.sysl:8:1)\n")
+
+@test("with the locations dropped, a clause is still named, by its text alone")
+rqm_struct_invariant_without_locations()
+    use_bounds_locations(false)
+
+    val text = "struct Window\n    lo: int\n    hi: int\n    invariant lo <= hi\n\nvar w = Window(2, 10)\nw.hi = 1\n"
+    val ir = xvr_ir([("main.sysl", text)])
+
+    use_bounds_locations(true)
+    assert(ir.contains("c\"clause 'lo <= hi'\\00\""), ir)
+    assert(ir.contains("c\"invariant of 'Window' failed: \\00\""), ir)
+    assert(!ir.contains("main.sysl:"), ir)
+end rqm_struct_invariant_without_locations
 
 @test("a require on a method reports its message")
 rqm_require_on_a_method()
@@ -144,6 +203,16 @@ rqm_const_ensure_carries_its_message()
                         "const h = f(1)\n\nprint(h)\n"),
               "5:11 'h' traps while it is being compiled: an 'ensure' of 'f' failed: too small " +
               "(main.sysl:2:12) — inside 'f(1)', called at main.sysl:5:11\n")
+
+@test("a struct invariant that fails while a constant is evaluated names the clause that failed")
+rqm_const_struct_invariant_names_the_clause()
+    if !enm_ready() then return
+
+    assert_eq(isc_diags(rqm_three_clauses() + "const lo_of(n: int) -> int = Window(1, n).lo\n\n" +
+                        "const L = lo_of(20)\n\nprint(L)\n"),
+              "10:11 'L' traps while it is being compiled: the 'invariant' of 'Window' does not hold for " +
+              "Window(1, 20): clause 'hi - lo < 10' at main.sysl:5:15 (main.sysl:8:30) — inside 'lo_of(20)', " +
+              "called at main.sysl:10:11\n")
 
 // -- under the test runner ------------------------------------------------------------------------------
 
@@ -205,29 +274,29 @@ private rqm_window(clauses: string) -> string = "struct Window\n    lo: int\n   
 rqm_struct_invariant_with_a_message()
     rqm_traps_saying(rqm_window("    invariant lo <= hi, \"lo must not pass hi\"\n") +
                      "var w = Window(2, 10)\nprint(w.hi)\nw.hi = 1\nprint(w.hi)\n", "10\n",
-                     "invariant failed: lo must not pass hi (main.sysl:4:15)\n")
+                     "invariant of 'Window' failed: lo must not pass hi: clause 'lo <= hi' at main.sysl:4:15 (main.sysl:8:1)\n")
 
 @test("a struct made against an invariant with a message reports it at construction")
 rqm_struct_invariant_message_at_construction()
     rqm_traps_saying(rqm_window("    invariant lo <= hi, \"lo must not pass hi\"\n") +
                      "var n = 5\nprint(n)\nval w = Window(n, 1)\nprint(w.hi)\n", "5\n",
-                     "invariant failed: lo must not pass hi (main.sysl:4:15)\n")
+                     "invariant of 'Window' failed: lo must not pass hi: clause 'lo <= hi' at main.sysl:4:15 (main.sysl:8:9)\n")
 
 @test("of several messaged clauses the one that failed is the one reported")
 rqm_struct_invariant_several_messages()
     val text = rqm_window("    invariant lo <= hi, \"lo must not pass hi\"\n    invariant hi - lo < 100, \"too wide\"\n") +
                "var w = Window(2, 10)\nw.hi = 500\nprint(w.hi)\n"
 
-    rqm_traps_saying(text, "", "invariant failed: too wide (main.sysl:5:15)\n")
+    rqm_traps_saying(text, "", "invariant of 'Window' failed: too wide: clause 'hi - lo < 100' at main.sysl:5:15 (main.sysl:8:1)\n")
 
 @test("a messaged clause and a bare one mix: each reports as it was written")
 rqm_struct_invariant_mixed()
     val head = rqm_window("    invariant lo >= 0\n    invariant lo <= hi, \"lo must not pass hi\"\n")
 
     rqm_traps_saying(head + "var w = Window(2, 10)\nw.lo = -1\nprint(w.lo)\n", "",
-                     "invariant of 'Window' failed (main.sysl:8:1)\n")
+                     "invariant of 'Window' failed: clause 'lo >= 0' at main.sysl:4:15 (main.sysl:8:1)\n")
     rqm_traps_saying(head + "var w = Window(2, 10)\nw.hi = 1\nprint(w.hi)\n", "",
-                     "invariant failed: lo must not pass hi (main.sysl:5:15)\n")
+                     "invariant of 'Window' failed: lo must not pass hi: clause 'lo <= hi' at main.sysl:5:15 (main.sysl:8:1)\n")
 
 @test("a struct whose messaged clauses all hold runs on")
 rqm_struct_invariant_message_holds()
@@ -244,10 +313,10 @@ rqm_struct_invariant_computed_message()
     rqm_traps_saying("const WHY: string = \"ordered\"\nconst CAP = 7\n\nstruct Window\n    lo: int\n    hi: int\n" +
                      "    invariant lo <= hi, WHY\n    invariant hi < 100, s\"hi under ${CAP}00\"\n\n" +
                      "var w = Window(2, 10)\nw.hi = 150\nprint(w.hi)\n", "",
-                     "invariant failed: hi under 700 (main.sysl:8:15)\n")
+                     "invariant of 'Window' failed: hi under 700: clause 'hi < 100' at main.sysl:8:15 (main.sysl:11:1)\n")
 
 @test("a generic struct's invariant reports its message")
 rqm_generic_struct_invariant_message()
     rqm_traps_saying("struct Span[T: PartialOrd]\n    lo: T\n    hi: T\n    invariant lo <= hi, \"span runs upward\"\n\n" +
                      "var s = Span(1, 5)\nprint(s.hi)\ns.hi = 0\nprint(s.hi)\n", "5\n",
-                     "invariant failed: span runs upward (main.sysl:4:15)\n")
+                     "invariant of 'Span[int]' failed: span runs upward: clause 'lo <= hi' at main.sysl:4:15 (main.sysl:8:1)\n")
