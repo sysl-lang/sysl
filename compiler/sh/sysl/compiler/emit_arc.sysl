@@ -31,6 +31,16 @@ box_header_fields(e: *Emit, payload: Type) -> int = if is_compact(e, payload) th
 // would lay the payload short of what its accesses claim.
 box_pad(e: *Emit, payload: Type) -> usize = header_pad(e, payload, usize(box_header_fields(e, payload)))
 
+// **The boundary a box of `payload` laid anywhere but the heap is put on** -- a module `val`'s static
+// image, a closure's frame slot, a vtable adapter's slot -- where LLVM's own reading of the box type
+// may fall short of it: the pad above counts from a block on the payload's boundary, and LLVM's
+// boundary for the box is only its widest field's, which carries neither a raised `@align(n)` nor,
+// on a 32-bit Arm, an `i128`'s or a `<4>f32`'s sixteen. None where the header's words already put
+// the box on it. The heap needs no word of this: a block from the allocating pair is on `heap_align`,
+// and anything beyond it comes from the aligned hook.
+box_storage_align(e: *Emit, payload: Type) -> Option[int] =
+    if e.layout.align(payload) > e.layout.pointer_bytes() then Some(int(e.layout.align(payload))) else None
+
 // The same for a buffer, whose header is one word longer -- the element count.
 buf_pad(e: *Emit, elem: Type) -> usize = header_pad(e, elem, usize(header_fields() + 1))
 

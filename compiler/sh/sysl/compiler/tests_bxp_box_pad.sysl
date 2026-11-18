@@ -1,6 +1,8 @@
 module sh.sysl.compiler
 @tests
 
+import sysl.text.replace_all
+
 // **A box's pad is every byte between its header and its payload** (`emit_arc.sysl`'s `box_pad`): the
 // header's words plus the pad ARE the payload's offset, on every target, never a sum LLVM's struct
 // layout silently adds to. Before, the pad was laid only for a raised `@align(n)` or a boundary past
@@ -14,8 +16,14 @@ module sh.sysl.compiler
 // heap cell also runs: the payload's address on its boundary, the value read back, a round trip
 // through `into_raw`/`from_raw` on the counted heap.
 //
-// Skipped cells, and why: a frame box (`gen_frame_box`) lays the same named box type, so its layout is
-// the heap cell's; a payload past the heap's boundary already had its pad (`tests_aah_aligned_alloc`).
+// The boundaries run 1, 2, 4, 8 (no pad after either header), 16 (`u128`, `<4>f32`) and 64 (`@align`),
+// each written through the box and read back. A box laid anywhere but the heap -- a static image, a
+// closure's frame slot, a split method's receiver slot -- is also laid ON its payload's boundary
+// (`box_storage_align`), which LLVM's box type cannot carry.
+//
+// Skipped cells, and why: the heap block's size is a GEP over the box type and a payload past the
+// heap's boundary is already checked through the aligned hook (`tests_aah_aligned_alloc`); a buffer's
+// header is four words, so on a 64-bit word only a boundary past sixteen pads it, which is that file's.
 
 private bxp_lowered_for(text: string, target_name: string) -> string
     val t = target_named(target_name).unwrap()
@@ -123,3 +131,129 @@ bxp_thumb_u64()
 
     assert(ir.contains("%arc.E = type { i32, [4 x i8], %struct.E }"), ir)
     assert(ir.contains("%arc.F = type { i32, ptr, i32, [4 x i8], %struct.F }"), ir)
+
+// -- every boundary, heap and static, read and written ---------------------------------------------
+
+// One struct per boundary below a word -- 1, 2, 4 and 8 -- each a byte and then the wider field, so
+// the gap inside the payload is LLVM's own and the one before it is the box's.
+private bxp_narrow() -> string =
+    "struct A1\n    a: u8\n    x: u8\n\nstruct A2\n    a: u8\n    x: u16\n\n" +
+    "struct A4\n    a: u8\n    x: u32\n\nstruct A8\n    a: u8\n    x: u64\n\n"
+
+private bxp_narrow_main() -> string =
+    "main()\n    val b1: &A1 = A1(1, 2)\n    val b2: &A2 = A2(1, 2)\n    val b4: &A4 = A4(1, 2)\n" +
+    "    val b8: &A8 = A8(1, 2)\n    b1.x = 201\n    b2.x = 60001\n    b4.x = 4000000001\n" +
+    "    b8.x = 1u64 << 60\n    b1.a += 1\n    b8.a += 7\n" +
+    "    print(usize(&*b2) % 2, usize(&*b4) % 4, usize(&*b8) % 8)\n" +
+    "    print(b1.a, b1.x, b2.x, b4.x, b8.a, b8.x == 1u64 << 60)\n"
+
+@test("payloads on a boundary of one, two, four and eight sit right after a compact count, written and read")
+bxp_narrow_compact()
+    if !enm_ready() then return
+
+    val src = bxp_narrow() + bxp_narrow_main()
+    val ir = enm_ir(src)
+
+    assert(enm_says(ir, "%arc.A1 = type { i64, %struct.A1 }"), ir)
+    assert(enm_says(ir, "%arc.A2 = type { i64, %struct.A2 }"), ir)
+    assert(enm_says(ir, "%arc.A4 = type { i64, %struct.A4 }"), ir)
+    assert(enm_says(ir, "%arc.A8 = type { i64, %struct.A8 }"), ir)
+    assert_eq(enm_ran(src), "0 0 0\n2 201 60001 4000000001 8 true\n")
+
+@test("payloads on a boundary of one, two, four and eight sit right after a full header, written and read")
+bxp_narrow_full()
+    if !enm_ready() then return
+
+    val src = bxp_narrow() + "var k1: weak A1 = None\nvar k2: weak A2 = None\nvar k4: weak A4 = None\n" +
+        "var k8: weak A8 = None\n\n" +
+        replace_all(bxp_narrow_main(), "    b1.x = 201\n", "    k1 = b1\n    k2 = b2\n    k4 = b4\n    k8 = b8\n    b1.x = 201\n")
+    val ir = enm_ir(src)
+
+    assert(enm_says(ir, "%arc.A1 = type { i64, ptr, i64, %struct.A1 }"), ir)
+    assert(enm_says(ir, "%arc.A2 = type { i64, ptr, i64, %struct.A2 }"), ir)
+    assert(enm_says(ir, "%arc.A4 = type { i64, ptr, i64, %struct.A4 }"), ir)
+    assert(enm_says(ir, "%arc.A8 = type { i64, ptr, i64, %struct.A8 }"), ir)
+    assert_eq(enm_ran(src), "0 0 0\n2 201 60001 4000000001 8 true\n")
+
+@test("a <4>f32 payload is padded to sixteen behind either header, its lanes written and read")
+bxp_vector_payload()
+    if !enm_ready() then return
+
+    val src = "struct V\n    v: <4>f32\n\nstruct U\n    v: <4>f32\n\nvar keep: weak U = None\n\n" +
+        "main()\n    val a: &V = V([1, 2, 3, 4])\n    val b: &U = U([5, 6, 7, 8])\n    keep = b\n" +
+        "    a.v = a.v + b.v\n    b.v = [9, 10, 11, 12]\n" +
+        "    print(usize(&*a) % 16, usize(&*b) % 16, a.v[0], a.v[3], b.v[1])\n"
+    val ir = enm_ir(src)
+
+    assert(enm_says(ir, "%arc.V = type { i64, [8 x i8], %struct.V }"), ir)
+    assert(enm_says(ir, "%arc.U = type { i64, ptr, i64, [8 x i8], %struct.U }"), ir)
+    assert_eq(enm_ran(src), "0 0 6 12 10\n")
+
+// **A static box is laid on its payload's boundary**: the pad counts from a block on it, and LLVM's
+// own boundary for the box type is only its widest field's, which carries no raised `@align(n)`.
+// Before, a `@align(64)` payload's static box was on sixteen, its payload wherever that fell.
+@test("a module val's box is laid on its payload's boundary where the header's words do not already put it there")
+bxp_static_box_aligned()
+    if !enm_ready() then return
+
+    val src = "@align(64)\nstruct R\n    a: u8\n    b: u128\n\n" + bxp_wide() + bxp_narrow() +
+        "val r: &R = R(3, 4)\nval w: &W = W(7)\nval s1: &A1 = A1(1, 2)\nval s2: &A2 = A2(1, 2)\n" +
+        "val s4: &A4 = A4(1, 2)\nval s8: &A8 = A8(1, 2)\n\n" +
+        "main()\n    r.b = 40\n    w.x += 1\n    s1.x = 9\n    s2.x = 900\n    s4.x = 90000\n    s8.x = 1u64 << 40\n" +
+        "    print(usize(&*r) % 64, usize(&*w) % 16, usize(&*s2) % 2, usize(&*s4) % 4, usize(&*s8) % 8)\n" +
+        "    print(r.a, r.b, w.x, s1.x, s2.x, s4.x, s8.x == 1u64 << 40)\n"
+    val ir = enm_ir(src)
+
+    assert(enm_says(ir, "%arc.R = type { i64, ptr, i64, [40 x i8], %struct.R }"), ir)
+    assert(enm_says(ir, "[40 x i8] zeroinitializer, %struct.R { i8 3, [15 x i8] zeroinitializer, i128 4, " +
+                        "[32 x i8] zeroinitializer } }, align 64"), ir)
+    assert(enm_says(ir, "[8 x i8] zeroinitializer, %struct.W { i128 7 } }, align 16"), ir)
+    // A payload on a boundary of a word or less says nothing: the header's words already put it there.
+    assert(enm_says(ir, "%struct.A8 { i8 1, i64 2 } }\n"), ir)
+    assert_eq(enm_ran(src), "0 0 0 0 0\n3 40 8 9 900 90000 true\n")
+
+// **A closure's frame box is laid on its payload's boundary**: the slot's own boundary was LLVM's for
+// the box type, sixteen, while the environment holding a `@align(64)` capture sat at 64 into it.
+@test("a frame box holding a raised capture is laid on the capture's boundary")
+bxp_frame_box_aligned()
+    if !enm_ready() then return
+
+    val src = "@align(64)\nstruct R\n    a: u8\n    b: u128\n\ncall(f: &Fn() -> int) -> int = f()\n\n" +
+        "main()\n    val r = R(3, 4)\n    val k = 5\n    print(call(() -> int(r.b) + k))\n"
+    val ir = enm_ir(src)
+
+    assert(enm_says(ir, "= alloca %arc.$closure0, align 64\n"), ir)
+    assert_eq(enm_ran(src), "9\n")
+
+// **A table's split method lays its receiver's slot on the receiver's boundary**: the box-shaped slot
+// a by-value call stores into, and the snapshot slot a lent receiver is copied to, were both laid
+// directly, so neither carried the raised boundary `emit_alloca` gives every other slot.
+@test("a split method's box-shaped receiver slot and its snapshot slot are laid on a raised boundary")
+bxp_vtable_slots_aligned()
+    if !enm_ready() then return
+
+    val src = "@align(64)\nstruct R\n    a: u8\n    n: int\n\n" +
+        "trait Count\n    count(self, k: int) -> int\n    seen(self, other: &Count) -> int\n    bump(*self)\n\n" +
+        "impl Count for R\n    count(self, k: int) -> int = if k == 0 then self.n else self.count(k - 1)\n" +
+        "    seen(self, other: &Count) -> int\n        other.bump()\n        self.n\n" +
+        "    bump(*self) = self.n += 1\n\n" +
+        "main()\n    val o: &Count = R(1, 7)\n    print(o.count(3), o.seen(o), o.count(0))\n" +
+        "    val b = R(2, 4)\n    print(b.count(2))\n"
+    val ir = enm_ir(src)
+
+    assert(enm_says(ir, "%self.object = alloca %arc.R, align 64\n"), ir)
+    assert(enm_says(ir, "%self.lent = alloca %struct.R, align 64\n"), ir)
+    assert_eq(enm_ran(src), "7 7 8\n4\n")
+
+// On a 32-bit Arm LLVM puts an `i128` and a `<4>f32` on eight, so a static box of either says its
+// sixteen itself, and a `u64`'s eight is past the word too.
+@test("on a 32-bit Arm a static box of a u128, a <4>f32 or a u64 is laid on the payload's boundary")
+bxp_thumb_static()
+    val ir = bxp_lowered_for("struct W\n    x: u128\n\nstruct E\n    x: u64\n\nstruct C\n    x: u8\n\n" +
+        "val w: &W = W(7)\nval e: &E = E(8)\nval c: &C = C(9)\n\n" +
+        "keep() -> u128 = w.x + u128(e.x) + u128(c.x)\n", "thumb-freestanding")
+
+    assert(ir.contains("%arc.W = type { i32, [12 x i8], %struct.W }"), ir)
+    assert(ir.contains("[12 x i8] zeroinitializer, %struct.W { i128 7 } }, align 16"), ir)
+    assert(ir.contains("[4 x i8] zeroinitializer, %struct.E { i64 8 } }, align 8"), ir)
+    assert(ir.contains("%struct.C { i8 9 } }\n"), ir)
