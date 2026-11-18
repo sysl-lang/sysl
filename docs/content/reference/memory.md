@@ -402,11 +402,12 @@ through a plain struct field are each refused, unless one of three things holds:
 
 - the field is an `Atomic`, written through its members — or a struct made only of atomics, locks
   and guarded fields, whose `*self` members can write nothing else;
-- a [`@guards`](#a-guarded-value-crosses-with-its-lock) names the field, so a write holds the lock (a
-  `Mutex` field is one, and the library's locks — `SpinLock`, `SleepLock`, `Condvar`, `Barrier`,
-  `Channel` — are used through their own members);
-- the type is `@unchecked(Share)`, the program's promise that its writes are synchronised another
-  way.
+- a [`@guards`](#a-guarded-value-crosses-with-its-lock) names a `private` field, so only the type's own members write it. **That
+  they take the lock is not checked**: the members are trusted. The library's `Mutex` and `Guarded`
+  take it in every member (a `Mutex` field is one, and the library's locks — `SpinLock`,
+  `SleepLock`, `Condvar`, `Barrier`, `Channel` — are used through their own members);
+- the type is `@unchecked(Share)`, the other trusted form: the program's promise that its writes are
+  synchronised another way.
 
 A field that is itself a `&sync U` may be read, and its own fields follow the same rule. A `*T`
 reached through one leads to storage the object does not hold, and is the raw tier's as everywhere. An
@@ -423,7 +424,7 @@ c.n += 1
 ```
 
 ```error
-this '+=' writes a field reached through a '&sync Cell', which is read-only: every thread holding the reference may reach it at once, and a plain write would race theirs. Make the field an 'Atomic', name it in a '@guards' so a write holds the lock, or write '@unchecked(Share)' above 'Cell' where its writes are synchronised another way
+this '+=' writes a field reached through a '&sync Cell', which is read-only: every thread holding the reference may reach it at once, and a plain write would race theirs. Make the field an 'Atomic', name it in a '@guards' (the field is then private, so only the type's own members write it, and they must take the lock, which is not checked), or write '@unchecked(Share)' above 'Cell' where its writes are synchronised another way
 ```
 
 The counter that is meant to be shared is an `Atomic`:
@@ -2301,7 +2302,10 @@ function, its address taken — it is refused). A `.copy()` of a `Buf` is fresh 
 no count, and one of strings or `Buf`s copies only the handles. A value read out of the guarded one
 still shares its count, and is refused; the guarded value held as a `&sync Mutex[...]` and captured
 crosses whole. A struct of the program's
-own opts in with `@guards(field)` over a `private` field. **Not checked**: a closure that *stores*
+own opts in with `@guards(field)` over a `private` field: the compiler checks that the field is
+private, so only the type's own members write it, and trusts those members to take the lock, as
+`Mutex` and `Guarded` do in every member. **Not checked**: that a member of a program's own type
+takes the lock (the example below compiles and prints `1` with no lock taken), and a closure that *stores*
 something read out of the guarded value where it outlives the call.
 
 ```sysl
@@ -2315,6 +2319,29 @@ print(names.with((t) -> t.get("a").unwrap_or("none")))
 
 ```error
 'sysl.threads.Mutex.with' answers a value out of the 'value' it guards, and once the guard is let go that value is shared with whoever holds it next, so every count it reaches has to be atomic — but this answers a 'string', which may share its bytes' count with the guarded one. Answer a fresh string instead — '.copy()' inside the closure gives the string an owner of its own, and a literal is immortal
+```
+
+```sysl
+import sysl.sync.SpinLock
+
+@guards(n)
+struct Cell
+    lock: SpinLock
+    private n: u64
+
+    bump(*self)
+        self.n += 1
+
+    get(self) -> u64 = self.n
+
+val c: &sync Cell = Cell(SpinLock(0), 0)
+
+c.bump()
+print(c.get())
+```
+
+```output
+1
 ```
 
 ### A table whose every record has its own lock
