@@ -1806,8 +1806,10 @@ print(halves())
 ## A destructor
 
 **`impl Drop for T` says what a type does when the last reference to one of its values goes.** It
-declares one member, `drop(self)`, answering nothing. It is for the resource the language does not
-manage — a descriptor, a mapped region, a handle a C library made — said once, beside the type:
+declares one member, `drop(*self)`, answering nothing, which an implementation writes `drop(self)`
+where a copy of the value will do ([below](#a-destructor-handed-its-own-storage)). It is for the
+resource the language does not manage — a descriptor, a mapped region, a handle a C library made —
+said once, beside the type:
 
 ```sysl
 struct Handle
@@ -1847,8 +1849,9 @@ the hooks it would call are not asked for.
 - **The order is Rust's**: locals in reverse order of declaration at the end of their block, each
   deferred statement in its written place among them; temporaries at the end of their statement;
   fields and elements in declaration and index order.
-- **`drop(self)` runs before the object's own fields are released**, sees `self` intact, and may not
-  resurrect it.
+- **`drop` runs before the object's own fields are released**, sees `self` intact, and may not
+  resurrect it. A `drop(*self)` is handed the object's own storage, and its fields are released as
+  it leaves them.
 - **A type with `Drop` is a reference type**, so only `&T` of it exists.
 - **A copy of a value retains its `&T` fields.**
 - **Cycles leak unless broken with `weak`.**
@@ -1989,6 +1992,52 @@ print(peek(Thing(2)))
   and the value it builds takes a share rather than becoming a second owner.
 - **It is not called for a value in a reference cycle**, nor **for module storage at exit**: there is
   no exit pass, so a buffered writer held in a static is flushed by the program.
+
+### A destructor handed its own storage
+
+**`drop(self)` is handed a copy; `drop(*self)` is handed the object itself.** A `(self)` method
+copies the value it is called on, and for a destructor that reads a field to close what it names, a
+copy is all it needs. A destructor that gives C back *the address of the object* — a node it linked
+into a C list, a key it registered, storage it must wipe before it is freed — needs the address every
+`(*self)` method saw while the object lived, and `drop(*self)` is handed exactly that:
+
+```sysl
+static var registered: usize = 0
+
+struct Key
+    bytes: [4]u8
+
+impl Key
+    register(*self)
+        registered = usize(self)
+
+impl Drop for Key
+    drop(*self)
+        print("same storage:", usize(self) == registered)
+        self.bytes = [0, 0, 0, 0]
+
+hold()
+    val k = Key([1, 2, 3, 4])
+
+    k.register()
+    print("holding", k.bytes[0])
+
+hold()
+```
+
+```output
+holding 1
+same storage: true
+```
+
+- **The trait declares `drop(*self)`, and a `drop(self)` stands for it** as a `(self)` member stands
+  for any trait's `(*self)` one ([traits](/reference/traits/)); neither form replaces the other.
+- **It is the same address wherever the object lives**: a box on the heap, one laid in a frame, one a
+  module `var` holds, one a field of another object holds.
+- **A write through it is the object's own.** A field it replaces is released there and then, and the
+  fields are released as the destructor leaves them, not as they were when it was called.
+- **`drop(&self)` is refused**, as any receiver the trait does not declare: a `&self` would take a
+  share of an object whose count has already reached zero.
 
 ### When a value is dropped
 

@@ -1,0 +1,417 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `drop(*self)` (`reference/memory.md § A destructor handed its own storage`): the trait declares
+// `drop(*self)`, a `drop(self)` stands for it as a `(self)` member stands for any trait's `(*self)`
+// one, and the hook hands a `(*self)` destructor the payload's own address -- the address every
+// `(*self)` method saw while the object lived. Each program below registers that address with a C
+// registry at construction and takes it back out in the destructor: `dsa_remove` answers 1 only for
+// an address it was handed, so a destructor handed a copy prints 0.
+//
+// The axes: where the object lives (a heap box handed out of a function, a box laid in a frame, a
+// module `var` replaced, a field of another object, an element of a `Buf`, behind a trait object),
+// the payload's layout (small, and a large one passed indirectly), the type's kind (a struct, a
+// generic struct at two instances, an enum), what the destructor does with the storage (reads it,
+// writes a scalar C then reads back, replaces a counted field), and both receivers in one program,
+// plus the receivers that are refused. Every run is on the counted heap and nets 0.
+//
+// Skipped: a `drop(*self)` type in the precompiled standard module, which declares none -- the
+// receiver is read off the member table every compilation hoists from source, the standard module's
+// included, so a library type is asked the same way; a bare-metal target, where the hook is the same
+// function and the call differs only in its argument.
+
+private struct DsaRun
+    ok: bool
+    out: string
+    err: string
+
+private dsa_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end dsa_ready
+
+// The registry: addresses handed in, taken back out by identity. `dsa_peek` reads the word at an
+// address, which is the `id` a `Handle` keeps first.
+private dsa_c() -> string = raw"""
+    #include <stdint.h>
+
+    static uintptr_t dsa_seen[64];
+    static int32_t dsa_n;
+
+    void dsa_add(uintptr_t a) { dsa_seen[dsa_n++] = a; }
+
+    int32_t dsa_remove(uintptr_t a) {
+        for (int32_t i = 0; i < dsa_n; i++)
+            if (dsa_seen[i] == a) {
+                dsa_seen[i] = dsa_seen[--dsa_n];
+                return 1;
+            }
+        return 0;
+    }
+
+    int32_t dsa_count(void) { return dsa_n; }
+
+    int64_t dsa_peek(uintptr_t a) { return *(int64_t *)a; }
+    """
+
+// The externs, and a `Handle` that registers its storage and gives it back in `drop(*self)`.
+private dsa_prelude() -> string = """
+    extern dsa_add(a: usize)
+    extern dsa_remove(a: usize) -> i32
+    extern dsa_count() -> i32
+    extern dsa_peek(a: usize) -> i64
+
+    struct Handle
+        id: int
+
+    impl Handle
+        register(*self) = dsa_add(usize(self))
+
+    impl Drop for Handle
+        drop(*self) = print("drop", self.id, dsa_remove(usize(self)))
+
+    made(id: int) -> &Handle
+        val h = Handle(id)
+
+        h.register()
+        h
+
+    """
+
+// A project whose module `p` carries the C side and `sysl`, and whose `main.sysl` prints `p.check()`
+// and then how many addresses the registry still holds, built on the counted heap and run.
+private dsa_run(sysl: string) -> DsaRun
+    val root = make_temp_dir("sysl-dsa").unwrap()
+
+    make_dir_all(s"$root/p").unwrap()
+    write_text(s"$root/main.sysl", "print(p.check())\nprint(\"left\", p.dsa_count())\n").unwrap()
+    write_text(s"$root/p/p.sysl", s"module p\n\n${dsa_prelude()}$sysl").unwrap()
+    write_text(s"$root/p/reg.c", dsa_c()).unwrap()
+    force_alloc_counting(true)
+
+    val built = build_native_program(root, None, None, DefaultOptimization, Some(s"$root/built"))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return DsaRun(false, failure_text(why), "")
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> DsaRun(false, "could not be started", "")
+        Ok(o) -> DsaRun(o.status.ok(), o.text, o.err.unwrap_or(""))
+end dsa_run
+
+private dsa_prints(sysl: string, expected: string)
+    val run = dsa_run(sysl)
+
+    assert(run.ok, run.out)
+    assert_eq(run.out, expected)
+    assert_eq(alloc_count_reported(run.err), 0)
+
+// What a program that must be refused is told.
+private dsa_err(text: string) -> string
+    val root = make_temp_dir("sysl-dsa-err").unwrap()
+    val src = s"$root/main.sysl"
+
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end dsa_err
+
+// -- where the object lives ---------------------------------------------------------------------------
+
+@test("a heap box handed out of the function that registered it gives the destructor the same address")
+dsa_a_heap_box()
+    if !dsa_ready() then return
+
+    dsa_prints("""
+        check() -> string
+            val h = made(1)
+
+            print("holding", dsa_count())
+            "end"
+        """, "holding 1\ndrop 1 1\nend\nleft 0\n")
+
+@test("a box that never leaves its frame gives the destructor the address its method saw")
+dsa_a_frame_box()
+    if !dsa_ready() then return
+
+    dsa_prints("""
+        local()
+            val h = Handle(2)
+
+            h.register()
+            print("local", dsa_count())
+
+        check() -> string
+            local()
+            local()
+            "end"
+        """, "local 1\ndrop 2 1\nlocal 1\ndrop 2 1\nend\nleft 0\n")
+
+@test("a field of another object is dropped at the address it was registered at, when its holder goes")
+dsa_a_field()
+    if !dsa_ready() then return
+
+    dsa_prints("""
+        struct Outer
+            n: int
+            inner: &Handle
+
+        struct Twice
+            a: &Handle
+            b: &Handle
+
+        check() -> string
+            val o = Outer(7, made(3))
+            val t = Twice(made(4), made(5))
+
+            print("holding", dsa_count(), o.n, t.b.id)
+            "end"
+        """, "holding 3 7 5\ndrop 4 1\ndrop 5 1\ndrop 3 1\nend\nleft 0\n")
+
+@test("a module var replaced drops the old object at its own address, and the one kept at exit is never dropped")
+dsa_module_storage()
+    if !dsa_ready() then return
+
+    dsa_prints("""
+        var kept: &Handle = made(10)
+
+        check() -> string
+            print("before", dsa_count(), kept.id)
+            kept = made(11)
+            print("after", dsa_count(), kept.id)
+            "end"
+        """, "before 1 10\ndrop 10 1\nafter 1 11\nend\nleft 1\n")
+
+@test("an element of a Buf is dropped at its own box's address when the Buf goes")
+dsa_buf_elements()
+    if !dsa_ready() then return
+
+    dsa_prints("""
+        import sysl.buf.{Buf, buf}
+
+        check() -> string
+            var all: Buf[&Handle] = buf()
+
+            for i in 0..<3
+                all.push(made(20 + i))
+
+            print("holding", dsa_count())
+            "end"
+        """, "holding 3\ndrop 20 1\ndrop 21 1\ndrop 22 1\nend\nleft 0\n")
+
+@test("an object held only behind a trait object is dropped at the address it was registered at")
+dsa_behind_a_trait_object()
+    if !dsa_ready() then return
+
+    dsa_prints("""
+        trait Named
+            name_of(self) -> int
+
+        impl Named for Handle
+            name_of(self) -> int = self.id
+
+        check() -> string
+            val n: &Named = made(30)
+
+            print("named", n.name_of(), dsa_count())
+            "end"
+        """, "named 30 1\ndrop 30 1\nend\nleft 0\n")
+
+// -- the payload's layout and the type's kind -----------------------------------------------------
+
+@test("a payload large enough to be passed indirectly gives the destructor its storage, not a copy")
+dsa_a_large_payload()
+    if !dsa_ready() then return
+
+    dsa_prints("""
+        struct Big
+            id: int
+            pad: [16]int
+
+        impl Big
+            register(*self) = dsa_add(usize(self))
+
+        impl Drop for Big
+            drop(*self) = print("drop big", self.id, self.pad[15], dsa_remove(usize(self)))
+
+        check() -> string
+            var pad = [0; 16]
+
+            pad[15] = 9
+
+            val b = Big(4, pad)
+
+            b.register()
+            print("holding", dsa_count())
+            "end"
+        """, "holding 1\ndrop big 4 9 1\nend\nleft 0\n")
+
+@test("a generic type's drop(*self) gives each instance its own storage")
+dsa_a_generic_type()
+    if !dsa_ready() then return
+
+    dsa_prints("""
+        struct Cell[T]
+            v: T
+
+        impl[T] Cell[T]
+            register(*self) = dsa_add(usize(self))
+
+        impl[T] Drop for Cell[T]
+            drop(*self) = print("drop cell", dsa_remove(usize(self)))
+
+        check() -> string
+            val a = Cell(5)
+            val b = Cell("five" + "!")
+
+            a.register()
+            b.register()
+            print("holding", dsa_count(), a.v, b.v)
+            "end"
+        """, "holding 2 5 five!\ndrop cell 1\ndrop cell 1\nend\nleft 0\n")
+
+@test("an enum's drop(*self) gives the destructor the payload's storage")
+dsa_an_enum()
+    if !dsa_ready() then return
+
+    dsa_prints("""
+        enum Slot
+            Empty
+            Held(int)
+
+        impl Slot
+            register(*self) = dsa_add(usize(self))
+
+        impl Drop for Slot
+            drop(*self)
+                val n = match *self
+                    Empty -> 0
+                    Held(k) -> k
+
+                print("drop slot", n, dsa_remove(usize(self)))
+
+        check() -> string
+            val s = Held(8)
+            val e = Empty
+
+            s.register()
+            e.register()
+            print("holding", dsa_count())
+            "end"
+        """, "holding 2\ndrop slot 0 1\ndrop slot 8 1\nend\nleft 0\n")
+
+// -- what the destructor does with the storage ------------------------------------------------------
+
+@test("a write through drop(*self) lands in the object's own storage, where C reads it back")
+dsa_a_write_is_the_objects_own()
+    if !dsa_ready() then return
+
+    dsa_prints("""
+        struct Key
+            word: int
+
+        impl Drop for Key
+            drop(*self)
+                self.word = 0
+                print("wiped", dsa_peek(usize(self)))
+
+        check() -> string
+            val k = Key(77)
+
+            print("key", k.word)
+            "end"
+        """, "key 77\nwiped 0\nend\nleft 0\n")
+
+@test("a field drop(*self) replaces is released there, and the one it put in is released after it")
+dsa_a_replaced_field()
+    if !dsa_ready() then return
+
+    dsa_prints("""
+        struct Swap
+            inner: &Handle
+
+        impl Drop for Swap
+            drop(*self)
+                self.inner = Handle(99)
+                print("swapped")
+
+        check() -> string
+            val s = Swap(made(6))
+
+            print("holding", dsa_count(), s.inner.id)
+            "end"
+        """, "holding 1 6\ndrop 6 1\nswapped\ndrop 99 0\nend\nleft 0\n")
+
+@test("drop(self) still compiles beside drop(*self) in one program, and is handed a copy that reads the same")
+dsa_both_receivers()
+    if !dsa_ready() then return
+
+    dsa_prints("""
+        struct Plain
+            id: int
+
+        impl Drop for Plain
+            drop(self) = print("drop plain", self.id)
+
+        check() -> string
+            val q = Plain(12)
+            val h = made(13)
+
+            print("holding", q.id, h.id)
+            "end"
+        """, "holding 12 13\ndrop 13 1\ndrop plain 12\nend\nleft 0\n")
+
+// -- the receivers that are refused -------------------------------------------------------------------
+
+@test("drop(&self) is refused, as any receiver the trait does not declare")
+dsa_a_ref_receiver_is_refused()
+    if !dsa_ready() then return
+
+    val said = dsa_err("""
+        struct H
+            v: int
+
+        impl Drop for H
+            drop(&self) = print(self.v)
+
+        val h = H(1)
+        """)
+
+    assert(said.contains("method 'drop' of 'impl Drop for H' takes a different receiver than the trait declares"), said)
+
+@test("a drop with no receiver is refused")
+dsa_no_receiver_is_refused()
+    if !dsa_ready() then return
+
+    val said = dsa_err("""
+        struct H
+            v: int
+
+        impl Drop for H
+            drop() = print("gone")
+
+        val h = H(1)
+        """)
+
+    assert(said.contains("'drop'") && said.contains("'impl Drop for H'"), said)
