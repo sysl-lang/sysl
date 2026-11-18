@@ -221,7 +221,22 @@ end open_box_zeroed
 
 // The bytes one box occupies, asked of LLVM rather than computed here: a `getelementptr` one past
 // null, read back as an integer, is the size of what was stepped over.
+//
+// **A null answer traps here, before anything is stored** (`reference/memory.md § An allocation that
+// may fail`); `try_heap` asks `box_heap_call` itself and branches on the answer instead.
 private allocate_box(e: *Emit, bn: LType, inner: Type, zeroed: bool) -> Val
+    val asked = box_heap_call(e, bn, inner, zeroed)
+    val p = asked.0
+    val got = fresh_reg(e)
+
+    emit(e, InIntCmp(got, INe, LPtr, p, VNull))
+    trap_unless(e, got, "alloc")
+    clear_unless_zeroed(e, p, asked.1, inner, zeroed)
+    p
+end allocate_box
+
+// The heap's answer for one box of `inner` -- which may be null -- and the size it was asked for.
+private box_heap_call(e: *Emit, bn: LType, inner: Type, zeroed: bool) -> (Val, Val)
     val end = fresh_reg(e)
 
     var idx: Buf[IrArg] = buf()
@@ -232,15 +247,76 @@ private allocate_box(e: *Emit, bn: LType, inner: Type, zeroed: bool) -> Val
     val size = fresh_reg(e)
 
     emit(e, InCast(size, CastPtrToInt, LPtr, end, word_lty(e)))
+    (heap_call(e, size, inner, "a box", zeroed), size)
+end box_heap_call
 
-    val p = heap_call(e, size, inner, "a box", zeroed)
+// `try_heap(v)`: the box `gen_box` makes, as `Some(box)`, where the heap answered -- and `None`, with
+// nothing stored and no count taken, where it answered null. The value is produced before the heap is
+// asked, so a temporary it made is released at the statement's end on either arm; the box takes its
+// own share of what the value holds (`retain_value`) on the arm that has a box, rather than taking a
+// temporary's share over, which the other arm would then have to give back.
+gen_try_heap(e: *Emit, boxed: TExpr, opt_ty: Type) -> Val
+    val (value, ref_ty) = *boxed.kind match
+        TBox(v, rt) -> (v, rt)
+        _ -> return gap_at(e, "a fallible box over something that is not a box")
+
+    val d = enum_decl(opt_ty)
+
+    if d.is_none() then return gap_at(e, "a fallible box whose answer is not an option")
+
+    val some = d.unwrap().variant("Some")
+    val none = d.unwrap().variant("None")
+
+    if some.is_none() || none.is_none() then return gap_at(e, "a fallible box whose option has no variants")
+
+    val inner = ref_inner(ref_ty)
+    val v = gen_expr(e, value)
+    val olt = lty(e, opt_ty)
+    val result = alloca(e, fresh_reg(e), olt)
+    val bn = box_lty(e, inner)
+    val p = box_heap_call(e, bn, inner, false).0
     val got = fresh_reg(e)
+    val given = fresh_label(e, "trybox.given")
+    val refused = fresh_label(e, "trybox.refused")
+    val joined = fresh_label(e, "trybox.end")
 
     emit(e, InIntCmp(got, INe, LPtr, p, VNull))
-    trap_unless(e, got, "alloc")
-    clear_unless_zeroed(e, p, size, inner, zeroed)
-    p
-end allocate_box
+    emit_term(e, InCondBr(got, given, refused))
+    emit_label(e, given)
+    emit(e, InStore(word_lty(e), VInt(from_int(1)), p, AccPlain, None))
+    store_header_word(e, bn, p, 1, LPtr, drop_fn(e, inner))
+    store_header_word(e, bn, p, 2, word_lty(e), VInt(from_int(1)))
+
+    if e.layout.size(inner) > 0
+        val slot = fresh_reg(e)
+
+        var idx: Buf[IrArg] = buf()
+
+        idx.push(ir_arg(l_i32(), VInt(from_int(0))))
+        idx.push(ir_arg(l_i32(), VInt(from_int(long(box_payload_field(e, inner))))))
+        emit(e, InGep(slot, bn, p, idx))
+        retain_value(e, inner, v)
+        emit(e, InStore(lty(e, inner), v, slot, AccPlain, None))
+    end if
+
+    var carried: Buf[Val] = buf()
+
+    carried.push(p)
+    emit(e, InStore(olt, enum_value(e, opt_ty, d.unwrap(), some.unwrap(), carried), result, AccPlain, None))
+    emit_term(e, InBr(joined))
+    emit_label(e, refused)
+
+    var empty: Buf[Val] = buf()
+
+    emit(e, InStore(olt, enum_value(e, opt_ty, d.unwrap(), none.unwrap(), empty), result, AccPlain, None))
+    emit_term(e, InBr(joined))
+    emit_label(e, joined)
+
+    val r = fresh_reg(e)
+
+    emit(e, InLoad(r, olt, result, AccPlain, None))
+    own_temp(e, r, opt_ty)
+end gen_try_heap
 
 // The call that takes `size` bytes from the heap for storage of `t`: the allocating pair's, or the
 // aligned hook's where `t` asks for a boundary beyond what the pair promises (`beyond_heap`). The
@@ -330,6 +406,68 @@ gen_buffer(e: *Emit, elem: Type, n: Val) -> (Val, Val) = gen_buffer_zeroed(e, el
 // The same, with every element's bytes zero before anything is written into them where `zeroed`
 // asks (`heap_call`): a fill of zeros, which then writes nothing.
 gen_buffer_zeroed(e: *Emit, elem: Type, n: Val, zeroed: bool) -> (Val, Val)
+    val sized = buffer_size(e, elem, n)
+
+    trap_unless(e, sized.1, "size")
+
+    val p = heap_call(e, sized.0, elem, "a buffer", zeroed)
+    val got = fresh_reg(e)
+
+    emit(e, InIntCmp(got, INe, LPtr, p, VNull))
+    trap_unless(e, got, "alloc")
+    clear_unless_zeroed(e, p, sized.0, elem, zeroed)
+    (p, buffer_header(e, elem, p, n))
+end gen_buffer_zeroed
+
+// **The same box where the heap may refuse it**, for `try_slot_storage`: the box, the address its
+// elements start at, and whether there is one. A size that does not fit in a word asks the heap for
+// nothing and answers as a refusal does; so does a null from the heap. The header is written on the
+// arm that has a box to write it into, so the box and the address mean something only where the flag
+// is true, and the caller branches on it in the block this leaves it in.
+gen_try_buffer(e: *Emit, elem: Type, n: Val) -> (Val, Val, Val)
+    val sized = buffer_size(e, elem, n)
+    val p_slot = alloca(e, fresh_reg(e), LPtr)
+    val ask = fresh_label(e, "trybuf.ask")
+    val after = fresh_label(e, "trybuf.end")
+
+    emit(e, InStore(LPtr, VNull, p_slot, AccPlain, None))
+    emit_term(e, InCondBr(sized.1, ask, after))
+    emit_label(e, ask)
+
+    val asked = heap_call(e, sized.0, elem, "a buffer", false)
+
+    emit(e, InStore(LPtr, asked, p_slot, AccPlain, None))
+    emit_term(e, InBr(after))
+    emit_label(e, after)
+
+    val p = fresh_reg(e)
+
+    emit(e, InLoad(p, LPtr, p_slot, AccPlain, None))
+
+    val got = fresh_reg(e)
+
+    emit(e, InIntCmp(got, INe, LPtr, p, VNull))
+
+    val write = fresh_label(e, "trybuf.write")
+    val done = fresh_label(e, "trybuf.done")
+    val data_slot = alloca(e, fresh_reg(e), LPtr)
+
+    emit(e, InStore(LPtr, VNull, data_slot, AccPlain, None))
+    emit_term(e, InCondBr(got, write, done))
+    emit_label(e, write)
+    emit(e, InStore(LPtr, buffer_header(e, elem, p, n), data_slot, AccPlain, None))
+    emit_term(e, InBr(done))
+    emit_label(e, done)
+
+    val data = fresh_reg(e)
+
+    emit(e, InLoad(data, LPtr, data_slot, AccPlain, None))
+    (p, data, got)
+end gen_try_buffer
+
+// The bytes a buffer of `n` elements occupies, header included, and whether that fits in a word: the
+// size is computed with the checked forms, since a count the program worked out can be anything.
+private buffer_size(e: *Emit, elem: Type, n: Val) -> (Val, Val)
     val bn = buf_lty(e, elem)
 
     e.checked = true
@@ -366,14 +504,14 @@ gen_buffer_zeroed(e: *Emit, elem: Type, n: Val, zeroed: bool) -> (Val, Val)
     val fits = fresh_reg(e)
 
     emit(e, InBin(fits, OpXor, l_i1(), over, VBool(true)))
-    trap_unless(e, fits, "size")
+    (total.0, fits)
+end buffer_size
 
-    val p = heap_call(e, total.0, elem, "a buffer", zeroed)
-    val got = fresh_reg(e)
+// A buffer's header written into the box the heap answered -- one strong count, the hook, one weak
+// share, the length -- and the address its elements start at.
+private buffer_header(e: *Emit, elem: Type, p: Val, n: Val) -> Val
+    val bn = buf_lty(e, elem)
 
-    emit(e, InIntCmp(got, INe, LPtr, p, VNull))
-    trap_unless(e, got, "alloc")
-    clear_unless_zeroed(e, p, total.0, elem, zeroed)
     emit(e, InStore(word_lty(e), VInt(from_int(1)), p, AccPlain, None))
     store_header_word(e, bn, p, 1, LPtr, drop_buf_fn(e, elem))
     store_header_word(e, bn, p, 2, word_lty(e), VInt(from_int(1)))
@@ -386,8 +524,8 @@ gen_buffer_zeroed(e: *Emit, elem: Type, n: Val, zeroed: bool) -> (Val, Val)
     didx.push(ir_arg(l_i32(), VInt(from_int(0))))
     didx.push(ir_arg(l_i32(), VInt(from_int(long(buf_elems_field(e, elem))))))
     emit(e, InGep(data, bn, p, didx))
-    (p, data)
-end gen_buffer_zeroed
+    data
+end buffer_header
 
 // One step of a size computation, with the overflow flag beside the answer. The intrinsic carries
 // its width in the **name** as well as in the signature, so a size computed at the machine's own
@@ -435,7 +573,11 @@ end size_op
 // is the count this view holds.
 buffer_view(e: *Emit, slice_ty: Type, box: Val, data: Val, n: Val) -> Val
     e.maybe_heap = true
+    own_temp(e, view_parts(e, slice_ty, box, data, n), slice_ty)
+end buffer_view
 
+// The three words of a view over a buffer, owned by nobody yet.
+view_parts(e: *Emit, slice_ty: Type, box: Val, data: Val, n: Val) -> Val
     val lt = lty(e, slice_ty)
     val with_owner = fresh_reg(e)
 
@@ -448,8 +590,8 @@ buffer_view(e: *Emit, slice_ty: Type, box: Val, data: Val, n: Val) -> Val
     val whole = fresh_reg(e)
 
     emit(e, InInsert(whole, lt, with_ptr, word_lty(e), n, index_list(2)))
-    own_temp(e, whole, slice_ty)
-end buffer_view
+    whole
+end view_parts
 
 // -- an array whose storage a view outlives -------------------------------------------------------------
 

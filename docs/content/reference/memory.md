@@ -152,9 +152,63 @@ print(*n + 1)
 
 **A reference is never null.** There is no null in the safe subset; something that may be absent is
 an `Option[&T]`, and a `match` is the only route to it. A box is made from what the allocator answers,
-and a null answer **traps** before anything is stored, exactly as a failed array allocation does. The
-one `&T` that reads as null is one in storage the language did not lay out and the program zeroed
+and a null answer **traps** before anything is stored, exactly as a failed array allocation does — a
+program that must answer the refusal instead asks with a fallible twin
+([below](#an-allocation-that-may-fail)). The one `&T` that reads as null is one in storage the language
+did not lay out and the program zeroed
 ([below](#storage-the-compiler-did-not-lay-out-may-not-hold-a-counted-value)).
+
+### An allocation that may fail
+
+**The allocator may answer null**: libc's `malloc` does for a size it cannot give, and a pair a
+manifest names (`allocator { alloc, free }`, [packages](/reference/packages/)) — a kernel's heap — may
+answer null whenever it is out of room. **Every allocation the language makes traps on that answer
+before anything is stored**: a box, a slice, a string (a concatenation, a rendering, `str_cast`), a
+buffer's growth, a task's frame. The trap is the one every other check stops with — status 133, no
+message — after what was printed so far is flushed.
+
+That is the right default for a program with nowhere to go when memory runs out, and the wrong one for
+a kernel, whose system calls answer `ENOMEM` and carry on. So **each allocating member of the library
+has exactly one fallible twin**, named `try_` and the member's own name, which answers
+`Result[_, AllocError]` ([`sysl.alloc`](/library/buf/#allocation-that-may-fail)) and never traps on the
+heap's refusal: `Buf.try_push`, `try_reserve`, `try_extend`, `try_insert`, `try_copy`, `try_buf`,
+`try_buf_with_capacity`, `try_buf_filled`; `StrBuilder.try_push` and its siblings, `try_finish`,
+`try_str_builder`, `try_cstring`; and `try_box(v)` for the box a `&T` of `v` would be. `AllocError` is
+`CapacityOverflow` — the size does not fit in a `usize`, and the heap was not asked — or `OutOfMemory`.
+
+```sysl
+import sysl.alloc.try_box
+import sysl.buf.{Buf, buf}
+
+struct Point
+    x: int
+    y: int
+
+main()
+    var b: Buf[u64] = buf()
+
+    b.try_reserve(usize(1) << 61) match
+        Ok(_) -> print("reserved")
+        Err(e) -> print("refused:", e, b.len())
+
+    val p = try_box(Point(1, 2))
+
+    print(p.is_ok(), p.unwrap().y)
+```
+
+```output
+refused: capacity overflow 0
+true 2
+```
+
+**A refused twin leaves nothing half-built**: the buffer keeps its elements, its count and its storage;
+the value it was handed is not kept; nothing allocated before the refusal stays allocated. Rust's
+`try_reserve` family and Rust for Linux's `try_push` and `Box::try_new` are the same bargain. A twin
+still traps on what is a mistake in the program rather than a refusal — an index past the end, a
+buffer never given storage.
+
+The twins are written over two raw-tier forms, `try_slot_storage(n)` and `try_heap(v)`
+([below](#slot-storage-room-that-holds-no-value-yet)); a program writes the twins.
 
 ### References compare through their referent
 
@@ -3106,6 +3160,33 @@ print(xs[0].n + xs[1].n)
 releases exactly those; the view's `len` is still the whole room. **The caller owes the one check the
 compiler cannot make**: nothing reads a slot past the live run. On storage `slot_storage` did not make,
 the two writing forms are an assignment and nothing.
+
+**Two forms answer the heap's refusal instead of trapping on it** ([above](#an-allocation-that-may-fail)):
+
+- **`try_slot_storage(n)`** is `slot_storage(n)`, except that where the heap answers null — or `n`
+  slots do not fit in a word, in which case the heap is not asked — it answers an **empty** view. A
+  caller asking for `n > 0` slots tells the two apart by the length.
+- **`try_heap(v)`** is the box a `&T` of `v` would be, as an `Option[&T]`: `None` where the heap
+  answered null, with nothing stored and no count of `v` taken.
+
+```sysl
+struct Node
+    n: int
+
+val xs: []&Node = try_slot_storage(4)
+val big = try_slot_storage[u64](usize::Max)
+
+print(xs.len, big.len)
+
+try_heap(Node(7)) match
+    Some(b) -> print((*b).n)
+    None -> print("refused")
+```
+
+```output
+4 0
+7
+```
 
 ### Moving one value through a raw pointer
 

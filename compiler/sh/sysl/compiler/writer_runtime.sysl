@@ -51,15 +51,15 @@ end buffer_lty
 // inert again.
 //
 // Neither of these can fail in a way a caller could act on: an allocator returning null is the
-// program's end rather than this writer's business, so `failed` is the constant a latch with nothing
-// to latch reports.
+// program's end rather than this writer's business -- it traps (`trap`, the module's stop) before the
+// null is stored -- so `failed` is the constant a latch with nothing to latch reports.
 //
 // **Every method table carries its type's identity in front of the slots**, and this one is a table
 // like any other as far as a call site is concerned -- a `*Writer` handed to a `display`
 // implementation may be this buffer, and asking its identity has to answer something. There is no
 // `Type` here to ask, so the name is hashed directly; it begins with the module separator, which
 // nothing a program can declare does.
-writer_buffer(word: string, str: string, slot: string, id: string) -> string
+writer_buffer(word: string, str: string, slot: string, id: string, trap: string) -> string
     s"""
     define private void @sysl.w.buf.write(ptr %self, $str %b) {
     entry:
@@ -80,10 +80,16 @@ writer_buffer(word: string, str: string, slot: string, id: string) -> string
       %tiny = icmp ult $word %want, 32
       %newcap = select i1 %tiny, $word 32, $word %want
       %new = call ptr @${malloc_symbol()}($word %newcap)
+      %given = icmp ne ptr %new, null
+      br i1 %given, label %grown, label %refused
+    refused:
+      call void @$trap()
+      unreachable
+    grown:
       %old = load ptr, ptr %bufp
       br label %move
     move:
-      %i = phi $word [ 0, %grow ], [ %inext, %step ]
+      %i = phi $word [ 0, %grown ], [ %inext, %step ]
       %more = icmp ult $word %i, %len
       br i1 %more, label %step, label %swap
     step:
@@ -153,6 +159,8 @@ buffer_table(e: *Emit) -> string
     val slot = l_render(buffer_lty(e))
     val id = to_string(type_identity(s"${ModuleSep}buf", e.word_bits))
 
+    e.traps = true
+
     request_text(e, "sysl.vt.buf",
-                 writer_buffer(s"i${e.word_bits}", l_render(lty(e, Str)), slot, id))
+                 writer_buffer(s"i${e.word_bits}", l_render(lty(e, Str)), slot, id, trap_symbol(e)))
 end buffer_table

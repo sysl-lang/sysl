@@ -1,0 +1,657 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{is_file, make_dir_all, make_temp_dir, read_text, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{join, Search}
+
+// **An allocation that may fail** (`reference/memory.md § An allocation that may fail`, `sysl.alloc`):
+// every allocating member of `Buf`, `StrBuilder` and the box has one fallible twin answering
+// `Result[_, AllocError]`, built on the two raw forms `try_slot_storage` and `try_heap`
+// (`slots.sysl`), and every allocation the language makes otherwise traps on a null from the heap
+// before anything is stored -- the strings and the writer buffer the runtime text makes, and a task's
+// frame, included. Found by the keel kernel (FINDINGS 82): `b.reserve(usize(1) << 61)` ended the
+// program with status 133, and nothing it wrote could answer ENOMEM.
+//
+// The axes: the twin (every one, each driven to its refusal and then to its success), which
+// allocation inside it is refused (the storage or the box, where it makes both), the element (a
+// counted `&Node`, which a leak would show, and a plain `int` or byte), the heap (libc's, refusing an
+// impossible size; a manifest-named pair the program defines, refusing on the call it is told to; a C
+// program's pair behind `build-c`; a bare-metal target's), and the trapping forms beside them (a
+// buffer's growth, a box, a concatenation, a rendering's two allocations). Cells skipped: a task's
+// frame refused (LLVM may elide the allocation, so the refusal cannot be placed on a call), and the
+// compile-time evaluator, where no allocation is ever refused (`try_heap` is refused there by name).
+
+private fal_ready() -> bool = std_root().is_ok() && clang_available()
+
+// A program's whole run: whether it was built, its status as the shell hears it, and its two streams.
+private struct FalRun
+    built: bool
+    code: int
+    out: string
+    err: string
+
+// A single-file program built and run, with the counted heap where `counted` asks for it.
+private fal_run(text: string, counted: bool) -> FalRun
+    val root = make_temp_dir("sysl-fal").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+    force_alloc_counting(counted)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization,
+                                     Some(s"$root/built"))
+
+    force_alloc_counting(false)
+
+    val ran = built match
+        Err(why) -> FalRun(false, -1, failure_text(why), "")
+        Ok(_) -> capture(s"$root/built", [], "", [], true) match
+            Err(_) -> FalRun(false, -1, "could not be started", "")
+            Ok(o) -> FalRun(true, shell_status(o.status), o.text, o.err.unwrap_or(""))
+
+    remove_dir_all(root).unwrap_or(())
+    ran
+end fal_run
+
+// The heap a project names in its manifest, written in sysl: libc's pair underneath, a count of the
+// blocks live, and a countdown -- `refuse(k)` makes the k-th allocation from now answer null, once.
+// Every call is counted in `asked`, so a test can tell whether the heap was asked at all.
+private val fal_heap: string = raw"""
+    module theap
+
+    extern "malloc" c_malloc(n: usize) -> *u8
+    extern "free" c_free(p: *u8)
+
+    var live: int = 0
+    var asked: int = 0
+    var refused: int = 0
+    var countdown: int = 0
+
+    refuse(k: int)
+        countdown = k
+
+    @export("t_alloc")
+    t_alloc(n: usize) -> *u8
+        asked += 1
+
+        if countdown > 0
+            countdown -= 1
+
+            if countdown == 0
+                refused += 1
+                return null
+        end if
+
+        live += 1
+        c_malloc(n)
+    end t_alloc
+
+    @export("t_free")
+    t_free(p: *u8)
+        if p != null then live -= 1
+
+        c_free(p)
+    """
+
+// A project whose manifest names `theap`'s pair, with `main` as its program.
+private fal_project(main: string) -> string
+    val root = make_temp_dir("sysl-fal-heap").unwrap()
+
+    write_text(s"$root/sysl.hocon", "package { name = \"fal\", version = \"0.1.0\" }\n" +
+               "allocator { alloc = \"t_alloc\", free = \"t_free\" }\n").unwrap()
+    write_text(s"$root/main.sysl", main).unwrap()
+    make_dir_all(s"$root/theap").unwrap()
+    write_text(s"$root/theap/theap.sysl", fal_heap).unwrap()
+    root
+end fal_project
+
+// The project built with `sysl build` and run: its status as the shell hears it, and its stdout.
+private fal_project_run(main: string) -> (int, string)
+    val root = fal_project(main)
+    val exe = s"$root/out"
+
+    var lines: Buf[string] = buf()
+
+    val sink = &lines
+    val code = run_cli(["sysl", "build", root, "-o", exe], (line) -> sink.push(line))
+
+    use_allocator(("malloc", "free"))
+
+    if code != 0
+        remove_dir_all(root).unwrap_or(())
+        return (-1, s"build failed: ${join(lines.view(), "\n")}")
+    end if
+
+    val ran = capture(exe, [], "", [], true) match
+        Err(_) -> (-1, "did not run")
+        Ok(o) -> (shell_status(o.status), o.text)
+
+    remove_dir_all(root).unwrap_or(())
+    ran
+end fal_project_run
+
+// -- the shortest input, made fallible --------------------------------------------------------------
+
+@test("the finding's reserve, made fallible, answers the overflow rather than trapping")
+fal_the_findings_reserve_answers()
+    if !fal_ready() then return
+
+    val run = fal_run(raw"""
+        import sysl.buf.{Buf, buf}
+
+        main()
+            var b: Buf[u64] = buf()
+
+            b.try_reserve(usize(1) << 61) match
+                Ok(_) -> print("reserved", b.len())
+                Err(e) -> print("refused:", e, b.len(), b.cap())
+
+            b.push(7)
+            print(b.len(), b[0])
+        """, true)
+
+    assert(run.built, run.out)
+    assert_eq(run.code, 0, run.out + run.err)
+    assert_eq(run.out, "refused: capacity overflow 0 0\n1 7\n")
+    assert(!run.err.contains(alloc_count_said()), run.err)
+end fal_the_findings_reserve_answers
+
+@test("libc's heap refusing a size it cannot give is answered as out of memory, nothing leaked")
+fal_libc_refusal_is_out_of_memory()
+    if !fal_ready() then return
+
+    val run = fal_run(raw"""
+        import sysl.alloc.AllocError
+        import sysl.buf.{Buf, buf}
+
+        struct Node
+            n: int
+
+        main()
+            var b: Buf[&Node] = buf()
+
+            b.push(Node(1))
+
+            val r = b.try_reserve(usize(1) << 56)
+
+            print(r.is_err(), r == Err(AllocError.OutOfMemory), b.len(), b.cap(), b[0].n)
+        """, true)
+
+    assert(run.built, run.out)
+    assert_eq(run.code, 0, run.out + run.err)
+    assert_eq(run.out, "true true 1 8 1\n")
+    assert(!run.err.contains(alloc_count_said()), run.err)
+end fal_libc_refusal_is_out_of_memory
+
+// -- every twin, refused on the call it makes, and then answered ------------------------------------
+
+// Each case runs in a function of its own, so everything it made is released by the time `main` asks
+// the heap how many blocks are live; `leaked` is that count's change across the case.
+private val fal_twins: string = raw"""
+    import theap
+    import sysl.alloc.{AllocError, try_box}
+    import sysl.buf.{Buf, buf, try_buf, try_buf_filled, try_buf_with_capacity}
+    import sysl.text.{str_builder, try_cstring, try_str_builder, try_str_builder_with_capacity}
+
+    struct Node
+        n: int
+
+    struct Pair
+        node: &Node
+        k: int
+
+    said[T](r: Result[T, AllocError]) -> string = r match
+        Ok(_) -> "ok"
+        Err(e) -> e.message()
+
+    full() -> Buf[&Node]
+        var b: Buf[&Node] = buf()
+
+        for i in 0..<8
+            b.push(Node(i))
+
+        b
+
+    push_case()
+        val b = full()
+        val v: &Node = Node(9)
+
+        theap.refuse(1)
+
+        val r = b.try_push(v)
+
+        print("push", said(r), b.len(), b.cap(), b[7].n)
+        print("push again", said(b.try_push(v)), b.len(), b[8].n)
+    end push_case
+
+    extend_case()
+        val b = full()
+        val more: [3]&Node = [Node(10), Node(11), Node(12)]
+
+        theap.refuse(1)
+
+        val r = b.try_extend(more[..])
+
+        print("extend", said(r), b.len(), b.cap())
+        print("extend again", said(b.try_extend(more[..])), b.len(), b[10].n)
+    end extend_case
+
+    insert_case()
+        val b = full()
+        val v: &Node = Node(99)
+
+        theap.refuse(1)
+
+        val r = b.try_insert(0, v)
+
+        print("insert", said(r), b.len(), b[0].n, b[7].n)
+        print("insert again", said(b.try_insert(0, v)), b.len(), b[0].n, b[8].n)
+    end insert_case
+
+    reserve_case()
+        val b = full()
+
+        theap.refuse(1)
+
+        val r = b.try_reserve(100)
+
+        print("reserve", said(r), b.len(), b.cap())
+        print("reserve over", said(b.try_reserve(usize::Max)), b.cap())
+        print("reserve again", said(b.try_reserve(100)), b.len(), b.cap() >= 108)
+    end reserve_case
+
+    copy_case()
+        val b = full()
+
+        theap.refuse(1)
+
+        val storage = said(b.try_copy())
+
+        theap.refuse(2)
+
+        val boxed = said(b.try_copy())
+        val c = b.try_copy().unwrap()
+
+        c.push(Node(8))
+        print("copy", storage, boxed, c.len(), c[7].n, b.len())
+    end copy_case
+
+    buf_case()
+        val v: &Node = Node(4)
+
+        theap.refuse(1)
+
+        val a: Result[Buf[int], AllocError] = try_buf()
+
+        theap.refuse(1)
+
+        val c: Result[Buf[int], AllocError] = try_buf_with_capacity(16, 0)
+
+        theap.refuse(2)
+
+        val d: Result[Buf[int], AllocError] = try_buf_with_capacity(16, 0)
+
+        theap.refuse(2)
+
+        val e = try_buf_filled(3, v)
+
+        print("ctors", said(a), "/", said(c), "/", said(d), "/", said(e))
+
+        val f = try_buf_filled(3, v).unwrap()
+        val g: Buf[int] = try_buf_with_capacity(16, 0).unwrap()
+        val h: Buf[int] = try_buf().unwrap()
+
+        print("ctors again", f.len(), f[2].n, g.cap(), h.len())
+    end buf_case
+
+    box_case()
+        val p = Pair(Node(5), 3)
+
+        theap.refuse(1)
+
+        val r = try_box(p)
+
+        print("box", said(r))
+
+        val q = try_box(p).unwrap()
+
+        print("box again", q.node.n, q.k)
+    end box_case
+
+    builder_case()
+        var s = str_builder()
+
+        theap.refuse(1)
+
+        val r = s.try_push("hello")
+
+        print("sb push", said(r), s.len)
+        print("sb push again", said(s.try_push("hello")), said(s.try_push("abc")), s.len)
+
+        theap.refuse(1)
+
+        val c = said(s.try_push_char('é'))
+
+        theap.refuse(1)
+
+        val i = said(s.try_push_int(-42))
+
+        theap.refuse(1)
+
+        val u = said(s.try_push_uint(42))
+
+        theap.refuse(1)
+
+        val b = said(s.try_push_bool(true))
+
+        theap.refuse(1)
+
+        val x = said(s.try_push_real(1.5))
+
+        print("sb grow", c, "/", i, "/", u, "/", b, "/", x, s.len)
+
+        theap.refuse(1)
+
+        val f1 = said(s.try_finish())
+
+        theap.refuse(2)
+
+        val f2 = said(s.try_finish())
+
+        print("sb finish", f1, "/", f2, s.try_finish().unwrap())
+    end builder_case
+
+    builder_ctor_case()
+        theap.refuse(1)
+
+        val a = said(try_str_builder())
+
+        theap.refuse(2)
+
+        val b = said(try_str_builder())
+
+        theap.refuse(1)
+
+        val c = said(try_str_builder_with_capacity(10))
+
+        theap.refuse(3)
+
+        val d = said(try_str_builder_with_capacity(10))
+
+        theap.refuse(1)
+
+        val e = said(try_cstring("hi"))
+
+        theap.refuse(2)
+
+        val f = said(try_cstring("hi"))
+
+        print("sb ctors", a, "/", b, "/", c, "/", d, "/", e, "/", f)
+
+        var s = try_str_builder_with_capacity(10).unwrap()
+
+        s.push("x")
+        print("sb ctors again", s.finish(), try_cstring("hi").unwrap().len)
+    end builder_ctor_case
+
+    main()
+        var before = theap.live
+
+        push_case()
+        print("leaked", theap.live - before)
+        before = theap.live
+        extend_case()
+        print("leaked", theap.live - before)
+        before = theap.live
+        insert_case()
+        print("leaked", theap.live - before)
+        before = theap.live
+        reserve_case()
+        print("leaked", theap.live - before)
+        before = theap.live
+        copy_case()
+        print("leaked", theap.live - before)
+        before = theap.live
+        buf_case()
+        print("leaked", theap.live - before)
+        before = theap.live
+        box_case()
+        print("leaked", theap.live - before)
+        before = theap.live
+        builder_case()
+        print("leaked", theap.live - before)
+        before = theap.live
+        builder_ctor_case()
+        print("leaked", theap.live - before)
+        print("refused", theap.refused)
+    end main
+    """
+
+private val fal_twins_said: string =
+    "push out of memory 8 8 7\npush again ok 9 9\nleaked 0\n" +
+    "extend out of memory 8 8\nextend again ok 11 12\nleaked 0\n" +
+    "insert out of memory 8 0 7\ninsert again ok 9 99 7\nleaked 0\n" +
+    "reserve out of memory 8 8\nreserve over capacity overflow 8\nreserve again ok 8 true\nleaked 0\n" +
+    "copy out of memory out of memory 9 7 8\nleaked 0\n" +
+    "ctors out of memory / out of memory / out of memory / out of memory\nctors again 3 4 16 0\nleaked 0\n" +
+    "box out of memory\nbox again 5 3\nleaked 0\n" +
+    "sb push out of memory 0\nsb push again ok ok 8\n" +
+    "sb grow out of memory / out of memory / out of memory / out of memory / out of memory 8\n" +
+    "sb finish out of memory / out of memory helloabc\nleaked 0\n" +
+    "sb ctors out of memory / out of memory / out of memory / out of memory / out of memory / out of memory\n" +
+    "sb ctors again x 2\nleaked 0\nrefused 25\n"
+
+@test("every fallible twin answers a refused heap with nothing half-built and nothing leaked")
+fal_every_twin_answers_its_refusal()
+    if !fal_ready() then return
+
+    val (code, out) = fal_project_run(fal_twins)
+
+    assert_eq(code, 0, out)
+    assert_eq(out, fal_twins_said)
+end fal_every_twin_answers_its_refusal
+
+// -- the raw forms ----------------------------------------------------------------------------------
+
+@test("try_slot_storage answers an empty view where the heap refused, and a size past a word asks nothing")
+fal_try_slot_storage_answers_empty()
+    if !fal_ready() then return
+
+    val (code, out) = fal_project_run(raw"""
+        import theap
+
+        struct Node
+            n: int
+
+        main()
+            theap.refuse(1)
+
+            val a: []&Node = try_slot_storage(4)
+            val asked = theap.asked
+            val b = try_slot_storage[u64](usize::Max)
+            val more = theap.asked - asked
+            val c: []&Node = try_slot_storage(4)
+
+            slot_place(c, 0, Node(6))
+            print(a.len, b.len, more, c.len, c[0].n, theap.live)
+        """)
+
+    assert_eq(code, 0, out)
+    assert_eq(out, "0 0 0 4 6 2\n")
+end fal_try_slot_storage_answers_empty
+
+@test("try_heap answers None where the heap refused and Some of the box where it did not")
+fal_try_heap_answers_an_option()
+    if !fal_ready() then return
+
+    val (code, out) = fal_project_run(raw"""
+        import theap
+
+        struct Node
+            n: int
+
+        main()
+            val n: &Node = Node(8)
+            val live = theap.live
+
+            theap.refuse(1)
+
+            val a = try_heap(n)
+            val kept = theap.live - live
+            val b = try_heap(n)
+
+            print(a.is_none(), kept, theap.live - live)
+
+            b match
+                Some(boxed) -> print((*boxed).n)
+                None -> print("refused")
+        """)
+
+    assert_eq(code, 0, out)
+    assert_eq(out, "true 0 1\n8\n")
+end fal_try_heap_answers_an_option
+
+@test("the raw forms are refused with the wrong number of arguments or no element type")
+fal_raw_forms_refused()
+    if !fal_ready() then return
+
+    assert(enm_says(enm_err("val a = try_slot_storage(4)\n"),
+        "'try_slot_storage' makes storage for elements of some type, and nothing here says which — " +
+        "write 'try_slot_storage[T](n)', or put it where a '[]T' is expected"), "no element type")
+    assert(enm_says(enm_err("val a: []int = try_slot_storage(4, 5)\n"),
+        "'try_slot_storage' takes 1 argument — how many slots — but 2 arguments were given"), "two arguments")
+    assert(enm_says(enm_err("val a = try_heap(1, 2)\n"),
+        "'try_heap' takes 1 argument — the value to put on the heap — but 2 arguments were given"), "two")
+end fal_raw_forms_refused
+
+@test("a module that gave the allocator up is refused both raw forms")
+fal_no_alloc_refuses_the_forms()
+    if !fal_ready() then return
+
+    val boxed = enm_err("@no_alloc\n\nf(n: int) -> bool = try_heap(n).is_some()\n\nprint(f(1))\n")
+    val stored = enm_err("@no_alloc\n\nf(n: usize) -> usize\n    val s: []int = try_slot_storage(n)\n    s.len\n\n" +
+        "print(f(1))\n")
+
+    assert(enm_says(boxed, "needs an allocator"), boxed)
+    assert(enm_says(stored, "needs an allocator"), stored)
+end fal_no_alloc_refuses_the_forms
+
+// -- the infallible forms still trap ----------------------------------------------------------------
+
+// A program that prints, has the heap refuse its next allocation (or the `k`-th), then does `what`.
+private fal_trapping(k: int, setup: string, what: string) -> (int, string) =
+    fal_project_run("import theap\nimport sysl.buf.{Buf, buf}\n\nstruct Node\n    n: int\n\n" +
+                    s"main()\n$setup    print(\"before\")\n    theap.refuse($k)\n$what    print(\"after\")\n")
+
+@test("the trapping forms still trap on a refused heap, silently, after what was printed")
+fal_trapping_forms_still_trap()
+    if !fal_ready() then return
+
+    val cases: [6](int, string, string) = [
+        (1, "    var b: Buf[int] = buf()\n", "    b.push(1)\n"),
+        (1, "    var b: Buf[int] = buf()\n", "    b.reserve(64)\n"),
+        (1, "", "    val p: &Node = Node(3)\n    print(p.n)\n"),
+        (1, "    val a = s\"${theap.live}\"\n", "    val s = a + \"right\"\n    print(s)\n"),
+        (1, "    val n = 41 + theap.live\n", "    val s = s\"n=${n}\"\n    print(s)\n"),
+        (2, "    val n = 41 + theap.live\n", "    val s = s\"n=${n}\"\n    print(s)\n")]
+
+    for c in cases
+        val (code, out) = fal_trapping(c.0, c.1, c.2)
+
+        assert_eq(code, 133, s"${c.2}: $out")
+        assert_eq(out, "before\n", c.2)
+end fal_trapping_forms_still_trap
+
+// -- build-c and a bare-metal target ---------------------------------------------------------------
+
+private val fal_archive_main: string = raw"""
+    import sysl.alloc.{AllocError, try_box}
+    import sysl.buf.{Buf, try_buf, try_buf_with_capacity}
+
+    struct Pair
+        a: int
+        b: int
+
+    @export("fal_probe")
+    fal_probe() -> i32
+        val b: Result[Buf[int], AllocError] = try_buf()
+
+        if b.is_ok() then return 1
+
+        val c: Result[Buf[int], AllocError] = try_buf_with_capacity(4, 0)
+
+        if c.is_ok() then return 2
+
+        val p = try_box(Pair(1, 2))
+
+        if p.is_ok() then return 3
+
+        0
+    end fal_probe
+    """
+
+@test("an archive whose C heap always answers null answers every twin, and asks it each time")
+fal_build_c_heap_answering_null()
+    if !fal_ready() then return
+
+    val root = make_temp_dir("sysl-fal-c").unwrap()
+    val pkg = s"$root/pkg"
+
+    make_dir_all(pkg).unwrap()
+    write_text(s"$pkg/sysl.hocon", "package { name = \"pkg\" }\n\nallocator { alloc = \"c_alloc\", free = \"c_free\" }\n").unwrap()
+    write_text(s"$pkg/main.sysl", fal_archive_main).unwrap()
+
+    val (code, out, err) = clx_ran(["sysl", "build-c", pkg, "-o", s"$root/pkg.a"])
+
+    assert_eq(code, Fine, s"$out$err")
+    write_text(s"$root/main.c", raw"""
+        #include <stdio.h>
+        #include <stddef.h>
+
+        static int asked = 0;
+
+        void *c_alloc(size_t n) { asked++; return NULL; }
+        void c_free(void *p) { }
+
+        int fal_probe(void);
+
+        int main(void) {
+            int r = fal_probe();
+            printf("%d %d\n", r, asked);
+            return 0;
+        }
+        """).unwrap()
+
+    val linked = capture("clang", [s"$root/main.c", s"$root/pkg.a", "-lm", "-o", s"$root/app"], "", [], true)
+
+    assert(linked.is_ok() && linked.unwrap().status.ok(), "the link failed")
+
+    val ran = capture(s"$root/app", [], "", [], true).unwrap()
+
+    assert_eq(ran.text, "0 3\n")
+    remove_dir_all(root).unwrap_or(())
+end fal_build_c_heap_answering_null
+
+@test("for a bare-metal target with a heap answering null the twins build, branching on the answer")
+fal_freestanding_twins_build()
+    if !fal_ready() then return
+
+    val root = make_temp_dir("sysl-fal-thumb").unwrap()
+    val pkg = s"$root/pkg"
+
+    make_dir_all(pkg).unwrap()
+    write_text(s"$pkg/sysl.hocon", "package { name = \"pkg\" }\n\nallocator { alloc = \"k_alloc\", free = \"k_free\" }\n").unwrap()
+    write_text(s"$pkg/main.sysl", fal_archive_main +
+        "\n@export(\"k_alloc\")\nk_alloc(n: usize) -> *u8 = null\n\n@export(\"k_free\")\nk_free(p: *u8) = ()\n").unwrap()
+
+    val (code, out, err) = clx_ran(["sysl", "build-c", pkg, "--target", "thumb-freestanding", "-o",
+                                    s"$root/pkg.a", "--emit-llvm", s"$root/out.ll"])
+    val text = read_text(s"$root/out.ll").unwrap_or("")
+
+    assert_eq(code, Fine, s"$out$err")
+    assert(is_file(s"$root/pkg.a"), "no archive")
+    assert(text.contains("trybox.refused"), "no refused arm for the box")
+    assert(text.contains("trystore.refused"), "no refused arm for the storage")
+    remove_dir_all(root).unwrap_or(())
+end fal_freestanding_twins_build

@@ -853,6 +853,49 @@ There is still no allocator-free `Buf` and there cannot be one: growing is the w
 What an allocator-free module may now do is *hold* an empty one — which is what a function answering
 "no results" wants, and what it could not do before.
 
+## Allocation that may fail
+
+**Every member that allocates traps when the heap answers null**, before anything is stored
+([memory § An allocation that may fail](/reference/memory/#an-allocation-that-may-fail)). Each has one
+fallible twin that answers `Result[_, AllocError]` instead — the type is `sysl.alloc`'s, with
+`CapacityOverflow` and `OutOfMemory`:
+
+| trapping | fallible twin |
+|---|---|
+| `push(v)` | `try_push(v)` |
+| `extend(xs)` | `try_extend(xs)` |
+| `insert(i, v)` | `try_insert(i, v)` |
+| `reserve(more)` | `try_reserve(more)` |
+| `copy()` | `try_copy()` |
+| `buf()`, `buffer()` | `try_buf()` |
+| `buf_with_capacity(n, fill)` | `try_buf_with_capacity(n, fill)` |
+| `buf_filled(n, value)` | `try_buf_filled(n, value)` |
+| a box, `val p: &T = v` | `sysl.alloc.try_box(v)` |
+
+```sysl
+import sysl.alloc.AllocError
+import sysl.buf.{Buf, buf}
+
+var b: Buf[int] = buf()
+
+b.push(1)
+
+print(b.try_push(2).is_ok(), b.len())
+print(b.try_reserve(usize::Max) == Err(AllocError.CapacityOverflow), b.len(), b.cap())
+```
+
+```output
+true 2
+true 2 8
+```
+
+**A refusal leaves the buffer as it was**: its elements, its count, its storage and its `cap()`; the
+value handed to `try_push` or `try_insert` is not kept. What is a mistake in the program still traps
+in the twin as in the member — an index past `len()` in `try_insert`, a buffer never given storage.
+`freeze()` has no twin: a frozen buffer is made once, when the program sets up, and the buffer it
+consumes would have to survive the refusal. `ByteSink`'s `write` has none either — a `Writer` answers
+through its `Fallible` latch, not a `Result`.
+
 ## `ByteSink`
 
 ```sysl

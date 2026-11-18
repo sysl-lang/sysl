@@ -22,9 +22,19 @@ import sysl.math.bigint.{BigInt, from_int, pow, sub as big_sub, to_string}
 // **The hook cannot be null.** The free is the hook's, so a null one would mean a `StrBuf` whose
 // bytes are never given back; `arc.drop.plain` is exactly the hook for a payload that holds nothing,
 // and a module whose helpers reach the allocator is given one.
-private str_buf_header(word: string) -> string
+//
+// **A null answer traps before anything is stored**, as every box's does (`emit_box.sysl`'s
+// `allocate_box`); `trap` is the module's stop (`trap_symbol`), and the block the header ends in is
+// `got`, which is what a `phi` after it names as its way in.
+private str_buf_header(word: string, trap: string) -> string
     s"""
       %p = call ptr @${malloc_symbol()}($word %size)
+      %given = icmp ne ptr %p, null
+      br i1 %given, label %got, label %refused
+    refused:
+      call void @$trap()
+      unreachable
+    got:
       store $word 1, ptr %p
       %hook = getelementptr %arc.header, ptr %p, i32 0, i32 1
       store ptr @arc.drop.plain, ptr %hook
@@ -235,7 +245,7 @@ str_search_text(word: string, str: string) -> string
 // The two halves are copied in a byte at a time, and the returned view names the buffer as its
 // owner, the first payload byte as its start, and the summed length. UTF-8 is closed under
 // concatenation, so the validity invariant needs no re-checking.
-str_concat_text(word: string, str: string) -> string
+str_concat_text(word: string, str: string, trap: string) -> string
     s"""
     define private $str @sysl.str.concat(ptr %ap, $word %an, ptr %bp, $word %bn) {
     entry:
@@ -243,9 +253,9 @@ str_concat_text(word: string, str: string) -> string
       %hend = getelementptr %arc.header, ptr null, i32 1
       %hsize = ptrtoint ptr %hend to $word
       %size = add $word %hsize, %total
-    ${str_buf_header(word)}  br label %acond
+    ${str_buf_header(word, trap)}  br label %acond
     acond:
-      %i = phi $word [ 0, %entry ], [ %inext, %abody ]
+      %i = phi $word [ 0, %got ], [ %inext, %abody ]
       %amore = icmp ult $word %i, %an
       br i1 %amore, label %abody, label %bcond
     abody:
@@ -277,16 +287,16 @@ str_concat_text(word: string, str: string) -> string
 
 // Copies a run of bytes into a fresh owning string. Every `str(x)` that renders into a scratch
 // buffer finishes through here, so the allocation and the copy live in one place.
-str_from_bytes_text(word: string, str: string) -> string
+str_from_bytes_text(word: string, str: string, trap: string) -> string
     s"""
     define private $str @sysl.str.from_bytes(ptr %src, $word %n) {
     entry:
       %hend = getelementptr %arc.header, ptr null, i32 1
       %hsize = ptrtoint ptr %hend to $word
       %size = add $word %hsize, %n
-    ${str_buf_header(word)}  br label %cond
+    ${str_buf_header(word, trap)}  br label %cond
     cond:
-      %i = phi $word [ 0, %entry ], [ %next, %body ]
+      %i = phi $word [ 0, %got ], [ %next, %body ]
       %more = icmp ult $word %i, %n
       br i1 %more, label %body, label %done
     body:

@@ -1,6 +1,7 @@
 module sysl.buf
 
 import sysl.{index_past, insert_past}
+import sysl.alloc.AllocError
 import sysl.raw.ptr_cast
 
 /** The growable sequence and the sink built on it.
@@ -310,6 +311,78 @@ private[buf] struct BufCore[T]
     reserve(*self, more: usize)
         if more > self.elems.len - self.count then self.grow(self.count + more)
 
+    // -- the fallible twins (`sysl.alloc`) ------------------------------------------------------------
+    //
+    // Each asks for its storage with `try_storage` and answers a refusal before anything here has
+    // changed: the storage is replaced only once the new storage exists and holds every element.
+
+    /** `grow`, answering a refusal. The doubling stops at `need` where doubling again would pass the
+     * largest size, so the arithmetic itself is never what fails.
+     */
+    @noinline
+    @cold
+    private try_grow(*self, need: usize) -> Result[unit, AllocError]
+        var bigger_len = if self.elems.len == 0 then 8usize else self.elems.len
+
+        while bigger_len < need
+            bigger_len = if bigger_len <= usize::Max / 2 then bigger_len * 2 else need
+
+        val bigger: []T = try_storage(bigger_len)?
+
+        for i in 0..<self.count
+            slot_place(bigger, i, self.elems[i])
+
+        self.elems = bigger
+        Ok(())
+    end try_grow
+
+    try_push(*self, v: T) -> Result[unit, AllocError]
+        val n = self.count
+
+        if n >= self.elems.len then self.try_grow(n + 1)?
+
+        slot_place(self.elems, n, v)
+        self.count = n + 1
+        Ok(())
+    end try_push
+
+    try_extend(*self, xs: []const T) -> Result[unit, AllocError]
+        if xs.len == 0 then return Ok(())
+
+        val need = self.count.checked_add(xs.len).ok_or(AllocError.CapacityOverflow)?
+
+        if need > self.elems.len then self.try_grow(need)?
+
+        val run = self.elems[self.count..<need]
+
+        for i in 0..<xs.len
+            slot_place(run, i, xs[i])
+
+        self.count = need
+        Ok(())
+    end try_extend
+
+    @track_caller
+    try_insert(*self, i: usize, v: T) -> Result[unit, AllocError]
+        if i > self.count then insert_past(i, self.count)
+
+        self.try_push(v)?
+
+        var j = self.count - 1
+
+        while j > i
+            self.elems[j] = self.elems[j - 1]
+            j -= 1
+
+        self.elems[i] = v
+        Ok(())
+    end try_insert
+
+    try_reserve(*self, more: usize) -> Result[unit, AllocError]
+        if more <= self.elems.len - self.count then return Ok(())
+
+        self.try_grow(self.count.checked_add(more).ok_or(AllocError.CapacityOverflow)?)
+
     /** The count moved to `n`. Past the storage is a mistake and panics; below the count is
      * `truncate`, giving the elements up; above it, the slots between are taken as they are.
      */
@@ -456,6 +529,40 @@ struct Buf[T]
         if is_null(self.core) then unassigned(BufUnassigned)
         self.core.reserve(more)
 
+    /** `push`, answering `AllocError` where the storage had to grow and the heap refused it -- the
+     * buffer then holds what it held, and `v` is not kept. A buffer never given storage still traps,
+     * as `push` does: that is a mistake in the program, not a refusal.
+     */
+    @relocates
+    try_push(self, v: T) -> Result[unit, AllocError]
+        if is_null(self.core) then unassigned(BufUnassigned)
+        self.core.try_push(v)
+
+    /** `extend`, answering `AllocError` -- `CapacityOverflow` where the count plus the run passes the
+     * largest size -- with nothing appended where it does.
+     */
+    @relocates
+    try_extend(self, xs: []const T) -> Result[unit, AllocError]
+        if is_null(self.core) then unassigned(BufUnassigned)
+        self.core.try_extend(xs)
+
+    /** `insert`, answering `AllocError` where the storage had to grow; an index past `len()` still
+     * traps, as it does in `insert`.
+     */
+    @relocates
+    @track_caller
+    try_insert(self, i: usize, v: T) -> Result[unit, AllocError]
+        if is_null(self.core) then unassigned(BufUnassigned)
+        self.core.try_insert(i, v)
+
+    /** `reserve`, answering `AllocError`: `CapacityOverflow` where `len() + more` passes the largest
+     * size, `OutOfMemory` where the heap refused the storage. `cap()` is unchanged where it does.
+     */
+    @relocates
+    try_reserve(self, more: usize) -> Result[unit, AllocError]
+        if is_null(self.core) then unassigned(BufUnassigned)
+        self.core.try_reserve(more)
+
     @relocates
     @track_caller
     const remove(self, i: usize) -> T
@@ -470,6 +577,18 @@ struct Buf[T]
 
         out.extend(self.view())
         out
+
+    /** `copy`, answering `AllocError` where the heap refused the second buffer or its storage, with
+     * nothing of either left allocated.
+     */
+    try_copy(self) -> Result[Buf[T], AllocError]
+        val storage: []T = try_storage(self.len())?
+
+        var out = Buf(try_core(BufCore(storage, 0))?)
+
+        out.extend(self.view())
+        Ok(out)
+    end try_copy
 
     /** The elements, frozen: a `&Frozen[T]` nothing writes, and this buffer -- through this name and
      * every other -- left empty (`Frozen`). **The count is chosen the way a construction's is**: where
@@ -717,6 +836,45 @@ const buf_filled[T](n: usize, value: T) -> Buf[T]
 
     out
 end buf_filled
+
+// -- the fallible constructors (`sysl.alloc`) ---------------------------------------------------------
+
+/** `buf()`, answering `AllocError` where the heap refused the box every handle shares. */
+try_buf[T]() -> Result[Buf[T], AllocError] = Ok(Buf(try_core(BufCore([], 0))?))
+
+/** `buf_with_capacity(n, fill)`, answering `AllocError` where the heap refused the storage or the
+ * box -- with neither left allocated -- and `CapacityOverflow` where `n` elements do not fit in a
+ * `usize` of bytes.
+ */
+try_buf_with_capacity[T](n: usize, fill: T) -> Result[Buf[T], AllocError] =
+    Ok(Buf(try_core(BufCore(try_storage(n)?, 0))?))
+
+/** `buf_filled(n, value)`, answering `AllocError` as `try_buf_with_capacity` does. */
+try_buf_filled[T](n: usize, value: T) -> Result[Buf[T], AllocError]
+    var out: Buf[T] = try_buf_with_capacity(n, value)?
+
+    for _ in 0..<n
+        out.push(value)
+
+    Ok(out)
+end try_buf_filled
+
+/** `n` slots of storage from `try_slot_storage`, or why there are none: the form answers an empty
+ * view where the heap refused it or the bytes do not fit in a word, and which one is told by the size.
+ */
+private[buf] try_storage[T](n: usize) -> Result[[]T, AllocError]
+    val got: []T = try_slot_storage(n)
+
+    if got.len == n then return Ok(got)
+    if sizeof(T) > 0 && n > usize::Max / sizeof(T) then return Err(AllocError.CapacityOverflow)
+
+    Err(AllocError.OutOfMemory)
+end try_storage
+
+/** The box a handle holds, or `OutOfMemory`. */
+private try_core[T](core: BufCore[T]) -> Result[&BufCore[T], AllocError] = try_heap(core) match
+    Some(boxed) -> Ok(boxed)
+    None -> Err(AllocError.OutOfMemory)
 
 /** A writer that gathers, and the reason it is supplied rather than left to each program is the rule
  * that a specifier describes the field the *whole* value occupies (`library/core.md § A specifier
