@@ -1,0 +1,249 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.from_int
+
+// `xs.view_as[T]()`: a view read at another element type -- the same storage and the same owner, the
+// length counted again in `T`s (`reference/arrays.md § Reading a view as another element`).
+//
+// **It is the safe tier's reinterpretation, so both element types must be plain data**: nothing that
+// holds an address or a count, and nothing some bit pattern of which is not a value -- no `bool`, no
+// `char`, no enum, no checked subtype, no padding byte a value never sets. Then every byte the source
+// holds is a valid `T` and every `T` written through the view is a valid source element, so the view
+// is read-only exactly where the source is and nothing has to be refused about writing.
+//
+// **What only the run can know is checked by the run**: whether the first element sits on `T`'s
+// boundary and whether the bytes are a whole number of `T`s. Each check is emitted only where the two
+// layouts leave it open -- a `[]u32` read as `[]u8` checks nothing -- and an empty view passes both,
+// whatever address it carries. A zero-sized element on either side is refused, since no count of
+// them names any bytes.
+//
+// The node is `TViewAs`, which fixed point's `::Bits` and `.bits` already make over equal-sized
+// elements; every walk that keeps a view's owner treats it as the view it was made of, so the result
+// keeps the source's storage alive as any view does.
+
+// Whether `recv.view_as[...]` names this member: a view, or an array a view is taken of.
+is_view_as_receiver(rty: Type) -> bool = rty match
+    Slice(_, _) -> true
+    Array(_, _) -> true
+    _ -> false
+
+// `xs.view_as[T]()`, `receiver` already read through its reference.
+view_as_member(cx: &Analyzer, span: Span, receiver: TExpr, args: Buf[Expr], targs: Buf[Expr]) -> TExpr
+    if targs.len() != 1 then
+        return cx.err(span, "'view_as' takes one type argument, the element to read the view as — " +
+                      "'xs.view_as[u32]()'")
+
+    if !args.is_empty() then
+        return cx.err(span, "'view_as' takes no arguments — it reads the view it is called on")
+
+    val to = written_type_arg(cx, targs[0])
+
+    if to == Unknown then return bad_expr(span)
+
+    val v = whole_view(cx, receiver)
+
+    val (from, read_only) = texpr_type(v) match
+        Slice(e, ro) -> (*e, ro)
+        _ -> (Unknown, false)
+
+    if from == Unknown then return bad_expr(span)
+
+    val result = Slice(to, read_only)
+
+    // A parameter standing for itself is measured at each instantiation, where the body is read again.
+    if mentions_abstract(from) || mentions_abstract(to) then return TExpr(span, TViewAs(v, result))
+
+    val why_to = not_plain(cx, to)
+
+    if why_to.is_some() then
+        return cx.err(targs[0].span, s"'view_as' reads the storage as ${type_show(to)}, which is not " +
+                      s"plain data — ${why_to.unwrap()}")
+
+    val why_from = not_plain(cx, from)
+
+    if why_from.is_some() then
+        return cx.err(span, s"'view_as' reads the storage of a '${type_show(texpr_type(v))}', and " +
+                      s"${type_show(from)} is not plain data — ${why_from.unwrap()}")
+
+    val layout = cx.an.tables.layout
+
+    if layout.size(to) == 0 then
+        return cx.err(targs[0].span, s"'view_as' cannot read a view as ${type_show(to)}, which takes " +
+                      "no room — no count of them names any bytes")
+
+    if layout.size(from) == 0 then
+        return cx.err(span, s"'view_as' cannot read a view of ${type_show(from)}, which takes no " +
+                      "room — the view holds no bytes")
+
+    TExpr(span, TViewAs(v, result))
+end view_as_member
+
+// The receiver as a view: itself, or the whole-array view an array converts to, read-only over a
+// `val` array's own storage.
+private whole_view(cx: &Analyzer, x: TExpr) -> TExpr = texpr_type(x) match
+    Slice(_, _) -> x
+    Array(_, elem) -> array_view(cx, x, *elem, false).unwrap_or(x)
+    _ -> x
+
+// Why a type is not plain data, or nothing where it is: every byte of it belongs to a value, every
+// bit pattern of those bytes is one, and nothing in it is an address or a count.
+private not_plain(cx: &Analyzer, t: Type) -> Option[string]
+    val shape = shape_not_plain(cx, t)
+
+    if shape.is_some() then return shape
+
+    val layout = cx.an.tables.layout
+    val size = layout.size(t)
+
+    if size != 0 && size % layout.align(t) != 0 then
+        return Some(s"a '${type_show(t)}' ends in padding, bytes no value of it sets")
+
+    None
+end not_plain
+
+private shape_not_plain(cx: &Analyzer, t: Type) -> Option[string]
+    val shown = type_show(t)
+    val layout = cx.an.tables.layout
+
+    t match
+        Integer(bits, _, _) -> whole_bytes(layout.size(t), bits, shown)
+        Fixed(bits, _, _) -> whole_bytes(layout.size(t), bits, shown)
+        Floating(bits, _) -> whole_bytes(layout.size(t), bits, shown)
+        Unit -> None
+        Bool -> Some("a 'bool' is valid only as 0 or 1")
+        Char -> Some("a 'char' is valid only as a Unicode scalar value")
+        Enum(_) -> Some(s"'$shown' is valid only as one of its variants")
+        Constrained(d) ->
+            if constraint_free(d) then not_plain(cx, d.base)
+            else Some(s"'$shown' holds only the values its check allows")
+        Array(_, elem) -> not_plain(cx, *elem)
+        Vector(_, elem) ->
+            if underlying(*elem) == Bool then Some(s"'$shown' packs its lanes as bits")
+            else not_plain(cx, *elem)
+        Struct(d) -> struct_not_plain(cx, t, d)
+        Volatile(_) -> Some(s"'$shown' is reached one access at a time, never through a view")
+        Ptr(_, _) -> Some(s"'$shown' is an address")
+        CFn(_, _, _) -> Some(s"'$shown' is an address")
+        Ref(_, _) -> Some(s"'$shown' is a counted reference")
+        Weak(_) -> Some(s"'$shown' is a reference")
+        Slice(_, _) -> Some(s"'$shown' is a view, which holds an address and a count")
+        Str -> Some("a 'string' is a view, which holds an address and a count")
+        _ -> Some(s"'$shown' has no layout a view can be read at")
+end shape_not_plain
+
+// An integer or float whose bits fill its bytes: a `u12` stored in two bytes has four that are not
+// part of it.
+private whole_bytes(size: usize, bits: int, shown: string) -> Option[string] =
+    if size * 8 == usize(bits) then None
+    else Some(s"a '$shown' is $bits bits stored in $size bytes, and the rest are no part of it")
+
+private struct_not_plain(cx: &Analyzer, t: Type, d: &StructType) -> Option[string]
+    val shown = type_show(t)
+
+    if d.base == TaskBase then return Some(s"'$shown' holds its coroutine's frame")
+    if d.opaque then return Some(s"'$shown' is opaque, laid out where sysl cannot see")
+    if !d.c_bits.is_empty() then return Some(s"'$shown' packs bitfields, and bits no field names")
+    if has_drop(cx.an, t) then return Some(s"'$shown' has a destructor, which a copy of its bytes would skip")
+
+    val layout = cx.an.tables.layout
+    val size = layout.size(t)
+    var sum: usize = 0
+
+    for f in d.fields
+        val why = not_plain(cx, f.1)
+
+        if why.is_some() then return Some(s"its field '${f.0}' is not, since ${why.unwrap()}")
+
+        val fs = layout.size(f.1)
+
+        if d.union_layout && fs != size then
+            return Some(s"union '$shown' has a field narrower than itself, so bytes some fields leave unset")
+
+        sum += fs
+
+    if !d.union_layout && sum != size then
+        return Some(s"'$shown' has padding between or after its fields, bytes no value of it sets")
+
+    None
+end struct_not_plain
+
+// The view, read at the element its type names: the owner kept, the address checked against the
+// element's boundary where the source's does not promise it, and the length counted again.
+gen_view_as(e: *Emit, arg: TExpr, ty: Type) -> Val
+    val v = gen_expr(e, arg)
+    val from = element(texpr_type(arg))
+    val to = element(ty)
+
+    if from.is_none() || to.is_none() then return v
+
+    val fs = e.layout.size(from.unwrap())
+    val ts = e.layout.size(to.unwrap())
+    val fa = e.layout.align(from.unwrap())
+    val ta = e.layout.align(to.unwrap())
+
+    // Equal sizes and no stricter boundary: only the element type changed, and a view's pointer
+    // carries none. A zero size was refused by the analyzer.
+    if (fs == ts && ta <= fa) || fs == 0 || ts == 0 then return v
+
+    val vty = lty(e, ty)
+    val w = word_lty(e)
+    val len = fresh_reg(e)
+
+    emit(e, InExtract(len, vty, v, index_list(2)))
+
+    if ta > fa
+        val p = fresh_reg(e)
+
+        emit(e, InExtract(p, vty, v, index_list(1)))
+
+        val addr = fresh_reg(e)
+
+        emit(e, InCast(addr, CastPtrToInt, LPtr, p, w))
+
+        val low = fresh_reg(e)
+
+        emit(e, InBin(low, OpAnd, w, addr, VInt(from_int(long(ta - 1)))))
+
+        val aligned = fresh_reg(e)
+
+        emit(e, InIntCmp(aligned, IEq, w, low, VInt(from_int(0))))
+
+        val empty = fresh_reg(e)
+
+        emit(e, InIntCmp(empty, IEq, w, len, VInt(from_int(0))))
+
+        val ok = fresh_reg(e)
+
+        emit(e, InBin(ok, OpOr, LInt(1), aligned, empty))
+        trap_unless(e, ok, "view_align", type_show(to.unwrap()))
+    end if
+
+    if fs == ts then return v
+
+    val counted = fresh_reg(e)
+
+    if fs % ts == 0
+        emit(e, InBin(counted, OpMul, w, len, VInt(from_int(long(fs / ts)))))
+    else
+        val bytes = fresh_reg(e)
+
+        emit(e, InBin(bytes, OpMul, w, len, VInt(from_int(long(fs)))))
+
+        val rest = fresh_reg(e)
+
+        emit(e, InBin(rest, OpURem, w, bytes, VInt(from_int(long(ts)))))
+
+        val whole = fresh_reg(e)
+
+        emit(e, InIntCmp(whole, IEq, w, rest, VInt(from_int(0))))
+        trap_unless(e, whole, "view_tail", type_show(to.unwrap()))
+        emit(e, InBin(counted, OpUDiv, w, bytes, VInt(from_int(long(ts)))))
+    end if
+
+    val out = fresh_reg(e)
+
+    emit(e, InInsert(out, vty, v, w, counted, index_list(2)))
+    out
+end gen_view_as

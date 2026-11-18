@@ -31,6 +31,16 @@ box_header_fields(e: *Emit, payload: Type) -> int = if is_compact(e, payload) th
 // would lay the payload short of what its accesses claim.
 box_pad(e: *Emit, payload: Type) -> usize = header_pad(e, payload, usize(box_header_fields(e, payload)))
 
+// **The boundary a box of `payload` laid anywhere but the heap is put on** -- a module `val`'s static
+// image, a closure's frame slot, a vtable adapter's slot -- where LLVM's own reading of the box type
+// may fall short of it: the pad above counts from a block on the payload's boundary, and LLVM's
+// boundary for the box is only its widest field's, which carries neither a raised `@align(n)` nor,
+// on a 32-bit Arm, an `i128`'s or a `<4>f32`'s sixteen. None where the header's words already put
+// the box on it. The heap needs no word of this: a block from the allocating pair is on `heap_align`,
+// and anything beyond it comes from the aligned hook.
+box_storage_align(e: *Emit, payload: Type) -> Option[int] =
+    if e.layout.align(payload) > e.layout.pointer_bytes() then Some(int(e.layout.align(payload))) else None
+
 // The same for a buffer, whose header is one word longer -- the element count.
 buf_pad(e: *Emit, elem: Type) -> usize = header_pad(e, elem, usize(header_fields() + 1))
 
@@ -974,6 +984,17 @@ destructor_of(e: *Emit, t: Type) -> Option[string]
     None
 end destructor_of
 
+// Whether a type's destructor takes `*self`: it is handed the address of the payload itself rather
+// than the value loaded out of it.
+private destructor_by_address(e: *Emit, t: Type) -> bool
+    val key = mangle(t)
+
+    for item in e.destructors
+        if item.0 == key then return item.2
+
+    false
+end destructor_by_address
+
 // -- generating a helper ----------------------------------------------------------------------------
 
 // One queued helper, built. The queue may grow while this runs -- a destructor releases the
@@ -1102,24 +1123,32 @@ private gen_drop_hook(e: *Emit, payload: Type, frees: bool)
         return
     end if
 
+    val by_address = destructor_by_address(e, payload)
     val v = fresh_reg(e)
 
-    emit(e, InLoad(v, lty(e, payload), pa, AccPlain, None))
+    if !by_address then emit(e, InLoad(v, lty(e, payload), pa, AccPlain, None))
 
     // **Before the walk, not after.** The destructor is handed the value as it stands, so it may
     // read a field to close what that field names; releasing first would hand it a value whose
     // references had already been let go of. It takes `self` **borrowed** -- no count is taken for
     // the call -- because the count is already zero and taking one would resurrect the object into
     // a second teardown.
+    //
+    // **A `drop(*self)` is handed the payload's own address**, the one every `(*self)` method saw
+    // while the object lived, and may write through it -- wipe a key, or replace a field, which
+    // releases the old one itself. So the walk reads the value AFTER the call: a load taken
+    // before it would release what the destructor already let go of, and miss what it put in.
     destructor_of(e, payload) match
         Some(d) ->
             var args: Buf[IrArg] = buf()
 
-            if e.layout.indirect(payload) then args.push(ir_arg(LPtr, pa))
+            if e.layout.indirect(payload) || by_address then args.push(ir_arg(LPtr, pa))
             else args.push(ir_arg(lty(e, payload), v))
 
             emit(e, ir_call(None, LVoid, VGlobal(d), args))
         None -> ()
+
+    if by_address then emit(e, InLoad(v, lty(e, payload), pa, AccPlain, None))
 
     release_value(e, payload, v)
     emit_term(e, InRet(None, None))
