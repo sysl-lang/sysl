@@ -1,0 +1,308 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// **A string two domains reach** (`reference/memory.md § A string crosses into a shared object`): a
+// string a `&sync Fn` captures, or a `&sync T` holds, is put in bytes of its own whose count is atomic
+// where the box is made (`emit_cross.sysl`'s `share_payload`), and every view of those bytes -- a slice
+// included -- takes and gives back its shares atomically (`arc_runtime.sysl`'s `arc_maybe`). A literal,
+// and a string already shared, is left as it is.
+//
+// The axes: where the string is placed (a capture, a field, an array element, an `Option`, an enum
+// payload, a scoped child's capture), what crosses after (a call on another thread, a slice, a channel
+// send), the bytes (literal, built, already shared), the target (one with a word-wide read-modify-
+// write, Armv6-M without, a 32-bit one, ThreadSanitizer), and the places a string is still refused
+// because nothing copies it (module storage, a view of strings, a lent struct, a frozen buffer, a
+// pointer's pointee -- the last three pinned in `tests_sce_`, `tests_fzb_` and `tests_ixc_`).
+// Every program runs on the counted heap, so a share taken or given back once too often shows as a
+// leak or a crash rather than passing quietly.
+
+// What a one-file program prints, then its standard error, built on the counted heap and run; or what
+// it was refused for.
+private shs_ran(text: string) -> (string, string)
+    val root = make_temp_dir("sysl-shs").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    force_alloc_counting(true)
+
+    val built = build_native_program(root, None, None, DefaultOptimization, Some(s"$root/built"))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), "refused")
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true, 60000)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("", "could not be started")
+        Ok(o) -> (o.text, o.err.unwrap_or("") + (if o.status.ok() then "" else "failed"))
+end shs_ran
+
+// The program prints exactly `want`, and gives back everything it allocated.
+private shs_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = shs_ran(text)
+
+    assert_eq(out.0, want, out.1)
+    assert_eq(out.1, "", out.0)
+end shs_prints
+
+// The program is refused, for a reason holding each of `parts`.
+private shs_refused(text: string, parts: []const string)
+    if xvr_no_library() then return
+
+    val out = shs_ran(text)
+
+    assert_eq(out.1, "refused", out.0)
+
+    for p in parts
+        assert(out.0.contains(p), out.0)
+end shs_refused
+
+private shs_count(hay: string, needle: string) -> usize = xvr_count(hay, needle)
+
+// -- a capture --------------------------------------------------------------------------------------
+
+@test("a '&sync Fn' captures a built string and is called on other threads, slices included")
+shs_capture_on_threads()
+    shs_prints(raw"""
+        import sysl.threads.scope
+
+        val n = 7
+        val name = s"worker-$n"
+        val job: &sync Fn() -> string = () -> name[0..<6]
+
+        val got = scope((s) ->
+            val a = s.spawn(() -> job())
+            val b = s.spawn(() -> job() + name[6..<name.len])
+
+            a.join() + " " + b.join())
+
+        print(got, name)
+        """, "worker worker-7 worker-7\n")
+
+@test("a literal and a built string captured side by side")
+shs_capture_literal_and_built()
+    shs_prints(raw"""
+        val n = 2
+        val built = s"b$n"
+        val lit = "lit"
+        val job: &sync Fn() -> string = () -> lit + built + lit[0..<1]
+
+        print(job(), job())
+        """, "litb2l litb2l\n")
+
+// Four threads each push and drop forty thousand slices of one shared string. A count changed
+// without atomics loses updates under this, and the counted heap or the free sees it.
+@test("many threads taking and giving back shares of one shared string agree on its count")
+shs_threads_hammer_one_count()
+    shs_prints(raw"""
+        import sysl.buf.{Buf, buf}
+        import sysl.threads.scope
+
+        count(t: string) -> int
+            var k = 0
+            var keep: Buf[string] = buf()
+
+            for i in 0..<40000
+                keep.push(t[i % 4..<t.len])
+
+                if keep.len() == 8
+                    for p in keep do k += int(p.len)
+                    keep.clear()
+
+            k
+
+        val n = 5
+        val text = s"abcdef$n"
+        val job: &sync Fn() -> int = () -> count(text)
+
+        val total = scope((s) ->
+            val a = s.spawn(() -> job())
+            val b = s.spawn(() -> job())
+            val c = s.spawn(() -> job())
+            val d = s.spawn(() -> job())
+
+            a.join() + b.join() + c.join() + d.join())
+
+        print(total)
+        """, "880000\n")
+
+// A slice of the shared string is kept by the thread past the closure that made it, and outlives it.
+@test("a slice of a shared string outlives the closure it was taken through")
+shs_slice_outlives_closure()
+    shs_prints(raw"""
+        import sysl.threads.scope
+
+        part() -> string
+            val n = 11
+            val whole = s"kept-$n-bytes"
+            val job: &sync Fn() -> string = () -> whole[5..<7]
+
+            scope((s) -> s.spawn(() -> job()).join())
+
+        print(part(), part().len)
+        """, "11 2\n")
+
+// -- a channel ----------------------------------------------------------------------------------------
+
+@test("a shared string and a slice of it are sent through a channel from another thread")
+shs_channel_send()
+    shs_prints(raw"""
+        import sysl.threads.*
+
+        val n = 3
+        val name = s"chan-$n"
+        var slots: [4]string = [""; 4]
+        var ch = channel(slots[..])
+        val c = &ch
+        val job: &sync Fn() -> bool = () -> c.send(name) && c.send(name[0..<4])
+
+        scope((s) -> s.spawn(() -> job()).join())
+        print(ch.try_receive().unwrap(), ch.try_receive().unwrap(), ch.try_receive().is_none())
+        """, "chan-3 chan true\n")
+
+// -- a field ------------------------------------------------------------------------------------------
+
+@test("a '&sync' struct shares the strings in its array, its Option and its enum payload")
+shs_struct_parts()
+    shs_prints(raw"""
+        import sysl.threads.scope
+
+        enum Tag
+            Named(text: string)
+            Plain
+
+        struct Cfg
+            names: [2]string
+            alias: Option[string]
+            tag: Tag
+
+        val n = 9
+        val cfg: &sync Cfg = Cfg([s"a$n", "b"], Some(s"c$n"), Named(s"d$n"))
+
+        said(c: &sync Cfg) -> string
+            val t = c.tag match
+                Named(x) -> x[0..<2]
+                Plain -> "-"
+
+            c.names[0] + c.names[1] + c.alias.unwrap_or("") + t
+
+        print(scope((s) -> s.spawn(() -> said(cfg)).join()), said(cfg))
+        """, "a9bc9d9 a9bc9d9\n")
+
+@test("a string read out of one shared object makes another")
+shs_shared_into_shared()
+    shs_prints(raw"""
+        struct Reg
+            tag: string
+
+        val n = 4
+        val a: &sync Reg = Reg(s"dev$n")
+        val b: &sync Reg = Reg(a.tag[1..<4])
+        val job: &sync Fn() -> string = () -> a.tag + b.tag
+
+        print(job())
+        """, "dev4ev4\n")
+
+// -- what is emitted ----------------------------------------------------------------------------------
+
+@test("a '&sync' box holding a string is put through the share pass, and one holding none is not")
+shs_share_pass_emitted()
+    if xvr_no_library() then return
+
+    val with = xvr_ir([("main.sysl", "struct R\n    t: string\nval n = 1\nval r: &sync R = R(s\"x$n\")\nprint(r.t)\n")])
+    val without = xvr_ir([("main.sysl", "struct R\n    t: int\nval r: &sync R = R(1)\nprint(r.t)\n")])
+    val plain = xvr_ir([("main.sysl", "struct R\n    t: string\nval n = 1\nval r: &R = R(s\"x$n\")\nprint(r.t)\n")])
+
+    assert(with.contains("call void @share.copy."), with)
+    assert(with.contains("call i1 @arc.share_wanted("), with)
+    assert(with.contains("call void @arc.mark_shared("), with)
+    assert(!without.contains("share.copy"), without)
+    assert(!plain.contains("share.copy"), plain)
+
+// -- the runtime text ---------------------------------------------------------------------------------
+
+@test("a view's pair tests the mark and changes a marked count atomically")
+shs_runtime_marked_pair()
+    val t = host_target()
+    val w = t.pointer_bits()
+    val text = arc_maybe(t, false)
+
+    assert(text.contains(s"%c = load atomic i$w, ptr %p unordered, align ${w / 8}\n"), text)
+    assert(text.contains(s"%shared = icmp slt i$w %c, 0\n"), text)
+    assert(text.contains(s"atomicrmw add ptr %p, i$w 1 monotonic"), text)
+    assert(text.contains(s"atomicrmw sub ptr %p, i$w 1 release"), text)
+    assert(text.contains("icmp eq i64 %o, -9223372036854775807\n"), text)
+    assert(text.contains("acquired:\n  fence acquire\n  br label %reap"), text)
+    assert(text.contains("or i64 %c, -9223372036854775808\n"), text)
+    assert_eq(shs_count(text, "call void @arc.reap(ptr %p)"), 1)
+
+@test("under ThreadSanitizer the marked release acquires with a load")
+shs_runtime_tsan()
+    val text = arc_maybe(host_target(), true)
+
+    assert(text.contains("acquired:\n  %a = load atomic i64, ptr %p acquire, align 8\n"), text)
+    assert(!text.contains("fence"), text)
+
+@test("on a 32-bit machine the mark is the word's top bit")
+shs_runtime_32_bit()
+    val text = arc_maybe(target_named("thumbv7em-freestanding").unwrap(), false)
+
+    assert(text.contains("icmp eq i32 %o, -2147483647\n"), text)
+    assert(text.contains("or i32 %c, -2147483648\n"), text)
+    assert(text.contains("atomicrmw sub ptr %p, i32 1 release"), text)
+
+@test("where a word cannot be changed indivisibly nothing is marked and nothing is atomic")
+shs_runtime_no_rmw()
+    val t = target_named("thumbv6m-freestanding").unwrap()
+    val text = arc_maybe(t, false)
+
+    assert(!marks_shared(t))
+    assert(marks_shared(host_target()))
+    assert(!text.contains("atomicrmw"), text)
+    assert(!text.contains("load atomic"), text)
+    assert(text.contains("call void @arc.retain(ptr %p)"), text)
+    assert(text.contains("%some = icmp ne ptr %p, null\n  ret i1 %some"), text)
+    assert(text.contains("define private void @arc.mark_shared(ptr %p) {\nentry:\n  ret void\n}"), text)
+
+// -- where a string is still refused -----------------------------------------------------------------
+
+@test("module storage holding a string is still refused from another domain")
+shs_module_storage_refused()
+    shs_refused(raw"""
+        static var greeting: string = "hi"
+
+        val job: &sync Fn() -> unit = () -> print(greeting)
+
+        job()
+        """, ["the module storage 'greeting' it reaches", "nothing copies it on the way here"])
+
+@test("a view of strings captured by a '&sync Fn' is still refused")
+shs_view_of_strings_refused()
+    shs_refused(raw"""
+        val xs = ["a", "b"]
+        val v = xs[..]
+        val job: &sync Fn() -> int = () -> int(v.len)
+
+        print(job())
+        """, ["'v' it captures reaches a '[]string'"])
+
+@test("a string is still not 'Share': a bound asks of every place, copied or not")
+shs_not_share()
+    shs_refused(raw"""
+        needs[T: Share](x: T) -> int = 1
+
+        print(needs("hi"))
+        """, ["to implement 'Share', but string does not", "nothing copies it on the way here"])
