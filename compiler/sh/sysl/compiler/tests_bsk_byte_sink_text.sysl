@@ -1,0 +1,273 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `ByteSink.text()` hands back what the sink gathered, a view of its `Buf[u8]`. It used to take that
+// view through `into_view()`, the member that gives its receiver up and so is `@relocates` -- and a
+// callee reaching a `@relocates` member on a buffer of a `ref`'s type counts as writing one
+// (`checks.sysl`'s `ref_call`, `borrowing.sysl`'s `moves`). A `ref` or a pointer into ANY `Buf[u8]`
+// was then refused across `sink.text()` and across every function that read a sink's text.
+//
+// Accepted now: `text()` on a local, on a field, through a `*ByteSink`, on a copy passed by value, in
+// a loop, and on a sink sharing the ref's own buffer, each with a `ref` or a pointer into a `Buf[u8]`
+// live across it. What `text()` answers is checked on a local, a field, a copy, an empty sink and a
+// loop of writes. Each accepted program is built and run at `-O0` with the heap counted (net zero), at
+// `-O1` and at `-O2`.
+//
+// Still refused: a `ref` across `write` (a sink may share the ref's buffer, `ByteSink(b)`, and a write
+// grows it) and across a callee that writes and then reads the text.
+//
+// Not crossed: bare metal and the layout axes (the change is to which library member `text` calls,
+// whose emitted code is the same view), and separate compilation (a callee with no body in the program
+// is judged by what it can reach, which this does not change).
+
+private bsk_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end bsk_ready
+
+private bsk_root(text: string) -> string
+    val root = make_temp_dir("sysl-byte-sink-text").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+
+private bsk_said(text: string) -> string
+    val root = bsk_root(text)
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end bsk_said
+
+private bsk_ran(text: string, level: string, counted: bool) -> string
+    val root = bsk_root(text)
+    val exe = s"$root/built"
+
+    force_alloc_counting(counted)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, level, Some(exe))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text + out.err.unwrap_or("")
+end bsk_ran
+
+private bsk_accepted(text: string, printed: string)
+    val out = bsk_said(text)
+
+    assert(!out.contains("error"), s"expected no complaint, got: $out")
+    assert_eq(bsk_ran(text, "0", true), printed)
+    assert_eq(bsk_ran(text, "1", false), printed)
+    assert_eq(bsk_ran(text, "2", false), printed)
+end bsk_accepted
+
+private bsk_refused(text: string, said: string)
+    val out = bsk_said(text)
+
+    assert(out.contains(said), s"expected '$said' in: $out")
+
+private bsk_writes(name: string, callee: string) -> string =
+    s"'$name' is a 'ref' standing on storage held in a 'Buf[byte]', and '$callee' may write a " +
+    "'Buf[byte]' — another name for the same object would leave the 'ref' pointing at freed memory"
+
+// A sink holding "abc" and a `ref e = b[0]` into a `Buf[u8]` live across `call`, after `decls`.
+private bsk_byte_ref(decls: string, call: string) -> string = """
+    import sysl.buf.{Buf, ByteSink, buf, byte_sink}
+    import sysl.text.from_utf8_unchecked
+
+    """ + decls + """
+
+    main()
+        var sink = byte_sink()
+
+        sink.write("abc".bytes)
+
+        var b: Buf[u8] = buf()
+
+        b.push(7)
+
+        ref e = b[0]
+
+    """ + s"    print($call, e)\n"
+
+// -- what text() answers -------------------------------------------------------------------------------
+
+@test("text answers what was written, on a local, a field, a copy, an empty sink and in a loop")
+bsk_answers()
+    if !bsk_ready() then return
+
+    bsk_accepted("""
+        import sysl.buf.{ByteSink, byte_sink}
+        import sysl.text.from_utf8_unchecked
+
+        struct Holder
+            name: string
+            sink: ByteSink
+
+        said(s: *ByteSink) -> string = from_utf8_unchecked(s.text())
+
+        said_val(s: ByteSink) -> string = from_utf8_unchecked(s.text())
+
+        main()
+            var sink = byte_sink()
+
+            print(sink.text().len)
+            sink.write("ab".bytes)
+            print(from_utf8_unchecked(sink.text()))
+            sink.write("cd".bytes)
+            print(from_utf8_unchecked(sink.text()), sink.text().len)
+
+            var h = Holder("h", byte_sink())
+
+            h.sink.write("field".bytes)
+            print(from_utf8_unchecked(h.sink.text()))
+            h.sink.write("!".bytes)
+            print(from_utf8_unchecked(h.sink.text()))
+
+            print(said(&sink), said_val(sink))
+            sink.write("e".bytes)
+            print(said(&sink), said_val(sink))
+
+            var l = byte_sink()
+
+            for i in 0..<3
+                l.write("x".bytes)
+                print(from_utf8_unchecked(l.text()))
+        """, "0\nab\nabcd 4\nfield\nfield!\nabcd abcd\nabcde abcde\nx\nxx\nxxx\n")
+
+// -- accepted: text() only reads ----------------------------------------------------------------------
+
+@test("a ref into a Buf[u8] is kept across text() on a local sink")
+bsk_ref_local()
+    if !bsk_ready() then return
+
+    bsk_accepted(bsk_byte_ref("", "from_utf8_unchecked(sink.text())"), "abc 7\n")
+
+@test("a ref into a Buf[u8] is kept across a callee reading a sink's text through a pointer")
+bsk_ref_pointer_callee()
+    if !bsk_ready() then return
+
+    val decls = "said(s: *ByteSink) -> string = from_utf8_unchecked(s.text())\n"
+
+    bsk_accepted(bsk_byte_ref(decls, "said(&sink)"), "abc 7\n")
+
+@test("a ref into a Buf[u8] is kept across a callee reading the text of a sink passed by value")
+bsk_ref_value_callee()
+    if !bsk_ready() then return
+
+    val decls = "said(s: ByteSink) -> usize = s.text().len\n"
+
+    bsk_accepted(bsk_byte_ref(decls, "said(sink)"), "3 7\n")
+
+@test("a ref into a Buf[u8] is kept across text() on a field and in a loop")
+bsk_ref_field_loop()
+    if !bsk_ready() then return
+
+    bsk_accepted("""
+        import sysl.buf.{Buf, ByteSink, buf, byte_sink}
+
+        struct Holder
+            sink: ByteSink
+
+        main()
+            var h = Holder(byte_sink())
+
+            h.sink.write("abcd".bytes)
+
+            var b: Buf[u8] = buf()
+
+            b.push(7)
+
+            ref e = b[0]
+            var n: usize = 0
+
+            for i in 0..<3 do n += h.sink.text().len
+
+            print(n, e)
+        """, "12 7\n")
+
+@test("a ref into the sink's own buffer is kept across text() and reads what text() reads")
+bsk_ref_shared_buffer()
+    if !bsk_ready() then return
+
+    bsk_accepted("""
+        import sysl.buf.{Buf, ByteSink, buf}
+
+        main()
+            var b: Buf[u8] = buf()
+
+            b.push(65)
+            b.push(66)
+
+            val sink = ByteSink(b)
+
+            ref e = b[1]
+
+            print(sink.text().len, e, sink.text()[1])
+        """, "2 66 66\n")
+
+@test("a pointer into a Buf[u8] is used after a callee reading a sink's text")
+bsk_pointer_after_text()
+    if !bsk_ready() then return
+
+    bsk_accepted("""
+        import sysl.buf.{Buf, ByteSink, buf, byte_sink}
+
+        count(s: *ByteSink) -> usize = s.text().len
+
+        main()
+            var sink = byte_sink()
+
+            sink.write("hello".bytes)
+
+            var b: Buf[u8] = buf()
+
+            b.push(41)
+
+            val p = &b[0]
+            val n = count(&sink)
+
+            print(n, *p + 1)
+        """, "5 42\n")
+
+// -- refused: a write really grows a Buf[u8] ----------------------------------------------------------
+
+@test("a ref into a Buf[u8] across a sink's write is still refused")
+bsk_ref_write()
+    if !bsk_ready() then return
+
+    bsk_refused(bsk_byte_ref("", "sink.write(\"d\".bytes)"), bsk_writes("e", "sysl.buf.ByteSink.write"))
+
+@test("a ref into a Buf[u8] across a callee that writes and then reads the text is still refused")
+bsk_ref_write_then_text()
+    if !bsk_ready() then return
+
+    val decls = "more(s: *ByteSink) -> usize\n    s.write(\"d\".bytes)\n    s.text().len\n"
+
+    bsk_refused(bsk_byte_ref(decls, "more(&sink)"), bsk_writes("e", "more"))

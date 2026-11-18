@@ -958,8 +958,8 @@ end gen_variant_check
 // they are read out of it once it has been lifted out, which is the same one read whether the
 // invariant relates one field or all of them.
 //
-// A failure reports through `contract_unless`, naming the struct and `site`, the write or the
-// construction that broke it.
+// A failure reports through `clause_unless`, naming the struct, the clause that does not hold, and
+// `site`, the write or the construction that broke it.
 emit_inv_check(e: *Emit, v: Val, d: &StructType, inv_fn: string, site: Span)
     val ranges = bitfield_ranges(d)
     val container =
@@ -989,8 +989,14 @@ emit_inv_check(e: *Emit, v: Val, d: &StructType, inv_fn: string, site: Span)
             // slot holding it, which is how the clause function receives it.
             args.push(operand_arg(e, ft, r))
 
+    // The clauses answer with the one that does not hold, named, or with nothing (`first_broken`).
+    val broken = fresh_reg(e)
+
+    emit(e, ir_call(Some(broken), lty(e, Str), VGlobal(symbol_of(e, inv_fn)), args))
+
+    val (named, n) = str_bytes(e, broken)
     val ok = fresh_reg(e)
 
-    emit(e, ir_call(Some(ok), l_i1(), VGlobal(symbol_of(e, inv_fn)), args))
-    contract_unless(e, ok, "invariant", s"invariant of '${d.name()}'", None, site)
+    emit(e, InIntCmp(ok, IEq, word_lty(e), n, VInt(from_int(0))))
+    clause_unless(e, ok, s"invariant of '${d.name()}'", named, n, site)
 end emit_inv_check

@@ -20,7 +20,7 @@ is_vector_method(name: string) -> bool =
     name == "select" || name == "shuffle" || name == "sum" || name == "min" || name == "max" ||
         name == "any" || name == "all" || name == "abs" || name == "mul_add" || name == "maximum" ||
         name == "minimum" || is_lane_float_op(name) || name == "bits" || name == "lookup" ||
-        name == "compress"
+        name == "compress" || name == "dot"
 
 // The lane-wise float operations that are one LLVM intrinsic each and are named as the scalar
 // `Float` methods are: `v.sqrt()` is `llvm.sqrt` over the register, as `x.sqrt()` is over one lane.
@@ -166,6 +166,7 @@ vector_method(cx: &Analyzer, span: Span, v: Type, tr: TExpr, name: string,
         return vector_select(cx, span, v, parts.0, tr, args)
     end if
 
+    if name == "dot" then return vector_dot(cx, span, v, parts.0, elem, lane, tr, args)
     if name == "abs" then return vector_abs(cx, span, v, lane, tr, args)
     if is_lane_float_op(name) then return vector_lane_float(cx, span, v, lane, tr, name, args)
     if name == "mul_add" then return vector_mul_add(cx, span, v, elem, lane, tr, args)
@@ -211,6 +212,44 @@ vector_method(cx: &Analyzer, span: Span, v: Type, tr: TExpr, name: string,
 
     TExpr(span, TReduce(op, tr, elem))
 end vector_method
+
+// `a.dot(b)` -- the integer dot product, accumulated in a wider integer than the lanes.
+//
+// The lanes of both vectors are widened to the accumulator (`i8`/`i16` lanes to 32 bits, `i32` to 64,
+// wider ones stay as they are), multiplied, and summed: `sum(wide(a) * wide(b))`. That is the shape
+// AArch64's `sdot`/`udot` (with the dot-product feature) and x86's `vpdpbusd`/`vpdpwssd` compute, and
+// LLVM selects them from it; without the feature it is a widening multiply and a pairwise add. The
+// product of two widened lanes cannot overflow, and the sum wraps at the accumulator's width as an
+// integer `sum()` does. Both vectors must be the same integer vector type: a mixed-signedness
+// product has no one answer to give and is refused, as is a float, fixed-point or mask lane.
+private vector_dot(cx: &Analyzer, span: Span, v: Type, n: int, elem: Type, lane: Type, tr: TExpr,
+                   args: Buf[Expr]) -> TExpr
+    val info = lane match
+        Integer(bits, signed, _) -> Some((bits, signed))
+        _ -> None
+
+    if info.is_none() then
+        return cx.err(span, s"'dot' multiplies and adds integer lanes into a wider integer, and " +
+                      s"${type_show(v)} is not one — a float vector's dot product is '(a * b).sum()'")
+
+    if args.len() != 1 then
+        return cx.err(span, "'dot' takes the vector to multiply by — 'a.dot(b)', and " +
+                      s"${quantity(args.len(), "argument")} ${if args.len() == 1 then "was" else "were"} given")
+
+    val b = mul_add_operand(cx, args[0], v, elem)
+
+    if !type_eq(repr(texpr_type(b)), repr(v)) then
+        return cx.err(span, s"'dot' multiplies vectors of one type, and the receiver is " +
+                      s"${type_show(v)} where the argument is ${type_show(texpr_type(b))}")
+
+    val (bits, signed) = info.unwrap()
+    val width = if bits <= 16 then 32 else if bits <= 32 then 64 else bits
+    val acc = Integer(width, signed, false)
+    val wide = Vector(n, acc)
+    val product = TExpr(span, TBinary("*%", TExpr(span, TCast(tr, wide)), TExpr(span, TCast(b, wide)), wide))
+
+    TExpr(span, TReduce("add", product, acc))
+end vector_dot
 
 // `v.abs()` -- the magnitude of every lane, one `llvm.fabs` or `llvm.abs` over the register.
 //

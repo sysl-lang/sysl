@@ -10,7 +10,12 @@ import sysl.math.bigint.from_int
 // hold one, a value of any other variant goes through the call and every test only to find nothing
 // to do -- and with thousands of call sites LLVM leaves the helper out of line. So each such call is
 // guarded here by one test of the tag, written in line: the call is made only where the variant holds
-// a count, and that arm is marked unlikely, so the fall-through is the variant that needs nothing.
+// a count.
+//
+// **The test carries no `llvm.expect`.** Whether a value holds a count is a fact of the data, not of
+// the program: in a walk down a linked list the `Some` that holds the next node is the common case,
+// and a hint that it is not lays the hot path out of line (the AWFY List study: 8%). Left unhinted,
+// LLVM weighs the two arms evenly and the profile, where there is one, decides.
 //
 // The test is chosen once per enum (`emit_arc.sysl`'s `tag_test`). An enum where every variant holds
 // a count, or none does, is left alone: the test would decide nothing.
@@ -38,8 +43,8 @@ guard_enum_walks(e: *Emit, blocks: Buf[IrBlock]) -> Buf[IrBlock]
     out
 end guard_enum_walks
 
-// One block, split at each guarded call: the test ends the part before it, the call is the unlikely
-// arm, and both arms meet where the rest of the block goes on. The function has no `phi` to update,
+// One block, split at each guarded call: the test ends the part before it, the call is an arm of its
+// own, and both arms meet where the rest of the block goes on. The function has no `phi` to update,
 // since nothing here writes one.
 private guard_block(e: *Emit, b: IrBlock, out: *Buf[IrBlock])
     var label = b.label
@@ -76,8 +81,7 @@ private guarded_walk(e: *Emit, inst: Inst) -> Option[(TagTest, bool, IrArg)] = i
             None -> None
     _ -> None
 
-// Writes the test into `into`, and answers the `i1` that is true where the value holds a count --
-// already passed through `llvm.expect` as unlikely.
+// Writes the test into `into`, and answers the `i1` that is true where the value holds a count.
 private tag_holds(e: *Emit, test: TagTest, at: bool, arg: IrArg, into: *Buf[Inst]) -> Val
     val tag = fresh_reg(e)
 
@@ -108,15 +112,5 @@ private tag_holds(e: *Emit, test: TagTest, at: bool, arg: IrArg, into: *Buf[Inst
             into.push(InBin(hit, OpAnd, w, bit, VInt(from_int(mask))))
             into.push(InIntCmp(held, INe, w, hit, VInt(from_int(0))))
 
-    val hinted = fresh_reg(e)
-    var args: Buf[IrArg] = buf()
-
-    args.push(ir_arg(l_i1(), held))
-    args.push(ir_arg(l_i1(), VInt(from_int(0))))
-    into.push(ir_call(Some(hinted), l_i1(), VGlobal(llvm_expect_i1()), args))
-    e.uses_expect = true
-    hinted
+    held
 end tag_holds
-
-// The hint's name at the one width a condition has.
-llvm_expect_i1() -> string = llvm_expect_entry().base + ".i1"

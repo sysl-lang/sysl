@@ -1338,8 +1338,76 @@ where the parts alone do not determine it, as anywhere else.
 **A tuple is taken apart with the ordinary comma binding**, `val a, b = q`, or with a
 [tuple pattern](/reference/patterns/) in a `match`.
 
-**Arity starts at two.** There is no one-tuple: `(x)` is a parenthesized expression, since a
-one-element product is just the element. There is no zero-tuple either; `unit` fills that role, and `()` in a type is `unit`.
+**Arity starts at one, and one part needs a comma.** `(x)` is a parenthesized expression, and `(T)`
+a type in parentheses; the tuple of one part is written `(x,)` and its type `(T,)`, as in Rust. There
+is no zero-tuple; `unit` fills that role, and `()` in a type is `unit`. A trailing comma is allowed
+after any tuple's last part, in a value, a type and a pattern alike.
+
+### A tuple of one part
+
+A one-tuple is an ordinary tuple: its part is `t.0`, a place like any other, and it prints, compares,
+orders and hashes by the same blocks every arity has. It keeps its comma when printed, so it never
+reads as a grouping:
+
+```sysl
+val t: (int,) = (7,)
+val pair = (1, 2,)
+
+print(t.0, t, pair)
+
+t match
+    (0,) -> print("zero")
+    (n,) -> print(n + 1)
+
+val (a,) = ("one",)
+
+print(a)
+```
+
+```output
+7 (7,) (1, 2)
+8
+one
+```
+
+Its use is where a **type** stands for a list of parts. A generic that walks `T::Fields` over a tuple
+type is handed one part as `(Pos,)`; handed `Pos` itself it walks `Pos`'s own fields, a different
+question with a different answer:
+
+```sysl
+struct Pos
+    x: int
+    y: int
+
+parts[Q]() -> usize
+    var n: usize = 0
+
+    for const f in Q::Fields
+        if sizeof(f::Type) > 0 then n += 1
+
+    n
+
+print(parts[(Pos, Pos)](), parts[(Pos,)](), parts[Pos]())
+```
+
+```output
+2 1 2
+```
+
+A [type pack](/reference/generics/#a-parameter-may-stand-for-a-list-of-types) matches a one-tuple
+at arity one, and a written list names a pack of one type directly
+([generics](/reference/generics/#a-written-list-spreads-over-a-pack)).
+
+The comma is required: one part in parentheses with none after it is refused, and told both
+spellings it could have meant.
+
+```sysl
+val x: (int) = 1
+```
+
+```error
+'(int)' is a type in parentheses — write 'int' for the type itself, or '(int,)' for a tuple of one part
+```
 
 ### A nested part needs parentheses
 
@@ -1899,7 +1967,9 @@ same closures; they differ in what the call costs and in what the declaration co
 **Parentheses before the arrow are its parameter list**, whatever its length: `(string) -> usize`
 is the same type as `string -> usize`, `() -> T` takes nothing, and `((int, int)) -> int` takes one
 tuple. Only the arrow makes them a list — `(string)` with none after it is a type in parentheses,
-and refused.
+and refused. A comma before the arrow is the list's own, so `(string,) -> usize` takes one `string`
+too, and a callable taking a [tuple of one part](#a-tuple-of-one-part) writes it in a second pair,
+`((string,)) -> usize`.
 
 ```sysl
 apply(f: (string) -> usize, s: string) -> usize = f(s)
