@@ -1,0 +1,104 @@
+module sysl.sync
+@no_alloc
+
+import sysl.encoding.Plain
+
+/** A value many threads read and a few write, where a reader never waits for another reader and
+ * never makes a writer wait.
+ *
+ * **The value sits beside a sequence number.** A writer makes the number odd, writes the value, and
+ * makes it even again; a reader notes the number, copies the value, and looks at the number again. If
+ * it was odd, or has moved, a writer was in the middle and the copy may be torn, so the reader copies
+ * again. A copy the number did not move across is all of one write. Readers write nothing, so a
+ * hundred of them on a hundred cores never contend for the line the way a lock's readers do; what
+ * they pay is a retry when a write lands under them. That makes it the shape for a value read far
+ * more often than it is written -- a clock's calibration, a sensor's latest sample, a game's frame
+ * state -- and the wrong one for a value written constantly, where readers starve.
+ *
+ * **The copies are word-wise relaxed atomics** (`load_relaxed`, `store_relaxed`), so a reader copying
+ * while a writer writes is not a data race, only a torn copy the recheck throws away. The fences are
+ * the C++ model's:
+ *
+ * - **reading**: an acquire load of the number, the relaxed copy, an acquire fence, a relaxed load of
+ *   the number. A copy that saw any word of a write synchronises, through the writer's release fence
+ *   and this acquire fence, with that write's first step, so the recheck sees the number it moved to.
+ * - **writing**: the number incremented to odd, a release fence, the relaxed copy, a release store of
+ *   the number incremented to even. A reader whose first load sees that even number sees every word
+ *   before it.
+ *
+ * **Writers exclude each other**: making the number odd is a compare-and-swap from an even value, and
+ * a writer that finds it odd spins (`spin_hint`) until the writer before it has finished. So it is
+ * safe with any number of writers, and fast with one.
+ *
+ * **`T` is plain data** (`sysl.encoding.Plain`), for `load_relaxed`'s reason: a reader holds a torn
+ * copy before it knows to throw it away, and a copy of a counted reference's bytes would be an owner
+ * nobody counted. A struct holding a `&T`, a `string` or a slice is refused where it names the type.
+ */
+@unchecked(Share)
+struct SeqLock[T: Plain]
+
+    // Even when no write is under way, odd while one is. It only ever grows, and wraps (a reader would
+    // need to sleep through 2^63 writes on a 64-bit machine to be fooled by the wrap).
+    private seq: usize
+
+    // The value. Private, as `@unchecked(Share)` requires: a reader reaching it directly would be a
+    // way round the sequence number, and so a race.
+    private value: T
+
+    /** A lock holding `value`, with no write under way. */
+    const new(value: T) -> SeqLock[T] = SeqLock(0, value)
+
+    /** A copy of the value that is all of one write, trying again for as long as writes land under it.
+     *
+     * Never blocks a writer and is never blocked by another reader; it spins only while a write is
+     * under way.
+     */
+    read(*self) -> T
+        loop
+            self.try_read() match
+                Some(v) -> return v
+                None -> spin_hint()
+
+    /** A copy of the value that is all of one write, or `None` where a write was under way. One try:
+     * never spins.
+     */
+    try_read(*self) -> Option[T]
+        val before = atomic_load(&self.seq, Acquire)
+
+        if before & 1 != 0 then return None
+
+        val v = load_relaxed(&self.value)
+
+        atomic_fence(Acquire)
+
+        if atomic_load(&self.seq, Relaxed) != before then return None
+
+        Some(v)
+    end try_read
+
+    /** Replaces the value, waiting for a write already under way to finish first. */
+    write(*self, v: T)
+        var seen = atomic_load(&self.seq, Relaxed)
+
+        loop
+            if seen & 1 != 0
+                spin_hint()
+                seen = atomic_load(&self.seq, Relaxed)
+            else
+                val found = atomic_cas(&self.seq, seen, seen +% 1, Acquire)
+
+                if found == seen then break
+
+                seen = found
+
+        atomic_fence(Release)
+        store_relaxed(&self.value, v)
+        atomic_store(&self.seq, seen +% 2, Release)
+    end write
+
+    /** How many writes have finished, which is half the sequence number. A reader that wants to know
+     * whether anything changed since it last looked compares two of these.
+     */
+    writes(*self) -> usize = atomic_load(&self.seq, Acquire) / 2
+
+end SeqLock
