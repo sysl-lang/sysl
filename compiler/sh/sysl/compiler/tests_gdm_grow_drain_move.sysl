@@ -1,0 +1,506 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// A copy out of storage the next statement lets go of is a move (`slot_drain.sysl`, `slots.sysl`'s
+// drain): a container's growth -- every element placed into fresh storage, then the storage replaced
+// -- takes each element's share out of its old slot instead of retaining one and having the old
+// storage's hook give it back. The claims: what the idiomatic growth lowers to (the read retains only
+// where the old storage is shared, and zeroes a slot only where the hook would still walk it); what is
+// left alone; and that what a program observes -- every element let go of exactly once, at the moment
+// it was before, and a counted heap that ends where it began -- is unchanged whether the old storage
+// had one holder or two, whether all of it or part of it was copied, and from a loop or a run.
+//
+// Axes: the copy's form (counted loop / `slot_place_run`), the old storage's holders (one / two),
+// how much is copied (all / a prefix / a suffix / the middle / nothing), the element (a plain
+// reference / one with a `Drop`), the loop variable (unsigned / signed), and the old storage's kind
+// (`slot_storage` / a filled buffer). Not crossed: a large element held by address, which the drain
+// leaves to the ordinary copy and so has nothing new to show.
+
+private struct GdmRun
+    ok: bool
+    out: string
+    err: string
+
+private gdm_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end gdm_ready
+
+// A program built with the heap counted and run.
+private gdm_run(text: string) -> GdmRun
+    val root = make_temp_dir("sysl-gdm").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    force_alloc_counting(true)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization,
+                                     Some(s"$root/built"))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return GdmRun(false, failure_text(why), "")
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> GdmRun(false, "could not be started", "")
+        Ok(o) -> GdmRun(o.status.ok(), o.text, o.err.unwrap_or(""))
+end gdm_run
+
+private gdm_clean(run: GdmRun, expected: string)
+    assert(run.ok, run.out)
+    assert_eq(run.out, expected)
+    assert(!run.err.contains(alloc_count_said()), run.err)
+end gdm_clean
+
+// A container of jobs written the way the growable containers are: storage whose spare slots hold
+// nothing, grown by a loop of places (`grow`) or by one run (`grow_run`). `copy(lo, hi, at)` is the
+// partial copy: the slots `lo ..< hi` placed from `at` on, the rest let go of with the old storage.
+private gdm_jobs() -> string = raw"""
+    struct Job
+        id: int
+
+    impl Drop for Job
+        drop(self) = print(f"let go ${self.id}")
+
+    struct Jobs
+        storage: []&Job
+        last: usize
+
+        add(*self, id: int)
+            slot_place(self.storage, self.last, Job(id))
+            self.last += 1
+
+        grow(*self, n: usize)
+            var fresh: []&Job = slot_storage(n)
+            for i in 0..<self.last do slot_place(fresh, i, self.storage[i])
+            self.storage = fresh
+
+        grow_run(*self, n: usize)
+            var fresh: []&Job = slot_storage(n)
+            slot_place_run(fresh, 0, self.storage[0..<self.last])
+            self.storage = fresh
+
+        copy(*self, lo: usize, hi: usize, n: usize)
+            var fresh: []&Job = slot_storage(n)
+            for i in lo..<hi do slot_place(fresh, i - lo, self.storage[i])
+            self.storage = fresh
+            self.last = hi - lo
+
+        show(*self)
+            var line = ""
+            for i in 0..<self.last do line = line + f"${self.storage[i].id} "
+            print(line)
+    end Jobs
+
+    jobs(n: usize) -> Jobs
+        var j = Jobs(slot_storage(n), 0)
+
+        for i in 1..n do j.add(int(i))
+        j
+
+    """
+
+// The IR text of the block a label opens, up to the next label.
+private gdm_block(ir: string, label: string) -> string
+    var out = ""
+    var inside = false
+
+    for line in ir.split("\n")
+        val opens = line.len > 0 && !line.starts_with(" ") && line.ends_with(":")
+
+        if opens then inside = line.starts_with(label)
+        if inside then out = out + line + "\n"
+
+    out
+end gdm_block
+
+private gdm_node() -> string = "struct N\n    v: int\n\n"
+
+// -- what it lowers to ---------------------------------------------------------------------------------
+
+@test("the idiomatic growth loop retains only where the old storage is shared")
+gdm_loop_retains_only_when_shared()
+    val ir = emit_func_text(gdm_node() + raw"""
+        grow(old: *[]&N, last: usize, n: usize)
+            var fresh: []&N = slot_storage(n)
+            for i in 0..<last do slot_place(fresh, i, (*old)[i])
+            *old = fresh
+        """, "grow")
+
+    assert(ir.starts_with("define"), ir)
+    assert(ir.contains("drain.sole"), ir)
+    assert_eq(ir.count_of("call void @arc.retain("), 1)
+    assert(gdm_block(ir, "drain.shared").contains("@arc.retain("), ir)
+    assert(!gdm_block(ir, "drain.taken").contains("@arc."), ir)
+    assert(gdm_block(ir, "drain.clear").contains("store ptr null"), ir)
+
+@test("a growth loop over a field through a pointer is drained the same way")
+gdm_field_loop_is_drained()
+    val ir = emit_func_text(gdm_node() + raw"""
+        struct V
+            storage: []&N
+            last: usize
+
+        grow(v: *V, n: usize)
+            var fresh: []&N = slot_storage(n)
+            for i in 0..<v.last do slot_place(fresh, i, v.storage[i])
+            v.storage = fresh
+        """, "grow")
+
+    assert(ir.contains("drain.sole"), ir)
+    assert(ir.contains("drain.tail"), ir)
+    assert_eq(ir.count_of("call void @arc.retain("), 1)
+
+@test("a growth by one run retains only where the old storage is shared, and cuts the prefix")
+gdm_run_retains_only_when_shared()
+    val ir = emit_func_text(gdm_node() + raw"""
+        grow(old: *[]&N, last: usize, n: usize)
+            var fresh: []&N = slot_storage(n)
+            slot_place_run(fresh, 0, (*old)[0..<last])
+            *old = fresh
+        """, "grow")
+
+    assert(ir.contains("drain.sole"), ir)
+    assert(ir.contains("drain.tail"), ir)
+    assert_eq(ir.count_of("call void @arc.retain("), 1)
+    assert(gdm_block(ir, "drain.shared").contains("@arc.retain("), ir)
+
+// One function of a program lowered with the standard module beside it, or "skipped".
+private gdm_with_std(text: string, symbol: string) -> string
+    val root = std_root()
+
+    if root.is_err() then return "skipped"
+
+    val std = std_units(root.unwrap(), host_target())
+
+    if std.is_err() then return "skipped"
+
+    var units: Buf[Program] = buf()
+
+    for item in std.unwrap()
+        units.push(item)
+
+    units.push(parse(source_of("test.sysl", text)).program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if !done.reported.is_empty() then return done.reported[0].diag.message
+
+    val whole = program_of(done, "")
+    val lowered = codegen_with_gaps(strip_tests(whole), host_target(),
+                                    post_analysis_checks(done.an, whole, buf()))
+    var names = ""
+
+    for item in func_texts(ir_print_module(lowered.0))
+        if names_as_written(item.0, symbol) then return item.1
+        if item.0.contains("grow") then names = names + item.0 + " "
+
+    s"no function '$symbol' among: $names"
+end gdm_with_std
+
+@test("the standard Buf's growth is drained")
+gdm_buf_grow_is_drained()
+    val ir = gdm_with_std(gdm_node() + raw"""
+        import sysl.buf.{Buf, buf}
+
+        main()
+            var b: Buf[&N] = buf()
+
+            for i in 0..<20 do b.push(N(i))
+            print(b.len())
+        """, "sysl.buf.BufCore[&N].grow")
+
+    if ir == "skipped" then return
+
+    assert(ir.contains("drain.sole"), ir)
+    assert(ir.contains("drain.tail"), ir)
+    assert_eq(ir.count_of("call void @arc.retain("), 1)
+
+// -- what it leaves alone ------------------------------------------------------------------------------
+
+@test("no drain where the storage is not replaced next, where the loop calls, or the destination is not fresh")
+gdm_left_alone()
+    val not_replaced = emit_func_text(gdm_node() + raw"""
+        copy(old: *[]&N, last: usize, n: usize) -> []&N
+            var fresh: []&N = slot_storage(n)
+            for i in 0..<last do slot_place(fresh, i, (*old)[i])
+            fresh
+        """, "copy")
+
+    assert(not_replaced.starts_with("define"), not_replaced)
+    assert(!not_replaced.contains("drain."), not_replaced)
+
+    val calls = emit_func_text(gdm_node() + raw"""
+        pick(xs: []&N, i: usize) -> &N = xs[i]
+
+        grow(old: *[]&N, last: usize, n: usize)
+            var fresh: []&N = slot_storage(n)
+            for i in 0..<last do slot_place(fresh, i, pick(*old, i))
+            *old = fresh
+        """, "grow")
+
+    assert(calls.starts_with("define"), calls)
+    assert(!calls.contains("drain."), calls)
+
+    val not_fresh = emit_func_text(gdm_node() + raw"""
+        grow(old: *[]&N, fresh: []&N, last: usize)
+            for i in 0..<last do slot_place(fresh, i, (*old)[i])
+            *old = fresh
+        """, "grow.owned")
+
+    assert(not_fresh.starts_with("define"), not_fresh)
+    assert(!not_fresh.contains("drain."), not_fresh)
+
+    val same_slot = emit_func_text(gdm_node() + raw"""
+        grow(old: *[]&N, last: usize, n: usize)
+            var fresh: []&N = slot_storage(n)
+            for i in 0..<last do slot_place(fresh, 0, (*old)[i])
+            *old = fresh
+        """, "grow")
+
+    assert(same_slot.starts_with("define"), same_slot)
+    assert(!same_slot.contains("drain."), same_slot)
+
+@test("no drain where the loop can leave before the storage is replaced")
+gdm_early_return_is_left_alone()
+    val ir = emit_func_text(gdm_node() + raw"""
+        grow(old: *[]&N, last: usize, n: usize)
+            var fresh: []&N = slot_storage(n)
+            for i in 0..<last
+                if i == 2 then return
+                slot_place(fresh, i, (*old)[i])
+            *old = fresh
+        """, "grow")
+
+    assert(ir.starts_with("define"), ir)
+    assert(!ir.contains("drain."), ir)
+
+@test("no drain over elements that hold no count")
+gdm_plain_elements_are_left_alone()
+    val ir = emit_func_text(raw"""
+        grow(old: *[]int, last: usize, n: usize)
+            var fresh: []int = slot_storage(n)
+            for i in 0..<last do slot_place(fresh, i, (*old)[i])
+            *old = fresh
+        """, "grow")
+
+    assert(ir.starts_with("define"), ir)
+    assert(!ir.contains("drain."), ir)
+
+// -- what a program sees ------------------------------------------------------------------------------
+
+@test("a unique old storage grown by a loop: each element is let go of once, with the container")
+gdm_unique_loop()
+    if !gdm_ready() then return
+
+    gdm_clean(gdm_run(gdm_jobs() + raw"""
+        var j = jobs(3)
+
+        j.grow(6)
+        j.add(4)
+        j.grow(12)
+        j.show()
+        print("grown")
+        """), "1 2 3 4 \ngrown\nlet go 1\nlet go 2\nlet go 3\nlet go 4\n")
+
+@test("a unique old storage grown by a run: each element is let go of once, with the container")
+gdm_unique_run()
+    if !gdm_ready() then return
+
+    gdm_clean(gdm_run(gdm_jobs() + raw"""
+        var j = jobs(3)
+
+        j.grow_run(6)
+        j.add(4)
+        j.grow_run(12)
+        j.show()
+        print("grown")
+        """), "1 2 3 4 \ngrown\nlet go 1\nlet go 2\nlet go 3\nlet go 4\n")
+
+@test("a shared old storage keeps every element it holds, whichever form grew the container")
+gdm_shared_old_storage()
+    if !gdm_ready() then return
+
+    gdm_clean(gdm_run(gdm_jobs() + raw"""
+        var j = jobs(3)
+        val kept = j.storage
+
+        j.grow(6)
+        j.grow_run(12)
+
+        var line = ""
+        for x in kept do line = line + f"${x.id} "
+        print(line)
+        j.show()
+        print("grown")
+        """), "1 2 3 \n1 2 3 \ngrown\nlet go 1\nlet go 2\nlet go 3\n")
+
+@test("storage lent to a call before the growth is still drained, and an element assigned over after it is let go of there")
+gdm_lent_then_assigned()
+    if !gdm_ready() then return
+
+    gdm_clean(gdm_run(gdm_jobs() + raw"""
+        drop_view(xs: []&Job) = print(xs.len)
+
+        var j = jobs(2)
+
+        drop_view(j.storage)
+        j.grow(4)
+        j.storage[0] = Job(9)
+        print("replaced")
+        """), "2\nlet go 1\nreplaced\nlet go 9\nlet go 2\n")
+
+@test("a copy of a prefix lets go of the rest with the old storage, at the replacement")
+gdm_partial_prefix()
+    if !gdm_ready() then return
+
+    gdm_clean(gdm_run(gdm_jobs() + raw"""
+        var j = jobs(4)
+
+        j.copy(0, 2, 4)
+        print("copied")
+        j.show()
+        """), "let go 3\nlet go 4\ncopied\n1 2 \nlet go 1\nlet go 2\n")
+
+@test("a copy of a suffix lets go of the front with the old storage, at the replacement")
+gdm_partial_suffix()
+    if !gdm_ready() then return
+
+    gdm_clean(gdm_run(gdm_jobs() + raw"""
+        var j = jobs(4)
+
+        j.copy(2, 4, 4)
+        print("copied")
+        j.show()
+        """), "let go 1\nlet go 2\ncopied\n3 4 \nlet go 3\nlet go 4\n")
+
+@test("a copy of the middle lets go of both ends, in their order, at the replacement")
+gdm_partial_middle()
+    if !gdm_ready() then return
+
+    gdm_clean(gdm_run(gdm_jobs() + raw"""
+        var j = jobs(4)
+
+        j.copy(1, 3, 4)
+        print("copied")
+        j.show()
+        """), "let go 1\nlet go 4\ncopied\n2 3 \nlet go 2\nlet go 3\n")
+
+@test("a copy of nothing lets go of everything at the replacement")
+gdm_partial_nothing()
+    if !gdm_ready() then return
+
+    gdm_clean(gdm_run(gdm_jobs() + raw"""
+        var j = jobs(3)
+
+        j.copy(2, 2, 4)
+        print("copied")
+        """), "let go 1\nlet go 2\nlet go 3\ncopied\n")
+
+// A signed range whose end is below its start runs no turn: nothing is taken, and the prefix is left
+// whole however the end compares with it read as an unsigned count.
+@test("a signed range that runs no turn takes nothing")
+gdm_signed_empty_range()
+    if !gdm_ready() then return
+
+    gdm_clean(gdm_run(gdm_jobs() + raw"""
+        shrink(j: *Jobs, hi: int)
+            var fresh: []&Job = slot_storage(4)
+            for i in 0..<hi do slot_place(fresh, i, j.storage[i])
+            j.storage = fresh
+
+        var j = jobs(3)
+
+        shrink(&j, -1)
+        j.last = 0
+        print("shrunk")
+        """), "let go 1\nlet go 2\nlet go 3\nshrunk\n")
+
+@test("a signed range covering the live slots is a move like an unsigned one")
+gdm_signed_full_range()
+    if !gdm_ready() then return
+
+    gdm_clean(gdm_run(gdm_jobs() + raw"""
+        regrow(j: *Jobs, hi: int)
+            var fresh: []&Job = slot_storage(8)
+            for i in 0..<hi do slot_place(fresh, i, j.storage[i])
+            j.storage = fresh
+
+        var j = jobs(3)
+
+        regrow(&j, 3)
+        j.show()
+        print("grown")
+        """), "1 2 3 \ngrown\nlet go 1\nlet go 2\nlet go 3\n")
+
+@test("old storage that is a filled buffer, not slot storage, is copied as written")
+gdm_filled_old_storage()
+    if !gdm_ready() then return
+
+    gdm_clean(gdm_run(gdm_jobs() + raw"""
+        var j = Jobs([Job(7); 2], 2)
+
+        j.grow(4)
+        j.add(8)
+        j.show()
+        print("grown")
+        """), "7 7 8 \ngrown\nlet go 7\nlet go 8\n")
+
+@test("the standard Buf grown many times over a counted element leaves the heap where it began")
+gdm_buf_growth_is_clean()
+    if !gdm_ready() then return
+
+    gdm_clean(gdm_run(gdm_jobs() + raw"""
+        import sysl.buf.{Buf, buf}
+
+        var b: Buf[&Job] = buf()
+
+        for i in 0..<20 do b.push(Job(i))
+
+        val view = b.view()
+
+        for i in 20..<40 do b.push(Job(i))
+        print(view.len, b.len(), view[3].id, b[33].id)
+        b.clear()
+        print("cleared")
+        """), "20 40 3 33\n" + gdm_let_go(0, 40) + "cleared\n")
+
+private gdm_let_go(lo: int, hi: int) -> string
+    var out = ""
+
+    for i in lo..<hi do out = out + f"let go $i\n"
+    out
+
+@test("a growth into storage too small traps at the first slot past it")
+gdm_trap_inside_the_loop()
+    if !gdm_ready() then return
+
+    val run = gdm_run(gdm_jobs() + raw"""
+        var j = jobs(4)
+
+        print("before")
+        j.grow(2)
+        print("after")
+        """)
+
+    assert(!run.ok, run.out)
+    assert(run.out.starts_with("before\n"), run.out)
+    assert(!run.out.contains("after"), run.out)
