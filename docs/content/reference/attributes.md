@@ -3123,6 +3123,11 @@ the body across that wall** for:
 - every *small* function — a few statements' worth: an accessor, a comparison, a fixed-point
   multiply — whether marked or not.
 
+Small is measured by what the optimizer keeps of the body, not by its unoptimized length: the
+report and trap of a failed bounds or overflow check is a cold exit and does not count, and nor does
+the guard on a shift by a constant amount, which folds away. A getter that indexes an array and
+shifts the element is small.
+
 The calling module is given a copy of the body to inline (LLVM's `available_externally`) and never
 emits it, so the program still links the package's one definition, and a call the optimizer leaves
 out of line is the same call it always was. The copy is made from the package's source on every
