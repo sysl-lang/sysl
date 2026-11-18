@@ -1,0 +1,263 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// **A module vector is constant data as an array is**: a literal, a splat, arithmetic over constants,
+// a shuffle, a select, a conversion and a vector worked out from another folded `val` are all laid
+// into the object file, so a freestanding archive that reads one is built, and nothing runs before
+// `main` to fill it in. So is a vector inside a struct, an array or an enum's payload, and a scalar
+// worked out from one (a lane, a reduction). A vector that reads a module `var` is still code, and a
+// freestanding archive still refuses it.
+
+private vsf_library_for(t: Target) -> Buf[Program]
+    var out: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, t) match
+            Err(_) -> ()
+            Ok(units) -> out = units
+
+    out
+end vsf_library_for
+
+private vsf_first_of(said: Buf[Placed]) -> string
+    for item in said
+        if !item.src.name.starts_with("library/") then return item.diag.message
+
+    ""
+end vsf_first_of
+
+// A C archive for `t`, as `build-c` makes one: the first thing the compilation had to say, or the
+// LLVM text it lowered to.
+private vsf_archive(t: Target, text: string) -> string
+    var units = vsf_library_for(t)
+    val parsed = parse(source_of("main.sysl", text), t)
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    units.push(parsed.program)
+
+    val done = analyze_produced(units, t, buf(), false)
+    val early = vsf_first_of(done.reported)
+
+    if early != "" then return early
+
+    val whole = program_of(done, done.main_module) with { entry_point = false, c_artifact = true }
+    var own: Buf[string] = buf()
+
+    own.push("")
+
+    val pr = post_analysis_checks(done.an, whole, own)
+    val late = vsf_first_of(done.an.diagnostics())
+
+    if late != "" then return late
+
+    ir_print_module(codegen_with_gaps(prune(strip_tests(whole), own), t, pr).0)
+end vsf_archive
+
+private vsf_thumb() -> Target = target_named("thumb-freestanding-softfp").unwrap()
+
+private vsf_arm64() -> Target = target_named("aarch64-freestanding").unwrap()
+
+private vsf_skip() -> bool
+    if vsf_library_for(vsf_thumb()).is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end vsf_skip
+
+// Every global is laid down as the constant the object file carries, and nothing runs to fill one.
+private vsf_laid_down(out: string, globals: []const string)
+    for g in globals
+        assert(out.contains(g), out)
+
+    assert(!out.contains("module_init"), out)
+    assert(!out.contains("llvm.global_ctors"), out)
+end vsf_laid_down
+
+private val vsf_main: string = "\n\n@export(\"main\")\nprobe() -> i32 = "
+
+// Every way a vector is written at module level, each read by the export.
+private val vsf_body: string =
+    "private val v: <4>u16 = [1, 2, 3, 4]\n" +
+    "private val s: <4>u16 = 7\n" +
+    "private val f: <4>i32 = [-1; 4]\n" +
+    "private val m: <4>u16 = [1, 2, 3, 4] * 2 + 1\n" +
+    "private val w: <4>u16 = v + s\n" +
+    "private val c: <4>f32 = <4>f32([1, 2, 3, 4])\n" +
+    "private val h: <4>u16 = v.shuffle([3, 2, 1, 0])\n" +
+    "private val l: <4>u16 = (v > 2).select(v, s)\n" +
+    "private val z: <4>u8 = [255, 2, 3, 4] + 1\n" +
+    "private val k: u16 = v[2] + v.sum()\n" +
+    "private var g: <2>u64 = [5, 6]\n" +
+    "private val d: <2>f64 = [0.5, 1.5]\n"
+
+private val vsf_reads: string = "i32(v[0] + s[1] + m[2] + w[3] + h[0] + l[1] + u16(z[0]) + k) + f[0] + " +
+    "i32(c[2]) + i32(g[1]) + i32(d[1])\n"
+
+private vsf_program() -> string = vsf_body + vsf_main + vsf_reads
+
+private val vsf_globals: []const string = [
+    "@v = private constant <4 x i16> <i16 1, i16 2, i16 3, i16 4>\n",
+    "@s = private constant <4 x i16> <i16 7, i16 7, i16 7, i16 7>\n",
+    "@f = private constant <4 x i32> <i32 -1, i32 -1, i32 -1, i32 -1>\n",
+    "@m = private constant <4 x i16> <i16 3, i16 5, i16 7, i16 9>\n",
+    "@w = private constant <4 x i16> <i16 8, i16 9, i16 10, i16 11>\n",
+    "@c = private constant <4 x float> <float 0x3FF0000000000000, float 0x4000000000000000, " +
+    "float 0x4008000000000000, float 0x4010000000000000>\n",
+    "@h = private constant <4 x i16> <i16 4, i16 3, i16 2, i16 1>\n",
+    "@l = private constant <4 x i16> <i16 7, i16 7, i16 3, i16 4>\n",
+    "@z = private constant <4 x i8> <i8 0, i8 3, i8 4, i8 5>\n",
+    "@k = private constant i16 13\n",
+    "@g = private global <2 x i64> <i64 5, i64 6>\n",
+    "@d = private constant <2 x double> <double 0x3FE0000000000000, double 0x3FF8000000000000>\n"]
+
+@test("a module vector written any way over constants is constant data on a 32-bit freestanding target")
+vsf_vectors_fold_on_thumb()
+    if vsf_skip() then return
+
+    vsf_laid_down(vsf_archive(vsf_thumb(), vsf_program()), vsf_globals)
+end vsf_vectors_fold_on_thumb
+
+@test("and on a 64-bit freestanding target")
+vsf_vectors_fold_on_arm64()
+    if vsf_skip() then return
+
+    vsf_laid_down(vsf_archive(vsf_arm64(), vsf_program()), vsf_globals)
+end vsf_vectors_fold_on_arm64
+
+@test("and on the host")
+vsf_vectors_fold_on_the_host()
+    if vsf_skip() then return
+
+    vsf_laid_down(vsf_archive(host_target(), vsf_program()), vsf_globals)
+end vsf_vectors_fold_on_the_host
+
+private val vsf_nested: string =
+    "struct P\n    n: u8\n    w: <4>u16\n\n" +
+    "enum E\n    A(w: <4>u16)\n    B\n\n" +
+    "private val p: P = P(1, [1, 2, 3, 4] * 3)\n" +
+    "private val a: [2]<2>i32 = [[1, 2], [3, 4]]\n" +
+    "private val e: E = A([5, 6, 7, 8])\n" +
+    "private val q: [2]P = [P(2, 9), P(3, [1; 4])]" + vsf_main +
+    "i32(p.w[1] + q[0].w[3] + q[1].w[0] + (e match\n    A(w) -> w[2]\n    B -> 0)) + a[1][0]\n"
+
+@test("a vector inside a struct, an array and an enum's payload is constant data on freestanding targets")
+vsf_nested_vectors_fold()
+    if vsf_skip() then return
+
+    for t in [vsf_thumb(), vsf_arm64(), host_target()]
+        val out = vsf_archive(t, vsf_nested)
+
+        vsf_laid_down(out, ["@p = private constant %struct.P { i8 1, <4 x i16> <i16 3, i16 6, i16 9, i16 12> }\n",
+                            "@a = private constant [2 x <2 x i32>] [<2 x i32> <i32 1, i32 2>, <2 x i32> <i32 3, i32 4>]\n",
+                            "@q = private constant [2 x %struct.P] [%struct.P { i8 2, <4 x i16> <i16 9, i16 9, i16 9, i16 9> }, " +
+                            "%struct.P { i8 3, <4 x i16> <i16 1, i16 1, i16 1, i16 1> }]\n",
+                            "@e = private constant "])
+end vsf_nested_vectors_fold
+
+// The refusal a freestanding archive gives storage that stays code, up to the reason.
+private vsf_refusal(name: string, target: string) -> string =
+    s"'probe' is exported and reaches '$name', which is module storage an initializer fills " +
+    "before the program's own statements run. This artifact has no entry point to fill it in, and " +
+    s"'$target' is freestanding — there is no loader to run a constructor either, so " +
+    "the function would read whatever the image left. Build for a hosted target, where the storage " +
+    "is filled before any export can run, or make the initializer constant data, which is laid " +
+    "straight into the object file"
+
+@test("a vector that reads a module 'var' is still code, and a freestanding archive still refuses it")
+vsf_a_vector_over_a_var_is_refused()
+    if vsf_skip() then return
+
+    val said = vsf_archive(vsf_thumb(), "var b: u16 = 1\n\nprivate val r: <4>u16 = [b, 2, 3, 4]" + vsf_main + "i32(r[1])\n")
+
+    assert_eq(said, vsf_refusal("r", "thumb-freestanding-softfp") + ". 'r' reads 'b', a module 'var', whose value " +
+              "is whatever the program last wrote to it")
+end vsf_a_vector_over_a_var_is_refused
+
+@test("and so is one built from a 'var' by arithmetic, and a struct holding it, on a 64-bit target")
+vsf_arithmetic_over_a_var_is_refused()
+    if vsf_skip() then return
+
+    val said = vsf_archive(vsf_arm64(), "var b: <4>u16 = 1\n\nstruct P\n    w: <4>u16\n\n" +
+                           "private val r: P = P(b * 2)" + vsf_main + "i32(r.w[1])\n")
+
+    assert(said.starts_with(vsf_refusal("r", "aarch64-freestanding")), said)
+    assert(said.contains("'r' reads 'b', a module 'var'"), said)
+end vsf_arithmetic_over_a_var_is_refused
+
+@test("a lane-wise intrinsic the evaluator does not run keeps its refusal, naming the intrinsic")
+vsf_an_intrinsic_keeps_its_refusal()
+    if vsf_skip() then return
+
+    val said = vsf_archive(vsf_thumb(), "private val x: <4>i32 = [-1, 2, -3, 4]\nprivate val y: <4>i32 = x.abs()" +
+                           vsf_main + "y[0]\n")
+
+    assert(said.starts_with(vsf_refusal("y", "thumb-freestanding-softfp")), said)
+    assert(said.contains("'y' cannot be computed while compiling: a vector's lane-wise 'abs' is known only where " +
+                         "the program runs"), said)
+end vsf_an_intrinsic_keeps_its_refusal
+
+@test("a mask, and a vector read through a splat 'val', are constant data too")
+vsf_masks_and_splat_reads_fold()
+    if vsf_skip() then return
+
+    vsf_laid_down(vsf_archive(vsf_thumb(), "private val v: <4>u16 = [1, 2, 3, 4]\nprivate val s: <4>u16 = 2\n" +
+                              "private val mk: <4>bool = v > s\nprivate val t: u16 = s[0] * 5" + vsf_main +
+                              "i32(t) + (if mk[3] then 1 else 0)\n"),
+                  ["@mk = private constant <4 x i1> <i1 0, i1 0, i1 1, i1 1>\n", "@t = private constant i16 10\n"])
+end vsf_masks_and_splat_reads_fold
+
+@test("a module vector over a 'var' is still filled before main on the host, and its value is right")
+vsf_a_vector_over_a_var_runs_on_the_host()
+    if vsf_skip() then return
+
+    val out = vsf_archive(host_target(), "var b: u16 = 1\n\nprivate val r: <4>u16 = [b, 2, 3, 4]" + vsf_main + "i32(r[1])\n")
+
+    assert(out.contains("@r = private global <4 x i16> zeroinitializer"), out)
+    assert_eq(vsf_build_run("var b: u16 = 5\nval r: <4>u16 = [b, 2, 3, 4] * 2\n\nprint(r[0], r[3])\n"), "10 8\n")
+end vsf_a_vector_over_a_var_runs_on_the_host
+
+private vsf_build_run(text: string) -> string
+    val root = make_temp_dir("sysl-vector-static-fold").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end vsf_build_run
+
+@test("every folded vector reads back as the program would have computed it, on the host")
+vsf_folded_values_are_right()
+    if vsf_skip() then return
+
+    val text = vsf_body +
+        "struct P\n    n: u8\n    w: <4>u16\n\nenum E\n    A(w: <4>u16)\n    B\n\n" +
+        "private val p: P = P(1, [1, 2, 3, 4] * 3)\nprivate val e: E = A([5, 6, 7, 8])\n" +
+        "private val a: [2]<2>i32 = [[1, 2], [3, 4]]\n\n" +
+        "print(v[0], v[3], s[2], f[1], m[3], w[0], c[3], h[0], l[0], l[3], z[0], z[3], k, g[1], d[0])\n" +
+        "print(p.n, p.w[3], a[1][1], e match\n    A(x) -> x[2]\n    B -> 0)\n"
+
+    assert_eq(vsf_build_run(text), "1 4 7 -1 9 8 4 4 7 4 0 5 13 6 0.5\n1 12 4 7\n")
+end vsf_folded_values_are_right

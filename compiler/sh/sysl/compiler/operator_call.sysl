@@ -454,6 +454,137 @@ private bound_heads(a: &Analysis, tr_name: string, subject: Type, bounds: Buf[Bo
     heads
 end bound_heads
 
+// **The right-hand type an operand in the literal's tier is read at, beside a subject whose operator
+// is dispatched** -- chosen exactly as a literal argument chooses between overloads
+// (`reference/expressions.md § Operator dispatch`): the implementations whose right-hand type the
+// literal reads at are the candidates, and `narrowed_at` decides between several. So `n + 4567890123`
+// over `impl Add[long]` reads the literal as the `long` it is, where it was first read at its `int`
+// default and refused for not fitting one, and over `Add[long]` and `Add[ulong]` the signed one is
+// meant, as `f(4567890123)` over `f(long)` and `f(ulong)` means it.
+//
+// Nothing where the operand is not in the literal's tier, the subject's operator is the machine's or
+// a type parameter's (whose bound settles the literal, `operand_rhs`), or no single implementation
+// is chosen -- each of those is read, and refused, as it was.
+literal_operand_head(cx: &Analyzer, op: string, subject: Type, e: Expr) -> Option[Type]
+    val spelling = core_infix(op)
+
+    if spelling.is_none() || subject == Unknown || core_builtin(spelling.unwrap(), subject) then return None
+
+    subject match
+        Abstract(_, _) -> return None
+        _ -> ()
+
+    if !literal_valued(cx, e) then return None
+
+    val tr_name = library_key(spelling.unwrap())
+    val d = trait_decl_at(cx.an, tr_name)
+
+    if d.is_none() || d.unwrap().tparams.is_empty() then return None
+
+    var reached: Buf[Type] = buf()
+
+    for h in impl_heads(cx.an, tr_name, subject, d.unwrap())
+        var seen = false
+
+        for r in reached
+            if type_eq(r, h) then seen = true
+
+        if !seen && literal_fits(cx, e, h) then reached.push(h)
+
+    if reached.len() == 1 then return Some(reached[0])
+    if reached.is_empty() then return None
+
+    var declared: Buf[usize] = buf()
+    var generic: Buf[bool] = buf()
+    var fitted: Buf[Buf[Type]] = buf()
+
+    for h in reached
+        var one: Buf[Type] = buf()
+
+        one.push(h)
+        declared.push(1)
+        generic.push(false)
+        fitted.push(one)
+
+    var args: Buf[Expr] = buf()
+    var natural: Buf[Option[Type]] = buf()
+
+    args.push(e)
+    natural.push(None)
+
+    val chosen = narrowed_at(declared, generic, fitted, args, natural)
+
+    if chosen.len() == 1 then Some(reached[chosen[0]]) else None
+end literal_operand_head
+
+// **The refusal for an operand in the literal's tier that no implementation takes and its own default
+// cannot hold either** -- `b + 36893488147419103232` over `Add[long]` and `Add[ulong]`. Told that the
+// literal does not fit `int` the reader would be told about a type nothing in the program asked
+// for; what was asked for is one of the implementations, and those are what the message names.
+// Nothing where the literal fits an implementation or its own default (whose refusal, naming the
+// implementation it would have needed, stands), or where `literal_operand_head` would not apply.
+literal_operand_misfit(cx: &Analyzer, op: string, subject: Type, e: Expr) -> Option[string]
+    val spelling = core_infix(op)
+
+    if spelling.is_none() || subject == Unknown || core_builtin(spelling.unwrap(), subject) then return None
+
+    subject match
+        Abstract(_, _) -> return None
+        _ -> ()
+
+    val own = literal_arith_default(e)
+
+    if own.is_none() || !literal_valued(cx, e) || literal_fits(cx, e, own.unwrap()) then return None
+
+    val tr_name = library_key(spelling.unwrap())
+    val d = trait_decl_at(cx.an, tr_name)
+
+    if d.is_none() || d.unwrap().tparams.is_empty() then return None
+
+    val heads = impl_heads(cx.an, tr_name, subject, d.unwrap())
+
+    if heads.is_empty() then return None
+
+    var shown: Buf[string] = buf()
+
+    for h in heads
+        if literal_fits(cx, e, h) then return None
+
+        shown.push(s"'${show_bound(cx.an, op_bound(cx.an, cx.scope, tr_name, subject, Some(h)), subject)}'")
+
+    Some(s"'$op' on ${type_show(subject)} has no right-hand type this literal fits — it implements " +
+         conjoin(shown))
+end literal_operand_misfit
+
+// The same refusal for a literal on the LEFT of an operator whose right operand's type has no
+// instruction of its own: the scalars implementing the trait at that type are the candidates, and
+// the literal fits none of them nor its own default.
+literal_subject_misfit(cx: &Analyzer, op: string, rhs: Type, e: Expr, scalars: Buf[Type]) -> Option[string]
+    val own = literal_arith_default(e)
+
+    if scalars.is_empty() || own.is_none() || literal_fits(cx, e, own.unwrap()) then return None
+
+    val tr_name = library_key(core_infix(op).unwrap())
+    var shown: Buf[string] = buf()
+
+    for h in scalars
+        if literal_fits(cx, e, h) then return None
+
+        shown.push(s"'${type_show(h)}: ${show_bound(cx.an, op_bound(cx.an, cx.scope, tr_name, h, Some(rhs)), h)}'")
+
+    Some(s"'$op' with ${type_show(rhs)} on the right has no left-hand scalar this literal fits — they " +
+         s"are ${conjoin(shown)}")
+end literal_subject_misfit
+
+// What a compound assignment's right-hand side is read as, where the value is in the literal's tier
+// and the place's operator dispatched: the implementation the literal selects
+// (`literal_operand_head`), and otherwise what `update_expected` says.
+update_expected_for(cx: &Analyzer, op: string, place_ty: Type, value: Expr) -> Option[Type]
+    val head = literal_operand_head(cx, op, place_ty, value)
+
+    if head.is_some() then head else update_expected(cx.an, op, place_ty)
+end update_expected_for
+
 // Every argument list the subject's implementations of a trait were written at, reduced to the one
 // right-hand type they all name.
 private agreed_operand(a: &Analysis, tr_name: string, subject: Type, d: TraitDecl) -> Option[Type]
@@ -501,11 +632,21 @@ widened_operand(cx: &Analyzer, span: Span, op: string, subject: Type, t: TExpr,
     val heads = subject match
         Abstract(_, bounds) -> bound_heads(a, tr_name, subject, bounds, d.unwrap())
         _ -> impl_heads(a, tr_name, subject, d.unwrap())
-    val literal = written.is_some() && is_literal(written.unwrap())
+    // Arithmetic over literals is the literal it comes to (`literal_arith_default`): `b + 60 * 52` is
+    // read at whichever implementation `b + 3120` is, and refused alike where that is ambiguous.
+    val literal = written.is_some() && literal_arith_default(written.unwrap()).is_some()
     var reached: Buf[Type] = buf()
 
     for h in heads
         if type_eq(h, got) then return t
+
+    // **A name for a type that checks nothing is that type** (`repr`): a measured `c type` over
+    // `unsigned long` selects `Add[ulong]` as a `ulong` does, as an argument of that type selects
+    // `f(v: ulong)`.
+    for h in heads
+        if plain_operand(h) && type_eq(h, repr(got)) then return TExpr(t.span, TCast(t, h))
+
+    for h in heads
 
         if implicitly_widens(got, h) || (literal && literal_fits(cx, written.unwrap(), h))
             var seen = false
@@ -552,7 +693,15 @@ widened_operand(cx: &Analyzer, span: Span, op: string, subject: Type, t: TExpr,
     bad_expr(t.span)
 end widened_operand
 
-// The operand read at the right-hand type of the implementation it selected: a bare literal is read
+// A scalar an operand may be converted to with nothing to check.
+private plain_operand(t: Type) -> bool = t match
+    Integer(_, _, _) -> true
+    Floating(_, _) -> true
+    Fixed(_, _, _) -> true
+    _ -> false
+
+// The operand read at the right-hand type of the implementation it selected: a bare literal, or
+// arithmetic over literals, is read
 // at that type afresh, as an argument would be -- `2` over `Mul[f32]` is an `f32` two, where no
 // widening reaches from the `int` it was first read as -- and a typed operand is converted to it.
 private operand_at(cx: &Analyzer, t: TExpr, written: Option[Expr], literal: bool, at: Type) -> TExpr =

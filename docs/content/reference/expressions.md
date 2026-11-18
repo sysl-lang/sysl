@@ -2173,8 +2173,9 @@ print(max(a, b))
 ```
 
 **Between overloads, an exact match beats any widening, and among widenings the narrowest wins** —
-the candidate each of whose parameters converts to the other's. Where neither is narrower at every
-position, the call is ambiguous — except where the candidates are tied only by bare literals, which
+the candidate each of whose parameters converts to the other's. A literal, or arithmetic over
+literals alone (`60 * 52`), has no type to widen from and decides nothing in this step. Where
+neither is narrower at every position, the call is ambiguous — except where the candidates are tied only by bare literals, which
 then take their default types, or are tied only by bare literals beside typed arguments that one
 candidate takes exactly, which then read the literals at that candidate's parameter types
 ([Overloading](/reference/declarations/#overloading)).
@@ -3117,6 +3118,49 @@ print(c.re, c.im)
 13.5 -18
 ```
 
+A literal is read at the implementation it selects, never at its `int` default first, so one too wide
+for `int` is the `long` or the `ulong` an implementation takes, and a literal's arithmetic chooses as
+the literal it comes to:
+
+```sysl
+struct Big
+    n: long
+
+impl Add[long, string] for Big
+    add(self, v: long) -> string = s"long ${self.n + v}"
+
+impl Add[ulong, string] for Big
+    add(self, v: ulong) -> string = s"ulong $v"
+
+val b = Big(1)
+
+print(b + 4567890123)
+print(b + 18446744073709551615)
+print(b + 60 * 52)
+```
+
+```output
+long 4567890124
+ulong 18446744073709551615
+long 3121
+```
+
+A literal no implementation's right-hand type holds is refused naming what is implemented:
+
+```sysl
+struct Big
+    n: long
+
+impl Add[long, string] for Big
+    add(self, v: long) -> string = "long"
+
+print(Big(1) + 36893488147419103232)
+```
+
+```error
+'+' on Big has no right-hand type this literal fits — it implements 'Add[long, string]'
+```
+
 Two implementations neither of which is the narrower leave the operand saying nothing about which is
 meant. On a 64-bit target `isize` and `i64` each widen to the other, so an `int` reaches both
 equally, and `s * n`, `s *= n` and `s.mul(n)` are all refused; an operand at either type exactly
@@ -3246,7 +3290,9 @@ print(sum([1, 2, 3]), sum(none), sum([1.5, 2.5]) == 4)
 
 **A constrained subtype is deliberately not a member, the one place where a value and an operation
 are treated differently.** [A derivation](/reference/errors/) gives a subtype every operation its
-base has, because narrowing which values a type holds does not narrow what can be done with them. An
+base has, because narrowing which values a type holds does not narrow what can be done with them —
+all but two: a `new` type [is not `Mul` or `Div` at itself](/reference/errors/#a-new-type-does-not-multiply-or-divide-by-itself),
+since two `Meters` multiplied are an area and divided a ratio. An
 identity is a value, not an operation: a range written to exclude zero does not contain one, so the
 membership stops at the integer types themselves. A **vector** is left out for a related reason — `<4>i32` has four lanes and
 `zero()` names none of them, where every operator above is the lane's operation happening four times
