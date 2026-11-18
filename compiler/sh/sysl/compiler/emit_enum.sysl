@@ -20,6 +20,53 @@ payload_ptr(e: *Emit, d: &EnumType, base: Val) -> Val
     r
 end payload_ptr
 
+// A data enum's tag, read out of a value of it into `dest`, at `i32`. A null-niche enum (`layout.sysl`'s
+// `null_niche`) stores none: whether its address is null decides the variant, and the tag it reads as
+// is that variant's own, so every test written against tags reads it unchanged.
+enum_tag_into(e: *Emit, d: &EnumType, dest: Val, value: Val)
+    if !null_niche(d) then return emit(e, InExtract(dest, enum_lty(d), value, index_list(0)))
+
+    val word = fresh_reg(e)
+    var idx: Buf[int] = buf()
+
+    idx.push(0)
+    idx.push(0)
+    emit(e, InExtract(word, enum_lty(d), value, idx))
+    niche_tag(e, d, dest, word)
+end enum_tag_into
+
+// The same, loaded out of the enum sitting at `at`.
+enum_tag_load(e: *Emit, d: &EnumType, dest: Val, at: Val)
+    if !null_niche(d) then return emit(e, InLoad(dest, l_i32(), at, AccPlain, None))
+
+    val word = fresh_reg(e)
+
+    emit(e, InLoad(word, niche_unit(e, d), at, AccPlain, None))
+    niche_tag(e, d, dest, word)
+end enum_tag_load
+
+// Writes a variant's tag into the enum at `at`, before or after its payload. A null-niche `None` is
+// the null address; its `Some` is the payload alone, so there is nothing to write for it here.
+enum_tag_store(e: *Emit, d: &EnumType, v: EnumVariant, at: Val) =
+    if !null_niche(d) then emit(e, InStore(l_i32(), VInt(v.tag), at, AccPlain, None))
+    else if !v.carries then emit(e, InStore(niche_unit(e, d), VInt(from_int(0)), at, AccPlain, None))
+
+// The integer a null-niche enum's address is read as: its payload region's one unit.
+private niche_unit(e: *Emit, d: &EnumType) -> LType = payload_area(d, e.layout).0
+
+private niche_tag(e: *Emit, d: &EnumType, dest: Val, word: Val)
+    var some = VInt(from_int(0))
+    var none = VInt(from_int(0))
+
+    for v in d.variants
+        if v.carries then some = VInt(v.tag) else none = VInt(v.tag)
+
+    val held = fresh_reg(e)
+
+    emit(e, InIntCmp(held, INe, niche_unit(e, d), word, VInt(from_int(0))))
+    emit(e, InSelect(dest, held, l_i32(), some, none, l_i1()))
+end niche_tag
+
 // Reads a variant's payload out of an enum value, at that variant's type.
 //
 // Reading a variant the value is not holding yields whatever the one it *is* holding left there --
@@ -200,7 +247,10 @@ end gen_enum_try
 enum_value(e: *Emit, en: Type, d: &EnumType, v: EnumVariant, vals: Buf[Val]) -> Val
     if d.simple then return VInt(v.tag)
 
+    // A null-niche `None` is the null address, which is every byte of it zero.
     if !v.carries
+        if null_niche(d) then return VZero
+
         val tagged = fresh_reg(e)
 
         emit(e, InInsert(tagged, enum_lty(d), VUndef, l_i32(), VInt(v.tag), index_list(0)))
@@ -218,7 +268,7 @@ enum_value(e: *Emit, en: Type, d: &EnumType, v: EnumVariant, vals: Buf[Val]) -> 
 
     val slot = scratch_slot(e, enum_lty(d))
 
-    emit(e, InStore(l_i32(), VInt(v.tag), slot, AccPlain, None))
+    enum_tag_store(e, d, v, slot)
 
     val p = payload_ptr(e, d, slot)
 

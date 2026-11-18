@@ -451,6 +451,37 @@ lays it out in is marked [`@pinned`](/reference/attributes/#pinned-on-a-struct-a
 kept in module storage or a `&T` box, and passed to C as `&fs`. The compiler then refuses every copy of
 it.
 
+### A nullable pointer is an `Option`
+
+**`Option[*T]` is laid out as the pointer itself, with `None` as null**
+([`memory.md`](memory.md#an-option-of-an-address-is-one-word)), so it is exactly C's nullable `T *`:
+an extern that may answer `NULL` says so in its signature, and the answer is matched rather than
+compared with `null`. It crosses as a pointer in every position a `*T` does — an argument, a result,
+a field of a struct handed over by value, and an `@export`'s parameter, where the header spells it
+`T *`:
+
+```sysl
+import sysl.text.cstring
+
+extern strchr(s: *u8, c: i32) -> Option[*u8]
+
+val text = cstring("hello")
+
+for c in ['l', 'z']
+    strchr(text.ptr, i32(c)) match
+        Some(at) -> print(at - text.ptr)
+        None -> print("absent")
+```
+
+```output
+2
+absent
+```
+
+Passing `None` hands C a `NULL`. A `Some` holding a null `*T` is `None` too, since the two are the
+same bits. An `Option[&T]` is one word as well, but a counted reference is not something C may hold,
+so an `@export` taking or answering one is refused as a bare `&T` is.
+
 ### Handing C an object to hold
 
 A C API that hands out a handle — `db_open` answering a `Db *` that the caller passes back to every

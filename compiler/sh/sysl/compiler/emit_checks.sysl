@@ -1315,7 +1315,7 @@ private variadic_export_reason() -> string =
 // Whether a type that crosses does so as an aggregate: a struct, a tuple, or a data enum.
 private export_aggregate(t: Type) -> bool = repr(t) match
     Struct(_) -> true
-    Enum(d) -> !d.simple
+    Enum(d) -> !d.simple && !null_niche(d)
     _ -> false
 
 private is_va_list(t: Type) -> bool = repr(t) match
@@ -1441,8 +1441,9 @@ export_carried(t: Type) -> bool = repr(t) match
     Array(_, elem) -> export_carried(*elem)
 
     // A simple enum **is** its underlying integer, so it crosses as one. A data enum is a tag beside
-    // a union of payloads sysl laid out, which is not what a C union is.
-    Enum(d) -> d.simple
+    // a union of payloads sysl laid out, which is not what a C union is -- except an `Option` with a
+    // null niche, which is the one address C calls a nullable pointer.
+    Enum(d) -> d.simple || null_niche(d) && export_carried(d.targs[0])
     _ -> false
 
 private all_carried(fields: Buf[(string, Type)]) -> bool
@@ -1476,7 +1477,8 @@ export_advice(t: Type) -> string = repr(t) match
             "value. Wrap it in a struct, which is how C hands an array over as a value and lays out " +
             "identically, or take a pointer to its first element and a length"
     Enum(d) ->
-        if !d.simple
+        if null_niche(d) then export_advice(d.targs[0])
+        else if !d.simple
             "A data enum is a tag beside a union of the payloads sysl laid out, which is not the " +
             "shape a C union has. Export the tag and the payload as separate parameters, or a " +
             "pointer to the whole"

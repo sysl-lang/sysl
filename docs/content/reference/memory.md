@@ -156,6 +156,52 @@ and a null answer **traps** before anything is stored, exactly as a failed array
 one `&T` that reads as null is one in storage the language did not lay out and the program zeroed
 ([below](#storage-the-compiler-did-not-lay-out-may-not-hold-a-counted-value)).
 
+### An `Option` of an address is one word
+
+**`Option[&T]` and `Option[*T]` are guaranteed to be the address alone, with `None` as null** — the
+same size and alignment as the pointer, with no tag beside it. `Some` is every address that is not
+null. A `&T` is never null, so nothing is lost, and the absent reference costs nothing over the
+present one, whether it sits in a local, a field, an array element or module storage; a zeroed one
+is `None`. The same holds on every target: on a 32-bit one it is four bytes.
+
+```sysl
+struct Node
+    value: int
+
+struct Link
+    next: Option[&Node]
+
+print(sizeof(Option[&Node]), sizeof(&Node), sizeof(Option[*Node]), sizeof(Link))
+
+var empty: [4]Option[&Node]
+
+print(empty[3].is_none())
+```
+
+```output
+8 8 8 8
+true
+```
+
+**A `*T` may be null, and a null one inside `Some` reads back as `None`**, since the two are the same
+bits. That is what makes an `Option[*T]` the nullable C pointer an extern declares
+([`ffi.md`](ffi.md#a-nullable-pointer-is-an-option)), and it is the one case where `Some(p).is_some()`
+is false:
+
+```sysl
+val p: *int = null
+
+print(Some(p).is_none())
+```
+
+```output
+true
+```
+
+The guarantee is for a thin address. A `*Shape` or `&Shape` of a trait is two words, the value and
+its table, and an `Option` of one keeps its tag, as does an `Option` of a `weak T` and every other
+enum.
+
 ### References compare through their referent
 
 **`==` and `!=` on two `&T`s (or two `&sync T`s) compare the objects as `T` does wherever `T` has an

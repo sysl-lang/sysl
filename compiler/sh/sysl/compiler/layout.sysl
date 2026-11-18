@@ -15,6 +15,19 @@ import sysl.container.{Map, map}
 // A struct pads every field onto its own alignment and then pads its end onto the widest of them, so
 // that an array of it steps by its size.
 
+// **An `Option` of a thin address has a null niche**: it is the address alone, one word, and `None`
+// is the null address -- the guarantee Rust makes, and what lets an `Option[*T]` stand for a nullable
+// C pointer in an extern signature. There is no tag: `Some` is any address that is not null, so a
+// `Some(p)` built from a null `*T` reads back as `None`. A trait object, being two words, keeps the
+// tag, and so does every other enum.
+null_niche(d: &EnumType) -> bool =
+    !d.simple && d.targs.len() == 1 && d.base == library_key("Option") && thin_address(d.targs[0])
+
+private thin_address(t: Type) -> bool = underlying(t) match
+    Ptr(_, _) -> !erased(underlying(t))
+    Ref(_, _) -> !erased(underlying(t))
+    _ -> false
+
 // A run of bits inside a packed struct's container.
 struct BitRange
     name: string
@@ -458,13 +471,17 @@ struct TargetLayout
         self.aggregate(members)
     end variant_aggregate
 
+    // A null-niche enum is its payload alone: the address, with no tag beside it.
     private enum_size(self, e: &EnumType) -> usize
         val both = self.payload(e)
+
+        if null_niche(e) then return round_up(both.0, both.1)
 
         round_up(round_up(4, both.1) + both.0, max_usize(4, both.1))
     end enum_size
 
-    private enum_align(self, e: &EnumType) -> usize = max_usize(4, self.payload_align(e))
+    private enum_align(self, e: &EnumType) -> usize =
+        if null_niche(e) then self.payload_align(e) else max_usize(4, self.payload_align(e))
 
     // -- a boundary `@align(n)` raises -------------------------------------------------------------
     //
