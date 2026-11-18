@@ -965,6 +965,41 @@ Every refusal names the shape to write instead, because there always is one — 
 pointer and length C's own buffer functions already take, an array becomes a struct holding it. That
 is what makes the boundary writable rather than merely restricted.
 
+### A trap inside an export
+
+**A check that fails inside an exported function ends the process, and nothing after it runs.** A
+bounds check, an overflow check in a debug build, a `require` or other contract, an index past a
+container's count and `trap()` all stop exactly as they do in a sysl program
+([errors](/reference/errors/#what-stopping-looks-like)): the line the check reports goes to standard
+error, C's open output streams are flushed, and the trap instruction ends the process — status 133
+in a shell on AArch64, where the instruction raises SIGTRAP, and 132 on x86-64, where `ud2` raises
+SIGILL. Nothing is unwound: the statement of the C caller after the call never runs, no `defer` of
+the sysl frames between runs, a C frame sitting between two of them (a callback that calls back in)
+is never returned to, and no `atexit` handler runs. Since the stop is the process's, it is the same
+whether the C project linked the `build-c` archive statically or made a shared library of it:
+
+```c
+#include <stdio.h>
+#include "libmylib.a.h"
+
+int main(void) {
+    printf("before\n");          /* printed: the trap flushes stdout first */
+    mylib_lookup(5);             /* an index past the end: the process ends here */
+    printf("after\n");           /* never runs */
+}
+```
+
+**A C program that defines `sysl_bounds_fail` itself replaces the report, not the stop.** Its
+definition is called with the failure in place of the default line, and when it returns the check
+traps as it would have, so an embedder may log a bounds failure its own way but cannot make the
+export return. An overflow wraps rather than trapping in a release build, so there the export returns
+the wrapped answer like any other.
+
+`panic` and the forcing members built on it (`unwrap`, `expect`, `assert`) are the one difference,
+as they are in a program: they print their line on standard output and exit with status 1 through
+C's `exit`, so the caller's `atexit` handlers do run — and the caller still never sees the call
+return.
+
 ### A variadic export
 
 **An exported function may end in `...`**, which is what a C library written in sysl needs to define
@@ -3824,6 +3859,41 @@ the C compiler refused this file's 'c const' block
 Four more refusals go with it: a header that is not there, a value the declared type cannot hold
 (naming the value and both ends of the range), a type that is not a number, and a block written
 inside a body, which has no file's headers to be compiled against.
+
+**A whole number is C's own value, read at its own C type and width**, whatever the line is
+declared at — so the range check is made against the number the header means. `UINT64_MAX` is
+18446744073709551615 at any width that holds it, an `unsigned __int128` reads whole into a `u128`, and
+C's rules for a negative in an unsigned type are C's: `-1u` is the `unsigned int` 4294967295.
+
+```sysl
+@include("<stdint.h>")
+
+c const
+    TOP: u64   = "UINT64_MAX"
+    WIDE: u128 = "(unsigned __int128)UINT64_MAX << 8"
+    LOW: i128  = "(__int128)INT64_MIN * 4"
+    MASK: u32  = "-1u"
+
+print(s"$TOP $WIDE $LOW $MASK")
+```
+
+```output
+18446744073709551615 4722366482869645213440 -36893488147419103232 4294967295
+```
+
+Read at a type that cannot hold it, the same number is refused rather than wrapped into one that
+fits — `UINT64_MAX` is not the `i64` -1, and `-1` (an `int`) is no `u64`:
+
+```sysl
+@include("<stdint.h>")
+
+c const
+    N: i64 = "UINT64_MAX"
+```
+
+```error
+'UINT64_MAX' is 18446744073709551615 here, which 'i64' cannot hold
+```
 
 **A `string` from C is not written this way.** A number is a number in the compiler's output and
 reads straight off; a string constant is a block of storage and a different job, and it would have to
