@@ -294,9 +294,14 @@ wsr_recursion_made_a_loop()
     wsr_check(wsr_err(main, "0"), "'fact' recurses by the cycle 'fact' → 'fact'")
     assert_eq(wsr_err(main, "2"), "")
 
+// Kept out of line, so no level can see which closure it calls and turn the call into a direct one.
 private const wsr_lock: string =
     "struct Lock\n    n: int\n\n" +
-    "with_lock(l: *Lock, op: &Fn() -> int) -> int\n    l.n += 1\n    val r = op()\n    l.n -= 1\n    r\n\n"
+    "@noinline\nwith_lock(l: *Lock, op: &Fn() -> int) -> int\n    l.n += 1\n    val r = op()\n    l.n -= 1\n    r\n\n"
+
+// The lock with what its body's calls through a pointer need said above it.
+private wsr_lock_said(bytes: int) -> string =
+    replace_all(wsr_lock, "with_lock(l:", s"@stack(calls: $bytes)\nwith_lock(l:")
 
 private const wsr_handler: string =
     "@stack(65536)\nhandler(x: int) -> int\n    var l = Lock(0)\n    with_lock(&l, () -> x + 1)\n\nprint(handler(1))\n"
@@ -313,16 +318,22 @@ wsr_bound_closure()
         // Said on the function whose body makes the call, the bound holds wherever the optimizer
         // put that call -- and the closure's release, which runs its destructor through the object's
         // header, is answered by the runtime's hooks rather than refused.
-        val said_calls = replace_all(wsr_lock, "with_lock(", "@stack(calls: 1024)\nwith_lock(")
+        assert_eq(wsr_err(wsr_lock_said(1024) + wsr_handler, level), "")
 
-        assert_eq(wsr_err(said_calls + wsr_handler, level), "")
+@test("a closure call the optimizer made direct needs nothing said: the frames are the optimized program's")
+wsr_closure_made_direct()
+    if !wsr_ready() then return
+
+    val inlined = replace_all(wsr_lock, "@noinline\n", "")
+
+    wsr_check(wsr_err(inlined + wsr_handler, "0"), "'with_lock' calls through a pointer")
+    assert_eq(wsr_err(inlined + wsr_handler, "2"), "")
 
 @test("'calls:' bounds the calls through a pointer, and the depth is held to it: a bound too small is refused")
 wsr_bound_closure_counted()
     if !wsr_ready() then return
 
-    val said_calls = replace_all(wsr_lock, "with_lock(", "@stack(calls: 100000)\nwith_lock(")
-    val said = wsr_err(said_calls + wsr_handler)
+    val said = wsr_err(wsr_lock_said(100000) + wsr_handler)
 
     wsr_check(said, "'handler' declared '@stack(65536)', and it can need ")
     wsr_check(said, "a call through a pointer, taken as 100000 bytes")

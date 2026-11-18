@@ -2755,12 +2755,15 @@ print(handler(3))
 
 **A depth with no bound is refused, with the reason**: a cycle of calls reachable from the function,
 a frame the back end sizes at run time, or a call through a pointer — a trait object, a `&Fn`
-closure, a function pointer — whose target the text does not name:
+closure, a function pointer — whose target the text does not name. `with_lock` is kept out of line
+here; where the optimizer can see which closure a call runs, the call is a direct one and needs
+nothing said:
 
 ```sysl
 struct Lock
     n: int
 
+@noinline
 with_lock(l: *Lock, op: &Fn() -> int) -> int
     l.n += 1
     val r = op()
@@ -2789,6 +2792,7 @@ byte count may be written in hexadecimal:
 struct Lock
     n: int
 
+@noinline
 @stack(calls: 1024)
 with_lock(l: *Lock, op: &Fn() -> int) -> int
     l.n += 1
