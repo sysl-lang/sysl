@@ -3290,7 +3290,9 @@ print(sum([1, 2, 3]), sum(none), sum([1.5, 2.5]) == 4)
 
 **A constrained subtype is deliberately not a member, the one place where a value and an operation
 are treated differently.** [A derivation](/reference/errors/) gives a subtype every operation its
-base has, because narrowing which values a type holds does not narrow what can be done with them. An
+base has, because narrowing which values a type holds does not narrow what can be done with them —
+all but two: a `new` type [is not `Mul` or `Div` at itself](/reference/errors/#a-new-type-does-not-multiply-or-divide-by-itself),
+since two `Meters` multiplied are an area and divided a ratio. An
 identity is a value, not an operation: a range written to exclude zero does not contain one, so the
 membership stops at the integer types themselves. A **vector** is left out for a related reason — `<4>i32` has four lanes and
 `zero()` names none of them, where every operator above is the lane's operation happening four times
