@@ -3160,6 +3160,8 @@ from* — never the rule:
   operator *is* implementing its trait; there is no separate operator-method syntax.
 - **A bounded parameter `[T: Op]`** resolves abstractly at the definition, and monomorphization binds
   it per instantiation.
+- **An operand held as a `&T`** is read through to the `T` it reaches, and the operator is `T`'s
+  ([generics](/reference/generics/#operators-see-through-a-reference)).
 
 **The right-hand operand selects the implementation as an argument selects an overload.** One
 written at `b`'s own type is meant where there is one; otherwise `b` takes an

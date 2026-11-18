@@ -2018,7 +2018,9 @@ private unary_expr(cx: &Analyzer, e: Expr, op: string, operand: Expr,
     // **`-` and `~` answer the operand's own type** -- a number's, or `Self` from `Neg` and `Not` --
     // so the type the position wants is the type the operand has to be, and it is passed down whole:
     // `-P.make()` at `P[int]` settles `make`'s `T` exactly as `P.make()` there does.
-    val t = type_expr(cx, operand, operand_expectation(op, expected))
+    val read = type_expr(cx, operand, operand_expectation(op, expected))
+    // A `&T` is read through to the `T` it reaches, as a binary operator's operands are.
+    val t = if op == "-" || op == "~" then through_reference(cx, read) else read
     val ty = texpr_type(t)
 
     if ty == Unknown then return t
@@ -2238,7 +2240,7 @@ private literal_subject_operands(cx: &Analyzer, span: Span, op: string, l: Expr,
     if own.is_none() || is_literal(r) || !selects_by_operand(cx.an, op) then return None
 
     val read = sandboxed_reading(cx, r)
-    val rty = texpr_type(read.0)
+    val rty = texpr_type(through_reference(cx, read.0))
 
     if read.1 || rty == Unknown || literal_fits(cx, l, rty) then return None
 
@@ -2260,7 +2262,7 @@ private literal_subject_operands(cx: &Analyzer, span: Span, op: string, l: Expr,
 
     one.push(r)
 
-    val tr = analyze_operands(cx, one, numeric)[0]
+    val tr = analyze_operands(cx, one, numeric, through = true)[0]
 
     if at.unwrap() == Unknown then return Some((bad_expr(l.span), tr))
 
@@ -2322,9 +2324,9 @@ private paired_operands(cx: &Analyzer, op: string, l: Expr, r: Expr,
         left.push(l)
         count.push(r)
 
-        val tl = analyze_operands(cx, left, numeric)[0]
+        val tl = analyze_operands(cx, left, numeric, through = true)[0]
 
-        return (tl, operand_rhs(cx, op, tl, r, analyze_operands(cx, count, None)[0]))
+        return (tl, operand_rhs(cx, op, tl, r, analyze_operands(cx, count, None, through = true)[0]))
     end if
 
     var operands: Buf[Expr] = buf()
@@ -2334,7 +2336,7 @@ private paired_operands(cx: &Analyzer, op: string, l: Expr, r: Expr,
 
     val unshifted = op != "<<" && op != ">>"
     val read = analyze_operands(cx, operands, numeric, unshifted, op == "*" || op == "/", false, unshifted,
-                                if is_wrap_sat_op(op) then op else "", op)
+                                if is_wrap_sat_op(op) then op else "", op, true)
     val ts = if op == "+" || op == "-" then fixed_siblings(cx, operands, read) else read
     val tl = ts[0]
 
@@ -2358,7 +2360,7 @@ private scale_operands(cx: &Analyzer, op: string, l: Expr, r: Expr,
 
         one.push(l)
 
-        val tl = analyze_operands(cx, one, numeric)[0]
+        val tl = analyze_operands(cx, one, numeric, through = true)[0]
 
         if is_fixed(texpr_type(tl)) then return Some((tl, type_expr(cx, r, None)))
 
@@ -2383,7 +2385,7 @@ private scale_operands(cx: &Analyzer, op: string, l: Expr, r: Expr,
 
         one.push(r)
 
-        val tr = analyze_operands(cx, one, numeric)[0]
+        val tr = analyze_operands(cx, one, numeric, through = true)[0]
 
         if is_fixed(texpr_type(tr)) then return Some((type_expr(cx, l, None), tr))
 
@@ -2470,15 +2472,42 @@ private compare_expr(cx: &Analyzer, span: Span, operands: Buf[Expr], ops: Buf[st
             continue
         end if
 
+        // **A `&T` beside the `T` it reaches is read through** (`reference/generics.md § Operators
+        // see through a reference`), so `r < v` and `r == v` compare two `T`s, and so is a `&T`
+        // beside a `&sync T`. Only in a link of its own: a middle operand is read once for both its
+        // links, and the other link may compare the reference itself.
+        if ops.len() == 1 && a != Unknown && b != Unknown && !type_eq(repr(a), repr(b))
+            val pa = if reads_through(a) then peeled(a, 1) else a
+            val pb = if reads_through(b) then peeled(b, 1) else b
+
+            if type_eq(repr(pa), repr(pb))
+                ts[i] = through_reference(cx, ts[i])
+                ts[i + 1] = through_reference(cx, ts[i + 1])
+                a = texpr_type(ts[i])
+                b = texpr_type(ts[i + 1])
+            end if
+        end if
+
         // **A reference compares as its referent does, where the referent has an `Eq`**
         // (`reference/memory.md § References compare through their referent`): the link reads both
         // operands through to it and dispatches on its type. Where it has none, the reference is
-        // its own identity, and the link is the machine's comparison of the addresses below.
-        val through = if (op == "==" || op == "!=") && a != Unknown && b != Unknown &&
-                         type_eq(repr(a), repr(b)) then through_levels(cx.an, "Eq", a) else 0
+        // its own identity, and the link is the machine's comparison of the addresses below. **An
+        // ordering always reads through**, since a reference has no order of its own: the referent's
+        // `PartialOrd`, or its refusal naming the referent.
+        val ordering = op == "<" || op == "<=" || op == ">" || op == ">="
+        val same = a != Unknown && b != Unknown && type_eq(repr(a), repr(b))
+        val through = if (op == "==" || op == "!=") && same then through_levels(cx.an, "Eq", a)
+        else if ordering && same && reads_through(a) then 1
+        else 0
 
         if through > 0
-            cmps.push(TCmp(op, compare_at(cx, span, op, peeled(a, through)), through))
+            val at = peeled(a, through)
+            val found = compare_at(cx, span, op, at)
+
+            if found.is_none() && ordering && at != Unknown && !is_ordered(at) then
+                cx.fault(span, s"'$op' is not defined for ${type_show(at)}")
+
+            cmps.push(TCmp(op, found, through))
             continue
         end if
 
@@ -2585,16 +2614,23 @@ private same_handle_kind(a: Type, b: Type) -> bool = a match
 // a right operand in the literal's tier beside a left one whose operator is dispatched is read at the
 // right-hand type of the implementation it selects (`literal_operand_head`), never at its default
 // first -- `n + 4567890123` over `impl Add[long]` is a `long` operand, not an `int` that does not fit.
+//
+// **`through` marks the operands of an operator that reads through a reference**
+// (`operator_call.sysl`'s `through_reference`): an operand held as a `&T` is read as the `T` it
+// reaches before the pair settles, so a literal beside it takes the referent's type and `r + v` over
+// a `&V` and a `V` is one type.
 analyze_operands(cx: &Analyzer, operands: Buf[Expr], expected: Option[Type],
                  widen: bool = false, rescales: bool = false, compared: bool = false,
-                 arithmetic: bool = false, held: string = "", dispatch: string = "") -> Buf[TExpr]
+                 arithmetic: bool = false, held: string = "", dispatch: string = "",
+                 through: bool = false) -> Buf[TExpr]
     var own: Buf[Option[TExpr]] = buf()
     var refused_before = false
 
     for e in operands
         if is_literal(e) || typed_by_position(cx, e) then own.push(None)
         else
-            val t = attempt_operand(cx, e, expected)
+            val read = attempt_operand(cx, e, expected)
+            val t = if through && read.is_some() then Some(through_reference(cx, read.unwrap())) else read
 
             own.push(t)
 
