@@ -35,11 +35,12 @@ import sysl.buf.{Buf, buf}
  * allocation per operation. A program doing this in a loop is doing something a big-integer library
  * is not the fastest way to do.
  *
- * **Multiplication is schoolbook and division is Knuth's algorithm D.** Both are quadratic.
- * Karatsuba, Toom-Cook and a Barrett or Montgomery reduction are all improvements that fit behind
- * this same surface, and none of them changes an answer -- so they are work somebody does when a
- * program is slow rather than decisions this module has to make now. What this is for is money,
- * identifiers, checksums and the occasional exact computation, none of which is GMP's territory.
+ * **Each operation picks a published algorithm by the size of its operands**: schoolbook,
+ * Karatsuba and Toom-3 multiplication (`multiply.sysl`), Knuth's algorithm D and Burnikel and
+ * Ziegler's recursive division (`divide.sysl`, `recursive.sysl`), divide-and-conquer conversion to
+ * and from text (`text.sysl`), and Lehmer's gcd (`theory.sysl`), all over the limb loops in
+ * `kernels.sysl`. None changes an answer. Nothing is FFT-based, so far past ten thousand limbs a
+ * library with a Schönhage-Strassen multiply is the faster.
  *
  * ## The bit operations, and the reading they settled on
  *
@@ -294,6 +295,11 @@ mul(a: BigInt, b: BigInt) -> BigInt
 impl Mul for BigInt
     mul(self, rhs: BigInt) -> BigInt = mul(self, rhs)
 
+/** `x * x`, by the squaring algorithms -- about half the multiplies of a general product -- and never
+ * negative.
+ */
+private[bigint] square(x: BigInt) -> BigInt = BigInt(false, sqr_mag(x.mag))
+
 /** `a` raised to `n`, by repeated squaring. Allocates once per squaring and once per set bit.
  *
  * **A negative exponent has no integer answer and gives one**, since `x^-1` is not an integer for
@@ -312,7 +318,7 @@ pow(a: BigInt, n: usize) -> BigInt
 
         k = k >> 1
 
-        if k > 0 then base = mul(base, base)
+        if k > 0 then base = square(base)
 
     result
 end pow
@@ -340,73 +346,33 @@ private[bigint] cmp_mag(a: []const Limb, b: []const Limb) -> int
     0
 end cmp_mag
 
-/** `a + b`, carrying in the double width so that the sum of two limbs and a carry cannot overflow. */
+/** `a + b`: the overlap with `add_n`, the longer one's tail with `add_1` taking the carry, and the
+ * carry out of the top as one more limb where there is one. The sum of two limbs and a carry is
+ * carried in the double width, so it cannot overflow.
+ */
 private[bigint] add_mag(a: []const Limb, b: []const Limb) -> []const Limb
     val long_side = if a.len >= b.len then a else b
     val short_side = if a.len >= b.len then b else a
-    var out: Buf[Limb] = buf()
-    var carry: Wide = 0
+    val n = long_side.len
+    var out = fresh(n + 1)
+    val c = add_n(out, long_side, short_side, short_side.len)
 
-    for i in 0..<long_side.len
-        var s = Wide(long_side[i]) + carry
+    out[n] = add_1(out[short_side.len..], long_side[short_side.len..], n - short_side.len, c)
 
-        if i < short_side.len then s += Wide(short_side[i])
-
-        out.push(low_limb(s))
-        carry = s >> limb_bits
-
-    if carry != 0 then out.push(Limb(carry))
-
-    trimmed(out)
+    finished(out, n + 1)
 end add_mag
 
 /** `a - b`, where `a >= b`. The caller is what guarantees that, which is why this is private: a
  * borrow out of the top would wrap silently and produce a number rather than a complaint.
  */
 private[bigint] sub_mag(a: []const Limb, b: []const Limb) -> []const Limb
-    var out: Buf[Limb] = buf()
-    var borrow: Wide = 0
+    var out = fresh(a.len)
+    val c = sub_n(out, a, b, b.len)
 
-    for i in 0..<a.len
-        // The borrow is folded into what is being taken away rather than applied afterwards, so the
-        // two cases below are one comparison each. Where the limb is the smaller, the difference
-        // wraps at the double width and its low half is the limb `cur + 2^w - take` would give.
-        val take = (if i < b.len then Wide(b[i]) else 0) + borrow
-        val cur = Wide(a[i])
+    sub_1(out[b.len..], a[b.len..], a.len - b.len, c)
 
-        out.push(low_limb(cur -% take))
-        borrow = if cur >= take then 0 else 1
-
-    trimmed(out)
+    finished(out, a.len)
 end sub_mag
-
-/** `a * b`, one limb of `b` against all of `a` at a time.
- *
- * The accumulator is a `Wide`, which is exactly enough: a limb times a limb is at most
- * `(2^w - 1)^2`, and adding the running carry and the limb already sitting in the answer keeps it
- * under `2^(2w)`. That is the whole reason the arithmetic is done at twice the limb's width.
- */
-private[bigint] mul_mag(a: []const Limb, b: []const Limb) -> []const Limb
-    var out: Buf[Limb] = buf()
-
-    for i in 0..<(a.len + b.len)
-        out.push(0)
-
-    for i in 0..<a.len
-        val ai = Wide(a[i])
-        var carry: Wide = 0
-
-        for j in 0..<b.len
-            val at = i + j
-            val t = ai * Wide(b[j]) + Wide(out[at]) + carry
-
-            out[at] = low_limb(t)
-            carry = t >> limb_bits
-
-        out[i + b.len] = Limb(carry)
-
-    trimmed(out)
-end mul_mag
 
 /** The magnitude of `n`: one limb on a 64-bit target, up to two on a 32-bit one. */
 private[bigint] mag_of_u64(n: u64) -> []const Limb

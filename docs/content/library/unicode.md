@@ -72,6 +72,31 @@ true
 So: `to_lower` to show text to somebody, `fold` to decide whether two pieces of text are the same
 one.
 
+**`simple_fold` is the same key for one character**, for a caller that has a `char` and no heap: a
+case-insensitive matcher stepping through two strings, a regex engine's `(?i)`, a hash that must give
+`K` and `k` one bucket. It is CaseFolding.txt's statuses **C** and **S** — one character in, one out —
+from a table of 209 runs that allocates nothing and is linked only by a program that calls it.
+
+```sysl
+import sysl.unicode.{simple_fold, to_lower}
+
+print(simple_fold('K'), simple_fold('\u{212a}'), simple_fold('ſ'))
+print(to_lower('\u{212a}') == simple_fold('\u{212a}'), to_lower('ſ') == simple_fold('ſ'))
+print(simple_fold('ß'), simple_fold('ẞ'), simple_fold('Σ'), simple_fold('ς'))
+```
+
+```output
+k k s
+true false
+ß ß σ σ
+```
+
+Two things it does not do, both because it is one character out. **`ß` folds to itself**: its folding
+is `ss`, status **F**, which only `fold` can produce, so a comparison that must equate `STRASSE` with `straße` wants
+`fold`. And the Turkic
+entries (`I` to `ı`) are status **T**, which is a locale's choice and not in the table. Folding is
+idempotent, so a key folded once compares equal to anything folded the same way.
+
 **And ASCII case mapping, for a protocol identifier.** An HTTP header name, a scheme, a SQL keyword
 and a hostname label are all defined as ASCII, and case-mapping one the Unicode way is a known
 footgun: **characters outside ASCII map into it**. The Kelvin sign `K` (U+212A) lowercases to a plain
