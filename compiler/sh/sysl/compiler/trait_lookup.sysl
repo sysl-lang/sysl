@@ -936,8 +936,23 @@ private referent_satisfies(a: &Analysis, tr: Bound, t: Type) -> bool
         _ -> false
 
     if !reaches_through_reference(a, tr, raw) then return false
+    if referent_implements(a, tr, inner.unwrap()) then return true
 
-    referent_implements(a, tr, inner.unwrap())
+    // **An operator reads both its operands through** (`operator_call.sysl`'s `through_reference`),
+    // so `[T: Add]` at `&V` asks `V` for `Add` at `V` where the bound names the reference itself:
+    // `Rhs = Self` and `Out = Self` are the referent in the implementation as in the body. And a
+    // scalar's operators are the machine's, which `n + 1` on a `&int` reaches as well, so the
+    // membership the compiler gives the scalar is met through the reference too.
+    if raw || !operator_key(tr.name) then return false
+
+    var args: Buf[Type] = buf()
+
+    for x in tr.args
+        args.push(if type_eq(x, t) then inner.unwrap() else x)
+
+    val at = Bound(tr.name, args, tr.assocs, tr.bounded)
+
+    referent_implements(a, at, inner.unwrap()) || builtin_satisfies(a, at, inner.unwrap())
 end referent_satisfies
 
 private referent_implements(a: &Analysis, tr: Bound, inner: Type) -> bool = inner match
@@ -1157,7 +1172,7 @@ private builtin_satisfies(a: &Analysis, tr: Bound, t: Type) -> bool
 
     if spelling == Some("Hash") && hash_law_breaks(a, t) then return false
 
-    spelling.is_some() && core_builtin(spelling.unwrap(), t)
+    spelling.is_some() && core_member(spelling.unwrap(), t)
 end builtin_satisfies
 
 // Whether a **trait object** satisfies a bound, which it does for the trait it dispatches through

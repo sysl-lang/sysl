@@ -399,17 +399,26 @@ private generic_member_instance(cx: &Analyzer, span: Span, shown: string, name: 
             return ""
         end if
 
-        if mine.len() != targ_exprs.len()
-            val were = if targ_exprs.len() == 1 then "was" else "were"
+        if names_a_pack(mine, m.tpacks)
+            val spread = written_pack_args(cx, span, written, mine, m.tpacks, targ_exprs,
+                                           (param, e) -> member_arg_for(cx, m, home, param, e, true))
 
-            cx.fault(span, s"'$written' takes ${quantity(mine.len(), "type argument")} " +
-                     s"(${quoted_names(mine)}), and ${targ_exprs.len()} $were written")
-            return ""
+            if spread.is_none() then return ""
+
+            own = spread.unwrap()
+        else
+            if mine.len() != targ_exprs.len()
+                val were = if targ_exprs.len() == 1 then "was" else "were"
+
+                cx.fault(span, s"'$written' takes ${quantity(mine.len(), "type argument")} " +
+                         s"(${quoted_names(mine)}), and ${targ_exprs.len()} $were written")
+                return ""
+            end if
+
+            // Read against the member's own parameters, as a module function's are.
+            for i in 0..<targ_exprs.len()
+                own.push(member_arg_for(cx, m, home, mine[i], targ_exprs[i], true))
         end if
-
-        // Read against the member's own parameters, as a module function's are.
-        for i in 0..<targ_exprs.len()
-            own.push(member_arg_for(cx, m, home, mine[i], targ_exprs[i], true))
 
         for t in own
             if t == Unknown then return ""
@@ -771,33 +780,38 @@ private written_instantiation(cx: &Analyzer, span: Span, written: string, key: s
         return ""
     end if
 
-    if decl.tparams.len() != targ_exprs.len()
-        var names = ""
-
-        for i in 0..<decl.tparams.len()
-            names = names + (if i == 0 then "" else ", ") + s"'${decl.tparams[i]}'"
-
-        val were = if targ_exprs.len() == 1 then "was" else "were"
-
-        cx.fault(span, s"'$written' takes ${quantity(decl.tparams.len(), "type argument")} " +
-                 s"($names), and ${targ_exprs.len()} $were written")
-        return ""
-    end if
-
-    // A pack stands for a list of types rather than one, so no written argument stands against it.
-    if !decl.tpacks.is_empty()
-        cx.fault(span, s"'${decl.tpacks[0]}' is a type pack, which stands for a list of types " +
-                 "rather than one, so it has no written form here — a declaration taking one has " +
-                 "its instantiation read off the type its address is wanted at")
-        return ""
-    end if
-
     var targs: Buf[Type] = buf()
 
-    // Each argument is read against the parameter it fills, as a call's are: a `const` the
-    // declaration wrote takes a value -- a constant, or arithmetic over one -- and the rest a type.
-    for i in 0..<targ_exprs.len()
-        targs.push(address_arg_for(cx, f, decl.tparams[i], targ_exprs[i]))
+    // A pack takes the run of arguments the other parameters leave, exactly as at a call:
+    // `&count[int, bool]` is the copy whose `A` is those two types.
+    if !decl.tpacks.is_empty()
+        val known = written_pack_list(cx, span, written, decl.tparams, decl.tpacks, targ_exprs,
+                                      (name, e) -> address_arg_for(cx, f, name, e))
+
+        if known.is_none() then return ""
+
+        for tparam in decl.tparams
+            targs.push(bound_type(known.unwrap(), tparam).unwrap_or(Unknown))
+    else
+        if decl.tparams.len() != targ_exprs.len()
+            var names = ""
+
+            for i in 0..<decl.tparams.len()
+                names = names + (if i == 0 then "" else ", ") + s"'${decl.tparams[i]}'"
+
+            val were = if targ_exprs.len() == 1 then "was" else "were"
+
+            cx.fault(span, s"'$written' takes ${quantity(decl.tparams.len(), "type argument")} " +
+                     s"($names), and ${targ_exprs.len()} $were written")
+            return ""
+        end if
+
+        // Each argument is read against the parameter it fills, as a call's are: a `const` the
+        // declaration wrote takes a value -- a constant, or arithmetic over one -- and the rest a
+        // type.
+        for i in 0..<targ_exprs.len()
+            targs.push(address_arg_for(cx, f, decl.tparams[i], targ_exprs[i]))
+    end if
 
     // An argument already refused instantiates nothing, or the body would report every use of
     // its parameter as a name nobody declared.

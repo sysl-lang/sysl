@@ -5,6 +5,9 @@ import sysl.buf.{Buf, buf, byte_sink}
 import sysl.text.{Search, split, str_builder, StrBuilder, parse_real, from_utf8}
 import sysl.fs.{make_temp_dir, remove_dir_all, write_text, read_text}
 import sysl.process.capture
+import sysl.math.bigint.{BigInt, from_u64, to_string as big_text, shl as big_shl, add as big_add,
+                         sub as big_sub, negate as big_negate, cmp as big_cmp, zero as big_zero,
+                         parse as parse_big}
 
 // **A `c const` and a `c type` are questions put to the C compiler, and this is where they are
 // asked** (`reference/ffi.md § c const`). A block is lowered into ordinary declarations before
@@ -28,17 +31,30 @@ private const KindMarker: string = "__sysl_c_type_kind_"
 private const SizeMarker: string = "__sysl_c_type_size_"
 private const ObjMarker: string = "__sysl_c_type_obj_"
 private const CharMarker: string = "__sysl_c_char_signed"
+private const LimbMarker: string = "__sysl_c_limb_"
+private const SignMarker: string = "__sysl_c_sign_"
+
+// The most 64-bit words a whole number is read in, past the one that says whether there is more. No
+// C type this side of `_BitInt` is wider than two, and a declared width wider than this is read to
+// here and refused past it rather than written out as thousands of globals.
+private const MostLimbs: int = 64
 
 // What a `c const`'s written type turns out to be, as far as the file alone can say -- which is all
 // of it for a primitive and half of it for one measured against a `c type` in the same file.
 //
 // **`KnownLater` is a knot untied.** A constant declared at a `c type` is circular against the
 // probe: the global has to be written before clang runs, and how wide it should be written is one of
-// the answers clang is being asked for. So it is carried at the full unsigned width and the same
-// probe's measurement says how to read it.
+// the answers clang is being asked for. A whole number is read at the C expression's own type
+// whatever it is declared at (`probe_text`), so only the range it is held to waits for the same
+// probe's measurement.
+//
+// **`Text` is a string read out of C** -- a `string` (`c_string` unset) or a C string, `*u8`, which
+// is a `c"…"` literal's type. It is not a number at all: what crosses is the address of the
+// literal's bytes, and the bytes are read off the array the IR lays down at that address.
 private enum CDeclared
     KnownNow(bits: int, signed: bool, floating: bool, written: string)
     KnownLater(index: usize, c: string, written: string)
+    Text(c_string: bool, written: string)
 end CDeclared
 
 // One C type as the probe describes it: which integer C says it is, and how wide that is here.
@@ -224,7 +240,7 @@ private measure(a: &Analysis, unit: Program, consts: Buf[CConstDecl], plan: Buf[
         Ok(made) -> made
 
     val src = join_path(dir, "probe.c")
-    val text = probe_text(unit, consts, plan, types)
+    val text = probe_text(unit, consts, plan, types, true)
 
     write_text(src, text) match
         Err(_) ->
@@ -303,11 +319,32 @@ private measure(a: &Analysis, unit: Program, consts: Buf[CConstDecl], plan: Buf[
     args.push("-")
     args.push(src)
 
-    val said = capture(clang, args.view(), "", [], true) match
+    val first = capture(clang, args.view(), "", [], true) match
         Err(_) ->
             remove_dir_all(dir).unwrap_or(())
             return probe_fault(a, unit, where,s"cannot run '$clang'")
         Ok(got) -> got
+
+    // **A refusal is re-asked of the one-global form**, where each expression is written once: the
+    // exact form writes it a dozen times over and clang would say every complaint as often. A probe
+    // that refuses only the exact form keeps that form's words. The lines a complaint names are the
+    // lines of whichever text it was said about (`blamed_span`).
+    val plain = if first.status.ok() || consts.is_empty() then text else probe_text(unit, consts, plan, types, false)
+
+    // **A line the one-global form settles as an address is named as that**: a string literal cast
+    // to an integer is an address constant C accepts there and refuses once it is shifted into words,
+    // so its refusal would otherwise be clang's, about an initializer the reader never wrote.
+    var addressed: Option[usize] = None
+
+    val (said, asked) = if plain == text then (first, text)
+    else write_text(src, plain) match
+        Err(_) -> (first, text)
+        Ok(_) -> capture(clang, args.view(), "", [], true) match
+            Ok(again) ->
+                if again.status.ok() then addressed = address_line(again.text, plan)
+
+                if again.status.ok() then (first, text) else (again, plain)
+            Err(_) -> (first, text)
 
     // The probe's own source is a temporary and is no input of the build -- named by its directory's
     // prefix, since clang may spell the temporary directory through a link the path here does not.
@@ -326,13 +363,16 @@ private measure(a: &Analysis, unit: Program, consts: Buf[CConstDecl], plan: Buf[
     note_files_read(read)
     remove_dir_all(dir).unwrap_or(())
 
+    if addressed.is_some()
+        return probe_fault(a, unit, consts[addressed.unwrap()].span, address_said(consts[addressed.unwrap()]))
+
     if !said.status.ok()
         val complaint = after_search_list(said.err.unwrap_or(""))
 
         // **Pointed at the entry whose expression clang refused**, not the block's first: a block of
         // forty constants with one wrong is otherwise a hunt. A refusal no entry owns -- a header
         // that will not compile -- stays at the first.
-        val blamed = blamed_span(text, complaint, consts, types).unwrap_or(where)
+        val blamed = blamed_span(asked, complaint, consts, types).unwrap_or(where)
 
         return probe_fault(a, unit, blamed, s"the C compiler refused this file's " +
             s"${blocks_named(consts, types)}:\n${complaint.trim()}")
@@ -342,9 +382,22 @@ private measure(a: &Analysis, unit: Program, consts: Buf[CConstDecl], plan: Buf[
     var values: Buf[CGlobal] = buf()
 
     for i in 0..<consts.len()
-        marked(globals, ConstMarker, i) match
+        // A float and a string are one global each; a whole number is its words and its sign.
+        val one_global = plan[i] match
+            KnownNow(_, _, floating, _) -> floating
+            KnownLater(_, _, _) -> false
+            Text(_, _) -> true
+
+        val answer = if one_global then marked(globals, ConstMarker, i)
+        else exact_whole(globals, i, limbs_of(plan[i]))
+
+        answer match
             None -> return silent(a, unit,consts[i].span, s"'${consts[i].c}'")
             Some(g) -> values.push(g)
+
+    // A string line's answer is an address, and what it holds is the array laid down there.
+    for i in 0..<consts.len()
+        if is_text(plan[i]) then values[i] = text_at(said.text, values[i])
 
     var measured: Buf[CMeasured] = buf()
 
@@ -552,24 +605,59 @@ private blocks_named(consts: Buf[CConstDecl], types: Buf[CTypeDecl]) -> string =
 // whatever the typedef turns out to be: `_Generic` wants a complete type and nothing more, so a
 // struct reaches the `default` arm instead of failing to compile, while a cast would have been a C
 // error for exactly the types the refusal is written for.
+//
+// **A whole number is read at the C expression's own type, in 64-bit words** (`exact` set), because
+// no one carrier holds every C value: `UINT64_MAX` is no `long long`, an `unsigned __int128` is no
+// `unsigned long long`, and a cast to either would hand back a different number that may well be in
+// range. So each word is the expression shifted down at its own width (`whole_word`) -- a word past
+// that width is its sign's fill -- and one more global says whether the value is negative and
+// whether anything is left above the words read. The words and that sign are the value exactly, in
+// any width C has, on a target with no `__int128` as on one with. `exact` unset is the one-global form
+// the refusal is re-asked in, so that clang says a bad expression once instead of once per word.
 private probe_text(unit: Program, consts: Buf[CConstDecl], plan: Buf[CDeclared],
-                   types: Buf[CTypeDecl]) -> string
+                   types: Buf[CTypeDecl], exact: bool) -> string
     var out = str_builder()
 
     for item in unit.includes
         out.push(s"#include ${quoted_header(item.header)}\n")
 
     for i in 0..<consts.len()
-        val carrier = plan[i] match
-            KnownNow(bits, signed, floating, _) ->
-                if floating then (if bits == 128 then "long double" else "double")
-                else if signed then "long long" else "unsigned long long"
-            // A constant declared at a `c type` is carried unsigned, because the signedness that
-            // would have chosen the carrier is one of the answers this same probe is being asked
-            // for. Nothing is lost: the IR prints an `i64` bit pattern whichever carrier is written.
-            KnownLater(_, _, _) -> "unsigned long long"
+        val e = consts[i].c
 
-        out.push(s"$carrier $ConstMarker$i = ($carrier)(${consts[i].c});\n")
+        // A string is one global in either form: it is not a number, so it has no words.
+        if is_text(plan[i])
+            out.push(text_global(e, i))
+            continue
+
+        val floating = plan[i] match
+            KnownNow(bits, _, floating, _) ->
+                if floating
+                    val carrier = if bits == 128 then "long double" else "double"
+
+                    out.push(s"$carrier $ConstMarker$i = ($carrier)($e);\n")
+
+                floating
+            KnownLater(_, _, _) -> false
+            Text(_, _) -> false
+
+        if floating then continue
+
+        if !exact
+            out.push(s"unsigned long long $ConstMarker$i = (unsigned long long)($e);\n")
+            continue
+
+        val limbs = limbs_of(plan[i])
+
+        out.push(s"unsigned long long $ConstMarker$i = ${whole_word(e, 0)};\n")
+
+        for k in 1..<limbs
+            out.push(s"unsigned long long $LimbMarker${i}_$k = ${whole_word(e, k)};\n")
+
+        val v = integral(e)
+        val width = s"(sizeof($v) * 8 > ${64 * limbs})"
+        val above = s"($v >> ($width ? ${64 * limbs} : 0))"
+
+        out.push(s"long long $SignMarker$i = ($v < 0) | (($width ? $above != ($v < 0 ? -1 : 0) : 0) << 1);\n")
 
     for i in 0..<types.len()
         val c = types[i].c
@@ -584,6 +672,48 @@ private probe_text(unit: Program, consts: Buf[CConstDecl], plan: Buf[CDeclared],
 
     out.finish()
 end probe_text
+
+private is_text(d: CDeclared) -> bool = d match
+    Text(_, _) -> true
+    _ -> false
+
+// A string line's global: a pointer holding the expression when C says it is a string, and a null
+// one when it is anything else -- so that a macro that is a number, a struct or a float is refused in
+// sysl's words (`text_const`) rather than in a C type error about an initializer.
+//
+// `_Generic` is what tells them apart. A string literal is a `char` array, and an array names its
+// first element where `_Generic` looks at it, so a literal, two literals C joins into one, and a
+// `static const char NAME[]` all reach the `char *` arms; the arms not chosen are never evaluated, so
+// a `42` in them is no error.
+private text_global(e: string, i: usize) -> string =
+    s"const char *$ConstMarker$i = _Generic(($e), char *: ($e), const char *: ($e), " +
+    "default: (const char *)0);\n"
+
+// How many 64-bit words a whole number is read in: enough for the declared width and one more, so a
+// value one step past the type is still read exactly and named in the refusal. A `c type` is at most
+// 64 bits (`integer_kind`), so a line declared at one takes two.
+private limbs_of(d: CDeclared) -> int = d match
+    KnownNow(bits, _, _, _) -> (if bits > 64 * MostLimbs then MostLimbs else (bits + 63) / 64) + 1
+    KnownLater(_, _, _) -> 2
+    Text(_, _) -> 1
+
+// The expression as an integer of its own type, which is what a shift needs. A pointer -- a register
+// address macro, `((GPIO_TypeDef *)0x40020000)` -- is read as its address, and a float truncates as
+// a cast to `long long` would, which is what the line read before it was read exactly.
+// `__builtin_choose_expr` keeps the expression's own type where it already is an integer: a
+// conditional would have converted both arms to a common one.
+private integral(e: string) -> string =
+    s"__builtin_choose_expr(__builtin_classify_type($e) == 5, (unsigned long long)($e), " +
+    s"__builtin_choose_expr(__builtin_classify_type($e) == 8, (long long)($e), ($e)))"
+
+// Word `k` of the expression, at its own width: shifted down where the type reaches that far, and
+// the sign's fill where it does not. The count is itself conditional, so a narrow type never sees a
+// shift past its width even in the arm that is not taken.
+private whole_word(e: string, k: int) -> string
+    val v = integral(e)
+    val reaches = s"(sizeof($v) * 8 > ${64 * k})"
+
+    s"(unsigned long long)($reaches ? $v >> ($reaches ? ${64 * k} : 0) : ($v < 0 ? -1 : 0))"
 
 // The entry the first error clang reported against the probe itself was written for: the probe's
 // line is read off `probe.c:<line>:` and the marker on that line names the entry. An error inside a
@@ -614,7 +744,9 @@ blamed_span(text: string, complaint: string, consts: Buf[CConstDecl], types: Buf
         val written = lines[n - 1]
 
         for i in 0..<consts.len()
-            if written.index_of(s"$ConstMarker$i =").is_some() then return Some(consts[i].span)
+            if (written.index_of(s"$ConstMarker$i =").is_some() || written.index_of(s"$SignMarker$i =").is_some() ||
+                written.index_of(s"$LimbMarker${i}_").is_some())
+                return Some(consts[i].span)
 
         for i in 0..<types.len()
             if (written.index_of(s"$ObjMarker$i;").is_some() || written.index_of(s"$KindMarker$i =").is_some() ||
@@ -687,6 +819,14 @@ private read_globals(ir: string) -> Buf[CGlobal]
         val operand = trimmed_comma(words[at + 2])
 
         if name == CharMarker then out.push(CGlobal(0, "char-signed", operand))
+        else if name.starts_with(LimbMarker)
+            limb_numbers(name[LimbMarker.bytes.len..<name.bytes.len]) match
+                Some(found) -> out.push(CGlobal(found.0, s"limb-${found.1}", operand))
+                None -> ()
+        else if name.starts_with(SignMarker)
+            numbered(name, SignMarker) match
+                Some(n) -> out.push(CGlobal(n, "sign", operand))
+                None -> ()
         else
             numbered(name, ConstMarker) match
                 Some(n) -> out.push(CGlobal(n, ty, operand))
@@ -717,11 +857,147 @@ private marked(globals: Buf[CGlobal], marker: string, index: usize) -> Option[CG
 
     for g in globals
         if g.index == index && g.ty.starts_with(want) && g.ty != "char-signed"
-            if want != "" || (g.ty == "i64" || g.ty == "double" || g.ty == "fp128" || g.ty == "x86_fp80")
+            if (want != "" || g.ty == "i64" || g.ty == "double" || g.ty == "fp128" || g.ty == "x86_fp80" ||
+                g.ty == "ptr")
                 return Some(g)
 
     None
 end marked
+
+// A string line's answer read through its address: the array the IR lays down there, as
+// `CGlobal(index, "chars", <its bytes as LLVM escapes them>)`. An answer that is not the address of
+// a byte array -- a null, which is what a value C does not call a string comes to, or an address into
+// the middle of one -- is handed back as it came, for `text_const` to refuse.
+//
+// LLVM writes the array one of two ways: `[4 x i8] c"abc\00"`, or `[N x i8] zeroinitializer` when
+// every byte is zero (`""` is one of those). The second is written out as the first here, so that one
+// reading serves both.
+private text_at(ir: string, g: CGlobal) -> CGlobal
+    if g.ty != "ptr" || !g.operand.starts_with("@") then return g
+
+    val head = s"${g.operand} = "
+
+    for line in lines_of(ir)
+        if !line.starts_with(head) then continue
+
+        val open = line.index_of("[") match
+            None -> return g
+            Some(at) -> at
+
+        val shape = line[open..<line.bytes.len]
+
+        val close = shape.index_of(" x i8] ") match
+            None -> return g
+            Some(at) -> at
+
+        val count = shape[1..<close]
+        val rest = shape[(close + 7)..<shape.bytes.len]
+
+        if rest.starts_with("zeroinitializer")
+            var zeros = str_builder()
+
+            for _ in 0..<number_of(count, 10)
+                zeros.push("\\00")
+
+            return CGlobal(g.index, "chars", zeros.finish())
+
+        if !rest.starts_with("c\"") then return g
+
+        // LLVM escapes a `"` as `\22`, so the first quote after the opening one closes it.
+        val body = rest[2..<rest.bytes.len]
+
+        return body.index_of("\"") match
+            None -> g
+            Some(end_at) -> CGlobal(g.index, "chars", body[0..<end_at])
+
+    g
+end text_at
+
+// The bytes of an array as LLVM escapes them: `\\` is a backslash, `\` and two hex digits is one
+// byte, and every other byte stands for itself.
+private unescaped(text: string) -> Buf[u8]
+    var out: Buf[u8] = buf()
+    val b = text.bytes
+    var i: usize = 0
+
+    while i < b.len
+        if b[i] == u8('\\') && i + 1 < b.len && b[i + 1] == u8('\\')
+            out.push(b[i])
+            i += 2
+        else if b[i] == u8('\\') && i + 2 < b.len && hex_digit(b[i + 1]).is_some() && hex_digit(b[i + 2]).is_some()
+            out.push(hex_digit(b[i + 1]).unwrap() * 16 + hex_digit(b[i + 2]).unwrap())
+            i += 3
+        else
+            out.push(b[i])
+            i += 1
+
+    out
+end unescaped
+
+private hex_digit(c: u8) -> Option[u8] =
+    if c >= u8('0') && c <= u8('9') then Some(c - u8('0'))
+    else if c >= u8('A') && c <= u8('F') then Some(c - u8('A') + 10)
+    else if c >= u8('a') && c <= u8('f') then Some(c - u8('a') + 10)
+    else None
+
+// `3_2` -- which line a word answers for, and which word of it it is.
+private limb_numbers(rest: string) -> Option[(usize, int)]
+    val under = rest.index_of("_") match
+        None -> return None
+        Some(at) -> at
+
+    val line = numbered(rest[0..<under], "")
+    val word = numbered(rest[(under + 1)..<rest.bytes.len], "")
+
+    if line.is_none() || word.is_none() then return None
+
+    Some((line.unwrap(), int(word.unwrap())))
+end limb_numbers
+
+// One whole number put back together from its words and its sign (`probe_text`), as the decimal it
+// is -- signed, and at whatever width it came to. Past the words read it is `wide`, which is out of
+// range of the type it was asked for by construction and is refused as that.
+private exact_whole(globals: Buf[CGlobal], index: usize, limbs: int) -> Option[CGlobal]
+    var words: Buf[Option[u64]] = buf()
+
+    for k in 0..<limbs
+        words.push(None)
+
+    var sign: Option[i64] = None
+
+    for g in globals
+        if g.index != index then continue
+
+        // A word that is a constant expression rather than digits -- `ptrtoint (ptr @.str to i64)` --
+        // is an address only the linker knows, and no number at all here.
+        if (g.ty == "sign" || g.ty == "i64" || g.ty.starts_with("limb-")) && !decimal_shaped(g.operand)
+            return Some(CGlobal(index, "address", g.operand))
+
+        if g.ty == "sign" then sign = Some(decimal_of(g.operand))
+        else if g.ty == "i64" then words[0] = Some(u64.wrap(decimal_of(g.operand)))
+        else if g.ty.starts_with("limb-")
+            val k = int(number_of(g.ty[5..<g.ty.bytes.len], 10))
+
+            if k > 0 && k < limbs then words[k] = Some(u64.wrap(decimal_of(g.operand)))
+
+    if sign.is_none() then return None
+
+    var value = big_zero()
+
+    for k in 0..<limbs
+        if words[k].is_none() then return None
+
+        value = big_add(value, big_shl(from_u64(words[k].unwrap()), usize(64 * k)))
+
+    val flags = sign.unwrap()
+
+    if flags & 2 != 0 then return Some(CGlobal(index, "wide", s"${64 * limbs}"))
+
+    // Two's complement over the words read: a negative value's words are its sign's fill on top.
+    if flags & 1 != 0 then value = big_sub(value, big_shl(from_u64(1), usize(64 * limbs)))
+
+    Some(CGlobal(index, "whole", big_text(value)))
+end exact_whole
 
 private probe_words(line: string) -> Buf[string]
     var out: Buf[string] = buf()
@@ -745,8 +1021,8 @@ private trimmed_comma(word: string) -> string =
     if word.ends_with(",") then word[0..<(word.bytes.len - 1)] else word
 
 // One decimal operand as a number. LLVM prints an `i64` as a signed decimal whatever the C type was,
-// so an unsigned value past the signed ceiling comes back negative and is reinterpreted where it is
-// read rather than here.
+// so a word with its top bit set comes back negative and is reinterpreted where it is read
+// (`exact_whole`) rather than here.
 //
 // A negative is accumulated downward, because the magnitude of `i64`'s minimum is not an `i64`.
 private decimal_of(text: string) -> i64
@@ -776,9 +1052,20 @@ private declared_type(a: &Analysis, unit: Program, c: CConstDecl,
     var written_ref = c.typ
 
     loop
+        // A string, or a C string -- `*u8`, which is what a `c"…"` literal is.
+        val pointee = *written_ref.kind match
+            PtrType(inner, _) -> *inner.kind match
+                NamedType(n, args) -> if args.is_empty() then n else ""
+                _ -> ""
+            _ -> ""
+
+        if pointee == "u8" || pointee == "byte" then return Text(true, type_text(c.typ))
+
         val name = *written_ref.kind match
             NamedType(n, args) -> if args.is_empty() then n else ""
             _ -> ""
+
+        if name == "string" then return Text(false, type_text(c.typ))
 
         if name == ""
             return not_a_number(a, at, c)
@@ -829,10 +1116,9 @@ private declared_type(a: &Analysis, unit: Program, c: CConstDecl,
 end declared_type
 
 private not_a_number(a: &Analysis, at: Scope, c: CConstDecl) -> CDeclared
-    a.fault(at, c.span, s"'${type_text(c.typ)}' is not a number, and a 'c const' " +
-            "reads a number — the value is read back out of the C compiler's own output, where a " +
-            "number is a number and a string is a block of storage. A string from C is not written " +
-            "this way")
+    a.fault(at, c.span, s"'${type_text(c.typ)}' is not a number or a string, and a 'c const' " +
+            "reads a number, a 'string' or a C string ('*u8') — the three things the C compiler's " +
+            "own output states whole")
     KnownNow(32, true, false, type_text(c.typ))
 
 // Narrower than the widths a C constant expression is written at, and narrow enough that rounding
@@ -891,6 +1177,15 @@ private measured_const(a: &Analysis, home: Scope, c: CConstDecl, d: CDeclared,
                             s"'$c_type', which is not an integer here, and a 'c const' reads an " +
                             "integer")
                     return held(c, expr(c.span, IntLit("0", 10, "")))
+        Text(c_string, written) -> return text_const(a, home, c, c_string, written, raw)
+
+    // **An address is not a number this line can be given**, though C converts one to an integer
+    // without a word: a string literal cast to `unsigned long long` settles as the literal's address,
+    // which the IR writes as `ptrtoint (ptr @.str to i64)` -- a value the linker decides, not one the
+    // probe can read (`exact_whole` answers `address` for it). Read as digits it was a silent 0.
+    if !kind.2 && raw.ty == "address"
+        a.fault(home, c.span, address_said(c))
+        return held(c, expr(c.span, IntLit("0", 10, "")))
 
     if kind.2 then fraction(a, home, c, kind.0, kind.3, raw) else whole(a, home, c, kind.0, kind.1, kind.3, raw)
 end measured_const
@@ -900,49 +1195,132 @@ end measured_const
 private held(c: CConstDecl, value: Expr) -> Stmt =
     stmt(c.span, ConstDecl(c.name, Some(c.typ), value, c.vis, None))
 
+private address_said(c: CConstDecl) -> string =
+    s"'${c.c}' is an address here rather than a number, and a 'c const' reads the number a " +
+    "constant expression comes to — a string from C is read by declaring the line 'string' or '*u8'"
+
+// The first whole-number line the one-global form (`probe_text`'s `exact` unset) settled as an
+// address -- `ptrtoint (ptr @.str to i64)` -- rather than as digits.
+private address_line(ir: string, plan: Buf[CDeclared]) -> Option[usize]
+    val globals = read_globals(ir)
+
+    for i in 0..<plan.len()
+        val whole = plan[i] match
+            KnownNow(_, _, floating, _) -> !floating
+            KnownLater(_, _, _) -> true
+            Text(_, _) -> false
+
+        if !whole then continue
+
+        marked(globals, ConstMarker, i) match
+            Some(g) -> if g.ty == "i64" && !decimal_shaped(g.operand) then return Some(i)
+            None -> ()
+
+    None
+end address_line
+
+// Whether an operand is the decimal LLVM prints for an integer, rather than a constant expression
+// such as `ptrtoint`.
+private decimal_shaped(text: string) -> bool
+    val b = text.bytes
+    val from: usize = if b.len > 0 && b[0] == u8('-') then 1 else 0
+
+    if b.len <= from then return false
+
+    for i in from..<b.len
+        if b[i] < u8('0') || b[i] > u8('9') then return false
+
+    true
+end decimal_shaped
+
+// One measured string. A `string` becomes a `const` holding the literal; a C string becomes a module
+// `val` holding the `c"…"` literal, since a pointer is no `const` -- and a `val` over a `c"…"` is
+// constant data (`reference/ffi.md § What constant data is`), laid down as the literal's address on
+// a bare machine as anywhere.
+//
+// **The whole literal is the value**, every byte of it up to the terminator C adds: `"a\0b"` is three
+// bytes in a `string`, which has a length and keeps them. A C string has no length and would end at
+// the first NUL, so one there is refused rather than cut short, as a `c"…"` literal's own is.
+private text_const(a: &Analysis, at: Scope, c: CConstDecl, c_string: bool, written: string,
+                   raw: CGlobal) -> Stmt
+    val empty = text_held(c, c_string, "")
+
+    if raw.ty != "chars"
+        val why = if raw.operand == "null" then "is not a string in C" else "is not the start of a string here"
+
+        a.fault(at, c.span, s"'${c.c}' $why, and this line reads one as '$written' — a string " +
+                "literal, literals C joins into one, or a macro or a 'char' array that is one")
+        return empty
+
+    val bytes = unescaped(raw.operand)
+
+    // The terminator C adds to every literal, which is C's and not part of the value.
+    val n = if !bytes.is_empty() && bytes[bytes.len() - 1] == 0 then bytes.len() - 1 else bytes.len()
+
+    val text = from_utf8(bytes.view()[0..<n]) match
+        Err(_) ->
+            a.fault(at, c.span, s"'${c.c}' is not UTF-8 here, and a '$written' read from C " +
+                    "holds UTF-8 as every sysl string does")
+            return empty
+        Ok(found) -> found
+
+    var nul = false
+
+    for i in 0..<n
+        if bytes[i] == 0 then nul = true
+
+    if c_string && nul
+        a.fault(at, c.span, s"'${c.c}' holds a NUL before its end, where a C string would stop — " +
+                "a '*u8' cannot carry it; a 'string' keeps every byte")
+        return empty
+
+    text_held(c, c_string, text)
+end text_const
+
+private text_held(c: CConstDecl, c_string: bool, text: string) -> Stmt
+    if !c_string then return held(c, expr(c.span, StrLit(text)))
+
+    stmt(c.span, ValDecl(c.name, Some(c.typ), expr(c.span, CStrLit(text)), c.vis, None, None, OneCopy, None))
+
 // One measured whole number, held to the range of the type it was asked for.
 //
 // A value out of range is the mistake this feature exists to catch, arriving one step earlier than
 // it used to: a macro read into a `u16` is the transcription error made against the real number
 // instead of against a remembered one. The message quotes both the C and the value, because neither
 // alone tells the reader which end was wrong.
+//
+// **The value is C's own, exactly, at its own type** (`exact_whole`), so what is checked is the
+// number the header means: `UINT64_MAX` is 18446744073709551615 whatever line reads it, `-1` is -1
+// and no `u64` holds it, while `-1u` is C's 4294967295 and a `u32` does.
 private whole(a: &Analysis, at: Scope, c: CConstDecl, bits: int, signed: bool, name: string,
               raw: CGlobal) -> Stmt
-    if raw.ty != "i64"
+    val low = min_of(bits, signed)
+    val high = max_of(bits, signed)
+
+    if raw.ty == "wide"
+        a.fault(at, c.span, s"'${c.c}' is wider than ${raw.operand} bits here, which '$name' cannot " +
+                s"hold — it holds ${big_text(low)} to ${big_text(high)}")
+        return held(c, expr(c.span, IntLit("0", 10, "")))
+
+    val value = if raw.ty == "whole" then parse_big(raw.operand) else None
+
+    if value.is_none()
         a.fault(at, c.span, s"the C compiler answered for '${c.c}' with a " +
                 s"'${raw.ty}', and this line asks for a whole number")
         return held(c, expr(c.span, IntLit("0", 10, "")))
 
-    val printed = decimal_of(raw.operand)
+    val v = value.unwrap()
 
-    if signed
-        // The whole of `i64` is in range at 64 bits, so only a narrower width has anything to check.
-        if bits < 64
-            val high = (1 << (i64(bits) - 1)) - 1
-            val low = -(1 << (i64(bits) - 1))
+    if big_cmp(v, low) < 0 || big_cmp(v, high) > 0
+        return out_of_range(a, at, c, raw.operand, name, big_text(low), big_text(high))
 
-            if printed < low || printed > high
-                return out_of_range(a, at, c, s"$printed", name, s"$low", s"$high")
+    // A negative is written as the negation of its magnitude, which a minimum's literal is held to
+    // as the rest are.
+    if big_cmp(v, big_zero()) >= 0 then return held(c, expr(c.span, IntLit(raw.operand, 10, "")))
 
-        // The magnitude is taken as a `u64`, which holds `i64`'s minimum where `-printed` would not.
-        val digits = if printed < 0 then s"${0 -% u64.wrap(printed)}" else s"$printed"
-        val lit = expr(c.span, IntLit(digits, 10, ""))
+    val lit = expr(c.span, IntLit(big_text(big_negate(v)), 10, ""))
 
-        return held(c, if printed < 0 then expr(c.span, Unary("-", lit)) else lit)
-    end if
-
-    // **The IR prints an `i64` as a signed decimal whatever the C type was**, so an unsigned value
-    // past the signed ceiling comes back negative. Reinterpreting the bits (`unsigned_bits`) is what reads it back as
-    // the number the header meant; a genuinely negative value asked for as unsigned survives that
-    // and is refused by the range check below.
-    val value = unsigned_bits(printed)
-
-    if bits < 64
-        val high = u64((1 << i64(bits)) - 1)
-
-        if value > high then return out_of_range(a, at, c, s"$value", name, "0", s"$high")
-
-    held(c, expr(c.span, IntLit(s"$value", 10, "")))
+    held(c, expr(c.span, Unary("-", lit)))
 end whole
 
 private out_of_range(a: &Analysis, at: Scope, c: CConstDecl, value: string, name: string, low: string,

@@ -1,0 +1,544 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// An object whose box has nothing in it to tear down dies without the reaper (`emit_arc.sysl`'s
+// `arc_value` and `gen_push` with `queued` false, writing `arc.release.<T>`), and the reaper itself has
+// a symbol a profile can charge (`arc_runtime.sysl`'s `arc.reap`, `internal`).
+//
+// Before, every release that reached zero outside a drain went through `arc.reap`: a thread-local ask
+// for the slot, a push onto the worklist, an indirect call to the hook to walk nothing and a second
+// to free -- and the reaper, `private`, was a temporary label, so a profile charged all of it to
+// whatever function preceded it.
+//
+// The cells. The text: a payload holding nothing has its own release, which compares the hook with
+// the shared plain hook, reads the weak count, frees directly, and otherwise starts the reaper -- with
+// no thread-local ask and no indirect call of its own; an enum with an empty variant tests the tag; a
+// type with a destructor and a type holding a reference keep the generic release; a `&sync`, a trait
+// object and a weak reference keep theirs; `arc.reap` is `internal` and its symbol is in the object;
+// clang takes the text on every hosted machine, a freestanding one and a switching program. The
+// behaviour at `-O2` on a counted heap, where a leak or a second free is a failure: plain boxes
+// dropped by the hundred thousand; a weak reference to a plain box outliving its last share; a
+// destructor that makes and drops plain boxes and holds others, run inside the drain; a plain box laid
+// in a frame; trait objects of a plain type; a chain of a million links each holding a plain box; and
+// four threads each tearing down their own chains at once, every thread's reaper its own.
+//
+// Cells skipped, with the reason: a box crossing `build-c` -- an archive carries the runtime of the
+// compiler that built it, and its hook is not this module's, so its release starts the reaper as
+// before; a plain box made in one codegen unit and released in another -- each unit has its own copy
+// of the plain hook, so the comparison fails and the reaper runs, which is the old cost, not a fault.
+
+private val rfp_kinds: string = raw"""
+    struct Point
+        x: int
+        y: int
+
+    struct Res
+        name: string
+
+    impl Drop for Res
+        drop(self) = print("drop " + self.name)
+
+    struct Link
+        n: int
+        next: Option[&Link]
+
+    enum Tree
+        Leaf
+        Node(left: &Tree, right: &Tree)
+
+    trait Shape
+        area(self) -> int
+
+    impl Shape for Point
+        area(self) -> int = self.x * self.y
+
+    keep(p: &Point) -> &Point = p
+
+    main()
+        val p: &Point = keep(Point(1, 2))
+        val wp: weak Point = p
+        val r: &Res = Res("r")
+        val wr: weak Res = r
+        val l: &Link = Link(1, None)
+        val wl: weak Link = l
+        val t: &Tree = Node(Leaf, Leaf)
+        val wt: weak Tree = t
+        val s: &Shape = Point(3, 4)
+        val q: &sync Point = Point(5, 6)
+
+        print(p.x, l.n, s.area(), q.x)
+    """
+
+private var rfp_library_names: Buf[string] = buf()
+private var rfp_library_units: Buf[Buf[Program]] = buf()
+
+private rfp_library(t: Target) -> Buf[Program]
+    for i in 0..<rfp_library_names.len()
+        if rfp_library_names[i] == t.name then return rfp_library_units[i]
+
+    var out: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, t) match
+            Err(_) -> ()
+            Ok(units) -> out = units
+
+    rfp_library_names.push(t.name)
+    rfp_library_units.push(out)
+    out
+end rfp_library
+
+private rfp_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the standard module's source or clang is not on this machine")
+        return false
+
+    true
+end rfp_ready
+
+// The LLVM text a program lowers to on `machine`.
+private rfp_ir(text: string, machine: string) -> string
+    val t = target_named(machine).unwrap()
+    var units: Buf[Program] = buf()
+
+    for item in rfp_library(t)
+        units.push(item)
+
+    val parsed = parse(source_of("main.sysl", text), t)
+
+    if !parsed.ok() then assert(false, parsed.first().message)
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, t)
+
+    assert(done.reported.is_empty(), s"refused on $machine")
+
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+
+    assert(errors_of(done.an.diagnostics()).is_empty(), s"refused on $machine")
+    ir_print_module(codegen_with_gaps(prune(strip_tests(whole), program_own(units)), t, promotions).0)
+end rfp_ir
+
+// What clang makes of `ir` for `machine` at `-O2`: an object when `object` says so, the optimized
+// text otherwise. `nm` of the object, when asked for, is what comes back.
+private rfp_clang(ir: string, machine: string, symbols: bool) -> string
+    val dir = make_temp_dir("sysl-rfp").unwrap()
+    val file = s"$dir/t.ll"
+    val obj = s"$dir/t.o"
+
+    write_text(file, ir).unwrap()
+
+    val triple = "--target=" + target_named(machine).unwrap().triple
+    val got = if symbols then
+        capture("clang", [triple, "-O2", "-c", "-Wno-override-module", file, "-o", obj], "", [], true).unwrap()
+    else capture("clang", [triple, "-O2", "-S", "-emit-llvm", "-Wno-override-module", file, "-o", "-"],
+                 "", [], true).unwrap()
+
+    if !got.status.ok()
+        remove_dir_all(dir).unwrap_or(())
+        assert(false, s"clang refused the emitted IR for $machine:\n${got.err.unwrap_or("")}")
+
+    var out = got.text
+
+    if symbols then out = capture("nm", [obj], "", [], true).unwrap().text
+
+    remove_dir_all(dir).unwrap_or(())
+    out
+end rfp_clang
+
+// The lines of the definition of `@name`, up to its closing brace.
+private rfp_body(text: string, name: string) -> string
+    var body = ""
+    var inside = false
+
+    for l in lines_of(text)
+        if !inside && l.starts_with("define") && l.contains(s"@$name(") then inside = true
+
+        if inside
+            if l == "}" then return body
+
+            body = body + l + "\n"
+        end if
+
+    body
+end rfp_body
+
+private rfp_count(text: string, what: string) -> int
+    var n = 0
+
+    for l in lines_of(text)
+        if l.contains(what) then n += 1
+
+    n
+end rfp_count
+
+// -- the emitted text ------------------------------------------------------------------------------------
+
+@test("a plain payload's own release frees directly, with no thread-local ask and no indirect call")
+rfp_plain_release_frees_directly()
+    if !rfp_ready() then return
+
+    val out = rfp_ir(rfp_kinds, "aarch64-macos")
+    val release = rfp_body(out, "arc.release.Point")
+
+    assert(release.contains("define private void @arc.release.Point(ptr %p)"), out)
+    assert(release.contains("icmp eq ptr %p, null"), release)
+    assert(release.contains("sub i64"), release)
+    assert(release.contains(", @arc.drop.plain"), release)
+    assert(release.contains("getelementptr %arc.Point, ptr %p, i32 0, i32 2"), release)
+    assert_eq(rfp_count(release, "call void @free(ptr %p)"), 1, release)
+    assert_eq(rfp_count(release, "call void @arc.reap(ptr %p)"), 1, release)
+    assert_eq(rfp_count(release, "load i32"), 0, release)
+    assert_eq(rfp_count(release, "threadlocal"), 0, release)
+    assert_eq(rfp_count(release, "arc.reaper"), 0, release)
+    assert_eq(rfp_count(release, "call void %"), 0, release)
+    assert_eq(rfp_count(release, "%slot"), 0, release)
+    assert(rfp_body(out, "$$main").contains("call void @arc.release.Point(ptr %"), out)
+end rfp_plain_release_frees_directly
+
+@test("an enum with an empty variant frees only that variant directly")
+rfp_enum_reads_the_tag()
+    if !rfp_ready() then return
+
+    val release = rfp_body(rfp_ir(rfp_kinds, "aarch64-macos"), "arc.release.Tree")
+
+    assert(release.contains(", @arc.drop.Tree"), release)
+    assert_eq(rfp_count(release, "icmp eq i32"), 1, release)
+    assert_eq(rfp_count(release, "call void @arc.reap(ptr %p)"), 1, release)
+end rfp_enum_reads_the_tag
+
+@test("a type with a destructor, or holding a reference, keeps the generic release and the reaper")
+rfp_drop_and_refs_keep_the_reaper()
+    if !rfp_ready() then return
+
+    val out = rfp_ir(rfp_kinds, "aarch64-macos")
+
+    assert(!out.contains("@arc.release.Res("), out)
+    assert(!out.contains("@arc.release.Link("), out)
+    assert(rfp_count(rfp_body(out, "$$main"), "call void @arc.release(ptr %") >= 2, out)
+end rfp_drop_and_refs_keep_the_reaper
+
+@test("a &sync, a trait object and a weak reference keep their own release")
+rfp_other_kinds_keep_their_release()
+    if !rfp_ready() then return
+
+    val main = rfp_body(rfp_ir(rfp_kinds, "aarch64-macos"), "$$main")
+
+    assert(main.contains("call void @arc.release_sync(ptr %"), main)
+    assert(main.contains("call void @arc.weak_release(ptr %"), main)
+    // `p`'s release is the typed one; the trait object `s` of the same payload is let go of without
+    // its type, so a generic release is there for it beside `r`'s and `l`'s.
+    assert(rfp_count(main, "call void @arc.release.Point(ptr %") >= 1, main)
+    assert_eq(rfp_count(main, "call void @arc.release(ptr %"), 3, main)
+end rfp_other_kinds_keep_their_release
+
+@test("arc.reap is internal, so the object carries a symbol a profile can charge")
+rfp_reap_has_a_symbol()
+    if !rfp_ready() then return
+
+    val out = rfp_ir(rfp_kinds, "aarch64-macos")
+
+    assert(out.contains("define internal void @arc.reap(ptr %p) noinline cold {"), out)
+
+    val syms = rfp_clang(out, "aarch64-macos", true)
+
+    assert(syms.contains(" _arc.reap\n"), syms)
+end rfp_reap_has_a_symbol
+
+@test("clang takes the text on every hosted machine, a freestanding one, and a switching program")
+rfp_clang_takes_every_machine()
+    if !rfp_ready() then return
+
+    for machine in ["aarch64-macos", "x86_64-linux", "aarch64-linux", "x86_64-windows", "wasm32-wasi"]
+        rfp_clang(rfp_ir(rfp_kinds, machine), machine, false)
+
+    val bare = rfp_ir(raw"""
+        struct Point
+            x: int
+
+        struct Link
+            p: &Point
+            next: Option[&Link]
+
+        keep(p: &Point) -> &Point = p
+
+        main()
+            val p: &Point = keep(Point(1))
+            val w: weak Point = p
+            val l: &Link = Link(p, None)
+            val wl: weak Link = l
+        """, "aarch64-freestanding")
+
+    assert_eq(rfp_count(rfp_body(bare, "arc.release.Point"), "__sysl_arc_reaper"), 0, bare)
+    rfp_clang(bare, "aarch64-freestanding", false)
+
+    val switching = rfp_ir(raw"""
+        import sysl.fiber.{Context, Stack, switch}
+
+        struct Point
+            x: int
+
+        struct Hop
+            back: Context
+            me: Context
+
+        hop(h: *Hop)
+            loop
+                switch(&h.me, &h.back)
+
+        main()
+            val s = Stack.reserve(64 * 1024).unwrap()
+            val h: &Hop = Hop(Context.new(), Context.new())
+            val p: &Point = Point(1)
+            val w: weak Point = p
+
+            h.me = Context.start(s, &hop, &*h)
+            switch(&h.back, &h.me)
+            print("back", p.x)
+        """, "aarch64-macos")
+
+    assert(switching.contains("call void @arc.release.Point(ptr %"), switching)
+    rfp_clang(switching, "aarch64-macos", false)
+end rfp_clang_takes_every_machine
+
+// -- the behaviour at -O2 ---------------------------------------------------------------------------------
+
+private struct RfpRun
+    out: string
+    err: string
+    code: int
+
+// What a program prints at `-O2` on a counted heap: its output, its standard error (where a leak is
+// reported) and its status.
+private rfp_run(program: string) -> RfpRun
+    val root = make_temp_dir("sysl-rfp-run").unwrap()
+
+    write_text(s"$root/main.sysl", program).unwrap()
+
+    val exe = s"$root/built"
+
+    force_alloc_counting(true)
+
+    val made = build_native_program(s"$root/main.sysl", None, None, "2", Some(exe))
+
+    force_alloc_counting(false)
+
+    made match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return RfpRun(failure_text(why), "", -1)
+        Ok(_) -> ()
+
+    val ran = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    ran match
+        Err(_) -> RfpRun("the program that was built could not be run", "", -1)
+        Ok(o) -> RfpRun(o.text, o.err.unwrap_or(""), shell_status(o.status))
+end rfp_run
+
+private rfp_prints(program: string, want: string)
+    if !rfp_ready() then return
+
+    val got = rfp_run(program)
+
+    assert_eq(got.out, want)
+    assert_eq(got.err, "")
+    assert_eq(got.code, 0)
+end rfp_prints
+
+@test("at -O2 plain boxes die by the hundred thousand with nothing left over")
+rfp_many_plain_at_o2()
+    rfp_prints(raw"""
+        struct Point
+            x: int
+            y: int
+
+        make(i: int) -> &Point = Point(i, i + 1)
+
+        run() -> int
+            var sum = 0
+            val kept: &Point = make(0)
+            val w: weak Point = kept
+
+            for i in 0..<200000
+                val p = make(i)
+                sum += p.y - p.x
+
+            sum
+
+        print(run())
+        """, "200000\n")
+
+@test("at -O2 a weak reference to a plain box outlives its last share, and reads as gone after")
+rfp_weak_plain_at_o2()
+    rfp_prints(raw"""
+        struct Point
+            x: int
+
+        run() -> weak Point
+            val p: &Point = Point(7)
+            val w: weak Point = p
+
+            print(w.get().unwrap().x)
+            w
+
+        val w = run()
+
+        print(if w.get() == None then "gone" else "alive")
+        """, "7\ngone\n")
+
+@test("at -O2 a destructor that holds plain boxes and makes and drops more runs in order")
+rfp_destructor_releases_plain_at_o2()
+    rfp_prints(raw"""
+        struct Point
+            x: int
+
+        struct Res
+            name: string
+            a: &Point
+            b: &Point
+
+        impl Drop for Res
+            drop(self)
+                val tmp: &Point = Point(self.a.x + self.b.x)
+                val w: weak Point = tmp
+
+                print("drop " + self.name, tmp.x)
+
+        struct Pair
+            left: &Res
+            right: &Res
+
+        run()
+            val shared: &Point = Point(1)
+            val w: weak Point = shared
+            val p: &Pair = Pair(Res("l", shared, Point(2)), Res("r", Point(3), shared))
+
+            print("made", p.left.a.x)
+
+        run()
+        print("end")
+        """, "made 1\ndrop l 3\ndrop r 4\nend\n")
+
+@test("at -O2 trait objects and a frame-laid box of a plain type come apart")
+rfp_trait_and_frame_at_o2()
+    rfp_prints(raw"""
+        trait Shape
+            area(self) -> int
+
+        struct Rect
+            w: int
+            h: int
+
+        impl Shape for Rect
+            area(self) -> int = self.w * self.h
+
+        local() -> int
+            val r: &Rect = Rect(2, 5)
+
+            r.w * r.h
+
+        run() -> int
+            var total = 0
+
+            for i in 0..<1000
+                val s: &Shape = Rect(i, 2)
+                val r: &Rect = Rect(1, i)
+                val w: weak Rect = r
+
+                total += s.area() + r.area() + local()
+
+            total
+
+        print(run())
+        """, "1508500\n")
+
+@test("at -O2 a chain of a million links, each holding a plain box, comes apart without a stack overflow")
+rfp_deep_at_o2()
+    rfp_prints(raw"""
+        struct Point
+            x: int
+
+        struct Link
+            n: int
+            p: &Point
+            next: Option[&Link]
+
+        run()
+            var head: Option[&Link] = None
+            val first: &Point = Point(0)
+            val w: weak Point = first
+
+            for i in 0..<1000000
+                head = Some(Link(i, Point(i), head))
+
+            print("built")
+
+        run()
+        print("done")
+        """, "built\ndone\n")
+
+@test("at -O2 four threads tear down their own chains at once, each with its own reaper")
+rfp_threads_at_o2()
+    rfp_prints(raw"""
+        import sysl.threads.spawn
+
+        struct Point
+            x: int
+
+        struct Link
+            n: int
+            p: &Point
+            next: Option[&Link]
+
+        struct Job
+            seed: int
+            sum: int
+
+        work(j: *Job) -> unit
+            for round in 0..<20
+                var head: Option[&Link] = None
+
+                for i in 0..<20000
+                    val q: &Point = Point(i)
+                    val w: weak Point = q
+
+                    head = Some(Link(i, Point(j.seed), head))
+                    j.sum += q.x - i
+
+                head match
+                    Some(l) -> j.sum += l.p.x
+                    None -> ()
+
+        run()
+            val j0: &sync Job = Job(1, 0)
+            val j1: &sync Job = Job(2, 0)
+            val j2: &sync Job = Job(3, 0)
+            val j3: &sync Job = Job(4, 0)
+
+            val t0 = spawn(&work, &*j0).unwrap()
+            val t1 = spawn(&work, &*j1).unwrap()
+            val t2 = spawn(&work, &*j2).unwrap()
+            val t3 = spawn(&work, &*j3).unwrap()
+
+            t0.join()
+            t1.join()
+            t2.join()
+            t3.join()
+
+            for j in [j0, j1, j2, j3]
+                print(j.sum)
+
+        run()
+        print("end")
+        """, "20\n40\n60\n80\nend\n")
