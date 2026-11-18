@@ -137,6 +137,52 @@ pattern_bind(e: *Emit, p: TPattern, value: Val) -> unit = p match
 
     _ -> ()
 
+// A pattern's bindings made out of the enum at `at` rather than out of a loaded value: the variant's
+// payload is read straight from the local, with no copy of the whole enum to read it out of. Only the
+// shapes `binds_shallow` admits reach here.
+private bind_through(e: *Emit, p: TPattern, at: Val) -> unit = p match
+    TVariantPattern(enum_ty, variant, args) ->
+        if any_binds(args)
+            val d = enum_decl(enum_ty).unwrap()
+            val payload = fresh_reg(e)
+
+            emit(e, InLoad(payload, variant_lty(d, variant), payload_ptr(e, d, at), AccPlain, None))
+
+            for i in 0..<args.len()
+                pattern_bind(e, args[i], payload_field(e, d, variant, payload, i))
+        end if
+    _ -> ()
+
+// Whether every arm is one pattern -- `_`, or a variant whose fields are each bound by a name or let
+// go -- with no guard: what a `match` that reads a local through its address can bind.
+private binds_shallow(arms: Buf[TArm]) -> bool
+    for arm in arms
+        if arm.guard.is_some() || arm.patterns.len() != 1 then return false
+
+        arm.patterns[0] match
+            TWildPattern(_) -> ()
+            TVariantPattern(_, _, args) ->
+                for item in args
+                    item match
+                        TBindPattern(_, _) -> ()
+                        TWildPattern(_) -> ()
+                        _ -> return false
+            _ -> return false
+
+    true
+end binds_shallow
+
+// The tag of the enum at `at`, as the first slot of an otherwise empty value of its type -- the one
+// word a tag switch reads (`load_held` makes the same value).
+private tag_held(e: *Emit, d: &EnumType, at: Val) -> Val
+    val tag = fresh_reg(e)
+    val r = fresh_reg(e)
+
+    emit(e, InLoad(tag, l_i32(), at, AccPlain, None))
+    emit(e, InInsert(r, enum_lty(d), VPoison, l_i32(), tag, index_list(0)))
+    r
+end tag_held
+
 // One field of a variant's payload, or nothing where the field is zero-sized -- the same skipping
 // the layout does, seen from the reading side.
 private payload_field(e: *Emit, d: &EnumType, v: EnumVariant, payload: Val, i: usize) -> Val
@@ -216,6 +262,30 @@ gen_match(e: *Emit, scrutinee: TExpr, arms: Buf[TArm], ty: Type, into: Option[Va
     val moving = e.layout.indirect(sty) && any_moves(e, arms, into.is_some())
     var sv: Val = VNothing
     var at: Option[Val] = held
+
+    // **A local switched on by its tag is read through its address** where every arm binds at most
+    // a variant's fields: the tag is the one word loaded, and each arm reads its own payload out of
+    // the local. Loaded whole, the value was copied once for the `match` and again into a slot for
+    // the payload to be read from -- in an unoptimized build two stack slots the size of the enum for
+    // every `match`, which an `x.(c)` walk over the variants makes once per variant.
+    if held.is_none() && is_load(scrutinee) && binds_shallow(arms)
+        enum_decl(sty) match
+            Some(d) ->
+                if !d.simple
+                    tag_switch(arms) match
+                        Some(dispatch) ->
+                            val h = address(e, scrutinee)
+                            val tag = tag_held(e, d, h)
+                            val done_l = fresh_label(e, "match.end")
+                            val merge = merge_for(e, ty, into, in_place)
+
+                            gen_tag_switch(e, dispatch, tag, Some(h), ty, merge, done_l, true)
+                            emit_label(e, done_l)
+                            ends_nowhere(e, ty)
+                            return merged_value(e, merge, ty)
+                        None -> ()
+                end if
+            None -> ()
 
     held match
         Some(h) -> sv = load_held(e, h, sty, arms, into.is_some())
@@ -500,7 +570,7 @@ private switch_variant(p: TPattern) -> Option[(Type, BigInt)] = p match
 // fallthrough carried: the catch-all arm where the match has one, and otherwise the `unreachable` an
 // exhaustive match ends in -- for a statement match too, wherever the table names every variant.
 private gen_tag_switch(e: *Emit, d: TagDispatch, sv: Val, at: Option[Val], ty: Type, slot: Merge,
-                       end_l: string)
+                       end_l: string, through: bool = false)
     val tag_val = tag_of(e, d.en, sv)
 
     var arm_ls: Buf[string] = buf()
@@ -524,12 +594,12 @@ private gen_tag_switch(e: *Emit, d: TagDispatch, sv: Val, at: Option[Val], ty: T
 
     for i in 0..<d.arms.len()
         emit_label(e, arm_ls[i])
-        gen_arm_body(e, d.arms[i].0, sv, at, ty, slot, end_l)
+        gen_arm_body(e, d.arms[i].0, sv, at, ty, slot, end_l, through)
 
     d.catch_all match
         Some(arm) ->
             emit_label(e, none_l)
-            gen_arm_body(e, arm, sv, at, ty, slot, end_l)
+            gen_arm_body(e, arm, sv, at, ty, slot, end_l, through)
         None ->
             if none_l != end_l
                 emit_label(e, none_l)
@@ -614,12 +684,27 @@ private settle_owned(e: *Emit, j: usize, owned_n: *usize)
 
 // An arm's bindings and body, in the block the branch to it has already opened. Its alternatives
 // bind in blocks of their own (`bind_alternatives`), which is what lets one block serve several tags.
+//
+// `through` is a `match` reading a local through its address (`gen_match`): `sv` is then the tag
+// alone, and the arm's one pattern binds the fields out of the local at `at`.
 private gen_arm_body(e: *Emit, arm: TArm, sv: Val, at: Option[Val], ty: Type, slot: Merge,
-                     end_l: string)
+                     end_l: string, through: bool = false)
     // The arm is a region a slot's life is bounded by (`emit_lifetime.sysl`).
     val region = open_region(e)
 
     push_owned(e)
+
+    if through
+        bind_through(e, arm.patterns[0], at.unwrap())
+
+        if no_value(ty) then gen_block_void(e, arm.body)
+        else store_merged(e, arm.body, ty, slot)
+
+        pop_owned(e)
+        emit_term(e, InBr(end_l))
+        close_region(e, region)
+        return
+    end if
 
     if rebuilt_whole(e, arm, sv, at, ty, slot)
         pop_owned(e)
