@@ -6,20 +6,29 @@ import sysl.text.{Ascii, from_utf8_unchecked}
 // Reading a big integer and writing one, in any base from 2 to 36.
 //
 // **Both directions work a CHUNK at a time rather than a digit at a time**, and the chunk is the
-// largest power of the base that fits in a limb -- `10^9` for base ten, `2^31` for binary. So
-// rendering divides the whole magnitude by a billion and gets nine digits out of the remainder with
-// ordinary machine arithmetic, and reading multiplies by a billion and adds nine digits at a time.
-// The digit-at-a-time version of either is a full pass over the limbs per digit, which for a
-// thousand-digit number is a thousand passes rather than a hundred and twelve.
+// largest power of the base that fits in a limb -- `10^19` for base ten on a 64-bit target, `10^9`
+// on a 32-bit one. So rendering divides the magnitude by `10^19` and gets nineteen digits out of the
+// remainder with ordinary machine arithmetic, and reading multiplies by `10^19` and adds nineteen
+// digits at a time.
 //
-// **Rendering is still quadratic**, and no chunking fixes that: each division is a pass over what is
-// left. A subquadratic conversion is a divide-and-conquer algorithm with its own recursion, and it
-// belongs behind this same surface if a program ever needs it.
+// **Chunking alone is still quadratic**: each division by the chunk is a pass over what is left. So a
+// large value goes through a DIVIDE-AND-CONQUER conversion first (Knuth, *The Art of Computer
+// Programming* volume 2, §4.4, answer to exercise 14; GMP's `mpn_get_str` and `mpn_set_str` are this
+// shape). Rendering divides by `chunk^(2^k)`, the largest such power under the value, and renders the
+// quotient and the remainder each by the same rule a level down -- the remainder padded with zeros to
+// exactly `per 2^k` digits, since its leading zeros are digits of the whole. Reading splits the
+// digits so that the low part has `per 2^k` of them, reads both halves, and puts them together as
+// `high * chunk^(2^k) + low`. The powers are built once per conversion by squaring. With the
+// recursive division and Karatsuba underneath, both directions cost a constant times a
+// multiplication's `log n`, and below a threshold the chunk-at-a-time loops do the rest.
 
 /** The digits, in the order their values run. Lower case, which is what every language emits and
  * what `parse` accepts either of.
  */
 private const DIGITS: string = "0123456789abcdefghijklmnopqrstuvwxyz"
+
+/** The size in limbs below which a conversion is the chunk-at-a-time loop. */
+private[bigint] val text_threshold: usize = 40
 
 /** `x` in base ten -- the older spelling of `x.to_string()`, kept while the compiler's own source,
  * built by the previous release, still calls it.
@@ -35,44 +44,31 @@ impl Display for BigInt
  * **A base outside 2 to 36 traps**, since there is no digit to write past `z` and a caller asking
  * for base 37 has a mistake rather than an unusual requirement. Zero is `"0"` in every base.
  *
- * Allocates the answer, and a working buffer the size of the answer.
+ * Allocates the answer, and working storage a small multiple of the value's size.
  */
 to_string_radix(x: BigInt, base: int) -> string
     if base < 2 || base > 36 then panic("sysl.math.bigint: a base runs from 2 to 36")
     if x.is_zero() then return "0"
 
-    val alphabet = DIGITS.bytes
-    val (chunk, per) = chunk_of(base)
-    var digits: Buf[u8] = buf()
-    var mag = x.mag
-
-    // Every chunk emits `per` digits whether it needed them or not, which pads the most significant
-    // one with zeros; stripping them afterwards is one loop and is simpler than deciding, inside
-    // the loop, whether this is the last chunk.
-    while mag.len > 0
-        val (q, r) = short_divide(mag, chunk)
-        var value: Limb = if r.len == 0 then 0 else r[0]
-
-        for _ in 0..<per
-            digits.push(alphabet[value % Limb(base)])
-            value = value / Limb(base)
-
-        mag = q
-
-    var n = digits.len()
-
-    while n > 1 && digits[n - 1] == u8('0')
-        n -= 1
-
+    val conv = Conversion.of(base)
     var out: Buf[u8] = buf()
+
+    out.reserve(x.mag.len * usize(conv.per) + usize(conv.per) + 1)
 
     if x.minus then out.push(u8('-'))
 
-    var i = n
+    if x.mag.len < text_threshold
+        conv.render_small(&out, x.mag, 0)
+    else
+        val powers = conv.powers_upto(x.mag.len)
+        var k = powers.len()
 
-    while i > 0
-        i -= 1
-        out.push(digits[i])
+        // The largest power not above the value: the value is below that power squared, so the
+        // quotient and the remainder are both below the power itself.
+        while k > 1 && cmp_mag(x.mag, powers[k - 1]) < 0
+            k -= 1
+
+        conv.render(&out, x.mag, powers, k - 1, 0)
 
     // Every byte written is an ASCII digit, a letter or a hyphen, so the result is valid UTF-8 by
     // construction and there is nothing for a validating pass to find.
@@ -105,58 +101,168 @@ parse_radix(s: string, base: int) -> Option[BigInt]
 
     if i >= b.len then return None
 
-    val (chunk, per) = chunk_of(base)
+    // Every digit is checked once, here, so the conversion below reads digits it knows are valid.
+    for j in i..<b.len
+        if b[j].digit_value(base).is_none() then return None
+
+    val conv = Conversion.of(base)
+    val digits = b[i..]
+    val chunks = digits.len / usize(conv.per)
     var mag = empty()
 
-    while i < b.len
-        var acc: Limb = 0
-        var mult: Limb = 1
-        var k = 0
-
-        while k < per && i < b.len
-            val d = b[i].digit_value(base)?
-
-            acc = acc * Limb(base) + Limb(d)
-            mult = mult * Limb(base)
-            i += 1
-            k += 1
-
-        mag = mul_add_small(mag, mult, acc)
+    if chunks < text_threshold
+        mag = conv.read_small(digits)
+    else
+        mag = conv.read(digits, conv.powers_upto(chunks + 1))
 
     if mag.len == 0 then Some(zero()) else Some(BigInt(minus, mag))
 end parse_radix
 
-/** The largest power of `base` that fits in a limb, and how many digits that is.
- *
- * It is computed rather than tabled because a table of thirty-five entries is a table to get wrong,
- * and this runs once per conversion against a loop that runs once per chunk.
- */
-private chunk_of(base: int) -> (Limb, int)
-    val radix = Wide(1) << limb_bits
-    var chunk = Wide(base)
-    var per = 1
+/** A base, with the largest power of it that fits a limb and how many digits that power is. */
+private struct Conversion
+    base: int
+    chunk: Limb
+    per: int
 
-    while chunk * Wide(base) < radix
-        chunk = chunk * Wide(base)
-        per += 1
+    /** The chunk is computed rather than tabled because a table of thirty-five entries is a table
+     * to get wrong, and this runs once per conversion against loops that run once per chunk.
+     */
+    of(base: int) -> Conversion
+        val radix = Wide(1) << limb_bits
+        var chunk = Wide(base)
+        var per = 1
 
-    (Limb(chunk), per)
-end chunk_of
+        while chunk * Wide(base) < radix
+            chunk = chunk * Wide(base)
+            per += 1
 
-/** `mag * m + add`, both of which fit a limb -- the one operation reading a number needs and the
- * only place in this module where a magnitude grows by arithmetic rather than by a full multiply.
- */
-private mul_add_small(mag: []const Limb, m: Limb, add: Limb) -> []const Limb
-    var out: Buf[Limb] = buf()
-    var carry = Wide(add)
+        Conversion(base, Limb(chunk), per)
+    end of
 
-    for i in 0..<mag.len
-        val t = Wide(mag[i]) * Wide(m) + carry
+    /** `chunk^(2^k)` for `k` from 0 up to the first one with more than `limbs / 2` limbs, so that
+     * the last one squared is past any value of `limbs` limbs. Each is the one before squared.
+     */
+    powers_upto(self, limbs: usize) -> Buf[[]const Limb]
+        var out: Buf[[]const Limb] = buf()
 
-        out.push(low_limb(t))
-        carry = t >> limb_bits
+        out.push(mag_of_u64(u64(self.chunk)))
 
-    if carry != 0 then out.push(Limb(carry))
+        while out[out.len() - 1].len * 2 <= limbs + 1
+            val p = out[out.len() - 1]
 
-    trimmed(out)
-end mul_add_small
+            out.push(sqr_mag(p))
+
+        out
+    end powers_upto
+
+    /** The digits of `mag` appended to `out`, most significant first, padded with zeros to `width`
+     * digits where `width` is not zero.
+     *
+     * **`mag` is below `powers[k]` squared** -- the caller picks `k` so -- which is what makes the
+     * quotient and the remainder each below `powers[k]`, and so each below `powers[k - 1]` squared
+     * for the level down. At `k` of zero that bound is two limbs, under any threshold.
+     */
+    render(self, out: *Buf[u8], mag: []const Limb, powers: Buf[[]const Limb], k: usize, width: usize)
+        if mag.len < text_threshold
+            self.render_small(out, mag, width)
+            return
+
+        val (q, r) = divmod_mag(mag, powers[k])
+        val low = usize(self.per) << k
+
+        // The quotient's own width is what is left of this call's, or none at the top.
+        if width == 0 && q.len == 0
+            self.render(out, r, powers, if k > 0 then k - 1 else 0, 0)
+        else
+            self.render(out, q, powers, if k > 0 then k - 1 else 0, if width > low then width - low else 0)
+            self.render(out, r, powers, if k > 0 then k - 1 else 0, low)
+    end render
+
+    /** The chunk-at-a-time rendering: `mag` divided in place by the chunk, `per` digits out of each
+     * remainder, least significant first, then turned around onto `out`.
+     */
+    render_small(self, out: *Buf[u8], mag: []const Limb, width: usize)
+        val alphabet = DIGITS.bytes
+        var digits: Buf[u8] = buf()
+        var work: []Limb = [0; mag.len + 1]
+        var len = mag.len
+
+        copy_n(work, mag, len)
+
+        // Every chunk emits `per` digits whether it needed them or not, which pads the most
+        // significant one with zeros; stripping them afterwards is one loop and is simpler than
+        // deciding, inside the loop, whether this is the last chunk.
+        while len > 0
+            var value = divrem_1(work, work, len, self.chunk)
+
+            len = top_of(work, len)
+
+            for _ in 0..<self.per
+                digits.push(alphabet[value % Limb(self.base)])
+                value = value / Limb(self.base)
+
+        var n = digits.len()
+
+        while n > 0 && digits[n - 1] == u8('0')
+            n -= 1
+
+        // A value with no digits of its own is a zero, written as one digit where nothing pads it.
+        val wanted = if width > n then width elif n == 0 then 1 else n
+
+        for _ in n..<wanted do out.push(u8('0'))
+
+        var i = n
+
+        while i > 0
+            i -= 1
+            out.push(digits[i])
+    end render_small
+
+    /** The value of `digits`, all of them valid, by splitting where the low part has `per 2^k`
+     * digits for the largest `k` that leaves the high part non-empty.
+     */
+    read(self, digits: []const u8, powers: Buf[[]const Limb]) -> []const Limb
+        val chunks = digits.len / usize(self.per)
+
+        if chunks < text_threshold then return self.read_small(digits)
+
+        var k = powers.len() - 1
+
+        while k > 0 && usize(self.per) << k >= digits.len
+            k -= 1
+
+        val split = digits.len - (usize(self.per) << k)
+        val high = self.read(digits[..<split], powers)
+        val low = self.read(digits[split..], powers)
+
+        add_mag(mul_mag(high, powers[k]), low)
+    end read
+
+    /** The chunk-at-a-time reading, built in place in storage sized for every digit at once: each
+     * chunk multiplies what is there by the chunk's power and adds the chunk in one pass.
+     */
+    read_small(self, digits: []const u8) -> []const Limb
+        var mag: []Limb = [0; digits.len / usize(self.per) + 2]
+        var len: usize = 0
+        var i: usize = 0
+
+        while i < digits.len
+            var acc: Limb = 0
+            var mult: Limb = 1
+            var k = 0
+
+            while k < self.per && i < digits.len
+                acc = acc * Limb(self.base) + Limb(digits[i].digit_value(self.base).unwrap())
+                mult = mult * Limb(self.base)
+                i += 1
+                k += 1
+
+            val top = mul_1(mag, mag, len, mult, acc)
+
+            if top != 0
+                mag[len] = top
+                len += 1
+
+        mag[0..<len]
+    end read_small
+end Conversion

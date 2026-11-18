@@ -407,8 +407,8 @@ assembly at `-O0`, as `fx2_` reads disassembly). Each fix row goes in `scripts/f
 
 **As built, item 1 ships six of Q5's nine lists**: `zip_lo`, `zip_hi`, `unzip_even`, `unzip_odd`,
 `reverse` and `rotate[W, K]`. `concat`, `low_half` and `high_half` answer `[2 * W]usize` or
-`[W / 2]usize`, and a type may name a value parameter but not compute with one ("this length does
-arithmetic on 'W' … type-level arithmetic, which is a separate feature"). Spelling them by the
+`[W / 2]usize`, and a type may name a value parameter but not compute with one ("the length '2 * W' computes
+with the value parameter 'W' … type-level arithmetic, which is a separate feature"). Spelling them by the
 answer's width instead (`low_half[H]`) would make `concat[N]` and `low_half[H]` the same list, so
 they wait on that feature or on the user's choice of spelling.
 

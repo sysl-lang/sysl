@@ -2464,9 +2464,14 @@ private member_accepts(cx: &Analyzer, rty: Type, base: string, filed: string,
     // refused** -- a closure takes its whole shape from the parameter it is read at, so it would fit
     // every callable candidate it could be read at. It fits none, and a call it alone would have to
     // settle is reported as not settled rather than handed to whichever one it was read at first.
+    //
+    // **An argument in the literal's tier is the exception** (`literal_valued`): read with nothing
+    // expected it is an `int`, and refused where it does not fit one, but that reading is no more its
+    // own than a bare literal's default is -- `B.of(1234567890123)` stands at a `long` parameter as
+    // `f(1234567890123)` does, the parameter being what reads it.
     for i in 0..<params.len()
         if i < args.len()
-            if arg_tys[i].is_none() || declines(args[i]) then return None
+            if arg_tys[i].is_none() && !literal_valued(cx, args[i]) || declines(args[i]) then return None
             if !reads_at(cx, args[i], params[i]) then return None
         end if
 
@@ -2513,13 +2518,17 @@ private declines(e: Expr) -> bool = *e.kind match
 // Whether an argument read at a parameter's type comes out at that type with nothing said -- the
 // question a call of one candidate answers for each argument. Every trace of the reading is put back,
 // the instantiations and closures it made included, since the candidate may not be the one chosen.
+//
+// **"At that type" is agreement, as a call's own argument check asks it** (`disagree`): a measured
+// `c type` is the integer it was measured as, so a `Ulong` stands at a `ulong` parameter here exactly
+// as it does in `f(u)`.
 private reads_at(cx: &Analyzer, e: Expr, want: Type) -> bool
     val tried = begin_trial(cx)
     val t = analyze_expected(cx, e, Some(want))
     val refused = refused_since(cx, tried)
 
     discard_trial(cx, tried)
-    !refused && type_eq(texpr_type(t), want)
+    !refused && type_eq(repr(texpr_type(t)), repr(want))
 end reads_at
 
 // The lowered name a candidate goes under, with nothing said where it has none: this is asked while

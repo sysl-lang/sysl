@@ -3500,7 +3500,7 @@ private signed_literal_preference(fitted: Buf[Buf[Type]], ranked: Buf[usize],
                 differs = true
 
         if differs
-            if !bare_int_literal(args[j]) then return none
+            if !int_literal_valued(args[j]) then return none
 
             for r in 0..<ranked.len()
                 val here = fitted[ranked[r]]
@@ -3542,7 +3542,9 @@ end signed_literal_preference
 // meant**: a candidate beats another where each of its parameters is the other's or widens to it, so
 // `f(b)` over `f(x: int)` and `f(x: long)` at a `byte` is the `int` one. A literal has no type to be
 // widened from, so a position holding one decides nothing here -- what it means is the literal's
-// own rule above. Empty where no candidate beats every other.
+// own rule above -- and nor does arithmetic over bare literals, which is in the literal's tier:
+// `q(2.0 * 3)` over `f32` and `f128` is as ambiguous as `q(2.0)`. Empty where no candidate beats
+// every other.
 private narrowest_widening(fitted: Buf[Buf[Type]], ranked: Buf[usize], args: Buf[Expr]) -> Buf[usize]
     var winners: Buf[usize] = buf()
 
@@ -3586,7 +3588,7 @@ private literal_default_preference(fitted: Buf[Buf[Type]], ranked: Buf[usize], a
                 differs = true
 
         if differs
-            if literal_default(args[j]).is_none() then return none
+            if literal_arith_default(args[j]).is_none() then return none
 
             differ.push(j)
         end if
@@ -3611,8 +3613,10 @@ end literal_default_preference
 // Where every argument with a type of its own is exactly the parameter of one candidate, and every
 // other argument is a numeric literal with no suffix, that candidate wins and the literals are read
 // at its parameters: `nextafter(x, 100.0)` at an `f32` `x` is the `f32` one, as `x * 100.0` is at
-// `f32`. A typed argument that no candidate takes exactly stays ambiguous, and so do two candidates
-// that both match every typed argument. Empty where the rule does not apply.
+// `f32`. Arithmetic over bare literals is a literal here as everywhere in the rule (`2.0 * 3` beside
+// `x` is read at `f32` as `2.0` is). A typed argument that no candidate takes exactly stays
+// ambiguous, and so do two candidates that both match every typed argument. Empty where the rule
+// does not apply.
 private literal_follows_typed(fitted: Buf[Buf[Type]], ranked: Buf[usize], args: Buf[Expr],
                               natural: Buf[Option[Type]]) -> Buf[usize]
     var winners: Buf[usize] = buf()
@@ -3620,7 +3624,7 @@ private literal_follows_typed(fitted: Buf[Buf[Type]], ranked: Buf[usize], args: 
     var literals = 0
 
     for j in 0..<args.len()
-        if literal_default(args[j]).is_some() then literals += 1 else typed += 1
+        if literal_arith_default(args[j]).is_some() then literals += 1 else typed += 1
 
     if typed == 0 || literals == 0 || natural.len() != args.len() then return winners
 
@@ -3630,7 +3634,7 @@ private literal_follows_typed(fitted: Buf[Buf[Type]], ranked: Buf[usize], args: 
 
         for j in 0..<args.len()
             if !all then break
-            if literal_default(args[j]).is_some() then continue
+            if literal_arith_default(args[j]).is_some() then continue
 
             natural[j] match
                 Some(t) -> if !type_eq(here[j], t) then all = false
@@ -3644,7 +3648,7 @@ end literal_follows_typed
 // The type a bare numeric literal defaults to at a parameter: `real` for a float literal, and for
 // an integer literal `real` at a float parameter and `int` anywhere else.
 literal_default_at(e: Expr, param: Type) -> Type
-    val own = literal_default(e).unwrap()
+    val own = literal_arith_default(e).unwrap()
     val float_param = param match
         Floating(_, _) -> true
         _ -> false
@@ -3658,7 +3662,8 @@ private params_narrower(mine: Buf[Type], theirs: Buf[Type], args: Buf[Expr]) -> 
 
     for j in 0..<mine.len()
         if type_eq(mine[j], theirs[j]) then continue
-        if is_literal(args[j]) || !implicitly_widens(mine[j], theirs[j]) then return false
+        if is_literal(args[j]) || literal_arith_default(args[j]).is_some() ||
+           !implicitly_widens(mine[j], theirs[j]) then return false
 
         strictly = true
 
@@ -3671,6 +3676,53 @@ private bare_int_literal(e: Expr) -> bool = *e.kind match
     IntLit(_, _, suffix) -> suffix == ""
     Unary(op, operand) -> op == "-" && bare_int_literal(operand)
     _ -> false
+
+// **Arithmetic over bare integer literals is in the literal's tier** (`reference/expressions.md §
+// Which conversions are implicit`): `60 * 52` takes its position's type exactly as `3120` does, so
+// between overloads it prefers what the single literal prefers -- `f(60 * 52)` over `f(x: long)`
+// and `f(x: ulong)` is the `long` one, as `f(3120)` is. A shift is its left operand's value
+// whatever the count; a comparison or a logical operator yields a `bool` and is not one.
+private int_literal_valued(e: Expr) -> bool
+    if bare_int_literal(e) then return true
+
+    *e.kind match
+        Unary(op, operand) -> (op == "-" || op == "~") && int_literal_valued(operand)
+        Binary(op, l, r) ->
+            if op == "<<" || op == ">>" then int_literal_valued(l)
+            else literal_arith_op(op) && int_literal_valued(l) && int_literal_valued(r)
+        _ -> false
+end int_literal_valued
+
+// The default type of a bare numeric literal, or of arithmetic over bare numeric literals: `real`
+// where a float literal takes part (`1.5 * 2` is a `real` as `1 + 2.0` is), `int` where only integer
+// ones do, and nothing for anything else.
+literal_arith_default(e: Expr) -> Option[Type]
+    val own = literal_default(e)
+
+    if own.is_some() then return own
+
+    *e.kind match
+        Unary(op, operand) ->
+            if op == "-" then literal_arith_default(operand)
+            else if op == "~" && int_literal_valued(operand) then Some(int_type())
+            else None
+        Binary(op, l, r) ->
+            if op == "<<" || op == ">>"
+                if int_literal_valued(l) then Some(int_type()) else None
+            else if literal_arith_op(op)
+                val a = literal_arith_default(l)
+                val b = literal_arith_default(r)
+
+                if a.is_none() || b.is_none() then None
+                else if type_eq(a.unwrap(), real_type()) || type_eq(b.unwrap(), real_type()) then Some(real_type())
+                else Some(int_type())
+            else None
+        _ -> None
+end literal_arith_default
+
+// An operator whose result over two numbers is a number of their type.
+private literal_arith_op(op: string) -> bool =
+    op == "+" || op == "-" || op == "*" || op == "/" || op == "%" || op == "&" || op == "|" || op == "^"
 
 // The width of a signed integer parameter at a position, and 0 for anything else.
 private signed_bits(params: Buf[Type], j: usize) -> int
