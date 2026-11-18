@@ -1,0 +1,416 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.{Search, replace_all}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+
+// **`t[i, j]` is a subscript with several indices** (`reference/arrays.md § Several indices in one
+// subscript`, `multi_index.sysl`). A container whose `Index`, `IndexPlace` or `IndexSet` is over a
+// tuple or an array takes its parts as a list, each part typed as a subscript's index at the type it
+// lands on -- so a part landing on a `usize` takes any integer and traps on a negative one.
+//
+// Axes: the trait (`IndexPlace`, `Index`, `IndexSet`, a block writing `index_place_mut`); the index
+// type (a tuple of two and of three, an array, a tuple mixing a `usize` with a key and with a
+// `Range`); the part (a literal, an `int`, a `usize`, an `i8`, a negative `int` at run time, a range);
+// the position (a read, an assignment, a compound assignment, `++`, `&`, `ref`, a field of the element,
+// a `*self` method on the element, a call of an element that is a closure, a multiple assignment, a
+// read inside a closure); the receiver (a `var`, a `val`, a pointer, a type parameter with a bound, a
+// local shadowing a generic function, a type with both a one-index and a two-index `Index`); chaining
+// (an element indexed again, by one index and by several). Refusals: the count disagrees with the
+// tuple or the array, several indices on a one-index container, a built-in array, a compound
+// assignment and a multiple assignment through `IndexSet`, a part of the wrong type, a written tuple
+// where the index is an array. Skipped: build modes and targets (the subscript lowers as a member
+// call with a tuple or an array argument, which both already lower everywhere); separate compilation
+// (the impl is found by the lookup every subscript uses); a `const` function (it is evaluated over the
+// same typed call).
+
+private mdx_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end mdx_ready
+
+private mdx_root(text: string) -> string
+    val root = replace_all(make_temp_dir("sysl-mdx").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", mdx_head + text).unwrap()
+    root
+end mdx_root
+
+// The program built and run: its status, what it printed, and what it said on standard error -- or,
+// where the build refused it, the refusal.
+private mdx_run(text: string) -> (Status, string, string)
+    val root = mdx_root(text)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, "0", Some(s"$root/built"))
+
+    built match
+        Err(why) ->
+            val said = replace_all(failure_text(why), root, "@")
+
+            remove_dir_all(root).unwrap_or(())
+            return (Status.Exited(-1), "", said)
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> (Status.Exited(-1), "", "the program that was built could not be run")
+        Ok(o) -> (o.status, o.text, o.err.unwrap_or(""))
+end mdx_run
+
+private mdx_prints(text: string, expected: string)
+    if !mdx_ready() then return
+
+    val (state, printed, err) = mdx_run(text)
+
+    assert(state == Status.Exited(0), s"$state, '$err'")
+    assert_eq(printed, expected)
+end mdx_prints
+
+private mdx_refused(text: string, message: string, at: string)
+    if !mdx_ready() then return
+
+    val root = mdx_root(text)
+
+    val said = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> replace_all(failure_text(why), root, "@")
+        Ok(made) -> replace_all(analysis_report(made.report), root, "@")
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert(said.contains(s"error: $message"), said)
+    assert(said.contains(s" --> @/main.sysl:$at\n"), said)
+end mdx_refused
+
+// Twenty lines, so a program's first line is line 21.
+private const mdx_head: string =
+    "import sysl.buf.{Buf, buf}\nstruct P\n    n: int\nimpl P\n    bump(*self) = self.n += 1\n" +
+    "struct Grid\n    cells: [6]int\nimpl IndexPlace[(usize, usize), int] for Grid\n" +
+    "    index_place(*self, at: (usize, usize)) -> *int = &self.cells[at.0 * 3 + at.1]\n" +
+    "struct Table\n    cells: [6]int\nimpl Index[[2]usize, int] for Table\n" +
+    "    index(self, at: [2]usize) -> int = self.cells[at[0] * 3 + at[1]]\n" +
+    "impl IndexSet[[2]usize, int] for Table\n" +
+    "    index_set(*self, at: [2]usize, v: int) = self.cells[at[0] * 3 + at[1]] = v\n" +
+    "struct Cube\n    cells: [8]int\nimpl Index[(usize, usize, usize), int] for Cube\n" +
+    "    index(self, at: (usize, usize, usize)) -> int = self.cells[at.0 * 4 + at.1 * 2 + at.2]\n" +
+    "grid() -> Grid = Grid([1, 2, 3, 4, 5, 6])\n"
+
+// -- reading ----------------------------------------------------------------------------------------
+
+@test("a read takes a literal, an int, a usize and a narrow integer as each part")
+mdx_read_parts()
+    mdx_prints(raw"""
+        main()
+            var g = grid()
+            val i = 1
+            val j: usize = 2
+            val k: i8 = 0
+            print(g[0, 1], g[i, j], g[i, k], g[i, 0])
+        """, "2 6 4 4\n")
+end mdx_read_parts
+
+@test("an index over an array, and a tuple of three")
+mdx_array_and_three()
+    mdx_prints(raw"""
+        main()
+            val t = Table([1, 2, 3, 4, 5, 6])
+            val c = Cube([0, 1, 2, 3, 4, 5, 6, 7])
+            val i = 1
+            print(t[1, 2], t[i, 0], c[1, 1, 0], c[0, i, i])
+        """, "6 4 6 3\n")
+end mdx_array_and_three
+
+@test("a part that is not a usize is an ordinary argument: a key, a range")
+mdx_key_and_range_parts()
+    mdx_prints(raw"""
+        struct Sheet
+            cells: [6]int
+
+        impl Index[(string, int), int] for Sheet
+            index(self, at: (string, int)) -> int = if at.0 == "b" then self.cells[3 + at.1] else self.cells[at.1]
+
+        struct Strip
+            cells: [6]int
+
+        impl Index[(Range[usize], usize), int] for Strip
+            index(self, at: (Range[usize], usize)) -> int
+                var s = 0
+                for r in at.0
+                    s += self.cells[r * 3 + at.1]
+                s
+
+        main()
+            val s = Sheet([1, 2, 3, 4, 5, 6])
+            val g = Strip([1, 2, 3, 4, 5, 6])
+            print(s["b", 1], s["a", 2], g[0..<2, 1], g[0..1, 2])
+        """, "5 3 7 9\n")
+end mdx_key_and_range_parts
+
+@test("a type indexed both by one index and by two is read by either")
+mdx_one_and_two()
+    mdx_prints(raw"""
+        struct Rows
+            cells: [6]int
+
+        impl Index[usize, int] for Rows
+            index(self, i: usize) -> int = self.cells[i]
+
+        impl Index[(usize, usize), int] for Rows
+            index(self, at: (usize, usize)) -> int = self.cells[at.0 * 3 + at.1]
+
+        main()
+            val r = Rows([1, 2, 3, 4, 5, 6])
+            val i = 1
+            print(r[4], r[i, 2], r[i])
+        """, "5 6 2\n")
+end mdx_one_and_two
+
+@test("a pointer to the container, a val, a closure reading one and an element indexed again")
+mdx_receivers()
+    mdx_prints(raw"""
+        struct Blocks
+            gs: [2]Grid
+
+        impl IndexPlace[(usize, usize), Grid] for Blocks
+            index_place(*self, at: (usize, usize)) -> *Grid = &self.gs[at.0 + at.1]
+
+        struct Rows
+            rs: [2][3]int
+
+        impl IndexPlace[(usize, usize), [3]int] for Rows
+            index_place(*self, at: (usize, usize)) -> *[3]int = &self.rs[at.0 * at.1]
+
+        main()
+            var g = grid()
+            val p = &g
+            val v = Table([6, 5, 4, 3, 2, 1])
+            val read = () -> v[1, 1]
+            var b = Blocks([grid(), Grid([7, 8, 9, 10, 11, 12])])
+            var r = Rows([[1, 2, 3], [4, 5, 6]])
+            print(p[1, 2], read(), b[0, 1][1, 0], r[1, 1][2])
+        """, "6 2 10 6\n")
+end mdx_receivers
+
+@test("a type parameter bounded by a two-index trait, instantiated twice")
+mdx_generic()
+    mdx_prints(raw"""
+        corner[C: Index[(usize, usize), int]](c: C) -> int = c[1, 2]
+
+        bump_at[C: IndexPlace[(usize, usize), int]](c: *C, i: int)
+            c[i, 0] += 100
+
+        impl Index[(usize, usize), int] for Grid
+            index(self, at: (usize, usize)) -> int = self.cells[at.0 * 3 + at.1] * 10
+
+        struct Flat
+            cells: [6]int
+
+        impl Index[(usize, usize), int] for Flat
+            index(self, at: (usize, usize)) -> int = self.cells[at.0 * 3 + at.1]
+
+        main()
+            var g = grid()
+            bump_at(&g, 1)
+            print(corner(Flat([1, 2, 3, 4, 5, 6])), corner(g), g.cells[3])
+        """, "6 60 104\n")
+end mdx_generic
+
+@test("a local shadowing a generic function is indexed")
+mdx_local_shadows_generic()
+    mdx_prints(raw"""
+        pair[A, B](a: A, b: B) -> (A, B) = (a, b)
+
+        main()
+            print(pair[int, string](1, "x").1)
+            val pair = Table([1, 2, 3, 4, 5, 6])
+            print(pair[1, 0])
+        """, "x\n4\n")
+end mdx_local_shadows_generic
+
+// -- writing ----------------------------------------------------------------------------------------
+
+@test("every write position on an IndexPlace container")
+mdx_place_writes()
+    mdx_prints(raw"""
+        struct Things
+            ps: [4]P
+
+        impl IndexPlace[(usize, usize), P] for Things
+            index_place(*self, at: (usize, usize)) -> *P = &self.ps[at.0 * 2 + at.1]
+
+        main()
+            var g = grid()
+            g[0, 0] = 10
+            g[0, 1] += 20
+            g[0, 2]++
+            val q = &g[1, 0]
+            *q = 40
+            if true
+                ref r = g[1, 1]
+                r = 50
+            (g[1, 2], g[0, 0]) = (g[0, 0], g[1, 2])
+            print(g.cells)
+            var t = Things([P(1), P(2), P(3), P(4)])
+            t[1, 0].n = 30
+            t[1, 1].bump()
+            t[0, 1].n -= 2
+            print(t.ps[0].n, t.ps[1].n, t.ps[2].n, t.ps[3].n)
+        """, "[6, 22, 4, 40, 50, 10]\n1 0 30 5\n")
+end mdx_place_writes
+
+@test("an assignment through IndexSet is its call, over an array index")
+mdx_index_set()
+    mdx_prints(raw"""
+        main()
+            var t = Table([1, 2, 3, 4, 5, 6])
+            val i = 1
+            t[i, 2] = 60
+            t[0, 0] = t[i, 2] + 1
+            print(t.cells)
+        """, "[61, 2, 3, 4, 5, 60]\n")
+end mdx_index_set
+
+@test("a write goes through index_place_mut and a read through index_place")
+mdx_place_mut()
+    mdx_prints(raw"""
+        var reads = 0
+        var writes = 0
+
+        struct Cells
+            ps: Buf[P]
+
+        impl IndexPlace[(usize, usize), P] for Cells
+            index_place(self, at: (usize, usize)) -> *P
+                reads += 1
+                self.ps.index_place(at.0 * 2 + at.1)
+            override index_place_mut(*self, at: (usize, usize)) -> *P
+                writes += 1
+                self.ps.index_place(at.0 * 2 + at.1)
+
+        main()
+            var c = Cells(buf())
+            for k in 0..<4
+                c.ps.push(P(k))
+            c[1, 0].n = 9
+            c[0, 1].bump()
+            c[1, 1].n += c[0, 0].n
+            print(reads, writes, c.ps[2].n, c.ps[1].n, c.ps[3].n)
+        """, "1 3 9 2 3\n")
+end mdx_place_mut
+
+@test("a call of an element that is a closure")
+mdx_call_element()
+    mdx_prints(raw"""
+        struct Ops
+            fs: [4]&Fn(int) -> int
+
+        impl Index[(usize, usize), &Fn(int) -> int] for Ops
+            index(self, at: (usize, usize)) -> &Fn(int) -> int = self.fs[at.0 * 2 + at.1]
+
+        main()
+            val o = Ops([x -> x + 1, x -> x * 2, x -> x - 3, x -> -x])
+            print(o[0, 1](21), o[1, 1](5))
+        """, "42 -5\n")
+end mdx_call_element
+
+@test("a negative int part traps where the index lands on a usize")
+mdx_negative_part_traps()
+    if !mdx_ready() then return
+
+    val (state, printed, _) = mdx_run(raw"""
+        main()
+            var g = grid()
+            var i = 1
+            print(g[0, i])
+            i -= 2
+            print(g[0, i])
+        """)
+
+    assert(state == Status.Signalled(5), s"stopped with $state")
+    assert_eq(printed, "2\n")
+end mdx_negative_part_traps
+
+// -- what is refused --------------------------------------------------------------------------------
+
+@test("more parts than the tuple has")
+mdx_too_many()
+    mdx_refused(raw"""
+        main()
+            var g = grid()
+            print(g[0, 1, 2])
+        """, "3 indices were written, and this subscript takes 2 — its index is (usize, usize)", "23:12")
+end mdx_too_many
+
+@test("fewer parts than the array has")
+mdx_too_few()
+    mdx_refused(raw"""
+        main()
+            val c = Cube([0, 1, 2, 3, 4, 5, 6, 7])
+            print(c[0, 1])
+        """, "2 indices were written, and this subscript takes 3 — its index is (usize, usize, usize)",
+        "23:12")
+end mdx_too_few
+
+@test("several parts on a container indexed by one")
+mdx_one_index_container()
+    mdx_refused(raw"""
+        main()
+            var b: &Buf[int] = buf()
+            b.push(1)
+            print(b[0, 0])
+        """, "2 indices were written, and this subscript takes one — its index is usize", "24:12")
+end mdx_one_index_container
+
+@test("a part of the wrong type")
+mdx_wrong_part()
+    mdx_refused(raw"""
+        main()
+            var g = grid()
+            print(g["a", 0])
+        """, "an index must be an integer, not string", "23:13")
+end mdx_wrong_part
+
+@test("a written tuple where the index is an array")
+mdx_tuple_is_not_an_array()
+    mdx_refused(raw"""
+        main()
+            val t = Table([1, 2, 3, 4, 5, 6])
+            print(t[(0, 1)])
+        """, "'at' of 'Table.index' is [2]usize, but (int, int) was given", "23:13")
+end mdx_tuple_is_not_an_array
+
+@test("a compound assignment through IndexSet")
+mdx_index_set_compound()
+    mdx_refused(raw"""
+        main()
+            var t = Table([1, 2, 3, 4, 5, 6])
+            t[0, 1] += 1
+        """, "'+=' on an element read through 'Index' would evaluate the receiver and the index twice",
+        "23:5")
+end mdx_index_set_compound
+
+@test("an IndexSet element as one place of a multiple assignment")
+mdx_index_set_multiple()
+    mdx_refused(raw"""
+        main()
+            var t = Table([1, 2, 3, 4, 5, 6])
+            (t[0, 1], t[0, 0]) = (1, 2)
+        """, "an element set through 'Index' is a call rather than a store", "23:7")
+end mdx_index_set_multiple
+
+@test("several parts on a built-in array keep the one-index refusal")
+mdx_built_in_array()
+    mdx_refused(raw"""
+        main()
+            var m = [[1, 2], [3, 4]]
+            print(m[1, 0])
+        """, "a subscript takes one index, and 2 were written", "23:12")
+end mdx_built_in_array

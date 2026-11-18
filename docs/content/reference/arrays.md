@@ -869,6 +869,96 @@ print(r.cells)
 [1, 2, 30, 0]
 ```
 
+### Several indices in one subscript
+
+**A container indexed by a tuple or an array takes its index as a list**: `g[i, j]` means
+`g[(i, j)]` where the trait is over `(usize, usize)`, and `g[[i, j]]` where it is over `[2]usize`.
+It is the same subscript in every other way — a place through `IndexPlace`, a call through `Index`
+and `IndexSet` — so it is read, assigned, compounded, borrowed with `&` and named with `ref` exactly
+as `b[i]` is:
+
+```sysl
+struct Grid
+    cells: [6]int
+
+impl IndexPlace[(usize, usize), int] for Grid
+    index_place(*self, at: (usize, usize)) -> *int = &self.cells[at.0 * 3 + at.1]
+
+var g = Grid([1, 2, 3, 4, 5, 6])
+val row = 1
+
+g[row, 2] += 10
+g[0, 0] = g[row, 0]
+
+print(g[0, 0], g[1, 2], g.cells)
+```
+
+```output
+4 16 [4, 2, 3, 4, 5, 16]
+```
+
+**Each part is a subscript's index where it lands.** A part whose field is a `usize` takes any
+integer, as `b[i]` does, and traps on a negative one; a part of any other type — a key, a `Range` —
+is an ordinary argument, so a container can take a range in one position and an index in another:
+
+```sysl
+struct Sheet
+    cells: [6]int
+
+impl Index[(Range[usize], usize), int] for Sheet
+    index(self, at: (Range[usize], usize)) -> int
+        var sum = 0
+
+        for r in at.0
+            sum += self.cells[r * 3 + at.1]
+
+        sum
+
+impl Index[[2]usize, int] for Sheet
+    index(self, at: [2]usize) -> int = self.cells[at[0] * 3 + at[1]]
+
+val s = Sheet([1, 2, 3, 4, 5, 6])
+
+print(s[0..<2, 1], s[1, 2])
+```
+
+```output
+7 6
+```
+
+A type may be indexed both ways, by one index and by several, and `s[i]` and `s[i, j]` each find
+theirs. **The count is the tuple's or the array's**, and a different one is refused:
+
+```sysl
+struct Cube
+    cells: [8]int
+
+impl Index[(usize, usize, usize), int] for Cube
+    index(self, at: (usize, usize, usize)) -> int = self.cells[at.0 * 4 + at.1 * 2 + at.2]
+
+val c = Cube([0, 1, 2, 3, 4, 5, 6, 7])
+
+print(c[1, 0])
+```
+
+```error
+2 indices were written, and this subscript takes 3 — its index is (usize, usize, usize)
+```
+
+**The list is a subscript only on a value indexed through one of the three traits.** After a
+generic's name the same brackets are its type arguments (`reference/generics.md`), and a built-in
+array keeps one index: an array of arrays is indexed a level at a time, `m[i][j]`.
+
+```sysl
+var m = [[1, 2], [3, 4]]
+
+print(m[1, 0])
+```
+
+```error
+a subscript takes one index, and 2 were written
+```
+
 ### Writing through a subscript
 
 **A write through a subscript goes through `index_place_mut`; a read goes through `index_place`.**
@@ -1779,7 +1869,9 @@ divides the same properties the same way — `&[T]` carries writability in the r
 ## What is still refused
 
 **There is no rectangular multi-dimensional type.** `[3][3]f64` is an array of arrays and works;
-there is no distinct type with one bounds check for two indexes.
+there is no distinct built-in type with one bounds check for two indexes. A program's own matrix is
+one, indexed `m[i, j]` through a trait over a tuple
+([several indices in one subscript](#several-indices-in-one-subscript)).
 
 ---
 
