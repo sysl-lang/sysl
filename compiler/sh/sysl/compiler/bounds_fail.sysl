@@ -282,6 +282,8 @@ check_said(what: string, subject: string) -> (int, string)
         "size" -> (TrapCheck, "allocation size does not fit in usize")
         "slot" -> (TrapCheck, "slot is outside the buffer's storage")
         "bounds" -> (TrapCheck, "count is past the buffer's length")
+        "view_align" -> (TrapCheck, s"view_as: the first element is not aligned for '$subject'")
+        "view_tail" -> (TrapCheck, s"view_as: the bytes are not a whole number of '$subject'")
         _ -> (TrapCheck, s"'$what' check failed")
 end check_said
 
@@ -375,10 +377,8 @@ end overflow_unless
 // **A contract clause that does not hold** -- a `require`, an `ensure` or a loop's `invariant` --
 // reports through `sysl_trap` as `TrapContract`, its sentence composed here from the clause's word
 // and the message it was written with (`require failed: x must be non-negative`), or the word alone
-// where it was written with none (`ensure failed`), and stops the program. A struct's `invariant`
-// reports the same way, its word naming the struct (`invariant of 'Window' failed`). `label` names
-// the two blocks; `site` is the clause, or the write that broke a struct's invariant. Traps unless
-// `ok` holds.
+// where it was written with none (`ensure failed`), and stops the program. `label` names the two
+// blocks; `site` is the clause. Traps unless `ok` holds.
 //
 // The sentence is the program's own text, so it is laid down as a constant (`c_text_of`) and handed
 // to ONE private helper, `sysl.contract`, with the location: the failure block is one call with two
@@ -421,6 +421,76 @@ private contract_helper_text(word_bits: int) -> string
         s"  call void @${trap_hook_symbol()}(i32 $TrapContract, $word %a, $word 0, $word 0, ptr %at)\n" +
         "  ret void\n}\n"
 end contract_helper_text
+
+// **A struct's `invariant` that does not hold** reports the same way, as `TrapContract`, its
+// sentence naming the struct, the clause that failed and where that clause is written
+// (`invariant of 'Window' failed: clause 'lo <= hi' at main.sysl:4:15`), and `site` the write or
+// construction that broke it. The clauses answer with which of them failed (`first_broken`), so
+// that half of the sentence is a value: `clause` is the address of its bytes and `clause_len` their
+// count. The helper `sysl.contract.clause` joins the constant head to it on its own stack, NUL
+// ends it, and hands the whole sentence to `sysl_trap` as one text -- what any other form carries --
+// with no allocator and no formatter. Traps unless `ok` holds.
+clause_unless(e: *Emit, ok: Val, kind: string, clause: Val, clause_len: Val, site: Span)
+    e.traps = true
+    e.bounds_fails = true
+
+    val ok_l = fresh_label(e, "invariant.ok")
+    val bad_l = fresh_label(e, "invariant.bad")
+
+    emit_term(e, InCondBr(ok, ok_l, bad_l))
+    emit_label(e, bad_l)
+
+    val head = s"$kind failed: "
+    val w = word_lty(e)
+
+    request_text(e, clause_helper_symbol(), clause_helper_text(e.word_bits))
+
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(LPtr, c_text_of(e, head)))
+    args.push(ir_arg(w, VInt(from_int(long(head.bytes.len)))))
+    args.push(ir_arg(LPtr, clause))
+    args.push(ir_arg(w, clause_len))
+    args.push(ir_arg(LPtr, location_of(e, site)))
+    emit(e, ir_call(None, LVoid, VGlobal(clause_helper_symbol()), args))
+    emit(e, ir_call(None, LVoid, VGlobal(trap_symbol(e)), no_ir_args()))
+    emit_term(e, InUnreachable)
+    emit_label(e, ok_l)
+end clause_unless
+
+private clause_helper_symbol() -> string = "sysl.contract.clause"
+
+// The helper: the head's `hn` bytes and then the clause's `cn`, copied a byte at a time into a
+// buffer on its stack and ended by a NUL, whose address is handed to `sysl_trap` as `a`, with the
+// location. A loop rather than `llvm.memcpy`, so a bare target needs no `memcpy` for it.
+private clause_helper_text(word_bits: int) -> string
+    val w = s"i$word_bits"
+    val name = clause_helper_symbol()
+
+    s"define private void @$name(ptr %head, $w %hn, ptr %clause, $w %cn, ptr %at) cold noinline {\nentry:\n" +
+        s"  %n = add $w %hn, %cn\n" +
+        s"  %size = add $w %n, 1\n" +
+        s"  %said = alloca i8, $w %size\n" +
+        "  br label %copy\ncopy:\n" +
+        s"  %i = phi $w [ 0, %entry ], [ %next, %byte ]\n" +
+        s"  %more = icmp ult $w %i, %n\n" +
+        "  br i1 %more, label %byte, label %done\nbyte:\n" +
+        s"  %in.head = icmp ult $w %i, %hn\n" +
+        s"  %j = sub $w %i, %hn\n" +
+        s"  %from.head = getelementptr i8, ptr %head, $w %i\n" +
+        s"  %from.clause = getelementptr i8, ptr %clause, $w %j\n" +
+        "  %from = select i1 %in.head, ptr %from.head, ptr %from.clause\n" +
+        "  %b = load i8, ptr %from\n" +
+        s"  %to = getelementptr i8, ptr %said, $w %i\n" +
+        "  store i8 %b, ptr %to\n" +
+        s"  %next = add $w %i, 1\n" +
+        "  br label %copy\ndone:\n" +
+        s"  %end = getelementptr i8, ptr %said, $w %n\n" +
+        "  store i8 0, ptr %end\n" +
+        s"  %a = ptrtoint ptr %said to $w\n" +
+        s"  call void @${trap_hook_symbol()}(i32 $TrapContract, $w %a, $w 0, $w 0, ptr %at)\n" +
+        "  ret void\n}\n"
+end clause_helper_text
 
 // A failure whose two values are the addresses of NUL-terminated texts.
 private two_texts_fail(e: *Emit, kind: int, first: Val, second: Val, site: Span) -> Val

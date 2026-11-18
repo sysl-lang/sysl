@@ -1,0 +1,423 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **Every way of choosing between overloads chooses by one rule** (`reference/declarations.md §
+// Overloading`, `reference/expressions.md § Which conversions are implicit` and `§ Operator
+// dispatch`): a free function, an associated function, a method and an operator's right-hand operand
+// each take a literal at whichever candidate reads it, a literal's arithmetic as the literal, and a
+// measured `c type` as the integer it was measured as. The pair `long`/`ulong` is the binding shape
+// (gmp's `Int.of`) the three paths disagreed over: an associated function refused a literal too wide
+// for `int` and a `c type` argument, an operator refused the literal for not fitting `int`, and every
+// path called `60 * 52` ambiguous although no `int` reaches a `ulong`.
+
+private olm_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end olm_ready
+
+// What a program prints, built and run.
+private olm_ran(text: string) -> string
+    val root = make_temp_dir("sysl-olm").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end olm_ran
+
+// Everything a source has to say for itself, taken through the lowering.
+private olm_err(text: string) -> string
+    val root = make_temp_dir("sysl-olm").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end olm_err
+
+// The pair at every path: a free function, an associated function, a method, and an operator whose
+// implementations are at the two types on either side, each naming which one ran.
+private olm_pair() -> string = raw"""
+    c type
+        Ulong = "unsigned long"
+        Slong = "long"
+
+    f(v: long) -> string = "long"
+    f(v: ulong) -> string = "ulong"
+
+    struct B
+        n: int
+
+        of(v: long) -> string = "long"
+        of(v: ulong) -> string = "ulong"
+        at(self, v: long) -> string = "long"
+        at(self, v: ulong) -> string = "ulong"
+
+    impl Add[long, string] for B
+        add(self, v: long) -> string = "long"
+
+    impl Add[ulong, string] for B
+        add(self, v: ulong) -> string = "ulong"
+
+    impl Add[B, string] for long
+        add(self, v: B) -> string = "long"
+
+    impl Add[B, string] for ulong
+        add(self, v: B) -> string = "ulong"
+
+    val b = B(0)
+    val x: u32 = 3
+    """
+
+@test("a literal chooses alike at a free function, an associated function, a method and either side of an operator")
+olm_literals_at_every_path()
+    if !olm_ready() then return
+
+    assert_eq(olm_ran(olm_pair() + raw"""
+        print(f(1), B.of(1), b.at(1), b + 1, 1 + b)
+        print(f(1234567890123), B.of(1234567890123), b.at(1234567890123), b + 1234567890123, 1234567890123 + b)
+        print(f(18446744073709551615), B.of(18446744073709551615), b.at(18446744073709551615),
+              b + 18446744073709551615, 18446744073709551615 + b)
+        print(f(-5), B.of(-5), b.at(-5), b + -5, -5 + b)
+        print(f(-1234567890123), B.of(-1234567890123), b.at(-1234567890123), b + -1234567890123)
+        """), "long long long long long\nlong long long long long\nulong ulong ulong ulong ulong\n" +
+              "long long long long long\nlong long long long\n")
+
+@test("arithmetic over literals chooses as the literal it comes to")
+olm_literal_arithmetic()
+    if !olm_ready() then return
+
+    assert_eq(olm_ran(olm_pair() + raw"""
+        print(f(60 * 52), B.of(60 * 52), b.at(60 * 52), b + 60 * 52, 60 * 52 + b)
+        print(f(4567890123 * 2), B.of(4567890123 * 2), b.at(4567890123 * 2), b + 4567890123 * 2)
+        print(f(-(3 + 4)), B.of(1 << 40), b.at(~0), b + (7 - 9))
+        """), "long long long long long\nlong long long long\nlong long long long\n")
+
+@test("a measured c type is the integer it was measured as, at every path")
+olm_c_type_arguments()
+    if !olm_ready() then return
+
+    assert_eq(olm_ran(olm_pair() + raw"""
+        val u = Ulong(5)
+        val s = Slong(-5)
+        print(f(u), B.of(u), b.at(u), b + u, u + b)
+        print(f(s), B.of(s), b.at(s), b + s, s + b)
+        """), "ulong ulong ulong ulong ulong\nlong long long long long\n")
+
+@test("a typed argument chooses by its own type, and a signed one never reaches an unsigned parameter")
+olm_typed_arguments()
+    if !olm_ready() then return
+
+    assert_eq(olm_ran(olm_pair() + raw"""
+        val l: long = 7
+        val w: ulong = 7
+        val n: int = -7
+        val h: i16 = 3
+        print(f(l), B.of(l), b.at(l), b + l, l + b)
+        print(f(w), B.of(w), b.at(w), b + w, w + b)
+        print(f(n), B.of(n), b.at(n), b + n)
+        print(f(h), B.of(h), b.at(h), b + h)
+        print(f(n * 2), B.of(n * 2), b.at(l + 1), b + (w - 1))
+        """), "long long long long long\nulong ulong ulong ulong ulong\nlong long long long\n" +
+              "long long long long\nlong long long ulong\n")
+
+@test("the operand an operator is handed is the literal at the implementation's own type")
+olm_operator_values()
+    if !olm_ready() then return
+
+    assert_eq(olm_ran(raw"""
+        c type
+            Ulong = "unsigned long"
+
+        struct Acc
+            v: long
+            u: ulong
+
+        impl Add[long] for Acc
+            add(self, k: long) -> Acc = Acc(self.v + k, self.u)
+
+        impl Add[ulong] for Acc
+            add(self, k: ulong) -> Acc = Acc(self.v, self.u + k)
+
+        struct One
+            v: long
+
+        impl Mul[long] for One
+            mul(self, k: long) -> One = One(self.v * k)
+
+        var a = Acc(0, 0)
+
+        a = a + 4567890123
+        a += 4567890123
+        a += 60 * 52
+        a = a + 18446744073709551000
+        a += Ulong(7)
+
+        var o = One(1)
+
+        o = o * 4567890123
+        o *= 2
+        o = o * (1 << 3)
+
+        print(a.v, a.u, o.v)
+        """), "9135783366 18446744073709551007 73086241968\n")
+
+@test("a literal too wide for every candidate is refused at every path, naming what was there")
+olm_too_wide_for_all()
+    if !olm_ready() then return
+
+    val free = olm_err(olm_pair() + "print(f(36893488147419103232))\n")
+    val assoc = olm_err(olm_pair() + "print(B.of(36893488147419103232))\n")
+    val method = olm_err(olm_pair() + "print(b.at(36893488147419103232))\n")
+    val right = olm_err(olm_pair() + "print(b + 36893488147419103232)\n")
+    val left = olm_err(olm_pair() + "print(36893488147419103232 + b)\n")
+    val scaled = olm_err(olm_pair() + "impl Mul[long, string] for B\n    mul(self, v: long) -> string = \"l\"\n" +
+                         "print(b * 36893488147419103232)\n")
+
+    assert(free.contains("no 'f' takes these arguments — the declarations of that name are:\n    f(v: long)\n" +
+                         "    f(v: ulong)"), free)
+    assert(assoc.contains("no 'B.of' takes these arguments — the declarations of that name are:\n" +
+                          "    B.of(v: long)\n    B.of(v: ulong)"), assoc)
+    assert(method.contains("no 'B.at' takes these arguments"), method)
+    assert(right.contains("'+' on B has no right-hand type this literal fits — it implements " +
+                          "'Add[long, string]' and 'Add[ulong, string]'"), right)
+    assert(left.contains("'+' with B on the right has no left-hand scalar this literal fits — they are " +
+                         "'long: Add[B, string]' and 'ulong: Add[B, string]'"), left)
+    assert(scaled.contains("'*' on B has no right-hand type this literal fits — it implements " +
+                           "'Mul[long, string]'"), scaled)
+    assert(!right.contains("does not fit int") && !left.contains("does not fit int"), right + left)
+
+@test("a literal no candidate takes keeps the roster and the operator's own refusal")
+olm_literal_no_candidate_takes()
+    if !olm_ready() then return
+
+    val free = olm_err(olm_pair() + "print(f(1.5))\n")
+    val assoc = olm_err(olm_pair() + "print(B.of(1.5))\n")
+    val op = olm_err(olm_pair() + "print(b + 1.5)\n")
+
+    assert(free.contains("no 'f' takes these arguments"), free)
+    assert(assoc.contains("no 'B.of' takes these arguments"), assoc)
+    assert(op.contains("'+' between B and real needs 'Add[real]' — it implements 'Add[long, string]' and " +
+                       "'Add[ulong, string]'"), op)
+
+@test("a typed argument reaching both by widening stays ambiguous at every path")
+olm_genuinely_ambiguous()
+    if !olm_ready() then return
+
+    val free = olm_err(olm_pair() + "print(f(x))\n")
+    val assoc = olm_err(olm_pair() + "print(B.of(x))\n")
+    val method = olm_err(olm_pair() + "print(b.at(x))\n")
+    val right = olm_err(olm_pair() + "print(b + x)\n")
+    val left = olm_err(olm_pair() + "print(x + b)\n")
+
+    assert(free.contains("'f' is ambiguous here — 2 of its declarations take these arguments:"), free)
+    assert(assoc.contains("'B.of' is ambiguous here — 2 of its declarations take these arguments:"), assoc)
+    assert(method.contains("'B.at' is ambiguous here"), method)
+    assert(right.contains("'+' between B and uint comes from 2 implementations of one trait on B, and the " +
+                          "operands do not say which was meant"), right)
+    assert(left.contains("'+' between uint and B comes from 2 implementations of one trait on different " +
+                         "scalars"), left)
+
+// Two unsigned candidates offer nothing signed, so the literal's preference does not apply and the
+// call stays ambiguous at either kind of path.
+@test("a literal between two unsigned candidates stays ambiguous at a function and a type's own overloads")
+olm_unsigned_pair_stays_ambiguous()
+    if !olm_ready() then return
+
+    val pair = "g(v: u32) -> string = \"u32\"\ng(v: u64) -> string = \"u64\"\n" +
+               "struct G\n    n: int\n\n    of(v: u32) -> string = \"u32\"\n    of(v: u64) -> string = \"u64\"\n"
+
+    assert(olm_err(pair + "print(g(3))\n").contains("'g' is ambiguous here"), "function")
+    assert(olm_err(pair + "print(G.of(3))\n").contains("'G.of' is ambiguous here"), "associated")
+
+// A float literal's arithmetic defaults as the float literal does: `real` beside `f32`.
+@test("float literal arithmetic takes the literal's default between float candidates")
+olm_float_literal_arithmetic()
+    if !olm_ready() then return
+
+    assert_eq(olm_ran(raw"""
+        h(x: f32) -> string = "f32"
+        h(x: real) -> string = "real"
+
+        struct S
+            n: int
+
+            of(x: f32) -> string = "f32"
+            of(x: real) -> string = "real"
+
+        print(h(1.5 * 2), S.of(1.5 * 2), h(1 + 2.0), S.of(-(0.5 + 1)))
+        """), "real real real real\n")
+
+// **Arithmetic over literals is the literal it comes to at every tie-break, the narrowest widening
+// included** (`reference/declarations.md § Overloading`): `60 * 52` is the `3120` it folds to, not an
+// `int` that widens, so over `u32` and `u64` it is as ambiguous as `3120` is -- where it once chose
+// `u32` by widening from an `int` it never was.
+private olm_unsigned() -> string = raw"""
+    g(v: u32) -> string = "u32"
+    g(v: u64) -> string = "u64"
+
+    struct G
+        n: int
+
+        of(v: u32) -> string = "u32"
+        of(v: u64) -> string = "u64"
+        at(self, v: u32) -> string = "u32"
+        at(self, v: u64) -> string = "u64"
+
+    impl Add[u32, string] for G
+        add(self, v: u32) -> string = "u32"
+
+    impl Add[u64, string] for G
+        add(self, v: u64) -> string = "u64"
+
+    impl Add[G, string] for u32
+        add(self, v: G) -> string = "u32"
+
+    impl Add[G, string] for u64
+        add(self, v: G) -> string = "u64"
+
+    val gv = G(0)
+    val x: u32 = 3
+    const N: u32 = 3120
+    const W: u64 = 3120
+    """
+
+@test("literal arithmetic over an unsigned pair is as ambiguous as the literal, through every operator")
+olm_arith_unsigned_pair_ambiguous()
+    if !olm_ready() then return
+
+    for e in ["3120", "60 * 52", "3000 + 120", "3200 - 80", "6240 / 2", "7000 % 3880", "195 << 4",
+              "4095 & 3120", "3072 | 48", "3072 ^ 48", "(50 + 10) * 52", "~0"]
+        val free = olm_err(olm_unsigned() + s"print(g($e))\n")
+        val assoc = olm_err(olm_unsigned() + s"print(G.of($e))\n")
+        val method = olm_err(olm_unsigned() + s"print(gv.at($e))\n")
+
+        assert(free.contains("'g' is ambiguous here — 2 of its declarations take these arguments"), e + ": " + free)
+        assert(assoc.contains("'G.of' is ambiguous here"), e + ": " + assoc)
+        assert(method.contains("'G.at' is ambiguous here"), e + ": " + method)
+
+@test("an operator's literal-arithmetic operand is as ambiguous as the literal on either side")
+olm_arith_unsigned_pair_operator()
+    if !olm_ready() then return
+
+    for e in ["3120", "60 * 52", "(60 * 52)", "3072 | 48"]
+        val right = olm_err(olm_unsigned() + s"print(gv + $e)\n")
+        val left = olm_err(olm_unsigned() + s"print(($e) + gv)\n")
+
+        assert(right.contains("'+' between G and int comes from 2 implementations of one trait on G, and " +
+                              "the operands do not say which was meant"), e + ": " + right)
+        assert(left.contains("'+' between int and G comes from 2 implementations of one trait on different " +
+                             "scalars"), e + ": " + left)
+
+@test("literal arithmetic only the wider candidate holds chooses it at every path")
+olm_arith_only_wider_fits()
+    if !olm_ready() then return
+
+    assert_eq(olm_ran(olm_unsigned() + raw"""
+        print(g(4567890123 * 2), G.of(4567890123 * 2), gv.at(4567890123 * 2), gv + 4567890123 * 2,
+              4567890123 * 2 + gv, g(1 << 40), g(65536 * 65536))
+        """), "u64 u64 u64 u64 u64 u64 u64\n")
+
+@test("negative literal arithmetic is refused by unsigned candidates as a negative literal is")
+olm_arith_negative_against_unsigned()
+    if !olm_ready() then return
+
+    for e in ["-5", "3 - 5", "-(3 + 4)", "-(1 << 2)"]
+        val free = olm_err(olm_unsigned() + s"print(g($e))\n")
+        val assoc = olm_err(olm_unsigned() + s"print(G.of($e))\n")
+
+        assert(free.contains("no 'g' takes these arguments"), e + ": " + free)
+        assert(assoc.contains("no 'G.of' takes these arguments"), e + ": " + assoc)
+
+    val bare = olm_err(olm_unsigned() + "print(gv + -5)\n")
+    val arith = olm_err(olm_unsigned() + "print(gv + (3 - 5))\n")
+
+    assert(bare.contains("'+' between G and int needs 'Add[int]'"), bare)
+    assert(arith.contains("'+' between G and int needs 'Add[int]'"), arith)
+
+@test("arithmetic with a typed operand, and a typed constant, keep their own type")
+olm_arith_typed_stays_typed()
+    if !olm_ready() then return
+
+    assert_eq(olm_ran(olm_unsigned() + raw"""
+        print(g(x * 2), G.of(x + 1), gv.at(2 * x), gv + (x - 1), (x + 1) + gv)
+        print(g(N), G.of(N), gv.at(N * 2), gv + N, N + gv)
+        print(g(W), G.of(W), gv.at(W - 1), gv + W, W + gv)
+        """), "u32 u32 u32 u32 u32\nu32 u32 u32 u32 u32\nu64 u64 u64 u64 u64\n")
+
+@test("float literal arithmetic decides nothing by widening, as the float literal does not")
+olm_float_arith_no_narrowest()
+    if !olm_ready() then return
+
+    val pair = "k(v: f32) -> string = \"f32\"\nk(v: f128) -> string = \"f128\"\n"
+
+    for e in ["1.5", "1.5 * 2", "3.0 / 2", "-(0.5 + 1)", "0.5 + 1"]
+        val said = olm_err(pair + s"print(k($e))\n")
+
+        assert(said.contains("'k' is ambiguous here"), e + ": " + said)
+
+@test("literal arithmetic beside a typed argument follows it, and an operand reaches a float implementation")
+olm_arith_follows_typed()
+    if !olm_ready() then return
+
+    assert_eq(olm_ran(raw"""
+        n(a: f32, c: f32) -> string = "f32"
+        n(a: real, c: real) -> string = "real"
+        m(a: f32, c: f32) -> string = "f32 f32"
+        m(a: f32, c: real) -> string = "f32 real"
+
+        struct P
+            v: f32
+
+        impl Mul[f32] for P
+            mul(self, k: f32) -> P = P(self.v * k)
+
+        val y: f32 = 1.0
+        val p = P(1.5)
+
+        print(n(y, 50.0), n(y, 50.0 * 2), n(y, 2 + 0.5), m(y, 50.0), m(y, 25.0 * 2))
+        print((p * 6).v, (p * (2 * 3)).v, (p * (8 / 2)).v)
+        """), "f32 f32 f32 f32 real f32 real\n9 9 6\n")
+
+@test("integer literal arithmetic converted to a new type runs that type's own From[int], as the literal does")
+olm_arith_own_from()
+    if !olm_ready() then return
+
+    assert_eq(olm_ran(raw"""
+        type Phase = new real
+
+        impl From[int] for Phase
+            from(n: int) -> Phase = Phase(n) * 2.0
+
+        print(real(Phase(3)), real(Phase(1 + 2)), real(Phase(6 / 2)), real(Phase(-(1 - 4))), real(Phase(1.5 * 2)))
+        """), "6 6 6 6 3\n")

@@ -157,6 +157,26 @@ private byte_image(l: TargetLayout, t: TExpr, ty: Type, out: Buf[u8], refs: Buf[
             if !byte_image(l, items[i], element_of(aty), out, refs, at + i * stride) then return false
 
         true
+    // A vector's lanes sit in memory as an array of them does -- where every lane is whole bytes. A
+    // mask's lanes and a lane of a width that is not a power of two bytes are packed as bits, so such a
+    // vector is not claimed.
+    TVectorLit(lanes, vty) ->
+        val lane = underlying(vty) match
+            Vector(_, el) -> *el
+            _ -> return false
+
+        val stride = l.size(lane)
+        val whole = underlying(lane) match
+            Integer(bits, _, _) -> bits == 8 || bits == 16 || bits == 32 || bits == 64
+            Floating(bits, false) -> bits == 32 || bits == 64
+            _ -> false
+
+        if !whole then return false
+
+        for i in 0..<lanes.len()
+            if !byte_image(l, lanes[i], lane, out, refs, at + i * stride) then return false
+
+        true
     TArrayFill(value, aty) ->
         val n = underlying(aty) match
             Array(count, _) -> usize(count)

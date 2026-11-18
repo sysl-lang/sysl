@@ -23,6 +23,94 @@ quoted_names(names: Buf[string]) -> string
     out
 end quoted_names
 
+// `f[Pos, Vel]()` against `f[..A]` -- a written list over a declaration with a **pack**, read as the
+// bindings it makes, or `None` once the refusal is reported.
+//
+// **The pack takes every argument the other parameters leave**: those before it take the leading
+// ones and those after it the trailing ones, each one type, and the pack the run between -- one type
+// or more, since a pack is a list of types and a tuple of none is no tuple. So `f[Vel]()` binds `A` to
+// the one type `Vel`, never to `Vel`'s own parts, and `f[(Pos, Vel)]()` binds it to the one type that
+// pair is. The list names **every** written parameter: a shorter one would leave nothing to say where
+// the pack ends. Two packs in one list are refused for the same reason.
+written_pack_list(cx: &Analyzer, span: Span, written: string, authored: Buf[string],
+                  tpacks: Buf[string], targs: Buf[Expr],
+                  read: &Fn(string, Expr) -> Type) -> Option[Buf[Binding]]
+    var packs: Buf[string] = buf()
+
+    for name in authored
+        if holds_string(tpacks, name) then packs.push(name)
+
+    if packs.len() > 1
+        cx.fault(span, s"'$written' takes two type packs, '..${packs[0]}' and '..${packs[1]}', so " +
+                 "a written list cannot say where one ends and the next begins — let the arguments " +
+                 "settle them")
+        return None
+    end if
+
+    val singles = authored.len() - 1
+
+    if targs.len() < authored.len()
+        val were = if targs.len() == 1 then "was" else "were"
+
+        cx.fault(span, s"'$written' takes ${quantity(authored.len(), "type argument")} or more " +
+                 s"(${quoted_names(authored)}), '${packs[0]}' being a type pack that stands for one " +
+                 s"type or more, and ${targs.len()} $were written")
+        return None
+    end if
+
+    val spread = targs.len() - singles
+    var out: Buf[Binding] = buf()
+    var at: usize = 0
+
+    for name in authored
+        if name == packs[0]
+            var parts: Buf[Type] = buf()
+
+            for j in at..<at + spread
+                parts.push(read(name, targs[j]))
+
+            at += spread
+            out.push(Binding(name, Pack(parts)))
+        else
+            out.push(Binding(name, read(name, targs[at])))
+            at += 1
+    end for
+
+    for b in out
+        b.ty match
+            Pack(parts) ->
+                for t in parts
+                    if t == Unknown then return None
+            _ -> if b.ty == Unknown then return None
+
+    Some(out)
+end written_pack_list
+
+// The same, laid out by position over `authored`, the pack's place holding its whole list: the shape
+// a member's written list is carried in.
+written_pack_args(cx: &Analyzer, span: Span, written: string, authored: Buf[string],
+                  tpacks: Buf[string], targs: Buf[Expr],
+                  read: &Fn(string, Expr) -> Type) -> Option[Buf[Type]]
+    val known = written_pack_list(cx, span, written, authored, tpacks, targs, read)
+
+    if known.is_none() then return None
+
+    var out: Buf[Type] = buf()
+
+    for name in authored
+        out.push(bound_type(known.unwrap(), name).unwrap_or(Unknown))
+
+    Some(out)
+end written_pack_args
+
+// Whether any of the parameters a list fills is a pack.
+names_a_pack(authored: Buf[string], tpacks: Buf[string]) -> bool
+    for name in authored
+        if holds_string(tpacks, name) then return true
+
+    false
+end names_a_pack
+
 // `f[int](x)` -- the instantiation the reader named.
 //
 // **Written out, the type arguments are what settle the instantiation and nothing else is
@@ -60,6 +148,17 @@ written_generic_call(cx: &Analyzer, span: Span, written: string, targ_exprs: Buf
     if decl.tparams.is_empty() then
         return cx.err(span, s"'$written' is not generic, so it has no type arguments to write — " +
                       s"the call is '$written(…)'")
+
+    // A pack among them is spread over: the list is read whole, and what the arguments and the
+    // position say settles only the sugar's own parameters.
+    if !decl.tpacks.is_empty()
+        val known = written_pack_list(cx, span, written, authored, decl.tpacks, targ_exprs,
+                                      (name, e) -> written_arg_for(cx, f, name, e))
+
+        if known.is_none() then return bad_expr(span)
+
+        return generic_call_with(cx, span, written, key, f, args, expected, true, known.unwrap())
+    end if
 
     // **The parameters are named**, since a declaration carrying the sugar's own has more of them
     // than the reader wrote and a bare count would be a number they could not check. **Fewer is
