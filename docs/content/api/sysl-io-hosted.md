@@ -9,7 +9,7 @@ requires: "requires { libc }"
 
 ## Index
 
-[`io_flush`](#io_flush) [`io_poll_close`](#io_poll_close) [`io_poll_control`](#io_poll_control) [`io_poll_open`](#io_poll_open) [`io_poll_wait`](#io_poll_wait) [`io_poll_wake`](#io_poll_wake) [`io_read`](#io_read) [`io_wait`](#io_wait) [`io_write`](#io_write)
+[`io_flush`](#io_flush) [`io_poll_close`](#io_poll_close) [`io_poll_control`](#io_poll_control) [`io_poll_open`](#io_poll_open) [`io_poll_wait`](#io_poll_wait) [`io_poll_wake`](#io_poll_wake) [`io_read`](#io_read) [`io_wait`](#io_wait) [`io_wakefd_close`](#io_wakefd_close) [`io_wakefd_drain`](#io_wakefd_drain) [`io_wakefd_open`](#io_wakefd_open) [`io_wakefd_wake`](#io_wakefd_wake) [`io_write`](#io_write)
 
 ## Functions
 
@@ -59,6 +59,30 @@ io_read(fd: int, into: *u8, room: usize) -> isize
 
 ```sysl
 io_wait(fd: int, writable: int, micros: long) -> int
+```
+
+### `io_wakefd_close`
+
+```sysl
+io_wakefd_close(fd: int, write: int) -> int
+```
+
+### `io_wakefd_drain`
+
+```sysl
+io_wakefd_drain(fd: int) -> int
+```
+
+### `io_wakefd_open`
+
+```sysl
+io_wakefd_open(write: *i32) -> int
+```
+
+### `io_wakefd_wake`
+
+```sysl
+io_wakefd_wake(fd: int, write: int) -> int
 ```
 
 ### `io_write`

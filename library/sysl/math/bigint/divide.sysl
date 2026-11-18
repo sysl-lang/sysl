@@ -31,152 +31,118 @@ private[bigint] divmod_mag(a: []const Limb, b: []const Limb) -> ([]const Limb, [
     if cmp_mag(a, b) < 0 then return (empty(), a)
     if b.len == 1 then return short_divide(a, b[0])
 
+    // A quotient and a divisor both past the threshold go to the recursive division; otherwise one of
+    // the two dimensions of the schoolbook loop is short and it is the faster.
+    if b.len >= dc_threshold && a.len - b.len >= dc_threshold then return divide_recursive(a, b)
+
+    long_divide(a, b)
+end divmod_mag
+
+/** Algorithm D over two magnitudes, `a >= b` and `b` of two limbs or more. */
+private[bigint] long_divide(a: []const Limb, b: []const Limb) -> ([]const Limb, []const Limb)
     val n = b.len
     val m = a.len - n
+    var v = fresh(n)
+    var u = fresh(a.len + 1)
+
+    normalize(v, u, a, b)
+
+    var q = fresh(m + 1)
+
+    divide_normalized(q, u, a.len + 1, v, n)
+
+    // What is left in the bottom `n` limbs is the remainder, still scaled by the normalization: the
+    // quotient needs no such undoing -- scaling both operands leaves it alone.
     val shift = usize(b[n - 1].leading_zeros())
-    var v = shifted_left(b, shift, n)
-    var u = shifted_left(a, shift, a.len + 1)
-    var q: Buf[Limb] = buf()
 
-    for i in 0..<(m + 1)
-        q.push(0)
+    if shift > 0 then rshift(u, u, n, shift)
 
+    (finished(q, m + 1), finished(u, n))
+end long_divide
+
+/** `v` and `u` filled with `b` and `a` shifted left by the divisor's leading zero count, `u` one limb
+ * longer than `a` for what the shift moves out of the top. **Normalization is the shift**: the
+ * divisor's top bit has to be set for the digit estimate to be within one.
+ */
+private normalize(v: []Limb, u: []Limb, a: []const Limb, b: []const Limb)
+    val shift = usize(b[b.len - 1].leading_zeros())
+
+    if shift == 0
+        copy_n(v, b, b.len)
+        copy_n(u, a, a.len)
+        u[a.len] = 0
+    else
+        lshift(v, b, b.len, shift)
+        u[a.len] = lshift(u, a, a.len, shift)
+end normalize
+
+/** Algorithm D proper, over a normalized divisor `v[0..<n]` (`n >= 2`, top bit set) and a running
+ * remainder `u[0..<un]` whose top limb is below `v`'s: `q[0..<un - n]` gets the quotient and the
+ * bottom `n` limbs of `u` are left holding the remainder.
+ */
+private[bigint] divide_normalized(q: []Limb, u: []Limb, un: usize, v: []const Limb, n: usize)
     // One past the largest limb, `2^w`, as a double-width value.
     val radix = Wide(1) << limb_bits
-    val vn1 = Wide(v[n - 1])
+    val vn1 = v[n - 1]
     val vn2 = Wide(v[n - 2])
-    var j = m + 1
+    val inv = reciprocal(vn1)
+    var j = un - n
 
     while j > 0
         j -= 1
 
-        val top = Wide(u[j + n]) << limb_bits | Wide(u[j + n - 1])
-        var qhat = top / vn1
-        var rhat = top % vn1
+        val u2 = u[j + n]
+        val u1 = u[j + n - 1]
+        var qhat: Limb = 0
+        var rhat: Wide = 0
 
-        // Tighten the estimate. The first test is the one that matters when the top limbs happen to
-        // be equal, where the division above answers `2^w` exactly; the second is the two-limb
-        // refinement, and it is written second so that the first has already ruled out the overflow
-        // its own multiplication would otherwise have.
-        loop
-            if qhat >= radix || qhat * vn2 > (rhat << limb_bits | Wide(u[j + n - 2]))
-                qhat -= 1
-                rhat += vn1
+        // The first guess, from the top two limbs over the divisor's top one. The remainder's top
+        // limb never exceeds the divisor's, and where they are equal the true two-by-one quotient
+        // would be `2^w` or more: Knuth's first test caps it at `2^w - 1`, and the remainder of that
+        // guess is `u1 + vn1`, which may itself pass `2^w` -- in which case no tightening is needed.
+        if u2 >= vn1
+            qhat = ~Limb(0)
+            rhat = Wide(u1) + Wide(vn1)
+        else
+            val (qq, rr) = div_2by1(u2, u1, vn1, inv)
 
-                if rhat < radix then continue
+            qhat = qq
+            rhat = Wide(rr)
 
-            break
+        // Tighten the estimate with the divisor's second limb: the two-limb refinement.
+        while rhat < radix && Wide(qhat) * vn2 > (rhat << limb_bits | Wide(u[j + n - 2]))
+            qhat -= 1
+            rhat += Wide(vn1)
 
-        // Multiply the divisor by the guess and take it off the running remainder, one limb at a
-        // time, carrying the product and borrowing the difference in the same pass. A difference
-        // that goes below zero wraps at the double width, and its low half is the limb.
-        var borrow: Wide = 0
-        var carry: Wide = 0
+        // Multiply the divisor by the guess and take it off the running remainder.
+        val borrow = submul_1(u[j..], v, n, qhat)
+        val overshot = u2 < borrow
 
-        for i in 0..<n
-            val p = qhat * Wide(v[i]) + carry
-
-            carry = p >> limb_bits
-
-            val take = Wide(low_limb(p)) + borrow
-            val cur = Wide(u[j + i])
-
-            u[j + i] = low_limb(cur -% take)
-            borrow = if cur >= take then 0 else 1
-
-        val take = carry + borrow
-        val cur = Wide(u[j + n])
-        val overshot = cur < take
-
-        u[j + n] = low_limb(cur -% take)
+        u[j + n] = u2 -% borrow
 
         // The one case the estimate can still get wrong, and it is rare -- Knuth puts it at about
         // two in `2^w`. The subtraction went below zero, so the guess was one too large: put the
-        // divisor back and count one less.
+        // divisor back and count one less. The carry out of the top is the borrow the subtraction
+        // made, and is dropped.
         if overshot
             qhat -= 1
 
-            var c: Wide = 0
+            val c = add_n(u[j..], u[j..], v, n)
 
-            for i in 0..<n
-                val s = Wide(u[j + i]) + Wide(v[i]) + c
+            u[j + n] = u[j + n] +% c
 
-                u[j + i] = low_limb(s)
-                c = s >> limb_bits
+        q[j] = qhat
+end divide_normalized
 
-            // The carry out of the top limb is the borrow the subtraction made, and is dropped.
-            u[j + n] = low_limb(Wide(u[j + n]) + c)
-
-        q[j] = Limb(qhat)
-
-    (trimmed(q), shifted_right(u, shift, n))
-end divmod_mag
-
-/** Division by one limb, which is the ordinary short division and is not worth normalizing for:
- * every partial dividend fits a `Wide` on its own.
- */
+/** Division by one limb, which is the ordinary short division: a pass of `divrem_1`. */
 private[bigint] short_divide(a: []const Limb, d: Limb) -> ([]const Limb, []const Limb)
-    var q: Buf[Limb] = buf()
+    var q = fresh(a.len)
+    var r = fresh(1)
 
-    for i in 0..<a.len
-        q.push(0)
+    r[0] = divrem_1(q, a, a.len, d)
 
-    val dw = Wide(d)
-    var rem: Wide = 0
-    var i = a.len
-
-    while i > 0
-        i -= 1
-
-        val cur = rem << limb_bits | Wide(a[i])
-
-        q[i] = Limb(cur / dw)
-        rem = cur % dw
-
-    var r: Buf[Limb] = buf()
-
-    if rem != 0 then r.push(Limb(rem))
-
-    (trimmed(q), r.into_view())
+    (finished(q, a.len), finished(r, 1))
 end short_divide
-
-/** `x` shifted left by `shift` bits into `width` limbs, which is more limbs than `x` has where the
- * shift needs somewhere to go.
- *
- * A shift of zero is the case the guard is for: the bits carried up from the limb below are taken
- * with `>> (limb_bits - shift)`, a shift by the whole width there, which leaves zero -- the guard
- * says so rather than leaning on it.
- */
-private shifted_left(x: []const Limb, shift: usize, width: usize) -> Buf[Limb]
-    var out: Buf[Limb] = buf()
-
-    for i in 0..<width
-        var low: Limb = 0
-        var high: Limb = 0
-
-        if i < x.len then low = x[i] << shift
-        if shift > 0 && i > 0 && i - 1 < x.len then high = x[i - 1] >> (limb_bits - shift)
-
-        out.push(low | high)
-
-    out
-end shifted_left
-
-/** The first `n` limbs of `u` shifted back down by `shift`, which undoes what normalization did to
- * the remainder. The quotient needs no such undoing -- scaling both operands leaves it alone.
- */
-private shifted_right(u: Buf[Limb], shift: usize, n: usize) -> []const Limb
-    var out: Buf[Limb] = buf()
-
-    for i in 0..<n
-        var low = u[i] >> shift
-
-        if shift > 0 && i + 1 < n then low = low | u[i + 1] << (limb_bits - shift)
-
-        out.push(low)
-
-    trimmed(out)
-end shifted_right
 
 /** The empty magnitude, which is zero. It is a function rather than a constant because an array
  * literal is not a constant expression and a module-level `val` would be storage a freestanding
