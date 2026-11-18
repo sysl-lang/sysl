@@ -15,11 +15,13 @@ import sysl.time.monotonic
 
 private tmg_compiler() -> Option[string] = get("SYSL_STAGE2")
 
-// The phases a `sysl build` of a program says, in the order it said them, with what else it printed.
-private tmg_phases(binary: string, timed: bool) -> (Buf[string], string)
+// The phases a `sysl build` of a program says, in the order it said them, with what else it printed --
+// or, with `test` set, the phases of a `sysl test` of a project holding one test.
+private tmg_phases(binary: string, timed: bool, test: bool = false) -> (Buf[string], string)
     val dir = make_temp_dir("sysl-tmg").unwrap()
 
-    write_text(s"$dir/main.sysl", "main()\n    print(\"hi\")\n").unwrap()
+    write_text(s"$dir/main.sysl", "main()\n    print(\"hi\")\n\n@test(\"one\")\none()\n    assert_eq(1, 1)\n").unwrap()
+    write_text(s"$dir/sysl.hocon", "package { name = \"tmg\", version = \"0.1.0\" }\n").unwrap()
 
     var env: Buf[Var] = buf()
 
@@ -28,7 +30,8 @@ private tmg_phases(binary: string, timed: bool) -> (Buf[string], string)
 
     if timed then env.push(Var("SYSL_TIMINGS", "1"))
 
-    val said = capture(binary, ["build", s"$dir/main.sysl", "-o", s"$dir/main"], "", env.view(), true)
+    val said = if test then capture(binary, ["test", dir], "", env.view(), true)
+    else capture(binary, ["build", s"$dir/main.sysl", "-o", s"$dir/main"], "", env.view(), true)
 
     remove_dir_all(dir).unwrap_or(())
 
@@ -72,6 +75,36 @@ tmg_a_build_says_its_phases()
 
     // The checks' own lines are not phases, so they never reach the list above.
     assert(text.contains("sysl:   check keeps "), text)
+
+@test("SYSL_TIMINGS=1 says every phase of a test build too, with the printing of its text apart")
+tmg_a_test_build_says_its_phases()
+    val binary = tmg_compiler() match
+        None ->
+            print("skipped: SYSL_STAGE2 names no compiler binary")
+            return
+        Some(b) -> b
+
+    val (phases, text) = tmg_phases(binary, true, true)
+    var named = ""
+
+    for p in phases
+        named = named + p + ","
+
+    assert_eq(named, "parse std,parse program,declarations,bodies,checks,prune,std,codegen,print,link,", text)
+    assert(text.contains("1 passed, 0 failed"), text)
+
+@test("without SYSL_TIMINGS a test build says no phase")
+tmg_an_untimed_test_build_is_silent()
+    val binary = tmg_compiler() match
+        None ->
+            print("skipped: SYSL_STAGE2 names no compiler binary")
+            return
+        Some(b) -> b
+
+    val (phases, text) = tmg_phases(binary, false, true)
+
+    assert(phases.is_empty(), text)
+    assert(text.contains("1 passed, 0 failed"), text)
 
 // The milliseconds a report line ends with.
 private tmg_ms(line: string) -> int

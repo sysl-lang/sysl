@@ -2294,7 +2294,14 @@ test_build_of(path: string, named_target: Option[string],
 
     headers_refused(path)?
 
-    Ok(test_build_from(packaged_compilation_of(path, t)?, false, level, path, true)?)
+    // Timed as a build is (`SYSL_TIMINGS=1`): the suite's build is the heaviest compilation there is.
+    phase_start()
+
+    val program = packaged_compilation_of(path, t)?
+
+    phase_done("parse program")
+
+    Ok(test_build_from(program, false, level, path, true)?)
 end test_build_of
 
 // The same for a tree that **is** the standard module (`sysl test <root> --std`), which is how the
@@ -2360,14 +2367,18 @@ private test_build_from(program: Compilation, standalone: bool, level: string,
     val done = if standalone then analyze_produced(program.units, t, file_names(program.units))
     else analyze_bodies(program.units, t)
 
+    phase_done("bodies")
+
     val whole = program_of(done, done.main_module)
     val promotions = post_analysis_checks_of_tests(done.an, whole, program.own)
 
+    phase_done("checks")
     explain_drops(program, done.an, whole)
 
     val kept = tests_only(whole, program.own)
 
     check_library_hooks(done.an, kept)
+    phase_done("prune")
 
     var precompiled: Buf[string] = buf()
 
@@ -2376,9 +2387,13 @@ private test_build_from(program: Compilation, standalone: bool, level: string,
         Ok(Some(found)) -> precompiled = found.precompiled
         Ok(None) -> ()
 
+    phase_done("std")
+
     val lowered = codegen_with_gaps(kept with { precompiled = joined_names(precompiled,
                                                                            roots.precompiled) },
                                     t, promotions, imports_bodies(level), None, false, program.own)
+
+    phase_done("codegen")
 
     check_aligned_heap(done.an, kept)
 
@@ -2395,6 +2410,8 @@ private test_build_from(program: Compilation, standalone: bool, level: string,
 
     val emitted = Emitted(ir_print_module(lowered.0), report, lowered.1,
                           link_required(program.units), roots.archives)
+
+    phase_done("print")
 
     Ok(TestBuild(emitted, kept.tests, t, standalone))
 end test_build_from
@@ -2434,13 +2451,17 @@ build_test_binary_cached(path: string, build: TestBuild, cc: Option[string], lev
     slot match
         Some(reserved) ->
             val exe = link_into_cache(path, build.emitted.text, build.target, cc, level, reserved,
-                                      build.standalone, build.emitted.links, build.emitted.archives)?
+                                      build.standalone, build.emitted.links, build.emitted.archives)
 
-            Ok((exe, true))
+            phase_done("link")
+
+            Ok((exe?, true))
         None ->
-            val made = build_test_binary(path, build, cc, level)?
+            val made = build_test_binary(path, build, cc, level)
 
-            Ok((made, false))
+            phase_done("link")
+
+            Ok((made?, false))
 end build_test_binary_cached
 
 // The directory a test binary was built in, taken away. The binary is the only thing in it, so the

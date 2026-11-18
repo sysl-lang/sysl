@@ -346,6 +346,87 @@ tbc_jobs_bound_the_link()
     remove_dir_all(objects).unwrap_or(())
 end tbc_jobs_bound_the_link
 
+// The suite above, run with `args` and six units, answering the clang limit in force and the most
+// clangs that were out at once.
+private tbc_unit_jobs(root: string, args: []const string) -> (int, usize, usize)
+    val objects = make_temp_dir("sysl-tbc-cobj").unwrap()
+    val k = cstring("SYSL_CODEGEN_UNITS")
+    val v = cstring("6")
+
+    use_c_object_cache_dir(Some(objects))
+    tbc_c_setenv(k.ptr, v.ptr, 1)
+
+    val got = tbc_in_process(args)
+
+    tbc_c_unsetenv(k.ptr)
+    use_c_object_cache_dir(None)
+    remove_dir_all(objects).unwrap_or(())
+    (got.code, unit_jobs_limit(), most_units_at_once())
+end tbc_unit_jobs
+
+@test("tbc: --build-jobs 1 builds one unit at a time while --jobs still runs the tests four at once")
+tbc_build_jobs_serialize_the_link()
+    if !tbc_ready() then return
+
+    val root = tbc_mixed()
+    val got = tbc_unit_jobs(root, [root, "--jobs", "4", "--build-jobs", "1", "--filter", "adds"])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(got.0, Fine)
+    assert_eq(got.1, 1)
+    assert_eq(got.2, 1)
+end tbc_build_jobs_serialize_the_link
+
+@test("tbc: --build-jobs may be wider than --jobs")
+tbc_build_jobs_wider_than_jobs()
+    if !tbc_ready() then return
+
+    val root = tbc_mixed()
+    val got = tbc_unit_jobs(root, [root, "--jobs", "1", "--build-jobs", "3", "--filter", "adds"])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(got.0, Fine)
+    assert_eq(got.1, 3)
+end tbc_build_jobs_wider_than_jobs
+
+@test("tbc: the manifest's 'test.build_jobs' bounds the link, and '--build-jobs' beats it")
+tbc_build_jobs_from_the_manifest()
+    if !tbc_ready() then return
+
+    val root = tbc_mixed()
+
+    tbc_write(root, "sysl.hocon", "package { name = \"mixed\", version = \"0.1.0\" }\ntest { build_jobs = 1 }\n")
+
+    val block = tbc_unit_jobs(root, [root, "--jobs", "4", "--filter", "adds"])
+    val flag = tbc_unit_jobs(root, [root, "--build-jobs", "2", "--filter", "adds"])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(block.0, Fine)
+    assert_eq(block.1, 1)
+    assert_eq(block.2, 1)
+    assert_eq(flag.0, Fine)
+    assert_eq(flag.1, 2)
+end tbc_build_jobs_from_the_manifest
+
+@test("tbc: --build-jobs takes a whole number from one up, and is a misuse otherwise")
+tbc_build_jobs_refused_unless_a_count()
+    if !tbc_ready() then return
+
+    val root = tbc_mixed()
+
+    for bad in ["0", "-1", "many", ""]
+        val got = tbc_in_process([root, "--build-jobs", bad])
+
+        assert_eq(got.code, Misused)
+        assert(got.out.contains(s"'--build-jobs' takes how many of the test build's compiles may run at once, " +
+                                s"a whole number from 1 up, and '$bad' is not one"), got.err)
+
+    val missing = tbc_in_process([root, "--build-jobs"])
+
+    assert_eq(missing.code, Misused)
+    remove_dir_all(root).unwrap_or(())
+end tbc_build_jobs_refused_unless_a_count
+
 // --- the command line against the same run in process ----------------------------------------------
 
 @test("tbc: the command line answers a passing and failing suite as a run in process does")

@@ -277,6 +277,7 @@ test {
 | key | what it says | the flag it is the default for |
 |---|---|---|
 | `jobs` | how many tests may run at once, a whole number from 1 up | `--jobs` |
+| `build_jobs` | how many of the suite's build compiles may run at once; `jobs` where it is not said | `--build-jobs` |
 | `timeout` | the seconds each test may run, 0 for no limit | `--timeout` |
 | `alone` | the tests that run with no other test beside them | — |
 
@@ -288,7 +289,8 @@ running, and nothing starts beside it until it is in; the rest of the suite stil
 it. A suite whose every test is like that says `jobs = 1` instead.
 
 **The flag beats the key, and the key beats the default**, as with
-[`optimization`](#the-optimization-level-a-project-is-built-at). A test's own
+[`optimization`](#the-optimization-level-a-project-is-built-at). The build's count is the one that
+falls back further: `--build-jobs`, then `build_jobs`, then whatever settled `jobs`. A test's own
 [`@test(timeout: n)`](/reference/attributes/#a-test-may-be-given-a-limit) beats both limits. In a
 workspace, each member's suite is run by its own block.
 
