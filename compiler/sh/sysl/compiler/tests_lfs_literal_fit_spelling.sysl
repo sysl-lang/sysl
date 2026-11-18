@@ -259,3 +259,38 @@ lfs_plain_assignment()
                 "a constant shifted by 40 places, at or past the 32 bits of u32", "2:9")
     lfs_clean("var b: u8 = 1\nb = 200\nprint(b)\n")
 end lfs_plain_assignment
+
+// -- every compound operator words the refusal as plain assignment does -----------------------------
+
+private lfs_wide_cases() -> [5](string, string) =
+    [("u8", "300"), ("i16", "70000"), ("u64", "18446744073709551616"),
+     ("u128", "340282366920938463463374607431768211456"), ("i8", "-200")]
+
+@test("every compound operator names the place's type, as plain assignment does, at every width")
+lfs_compound_operator_matrix()
+    val ops = ["+=", "-=", "*=", "/=", "%=", "<<=", ">>=", "&=", "|=", "^="]
+    val cases = lfs_wide_cases()
+
+    for i in 0..<5
+        val ty = cases[i].0
+        val lit = cases[i].1
+        val msg = s"the literal $lit does not fit $ty"
+
+        lfs_refused(s"var v: $ty = 1\nv = $lit\nprint(v)\n", msg, "2:5")
+
+        for j in 0..<ops.len
+            lfs_refused(s"var v: $ty = 1\nv ${ops[j]} $lit\nprint(v)\n", msg, s"2:${ops[j].bytes.len + 4}")
+end lfs_compound_operator_matrix
+
+@test("a compound assignment names the type for a constant, literal arithmetic and a field or element place")
+lfs_compound_other_places()
+    lfs_refused("const K = 300\nvar v: u8 = 1\nv += K\nprint(v)\n", "the constant 'K' (300) does not fit u8", "3:6")
+    lfs_refused("var v: u8 = 1\nv *= 60 * 52\nprint(v)\n", "the value 3120 does not fit u8", "2:6")
+    lfs_refused("var v: i16 = 1\nv <<= 70000\nprint(v)\n", "the literal 70000 does not fit i16", "2:7")
+    lfs_refused("struct S\n    a: u8\nend S\n\nvar s = S(a = 1)\ns.a += 300\nprint(s.a)\n",
+                "the literal 300 does not fit u8", "6:8")
+    lfs_refused("var a: [2]u8 = [1, 2]\na[0] -= 300\nprint(a[0])\n", "the literal 300 does not fit byte", "2:9")
+    lfs_refused("type Small = u8\n\nvar v: Small = 1\nv |= 300\nprint(v)\n",
+                "the literal 300 does not fit Small (aka byte)", "4:6")
+    lfs_clean("var v: u8 = 1\nv += 254\nv ^= 255\nprint(v)\n")
+end lfs_compound_other_places

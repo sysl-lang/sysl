@@ -901,3 +901,297 @@ no_negative_zero()
         assert_eq(z.to_string(), "0")
         assert_eq(z.hash(), zero().hash())
 end no_negative_zero
+
+// -- the fast algorithms against the plain ones ----------------------------------------------------
+//
+// **Each fast algorithm is checked against a slow one that shares none of its code**, over sizes
+// that straddle its threshold -- the boundary is where a fast algorithm hands over to the plain one,
+// and an off-by-one in a split shows only on one side of it. The plain multiply is written out here
+// rather than taken from the module, so a defect in the module's own kernels cannot hide on both
+// sides of an `assert_eq`.
+
+/** The schoolbook product written the plain way, as the module wrote it before it had kernels. */
+private naive_mul(a: BigInt, b: BigInt) -> BigInt
+    if a.is_zero() || b.is_zero() then return zero()
+
+    var out: Buf[Limb] = buf()
+
+    for _ in 0..<(a.mag.len + b.mag.len) do out.push(0)
+
+    for i in 0..<a.mag.len
+        var carry: Wide = 0
+
+        for j in 0..<b.mag.len
+            val t = Wide(a.mag[i]) * Wide(b.mag[j]) + Wide(out[i + j]) + carry
+
+            out[i + j] = low_limb(t)
+            carry = t >> limb_bits
+
+        out[i + b.mag.len] = low_limb(carry)
+
+    BigInt(a.minus != b.minus, trimmed(out))
+end naive_mul
+
+/** Sizes around a threshold: below it, at it, just past it, at twice it and its neighbours, and a
+ * few well past it -- where the recursion splits more than once and the halves come out odd.
+ */
+private sizes_around(t: usize) -> Buf[usize]
+    var out: Buf[usize] = buf()
+
+    for s in [1, t - 1, t, t + 1, t * 2 - 1, t * 2, t * 2 + 1, t * 3 + 7, t * 5 + 3]
+        out.push(s)
+
+    out
+end sizes_around
+
+@test("Karatsuba agrees with the plain product across its threshold, balanced and not")
+karatsuba_against_plain()
+    var g = rng(20261117, 11)
+    val sizes = sizes_around(karatsuba_threshold)
+
+    for an in sizes
+        for bn in sizes
+            val a = random_big(&g, an, an % 2 == 0)
+            val b = random_big(&g, bn, bn % 3 == 0)
+
+            assert_eq(mul(a, b), naive_mul(a, b))
+end karatsuba_against_plain
+
+@test("a square, and a product with every limb set, carry through every Karatsuba sum")
+karatsuba_carries()
+    var g = rng(5, 5)
+
+    // Every limb set makes `a0 + a1` carry out of its `k` limbs, which is the branch the sums'
+    // top limb exists for; the square makes both sums carry at once.
+    for n in [karatsuba_threshold + 1, karatsuba_threshold * 2 + 1, karatsuba_threshold * 4]
+        val ones = sub(shl(one(), n * limb_bits), one())
+
+        assert_eq(mul(ones, ones), naive_mul(ones, ones))
+
+        val a = random_big(&g, n, false)
+
+        assert_eq(mul(a, a), naive_mul(a, a))
+        assert_eq(mul(ones, a), naive_mul(ones, a))
+end karatsuba_carries
+
+@test("Toom-3 agrees with the plain product across its threshold, with every sign of evaluation")
+toom_against_plain()
+    var g = rng(31, 3)
+
+    for an in sizes_around(toom_threshold)
+        // From the shortest `b` that still takes Toom-3 to `a`'s own length.
+        for bn in [an * 2 / 3 + 1, an * 3 / 4, an - 1, an]
+            if bn == 0 || bn > an then continue
+
+            val a = random_big(&g, an, false)
+            val b = random_big(&g, bn, true)
+
+            assert_eq(mul(a, b), naive_mul(a, b))
+
+            // Every limb set makes the sums at 1 carry, and a small middle third makes the values at
+            // -1 and -2 negative -- each sign of each point.
+            val ones = sub(shl(one(), an * limb_bits), one())
+            val dip = sub(ones, shl(sub(shl(one(), (an / 3) * limb_bits), one()), (an / 3) * limb_bits))
+
+            assert_eq(mul(ones, b), naive_mul(ones, b))
+            assert_eq(mul(dip, b), naive_mul(dip, b))
+
+        // A power of two is all zero limbs under its top one, so every piece but the top is zero or
+        // has zeros at its own top -- which a piece has to drop before it is a value.
+        val p = shl(one(), an * limb_bits - 3)
+
+        assert_eq(mul(p, p), shl(one(), an * limb_bits * 2 - 6))
+        val c = random_big(&g, an, false)
+
+        assert_eq(mul(p, c), naive_mul(p, c))
+        assert_eq(mul(c, p), shl(c, an * limb_bits - 3))
+end toom_against_plain
+
+@test("a square agrees with the plain product at every size around the threshold")
+squaring_against_plain()
+    var g = rng(8, 8)
+
+    for n in sizes_around(karatsuba_threshold)
+        val a = random_big(&g, n, n % 2 == 1)
+
+        assert_eq(square(a), naive_mul(a, a))
+
+        // Every limb set carries out of every sum, the doubled cross products included.
+        val ones = sub(shl(one(), n * limb_bits), one())
+
+        assert_eq(square(ones), naive_mul(ones, ones))
+
+    assert_eq(square(zero()), zero())
+    assert_eq(square(from_int(-3)), from_int(9))
+end squaring_against_plain
+
+@test("the recursive division agrees with algorithm D, and with the identity, across its threshold")
+recursive_division_against_algorithm_d()
+    var g = rng(42, 17)
+    val sizes = sizes_around(dc_threshold)
+
+    for bn in sizes
+        if bn < 2 then continue
+
+        for extra in [dc_threshold - 1, dc_threshold, dc_threshold + 3, bn, bn * 2 + 5]
+            val a = random_big(&g, bn + extra, false)
+            val b = random_big(&g, bn, false)
+            val (q, r) = divmod_mag(a.mag, b.mag)
+            val (lq, lr) = long_divide(a.mag, b.mag)
+
+            assert_eq(cmp_mag(q, lq), 0)
+            assert_eq(cmp_mag(r, lr), 0)
+            assert(cmp_mag(r, b.mag) < 0)
+            assert_eq(add(mul(normalized(false, q), b), normalized(false, r)), a)
+end recursive_division_against_algorithm_d
+
+@test("a quotient of every limb set takes the recursive division's capped guess at every level")
+recursive_division_capped_guess()
+    var g = rng(9, 9)
+
+    // `b B^m - 1` over `b` is `B^m - 1` with remainder `b - 1`: every quotient limb is the largest
+    // there is, so the top of each partial dividend equals the divisor's top and the guess has to be
+    // capped rather than divided for.
+    for bn in [dc_threshold, dc_threshold * 2 + 1, dc_threshold * 4 - 3]
+        val b = random_big(&g, bn, false)
+
+        for m in [dc_threshold, bn + 1, bn * 2]
+            val a = sub(shl(b, m * limb_bits), one())
+            val (q, r) = div_rem(a, b)
+
+            assert_eq(q, sub(shl(one(), m * limb_bits), one()))
+            assert_eq(r, sub(b, one()))
+end recursive_division_capped_guess
+
+@test("division by a single limb takes every normalization shift")
+short_division_shifts()
+    var g = rng(3, 1)
+    val a = random_big(&g, 30, false)
+
+    for s in 0..<limb_bits
+        val d = Limb(1) << s | Limb(g.next_u64()) >> (limb_bits - s)
+
+        if d == 0 then continue
+
+        val b = normalized(false, mag_of_u64(u64(d)))
+        val (q, r) = div_rem(a, b)
+
+        assert_eq(add(naive_mul(q, b), r), a)
+        assert(cmp(r, b) < 0)
+end short_division_shifts
+
+/** Base ten the slow way: eighteen digits at a time off the bottom with `div_rem_long`, which is a
+ * short division and nothing else.
+ */
+private slow_decimal(x: BigInt) -> string
+    var parts: Buf[long] = buf()
+    var v = abs(x)
+
+    while !v.is_zero()
+        val (q, r) = div_rem_long(v, 1000000000000000000)
+
+        parts.push(r)
+        v = q
+
+    if parts.len() == 0 then return "0"
+
+    var out = s"${parts[parts.len() - 1]}"
+    var i = parts.len() - 1
+
+    while i > 0
+        i -= 1
+
+        val piece = s"${parts[i]}"
+
+        for _ in piece.len..<18 do out = out + "0"
+        out = out + piece
+
+    if x.minus then "-" + out else out
+end slow_decimal
+
+@test("the divide-and-conquer conversions agree with a digit-chunk loop across their threshold")
+text_against_slow()
+    var g = rng(77, 2)
+
+    for n in [text_threshold - 1, text_threshold, text_threshold + 1, text_threshold * 2 + 1,
+              text_threshold * 7]
+        val x = random_big(&g, n, n % 2 == 1)
+        val s = to_string(x)
+
+        assert_eq(s, slow_decimal(x))
+        assert_eq(parse(s).unwrap(), x)
+        assert_eq(parse_radix(to_string_radix(x, 7), 7).unwrap(), x)
+        assert_eq(parse_radix(to_string_radix(x, 36), 36).unwrap(), x)
+end text_against_slow
+
+@test("a remainder with leading zeros keeps them as digits of the whole")
+text_inner_zeros()
+    // `10^k` and its neighbours put long runs of zeros wherever a split falls.
+    val places: []usize = [800, 1500, 4000]
+
+    for k in places
+        val p = pow(from_int(10), k)
+        val s = to_string(p)
+
+        assert_eq(s.len, k + 1)
+        assert_eq(parse(s).unwrap(), p)
+        assert_eq(to_string(add(p, one())), slow_decimal(add(p, one())))
+        assert_eq(to_string(sub(p, one())), slow_decimal(sub(p, one())))
+end text_inner_zeros
+
+@test("3^50000 has the digits an independent implementation gives")
+text_large_pinned()
+    // Python's own integers, which share no code with this: 23857 digits, these at each end.
+    val s = to_string(pow(from_int(3), 50000))
+
+    assert_eq(s.len, 23857)
+    assert_eq(s[0..<25], "1155409630490589891144596")
+    assert_eq(s[s.len - 25..], "0618632083774432761000001")
+    assert_eq(parse(s).unwrap(), pow(from_int(3), 50000))
+end text_large_pinned
+
+/** Euclid the plain way, a full division per step. */
+private plain_gcd(a: BigInt, b: BigInt) -> BigInt
+    var x = abs(a)
+    var y = abs(b)
+
+    while !y.is_zero()
+        val r = rem(x, y)
+
+        x = y
+        y = r
+
+    x
+end plain_gcd
+
+@test("Lehmer's gcd agrees with plain Euclid over generated pairs of every shape")
+lehmer_against_plain()
+    var g = rng(1234, 8)
+
+    for n in 0..<60
+        val an = 1 + usize(n % 13) * 3
+        val bn = if n % 4 == 0 then an else 1 + usize(n % 11)
+        val c = random_big(&g, 1 + usize(n % 3), false)
+
+        // A shared factor, so the answer is not almost always one.
+        val a = mul(random_big(&g, an, n % 2 == 0), c)
+        val b = mul(random_big(&g, bn, n % 5 == 0), c)
+
+        assert_eq(gcd(a, b), plain_gcd(a, b))
+end lehmer_against_plain
+
+@test("gcd of two Fibonacci numbers is the Fibonacci number at the gcd of their places")
+lehmer_fibonacci()
+    // Consecutive Fibonacci numbers are Euclid's worst case: every quotient is one, which is the
+    // case Lehmer's leading-bit steps take the most of at once.
+    var fib: Buf[BigInt] = buf()
+
+    fib.push(zero())
+    fib.push(one())
+
+    for i in 2..<4501 do fib.push(add(fib[i - 1], fib[i - 2]))
+
+    assert_eq(gcd(fib[4500], fib[3000]), fib[1500])
+    assert_eq(gcd(fib[4500], fib[4499]), one())
+    assert_eq(gcd(fib[2310], fib[1001]), fib[77])
+end lehmer_fibonacci
