@@ -38,7 +38,8 @@ end swr_accepts
 private swr_message(head: string, through: string, owner: string) -> string =
     s"$head a field reached through a '$through', which is read-only: every thread holding the " +
     "reference may reach it at once, and a plain write would race theirs. Make the field an " +
-    s"'Atomic', name it in a '@guards' so a write holds the lock, or write '@unchecked(Share)' above " +
+    s"'Atomic', name it in a '@guards' (the field is then private, so only the type's own members write it, " +
+    "and they must take the lock, which is not checked), or write '@unchecked(Share)' above " +
     s"'$owner' where its writes are synchronised another way"
 
 private val swr_cell: string = raw"""
@@ -243,6 +244,33 @@ swr_guarded_field()
     swr_accepts(shelf + "s.value = 3\nprint(s.value)\n")
     swr_says(shelf + "s.other = 3\n", swr_message("this assignment writes", "&sync Shelf", "Shelf"))
 end swr_guarded_field
+
+// What `@guards` does NOT check: that a member of the program's own type takes the lock. The type's
+// members are the only writers of the private field, and they are trusted. The program compiles with
+// no lock taken, as the reference page's example says.
+@test("a '@guards' member that never takes the lock is accepted: the members are trusted")
+swr_guarded_member_untaken_lock()
+    if !azd_ready() then return
+
+    swr_accepts(raw"""
+        import sysl.sync.SpinLock
+
+        @guards(n)
+        struct Cell
+            lock: SpinLock
+            private n: u64
+
+            bump(*self)
+                self.n += 1
+
+            get(self) -> u64 = self.n
+
+        val c: &sync Cell = Cell(SpinLock(0), 0)
+
+        c.bump()
+        print(c.get())
+        """)
+end swr_guarded_member_untaken_lock
 
 @test("a 'Mutex' or a 'SpinLock' field is used through its own members")
 swr_lock_fields()
