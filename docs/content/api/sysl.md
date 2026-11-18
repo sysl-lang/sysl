@@ -1112,7 +1112,7 @@ trait Div[Rhs = Self, Out = Self]
 
 ```sysl
 trait Drop
-    drop(self)
+    drop(*self)
 ```
 
 What a type does when the last reference to one of its values goes (`reference/memory.md § A
@@ -1148,9 +1148,14 @@ caller to receive an error and no `?` to carry one out. A close whose failure th
 about is called explicitly, where there is somewhere to report it; the destructor is the backstop
 for the paths that did not.
 
+**An implementation writes `drop(self)` or `drop(*self)`.** `(self)` is handed a copy of the
+value, which is all a destructor that reads a field needs. `(*self)` is handed the address of the
+object's own storage -- the address every `(*self)` method saw while it lived -- for the destructor
+that gives C back a pointer it registered, or wipes the storage itself.
+
 | Member | Signature | Description |
 |---|---|---|
-| `drop` | `drop(self)` |  |
+| `drop` | `drop(*self)` |  |
 
 ### `Eq`
 
