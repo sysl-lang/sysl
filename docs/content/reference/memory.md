@@ -186,7 +186,8 @@ true
 **A `*T` may be null, and a null one inside `Some` reads back as `None`**, since the two are the same
 bits. That is what makes an `Option[*T]` the nullable C pointer an extern declares
 ([`ffi.md`](ffi.md#a-nullable-pointer-is-an-option)), and it is the one case where `Some(p).is_some()`
-is false:
+is false. Generic code meets it too: a `Buf[*T]` holding a null element pops it as `None`, so a collection that must keep null pointers apart from absence holds them as `usize`
+addresses instead.
 
 ```sysl
 val p: *int = null

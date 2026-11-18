@@ -154,9 +154,7 @@ nnc_thirty_two_bits()
         """, target_named("thumb-freestanding").unwrap())
 
     assert_eq(b.0, "")
-    nnc_says(b.1, "%enum.Option_")
-    nnc_says(b.1, "= type { [1 x i32] }")
-
+    nnc_says(b.1, "%enum.sysl$Option.ptr.Cell = type { [1 x i32] }")
 // -- every way the variant is read ----------------------------------------------------------------
 
 @test("a match, unwrap, unwrap_or, is_none and ? read an Option of a reference by its address")
@@ -203,8 +201,8 @@ nnc_generic_methods()
         print(nums.unwrap(), back.unwrap().v, none.map(n -> n.v).is_none())
         print(some.filter(n -> n.v > 9).is_none(), some.filter(n -> n.v < 9).unwrap().v)
         print(some.ok_or("gone").is_ok(), none.ok_or("gone").is_err())
-        print(wrap(3).unwrap(), wrap(&some).is_some())
-        """, "", "5 50 true\ntrue 4\ntrue true\n3 true\n")
+        print(wrap(3).unwrap(), wrap(none).unwrap().is_none(), wrap(some).unwrap().unwrap().v)
+        """, "", "5 50 true\ntrue 4\ntrue true\n3 true 4\n")
 
 // -- ownership ------------------------------------------------------------------------------------
 
@@ -288,6 +286,19 @@ nnc_module_storage()
         print(held.is_some())
         """, "", "7 true true true\ntrue\nfalse\n")
 
+@test("generic code meets the niche: a Buf of pointers pops a null element as None")
+nnc_generic_null_element()
+    nnc_prints(raw"""
+        import sysl.buf.{Buf, buf}
+
+        var x = 5
+        var b: Buf[*int] = buf()
+
+        b.push(&x)
+        b.push(null)
+        print(b.pop().is_none(), b.pop().is_some(), b.len())
+        """, "", "true true 0\n")
+
 // -- the C boundary -------------------------------------------------------------------------------
 
 private val nnc_c: string = raw"""
@@ -333,7 +344,9 @@ nnc_extern_null()
         print(c_through(1), c_through(0))
         """, nnc_c, "true true 41\n1 0\n42 1\n41 -1\n")
 
-@test("an extern's Option of a pointer is a plain ptr in the LLVM signature")
+// A result is named by its width on AArch64 (`cabi.sysl`), so it is the argument that shows the
+// address; neither travels through memory.
+@test("an extern's Option of a pointer crosses in one register, an argument as a plain ptr")
 nnc_extern_signature()
     if std_root().is_err() then return
 
@@ -345,8 +358,9 @@ nnc_extern_signature()
         """, host_target())
 
     assert_eq(b.0, "")
-    nnc_says(b.1, "declare ptr @c_find(i32")
-    nnc_says(b.1, "@c_is_null(ptr")
+    nnc_says(b.1, " @c_find(i32)\n")
+    nnc_says(b.1, "declare i32 @c_is_null(ptr)\n")
+    assert(!b.1.contains("sret"), b.1)
 
 @test("the header spells an exported Option of a pointer as the C pointer")
 nnc_header()
@@ -358,7 +372,7 @@ nnc_header()
         """, host_target())
 
     assert_eq(b.0, "")
-    nnc_says(c_header_render(exports_by_symbol(b.2), "demo"), "int32_t *s_pick(int32_t *p);")
+    nnc_says(c_header_render(exports_by_symbol(b.2), "demo"), "int32_t * s_pick(int32_t * p);")
 
 @test("an exported Option of a counted reference is refused with the counted reference's advice")
 nnc_export_counted_refused()

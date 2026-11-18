@@ -5655,7 +5655,7 @@ the register should hold:
 ```text
 var block: [256]u8 = [0; 256]            // at least tls_room()
 val tp = tls_place(block[..]).unwrap()   // copies .tdata, zeroes .tbss
-write_sysreg("tpidr_el0", u64(usize(tp)))
+write_sysreg("tpidr_el0", u64(tp))
 ```
 
 A thread that never gets a block reads whatever the register points at, as it would through any
