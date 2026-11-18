@@ -1,0 +1,339 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.math.bigint.{from_int, to_string}
+
+// **Memory read as another type, while compiling** (`const_bytes.sysl`): a read through a pointer
+// converted to another type is answered from the bytes the values it reaches are laid out in, in the
+// target's byte order, and a write lays its value over them. The axes: the width read (16, 32, 64),
+// where it starts (the first byte, an unaligned one, an element past it), the form (`p[k]`, `*p`, a
+// compound write), the storage (an array's elements, a whole array, a scalar local, a struct's field),
+// the types on either side (integers of both signs, floats, `bool`), the byte order (only
+// little-endian targets exist, so big-endian is asked of the layout functions directly), and a read
+// or write outside the storage, which is refused. The bare-target case is the one the change was
+// made for: a `val` whose initializer reads so, reached from an `@export`, now folds into data.
+
+@test("a read through a reinterpreting pointer folds at each width, aligned or not")
+crr_reads_at_each_width_and_offset()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        const bytes16() -> [16]u8
+            var b: [16]u8 = [0; 16]
+
+            for i in 0..<16
+                b[i] = u8(i + 1)
+
+            b
+
+        const r16(at: usize) -> u16
+            var b = bytes16()
+            val p: *u16 = ptr_cast(&b[at])
+            p[0]
+
+        const r32(at: usize, k: int) -> u32
+            var b = bytes16()
+            val p: *u32 = ptr_cast(&b[at])
+            p[k]
+
+        const r64(at: usize) -> u64
+            var b = bytes16()
+            val p: *u64 = ptr_cast(&b[at])
+            *p
+
+        const neg() -> i16
+            var b: [2]u8 = [0xFF, 0xFE]
+            val p: *i16 = ptr_cast(&b[0])
+            *p
+
+        const A: u16 = r16(0)
+        const B: u16 = r16(1)
+        const C: u32 = r32(0, 0)
+        const D: u32 = r32(3, 0)
+        const E: u32 = r32(0, 1)
+        const F: u64 = r64(0)
+        const G: u64 = r64(5)
+        const H: i16 = neg()
+
+        print(A, B, C, D, E, F, G, H)
+        """), "513 770 67305985 117835012 134678021 578437695752307201 940138559942690566 -257\n")
+end crr_reads_at_each_width_and_offset
+
+@test("a whole array, a scalar and an array of wider elements read as another type")
+crr_reads_over_other_storage()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        const whole() -> u32
+            var b: [4]u8 = [1, 2, 3, 4]
+            val p: *u32 = ptr_cast(&b)
+            *p
+
+        const low_and_high() -> int
+            var w: u32 = 0x11223344
+            val p: *u8 = ptr_cast(&w)
+            int(p[0]) * 1000 + int(p[3])
+
+        const halves() -> u32
+            var h: [2]u16 = [0x1122, 0x3344]
+            val p: *u32 = ptr_cast(&h[0])
+            *p
+
+        const W: u32 = whole()
+        const L: int = low_and_high()
+        const S: u32 = halves()
+
+        print(W, L, S)
+        """), "67305985 68017 860098850\n")
+end crr_reads_over_other_storage
+
+@test("a float's bits read as an integer, and an integer's as a float")
+crr_float_reinterpretation()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        const f32_bits(x: f32) -> u32
+            var f = x
+            val p: *u32 = ptr_cast(&f)
+            *p
+
+        const pi_of_bits() -> real
+            var u: u64 = 0x400921FB54442D18
+            val p: *real = ptr_cast(&u)
+            *p
+
+        const B: u32 = f32_bits(1.0)
+        const PI: real = pi_of_bits()
+
+        print(B, PI)
+        """), "1065353216 3.141592653589793\n")
+end crr_float_reinterpretation
+
+@test("a write through a reinterpreting pointer lands in the bytes of what it points at")
+crr_writes_through_a_reinterpreting_pointer()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        const patched() -> u32
+            var b: [4]u8 = [0, 0, 0, 0]
+            val p: *u16 = ptr_cast(&b[1])
+            p[0] = 0xABCD
+            val q: *u32 = ptr_cast(&b[0])
+            *q
+
+        const bumped() -> u32
+            var b: [4]u8 = [0xFF, 0, 0, 0]
+            val p: *u16 = ptr_cast(&b[0])
+            p[0] += 1
+            *p += 2
+            val q: *u32 = ptr_cast(&b)
+            *q
+
+        const float_in() -> u32
+            var u: u32 = 0
+            val p: *f32 = ptr_cast(&u)
+            *p = 1.0
+            u
+
+        const P: u32 = patched()
+        const B: u32 = bumped()
+        const F: u32 = float_in()
+
+        print(P, B, F)
+        """), "11259136 258 1065353216\n")
+end crr_writes_through_a_reinterpreting_pointer
+
+@test("a read or write outside the storage, or of bytes that are no value, is refused rather than folded")
+crr_refusals()
+    if !enm_ready() then return
+
+    val said = enm_outcome(raw"""
+        struct S
+            a: u8
+            b: u8
+
+        struct A
+            v: int
+
+        past_end() -> u32
+            var b: [4]u8 = [1, 2, 3, 4]
+            val p: *u32 = ptr_cast(&b[1])
+            p[0]
+
+        before() -> u16
+            var b: [4]u8 = [1, 2, 3, 4]
+            val p: *u16 = ptr_cast(&b[0])
+            p[-1]
+
+        field() -> u16
+            var s = S(1, 2)
+            val p: *u16 = ptr_cast(&s.a)
+            *p
+
+        not_bool() -> bool
+            var b: [2]u8 = [2, 0]
+            val p: *bool = ptr_cast(&b[0])
+            *p
+
+        into_bool() -> bool
+            var b: [2]bool = [false, false]
+            val p: *u8 = ptr_cast(&b[0])
+            p[1] = 7
+            b[1]
+
+        record() -> u32
+            var a = A(1)
+            val p: *u32 = ptr_cast(&a)
+            *p
+
+        const K1: u32 = past_end()
+        const K2: u16 = before()
+        const K3: u16 = field()
+        const K4: bool = not_bool()
+        const K5: bool = into_bool()
+        const K6: u32 = record()
+
+        print(K1, K2, K3, K4, K5, K6)
+        """).0
+
+    // A width is shown by the C name it is the same type as: 'uint', 'ushort', 'byte'.
+    for part in ["'K1' cannot be computed while compiling: a 'uint' read or written at element 0 through a pointer " +
+                 "converted from a '*byte' reaches outside the storage the address is in, 4 bytes long — what lies " +
+                 "there exists only when the program runs",
+                 "'K2' cannot be computed while compiling: a 'ushort' read or written at element -1",
+                 "'K3' cannot be computed while compiling: a 'ushort' read or written at element 0 through a pointer " +
+                 "converted from a '*byte' reaches outside the storage the address is in, 1 byte long",
+                 "'K4' cannot be computed while compiling: the bytes read as a 'bool' are not a value of it",
+                 "'K5' cannot be computed while compiling: a write through a pointer converted from a 'bool' " +
+                 "leaves bytes that are no 'bool'",
+                 "'K6' cannot be computed while compiling: memory a '*A' points at, read as another type, is not " +
+                 "evaluated while compiling — the bytes of integers, floats, 'bool', 'char' and fixed arrays of " +
+                 "them are laid out while compiling, and a 'A' is none of those"]
+        assert(said.contains(part), said)
+end crr_refusals
+
+// -- the bare target ---------------------------------------------------------------------------------
+
+private crr_build_c(text: string) -> (int, string)
+    val root = make_temp_dir("sysl-crr-c").unwrap()
+
+    write_text(s"$root/sysl.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    var said: Buf[string] = buf()
+    val sink = &said
+    var args: [7]string = ["sysl", "build-c", "--target", "thumb-freestanding-softfp", "-o", s"$root/probe.a", root]
+    val code = run_cli(args[..], piece -> sink.push(piece))
+
+    reset_search_paths()
+    remove_dir_all(root).unwrap_or(())
+
+    var text_out = ""
+
+    for piece in said
+        text_out = text_out + piece
+
+    (code, text_out)
+end crr_build_c
+
+@test("an exported function on a bare target reads a val folded through a reinterpreting pointer")
+crr_bare_target_export_folds()
+    if std_root().is_err() || !clang_available() then return
+
+    val (code, said) = crr_build_c(raw"""
+        const word(bytes: [4]u8) -> u32
+            var b = bytes
+            val p = ptr_cast[*u32](&b[0])
+            p[0]
+
+        val W: u32 = word([1, 2, 3, 4])
+
+        @export("main")
+        begin() -> u32 = W
+        """)
+
+    assert_eq(code, 0, said)
+
+    // The control: a read past the end is refused, so the same export is refused for the storage it
+    // would have to fill when the program starts.
+    val (bad, why) = crr_build_c(raw"""
+        const word(bytes: [4]u8) -> u32
+            var b = bytes
+            val p = ptr_cast[*u32](&b[1])
+            p[0]
+
+        val W: u32 = word([1, 2, 3, 4])
+
+        @export("main")
+        begin() -> u32 = W
+        """)
+
+    assert(bad != 0, why)
+    assert(why.contains("reaches outside the storage the address is in, 4 bytes long"), why)
+end crr_bare_target_export_folds
+
+// -- the layout itself, in both byte orders ------------------------------------------------------------
+
+private crr_bytes(v: Const, t: Type, little: bool) -> Buf[u8]
+    var out: Buf[u8] = buf()
+
+    assert(laid_bytes(v, t, little, out))
+    out
+
+@test("a value's bytes are laid out, and read back, in either byte order")
+crr_layout_in_both_byte_orders()
+    val u32_t = Integer(32, false, false)
+    val i16_t = Integer(16, true, false)
+    val w = ConstInt(from_int(0x01020304))
+
+    val le = crr_bytes(w, u32_t, true)
+    val be = crr_bytes(w, u32_t, false)
+
+    assert_eq(crr_shown(le), "4 3 2 1")
+    assert_eq(crr_shown(be), "1 2 3 4")
+
+    // Read back at each order, and across: the bytes laid out big-endian read little-endian are the
+    // value swapped.
+    assert_eq(crr_int(value_of_bytes(le, 0, u32_t, true)), "16909060")
+    assert_eq(crr_int(value_of_bytes(be, 0, u32_t, false)), "16909060")
+    assert_eq(crr_int(value_of_bytes(be, 0, u32_t, true)), "67305985")
+
+    // An unaligned 16-bit read from the middle, signed, in both orders.
+    assert_eq(crr_int(value_of_bytes(be, 1, i16_t, false)), "515")
+    assert_eq(crr_int(value_of_bytes(le, 1, i16_t, true)), "515")
+
+    // A negative value is laid out as its two's complement, and read back signed.
+    val minus = crr_bytes(ConstInt(from_int(-2)), i16_t, false)
+
+    assert_eq(crr_shown(minus), "255 254")
+    assert_eq(crr_int(value_of_bytes(minus, 0, i16_t, false)), "-2")
+    assert_eq(crr_int(value_of_bytes(minus, 0, Integer(16, false, false), false)), "65534")
+
+    // A float's bits, most significant byte first when big-endian.
+    val one = crr_bytes(ConstFloat(1.5), Floating(64, false), false)
+
+    assert_eq(crr_shown(one), "63 248 0 0 0 0 0 0")
+
+    value_of_bytes(one, 0, Floating(64, false), false) match
+        Some(ConstFloat(f)) -> assert(f == 1.5)
+        _ -> assert(false, "a float did not read back")
+
+    // Past the end, and bytes that are no value of the type, come back as nothing.
+    assert(value_of_bytes(le, 1, u32_t, true).is_none())
+    assert(value_of_bytes(le, 0, Bool, true).is_none())
+    assert(value_of_bytes(be, 0, Char, false).is_none())
+end crr_layout_in_both_byte_orders
+
+private crr_shown(bytes: Buf[u8]) -> string
+    var out = ""
+
+    for i in 0..<bytes.len()
+        out = if i == 0 then s"${bytes[i]}" else s"$out ${bytes[i]}"
+
+    out
+
+private crr_int(v: Option[Const]) -> string = v match
+    Some(ConstInt(n)) -> to_string(n)
+    _ -> "none"
