@@ -49,7 +49,11 @@ bytes_literal(cx: &Analyzer, span: Span, text: string, expected: Option[Type]) -
 end bytes_literal
 
 array_literal(cx: &Analyzer, span: Span, elems: Buf[Expr], expected: Option[Type]) -> TExpr
-    val elem_exp = expected.and_then(t -> element_wanted(t))
+    // **An element of `volatile T` is storage, and what goes into it is a `T` value**, so the
+    // elements are read at the plain type and the literal is laid out at the qualified one --
+    // `var bank: [4]volatile u32 = [1, 2, 3, 4]` as a constructor fills a qualified field.
+    val qualified = expected.and_then(t -> element_wanted(t))
+    val elem_exp = qualified.map(t -> unqualified(t))
     var ts: Buf[TExpr] = buf()
 
     // With nothing asked of it, the literal's elements are operands that must share one type, and
@@ -90,7 +94,10 @@ array_literal(cx: &Analyzer, span: Span, elems: Buf[Expr], expected: Option[Type
             cx.fault(span, s"an array literal needs one element type, got " +
                      s"${type_show(texpr_type(ts[0]))} and ${type_show(t)}")
 
-    val elem_ty = settled_element(ts, elem_exp)
+    val settled = settled_element(ts, elem_exp)
+    val elem_ty = qualified match
+        Some(Volatile(inner)) -> if type_eq(settled, *inner) then qualified.unwrap() else settled
+        _ -> settled
 
     if elem_ty == Unknown && ts.is_empty() then
         return cx.err(span, "an empty array literal takes its element type from its context, and " +

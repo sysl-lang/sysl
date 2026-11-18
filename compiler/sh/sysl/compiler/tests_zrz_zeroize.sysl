@@ -1,0 +1,511 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **A `[]T` is accepted where a `[]volatile T` is wanted, and `sysl.slices.zeroize` is built on it**
+// (`reference/memory.md § Device memory`, `library/slices`). The widening is a retyping of one view:
+// the same pointer, length and owner, with every access through the new view emitted as written. It
+// goes one way and one level only. The axes: where the view comes from (a view, a frame array, a
+// module array, a `val` array, a `Buf`, a string's bytes, a nested view), what the position keeps
+// (`const`, the element), how the value arrives (an argument, a binding, a result, a branch), and what
+// clang's `-O2` leaves -- the claim `zeroize` exists for, asked beside a control that must be removed.
+
+private var zrz_library_cache: Buf[Program] = buf()
+private var zrz_library_read: bool = false
+
+private zrz_library() -> Buf[Program]
+    if zrz_library_read then return zrz_library_cache
+
+    zrz_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> zrz_library_cache = units
+
+    zrz_library_cache
+end zrz_library
+
+private zrz_ready() -> bool
+    if zrz_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    true
+end zrz_ready
+
+private zrz_can_run() -> bool
+    if !zrz_ready() then return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end zrz_can_run
+
+// The LLVM text of the whole module a source lowers to, or every message it was refused with.
+private zrz_ir(text: string) -> string
+    val parsed = parse(source_of("main.sysl", forms_imported(text)))
+
+    if !parsed.ok() then return parsed.first().message
+
+    var units: Buf[Program] = buf()
+
+    for item in zrz_library()
+        units.push(item)
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if !done.reported.is_empty()
+        var said = ""
+
+        for item in done.reported
+            said = said + item.diag.message + "\n"
+
+        return said
+    end if
+
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+    val said = errors_of(done.an.diagnostics())
+
+    if !said.is_empty() then return analysis_report(said)
+
+    val kept = prune(strip_tests(whole), program_own(units))
+
+    ir_print_module(codegen_with_gaps(kept, host_target(), promotions).0)
+end zrz_ir
+
+// What a refused program is told.
+private zrz_err(text: string) -> string = zrz_ir(text)
+
+// What clang's `-O2` leaves of a program.
+private zrz_optimized(text: string) -> string
+    val dir = make_temp_dir("sysl-zrz").unwrap()
+    val file = s"$dir/t.ll"
+
+    write_text(file, zrz_ir(text)).unwrap()
+
+    val got = capture("clang", ["-O2", "-S", "-emit-llvm", "-o", "-", file], "", [], true).unwrap()
+
+    remove_dir_all(dir).unwrap_or(())
+    assert(got.status.ok(), s"clang refused the emitted IR:\n${got.err.unwrap_or("")}")
+    got.text
+end zrz_optimized
+
+// The lines of the first definition whose `define` line names `name` the way a program writes it.
+private zrz_body(out: string, name: string) -> string
+    var body = ""
+    var inside = false
+
+    for l in lines_of(out)
+        if !inside && l.starts_with("define") && mentions_as_written(l, name) then inside = true
+
+        if inside
+            if l == "}" then return body
+
+            body = body + l + "\n"
+        end if
+
+    body
+end zrz_body
+
+// The lines of the first definition whose `define` line holds a library function's symbol.
+private zrz_library_body(out: string, symbol: string) -> string
+    var body = ""
+    var inside = false
+
+    for l in lines_of(out)
+        if !inside && l.starts_with("define") && l.contains(symbol) then inside = true
+
+        if inside
+            if l == "}" then return body
+
+            body = body + l + "\n"
+        end if
+
+    body
+end zrz_library_body
+
+// **What a program PRINTS**, where it runs to the end.
+private zrz_ran(text: string) -> string
+    val root = make_temp_dir("sysl-zrz").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> if out.status.ok() then out.text else s"it did not exit zero: ${out.text}"
+end zrz_ran
+
+// A function that writes through a `[]volatile u8`, and counts what it wrote.
+private val zrz_clear = "clear(v: []volatile u8) -> usize\n    for i in 0..<v.len\n        v[i] = 0\n    v.len\n"
+
+// The refusal a read-only view meets, whose words name the two view types.
+private val zrz_const_words = "a '[]const volatile byte' views elements it may not write, and a '[]volatile byte' is a licence"
+
+// -- what clang's -O2 leaves ------------------------------------------------------------------------
+
+// A secret in a frame array, read once and then cleared, so that nothing reads the clearing. The
+// control clears it with `fill`, which is a dead store and must go; the other with `zeroize`, whose
+// thirty-two stores must all be there. A run where the control's clearing survives is one where the
+// optimizer was not trying, and would prove nothing about `zeroize`.
+private val zrz_secret: string = raw"""
+    import sysl.slices.{fill, zeroize}
+
+    @export
+    plain_wipe(seed: u8) -> u8
+        var key: [32]u8
+        for i in 0..<key.len
+            key[i] = seed ^ u8(i)
+        var acc = seed
+        for i in 0..<key.len
+            acc = acc ^ key[i]
+        fill(key[..], 0)
+        acc
+
+    @export
+    volatile_wipe(seed: u8) -> u8
+        var key: [32]u8
+        for i in 0..<key.len
+            key[i] = seed ^ u8(i)
+        var acc = seed
+        for i in 0..<key.len
+            acc = acc ^ key[i]
+        zeroize(key[..])
+        acc
+
+    print(plain_wipe(1), volatile_wipe(1))
+    """
+
+@test("at -O2 a fill of a frame array nothing reads again is removed: the control")
+zrz_a_dead_fill_is_removed()
+    if !zrz_can_run() then return
+
+    val body = zrz_body(zrz_optimized(zrz_secret), "plain_wipe")
+
+    assert(!body.is_empty(), "plain_wipe was not emitted")
+    assert(!body.contains("alloca"), body)
+    assert(!body.contains("memset"), body)
+    assert(!body.contains("store"), body)
+end zrz_a_dead_fill_is_removed
+
+@test("and zeroize in the same position keeps every store")
+zrz_zeroize_survives_o2()
+    if !zrz_can_run() then return
+
+    val out = zrz_optimized(zrz_secret)
+    val body = zrz_body(out, "volatile_wipe")
+
+    assert(!body.is_empty(), "volatile_wipe was not emitted")
+
+    // Inlined, the loop is the stores themselves; called, the call stands and the callee has them.
+    if body.contains("store volatile i8 0")
+        assert(body.contains("alloca"), body)
+    else
+        assert(body.contains("zeroize"), body)
+        assert(zrz_library_body(out, s"sysl.slices${ModuleSep}zeroize").contains("store volatile i8 0"), out)
+    end if
+end zrz_zeroize_survives_o2
+
+// The same claim at the seam that matters: the widened view hands the callee the array's own storage,
+// and the store at each element is volatile.
+@test("the widened view is the array's own storage, written with volatile stores")
+zrz_the_view_is_the_arrays_storage()
+    if !zrz_ready() then return
+
+    val out = zrz_ir(zrz_clear + "var a = [1u8, 2, 3]\nprint(clear(a[..]), a[0], a[2])")
+
+    assert(zrz_body(out, "clear").contains("store volatile i8"), out)
+end zrz_the_view_is_the_arrays_storage
+
+// -- the widening matrix: where the view comes from -------------------------------------------------
+
+@test("a view of a frame array widens, and the writes land in the array")
+zrz_a_view_widens()
+    if !zrz_can_run() then return
+
+    val src = zrz_clear + "go()\n    var a = [1u8, 2, 3]\n    print(clear(a[..]), a[0], a[1], a[2])\ngo()"
+
+    assert_eq(zrz_ran(src), "3 0 0 0\n")
+end zrz_a_view_widens
+
+@test("a part of one widens, and only that part is written")
+zrz_a_part_widens()
+    if !zrz_can_run() then return
+
+    val src = zrz_clear + "var a = [1u8, 2, 3, 4]\nprint(clear(a[1..<3]), a[0], a[1], a[2], a[3])"
+
+    assert_eq(zrz_ran(src), "2 1 0 0 4\n")
+end zrz_a_part_widens
+
+@test("an array widens as its whole view does, with no '[..]'")
+zrz_an_array_widens()
+    if !zrz_can_run() then return
+
+    val src = zrz_clear + "var a = [5u8, 6]\nprint(clear(a), a[0], a[1])"
+
+    assert_eq(zrz_ran(src), "2 0 0\n")
+end zrz_an_array_widens
+
+@test("an empty view widens, and nothing is written")
+zrz_an_empty_view_widens()
+    if !zrz_can_run() then return
+
+    val src = zrz_clear + "var a = [9u8]\nprint(clear(a[0..<0]), a[0])"
+
+    assert_eq(zrz_ran(src), "0 9\n")
+end zrz_an_empty_view_widens
+
+@test("a Buf's writable view widens")
+zrz_a_buf_view_widens()
+    if !zrz_can_run() then return
+
+    val src = zrz_clear + "import sysl.buf.{Buf, buf}\nvar b: Buf[u8] = buf()\nb.push(7)\nb.push(8)\n" +
+              "print(clear(b.view_mut()), b[0], b[1])"
+
+    assert_eq(zrz_ran(src), "2 0 0\n")
+end zrz_a_buf_view_widens
+
+@test("a parameter's view widens when it is handed on")
+zrz_a_parameter_widens()
+    if !zrz_can_run() then return
+
+    val src = zrz_clear + "wipe(xs: []u8) -> usize = clear(xs)\nvar a = [1u8, 2]\nprint(wipe(a[..]), a[0], a[1])"
+
+    assert_eq(zrz_ran(src), "2 0 0\n")
+end zrz_a_parameter_widens
+
+// -- what the position keeps ------------------------------------------------------------------------
+
+// `const` is the view's, `volatile` the element's, so a writable view becomes a read-only volatile one
+// in one step.
+@test("a writable view widens to '[]const volatile T' too")
+zrz_widens_to_const_volatile()
+    if !zrz_can_run() then return
+
+    val src = "peek(v: []const volatile u8) -> u8 = v[1]\nvar a = [1u8, 2]\nprint(peek(a[..]), peek(a))"
+
+    assert_eq(zrz_ran(src), "2 2\n")
+end zrz_widens_to_const_volatile
+
+@test("a read-only view widens only to a read-only volatile one")
+zrz_a_const_view_stays_read_only()
+    if !zrz_can_run() then return
+
+    val src = "peek(v: []const volatile u8) -> u8 = v[0]\nshow(xs: []const u8) -> u8 = peek(xs)\n" +
+              "print(show([4u8, 5][..]))"
+
+    assert_eq(zrz_ran(src), "4\n")
+end zrz_a_const_view_stays_read_only
+
+@test("a read-only view is refused where a writable volatile one is wanted")
+zrz_a_const_view_is_refused()
+    if !zrz_ready() then return
+
+    val said = zrz_err(zrz_clear + "wipe(xs: []const u8) -> usize = clear(xs)\nprint(0)")
+
+    assert(said.contains(zrz_const_words), said)
+end zrz_a_const_view_is_refused
+
+@test("a 'val' array is read-only storage, so it is refused for writing")
+zrz_a_val_array_is_refused()
+    if !zrz_ready() then return
+
+    val said = zrz_err(zrz_clear + "val a = [1u8, 2]\nprint(clear(a[..]))")
+
+    assert(said.contains(zrz_const_words), said)
+end zrz_a_val_array_is_refused
+
+@test("and so is the 'val' array named without '[..]'")
+zrz_a_val_array_whole_is_refused()
+    if !zrz_ready() then return
+
+    val said = zrz_err(zrz_clear + "val a = [1u8, 2]\nprint(clear(a))")
+
+    assert(said.contains(zrz_const_words), said)
+end zrz_a_val_array_whole_is_refused
+
+@test("but a 'val' array is read through a '[]const volatile T'")
+zrz_a_val_array_is_read()
+    if !zrz_can_run() then return
+
+    val src = "peek(v: []const volatile u8) -> u8 = v[1]\nval a = [1u8, 2]\nprint(peek(a))"
+
+    assert_eq(zrz_ran(src), "2\n")
+end zrz_a_val_array_is_read
+
+@test("a string's bytes are read-only, so they are refused for writing")
+zrz_string_bytes_are_refused()
+    if !zrz_ready() then return
+
+    val said = zrz_err(zrz_clear + "val s = \"secret\"\nprint(clear(s.bytes))")
+
+    assert(said.contains(zrz_const_words), said)
+end zrz_string_bytes_are_refused
+
+@test("and read through a '[]const volatile u8'")
+zrz_string_bytes_are_read()
+    if !zrz_can_run() then return
+
+    val src = "peek(v: []const volatile u8) -> u8 = v[0]\nval s = \"secret\"\nprint(peek(s.bytes))"
+
+    assert_eq(zrz_ran(src), "115\n")
+end zrz_string_bytes_are_read
+
+@test("a Buf's read-only view is refused for writing")
+zrz_a_buf_read_view_is_refused()
+    if !zrz_ready() then return
+
+    val said = zrz_err(zrz_clear + "import sysl.buf.{Buf, buf}\nvar b: Buf[u8] = buf()\nb.push(1)\n" +
+                       "print(clear(b.view()))")
+
+    assert(said.contains(zrz_const_words), said)
+end zrz_a_buf_read_view_is_refused
+
+// One level only: a `[][]volatile u8` could be handed a view of device memory, which the `[][]u8`
+// holder would then read as ordinary memory.
+@test("a view of views does not widen its inner views")
+zrz_nested_views_are_refused()
+    if !zrz_ready() then return
+
+    val said = zrz_err("deep(vs: [][]volatile u8) -> usize = vs.len\ngo(vs: [][]u8) -> usize = deep(vs)\nprint(0)")
+
+    assert(said.contains("'vs' of 'deep' is [][]volatile u8, but [][]u8 was given"), said)
+end zrz_nested_views_are_refused
+
+@test("the qualifier is never taken away")
+zrz_volatile_never_narrows()
+    if !zrz_ready() then return
+
+    val said = zrz_err("plain(xs: []u8) -> usize = xs.len\ngo(v: []volatile u8) -> usize = plain(v)\nprint(0)")
+
+    assert(said.contains("'xs' of 'plain' is []u8, but []volatile u8 was given"), said)
+end zrz_volatile_never_narrows
+
+@test("and the element type is not converted on the way")
+zrz_the_element_must_match()
+    if !zrz_ready() then return
+
+    val said = zrz_err(zrz_clear + "go(xs: []u16) -> usize = clear(xs)\nprint(0)")
+
+    assert(said.contains("'v' of 'clear' is []volatile u8, but []u16 was given"), said)
+end zrz_the_element_must_match
+
+// -- how the value arrives --------------------------------------------------------------------------
+
+@test("a binding at the volatile view type widens")
+zrz_a_binding_widens()
+    if !zrz_can_run() then return
+
+    val src = "go()\n    var a = [1u8, 2]\n    val v: []volatile u8 = a[..]\n    v[0] = 0\n    print(a[0], a[1])\ngo()"
+
+    assert_eq(zrz_ran(src), "0 2\n")
+end zrz_a_binding_widens
+
+@test("a result at the volatile view type widens")
+zrz_a_result_widens()
+    if !zrz_can_run() then return
+
+    val src = "as_device(xs: []u8) -> []volatile u8 = xs\nvar a = [3u8, 4]\nval v = as_device(a[..])\n" +
+              "v[1] = 0\nprint(a[0], a[1])"
+
+    assert_eq(zrz_ran(src), "3 0\n")
+end zrz_a_result_widens
+
+// A branch converts for itself when its position does, which is what `converts` answers.
+@test("each arm of a branch widens")
+zrz_each_branch_widens()
+    if !zrz_can_run() then return
+
+    val src = zrz_clear + "pick(c: bool)\n    var a = [1u8, 2]\n    var b = [3u8, 4]\n" +
+              "    print(clear(if c then a[..] else b[..]), a[0], b[0])\npick(true)\npick(false)"
+
+    assert_eq(zrz_ran(src), "2 0 3\n2 1 0\n")
+end zrz_each_branch_widens
+
+// -- the library function ---------------------------------------------------------------------------
+
+@test("zeroize clears a frame array, a part of one and a Buf, and passes an empty view")
+zrz_zeroize_runs()
+    if !zrz_can_run() then return
+
+    val src = "import sysl.slices.zeroize\nimport sysl.buf.{Buf, buf}\nvar a = [1u8, 2, 3, 4]\n" +
+              "zeroize(a[1..<3])\nprint(a[0], a[1], a[2], a[3])\nzeroize(a)\nprint(a[0], a[3])\n" +
+              "var b: Buf[u8] = buf()\nb.push(9)\nzeroize(b.view_mut())\nzeroize(b.view_mut()[0..<0])\nprint(b[0])"
+
+    assert_eq(zrz_ran(src), "1 0 0 4\n0 0\n0\n")
+end zrz_zeroize_runs
+
+// -- an array of qualified elements built from a literal --------------------------------------------
+
+// Its elements are values of the plain type, as a constructor's argument is for a qualified field;
+// refused before, for being an array of the plain type.
+@test("a literal fills an array of volatile elements, in module storage and in a frame")
+zrz_a_literal_fills_volatile_elements()
+    if !zrz_can_run() then return
+
+    val src = "var m: [3]volatile u32 = [1, 2, 3]\ngo()\n    var l: [2]volatile u8 = [4, 5]\n" +
+              "    print(l[0], l[1])\ngo()\nprint(m[0], m[2])"
+
+    assert_eq(zrz_ran(src), "4 5\n1 3\n")
+end zrz_a_literal_fills_volatile_elements
+
+@test("and each element of it is then read with a volatile load")
+zrz_a_literal_array_reads_volatile()
+    if !zrz_ready() then return
+
+    val out = zrz_ir("var m: [3]volatile u32 = [1, 2, 3]\nread(i: usize) -> u32 = m[i]\nprint(read(1))")
+
+    assert(zrz_body(out, "read").contains("load volatile i32"), out)
+end zrz_a_literal_array_reads_volatile
+
+// The elements meet the plain type exactly as a plain array's do: a narrower one widens, a wider one
+// and a literal that does not fit are refused.
+@test("a narrower element widens into it, as it does into a plain array")
+zrz_a_narrower_element_widens()
+    if !zrz_can_run() then return
+
+    assert_eq(zrz_ran("var m: [2]volatile u32 = [1u8, 2u8]\nprint(m[0], m[1])"), "1 2\n")
+end zrz_a_narrower_element_widens
+
+@test("a wider element is refused, naming the plain array the literal is")
+zrz_a_wider_element_is_refused()
+    if !zrz_ready() then return
+
+    val said = zrz_err("val w: u32 = 7\nvar m: [2]volatile u8 = [w, w]\nprint(m[0])")
+
+    assert(said.contains("declared [2]volatile u8 but the value is [2]uint"), said)
+end zrz_a_wider_element_is_refused
+
+@test("a literal that does not fit the element is refused at the literal")
+zrz_a_literal_that_does_not_fit_is_refused()
+    if !zrz_ready() then return
+
+    val said = zrz_err("var m: [2]volatile u8 = [300, 1]\nprint(m[0])")
+
+    assert(said.contains("the literal 300 does not fit byte"), said)
+end zrz_a_literal_that_does_not_fit_is_refused

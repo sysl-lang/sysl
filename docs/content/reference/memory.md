@@ -3344,6 +3344,30 @@ wait_for(n: u64)
 - **`volatile` is not reserved** — special only before a type, as `sync` is after `&`. `[]const
   volatile u32` is a read-only register view: `const` is the view's property, `volatile` the
   element's.
+- **A `[]T` is accepted where a `[]volatile T` is wanted**, and an array where its view would be — the
+  same elements, every access through the new view an effect. It keeps the view's `const`: a
+  `[]const T`, a `val` array or a string's bytes reach only a `[]const volatile T`. It is never taken
+  away, and it goes one level only: a `[][]u8` is not a `[][]volatile u8`, whose slots could then be
+  handed a view of device memory that the `[][]u8` holder reads as ordinary memory. This is what
+  [`sysl.slices.zeroize`](/library/slices/#clearing-a-secret) is built on — a clearing of a buffer
+  nothing reads again, kept at `-O2`:
+
+```sysl
+clear(v: []volatile u8)
+    for i in 0..<v.len
+        v[i] = 0
+
+var key = [3u8, 1, 4]
+clear(key)
+print(key)
+```
+
+```output
+[0, 0, 0]
+```
+
+- **An array of qualified elements is filled from a literal** of the plain type, as a struct's
+  qualified field is from a constructor: `var bank: [4]volatile u32 = [1, 2, 3, 4]`.
 - **Memory a device reads by DMA is a library type**, [`sysl.dma`'s `Region`](/library/dma/), not a
   qualifier: it needs a device address and a cache-honest handover, neither a property of a place.
 
