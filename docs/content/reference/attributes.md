@@ -3763,7 +3763,7 @@ const K = add(200, 100)
 ```
 
 ```error
-'K' traps while it is being compiled: 200 + 100 overflows u8
+'K' traps while it is being compiled: 200 + 100 overflows byte
 ```
 
 A whole package is checked with [`checked_overflow = true`](/reference/packages/#overflow-that-traps-in-every-build)
