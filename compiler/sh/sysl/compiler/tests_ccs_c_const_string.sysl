@@ -64,6 +64,27 @@ private ccs_ir(main_text: string, header: string, target: Option[string]) -> str
     out
 end ccs_ir
 
+// A module `bare` holding `module_text`, with `c.h` beside it, reached from a beginning that calls its
+// `ping` -- lowered for thumbv7em-freestanding. Module storage and exports live in a module: the
+// beginning's own top level is the body of `main`.
+private ccs_bare_ir(module_text: string, header: string) -> string
+    val root = make_temp_dir("sysl-ccs").unwrap()
+
+    make_dir_all(s"$root/bare").unwrap()
+    write_text(s"$root/bare/bare.sysl", s"module bare\n$module_text").unwrap()
+
+    if header != "" then write_text(s"$root/bare/c.h", header).unwrap()
+
+    write_text(s"$root/main.sysl", "import bare.ping\n\nprint(ping())\n").unwrap()
+
+    val out = emit_llvm_text(root, Some("thumbv7em-freestanding")) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(made) -> if made.report.is_empty() then made.text else s"refused: ${analysis_report(made.report)}"
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end ccs_bare_ir
+
 private ccs_refuses(main_text: string, header: string, part: string)
     val said = ccs_ir(main_text, header, None)
 
@@ -122,9 +143,10 @@ ccs_escapes()
         c const
             S: string = "\"tab\\tq\\\"b\\\\s\\n\""
             H: string = "\"\\x41\\101\\x7e\""
+            B: string = "\"\\\\41\""
 
-        print(S == "tab\tq\"b\\s\n", S.bytes.len, H)
-        """, ""), "true 10 AA~\n")
+        print(S == "tab\tq\"b\\s\n", S.bytes.len, H, B, B.bytes.len)
+        """, ""), "true 10 AA~ \\41 3\n")
 
 @test("the bytes LLVM itself escapes come through -- a quote, a backslash, a byte past ASCII")
 ccs_bytes_llvm_escapes()
@@ -227,7 +249,7 @@ ccs_public()
 
     val exe = s"$root/built"
 
-    val said = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+    val said = build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
         Err(why) -> failure_text(why)
         Ok(_) -> capture(exe, [], "", [], true) match
             Err(_) -> "could not run"
@@ -296,7 +318,7 @@ ccs_empty_c_string()
 ccs_folds_on_a_bare_machine()
     if !ccs_ready() then return
 
-    val ir = ccs_ir(raw"""
+    val ir = ccs_bare_ir(raw"""
         @include("c.h")
 
         c const
@@ -311,9 +333,9 @@ ccs_folds_on_a_bare_machine()
 
         val version: string = VERSION
 
-        @export("ccs_version_len")
-        version_len() -> usize = version.bytes.len
-        """, ccs_vulkan_header(), Some("thumbv7em-freestanding"))
+        @export("ccs_ping")
+        ping() -> usize = version.bytes.len + usize(surface[0]) + usize(names[1][0])
+        """, ccs_vulkan_header())
 
     assert(!ir.starts_with("refused: "), ir)
     assert(ir.index_of("c\"VK_KHR_surface\\00\"").is_some(), ir)
@@ -327,7 +349,6 @@ end ccs_folds_on_a_bare_machine
 // What a measured `*u8` lowers to is a `val` holding a `c"…"`, so the rule that a read of a module
 // `val` over constant data is that data (`reference/ffi.md § What constant data is`) has to hold for
 // a C string as it does for an address. It did not: the read was code, refused on a bare machine.
-private ccs_bare_ir(main_text: string) -> string = ccs_ir(main_text, "", Some("thumbv7em-freestanding"))
 
 @test("a val holding a c-string literal, read by an exported val, is data")
 ccs_cstr_val_read_by_a_val()
@@ -339,9 +360,9 @@ ccs_cstr_val_read_by_a_val()
         @export("ccs_one")
         val one: *u8 = SURFACE
 
-        @export("ccs_first")
-        first() -> u8 = one[0]
-        """)
+        @export("ccs_ping")
+        ping() -> u8 = one[0]
+        """, "")
 
     assert(!ir.starts_with("refused: "), ir)
     assert(ir.index_of("@ccs_one = ").is_some(), ir)
@@ -364,9 +385,9 @@ ccs_cstr_val_in_an_array()
         @export("ccs_pair")
         val pair: Pair = Pair(B, A)
 
-        @export("ccs_first")
-        first() -> u8 = names[1][0] + pair.name[1]
-        """)
+        @export("ccs_ping")
+        ping() -> u8 = names[1][0] + pair.name[1]
+        """, "")
 
     assert(!ir.starts_with("refused: "), ir)
     assert(ir.index_of("@ccs_names = ").is_some(), ir)
@@ -403,9 +424,9 @@ ccs_neighbours_of_the_cstr_val()
         @export("ccs_nones")
         var nones: [2]*u8 = [NONE, NONE]
 
-        @export("ccs_call")
-        call() -> i32 = if nones[0] == null then hooks[1]() else 0
-        """)
+        @export("ccs_ping")
+        ping() -> i32 = if nones[0] == null then hooks[1]() else 0
+        """, "")
 
     assert(!ir.starts_with("refused: "), ir)
 
