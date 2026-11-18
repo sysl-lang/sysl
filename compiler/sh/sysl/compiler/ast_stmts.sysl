@@ -377,6 +377,12 @@ struct FuncMarks
     // instantiation.
     bounded: Buf[string]
 
+    // `@pinned(thread)`: the fiber this body runs on is only ever resumed on the thread it began on,
+    // so a count it holds across a call that can reach `sysl.fiber.switch` is touched by one thread
+    // alone (`abandons.sysl`'s `check_switch_holds`). Not given to a closure or nested function
+    // written inside, which may be called from anywhere.
+    pinned_thread: bool
+
     // Whether any of the three was written.
     any(self) -> bool = self.noinline || self.cold || self.inline
 
@@ -394,7 +400,7 @@ end FuncMarks
 // A definition nothing was said about.
 no_marks() -> FuncMarks = FuncMarks(false, false, false, None, buf(), false, None, false, false,
                                     false, false, false, false, false, false, buf(), false, buf(), buf(),
-                                    false, false, false, false, buf(), buf(), buf())
+                                    false, false, false, false, buf(), buf(), buf(), false)
 
 // A method of a struct, an enum, a trait or an `impl` block.
 struct MethodDecl
@@ -571,6 +577,9 @@ enum Attr
     MainThread
     Pinned
     Pins
+    // `@pinned(thread)` above a function or a member: its fiber is only ever resumed on the thread it
+    // began on.
+    PinnedThread
     // `@no_alloc` above a function or a method: the capability it gives up, as the word after `no_`.
     Forgoes(cap: string)
     // `@blocks` above a function, a method or an `extern`: reaching it may wait.
@@ -669,6 +678,7 @@ attr_word(a: Attr) -> string = a match
     MainThread -> "main_thread"
     Pinned -> "pinned"
     Pins -> "pins"
+    PinnedThread -> "pinned(thread)"
     Forgoes(cap) -> s"no_$cap"
     Blocks -> "blocks"
     StrictFp -> "strict_fp"

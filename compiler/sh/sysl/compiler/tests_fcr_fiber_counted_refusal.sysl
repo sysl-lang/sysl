@@ -1,0 +1,386 @@
+module sh.sysl.compiler
+@tests
+
+// A count that is not atomic held across a call that can reach `sysl.fiber.switch` is refused
+// (`abandons.sysl`'s `check_switch_holds`, `library/fiber.md § A fiber may move between threads`):
+// the fiber may come back on another carrier and give the count back there with a plain decrement,
+// racing the carrier it was made on.
+//
+// The axes: the call (the switch itself, a function that reaches it, one that only takes its address,
+// one that cannot switch); what is held (a local view, a string, a `&T`, a closure, a temporary, a
+// `match` binding, a loop variable, a `&sync T`, a scalar, a `*T`); where it dies (before the call, in
+// a block of its own, after it); the body (a function, a member, a closure, a loop body, `main`); and
+// the opt-out (`@pinned(thread)` on a function and on a member, its misspellings, and where it may not
+// stand). Not here: a generic body, whose instantiations are walked as any other body; a call through
+// a value, which is not followed, as for `@abandons` (`tests_nfc_`).
+
+// A fiber scheduler of the smallest kind: `wait` switches back to whoever started the fiber.
+private fcr_head() -> string = raw"""
+    import sysl.fiber.{Context, Stack, switch}
+
+    struct Pair
+        home: Context
+        away: Context
+
+    var pair = Pair(Context.new(), Context.new())
+
+    wait()
+        switch(&pair.away, &pair.home)
+
+    add(a: int, b: int) -> int = a + b
+
+    struct Box
+        n: int
+
+    """
+
+private fcr_ir(body: string) -> string = xvr_ir([("main.sysl", fcr_head() + body)])
+
+private fcr_accepted(body: string)
+    if xvr_no_library() then return
+
+    val said = fcr_ir(body)
+
+    assert(!said.contains("error:"), said)
+
+// A refusal names what is held and the call it is held across.
+private fcr_refused(body: string, held: string, callee: string)
+    if xvr_no_library() then return
+
+    val said = fcr_ir(body)
+
+    assert(said.contains("error: "), said)
+    assert(said.contains(s"and this frame holds $held across the call"), said)
+
+    val head = if callee == "sysl.fiber.switch" then "'sysl.fiber.switch' may resume this fiber on another thread"
+    else s"'$callee' can reach 'sysl.fiber.switch', which may resume this fiber on another thread"
+
+    assert(said.contains(s"error: $head"), said)
+    assert(said.contains("End it before the call (in a block of its own, or in a function that returns first), or hold it as a '&sync' reference, whose count is atomic; a function whose fiber is only ever resumed on the thread it began on says so with '@pinned(thread)'"), said)
+
+@test("a view held across the switch itself is refused, naming the view and the switch")
+fcr_view_across_switch()
+    fcr_refused(raw"""
+        work()
+            val bytes: []u8 = [1, 2, 3]
+            switch(&pair.away, &pair.home)
+            print(bytes.len)
+        """, "'bytes'", "sysl.fiber.switch")
+
+@test("a view held across a function that reaches the switch is refused, naming that function")
+fcr_view_across_reacher()
+    fcr_refused(raw"""
+        work()
+            val bytes: []u8 = [1, 2, 3]
+            wait()
+            print(bytes.len)
+        """, "'bytes'", "wait")
+
+@test("two calls down is still a reach")
+fcr_two_calls_down()
+    fcr_refused(raw"""
+        settle() = wait()
+
+        work()
+            val name = "a" + "b"
+            settle()
+            print(name)
+        """, "'name'", "settle")
+
+@test("a carrier's buffer sliced and held across a wait is refused -- the shape avin's receive had")
+fcr_carrier_buffer_view()
+    fcr_refused(raw"""
+        struct Carrier
+            receiving: []u8
+
+        receive(k: &Carrier, want: usize) -> int
+            val room: []u8 = k.receiving[0..<want]
+            wait()
+            int(room.len)
+        """, "'room'", "wait")
+
+@test("a counted value held across a call that cannot switch is accepted")
+fcr_call_that_cannot_switch()
+    fcr_accepted(raw"""
+        work()
+            val bytes: []u8 = [1, 2, 3]
+            print(add(1, 2))
+            print(bytes.len)
+        """)
+
+@test("a function that only takes the switch's address does not switch by being called")
+fcr_address_is_no_call()
+    fcr_accepted(raw"""
+        entry(p: *Pair) = wait()
+
+        starts(stack: &Stack) -> Context = Context.start(stack, &entry, &pair)
+
+        work(stack: &Stack)
+            val name = "a" + "b"
+            val c = starts(stack)
+            print(c.is_ready())
+            print(name)
+        """)
+
+@test("a value that dies in a block of its own before the call is accepted")
+fcr_dead_before_the_call()
+    fcr_accepted(raw"""
+        work(flag: bool)
+            if flag
+                val bytes: []u8 = [1, 2, 3]
+                print(bytes.len)
+            wait()
+        """)
+
+@test("a value declared after the call is accepted")
+fcr_declared_after()
+    fcr_accepted(raw"""
+        work()
+            wait()
+            val bytes: []u8 = [1, 2, 3]
+            print(bytes.len)
+        """)
+
+@test("a '&sync' reference held across the call is accepted -- its count is atomic")
+fcr_sync_reference()
+    fcr_accepted(raw"""
+        work()
+            val b: &sync Box = Box(1)
+            wait()
+            print(b.n)
+        """)
+
+@test("a plain '&T' held across the call is refused")
+fcr_plain_reference()
+    fcr_refused(raw"""
+        work()
+            val b: &Box = Box(1)
+            wait()
+            print(b.n)
+        """, "'b'", "wait")
+
+@test("a scalar, a struct of scalars and a '*T' held across the call are accepted")
+fcr_scalars()
+    fcr_accepted(raw"""
+        struct Point
+            x: int
+            y: int
+
+        work(p: *Pair)
+            val n = 3
+            val at = Point(1, 2)
+            val q = p
+            wait()
+            print(n + at.x + at.y)
+            print(q != null)
+        """)
+
+@test("a value held across a call inside a loop is refused")
+fcr_inside_a_loop()
+    fcr_refused(raw"""
+        work()
+            for i in 0..<3
+                val s = i.to_string()
+                wait()
+                print(s)
+        """, "'s'", "wait")
+
+@test("a value declared before a loop is held across a call in the loop")
+fcr_before_a_loop()
+    fcr_refused(raw"""
+        work()
+            val s = 7.to_string()
+            var i = 0
+            while i < 3
+                wait()
+                i += 1
+            print(s)
+        """, "'s'", "wait")
+
+@test("a loop body whose value dies before the call is accepted")
+fcr_loop_value_dies_first()
+    fcr_accepted(raw"""
+        work()
+            for i in 0..<3
+                if i > 0
+                    val s = i.to_string()
+                    print(s)
+                wait()
+        """)
+
+@test("a closure that captured a counted value is itself a count held across the call")
+fcr_closure_capture()
+    fcr_refused(raw"""
+        printer(s: string) -> &Fn() -> unit = () -> print(s)
+
+        work()
+            val f = printer("x" + "y")
+            wait()
+            f()
+        """, "'f'", "wait")
+
+@test("a closure's own body is asked as a function's is")
+fcr_closure_body()
+    fcr_refused(raw"""
+        run(f: &Fn() -> unit) = f()
+
+        work()
+            run(() ->
+                val s = 1.to_string()
+                wait()
+                print(s))
+        """, "'s'", "wait")
+
+@test("a counted temporary of the enclosing expression is held across a call in a later operand")
+fcr_temporary()
+    fcr_refused(raw"""
+        made() -> string = "a" + "b"
+
+        waited() -> int
+            wait()
+            1
+
+        take(s: string, n: int) -> int = s.bytes.len + n
+
+        work()
+            print(take(made(), waited()))
+        """, "a counted temporary the enclosing expression is still holding", "waited")
+
+@test("a binding a 'match' took a share of is held across a call in its arm")
+fcr_match_binding()
+    fcr_refused(raw"""
+        work(o: Option[string])
+            o match
+                Some(s) ->
+                    wait()
+                    print(s)
+                None -> ()
+        """, "a binding this arm took a share of", "wait")
+
+@test("an arm whose variant carries nothing counted holds nothing of the value matched -- avin's receive loop")
+fcr_empty_variant_arm()
+    fcr_accepted(raw"""
+        made(n: int) -> Option[[]u8] = if n > 0 then Some([1, 2, 3]) else None
+
+        receive(n: int) -> int
+            loop
+                made(n) match
+                    Some(out) -> return int(out.len)
+                    None -> wait()
+        """)
+
+@test("an arm whose variant carries a scalar holds nothing either, and a wildcard arm holds the value")
+fcr_scalar_variant_arm()
+    fcr_accepted(raw"""
+        made(n: int) -> Result[string, int] = if n > 0 then Ok("x" + "y") else Err(n)
+
+        work(n: int)
+            made(n) match
+                Ok(s) -> print(s)
+                Err(code) ->
+                    wait()
+                    print(code)
+        """)
+
+    fcr_refused(raw"""
+        made(n: int) -> Result[string, int] = if n > 0 then Ok("x" + "y") else Err(n)
+
+        work(n: int)
+            made(n) match
+                Err(code) -> print(code)
+                _ -> wait()
+        """, "a counted temporary the enclosing expression is still holding", "wait")
+
+@test("a 'defer' holds nothing across a switch")
+fcr_defer()
+    fcr_accepted(raw"""
+        work()
+            defer print("done")
+            wait()
+        """)
+
+@test("a member is asked as a function is")
+fcr_member()
+    fcr_refused(raw"""
+        struct Reader
+            n: int
+
+            read(*self)
+                val s = self.n.to_string()
+                wait()
+                print(s)
+        """, "'s'", "wait")
+
+@test("'@pinned(thread)' on a function accepts what it holds across the switch")
+fcr_pinned_function()
+    fcr_accepted(raw"""
+        @pinned(thread)
+        work()
+            val bytes: []u8 = [1, 2, 3]
+            wait()
+            switch(&pair.away, &pair.home)
+            print(bytes.len)
+        """)
+
+@test("'@pinned(thread)' on a member accepts what it holds across the switch")
+fcr_pinned_member()
+    fcr_accepted(raw"""
+        struct Reader
+            n: int
+
+            @pinned(thread)
+            read(*self)
+                val s = self.n.to_string()
+                wait()
+                print(s)
+        """)
+
+@test("'@pinned(thread)' covers its own body only: a function it calls is asked on its own")
+fcr_pinned_is_per_body()
+    fcr_refused(raw"""
+        inner()
+            val s = 1.to_string()
+            wait()
+            print(s)
+
+        @pinned(thread)
+        outer()
+            val s = 2.to_string()
+            inner()
+            print(s)
+        """, "'s'", "wait")
+
+@test("'main' runs on the main thread's own stack and holds what it likes")
+fcr_main_is_pinned()
+    fcr_accepted(raw"""
+        main()
+            val stack = Stack.reserve(64 * 1024).unwrap()
+            val name = "a" + "b"
+            wait()
+            print(name)
+            print(stack.len() > 0)
+        """)
+
+@test("'@pinned' takes no argument but 'thread'")
+fcr_pinned_other_argument()
+    if xvr_no_library() then return
+
+    val said = fcr_ir(raw"""
+        @pinned(core)
+        work() = ()
+        """)
+
+    assert(said.contains("'@pinned' takes no argument but 'thread' — '@pinned' alone says every caller keeps the function on one core, and '@pinned(thread)' that the fiber it runs on is only ever resumed on the thread it began on"), said)
+
+@test("'@pinned(thread)' does not stand above a struct, which has no body to resume")
+fcr_pinned_thread_on_struct()
+    if xvr_no_library() then return
+
+    val said = fcr_ir(raw"""
+        @pinned(thread)
+        struct S
+            n: int
+        """)
+
+    assert(said.contains("error") || said.contains("'@pinned(thread)'"), said)
+    assert(said.contains("pinned(thread)"), said)

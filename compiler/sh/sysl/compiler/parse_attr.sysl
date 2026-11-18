@@ -140,7 +140,11 @@ parse_member_attrs(p: *Parser, in_trait: bool) -> Buf[Attr]
             break
         end if
 
-        if !member_attr_word(word) && !(in_trait && (word == "keeps" || word == "answers"))
+        // `@pinned(thread)` is about the body a member has as much as a function's; the bare
+        // `@pinned` is about per-core storage, which a member is not asked about.
+        val thread_pin = word == "pinned" && p.kw_at(2, "(")
+
+        if !member_attr_word(word) && !thread_pin && !(in_trait && (word == "keeps" || word == "answers"))
             if word == "assert"
                 p.fault(at, "'@assert' stands where a declaration stands, and a type's body holds its members — write it beside the type rather than inside it, where 'sizeof' and 'offsetof' still name what it is about")
             else if word == "align" || word == "packed" || word == "byte_order"
@@ -435,7 +439,7 @@ parse_attribute(p: *Parser) -> Option[Attr]
 
     // `@main_thread` takes none: which thread is the main one is the program's, not the binding's.
     if word == "main_thread" then return Some(MainThread)
-    if word == "pinned" then return Some(Pinned)
+    if word == "pinned" then return parse_pinned_attr(p)
     if word == "pins" then return Some(Pins)
     if fn_forgo_word(word) then return Some(Forgoes(word[3..<word.len]))
 
@@ -525,6 +529,29 @@ private parse_inline_attr(p: *Parser) -> Option[Attr]
     skip_line(p)
     None
 end parse_inline_attr
+
+// `@pinned`, or `@pinned(thread)`: the bare word says every caller keeps the function on one core
+// (`@per_cpu`); with `thread` it says the fiber the body runs on is only ever resumed on the thread it
+// began on, so a count it holds across a switch is not touched from two threads
+// (`library/fiber.md § A fiber may move between threads`).
+private parse_pinned_attr(p: *Parser) -> Option[Attr]
+    if !p.accept_kw("(") then return Some(Pinned)
+
+    val at = p.here()
+    val word = p.peek() match
+        Ident(n) -> n
+        _ -> ""
+
+    if word == "thread"
+        p.bump()
+
+        if p.accept_kw(")") then return Some(PinnedThread)
+    end if
+
+    p.fault(at, "'@pinned' takes no argument but 'thread' — '@pinned' alone says every caller keeps the function on one core, and '@pinned(thread)' that the fiber it runs on is only ever resumed on the thread it began on")
+    skip_line(p)
+    None
+end parse_pinned_attr
 
 private hook_attr(p: *Parser, at: Span, kind: HookKind) -> Attr
     if p.at_kw("(")
@@ -1025,6 +1052,7 @@ apply_func_attrs(f: *FuncDecl, attrs: Buf[Attr])
             Abandons -> f.marks.abandons = true
             Pinned -> f.marks.pinned = true
             Pins -> f.marks.pins = true
+            PinnedThread -> f.marks.pinned_thread = true
             Forgoes(cap) -> f.marks.forgoes.push(cap)
             Blocks -> f.marks.blocks = true
             StrictFp -> f.marks.strict_fp = true
@@ -1053,6 +1081,7 @@ apply_member_attrs(m: *MethodDecl, attrs: Buf[Attr])
             Cold -> m.marks.cold = true
             Pinned -> m.marks.pinned = true
             Pins -> m.marks.pins = true
+            PinnedThread -> m.marks.pinned_thread = true
             Forgoes(cap) -> m.marks.forgoes.push(cap)
             Blocks -> m.marks.blocks = true
             StrictFp -> m.marks.strict_fp = true
