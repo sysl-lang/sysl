@@ -3543,9 +3543,9 @@ end signed_literal_preference
 // meant**: a candidate beats another where each of its parameters is the other's or widens to it, so
 // `f(b)` over `f(x: int)` and `f(x: long)` at a `byte` is the `int` one. A literal has no type to be
 // widened from, so a position holding one decides nothing here -- what it means is the literal's
-// own rule above. **Nor does arithmetic over literals** (`literal_arith_default`): `60 * 52` is the
-// `3120` it comes to, not an `int` that widens, so `g(60 * 52)` over `g(v: u32)` and `g(v: u64)` is
-// as ambiguous as `g(3120)`. Empty where no candidate beats every other.
+// own rule above -- and nor does arithmetic over bare literals, which is in the literal's tier:
+// `q(2.0 * 3)` over `f32` and `f128` is as ambiguous as `q(2.0)`. Empty where no candidate beats
+// every other.
 private narrowest_widening(fitted: Buf[Buf[Type]], ranked: Buf[usize], args: Buf[Expr]) -> Buf[usize]
     var winners: Buf[usize] = buf()
 
@@ -3614,9 +3614,10 @@ end literal_default_preference
 // Where every argument with a type of its own is exactly the parameter of one candidate, and every
 // other argument is a numeric literal with no suffix, that candidate wins and the literals are read
 // at its parameters: `nextafter(x, 100.0)` at an `f32` `x` is the `f32` one, as `x * 100.0` is at
-// `f32`. A typed argument that no candidate takes exactly stays ambiguous, and so do two candidates
-// that both match every typed argument. Arithmetic over literals is a literal here too
-// (`nextafter(x, 50.0 * 2)`). Empty where the rule does not apply.
+// `f32`. Arithmetic over bare literals is a literal here as everywhere in the rule (`2.0 * 3` beside
+// `x` is read at `f32` as `2.0` is). A typed argument that no candidate takes exactly stays
+// ambiguous, and so do two candidates that both match every typed argument. Empty where the rule
+// does not apply.
 private literal_follows_typed(fitted: Buf[Buf[Type]], ranked: Buf[usize], args: Buf[Expr],
                               natural: Buf[Option[Type]]) -> Buf[usize]
     var winners: Buf[usize] = buf()
@@ -3662,7 +3663,8 @@ private params_narrower(mine: Buf[Type], theirs: Buf[Type], args: Buf[Expr]) -> 
 
     for j in 0..<mine.len()
         if type_eq(mine[j], theirs[j]) then continue
-        if literal_arith_default(args[j]).is_some() || !implicitly_widens(mine[j], theirs[j]) then return false
+        if is_literal(args[j]) || literal_arith_default(args[j]).is_some() ||
+           !implicitly_widens(mine[j], theirs[j]) then return false
 
         strictly = true
 

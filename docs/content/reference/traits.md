@@ -1253,7 +1253,8 @@ true false true
 `Cell` has neither trait and `Edge` derives both all the same: a reference is a key whatever it
 names, by value where the referent has one and by identity where it has not. **A referent with an
 `Eq` and no `Hash`** is the one refused: its references compare by value, and the address's hash
-would not agree. **`===`** is identity whatever the referent defines, and
+would not agree. **`===`** is identity whatever the referent defines — on a trait object too,
+where it is the object's ([below](#two-objects-compared-by-identity)) — and
 [`ByAddress`](/reference/memory/#references-compare-through-their-referent) keys a table by it. A
 **`*T`** meets both by its address, and a trait requiring either is refused through one. A
 reference to a trait object is two words and meets `Hash` only through its table.
@@ -3143,6 +3144,73 @@ main()
 ```output
 3
 ```
+
+### Two objects compared by identity
+
+**`===` and `!==` on a trait object compare its data word** — the value it was made from — so two
+objects over one value are identical whichever trait each was made against, and the table beside
+the word plays no part. An object also meets a reference of the type it holds, on either side, as
+`&Trait` against `&T` and `*Trait` against `*T`:
+
+```sysl
+trait Shape
+    area(self) -> int
+
+trait Named
+    name(self) -> string
+
+struct Sq
+    s: int
+
+impl Shape for Sq
+    area(self) -> int = self.s * self.s
+
+impl Named for Sq
+    name(self) -> string = "sq"
+
+main()
+    val s: &Sq = Sq(2)
+    val a: &Shape = s
+    val n: &Named = s
+    val other: &Shape = Sq(2)
+
+    print(a === n, a === s, a === other, n !== other)
+```
+
+```output
+true true false true
+```
+
+The two handles must be of one kind — two references of one sharing, or two pointers — and a
+concrete type must implement the object's trait, since otherwise the two never name one value:
+
+```sysl
+trait Shape
+    area(self) -> int
+
+struct Sq
+    s: int
+
+impl Shape for Sq
+    area(self) -> int = self.s * self.s
+
+struct Plain
+    v: int
+
+main()
+    val s: &Shape = Sq(1)
+    val p: &Plain = Plain(1)
+
+    print(s === p)
+```
+
+```error
+'===' compares a &Shape with a &Plain, and Plain does not implement Shape, so the two never name one value
+```
+
+An object has no `==`: equality would need the two values' types to agree, which the objects have
+forgotten. Identity is what an object can be asked, and what a search for one in a list of objects
+wants.
 
 ### Object safety
 

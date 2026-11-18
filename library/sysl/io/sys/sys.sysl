@@ -61,7 +61,8 @@ private[sysl] extern "sysl_io_wait" fd_wait(fd: int, writable: int, micros: long
 
 // ## The readiness poller's hooks
 //
-// `sysl.io.poll` is a kernel's readiness set -- kqueue, epoll -- reached through five hooks. A poller
+// `sysl.io.poll` is a kernel's readiness set -- kqueue, epoll -- reached through five hooks, and a
+// wake that is a descriptor, reached through four more below. A poller
 // is two descriptors: the set itself, and a second one a wake is written to where the system needs
 // one (epoll's `eventfd`); a system that wakes the set through the set itself answers `-1` for the
 // second, and every hook below takes it back as it was handed out.
@@ -101,3 +102,32 @@ private[sysl] extern "sysl_io_poll_wake" poll_wake(poller: int, wake: int) -> in
 /** Closes both of a poller's descriptors, answering zero or the first failure's code, negated. */
 @needs(os)
 private[sysl] extern "sysl_io_poll_close" poll_close(poller: int, wake: int) -> int
+
+// ## A wake that is a descriptor
+//
+// `sysl.io.poll.WakeFd` is a descriptor made readable by a wake and made not readable by a drain:
+// Linux's `eventfd`, or a pipe whose read end is the descriptor and whose write end the wakes are
+// written to. Four hooks; the second descriptor is `-1` where wakes are written to the first.
+
+/** Makes a wake descriptor with no wake pending, answering the descriptor to watch or the failure's
+ * code, negated, and leaving the one a wake is written to -- or `-1` for the same one -- in `write`.
+ * Neither blocks a read or a write.
+ */
+@needs(os)
+private[sysl] extern "sysl_io_wakefd_open" wakefd_open(write: *i32) -> int
+
+/** Makes `fd` readable, answering zero or the failure's code, negated. **A wake already pending is
+ * success** -- a full counter or a full pipe is a wake nobody has taken yet.
+ */
+@needs(os)
+private[sysl] extern "sysl_io_wakefd_wake" wakefd_wake(fd: int, write: int) -> int
+
+/** Takes every pending wake from `fd` without waiting, answering one where there was one, zero where
+ * there was none, or the failure's code, negated.
+ */
+@needs(os)
+private[sysl] extern "sysl_io_wakefd_drain" wakefd_drain(fd: int) -> int
+
+/** Closes both of a wake's descriptors, answering zero or the first failure's code, negated. */
+@needs(os)
+private[sysl] extern "sysl_io_wakefd_close" wakefd_close(fd: int, write: int) -> int

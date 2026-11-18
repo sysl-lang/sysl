@@ -94,7 +94,7 @@ trh_ensure()
 trh_struct_invariant()
     trh_traps("struct Span\n    lo: int\n    hi: int\n    invariant lo <= hi\n\nvar hi = 1\n" +
               "val s = Span(3, hi)\nprint(s.lo)\n",
-              "invariant of 'Span' failed (main.sysl:7:9)\n")
+              "invariant of 'Span' failed: clause 'lo <= hi' at main.sysl:4:15 (main.sysl:7:9)\n")
 
 @test("a loop invariant that stops holding says so")
 trh_loop_invariant()
@@ -199,6 +199,22 @@ trh_hook_sees_a_contract_message()
     trh_stops(trh_hooked("f(x: int) -> int\n    require x > 0, \"x > 0\"\n    require x < 9, \"x < 9\"\n    x\n\n" +
                          "print(f(3))\nprint(f(10))\n")[..], 5, "3\n",
               "hook 17 main.sysl:5:13 require failed: x < 9|0\n")
+
+// A struct's invariant: the clause that failed is a value the clauses answered with, and the hook is
+// still handed ONE sentence, the struct and the clause joined, the location the write's.
+@test("an exported sysl_trap sees a struct invariant's whole sentence, the failing clause in it")
+trh_hook_sees_an_invariant_clause()
+    trh_stops(trh_hooked("struct Window\n    lo: int\n    hi: int\n    invariant lo <= hi\n    invariant hi - lo < 10\n\n" +
+                         "var w = Window(1, 2)\nprint(w.hi)\nw.hi = 40\nprint(w.hi)\n")[..], 5, "2\n",
+              "hook 17 main.sysl:11:1 invariant of 'Window' failed: clause 'hi - lo < 10' at main.sysl:7:15|0\n")
+
+// A sentence longer than any fixed buffer would hold arrives whole: the clause is copied by its count.
+@test("an exported sysl_trap sees a long invariant clause whole")
+trh_hook_sees_a_long_invariant_clause()
+    val clause = "a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a < 100"
+
+    trh_stops(trh_hooked(s"struct Big\n    a: int\n    invariant $clause\n\nvar b = Big(1)\nb.a = 9\nprint(b.a)\n")[..],
+              5, "", s"hook 17 main.sysl:8:1 invariant of 'Big' failed: clause '$clause' at main.sysl:5:15|0\n")
 
 @test("an exported sysl_trap sees a range failure as its own kind")
 trh_hook_sees_a_range()
