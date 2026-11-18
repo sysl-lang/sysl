@@ -2185,6 +2185,28 @@ u64
 long
 ```
 
+**Arithmetic over literals is the literal it comes to at every one of these rules**, the narrowest
+widening included. `60 * 52` is the `3120` it folds to, not an `int` that widens, so over two
+unsigned candidates it is as ambiguous as `3120` is, and one only the wider candidate holds
+(`4567890123 * 2`) chooses that one. A typed operand anywhere in it (`x * 2`), or a constant
+declared with a type, makes it a value of that type, which widens as any typed argument does:
+
+```sysl
+g(v: u32) -> string = "u32"
+g(v: u64) -> string = "u64"
+
+const N: u32 = 3120
+
+print(g(N * 2), g(4567890123 * 2))
+print(g(60 * 52))
+```
+
+```error
+'g' is ambiguous here — 2 of its declarations take these arguments:
+    g(v: u32)
+    g(v: u64)
+```
+
 **Candidates tied only by bare literals take each literal at its default type.** Where every
 position the candidates differ at holds a numeric literal with no suffix, and no rule above has
 chosen, the candidate whose parameter at each of those positions is the literal's default wins. A

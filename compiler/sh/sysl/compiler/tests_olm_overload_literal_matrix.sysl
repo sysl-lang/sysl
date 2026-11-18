@@ -277,3 +277,147 @@ olm_float_literal_arithmetic()
 
         print(h(1.5 * 2), S.of(1.5 * 2), h(1 + 2.0), S.of(-(0.5 + 1)))
         """), "real real real real\n")
+
+// **Arithmetic over literals is the literal it comes to at every tie-break, the narrowest widening
+// included** (`reference/declarations.md § Overloading`): `60 * 52` is the `3120` it folds to, not an
+// `int` that widens, so over `u32` and `u64` it is as ambiguous as `3120` is -- where it once chose
+// `u32` by widening from an `int` it never was.
+private olm_unsigned() -> string = raw"""
+    g(v: u32) -> string = "u32"
+    g(v: u64) -> string = "u64"
+
+    struct G
+        n: int
+
+        of(v: u32) -> string = "u32"
+        of(v: u64) -> string = "u64"
+        at(self, v: u32) -> string = "u32"
+        at(self, v: u64) -> string = "u64"
+
+    impl Add[u32, string] for G
+        add(self, v: u32) -> string = "u32"
+
+    impl Add[u64, string] for G
+        add(self, v: u64) -> string = "u64"
+
+    impl Add[G, string] for u32
+        add(self, v: G) -> string = "u32"
+
+    impl Add[G, string] for u64
+        add(self, v: G) -> string = "u64"
+
+    val gv = G(0)
+    val x: u32 = 3
+    const N: u32 = 3120
+    const W: u64 = 3120
+    """
+
+@test("literal arithmetic over an unsigned pair is as ambiguous as the literal, through every operator")
+olm_arith_unsigned_pair_ambiguous()
+    if !olm_ready() then return
+
+    for e in ["3120", "60 * 52", "3000 + 120", "3200 - 80", "6240 / 2", "7000 % 3880", "195 << 4",
+              "4095 & 3120", "3072 | 48", "3072 ^ 48", "(50 + 10) * 52"]
+        val free = olm_err(olm_unsigned() + s"print(g($e))\n")
+        val assoc = olm_err(olm_unsigned() + s"print(G.of($e))\n")
+        val method = olm_err(olm_unsigned() + s"print(gv.at($e))\n")
+
+        assert(free.contains("'g' is ambiguous here — 2 of its declarations take these arguments"), e + ": " + free)
+        assert(assoc.contains("'G.of' is ambiguous here"), e + ": " + assoc)
+        assert(method.contains("'G.at' is ambiguous here"), e + ": " + method)
+
+@test("an operator's literal-arithmetic operand is as ambiguous as the literal on either side")
+olm_arith_unsigned_pair_operator()
+    if !olm_ready() then return
+
+    for e in ["3120", "60 * 52", "(60 * 52)", "3072 | 48"]
+        val right = olm_err(olm_unsigned() + s"print(gv + $e)\n")
+        val left = olm_err(olm_unsigned() + s"print(($e) + gv)\n")
+
+        assert(right.contains("'+' between G and int comes from 2 implementations of one trait on G, and " +
+                              "the operands do not say which was meant"), e + ": " + right)
+        assert(left.contains("'+' between int and G comes from 2 implementations of one trait on different " +
+                             "scalars"), e + ": " + left)
+
+@test("literal arithmetic only the wider candidate holds chooses it at every path")
+olm_arith_only_wider_fits()
+    if !olm_ready() then return
+
+    assert_eq(olm_ran(olm_unsigned() + raw"""
+        print(g(4567890123 * 2), G.of(4567890123 * 2), gv.at(4567890123 * 2), gv + 4567890123 * 2,
+              4567890123 * 2 + gv, g(1 << 40), g(65536 * 65536))
+        """), "u64 u64 u64 u64 u64 u64 u64\n")
+
+@test("negative literal arithmetic is refused by unsigned candidates as a negative literal is")
+olm_arith_negative_against_unsigned()
+    if !olm_ready() then return
+
+    for e in ["-5", "3 - 5", "-(3 + 4)", "~0"]
+        val free = olm_err(olm_unsigned() + s"print(g($e))\n")
+        val assoc = olm_err(olm_unsigned() + s"print(G.of($e))\n")
+
+        assert(free.contains("no 'g' takes these arguments"), e + ": " + free)
+        assert(assoc.contains("no 'G.of' takes these arguments"), e + ": " + assoc)
+
+    val bare = olm_err(olm_unsigned() + "print(gv + -5)\n")
+    val arith = olm_err(olm_unsigned() + "print(gv + (3 - 5))\n")
+
+    assert(bare.contains("'+' between G and int needs 'Add[int]'"), bare)
+    assert(arith.contains("'+' between G and int needs 'Add[int]'"), arith)
+
+@test("arithmetic with a typed operand, and a typed constant, keep their own type")
+olm_arith_typed_stays_typed()
+    if !olm_ready() then return
+
+    assert_eq(olm_ran(olm_unsigned() + raw"""
+        print(g(x * 2), G.of(x + 1), gv.at(2 * x), gv + (x - 1), (x + 1) + gv)
+        print(g(N), G.of(N), gv.at(N * 2), gv + N, N + gv)
+        print(g(W), G.of(W), gv.at(W - 1), gv + W, W + gv)
+        """), "u32 u32 u32 u32 u32\nu32 u32 u32 u32 u32\nu64 u64 u64 u64 u64\n")
+
+@test("float literal arithmetic decides nothing by widening, as the float literal does not")
+olm_float_arith_no_narrowest()
+    if !olm_ready() then return
+
+    val pair = "k(v: f32) -> string = \"f32\"\nk(v: f128) -> string = \"f128\"\n"
+
+    for e in ["1.5", "1.5 * 2", "3.0 / 2", "-(0.5 + 1)", "0.5 + 1"]
+        val said = olm_err(pair + s"print(k($e))\n")
+
+        assert(said.contains("'k' is ambiguous here"), e + ": " + said)
+
+@test("literal arithmetic beside a typed argument follows it, and an operand reaches a float implementation")
+olm_arith_follows_typed()
+    if !olm_ready() then return
+
+    assert_eq(olm_ran(raw"""
+        n(a: f32, c: f32) -> string = "f32"
+        n(a: real, c: real) -> string = "real"
+        m(a: f32, c: f32) -> string = "f32 f32"
+        m(a: f32, c: real) -> string = "f32 real"
+
+        struct P
+            v: f32
+
+        impl Mul[f32] for P
+            mul(self, k: f32) -> P = P(self.v * k)
+
+        val y: f32 = 1.0
+        val p = P(1.5)
+
+        print(n(y, 50.0), n(y, 50.0 * 2), n(y, 2 + 0.5), m(y, 50.0), m(y, 25.0 * 2))
+        print((p * 6).v, (p * (2 * 3)).v, (p * (1 << 2)).v)
+        """), "f32 f32 f32 f32 real f32 real\n9 9 6\n")
+
+@test("integer literal arithmetic converted to a new type runs that type's own From[int], as the literal does")
+olm_arith_own_from()
+    if !olm_ready() then return
+
+    assert_eq(olm_ran(raw"""
+        type Phase = new real
+
+        impl From[int] for Phase
+            from(n: int) -> Phase = Phase(n) * 2.0
+
+        print(real(Phase(3)), real(Phase(1 + 2)), real(Phase(6 / 2)), real(Phase(-(1 - 4))), real(Phase(1.5 * 2)))
+        """), "6 6 6 6 3\n")

@@ -2533,8 +2533,9 @@ private into_subtype(cx: &Analyzer, span: Span, target: Type, written: string,
             // Read without widening: the conversion below is the one this call names, and a value
             // widened to the base first would never reach the type's own `From` for it. So is an
             // integer literal where the type has its own `From[int]`: read at a float base it would be
-            // that float, and wrapped rather than handed to the `from` the type wrote for it.
-            val own_int = d.derived && literal_default(args[0]).unwrap_or(Unknown) == int_type() &&
+            // that float, and wrapped rather than handed to the `from` the type wrote for it -- and
+            // arithmetic over integer literals is that literal (`Phase(1 + 2)` is `Phase(3)`).
+            val own_int = d.derived && literal_arith_default(args[0]).unwrap_or(Unknown) == int_type() &&
                           from_conversion(cx, int_type(), target).is_some()
 
             // A conversion's value is not used at the type it is converted to, so a literal binding
@@ -3542,7 +3543,9 @@ end signed_literal_preference
 // meant**: a candidate beats another where each of its parameters is the other's or widens to it, so
 // `f(b)` over `f(x: int)` and `f(x: long)` at a `byte` is the `int` one. A literal has no type to be
 // widened from, so a position holding one decides nothing here -- what it means is the literal's
-// own rule above. Empty where no candidate beats every other.
+// own rule above. **Nor does arithmetic over literals** (`literal_arith_default`): `60 * 52` is the
+// `3120` it comes to, not an `int` that widens, so `g(60 * 52)` over `g(v: u32)` and `g(v: u64)` is
+// as ambiguous as `g(3120)`. Empty where no candidate beats every other.
 private narrowest_widening(fitted: Buf[Buf[Type]], ranked: Buf[usize], args: Buf[Expr]) -> Buf[usize]
     var winners: Buf[usize] = buf()
 
@@ -3612,7 +3615,8 @@ end literal_default_preference
 // other argument is a numeric literal with no suffix, that candidate wins and the literals are read
 // at its parameters: `nextafter(x, 100.0)` at an `f32` `x` is the `f32` one, as `x * 100.0` is at
 // `f32`. A typed argument that no candidate takes exactly stays ambiguous, and so do two candidates
-// that both match every typed argument. Empty where the rule does not apply.
+// that both match every typed argument. Arithmetic over literals is a literal here too
+// (`nextafter(x, 50.0 * 2)`). Empty where the rule does not apply.
 private literal_follows_typed(fitted: Buf[Buf[Type]], ranked: Buf[usize], args: Buf[Expr],
                               natural: Buf[Option[Type]]) -> Buf[usize]
     var winners: Buf[usize] = buf()
@@ -3620,7 +3624,7 @@ private literal_follows_typed(fitted: Buf[Buf[Type]], ranked: Buf[usize], args: 
     var literals = 0
 
     for j in 0..<args.len()
-        if literal_default(args[j]).is_some() then literals += 1 else typed += 1
+        if literal_arith_default(args[j]).is_some() then literals += 1 else typed += 1
 
     if typed == 0 || literals == 0 || natural.len() != args.len() then return winners
 
@@ -3630,7 +3634,7 @@ private literal_follows_typed(fitted: Buf[Buf[Type]], ranked: Buf[usize], args: 
 
         for j in 0..<args.len()
             if !all then break
-            if literal_default(args[j]).is_some() then continue
+            if literal_arith_default(args[j]).is_some() then continue
 
             natural[j] match
                 Some(t) -> if !type_eq(here[j], t) then all = false
@@ -3658,7 +3662,7 @@ private params_narrower(mine: Buf[Type], theirs: Buf[Type], args: Buf[Expr]) -> 
 
     for j in 0..<mine.len()
         if type_eq(mine[j], theirs[j]) then continue
-        if is_literal(args[j]) || !implicitly_widens(mine[j], theirs[j]) then return false
+        if literal_arith_default(args[j]).is_some() || !implicitly_widens(mine[j], theirs[j]) then return false
 
         strictly = true
 
