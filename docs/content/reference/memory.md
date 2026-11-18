@@ -2993,6 +2993,7 @@ none: `p[i]` and `p[0..<n]` are unchecked, as in C. A pointer to something with 
 | `usize(p)` | a pointer as a number | an ordinary conversion |
 | `ptr_cast(n)` | a number as a pointer | unsafe |
 | `ptr_cast(p)` | one pointee type as another | unsafe |
+| `xs.view_as[T]()` | a view's plain-data elements as other plain data, owner kept, boundary and tail checked | safe ([arrays](/reference/arrays/#reading-a-view-as-another-element)) |
 
 **`ptr_cast` is imported from `sysl.raw`**, beside `str_cast` and `str_alias`, so every
 reinterpretation is found by its imports; an alias, a wildcard and a module path reach it as they
