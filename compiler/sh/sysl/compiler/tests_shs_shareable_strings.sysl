@@ -83,14 +83,15 @@ shs_capture_on_threads()
         val name = s"worker-$n"
         val job: &sync Fn() -> string = () -> name[0..<6]
 
-        val got = scope((s) ->
-            val a = s.spawn(() -> job())
-            val b = s.spawn(() -> job() + name[6..<name.len])
+        val lens = scope((s) ->
+            val a = s.spawn(() -> int(job().len))
+            val b = s.spawn(() -> int((job() + name[6..<name.len]).len))
 
-            a.join() + " " + b.join())
+            a.join() * 100 + b.join())
 
-        print(got, name)
-        """, "worker worker-7 worker-7\n")
+        scope((s) -> s.spawn(() -> print(job(), job() + name[6..<name.len])).join())
+        print(lens, name)
+        """, "worker worker-7\n608 worker-7\n")
 
 @test("a literal and a built string captured side by side")
 shs_capture_literal_and_built()
@@ -139,7 +140,8 @@ shs_threads_hammer_one_count()
         print(total)
         """, "880000\n")
 
-// A slice of the shared string is kept by the thread past the closure that made it, and outlives it.
+// A slice of the shared string is kept past the closure that made it, and outlives it: the closure is
+// let go when `part` returns, and the slice still holds its share of the marked bytes.
 @test("a slice of a shared string outlives the closure it was taken through")
 shs_slice_outlives_closure()
     shs_prints(raw"""
@@ -149,11 +151,15 @@ shs_slice_outlives_closure()
             val n = 11
             val whole = s"kept-$n-bytes"
             val job: &sync Fn() -> string = () -> whole[5..<7]
+            val got = job()
 
-            scope((s) -> s.spawn(() -> job()).join())
+            scope((s) -> s.spawn(() -> print(job())).join())
+            got
 
-        print(part(), part().len)
-        """, "11 2\n")
+        val p = part()
+
+        print(p, p.len)
+        """, "11\n11 2\n")
 
 // -- a channel ----------------------------------------------------------------------------------------
 
@@ -199,8 +205,9 @@ shs_struct_parts()
 
             c.names[0] + c.names[1] + c.alias.unwrap_or("") + t
 
-        print(scope((s) -> s.spawn(() -> said(cfg)).join()), said(cfg))
-        """, "a9bc9d9 a9bc9d9\n")
+        scope((s) -> s.spawn(() -> print(said(cfg))).join())
+        print(said(cfg))
+        """, "a9bc9d9\na9bc9d9\n")
 
 @test("a string read out of one shared object makes another")
 shs_shared_into_shared()
@@ -297,7 +304,7 @@ shs_view_of_strings_refused()
         val job: &sync Fn() -> int = () -> int(v.len)
 
         print(job())
-        """, ["'v' it captures reaches a '[]string'"])
+        """, ["'v' it captures reaches a '[]const string'"])
 
 @test("a string is still not 'Share': a bound asks of every place, copied or not")
 shs_not_share()

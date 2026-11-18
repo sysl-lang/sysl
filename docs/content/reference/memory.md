@@ -2446,17 +2446,19 @@ val n = 7
 val name = s"worker-$n"
 val job: &sync Fn() -> string = () -> name[0..<6]
 
-val got = scope((s) ->
-    val a = s.spawn(() -> job())
-    val b = s.spawn(() -> job() + name[6..<name.len])
+val lens = scope((s) ->
+    val a = s.spawn(() -> job().len)
+    val b = s.spawn(() -> (job() + name[6..<name.len]).len)
 
-    a.join() + " " + b.join())
+    a.join() * 100 + b.join())
 
-print(got, name)
+scope((s) -> s.spawn(() -> print(job(), job() + name[6..<name.len])).join())
+print(lens, name)
 ```
 
 ```output
-worker worker-7 worker-7
+worker worker-7
+608 worker-7
 ```
 
 - **A literal is not copied**, nor a string already shared — one read out of another `&sync` object:
