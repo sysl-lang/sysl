@@ -1,0 +1,270 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.replace_all
+
+// An `int` and a `usize` meet where the value of one is known to fit the other's type
+// (`mixing.sysl`, `reference/expressions.md § An int and a usize meet where the value fits`).
+//
+// The axes: what makes a value known (a literal, a typed `const`, `sizeof`, a `val` and a chain of
+// `val`s, a mask, a conversion from a narrower unsigned type) against what does not (a `var`, a
+// parameter, a `for` variable, a negative constant, a `val` that may be negative, a capture, a
+// `usize` constant past `int`); the operator positions (arithmetic either way round, `/` and `%`, a
+// comparison and a chain, the bounds of a `for` and of a range value, a compound assignment either
+// way round); which type the pair settles at (the one whose value is not known, `int` where both are,
+// the position's where it names one); the pairs that stay refused (a wrapping operator, `long`,
+// `isize`, `u32`, every position that is not an operator); a generic body; and a 16-bit target, where
+// a non-negative `int` is not a `usize`. Skipped: the branches of an `if` (a position, which keeps
+// the type table) and module-level `val`s (a global is not a binding `known` is kept for).
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private ium_ready() -> bool = std_root().is_ok() && clang_available()
+
+private ium_root(text: string) -> string
+    val root = replace_all(make_temp_dir("sysl-ium").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+end ium_root
+
+// What a one-file program prints, or why it was refused.
+private ium_ran(text: string) -> string
+    val root = ium_root(text)
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = replace_all(failure_text(why), s"$root/", "")
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end ium_ran
+
+// The report a one-file program is refused with on a machine (this one where none is named), or
+// nothing where it is accepted.
+private ium_report(machine: Option[string], text: string) -> string
+    val root = ium_root(text)
+
+    val out = emit_llvm_text(s"$root/main.sysl", machine) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    replace_all(out, s"$root/", "")
+end ium_report
+
+private ium_prints(text: string, want: string)
+    if !ium_ready() then return
+
+    assert_eq(ium_ran(text), want)
+end ium_prints
+
+// The hint every refusal of an `int` beside a `usize` ends with.
+private ium_hint() -> string =
+    " — an int and a usize meet only where the value of one is known to fit the other's type; " +
+    "convert one with 'usize(…)' or 'int(…)'"
+
+// Refused with exactly `message` first, at `at` (`line:col`).
+private ium_refused_on(machine: Option[string], text: string, message: string, at: string)
+    if !ium_ready() then return
+
+    val said = ium_report(machine, text)
+    val head = s"error: $message\n"
+    val place = s"--> main.sysl:$at\n"
+
+    assert(said.starts_with(head) && said.contains(place),
+           s"expected a report starting\n$head\nlocated at $place\ngot\n$said")
+end ium_refused_on
+
+private ium_refused(text: string, message: string, at: string) = ium_refused_on(None, text, message, at)
+
+// The type an expression settles at, read off the refusal of a `bool` binding of it.
+private ium_type_of(prelude: string, e: string, ty: string)
+    val said = ium_report(None, s"${prelude}val z: bool = $e\n")
+    val head = s"error: cannot initialize 'z': declared bool but the value is $ty\n"
+
+    assert(said.starts_with(head), s"expected a report starting\n$head\ngot\n$said")
+end ium_type_of
+
+// -- what is known --------------------------------------------------------------------------------
+
+@test("a typed constant meets a usize in every arithmetic operator, on either side")
+ium_typed_constant()
+    ium_prints("const K: int = 4\nvar n: usize = 10\nprint(n + K, K * n, n - K, n / K, n % K, K + n)\n",
+               "14 40 6 2 2 14\n")
+
+@test("a val of a known value, and a val computed from one, meet a usize")
+ium_known_val()
+    ium_prints("val a: int = 3\nval b = a * 2 + 1\nvar n: usize = 1\nprint(n + a, b + n)\n", "4 8\n")
+
+@test("the largest int is a usize; a usize constant that fits an int is an int")
+ium_at_the_edges()
+    ium_prints("val k: int = 2147483647\nvar n: usize = 1\nprint(n + k)\n", "2147483648\n")
+    ium_prints("const SMALL: usize = 2147483647\nvar i: int = -5\nprint(i + SMALL, i < SMALL)\n",
+               "2147483642 true\n")
+end ium_at_the_edges
+
+@test("sizeof is a usize constant that meets an int offset at int")
+ium_sizeof_offset()
+    ium_prints("struct H\n    a: u32\n    b: u32\nslot(i: int) -> int = sizeof(H) + i * sizeof(u32)\n" +
+               "print(slot(3), slot(-1))\n", "20 4\n")
+
+@test("a mask with a non-negative side, and a narrower unsigned value, are non-negative ints")
+ium_mask_and_narrow()
+    ium_prints("f(x: int, n: usize) -> usize = n + (x & 0xff)\nprint(f(-1, 1))\n", "256\n")
+    ium_prints("f(b: u8, n: usize) -> usize = n + int(b)\nprint(f(200, 1))\n", "201\n")
+    ium_prints("f(x: int, n: usize) -> usize = n + (x & 0xff) % 7 + (x & 0x7f) / 2 + ((x & 0xff) >> 1)\n" +
+               "print(f(-1, 0))\n", "193\n")
+end ium_mask_and_narrow
+
+@test("a length minus a known int is a usize")
+ium_length_arithmetic()
+    ium_prints("val b = [1, 2, 3]\nval i: int = 1\nconst K: int = 1\nprint(b.len - i, b.len - K, b[..].len - i)\n",
+               "2 2 2\n")
+
+@test("a known int compares with a usize, in a chain too")
+ium_comparisons()
+    ium_prints("val i: int = 3\nvar n: usize = 10\nprint(i < n, n == i, 0 <= i < n, n != i)\n",
+               "true false true true\n")
+
+@test("a range bounded by a constant int and a length is a usize range, in a for and as a value")
+ium_ranges()
+    ium_prints("const S: int = 1\nval b = [1, 2, 3, 4]\nfor j in S..<b.len\n    print(j)\n", "1\n2\n3\n")
+    ium_prints("const S: int = 2\nval b = [1, 2, 3, 4]\nval r = S..<b.len\nfor j in r\n    print(j)\n", "2\n3\n")
+end ium_ranges
+
+@test("a compound assignment takes a known value of the other type, either way round")
+ium_compound()
+    ium_prints("const K: int = 2\nvar n: usize = 4\nn += K\nn *= K\nn -= K\nprint(n)\n", "10\n")
+    ium_prints("val c: usize = 3\nvar i: int = 1\ni += c\ni -= c * 2\nprint(i)\n", "-2\n")
+end ium_compound
+
+@test("a known value meets a usize inside a generic body")
+ium_generic_body()
+    ium_prints("grow[T](x: T, n: usize) -> usize\n    val k: int = 2\n    n + k\nend grow\n" +
+               "print(grow(1.5, 4), grow(\"s\", 5))\n", "6 7\n")
+
+// -- which type the pair settles at ---------------------------------------------------------------
+
+@test("the pair settles at the type whose value is not known")
+ium_settles_at_the_unknown()
+    if !ium_ready() then return
+
+    ium_type_of("const K: int = 2\nvar n: usize = 4\n", "n + K", "usize")
+    ium_type_of("const K: int = 2\nvar n: usize = 4\n", "K + n", "usize")
+    ium_type_of("var i: int = 2\n", "sizeof(u64) + i", "int")
+    ium_type_of("var i: int = 2\n", "i * sizeof(u64)", "int")
+end ium_settles_at_the_unknown
+
+@test("where both values are known the pair is an int, or the type its position names")
+ium_settles_where_both_known()
+    if !ium_ready() then return
+
+    ium_type_of("const K: int = 2\n", "sizeof(u32) + K", "int")
+    ium_type_of("const K: int = 2\n", "K + sizeof(u32)", "int")
+    ium_prints("const K: int = 2\nval y: usize = K + sizeof(u32)\nval x: int = sizeof(u32) - K\nprint(y, x)\n",
+               "6 2\n")
+end ium_settles_where_both_known
+
+// -- what stays refused ---------------------------------------------------------------------------
+
+@test("a var, a parameter and a for variable are not known, so they do not meet a usize")
+ium_unknown_bindings()
+    ium_refused("var i: int = 3\nvar n: usize = 10\nprint(n + i)\n",
+                "'+' needs matching types, got usize and int" + ium_hint(), "3:11")
+    ium_refused("f(i: int, n: usize) -> usize = n + i\nprint(f(1, 2))\n",
+                "'+' needs matching types, got usize and int" + ium_hint(), "1:36")
+    ium_refused("val b = [1, 2, 3]\nval k: int = 3\nfor i in 0..<k\n    print(b.len - i)\n",
+                "'-' needs matching types, got usize and int" + ium_hint(), "4:19")
+end ium_unknown_bindings
+
+@test("a for variable written in its body would not be known, which is why none is")
+ium_for_variable_is_written()
+    ium_prints("var n: usize = 0\nfor i in 0..<3\n    i += 1\n    n += usize(i)\nprint(n)\n", "4\n")
+
+@test("a value that may be negative is refused, constant, val or computed")
+ium_negative()
+    ium_refused("const K: int = -1\nvar n: usize = 10\nprint(n + K)\n",
+                "'+' needs matching types, got usize and int" + ium_hint(), "3:11")
+    ium_refused("val k: int = -1\nvar n: usize = 10\nprint(k + n)\n",
+                "'+' needs matching types, got int and usize" + ium_hint(), "3:11")
+    ium_refused("val a: int = 3\nval b = a - 5\nvar n: usize = 1\nprint(n + b)\n",
+                "'+' needs matching types, got usize and int" + ium_hint(), "4:11")
+    ium_refused("f(x: int, n: usize) -> usize = n + x % 7\nprint(f(-1, 1))\n",
+                "'+' needs matching types, got usize and int" + ium_hint(), "1:36")
+end ium_negative
+
+@test("a usize constant past the largest int does not meet an unknown int")
+ium_usize_past_int() =
+    ium_refused("var i: int = 1\nconst BIG: usize = 3000000000\nprint(i + BIG)\n",
+                "'+' needs matching types, got int and usize" + ium_hint(), "3:11")
+
+@test("a val read inside a closure is a capture, which is not known")
+ium_capture() =
+    ium_refused("val k: int = 2\nvar n: usize = 4\nval f = () -> n + k\nprint(f())\n",
+                "'+' needs matching types, got usize and int" + ium_hint(), "3:19")
+
+@test("a comparison, a range and a compound assignment over unknown values are refused with the hint")
+ium_other_positions_refused()
+    ium_refused("var i: int = 3\nvar n: usize = 10\nprint(i < n)\n",
+                "cannot compare int with usize" + ium_hint(), "3:7")
+    ium_refused("var s: int = 1\nval b = [1, 2]\nfor j in s..<b.len\n    print(j)\n",
+                "a 'for' range needs matching bounds, got int and usize" + ium_hint(), "3:1")
+    ium_refused("var s: int = 1\nval b = [1, 2]\nval r = s..<b.len\n",
+                "a range needs matching bounds, got int and usize" + ium_hint(), "3:9")
+    ium_refused("var c: usize = 3\nvar i: int = 1\ni += c\n",
+                "'+' needs matching types, got int and usize" + ium_hint(), "3:6")
+    ium_refused("const K: int = -2\nvar n: usize = 4\nn += K\n",
+                "'+' needs matching types, got usize and int" + ium_hint(), "3:6")
+end ium_other_positions_refused
+
+@test("a wrapping operator still takes two values of one type")
+ium_wrapping() =
+    ium_refused("const K: int = 2\nvar n: usize = 4\nprint(n +% K)\n",
+                "'+%' takes two values of one type, got usize and int", "3:12")
+
+@test("only an int and a usize mix: long, isize and u32 keep the table, with no hint")
+ium_other_pairs()
+    ium_refused("const K: long = 3\nvar n: usize = 10\nprint(n + K)\n",
+                "'+' needs matching types, got usize and long", "3:11")
+    ium_refused("val k: isize = 3\nvar n: usize = 10\nprint(n + k)\n",
+                "'+' needs matching types, got usize and isize", "3:11")
+    ium_refused("val k: u32 = 3\nvar i: int = 10\nprint(i + k * 0)\n",
+                "'+' needs matching types, got int and uint", "3:11")
+end ium_other_pairs
+
+@test("a position that is not an operator keeps the type table")
+ium_positions_unchanged()
+    ium_refused("const K: int = 4\nvar n: usize = K\n",
+                "cannot initialize 'n': declared usize but the value is int", "2:1")
+    ium_refused("take(n: usize) -> usize = n\nval k: int = 4\nprint(take(k))\n",
+                "'n' of 'take' is usize, but int was given", "3:12")
+end ium_positions_unchanged
+
+// -- a 16-bit usize -------------------------------------------------------------------------------
+
+private ium_probe(k: string) -> string =
+    s"@export(\"ium_probe\")\nprobe(n: usize) -> usize\n    val k: int = $k\n    n + k\nend probe\n"
+
+@test("on Craft's 16-bit target an int meets a usize only where its value fits 16 bits")
+ium_on_craft()
+    if !ium_ready() then return
+
+    assert_eq(ium_report(Some("craft-freestanding"), ium_probe("65535")), "")
+    ium_refused_on(Some("craft-freestanding"), ium_probe("65536"),
+                   "'+' needs matching types, got usize and int" + ium_hint(), "4:9")
+    assert_eq(ium_report(Some("thumbv7em-freestanding"), ium_probe("2147483647")), "")
+end ium_on_craft

@@ -1937,7 +1937,8 @@ type the context gives, and the branches of an `if` or a `match` used as a value
 wider of their types as two operands do. **The bounds of a range and the elements of an unannotated
 array literal meet the same way**: `i..<n` over an `int` and a `long` is a `long` range, and `[a, b]`
 over an `int` and a `long` is a `[2]long`. A pair neither of whose types holds the other — a `u32` and
-an `int` — is refused.
+an `int` — is refused; an `int` and a `usize` [meet where the value of one
+fits](#an-int-and-a-usize-meet-where-the-value-fits).
 
 ```sysl
 struct Sample
@@ -2182,6 +2183,76 @@ var n: int = l
 
 ```error
 cannot initialize 'n': declared int but the value is long
+```
+
+### An int and a usize meet where the value fits
+
+**An `int` and a `usize` are the one pair of operands that meet where neither type holds the other:
+an operand converts to the other's type where the compiler can show its value fits there.** A
+length, a `sizeof` and an offset are `usize`s while a counter is an `int`, and the values that meet
+are nearly always small and non-negative, so `sizeof(Header) + i * sizeof(Slot)` over an `int` `i`
+is an `int` and `b.len - K` over a constant `int` `K` is a `usize`. Nothing is rounded, truncated or
+checked at run time, because nothing could fail: the conversion is the one the table makes for a
+narrower type.
+
+What the compiler knows is the interval a value lies in. A literal and a constant are their own
+value — a typed `const`, a `sizeof`, `alignof` or `offsetof`. A `val` is what its initializer was
+known to be, so `val b = a * 2 + 1` over a known `a` is known too. A conversion is its operand's
+value where the target holds it, so `int(x)` over a `byte` is 0 to 255. `+`, `-` and `*` combine
+their operands, and `x & 0xff`, `x >> k`, `x / k` and `x % k` over non-negative values stay
+non-negative. Anything else — a `var`, a parameter, a field, a call's result, a `for` variable (its
+body may assign it), a `val` read inside a closure — may hold any value of its type: an `int` that
+may be negative is never a `usize`, nor a `usize` that may pass 2147483647 an `int`.
+
+**The pair settles at the type whose value is not known**, so `n + K` is a `usize` and `sizeof(T) +
+i` an `int`. Where both values are known it is the type the position names, and otherwise an `int`.
+It holds in every operator that meets two values — arithmetic, a comparison, the bounds of a range,
+a compound assignment (which converts its value to the place's type, never the reverse) — and in no
+other position: an initializer, an argument, a return and the branches of an `if` keep the table,
+and a wrapping or saturating operator still takes two values of one type. No other pair mixes, so
+`long` beside `usize` and `isize` beside `usize` are refused as before. The width is the target's:
+on Craft's 16-bit target a `val k: int = 65536` is not a `usize`.
+
+```sysl
+struct Header
+    count: u32
+    free: u32
+
+const LIMIT: int = 2
+
+slot(i: int) -> int = sizeof(Header) + i * sizeof(u32)
+
+val b = [5, 6, 7, 8]
+val first: int = 1
+val last = first * 2 + 1
+var n: usize = b.len
+
+n -= LIMIT
+
+print(slot(3), b.len - first, n, first < b.len, last % b.len)
+
+for j in first..<b.len
+    print(b[j])
+```
+
+```output
+20 3 2 true 3
+6
+7
+8
+```
+
+A `var`, or any value that may be negative, is refused, and the diagnostic says how to convert:
+
+```sysl
+val b = [5, 6, 7]
+var i: int = 1
+
+print(b.len - i)
+```
+
+```error
+'-' needs matching types, got usize and int — an int and a usize meet only where the value of one is known to fit the other's type; convert one with 'usize(…)' or 'int(…)'
 ```
 
 ## `sizeof`, `alignof` and `offsetof`

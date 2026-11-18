@@ -3,6 +3,7 @@ module sh.sysl.compiler
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.container.{Map, map}
+import sysl.math.bigint.BigInt
 import sysl.text.Search
 
 // The context an expression is typed in: the declaration tables the whole compilation shares, the
@@ -60,6 +61,11 @@ struct Local
     // refusal: a name a pattern over a type parameter's value bound at a generic's definition, or one
     // bound from such names alone (`Analysis.defers`). Reading one gives nothing up.
     deferred: bool
+
+    // The values a `val` of an integer type is known to hold, both ends included, where its
+    // initializer said (`mixing.sysl`): what lets an `int` beside a `usize` meet it when its value
+    // fits. Nothing for every binding that may be written again.
+    known: Option[(BigInt, BigInt)]
 end Local
 
 // One loop, while its body is being read.
@@ -722,7 +728,7 @@ struct Analyzer
         val unique = self.fresh_name(name)
 
         self.locals.push(Local(name, unique, ty, false, false, None, self.declared_at(named), None,
-                               self.an.defers(ty)))
+                               self.an.defers(ty), None))
         unique
     end bind
 
@@ -754,6 +760,36 @@ struct Analyzer
         end while
     end spell_binding
 
+    // Records the values the read-only binding `unique` names is known to hold (`Local.known`).
+    note_known(*self, unique: string, values: (BigInt, BigInt))
+        var i = self.locals.len()
+
+        while i > 0
+            i -= 1
+
+            if self.locals[i].unique == unique
+                var l = self.locals[i]
+
+                if l.read_only && l.stands_for.is_none() then l.known = Some(values)
+
+                self.locals[i] = l
+                return
+            end if
+        end while
+    end note_known
+
+    // The values the binding `unique` names is known to hold, where it is in scope and they are.
+    known_of(self, unique: string) -> Option[(BigInt, BigInt)]
+        var i = self.locals.len()
+
+        while i > 0
+            i -= 1
+
+            if self.locals[i].unique == unique then return self.locals[i].known
+
+        None
+    end known_of
+
     // Binds a name that may not be assigned to again -- what a local `val` declares.
     bind_read_only(*self, name: string, ty: Type, named: Option[Span] = None) -> string
         self.refuse_reserved_binding(name)
@@ -762,7 +798,7 @@ struct Analyzer
         val unique = self.fresh_name(name)
 
         self.locals.push(Local(name, unique, ty, true, false, None, self.declared_at(named), None,
-                               self.an.defers(ty)))
+                               self.an.defers(ty), None))
         unique
     end bind_read_only
 
@@ -776,7 +812,7 @@ struct Analyzer
         val unique = self.fresh_name(name)
 
         self.locals.push(Local(name, unique, texpr_type(place), read_only, false, Some(place),
-                               self.declared_at(named), None, self.an.defers(texpr_type(place))))
+                               self.declared_at(named), None, self.an.defers(texpr_type(place)), None))
         unique
     end bind_ref
 
@@ -788,7 +824,7 @@ struct Analyzer
         val unique = self.fresh_name(name)
 
         self.locals.push(Local(name, unique, ty, true, true, None, self.declared_at(named), None,
-                               self.an.defers(ty)))
+                               self.an.defers(ty), None))
         unique
     end bind_pattern
 
@@ -796,7 +832,7 @@ struct Analyzer
     // parameter is loaded by the name its declaration gave it.
     bind_as(*self, name: string, unique: string, ty: Type)
         self.refuse_reserved_binding(name)
-        self.locals.push(Local(name, unique, ty, false, false, None, self.bind_site, None, self.an.defers(ty)))
+        self.locals.push(Local(name, unique, ty, false, false, None, self.bind_site, None, self.an.defers(ty), None))
 
     // A name nothing else in this **function** holds, which is what a slot of the frame is.
     //
