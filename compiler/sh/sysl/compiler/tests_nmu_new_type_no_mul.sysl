@@ -1,15 +1,16 @@
 module sh.sysl.compiler
 @tests
 
-import sysl.text.Search
+import sysl.text.{replace_all, Search}
 import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
 import sysl.process.capture
 
-// A `new` type is not `Mul` at itself (`reference/errors.md § A new type does not multiply by
-// itself`): two `Meters` multiplied are an area, so `a * b`, `a *= b`, `a *% b` and `a *| b` over two
-// values of one `new` type are refused, naming `impl Mul` as the fix, over every base. A literal is
-// a scale and still multiplies; every other operator is untouched; a written `impl Mul` is accepted
-// and dispatched to; a `[T: Mul]` bound refuses the type until one is written.
+// A `new` type is not `Mul` or `Div` at itself (`reference/errors.md § A new type does not multiply
+// or divide by itself`): two `Meters` multiplied are an area and divided a ratio, so `a * b`, `a *= b`,
+// `a *% b`, `a *| b`, `a / b` and `a /= b` over two values of one `new` type are refused, naming
+// `impl Mul` or `impl Div` as the fix, over every base. A literal is a scale -- either side of `*`,
+// the divisor of `/` -- and still computes; every other operator is untouched; a written `impl` is
+// accepted and dispatched to; a `[T: Mul]` or `[T: Div]` bound refuses the type until one is written.
 
 // -- the harness ----------------------------------------------------------------------------------
 
@@ -74,6 +75,17 @@ private nmu_why(op: string, name: string) -> string =
     s"of two of its values is a different quantity. To multiply, write 'impl Mul for $name' with the " +
     "product it means, or scale by a literal"
 
+// The refusal for `op` (`/` or `div`) dividing two values of `name`.
+private nmu_why_div(op: string, name: string) -> string =
+    s"'$op' over two $name is refused — a 'new' type does not divide by itself, since a quotient " +
+    s"of two of its values is a different quantity. To divide, write 'impl Div for $name' with the " +
+    "quotient it means, or divide by a literal"
+
+// `main`, with `OP` in it, refused at `at` both as a product and as a quotient of two `name`s.
+private nmu_both(main: string, name: string, at: string)
+    nmu_refused(replace_all(main, "OP", "*"), nmu_why("*", name), at)
+    nmu_refused(replace_all(main, "OP", "/"), nmu_why_div("/", name), at)
+
 // The refusal for a wrapping or saturating `op` over two values of `name`, whose base is `base`.
 private nmu_why_ws(op: string, name: string, base: string) -> string =
     s"'$op' over two $name is refused — a 'new' type does not multiply by itself, since a product " +
@@ -82,47 +94,47 @@ private nmu_why_ws(op: string, name: string, base: string) -> string =
 
 // -- refused over every base ----------------------------------------------------------------------
 
-@test("a new f64 does not multiply by itself, and the refusal names the impl")
-nmu_f64() = nmu_refused("type Meters = new f64\nval a = Meters(2.0)\nprint(f64(a * a))\n",
-                        nmu_why("*", "Meters"), "3:11")
+@test("a new f64 neither multiplies nor divides by itself, and the refusal names the impl")
+nmu_f64() = nmu_both("type Meters = new f64\nval a = Meters(2.0)\nprint(f64(a OP a))\n",
+                        "Meters", "3:11")
 
 @test("nor does a new f32")
-nmu_f32() = nmu_refused("type M = new f32\nval a = M(2.0)\nprint(f32(a * a))\n", nmu_why("*", "M"), "3:11")
+nmu_f32() = nmu_both("type M = new f32\nval a = M(2.0)\nprint(f32(a OP a))\n", "M", "3:11")
 
 @test("nor a new real")
-nmu_real() = nmu_refused("type M = new real\nval a = M(2.0)\nprint(f64(a * a))\n", nmu_why("*", "M"), "3:11")
+nmu_real() = nmu_both("type M = new real\nval a = M(2.0)\nprint(f64(a OP a))\n", "M", "3:11")
 
 @test("nor a new signed integer")
-nmu_i32() = nmu_refused("type M = new i32\nval a = M(2)\nprint(i32(a * a))\n", nmu_why("*", "M"), "3:11")
+nmu_i32() = nmu_both("type M = new i32\nval a = M(2)\nprint(i32(a OP a))\n", "M", "3:11")
 
 @test("nor a new integer of an odd width")
-nmu_u12() = nmu_refused("type M = new u12\nval a = M(2)\nprint(u16(a * a))\n", nmu_why("*", "M"), "3:11")
+nmu_u12() = nmu_both("type M = new u12\nval a = M(2)\nprint(u16(a OP a))\n", "M", "3:11")
 
 @test("nor one wider than a machine word")
-nmu_i512() = nmu_refused("type M = new i512\nval a = M(2)\nval b = a * a\n", nmu_why("*", "M"), "3:9")
+nmu_i512() = nmu_both("type M = new i512\nval a = M(2)\nval b = a OP a\n", "M", "3:9")
 
 @test("nor a new type with a range")
-nmu_range() = nmu_refused("type M = new u8 within 0..<8\nval a = M(2)\nprint(u8(a * a))\n",
-                          nmu_why("*", "M"), "3:10")
+nmu_range() = nmu_both("type M = new u8 within 0..<8\nval a = M(2)\nprint(u8(a OP a))\n",
+                          "M", "3:10")
 
 @test("nor a new type with a predicate")
-nmu_where() = nmu_refused("type Even = new int where value % 2 == 0\nval a = Even(2)\nprint(int(a * a))\n",
-                          nmu_why("*", "Even"), "3:11")
+nmu_where() = nmu_both("type Even = new int where value % 2 == 0\nval a = Even(2)\nprint(int(a OP a))\n",
+                          "Even", "3:11")
 
 @test("nor a new fixed-point type")
-nmu_q15() = nmu_refused("type M = new q15\nval a = M(0.5)\nprint(f64(q15(a * a)))\n", nmu_why("*", "M"), "3:15")
+nmu_q15() = nmu_both("type M = new q15\nval a = M(0.5)\nprint(f64(q15(a OP a)))\n", "M", "3:15")
 
 @test("nor a wrapping fixed-point one")
-nmu_fixed_wrapping() = nmu_refused("type M = new i64q61 wrapping\nval a = M(0.5)\nval b = a * a\n",
-                                   nmu_why("*", "M"), "3:9")
+nmu_fixed_wrapping() = nmu_both("type M = new i64q61 wrapping\nval a = M(0.5)\nval b = a OP a\n",
+                                   "M", "3:9")
 
 @test("nor a new type with a phantom parameter")
-nmu_phantom() = nmu_refused("type P[T] = new u64\nval a = P[u8](2)\nprint(u64(a * a))\n",
-                            nmu_why("*", "P[byte]"), "3:11")
+nmu_phantom() = nmu_both("type P[T] = new u64\nval a = P[u8](2)\nprint(u64(a OP a))\n",
+                            "P[byte]", "3:11")
 
 @test("nor a transparent subtype that narrows a new type")
-nmu_subtype_of_new() = nmu_refused(
-    "type M = new int\ntype S = M within M(0)..M(9)\nval a = S(2)\nprint(int(a * a))\n", nmu_why("*", "S"), "4:11")
+nmu_subtype_of_new() = nmu_both(
+    "type M = new int\ntype S = M within M(0)..M(9)\nval a = S(2)\nprint(int(a OP a))\n", "S", "4:11")
 
 // -- every spelling of a product ------------------------------------------------------------------
 
@@ -148,7 +160,45 @@ nmu_const() = nmu_refused("type Meters = new f64\nconst A: Meters = Meters(2.0) 
 nmu_generic_body() = nmu_refused("type Meters = new f64\nf[T](x: T, m: Meters) -> Meters = m * m\nprint(f64(f(1, Meters(2.0))))\n",
                                  nmu_why("*", "Meters"), "2:35")
 
-// -- what still multiplies ------------------------------------------------------------------------
+// -- every spelling of a quotient -----------------------------------------------------------------
+
+@test("a compound quotient of two is refused at the statement")
+nmu_compound_div() = nmu_refused("type Meters = new f64\nvar a = Meters(2.0)\nval b = Meters(3.0)\na /= b\nprint(f64(a))\n",
+                                 nmu_why_div("/", "Meters"), "4:1")
+
+@test("a literal numerator is not a scale: two over a length is per-length")
+nmu_literal_numerator() = nmu_refused("type Meters = new f64\nval a = Meters(2.0)\nprint(f64(2.0 / a))\n",
+                                      nmu_why_div("/", "Meters"), "3:11")
+
+@test("the div method is not there either")
+nmu_div_method() = nmu_refused("type Meters = new f64\nval a = Meters(2.0)\nprint(f64(a.div(a)))\n",
+                               nmu_why_div("div", "Meters"), "3:13")
+
+@test("a module constant's quotient is refused as a body's is")
+nmu_const_div() = nmu_refused("type Meters = new f64\nconst A: Meters = Meters(2.0) / Meters(3.0)\nprint(f64(A))\n",
+                              nmu_why_div("/", "Meters"), "2:19")
+
+@test("a generic function's own quotient of a new type is refused at the body")
+nmu_generic_body_div() = nmu_refused("type Meters = new f64\nf[T](x: T, m: Meters) -> Meters = m / m\nprint(f64(f(1, Meters(2.0))))\n",
+                                     nmu_why_div("/", "Meters"), "2:35")
+
+// -- what still multiplies and divides ------------------------------------------------------------
+
+@test("a literal divisor is a scale, in a compound too, over every kind of base")
+nmu_divide_scale() = nmu_prints(raw"""
+    type Meters = new f64
+    type Slot = new u8 within 0..<100
+    type Gain = new q15
+
+    var d = Meters(6.0)
+    var s = Slot(9)
+    val g = Gain(0.5)
+
+    print(f64(d / 2.0), f64(d / 4), f64(-d / 3.0), u8(s / 3), u8(s % 4), f64(q15(g / 2)))
+    d /= 3.0
+    s /= 3
+    print(f64(d), u8(s))
+    """, "3 1.5 -2 3 1 0.25\n2 3\n")
 
 @test("a literal is a scale, on either side, of any spelling, and in a compound")
 nmu_scale() = nmu_prints(raw"""
@@ -185,13 +235,14 @@ nmu_others_stay() = nmu_prints(raw"""
     var d = Meters(6.0)
     var s = Slot(7)
 
-    print(f64(d + d), f64(d - d), f64(d / d), f64(-d), d < d, d == d)
+    print(f64(d + d), f64(d - d), f64(-d), d < d, d == d)
     print(u8(s % Slot(4)), u8(s & Slot(3)), u8(s | Slot(8)), u8(s ^ s), u8(s << 1), u8(~s))
     d += Meters(1.0)
-    d /= Meters(7.0)
+    d -= Meters(2.0)
+    s %= Slot(4)
     s++
     print(f64(d), u8(s))
-    """, "12 0 1 -6 false true\n3 3 15 0 14 248\n1 8\n")
+    """, "12 0 -6 false true\n3 3 15 0 14 248\n5 4\n")
 
 @test("a transparent subtype is its base, and multiplies as its base does")
 nmu_transparent() = nmu_prints("type Small = u8 within 0..<100\nprint(Small(5) * Small(6))\n", "30\n")
@@ -249,9 +300,43 @@ nmu_impl_other_operand() = nmu_refused(raw"""
     print(f64(a * a))
     """, nmu_why("*", "Meters"), "10:11")
 
+@test("an impl Div names its quotient, which may be another type, and a literal divisor is still a scale")
+nmu_impl_ratio() = nmu_prints(raw"""
+    type Meters = new f64
+
+    impl Div[Meters, f64] for Meters
+        div(self, other: Meters) -> f64 = f64(self) / f64(other) + 100.0
+
+    val w = Meters(6.0)
+    val r: f64 = w / Meters(3.0)
+    val half: Meters = w / 2.0
+    var v = w
+
+    v /= 3.0
+    print(r, f64(half), f64(v))
+    """, "102 3 2\n")
+
+@test("an impl Div for a new type itself is accepted, and '/=' reaches it")
+nmu_impl_div_self() = nmu_prints(raw"""
+    type Ratio = new f64
+
+    impl Div for Ratio
+        div(self, other: Ratio) -> Ratio = Ratio(f64(self) / f64(other) + 1.0)
+
+    var r = Ratio(6.0)
+
+    print(f64(r / Ratio(2.0)))
+    r /= Ratio(3.0)
+    print(f64(r))
+    """, "4\n3\n")
+
 @test("an impl of any other operator is still the compiler's to provide")
-nmu_impl_div_refused() = nmu_refused("type Meters = new f64\nimpl Div for Meters\n    div(self, o: Meters) -> Meters = self\n",
-                                     "'Meters' already implements 'Div' — the compiler provides it", "2:1")
+nmu_impl_add_refused() = nmu_refused("type Meters = new f64\nimpl Add for Meters\n    add(self, o: Meters) -> Meters = self\n",
+                                     "'Meters' already implements 'Add' — the compiler provides it", "2:1")
+
+@test("and so is the remainder, which is in the same units")
+nmu_impl_rem_refused() = nmu_refused("type Slot = new u8\nimpl Rem for Slot\n    rem(self, o: Slot) -> Slot = self\n",
+                                     "'Slot' already implements 'Rem' — the compiler provides it", "2:1")
 
 // -- bounds ---------------------------------------------------------------------------------------
 
@@ -267,16 +352,33 @@ nmu_bound_met() = nmu_prints(raw"""
         mul(self, other: Ratio) -> Ratio = Ratio(f64(self) * f64(other))
 
     sq[T: Mul](x: T) -> T = x * x
-    total[T: Add + Div](a: T, b: T) -> T = (a + b) / b
+    total[T: Add + Sub](a: T, b: T) -> T = (a + b) - b
 
     print(f64(sq(Ratio(3.0))), f64(total(Ratio(6.0), Ratio(2.0))))
-    """, "9 4\n")
+    """, "9 6\n")
 
-@test("a body generic over Integer multiplies a new integer, as the family promises its members")
+@test("a Div bound refuses a new type with no impl")
+nmu_div_bound() = nmu_refused("type Meters = new f64\nhalf[T: Div](x: T) -> T = x / x\nprint(f64(half(Meters(2.0))))\n",
+                              "'half' requires its type parameter 'T' to implement 'Div', but Meters does not", "3:11")
+
+@test("a Div bound is met by the impl a program writes")
+nmu_div_bound_met() = nmu_prints(raw"""
+    type Ratio = new f64
+
+    impl Div for Ratio
+        div(self, other: Ratio) -> Ratio = Ratio(f64(self) / f64(other))
+
+    per[T: Div](a: T, b: T) -> T = a / b
+
+    print(f64(per(Ratio(9.0), Ratio(3.0))))
+    """, "3\n")
+
+@test("a body generic over Integer multiplies and divides a new integer, as the family promises its members")
 nmu_integer_family() = nmu_prints(raw"""
     type Slot = new u8
 
     twice[T: Integer](x: T) -> T = x * x
+    per[T: Integer](x: T, y: T) -> T = x / y
 
-    print(u8(twice(Slot(5))), Slot(7))
-    """, "25 7\n")
+    print(u8(twice(Slot(5))), u8(per(Slot(9), Slot(3))), Slot(7))
+    """, "25 3 7\n")

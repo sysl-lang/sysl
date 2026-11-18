@@ -1659,10 +1659,11 @@ checks.**
 
 ### A derivation inherits its base's behaviour and may replace none of it
 
-A `new` type over a scalar comes with **everything the scalar supports but one product**: `+`, `-`
-and `/`, the remainder, the bitwise operators and the shifts, unary `-` and `~`, the comparisons, the
-compound assignments, `++` and `--`, and `str`, each operating on the new type and producing it. The
-one thing missing is [two of its values multiplied](#a-new-type-does-not-multiply-by-itself).
+A `new` type over a scalar comes with **everything the scalar supports but a product and a
+quotient**: `+` and `-`, the remainder, the bitwise operators and the shifts, unary `-` and `~`, the
+comparisons, the compound assignments, `++` and `--`, and `str`, each operating on the new type and
+producing it. What is missing is
+[two of its values multiplied or divided](#a-new-type-does-not-multiply-or-divide-by-itself).
 
 No `impl` may **replace** any of it:
 
@@ -1727,11 +1728,12 @@ behaviour is not a narrowing.
 
 So if you want your own `+`, you want a **struct**, not a derivation.
 
-### A `new` type does not multiply by itself
+### A `new` type does not multiply or divide by itself
 
 Two lengths added are a length, and a length halved is a length, but two lengths multiplied are an
-area. So the one operation a derivation does not inherit is the product of **two of its own
-values**: a `Meters` is not `Mul` at `Meters`, and `a * b` over two of them is refused, with the fix:
+area and two lengths divided are a ratio. So the two operations a derivation does not inherit are
+the product and the quotient of **two of its own values**: a `Meters` is not `Mul` or `Div` at
+`Meters`, and `a * b` or `a / b` over two of them is refused, with the fix:
 
 ```sysl
 type Meters = new f64
@@ -1745,17 +1747,31 @@ print(f64(a * a))
 '*' over two Meters is refused — a 'new' type does not multiply by itself, since a product of two of its values is a different quantity. To multiply, write 'impl Mul for Meters' with the product it means, or scale by a literal
 ```
 
+```sysl
+type Meters = new f64
+
+val a = Meters(6.0)
+
+print(f64(a / a))
+```
+
+```error
+'/' over two Meters is refused — a 'new' type does not divide by itself, since a quotient of two of its values is a different quantity. To divide, write 'impl Div for Meters' with the quotient it means, or divide by a literal
+```
+
 The rule is the same over every base — an integer, a float, a fixed-point format, one with a range
-or a predicate, a `new` type with type parameters — and it covers `*=`, the wrapping `*%` and the
-saturating `*|`. A transparent subtype (`type Small = u8 within 0..<8`, no `new`) is its base and
-multiplies as its base does.
+or a predicate, a `new` type with type parameters — and it covers `*=` and `/=`, the wrapping `*%`
+and the saturating `*|`. The remainder stays: `a % b` is in `a`'s units. A transparent subtype
+(`type Small = u8 within 0..<8`, no `new`) is its base and multiplies and divides as its base does.
 
-**A scale is still a product.** A literal is a number with no unit, so `a * 2.0`, `2 * a` and
-`a *= 3.0` scale the value and keep its type, as they always did. A typed `f64` is not a scale: it
-was never a `Meters` operand, and `a * k` is the mismatch it always was.
+**A scale is still a product or a quotient.** A literal is a number with no unit, so `a * 2.0`,
+`2 * a`, `a / 2.0`, `a *= 3.0` and `a /= 3` scale the value and keep its type, as they always did.
+Only the *divisor* of `/` is a scale: `2.0 / a` is per-metre, and it is refused as `a / a` is. A
+typed `f64` is not a scale either: it was never a `Meters` operand, and `a * k` is the mismatch it
+always was.
 
-**The product a program means is written as an `impl`**, which the compiler now leaves free. It
-names its result, so it can be another type:
+**The product or quotient a program means is written as an `impl`**, which the compiler now leaves
+free. It names its result, so it can be another type, and a literal beside it stays a scale:
 
 ```sysl
 type Meters = new f64
@@ -1764,21 +1780,25 @@ type Area = new f64
 impl Mul[Meters, Area] for Meters
     mul(self, other: Meters) -> Area = Area(f64(self) * f64(other))
 
+impl Div[Meters, f64] for Meters
+    div(self, other: Meters) -> f64 = f64(self) / f64(other)
+
 val w = Meters(3.0)
 val h = Meters(4.0)
 val a: Area = w * h
 
-print(f64(a), f64(w * 2.0))
+print(f64(a), w / h, f64(w * 2.0), f64(w / 2.0))
 ```
 
 ```output
-12 6
+12 0.75 6 1.5
 ```
 
-A bound follows the operator: `[T: Mul]` refuses `Meters` until such an `impl` is written, and is
-met by it then. A body generic over **`Integer`** is different, since every integer type is a member
-of that family by the compiler's rule and the family promises its members a product; such a body,
-read at a `new` integer, multiplies at the base as it does at every other member.
+A bound follows the operator: `[T: Mul]` and `[T: Div]` refuse `Meters` until such an `impl` is
+written, and are met by it then. A body generic over **`Integer`** is different, since every
+integer type is a member of that family by the compiler's rule and the family promises its members
+a product and a quotient; such a body, read at a `new` integer, computes at the base as it does at
+every other member.
 
 ### Except rendering, which a derivation may replace
 
@@ -1811,9 +1831,9 @@ behaviour a derivation may replace, and the operators are not.
 | | a `new` derivation | a one-field struct |
 |---|---|---|
 | distinct type | yes | yes |
-| the base's catalogue | free, but for a product of two of its values; only `Display` is replaceable | nothing, write it all |
+| the base's catalogue | free, but for a product or quotient of two of its values; only `Display` is replaceable | nothing, write it all |
 | an operation the base does not have | a member, or an `impl` at another argument list | ordinary |
-| an operation the base has that makes no sense for the new type | present anyway, but for the self-product | absent |
+| an operation the base has that makes no sense for the new type | present anyway, but for the self-product and self-quotient | absent |
 | rendering as something other than the base | `override impl Display` | ordinary |
 
 **Use a derivation for an identity**: a slot number, a handle, a unit-tagged measurement, anything
