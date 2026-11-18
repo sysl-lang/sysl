@@ -1,0 +1,157 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// **`t[i, j]` is a subscript with more than one index** (`reference/arrays.md § Several indices in
+// one subscript`). A container indexed by a tuple or an array -- `Index[(usize, usize), E]`,
+// `IndexPlace[[3]usize, E]` -- is subscripted with the parts written as a list, and `t[i, j]` means
+// `t[(i, j)]` or `t[[i, j]]`, whichever its trait takes. Each part is a subscript's index on its own:
+// a part landing on a `usize` takes any integer and traps on a negative one, exactly as the one
+// index of `b[i]` does.
+//
+// The parser cannot tell `t[i, j]` from `f[A, B]`, which is a type-argument list, so the brackets
+// arrive as a `TypeArgs` and are settled here, where the head can be read: **a head that is a value
+// indexed through one of the three traits is subscripted**, and anything else -- a generic function, a
+// type, a value with no such trait -- keeps the type-argument reading and its refusals.
+//
+// **Settling rewrites the node in place**, so that every reader after the first -- an assignment's
+// own `IndexSet` test, the write-through routing, a multiple assignment's places, the lowering of a
+// call on an element -- finds the ordinary `Index` it already knows. The rewrite is a function of the
+// node's scope alone (the head's binding and its type's traits), so it is the same at every reading,
+// an instantiation's included.
+
+// Whether `e` is, or has just been settled as, a subscript with several indices.
+settle_multi_index(cx: &Analyzer, e: Expr) -> bool
+    var head: Option[Expr] = None
+    var parts: Buf[Expr] = buf()
+    var open = e.span
+
+    *e.kind match
+        TypeArgs(h, items, at) ->
+            head = Some(h)
+            parts = items
+            open = at
+        _ -> ()
+
+    if head.is_none() then return false
+
+    // A part only the type grammar can read is a type argument, whatever the head is.
+    for p in parts
+        *p.kind match
+            TypeArg(_) -> return false
+            _ -> ()
+
+    // A path to the subscript is settled from the inside out, so `g[i, j][k, l]` reads its inner
+    // subscript first, as the reading of the outer one's receiver will.
+    settle_written_path(cx, head.unwrap())
+
+    if !subscripted_by_trait(cx, head.unwrap()) then return false
+
+    val list = Expr(parts[0].span.to(parts[parts.len() - 1].span),
+                    Call(Expr(open, Ident(SubscriptIndex)), parts))
+
+    *e.kind = Index(head.unwrap(), list, open)
+    true
+end settle_multi_index
+
+// Settles every subscript on a written path -- the place itself, and each receiver it is reached
+// through -- before a reader that looks at the path's shape sees it.
+settle_written_path(cx: &Analyzer, e: Expr)
+    *e.kind match
+        TypeArgs(_, _, _) -> settle_multi_index(cx, e)
+        Index(r, _, _) -> settle_written_path(cx, r)
+        Field(r, _, _) -> settle_written_path(cx, r)
+        _ -> ()
+end settle_written_path
+
+// Whether `head` is a value whose subscript goes through `IndexPlace`, `Index` or `IndexSet`: a type
+// implementing one, a pointer to one, or a type parameter whose bounds promise one of their members.
+// Read on trial, so a head that is no value at all -- a generic function, a type -- says nothing.
+private subscripted_by_trait(cx: &Analyzer, head: Expr) -> bool
+    val tried = begin_trial(cx)
+    val t = type_expr_bare(cx, head)
+
+    discard_trial(cx, tried)
+
+    val ty = repr(texpr_type(t))
+
+    if ty == Unknown then return false
+
+    val subject = ty match
+        Ptr(inner, _) -> repr(*inner)
+        Ref(inner, _) -> repr(*inner)
+        _ -> ty
+
+    if element(subject).is_some() then return false
+
+    subject match
+        Abstract(_, bounds) ->
+            for m in ["index_place", "index", "index_set"]
+                if bound_member(cx.an, subject, bounds, m).is_some() then return true
+
+            return false
+        _ -> ()
+
+    for name in ["IndexPlace", "Index", "IndexSet"]
+        val key = catalog_key(cx.an, name)
+
+        if key.is_some() && indexes_through(cx.an, key.unwrap(), subject) then return true
+
+    false
+end subscripted_by_trait
+
+// **The parts of a multi-index, typed as the one argument of the method behind the subscript.**
+// `expected` is that method's parameter: a tuple of as many parts takes them as its fields, an array
+// of as many as its elements, and each part is typed as a subscript's index at the type it lands on.
+// No parameter to read -- a container generic over its index -- takes them as a tuple.
+multi_index_form(cx: &Analyzer, span: Span, parts: Buf[Expr], expected: Option[Type]) -> TExpr
+    val n = parts.len()
+
+    if expected.is_none() then return tuple_expr(cx, span, parts, None)
+
+    val want = expected.unwrap()
+
+    repr(want) match
+        Struct(d) ->
+            if is_tuple(d) && d.fields.len() == n
+                var ts: Buf[TExpr] = buf()
+                var types: Buf[Type] = buf()
+
+                for i in 0..<n
+                    val t = index_part(cx, parts[i], d.fields[i].1)
+
+                    ts.push(t)
+                    types.push(texpr_type(t))
+
+                return TExpr(span, TStructNew(registered_tuple(cx.an, types), ts))
+            end if
+        Array(len, elem) ->
+            if len == int(n)
+                var ts: Buf[TExpr] = buf()
+
+                for p in parts
+                    ts.push(index_part(cx, p, *elem))
+
+                return TExpr(span, TArrayLit(ts, want))
+            end if
+        Unknown -> return bad_expr(span)
+        _ -> ()
+
+    cx.err(span, s"$n indices were written, and this subscript takes ${index_count(want)} — its " +
+           s"index is ${type_show(want)}")
+end multi_index_form
+
+// One part, typed as the one index of a subscript is where it lands on `t`.
+private index_part(cx: &Analyzer, part: Expr, t: Type) -> TExpr
+    var one: Buf[Expr] = buf()
+
+    one.push(part)
+    subscript_index_form(cx, part.span, one, Some(t))
+end index_part
+
+// How many indices a subscript indexed by `t` takes, said in words.
+private index_count(t: Type) -> string = repr(t) match
+    Struct(d) -> if is_tuple(d) then s"${d.fields.len()}" else "one"
+    Array(len, _) -> s"$len"
+    _ -> "one"

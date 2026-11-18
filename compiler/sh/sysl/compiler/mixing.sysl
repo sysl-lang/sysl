@@ -1,0 +1,198 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.{BigInt, add, cmp, from_int, mul, sub}
+
+// **An `int` and a `usize` meet where the value of one is known to fit the other's type**
+// (`reference/expressions.md § An int and a usize meet where the value fits`).
+//
+// Neither type holds every value of the other, so the type table converts neither to the other. But
+// a length, a `sizeof` and an offset are `usize` while a counter is an `int`, and most of the values
+// that meet are small and non-negative. So where the compiler can show that every value one operand
+// can hold is a value of the other operand's type, the operand converts, exactly as a narrower one
+// would: nothing is rounded, truncated or reinterpreted, and nothing is checked at run time, because
+// there is nothing that could fail.
+//
+// What the compiler knows is the **interval** an operand's value lies in, both ends included:
+// a literal and a constant are their own value; a `val` is what its initializer was known to be
+// (`Analyzer.note_known`); a conversion is what its operand was, where the target holds all of it,
+// and the target's whole range otherwise; `+`, `-`, `*`, `&`, `/`, `%` and `>>` combine their
+// operands' intervals. Anything else -- a `var`, a parameter, a `for` variable (the body may assign
+// it), a field, a call -- is its type's whole range, which is never inside the other type's.
+//
+// It is asked only of an `int` beside a `usize`, in the operator positions that meet two values
+// (arithmetic, a comparison, the bounds of a range, a compound assignment); every other pair, and
+// every other position, keeps the type table.
+
+// Whether two types are an `int` and a `usize`, in either order.
+int_usize_pair(a: Type, b: Type) -> bool = is_plain_int(a) && is_address_unsigned(b) ||
+                                            is_address_unsigned(a) && is_plain_int(b)
+
+private is_plain_int(t: Type) -> bool = type_eq(repr(t), int_type())
+
+private is_address_unsigned(t: Type) -> bool = repr(t) match
+    Integer(_, signed, pointer_width) -> !signed && pointer_width
+    _ -> false
+
+// The integer type's own range, both ends included.
+private type_interval(t: Type) -> Option[(BigInt, BigInt)] = repr(t) match
+    Integer(bits, signed, _) -> Some((base_min(bits, signed), base_max(bits, signed)))
+    _ -> None
+
+private within(v: (BigInt, BigInt), range: (BigInt, BigInt)) -> bool =
+    cmp(v.0, range.0) >= 0 && cmp(v.1, range.1) <= 0
+
+private least(a: BigInt, b: BigInt) -> BigInt = if cmp(a, b) <= 0 then a else b
+private most(a: BigInt, b: BigInt) -> BigInt = if cmp(a, b) >= 0 then a else b
+
+// The interval an integer expression's value is known to lie in -- its type's whole range where
+// nothing narrower is known -- and nothing for an expression of another type.
+//
+// **A result its type cannot hold is the whole range**, never the part of the computed interval the
+// type keeps: a release build wraps an overflowing `+` and keeps the low bits of a narrowing
+// conversion, so the value could be anywhere in the type.
+value_interval(cx: &Analyzer, t: TExpr) -> Option[(BigInt, BigInt)]
+    val own = type_interval(texpr_type(t))
+
+    if own.is_none() then return None
+
+    val found = *t.kind match
+        TIntLit(v, _) -> Some((v, v))
+        TLoad(n, _) -> cx.known_of(n)
+        TCast(inner, _) -> value_interval(cx, inner)
+        TBinary(op, l, r, _) -> combined(op, value_interval(cx, l), value_interval(cx, r))
+        _ -> None
+
+    if found.is_some() && within(found.unwrap(), own.unwrap()) then found else own
+end value_interval
+
+// The interval an operator's result lies in, from its operands', where the operator is one whose
+// result follows from them.
+private combined(op: string, a: Option[(BigInt, BigInt)],
+                 b: Option[(BigInt, BigInt)]) -> Option[(BigInt, BigInt)]
+    if a.is_none() || b.is_none() then return None
+
+    val (a0, a1) = a.unwrap()
+    val (b0, b1) = b.unwrap()
+    val zero = from_int(0)
+    val one = from_int(1)
+
+    op match
+        "+" -> Some((add(a0, b0), add(a1, b1)))
+        "-" -> Some((sub(a0, b1), sub(a1, b0)))
+        "*" ->
+            val c1 = mul(a0, b0)
+            val c2 = mul(a0, b1)
+            val c3 = mul(a1, b0)
+            val c4 = mul(a1, b1)
+
+            Some((least(least(c1, c2), least(c3, c4)), most(most(c1, c2), most(c3, c4))))
+        // A mask with a non-negative side clears the sign, and keeps no bit that side does not have.
+        "&" ->
+            if cmp(a0, zero) >= 0 && cmp(b0, zero) >= 0 then Some((zero, least(a1, b1)))
+            else if cmp(a0, zero) >= 0 then Some((zero, a1))
+            else if cmp(b0, zero) >= 0 then Some((zero, b1))
+            else None
+        // A non-negative value divided by a positive one, or shifted right, only comes down.
+        "/" -> if cmp(a0, zero) >= 0 && cmp(b0, one) >= 0 then Some((zero, a1)) else None
+        ">>" -> if cmp(a0, zero) >= 0 && cmp(b0, zero) >= 0 then Some((zero, a1)) else None
+        "%" -> if cmp(a0, zero) >= 0 && cmp(b0, one) >= 0 then Some((zero, least(a1, sub(b1, one)))) else None
+        _ -> None
+end combined
+
+// Whether every value an integer expression can hold is a value of `to`.
+fits_by_value(cx: &Analyzer, t: TExpr, to: Type) -> bool
+    val range = type_interval(to)
+    val v = value_interval(cx, t)
+
+    range.is_some() && v.is_some() && within(v.unwrap(), range.unwrap())
+end fits_by_value
+
+// Whether an expression's value is one number, which is what a constant comes to.
+private one_value(cx: &Analyzer, t: TExpr) -> bool = value_interval(cx, t) match
+    Some((lo, hi)) -> cmp(lo, hi) == 0
+    None -> false
+
+// **The type an `int` and a `usize` meet at**, among operands read at their own types (`read`, with
+// nothing where an operand is a literal the pair will be told): nothing unless the operands that have
+// a type of their own are `int`s and `usize`s, both present.
+//
+// The pair is the `usize` where every `int` among them fits it, and the `int` where every `usize`
+// fits that. Where both hold -- every value small and non-negative -- the position's type decides if
+// it is one of the two, then the operands that are not constants if they agree, and otherwise `int`,
+// the type a number takes where nothing else says.
+mixed_meet(cx: &Analyzer, operands: Buf[Expr], read: Buf[Option[TExpr]],
+           expected: Option[Type]) -> Option[Type]
+    var ints: Buf[TExpr] = buf()
+    var sizes: Buf[TExpr] = buf()
+
+    for i in 0..<operands.len()
+        read[i] match
+            Some(t) ->
+                if !adaptable(cx, operands[i], t)
+                    val ty = texpr_type(t)
+
+                    if is_plain_int(ty) then ints.push(t)
+                    else if is_address_unsigned(ty) then sizes.push(t)
+                    else return None
+                end if
+            None -> ()
+
+    if ints.is_empty() || sizes.is_empty() then return None
+
+    val size_ty = repr(texpr_type(sizes[0]))
+
+    for s in sizes
+        if !type_eq(repr(texpr_type(s)), size_ty) then return None
+
+    val to_size = all_fit(cx, ints, size_ty)
+    val to_int = all_fit(cx, sizes, int_type())
+
+    if to_size && !to_int then return Some(size_ty)
+    if to_int && !to_size then return Some(int_type())
+    if !to_size then return None
+
+    if expected.is_some()
+        if is_plain_int(expected.unwrap()) then return Some(int_type())
+        if type_eq(repr(expected.unwrap()), size_ty) then return Some(size_ty)
+    end if
+
+    val varying_int = any_varies(cx, ints)
+    val varying_size = any_varies(cx, sizes)
+
+    if varying_size && !varying_int then Some(size_ty) else Some(int_type())
+end mixed_meet
+
+private all_fit(cx: &Analyzer, ts: Buf[TExpr], to: Type) -> bool
+    for t in ts
+        if !fits_by_value(cx, t, to) then return false
+
+    true
+end all_fit
+
+private any_varies(cx: &Analyzer, ts: Buf[TExpr]) -> bool
+    for t in ts
+        if !one_value(cx, t) then return true
+
+    false
+end any_varies
+
+// An operand of an `int`-and-`usize` pair, converted to the type the pair met at where its value
+// fits there (`mixed_meet`), and as it was otherwise -- for the mismatch to be reported.
+met_by_value(cx: &Analyzer, t: TExpr, ty: Type) -> TExpr =
+    if int_usize_pair(texpr_type(t), ty) && fits_by_value(cx, t, ty) then TExpr(t.span, TCast(t, repr(ty)))
+    else t
+
+// The value of a compound assignment over an `int` or a `usize` place, converted to the place's type
+// where it is the other of the two and its value fits there: `n += k` over a `usize` `n` and a
+// constant `int` `k`. A wrapping or saturating update takes two values of one type, as its operator
+// does.
+updated_by_value(cx: &Analyzer, op: string, place: Type, tv: TExpr) -> TExpr =
+    if is_wrap_sat_op(op) || op == "<<" || op == ">>" then tv else met_by_value(cx, tv, place)
+
+// What a refusal of an `int` beside a `usize` adds, so the reader learns the pair meets where a value
+// is known to fit and what to write where it is not: nothing for any other pair.
+mixing_hint(a: Type, b: Type) -> string =
+    if !int_usize_pair(a, b) then ""
+    else " — an int and a usize meet only where the value of one is known to fit the other's type; " +
+         "convert one with 'usize(…)' or 'int(…)'"

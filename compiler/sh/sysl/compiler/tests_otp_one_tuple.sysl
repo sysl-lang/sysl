@@ -1,0 +1,340 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// The tuple of one part, `(T,)` and `(x,)` (`reference/types.md § Tuples`). The comma is the whole of
+// the spelling: `(x)` stays a grouping and `(T)` a type in parentheses. A one-tuple is the `$tuple1`
+// struct a pack of one type already made, so what is worth testing is everywhere a tuple meets
+// another feature -- its spellings (type, value, pattern, the left of an assignment), the catalog's
+// blocks, a generic over `(T,)`, a pack, a walk of its fields, the counted heap, and the places a
+// value lives.
+//
+// Cells skipped, with the reason: separate compilation and codegen units (the tuple is the same
+// compiler-declared struct every arity is, filed by one instance key, so nothing about it differs
+// between a file and a `.syslib`); bare metal (nothing new is emitted -- a one-tuple lowers as a
+// one-field struct).
+
+private otp_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end otp_ready
+
+private struct OtpRun
+    ok: bool
+    out: string
+    err: string
+
+// The program built -- counted or not -- and run; a build that failed answers `ok` false with the
+// reason in `out`.
+private otp_run(text: string, counted: bool) -> OtpRun
+    val root = make_temp_dir("sysl-otp").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    force_alloc_counting(counted)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization,
+                                     Some(s"$root/built"))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return OtpRun(false, failure_text(why), "")
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> OtpRun(false, "could not be started", "")
+        Ok(o) -> OtpRun(o.status.ok(), o.text, o.err.unwrap_or(""))
+end otp_run
+
+// What a program prints.
+private otp_ran(text: string) -> string = otp_run(text, false).out
+
+// Everything a source has to say for itself, taken through the lowering.
+private otp_err(text: string) -> string
+    val root = make_temp_dir("sysl-otp").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end otp_err
+
+private otp_refused(text: string, part: string)
+    val out = otp_err(text)
+
+    assert(out.index_of(part).is_some(), s"expected a refusal holding '$part', got: $out")
+
+// ---- the spellings ----
+
+@test("a written type and a literal make one, and its part is read by position")
+otp_type_and_literal()
+    if !otp_ready() then return
+
+    assert_eq(otp_ran("val t: (int,) = (7,)\nprint(t.0)\n"), "7\n")
+
+@test("its part is a place")
+otp_part_is_a_place()
+    if !otp_ready() then return
+
+    assert_eq(otp_ran(raw"""
+        demo()
+            var t = (1,)
+            t.0 += 4
+            print(t.0)
+        demo()
+        """), "5\n")
+
+@test("the part takes the width of the position it is heading for")
+otp_part_takes_width()
+    if !otp_ready() then return
+
+    assert_eq(otp_ran("val t: (u8,) = (200,)\nprint(t.0 + 50)\n"), "250\n")
+
+@test("it is a parameter and a result")
+otp_parameter_and_result()
+    if !otp_ready() then return
+
+    assert_eq(otp_ran(raw"""
+        wrap(x: int) -> (int,) = (x,)
+        unwrap(t: (int,)) -> int = t.0
+        print(unwrap(wrap(3)))
+        """), "3\n")
+
+@test("one nests in another, and both keep their comma when printed")
+otp_nests()
+    if !otp_ready() then return
+
+    assert_eq(otp_ran("val n = ((1,),)\nprint((n.0).0, n)\n"), "1 ((1,),)\n")
+
+@test("a part of unit lays out as nothing")
+otp_unit_part()
+    if !otp_ready() then return
+
+    assert_eq(otp_ran("val u: ((),) = ((),)\nprint(u, sizeof((int,)) == sizeof(int))\n"), "((),) true\n")
+
+// A parenthesised list before an arrow is a parameter list, and its comma is a list's own: the
+// one-tuple as a callable's parameter is written inside a second pair.
+@test("before an arrow the comma is a parameter list's, and a one-tuple parameter has its own parentheses")
+otp_before_an_arrow()
+    if !otp_ready() then return
+
+    assert_eq(otp_ran(raw"""
+        apply(f: (int,) -> int) -> int = f(2)
+        apply_one(f: ((int,)) -> int) -> int = f((2,))
+        print(apply(x -> x + 1), apply_one(t -> t.0 * 5))
+        """), "3 10\n")
+
+@test("a diagnostic shows the type with its comma")
+otp_shown_with_its_comma()
+    if !otp_ready() then return
+
+    otp_refused("val x: int = (1,)\nprint(x)\n", "(int,)")
+
+// ---- the catalog's blocks ----
+
+@test("prints through Display with its comma")
+otp_prints()
+    if !otp_ready() then return
+
+    assert_eq(otp_ran("print((1,), (\"a\",))\n"), "(1,) (a,)\n")
+
+@test("prints a part with no Display through Debug, with its comma")
+otp_prints_debug()
+    if !otp_ready() then return
+
+    assert_eq(otp_ran(raw"""
+        struct Q
+            x: int
+        end Q
+        print((Q(2),))
+        """), "(Q(x: 2),)\n")
+
+@test("compares, orders and hashes")
+otp_compares()
+    if !otp_ready() then return
+
+    assert_eq(otp_ran("print((1,) == (1,), (1,) == (2,), (1,) < (2,), (1,).hash() == (1,).hash())\n"),
+              "true false true true\n")
+
+// The shape a block for one arity is filed under is the one-tuple's own, `(_,)`, distinct from a
+// pair's `(,)`.
+@test("a block written for one arity answers for that arity only")
+otp_block_for_one_arity()
+    if !otp_ready() then return
+
+    assert_eq(otp_ran(raw"""
+        trait Name
+            name(self) -> string
+        impl Name for (int,)
+            name(self) -> string = "one"
+        impl Name for (int, int)
+            name(self) -> string = "two"
+        print((1,).name(), (1, 2).name())
+        """), "one two\n")
+
+// ---- patterns ----
+
+@test("a pattern takes one apart, a literal one is refutable, and the arms are exhaustive")
+otp_patterns()
+    if !otp_ready() then return
+
+    assert_eq(otp_ran(raw"""
+        show(t: (int,))
+            t match
+                (0,) -> print("zero")
+                (1 | 3,) -> print("one or three")
+                (n,) -> print(n)
+        show((0,))
+        show((3,))
+        show((8,))
+        val b = (true,)
+        print(b match
+            (true,) -> 1
+            (false,) -> 0)
+        """), "zero\none or three\n8\n1\n")
+
+@test("a pattern reaches one inside a payload")
+otp_pattern_in_a_payload()
+    if !otp_ready() then return
+
+    assert_eq(otp_ran(raw"""
+        val o = Some((5,))
+        o match
+            Some((v,)) -> print(v)
+            None -> print("none")
+        """), "5\n")
+
+@test("a binding takes one apart")
+otp_binding()
+    if !otp_ready() then return
+
+    assert_eq(otp_ran("val (a,) = (9,)\nprint(a)\n"), "9\n")
+
+@test("the left of an assignment takes one apart")
+otp_assignment()
+    if !otp_ready() then return
+
+    assert_eq(otp_ran(raw"""
+        demo()
+            var a = 0
+            (a,) = (4,)
+            print(a)
+        demo()
+        """), "4\n")
+
+@test("and refuses a carrier of another arity")
+otp_assignment_wrong_arity()
+    if !otp_ready() then return
+
+    otp_refused(raw"""
+        demo()
+            var a = 0
+            (a,) = (1, 2)
+            print(a)
+        demo()
+        """, "this assignment has 1 place on the left, and a (int, int) has 2 parts to give them")
+
+@test("and refuses a value that is not a tuple")
+otp_assignment_not_a_tuple()
+    if !otp_ready() then return
+
+    otp_refused(raw"""
+        demo()
+            var a = 0
+            (a,) = 5
+            print(a)
+        demo()
+        """, "this assignment has 1 place on the left, and one int is not something to take apart")
+
+// ---- generics, packs and the walk of a type's fields ----
+
+@test("a generic parameter is read off one")
+otp_generic()
+    if !otp_ready() then return
+
+    assert_eq(otp_ran(raw"""
+        first[T](t: (T,)) -> T = t.0
+        print(first((1,)), first(("x",)))
+        """), "1 x\n")
+
+@test("a pack matches one at arity one")
+otp_pack_at_one()
+    if !otp_ready() then return
+
+    assert_eq(otp_ran(raw"""
+        count[..A](t: (..A)) -> usize = A.len
+        print(count((1,)), count((1, 2)))
+        """), "1 2\n")
+
+// The trap the one-tuple removes: a query written over a tuple type walks a lone struct's own fields
+// where it was given the struct, and the one-tuple is how one component is asked for.
+@test("a walk of its fields has one part, where the bare type walks that type's own")
+otp_walks_one_field()
+    if !otp_ready() then return
+
+    assert_eq(otp_ran(raw"""
+        struct Pos
+            x: int
+            y: int
+        struct Vel
+            dx: int
+        parts[Q]() -> usize
+            var n: usize = 0
+            for const f in Q::Fields
+                if sizeof(f::Type) > 0 then n += 1
+            n
+        print(parts[(Pos, Vel)](), parts[(Pos,)](), parts[Pos]())
+        """), "2 1 2\n")
+
+// ---- where a value lives ----
+
+@test("a refcounted part is counted and given back")
+otp_counted_part()
+    if !otp_ready() then return
+
+    val run = otp_run(raw"""
+        make(s: string) -> (string,) = (s + "!",)
+        demo()
+            val xs: [2](string,) = [make("a"), make("b")]
+            val t = make("c")
+            val f = () -> t.0
+            print(xs[1].0, f())
+        demo()
+        """, true)
+
+    assert_eq(run.out, "b! c!\n")
+    assert(alloc_count_reported(run.err) == 0, run.err)
+
+@test("it is module storage, a field, and an array element")
+otp_storage()
+    if !otp_ready() then return
+
+    assert_eq(otp_ran(raw"""
+        val G: (int,) = (5,)
+        var M = ("m",)
+        struct S
+            t: (int,)
+        val arr = [(1,), (2,)]
+        print(G.0, M.0, S((2,)).t.0, arr[1].0)
+        """), "5 m 2 2\n")
