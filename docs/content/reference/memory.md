@@ -2308,10 +2308,11 @@ acquire`, or an acquire load under `-fsanitize=thread`, which does not model a s
 ### Module storage reached from another domain
 
 A closure erased into a `&sync Fn` is asked about what it captures **and about the module storage it
-reaches**, however many calls down. What may be reached is what may be captured: a scalar, an
-`Atomic`, a `&sync T`, a raw pointer, `@thread_local` storage, and a `val` laid down as constant data
-(a `val` over a slice literal is one; a `val` over a call is not, and a `[]T` without `const` is
-writable). An interrupt handler — the `interrupt` convention, or
+reaches**, however many calls down. What may be reached is what may be captured, less a string: a
+scalar, an `Atomic`, a `&sync T`, a raw pointer, `@thread_local` storage, and a `val` laid down as
+constant data (a `val` over a slice literal is one; a `val` over a call is not, and a `[]T` without
+`const` is writable). A string in module storage is refused where a captured one is not, because
+[nothing copies it](#a-string-crosses-into-a-shared-object) on the way. An interrupt handler — the `interrupt` convention, or
 [`@domain(interrupt)`](/reference/attributes/#domain-interrupt-a-function-entered-on-top-of-whatever-was-running)
 — is held to it too; a bare `@export` is not, since nothing says a second domain exists until `@domain`
 does.
@@ -2529,6 +2530,70 @@ job()
 a closure shared between two domains may be called from either, so every count it captures has to be atomic — but the 'f' it captures reaches a '&Frozen[int]', whose count is not. Hold it as a '&sync Frozen[int]' ('06')
 ```
 
+### A string crosses into a shared object
+
+**A string a `&sync Fn` captures, or a `&sync T` holds, is put in bytes of its own whose count is
+atomic, where the closure or the object is made.** Nothing is written for it: the type stays `string`,
+and the string the program holds keeps its ordinary count. The bytes are copied once, as the box is
+filled and before anyone else can reach it, and the copy's count carries a mark — its top bit — that
+every share of it reads. A share of a marked count is taken and given back atomically, as a
+`&sync T`'s is, wherever it is taken: in the closure's body, on another thread, in a slice of the
+string, in a string a channel carries.
+
+```sysl
+import sysl.threads.scope
+
+val n = 7
+val name = s"worker-$n"
+val job: &sync Fn() -> string = () -> name[0..<6]
+
+val lens = scope((s) ->
+    val a = s.spawn(() -> job().len)
+    val b = s.spawn(() -> (job() + name[6..<name.len]).len)
+
+    a.join() * 100 + b.join())
+
+scope((s) -> s.spawn(() -> print(job(), job() + name[6..<name.len])).join())
+print(lens, name)
+```
+
+```output
+worker worker-7
+608 worker-7
+```
+
+- **A literal is not copied**, nor a string already shared — one read out of another `&sync` object:
+  the first has no count at all, and the second's is atomic already.
+- **A field, an array element, an `Option` and an enum payload** of the object are followed, so a
+  `&sync Cfg` whose `names: [2]string` and `alias: Option[string]` were built at run time shares each.
+  A field a `@guards` guards, a frozen buffer's elements and a struct promising `@unchecked(Share)` are
+  left as they are, as the rule about what a `&sync T` may hold leaves them.
+- **What it costs**: the copy, once per string per object made, and on every share of any string a
+  test of the mark, made on the count it was about to change anyway. A program that shares nothing
+  never sets the mark, and its counts change as they always did.
+- **Where a word cannot be changed indivisibly** (Armv6-M) nothing is marked: the copy is still made,
+  and its count is an ordinary one.
+
+**A string is shared only where something copies it on the way.** Module storage is reached rather
+than captured, so a string there stays in its own domain, and so does a string among a view's
+elements, a frozen buffer's, a task's frame, or what a pointer handed to a `@crossing` parameter
+reaches:
+
+```sysl
+static var greeting: string = "hi"
+
+val job: &sync Fn() -> unit = () -> print(greeting)
+
+job()
+```
+
+```error
+the module storage 'greeting' it reaches is a 'string', which owns its bytes through a count that is not atomic, and nothing copies it on the way here
+```
+
+A string is therefore `Send` and still not `Share` (below): the bound asks about every place a value
+of the type may be put, and a pointer's pointee is one.
+
 ### `@crossing` — where the rule is asked
 
 **`@crossing(p)` is written above the function that hands `p` to another domain.**
@@ -2574,8 +2639,10 @@ what 's' of 'start' points at reaches another concurrency domain, so every count
 **`sysl.Send` and `sysl.Share` are the two questions above, as bounds a signature can write.** A type
 is **`Send`** where a value of it may be handed to another domain by value — the question a `@crossing`
 parameter taken by value asks, every view and string inside it copied on the way. It is **`Share`**
-where an object of it may be reached from two domains at once — the question `&sync T` asks, nothing
-copied, so a view and a `string` are out. `Share` is `Send` and more.
+where an object of it may be reached from two domains at once wherever it is — behind a pointer as
+well as a `&sync T` — with nothing copied, so a view and a `string` are out. (A `&sync T` holding a
+string copies it in where the object is made, which is a property of that place rather than of the
+type.) `Share` is `Send` and more.
 
 | type | `Send` | `Share` |
 |---|---|---|

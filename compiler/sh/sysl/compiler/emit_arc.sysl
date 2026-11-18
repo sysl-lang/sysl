@@ -85,6 +85,12 @@ private arc_value(e: *Emit, ty: Type, v: Val, retain: bool) = ty match
             release_compact(e, *inner, subject)
         else if e.draining && !retain && !sync
             push_ref(e, *inner, subject)
+        // **A box that can have nothing in it to tear down dies without the reaper**: its own type's
+        // release frees it on the spot, with no thread asked for its slot and no hook called, where
+        // the generic one would start a drain to call the hook twice -- once to walk nothing, once to
+        // free. That is what makes an object's death cost what C++'s `delete` does.
+        else if !retain && !sync && !is_trait(*inner) && empties(e, *inner).is_some()
+            arc_call(e, request_helper(e, s"arc.release.${mangle(*inner)}", HrPlainRelease(*inner)), subject)
         else
             arc_call(e, s"arc.${if retain then "retain" else "release"}${if sync then "_sync" else ""}",
                      subject)
@@ -430,7 +436,11 @@ private boxed_tag(e: *Emit, payload: Type, bn: LType, tag: Val) =
 // Anything else -- a box laid in a frame, one another module made, one with a weak reference out, a
 // variant that holds a count -- is queued on the drain's slot, which is what `arc.reap` would have done
 // with it. Nothing about the order anything is torn down in changes: what is freed here runs no code.
-private gen_push(e: *Emit, payload: Type)
+//
+// **`arc.release.<T>` is the same body outside a drain** (`queued` false): it has no slot, so what
+// it cannot free on the spot goes to `arc.reap` -- which is where the generic release would have sent
+// it -- and only then is a thread asked for anything.
+private gen_push(e: *Emit, payload: Type, queued: bool = true)
     val tags = empties(e, payload).unwrap_or(buf())
     val bn = box_lty(e, payload)
     val word = word_lty(e)
@@ -501,11 +511,15 @@ private gen_push(e: *Emit, payload: Type)
     emit_term(e, InRet(None, None))
     emit_label(e, queue)
 
-    val head = fresh_reg(e)
+    if queued
+        val head = fresh_reg(e)
 
-    emit(e, InLoad(head, LPtr, VReg("slot"), AccPlain, None))
-    emit(e, InStore(LPtr, head, p, AccPlain, None))
-    emit(e, InStore(LPtr, p, VReg("slot"), AccPlain, None))
+        emit(e, InLoad(head, LPtr, VReg("slot"), AccPlain, None))
+        emit(e, InStore(LPtr, head, p, AccPlain, None))
+        emit(e, InStore(LPtr, p, VReg("slot"), AccPlain, None))
+    else
+        arc_call(e, "arc.reap", p)
+
     emit_term(e, InRet(None, None))
     emit_label(e, live)
     emit_term(e, InRet(None, None))
@@ -1019,12 +1033,14 @@ gen_helper(e: *Emit, what: HelperReq, name: string) -> Option[IrFunc]
         HrPlainDrop -> helper_sig(name, hook_params())
         HrFrameDrop(_) -> helper_sig(name, hook_params())
         HrPush(_) -> helper_sig(name, push_params())
+        HrPlainRelease(_) -> helper_sig(name, one_param("p", LPtr))
         HrCompactRelease(_) -> helper_sig(name, one_param("p", LPtr))
         HrCompactPush(_) -> helper_sig(name, push_params())
         HrTaskDrop(_) -> helper_sig(name, hook_params())
         HrSlotBuf(_) -> bound_sig(helper_sig(name, hook_params()) with { linkage = LinkWeakOdr }, binds_locally(e))
         HrSlotPlace(elem) -> helper_sig(name, slot_place_params(e, elem)) with { bare = rarely() }
         HrCross(_) -> helper_sig(name, one_param("p", LPtr))
+        HrShare(_) -> helper_sig(name, one_param("p", LPtr))
 
         // A hand-written block is text rather than a function: the drain writes it down as it
         // stands, so nothing brings one here.
@@ -1046,6 +1062,7 @@ gen_helper(e: *Emit, what: HelperReq, name: string) -> Option[IrFunc]
         HrPlainDrop -> gen_plain_hook(e)
         HrFrameDrop(payload) -> gen_drop_hook(e, payload, false)
         HrPush(payload) -> gen_push(e, payload)
+        HrPlainRelease(payload) -> gen_push(e, payload, false)
         HrCompactRelease(payload) -> gen_compact_release(e, payload)
         HrCompactPush(payload) -> gen_compact_push(e, payload)
         HrTaskDrop(result) -> gen_task_hook(e, result)
@@ -1053,6 +1070,9 @@ gen_helper(e: *Emit, what: HelperReq, name: string) -> Option[IrFunc]
         HrSlotPlace(elem) -> gen_slot_place_rest(e, elem)
         HrCross(ty) ->
             fresh_views_at(e, ty, VReg("p"))
+            emit_term(e, InRet(None, None))
+        HrShare(ty) ->
+            shared_strings_at(e, ty, VReg("p"))
             emit_term(e, InRet(None, None))
         HrText(_) -> gap_here(e, "a hand-written runtime block asked of the generator")
         HrAdapter(table, slot) -> gen_adapter(e, table, slot)

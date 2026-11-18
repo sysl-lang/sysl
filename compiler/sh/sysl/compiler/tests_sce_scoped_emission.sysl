@@ -357,17 +357,35 @@ sce_ref_refused()
         """, sce_head("'t' it captures reaches a '&Thing', whose count is not. Hold it as a " +
                       "'&sync Thing' ('06')"))
 
-@test("a scoped child capturing a string is refused")
-sce_string_refused()
-    sce_refused(sce_scope("@scoped(f)") + raw"""
+// A string a scoped child captures is not lent: the closure holds a share of it, and the share pass
+// puts it in bytes of its own with an atomic count as the box is made (`emit_cross.sysl`).
+@test("a scoped child capturing a string shares it")
+sce_string_shared()
+    sce_prints(sce_scope("@scoped(f)") + raw"""
         d(w: string) -> int
             Runner(0).scope((s) ->
-                s.spawn((u) -> print(w))
+                s.spawn((u) -> print(w, w[1..<3]))
                 0)
-        """, sce_head("'w' it captures reaches a 'string', which owns its bytes through a count " +
-                      "that is not atomic. A literal's bytes are immortal and would be safe to " +
-                      "share, but nothing in the type says whether these are, so a shared object " +
-                      "holds no view at all ('06')"))
+
+        val n = 42
+        print(d(s"x$n!"))
+        """, "x42! 42\n0\n")
+
+// A string beside a view in a struct the child borrows whole is borrowed with it, so nothing copies
+// it, and it is refused as a lent view's string elements are.
+@test("a scoped child capturing a struct of a view and a string is refused")
+sce_lent_struct_string_refused()
+    sce_refused(sce_scope("@scoped(f)") + raw"""
+        struct Pair
+            v: []int
+            w: string
+
+        d(p: Pair) -> int
+            Runner(0).scope((s) ->
+                s.spawn((u) -> print(p.w))
+                0)
+        """, sce_head("'p.w' it captures reaches a 'string', which owns its bytes through a count " +
+                      "that is not atomic, and nothing copies it on the way here"))
 
 @test("a scoped child capturing a Buf is refused")
 sce_buf_refused()
