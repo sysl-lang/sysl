@@ -3891,8 +3891,8 @@ the C compiler refused this file's 'c const' block
 ```
 
 Four more refusals go with it: a header that is not there, a value the declared type cannot hold
-(naming the value and both ends of the range), a type that is not a number, and a block written
-inside a body, which has no file's headers to be compiled against.
+(naming the value and both ends of the range), a type that is neither a number nor a string, and a
+block written inside a body, which has no file's headers to be compiled against.
 
 **A whole number is C's own value, read at its own C type and width**, whatever the line is
 declared at — so the range check is made against the number the header means. `UINT64_MAX` is
@@ -3929,10 +3929,104 @@ c const
 'UINT64_MAX' is 18446744073709551615 here, which 'i64' cannot hold
 ```
 
-**A `string` from C is not written this way.** A number is a number in the compiler's output and
-reads straight off; a string constant is a block of storage and a different job, and it would have to
-be written `"\"foo\""` — two quotings for one value, which is a form nobody would guess. The refusal
-says so rather than leaving it to be found.
+### A string is read too
+
+**The declared type may be `string`, or `*u8` for a C string** — the type a `c"…"` literal has. The
+case is the version macro a header spells out of other macros, which C joins into one literal and
+nobody can copy without doing the joining by hand:
+
+```c
+#define LUA_VERSION_MAJOR "5"
+#define LUA_VERSION_MINOR "4"
+#define LUA_VERSION       "Lua " LUA_VERSION_MAJOR "." LUA_VERSION_MINOR
+```
+
+```sysl
+c const
+    VERSION: string = "\"Lua \" \"5\" \".\" \"4\""
+
+print(VERSION, VERSION.bytes.len)
+```
+
+```output
+Lua 5.4 7
+```
+
+The line is written `"LUA_VERSION"` against the header; the block above writes the macro's own
+expansion out, since a page has no `lua.h` beside it. A literal written on the line itself is C, so
+it carries C's quotes inside sysl's — the one place the two quotings meet, and the reason a macro is
+the usual right-hand side.
+
+**A `*u8` line is the C string a C API takes**, which is what Vulkan's extension names are for: they
+go into an array of `const char *` and nowhere else.
+
+```sysl
+c const
+    SURFACE: *u8   = "\"VK_KHR_surface\""
+    SWAPCHAIN: *u8 = "\"VK_KHR_swapchain\""
+
+extern strlen(s: *u8) -> usize
+
+val wanted: [2]*u8 = [SURFACE, SWAPCHAIN]
+
+print(strlen(wanted[0]), strlen(wanted[1]))
+```
+
+```output
+14 16
+```
+
+A `string` line is a `const` holding the literal; a `*u8` line is a module `val` holding the
+`c"…"` literal, since a pointer is no `const` — and that `val` is
+[constant data](#what-constant-data-is), so an array of them, exported or not, is laid down as
+relocations on a bare machine exactly as `[c"VK_KHR_surface", c"VK_KHR_swapchain"]` would be.
+
+**The value is the whole literal, as C settles it**: the joining, every escape, and the bytes of the
+header's UTF-8. C's terminator is C's and not part of the value. **An embedded NUL** is kept by a
+`string`, which has a length — `"a\0b"` is three bytes — and refused by a `*u8`, which has none and
+would end there, as a `c"…"` literal's own is:
+
+```sysl
+c const
+    P: *u8 = "\"a\\0b\""
+
+val p = P
+```
+
+```error
+holds a NUL before its end, where a C string would stop
+```
+
+**Something C does not call a string is refused in sysl's words**, rather than in a C type error
+about an initializer — a number, a float, a struct, an address into the middle of a literal:
+
+```sysl
+c const
+    S: string = "504"
+
+print(S)
+```
+
+```error
+'504' is not a string in C, and this line reads one as 'string'
+```
+
+What C calls a string is a `char` array or a `char *` constant that is one: a literal, literals C
+joins, a macro that is either, and a `static const char NAME[]` in a header. A `string` holds UTF-8
+whatever it came from, so bytes that are not UTF-8 are refused; a `*u8` is held to the same, being a
+`c"…"` literal underneath. And the other way round, **a string read at a number type is refused**
+rather than read as the literal's address, which is a number only the linker knows:
+
+```sysl
+c const
+    N: u64 = "\"abc\""
+
+print(N)
+```
+
+```error
+is an address here rather than a number
+```
 
 ### A float is measured too, and it is the value hand-copying gets wrong
 

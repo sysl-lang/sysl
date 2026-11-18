@@ -13,8 +13,11 @@ import sysl.buf.{Buf, buf}
 // Whether one carrier on the right was what the form was read as, which is also what says the
 // count check has nothing left to add: a carrier that could not supply the parts has already been
 // complained about in its own terms.
-private spread_was_tried(places: usize, values: Buf[Expr]) -> bool =
-    values.len() == 1 && places > 1
+//
+// **One place takes a carrier apart only where its comma said so**: `(a,) = t` is the one-tuple's
+// own spelling on the left, while `_ = x` is one place given `x` whole.
+private spread_was_tried(places: usize, values: Buf[Expr], single: bool = false) -> bool =
+    values.len() == 1 && (places > 1 || single && places == 1)
 
 // The values a comma form on the left is given, where the right side is **one** thing carrying
 // several -- the third of the three feeds this syntax has.
@@ -25,8 +28,8 @@ private spread_was_tried(places: usize, values: Buf[Expr]) -> bool =
 //
 // None where the right side is a list rather than one carrier, which is every other case.
 private spread(cx: &Analyzer, places: usize, values: Buf[Expr],
-               subject: string) -> Option[(TStmt, Buf[TExpr])]
-    if !spread_was_tried(places, values) then return None
+               subject: string, single: bool = false) -> Option[(TStmt, Buf[TExpr])]
+    if !spread_was_tried(places, values, single) then return None
 
     val one_value = values[0]
     val tv = type_expr_multi(cx, one_value, None)
@@ -83,7 +86,7 @@ private yields_results(t: TExpr) -> bool = *t.kind match
 // on the right takes the width of the place it is heading for, exactly as it does after a single
 // `=`. Each arm is then checked by the rule its own operator already has.
 multi_assign(cx: &Analyzer, span: Span, op: string, targets: Buf[Expr],
-                     values: Buf[Expr]) -> Buf[TStmt]
+                     values: Buf[Expr], one_tuple: bool = false) -> Buf[TStmt]
     // A multiple assignment is a statement, and its places yield nothing for `:=` to hand on.
     if is_yielding_assign(op)
         var none: Buf[TStmt] = buf()
@@ -94,10 +97,11 @@ multi_assign(cx: &Analyzer, span: Span, op: string, targets: Buf[Expr],
     end if
 
     val taken = spread(cx, targets.len(), values,
-                       s"this assignment has ${targets.len()} places on the left")
+                       s"this assignment has ${quantity(targets.len(), "place")} on the left",
+                       one_tuple)
 
-    if !spread_was_tried(targets.len(), values) && targets.len() != values.len() then
-        cx.fault(span, s"this assignment has ${targets.len()} places on the left and " +
+    if !spread_was_tried(targets.len(), values, one_tuple) && targets.len() != values.len() then
+        cx.fault(span, s"this assignment has ${quantity(targets.len(), "place")} on the left and " +
                  s"${values.len()} ${if values.len() == 1 then "value" else "values"} on the right")
 
     // `b[i] = v` on a container is a call to `index_set` rather than a store, so it has no address
@@ -279,8 +283,9 @@ private one_write(cx: &Analyzer, op: string, target: Expr, place: TExpr, part: O
     val bin = op[0..<op.bytes.len - 1]
     val want = scale_expectation(bin, texpr_type(place), written, update_expected_for(cx, bin, texpr_type(place), written))
     val read = arm_value_at(cx, part, written, want)
-    val tv = widened_operand(cx, written.span, bin, texpr_type(place), read,
-                             if part.is_none() then Some(written) else None)
+    val tv = updated_by_value(cx, bin, texpr_type(place),
+                              widened_operand(cx, written.span, bin, texpr_type(place), read,
+                                              if part.is_none() then Some(written) else None))
 
     if operand_refused(read, tv) then return TWrite(place, op, tv, None, arm_checks(cx, place), None)
 

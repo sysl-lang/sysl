@@ -50,8 +50,16 @@ gen_box(e: *Emit, value: TExpr, ref_ty: Type) -> Val
         retain_moving(e, value, inner, v, false)
         emit(e, InStore(lty(e, inner), v, slot, AccPlain, None))
 
+    shared_box_payload(e, ref_ty, inner, slot)
     own_temp(e, opened.0, ref_ty)
 end gen_box
+
+// **A `&sync` box's strings are put in bytes with an atomic count before anyone else can reach it**
+// (`emit_cross.sysl`'s `share_payload`), wherever a box is filled: from an expression here, or from a
+// payload a `match` arm moves out of its scrutinee (`emit_pattern.sysl`'s `payload_move`).
+shared_box_payload(e: *Emit, ref_ty: Type, inner: Type, slot: Val) = repr(ref_ty) match
+    Ref(_, sync) -> if sync then share_payload(e, inner, slot)
+    _ -> ()
 
 // **Whether a box is worth taking zeroed**: where its payload's zeros fill at least a page, or are the
 // whole of it. A zeroing call costs a small block what writing its zeros would have, so below a page
@@ -188,6 +196,7 @@ private gen_frame_box(e: *Emit, value: TExpr, ref_ty: Type) -> Val
         emit(e, InStore(lty(e, inner), v, slot, AccPlain, None))
     end if
 
+    shared_box_payload(e, ref_ty, inner, slot)
     own_temp(e, p, ref_ty)
 end gen_frame_box
 
