@@ -1195,3 +1195,274 @@ lehmer_fibonacci()
     assert_eq(gcd(fib[4500], fib[4499]), one())
     assert_eq(gcd(fib[2310], fib[1001]), fib[77])
 end lehmer_fibonacci
+
+// -- the half-gcd, the extended gcd and the modular inverse ----------------------------------------
+//
+// `gcd`, `gcd_ext` and `mod_inverse` reduce through `half_gcd.sysl` from `gcd_dc_threshold` limbs,
+// which a debug suite cannot afford at every shape. So the internal entries take the thresholds as
+// parameters, and these tests push them down to a handful of limbs: every route of the recursion --
+// both recursive calls, the steps between them, the Lehmer step held above the floor and the division
+// that takes one quotient less -- then runs on values a few dozen limbs long, against Lehmer's loop
+// with the half-gcd switched off. Agreement with GMP from 1 to 20,000 limbs, across the real
+// thresholds, is checked outside the suite against the `gmp` package; what pins GMP's answer here is
+// that its cofactors are the unique pair inside the bounds `check_ext` asserts.
+
+private big_of(m: []const Limb) -> BigInt = normalized(false, m)
+
+/** A threshold no test value reaches: the half-gcd off, Lehmer's loop alone. */
+private val never: usize = 1 << 40
+
+/** Lehmer's gcd with the half-gcd switched off -- the reference the half-gcd is checked against. */
+private lehmer_gcd(a: BigInt, b: BigInt) -> BigInt = big_of(gcd_mag(a.mag, b.mag, never, never))
+
+/** Asserts what `hgcd` promises of `(a, b)` at `threshold`, answering whether it moved: the pair is
+ * `M (alpha; beta)` exactly, `M` has determinant one, both values are more than `s` limbs long, and
+ * the reduction went as far as it goes -- the two are within `2^(s w)` of each other.
+ */
+private check_hgcd(a: BigInt, b: BigInt, threshold: usize) -> bool
+    val r = hgcd(a.mag, b.mag, threshold)
+    val n = if a.mag.len > b.mag.len then a.mag.len else b.mag.len
+    val s = n / 2 + 1
+    val alpha = big_of(r.a)
+    val beta = big_of(r.b)
+    val u00 = big_of(r.u00)
+    val u01 = big_of(r.u01)
+    val u10 = big_of(r.u10)
+    val u11 = big_of(r.u11)
+
+    assert_eq(add(mul(u00, alpha), mul(u01, beta)), a)
+    assert_eq(add(mul(u10, alpha), mul(u11, beta)), b)
+    assert_eq(sub(mul(u00, u11), mul(u01, u10)), one())
+
+    if !r.moved then return false
+
+    assert(r.a.len > s && r.b.len > s)
+    assert(abs(sub(alpha, beta)).mag.len <= s)
+
+    true
+end check_hgcd
+
+/** The first `count` Fibonacci numbers, from F(0). */
+private fibonacci(count: usize) -> Buf[BigInt]
+    var fib: Buf[BigInt] = buf()
+
+    fib.push(zero())
+    fib.push(one())
+
+    for i in 2..<count do fib.push(add(fib[i - 1], fib[i - 2]))
+
+    fib
+
+@test("Lehmer's window reaches past two limbs when the top limb is short, at every shift")
+lehmer_window_shifts()
+    // The window is two limbs less two bits read from the top bit down, so a top limb with `k`
+    // leading zeros puts `k - 2` of its bits in the third limb from the top. A window that stopped
+    // at two limbs read those as zeros and certified quotients that were wrong.
+    var g = rng(6502, 8)
+
+    for k in 0..<limb_bits
+        val top = random_big(&g, 1, false)
+        val x = add(shl(shr(top, k), 4 * limb_bits), random_big(&g, 4, false))
+        val y = add(shl(shr(random_big(&g, 1, false), k), 4 * limb_bits), random_big(&g, 4, false))
+
+        if x.is_zero() || y.is_zero() then continue
+
+        assert_eq(lehmer_gcd(x, y), plain_gcd(x, y))
+        assert_eq(lehmer_gcd(mul(x, top), mul(y, top)), plain_gcd(mul(x, top), mul(y, top)))
+end lehmer_window_shifts
+
+@test("the half-gcd's reduction is exact, unimodular, above its floor and as far as it goes")
+hgcd_invariants()
+    var g = rng(4242, 8)
+    var moved = 0
+
+    for k in 0..<90
+        val n = 3 + usize(k % 45)
+        val m = if k % 3 == 0 then n else n - usize(k % 4)
+        val a = random_big(&g, n, false)
+        val b = random_big(&g, if m == 0 then 1 else m, false)
+
+        // The same pair, recursing from 4 limbs and from 8, and stepping only.
+        for t in [4, 8, never]
+            if check_hgcd(a, b, t) then moved += 1
+
+    // Not a vacuous pass: nearly every pair has a top half to reduce.
+    assert(moved > 200)
+end hgcd_invariants
+
+@test("the half-gcd reduces Fibonacci pairs, every quotient one, exactly")
+hgcd_fibonacci()
+    val fib = fibonacci(3001)
+
+    for i in [400, 1000, 2999]
+        assert(check_hgcd(fib[i + 1], fib[i], 4))
+        assert(check_hgcd(fib[i], fib[i + 1], 6))
+
+@test("the half-gcd refuses a pair already at its floor, and leaves it as it was")
+hgcd_at_floor()
+    var g = rng(77, 8)
+    val a = random_big(&g, 20, false)
+
+    // Equal operands, an operand of `s` limbs or fewer, and two within 2^(s w) of each other.
+    assert(!check_hgcd(a, a, 4))
+    assert(!check_hgcd(a, random_big(&g, 11, false), 4))
+    assert(!check_hgcd(a, add(a, random_big(&g, 10, false)), 4))
+    assert(!check_hgcd(zero(), a, 4))
+
+@test("gcd through the half-gcd agrees with Lehmer's loop around every threshold")
+hgcd_gcd_against_lehmer()
+    var g = rng(9001, 8)
+
+    for k in 0..<80
+        val n = 1 + usize(k % 70)
+        val m = if k % 4 == 0 then n else 1 + usize((k * 7) % 70)
+        val c = random_big(&g, 1 + usize(k % 5), false)
+        val a = mul(random_big(&g, n, k % 2 == 0), c)
+        val b = mul(random_big(&g, m, k % 3 == 0), c)
+        val want = lehmer_gcd(a, b)
+
+        for dc in [4, 9, 24]
+            for t in [4, 7, 16, never]
+                assert_eq(big_of(gcd_mag(a.mag, b.mag, dc, t)), want)
+
+        assert_eq(gcd(a, b), want)
+end hgcd_gcd_against_lehmer
+
+@test("gcd through the half-gcd on Fibonacci pairs, a shared factor, and the uneven shapes")
+hgcd_gcd_shapes()
+    val fib = fibonacci(4501)
+    var g = rng(31337, 8)
+    val big = random_big(&g, 60, false)
+    val small = random_big(&g, 2, false)
+    val f = random_big(&g, 25, false)
+
+    for t in [4, 6, 12]
+        assert_eq(big_of(gcd_mag(fib[4500].mag, fib[4499].mag, 4, t)), one())
+        assert_eq(big_of(gcd_mag(fib[4500].mag, fib[3000].mag, 4, t)), fib[1500])
+        assert_eq(big_of(gcd_mag(fib[2310].mag, fib[1001].mag, 4, t)), fib[77])
+
+        // One a multiple of the other, equal, one zero, and huge against small.
+        assert_eq(big_of(gcd_mag(mul(big, f).mag, big.mag, 4, t)), big)
+        assert_eq(big_of(gcd_mag(big.mag, big.mag, 4, t)), big)
+        assert_eq(big_of(gcd_mag(big.mag, empty(), 4, t)), big)
+        assert_eq(big_of(gcd_mag(empty(), big.mag, 4, t)), big)
+        assert_eq(big_of(gcd_mag(big.mag, small.mag, 4, t)), lehmer_gcd(big, small))
+
+        // A large common factor, so the answer is many limbs long.
+        val a = mul(f, random_big(&g, 30, false))
+        val b = mul(f, random_big(&g, 31, false))
+
+        assert_eq(big_of(gcd_mag(a.mag, b.mag, 4, t)), lehmer_gcd(a, b))
+end hgcd_gcd_shapes
+
+/** Asserts that `(gv, s, t)` is `gcd_ext(a, b)`: the gcd, Bézout's identity, and GMP's choice of
+ * cofactors -- `|s| < |b| / 2g` and `|t| < |a| / 2g`, with the cases the bounds leave empty decided
+ * the way `gcd_ext`'s docstring says.
+ */
+private check_ext(a: BigInt, b: BigInt, gv: BigInt, s: BigInt, t: BigInt)
+    assert_eq(gv, lehmer_gcd(a, b))
+    assert_eq(add(mul(a, s), mul(b, t)), gv)
+
+    val sa = from_int(long(a.sign()))
+    val sb = from_int(long(b.sign()))
+    val two_g = mul_long(gv, 2)
+
+    if cmp(abs(a), abs(b)) == 0
+        assert_eq(s, zero())
+        assert_eq(t, sb)
+    elif b.is_zero()
+        assert_eq(s, sa)
+        assert_eq(t, zero())
+    elif a.is_zero()
+        assert_eq(s, zero())
+        assert_eq(t, sb)
+    else
+        if cmp(abs(b), two_g) == 0 then assert_eq(s, sa) else assert(cmp(mul(abs(s), two_g), abs(b)) < 0)
+        if cmp(abs(a), two_g) == 0 then assert_eq(t, sb) else assert(cmp(mul(abs(t), two_g), abs(a)) < 0)
+end check_ext
+
+@test("the extended gcd on values a reader can check, and every case the bounds leave empty")
+gcd_ext_named()
+    val (g1, s1, t1) = gcd_ext(from_int(240), from_int(46))
+
+    assert_eq(g1, from_int(2))
+    assert_eq(s1, from_int(-9))
+    assert_eq(t1, from_int(47))
+
+    for (a, b) in [(240, 46), (-240, 46), (240, -46), (-240, -46), (0, 0), (0, 5), (0, -5), (5, 0),
+            (-5, 0), (7, 7), (7, -7), (-7, 7), (6, 4), (4, 6), (3, 6), (6, 3), (2, 3), (3, 2),
+            (1, 1), (1, 0), (0, 1), (12, 18), (17, 5), (-17, 5), (10, 4), (-10, 4)]
+        val x = from_int(a)
+        val y = from_int(b)
+        val (gv, s, t) = gcd_ext(x, y)
+
+        check_ext(x, y, gv, s, t)
+
+    val (g0, s0, t0) = gcd_ext(zero(), zero())
+
+    assert_eq(g0, zero())
+    assert_eq(s0, zero())
+    assert_eq(t0, zero())
+end gcd_ext_named
+
+@test("the extended gcd through the half-gcd keeps Bézout's identity and GMP's cofactors")
+gcd_ext_against_bounds()
+    var g = rng(271828, 8)
+
+    for k in 0..<60
+        val n = 1 + usize(k % 50)
+        val m = if k % 3 == 0 then n else 1 + usize((k * 5) % 50)
+        val c = random_big(&g, 1 + usize(k % 4), false)
+        val a = mul(random_big(&g, n, k % 2 == 0), c)
+        val b = mul(random_big(&g, m, k % 5 == 0), c)
+
+        for (dc, t) in [(4, 4), (6, 9), (never, never)]
+            val (gv, s, tt) = gcd_ext_with(a, b, dc, t)
+
+            check_ext(a, b, gv, s, tt)
+end gcd_ext_against_bounds
+
+@test("the extended gcd on Fibonacci pairs, multiples, equal values and huge against small")
+gcd_ext_shapes()
+    val fib = fibonacci(2001)
+    var g = rng(161803, 8)
+    val big = random_big(&g, 40, true)
+    val small = random_big(&g, 1, false)
+
+    for (a, b) in [(fib[2000], fib[1999]), (fib[1999], fib[2000]), (fib[2000], fib[1000]),
+            (mul(big, small), big), (big, mul(big, small)), (big, big), (big, negate(big)),
+            (big, small), (small, big), (big, zero()), (zero(), big), (mul_long(small, 2), small)]
+        for t in [4, 7]
+            val (gv, s, tt) = gcd_ext_with(a, b, 4, t)
+
+            check_ext(a, b, gv, s, tt)
+
+        val (gv, s, tt) = gcd_ext(a, b)
+
+        check_ext(a, b, gv, s, tt)
+end gcd_ext_shapes
+
+@test("the modular inverse, where there is one and where there is not")
+mod_inverse_cases()
+    assert_eq(mod_inverse(from_int(3), from_int(7)), Some(from_int(5)))
+    assert_eq(mod_inverse(from_int(-3), from_int(7)), Some(from_int(2)))
+    assert_eq(mod_inverse(from_int(3), from_int(-7)), Some(from_int(-2)))
+    assert_eq(mod_inverse(from_int(10), from_int(7)), Some(from_int(5)))
+    assert_eq(mod_inverse(from_int(2), from_int(4)), None)
+    assert_eq(mod_inverse(zero(), from_int(7)), None)
+    assert_eq(mod_inverse(from_int(5), one()), Some(zero()))
+    assert_eq(mod_inverse(from_int(5), from_int(-1)), Some(zero()))
+
+    var g = rng(1729, 8)
+    val p = sub(two_pow(521), one())
+
+    for k in 0..<30
+        val a = random_big(&g, 1 + usize(k % 40), k % 2 == 0)
+        val m = if k % 3 == 0 then p else random_big(&g, 1 + usize((k * 3) % 40), false)
+
+        mod_inverse(a, m) match
+            Some(x) ->
+                assert(cmp(x, zero()) >= 0 && cmp(x, m) < 0)
+                assert_eq(mod_floor(mul(a, x), m), mod_floor(one(), m))
+            None -> assert(cmp(gcd(a, m), one()) != 0)
+end mod_inverse_cases

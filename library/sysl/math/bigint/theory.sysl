@@ -24,15 +24,48 @@ module sysl.math.bigint
  *
  * **It is Lehmer's form of it** (Knuth, *The Art of Computer Programming* volume 2, §4.5.2,
  * algorithm L). Most of Euclid's quotients are small and depend only on the leading bits, so the
- * steps are run on the top `w - 1` bits of the pair in machine arithmetic, recording what they did as a
- * two-by-two matrix of cofactors, and the matrix is applied to the whole pair once -- one pass over
- * the limbs for about sixty bits of progress, where plain Euclid makes a pass, and an allocation,
- * per quotient. Where the leading bits cannot decide even one quotient, a full division step is
+ * steps are run on the top `2w - 2` bits of the pair in double-width machine arithmetic, recording
+ * what they did as a two-by-two matrix of cofactors, and the matrix is applied to the whole pair once
+ * -- one pass over the limbs for about a limb of progress, where plain Euclid makes a pass, and an
+ * allocation, per quotient. (A window of one limb gets half that: Knuth's test stops the cofactors
+ * at about the square root of the window.) Where the leading bits cannot decide even one quotient, a full division step is
  * taken instead. Below two limbs it is plain Euclid in machine words.
+ *
+ * **From `gcd_dc_threshold` limbs it is the half-gcd** (`half_gcd.sysl`): the top of the pair is
+ * reduced recursively and the reduction applied to the whole by multiplication, which makes the cost
+ * a multiply's times a logarithm rather than quadratic. Lehmer's loop finishes what it leaves.
  */
-gcd(a: BigInt, b: BigInt) -> BigInt
-    var x = a.mag
-    var y = b.mag
+gcd(a: BigInt, b: BigInt) -> BigInt = normalized(false, gcd_mag(a.mag, b.mag, gcd_dc_threshold, hgcd_threshold))
+
+/** The split `gcd` and `gcd_ext` reduce at: the half-gcd runs on the limbs from here up, the top
+ * half of the pair -- as large a piece as one reduction can take whole.
+ */
+private split_at(n: usize) -> usize = n / 2
+
+/** The half-gcd of the top half of a pair `x >= y`, applied to the whole of it: the reduction, its
+ * `a` and `b` the whole pair reduced -- in no particular order. `moved` false says the top half could
+ * not be reduced, and the caller takes a division instead.
+ */
+private dc_reduce(x: []const Limb, y: []const Limb, threshold: usize) -> Reduction
+    val p = split_at(x.len)
+    var r = hgcd(limbs_above(x, p), limbs_above(y, p), threshold)
+
+    if r.moved
+        val (alpha, beta) = applied(r, x, y, p)
+
+        r.a = alpha
+        r.b = beta
+
+    r
+end dc_reduce
+
+/** The gcd of two magnitudes: the half-gcd while the smaller has `dc` limbs or more, Lehmer's loop
+ * below that, and machine words for the last limb. The two thresholds are parameters so that a test
+ * can push every route of the half-gcd down to sizes it can afford to check.
+ */
+private[bigint] gcd_mag(a: []const Limb, b: []const Limb, dc: usize, threshold: usize) -> []const Limb
+    var x = a
+    var y = b
 
     if cmp_mag(x, y) < 0
         val t = x
@@ -40,8 +73,24 @@ gcd(a: BigInt, b: BigInt) -> BigInt
         x = y
         y = t
 
+    while y.len >= dc
+        val r = dc_reduce(x, y, threshold)
+        var nx = r.a
+        var ny = r.b
+
+        if !r.moved
+            val (_, rem) = divmod_mag(x, y)
+
+            nx = y
+            ny = rem
+
+        val swap = cmp_mag(nx, ny) < 0
+
+        x = if swap then ny else nx
+        y = if swap then nx else ny
+
     while y.len > 1
-        val m = if x.len == y.len + 1 || x.len == y.len then lehmer_matrix(x, y) else Cofactors(1, 0, 0, 1)
+        val m = if x.len == y.len + 1 || x.len == y.len then lehmer_matrix(x, y, 0) else Cofactors(1, 0, 0, 1)
 
         if m.b == 0
             val (_, r) = divmod_mag(x, y)
@@ -66,7 +115,7 @@ gcd(a: BigInt, b: BigInt) -> BigInt
                 x = y
                 y = t
 
-    if y.len == 0 then return normalized(false, x)
+    if y.len == 0 then return x
 
     // One limb left in `y`: one short division brings `x` under it, and the rest is machine words.
     val (_, r) = short_divide(x, y[0])
@@ -79,14 +128,14 @@ gcd(a: BigInt, b: BigInt) -> BigInt
         p = q
         q = t
 
-    normalized(false, mag_of_u64(u64(p)))
-end gcd
+    mag_of_u64(u64(p))
+end gcd_mag
 
 /** The matrix `[[a, b], [c, d]]` that takes a pair `(x, y)` to `(a x + b y, c x + d y)`. Its entries
- * alternate in sign, and each is under `2^(w - 1)` in magnitude for a `w`-bit limb, so a limb holds
- * it.
+ * alternate in sign, and each is at most `2^(w - 2)` in magnitude for a `w`-bit limb
+ * (`cofactor_limit`), so a limb holds it.
  */
-private struct Cofactors
+private[bigint] struct Cofactors
     a: long
     b: long
     c: long
@@ -96,17 +145,28 @@ private struct Cofactors
  * for as long as the quotient the leading bits give is certainly the quotient of the whole --
  * which Knuth's test checks by computing it from both ends of the interval the true values lie in.
  * `b` of zero says not one step could be taken.
+ *
+ * **A non-zero `floor` also stops it before any remainder could fall under `2^floor`** -- the
+ * half-gcd's condition. The window reads `x` from bit `low` up, so a remainder whose row is
+ * `(t1, t2)` and whose window value is `t3` is `t3 2^low` give or take less than `(|t1| + |t2|) 2^low`;
+ * a step is taken only where the low end of that is still `2^floor` or more.
  */
-private lehmer_matrix(x: []const Limb, y: []const Limb) -> Cofactors
+private[bigint] lehmer_matrix(x: []const Limb, y: []const Limb, floor: usize) -> Cofactors
     val lead = usize(x[x.len - 1].leading_zeros())
-    val xh = i128(top_bits(x, x.len, lead))
-    val yh = i128(top_bits(y, x.len, lead))
-    var u = xh
-    var v = yh
+    var u = i128(top_bits(x, x.len, lead))
+    var v = i128(top_bits(y, x.len, lead))
     var a: i128 = 1
     var b: i128 = 0
     var c: i128 = 0
     var d: i128 = 1
+
+    // The floor in units of the window's lowest bit. Past 2^120 no remainder the window holds clears
+    // it, and at or under one unit any positive certified window value does.
+    val gap = long(floor) - (long(x.len * limb_bits) - long(lead) - long(window_bits))
+
+    if floor > 0 && gap > 120 then return Cofactors(1, 0, 0, 1)
+
+    val least: i128 = if gap <= 0 then 1 else i128(1) << usize(gap)
 
     loop
         if v + c <= 0 || v + d <= 0 then break
@@ -115,45 +175,61 @@ private lehmer_matrix(x: []const Limb, y: []const Limb) -> Cofactors
 
         if q != (u + b) / (v + d) then break
 
+        // A cofactor past `cofactor_limit` would not fit the limb `combine` multiplies by; checked
+        // before the products, which it also keeps inside an `i128`.
+        if q > cofactor_limit then break
+
         val t1 = a - q * c
-
-        a = c
-        c = t1
-
         val t2 = b - q * d
 
-        b = d
-        d = t2
+        if t1 > cofactor_limit || -t1 > cofactor_limit || t2 > cofactor_limit || -t2 > cofactor_limit then break
 
         val t3 = u - q * v
 
+        if floor > 0 && t3 - (if t1 < 0 then -t1 else t1) - (if t2 < 0 then -t2 else t2) < least then break
+
+        a = c
+        c = t1
+        b = d
+        d = t2
         u = v
         v = t3
 
     Cofactors(long(a), long(b), long(c), long(d))
 end lehmer_matrix
 
-/** The `w - 1` bits of `x` that start `lead` bits below the top of limb `n - 1` -- the longer
- * operand's top bit, so that both operands are read through the same window and their leading bits
- * line up. One bit short of a limb keeps every cofactor the loop builds under `2^(w - 1)`. The window
- * is 128 bits whatever a limb is, which holds a limb's width from anywhere in a limb.
+/** How many bits of the pair Lehmer's loop reads: two limbs less two bits. Knuth's test lets the
+ * cofactors grow to about the square root of the window, so a window of two limbs is what lets a
+ * matrix take a whole limb of progress -- one limb's window stops at half of one.
  */
-private top_bits(x: []const Limb, n: usize, lead: usize) -> u64
-    var window: u128 = 0
+private val window_bits: usize = 2 * limb_bits - 2
 
-    for i in 0..<(128 / limb_bits)
+/** The largest cofactor a Lehmer matrix may hold: `2^(w - 2)`, which a limb holds with a bit to spare
+ * and which keeps every product the loop forms inside an `i128`.
+ */
+private val cofactor_limit: i128 = i128(1) << (limb_bits - 2)
+
+/** The `window_bits` bits of `x` that start `lead` bits below the top of limb `n - 1` -- the longer
+ * operand's top bit, so that both operands are read through the same window and their leading bits
+ * line up. The window is 256 bits whatever a limb is: the bits wanted start anywhere in the top limb
+ * and so reach into the third one down, which a window of two limbs would read as zeros.
+ */
+private top_bits(x: []const Limb, n: usize, lead: usize) -> u128
+    var window: u256 = 0
+
+    for i in 0..<(256 / limb_bits)
         window = window << limb_bits
 
-        if i < n && n - 1 - i < x.len then window = window | u128(x[n - 1 - i])
+        if i < n && n - 1 - i < x.len then window = window | u256(x[n - 1 - i])
 
-    u64((window << lead) >> (129 - limb_bits))
+    u128((window << lead) >> (256 - window_bits))
 end top_bits
 
 /** `p x + q y`, which is non-negative, where `p` and `q` have opposite signs (or one is zero) -- one
  * row of a Lehmer matrix applied to the pair, `yp` being `y` padded to `x`'s length. One multiply
  * pass and one multiply-and-subtract pass.
  */
-private combine(x: []const Limb, yp: []const Limb, p: long, q: long) -> []const Limb
+private[bigint] combine(x: []const Limb, yp: []const Limb, p: long, q: long) -> []const Limb
     val n = x.len
     var t: []Limb = [0; n + 1]
 
@@ -168,6 +244,131 @@ private combine(x: []const Limb, yp: []const Limb, p: long, q: long) -> []const 
 
     finished(t, n + 1)
 end combine
+
+/** `(g, s, t)` with `g = gcd(a, b)` and `a s + b t = g` -- the extended gcd, Bézout's cofactors:
+ * `gcd_ext(240, 46)` is `(2, -9, 47)`.
+ *
+ * **The cofactors are the smallest pair, and the pair is GMP's** (`mpz_gcdext`), so that two
+ * implementations agree on more than the gcd: `|s| < |b| / (2g)` and `|t| < |a| / (2g)`, which
+ * between them leave one pair. Where those bounds leave none, the answer is the one the definition
+ * forces: `|a| == |b|` gives `s = 0`, `t = sign(b)`; `b` of zero gives `s = sign(a)`, `t = 0`; `a`
+ * of zero gives `s = 0`, `t = sign(b)`; `|b| == 2g` gives `s = sign(a)`. `gcd_ext(0, 0)` is
+ * `(0, 0, 0)`.
+ *
+ * **It is the same reduction `gcd` is** -- the half-gcd from `gcd_dc_threshold` limbs, Lehmer's
+ * matrices below it -- with `s` carried through every matrix the reduction applies, and `t` found
+ * once at the end as `(g - a s) / b`, one exact division, rather than carried as well.
+ */
+gcd_ext(a: BigInt, b: BigInt) -> (BigInt, BigInt, BigInt) = gcd_ext_with(a, b, gcd_dc_threshold, hgcd_threshold)
+
+/** `gcd_ext` at the thresholds given, which a test pushes down to reach the half-gcd cheaply. */
+private[bigint] gcd_ext_with(a: BigInt, b: BigInt, dc: usize, threshold: usize) -> (BigInt, BigInt, BigInt)
+    val (gm, sm) = gcd_cofactor(a.mag, b.mag, dc, threshold)
+    val g = normalized(false, gm)
+
+    if b.is_zero() then return (g, from_int(long(a.sign())), zero())
+
+    // `sm` is the cofactor of `|a|`; `a`'s own is that with `a`'s sign. It is unique modulo `|b| / g`,
+    // and the representative wanted is the one nearest zero.
+    val m = div(abs(b), g)
+    var s = mod_floor(if a.minus then negate(sm) else sm, m)
+    val twice = cmp(shl(s, 1), m)
+
+    if twice > 0
+        s = sub(s, m)
+    elif twice == 0
+        s = from_int(long(a.sign()))
+
+    (g, s, div(sub(g, mul(a, s)), b))
+end gcd_ext_with
+
+/** `a`'s inverse modulo `m` -- the `x` with `a x` congruent to 1 -- or `None` where `a` and `m` share
+ * a factor and there is none: `mod_inverse(3, 7)` is `Some(5)`, `mod_inverse(2, 4)` is `None`.
+ *
+ * **The answer takes the modulus's sign**, as `mod_pow`'s does: it lands in `0..<m` for a positive
+ * `m`. Modulo 1 everything is congruent to everything, and the answer is `Some(0)`. A zero modulus
+ * traps, as `mod_pow`'s does.
+ *
+ * It is `gcd_ext`'s reduction, carrying only the one cofactor it needs.
+ */
+mod_inverse(a: BigInt, m: BigInt) -> Option[BigInt]
+    if m.is_zero() then panic("sysl.math.bigint: a modular inverse modulo zero")
+
+    val (g, s) = gcd_cofactor(a.mag, m.mag, gcd_dc_threshold, hgcd_threshold)
+
+    if g.len != 1 || g[0] != 1 then return None
+
+    Some(mod_floor(if a.minus then negate(s) else s, m))
+end mod_inverse
+
+/** `(g, s)` for two magnitudes: `g` their gcd and `s` a cofactor of `a` -- `g = s a + t b` for some
+ * `t`. The reduction is `gcd_mag`'s, the half-gcd while the smaller has `dc` limbs or more and
+ * Lehmer's matrices below, and `s` rides along with the pair: if `x = sx a + _ b` and
+ * `y = sy a + _ b`, then any matrix applied to `(x, y)` applies to `(sx, sy)` alike.
+ */
+private[bigint] gcd_cofactor(a: []const Limb, b: []const Limb, dc: usize, threshold: usize) -> ([]const Limb, BigInt)
+    var x = a
+    var y = b
+    var sx = one()
+    var sy = zero()
+
+    if cmp_mag(x, y) < 0
+        x = b
+        y = a
+        sx = zero()
+        sy = one()
+
+    while y.len > 0
+        var nx = x
+        var ny = y
+        var nsx = sx
+        var nsy = sy
+        var moved = false
+
+        if y.len >= dc
+            val r = dc_reduce(x, y, threshold)
+
+            if r.moved
+                // `(x; y) = M (alpha; beta)`, so `(alpha; beta) = [[u11, -u01], [-u10, u00]] (x; y)`.
+                nx = r.a
+                ny = r.b
+                nsx = sub(mul(normalized(false, r.u11), sx), mul(normalized(false, r.u01), sy))
+                nsy = sub(mul(normalized(false, r.u00), sy), mul(normalized(false, r.u10), sx))
+                moved = true
+        elif x.len == y.len || x.len == y.len + 1
+            val m = lehmer_matrix(x, y, 0)
+
+            if m.b != 0
+                var yp: []Limb = [0; x.len]
+
+                copy_n(yp, y, y.len)
+                nx = combine(x, yp, m.a, m.b)
+                ny = combine(x, yp, m.c, m.d)
+                nsx = add(mul_long(sx, m.a), mul_long(sy, m.b))
+                nsy = add(mul_long(sx, m.c), mul_long(sy, m.d))
+                moved = true
+
+        if !moved
+            val (q, rem) = divmod_mag(x, y)
+
+            nx = y
+            ny = rem
+            nsx = sy
+            nsy = sub(sx, mul(normalized(false, q), sy))
+
+        if cmp_mag(nx, ny) < 0
+            x = ny
+            y = nx
+            sx = nsy
+            sy = nsx
+        else
+            x = nx
+            y = ny
+            sx = nsx
+            sy = nsy
+
+    (x, sx)
+end gcd_cofactor
 
 /** The smallest non-negative value both divide: `lcm(4, 6)` is `12`.
  *
