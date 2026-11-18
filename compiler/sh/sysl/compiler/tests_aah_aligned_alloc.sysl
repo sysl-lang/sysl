@@ -7,15 +7,16 @@ import sysl.process.capture
 import sysl.text.Search
 import sysl.testing.skip
 
-// **The aligned hook: a box or a buffer of a type aligned beyond what the allocating pair promises.**
+// **A box or a buffer of a type aligned beyond what `malloc` promises.**
 //
-// The pair promises two words -- sixteen bytes on a 64-bit machine (`target.sysl`'s
-// `heap_boundary`) -- so storage of a type asking for more is taken from
-// `sysl_alloc_aligned(size, align)` and handed back through the pair's own free, its payload laid
-// after the header on the boundary (`emit_box.sysl`'s `heap_call`, `emit_arc.sysl`'s `box_pad`). On a
-// POSIX host with libc's pair a `weak` default over `posix_memalign` answers it; anywhere else the
-// program does, and one that makes such storage without answering it is refused when it is compiled
-// (`emit_checks.sysl`'s `check_aligned_heap`). Found by the keel kernel (FINDINGS 20): a box of an
+// `malloc` promises two words -- sixteen bytes on a 64-bit machine (`target.sysl`'s
+// `heap_boundary`). Under libc's pair, storage of a type asking for more is taken from
+// `sysl.heap.alloc_aligned(size, align)` and given back through `sysl.heap.free_aligned(p)`, written
+// over `posix_memalign` (or `_aligned_malloc` on Windows); its payload is laid after the header on
+// the boundary (`emit_box.sysl`'s `heap_take`, `emit_arc.sysl`'s `box_pad`). A pair a manifest names
+// is handed every block's boundary itself, `alloc(size, align)` and `free(p, size, align)`, so it
+// needs nothing more; under libc's pair on a machine with no C library the program is refused
+// (`tests_lic_libc_capability.sysl`). Found by the keel kernel (FINDINGS 20): a box of an
 // `@align(4096)` struct landed at an address 88 past a page.
 
 private aah_page() -> string = "@align(4096)\nstruct Page\n    e: [512]u64\n\n"
@@ -34,15 +35,15 @@ aah_a_hosted_box_lands_on_the_boundary()
 
     // The header's three words and the run of bytes that puts the payload on the page.
     assert(enm_says(ir, "%arc.Page = type { i64, ptr, i64, [4072 x i8], %struct.Page }"), ir)
-    assert(enm_says(ir, "@sysl_alloc_aligned(i64 %"), ir)
+    assert(enm_says(ir, "@sysl.heap.alloc_aligned(i64 %"), ir)
     assert(enm_says(ir, ", i64 4096)"), ir)
-    assert(enm_says(ir, "define weak ptr @sysl_alloc_aligned("), ir)
+    assert(enm_says(ir, "define weak ptr @sysl.heap.alloc_aligned("), ir)
     assert(enm_says(ir, "call i32 @posix_memalign("), ir)
     assert(enm_says(ir, "ptr align 4096"), ir)
 
-    // Its drop hook gives the block back through the aligned pair's free, `free` by default.
-    assert(enm_says(ir, "define weak void @sysl_free_aligned(ptr %p)"), ir)
-    assert(enm_says(ir, "call void @sysl_free_aligned(ptr %p)"), ir)
+    // Its drop hook gives the block back through the aligned free, `free` underneath.
+    assert(enm_says(ir, "define weak void @sysl.heap.free_aligned(ptr %p)"), ir)
+    assert(enm_says(ir, "call void @sysl.heap.free_aligned(ptr %p)"), ir)
     assert_eq(enm_ran(src), "0 9 9\n")
 
 @test("a task holding an @align(4096) local across a suspension finds it on its boundary resumed")
@@ -54,13 +55,17 @@ aah_a_task_frame_lands_on_the_boundary()
         "    int(at) * 1000 + int(t.e[1]) * 10 + int(t.e[2])\n\nprint(block_on(hold(6)))\n"
     val ir = enm_ir(src)
 
-    // The frame comes from the aligned pair, at the page, and goes back through its free.
-    assert(enm_says(ir, "@sysl_alloc_aligned(i64 %"), ir)
+    // The frame goes to the task hooks told its boundary, whose default hands a page to the aligned
+    // allocation and gives it back the same way.
+    assert(enm_says(ir, "call ptr @sysl_task_alloc(i64 %"), ir)
     assert(enm_says(ir, ", i64 4096)"), ir)
-    assert(enm_says(ir, "call void @sysl_free_aligned(ptr %"), ir)
+    assert(enm_says(ir, "call void @sysl_task_free(ptr %"), ir)
+    assert(enm_says(ir, "define weak ptr @sysl_task_alloc(i64 %size, i64 %align)"), ir)
+    assert(enm_says(ir, "call ptr @sysl.heap.alloc_aligned(i64 %size, i64 %align)"), ir)
+    assert(enm_says(ir, "call void @sysl.heap.free_aligned(ptr %p)"), ir)
     assert_eq(enm_ran(src), "67\n")
 
-@test("a task holding nothing over-aligned takes its frame from sysl_task_alloc as before")
+@test("a task holding nothing over-aligned asks sysl_task_alloc on the word's boundary")
 aah_an_ordinary_task_frame_is_unchanged()
     if !enm_ready() then return
 
@@ -68,7 +73,8 @@ aah_an_ordinary_task_frame_is_unchanged()
     val ir = enm_ir(src)
 
     assert(enm_says(ir, "call ptr @sysl_task_alloc("), ir)
-    assert(!enm_says(ir, "sysl_alloc_aligned"), ir)
+    assert(enm_says(ir, ", i64 8)"), ir)
+    assert(!enm_says(ir, ", i64 4096)"), ir)
     assert_eq(enm_ran(src), "42\n")
 
 // -- Windows, read off the text -----------------------------------------------------------------------
@@ -85,18 +91,18 @@ private aah_lowered_for(text: string, target_name: string) -> string
     ir_print_module(codegen_with_gaps(p, t, check_escapes(done.an, p)).0)
 end aah_lowered_for
 
-@test("on Windows the aligned pair defaults to _aligned_malloc and _aligned_free")
+@test("on Windows the aligned allocation is _aligned_malloc and _aligned_free")
 aah_windows_defaults_to_aligned_malloc()
     val ir = aah_lowered_for(aah_page() + "keep(n: u64) -> u64\n    var t: Page\n    t.e[1] = n\n" +
         "    val b: &Page = t\n    b.e[1]\n", "x86_64-windows")
 
-    assert(ir.contains("define weak ptr @sysl_alloc_aligned(i64 %size, i64 %align)"), ir)
+    assert(ir.contains("define weak ptr @sysl.heap.alloc_aligned(i64 %size, i64 %align)"), ir)
     assert(ir.contains("call ptr @_aligned_malloc(i64 %size, i64 %align)"), ir)
     assert(ir.contains("declare ptr @_aligned_malloc(i64, i64)"), ir)
-    assert(ir.contains("define weak void @sysl_free_aligned(ptr %p)"), ir)
+    assert(ir.contains("define weak void @sysl.heap.free_aligned(ptr %p)"), ir)
     assert(ir.contains("call void @_aligned_free(ptr %p)"), ir)
     assert(ir.contains("declare void @_aligned_free(ptr)"), ir)
-    assert(ir.contains("call void @sysl_free_aligned(ptr %p)"), ir)
+    assert(ir.contains("call void @sysl.heap.free_aligned(ptr %p)"), ir)
     assert(!ir.contains("posix_memalign"), ir)
     assert(unaligned_heap().is_none(), "Windows was refused")
 
@@ -112,7 +118,7 @@ aah_a_hosted_buffer_lands_on_the_boundary()
     assert(enm_says(ir, "%arc.buf.Page = type { i64, ptr, i64, i64, [4064 x i8], [0 x %struct.Page] }"), ir)
     assert_eq(enm_ran(src), "0 0 4 3\n")
 
-@test("a box of a type at the pair's boundary takes the pair, its payload still on its boundary")
+@test("a box of a type at malloc's boundary takes malloc, its payload still on its boundary")
 aah_a_type_at_the_threshold_takes_the_pair()
     if !enm_ready() then return
 
@@ -124,11 +130,11 @@ aah_a_type_at_the_threshold_takes_the_pair()
     // but sixteen is what malloc promises.
     assert(enm_says(ir, "%arc.Line = type { i64, [8 x i8], %struct.Line }"), ir)
     assert(enm_says(ir, "call ptr @malloc("), ir)
-    assert(!enm_says(ir, "sysl_alloc_aligned"), ir)
+    assert(!enm_says(ir, "sysl.heap.alloc_aligned"), ir)
     assert(!enm_says(ir, "posix_memalign"), ir)
     assert_eq(enm_ran(src), "0 7\n")
 
-@test("a program boxing nothing over-aligned names neither the hook nor its default")
+@test("a program boxing nothing over-aligned names no aligned allocation")
 aah_an_ordinary_box_is_unchanged()
     if !enm_ready() then return
 
@@ -136,7 +142,8 @@ aah_an_ordinary_box_is_unchanged()
     val ir = enm_ir(src)
 
     assert(enm_says(ir, "%arc.P = type { i64, %struct.P }"), ir)
-    assert(!enm_says(ir, "sysl_alloc_aligned"), ir)
+    assert(!enm_says(ir, "sysl.heap.alloc_aligned"), ir)
+    assert(!enm_says(ir, "sysl.heap.free_aligned"), ir)
     assert_eq(enm_ran(src), "3\n")
 
 @test("a raised boundary behind the full header of a weakened box is padded past all three words")
@@ -153,16 +160,18 @@ aah_a_weakened_box_pads_past_the_full_header()
 
 // -- a pair the manifest named -----------------------------------------------------------------------
 
-// A hosted project whose heap is its own pair, over libc's.
+// A hosted project whose heap is its own pair, over libc's aligned allocation.
 private aah_own_pair() -> string =
     "package { name = \"own\", version = \"0.0.1\" }\nallocator {\n  alloc = \"own_alloc\"\n" +
     "  free  = \"own_free\"\n}\n"
 
 private aah_pair_runtime() -> string =
-    "extern \"malloc\" c_malloc(n: usize) -> *u8\nextern \"free\" c_free(p: *u8)\n" +
+    "extern \"free\" c_free(p: *u8)\n" +
     "extern \"posix_memalign\" c_memalign(out: **u8, align: usize, n: usize) -> int\n\n" +
-    "@export(\"own_alloc\")\nown_alloc(n: usize) -> *u8 = c_malloc(n)\n\n" +
-    "@export(\"own_free\")\nown_free(p: *u8) = c_free(p)\n\n"
+    "@export(\"own_alloc\")\nown_alloc(n: usize, a: usize) -> *u8\n" +
+    "    var p: *u8 = null\n    if c_memalign(&p, if a < 16 then 16 else a, n) != 0 then return null\n" +
+    "    p\n\n" +
+    "@export(\"own_free\")\nown_free(p: *u8, n: usize, a: usize) = c_free(p)\n\n"
 
 private aah_project(program: string) -> string =
     lbr_tree(lbr_two("main.sysl", program, "package.hocon", aah_own_pair()))
@@ -189,7 +198,7 @@ private aah_ran_ending(p: string) -> (string, bool)
     ran
 end aah_ran_ending
 
-@test("a manifest-named pair still boxes an ordinary type through itself")
+@test("a manifest-named pair boxes an ordinary type through itself, told its size and boundary")
 aah_a_named_pair_still_works()
     if !lbr_ready() then return
 
@@ -197,8 +206,11 @@ aah_a_named_pair_still_works()
         "struct P\n    x: u64\n\nmain()\n    val b: &P = P(41)\n    print(b.x + 1)\n")
     val ir = lbr_text(p, [])
 
-    assert(ir.contains("call ptr @own_alloc("), ir)
-    assert(!ir.contains("sysl_alloc_aligned"), ir)
+    assert(ir.contains("call ptr @own_alloc(i64 %"), ir)
+    assert(ir.contains("call void @own_free(ptr %p, i64 %"), ir)
+    assert(ir.contains(", i64 8)"), ir)
+    assert(!ir.contains("sysl.heap.alloc_aligned"), ir)
+    assert(!ir.contains("arc.drop.plain"), ir)
     assert_eq(aah_ran(p), "42\n")
     lbr_drop([p])
 
@@ -206,8 +218,8 @@ aah_a_named_pair_still_works()
 aah_a_failed_box_allocation_traps()
     if !lbr_ready() then return
 
-    val refusing = "@export(\"own_alloc\")\nown_alloc(n: usize) -> *u8 = null\n\n" +
-        "@export(\"own_free\")\nown_free(p: *u8) = ()\n\n"
+    val refusing = "@export(\"own_alloc\")\nown_alloc(n: usize, a: usize) -> *u8 = null\n\n" +
+        "@export(\"own_free\")\nown_free(p: *u8, n: usize, a: usize) = ()\n\n"
     val p = aah_project(refusing +
         "struct P\n    x: u64\n\nmain()\n    print(\"before\")\n    val b: &P = P(41)\n    print(b.x + 1)\n")
     val ir = lbr_text(p, [])
@@ -223,39 +235,55 @@ aah_a_failed_box_allocation_traps()
     assert(!ran.1, "the program ended by exiting zero instead of trapping: " + said)
     lbr_drop([p])
 
-@test("a manifest-named pair with an over-aligned box and no aligned hook is refused")
-aah_a_named_pair_needs_the_hook()
+@test("a manifest-named pair is handed an over-aligned box's boundary and needs nothing more")
+aah_a_named_pair_takes_the_boundary()
     if !lbr_ready() then return
 
     val p = aah_project(aah_pair_runtime() + aah_page() +
-        "main()\n    var t: Page\n    val b: &Page = t\n    print(b.e[0])\n")
-    val said = aah_ran(p)
-
-    assert(said.starts_with("refused: "), said)
-    assert(said.contains("a box of 'Page' asks for the 4096-byte boundary its type is aligned on, and " +
-        "the allocating pair ('own_alloc' and 'own_free') promises only 16 — the program named a heap " +
-        "of its own, so nothing but the program can say how that heap answers a boundary. Define " +
-        "'sysl_alloc_aligned(size: usize, align: usize) -> *u8' and 'sysl_free_aligned(p: *u8)' with " +
-        "'@export', the first answering a block on that boundary and the second giving one back"), said)
-    lbr_drop([p])
-
-@test("a manifest-named pair answering the aligned pair boxes on the boundary through it")
-aah_a_named_pair_answering_the_hook()
-    if !lbr_ready() then return
-
-    val hook = "@export(\"sysl_alloc_aligned\")\nown_aligned(n: usize, a: usize) -> *u8\n" +
-        "    var p: *u8 = null\n    if c_memalign(&p, a, n) != 0 then return null\n    p\n\n" +
-        "@export(\"sysl_free_aligned\")\nown_free_aligned(p: *u8) = c_free(p)\n\n"
-    val p = aah_project(aah_pair_runtime() + hook + aah_page() +
         "main()\n    var t: Page\n    t.e[2] = 5\n    val b: &Page = t\n" +
         "    print(usize(&*b) % 4096, b.e[2])\n")
     val ir = lbr_text(p, [])
 
-    assert(ir.contains("define ptr @sysl_alloc_aligned("), ir)
-    assert(ir.contains("define void @sysl_free_aligned("), ir)
-    assert(!ir.contains("define weak ptr @sysl_alloc_aligned("), ir)
-    assert(!ir.contains("define weak void @sysl_free_aligned("), ir)
+    assert(ir.contains(", i64 4096)"), ir)
+    assert(ir.contains("call void @own_free(ptr %p, i64 %"), ir)
+    assert(!ir.contains("sysl.heap.alloc_aligned"), ir)
     assert_eq(aah_ran(p), "0 5\n")
+    lbr_drop([p])
+
+@test("a manifest-named pair written in the old one-word shapes is refused at its definitions")
+aah_an_old_shaped_pair_is_refused()
+    if !lbr_ready() then return
+
+    val old = "extern \"malloc\" c_malloc(n: usize) -> *u8\nextern \"free\" c_free(p: *u8)\n\n" +
+        "@export(\"own_alloc\")\nown_alloc(n: usize) -> *u8 = c_malloc(n)\n\n" +
+        "@export(\"own_free\")\nown_free(p: *u8) = c_free(p)\n\n"
+    val p = aah_project(old + "struct P\n    x: u64\n\nmain()\n    val b: &P = P(41)\n    print(b.x + 1)\n")
+    val said = aah_ran(p)
+
+    assert(said.starts_with("refused: "), said)
+    assert(said.contains("'own_alloc' is exported as 'own_alloc', the half of the program's heap taking " +
+        "every block, which is called as 'alloc(size: usize, align: usize) -> *u8' — answering a block " +
+        "of 'size' bytes on 'align'. This one takes 1 parameter"), said)
+    assert(said.contains("'own_free' is exported as 'own_free', the half of the program's heap giving " +
+        "back every block, which is called as 'free(p: *u8, size: usize, align: usize)' — told the size " +
+        "and boundary the block was taken with. This one takes 1 parameter"), said)
+    lbr_drop([p])
+
+@test("a free half taking the size but not the boundary is refused too")
+aah_a_free_without_the_boundary_is_refused()
+    if !lbr_ready() then return
+
+    val half = "extern \"free\" c_free(p: *u8)\n" +
+        "extern \"posix_memalign\" c_memalign(out: **u8, align: usize, n: usize) -> int\n\n" +
+        "@export(\"own_alloc\")\nown_alloc(n: usize, a: usize) -> *u8\n" +
+        "    var p: *u8 = null\n    if c_memalign(&p, 16, n) != 0 then return null\n    p\n\n" +
+        "@export(\"own_free\")\nown_free(p: *u8, n: usize) = c_free(p)\n\n"
+    val p = aah_project(half + "main()\n    val s = \"a\" + \"b\"\n    print(s)\n")
+    val said = aah_ran(p)
+
+    assert(said.starts_with("refused: "), said)
+    assert(said.contains("This one takes 2 parameters"), said)
+    assert(!said.contains("'own_alloc' is exported"), said)
     lbr_drop([p])
 
 // -- a freestanding image ----------------------------------------------------------------------------
@@ -283,10 +311,10 @@ private val aah_runtime: string = raw"""
             ()
 
     @export("img_alloc")
-    img_alloc(n: usize) -> *u8 = null
+    img_alloc(n: usize, a: usize) -> *u8 = null
 
     @export("img_free")
-    img_free(p: *u8) = ()
+    img_free(p: *u8, n: usize, a: usize) = ()
 
     @export("memset")
     mem_set(dst: *u8, c: int, n: usize) -> *u8
@@ -323,14 +351,6 @@ private aah_run(aligned: bool) -> string = (if aligned then "@align(4096)\n" els
 
         int(b.e[1])
     end run
-    """
-
-private val aah_hook: string = raw"""
-    @export("sysl_alloc_aligned")
-    img_alloc_aligned(n: usize, a: usize) -> *u8 = null
-
-    @export("sysl_free_aligned")
-    img_free_aligned(p: *u8) = ()
     """
 
 // A task holding a page-aligned local across a suspension, driven from the image.
@@ -376,61 +396,49 @@ private aah_link_ready() -> bool
     true
 end aah_link_ready
 
-@test("a freestanding program boxing an over-aligned type with no aligned hook is refused")
-aah_freestanding_without_the_hook_is_refused()
-    if !lbr_ready() then return
+// The image's symbols, as llvm-nm lists them.
+private aah_listing(out: string) -> string = capture(aah_nm, [s"$out/img.elf"], "", [], true) match
+    Ok(o) -> o.text
+    Err(_) -> "llvm-nm could not be run"
+
+@test("a freestanding image's own pair is handed a page-aligned box's boundary, and the image links")
+aah_freestanding_pair_takes_the_boundary()
+    if !aah_link_ready() then return
 
     val p = aah_image(aah_runtime + aah_run(true))
     val (said, out) = aah_build(p)
 
-    assert(said.0 != 0, "built with the aligned hook unanswered")
-    assert(said.1.contains("a box of 'Page' asks for the 4096-byte boundary its type is aligned on, " +
-        "and the allocating pair ('img_alloc' and 'img_free') promises only 16 — " +
-        s"'$aah_target' has no C library with an aligned allocation to answer it. Define " +
-        "'sysl_alloc_aligned(size: usize, align: usize) -> *u8' and 'sysl_free_aligned(p: *u8)' with " +
-        "'@export'"), said.1)
+    assert(said.0 == 0, said.1)
 
-    // It is told before the link, so no linker names a symbol.
-    assert(!said.1.contains("undefined symbol"), said.1)
+    val listing = aah_listing(out)
+
+    assert(listing.contains(" T img_alloc"), listing)
+    assert(!listing.contains("posix_memalign"), listing)
+    assert(!listing.contains("sysl.heap"), listing)
+
+    val ir = lbr_cli(["sysl", "emit-llvm", "--target", aah_target, p])
+
+    assert(ir.1.contains("@img_alloc(i64 %"), ir.1)
+    assert(ir.1.contains(", i64 4096)"), ir.1)
     lbr_drop([p, out])
 
-@test("a freestanding task holding an over-aligned local with no aligned pair is refused")
-aah_freestanding_task_without_the_hook_is_refused()
-    if !lbr_ready() then return
+@test("a freestanding task holding a page-aligned local hands its frame's boundary to the image's pair")
+aah_freestanding_task_frame_takes_the_boundary()
+    if !aah_link_ready() then return
 
     val p = aah_image(aah_runtime + aah_async_run)
     val (said, out) = aah_build(p)
 
-    assert(said.0 != 0, "built with the aligned pair unanswered")
-    assert(said.1.contains("asks for the 4096-byte boundary a value it holds is aligned on, and the " +
-        "allocating pair ('img_alloc' and 'img_free') promises only 16"), said.1)
-    assert(said.1.contains("the frame of the task '"), said.1)
-    lbr_drop([p, out])
-
-@test("a freestanding program answering the aligned hook links, and its box calls the hook")
-aah_freestanding_with_the_hook_links()
-    if !aah_link_ready() then return
-
-    val p = aah_image(aah_runtime + aah_run(true) + aah_hook)
-    val (said, out) = aah_build(p)
-
     assert(said.0 == 0, said.1)
-
-    val listing = capture(aah_nm, [s"$out/img.elf"], "", [], true) match
-        Ok(o) -> o.text
-        Err(_) -> "llvm-nm could not be run"
-
-    assert(listing.contains(" T sysl_alloc_aligned"), listing)
-    assert(listing.contains(" T sysl_free_aligned"), listing)
-    assert(!listing.contains("posix_memalign"), listing)
 
     val ir = lbr_cli(["sysl", "emit-llvm", "--target", aah_target, p])
 
-    assert(ir.1.contains("@sysl_alloc_aligned(i64 %"), ir.1)
-    assert(ir.1.contains(", i64 4096)"), ir.1)
+    assert(ir.1.contains("call ptr @sysl_task_alloc(i64 %"), ir.1)
+    assert(ir.1.contains("call ptr @img_alloc(i64 %size, i64 %align)"), ir.1)
+    assert(ir.1.contains("call void @img_free(ptr %p, i64 %size, i64 %align)"), ir.1)
     lbr_drop([p, out])
 
-@test("a freestanding program supplying only the pair, boxing nothing over-aligned, is unchanged")
+@test("a freestanding image boxing nothing over-aligned names no aligned allocation")
 aah_freestanding_without_over_aligned_storage_is_unchanged()
     if !aah_link_ready() then return
 
@@ -439,9 +447,8 @@ aah_freestanding_without_over_aligned_storage_is_unchanged()
 
     assert(said.0 == 0, said.1)
 
-    val listing = capture(aah_nm, [s"$out/img.elf"], "", [], true) match
-        Ok(o) -> o.text
-        Err(_) -> "llvm-nm could not be run"
+    val listing = aah_listing(out)
 
-    assert(!listing.contains("sysl_alloc_aligned"), listing)
+    assert(!listing.contains("sysl.heap"), listing)
+    assert(!listing.contains("posix_memalign"), listing)
     lbr_drop([p, out])

@@ -327,7 +327,12 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
     request_task_storage(e, p)
 
     // And where a block on a boundary beyond the pair's comes from (`emit_box.sysl`).
-    request_aligned_heap(e, p)
+    request_aligned_heap(e)
+
+    made = drain_helpers(e, made, built_helpers, gaps)
+
+    // Asked again, since a hook just built may be the module's only call giving such a block back.
+    request_aligned_heap(e)
 
     made = drain_helpers(e, made, built_helpers, gaps)
 
@@ -456,13 +461,13 @@ private drain_helpers(e: *Emit, from: usize, built_helpers: Buf[IrRuntime], gaps
 
         what match
             HrText(llvm) ->
-                if text_allocates(llvm, malloc_symbol()) then plain_drop_fn(e)
+                if !heap_sized() && text_allocates(llvm, malloc_symbol()) then plain_drop_fn(e)
 
                 built_helpers.push(RtTemplate(name, llvm))
             _ ->
                 gen_helper(e, what, name) match
                     Some(built) ->
-                        if allocates(built, malloc_symbol()) then plain_drop_fn(e)
+                        if !heap_sized() && allocates(built, malloc_symbol()) then plain_drop_fn(e)
 
                         built_helpers.push(RtEmitted(built))
                     None -> gaps.push((name, gap_text(e)))
@@ -972,22 +977,32 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
     // name a pair the program writes itself with `@export` (a kernel's heap, an application's own
     // arena), and a `declare` beside that `define` is `invalid redefinition of function`. A pair a
     // prebuilt module or the C beside a package supplies is still declared, for the linker to find.
+    //
+    // **A pair told sizes is declared with them** (`heap_sized`): `alloc(size, align)` and
+    // `free(p, size, align)`.
     if e.heap && !defines_alloc_count(e)
         if !emits_export(p, malloc_symbol())
             var alloc_params: Buf[IrParam] = buf()
 
             alloc_params.push(ir_param(word_lty(e)))
+
+            if heap_sized() then alloc_params.push(ir_param(word_lty(e)))
+
             out.push(declared_sig(e, malloc_symbol(), ir_fn_type(LPtr, alloc_params)))
 
         if !emits_export(p, free_symbol())
             var free_params: Buf[IrParam] = buf()
 
             free_params.push(ir_param(LPtr))
+
+            if heap_sized()
+                free_params.push(ir_param(word_lty(e)))
+                free_params.push(ir_param(word_lty(e)))
+
             out.push(declared_sig(e, free_symbol(), ir_fn_type(LVoid, free_params)))
 
-    // The zeroing half, on the same terms: `calloc(count, size)`, or the counting runtime's twin of it
-    // where that runtime is defined elsewhere.
-    if e.uses_calloc && !defines_alloc_count(e)
+    // The zeroing half, on the same terms: libc's `calloc(count, size)`.
+    if e.uses_calloc
         val zeroing = calloc_symbol().unwrap_or("calloc")
 
         if !emits_export(p, zeroing)
@@ -997,16 +1012,15 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
             zero_params.push(ir_param(word_lty(e)))
             out.push(declared_sig(e, zeroing, ir_fn_type(LPtr, zero_params)))
 
-    // The aligned pair, on the same terms -- and not where this module writes its default or the
-    // counting runtime defines it.
-    if aligned_hook_declared(e, p, aligned_alloc_symbol())
+    // The aligned pair, where this module calls it and does not write it.
+    if aligned_hook_declared(e, aligned_alloc_symbol())
         var aligned_params: Buf[IrParam] = buf()
 
         aligned_params.push(ir_param(word_lty(e)))
         aligned_params.push(ir_param(word_lty(e)))
         out.push(declared_sig(e, aligned_alloc_symbol(), ir_fn_type(LPtr, aligned_params)))
 
-    if aligned_hook_declared(e, p, aligned_free_symbol())
+    if aligned_hook_declared(e, aligned_free_symbol())
         var aligned_free_params: Buf[IrParam] = buf()
 
         aligned_free_params.push(ir_param(LPtr))
@@ -1131,7 +1145,7 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
 
     if e.uses_calloc then seen.push(calloc_symbol().unwrap_or("calloc"))
 
-    if !e.aligned_heap.is_empty()
+    if aligned_heap_used(e)
         seen.push(aligned_alloc_symbol())
         seen.push(aligned_free_symbol())
 
@@ -1212,11 +1226,10 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
     out
 end declares
 
-// Whether one half of the aligned pair is declared here: something asked for it, and it is not this
-// module's own `@export`, the default written beside it, or the counting runtime's.
-private aligned_hook_declared(e: *Emit, p: TProgram, sym: string) -> bool =
-    !e.aligned_heap.is_empty() && !defines_alloc_count(e) && !emits_export(p, sym) &&
-        !e.requested_set.has(sym)
+// Whether one half of the aligned pair is declared here: something called it, and the default is not
+// written beside it -- which only a machine with no C library leaves unwritten, where the build is
+// refused, and the module is still whole for `emit-llvm` to print.
+private aligned_hook_declared(e: *Emit, sym: string) -> bool = aligned_heap_used(e) && !e.requested_set.has(sym)
 
 // A whole module as LLVM text, which is what `emit-llvm` prints.
 codegen_text(p: TProgram, t: Target) -> string = ir_print_module(codegen_module(p, t))

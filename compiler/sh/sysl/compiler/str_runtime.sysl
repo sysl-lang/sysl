@@ -14,23 +14,40 @@ import sysl.math.bigint.{BigInt, from_int, pow, sub as big_sub, to_string}
 // **Every block below is a function of the machine's word**, because a string's length is a `usize`
 // and these are the only places where a length is written as text rather than emitted from a type.
 
-// The three header words every `StrBuf` starts with -- a strong count of one, the hook that gives
-// the bytes back and does nothing else, and a share count of one. The header's own layout is
-// `%arc.header`, and its size is taken from that type rather than written down, so a target that
-// lays it out differently needs nothing changed here.
+// **A `StrBuf` is a `[]u8` buffer** (`emit_box.sysl`'s `gen_buffer`): the three header words -- a
+// strong count of one, the hook, a share count of one -- then the byte count, then the bytes. `%n` is
+// the count and `%size` the whole block; the header's own layout is `%arc.header`, and its size is
+// taken from that type rather than written down, so a target that lays it out differently needs
+// nothing changed here.
 //
-// **The hook cannot be null.** The free is the hook's, so a null one would mean a `StrBuf` whose
-// bytes are never given back; `arc.drop.plain` is exactly the hook for a payload that holds nothing,
-// and a module whose helpers reach the allocator is given one.
-private str_buf_header(word: string) -> string
+// **The hook is a byte buffer's** (`drop_buf_fn`), which reads the count back to give the block
+// back with its size where the pair is told sizes, and is the plain hook where it is not. It cannot
+// be null: the free is the hook's, so a null one would mean a `StrBuf` whose bytes are never given
+// back.
+private str_buf_header(e: *Emit, n: string) -> string
+    val word = s"i${e.word_bits}"
+    val hook = drop_buf_fn(e, byte_type()) match
+        VGlobal(name) -> name
+        _ -> "arc.drop.plain"
+
+    heap_take_text(e, "%p", "%size", e.layout.pointer_bytes()) +
     s"""
-      %p = call ptr @${malloc_symbol()}($word %size)
       store $word 1, ptr %p
       %hook = getelementptr %arc.header, ptr %p, i32 0, i32 1
-      store ptr @arc.drop.plain, ptr %hook
+      store ptr @$hook, ptr %hook
       %share = getelementptr %arc.header, ptr %p, i32 0, i32 2
       store $word 1, ptr %share
-      %bytes = getelementptr %arc.header, ptr %p, i32 1
+      %count = getelementptr %arc.header, ptr %p, i32 1
+      store $word $n, ptr %count
+      %bytes = getelementptr $word, ptr %count, i32 1
+    """
+end str_buf_header
+
+// The bytes in front of a `StrBuf`'s first byte: its header and the count.
+private str_buf_lead(word: string) -> string
+    s"""
+      %hend = getelementptr { %arc.header, $word }, ptr null, i32 1
+      %hsize = ptrtoint ptr %hend to $word
     """
 
 // Writing bytes out. `putchar` is declared here rather than beside `printf` because a module that
@@ -235,15 +252,15 @@ str_search_text(word: string, str: string) -> string
 // The two halves are copied in a byte at a time, and the returned view names the buffer as its
 // owner, the first payload byte as its start, and the summed length. UTF-8 is closed under
 // concatenation, so the validity invariant needs no re-checking.
-str_concat_text(word: string, str: string) -> string
+str_concat_text(e: *Emit, str: string) -> string
+    val word = s"i${e.word_bits}"
+
     s"""
     define private $str @sysl.str.concat(ptr %ap, $word %an, ptr %bp, $word %bn) {
     entry:
       %total = add $word %an, %bn
-      %hend = getelementptr %arc.header, ptr null, i32 1
-      %hsize = ptrtoint ptr %hend to $word
-      %size = add $word %hsize, %total
-    ${str_buf_header(word)}  br label %acond
+    ${str_buf_lead(word)}  %size = add $word %hsize, %total
+    ${str_buf_header(e, "%total")}  br label %acond
     acond:
       %i = phi $word [ 0, %entry ], [ %inext, %abody ]
       %amore = icmp ult $word %i, %an
@@ -277,14 +294,14 @@ str_concat_text(word: string, str: string) -> string
 
 // Copies a run of bytes into a fresh owning string. Every `str(x)` that renders into a scratch
 // buffer finishes through here, so the allocation and the copy live in one place.
-str_from_bytes_text(word: string, str: string) -> string
+str_from_bytes_text(e: *Emit, str: string) -> string
+    val word = s"i${e.word_bits}"
+
     s"""
     define private $str @sysl.str.from_bytes(ptr %src, $word %n) {
     entry:
-      %hend = getelementptr %arc.header, ptr null, i32 1
-      %hsize = ptrtoint ptr %hend to $word
-      %size = add $word %hsize, %n
-    ${str_buf_header(word)}  br label %cond
+    ${str_buf_lead(word)}  %size = add $word %hsize, %n
+    ${str_buf_header(e, "%n")}  br label %cond
     cond:
       %i = phi $word [ 0, %entry ], [ %next, %body ]
       %more = icmp ult $word %i, %n

@@ -4790,10 +4790,10 @@ The boundary travels with every value of the type the compiler lays down: a modu
 a `static`, a local, an element of an array, a field of another struct — which begins on the
 boundary and raises its holder's to match — and the payload of an enum variant carrying one.
 **A value on the heap keeps it too.** A box (`&T`), a buffer or a task's frame takes its storage
-from the allocating pair, which promises only what `malloc` does — two words, sixteen bytes on a
-64-bit machine and eight on a 32-bit one — so storage of a type aligned beyond that comes from the
-aligned pair, `sysl_alloc_aligned(size, align)` and `sysl_free_aligned(p)`, and the payload is laid
-after the box's header on the boundary:
+on the type's boundary, and the payload is laid after the box's header on it. A heap the manifest
+names is handed the boundary with every block; under libc's pair, whose `malloc` promises only two
+words — sixteen bytes on a 64-bit machine and eight on a 32-bit one — storage of a type aligned
+beyond that comes from the C library's aligned allocation:
 
 ```sysl
 @align(4096)
@@ -4813,9 +4813,9 @@ print(usize(&*b) % 4096, b.e[3])
 ```
 
 Every access through an address of the type claims its whole boundary. With libc's `malloc` and
-`free` on a POSIX system, WASI or Windows the aligned pair needs nothing from the program; anywhere
-else the program answers it,
-as [`packages.md` § A type aligned beyond what the pair promises](/reference/packages/#a-type-aligned-beyond-what-the-pair-promises)
+`free` on a POSIX system, WASI or Windows this needs nothing from the program; on a machine with no
+C library the program names a heap of its own,
+as [`packages.md` § A type aligned beyond what `malloc` promises](/reference/packages/#a-type-aligned-beyond-what-malloc-promises)
 says.
 
 **The bound is folded rather than lexed**, so a program writes the name it already has for the number,

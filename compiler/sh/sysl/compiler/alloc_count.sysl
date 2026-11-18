@@ -43,12 +43,11 @@ force_alloc_counting(on: bool)
 alloc_counting_asked() -> bool =
     alloc_counting_forced || env_var("SYSL_COUNT_ALLOCS").unwrap_or("") == "1"
 
-// The pair a counted build allocates through.
+// The pair a counted build allocates through. It is a pair told sizes (`emit_arc.sysl`'s
+// `heap_sized`), so it is also the check that **every block goes back with the size and boundary it
+// was taken with**: each block carries the two in front of it, and a free that names others says
+// both and stops the program.
 counted_allocator() -> (string, string) = ("sysl_count_alloc", "sysl_count_free")
-
-// The zeroing call of a counted build (`emit_arc.sysl`'s `calloc_symbol`), counted as the pair's
-// allocation is and given back through the same `sysl_count_free`.
-counted_calloc_symbol() -> string = "sysl_count_calloc"
 
 // Whether the pair this compilation settled on is the counting one.
 alloc_counting_active() -> bool = malloc_symbol() == counted_allocator().0
@@ -60,78 +59,72 @@ alloc_count_said() -> string = "counted allocations still live at exit"
 //
 // The counter is atomic because a program may allocate from several threads. The report is
 // registered first thing in `main`, so every `atexit` the program registers later runs before it.
+//
+// **Each block is laid `lead` bytes into what `posix_memalign` answered**, `lead` being its boundary or
+// sixteen, whichever is more -- so the block keeps its boundary -- and the two words just in front of
+// it hold the size and the boundary it was taken with.
 alloc_count_text(word: string) -> string
     val said = s"sysl: %lld ${alloc_count_said()}"
+    val wrong = s"sysl: ${alloc_count_mismatch_said()}"
 
     s"""
     @sysl.count.live = internal global i64 0
     @sysl.count.base = internal global i64 0
     @sysl.count.said = private constant [${said.bytes.len + 2} x i8] c"$said\\0A\\00"
+    @sysl.count.wrong = private constant [${wrong.bytes.len + 2} x i8] c"$wrong\\0A\\00"
 
-    declare ptr @malloc($word)
-    declare ptr @calloc($word, $word)
     declare void @free(ptr)
     declare i32 @dprintf(i32, ptr, ...)
     declare i32 @atexit(ptr)
     declare i32 @posix_memalign(ptr, $word, $word)
+    declare void @abort()
 
-    define ptr @${counted_aligned_symbol()}($word %n, $word %a) {
+    define ptr @sysl_count_alloc($word %n, $word %a) {
     entry:
+      %wide = icmp ugt $word %a, 16
+      %lead = select i1 %wide, $word %a, $word 16
+      %whole = add $word %n, %lead
       %slot = alloca ptr
-      %r = call i32 @posix_memalign(ptr %slot, $word %a, $word %n)
+      %r = call i32 @posix_memalign(ptr %slot, $word %lead, $word %whole)
       %got = icmp eq i32 %r, 0
       br i1 %got, label %count, label %none
     count:
       %was = atomicrmw add ptr @sysl.count.live, i64 1 monotonic
-      %p = load ptr, ptr %slot
+      %base = load ptr, ptr %slot
+      %p = getelementptr i8, ptr %base, $word %lead
+      %ap = getelementptr $word, ptr %p, i32 -1
+      %np = getelementptr $word, ptr %p, i32 -2
+      store $word %n, ptr %np
+      store $word %a, ptr %ap
       ret ptr %p
     none:
       ret ptr null
     }
 
-    define void @${counted_aligned_free_symbol()}(ptr %p) {
+    define void @sysl_count_free(ptr %p, $word %n, $word %a) {
     entry:
       %none = icmp eq ptr %p, null
-      br i1 %none, label %done, label %count
+      br i1 %none, label %done, label %check
+    check:
+      %ap = getelementptr $word, ptr %p, i32 -1
+      %np = getelementptr $word, ptr %p, i32 -2
+      %took_n = load $word, ptr %np
+      %took_a = load $word, ptr %ap
+      %same_n = icmp eq $word %took_n, %n
+      %same_a = icmp eq $word %took_a, %a
+      %same = and i1 %same_n, %same_a
+      br i1 %same, label %count, label %wrong
+    wrong:
+    ${count_widen(word, "%wn", "%n")}${count_widen(word, "%wa", "%a")}${count_widen(word, "%tn", "%took_n")}${count_widen(word, "%ta", "%took_a")}  %w = call i32 (i32, ptr, ...) @dprintf(i32 2, ptr @sysl.count.wrong, i64 %wn, i64 %wa, i64 %tn, i64 %ta)
+      call void @abort()
+      unreachable
     count:
       %was = atomicrmw sub ptr @sysl.count.live, i64 1 monotonic
-      call void @free(ptr %p)
-      br label %done
-    done:
-      ret void
-    }
-
-    define ptr @sysl_count_alloc($word %n) {
-    entry:
-      %p = call ptr @malloc($word %n)
-      %got = icmp ne ptr %p, null
-      br i1 %got, label %count, label %done
-    count:
-      %was = atomicrmw add ptr @sysl.count.live, i64 1 monotonic
-      br label %done
-    done:
-      ret ptr %p
-    }
-
-    define ptr @${counted_calloc_symbol()}($word %k, $word %n) {
-    entry:
-      %p = call ptr @calloc($word %k, $word %n)
-      %got = icmp ne ptr %p, null
-      br i1 %got, label %count, label %done
-    count:
-      %was = atomicrmw add ptr @sysl.count.live, i64 1 monotonic
-      br label %done
-    done:
-      ret ptr %p
-    }
-
-    define void @sysl_count_free(ptr %p) {
-    entry:
-      %none = icmp eq ptr %p, null
-      br i1 %none, label %done, label %count
-    count:
-      %was = atomicrmw sub ptr @sysl.count.live, i64 1 monotonic
-      call void @free(ptr %p)
+      %wide = icmp ugt $word %a, 16
+      %lead = select i1 %wide, $word %a, $word 16
+      %back = sub $word 0, %lead
+      %base = getelementptr i8, ptr %p, $word %back
+      call void @free(ptr %base)
       br label %done
     done:
       ret void
@@ -161,6 +154,15 @@ alloc_count_text(word: string) -> string
     """
 end alloc_count_text
 
+// A word as the `i64` the report's `%lld` reads, into `dest`.
+private count_widen(word: string, dest: string, v: string) -> string =
+    if word == "i64" then s"  $dest = add i64 $v, 0\n" else s"  $dest = zext $word $v to i64\n"
+
+// What a counted program says when a block goes back with another size or boundary than it was taken
+// with -- the two it was given back with, then the two it was taken with -- before it stops.
+alloc_count_mismatch_said() -> string =
+    "a block given back as %lld bytes on %lld was taken as %lld bytes on %lld"
+
 // The mark, emitted once module storage is filled, and the runtime it calls into.
 gen_alloc_count_mark(e: *Emit)
     if !alloc_counting_active() then return
@@ -175,8 +177,7 @@ defines_alloc_count(e: *Emit) -> bool = e.requested_set.has("sysl.count")
 
 // The symbols the counting runtime states.
 alloc_count_symbols() -> []const string =
-    [counted_allocator().0, counted_allocator().1, counted_aligned_symbol(), counted_aligned_free_symbol(), counted_calloc_symbol(), "malloc", "calloc", "free", "dprintf",
-     "atexit", "posix_memalign"]
+    [counted_allocator().0, counted_allocator().1, "free", "dprintf", "atexit", "posix_memalign", "abort"]
 
 // What a counted program said about its heap: the net count it reported, or zero where it said
 // nothing. Read off its standard error.
