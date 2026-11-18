@@ -1,0 +1,106 @@
+module sh.sysl.compiler
+
+import sysl.buf.Buf
+
+// `@no_fuse`: a body whose multiplies are never fused with the adds they feed
+// (`reference/attributes.md § @no_fuse`).
+//
+// **Contraction is on by default** (`fp_contract.sysl`): `a * b + c` written as one expression is one
+// fused multiply-add wherever the target has the unit, rounded once. `@no_fuse` turns that off -- C's
+// `-ffp-contract=off` -- for what it marks: above a function or a member, that body; in a file's
+// header -- which every file of the module repeats, as it repeats its capabilities -- every body of the
+// module. There the product is an `fmul` and the sum an `fadd`, each rounded, with no `contract` flag
+// and no `llvm.fma` or `llvm.fmuladd` -- so the back end cannot fuse them either, at any `-O`.
+//
+// **It holds wherever the body's arithmetic is worked out, and nowhere else:**
+//
+// - **A closure or a nested function written inside** is inside: its arithmetic is the marked
+//   body's text (`Analyzer.no_fuse`, carried into the reading of each).
+// - **Every instantiation of a marked generic, and every lowered copy of a marked member**, carry the
+//   mark (`FuncMarks.no_fuse`), and a generic written in a `@no_fuse` module is that module's
+//   wherever it is instantiated -- its body is read in the definition's terms.
+// - **Inlined, the body stays unfused**: no operation in it carries a flag that licenses fusing, so
+//   the optimizer has nothing to contract once it is inside a caller that fuses. The caller's own
+//   operations around it are fused as they always are.
+// - **An arithmetic operator marked `@no_fuse` is never read as its body** at a call
+//   (`fp_operators.sysl`): it stays a call. A `@no_fuse` body reads no operator call as its body
+//   either, since the reading exists only to let a product reach a sum.
+// - **The compiler's own arithmetic agrees.** A `const`, a fold and a `const` function's run compute
+//   a marked body's `a * b + c` with two roundings, as the machine will (`fold_machine_in`,
+//   `const_eval.sysl`'s `ev_fusing`), so a value is the same whoever worked it out.
+// - **A module's storage** is computed under the module's header: an initializer in a `@no_fuse`
+//   module rounds twice, laid down as data or filled at startup (`TVal.no_fuse`).
+//
+// **It composes with the other two float annotations.** `@strict_fp` keeps each operation where it is
+// written and makes it follow the environment, and a strict body that is also `@no_fuse` is its
+// strict `fmul` and `fadd` -- never a strict `fma`. `@reassociate` lets sums be regrouped and licenses
+// no contraction of its own, so a `@no_fuse` body under it, or a `@reassociate` block inside one,
+// regroups with every product still rounded on its own.
+
+// The annotation's word, in a file's header and above a declaration.
+const NoFuseWord: string = "no_fuse"
+
+// The refusal for `@no_fuse` above anything that has no body of sysl.
+no_fuse_not_a_body() -> string =
+    "'@no_fuse' says how a body's multiplies and adds are compiled, so it marks a function or a " +
+    "method, whose body is sysl, or — in the file's header — the whole module, and this is none of " +
+    "them. An 'extern''s operations are compiled by whoever compiled it"
+
+// Every module one of whose files says `@no_fuse` in its header.
+note_no_fuse_modules(a: &Analysis, units: Buf[Program])
+    for u in units
+        if u.no_fuse then a.tables.no_fuse_modules.add(module_of_unit(u))
+end note_no_fuse_modules
+
+// **Every file of a `@no_fuse` module says so**, as every file of a `@no_alloc` one does: a reader
+// opening any of them sees how its arithmetic is compiled. A file that does not is refused at its
+// header. Only the files that ship are held to it -- a `@tests` file is scaffolding -- and the
+// library's own were held to it when it was built.
+check_no_fuse_agreement(a: &Analysis, units: Buf[Program])
+    for u in units
+        val name = module_of_unit(u)
+
+        if u.no_fuse || u.test_only || !a.tables.no_fuse_modules.has(name) then continue
+
+        val scope = scope_of_unit(a, u)
+
+        if from_library(a, scope) then continue
+
+        val at = u.module_name match
+            Some(m) -> m.span
+            None -> span_zero()
+
+        val whose = if name == ModuleRoot then "the program's root module" else s"'$name'"
+
+        a.fault(scope, at, s"another file of $whose says '@no_fuse' in its header, and ${u.src.name} " +
+                "does not — how a module's multiplies and adds are compiled is a property of the " +
+                "module, so every one of its files states it")
+end check_no_fuse_agreement
+
+// Whether a module's header says `@no_fuse`.
+no_fuse_in(a: &Analysis, scope: Scope) -> bool = a.tables.no_fuse_modules.has(scope.module_name)
+
+// Whether what is being read keeps its multiplies apart: the body says so, or its module does.
+no_fuse_here(cx: &Analyzer) -> bool = cx.no_fuse || no_fuse_in(cx.an, cx.scope)
+
+// The marks a body's typed function carries: its declaration's, with `no_fuse` set where the body
+// inherits it -- from the body it is written in, or from its module.
+body_marks(cx: &Analyzer, marks: FuncMarks) -> FuncMarks
+    var out = marks
+
+    out.no_fuse = marks.no_fuse || no_fuse_here(cx)
+    out
+end body_marks
+
+// The widths a multiply-add is fused at: the target's, or none where contraction is off.
+fusing_for(t: Target, off: bool) -> Fusing = if off then Fusing(false, false) else fusing_of(t)
+
+// The machine a fold computes for, in the body being read.
+fold_machine_in(cx: &Analyzer) -> FoldMachine
+    val t = cx.an.tables
+
+    FoldMachine(t.layout.little_endian, fusing_for(t.target, no_fuse_here(cx)))
+end fold_machine_in
+
+// The widths the body being lowered fuses at.
+fusing_here(e: *Emit) -> Fusing = fusing_for(e.target, e.fuse_off)

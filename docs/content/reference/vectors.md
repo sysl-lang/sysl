@@ -61,6 +61,13 @@ print(zero[0], ones[3], half(ones)[0])
 
 **A declaration with no initializer** starts every lane at the lane type's zero.
 
+**A module vector over constants is constant data**, as an array literal is: a literal, a splat, the
+operators, a shuffle, a `select`, a conversion and a vector worked out from another such `val` are
+computed while compiling and laid into the object file, alone or inside a struct, an array or an enum's
+payload. So a package holding a table of weights builds for a freestanding target, where nothing runs
+before `main` to fill storage in. One that reads a module `var`, or calls `abs` or `mul_add`, is
+computed when the program starts, and a freestanding build refuses it, saying which.
+
 **A lane is read by a constant index.** This is the one subscript in sysl that is not checked at run
 time: a vector has no address, and an out-of-range lane read has no defined result at the machine
 level. The index must therefore be a literal or a `const`, and it is checked at compile time:
@@ -775,6 +782,48 @@ wraps at the lane width, exactly as scalar integer arithmetic does.
 [`min_num` and `max_num`](/library/math/#rounding-sign-and-the-rest) do: a NaN lane loses to any
 number, and only a vector of nothing but NaNs reduces to one. Where a NaN must not be lost,
 [`maximum()` and `minimum()`](#nan-propagating-maximum-and-minimum) are the reductions that keep it.
+
+### The integer dot product
+
+**`a.dot(b)` multiplies two integer vectors lane by lane and adds the products into an integer wider
+than the lanes.** The accumulator is 32 bits for 8- and 16-bit lanes, 64 bits for 32-bit lanes, and
+the lane's own width for wider ones (nothing is wider to widen into), and it has the lanes'
+signedness: `<16>i8` answers an `i32`, `<16>u8` a `u32`. It is `(wide(a) * wide(b)).sum()` with the
+lanes widened first, which is the shape AArch64's `sdot`/`udot` (the dot-product extension) and x86's
+`vpdpbusd`/`vpdpwssd` compute, so LLVM selects them where the target has them. Where it does not, the
+same expression is a widening multiply and a pairwise add; the answer is the same on every target.
+
+```sysl
+val a: <16>i8 = [127; 16]
+val b: <4>i16 = [-32768; 4]
+
+val big: i32 = a.dot(a)
+val wrapped: i32 = b.dot(b)
+
+print(big, wrapped)
+```
+
+```output
+258064 0
+```
+
+**Overflow.** A product of two widened lanes always fits the accumulator, so only the sum can
+overflow, and it **wraps** at the accumulator's width in every build, as an integer `sum()` does:
+four `i16` lanes of `-32768` give `2^32`, which is `0` in an `i32`. It never traps. A float vector's
+dot product is still `(a * b).sum()`.
+
+**Both vectors must be one type.** A mixed-signedness product (`<16>i8` with `<16>u8`), two lengths, a
+scalar, a float, fixed-point or mask lane, or the wrong number of arguments is refused:
+
+```sysl
+val a: <16>i8 = [1; 16]
+val b: <16>u8 = [1; 16]
+val r = a.dot(b)
+```
+
+```error
+'dot' multiplies vectors of one type, and the receiver is <16>i8 where the argument is <16>byte
+```
 
 ## Magnitude, and a fused multiply-add
 

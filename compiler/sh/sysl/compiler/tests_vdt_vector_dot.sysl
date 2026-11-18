@@ -1,0 +1,316 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.text.{replace_all, split}
+
+// **`a.dot(b)` is the integer dot product, accumulated in a wider integer** (`vectors.sysl`'s
+// `vector_dot`): `i8` and `i16` lanes into 32 bits, `i32` into 64, a 64-bit lane into itself, with
+// the signedness of the lanes. The product cannot overflow its accumulator, the sum wraps at the
+// accumulator's width, and both operands must be one integer vector type.
+//
+// The cells: every lane width that has a wider accumulator (8, 16, 32) and the one that has none
+// (64), signed and unsigned, an odd width (`u12`) and an odd lane count, values that would overflow
+// the lane (so a lane-width sum would be wrong), values that overflow the accumulator (wrap), the
+// result's type, and the refusals (float, mask, fixed-point, mixed signedness, scalar, wrong arity,
+// different width). The instructions are read off the IR and, on an AArch64 host, the disassembly.
+
+private vdt_ran(text: string) -> string = enm_ran(text)
+
+private vdt_says(text: string, want: string)
+    val said = enm_err(text)
+
+    assert(said.contains(want), s"expected it to say: $want\nit said: $said")
+
+@test("signed bytes accumulate in an i32, past what an i8 could hold")
+vdt_i8()
+    if !enm_ready() then return
+
+    assert_eq(vdt_ran(raw"""
+        val a: <16>i8 = [127; 16]
+        val b: <16>i8 = [127; 16]
+        val c: <16>i8 = [-128; 16]
+        val r: i32 = a.dot(b)
+        val s: i32 = c.dot(c)
+        val t: i32 = a.dot(c)
+        print(r, s, t)
+        """), "258064 262144 -260096\n")
+
+@test("unsigned bytes accumulate in a u32")
+vdt_u8()
+    if !enm_ready() then return
+
+    assert_eq(vdt_ran(raw"""
+        val a: <16>u8 = [255; 16]
+        val r: u32 = a.dot(a)
+        print(r)
+        """), "1040400\n")
+
+@test("a dot product is the sum of the lane products, in order of lanes not of reading")
+vdt_values()
+    if !enm_ready() then return
+
+    assert_eq(vdt_ran(raw"""
+        val a: <8>i8 = [1, 2, 3, 4, 5, 6, 7, 8]
+        val b: <8>i8 = [8, 7, 6, 5, 4, 3, 2, -1]
+        val r: i32 = a.dot(b)
+        print(r)
+        """), "104\n")
+
+@test("an odd lane count")
+vdt_odd_count()
+    if !enm_ready() then return
+
+    assert_eq(vdt_ran(raw"""
+        val a: <3>i8 = [1, 2, 3]
+        val b: <3>i8 = [4, 5, 6]
+        val r: i32 = a.dot(b)
+        print(r)
+        """), "32\n")
+
+@test("a single lane")
+vdt_one_lane()
+    if !enm_ready() then return
+
+    assert_eq(vdt_ran(raw"""
+        val a: <1>i8 = [-7]
+        val b: <1>i8 = [9]
+        val r: i32 = a.dot(b)
+        print(r)
+        """), "-63\n")
+
+@test("sixteen-bit lanes accumulate in 32 bits and the sum wraps there")
+vdt_i16()
+    if !enm_ready() then return
+
+    assert_eq(vdt_ran(raw"""
+        val a: <4>i16 = [-32768; 4]
+        val b: <2>i16 = [-32768; 2]
+        val c: <4>i16 = [1000, -2000, 3000, 4000]
+        val z: i32 = a.dot(a)
+        val w: i32 = b.dot(b)
+        val r: i32 = c.dot(c)
+        print(z, w, r)
+        """), "0 -2147483648 30000000\n")
+
+@test("unsigned sixteen-bit lanes")
+vdt_u16()
+    if !enm_ready() then return
+
+    assert_eq(vdt_ran(raw"""
+        val a: <2>u16 = [65535; 2]
+        val r: u32 = a.dot(a)
+        print(r)
+        """), "4294705154\n")
+
+@test("thirty-two-bit lanes accumulate in 64 bits and wrap there")
+vdt_i32()
+    if !enm_ready() then return
+
+    assert_eq(vdt_ran(raw"""
+        val a: <4>i32 = [2147483647; 4]
+        val b: <2>i32 = [2147483647, -2147483648]
+        val r: i64 = a.dot(a)
+        val s: i64 = b.dot(b)
+        print(r, s)
+        """), "-17179869180 9223372032559808513\n")
+
+@test("unsigned thirty-two-bit lanes")
+vdt_u32()
+    if !enm_ready() then return
+
+    assert_eq(vdt_ran(raw"""
+        val a: <2>u32 = [4294967295; 2]
+        val r: u64 = a.dot(a)
+        print(r)
+        """), "18446744056529682434\n")
+
+@test("sixty-four-bit lanes have no wider accumulator and wrap at 64 bits")
+vdt_i64()
+    if !enm_ready() then return
+
+    assert_eq(vdt_ran(raw"""
+        val a: <2>i64 = [3, 4]
+        val b: <2>i64 = [5, 6]
+        val c: <2>i64 = [4611686018427387904; 2]
+        val d: <2>i64 = [2; 2]
+        val r: i64 = a.dot(b)
+        val s: i64 = c.dot(d)
+        print(r, s)
+        """), "39 0\n")
+
+@test("a lane of an odd width")
+vdt_u12()
+    if !enm_ready() then return
+
+    assert_eq(vdt_ran(raw"""
+        val a: <4>u12 = [4095; 4]
+        val r: u32 = a.dot(a)
+        print(r)
+        """), "67076100\n")
+
+@test("the argument may be a computed vector, and the result feeds arithmetic")
+vdt_composes()
+    if !enm_ready() then return
+
+    assert_eq(vdt_ran(raw"""
+        val a: <4>i8 = [1, 2, 3, 4]
+        var acc: i32 = 100
+        for i in 0..<3
+            acc += a.dot(a + a)
+        print(acc)
+        """), "280\n")
+
+@test("a dot product in a debug build does not trap where it wraps")
+vdt_wrap_is_not_a_trap()
+    if !enm_ready() then return
+
+    assert_eq(vdt_ran(raw"""
+        val a: <2>i16 = [-32768; 2]
+        val r: i32 = a.dot(a)
+        print(r)
+        """), "-2147483648\n")
+
+// -- refusals --------------------------------------------------------------------------------------
+
+@test("a float vector is refused and pointed at the product and sum")
+vdt_float()
+    if !enm_ready() then return
+
+    vdt_says("val a: <4>f32 = [1.0; 4]\nval r = a.dot(a)\n",
+             "'dot' multiplies and adds integer lanes into a wider integer, and <4>f32 is not one — " +
+                 "a float vector's dot product is '(a * b).sum()'")
+
+@test("a mask is refused")
+vdt_mask()
+    if !enm_ready() then return
+
+    vdt_says("val a: <4>i32 = [1; 4]\nval m = a < a\nval r = m.dot(m)\n",
+             "'dot' multiplies and adds integer lanes into a wider integer, and <4>bool is not one")
+
+@test("a fixed-point vector is refused")
+vdt_fixed()
+    if !enm_ready() then return
+
+    vdt_says("val a: <4>q15 = [0.5; 4]\nval r = a.dot(a)\n",
+             "'dot' multiplies and adds integer lanes into a wider integer")
+
+@test("mixed signedness is refused, naming both types")
+vdt_mixed()
+    if !enm_ready() then return
+
+    vdt_says("val a: <16>i8 = [1; 16]\nval b: <16>u8 = [1; 16]\nval r = a.dot(b)\n",
+             "'dot' multiplies vectors of one type, and the receiver is <16>i8 where the argument is <16>byte")
+
+@test("a different lane count is refused")
+vdt_widths()
+    if !enm_ready() then return
+
+    vdt_says("val a: <16>i8 = [1; 16]\nval b: <8>i8 = [1; 8]\nval r = a.dot(b)\n",
+             "'dot' multiplies vectors of one type, and the receiver is <16>i8 where the argument is <8>i8")
+
+@test("a scalar argument is refused")
+vdt_scalar()
+    if !enm_ready() then return
+
+    vdt_says("val a: <16>i8 = [1; 16]\nval r = a.dot(2)\n",
+             "'dot' multiplies vectors of one type")
+
+@test("the wrong number of arguments is refused")
+vdt_arity()
+    if !enm_ready() then return
+
+    vdt_says("val a: <4>i8 = [1; 4]\nval r = a.dot()\n",
+             "'dot' takes the vector to multiply by — 'a.dot(b)', and 0 arguments were given")
+    vdt_says("val a: <4>i8 = [1; 4]\nval r = a.dot(a, a)\n",
+             "'dot' takes the vector to multiply by — 'a.dot(b)', and 2 arguments were given")
+
+@test("the result is not narrowed silently")
+vdt_result_type()
+    if !enm_ready() then return
+
+    vdt_says("val a: <16>i8 = [1; 16]\nval r: i8 = a.dot(a)\n", "declared i8 but the value is int")
+
+// One function's emitted text, whatever suffix the module's naming gives its symbol.
+private vdt_body(ir: string, name: string) -> string
+    val lines = split(ir, "\n")
+    var out = ""
+    var inside = false
+
+    for i in 0..<lines.len
+        val line = lines[i]
+        val names = line.contains("@" + name + "(") || line.contains("@" + name + "$") ||
+            line.contains("$" + name + "(") || line.contains("$" + name + "$")
+
+        if !inside && line.starts_with("define ") && names then inside = true
+
+        if inside
+            if line == "}" then return out
+
+            out = out + line + "\n"
+    end for
+
+    s"no definition of '$name' in:\n$ir"
+end vdt_body
+
+private vdt_ir_for(machine: string, text: string) -> string
+    val root = replace_all(make_temp_dir("sysl-vdt").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val out = emit_llvm_text(s"$root/main.sysl", Some(machine)) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end vdt_ir_for
+
+// -- the instructions ------------------------------------------------------------------------------
+
+private vdt_kernel() -> string = raw"""
+dot16(a: <16>i8, b: <16>i8) -> i32 = a.dot(b)
+
+udot16(a: <16>u8, b: <16>u8) -> u32 = a.dot(b)
+
+main()
+    val a: <16>i8 = [3; 16]
+    val u: <16>u8 = [3; 16]
+    print(dot16(a, a), udot16(u, u))
+"""
+
+private vdt_exported() -> string = raw"""
+@export("sdot16")
+sdot16(a: *<16>i8, b: *<16>i8) -> i32 = (*a).dot(*b)
+@export("udot16")
+udot16(a: *<16>u8, b: *<16>u8) -> u32 = (*a).dot(*b)
+
+print(1)
+"""
+
+@test("the IR widens, multiplies and adds: the shape the dot-product instructions are selected from")
+vdt_ir()
+    if !enm_ready() then return
+
+    val ir = vdt_ir_for("aarch64-macos", vdt_kernel())
+    val body = vdt_body(ir, "dot16")
+
+    assert(body.contains("sext <16 x i8>"), body)
+    assert(body.contains("<16 x i32>"), body)
+    assert(body.contains("mul <16 x i32>"), body)
+    assert(body.contains("llvm.vector.reduce.add"), body)
+    assert(vdt_body(ir, "udot16").contains("zext <16 x i8>"), ir)
+
+@test("on AArch64 a sixteen-byte dot product is sdot and udot where the CPU has them")
+vdt_aarch64_code()
+    if !enm_ready() then return
+
+    val code = vdt_host(vdt_exported())
+
+    if code.is_none() then return
+
+    assert(code.unwrap().contains("sdot"), code.unwrap())
+    assert(code.unwrap().contains("udot"), code.unwrap())
+
+private vdt_host(program: string) -> Option[string] = vmo_host_code(program)
