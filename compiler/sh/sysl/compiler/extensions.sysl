@@ -1,0 +1,455 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+
+// `@extensions("crc", "aes")`: a function compiled for processor extensions the build does not
+// promise (`reference/attributes.md § @extensions`), and `@unchecked("crc")`, the block that may
+// call one.
+//
+// **The function is compiled for them, and nothing else is.** Its `define` line carries LLVM's
+// `"target-features"`: the processor's own list, the build's (`codegen_features.sysl`), then the
+// function's -- so the back end may select the extension's instructions in that body, an `asm` block
+// there may name them, and an intrinsic it calls is one the back end can select. Every closure and
+// nested function written inside is compiled the same way: it can only be reached by running the
+// body that made it, which the processor has already been shown to manage.
+//
+// **A call is the promise, so a call is what is checked.** On a processor without the extension the
+// body's first such instruction faults, so a call is accepted only where the code making it is known
+// to run on a processor that has every extension the callee names: code compiled for them itself (a
+// function marked with them, or written inside one), code the build promises them to everywhere
+// (`codegen.extensions`, the row's processor -- the M1 for `aarch64-macos` -- or `--cpu`), or code
+// inside an `@unchecked("...")` block naming them, which is the program's word that it has asked the
+// processor first. That is Rust's rule for a `#[target_feature]` function, an `unsafe` call outside a
+// function with the features, said in the word sysl's unchecked tier already uses. The block checks
+// nothing at run time -- how a program asks the processor is the system's (`getauxval`, `sysctl`,
+// `cpuid`) -- and it relaxes nothing else: a subscript inside it is bounds-checked as anywhere.
+// Taking the function's address is held to the same rule, since a call through the address names no
+// callee to check, and a function marked so may not fill a trait's table, which a call through an
+// object reaches with no callee named either.
+//
+// **Inlining follows the features**, which is LLVM's rule and clang's: such a body is put inside a
+// caller whose features hold its own, and is a call from every other. So `@inline` is the hint it
+// always was, and `@inline(always)` beside it is refused -- a promise the back end would break at
+// every call from code without the extension.
+//
+// **Only where a function's features add to its processor's**: aarch64 and x86_64. On Thumb the list
+// carries the unit `-mfpu` named, and on RISC-V the extensions the triple names, and LLVM replaces a
+// build's list with a function's rather than merging them -- so there the manifest's
+// `codegen.extensions` is the way to say it, for the whole build.
+
+// The form `@unchecked("crc")` and its block are parsed into: a call no program can spell, its first
+// argument the block and the rest the names, as string literals.
+const ExtensionsBlock: string = "unchecked extensions block"
+
+// -- parsing ------------------------------------------------------------------------------------------
+
+// Whether the `k`th token ahead is a string literal.
+at_string(p: *Parser, k: usize) -> bool = p.peek_at(k) match
+    StrLit(_) -> true
+    _ -> false
+
+// `("crc", "aes")` after `@extensions` or `@unchecked`: one extension per string, each written alone.
+parse_extension_names(p: *Parser, word: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    if !p.accept_kw("(") || !at_string(p, 0)
+        p.fault(p.here(), extension_list_refusal(word))
+        skip_line(p)
+        return out
+    end if
+
+    loop
+        val at = p.here()
+
+        p.peek() match
+            StrLit(v) ->
+                p.bump()
+
+                val why = extension_name_refusal(word, v)
+
+                if why != "" then p.fault(at, why)
+                else if holds_string(out, v) then p.fault(at, s"'@$word' names '$v' twice, and it says nothing the once does not")
+                else out.push(v)
+            _ ->
+                p.fault(at, extension_list_refusal(word))
+                skip_line(p)
+                return out
+
+        if !p.accept_kw(",") then break
+
+    p.expect_kw(")")
+    out
+end parse_extension_names
+
+private extension_list_refusal(word: string) -> string
+    if word == "unchecked"
+        return "'@unchecked(\"...\")' names the processor's extensions the block it marks is known to " +
+               "run with, as strings in parentheses — '@unchecked(\"crc\")'. It is the program's " +
+               "promise that it has asked the processor first, and it is what lets the block call a " +
+               "function marked '@extensions' with them"
+    end if
+
+    "'@extensions' names the processor's extensions a body is compiled to use, as strings in " +
+    "parentheses — '@extensions(\"crc\")', '@extensions(\"aes\", \"sha3\")', each as LLVM spells the " +
+    "feature. There is no empty form: a function that uses only what the build promises says so by " +
+    "not writing the annotation"
+end extension_list_refusal
+
+// Why one written name is not an extension's, or `""`.
+private extension_name_refusal(word: string, v: string) -> string
+    if v == "" then return s"'@$word' names an extension, and \"\" is not the name of one"
+
+    if v.starts_with("+") || v.starts_with("-")
+        return s"'@$word' names an extension as LLVM spells the feature, written alone — \"${v[1..<v.len]}\", " +
+               s"not \"$v\": every name is one the code may use, and nothing here takes one away"
+    end if
+
+    for b in v.bytes
+        if b == u8(',') || b == u8(' ')
+            return s"'@$word' takes one extension per string — write \"$v\" as separate strings, " +
+                   "'\"crc\", \"aes\"'"
+
+    ""
+end extension_name_refusal
+
+// `@unchecked("crc")` and the block indented under it. The `@` is the cursor.
+parse_extensions_block(p: *Parser, start: Span) -> Stmt
+    p.bump()
+    p.bump()
+
+    val names = parse_extension_names(p, "unchecked")
+
+    if !p.block_ahead()
+        p.fault(start, extensions_block_not_a_block())
+        skip_line(p)
+        return stmt(start.to(p.just_taken()), Bad)
+    end if
+
+    val body = parse_suite(p)
+    // The block's extent decides which calls it covers, so it runs to the end of its last statement
+    // -- the token taken last is the dedent, which carries no extent of its own.
+    val span = if body.is_empty() then start else start.to(body[body.len() - 1].span)
+    var args: Buf[Expr] = buf()
+
+    args.push(expr(span, Block(body)))
+
+    for name in names
+        args.push(expr(start, StrLit(name)))
+
+    stmt(span, ExprStmt(expr(span, Call(expr(start, Ident(ExtensionsBlock)), args))))
+end parse_extensions_block
+
+// Whether a call's head is the form an `@unchecked("...")` block was parsed into.
+is_extensions_block(head: Expr) -> bool = *head.kind match
+    Ident(n) -> n == ExtensionsBlock
+    _ -> false
+
+extensions_block_not_a_block() -> string =
+    "'@unchecked(\"...\")' with an extension's name marks a block: write it on a line of its own and " +
+    "indent the statements it covers under it — a call of a function marked '@extensions' with those " +
+    "names may be made there. A declaration is marked '@extensions' itself"
+
+// The refusal for `@extensions` above anything that has no body of sysl.
+extensions_not_a_body() -> string =
+    "'@extensions' says which of the processor's extensions a body is compiled to use, so it marks " +
+    "a function or a method, whose body is sysl — and this declares neither. An 'extern''s " +
+    "instructions are chosen by whoever compiled it"
+
+extensions_beside_always() -> string =
+    "'@inline(always)' puts the body in place of every call, and a body compiled for a processor's " +
+    "extensions is only ever put inside a caller that has them too — anywhere else the call stays a " +
+    "call, so the promise could not be kept. Write '@inline' for the hint, which a caller with the " +
+    "extensions takes"
+
+// -- reading ------------------------------------------------------------------------------------------
+
+// The block, read as a block written bare would be, and recorded by file, span and names.
+extensions_block_form(cx: &Analyzer, span: Span, args: Buf[Expr], expected: Option[Type]) -> TExpr
+    if args.len() < 2 then return cx.err(span, extensions_block_not_a_block())
+
+    var names: Buf[string] = buf()
+
+    for i in 1..<args.len()
+        *args[i].kind match
+            StrLit(v) -> names.push(v)
+            _ -> ()
+
+    cx.an.tables.ext_blocks.push(ExtBlock(cx.scope.src.name, args[0].span, names))
+    cx.tail_carry = cx.unit_tail
+    type_expr(cx, args[0], expected)
+end extensions_block_form
+
+// One `@unchecked("...")` block: the file it is in, its extent, and the extensions it promises.
+struct ExtBlock
+    file: string
+    span: Span
+    names: Buf[string]
+end ExtBlock
+
+// -- which bodies -----------------------------------------------------------------------------------
+
+// The extensions each function is compiled for, by key: its own `@extensions`, and those of every
+// marked function it is written inside -- a closure or a nested function, whose text is the marked
+// body's -- in the same file and strictly within its span. A function with none is absent.
+extension_sets(funcs: Buf[TFunc]) -> Map[string, Buf[string]]
+    var out: Map[string, Buf[string]] = map()
+    var marked: Buf[TFunc] = buf()
+
+    for f in funcs
+        if !f.marks.extensions.is_empty() then marked.push(f)
+
+    if marked.is_empty() then return out
+
+    for f in funcs
+        var names: Buf[string] = buf()
+
+        for n in f.marks.extensions
+            if !holds_string(names, n) then names.push(n)
+
+        if f.src.is_some()
+            for g in marked
+                if g.src.is_some() && g.src.unwrap().name == f.src.unwrap().name && strictly_encloses(g.span, f.span)
+                    for n in g.marks.extensions
+                        if !holds_string(names, n) then names.push(n)
+        end if
+
+        if !names.is_empty() then out.put(f.name, names)
+    end for
+
+    out
+end extension_sets
+
+private strictly_encloses(outer: Span, inner: Span) -> bool =
+    outer.start <= inner.start && inner.end <= outer.end &&
+        !(outer.start == inner.start && outer.end == inner.end)
+
+private within(outer: Span, inner: Span) -> bool = outer.start <= inner.start && inner.end <= outer.end
+
+// The extension a CRC-32C instruction's `extern` is compiled for, where `symbol` names one, or `""`.
+// It is held to the rule a marked function is: a call is accepted where the code making it has it.
+crc32c_extension(symbol: string) -> string
+    for name in llvm_crc32c_intrinsics()
+        if name == symbol then return if symbol.starts_with("llvm.aarch64.") then "crc" else "sse4.2"
+
+    ""
+end crc32c_extension
+
+// -- the check ----------------------------------------------------------------------------------------
+
+// What the check needs at each call: who needs what, and what the build already promises.
+private struct ExtCheck
+    t: Target
+    sets: Map[string, Buf[string]]
+    externs: Map[string, string]
+    blocks: Buf[ExtBlock]
+    promised: Map[string, bool]
+end ExtCheck
+
+// Every `@extensions` and `@unchecked("...")` this program wrote is held to the target and the back
+// end, and every call and address of a function compiled for extensions to the rule above.
+check_extensions(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable], externs: Buf[TExtern])
+    val sets = extension_sets(funcs)
+    var crc: Map[string, string] = map()
+
+    for x in externs
+        val ext = crc32c_extension(x.symbol)
+
+        if ext != "" then crc.put(x.name, ext)
+
+    val blocks = a.tables.ext_blocks
+
+    if sets.is_empty() && blocks.is_empty() && crc.is_empty() then return
+
+    val t = a.tables.target
+
+    if !refuse_unknown_extensions(a, funcs, blocks) then return
+
+    val cx: &ExtCheck = ExtCheck(t, sets, crc, blocks, map())
+    val an = a
+
+    for f in funcs
+        val scope = func_home(a, f.name)
+        val own = sets.get(f.name).unwrap_or(buf())
+
+        walk_block_stmts(f.body, expr_walk(false, e -> ext_use(an, cx, scope, f, own, e)))
+
+    for vt in vtables
+        for slot in vt.slots
+            if sets.has(slot.target)
+                val shown = qualified_name(a.tables.members.func_origin.get(slot.target).unwrap_or(slot.target))
+
+                a.fault(func_home(a, slot.target), span_of_func(funcs, slot.target),
+                        s"'$shown' is compiled for the processor's ${quoted_names(sets.get(slot.target).unwrap())} " +
+                        s"and fills a slot of '${vt.trait_name}''s table, and a call through a trait " +
+                        "object names no function, so it could not be checked for them — call it directly, " +
+                        "from a method that is not marked, inside '@unchecked(\"...\")' or a function with them")
+end check_extensions
+
+// Every name is the back end's and the machine is one whose functions' features add to its
+// processor's; false where something was refused, after which the calls are not looked at.
+private refuse_unknown_extensions(a: &Analysis, funcs: Buf[TFunc], blocks: Buf[ExtBlock]) -> bool
+    val t = a.tables.target
+    var written: Buf[(Scope, Span, string, string)] = buf()
+
+    for f in funcs
+        for n in f.marks.extensions
+            written.push((func_home(a, f.name), f.span, "'@extensions'", n))
+
+    for b in blocks
+        for n in b.names
+            written.push((block_scope(a, funcs, b), b.span, "'@unchecked'", n))
+
+    if written.is_empty() then return true
+
+    if t.cpu != Aarch64 && t.cpu != X86_64
+        val w = written[0]
+
+        a.fault(w.0, w.1, s"${w.2} is accepted on aarch64 and x86_64, where a function's extensions " +
+                s"add to its processor's, and this build is for '${t.name}' — whose functions' list " +
+                "would replace the one the build is compiled with. Name the extension for the whole " +
+                "build in sysl.hocon: 'codegen { extensions = [\"...\"] }'")
+        return false
+    end if
+
+    val clang = find_clang(t, named_cc()) match
+        Err(why) ->
+            a.fault(written[0].0, written[0].1, s"cannot check ${written[0].2}: $why")
+            return false
+        Ok(found) -> found
+
+    var ok = true
+
+    for w in written
+        extension_known_cached(t, clang, w.3) match
+            Err(why) ->
+                a.fault(w.0, w.1, why)
+                return false
+            Ok(known) ->
+                if !known
+                    a.fault(w.0, w.1, unknown_extension(w.2, t, w.3))
+                    ok = false
+
+    ok
+end refuse_unknown_extensions
+
+// The scope a block's refusal is reported in: the function written over it, or an empty one.
+private block_scope(a: &Analysis, funcs: Buf[TFunc], b: ExtBlock) -> Scope
+    for f in funcs
+        if f.src.is_some() && f.src.unwrap().name == b.file && within(f.span, b.span) then return func_home(a, f.name)
+
+    empty_scope()
+end block_scope
+
+private span_of_func(funcs: Buf[TFunc], name: string) -> Span
+    for f in funcs
+        if f.name == name then return f.span
+
+    span_zero()
+end span_of_func
+
+// One expression of `f`'s body: a call or an address of something compiled for extensions.
+private ext_use(a: &Analysis, cx: &ExtCheck, scope: Scope, f: TFunc, own: Buf[string], e: TExpr)
+    *e.kind match
+        TCall(name, _, _, _) -> ext_reach(a, cx, scope, f, own, e.span, name, false)
+        TFuncAddr(name, _, _) -> ext_reach(a, cx, scope, f, own, e.span, name, true)
+        _ -> ()
+end ext_use
+
+private ext_reach(a: &Analysis, cx: &ExtCheck, scope: Scope, f: TFunc, own: Buf[string], at: Span,
+                  name: string, address: bool)
+    var needs: Buf[string] = buf()
+
+    cx.sets.get(name) match
+        Some(ns) -> needs = ns
+        None ->
+            cx.externs.get(name) match
+                Some(ext) ->
+                    // A CRC-32C instruction the row promises is the build's (`#if crc32c`).
+                    if crc32c_instruction(cx.t) then return
+
+                    needs.push(ext)
+                None -> return
+
+    var missing: Buf[string] = buf()
+
+    for n in needs
+        if !holds_string(own, n) &&!block_covers(cx, f, at, n) && !promised(cx, n) then missing.push(n)
+
+    if missing.is_empty() then return
+
+    val shown = qualified_name(a.tables.members.func_origin.get(name).unwrap_or(name))
+    val what = if address then s"the address of '$shown' is taken" else s"'$shown' is called"
+    val list = quoted_strings(missing)
+
+    a.fault(scope, at, s"$what, and it is compiled for the processor's ${quoted_names(missing)}, which " +
+            s"'${cx.t.name}' does not promise and the code here is not compiled for — on a processor " +
+            s"without ${if missing.len() == 1 then "it" else "them"} its first such instruction faults. " +
+            s"Mark the caller '@extensions($list)', or make the call inside '@unchecked($list)' once " +
+            "the program has asked the processor")
+end ext_reach
+
+// Whether an `@unchecked("...")` block naming `n` holds the expression at `at` of `f`'s body.
+private block_covers(cx: &ExtCheck, f: TFunc, at: Span, n: string) -> bool
+    for b in cx.blocks
+        if !holds_string(b.names, n) then continue
+
+        val same_file = f.src match
+            Some(s) -> s.name == b.file
+            None -> true
+
+        if same_file && within(b.span, at) then return true
+    end for
+
+    false
+end block_covers
+
+// Whether the build promises `n` everywhere, asked once per name.
+private promised(cx: &ExtCheck, n: string) -> bool
+    cx.promised.get(n) match
+        Some(v) -> return v
+        None -> ()
+
+    val v = build_promises(cx.t, n)
+
+    cx.promised.put(n, v)
+    v
+end promised
+
+// `'crc' extension`, `'aes' and 'sha3' extensions`.
+private quoted_names(names: Buf[string]) -> string
+    var out = ""
+
+    for i in 0..<names.len()
+        if i > 0 then out = out + (if i == names.len() - 1 then " and " else ", ")
+
+        out = out + s"'${names[i]}'"
+
+    out + (if names.len() == 1 then " extension" else " extensions")
+end quoted_names
+
+// `"crc"`, `"aes", "sha3"` -- the names as an annotation writes them.
+private quoted_strings(names: Buf[string]) -> string
+    var out = ""
+
+    for i in 0..<names.len()
+        if i > 0 then out = out + ", "
+
+        out = out + s"\"${names[i]}\""
+
+    out
+end quoted_strings
+
+// -- lowering -----------------------------------------------------------------------------------------
+
+// The `"target-features"` a function's `define` line carries, where it is compiled for extensions.
+extension_attribute(e: *Emit, name: string) -> Option[(string, string)]
+    val names = e.ext_fns.get(name) match
+        Some(ns) -> ns
+        None -> return None
+
+    val baseline = processor_features(e.target).unwrap_or(buf())
+
+    Some(("target-features", function_feature_text(e.target, baseline, names)))
+end extension_attribute

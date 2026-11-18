@@ -3,7 +3,7 @@ module sh.sysl.compiler
 import sysl.buf.{Buf, buf}
 import sysl.process.{capture, run, Output, Status}
 import sysl.fs.{IoError, remove_file, write_text, is_file, is_dir, entries}
-import sysl.text.{join, split, repeat, str_builder, Search}
+import sysl.text.{join, split, repeat, str_builder, StrBuilder, Search}
 import sysl.env.{get as env_var}
 
 // **The C toolchain a build drives**: which clang, what it is handed, and what comes back.
@@ -530,32 +530,58 @@ sanitized(ir: string, attrs: Buf[string] = sanitizer_attrs(extra_cflags())) -> s
 
     var b = str_builder()
     var start: usize = 0
+    var own = false
 
     for i in 0..<ir.bytes.len
         if ir.bytes[i] == u8('\n')
-            b.push(marked_line(ir[start..<i]))
+            own = marked_line(&b, ir[start..<i]) || own
             b.push_char('\n')
             start = i + 1
 
-    if start < ir.bytes.len then b.push(marked_line(ir[start..<ir.bytes.len]))
+    if start < ir.bytes.len then own = marked_line(&b, ir[start..<ir.bytes.len]) || own
 
     b.push(s"\nattributes #99 = { ${join(attrs.view(), " ")} }\n")
+
+    // **A definition with a feature list of its own** (`@extensions`, `extensions.sysl`) takes the
+    // group without the build's list: LLVM lets a group's string attribute win over the same one
+    // written on the line, and the function's list already holds the build's.
+    if own
+        var rest: Buf[string] = buf()
+
+        for item in attrs
+            if !item.starts_with(FeaturesKey) then rest.push(item)
+
+        b.push(s"attributes #98 = { ${join(rest.view(), " ")} }\n")
+    end if
+
     b.finish()
 end sanitized
 
-// One line of a module, with a definition's attributes followed by the group.
+// The key a definition's own feature list is written under.
+private const FeaturesKey: string = "\"target-features\"="
+
+// One line of a module into `b`, with a definition's attributes followed by the group; whether it
+// was a definition carrying its own feature list, which takes the group without one (`#98`).
 //
 // **The group is a function attribute, so it goes where the attributes end, and that is before a
 // `section`** -- LLVM refuses `section "x" #99 {` with "expected '{' in function body". A definition
 // with no section takes it in front of its opening brace.
-private marked_line(line: string) -> string
-    if !line.starts_with("define ") || !line.ends_with(" {") then return line
+private marked_line(b: *StrBuilder, line: string) -> bool
+    if !line.starts_with("define ") || !line.ends_with(" {")
+        b.push(line)
+        return false
+    end if
 
     val at = last_section(line) match
         Some(i) -> i
         None -> line.bytes.len - 1
 
-    line[0..<at] + "#99 " + line[at..<line.bytes.len]
+    val own = line.contains(FeaturesKey)
+
+    b.push(line[0..<at])
+    b.push(if own then "#98 " else "#99 ")
+    b.push(line[at..<line.bytes.len])
+    own
 end marked_line
 
 // Where the ` section "` of a definition line begins, past its leading space, or nothing. The last
