@@ -16,6 +16,8 @@ module sh.sysl.compiler
 
 // A fiber scheduler of the smallest kind: `wait` switches back to whoever started the fiber.
 private fcr_head() -> string = raw"""
+    module sched
+
     import sysl.fiber.{Context, Stack, switch}
 
     struct Pair
@@ -34,7 +36,10 @@ private fcr_head() -> string = raw"""
 
     """
 
-private fcr_ir(body: string) -> string = xvr_ir([("main.sysl", fcr_head() + body)])
+// The scheduler is a module of its own, so its `pair` is module storage every body may reach rather
+// than the entry file's own.
+private fcr_ir(body: string) -> string = xvr_ir([("main.sysl", "import sched.*\nimport sysl.fiber.{Context, Stack, switch}\n\n" + body),
+                                               ("sched/sched.sysl", fcr_head())])
 
 private fcr_accepted(body: string)
     if xvr_no_library() then return
@@ -74,7 +79,7 @@ fcr_view_across_reacher()
             val bytes: []u8 = [1, 2, 3]
             wait()
             print(bytes.len)
-        """, "'bytes'", "wait")
+        """, "'bytes'", "sched.wait")
 
 @test("two calls down is still a reach")
 fcr_two_calls_down()
@@ -97,7 +102,7 @@ fcr_carrier_buffer_view()
             val room: []u8 = k.receiving[0..<want]
             wait()
             int(room.len)
-        """, "'room'", "wait")
+        """, "'room'", "sched.wait")
 
 @test("a counted value held across a call that cannot switch is accepted")
 fcr_call_that_cannot_switch()
@@ -157,7 +162,7 @@ fcr_plain_reference()
             val b: &Box = Box(1)
             wait()
             print(b.n)
-        """, "'b'", "wait")
+        """, "'b'", "sched.wait")
 
 @test("a scalar, a struct of scalars and a '*T' held across the call are accepted")
 fcr_scalars()
@@ -183,7 +188,7 @@ fcr_inside_a_loop()
                 val s = i.to_string()
                 wait()
                 print(s)
-        """, "'s'", "wait")
+        """, "'s'", "sched.wait")
 
 @test("a value declared before a loop is held across a call in the loop")
 fcr_before_a_loop()
@@ -195,7 +200,7 @@ fcr_before_a_loop()
                 wait()
                 i += 1
             print(s)
-        """, "'s'", "wait")
+        """, "'s'", "sched.wait")
 
 @test("a loop body whose value dies before the call is accepted")
 fcr_loop_value_dies_first()
@@ -217,7 +222,7 @@ fcr_closure_capture()
             val f = printer("x" + "y")
             wait()
             f()
-        """, "'f'", "wait")
+        """, "'f'", "sched.wait")
 
 @test("a closure's own body is asked as a function's is")
 fcr_closure_body()
@@ -229,7 +234,7 @@ fcr_closure_body()
                 val s = 1.to_string()
                 wait()
                 print(s))
-        """, "'s'", "wait")
+        """, "'s'", "sched.wait")
 
 @test("a counted temporary of the enclosing expression is held across a call in a later operand")
 fcr_temporary()
@@ -255,7 +260,7 @@ fcr_match_binding()
                     wait()
                     print(s)
                 None -> ()
-        """, "a binding this arm took a share of", "wait")
+        """, "a binding this arm took a share of", "sched.wait")
 
 @test("an arm whose variant carries nothing counted holds nothing of the value matched -- avin's receive loop")
 fcr_empty_variant_arm()
@@ -289,7 +294,7 @@ fcr_scalar_variant_arm()
             made(n) match
                 Err(code) -> print(code)
                 _ -> wait()
-        """, "a counted temporary the enclosing expression is still holding", "wait")
+        """, "a counted temporary the enclosing expression is still holding", "sched.wait")
 
 @test("a 'defer' holds nothing across a switch")
 fcr_defer()
@@ -309,7 +314,7 @@ fcr_member()
                 val s = self.n.to_string()
                 wait()
                 print(s)
-        """, "'s'", "wait")
+        """, "'s'", "sched.wait")
 
 @test("'@pinned(thread)' on a function accepts what it holds across the switch")
 fcr_pinned_function()
@@ -348,7 +353,7 @@ fcr_pinned_is_per_body()
             val s = 2.to_string()
             inner()
             print(s)
-        """, "'s'", "wait")
+        """, "'s'", "sched.wait")
 
 @test("'main' runs on the main thread's own stack and holds what it likes")
 fcr_main_is_pinned()
@@ -382,5 +387,4 @@ fcr_pinned_thread_on_struct()
             n: int
         """)
 
-    assert(said.contains("error") || said.contains("'@pinned(thread)'"), said)
-    assert(said.contains("pinned(thread)"), said)
+    assert(said.contains("an annotation marks a function, and only a function"), said)
