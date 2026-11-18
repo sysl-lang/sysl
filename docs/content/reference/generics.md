@@ -55,7 +55,10 @@ print(id[int](7), id[string]("s"))
 **The list takes `()` and tuple types as the type grammar does**: `id[()](())` instantiates at
 `unit`, `id[(int, bool)]((1, true))` at a tuple, and either may sit inside an application
 (`Option[()]`, `Result[(), string]`). A subscript holding parentheses still subscripts: `a[(1)]`
-indexes, and `b[()]` and `g[(i, j)]` index a type with an `Index` for `()` or for a tuple.
+indexes, and `b[()]` and `g[(i, j)]` index a type with an `Index` for `()` or for a tuple. On such
+a value the parentheses may go: `g[i, j]` is a subscript with two indices
+([`reference/arrays.md`](/reference/arrays/#several-indices-in-one-subscript)), read so wherever the
+head is a value rather than a generic.
 
 ```sysl
 id[T](x: T) -> T = x
