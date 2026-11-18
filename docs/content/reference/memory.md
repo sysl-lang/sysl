@@ -179,7 +179,7 @@ true false false true
 ```
 
 **`===` and `!==` are identity**, always, and take two references or two pointers of one type and
-nothing else — an integer has no identity apart from its value, and a trait object is two words:
+nothing else — an integer has no identity apart from its value:
 
 ```sysl
 main()
@@ -189,6 +189,10 @@ main()
 ```error
 '===' compares the identity of two references or pointers, and int is neither — '==' compares its value
 ```
+
+A trait object's identity is the value it was made from, so it also meets an object over another
+trait, or a reference of the type it holds
+([traits](/reference/traits/#two-objects-compared-by-identity)).
 
 - **Where `T` has no `Eq`, a reference is its own identity**: `==` asks whether the two name one
   object, and the hash is the address's, so a `Map[&Node, V]` keys by identity — what a
@@ -204,7 +208,7 @@ main()
   than keyed wrongly. To key by identity where the referent defines equality, wrap the reference in
   `ByAddress`, whose `Eq` is `===` and whose `Hash` is the address's.
 - **A reference to a reference** compares as the inner reference does. **A trait object** (`&Shape`)
-  has no `==`. **A pointer compares and hashes by address**, whatever `T` defines. There is no ordering
+  has no `==`, and its `===` compares the objects. **A pointer compares and hashes by address**, whatever `T` defines. There is no ordering
   on a reference or a pointer. Its other bounds a reference meets through its referent
   ([generics](/reference/generics/#a-reference-meets-its-referent-s-bounds)).
 
