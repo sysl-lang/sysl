@@ -2228,7 +2228,7 @@ module image.png
 extern "png_create_read_struct" create(ver: *u8, err: *u8, fn: *u8) -> *u8
 ```
 
-**A directive names a library, and never a flag.** That is the whole of the design. Where a library
+**A directive names a library, or a framework, and never a flag.** That is the whole of the design. Where a library
 *lives* is a property of the machine being built for: the mathematics is a file of its own on ELF,
 part of `libSystem` on Darwin, inside the CRT on Windows, and absent from a freestanding target that
 has no libc for it to be in. A directive spelling `-lm` would be right on one of those and wrong on
@@ -2254,6 +2254,34 @@ A board whose manifest grants `libc` — newlib, picolibc — has its mathematic
 whose placement actually differs. An unrecognized name is passed straight through rather than
 guessed about. Being wrong in that direction produces a link error naming the *library*; being wrong
 in the other produces one naming a *function*, on a platform the author does not have.
+
+**A framework is the one other thing a directive may name.** On macOS a system API such as Metal
+or Foundation ships as a framework, which is not a `-l` library and has a flag of its own, so it has
+its own spelling:
+
+```sysl
+module gpu.metal
+#if macos
+@link(framework: "Metal")
+#endif
+
+extern "MTLCreateSystemDefaultDevice" create_device() -> *u8
+```
+
+`@link(framework: "Metal")` becomes `-framework Metal` on a macOS target, in the same place in the
+command line, in the same order, and through every path that links: `build`, `test`, `build-lib`
+(which only checks), `build-c` (which names the framework among the things the C project must
+link) and `build-c --shared` (which links it into the library). A framework and a library may share a
+name, and are different requirements. The name is checked as a library's is: not empty, no space, no
+leading dash.
+
+**A target with no frameworks refuses the directive, and does not drop it.** On Linux, Windows, WASI
+or a freestanding target `@link(framework: "Metal")` is an error — *names a macOS framework, and this
+target has none — gate it with '#if macos'*. Refusing loses nothing, since `#if macos` around the
+line says exactly what a portable binding means, and it keeps a build that silently lacked the
+framework from reaching a link error naming a function. There is no manifest form: a manifest's
+`pkg_config` names installed libraries, and a framework is a property of a file's `extern`s like any
+other `@link`.
 
 Four more rules:
 
