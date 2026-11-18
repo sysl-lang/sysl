@@ -103,8 +103,8 @@ print(c.send(&n))
 7
 ```
 
-Beside them a member takes the six about the function it lowers to — `@noinline`, `@inline`, `@cold`,
-`@no_alloc`, `@no_block` and `@blocks` — and `@relocates`, which says a call may move the storage its
+Beside them a member takes the seven about the function it lowers to — `@noinline`, `@inline`, `@cold`,
+`@no_alloc`, `@no_block`, `@no_recursion` and `@blocks` — and `@relocates`, which says a call may move the storage its
 receiver's elements live in, so a live `ref` to one of them is refused the call
 ([memory](/reference/memory/#the-one-rule-what-may-move-underneath-it)), and `@views(self)`, which says
 the view a call answers is borrowed from its receiver, so the view may not outlive it

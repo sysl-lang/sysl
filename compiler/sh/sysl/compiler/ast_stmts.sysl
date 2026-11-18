@@ -377,6 +377,15 @@ struct FuncMarks
     // instantiation.
     bounded: Buf[string]
 
+    // `@stack(n, calls: m)` above a function or a member: the deepest stack a call of it may need,
+    // the build refusing it where the call graph and the back end's frames say more, and what each
+    // call its own body makes through a pointer is taken to need (`stack_bound.sysl`). Either may be
+    // absent; `stack_at` is where the annotation was written, which a refusal points at. Carried to
+    // every lowered copy.
+    stack: Option[u64]
+    stack_calls: Option[u64]
+    stack_at: Option[Span]
+
     // Whether any of the three was written.
     any(self) -> bool = self.noinline || self.cold || self.inline
 
@@ -394,7 +403,7 @@ end FuncMarks
 // A definition nothing was said about.
 no_marks() -> FuncMarks = FuncMarks(false, false, false, None, buf(), false, None, false, false,
                                     false, false, false, false, false, false, buf(), false, buf(), buf(),
-                                    false, false, false, false, buf(), buf(), buf())
+                                    false, false, false, false, buf(), buf(), buf(), None, None, None)
 
 // A method of a struct, an enum, a trait or an `impl` block.
 struct MethodDecl
@@ -591,6 +600,9 @@ enum Attr
     Reassociate
     // `@track_caller` above a function or a member: what it reports names the line that called it.
     TrackCaller
+    // `@stack(n, calls: m)` above a function or a member: the deepest stack a call may need, and what
+    // each call through a pointer in its body is taken to need. Each part is optional, not both.
+    StackBound(bytes: Option[u64], calls: Option[u64], at: Span)
     // `@annotation` above a struct: the struct is an annotation a program writes as `@Name(...)`.
     AnnotationMark
     // `@rename("id")` above a type: an annotation the program declared, not one of the language's.
@@ -674,6 +686,7 @@ attr_word(a: Attr) -> string = a match
     StrictFp -> "strict_fp"
     Reassociate -> "reassociate"
     TrackCaller -> "track_caller"
+    StackBound(_, _, _) -> "stack"
     Relocates -> "relocates"
     Views(_) -> "views"
     Consumes -> "consumes"

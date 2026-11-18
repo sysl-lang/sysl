@@ -1,0 +1,101 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+
+// `@stack(n)`: a function whose every call, however deep it goes, fits in `n` bytes of stack -- and a
+// build that refuses it where the call graph and the back end's frames say otherwise.
+//
+// **It is the whole-program question, asked at build time.** A frame is the back end's answer and the
+// way down is the call graph's, so the check is `sysl stack`'s walk (`stack_report.sysl`) started at
+// the marked function: the library's bodies lowered into the text so a call into them is followed, the
+// text handed to clang at the level and for the machine being built, and the frames it reports added
+// up along the deepest way down. A program that marks nothing pays nothing for any of it.
+//
+// **A way down that has no bound is refused, not passed**: a cycle of calls, a frame sized at run
+// time, or a call through a pointer -- a trait object, a `&Fn` closure, a function pointer -- in a
+// body that did not say, with `@stack(calls: m)`, what such a call needs. That assumption is the
+// program's word for code the text cannot name; the report states it wherever it was used.
+//
+// **A C function's frame is not in the text**, so it is counted as nothing; `sysl stack` names the C
+// each entry reaches, which is where a reader looks for what the number leaves out.
+
+// Refuses each function marked `@stack(n)` whose deepest stack is more than `n` bytes, or has no bound.
+//
+// `whole` is the lowered text where it already holds every body this build reaches; otherwise it is
+// lowered again with nothing precompiled.
+check_stack_bounds(a: &Analysis, kept: TProgram, t: Target, level: string, pr: Promotions,
+                   whole: Option[string])
+    var marked: Buf[TFunc] = buf()
+
+    for f in kept.funcs
+        if f.marks.stack.is_some() then marked.push(f)
+
+    if marked.is_empty() then return
+
+    if !t.builds_with_clang()
+        for f in marked
+            stack_fault(a, f, s"'@stack' is checked against the frames clang lays out, and " +
+                              s"'${t.name}' is built without clang — ${t.no_toolchain()}")
+
+        return
+    end if
+
+    val ir = whole match
+        Some(text) -> text
+        None -> ir_print_module(codegen_with_gaps(kept with { precompiled = buf() }, t, pr).0)
+
+    val usage = stack_usage_of(ir, t, level) match
+        Err(why) ->
+            for f in marked
+                stack_fault(a, f, s"'@stack' could not be checked: $why")
+
+            return
+        Ok(made) -> made
+
+    val facts = stack_analysis(ir, usage, stack_assumptions(kept.funcs))
+
+    for f in marked
+        val limit = f.marks.stack.unwrap()
+        val said = s"'${qualified_name(f.name)}' declared '@stack($limit)'"
+
+        depth_of_symbol(facts, symbol_of_func(facts, f.name)) match
+            None -> ()
+            Some(d) ->
+                d match
+                    Unbounded(why) -> stack_fault(a, f, s"$said, and how deep its stack goes has no bound — $why")
+                    Bounded(bytes, path, _) ->
+                        if bytes > limit then
+                            stack_fault(a, f, s"$said, and it can need $bytes bytes at -O$level, by ${arrows_text(path)}")
+end check_stack_bounds
+
+// What `@stack(calls: m)` says, by every symbol the function it marks may be laid down under.
+stack_assumptions(funcs: Buf[TFunc]) -> Buf[(string, u64)]
+    var out: Buf[(string, u64)] = buf()
+
+    for f in funcs
+        if f.marks.stack_calls.is_none() then continue
+
+        out.push((llvm_safe(f.name), f.marks.stack_calls.unwrap()))
+        out.push((root_symbol(llvm_safe(f.name)), f.marks.stack_calls.unwrap()))
+
+    out
+end stack_assumptions
+
+// The symbol a function is laid down under in the text: its key, or a root function's `$$sysl` name.
+private symbol_of_func(an: &StackAnalysis, key: string) -> string =
+    if an.written.index.get(root_symbol(llvm_safe(key))).is_some() then root_symbol(llvm_safe(key))
+    else llvm_safe(key)
+
+// A refusal at the annotation, in the file the function was written in -- a generic's for an instance.
+private stack_fault(a: &Analysis, f: TFunc, message: string)
+    val origin = a.tables.members.func_origin.get(f.name)
+    var home = f.name
+
+    if origin.is_some()
+        val written = abstract_named(a, origin.unwrap())
+
+        if written.is_some() then home = written.unwrap().name
+    end if
+
+    a.fault(func_home(a, home), f.marks.stack_at.unwrap_or(f.span), message)
+end stack_fault

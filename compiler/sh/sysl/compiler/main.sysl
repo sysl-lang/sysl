@@ -129,6 +129,7 @@ private run_cli_command(args: []const string, say: string -> unit, note: string 
         "emit-ast" -> emit_ast_command(args, say, note)
         "emit-typed" -> emit_typed_command(args, say, note)
         "emit-llvm" -> emit_llvm_command(args, say, note)
+        "stack" -> stack_command(args, say, note)
         "build" -> build_command(args, note)
         "build-lib" -> build_lib_command(args, note)
         "build-c" -> build_c_command(args, note)
@@ -397,6 +398,100 @@ end emit_llvm_command
 
 private emit_llvm_usage() -> string =
     "usage: sysl emit-llvm [--gaps] [--target <name>] [-O<level>] " + where_flags() + " <path>"
+
+// `sysl stack [--target <name>] [-O<level>] <path>` -- the deepest stack each entry point can need:
+// `main`, a bare image's entry and every function the program exports, each with the way down that
+// needs it, or `unbounded` and why (`stack_report.sysl`).
+//
+// **The standard module is lowered into the text rather than linked**, as `--no-std-lib` asks for,
+// so a call into the library is followed to the frames it reaches.
+private stack_command(args: []const string, say: string -> unit, note: string -> unit) -> int
+    var named: Option[string] = None
+    var level: Option[string] = None
+    var file = ""
+    var mistakes: Buf[string] = buf()
+    var i: usize = 2
+
+    while i < args.len
+        val took = took_search_flag(args, i)
+
+        if took == 0
+            mistakes.push(missing_value(args[i]))
+            break
+        end if
+
+        if took > 0
+            if took == 2 then i += 1
+        else if args[i] == "--target"
+            if i + 1 >= args.len
+                mistakes.push(missing_value(args[i]))
+                break
+            end if
+
+            i += 1
+            named = Some(args[i])
+        else if took_level(args, i).0 != 0
+            val given = took_level(args, i)
+
+            if given.0 < 0
+                mistakes.push(missing_value(args[i]))
+                break
+            end if
+
+            level = Some(given.1)
+
+            if given.0 == 2 then i += 1
+        else
+            val taken = took_any_command_flag(args, i, &mistakes)
+
+            if taken == 0 then file = args[i] else i += taken - 1
+
+        i += 1
+
+    if mistakes.len() > 0
+        note(misused(mistakes, stack_usage()))
+        return Misused
+    end if
+
+    if file == ""
+        note(stack_usage())
+        return Misused
+    end if
+
+    val at = build_level(file, level) match
+        Err(why) ->
+            say_failure(why, note)
+            return Failed
+        Ok(resolved) -> resolved
+
+    val emitted = emit_llvm_text(file, named, at, buf(), Some(buf())) match
+        Err(why) ->
+            say_failure(why, note)
+            return Failed
+        Ok(made) -> made
+
+    if !emitted.report.is_empty()
+        note(analysis_report(emitted.report))
+        return Failed
+    end if
+
+    val t = target_for(file, named) match
+        Err(why) ->
+            say_failure(Said(why), note)
+            return Failed
+        Ok(resolved) -> resolved
+
+    stack_usage_of(emitted.text, t, at) match
+        Err(why) ->
+            note(refused(why))
+            Failed
+        Ok(usage) ->
+            say(stack_report_text(stack_analysis(emitted.text, usage, emitted.stack_assumed), emitted.entries))
+            Fine
+end stack_command
+
+private stack_usage() -> string =
+    "usage: sysl stack [--target <name>] [-O<level>] " + where_flags() + " <path>"
 
 // `sysl build [--target <name>] [--cc <path>] [-O<level>] [-o <exe>] <path>` -- one program, made
 // into something the machine will run.
@@ -1768,7 +1863,7 @@ builtin_commands() -> Buf[string]
     var out: Buf[string] = buf()
 
     for c in ["run", "build", "build-lib", "build-c", "emit-header", "weave", "tangle", "test",
-              "emit-llvm",
+              "emit-llvm", "stack",
               "emit-ast", "emit-typed", "prove", "deps", "add", "config", "vendor", "tidy", "init", "doc", "import-c",
               "targets", "lsp"]
         out.push(c)
@@ -1788,7 +1883,7 @@ help_text() -> string
     lines.push("Commands:")
 
     for u in [run_usage(), build_usage(), build_lib_usage(), build_c_usage(), emit_header_usage(),
-              weave_usage(), tangle_usage(), test_usage(), emit_llvm_usage(), emit_ast_usage(),
+              weave_usage(), tangle_usage(), test_usage(), emit_llvm_usage(), stack_usage(), emit_ast_usage(),
               emit_typed_usage(), "usage: sysl prove [--emit-whyml] [--overflow check|ignore] <path>",
               deps_usage(), add_usage(), config_usage(), "usage: sysl vendor <path>", "usage: sysl tidy [--check] [<path>]",
               "usage: sysl init [<dir>]",

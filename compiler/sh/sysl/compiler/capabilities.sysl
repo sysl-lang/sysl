@@ -34,6 +34,15 @@ const CapLibc: string = "libc"
 // module that gave it up may reach nothing marked `@blocks` (`no_block.sysl`).
 const CapBlock: string = "block"
 
+// **Recursion, which a module may promise never to do** (`@no_recursion`): conduct as waiting is, so
+// a narrowing and never a facility. A module that gave it up may reach no cycle of calls
+// (`no_recursion.sysl`).
+const CapRecursion: string = "recursion"
+
+// Whether a narrowing's word is conduct with no facility behind it, which a `requires` or a `@needs`
+// cannot name.
+private conduct_only(name: string) -> bool = name == CapBlock || name == CapRecursion
+
 // The capabilities there are, in the order a refusal lists them.
 capability_core() -> Buf[string]
     var out: Buf[string] = buf()
@@ -53,6 +62,7 @@ narrowed_by(word: string) -> Option[string] = word match
     "os" -> Some(CapOs)
     "posix" -> Some(CapPosix)
     "block" -> Some(CapBlock)
+    "recursion" -> Some(CapRecursion)
     _ -> None
 
 // The word a narrowing is written with, for a capability named as a facility.
@@ -125,8 +135,8 @@ private check_clause(a: &Analysis, u: Program, c: CapabilityClause)
             if !is_facility(c.name)
                 // Naming what a module *does* where a facility belongs. `@requires(alloc)` is the
                 // one that happens, since the narrowing beside it is spelled that way.
-                if c.name == CapBlock
-                    a.fault(scope, c.span, block_is_conduct("'@requires'"))
+                if conduct_only(c.name)
+                    a.fault(scope, c.span, conduct_refusal(c.name, "'@requires'"))
                     return
 
                 if narrowed_by(c.name).is_some() then
@@ -154,12 +164,19 @@ private check_clause(a: &Analysis, u: Program, c: CapabilityClause)
                 else unknown_capability(a, scope, c)
 end check_clause
 
-// **Waiting is the one narrowing with no facility behind it**, so the advice the other words get --
-// write the facility instead -- would name nothing.
-private block_is_conduct(form: string) -> string =
-    s"'block' is what a module does, not something a machine has, and no machine takes it away — " +
-    s"$form names a facility, and a module that may wait says nothing. '@no_block' is the promise " +
-    "never to wait, and '@blocks' marks a declaration that may"
+// **Waiting and recursing are the narrowings with no facility behind them**, so the advice the other
+// words get -- write the facility instead -- would name nothing.
+private conduct_refusal(name: string, form: string) -> string
+    val head = s"'$name' is what a module does, not something a machine has, and no machine takes it " +
+               s"away — $form names a facility"
+
+    if name == CapRecursion then
+        return head + ", and a module that may recurse says nothing. '@no_recursion' is the promise " +
+               "that no cycle of calls is ever reached"
+
+    head + ", and a module that may wait says nothing. '@no_block' is the promise never to wait, and " +
+        "'@blocks' marks a declaration that may"
+end conduct_refusal
 
 private unknown_capability(a: &Analysis, scope: Scope, c: CapabilityClause)
     a.fault(scope, c.span, s"no capability is called '${c.name}' — the set is 'heap', 'os', 'posix', " +
@@ -713,8 +730,8 @@ private check_need_names(a: &Analysis, scope: Scope, span: Span, needs: Buf[stri
 
         if is_facility(cap) then continue
 
-        if cap == CapBlock
-            a.fault(scope, span, block_is_conduct("'@needs'"))
+        if conduct_only(cap)
+            a.fault(scope, span, conduct_refusal(cap, "'@needs'"))
             continue
 
         if narrowed_by(cap).is_some() then
