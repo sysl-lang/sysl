@@ -711,6 +711,7 @@ analyze_body(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, key: string = 
     cx.body = name
     cx.in_variadic = d.variadic
     cx.owner = owner_of(a, d.name, scope)
+    cx.no_fuse = d.marks.no_fuse
     cx.bind_site = Some(span)
 
     var params: Buf[(string, Type)] = buf()
@@ -772,7 +773,7 @@ analyze_body(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, key: string = 
           contract.2, file_local(d.vis), d.conv, d.tailrec, contract.3, d.pure, d.ghost,
           frame_symbols(cx, span, name, d.reads, "reads"),
           frame_symbols(cx, span, name, d.writes, "writes"),
-          exported_symbol(d), d.section, d.marks, cx.owner, d.const_fn, Some(scope.src),
+          exported_symbol(d), d.section, body_marks(cx, d.marks), cx.owner, d.const_fn, Some(scope.src),
           export_hidden(d))
 end analyze_body
 
@@ -998,6 +999,7 @@ private check_abstract_body(a: &Analysis, scope: Scope, d: FuncDecl, keep: bool 
 
     cx.subst = subst
     cx.owner = owner_of(a, d.name, scope)
+    cx.no_fuse = d.marks.no_fuse
     cx.at_definition = true
     remember_bounds(cx, d)
 
@@ -1138,6 +1140,7 @@ opaque_body_type(a: &Analysis, scope: Scope, d: FuncDecl) -> Type
 
     cx.subst = subst
     cx.owner = owner_of(a, d.name, scope)
+    cx.no_fuse = d.marks.no_fuse
     remember_bounds(cx, d)
 
     for p in d.params
@@ -1278,6 +1281,7 @@ analyze_instance_in(a: &Analysis, cx: &Analyzer, name: string, d: FuncDecl) -> T
     // Who declared it is read off the declaration too, so an instantiation belongs to the module of
     // the generic it was made from rather than to whichever module's call asked for it.
     cx.owner = owner_of(a, d.name, cx.scope)
+    cx.no_fuse = d.marks.no_fuse
 
     if sig.is_none() then return TFunc(span_zero(), name, buf(), Unit, empty_block(), false, buf(),
                                        buf(), buf(), false, None, false, None, false, false, None,
@@ -1345,16 +1349,22 @@ analyze_instance_in(a: &Analysis, cx: &Analyzer, name: string, d: FuncDecl) -> T
 
     if !d.crossing.is_empty() then a.crossing_params.put(name, d.crossing)
 
-    // A member's typed function carries its declaration's span, as a free function's does; an
-    // instantiation, declared nowhere under its own name, keeps its body's.
-    val declared = a.tables.members.decl_spans.get(name).unwrap_or(span)
+    // **An instantiation carries the span of the declaration it was made from**, head to end of body,
+    // as a free function and a member do: every instantiation of one generic shares it, which is what
+    // tells a closure lowered once per instantiation from one written inside another body
+    // (`emit_strict_fp.sysl`, `error_trace.sysl`). Only a body the compiler made up, written nowhere,
+    // falls back to its last statement (`decl_anchor`). A free generic's is the statement it was
+    // filed under, so an annotation above it is where it begins, as it is for a plain function.
+    val origin = a.tables.members.func_origin.get(name)
+    val filed = if origin.is_some() then a.tables.funcs.get(origin.unwrap()).map(f -> f.span) else None
+    val declared = a.tables.members.decl_spans.get(name).unwrap_or(filed.unwrap_or(decl_anchor(d)))
 
     TFunc(declared, name, params, answers, answered, d.variadic, contract.0, contract.1, contract.2,
           file_local(d.vis) || mentions_closure(name),
           d.conv, d.tailrec, contract.3, d.pure, d.ghost,
-          frame_symbols(cx, span, name, d.reads, "reads"),
-          frame_symbols(cx, span, name, d.writes, "writes"),
-          exported_symbol(d), d.section, d.marks, cx.owner, d.const_fn, Some(cx.scope.src),
+          frame_symbols(cx, declared, name, d.reads, "reads"),
+          frame_symbols(cx, declared, name, d.writes, "writes"),
+          exported_symbol(d), d.section, body_marks(cx, d.marks), cx.owner, d.const_fn, Some(cx.scope.src),
           export_hidden(d))
 end analyze_instance_in
 
@@ -2124,7 +2134,7 @@ private laid_storage(cx: &Analyzer, typed: StorageTyped) -> TVal
     if d.export.is_some() then check_exported_storage(cx, d, key, ty, computed)
 
     TVal(key, stored, init, computed, writable, storage_align(cx, d), d.section, d.thread_local, d.per_cpu,
-         d.main_thread, exported_storage_symbol(d), storage_hidden(d), false)
+         d.main_thread, exported_storage_symbol(d), storage_hidden(d), false, no_fuse_here(cx))
 end laid_storage
 
 // The type a `val` or `var` written with none is stored at, which is its initializer's -- refused
@@ -2501,6 +2511,7 @@ laid_down(t: TExpr) -> bool = *t.kind match
     TArrayLit(elems, _) -> all_laid_down(elems)
     TArrayFill(value, _) -> laid_down(value)
     TBufLit(elems, _) -> all_laid_down(elems)
+    TVectorLit(lanes, _) -> all_laid_down(lanes)
     // A `@packed` struct holding a union stays code, and so does one with C bitfields, which LLVM
     // also sees as packed: its constant would need the packed brackets
     // around a union's image, which LLVM's literal types do not take.
@@ -2642,7 +2653,7 @@ private static_image(cx: &Analyzer, name: string, t: TExpr) -> Option[TExpr] = *
     TIntOp(op, operand, _, _, ty) ->
         if op != "bitfield_from_bits" then return leaf_image(cx, name, t)
 
-        val n = const_fold_typed(operand, fold_machine(cx.an.tables)) match
+        val n = const_fold_typed(operand, fold_machine_in(cx)) match
             Some(ConstInt(found)) -> found
             _ -> return None
 
@@ -2798,7 +2809,7 @@ private device_place(cx: &Analyzer, name: string, place: TExpr) -> Option[long] 
             Array(n, el) -> (long(n), *el)
             _ -> return None
 
-        val at = const_fold_typed(index, fold_machine(cx.an.tables)) match
+        val at = const_fold_typed(index, fold_machine_in(cx)) match
             Some(ConstInt(n)) -> n.to_long()
             _ -> None
 
@@ -2840,7 +2851,7 @@ private device_address(cx: &Analyzer, t: TExpr, at: long, ty: Type) -> TExpr =
 private leaf_image(cx: &Analyzer, name: string, t: TExpr) -> Option[TExpr]
     if laid_down(t) then return Some(t)
 
-    val folded = scalar_image(t, fold_machine(cx.an.tables))
+    val folded = scalar_image(t, fold_machine_in(cx))
 
     if folded.is_some() then folded else const_val_image(cx, name, t)
 end leaf_image
@@ -2874,7 +2885,7 @@ private place_image(cx: &Analyzer, place: TExpr) -> Option[TExpr] = *place.kind 
             Array(n, _) -> long(n)
             _ -> return None
 
-        val at = const_fold_typed(index, fold_machine(cx.an.tables)) match
+        val at = const_fold_typed(index, fold_machine_in(cx)) match
             Some(ConstInt(n)) -> n.to_long()
             _ -> None
 
@@ -2903,7 +2914,7 @@ private constrained_image(cx: &Analyzer, name: string, t: TExpr, value: TExpr,
     if inner.is_none() then return None
 
     if d.lo.is_some() || d.hi.is_some()
-        val v = const_fold_typed(inner.unwrap(), fold_machine(cx.an.tables))
+        val v = const_fold_typed(inner.unwrap(), fold_machine_in(cx))
 
         if v.is_none() then return None
 
@@ -2924,11 +2935,14 @@ end constrained_image
 // converted is imaged first**, so a conversion over arithmetic, over another conversion or over a
 // `const` call folds as one over a literal does.
 private cast_image(cx: &Analyzer, name: string, t: TExpr, inner: TExpr, to: Type) -> Option[TExpr]
-    val m = fold_machine(cx.an.tables)
+    val m = fold_machine_in(cx)
     val pointerish = to match
         Ptr(_, _) -> true
         CFn(_, _, _) -> true
         _ -> false
+
+    // A conversion to a vector converts lane by lane, which the evaluator runs as the program does.
+    if is_vector(underlying(to)) then return leaf_image(cx, name, t)
 
     val from = static_image(cx, name, inner)
 
@@ -3147,7 +3161,7 @@ private scalar_image(t: TExpr, m: FoldMachine) -> Option[TExpr]
         ConstView(_, _, _, _) -> None
         ConstWriter(_) -> None
         ConstLink(_) -> None
-        ConstPtr(_, _, _) -> None
+        ConstPtr(_, _, _, _) -> None
         ConstUnset -> None
         ConstUnit -> None
         ConstPun(_, _) -> None

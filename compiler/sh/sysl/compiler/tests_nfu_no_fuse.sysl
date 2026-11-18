@@ -1,0 +1,646 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.replace_all
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.path.parent
+
+// `@no_fuse` (`reference/attributes.md § @no_fuse`, `no_fuse.sysl`): a multiply feeding an add in a
+// marked body is an `fmul` and an `fadd`, never `llvm.fma` or `llvm.fmuladd`, and every way the
+// compiler computes that body's arithmetic agrees. The axes: where it is written (function, member,
+// generic, closure and nested function inside, a function called from inside, a module header, the
+// other files of that module, the module's storage and constants), which shape (`a * b + c`,
+// `c - a * b`, `-(a * b) + c`, `+=`, `-=`), which width (`f32`, `f64`, a vector of `f32`), beside
+// `@reassociate` and `@strict_fp`, through an arithmetic operator and through the inliner, what a run
+// prints at `-O0` and `-O3`, what compile-time evaluation computes, and every refusal.
+//
+// The witness everywhere: `x = 1 + 2^-27` squares to `1 + 2^-26 + 2^-54`, and `c = -(1 + 2^-26)`
+// cancels all but the `2^-54` -- fused, `x * x + c` is `2^-54`; rounded first, 0. The `f32` twin is
+// `(1 + 2^-12)^2 - (1 + 2^-11)`, which is `2^-24`.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private var nfu_library_cache: Buf[Program] = buf()
+private var nfu_library_read: bool = false
+
+private nfu_library() -> Buf[Program]
+    if nfu_library_read then return nfu_library_cache
+
+    nfu_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> nfu_library_cache = units
+
+    nfu_library_cache
+end nfu_library
+
+// Whether the tests below can say anything: the library's source is here, and this machine fuses at
+// both widths, so an unmarked body is an `llvm.fma` to compare a marked one against.
+private nfu_ready() -> bool
+    if nfu_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    val f = fusing_of(host_target())
+
+    if !f.single || !f.double
+        print("skipped: this machine does not fuse a multiply-add at both widths")
+        return false
+    end if
+
+    true
+end nfu_ready
+
+// The LLVM text of the whole module the files lower to, or the first thing they were refused with.
+private nfu_ir_files(files: []const (string, string)) -> string
+    var units: Buf[Program] = buf()
+
+    for item in nfu_library()
+        units.push(item)
+
+    for (name, text) in files
+        val parsed = parse(source_of(name, text))
+
+        if !parsed.ok() then return parsed.first().message
+
+        units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if !done.reported.is_empty() then return done.reported[0].diag.message
+
+    val whole = program_of(done, done.main_module)
+    val promotions = post_analysis_checks(done.an, whole, buf())
+    val said = errors_of(done.an.diagnostics())
+
+    if !said.is_empty() then return analysis_report(said)
+
+    val kept = prune(strip_tests(whole), program_own(units))
+
+    ir_print_module(codegen_with_gaps(kept, host_target(), promotions).0)
+end nfu_ir_files
+
+private nfu_ir(text: string) -> string = nfu_ir_files([("t.sysl", text)])
+
+// What clang's `-O3` leaves of a program.
+private nfu_optimized(text: string) -> string
+    val dir = make_temp_dir("sysl-nfu").unwrap()
+    val file = s"$dir/t.ll"
+
+    write_text(file, nfu_ir(text)).unwrap()
+
+    val got = capture("clang", ["-O3", "-S", "-emit-llvm", "-o", "-", file], "", [], true).unwrap()
+
+    remove_dir_all(dir).unwrap_or(())
+    assert(got.status.ok(), s"clang refused the emitted IR:\n${got.err.unwrap_or("")}")
+    got.text
+end nfu_optimized
+
+// What a program of these files prints, built at `level`, or why it did not build.
+private nfu_ran(files: []const (string, string), level: string) -> string
+    val root = replace_all(make_temp_dir("sysl-nfu").unwrap(), "//", "/")
+
+    for (name, text) in files
+        val at = s"$root/$name"
+
+        make_dir_all(parent(at).unwrap()).unwrap()
+        write_text(at, text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, level, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end nfu_ran
+
+// That a program prints `expected` unoptimized and at `-O3` alike.
+private nfu_prints(files: []const (string, string), expected: string)
+    if !nfu_ready() || !clang_available() then return
+
+    for level in ["0", "3"]
+        assert_eq(nfu_ran(files, level), expected)
+end nfu_prints
+
+// The body of the first function whose `define` line holds `name`.
+private nfu_body(out: string, name: string) -> string
+    var body = ""
+    var inside = false
+
+    for l in lines_of(out)
+        if !inside && l.starts_with("define") && l.contains(name) then inside = true
+
+        if inside
+            if l == "}" then return body
+
+            body = body + l + "\n"
+        end if
+
+    assert(false, s"no function '$name' in:\n$out")
+    ""
+end nfu_body
+
+private nfu_says(text: string, part: string) = assert(text.contains(part), s"expected '$part' in:\n$text")
+
+private nfu_lacks(text: string, part: string) = assert(!text.contains(part), s"did not expect '$part' in:\n$text")
+
+// That a body has no fused multiply-add of either kind.
+private nfu_unfused(body: string)
+    nfu_lacks(body, "llvm.fma")
+    nfu_lacks(body, "llvm.fmuladd")
+    nfu_lacks(body, "contract")
+end nfu_unfused
+
+// That a program is refused with a diagnostic holding `part`.
+private nfu_refused(text: string, part: string)
+    if nfu_library().is_empty() then return
+
+    val said = nfu_ir(text)
+
+    assert(said.contains(part), s"expected a refusal holding\n$part\nin\n$said")
+end nfu_refused
+
+// -- the lowering -----------------------------------------------------------------------------------
+
+@test("a '@no_fuse' function's a * b + c is fmul and fadd at f64, f32 and a vector; its unmarked twin is llvm.fma")
+nfu_widths()
+    if !nfu_ready() then return
+
+    val ir = nfu_ir(raw"""
+        id(x: real) -> real = x
+
+        @no_fuse
+        @noinline
+        apart(a: real, b: real, c: real) -> real = a * b + c
+
+        @no_fuse
+        @noinline
+        apart32(a: f32, b: f32, c: f32) -> f32 = a * b + c
+
+        @no_fuse
+        @noinline
+        lanes(a: <4>f32, b: <4>f32, c: <4>f32) -> <4>f32 = a * b + c
+
+        @noinline
+        fused(a: real, b: real, c: real) -> real = a * b + c
+
+        @noinline
+        fused_lanes(a: <4>f32, b: <4>f32, c: <4>f32) -> <4>f32 = a * b + c
+
+        val v = <4>f32(1.5f32)
+
+        print(apart(1.0, 2.0, 3.0), apart32(1.0f32, 2.0f32, 3.0f32), lanes(v, v, v).sum())
+        print(fused(1.0, 2.0, 3.0), fused_lanes(v, v, v).sum())
+        """)
+
+    val wide = nfu_body(ir, "@apart$$")
+    val narrow = nfu_body(ir, "@apart32$$")
+    val vec = nfu_body(ir, "@lanes$$")
+
+    nfu_says(wide, "fmul double")
+    nfu_says(wide, "fadd double")
+    nfu_unfused(wide)
+    nfu_says(narrow, "fmul float")
+    nfu_says(narrow, "fadd float")
+    nfu_unfused(narrow)
+    nfu_says(vec, "fmul <4 x float>")
+    nfu_says(vec, "fadd <4 x float>")
+    nfu_unfused(vec)
+    nfu_says(nfu_body(ir, "@fused$$"), "llvm.fma.f64")
+    nfu_says(nfu_body(ir, "@fused_lanes$$"), "llvm.fma.v4f32")
+end nfu_widths
+
+@test("every contracted shape is two operations in a '@no_fuse' body: c - a * b, -(a * b) + c, a * b - c, += and -=")
+nfu_shapes()
+    if !nfu_ready() then return
+
+    val ir = nfu_ir(raw"""
+        id(x: real) -> real = x
+
+        @no_fuse
+        @noinline
+        shapes(a: real, b: real, c: real) -> real
+            var s = c
+            s += a * b
+            s -= a * b
+
+            (c - a * b) + (-(a * b) + c) + (a * b - c) + s
+
+        print(shapes(1.0, 2.0, 3.0))
+        """)
+
+    val body = nfu_body(ir, "shapes")
+
+    nfu_says(body, "fmul double")
+    nfu_says(body, "fsub double")
+    nfu_unfused(body)
+end nfu_shapes
+
+@test("a member, a generic's instance, and a closure and a nested function written inside are unfused; a function called from inside is not")
+nfu_reach()
+    if !nfu_ready() then return
+
+    val ir = nfu_ir(raw"""
+        struct Acc
+            total: real
+
+        impl Acc
+            @no_fuse
+            @noinline
+            take(*self, a: real, b: real)
+                self.total += a * b
+
+        @no_fuse
+        @noinline
+        twice[T: Add + Mul](a: T, b: T) -> T = a * b + a
+
+        @noinline
+        elsewhere(a: real, b: real, c: real) -> real = a * b + c
+
+        @no_fuse
+        @noinline
+        outer(a: real, b: real, c: real) -> real
+            val f = (x: real) -> x * b + c
+
+            inner(x: real) -> real = x * a + c
+
+            f(a) + inner(b) + elsewhere(a, b, c)
+
+        var acc = Acc(0.0)
+
+        acc.take(1.0, 2.0)
+        print(acc.total, twice(1.5, 2.5), outer(1.0, 2.0, 3.0))
+        """)
+
+    nfu_unfused(nfu_body(ir, "take"))
+    nfu_unfused(nfu_body(ir, "twice"))
+    nfu_unfused(nfu_body(ir, "outer"))
+    nfu_unfused(nfu_body(ir, "closure"))
+    nfu_unfused(nfu_body(ir, "inner"))
+    nfu_says(nfu_body(ir, "elsewhere"), "llvm.fma.f64")
+end nfu_reach
+
+@test("'@no_fuse' beside '@reassociate' regroups with every product rounded apart, and a '@reassociate' block inside one too")
+nfu_with_reassociate()
+    if !nfu_ready() then return
+
+    val ir = nfu_ir(raw"""
+        id(x: real) -> real = x
+
+        @no_fuse
+        @reassociate
+        @noinline
+        both(a: real, b: real, c: real) -> real = a * b + c
+
+        @no_fuse
+        @noinline
+        block(xs: []const real, k: real) -> real
+            var total = 0.0
+
+            @reassociate
+                for x in xs do total = total + x * k
+
+            total
+
+        @reassociate
+        @noinline
+        regrouped(a: real, b: real, c: real) -> real = a * b + c
+
+        val xs = [1.0, 2.0]
+
+        print(both(1.0, 2.0, 3.0), block(xs[..], 2.0), regrouped(1.0, 2.0, 3.0))
+        """)
+
+    val marked = nfu_body(ir, "both")
+
+    nfu_says(marked, "fmul reassoc double")
+    nfu_says(marked, "fadd reassoc double")
+    nfu_unfused(marked)
+
+    val inside = nfu_body(ir, "block")
+
+    nfu_says(inside, "fmul reassoc double")
+    nfu_unfused(inside)
+    nfu_says(nfu_body(ir, "regrouped"), "llvm.fmuladd.f64")
+end nfu_with_reassociate
+
+@test("a '@strict_fp' body that is '@no_fuse' is a strict fmul and a strict fadd, never a strict fma")
+nfu_with_strict()
+    if !nfu_ready() then return
+
+    val ir = nfu_ir(raw"""
+        id(x: real) -> real = x
+
+        @no_fuse
+        @strict_fp
+        @noinline
+        strict_apart(a: real, b: real, c: real) -> real = a * b + c
+
+        @strict_fp
+        @noinline
+        strict_fused(a: real, b: real, c: real) -> real = a * b + c
+
+        print(strict_apart(1.0, 2.0, 3.0), strict_fused(1.0, 2.0, 3.0))
+        """)
+
+    val apart = nfu_body(ir, "strict_apart")
+
+    nfu_says(apart, "llvm.experimental.constrained.fmul.f64")
+    nfu_says(apart, "llvm.experimental.constrained.fadd.f64")
+    nfu_lacks(apart, "fma")
+    nfu_says(nfu_body(ir, "strict_fused"), "llvm.experimental.constrained.fma.f64")
+end nfu_with_strict
+
+@test("inlined into a caller that fuses, a '@no_fuse' body stays fmul and fadd at -O3, and the caller's own sum is still fused")
+nfu_inlined()
+    if !nfu_ready() || !clang_available() then return
+
+    val out = nfu_optimized(raw"""
+        id(x: real) -> real = x
+
+        @no_fuse
+        @inline(always)
+        apart(a: real, b: real, c: real) -> real = a * b + c
+
+        @noinline
+        caller(a: real, b: real, c: real, d: real) -> real = apart(a, b, c) * d + c
+
+        print(caller(1.0, 2.0, 3.0, 4.0))
+        """)
+
+    val body = nfu_body(out, "caller")
+
+    nfu_lacks(out, "define internal double @\"t$apart\"")
+    nfu_says(body, "fmul double %a.param, %b.param")
+    nfu_says(body, "llvm.fma.f64")
+    nfu_lacks(body, "llvm.fma.f64(double %a.param, double %b.param")
+end nfu_inlined
+
+@test("a '@no_fuse' arithmetic operator stays a call wherever it is used, and a '@no_fuse' caller reads no operator as its body")
+nfu_operators()
+    if !nfu_ready() then return
+
+    val ir = nfu_ir(raw"""
+        struct V
+            x: real
+            y: real
+
+        impl Add for V
+            add(self, o: V) -> V = V(self.x + o.x, self.y + o.y)
+
+        impl Mul[real] for V
+            @no_fuse
+            mul(self, k: real) -> V = V(self.x * k, self.y * k)
+
+        struct W
+            x: real
+
+        impl Add for W
+            add(self, o: W) -> W = W(self.x + o.x)
+
+        impl Mul[real] for W
+            mul(self, k: real) -> W = W(self.x * k)
+
+        @noinline
+        fused_caller(a: V, b: V, k: real) -> V = a + b * k
+
+        @no_fuse
+        @noinline
+        apart_caller(a: W, b: W, k: real) -> W = a + b * k
+
+        @noinline
+        read_through(a: W, b: W, k: real) -> W = a + b * k
+
+        val v = fused_caller(V(1.0, 2.0), V(3.0, 4.0), 2.0)
+        val w = apart_caller(W(1.0), W(3.0), 2.0)
+        val u = read_through(W(1.0), W(3.0), 2.0)
+
+        print(v.x, v.y, w.x, u.x)
+        """)
+
+    nfu_unfused(nfu_body(ir, "fused_caller"))
+    nfu_unfused(nfu_body(ir, "apart_caller"))
+    nfu_says(nfu_body(ir, "read_through"), "llvm.fma.f64")
+end nfu_operators
+
+// -- what a run prints ------------------------------------------------------------------------------
+
+private val nfu_witness: string = raw"""
+    id(x: real) -> real = x
+
+    @no_fuse
+    @noinline
+    apart(x: real, c: real) -> real = x * x + c
+
+    @noinline
+    fused(x: real, c: real) -> real = x * x + c
+
+    @no_fuse
+    @noinline
+    apart32(y: f32, d: f32) -> f32 = y * y + d
+
+    @noinline
+    fused32(y: f32, d: f32) -> f32 = y * y + d
+
+    @no_fuse
+    @noinline
+    lanes(y: <4>f32, d: <4>f32) -> <4>f32 = y * y + d
+
+    @noinline
+    fused_lanes(y: <4>f32, d: <4>f32) -> <4>f32 = y * y + d
+
+    var x = 1.0 + 1.0 / 134217728.0
+    var c = -(1.0 + 1.0 / 67108864.0)
+    var y = 1.0f32 + 1.0f32 / 4096.0f32
+    var d = -(1.0f32 + 1.0f32 / 2048.0f32)
+    val ys = <4>f32(y)
+    val ds = <4>f32(d)
+
+    print(apart(x, c) * 18014398509481984.0, fused(x, c) * 18014398509481984.0)
+    print(apart32(y, d) * 16777216.0f32, fused32(y, d) * 16777216.0f32)
+    print(lanes(ys, ds).sum() * 16777216.0f32, fused_lanes(ys, ds).sum() * 16777216.0f32)
+    """
+
+@test("the witness rounds twice in a '@no_fuse' function and once beside it, at f64, f32 and on a vector, at -O0 and -O3")
+nfu_run_bits()
+    nfu_prints([("main.sysl", nfu_witness)], "0 1\n0 1\n0 4\n")
+
+// A module whose header says `@no_fuse`, in two files, and a program that uses it. The program's own
+// arithmetic is its own module's, and fuses.
+private val nfu_module_a: string = raw"""
+    module witness
+    @no_fuse
+
+    const X = 1.0 + 1.0 / 134217728.0
+    const C = -(1.0 + 1.0 / 67108864.0)
+
+    val image = X * X + C
+    val ran = accumulated(X, C) > 0.0
+    const K = X * X + C
+    const B = X * X + C > 0.0
+
+    const accumulated(x: f64, c: f64) -> f64
+        var s = c
+        s += x * x
+        s
+    """
+
+private val nfu_module_b: string = raw"""
+    module witness
+    @no_fuse
+
+    @noinline
+    sibling(x: real, c: real) -> real = x * x + c
+
+    @noinline
+    generic[T: Add + Mul](x: T, c: T) -> T = x * x + c
+
+    @noinline
+    with_closure(x: real, c: real) -> real
+        val f = (v: real) -> v * v + c
+
+        f(x)
+    """
+
+private val nfu_module_main: string = raw"""
+    import witness.{image, ran, K, B, X, C, accumulated, sibling, generic, with_closure}
+
+    var x = X
+    var c = C
+    val big = 18014398509481984.0
+
+    print(image * big, ran, K * big, B, accumulated(x, c) * big)
+    print(sibling(x, c) * big, generic(x, c) * big, with_closure(x, c) * big)
+    print((x * x + c) * big)
+    """
+
+@test("a '@no_fuse' module header holds for every file of the module, its storage, its constants and its instances, and not for the program using it")
+nfu_module_header()
+    nfu_prints([("main.sysl", nfu_module_main), ("witness/a.sysl", nfu_module_a), ("witness/b.sysl", nfu_module_b)],
+               "0 false 0 false 0\n0 0 0\n1\n")
+
+// A `const` function marked `@no_fuse`, run while compiling and called at run time, beside one that
+// is not: each computes the same bits both ways.
+private val nfu_const_fn: string = raw"""
+    const X = 1.0 + 1.0 / 134217728.0
+    const C = -(1.0 + 1.0 / 67108864.0)
+
+    @no_fuse
+    const apart(x: real, c: real) -> real = x * x + c
+
+    const fused(x: real, c: real) -> real = x * x + c
+
+    const A = apart(X, C)
+    const F = fused(X, C)
+
+    @no_fuse
+    @noinline
+    local() -> real
+        const L = X * X + C
+        L
+
+    const G = X * X + C
+
+    @no_fuse
+    @noinline
+    reads_fused() -> real = G
+
+    @noinline
+    outer_fused() -> real
+        const M = X * X + C
+
+        @no_fuse
+        inner_apart() -> real = M
+
+        inner_apart()
+
+    var x = X
+    var c = C
+    val big = 18014398509481984.0
+
+    print(A * big, apart(x, c) * big, F * big, fused(x, c) * big, local() * big, reads_fused() * big,
+          outer_fused() * big)
+    """
+
+@test("a '@no_fuse' const function computes the same bits while compiling and at run time, and a const keeps the value of the body it was declared in")
+nfu_const_agrees()
+    nfu_prints([("main.sysl", nfu_const_fn)], "0 0 1 1 0 1 1\n")
+
+// -- what is refused --------------------------------------------------------------------------------
+
+@test("'@no_fuse' above a struct, a binding, an 'extern' or an enum is refused: it marks a body")
+nfu_not_a_body()
+    val why = "'@no_fuse' says how a body's multiplies and adds are compiled"
+
+    nfu_refused("print(0)\n\n@no_fuse\nstruct P\n    x: real\n\nprint(P(1.0).x)\n", why)
+    nfu_refused("print(0)\n\n@no_fuse\nval k = 2.0\n\nprint(k)\n", why)
+    nfu_refused("print(0)\n\n@no_fuse\nextern \"C\" fma(a: real, b: real, c: real) -> real\n\nprint(1)\n", why)
+    nfu_refused("enum E\n    A\n\n@no_fuse\nenum F\n    B\n\nprint(1)\n", why)
+end nfu_not_a_body
+
+@test("'@no_fuse' takes no arguments, is written once, and is refused in front of a closure and above a statement")
+nfu_misuse()
+    nfu_refused("print(0)\n\n@no_fuse(on)\nf(a: real) -> real = a * a + a\n\nprint(f(1.0))\n", "'@no_fuse' takes no arguments")
+    nfu_refused("print(0)\n\n@no_fuse\n@no_fuse\nf(a: real) -> real = a * a + a\n\nprint(f(1.0))\n",
+                "'@no_fuse' is written twice above one declaration")
+    nfu_refused("val f = @no_fuse (a: real) -> a * a + a\n\nprint(f(1.0))\n",
+                "a closure takes no annotations, and '@no_fuse' reaches one through the function it is written in")
+    nfu_refused("f(a: real) -> real\n    @no_fuse\n    val k = a * a + a\n    k\n\nprint(f(1.0))\n", "'@no_fuse' says how")
+end nfu_misuse
+
+@test("'@no_fuse' in a file's header is the module's, not a capability the module gives up")
+nfu_header_not_a_capability()
+    if nfu_library().is_empty() then return
+
+    val ir = nfu_ir_files([("main.sysl", "import m.f\n\nprint(f(1.0))\n"),
+                           ("m/m.sysl", "module m\n@no_fuse\n\n@noinline\nf(a: real) -> real = a * a + a\n")])
+
+    nfu_lacks(ir, "error")
+    nfu_unfused(nfu_body(ir, "@m$f"))
+end nfu_header_not_a_capability
+
+@test("a file of a '@no_fuse' module that does not say so is refused at its header; a '@tests' file need not")
+nfu_module_disagrees()
+    if nfu_library().is_empty() then return
+
+    val said = nfu_ir_files([("main.sysl", "import m.{f, g}\n\nprint(f(1.0) + g(1.0))\n"),
+                             ("m/a.sysl", "module m\n@no_fuse\n\nf(a: real) -> real = a * a + a\n"),
+                             ("m/b.sysl", "module m\n\ng(a: real) -> real = a * a + a\n")])
+
+    nfu_says(said, "another file of 'm' says '@no_fuse' in its header, and m/b.sysl does not")
+end nfu_module_disagrees
+
+// The header is read first, as `@no_alloc`'s is: `@no_fuse` on the first lines of a file is the
+// module's even where a function follows it, so the function beside it is unfused too.
+@test("'@no_fuse' on a file's first lines is the module's clause, even above a function")
+nfu_first_lines_are_the_header()
+    if !nfu_ready() then return
+
+    val ir = nfu_ir(raw"""
+        @no_fuse
+        marked(a: real, b: real, c: real) -> real = a * b + c
+
+        @noinline
+        beside(a: real, b: real, c: real) -> real = a * b + c
+
+        print(marked(1.0, 2.0, 3.0), beside(1.0, 2.0, 3.0))
+        """)
+
+    nfu_unfused(nfu_body(ir, "beside"))
+end nfu_first_lines_are_the_header
