@@ -380,7 +380,20 @@ private parse_tuple_type(p: *Parser, start: Span, params: bool) -> TypeRef
         return type_ref(start.to(p.just_taken()), TupleType(parts, false))
     end if
 
-    val parts = parse_type_list(p, ")")
+    var parts: Buf[TypeRef] = buf()
+    var trailing = false
+
+    if !p.at_kw(")")
+        loop
+            parts.push(parse_type(p))
+            trailing = false
+
+            if !p.accept_kw(",") then break
+
+            trailing = true
+
+            if p.at_kw(")") then break
+    end if
 
     p.expect_kw(")")
 
@@ -389,17 +402,22 @@ private parse_tuple_type(p: *Parser, start: Span, params: bool) -> TypeRef
     // `()` is the type whose one value is written `()`: `unit`, spelled as its value is.
     if parts.len() == 0 then return projections_over(p, start, named_type(at, "unit"))
 
+    // `(T,)` -- the tuple of one part, which the trailing comma is the whole of the spelling of, as
+    // in Rust. Before an arrow it is still a parameter list of one, whose comma is a list's own.
+    if parts.len() == 1 && trailing && !(params && p.at_kw("->")) then
+        return projections_over(p, start, type_ref(at, TupleType(parts, false)))
+
     // `(&View)::Target` -- the parentheses group a type for the `::` after them, which a mode has to
     // be grouped to take: `&View::Target` is a reference to `View::Target`.
     if parts.len() == 1 && p.at_kw("::") then return projections_over(p, start, parts[0])
 
-    // A product of one thing is that thing, so `(T)` is a type in parentheses and not a tuple. The
-    // reference anchors it at the token after the ')', where the reading learned it had one part.
+    // Without the comma, `(T)` is a type in parentheses and not a tuple. The reference anchors it at
+    // the token after the ')', where the reading learned it had one part.
     if parts.len() == 1 && !(params && p.at_kw("->"))
         val shown = type_text(parts[0])
 
-        p.fault(p.here(), s"'(${shown})' is a type in parentheses, and a tuple has two or more parts " +
-            s"\u{2014} a product of one thing is that thing, so write '${shown}'")
+        p.fault(p.here(), s"'(${shown})' is a type in parentheses \u{2014} write '${shown}' for the " +
+            s"type itself, or '(${shown},)' for a tuple of one part")
 
         return parts[0]
     end if

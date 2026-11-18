@@ -1,15 +1,15 @@
 module sh.sysl.compiler
 
-import sh.sysl.parsing.Span
+import sh.sysl.parsing.{Source, Span}
 import sysl.buf.{Buf, buf}
-import sysl.text.Search
+import sysl.text.{from_utf8_unchecked, Search}
 
 // The functions a declaration lowers a condition to.
 //
 // **A `where` predicate and a struct's `invariant` clauses are code somebody wrote**, and the way to
 // hold them to everything code is held to is to make them ordinary functions rather than a shape
 // some later pass reads specially. So a `where` becomes `<Type>$pred(value: Base) -> bool` and a
-// struct's clauses become `<Struct>$inv(field1: T1, ...) -> bool`, both registered where every other
+// struct's clauses become `<Struct>$inv(field1: T1, ...) -> string`, both registered where every other
 // function is registered and both typed where every other body is typed. What calls them -- a
 // conversion into the subtype, a write to a field -- names them by the key below.
 //
@@ -36,7 +36,7 @@ register_predicate(a: &Analysis, scope: Scope, s: Stmt)
 
             params.push(Param(s.span, "value", d.base, Public, None, false, false))
             a.tables.funcs.put(pred_key(key),
-                               Func(bool_func(pred_key(key), params, d.pred.unwrap(), s.span),
+                               Func(lowered_func(pred_key(key), params, "bool", d.pred.unwrap(), s.span),
                                     s.span, scope))
         StructDecl(d) ->
             if d.invariants.is_empty() then return
@@ -54,7 +54,7 @@ register_predicate(a: &Analysis, scope: Scope, s: Stmt)
             // parameters, with its bounds -- so the body is checked once against the bounds by the
             // definition-time pass, as any generic body is, and made real per instantiation by the
             // check site (`inv_fn_for`).
-            var f = bool_func(inv_key(key), params, all_of(d.invariants), s.span)
+            var f = lowered_func(inv_key(key), params, "string", first_broken(d.invariants, scope.src), s.span)
 
             f.tparams = d.tparams
             f.bounds = d.bounds
@@ -62,26 +62,70 @@ register_predicate(a: &Analysis, scope: Scope, s: Stmt)
             a.tables.funcs.put(inv_key(key), Func(f, s.span, scope))
         _ -> ()
 
-// The declaration one of these lowers to: a plain function of the values, answering a `bool`.
-private bool_func(name: string, params: Buf[Param], cond: Expr, span: Span) -> FuncDecl
-    var body: Buf[Stmt] = buf()
-
-    body.push(stmt(cond.span, ExprStmt(cond)))
-
-    FuncDecl(name, buf(), params, Some(named_type(span, "bool")), body, buf(), false, Public, buf(),
+// The declaration one of these lowers to: a plain function of the values, answering `ret`.
+private lowered_func(name: string, params: Buf[Param], ret: string, cond: Expr, span: Span) -> FuncDecl
+    FuncDecl(name, buf(), params, Some(named_type(span, ret)), one_stmt(cond), buf(), false, Public, buf(),
              buf(), buf(), None, None, None, false, false, false, None, None, None, None, buf(),
              buf(), no_marks(), span, false)
-end bool_func
+end lowered_func
 
-// A run of clauses as the one condition they amount to.
-private all_of(clauses: Buf[Expr]) -> Expr
-    var out = clauses[0]
+// **A struct's clauses as the one answer a check needs: which of them does not hold.** The answer is
+// empty where every clause holds, and otherwise names the first that does not -- its text, and where
+// it is written (`clause_named`) -- for the failure to report beside the struct
+// (`invariant of 'Window' failed: clause 'lo <= hi' at main.sysl:4:15`).
+//
+// Each clause is the condition of an `if` of its own, in the order written, so the clauses run in
+// that order and stop at the first that fails, exactly as their conjunction would. A clause stands
+// in the `if` as a block, so the `if` takes it as the one `bool` it is -- it neither splits a clause
+// written with `&&` into terms nor lets an `is` in it bind -- and one that is not a `bool` is
+// refused as an invariant (`analyze_bool`).
+private first_broken(clauses: Buf[Expr], src: Source) -> Expr
+    var out = expr(clauses[clauses.len() - 1].span, StrLit(""))
+    var i = clauses.len()
 
-    for i in 1..<clauses.len()
-        out = expr(out.span, Binary("&&", out, clauses[i]))
+    while i > 0
+        i -= 1
+
+        val c = clauses[i]
+        val cond = expr(c.span, Block(one_stmt(c)))
+        val broken = expr(c.span, StrLit(clause_named(src, c.span)))
+
+        out = expr(c.span, IfExpr(cond, one_stmt(out), Some(one_stmt(broken)), false))
 
     out
-end all_of
+end first_broken
+
+private one_stmt(x: Expr) -> Buf[Stmt]
+    var out: Buf[Stmt] = buf()
+
+    out.push(stmt(x.span, ExprStmt(x)))
+    out
+end one_stmt
+
+// A clause as a failure names it: its text, every run of white space one space, and where it is
+// written, unless the build lays down no locations (`bounds_locations`).
+clause_named(src: Source, at: Span) -> string
+    val written = src.text(at)
+    var text: Buf[u8] = buf()
+    var gap = false
+
+    for b in written
+        if b == u8(' ') || b == u8('\n') || b == u8('\t') || b == u8('\r')
+            gap = text.len() > 0
+        else
+            if gap then text.push(u8(' '))
+
+            gap = false
+            text.push(b)
+
+    val named = s"clause '${from_utf8_unchecked(text.view())}'"
+
+    if !bounds_locations() then return named
+
+    val loc = src.locate(at.start)
+
+    s"$named at ${location_file(src.name)}:${loc.line}:${loc.col}"
+end clause_named
 
 // A written type with the qualifier a field carried taken off, which is what a value of it is.
 private unqualified_ref(t: TypeRef) -> TypeRef = *t.kind match
