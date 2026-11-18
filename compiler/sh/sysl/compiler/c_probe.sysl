@@ -331,11 +331,19 @@ private measure(a: &Analysis, unit: Program, consts: Buf[CConstDecl], plan: Buf[
     // lines of whichever text it was said about (`blamed_span`).
     val plain = if first.status.ok() || consts.is_empty() then text else probe_text(unit, consts, plan, types, false)
 
+    // **A line the one-global form settles as an address is named as that**: a string literal cast
+    // to an integer is an address constant C accepts there and refuses once it is shifted into words,
+    // so its refusal would otherwise be clang's, about an initializer the reader never wrote.
+    var addressed: Option[usize] = None
+
     val (said, asked) = if plain == text then (first, text)
     else write_text(src, plain) match
         Err(_) -> (first, text)
         Ok(_) -> capture(clang, args.view(), "", [], true) match
-            Ok(again) -> if again.status.ok() then (first, text) else (again, plain)
+            Ok(again) ->
+                if again.status.ok() then addressed = address_line(again.text, plan)
+
+                if again.status.ok() then (first, text) else (again, plain)
             Err(_) -> (first, text)
 
     // The probe's own source is a temporary and is no input of the build -- named by its directory's
@@ -354,6 +362,9 @@ private measure(a: &Analysis, unit: Program, consts: Buf[CConstDecl], plan: Buf[
 
     note_files_read(read)
     remove_dir_all(dir).unwrap_or(())
+
+    if addressed.is_some()
+        return probe_fault(a, unit, consts[addressed.unwrap()].span, address_said(consts[addressed.unwrap()]))
 
     if !said.status.ok()
         val complaint = after_search_list(said.err.unwrap_or(""))
@@ -1173,9 +1184,7 @@ private measured_const(a: &Analysis, home: Scope, c: CConstDecl, d: CDeclared,
     // which the IR writes as `ptrtoint (ptr @.str to i64)` -- a value the linker decides, not one the
     // probe can read (`exact_whole` answers `address` for it). Read as digits it was a silent 0.
     if !kind.2 && raw.ty == "address"
-        a.fault(home, c.span, s"'${c.c}' is an address here rather than a number, and a " +
-                "'c const' reads the number a constant expression comes to — a string from C is " +
-                "read by declaring the line 'string' or '*u8'")
+        a.fault(home, c.span, address_said(c))
         return held(c, expr(c.span, IntLit("0", 10, "")))
 
     if kind.2 then fraction(a, home, c, kind.0, kind.3, raw) else whole(a, home, c, kind.0, kind.1, kind.3, raw)
@@ -1185,6 +1194,30 @@ end measured_const
 // literal -- the same shape whichever carrier the value crossed on.
 private held(c: CConstDecl, value: Expr) -> Stmt =
     stmt(c.span, ConstDecl(c.name, Some(c.typ), value, c.vis, None))
+
+private address_said(c: CConstDecl) -> string =
+    s"'${c.c}' is an address here rather than a number, and a 'c const' reads the number a " +
+    "constant expression comes to — a string from C is read by declaring the line 'string' or '*u8'"
+
+// The first whole-number line the one-global form (`probe_text`'s `exact` unset) settled as an
+// address -- `ptrtoint (ptr @.str to i64)` -- rather than as digits.
+private address_line(ir: string, plan: Buf[CDeclared]) -> Option[usize]
+    val globals = read_globals(ir)
+
+    for i in 0..<plan.len()
+        val whole = plan[i] match
+            KnownNow(_, _, floating, _) -> !floating
+            KnownLater(_, _, _) -> true
+            Text(_, _) -> false
+
+        if !whole then continue
+
+        marked(globals, ConstMarker, i) match
+            Some(g) -> if g.ty == "i64" && !decimal_shaped(g.operand) then return Some(i)
+            None -> ()
+
+    None
+end address_line
 
 // Whether an operand is the decimal LLVM prints for an integer, rather than a constant expression
 // such as `ptrtoint`.
