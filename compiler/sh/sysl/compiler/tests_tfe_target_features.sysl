@@ -1,0 +1,509 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, split}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `@extensions("...")` and `@unchecked("...")` (`extensions.sysl`, `reference/attributes.md §
+// @extensions`): a body compiled for processor extensions the build does not promise, and the rule
+// a call of one is held to.
+//
+// **The axes**: where the call is (a plain body, a marked one, a closure or nested function inside a
+// marked one, an `@unchecked` block naming the extension, one naming another), what the build
+// promises (nothing, `codegen.extensions`, the row's processor -- `aarch64-macos` is the M1), what
+// is reached (a function, a generic's instance, a member, a CRC-32C `extern`, an address, a trait's
+// table), and the machine (aarch64, x86_64, a row whose functions' lists replace the build's). The
+// instructions are proved by clang assembling the text: `crc` through the intrinsic, `aes`, `sha3`
+// and `dotprod` through `asm`, each refused by the assembler without the annotation. Not crossed:
+// separate compilation -- no precompiled package carries an `@extensions` body, and the standard
+// module has none -- and wasm/craft, whose code LLVM does not get extensions for, refused with the
+// Thumb row's sentence.
+
+// What a program says for `t`: its first diagnostic, or the LLVM text clang is handed.
+private tfe_for(t: Target, text: string) -> string
+    var units: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, t) match
+            Err(_) -> ()
+            Ok(library) -> units = library
+
+    if units.is_empty() then return "the library could not be read for this machine"
+
+    val parsed = parse(source_of("main.sysl", text), t)
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, t)
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+
+    for item in errors_of(done.an.diagnostics())
+        if !item.src.name.starts_with("library/") then return item.render()
+
+    for_clang(ir_print_module(codegen_with_gaps(prune(strip_tests(whole), program_own(units)), t,
+                                                promotions).0), t)
+end tfe_for
+
+// What clang makes of `ll` for `t` at -O1: whether it compiled, and the assembly or the complaint.
+private tfe_asm(t: Target, ll: string) -> (bool, string)
+    val clang = find_clang(t, None).unwrap()
+    val dir = make_temp_dir("sysl-tfe").unwrap()
+    val src = s"$dir/m.ll"
+
+    write_text(src, ll).unwrap()
+
+    val got = capture(clang, [s"--target=${t.triple}", "-S", "-O1", "-Wno-override-module", "-o", "-", src],
+                      "", [], true)
+
+    remove_dir_all(dir).unwrap_or(())
+
+    got match
+        Err(_) -> (false, "clang could not be run")
+        Ok(out) -> (out.status.ok(), out.text + out.err.unwrap_or(""))
+end tfe_asm
+
+private tfe_row(name: string) -> Target = target_named(name).unwrap()
+
+private tfe_reset()
+    use_codegen_features(no_codegen_features())
+    use_cpu("", buf())
+
+private tfe_said(t: Target, text: string) -> string
+    tfe_reset()
+    tfe_for(t, text)
+
+// A function compiled for `crc`, through the CRC-32C intrinsic, and a line calling it as `call`.
+private tfe_crc(call: string) -> string =
+    "private extern \"llvm.aarch64.crc32cx\" crc_word(crc: u32, w: u64) -> u32\n\n" +
+    "@extensions(\"crc\")\nstep(crc: u32, w: u64) -> u32 = crc_word(crc, w)\n\n" + call + "\n"
+
+// -- what may be written ---------------------------------------------------------------------------
+
+@test("@extensions takes its names as strings in parentheses, and has no empty or bare form")
+tfe_names_are_strings()
+    val t = tfe_row("aarch64-linux")
+
+    for text in ["@extensions\nf() -> int = 1\n\nprint(f())\n", "@extensions()\nf() -> int = 1\n\nprint(f())\n",
+                 "@extensions(crc)\nf() -> int = 1\n\nprint(f())\n"]
+        val said = tfe_said(t, text)
+
+        assert(said.contains("'@extensions' names the processor's extensions a body is compiled to use, as " +
+               "strings in parentheses"), said)
+end tfe_names_are_strings
+
+@test("a name is written alone: no sign, no comma, not empty, not twice")
+tfe_name_shapes()
+    val t = tfe_row("aarch64-linux")
+    val plus = tfe_said(t, "@extensions(\"+crc\")\nf() -> int = 1\n\nprint(f())\n")
+
+    assert(plus.contains("'@extensions' names an extension as LLVM spells the feature, written alone — " +
+           "\"crc\", not \"+crc\""), plus)
+
+    val minus = tfe_said(t, "@extensions(\"-neon\")\nf() -> int = 1\n\nprint(f())\n")
+
+    assert(minus.contains("\"neon\", not \"-neon\": every name is one the code may use, and nothing here " +
+           "takes one away"), minus)
+
+    val comma = tfe_said(t, "@extensions(\"crc,aes\")\nf() -> int = 1\n\nprint(f())\n")
+
+    assert(comma.contains("'@extensions' takes one extension per string"), comma)
+
+    val empty = tfe_said(t, "@extensions(\"\")\nf() -> int = 1\n\nprint(f())\n")
+
+    assert(empty.contains("'@extensions' names an extension, and \"\" is not the name of one"), empty)
+
+    val twice = tfe_said(t, "@extensions(\"crc\", \"crc\")\nf() -> int = 1\n\nprint(f())\n")
+
+    assert(twice.contains("'@extensions' names 'crc' twice"), twice)
+
+    val again = tfe_said(t, "@extensions(\"crc\")\n@extensions(\"aes\")\nf() -> int = 1\n\nprint(f())\n")
+
+    assert(again.contains("'@extensions' is written twice above one declaration"), again)
+end tfe_name_shapes
+
+@test("@extensions marks a function or a method, never an extern or a struct")
+tfe_marks_a_body()
+    val t = tfe_row("aarch64-linux")
+    val ext = tfe_said(t, "@extensions(\"crc\")\nextern \"llvm.aarch64.crc32cx\" s(c: u32, w: u64) -> u32\n\n" +
+                          "print(1)\n")
+
+    assert(ext.contains("'@extensions' says which of the processor's extensions a body is compiled to " +
+           "use, so it marks a function or a method"), ext)
+
+    val st = tfe_said(t, "@extensions(\"crc\")\nstruct P\n    x: int\n\nprint(1)\n")
+
+    assert(st.contains("'@extensions' says which of the processor's extensions"), st)
+end tfe_marks_a_body
+
+@test("@inline(always) beside @extensions is refused, and the bare hint is not")
+tfe_always_inline_refused()
+    val t = tfe_row("aarch64-linux")
+    val always = tfe_said(t, "@inline(always)\n@extensions(\"crc\")\nf() -> int = 1\n\nprint(1)\n")
+
+    assert(always.contains("'@inline(always)' puts the body in place of every call, and a body " +
+           "compiled for a processor's extensions is only ever put inside a caller that has them too"), always)
+
+    val hint = tfe_said(t, "@inline\n@extensions(\"crc\")\nf() -> int = 1\n\n@extensions(\"crc\")\n" +
+                           "g() -> int = f()\n\n@unchecked(\"crc\")\n    print(g())\n")
+
+    assert(hint.contains("inlinehint"), hint)
+end tfe_always_inline_refused
+
+@test("@unchecked(\"...\") marks a block, and its names are held to what @extensions' are")
+tfe_unchecked_block_shapes()
+    val t = tfe_row("aarch64-linux")
+    val bare = tfe_said(t, "@unchecked(\"crc\") print(1)\n")
+
+    assert(bare.contains("'@unchecked(\"...\")' with an extension's name marks a block"), bare)
+
+    val decl = tfe_said(t, "@unchecked(\"crc\")\nf() -> int = 1\n\nprint(f())\n")
+
+    assert(decl.contains("marks a block"), decl)
+
+    val plus = tfe_said(t, "@unchecked(\"+crc\")\n    print(1)\n")
+
+    assert(plus.contains("'@unchecked' names an extension as LLVM spells the feature, written alone"), plus)
+
+    val unknown = tfe_said(t, "@unchecked(\"crcc\")\n    print(1)\n")
+
+    assert(unknown.contains("'@unchecked' names 'crcc', which the aarch64 back end does not know"), unknown)
+
+    // `@unchecked(Send)` above a struct is still the struct's promise.
+    val send = tfe_said(t, "@unchecked(Send)\nstruct P\n    x: int\n\nprint(1)\n")
+
+    assert(!send.contains("marks a block"), send)
+end tfe_unchecked_block_shapes
+
+@test("a name the back end does not know is refused, as codegen.extensions refuses it")
+tfe_unknown_name()
+    val said = tfe_said(tfe_row("aarch64-linux"), "@extensions(\"crcc\")\nf() -> int = 1\n\nprint(f())\n")
+
+    assert(said.contains("'@extensions' names 'crcc', which the aarch64 back end does not know — an " +
+           "extension is spelled as LLVM spells the feature"), said)
+
+    // An AArch64 name is not an x86 one.
+    val x86 = tfe_said(tfe_row("x86_64-linux"), "@extensions(\"crc\")\nf() -> int = 1\n\nprint(f())\n")
+
+    assert(x86.contains("'@extensions' names 'crc', which the x86_64 back end does not know"), x86)
+end tfe_unknown_name
+
+@test("only aarch64 and x86_64 take it: a Thumb or RISC-V function's list would replace the build's")
+tfe_other_machines_refused()
+    for row in ["thumb-freestanding", "riscv64-freestanding"]
+        val said = tfe_said(tfe_row(row), "@extensions(\"dsp\")\nf() -> int = 1\n\n@export(\"main\")\n" +
+                                          "go() -> i32 = i32(f())\n")
+
+        assert(said.contains(s"'@extensions' is accepted on aarch64 and x86_64, where a function's " +
+               s"extensions add to its processor's, and this build is for '$row'"), s"$row: $said")
+end tfe_other_machines_refused
+
+// -- the rule a call is held to --------------------------------------------------------------------
+
+@test("a call from code without the extension is refused, naming both ways to make it")
+tfe_plain_call_refused()
+    val said = tfe_said(tfe_row("aarch64-linux"), tfe_crc("print(step(1, 2))"))
+
+    assert(said.contains("'step' is called, and it is compiled for the processor's 'crc' extension, which " +
+           "'aarch64-linux' does not promise and the code here is not compiled for — on a processor " +
+           "without it its first such instruction faults. Mark the caller '@extensions(\"crc\")', or " +
+           "make the call inside '@unchecked(\"crc\")' once the program has asked the processor"), said)
+end tfe_plain_call_refused
+
+@test("a function compiled for the extension calls it, and so does an @unchecked block naming it")
+tfe_marked_and_unchecked_callers()
+    val t = tfe_row("aarch64-linux")
+    val marked = tfe_said(t, tfe_crc("@extensions(\"crc\")\ntwice(c: u32) -> u32 = step(step(c, 1), 2)\n\n" +
+                                     "@unchecked(\"crc\")\n    print(twice(0))"))
+
+    assert(!marked.contains("error") && marked.contains("@twice"), marked)
+
+    // A block naming more than the callee needs is fine; one naming another extension is not.
+    val more = tfe_said(t, tfe_crc("@unchecked(\"aes\", \"crc\")\n    print(step(1, 2))"))
+
+    assert(!more.contains("error"), more)
+
+    val other = tfe_said(t, tfe_crc("@unchecked(\"aes\")\n    print(step(1, 2))"))
+
+    assert(other.contains("'step' is called, and it is compiled for the processor's 'crc' extension"), other)
+
+    // The block is lexical: a call after it is outside it.
+    val after = tfe_said(t, tfe_crc("@unchecked(\"crc\")\n    print(step(1, 2))\nprint(step(3, 4))"))
+
+    assert(after.contains("'step' is called"), after)
+
+    // Inside an `if`, which is where a program's own check puts it.
+    val guarded = tfe_said(t, tfe_crc("val ok = true\n\nif ok\n    @unchecked(\"crc\")\n        print(step(1, 2))"))
+
+    assert(!guarded.contains("error"), guarded)
+end tfe_marked_and_unchecked_callers
+
+@test("every extension a callee names must be had, and the refusal names only the missing")
+tfe_two_extensions()
+    val text = "@extensions(\"aes\", \"sha3\")\nmix(x: int) -> int = x + 1\n\n@unchecked(\"aes\")\n" +
+               "    print(mix(1))\n"
+    val said = tfe_said(tfe_row("aarch64-linux"), text)
+
+    assert(said.contains("compiled for the processor's 'sha3' extension, which"), said)
+    assert(said.contains("'@extensions(\"sha3\")'"), said)
+
+    val none = tfe_said(tfe_row("aarch64-linux"), "@extensions(\"aes\", \"sha3\")\nmix(x: int) -> int = x + 1\n\n" +
+                                                  "print(mix(1))\n")
+
+    assert(none.contains("'aes' and 'sha3' extensions") && none.contains("'@unchecked(\"aes\", \"sha3\")'"), none)
+end tfe_two_extensions
+
+@test("a closure and a nested function written inside a marked body have its extensions")
+tfe_written_inside_inherits()
+    val t = tfe_row("aarch64-linux")
+    val closure = tfe_said(t, tfe_crc("@extensions(\"crc\")\nall(xs: []u64) -> u32\n    var c: u32 = 0\n" +
+                                      "    val f = (w: u64) -> step(c, w)\n    for x in xs\n        c = f(x)\n" +
+                                      "    c\n\nval ws: [2]u64 = [1, 2]\n\n@unchecked(\"crc\")\n    print(all(ws[..]))"))
+
+    assert(!closure.contains("error"), closure)
+
+    val nested = tfe_said(t, tfe_crc("@extensions(\"crc\")\nouter(w: u64) -> u32\n    inner(v: u64) -> u32 = " +
+                                     "step(0, v)\n    inner(w)\n\n@unchecked(\"crc\")\n    print(outer(1))"))
+
+    assert(!nested.contains("error"), nested)
+
+    // And a closure written inside the block is inside it.
+    val in_block = tfe_said(t, tfe_crc("@unchecked(\"crc\")\n    val g = (w: u64) -> step(0, w)\n    print(g(1))"))
+
+    assert(!in_block.contains("error"), in_block)
+
+    // A closure written outside both is not.
+    val outside = tfe_said(t, tfe_crc("val g = (w: u64) -> step(0, w)\n\n@unchecked(\"crc\")\n    print(g(1))"))
+
+    assert(outside.contains("'step' is called"), outside)
+end tfe_written_inside_inherits
+
+@test("what the build promises everywhere needs no block: codegen.extensions, and the M1's own list")
+tfe_build_promise()
+    tfe_reset()
+
+    var xs: Buf[string] = buf()
+
+    xs.push("crc")
+    use_codegen_features(CodegenFeatures(false, false, xs))
+
+    val listed = tfe_for(tfe_row("aarch64-linux"), tfe_crc("print(step(1, 2))"))
+
+    tfe_reset()
+    assert(!listed.contains("error"), listed)
+
+    val mac = tfe_said(tfe_row("aarch64-macos"), tfe_crc("print(step(1, 2))"))
+
+    assert(!mac.contains("error"), mac)
+
+    // The M1 has `sha3` too, and no `sve`.
+    val sve = tfe_said(tfe_row("aarch64-macos"), "@extensions(\"sha3\", \"sve\")\nf() -> int = 1\n\nprint(f())\n")
+
+    assert(sve.contains("compiled for the processor's 'sve' extension, which 'aarch64-macos' does not promise"), sve)
+end tfe_build_promise
+
+@test("a generic's every instance and a member are held to the rule")
+tfe_generic_and_member()
+    val t = tfe_row("aarch64-linux")
+    val generic = tfe_said(t, "@extensions(\"crc\")\nid[T](x: T) -> T = x\n\n@unchecked(\"crc\")\n" +
+                              "    print(id(1))\nprint(id(\"a\"))\n")
+
+    assert(generic.contains("is called, and it is compiled for the processor's 'crc' extension"), generic)
+
+    val member = tfe_said(t, "struct P\n    x: int\n\n    @extensions(\"crc\")\n    get(self) -> int = self.x\n\n" +
+                             "val p = P(1)\n\nprint(p.get())\n")
+
+    assert(member.contains("is called, and it is compiled for the processor's 'crc' extension"), member)
+
+    val member_ok = tfe_said(t, "struct P\n    x: int\n\n    @extensions(\"crc\")\n    get(self) -> int = self.x\n\n" +
+                                "val p = P(1)\n\n@unchecked(\"crc\")\n    print(p.get())\n")
+
+    assert(!member_ok.contains("error"), member_ok)
+end tfe_generic_and_member
+
+@test("an address of a marked function is held to what a call is")
+tfe_address_taken()
+    val t = tfe_row("aarch64-linux")
+    val text = "@extensions(\"crc\")\ntwice(x: int) -> int = x * 2\n\n"
+    val plain = tfe_said(t, text + "val f = twice\n\nprint(f(2))\n")
+
+    assert(plain.contains("compiled for the processor's 'crc' extension"), plain)
+
+    val inside = tfe_said(t, text + "@unchecked(\"crc\")\n    val f = twice\n    print(f(2))\n")
+
+    assert(!inside.contains("error"), inside)
+end tfe_address_taken
+
+@test("a marked method may not fill a trait's table, where a call names no function")
+tfe_trait_table_refused()
+    val said = tfe_said(tfe_row("aarch64-linux"),
+        "trait Shape\n    area(self) -> int\n\nstruct Sq\n    s: int\n\nimpl Shape for Sq\n" +
+        "    @extensions(\"crc\")\n    area(self) -> int = self.s * self.s\n\n" +
+        "val sh: &Shape = Sq(3)\n\n@unchecked(\"crc\")\n    print(sh.area())\n")
+
+    assert(said.contains("fills a slot of 'Shape''s table, and a call through a trait object names no " +
+           "function, so it could not be checked for them"), said)
+end tfe_trait_table_refused
+
+@test("a CRC-32C extern is held to the rule: declared anywhere, called where crc is had")
+tfe_crc32c_extern_per_call()
+    val t = tfe_row("aarch64-linux")
+    val decl = "private extern \"llvm.aarch64.crc32cx\" step(crc: u32, w: u64) -> u32\n\n"
+    val plain = tfe_said(t, decl + "print(step(1, 2))\n")
+
+    assert(plain.contains("'step' is called, and it is compiled for the processor's 'crc' extension, which " +
+           "'aarch64-linux' does not promise"), plain)
+
+    val unused = tfe_said(t, decl + "print(1)\n")
+
+    assert(!unused.contains("error"), unused)
+
+    val blocked = tfe_said(t, decl + "@unchecked(\"crc\")\n    print(step(1, 2))\n")
+
+    assert(blocked.contains("call i32 @llvm.aarch64.crc32cx("), blocked)
+
+    // SSE 4.2's are `sse4.2`'s.
+    val x86 = tfe_said(tfe_row("x86_64-linux"), "private extern \"llvm.x86.sse42.crc32.32.8\" b8(crc: u32, " +
+                       "b: u8) -> u32\n\nprint(b8(0, 1))\n")
+
+    assert(x86.contains("compiled for the processor's 'sse4.2' extension"), x86)
+
+    val x86_ok = tfe_said(tfe_row("x86_64-linux"), "private extern \"llvm.x86.sse42.crc32.32.8\" b8(crc: u32, " +
+                          "b: u8) -> u32\n\n@extensions(\"sse4.2\")\none() -> u32 = b8(0, 1)\n\n" +
+                          "@unchecked(\"sse4.2\")\n    print(one())\n")
+
+    assert(!x86_ok.contains("error"), x86_ok)
+end tfe_crc32c_extern_per_call
+
+// -- what reaches the back end ---------------------------------------------------------------------
+
+@test("the define line carries the processor's list, then the function's, in a group without the build's")
+tfe_feature_attribute()
+    val out = tfe_said(tfe_row("aarch64-linux"), tfe_crc("@unchecked(\"crc\")\n    print(step(1, 2))"))
+    val lines = split(out, "\n")
+    var line = ""
+
+    for l in lines
+        if tfe_defines(l, "step") then line = l
+
+    assert(line.contains("\"target-features\"=\"+v8a,+fp-armv8,+neon") && line.contains(",+crc\""), line)
+    assert(line.contains("#98 {"), line)
+    assert(out.contains("attributes #98 = { nounwind"), out)
+
+    // Every other definition keeps the shared group, and the plain ones carry no list of their own.
+    for l in lines
+        if l.starts_with("define") && !tfe_defines(l, "step")
+            assert(l.contains("#99") && !l.contains("target-features"), l)
+end tfe_feature_attribute
+
+// Whether `line` defines the program's function `name`.
+private tfe_defines(line: string, name: string) -> bool =
+    line.starts_with("define") && (line.contains(s"@$name(") || line.contains(s"@$name$$"))
+
+@test("the build's own settings come before the function's, and strict_align after both")
+tfe_feature_order()
+    tfe_reset()
+
+    var xs: Buf[string] = buf()
+
+    xs.push("lse")
+    use_codegen_features(CodegenFeatures(false, true, xs))
+
+    val out = tfe_for(tfe_row("aarch64-linux"), tfe_crc("@unchecked(\"crc\")\n    print(step(1, 2))"))
+
+    tfe_reset()
+    assert(out.contains(",+lse,+crc,+strict-align\""), out)
+
+    // `#98` is `#99` without the build's list, which the function's already holds.
+    var group98 = ""
+    var group99 = ""
+
+    for l in split(out, "\n")
+        if l.starts_with("attributes #98") then group98 = l
+        if l.starts_with("attributes #99") then group99 = l
+
+    assert(group99.contains("\"target-features\"=\"+lse,+strict-align\""), group99)
+    assert(group98 != "" && !group98.contains("target-features"), group98)
+end tfe_feature_order
+
+@test("the back end emits each extension's instructions in the marked body, and refuses them without")
+tfe_instructions_emitted()
+    val t = tfe_row("aarch64-linux")
+    val text = "private extern \"llvm.aarch64.crc32cx\" crc_word(crc: u32, w: u64) -> u32\n\n" +
+        "@extensions(\"crc\")\ncrc(c: u32, w: u64) -> u32 = crc_word(c, w)\n\n" +
+        "@extensions(\"aes\")\naes()\n    asm\n        [aarch64]\n            \"aese v0.16b, v1.16b\"\n" +
+        "            clobbers \"v0\"\n        [x86_64, riscv64, riscv32, thumb, craft, wasm32] unavailable \"aarch64\"\n\n" +
+        "@extensions(\"sha3\")\nsha3()\n    asm\n        [aarch64]\n            \"eor3 v0.16b, v1.16b, v2.16b, v3.16b\"\n" +
+        "            clobbers \"v0\"\n        [x86_64, riscv64, riscv32, thumb, craft, wasm32] unavailable \"aarch64\"\n\n" +
+        "@extensions(\"dotprod\")\ndot()\n    asm\n        [aarch64]\n            \"udot v0.4s, v1.16b, v2.16b\"\n" +
+        "            clobbers \"v0\"\n        [x86_64, riscv64, riscv32, thumb, craft, wasm32] unavailable \"aarch64\"\n\n" +
+        "@unchecked(\"crc\", \"aes\", \"sha3\", \"dotprod\")\n    aes()\n    sha3()\n    dot()\n    print(crc(1, 2))\n"
+    val ll = tfe_said(t, text)
+
+    assert(ll.contains("target-features"), ll)
+
+    val built = tfe_asm(t, ll)
+    val code = built.1
+
+    assert(built.0, code)
+    assert(code.contains("crc32cx"), code)
+    assert(code.contains("aese"), code)
+    assert(code.contains("eor3"), code)
+    assert(code.contains("udot"), code)
+
+    // The same body unmarked is refused by the assembler -- the annotation is what put them there.
+    val insns = ["aese v0.16b, v1.16b", "eor3 v0.16b, v1.16b, v2.16b, v3.16b", "udot v0.4s, v1.16b, v2.16b"]
+
+    for insn in insns
+        val bare = tfe_said(t, s"f()\n    asm\n        [aarch64]\n            \"$insn\"\n            clobbers \"v0\"\n" +
+                               "        [x86_64, riscv64, riscv32, thumb, craft, wasm32] unavailable \"aarch64\"\n\nf()\n")
+        val refused = tfe_asm(t, bare)
+
+        assert(!refused.0 && refused.1.contains("instruction requires"), s"$insn: ${refused.1}")
+end tfe_instructions_emitted
+
+@test("a plain helper is inlined into a marked body, and the marked body into no plain caller")
+tfe_inlining_follows_the_features()
+    val t = tfe_row("aarch64-linux")
+    val text = "private extern \"llvm.aarch64.crc32cx\" crc_word(crc: u32, w: u64) -> u32\n\n" +
+        "private helper(w: u64) -> u64 = w * 7\n\n" +
+        "@extensions(\"crc\")\nprivate kern(c: u32, w: u64) -> u32 = crc_word(c, helper(w))\n\n" +
+        "@export(\"plain\")\nplain(c: u32, w: u64) -> u32\n    @unchecked(\"crc\")\n        return kern(c, w)\n\n" +
+        "@export(\"marked\")\n@extensions(\"crc\")\nmarked(c: u32, w: u64) -> u32 = kern(c, w)\n\nprint(plain(1, 2), marked(1, 2))\n"
+    val built = tfe_asm(t, tfe_said(t, text))
+    val code = built.1
+
+    assert(built.0, code)
+
+    // The helper's multiply is in the marked body, with no call of it left anywhere.
+    assert(!code.contains("helper"), code)
+    // The plain caller keeps the call, since inlining would put crc32cx in a body without +crc.
+    assert(code.contains("kern"), code)
+end tfe_inlining_follows_the_features
+
+@test("it runs on this machine, from an @unchecked block and from a marked caller")
+tfe_runs_here()
+    if host_target().cpu != Aarch64 then return
+
+    val out = xvr_ran([("main.sysl",
+        "private extern \"llvm.aarch64.crc32cx\" crc_word(crc: u32, w: u64) -> u32\n\n" +
+        "@extensions(\"crc\")\nstep(c: u32, w: u64) -> u32 = crc_word(c, w)\n\n" +
+        "@extensions(\"sha3\")\nxor3(a: u64, b: u64, c: u64) -> u64\n    var r: u64 = 0\n    asm\n        [aarch64]\n" +
+        "            \"fmov d1, {a}\"\n            \"fmov d2, {b}\"\n            \"fmov d3, {c}\"\n" +
+        "            \"eor3 v0.16b, v1.16b, v2.16b, v3.16b\"\n            \"fmov {r}, d0\"\n" +
+        "            in a : reg\n            in b : reg\n            in c : reg\n            out r : reg\n" +
+        "            clobbers \"v0\", \"v1\", \"v2\", \"v3\"\n" +
+        "        [x86_64, riscv64, riscv32, thumb, craft, wasm32] unavailable \"aarch64\"\n    r\n\n" +
+        "soft(c: u32, w: u64) -> u32\n    var crc = c\n    for i in 0..<8\n        crc ^= u32((w >> u64(8 * i)) & 0xff)\n" +
+        "        for _ in 0..<8\n            crc = if (crc & 1) == 1 then (crc >> 1) ^ 0x82f63b78 else crc >> 1\n    crc\n\n" +
+        "@unchecked(\"crc\", \"sha3\")\n    print(step(0xffffffff, 0x3837363534333231) == soft(0xffffffff, 0x3837363534333231))\n" +
+        "    print(xor3(0xf0, 0x0f, 0xff))\n")])
+
+    assert_eq(out, "true\n0\n")
+end tfe_runs_here
