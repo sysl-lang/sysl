@@ -931,6 +931,36 @@ sfp_generics_methods_closures()
     assert_eq(strict_defines, 9)
 end sfp_generics_methods_closures
 
+// A closure is inside a strict generic by the instantiation's span, which is the declaration's: one
+// written above the body's last statement is strict too, at one type and at two.
+@test("a closure above the last statement of a strict generic is strict")
+sfp_closure_above_a_generic_tail()
+    if !sfp_ready() then return
+
+    val program = raw"""
+        import sysl.fenv.*
+        import sysl.math.Float
+
+        @strict_fp
+        third[T: Float](x: T, three: T) -> T
+            val up = with_rounding(Upward, () -> x / three)
+            up
+
+        main(args: []string)
+            print(third(f32(args.len), 3.0f32).bits(), third(real(args.len), 3.0).bits())
+        """
+
+    sfp_prints(program, "1051372203 4599676419421066582\n")
+
+    // Each division is in a closure, one per instantiation, and each is the constrained one: before,
+    // both closures were lowered as ordinary code, their division a plain `fdiv`.
+    val ir = sfp_ir(program, Some("aarch64-freestanding"))
+
+    assert_eq(sfp_count(ir, "@llvm.experimental.constrained.fdiv.f32(float "), 1)
+    assert_eq(sfp_count(ir, "@llvm.experimental.constrained.fdiv.f64(double "), 1)
+    sfp_lacks(ir, " = fdiv ")
+end sfp_closure_above_a_generic_tail
+
 // -- vectors -------------------------------------------------------------------------------------------
 
 @test("a lane-wise vector operation is strict like a scalar one")
