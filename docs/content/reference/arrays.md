@@ -1606,6 +1606,71 @@ this returns a view borrowed from 'r', and nothing keeps 'r' alive once this fun
 The view is still a plain `[]const u8` at no run-time cost. [Memory](/reference/memory/#a-view-borrowed-from-its-receiver)
 has the four places it is refused.
 
+## Reading a view as another element
+
+**`xs.view_as[T]()` is the same storage read as `T`s**: the same owner, the same first byte, and the
+length counted again — eight bytes are two `u32`s, and two `u32`s are eight bytes. It is called on a
+view or on an array, which is read whole. Nothing is copied, so a write through either side is seen
+through the other, and the view keeps the storage alive exactly as the view it was made from does:
+
+```sysl
+@align(4)
+var packet: [8]u8 = [1, 0, 0, 0, 2, 0, 0, 0]
+
+val words = packet.view_as[u32]()
+
+print(words.len, words[0], words[1])
+
+words[1] = 0x0403_0201
+
+print(packet[4], packet[7])
+```
+
+```output
+2 1 2
+1 4
+```
+
+**Both element types must be plain data**: no address and no count in them, and no bit pattern of
+their bytes that is not a value. The integers whose bits fill their bytes, the floats, fixed point, a
+`new` type that checks nothing, and arrays, vectors and structs of those qualify; so does a union whose
+every field is its full size. A `bool`, a `char`, an enum, a ranged subtype, a pointer, a reference, a
+view, a type with a destructor and a struct with padding do not, on either side — a write through the
+view would otherwise put into the source a value its type does not have:
+
+```sysl
+var flags: [4]bool = [true, false, true, false]
+val raw = flags.view_as[u8]()
+```
+
+```error
+'view_as' reads the storage of a '[]bool', and bool is not plain data — a 'bool' is valid only as 0 or 1
+```
+
+**What only the run can know, the run checks**: that the first element sits on `T`'s boundary, and
+that the bytes are a whole number of `T`s. Each check is made only where the two layouts leave it
+open — a `[]u32` read as `[]u8` checks nothing — and an empty view passes both, whatever address it
+carries. A failure traps, as a subscript out of range does; `@align(n)` on the storage is how an array
+of bytes is put on a wider element's boundary:
+
+```sysl
+@align(4)
+var packet: [8]u8 = [1, 0, 0, 0, 2, 0, 0, 0]
+
+print(packet[0..<4].view_as[u32]().len)
+print(packet[0..<6].view_as[u32]().len)
+```
+
+```output trap
+1
+```
+
+**A read-only view is read as a read-only one**, and a view of a `val` array is read-only, so the
+licence to write is never gained by changing the element. A zero-sized element is refused on either
+side, since no count of them names any bytes. The bytes are the machine's, in its own order: a
+program that reads a format of a stated order reads its fields through
+[`@byte_order`](/reference/attributes/) or `sysl.math.ByteOrder`.
+
 ## Growing one
 
 `Buf[T]` is the growable array, and it is **ordinary sysl in the library** rather than a type the

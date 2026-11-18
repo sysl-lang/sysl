@@ -137,11 +137,18 @@ end unwrap_results
 // A condition, which must be a `bool`. A refusal is anchored at `at`, the form that asks for the
 // boolean -- the `if`, the loop, the `&&`, the `!`, the clause or the function a contract belongs
 // to -- rather than at the operand, which is where the reference puts it.
+//
+// **A struct's `invariant` clause is the one condition here that is a block**, standing in the `if`
+// its clauses lower to (`first_broken`), and it is refused as the clause the reader wrote.
 analyze_bool(cx: &Analyzer, e: Expr, at: Span) -> TExpr
     val t = type_expr(cx, e, Some(Bool))
 
-    if texpr_type(t) != Bool && texpr_type(t) != Unknown then
+    if texpr_type(t) != Bool && texpr_type(t) != Unknown
+        if *e.kind is Block(_) && cx.func_name.contains("$inv") then
+            return cx.err(at, s"an 'invariant' must be a 'bool', but this one is ${type_show(texpr_type(t))}")
+
         return cx.err(at, s"condition must be bool, got ${type_show(texpr_type(t))}")
+    end if
 
     t
 end analyze_bool
@@ -554,6 +561,15 @@ name_expr(cx: &Analyzer, span: Span, name: string, expected: Option[Type]) -> TE
             end if
 
             if lc.character && wants_byte(expected) then return local_char_at(cx, span, lc, expected)
+
+            // Read in a body whose fusing differs from the one it was declared in, it is the value it
+            // came to there (`no_fuse.sysl`).
+            if lc.no_fuse != no_fuse_here(cx)
+                lc.folded match
+                    Some(ConstFloat(f)) ->
+                        return TExpr(span, TFloatLit(float_pattern(f), underlying(texpr_type(lc.image))))
+                    _ -> ()
+            end if
 
             return TExpr(span, konst.unwrap().0.kind)
         end if
@@ -1293,6 +1309,22 @@ private const_value_expr(cx: &Analyzer, span: Span, key: string,
         val byte_at = char_at_byte(cx, span, value, expected)
 
         if byte_at.is_some() then return byte_at.unwrap()
+    end if
+
+    // **A float constant used where fusing is not what it is where it was declared** -- one of a
+    // `@no_fuse` module read by a module that fuses, or the other way round -- is the value its own
+    // module computes, folded there, rather than its arithmetic lowered under the reader's rule
+    // (`no_fuse.sysl`).
+    val floating = underlying(ty) match
+        Floating(_, _) -> true
+        _ -> false
+
+    if floating && no_fuse_here(inner) != no_fuse_here(cx)
+        val folded = const_fold_typed(type_expr(inner, d.init.unwrap(), Some(ty)), fold_machine_in(inner))
+
+        folded match
+            Some(ConstFloat(f)) -> return TExpr(span, TFloatLit(float_pattern(f), underlying(ty)))
+            _ -> ()
     end if
 
     // **A `const` IS ITS VALUE, so a use of one is the value and not the arithmetic that wrote it.**
@@ -2190,7 +2222,7 @@ end binary_expr
 // its neighbour is read at.
 private literal_subject_operands(cx: &Analyzer, span: Span, op: string, l: Expr, r: Expr,
                                  numeric: Option[Type]) -> Option[(TExpr, TExpr)]
-    val own = literal_default(l)
+    val own = literal_arith_default(l)
 
     if own.is_none() || is_literal(r) || !selects_by_operand(cx.an, op) then return None
 
@@ -2200,9 +2232,14 @@ private literal_subject_operands(cx: &Analyzer, span: Span, op: string, l: Expr,
     if read.1 || rty == Unknown || literal_fits(cx, l, rty) then return None
 
     var reached: Buf[Type] = buf()
+    val scalars = scalar_impls_at(cx.an, op, rty)
 
-    for s in scalar_impls_at(cx.an, op, rty)
+    for s in scalars
         if literal_fits(cx, l, s) then reached.push(s)
+
+    val misfit = literal_subject_misfit(cx, op, rty, l, scalars)
+
+    if misfit.is_some() then return Some((cx.err(l.span, misfit.unwrap()), read.0))
 
     val at = chosen_scalar(cx, span, op, l, own.unwrap(), rty, reached)
 
@@ -2227,7 +2264,10 @@ end literal_subject_operands
 private scalar_subject_widened(cx: &Analyzer, span: Span, op: string, l: Expr, tl: TExpr,
                                tr: TExpr) -> TExpr
     val got = texpr_type(tl)
-    val scalar = got match
+    // **A name for a scalar that checks nothing is that scalar** (`repr`): a measured `c type` over
+    // `unsigned long` is the `ulong` whose implementation it reaches, as it is as an argument.
+    val plain = repr(got)
+    val scalar = plain match
         Integer(_, _, _) -> true
         Floating(_, _) -> true
         Fixed(_, _, _) -> true
@@ -2240,6 +2280,9 @@ private scalar_subject_widened(cx: &Analyzer, span: Span, op: string, l: Expr, t
 
     for s in found
         if type_eq(s, got) then return tl
+
+    for s in found
+        if type_eq(s, plain) then return TExpr(tl.span, TCast(tl, s))
         if implicitly_widens(got, s) then reached.push(s)
 
     val at = chosen_scalar(cx, span, op, expr(l.span, Ident("")), got, texpr_type(tr), reached)
@@ -2280,7 +2323,7 @@ private paired_operands(cx: &Analyzer, op: string, l: Expr, r: Expr,
 
     val unshifted = op != "<<" && op != ">>"
     val read = analyze_operands(cx, operands, numeric, unshifted, op == "*" || op == "/", false, unshifted,
-                                if is_wrap_sat_op(op) then op else "")
+                                if is_wrap_sat_op(op) then op else "", op)
     val ts = if op == "+" || op == "-" then fixed_siblings(cx, operands, read) else read
     val tl = ts[0]
 
@@ -2307,6 +2350,16 @@ private scale_operands(cx: &Analyzer, op: string, l: Expr, r: Expr,
         val tl = analyze_operands(cx, one, numeric)[0]
 
         if is_fixed(texpr_type(tl)) then return Some((tl, type_expr(cx, r, None)))
+
+        // Beside a type whose operator is dispatched the literal is an operand selecting an
+        // implementation, not a scale (`literal_operand_head`).
+        val head = literal_operand_head(cx, op, texpr_type(tl), r)
+
+        if head.is_some() then return Some((tl, type_expr(cx, r, head)))
+
+        val misfit = literal_operand_misfit(cx, op, texpr_type(tl), r)
+
+        if misfit.is_some() then return Some((tl, cx.err(r.span, misfit.unwrap())))
 
         val at = scale_literal_type(cx, op, texpr_type(tl), r, numeric)
         val wl = widened(tl, Some(at))
@@ -2446,11 +2499,19 @@ private compare_expr(cx: &Analyzer, span: Span, operands: Buf[Expr], ops: Buf[st
     TExpr(span, TCompare(ts, cmps))
 end compare_expr
 
-// The operands of `===` or `!==`: two references, or two pointers, of one type. A trait object is
-// two words and has no single address to compare; anything else has no identity apart from its
-// value, and `==` is the comparison it has.
+// The operands of `===` or `!==`: two references, or two pointers, of one type; anything else has no
+// identity apart from its value, and `==` is the comparison it has.
+//
+// **A trait object's identity is the object's**, the data word beside its table, so two objects over
+// one value are identical whichever trait each was made against (`reference/memory.md § References
+// compare through their referent`). An object therefore also meets an object over another trait, and
+// a reference of the very kind it was made from -- a `&Shape` and a `&Circle`, a `*Shape` and a
+// `*Circle` -- where the concrete type implements the trait, since otherwise the two never name one
+// value. The emitter compares the two addresses (`identity_link`).
 private identity_operands(cx: &Analyzer, span: Span, op: string, a: Type, b: Type)
-    val addressed = underlying(a) match
+    val ua = underlying(a)
+    val ub = underlying(b)
+    val addressed = ua match
         Ref(_, _) -> true
         Ptr(_, _) -> true
         _ -> false
@@ -2458,13 +2519,32 @@ private identity_operands(cx: &Analyzer, span: Span, op: string, a: Type, b: Typ
     if !addressed
         cx.fault(span, s"'$op' compares the identity of two references or pointers, and " +
                  s"${type_show(a)} is neither — '${if op == "===" then "==" else "!="}' compares its value")
-    else if erased(underlying(a))
-        cx.fault(span, s"'$op' is not defined for the trait object ${type_show(a)}, which is two words " +
-                 "rather than one address")
-    else if !type_eq(repr(a), repr(b))
+    else if type_eq(repr(a), repr(b))
+        return
+    else if (erased(ua) || erased(ub)) && same_handle_kind(ua, ub)
+        val concrete = if erased(ua) then ub else ua
+        val object = if erased(ua) then ua else ub
+
+        if !erased(concrete) && !conforms(cx.an, trait_bound_of(erased_trait(object).unwrap()),
+                                          pointee(concrete).unwrap())
+            cx.fault(span, s"'$op' compares a ${type_show(object)} with a ${type_show(concrete)}, and " +
+                     s"${show_bare(pointee(concrete).unwrap())} does not implement " +
+                     s"${trait_bound_of(erased_trait(object).unwrap()).show()}, so the two never name one value")
+    else
         cx.fault(span, s"'$op' compares two references or pointers of one type, got ${type_show(a)} " +
                  s"and ${type_show(b)}")
 end identity_operands
+
+// Two references of one sharing, or two pointers: the handles a trait object and the value it was
+// made from are both of.
+private same_handle_kind(a: Type, b: Type) -> bool = a match
+    Ref(_, sa) -> b match
+        Ref(_, sb) -> sa == sb
+        _ -> false
+    Ptr(_, _) -> b match
+        Ptr(_, _) -> true
+        _ -> false
+    _ -> false
 
 // -- the tiering a pair of operands is read in ---------------------------------------------------
 
@@ -2489,9 +2569,14 @@ end identity_operands
 // values of one type: a literal beside a typed operand is read at that type and refused where it does
 // not fit, rather than taking its default for the typed operand to widen to -- `y +| 300` over a `u8`
 // is the 300 no `u8` holds, not an `int` sum of 555. That is Rust's reading of `255u8.saturating_add(300)`.
+//
+// **`dispatch` names the operator a pair is the operands of**, where it may be one a type implements:
+// a right operand in the literal's tier beside a left one whose operator is dispatched is read at the
+// right-hand type of the implementation it selects (`literal_operand_head`), never at its default
+// first -- `n + 4567890123` over `impl Add[long]` is a `long` operand, not an `int` that does not fit.
 analyze_operands(cx: &Analyzer, operands: Buf[Expr], expected: Option[Type],
                  widen: bool = false, rescales: bool = false, compared: bool = false,
-                 arithmetic: bool = false, held: string = "") -> Buf[TExpr]
+                 arithmetic: bool = false, held: string = "", dispatch: string = "") -> Buf[TExpr]
     var own: Buf[Option[TExpr]] = buf()
     var refused_before = false
 
@@ -2528,6 +2613,22 @@ analyze_operands(cx: &Analyzer, operands: Buf[Expr], expected: Option[Type],
     // nothing around it is the `usize` its shift was read at.
     val settled = firmest(cx, operands, unless_soft(own, soft), widen, rescales).or_else(() -> expected)
                       .or_else(() -> firmest(cx, operands, own, widen, rescales))
+    val dispatched = dispatch != "" && held == "" && operands.len() == 2 && settled.is_some() &&
+                     !is_literal(operands[0]) && !soft[0]
+    val rhs_at = if dispatched then literal_operand_head(cx, dispatch, settled.unwrap(), operands[1]) else None
+    val misfit = if !dispatched || rhs_at.is_some() then None
+                 else literal_operand_misfit(cx, dispatch, settled.unwrap(), operands[1])
+
+    if misfit.is_some()
+        cx.err(operands[1].span, misfit.unwrap())
+
+        var bad: Buf[TExpr] = buf()
+
+        for e in operands
+            bad.push(bad_expr(e.span))
+
+        return bad
+    end if
     var told: Buf[Option[TExpr]] = buf()
 
     for i in 0..<operands.len()
@@ -2535,6 +2636,7 @@ analyze_operands(cx: &Analyzer, operands: Buf[Expr], expected: Option[Type],
 
         if own[i].is_some() then told.push(own[i])
         else if is_literal(e) then told.push(None)
+        else if i == 1 && rhs_at.is_some() then told.push(Some(type_expr(cx, e, rhs_at)))
         else told.push(Some(type_expr_unwidened(cx, e, settled)))
 
     if held != "" && !one_type_held(cx, operands, told, soft, held) then
@@ -2553,6 +2655,10 @@ analyze_operands(cx: &Analyzer, operands: Buf[Expr], expected: Option[Type],
     var out: Buf[TExpr] = buf()
 
     for i in 0..<operands.len()
+        if i == 1 && rhs_at.is_some()
+            out.push(type_expr(cx, operands[i], rhs_at))
+            continue
+
         told[i] match
             Some(t) ->
                 if ty.is_some()
