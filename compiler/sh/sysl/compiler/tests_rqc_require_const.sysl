@@ -187,3 +187,42 @@ rqc_invariant()
 
     rqc_has(rqc_ir_of("const WHY = \"stays small\"\nvar i = 0\nwhile i < 3\n    invariant i <= 3, WHY\n    i += 1\nprint(i)\n"),
             "stays small")
+
+// -- a struct's invariant follows the same rule ---------------------------------------------------
+
+private rqc_struct(clause: string) -> string =
+    "var why: string = \"lo must not pass hi\"\n\nstruct Window\n    lo: int\n    hi: int\n    " + clause +
+    "\n\nprint(Window(1, 2).hi)\n"
+
+@test("a struct invariant message read out of run-time storage is refused, as a require's is")
+rqc_invariant_not_constant()
+    if xvr_no_library() then return
+
+    var fs = rqc_files()
+
+    fs.push(("texts", "a.sysl", "module texts\nvar why: string = \"lo must not pass hi\"\n"))
+    fs.push(("", "main.sysl", "import texts.{why}\n\nstruct Window\n    lo: int\n    hi: int\n" +
+                              "    invariant lo <= hi, why\n\nprint(Window(1, 2).hi)\n"))
+    rqc_has(rqc_ir(fs),
+            "error: the message of this 'invariant' cannot be computed while compiling — it has to be a " +
+            "'string' made of constants, what a type answers and calls whose bodies run while compiling, " +
+            "and nothing read out of storage filled at run time")
+
+@test("a struct invariant message that is not a string is refused, as a require's is")
+rqc_invariant_not_a_string()
+    if xvr_no_library() then return
+
+    rqc_has(rqc_ir_of(rqc_struct("invariant lo <= hi, 5")),
+            "error: the message of this 'invariant' is of type 'int', and a message is a 'string' — " +
+            "interpolate the value into one")
+
+@test("a struct invariant message may be a const, a concatenation or a computed constant")
+rqc_invariant_constant_forms()
+    if xvr_no_library() then return
+
+    val head = "const WHY = \"ordered\"\nconst cap() -> int = 7\n\nstruct Window\n    lo: int\n    hi: int\n"
+    val said = rqc_ir_of(head + "    invariant lo <= hi, WHY + \" pair\"\n    invariant hi < 100, s\"under ${cap()}00\"\n\n" +
+                         "print(Window(1, 2).hi)\n")
+
+    rqc_has(said, "ordered pair")
+    rqc_has(said, "under 700")

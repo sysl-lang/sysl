@@ -62,6 +62,46 @@ register_predicate(a: &Analysis, scope: Scope, s: Stmt)
             a.tables.funcs.put(inv_key(key), Func(f, s.span, scope))
         _ -> ()
 
+// **A clause's message is worked out while compiling, by the rule every contract message follows**
+// (`clause_message`): any `string` the compiler can compute, and a complaint, worded for the
+// 'invariant', where it cannot. The function registered with the clauses is made again with each
+// message the text it came to. A generic struct's is read in the struct's own terms.
+settle_invariant_messages(a: &Analysis, scope: Scope, key: string, d: StructDecl, span: Span)
+    if d.invariants.is_empty() then return
+
+    var written = false
+
+    for m in d.invariant_msgs
+        if m.is_some() then written = true
+
+    if !written then return
+
+    val old = a.tables.funcs.get(inv_key(key))
+
+    if old.is_none() then return
+
+    val cx = analyzer_for(a, scope)
+    var settled: Buf[Option[Expr]] = buf()
+
+    for i in 0..<d.invariants.len()
+        val m = if i < d.invariant_msgs.len() then d.invariant_msgs[i] else None
+
+        if m.is_none()
+            settled.push(None)
+        else
+            val text = clause_message(cx, m.unwrap().span, m.unwrap(), "invariant")
+
+            settled.push(Some(expr(m.unwrap().span, StrLit(text.unwrap_or("")))))
+
+    val was = old.unwrap()
+    var f = lowered_func(inv_key(key), was.decl.params, "string", first_broken(d.invariants, settled, scope.src), span)
+
+    f.tparams = d.tparams
+    f.bounds = d.bounds
+    f.tvalues = d.tvalues
+    a.tables.funcs.put(inv_key(key), Func(f, was.span, was.scope))
+end settle_invariant_messages
+
 // The declaration one of these lowers to: a plain function of the values, answering `ret`.
 private lowered_func(name: string, params: Buf[Param], ret: string, cond: Expr, span: Span) -> FuncDecl
     FuncDecl(name, buf(), params, Some(named_type(span, ret)), one_stmt(cond), buf(), false, Public, buf(),

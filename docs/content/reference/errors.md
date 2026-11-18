@@ -2207,9 +2207,24 @@ print(w.lo, w.hi, w.hi - w.lo)
 ```
 
 A clause takes a message after a comma, as a `require`, an `ensure` and a loop's `invariant` do:
-`invariant lo <= hi, "lo must not pass hi"`. The message is any `string` expression, and a failure
-reports it ahead of the clause: `invariant of 'Window' failed: lo must not pass hi: clause 'lo <= hi'
+`invariant lo <= hi, "lo must not pass hi"`. The message follows the rule every contract message
+follows ([Contracts](#contracts-on-a-function)): any `string` the compiler can compute, worked out while compiling.
+A failure reports it ahead of the clause: `invariant of 'Window' failed: lo must not pass hi: clause 'lo <= hi'
 at main.sysl:4:15 (main.sysl:8:1)`. A clause with none reports as before.
+
+A message that is not a `string`, or that cannot be worked out while compiling, is refused as a
+`require`'s is:
+
+```sysl
+struct Window
+    lo: int
+    hi: int
+    invariant lo <= hi, 5
+```
+
+```error
+the message of this 'invariant' is of type 'int', and a message is a 'string'
+```
 
 An invariant may read a module constant. `invariant` is contextual here too, and the grammar
 distinguishes by shape: a **member** declaration has a parameter list or a `->`, an **invariant
@@ -2548,7 +2563,7 @@ would. Both take an optional message after a comma.
 
 **The message is any `string` the compiler can compute**, the same reading an `@assert`'s message
 gets: a literal, a `const`, a `val` that folds, a concatenation of them, a name from another module.
-`invariant` takes its message the same way.
+A struct's `invariant` and a loop's take theirs by this one rule, and refuse what it refuses.
 
 ```sysl
 const Negative = "x must not be negative"
