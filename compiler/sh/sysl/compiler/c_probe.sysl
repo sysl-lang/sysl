@@ -36,9 +36,14 @@ private const CharMarker: string = "__sysl_c_char_signed"
 // probe: the global has to be written before clang runs, and how wide it should be written is one of
 // the answers clang is being asked for. So it is carried at the full unsigned width and the same
 // probe's measurement says how to read it.
+//
+// **`Text` is a string read out of C** -- a `string` (`c_string` unset) or a C string, `*u8`, which
+// is a `c"…"` literal's type. It is not a number at all: what crosses is the address of the
+// literal's bytes, and the bytes are read off the array the IR lays down at that address.
 private enum CDeclared
     KnownNow(bits: int, signed: bool, floating: bool, written: string)
     KnownLater(index: usize, c: string, written: string)
+    Text(c_string: bool, written: string)
 end CDeclared
 
 // One C type as the probe describes it: which integer C says it is, and how wide that is here.
@@ -346,6 +351,10 @@ private measure(a: &Analysis, unit: Program, consts: Buf[CConstDecl], plan: Buf[
             None -> return silent(a, unit,consts[i].span, s"'${consts[i].c}'")
             Some(g) -> values.push(g)
 
+    // A string line's answer is an address, and what it holds is the array laid down there.
+    for i in 0..<consts.len()
+        if is_text(plan[i]) then values[i] = text_at(said.text, values[i])
+
     var measured: Buf[CMeasured] = buf()
 
     for i in 0..<types.len()
@@ -560,6 +569,10 @@ private probe_text(unit: Program, consts: Buf[CConstDecl], plan: Buf[CDeclared],
         out.push(s"#include ${quoted_header(item.header)}\n")
 
     for i in 0..<consts.len()
+        if is_text(plan[i])
+            out.push(text_global(consts[i].c, i))
+            continue
+
         val carrier = plan[i] match
             KnownNow(bits, signed, floating, _) ->
                 if floating then (if bits == 128 then "long double" else "double")
@@ -568,6 +581,7 @@ private probe_text(unit: Program, consts: Buf[CConstDecl], plan: Buf[CDeclared],
             // would have chosen the carrier is one of the answers this same probe is being asked
             // for. Nothing is lost: the IR prints an `i64` bit pattern whichever carrier is written.
             KnownLater(_, _, _) -> "unsigned long long"
+            Text(_, _) -> "unsigned long long"
 
         out.push(s"$carrier $ConstMarker$i = ($carrier)(${consts[i].c});\n")
 
@@ -584,6 +598,22 @@ private probe_text(unit: Program, consts: Buf[CConstDecl], plan: Buf[CDeclared],
 
     out.finish()
 end probe_text
+
+private is_text(d: CDeclared) -> bool = d match
+    Text(_, _) -> true
+    _ -> false
+
+// A string line's global: a pointer holding the expression when C says it is a string, and a null
+// one when it is anything else -- so that a macro that is a number, a struct or a float is refused in
+// sysl's words (`text_const`) rather than in a C type error about an initializer.
+//
+// `_Generic` is what tells them apart. A string literal is a `char` array, and an array names its
+// first element where `_Generic` looks at it, so a literal, two literals C joins into one, and a
+// `static const char NAME[]` all reach the `char *` arms; the arms not chosen are never evaluated, so
+// a `42` in them is no error.
+private text_global(e: string, i: usize) -> string =
+    s"const char *$ConstMarker$i = _Generic(($e), char *: ($e), const char *: ($e), " +
+    "default: (const char *)0);\n"
 
 // The entry the first error clang reported against the probe itself was written for: the probe's
 // line is read off `probe.c:<line>:` and the marker on that line names the entry. An error inside a
@@ -717,11 +747,85 @@ private marked(globals: Buf[CGlobal], marker: string, index: usize) -> Option[CG
 
     for g in globals
         if g.index == index && g.ty.starts_with(want) && g.ty != "char-signed"
-            if want != "" || (g.ty == "i64" || g.ty == "double" || g.ty == "fp128" || g.ty == "x86_fp80")
+            if (want != "" || g.ty == "i64" || g.ty == "double" || g.ty == "fp128" || g.ty == "x86_fp80" ||
+                g.ty == "ptr")
                 return Some(g)
 
     None
 end marked
+
+// A string line's answer read through its address: the array the IR lays down there, as
+// `CGlobal(index, "chars", <its bytes as LLVM escapes them>)`. An answer that is not the address of
+// a byte array -- a null, which is what a value C does not call a string comes to, or an address into
+// the middle of one -- is handed back as it came, for `text_const` to refuse.
+//
+// LLVM writes the array one of two ways: `[4 x i8] c"abc\00"`, or `[N x i8] zeroinitializer` when
+// every byte is zero (`""` is one of those). The second is written out as the first here, so that one
+// reading serves both.
+private text_at(ir: string, g: CGlobal) -> CGlobal
+    if g.ty != "ptr" || !g.operand.starts_with("@") then return g
+
+    val head = s"${g.operand} = "
+
+    for line in lines_of(ir)
+        if !line.starts_with(head) then continue
+
+        val open = line.index_of("[") match
+            None -> return g
+            Some(at) -> at
+
+        val shape = line[open..<line.bytes.len]
+
+        val close = shape.index_of(" x i8] ") match
+            None -> return g
+            Some(at) -> at
+
+        val count = shape[1..<close]
+        val rest = shape[(close + 7)..<shape.bytes.len]
+
+        if rest.starts_with("zeroinitializer")
+            var zeros = str_builder()
+
+            for _ in 0..<number_of(count, 10)
+                zeros.push("\\00")
+
+            return CGlobal(g.index, "chars", zeros.finish())
+
+        if !rest.starts_with("c\"") then return g
+
+        // LLVM escapes a `"` as `\22`, so the first quote after the opening one closes it.
+        val body = rest[2..<rest.bytes.len]
+
+        return body.index_of("\"") match
+            None -> g
+            Some(end_at) -> CGlobal(g.index, "chars", body[0..<end_at])
+
+    g
+end text_at
+
+// The bytes of an array as LLVM escapes them: `\` and two hex digits is one byte, and every other
+// byte stands for itself.
+private unescaped(text: string) -> Buf[u8]
+    var out: Buf[u8] = buf()
+    val b = text.bytes
+    var i: usize = 0
+
+    while i < b.len
+        if b[i] == u8('\\') && i + 2 < b.len && hex_digit(b[i + 1]).is_some() && hex_digit(b[i + 2]).is_some()
+            out.push(hex_digit(b[i + 1]).unwrap() * 16 + hex_digit(b[i + 2]).unwrap())
+            i += 3
+        else
+            out.push(b[i])
+            i += 1
+
+    out
+end unescaped
+
+private hex_digit(c: u8) -> Option[u8] =
+    if c >= u8('0') && c <= u8('9') then Some(c - u8('0'))
+    else if c >= u8('A') && c <= u8('F') then Some(c - u8('A') + 10)
+    else if c >= u8('a') && c <= u8('f') then Some(c - u8('a') + 10)
+    else None
 
 private probe_words(line: string) -> Buf[string]
     var out: Buf[string] = buf()
@@ -776,9 +880,20 @@ private declared_type(a: &Analysis, unit: Program, c: CConstDecl,
     var written_ref = c.typ
 
     loop
+        // A string, or a C string -- `*u8`, which is what a `c"…"` literal is.
+        val pointee = *written_ref.kind match
+            PtrType(inner, _) -> *inner.kind match
+                NamedType(n, args) -> if args.is_empty() then n else ""
+                _ -> ""
+            _ -> ""
+
+        if pointee == "u8" || pointee == "byte" then return Text(true, type_text(c.typ))
+
         val name = *written_ref.kind match
             NamedType(n, args) -> if args.is_empty() then n else ""
             _ -> ""
+
+        if name == "string" then return Text(false, type_text(c.typ))
 
         if name == ""
             return not_a_number(a, at, c)
@@ -829,10 +944,9 @@ private declared_type(a: &Analysis, unit: Program, c: CConstDecl,
 end declared_type
 
 private not_a_number(a: &Analysis, at: Scope, c: CConstDecl) -> CDeclared
-    a.fault(at, c.span, s"'${type_text(c.typ)}' is not a number, and a 'c const' " +
-            "reads a number — the value is read back out of the C compiler's own output, where a " +
-            "number is a number and a string is a block of storage. A string from C is not written " +
-            "this way")
+    a.fault(at, c.span, s"'${type_text(c.typ)}' is not a number or a string, and a 'c const' " +
+            "reads a number, a 'string' or a C string ('*u8') — the three things the C compiler's " +
+            "own output states whole")
     KnownNow(32, true, false, type_text(c.typ))
 
 // Narrower than the widths a C constant expression is written at, and narrow enough that rounding
@@ -891,6 +1005,17 @@ private measured_const(a: &Analysis, home: Scope, c: CConstDecl, d: CDeclared,
                             s"'$c_type', which is not an integer here, and a 'c const' reads an " +
                             "integer")
                     return held(c, expr(c.span, IntLit("0", 10, "")))
+        Text(c_string, written) -> return text_const(a, home, c, c_string, written, raw)
+
+    // **An address is not a number this line can be given**, though C converts one to an integer
+    // without a word: a string literal cast to `unsigned long long` settles as the literal's address,
+    // which the IR writes as `ptrtoint (ptr @.str to i64)` -- a value the linker decides, not one the
+    // probe can read. Read as digits it was a silent 0.
+    if !kind.2 && raw.ty == "i64" && !decimal_shaped(raw.operand)
+        a.fault(home, c.span, s"'${c.c}' is an address here rather than a number, and a " +
+                "'c const' reads the number a constant expression comes to — a string from C is " +
+                "read by declaring the line 'string' or '*u8'")
+        return held(c, expr(c.span, IntLit("0", 10, "")))
 
     if kind.2 then fraction(a, home, c, kind.0, kind.3, raw) else whole(a, home, c, kind.0, kind.1, kind.3, raw)
 end measured_const
@@ -899,6 +1024,69 @@ end measured_const
 // literal -- the same shape whichever carrier the value crossed on.
 private held(c: CConstDecl, value: Expr) -> Stmt =
     stmt(c.span, ConstDecl(c.name, Some(c.typ), value, c.vis, None))
+
+// Whether an operand is the decimal LLVM prints for an integer, rather than a constant expression
+// such as `ptrtoint`.
+private decimal_shaped(text: string) -> bool
+    val b = text.bytes
+    val from: usize = if b.len > 0 && b[0] == u8('-') then 1 else 0
+
+    if b.len <= from then return false
+
+    for i in from..<b.len
+        if b[i] < u8('0') || b[i] > u8('9') then return false
+
+    true
+end decimal_shaped
+
+// One measured string. A `string` becomes a `const` holding the literal; a C string becomes a module
+// `val` holding the `c"…"` literal, since a pointer is no `const` -- and a `val` over a `c"…"` is
+// constant data (`reference/ffi.md § What constant data is`), laid down as the literal's address on
+// a bare machine as anywhere.
+//
+// **The whole literal is the value**, every byte of it up to the terminator C adds: `"a\0b"` is three
+// bytes in a `string`, which has a length and keeps them. A C string has no length and would end at
+// the first NUL, so one there is refused rather than cut short, as a `c"…"` literal's own is.
+private text_const(a: &Analysis, at: Scope, c: CConstDecl, c_string: bool, written: string,
+                   raw: CGlobal) -> Stmt
+    val empty = text_held(c, c_string, "")
+
+    if raw.ty != "chars"
+        val why = if raw.operand == "null" then "is not a string in C" else "is not the start of a string here"
+
+        a.fault(at, c.span, s"'${c.c}' $why, and this line reads one as '$written' — a string " +
+                "literal, literals C joins into one, or a macro or a 'char' array that is one")
+        return empty
+
+    val bytes = unescaped(raw.operand)
+
+    // The terminator C adds to every literal, which is C's and not part of the value.
+    val n = if !bytes.is_empty() && bytes[bytes.len() - 1] == 0 then bytes.len() - 1 else bytes.len()
+
+    val text = from_utf8(bytes.view()[0..<n]) match
+        Err(_) ->
+            a.fault(at, c.span, s"'${c.c}' is not UTF-8 here, and a '$written' read from C " +
+                    "holds UTF-8 as every sysl string does")
+            return empty
+        Ok(found) -> found
+
+    var nul = false
+
+    for i in 0..<n
+        if bytes[i] == 0 then nul = true
+
+    if c_string && nul
+        a.fault(at, c.span, s"'${c.c}' holds a NUL before its end, where a C string would stop — " +
+                "a '*u8' cannot carry it; a 'string' keeps every byte")
+        return empty
+
+    text_held(c, c_string, text)
+end text_const
+
+private text_held(c: CConstDecl, c_string: bool, text: string) -> Stmt
+    if !c_string then return held(c, expr(c.span, StrLit(text)))
+
+    stmt(c.span, ValDecl(c.name, Some(c.typ), expr(c.span, CStrLit(text)), c.vis, None, None, OneCopy, None))
 
 // One measured whole number, held to the range of the type it was asked for.
 //

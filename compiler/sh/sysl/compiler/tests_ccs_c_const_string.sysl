@@ -1,0 +1,486 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `c const` at `string` and at `*u8` -- a string read out of C (`reference/ffi.md § A string is
+// read too`). Every program is built and run, or lowered and refused, by a real clang; each returns
+// saying so where there is none.
+
+private ccs_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end ccs_ready
+
+// A fresh root holding `main.sysl` and, where one is given, a header `c.h` beside it.
+private ccs_root(main_text: string, header: string) -> string
+    val root = make_temp_dir("sysl-ccs").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", main_text).unwrap()
+
+    if header != "" then write_text(s"$root/c.h", header).unwrap()
+
+    root
+end ccs_root
+
+// What the program printed, or why it was not built.
+private ccs_ran(main_text: string, header: string) -> string
+    val root = ccs_root(main_text, header)
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end ccs_ran
+
+// The LLVM text on a machine, or `refused: ` and everything the lowering had to say instead.
+private ccs_ir(main_text: string, header: string, target: Option[string]) -> string
+    val root = ccs_root(main_text, header)
+
+    val out = emit_llvm_text(s"$root/main.sysl", target) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(made) -> if made.report.is_empty() then made.text else s"refused: ${analysis_report(made.report)}"
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end ccs_ir
+
+private ccs_refuses(main_text: string, header: string, part: string)
+    val said = ccs_ir(main_text, header, None)
+
+    assert(said.starts_with("refused: ") && said.index_of(part).is_some(), s"expected '$part', got: $said")
+
+// -- a string ------------------------------------------------------------------------------------
+
+@test("a string literal is read as a sysl string")
+ccs_a_literal()
+    if !ccs_ready() then return
+
+    assert_eq(ccs_ran(raw"""
+        c const
+            S: string = "\"hello\""
+
+        print(S, S.bytes.len)
+        """, ""), "hello 5\n")
+
+@test("the motivating case: LUA_VERSION, a macro of macros C joins into one literal")
+ccs_lua_version()
+    if !ccs_ready() then return
+
+    assert_eq(ccs_ran(raw"""
+        @include("c.h")
+
+        c const
+            VERSION: string = "LUA_VERSION"
+            RELEASE: string = "LUA_RELEASE"
+
+        print(VERSION)
+        print(RELEASE)
+        """, raw"""
+        #define LUA_VERSION_MAJOR "5"
+        #define LUA_VERSION_MINOR "4"
+        #define LUA_VERSION_RELEASE "6"
+        #define LUA_VERSION "Lua " LUA_VERSION_MAJOR "." LUA_VERSION_MINOR
+        #define LUA_RELEASE LUA_VERSION "." LUA_VERSION_RELEASE
+        """), "Lua 5.4\nLua 5.4.6\n")
+
+@test("adjacent literals written on the line itself are joined, as C joins them")
+ccs_joined_on_the_line()
+    if !ccs_ready() then return
+
+    assert_eq(ccs_ran(raw"""
+        c const
+            S: string = "\"a\" \"b\" \"\" \"c\""
+
+        print(S)
+        """, ""), "abc\n")
+
+@test("C's escapes arrive as the bytes they stand for")
+ccs_escapes()
+    if !ccs_ready() then return
+
+    assert_eq(ccs_ran(raw"""
+        c const
+            S: string = "\"tab\\tq\\\"b\\\\s\\n\""
+            H: string = "\"\\x41\\101\\x7e\""
+
+        print(S == "tab\tq\"b\\s\n", S.bytes.len, H)
+        """, ""), "true 10 AA~\n")
+
+@test("the bytes LLVM itself escapes come through -- a quote, a backslash, a byte past ASCII")
+ccs_bytes_llvm_escapes()
+    if !ccs_ready() then return
+
+    assert_eq(ccs_ran(raw"""
+        @include("c.h")
+
+        c const
+            S: string = "ODD"
+
+        print(S == "\"\\\u{7f}\u{1}", S.bytes.len)
+        """, "#define ODD \"\\\"\\\\\\x7f\\x01\"\n"), "true 4\n")
+
+@test("an embedded NUL is kept by a string, which has a length")
+ccs_embedded_nul_in_a_string()
+    if !ccs_ready() then return
+
+    assert_eq(ccs_ran(raw"""
+        c const
+            S: string = "\"a\\0b\""
+
+        print(S.bytes.len, S.bytes[0], S.bytes[1], S.bytes[2])
+        """, ""), "3 97 0 98\n")
+
+@test("the empty literal, which LLVM writes as a zeroinitializer")
+ccs_empty()
+    if !ccs_ready() then return
+
+    assert_eq(ccs_ran(raw"""
+        c const
+            E: string = "\"\""
+            Z: string = "\"\\0\\0\""
+
+        print(E.bytes.len, Z.bytes.len, Z.bytes[1])
+        """, ""), "0 2 0\n")
+
+@test("UTF-8 in the header is UTF-8 in the string")
+ccs_utf8()
+    if !ccs_ready() then return
+
+    assert_eq(ccs_ran(raw"""
+        @include("c.h")
+
+        c const
+            S: string = "GREETING"
+
+        print(S, S == "héllo, 世界", S.bytes.len)
+        """, "#define GREETING \"héllo, \" \"世界\"\n"), "héllo, 世界 true 14\n")
+
+@test("a string that is not UTF-8 is refused, since every sysl string is")
+ccs_not_utf8()
+    if !ccs_ready() then return
+
+    ccs_refuses(raw"""
+        c const
+            S: string = "\"a\\377b\""
+
+        print(S)
+        """, "", "'\"a\\377b\"' is not UTF-8 here, and a 'string' read from C holds UTF-8 as every " +
+                 "sysl string does")
+
+@test("a 'static const char' array in a header is read as the literal it holds")
+ccs_a_char_array()
+    if !ccs_ready() then return
+
+    assert_eq(ccs_ran(raw"""
+        @include("c.h")
+
+        c const
+            S: string = "NAME"
+            P: *u8 = "NAME"
+
+        extern strlen(s: *u8) -> usize
+
+        print(S, strlen(P))
+        """, "static const char NAME[] = \"arr\";\n"), "arr 3\n")
+
+@test("a line is a string another module reads")
+ccs_public()
+    if !ccs_ready() then return
+
+    val root = make_temp_dir("sysl-ccs").unwrap()
+
+    make_dir_all(s"$root/lua").unwrap()
+    write_text(s"$root/lua/lua.sysl", raw"""
+        module lua
+
+        c const
+            VERSION: string = "\"Lua \" \"5.4\""
+            NAME: *u8 = "\"lua\""
+        """).unwrap()
+    write_text(s"$root/main.sysl", raw"""
+        import lua.{VERSION, NAME}
+
+        extern strlen(s: *u8) -> usize
+
+        print(VERSION, strlen(NAME))
+        """).unwrap()
+
+    val exe = s"$root/built"
+
+    val said = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) -> failure_text(why)
+        Ok(_) -> capture(exe, [], "", [], true) match
+            Err(_) -> "could not run"
+            Ok(out) -> out.text
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(said, "Lua 5.4 3\n")
+end ccs_public
+
+// -- a C string ----------------------------------------------------------------------------------
+
+private ccs_vulkan_header() -> string = raw"""
+    #define VK_KHR_SURFACE_EXTENSION_NAME "VK_KHR_surface"
+    #define VK_KHR_SWAPCHAIN_EXTENSION_NAME "VK_KHR_swapchain"
+    """
+
+@test("the motivating case: Vulkan's extension names are C strings a C API takes")
+ccs_vulkan_names()
+    if !ccs_ready() then return
+
+    assert_eq(ccs_ran(raw"""
+        @include("c.h")
+
+        c const
+            SURFACE: *u8 = "VK_KHR_SURFACE_EXTENSION_NAME"
+            SWAPCHAIN: *u8 = "VK_KHR_SWAPCHAIN_EXTENSION_NAME"
+
+        extern strlen(s: *u8) -> usize
+        extern strcmp(a: *u8, b: *u8) -> i32
+
+        val wanted: [2]*u8 = [SURFACE, SWAPCHAIN]
+
+        print(strlen(wanted[0]), strlen(wanted[1]), strcmp(SURFACE, c"VK_KHR_surface"))
+        """, ccs_vulkan_header()), "14 16 0\n")
+
+@test("an embedded NUL is refused by a C string, which would end there")
+ccs_embedded_nul_in_a_c_string()
+    if !ccs_ready() then return
+
+    ccs_refuses(raw"""
+        c const
+            P: *u8 = "\"a\\0b\""
+
+        val p = P
+        """, "", "'\"a\\0b\"' holds a NUL before its end, where a C string would stop — a '*u8' " +
+                 "cannot carry it; a 'string' keeps every byte")
+
+@test("the empty C string")
+ccs_empty_c_string()
+    if !ccs_ready() then return
+
+    assert_eq(ccs_ran(raw"""
+        c const
+            P: *u8 = "\"\""
+
+        extern strlen(s: *u8) -> usize
+
+        print(strlen(P))
+        """, ""), "0\n")
+
+// -- on a bare machine ---------------------------------------------------------------------------
+
+// Both kinds of line, used by module storage, on a target with no heap, no OS and nothing that runs
+// before `main`: the lowering takes it, and the bytes are laid down as data.
+@test("on thumbv7em-freestanding both fold into module storage")
+ccs_folds_on_a_bare_machine()
+    if !ccs_ready() then return
+
+    val ir = ccs_ir(raw"""
+        @include("c.h")
+
+        c const
+            SURFACE: *u8 = "VK_KHR_SURFACE_EXTENSION_NAME"
+            VERSION: string = "\"Lua \" \"5.4\""
+
+        @export("ccs_names")
+        var names: [2]*u8 = [SURFACE, SURFACE]
+
+        @export("ccs_surface")
+        val surface: *u8 = SURFACE
+
+        val version: string = VERSION
+
+        @export("ccs_version_len")
+        version_len() -> usize = version.bytes.len
+        """, ccs_vulkan_header(), Some("thumbv7em-freestanding"))
+
+    assert(!ir.starts_with("refused: "), ir)
+    assert(ir.index_of("c\"VK_KHR_surface\\00\"").is_some(), ir)
+    assert(ir.index_of("Lua 5.4").is_some(), ir)
+    assert(ir.index_of("@ccs_surface = ").is_some(), ir)
+    assert(ir.index_of("@ccs_names = ").is_some(), ir)
+end ccs_folds_on_a_bare_machine
+
+// -- a `val` over a `c"…"` is constant data where it is read -------------------------------------
+
+// What a measured `*u8` lowers to is a `val` holding a `c"…"`, so the rule that a read of a module
+// `val` over constant data is that data (`reference/ffi.md § What constant data is`) has to hold for
+// a C string as it does for an address. It did not: the read was code, refused on a bare machine.
+private ccs_bare_ir(main_text: string) -> string = ccs_ir(main_text, "", Some("thumbv7em-freestanding"))
+
+@test("a val holding a c-string literal, read by an exported val, is data")
+ccs_cstr_val_read_by_a_val()
+    if !ccs_ready() then return
+
+    val ir = ccs_bare_ir(raw"""
+        val SURFACE: *u8 = c"VK_KHR_surface"
+
+        @export("ccs_one")
+        val one: *u8 = SURFACE
+
+        @export("ccs_first")
+        first() -> u8 = one[0]
+        """)
+
+    assert(!ir.starts_with("refused: "), ir)
+    assert(ir.index_of("@ccs_one = ").is_some(), ir)
+
+@test("and read by an exported array of them, at any depth")
+ccs_cstr_val_in_an_array()
+    if !ccs_ready() then return
+
+    val ir = ccs_bare_ir(raw"""
+        val A: *u8 = c"a"
+        val B: *u8 = c"bc"
+
+        struct Pair
+            name: *u8
+            other: *u8
+
+        @export("ccs_names")
+        var names: [2]*u8 = [A, B]
+
+        @export("ccs_pair")
+        val pair: Pair = Pair(B, A)
+
+        @export("ccs_first")
+        first() -> u8 = names[1][0] + pair.name[1]
+        """)
+
+    assert(!ir.starts_with("refused: "), ir)
+    assert(ir.index_of("@ccs_names = ").is_some(), ir)
+    assert(ir.index_of("@ccs_pair = ").is_some(), ir)
+
+@test("a val read through two vals is still the literal, and runs on the host")
+ccs_cstr_val_chain_runs()
+    if !ccs_ready() then return
+
+    assert_eq(ccs_ran(raw"""
+        val A: *u8 = c"chain"
+        val B: *u8 = A
+
+        extern strlen(s: *u8) -> usize
+
+        val table: [2]*u8 = [A, B]
+
+        print(strlen(table[0]), strlen(table[1]))
+        """, ""), "5 5\n")
+
+@test("its neighbours were data already: a val over null, and over a function's address")
+ccs_neighbours_of_the_cstr_val()
+    if !ccs_ready() then return
+
+    val ir = ccs_bare_ir(raw"""
+        setup() -> i32 = 7
+
+        val HOOK: *extern() -> i32 = &setup
+        val NONE: *u8 = null
+
+        @export("ccs_hooks")
+        var hooks: [2]*extern() -> i32 = [HOOK, HOOK]
+
+        @export("ccs_nones")
+        var nones: [2]*u8 = [NONE, NONE]
+
+        @export("ccs_call")
+        call() -> i32 = if nones[0] == null then hooks[1]() else 0
+        """)
+
+    assert(!ir.starts_with("refused: "), ir)
+
+// -- what it refuses -----------------------------------------------------------------------------
+
+@test("a macro that is a number is not a string, and says so")
+ccs_a_number_is_not_a_string()
+    if !ccs_ready() then return
+
+    ccs_refuses(raw"""
+        @include("c.h")
+
+        c const
+            S: string = "LUA_VERSION_NUM"
+
+        print(S)
+        """, "#define LUA_VERSION_NUM 504\n",
+        "'LUA_VERSION_NUM' is not a string in C, and this line reads one as 'string' — a string " +
+        "literal, literals C joins into one, or a macro or a 'char' array that is one")
+
+@test("and so is a float, asked for as a C string")
+ccs_a_float_is_not_a_c_string()
+    if !ccs_ready() then return
+
+    ccs_refuses(raw"""
+        c const
+            P: *u8 = "1.5"
+
+        val p = P
+        """, "", "'1.5' is not a string in C, and this line reads one as '*u8'")
+
+@test("an address into the middle of a literal is not the start of a string")
+ccs_into_the_middle()
+    if !ccs_ready() then return
+
+    ccs_refuses(raw"""
+        c const
+            S: string = "\"abc\" + 1"
+
+        print(S)
+        """, "", "'\"abc\" + 1' is not the start of a string here")
+
+@test("a string read as a number is an address, refused rather than read as 0")
+ccs_a_string_is_not_a_number()
+    if !ccs_ready() then return
+
+    ccs_refuses(raw"""
+        c const
+            N: u64 = "\"abc\""
+
+        print(N)
+        """, "", "'\"abc\"' is an address here rather than a number, and a 'c const' reads the " +
+                 "number a constant expression comes to — a string from C is read by declaring " +
+                 "the line 'string' or '*u8'")
+
+@test("a pointer to anything but a byte is neither a number nor a string")
+ccs_other_pointers()
+    if !ccs_ready() then return
+
+    ccs_refuses(raw"""
+        c const
+            P: *i32 = "0"
+
+        val p = P
+        """, "", "'*i32' is not a number or a string, and a 'c const' reads a number, a 'string' " +
+                 "or a C string ('*u8')")
+
+@test("an expression C refuses is still refused in C's words, blamed on its own line")
+ccs_c_refuses()
+    if !ccs_ready() then return
+
+    ccs_refuses(raw"""
+        c const
+            A: string = "\"fine\""
+            B: string = "NO_SUCH_MACRO_HERE"
+
+        print(A, B)
+        """, "", "the C compiler refused this file's 'c const' block")
