@@ -1065,10 +1065,12 @@ private parse_expr_or_multi(p: *Parser, start: Span, inline: bool) -> Stmt
             // a call answers is let go of on purpose. Read as an expression, the `_` would close a
             // closure over the assignment instead.
             if discarding_place(target) then
-                return parse_paren_multi(p, start, inline, op, one_place(target), value)
+                return parse_paren_multi(p, start, inline, op, one_place(target), value, false)
 
+            // A tuple of places is only ever one place long as `(a,)`, the one-tuple's spelling.
             paren_places(target) match
-                Some(places) -> return parse_paren_multi(p, start, inline, op, places, value)
+                Some(places) ->
+                    return parse_paren_multi(p, start, inline, op, places, value, places.len() == 1)
                 None -> ()
         _ -> ()
 
@@ -1117,7 +1119,7 @@ private parse_expr_or_multi(p: *Parser, start: Span, inline: bool) -> Stmt
 
         if !p.accept_kw(",") then break
 
-    stmt(start.to(p.just_taken()), MultiAssign(op, parts, values))
+    stmt(start.to(p.just_taken()), MultiAssign(op, parts, values, false))
 end parse_expr_or_multi
 
 // Whether an assignment's whole left side is `_`.
@@ -1155,7 +1157,7 @@ private paren_places(target: Expr) -> Option[Buf[Expr]] = *target.kind match
 // has already taken the first value; the rest of the list follows its commas, which belong to a
 // bracket instead where an inline branch stands inside one.
 private parse_paren_multi(p: *Parser, start: Span, inline: bool, op: string, places: Buf[Expr],
-                          value: Expr) -> Stmt
+                          value: Expr, one_tuple: bool) -> Stmt
     var values: Buf[Expr] = buf()
 
     values.push(lift_placeholders(value))
@@ -1167,7 +1169,7 @@ private parse_paren_multi(p: *Parser, start: Span, inline: bool, op: string, pla
             values.push(lift_placeholders(parse_expr(p)))
     end if
 
-    stmt(start.to(p.just_taken()), MultiAssign(op, places, values))
+    stmt(start.to(p.just_taken()), MultiAssign(op, places, values, one_tuple))
 end parse_paren_multi
 
 // The assignment operator standing at the cursor, or `""` where there is none.

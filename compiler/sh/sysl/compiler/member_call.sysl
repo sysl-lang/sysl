@@ -1457,20 +1457,29 @@ private call_generic_member(cx: &Analyzer, span: Span, receiver: Option[TExpr], 
     // rather than the author's -- so `map[U](f: T -> U)` is written `map[int]`, and the callable's
     // own parameter goes on being read off the closure.
     val mine = authored_tparams(m.tparams)
-
-    // A shorter list is a prefix: the solve below settles the trailing parameters it left open.
-    if targs.len() > mine.len() then
-        return cx.err(span, s"'${source_member_name(m.name)}' takes " +
-                      s"${quantity(mine.len(), "type argument")} (${quoted_names(mine)}), and " +
-                      s"${targs.len()} ${if targs.len() == 1 then "was" else "were"} written")
-
     val home = instantiation_scope(cx, fd.name)
     var written_args: Buf[Type] = buf()
 
-    // Each is read against the member's own parameter it fills, as a module function's are: a
-    // `const` the declaration wrote takes a value -- a constant, or arithmetic over one.
-    for i in 0..<targs.len()
-        written_args.push(member_arg_for(cx, m, home, mine[i], targs[i], false))
+    // A pack among them takes the run of arguments the others leave, as at a module function.
+    if !targs.is_empty() && names_a_pack(mine, m.tpacks)
+        val spread = written_pack_args(cx, span, source_member_name(m.name), mine, m.tpacks, targs,
+                                       (name, e) -> member_arg_for(cx, m, home, name, e, false))
+
+        if spread.is_none() then return bad_expr(span)
+
+        written_args = spread.unwrap()
+    else
+        // A shorter list is a prefix: the solve below settles the trailing parameters it left open.
+        if targs.len() > mine.len() then
+            return cx.err(span, s"'${source_member_name(m.name)}' takes " +
+                          s"${quantity(mine.len(), "type argument")} (${quoted_names(mine)}), and " +
+                          s"${targs.len()} ${if targs.len() == 1 then "was" else "were"} written")
+
+        // Each is read against the member's own parameter it fills, as a module function's are: a
+        // `const` the declaration wrote takes a value -- a constant, or arithmetic over one.
+        for i in 0..<targs.len()
+            written_args.push(member_arg_for(cx, m, home, mine[i], targs[i], false))
+    end if
 
     // An argument already refused instantiates nothing, or the body would report every use of its
     // parameter as a name nobody declared.
