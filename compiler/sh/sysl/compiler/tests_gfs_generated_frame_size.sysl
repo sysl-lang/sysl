@@ -60,8 +60,22 @@ private gfs_report(program: string) -> string
     text
 end gfs_report
 
-// The frame the report gives `name`, in bytes, or -1 where it names no such function.
+// The frame the report gives `name`, in bytes, or -1 where it names no such function. A root
+// function is found under its symbol (`root_symbol`).
 private gfs_frame(report: string, name: string) -> int
+    val rooted = gfs_frame_of(report, root_symbol(name))
+
+    if rooted >= 0 then rooted else gfs_frame_of(report, name)
+
+// The frame of a member's body: a type passed by value may have its body in a `.owned` twin that the
+// entry forwards to, so the larger of the two is the body's.
+private gfs_member_frame(report: string, name: string) -> int
+    val plain = gfs_frame_of(report, name)
+    val owned = gfs_frame_of(report, s"$name.owned")
+
+    if owned > plain then owned else plain
+
+private gfs_frame_of(report: string, name: string) -> int
     val key = s":$name\t"
     val at = report.index_of(key) match
         Some(i) -> i + key.bytes.len
@@ -75,7 +89,7 @@ private gfs_frame(report: string, name: string) -> int
         i += 1
 
     if i == at then -1 else n
-end gfs_frame
+end gfs_frame_of
 
 // What the program printed at `level`, on both streams, and whether it ran to the end; counted, a
 // heap left holding anything says so on stderr.
@@ -149,7 +163,7 @@ gfs_debug_frame_is_small()
     if !gfs_ready() then return
 
     val report = gfs_report(gfs_corruption())
-    val debug = gfs_frame(report, "Corruption.debug.owned")
+    val debug = gfs_member_frame(report, "Corruption.debug")
 
     // It was 4,128 bytes on aarch64: four inline writes and two whole-enum copies per variant.
     assert(debug > 0, report)
@@ -162,8 +176,8 @@ gfs_derived_frames_are_small()
 
     val report = gfs_report(gfs_corruption())
 
-    for name in ["Corruption.display.owned", "Corruption.eq.owned", "Corruption.hash.owned", "Corruption.lt.owned"]
-        val frame = gfs_frame(report, name)
+    for name in ["Corruption.display", "Corruption.eq", "Corruption.hash", "Corruption.lt"]
+        val frame = gfs_member_frame(report, name)
 
         assert(frame > 0, s"$name is not in the report: $report")
         assert(frame < 2048, s"$name takes $frame bytes")
@@ -194,8 +208,8 @@ gfs_wide_variant_is_not_paid_per_variant()
     val report = gfs_report(gfs_widths())
 
     for form in ["debug", "display", "eq", "hash", "lt"]
-        val narrow = gfs_frame(report, s"E4.$form.owned")
-        val wide = gfs_frame(report, s"E256.$form.owned")
+        val narrow = gfs_member_frame(report, s"E4.$form")
+        val wide = gfs_member_frame(report, s"E256.$form")
 
         assert(narrow > 0 && wide > 0, s"$form is not in the report: $report")
         // The wide variant's own arm copies its payload a few times (`lt` binds two of them); the
@@ -203,29 +217,29 @@ gfs_wide_variant_is_not_paid_per_variant()
         assert(wide - narrow < 12 * 256, s"$form: $narrow bytes narrow, $wide wide")
 end gfs_wide_variant_is_not_paid_per_variant
 
-@test("a hand-written match on a local large enum keeps its -O0 frame from growing per arm")
+@test("hand-written matches on a local large enum keep its -O0 frame from growing per match")
 gfs_match_on_a_local_reads_through_it()
     if !gfs_ready() then return
 
-    var arms = ""
+    var matches = ""
 
-    for v in ["B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L"]
-        arms += s"            $v(n) -> n\n"
+    for v in ["B", "C", "D", "E", "F", "G", "H", "I"]
+        matches += s"    t += w match\n        $v(n) -> n\n        A(_) -> 2\n        _ -> 1\n"
 
     val program = "enum W\n    A(a: [256]u8)\n" +
         "    B(n: u32)\n    C(n: u32)\n    D(n: u32)\n    E(n: u32)\n    F(n: u32)\n    G(n: u32)\n" +
-        "    H(n: u32)\n    I(n: u32)\n    J(n: u32)\n    K(n: u32)\n    L(n: u32)\n\n" +
-        "pick(w: W) -> u32\n    var t: u32 = 0\n\n    for i in 0..<3\n        t += w match\n" +
-        "            A(a) -> u32(a[i])\n" + arms + "\n    t\n\n" +
+        "    H(n: u32)\n    I(n: u32)\n\n" +
+        "pick(w: W) -> u32\n    var t: u32 = 0\n\n" + matches + "\n    t\n\n" +
         "main()\n    print(pick(W.C(5)), pick(W.A([7; 256])))\n"
     val report = gfs_report(program)
     val frame = gfs_frame(report, "pick")
 
-    // Read whole, each `match` copied the 260-byte enum twice; read through the local, one payload.
+    // Read whole, each `match` copied the 260-byte enum twice; read through the local, only the
+    // tag and the four-byte payload.
     assert(frame > 0, report)
     assert(frame < 1024, s"pick takes $frame bytes")
 
-    gfs_prints(program, "15 21\n")
+    gfs_prints(program, "12 16\n")
 end gfs_match_on_a_local_reads_through_it
 
 // -- the outputs ----------------------------------------------------------------------------------

@@ -267,8 +267,11 @@ gen_match(e: *Emit, scrutinee: TExpr, arms: Buf[TArm], ty: Type, into: Option[Va
     // a variant's fields: the tag is the one word loaded, and each arm reads its own payload out of
     // the local. Loaded whole, the value was copied once for the `match` and again into a slot for
     // the payload to be read from -- in an unoptimized build two stack slots the size of the enum for
-    // every `match`, which an `x.(c)` walk over the variants makes once per variant.
-    if held.is_none() && is_load(scrutinee) && binds_shallow(arms)
+    // every `match`, which an `x.(c)` walk over the variants makes once per variant. An arm that
+    // moves its payload out moves it from the local, as above, where the enum is large; a small one
+    // with such an arm keeps the loaded value.
+    if held.is_none() && is_load(scrutinee) && binds_shallow(arms) &&
+       (moving || !any_moves(e, arms, into.is_some()))
         enum_decl(sty) match
             Some(d) ->
                 if !d.simple
@@ -694,11 +697,15 @@ private gen_arm_body(e: *Emit, arm: TArm, sv: Val, at: Option[Val], ty: Type, sl
 
     push_owned(e)
 
+    // An arm that hands a large payload back moves it out of the local as `payload_move` always did;
+    // only the whole-value rebuild, which needs the value loaded, is not open to it.
     if through
-        bind_through(e, arm.patterns[0], at.unwrap())
+        if !payload_move(e, arm, slot, at)
+            bind_through(e, arm.patterns[0], at.unwrap())
 
-        if no_value(ty) then gen_block_void(e, arm.body)
-        else store_merged(e, arm.body, ty, slot)
+            if no_value(ty) then gen_block_void(e, arm.body)
+            else store_merged(e, arm.body, ty, slot)
+        end if
 
         pop_owned(e)
         emit_term(e, InBr(end_l))
