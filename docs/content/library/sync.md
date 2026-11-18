@@ -851,10 +851,12 @@ var held = SeqLock.new(Holder(1, Node(2)))
 ```
 
 ```error
-Plain
+'SeqLock' requires its type parameter 'T' to implement 'Plain', but Holder does not
 ```
 
-`load_relaxed` and `store_relaxed` hold their type to the same bound, for the same reason.
+`load_relaxed` and `store_relaxed` hold their type to the same bound, for the same reason. The copy
+builds its answer in a local that starts at `T`'s zero value, so a `T` with none — a simple enum none
+of whose variants is written `= 0`, or a struct holding one — is refused too.
 
 ## What is not here
 
