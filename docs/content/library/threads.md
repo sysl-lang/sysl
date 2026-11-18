@@ -879,8 +879,9 @@ print(halves(xs[..]))
 
 **What a scoped closure may capture is what `@scoped(f)` allows**
 ([attributes § `@scoped(f)`](/reference/attributes/#scoped-f-a-member-that-finishes-what-it-starts-before-its-scope-closes)):
-scalars, arrays, `&sync T`, raw pointers, the scope itself, and views. A `string`, a `&T` or a `Buf`
-is refused by name, and so is a closure made earlier and handed in — only one written at the call
+scalars, arrays, `&sync T`, raw pointers, the scope itself, views, and strings — a string is not lent
+but [shared](/reference/memory/#a-string-crosses-into-a-shared-object), copied once into bytes with
+an atomic count. A `&T` or a `Buf` is refused by name, and so is a closure made earlier and handed in — only one written at the call
 borrows. Storing a borrowed view where it outlives the scope is refused the way module storage reached
 from another domain always is:
 
