@@ -3685,11 +3685,12 @@ Each name is the extension as LLVM names the feature, the names `codegen.extensi
 `aes`, `sha3`, `dotprod`, `lse` on AArch64, `sse4.2`, `avx2`, `bmi2` on x86-64 — and each is asked of
 the clang that will build the program, which would only warn about a name it does not know:
 
-```sysl target=aarch64-linux
+```sysl target=aarch64-freestanding
 @extensions("crcc")
 step(x: u32) -> u32 = x
 
-print(step(1))
+@export("main")
+start() -> i32 = i32(step(1))
 ```
 
 ```error
@@ -3717,15 +3718,16 @@ callee names:
 
 Anywhere else the call is refused, naming both ways to make it:
 
-```sysl target=aarch64-linux
+```sysl target=aarch64-freestanding
 @extensions("crc")
 step(x: u32) -> u32 = x
 
-print(step(1))
+@export("main")
+start() -> i32 = i32(step(1))
 ```
 
 ```error
-'step' is called, and it is compiled for the processor's 'crc' extension, which 'aarch64-linux' does not promise and the code here is not compiled for — on a processor without it its first such instruction faults. Mark the caller '@extensions("crc")', or make the call inside '@unchecked("crc")' once the program has asked the processor
+'step' is called, and it is compiled for the processor's 'crc' extension, which 'aarch64-freestanding' does not promise and the code here is not compiled for — on a processor without it its first such instruction faults. Mark the caller '@extensions("crc")', or make the call inside '@unchecked("crc")' once the program has asked the processor
 ```
 
 That is Rust's rule — a `#[target_feature]` function is an `unsafe` call from a function without the

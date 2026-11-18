@@ -264,7 +264,7 @@ tfe_written_inside_inherits()
     val t = tfe_row("aarch64-linux")
     val closure = tfe_said(t, tfe_crc("@extensions(\"crc\")\nall(xs: []u64) -> u32\n    var c: u32 = 0\n" +
                                       "    val f = (w: u64) -> step(c, w)\n    for x in xs\n        c = f(x)\n" +
-                                      "    c\n\nval ws: [2]u64 = [1, 2]\n\n@unchecked(\"crc\")\n    print(all(ws[..]))"))
+                                      "    c\n\nvar ws: [2]u64 = [1, 2]\n\n@unchecked(\"crc\")\n    print(all(ws[..]))"))
 
     assert(!closure.contains("error"), closure)
 
@@ -327,15 +327,20 @@ tfe_generic_and_member()
     assert(!member_ok.contains("error"), member_ok)
 end tfe_generic_and_member
 
-@test("an address of a marked function is held to what a call is")
+@test("an address of a marked function, and the function as a callable, are held to what a call is")
 tfe_address_taken()
     val t = tfe_row("aarch64-linux")
-    val text = "@extensions(\"crc\")\ntwice(x: int) -> int = x * 2\n\n"
-    val plain = tfe_said(t, text + "val f = twice\n\nprint(f(2))\n")
+    val text = "@extensions(\"crc\")\ntwice(x: int) -> int = x * 2\n\napply(f: int -> int, x: int) -> int = f(x)\n\n"
+    val address = tfe_said(t, text + "val p = &twice\n\nprint(1)\n")
 
-    assert(plain.contains("compiled for the processor's 'crc' extension"), plain)
+    assert(address.contains("the address of 'twice' is taken, and it is compiled for the processor's 'crc' " +
+           "extension"), address)
 
-    val inside = tfe_said(t, text + "@unchecked(\"crc\")\n    val f = twice\n    print(f(2))\n")
+    val callable = tfe_said(t, text + "print(apply(twice, 2))\n")
+
+    assert(callable.contains("compiled for the processor's 'crc' extension"), callable)
+
+    val inside = tfe_said(t, text + "@unchecked(\"crc\")\n    val p = &twice\n    print(apply(twice, 2))\n")
 
     assert(!inside.contains("error"), inside)
 end tfe_address_taken
@@ -475,7 +480,8 @@ tfe_inlining_follows_the_features()
         "private helper(w: u64) -> u64 = w * 7\n\n" +
         "@extensions(\"crc\")\nprivate kern(c: u32, w: u64) -> u32 = crc_word(c, helper(w))\n\n" +
         "@export(\"plain\")\nplain(c: u32, w: u64) -> u32\n    @unchecked(\"crc\")\n        return kern(c, w)\n\n" +
-        "@export(\"marked\")\n@extensions(\"crc\")\nmarked(c: u32, w: u64) -> u32 = kern(c, w)\n\nprint(plain(1, 2), marked(1, 2))\n"
+        "@export(\"marked\")\n@extensions(\"crc\")\nmarked(c: u32, w: u64) -> u32 = kern(c, w)\n\n" +
+        "@unchecked(\"crc\")\n    print(plain(1, 2), marked(1, 2))\n"
     val built = tfe_asm(t, tfe_said(t, text))
     val code = built.1
 
