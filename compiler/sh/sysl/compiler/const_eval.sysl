@@ -229,7 +229,8 @@ const_run(cx: &Analyzer, e: Expr, whole: bool) -> Option[Const]
     if typed.is_none() then return None
 
     *typed.unwrap().kind match
-        TCall(name, _, _, _) -> if !runs_while_compiling(cx.an, name) then return None
+        TCall(name, _, _, _) ->
+            if !runs_while_compiling(cx.an, name) && !is_sqrt_extern(cx.an, name) then return None
         _ -> if !whole then return None
 
     evaluate(cx.an, cx.scope, subject_of(cx.an), typed.unwrap(), no_fuse_here(cx)) match
@@ -4244,6 +4245,12 @@ private call_with(r: &EvRun, at: Span, name: string, vals: Buf[Const]) -> Flow
         if folded.is_some() then return EvGave(folded.unwrap())
     end if
 
+    if vals.len() == 1
+        val root = sqrt_intrinsic(r.a, name, vals[0])
+
+        if root.is_some() then return EvGave(root.unwrap())
+    end if
+
     val routine = qualified_name(r.a.tables.members.func_origin.get(name).unwrap_or(name))
 
     if writer_routine(routine) then return writer_render(r, at, routine, vals)
@@ -4252,6 +4259,35 @@ private call_with(r: &EvRun, at: Span, name: string, vals: Buf[Const]) -> Flow
 
     run_call(r, at, name, vals)
 end call_with
+
+// `llvm.sqrt` over a float the evaluator holds: the one `extern` besides the encodings that a constant
+// may call, because the standard says what its answer is -- the exact root rounded once to nearest,
+// ties to even, at the width the declaration names. The machine compiling gives that same answer
+// (its own `sqrt` is `llvm.sqrt`), so a `-0.0` stays `-0.0`, a negative number and a NaN are a NaN
+// (which bits a NaN has is the machine's choice, and `float_pattern` writes the one pattern), an
+// infinity stays one, and a subnormal is rounded as the instruction rounds it. An `f32` is rooted at
+// `f32`, never at `f64` and rounded after.
+private is_sqrt_extern(a: &Analysis, name: string) -> bool
+    val x = a.tables.externs.get(name)
+
+    x.is_some() && extern_symbol(x.unwrap()) == "llvm.sqrt" && x.unwrap().params.len() == 1
+end is_sqrt_extern
+
+private sqrt_intrinsic(a: &Analysis, name: string, arg: Const) -> Option[Const]
+    if !is_sqrt_extern(a, name) then return None
+
+    val x = a.tables.externs.get(name)
+
+    val f = arg match
+        ConstFloat(v) -> v
+        _ -> return None
+
+    val single = *x.unwrap().params[0].typ.kind match
+        NamedType(n, _) -> n == "f32"
+        _ -> false
+
+    Some(ConstFloat(if single then real(f32(f).sqrt()) else f.sqrt()))
+end sqrt_intrinsic
 
 // -- trait objects ------------------------------------------------------------------------------------
 //
