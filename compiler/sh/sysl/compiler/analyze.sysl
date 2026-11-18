@@ -948,12 +948,16 @@ private resolve_signatures(a: &Analysis)
             resolved.push((p.name, t))
 
             if !vector_said && is_vector(t)
-                extern_vector_fault(a, key, s"'${p.name}' of the 'extern' '${d.name}' is ${type_show(t)}, " +
+                extern_signature_fault(a, key, s"'${p.name}' of the 'extern' '${d.name}' is ${type_show(t)}, " +
                                     "and how a vector reaches a C function differs by target and by " +
                                     "what the other side was compiled for — so sysl will not guess at " +
                                     s"one. Pass the lanes through memory, as a '*${lane_shown(t)}'")
                 vector_said = true
             end if
+
+            if option_of_raw_pointer(t)
+                extern_signature_fault(a, key, s"'${p.name}' of the 'extern' '${d.name}' is ${type_show(t)}, " +
+                                    nullable_pointer_reason(t))
 
         if d.ret_type.is_some()
             val t = resolve_result(a, scope, d.ret_type.unwrap(), no_bindings())
@@ -961,11 +965,15 @@ private resolve_signatures(a: &Analysis)
             answer = t
 
             if !vector_said && is_vector(t) then
-                extern_vector_fault(a, key, s"the 'extern' '${d.name}' returns ${type_show(t)}, and how " +
+                extern_signature_fault(a, key, s"the 'extern' '${d.name}' returns ${type_show(t)}, and how " +
                                     "a vector comes back from a C function differs by target and by " +
                                     "what the other side was compiled for — so sysl will not guess at " +
                                     s"one. Have it write the lanes through a '*${lane_shown(t)}' the " +
                                     "caller supplies")
+
+            if option_of_raw_pointer(t)
+                extern_signature_fault(a, key, s"the 'extern' '${d.name}' returns ${type_show(t)}, " +
+                                    nullable_pointer_reason(t))
         end if
 
         leave_reaching(a, covered)
@@ -1024,10 +1032,22 @@ end resolve_signatures
 // The terms a declaration's own file set up, which is where its signature is read.
 // How a vector crosses to C differs by target and by what the other side was compiled for, so an
 // `extern` taking or answering one is refused at its declaration rather than declared at a guess.
-private extern_vector_fault(a: &Analysis, key: string, message: string)
+private extern_signature_fault(a: &Analysis, key: string, message: string)
     val home = a.tables.extern_scopes.get(key).unwrap()
 
     a.fault(home.scope, home.span, message)
+
+// Why an `Option` of a raw pointer cannot cross to C, and what to write instead, as the tail of a
+// refusal: its tag sits beside the address, so it is not the nullable pointer C declares.
+nullable_pointer_reason(t: Type) -> string
+    val inner = underlying(t) match
+        Enum(d) if d.targs.len() == 1 -> type_show(d.targs[0])
+        _ -> "*T"
+
+    "which C has no spelling for — an 'Option' of a raw pointer is a tag beside the address, so " +
+    s"'Some(null)' stays apart from 'None'. A pointer C may make null is a plain '$inner', compared " +
+    "with 'null'"
+end nullable_pointer_reason
 
 // The type a vector's lanes are, as a diagnostic shows it.
 private lane_shown(t: Type) -> string = t match

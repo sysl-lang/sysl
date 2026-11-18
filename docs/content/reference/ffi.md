@@ -451,26 +451,35 @@ lays it out in is marked [`@pinned`](/reference/attributes/#pinned-on-a-struct-a
 kept in module storage or a `&T` box, and passed to C as `&fs`. The compiler then refuses every copy of
 it.
 
-### A nullable pointer is an `Option`
+### A nullable pointer is a plain `*T`
 
-**`Option[*T]` is laid out as the pointer itself, with `None` as null**
-([`memory.md`](memory.md#an-option-of-an-address-is-one-word)), so it is exactly C's nullable `T *`:
-an extern that may answer `NULL` says so in its signature, and the answer is matched rather than
-compared with `null`. It crosses as a pointer in every position a `*T` does — an argument, a result,
-a field of a struct handed over by value, and an `@export`'s parameter, where the header spells it
-`T *`:
+**A pointer C may make null is a `*T`, compared with `null`.** An `Option[*T]` keeps a tag beside the
+address so that `Some(null)` stays apart from `None`
+([`memory.md`](memory.md#an-option-of-a-reference-is-one-word)), so it is not the `T *` C declares,
+and an `extern` or `@export` that names one is refused rather than read wrong:
+
+```sysl
+extern strchr(s: *u8, c: i32) -> Option[*u8]
+```
+
+```error
+A pointer C may make null is a plain '*u8', compared with 'null'
+```
 
 ```sysl
 import sysl.text.cstring
 
-extern strchr(s: *u8, c: i32) -> Option[*u8]
+extern strchr(s: *u8, c: i32) -> *u8
 
 val text = cstring("hello")
 
 for c in ['l', 'z']
-    strchr(text.ptr, i32(c)) match
-        Some(at) -> print(at - text.ptr)
-        None -> print("absent")
+    val at = strchr(text.ptr, i32(c))
+
+    if at == null
+        print("absent")
+    else
+        print(at - text.ptr)
 ```
 
 ```output
@@ -478,9 +487,13 @@ for c in ['l', 'z']
 absent
 ```
 
-Passing `None` hands C a `NULL`. A `Some` holding a null `*T` is `None` too, since the two are the
-same bits. An `Option[&T]` is one word as well, but a counted reference is not something C may hold,
-so an `@export` taking or answering one is refused as a bare `&T` is.
+The same holds for a `*extern` function pointer: a callback C may leave unset is a plain one,
+compared with `null`.
+
+**An `Option[&T]` is one word, with `None` as null**, so an `extern` takes or answers one wherever
+it takes or answers a bare `&T` — the address of the object, and `NULL` for `None` — under the same
+promise a `&T` handed to C already makes. An `@export` taking or answering one is refused, as one
+taking a bare `&T` is: a counted reference is not something C may hold.
 
 ### Handing C an object to hold
 

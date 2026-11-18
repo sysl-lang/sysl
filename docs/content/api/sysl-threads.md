@@ -192,17 +192,15 @@ on aarch64 -- and is trimmed to whole 16 KiB pages first.
 ### `tls_place`
 
 ```sysl
-tls_place(room: []u8) -> Option[usize]
+tls_place(room: []u8) -> Option[*u8]
 ```
 
 Lays one thread's block of `@thread_local` storage out in `room` -- the template's initialized
 bytes copied, the rest zeroed -- and answers the value the thread pointer holds while that thread
-runs, as an address.
+runs.
 
-`Some(0)` where there is nothing to lay: the program has no thread-local storage, or the target is
-hosted and the C library lays it. `None` where `room` is smaller than `tls_room()`. The answer is a
-number rather than a `*u8` because an `Option` of a pointer has no room for a null `Some`
-(`reference/memory.md § An Option of an address is one word`).
+`Some(null)` where there is nothing to lay: the program has no thread-local storage, or the target
+is hosted and the C library lays it. `None` where `room` is smaller than `tls_room()`.
 
 **The layout is the processor's ABI for local-exec access, at the offsets the linker computed**: on
 AArch64 the pointer is the start of a 16-byte control block the storage follows at its alignment; on

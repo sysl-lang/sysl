@@ -7,23 +7,24 @@ import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
 import sysl.process.capture
 import sysl.text.Search
 
-// **An `Option` of a thin address has a null niche** (`layout.sysl`'s `null_niche`,
-// `reference/memory.md § Option of an address is one word`): `Option[&T]` and `Option[*T]` are the
-// address alone, and `None` is null, so an `Option[*T]` is the nullable C pointer an extern
-// signature declares.
+// **An `Option` of a thin reference has a null niche** (`layout.sysl`'s `null_niche`,
+// `reference/memory.md § An Option of a reference is one word`): `Option[&T]` and `Option[&sync T]`
+// are the address alone, and `None` is null. A raw `*T` may be null, so its `Option` keeps the tag,
+// as Rust's does, and an `extern` or `@export` that names one is refused.
 //
 // The axes: the size wherever the value sits (a local, a field, an array element, nested in another
-// `Option`), next to the shapes that keep the tag (a trait object, a weak reference, an integer);
-// every way a tag is read (a `match`, its `switch`, `?`, `unwrap`, the library's generic methods
-// instantiated at an address and crossing to a tagged `Option`); ARC of a `&T` inside `Some` in a
-// local, a field, an array element, reassigned, passed and returned, counted to zero; module storage
-// (a constant `Some(&x)`, `None`, a zeroed one); a `Some` of a null `*T`; the C boundary both ways
-// (an extern answering and taking NULL, an export called from C with NULL, a struct holding one by
-// value), the header's spelling and the export refusal of `Option[&T]`; and a 32-bit target.
+// `Option`), next to the shapes that keep the tag (a raw pointer, a trait object, a weak reference,
+// an integer); every way a tag is read (a `match`, its `switch`, `?`, `unwrap`, the library's
+// generic methods instantiated at a reference and crossing to a tagged `Option`); ARC of a `&T`
+// inside `Some` in a local, a field, an array element, reassigned, passed and returned, counted to
+// zero; module storage (`None`, a zeroed one, an array of them); a `Some` of a null `*T` staying a
+// `Some`; the C boundary (an extern handed an `Option[&T]` and NULL, its signature, the refusals of
+// `Option[*T]` and `Option[*extern]` on an extern and of `Option[*T]` and `Option[&T]` on an export);
+// and a 32-bit target.
 //
 // Skipped cells, and why: separate compilation does not change a layout, which every unit asks of
-// the same `TargetLayout`; a `*extern` function pointer and a `*Trait` keep their tag, so they are
-// only measured.
+// the same `TargetLayout`; an extern ANSWERING an `Option[&T]` hands back a count exactly as one
+// answering a bare `&T` does, which is that rule's to test.
 
 // -- the harness ----------------------------------------------------------------------------------
 
@@ -118,7 +119,7 @@ private nnc_says(text: string, part: string) = assert(text.contains(part), s"exp
 
 // -- the size -------------------------------------------------------------------------------------
 
-@test("an Option of a reference or a pointer is one word; a trait object, a weak edge and an int keep the tag")
+@test("an Option of a reference is one word; a raw pointer, a trait object, a weak edge and an int keep the tag")
 nnc_sizes()
     nnc_prints(raw"""
         struct Node
@@ -131,12 +132,13 @@ nnc_sizes()
             a: Option[&Node]
             b: int
 
-        print(sizeof(Option[&Node]), alignof(Option[&Node]), sizeof(Option[*int]), sizeof(Option[*u8]))
-        print(sizeof(Option[int]), sizeof(Option[*Shape]), sizeof(Option[weak Node]))
-        print(sizeof(Option[Option[&Node]]), sizeof(Pair), sizeof([4]Option[*int]))
-        """, "", "8 8 8 8\n8 24 16\n16 16 32\n")
+        print(sizeof(Option[&Node]), alignof(Option[&Node]), sizeof(Option[&sync Node]))
+        print(sizeof(Option[*int]), sizeof(Option[*u8]), sizeof(Option[int]), sizeof(Option[*Shape]),
+              sizeof(Option[weak Node]))
+        print(sizeof(Option[Option[&Node]]), sizeof(Pair), sizeof([4]Option[&Node]))
+        """, "", "8 8 8\n16 16 8 24 16\n16 16 32\n")
 
-@test("on a 32-bit target the Option of a pointer is the four-byte address and no tag")
+@test("on a 32-bit target the Option of a reference is the four-byte address and no tag")
 nnc_thirty_two_bits()
     if std_root().is_err() then return
 
@@ -144,17 +146,19 @@ nnc_thirty_two_bits()
         struct Cell
             v: int
 
-        @assert(sizeof(Option[*Cell]) == 4, "one address")
         @assert(sizeof(Option[&Cell]) == 4, "one address")
+        @assert(sizeof(Option[*Cell]) == 8, "a tag beside the address")
 
-        @export("pick")
-        pick(p: Option[*Cell]) -> int = p match
+        first(o: Option[&Cell]) -> int = o match
             Some(c) -> c.v
             None -> -1
+
+        @export("pick")
+        pick() -> int = first(None)
         """, target_named("thumb-freestanding").unwrap())
 
     assert_eq(b.0, "")
-    nnc_says(b.1, "%enum.sysl$Option.ptr.Cell = type { [1 x i32] }")
+    nnc_says(b.1, "%enum.sysl$Option.ref.Cell = type { [1 x i32] }")
 // -- every way the variant is read ----------------------------------------------------------------
 
 @test("a match, unwrap, unwrap_or, is_none and ? read an Option of a reference by its address")
@@ -264,7 +268,7 @@ nnc_bound_share()
 
 // -- module storage and the zero value ------------------------------------------------------------
 
-@test("a constant Some of an address, None, a zeroed one and a Some of null in module storage")
+@test("None, a zeroed one and an array of them in module storage, beside a tagged constant Some of an address")
 nnc_module_storage()
     nnc_prints(raw"""
         struct Cell
@@ -272,107 +276,114 @@ nnc_module_storage()
 
         var c = Cell(7)
         var held: Option[*Cell] = Some(&c)
-        var nothing: Option[*Cell] = None
+        var nothing: Option[&Cell] = None
         var later: Option[&Cell]
-        var many: [3]Option[*Cell]
+        var many: [3]Option[&Cell]
 
         print(held.unwrap().v, nothing.is_none(), later.is_none(), many[2].is_none())
+        later = Some(Cell(8))
+        print(later.unwrap().v)
+        """, "", "7 true true true\n8\n")
 
-        val p: *Cell = null
-        val wrapped: Option[*Cell] = Some(p)
+// -- a raw pointer keeps its tag ------------------------------------------------------------------
 
-        print(wrapped.is_none())
-        held = None
-        print(held.is_some())
-        """, "", "7 true true true\ntrue\nfalse\n")
-
-@test("generic code meets the niche: a Buf of pointers pops a null element as None")
-nnc_generic_null_element()
+@test("a Some of a null raw pointer stays a Some, in a local, through generic code and in a Buf")
+nnc_some_null_stays_some()
     nnc_prints(raw"""
         import sysl.buf.{Buf, buf}
+
+        wrap[T](x: T) -> Option[T] = Some(x)
+
+        val p: *int = null
+        val o: Option[*int] = Some(p)
+
+        print(o.is_some(), o.unwrap() == null, wrap(p).is_some())
 
         var x = 5
         var b: Buf[*int] = buf()
 
         b.push(&x)
         b.push(null)
-        print(b.pop().is_none(), b.pop().is_some(), b.len())
-        """, "", "true true 0\n")
+        print(b.pop().is_some(), b.pop().is_some(), b.pop().is_none())
+
+        val f: *extern(i32) -> i32 = null
+
+        print(Some(f).is_some())
+        """, "", "true true true\ntrue true true\ntrue\n")
 
 // -- the C boundary -------------------------------------------------------------------------------
 
-private val nnc_c: string = raw"""
-    #include <stdint.h>
-    #include <stddef.h>
-
-    static int32_t box = 41;
-
-    struct Pair { int32_t *p; int32_t n; };
-
-    int32_t *c_find(int32_t want) { return want == 41 ? &box : NULL; }
-    int32_t c_is_null(int32_t *p) { return p == NULL; }
-    int32_t c_pair(struct Pair x) { return x.p ? *x.p + x.n : x.n; }
-
-    int32_t *s_pick(int32_t *p);
-
-    int32_t c_through(int32_t flag) {
-        int32_t *r = s_pick(flag ? &box : NULL);
-        return r == NULL ? -1 : *r;
-    }
-    """
-
-@test("an extern answers and takes NULL as None, an export called from C sees it, and a struct carries one")
-nnc_extern_null()
+// An `Option` of a reference on an `extern` crosses where a bare `&T` does, as the one address C
+// sees, with `None` the null C may be handed.
+@test("an extern taking an Option of a reference is handed the address, and NULL for None")
+nnc_extern_option_ref()
     nnc_prints(raw"""
-        struct Pair
-            p: Option[*i32]
-            n: i32
+        struct Node
+            v: i32
 
-        extern c_find(want: i32) -> Option[*i32]
-        extern c_is_null(p: Option[*i32]) -> i32
-        extern c_pair(x: Pair) -> i32
-        extern c_through(flag: i32) -> i32
+        extern c_value_or(n: Option[&Node], d: i32) -> i32
 
-        @export("s_pick")
-        pick(p: Option[*i32]) -> Option[*i32] = p match
-            Some(q) -> Some(q)
-            None -> None
+        val n: &Node = Node(41)
 
-        print(c_find(41).is_some(), c_find(0).is_none(), *c_find(41).unwrap())
-        print(c_is_null(None), c_is_null(c_find(41)))
-        print(c_pair(Pair(c_find(41), 1)), c_pair(Pair(None, 1)))
-        print(c_through(1), c_through(0))
-        """, nnc_c, "true true 41\n1 0\n42 1\n41 -1\n")
+        print(c_value_or(Some(n), -1), c_value_or(None, -1), n.v)
+        """, raw"""
+        #include <stdint.h>
+        #include <stddef.h>
 
-// A result is named by its width on AArch64 (`cabi.sysl`), so it is the argument that shows the
-// address; neither travels through memory.
-@test("an extern's Option of a pointer crosses in one register, an argument as a plain ptr")
-nnc_extern_signature()
+        struct Node { int32_t v; };
+
+        int32_t c_value_or(struct Node *n, int32_t d) { return n ? n->v : d; }
+        """, "41 -1 41\n")
+
+@test("and its signature is a plain ptr, nothing through memory")
+nnc_extern_option_ref_signature()
     if std_root().is_err() then return
 
     val b = nnc_build(raw"""
-        extern c_find(want: i32) -> Option[*i32]
-        extern c_is_null(p: Option[*i32]) -> i32
+        struct Node
+            v: i32
 
-        print(c_is_null(c_find(1)))
+        extern c_value_or(n: Option[&Node], d: i32) -> i32
+
+        print(c_value_or(None, 0))
         """, host_target())
 
     assert_eq(b.0, "")
-    nnc_says(b.1, " @c_find(i32)\n")
-    nnc_says(b.1, "declare i32 @c_is_null(ptr)\n")
-    assert(!b.1.contains("sret"), b.1)
+    nnc_says(b.1, "declare i32 @c_value_or(ptr, i32)\n")
 
-@test("the header spells an exported Option of a pointer as the C pointer")
-nnc_header()
+// An `Option` of a raw pointer is tagged, so it is not C's nullable pointer; before, the tag was read
+// out of the address's low bits.
+@test("an extern taking or answering an Option of a raw pointer is refused, naming the plain pointer")
+nnc_extern_option_ptr_refused()
+    if std_root().is_err() then return
+
+    val taking = nnc_build("extern c_is_null(p: Option[*i32]) -> i32\n", host_target()).0
+
+    nnc_says(taking, "'p' of the 'extern' 'c_is_null' is ")
+    nnc_says(taking, "which C has no spelling for — an 'Option' of a raw pointer is a tag beside the address")
+    nnc_says(taking, "A pointer C may make null is a plain '*i32', compared with 'null'")
+
+    val answering = nnc_build("extern c_find(want: i32) -> Option[*u8]\n", host_target()).0
+
+    nnc_says(answering, "the 'extern' 'c_find' returns ")
+    nnc_says(answering, "A pointer C may make null is a plain '*u8', compared with 'null'")
+
+    val callback = nnc_build("extern c_set(f: Option[*extern(i32) -> i32])\n", host_target()).0
+
+    nnc_says(callback, "'f' of the 'extern' 'c_set' is ")
+    nnc_says(callback, "compared with 'null'")
+
+@test("an exported Option of a raw pointer is refused, naming the plain pointer")
+nnc_export_option_ptr_refused()
     if std_root().is_err() then return
 
     val b = nnc_build(raw"""
         @export("s_pick")
-        pick(p: Option[*i32]) -> Option[*i32] = p
+        pick(p: Option[*i32]) -> int = 0
         """, host_target())
 
-    assert_eq(b.0, "")
-    nnc_says(c_header_render(exports_by_symbol(b.2), "demo"), "int32_t * s_pick(int32_t * p);")
+    nnc_says(b.0, "which C has no way to spell")
+    nnc_says(b.0, "A pointer C may make null is a plain '*i32', compared with 'null'")
 
 @test("an exported Option of a counted reference is refused with the counted reference's advice")
 nnc_export_counted_refused()

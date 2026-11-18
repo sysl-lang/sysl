@@ -221,7 +221,7 @@ private start_on(room: []u8, body: *extern(*u8) -> unit, arg: *u8) -> Option[Thr
 
     if hi <= lo then return None
 
-    if tsys.spawn(body, arg, ptr_cast(lo), hi - lo, ptr_cast(tls), word) != 0 then return None
+    if tsys.spawn(body, arg, ptr_cast(lo), hi - lo, tls, word) != 0 then return None
 
     Some(Thread(*word, word, null))
 end start_on
@@ -257,23 +257,21 @@ end tls_room
 
 /** Lays one thread's block of `@thread_local` storage out in `room` -- the template's initialized
  * bytes copied, the rest zeroed -- and answers the value the thread pointer holds while that thread
- * runs, as an address.
+ * runs.
  *
- * `Some(0)` where there is nothing to lay: the program has no thread-local storage, or the target is
- * hosted and the C library lays it. `None` where `room` is smaller than `tls_room()`. The answer is a
- * number rather than a `*u8` because an `Option` of a pointer has no room for a null `Some`
- * (`reference/memory.md § An Option of an address is one word`).
+ * `Some(null)` where there is nothing to lay: the program has no thread-local storage, or the target
+ * is hosted and the C library lays it. `None` where `room` is smaller than `tls_room()`.
  *
  * **The layout is the processor's ABI for local-exec access, at the offsets the linker computed**: on
  * AArch64 the pointer is the start of a 16-byte control block the storage follows at its alignment; on
  * x86-64 the storage ends at the pointer, whose first word holds its own address; elsewhere the
  * storage starts at the pointer. The pointer is aligned to the storage's alignment in each.
  */
-tls_place(room: []u8) -> Option[usize]
+tls_place(room: []u8) -> Option[*u8]
 #if freestanding
     laid(template(), room)
 #else
-    Some(0)
+    Some(null)
 #endif
 end tls_place
 
@@ -325,10 +323,10 @@ end at_pointer
 // The room one block needs, slack for aligning the pointer included; zero for an empty template.
 private[threads] room_for(t: Template) -> usize = if t.size == 0 then 0 else t.before + t.after + t.align
 
-// The block laid in `room`, and the thread pointer it answers to: `Some(0)` for an empty template,
+// The block laid in `room`, and the thread pointer it answers to: `Some(null)` for an empty template,
 // `None` where `room` is too small.
-private[threads] laid(t: Template, room: []u8) -> Option[usize]
-    if t.size == 0 then return Some(0)
+private[threads] laid(t: Template, room: []u8) -> Option[*u8]
+    if t.size == 0 then return Some(null)
 
     if room.len < room_for(t) then return None
 
@@ -351,7 +349,7 @@ private[threads] laid(t: Template, room: []u8) -> Option[usize]
         *word = usize(tp)
     end if
 
-    Some(usize(tp))
+    Some(tp)
 end laid
 
 #if freestanding
