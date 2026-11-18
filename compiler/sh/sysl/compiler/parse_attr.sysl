@@ -259,7 +259,7 @@ builtin_attr_word(w: string) -> bool
                  "tailrec", "pure", "ghost", "packed", "reads", "writes", "align", "byte_order", "export",
                  "section", "crossing", "domain", "keeps", "answers", "disjoint", "guards", "needs",
                  "noinline", "inline", "cold", "thread_local", "abandons", "per_cpu", "main_thread",
-                 "pinned", "pins", "relocates", "views", "consumes", "blocks", "scoped", "bounded", "joined",
+                 "pinned", "pins", "unique", "relocates", "views", "consumes", "blocks", "scoped", "bounded", "joined",
                  "strict_fp", "track_caller", "returns_twice", "renamed", "removed", "unchecked",
                  "frame_limit"]
         if word == w then return true
@@ -425,6 +425,9 @@ parse_attribute(p: *Parser) -> Option[Attr]
     if word == "main_thread" then return Some(MainThread)
     if word == "pinned" then return Some(Pinned)
     if word == "pins" then return Some(Pins)
+
+    // `@unique` takes none: a value has one owner or it does not.
+    if word == "unique" then return no_inlining_args(p, Unique, "a value of the type has one owner, and nothing qualifies that")
     if fn_forgo_word(word) then return Some(Forgoes(word[3..<word.len]))
 
     // `@blocks` takes no parentheses: what it says is that a call may wait, and how long is not a
@@ -1195,9 +1198,9 @@ private parse_attributed_decl(p: *Parser, start: Span) -> Stmt
         return from_first(start, laid_out(p, at, parse_struct_decl(p, at, vis, false, a_union), attrs))
     end if
 
-    // An enum takes the annotations a program declares and nothing else: its layout is the
-    // compiler's, and it names no symbol.
-    if p.at_kw("enum") && any_user(attrs)
+    // An enum takes the annotations a program declares and `@unique`, and nothing else: its layout is
+    // the compiler's, and it names no symbol.
+    if p.at_kw("enum") && (any_user(attrs) || any_is(attrs, "unique"))
         refuse_unless(p, at, attrs, "enum")
         return from_first(start, annotated_enum(parse_enum_decl(p, at, vis), attrs))
     end if
@@ -1311,10 +1314,10 @@ private refuse_unless(p: *Parser, at: Span, attrs: Buf[Attr], form: string)
 private may_carry(form: string, a: Attr) -> bool
     if form == "struct"
         return is_layout(a) || attr_word(a) == "export" || attr_word(a) == "guards" || attr_word(a) == "unchecked" ||
-            attr_word(a) == "pinned" || is_user(a) || is_annotation_mark(a)
+            attr_word(a) == "pinned" || attr_word(a) == "unique" || is_user(a) || is_annotation_mark(a)
     end if
 
-    if form == "enum" then return is_user(a)
+    if form == "enum" then return is_user(a) || attr_word(a) == "unique"
     if form == "type" then return is_user(a) || attr_word(a) == "export"
 
     if form == "binding" then return is_storage(a) || attr_word(a) == "export"
@@ -1323,7 +1326,7 @@ private may_carry(form: string, a: Attr) -> bool
         attr_word(a) == "returns_twice"
 
     !is_layout(a) && attr_word(a) != "keeps" && attr_word(a) != "returns_twice" && attr_word(a) != "answers" && attr_word(a) != "guards" &&
-        attr_word(a) != "unchecked" &&
+        attr_word(a) != "unchecked" && attr_word(a) != "unique" &&
         attr_word(a) != "relocates" && attr_word(a) != "views" && attr_word(a) != "consumes" &&
         !is_user(a) && !is_annotation_mark(a)
 end may_carry
@@ -1395,6 +1398,9 @@ private attributed_refusal(attrs: Buf[Attr]) -> string
 
     if any_is(attrs, "consumes")
         return "'@consumes' says a call takes everything its receiver holds, so it marks a method — and this declares none"
+
+    if any_is(attrs, "unique")
+        return "'@unique' says a value of a type has one owner, so it marks a 'struct' or an 'enum' — and this declares neither"
 
     if all_are(attrs, "needs")
         return "'@needs(...)' names what reaching a declaration requires, so it marks a function or an 'extern' — and this declares neither"
@@ -1615,7 +1621,7 @@ end refuse_layout_beside_function
 private marks_a_function(attrs: Buf[Attr]) -> bool
     for attr in attrs
         if !is_layout(attr) && attr_word(attr) != "section" && attr_word(attr) != "pinned" &&
-                !is_user(attr) && !is_annotation_mark(attr) then
+                attr_word(attr) != "unique" && !is_user(attr) && !is_annotation_mark(attr) then
             return true
 
     false
@@ -1786,6 +1792,7 @@ private laid_out(p: *Parser, at: Span, s: Stmt, attrs: Buf[Attr]) -> Stmt
                     Guards(ns) -> decl.guards = guarded_fields(p, at, decl, ns)
                     Promises(ns) -> decl.promised = ns
                     Pinned -> decl.pinned = true
+                    Unique -> decl.unique = true
                     AnnotationMark -> decl.annotation = true
                     User(u) -> decl.annots.push(u)
                     _ -> ()
@@ -1831,6 +1838,7 @@ private annotated_enum(s: Stmt, attrs: Buf[Attr]) -> Stmt
             for attr in attrs
                 attr match
                     User(u) -> decl.annots.push(u)
+                    Unique -> decl.unique = true
                     _ -> ()
 
             stmt(s.span, EnumDecl(decl))

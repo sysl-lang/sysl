@@ -2,7 +2,8 @@ module sh.sysl.compiler
 @tests
 
 import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
-import sysl.process.capture
+import sysl.buf.{Buf, buf}
+import sysl.process.{Var, capture}
 
 // The reference's four `sysl.regex` suites: `RegexParseTests` (a POSIX ERE pattern read into a tree,
 // asserted on `show`'s parenthesised term, which tells `a|bc` from `(a|b)c` where a round trip to
@@ -570,6 +571,125 @@ rgx_a_doubled_backslash_is_one() = rgx_uses(raw"""
 rgx_no_match_leaves_the_text() = rgx_uses(raw"""
     print(regex("z+").unwrap().replace_all("abc", "X"))
     """, "abc\n")
+
+// The cells of the builder `replace_all` gathers into: nothing matched, every character matched,
+// empty matches, a replacement longer and shorter than what it replaces, text outside ASCII on
+// either side of a match and inside one, and every escape the replacement may hold.
+@test("replacing: every character, nothing, empty matches, longer and shorter replacements")
+rgx_replacing_matrix() = rgx_uses(raw"""
+    r(pat: string, s: string, with: string) = print(s"[${regex(pat).unwrap().replace_all(s, with)}]")
+
+    r("z+", "", "X")
+    r(".", "abc", "XY")
+    r("[a-z]", "abc", "")
+    r("x*", "", "-")
+    r("a*", "aab", "-")
+    r("ab", "xabyab", "LONGER")
+    r("ab", "xabyab", "")
+    """, "[]\n[XYXYXY]\n[]\n[-]\n[--b-]\n[xLONGERyLONGER]\n[xy]\n")
+
+@test("replacing across characters of more than one byte")
+rgx_replacing_across_utf8() = rgx_uses(raw"""
+    r(pat: string, s: string, with: string) = print(s"[${regex(pat).unwrap().replace_all(s, with)}]")
+
+    r("é", "aébé", "ü")
+    r("x*", "éü", "-")
+    r(".", "日本", "[\\0]")
+    r("(é+)(b)", "aééb", "\\2\\1")
+    r("b", "日b本", "ü日")
+    """, "[aübü]\n[-é-ü-]\n[[日][本]]\n[abéé]\n[日ü日本]\n")
+
+// A backslash before a character that is not a digit stands for that character -- the whole of it,
+// where it used to be cut at its first byte and trap on the boundary check.
+@test("the escapes a replacement may hold, a character of more than one byte among them")
+rgx_replacement_escapes() = rgx_uses(raw"""
+    r(pat: string, s: string, with: string) = print(s"[${regex(pat).unwrap().replace_all(s, with)}]")
+
+    r("b", "abc", "<\\q>")
+    r("b", "abc", "<\\é>")
+    r("b", "abc", "<\\")
+    r("(x)|(b)", "abc", "[\\1|\\2]")
+    r("b", "abc", "\\9")
+    r("[[:alpha:]]+", "ab, cd!", "<\\0\\0>")
+    """, "[a<q>c]\n[a<é>c]\n[a<\\c]\n[a[|b]c]\n[ac]\n[<abab>, <cdcd>!]\n")
+
+// What a counted build of `text` reports it allocated in all, run once with each case at each size.
+private rgx_bytes(text: string, cases: []const string, sizes: []const string) -> &Buf[long]
+    var out: &Buf[long] = buf()
+    val root = make_temp_dir("sysl-rgx").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    force_alloc_counting(true)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization,
+                                     Some(s"$root/built"))
+
+    force_alloc_counting(false)
+
+    if built.is_err()
+        remove_dir_all(root).unwrap_or(())
+        assert(false, "the counted program did not build")
+        return out
+
+    for c in cases
+        for n in sizes
+            val said = capture(s"$root/built", [c, n], "", [Var(alloc_bytes_variable(), "1")], true).unwrap()
+
+            assert(said.status.ok(), said.text)
+            out.push(alloc_bytes_reported(said.err.unwrap_or("")))
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end rgx_bytes
+
+// **Gathering is linear in what is gathered.** Each member is run at n and 2n and its total heap
+// asked for compared, which is deterministic where a timing is not: no block is grown in place, so
+// the bytes allocated bound the bytes copied. Linear work doubles (measured: 2.0x); the `out +=`
+// accumulation this replaced copied everything built so far at every piece and went 3.2-4x.
+@test("replacing, the listing, a class's rendering and a class name cost bytes linear in their size")
+rgx_gathering_is_linear()
+    if !rgx_ready() then return
+
+    val text = raw"""
+        import sysl.regex.{regex, compile_pattern, dump, parse_counted, show, describe}
+        import sysl.text.{parse_long, repeat}
+
+        main(args: []const string)
+            val n = usize(parse_long(args[2]).unwrap())
+
+            args[1] match
+                "every" -> print(regex(".").unwrap().replace_all(repeat("é", n), "ab").len)
+                "between" -> print(regex("b").unwrap().replace_all(repeat("aab", n), "").len)
+                "empty" -> print(regex("x*").unwrap().replace_all(repeat("é", n), "-").len)
+                "with" -> print(regex("x").unwrap().replace_all("axb", repeat("q\\0é", n)).len)
+                "dump" ->
+                    compile_pattern(repeat("a", n)) match
+                        Ok(p) -> print(dump(p).len)
+                        Err(e) -> print(describe(e))
+                "set" ->
+                    parse_counted("[" + repeat("a-b", n) + "]") match
+                        Ok(t) -> print(show(t.0).len)
+                        Err(e) -> print(describe(e))
+                "name" ->
+                    parse_counted("[[:" + repeat("é", n) + ":]]") match
+                        Ok(t) -> print(show(t.0).len)
+                        Err(e) -> print(describe(e).len)
+                else print("?")
+        """
+
+    val cases = ["every", "between", "empty", "with", "dump", "set", "name"]
+    val got = rgx_bytes(text, cases, ["2000", "4000"])
+
+    if got.len() != cases.len * 2 then return
+
+    for i in 0..<cases.len
+        val small = got[i * 2]
+        val large = got[i * 2 + 1]
+
+        assert(small > 0, s"${cases[i]}: no byte total was reported")
+        assert(large * 10 <= small * 22, s"${cases[i]}: $small bytes at 2000, $large at 4000")
+end rgx_gathering_is_linear
 
 // ---- splitting
 
