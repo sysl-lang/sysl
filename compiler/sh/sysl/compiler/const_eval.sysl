@@ -229,7 +229,8 @@ const_run(cx: &Analyzer, e: Expr, whole: bool) -> Option[Const]
     if typed.is_none() then return None
 
     *typed.unwrap().kind match
-        TCall(name, _, _, _) -> if !runs_while_compiling(cx.an, name) then return None
+        TCall(name, _, _, _) ->
+            if !runs_while_compiling(cx.an, name) && !is_sqrt_extern(cx.an, name) then return None
         _ -> if !whole then return None
 
     evaluate(cx.an, cx.scope, subject_of(cx.an), typed.unwrap()) match
@@ -4257,10 +4258,16 @@ end call_with
 // (which bits a NaN has is the machine's choice, and `float_pattern` writes the one pattern), an
 // infinity stays one, and a subnormal is rounded as the instruction rounds it. An `f32` is rooted at
 // `f32`, never at `f64` and rounded after.
-private sqrt_intrinsic(a: &Analysis, name: string, arg: Const) -> Option[Const]
+private is_sqrt_extern(a: &Analysis, name: string) -> bool
     val x = a.tables.externs.get(name)
 
-    if x.is_none() || extern_symbol(x.unwrap()) != "llvm.sqrt" || x.unwrap().params.len() != 1 then return None
+    x.is_some() && extern_symbol(x.unwrap()) == "llvm.sqrt" && x.unwrap().params.len() == 1
+end is_sqrt_extern
+
+private sqrt_intrinsic(a: &Analysis, name: string, arg: Const) -> Option[Const]
+    if !is_sqrt_extern(a, name) then return None
+
+    val x = a.tables.externs.get(name)
 
     val f = arg match
         ConstFloat(v) -> v
