@@ -1993,7 +1993,7 @@ print(1)
 ```
 
 ```error
-this length does arithmetic on 'N'
+the length 'N + 1' computes with the value parameter 'N'
 ```
 
 Deciding that `N + 1` and `1 + N` are one type, or that `2 * N` and `N + N` are, requires type-level

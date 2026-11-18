@@ -1,0 +1,284 @@
+module sysl.unicode
+
+/** The character `c` folds to under *simple* case folding, or `c` where the database gives it no
+ * folding -- CaseFolding.txt's statuses **C** (common) and **S** (simple), one character in and one
+ * out.
+ *
+ * **This is the comparison key for a `char`, and it is not `to_lower`.** Folding exists so that two
+ * spellings of "the same letter" compare equal, which lowercasing does not promise: `ſ` (the long
+ * s, U+017F) and the Kelvin sign U+212A are already lowercase-or-not in ways `to_lower` does not
+ * collapse, and both fold to the ASCII letters `s` and `k`. So `simple_fold('K')`, `simple_fold('k')`
+ * and `simple_fold('\u{212a}')` are all `'k'`, and `simple_fold('ſ')` is `'s'`.
+ *
+ * **`ß` folds to itself.** Its folding is the two characters `ss`, which is status **F** (full) and
+ * cannot come out of a `char -> char` signature; the database gives it no C or S entry, so the
+ * simple answer is `ß`. Where a string comparison wants `ß` equal to `ss`, `fold` in `map.sysl` is
+ * the operation. The capital sharp s `ẞ` (U+1E9E) *does* have an S entry and folds to `ß`.
+ *
+ * **Every sigma folds to `σ`**: `Σ`, `σ` and the final sigma `ς` all answer `'σ'`.
+ *
+ * Folding is idempotent -- `simple_fold(simple_fold(c)) == simple_fold(c)` -- which is what lets a
+ * caller fold a key once and compare it with anything folded the same way. The Turkic `T` entries
+ * (`I` to `ı`, `İ` to `i`) are not in the table, so `simple_fold('I')` is `'i'` as in every
+ * locale-free comparison.
+ *
+ * The table is static, so this allocates nothing and links nothing a program that never calls it.
+ */
+simple_fold(c: char) -> char
+    val u = u32(c)
+
+    // Nothing below U+00B5 folds except the ASCII capitals, so the common case never searches.
+    if u < 0x41 then return c
+
+    if u < 0x5b then return char(u + 32)
+
+    if u < 0xb5 then return c
+
+    var lo: usize = 0
+    var hi = fold_runs.len
+
+    // The runs are sorted by low end and do not overlap, so the candidate is the last run whose low
+    // end is at or below `u`: the search finds the first one above it and steps back.
+    while lo < hi
+        val mid = lo + (hi - lo) / 2
+
+        if fold_runs[mid].0 <= u then
+            lo = mid + 1
+        else
+            hi = mid
+
+    if lo == 0 then return c
+
+    val (first, last, step, delta) = fold_runs[lo - 1]
+
+    if u > last || (u - first) % step != 0 then return c
+
+    char(u32(i64(u) + i64(delta)))
+end simple_fold
+
+// The table, and where every number in it came from.
+//
+// **Nothing here was written by hand.** It is `CaseFolding.txt` at **17.0.0** -- the same Unicode
+// version `unicode_version()` answers from the vendored utf8proc -- filtered to status **C** and
+// **S** (1512 code points), then reduced to runs `(first, last, step, delta)`: every `step`th code
+// point from `first` to `last` folds to itself plus `delta`. A step of 2 is the Latin Extended and
+// Cyrillic habit of alternating capital and small letters, which is most of the table.
+//
+// https://www.unicode.org/Public/17.0.0/ucd/CaseFolding.txt,
+// SHA-256 ff8d8fefbf123574205085d6714c36149eb946d717a0c585c27f0f4ef58c4183.
+//
+// **Bringing it up to a later Unicode is re-running that filter**: read the file, keep the lines
+// whose second field is `C` or `S`, sort by code point, and merge neighbours with an equal delta at
+// a distance of 1 or 2 into one run. The test file carries the same 1512 pairs unmerged, so a
+// regenerated table that loses or invents one fails there.
+private val fold_runs: [209](u32, u32, u32, i32) = [
+    (0x00041, 0x0005a, 1, 32),
+    (0x000b5, 0x000b5, 1, 775),
+    (0x000c0, 0x000d6, 1, 32),
+    (0x000d8, 0x000de, 1, 32),
+    (0x00100, 0x0012e, 2, 1),
+    (0x00132, 0x00136, 2, 1),
+    (0x00139, 0x00147, 2, 1),
+    (0x0014a, 0x00176, 2, 1),
+    (0x00178, 0x00178, 1, -121),
+    (0x00179, 0x0017d, 2, 1),
+    (0x0017f, 0x0017f, 1, -268),
+    (0x00181, 0x00181, 1, 210),
+    (0x00182, 0x00184, 2, 1),
+    (0x00186, 0x00186, 1, 206),
+    (0x00187, 0x00187, 1, 1),
+    (0x00189, 0x0018a, 1, 205),
+    (0x0018b, 0x0018b, 1, 1),
+    (0x0018e, 0x0018e, 1, 79),
+    (0x0018f, 0x0018f, 1, 202),
+    (0x00190, 0x00190, 1, 203),
+    (0x00191, 0x00191, 1, 1),
+    (0x00193, 0x00193, 1, 205),
+    (0x00194, 0x00194, 1, 207),
+    (0x00196, 0x00196, 1, 211),
+    (0x00197, 0x00197, 1, 209),
+    (0x00198, 0x00198, 1, 1),
+    (0x0019c, 0x0019c, 1, 211),
+    (0x0019d, 0x0019d, 1, 213),
+    (0x0019f, 0x0019f, 1, 214),
+    (0x001a0, 0x001a4, 2, 1),
+    (0x001a6, 0x001a6, 1, 218),
+    (0x001a7, 0x001a7, 1, 1),
+    (0x001a9, 0x001a9, 1, 218),
+    (0x001ac, 0x001ac, 1, 1),
+    (0x001ae, 0x001ae, 1, 218),
+    (0x001af, 0x001af, 1, 1),
+    (0x001b1, 0x001b2, 1, 217),
+    (0x001b3, 0x001b5, 2, 1),
+    (0x001b7, 0x001b7, 1, 219),
+    (0x001b8, 0x001b8, 1, 1),
+    (0x001bc, 0x001bc, 1, 1),
+    (0x001c4, 0x001c4, 1, 2),
+    (0x001c5, 0x001c5, 1, 1),
+    (0x001c7, 0x001c7, 1, 2),
+    (0x001c8, 0x001c8, 1, 1),
+    (0x001ca, 0x001ca, 1, 2),
+    (0x001cb, 0x001db, 2, 1),
+    (0x001de, 0x001ee, 2, 1),
+    (0x001f1, 0x001f1, 1, 2),
+    (0x001f2, 0x001f4, 2, 1),
+    (0x001f6, 0x001f6, 1, -97),
+    (0x001f7, 0x001f7, 1, -56),
+    (0x001f8, 0x0021e, 2, 1),
+    (0x00220, 0x00220, 1, -130),
+    (0x00222, 0x00232, 2, 1),
+    (0x0023a, 0x0023a, 1, 10795),
+    (0x0023b, 0x0023b, 1, 1),
+    (0x0023d, 0x0023d, 1, -163),
+    (0x0023e, 0x0023e, 1, 10792),
+    (0x00241, 0x00241, 1, 1),
+    (0x00243, 0x00243, 1, -195),
+    (0x00244, 0x00244, 1, 69),
+    (0x00245, 0x00245, 1, 71),
+    (0x00246, 0x0024e, 2, 1),
+    (0x00345, 0x00345, 1, 116),
+    (0x00370, 0x00372, 2, 1),
+    (0x00376, 0x00376, 1, 1),
+    (0x0037f, 0x0037f, 1, 116),
+    (0x00386, 0x00386, 1, 38),
+    (0x00388, 0x0038a, 1, 37),
+    (0x0038c, 0x0038c, 1, 64),
+    (0x0038e, 0x0038f, 1, 63),
+    (0x00391, 0x003a1, 1, 32),
+    (0x003a3, 0x003ab, 1, 32),
+    (0x003c2, 0x003c2, 1, 1),
+    (0x003cf, 0x003cf, 1, 8),
+    (0x003d0, 0x003d0, 1, -30),
+    (0x003d1, 0x003d1, 1, -25),
+    (0x003d5, 0x003d5, 1, -15),
+    (0x003d6, 0x003d6, 1, -22),
+    (0x003d8, 0x003ee, 2, 1),
+    (0x003f0, 0x003f0, 1, -54),
+    (0x003f1, 0x003f1, 1, -48),
+    (0x003f4, 0x003f4, 1, -60),
+    (0x003f5, 0x003f5, 1, -64),
+    (0x003f7, 0x003f7, 1, 1),
+    (0x003f9, 0x003f9, 1, -7),
+    (0x003fa, 0x003fa, 1, 1),
+    (0x003fd, 0x003ff, 1, -130),
+    (0x00400, 0x0040f, 1, 80),
+    (0x00410, 0x0042f, 1, 32),
+    (0x00460, 0x00480, 2, 1),
+    (0x0048a, 0x004be, 2, 1),
+    (0x004c0, 0x004c0, 1, 15),
+    (0x004c1, 0x004cd, 2, 1),
+    (0x004d0, 0x0052e, 2, 1),
+    (0x00531, 0x00556, 1, 48),
+    (0x010a0, 0x010c5, 1, 7264),
+    (0x010c7, 0x010c7, 1, 7264),
+    (0x010cd, 0x010cd, 1, 7264),
+    (0x013f8, 0x013fd, 1, -8),
+    (0x01c80, 0x01c80, 1, -6222),
+    (0x01c81, 0x01c81, 1, -6221),
+    (0x01c82, 0x01c82, 1, -6212),
+    (0x01c83, 0x01c84, 1, -6210),
+    (0x01c85, 0x01c85, 1, -6211),
+    (0x01c86, 0x01c86, 1, -6204),
+    (0x01c87, 0x01c87, 1, -6180),
+    (0x01c88, 0x01c88, 1, 35267),
+    (0x01c89, 0x01c89, 1, 1),
+    (0x01c90, 0x01cba, 1, -3008),
+    (0x01cbd, 0x01cbf, 1, -3008),
+    (0x01e00, 0x01e94, 2, 1),
+    (0x01e9b, 0x01e9b, 1, -58),
+    (0x01e9e, 0x01e9e, 1, -7615),
+    (0x01ea0, 0x01efe, 2, 1),
+    (0x01f08, 0x01f0f, 1, -8),
+    (0x01f18, 0x01f1d, 1, -8),
+    (0x01f28, 0x01f2f, 1, -8),
+    (0x01f38, 0x01f3f, 1, -8),
+    (0x01f48, 0x01f4d, 1, -8),
+    (0x01f59, 0x01f5f, 2, -8),
+    (0x01f68, 0x01f6f, 1, -8),
+    (0x01f88, 0x01f8f, 1, -8),
+    (0x01f98, 0x01f9f, 1, -8),
+    (0x01fa8, 0x01faf, 1, -8),
+    (0x01fb8, 0x01fb9, 1, -8),
+    (0x01fba, 0x01fbb, 1, -74),
+    (0x01fbc, 0x01fbc, 1, -9),
+    (0x01fbe, 0x01fbe, 1, -7173),
+    (0x01fc8, 0x01fcb, 1, -86),
+    (0x01fcc, 0x01fcc, 1, -9),
+    (0x01fd3, 0x01fd3, 1, -7235),
+    (0x01fd8, 0x01fd9, 1, -8),
+    (0x01fda, 0x01fdb, 1, -100),
+    (0x01fe3, 0x01fe3, 1, -7219),
+    (0x01fe8, 0x01fe9, 1, -8),
+    (0x01fea, 0x01feb, 1, -112),
+    (0x01fec, 0x01fec, 1, -7),
+    (0x01ff8, 0x01ff9, 1, -128),
+    (0x01ffa, 0x01ffb, 1, -126),
+    (0x01ffc, 0x01ffc, 1, -9),
+    (0x02126, 0x02126, 1, -7517),
+    (0x0212a, 0x0212a, 1, -8383),
+    (0x0212b, 0x0212b, 1, -8262),
+    (0x02132, 0x02132, 1, 28),
+    (0x02160, 0x0216f, 1, 16),
+    (0x02183, 0x02183, 1, 1),
+    (0x024b6, 0x024cf, 1, 26),
+    (0x02c00, 0x02c2f, 1, 48),
+    (0x02c60, 0x02c60, 1, 1),
+    (0x02c62, 0x02c62, 1, -10743),
+    (0x02c63, 0x02c63, 1, -3814),
+    (0x02c64, 0x02c64, 1, -10727),
+    (0x02c67, 0x02c6b, 2, 1),
+    (0x02c6d, 0x02c6d, 1, -10780),
+    (0x02c6e, 0x02c6e, 1, -10749),
+    (0x02c6f, 0x02c6f, 1, -10783),
+    (0x02c70, 0x02c70, 1, -10782),
+    (0x02c72, 0x02c72, 1, 1),
+    (0x02c75, 0x02c75, 1, 1),
+    (0x02c7e, 0x02c7f, 1, -10815),
+    (0x02c80, 0x02ce2, 2, 1),
+    (0x02ceb, 0x02ced, 2, 1),
+    (0x02cf2, 0x02cf2, 1, 1),
+    (0x0a640, 0x0a66c, 2, 1),
+    (0x0a680, 0x0a69a, 2, 1),
+    (0x0a722, 0x0a72e, 2, 1),
+    (0x0a732, 0x0a76e, 2, 1),
+    (0x0a779, 0x0a77b, 2, 1),
+    (0x0a77d, 0x0a77d, 1, -35332),
+    (0x0a77e, 0x0a786, 2, 1),
+    (0x0a78b, 0x0a78b, 1, 1),
+    (0x0a78d, 0x0a78d, 1, -42280),
+    (0x0a790, 0x0a792, 2, 1),
+    (0x0a796, 0x0a7a8, 2, 1),
+    (0x0a7aa, 0x0a7aa, 1, -42308),
+    (0x0a7ab, 0x0a7ab, 1, -42319),
+    (0x0a7ac, 0x0a7ac, 1, -42315),
+    (0x0a7ad, 0x0a7ad, 1, -42305),
+    (0x0a7ae, 0x0a7ae, 1, -42308),
+    (0x0a7b0, 0x0a7b0, 1, -42258),
+    (0x0a7b1, 0x0a7b1, 1, -42282),
+    (0x0a7b2, 0x0a7b2, 1, -42261),
+    (0x0a7b3, 0x0a7b3, 1, 928),
+    (0x0a7b4, 0x0a7c2, 2, 1),
+    (0x0a7c4, 0x0a7c4, 1, -48),
+    (0x0a7c5, 0x0a7c5, 1, -42307),
+    (0x0a7c6, 0x0a7c6, 1, -35384),
+    (0x0a7c7, 0x0a7c9, 2, 1),
+    (0x0a7cb, 0x0a7cb, 1, -42343),
+    (0x0a7cc, 0x0a7da, 2, 1),
+    (0x0a7dc, 0x0a7dc, 1, -42561),
+    (0x0a7f5, 0x0a7f5, 1, 1),
+    (0x0ab70, 0x0abbf, 1, -38864),
+    (0x0fb05, 0x0fb05, 1, 1),
+    (0x0ff21, 0x0ff3a, 1, 32),
+    (0x10400, 0x10427, 1, 40),
+    (0x104b0, 0x104d3, 1, 40),
+    (0x10570, 0x1057a, 1, 39),
+    (0x1057c, 0x1058a, 1, 39),
+    (0x1058c, 0x10592, 1, 39),
+    (0x10594, 0x10595, 1, 39),
+    (0x10c80, 0x10cb2, 1, 64),
+    (0x10d50, 0x10d65, 1, 32),
+    (0x118a0, 0x118bf, 1, 32),
+    (0x16e40, 0x16e5f, 1, 32),
+    (0x16ea0, 0x16eb8, 1, 27),
+    (0x1e900, 0x1e921, 1, 34),
+]

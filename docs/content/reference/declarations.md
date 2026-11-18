@@ -2164,8 +2164,8 @@ different one are ambiguous, and saying so beats a ladder of precedences nobody 
 the source.
 
 **The one exception is a bare integer literal, which prefers the signed widening.** Where the
-candidates differ only at positions holding an integer literal with no suffix, negated or not, and
-none takes it at `int`, a candidate whose parameter there is a signed integer at least as wide as `int` beats an
+candidates differ only at positions holding an integer literal with no suffix, negated or not, or
+arithmetic over such literals (`60 * 52`, which is in the literal's tier), and none takes it at `int`, a candidate whose parameter there is a signed integer at least as wide as `int` beats an
 unsigned, a narrower signed or a float one, and among several the narrowest wins. Two unsigned
 candidates offer nothing signed and stay ambiguous. The rule is the same for a member several
 implementations of one trait answer, so `BigInt.from(3)` is its `From[long]`:
@@ -2176,11 +2176,13 @@ pick(x: u64) -> string = "u64"
 
 print(pick(3))
 print(pick(3u64))
+print(pick(60 * 52))
 ```
 
 ```output
 long
 u64
+long
 ```
 
 **Candidates tied only by bare literals take each literal at its default type.** Where every
@@ -2209,7 +2211,8 @@ true
 argument with a type of its own is exactly one candidate's parameter and every other argument is a
 numeric literal with no suffix, that candidate wins and the literals are read at its parameters, as
 `x * 2.0` is at `f32` for an `f32` `x`. So `nextafter(x, 100.0)` at an `f32` `x` is the `f32`
-declaration, in either argument order:
+declaration, in either argument order. Arithmetic over bare literals counts as a literal here, as it
+does in every rule above, so `scale(a, 2.0 * 3)` is the `f32` one too:
 
 ```sysl
 import sysl.math.nextafter
@@ -2221,17 +2224,19 @@ val a = 1.5f32
 val d = 1.5
 
 print(scale(a, 2.0), scale(2.0, a), scale(d, 2.0), scale(2.0, 3.0))
+print(scale(a, 2.0 * 3), scale(-(1.5 + 2), a))
 print(nextafter(a, 100.0) > a)
 ```
 
 ```output
 f32 f32 real real
+f32 f32
 true
 ```
 
 The call stays ambiguous where a typed argument is matched by no candidate exactly, where two
 candidates match every typed argument, where no candidate takes the literals at their defaults (`f32`
-beside `f128` at `2`), and where two do (`(int, real)` beside `(real, int)` at `(2, 2)`):
+beside `f128` at `2`, or at `2.0 * 3`), and where two do (`(int, real)` beside `(real, int)` at `(2, 2)`):
 
 ```sysl
 scale(x: f32, k: f32) -> string = "f32"
@@ -2351,6 +2356,28 @@ print(s.f(1), s.f("abc"), s.f(3, 4), S.make(2).n)
 
 ```output
 11 3 12 2
+```
+
+**A literal, a literal's arithmetic and a measured `c type` choose between a type's own overloads as
+they choose between functions'**: `B.of(1234567890123)` reads the literal at whichever parameter
+holds it, preferring the signed one, and a `c type` over `unsigned long` is the `ulong` it was
+measured as.
+
+```sysl
+c type
+    Ulong = "unsigned long"
+
+struct B
+    n: int
+
+    of(v: long) -> string = "long"
+    of(v: ulong) -> string = "ulong"
+
+print(B.of(1234567890123), B.of(18446744073709551615), B.of(60 * 52), B.of(Ulong(5)))
+```
+
+```output
+long ulong long ulong
 ```
 
 **On a generic type the choice is made at the receiver's instantiation**, so a member taking `T`
@@ -2810,7 +2837,7 @@ reading through an address is not evaluated while compiling — the linker fills
 **A reference, and a pointer to storage the run owns, are values while compiling.** A box made with
 `&T`, a local, an element or a field reached through `&` or `*` is held by the run itself, and a
 write through one is seen wherever else the storage is held, as it is when the program runs. A
-pointer may not outlive its call, nor be converted to a number or read as another type:
+pointer may not outlive its call, nor be converted to a number:
 
 ```sysl
 struct Node
@@ -2843,6 +2870,58 @@ print(T)
 
 ```output
 11
+```
+
+**Memory read as another type is read as its bytes.** A pointer converted with `ptr_cast` reads
+and writes the bytes of the storage it was taken in, laid out as the target lays them and in the
+target's byte order, where what is on both sides is an integer of 8, 16, 32, 64 or more bits (a
+power of two), a float, a `bool`, a `char`, or a fixed array of them. A read at an address that is
+not a multiple of its width is answered from the bytes it covers. So a constant decoded from bytes
+is data, on a bare machine as everywhere else:
+
+```sysl
+import sysl.raw.ptr_cast
+
+const word(bytes: [4]u8, at: usize) -> u32
+    var b: [8]u8 = [0; 8]
+
+    for i in 0..<4
+        b[at + i] = bytes[i]
+
+    val p: *u32 = ptr_cast(&b[at])
+    *p
+
+const W: u32 = word([0x78, 0x56, 0x34, 0x12], 0)
+const V: u32 = word([1, 0, 0, 0], 3)
+
+print(W == 0x12345678, V)
+```
+
+```output
+true 1
+```
+
+A read or a write that reaches outside the storage the address was taken in — past an array's
+end, or beyond a struct's field into the next — is refused, since what lies there is decided only
+when the program runs. So are bytes that are no value of the type they are read as (a `bool` other
+than 0 or 1), and a struct, an enum or a pointer on either side, whose padding and addresses are
+the program's own:
+
+```sysl
+import sysl.raw.ptr_cast
+
+const word_at(at: usize) -> u32
+    var b: [4]u8 = [1, 2, 3, 4]
+    val p: *u32 = ptr_cast(&b[at])
+    *p
+
+const W: u32 = word_at(1)
+
+print(W)
+```
+
+```error
+reaches outside the storage the address is in, 4 bytes long
 ```
 
 **The heap is the run's own**, so a `Buf`, a `Map`, a `Set` and a frozen buffer run while

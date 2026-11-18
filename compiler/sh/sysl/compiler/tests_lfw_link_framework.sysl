@@ -1,0 +1,350 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{join, replace_all, Search}
+
+// `@link(framework: "CoreFoundation")` -- a macOS framework, linked as `-framework CoreFoundation`
+// (`reference/ffi.md § @link`). Parsed in the header beside the library form, carried to the
+// command line of every path that links, and refused on a target that has no frameworks.
+// CoreFoundation is the framework linked for real: `CFAbsoluteTimeGetCurrent` lives in it and not
+// in libSystem, so a program that calls it links only if the flag arrived.
+
+private val lfw_extern: string = "extern \"CFAbsoluteTimeGetCurrent\" lfw_now() -> f64\n"
+
+private lfw_project(files: []string) -> string = pkc_tree("sysl-lfw", files)
+
+private lfw_on_macos() -> bool = host_os() == MacOS
+
+private lfw_links_for(files: []string, target: string) -> Buf[string]
+    val root = lfw_project(files)
+
+    val out = packaged_compilation_of(root, target_named(target).unwrap()) match
+        Ok(c) -> link_required(c.units)
+        Err(why) -> panic(s"did not compile: ${failure_text(why)}")
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end lfw_links_for
+
+// What a project that must not compile said, for the named target.
+private lfw_err_for(files: []string, target: string) -> string
+    val root = lfw_project(files)
+
+    val out = emit_llvm_text(root, Some(target)) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    replace_all(out, root, "<root>")
+end lfw_err_for
+
+// What `build-lib` says to a module of this text for the named target, or "" where it checks. A
+// library check reads no standard module, so it can be asked of a target whose runtime is not here.
+private lfw_lib_err(header: string, target: string) -> string
+    val root = lfw_project(["demo/demo.sysl", s"module demo\n$header\n\nf() -> int = 1\n"])
+    val got = pkc_cli(["sysl", "build-lib", root, "--target", target])
+
+    remove_dir_all(root).unwrap_or(())
+    if got.0 == 0 then "" else got.1
+end lfw_lib_err
+
+private lfw_has(names: Buf[string], name: string) -> bool
+    for item in names
+        if item == name then return true
+
+    false
+end lfw_has
+
+private lfw_flags(entry: string, target: string) -> string
+    var one: Buf[string] = buf()
+
+    one.push(entry)
+    join(library_flags(one, target_named(target).unwrap()).view(), " ")
+end lfw_flags
+
+private lfw_program(link: string) -> string
+    s"$link\n\n$lfw_extern\nprint(lfw_now() > 1.0)\n"
+
+// -- the spelling -----------------------------------------------------------------------------------
+
+@test("parses in the header and is marked a framework in the tree, anchored at its word")
+lfw_parses()
+    if std_root().is_err() then return
+
+    val root = lfw_project(["main.sysl", "@link(framework: \"Metal\")\n\nprint(1)\n"])
+    val said = pkc_cli(["sysl", "emit-ast", s"$root/main.sysl"])
+
+    remove_dir_all(root).unwrap_or(())
+    assert(said.1.contains("LinkClause 1:2-1:26"), said.1)
+    assert(said.1.contains("framework"), said.1)
+
+@test("is a distinct entry from a library of the same name, and beside one")
+lfw_beside_a_library()
+    if std_root().is_err() then return
+
+    val links = lfw_links_for(["main.sysl", "@link(\"z\")\n@link(framework: \"z\")\n\nprint(1)\n"],
+                              "aarch64-macos")
+
+    assert(lfw_has(links, "z") && lfw_has(links, "-framework z"), join(links.view(), " "))
+
+@test("keeps the order it was written in, among libraries")
+lfw_keeps_order()
+    if std_root().is_err() then return
+
+    val links = lfw_links_for(["main.sysl",
+                               "@link(\"b\")\n@link(framework: \"A\")\n@link(\"c\")\n\nprint(1)\n"],
+                              "aarch64-macos")
+    var mine: Buf[string] = buf()
+
+    for item in links
+        if item == "b" || item == "-framework A" || item == "c" then mine.push(item)
+
+    assert_eq(join(mine.view(), ","), "b,-framework A,c")
+
+@test("two files naming one framework ask for it once")
+lfw_two_files_once()
+    if std_root().is_err() then return
+
+    val links = lfw_links_for(["t/a.sysl", "module t\n@link(framework: \"Metal\")\n\nf() -> int = 1\n",
+                               "t/b.sysl", "module t\n@link(framework: \"Metal\")\n\ng() -> int = 2\n",
+                               "main.sysl", "print(t.g())"], "aarch64-macos")
+    var count = 0
+
+    for item in links
+        if item == "-framework Metal" then count += 1
+
+    assert_eq(count, 1)
+
+// -- what a target makes of it ----------------------------------------------------------------------
+
+@test("is two words on a macOS command line")
+lfw_two_words_on_macos()
+    assert_eq(lfw_flags("-framework Metal", "aarch64-macos"), "-framework Metal")
+    assert_eq(lfw_flags("-framework Metal", "x86_64-macos"), "-framework Metal")
+
+@test("is nothing on any other target's command line")
+lfw_nothing_elsewhere()
+    assert_eq(lfw_flags("-framework Metal", "x86_64-linux"), "")
+    assert_eq(lfw_flags("-framework Metal", "aarch64-freestanding"), "")
+
+@test("leaves a library's own flag alone beside it")
+lfw_library_unchanged()
+    assert_eq(lfw_flags("png", "x86_64-linux"), "-lpng")
+
+@test("is in the link command, after the objects, before the output")
+lfw_in_the_link_command()
+    var links: Buf[string] = buf()
+
+    links.push("-framework Metal")
+
+    val line = link_command("clang", "prog.ll", buf(), "prog", target_named("aarch64-macos").unwrap(),
+                            DefaultOptimization, links, no_probe())
+    var at = -1
+    var out = -1
+
+    for i in 0..<line.len()
+        if line[i] == "-framework" && i + 1 < line.len() && line[i + 1] == "Metal" then at = int(i)
+        if line[i] == "-o" then out = int(i)
+
+    assert(at >= 0 && out > at, join(line.view(), " "))
+
+@test("is named in what build-c tells the C author to link, on macOS")
+lfw_in_the_hint()
+    var links: Buf[string] = buf()
+
+    links.push("-framework Metal")
+    links.push("png")
+
+    assert_eq(join(link_hint(links, target_named("aarch64-macos").unwrap()).view(), ","),
+              "-framework Metal,png")
+    assert_eq(join(link_hint(links, target_named("aarch64-freestanding").unwrap()).view(), ","), "png")
+
+// -- refusals ---------------------------------------------------------------------------------------
+
+@test("on a target with no frameworks it is refused, telling the author to gate it")
+lfw_refused_elsewhere()
+    if std_root().is_err() then return
+
+    val e = lfw_lib_err("@link(framework: \"Metal\")", "x86_64-linux")
+
+    assert(e.contains("error: '@link(framework: \"Metal\")' names a macOS framework, and this target " +
+                      "has none — gate it with '#if macos'"), e)
+
+@test("and gated by '#if macos' it builds for a target that has none")
+lfw_gated_builds_elsewhere()
+    if std_root().is_err() then return
+
+    assert_eq(lfw_lib_err("#if macos\n@link(framework: \"Metal\")\n#endif", "x86_64-linux"), "")
+
+@test("and still reaches a macOS target through the same gate")
+lfw_gated_reaches_macos()
+    if std_root().is_err() then return
+
+    val src = "#if macos\n@link(framework: \"Metal\")\n#endif\n\nprint(1)\n"
+
+    assert(lfw_has(lfw_links_for(["main.sysl", src], "aarch64-macos"), "-framework Metal"), "absent")
+    assert(!lfw_has(lfw_links_for(["main.sysl", src], "x86_64-linux"), "-framework Metal"), "present")
+
+@test("an empty name")
+lfw_empty_name()
+    if std_root().is_err() then return
+
+    val e = lfw_err_for(["main.sysl", "@link(framework: \"\")\n\nprint(1)\n"], "aarch64-macos")
+
+    assert(e.contains("error: a link directive names a library, and '' is not a name"), e)
+
+@test("a flag written as the name")
+lfw_flag_as_name()
+    if std_root().is_err() then return
+
+    val e = lfw_err_for(["main.sysl", "@link(framework: \"-lz\")\n\nprint(1)\n"], "aarch64-macos")
+
+    assert(e.contains("error: '-lz' begins with a dash"), e)
+
+@test("a name holding a space")
+lfw_space_in_name()
+    if std_root().is_err() then return
+
+    val e = lfw_err_for(["main.sysl", "@link(framework: \"Core Foundation\")\n\nprint(1)\n"],
+                        "aarch64-macos")
+
+    assert(e.contains("error: 'Core Foundation' holds a space"), e)
+
+@test("the same framework twice in one file")
+lfw_twice()
+    if std_root().is_err() then return
+
+    val src = "@link(framework: \"Metal\")\n@link(framework: \"Metal\")\n\nprint(1)\n"
+    val e = lfw_err_for(["main.sysl", src], "aarch64-macos")
+
+    assert(e.contains("error: 'Metal' is already linked by this file"), e)
+
+@test("a library and a framework of one name are not a repeat")
+lfw_not_a_repeat()
+    if std_root().is_err() then return
+
+    assert_eq(lfw_err_for(["main.sysl", "@link(\"z\")\n@link(framework: \"z\")\n\nprint(1)\n"],
+                          "aarch64-macos"), "")
+
+@test("a word other than 'framework' before the colon is not a name")
+lfw_other_word()
+    if std_root().is_err() then return
+
+    val e = lfw_err_for(["main.sysl", "@link(library: \"z\")\n\nprint(1)\n"], "aarch64-macos")
+
+    assert(e != "", "accepted")
+
+@test("'framework' without a string is refused")
+lfw_no_string()
+    if std_root().is_err() then return
+
+    val e = lfw_err_for(["main.sysl", "@link(framework:)\n\nprint(1)\n"], "aarch64-macos")
+
+    assert(e != "", "accepted")
+
+@test("'framework' is still an ordinary name in a program")
+lfw_still_a_name()
+    if !pkc_ready() then return
+
+    val root = lfw_project(["main.sysl", "var framework = 3\nprint(framework * 2)\n"])
+    val said = pkc_ran(root)
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(said, "6\n")
+
+// -- linked for real, through every path that links -------------------------------------------------
+
+@test("build: a call into CoreFoundation links and runs")
+lfw_build_runs()
+    if !pkc_ready() || !lfw_on_macos() then return
+
+    val root = lfw_project(["main.sysl", lfw_program("@link(framework: \"CoreFoundation\")")])
+    val said = pkc_ran(root)
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(said, "true\n")
+
+@test("build: the same program without the directive fails to link, naming the symbol")
+lfw_build_without_fails()
+    if !pkc_ready() || !lfw_on_macos() then return
+
+    val root = lfw_project(["main.sysl", lfw_program("")])
+    val said = pkc_ran(root)
+
+    remove_dir_all(root).unwrap_or(())
+    assert(said.starts_with("build failed: ") && said.contains("_CFAbsoluteTimeGetCurrent"), said)
+
+@test("build: a framework that does not exist fails the link and names itself")
+lfw_build_missing_framework()
+    if !pkc_ready() || !lfw_on_macos() then return
+
+    val root = lfw_project(["main.sysl", lfw_program("@link(framework: \"SyslNoSuchFramework\")")])
+    val said = pkc_ran(root)
+
+    remove_dir_all(root).unwrap_or(())
+    assert(said.starts_with("build failed: ") && said.contains("SyslNoSuchFramework"), said)
+
+@test("test: a test build links the framework")
+lfw_test_build()
+    if !pkc_ready() || !lfw_on_macos() then return
+
+    val src = "@link(framework: \"CoreFoundation\")\n\n" + lfw_extern +
+              "\n@test\nt() = assert(lfw_now() > 1.0)\n"
+    val root = lfw_project(["main.sysl", src])
+
+    pkc_as_project(root)
+
+    val got = pkc_cli(["sysl", "test", root])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(got.0, 0, got.1)
+
+@test("build-lib: a module naming a framework checks, and is refused for a target without them")
+lfw_build_lib()
+    if !pkc_ready() then return
+
+    val src = "module demo\n@link(framework: \"CoreFoundation\")\n\n" + lfw_extern +
+              "\nnow() -> f64 = lfw_now()\n"
+    val root = lfw_project(["demo/demo.sysl", src])
+    val here = pkc_cli(["sysl", "build-lib", root, "--target", "aarch64-macos"])
+    val there = pkc_cli(["sysl", "build-lib", root, "--target", "x86_64-linux"])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(here.0, 0, here.1)
+    assert(there.0 != 0 && there.1.contains("names a macOS framework"), there.1)
+
+@test("build-c: the C author is told to link the framework")
+lfw_build_c_hint()
+    if !pkc_ready() || !lfw_on_macos() then return
+
+    val root = lfw_project(["main.sysl", lfw_program("@link(framework: \"CoreFoundation\")")])
+
+    pkc_as_project(root)
+
+    val got = clx_ran(["sysl", "build-c", root, "-o", s"$root/out.a"])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(got.0, 0, got.2)
+    assert(got.2.contains("-framework CoreFoundation"), got.2)
+
+@test("build-c --shared: the framework is linked into the library, so it loads and answers")
+lfw_build_c_shared()
+    if !pkc_ready() || !lfw_on_macos() then return
+
+    val src = "@link(framework: \"CoreFoundation\")\n\n" + lfw_extern +
+              "\n@export(\"lfw_answer\")\nanswer() -> int = if lfw_now() > 1.0 then 1 else 0\n"
+    val root = lfw_project(["main.sysl", src])
+
+    pkc_as_project(root)
+
+    val got = clx_ran(["sysl", "build-c", root, "--shared", "-o", s"$root/libp.dylib"])
+    val otool = capture("otool", ["-L", s"$root/libp.dylib"], "", [], true) match
+        Ok(o) -> o.text
+        Err(_) -> ""
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(got.0, 0, got.2)
+    assert(otool.contains("CoreFoundation.framework"), otool)

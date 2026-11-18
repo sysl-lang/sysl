@@ -1,0 +1,212 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{join, replace_all}
+import sysl.fs.{exists, make_dir_all, make_temp_dir, remove_dir_all, write_text}
+
+// `x.sqrt()` over constants, at `real` and `f32`, worked out while compiling: the exact root rounded
+// once to nearest, ties to even -- the bits the instruction gives where the program runs. The values
+// are written as encodings (`real.from_bits`), so a `-0.0`, an infinity or a subnormal is exactly the
+// one meant, and each root is compared with the same root taken at run time by a function the
+// compiler does not look into.
+
+// What a program prints, built and run.
+private fsq_ran(text: string) -> string = xvr_ran([("main.sysl", text)])
+
+// What a program's analysis says, or its LLVM text where it says nothing.
+private fsq_said(text: string) -> string = xvr_ir([("main.sysl", text)])
+
+private val fsq_doubles: []string = ["0x0000000000000000", "0x8000000000000000", "0x3ff0000000000000",
+    "0x4000000000000000", "0x4008000000000000", "0x3fe0000000000000", "0x0000000000000001",
+    "0x000fffffffffffff", "0x0010000000000000", "0x0008000000000000", "0x0000000000000003",
+    "0x7fefffffffffffff", "0x7ff0000000000000", "0xfff0000000000000", "0x7ff8000000000000",
+    "0xbff0000000000000", "0x8000000000000001", "0x3fb999999999999a", "0x4202a05f20000000",
+    "0x7fe0000000000001", "0x3ff0000000000001", "0x3fefffffffffffff", "0x7fd5555555555555",
+    "0x4340000000000001", "0x1234567890abcdef", "0x4024000000000000", "0x4059000000000000"]
+
+private val fsq_singles: []string = ["0x00000000", "0x80000000", "0x3f800000", "0x40000000", "0x40400000",
+    "0x3f000000", "0x00000001", "0x007fffff", "0x00800000", "0x00400000", "0x00000003", "0x7f7fffff",
+    "0x7f800000", "0xff800000", "0x7fc00000", "0xbf800000", "0x80000001", "0x3dcccccd", "0x3f800001",
+    "0x3f7fffff", "0x7f000001", "0x12345678", "0x4b7fffff", "0x41200000", "0x42c80000"]
+
+// A program holding one `const` root per value and the run-time root beside it, printing every value
+// whose two bits differ, then `done`.
+private fsq_matrix() -> string
+    var out: Buf[string] = buf()
+
+    out.push("@noinline")
+    out.push("rt64(x: real) -> real = x.sqrt()")
+    out.push("@noinline")
+    out.push("rt32(x: f32) -> f32 = x.sqrt()")
+    out.push("same64(a: real, b: real) -> bool = if a != a then b != b else a.bits() == b.bits()")
+    out.push("same32(a: f32, b: f32) -> bool = if a != a then b != b else a.bits() == b.bits()")
+
+    for i in 0..<fsq_doubles.len
+        out.push(s"const D$i: real = real.from_bits(${fsq_doubles[i]}).sqrt()")
+
+    for i in 0..<fsq_singles.len
+        out.push(s"const S$i: f32 = f32.from_bits(${fsq_singles[i]}).sqrt()")
+
+    out.push("main()")
+
+    for i in 0..<fsq_doubles.len
+        out.push(s"    if !same64(D$i, rt64(real.from_bits(${fsq_doubles[i]}))) then print(\"f64 ${fsq_doubles[i]}\")")
+
+    for i in 0..<fsq_singles.len
+        out.push(s"    if !same32(S$i, rt32(f32.from_bits(${fsq_singles[i]}))) then print(\"f32 ${fsq_singles[i]}\")")
+
+    out.push("    print(\"done\")")
+    join(out.view(), "\n") + "\n"
+end fsq_matrix
+
+@test("a constant root is the run-time root bit for bit, over zeros, infinities, negatives, subnormals and the extremes at both widths")
+fsq_matrix_matches_run_time()
+    if xvr_no_library() then return
+
+    assert_eq(fsq_ran(fsq_matrix()), "done\n")
+end fsq_matrix_matches_run_time
+
+@test("the roots a constant gives are the IEEE ones: sqrt(-0) is -0, a negative is a NaN, an infinity stays one, a subnormal is exact")
+fsq_known_answers()
+    if xvr_no_library() then return
+
+    val text = "const NEG_ZERO: real = real.from_bits(0x8000000000000000).sqrt()\n" +
+        "const TWO: real = real.from_bits(0x4000000000000000).sqrt()\n" +
+        "const MINUS_ONE: real = real.from_bits(0xbff0000000000000).sqrt()\n" +
+        "const INF: real = real.from_bits(0x7ff0000000000000).sqrt()\n" +
+        "const MINUS_INF: real = real.from_bits(0xfff0000000000000).sqrt()\n" +
+        "const TINY: real = real.from_bits(0x0000000000000001).sqrt()\n" +
+        "const FOUR: real = 4.0.sqrt()\n" +
+        "const TWO32: f32 = f32.from_bits(0x40000000).sqrt()\n" +
+        "const ONE_UP32: f32 = f32.from_bits(0x3f800001).sqrt()\n" +
+        "const NEG32: f32 = f32.from_bits(0x80000000).sqrt()\n" +
+        "\nmain()\n" +
+        "    print(NEG_ZERO.bits() == 0x8000000000000000)\n" +
+        "    print(TWO.bits() == 0x3ff6a09e667f3bcd)\n" +
+        "    print(MINUS_ONE != MINUS_ONE, MINUS_INF != MINUS_INF)\n" +
+        "    print(INF.bits() == 0x7ff0000000000000)\n" +
+        "    print(TINY.bits() == 0x1e60000000000000)\n" +
+        "    print(FOUR == 2.0)\n" +
+        "    print(TWO32.bits() == 0x3fb504f3)\n" +
+        "    print(ONE_UP32.bits() == 0x3f800000)\n" +
+        "    print(NEG32.bits() == 0x80000000)\n"
+
+    assert_eq(fsq_ran(text), "true\ntrue\ntrue true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n")
+end fsq_known_answers
+
+@test("a root of a constant that is an f32 is taken at f32, not at f64 and rounded after")
+fsq_single_is_rooted_at_single()
+    if xvr_no_library() then return
+
+    // 0x4b7fffff is 16777215: its f64 root, rounded to f32, and the f32 root are the same here, so the
+    // witness is the value the two roundings could not disagree on -- the answer is the correctly
+    // rounded one.
+    val text = "const R: f32 = f32.from_bits(0x4b7fffff).sqrt()\n" +
+        "@noinline\nrt(x: f32) -> f32 = x.sqrt()\n" +
+        "main()\n" +
+        "    print(R.bits() == rt(f32.from_bits(0x4b7fffff)).bits())\n" +
+        "    print(R.bits() == 0x457fffff)\n"
+
+    assert_eq(fsq_ran(text), "true\ntrue\n")
+end fsq_single_is_rooted_at_single
+
+@test("a root of a constant is data: no call of the root is left in the program that reads it")
+fsq_root_is_data()
+    if xvr_no_library() then return
+
+    val ir = fsq_said("val ROOT = 2.0.sqrt()\nval ROOTF = 2.0f32.sqrt()\nmain()\n    print(ROOT, ROOTF)\n")
+
+    assert(!ir.contains("call double @real.sqrt(") && !ir.contains("call float @f32.sqrt("), ir)
+    assert(ir.to_lower().contains("@root = private constant double 0x3ff6a09e667f3bcd"), ir)
+end fsq_root_is_data
+
+@test("a const function that takes a root, and the root of a const function's answer, fold")
+fsq_const_functions()
+    if xvr_no_library() then return
+
+    val text = "const hyp(a: real, b: real) -> real = (a * a + b * b).sqrt()\n" +
+        "const H: real = hyp(3.0, 4.0)\n" +
+        "const G: f32 = (f32(2.0) * f32(8.0)).sqrt()\n" +
+        "main()\n" +
+        "    print(H == 5.0, G == 4.0)\n"
+
+    assert_eq(fsq_ran(text), "true true\n")
+end fsq_const_functions
+
+@test("an extern of llvm.sqrt a program declares itself folds, at the width its parameter names")
+fsq_declared_intrinsic()
+    if xvr_no_library() then return
+
+    val text = "extern \"llvm.sqrt\" root64(x: f64) -> f64\n" +
+        "extern \"llvm.sqrt\" root32(x: f32) -> f32\n" +
+        "const A: f64 = root64(2.0)\n" +
+        "const B: f32 = root32(2.0)\n" +
+        "main()\n" +
+        "    print(A.bits() == 0x3ff6a09e667f3bcd, B.bits() == 0x3fb504f3)\n"
+
+    assert_eq(fsq_ran(text), "true true\n")
+end fsq_declared_intrinsic
+
+@test("a root that is not of a constant is still taken when the program runs")
+fsq_run_time_root_is_untouched()
+    if xvr_no_library() then return
+
+    val text = "@noinline\nbits_of(x: real) -> u64 = x.sqrt().bits()\n" +
+        "main()\n" +
+        "    var x = 9.0\n" +
+        "    x += 7.0\n" +
+        "    print(x.sqrt() == 4.0, bits_of(2.0) == 0x3ff6a09e667f3bcd)\n"
+
+    assert_eq(fsq_ran(text), "true true\n")
+end fsq_run_time_root_is_untouched
+
+// -- a board has no startup to run an initializer ---------------------------------------------------
+
+// `sysl build-c` of `text` for `target`: what it said where it failed, or "built".
+private fsq_board(text: string, target: string) -> string
+    val root = replace_all(make_temp_dir("sysl-fsq").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(["sysl", "build-c", root, "--target", target, "-o", s"$root/app.a"], (line) -> sink.push(line))
+    val said = replace_all(join(lines.view(), "\n"), root, "@")
+
+    remove_dir_all(root).unwrap_or(())
+    if code == Fine then "built" else said
+end fsq_board
+
+private val fsq_export: string = raw"""
+    val ROOT = 2.0.sqrt()
+    val ROOTF = 2.0f32.sqrt()
+
+    @export("get_root")
+    get_root() -> real = ROOT
+
+    @export("get_rootf")
+    get_rootf() -> f32 = ROOTF
+    """
+
+@test("a module val that is a root is constant data, so an export reading it builds for a board")
+fsq_module_val_builds_freestanding()
+    if xvr_no_library() || !clang_available() then return
+
+    for target in ["thumb-freestanding", "thumb-freestanding-softfp", "riscv32-freestanding"]
+        assert_eq(fsq_board(fsq_export, target), "built")
+end fsq_module_val_builds_freestanding
+
+@test("a module val that takes the root of a value only known at run time is still refused on a board")
+fsq_run_time_val_still_refused_freestanding()
+    if xvr_no_library() || !clang_available() then return
+
+    val text = "extern \"rand\" seed() -> i32\n" +
+        "val ROOT = real(seed()).sqrt()\n" +
+        "@export(\"get_root\")\nget_root() -> real = ROOT\n"
+
+    val said = fsq_board(text, "thumb-freestanding-softfp")
+
+    assert(said.contains("'ROOT' cannot be computed while compiling"), said)
+end fsq_run_time_val_still_refused_freestanding
