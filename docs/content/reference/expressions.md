@@ -482,6 +482,27 @@ true
 The fused instruction is asked for exactly, never left to the optimizer to choose site by site, so a
 program prints the same bits at `-O0` and at `-O3`, vectorized loops included.
 
+**[`@no_fuse`](/reference/attributes/#no-fuse-multiplies-and-adds-rounded-apart) turns fusing off**
+— C's `-ffp-contract=off` — for a function or a method, or, in a file's header, for a whole module.
+There every product is rounded before the sum, at every optimization level and in every constant,
+which is what a program checked against results computed that way needs:
+
+```sysl
+id(x: real) -> real = x
+
+@no_fuse
+apart(x: real, c: real) -> real = x * x + c
+
+var x = 1.0 + 1.0 / 1073741824.0
+var c = -(1.0 + 1.0 / 536870912.0)
+
+print(apart(x, c) * 1152921504606846976.0)
+```
+
+```output
+0
+```
+
 **Every float `+`, `-` and `*` is computed in the order it is written**, so a sum of many terms is a
 chain the optimizer keeps in that order. A function or block marked
 [`@reassociate`](/reference/attributes/#reassociate-float-sums-the-back-end-may-regroup) gives the
@@ -1937,7 +1958,8 @@ type the context gives, and the branches of an `if` or a `match` used as a value
 wider of their types as two operands do. **The bounds of a range and the elements of an unannotated
 array literal meet the same way**: `i..<n` over an `int` and a `long` is a `long` range, and `[a, b]`
 over an `int` and a `long` is a `[2]long`. A pair neither of whose types holds the other — a `u32` and
-an `int` — is refused.
+an `int` — is refused; an `int` and a `usize` [meet where the value of one
+fits](#an-int-and-a-usize-meet-where-the-value-fits).
 
 ```sysl
 struct Sample
@@ -2152,8 +2174,9 @@ print(max(a, b))
 ```
 
 **Between overloads, an exact match beats any widening, and among widenings the narrowest wins** —
-the candidate each of whose parameters converts to the other's. Where neither is narrower at every
-position, the call is ambiguous — except where the candidates are tied only by bare literals, which
+the candidate each of whose parameters converts to the other's. A literal, or arithmetic over
+literals alone (`60 * 52`), has no type to widen from and decides nothing in this step. Where
+neither is narrower at every position, the call is ambiguous — except where the candidates are tied only by bare literals, which
 then take their default types, or are tied only by bare literals beside typed arguments that one
 candidate takes exactly, which then read the literals at that candidate's parameter types
 ([Overloading](/reference/declarations/#overloading)).
@@ -2182,6 +2205,76 @@ var n: int = l
 
 ```error
 cannot initialize 'n': declared int but the value is long
+```
+
+### An int and a usize meet where the value fits
+
+**An `int` and a `usize` are the one pair of operands that meet where neither type holds the other:
+an operand converts to the other's type where the compiler can show its value fits there.** A
+length, a `sizeof` and an offset are `usize`s while a counter is an `int`, and the values that meet
+are nearly always small and non-negative, so `sizeof(Header) + i * sizeof(Slot)` over an `int` `i`
+is an `int` and `b.len - K` over a constant `int` `K` is a `usize`. Nothing is rounded, truncated or
+checked at run time, because nothing could fail: the conversion is the one the table makes for a
+narrower type.
+
+What the compiler knows is the interval a value lies in. A literal and a constant are their own
+value — a typed `const`, a `sizeof`, `alignof` or `offsetof`. A `val` is what its initializer was
+known to be, so `val b = a * 2 + 1` over a known `a` is known too. A conversion is its operand's
+value where the target holds it, so `int(x)` over a `byte` is 0 to 255. `+`, `-` and `*` combine
+their operands, and `x & 0xff`, `x >> k`, `x / k` and `x % k` over non-negative values stay
+non-negative. Anything else — a `var`, a parameter, a field, a call's result, a `for` variable (its
+body may assign it), a `val` read inside a closure — may hold any value of its type: an `int` that
+may be negative is never a `usize`, nor a `usize` that may pass 2147483647 an `int`.
+
+**The pair settles at the type whose value is not known**, so `n + K` is a `usize` and `sizeof(T) +
+i` an `int`. Where both values are known it is the type the position names, and otherwise an `int`.
+It holds in every operator that meets two values — arithmetic, a comparison, the bounds of a range,
+a compound assignment (which converts its value to the place's type, never the reverse) — and in no
+other position: an initializer, an argument, a return and the branches of an `if` keep the table,
+and a wrapping or saturating operator still takes two values of one type. No other pair mixes, so
+`long` beside `usize` and `isize` beside `usize` are refused as before. The width is the target's:
+on Craft's 16-bit target a `val k: int = 65536` is not a `usize`.
+
+```sysl
+struct Header
+    count: u32
+    free: u32
+
+const LIMIT: int = 2
+
+slot(i: int) -> int = sizeof(Header) + i * sizeof(u32)
+
+val b = [5, 6, 7, 8]
+val first: int = 1
+val last = first * 2 + 1
+var n: usize = b.len
+
+n -= LIMIT
+
+print(slot(3), b.len - first, n, first < b.len, last % b.len)
+
+for j in first..<b.len
+    print(b[j])
+```
+
+```output
+20 3 2 true 3
+6
+7
+8
+```
+
+A `var`, or any value that may be negative, is refused, and the diagnostic says how to convert:
+
+```sysl
+val b = [5, 6, 7]
+var i: int = 1
+
+print(b.len - i)
+```
+
+```error
+'-' needs matching types, got usize and int — an int and a usize meet only where the value of one is known to fit the other's type; convert one with 'usize(…)' or 'int(…)'
 ```
 
 ## `sizeof`, `alignof` and `offsetof`
@@ -3098,6 +3191,49 @@ print(c.re, c.im)
 13.5 -18
 ```
 
+A literal is read at the implementation it selects, never at its `int` default first, so one too wide
+for `int` is the `long` or the `ulong` an implementation takes, and a literal's arithmetic chooses as
+the literal it comes to:
+
+```sysl
+struct Big
+    n: long
+
+impl Add[long, string] for Big
+    add(self, v: long) -> string = s"long ${self.n + v}"
+
+impl Add[ulong, string] for Big
+    add(self, v: ulong) -> string = s"ulong $v"
+
+val b = Big(1)
+
+print(b + 4567890123)
+print(b + 18446744073709551615)
+print(b + 60 * 52)
+```
+
+```output
+long 4567890124
+ulong 18446744073709551615
+long 3121
+```
+
+A literal no implementation's right-hand type holds is refused naming what is implemented:
+
+```sysl
+struct Big
+    n: long
+
+impl Add[long, string] for Big
+    add(self, v: long) -> string = "long"
+
+print(Big(1) + 36893488147419103232)
+```
+
+```error
+'+' on Big has no right-hand type this literal fits — it implements 'Add[long, string]'
+```
+
 Two implementations neither of which is the narrower leave the operand saying nothing about which is
 meant. On a 64-bit target `isize` and `i64` each widen to the other, so an `int` reaches both
 equally, and `s * n`, `s *= n` and `s.mul(n)` are all refused; an operand at either type exactly
@@ -3227,7 +3363,9 @@ print(sum([1, 2, 3]), sum(none), sum([1.5, 2.5]) == 4)
 
 **A constrained subtype is deliberately not a member, the one place where a value and an operation
 are treated differently.** [A derivation](/reference/errors/) gives a subtype every operation its
-base has, because narrowing which values a type holds does not narrow what can be done with them. An
+base has, because narrowing which values a type holds does not narrow what can be done with them —
+all but two: a `new` type [is not `Mul` or `Div` at itself](/reference/errors/#a-new-type-does-not-multiply-or-divide-by-itself),
+since two `Meters` multiplied are an area and divided a ratio. An
 identity is a value, not an operation: a range written to exclude zero does not contain one, so the
 membership stops at the integer types themselves. A **vector** is left out for a related reason — `<4>i32` has four lanes and
 `zero()` names none of them, where every operator above is the lane's operation happening four times
