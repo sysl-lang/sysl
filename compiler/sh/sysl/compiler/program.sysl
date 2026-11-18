@@ -228,7 +228,7 @@ program_of(done: TypedBodies, main_module: string) -> TProgram
              a.tables.test_only, destructors_of(a), a.warnings(), a.tables.module_deps,
              entry_source(done), a.tables.module_asm, false, a.tables.target.double_unit(),
              a.tables.target.single_unit(), a.tables.target.divider(), a.tables.test_reporters,
-             a.tables.reassoc_blocks)
+             a.tables.reassoc_blocks, a.tables.no_fuse_modules.has(main_module))
 end program_of
 
 // The file the program starts in, which `entry_body` typed the statements of.
@@ -265,16 +265,16 @@ dropping_reached(a: &Analysis) -> Buf[Type]
     out
 end dropping_reached
 
-private has_destructor_key(keys: Buf[(string, string)], key: string) -> bool
+private has_destructor_key(keys: Buf[(string, string, bool)], key: string) -> bool
     for item in keys
         if item.0 == key then return true
 
     false
 end has_destructor_key
 
-private destructors_of(a: &Analysis) -> Buf[(string, string)]
+private destructors_of(a: &Analysis) -> Buf[(string, string, bool)]
     val drops = drops_declared(a)
-    var out: Buf[(string, string)] = buf()
+    var out: Buf[(string, string, bool)] = buf()
 
     if drops.is_empty() then return out
 
@@ -290,7 +290,8 @@ private destructors_of(a: &Analysis) -> Buf[(string, string)]
     out
 end destructors_of
 
-private push_destructor(a: &Analysis, drops: Buf[string], out: *Buf[(string, string)], t: Type)
+private push_destructor(a: &Analysis, drops: Buf[string], out: *Buf[(string, string, bool)],
+                        t: Type)
     val owner = owner_key(t)
 
     if !holds_string(drops, owner) then return
@@ -299,8 +300,19 @@ private push_destructor(a: &Analysis, drops: Buf[string], out: *Buf[(string, str
     val made = a.tables.members.generic_drops.get(mangle(t))
     val filed = if made.is_some() then made else a.tables.members.funcs.get(member_key_of(owner, "drop"))
 
-    out.push((mangle(t), filed.unwrap_or(s"${member_symbol(t)}.drop")))
+    out.push((mangle(t), filed.unwrap_or(s"${member_symbol(t)}.drop"), drop_by_address(a, owner)))
 end push_destructor
+
+// Whether a type's `drop` was written `drop(*self)`, which the hook hands the payload's address.
+private drop_by_address(a: &Analysis, owner: string) -> bool
+    val decl = a.tables.members.decls.get(member_key_of(owner, "drop"))
+
+    if decl.is_none() then return false
+
+    decl.unwrap().receiver match
+        Some(ByPtr) -> true
+        _ -> false
+end drop_by_address
 
 // The bodies a program **emits**, which is the question a printed tree answers.
 //

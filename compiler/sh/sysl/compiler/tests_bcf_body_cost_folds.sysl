@@ -1,0 +1,359 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.buf
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **What a body costs the optimizer counts only the code that survives it** (`codegen_units.sysl`'s
+// `body_cost`): a block that ends in `unreachable` -- a failed check reporting itself and trapping --
+// is a cold exit, and the guard a shift by a constant amount is lowered with folds to nothing. Both
+// used to count, so a small getter that indexes or shifts by a constant was priced as a large one and
+// left out of line across codegen units (`CopyCost`) and across a precompiled module (`ImportCost`).
+
+// A getter's body: the index is checked against the length, the bad block reports and traps, and the
+// good one reads the element. `bad` is the failing block's own instructions.
+private bcf_getter(bad: string) -> string =
+    "define i64 @get(ptr %b, i64 %i) {\nentry:\n  %len = load i64, ptr %b\n" +
+    "  %ok = icmp ult i64 %i, %len\n  br i1 %ok, label %bounds.ok, label %bounds.bad\n" +
+    s"bounds.bad:\n$bad  call void @sysl_trap()\n  unreachable\n" +
+    "bounds.ok:\n  %p = getelementptr i64, ptr %b, i64 %i\n  %v = load i64, ptr %p\n  ret i64 %v\n}\n"
+
+private bcf_cost(text: string) -> usize = body_cost(text, 0, text.len)
+
+@test("a failed bounds check's block costs nothing: a getter is priced by its path that returns")
+bcf_bounds_fail_block_is_free()
+    // load, icmp, br i1 on the way in; getelementptr, load, ret on the way out.
+    assert_eq(bcf_cost(bcf_getter("")), 6)
+end bcf_bounds_fail_block_is_free
+
+@test("however much the failure reports, the getter costs the same")
+bcf_report_length_does_not_count()
+    var report = ""
+
+    for k in 0..<60
+        report = report + s"  %r$k = call i64 @report_part(i64 %i, i64 $k)\n"
+
+    assert_eq(bcf_cost(bcf_getter(report)), 6)
+end bcf_report_length_does_not_count
+
+@test("several failing checks in one body are each free")
+bcf_every_trap_block_is_free()
+    val text = "define i64 @two(ptr %b, i64 %i, i64 %j) {\nentry:\n  %len = load i64, ptr %b\n" +
+        "  %ok = icmp ult i64 %i, %len\n  br i1 %ok, label %a.ok, label %a.bad\n" +
+        "a.bad:\n  call void @report(i64 %i)\n  call void @sysl_trap()\n  unreachable\n" +
+        "a.ok:\n  %ok2 = icmp ult i64 %j, %len\n  br i1 %ok2, label %b.ok, label %b.bad\n" +
+        "b.bad:\n  call void @report(i64 %j)\n  call void @sysl_trap()\n  unreachable\n" +
+        "b.ok:\n  %s = add i64 %i, %j\n  ret i64 %s\n}\n"
+
+    // load, icmp, br; icmp, br; add, ret.
+    assert_eq(bcf_cost(text), 7)
+end bcf_every_trap_block_is_free
+
+@test("a body with no return counts every block: when every path traps, nothing is a cold exit")
+bcf_no_return_counts_everything()
+    val text = "define void @fail(i64 %code) {\nentry:\n  %c = icmp eq i64 %code, 0\n" +
+        "  br i1 %c, label %a, label %b\na:\n  call void @report(i64 0)\n  call void @sysl_trap()\n" +
+        "  unreachable\nb:\n  call void @report(i64 %code)\n  call void @sysl_trap()\n  unreachable\n}\n"
+
+    assert_eq(bcf_cost(text), 6)
+end bcf_no_return_counts_everything
+
+@test("a block that ends in a return is counted as before, however it was entered")
+bcf_returning_blocks_still_count()
+    val text = "define i64 @pick(i1 %c, i64 %x) {\nentry:\n  br i1 %c, label %a, label %b\n" +
+        "a:\n  %y = mul i64 %x, 3\n  ret i64 %y\nb:\n  %z = add i64 %x, 1\n  ret i64 %z\n}\n"
+
+    assert_eq(bcf_cost(text), 5)
+end bcf_returning_blocks_still_count
+
+// What `bounded_shift` lowers `x >> amount` to: a clamp of the amount, the shift, and the answer for
+// an amount past the width.
+private bcf_shift(amount: string) -> string =
+    "define i64 @sh(i64 %x.param, i64 %n) {\nentry:\n  %x.addr = alloca i64\n" +
+    "  store i64 %x.param, ptr %x.addr\n  %t1 = load i64, ptr %x.addr\n" +
+    s"  %t2 = icmp uge i64 $amount, 64\n  %t3 = select i1 %t2, i64 63, i64 $amount\n" +
+    "  %t4 = lshr i64 %t1, %t3\n  %t5 = select i1 %t2, i64 0, i64 %t4\n  ret i64 %t5\n}\n"
+
+@test("a shift by a constant amount costs the shift alone: its guard folds away")
+bcf_constant_shift_guard_folds()
+    assert_eq(bcf_cost(bcf_shift("18")), 2)
+    assert_eq(bcf_cost(bcf_shift("63")), 2)
+end bcf_constant_shift_guard_folds
+
+@test("a constant amount past the width folds too: the guard is a constant either way")
+bcf_constant_shift_past_width_folds()
+    assert_eq(bcf_cost(bcf_shift("64")), 2)
+    assert_eq(bcf_cost(bcf_shift("200")), 2)
+end bcf_constant_shift_past_width_folds
+
+@test("a shift by an amount only known at run time keeps its guard")
+bcf_register_shift_guard_counts()
+    // icmp, select, lshr, select, ret.
+    assert_eq(bcf_cost(bcf_shift("%n")), 5)
+end bcf_register_shift_guard_counts
+
+@test("a constant propagates: what is computed from folded registers folds, and a branch on it is free")
+bcf_folds_chain()
+    val text = "define i64 @chain(i64 %x) {\nentry:\n  %a = icmp eq i32 3, 3\n  %b = xor i1 %a, true\n" +
+        "  %w = zext i1 %b to i64\n  %v = add i64 %w, 7\n  br i1 %b, label %no, label %yes\n" +
+        "no:\n  call void @sysl_trap()\n  unreachable\nyes:\n  br i1 true, label %end, label %end\n" +
+        "end:\n  %r = add i64 %x, %v\n  ret i64 %r\n}\n"
+
+    // Only the last add, which reads a parameter, and the return survive.
+    assert_eq(bcf_cost(text), 2)
+end bcf_folds_chain
+
+@test("a select on a run-time condition is counted even when both its operands are constants")
+bcf_select_on_register_counts()
+    val text = "define i64 @sel(i1 %c) {\nentry:\n  %s = select i1 %c, i64 1, i64 2\n" +
+        "  %t = add i64 %s, 1\n  ret i64 %t\n}\n"
+
+    assert_eq(bcf_cost(text), 3)
+end bcf_select_on_register_counts
+
+@test("a vector comparison, a global's address and a call are never taken for constants")
+bcf_vector_global_and_call_not_folded()
+    val text = "define i64 @odd() {\nentry:\n" +
+        "  %v = icmp uge <2 x i64> <i64 1, i64 2>, <i64 64, i64 64>\n" +
+        "  %g = icmp eq ptr @here, null\n  %c = call i64 @seven()\n  %d = add i64 %c, 1\n" +
+        "  %e = select i1 %g, i64 1, i64 2\n  ret i64 %d\n}\n"
+
+    assert_eq(bcf_cost(text), 6)
+end bcf_vector_global_and_call_not_folded
+
+@test("a constant's register is the function's own: the same name in the next body starts unknown")
+bcf_fold_is_per_body()
+    val one = "define i64 @one() {\nentry:\n  %k = icmp eq i64 1, 1\n  ret i64 0\n}\n"
+    val two = "define i64 @two(i1 %k) {\nentry:\n  %s = select i1 %k, i64 1, i64 2\n  ret i64 %s\n}\n"
+    val both = one + two
+
+    assert_eq(body_cost(both, 0, one.len), 1)
+    assert_eq(body_cost(both, one.len, both.len), 2)
+end bcf_fold_is_per_body
+
+// -- across codegen units ---------------------------------------------------------------------------
+
+private bcf_lines(text: string, head: string, part: string) -> int
+    var n = 0
+
+    for line in lines_of(text)
+        if line.starts_with(head) && line.contains(part) then n += 1
+
+    n
+end bcf_lines
+
+private bcf_calls(text: string, part: string) -> bool
+    for line in lines_of(text)
+        if line.contains("call ") && line.contains(part) then return true
+
+    false
+end bcf_calls
+
+// `body` defined as `@get` and called from sixteen functions, so that a cut into four units has
+// callers away from its home.
+private bcf_module(body: string) -> string
+    var text = "declare void @sysl_trap()\ndeclare i64 @report_part(i64, i64)\n" + body
+
+    for k in 0..<16
+        text = text + s"define i64 @c$k(ptr %b) {\nentry:\n  %r = call i64 @get(ptr %b, i64 $k)\n  ret i64 %r\n}\n"
+
+    text
+end bcf_module
+
+// How many units call `@get` from away from its home, and how many of those carry a copy.
+private bcf_copies(text: string) -> (int, int)
+    val parts = split_module(text, 4).unwrap()
+    var away = 0
+    var copies = 0
+
+    for p in parts
+        if bcf_calls(p, "@get(") && bcf_lines(p, "define i64 @get(", "") == 0
+            away += 1
+            copies += bcf_lines(p, "define available_externally i64 @get(", "")
+
+    (away, copies)
+end bcf_copies
+
+@test("a getter whose failing check reports at length is copied into every unit that calls it")
+bcf_getter_copied_across_units()
+    var report = ""
+
+    // Past `CopyCost` by itself, and all of it in the block that traps.
+    for k in 0..<60
+        report = report + s"  %r$k = call i64 @report_part(i64 %i, i64 $k)\n"
+
+    val got = bcf_copies(bcf_module(bcf_getter(report)))
+
+    assert(got.0 >= 1, "a unit calls '@get' from outside its home")
+    assert_eq(got.1, got.0)
+end bcf_getter_copied_across_units
+
+@test("a getter whose path that returns is long stays one definition, its trap block notwithstanding")
+bcf_long_live_path_not_copied()
+    var live = ""
+
+    for k in 0..<60
+        live = live + s"  %m$k = mul i64 %i, ${k + 2}\n"
+
+    val text = "define i64 @get(ptr %b, i64 %i) {\nentry:\n  %len = load i64, ptr %b\n" +
+        "  %ok = icmp ult i64 %i, %len\n  br i1 %ok, label %bounds.ok, label %bounds.bad\n" +
+        "bounds.bad:\n  call void @sysl_trap()\n  unreachable\n" +
+        s"bounds.ok:\n$live  ret i64 %m59\n}\n"
+
+    val got = bcf_copies(bcf_module(text))
+
+    assert(got.0 >= 1, "a unit calls '@get' from outside its home")
+    assert_eq(got.1, 0)
+end bcf_long_live_path_not_copied
+
+// -- across a precompiled module (`codegen.sysl`'s `keeps_import`) ---------------------------------
+//
+// A `--lib` root's getter that indexes an array -- a bounds check whose failure reports and traps --
+// and mixes the element by ten shifts of constant amounts. Its raw count is past `ImportLimit`, so
+// its cost decides: about 60 with the trap block and the ten guards counted, past `ImportCost`
+// (45), and under 30 without them. `cell_wide` is the same with forty shifts, whose surviving cost is past
+// the limit on its own.
+
+private bcf_shifts(n: int) -> string
+    var s = "v"
+
+    for k in 1..n
+        val op = if k % 2 == 0 then "<<" else ">>"
+
+        s = s + s" ^ (v $op $k)"
+
+    s
+end bcf_shifts
+
+private bcf_root() -> string = lbr_tree(lbr_one("bcfl/bcfl.sysl",
+    "module bcfl\n\nstruct Grid\n    cells: [64]u64\n\n" +
+    s"cell(g: *Grid, i: int) -> u64\n    val v = g.cells[i]\n    ${bcf_shifts(10)}\n\n" +
+    s"cell_wide(g: *Grid, i: int) -> u64\n    val v = g.cells[i]\n    ${bcf_shifts(40)}\n"))
+
+private bcf_app() -> string = lbr_program(
+    "var g = bcfl.Grid([0; 64])\n\nfor k in 0..<64\n    g.cells[k] = u64(k) * 2654435761\n\n" +
+    "print(bcfl.cell(&g, 5))\nprint(bcfl.cell_wide(&g, 9))\n")
+
+private bcf_root_text(app: string, root: string, level: string) -> string
+    lbr_hand([root])
+
+    val text = emit_llvm_text(app, None, level, buf(), None, true) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(emitted) -> emitted.text
+
+    reset_search_paths()
+    text
+end bcf_root_text
+
+private bcf_optimized(text: string) -> string
+    val dir = make_temp_dir("sysl-bcf-opt").unwrap()
+    val file = s"$dir/t.ll"
+
+    write_text(file, text).unwrap()
+
+    val got = capture("clang", ["-O2", "-S", "-emit-llvm", "-o", "-", file], "", [], true).unwrap()
+
+    remove_dir_all(dir).unwrap_or(())
+    assert(got.status.ok(), s"clang refused the text:\n${got.err.unwrap_or("")}")
+    got.text
+end bcf_optimized
+
+// A cache of the case's own, so the root is built for it and the machine's cache is left alone.
+private bcf_begin() -> string
+    val cache = lbr_temp("sysl-bcf-cache")
+
+    use_root_cache_dir(Some(cache))
+    use_c_object_cache_dir(Some(cache))
+    cache
+end bcf_begin
+
+private bcf_end(cache: string, trees: []string)
+    use_root_cache_dir(None)
+    use_c_object_cache_dir(None)
+    reset_search_paths()
+    remove_dir_all(cache).unwrap_or(())
+    lbr_drop(trees)
+end bcf_end
+
+// What `app` built against `root` at `level` prints, or how it failed.
+private bcf_run(app: string, root: string, level: string) -> string
+    val dir = make_temp_dir("sysl-bcf-run").unwrap()
+
+    lbr_hand([root])
+
+    val said = build_native_program(app, None, None, level, Some(s"$dir/bcf-run")) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(made) ->
+            capture(made, [], "", [], true) match
+                Err(_) -> "the program that was built could not be run"
+                Ok(out) -> if out.status.ok() then out.text else s"exited badly: ${out.text}${out.err.unwrap_or("")}"
+
+    reset_search_paths()
+    remove_dir_all(dir).unwrap_or(())
+    said
+end bcf_run
+
+@test("a root's getter that indexes and shifts by constants is copied into the program and inlined")
+bcf_root_getter_copied_and_inlined()
+    if !lbr_ready() then return
+
+    val cache = bcf_begin()
+    val root = bcf_root()
+    val app = bcf_app()
+    val text = bcf_root_text(app, root, "2")
+
+    assert(!text.starts_with("refused"), text)
+    assert_eq(bcf_lines(text, "define available_externally ", "bcfl$cell("), 1)
+    assert_eq(bcf_lines(text, "declare ", "bcfl$cell("), 0)
+
+    val out = bcf_optimized(text)
+
+    assert(!bcf_calls(out, "bcfl$cell(") && !bcf_calls(out, "bcfl$cell\"("), "the getter was inlined")
+    bcf_end(cache, [root, app])
+end bcf_root_getter_copied_and_inlined
+
+@test("the same getter with forty shifts costs more than the optimizer would take and stays a declaration")
+bcf_root_wide_getter_declared()
+    if !lbr_ready() then return
+
+    val cache = bcf_begin()
+    val root = bcf_root()
+    val app = bcf_app()
+    val text = bcf_root_text(app, root, "2")
+
+    assert_eq(bcf_lines(text, "define available_externally ", "bcfl$cell_wide("), 0)
+    assert_eq(bcf_lines(text, "declare ", "bcfl$cell_wide("), 1)
+    assert(bcf_calls(bcf_optimized(text), "bcfl$cell_wide"), "the wide getter is still called")
+    bcf_end(cache, [root, app])
+end bcf_root_wide_getter_declared
+
+@test("the copied getter's program prints at -O2 what it prints at -O0")
+bcf_root_getter_runs_the_same()
+    if !lbr_ready() then return
+
+    val cache = bcf_begin()
+    val root = bcf_root()
+    val app = bcf_app()
+    val low = bcf_run(app, root, "0")
+    val high = bcf_run(app, root, "2")
+
+    assert_eq(high, low)
+    assert_eq(bcf_lines(low, "", ""), 2)
+    bcf_end(cache, [root, app])
+end bcf_root_getter_runs_the_same
+
+@test("an index out of range still traps through the inlined copy: its check was not counted, not dropped")
+bcf_root_getter_still_traps()
+    if !lbr_ready() then return
+
+    val cache = bcf_begin()
+    val root = bcf_root()
+    val app = lbr_program("@noinline\nfar() -> int = 70\n\nvar g = bcfl.Grid([0; 64])\n\n" +
+                          "print(bcfl.cell(&g, far()))\n")
+    val said = bcf_run(app, root, "2")
+
+    assert(said.starts_with("exited badly"), said)
+    assert(said.contains("70"), said)
+    bcf_end(cache, [root, app])
+end bcf_root_getter_still_traps
