@@ -2158,6 +2158,26 @@ print(called)
 4
 ```
 
+**`x.sqrt()` of a constant folds**, at `real` and at `f32`, and the answer is the one the machine's
+square-root instruction gives where the program runs: the exact root rounded once to nearest, ties to
+even, at the float's own width. `-0.0` has the root `-0.0`, a negative number and a NaN have a NaN, an
+infinity stays one, and a subnormal is rounded as the instruction rounds it. A module `val` that is a
+root is therefore constant data, and an export reading it builds for a board with no startup code.
+The other functions of `sysl.math` (`sin`, `exp`, `ln`, …) are the C library's and do not fold, because
+their last bit is the library's own.
+
+```sysl
+const ROOT2: real = 2.0.sqrt()
+const ROOT2F: f32 = f32(2.0).sqrt()
+val TINY = real.from_bits(1).sqrt()
+
+print(ROOT2.bits() == 0x3ff6a09e667f3bcd, ROOT2F.bits() == 0x3fb504f3, TINY.bits() == 0x1e60000000000000)
+```
+
+```output
+true true true
+```
+
 **An `if` or a `match` over constants is one too**, in every position a constant is read: a
 `const`, an array length, an `@assert`, a value argument. It is typed whole, and only the branch its
 condition chooses is computed, so a branch that would trap if it ran is harmless when it is not

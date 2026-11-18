@@ -302,10 +302,50 @@ private check_exhaustive(cx: &Analyzer, span: Span, arms: Buf[AsmArm])
 // operand rather than with a broken one: the diagnostic has been recorded, and a later pass reading
 // a half-bound operand would be a crash on top of a message the reader already has.
 private bind_operand(cx: &Analyzer, op: AsmOperand) -> Option[TAsmOperand]
-    val local = cx.lookup(op.name)
+    // The name an `inout a -> b` reads is only read; the result goes to `b`.
+    val read = operand_local(cx, op, op.name, op.dir == Out || (op.dir == InOut && op.into.is_none()))
+
+    if read.is_none() then return None
+
+    val l = read.unwrap()
+
+    if !fits_place(cx, op.place, l.ty)
+        cx.fault(op.span, place_fit_message(cx, op.place, op.name, l.ty))
+
+        return None
+    end if
+
+    // **The two sides of a tie are one register**, so they are one type: the register is loaded at
+    // the type the instructions read and stored back at the type they wrote, and two types would
+    // have it stored at a width or a meaning nobody wrote.
+    op.into match
+        Some(other) ->
+            val written = operand_local(cx, op, other, true)
+
+            if written.is_none() then return None
+
+            val w = written.unwrap()
+
+            if !type_eq(l.ty, w.ty)
+                cx.fault(op.span, s"'${op.name}' is ${type_show(l.ty)} and '$other' is " +
+                         s"${type_show(w.ty)}, but an 'inout' leaves its result in the register " +
+                         "it read, so the two sides are one type. Convert one of them into a " +
+                         "variable of the other's type first")
+
+                return None
+            end if
+
+            Some(TAsmOperand(op.dir, op.name, l.unique, l.ty, op.place, other, w.unique))
+        None -> Some(TAsmOperand(op.dir, op.name, l.unique, l.ty, op.place, op.name, l.unique))
+end bind_operand
+
+// The local an operand names, refusing a name that is not one, a `ref`, and -- where the operand
+// writes it -- one that cannot be written.
+private operand_local(cx: &Analyzer, op: AsmOperand, name: string, writes: bool) -> Option[Local]
+    val local = cx.lookup(name)
 
     if local.is_none()
-        cx.fault(op.span, s"undefined name '${op.name}'. An assembly operand names a variable " +
+        cx.fault(op.span, s"undefined name '$name'. An assembly operand names a variable " +
                  "that already exists — an expression needs somewhere to be evaluated to, so bind " +
                  "one first")
 
@@ -320,7 +360,7 @@ private bind_operand(cx: &Analyzer, op: AsmOperand) -> Option[TAsmOperand]
     // explain -- and it is asked before the other two questions, a name that cannot be an operand
     // having no direction to be wrong in and no register to fit.
     if l.stands_for.is_some()
-        cx.fault(op.span, s"'${op.name}' is bound by 'ref', so it names storage somewhere else " +
+        cx.fault(op.span, s"'$name' is bound by 'ref', so it names storage somewhere else " +
                  "rather than a variable of its own, and there is nothing here for an operand to " +
                  "be. Copy it into a 'var' first, and write that back afterwards if the " +
                  "instructions set it")
@@ -328,29 +368,42 @@ private bind_operand(cx: &Analyzer, op: AsmOperand) -> Option[TAsmOperand]
         return None
     end if
 
-    if l.read_only && is_out(op.dir)
+    if l.read_only && writes
         // A pattern binding is written once as well, and its advice cannot be "declare it 'var'":
         // there is no keyword on an arm's capture to change.
         if l.from_pattern then
-            cx.fault(op.span, s"'${op.name}' cannot be written by this assembly, because a " +
+            cx.fault(op.span, s"'$name' cannot be written by this assembly, because a " +
                      "pattern binding holds a copy of what it matched and is written once. Copy " +
                      "it into a 'var' and name that instead")
+        elif op.dir == InOut && op.into.is_none() then
+            cx.fault(op.span, s"'$name' cannot be written by this assembly, because it is a " +
+                     s"'val'. Declare it 'var' if the instructions are meant to set it, or write " +
+                     s"'inout $name -> other' to leave the result in another variable")
         else
-            cx.fault(op.span, s"'${op.name}' cannot be written by this assembly, because it is a " +
+            cx.fault(op.span, s"'$name' cannot be written by this assembly, because it is a " +
                      "'val'. Declare it 'var' if the instructions are meant to set it")
     end if
 
-    if !fits_register(l.ty) then cx.fault(op.span, register_fit_message(op.name, l.ty))
+    Some(l)
+end operand_local
 
-    Some(TAsmOperand(op.dir, op.name, l.unique, l.ty, op.reg))
-end bind_operand
+// The names an operand reads and the name it writes.
+private reads_name(op: AsmOperand, name: string) -> bool = op.dir != Out && op.name == name
 
-private is_out(d: AsmDir) -> bool = d match
-    Out -> true
+private writes_name(op: AsmOperand, name: string) -> bool = op.dir match
     In -> false
+    Out -> op.name == name
+    InOut -> op.into.unwrap_or(op.name) == name
 
-// Whether a value of this type can live in a general-purpose register, which is the only class
-// there is. A trait object is two words and so is not one of them.
+// Whether a value of this type can live where the operand asks.
+private fits_place(cx: &Analyzer, place: AsmPlace, ty: Type) -> bool = place match
+    PlaceReg -> fits_register(ty)
+    PlaceVreg -> fits_vector_register(cx, ty)
+    // A machine register by name may be either kind, the assembler knowing which it is.
+    PlaceAt(_) -> fits_register(ty) || fits_vector_register(cx, ty)
+
+// Whether a value of this type can live in a general-purpose register. A trait object is two words
+// and so is not one of them.
 private fits_register(ty: Type) -> bool = ty match
     Integer(_, _, _) -> true
     Fixed(_, _, _) -> true
@@ -359,11 +412,73 @@ private fits_register(ty: Type) -> bool = ty match
     Ptr(inner, _) -> !is_trait(*inner)
     _ -> false
 
-private register_fit_message(name: string, ty: Type) -> string = ty match
+// **The vector register class is AArch64's `v` registers and x86-64's `xmm` registers**, the one
+// file each machine keeps its SIMD lanes and its floats in. A value fits one when this build has
+// them and the value is exactly one register's worth: a vector of 64 or 128 bits on AArch64 (a `d`
+// or a `q`), of 128 on x86-64 (wider ones are `ymm` and `zmm`, which a baseline x86-64 does not
+// have), or an `f32` or an `f64`. The other processors have no class here -- Thumb's floating
+// registers hold no vector, RISC-V's vector registers have no fixed width -- and say so.
+private fits_vector_register(cx: &Analyzer, ty: Type) -> bool
+    if vector_class_absent(cx) != "" then return false
+
+    ty match
+        Floating(bits, brain) -> !brain && (bits == 32 || bits == 64)
+        Vector(n, elem) ->
+            val lane = lane_bits(cx, *elem)
+
+            if lane == 0 then return false
+
+            val total = n * lane
+
+            if cx.an.tables.target.cpu == Aarch64 then total == 64 || total == 128 else total == 128
+        _ -> false
+end fits_vector_register
+
+// Why this build has no vector register class, or nothing where it has one.
+private vector_class_absent(cx: &Analyzer) -> string
+    val t = cx.an.tables.target
+    val here = cpu_symbol(t.cpu)
+
+    if t.cpu != Aarch64 && t.cpu != X86_64 then
+        return s"there is no vector register class on $here — 'vreg' names AArch64's 'v' " +
+            "registers and x86-64's 'xmm' ones"
+
+    if codegen_features().general_regs_only || !t.fp_registers() then
+        return s"this build is for $here without its floating-point and vector registers " +
+            "('general_regs_only'), so there is no 'vreg' for an operand to land in"
+
+    ""
+end vector_class_absent
+
+// The width of one lane a vector register can hold, or 0 for a lane it cannot: an 8-, 16-, 32- or
+// 64-bit integer, or a binary16, binary32 or binary64 float.
+private lane_bits(cx: &Analyzer, elem: Type) -> int = elem match
+    Integer(bits, _, pw) ->
+        val b = if pw then int(cx.an.tables.target.pointer_bits()) else bits
+
+        if b == 8 || b == 16 || b == 32 || b == 64 then b else 0
+    Floating(bits, brain) -> if !brain && (bits == 16 || bits == 32 || bits == 64) then bits else 0
+    _ -> 0
+
+private place_fit_message(cx: &Analyzer, place: AsmPlace, name: string, ty: Type) -> string = place match
+    PlaceVreg -> vector_fit_message(cx, name, ty)
+    _ -> register_fit_message(cx, name, ty)
+
+private register_fit_message(cx: &Analyzer, name: string, ty: Type) -> string = ty match
     Floating(_, _) ->
-        s"'$name' is a floating-point value, and there is no floating register class yet — only " +
-            "'reg', which is the general-purpose one. Move the value through an integer of the " +
-            "same width, or through memory"
+        if fits_vector_register(cx, ty) then
+            s"'$name' is a floating-point value, which lives in a vector register rather than a " +
+                s"general-purpose one. Write 'vreg' for its class"
+        else
+            s"'$name' is a floating-point value, and this build has no register class for one — " +
+                "only 'reg', which is the general-purpose one. Move the value through an integer " +
+                "of the same width, or through memory"
+    Vector(_, _) ->
+        if fits_vector_register(cx, ty) then
+            s"'$name' is a vector, which lives in a vector register rather than a " +
+                s"general-purpose one. Write 'vreg' for its class"
+        else
+            vector_fit_message(cx, name, ty)
     Ptr(inner, _) ->
         if is_trait(*inner) then
             s"'$name' is a trait object, which is two words — a pointer to the value and a " +
@@ -373,22 +488,67 @@ private register_fit_message(name: string, ty: Type) -> string = ty match
             does_not_fit(name)
     _ -> does_not_fit(name)
 
+private vector_fit_message(cx: &Analyzer, name: string, ty: Type) -> string
+    val absent = vector_class_absent(cx)
+
+    if absent != "" then return s"'$name' cannot be a 'vreg' operand: $absent"
+
+    val shown = type_show(ty)
+    val aarch64 = cx.an.tables.target.cpu == Aarch64
+    val sizes = if aarch64 then "64 or 128 bits" else "128 bits"
+
+    ty match
+        Vector(n, elem) ->
+            val lane = lane_bits(cx, *elem)
+
+            if lane == 0 then
+                return s"'$name' is $shown, and a vector register's lanes are 8-, 16-, 32- or 64-bit " +
+                    "integers or binary16, binary32 or binary64 floats"
+
+            s"'$name' is $shown, ${n * lane} bits, and a vector register here holds $sizes. A " +
+                "vector of another width goes through memory, or as several operands of one " +
+                "register each"
+        Floating(_, _) ->
+            s"'$name' is $shown, and a vector register holds an 'f32' or an 'f64' as a scalar"
+        _ ->
+            if fits_register(ty) then
+                s"'$name' is $shown, which lives in a general-purpose register — 'vreg' holds " +
+                    "vectors and floats. Write 'reg' for its class"
+            else
+                s"'$name' is $shown, which fits no register, so it cannot be an assembly operand"
+end vector_fit_message
+
 private does_not_fit(name: string) -> string =
     s"'$name' does not fit a general-purpose register, so it cannot be an assembly operand. " +
         "Operands are the integers, the pointers and 'bool'; anything larger goes through memory"
 
-// Reading and writing one variable is two operands, and two operands may be two registers -- so the
-// spelling that looks like it says "read this and write the answer back" would compile to reading
-// one register and writing a different one.
+// Reading and writing one variable through two operands may be two registers -- so the spelling
+// that looks like it says "read this and write the answer back" would compile to reading one
+// register and writing a different one. One `inout` operand is the spelling that means it.
 private check_no_double_binding(cx: &Analyzer, operands: Buf[AsmOperand])
     for i in 0..<operands.len()
         for j in 0..<i
-            if operands[j].name == operands[i].name &&
-                    is_out(operands[j].dir) != is_out(operands[i].dir) then
-                cx.fault(operands[i].span, s"'${operands[i].name}' is both read and written " +
-                         "here, which is two operands and so possibly two registers — the " +
-                         "instructions would read one and write another. A single operand that " +
-                         "does both is not something this language has yet")
+            val name = crossed_name(operands[i], operands[j])
+
+            if name != "" then
+                cx.fault(operands[i].span, s"'$name' is both read and written here, which is two " +
+                         "operands and so possibly two registers — the instructions would read " +
+                         s"one and write another. Write 'inout $name : ${place_word(operands[i].place)}' " +
+                         "for one operand that does both")
+
+// A name one of two operands reads and the other writes, or nothing.
+private crossed_name(a: AsmOperand, b: AsmOperand) -> string
+    for name in [a.name, a.into.unwrap_or(a.name), b.name, b.into.unwrap_or(b.name)]
+        if (reads_name(a, name) && writes_name(b, name)) || (reads_name(b, name) && writes_name(a, name)) then
+            return name
+
+    ""
+end crossed_name
+
+private place_word(place: AsmPlace) -> string = place match
+    PlaceReg -> "reg"
+    PlaceVreg -> "vreg"
+    PlaceAt(r) -> s"\"$r\""
 
 // Every `{name}` in the instructions has to be an operand. A placeholder nothing declares would
 // reach the assembler as a literal brace and fail there, with a message about the text rather than
@@ -405,7 +565,7 @@ private check_placeholders(cx: &Analyzer, span: Span, lines: Buf[string],
             var declared = false
 
             for k in 0..<operands.len()
-                if operands[k].name == names[j] then declared = true
+                if operands[k].name == names[j] || operands[k].into.unwrap_or(operands[k].name) == names[j] then declared = true
 
             if !declared then
                 cx.fault(span, s"'{${names[j]}}' names an operand this assembly does not " +

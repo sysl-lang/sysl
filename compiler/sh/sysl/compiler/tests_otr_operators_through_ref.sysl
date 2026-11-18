@@ -1,0 +1,367 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// An operator resolves through a `&T` (`reference/generics.md § Operators see through a reference`):
+// an operand held as a counted reference is read through to what it reaches, one level, and the
+// operator is the referent's -- binary, unary, ordering and compound assignment, and a bound on an
+// operator's trait is met through a `&T`. A type with a `Drop`, held only as a `&T`, has operators.
+//
+// The matrix, by axis:
+// - operand shapes: `&T op &T`, `&T op T`, `T op &T`, a literal either side, `&T` vs `&sync T`;
+// - operators: arithmetic (each trait), unary `-`/`~`, `<`/`<=`/`>`/`>=`, chains, `==` mixed;
+// - referent kinds: a value struct, a `Drop` struct (`Rhs`/`Out` are `&T`), a scalar (`&int`);
+// - compound assignment: `&T` place (a new value stored, aliases unchanged), `+:=`, a `T` place
+//   with a `&T` value, a `Drop` place, a place not re-readable (refused), a multi-place write
+//   (refused);
+// - generics: `[T: Add]`, `[T: Add[T]]`, `[T: Ord]`, a member named through the bound (`a.lt(b)`),
+//   a `Drop` type, a scalar instantiation unchanged;
+// - refusals naming `T`: no impl (binary, unary, ordering, compound), a `*T` bound, a trait object,
+//   a second level of reference;
+// - unchanged: `V + V`, `==` on references with no `Eq` stays identity, scalar arithmetic.
+// Not covered here, on purpose: `IndexSet`-style compound writes (refused before this change, and
+// untouched by it).
+
+private otr_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end otr_ready
+
+// What a program PRINTS, built and run.
+private otr_ran(text: string) -> string
+    val root = make_temp_dir("sysl-otr").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    force_alloc_counting(true)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    // Every allocation a run made is given back: a value boxed into a `&T` place by `op=`, and the
+    // result an implementation for a `Drop` type hands back.
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) ->
+            if !out.status.ok() then return s"the program failed: ${out.text}"
+
+            val err = out.err.unwrap_or("")
+
+            if alloc_count_reported(err) != 0 then return s"leaked: $err"
+
+            out.text
+end otr_ran
+
+// Everything a source has to say for itself, taken through the lowering.
+private otr_err(text: string) -> string
+    val root = make_temp_dir("sysl-otr").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end otr_err
+
+// A value type with the operator traits, a literal on either side, and an order.
+private otr_value() -> string = raw"""
+    struct V
+        x: int
+    impl Add for V
+        add(self, rhs: V) -> V = V(self.x + rhs.x)
+    impl Add[int] for V
+        add(self, rhs: int) -> V = V(self.x + rhs)
+    impl Add[V, V] for int
+        add(self, rhs: V) -> V = V(self + rhs.x)
+    impl Sub for V
+        sub(self, rhs: V) -> V = V(self.x - rhs.x)
+    impl Mul[int] for V
+        mul(self, rhs: int) -> V = V(self.x * rhs)
+    impl Neg for V
+        neg(self) -> V = V(-self.x)
+    impl Not for V
+        not(self) -> V = V(~self.x)
+    impl Ord for V
+        lt(self, rhs: V) -> bool = self.x < rhs.x
+    impl Eq for V
+        eq(self, rhs: V) -> bool = self.x == rhs.x
+    """
+
+// A type with a `Drop`, whose implementations take and give `&D`.
+private otr_drop() -> string = raw"""
+    struct D
+        x: int
+    impl Drop for D
+        drop(self) = print("drop", self.x)
+    impl Add[&D, &D] for D
+        add(self, rhs: &D) -> &D = D(self.x + rhs.x)
+    impl Add[int, &D] for D
+        add(self, rhs: int) -> &D = D(self.x + rhs)
+    impl Ord for D
+        lt(self, rhs: D) -> bool = self.x < rhs.x
+    """
+
+@test("two references, a reference and a value, and a value and a reference")
+otr_mixed_operands()
+    if !otr_ready() then return
+
+    assert_eq(otr_ran(otr_value() + raw"""
+        val a: &V = V(1)
+        val b: &V = V(2)
+        val v = V(10)
+        print((a + b).x, (a + v).x, (v + a).x, (a - b).x, (b * 3).x)
+        """), "3 11 11 -1 6\n")
+
+@test("a literal on either side of a reference")
+otr_literal_either_side()
+    if !otr_ready() then return
+
+    assert_eq(otr_ran(otr_value() + raw"""
+        val a: &V = V(1)
+        print((a + 5).x, (5 + a).x, (a * 4).x)
+        """), "6 6 4\n")
+
+@test("the prefix operators read a reference through")
+otr_prefix()
+    if !otr_ready() then return
+
+    assert_eq(otr_ran(otr_value() + raw"""
+        val a: &V = V(1)
+        print((-a).x, (~a).x)
+        """), "-1 -2\n")
+
+@test("every ordering, a chain, and a reference beside its referent")
+otr_orderings()
+    if !otr_ready() then return
+
+    assert_eq(otr_ran(otr_value() + raw"""
+        val a: &V = V(1)
+        val b: &V = V(2)
+        val c: &V = V(3)
+        val v = V(10)
+        print(a < b, a > b, a <= b, b >= a, b <= a)
+        print(a < b < c, c < b < a, a <= a < b)
+        print(a < v, v < a, a == v, v == V(10), a != b)
+        """), "true false true true false\ntrue false true\ntrue false false true true\n")
+
+@test("a reference and a sync reference to one type")
+otr_sync()
+    if !otr_ready() then return
+
+    assert_eq(otr_ran(otr_value() + raw"""
+        val s: &sync V = V(7)
+        val a: &V = V(1)
+        print((s + a).x, (a + s).x, s < a, a < s)
+        """), "8 8 false true\n")
+
+@test("'op=' on a reference stores a new value, and another reference keeps the old one")
+otr_compound_on_a_reference()
+    if !otr_ready() then return
+
+    assert_eq(otr_ran(otr_value() + raw"""
+        val a: &V = V(1)
+        val b: &V = V(2)
+        var r: &V = V(100)
+        val alias = r
+        r += a
+        r += 7
+        r -= b
+        print(r.x, alias.x)
+        val got = (r +:= b)
+        print(got.x, r.x)
+        """), "106 100\n108 108\n")
+
+@test("'op=' on a value with a reference on the right")
+otr_compound_value_place()
+    if !otr_ready() then return
+
+    assert_eq(otr_ran(otr_value() + raw"""
+        val a: &V = V(1)
+        var x = V(10)
+        x += a
+        x -= a
+        x += a
+        print(x.x)
+        """), "11\n")
+
+@test("'op=' on a field held as a reference")
+otr_compound_field()
+    if !otr_ready() then return
+
+    assert_eq(otr_ran(otr_value() + raw"""
+        struct H
+            v: &V
+        var h = H(V(1))
+        h.v += V(4)
+        print(h.v.x)
+        """), "5\n")
+
+@test("a type with a Drop has operators, and each value is dropped once")
+otr_drop_type()
+    if !otr_ready() then return
+
+    assert_eq(otr_ran(otr_drop() + raw"""
+        run()
+            val a = D(1)
+            val b = D(2)
+            print((a + b).x, (a + 10).x, a < b, b < a)
+            var acc = D(0)
+            acc += a
+            acc += 100
+            print(acc.x)
+        run()
+        print("done")
+        """), "3 11 true false\ndrop 11\ndrop 3\ndrop 0\ndrop 1\n101\ndrop 101\ndrop 2\ndrop 1\ndone\n")
+
+@test("a reference to a scalar reads through to the machine's operator")
+otr_scalar_referent()
+    if !otr_ready() then return
+
+    assert_eq(otr_ran(raw"""
+        val n: &int = 4
+        val m: &int = 6
+        print(n + 1, -n, n < 5, n + m, m > n, ~n)
+        """), "5 -4 true 10 true -5\n")
+
+@test("a bound on an operator's trait is met through a reference")
+otr_generic_bounds()
+    if !otr_ready() then return
+
+    assert_eq(otr_ran(otr_value() + raw"""
+        sum[T: Add](a: T, b: T) -> T = a + b
+        twice[T: Add[T]](a: T) -> T = a + a
+        least[T: Ord](a: T, b: T) -> bool = a < b
+        named[T: Ord](a: T, b: T) -> bool = a.lt(b) && a.le(b)
+        negated[T: Neg](a: T) -> T = -a
+        val a: &V = V(1)
+        val b: &V = V(2)
+        print(sum(a, b).x, twice(a).x, least(a, b), least(b, a), named(a, b), named(b, a))
+        print(negated(b).x, sum(3, 4), twice(V(5)).x, least(1, 2))
+        """), "3 2 true false true false\n-2 7 10 true\n")
+
+@test("a bound on an operator's trait is met by a type with a Drop")
+otr_generic_drop()
+    if !otr_ready() then return
+
+    assert_eq(otr_ran(otr_drop() + raw"""
+        total[T: Add](a: T, b: T) -> T = a + b
+        least[T: Ord](a: T, b: T) -> bool = a < b
+        run()
+            val a = D(1)
+            val b = D(2)
+            print(total(a, b).x, least(a, b))
+        run()
+        """), "3 true\ndrop 3\ndrop 2\ndrop 1\n")
+
+@test("a value type's own operators are unchanged, and references with no Eq compare by identity")
+otr_unchanged()
+    if !otr_ready() then return
+
+    assert_eq(otr_ran(otr_value() + raw"""
+        struct W
+            x: int
+        val w1: &W = W(1)
+        val w2: &W = W(1)
+        print((V(1) + V(2)).x, (V(1) + 2).x, (-V(3)).x, V(1) < V(2), 3 + 4, 7 % 4)
+        print(w1 == w2, w1 == w1, w1 === w1, w1 !== w2)
+        """), "3 3 -3 true 7 3\nfalse true true true\n")
+
+@test("a referent with no implementation is named in the refusal, not its reference")
+otr_refusals_name_the_referent()
+    if !otr_ready() then return
+
+    val w = raw"""
+        struct W
+            x: int
+        """
+
+    assert(otr_err(w + "main()\n    val a: &W = W(1)\n    print((a + a).x)\n")
+                    .contains("operator '+' is not defined for W"))
+    assert(otr_err(w + "main()\n    val a: &W = W(1)\n    print(a < a)\n")
+                    .contains("'<' is not defined for W"))
+    assert(otr_err(w + "main()\n    val a: &W = W(1)\n    print((-a).x)\n")
+                    .contains("unary '-' is not defined for W"))
+    assert(otr_err(w + "main()\n    var a: &W = W(1)\n    a += W(2)\n")
+                    .contains("operator '+' is not defined for W"))
+
+@test("a pointer, a trait object and a second level do not read through")
+otr_not_through()
+    if !otr_ready() then return
+
+    val v = raw"""
+        struct V
+            x: int
+        impl Add for V
+            add(self, rhs: V) -> V = V(self.x + rhs.x)
+        trait Shape
+            area(self) -> int
+        impl Shape for V
+            area(self) -> int = self.x
+        """
+
+    assert(otr_err(v + "main()\n    val p: *V = null\n    print((p + p).x)\n")
+                    .contains("operator '+' is not defined for *V"))
+    assert(otr_err(v + "main()\n    val s: &Shape = V(1)\n    print(s + s)\n")
+                    .contains("operator '+' is not defined for &Shape"))
+    assert(otr_err(v + "least[T: Ord](a: T, b: T) -> bool = a < b\nimpl Ord for V\n    " +
+                        "lt(self, rhs: V) -> bool = self.x < rhs.x\nmain()\n    val p: *V = null\n" +
+                        "    print(least(p, p))\n")
+                    .contains("an operator does not see through a pointer"))
+    val twice = otr_err(v + "bump(r: & &V) -> int = (r + r).x\nmain()\n    val inner: &V = V(4)\n" +
+                        "    val outer: & &V = inner\n    print(bump(outer))\n")
+
+    assert(twice.contains("operator '+' is not defined for &V"), twice)
+
+    val ordered = otr_err(v + "impl Ord for V\n    lt(self, rhs: V) -> bool = self.x < rhs.x\n" +
+                          "less(r: & &V) -> bool = r < r\nmain()\n    val inner: &V = V(4)\n" +
+                          "    val outer: & &V = inner\n    print(less(outer))\n")
+
+    assert(ordered.contains("is not defined for &V"), ordered)
+
+@test("'op=' on a reference refuses a place it would work out twice, and a write of several places")
+otr_compound_refusals()
+    if !otr_ready() then return
+
+    val v = raw"""
+        struct V
+            x: int
+        impl Add for V
+            add(self, rhs: V) -> V = V(self.x + rhs.x)
+        pick(i: int) -> int = i
+        """
+
+    assert(otr_err(v + "main()\n    var xs: [2]&V = [V(1), V(2)]\n    xs[pick(0)] += V(5)\n")
+                    .contains("this place would be worked out twice"))
+    assert(otr_err(v + "main()\n    var p: &V = V(1)\n    var q: &V = V(2)\n    p, q += V(1), V(2)\n")
+                    .contains("stores a new value rather than updating one in place"))
+    assert_eq(otr_ran(v + "var xs: [2]&V = [V(1), V(2)]\nval i = 1\nxs[i] += V(5)\nxs[0] += V(9)\n" +
+                      "print(xs[0].x, xs[1].x)\n"), "10 7\n")

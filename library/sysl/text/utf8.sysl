@@ -79,8 +79,11 @@ validate_utf8(b: []const u8) -> Option[int] = first_fault(b) match
 /** The scan the three public forms share: the vector test over sixteen-byte blocks and the table
  * walk described on `from_utf8`.
  */
-private first_fault(b: []const u8) -> Option[Utf8Error]
-    var i: usize = 0
+private first_fault(b: []const u8) -> Option[Utf8Error] = first_fault_from(b, 0)
+
+/** `first_fault` starting at `from`, which must be the start of a character. */
+private first_fault_from(b: []const u8, from: usize) -> Option[Utf8Error]
+    var i = from
     var gap: usize = 16
 
     while i < b.len
@@ -106,7 +109,7 @@ private first_fault(b: []const u8) -> Option[Utf8Error]
                 Invalid(_) -> return Some(Utf8Error(i, false))
 
     None
-end first_fault
+end first_fault_from
 
 /** The same conversion with the validation left out -- the bytes become a `string` and nothing looks
  * at them.
@@ -228,14 +231,9 @@ end scan_at
  * is the case a caller who cannot know has most of the time.
  */
 from_utf8_lossy(b: []const u8) -> string
-    var i: usize = 0
-
-    while i < b.len
-        scan_at(b, i) match
-            Valid(n) -> i += n
-            _ -> return lossy_from(b, i)
-
-    from_utf8_unchecked(b)
+    first_fault(b) match
+        Some(e) -> lossy_from(b, e.offset)
+        None -> from_utf8_unchecked(b)
 end from_utf8_lossy
 
 /** The rebuilding half, entered at the first fault so that the valid prefix is copied once rather
@@ -248,17 +246,18 @@ private lossy_from(b: []const u8, from: usize) -> string
 
     var i = from
 
+    // Each pass replaces the ill-formed run at `i`, then copies the well-formed stretch up to the
+    // next fault in one piece, found by the same vector scan `from_utf8` uses.
     while i < b.len
-        scan_at(b, i) match
-            Valid(n) ->
-                out.bytes.extend(b[i..<i + n])
-                i += n
-            Invalid(n) ->
-                out.push_char(replacement)
-                i += n
-            Truncated(n) ->
-                out.push_char(replacement)
-                i += n
+        out.push_char(replacement)
+        i += scan_at(b, i).width()
+
+        val next = first_fault_from(b, i) match
+            Some(e) -> e.offset
+            None -> b.len
+
+        out.bytes.extend(b[i..<next])
+        i = next
 
     out.finish()
 end lossy_from
