@@ -1,0 +1,283 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.replace_all
+
+// **`===` and `!==` on a trait object compare the object's identity** (`reference/memory.md §
+// References compare through their referent`): the data word beside the table, which is the box the
+// object was made from. Two objects over one value are identical whatever trait each was made
+// against, and an object meets a reference of the concrete type it holds.
+//
+// The matrix: one object / two objects of equal fields; the same object through two coercions of one
+// trait, through two traits, through a trait and the trait it requires; an object against the `&T`
+// it was made from, either side; a copy of the handle; an object kept in a `Buf` and found by
+// identity; an `Option[&Trait]` unwrapped and matched; a chain mixing the kinds; `*Trait` against
+// `*T`; and the refusals that stay (`==` on an object, a concrete type that does not implement the
+// trait, a `&sync` against a `&`, a reference against a pointer).
+//
+// Skipped cells: bare metal and separate compilation, since the lowering is an `extractvalue` and an
+// `icmp` with no runtime or library call; `&sync Trait` against `&sync T`, which is the same handle
+// kind check as `&` and lowered by the same instruction.
+
+private struct ToiRun
+    ok: bool
+    out: string
+    err: string
+
+private toi_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end toi_ready
+
+private toi_run(text: string) -> ToiRun
+    val root = replace_all(make_temp_dir("sysl-toi").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    force_alloc_counting(true)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization,
+                                     Some(s"$root/built"))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            val said = replace_all(failure_text(why), s"$root/", "")
+
+            remove_dir_all(root).unwrap_or(())
+            return ToiRun(false, said, "")
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ToiRun(false, "could not be started", "")
+        Ok(o) -> ToiRun(o.status.ok(), o.text, o.err.unwrap_or(""))
+end toi_run
+
+// The program ran to the end, printed `want`, and gave back every allocation it made.
+private toi_prints(text: string, want: string)
+    val run = toi_run(text)
+
+    assert(run.ok, run.out)
+    assert_eq(run.out, want)
+    assert(alloc_count_reported(run.err) == 0, run.err)
+end toi_prints
+
+// The program is refused, and the report says `want`.
+private toi_refused(text: string, want: string)
+    val run = toi_run(text)
+
+    assert(!run.ok, run.out)
+    assert(run.out.contains(want), run.out)
+end toi_refused
+
+private toi_types() -> string = raw"""
+    trait Shape
+        area(self) -> int
+
+    trait Named
+        name(self) -> string
+
+    trait Solid: Shape
+        depth(self) -> int
+
+    struct Sq
+        v: int
+
+    impl Shape for Sq
+        area(self) -> int = self.v * self.v
+
+    impl Named for Sq
+        name(self) -> string = "sq"
+
+    impl Solid for Sq
+        depth(self) -> int = 1
+
+    struct Plain
+        v: int
+
+    """
+
+@test("one object is identical to itself and to a copy of its handle, and two equal ones are not")
+toi_same_and_different()
+    if !toi_ready() then return
+
+    toi_prints(toi_types() + raw"""
+        main()
+            val a: &Shape = Sq(2)
+            val b: &Shape = Sq(2)
+            val c = a
+
+            print(a === a, a === b, a !== b, a === c, c !== a, b === c)
+        """, "true false true true false false\n")
+
+@test("two objects made from one reference are identical, through one trait, two traits, or a required one")
+toi_through_two_traits()
+    if !toi_ready() then return
+
+    toi_prints(toi_types() + raw"""
+        main()
+            val s: &Sq = Sq(3)
+            val other: &Sq = Sq(3)
+            val a: &Shape = s
+            val b: &Shape = s
+            val n: &Named = s
+            val d: &Solid = s
+            val m: &Named = other
+
+            print(a === b, a === n, n === a, n === d, d === a, a === m, a !== m, n !== d)
+        """, "true true true true true false true false\n")
+
+@test("an object meets the reference it was made from, on either side, and a different one")
+toi_object_and_concrete()
+    if !toi_ready() then return
+
+    toi_prints(toi_types() + raw"""
+        main()
+            val s: &Sq = Sq(3)
+            val t: &Sq = Sq(3)
+            val a: &Shape = s
+
+            print(a === s, s === a, a === t, t !== a, s === t)
+        """, "true true false true false\n")
+
+@test("a chain mixes objects over two traits and the concrete reference, link by link")
+toi_chain()
+    if !toi_ready() then return
+
+    toi_prints(toi_types() + raw"""
+        main()
+            val s: &Sq = Sq(3)
+            val a: &Shape = s
+            val n: &Named = s
+            val other: &Named = Sq(3)
+
+            print(a === s === n, a === n === other, s === a !== other)
+        """, "true false true\n")
+
+@test("an object kept in a Buf is found by identity, and an equal stranger is not")
+toi_find_in_buf()
+    if !toi_ready() then return
+
+    toi_prints(toi_types() + raw"""
+        import sysl.buf.{Buf, buf}
+
+        find(xs: Buf[&Shape], x: &Shape) -> Option[usize]
+            for i in 0..<xs.len()
+                if xs[i] === x then return Some(i)
+
+            None
+
+        main()
+            val kept: &Sq = Sq(2)
+            var xs: Buf[&Shape] = buf()
+
+            xs.push(Sq(2))
+            xs.push(kept)
+            xs.push(Sq(2))
+
+            val as_named: &Named = kept
+
+            print(find(xs, kept).unwrap(), find(xs, Sq(2)).is_none(), xs[1] === as_named, xs[0] === xs[2])
+        """, "1 true true false\n")
+
+@test("an Option of an object is compared once unwrapped or matched, and its None stays apart")
+toi_option()
+    if !toi_ready() then return
+
+    toi_prints(toi_types() + raw"""
+        struct Var
+            determined_by: Option[&Shape]
+
+        holds(v: &Var, c: &Shape) -> bool = v.determined_by match
+            Some(d) -> d === c
+            None -> false
+
+        main()
+            val c: &Shape = Sq(1)
+            val other: &Shape = Sq(1)
+            val v: &Var = Var(Some(c))
+            val w: &Var = Var(None)
+
+            print(holds(v, c), holds(v, other), holds(w, c), v.determined_by.unwrap() === c)
+
+            if holds(v, c) then v.determined_by = None
+
+            print(v.determined_by.is_none())
+        """, "true false false true\ntrue\n")
+
+@test("a pointer to a trait meets a pointer to the value it points at")
+toi_raw_pointers()
+    if !toi_ready() then return
+
+    toi_prints(toi_types() + raw"""
+        main()
+            var x = Sq(4)
+            var y = Sq(4)
+            val px: *Sq = &x
+            val a: *Shape = &x
+            val b: *Named = &x
+            val c: *Shape = &y
+
+            print(a === px, px === a, a === b, a === c, b !== c)
+        """, "true true true false true\n")
+
+@test("== stays undefined on a trait object")
+toi_eq_refused()
+    if !toi_ready() then return
+
+    toi_refused(toi_types() + raw"""
+        main()
+            val s: &Shape = Sq(1)
+            print(s == s)
+        """, "'==' is not defined for &Shape")
+
+@test("an object against a reference whose type does not implement its trait is refused, either side")
+toi_non_conforming_refused()
+    if !toi_ready() then return
+
+    toi_refused(toi_types() + raw"""
+        main()
+            val s: &Shape = Sq(1)
+            val p: &Plain = Plain(1)
+            print(s === p)
+        """, "'===' compares a &Shape with a &Plain, and Plain does not implement Shape, so the two never name one value")
+    toi_refused(toi_types() + raw"""
+        main()
+            val s: &Shape = Sq(1)
+            val p: &Plain = Plain(1)
+            print(p !== s)
+        """, "'!==' compares a &Shape with a &Plain, and Plain does not implement Shape")
+
+@test("an object against a handle of another kind is refused: a pointer, or a reference of another sharing")
+toi_other_kind_refused()
+    if !toi_ready() then return
+
+    toi_refused(toi_types() + raw"""
+        main()
+            var x = Sq(1)
+            val s: &Shape = Sq(1)
+            val p: *Shape = &x
+            print(s === p)
+        """, "'===' compares two references or pointers of one type, got &Shape and *Shape")
+    toi_refused(toi_types() + raw"""
+        main()
+            val s: &Shape = Sq(1)
+            val t: &sync Sq = Sq(1)
+            print(s === t)
+        """, "'===' compares two references or pointers of one type, got &Shape and &sync Sq")
+    toi_refused(toi_types() + raw"""
+        main()
+            val s: &Shape = Sq(1)
+            print(s === 1)
+        """, "'===' compares two references or pointers of one type")

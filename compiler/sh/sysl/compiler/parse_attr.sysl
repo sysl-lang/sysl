@@ -41,7 +41,7 @@ attr_name(p: *Parser) -> string = p.peek_at(1) match
 parse_at_stmt(p: *Parser, start: Span) -> Stmt
     val word = attr_name(p)
 
-    if header_attr_word(word) && !fn_forgo_word(word)
+    if header_attr_word(word) && !fn_forgo_word(word) && word != NoFuseWord
         p.fault(start, "this attribute belongs in the file's header, on the lines directly after 'module' and before everything else — it is a property of the whole module, not of the statements below it")
         skip_line(p)
         return stmt(start.to(p.just_taken()), Bad)
@@ -216,7 +216,7 @@ private member_attr_word(w: string) -> bool
 
     for word in ["crossing", "reads", "writes", "noinline", "inline", "cold", "blocks",
                  "relocates", "views", "consumes", "disjoint", "scoped", "bounded", "joined", "strict_fp",
-                 "reassociate", "track_caller"]
+                 "reassociate", "track_caller", NoFuseWord]
         if word == w then return true
 
     false
@@ -451,6 +451,8 @@ parse_attribute(p: *Parser) -> Option[Attr]
     if word == "strict_fp" then return no_inlining_args(p, StrictFp, "the rounding mode and the exceptions are whatever the floating-point environment holds when the body runs, which is what the annotation says to follow")
     // `@reassociate` takes none: the order is the back end's to choose, so there is nothing to name.
     if word == "reassociate" then return no_inlining_args(p, Reassociate, "the order a regrouped sum is computed in is the back end's to choose, so there is no order to name")
+    // `@no_fuse` takes none: what it turns off is one thing, and there is no degree of it to name.
+    if word == NoFuseWord then return no_inlining_args(p, NoFuse, "what it turns off is the fusing of a multiply with the add it feeds, which a body either has or does not")
     // `@track_caller` takes none: the location it hands on is the call's, which is not something a
     // declaration could name.
     if word == "track_caller" then return no_inlining_args(p, TrackCaller, "the location it hands on is the line of each call, which the call supplies")
@@ -1029,6 +1031,7 @@ apply_func_attrs(f: *FuncDecl, attrs: Buf[Attr])
             Blocks -> f.marks.blocks = true
             StrictFp -> f.marks.strict_fp = true
             Reassociate -> f.marks.reassociate = true
+            NoFuse -> f.marks.no_fuse = true
             TrackCaller -> f.marks.track_caller = true
             Scoped(ns) -> f.marks.scoped = ns
             Bounded(ns) -> f.marks.bounded = ns
@@ -1057,6 +1060,7 @@ apply_member_attrs(m: *MethodDecl, attrs: Buf[Attr])
             Blocks -> m.marks.blocks = true
             StrictFp -> m.marks.strict_fp = true
             Reassociate -> m.marks.reassociate = true
+            NoFuse -> m.marks.no_fuse = true
             TrackCaller -> m.marks.track_caller = true
             Relocates -> m.marks.relocates = true
             Views(_) -> m.marks.views = true
@@ -1331,6 +1335,7 @@ private attributed_refusal(attrs: Buf[Attr]) -> string
         return "'@strict_fp' says how a body's floating-point operations are compiled, so it marks a function or a method, whose body is sysl — and this declares neither. An 'extern''s operations are compiled by whoever compiled it"
 
     if any_is(attrs, "reassociate") then return reassociate_not_a_body()
+    if any_is(attrs, NoFuseWord) then return no_fuse_not_a_body()
 
     if any_is(attrs, "inline(always)")
         return "'@inline(always)' puts a function's body in place of every call to it, so it marks a function or a method — and this declares neither. An 'extern' has no body in this program to put anywhere: its definition is in the object it is linked from"
