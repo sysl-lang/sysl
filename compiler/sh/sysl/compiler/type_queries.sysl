@@ -279,6 +279,39 @@ underlying(t: Type) -> Type = t match
     Volatile(inner) -> underlying(*inner)
     _ -> t
 
+// Whether a value of the type is, or holds by value, a `@unique` struct or enum -- read off the types
+// themselves, at any depth a value is stored at (`unique_moves.sysl`'s `unique_held` asks the
+// declarations). What a value holds by value is finite and holds nothing of its own type, and a
+// reference or a pointer ends the walk, so it needs no list of what it has seen; it allocates nothing,
+// which is what lets the emitter ask it of every value it owns.
+holds_unique_value(t: Type) -> bool = unique_inside(t, 0)
+
+private unique_inside(t: Type, depth: int) -> bool
+    if depth > 64 then return false
+
+    t match
+        Struct(d) ->
+            if d.unique then return true
+
+            for item in d.fields
+                if unique_inside(item.1, depth + 1) then return true
+
+            false
+        Enum(d) ->
+            if d.unique then return true
+            if d.simple then return false
+
+            for v in d.variants
+                for item in v.fields
+                    if unique_inside(item.1, depth + 1) then return true
+
+            false
+        Array(_, elem) -> unique_inside(*elem, depth + 1)
+        Constrained(d) -> unique_inside(d.base, depth + 1)
+        Volatile(inner) -> unique_inside(*inner, depth + 1)
+        _ -> false
+end unique_inside
+
 // Whether the type holds anything that carries a count, which is what says a copy is not a copy.
 contains_counted(t: Type) -> bool = t match
     Ref(_, _) -> true

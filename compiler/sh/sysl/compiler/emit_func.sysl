@@ -55,6 +55,7 @@ gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
 
     e.exposed_now = exposed_in(no_stmts, f.body.result, none)
     begin_moves(e, f.body.stmts, f.body.result)
+    begin_unique(e, f.body.stmts, f.body.result)
 
     // The local every `return` hands back, where it can be built in the caller's result storage.
     e.return_slot = return_plan(e, f)
@@ -82,7 +83,19 @@ gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
         if !zero_sized(p.1)
             val ty = p.1
             val handed = !e.zero_body && e.owned_params.has(owned_key(f.name, j))
-            val owned = owns.has(p.0) || handed
+
+            // A `@unique` value with a destructor is the callee's to drop only where it was handed
+            // over (`owned_params.sysl`); a `(self)` receiver is a copy that owns nothing, and takes
+            // no count of its own either -- one would be a second owner (`emit_unique.sysl`).
+            val reader = value_drops(e, ty) && reads_receiver(f, j)
+            val owned = !reader && (owns.has(p.0) || handed)
+
+            if value_drops(e, ty) && !reader && !handed && !e.zero_body
+                gap_here(e, s"the '@unique' parameter '${p.0}', which this function cannot be handed")
+
+            if reader && rebound(f).has(p.0)
+                gap_here(e, s"a '(self)' member of the '@unique' '${type_show(ty)}' that writes 'self' or " +
+                         "takes its address")
 
             if underlying(ty) == VaList
                 receive_walk(e, p.0)

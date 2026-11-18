@@ -1,0 +1,680 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{join, Search}
+
+// A destructor on a `@unique` value (`design/affine-values.md`, stage U-2; `emit_unique.sysl`): the
+// value's `drop` runs where its owner lets go of it -- at the end of the owner's scope, on every way
+// out, in reverse declaration order with the `defer`s; when the owner is assigned again; at the end of
+// its statement for a temporary -- exactly once, on every path, and never after the value was moved.
+// A local moved on some paths only is dropped by its flag. A trap runs nothing.
+//
+// Every program here is built with the counted heap on, so a value or a field that is never let go of
+// shows up in what the program said; the file is also run under ASan, where a value let go of twice
+// shows up as a fault.
+//
+// The cells: if/else, match, loops (a body's own local each turn, `break`, `continue`, a value
+// reassigned before the next turn), early `return`, `?`, a trap; drop order with nested fields,
+// a tuple, an array, a `defer`; reassignment, of a maybe-moved local too, and a swap; a parameter, a
+// result, a temporary (thrown away, read through, a `(self)` receiver); a generic instance; a
+// `@unique` field inside a `@unique` struct, with and without a destructor of the holder's own; a
+// box; `@consumes`. Then what this stage refuses, each by its sentence.
+//
+// Skipped, with the reason: a library container holding one (refused here, U-3's to build); a
+// pattern binding one, a closure capturing one, a partial move (refused by U-1, later stages); a task
+// cancelled while it holds one -- a task is handed nothing `@unique` (refused below), and a body's own
+// local held across an `await` is let go of by the same scope walk `return` takes, which the cells
+// here cover; `forget` (the library's `sysl.mem` is U-3's).
+
+private var udr_std_cache: Buf[Program] = buf()
+private var udr_std_read: bool = false
+
+private udr_std() -> Buf[Program]
+    if udr_std_read then return udr_std_cache
+
+    udr_std_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> udr_std_cache = units
+
+    udr_std_cache
+end udr_std
+
+private udr_skip() -> bool
+    if udr_std().is_empty() || !clang_available()
+        print("skipped: the standard module's source or the toolchain is not on this machine")
+        return true
+
+    false
+end udr_skip
+
+// Everything analysing one file said about that file, one message to a line.
+private udr_said(text: string) -> string
+    var units: Buf[Program] = buf()
+
+    for item in udr_std()
+        units.push(item)
+
+    units.push(parse(source_of("main.sysl", text)).program)
+
+    val done = analyze_bodies(units, host_target())
+    var out: Buf[string] = buf()
+
+    for item in done.reported
+        if item.src.name == "main.sysl" then out.push(item.diag.message)
+
+    join(out.view(), "\n")
+end udr_said
+
+private udr_refused(text: string, part: string)
+    val said = udr_said(text)
+
+    assert(said.contains(part), s"expected '$part' in: $said")
+
+// What a program built with the counted heap printed, its errors after, or what stopped it building.
+private udr_ran(text: string) -> string
+    val root = make_temp_dir("sysl-udr").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+    force_alloc_counting(true)
+
+    val built = build_native_program(root, None, None, DefaultOptimization, Some(s"$root/built"))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return s"it did not build: ${failure_text(why)}"
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text + out.err.unwrap_or("")
+end udr_ran
+
+private udr_runs(text: string, want: string) = assert_eq(udr_ran(text), want)
+
+// The LLVM text a program lowers to, or the first thing it was refused with, with every gap a body
+// reached after it.
+private udr_ir(text: string) -> string
+    var units: Buf[Program] = buf()
+
+    for item in udr_std()
+        units.push(item)
+
+    units.push(parse(source_of("t.sysl", text)).program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if !done.reported.is_empty() then return done.reported[0].diag.message
+
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+    val said = errors_of(done.an.diagnostics())
+
+    if !said.is_empty() then return analysis_report(said)
+
+    val kept = prune(strip_tests(whole), program_own(units))
+    val lowered = codegen_with_gaps(kept, host_target(), promotions)
+    var gaps = ""
+
+    for item in lowered.1
+        gaps = gaps + s"gap in ${item.0}: ${item.1}\n"
+
+    gaps + ir_print_module(lowered.0)
+end udr_ir
+
+// The body of one function in a module's text, from its `define` to the closing brace.
+private udr_body(ir: string, symbol: string) -> string
+    val lines = ir.lines()
+    var out: Buf[string] = buf()
+    var inside = false
+
+    for line in lines
+        if line.starts_with("define ") && line.contains(s"@$symbol(") then inside = true
+
+        if inside
+            out.push(line)
+
+            if line == "}" then break
+    end for
+
+    join(out.view(), "\n")
+end udr_body
+
+// A `@unique` resource whose destructor says which one it was.
+private val udr_res: string = "@unique\nstruct Res\n    n: int\n\nimpl Drop for Res\n    drop(self) = print(\"drop\", self.n)\n\n"
+
+private val udr_keep: string = "keep(r: Res) = print(\"kept\", r.n)\n\n"
+
+// -- the design's claims ------------------------------------------------------------------------------
+
+@test("locals drop in reverse declaration order, each defer in its place, a moved one skipped")
+udr_drop_order()
+    if udr_skip() then return
+
+    udr_runs(raw"""
+        @unique
+        struct Res
+            name: string
+
+        impl Drop for Res
+            drop(self) = print("drop", self.name)
+
+        main()
+            val a = Res("a")
+            defer print("deferred")
+            val b = Res("b")
+            val c = Res("c")
+            val keep = b
+
+            print("end")
+        """, "end\ndrop b\ndrop c\ndeferred\ndrop a\n")
+
+@test("assignment drops what was there after the right side is worked out, then moves the value in")
+udr_assignment()
+    if udr_skip() then return
+
+    udr_runs(udr_res + raw"""
+        make(n: int) -> Res
+            print("making", n)
+            Res(n)
+
+        main()
+            var r = Res(1)
+
+            r = make(2)
+            print("swapped")
+        """, "making 2\ndrop 1\nswapped\ndrop 2\n")
+
+@test("a local moved on some paths is dropped at its scope's end only where it is still held")
+udr_maybe_moved()
+    if udr_skip() then return
+
+    val text = udr_res + udr_keep + raw"""
+        run(c: bool)
+            val r = Res(1)
+
+            if c then keep(r)
+            print("after")
+
+        main()
+            run(true)
+            run(false)
+        """
+
+    udr_runs(text, "kept 1\ndrop 1\nafter\nafter\ndrop 1\n")
+
+    // The flag is made only for a local some expression may move.
+    val ir = udr_ir(text + "\nstill()\n    val s = Res(9)\n\n    print(s.n)\n")
+
+    assert(!ir.contains("gap in"), ir)
+    assert(udr_body(ir, "run").contains(".held"), udr_body(ir, "run"))
+    assert(!udr_body(ir, "still").contains(".held"), udr_body(ir, "still"))
+
+@test("'@consumes' takes the receiver: the member owns it and drops it at its end; '(self)' reads")
+udr_consumes()
+    if udr_skip() then return
+
+    udr_runs(raw"""
+        @unique
+        struct Res
+            n: int
+
+            peek(self) -> int = self.n
+
+            @consumes
+            close(self, why: string) = print("closing", self.n, why)
+
+        impl Drop for Res
+            drop(self) = print("drop", self.n)
+
+        main()
+            val r = Res(1)
+
+            print(r.peek())
+            r.close("done")
+            print("after")
+        """, "1\nclosing 1 done\ndrop 1\nafter\n")
+
+@test("drop(self) runs before the fields, and the fields drop in declaration order, depth first")
+udr_field_order()
+    if udr_skip() then return
+
+    udr_runs(udr_res + raw"""
+        @unique
+        struct Pair
+            a: Res
+            b: Res
+
+        impl Drop for Pair
+            drop(self) = print("drop pair", self.a.n + self.b.n)
+
+        @unique
+        struct Outer
+            p: Pair
+            c: Res
+
+        main()
+            val o = Outer(Pair(Res(1), Res(2)), Res(3))
+
+            print("built")
+        """, "built\ndrop pair 3\ndrop 1\ndrop 2\ndrop 3\n")
+
+// -- control flow: exactly once on every path ------------------------------------------------------------
+
+@test("if/else and match: a move in an arm, in every arm, and in none")
+udr_branches()
+    if udr_skip() then return
+
+    udr_runs(udr_res + udr_keep + raw"""
+        both(c: bool)
+            val r = Res(1)
+
+            if c then keep(r) else keep(r)
+            print("both")
+
+        neither(c: bool)
+            val r = Res(2)
+
+            if c then print("yes", r.n) else print("no", r.n)
+
+        arms(n: int)
+            val r = Res(n)
+
+            n match
+                0 -> keep(r)
+                1 -> print("one")
+                _ -> print("many", r.n)
+
+            print("matched")
+
+        main()
+            both(true)
+            both(false)
+            neither(true)
+            arms(0)
+            arms(1)
+            arms(2)
+        """, "kept 1\ndrop 1\nboth\nkept 1\ndrop 1\nboth\nyes 2\ndrop 2\nkept 0\ndrop 0\nmatched\none\n" +
+             "matched\ndrop 1\nmany 2\nmatched\ndrop 2\n")
+
+@test("loops: a body's own local each turn, break, continue, and an outer one moved and refilled")
+udr_loops()
+    if udr_skip() then return
+
+    udr_runs(udr_res + udr_keep + raw"""
+        main()
+            for i in 0..<3
+                val r = Res(i)
+
+                if i == 1 then continue
+                if i == 2 then break
+
+                print("turn", r.n)
+
+            var r = Res(10)
+
+            for i in 0..<2
+                keep(r)
+                r = Res(20 + i)
+
+            var n = 0
+
+            while n < 2
+                val t = Res(30 + n)
+
+                n += 1
+
+                if n == 2
+                    keep(t)
+                    break
+
+            print("end")
+        """, "turn 0\ndrop 0\ndrop 1\ndrop 2\nkept 10\ndrop 10\nkept 20\ndrop 20\ndrop 30\nkept 31\ndrop 31\n" +
+             "end\ndrop 21\n")
+
+@test("an early return, a '?' that fails and a value broken out of a loop drop exactly once")
+udr_early_exits()
+    if udr_skip() then return
+
+    udr_runs(udr_res + raw"""
+        early(c: bool) -> int
+            val r = Res(1)
+
+            if c then return 0
+
+            val s = Res(2)
+
+            print("late", r.n + s.n)
+            3
+
+        fails(ok: bool) -> Result[int, string]
+            val r = Res(5)
+            val v: Result[int, string] = if ok then Ok(1) else Err("no")
+            val got = v?
+
+            print("got", got, r.n)
+            Ok(got)
+
+        found() -> Res
+            var i = 0
+
+            val r = loop
+                i += 1
+
+                if i == 3 then break Res(i)
+
+            print("broke")
+            r
+
+        main()
+            print(early(true))
+            print(early(false))
+            print(fails(true).is_ok())
+            print(fails(false).is_ok())
+
+            val f = found()
+
+            print("found", f.n)
+        """, "drop 1\n0\nlate 3\ndrop 2\ndrop 1\n3\ngot 1 5\ndrop 5\ntrue\ndrop 5\nfalse\nbroke\nfound 3\ndrop 3\n")
+
+@test("a trap runs nothing: no destructor and no defer")
+udr_trap()
+    if udr_skip() then return
+
+    val got = udr_ran(udr_res + raw"""
+        main()
+            val r = Res(1)
+
+            defer print("deferred")
+            print("before")
+
+            val xs = [1, 2]
+            var i = 2
+
+            print(xs[i])
+        """)
+
+    assert(got.starts_with("before\n"), got)
+    assert(!got.contains("drop"), got)
+    assert(!got.contains("deferred"), got)
+
+// -- reassignment ------------------------------------------------------------------------------------------
+
+@test("reassignment: a held value is dropped, a moved one is not, and a swap drops nothing")
+udr_reassignment()
+    if udr_skip() then return
+
+    udr_runs(udr_res + udr_keep + raw"""
+        refill(c: bool)
+            var r = Res(1)
+
+            if c then keep(r)
+
+            r = Res(2)
+            print("refilled", r.n)
+
+        main()
+            refill(true)
+            refill(false)
+
+            var a = Res(7)
+            var b = Res(8)
+
+            (a, b) = (b, a)
+            print("swapped", a.n, b.n)
+        """, "kept 1\ndrop 1\nrefilled 2\ndrop 2\ndrop 1\nrefilled 2\ndrop 2\nswapped 8 7\ndrop 7\ndrop 8\n")
+
+@test("a field of a '@unique' holder assigned through a pointer drops what it held")
+udr_field_assignment()
+    if udr_skip() then return
+
+    udr_runs(udr_res + raw"""
+        @unique
+        struct Wallet
+            r: Res
+
+        swap_in(w: *Wallet, n: int)
+            w.r = Res(n)
+
+        main()
+            var w = Wallet(Res(1))
+
+            swap_in(&w, 2)
+            print("in", w.r.n)
+            w.r = Res(3)
+            print("again", w.r.n)
+        """, "drop 1\nin 2\ndrop 2\nagain 3\ndrop 3\n")
+
+// -- parameters, results, temporaries ----------------------------------------------------------------------
+
+@test("a parameter is the callee's: dropped at its end unless handed on; a result is the caller's")
+udr_parameters()
+    if udr_skip() then return
+
+    udr_runs(udr_res + udr_keep + raw"""
+        relay(r: Res) = keep(r)
+
+        maybe(r: Res, c: bool)
+            if c then keep(r)
+            print("maybe done")
+
+        make(n: int) -> Res = Res(n)
+
+        pass(r: Res) -> Res = r
+
+        main()
+            relay(Res(1))
+            maybe(Res(2), true)
+            maybe(Res(3), false)
+
+            val m = pass(make(4))
+
+            print("got", m.n)
+        """, "kept 1\ndrop 1\nkept 2\ndrop 2\nmaybe done\nmaybe done\ndrop 3\ngot 4\ndrop 4\n")
+
+@test("a temporary drops at the end of its statement: thrown away, read through, or a receiver")
+udr_temporaries()
+    if udr_skip() then return
+
+    udr_runs(raw"""
+        @unique
+        struct Res
+            n: int
+
+            peek(self) -> int = self.n
+
+        impl Drop for Res
+            drop(self) = print("drop", self.n)
+
+        make(n: int) -> Res = Res(n)
+
+        main()
+            make(1)
+            print("after one")
+            print(make(2).n)
+            print(make(3).peek() + 1)
+            print("end")
+        """, "drop 1\nafter one\n2\ndrop 2\n4\ndrop 3\nend\n")
+
+@test("a generic instance at a '@unique' type hands its value over and drops what it owns")
+udr_generics()
+    if udr_skip() then return
+
+    udr_runs(udr_res + raw"""
+        pass[T](x: T) -> T = x
+
+        sink[T](x: T) = print("sunk")
+
+        @unique
+        struct Holder[T]
+            v: T
+
+        impl[T] Drop for Holder[T]
+            drop(self) = print("drop holder")
+
+        main()
+            val r = pass(Res(1))
+
+            sink(Res(2))
+
+            val h = Holder(Res(3))
+
+            print("end", r.n, h.v.n)
+        """, "sunk\ndrop 2\nend 1 3\ndrop holder\ndrop 3\ndrop 1\n")
+
+// -- holders -------------------------------------------------------------------------------------------------
+
+@test("a '@unique' field inside a '@unique' struct, a tuple and an array drop with their holder")
+udr_holders()
+    if udr_skip() then return
+
+    udr_runs(udr_res + udr_keep + raw"""
+        @unique
+        struct Wallet
+            label: string
+            r: Res
+
+        main()
+            val r = Res(1)
+            val w = Wallet("w", r)
+            val p = (Res(2), 5)
+            val a = [Res(3), Res(4)]
+            val moved = Wallet("m", Res(6))
+            val kept = moved
+
+            print(w.label, w.r.n, p.1, a[1].n, kept.r.n)
+        """, "w 1 5 4 6\ndrop 6\ndrop 3\ndrop 4\ndrop 2\ndrop 1\n")
+
+@test("a box of a '@unique' value drops it once, when the count reaches zero")
+udr_box()
+    if udr_skip() then return
+
+    udr_runs(udr_res + raw"""
+        main()
+            val b: &Res = Res(1)
+            val c = b
+
+            print("shared", b.n, c.n)
+        """, "shared 1 1\ndrop 1\n")
+
+@test("a simple '@unique' enum and one carrying a value run their destructors")
+udr_enums()
+    if udr_skip() then return
+
+    udr_runs(udr_res + raw"""
+        @unique
+        enum Light
+            Red
+            Green
+
+        impl Drop for Light
+            drop(self) = print("light off")
+
+        @unique
+        enum Slot
+            Empty
+            Full(r: Res)
+
+        main()
+            val l = Green
+            val s = Full(Res(1))
+            val e: Slot = Empty
+
+            print("lit")
+        """, "lit\ndrop 1\nlight off\n")
+
+// -- the whole-program rules ---------------------------------------------------------------------------------
+
+@test("'@no_alloc': building, moving and dropping allocates nothing, and the destructor is held to it")
+udr_no_alloc()
+    if udr_skip() then return
+
+    val clean = udr_res + udr_keep + "@no_alloc\nwork(n: int)\n    val r = Res(n)\n    val s = r\n\n    keep(s)\n"
+
+    assert_eq(udr_said(clean), "")
+
+    udr_refused(raw"""
+        @unique
+        struct Res
+            n: int
+
+        impl Drop for Res
+            drop(self)
+                val b: &int = self.n
+                print(b)
+
+        @no_alloc
+        work(n: int)
+            val r = Res(n)
+        """, "which makes")
+
+@test("'@abandons': a '@unique' parameter is refused, and so is one held across a call that can reach one")
+udr_abandons()
+    if udr_skip() then return
+
+    udr_refused(udr_res + "@abandons\nstop(r: Res) -> never\n    loop\n        ()\n",
+                "so it never comes back to drop its parameter 'r'")
+
+    udr_refused(udr_res + raw"""
+        @abandons
+        stop(code: int) -> never
+            loop
+                ()
+
+        work()
+            val r = Res(1)
+
+            stop(1)
+        """, "'r'")
+
+// -- what this stage refuses -----------------------------------------------------------------------------------
+
+@test("what this stage cannot honour yet is refused, naming the form")
+udr_not_yet()
+    if udr_skip() then return
+
+    val not_yet = "and 'Res' is '@unique' — this is not supported yet"
+
+    udr_refused(udr_res + "main()\n    val o = Some(Res(1))\n", "this makes a 'Option[Res]', which holds 'Res' by value, " + not_yet)
+    udr_refused(udr_res + udr_keep + "main()\n    val f = keep\n\n    f(Res(1))\n",
+                "this hands 'Res' by value to a call through a pointer, " + not_yet)
+    udr_refused(udr_res + "main()\n    val f = (r: Res) -> r.n\n",
+                "a closure taking 'r' by value, and 'Res' is '@unique' with a 'Drop'")
+    udr_refused(udr_res + "async work(r: Res) -> int = r.n\n",
+                "an 'async' function taking 'r' by value, and 'Res' is '@unique' with a 'Drop'")
+    udr_refused(raw"""
+        @unique
+        struct Res
+            n: int
+
+            @consumes
+            close(*self) = print(self.n)
+
+        impl Drop for Res
+            drop(self) = print("drop")
+        """, "'close' is '@consumes' and takes '*self', and 'Res' is '@unique' with a 'Drop'")
+    udr_refused(raw"""
+        @unique
+        struct Big
+            words: [20]int
+
+        impl Drop for Big
+            drop(self) = print("drop")
+        """, "a '@unique' value with a destructor larger than 128 bytes is not supported yet")
+
+    // Without a destructor, U-1's token is unchanged: an 'Option' of one is fine.
+    assert_eq(udr_said("@unique\nstruct Token\n    n: int\n\nmain()\n    val o = Some(Token(1))\n"), "")

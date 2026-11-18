@@ -61,7 +61,17 @@ check_abandons_signature(a: &Analysis, scope: Scope, at: Span, name: string, gen
         if contains_counted(p.1)
             a.fault(scope, at, s"'${name}' is '@abandons', so its caller's frame is given back before the call and nothing is left to give back the count its parameter '${p.0}' holds — a '${type_show(p.1)}' carries one. Pass what it needs as a value that carries no count, or through a '*T'")
             return
+
+        unique_drop_held(a, p.1) match
+            Some(held) ->
+                a.fault(scope, at, s"'${name}' is '@abandons', so it never comes back to drop its parameter '${p.0}' — a '${type_show(p.1)}' holds the '@unique' '${type_show(held)}', whose destructor would never run. Pass a '*${type_show(p.1)}' instead")
+                return
+            None -> ()
 end check_abandons_signature
+
+// Whether a value of this type, held across a call that can abandon the frame, would be given back by
+// nothing: it carries a count, or holds a `@unique` value with a destructor.
+private held_across(a: &Analysis, t: Type) -> bool = contains_counted(t) || unique_drop_held(a, t).is_some()
 
 // -- the program --------------------------------------------------------------------------------------
 
@@ -124,13 +134,20 @@ check_abandons(a: &Analysis, funcs: Buf[TFunc], externs: Buf[TExtern], vtables: 
         cx.scope = func_home(a, f.name)
         cx.is_async = f.marks.is_async()
 
-        scan_block(a, cx, f.body, held_on_entry(f))
+        scan_block(a, cx, f.body, held_on_entry(a, f))
 end check_abandons
 
 // What a frame holds before its body has run: nothing, because a parameter is its caller's to hold
 // (`borrowing.sysl`) -- except where something outside sysl's convention may call it, when the
-// count it arrived with is the frame's own.
-private held_on_entry(f: TFunc) -> string
+// count it arrived with is the frame's own, and a `@unique` value with a destructor, which the callee
+// is handed and drops (`design/affine-values.md` § 7). A `(self)` receiver of one owns nothing.
+private held_on_entry(a: &Analysis, f: TFunc) -> string
+    for j in 0..<f.params.len()
+        val p = f.params[j]
+
+        if unique_drop_held(a, p.1).is_some() && !(j == 0 && p.0 == "self" && !f.marks.consumes)
+            return s"the parameter '${shown_local(p.0)}'"
+
     if f.exported.is_none() && f.conv.is_none() then return ""
 
     for p in f.params
@@ -170,7 +187,7 @@ private scan_stmts(a: &Analysis, cx: &Abandoning, stmts: Buf[TStmt], held: strin
             TVarDecl(name, ty, init, _) ->
                 scan(a, cx, init, h)
 
-                if h == "" && contains_counted(ty) then h = s"'${shown_local(name)}'"
+                if h == "" && held_across(a, ty) then h = s"'${shown_local(name)}'"
             TExprStmt(e) -> scan(a, cx, e, h)
             TInvariant(cond, _) -> scan(a, cx, cond, h)
             TVariantCheck(_, _, e) -> scan(a, cx, e, h)
@@ -262,7 +279,7 @@ private scan(a: &Analysis, cx: &Abandoning, e: TExpr, held: string)
 
             var h = with_temp(held, seq)
 
-            if h == "" && contains_counted(elem_ty) then h = s"'${shown_local(name)}'"
+            if h == "" && held_across(a, elem_ty) then h = s"'${shown_local(name)}'"
 
             val _ = scan_stmts(a, cx, body, h)
 
@@ -272,7 +289,7 @@ private scan(a: &Analysis, cx: &Abandoning, e: TExpr, held: string)
 
             var h = held
 
-            if h == "" && contains_counted(cursor_ty) then h = s"'${shown_local(cursor)}'"
+            if h == "" && held_across(a, cursor_ty) then h = s"'${shown_local(cursor)}'"
 
             scan(a, cx, next, h)
 

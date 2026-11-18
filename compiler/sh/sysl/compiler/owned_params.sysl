@@ -48,13 +48,19 @@ owned_params(e: *Emit, p: TProgram) -> Set[string]
     for i in 0..<p.funcs.len()
         val f = p.funcs[i]
 
+        // **A `@unique` value with a destructor is always handed over** (`emit_unique.sysl`): it is
+        // never copied, so a callee that is passed one owns it, and drops it at its end unless it moves
+        // it on. A `(self)` receiver is the exception: a copy that owns nothing.
+        for j in 0..<f.params.len()
+            if value_drops(e, f.params[j].1) && !reads_receiver(f, j) then owned.add(owned_key(f.name, j))
+
         if !may_own(f) then continue
 
         for j in 0..<f.params.len()
-            if may_own_param(e, f, j) then asks.push((f, j))
+            if may_own_param(e, f, j) && !value_drops(e, f.params[j].1) then asks.push((f, j))
 
-    // Every candidate starts owned and is let go once some way out of its body is found not to keep
-    // it. An answer only turns off as the answers it reads do, so the rounds settle -- on the largest
+    // Every other candidate starts owned and is let go once some way out of its body is found not to
+    // keep it. An answer only turns off as the answers it reads do, so the rounds settle -- on the largest
     // agreeing answer, which is what lets a recursive call that hands the parameter on count as keeping
     // it: `ping` calling `pong` calling `ping`, with a store at the bottom, owns all the way down.
     for item in asks
@@ -725,7 +731,10 @@ private owned_entry(e: *Emit, f: TFunc, sig: IrFuncSig) -> IrFunc
     for j in 0..<f.params.len()
         val p = f.params[j]
 
-        if e.owned_params.has(owned_key(f.name, j)) then retain_value(e, p.1, VReg(s"${p.0}.param"))
+        // A `@unique` value with a destructor is handed over through the entry as well: whoever
+        // reaches it gives its value up, as a direct caller does.
+        if e.owned_params.has(owned_key(f.name, j)) && !value_drops(e, p.1)
+            retain_value(e, p.1, VReg(s"${p.0}.param"))
 
         if e.lent_params.has(owned_key(f.name, j))
             val slot = alloca(e, VReg(s"${p.0}.lent"), lty(e, p.1))
