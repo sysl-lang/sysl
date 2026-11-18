@@ -1,6 +1,6 @@
 ---
 title: The poll module
-summary: "`sysl.io.poll` — the kernel's readiness set: `Poller.open`, `register`, `modify` and `deregister` with a token and a `Mode`, a `wait` that fills the caller's slice and allocates nothing, and a `Waker` that ends a wait from any thread. kqueue on Darwin and the BSDs, epoll on Linux."
+summary: "`sysl.io.poll` — the kernel's readiness set: `Poller.open`, `register`, `modify` and `deregister` with a token and a `Mode`, a `wait` that fills the caller's slice and allocates nothing, a `Waker` that ends a wait from any thread, a `WakeFd` that is a wake registered like a descriptor, and `fd()` for nesting one poller in another. kqueue on Darwin and the BSDs, epoll on Linux."
 weight: 77
 ---
 
@@ -200,11 +200,70 @@ The first wait has no time limit and still answers at once; the second waits its
 the wake having been spent. Under kqueue the wake is an `EVFILT_USER` event on the set itself; under
 epoll it is an `eventfd` registered in the set, drained by the wait that sees it.
 
+## A wake that is a descriptor
+
+**`WakeFd` is a wake you register**, where a `Waker` is one that ends a wait and is never an event.
+It is a descriptor — Linux's `eventfd`, and a pipe on a system without one — readable once something
+has called `wake` and until `drain` takes the wakes back. So it comes back from `wait` as an event
+with the token it was registered with, and it works wherever a descriptor does: in several pollers at
+once, in a poller nested in another, in `sysl.io.wait.ready`, or in an event loop that is not this
+module's.
+
+```sysl
+import sysl.io.poll.{Event, Poller, WakeFd}
+import sysl.io.wait.Readable
+import sysl.time.millis
+
+val p = Poller.open().unwrap()
+val w = WakeFd.open().unwrap()
+var got = [Event.none; 4]
+
+p.register(w.fd(), [Readable], 7).unwrap()
+
+for _ in 0..<3 do w.wake().unwrap()
+
+print(p.wait(got[..], None))
+print(got[0].token)
+print(w.drain())
+print(p.wait(got[..], Some(millis(10))))
+```
+
+```output
+Ok(1)
+7
+Ok(true)
+Ok(0)
+```
+
+**Wakes coalesce**: any number before a `drain` leave the descriptor readable once, one `drain` takes
+them all, and a `wake` never blocks and never fails for there being too many — a full counter or a
+full pipe is a wake nobody has taken yet. A program drains when it sees the event and then looks at
+its own state, rather than counting wakes; `drain` answers whether there was anything to take, and
+never waits.
+
+**Every copy shares one**, held as a `&sync`, so a `WakeFd` is captured by another thread's closure
+as a `Poller` is, and its descriptors are closed when the last copy goes. `open` fails only as the
+descriptors run out — an `eventfd` takes one, a pipe two.
+
+## The poller's own descriptor
+
+**`fd()` lends the set's own descriptor** — the kqueue or the epoll instance — for a call this module
+does not make. Registered in another poller it reports the inner one readable while a `wait` on it
+would find something, which is how one poller is nested in another, and an outer event loop that
+wants one descriptor to watch is handed this one. **Readable is "look", not a promise**: a
+descriptor that was ready and no longer is may keep the set readable until a `wait` on it looks again
+— kqueue rechecks only then — and that wait answers zero, so the outer loop waits on the inner poller
+with a zero timeout and takes what it gets. A pending wake from the inner poller's `Waker` shows
+too, until the inner `wait` takes it. The descriptor is lent, not given: the poller closes it when its
+last copy and its last `Waker` go. A poller registered in itself is refused by both kernels with the
+error of an invalid argument (code 22).
+
 ## Where there is no kqueue or epoll
 
 A hosted POSIX target with neither answers every call with the error
 [`sysl.fs.unsupported()`](/library/fs/) stands for, as `sysl.io.wait` does where there is no `poll`.
 Each call is `@needs(os)`. On a target with no C library the module reaches five hooks in
 `sysl.io.sys` — `sysl_io_poll_open`, `sysl_io_poll_control`, `sysl_io_poll_wait`, `sysl_io_poll_wake`
-and `sysl_io_poll_close` — which the program answers with an `@export` of its own, or is refused by
-name when it is compiled.
+and `sysl_io_poll_close` — and a `WakeFd` four more, `sysl_io_wakefd_open`, `sysl_io_wakefd_wake`,
+`sysl_io_wakefd_drain` and `sysl_io_wakefd_close` — which the program answers with an `@export` of
+its own, or is refused by name when it is compiled.

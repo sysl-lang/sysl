@@ -1,0 +1,150 @@
+module sysl.math.bigint
+
+// Division for large operands: Burnikel and Ziegler's recursive division ("Fast Recursive
+// Division", Max-Planck-Institut für Informatik research report MPI-I-98-1-022, 1998).
+//
+// **Algorithm D is quadratic however the multiply is done**, because it produces one limb of quotient
+// per pass over the divisor. The recursive division produces HALF the quotient per step, by dividing
+// the top of the dividend by the top HALF of the divisor and correcting with one multiplication by
+// the bottom half -- which is where Karatsuba's speed comes back in. Its cost is about twice a
+// multiplication of the same size, against algorithm D's `n^2`.
+//
+// The two procedures call each other, and the names are the paper's:
+//
+// - `div_2n_1n` divides a `2n`-limb value by an `n`-limb divisor, as two `div_3n_2n` steps of `n/2`
+//   limbs of quotient each;
+// - `div_3n_2n` divides a `3h`-limb value by a `2h`-limb divisor, guessing its quotient from the top
+//   `2h` limbs over the divisor's top `h` (a `div_2n_1n` one size down), then taking the guess times
+//   the divisor's bottom half off and adding the divisor back while the remainder is negative --
+//   which the paper shows happens at most twice.
+//
+// **Both need the divisor normalized** (its top bit set), for the same reason algorithm D does, and
+// `div_2n_1n` needs `n` even all the way down to where it hands over to algorithm D. So the top level
+// scales both operands: by a power of two to set the divisor's top bit, and by a power of the limb
+// radix to make its length `m 2^k` with `m` below the threshold. Neither changes the quotient, and
+// the remainder is scaled back. Every step's precondition -- the value below `divisor * B^n` -- is
+// what the previous step's remainder being below the divisor gives.
+
+/** The divisor length in limbs at which the recursive division takes over from algorithm D. */
+private[bigint] val dc_threshold: usize = 48
+
+/** `(quotient, remainder)` for `a >= b`, `b` past the threshold. */
+private[bigint] divide_recursive(a: []const Limb, b: []const Limb) -> ([]const Limb, []const Limb)
+    var m = b.len
+    var k: usize = 0
+
+    while m > dc_threshold
+        m = (m + 1) / 2
+        k += 1
+
+    val n = m << k
+    val extra = n - b.len
+    val shift = usize(b[b.len - 1].leading_zeros())
+    val bu = scaled(b, shift, extra)
+    val au = scaled(a, shift, extra)
+
+    // The dividend a block of `n` limbs at a time from the top, each step's remainder carried into
+    // the next as its upper half: long division with digits of `B^n`.
+    val blocks = (au.len + n - 1) / n
+    var q: []Limb = [0; blocks * n]
+    var r = empty()
+    var i = blocks
+
+    while i > 0
+        i -= 1
+
+        val hi = if (i + 1) * n < au.len then (i + 1) * n else au.len
+        val cur = add_mag(shifted_up(r, n), trim(au[i * n..<hi]))
+        val (qi, ri) = div_2n_1n(cur, bu, n)
+
+        copy_n(q[i * n..], qi, qi.len)
+        r = ri
+
+    // The remainder is scaled by `2^shift B^extra`, and its bottom `extra` limbs are zero.
+    val rest = if r.len > extra then r[extra..] else empty()
+    var out: []Limb = [0; rest.len + 1]
+
+    copy_n(out, rest, rest.len)
+
+    if shift > 0 && rest.len > 0 then rshift(out, out, rest.len, shift)
+
+    (finished(q, blocks * n), finished(out, rest.len))
+end divide_recursive
+
+/** `x * 2^shift * B^extra`, as a magnitude. */
+private scaled(x: []const Limb, shift: usize, extra: usize) -> []const Limb
+    var out: []Limb = [0; x.len + extra + 1]
+
+    if shift == 0
+        copy_n(out[extra..], x, x.len)
+    else
+        out[extra + x.len] = lshift(out[extra..], x, x.len, shift)
+
+    finished(out, x.len + extra + 1)
+end scaled
+
+/** `x * B^k`: `k` zero limbs under it. */
+private shifted_up(x: []const Limb, k: usize) -> []const Limb
+    if x.len == 0 then return x
+
+    var out: []Limb = [0; x.len + k]
+
+    copy_n(out[k..], x, x.len)
+    out
+end shifted_up
+
+/** A run of limbs with the zeros at its top dropped -- a piece cut out of a magnitude, made one. */
+private trim(x: []const Limb) -> []const Limb = x[0..<top_of(x, x.len)]
+
+/** The limbs at and above `k`, which is `x / B^k`. */
+private above(x: []const Limb, k: usize) -> []const Limb = if x.len > k then x[k..] else empty()
+
+/** The limbs below `k`, which is `x mod B^k`. */
+private below(x: []const Limb, k: usize) -> []const Limb = trim(x[0..<(if x.len < k then x.len else k)])
+
+/** `a / b` and `a mod b` for `a < b * B^n`, `b` normalized and exactly `n` limbs. */
+private div_2n_1n(a: []const Limb, b: []const Limb, n: usize) -> ([]const Limb, []const Limb)
+    if n % 2 == 1 || n <= dc_threshold
+        if cmp_mag(a, b) < 0 then return (empty(), a)
+
+        return long_divide(a, b)
+
+    val h = n / 2
+    val (q1, r1) = div_3n_2n(above(a, h), b, h)
+    val (q2, r) = div_3n_2n(add_mag(shifted_up(r1, h), below(a, h)), b, h)
+
+    (add_mag(shifted_up(q1, h), q2), r)
+end div_2n_1n
+
+/** `a / b` and `a mod b` for `a < b * B^h`, `b` normalized and exactly `2h` limbs. */
+private div_3n_2n(a: []const Limb, b: []const Limb, h: usize) -> ([]const Limb, []const Limb)
+    val b1 = above(b, h)
+    val b2 = below(b, h)
+    val a12 = above(a, h)
+    var qhat = empty()
+    var r1 = empty()
+
+    if cmp_mag(above(a, h * 2), b1) < 0
+        val (q, r) = div_2n_1n(a12, b1, h)
+
+        qhat = q
+        r1 = r
+    else
+        // The guess is `B^h - 1`, every limb set, and `a12 - qhat b1` is `a12 - b1 B^h + b1`.
+        var ones: []Limb = [0; h]
+
+        for i in 0..<h do ones[i] = ~Limb(0)
+
+        qhat = ones
+        r1 = sub_mag(add_mag(a12, b1), shifted_up(b1, h))
+
+    val d = mul_mag(qhat, b2)
+    var t = add_mag(shifted_up(r1, h), below(a, h))
+
+    // The remainder `t - d` is negative while the guess is too large; the paper bounds this at two.
+    while cmp_mag(t, d) < 0
+        qhat = sub_mag(qhat, mag_of_u64(1))
+        t = add_mag(t, b)
+
+    (qhat, sub_mag(t, d))
+end div_3n_2n
