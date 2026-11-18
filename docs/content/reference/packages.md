@@ -753,6 +753,30 @@ error_traces = false
 does the same for one build. Like `bounds_locations`, the key is `true` or `false`, is read from the
 root project only, and anything else is refused when the file is read.
 
+## Overflow that traps in every build
+
+A plain integer overflow [stops a debug build and wraps in a release one](/reference/types/#arithmetic-wraps).
+A package whose overflow is a fault however it is built says so once:
+
+```hocon
+checked_overflow = true
+```
+
+Every plain integer `+`, `-`, `*`, unary `-`, compound assignment, `++` and `--` and every written
+integer conversion in the package's own files is then checked in every build, exactly as
+[`@checked`](/reference/attributes/#checked-integer-overflow-that-traps-in-every-build) checks one
+function: the same report, nothing made to wrap that did not, `+%`, `+|` and `T.wrap(n)` keeping
+their meaning, and a `const` function of the package refusing a constant whose evaluation overflows.
+
+**Unlike the keys above, a dependency's `checked_overflow` is read, and covers that dependency.** It
+is a statement about the package's code rather than about how the consumer's program is built, so a
+package that says it keeps its promise inside any program, and its files only: the program using it,
+and the other packages it uses, keep the mode's meaning unless they say so too. A root that says it
+does not reach a dependency that does not. A file belongs to the package whose root holds it.
+
+The key is `true` or `false` — `false`, the default, leaves overflow to the mode — and anything else
+is refused when the file is read.
+
 ## Linking a freestanding image
 
 A kernel, or a board's firmware, is an ELF image nothing loads: an emulator or a debug probe puts it

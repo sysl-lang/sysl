@@ -922,6 +922,7 @@ before the program stops. So `defer` is for releasing a resource, not for restor
 | `T::Succ` past `T::Last`, `T::Pred` below `T::First` | below |
 | overflow of `+`, `-`, `*` where an operand came through a ranged type | below |
 | in a **debug build**, overflow of a plain `+`, `-`, `*`, a unary `-`, or a written integer conversion | `i8(200)`, `x * 2` past the width |
+| the same in **every build**, inside a [`@checked`](/reference/attributes/#checked-integer-overflow-that-traps-in-every-build) function or block, or in a package that says [`checked_overflow = true`](/reference/packages/#overflow-that-traps-in-every-build) | `x * 2` past the width |
 
 **A build is debug or release, and the one difference is integer overflow.** `sysl test` and `sysl
 run` build in debug; `sysl build` and every other command build in release; `--debug` and

@@ -212,6 +212,11 @@ struct Manifest
     // The chip's memory, the sections a package places, the symbols a start-up expects, and the
     // root's `layout` blocks: what a generated linker script is made from (`memory_map.sysl`).
     memory: MemoryMap
+
+    // `checked_overflow = true`: every plain integer `+`, `-`, `*`, unary `-` and written conversion
+    // in this package's own files traps on overflow whatever the build mode (`checked.sysl`). Unlike
+    // the keys above it, a dependency's is read and applies to that dependency's files.
+    checked_overflow: Option[bool]
 end Manifest
 
 // What a package's `test` block says about running its suite (`read_test_settings`). Each is a
@@ -244,7 +249,8 @@ no_test_settings() -> TestSettings = TestSettings(None, None, buf(), None, buf()
 empty_manifest() -> Manifest =
     Manifest("", "", "", "", buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), None,
              buf(), None, None, None, buf(), None, false, "", None, buf(), buf(), buf(), None, buf(),
-             buf(), buf(), no_test_settings(), None, buf(), buf(), buf(), buf(), buf(), buf(), no_memory_map())
+             buf(), buf(), no_test_settings(), None, buf(), buf(), buf(), buf(), buf(), buf(), no_memory_map(),
+             None)
 
 // The manifest a directory carries, or the empty one where it carries none -- with the `c`, `defines`
 // and `requires` the layers in force write (`c_layers.sysl`): those of the machine being built and of
@@ -746,6 +752,7 @@ read_manifest(text: string) -> Result[Manifest, string]
     val lto = read_lto(root)?
     val bounds_locations = read_bounds_locations(root)?
     val error_traces = read_error_traces(root)?
+    val checked_overflow = read_checked_overflow(root)?
     val tests = read_test_settings(root, &warnings)?
     val options = read_options(root)?
 
@@ -776,7 +783,7 @@ read_manifest(text: string) -> Result[Manifest, string]
                 optimization, link, lto, warnings, bounds_locations, has_package, repository, workspace,
                 images, codegen_read.0, target_codegen, codegen_read.2, target_extensions,
                 codegen_read.1, target_codegen_registers, tests, error_traces, options, feature_targets,
-                read.info, choices, layers, exclude, memory)
+                read.info, choices, layers, exclude, memory, checked_overflow)
 
     if read.long_form
         needs_floor_refusal(floor, "a feature block") match
@@ -876,6 +883,19 @@ private read_error_traces(root: Value) -> Result[Option[bool], string]
     Err("'error_traces' says whether a failure records where it was made and each '?' that handed " +
         "it on, so it is true or false")
 end read_error_traces
+
+// The `checked_overflow` key: `true` to trap on every plain integer overflow in this package's own
+// files whatever the build mode, or `false`, the default, to leave it to the mode (`checked.sysl`).
+private read_checked_overflow(root: Value) -> Result[Option[bool], string]
+    val value = root.get("checked_overflow") match
+        None -> return Ok(None)
+        Some(v) -> v
+
+    if value.as_bool().is_some() then return Ok(value.as_bool())
+
+    Err("'checked_overflow' says whether every plain integer '+', '-', '*', unary '-' and written " +
+        "conversion in this package traps on overflow in every build, so it is true or false")
+end read_checked_overflow
 
 // A `codegen` block, at the top of the file or inside a `targets.<name>` block: each setting
 // `codegen_features.sysl` knows, `true` or `false`. **A name it does not know is refused rather than
@@ -2056,7 +2076,7 @@ val TargetKeys: []const string = ["triple", "linker", "linker_script", "entry", 
 
 val TopKeys: []const string = ["package", "dependencies", "dev_dependencies", "requires", "capabilities",
                                "targets", "allocator", "defines", "links", "features", "optimization",
-                               "link", "lto", "bounds_locations", "error_traces", "workspace", "codegen",
+                               "link", "lto", "bounds_locations", "error_traces", "checked_overflow", "workspace", "codegen",
                                "c", "test", "options", "choices", "config", "exclude", "memory", "sections",
                                "symbols"]
 

@@ -1,0 +1,166 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+
+// `@checked` and `checked_overflow`: integer overflow that traps whatever the build mode
+// (`reference/attributes.md § @checked`, `reference/packages.md § Overflow that traps in every build`).
+//
+// **The build mode decides what a plain overflow does** (`build_mode.sysl`): a debug build traps and
+// a release build wraps. Code whose overflow is a fault in every build -- flight software, a
+// counter whose wrap would be read as a small number -- says so instead of trusting the command line,
+// in one of two places:
+//
+// - `@checked` above a function or a member, or on a line of its own above an indented block;
+// - `checked_overflow = true` in a package's manifest, which covers every file of that package.
+//
+// Either one makes every plain integer `+`, `-`, `*`, unary `-` (with their compound forms, `++` and
+// `--`) and every written integer conversion that can lose a value **checked**, exactly as a debug
+// build checks it, with the same report. It never makes anything wrap: `+%`, `+|` and `T.wrap(x)` say
+// what they do in their spelling and keep it, and outside a marked region the mode decides as before.
+//
+// **The region is lexical, and it is a stretch of source**, as `@reassociate`'s is: the function's
+// span, or the block's, in its file. An operation is checked where its own expression lies inside
+// one, so a closure or a nested function written inside is inside, and a function called from
+// inside but written elsewhere is not. It nests with `@unchecked`, which is about subscripts: the two
+// are independent, and each keeps its own meaning inside the other.
+//
+// **A package's key covers its own files and nobody else's.** Unlike `optimization`, which is the
+// root's, `checked_overflow` is a statement about the package's code, so a dependency's key is read
+// and applies to that dependency. A file belongs to the package whose root is the longest one that
+// holds it.
+//
+// **Compile-time evaluation agrees.** Evaluating a `const` function written inside a region, an
+// overflow that the running program would trap on refuses the constant instead of wrapping it.
+
+// The form a `@checked` block is parsed into: a call no program can spell, its one argument the block.
+const CheckedBlock: string = "checked block"
+
+// -- the regions ----------------------------------------------------------------------------------------
+
+// Every stretch of source that is checked: each `@checked` block, and each function or member marked
+// `@checked`, by its file and span. A fact about the source, so a reading thrown away records the
+// same block a kept one does, and a span recorded twice is harmless.
+private var regions: Buf[(string, Span)] = buf()
+
+// The package roots of this compilation, each absolute with a trailing `/`, and whether its manifest
+// says `checked_overflow = true`.
+private var package_roots: Buf[(string, bool)] = buf()
+
+// What `checked_file` has answered, by the file's name as written.
+private var file_answers: Map[string, bool] = map()
+
+// Records a checked stretch of source.
+note_checked_region(file: string, at: Span)
+    regions.push((file, at))
+end note_checked_region
+
+// Sets the package roots of this compilation and whether each is checked, forgetting the answers
+// given for the last one.
+use_checked_packages(roots: Buf[(string, bool)])
+    package_roots = roots
+    file_answers = map()
+end use_checked_packages
+
+// Forgets every region and root, as each command line starts.
+forget_checked()
+    regions = buf()
+    package_roots = buf()
+    file_answers = map()
+end forget_checked
+
+// Whether a file belongs to a package whose manifest says `checked_overflow = true`.
+checked_file(file: string) -> bool
+    if file == "" || package_roots.is_empty() then return false
+
+    val known = file_answers.get(file)
+
+    if known.is_some() then return known.unwrap()
+
+    val name = absolute_path(file)
+    var best: usize = 0
+    var answer = false
+
+    for root in package_roots
+        val (dir, checked) = root
+
+        if dir.bytes.len > best && name.bytes.len > dir.bytes.len && bytes_at(name, 0, dir)
+            best = dir.bytes.len
+            answer = checked
+
+    file_answers.put(file, answer)
+    answer
+end checked_file
+
+// Whether an operation written at `at` in `file` lies inside a `@checked` region.
+in_checked_region(file: string, at: Span) -> bool
+    for region in regions
+        if region.0 == file && region.1.start <= at.start && at.end <= region.1.end then return true
+
+    false
+end in_checked_region
+
+// Whether an operation written at `at` in `file` is checked whatever the mode: inside a region, or in
+// a checked package's file.
+checked_whatever_mode(file: string, at: Span) -> bool = in_checked_region(file, at) || checked_file(file)
+
+// -- parsing ------------------------------------------------------------------------------------------
+
+// `@checked` and the block indented under it. The `@` is the cursor, and the block is known to follow
+// (`parse_at_stmt`).
+parse_checked_block(p: *Parser, start: Span) -> Stmt
+    p.bump()
+    p.bump()
+
+    val body = parse_suite(p)
+    // The block's extent is what decides which operations are checked, so it runs to the end of its
+    // last statement -- the token taken last is the dedent, which carries no extent of its own.
+    val span = if body.is_empty() then start else start.to(body[body.len() - 1].span)
+    var one: Buf[Expr] = buf()
+
+    one.push(expr(span, Block(body)))
+    stmt(span, ExprStmt(expr(span, Call(expr(start, Ident(CheckedBlock)), one))))
+end parse_checked_block
+
+// The refusal for `@checked` above anything that has no body of sysl.
+checked_not_a_body() -> string =
+    "'@checked' makes the integer arithmetic written in a body trap on overflow in every build, so it " +
+    "marks a function, a method, or — on a line of its own — the block indented under it, and this " +
+    "is none of them. An 'extern''s arithmetic is compiled by whoever compiled it"
+
+// Whether a call's head is the form a `@checked` block was parsed into.
+is_checked_block(head: Expr) -> bool = *head.kind match
+    Ident(n) -> n == CheckedBlock
+    _ -> false
+
+// -- reading ------------------------------------------------------------------------------------------
+
+// The block, read as a block written bare would be, and recorded by file and span.
+checked_block_form(cx: &Analyzer, span: Span, args: Buf[Expr], expected: Option[Type]) -> TExpr
+    if args.len() != 1 then return cx.err(span, checked_not_a_body())
+
+    // The block's own extent, which the parser gave the argument; the form's is the annotation's.
+    note_checked_region(cx.scope.src.name, args[0].span)
+    cx.tail_carry = cx.unit_tail
+    type_expr(cx, args[0], expected)
+end checked_block_form
+
+// -- lowering -----------------------------------------------------------------------------------------
+
+// Every function marked `@checked`, recorded as a region -- every lowered copy of one has its
+// declaration's span and file, and a closure or nested function written inside lies within it.
+note_checked_functions(funcs: Buf[TFunc])
+    for f in funcs
+        if f.marks.checked && f.src.is_some() then note_checked_region(f.src.unwrap().name, f.span)
+end note_checked_functions
+
+// Whether an operation written at `at` in the body being lowered is checked: in a debug build every
+// one is, and in a release build the ones inside a region or a checked package's file.
+checked_at(e: *Emit, at: Span) -> bool
+    if overflow_checks() || e.checked_whole then return true
+
+    e.src match
+        Some(s) -> checked_whatever_mode(s.name, at)
+        None -> false
+end checked_at

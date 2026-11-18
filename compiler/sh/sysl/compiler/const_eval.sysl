@@ -3683,6 +3683,18 @@ private unary(r: &EvRun, at: Span, op: string, operand: TExpr, ty: Type) -> Flow
                     other -> return other
 
             EvGave(ConstArray(out))
+        Integer(bits, signed, _) ->
+            // Inside a `@checked` region negating the most negative value is the overflow it is; a
+            // vector's lanes wrap, as they do when the program runs.
+            val n = v match
+                ConstInt(k) -> Some(k)
+                _ -> None
+
+            if op == "-" && n.is_some() && !fits(negate(n.unwrap()), bits, signed) &&
+               checked_whatever_mode(here(r).src.name, at) then
+                return trap(r, at, s"-${to_string(n.unwrap())} overflows ${type_show(ty)}")
+
+            unary_value(r, at, op, v, ty)
         _ -> unary_value(r, at, op, v, ty)
 end unary
 
@@ -3732,8 +3744,14 @@ private binary(r: &EvRun, at: Span, op: string, l: TExpr, rt: TExpr, ty: Type) -
     if fixed_arith_op(op, texpr_type(l), texpr_type(rt), ty) then
         return fixed_operate(r, at, op, texpr_type(l), texpr_type(rt), ty, x, y)
 
-    operate(r, at, op, texpr_type(l), x, y, checked_op(op, l, rt))
+    operate(r, at, op, texpr_type(l), x, y, checked_op(op, l, rt) || ev_checked(r, at, op))
 end binary
+
+// Whether a plain `+`, `-` or `*` written at `at` is inside a `@checked` region or a checked package's
+// file (`checked.sysl`): there an overflow traps while compiling, as it would when the program ran.
+// Outside one the evaluator computes what a release build would, the mode being the run's.
+private ev_checked(r: &EvRun, at: Span, op: string) -> bool =
+    (op == "+" || op == "-" || op == "*") && checked_whatever_mode(here(r).src.name, at)
 
 // A contracted `±(a * b) ± c` (`fp_contract.sysl`), rounded once as the machine's fused instruction
 // rounds it, lane by lane over a vector. The operands are read in the order they are written; an
@@ -3994,6 +4012,16 @@ private cast(r: &EvRun, at: Span, operand: TExpr, ty: Type) -> Flow
     val (held, from) = (v, underlying(texpr_type(operand))) match
         (ConstRecord(i, _), Enum(d)) -> (ConstInt(d.variants[usize(i)].tag), underlying(d.underlying))
         pair -> pair
+
+    // A written conversion inside a `@checked` region that cannot hold its value is the overflow it
+    // would be when the program ran (`checked.sysl`).
+    (held, from, underlying(ty)) match
+        (ConstInt(n), Integer(_, _, _), Integer(bits, signed, _)) ->
+            val file = here(r).src.name
+
+            if !fits(n, bits, signed) && is_written_conversion(file, at) && checked_whatever_mode(file, at) then
+                return trap(r, at, s"${to_string(n)} overflows ${type_show(ty)}")
+        _ -> ()
 
     val converted = fixed_eval_convert(held, texpr_type(operand), ty).unwrap_or(run_convert(held, from, underlying(ty)))
 
@@ -4617,6 +4645,10 @@ private entered(r: &EvRun, at: Span, name: string, vals: Buf[Const], f: &TFunc,
     if r.frames.len() > EvDepthLimit then
         return Err(refuse_form(r, at, s"the calls nest more than 512 deep, at '$shown'"))
 
+    // A `@checked` function is a region its body's arithmetic is checked in, and so is every closure
+    // written inside it (`checked.sysl`).
+    if f.marks.checked && f.src.is_some() then note_checked_region(f.src.unwrap().name, f.span)
+
     val frame: &EvFrame = EvFrame(name, shown, at, here(r), func_home(r.a, name), map(), buf(), None, map())
 
     for i in 0..<f.params.len()
@@ -5091,7 +5123,8 @@ end store
 private combined(r: &EvRun, at: Span, op: string, place_ty: Type, value_ty: Type, cur: Const, v: Const,
                  check: Option[Type]) -> Flow
     val bin = op[0..<(op.bytes.len - 1)]
-    val checked = is_ranged(place_ty) && (bin == "+" || bin == "-" || bin == "*" || bin == "<<")
+    val checked = (is_ranged(place_ty) && (bin == "+" || bin == "-" || bin == "*" || bin == "<<")) ||
+        ev_checked(r, at, bin)
     val fixed = fixed_arith_op(bin, place_ty, value_ty, place_ty)
     val out = if fixed then fixed_operate(r, at, bin, place_ty, value_ty, place_ty, cur, v) else operate(r, at, bin, place_ty, cur, v, checked)
 
@@ -5174,7 +5207,12 @@ private ev_inc_dec(r: &EvRun, at: Span, place: TExpr, op: string, pre: bool, ty:
 
     val stepped = if op == "++" then add(cur, from_int(1)) else sub(cur, from_int(1))
     val nv = underlying(ty) match
-        Integer(bits, signed, _) -> wrap(stepped, bits, signed)
+        Integer(bits, signed, _) ->
+            // Inside a `@checked` region a step past the width is the overflow it is (`checked.sysl`).
+            if !fits(stepped, bits, signed) && checked_whatever_mode(here(r).src.name, at) then
+                return trap(r, at, s"${to_string(cur)} $op overflows ${type_show(ty)}")
+
+            wrap(stepped, bits, signed)
         _ -> stepped
 
     check match

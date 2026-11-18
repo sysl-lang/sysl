@@ -787,7 +787,7 @@ private gen_binary(e: *Emit, op: string, l: TExpr, r: TExpr, ty: Type, site: Spa
             // A sum proved not to wrap is the `nuw` add in either mode: there is nothing to check.
             val proved = op == "+" && nowrap_add(e, l, r, bt)
 
-            if overflow_checked(op, l, r, bits, signed) || (!proved && plain_checked(op, bt))
+            if overflow_checked(op, l, r, bits, signed) || (!proved && plain_checked(e, op, bt, site))
                 return checked_arith(e, op, bits, signed, lv, rv, arith_text(op, texpr_type(l), texpr_type(r)), site)
 
             if proved
@@ -932,8 +932,9 @@ private gen_unary(e: *Emit, op: string, operand: TExpr, ty: Type, site: Span) ->
                 underlying(ty) match
                     Vector(_, _) -> emit(e, InBin(r, OpSub, ety, VZero, v))
                     _ ->
-                        // In a debug build, negating the most negative value is the overflow it is.
-                        if overflow_checks()
+                        // In a debug build, or inside a `@checked` region, negating the most
+                        // negative value is the overflow it is.
+                        if checked_at(e, site)
                             return checked_arith(e, "-", bits, signed, VInt(from_int(0)), v,
                                                  s"-${type_show(ty)}", site)
 
@@ -1212,7 +1213,7 @@ private gen_inc_dec(e: *Emit, place: TExpr, op: string, pre: bool, ty: Type,
     val bin = if op == "++" then "+" else "-"
 
     val nv = underlying(ty) match
-        Integer(bits, signed, _) if plain_checked(bin, ty) ->
+        Integer(bits, signed, _) if plain_checked(e, bin, ty, site) ->
             checked_arith(e, bin, bits, signed, cur, VInt(from_int(1)), s"${type_show(ty)}$op", site)
         _ ->
             val r = fresh_reg(e)
@@ -1254,7 +1255,7 @@ combine(e: *Emit, op: string, ty: Type, value_ty: Type, dispatch: Option[TDispat
         Integer(bits, signed, _) ->
             if bin == "<<" && is_ranged(ty) then return checked_shl(e, bits, signed, cur, rv)
 
-            if ((bin == "+" || bin == "-" || bin == "*") && is_ranged(ty)) || plain_checked(bin, bt)
+            if ((bin == "+" || bin == "-" || bin == "*") && is_ranged(ty)) || plain_checked(e, bin, bt, site)
                 return checked_arith(e, bin, bits, signed, cur, rv, arith_text(op, ty, value_ty), site)
         _ -> ()
 
@@ -1886,13 +1887,14 @@ end no_fast_math
 // -- conversions and zeros ----------------------------------------------------------------------------
 
 // A conversion in the tree. **A written integer conversion that can lose a value is checked in a
-// debug build** (`build_mode.sysl`) -- unless what it converts is a constant, which is the bit
-// pattern written down (`u32(-1)`) and converts as it does in a `const`, the same in every build.
+// debug build** (`build_mode.sysl`), and inside a `@checked` region in every build (`checked.sysl`)
+// -- unless what it converts is a constant, which is the bit pattern written down (`u32(-1)`) and
+// converts as it does in a `const`, the same in every build.
 private gen_cast(e: *Emit, operand: TExpr, ty: Type, site: Span) -> Val
     val from = underlying(texpr_type(operand))
     val v = gen_expr(e, operand)
 
-    if !overflow_checks() then return convert(e, from, ty, v)
+    if !checked_at(e, site) then return convert(e, from, ty, v)
 
     val constant = *operand.kind match
         TIntLit(_, _) -> true
