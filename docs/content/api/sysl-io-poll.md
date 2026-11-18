@@ -32,13 +32,18 @@ and a registration made during a wait is seen by that wait. A `Waker` ends a wai
 Two threads waiting on one poller at once is allowed and each gets some of the events, but which is
 the kernel's choice.
 
+**A `WakeFd` is a wake that is itself a descriptor** -- `eventfd` on Linux, a pipe elsewhere --
+registered like any other and reported as an event, for waking a poller nested in another, or
+several, or a loop that is not this module's. `Poller.fd()` lends the set's own descriptor, which
+is what nests one poller in another.
+
 A target with neither kqueue nor epoll answers every call with the error `sysl.fs.unsupported()`
 stands for, as `sysl.io.wait` does for a system without `poll`. It needs an operating system: a
 freestanding program reaching it answers the `sysl_io_poll_*` hooks itself (`sysl.io.sys`).
 
 ## Index
 
-[`Event`](#event) [`Mode`](#mode) [`Poller`](#poller) [`Waker`](#waker) [Drop for PollerState](#drop-for-pollerstate)
+[`Event`](#event) [`Mode`](#mode) [`Poller`](#poller) [`WakeFd`](#wakefd) [`Waker`](#waker) [Drop for PollerState](#drop-for-pollerstate) [Drop for WakeState](#drop-for-wakestate)
 
 ## Types
 
@@ -100,6 +105,46 @@ be called through one while another thread waits through another.
 | `deregister` | `deregister(self, fd: int) -> Result[unit, IoError]` | Stop watching `fd`; no event for it is reported by a `wait` that begins afterwards. |
 | `wait` | `wait(self, events: []Event, timeout: Option[Duration]) -> Result[usize, IoError]` | Wait at most `timeout` -- for ever where it is `None` -- for something registered to be ready, writing what is into `events` and answering how many. |
 | `waker` | `waker(self) -> Waker` | Something that ends this poller's `wait` from any thread: a share of the poller, which stays open while a waker lives. |
+| `fd` | `fd(self) -> int` | The set's own descriptor -- the kqueue or the epoll instance -- for a call this module does not make: registering this poller in another one, which reports it readable once a `wait` here would find something, or handing it to an event loop that wants one descriptor to watch. |
+
+### `WakeFd`
+
+```sysl
+struct WakeFd
+    private[poll] state: &sync WakeState
+```
+
+A wake that is a descriptor: readable once something has called `wake`, and until `drain` takes
+the wakes back -- Linux's `eventfd`, and a pipe on a system without one.
+
+Where a `Waker` ends one poller's `wait` and is never itself an event, this is a descriptor like any
+other, so it is registered with a token and **comes back from `wait` as an event** -- in any poller,
+in several at once, in an outer poller watching inner ones, or in `sysl.io.wait.ready`:
+
+    val w = WakeFd.open()?
+
+    p.register(w.fd(), [Readable], QUEUE)?
+
+    // any thread:
+    w.wake()?
+
+    // the waiting thread, on QUEUE:
+    _ = w.drain()?
+
+**Wakes coalesce.** Any number of them before a `drain` leave the descriptor readable once, and one
+`drain` takes them all; a `wake` never blocks and never fails for there being too many. A program
+drains when it sees the event and then looks at its own state, rather than counting wakes.
+
+**It closes itself**, and every copy shares one: a copy is what another thread is handed -- the
+shared state is a `&sync`, so a `WakeFd` may be captured by a `&sync Fn` or a scoped thread's
+closure -- and the descriptors are closed when the last copy goes.
+
+| Member | Signature | Description |
+|---|---|---|
+| `open` | `open() -> Result[WakeFd, IoError]` | A new wake with none pending. |
+| `fd` | `fd(self) -> int` | The descriptor to watch: readable while a wake is pending. |
+| `wake` | `wake(self) -> Result[unit, IoError]` | Make the descriptor readable, from any thread. |
+| `drain` | `drain(self) -> Result[bool, IoError]` | Take back every pending wake, leaving the descriptor not readable, and answer whether there was one. |
 
 ### `Waker`
 
@@ -128,3 +173,11 @@ impl Drop for PollerState
 
 Both descriptors closed. A failure is not reported, there being nobody to report it to
 (`sysl.Drop`).
+
+### Drop for WakeState
+
+```sysl
+impl Drop for WakeState
+```
+
+Both descriptors closed, unreported (`sysl.Drop`).

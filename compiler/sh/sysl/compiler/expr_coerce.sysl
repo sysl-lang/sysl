@@ -232,10 +232,14 @@ private converts(want: Type) -> bool
     want match
         Ref(_, _) -> true
         Weak(_) -> true
-        Slice(_, ro) -> ro
+        Slice(e, ro) -> ro || is_volatile_elem(*e)
         Ptr(_, ro) -> ro
         _ -> false
 end converts
+
+private is_volatile_elem(t: Type) -> bool = t match
+    Volatile(_) -> true
+    _ -> false
 
 // Whether an expression yields its value through branches rather than producing one itself.
 private branching(e: Expr) -> bool = *e.kind match
@@ -405,6 +409,15 @@ coerce(cx: &Analyzer, t: TExpr, expected: Type) -> TExpr
 
             t
         Slice(want, read_only) ->
+            // **A `[]T` is accepted where a `[]volatile T` is wanted**: the same elements, every access
+            // through the new view made an effect the optimizer keeps. Never the other way round, and
+            // never one level down -- a `[][]volatile T` slot could be handed a view of device memory
+            // that the `[][]T` holder would then read as ordinary memory. The view keeps its `const`,
+            // and is put back through the position so that a read-only one meets the refusal below.
+            val widened = volatile_widened(cx, t, *want)
+
+            if widened.is_some() then return coerce(cx, widened.unwrap(), expected)
+
             if read_only && type_eq(got, Slice(*want, false)) then
                 return TExpr(t.span, TConstView(t))
 
@@ -466,6 +479,19 @@ private lane_count_of(t: Type) -> int = t match
 private array_len_of_type(t: Type) -> int = t match
     Array(n, _) -> n
     _ -> 0
+
+// The view of `t` at `want` where `want` is `volatile T` and `t` is a view of plain `T`, or an array
+// of them; `None` for anything else, so a view already of volatile elements is left as it stands.
+private volatile_widened(cx: &Analyzer, t: TExpr, want: Type) -> Option[TExpr]
+    val plain = want match
+        Volatile(inner) -> *inner
+        _ -> return None
+
+    texpr_type(t) match
+        Slice(e, ro) ->
+            if type_eq(*e, plain) then Some(TExpr(t.span, TViewAs(t, Slice(want, ro)))) else None
+        _ -> array_view(cx, t, plain, false)
+end volatile_widened
 
 // The whole-array view an array coerces to, where its elements are the ones the slice wants.
 //

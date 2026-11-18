@@ -79,8 +79,9 @@ enum StmtKind
     // `ref name = place` -- another name for storage that already exists.
     RefDecl(name: string, place: Expr)
 
-    // `a, b = f()` -- assignment to several places at once.
-    MultiAssign(op: string, targets: Buf[Expr], values: Buf[Expr])
+    // `a, b = f()` -- assignment to several places at once. `one_tuple` is `(a,) = t`, the one-tuple
+    // spelled on the left, which takes its one place out of a carrier where `_ = x` stores `x` whole.
+    MultiAssign(op: string, targets: Buf[Expr], values: Buf[Expr], one_tuple: bool)
 
     // `val a, b = f()` -- several names bound at once. `vis` is what a module-level one says of every
     // name it binds; a local's is never read.
@@ -201,18 +202,32 @@ enum AsmBody
     AsmUnavailable(reason: string)
 end AsmBody
 
-// Which way an operand travels.
+// Which way an operand travels. `InOut` is read and written through one register: it arrives holding
+// the variable it names and leaves holding what the instructions put there.
 enum AsmDir
     In
     Out
+    InOut
 end AsmDir
 
-// One `in`/`out` operand of an inline-assembly block.
+// Where an operand has to live: any general-purpose register, any vector register (the one that
+// holds a `<N>T` or a float -- AArch64's `v`, x86-64's `xmm`), or one machine register by the
+// assembler's name for it.
+enum AsmPlace
+    PlaceReg
+    PlaceVreg
+    PlaceAt(register: string)
+end AsmPlace
+
+// One `in`/`out`/`inout` operand of an inline-assembly block. `into` is the variable an `inout`
+// leaves its result in when that is not the one it read (`inout a -> b : reg`); nothing means the
+// same one.
 struct AsmOperand
     span: Span
     dir: AsmDir
     name: string
-    reg: Option[string]
+    into: Option[string]
+    place: AsmPlace
 end AsmOperand
 
 // One line of an `asm` block as it was read, before the three kinds are separated.
@@ -377,6 +392,11 @@ struct FuncMarks
     // instantiation.
     bounded: Buf[string]
 
+    // `@no_fuse`, or a body that inherits it -- a closure or a nested function written inside a marked
+    // one, or any body of a module whose header says it: a multiply feeding an add is two operations,
+    // rounded twice (`no_fuse.sysl`). Carried to every lowered copy and every instantiation.
+    no_fuse: bool
+
     // `@pinned(thread)`: the fiber this body runs on is only ever resumed on the thread it began on,
     // so a count it holds across a call that can reach `sysl.fiber.switch` is touched by one thread
     // alone (`abandons.sysl`'s `check_switch_holds`). Not given to a closure or nested function
@@ -400,7 +420,7 @@ end FuncMarks
 // A definition nothing was said about.
 no_marks() -> FuncMarks = FuncMarks(false, false, false, None, buf(), false, None, false, false,
                                     false, false, false, false, false, false, buf(), false, buf(), buf(),
-                                    false, false, false, false, buf(), buf(), buf(), false)
+                                    false, false, false, false, buf(), buf(), buf(), false, false)
 
 // A method of a struct, an enum, a trait or an `impl` block.
 struct MethodDecl
@@ -598,6 +618,8 @@ enum Attr
     StrictFp
     // `@reassociate` above a function or a member: its float sums and products may be regrouped.
     Reassociate
+    // `@no_fuse` above a function or a member: no multiply in it is fused with the add it feeds.
+    NoFuse
     // `@track_caller` above a function or a member: what it reports names the line that called it.
     TrackCaller
     // `@annotation` above a struct: the struct is an annotation a program writes as `@Name(...)`.
@@ -683,6 +705,7 @@ attr_word(a: Attr) -> string = a match
     Blocks -> "blocks"
     StrictFp -> "strict_fp"
     Reassociate -> "reassociate"
+    NoFuse -> NoFuseWord
     TrackCaller -> "track_caller"
     Relocates -> "relocates"
     Views(_) -> "views"

@@ -1,0 +1,367 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `c const` reads a whole number at the C expression's own type and width, whatever the line is
+// declared at (`reference/ffi.md § c const`): a value past `i64` -- `UINT64_MAX` read as an `i64`,
+// an `unsigned __int128`, a `_BitInt` -- used to cross on a 64-bit carrier and come back as some
+// other number, often one in range. The axes: the expression's C type (int, unsigned, `long long`,
+// `__int128`, an enum, a `char`, a pointer, a float), its sign, the declared width (to 64, to 128,
+// past it), a line declared at a measured `c type`, the target (the host, a Cortex-M with no
+// `__int128`, x86-64 with a 256-bit `_BitInt`), and the refusals. A float line is not read this way
+// and is not in the matrix.
+
+private ccw_ready() -> bool
+    if std_root().is_err() then return false
+    clang_available()
+
+private ccw_says(text: string, part: string) -> bool = text.index_of(part).is_some()
+
+private ccw_times(line: string, n: int) -> string
+    var out = ""
+
+    for _ in 0..<n
+        out = out + line
+
+    out
+
+private ccw_count(text: string, part: string) -> int
+    var n = 0
+    var rest = text
+
+    loop
+        val at = rest.index_of(part) match
+            None -> return n
+            Some(found) -> found
+
+        n += 1
+        rest = rest[(at + part.bytes.len)..<rest.bytes.len]
+
+// A program written beside a header `wide.h`, built and run, and what it printed.
+private ccw_ran_with(header: string, text: string) -> string
+    val root = make_temp_dir("sysl-cconst-wide").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/wide.h", header).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end ccw_ran_with
+
+private ccw_ran(text: string) -> string = ccw_ran_with("", text)
+
+// What the lowering says for a file on a machine: its LLVM text, or `refused: ` and the report.
+private ccw_lowered(text: string, target: Option[string]) -> string
+    val root = make_temp_dir("sysl-cconst-wide").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val made = emit_llvm_text(s"$root/main.sysl", target)
+
+    remove_dir_all(root).unwrap_or(())
+
+    made match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(m) -> if m.report.is_empty() then m.text else s"refused: ${analysis_report(m.report)}"
+end ccw_lowered
+
+private ccw_err(text: string) -> string = ccw_lowered(text, None)
+
+private ccw_line(decl: string, c: string) -> string =
+    s"@include(\"<stdint.h>\")\nc const\n    N: $decl = \"$c\"\n\nprint(N)\n"
+
+// -- past 64 bits, unsigned -------------------------------------------------------------------------
+
+@test("an unsigned 64-bit maximum, however C spells it, at u64")
+ccw_the_u64_maximum_every_spelling()
+    if !ccw_ready() then return
+
+    val text = "@include(\"<stdint.h>\")\n" +
+               "c const\n" +
+               "    A: u64 = \"UINT64_MAX\"\n    B: u64 = \"0xFFFFFFFFFFFFFFFFULL\"\n" +
+               "    C: u64 = \"~0ull\"\n    D: u64 = \"-1ull\"\n    E: u64 = \"18446744073709551615u\"\n\n" +
+               "print(A)\nprint(B)\nprint(C)\nprint(D)\nprint(E)\n"
+
+    assert_eq(ccw_ran(text), ccw_times("18446744073709551615\n", 5))
+
+// The regression: the value crossed as a `long long`, which is -1 and in range.
+@test("UINT64_MAX read as an i64 is refused as the number it is, not taken as -1")
+ccw_u64_max_at_i64_is_refused()
+    if !ccw_ready() then return
+
+    val a = ccw_err(ccw_line("i64", "UINT64_MAX"))
+
+    assert(ccw_says(a, "'UINT64_MAX' is 18446744073709551615 here, which 'i64' cannot hold — it holds " +
+                       "-9223372036854775808 to 9223372036854775807"), a)
+
+    val b = ccw_err(ccw_line("i64", "0xFFFFFFFFFFFFFFFFULL"))
+
+    assert(ccw_says(b, "is 18446744073709551615 here, which 'i64' cannot hold"), b)
+
+    // A hex literal past `long long` is `unsigned long long` by C's rules, and so past `i64`.
+    val c = ccw_err(ccw_line("i64", "0x8000000000000000"))
+
+    assert(ccw_says(c, "is 9223372036854775808 here, which 'i64' cannot hold"), c)
+
+@test("and at a width that holds it, it is read")
+ccw_u64_max_at_a_wider_type()
+    if !ccw_ready() then return
+
+    val text = "@include(\"<stdint.h>\")\n" +
+               "c const\n" +
+               "    A: i128 = \"UINT64_MAX\"\n    B: u65 = \"UINT64_MAX\"\n    C: i65 = \"UINT64_MAX\"\n" +
+               "    D: u64 = \"0x8000000000000000\"\n\n" +
+               "print(A)\nprint(B)\nprint(C)\nprint(D)\n"
+
+    assert_eq(ccw_ran(text), ccw_times("18446744073709551615\n", 3) + "9223372036854775808\n")
+
+// -- 128 bits ----------------------------------------------------------------------------------------
+
+@test("the extremes of __int128 and unsigned __int128, at their own width")
+ccw_int128_extremes()
+    if !ccw_ready() then return
+
+    val text = "c const\n" +
+               "    A: u128 = \"(unsigned __int128)-1\"\n" +
+               "    B: i128 = \"(__int128)((unsigned __int128)1 << 127)\"\n" +
+               "    C: i128 = \"(__int128)(~(unsigned __int128)0 >> 1)\"\n" +
+               "    D: i128 = \"-(__int128)5\"\n" +
+               "    E: u128 = \"(unsigned __int128)1 << 64\"\n\n" +
+               "print(A)\nprint(B)\nprint(C)\nprint(D)\nprint(E)\n"
+
+    assert_eq(ccw_ran(text),
+              "340282366920938463463374607431768211455\n-170141183460469231731687303715884105728\n" +
+              "170141183460469231731687303715884105727\n-5\n18446744073709551616\n")
+
+@test("a 128-bit value read at a narrower type is refused, naming it exactly")
+ccw_int128_at_a_narrower_type()
+    if !ccw_ready() then return
+
+    val a = ccw_err(ccw_line("i64", "(__int128)1 << 100"))
+
+    assert(ccw_says(a, "is 1267650600228229401496703205376 here, which 'i64' cannot hold"), a)
+
+    val b = ccw_err(ccw_line("u64", "(unsigned __int128)-1"))
+
+    assert(ccw_says(b, "is 340282366920938463463374607431768211455 here, which 'u64' cannot hold — " +
+                       "it holds 0 to 18446744073709551615"), b)
+
+    val c = ccw_err(ccw_line("i128", "(unsigned __int128)-1"))
+
+    assert(ccw_says(c, "which 'i128' cannot hold — it holds -170141183460469231731687303715884105728 " +
+                       "to 170141183460469231731687303715884105727"), c)
+
+    val d = ccw_err(ccw_line("u8", "(__int128)1 << 64"))
+
+    assert(ccw_says(d, "is 18446744073709551616 here, which 'u8' cannot hold"), d)
+
+@test("an odd width between 64 and 128 holds exactly its range")
+ccw_odd_widths_hold_their_range()
+    if !ccw_ready() then return
+
+    assert_eq(ccw_ran("c const\n    A: u65 = \"((unsigned __int128)1 << 65) - 1\"\n" +
+                      "    B: i100 = \"-((__int128)1 << 99)\"\n\nprint(A)\nprint(B)\n"),
+              "36893488147419103231\n-633825300114114700748351602688\n")
+
+    val a = ccw_err(ccw_line("u65", "(unsigned __int128)1 << 65"))
+
+    assert(ccw_says(a, "is 36893488147419103232 here, which 'u65' cannot hold — it holds 0 to " +
+                       "36893488147419103231"), a)
+
+    val b = ccw_err(ccw_line("i100", "-((__int128)1 << 99) - 1"))
+
+    assert(ccw_says(b, "is -633825300114114700748351602689 here, which 'i100' cannot hold"), b)
+
+@test("a wide constant is an ordinary constant, usable in arithmetic")
+ccw_a_wide_constant_is_usable()
+    if !ccw_ready() then return
+
+    val text = "c const\n    TOP: u128 = \"(unsigned __int128)-1\"\n    LOW: i128 = " +
+               "\"(__int128)((unsigned __int128)1 << 127)\"\n\n" +
+               "val x: u128 = TOP - 1\nprint(x)\nprint(LOW + 1 < 0)\nprint(TOP >> 127)\n"
+
+    assert_eq(ccw_ran(text), "340282366920938463463374607431768211454\ntrue\n1\n")
+
+// -- negative values in C's unsigned types ------------------------------------------------------------
+
+// `-1u` is C's `unsigned int` 4294967295; `-1` is an `int` -1 and no unsigned type holds it -- which
+// is the one this used to take as 18446744073709551615 at `u64`.
+@test("a negative value in an unsigned C type is the number C made of it")
+ccw_negative_in_an_unsigned_c_type()
+    if !ccw_ready() then return
+
+    val text = "c const\n" +
+               "    A: u32 = \"-1u\"\n    B: u64 = \"-1u\"\n    C: u8 = \"(unsigned char)-1\"\n" +
+               "    D: u16 = \"(unsigned short)-2\"\n    E: i64 = \"-1u\"\n\n" +
+               "print(A)\nprint(B)\nprint(C)\nprint(D)\nprint(E)\n"
+
+    assert_eq(ccw_ran(text), "4294967295\n4294967295\n255\n65534\n4294967295\n")
+
+@test("and a negative in a signed C type is refused at every unsigned width")
+ccw_negative_in_a_signed_c_type_at_unsigned()
+    if !ccw_ready() then return
+
+    val a = ccw_err(ccw_line("u64", "-1"))
+
+    assert(ccw_says(a, "'-1' is -1 here, which 'u64' cannot hold — it holds 0 to 18446744073709551615"), a)
+
+    val b = ccw_err(ccw_line("u128", "INT64_MIN"))
+
+    assert(ccw_says(b, "is -9223372036854775808 here, which 'u128' cannot hold"), b)
+
+    val c = ccw_err(ccw_line("u32", "-1"))
+
+    assert(ccw_says(c, "is -1 here, which 'u32' cannot hold"), c)
+
+@test("the signed minimum at every width it fits, and refused one width down")
+ccw_signed_minimum_at_wider_widths()
+    if !ccw_ready() then return
+
+    assert_eq(ccw_ran("@include(\"<stdint.h>\")\nc const\n    A: i128 = \"INT64_MIN\"\n" +
+                      "    B: i65 = \"INT64_MIN\"\n    C: i64 = \"INT64_MIN\"\n\nprint(A)\nprint(B)\nprint(C)\n"),
+              ccw_times("-9223372036854775808\n", 3))
+
+    val a = ccw_err(ccw_line("i63", "INT64_MIN"))
+
+    assert(ccw_says(a, "is -9223372036854775808 here, which 'i63' cannot hold — it holds " +
+                       "-4611686018427387904 to 4611686018427387903"), a)
+
+// -- what the expression is ---------------------------------------------------------------------------
+
+@test("an enum constant, at its enum's own type")
+ccw_enum_constants()
+    if !ccw_ready() then return
+
+    val header = "enum small { S_NEG = -7, S_POS = 9 };\n" +
+                 "enum big { B_TOP = 0xFFFFFFFFFFFFFFFFull };\n"
+    val text = "@include(\"wide.h\")\nc const\n    A: i8 = \"S_NEG\"\n    B: u8 = \"S_POS\"\n" +
+               "    C: u64 = \"B_TOP\"\n    D: u128 = \"B_TOP\"\n\nprint(A)\nprint(B)\nprint(C)\nprint(D)\n"
+
+    assert_eq(ccw_ran_with(header, text), "-7\n9\n18446744073709551615\n18446744073709551615\n")
+
+@test("a macro with a suffix, at the type its suffix makes it")
+ccw_macros_with_suffixes()
+    if !ccw_ready() then return
+
+    val header = "#define W_ULL 18446744073709551615ULL\n#define W_NEG_L (-5L)\n" +
+                 "#define W_U 4294967295U\n#define W_WIDE ((unsigned __int128)W_ULL << 8)\n"
+    val text = "@include(\"wide.h\")\nc const\n    A: u64 = \"W_ULL\"\n    B: i8 = \"W_NEG_L\"\n" +
+               "    C: u32 = \"W_U\"\n    D: u72 = \"W_WIDE\"\n\nprint(A)\nprint(B)\nprint(C)\nprint(D)\n"
+
+    assert_eq(ccw_ran_with(header, text), "18446744073709551615\n-5\n4294967295\n4722366482869645213440\n")
+
+@test("a char, a bool, a pointer and a float are each read as before")
+ccw_other_c_types()
+    if !ccw_ready() then return
+
+    val text = "c const\n    A: i8 = \"(signed char)-3\"\n    B: u8 = \"(_Bool)7\"\n" +
+               "    C: usize = \"(void *)4096\"\n    D: i32 = \"2.9\"\n    E: i32 = \"-2.9\"\n" +
+               "    F: u8 = \"'A'\"\n\nprint(A)\nprint(B)\nprint(C)\nprint(D)\nprint(E)\nprint(F)\n"
+
+    assert_eq(ccw_ran(text), "-3\n1\n4096\n2\n-2\n65\n")
+
+// -- a line declared at a measured type ---------------------------------------------------------------
+
+@test("a line declared at a measured signed type refuses an unsigned maximum")
+ccw_measured_signed_type_refuses_u64_max()
+    if !ccw_ready() then return
+
+    val a = ccw_err("@include(\"<stdint.h>\")\nc type\n    T = \"int64_t\"\n\nc const\n    N: T = \"UINT64_MAX\"\n\nprint(N)\n")
+
+    assert(ccw_says(a, "is 18446744073709551615 here, which 'T' cannot hold"), a)
+
+    val b = ccw_err("@include(\"<stdint.h>\")\nc type\n    T = \"uint32_t\"\n\nc const\n    N: T = \"-1\"\n\nprint(N)\n")
+
+    assert(ccw_says(b, "is -1 here, which 'T' cannot hold — it holds 0 to 4294967295"), b)
+
+    assert_eq(ccw_ran("@include(\"<stdint.h>\")\nc type\n    T = \"int64_t\"\n\nc const\n    N: T = \"INT64_MIN\"\n" +
+                      "    M: T = \"-1u\"\n\nprint(N)\nprint(M)\n"),
+              "-9223372036854775808\n4294967295\n")
+
+// -- the target ---------------------------------------------------------------------------------------
+
+// A Cortex-M has no `__int128`, so the probe must read 64-bit values without one -- and its plain
+// `char` is unsigned, which the C type of the expression carries through.
+@test("on a machine with no __int128, the u64 maximum and C's own char")
+ccw_a_target_with_no_int128()
+    if !ccw_ready() then return
+
+    val ir = ccw_lowered("@include(\"<stdint.h>\")\nc const\n    A: u64 = \"UINT64_MAX\"\n" +
+                         "    B: u8 = \"(char)-3\"\n    C: i64 = \"INT64_MIN\"\n\n" +
+                         "@export(\"main\")\nentry() -> i32\n    val a = A\n    val b = B\n    val c = C\n" +
+                         "    i32(a & 1) + i32(b) + i32(c & 1)\n",
+                         Some("thumbv7em-freestanding"))
+
+    assert(!ccw_says(ir, "refused:"), ir)
+
+    val a = ccw_lowered("@include(\"<stdint.h>\")\nc const\n    N: i64 = \"UINT64_MAX\"\n\n" +
+                        "@export(\"main\")\nentry() -> i32 = i32(N & 1)\n", Some("thumbv7em-freestanding"))
+
+    assert(ccw_says(a, "is 18446744073709551615 here, which 'i64' cannot hold"), a)
+
+// x86-64 has a `_BitInt` past 128 bits, which is the one way C has a value past the words read.
+@test("a _BitInt past 128 bits is read exactly where it is declared that wide")
+ccw_a_bitint_past_128_bits()
+    if !ccw_ready() then return
+
+    val ir = ccw_lowered("c const\n    N: u256 = \"(unsigned _BitInt(256))1 << 200\"\n\n" +
+                         "@export(\"main\")\nentry() -> i32 = if N > 0 then 1 else 0\n",
+                         Some("x86_64-freestanding"))
+
+    assert(!ccw_says(ir, "refused:"), ir)
+
+    val a = ccw_lowered("c const\n    N: u200 = \"(unsigned _BitInt(256))1 << 200\"\n\n" +
+                        "@export(\"main\")\nentry() -> i32 = if N > 0 then 1 else 0\n", Some("x86_64-freestanding"))
+
+    assert(ccw_says(a, "is 1606938044258990275541962092341162602522202993782792835301376 here, which " +
+                       "'u200' cannot hold"), a)
+
+@test("and past the words read for a narrow line, refused as wider than they are")
+ccw_a_bitint_past_the_words_read()
+    if !ccw_ready() then return
+
+    val a = ccw_lowered("c const\n    N: u8 = \"(unsigned _BitInt(256))1 << 200\"\n\n" +
+                        "@export(\"main\")\nentry() -> i32 = i32(N)\n", Some("x86_64-freestanding"))
+
+    assert(ccw_says(a, "'(unsigned _BitInt(256))1 << 200' is wider than 128 bits here, which 'u8' " +
+                       "cannot hold — it holds 0 to 255"), a)
+
+    val b = ccw_lowered("c const\n    N: i64 = \"-((_BitInt(256))1 << 200)\"\n\n" +
+                        "@export(\"main\")\nentry() -> i32 = i32(N & 1)\n", Some("x86_64-freestanding"))
+
+    assert(ccw_says(b, "is wider than 128 bits here, which 'i64' cannot hold"), b)
+
+// -- the refusal C makes ------------------------------------------------------------------------------
+
+// The exact form writes each expression many times over; a refusal is re-asked of the one-global
+// form, so clang's complaint is said once.
+@test("an expression C refuses is quoted once, not once per word read")
+ccw_a_c_refusal_is_said_once()
+    if !ccw_ready() then return
+
+    val a = ccw_err("c const\n    N: u128 = \"1 +\"\n\nprint(N)\n")
+
+    assert(ccw_says(a, "the C compiler refused this file's 'c const' block:"), a)
+    assert_eq(ccw_count(a, "error: expected expression"), 1)
+
+    val b = ccw_err("c const\n    N: u64 = \"atoi(\\\"3\\\")\"\n\nprint(N)\n")
+
+    assert(ccw_says(b, "the C compiler refused this file's 'c const' block:"), b)
+    assert_eq(ccw_count(b, "error: initializer element is not a compile-time constant"), 1)
