@@ -1349,15 +1349,21 @@ analyze_instance_in(a: &Analysis, cx: &Analyzer, name: string, d: FuncDecl) -> T
 
     if !d.crossing.is_empty() then a.crossing_params.put(name, d.crossing)
 
-    // A member's typed function carries its declaration's span, as a free function's does; an
-    // instantiation, declared nowhere under its own name, keeps its body's.
-    val declared = a.tables.members.decl_spans.get(name).unwrap_or(span)
+    // **An instantiation carries the span of the declaration it was made from**, head to end of body,
+    // as a free function and a member do: every instantiation of one generic shares it, which is what
+    // tells a closure lowered once per instantiation from one written inside another body
+    // (`emit_strict_fp.sysl`, `error_trace.sysl`). Only a body the compiler made up, written nowhere,
+    // falls back to its last statement (`decl_anchor`). A free generic's is the statement it was
+    // filed under, so an annotation above it is where it begins, as it is for a plain function.
+    val origin = a.tables.members.func_origin.get(name)
+    val filed = if origin.is_some() then a.tables.funcs.get(origin.unwrap()).map(f -> f.span) else None
+    val declared = a.tables.members.decl_spans.get(name).unwrap_or(filed.unwrap_or(decl_anchor(d)))
 
     TFunc(declared, name, params, answers, answered, d.variadic, contract.0, contract.1, contract.2,
           file_local(d.vis) || mentions_closure(name),
           d.conv, d.tailrec, contract.3, d.pure, d.ghost,
-          frame_symbols(cx, span, name, d.reads, "reads"),
-          frame_symbols(cx, span, name, d.writes, "writes"),
+          frame_symbols(cx, declared, name, d.reads, "reads"),
+          frame_symbols(cx, declared, name, d.writes, "writes"),
           exported_symbol(d), d.section, body_marks(cx, d.marks), cx.owner, d.const_fn, Some(cx.scope.src),
           export_hidden(d))
 end analyze_instance_in

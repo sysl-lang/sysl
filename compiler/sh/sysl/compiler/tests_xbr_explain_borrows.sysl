@@ -266,11 +266,11 @@ xbr_generics()
             var firsts: Buf[string] = buf()
             var fetches: Buf[string] = buf()
 
-            // An instantiation is placed at its body, which is where the two copies differ from the
-            // declaration they were made from.
+            // An instantiation is placed where its generic was declared, as a plain function is: both
+            // copies at the declaration's head.
             for item in notes
-                if item.starts_with(s"$file:23:29: ") then firsts.push(item[file.len + 8..<item.len])
-                if item.starts_with(s"$file:24:32: ") then fetches.push(item[file.len + 8..<item.len])
+                if item.starts_with(s"$file:23:1: ") then firsts.push(item[file.len + 7..<item.len])
+                if item.starts_with(s"$file:24:1: ") then fetches.push(item[file.len + 7..<item.len])
 
             assert_eq(firsts.len(), 2)
             assert(firsts[0].ends_with("answers a place of 'p': p.a"), firsts[0])
@@ -326,3 +326,28 @@ xbr_report_edges()
             assert_eq(notes.len(), 1)
             assert(notes[0].starts_with("error: undefined name 'm'"), notes[0])
 end xbr_report_edges
+
+// An instantiation's note is placed and worded as the plain function's beside it is: at the
+// declaration's head, with the line inside its body that made the answer.
+@test("an instantiation is placed at its declaration, and says where in its body its answer was made")
+xbr_instantiation_placed_as_a_plain_function()
+    xbr_run(raw"""
+        struct Leaf
+            v: int
+
+        made[T](x: T, n: int) -> &Leaf
+            val l = Leaf(n)
+            l
+
+        plain(x: int, n: int) -> &Leaf
+            val l = Leaf(n)
+            l
+
+        print(made(1, 2).v + plain(1, 3).v)
+        """, true) match
+        None -> ()
+        Some((code, notes, file)) ->
+            assert_eq(code, Fine)
+            assert_eq(xbr_line(notes, file, "4:1"), "'made.int' is not borrowed: a reference made here, at 6:5")
+            assert_eq(xbr_line(notes, file, "8:1"), "'plain' is not borrowed: a reference made here, at 10:5")
+end xbr_instantiation_placed_as_a_plain_function
