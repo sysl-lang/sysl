@@ -1,6 +1,6 @@
 ---
 title: The bigint module
-summary: "`sysl.math.bigint` — integers with no width: sign and magnitude over machine-word limbs, schoolbook multiply, Knuth's algorithm D, bit operations on an infinite two's complement, and text in any base."
+summary: "`sysl.math.bigint` — integers with no width: sign and magnitude over machine-word limbs, Karatsuba and Toom-3 multiplication, Knuth's algorithm D and recursive division, bit operations on an infinite two's complement, and text in any base."
 weight: 63
 ---
 
@@ -120,16 +120,37 @@ wants the floored one, and gets a negative index from the other. That is what th
 
 ## The algorithms are named so they can be checked
 
-**Multiplication is schoolbook** and **division is Knuth's algorithm D** (*The Art of Computer
-Programming*, volume 2, §4.3.1). Both are quadratic. Karatsuba, Toom-Cook and a Barrett or Montgomery
-reduction are all improvements that fit behind this same surface and change no answer, so they are
-work somebody does when a program is slow rather than decisions this module had to make.
+Each operation picks its algorithm by the size of its operands, and every one of them is a published
+algorithm a reader can check this one against. None changes an answer; they change how the time grows.
+
+| operation | small operands | larger | largest |
+|---|---|---|---|
+| multiply | schoolbook | **Karatsuba** (from 32 limbs) | **Toom-3** (from 160 limbs), Bodrato's interpolation |
+| square | schoolbook, each cross product once | Karatsuba of squares | — |
+| divide | **Knuth's algorithm D** (*TAOCP* vol. 2, §4.3.1) | **Burnikel–Ziegler** recursive division (divisor and quotient both from 48 limbs) | — |
+| divide by one limb | Möller–Granlund division by a precomputed reciprocal | — | — |
+| text, both ways | a limb-sized chunk of digits at a time | **divide and conquer** over the squares of the chunk (from 40 limbs) | — |
+| gcd | Euclid in machine words | **Lehmer's** algorithm (*TAOCP* §4.5.2, algorithm L) | — |
+
+Karatsuba multiplies in about `n^1.585` steps where schoolbook takes `n^2`, and Toom-3 in about
+`n^1.465`; the recursive division costs about twice a multiplication of the same size, and the
+conversions to and from text a multiplication's cost times `log n`. **Nothing here is FFT-based**, so
+past ten thousand limbs or so a library that has a Schönhage–Strassen multiply pulls away. The
+thresholds are measured crossovers on a 64-bit Apple core, and the crossovers are broad.
+
+**Division by a single limb never divides.** No 64-bit machine has an instruction for a two-limb by
+one-limb division, and a `u128 / u128` is a call into the runtime; Möller and Granlund's method
+("Improved division by invariant integers", 2011) replaces it with two multiplications by a reciprocal
+computed once per divisor. Every conversion to text is made of these.
 
 The one thing worth knowing about algorithm D is that its quotient digit is a *guess* that has to be
 corrected twice — a loop that tightens it, and an add-back for the one case the loop still gets wrong.
 The add-back fires about twice in every `2^w` digits for a `w`-bit limb, which is rare enough that a
 suite of generated inputs never enters it: the library's own tests use inputs constructed to force
 it, one for each limb width, because two hundred random pairs left the branch green with it deleted.
+The recursive division has a rare branch of the same kind — a guess capped at every limb set when the
+top of the dividend equals the top of the divisor — and its tests force that one with a quotient whose
+every limb is the largest there is.
 
 ## The bit operations read a value as infinitely wide two's complement
 
@@ -219,8 +240,11 @@ decrease is the one that has arrived. It is the exact floor, so `isqrt(2)` is `1
 
 Both directions work a chunk at a time rather than a digit at a time, the chunk being the largest
 power of the base that fits in a limb — on a 64-bit target `10^19` for base ten and `2^63` for
-binary. So rendering divides the whole magnitude by `10^19` and gets nineteen digits out of the
-remainder with ordinary machine arithmetic.
+binary. So rendering divides the magnitude by `10^19` and gets nineteen digits out of the remainder
+with ordinary machine arithmetic. A large value is first split by divide and conquer: divided by the
+largest `10^(19·2^k)` below it, with the quotient and the remainder each rendered the same way and the
+remainder padded with the zeros that are digits of the whole — and reading is the mirror image, so a
+million digits take a fraction of a second rather than minutes.
 
 ```sysl
 import sysl.math.bigint.{parse, parse_radix, to_string_radix}

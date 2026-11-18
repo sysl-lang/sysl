@@ -371,3 +371,91 @@ int sysl_io_posix_poll_close(int poller, int wake) {
 
     return -e;
 }
+
+// `sysl.io.poll.WakeFd`: a descriptor readable while a wake is pending. **Linux's `eventfd` is one
+// descriptor**, a counter a wake adds one to and a read empties; everywhere else it is a pipe, whose
+// read end is watched and whose write end takes a byte per wake. Both ends never block, so a wake
+// finding the counter or the pipe full -- a wake already pending -- succeeds, and a drain reads until
+// there is nothing left.
+
+#include <fcntl.h>
+
+#if defined(__linux__)
+
+#include <sys/eventfd.h>
+
+int sysl_io_posix_wakefd_open(int32_t *write_end) {
+    int fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+
+    *write_end = -1;
+    return fd < 0 ? -errno : fd;
+}
+
+#else
+
+// Both ends close on `exec` and never block; a failure setting either closes both.
+static int sysl_wakefd_flags(int fd) {
+    int fl = fcntl(fd, F_GETFL);
+
+    if (fl < 0 || fcntl(fd, F_SETFL, fl | O_NONBLOCK) != 0) return errno;
+    if (fcntl(fd, F_SETFD, FD_CLOEXEC) != 0) return errno;
+    return 0;
+}
+
+int sysl_io_posix_wakefd_open(int32_t *write_end) {
+    int ends[2];
+
+    *write_end = -1;
+
+    if (pipe(ends) != 0) return -errno;
+
+    int e = sysl_wakefd_flags(ends[0]);
+
+    if (e == 0) e = sysl_wakefd_flags(ends[1]);
+
+    if (e != 0) {
+        close(ends[0]);
+        close(ends[1]);
+        return -e;
+    }
+
+    *write_end = ends[1];
+    return ends[0];
+}
+
+#endif
+
+int sysl_io_posix_wakefd_wake(int fd, int write_end) {
+    uint64_t one = 1;
+    int to = write_end >= 0 ? write_end : fd;
+    size_t len = write_end >= 0 ? 1 : sizeof one;
+
+    for (;;) {
+        if (write(to, &one, len) == (ssize_t) len) return 0;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+        if (errno != EINTR) return -errno;
+    }
+}
+
+int sysl_io_posix_wakefd_drain(int fd) {
+    char into[512];
+    int took = 0;
+
+    for (;;) {
+        ssize_t n = read(fd, into, sizeof into);
+
+        if (n > 0) {
+            took = 1;
+            continue;
+        }
+
+        if (n == 0) return took;
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return took;
+        return -errno;
+    }
+}
+
+int sysl_io_posix_wakefd_close(int fd, int write_end) {
+    return sysl_io_posix_poll_close(fd, write_end);
+}
