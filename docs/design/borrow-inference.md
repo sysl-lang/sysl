@@ -107,7 +107,7 @@ every root in `R` is alive (decision 7) and nothing **kills** it:
 |---|---|
 | a store to a place whose edge keys meet `E` | its owner type and field, any alias (`*p`, a `ref`, another parameter, a global); a whole-value store writes every by-value part's keys |
 | a call whose edge-write summary meets `E`, or is `opaque` | §4.2 |
-| a release that may run a destructor (`may_run_drop`) | as a call to the destructor bodies it reaches (`Reacher.lets_go`); item 1 treats it as opaque |
+| a release that may run a destructor (`may_run_drop`) | opaque (BI1); BI5 makes it a call to the destructor bodies it reaches (`Reacher.lets_go`) |
 | an operation that reads a count of a type on the chain (`slot_vacate`, a uniqueness test) | the summary's count-reading set |
 | `await`, a suspension, a fiber switch, a lock or unlock | always — other code runs in the frame's time |
 | a root dying | reassignment, move, hand-over or end of block of a local root; a `@unique` root moved, assigned or dropped |
@@ -143,22 +143,62 @@ after this kill" (a dead local cannot be harmed by a kill).
 
 ### 4.2 Interprocedural — the edge-write summary
 
-`EdgeWrites { keys: Set[EdgeKey], counts: Set[Type], opaque: bool }` per function (per instance),
-the **least** fixed point over the call graph (start empty, grow — a write needs a finite path to
-it, so recursion settles on what the bodies actually write). A body contributes:
+`EdgeWrites { keys, within: Buf[Type], counts: Buf[Type], opaque: string }` per function (per
+instance), the **least** fixed point over the call graph (start empty, grow — a write needs a finite
+path to it, so recursion settles on what the bodies actually write). `opaque` is a reason (`a call
+through a closure`, `a destructor of 'Res'`), empty when every write is named, with the function whose
+own body holds it (`opaque_in`) — the words `--explain-borrows` will quote. A body contributes:
 
-- each store's edge keys (decision 4) — a store to its own `var`'s slot contributes nothing;
-- each release that may run a destructor: the destructor bodies' summaries (`releases`, `lets_go`);
-- each count read (`slot_vacate`, a uniqueness test): the type;
-- `opaque` for a foreign call outside the trusted set `untouched_by` already trusts (the printing
-  helpers, `sealed_callees`), a call through a function value or closure, a table call not resolved
-  by `slot_callees` in a closed program, a laundered cast's store (`Casts`), a thread spawn, a
-  suspension, a fiber switch, inline `asm` that may write memory;
-- every callee's summary.
+- **each store's edge keys** (decision 4), by these rules:
+  - a store to a local or parameter of the body's own, reached without a dereference (fields of it,
+    elements of a local array), contributes nothing — the frame's slot is no edge;
+  - a store of a value that holds **no count** changes no edge and contributes no key;
+  - otherwise it writes the edge its place sits on **and every edge that place sits inside by value**
+    — `a.b.c = v` writes `(B, c)` and `(A, b)`, since a reader may hold a copy of the `B` — climbing
+    until the object the place is in: module storage (no edge), a reference's referent (a counted
+    object, which nothing holds by value), or storage reached through a **pointer, a view or a `ref`**,
+    whose container cannot be named: that adds the written type to `within`;
+  - it also writes every counted edge of the value it overwrites (`by_value_parts`);
+- **`within`**: a type written through a pointer, view or `ref`. It meets an edge whose held value
+  lays that type out by value (`*p = None` with `p: *Option[&Node]` meets `(Node, next)` and
+  `(Holder, inner)` where `inner: Inner` holds one). Every pointer write is noted counted or not, and
+  judged against the program's **writable** casts (a cast to a non-`const` pointer from another
+  pointee type, an integer or anything not a named object; a non-read-only `view_as`): a write
+  through a type such a cast made from anything is `opaque`; one made from a named object's address
+  writes that object's counted edges; read-only casts and views (`x.bytes`) are not counted, since
+  nothing can store through them;
+- **the slot forms**: `slot_place`, `slot_place_run`, `slot_take` and `slot_vacate` write
+  `(slot of E)` and the counted edges inside an `E`; `slot_put` (fills an empty slot) and
+  `slot_storage` write nothing a reader could have read, and neither does relocation;
+- each count read (`slot_vacate`; there is no other uniqueness test today): the element type;
+- **`opaque`** for: a call through a closure (an erased `FnN` table — not followed into the closures
+  it could be, even in a closed program; a closure called directly by its own type is an ordinary
+  call), a call through a function value, a table call not resolved by `slot_callees` in a closed
+  program, a store through a laundered cast, a suspension (`await`, `block_on`, a step) and a fiber
+  switch, inline `asm` that clobbers memory, a store to a place the analysis cannot name, and **any
+  release that may run a destructor** (`may_run_drop` on what the body holds; BI5 refines this to the
+  destructor bodies' summaries);
+- **a foreign call**: trusted (contributes only a `within` write of what it is handed a writable
+  pointer or view to) when the program is a closed program's build, the function is not variadic,
+  `@abandons` or returns-twice, every parameter is a plain value or a pointer/view to one, and every
+  sysl function C can call (`c_entered`) has an empty, non-opaque summary — otherwise the summary is
+  solved again with every foreign call opaque, as `quiet_callees` does. A thread spawn is opaque by
+  this rule (`pthread_create` is handed a function pointer);
+- every callee's summary, for the calls on paths that come back; **a call on a path that ends the
+  program is not followed** (no frame that lent anything runs again), except an `@abandons` callee,
+  after which the program goes on in an earlier frame.
 
-It is computed in the walk `untouched_summary` already makes (`ReachSink` gains the three fields), so
-it costs one more fixpoint, not one more walk. Where no body is in sight — `extern`, a function
-pointer, an archive's function — the answer is `opaque`, the line every inferred fact draws.
+It is computed in the walk `untouched_summary` already makes (`ReachSink` gains `writes` and
+`wcasts`; `Untouched` keeps each body's own writes), and the fixpoint runs the first time a summary is
+asked for (`edge_writes(u, name)`), so a build that asks none pays only the walk's extra notes. Where
+no body is in sight — `extern`, a function pointer, an archive's function, a name no body of the
+build has — the answer is `opaque`, the line every inferred fact draws.
+
+**The API the later items use** (`borrowing.sysl`): `edge_writes(u, name) -> EdgeWrites`;
+`field_key(owner, i)` and `slot_key(elem)` build the keys a read adds; `writes_edge(w, key)` and
+`first_written(w, keys)` answer whether a summary meets a chain (and which edge, for the report);
+`reads_count(w, t)` whether it reads a count of a chain type; `edge_text(key)` shows one
+(`Node.next`, `the slots of &Node`).
 
 ### 4.3 Parameter conventions
 
@@ -354,12 +394,16 @@ the functions it changes; `tests_fle_for_lend.sysl`, `tests_dvp_diverging_path.s
 owned-params tests are the blast radius of every item). Expected gains are the studies' numbers,
 not new measurements; each item's proof is its IR-count rows.
 
-1. **BI1 — the edge-write summary** (`borrowing.sysl`: `ReachSink`/`Untouched` gain `edges`,
-   `counts`, `opaque`; the least fixpoint; edge keys incl. by-value parts and slot elements).
-   No codegen change. Tests (`bls_`): summaries of a store, a whole-value store, a callee's
-   inherited write, recursion settling, a closure/foreign/table call → opaque, a destructor's writes
-   reached by a release, `slot_vacate` → counts, relocation → no key, a generic per instance.
-   Gain: none by itself; it is the judgment the rest share.
+1. **BI1 — the edge-write summary** (`borrowing.sysl`: `ReachSink` gains `writes`/`wcasts`,
+   `Untouched` each body's own writes; the least fixpoint, solved lazily; edge keys incl. by-value
+   parts and slot elements; the API at the end of §4.2). No codegen change, no `--explain-borrows`
+   line (its lines are BI2's and BI3's). Tests (`tests_bls_borrow_edge_summary.sysl`): a store, a
+   plain store, own slots, a whole-value store, a nested store, stores through a pointer, a `ref`,
+   another parameter and module storage, a laundered cast, a callee's inherited write, recursion
+   settling, a closure/function-value/foreign/variadic/table call → opaque (and a trusted foreign
+   call, and the call-back and library distrust), a spawn, an `await`, an unseen callee, a release
+   that may run a destructor → opaque, `slot_vacate` → slots + counts, push (relocation) → no key, a
+   generic per instance. Gain: none by itself; it is the judgment the rest share.
 2. **BI2 — +0 locals (R1)**: the dataflow of §4.1 on the typed tree; `lent_decls` generalised to
    every `var`, `val`, arm and `is` binding; materialisation at keeps; `--explain-borrows` local
    lines; `memory.md`'s new section; `lent_element` left as is (it becomes a special case; folding it

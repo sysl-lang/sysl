@@ -1,0 +1,609 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.container.set
+import sysl.text.Search
+
+// The edge-write summary (`borrowing.sysl`'s `edge_writes`): what a function and everything it calls
+// may overwrite of the edges a caller read through, asked of a program typed in-process beside the
+// standard module. Each source of a write gets the case that writes and the neighbour that does not.
+
+private var bls_library_cache: Buf[Program] = buf()
+private var bls_library_read: bool = false
+
+private bls_library() -> Buf[Program]
+    if bls_library_read then return bls_library_cache
+
+    bls_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> bls_library_cache = units
+
+    bls_library_cache
+end bls_library
+
+private bls_no_library() -> bool
+    if bls_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end bls_no_library
+
+private bls_program(text: string) -> TProgram
+    var units: Buf[Program] = buf()
+
+    for item in bls_library()
+        units.push(item)
+
+    units.push(parse(source_of("test.sysl", text)).program)
+    program_of(analyze_bodies(units, host_target()), "")
+end bls_program
+
+// The program's types with a destructor, as `dropping_types` finds them.
+private bls_dropping(p: TProgram) -> Buf[Type]
+    var out: Buf[Type] = buf()
+
+    for item in p.structs
+        for d in p.destructors
+            if d.0 == mangle(item) then out.push(item)
+
+    for item in p.enums
+        for d in p.destructors
+            if d.0 == mangle(item) then out.push(item)
+
+    out
+end bls_dropping
+
+private bls_summary(p: TProgram) -> Untouched = untouched_summary(p, bls_dropping(p), set(), true)
+
+// The key of the program's function `m.<name>`.
+private bls_key(name: string) -> string = s"m${ModuleSep}$name"
+
+private bls_of(u: *Untouched, name: string) -> EdgeWrites = edge_writes(u, bls_key(name))
+
+private bls_writes(text: string, name: string) -> EdgeWrites
+    var u = bls_summary(bls_program(text))
+
+    bls_of(&u, name)
+end bls_writes
+
+// The edges a summary names, as a reader is shown them, in the order they were found.
+private bls_keys(w: EdgeWrites) -> string
+    var out = ""
+
+    for item in w.keys
+        out = if out == "" then edge_text(item) else s"$out, ${edge_text(item)}"
+
+    out
+end bls_keys
+
+private bls_has(w: EdgeWrites, text: string) -> bool
+    for item in w.keys
+        if edge_text(item) == text then return true
+
+    false
+end bls_has
+
+private bls_quiet(w: EdgeWrites) -> bool =
+    w.opaque == "" && w.keys.is_empty() && w.within.is_empty() && w.counts.is_empty()
+
+private bls_says(w: EdgeWrites) -> string =
+    s"keys [${bls_keys(w)}] within ${w.within.len()} counts ${w.counts.len()} opaque '${w.opaque}' in '${w.opaque_in}'"
+
+// A field of a struct the program declares, as an edge key.
+private bls_field(p: TProgram, owner: string, field: string) -> EdgeKey
+    for item in p.structs
+        underlying(item) match
+            Struct(d) ->
+                if type_show(item) == owner
+                    for i in 0..<d.fields.len()
+                        if d.fields[i].0 == field then return field_key(item, int(i)).unwrap()
+            _ -> ()
+
+    assert(false, s"no field $owner.$field")
+    slot_key(Unknown)
+end bls_field
+
+private bls_head() -> string = """
+    module m
+
+    struct Node
+        v: int
+        next: Option[&Node]
+
+    struct Inner
+        n: int
+        r: Option[&Node]
+
+    struct Holder
+        k: int
+        inner: Inner
+
+    """
+
+// -- a body's own stores ---------------------------------------------------------------------------
+
+@test("a store to a counted field through a reference writes that field's edge, and only it")
+bls_field_store()
+    if bls_no_library() then return
+
+    val w = bls_writes(bls_head() + "cut(n: &Node)\n    n.next = None\n", "cut")
+
+    assert_eq(bls_keys(w), "Node.next", bls_says(w))
+    assert(w.opaque == "" && w.within.is_empty() && w.counts.is_empty(), bls_says(w))
+
+@test("a store of a value that holds no count writes no edge")
+bls_plain_store()
+    if bls_no_library() then return
+
+    val w = bls_writes(bls_head() + "bump(n: &Node)\n    n.v += 1\n    n.v = 3\n", "bump")
+
+    assert(bls_quiet(w), bls_says(w))
+
+@test("a store to the body's own local, parameter or local array writes no edge")
+bls_own_slots()
+    if bls_no_library() then return
+
+    val text = bls_head() + """
+        walk(n: &Node) -> int
+            var cur = n.next
+            var h = Holder(0, Inner(0, None))
+            var a: [2]Option[&Node] = [None, None]
+
+            h.inner.r = cur
+            a[1] = cur
+            cur = None
+            0
+
+        """
+    val w = bls_writes(text, "walk")
+
+    assert(bls_quiet(w), bls_says(w))
+
+@test("a whole-value store writes every counted edge of the value it overwrites, by value all the way down")
+bls_whole_value_store()
+    if bls_no_library() then return
+
+    val w = bls_writes(bls_head() + "reset(h: &Holder2)\n    h.h = Holder(1, Inner(2, None))\n" +
+                       "struct Holder2\n    h: Holder\n", "reset")
+
+    assert(bls_has(w, "Holder2.h") && bls_has(w, "Holder.inner") && bls_has(w, "Inner.r"), bls_says(w))
+    assert(!bls_has(w, "Holder.k") && !bls_has(w, "Node.next"), bls_says(w))
+
+@test("a store inside a value held by value writes the edges it sits inside")
+bls_nested_store()
+    if bls_no_library() then return
+
+    val w = bls_writes(bls_head() + "struct Box\n    h: Holder\n\nset(b: &Box)\n    b.h.inner.r = None\n",
+                       "set")
+
+    assert_eq(bls_keys(w), "Inner.r, Holder.inner, Box.h", bls_says(w))
+
+// -- stores through aliases ------------------------------------------------------------------------
+
+@test("a store through a pointer is a write within the pointee's type, and meets every edge holding one")
+bls_pointer_store()
+    if bls_no_library() then return
+
+    val text = bls_head() + "clear(p: *Option[&Node])\n    *p = None\n"
+    val p = bls_program(text)
+    var u = bls_summary(p)
+    val w = bls_of(&u, "clear")
+
+    assert(w.opaque == "" && w.within.len() == 1, bls_says(w))
+    assert(writes_edge(w, bls_field(p, "Node", "next")), bls_says(w))
+    assert(writes_edge(w, bls_field(p, "Inner", "r")), bls_says(w))
+    // `Holder.inner` lays an `Inner`, and with it an `Option[&Node]`, out by value.
+    assert(writes_edge(w, bls_field(p, "Holder", "inner")), bls_says(w))
+    assert(!writes_edge(w, bls_field(p, "Holder", "k")), bls_says(w))
+
+@test("a store to a field through a pointer names the field and its container may be anywhere")
+bls_pointer_field_store()
+    if bls_no_library() then return
+
+    val text = bls_head() + "struct Box\n    h: Inner\n\nset(p: *Inner)\n    p.r = None\n"
+    val p = bls_program(text)
+    var u = bls_summary(p)
+    val w = bls_of(&u, "set")
+
+    assert(bls_has(w, "Inner.r"), bls_says(w))
+    assert(writes_edge(w, bls_field(p, "Box", "h")), bls_says(w))
+    assert(!writes_edge(w, bls_field(p, "Node", "next")), bls_says(w))
+
+@test("a store through a 'ref' lands wherever the ref was bound")
+bls_ref_store()
+    if bls_no_library() then return
+
+    val text = bls_head() + "cut(n: &Node)\n    ref r = n.next\n\n    r = None\n"
+    val p = bls_program(text)
+    var u = bls_summary(p)
+    val w = bls_of(&u, "cut")
+
+    assert(writes_edge(w, bls_field(p, "Node", "next")), bls_says(w))
+    assert(!writes_edge(w, bls_field(p, "Holder", "inner")), bls_says(w))
+
+@test("a store through another parameter or module storage is judged by owner and field, not by name")
+bls_alias_store()
+    if bls_no_library() then return
+
+    val text = bls_head() + """
+        var head: Option[&Node] = None
+
+        cut_global()
+            head.unwrap().next = None
+
+        cut_other(a: &Node, b: &Node)
+            b.next = a.next
+
+        drop_head()
+            head = None
+
+        """
+    var u = bls_summary(bls_program(text))
+
+    assert_eq(bls_keys(bls_of(&u, "cut_global")), "Node.next", bls_says(bls_of(&u, "cut_global")))
+    assert_eq(bls_keys(bls_of(&u, "cut_other")), "Node.next", bls_says(bls_of(&u, "cut_other")))
+
+    // Module storage is no edge; the value it overwrites is an `Option[&Node]` whose payload is one.
+    val g = bls_of(&u, "drop_head")
+
+    assert(g.opaque == "" && !bls_has(g, "Node.next"), bls_says(g))
+
+@test("a store through a pointer a cast made from another type is opaque; a read-only view is not")
+bls_laundered_store()
+    if bls_no_library() then return
+
+    val text = bls_head() + """
+        import sysl.raw.ptr_cast
+
+        scribble(p: *Node)
+            val b: *u8 = ptr_cast(p)
+
+            *b = 0
+
+        fill(b: []u8)
+            b[0] = 1
+
+        """
+    var u = bls_summary(bls_program(text))
+    val w = bls_of(&u, "scribble")
+
+    assert_eq(w.opaque, "a store through a pointer a cast made", bls_says(w))
+
+    // Every byte write in that program is now suspect: a `*u8` may lay over a `Node`.
+    assert_eq(bls_of(&u, "fill").opaque, "a store through a pointer a cast made", bls_says(bls_of(&u, "fill")))
+
+    // Without the cast, the byte write changes no edge.
+    var v = bls_summary(bls_program(bls_head() + "fill(b: []u8)\n    b[0] = 1\n\nlook(n: &Node) -> int = n.v\n"))
+
+    assert(bls_quiet(bls_of(&v, "fill")), bls_says(bls_of(&v, "fill")))
+
+// -- calls -----------------------------------------------------------------------------------------
+
+@test("a caller inherits what its callees write, through any depth, and not what they do not")
+bls_transitive()
+    if bls_no_library() then return
+
+    val text = bls_head() + """
+        cut(n: &Node)
+            n.next = None
+
+        middle(n: &Node)
+            cut(n)
+
+        outer(n: &Node) -> int
+            middle(n)
+            n.v
+
+        reader(n: &Node) -> int = n.v + 1
+
+        caller(n: &Node) -> int = reader(n) * 2
+
+        """
+    var u = bls_summary(bls_program(text))
+
+    assert_eq(bls_keys(bls_of(&u, "outer")), "Node.next", bls_says(bls_of(&u, "outer")))
+    assert(bls_quiet(bls_of(&u, "caller")), bls_says(bls_of(&u, "caller")))
+
+@test("recursion settles on what the bodies write: a recursive reader writes nothing")
+bls_recursion()
+    if bls_no_library() then return
+
+    val text = bls_head() + """
+        length(n: Option[&Node]) -> int = n match
+            Some(x) -> 1 + length(x.next)
+            None -> 0
+
+        even(n: Option[&Node]) -> bool = n match
+            Some(x) -> odd(x.next)
+            None -> true
+
+        odd(n: Option[&Node]) -> bool = n match
+            Some(x) ->
+                x.v = 0
+                even(x.next)
+            None -> false
+
+        ping(n: Option[&Node]) -> int = n match
+            Some(x) -> pong(x.next)
+            None -> 0
+
+        pong(n: Option[&Node]) -> int = n match
+            Some(x) ->
+                x.next = None
+                ping(None)
+            None -> 0
+
+        """
+    var u = bls_summary(bls_program(text))
+
+    assert(bls_quiet(bls_of(&u, "length")), bls_says(bls_of(&u, "length")))
+    assert(bls_quiet(bls_of(&u, "even")) && bls_quiet(bls_of(&u, "odd")), bls_says(bls_of(&u, "even")))
+    assert_eq(bls_keys(bls_of(&u, "ping")), "Node.next", bls_says(bls_of(&u, "ping")))
+    assert_eq(bls_keys(bls_of(&u, "pong")), "Node.next", bls_says(bls_of(&u, "pong")))
+
+@test("a call through a closure is opaque, and so is its caller")
+bls_closure_call()
+    if bls_no_library() then return
+
+    val text = bls_head() + """
+        apply(f: &Fn1[&Node, unit], n: &Node)
+            f(n)
+
+        use(n: &Node)
+            apply(x -> x.v = 1, n)
+
+        """
+    var u = bls_summary(bls_program(text))
+
+    assert_eq(bls_of(&u, "apply").opaque, "a call through a closure", bls_says(bls_of(&u, "apply")))
+    assert_eq(bls_of(&u, "apply").opaque_in, bls_key("apply"), bls_says(bls_of(&u, "apply")))
+    assert_eq(bls_of(&u, "use").opaque_in, bls_key("apply"), bls_says(bls_of(&u, "use")))
+
+@test("a call through a function value is opaque")
+bls_function_value()
+    if bls_no_library() then return
+
+    val text = bls_head() + """
+        cut(n: &Node)
+            n.next = None
+
+        via(n: &Node)
+            val f: *extern(&Node) -> unit = &cut
+
+            f(n)
+
+        """
+    val w = bls_writes(text, "via")
+
+    assert_eq(w.opaque, "a call through a function value", bls_says(w))
+
+@test("a foreign call handed only plain values is trusted; one handed a counted object's address is not")
+bls_foreign_call()
+    if bls_no_library() then return
+
+    val text = bls_head() + """
+        extern "labs" c_labs(x: long) -> long
+        extern "bls_poke" c_poke(p: *Node)
+        extern "bls_dots" c_dots(n: int, ...) -> int
+
+        plain(n: &Node) -> long = c_labs(long(n.v))
+
+        poke(p: *Node)
+            c_poke(p)
+
+        dots() -> int = c_dots(1, 2)
+
+        """
+    var u = bls_summary(bls_program(text))
+
+    assert(bls_quiet(bls_of(&u, "plain")), bls_says(bls_of(&u, "plain")))
+    assert_eq(bls_of(&u, "poke").opaque, "a foreign call to 'm.c_poke', handed a pointer to 'Node'",
+              bls_says(bls_of(&u, "poke")))
+    assert_eq(bls_of(&u, "dots").opaque, "a foreign call to 'm.c_dots'", bls_says(bls_of(&u, "dots")))
+
+@test("no foreign call is trusted where C can call back into a function that writes an edge")
+bls_foreign_call_back()
+    if bls_no_library() then return
+
+    val text = bls_head() + """
+        extern "labs" c_labs(x: long) -> long
+
+        @export("bls_back")
+        back(n: &Node)
+            n.next = None
+
+        plain(n: &Node) -> long = c_labs(long(n.v))
+
+        """
+    val w = bls_writes(text, "plain")
+
+    assert_eq(w.opaque, "a foreign call to 'm.c_labs' (C can call back into code that writes one)", bls_says(w))
+
+@test("a call through a trait object's table is every table's body in a program, and opaque in a library")
+bls_table_call()
+    if bls_no_library() then return
+
+    val text = bls_head() + """
+        trait Step
+            step(self, n: &Node)
+
+        struct Cut
+
+        struct Look
+
+        impl Step for Cut
+            step(self, n: &Node) = n.next = None
+
+        impl Step for Look
+            step(self, n: &Node) = print(n.v)
+
+        go(s: &Step, n: &Node)
+            s.step(n)
+
+        both(n: &Node)
+            var a: &Step = Cut()
+            var b: &Step = Look()
+
+            go(a, n)
+            go(b, n)
+
+        """
+    val p = bls_program(text)
+    var u = bls_summary(p)
+    val w = bls_of(&u, "go")
+
+    assert_eq(bls_keys(w), "Node.next", bls_says(w))
+
+    var lib = untouched_summary(p, bls_dropping(p), set(), false)
+
+    assert_eq(bls_of(&lib, "go").opaque, "a call through a trait object's table", bls_says(bls_of(&lib, "go")))
+
+@test("a thread spawn is opaque")
+bls_spawn()
+    if bls_no_library() then return
+
+    val text = bls_head() + """
+        import sysl.threads.spawn
+
+        struct Job
+            out: int
+
+        run(j: *Job)
+            j.out = 1
+
+        start()
+            var job = Job(0)
+
+            spawn(&run, &job).unwrap().join()
+
+        """
+    val w = bls_writes(text, "start")
+
+    assert(w.opaque != "", bls_says(w))
+
+@test("an await is opaque")
+bls_await()
+    if bls_no_library() then return
+
+    val text = bls_head() + """
+        import sysl.task.yield_now
+
+        async pause(n: &Node) -> int
+            await yield_now()
+            n.v
+
+        """
+    val w = bls_writes(text, "pause")
+
+    assert(w.opaque != "", bls_says(w))
+
+@test("a callee whose body is not in the build is opaque, as a precompiled function's is")
+bls_unseen()
+    if bls_no_library() then return
+
+    var u = bls_summary(bls_program(bls_head() + "look(n: &Node) -> int = n.v\n"))
+    val w = edge_writes(&u, bls_key("nowhere"))
+
+    assert_eq(w.opaque, "a call to 'm.nowhere', whose body is not in this build", bls_says(w))
+
+@test("in a library build no foreign call is trusted")
+bls_library_build()
+    if bls_no_library() then return
+
+    var p = bls_program(bls_head() + "extern \"labs\" c_labs(x: long) -> long\n\n" +
+                        "plain(n: &Node) -> long = c_labs(long(n.v))\n")
+
+    p.entry_point = false
+
+    var u = bls_summary(p)
+    val w = bls_of(&u, "plain")
+
+    assert_eq(w.opaque, "a foreign call to 'm.c_labs' (a library cannot see what C calls)", bls_says(w))
+
+// -- releases and counts ---------------------------------------------------------------------------
+
+@test("a release that may run a destructor is opaque, and the type is named")
+bls_destructor()
+    if bls_no_library() then return
+
+    val text = bls_head() + """
+        struct Res
+            id: int
+
+        impl Drop for Res
+            drop(self) = print("gone", self.id)
+
+        make(n: &Node) -> int
+            val r = Res(n.v)
+
+            r.id
+
+        look(n: &Node) -> int = n.v
+
+        """
+    var u = bls_summary(bls_program(text))
+    val w = bls_of(&u, "make")
+
+    assert(w.opaque.starts_with("a destructor of '") && w.opaque.contains("Res"), bls_says(w))
+    assert(bls_quiet(bls_of(&u, "look")), bls_says(bls_of(&u, "look")))
+
+@test("letting go of a buffer's elements writes its slots and reads its storage's count; pushing does not")
+bls_slots()
+    if bls_no_library() then return
+
+    val text = bls_head() + """
+        import sysl.buf.{Buf, buf}
+
+        take(b: *Buf[&Node]) -> Option[&Node] = b.pop()
+
+        add(b: *Buf[&Node], n: &Node)
+            b.push(n)
+
+        """
+    var u = bls_summary(bls_program(text))
+    val popped = bls_of(&u, "take")
+    val pushed = bls_of(&u, "add")
+
+    assert(bls_has(popped, "the slots of &Node"), bls_says(popped))
+    assert(popped.counts.len() > 0 && popped.opaque == "", bls_says(popped))
+    assert(!bls_has(pushed, "the slots of &Node") && pushed.counts.is_empty(), bls_says(pushed))
+
+// -- generics --------------------------------------------------------------------------------------
+
+@test("a generic is summarised per instance: a counted instance writes the edge, a plain one does not")
+bls_generic()
+    if bls_no_library() then return
+
+    val text = bls_head() + """
+        struct Cell[T]
+            first: T
+
+        put[T](c: &Cell[T], v: T)
+            c.first = v
+
+        use(n: &Node)
+            put(Cell(n), n)
+            put(Cell(1), 2)
+
+        """
+    var u = bls_summary(bls_program(text))
+    var counted = 0
+    var plain = 0
+
+    for name in u.names
+        if name.starts_with(bls_key("put"))
+            val w = edge_writes(&u, name)
+
+            if w.keys.len() == 1 && edge_text(w.keys[0]).contains("first") then counted += 1
+            else if bls_quiet(w) then plain += 1
+            else assert(false, s"$name: ${bls_says(w)}")
+
+    assert(counted == 1 && plain == 1, s"counted $counted plain $plain")
+    assert(bls_keys(bls_of(&u, "use")).contains("first"), bls_says(bls_of(&u, "use")))
