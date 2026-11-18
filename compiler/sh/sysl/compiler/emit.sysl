@@ -431,10 +431,8 @@ struct Emit
     trap_site: Option[Span]
 
     // The tag test each enum walk's call is guarded by, by helper name, with whether the helper takes
-    // the value's address (`arc_fastpath.sysl`); and whether any call was, which is what
-    // `llvm.expect` is declared for.
+    // the value's address (`arc_fastpath.sysl`).
     tag_tests: Map[string, (TagTest, bool)]
-    uses_expect: bool
 
     // The stretches of a body a slot's life can be bounded by -- an arm, a branch, a loop's body --
     // the ones open now, innermost last, and for each entry of `prologue` the region open when that
@@ -493,6 +491,11 @@ enum HelperReq
     // object queued on the drain's slot where something is.
     HrPush(payload: Type)
 
+    // How code outside a drain lets go of a `&T` whose box can have nothing in it to tear down
+    // (`emit_arc.sysl`'s `gen_push`, writing `arc.release.<T>`): a count given back, and at zero the
+    // storage freed on the spot under the same three conditions, or the reaper started where not.
+    HrPlainRelease(payload: Type)
+
     // The release of a compact box, which finds its teardown by the payload's type rather than through
     // a hook (`emit_arc.sysl`'s `gen_compact_release`), and the step its walk takes for a reference of
     // the same type: a count given back, and at zero the box queued on the release's own list, or freed
@@ -515,6 +518,10 @@ enum HelperReq
     // What a by-value `@crossing` argument goes through (`emit_cross.sysl`): every view in the `T` at
     // an address replaced by a copy of its own, the share the old one held given back.
     HrCross(ty: Type)
+
+    // What a `&sync` box's payload goes through where it is made (`emit_cross.sysl`): every string in
+    // the `T` at an address that two domains could reach replaced by a copy whose owner is marked shared.
+    HrShare(ty: Type)
 
     // A block written out by hand as LLVM, which is text and can only be **named** by anything that
     // is not LLVM. It shares the queue with the generated ones so that a module writes its helpers
@@ -668,7 +675,7 @@ emitter_for(t: Target, destructors: Buf[(string, string, bool)]) -> Emit
          None, false, buf(), map(), map(), map(), set(), buf(), set(), set(), set(), false, untouched_none(), set(),
          no_wrap_none(), map(), buf(), Leaving, false, "", set(), buf(), map(), map(), 0, moves_none(), set(), set(), set(), set(),
          set(), map(), 0, map(), set(), map(), false, set(), map(), set(), false, false, false, buf(), set(),
-          "", set(), false, None, None, set(), None, map(), false, buf(), buf(), buf(), false, set(), None,
+          "", set(), false, None, None, set(), None, map(), buf(), buf(), buf(), false, set(), None,
           buf(), buf(), false, false, map())
 end emitter_for
 
