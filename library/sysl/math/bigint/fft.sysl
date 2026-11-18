@@ -1,0 +1,503 @@
+module sysl.math.bigint
+
+// Multiplication by number-theoretic transform, for the largest operands.
+//
+// **A product is a convolution.** Read each operand as a polynomial whose coefficients are its
+// limbs, `a = sum a_i x^i` at `x = B`, and the product's coefficients are `c_k = sum a_i b_(k - i)` --
+// before any carry is propagated. A discrete Fourier transform of length `N` turns that convolution
+// into `N` pointwise products, and a transform costs `N log N`, so the whole product does too: past
+// the size where Toom-3's `n^1.465` overtakes it, nothing else here comes close.
+//
+// **The transform is done modulo a prime, three times, and the three answers put together by the
+// Chinese remainder theorem** (Pollard, "The fast Fourier transform in a finite field", 1971).
+// Modulo a prime `p = c 2^k + 1` there is a root of unity of order `2^k`, so a transform of any
+// power-of-two length up to `2^k` exists and is exact -- no rounding to reason about, which is the
+// floating-point transform's whole difficulty. One prime under `2^62` cannot hold a coefficient,
+// which can be as large as `min(an, bn) 2^128`, but three can: their product is about `2^182.7`, so
+// every coefficient is found exactly for operands up to `2^54` limbs, far past any memory.
+//
+// That was chosen over Schönhage-Strassen -- the transform modulo `2^N + 1` GMP uses -- for two
+// reasons. Its butterflies are a multiply of one limb by one limb, which a 64-bit machine does in a
+// few instructions, where Schönhage-Strassen's are additions and shifts over whole runs of limbs, the
+// kernel this module is furthest behind GMP's assembly on. And it is a third the code, with no
+// recursion of its own: the pointwise products are single limbs.
+//
+// **Each butterfly multiplies by a twiddle in Shoup's form** -- the twiddle `w` stored beside
+// `floor(w 2^64 / p)`, so that `w v mod p` is one high multiply and two low ones with no division
+// -- and **the values are reduced lazily** (Harvey, "Faster arithmetic for number-theoretic
+// transforms", 2014): they are kept below `2p` or `4p` rather than below `p`, which is why every
+// prime is under `2^62`. The forward transform is decimation in frequency, natural order in and
+// bit-reversed out; the inverse is decimation in time, bit-reversed in and natural out; so the
+// pointwise products are taken in the scrambled order and no permutation is ever done.
+//
+// **A length is a power of two or three times one.** A product just past a power of two would
+// otherwise pay for a transform nearly twice the length it needs; with `3 2^k` as well, the waste
+// is at most a third. Every prime has `3` dividing `p - 1` for this, so a cube root of unity exists,
+// and a length `3m` is one radix-3 step that deals the values into three runs of `m`, each then a
+// power-of-two transform of its own.
+//
+// A limb is one coefficient, which ties this to a 64-bit limb: on a 32-bit machine Toom-3 carries
+// the largest products.
+
+#if ptr64
+
+/** The shorter operand's length at which the transform takes over from Toom-3. Measured on an Apple
+ * M4: Toom-3 is ahead below about 550 limbs and the transform from about 600, with the crossover
+ * stepped by which transform length a product needs.
+ */
+private[bigint] val fft_threshold: usize = 600
+
+/** The length at which a square is taken by transform rather than by Karatsuba's squares: about 800
+ * limbs, measured the same way. A square costs two transforms where a product costs three, but
+ * Karatsuba's squares are cheaper than its products too, so the crossover comes later.
+ */
+private[bigint] val fft_sqr_threshold: usize = 800
+
+/** One prime of the transform and the constants it is used with. */
+private[bigint] struct NttPrime
+    /** The prime, `c 2^k + 1` with `3` dividing `c`, under `2^62`. */
+    p: u64
+    /** `k`: the longest power-of-two transform this prime has a root of unity for is `2^k`. */
+    log_order: usize
+    /** A root of unity of order exactly `2^k`. */
+    root: u64
+    /** A root of unity of order exactly 3. */
+    cube: u64
+    /** `-p^-1 mod 2^64`, Montgomery's constant. */
+    neg_inv: u64
+    /** `2^128 mod p`, which takes a value into Montgomery's form and back out of it. */
+    r2: u64
+
+// The three primes, smallest first: the Chinese remainder step below relies on that order. Each
+// root is a power of a generator of the prime's group (5, 7 and 5); the test `ntt_prime_constants`
+// checks every constant against its definition.
+private[bigint] val prime1 = NttPrime(0x1b00000000000001, 56, 0x1665c793fa10079a,
+    0x0d80000048000000, 0x1affffffffffffff, 0x03bda12f684bda6d)
+private[bigint] val prime2 = NttPrime(0x1c80000000000001, 55, 0x08e3b9cbae619c24,
+    0x11e92dc7b67d6a2a, 0x1c7fffffffffffff, 0x09fdc11f7047dc63)
+private[bigint] val prime3 = NttPrime(0x2280000000000001, 55, 0x179a476520601fd1,
+    0x2110e79b2757e862, 0x227fffffffffffff, 0x1b67e2519f8946b6)
+
+// The Chinese remainder constants: `p1^-1 mod p2`, `(p1 p2)^-1 mod p3`, and `p1 p2` in two halves.
+private[bigint] val inv_p1_mod_p2: u64 = 0x13
+private[bigint] val inv_p12_mod_p3: u64 = 0x0c1333333333334e
+private[bigint] val p12_lo: u64 = 0x3780000000000001
+private[bigint] val p12_hi: u64 = 0x0301800000000000
+
+/** `r[0..<an + bn] = a[0..<an] * b[0..<bn]` by transform, for `an >= bn >= 1`. Writes every limb of
+ * that run; `r` must not overlap `a` or `b`.
+ */
+private[bigint] fft_mul(r: []Limb, a: []const Limb, an: usize, b: []const Limb, bn: usize)
+    convolve(r, a, an, b, bn, false)
+
+/** `r[0..<2n] = a[0..<n]^2` by transform: one forward transform per prime instead of two. */
+private[bigint] fft_sqr(r: []Limb, a: []const Limb, n: usize)
+    convolve(r, a, n, a, n, true)
+
+/** The shape of one transform: `m` a power of two, and the length `m` or `3m`. */
+private[bigint] struct Shape
+    m: usize
+    three: bool
+
+/** The shortest transform at least `need` long. */
+private[bigint] shape_for(need: usize) -> Shape
+    var m: usize = 1
+
+    while m < need do m *= 2
+
+    // `3 (m / 4)` is shorter than `m` and long enough whenever `need` is at most three quarters
+    // of `m`; a power-of-two `m` of 4 or less is short enough not to matter.
+    if m >= 8 && need <= (m / 4) * 3 then Shape(m / 4, true) else Shape(m, false)
+end shape_for
+
+/** The product's coefficients modulo each prime, then put together and carried into `r`. */
+private convolve(r: []Limb, a: []const Limb, an: usize, b: []const Limb, bn: usize, square: bool)
+    val len = an + bn
+    val shape = shape_for(len - 1)
+    val n = if shape.three then shape.m * 3 else shape.m
+
+    // One run for each prime's residues, one for the second operand's transform, and the twiddles.
+    var res = fresh(n * 3)
+    var g = if square then fresh(0) else fresh(n)
+    var tw = fresh(shape.m)
+    var twq = fresh(shape.m)
+    var t3 = if shape.three then fresh(n) else fresh(0)
+
+    residues(res[0..<n], a, an, b, bn, square, shape, prime1, tw, twq, t3, g)
+    residues(res[n..<n * 2], a, an, b, bn, square, shape, prime2, tw, twq, t3, g)
+    residues(res[n * 2..], a, an, b, bn, square, shape, prime3, tw, twq, t3, g)
+
+    recombine(r, len, res, n)
+end convolve
+
+/** `out[0..<n]` = the cyclic convolution of `a` and `b` (zero-padded to `n`) modulo `pr.p`, each
+ * value reduced into `[0, p)`. `tw`, `twq`, `t3` and `g` are scratch (`g` unused for a square).
+ */
+private residues(out: []u64, a: []const Limb, an: usize, b: []const Limb, bn: usize, square: bool,
+        shape: Shape, pr: NttPrime, tw: []u64, twq: []u64, t3: []u64, g: []u64)
+    val p = pr.p
+    val m = shape.m
+    val n = if shape.three then m * 3 else m
+    val pre = shoup_divisor(p)
+
+    // A root of order `n`: the power-of-two root squared down to order `m`, times the cube root
+    // when the length is `3m` -- orders 3 and `m` are coprime, so the product has order `3m`.
+    var w = pr.root
+    var order = pr.log_order
+
+    while (usize(1) << order) > m
+        w = mul_mod(w, w, pr)
+        order -= 1
+
+    if shape.three
+        w = mul_mod(w, pr.cube, pr)
+        powers(t3, n, w, pr)
+        // The runs of `m` are transformed with `w^3`, which is the root of order `m` the radix-3
+        // step's deal calls for.
+        w = mul_mod(mul_mod(w, w, pr), w, pr)
+
+    twiddles(tw, twq, m, w, p, pre)
+
+    val one_q = pre.quotient(1)
+
+    load(out, a, an, n, one_q, p)
+    transform(out, shape, tw, twq, t3, pr)
+
+    // The pointwise products, scaled by `1/n` on the way: `mont(x, c)` is `x c / R`, and with `x`
+    // already `a b / R`, `c = R^2 / n` leaves `a b / n`.
+    val c = mul_mod(pr.r2, p - (p - 1) / u64(n), pr)
+    val ni = pr.neg_inv
+
+    if square
+        @unchecked
+            for i in 0..<n
+                val x = out[i]
+
+                out[i] = mont(mont(x, x, p, ni), c, p, ni)
+    else
+        load(g, b, bn, n, one_q, p)
+        transform(g, shape, tw, twq, t3, pr)
+
+        @unchecked
+            for i in 0..<n
+                out[i] = mont(mont(out[i], g[i], p, ni), c, p, ni)
+
+    untransform(out, shape, tw, twq, t3, pr)
+
+    // Everything is below `6p` here; into `[0, p)`.
+    val p2 = p * 2
+    val p4 = p * 4
+
+    @unchecked
+        for i in 0..<n
+            var x = out[i]
+
+            if x >= p4 then x -= p4
+            if x >= p2 then x -= p2
+            if x >= p then x -= p
+            out[i] = x
+end residues
+
+/** `dst[0..<n]` = `src[0..<len]` modulo `p` (below `2p`), then zeros. */
+private load(dst: []u64, src: []const Limb, len: usize, n: usize, one_q: u64, p: u64)
+    @unchecked
+        for i in 0..<len
+            dst[i] = shoup(src[i], 1, one_q, p)
+
+        for i in len..<n
+            dst[i] = 0
+
+/** The forward transform of the whole length: for `3m`, the radix-3 step and then each run. */
+private transform(a: []u64, shape: Shape, tw: []const u64, twq: []const u64, t3: []const u64,
+        pr: NttPrime)
+    val m = shape.m
+
+    if shape.three
+        deal3(a, m, t3, pr)
+        forward(a, m, tw, twq, pr.p)
+        forward(a[m..], m, tw, twq, pr.p)
+        forward(a[m * 2..], m, tw, twq, pr.p)
+    else
+        forward(a, m, tw, twq, pr.p)
+end transform
+
+/** The inverse of `transform`, `n` times too large. */
+private untransform(a: []u64, shape: Shape, tw: []const u64, twq: []const u64, t3: []const u64,
+        pr: NttPrime)
+    val m = shape.m
+
+    if shape.three
+        inverse(a, m, tw, twq, pr.p)
+        inverse(a[m..], m, tw, twq, pr.p)
+        inverse(a[m * 2..], m, tw, twq, pr.p)
+        undeal3(a, m, t3, pr)
+    else
+        inverse(a, m, tw, twq, pr.p)
+end untransform
+
+/** `t[i] = w^i R mod p` for `i < n` -- the powers in Montgomery's form, so that `mont(v, t[i])` is
+ * `v w^i`. Four chains a quarter of the way apart, so that four multiplies are in flight at once.
+ */
+private powers(t: []u64, n: usize, w: u64, pr: NttPrime)
+    val p = pr.p
+    val ni = pr.neg_inv
+
+    // `R mod p` is one in Montgomery's form; `mont(x, r2)` takes `x` into the form.
+    val wr = below(mont(w, pr.r2, p, ni), p)
+
+    t[0] = below(mont(1, pr.r2, p, ni), p)
+
+    for i in 1..<4
+        if i < n then t[i] = below(mont(t[i - 1], wr, p, ni), p)
+
+    if n <= 4 then return
+
+    val w4 = below(mont(t[3], wr, p, ni), p)
+
+    @unchecked
+        for i in 4..<n
+            t[i] = below(mont(t[i - 4], w4, p, ni), p)
+end powers
+
+/** The radix-3 step of a length-`3m` transform, in place: with `x0, x1, x2` the values `m` apart
+ * and `w` the root of order `3m`, run `r` at place `j` gets `w^(rj) (x0 + u^r x1 + u^(2r) x2)`,
+ * `u = w^m` a cube root of unity. Each run is then the length-`m` transform of what it holds, and
+ * together they are the whole transform with its points dealt three ways. Values below `2p` in and
+ * out.
+ *
+ * With `u^2 = -1 - u`, the three sums need one multiply by `u` between them:
+ * `x0 + x1 + x2`, `(x0 - x2) + u (x1 - x2)` and `(x0 - x1) - u (x1 - x2)`.
+ */
+private deal3(a: []u64, m: usize, t: []const u64, pr: NttPrime)
+    val p = pr.p
+    val ni = pr.neg_inv
+    val p2 = p * 2
+    val p4 = p * 4
+    val u = t[m]
+
+    @unchecked
+        for j in 0..<m
+            val x0 = a[j]
+            val x1 = a[j + m]
+            val x2 = a[j + m * 2]
+            var s = x0 + x1 + x2
+
+            if s >= p4 then s -= p4
+            if s >= p2 then s -= p2
+
+            val e = mont(x1 + p2 - x2, u, p, ni)
+
+            a[j] = s
+            a[j + m] = mont(x0 + p2 - x2 + e, t[j], p, ni)
+            a[j + m * 2] = mont(x0 + p4 - x1 - e, t[j * 2], p, ni)
+end deal3
+
+/** The inverse of `deal3`, three times too large: each run's place `j` multiplied back by
+ * `w^(-rj)`, then the three-point transform with `u^-1 = u^2`. Values below `4p` in, `6p` out.
+ */
+private undeal3(a: []u64, m: usize, t: []const u64, pr: NttPrime)
+    val p = pr.p
+    val ni = pr.neg_inv
+    val p2 = p * 2
+    val n = m * 3
+    val v = t[m * 2]
+
+    @unchecked
+        for j in 0..<m
+            var y0 = a[j]
+
+            if y0 >= p2 then y0 -= p2
+
+            // `w^-j` is `w^(n - j)`, and `w^0` is the table's first entry.
+            val y1 = mont(a[j + m], t[if j == 0 then 0 else n - j], p, ni)
+            val y2 = mont(a[j + m * 2], t[if j == 0 then 0 else n - j * 2], p, ni)
+            val e = mont(y1 + p2 - y2, v, p, ni)
+
+            a[j] = y0 + y1 + y2
+            a[j + m] = y0 + p2 - y2 + e
+            a[j + m * 2] = y0 + p2 - y1 + p2 - e
+end undeal3
+
+/** `tw[m + j] = w_2m^j`, `w_2m` a root of unity of order `2m`, for every `m = 1, 2, 4, ..., n / 2`
+ * and `0 <= j < m`, each beside its Shoup quotient in `twq`, from `w` of order `n`. The top level is
+ * the powers of `w`; every level below takes every other entry of the one above, since
+ * `w_2m^j = w_4m^(2j)`.
+ */
+private twiddles(tw: []u64, twq: []u64, n: usize, w: u64, p: u64, pre: ShoupDivisor)
+    val h = n / 2
+
+    if h == 0 then return
+
+    val wq = pre.quotient(w)
+
+    tw[h] = 1
+    twq[h] = pre.quotient(1)
+
+    @unchecked
+        for j in 1..<h
+            val x = below(shoup(tw[h + j - 1], w, wq, p), p)
+
+            tw[h + j] = x
+            twq[h + j] = pre.quotient(x)
+
+        var m = h / 2
+
+        while m >= 1
+            for j in 0..<m
+                tw[m + j] = tw[m * 2 + j * 2]
+                twq[m + j] = twq[m * 2 + j * 2]
+
+            m /= 2
+end twiddles
+
+/** The power-of-two transform in place, decimation in frequency: natural order in, bit-reversed
+ * out. Values below `2p` in, below `2p` out.
+ */
+private forward(a: []u64, n: usize, tw: []const u64, twq: []const u64, p: u64)
+    val p2 = p * 2
+    var m = n / 2
+
+    @unchecked
+        while m >= 1
+            var s: usize = 0
+
+            while s < n
+                for j in 0..<m
+                    val x = a[s + j]
+                    val y = a[s + j + m]
+                    var u = x + y
+
+                    if u >= p2 then u -= p2
+                    a[s + j] = u
+                    a[s + j + m] = shoup(x + p2 - y, tw[m + j], twq[m + j], p)
+
+                s += m * 2
+
+            m /= 2
+end forward
+
+/** The inverse power-of-two transform in place, decimation in time: bit-reversed in, natural order
+ * out, and `n` times too large. Values below `4p` in and out.
+ *
+ * It runs the forward transform's levels backwards with the inverse twiddles, and needs no table of
+ * its own: `w_2m^-j = -w_2m^(m - j)`, since `w_2m^m = -1`, so the twiddle is the forward table's
+ * entry `2m - j` and the minus sign swaps the butterfly's two outputs.
+ */
+private inverse(a: []u64, n: usize, tw: []const u64, twq: []const u64, p: u64)
+    val p2 = p * 2
+    var m: usize = 1
+
+    @unchecked
+        while m < n
+            var s: usize = 0
+
+            while s < n
+                var x0 = a[s]
+                var y0 = a[s + m]
+
+                if x0 >= p2 then x0 -= p2
+                if y0 >= p2 then y0 -= p2
+                a[s] = x0 + y0
+                a[s + m] = x0 + p2 - y0
+
+                for j in 1..<m
+                    var x = a[s + j]
+
+                    if x >= p2 then x -= p2
+
+                    val t = shoup(a[s + j + m], tw[m * 2 - j], twq[m * 2 - j], p)
+
+                    a[s + j] = x + p2 - t
+                    a[s + j + m] = x + t
+
+                s += m * 2
+
+            m *= 2
+end inverse
+
+/** Each coefficient from its three residues, by Garner's form of the Chinese remainder theorem,
+ * carried into `r[0..<len]`.
+ *
+ * `x = x1 + x2 p1 + x3 p1 p2` with each `x_i < p_i`: `x1` is the first residue, `x2` makes the
+ * second agree and `x3` the third. That is below `p1 p2 p3`, and the coefficient is below that, so it
+ * is the coefficient. With the primes in increasing order every difference below is made
+ * non-negative by adding the modulus once.
+ */
+private recombine(r: []Limb, len: usize, res: []const u64, n: usize)
+    val p1 = prime1.p
+    val p2 = prime2.p
+    val p3 = prime3.p
+    val i12q = shoup_divisor(p2).quotient(inv_p1_mod_p2)
+    val pre3 = shoup_divisor(p3)
+    val i123q = pre3.quotient(inv_p12_mod_p3)
+    val p1m3q = pre3.quotient(p1)
+    val top = if len < n then len else n
+
+    // What is carried into the next limb: the coefficient is under 2^183, so this is under 2^120.
+    var carry: u128 = 0
+
+    @unchecked
+        for i in 0..<top
+            val x1 = res[i]
+            val x2 = below(shoup(res[n + i] + p2 - x1, inv_p1_mod_p2, i12q, p2), p2)
+            val y = below(x1 + below(shoup(x2, p1, p1m3q, p3), p3), p3)
+            val x3 = below(shoup(res[n * 2 + i] + p3 - y, inv_p12_mod_p3, i123q, p3), p3)
+
+            // `x1 + x2 p1`, under `2^122`, plus `x3 p1 p2` taken in two halves.
+            val s = u128(x2) * u128(p1) + u128(x1) + u128(x3) * u128(p12_lo)
+            val lo = u128(u64.wrap(carry)) + u128(u64.wrap(s))
+
+            r[i] = u64.wrap(lo)
+            carry = (carry >> 64) + (s >> 64) + u128(x3) * u128(p12_hi) + (lo >> 64)
+
+        for i in top..<len
+            r[i] = u64.wrap(carry)
+            carry >>= 64
+end recombine
+
+/** `x` below `m`, for an `x` below `2m`. */
+private below(x: u64, m: u64) -> u64 = if x >= m then x - m else x
+
+/** `w v mod p`, below `2p`, for any `v` and a `w < p` given with its quotient
+ * `wq = floor(w 2^64 / p)` (Shoup). The estimate `q` of `w v / p` is low by at most one, so the
+ * remainder it leaves is below `2p` -- and since that fits a limb, it can be computed modulo `2^64`.
+ */
+private shoup(v: u64, w: u64, wq: u64, p: u64) -> u64
+    val q = u64((u128(wq) * u128(v)) >> 64)
+
+    w *% v -% q *% p
+end shoup
+
+/** What Shoup quotients are computed with: `p` normalized and its reciprocal, so that
+ * `floor(w 2^64 / p)` is the two-limb-by-one division `div_2by1` does without a divide instruction.
+ */
+private struct ShoupDivisor
+    shift: usize
+    d: u64
+    v: u64
+
+private shoup_divisor(p: u64) -> ShoupDivisor
+    val shift = usize(p.leading_zeros())
+    val d = p << shift
+
+    ShoupDivisor(shift, d, reciprocal(d))
+
+impl ShoupDivisor
+    /** `floor(w 2^64 / p)` for `w < p`. */
+    quotient(self, w: u64) -> u64 = div_2by1(w << self.shift, 0, self.d, self.v).0
+
+/** Montgomery's product `a b / 2^64 mod p`, below `2p`, for `a b < p 2^64` -- `a` below `6p` and
+ * `b` below `p`, or both below `2p`, with every prime here under `2^62`.
+ */
+private mont(a: u64, b: u64, p: u64, neg_inv: u64) -> u64
+    val t = u128(a) * u128(b)
+    val m = u64.wrap(t) *% neg_inv
+
+    u64((t + u128(m) * u128(p)) >> 64)
+end mont
+
+/** `a b mod p`, below `p`, for `a` and `b` below `p`: Montgomery's product, then out of its form. */
+private[bigint] mul_mod(a: u64, b: u64, pr: NttPrime) -> u64
+    below(mont(mont(a, b, pr.p, pr.neg_inv), pr.r2, pr.p, pr.neg_inv), pr.p)
+
+#endif

@@ -186,7 +186,16 @@ private dm_module(name: string, us: Buf[Program], include_private: bool) -> DocM
     for u in us
         for j in 0..<u.body.len()
             dm_symbol_of(u, u.body[j], include_private) match
-                Some(s) -> if include_private || s.access == DocAccess.DaPublic then dm_insert_symbol(&symbols, s)
+                Some(found) ->
+                    var s = found
+
+                    // An `impl` has no visibility of its own, so it takes its type's: the block of
+                    // a private type is as private as the type, and lists nothing a reader can use.
+                    dm_impl_type(u.body[j]) match
+                        Some(t) -> s.access = dm_type_access(us, t)
+                        None -> ()
+
+                    if include_private || s.access == DocAccess.DaPublic then dm_insert_symbol(&symbols, s)
                 None -> ()
 
         for j in 0..<u.capabilities.len()
@@ -196,6 +205,33 @@ private dm_module(name: string, us: Buf[Program], include_private: bool) -> DocM
 
     DocModule(name, symbols, dm_headline(name, us), caps)
 end dm_module
+
+// The name of the type an `impl` is for, its type arguments dropped; nothing for any other statement.
+private dm_impl_type(s: Stmt) -> Option[string] = *s.kind match
+    ImplDecl(d) ->
+        val text = doc_type_text(d.for_type)
+        val b = text.bytes
+        var end_at = b.len
+
+        for i in 0..<b.len
+            if b[i] == u8('[') && end_at == b.len then end_at = i
+
+        Some(text[0..<end_at])
+    _ -> None
+
+// The visibility of the type this module declares under `name`, or public where the module declares
+// none -- a type from elsewhere, whose own module decides what is shown of it.
+private dm_type_access(us: Buf[Program], name: string) -> DocAccess
+    for u in us
+        for s in u.body
+            *s.kind match
+                StructDecl(d) -> if d.name == name then return dm_access(d.vis)
+                EnumDecl(d) -> if d.name == name then return dm_access(d.vis)
+                TypeDecl(d) -> if d.name == name then return dm_access(d.vis)
+                _ -> ()
+
+    DocAccess.DaPublic
+end dm_type_access
 
 // A capability clause as a reader would write it.
 private dm_capability_text(c: CapabilityClause) -> string = c.direction match

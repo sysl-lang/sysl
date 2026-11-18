@@ -1,6 +1,6 @@
 ---
 title: The bigint module
-summary: "`sysl.math.bigint` — integers with no width: sign and magnitude over machine-word limbs, Karatsuba and Toom-3 multiplication, Knuth's algorithm D and recursive division, bit operations on an infinite two's complement, and text in any base."
+summary: "`sysl.math.bigint` — integers with no width: sign and magnitude over machine-word limbs, Karatsuba, Toom-3 and number-theoretic-transform multiplication, Knuth's algorithm D and recursive division, bit operations on an infinite two's complement, and text in any base."
 weight: 63
 ---
 
@@ -125,18 +125,29 @@ algorithm a reader can check this one against. None changes an answer; they chan
 
 | operation | small operands | larger | largest |
 |---|---|---|---|
-| multiply | schoolbook | **Karatsuba** (from 32 limbs) | **Toom-3** (from 160 limbs), Bodrato's interpolation |
-| square | schoolbook, each cross product once | Karatsuba of squares | — |
+| multiply | schoolbook | **Karatsuba** (from 32 limbs), then **Toom-3** (from 160 limbs), Bodrato's interpolation | **number-theoretic transform** modulo three primes (from 600 limbs) |
+| square | schoolbook, each cross product once | Karatsuba of squares | the transform, one forward transform per prime (from 800 limbs) |
 | divide | **Knuth's algorithm D** (*TAOCP* vol. 2, §4.3.1) | **Burnikel–Ziegler** recursive division (divisor and quotient both from 48 limbs) | — |
 | divide by one limb | Möller–Granlund division by a precomputed reciprocal | — | — |
 | text, both ways | a limb-sized chunk of digits at a time | **divide and conquer** over the squares of the chunk (from 40 limbs) | — |
 | gcd | Euclid in machine words | **Lehmer's** algorithm (*TAOCP* §4.5.2, algorithm L) | — |
 
-Karatsuba multiplies in about `n^1.585` steps where schoolbook takes `n^2`, and Toom-3 in about
-`n^1.465`; the recursive division costs about twice a multiplication of the same size, and the
-conversions to and from text a multiplication's cost times `log n`. **Nothing here is FFT-based**, so
-past ten thousand limbs or so a library that has a Schönhage–Strassen multiply pulls away. The
-thresholds are measured crossovers on a 64-bit Apple core, and the crossovers are broad.
+Karatsuba multiplies in about `n^1.585` steps where schoolbook takes `n^2`, Toom-3 in about
+`n^1.465`, and the transform in about `n log n`; the recursive division costs about twice a
+multiplication of the same size, and the conversions to and from text a multiplication's cost times
+`log n` — so the transform speeds up every one of them at large sizes, and `pow` too. The thresholds
+are measured crossovers on a 64-bit Apple core.
+
+**The transform is Pollard's: a discrete Fourier transform modulo a prime**, rather than the
+Schönhage–Strassen transform modulo `2^N + 1` that GMP uses. Each limb is one coefficient; the
+product's coefficients are found modulo three primes just under `2^62`, each of the form
+`c · 2^k + 1` so that roots of unity of every needed order exist, and put together by the Chinese
+remainder theorem (Garner's form). Their product is about `2^182.7`, more than any coefficient of a
+product of two operands under `2^54` limbs can reach, so the answer is exact — there is no rounding,
+as there would be in floating point. A butterfly is a multiply by a precomputed twiddle in Shoup's
+form, the values are reduced lazily (Harvey, 2014), and a transform is a power of two long or three
+times one, so a product never pays for a transform more than a third longer than it needs. It needs
+a 64-bit limb: on a 32-bit target Toom-3 carries the largest products.
 
 **Division by a single limb never divides.** No 64-bit machine has an instruction for a two-limb by
 one-limb division, and a `u128 / u128` is a call into the runtime; Möller and Granlund's method
