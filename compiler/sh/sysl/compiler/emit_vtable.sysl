@@ -206,7 +206,7 @@ split_self(e: *Emit, f: TFunc, built: IrFunc, forms: Map[string, (bool, string)]
     // The method: the receiver stored where the body expects the object, and the body called.
     var entry: Buf[Inst] = buf()
 
-    entry.push(InAlloca(object, shape, None))
+    entry.push(InAlloca(object, shape, adapter_slot_align(e, ty, shape, boxed)))
 
     if boxed then entry.push(InGep(payload, shape, object, step))
 
@@ -231,6 +231,12 @@ split_self(e: *Emit, f: TFunc, built: IrFunc, forms: Map[string, (bool, string)]
     out.push(IrFunc(body_sig, blocks))
     out
 end split_self
+
+// The boundary a split method's slot for its receiver is laid on: a box's (`box_storage_align`), or
+// the raised one the receiver's own type asks for. Nothing but this says it, since the slot is laid
+// directly rather than through `emit_alloca`.
+private adapter_slot_align(e: *Emit, ty: Type, shape: LType, boxed: bool) -> Option[int] =
+    if boxed then box_storage_align(e, ty) else slot_align(e, shape)
 
 // The body a table reaches for a method whose receiver is lent by address (`read_by_address`): the
 // receiver's bytes copied out of the object into a slot of its own -- the snapshot a by-value `self`
@@ -277,7 +283,7 @@ private lent_self(e: *Emit, f: TFunc, body: IrFuncSig, boxed: bool) -> IrFunc
             val at = VReg(other.unwrap().1)
 
             params.push(IrParam(shape_of, no_ir_attrs(), p.name))
-            lends.push(InAlloca(at, shape_of, None))
+            lends.push(InAlloca(at, shape_of, slot_align(e, shape_of)))
             lends.push(InStore(shape_of, p.name.unwrap_or(VUndef), at, AccPlain, None))
             args.push(ir_arg(LPtr, at))
         else
@@ -298,7 +304,7 @@ private lent_self(e: *Emit, f: TFunc, body: IrFuncSig, boxed: bool) -> IrFunc
     if boxed then instrs.push(InGep(payload, shape, object, step))
 
     if !as_is
-        instrs.push(InAlloca(slot, lty(e, ty), None))
+        instrs.push(InAlloca(slot, lty(e, ty), slot_align(e, lty(e, ty))))
         instrs.push(InLoad(value, lty(e, ty), payload, AccPlain, None))
         instrs.push(InStore(lty(e, ty), value, slot, AccPlain, None))
     end if

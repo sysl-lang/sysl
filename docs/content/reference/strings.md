@@ -195,6 +195,34 @@ A sentinel refcount in a header could express the same thing. The null owner is 
 is not specific to strings: it is already how a slice of static storage says "nothing to keep alive",
 so immortality needs no mechanism of its own.
 
+## Shared bytes
+
+**A string crosses into an object two threads reach — a capture of a `&sync Fn`, a field of a `&sync
+T` — with no spelling of its own.** Where the object is made, each string in it is copied once into
+bytes whose owner's count is atomic, marked so by its top bit; every share of those bytes is then
+taken atomically, a substring's included, on whichever thread takes it. A literal is left as it is,
+having no count, and so is a string already shared. The string the program held keeps its ordinary
+count, so code that shares nothing pays only the test of the mark on each share it takes.
+
+```sysl
+struct Reg
+    tag: string
+
+val n = 4
+val r: &sync Reg = Reg(s"dev$n")
+val job: &sync Fn() -> string = () -> r.tag[1..<r.tag.len]
+
+print(job(), r.tag)
+```
+
+```output
+ev4 dev4
+```
+
+Where nothing copies a string on its way to another domain it is still refused: module storage, a
+view of strings, a frozen buffer of them, a pointer's pointee. The whole rule is in
+[memory § A string crosses into a shared object](/reference/memory/#a-string-crosses-into-a-shared-object).
+
 ## Granularity: bytes and scalar values
 
 A string is indexed and measured in **bytes**, and decoded into **`char`** — Unicode scalar values.
