@@ -19,6 +19,7 @@ alone. The [modules reference](/reference/modules/) describes the rule in full.
 | `sysl build-c <path> -o <archive>` | compile to a static archive and a C header, for a C project; with `--shared`, a shared library |
 | `sysl test [<path>]` | run the `@test` functions |
 | `sysl emit-llvm <path>` | print the generated LLVM IR |
+| `sysl stack <path>` | print the deepest stack each entry point can need, or why it has no bound |
 | `sysl emit-ast <path>` | print one file's untyped parse tree, as deterministic text |
 | `sysl emit-typed <path>` | print one module's typed tree, as deterministic text |
 | `sysl emit-header <path>` | print the C header for what a module exports |
@@ -58,7 +59,7 @@ An unknown subcommand is refused on stderr with the list of valid ones, and sysl
 command is built in; sysl does not look for external commands on the `PATH`:
 
 ```text
-sysl: error: 'wave' is not a sysl command — the commands are run, build, build-lib, build-c, emit-header, weave, tangle, test, emit-llvm, emit-ast, emit-typed, prove, deps, add, vendor, tidy, doc, import-c, targets, lsp
+sysl: error: 'wave' is not a sysl command — the commands are run, build, build-lib, build-c, emit-header, weave, tangle, test, emit-llvm, stack, emit-ast, emit-typed, prove, deps, add, vendor, tidy, doc, import-c, targets, lsp
 ```
 
 **A command's product goes to stdout, and everything it reports about the run goes to stderr**: a
@@ -614,7 +615,37 @@ the target's `target datalayout`, obtained from that clang. Without it, LLVM wou
 unaligned access (riscv64) splits each one in two. Nothing is assembled, and no toolchain is needed.
 What is printed is a current LLVM's text: **an older clang is handed that text in a form it can read**
 ([Installation](/getting-started/installation/) gives the oldest), and `build-c --emit-llvm` writes
-the form that clang was actually handed.
+the form that clang was actually handed. A program with a function marked
+[`@stack(n)`](/reference/attributes/#stack-a-bound-on-the-stack-a-call-needs) is the one exception: that
+bound is checked against the frames clang lays out, so it needs clang here as every build does.
+
+### `stack`
+
+```bash
+sysl stack [--target <name>] [-O<level>] <path>
+```
+
+Prints, for each way into the program — `main`, a bare image's own entry, and every function it
+exports — the deepest stack a call can need, at the level and for the machine named, with the way
+down that needs it:
+
+```text
+main: 896 bytes, by 'main' → 'sysl.printi' → 'sysl.digits_long', not counting the C it calls: 'fflush', 'sysl_install_stack_guard', 'sysl_stdout_write', 'write'
+handler: 4192 bytes, by 'handler' → 'deep'
+rec: unbounded — 'fib' recurses by the cycle 'fib' → 'fib'
+apply: unbounded — 'apply' calls through a pointer — a trait object, a '&Fn' closure or a function pointer — whose target is not known, and it says nothing with '@stack(calls: n)'
+```
+
+The numbers are the back end's: the program is lowered with the standard module's bodies in the
+text, so a call into the library is followed, and clang reports each function's frame
+(`-fstack-usage`) and the optimized text those frames belong to, whose calls are the graph. A
+function the optimizer inlined is counted once, in the frame it was inlined into. **What has no
+bound says so, and why**: a cycle of calls, a frame sized at run time, or a call through a pointer
+in a body that did not say what such a call needs with
+[`@stack(calls: m)`](/reference/attributes/#stack-a-bound-on-the-stack-a-call-needs). A C
+function's frame is not in the text; it counts as nothing, and the line names every C function it
+reaches. The deepest way may run through a failed check's report (`sysl_trap`), which is a way the
+program can take. To hold a function to a number at build time, mark it `@stack(n)`.
 
 ### `emit-ast`
 

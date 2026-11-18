@@ -72,6 +72,11 @@ reaper_slot_symbol() -> string = "__sysl_arc_reaper"
 // says the program may resume a body on another thread (`fiber_switch.sysl`): there the slot is
 // still named at each use, as it always was, so nothing about a fiber that moves changes either.
 // The module that declares the intrinsic is told by `arc_core_intrinsic`.
+//
+// **The two functions that call a hook through the header, `arc.destroy` and `arc.unshare`, are never
+// inlined**, so the call through a pointer that runs a destructor stays in a function `sysl stack` can
+// name and answer with every destructor (`stack_report.sysl`'s `hook_callers`). Both are on
+// teardown's path, which is cold.
 arc_core(t: Target, reaper_exported: bool, switches: bool = false) -> string
     val tls = if t.thread_local_storage() then "thread_local " else ""
     val supplied = !t.thread_local_storage()
@@ -105,7 +110,7 @@ arc_core(t: Target, reaper_exported: bool, switches: bool = false) -> string
     "  ret void\n" +
     "}\n" +
     "\n" +
-    "define private void @arc.destroy(ptr %p, ptr %s) {\n" +
+    "define private void @arc.destroy(ptr %p, ptr %s) noinline {\n" +
     "entry:\n" +
     "  %h = getelementptr %arc.header, ptr %p, i32 0, i32 1\n" +
     "  %f = load ptr, ptr %h\n" +
@@ -119,7 +124,7 @@ arc_core(t: Target, reaper_exported: bool, switches: bool = false) -> string
     "  ret void\n" +
     "}\n" +
     "\n" +
-    "define private void @arc.unshare(ptr %p) {\n" +
+    "define private void @arc.unshare(ptr %p) noinline {\n" +
     "entry:\n" +
     "  %w = getelementptr %arc.header, ptr %p, i32 0, i32 2\n" +
     s"  %c = load $word, ptr %w\n" +

@@ -10,7 +10,7 @@ has a name and a spelling of its own:
 | written | is | read by |
 |---|---|---|
 | `T::Attr` | an **attribute** — a question a type's own name answers | the analyzer, at the use |
-| `@test`, `@tailrec`, `@pure`, `@ghost`, `@export`, `@reads`, `@writes`, `@crossing`, `@domain`, `@noinline`, `@inline`, `@cold`, `@disjoint`, `@no_alloc`, `@no_block`, `@blocks`, `@abandons`, `@track_caller` | an **annotation** — a fact about the free function under it | the grammar |
+| `@test`, `@tailrec`, `@pure`, `@ghost`, `@export`, `@reads`, `@writes`, `@crossing`, `@domain`, `@noinline`, `@inline`, `@cold`, `@disjoint`, `@no_alloc`, `@no_block`, `@no_recursion`, `@blocks`, `@stack`, `@abandons`, `@track_caller` | an **annotation** — a fact about the free function under it | the grammar |
 | `@setup`, `@teardown`, `@setup_all`, `@teardown_all` | an **annotation** — a hook `sysl test` runs around a module's tests | the grammar |
 | `@keeps(...)` | an **annotation** on an `extern` — the parameters the C function holds on to past the call; see [`@keeps`](/reference/ffi/#keeps-a-c-function-that-holds-on-to-a-pointer). On a trait's own method declaration, with `@answers(...)`, what a call through an object is told; see [below](#keeps-and-answers-on-a-trait-method) | the grammar |
 | `@abandons *extern(A) -> R` | a **mark on a type** — a C function pointer a call through which may abandon every frame below it; see [`@abandons *extern`](/reference/ffi/#abandons-extern-a-callback-that-may-jump-past-c) | the grammar |
@@ -22,7 +22,7 @@ has a name and a spelling of its own:
 | `@renamed("...", "...")`, `@removed("...", "...")` | an **annotation** — the declaration under it is a tombstone, a name that is gone; see [`@renamed` and `@removed`](#renamed-and-removed-a-name-that-is-gone-and-what-became-of-it) | the grammar |
 | `@export("...")` on a module `var` or `val` | an **annotation** — the C symbol the storage is published under | the grammar |
 | `@export("...")` on a `const` or a simple `enum` | an **annotation** — the macro a generated C header defines for the value, or the prefix of one per variant; see [constants in the header](/reference/ffi/#constants-in-the-header) | the grammar |
-| `@no_alloc`, `@requires`, `@link`, `@include`, `@tests` | an **annotation** — a fact about the whole file, in its header | the grammar |
+| `@no_alloc`, `@no_block`, `@no_recursion`, `@requires`, `@link`, `@include`, `@tests` | an **annotation** — a fact about the whole file, in its header | the grammar |
 | `@assert` | an **annotation** that describes nothing but itself — a condition settled while compiling | the analyzer, once |
 | `#if` | a **directive** — a gate on lines | a pass before the lexer |
 
@@ -2593,6 +2593,247 @@ print(f())
 ```error
 'block' is what a module does, not something a machine has, and no machine takes it away
 ```
+
+## `@no_recursion` — a path that never calls itself again
+
+Flight software, a kernel's interrupt path and every safety-critical rule set forbid recursion for
+one reason: a function that can reach itself again before it returns has a stack depth nobody can
+bound by reading it. **`@no_recursion` is that promise.** Above a function or a method it says no
+call the definition makes, however many calls away and in whoever's code, ever arrives back at a
+function already on the stack; in a file's header it says it of every body in the module. A cycle
+is refused at the call that begins the way to it, and the refusal names the cycle:
+
+```sysl
+f() -> int = 1
+
+@no_recursion
+fact(n: int) -> int = if n <= 1 then 1 else n * fact(n - 1)
+
+print(fact(5))
+```
+
+```error
+this call recurses by the cycle 'fact' → 'fact', and 'fact' declared '@no_recursion'
+```
+
+**Any cycle counts, not only a function calling itself.** Where the promised body reaches a cycle it
+is not on, the refusal names the call the body wrote, the way from it to the cycle, and the cycle:
+
+```sysl
+f() -> int = 1
+
+even(n: int) -> bool = if n == 0 then true else odd(n - 1)
+odd(n: int) -> bool = if n == 0 then false else even(n - 1)
+middle(n: int) -> bool = even(n)
+
+@no_recursion
+top(n: int) -> bool = middle(n)
+
+print(top(4))
+```
+
+```error
+this reaches 'middle', which recurses by the call path 'middle' → 'even' and the cycle 'even' → 'odd' → 'even', and 'top' declared '@no_recursion'
+```
+
+A body that keeps the promise builds, and a sibling beside it may recurse as it likes:
+
+```sysl
+fact(n: int) -> int = if n <= 1 then 1 else n * fact(n - 1)
+
+@no_recursion
+square(n: int) -> int = n * n
+
+print(square(3), fact(4))
+```
+
+```output
+9 24
+```
+
+**A call whose target is decided at run time is followed to everything it could reach**, since a
+cycle missed would be a promise broken in silence:
+
+- a call through a trait object, a `&Fn` closure among them, reaches **every** implementation of
+  that method in the program — the value behind it is chosen wherever it was erased, often in a body
+  the promised one never reaches;
+- a call through a function pointer reaches every function whose address the program takes at that
+  pointer's type;
+- taking a function's address is a call of it, since whoever is handed the address — a C function
+  among them — may call it while the body that took it is still on the stack.
+
+```sysl
+trait Shape
+    area(self) -> int
+
+struct Sq
+    n: int
+
+impl Shape for Sq
+    area(self) -> int = if self.n == 0 then 0 else measure(Sq(self.n - 1))
+
+measure(s: &Shape) -> int = s.area()
+
+@no_recursion
+top(n: int) -> int = measure(Sq(n))
+
+print(top(3))
+```
+
+```error
+this reaches 'measure', which recurses by the cycle 'measure' → 'Sq.area' → 'measure', and 'top' declared '@no_recursion'
+```
+
+A closure handed to a generic or a bare-arrow parameter is an ordinary call in the instance, and a
+generic is held at each instance, so a cycle that only one type argument closes is refused there,
+naming the instance. **The library is held too**: `sysl.slices.sort` recurses, and a promised body
+that sorts is refused naming it. What a C function does is not read, but a C function can only call
+back into sysl through an address the program took, and that address is already a call.
+
+**One cycle is one refusal.** Where several promised functions are on one cycle — a module's clause
+holds every function in it — the first by name is told; a promised function that only reaches a
+cycle some promised function is on says nothing more. A `@tailrec` self-call is a cycle like any
+other: it is lowered as a jump, but the promise is about what the program says, and a loop says it
+plainly. The rules for where it stands are `@no_alloc`'s: directly under the header it is the
+module's clause, a method may promise it, and a function declared inside another may not — the
+function around it, whose promise covers every call the inner one makes, carries it. Recursing is
+conduct, not a facility, so `@requires(recursion)` and `@needs(recursion)` are refused:
+
+```sysl
+@needs(recursion)
+f() -> int = 1
+
+print(f())
+```
+
+```error
+'recursion' is what a module does, not something a machine has, and no machine takes it away
+```
+
+## `@stack` — a bound on the stack a call needs
+
+A kernel sizes every thread's stack, and an interrupt pushes its frame on top of whichever thread it
+lands on, so a handler that needs more than the room left writes into the guard below. **`@stack(n)`
+above a function or a method fails the build when a call of it can need more than `n` bytes of
+stack**, counted the whole way down: the call graph is the program's, the library's bodies
+included, and each frame is the one the back end lays out at the level and for the machine being
+built. A bound too small is refused at the annotation, with the depth and the way down that needs it:
+
+```sysl
+deep(n: usize) -> u8
+    var block: [4096]u8 = [0; 4096]
+    block[n % 4096] = u8(n)
+    block[(n * 7) % 4096]
+
+@stack(1024)
+handler(x: usize) -> u8 = deep(x)
+
+print(handler(3))
+```
+
+```error
+'handler' declared '@stack(1024)', and it can need
+```
+
+A bound the depth fits under builds as if it were not there:
+
+```sysl
+deep(n: usize) -> u8
+    var block: [4096]u8 = [0; 4096]
+    block[n % 4096] = u8(n)
+    block[(n * 7) % 4096]
+
+@stack(65536)
+handler(x: usize) -> u8 = deep(x)
+
+print(handler(3))
+```
+
+```output
+0
+```
+
+**A depth with no bound is refused, with the reason**: a cycle of calls reachable from the function,
+a frame the back end sizes at run time, or a call through a pointer — a trait object, a `&Fn`
+closure, a function pointer — whose target the text does not name:
+
+```sysl
+struct Lock
+    n: int
+
+with_lock(l: *Lock, op: &Fn() -> int) -> int
+    l.n += 1
+    val r = op()
+    l.n -= 1
+    r
+
+@stack(16384)
+handler(x: int) -> int
+    var l = Lock(0)
+    with_lock(&l, () -> x + 1)
+
+print(handler(1))
+```
+
+```error
+'handler' declared '@stack(16384)', and how deep its stack goes has no bound — 'with_lock' calls through a pointer
+```
+
+**`@stack(calls: m)` is what the program says a call through a pointer needs**: above the function
+whose body makes the call, it makes each such call count `m` bytes. It is the program's word for code
+the text cannot name — the closure behind the object is chosen elsewhere — so it is an assumption,
+and every report that leans on it says so. The two parts combine, `@stack(8192, calls: 1024)`, and a
+byte count may be written in hexadecimal:
+
+```sysl
+struct Lock
+    n: int
+
+@stack(calls: 1024)
+with_lock(l: *Lock, op: &Fn() -> int) -> int
+    l.n += 1
+    val r = op()
+    l.n -= 1
+    r
+
+@stack(16384)
+handler(x: int) -> int
+    var l = Lock(0)
+    with_lock(&l, () -> x + 1)
+
+print(handler(1))
+```
+
+```output
+2
+```
+
+The assumption follows the call wherever the optimizer moves it: a body inlined into its caller takes
+its calls through a pointer with it, and they still count `m`. **A function the optimizer inlined is
+counted once**, in the frame it was inlined into, and a recursion it turned into a loop is a frame
+rather than a cycle — so a bound checked at `-O2` may hold where the same bound at `-O0` does not, and
+the build checks the level it builds at. A destructor, run through the header of the object it tears
+down, is answered by every destructor in the program rather than refused; teardown never recurses
+([memory](/reference/memory/)). **A C function's frame is not in the text** and counts as nothing;
+`sysl stack` names every C function each entry reaches. Every build checks the bound — `build`,
+`run`, `build-c` and `emit-llvm` — and `@stack` marks a function or a method and nothing else:
+
+```sysl
+f() -> int = 1
+
+@stack(64)
+struct P
+    x: int
+
+print(f())
+```
+
+```error
+'@stack(...)' bounds the stack a call needs, so it marks a function or a method whose body is sysl
+```
+
+[`sysl stack`](/getting-started/cli/#stack) prints the same depth for every way into a program —
+`main`, a bare image's entry and each export — and why where there is none.
 
 ## `@track_caller` — a function that reports its caller's line
 

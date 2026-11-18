@@ -3,7 +3,7 @@ module sh.sysl.compiler
 import sysl.buf.{Buf, buf}
 import sysl.container.{Map, map}
 import sysl.fs.{make_temp_dir, read_text, remove_dir_all}
-import sysl.text.{join, parse_int, Search}
+import sysl.text.{join, parse_int, split, Search}
 
 // `sysl stack`: the deepest stack each way into a program can need, worked out before it runs.
 //
@@ -218,14 +218,18 @@ end Depth
 
 arrows_text(path: Buf[string]) -> string
     var quoted: Buf[string] = buf()
+    var last = ""
 
     for item in path
         val step = if item.starts_with(PointerStep) then
             s"a call through a pointer, taken as ${item[PointerStep.len..<item.len]} bytes"
         else s"'${ir_display(item)}'"
 
-        // An export's thunk and the function it calls read as one name, and are one step to a reader.
-        if quoted.is_empty() || quoted[quoted.len() - 1] != step then quoted.push(step)
+        // An export's thunk and the function it calls are two symbols with one name, and one step to a
+        // reader. A function calling itself is one symbol twice, and two steps.
+        if quoted.is_empty() || quoted[quoted.len() - 1] != step || item == last then quoted.push(step)
+
+        last = item
 
     join(quoted.view(), " → ")
 end arrows_text
@@ -339,6 +343,7 @@ assumed_key(symbol: string) -> string = if symbol.ends_with(".owned") then symbo
 // Every function the text defines, with what its body calls.
 ir_calls_of(ir: string) -> Buf[IrCalls]
     var out: Buf[IrCalls] = buf()
+    var hooks: Buf[string] = buf()
     var name = ""
     var calls: Buf[string] = buf()
     var indirect = false
@@ -350,6 +355,9 @@ ir_calls_of(ir: string) -> Buf[IrCalls]
             calls = buf()
             indirect = false
             inside = true
+
+            if hook_shaped(line) then hooks.push(name)
+
             continue
         end if
 
@@ -371,8 +379,65 @@ ir_calls_of(ir: string) -> Buf[IrCalls]
                 if !c.0 then indirect = true
             None -> ()
 
-    out
+    // **A destructor is called through the header of the object it tears down**, by the two runtime
+    // functions that read the header (`arc_runtime.sysl`, which keeps both out of line). Which
+    // destructor is the object's is decided at run time, so each of the two calls every function shaped
+    // as a hook is -- `void (ptr, i1, ptr)` -- by name, and makes no call through a pointer the program
+    // could be asked to bound.
+    var answered: Buf[IrCalls] = buf()
+
+    for f in out
+        if holds_string(hook_callers(), f.name) then
+            answered.push(IrCalls(f.name, joined_calls(f.calls, hooks), false))
+        else answered.push(f)
+
+    answered
 end ir_calls_of
+
+// The runtime functions whose one call through a pointer runs a destructor.
+private hook_callers() -> Buf[string]
+    var out: Buf[string] = buf()
+
+    out.push("arc.destroy")
+    out.push("arc.unshare")
+    out
+end hook_callers
+
+private joined_calls(a: Buf[string], b: Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for item in a
+        out.push(item)
+
+    for item in b
+        if !holds_string(out, item) then out.push(item)
+
+    out
+end joined_calls
+
+// Whether a `define` line is shaped as a destructor hook: it answers nothing and takes a pointer, a
+// flag and a pointer. A parameter's type is the first word of it, whatever attributes the optimizer
+// wrote after.
+private hook_shaped(line: string) -> bool
+    val at = line.index_of("@")
+
+    if at.is_none() || line[0..<at.unwrap()].index_of(" void ").is_none() then return false
+
+    val open = line[at.unwrap()..<line.len].index_of("(")
+    val close = line.index_of(")")
+
+    if open.is_none() || close.is_none() then return false
+
+    val inner = line[at.unwrap() + open.unwrap() + 1..<close.unwrap()]
+    var types: Buf[string] = buf()
+
+    for part in split(inner, ", ")
+        val space = part.index_of(" ")
+
+        types.push(if space.is_some() then part[0..<space.unwrap()] else part)
+
+    types.len() == 3 && types[0] == "ptr" && types[1] == "i1" && types[2] == "ptr"
+end hook_shaped
 
 // Where a line's `call` or `invoke` begins, or nothing where the line makes no call.
 private call_at(line: string) -> Option[usize]

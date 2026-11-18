@@ -1,0 +1,321 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `@no_recursion` (`reference/attributes.md § @no_recursion`): a function, a method or a module that
+// can reach no cycle of calls, checked through every call -- by name, through a generic's instance,
+// through a closure handed on as a bound or as a `&Fn`, through a trait object and through a function
+// pointer -- and refused at the call that begins the way to the cycle, naming it.
+//
+// **A fixture's first declaration is a function with no annotation**, since `@no_recursion` directly
+// under the header is the module's clause, which has tests of its own here.
+
+private var nrc_library_checked: bool = false
+private var nrc_library_there: bool = false
+
+private nrc_ready() -> bool
+    if !nrc_library_checked
+        nrc_library_checked = true
+        nrc_library_there = std_root().is_ok()
+
+    if !nrc_library_there
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end nrc_ready
+
+private nrc_check(said: string, part: string) = assert(said.index_of(part).is_some(), said)
+
+// How many refusals a report holds.
+private nrc_count(said: string) -> usize
+    var n: usize = 0
+    var rest = said
+
+    loop
+        val at = rest.index_of("error: ")
+
+        if at.is_none() then break
+
+        n += 1
+        rest = rest[at.unwrap() + 7..<rest.len]
+
+    n
+end nrc_count
+
+private nrc_root(main: string, thing: string) -> string
+    val root = make_temp_dir("sysl-no-recursion").unwrap()
+
+    write_text(s"$root/main.sysl", main).unwrap()
+
+    if thing != ""
+        make_dir_all(s"$root/thing").unwrap()
+        write_text(s"$root/thing/a.sysl", s"module thing\n\n$thing").unwrap()
+    end if
+
+    root
+end nrc_root
+
+// Everything a program has to say for itself, the lowering included; "" where it had nothing.
+private nrc_err(main: string, thing: string = "") -> string
+    val root = nrc_root(main, thing)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end nrc_err
+
+// What the program prints, or what the build had to say.
+private nrc_ran(main: string) -> string
+    val root = nrc_root(main, "")
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end nrc_ran
+
+private const nrc_lead: string = "f() -> int = 1\n\n"
+
+@test("a function calling itself is refused at the call, naming the cycle")
+nrc_self()
+    if !nrc_ready() then return
+
+    val said = nrc_err(nrc_lead + "@no_recursion\nfact(n: int) -> int = if n <= 1 then 1 else n * fact(n - 1)\n\n" +
+                       "print(fact(5))\n")
+
+    nrc_check(said, "this call recurses by the cycle 'fact' → 'fact', and 'fact' declared '@no_recursion'")
+    nrc_check(said, "main.sysl:4:49")
+    assert_eq(nrc_count(said), 1)
+
+@test("a promise that reaches a cycle through callees names the call it wrote, the way and the cycle")
+nrc_through_callees()
+    if !nrc_ready() then return
+
+    val said = nrc_err(nrc_lead + "even(n: int) -> bool = if n == 0 then true else odd(n - 1)\n" +
+                       "odd(n: int) -> bool = if n == 0 then false else even(n - 1)\n" +
+                       "middle(n: int) -> bool = even(n)\n\n" +
+                       "@no_recursion\ntop(n: int) -> bool = middle(n)\n\nprint(top(4))\n")
+
+    nrc_check(said, "this reaches 'middle', which recurses by the call path 'middle' → 'even' and the cycle " +
+                    "'even' → 'odd' → 'even', and 'top' declared '@no_recursion'")
+    nrc_check(said, "main.sysl:8:23")
+
+@test("a promise whose callee is on the cycle names the cycle from that callee")
+nrc_callee_on_cycle()
+    if !nrc_ready() then return
+
+    val said = nrc_err(nrc_lead + "even(n: int) -> bool = if n == 0 then true else odd(n - 1)\n" +
+                       "odd(n: int) -> bool = if n == 0 then false else even(n - 1)\n\n" +
+                       "@no_recursion\ntop(n: int) -> bool = even(n)\n\nprint(top(4))\n")
+
+    nrc_check(said, "this reaches 'even', which recurses by the cycle 'even' → 'odd' → 'even', and 'top' " +
+                    "declared '@no_recursion'")
+
+@test("a body that keeps the promise builds and runs, and a sibling may recurse")
+nrc_kept()
+    if !nrc_ready() then return
+
+    assert_eq(nrc_ran(nrc_lead + "fact(n: int) -> int = if n <= 1 then 1 else n * fact(n - 1)\n\n" +
+                      "@no_recursion\nsquare(n: int) -> int = n * n\n\nprint(square(3), fact(4))\n"), "9 24\n")
+
+@test("the library, a map, a trait object and a '&Fn' reach no cycle, so a promise over them builds")
+nrc_no_false_cycle()
+    if !nrc_ready() then return
+
+    val main = "import sysl.buf.{Buf, buf}\nimport sysl.container.{Map, map}\n\n" + nrc_lead +
+               "trait Shape\n    area(self) -> int\n\nstruct Sq\n    n: int\n\n" +
+               "impl Shape for Sq\n    area(self) -> int = self.n * self.n\n\n" +
+               "@no_recursion\nwork(n: int) -> int\n    var m: Map[string, int] = map()\n    m.put(\"a\", n)\n" +
+               "    var b: Buf[int] = buf()\n    b.push(n)\n    val s: &Shape = Sq(n)\n" +
+               "    val g: &Fn(int) -> int = k -> k + 1\n    print(s\"${m.get(\"a\").unwrap_or(0)} ${s.area()} ${g(n)} ${b.len()}\")\n" +
+               "    s.area()\n\nprint(work(3))\n"
+
+    assert_eq(nrc_ran(main), "3 9 4 1\n9\n")
+
+@test("the module's clause holds every body, and one cycle is one refusal however many of them are on it")
+nrc_module_clause()
+    if !nrc_ready() then return
+
+    val said = nrc_err("print(thing.g(3))\n",
+                       "@no_recursion\n\nimport sysl.buf.Buf\n\ng(n: int) -> int = if n > 0 then h(n) else 0\n" +
+                       "h(n: int) -> int = g(n - 1)\nk(n: int) -> int = g(n)\n")
+
+    nrc_check(said, "this call recurses by the cycle 'thing.g' → 'thing.h' → 'thing.g', and this module declared '@no_recursion'")
+    assert_eq(nrc_count(said), 1)
+
+@test("two promised functions reaching one cycle neither is on are each told, at their own call")
+nrc_two_promises()
+    if !nrc_ready() then return
+
+    val said = nrc_err(nrc_lead + "loop_on(n: int) -> int = if n == 0 then 0 else loop_on(n - 1)\n\n" +
+                       "@no_recursion\na(n: int) -> int = loop_on(n)\n\n@no_recursion\nb(n: int) -> int = loop_on(n)\n\n" +
+                       "print(a(1), b(2))\n")
+
+    assert_eq(nrc_count(said), 2)
+    nrc_check(said, "and 'a' declared '@no_recursion'")
+    nrc_check(said, "and 'b' declared '@no_recursion'")
+
+@test("a cycle through two generics is found at the instance the promise reaches")
+nrc_generics()
+    if !nrc_ready() then return
+
+    val said = nrc_err(nrc_lead + "walk[T](x: T, n: int) -> int = if n == 0 then 0 else back(x, n - 1)\n" +
+                       "back[T](x: T, n: int) -> int = walk(x, n)\n\n" +
+                       "@no_recursion\nrun(n: int) -> int = walk(1, n)\n\nprint(run(3))\n")
+
+    nrc_check(said, "this reaches 'walk.int', which recurses by the cycle 'walk.int' → 'back.int' → 'walk.int', " +
+                    "and 'run' declared '@no_recursion'")
+
+@test("a generic that promises is held at its instances, and told once for its body")
+nrc_generic_promise()
+    if !nrc_ready() then return
+
+    val said = nrc_err(nrc_lead + "@no_recursion\nwalk[T](x: T, n: int) -> int = if n == 0 then 0 else walk(x, n - 1)\n\n" +
+                       "print(walk(1, 3), walk(true, 2))\n")
+
+    nrc_check(said, "this call recurses by the cycle 'walk.int' → 'walk.int', and 'walk' declared '@no_recursion' " +
+                    "(instance 'walk.int')")
+    assert_eq(nrc_count(said), 1)
+
+@test("a closure handed to a bare-arrow parameter is an ordinary call, and a cycle through it is found")
+nrc_closure_bound()
+    if !nrc_ready() then return
+
+    val said = nrc_err(nrc_lead + "apply(g: int -> int, n: int) -> int = g(n)\n\n" +
+                       "count(n: int) -> int = if n == 0 then 0 else apply(k -> count(k), n - 1)\n\n" +
+                       "@no_recursion\ntop(n: int) -> int = count(n)\n\nprint(top(3))\n")
+
+    nrc_check(said, "this reaches 'count', which recurses by the cycle 'count' → ")
+    nrc_check(said, "and 'top' declared '@no_recursion'")
+
+@test("a closure called through '&Fn' reaches every closure of that type, and a cycle through one is found")
+nrc_closure_object()
+    if !nrc_ready() then return
+
+    val said = nrc_err(nrc_lead + "apply(g: &Fn(int) -> int, n: int) -> int = g(n)\n\n" +
+                       "count(n: int) -> int = if n == 0 then 0 else apply(k -> count(k), n - 1)\n\n" +
+                       "@no_recursion\ntop(n: int) -> int = count(n)\n\nprint(top(3))\n")
+
+    nrc_check(said, "this reaches 'count', which recurses by the cycle 'count' → 'apply' → the closure in 'count' → 'count'")
+
+@test("a call through a trait object reaches every implementation, whoever erased into it")
+nrc_trait_object()
+    if !nrc_ready() then return
+
+    val said = nrc_err("trait Shape\n    area(self) -> int\n\nstruct Sq\n    n: int\n\n" +
+                       "impl Shape for Sq\n    area(self) -> int = if self.n == 0 then 0 else measure(Sq(self.n - 1))\n\n" +
+                       "measure(s: &Shape) -> int = s.area()\n\n" +
+                       "@no_recursion\ntop(n: int) -> int = measure(Sq(n))\n\nprint(top(3))\n")
+
+    nrc_check(said, "this reaches 'measure', which recurses by the cycle 'measure' → 'Sq.area' → 'measure', " +
+                    "and 'top' declared '@no_recursion'")
+
+@test("a call through a function pointer reaches every function whose address is taken at its type")
+nrc_function_pointer()
+    if !nrc_ready() then return
+
+    val said = nrc_err("print(thing.use_top(3))\n",
+                       "var hook: *extern(int) -> int = &leaf\n\nleaf(n: int) -> int = n\n\n" +
+                       "again(n: int) -> int = if n == 0 then 0 else hook(n - 1)\n\ninstall()\n    hook = &again\n\n" +
+                       "@no_recursion\ntop(n: int) -> int = hook(n)\n\nuse_top(n: int) -> int = top(n)\n")
+
+    nrc_check(said, "this reaches 'thing.again', which recurses by the cycle 'thing.again' → 'thing.again', " +
+                    "and 'thing.top' declared '@no_recursion'")
+
+@test("a pointer of another type does not reach a function whose address was taken at this one")
+nrc_function_pointer_typed()
+    if !nrc_ready() then return
+
+    val said = nrc_err("print(thing.top(3))\n",
+                       "var hook: *extern(int) -> int = &leaf\nvar other: *extern(i64) -> i64 = &again\n\n" +
+                       "leaf(n: int) -> int = n\n\nagain(n: i64) -> i64 = if n == 0 then 0 else other(n - 1)\n\n" +
+                       "@no_recursion\ntop(n: int) -> int = hook(n)\n")
+
+    assert_eq(said, "")
+
+@test("a function handed to C as a callback is reached by taking its address, so a cycle through C is found")
+nrc_extern_callback()
+    if !nrc_ready() then return
+
+    val said = nrc_err("import sysl.raw.ptr_cast\n\nextern qsort(base: *u8, n: usize, size: usize, cmp: *extern(*u8, *u8) -> i32)\n\n" +
+                       "compare(a: *u8, b: *u8) -> i32 = sort_more()\n\n" +
+                       "sort_more() -> i32\n    var xs = [3, 1]\n    qsort(ptr_cast(&xs[0]), 2, 4, &compare)\n    0\n\n" +
+                       "@no_recursion\ntop() -> i32 = sort_more()\n\nprint(top())\n")
+
+    nrc_check(said, "this reaches 'sort_more', which recurses by the cycle 'sort_more' → 'compare' → 'sort_more'")
+
+@test("the library's own recursion is found: its sort recurses")
+nrc_library_recursion()
+    if !nrc_ready() then return
+
+    val said = nrc_err("import sysl.buf.{Buf, buf}\nimport sysl.slices.sort\n\n" + nrc_lead +
+                       "@no_recursion\nwork() -> int\n    var b: Buf[int] = buf()\n    b.push(2)\n    b.push(1)\n" +
+                       "    sort(b.view_mut())\n    b[0]\n\nprint(work())\n")
+
+    nrc_check(said, "this reaches 'sysl.slices.sort.int', which recurses by the call path")
+
+@test("a method may promise, and is held to it")
+nrc_method()
+    if !nrc_ready() then return
+
+    val said = nrc_err(nrc_lead + "struct Node\n    n: int\n\n    @no_recursion\n    depth(self) -> int = if self.n == 0 then 0 else Node(self.n - 1).depth()\n\n" +
+                       "print(Node(3).depth())\n")
+
+    nrc_check(said, "this call recurses by the cycle 'Node.depth' → 'Node.depth', and 'Node.depth' declared '@no_recursion'")
+
+@test("a '@tailrec' self-call is still a cycle of calls, and the promise refuses it")
+nrc_tailrec()
+    if !nrc_ready() then return
+
+    val said = nrc_err(nrc_lead + "@no_recursion\n@tailrec\ncount(n: int, acc: int) -> int = if n == 0 then acc else count(n - 1, acc + 1)\n\n" +
+                       "print(count(3, 0))\n")
+
+    nrc_check(said, "this call recurses by the cycle 'count' → 'count', and 'count' declared '@no_recursion'")
+
+@test("a function declared inside another may not promise; the one around it does")
+nrc_nested()
+    if !nrc_ready() then return
+
+    val said = nrc_err(nrc_lead + "outer(n: int) -> int\n    @no_recursion\n    inner(k: int) -> int = k + 1\n\n    inner(n)\n\n" +
+                       "print(outer(1))\n")
+
+    nrc_check(said, "'@no_recursion' holds a top-level function or a method, and 'inner' is declared inside another function")
+
+@test("recursion is conduct, so '@requires(recursion)' and '@needs(recursion)' are refused")
+nrc_conduct()
+    if !nrc_ready() then return
+
+    nrc_check(nrc_err("@needs(recursion)\nf() -> int = 1\n\nprint(f())\n"),
+              "'recursion' is what a module does, not something a machine has, and no machine takes it away — '@needs' names a facility")
+    nrc_check(nrc_err("print(thing.f())\n", "@requires(recursion)\n\nf() -> int = 1\n"),
+              "'@no_recursion' is the promise that no cycle of calls is ever reached")
+
+@test("'@no_recursion' above a struct is refused, as every '@no_<word>' is")
+nrc_on_a_struct()
+    if !nrc_ready() then return
+
+    val said = nrc_err(nrc_lead + "@no_recursion\nstruct P\n    x: int\n\nprint(f())\n")
+
+    assert(said.index_of("@no_recursion").is_some(), said)
