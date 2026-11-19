@@ -519,6 +519,18 @@ A name that reaches no file holding a test is refused, naming it, even when the 
 is not repeatable**: given twice, the last one counts. Both flags work with `--std` and with
 `SYSL_DOCS`, which they select among the tests the binary holds.
 
+**`--file` also decides what is built.** The `@tests` files it names are compiled with every file
+that is not `@tests`, and of the other `@tests` files only those the named ones need: a file that
+declares a name they spell (and, in turn, what that file spells), and one that acts without being
+named — a hook, an `@export`, an `@section`, a calling convention, module `asm`, or a header clause
+such as `@link`. The rest are left out before anything is analyzed, so a run naming one file of a
+large tree costs that file and what it reaches, not the whole suite. The report is the same: a test
+in a file left out is still counted in `running 3 tests of N`. A mistake in a `@tests` file the run
+neither names nor needs is not reported by that run; a run of the whole suite reports it. The
+narrowed binary is kept in the run cache under the names given, and a binary of the whole suite
+answers any `--file` as well. `SYSL_TEST_EVERY_FILE=1` builds every file, as a run without `--file`
+does. `--std` builds every file.
+
 **`--keep-binary <dir>` leaves a copy of the test binary in `<dir>`** as `<project>-tests` and prints
 `kept: <path>`. A binary replayed from the run cache is copied too; the cache entry stays. **A
 `-fsanitize=` in `SYSL_EXTRA_CFLAGS` is confirmed before any test runs**: the report starts with

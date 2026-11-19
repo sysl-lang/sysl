@@ -1339,21 +1339,32 @@ private test_project(file: string, named: Option[string], cc: Option[string], gi
     // of what a second `sysl test` over an unchanged tree costs.
     // A `--std` build keeps its own entries: the tree is compiled as the library rather than against
     // one, so the same sources at the same machine come to different bytes.
-    val key = run_cache_key_for(if std then "test --std" else "test", file, named, level, cc)
+    //
+    // **A `--file` run builds only the files it needs** (`test_selection.sysl`), so it has an entry of
+    // its own, under its names; the whole tree's binary holds every test and answers it too.
+    val narrowing = !std && narrows_tests(within)
+    val keys = if narrowing then run_cache_keys_for(narrowed_test_command("test", within), "test", file,
+                                                     named, level, cc)
+    else twice(run_cache_key_for(if std then "test --std" else "test", file, named, level, cc))
 
     // The package's `tests/refused/` programs: never cached, since what each comes to is a
     // compilation of its own, and that compilation is the whole of what it tests.
     val run = RefusedRun(if std then buf() else refused_files(file), named, level)
 
-    cached_test_build(key) match
+    cached_test_build(keys.0) match
         Some(hit) -> return tests_run(file, hit.0, hit.1, opts, seconds, false, run, note, report, within, keep)
         None -> ()
+
+    if narrowing
+        cached_test_build(keys.1) match
+            Some(hit) -> return tests_run(file, hit.0, hit.1, opts, seconds, false, run, note, report, within, keep)
+            None -> ()
 
     // What this build's C reads is gathered afresh: it is part of where the binary is kept.
     clear_files_read()
 
     val made_build = if std then std_test_build_of(file, named)
-    else test_build_of(file, named, level)
+    else test_build_of(file, named, level, if narrowing then within else buf())
 
     val build = made_build match
         Err(why) ->
@@ -1375,6 +1386,8 @@ private test_project(file: string, named: Option[string], cc: Option[string], gi
     if selected_in(build.tests, opts.filter, within).is_empty()
         return tests_run(file, "", build.tests, opts, seconds, false, run, note, report, within, keep)
 
+    // A narrowing that left nothing out built the whole tree, which is kept as the whole tree's.
+    val key = if build.dropped_files > 0 then keys.0 else keys.1
     val made = build_test_binary_cached(file, build, cc, level, key) match
         Err(refusal) ->
             note(refused(refusal.message))
@@ -1387,6 +1400,9 @@ private test_project(file: string, named: Option[string], cc: Option[string], gi
 
     tests_run(file, made.0, build.tests, opts, seconds, !made.1, run, note, report, within, keep)
 end test_project
+
+// One run-cache key standing for both of `test_project`'s, where there is no narrowed build.
+private twice(key: Option[string]) -> (Option[string], Option[string]) = (key, key)
 
 // What a project's refused programs are compiled with: the files, and the run's own target and
 // optimization, so each is compiled as the test build was.
