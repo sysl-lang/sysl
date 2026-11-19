@@ -38,11 +38,12 @@ copies, which is what makes `a + b * c` mean what it looks like, and the cost of
 allocation per operation. A program doing this in a loop is doing something a big-integer library
 is not the fastest way to do.
 
-**Multiplication is schoolbook and division is Knuth's algorithm D.** Both are quadratic.
-Karatsuba, Toom-Cook and a Barrett or Montgomery reduction are all improvements that fit behind
-this same surface, and none of them changes an answer -- so they are work somebody does when a
-program is slow rather than decisions this module has to make now. What this is for is money,
-identifiers, checksums and the occasional exact computation, none of which is GMP's territory.
+**Each operation picks a published algorithm by the size of its operands**: schoolbook,
+Karatsuba and Toom-3 multiplication (`multiply.sysl`) and a number-theoretic transform for the
+largest products (`fft.sysl`), Knuth's algorithm D and Burnikel and Ziegler's recursive division
+(`divide.sysl`, `recursive.sysl`), divide-and-conquer conversion to and from text (`text.sysl`),
+and Lehmer's gcd (`theory.sysl`), all over the limb loops in `kernels.sysl`. None changes an
+answer.
 
 ## The bit operations, and the reading they settled on
 
@@ -236,8 +237,8 @@ from_int(n: long) -> BigInt
 The value `n` names.
 
 The most negative `long` is the case worth knowing about: its magnitude cannot be reached by
-negating it, since that value has no positive counterpart, so the conversion goes through the
-unsigned reading of the bits.
+negating it, since that value has no positive counterpart, so the magnitude is taken one short of
+it and made up in a `u64` (`distance_u64`).
 
 ### `from_real`
 
@@ -275,9 +276,13 @@ of signs: the divisors of a number and of its negation are the same set, so the 
 dropped at the door rather than reasoned about. `gcd(x, 0)` is the magnitude of `x`, everything
 dividing zero, and `gcd(0, 0)` is zero.
 
-The binary algorithm -- shifts and subtractions, no division -- is the faster one on a machine
-whose divide is slow, and it is a fair amount more code for a constant factor. This is the one
-that is obviously right.
+**It is Lehmer's form of it** (Knuth, *The Art of Computer Programming* volume 2, §4.5.2,
+algorithm L). Most of Euclid's quotients are small and depend only on the leading bits, so the
+steps are run on the top `w - 1` bits of the pair in machine arithmetic, recording what they did as a
+two-by-two matrix of cofactors, and the matrix is applied to the whole pair once -- one pass over
+the limbs for about sixty bits of progress, where plain Euclid makes a pass, and an allocation,
+per quotient. Where the leading bits cannot decide even one quotient, a full division step is
+taken instead. Below two limbs it is plain Euclid in machine words.
 
 ### `is_even`
 
@@ -366,7 +371,8 @@ function rather than a flag on this one -- saying which one a caller got is the 
 mul(a: BigInt, b: BigInt) -> BigInt
 ```
 
-`a * b`, schoolbook. Allocates.
+`a * b`. Allocates. The algorithm is chosen by size -- schoolbook, Karatsuba, Toom-3, or a
+number-theoretic transform for the largest.
 
 The sign is the sign of the product and the magnitudes multiply, with the one special case every
 sign-and-magnitude implementation has: a zero result must not be negative, and here it cannot be,
@@ -563,7 +569,7 @@ to_string_radix(x: BigInt, base: int) -> string
 **A base outside 2 to 36 traps**, since there is no digit to write past `z` and a caller asking
 for base 37 has a mistake rather than an unusual requirement. Zero is `"0"` in every base.
 
-Allocates the answer, and a working buffer the size of the answer.
+Allocates the answer, and working storage a small multiple of the value's size.
 
 ### `to_u64`
 
