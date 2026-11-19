@@ -463,7 +463,7 @@ extern strchr(s: *u8, c: i32) -> Option[*u8]
 ```
 
 ```error
-A pointer C may make null is a plain '*u8', compared with 'null'
+A pointer C may make null is a plain '*byte', compared with 'null'
 ```
 
 ```sysl
@@ -491,8 +491,9 @@ The same holds for a `*extern` function pointer: a callback C may leave unset is
 compared with `null`.
 
 **An `Option[&T]` is one word, with `None` as null**, so an `extern` takes or answers one wherever
-it takes or answers a bare `&T` — the address of the object, and `NULL` for `None` — under the same
-promise a `&T` handed to C already makes. An `@export` taking or answering one is refused, as one
+it takes or answers a bare `&T` — the very address the bare `&T` hands over, and `NULL` for `None` —
+under the same promise a `&T` handed to C already makes: the counted box is a sysl layout C has no
+notion of, and a C struct reads an object only through [`into_raw`](#handing-c-an-object-to-hold). An `@export` taking or answering one is refused, as one
 taking a bare `&T` is: a counted reference is not something C may hold.
 
 ### Handing C an object to hold

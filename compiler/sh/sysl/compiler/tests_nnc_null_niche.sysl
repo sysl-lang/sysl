@@ -314,26 +314,27 @@ nnc_some_null_stays_some()
 // -- the C boundary -------------------------------------------------------------------------------
 
 // An `Option` of a reference on an `extern` crosses where a bare `&T` does, as the one address C
-// sees, with `None` the null C may be handed.
-@test("an extern taking an Option of a reference is handed the address, and NULL for None")
+// sees -- the very address the bare `&T` hands over -- with `None` the null C may be handed.
+@test("an extern taking an Option of a reference is handed the bare reference's address, and NULL for None")
 nnc_extern_option_ref()
     nnc_prints(raw"""
         struct Node
             v: i32
 
-        extern c_value_or(n: Option[&Node], d: i32) -> i32
+        extern c_same(a: Option[&Node], b: &Node) -> i32
+        extern c_is_null(a: Option[&Node]) -> i32
 
         val n: &Node = Node(41)
+        val m: &Node = Node(7)
 
-        print(c_value_or(Some(n), -1), c_value_or(None, -1), n.v)
+        print(c_same(Some(n), n), c_same(Some(m), n), c_is_null(None), c_is_null(Some(n)), n.v)
         """, raw"""
         #include <stdint.h>
         #include <stddef.h>
 
-        struct Node { int32_t v; };
-
-        int32_t c_value_or(struct Node *n, int32_t d) { return n ? n->v : d; }
-        """, "41 -1 41\n")
+        int32_t c_same(void *a, void *b) { return a == b; }
+        int32_t c_is_null(void *a) { return a == NULL; }
+        """, "1 0 1 0 41\n")
 
 @test("and its signature is a plain ptr, nothing through memory")
 nnc_extern_option_ref_signature()
@@ -361,12 +362,12 @@ nnc_extern_option_ptr_refused()
 
     nnc_says(taking, "'p' of the 'extern' 'c_is_null' is ")
     nnc_says(taking, "which C has no spelling for — an 'Option' of a raw pointer is a tag beside the address")
-    nnc_says(taking, "A pointer C may make null is a plain '*i32', compared with 'null'")
+    nnc_says(taking, "A pointer C may make null is a plain '*int', compared with 'null'")
 
     val answering = nnc_build("extern c_find(want: i32) -> Option[*u8]\n", host_target()).0
 
     nnc_says(answering, "the 'extern' 'c_find' returns ")
-    nnc_says(answering, "A pointer C may make null is a plain '*u8', compared with 'null'")
+    nnc_says(answering, "A pointer C may make null is a plain '*byte', compared with 'null'")
 
     val callback = nnc_build("extern c_set(f: Option[*extern(i32) -> i32])\n", host_target()).0
 
@@ -383,7 +384,7 @@ nnc_export_option_ptr_refused()
         """, host_target())
 
     nnc_says(b.0, "which C has no way to spell")
-    nnc_says(b.0, "A pointer C may make null is a plain '*i32', compared with 'null'")
+    nnc_says(b.0, "A pointer C may make null is a plain '*int', compared with 'null'")
 
 @test("an exported Option of a counted reference is refused with the counted reference's advice")
 nnc_export_counted_refused()
