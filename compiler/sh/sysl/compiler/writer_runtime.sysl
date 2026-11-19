@@ -51,8 +51,8 @@ end buffer_lty
 // inert again.
 //
 // Neither of these can fail in a way a caller could act on: an allocator returning null is the
-// program's end rather than this writer's business, so `failed` is the constant a latch with nothing
-// to latch reports.
+// program's end rather than this writer's business -- it traps (`trap`, the module's stop) before the
+// null is stored -- so `failed` is the constant a latch with nothing to latch reports.
 //
 // **Every method table carries its type's identity in front of the slots**, and this one is a table
 // like any other as far as a call site is concerned -- a `*Writer` handed to a `display`
@@ -61,12 +61,16 @@ end buffer_lty
 // nothing a program can declare does.
 //
 // The working storage is bytes and nothing else, so it is taken on a boundary of one, and given back
-// with the capacity it was taken at.
+// with the capacity it was taken at. A null answer from the heap traps (`trap_symbol`) before the
+// old bytes are moved.
 writer_buffer(e: *Emit, str: string, slot: string, id: string) -> string
     val word = s"i${e.word_bits}"
     val take = heap_take_text(e, "%new", "%newcap", 1)
     val give_old = heap_give_text(e, "%old", "%cap", 1)
     val give_buf = heap_give_text(e, "%buf", "%cap", 1)
+    val trap = trap_symbol(e)
+
+    e.traps = true
 
     s"""
     define private void @sysl.w.buf.write(ptr %self, $str %b) {
@@ -87,10 +91,16 @@ writer_buffer(e: *Emit, str: string, slot: string, id: string) -> string
       %want = select i1 %bigger, $word %need, $word %twice
       %tiny = icmp ult $word %want, 32
       %newcap = select i1 %tiny, $word 32, $word %want
-    $take  %old = load ptr, ptr %bufp
+    $take  %given = icmp ne ptr %new, null
+      br i1 %given, label %grown, label %refused
+    refused:
+      call void @$trap()
+      unreachable
+    grown:
+      %old = load ptr, ptr %bufp
       br label %move
     move:
-      %i = phi $word [ 0, %grow ], [ %inext, %step ]
+      %i = phi $word [ 0, %grown ], [ %inext, %step ]
       %more = icmp ult $word %i, %len
       br i1 %more, label %step, label %swap
     step:

@@ -32,6 +32,14 @@ import sysl.text.Search
 //
 // The report is one line on standard error, and only when the net count is not zero -- a clean
 // program prints exactly what it printed before. The exit status is left alone.
+//
+// **The bytes asked for, in all**: the runtime also adds up the size of every allocation, never
+// subtracting, and a counted program run with `SYSL_COUNT_BYTES` set in its environment says that
+// total at exit as a second line. It is the deterministic measure of a cost that is quadratic in
+// copying: nothing in the library grows a block in place (a `Buf` that grows allocates the larger
+// block and copies), so the bytes allocated bound the bytes copied, and a test can assert that twice
+// the input asks for about twice the bytes -- where a timing would only say "slower". It is read at
+// run time rather than at build time so that asking for it changes no build and no cache key.
 
 // Set by a test that builds in-process, where setting the environment would reach every other test.
 private var alloc_counting_forced: bool = false
@@ -55,6 +63,23 @@ alloc_counting_active() -> bool = malloc_symbol() == counted_allocator().0
 // The line a counted program writes when its count did not come back, without the number.
 alloc_count_said() -> string = "counted allocations still live at exit"
 
+// The line a counted program run with `SYSL_COUNT_BYTES` writes, without the number.
+alloc_bytes_said() -> string = "bytes allocated in all"
+
+// The environment variable that asks a counted program for its byte total.
+alloc_bytes_variable() -> string = "SYSL_COUNT_BYTES"
+
+// A machine word's size in bytes, for the alignment an atomic load of one states.
+private word_bytes(word: string) -> string = word match
+    "i64" -> "8"
+    "i32" -> "4"
+    else "2"
+
+// The instruction adding a size held in `n` to the byte total. The total is a machine word, as the
+// sizes are, and is said with `%zu`, so no width is converted on either side.
+private alloc_bytes_add(word: string, n: string) -> string =
+    s"  %added = atomicrmw add ptr @sysl.count.bytes, $word $n monotonic"
+
 // The pair, the mark and the report, as the entry module carries them.
 //
 // The counter is atomic because a program may allocate from several threads. The report is
@@ -66,18 +91,24 @@ alloc_count_said() -> string = "counted allocations still live at exit"
 alloc_count_text(word: string) -> string
     val said = s"sysl: %lld ${alloc_count_said()}"
     val wrong = s"sysl: ${alloc_count_mismatch_said()}"
+    val bytes_said = s"sysl: %zu ${alloc_bytes_said()}"
+    val variable = alloc_bytes_variable()
 
     s"""
     @sysl.count.live = internal global i64 0
     @sysl.count.base = internal global i64 0
+    @sysl.count.bytes = internal global $word 0
     @sysl.count.said = private constant [${said.bytes.len + 2} x i8] c"$said\\0A\\00"
     @sysl.count.wrong = private constant [${wrong.bytes.len + 2} x i8] c"$wrong\\0A\\00"
+    @sysl.count.bytes.said = private constant [${bytes_said.bytes.len + 2} x i8] c"$bytes_said\\0A\\00"
+    @sysl.count.bytes.var = private constant [${variable.bytes.len + 1} x i8] c"$variable\\00"
 
     declare void @free(ptr)
     declare i32 @dprintf(i32, ptr, ...)
     declare i32 @atexit(ptr)
     declare i32 @posix_memalign(ptr, $word, $word)
     declare void @abort()
+    declare ptr @getenv(ptr)
 
     define ptr @sysl_count_alloc($word %n, $word %a) {
     entry:
@@ -90,6 +121,7 @@ alloc_count_text(word: string) -> string
       br i1 %got, label %count, label %none
     count:
       %was = atomicrmw add ptr @sysl.count.live, i64 1 monotonic
+    ${alloc_bytes_add(word, "%n")}
       %base = load ptr, ptr %slot
       %p = getelementptr i8, ptr %base, $word %lead
       %ap = getelementptr $word, ptr %p, i32 -1
@@ -144,9 +176,17 @@ alloc_count_text(word: string) -> string
       %base = load i64, ptr @sysl.count.base
       %net = sub i64 %live, %base
       %clean = icmp eq i64 %net, 0
-      br i1 %clean, label %done, label %say
+      br i1 %clean, label %bytes, label %say
     say:
       %w = call i32 (i32, ptr, ...) @dprintf(i32 2, ptr @sysl.count.said, i64 %net)
+      br label %bytes
+    bytes:
+      %asked = call ptr @getenv(ptr @sysl.count.bytes.var)
+      %quiet = icmp eq ptr %asked, null
+      br i1 %quiet, label %done, label %total
+    total:
+      %all = load atomic $word, ptr @sysl.count.bytes monotonic, align ${word_bytes(word)}
+      %t = call i32 (i32, ptr, ...) @dprintf(i32 2, ptr @sysl.count.bytes.said, $word %all)
       br label %done
     done:
       ret void
@@ -172,17 +212,25 @@ gen_alloc_count_mark(e: *Emit)
 end gen_alloc_count_mark
 
 // Whether this module carries the counting runtime, and so defines the pair and declares `malloc`,
-// `free`, `dprintf` and `atexit` itself: nothing else may state those again.
+// `free`, `dprintf`, `atexit` and `getenv` itself: nothing else may state those again.
 defines_alloc_count(e: *Emit) -> bool = e.requested_set.has("sysl.count")
 
 // The symbols the counting runtime states.
 alloc_count_symbols() -> []const string =
-    [counted_allocator().0, counted_allocator().1, "free", "dprintf", "atexit", "posix_memalign", "abort"]
+    [counted_allocator().0, counted_allocator().1, "free", "dprintf", "atexit", "posix_memalign", "abort",
+     "getenv"]
 
 // What a counted program said about its heap: the net count it reported, or zero where it said
 // nothing. Read off its standard error.
-alloc_count_reported(err: string) -> long
-    val at = err.index_of(s" ${alloc_count_said()}") match
+alloc_count_reported(err: string) -> long = reported_number(err, alloc_count_said())
+
+// What a counted program run with `SYSL_COUNT_BYTES` said it had allocated in all, or zero where it
+// said nothing.
+alloc_bytes_reported(err: string) -> long = reported_number(err, alloc_bytes_said())
+
+// The number a `sysl: <n> <said>` line on standard error carries, or zero where there is none.
+private reported_number(err: string, said: string) -> long
+    val at = err.index_of(s" $said") match
         Some(i) -> i
         None -> return 0
 
@@ -201,4 +249,4 @@ alloc_count_reported(err: string) -> long
         else n = n * 10 + long(b - u8('0'))
 
     if negative then -n else n
-end alloc_count_reported
+end reported_number

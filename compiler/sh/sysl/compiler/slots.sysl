@@ -56,11 +56,27 @@ import sysl.math.bigint.from_int
 //
 // Both are unchecked: the caller promises that a taken slot is live and a put one is empty. Rust's
 // `ptr::read` and `ptr::write` are the same pair.
+//
+// **Two answer a refusal instead of trapping on it**, for the fallible members of the containers
+// (`sysl.alloc`, `reference/memory.md § An allocation that may fail`):
+//
+// - `try_slot_storage(n) -> []T` is `slot_storage(n)`, except that where the heap answers null -- or
+//   the size of `n` slots does not fit in a word -- it answers an **empty** view, owner null, rather
+//   than trapping. A caller asking for `n > 0` slots tells the two apart by the length.
+// - `try_heap(v) -> Option[&T]` is the box `v` would be put in where a `&T` is expected, answered as
+//   `Some`, or `None` where the heap answered null. The typed tree holds the box itself (`TBox`) as
+//   the form's one argument, so every analysis that reads a box reads this one; only the lowering
+//   knows the box may not be made. Nothing is stored and no count is taken on the refused arm.
 
-// The six names, whatever claims them.
+// The eight names, whatever claims them.
 slot_form_word(name: string) -> bool =
     name == "slot_storage" || name == "slot_place" || name == "slot_place_run" ||
-        name == "slot_vacate" || name == "slot_take" || name == "slot_put"
+        name == "slot_vacate" || name == "slot_take" || name == "slot_put" ||
+        name == "try_slot_storage" || name == "try_heap"
+
+// The two forms that make new storage of slots: the trapping one and the one that answers an empty
+// view where the heap refused. Every analysis asks this rather than naming either.
+storage_form(op: string) -> bool = op == "slot_storage" || op == "try_slot_storage"
 
 // Whether a name in call position is one of these forms. Like the atomics, a function or a local of
 // the name is what a call reaches, and the form applies only where nothing else claims it.
@@ -69,7 +85,8 @@ slot_form(cx: &Analyzer, name: string) -> bool =
 
 // One of the forms, analyzed.
 slot_call(cx: &Analyzer, span: Span, name: string, args: Buf[Expr], expected: Option[Type]) -> TExpr
-    if name == "slot_storage" then return slot_storage_call(cx, span, args, expected)
+    if storage_form(name) then return slot_storage_call(cx, span, name, args, expected)
+    if name == "try_heap" then return try_heap_call(cx, span, args)
     if name == "slot_take" || name == "slot_put" then return slot_move_call(cx, span, name, args)
 
     slot_write_call(cx, span, name, args)
@@ -120,16 +137,17 @@ private slot_move_call(cx: &Analyzer, span: Span, name: string, args: Buf[Expr])
     TExpr(span, TSlots(name, all, elem, if take then elem else Unit))
 end slot_move_call
 
-// `slot_storage(n)` -- the element type comes from the position, the way `ptr_cast`'s does.
-private slot_storage_call(cx: &Analyzer, span: Span, args: Buf[Expr],
+// `slot_storage(n)` and `try_slot_storage(n)` -- the element type comes from the position, the way
+// `ptr_cast`'s does.
+private slot_storage_call(cx: &Analyzer, span: Span, name: string, args: Buf[Expr],
                           expected: Option[Type]) -> TExpr
     if args.len() != 1 then
-        return cx.err(span, "'slot_storage' takes 1 argument — how many slots — but " +
+        return cx.err(span, s"'$name' takes 1 argument — how many slots — but " +
                       supplied(args.len(), "argument"))
 
     if expected.is_none() then
-        return cx.err(span, "'slot_storage' makes storage for elements of some type, and nothing " +
-                      "here says which — write 'slot_storage[T](n)', or put it where a '[]T' is " +
+        return cx.err(span, s"'$name' makes storage for elements of some type, and nothing " +
+                      s"here says which — write '$name[T](n)', or put it where a '[]T' is " +
                       "expected")
 
     val want = expected.unwrap()
@@ -137,19 +155,50 @@ private slot_storage_call(cx: &Analyzer, span: Span, args: Buf[Expr],
     val elem = underlying(want) match
         Slice(el, read_only) ->
             if read_only then
-                return cx.err(span, "'slot_storage' makes slots that are placed into, and " +
+                return cx.err(span, s"'$name' makes slots that are placed into, and " +
                               s"${type_show(want)} is a read-only view — ask for a " +
                               s"'[]${type_show(*el)}'")
 
             *el
         _ ->
-            return cx.err(span, "'slot_storage' makes a buffer, which is a '[]T', and the " +
+            return cx.err(span, s"'$name' makes a buffer, which is a '[]T', and the " +
                           s"position here wants ${type_show(want)}")
 
     val n = slot_count(cx, args[0])
 
-    TExpr(span, TSlots("slot_storage", one_texpr(n), elem, Slice(elem, false)))
+    TExpr(span, TSlots(name, one_texpr(n), elem, Slice(elem, false)))
 end slot_storage_call
+
+// `try_heap(v)` -- the box a `&T` of the value would be, as an `Option[&T]` that is `None` where the
+// heap refused it. The box is analyzed as the one a position expecting `&T` makes (`coerce`), so a
+// value that may not be boxed is refused here in the same words.
+private try_heap_call(cx: &Analyzer, span: Span, args: Buf[Expr]) -> TExpr
+    if args.len() != 1 then
+        return cx.err(span, "'try_heap' takes 1 argument — the value to put on the heap — but " +
+                      supplied(args.len(), "argument"))
+
+    val v = type_expr_bare(cx, args[0])
+    val vt = texpr_type(v)
+
+    if vt == Unknown then return bad_expr(span)
+
+    val ref_ty = Ref(vt, false)
+    val boxed = coerce(cx, v, ref_ty)
+
+    *boxed.kind match
+        TBox(_, _) -> ()
+        _ -> return boxed
+
+    var targs: Buf[Type] = buf()
+
+    targs.push(ref_ty)
+
+    val opt = reinstantiate(cx.an, library_key("Option"), targs)
+
+    opt match
+        Enum(_) -> TExpr(span, TSlots("try_heap", one_texpr(boxed), vt, opt))
+        _ -> bad_expr(span)
+end try_heap_call
 
 // `slot_place(xs, i, v)`, `slot_place_run(xs, at, src)` and `slot_vacate(xs, n)`.
 private slot_write_call(cx: &Analyzer, span: Span, name: string, args: Buf[Expr]) -> TExpr
@@ -263,6 +312,8 @@ end one_texpr
 // One of the forms, lowered.
 gen_slots(e: *Emit, op: string, args: Buf[TExpr], elem: Type, ty: Type) -> Val
     if op == "slot_storage" then return gen_slot_storage(e, args[0], elem, ty)
+    if op == "try_slot_storage" then return gen_try_slot_storage(e, args[0], elem, ty)
+    if op == "try_heap" then return gen_try_heap(e, args[0], ty)
     if op == "slot_take" then return gen_slot_take(e, args[0], elem)
 
     if op == "slot_put" then gen_slot_put(e, args[0], args[1], elem)
@@ -288,6 +339,40 @@ private gen_slot_storage(e: *Emit, count: TExpr, elem: Type, slice_ty: Type) -> 
 
     buffer_view(e, slice_ty, made.0, made.1, n)
 end gen_slot_storage
+
+// `slot_storage`'s buffer where the heap gave one, and an empty view where it did not
+// (`gen_try_buffer`): the hook and the live count are written on the arm that has a box to write
+// them into, and the view is owned once, where the arms meet.
+private gen_try_slot_storage(e: *Emit, count: TExpr, elem: Type, slice_ty: Type) -> Val
+    val n = widen_index(e, count, count.span, BoundsCountTooWide)
+    val lt = lty(e, slice_ty)
+    val result = alloca(e, fresh_reg(e), lt)
+    val made = gen_try_buffer(e, elem, n)
+    val given = fresh_label(e, "trystore.given")
+    val refused = fresh_label(e, "trystore.refused")
+    val joined = fresh_label(e, "trystore.end")
+
+    emit_term(e, InCondBr(made.2, given, refused))
+    emit_label(e, given)
+    emit(e, InStore(word_lty(e), VInt(from_int(0)), slot_header(e, elem, made.0, header_fields()),
+                    AccPlain, None))
+
+    if contains_counted(elem) || heap_sized() then
+        emit(e, InStore(LPtr, slot_buf_fn(e, elem), slot_header(e, elem, made.0, 1), AccPlain, None))
+
+    emit(e, InStore(lt, view_parts(e, slice_ty, made.0, made.1, n), result, AccPlain, None))
+    emit_term(e, InBr(joined))
+    emit_label(e, refused)
+    emit(e, InStore(lt, VZero, result, AccPlain, None))
+    emit_term(e, InBr(joined))
+    emit_label(e, joined)
+    e.maybe_heap = true
+
+    val r = fresh_reg(e)
+
+    emit(e, InLoad(r, lt, result, AccPlain, None))
+    own_temp(e, r, slice_ty)
+end gen_try_slot_storage
 
 // The value at `p`, which arrives owning the share the slot held -- registered as a temporary, as a
 // call's result is -- and the slot zeroed behind it where the element holds a count, so nothing that

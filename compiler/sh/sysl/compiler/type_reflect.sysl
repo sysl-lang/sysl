@@ -1207,7 +1207,25 @@ private payload_of(cx: &Analyzer, span: Span, tr: TExpr, owner: Type, v: int, se
     // Every other variant is one arm, which names the variant the value holds from a table indexed
     // by its tag -- one test per `x.(c)`, so the copies of a walk over a few hundred variants stay
     // a few hundred tests and not the square of it. The table needs tags that are the positions.
+    //
+    // **A local read is read again for its tag rather than copied into a binding**: the arm runs
+    // straight after the read, so the second one sees the same value, and a binding would be a copy
+    // of the whole enum with a stack slot of its own in every `x.(c)` -- which a walk over the
+    // variants unrolls once per variant, so an unoptimized frame grew by the enum's size per variant.
     if !en.simple && positional_tags(variants)
+        val again = *tr.kind match
+            TLoad(name, ty) -> Some(TExpr(tr.span, TLoad(name, ty)))
+            _ -> None
+
+        if again.is_some()
+            var rest: Buf[TPattern] = buf()
+            val fail = TExpr(span, TVariantFailHeld(asked, again.unwrap()))
+
+            rest.push(TWildPattern(owner))
+            arms.push(TArm(rest, None, TBlock(buf(), Some(fail), Never)))
+            return TExpr(span, TMatch(tr, arms, pt))
+        end if
+
         cx.enter()
 
         val u = cx.bind_pattern(s"${ModuleSep}held", owner)

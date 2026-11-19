@@ -24,14 +24,25 @@ import sysl.math.bigint.{BigInt, from_int, pow, sub as big_sub, to_string}
 // back with its size where the pair is told sizes, and is the plain hook where it is not. It cannot
 // be null: the free is the hook's, so a null one would mean a `StrBuf` whose bytes are never given
 // back.
+//
+// **A null answer traps before anything is stored**, as every box's does (`emit_box.sysl`'s
+// `allocate_box`); the trap is the module's stop (`trap_symbol`), and the block the header ends in is
+// `got`, which is what a `phi` after it names as its way in.
 private str_buf_header(e: *Emit, n: string) -> string
     val word = s"i${e.word_bits}"
+    val trap = trap_symbol(e)
     val hook = drop_buf_fn(e, byte_type()) match
         VGlobal(name) -> name
         _ -> "arc.drop.plain"
 
     heap_take_text(e, "%p", "%size", e.layout.pointer_bytes()) +
     s"""
+      %given = icmp ne ptr %p, null
+      br i1 %given, label %got, label %refused
+    refused:
+      call void @$trap()
+      unreachable
+    got:
       store $word 1, ptr %p
       %hook = getelementptr %arc.header, ptr %p, i32 0, i32 1
       store ptr @$hook, ptr %hook
@@ -262,7 +273,7 @@ str_concat_text(e: *Emit, str: string) -> string
     ${str_buf_lead(word)}  %size = add $word %hsize, %total
     ${str_buf_header(e, "%total")}  br label %acond
     acond:
-      %i = phi $word [ 0, %entry ], [ %inext, %abody ]
+      %i = phi $word [ 0, %got ], [ %inext, %abody ]
       %amore = icmp ult $word %i, %an
       br i1 %amore, label %abody, label %bcond
     abody:
@@ -303,7 +314,7 @@ str_from_bytes_text(e: *Emit, str: string) -> string
     ${str_buf_lead(word)}  %size = add $word %hsize, %n
     ${str_buf_header(e, "%n")}  br label %cond
     cond:
-      %i = phi $word [ 0, %entry ], [ %next, %body ]
+      %i = phi $word [ 0, %got ], [ %next, %body ]
       %more = icmp ult $word %i, %n
       br i1 %more, label %body, label %done
     body:

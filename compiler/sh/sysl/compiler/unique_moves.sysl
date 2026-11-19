@@ -1,0 +1,1142 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+
+// `@unique` on a struct or an enum: a value of it has one owner (`design/affine-values.md`).
+//
+// **Every by-value use hands the value over**, and the name it came from holds nothing until it is
+// assigned again: a binding, an argument, a result, a field or element of something built, a payload,
+// a box. Reading a field of a copyable type copies the field and moves nothing; a field, an address,
+// a `ref`, a `(self)` member and a comparison reach the value where it is.
+//
+// **Only a local or a parameter is moved out of.** A field reached through a pointer, an element,
+// module storage, what a `ref` names and `*p` would still hold the value after the move, so taking it
+// from there is refused. A `(self)` receiver is a copy that owns nothing; `@consumes` makes a member
+// take its receiver, and the caller's local is moved into the call.
+//
+// **The check follows every path**, as `consumes.sysl`'s does: a value moved on some paths is
+// maybe-moved after they meet, and a loop is walked until what reaches its head stops changing, so a
+// move on one turn and a use on the next is refused.
+//
+// **A type holding a `@unique` value by value is unique too.** A tuple, an array and an instance of a
+// generic type are unique by what they hold; a struct or an enum the program declares says so with
+// its own `@unique`, so a reader of the declaration sees that `val b = a` moves.
+//
+// What later stages of the design add is refused here with a sentence saying it is not supported
+// yet: a destructor on a `@unique` type, taking one apart with a pattern, moving a part out of a
+// local, a closure capturing one, a borrow that a move would end, and one crossing to C by value.
+
+// -- which types are unique ------------------------------------------------------------------------
+
+// Whether any declaration the program reads is `@unique`. Asked of every body, so what has been
+// looked through is remembered: once one is found the answer stays yes, and a table that grew is
+// looked through from where the last look stopped.
+any_unique(a: &Analysis) -> bool
+    if a.uniques < 0 then return true
+
+    val n = a.tables.types.len()
+    var i = usize(a.uniques)
+
+    while i < n
+        if unique_decl(a.tables.types.at(i)) then
+            a.uniques = -1
+            return true
+
+        i += 1
+    end while
+
+    a.uniques = int(n)
+    false
+end any_unique
+
+private unique_decl(d: Decl) -> bool = d.kind match
+    StructOf(sd) -> sd.unique
+    EnumOf(ed) -> ed.unique
+    _ -> false
+
+// Whether the struct or enum filed under this key was declared `@unique`.
+unique_base(a: &Analysis, base: string) -> bool
+    val decl = a.tables.types.get(base)
+
+    if decl.is_none() then return false
+
+    unique_decl(decl.unwrap())
+end unique_base
+
+// Whether a value of this type has one owner.
+is_unique(a: &Analysis, t: Type) -> bool = any_unique(a) && unique_held(a, t).is_some()
+
+// The first declared `@unique` type this one holds **by value**, at any depth a value is stored at --
+// `drop_values.sysl`'s walk, asking for the mark where that one asks for a `Drop`. `&T`, `weak T`
+// and `*T` stop it, except where a counted reference is a generic container's own storage
+// (`Buf[T]`'s `&BufCore[T]`), which is walked into.
+unique_held(a: &Analysis, t: Type) -> Option[Type]
+    var seen: Buf[string] = buf()
+
+    unique_at(a, t, &seen)
+
+private unique_at(a: &Analysis, t: Type, seen: *Buf[string]) -> Option[Type] = t match
+    Ref(inner, _) -> unique_behind(a, *inner, seen)
+    Weak(inner) -> unique_behind(a, *inner, seen)
+    Ptr(_, _) -> None
+    Struct(d) ->
+        if unique_base(a, d.base) then return Some(t)
+        if is_anonymous_type(d) || !d.targs.is_empty() then return unique_in_fields(a, d.fields, seen)
+
+        None
+    Enum(d) ->
+        if unique_base(a, d.base) then return Some(t)
+        if d.targs.is_empty() then return None
+
+        for v in d.variants
+            val held = unique_in_fields(a, v.fields, seen)
+
+            if held.is_some() then return held
+
+        None
+    Array(_, e) -> unique_at(a, *e, seen)
+    Slice(e, _) -> unique_at(a, *e, seen)
+    Vector(_, e) -> unique_at(a, *e, seen)
+    Volatile(inner) -> unique_at(a, *inner, seen)
+    Results(parts) -> unique_in(a, parts.targs, seen)
+    Pack(elems) -> unique_in(a, elems, seen)
+    _ -> None
+
+private unique_behind(a: &Analysis, t: Type, seen: *Buf[string]) -> Option[Type]
+    val generic = t match
+        Struct(d) -> !d.targs.is_empty() && !unique_base(a, d.base)
+        Enum(d) -> !d.targs.is_empty() && !unique_base(a, d.base)
+        _ -> false
+
+    if !generic then return None
+
+    val key = type_show(t)
+
+    if holds_string(*seen, key) then return None
+
+    seen.push(key)
+    unique_at(a, t, seen)
+end unique_behind
+
+private unique_in(a: &Analysis, ts: Buf[Type], seen: *Buf[string]) -> Option[Type]
+    for t in ts
+        val held = unique_at(a, t, seen)
+
+        if held.is_some() then return held
+
+    None
+end unique_in
+
+private unique_in_fields(a: &Analysis, fields: Buf[(string, Type)], seen: *Buf[string]) -> Option[Type]
+    for f in fields
+        val held = unique_at(a, f.1, seen)
+
+        if held.is_some() then return held
+
+    None
+end unique_in_fields
+
+// Whether a receiver handed to a `@consumes` member is a `@unique` value, whose move the move check
+// follows in place of the `@consumes` check.
+unique_receiver(a: &Analysis, receiver: TExpr) -> bool
+    if !any_unique(a) then return false
+
+    val t = texpr_type(receiver)
+
+    t match
+        Ptr(inner, _) -> is_unique(a, *inner)
+        _ -> is_unique(a, t)
+end unique_receiver
+
+// -- declarations ----------------------------------------------------------------------------------
+
+// A declared struct or enum holding a `@unique` value by value says so; a `@unique` type has no
+// destructor yet; and none crosses to C by value.
+check_unique_decls(a: &Analysis, funcs: Buf[TFunc])
+    if !any_unique(a) then return
+
+    unique_destructors(a)
+    unique_holders(a)
+    unique_c_signatures(a, funcs)
+end check_unique_decls
+
+private unique_destructors(a: &Analysis)
+    val drop_trait = catalog_key(a, "Drop")
+
+    if drop_trait.is_none() then return
+
+    for i in 0..<a.tables.types.len()
+        val d = a.tables.types.at(i)
+
+        if !unique_decl(d) then continue
+
+        val key = a.tables.types.key_at(i)
+
+        if impls_of(a, drop_trait.unwrap(), key).is_empty() then continue
+
+        val name = qualified_name(key)
+
+        a.fault(d.scope, d.span, s"'$name' is '@unique' and has a 'Drop' — a '@unique' type with a " +
+                "destructor is not supported yet. Drop the '@unique' to make it a reference type, " +
+                "built as a '&" + name + "', or release what it holds with a '@consumes' member")
+    end for
+end unique_destructors
+
+// The containment rule, told at the field: a declared struct or enum holding a `@unique` value by
+// value is marked `@unique` too. An instance of a generic one is unique by what it holds.
+private unique_holders(a: &Analysis)
+    for i in 0..<a.tables.struct_insts.len()
+        a.tables.struct_insts.at(i) match
+            Struct(d) ->
+                if !d.targs.is_empty() || is_anonymous_type(d) then continue
+
+                val decl = a.tables.types.get(d.base)
+
+                if decl.is_none() then continue
+
+                decl.unwrap().kind match
+                    StructOf(sd) ->
+                        if sd.unique then continue
+
+                        for j in 0..<d.fields.len()
+                            if j >= sd.fields.len() then break
+
+                            val f = d.fields[j]
+
+                            unique_held(a, f.1) match
+                                Some(held) ->
+                                    a.fault(decl.unwrap().scope, sd.fields[j].span,
+                                            holder_refusal(s"field '${f.0}' of '${type_show(Struct(d))}' holds",
+                                                           f.1, held, type_show(Struct(d)), "hold"))
+                                    break
+                                None -> ()
+                        end for
+                    _ -> ()
+            _ -> ()
+    end for
+
+    for i in 0..<a.tables.enum_insts.len()
+        a.tables.enum_insts.at(i) match
+            Enum(d) ->
+                if !d.targs.is_empty() then continue
+
+                val decl = a.tables.types.get(d.base)
+
+                if decl.is_none() then continue
+
+                decl.unwrap().kind match
+                    EnumOf(ed) ->
+                        if ed.unique then continue
+
+                        unique_payload(a, decl.unwrap(), d, ed)
+                    _ -> ()
+            _ -> ()
+    end for
+end unique_holders
+
+private unique_payload(a: &Analysis, decl: Decl, d: &EnumType, ed: EnumDecl)
+    for j in 0..<d.variants.len()
+        if j >= ed.variants.len() then break
+
+        val v = d.variants[j]
+
+        for k in 0..<v.fields.len()
+            val f = v.fields[k]
+            val at = if k < ed.variants[j].fields.len() then ed.variants[j].fields[k].span
+                     else ed.variants[j].span
+
+            unique_held(a, f.1) match
+                Some(held) ->
+                    a.fault(decl.scope, at, holder_refusal(s"variant '${v.name}' of '${type_show(Enum(d))}' carries",
+                                                           f.1, held, type_show(Enum(d)), "carry"))
+                    return
+                None -> ()
+    end for
+end unique_payload
+
+private holder_refusal(what: string, whole: Type, held: Type, holder: string, verb: string) -> string
+    val name = type_show(held)
+    val inside = if type_eq(whole, held) then "," else s", inside '${type_show(whole)}',"
+
+    s"$what '$name' by value$inside and '$name' is '@unique', so '$holder' would be moved rather " +
+        s"than copied too. Mark '$holder' '@unique', or $verb a '&$name' or a '*$name'"
+end holder_refusal
+
+// C cannot honour "exactly once", so a `@unique` value crosses an `extern` or an `@export` only
+// behind a pointer.
+private unique_c_signatures(a: &Analysis, funcs: Buf[TFunc])
+    for f in funcs
+        if f.exported.is_none() then continue
+
+        var types: Buf[Type] = buf()
+
+        for p in f.params
+            types.push(p.1)
+
+        types.push(f.ret_ty)
+        unique_crossing(a, func_home(a, f.name), f.span, s"'${qualified_name(f.name)}'", types)
+
+    val externs = reached_externs(a)
+
+    for x in externs
+        val home = a.tables.extern_scopes.get(x.name)
+
+        if home.is_none() then continue
+
+        var types: Buf[Type] = buf()
+
+        for p in x.params
+            types.push(p)
+
+        types.push(x.ret_ty)
+        unique_crossing(a, home.unwrap().scope, home.unwrap().span, s"'${qualified_name(x.name)}'", types)
+end unique_c_signatures
+
+private unique_crossing(a: &Analysis, scope: Scope, at: Span, what: string, types: Buf[Type])
+    for t in types
+        unique_held(a, t) match
+            Some(held) ->
+                val name = type_show(held)
+
+                a.fault(scope, at, s"$what hands '$name' across the C boundary by value, and '$name' is " +
+                        s"'@unique' — C cannot keep a value to one owner, and a '@unique' value crossing " +
+                        s"by value is not supported yet. Pass a '*$name' instead")
+                return
+            None -> ()
+end unique_crossing
+
+// -- moves in one body -----------------------------------------------------------------------------
+
+// One move of a local: its unique name and the name as written, what it went into, where, and the
+// `@consumes` member that took it where a call did.
+private struct UniqueMove
+    unique: string
+    name: string
+    into: string
+    span: Span
+    line: usize
+    member: string
+    ty: Type
+end UniqueMove
+
+// What may be true at one point of a body: whether it is reached, and the locals that may have been
+// moved on some path to it. Never changed once made, as `ConsumeFlow` is not.
+private struct MoveFlow
+    dead: bool
+    gone: Buf[UniqueMove]
+end MoveFlow
+
+private struct MoveLoop
+    breaks: MoveFlow
+    conts: MoveFlow
+end MoveLoop
+
+// A `ref` naming part of a `@unique` local, live until the end of the block that bound it.
+private struct UniqueBorrow
+    unique: string
+    root: string
+end UniqueBorrow
+
+private struct MoveWalk
+    cx: &Analyzer
+    loops: Buf[&MoveLoop]
+    told: Buf[Span]
+    refs: Buf[string]
+    borrows: Buf[UniqueBorrow]
+
+    // Whether the body owns a `self` it was handed by value: a `@consumes` member does, and any other
+    // member's `(self)` is a copy that owns nothing.
+    owns_self: bool
+end MoveWalk
+
+// Every move of a `@unique` value in one body, and every use after one, refused once each. `result`
+// says whether what the block comes to is handed out of it -- a function's or a closure's body.
+check_unique_moves(cx: &Analyzer, block: TBlock, result: bool)
+    if !any_unique(cx.an) then return
+
+    val w: &MoveWalk = MoveWalk(cx, buf(), buf(), buf(), buf(), owns_receiver(cx.an, cx.func_name))
+
+    flow_seq(w, block.stmts, block.result, if result then "the result" else "", flow_live())
+end check_unique_moves
+
+// The declaration a function's lowered name was made from: its own, or the generic it instantiates.
+private callee_decl(a: &Analysis, name: string) -> Option[FuncDecl]
+    val own = filed_decl(a, name)
+
+    if own.is_some() then return own
+
+    val origin = a.tables.members.func_origin.get(name)
+
+    if origin.is_none() then return None
+
+    val found = filed_decl(a, origin.unwrap())
+
+    if found.is_some() then return found
+
+    a.tables.members.generic.get(origin.unwrap())
+end callee_decl
+
+// A free function by its key, or a member by the name it was lowered to.
+private filed_decl(a: &Analysis, name: string) -> Option[FuncDecl]
+    val f = a.tables.funcs.get(name)
+
+    if f.is_some() then return Some(f.unwrap().decl)
+
+    val m = a.tables.members
+
+    m.lowered_at.get(name).map(i -> m.lowered[i])
+end filed_decl
+
+private owns_receiver(a: &Analysis, name: string) -> bool
+    val d = callee_decl(a, name)
+
+    d.is_some() && d.unwrap().marks.consumes
+end owns_receiver
+
+// Whether a call's first argument is the receiver of a member that takes `self`.
+private takes_self(d: Option[FuncDecl]) -> bool =
+    d.is_some() && !d.unwrap().params.is_empty() && d.unwrap().params[0].name == "self"
+
+// -- states ----------------------------------------------------------------------------------------
+
+private flow_live() -> MoveFlow = MoveFlow(false, buf())
+
+private flow_dead() -> MoveFlow = MoveFlow(true, buf())
+
+private gone_entry(gone: Buf[UniqueMove], unique: string) -> Option[UniqueMove]
+    for item in gone
+        if item.unique == unique then return Some(item)
+
+    None
+end gone_entry
+
+private flow_join(a: MoveFlow, b: MoveFlow) -> MoveFlow
+    if a.dead then return b
+    if b.dead then return a
+
+    var gone: Buf[UniqueMove] = buf()
+
+    for item in a.gone
+        gone.push(item)
+
+    for item in b.gone
+        if gone_entry(a.gone, item.unique).is_none() then gone.push(item)
+
+    MoveFlow(false, gone)
+end flow_join
+
+private flow_with(f: MoveFlow, m: UniqueMove) -> MoveFlow
+    if f.dead then return f
+
+    var gone: Buf[UniqueMove] = buf()
+
+    for item in f.gone
+        if item.unique != m.unique then gone.push(item)
+
+    gone.push(m)
+    MoveFlow(false, gone)
+end flow_with
+
+private flow_without(f: MoveFlow, unique: string) -> MoveFlow
+    if f.dead || gone_entry(f.gone, unique).is_none() then return f
+
+    var gone: Buf[UniqueMove] = buf()
+
+    for item in f.gone
+        if item.unique != unique then gone.push(item)
+
+    MoveFlow(false, gone)
+end flow_without
+
+private flow_same(a: MoveFlow, b: MoveFlow) -> bool
+    if a.dead != b.dead || a.gone.len() != b.gone.len() then return false
+
+    for item in a.gone
+        if gone_entry(b.gone, item.unique).is_none() then return false
+
+    true
+end flow_same
+
+private flow_unbind(f: MoveFlow, p: TPattern) -> MoveFlow = p match
+    TBindPattern(name, _) -> flow_without(f, name)
+    TAtPattern(name, inner) -> flow_unbind(flow_without(f, name), *inner)
+    TVariantPattern(_, _, args) -> flow_unbind_all(f, args)
+    TStructPattern(_, args) -> flow_unbind_all(f, args)
+    _ -> f
+
+private flow_unbind_all(f: MoveFlow, ps: Buf[TPattern]) -> MoveFlow
+    var g = f
+
+    for item in ps
+        g = flow_unbind(g, item)
+
+    g
+end flow_unbind_all
+
+// -- telling ---------------------------------------------------------------------------------------
+
+// The name as written: a local's unique name is the written one, or that with `.N` after it.
+private written_local(unique: string) -> string
+    val dot = unique.last_index_of(".")
+
+    if dot.is_none() then return unique
+
+    val at = dot.unwrap()
+    val b = unique.bytes
+
+    if at + 1 >= b.len then return unique
+
+    for i in at + 1..<b.len
+        if b[i] < u8('0') || b[i] > u8('9') then return unique
+
+    unique[0..<at]
+end written_local
+
+// The last part of a dotted name: a member's own name.
+private last_part(name: string) -> string
+    val dot = name.last_index_of(".")
+
+    if dot.is_none() then name else name[dot.unwrap() + 1..<name.bytes.len]
+end last_part
+
+private line_of(w: &MoveWalk, at: Span) -> usize = w.cx.scope.src.locate(at.start).line
+
+// Which instance a refusal inside a generic body is about, as `drop_values.sysl` names it.
+private instance_note(w: &MoveWalk) -> string =
+    refused_in(w.cx.an, w.cx.scope, w.cx.subst, w.cx.func_name, "")
+
+private once(w: &MoveWalk, at: Span) -> bool
+    for s in w.told
+        if s.start == at.start && s.end == at.end then return false
+
+    w.told.push(at)
+    true
+end once
+
+private tell(w: &MoveWalk, at: Span, message: string)
+    if once(w, at) then w.cx.fault(at, message)
+
+// A use of a local that may have been moved on the way here.
+private flow_read(w: &MoveWalk, at: Span, unique: string, f: MoveFlow)
+    if f.dead then return
+
+    val found = gone_entry(f.gone, unique)
+
+    if found.is_none() then return
+
+    val m = found.unwrap()
+    val ty = type_show(m.ty)
+    val note = instance_note(w)
+
+    if m.span.start == at.start && m.span.end == at.end
+        tell(w, at, s"'${m.name}' is moved here on one turn of the loop and would be moved again on the " +
+             s"next — '$ty' is '@unique'$note. Assign '${m.name}' a new value before the turn ends, or " +
+             "leave the loop after the move")
+        return
+    end if
+
+    if m.member != ""
+        tell(w, at, s"'${m.name}' is read here after '${m.name}.${m.member}()' took it — '$ty' is " +
+             s"'@unique'$note, so '${m.name}' holds nothing until it is assigned again")
+        return
+    end if
+
+    val where = if m.line == line_of(w, at) then "" else s" on line ${m.line}"
+
+    tell(w, at, s"'${m.name}' is read here after it was moved into ${m.into}$where — '$ty' is " +
+         s"'@unique'$note, so a by-value use hands it over, and '${m.name}' holds nothing until it is " +
+         "assigned again")
+end flow_read
+
+// A form a later stage of the design supports, refused until then.
+private not_yet(w: &MoveWalk, at: Span, ty: Type, what: string, instead: string)
+    tell(w, at, s"$what, and '${type_show(ty)}' is '@unique' — this is not supported yet" +
+         s"${instance_note(w)}. $instead")
+
+// -- moves -----------------------------------------------------------------------------------------
+
+// `e` is used by value, handed `into` something: a `@unique` local is moved, and anything else that
+// is not a value of its own is refused.
+private flow_move(w: &MoveWalk, e: TExpr, f: MoveFlow, into: string) -> MoveFlow
+    if !is_unique(w.cx.an, texpr_type(e)) then return flow_expr(w, e, f)
+
+    *e.kind match
+        TLoad(unique, ty) -> move_local(w, e.span, unique, ty, f, into, "")
+        TConstView(arg) -> flow_move(w, arg, f, into)
+        TStructInvCheck(value, _, _) -> flow_move(w, value, f, into)
+        TIf(cond, then_block, else_block, _) -> flow_if(w, cond, then_block, else_block, f, into)
+        TMatch(scrutinee, arms, _) -> flow_match(w, scrutinee, arms, f, into)
+        TBlockExpr(block) -> flow_seq(w, block.stmts, block.result, into, f)
+        TField(_, _, _) -> moved_out(w, e, f)
+        TDeref(_, _) -> moved_out(w, e, f)
+        TIndex(_, _, _) -> moved_out(w, e, f)
+        TGlobal(_, _, _) -> moved_out(w, e, f)
+        _ -> flow_expr(w, e, f)
+end flow_move
+
+// A local moved: refused if it was moved already, if it is a `ref`, if it is a `(self)` receiver that
+// owns nothing, or while a `ref` borrows from it; and from here on it holds nothing.
+private move_local(w: &MoveWalk, at: Span, unique: string, ty: Type, f: MoveFlow, into: string,
+                   member: string) -> MoveFlow
+    flow_read(w, at, unique, f)
+
+    val name = written_local(unique)
+
+    if holds_string(w.refs, unique)
+        tell(w, at, s"this moves '$name' out of what the 'ref' '$name' names, and '${type_show(ty)}' is " +
+             s"'@unique'${instance_note(w)} — only a local or a parameter can be moved out of, since " +
+             "whatever holds this would still hold it. Read through the 'ref' instead")
+        return f
+    end if
+
+    if unique == "self" && !w.owns_self
+        tell(w, at, s"this hands on 'self' by value, and '${type_show(ty)}' is '@unique'" +
+             s"${instance_note(w)} — a '(self)' receiver is a copy that owns nothing, so it may be read " +
+             "but not stored, returned or passed on by value. Mark the member '@consumes' to take its " +
+             "receiver")
+        return f
+    end if
+
+    for b in w.borrows
+        if b.root == unique
+            not_yet(w, at, ty, s"this moves '$name' while the 'ref' '${written_local(b.unique)}' borrows " +
+                    "from it", "End the 'ref''s block before the move")
+            return f
+        end if
+
+    flow_with(f, UniqueMove(unique, name, into, at, line_of(w, at), member, ty))
+end move_local
+
+// A value moved out of something that is not a local of this body.
+private moved_out(w: &MoveWalk, e: TExpr, f: MoveFlow) -> MoveFlow
+    val g = flow_place(w, e, f)
+    val shown = place_text(w, e)
+    val ty = texpr_type(e)
+    val root = place_root(e)
+
+    root match
+        Some(r) ->
+            *r.kind match
+                TLoad(unique, rty) ->
+                    if !holds_string(w.refs, unique) && !points(rty)
+                        if unique == "self" && !w.owns_self
+                            tell(w, e.span, s"this moves '$shown' out of 'self', and '${type_show(ty)}' is " +
+                                 s"'@unique'${instance_note(w)} — a '(self)' receiver is a copy that owns " +
+                                 "nothing, so no part of it may be moved out. Mark the member '@consumes' " +
+                                 "to take its receiver")
+                        else
+                            not_yet(w, e.span, ty, s"this moves '$shown' out of the local " +
+                                    s"'${written_local(unique)}'", "Name the part with a 'ref', or reach " +
+                                    "it through the local's address")
+                        return g
+                    end if
+                _ -> ()
+        None -> ()
+
+    tell(w, e.span, s"this moves '$shown' out of ${holder_text(w, e)}, and '${type_show(ty)}' is " +
+         s"'@unique'${instance_note(w)} — only a local or a parameter can be moved out of, since " +
+         "whatever holds this would still hold it. Name it with a 'ref', or reach it through its address")
+    g
+end moved_out
+
+private points(t: Type) -> bool = t match
+    Ptr(_, _) -> true
+    Ref(_, _) -> true
+    _ -> false
+
+// The expression a place is reached from: the local, module storage or pointer at its head.
+private place_root(e: TExpr) -> Option[TExpr] = *e.kind match
+    TLoad(_, _) -> Some(e)
+    TGlobal(_, _, _) -> Some(e)
+    TField(receiver, _, _) -> place_root(receiver)
+    TConstView(arg) -> place_root(arg)
+    TDeref(_, _) -> Some(e)
+    TIndex(_, _, _) -> Some(e)
+    _ -> None
+
+// What a place moved out of is held by, as a reader would say it.
+private holder_text(w: &MoveWalk, e: TExpr) -> string
+    val root = place_root(e)
+
+    if root.is_none() then return "what this reaches"
+
+    *root.unwrap().kind match
+        TLoad(unique, _) ->
+            if holds_string(w.refs, unique) then s"what the 'ref' '${written_local(unique)}' names"
+            else s"what '${written_local(unique)}' points at"
+        TGlobal(symbol, _, _) -> s"module storage '${module_bare(symbol)}'"
+        TDeref(operand, _) -> s"what '${place_text(w, operand)}' points at"
+        TIndex(receiver, _, _) -> s"an element of '${place_text(w, receiver)}'"
+        _ -> "what this reaches"
+end holder_text
+
+// A place as it was written, near enough to name it.
+private place_text(w: &MoveWalk, e: TExpr) -> string = *e.kind match
+    TLoad(unique, _) -> written_local(unique)
+    TGlobal(symbol, _, _) -> module_bare(symbol)
+    TConstView(arg) -> place_text(w, arg)
+    TDeref(operand, _) -> s"*${place_text(w, operand)}"
+    TAddrOf(place, _) -> place_text(w, place)
+    TIndex(receiver, _, _) -> s"${place_text(w, receiver)}[…]"
+    TField(receiver, index, _) ->
+        val head = *receiver.kind match
+            TDeref(operand, _) -> place_text(w, operand)
+            _ -> place_text(w, receiver)
+
+        s"$head.${field_name(texpr_type(receiver), index)}"
+    _ -> "this value"
+
+private field_name(t: Type, index: int) -> string = t match
+    Struct(d) -> if index >= 0 && usize(index) < d.fields.len() then d.fields[usize(index)].0 else "?"
+    Ptr(inner, _) -> field_name(*inner, index)
+    Ref(inner, _) -> field_name(*inner, index)
+    Volatile(inner) -> field_name(*inner, index)
+    _ -> "?"
+
+// `e` is reached where it is: a local is read, not moved.
+private flow_place(w: &MoveWalk, e: TExpr, f: MoveFlow) -> MoveFlow = *e.kind match
+    TLoad(unique, _) ->
+        flow_read(w, e.span, unique, f)
+        f
+    _ -> flow_expr(w, e, f)
+
+// -- statements ------------------------------------------------------------------------------------
+
+// A run of statements and what it comes to, handed `into` something where that is not empty; every
+// `defer` runs after both, last first, and every `ref` bound in it ends with it.
+private flow_seq(w: &MoveWalk, stmts: Buf[TStmt], result: Option[TExpr], into: string,
+                 entry: MoveFlow) -> MoveFlow
+    var f = entry
+    var held: Buf[Buf[TStmt]] = buf()
+    val borrowed = w.borrows.len()
+
+    for s in stmts
+        s match
+            TDefer(body, _) -> held.push(body)
+            _ -> f = flow_stmt(w, s, f)
+
+    if result.is_some() then
+        f = if into == "" then flow_expr(w, result.unwrap(), f) else flow_move(w, result.unwrap(), f, into)
+
+    var i = held.len()
+
+    while i > 0
+        i -= 1
+        f = flow_seq(w, held[i], None, "", f)
+
+    w.borrows.truncate(borrowed)
+    f
+end flow_seq
+
+private flow_block(w: &MoveWalk, b: TBlock, f: MoveFlow, into: string) -> MoveFlow =
+    flow_seq(w, b.stmts, b.result, into, f)
+
+private flow_opt_block(w: &MoveWalk, b: Option[TBlock], f: MoveFlow, into: string) -> MoveFlow =
+    if b.is_some() then flow_block(w, b.unwrap(), f, into) else f
+
+private flow_stmt(w: &MoveWalk, s: TStmt, f: MoveFlow) -> MoveFlow = s match
+    TVarDecl(name, _, init, _) -> flow_without(flow_move(w, init, f, s"'${written_local(name)}'"), name)
+    TExprStmt(e) -> flow_expr(w, e, f)
+    TRefDecl(name, _, place) -> flow_ref(w, name, place, f)
+    TWriteStmt(write) -> flow_write(w, write, f)
+    TMultiAssign(writes) -> flow_writes(w, writes, f)
+    TReturn(value) ->
+        if value.is_some() then flow_move(w, value.unwrap(), f, "the result")
+
+        flow_dead()
+    TBecome(call) ->
+        flow_expr(w, call, f)
+        flow_dead()
+    TBreak(value, depth) ->
+        val g = if value.is_some() then flow_move(w, value.unwrap(), f, "the loop's result") else f
+        val frame = loop_at_depth(w, depth)
+
+        if frame.is_some() then frame.unwrap().breaks = flow_join(frame.unwrap().breaks, g)
+
+        flow_dead()
+    TContinue(depth) ->
+        val frame = loop_at_depth(w, depth)
+
+        if frame.is_some() then frame.unwrap().conts = flow_join(frame.unwrap().conts, f)
+
+        flow_dead()
+    _ -> f
+
+private loop_at_depth(w: &MoveWalk, depth: int) -> Option[&MoveLoop]
+    if depth < 0 || usize(depth) >= w.loops.len() then return None
+
+    Some(w.loops[w.loops.len() - 1 - usize(depth)])
+end loop_at_depth
+
+// A `ref` reads its place where it is. One naming part of a `@unique` local borrows from it until
+// its block ends, and a move of the local meanwhile is refused.
+private flow_ref(w: &MoveWalk, name: string, place: TExpr, f: MoveFlow) -> MoveFlow
+    val g = flow_place(w, place, f)
+
+    w.refs.push(name)
+
+    val root = borrow_root(place)
+
+    if root.is_some()
+        *root.unwrap().kind match
+            TLoad(unique, ty) ->
+                if is_unique(w.cx.an, ty) then w.borrows.push(UniqueBorrow(name, unique))
+            _ -> ()
+    end if
+
+    g
+end flow_ref
+
+// The local a place borrows from: through fields, elements and addresses, and through the receiver
+// of a member that answers a place.
+private borrow_root(e: TExpr) -> Option[TExpr] = *e.kind match
+    TLoad(_, _) -> Some(e)
+    TField(receiver, _, _) -> borrow_root(receiver)
+    TIndex(receiver, _, _) -> borrow_root(receiver)
+    TConstView(arg) -> borrow_root(arg)
+    TAddrOf(place, _) -> borrow_root(place)
+    TTempAddr(value, _) -> borrow_root(value)
+    TDeref(operand, _) -> borrow_root(operand)
+    TCall(_, args, _, _) -> if args.is_empty() then None else borrow_root(args[0])
+    _ -> None
+
+private loaded(t: TExpr) -> string = *t.kind match
+    TLoad(unique, _) -> unique
+    _ -> ""
+
+// A plain assignment to a local fills it again; anything else reaches the place it writes to. The
+// value is handed over either way.
+private flow_write(w: &MoveWalk, write: TWrite, f: MoveFlow) -> MoveFlow
+    val unique = if write.op == "=" then loaded(write.place) else ""
+
+    if unique != ""
+        val g = flow_move(w, write.value, f, s"'${written_local(unique)}'")
+
+        return flow_without(g, unique)
+    end if
+
+    flow_move(w, write.value, flow_place(w, write.place, f), s"'${place_text(w, write.place)}'")
+end flow_write
+
+private flow_writes(w: &MoveWalk, writes: Buf[TWrite], f: MoveFlow) -> MoveFlow
+    var g = f
+
+    for item in writes
+        if item.op != "=" || loaded(item.place) == "" then g = flow_place(w, item.place, g)
+
+        g = flow_move(w, item.value, g, s"'${place_text(w, item.place)}'")
+
+    for item in writes
+        if item.op == "=" && loaded(item.place) != "" then g = flow_without(g, loaded(item.place))
+
+    g
+end flow_writes
+
+// -- expressions -----------------------------------------------------------------------------------
+
+private flow_expr(w: &MoveWalk, e: TExpr, f: MoveFlow) -> MoveFlow
+    val out = *e.kind match
+        TLoad(unique, _) ->
+            flow_read(w, e.span, unique, f)
+            f
+
+        // Reached where it is: the receiver of a field, an address, an element, a length, a view.
+        TField(receiver, _, _) -> flow_place(w, receiver, f)
+        TAddrOf(place, _) -> flow_place(w, place, f)
+        TTempAddr(value, _) -> flow_place(w, value, f)
+        TIndex(receiver, index, _) -> flow_expr(w, index, flow_place(w, receiver, f))
+        TLen(receiver, _) -> flow_place(w, receiver, f)
+        TBytes(receiver) -> flow_place(w, receiver, f)
+        TTypeId(receiver, _) -> flow_place(w, receiver, f)
+        TSlice(base, lo, hi, _, _) ->
+            var g = flow_place(w, base, f)
+
+            if lo.is_some() then g = flow_expr(w, lo.unwrap(), g)
+            if hi.is_some() then g = flow_expr(w, hi.unwrap(), g)
+
+            g
+        TConstView(arg) -> flow_expr(w, arg, f)
+        TStructInvCheck(value, _, _) -> flow_expr(w, value, f)
+        TRecheck(after, _, _, _) -> flow_expr(w, after, f)
+        TDeref(operand, _) -> flow_expr(w, operand, f)
+
+        // Read and compared or shown, never kept.
+        TBinary(_, left, right, _) -> flow_place(w, right, flow_place(w, left, f))
+        TCompare(operands, _) -> flow_places(w, operands, f)
+        TUnary(_, operand, _) -> flow_place(w, operand, f)
+        TCast(operand, _) -> flow_place(w, operand, f)
+        TEnumAttr(_, _, arg, _) -> flow_place(w, arg, f)
+        TStr(arg) -> flow_place(w, arg, f)
+        TRender(value, _, spec, _) -> flow_expr(w, spec, flow_place(w, value, f))
+        TFormat(arg, _, counts) -> flow_all(w, counts, flow_place(w, arg, f), "")
+
+        // Written to where it is.
+        TStore(place, value, _, _) ->
+            if loaded(place) != "" then
+                flow_without(flow_move(w, value, f, s"'${written_local(loaded(place))}'"), loaded(place))
+            else flow_move(w, value, flow_place(w, place, f), s"'${place_text(w, place)}'")
+        TUpdate(place, _, value, _, _, _, _) -> flow_place(w, place, flow_expr(w, value, f))
+        TIncDec(place, _, _, _, _) -> flow_place(w, place, f)
+
+        TLogical(_, left, right) ->
+            val l = flow_expr(w, left, f)
+
+            flow_join(l, flow_expr(w, right, l))
+        TIf(cond, then_block, else_block, _) -> flow_if(w, cond, then_block, else_block, f, "")
+        TMatch(scrutinee, arms, _) -> flow_match(w, scrutinee, arms, f, "")
+        TBlockExpr(block) -> flow_block(w, block, f, "")
+        TWhile(_, _, _, _) -> flow_loop(w, e, f)
+        TDoWhile(_, _, _, _) -> flow_loop(w, e, f)
+        TLoop(_, _) -> flow_loop(w, e, f)
+        TFor(_, _, _, _, _, _, _, _) -> flow_loop(w, e, f)
+        TCFor(_, _, _, _, _, _) -> flow_loop(w, e, f)
+        TForEach(_, elem_ty, _, _, _, _) ->
+            if is_unique(w.cx.an, elem_ty) then
+                not_yet(w, e.span, elem_ty, "this loop copies each element into its variable",
+                        "Loop over the indices and name each element with a 'ref'")
+
+            flow_loop(w, e, f)
+        TIterate(_, _, _, _, _, _, _, _) -> flow_loop(w, e, f)
+        TCheckedLoop(_, _, loop_expr) -> flow_expr(w, loop_expr, f)
+        TQuantifier(_, _, _, _, _, _, _) -> f
+
+        TArrayFill(value, _) ->
+            if is_unique(w.cx.an, texpr_type(value)) then
+                tell(w, e.span, s"this copies one '${type_show(texpr_type(value))}' into every element, " +
+                     s"and '${type_show(texpr_type(value))}' is '@unique'${instance_note(w)} — a value " +
+                     "with one owner cannot be copied. Write each element out")
+
+            flow_expr(w, value, f)
+        TCall(name, args, _, _) -> flow_call(w, e.span, name, args, f)
+        TStructNew(decl, args) ->
+            flow_all(w, args, f, if is_tuple(decl) then "the tuple" else s"a '${type_show(Struct(decl))}'")
+        TEnumNew(_, variant, args) -> flow_all(w, args, f, s"'${variant.name}'")
+        TArrayLit(elems, _) -> flow_all(w, elems, f, "an array")
+        TBox(value, _) -> flow_move(w, value, f, "a box")
+        TCallPtr(callee, args, _, _) -> flow_all(w, args, flow_expr(w, callee, f), "a call through a pointer")
+        TVCall(receiver, _, args, _, _) ->
+            flow_all(w, args, flow_place(w, receiver, f), "a call through a trait object")
+        _ -> flow_all(w, texpr_children(e), f, "this expression")
+
+    if texpr_type(e) == Never then return flow_dead()
+
+    out
+end flow_expr
+
+// Every operand, in order, each handed `into` the node that takes it.
+private flow_all(w: &MoveWalk, es: Buf[TExpr], f: MoveFlow, into: string) -> MoveFlow
+    var g = f
+
+    for item in es
+        g = if into == "" then flow_expr(w, item, g) else flow_move(w, item, g, into)
+
+    g
+end flow_all
+
+private flow_places(w: &MoveWalk, es: Buf[TExpr], f: MoveFlow) -> MoveFlow
+    var g = f
+
+    for item in es
+        g = flow_place(w, item, g)
+
+    g
+end flow_places
+
+// A call hands each argument over, except a receiver: a `(self)` or `*self` member reads it where it
+// is, and a `@consumes` member takes it.
+private flow_call(w: &MoveWalk, at: Span, name: string, args: Buf[TExpr], f: MoveFlow) -> MoveFlow
+    val d = callee_decl(w.cx.an, name)
+    val callee = qualified_name(w.cx.an.tables.members.func_origin.get(name).unwrap_or(name))
+    var g = f
+
+    for i in 0..<args.len()
+        if i == 0 && takes_self(d)
+            g = flow_receiver(w, args[0], g, d.unwrap(), callee)
+            continue
+        end if
+
+        g = flow_move(w, args[i], g, s"'$callee'")
+
+    g
+end flow_call
+
+private flow_receiver(w: &MoveWalk, arg: TExpr, f: MoveFlow, d: FuncDecl, callee: string) -> MoveFlow
+    val value = receiver_value(arg)
+
+    if !d.marks.consumes || !is_unique(w.cx.an, texpr_type(value)) then return flow_place(w, arg, f)
+
+    // The receiver moves into the call, which owns it from then on.
+    val member = last_part(callee)
+
+    *value.kind match
+        TLoad(unique, ty) -> move_local(w, value.span, unique, ty, f, s"'$callee'", member)
+        _ -> flow_move(w, value, f, s"'$callee'")
+end flow_receiver
+
+// What a receiver stands for, under the address or the read-only view the call took of it.
+private receiver_value(e: TExpr) -> TExpr = *e.kind match
+    TConstView(arg) -> receiver_value(arg)
+    TAddrOf(place, _) -> receiver_value(place)
+    TTempAddr(value, _) -> receiver_value(value)
+    _ -> e
+
+private flow_term(w: &MoveWalk, term: TCondTerm, f: MoveFlow) -> MoveFlow = term match
+    TCondTest(c) -> flow_expr(w, c, f)
+    TCondIs(subject, patterns, _) ->
+        bound_parts(w, subject.span, patterns)
+        flow_unbind_all(flow_place(w, subject, f), patterns)
+
+// A pattern that binds a `@unique` part by value takes it out of what was matched.
+private bound_parts(w: &MoveWalk, at: Span, patterns: Buf[TPattern])
+    for p in patterns
+        val ty = unique_binding(w.cx.an, p)
+
+        if ty.is_some() then
+            not_yet(w, at, ty.unwrap(), "a pattern here binds a part by value",
+                    "Match without binding it, and reach it through a 'ref' or its address")
+end bound_parts
+
+private unique_binding(a: &Analysis, p: TPattern) -> Option[Type] = p match
+    TBindPattern(_, ty) -> if is_unique(a, ty) then Some(ty) else None
+    TAtPattern(_, inner) ->
+        val ty = tpattern_type(*inner)
+
+        if is_unique(a, ty) then Some(ty) else unique_binding(a, *inner)
+    TVariantPattern(_, _, args) -> unique_binding_in(a, args)
+    TStructPattern(_, args) -> unique_binding_in(a, args)
+    _ -> None
+
+private unique_binding_in(a: &Analysis, ps: Buf[TPattern]) -> Option[Type]
+    for p in ps
+        val found = unique_binding(a, p)
+
+        if found.is_some() then return found
+
+    None
+end unique_binding_in
+
+private flow_if(w: &MoveWalk, cond: Buf[TCondTerm], then_block: TBlock, else_block: Option[TBlock],
+                f: MoveFlow, into: string) -> MoveFlow
+    var g = f
+    var failed = flow_dead()
+
+    for term in cond
+        g = flow_term(w, term, g)
+        failed = flow_join(failed, g)
+
+    flow_join(flow_block(w, then_block, g, into), flow_opt_block(w, else_block, failed, into))
+end flow_if
+
+private flow_match(w: &MoveWalk, scrutinee: TExpr, arms: Buf[TArm], f: MoveFlow, into: string) -> MoveFlow
+    var enter = flow_place(w, scrutinee, f)
+    var out = flow_dead()
+
+    for arm in arms
+        bound_parts(w, scrutinee.span, arm.patterns)
+
+        var a = flow_unbind_all(enter, arm.patterns)
+
+        if arm.guard.is_some()
+            a = flow_expr(w, arm.guard.unwrap(), a)
+            enter = flow_join(enter, a)
+        end if
+
+        out = flow_join(out, flow_block(w, arm.body, a, into))
+
+    out
+end flow_match
+
+// -- loops -----------------------------------------------------------------------------------------
+
+// Walked turn by turn until the state reaching the head stops growing, as `consumes.sysl` walks one.
+private flow_loop(w: &MoveWalk, e: TExpr, f: MoveFlow) -> MoveFlow
+    val entry = loop_entry(w, e, f)
+    var head = entry
+    var exits = flow_dead()
+    var turns = 0
+
+    loop
+        val frame: &MoveLoop = MoveLoop(flow_dead(), flow_dead())
+
+        w.loops.push(frame)
+
+        val turn = loop_turn(w, e, head, frame)
+
+        w.loops.pop()
+        exits = flow_join(frame.breaks, flow_opt_block(w, loop_else(e), turn.1, ""))
+
+        val next = flow_join(entry, turn.0)
+
+        turns += 1
+
+        if flow_same(next, head) || turns > 32 then break
+
+        head = next
+
+    exits
+end flow_loop
+
+private loop_entry(w: &MoveWalk, e: TExpr, f: MoveFlow) -> MoveFlow = *e.kind match
+    TFor(_, _, lo, hi, _, _, _, _) -> flow_expr(w, hi, flow_expr(w, lo, f))
+    TCFor(init, _, _, _, _, _) -> flow_seq(w, init, None, "", f)
+    TForEach(_, _, seq, _, _, _) -> flow_place(w, seq, f)
+    TIterate(cursor, _, init, _, bind, _, _, _) ->
+        var binds: Buf[TPattern] = buf()
+
+        binds.push(bind)
+        bound_parts(w, init.span, binds)
+        flow_without(flow_move(w, init, f, "the loop"), cursor)
+    _ -> f
+
+private loop_else(e: TExpr) -> Option[TBlock] = *e.kind match
+    TWhile(_, _, else_block, _) -> else_block
+    TDoWhile(_, _, else_block, _) -> else_block
+    TFor(_, _, _, _, _, _, else_block, _) -> else_block
+    TCFor(_, _, _, _, else_block, _) -> else_block
+    TForEach(_, _, _, _, else_block, _) -> else_block
+    TIterate(_, _, _, _, _, _, else_block, _) -> else_block
+    _ -> None
+
+private loop_turn(w: &MoveWalk, e: TExpr, head: MoveFlow, frame: &MoveLoop) -> (MoveFlow, MoveFlow) =
+    *e.kind match
+        TWhile(cond, body, _, _) ->
+            var g = head
+            var failed = flow_dead()
+
+            for term in cond
+                g = flow_term(w, term, g)
+                failed = flow_join(failed, g)
+
+            val end_body = flow_seq(w, body, None, "", g)
+
+            (flow_join(end_body, frame.conts), failed)
+        TDoWhile(body, cond, _, _) ->
+            val end_body = flow_seq(w, body, None, "", head)
+            val c = flow_expr(w, cond, flow_join(end_body, frame.conts))
+
+            (c, c)
+        TLoop(body, _) ->
+            val end_body = flow_seq(w, body, None, "", head)
+
+            (flow_join(end_body, frame.conts), flow_dead())
+        TFor(name, _, _, _, _, body, _, _) ->
+            val end_body = flow_seq(w, body, None, "", flow_without(head, name))
+
+            (flow_join(end_body, frame.conts), head)
+        TCFor(_, cond, step, body, _, _) ->
+            val c = if cond.is_some() then flow_expr(w, cond.unwrap(), head) else head
+            val end_body = flow_seq(w, body, None, "", c)
+            val stepped = flow_seq(w, step, None, "", flow_join(end_body, frame.conts))
+
+            (stepped, if cond.is_some() then c else flow_dead())
+        TForEach(name, _, _, body, _, _) ->
+            val end_body = flow_seq(w, body, None, "", flow_without(head, name))
+
+            (flow_join(end_body, frame.conts), head)
+        TIterate(cursor, _, _, next, bind, body, _, _) ->
+            val n = flow_expr(w, next, flow_without(head, cursor))
+            val end_body = flow_seq(w, body, None, "", flow_unbind(n, bind))
+
+            (flow_join(end_body, frame.conts), n)
+        _ -> (head, head)

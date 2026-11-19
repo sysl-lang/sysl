@@ -389,6 +389,11 @@ begin_coroutine(e: *Emit, f: TFunc)
         e.aligned_frame.push((s"the frame of the task '${f.name}' asks for the $boundary-byte boundary " +
             "a value it holds is aligned on", e.self_name, boundary))
 
+    // A task's frame is a box like any other, and a null answer traps before it is stored.
+    val got = fresh_reg(e)
+
+    emit(e, InIntCmp(got, INe, LPtr, mem, VNull))
+    trap_unless(e, got, "alloc")
     emit(e, InStore(LPtr, mem, mem_slot, AccPlain, None))
     emit_term(e, InBr("task.begin"))
     emit_label(e, "task.begin")
@@ -914,6 +919,27 @@ private task_waker_text(e: *Emit) -> string
     "}\n"
 end task_waker_text
 
+// A hand-written coroutine's frame taken from the task hook on the `a`-byte boundary, from the
+// `alloc` block to the `begin` one: a null answer traps before it is stored, as a compiled task's
+// does, and the block `begin` is reached from is `allocd`. `refused` is the stop, which the rest of the
+// text may branch to as well.
+private frame_alloc_text(e: *Emit, w: string, a: usize) -> string
+    e.traps = true
+
+    "alloc:\n" +
+    s"  %size = call $w @${coro_size_name(e)}()\n" +
+    s"  %mem = call ptr @${task_alloc_symbol()}($w %size, $w $a)\n" +
+    "  %given = icmp ne ptr %mem, null\n" +
+    "  br i1 %given, label %allocd, label %refused\n" +
+    "refused:\n" +
+    s"  call void @${trap_symbol(e)}()\n" +
+    "  unreachable\n" +
+    "allocd:\n" +
+    "  br label %begin\n" +
+    "begin:\n" +
+    "  %frame = phi ptr [ null, %entry ], [ %mem, %allocd ]\n"
+end frame_alloc_text
+
 // `park(register)`'s task. Started, it makes a waker over the step's own, hands it to `register` --
 // which keeps a share of it wherever the event it waits for will find it, or calls it at once -- and
 // suspends; every resumption that finds the waker still armed suspends again, so a step nobody asked
@@ -932,12 +958,7 @@ private task_park_text(e: *Emit) -> string
     s"  %id = call token @llvm.coro.id(i32 $a, ptr %pr, ptr null, ptr null)\n" +
     "  %need = call i1 @llvm.coro.alloc(token %id)\n" +
     "  br i1 %need, label %alloc, label %begin\n" +
-    "alloc:\n" +
-    s"  %size = call $w @${coro_size_name(e)}()\n" +
-    s"  %mem = call ptr @${task_alloc_symbol()}($w %size, $w $a)\n" +
-    "  br label %begin\n" +
-    "begin:\n" +
-    "  %frame = phi ptr [ null, %entry ], [ %mem, %alloc ]\n" +
+    frame_alloc_text(e, w, a) +
     "  %hdl = call ptr @llvm.coro.begin(token %id, ptr %frame)\n" +
     s"  store $w 1, ptr %pr\n" +
     s"  %hook = getelementptr ${header_text(e)}, ptr %pr, i32 0, i32 1\n" +
@@ -959,6 +980,9 @@ private task_park_text(e: *Emit) -> string
     s"  %bsz = getelementptr $shape, ptr null, i32 1\n" +
     s"  %bn = ptrtoint ptr %bsz to $w\n" +
     s"  %b = call ptr @${task_alloc_symbol()}($w %bn, $w $a)\n" +
+    "  %bgiven = icmp ne ptr %b, null\n" +
+    "  br i1 %bgiven, label %bgot, label %refused\n" +
+    "bgot:\n" +
     s"  store $w 1, ptr %b\n" +
     s"  %bh = getelementptr $shape, ptr %b, i32 0, i32 1\n" +
     "  store ptr @sysl.task.waker.hook, ptr %bh\n" +
@@ -1038,12 +1062,7 @@ private task_yield_text(e: *Emit) -> string
     s"  %id = call token @llvm.coro.id(i32 $a, ptr %pr, ptr null, ptr null)\n" +
     "  %need = call i1 @llvm.coro.alloc(token %id)\n" +
     "  br i1 %need, label %alloc, label %begin\n" +
-    "alloc:\n" +
-    s"  %size = call $w @${coro_size_name(e)}()\n" +
-    s"  %mem = call ptr @${task_alloc_symbol()}($w %size, $w $a)\n" +
-    "  br label %begin\n" +
-    "begin:\n" +
-    "  %frame = phi ptr [ null, %entry ], [ %mem, %alloc ]\n" +
+    frame_alloc_text(e, w, a) +
     "  %hdl = call ptr @llvm.coro.begin(token %id, ptr %frame)\n" +
     s"  store $w 1, ptr %pr\n" +
     s"  %hook = getelementptr ${header_text(e)}, ptr %pr, i32 0, i32 1\n" +

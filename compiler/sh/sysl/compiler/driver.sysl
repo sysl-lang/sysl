@@ -448,6 +448,10 @@ packaged_compilation_of(path: string, t: Target, keep_tests: bool = true,
         unit.pkg = mine_pkg
         units.push(unit)
 
+    // What every function's frame is held to: the build's limit and each package's own
+    // (`frame_limit.sysl`).
+    note_frame_limits(units, manifest.frame_limit, own_manifest)
+
     Ok(Compilation(units, own, t))
 end packaged_compilation_of
 
@@ -659,6 +663,10 @@ end typed_compilation
 //
 // **`watched` is set by `run` alone**: the entry of a program it is about to start ends the program
 // once the runner is gone (`gen_runner_watch`).
+//
+// **`compact`, the default, prints each body as it is built** (`codegen.sysl`), since the text is all
+// that is wanted of the module; off, the module is built whole and printed at the end, which is the
+// same text and what the tests compare it with.
 // Whether a build at `level` is optimized, and so inlines: every level clang spells but `0`. An
 // `available_externally` copy at `-O0` is lowered and then dropped unread.
 imports_bodies(level: string) -> bool = level != "0"
@@ -668,7 +676,7 @@ emit_llvm_text(path: string, named_target: Option[string],
                also_auto_imported: Buf[string] = buf(),
                against: Option[Buf[string]] = None,
                linking: bool = false, keep_tests: bool = false,
-               watched: bool = false) -> Result[Emitted, Failure]
+               watched: bool = false, compact: bool = true) -> Result[Emitted, Failure]
     val t = target_for(path, named_target)?
 
     phase_start()
@@ -767,7 +775,7 @@ emit_llvm_text(path: string, named_target: Option[string],
     val lowered = codegen_with_gaps(kept with { precompiled = joined_names(linked.precompiled,
                                                                            roots.precompiled) },
                                     t, promotions, linking && imports_bodies(level), None, watched,
-                                    if linking then program.own else buf())
+                                    if linking then program.own else buf(), compact)
 
     phase_done("codegen")
 
@@ -2243,6 +2251,9 @@ run_cache_key_for(command: string, path: string, named_target: Option[string], l
     // for it has no entry to replay.
     if explaining_drops() then return None
 
+    // Nor was the report of every frame, which is read off the compile.
+    if stack_usage_flag().is_some() then return None
+
     target_for(path, named_target) match
         Ok(t) -> run_cache_key_of(command, path, t, level, cc)
         Err(_) -> None
@@ -2317,20 +2328,54 @@ end TestBuild
 // left out before the analysis (`narrowed_test_units`), and their tests listed to be counted only.
 test_build_of(path: string, named_target: Option[string],
               level: string = DefaultOptimization,
-              within: Buf[string] = buf()) -> Result[TestBuild, Failure]
+              within: Buf[string] = buf(), compact: bool = true) -> Result[TestBuild, Failure]
     val t = test_target_of(path, named_target)?
 
     headers_refused(path)?
 
+    // Timed as a build is (`SYSL_TIMINGS=1`): the suite's build is the heaviest compilation there is.
+    phase_start()
+
     val program = packaged_compilation_of(path, t)?
+
+    phase_done("parse program")
+
     val narrowed = narrowed_test_units(program.units, within)
-    val built = test_build_from(program with { units = narrowed.units }, false, level, path, true)?
+    val built = test_build_from(program with { units = narrowed.units }, false, level, path, true, compact)?
 
     for dropped in narrowed.dropped_tests
         built.tests.push(dropped)
 
     Ok(built with { dropped_files = narrowed.dropped_files })
 end test_build_of
+
+// The suite a build child compiled, as the link child takes it up (`test_child.sysl`): the module's text
+// and the lists the link reads, from `stash`.
+//
+// **The project is read again first, and only read**: what the link asks of the packages -- their C,
+// their libraries, their config headers, the search paths -- is settled while the graph is resolved,
+// so the link child resolves it as the build child did and throws the parse away. It costs the parse,
+// a second or so for the compiler's own tree, and none of the analysis. What the build's C read is the
+// build child's list exactly, since the run cache keys the binary on it.
+test_build_restored(path: string, named_target: Option[string],
+                    stash: string) -> Result[TestBuild, Failure]
+    val t = test_target_of(path, named_target)?
+
+    headers_refused(path)?
+    _ = packaged_compilation_of(path, t)?
+
+    val s = stash_read(stash) match
+        Some(read) -> read
+        None -> return Err(said(Refusal(s"the compiled tests at $stash could not be read")))
+
+    clear_files_read()
+    note_files_read(s.files_read)
+
+    // The link is timed as the build child's phases were (`SYSL_TIMINGS=1`).
+    phase_start()
+
+    Ok(TestBuild(Emitted(s.text, buf(), buf(), s.links, s.archives), s.tests, t, false, s.dropped_files))
+end test_build_restored
 
 // The same for a tree that **is** the standard module (`sysl test <root> --std`), which is how the
 // library's own tests are run: there is no library beside it and no artifact to link, because the
@@ -2381,7 +2426,8 @@ end test_target_of
 // would refuse (`check_bare_metal_storage`) is worth nothing in a command that never shows it. A
 // `tests/refused/` program is compiled to be refused, and says nothing.
 private test_build_from(program: Compilation, standalone: bool, level: string,
-                        project: string = "", warns: bool = false) -> Result[TestBuild, Refusal]
+                        project: string = "", warns: bool = false,
+                        compact: bool = true) -> Result[TestBuild, Refusal]
     val t = program.target
 
     // A test binary links the roots' kept halves as a program does. A root whose own tests this build
@@ -2395,14 +2441,18 @@ private test_build_from(program: Compilation, standalone: bool, level: string,
     val done = if standalone then analyze_produced(program.units, t, file_names(program.units))
     else analyze_bodies(program.units, t)
 
+    phase_done("bodies")
+
     val whole = program_of(done, done.main_module)
     val promotions = post_analysis_checks_of_tests(done.an, whole, program.own)
 
+    phase_done("checks")
     explain_drops(program, done.an, whole)
 
     val kept = tests_only(whole, program.own)
 
     check_library_hooks(done.an, kept)
+    phase_done("prune")
 
     var precompiled: Buf[string] = buf()
 
@@ -2411,9 +2461,13 @@ private test_build_from(program: Compilation, standalone: bool, level: string,
         Ok(Some(found)) -> precompiled = found.precompiled
         Ok(None) -> ()
 
+    phase_done("std")
+
     val lowered = codegen_with_gaps(kept with { precompiled = joined_names(precompiled,
                                                                            roots.precompiled) },
-                                    t, promotions, imports_bodies(level), None, false, program.own)
+                                    t, promotions, imports_bodies(level), None, false, program.own, compact)
+
+    phase_done("codegen")
 
     check_aligned_heap(done.an, kept)
 
@@ -2430,6 +2484,8 @@ private test_build_from(program: Compilation, standalone: bool, level: string,
 
     val emitted = Emitted(ir_print_module(lowered.0), report, lowered.1,
                           link_required(program.units), roots.archives)
+
+    phase_done("print")
 
     Ok(TestBuild(emitted, kept.tests, t, standalone, 0))
 end test_build_from
@@ -2469,13 +2525,17 @@ build_test_binary_cached(path: string, build: TestBuild, cc: Option[string], lev
     slot match
         Some(reserved) ->
             val exe = link_into_cache(path, build.emitted.text, build.target, cc, level, reserved,
-                                      build.standalone, build.emitted.links, build.emitted.archives)?
+                                      build.standalone, build.emitted.links, build.emitted.archives)
 
-            Ok((exe, true))
+            phase_done("link")
+
+            Ok((exe?, true))
         None ->
-            val made = build_test_binary(path, build, cc, level)?
+            val made = build_test_binary(path, build, cc, level)
 
-            Ok((made, false))
+            phase_done("link")
+
+            Ok((made?, false))
 end build_test_binary_cached
 
 // The directory a test binary was built in, taken away. The binary is the only thing in it, so the
