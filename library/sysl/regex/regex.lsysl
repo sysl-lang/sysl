@@ -4,7 +4,7 @@ sysl.regex — what a program uses
     module sysl.regex
 
     import sysl.buf.{Buf, buf}
-    import sysl.text.is_char_boundary
+    import sysl.text.{StrBuilder, is_char_boundary, str_builder_with_capacity}
 
     /** Matching text against a pattern: compile one, then find, replace or split with it.
      *
@@ -132,19 +132,22 @@ found: `\1` through `\9` stand for those groups, `\0` for the whole match, and `
 A group that took no part contributes nothing rather than the two characters that named it.
 
         replace_all(self, s: string, with: string) -> string
-            var out = ""
-            var at: usize = 0
             var ms = self.find_all(s)
+
+            if ms.is_empty() then return s
+
+            var out = str_builder_with_capacity(s.len)
+            var at: usize = 0
 
             for i in 0..<ms.len()
                 var m = ms[i]
 
-                if m.start() > at then out += s[at..<m.start()]
-                out += expand_replacement(m, with)
+                out.push(s[at..<m.start()])
+                expand_replacement(&out, m, with)
                 at = m.end()
 
-            if at < s.len then out += s[at..<s.len]
-            out
+            out.push(s[at..<s.len])
+            out.finish()
         end replace_all
 
 The pieces between the matches. A pattern that matches the empty string splits between every
@@ -189,31 +192,28 @@ that in the top two bits of every byte.
         k
     end next_boundary
 
-    private expand_replacement(m: Match, with: string) -> string
-        var out = ""
+    private expand_replacement(out: *StrBuilder, m: Match, with: string)
         var b = with.bytes
         var i: usize = 0
+        var run: usize = 0
 
         while i < b.len
-            var c = b[i]
+            if b[i] == u8('\\') && i + 1 < b.len then
+                out.push(with[run..<i])
 
-            if c == u8('\\') && i + 1 < b.len then
                 var d = b[i + 1]
 
-                if d == u8('\\') then
-                    out += "\\"
-                elif d >= u8('0') && d <= u8('9') then
+                if d >= u8('0') && d <= u8('9') then
                     m.group(usize(d - u8('0'))) match
-                        Some(g) -> out += g
-                        None -> out += ""
+                        Some(g) -> out.push(g)
+                        None -> ()
                 else
-                    out += with[i + 1..<i + 2]
+                    out.push(with[i + 1..<next_boundary(b, i + 1)])
 
-                i += 2
+                i = next_boundary(b, i + 1)
+                run = i
             else
-                var stop = next_boundary(b, i)
+                i += 1
 
-                out += with[i..<stop]
-                i = stop
-        out
+        out.push(with[run..<b.len])
     end expand_replacement

@@ -13,6 +13,7 @@ These pages are generated from the library's own doc comments: every declaration
 | Module | Summary |
 |---|---|
 | [`sysl`](sysl/) | The core: what every program has without importing anything. |
+| [`sysl.alloc`](sysl-alloc/) | Allocation that may fail, answered rather than trapped. |
 | [`sysl.args`](sysl-args/) | How a program's arguments become a `[]string`, written here because every line of it is ordinary sysl. |
 | [`sysl.buf`](sysl-buf/) | The growable sequence and the sink built on it. |
 | [`sysl.c`](sysl-c/) | The C variadic forms: `va_start`, `va_arg`, `va_copy` and `va_end`. |

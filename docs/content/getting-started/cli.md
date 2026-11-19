@@ -155,14 +155,23 @@ as each phase ends:
 
 ```
 sysl: phase parse std 130ms
+sysl:   memory 240MB resident, 117MB in use
 sysl: phase parse program 0ms
+sysl:   memory 251MB resident, 124MB in use
 sysl: phase declarations 52ms
+sysl:   memory 262MB resident, 133MB in use
 sysl: phase bodies 23ms
+sysl:   memory 270MB resident, 139MB in use
 sysl: phase checks 4ms
+sysl:   memory 270MB resident, 139MB in use
 sysl: phase prune 0ms
+sysl:   memory 270MB resident, 139MB in use
 sysl: phase std 33ms
+sysl:   memory 271MB resident, 139MB in use
 sysl: phase codegen 2ms
+sysl:   memory 272MB resident, 140MB in use
 sysl: phase link 90ms
+sysl:   memory 272MB resident, 120MB in use
 ```
 
 The phases sum to the whole compilation, with nothing counted twice. The `checks` phase is followed
@@ -170,6 +179,12 @@ by one indented line per whole-program check (`sysl:   check keeps 12ms`), which
 phase's time, not further phases. `std` is the time to find the
 standard module's compiled artifact, or to build it on first use. Use these timings to find out
 why a build is slow.
+
+**Each phase is followed by what the compiler holds as it ends**: its resident memory, and — on
+macOS — how much of that the allocator holds for live data. The gap between the two is memory that
+was freed and kept by the allocator rather than given back; only the end of a process returns it,
+which is why `sysl test` compiles a suite in one child process and links it in another (below). A
+large link also says what it holds as its clangs start (`sysl:   memory as the clangs start …`).
 
 **When a phase is slow, a sampling profiler shows which functions are responsible.** On a hosted
 target sysl keeps the frame pointer wherever the platform's C compiler does (Apple platforms, and
@@ -519,6 +534,18 @@ A name that reaches no file holding a test is refused, naming it, even when the 
 is not repeatable**: given twice, the last one counts. Both flags work with `--std` and with
 `SYSL_DOCS`, which they select among the tests the binary holds.
 
+**`--file` also decides what is built.** The `@tests` files it names are compiled with every file
+that is not `@tests`, and of the other `@tests` files only those the named ones need: a file that
+declares a name they spell (and, in turn, what that file spells), and one that acts without being
+named — a hook, an `@export`, an `@section`, a calling convention, module `asm`, or a header clause
+such as `@link`. The rest are left out before anything is analyzed, so a run naming one file of a
+large tree costs that file and what it reaches, not the whole suite. The report is the same: a test
+in a file left out is still counted in `running 3 tests of N`. A mistake in a `@tests` file the run
+neither names nor needs is not reported by that run; a run of the whole suite reports it. The
+narrowed binary is kept in the run cache under the names given, and a binary of the whole suite
+answers any `--file` as well. `SYSL_TEST_EVERY_FILE=1` builds every file, as a run without `--file`
+does. `--std` builds every file.
+
 **`--keep-binary <dir>` leaves a copy of the test binary in `<dir>`** as `<project>-tests` and prints
 `kept: <path>`. A binary replayed from the run cache is copied too; the cache entry stays. **A
 `-fsanitize=` in `SYSL_EXTRA_CFLAGS` is confirmed before any test runs**: the report starts with
@@ -557,8 +584,9 @@ override it.
 **The same count bounds the build.** A large tree's link compiles its code in several pieces at once,
 and `--jobs <n>` keeps at most `n` of those compiles running too. The suite is compiled by a second
 `sysl` process, which exits before the first test starts. A long run therefore holds only what its
-tests need, not what the compile needed. Its notes and errors appear exactly as they would from one
-process.
+tests need, not what the compile needed. **A suite that has to be linked is linked by a third**, which
+takes up the compiled text once the second has exited, so the link's compiles never run beside the
+memory the compile left behind. Its notes and errors appear exactly as they would from one process.
 
 **`--features <list>` and `--option <name=value>`** choose what the package's own suite is built
 with. The `test` block's `features` and `options` are the defaults, `--features` replaces the block's
@@ -1349,6 +1377,8 @@ grammars.
 | `--general-regs-only` | keep the code out of the floating-point and SIMD registers — the [`codegen` block](/reference/packages/#what-the-generated-code-may-use-of-the-machine) for one build |
 | `--strict-align` | make every access aligned — the [`codegen` block](/reference/packages/#what-the-generated-code-may-use-of-the-machine) for one build |
 | `--cpu native` or `--cpu <name>` | generate code for a processor: `native` is the machine running the build, and any other value is an LLVM processor name such as `apple-m4` or `skylake`. Every function carries the `"target-cpu"` attribute, and so does every clang the build drives; `clang --target=<triple> -print-supported-cpus` lists the names. `native` is refused beside a `--target` that is not this machine, and a name LLVM does not know is refused; the processor is part of every cache key |
+| `--frame-limit <bytes>` | fail the build where a function's stack frame is larger — the [`frame_limit` key](/reference/packages/#a-function-s-stack-frame) for one build; `@frame_limit(n)` above a function and a dependency's own key are nearer |
+| `--stack-usage <file>` | write [every compiled function's stack frame](/reference/packages/#the-frame-of-every-function) to this file, largest first: bytes, `static` or `dynamic`, the function, where it was written |
 | `--error-limit <n>` | how many [errors a failed compilation shows](#how-many-errors-are-shown); defaults to 20, and `0` shows every one |
 | `-p <member>`, `--package <member>` | in a [workspace](/reference/packages/#workspaces), the member to build, test or run |
 | `-v`, `--verbose` | report what the build decided: the files read, the standard module and how it was reached, the search paths, the allocator, and the clang and linker command lines |
