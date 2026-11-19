@@ -734,6 +734,50 @@ buffer_view(e: *Emit, slice_ty: Type, box: Val, data: Val, n: Val) -> Val
     own_temp(e, view_parts(e, slice_ty, box, data, n), slice_ty)
 end buffer_view
 
+// **A buffer counted while running that may hold no elements is no allocation when it holds none**
+// (`[v; n]`, `slot_storage(n)`): the view of nothing is the all-zero one an empty literal is -- no
+// owner, so nothing to retain, release, grow from in place or free, and no element address anyone
+// reads. A container made empty and filled later (`vector()` over `slot_storage(0)`) then costs what
+// C++'s empty `std::vector` does. A count that is a constant zero is that view outright (the caller
+// asks `is_zero_const`); any other is a test around the allocation:
+//
+//     val skip = skip_if_empty(e, slice_ty, n)
+//     ... the allocation, and its view from `view_parts` ...
+//     join_unless_empty(e, slice_ty, skip, view)
+//
+// The view is carried across the join in a slot of the frame, which the optimizer turns into the
+// value it is; the one temporary the expression owns is registered after the join.
+skip_if_empty(e: *Emit, slice_ty: Type, n: Val) -> (Val, string)
+    val lt = lty(e, slice_ty)
+    val slot = alloca(e, fresh_reg(e), lt)
+
+    emit(e, InStore(lt, VZero, slot, AccPlain, None))
+
+    val none = fresh_reg(e)
+    val make_l = fresh_label(e, "buf.make")
+    val done_l = fresh_label(e, "buf.made")
+
+    emit(e, InIntCmp(none, IEq, word_lty(e), n, VInt(from_int(0))))
+    emit_term(e, InCondBr(none, done_l, make_l))
+    emit_label(e, make_l)
+    (slot, done_l)
+end skip_if_empty
+
+// The other half of `skip_if_empty`: `view` is the buffer the taken path made.
+join_unless_empty(e: *Emit, slice_ty: Type, skip: (Val, string), view: Val) -> Val
+    val lt = lty(e, slice_ty)
+
+    emit(e, InStore(lt, view, skip.0, AccPlain, None))
+    emit_term(e, InBr(skip.1))
+    emit_label(e, skip.1)
+
+    val joined = fresh_reg(e)
+
+    emit(e, InLoad(joined, lt, skip.0, AccPlain, None))
+    e.maybe_heap = true
+    own_temp(e, joined, slice_ty)
+end join_unless_empty
+
 // The three words of a view over a buffer, owned by nobody yet.
 view_parts(e: *Emit, slice_ty: Type, box: Val, data: Val, n: Val) -> Val
     val lt = lty(e, slice_ty)

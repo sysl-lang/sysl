@@ -324,9 +324,16 @@ gen_slots(e: *Emit, op: string, args: Buf[TExpr], elem: Type, ty: Type) -> Val
     VNothing
 end gen_slots
 
-// A buffer like `[v; n]`'s, with the live count stored as zero and no element written.
+// A buffer like `[v; n]`'s, with the live count stored as zero and no element written -- and, like
+// it, **no buffer at all where `n` is zero** (`emit_box.sysl`'s `skip_if_empty`): the empty view has
+// no owner, so the hook tests of the other forms send it down their "not this storage" path, and a
+// container grows from it by making storage of its own, as it does from `[]`.
 private gen_slot_storage(e: *Emit, count: TExpr, elem: Type, slice_ty: Type) -> Val
     val n = widen_index(e, count, count.span, BoundsCountTooWide)
+
+    if is_zero_const(n) then return VZero
+
+    val skip = skip_if_empty(e, slice_ty, n)
     val made = gen_slot_buffer(e, elem, n)
 
     emit(e, InStore(word_lty(e), VInt(from_int(0)), slot_header(e, elem, made.0, header_fields()),
@@ -337,20 +344,31 @@ private gen_slot_storage(e: *Emit, count: TExpr, elem: Type, slice_ty: Type) -> 
     if contains_counted(elem) || heap_sized() then
         emit(e, InStore(LPtr, slot_buf_fn(e, elem), slot_header(e, elem, made.0, 1), AccPlain, None))
 
-    buffer_view(e, slice_ty, made.0, made.1, n)
+    join_unless_empty(e, slice_ty, skip, view_parts(e, slice_ty, made.0, made.1, n))
 end gen_slot_storage
 
 // `slot_storage`'s buffer where the heap gave one, and an empty view where it did not
 // (`gen_try_buffer`): the hook and the live count are written on the arm that has a box to write
-// them into, and the view is owned once, where the arms meet.
+// them into, and the view is owned once, where the arms meet. A count of zero takes the empty arm
+// without asking the heap, as `slot_storage(0)` does: the answer is the same empty view either way.
 private gen_try_slot_storage(e: *Emit, count: TExpr, elem: Type, slice_ty: Type) -> Val
     val n = widen_index(e, count, count.span, BoundsCountTooWide)
+
+    if is_zero_const(n) then return VZero
+
     val lt = lty(e, slice_ty)
     val result = alloca(e, fresh_reg(e), lt)
-    val made = gen_try_buffer(e, elem, n)
+    val asked = fresh_label(e, "trystore.ask")
     val given = fresh_label(e, "trystore.given")
     val refused = fresh_label(e, "trystore.refused")
     val joined = fresh_label(e, "trystore.end")
+    val none = fresh_reg(e)
+
+    emit(e, InIntCmp(none, IEq, word_lty(e), n, VInt(from_int(0))))
+    emit_term(e, InCondBr(none, refused, asked))
+    emit_label(e, asked)
+
+    val made = gen_try_buffer(e, elem, n)
 
     emit_term(e, InCondBr(made.2, given, refused))
     emit_label(e, given)
