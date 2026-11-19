@@ -701,17 +701,40 @@ udr_abandons()
                 "'@unique' 'Res'")
     assert_eq(udr_said(udr_res + "@abandons\nstop(r: *Res) -> never\n    loop\n        ()\n"), "")
 
+    // A frame further down that holds one across a call that can reach an abandoning call is refused,
+    // naming the local.
     udr_refused(udr_res + raw"""
         @abandons
         stop(code: int) -> never
             loop
                 ()
 
+        middle(n: int)
+            if n == 0 then stop(1)
+
         work()
             val r = Res(1)
 
-            stop(1)
-        """, "'r'")
+            middle(0)
+        """, "this frame holds 'r' across the call")
+
+    // The caller of the abandoning function itself ends its frame first: what it still holds is
+    // dropped before the call, a moved one skipped, as a 'return' there would.
+    udr_runs(udr_res + udr_keep + raw"""
+        @abandons
+        extern "exit" leave(code: int) -> never
+
+        work(c: bool)
+            val r = Res(1)
+            val s = Res(2)
+
+            if c then keep(s)
+            print("before")
+            leave(0)
+
+        main()
+            work(true)
+        """, "kept 2\ndrop 2\nbefore\ndrop 1\n")
 
 // -- what this stage refuses -----------------------------------------------------------------------------------
 
@@ -742,11 +765,27 @@ udr_not_yet()
     udr_refused(raw"""
         @unique
         struct Big
-            words: [20]int
+            words: [40]int
 
         impl Drop for Big
             drop(self) = print("drop")
-        """, "a '@unique' value with a destructor larger than 128 bytes is not supported yet")
+        """, "'Big' holds the '@unique' 'Big', whose destructor runs on the value, and is 160 bytes — a " +
+             "'@unique' value with a destructor larger than 128 bytes is not supported yet")
+
+    // At the limit it is held and dropped as any other.
+    udr_runs(raw"""
+        @unique
+        struct Edge
+            words: [32]int
+
+        impl Drop for Edge
+            drop(self) = print("edge", self.words[31])
+
+        main()
+            var e = Edge([0; 32])
+
+            e.words[31] = 7
+        """, "edge 7\n")
 
     // Without a destructor, U-1's token is unchanged: an 'Option' of one is fine.
     assert_eq(udr_said("@unique\nstruct Token\n    n: int\n\nmain()\n    val o = Some(Token(1))\n"), "")
