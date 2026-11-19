@@ -55,8 +55,11 @@ parse_at_stmt(p: *Parser, start: Span) -> Stmt
         return parse_reassociate_block(p, start)
 
     // `@unchecked` marks the block under it rather than a declaration (`unchecked.sysl`) -- unless
-    // parentheses follow it, where it is a struct's promise to cross (`promises.sysl`).
+    // parentheses follow it, where it is a struct's promise to cross (`promises.sysl`), or, with a
+    // string in them, a block's promise that the processor has those extensions (`extensions.sysl`).
     if word == "unchecked" && !p.kw_at(2, "(") then return parse_unchecked_block(p, start)
+
+    if word == "unchecked" && at_string(p, 3) then return parse_extensions_block(p, start)
 
     parse_attributed_decl(p, start)
 end parse_at_stmt
@@ -216,7 +219,7 @@ private member_attr_word(w: string) -> bool
 
     for word in ["crossing", "reads", "writes", "noinline", "inline", "cold", "blocks",
                  "relocates", "views", "consumes", "disjoint", "scoped", "bounded", "joined", "strict_fp",
-                 "reassociate", "track_caller", NoFuseWord]
+                 "reassociate", "track_caller", NoFuseWord, "extensions"]
         if word == w then return true
 
     false
@@ -273,7 +276,8 @@ builtin_attr_word(w: string) -> bool
                  "section", "crossing", "domain", "keeps", "answers", "disjoint", "guards", "needs",
                  "noinline", "inline", "cold", "thread_local", "abandons", "per_cpu", "main_thread",
                  "pinned", "pins", "relocates", "views", "consumes", "blocks", "scoped", "bounded", "joined",
-                 "strict_fp", "reassociate", "track_caller", "returns_twice", "renamed", "removed", "unchecked"]
+                 "strict_fp", "reassociate", "track_caller", "returns_twice", "renamed", "removed", "unchecked",
+                 "extensions"]
         if word == w then return true
 
     false
@@ -418,6 +422,7 @@ parse_attribute(p: *Parser) -> Option[Attr]
     if word == "unchecked" && p.at_kw("(") then
         return Some(Promises(promise_names(p, p.here(), parse_named_list(p, "unchecked"))))
     if word == "needs" then return Some(Needs(parse_named_list(p, "needs")))
+    if word == "extensions" then return Some(Extensions(parse_extension_names(p, "extensions")))
     if word == "noinline" then return no_inlining_args(p, NoInline, "whether a call stays a call is the whole of what it says")
     if word == "inline" then return parse_inline_attr(p)
     if word == "cold" then return no_inlining_args(p, Cold, "how rare a rare path is is not a number a program has")
@@ -1033,6 +1038,7 @@ apply_func_attrs(f: *FuncDecl, attrs: Buf[Attr])
             Reassociate -> f.marks.reassociate = true
             NoFuse -> f.marks.no_fuse = true
             TrackCaller -> f.marks.track_caller = true
+            Extensions(ns) -> f.marks.extensions = ns
             Scoped(ns) -> f.marks.scoped = ns
             Bounded(ns) -> f.marks.bounded = ns
             _ -> ()
@@ -1062,6 +1068,7 @@ apply_member_attrs(m: *MethodDecl, attrs: Buf[Attr])
             Reassociate -> m.marks.reassociate = true
             NoFuse -> m.marks.no_fuse = true
             TrackCaller -> m.marks.track_caller = true
+            Extensions(ns) -> m.marks.extensions = ns
             Relocates -> m.marks.relocates = true
             Views(_) -> m.marks.views = true
             Consumes -> m.marks.consumes = true
@@ -1336,6 +1343,7 @@ private attributed_refusal(attrs: Buf[Attr]) -> string
 
     if any_is(attrs, "reassociate") then return reassociate_not_a_body()
     if any_is(attrs, NoFuseWord) then return no_fuse_not_a_body()
+    if any_is(attrs, "extensions") then return extensions_not_a_body()
 
     if any_is(attrs, "inline(always)")
         return "'@inline(always)' puts a function's body in place of every call to it, so it marks a function or a method — and this declares neither. An 'extern' has no body in this program to put anywhere: its definition is in the object it is linked from"
@@ -1501,6 +1509,13 @@ private refuse_impossible_pairs(p: *Parser, attrs: Buf[Attr])
     // back end would break at every such call.
     if always && any_is(attrs, "strict_fp")
         p.fault(p.here(), "'@inline(always)' puts the body in place of every call, and a '@strict_fp' body is only ever put inside a caller that is '@strict_fp' too — anywhere else the call stays a call, so the promise could not be kept. Write '@inline' for the hint, which a strict caller takes")
+        return
+    end if
+
+    // A body compiled for an extension is put inside a caller only where the caller has it too --
+    // anywhere else the call stays a call -- so `always` is a promise LLVM would break.
+    if always && any_is(attrs, "extensions")
+        p.fault(p.here(), extensions_beside_always())
         return
     end if
 

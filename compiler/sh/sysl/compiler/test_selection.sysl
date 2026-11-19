@@ -1,0 +1,286 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Source
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map, Set, set}
+import sysl.env.{get as env_var}
+import sysl.text.from_utf8_unchecked
+
+// **`sysl test --file <name>` compiles the `@tests` files it names, and only what they need** -- not
+// every `@tests` file of the tree. A test binary was the whole tree: on the compiler's own, ~1,300
+// `@tests` files and 18 MB of test source analyzed, lowered and compiled into every targeted run, to
+// run the dozens of tests one file holds. What a file's tests can reach does not depend on a
+// `@tests` file nothing in it names, so such a file is left out before anything is analyzed.
+//
+// ==What is kept==
+//
+// Every file that is not `@tests` -- no program file can name a test file's declarations, since every
+// other build drops those -- and of the `@tests` files:
+//
+//   - every one `--file` names (`file_named`, the runner's own reading of the flag);
+//   - every one that is **not inert**: one that acts without being named. A hook (`@setup` and the
+//     rest bracket every test of the module), an `@export` or a `@section` (a symbol C or the linker
+//     reaches by its spelling), a calling convention, module `asm`, a header clause (`@link`,
+//     `@include`, a capability, `@no_fuse`), or a top-level statement that is not a declaration;
+//   - every one declaring a name a kept `@tests` file's text spells, transitively.
+//
+// **The last is read off the text, as words**, every identifier-shaped run of bytes, strings and
+// comments included -- which can only keep more than is needed, never less: an interpolated hole is
+// inside a string, and a name that resolves to a declaration is spelled where it is used. A name
+// is what a file declares at top level that another file could see (a `private` one is the file's own),
+// with every member, variant and trait method beside it, so a method reached through a value whose
+// type nobody spelled still keeps its file. Overloads stay whole: a file declaring any of a name's
+// overloads is kept with the rest.
+//
+// ==What is said==
+//
+// **A dropped file's tests are still counted**: each is listed as a test that is never chosen
+// (`dropped_test`), so the header's `running 3 tests of N` and `--file`'s "to choose from" read as
+// the whole tree's. A `@tests` file that is left out is not analyzed, so a mistake in it is not
+// reported by a run that does not name it -- which is what naming one file asks for.
+//
+// `SYSL_TEST_EVERY_FILE=1` builds every file, as before; a narrowed binary is kept under a key of its
+// own (`narrowed_test_command`).
+
+// The variable that turns the narrowing off.
+private const EveryFile: string = "SYSL_TEST_EVERY_FILE"
+
+// A test build's files, narrowed to what `--file` asks for.
+struct NarrowedTests
+    units: Buf[Program]
+
+    // A test of every `@test` function the files left out declared, to be counted and never run.
+    dropped_tests: Buf[TTest]
+
+    // How many `@tests` files were left out; zero is the whole build.
+    dropped_files: usize
+end NarrowedTests
+
+// Whether a run naming `within` builds a narrowed binary at all.
+narrows_tests(within: Buf[string]) -> bool =
+    !within.is_empty() && env_var(EveryFile).unwrap_or("") == ""
+
+// The run cache's command for a narrowed build: the command, then every name `--file` gave, sorted
+// and once each, so two spellings of one request share an entry.
+narrowed_test_command(command: string, within: Buf[string]) -> string
+    var names: Buf[string] = buf()
+    var seen: Set[string] = set()
+
+    for named in within
+        if !seen.has(named)
+            seen.add(named)
+            names.push(named)
+
+    var out = command
+
+    for named in sort_names(names)
+        out = out + "\n--file " + named
+
+    out
+end narrowed_test_command
+
+// `units` with every `@tests` file `within` does not need left out.
+narrowed_test_units(units: Buf[Program], within: Buf[string]) -> NarrowedTests
+    if !narrows_tests(within) then return NarrowedTests(units, buf(), 0)
+
+    var keep: Buf[bool] = buf()
+    var todo: Buf[usize] = buf()
+    var declared: Map[string, Buf[usize]] = map()
+
+    for i in 0..<units.len()
+        val u = units[i]
+        val kept = !u.test_only || file_in(u.src.name, within) || !inert_unit(u)
+
+        keep.push(kept)
+
+        if u.test_only && kept then todo.push(i)
+
+        if u.test_only && !kept
+            for name in visible_names(u)
+                var list: Buf[usize] = declared.get(name).unwrap_or(buf())
+
+                list.push(i)
+                declared.put(name, list)
+    end for
+
+    var seen: Set[string] = set()
+
+    while !todo.is_empty()
+        val at = todo.pop().unwrap()
+
+        for word in words_of(units[at].src)
+            if seen.has(word) then continue
+
+            seen.add(word)
+
+            declared.get(word) match
+                Some(list) ->
+                    for j in list
+                        if !keep[j]
+                            keep[j] = true
+                            todo.push(j)
+                None -> ()
+    end while
+
+    var out: Buf[Program] = buf()
+    var dropped: Buf[TTest] = buf()
+    var files: usize = 0
+
+    for i in 0..<units.len()
+        if keep[i]
+            out.push(units[i])
+        else
+            files += 1
+
+            for t in dropped_tests_of(units[i])
+                dropped.push(t)
+
+    NarrowedTests(out, dropped, files)
+end narrowed_test_units
+
+// Whether a `@tests` file does nothing unless something names what it declares.
+inert_unit(u: Program) -> bool
+    if !u.capabilities.is_empty() || !u.links.is_empty() || !u.includes.is_empty() || u.no_fuse
+        return false
+
+    for s in u.body
+        if !inert_stmt(s) then return false
+
+    true
+end inert_unit
+
+private inert_stmt(s: Stmt) -> bool = *s.kind match
+    ImportDecl(_) -> true
+    AssertDecl(_, _) -> true
+    CConstBlock(_) -> true
+    CTypeBlock(_) -> true
+    TombstoneDecl(_) -> true
+    StructDecl(_) -> true
+    EnumDecl(_) -> true
+    TraitDecl(_) -> true
+    TypeDecl(_) -> true
+    ImplDecl(_) -> true
+    ExternDecl(_) -> true
+    ExternVarDecl(_, _, _, _, _) -> true
+    ConstDecl(_, _, _, _, export) -> export.is_none()
+    ValDecl(_, _, _, _, _, section, _, export) -> export.is_none() && section.is_none()
+    VarDecl(_, _, _, _, _, section, _, export) -> export.is_none() && section.is_none()
+    MultiDecl(_, _, _, _) -> true
+    PatternDecl(_, _, _, _, _) -> true
+    FuncDecl(d) -> d.hook.is_none() && d.exported.is_none() && d.section.is_none() && d.conv.is_none()
+    StaticDecl(inner) -> inert_stmt(inner)
+    CopiedDecl(_, inner) -> inert_stmt(inner)
+    _ -> false
+
+// Every name a file declares that another file could spell to reach it: its top-level declarations
+// that are not `private`, and every member, variant and trait method, whatever its mark.
+visible_names(u: Program) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for s in u.body
+        stmt_names(s, &out)
+
+    out
+end visible_names
+
+private stmt_names(s: Stmt, out: *Buf[string])
+    *s.kind match
+        ConstDecl(name, _, _, vis, _) -> seen_name(name, vis, out)
+        ValDecl(name, _, _, vis, _, _, _, _) -> seen_name(name, vis, out)
+        VarDecl(name, _, _, vis, _, _, _, _) -> seen_name(name, vis, out)
+        MultiDecl(names, _, _, vis) ->
+            for name in names
+                seen_name(name, vis, out)
+        PatternDecl(_, _, _, _, _) -> ()
+        CConstBlock(consts) ->
+            for c in consts
+                seen_name(c.name, c.vis, out)
+        CTypeBlock(types) ->
+            for c in types
+                seen_name(c.name, c.vis, out)
+        ExternDecl(d) -> seen_name(d.name, d.vis, out)
+        ExternVarDecl(name, _, _, vis, _) -> seen_name(name, vis, out)
+        FuncDecl(d) -> seen_name(d.name, d.vis, out)
+        StructDecl(d) ->
+            seen_name(d.name, d.vis, out)
+            for m in d.members
+                out.push(m.name)
+        EnumDecl(d) ->
+            seen_name(d.name, d.vis, out)
+            for v in d.variants
+                out.push(v.name)
+            for m in d.members
+                out.push(m.name)
+        TraitDecl(d) ->
+            seen_name(d.name, d.vis, out)
+            for m in d.methods
+                out.push(m.name)
+        TypeDecl(d) ->
+            seen_name(d.name, d.vis, out)
+            for m in d.members
+                out.push(m.name)
+        ImplDecl(d) ->
+            for m in d.methods
+                out.push(m.name)
+        TombstoneDecl(d) -> out.push(d.name)
+        StaticDecl(inner) -> stmt_names(inner, out)
+        CopiedDecl(_, inner) -> stmt_names(inner, out)
+        _ -> ()
+end stmt_names
+
+// A name another file can reach: anything but a `private` one.
+private seen_name(name: string, vis: Visibility, out: *Buf[string])
+    vis match
+        File -> ()
+        _ -> out.push(name)
+
+// Every identifier-shaped run of a file's bytes, once each.
+words_of(src: Source) -> Buf[string]
+    val b = src.bytes
+    var out: Buf[string] = buf()
+    var seen: Set[string] = set()
+    var i: usize = 0
+
+    while i < b.len
+        if !word_start(b[i])
+            i += 1
+            continue
+
+        val from = i
+
+        while i < b.len && word_byte(b[i])
+            i += 1
+
+        val word = from_utf8_unchecked(b[from..<i])
+
+        if !seen.has(word)
+            seen.add(word)
+            out.push(word)
+    end while
+
+    out
+end words_of
+
+private word_start(c: u8) -> bool =
+    (c >= u8('a') && c <= u8('z')) || (c >= u8('A') && c <= u8('Z')) || c == u8('_')
+
+private word_byte(c: u8) -> bool = word_start(c) || (c >= u8('0') && c <= u8('9'))
+
+// The `@test` functions a file left out declared, as the analysis would list them -- top level and
+// not generic -- each to be counted and never chosen.
+dropped_tests_of(u: Program) -> Buf[TTest]
+    var out: Buf[TTest] = buf()
+
+    for s in u.body
+        *s.kind match
+            FuncDecl(d) ->
+                if d.test.is_some() && d.tparams.is_empty()
+                    val attr = d.test.unwrap()
+
+                    out.push(TTest(d.name, attr.display.unwrap_or(d.name), attr.should_trap, attr.expected,
+                                   u.src.name, int(u.src.locate(attr.span.start).line), no_hooks(),
+                                   attr.ignored, attr.timeout))
+            _ -> ()
+
+    out
+end dropped_tests_of
