@@ -146,7 +146,7 @@ after this kill" (a dead local cannot be harmed by a kill).
 `EdgeWrites { keys, within: Buf[Type], counts: Buf[Type], opaque: string }` per function (per
 instance), the **least** fixed point over the call graph (start empty, grow — a write needs a finite
 path to it, so recursion settles on what the bodies actually write). `opaque` is a reason (`a call
-through a closure`, `a destructor of 'Res'`), empty when every write is named, with the function whose
+through a closure`, `a destructor of 'm.Res'`), empty when every write is named, with the function whose
 own body holds it (`opaque_in`) — the words `--explain-borrows` will quote. A body contributes:
 
 - **each store's edge keys** (decision 4), by these rules:
@@ -177,7 +177,9 @@ own body holds it (`opaque_in`) — the words `--explain-borrows` will quote. A 
   program, a store through a laundered cast, a suspension (`await`, `block_on`, a step) and a fiber
   switch, inline `asm` that clobbers memory, a store to a place the analysis cannot name, and **any
   release that may run a destructor** (`may_run_drop` on what the body holds; BI5 refines this to the
-  destructor bodies' summaries);
+  destructor bodies' summaries). A counted trait object or closure says nothing of what it holds, so
+  until BI5 a body that holds one is opaque by this rule (`a destructor of '&m.Step'`) whatever it
+  calls through it; a table call through a `*Step` is resolved by `slot_callees`;
 - **a foreign call**: trusted (contributes only a `within` write of what it is handed a writable
   pointer or view to) when the program is a closed program's build, the function is not variadic,
   `@abandons` or returns-twice, every parameter is a plain value or a pointer/view to one, and every
@@ -197,8 +199,8 @@ build has — the answer is `opaque`, the line every inferred fact draws.
 **The API the later items use** (`borrowing.sysl`): `edge_writes(u, name) -> EdgeWrites`;
 `field_key(owner, i)` and `slot_key(elem)` build the keys a read adds; `writes_edge(w, key)` and
 `first_written(w, keys)` answer whether a summary meets a chain (and which edge, for the report);
-`reads_count(w, t)` whether it reads a count of a chain type; `edge_text(key)` shows one
-(`Node.next`, `the slots of &Node`).
+`reads_count(w, t)` whether it reads a count of a chain type; `edge_text(key)` shows one, each type
+as `type_show` names it (`m.Node.next`, `sysl.Option[&m.Node].Some.value`, `the slots of &m.Node`).
 
 ### 4.3 Parameter conventions
 
