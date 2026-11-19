@@ -228,11 +228,26 @@ cko_method()
 @test("a closure and a nested function written inside a @checked function are inside it")
 cko_closure_and_nested()
     cko_traps("@checked\nf(a: u8) -> u8\n    val g = (x: u8) -> x * 2\n\n    g(a)\n\nprint(f(127))\nprint(f(128))\n",
-              "254\n", "integer overflow: byte * byte (main.sysl:3:24)\n")
+              "254\n", "integer overflow: u8 * u8 (main.sysl:3:24)\n")
     cko_traps("@checked\nf(a: u8) -> u8\n    inner(x: u8) -> u8 = x - 1\n\n    inner(a)\n\nprint(f(1))\nprint(f(0))\n",
-              "0\n", "integer overflow: byte - byte (main.sysl:3:26)\n")
+              "0\n", "integer overflow: u8 - u8 (main.sysl:3:26)\n")
     cko_traps("f(a: u8) -> u8\n    @checked\n        val g = (x: u8) -> x + 1\n\n        g(a)\n\nprint(f(254))\nprint(f(255))\n",
-              "255\n", "integer overflow: byte + byte (main.sysl:3:28)\n")
+              "255\n", "integer overflow: u8 + u8 (main.sysl:3:28)\n")
+
+// A report names an operand's type as its declaration wrote it, and a closure's or nested function's
+// parameter is a declaration like any other: it once fell back to the friendly word for the width.
+@test("an overflow inside a closure or a nested function names the parameter's type as it was written")
+cko_closure_names_as_written()
+    // Written as `byte`, it stays `byte`; written as an alias, the alias.
+    cko_traps("@checked\nf(a: u8) -> u8\n    val g = (x: byte) -> x + 200\n\n    g(a)\n\nprint(f(55))\nprint(f(56))\n",
+              "255\n", "integer overflow: byte + byte (main.sysl:3:26)\n")
+    cko_traps("type Octet = u8\n\n@checked\nf(a: Octet) -> Octet\n    inner(x: Octet) -> Octet = x * 2\n\n" +
+              "    inner(a)\n\nprint(f(100))\nprint(f(200))\n",
+              "200\n", "integer overflow: Octet * Octet (main.sysl:5:32)\n")
+    // A parameter the context typed is spelled as the position's written callable type spelled it.
+    cko_traps("@checked\napply(h: &Fn(u16) -> u16, v: u16) -> u16 = h(v)\n\n@checked\n" +
+              "f(a: u16) -> u16 = apply((x) -> x * 2, a)\n\nprint(f(30000))\nprint(f(40000))\n",
+              "60000\n", "integer overflow: u16 * u16 (main.sysl:5:33)\n")
 
 @test("a function called from a @checked one but written elsewhere keeps the mode's meaning, inlined or not")
 cko_callee_written_elsewhere()
@@ -244,7 +259,24 @@ cko_callee_written_elsewhere()
 cko_generic()
     cko_traps("@checked\ntwice[T: Add](x: T) -> T = x + x\n\nval w: u16 = 200\nval n: u8 = 200\n" +
               "print(twice(w))\nprint(twice(n))\n",
-              "400\n", "integer overflow: byte + byte (main.sysl:2:28)\n")
+              "400\n", "integer overflow: u8 + u8 (main.sysl:2:28)\n")
+
+// An operand typed by a type parameter has no spelling the program chose for the instantiation -- every
+// call reaching it shares it -- so it is named by its width, never by the friendly word for that width.
+@test("an overflow in a generic names a type parameter's operand by the width it was instantiated at")
+cko_generic_names_the_width()
+    // Instantiated at `int`, the width is `i32`; a closure and a nested function inside take the same.
+    cko_traps("@checked\ntwice[T: Mul](x: T) -> T = x * x\n\nprint(twice(40000))\nprint(twice(50000))\n",
+              "1600000000\n", "integer overflow: i32 * i32 (main.sysl:2:28)\n")
+    cko_traps("@checked\nbump[T: Add](x: T) -> T\n    val g = (y: T) -> y + y\n\n    g(x)\n\n" +
+              "val n: byte = 100\nval m: byte = 200\nprint(bump(n))\nprint(bump(m))\n",
+              "200\n", "integer overflow: u8 + u8 (main.sysl:3:23)\n")
+    cko_traps("@checked\nbump[T: Add](x: T) -> T\n    inner(y: T) -> T = y + y\n\n    inner(x)\n\n" +
+              "val n: u16 = 30000\nval m: u16 = 40000\nprint(bump(n))\nprint(bump(m))\n",
+              "60000\n", "integer overflow: u16 + u16 (main.sysl:3:24)\n")
+    // An operand the generic body declared with a width of its own keeps that spelling.
+    cko_traps("@checked\nscaled[T](x: T, k: byte) -> byte = k * 2\n\nprint(scaled(1, 100))\nprint(scaled(1, 200))\n",
+              "200\n", "integer overflow: byte * byte (main.sysl:2:36)\n")
 
 // -- with @unchecked ------------------------------------------------------------------------------------
 
@@ -252,13 +284,22 @@ cko_generic()
 cko_unchecked_inside_checked()
     cko_traps("@checked\nf(xs: []u8, i: int) -> u8\n    @unchecked\n        xs[i] + xs[i]\n\n" +
               "var xs: [2]u8 = [100, 200]\nprint(f(xs[..], 0))\nprint(f(xs[..], 1))\n",
-              "200\n", "integer overflow: byte + byte (main.sysl:4:9)\n")
+              "200\n", "integer overflow: u8 + u8 (main.sysl:4:9)\n")
 
 @test("@checked inside @unchecked traps too, and a bounds check outside it is still made")
 cko_checked_inside_unchecked()
     cko_traps("var xs: [2]u8 = [100, 200]\n\n@unchecked\n    print(xs[0] + 1)\n\n    @checked\n" +
               "        print(xs[1] + xs[1])\n",
-              "101\n", "integer overflow: byte + byte (main.sysl:7:15)\n")
+              "101\n", "integer overflow: u8 + u8 (main.sysl:7:15)\n")
+
+@test("an overflow of elements read by subscript names the element type the array or slice was declared with")
+cko_element_names_as_written()
+    // A slice of an alias, and an array written with `byte`.
+    cko_traps("type Octet = u8\n\n@checked\nf(xs: []Octet) -> Octet = xs[0] * xs[1]\n\n" +
+              "var a: [2]Octet = [10, 20]\nvar b: [2]Octet = [20, 20]\nprint(f(a[..]))\nprint(f(b[..]))\n",
+              "200\n", "integer overflow: Octet * Octet (main.sysl:4:27)\n")
+    cko_traps("var xs: [2]byte = [100, 200]\n\n@checked\n    print(xs[0] + xs[0])\n    print(xs[1] + xs[1])\n",
+              "200\n", "integer overflow: byte + byte (main.sysl:5:11)\n")
     cko_traps("@checked\nf(xs: []u8, i: int) -> u8 = xs[i]\n\nvar xs: [2]u8 = [1, 2]\nprint(f(xs[..], 1))\nprint(f(xs[..], 2))\n",
               "2\n", "index 2 out of bounds for length 2 (main.sysl:2:31)\n")
 

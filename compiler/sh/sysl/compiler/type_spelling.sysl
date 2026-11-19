@@ -26,10 +26,14 @@ import sysl.buf.{Buf, buf}
 // **`params` is what a written callable type (`Fn(u8)`, also behind `&`) spelled each of its
 // parameters as**, empty for every other type: a call through the call trait reads its parameters as
 // `A`, so the receiver's own written type is where a literal argument's declared type is found.
+//
+// **`elem` is what a written array, slice or vector type spelled its element as** (one entry, also
+// behind `&` or `*`), empty for every other type: an element read by subscript is named by it.
 struct Spelling
     text: string
     aliased: bool
     params: Buf[Spelling]
+    elem: Buf[Spelling]
 end Spelling
 
 // A type a position declared, with the spelling its declaration wrote.
@@ -77,8 +81,36 @@ spelled_show(t: Type, s: Option[Spelling]) -> string = s match
 spelling_of(written: TypeRef, t: Type, tparams: Buf[string]) -> Option[Spelling] =
     spell_verdict(written, t, tparams) match
         SpellUntrusted -> None
-        SpellPlain -> Some(Spelling(type_text(with_paths(written, t)), false, callable_params(written, t, tparams)))
-        SpellAliased -> Some(Spelling(type_text(with_paths(written, t)), true, callable_params(written, t, tparams)))
+        SpellPlain -> Some(Spelling(type_text(with_paths(written, t)), false, callable_params(written, t, tparams),
+                                    element_spelling(written, t, tparams)))
+        SpellAliased -> Some(Spelling(type_text(with_paths(written, t)), true, callable_params(written, t, tparams),
+                                      element_spelling(written, t, tparams)))
+
+// What a written array, slice or vector type spelled its element as, looking through the pointers and
+// references around it; empty for any other type, and where the element's spelling is not trusted.
+private element_spelling(w: TypeRef, t: Type, tparams: Buf[string]) -> Buf[Spelling]
+    var out: Buf[Spelling] = buf()
+
+    val found = *w.kind match
+        RefType(wi, _) -> t match
+            Ref(ti, _) -> return element_spelling(wi, *ti, tparams)
+            _ -> None
+        PtrType(wi, _) -> t match
+            Ptr(ti, _) -> return element_spelling(wi, *ti, tparams)
+            _ -> None
+        ArrayType(_, we, _) -> t match
+            Slice(te, _) -> spelling_of(we, *te, tparams)
+            Array(_, te) -> spelling_of(we, *te, tparams)
+            _ -> None
+        VectorType(_, we) -> t match
+            Vector(_, te) -> spelling_of(we, *te, tparams)
+            _ -> None
+        _ -> None
+
+    if found.is_some() then out.push(found.unwrap())
+
+    out
+end element_spelling
 
 // What each parameter of a written callable type was spelled as, looking through the references
 // around it; empty for any other type.
@@ -382,11 +414,39 @@ field_spelling(cx: &Analyzer, d: &StructType, index: int, ty: Type) -> Option[Sp
 // An operand's type as an overflow report names it (`build_mode.sysl`'s `note_trap_name`): the
 // spelling of the declaration it was read from, an alias by its name alone, and -- for an operand with
 // no declaration of its own, such as a literal -- the spelling of `beside` when that is the same type.
+// An element read by subscript is named by the element its array or slice was declared with.
+//
+// **An operand no declaration spelled, in a body read for an instantiation, whose type is what one of
+// its type parameters stands for, is named by its width** (`u8`, `i32`): the parameter was written
+// `T`, and the instantiation is shared by every call that reaches it whatever each wrote, so no name
+// the program chose can be quoted -- and the friendly word (`byte`) is one the program may never have
+// used, where the width is the type's own name and what overflowed.
 trap_operand(cx: &Analyzer, e: TExpr, beside: TExpr) -> string
-    val own = texpr_spelling(cx, e)
-    val sp = if own.is_none() && type_eq(texpr_type(e), texpr_type(beside)) then texpr_spelling(cx, beside) else own
+    val own = trap_spelling(cx, e)
+    val sp = if own.is_none() && type_eq(texpr_type(e), texpr_type(beside)) then trap_spelling(cx, beside) else own
+    val ty = texpr_type(e)
 
     sp match
         Some(s) -> s.text
-        None -> type_show(texpr_type(e))
+        None -> if stands_for_a_parameter(cx, ty) then canonical_text(ty) else type_show(ty)
 end trap_operand
+
+// An operand's declared spelling as an overflow report reads it: the declaration's, or for an element,
+// the element its array, slice or vector was declared with.
+private trap_spelling(cx: &Analyzer, e: TExpr) -> Option[Spelling] = *e.kind match
+    TIndex(receiver, _, _) -> trap_spelling(cx, receiver) match
+        Some(s) -> if s.elem.is_empty() then None else Some(s.elem[0])
+        None -> None
+    _ -> texpr_spelling(cx, e)
+
+// Whether an integer type is what a type parameter of the body being read stands for.
+private stands_for_a_parameter(cx: &Analyzer, ty: Type) -> bool
+    ty match
+        Integer(_, _, _) -> ()
+        _ -> return false
+
+    for b in cx.subst
+        if type_eq(b.ty, ty) then return true
+
+    false
+end stands_for_a_parameter

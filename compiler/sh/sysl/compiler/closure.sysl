@@ -115,29 +115,46 @@ closure_expr(cx: &Analyzer, span: Span, written: Buf[LambdaParam], body: Buf[Stm
     var ptypes: Buf[Type] = buf()
     var names: Buf[string] = buf()
 
+    // What each parameter's annotation spelled its type as, for the body's diagnostics to quote; one
+    // the context supplied is spelled as the position's written callable type spelled it, where the
+    // position declared one (`f: Fn(u8) -> u8`), and has none otherwise.
+    var spells: Buf[Option[Spelling]] = buf()
+    val tparams = subst_names(cx)
+    val told: Buf[Spelling] = cx.declared match
+        Some(d) ->
+            if expected.is_some() && type_eq(behind_ref(d.ty), behind_ref(expected.unwrap())) then d.spelled.params
+            else buf()
+        None -> buf()
+
     for i in 0..<params.len()
         val p = params[i]
 
         names.push(p.name)
 
         if p.typ.is_some()
-            ptypes.push(resolve_type(cx.an, cx.scope, p.typ.unwrap(), cx.subst))
+            val pty = resolve_type(cx.an, cx.scope, p.typ.unwrap(), cx.subst)
+
+            ptypes.push(pty)
+            spells.push(spelling_of(p.typ.unwrap(), pty, tparams))
         else if want.is_some() && i < want.unwrap().0.len()
             ptypes.push(want.unwrap().0[i])
+            spells.push(if i < told.len() then Some(told[i]) else None)
         // A position whose own type was refused has already said what is wrong, and the closure at
         // it is not a second mistake.
         else if expected.is_some() && expected.unwrap() == Unknown
             ptypes.push(Unknown)
+            spells.push(None)
         else
             cx.fault(p.span, missing_parameter_type(p.name))
             ptypes.push(Unknown)
+            spells.push(None)
 
     val result = if want.is_none() then None else want.unwrap().1
     var kept: Buf[(string, Type)] = buf()
 
     if expected.is_some() then kept = callable_marks(cx.an, expected.unwrap())
 
-    val lowered = lower_closure(cx, span, names, ptypes, result, body, "", kept)
+    val lowered = lower_closure(cx, span, names, ptypes, result, body, "", kept, spells)
 
     *lowered.kind match
         TStructNew(st, _) -> cx.an.closures_written.put(st.base, ClosureWritten(cx.scope, params, ptypes))
@@ -145,6 +162,12 @@ closure_expr(cx: &Analyzer, span: Span, written: Buf[LambdaParam], body: Buf[Stm
 
     lowered
 end closure_expr
+
+// A callable type with the reference a boxed slot (`&Fn(u8) -> u8`) puts around it taken off, so a
+// position's declared type and the type a closure literal is read against compare as one callable.
+private behind_ref(t: Type) -> Type = t match
+    Ref(inner, _) -> *inner
+    _ -> t
 
 // **A by-name parameter forwarded as itself is the callable it already is**, not a closure around a
 // call of it. `f(n - 1, value)` at a by-name `value` would otherwise thunk the read into a new
@@ -488,7 +511,8 @@ end refuse_pinned_captures
 // that *is* the closure -- its captures, in the order the fields hold them. `named` is the function a
 // program passed where the closure stands for one, and empty for a closure literal.
 lower_closure(cx: &Analyzer, span: Span, names: Buf[string], ptypes: Buf[Type],
-              result: Option[Type], body: Buf[Stmt], named: string = "", kept: Buf[(string, Type)] = buf()) -> TExpr
+              result: Option[Type], body: Buf[Stmt], named: string = "", kept: Buf[(string, Type)] = buf(),
+              spells: Buf[Option[Spelling]] = buf()) -> TExpr
     val captured = captures(cx, body, names)
 
     if refuse_ref_captures(cx, span, captured) then return bad_expr(span)
@@ -518,7 +542,7 @@ lower_closure(cx: &Analyzer, span: Span, names: Buf[string], ptypes: Buf[Type],
     cx.an.tables.struct_insts.put(base, Struct(st))
 
     val fname = s"$base.call"
-    val lowered = closure_body(cx, span, st, fname, names, ptypes, result, captured, body, named)
+    val lowered = closure_body(cx, span, st, fname, names, ptypes, result, captured, body, named, spells)
 
     cx.an.tables.members.func_insts.put(fname, FuncSig(lowered.params, lowered.ret_ty))
     cx.an.closure_funcs.push(lowered)
@@ -1482,7 +1506,8 @@ end holds_index
 // closure has no name a reader wrote.
 private closure_body(cx: &Analyzer, span: Span, st: &StructType, fname: string,
                      names: Buf[string], ptypes: Buf[Type], given: Option[Type],
-                     captured: Buf[string], body: Buf[Stmt], named: string) -> TFunc
+                     captured: Buf[string], body: Buf[Stmt], named: string,
+                     spells: Buf[Option[Spelling]]) -> TFunc
     val inner = analyzer_for(cx.an, cx.scope)
 
     inner.subst = cx.subst
@@ -1516,6 +1541,8 @@ private closure_body(cx: &Analyzer, span: Span, st: &StructType, fname: string,
         val unique = inner.bind(names[i], ptypes[i])
 
         params.push((unique, ptypes[i]))
+
+        if i < spells.len() then inner.spell_binding(unique, spells[i])
 
         // The registrar a `park` was handed takes the task's waker as its one parameter.
         if cx.reading_registrar && names.len() == 1 && type_eq(ptypes[i], waker_type(cx))
