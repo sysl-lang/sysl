@@ -3097,7 +3097,7 @@ print(a - b)
 ```
 
 ```error
-operator '-' is not defined for &Point
+operator '-' is not defined for Point
 ```
 
 **Bounds safety follows length, not pointers.** Arrays and views carry their length, so indexing is
@@ -3486,6 +3486,39 @@ print(key)
 
 ```output
 [0, 0, 0]
+```
+
+- **A type parameter may be qualified where its bound closes it to the scalars** — `[T: Integer]`, a
+  family whose membership is the compiler's and every member of which is one integer. `T` is read
+  through the widening, so a `[]u32` handed to a `[]volatile T` binds `u32`, and every store is at that
+  width:
+
+```sysl
+clear[T: Integer](v: []volatile T) -> usize
+    for i in 0..<v.len
+        v[i] = 0
+    v.len
+
+var round_keys = [0x9e3779b9u32, 0x7f4a7c15]
+var mac = [0xffu8, 0x10, 0x20]
+print(clear(round_keys), clear(mac[1..<3]), round_keys, mac)
+```
+
+```output
+2 2 [0, 0] [255, 0, 0]
+```
+
+- **Any other bound is refused at the declaration**: an unbounded `T` may stand for a struct, and an
+  open trait — `Float`, `Add` — may be implemented by one, so neither is known to be a scalar. A view
+  of a constrained subtype is refused at the call, as the wrong elements, since a volatile place holds
+  whatever is written to it:
+
+```sysl
+f[T](v: []volatile T) = ()
+```
+
+```error
+'volatile T' is not a type: 'volatile' qualifies a scalar or a raw pointer, since it promises the one load or the one store the source wrote and nothing else -- and nothing bounds 'T' to the scalars
 ```
 
 - **An array of qualified elements is filled from a literal** of the plain type, as a struct's
