@@ -775,28 +775,37 @@ when the async function is called and freed when the last reference to the task 
 storage comes from one pair of functions:
 
 ```
-sysl_task_alloc(size: usize) -> *u8
-sysl_task_free(p: *u8)
+sysl_task_alloc(size: usize, align: usize) -> *u8
+sysl_task_free(p: *u8, size: usize, align: usize)
 ```
 
-The compiler defines both over the program's allocator, **weakly**, so a program that defines either
-with [`@export`](/reference/ffi/) replaces the default, and every frame, and every waker a `park`
-creates, comes from the program's own allocator. Counting the calls shows each frame being returned:
+Each is told the frame's size and the boundary it begins on — the widest any value it holds asks
+for, and never less than the machine's word — and the free is handed back exactly what the
+allocation was asked, as the [program's own heap](/reference/packages/#one-heap-and-the-package-that-names-it)
+is. The compiler defines both over the program's allocator, **weakly**, so a program that defines
+either with [`@export`](/reference/ffi/) replaces the default, and every frame, and every waker a
+`park` creates, comes from the program's own allocator. A definition of another shape is refused at
+its definition. Counting the calls shows each frame being returned:
 
 ```sysl
-extern "malloc" c_malloc(n: usize) -> *u8
+extern "posix_memalign" c_memalign(out: **u8, align: usize, n: usize) -> int
 extern "free" c_free(p: *u8)
 
 static var frames: int = 0
 static var freed: int = 0
 
 @export("sysl_task_alloc")
-task_alloc(size: usize) -> *u8
+task_alloc(size: usize, align: usize) -> *u8
     frames += 1
-    c_malloc(size)
+
+    var p: *u8 = null
+
+    if c_memalign(&p, align, size) != 0 then return null
+
+    p
 
 @export("sysl_task_free")
-task_free(p: *u8)
+task_free(p: *u8, size: usize, align: usize)
     freed += 1
     c_free(p)
 
@@ -821,14 +830,14 @@ and it does not reference `malloc`: its frames come from whatever the program's 
 
 ```sysl build=c target=thumbv7em-freestanding
 // Frames come from a fixed pool the firmware owns, not from a heap.
-extern "pool_take" pool_take(n: usize) -> *u8
-extern "pool_give" pool_give(p: *u8)
+extern "pool_take" pool_take(n: usize, align: usize) -> *u8
+extern "pool_give" pool_give(p: *u8, n: usize)
 
 @export("sysl_task_alloc")
-task_alloc(size: usize) -> *u8 = pool_take(size)
+task_alloc(size: usize, align: usize) -> *u8 = pool_take(size, align)
 
 @export("sysl_task_free")
-task_free(p: *u8) = pool_give(p)
+task_free(p: *u8, size: usize, align: usize) = pool_give(p, size)
 
 async read_sensor(channel: int) -> int
     await yield_now()

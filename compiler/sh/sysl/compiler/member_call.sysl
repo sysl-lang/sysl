@@ -1358,9 +1358,14 @@ private call_declared(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, nam
     // Asked before either path makes the member real, a member with parameters of its own included.
     if !check_impl_condition(cx, span, rty, found.0, chosen.unwrap()) then return bad_expr(span)
 
-    if generic.is_some() && generic.unwrap().tparams.len() > found.1.len() then
+    // **Reach is asked on this path too**: a member with parameters of its own is still a member,
+    // and its modifier binds it as `member_dispatch` binds the rest.
+    if generic.is_some() && generic.unwrap().tparams.len() > found.1.len()
+        check_member_visible(cx, span, found.0, chosen.unwrap(), decl, reach)
+
         return call_generic_member(cx, span, Some(receiver), rty, found.0, decl, generic.unwrap(),
                                    found.1, args, expected, name, targs)
+    end if
 
     // A list written on a member that has no parameters for it. The receiver's arguments are not
     // among them -- they are the *type*'s, settled by the value in hand -- so this is the member's
@@ -2334,7 +2339,7 @@ private chosen_member(cx: &Analyzer, rty: Type, base: string, mname: string, spa
         end if
 
     if fits.len() > 1
-        val chosen = narrowed_at(declared, generic, fitted, args, arg_tys)
+        val chosen = narrowed_at(cx, declared, generic, fitted, args, arg_tys)
 
         if chosen.len() == 1 then return Some(fits[chosen[0]])
     end if
@@ -2343,7 +2348,7 @@ private chosen_member(cx: &Analyzer, rty: Type, base: string, mname: string, spa
 
     if overloads && !provided
         if fits.len() > 1
-            val chosen = narrowed_at(declared, generic, fitted, args, arg_tys)
+            val chosen = narrowed_at(cx, declared, generic, fitted, args, arg_tys)
             var tied: Buf[string] = buf()
 
             for i in chosen
@@ -2760,6 +2765,22 @@ bound_traits(cx: &Analyzer, written: string) -> Buf[string]
 
     keys
 end bound_traits
+
+// The traits `Self` is bound by in the body being read, where that body is a trait default's copy in
+// an implementing type: the trait itself and every trait it requires. The copy is read with `Self` the
+// implementing type, and nothing in its own signature says the trait's body promised only the trait.
+default_self_traits(cx: &Analyzer) -> Buf[string]
+    var keys: Buf[string] = buf()
+    val origin = cx.an.tables.members.default_origin.get(cx.func_name)
+
+    if origin.is_none() then return keys
+
+    val cut = last_dot_in(origin.unwrap())
+
+    if cut.is_some() then push_with_required(cx, origin.unwrap()[0..<cut.unwrap()], &keys)
+
+    keys
+end default_self_traits
 
 // A bound's trait and every trait it requires, each once. **A bound promises what the trait it names
 // requires**: `[T: wire.Codec]` with `trait Codec: Encode` reaches `Encode`'s members through the

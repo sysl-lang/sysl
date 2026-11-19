@@ -951,6 +951,32 @@ print(b.len())
 'len' is a property of 'StrBuilder' — read it as 'value.len', without '()'
 ```
 
+### When the heap may refuse
+
+Every way into a builder that may grow it traps when the heap answers null, as every allocation does
+([memory § An allocation that may fail](/reference/memory/#an-allocation-that-may-fail)). Each has one
+twin answering `Result[_, AllocError]` instead, and a refused twin gathers nothing: `try_push`,
+`try_push_char`, `try_push_int`, `try_push_uint`, `try_push_real`, `try_push_bool`, `try_finish`, and
+the constructors `try_str_builder`, `try_str_builder_with_capacity` and `try_cstring`.
+
+```sysl
+import sysl.text.try_str_builder
+
+var b = try_str_builder().unwrap()
+
+print(b.try_push("n=").is_ok(), b.try_push_int(42).is_ok(), b.len)
+print(b.try_finish().unwrap())
+```
+
+```output
+true true 4
+n=42
+```
+
+`try_finish` copies the bytes once into storage of their own and lays the string over it, so the
+string owns its bytes as `finish`'s does. `+`, interpolation and `to_string` have no twins: they are
+operators and forms with no `Result` to answer in, and a builder is the fallible way to make a string.
+
 ## Reading a value back: the parsers
 
 `ParseError` has `==`, variant by variant and payload by payload.
