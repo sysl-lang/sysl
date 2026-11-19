@@ -549,8 +549,11 @@ end owned_split
 
 // The pending entries something in the module names, in the order they were filed, each taken out of
 // `pending`.
+//
+// `printed` is what the functions whose blocks were let go of named (`referenced_globals`), which
+// answers for them.
 named_entries(pending: Buf[PendingEntry], funcs: Buf[IrFunc], helpers: Buf[IrRuntime], globals: Buf[IrGlobal],
-              asm_lines: Buf[string]) -> Buf[PendingEntry]
+              asm_lines: Buf[string], printed: Set[string] = set()) -> Buf[PendingEntry]
     var out: Buf[PendingEntry] = buf()
 
     if pending.is_empty() then return out
@@ -565,7 +568,11 @@ named_entries(pending: Buf[PendingEntry], funcs: Buf[IrFunc], helpers: Buf[IrRun
     var hits: Set[string] = set()
 
     for f in funcs
-        func_names(f, wanted, names, &hits)
+        if !is_printed(f) then func_names(f, wanted, names, &hits)
+
+    for item in printed
+        if item.starts_with(AsmText) then text_names(item[AsmText.bytes.len..<item.bytes.len], names, &hits)
+        else if wanted.has(item) then hits.add(item)
 
     for h in helpers
         h match
@@ -594,6 +601,15 @@ end named_entries
 // The entry a pending one is emitted as.
 pending_entry(e: *Emit, item: PendingEntry) -> IrFunc = owned_entry(e, item.f, item.sig)
 
+// Every global a body names, into `into` -- what `named_entries` asks of it once its blocks are let go
+// of. An `asm` is kept as its text, under `AsmText`, since what it names is found by reading it.
+referenced_globals(f: IrFunc, into: *Set[string]) = func_names(f, set(), buf(), into)
+
+// The mark an `asm` text is kept under among the names `referenced_globals` collects: no symbol
+// begins with a space.
+private const AsmText: string = " asm "
+
+// With `wanted` empty, every name is a hit.
 private func_names(f: IrFunc, wanted: Set[string], names: Buf[string], hits: *Set[string])
     for b in f.blocks
         for i in b.instrs
@@ -644,7 +660,7 @@ private inst_names(i: Inst, wanted: Set[string], names: Buf[string], hits: *Set[
         val_names(b, wanted, hits)
         val_names(mask.value, wanted, hits)
     InAsm(_, _, text, _, args) ->
-        text_names(text, names, hits)
+        if wanted.is_empty() then hits.add(AsmText + text) else text_names(text, names, hits)
         arg_names(args, wanted, hits)
     InCall(_, _, callee, args, _, _, _, _) ->
         val_names(callee, wanted, hits)
@@ -669,7 +685,7 @@ end arg_names
 
 private val_names(v: Val, wanted: Set[string], hits: *Set[string])
     v match
-        VGlobal(n) -> if wanted.has(n) then hits.add(n)
+        VGlobal(n) -> if wanted.is_empty() || wanted.has(n) then hits.add(n)
         VSplat(_, _, x) -> val_names(*x, wanted, hits)
         VAgg(fs) -> arg_names(fs, wanted, hits)
         VPackedAgg(fs) -> arg_names(fs, wanted, hits)

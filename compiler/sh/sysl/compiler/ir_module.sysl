@@ -134,7 +134,22 @@ end IrBlock
 struct IrFunc
     sig: IrFuncSig
     blocks: Buf[IrBlock]
+
+    // **The blocks already printed**, where a build that wants only the text let go of them as soon
+    // as the function was built (`codegen.sysl`'s `compact`), or empty where `blocks` is the body. The
+    // signature is never in it: it is printed with the module, as every other signature is.
+    printed: string
 end IrFunc
+
+// A function with its blocks, as every pass but the printer reads it.
+ir_func(sig: IrFuncSig, blocks: Buf[IrBlock]) -> IrFunc = IrFunc(sig, blocks, "")
+
+// The same function with its blocks printed and let go of. What the borrowing entries ask of the body
+// afterwards is asked of what `compact_from` kept (`referenced_globals`).
+printed_func(f: IrFunc) -> IrFunc = IrFunc(f.sig, buf(), ir_print_blocks(f))
+
+// Whether the body is printed text rather than blocks.
+is_printed(f: IrFunc) -> bool = f.blocks.is_empty() && f.printed != ""
 
 // A runtime function: one this compiler generated like any other, or one whose LLVM was written by
 // hand and is carried as text under a name.
@@ -179,12 +194,25 @@ ir_print_func(f: IrFunc) -> string
     b.push(sig_define(f.sig))
     b.push(" {\n")
 
-    for item in f.blocks
-        print_block(item, &b)
+    if is_printed(f)
+        b.push(f.printed)
+    else
+        for item in f.blocks
+            print_block(item, &b)
 
     b.push("}\n")
     b.finish()
 end ir_print_func
+
+// A function's blocks as text, as `ir_print_func` writes them between its braces.
+private ir_print_blocks(f: IrFunc) -> string
+    var b = str_builder()
+
+    for item in f.blocks
+        print_block(item, &b)
+
+    b.finish()
+end ir_print_blocks
 
 private print_block(bl: IrBlock, out: *StrBuilder)
     out.push(bl.label)

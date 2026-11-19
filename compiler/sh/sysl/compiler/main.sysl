@@ -20,7 +20,7 @@ val Misused: int = 2
 
 // What `sysl --version` answers. Written here as well as in `package.hocon`, because a program is
 // handed nothing about its own manifest; the test beside this file keeps the two in step.
-const Version: string = "0.11.12"
+const Version: string = "0.11.13"
 
 // The answer to a command line: the lines to say, and the status to exit with. What
 // `--explain-escapes` reports is said on the same channel, in the order it was found.
@@ -1279,7 +1279,11 @@ private test_project(file: string, named: Option[string], cc: Option[string], gi
     // What this build's C reads is gathered afresh: it is part of where the binary is kept.
     clear_files_read()
 
+    // The link child takes the suite the build child compiled (`test_child.sysl`) rather than compiling it.
+    val stashed = test_build_stashed()
+
     val made_build = if std then std_test_build_of(file, named)
+    else if stashed.is_some() then test_build_restored(file, named, stashed.unwrap())
     else test_build_of(file, named, level)
 
     val build = made_build match
@@ -1301,6 +1305,17 @@ private test_project(file: string, named: Option[string], cc: Option[string], gi
     // Refused programs and no `@test` function the filter keeps: there is no binary to link.
     if selected_in(build.tests, opts.filter, within).is_empty()
         return tests_run(file, "", build.tests, opts, seconds, false, run, note, report, within, keep)
+
+    // **A build child links nothing itself**: it hands the compiled suite to a fresh child and exits
+    // (`test_child.sysl`), so the link's clangs never run beside what the compilation left behind.
+    if !std && stashed.is_none()
+        test_build_child() match
+            Some(child) ->
+                return stash_written(child.0, StashedBuild(build.emitted.text, build.emitted.links,
+                                                           build.emitted.archives, build.tests,
+                                                           files_read_since(0)), note)
+            None -> ()
+    end if
 
     val made = build_test_binary_cached(file, build, cc, level, key) match
         Err(refusal) ->

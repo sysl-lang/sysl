@@ -83,12 +83,24 @@ private variant_test(e: *Emit, enum_ty: Type, variant: EnumVariant, args: Buf[TP
     r
 end variant_test
 
-// A value's tag: the value itself where the enum is simple, and the first slot otherwise.
+// A value's tag: the value itself where the enum is simple or where the `match` holds only the tag
+// (`tag_held`), and the first slot otherwise.
 private tag_of(e: *Emit, d: &EnumType, value: Val) -> Val
-    if d.simple then return value
+    if d.simple || bare_tag(e, value) then return value
 
     extracted_tag(e, d, value)
 end tag_of
+
+private bare_tag(e: *Emit, value: Val) -> bool
+    val name = value match
+        VReg(n) -> n
+        _ -> return false
+
+    for item in e.bare_tags
+        if item == name then return true
+
+    false
+end bare_tag
 
 private extracted_tag(e: *Emit, d: &EnumType, value: Val) -> Val
     val t = fresh_reg(e)
@@ -172,15 +184,21 @@ private binds_shallow(arms: Buf[TArm]) -> bool
     true
 end binds_shallow
 
-// The tag of the enum at `at`, as the first slot of an otherwise empty value of its type -- the one
-// word a tag switch reads (`load_held` makes the same value).
-private tag_held(e: *Emit, d: &EnumType, at: Val) -> Val
+// The tag of the enum at `at`, loaded alone and standing for the scrutinee: the one word a tag switch
+// or a tag test reads, and every reader of it asks `tag_of`, which answers the register as it is. No
+// value of the enum's type is built around it -- for a large enum that was a whole aggregate made an
+// LLVM value, by an `insertvalue` into `poison`, only for the switch to `extractvalue` the word back.
+// The `match` that asked for it lets it go where it ends (`gen_match`).
+private tag_held(e: *Emit, at: Val) -> Val
     val tag = fresh_reg(e)
-    val r = fresh_reg(e)
 
     emit(e, InLoad(tag, l_i32(), at, AccPlain, None))
-    emit(e, InInsert(r, enum_lty(d), VPoison, l_i32(), tag, index_list(0)))
-    r
+
+    tag match
+        VReg(name) -> e.bare_tags.push(name)
+        _ -> ()
+
+    tag
 end tag_held
 
 // One field of a variant's payload, or nothing where the field is zero-sized -- the same skipping
@@ -260,6 +278,7 @@ gen_match(e: *Emit, scrutinee: TExpr, arms: Buf[TArm], ty: Type, into: Option[Va
     // as a value, stored again for a payload to be read out of, and bound a third time.
     val sty = texpr_type(scrutinee)
     val moving = e.layout.indirect(sty) && any_moves(e, arms, into.is_some())
+    val tags_mark = e.bare_tags.len()
     var sv: Val = VNothing
     var at: Option[Val] = held
 
@@ -278,11 +297,12 @@ gen_match(e: *Emit, scrutinee: TExpr, arms: Buf[TArm], ty: Type, into: Option[Va
                     tag_switch(arms) match
                         Some(dispatch) ->
                             val h = address(e, scrutinee)
-                            val tag = tag_held(e, d, h)
+                            val tag = tag_held(e, h)
                             val done_l = fresh_label(e, "match.end")
                             val merge = merge_for(e, ty, into, in_place)
 
                             gen_tag_switch(e, dispatch, tag, Some(h), ty, merge, done_l, true)
+                            e.bare_tags.truncate(tags_mark)
                             emit_label(e, done_l)
                             ends_nowhere(e, ty)
                             return merged_value(e, merge, ty)
@@ -311,6 +331,7 @@ gen_match(e: *Emit, scrutinee: TExpr, arms: Buf[TArm], ty: Type, into: Option[Va
         Some(d) -> gen_tag_switch(e, d, sv, at, ty, slot, end_l)
         None -> gen_arm_chain(e, arms, sv, at, ty, slot, end_l)
 
+    e.bare_tags.truncate(tags_mark)
     emit_label(e, end_l)
     ends_nowhere(e, ty)
 
@@ -394,22 +415,16 @@ end any_moves
 // slot's count being the one released.
 //
 // Where no arm reads anything but the tag -- each one moves its payload through the address, or tests
-// a variant without binding or testing what it carries -- only the tag is loaded, into an otherwise
-// empty value of the enum's type: loading the whole of it would be the second copy of the result this
-// exists to avoid, left to the optimizer to notice it is dead.
+// a variant without binding or testing what it carries -- only the tag is loaded, and stands for the
+// scrutinee (`tag_held`): loading the whole of it would be the second copy of the result this exists
+// to avoid, left to the optimizer to notice it is dead.
 private load_held(e: *Emit, at: Val, ty: Type, arms: Buf[TArm], into: bool) -> Val
-    val r = fresh_reg(e)
-
     enum_decl(ty) match
         Some(d) ->
-            if !d.simple && tags_only(e, arms, into)
-                val tag = fresh_reg(e)
-
-                emit(e, InLoad(tag, l_i32(), at, AccPlain, None))
-                emit(e, InInsert(r, enum_lty(d), VPoison, l_i32(), tag, index_list(0)))
-                return r
-            end if
+            if !d.simple && tags_only(e, arms, into) then return tag_held(e, at)
         None -> ()
+
+    val r = fresh_reg(e)
 
     emit(e, InLoad(r, lty(e, ty), at, AccPlain, None))
     r
