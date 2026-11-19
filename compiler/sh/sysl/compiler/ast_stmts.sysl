@@ -401,6 +401,21 @@ struct FuncMarks
     // rounded twice (`no_fuse.sysl`). Carried to every lowered copy and every instantiation.
     no_fuse: bool
 
+    // `@extensions("crc", "aes")` above a function or a member: the processor's optional instructions
+    // the body is compiled to use beyond what the build promises, each as LLVM names the feature
+    // (`extensions.sysl`). It reaches the `define` line as `"target-features"`, and every call of the
+    // function from code that does not have them is refused unless it is inside `@unchecked("...")`
+    // naming them. Carried to every lowered copy -- a member's free function, each instantiation --
+    // and given to every closure and nested function written inside, by span.
+    extensions: Buf[string]
+
+    // `@frame_limit(n)` above a function or a member: the most bytes its stack frame may take, `0`
+    // where none was written; `@frame_limit(none)` sets `frame_exempt` instead -- no limit, whatever
+    // the package or the build says (`frame_limit.sysl`). Carried to every lowered copy, and given to
+    // every closure and nested function written inside.
+    frame_limit: long
+    frame_exempt: bool
+
     // Whether any of the three was written.
     any(self) -> bool = self.noinline || self.cold || self.inline
 
@@ -418,7 +433,8 @@ end FuncMarks
 // A definition nothing was said about.
 no_marks() -> FuncMarks = FuncMarks(false, false, false, None, buf(), false, None, false, false,
                                     false, false, false, false, false, false, buf(), false, buf(), buf(),
-                                    false, false, false, false, buf(), buf(), buf(), false, false)
+                                    false, false, false, false, buf(), buf(), buf(), false, false, buf(), 0,
+                                    false)
 
 // A method of a struct, an enum, a trait or an `impl` block.
 struct MethodDecl
@@ -581,6 +597,9 @@ enum Attr
     // `@unchecked(Send)` / `@unchecked(Share)` above a struct: the program promises the struct may
     // cross, which its fields alone do not show.
     Promises(names: Buf[string])
+    // `@extensions("crc", "aes")` above a function or a member: the processor's extensions its body
+    // is compiled to use (`extensions.sysl`).
+    Extensions(names: Buf[string])
     Needs(caps: Buf[string])
     NoInline
     // `@inline`, or `@inline(always)` where `always` is set.
@@ -595,6 +614,8 @@ enum Attr
     MainThread
     Pinned
     Pins
+    // `@unique` above a struct or an enum: a value of it has one owner.
+    Unique
     // `@no_alloc` above a function or a method: the capability it gives up, as the word after `no_`.
     Forgoes(cap: string)
     // `@blocks` above a function, a method or an `extern`: reaching it may wait.
@@ -619,6 +640,9 @@ enum Attr
     NoFuse
     // `@track_caller` above a function or a member: what it reports names the line that called it.
     TrackCaller
+    // `@frame_limit(n)` above a function or a member: the most bytes its stack frame may take, or no
+    // limit where `limit` is nothing (`@frame_limit(none)`).
+    FrameLimit(limit: Option[long])
     // `@annotation` above a struct: the struct is an annotation a program writes as `@Name(...)`.
     AnnotationMark
     // `@rename("id")` above a type: an annotation the program declared, not one of the language's.
@@ -686,6 +710,7 @@ attr_word(a: Attr) -> string = a match
     Bounded(_) -> "bounded"
     Guards(_) -> "guards"
     Promises(_) -> "unchecked"
+    Extensions(_) -> "extensions"
     Needs(_) -> "needs"
     NoInline -> "noinline"
     Inline(always) -> if always then "inline(always)" else "inline"
@@ -697,6 +722,7 @@ attr_word(a: Attr) -> string = a match
     MainThread -> "main_thread"
     Pinned -> "pinned"
     Pins -> "pins"
+    Unique -> "unique"
     Forgoes(cap) -> s"no_$cap"
     Blocks -> "blocks"
     StrictFp -> "strict_fp"
@@ -704,6 +730,7 @@ attr_word(a: Attr) -> string = a match
     Checked -> "checked"
     NoFuse -> NoFuseWord
     TrackCaller -> "track_caller"
+    FrameLimit(_) -> "frame_limit"
     Relocates -> "relocates"
     Views(_) -> "views"
     Consumes -> "consumes"
@@ -782,6 +809,9 @@ struct StructDecl
     // `@unchecked(Send)` / `@unchecked(Share)` above it: the program's promise that the struct may
     // cross, where its fields alone do not show it (`promises.sysl`).
     promised: Buf[string]
+
+    // `@unique`: a value of it has one owner, so a by-value use moves it (`unique_moves.sysl`).
+    unique: bool
 end StructDecl
 
 // What `in S` adds to the field at `field` (its position in `fields`): the type C declares it with,
@@ -821,6 +851,9 @@ struct EnumDecl
     // `@export("PREFIX")` above a simple enum: a generated header defines one constant per variant,
     // `PREFIX_VARIANT`, to its value.
     export: Option[ExportAttr]
+
+    // `@unique`: a value of it has one owner, so a by-value use moves it (`unique_moves.sysl`).
+    unique: bool
 end EnumDecl
 
 // `new 1..100` on a constrained type -- the range its values must lie in.

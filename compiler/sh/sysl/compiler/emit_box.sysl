@@ -233,33 +233,117 @@ end open_box_zeroed
 
 // The bytes one box occupies, asked of LLVM rather than computed here: a `getelementptr` one past
 // null, read back as an integer, is the size of what was stepped over.
+//
+// **A null answer traps here, before anything is stored** (`reference/memory.md § An allocation that
+// may fail`); `try_heap` asks `box_heap_call` itself and branches on the answer instead.
 private allocate_box(e: *Emit, bn: LType, inner: Type, zeroed: bool) -> Val
+    val asked = box_heap_call(e, bn, inner, zeroed)
+    val p = asked.0
+    val got = fresh_reg(e)
+
+    emit(e, InIntCmp(got, INe, LPtr, p, VNull))
+    trap_unless(e, got, "alloc")
+    clear_unless_zeroed(e, p, asked.1, inner, zeroed)
+    p
+end allocate_box
+
+// The heap's answer for one box of `inner` -- which may be null -- and the size it was asked for.
+private box_heap_call(e: *Emit, bn: LType, inner: Type, zeroed: bool) -> (Val, Val)
+    val size = lty_size(e, bn)
+
+    (heap_call(e, size, inner, "a box", zeroed), size)
+
+// The bytes a value of LLVM type `t` occupies, asked of LLVM rather than computed here: a
+// `getelementptr` one past null, read back as an integer, is the size of what was stepped over.
+lty_size(e: *Emit, t: LType) -> Val
     val end = fresh_reg(e)
 
     var idx: Buf[IrArg] = buf()
 
     idx.push(ir_arg(l_i32(), VInt(from_int(1))))
-    emit(e, InGep(end, bn, VNull, idx))
+    emit(e, InGep(end, t, VNull, idx))
 
     val size = fresh_reg(e)
 
     emit(e, InCast(size, CastPtrToInt, LPtr, end, word_lty(e)))
+    size
+end lty_size
 
-    val p = heap_call(e, size, inner, "a box", zeroed)
+// `try_heap(v)`: the box `gen_box` makes, as `Some(box)`, where the heap answered -- and `None`, with
+// nothing stored and no count taken, where it answered null. The value is produced before the heap is
+// asked, so a temporary it made is released at the statement's end on either arm; the box takes its
+// own share of what the value holds (`retain_value`) on the arm that has a box, rather than taking a
+// temporary's share over, which the other arm would then have to give back.
+gen_try_heap(e: *Emit, boxed: TExpr, opt_ty: Type) -> Val
+    val (value, ref_ty) = *boxed.kind match
+        TBox(v, rt) -> (v, rt)
+        _ -> return gap_at(e, "a fallible box over something that is not a box")
+
+    val d = enum_decl(opt_ty)
+
+    if d.is_none() then return gap_at(e, "a fallible box whose answer is not an option")
+
+    val some = d.unwrap().variant("Some")
+    val none = d.unwrap().variant("None")
+
+    if some.is_none() || none.is_none() then return gap_at(e, "a fallible box whose option has no variants")
+
+    val inner = ref_inner(ref_ty)
+    val v = gen_expr(e, value)
+    val olt = lty(e, opt_ty)
+    val result = alloca(e, fresh_reg(e), olt)
+    val bn = box_lty(e, inner)
+    val p = box_heap_call(e, bn, inner, false).0
     val got = fresh_reg(e)
+    val given = fresh_label(e, "trybox.given")
+    val refused = fresh_label(e, "trybox.refused")
+    val joined = fresh_label(e, "trybox.end")
 
     emit(e, InIntCmp(got, INe, LPtr, p, VNull))
-    trap_unless(e, got, "alloc")
-    clear_unless_zeroed(e, p, size, inner, zeroed)
-    p
-end allocate_box
+    emit_term(e, InCondBr(got, given, refused))
+    emit_label(e, given)
+    emit(e, InStore(word_lty(e), VInt(from_int(1)), p, AccPlain, None))
 
-// The call that takes `size` bytes from the heap for storage of `t`: the allocating pair's, or the
-// aligned hook's where `t` asks for a boundary beyond what the pair promises (`beyond_heap`). The
-// aligned block goes back through the hook's own free, `sysl_free_aligned`, which the type's drop
-// hook calls (`emit_arc.sysl`'s `drop_fn`).
+    // As `open_box_zeroed` writes it: a compact box has the strong count alone (`compact_box.sysl`).
+    if !is_compact(e, inner)
+        store_header_word(e, bn, p, 1, LPtr, drop_fn(e, inner))
+        store_header_word(e, bn, p, 2, word_lty(e), VInt(from_int(1)))
+
+    if e.layout.size(inner) > 0
+        val slot = fresh_reg(e)
+
+        var idx: Buf[IrArg] = buf()
+
+        idx.push(ir_arg(l_i32(), VInt(from_int(0))))
+        idx.push(ir_arg(l_i32(), VInt(from_int(long(box_payload_field(e, inner))))))
+        emit(e, InGep(slot, bn, p, idx))
+        retain_value(e, inner, v)
+        emit(e, InStore(lty(e, inner), v, slot, AccPlain, None))
+    end if
+
+    var carried: Buf[Val] = buf()
+
+    carried.push(p)
+    emit(e, InStore(olt, enum_value(e, opt_ty, d.unwrap(), some.unwrap(), carried), result, AccPlain, None))
+    emit_term(e, InBr(joined))
+    emit_label(e, refused)
+
+    var empty: Buf[Val] = buf()
+
+    emit(e, InStore(olt, enum_value(e, opt_ty, d.unwrap(), none.unwrap(), empty), result, AccPlain, None))
+    emit_term(e, InBr(joined))
+    emit_label(e, joined)
+
+    val r = fresh_reg(e)
+
+    emit(e, InLoad(r, olt, result, AccPlain, None))
+    own_temp(e, r, opt_ty)
+end gen_try_heap
+
+// The call that takes `size` bytes from the heap for storage of `t`, on the boundary `block_align`
+// says (`heap_take`).
 //
-// `what` is how the refusal names the storage, where there is no aligned hook to call
+// `what` is how the refusal names the storage, where libc's pair cannot answer the boundary
 // (`unaligned_heap`).
 //
 // **`zeroed` asks for storage that is all zero bytes**, which is the heap's zeroing call where it has
@@ -283,20 +367,112 @@ private heap_call(e: *Emit, size: Val, t: Type, what: string, zeroed: bool) -> V
         return p
     end if
 
+    val a = e.layout.align(t)
+
+    heap_take(e, p, size, block_align(e, t),
+              s"$what of '${type_show(t)}' asks for the $a-byte boundary its type is aligned on")
+end heap_call
+
+// The boundary a block holding `t` is taken on and given back with: the type's own, and never less
+// than the word every header begins with.
+block_align(e: *Emit, t: Type) -> usize
+    val word = e.layout.pointer_bytes()
+    val a = e.layout.align(t)
+
+    if a > word then a else word
+end block_align
+
+// **The one call that takes a block from the heap**, into `p`: `size` bytes on `align`.
+//
+// A pair that is told sizes (`heap_sized`) is called `alloc(size, align)` for every block. libc's is
+// called as libc declares it, `malloc(size)`, where `align` is within what `malloc` promises
+// (`heap_align`), and a block past that comes from the C library's aligned allocation through
+// `sysl.heap.alloc_aligned` (`request_aligned_heap`) -- which `said` describes to the refusal where
+// there is none (`unaligned_heap`).
+heap_take(e: *Emit, p: Val, size: Val, align: usize, said: string) -> Val
+    var args: Buf[IrArg] = buf()
+
     args.push(ir_arg(word_lty(e), size))
 
-    if e.layout.beyond_heap(t)
-        val a = e.layout.align(t)
-
-        args.push(ir_arg(word_lty(e), VInt(from_int(long(a)))))
+    if heap_sized()
+        args.push(ir_arg(word_lty(e), VInt(from_int(long(align)))))
+        emit(e, ir_call(Some(p), LPtr, VGlobal(malloc_symbol()), args))
+    else if align > e.layout.heap_align()
+        args.push(ir_arg(word_lty(e), VInt(from_int(long(align)))))
         emit(e, ir_call(Some(p), LPtr, VGlobal(aligned_alloc_symbol()), args))
-        note_aligned_heap(e, s"$what of '${type_show(t)}' asks for the $a-byte boundary its type is " +
-            "aligned on", a)
+        note_aligned_heap(e, said, align)
     else
         emit(e, ir_call(Some(p), LPtr, VGlobal(malloc_symbol()), args))
 
     p
-end heap_call
+end heap_take
+
+// **The one call that gives a block back**: the one at `p`, taken with `size` bytes on `align` --
+// `free(p, size, align)` to a pair told sizes, and `free(p)` (or `sysl.heap.free_aligned(p)` past
+// `malloc`'s boundary) to libc's, which is the one case `size` may be `VNothing`.
+heap_give(e: *Emit, p: Val, size: Val, align: usize)
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(LPtr, p))
+
+    if heap_sized()
+        args.push(ir_arg(word_lty(e), size))
+        args.push(ir_arg(word_lty(e), VInt(from_int(long(align)))))
+        emit(e, ir_call(None, LVoid, VGlobal(free_symbol()), args))
+    else if align > e.layout.heap_align()
+        e.aligned_frees = true
+        emit(e, ir_call(None, LVoid, VGlobal(aligned_free_symbol()), args))
+    else
+        emit(e, ir_call(None, LVoid, VGlobal(free_symbol()), args))
+end heap_give
+
+// The same two calls as text, for the runtime blocks written by hand: `%dest = …` taking `size` (a
+// register or a constant, written as it stands) bytes on `align`, and the call giving `p` back. A
+// block written by hand never asks past `malloc`'s boundary, so libc's pair is called as it is.
+heap_take_text(e: *Emit, dest: string, size: string, align: usize) -> string
+    val w = s"i${e.word_bits}"
+
+    if heap_sized() then s"  $dest = call ptr @${malloc_symbol()}($w $size, $w $align)\n"
+    else s"  $dest = call ptr @${malloc_symbol()}($w $size)\n"
+end heap_take_text
+
+heap_give_text(e: *Emit, p: string, size: string, align: usize) -> string
+    val w = s"i${e.word_bits}"
+
+    if heap_sized() then s"  call void @${free_symbol()}(ptr $p, $w $size, $w $align)\n"
+    else s"  call void @${free_symbol()}(ptr $p)\n"
+end heap_give_text
+
+// The bytes a buffer of `n` elements of `elem` occupies: its header, any pad, and the elements --
+// what `gen_buffer` took, without the overflow checks, since a buffer that exists already fit.
+buffer_bytes(e: *Emit, elem: Type, n: Val) -> Val
+    val esz = lty_size(e, stride_lty(e, elem))
+    val h1 = fresh_reg(e)
+
+    var hidx: Buf[IrArg] = buf()
+
+    hidx.push(ir_arg(l_i32(), VInt(from_int(0))))
+    hidx.push(ir_arg(l_i32(), VInt(from_int(long(buf_elems_field(e, elem))))))
+    emit(e, InGep(h1, buf_lty(e, elem), VNull, hidx))
+
+    val hsz = fresh_reg(e)
+
+    emit(e, InCast(hsz, CastPtrToInt, LPtr, h1, word_lty(e)))
+
+    val bytes = fresh_reg(e)
+    val total = fresh_reg(e)
+
+    emit(e, InBin(bytes, OpMul, word_lty(e), n, esz))
+    emit(e, InBin(total, OpAdd, word_lty(e), bytes, hsz))
+    total
+end buffer_bytes
+
+// **The word slot storage carries in front of its header** where the pair is told sizes: the
+// storage's fourth header word is the live prefix the slot forms move (`slots.sysl`), not the length
+// it was made with, so that length is laid one boundary before the header -- far enough that the
+// header still begins on the block's boundary -- and the hook gives the block back from there
+// (`emit_arc.sysl`'s `slot_buf_free`). Nothing in front where libc's pair needs no size.
+slot_lead(e: *Emit, elem: Type) -> usize = if heap_sized() then block_align(e, elem) else 0
 
 // The zeroing call a block for `t` is taken with, where there is one to take it with: not for storage
 // the aligned hook makes, and not on a machine with no C library promised under it.
@@ -341,7 +517,108 @@ gen_buffer(e: *Emit, elem: Type, n: Val) -> (Val, Val) = gen_buffer_zeroed(e, el
 
 // The same, with every element's bytes zero before anything is written into them where `zeroed`
 // asks (`heap_call`): a fill of zeros, which then writes nothing.
-gen_buffer_zeroed(e: *Emit, elem: Type, n: Val, zeroed: bool) -> (Val, Val)
+gen_buffer_zeroed(e: *Emit, elem: Type, n: Val, zeroed: bool) -> (Val, Val) = gen_buffer_led(e, elem, n, zeroed, 0)
+
+// The buffer `slot_storage` makes, with the length it was made with laid in front of it where the
+// pair is told sizes (`slot_lead`).
+gen_slot_buffer(e: *Emit, elem: Type, n: Val) -> (Val, Val) = gen_buffer_led(e, elem, n, false, slot_lead(e, elem))
+
+// The buffer, `lead` bytes into its block: the block is taken that much longer, its first word holds
+// `n`, and the box begins after the lead.
+private gen_buffer_led(e: *Emit, elem: Type, n: Val, zeroed: bool, lead: usize) -> (Val, Val)
+    val sized = buffer_size(e, elem, n, lead)
+
+    trap_unless(e, sized.1, "size")
+
+    val block = heap_call(e, sized.0, elem, "a buffer", zeroed)
+    val got = fresh_reg(e)
+
+    emit(e, InIntCmp(got, INe, LPtr, block, VNull))
+    trap_unless(e, got, "alloc")
+    clear_unless_zeroed(e, block, sized.0, elem, zeroed)
+
+    val p = past_lead(e, block, n, lead)
+
+    (p, buffer_header(e, elem, p, n))
+end gen_buffer_led
+
+// The box in a block taken `lead` bytes longer than it: the block's first word holds `n`, and the box
+// begins after the lead. With no lead the block is the box.
+private past_lead(e: *Emit, block: Val, n: Val, lead: usize) -> Val
+    if lead == 0 then return block
+
+    emit(e, InStore(word_lty(e), n, block, AccPlain, None))
+
+    val p = fresh_reg(e)
+
+    var lidx: Buf[IrArg] = buf()
+
+    lidx.push(ir_arg(word_lty(e), VInt(from_int(long(lead)))))
+    emit(e, InGep(p, LInt(8), block, lidx))
+    p
+end past_lead
+
+// **`slot_storage`'s box where the heap may refuse it**, for `try_slot_storage`: the box, the address
+// its elements start at, and whether there is one. The block carries the same lead `gen_slot_buffer`
+// lays in front of the box (`slot_lead`). A size that does not fit in a word asks the heap for nothing
+// and answers as a refusal does; so does a null from the heap. The lead and the header are written on
+// the arm that has a block to write them into, so the box and the address mean something only where
+// the flag is true, and the caller branches on it in the block this leaves it in.
+gen_try_buffer(e: *Emit, elem: Type, n: Val) -> (Val, Val, Val)
+    val lead = slot_lead(e, elem)
+    val sized = buffer_size(e, elem, n, lead)
+    val p_slot = alloca(e, fresh_reg(e), LPtr)
+    val ask = fresh_label(e, "trybuf.ask")
+    val after = fresh_label(e, "trybuf.end")
+
+    emit(e, InStore(LPtr, VNull, p_slot, AccPlain, None))
+    emit_term(e, InCondBr(sized.1, ask, after))
+    emit_label(e, ask)
+
+    val asked = heap_call(e, sized.0, elem, "a buffer", false)
+
+    emit(e, InStore(LPtr, asked, p_slot, AccPlain, None))
+    emit_term(e, InBr(after))
+    emit_label(e, after)
+
+    val p = fresh_reg(e)
+
+    emit(e, InLoad(p, LPtr, p_slot, AccPlain, None))
+
+    val got = fresh_reg(e)
+
+    emit(e, InIntCmp(got, INe, LPtr, p, VNull))
+
+    val write = fresh_label(e, "trybuf.write")
+    val done = fresh_label(e, "trybuf.done")
+    val box_slot = alloca(e, fresh_reg(e), LPtr)
+    val data_slot = alloca(e, fresh_reg(e), LPtr)
+
+    emit(e, InStore(LPtr, VNull, box_slot, AccPlain, None))
+    emit(e, InStore(LPtr, VNull, data_slot, AccPlain, None))
+    emit_term(e, InCondBr(got, write, done))
+    emit_label(e, write)
+
+    val boxed = past_lead(e, p, n, lead)
+
+    emit(e, InStore(LPtr, boxed, box_slot, AccPlain, None))
+    emit(e, InStore(LPtr, buffer_header(e, elem, boxed, n), data_slot, AccPlain, None))
+    emit_term(e, InBr(done))
+    emit_label(e, done)
+
+    val box = fresh_reg(e)
+    val data = fresh_reg(e)
+
+    emit(e, InLoad(box, LPtr, box_slot, AccPlain, None))
+    emit(e, InLoad(data, LPtr, data_slot, AccPlain, None))
+    (box, data, got)
+end gen_try_buffer
+
+// The bytes a buffer of `n` elements occupies, header and `lead` included, and whether that fits in a
+// word: the size is computed with the checked forms, since a count the program worked out can be
+// anything, and a multiplication that wrapped would ask for a block far smaller than the elements
+// written into it.
+private buffer_size(e: *Emit, elem: Type, n: Val, lead: usize) -> (Val, Val)
     val bn = buf_lty(e, elem)
 
     e.checked = true
@@ -370,22 +647,29 @@ gen_buffer_zeroed(e: *Emit, elem: Type, n: Val, zeroed: bool) -> (Val, Val)
     emit(e, InCast(hsz, CastPtrToInt, LPtr, h1, word_lty(e)))
 
     val bytes = size_op(e, "mul", n, esz)
-    val total = size_op(e, "add", bytes.0, hsz)
+    val boxed = size_op(e, "add", bytes.0, hsz)
+    val total = if lead == 0 then boxed else size_op(e, "add", boxed.0, VInt(from_int(long(lead))))
     val over = fresh_reg(e)
 
-    emit(e, InBin(over, OpOr, l_i1(), bytes.1, total.1))
+    emit(e, InBin(over, OpOr, l_i1(), bytes.1, boxed.1))
+
+    var wrapped = over
+
+    if lead > 0
+        wrapped = fresh_reg(e)
+        emit(e, InBin(wrapped, OpOr, l_i1(), over, total.1))
 
     val fits = fresh_reg(e)
 
-    emit(e, InBin(fits, OpXor, l_i1(), over, VBool(true)))
-    trap_unless(e, fits, "size")
+    emit(e, InBin(fits, OpXor, l_i1(), wrapped, VBool(true)))
+    (total.0, fits)
+end buffer_size
 
-    val p = heap_call(e, total.0, elem, "a buffer", zeroed)
-    val got = fresh_reg(e)
+// A buffer's header written into the box the heap answered -- one strong count, the hook, one weak
+// share, the length -- and the address its elements start at.
+private buffer_header(e: *Emit, elem: Type, p: Val, n: Val) -> Val
+    val bn = buf_lty(e, elem)
 
-    emit(e, InIntCmp(got, INe, LPtr, p, VNull))
-    trap_unless(e, got, "alloc")
-    clear_unless_zeroed(e, p, total.0, elem, zeroed)
     emit(e, InStore(word_lty(e), VInt(from_int(1)), p, AccPlain, None))
     store_header_word(e, bn, p, 1, LPtr, drop_buf_fn(e, elem))
     store_header_word(e, bn, p, 2, word_lty(e), VInt(from_int(1)))
@@ -398,8 +682,8 @@ gen_buffer_zeroed(e: *Emit, elem: Type, n: Val, zeroed: bool) -> (Val, Val)
     didx.push(ir_arg(l_i32(), VInt(from_int(0))))
     didx.push(ir_arg(l_i32(), VInt(from_int(long(buf_elems_field(e, elem))))))
     emit(e, InGep(data, bn, p, didx))
-    (p, data)
-end gen_buffer_zeroed
+    data
+end buffer_header
 
 // One step of a size computation, with the overflow flag beside the answer. The intrinsic carries
 // its width in the **name** as well as in the signature, so a size computed at the machine's own
@@ -447,7 +731,11 @@ end size_op
 // is the count this view holds.
 buffer_view(e: *Emit, slice_ty: Type, box: Val, data: Val, n: Val) -> Val
     e.maybe_heap = true
+    own_temp(e, view_parts(e, slice_ty, box, data, n), slice_ty)
+end buffer_view
 
+// The three words of a view over a buffer, owned by nobody yet.
+view_parts(e: *Emit, slice_ty: Type, box: Val, data: Val, n: Val) -> Val
     val lt = lty(e, slice_ty)
     val with_owner = fresh_reg(e)
 
@@ -460,8 +748,8 @@ buffer_view(e: *Emit, slice_ty: Type, box: Val, data: Val, n: Val) -> Val
     val whole = fresh_reg(e)
 
     emit(e, InInsert(whole, lt, with_ptr, word_lty(e), n, index_list(2)))
-    own_temp(e, whole, slice_ty)
-end buffer_view
+    whole
+end view_parts
 
 // -- an array whose storage a view outlives -------------------------------------------------------------
 
@@ -690,28 +978,20 @@ private array_length(ty: Type) -> int = underlying(ty) match
     Array(n, _) -> n
     _ -> 0
 
-// -- the aligned hook ----------------------------------------------------------------------------------
+// -- past `malloc`'s boundary --------------------------------------------------------------------------
 
-// **Storage of a type aligned beyond what the allocating pair promises comes from a second pair**:
-// `sysl_alloc_aligned(size, align)`, answering a block on that boundary or null, and
-// `sysl_free_aligned(p)`, giving one back. A box, a buffer or a task frame of such a type is made by
-// the first, and its drop hook calls the second (`emit_arc.sysl`'s `drop_fn`). Where the allocating
-// pair is libc's and the C library has an aligned allocation, `weak` defaults are written over it --
+// **A block libc's `malloc` cannot answer comes from the C library's aligned allocation.** Where the
+// pair is libc's and a block's boundary is past what `malloc` promises (`heap_align`), it is taken by
+// `sysl.heap.alloc_aligned(size, align)` and given back by `sysl.heap.free_aligned(p)`, written over
 // `posix_memalign` and `free` on a POSIX system and WASI, `_aligned_malloc` and `_aligned_free` on
-// Windows -- and a program's own `@export` (or an `extern` naming one) wins. Anywhere else -- a pair a
-// manifest named, a machine with no C library -- the program answers both, and one that makes such
-// storage without doing so is refused (`emit_checks.sysl`'s `check_aligned_heap`). A program that
-// never makes such storage never names either.
-aligned_alloc_symbol() -> string =
-    if alloc_counting_active() then counted_aligned_symbol() else "sysl_alloc_aligned"
+// Windows. A pair told sizes (`heap_sized`) needs neither: it is handed every block's boundary itself.
+// Under libc's pair on a machine with no C library there is nothing to answer the boundary with, and a
+// program putting such a block on its heap there is refused (`emit_checks.sysl`'s
+// `check_aligned_heap`). The two are the compiler's, not hooks: a program wanting its own answer names
+// a heap of its own.
+aligned_alloc_symbol() -> string = "sysl.heap.alloc_aligned"
 
-aligned_free_symbol() -> string =
-    if alloc_counting_active() then counted_aligned_free_symbol() else "sysl_free_aligned"
-
-// The aligned pair of a counted build, which the counting runtime defines (`alloc_count.sysl`).
-counted_aligned_symbol() -> string = "sysl_count_alloc_aligned"
-
-counted_aligned_free_symbol() -> string = "sysl_count_free_aligned"
+aligned_free_symbol() -> string = "sysl.heap.free_aligned"
 
 // Whether a C library is under this target for the aligned defaults to be written over -- the ONE
 // question the defaults and the refusal (`emit_checks.sysl`'s `check_aligned_heap`) ask about it.
@@ -734,49 +1014,42 @@ private var unaligned: Option[(string, string, usize)] = None
 
 unaligned_heap() -> Option[(string, string, usize)] = unaligned
 
-// The default, where one can be written; otherwise what the refusal is about. Asked once every body
-// is lowered, since that is when the module knows whether anything needed the hook.
-request_aligned_heap(e: *Emit, p: TProgram)
+// Whether this module calls either of the two (`heap_take`, `heap_give`).
+aligned_heap_used(e: *Emit) -> bool = !heap_sized() && (!e.aligned_heap.is_empty() || e.aligned_frees)
+
+// The two written, where there is a C library to write them over; otherwise what the refusal is
+// about. Asked once every body is lowered, since that is when the module knows whether anything
+// needed them. `weak`, so every codegen unit may carry them and the link keeps one.
+request_aligned_heap(e: *Emit)
     unaligned = None
 
-    if e.aligned_heap.is_empty() || alloc_counting_active() then return
+    if !aligned_heap_used(e) then return
+
+    val c_pair = c_aligned_pair(e.target)
+
+    if c_pair.is_none()
+        if !e.aligned_heap.is_empty() then unaligned = Some(e.aligned_heap[0])
+
+        return
 
     val alloc = aligned_alloc_symbol()
     val free = aligned_free_symbol()
-    val alloc_open = !claimed_symbol(e, p, alloc)
-    val free_open = !claimed_symbol(e, p, free)
-
-    if !alloc_open && !free_open then return
-
-    val libc_pair = malloc_symbol() == "malloc" && free_symbol() == "free"
-    val c_pair = if libc_pair then c_aligned_pair(e.target) else None
-
-    if c_pair.is_none()
-        unaligned = Some(e.aligned_heap[0])
-        return
-    end if
-
     val names = c_pair.unwrap()
     val w = s"i${e.word_bits}"
     val pre = e.target.preemption()
+    val body = if names.0 == "posix_memalign" then posix_aligned_body(w) else direct_aligned_body(names.0, w)
 
-    if alloc_open
-        val body = if names.0 == "posix_memalign" then posix_aligned_body(w) else direct_aligned_body(names.0, w)
-
-        request_helper(e, alloc, HrText(s"define weak ${pre}ptr @$alloc($w %size, $w %align) {\n" +
-                                         "entry:\n" + body))
-    end if
+    request_helper(e, alloc, HrText(s"define weak ${pre}ptr @$alloc($w %size, $w %align) {\n" +
+                                     "entry:\n" + body))
 
     // libc's `free` is already the pair's half, and declared as that; `_aligned_free` is not.
-    if free_open
-        val declared = if names.1 == "free" then "" else s"\ndeclare void @${names.1}(ptr)\n"
+    val declared = if names.1 == "free" then "" else s"\ndeclare void @${names.1}(ptr)\n"
 
-        request_helper(e, free, HrText(s"define weak ${pre}void @$free(ptr %p) {\n" +
-                                        "entry:\n" +
-                                        s"  call void @${names.1}(ptr %p)\n" +
-                                        "  ret void\n" +
-                                        "}\n" + declared))
-    end if
+    request_helper(e, free, HrText(s"define weak ${pre}void @$free(ptr %p) {\n" +
+                                    "entry:\n" +
+                                    s"  call void @${names.1}(ptr %p)\n" +
+                                    "  ret void\n" +
+                                    "}\n" + declared))
 end request_aligned_heap
 
 // The aligned default's body over `posix_memalign`, which answers through an out-pointer and a code.
