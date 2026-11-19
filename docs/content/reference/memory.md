@@ -3097,7 +3097,7 @@ print(a - b)
 ```
 
 ```error
-operator '-' is not defined for &Point
+operator '-' is not defined for Point
 ```
 
 **Bounds safety follows length, not pointers.** Arrays and views carry their length, so indexing is
