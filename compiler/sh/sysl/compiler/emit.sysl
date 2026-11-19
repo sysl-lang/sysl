@@ -275,10 +275,10 @@ struct Emit
     // offset from the global, which is the `.percpu` image (`emit_place.sysl`'s `per_cpu_address`).
     per_cpu: Set[string]
 
-    // The first storage on the heap this module asked the aligned hook for -- what it was, the
-    // function that made it, and the boundary -- or nothing where every block came from the pair
-    // (`emit_box.sysl`'s `heap_call`). It is what the hook is declared for, and what the refusal names
-    // where nothing answers it (`unaligned_heap`).
+    // The first storage on the heap this module took past `malloc`'s boundary under libc's pair --
+    // what it was, the function that made it, and the boundary -- or nothing where every block came
+    // from the pair (`emit_box.sysl`'s `heap_take`). It is what the aligned default is written for, and
+    // what the refusal names where nothing answers it (`unaligned_heap`).
     aligned_heap: Buf[(string, string, usize)]
 
     // The functions and `extern`s declared `@abandons`: a call to one gives back everything this frame
@@ -462,6 +462,25 @@ struct Emit
     // Whether the body being written keeps every multiply apart from the add it feeds -- marked
     // `@no_fuse`, written inside such a body, or in a module whose header says it (`no_fuse.sysl`).
     fuse_off: bool
+
+    // Whether this module gives a block past `malloc`'s boundary back (`emit_box.sysl`'s `heap_give`),
+    // which a hook may do in a module that took none (`aligned_heap`).
+    aligned_frees: bool
+
+    // The first task frame of this module whose boundary is past `malloc`'s, in `aligned_heap`'s
+    // shape: refused through it only where libc's pair answers the frame and cannot answer that
+    // boundary (`emit_async.sysl`'s `request_task_storage`).
+    aligned_frame: Buf[(string, string, usize)]
+
+    // The extensions each function is compiled for, by key: every one marked `@extensions` and every
+    // closure and nested function written inside one (`extensions.sysl`).
+    ext_fns: Map[string, Buf[string]]
+
+    // The registers a `match` holds its scrutinee's tag in alone, read straight from where the enum
+    // lives (`emit_pattern.sysl`'s `tag_held`), for the `match` running now and those around it. The
+    // tag of such a scrutinee is the register itself: no value of the enum's type is assembled around
+    // it, which for a large enum would be a whole aggregate made an LLVM value to carry one word.
+    bare_tags: Buf[string]
 end Emit
 
 // What a runtime helper is built from. A helper is asked for by name while a body is being written
@@ -487,6 +506,11 @@ enum HelperReq
     // object queued on the drain's slot where something is.
     HrPush(payload: Type)
 
+    // How code outside a drain lets go of a `&T` whose box can have nothing in it to tear down
+    // (`emit_arc.sysl`'s `gen_push`, writing `arc.release.<T>`): a count given back, and at zero the
+    // storage freed on the spot under the same three conditions, or the reaper started where not.
+    HrPlainRelease(payload: Type)
+
     // The release of a compact box, which finds its teardown by the payload's type rather than through
     // a hook (`emit_arc.sysl`'s `gen_compact_release`), and the step its walk takes for a reference of
     // the same type: a count given back, and at zero the box queued on the release's own list, or freed
@@ -509,6 +533,10 @@ enum HelperReq
     // What a by-value `@crossing` argument goes through (`emit_cross.sysl`): every view in the `T` at
     // an address replaced by a copy of its own, the share the old one held given back.
     HrCross(ty: Type)
+
+    // What a `&sync` box's payload goes through where it is made (`emit_cross.sysl`): every string in
+    // the `T` at an address that two domains could reach replaced by a copy whose owner is marked shared.
+    HrShare(ty: Type)
 
     // A block written out by hand as LLVM, which is text and can only be **named** by anything that
     // is not LLVM. It shares the queue with the generated ones so that a module writes its helpers
@@ -663,7 +691,7 @@ emitter_for(t: Target, destructors: Buf[(string, string, bool)]) -> Emit
          no_wrap_none(), map(), buf(), Leaving, false, "", set(), buf(), map(), map(), 0, moves_none(), set(), set(), set(), set(),
          set(), map(), 0, map(), set(), map(), false, set(), map(), set(), false, false, false, buf(), set(),
           "", set(), false, None, None, set(), None, map(), buf(), buf(), buf(), false, set(), None,
-          buf(), buf(), false, false)
+          buf(), buf(), false, false, false, buf(), map(), buf())
 end emitter_for
 
 // -- what a body could not say --------------------------------------------------------------------
@@ -1042,7 +1070,7 @@ finish_func(e: *Emit, sig: IrFuncSig) -> IrFunc
             InAlloca(VReg(n), _, _) -> before.add(n)
             _ -> ()
 
-    IrFunc(sig, bound_slot_lives(e, guard_enum_walks(e, lower_large_values(e, elided)), before))
+    ir_func(sig, bound_slot_lives(e, guard_enum_walks(e, lower_large_values(e, elided)), before))
 end finish_func
 
 // -- the constants a body folds against ------------------------------------------------------------

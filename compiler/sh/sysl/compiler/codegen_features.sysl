@@ -342,7 +342,42 @@ end codegen_feature_flags
 // that brings the SIMD unit with it (`sve`) is turned back off by `-neon` rather than reopening the
 // registers the setting closed.
 codegen_feature_attribute(t: Target) -> Option[string]
+    val parts = codegen_feature_parts(t, buf(), buf())
+
+    if parts.is_empty() then return None
+
+    Some(s"\"target-features\"=\"${comma_joined(parts)}\"")
+end codegen_feature_attribute
+
+// The `"target-features"` text of a function marked `@extensions(names)` (`extensions.sysl`): what
+// every definition says, with the function's own extensions after the build's, and **the processor's
+// whole list in front** -- `baseline`, the features clang compiles every function with (`-target-
+// feature` on its command line). An LLVM function's list replaces that command line's rather than
+// adding to it, and the inliner puts a body inside a caller only where the caller's features hold
+// the body's: given `+crc` alone, an AArch64 function would lose `+neon` and `+v8a`, and no
+// ordinary helper could be inlined into it. With the list in front it is a superset of every
+// ordinary function, as clang's own per-function lists are.
+function_feature_text(t: Target, baseline: Buf[string], names: Buf[string]) -> string =
+    comma_joined(codegen_feature_parts(t, baseline, names))
+
+private comma_joined(parts: Buf[string]) -> string
+    var text = ""
+
+    for i in 0..<parts.len()
+        if i > 0 then text = text + ","
+
+        text = text + parts[i]
+
+    text
+end comma_joined
+
+// The entries of a feature list in the order a later one wins in: the processor's, the build's
+// extensions and then `extra`, the settings, and `general_regs_only`'s negations last.
+private codegen_feature_parts(t: Target, baseline: Buf[string], extra: Buf[string]) -> Buf[string]
     var parts: Buf[string] = buf()
+
+    for f in baseline
+        parts.push(f)
 
     if t.cpu == Aarch64 || t.cpu == X86_64
         for f in cf_cpu_features
@@ -350,6 +385,9 @@ codegen_feature_attribute(t: Target) -> Option[string]
 
         for name in cf_extensions
             parts.push(s"+$name")
+
+    for name in extra
+        parts.push(s"+$name")
 
     if cf_strict_align && t.cpu == Aarch64 then parts.push("+strict-align")
 
@@ -367,17 +405,8 @@ codegen_feature_attribute(t: Target) -> Option[string]
             parts.push("-mmx")
             parts.push("-sse")
 
-    if parts.is_empty() then return None
-
-    var text = ""
-
-    for i in 0..<parts.len()
-        if i > 0 then text = text + ","
-
-        text = text + parts[i]
-
-    Some(s"\"target-features\"=\"$text\"")
-end codegen_feature_attribute
+    parts
+end codegen_feature_parts
 
 // -- the extensions, asked of the back end ---------------------------------------------------------
 
@@ -394,29 +423,35 @@ private var cf_known: Buf[(string, bool)] = buf()
 // is compiled once, in an empty function, and that warning is the refusal.
 extension_refusal(t: Target, clang: string, names: Buf[string]) -> Option[string]
     for name in names
-        val key = s"$clang|${t.triple}|$name"
-        var known: Option[bool] = None
+        val known = extension_known_cached(t, clang, name)
 
-        for row in cf_known
-            if row.0 == key then known = Some(row.1)
+        if known.is_err() then return Some(known.unwrap_err())
 
-        if known.is_none()
-            val asked = extension_known(t, clang, name)
-
-            if asked.is_err() then return Some(asked.unwrap_err())
-
-            known = Some(asked.unwrap())
-            cf_known.push((key, asked.unwrap()))
-        end if
-
-        if !known.unwrap()
-            return Some(s"'codegen.extensions' names '$name', which the ${cpu_symbol(t.cpu)} back end " +
-                s"does not know — an extension is spelled as LLVM spells the feature ('lse' or " +
-                "'rcpc' on AArch64, 'popcnt' on x86_64, 'zbb' on RISC-V)")
-    end for
+        if !known.unwrap() then return Some(unknown_extension("'codegen.extensions'", t, name))
 
     None
 end extension_refusal
+
+// The refusal for an extension name the back end does not know, said of `what` -- the manifest's list
+// or an annotation.
+unknown_extension(what: string, t: Target, name: string) -> string =
+    s"$what names '$name', which the ${cpu_symbol(t.cpu)} back end does not know — an extension is " +
+    "spelled as LLVM spells the feature ('lse' or 'rcpc' on AArch64, 'popcnt' on x86_64, 'zbb' on " +
+    "RISC-V)"
+
+// Whether `clang`'s back end for `t` knows `name`, asked once per process.
+extension_known_cached(t: Target, clang: string, name: string) -> Result[bool, string]
+    val key = s"$clang|${t.triple}|$name"
+
+    for row in cf_known
+        if row.0 == key then return Ok(row.1)
+
+    val asked = extension_known(t, clang, name)
+
+    if asked.is_ok() then cf_known.push((key, asked.unwrap()))
+
+    asked
+end extension_known_cached
 
 // Whether `clang`'s back end for `t` takes `+name` without complaint.
 private extension_known(t: Target, clang: string, name: string) -> Result[bool, string]
@@ -649,6 +684,69 @@ host_cpu(t: Target, clang: string) -> Result[(string, Buf[string]), string]
 
     Ok((name, features))
 end host_cpu
+
+// The features clang compiles every function for `t` with, under this build's processor: its
+// `-target-feature` list, read off `-###` as `host_cpu` reads it -- `+v8a`, `+fp-armv8`, `+neon` for
+// bare AArch64, the M1's whole list for `aarch64-macos`. `native`'s list is the one already read.
+// **Asked once per process and processor**, and only by a program that marks a function
+// `@extensions` (`extensions.sysl`), which both needs to know what the build already has and to put
+// the list in front of the function's own.
+private var cf_baseline: Buf[(string, Buf[string])] = buf()
+
+processor_features(t: Target) -> Result[Buf[string], string]
+    if cf_cpu != "" && !cf_cpu_features.is_empty() then return Ok(cf_cpu_features)
+
+    val key = s"${t.triple}|$cf_cpu"
+
+    for row in cf_baseline
+        if row.0 == key then return Ok(row.1)
+
+    val clang = find_clang(t, named_cc()) match
+        Err(why) -> return Err(s"cannot find the features '${t.name}' is compiled with: $why")
+        Ok(found) -> found
+
+    var args: Buf[string] = buf()
+
+    args.push(s"--target=${t.triple}")
+    args.push("-###")
+
+    if cf_cpu != "" then args.push(s"${cpu_flag_name(t)}$cf_cpu")
+
+    args.push("-c")
+    args.push("-x")
+    args.push("c")
+    args.push("/dev/null")
+
+    val got = capture(clang, args.view(), "", [], true) match
+        Err(_) -> return Err(s"cannot run '$clang' to find the features '${t.name}' is compiled with")
+        Ok(ran) -> ran
+
+    val parts = split(got.err.unwrap_or(""), "\"")
+    var features: Buf[string] = buf()
+    var i = 1
+
+    while i + 2 < parts.len
+        if parts[i] == "-target-feature" then features.push(parts[i + 2])
+
+        i += 2
+
+    cf_baseline.push((key, features))
+    Ok(features)
+end processor_features
+
+// Whether this build promises the extension `name` everywhere: the manifest's list, or the
+// processor's own feature list (`processor_features`) carrying it.
+build_promises(t: Target, name: string) -> bool
+    if promised_feature(name) then return true
+
+    processor_features(t) match
+        Ok(list) ->
+            for f in list
+                if f == s"+$name" then return true
+        Err(_) -> ()
+
+    false
+end build_promises
 
 // The `"target-cpu"` function attribute, or nothing where no processor was asked for.
 cpu_attribute() -> Option[string] = if cf_cpu == "" then None else Some(s"\"target-cpu\"=\"$cf_cpu\"")

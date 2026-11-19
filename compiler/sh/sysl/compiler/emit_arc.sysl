@@ -85,6 +85,12 @@ private arc_value(e: *Emit, ty: Type, v: Val, retain: bool) = ty match
             release_compact(e, *inner, subject)
         else if e.draining && !retain && !sync
             push_ref(e, *inner, subject)
+        // **A box that can have nothing in it to tear down dies without the reaper**: its own type's
+        // release frees it on the spot, with no thread asked for its slot and no hook called, where
+        // the generic one would start a drain to call the hook twice -- once to walk nothing, once to
+        // free. That is what makes an object's death cost what C++'s `delete` does.
+        else if !retain && !sync && !is_trait(*inner) && empties(e, *inner).is_some()
+            arc_call(e, request_helper(e, s"arc.release.${mangle(*inner)}", HrPlainRelease(*inner)), subject)
         else
             arc_call(e, s"arc.${if retain then "retain" else "release"}${if sync then "_sync" else ""}",
                      subject)
@@ -424,7 +430,11 @@ end empties
 // Anything else -- a box laid in a frame, one another module made, one with a weak reference out, a
 // variant that holds a count -- is queued on the drain's slot, which is what `arc.reap` would have done
 // with it. Nothing about the order anything is torn down in changes: what is freed here runs no code.
-private gen_push(e: *Emit, payload: Type)
+//
+// **`arc.release.<T>` is the same body outside a drain** (`queued` false): it has no slot, so what
+// it cannot free on the spot goes to `arc.reap` -- which is where the generic release would have sent
+// it -- and only then is a thread asked for anything.
+private gen_push(e: *Emit, payload: Type, queued: bool = true)
     val tags = empties(e, payload).unwrap_or(buf())
     val bn = box_lty(e, payload)
     val word = word_lty(e)
@@ -495,11 +505,15 @@ private gen_push(e: *Emit, payload: Type)
     emit_term(e, InRet(None, None))
     emit_label(e, queue)
 
-    val head = fresh_reg(e)
+    if queued
+        val head = fresh_reg(e)
 
-    emit(e, InLoad(head, LPtr, VReg("slot"), AccPlain, None))
-    emit(e, InStore(LPtr, head, p, AccPlain, None))
-    emit(e, InStore(LPtr, p, VReg("slot"), AccPlain, None))
+        emit(e, InLoad(head, LPtr, VReg("slot"), AccPlain, None))
+        emit(e, InStore(LPtr, head, p, AccPlain, None))
+        emit(e, InStore(LPtr, p, VReg("slot"), AccPlain, None))
+    else
+        arc_call(e, "arc.reap", p)
+
     emit_term(e, InRet(None, None))
     emit_label(e, live)
     emit_term(e, InRet(None, None))
@@ -944,9 +958,12 @@ drop_fn(e: *Emit, payload: Type) -> Val
     //
     // **Nor can it serve a payload the aligned pair made**, whose storage goes back through that
     // pair's free (`emit_box.sysl`'s `heap_call`).
+    //
+    // **Nor where the pair is told each block's size** (`heap_sized`): the plain hook is one for every
+    // payload, and so knows no size to give back.
     val plain = !contains_counted(payload) && destructor_of(e, payload).is_none()
 
-    if plain && !e.layout.beyond_heap(payload) then return plain_drop_fn(e)
+    if plain && !e.layout.beyond_heap(payload) && !heap_sized() then return plain_drop_fn(e)
 
     VGlobal(request_helper(e, s"arc.drop.${mangle(payload)}", HrDrop(payload)))
 end drop_fn
@@ -955,7 +972,7 @@ end drop_fn
 // walk, so the plain hook is enough -- it still gives the bytes back, which is the phase every box
 // needs whatever it holds.
 drop_buf_fn(e: *Emit, elem: Type) -> Val
-    if !contains_counted(elem) && !e.layout.beyond_heap(elem) then return plain_drop_fn(e)
+    if !contains_counted(elem) && !e.layout.beyond_heap(elem) && !heap_sized() then return plain_drop_fn(e)
 
     VGlobal(request_helper(e, s"arc.dropbuf.${mangle(elem)}", HrDropBuf(elem)))
 end drop_buf_fn
@@ -1013,12 +1030,14 @@ gen_helper(e: *Emit, what: HelperReq, name: string) -> Option[IrFunc]
         HrPlainDrop -> helper_sig(name, hook_params())
         HrFrameDrop(_) -> helper_sig(name, hook_params())
         HrPush(_) -> helper_sig(name, push_params())
+        HrPlainRelease(_) -> helper_sig(name, one_param("p", LPtr))
         HrCompactRelease(_) -> helper_sig(name, one_param("p", LPtr))
         HrCompactPush(_) -> helper_sig(name, push_params())
         HrTaskDrop(_) -> helper_sig(name, hook_params())
         HrSlotBuf(_) -> bound_sig(helper_sig(name, hook_params()) with { linkage = LinkWeakOdr }, binds_locally(e))
         HrSlotPlace(elem) -> helper_sig(name, slot_place_params(e, elem)) with { bare = rarely() }
         HrCross(_) -> helper_sig(name, one_param("p", LPtr))
+        HrShare(_) -> helper_sig(name, one_param("p", LPtr))
 
         // A hand-written block is text rather than a function: the drain writes it down as it
         // stands, so nothing brings one here.
@@ -1036,17 +1055,21 @@ gen_helper(e: *Emit, what: HelperReq, name: string) -> Option[IrFunc]
             walk_slot(e, ty, VReg("p"), retain)
             emit_term(e, InRet(None, None))
         HrDrop(payload) -> gen_drop_hook(e, payload, true)
-        HrDropBuf(elem) -> gen_drop_buf_hook(e, elem)
+        HrDropBuf(elem) -> gen_drop_buf_hook(e, elem, false)
         HrPlainDrop -> gen_plain_hook(e)
         HrFrameDrop(payload) -> gen_drop_hook(e, payload, false)
         HrPush(payload) -> gen_push(e, payload)
+        HrPlainRelease(payload) -> gen_push(e, payload, false)
         HrCompactRelease(payload) -> gen_compact_release(e, payload)
         HrCompactPush(payload) -> gen_compact_push(e, payload)
         HrTaskDrop(result) -> gen_task_hook(e, result)
-        HrSlotBuf(elem) -> gen_drop_buf_hook(e, elem)
+        HrSlotBuf(elem) -> gen_drop_buf_hook(e, elem, true)
         HrSlotPlace(elem) -> gen_slot_place_rest(e, elem)
         HrCross(ty) ->
             fresh_views_at(e, ty, VReg("p"))
+            emit_term(e, InRet(None, None))
+        HrShare(ty) ->
+            shared_strings_at(e, ty, VReg("p"))
             emit_term(e, InRet(None, None))
         HrText(_) -> gap_here(e, "a hand-written runtime block asked of the generator")
         HrAdapter(table, slot) -> gen_adapter(e, table, slot)
@@ -1059,6 +1082,8 @@ gen_helper(e: *Emit, what: HelperReq, name: string) -> Option[IrFunc]
 end gen_helper
 
 private gen_plain_hook(e: *Emit)
+    if heap_sized() then return gap_here(e, "the plain hook, which knows no size, asked of a heap told sizes")
+
     val give = fresh_label(e, "arc.give")
     val over = fresh_label(e, "arc.over")
 
@@ -1159,7 +1184,9 @@ private gen_drop_hook(e: *Emit, payload: Type, frees: bool)
     emit_term(e, InRet(None, None))
 end gen_drop_hook
 
-private gen_drop_buf_hook(e: *Emit, elem: Type)
+// `slot` is storage `slot_storage` made, which is given back from in front of its header
+// (`slot_buf_free`).
+private gen_drop_buf_hook(e: *Emit, elem: Type, slot: bool)
     val bn = buf_lty(e, elem)
     val give = fresh_label(e, "arc.give")
     val over = fresh_label(e, "arc.over")
@@ -1167,27 +1194,17 @@ private gen_drop_buf_hook(e: *Emit, elem: Type)
     emit_term(e, InCondBr(VReg("storage"), give, over))
     emit_label(e, over)
 
-    // Elements holding nothing are here only because the aligned pair made the buffer.
+    // Elements holding nothing are here only because the block cannot go back through the plain hook:
+    // the aligned pair made it, or the pair is told each block's size.
     if !contains_counted(elem)
         emit_term(e, InRet(None, None))
         emit_label(e, give)
-        emit_free(e, elem)
+        give_buffer(e, elem, slot)
         emit_term(e, InRet(None, None))
         return
     end if
 
-    val lenp = fresh_reg(e)
-
-    var idx: Buf[IrArg] = buf()
-
-    idx.push(ir_arg(l_i32(), VInt(from_int(0))))
-    idx.push(ir_arg(l_i32(), VInt(from_int(long(header_fields())))))
-    emit(e, InGep(lenp, bn, VReg("p"), idx))
-
-    val n = fresh_reg(e)
-
-    emit(e, InLoad(n, word_lty(e), lenp, AccPlain, None))
-
+    val n = buffer_count(e, elem, VReg("p"))
     val data = fresh_reg(e)
 
     var didx: Buf[IrArg] = buf()
@@ -1203,26 +1220,85 @@ private gen_drop_buf_hook(e: *Emit, elem: Type)
     e.draining = false
     emit_term(e, InRet(None, None))
     emit_label(e, give)
-    emit_free(e, elem)
+    give_buffer(e, elem, slot)
     emit_term(e, InRet(None, None))
 end gen_drop_buf_hook
 
+// The storage phase of a buffer's hook. The count is read here, after the walk: the walk's own phase
+// ran in an earlier call, and a buffer's count is the length it was made with.
+private give_buffer(e: *Emit, elem: Type, slot: bool)
+    if slot
+        slot_buf_free(e, elem)
+        return
+
+    val n = if heap_sized() then buffer_count(e, elem, VReg("p")) else VNothing
+
+    free_buffer_at(e, elem, VReg("p"), n)
+end give_buffer
+
 // Where `free` is **called**: inside a hook, or a compact box's release (`gen_compact_release`), so it
 // reaches a module only where that module builds a box -- which is a module that has already called
-// `malloc`, and therefore has an allocator to give the bytes back to. Storage of a type the aligned
-// pair made goes back through that pair's free (`emit_box.sysl`'s `heap_call`).
+// `malloc`, and therefore has an allocator to give the bytes back to. The block goes back with the
+// size and boundary it was taken with (`emit_box.sysl`'s `heap_give`).
 private emit_free(e: *Emit, held: Type) = free_at(e, held, VReg("p"))
 
-// The same for the storage at `p`.
+// The same for the box of `held` at `p`: its size is its type's, the one `allocate_box` asked for.
 private free_at(e: *Emit, held: Type, p: Val)
-    var args: Buf[IrArg] = buf()
+    val size = if heap_sized() then lty_size(e, box_lty(e, held)) else VNothing
 
-    args.push(ir_arg(LPtr, p))
-
-    val sym = if e.layout.beyond_heap(held) then aligned_free_symbol() else free_symbol()
-
-    emit(e, ir_call(None, LVoid, VGlobal(sym), args))
+    heap_give(e, p, size, block_align(e, held))
 end free_at
+
+// The buffer of `n` elements of `elem` at `p` given back, with the size `gen_buffer` took it at.
+private free_buffer_at(e: *Emit, elem: Type, p: Val, n: Val)
+    val size = if heap_sized() then buffer_bytes(e, elem, n) else VNothing
+
+    heap_give(e, p, size, block_align(e, elem))
+end free_buffer_at
+
+// The element count the buffer at `p` was made with: its fourth header word, which only the slot forms
+// ever move -- and their storage carries the count it was made with in front of it (`slot_buf_free`).
+private buffer_count(e: *Emit, elem: Type, p: Val) -> Val
+    val lenp = fresh_reg(e)
+
+    var idx: Buf[IrArg] = buf()
+
+    idx.push(ir_arg(l_i32(), VInt(from_int(0))))
+    idx.push(ir_arg(l_i32(), VInt(from_int(long(header_fields())))))
+    emit(e, InGep(lenp, buf_lty(e, elem), p, idx))
+
+    val n = fresh_reg(e)
+
+    emit(e, InLoad(n, word_lty(e), lenp, AccPlain, None))
+    n
+end buffer_count
+
+// **Slot storage given back.** Its fourth header word is the live prefix, not the length it was made
+// with, so where the pair is told sizes the storage is laid one boundary past a word holding that
+// length (`emit_box.sysl`'s `slot_lead`) and given back from there.
+private slot_buf_free(e: *Emit, elem: Type)
+    if !heap_sized()
+        free_buffer_at(e, elem, VReg("p"), VNothing)
+        return
+
+    val lead = slot_lead(e, elem)
+    val base = fresh_reg(e)
+
+    var back: Buf[IrArg] = buf()
+
+    back.push(ir_arg(word_lty(e), VInt(from_int(-long(lead)))))
+    emit(e, InGep(base, LInt(8), VReg("p"), back))
+
+    val n = fresh_reg(e)
+
+    emit(e, InLoad(n, word_lty(e), base, AccPlain, None))
+
+    val bytes = buffer_bytes(e, elem, n)
+    val size = fresh_reg(e)
+
+    emit(e, InBin(size, OpAdd, word_lty(e), bytes, VInt(from_int(long(lead)))))
+    heap_give(e, base, size, block_align(e, elem))
+end slot_buf_free
 
 // -- elements a buffer holds --------------------------------------------------------------------------
 
@@ -1884,15 +1960,17 @@ private var heap_free: string = "free"
 
 malloc_symbol() -> string = heap_alloc
 
-// The call that answers zeroed storage from the same heap, where the pair has one: libc's `calloc`
-// beside libc's pair, and the counting runtime's twin of it beside that runtime's. A pair a package
-// named has no zeroing half anyone promised, so a zeroed block from it is taken and then cleared.
-calloc_symbol() -> Option[string]
-    if heap_alloc == counted_allocator().0 then return Some(counted_calloc_symbol())
-    if heap_alloc == "malloc" && heap_free == "free" then return Some("calloc")
+// **Whether the pair is told what it is giving and taking back**: every pair but libc's own is
+// `alloc(size, align) -> *u8` and `free(p, size, align)`, handed the block's exact size and boundary
+// on both calls -- a manifest's pair and the counting runtime's alike. libc's `malloc(size)` and
+// `free(p)` are called as libc declares them, and a block aligned past `malloc`'s promise comes from
+// the C library's aligned allocation instead (`emit_box.sysl`'s `heap_take`).
+heap_sized() -> bool = !(heap_alloc == "malloc" && heap_free == "free")
 
-    None
-end calloc_symbol
+// The call that answers zeroed storage from the same heap, where the pair has one: libc's `calloc`
+// beside libc's pair. Any other pair has no zeroing half anyone promised, so a zeroed block from it
+// is taken and then cleared.
+calloc_symbol() -> Option[string] = if heap_sized() then None else Some("calloc")
 
 free_symbol() -> string = heap_free
 

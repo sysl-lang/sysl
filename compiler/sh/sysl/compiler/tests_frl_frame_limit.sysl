@@ -1,0 +1,573 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, read_text, remove_dir_all, write_text}
+import sysl.text.{cstring, replace_all, split, Search}
+
+// **A function's stack frame, limited and reported** (`frame_limit.sysl`, `reference/packages.md § A
+// function's stack frame`, `reference/attributes.md § @frame_limit`).
+//
+// The axes: where the limit comes from (`--frame-limit`, the root's key, a dependency's key,
+// `@frame_limit(n)`, `@frame_limit(none)`, a closure inside a marked function); the level (`-O0`
+// against an optimized build); the command (`build`, `build-c`, `build-lib`, `test`); the machine
+// (the host, two freestanding boards); how the text reaches clang (one unit in the link, several
+// units, link-time optimization); and the report (sorted, generics and closures named readably).
+// Not crossed: `--target` with a hosted cross triple (the same compile as the host's), and wasm,
+// whose frames live in linear memory LLVM does not lay out as a native stack.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private frl_ready() -> bool = clx_ready()
+
+// The FINDINGS 81 program: one function whose frame holds a 64 KiB array.
+private val FrlDeep: string = "deep(n: usize) -> u8\n    var block: [65536]u8 = [0; 65536]\n" +
+    "    block[n % 65536] = u8(n)\n    block[(n * 7) % 65536]\n"
+
+private frl_program(above_deep: string) -> string = s"$above_deep$FrlDeep\nmain()\n    print(deep(3))\n"
+
+// A project of `files`, each `(path, text)`, in a directory of its own.
+private frl_root(files: []const (string, string)) -> string
+    val root = absolute_path(replace_all(make_temp_dir("sysl-frl").unwrap(), "//", "/"))
+
+    for (path, text) in files
+        val at = s"$root/$path"
+
+        parent_of(at) match
+            Some(dir) -> make_dir_all(dir).unwrap_or(())
+            None -> ()
+
+        write_text(at, text).unwrap()
+
+    root
+end frl_root
+
+private frl_project(main: string, manifest: string) -> string =
+    frl_root([("sysl.hocon", s"package { name = \"frl\", version = \"0.1.0\" }\n$manifest"), ("main.sysl", main)])
+
+// `sysl <args…>` in this process, with the project's directory in place of `@`.
+private frl_ran(root: string, args: []const string) -> (int, string, string)
+    var line: Buf[string] = buf()
+
+    line.push("sysl")
+
+    for a in args
+        line.push(if a == "@" then root else replace_all(a, "@/", s"$root/"))
+
+    clx_ran(line.view())
+end frl_ran
+
+// The report's rows, each split into its four cells.
+private frl_rows(file: string) -> Buf[[]string]
+    var out: Buf[[]string] = buf()
+
+    for line in split(read_text(file).unwrap_or(""), "\n")
+        if line != "" then out.push(split(line, "\t"))
+
+    out
+end frl_rows
+
+// The frame the report gives the function shown as `name`, or -1.
+private frl_frame(file: string, name: string) -> long
+    for row in frl_rows(file)
+        if row.len == 4 && row[2] == name then return frame_number_text(row[0])
+
+    -1
+end frl_frame
+
+private frame_number_text(text: string) -> long
+    var n: long = 0
+
+    for b in text.bytes
+        n = n * 10 + long(b - u8('0'))
+
+    n
+end frame_number_text
+
+// -- reading what clang says, and what is written --------------------------------------------------
+
+@test("a byte count is a whole number from 1 to the most LLVM holds, with '_' between groups")
+frl_byte_counts()
+    assert_eq(frame_bytes_operand("2048"), Some(2048))
+    assert_eq(frame_bytes_operand("16_384"), Some(16384))
+    assert_eq(frame_bytes_operand("4294967295"), Some(4294967295))
+    assert(frame_bytes_operand("4294967296").is_none(), "past what the attribute holds")
+    assert(frame_bytes_operand("0").is_none(), "zero")
+    assert(frame_bytes_operand("").is_none(), "nothing")
+    assert(frame_bytes_operand("_1").is_none(), "a leading separator")
+    assert(frame_bytes_operand("2k").is_none(), "a suffix")
+    assert(frame_bytes_operand("-5").is_none(), "a sign")
+end frl_byte_counts
+
+@test("clang's frame report is read for the frame, the limit and the symbol, and nothing else is")
+frl_reads_the_report()
+    val line = "error: <unknown>:0:0: stack frame size (65632) exceeds limit (2048) in function " +
+        "'deep$$sysl' [-Werror,-Wframe-larger-than]"
+
+    val (size, limit, symbol) = frame_report_of(line).unwrap()
+
+    assert_eq(size, 65632)
+    assert_eq(limit, 2048)
+    assert_eq(symbol, "deep$$sysl")
+
+    val (_, _, other) = frame_report_of("warning: stack frame size (40) exceeds limit (8) in 'a.b'").unwrap()
+
+    assert_eq(other, "a.b")
+    assert(frame_report_of("error: undefined symbol: deep").is_none(), "another error")
+    assert(frame_report_of("1 error generated.").is_none(), "the count")
+    assert(frame_refusal("ld: symbol(s) not found").is_none(), "a failure that is not about frames")
+end frl_reads_the_report
+
+@test("a frame report that names no function this build lowered is still a sysl error")
+frl_an_unknown_symbol_is_still_named()
+    forget_frames()
+
+    val said = frame_refusal("error: <unknown>:0:0: stack frame size (900) exceeds limit (64) in function " +
+                             "'sysl.cgu:helper' [-Werror,-Wframe-larger-than]").unwrap()
+
+    assert(said.starts_with("error: 'helper' needs a stack frame of 900 bytes, over its limit of 64 bytes"), said)
+    assert(is_frame_report(said), said)
+end frl_an_unknown_symbol_is_still_named
+
+// -- the limit, from each place it is set ----------------------------------------------------------
+
+@test("the FINDINGS 81 program at -O0 is refused at a 2 KiB limit, naming the function, its frame, the limit and the flag")
+frl_refused_at_2k()
+    if !frl_ready() then return
+
+    val root = frl_project(frl_program(""), "")
+    val (code, _, err) = frl_ran(root, ["build", "@", "-O0", "--frame-limit", "2048", "-o", "@/app"])
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert(code != 0, err)
+    assert(err.starts_with("error: 'deep' needs a stack frame of "), err)
+    assert(err.contains(" bytes, over its limit of 2048 bytes, set by '--frame-limit 2048'"), err)
+    assert(err.contains("main.sysl:1:1"), err)
+    assert(!err.contains("sysl: error"), err)
+end frl_refused_at_2k
+
+@test("'@frame_limit(n)' above the function lets it through, and '@frame_limit(none)' does too")
+frl_a_function_of_its_own()
+    if !frl_ready() then return
+
+    for mark in ["@frame_limit(100000)\n", "@frame_limit(none)\n"]
+        val root = frl_project(frl_program(mark), "")
+        val (code, _, err) = frl_ran(root, ["build", "@", "-O0", "--frame-limit", "2048", "-o", "@/app"])
+
+        remove_dir_all(root).unwrap_or(())
+
+        assert_eq(code, 0, s"$mark$err")
+end frl_a_function_of_its_own
+
+@test("a mark smaller than the frame is refused by name, as the limit the mark set")
+frl_a_mark_below_the_frame()
+    if !frl_ready() then return
+
+    val root = frl_project(frl_program("@frame_limit(4096)\n"), "")
+    val (code, _, err) = frl_ran(root, ["build", "@", "-o", "@/app"])
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert(code != 0, err)
+    assert(err.contains("over its limit of 4096 bytes, set by '@frame_limit(4096)' above 'deep'"), err)
+end frl_a_mark_below_the_frame
+
+@test("with no limit anywhere, the program builds as it always did")
+frl_no_limit_no_change()
+    if !frl_ready() then return
+
+    val root = frl_project(frl_program(""), "")
+    val (code, _, err) = frl_ran(root, ["build", "@", "-O0", "-o", "@/app"])
+    val (_, ir, _) = frl_ran(root, ["emit-llvm", "@"])
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert_eq(code, 0, err)
+    assert(!ir.contains("warn-stack-size"), "no attribute without a limit")
+end frl_no_limit_no_change
+
+@test("emit-llvm shows the attribute the limit is written as")
+frl_emit_llvm_shows_it()
+    if !frl_ready() then return
+
+    val root = frl_project(frl_program("@frame_limit(3000)\n"), "")
+    val (_, ir, _) = frl_ran(root, ["emit-llvm", "@"])
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert(ir.contains("\"warn-stack-size\"=\"3000\""), ir)
+end frl_emit_llvm_shows_it
+
+@test("both -O0 and an optimized build are held to the limit, and -O0's frame is the larger")
+frl_levels()
+    if !frl_ready() then return
+
+    val main = frl_program("") + "\n@noinline\nmid(n: int) -> int\n    var a = n + 1\n    var b = a * 3\n" +
+        "    var c = b - n\n    var d = c * c\n    a + b + c + d\n"
+    val root = frl_project(replace_all(main, "print(deep(3))", "print(deep(3))\n    print(mid(4))"), "")
+
+    for level in ["-O0", "-O2"]
+        val (code, _, err) = frl_ran(root, ["build", "@", level, "--frame-limit", "2048", "-o", "@/app"])
+
+        assert(code != 0 && err.contains("'deep' needs a stack frame of"), s"$level: $err")
+
+    frl_ran(root, ["build", "@", "-O0", "--stack-usage", "@/o0.txt", "-o", "@/app"])
+    frl_ran(root, ["build", "@", "-O2", "--stack-usage", "@/o2.txt", "-o", "@/app"])
+
+    val o0 = frl_frame(s"$root/o0.txt", "mid")
+    val o2 = frl_frame(s"$root/o2.txt", "mid")
+    val deep0 = frl_frame(s"$root/o0.txt", "deep")
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert(deep0 >= 65536, s"deep at -O0: $deep0")
+    assert(o0 > o2 && o2 >= 0, s"mid: $o0 at -O0, $o2 at -O2")
+end frl_levels
+
+@test("the root manifest's key holds the build, and --frame-limit beats it")
+frl_the_root_key()
+    if !frl_ready() then return
+
+    val root = frl_project(frl_program(""), "frame_limit = 2048\n")
+    val (refused, _, err) = frl_ran(root, ["build", "@", "-o", "@/app"])
+    val (beaten, _, err2) = frl_ran(root, ["build", "@", "--frame-limit", "100000", "-o", "@/app"])
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert(refused != 0, err)
+    assert(err.contains("set by 'frame_limit = 2048' in sysl.hocon"), err)
+    assert_eq(beaten, 0, err2)
+end frl_the_root_key
+
+@test("a key that is not a byte count is refused when the manifest is read")
+frl_a_bad_key()
+    if !frl_ready() then return
+
+    for (written, shown) in [("\"big\"", "big"), ("0", "0"), ("4294967296", "4294967296"), ("2k", "2k")]
+        val root = frl_project(frl_program(""), s"frame_limit = $written\n")
+        val (code, _, err) = frl_ran(root, ["build", "@", "-o", "@/app"])
+
+        remove_dir_all(root).unwrap_or(())
+
+        assert(code != 0, written)
+        assert(err.contains(s"'frame_limit' takes the most bytes one function's stack frame may take, a whole number from 1 to 4294967295, and '$shown' is not one"), err)
+
+    // A string holding a count is the count, as `optimization = "2"` is a level.
+    val quoted = frl_project(frl_program(""), "frame_limit = \"2048\"\n")
+    val (refused, _, said) = frl_ran(quoted, ["build", "@", "-o", "@/app"])
+    val listed = frl_project(frl_program(""), "frame_limit = [2048]\n")
+    val (code, _, err) = frl_ran(listed, ["build", "@", "-o", "@/app"])
+
+    remove_dir_all(quoted).unwrap_or(())
+    remove_dir_all(listed).unwrap_or(())
+
+    assert(refused != 0 && said.contains("'deep' needs a stack frame of"), said)
+    assert(code != 0, err)
+    assert(err.contains("written as a whole number and not a block or a list"), err)
+end frl_a_bad_key
+
+@test("--frame-limit that is not a byte count is the command line's mistake")
+frl_a_bad_flag()
+    if !frl_ready() then return
+
+    val root = frl_project(frl_program(""), "")
+
+    for written in ["0", "lots", "-1"]
+        val (code, _, err) = frl_ran(root, ["build", "@", "--frame-limit", written, "-o", "@/app"])
+
+        assert(code != 0, written)
+        assert(err.contains(s"'--frame-limit' takes the most bytes"), err)
+
+    remove_dir_all(root).unwrap_or(())
+end frl_a_bad_flag
+
+// -- a dependency's key ---------------------------------------------------------------------------
+
+private val FrlDig: string = "module sh.x.dig\n\ndig(n: usize) -> u8\n    var block: [65536]u8 = [0; 65536]\n" +
+    "    block[n % 65536] = u8(n)\n    block[(n * 5) % 65536]\n"
+
+private frl_with_dependency(dep_key: string, app_key: string) -> (string, string)
+    val dep = frl_root([("sysl.hocon", s"package { name = \"dig\", version = \"0.1.0\" }\n$dep_key"),
+                        ("sh/x/dig/dig.sysl", FrlDig)])
+    val app = frl_root([("sysl.hocon", s"package { name = \"app\", version = \"0.1.0\" }\n" +
+                         s"dependencies { dig { path = \"$dep\" } }\n$app_key"),
+                        ("main.sysl", s"import sh.x.dig.dig\n\n$FrlDeep\nmain()\n    print(dig(3) + deep(4))\n")])
+
+    (dep, app)
+end frl_with_dependency
+
+@test("a dependency's key holds that package's functions, and not its consumer's")
+frl_a_dependency_holds_its_own()
+    if !frl_ready() then return
+
+    val (dep, app) = frl_with_dependency("frame_limit = 2048\n", "")
+    val (code, _, err) = frl_ran(app, ["build", "@", "-o", "@/app"])
+
+    remove_dir_all(app).unwrap_or(())
+    remove_dir_all(dep).unwrap_or(())
+
+    assert(code != 0, err)
+    assert(err.contains("'dig.sh.x.dig.dig' needs a stack frame of"), err)
+    assert(err.contains(s"set by 'frame_limit = 2048' in $dep/sysl.hocon"), err)
+    assert(!err.contains("'deep'"), s"the consumer's own function has no limit: $err")
+end frl_a_dependency_holds_its_own
+
+@test("a dependency's own key is nearer than the build's limit, and the build's holds the rest")
+frl_a_dependency_key_beats_the_build()
+    if !frl_ready() then return
+
+    val (dep, app) = frl_with_dependency("frame_limit = 100000\n", "")
+    val (code, _, err) = frl_ran(app, ["build", "@", "--frame-limit", "2048", "-o", "@/app"])
+
+    remove_dir_all(app).unwrap_or(())
+    remove_dir_all(dep).unwrap_or(())
+
+    assert(code != 0, err)
+    assert(err.contains("'deep' needs a stack frame of"), err)
+    assert(!err.contains("sh.x.dig.dig'"), s"the dependency's key lets its function through: $err")
+end frl_a_dependency_key_beats_the_build
+
+@test("a dependency that names no limit is held to the build's")
+frl_a_dependency_without_a_key()
+    if !frl_ready() then return
+
+    val (dep, app) = frl_with_dependency("", "frame_limit = 2048\n")
+    val (code, _, err) = frl_ran(app, ["build", "@", "-o", "@/app"])
+
+    remove_dir_all(app).unwrap_or(())
+    remove_dir_all(dep).unwrap_or(())
+
+    assert(code != 0, err)
+    assert(err.contains("'dig.sh.x.dig.dig' needs a stack frame of"), err)
+    assert(err.contains("'deep' needs a stack frame of"), err)
+end frl_a_dependency_without_a_key
+
+// -- closures and generics ------------------------------------------------------------------------
+
+private val FrlNamed: string = "first[T](xs: []const T) -> T = xs[0]\n\n" +
+    "@frame_limit(100000)\nbig(n: usize) -> u8\n    var block: [65536]u8 = [0; 65536]\n" +
+    "    block[n % 65536] = u8(n)\n    val f = (k: usize) ->\n        var inner: [32768]u8 = [0; 32768]\n" +
+    "        inner[k % 32768] = u8(k)\n        inner[(k * 3) % 32768]\n    block[(n * 7) % 65536] + f(n)\n\n" +
+    "main()\n    val xs = [3, 1, 4]\n    print(first(xs[..]))\n    print(big(3))\n"
+
+@test("a closure inside a marked function takes its mark")
+frl_a_closure_takes_the_mark()
+    if !frl_ready() then return
+
+    val root = frl_project(FrlNamed, "")
+    val (code, _, err) = frl_ran(root, ["build", "@", "-O0", "--frame-limit", "2048", "-o", "@/app"])
+
+    // And without the mark, the closure is refused under its owner's name.
+    write_text(s"$root/main.sysl", replace_all(FrlNamed, "@frame_limit(100000)\n", "")).unwrap()
+
+    val (code2, _, err2) = frl_ran(root, ["build", "@", "-O0", "--frame-limit", "2048", "-o", "@/app"])
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert_eq(code, 0, err)
+    assert(code2 != 0, err2)
+    assert(err2.contains("'big.<closure>' needs a stack frame of"), err2)
+    assert(err2.contains("'big' needs a stack frame of"), err2)
+end frl_a_closure_takes_the_mark
+
+@test("the report names a generic's instance with its arguments and a closure after its function")
+frl_the_report_names_readably()
+    if !frl_ready() then return
+
+    val root = frl_project(FrlNamed, "")
+    val (code, _, err) = frl_ran(root, ["build", "@", "-O0", "--stack-usage", "@/frames.txt", "-o", "@/app"])
+    val rows = frl_rows(s"$root/frames.txt")
+    val text = read_text(s"$root/frames.txt").unwrap_or("")
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert_eq(code, 0, err)
+
+    var names: Buf[string] = buf()
+
+    for row in rows
+        assert_eq(row.len, 4, text)
+        assert(row[1] == "static" || row[1].starts_with("dynamic"), text)
+        names.push(row[2])
+
+    assert(holds_string(names, "first[int]"), text)
+    assert(holds_string(names, "big.<closure>"), text)
+    assert(holds_string(names, "big"), text)
+
+    // Largest first.
+    assert_eq(rows[0][2], "big", text)
+    assert(rows[0][3] == s"$root/main.sysl:3", text)
+
+    for i in 1..<rows.len()
+        assert(frame_number_text(rows[i - 1][0]) >= frame_number_text(rows[i][0]), text)
+end frl_the_report_names_readably
+
+// -- the attribute, where it may be written --------------------------------------------------------
+
+@test("'@frame_limit' takes a byte count or 'none', in parentheses, and marks a function")
+frl_the_attribute_refusals()
+    if !frl_ready() then return
+
+    for (mark, words) in [("@frame_limit\n", "'@frame_limit' names the most bytes"),
+                          ("@frame_limit(0)\n", "'@frame_limit' names the most bytes"),
+                          ("@frame_limit(big)\n", "'@frame_limit' names the most bytes"),
+                          ("@frame_limit(2048u32)\n", "'@frame_limit' names the most bytes"),
+                          ("@frame_limit(4294967296)\n", "'@frame_limit' names the most bytes")]
+        val root = frl_project(frl_program(mark), "")
+        val (code, _, err) = frl_ran(root, ["build", "@", "-o", "@/app"])
+
+        remove_dir_all(root).unwrap_or(())
+
+        assert(code != 0, mark)
+        assert(err.contains(words), s"$mark$err")
+
+    val root = frl_project("@frame_limit(64)\nextern \"abs\" c_abs(n: i32) -> i32\n\nmain()\n    print(c_abs(-3))\n", "")
+    val (code, _, err) = frl_ran(root, ["build", "@", "-o", "@/app"])
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert(code != 0, err)
+    assert(err.contains("An 'extern''s frame is laid out by whoever compiled it"), err)
+end frl_the_attribute_refusals
+
+@test("'@frame_limit' on a method holds the method")
+frl_on_a_method()
+    if !frl_ready() then return
+
+    val main = "struct Pad\n    n: usize\n\n    @frame_limit(1024)\n    fill(self) -> u8\n" +
+        "        var block: [8192]u8 = [0; 8192]\n        block[self.n % 8192] = 1\n        block[0]\n\n" +
+        "main()\n    print(Pad(3).fill())\n"
+    val root = frl_project(main, "")
+    val (code, _, err) = frl_ran(root, ["build", "@", "-o", "@/app"])
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert(code != 0, err)
+    assert(err.contains("'Pad.fill' needs a stack frame of"), err)
+    assert(err.contains("set by '@frame_limit(1024)' above 'Pad.fill'"), err)
+end frl_on_a_method
+
+// -- every command, every path to clang -------------------------------------------------------------
+
+@test("build-c, build-lib and test are held to the limit as build is")
+frl_every_command()
+    if !frl_ready() then return
+
+    val lib = "@export(\"frl_deep\")\n" + FrlDeep
+
+    // A library is reached by naming its module, so its file sits in the module's directory.
+    val root = frl_root([("sysl.hocon", "package { name = \"frl\", version = \"0.1.0\" }\n"),
+                         ("frl/lib.sysl", s"module frl\n\n$lib")])
+
+    for command in ["build-c", "build-lib"]
+        var args: Buf[string] = buf()
+
+        args.push(command)
+        args.push("@")
+        args.push("--frame-limit")
+        args.push("2048")
+
+        if command == "build-c"
+            args.push("-o")
+            args.push("@/frl.a")
+
+        val (code, _, err) = frl_ran(root, args.view())
+
+        assert(code != 0, s"$command: $err")
+        assert(err.contains("deep' needs a stack frame of"), s"$command: $err")
+
+    val (ok, _, err) = frl_ran(root, ["build-c", "@", "-o", "@/frl.a"])
+
+    assert_eq(ok, 0, err)
+
+    write_text(s"$root/frl/lib.sysl", s"module frl\n\n$lib\n@test(\"deep\")\ndeep_answers()\n    assert_eq(deep(3), 0)\n").unwrap()
+
+    val (tested, _, err2) = frl_ran(root, ["test", "@", "--frame-limit", "2048"])
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert(tested != 0, err2)
+    assert(err2.contains("deep' needs a stack frame of"), err2)
+end frl_every_command
+
+@test("a freestanding board's archive is held to the limit, on 32-bit Thumb and on AArch64")
+frl_freestanding()
+    if !frl_ready() then return
+
+    for target in ["thumb-freestanding", "aarch64-freestanding"]
+        val manifest = s"targets {\n  default = \"$target\"\n  $target { capabilities { os = false, posix = false } }\n}\n"
+        val root = frl_project("@export(\"frl_deep\")\n" + FrlDeep, manifest)
+        val (code, _, err) = frl_ran(root, ["build-c", "@", "--target", target, "--frame-limit", "2048", "-o", "@/app.a"])
+        val (ok, _, err2) = frl_ran(root, ["build-c", "@", "--target", target, "--frame-limit", "100000", "-o", "@/app.a"])
+        val (_, _, _) = frl_ran(root, ["build-c", "@", "--target", target, "--stack-usage", "@/frames.txt", "-o", "@/app.a"])
+        val frame = frl_frame(s"$root/frames.txt", "deep")
+
+        remove_dir_all(root).unwrap_or(())
+
+        assert(code != 0 && err.contains("'deep' needs a stack frame of"), s"$target: $err")
+        assert_eq(ok, 0, s"$target: $err2")
+        assert(frame >= 65536, s"$target: $frame")
+end frl_freestanding
+
+private extern "setenv" frl_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" frl_c_unsetenv(name: *u8) -> int
+
+@test("text split into codegen units is held to the limit in every unit, and every unit is reported")
+frl_codegen_units()
+    if !frl_ready() then return
+
+    val k = cstring("SYSL_CODEGEN_UNITS")
+    val v = cstring("4")
+
+    frl_c_setenv(k.ptr, v.ptr, 1)
+
+    val main = frl_program("") + "\ndeeper(n: usize) -> u8\n    var block: [32768]u8 = [0; 32768]\n" +
+        "    block[n % 32768] = u8(n)\n    block[(n * 3) % 32768]\n"
+    val root = frl_project(replace_all(main, "print(deep(3))", "print(deep(3) + deeper(2))"), "")
+    val (code, _, err) = frl_ran(root, ["build", "@", "-O0", "--frame-limit", "2048", "-o", "@/app"])
+    val (ok, _, err2) = frl_ran(root, ["build", "@", "-O0", "--stack-usage", "@/frames.txt", "-o", "@/app"])
+    val deep = frl_frame(s"$root/frames.txt", "deep")
+    val deeper = frl_frame(s"$root/frames.txt", "deeper")
+
+    frl_c_unsetenv(k.ptr)
+    remove_dir_all(root).unwrap_or(())
+
+    assert(code != 0, err)
+    assert(err.contains("'deep' needs a stack frame of") && err.contains("'deeper' needs a stack frame of"), err)
+    assert_eq(ok, 0, err2)
+    assert(deep >= 65536 && deeper >= 32768, s"$deep $deeper")
+end frl_codegen_units
+
+@test("under link-time optimization the frames are still checked and reported")
+frl_under_lto()
+    if !frl_ready() then return
+
+    val root = frl_project(frl_program(""), "")
+    val (code, _, err) = frl_ran(root, ["build", "@", "--lto", "thin", "--frame-limit", "2048", "-o", "@/app"])
+    val (ok, _, err2) = frl_ran(root, ["build", "@", "--lto", "thin", "--stack-usage", "@/frames.txt", "-o", "@/app"])
+    val frame = frl_frame(s"$root/frames.txt", "deep")
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert(code != 0 && err.contains("'deep' needs a stack frame of"), err)
+    assert_eq(ok, 0, err2)
+    assert(frame >= 65536, s"$frame")
+end frl_under_lto
+
+@test("a run asking for the report compiles rather than replaying, and writes it")
+frl_run_writes_the_report()
+    if !frl_ready() then return
+
+    val root = frl_project(frl_program(""), "")
+
+    frl_ran(root, ["run", "@"])
+
+    val (code, _, err) = frl_ran(root, ["run", "@", "--stack-usage", "@/frames.txt"])
+    val frame = frl_frame(s"$root/frames.txt", "deep")
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert_eq(code, 0, err)
+    assert(frame >= 65536, s"$frame")
+end frl_run_writes_the_report
