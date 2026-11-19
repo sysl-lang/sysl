@@ -1,6 +1,7 @@
 # Unique values — `@unique` — design
 
-**Status: proposed (2026-11-17), for 0.11.13 as a language bug fix.** Every `sysl` block below with an
+**Status: proposed (2026-11-17). 0.11.13 ships U-1 only (§ 13): the attribute and the move check.
+`impl Drop` on a `@unique` type is still refused, so no `@unique` value has a destructor yet (U-2).** Every `sysl` block below with an
 `output` or `error` block under it is **proposed behaviour**: the compiler does not have it yet, and
 this page sits in `docs/design/`, which the docs sweep does not run. Each block moves into a reference
 page (`memory.md`, `attributes.md`, `declarations.md`) in the stage that makes it true (§ 13), and is
