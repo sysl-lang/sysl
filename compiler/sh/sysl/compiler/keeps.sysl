@@ -3301,15 +3301,31 @@ private bind_terms(t: &Track, cond: Buf[TCondTerm])
 end bind_terms
 
 // A name a pattern binds holds what its subject does, at the steps the subject was read at: a payload
-// sits in place in the value matched.
+// sits in place in the value matched. **Below a shape matched through a reference it is one step
+// further in**, as one bound out of `*x match` is (`steps_on`).
 private bind_pattern(t: &Track, p: TPattern, steps: Buf[int])
-    var names: Buf[string] = buf()
+    p match
+        TDerefPattern(_, inner) ->
+            var on: Buf[int] = buf()
 
-    pattern_names(p, &names)
+            for s in steps
+                if s + 1 < t.steps then push_step(&on, s + 1)
 
-    for n in names
-        bind_steps(t, n, steps)
-        bind_name(t, n)
+            bind_pattern(t, *inner, on)
+        TAtPattern(n, inner) ->
+            bind_steps(t, n, steps)
+            bind_name(t, n)
+            bind_pattern(t, *inner, steps)
+        TVariantPattern(_, _, args) ->
+            for a in args
+                bind_pattern(t, a, steps)
+        TStructPattern(_, args) ->
+            for a in args
+                bind_pattern(t, a, steps)
+        TBindPattern(n, _) ->
+            bind_steps(t, n, steps)
+            bind_name(t, n)
+        _ -> ()
 end bind_pattern
 
 private bind(t: &Track, name: string, value: TExpr)
@@ -3364,8 +3380,26 @@ pattern_names(p: TPattern, out: *Buf[string])
         TStructPattern(_, args) ->
             for a in args
                 pattern_names(a, out)
+        TDerefPattern(_, inner) -> pattern_names(*inner, out)
         _ -> ()
 end pattern_names
+
+// The names a pattern binds in the subject's own storage: not those below a shape matched through a
+// reference, which sit behind it, as nothing bound out of `*x match` sits in `x`.
+pattern_names_here(p: TPattern, out: *Buf[string])
+    p match
+        TBindPattern(n, _) -> out.push(n)
+        TAtPattern(n, inner) ->
+            out.push(n)
+            pattern_names_here(*inner, out)
+        TVariantPattern(_, _, args) ->
+            for a in args
+                pattern_names_here(a, out)
+        TStructPattern(_, args) ->
+            for a in args
+                pattern_names_here(a, out)
+        _ -> ()
+end pattern_names_here
 
 // The local whose own storage a place is: a chain of field and element steps from it, never through a
 // pointer or a reference, and a `ref` followed to what it names.

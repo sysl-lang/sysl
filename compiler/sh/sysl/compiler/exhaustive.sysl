@@ -257,6 +257,32 @@ private space(t: Type) -> Option[Buf[Ctor]] = repr(t) match
 
     _ -> None
 
+// The constructors a column is split by, given the rows that read it.
+//
+// **A reference column is split by what it holds only where some row reaches through it**: a row
+// that only names or skips the reference rules nothing out, and splitting a recursive type nobody
+// narrowed would walk every variant of every `&Self` field down to the cap -- the work multiplying by
+// the variant count at each level -- to learn nothing.
+private column_space(t: Type, rows: Buf[Buf[TPattern]], q: Option[TPattern]) -> Option[Buf[Ctor]] =
+    repr(t) match
+        Ref(inner, _) ->
+            if !erased(t) && (any_reaches(rows) || (q.is_some() && reaches_through(q.unwrap()))) then
+                column_space(*inner, rows, q)
+            else None
+        _ -> space(t)
+
+private any_reaches(rows: Buf[Buf[TPattern]]) -> bool
+    for row in rows
+        if !row.is_empty() && reaches_through(row[0]) then return true
+
+    false
+end any_reaches
+
+private reaches_through(p: TPattern) -> bool = p match
+    TAtPattern(_, inner) -> reaches_through(*inner)
+    TDerefPattern(_, _) -> true
+    _ -> false
+
 private field_types(fields: Buf[(string, Type)]) -> Buf[Type]
     var out: Buf[Type] = buf()
 
@@ -268,8 +294,12 @@ end field_types
 
 // A pattern with its bindings taken off -- what it *tests for*, which is the only thing coverage is
 // about. `n @ Circle(r)` covers exactly what `Circle(r)` covers.
+//
+// **A reference is covered by what it holds**: a shape matched through a `&T` tests the `T`, and
+// the reference has no other value to miss, so the column is read as the held type's.
 private unbound(p: TPattern) -> TPattern = p match
     TAtPattern(_, inner) -> unbound(*inner)
+    TDerefPattern(_, inner) -> unbound(*inner)
     _ -> p
 
 // The constructor a pattern tests for, or none where it matches whatever is there.
@@ -386,7 +416,7 @@ private covers(rows: Buf[Buf[TPattern]], tys: Buf[Type], depth: int, m: FoldMach
     if rows.is_empty() then return false
 
     val rest = tail_types(tys)
-    val cons = if depth < MaxSplitDepth then space(tys[0]) else None
+    val cons = if depth < MaxSplitDepth then column_space(tys[0], rows, None) else None
 
     if cons.is_none()
         val cut = if depth < MaxSplitDepth then pieces(tys[0], rows, m) else None
@@ -518,7 +548,7 @@ private witnesses(rows: Buf[Buf[TPattern]], tys: Buf[Type], depth: int, room: us
     end if
 
     val rest = tail_types(tys)
-    val cons = if depth < MaxSplitDepth then space(tys[0]) else None
+    val cons = if depth < MaxSplitDepth then column_space(tys[0], rows, None) else None
 
     if cons.is_some()
         val list = cons.unwrap()
@@ -931,7 +961,7 @@ private useful(rows: Buf[Buf[TPattern]], q: Buf[TPattern], tys: Buf[Type], depth
     val rest = tail_types(tys)
     val head = unbound(q[0])
     val qrest = tail_of(q)
-    val cons = space(tys[0])
+    val cons = column_space(tys[0], rows, Some(q[0]))
 
     if cons.is_some() then return useful_closed(cons.unwrap(), rows, head, q, qrest, rest, depth, m)
 
