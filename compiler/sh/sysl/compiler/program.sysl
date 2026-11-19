@@ -258,11 +258,27 @@ dropping_reached(a: &Analysis) -> Buf[Type]
     for item in reached_structs(a)
         if has_destructor_key(keys, mangle(item)) then out.push(item)
 
-    for item in reached_enums(a)
+    for item in dropping_enums(a)
         if has_destructor_key(keys, mangle(item)) then out.push(item)
 
     out
 end dropping_reached
+
+// The enums a destructor may be filed for: every one a program lists, and a simple one marked
+// `@unique` besides -- a simple enum is no box and has no layout entry, but a `@unique` one is a
+// value its owner lets go of, and its destructor runs then.
+private dropping_enums(a: &Analysis) -> Buf[Type]
+    var out = reached_enums(a)
+
+    for i in 0..<a.tables.enum_insts.len()
+        val t = a.tables.enum_insts.at(i)
+
+        t match
+            Enum(d) -> if d.simple && d.unique && !instantiated_abstract(t) then out.push(t)
+            _ -> ()
+
+    out
+end dropping_enums
 
 private has_destructor_key(keys: Buf[(string, string)], key: string) -> bool
     for item in keys
@@ -278,7 +294,7 @@ private destructors_of(a: &Analysis) -> Buf[(string, string)]
     if drops.is_empty() then return out
 
     val made = reached_structs(a)
-    val enums = reached_enums(a)
+    val enums = dropping_enums(a)
 
     for item in made
         push_destructor(a, drops, &out, item)

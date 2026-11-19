@@ -280,7 +280,12 @@ end forget_unique_temp
 // it, each counted part is taken over or retained as any destination's is, and the value is a
 // temporary of the statement until a destination takes it. Built and thrown away, it is let go of --
 // its destructor runs -- where the statement ends.
-own_built(e: *Emit, ty: Type, v: Val, parts: Buf[TExpr], part_vals: Buf[Val], part_tys: Buf[Type])
+//
+// **The value answered is the one to use from here.** A temporary is found again by its register, and
+// a value with nothing to compute -- a simple variant, a struct with no fields -- is a constant, which
+// is no register; such a one is given a register of its own, so two of them in one statement are two
+// temporaries a destination can tell apart.
+own_built(e: *Emit, ty: Type, v: Val, parts: Buf[TExpr], part_vals: Buf[Val], part_tys: Buf[Type]) -> Val
     for i in 0..<parts.len()
         if i < part_vals.len() && i < part_tys.len()
             val pty = part_tys[i]
@@ -288,7 +293,12 @@ own_built(e: *Emit, ty: Type, v: Val, parts: Buf[TExpr], part_vals: Buf[Val], pa
             if value_drops(e, pty) then take_unique(e, parts[i], pty, part_vals[i])
             else if contains_counted(pty) then retain_moving(e, parts[i], pty, part_vals[i])
 
-    own_temp(e, v, ty)
+    if slot_reg(v) != "" then return own_temp(e, v, ty)
+
+    val r = fresh_reg(e)
+
+    emit(e, InSelect(r, VBool(true), lty(e, ty), v, v, l_i1()))
+    own_temp(e, r, ty)
 end own_built
 
 // The types of a list of fields, in order.

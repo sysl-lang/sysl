@@ -61,13 +61,29 @@ check_abandons_signature(a: &Analysis, scope: Scope, at: Span, name: string, gen
         if contains_counted(p.1)
             a.fault(scope, at, s"'${name}' is '@abandons', so its caller's frame is given back before the call and nothing is left to give back the count its parameter '${p.0}' holds — a '${type_show(p.1)}' carries one. Pass what it needs as a value that carries no count, or through a '*T'")
             return
-
-        unique_drop_held(a, p.1) match
-            Some(held) ->
-                a.fault(scope, at, s"'${name}' is '@abandons', so it never comes back to drop its parameter '${p.0}' — a '${type_show(p.1)}' holds the '@unique' '${type_show(held)}', whose destructor would never run. Pass a '*${type_show(p.1)}' instead")
-                return
-            None -> ()
 end check_abandons_signature
+
+// What an `@abandons` function's parameters owe once every `impl` is in: none may hold a `@unique`
+// value with a destructor, which the callee owns and would never come back to drop. **Asked after the
+// members are hoisted**, not with the rest of the signature, since whether a type has a `Drop` is an
+// `impl` block's answer and the signatures are read before any `impl` is.
+check_abandons_unique(a: &Analysis)
+    if !any_unique(a) then return
+
+    for i in 0..<a.tables.funcs.len()
+        val f = a.tables.funcs.at(i)
+
+        if !f.decl.marks.abandons || !f.decl.tparams.is_empty() then continue
+
+        for p in resolved_params(a, f.scope, f.decl.params, false)
+            if contains_counted(p.1) then break
+
+            unique_drop_held(a, p.1) match
+                Some(held) ->
+                    a.fault(f.scope, f.span, s"'${f.decl.name}' is '@abandons', so it never comes back to drop its parameter '${p.0}' — a '${type_show(p.1)}' holds the '@unique' '${type_show(held)}', whose destructor would never run. Pass a '*${type_show(p.1)}' instead")
+                    break
+                None -> ()
+end check_abandons_unique
 
 // Whether a value of this type, held across a call that can abandon the frame, would be given back by
 // nothing: it carries a count, or holds a `@unique` value with a destructor.

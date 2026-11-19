@@ -55,7 +55,8 @@ private udr_skip() -> bool
     false
 end udr_skip
 
-// Everything analysing one file said about that file, one message to a line.
+// Everything analysing one file said about that file, one message to a line: the bodies, and where
+// they said nothing, the whole-program checks (`@abandons`, `@no_alloc`) after them.
 private udr_said(text: string) -> string
     var units: Buf[Program] = buf()
 
@@ -69,6 +70,13 @@ private udr_said(text: string) -> string
 
     for item in done.reported
         if item.src.name == "main.sysl" then out.push(item.diag.message)
+
+    if out.is_empty()
+        val _ = post_analysis_checks(done.an, program_of(done, ""), buf())
+
+        for item in errors_of(done.an.diagnostics())
+            if item.src.name == "main.sysl" then out.push(item.diag.message)
+    end if
 
     join(out.view(), "\n")
 end udr_said
@@ -143,7 +151,8 @@ private udr_body(ir: string, symbol: string) -> string
     var inside = false
 
     for line in lines
-        if line.starts_with("define ") && line.contains(s"@$symbol(") then inside = true
+        if line.starts_with("define ") && (line.contains("@" + symbol + "(") || line.contains("@" + symbol + "$"))
+            inside = true
 
         if inside
             out.push(line)
@@ -433,10 +442,20 @@ udr_reassignment()
 
             var a = Res(7)
             var b = Res(8)
+            val t = a
 
-            (a, b) = (b, a)
+            a = b
+            b = t
             print("swapped", a.n, b.n)
         """, "kept 1\ndrop 1\nrefilled 2\ndrop 2\ndrop 1\nrefilled 2\ndrop 2\nswapped 8 7\ndrop 7\ndrop 8\n")
+
+    // A tuple taken apart moves its parts out of a local the compiler made; that waits for patterns,
+    // and is refused naming the form the program wrote, by assignment and by declaration.
+    val apart = "this takes a tuple apart, moving a part out of it, and 'Res' is '@unique' — this is not " +
+                "supported yet"
+
+    udr_refused(udr_res + "main()\n    var a = Res(7)\n    var b = Res(8)\n\n    (a, b) = (b, a)\n", apart)
+    udr_refused(udr_res + "main()\n    val (a, b) = (Res(7), Res(8))\n\n    print(a.n, b.n)\n", apart)
 
 @test("a field of a '@unique' holder assigned through a pointer drops what it held")
 udr_field_assignment()
@@ -597,6 +616,51 @@ udr_enums()
             print("lit")
         """, "lit\ndrop 1\nlight off\n")
 
+    // A simple variant is a constant, and a struct with no fields too: each is still a value its owner
+    // lets go of -- handed on, assigned over, thrown away, or two of them made in one statement.
+    udr_runs(raw"""
+        @unique
+        enum Light
+            Red
+            Green
+
+        impl Drop for Light
+            drop(self)
+                val on = self match
+                    Red -> false
+                    Green -> true
+
+                print("light off", on)
+
+        @unique
+        struct Mark
+        end Mark
+
+        impl Drop for Mark
+            drop(self) = print("mark gone")
+
+        off(l: Light) = print("handed")
+
+        both(a: Light, b: Light)
+            print("both")
+            off(b)
+
+        made() -> Light = Red
+
+        main()
+            var m = Red
+
+            m = Green
+            off(Red)
+            both(Red, Green)
+            made()
+
+            val k = Mark()
+
+            print("end")
+        """, "light off false\nhanded\nlight off false\nboth\nhanded\nlight off true\nlight off false\n" +
+             "light off false\nend\nmark gone\nlight off true\n")
+
 // -- the whole-program rules ---------------------------------------------------------------------------------
 
 @test("'@no_alloc': building, moving and dropping allocates nothing, and the destructor is held to it")
@@ -629,6 +693,14 @@ udr_abandons()
     udr_refused(udr_res + "@abandons\nstop(r: Res) -> never\n    loop\n        ()\n",
                 "so it never comes back to drop its parameter 'r'")
 
+    // Asked once every 'impl' is in: a function written above the type and its 'Drop', a parameter
+    // that holds one in a field, and a pointer, which hands nothing over.
+    udr_refused("@abandons\nstop(w: Wallet) -> never\n    loop\n        ()\n\n" + udr_res +
+                "@unique\nstruct Wallet\n    r: Res\n",
+                "'stop' is '@abandons', so it never comes back to drop its parameter 'w' — a 'Wallet' holds the " +
+                "'@unique' 'Res'")
+    assert_eq(udr_said(udr_res + "@abandons\nstop(r: *Res) -> never\n    loop\n        ()\n"), "")
+
     udr_refused(udr_res + raw"""
         @abandons
         stop(code: int) -> never
@@ -650,7 +722,7 @@ udr_not_yet()
     val not_yet = "and 'Res' is '@unique' — this is not supported yet"
 
     udr_refused(udr_res + "main()\n    val o = Some(Res(1))\n", "this makes a 'Option[Res]', which holds 'Res' by value, " + not_yet)
-    udr_refused(udr_res + udr_keep + "main()\n    val f = keep\n\n    f(Res(1))\n",
+    udr_refused(udr_res + "run(f: *extern(Res) -> unit)\n    f(Res(1))\n",
                 "this hands 'Res' by value to a call through a pointer, " + not_yet)
     udr_refused(udr_res + "main()\n    val f = (r: Res) -> r.n\n",
                 "a closure taking 'r' by value, and 'Res' is '@unique' with a 'Drop'")
