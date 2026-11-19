@@ -2,7 +2,7 @@ module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
 import sysl.env.get as env_var
-import sysl.fs.{make_temp_dir, read_text, remove_dir_all, write_text_atomic}
+import sysl.fs.{is_file, make_temp_dir, read_text, remove_dir_all, write_text, write_text_atomic}
 import sysl.process.{spawn, Var}
 import sysl.text.{str_builder, StrBuilder}
 
@@ -17,6 +17,14 @@ import sysl.text.{str_builder, StrBuilder}
 // judge them -- and that process writes what is to be run (`TestPlan`) and exits, handing every byte
 // of the compile back to the system. The runner reads the plan and runs it.
 //
+// **A suite that is to be linked takes a second child.** The first compiles it, writes the module's text
+// and what the link reads of the compilation (`StashedBuild`) and exits before any clang starts; the
+// runner then starts the LINK child, which reads the project, takes the text up, links, judges the
+// refused programs and writes the plan. The link's clangs -- sixteen at once for the compiler's own
+// suite -- so never run beside a process holding what the compilation left behind, which no call
+// inside the process can give back (`heap_memory.sysl`). A suite with nothing to link -- replayed from
+// the cache, refused, nothing chosen -- is one child, as before.
+//
 // **The child says what it says itself**, on the streams it shares with the runner: every note, a
 // build error, a refusal, the `instrumented:` and `kept:` lines, each written and flushed before the
 // child exits, so the reader sees what one process would have shown, in the order it would have shown
@@ -30,6 +38,9 @@ import sysl.text.{str_builder, StrBuilder}
 // workspace member, or the path the command line named) it builds.
 private const PlanVariable: string = "SYSL_TEST_PLAN"
 private const ProjectVariable: string = "SYSL_TEST_PROJECT"
+
+// And the one that makes it the LINK child: where the compiled suite it links is (`StashedBuild`).
+private const BuiltVariable: string = "SYSL_TEST_BUILT"
 
 // The compiler a test run starts to build in, or empty to build in this process.
 private var test_builder: string = ""
@@ -47,10 +58,17 @@ build_tests_with(exe: Option[string])
 // The process id of the last build child, or zero where the last suite was built in process.
 last_test_builder() -> int = last_builder
 
+// Every child the command line started, in order: a suite that is linked has two, the one that
+// compiled it and the one that linked it; one that is not -- replayed, refused, nothing to run -- one.
+private var builders: Buf[int] = buf()
+
+test_builders() -> Buf[int] = builders.copy()
+
 // The command line `sysl test` was given, kept for the child: its arguments, the program's own name
 // being the one thing the child is not handed. A new command line has started no child yet.
 remember_test_args(args: []const string)
     last_builder = 0
+    builders = buf()
     test_args = buf()
 
     for i in 1..<args.len
@@ -105,22 +123,16 @@ tested_in_child(file: string, note: string -> unit, report: string -> unit) -> i
     flush_report()
     compiling_started(file)
 
-    val code = spawn(test_builder, test_args.view(), "", env) match
-        Err(_) ->
-            compiling_done()
-            remove_dir_all(dir).unwrap_or(())
-            note(refused(s"$test_builder could not be run to build the tests"))
-            return Failed
-        Ok(child) ->
-            last_builder = child.pid()
-            builder_started(child.pid())
+    var code = child_ran(env, note)
 
-            val ended = child.wait()
+    // **A suite the build child compiled is linked by a second child that never held the
+    // compilation.** The build child writes the module's text and exits, so what the analysis and the
+    // lowering left behind -- freed, but kept by the allocator, 11.5 GB of footprint for the compiler's
+    // own suite (`heap_memory.sysl`) -- is given back before the link's clangs start beside it.
+    val built = stash_of(plan)
 
-            builder_ended()
-            ended match
-                Ok(state) -> shell_status(state)
-                Err(_) -> Failed
+    if code == Fine && !is_file(plan) && is_file(built)
+        code = child_ran([Var(PlanVariable, plan), Var(ProjectVariable, file), Var(BuiltVariable, built)], note)
 
     compiling_done()
 
@@ -139,6 +151,25 @@ tested_in_child(file: string, note: string -> unit, report: string -> unit) -> i
             Failed
         Some(p) -> plan_run(p, report)
 end tested_in_child
+
+// The runner's own command line run as a child with `env`, waited for; its status, or `Failed` where
+// it could not be started, which is said.
+private child_ran(env: []const Var, note: string -> unit) -> int =
+    spawn(test_builder, test_args.view(), "", env) match
+        Err(_) ->
+            note(refused(s"$test_builder could not be run to build the tests"))
+            Failed
+        Ok(child) ->
+            last_builder = child.pid()
+            builders.push(child.pid())
+            builder_started(child.pid())
+
+            val ended = child.wait()
+
+            builder_ended()
+            ended match
+                Ok(state) -> shell_status(state)
+                Err(_) -> Failed
 
 // A plan, run and reported: the binary removed afterwards where it is not the cache's, and the run's
 // status from its verdicts.
@@ -351,4 +382,97 @@ private struct PlanReader
     skipped(*self) -> Option[int]
         _ = self.next()
         None
+
+    // A count, then that many fields.
+    fields(*self) -> Buf[string]
+        var out: Buf[string] = buf()
+
+        for _ in 0..<self.number()
+            out.push(self.next())
+
+        out
+    end fields
 end PlanReader
+
+// --- the compiled suite, handed to the link child ----------------------------------------------------
+
+// What a build child hands the child that links: everything the link and the run after it read of the
+// compilation, which is the module's text and four lists. The rest of what the link needs -- the
+// target, the packages' C, the standard module's artifact -- is the project's, and the link child
+// reads it from the project as the build child did.
+struct StashedBuild
+    text: string
+    links: Buf[string]
+    archives: Buf[string]
+    tests: Buf[TTest]
+
+    // Every file the build's C read, which the run cache keys the binary on (`c_object_cache.sysl`).
+    files_read: Buf[string]
+
+    // How many `@tests` files `--file` left out of the build (`TestBuild.dropped_files`), which picks
+    // the key the linked binary is kept under.
+    dropped_files: usize
+end StashedBuild
+
+// Where the build child writes the compiled suite: beside the plan, in the runner's directory, which
+// the runner takes away whatever happens.
+private stash_of(plan: string) -> string = plan + ".built"
+
+// The compiled suite this process is to link, where it is the link child.
+test_build_stashed() -> Option[string]
+    val at = env_var(BuiltVariable).unwrap_or("")
+
+    if at == "" then None else Some(at)
+end test_build_stashed
+
+// The compiled suite, written beside the build child's `plan` for the link child; a suite that cannot
+// be written is said and fails the run. The text goes in a file of its own, as it is, so writing it
+// copies nothing.
+stash_written(plan: string, s: StashedBuild, note: string -> unit) -> int
+    val at = stash_of(plan)
+    var b = str_builder()
+
+    plan_list(&b, s.links)
+    plan_list(&b, s.archives)
+    plan_field(&b, s"${s.tests.len()}")
+
+    for t in s.tests
+        plan_test(&b, t)
+
+    plan_list(&b, s.files_read)
+    plan_field(&b, s"${s.dropped_files}")
+
+    val wrote = write_text(s"$at.ll", s.text).is_ok() && write_text_atomic(at, b.finish()).is_ok()
+
+    if wrote then return Fine
+
+    note(refused(s"cannot write the compiled tests at $at"))
+    Failed
+end stash_written
+
+// The compiled suite read back, or nothing where any field will not read.
+stash_read(at: string) -> Option[StashedBuild]
+    val record = read_text(at).ok()?
+    val text = read_text(s"$at.ll").ok()?
+    var r = PlanReader(record, 0, true)
+    val links = r.fields()
+    val archives = r.fields()
+    var tests: Buf[TTest] = buf()
+
+    for _ in 0..<r.number()
+        tests.push(r.test())
+
+    val files = r.fields()
+    val dropped = r.number()
+
+    if !r.ok || r.at != record.bytes.len || dropped < 0 then return None
+
+    Some(StashedBuild(text, links, archives, tests, files, usize(dropped)))
+end stash_read
+
+private plan_list(b: *StrBuilder, items: Buf[string])
+    plan_field(b, s"${items.len()}")
+
+    for item in items
+        plan_field(b, item)
+end plan_list

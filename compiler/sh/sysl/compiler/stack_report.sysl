@@ -3,14 +3,14 @@ module sh.sysl.compiler
 import sysl.buf.{Buf, buf}
 import sysl.container.{Map, map}
 import sysl.fs.{make_temp_dir, read_text, remove_dir_all}
-import sysl.text.{join, parse_int, split, Search}
+import sysl.text.{join, split, Search}
 
 // `sysl stack`: the deepest stack each way into a program can need, worked out before it runs.
 //
 // **Two facts, each from the stage that knows it.** The program is lowered with the standard
 // module's bodies in the text, so a call into the library is followed rather than guessed at, and
 // clang is handed it at the level and for the machine asked about: once for each function's frame
-// (`-fstack-usage`) and once for the optimized text those frames belong to, whose calls are the call
+// (the stack-usage file `--stack-usage` reads too) and once for the optimized text those frames belong to, whose calls are the call
 // graph. The deepest way down the graph, its frames added up, is the answer.
 //
 // **What cannot be bounded is said to be, with the reason**, never answered with a number:
@@ -73,11 +73,13 @@ private stack_facts(ir: string, frames: Map[string, (u64, bool)], assumed: Map[s
     facts
 end stack_facts
 
-// What the back end answers with: each function's frame, as `-fstack-usage` writes it, and the text
-// its optimizer made of the program, at the same level.
+// What the back end answers with: each function's frame, as the stack-usage file `--stack-usage`
+// reads (`frame_limit.sysl`) writes it, the text its optimizer made of the program at the same level,
+// and the file clang compiled, which each line of the stack-usage file names before the function.
 struct StackUsage
     su: string
     optimized: string
+    source: string
 end StackUsage
 
 // The two graphs a depth is asked of.
@@ -96,7 +98,7 @@ struct StackAnalysis
 end StackAnalysis
 
 stack_analysis(written_ir: string, usage: StackUsage, assumed: Buf[(string, u64)]) -> &StackAnalysis
-    val frames = frames_of(usage.su)
+    val frames = frames_of(usage.su, usage.source)
     var taken: Map[string, u64] = map()
 
     for item in assumed
@@ -516,51 +518,31 @@ private name_byte(b: u8) -> bool =
     (b >= u8('a') && b <= u8('z')) || (b >= u8('A') && b <= u8('Z')) || (b >= u8('0') && b <= u8('9')) ||
     b == u8('$') || b == u8('.') || b == u8('_') || b == u8('-')
 
-// Each function's frame out of a `.su` file -- `file:name<TAB>bytes<TAB>static` -- with whether the
-// back end sized it at run time. `dynamic,bounded` is a frame whose size is a bound, and is one.
-frames_of(su: string) -> Map[string, (u64, bool)]
+// Each function's frame out of the stack-usage file clang wrote compiling `source`, read as
+// `--stack-usage` reads it (`frame_rows`), with whether the back end sized it at run time.
+// `dynamic,bounded` is a frame whose size is a bound, and is one.
+frames_of(su: string, source: string) -> Map[string, (u64, bool)]
     var out: Map[string, (u64, bool)] = map()
 
-    for line in lines_of(su)
-        val tab = line.index_of("\t")
-
-        if tab.is_none() then continue
-
-        val head = line[0..<tab.unwrap()]
-        val rest = line[tab.unwrap() + 1..<line.len]
-        val colon = last_colon(head)
-        val name = if colon.is_some() then head[colon.unwrap() + 1..<head.len] else head
-        val tab2 = rest.index_of("\t")
-        val digits = if tab2.is_some() then rest[0..<tab2.unwrap()] else rest
-        val kind = if tab2.is_some() then rest[tab2.unwrap() + 1..<rest.len] else "static"
-        val bytes = parse_int(digits).unwrap_or(0)
-
-        out.put(name, (u64(bytes), kind == "dynamic"))
+    for row in frame_rows(su, source)
+        out.put(row.2, (u64(row.0), row.1 == "dynamic"))
 
     out
 end frames_of
 
-private last_colon(s: string) -> Option[usize]
-    var found: Option[usize] = None
-
-    for i in 0..<s.bytes.len
-        if s.bytes[i] == u8(':') then found = Some(i)
-
-    found
-
 // -- the build that answers -----------------------------------------------------------------------
 
-// The frames the back end lays out for a lowered text, as the `.su` file `-fstack-usage` writes.
+// The frames the back end lays out for a lowered text, in the stack-usage file `--stack-usage` asks
+// for the same way (`stack_usage_flags`).
 //
 // Two runs of the same clang line: the object, for the frames, and the optimized text, for the calls
 // the frames belong to. `-S` stops the second short of the object the `-c` before it asks for.
 stack_usage_of(ir: string, t: Target, level: string) -> Result[StackUsage, string]
     val cc = find_clang(t, None)?
     val dir = make_temp_dir("sysl-stack").map_err(_ -> "cannot make a scratch directory")?
-    var frames_flags: Buf[string] = buf()
+    val frames_flags = stack_usage_flags(s"$dir/stack.su")
     var text_flags: Buf[string] = buf()
 
-    frames_flags.push("-fstack-usage")
     text_flags.push("-S")
     text_flags.push("-emit-llvm")
     text_flags.push("-Wno-unused-command-line-argument")
@@ -575,7 +557,8 @@ stack_usage_of(ir: string, t: Target, level: string) -> Result[StackUsage, strin
     made?
     shown?
 
-    val frames = su.map_err(_ -> s"$cc wrote no stack-usage file — it may not be a clang that supports '-fstack-usage'")?
+    val frames = su.map_err(_ -> s"$cc wrote no stack-usage file — it may not be a clang that supports '-stack-usage-file'")?
 
-    Ok(StackUsage(frames, optimized.map_err(_ -> s"$cc wrote no optimized text")?))
+    // `compile_object` hands clang the text as `<obj>.ll`, which each line of the file names.
+    Ok(StackUsage(frames, optimized.map_err(_ -> s"$cc wrote no optimized text")?, s"$dir/stack.o.ll"))
 end stack_usage_of

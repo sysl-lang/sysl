@@ -35,7 +35,7 @@ private wsr_line(ir: string, su: string, entry: string) -> string
     var entries: Buf[(string, string)] = buf()
 
     entries.push((entry, entry))
-    stack_report_text(stack_analysis(ir, StackUsage(su, ir), buf()), entries)
+    stack_report_text(stack_analysis(ir, StackUsage(su, ir, "x.ll"), buf()), entries)
 end wsr_line
 
 private const wsr_chain: string =
@@ -108,7 +108,7 @@ wsr_indirect_assumed()
     var entries: Buf[(string, string)] = buf()
 
     entries.push(("main", "main"))
-    assert_eq(stack_report_text(stack_analysis(ir, StackUsage(wsr_su(rows), ir), assumed), entries),
+    assert_eq(stack_report_text(stack_analysis(ir, StackUsage(wsr_su(rows), ir, "x.ll"), assumed), entries),
               "main: 560 bytes, by 'main' → 'run' → a call through a pointer, taken as 512 bytes")
 
 @test("inlining moves a call through a pointer into its caller, and the bound said of the written body follows it")
@@ -127,11 +127,11 @@ wsr_indirect_inlined()
     var entries: Buf[(string, string)] = buf()
 
     entries.push(("main", "main"))
-    assert_eq(stack_report_text(stack_analysis(written, StackUsage(wsr_su(rows), optimized), assumed), entries),
+    assert_eq(stack_report_text(stack_analysis(written, StackUsage(wsr_su(rows), optimized, "x.ll"), assumed), entries),
               "main: 560 bytes, by 'main' → a call through a pointer, taken as 512 bytes")
 
     // Unsaid, the inlined call is the written body's, and the reason names that body.
-    assert_eq(stack_report_text(stack_analysis(written, StackUsage(wsr_su(rows), optimized), buf()), entries),
+    assert_eq(stack_report_text(stack_analysis(written, StackUsage(wsr_su(rows), optimized, "x.ll"), buf()), entries),
               "main: unbounded — 'run' calls through a pointer — a trait object, a '&Fn' closure or a " +
               "function pointer — whose target is not known, and it says nothing with '@stack(calls: n)'")
 
@@ -150,6 +150,19 @@ wsr_dynamic_frame()
     bounded.push(("main", 16, "static"))
     bounded.push(("f", 32, "dynamic,bounded"))
     assert_eq(wsr_line(ir, wsr_su(bounded), "main"), "main: 48 bytes, by 'main' → 'f'")
+
+@test("the frames are read as '--stack-usage' reads them: a promoted symbol as written, a stray line skipped")
+wsr_frames_shared_reader()
+    val su = "x.ll:sysl.cgu:f\t32\tstatic\nx.ll:g\t8\tdynamic\nnot a row\nx.ll:h\tmany\tstatic\n"
+    val frames = frames_of(su, "x.ll")
+
+    assert_eq(frames.get("f").map((p) -> p.0), Some(u64(32)))
+    assert_eq(frames.get("g").map((p) -> p.1), Some(true))
+    assert(frames.get("sysl.cgu:f").is_none())
+    assert(frames.get("h").is_none())
+
+    // A file of another source keeps the whole head as the name, so nothing is read under a guess.
+    assert(frames_of(su, "y.ll").get("g").is_none())
 
 @test("a C function is counted as nothing and named; an LLVM intrinsic is neither")
 wsr_c_named()
@@ -187,7 +200,7 @@ wsr_callee_parse()
 @test("an entry the text does not define is said to have no code, and no entry at all is said too")
 wsr_missing_entry()
     assert_eq(wsr_line(wsr_chain, "", "nowhere"), "nowhere: no code of its own in this build")
-    assert_eq(stack_report_text(stack_analysis(wsr_chain, StackUsage("", wsr_chain), buf()), buf()),
+    assert_eq(stack_report_text(stack_analysis(wsr_chain, StackUsage("", wsr_chain, "x.ll"), buf()), buf()),
               "this program has no entry point and exports nothing, so nothing enters it")
 
 // -- real programs ---------------------------------------------------------------------------------

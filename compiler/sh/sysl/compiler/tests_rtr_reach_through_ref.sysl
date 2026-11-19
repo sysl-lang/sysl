@@ -1,0 +1,570 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{replace_all, Search}
+
+// Patterns reach through a reference (`reference/patterns.md § Matching through a reference`): a
+// variant, struct or tuple pattern over a `&T` -- at the top, or nested where a payload or a field is a
+// `&T` -- tests and binds what the reference holds, exactly as `*x match` does. A name, `_` and a
+// literal still meet the reference itself; a raw pointer is still matched through a written `*`.
+//
+// The axes: where the reference stands (the scrutinee, a payload, an `Option[&T]`, two references
+// deep, a `&sync T`); the form (`match`, `is`, `while … is`, `is not`, a `for` header, a `val`
+// binding, function clauses, `@`, `|` alternatives, a guard); the shape (variant, nullary name,
+// backticked name, positional struct, named struct, tuple); the counts (a counted heap after a
+// recursive walk, a payload that escapes, a failed guard; the retains emitted against the written
+// `*x match`); what is still refused (a write to a value binding, a raw pointer, a trait object, a
+// reference to a scalar, a gap, a dead arm, a name under `is not`). Skipped: a `ref` binding mode --
+// sysl has no `ref` pattern, and a binding is a copy here as everywhere (the decisions log).
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private struct RtrRun
+    ok: bool
+    out: string
+    err: string
+
+private rtr_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end rtr_ready
+
+private rtr_write(main: string) -> string
+    val root = make_temp_dir("sysl-ptr").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(root + "/main.sysl", main).unwrap()
+    root
+end rtr_write
+
+// The program built -- on a counted heap where `counted` -- and run.
+private rtr_run(main: string, counted: bool) -> RtrRun
+    val root = rtr_write(main)
+
+    force_alloc_counting(counted)
+
+    val built = build_native_program(root, None, None, DefaultOptimization, Some(root + "/built"))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return RtrRun(false, failure_text(why), "")
+        Ok(_) -> ()
+
+    val said = capture(root + "/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> RtrRun(false, "could not be started", "")
+        Ok(o) -> RtrRun(o.status.ok(), o.text, o.err.unwrap_or(""))
+end rtr_run
+
+// The program prints exactly this, and on a counted heap gives every allocation back.
+private rtr_prints(main: string, expected: string)
+    val run = rtr_run(main, true)
+
+    assert(run.ok, run.out)
+    assert(run.out == expected, s"expected '$expected', got: ${run.out}")
+    assert(alloc_count_reported(run.err) == 0, s"expected nothing kept, got: ${run.err}")
+end rtr_prints
+
+// The LLVM text of the program, or everything the analysis had to say about it.
+private rtr_report(main: string) -> string
+    val root = rtr_write(main)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end rtr_report
+
+// The program is refused, first, with a diagnostic containing `message`.
+private rtr_refused(main: string, message: string)
+    val out = rtr_report(main)
+
+    assert(out.starts_with("error: "), s"expected a refusal, got: $out")
+
+    val first = out.index_of("\n") match
+        Some(n) -> out[0..<n]
+        None -> out
+
+    assert(first.index_of(message).is_some(), s"expected '$message', got: $out")
+end rtr_refused
+
+// How many times the text calls `name`.
+private rtr_calls(ir: string, name: string) -> int
+    var n = 0
+    var at: usize = 0
+    val needle = s"call void @$name("
+
+    loop
+        val rest = ir[at..<ir.bytes.len]
+        val hit = rest.index_of(needle)
+
+        if hit.is_none() then return n
+
+        n += 1
+        at += hit.unwrap() + needle.bytes.len
+end rtr_calls
+
+private rtr_tree() -> string = """
+    enum Tree
+        Leaf(v: int)
+        Node(l: &Tree, r: &Tree)
+
+    sum(t: &Tree) -> int
+        t match
+            Leaf(v) -> v
+            Node(l, r) -> sum(l) + sum(r)
+
+    """
+
+private rtr_slot() -> string = """
+    enum Slot
+        Empty
+        Full(n: int)
+
+    """
+
+private rtr_point() -> string = """
+    struct Point
+        x: int
+        y: int
+
+    """
+
+// == what the reference claims =====================================================================
+
+@test("a variant pattern over a '&Enum' matches what the reference holds")
+rtr_top_level_reaches()
+    if !rtr_ready() then return
+
+    rtr_prints(rtr_tree() + """
+        val t: &Tree = Node(Leaf(1), Node(Leaf(2), Leaf(3)))
+
+        print(sum(t))
+        """, "6\n")
+
+@test("a variant pattern reaches through a '&T' payload at any depth")
+rtr_nested_payload_reaches()
+    if !rtr_ready() then return
+
+    rtr_prints(rtr_tree() + """
+        shape(t: &Tree) -> string
+            t match
+                Leaf(_) -> "leaf"
+                Node(Leaf(a), Leaf(b)) -> s"pair $a $b"
+                Node(Leaf(a), Node(Leaf(b), _)) -> s"left-leaning $a $b"
+                Node(_, _) -> "other"
+
+        print(shape(Leaf(1)))
+        print(shape(Node(Leaf(1), Leaf(2))))
+        print(shape(Node(Leaf(3), Node(Leaf(4), Leaf(5)))))
+        print(shape(Node(Node(Leaf(1), Leaf(2)), Leaf(3))))
+        """, "leaf\npair 1 2\nleft-leaning 3 4\nother\n")
+
+@test("a struct, a named struct and a tuple pattern reach through a reference")
+rtr_struct_and_tuple_reach()
+    if !rtr_ready() then return
+
+    rtr_prints(rtr_point() + """
+        val p: &Point = Point(3, 4)
+
+        p match
+            Point(x, y) -> print(x, y)
+
+        p match
+            Point{y} -> print(y)
+
+        val q: &(int, string) = (7, "seven")
+
+        q match
+            (n, s) -> print(n, s)
+        """, "3 4\n4\n7 seven\n")
+
+@test("a binding's pattern reaches through a reference, and stays irrefutable")
+rtr_val_binding_reaches()
+    if !rtr_ready() then return
+
+    rtr_prints(rtr_point() + """
+        val p: &Point = Point(5, 6)
+        val Point(a, b) = p
+
+        print(a + b)
+
+        var Point{x, y} = p
+
+        x = 100
+        print(x + y, p.x)
+        """, "11\n106 5\n")
+
+@test("a pattern reaches through two references, and through a '&sync T'")
+rtr_double_and_sync_reach()
+    if !rtr_ready() then return
+
+    rtr_prints(rtr_slot() + """
+        type SlotRef = &Slot
+
+        val inner: &Slot = Full(5)
+        val outer: &SlotRef = inner
+
+        outer match
+            Full(n) -> print(n)
+            Empty -> print("empty")
+
+        val shared: &sync Slot = Full(6)
+
+        shared match
+            Full(n) -> print(n)
+            Empty -> print("empty")
+        """, "5\n6\n")
+
+@test("a variant inside 'Some' reaches through the 'Option[&T]' it is held in")
+rtr_option_of_ref_reaches()
+    if !rtr_ready() then return
+
+    rtr_prints(rtr_tree() + """
+        lookup(o: Option[&Tree]) -> int
+            o match
+                Some(Leaf(v)) -> v
+                Some(Node(Leaf(a), _)) -> -a
+                Some(Node(_, _)) -> -100
+                None -> 0
+
+        val a: &Tree = Leaf(8)
+        val b: &Tree = Node(Leaf(2), Leaf(3))
+        val c: &Tree = Node(Node(Leaf(1), Leaf(1)), Leaf(3))
+
+        print(lookup(Some(a)), lookup(Some(b)), lookup(Some(c)), lookup(None))
+        """, "8 -2 -100 0\n")
+
+@test("an 'is' test, 'while … is' and 'is not' reach through a reference")
+rtr_is_forms_reach()
+    if !rtr_ready() then return
+
+    rtr_prints("""
+        enum List
+            Nil
+            Cons(head: int, tail: &List)
+
+        var at: &List = Cons(1, Cons(2, Cons(3, Nil)))
+        var total = 0
+
+        while at is Cons(h, rest)
+            total += h
+            at = rest
+
+        print(total)
+
+        val l: &List = Cons(9, Nil)
+
+        if l is Cons(h, Nil) then print("one", h)
+        if l is not Nil then print("not empty")
+        if at is Nil then print("walked to the end")
+        """, "6\none 9\nnot empty\nwalked to the end\n")
+
+@test("a nullary variant named bare or backticked reaches through a reference")
+rtr_nullary_names_reach()
+    if !rtr_ready() then return
+
+    rtr_prints(rtr_slot() + """
+        val s: &Slot = Empty
+
+        s match
+            Empty -> print("empty")
+            Full(n) -> print(n)
+
+        s match
+            `Empty` -> print("quoted")
+            Full(_) -> print("full")
+        """, "empty\nquoted\n")
+
+@test("a name binds the reference itself, beside arms that reach through it")
+rtr_name_binds_the_reference()
+    if !rtr_ready() then return
+
+    rtr_prints(rtr_tree() + """
+        struct Counter
+            n: int
+
+        leaves(t: &Tree) -> int
+            t match
+                Leaf(_) -> 1
+                other -> sum_leaves(other)
+
+        sum_leaves(t: &Tree) -> int = t match
+            Leaf(_) -> 1
+            Node(l, r) -> leaves(l) + leaves(r)
+
+        print(leaves(Node(Leaf(1), Node(Leaf(2), Leaf(3)))))
+
+        val c: &Counter = Counter(1)
+
+        c match
+            whole @ Counter(n) -> whole.n = n + 10
+
+        print(c.n)
+        """, "3\n11\n")
+
+@test("a 'for' header's pattern reaches through each '&T' element")
+rtr_for_header_reaches()
+    if !rtr_ready() then return
+
+    rtr_prints(rtr_point() + """
+        val a: &Point = Point(1, 2)
+        val b: &Point = Point(3, 4)
+
+        for Point{x, y} in [a, b]
+            print(x * y)
+        """, "2\n12\n")
+
+@test("alternatives and a failed guard reach through a reference, released once")
+rtr_alternatives_and_guards()
+    if !rtr_ready() then return
+
+    rtr_prints(rtr_tree() + """
+        first(t: &Tree) -> int
+            t match
+                Leaf(v) | Node(Leaf(v), _) -> v
+                Node(_, _) -> 0
+
+        pick(t: &Tree) -> int
+            t match
+                Node(l, _) if sum(l) > 100 -> 1
+                Node(_, r) -> sum(r)
+                Leaf(v) -> v
+
+        print(first(Leaf(4)), first(Node(Leaf(5), Leaf(0))), first(Node(Node(Leaf(1), Leaf(1)), Leaf(0))))
+        print(pick(Node(Leaf(1), Leaf(7))), pick(Leaf(9)))
+        """, "4 5 0\n7 9\n")
+
+@test("function clauses reach through a nested '&T' payload")
+rtr_clauses_reach()
+    if !rtr_ready() then return
+
+    rtr_prints(rtr_tree() + """
+        size(t: &Tree) -> int
+        size(Leaf(_)) = 1
+        size(Node(Leaf(_), r)) = 1 + size(r)
+        size(Node(l, r)) = size(l) + size(r)
+
+        print(size(Node(Leaf(1), Node(Node(Leaf(2), Leaf(3)), Leaf(4)))))
+        """, "4\n")
+
+@test("a generic's pattern reaches through a reference to its own instantiation")
+rtr_generic_reaches()
+    if !rtr_ready() then return
+
+    rtr_prints("""
+        present[T](o: &Option[T]) -> bool
+            o match
+                Some(_) -> true
+                None -> false
+
+        val a: &Option[int] = Some(3)
+        val b: &Option[string] = None
+
+        print(present(a), present(b))
+        """, "true false\n")
+
+// == counts =========================================================================================
+
+// A payload bound through the reference outlives the tree it was read from: it takes its own share,
+// and the counted heap gives every box back once the last name lets go.
+@test("a '&T' payload bound through a reference outlives the value it came from")
+rtr_bound_payload_escapes()
+    if !rtr_ready() then return
+
+    rtr_prints(rtr_tree() + """
+        left(t: &Tree) -> &Tree
+            t match
+                Node(l, _) -> l
+                Leaf(_) -> t
+
+        leftmost_pair(t: &Tree) -> &Tree
+            t match
+                Node(Node(l, _), _) -> l
+                _ -> t
+
+        var keep: &Tree = Leaf(0)
+        var deep: &Tree = Leaf(0)
+
+        if keep is Leaf(0)
+            val t: &Tree = Node(Node(Leaf(5), Leaf(6)), Leaf(7))
+
+            keep = left(t)
+            deep = leftmost_pair(t)
+
+        print(sum(keep), sum(deep))
+        """, "11 5\n")
+
+// The reach costs nothing the written dereference does not: the same program spelled `t match` and
+// `*t match` makes the same retains and releases.
+@test("reaching through a reference retains exactly what '*x match' retains")
+rtr_counts_match_the_written_deref()
+    if !rtr_ready() then return
+
+    val body = """
+        enum Tree
+            Leaf(v: int)
+            Node(l: &Tree, r: &Tree)
+
+        sum(t: &Tree) -> int
+            SUBJECT match
+                Leaf(v) -> v
+                Node(l, r) -> sum(l) + sum(r)
+
+        val t: &Tree = Node(Leaf(1), Leaf(2))
+
+        print(sum(t))
+        """
+
+    val reached = rtr_report(replace_all(body, "SUBJECT", "t"))
+    val written = rtr_report(replace_all(body, "SUBJECT", "*t"))
+
+    assert(reached.index_of("define").is_some(), reached)
+    assert(rtr_calls(reached, "arc.retain") == rtr_calls(written, "arc.retain"), reached)
+    assert(rtr_calls(reached, "arc.release") == rtr_calls(written, "arc.release"), reached)
+
+// A nested shape that only tests tags binds nothing, so nothing is counted for the references it
+// reads through: the program has no more retains than one whose match reads only the top tag.
+@test("testing a nested shape through references counts nothing")
+rtr_nested_test_counts_nothing()
+    if !rtr_ready() then return
+
+    val body = """
+        enum Tree
+            Leaf(v: int)
+            Node(l: &Tree, r: &Tree)
+
+        kind(t: &Tree) -> int
+            t match
+                SHAPE -> 1
+                _ -> 0
+
+        val t: &Tree = Node(Leaf(1), Leaf(2))
+
+        print(kind(t))
+        """
+
+    val nested = rtr_report(replace_all(body, "SHAPE", "Node(Leaf(_), Node(_, Leaf(_)))"))
+    val flat = rtr_report(replace_all(body, "SHAPE", "Node(_, _)"))
+
+    assert(nested.index_of("define").is_some(), nested)
+    assert(rtr_calls(nested, "arc.retain") == rtr_calls(flat, "arc.retain"), nested)
+    assert(rtr_calls(nested, "arc.release") == rtr_calls(flat, "arc.release"), nested)
+
+// == what is still refused ===========================================================================
+
+@test("a value bound through a reference is still a copy, and written once")
+rtr_value_binding_is_written_once()
+    if !rtr_ready() then return
+
+    rtr_refused(rtr_slot() + """
+        var s: &Slot = Full(1)
+
+        s match
+            Full(n) -> n = 99
+            Empty -> print("empty")
+        """, "a pattern binding is written once")
+
+@test("a '&T' payload bound through a reference writes through to the object")
+rtr_ref_payload_writes_through()
+    if !rtr_ready() then return
+
+    rtr_prints("""
+        struct Recorder
+            frames: int
+
+        val current: &Option[&Recorder] = Some(Recorder(0))
+
+        current match
+            Some(rec) -> rec.frames += 2
+            None -> ()
+
+        if current is Some(rec) then print(rec.frames)
+        """, "2\n")
+
+@test("a raw pointer is not reached through, and the refusal writes the dereference")
+rtr_raw_pointer_refused()
+    if !rtr_ready() then return
+
+    rtr_refused(rtr_slot() + """
+        var s = Full(1)
+        val p: *Slot = &s
+
+        p match
+            Full(n) -> print(n)
+            Empty -> print("empty")
+        """, "a pattern reaches through a '&T' but not through a raw pointer, which may point at " +
+             "nothing, so match what it holds: '*x match'")
+
+@test("a reference to a scalar is not taken apart by a shape")
+rtr_scalar_reference_refused()
+    if !rtr_ready() then return
+
+    rtr_refused("""
+        val n: &int = 3
+
+        n match
+            Some(v) -> print(v)
+            _ -> print("no")
+        """, "'Some(…)' matches an enum variant or a struct, but the value is &int")
+
+@test("a variant the held enum does not have is refused through a reference")
+rtr_wrong_variant_refused()
+    if !rtr_ready() then return
+
+    rtr_refused(rtr_tree() + """
+        val t: &Tree = Leaf(1)
+
+        t match
+            Some(v) -> print(v)
+            _ -> print("no")
+        """, "enum 'Tree' has no variant 'Some'")
+
+@test("a gap through a reference is reported at the depth it is missing")
+rtr_gap_through_reference()
+    if !rtr_ready() then return
+
+    rtr_refused(rtr_tree() + """
+        deep(t: &Tree) -> int
+            t match
+                Leaf(_) -> 0
+                Node(Leaf(_), _) -> 1
+        """, "match on '&Tree' is not exhaustive; missing Node(Node, _)")
+
+@test("an arm the arms above already cover through a reference is dead")
+rtr_dead_arm_through_reference()
+    if !rtr_ready() then return
+
+    rtr_refused(rtr_tree() + """
+        deep(t: &Tree) -> int
+            t match
+                Leaf(_) -> 0
+                Node(_, _) -> 1
+                Node(Leaf(_), _) -> 2
+        """, "unreachable pattern 'Node(Leaf(_), _)': every value it matches is already matched by " +
+             "the arm on line")
+
+@test("a name under 'is not' is refused through a reference as it is anywhere")
+rtr_is_not_binding_refused()
+    if !rtr_ready() then return
+
+    rtr_refused(rtr_slot() + """
+        val s: &Slot = Full(1)
+
+        if s is not Full(n) then print("empty")
+        """, "a pattern under 'is not' cannot bind a name")

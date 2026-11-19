@@ -19,7 +19,9 @@ import sysl.container.{Map, map, Set, set}
 // - never an `@export` (its definition is what C or a weak seam names), a function placed in a
 //   section (a linker script gathers it), or one with a calling convention of its own (an interrupt
 //   handler a vector names);
-// - never one module-level `asm` names, which the optimizer cannot see calling it.
+// - never one module-level `asm` names, which the optimizer cannot see calling it;
+// - never one whose frame this build limits or reports (`frame_limit.sysl`'s `frame_watched`): sealed
+//   and inlined at every call, its definition is deleted, and the limit and the report with it.
 //
 // A C file cannot spell any other sysl symbol (`codegen.sysl`'s `record_symbols`), and a function
 // whose address is handed to C is named only inside this module, where taking it is. The entry point
@@ -29,7 +31,7 @@ import sysl.container.{Map, map, Set, set}
 // Whether `f` is a function of one of the `sealing` modules that nothing outside the module names.
 sealable(f: TFunc, sealing: Buf[string]) -> bool =
     !sealing.is_empty() && holds_string(sealing, f.declared_in) && f.exported.is_none() &&
-        f.section.is_none() && f.conv.is_none() && !f.ghost
+        f.section.is_none() && f.conv.is_none() && !f.ghost && !frame_watched(f)
 
 // Notes the definitions `funcs` holds from `from` on -- one sealable function's body and the parts it
 // was split into -- unless a line of module `asm` names one.
@@ -59,8 +61,9 @@ end note_sealed
 // taken as well may be called again through it; leaving such a one external costs only what sealing
 // would have gained. The entry itself stays sealed: only the platform's `main` calls it.
 //
-// Returns the names among `sealed` that run once.
-run_once(funcs: Buf[IrFunc], sealed: Set[string]) -> Buf[string]
+// Returns the names among `sealed` that run once. A body already printed (`codegen.sysl`'s `compact`)
+// has no blocks left to walk, so its calls are the ones `printed` recorded before it was printed.
+run_once(funcs: Buf[IrFunc], sealed: Set[string], printed: Map[string, Buf[(string, bool)]]) -> Buf[string]
     var once: Buf[string] = buf()
     var index: Map[string, usize] = map()
 
@@ -71,16 +74,18 @@ run_once(funcs: Buf[IrFunc], sealed: Set[string]) -> Buf[string]
         Some(i) -> i
         None -> return once
 
+    var sites: Buf[Buf[(string, bool)]] = buf()
+
+    for f in funcs
+        sites.push(if is_printed(f) then printed.get(f.sig.name).unwrap_or(buf()) else call_sites(f))
+
     // How many calls name each sealed function, and how many of them run once.
     var calls: Map[string, int] = map()
     var once_calls: Map[string, int] = map()
 
-    for f in funcs
-        for b in f.blocks
-            for inst in b.instrs
-                sealed_callee(inst, sealed) match
-                    Some(c) -> calls.put(c, calls.get(c).unwrap_or(0) + 1)
-                    None -> ()
+    for made in sites
+        for (c, _) in made
+            if sealed.has(c) then calls.put(c, calls.get(c).unwrap_or(0) + 1)
 
     var todo: Buf[usize] = buf()
     var done: Set[string] = set()
@@ -89,43 +94,50 @@ run_once(funcs: Buf[IrFunc], sealed: Set[string]) -> Buf[string]
     done.add(entry_symbol())
 
     while todo.pop() is Some(at)
-        val blocks = funcs[at].blocks
-        var labels: Map[string, usize] = map()
+        for (c, looped) in sites[at]
+            if looped || !sealed.has(c) then continue
 
-        for j in 0..<blocks.len()
-            labels.put(blocks[j].label, j)
+            val n = once_calls.get(c).unwrap_or(0) + 1
 
-        for j in 0..<blocks.len()
-            var looped: Option[bool] = None
+            once_calls.put(c, n)
 
-            for inst in blocks[j].instrs
-                val c = sealed_callee(inst, sealed) match
-                    Some(c) -> c
-                    None -> continue
+            if n == calls.get(c).unwrap_or(0) && !done.has(c)
+                done.add(c)
+                once.push(c)
 
-                if looped.is_none() then looped = Some(on_a_loop(blocks, j, labels))
-
-                if looped == Some(true) then continue
-
-                val n = once_calls.get(c).unwrap_or(0) + 1
-
-                once_calls.put(c, n)
-
-                if n == calls.get(c).unwrap_or(0) && !done.has(c)
-                    done.add(c)
-                    once.push(c)
-
-                    index.get(c) match
-                        Some(i) -> todo.push(i)
-                        None -> ()
+                index.get(c) match
+                    Some(i) -> todo.push(i)
+                    None -> ()
+        end for
 
     once
 end run_once
 
-// The sealed function a direct call names, if it names one.
-private sealed_callee(inst: Inst, sealed: Set[string]) -> Option[string] = inst match
-    InCall(_, _, VGlobal(name), _, _, _, _, _) -> if sealed.has(name) then Some(name) else None
-    _ -> None
+// Every direct call `f` makes, in order: the function it names, and whether the block it is made from
+// is on a loop. A call of an intrinsic names no function the seal can see, and is left out.
+call_sites(f: IrFunc) -> Buf[(string, bool)]
+    var out: Buf[(string, bool)] = buf()
+    var labels: Map[string, usize] = map()
+
+    for j in 0..<f.blocks.len()
+        labels.put(f.blocks[j].label, j)
+
+    for j in 0..<f.blocks.len()
+        var looped: Option[bool] = None
+
+        for inst in f.blocks[j].instrs
+            inst match
+                InCall(_, _, VGlobal(name), _, _, _, _, _) ->
+                    if !name.starts_with("llvm.")
+                        if looped.is_none() then looped = Some(on_a_loop(f.blocks, j, labels))
+
+                        out.push((name, looped.unwrap()))
+                    end if
+                _ -> ()
+    end for
+
+    out
+end call_sites
 
 // Whether control can come back to block `at` once it has left it: whether `at` is on a loop.
 private on_a_loop(blocks: Buf[IrBlock], at: usize, labels: Map[string, usize]) -> bool

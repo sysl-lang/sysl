@@ -753,6 +753,105 @@ error_traces = false
 does the same for one build. Like `bounds_locations`, the key is `true` or `false`, is read from the
 root project only, and anything else is refused when the file is read.
 
+## A function's stack frame
+
+**`frame_limit` is the most bytes one function's stack frame may take**, and a build in which a
+function's frame is larger fails:
+
+```hocon
+package {
+  name    = "keel"
+  version = "0.4.0"
+}
+
+frame_limit = 2048
+```
+
+```
+error: 'deep' needs a stack frame of 65584 bytes, over its limit of 2048 bytes, set by
+'frame_limit = 2048' in sysl.hocon — move what makes it large off the stack, onto the heap or into
+module storage, or give this function a limit of its own with '@frame_limit(n)' above it
+ --> main.sysl:1:1
+```
+
+It is the check Linux makes with `-Wframe-larger-than`, and it is made the same way: LLVM lays the
+frame out, every function given a limit carries LLVM's `warn-stack-size` attribute, and the report
+LLVM makes is the build's error, every function over its limit named at once. A thread, an interrupt
+handler or a task on a microcontroller runs on a stack somebody sized by hand, and this is how a
+build says which function would not fit before a run finds out. **The frame is the one function's**
+— its locals, the registers it saves, what it passes on the stack — and not the frames of what it
+calls.
+
+`--frame-limit <bytes>` on the command line holds one build to a limit, and beats the root's key as
+`-O` beats `optimization`. `build`, `run`, `test`, `build-lib` and `build-c` all take it.
+
+### Which limit holds a function
+
+The nearest one, in this order:
+
+1. `@frame_limit(n)` above the function, or `@frame_limit(none)` for none
+   ([attributes](/reference/attributes/#frame-limit-n-the-most-stack-one-call-of-a-function-may-take));
+   a closure or nested function takes the mark of the function it is written in;
+2. the `frame_limit` key of the package the function is written in — **a dependency's key holds that
+   package's functions and no others**, so a package that knows its own code needs more than its
+   consumers allow says so once, for itself;
+3. the build's own: `--frame-limit`, or else the root project's `frame_limit`, which holds every
+   function nothing nearer speaks for — the project's, and every dependency's that names no limit of
+   its own.
+
+A function's package is the one it was *written* in: an instance of a generic is held to the limit of
+the package that declared the generic, whichever package asked for the instance. **The standard
+module's functions are held to none**, being compiled once into an artifact every build shares.
+
+The key is a whole number from 1 to 4294967295, and anything else is refused when the file is read:
+
+```
+sysl.hocon: 'frame_limit' takes the most bytes one function's stack frame may take, a whole
+number from 1 to 4294967295, and 'big' is not one
+```
+
+**The level decides the frame.** `-O0` keeps every local in its own slot, so a frame there can be
+many times what it is at `-O1`; a kernel built at `-O0` for debugging is the build most likely to
+need the check. Under link-time optimization the frames are laid out by the link, where no linker
+reports one, so the program's text is compiled once more without it to an object nothing uses, and
+that compile is the one checked.
+
+### The frame of every function
+
+**`--stack-usage <file>` writes a line for every function the build compiles**, largest frame first:
+its frame in bytes, `static` where the frame is all it takes or `dynamic` where it grows at run time,
+the function as the program names it, and where it was written — the equivalent of Linux's
+`make checkstack`, read from what LLVM's `-fstack-usage` writes:
+
+```
+sysl build . -O0 --stack-usage frames.txt
+```
+
+```
+65632	static	deep	main.sysl:1
+768	static	sysl_bounds_fail	-
+112	static	sysl.bounds.num	-
+64	static	sysl.bounds.put	-
+16	static	main	-
+16	static	main	main.sysl:6
+16	static	sysl.trap	-
+```
+
+The four columns are separated by tabs, and the place is the file as the build named it. A
+generic's instance is named with its arguments (`first[int]`), a closure after the function it is
+written in (`load.<closure>`), and what the compiler adds itself — the bounds check's reporter, the
+C entry point that calls the program's `main` — by the symbol it is emitted under, with `-` for its
+place. An `@export`ed function's entry point is held to the function's limit and reported under
+its name, since the optimizer inlines the body into it. A
+`run` or `test` asking for the report compiles rather than replaying a kept binary, and a `--lib`
+root is compiled into the build rather than linked from its kept artifact, so every frame the report
+lists is one this build laid out. **The standard module's precompiled functions are not in it**;
+`--no-std-lib` compiles them into the build, and into the report.
+
+A frame is one function's; the stack a call needs is the frames added up the whole way down, which
+[`sysl stack`](/getting-started/cli/#stack) prints for each way into a program and
+[`@stack(n)`](/reference/attributes/#stack-a-bound-on-the-stack-a-call-needs) holds a function to.
+
 ## Linking a freestanding image
 
 A kernel, or a board's firmware, is an ELF image nothing loads: an emulator or a debug probe puts it
@@ -1512,9 +1611,9 @@ targets {
 
 What it makes legal is **C's own functions** and nothing more. Text needs no C library either way:
 every [formatted string](/reference/strings/) specifier, and every integer and float written or read,
-is rendered in sysl. What it does decide is storage aligned beyond what the allocating pair promises:
-where `libc` stands and the pair is libc's own, `sysl_alloc_aligned` and `sysl_free_aligned` default
-to `posix_memalign` and `free`; where it does not, the program defines them.
+is rendered in sysl. What it does decide is storage aligned beyond what `malloc` promises under
+libc's pair: where `libc` stands it comes from `posix_memalign` and goes back to `free`; where it
+does not, the program names a heap of its own, which is handed every block's boundary.
 
 **It is not an operating system, and it is not POSIX.** The three say different things: `os` is a
 machine with an environment to hand a program (files, variables, processes), `posix` is that
@@ -1592,8 +1691,36 @@ allocator {
 
 Saying it settles the pair for the whole program, not for the package that said it. Every allocation
 the compilation emits calls that pair — a string concatenation, a `Buf` growing, a box the reference
-counter builds — and every release gives the storage back to it. Declare nothing anywhere and the pair
-is libc's `malloc` and `free`, which is what a program depending on nothing that says otherwise gets.
+counter builds, a closure's captures, a task's frame — and every release gives the storage back to it.
+Declare nothing anywhere and the pair is libc's `malloc` and `free`, which is what a program depending
+on nothing that says otherwise gets.
+
+**A pair the manifest names is told every block's size and boundary, on both calls:**
+
+```
+alloc(size: usize, align: usize) -> *u8
+free(p: *u8, size: usize, align: usize)
+```
+
+`alloc` answers `size` bytes beginning on `align` — a power of two, never less than the machine's
+word — or null, which stops the program at the allocation. `free` is handed back exactly the `size`
+and `align` the block was taken with, so a heap that keeps no headers of its own (a slab, an arena, a
+pool of fixed sizes, a C API shaped `free(ptr, size, align)`) is the pair as it stands. libc's pair is
+called as libc declares it, `malloc(size)` and `free(p)`.
+
+A program writing the pair itself writes it in that shape, and one of another shape is refused at its
+definition rather than handed arguments it does not take:
+
+```
+'my_free' is exported as 'my_free', the half of the program's heap giving back every block, which is
+called as 'free(p: *u8, size: usize, align: usize)' — told the size and boundary the block was taken
+with. This one takes 1 parameter, so its arguments would not be the ones it is passed
+```
+
+Counting proves it: a pair that records each block it hands out and checks every free against the
+record sees every free match, whether the program is a program, a `build-c` archive or a `--shared`
+library a C host links. `SYSL_COUNT_ALLOCS=1` builds a program on such a pair of the compiler's own,
+which stops a program whose free names another size or boundary than its allocation did.
 
 **It is the program's pair rather than the package's, because there is one heap.** Ownership is
 settled by reference count, so which code frees a thing is not knowable when a package is written: a
@@ -1631,42 +1758,27 @@ declare a pair too, which covers an application with its own arena and no depend
 handed over as a `--lib` source root declare the same thing and settle the same question — this is a
 property of the package, not of the flag that reached it.
 
-### A type aligned beyond what the pair promises
+### A type aligned beyond what `malloc` promises
 
-The pair is held to `malloc`'s promise: a block begins on a boundary of two words — sixteen bytes on
-a 64-bit machine, eight on a 32-bit one. A box, a buffer or a task's frame holding a type that asks
-for more (an [`@align(n)`](/reference/attributes/#align-n-where-the-aggregate-begins) struct, or a
-`u128` on a 32-bit machine) is taken from a second pair instead:
+A box, a buffer or a task's frame holding a type that asks for a wide boundary (an
+[`@align(n)`](/reference/attributes/#align-n-where-the-aggregate-begins) struct, or a `u128` on a
+32-bit machine) needs nothing more from a pair the manifest names: the boundary is the `align` its
+`alloc` is handed.
 
-```sysl
-@export("sysl_alloc_aligned")
-my_alloc_aligned(size: usize, align: usize) -> *u8 = ...
-
-@export("sysl_free_aligned")
-my_free_aligned(p: *u8) = ...
-```
-
-The first answers `size` bytes beginning on `align` — a power of two, larger than the pair's own
-boundary — or null, and the second gives such a block back; the storage's destruction hook knows
-which pair made it.
-
-Where the allocating pair is libc's, the compiler writes `weak` defaults over the C library's own
-aligned allocation — `posix_memalign` and `free` on a POSIX system and WASI, `_aligned_malloc` and
-`_aligned_free` on Windows — and a program's own definitions displace them. Anywhere else — a pair
-the manifest named, or a machine with no C library under it — only the program knows how its heap
-answers a boundary, so a program that puts such a type on the heap and does not define both is
-refused when it is compiled, naming the storage and the two hooks:
+libc's `malloc` promises only two words — sixteen bytes on a 64-bit machine, eight on a 32-bit one.
+Under libc's pair a block asking for more is taken from the C library's aligned allocation instead,
+`posix_memalign` on a POSIX system and WASI and `_aligned_malloc` on Windows, and given back to the
+matching free. A machine with no C library under libc's pair has nothing to answer the boundary
+with, so a program that puts such a type on the heap there is refused when it is compiled, naming
+the storage and the way out:
 
 ```
 a box of 'Page' asks for the 4096-byte boundary its type is aligned on, and the allocating pair
-('img_alloc' and 'img_free') promises only 16 — 'aarch64-freestanding' has no C library with an
-aligned allocation to answer it. Define 'sysl_alloc_aligned(size: usize, align: usize) -> *u8'
-and 'sysl_free_aligned(p: *u8)' with '@export', the first answering a block on that boundary and
-the second giving one back
+('malloc' and 'free') promises only 16 — 'aarch64-freestanding' has no C library with an aligned
+allocation to answer it. Name a heap of your own in sysl.hocon's 'allocator' block: its
+'alloc(size: usize, align: usize) -> *u8' and 'free(p: *u8, size: usize, align: usize)' are handed
+every block's boundary
 ```
-
-A program that never puts such a type on the heap never names either, so a pair alone is still the
-whole of what a heap needs to supply.
 
 ### The compiled standard module is built for one allocator
 

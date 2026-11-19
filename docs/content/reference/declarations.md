@@ -23,7 +23,9 @@ where it lives.
 `const Greeting = "hello"` is a `string`, `const Area = sq(3)` whatever `sq` answers — except that
 a value with no type of its own leaves the constant **untyped**: `const Step = 2` is the literal `2`,
 read at whatever type each use's position gives it, and an `int` where nothing does
-([untyped and typed constants](/reference/modules/#untyped-and-typed-constants)). Written,
+([untyped and typed constants](/reference/modules/#untyped-and-typed-constants)). It is that
+literal wherever an overload or an implementation is chosen too: `g(Step)` and `Step * 3` choose
+exactly as `g(2)` and `2 * 3` do ([Overloading](#overloading)). Written,
 `const Name: T = v`, the type governs: the value is read at `T`, and refused where `T` does not hold
 it. A `val` or a `const` with no value is not a declaration of anything.
 
@@ -2207,12 +2209,38 @@ print(g(60 * 52))
     g(v: u64)
 ```
 
+**An untyped constant is the literal it stands for at every one of these rules**, alone or in
+arithmetic, at a call, a method, either side of an operator and a new type's own `From[int]`. With
+`const K = 3120`, `g(K)` is as ambiguous as `g(3120)` and `pick(K)` is the `long` one as `pick(3120)`
+is; a float constant is a float literal. Naming the type — `u32(K)`, or `const K: u32 = 3120` —
+chooses:
+
+```sysl
+g(v: u32) -> string = "u32"
+g(v: u64) -> string = "u64"
+pick(x: long) -> string = "long"
+pick(x: u64) -> string = "u64"
+
+const K = 3120
+
+print(g(u32(K)), g(u64(K * 2)), pick(K), pick(-K))
+print(g(K))
+```
+
+```error
+'g' is ambiguous here — 2 of its declarations take these arguments:
+    g(v: u32)
+    g(v: u64)
+```
+
 **Candidates tied only by bare literals take each literal at its default type.** Where every
 position the candidates differ at holds a numeric literal with no suffix, and no rule above has
 chosen, the candidate whose parameter at each of those positions is the literal's default wins. A
 float literal's default is `real`. An integer literal's default is `int` at an integer parameter and
 `real` at a float one, since an integer literal is read as the float its position expects. So
-`nextafter(1.0, 2)`, which both the `real` and the `f32` declarations fit, means the `real` one:
+`nextafter(1.0, 2)`, which both the `real` and the `f32` declarations fit, means the `real` one.
+Arithmetic over bare literals counts as a literal here, as it does in the rule above, so
+`scale(2.0 * 3, 1)` is the `real` one too:
 
 ```sysl
 import sysl.math.nextafter
@@ -2221,11 +2249,13 @@ scale(x: f32, k: f32) -> string = "f32"
 scale(x: real, k: real) -> string = "real"
 
 print(scale(1.5, 2), scale(1, 2), scale(1.5f32, 2f32))
+print(scale(2.0 * 3, 1), scale(-(1.5 + 2), 1.0 / 4))
 print(nextafter(1.0, 2) > 1)
 ```
 
 ```output
 real real f32
+real real
 true
 ```
 

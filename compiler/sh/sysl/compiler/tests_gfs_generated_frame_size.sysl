@@ -1,0 +1,484 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_temp_dir, read_text, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// **A generated walk over an enum's variants keeps a small frame in an unoptimized build.** The
+// supplied `Debug` and the derived `Display`, `Eq`, `Hash` and `Ord` are one copy of their body per
+// variant, and at `-O0` LLVM gives every copy's temporaries a stack slot of their own and merges
+// none. A kernel thread with a 16 KiB stack overflowed on two of them: each copy wrote its text
+// through three or four inline `Writer` calls, and each `x.(c)` copied the whole enum twice -- once
+// as the `match` scrutinee, once to bind its failure arm -- so the frame grew by the enum's size per
+// variant. The writes are helper calls now, a `match` on a local reads it through its address, and
+// the failure arm reads the local's tag again.
+//
+// The frames are read from clang's `-fstack-usage` report over sysl's own `-O0` text, so they are the
+// numbers a build gets. The outputs are checked at `-O0` and the default level, since the change
+// is in what both levels are handed.
+//
+// Cells skipped, with the reason: a bare-metal build (the change emits a 32-bit load and a `getelementptr`,
+// no operation a core lacks and no libcall); separate compilation (the derive bodies are
+// instantiated in the user's module whichever way the library arrives).
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private gfs_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end gfs_ready
+
+// clang's stack-usage report for the program at -O0: one `file:function<TAB>bytes<TAB>kind` line
+// per function, or why there is none.
+private gfs_report(program: string) -> string
+    val root = make_temp_dir("sysl-gfs").unwrap()
+
+    write_text(s"$root/main.sysl", program).unwrap()
+
+    val t = host_target()
+    val ir = emit_llvm_text(s"$root/main.sysl", None, "0") match
+        Ok(emitted) -> emitted.text
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return s"it did not lower: ${failure_text(why)}"
+
+    write_text(s"$root/main.ll", for_clang(ir, t)).unwrap()
+
+    val made = capture(find_clang(t, None).unwrap(), ["-x", "ir", "-O0", "-c", "-fstack-usage",
+                       "-Wno-override-module", s"$root/main.ll", "-o", s"$root/main.o"], "", [], true)
+    val text = made match
+        Ok(out) -> if out.status.ok() then read_text(s"$root/main.su").unwrap_or("") else
+            s"clang refused it: ${out.err.unwrap_or("")}"
+        Err(_) -> "clang could not be run"
+
+    remove_dir_all(root).unwrap_or(())
+    text
+end gfs_report
+
+// The frame the report gives `name`, in bytes, or -1 where it names no such function. A root
+// function is found under its symbol (`root_symbol`).
+private gfs_frame(report: string, name: string) -> int
+    val rooted = gfs_frame_of(report, root_symbol(name))
+
+    if rooted >= 0 then rooted else gfs_frame_of(report, name)
+
+// The frame of a member's body: a type passed by value may have its body in a `.owned` twin that the
+// entry forwards to, so the larger of the two is the body's.
+private gfs_member_frame(report: string, name: string) -> int
+    val plain = gfs_frame_of(report, name)
+    val owned = gfs_frame_of(report, s"$name.owned")
+
+    if owned > plain then owned else plain
+
+private gfs_frame_of(report: string, name: string) -> int
+    val key = s":$name\t"
+    val at = report.index_of(key) match
+        Some(i) -> i + key.bytes.len
+        None -> return -1
+
+    var n = 0
+    var i = at
+
+    while i < report.bytes.len && report.bytes[i] >= u8('0') && report.bytes[i] <= u8('9')
+        n = n * 10 + int(report.bytes[i] - u8('0'))
+        i += 1
+
+    if i == at then -1 else n
+end gfs_frame_of
+
+// What the program printed at `level`, on both streams, and whether it ran to the end; counted, a
+// heap left holding anything says so on stderr.
+private gfs_run(program: string, level: string, counted: bool = false) -> (string, string, bool)
+    val root = make_temp_dir("sysl-gfs").unwrap()
+
+    write_text(s"$root/main.sysl", program).unwrap()
+
+    force_alloc_counting(counted)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, level, Some(s"$root/built"))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (s"it did not build: ${failure_text(why)}", "", false)
+        Ok(_) -> ()
+
+    val ran = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    ran match
+        Err(_) -> ("the program that was built could not be run", "", false)
+        Ok(out) -> (out.text, out.err.unwrap_or(""), out.status.ok())
+end gfs_run
+
+// The program prints `want` at -O0 and at the default level, and leaves nothing on a counted heap.
+private gfs_prints(program: string, want: string)
+    for level in ["0", DefaultOptimization]
+        val got = gfs_run(program, level, true)
+
+        assert(got.2, s"-O$level: ${got.0}${got.1}")
+        assert_eq(got.0, want, s"-O$level")
+        assert_eq(alloc_count_reported(got.1), 0, s"-O$level: ${got.1}")
+
+// -- the frames -----------------------------------------------------------------------------------
+
+// Twelve variants with small payloads, the shape of the filesystem error that overflowed: an inode,
+// a block, a nested enum.
+private gfs_corruption() -> string = raw"""
+    enum Fault derives Eq, Hash, Ord, Display
+        Bad
+        Worse(n: u32)
+
+    enum Corruption derives Eq, Hash, Ord, Display
+        BlockBitmap(group: u32)
+        InodeBitmap(group: u32)
+        GroupCounts(group: u32)
+        Inode(ino: u64)
+        FreeingFreeBlock(block: u64)
+        FreeingFreeInode(ino: u64)
+        NotDataBlocks(block: u64)
+        BadInodeNumber(ino: u64)
+        Extent(ino: u64, block: u64, fault: Fault)
+        OrphanList(ino: u64)
+        Directory(ino: u64, block: u64, fault: Fault)
+        Xattr(ino: u64, block: u64)
+
+    main()
+        val x = Corruption.Extent(1, 2, Fault.Worse(3))
+        val y = Corruption.Xattr(4, 5)
+
+        print(x.debug_string(), x, x == y, x < y, x.hash() != y.hash())
+    """
+
+@test("the supplied Debug of a twelve-variant enum keeps an -O0 frame under 2 KiB")
+gfs_debug_frame_is_small()
+    if !gfs_ready() then return
+
+    val report = gfs_report(gfs_corruption())
+    val debug = gfs_member_frame(report, "Corruption.debug")
+
+    // It was 4,128 bytes on aarch64: four inline writes and two whole-enum copies per variant.
+    assert(debug > 0, report)
+    assert(debug < 2048, s"Corruption.debug takes $debug bytes")
+end gfs_debug_frame_is_small
+
+@test("the derived Display, Eq, Hash and Ord of the same enum keep -O0 frames under 2 KiB")
+gfs_derived_frames_are_small()
+    if !gfs_ready() then return
+
+    val report = gfs_report(gfs_corruption())
+
+    for name in ["Corruption.display", "Corruption.eq", "Corruption.hash", "Corruption.lt"]
+        val frame = gfs_member_frame(report, name)
+
+        assert(frame > 0, s"$name is not in the report: $report")
+        assert(frame < 2048, s"$name takes $frame bytes")
+end gfs_derived_frames_are_small
+
+// Two enums alike but for one variant's payload, 4 bytes in one and 256 in the other: what the wide
+// one costs more is what a variant's copies of the enum cost, which must not be paid once per variant.
+private gfs_widths() -> string
+    var text = ""
+
+    for k in [4, 256]
+        text += s"enum E$k derives Eq, Hash, Ord, Display\n    A(a: [$k]u8)\n"
+
+        for v in ["B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L"]
+            text += s"    $v(n: u32)\n"
+
+        text += "    M\n\n"
+
+    text + "main()\n    val x = E4.C(3)\n    val y = E256.C(3)\n\n" +
+        "    print(x == x, x < x, x.hash() != 0, y == y, y < y, y.hash() != 0, x, y, x.debug_string(), " +
+        "y.debug_string())\n"
+end gfs_widths
+
+@test("a wide variant costs a generated body's -O0 frame a few copies of its payload, not one per variant")
+gfs_wide_variant_is_not_paid_per_variant()
+    if !gfs_ready() then return
+
+    val report = gfs_report(gfs_widths())
+
+    for form in ["debug", "display", "eq", "hash", "lt"]
+        val narrow = gfs_member_frame(report, s"E4.$form")
+        val wide = gfs_member_frame(report, s"E256.$form")
+
+        assert(narrow > 0 && wide > 0, s"$form is not in the report: $report")
+        // The wide variant's own arm copies its payload a few times (`lt` binds two of them); the
+        // other twelve copying the 260-byte enum each added 7 KiB and more.
+        assert(wide - narrow < 12 * 256, s"$form: $narrow bytes narrow, $wide wide")
+end gfs_wide_variant_is_not_paid_per_variant
+
+@test("hand-written matches on a local large enum keep its -O0 frame from growing per match")
+gfs_match_on_a_local_reads_through_it()
+    if !gfs_ready() then return
+
+    var matches = ""
+
+    for v in ["B", "C", "D", "E", "F", "G", "H", "I"]
+        matches += s"    t += w match\n        $v(n) -> n\n        A(_) -> 2\n        _ -> 1\n"
+
+    val program = "enum W\n    A(a: [256]u8)\n" +
+        "    B(n: u32)\n    C(n: u32)\n    D(n: u32)\n    E(n: u32)\n    F(n: u32)\n    G(n: u32)\n" +
+        "    H(n: u32)\n    I(n: u32)\n\n" +
+        "pick(w: W) -> u32\n    var t: u32 = 0\n\n" + matches + "\n    t\n\n" +
+        "main()\n    print(pick(W.C(5)), pick(W.A([7; 256])))\n"
+    val report = gfs_report(program)
+    val frame = gfs_frame(report, "pick")
+
+    // Read whole, each `match` copied the 260-byte enum twice; read through the local, only the
+    // tag and the four-byte payload.
+    assert(frame > 0, report)
+    assert(frame < 1024, s"pick takes $frame bytes")
+
+    gfs_prints(program, "12 16\n")
+end gfs_match_on_a_local_reads_through_it
+
+// -- the outputs ----------------------------------------------------------------------------------
+
+@test("every shape a supplied Debug and a derived Display show is shown as it was, at -O0 and optimized")
+gfs_every_shape_shows_the_same()
+    if !gfs_ready() then return
+
+    gfs_prints(raw"""
+        enum Tone derives Display
+            Low
+            High
+
+        struct Node
+            v: int
+            next: Option[&Node]
+
+        enum Shape derives Display
+            Dot
+            Circle(r: int)
+            Rect(w: int, h: int)
+            Named(label: string, at: (int, int))
+
+        enum Wrap[T] derives Display
+            One(v: T)
+            Two(a: T, b: T)
+            Nothing
+
+        enum Tree
+            Leaf(v: int)
+            Pair(l: &Tree, r: &Tree)
+
+        struct Bits
+            _: u3 in u32
+            a: u5 in u32
+            b: u4 in u32
+
+        struct Empty derives Display
+        end Empty
+
+        struct Point derives Display
+            x: int
+            y: string
+
+        val n = Node(1, Some(Node(2, None)))
+        val tree = Tree.Pair(Tree.Leaf(1), Tree.Pair(Tree.Leaf(2), Tree.Leaf(3)))
+
+        print(Tone.Low.debug_string(), Tone.High)
+        print(Shape.Dot.debug_string(), Shape.Circle(2).debug_string(), Shape.Rect(3, 4).debug_string())
+        print(Shape.Named("q", (5, 6)).debug_string())
+        print(Shape.Dot, Shape.Circle(2), Shape.Rect(3, 4))
+        val none: Wrap[int] = Wrap.Nothing
+
+        print(Wrap.One("s").debug_string(), Wrap.Two(n, n).debug_string(), none.debug_string())
+        print(Wrap.One(Tone.High), Wrap.Two(1, 2), none)
+        print(tree.debug_string())
+        print(Bits(1, 2).debug_string(), Empty().debug_string(), Empty(), Point(1, "z").debug_string(), Point(1, "z"))
+        print(f"[${Shape.Rect(3, 4)}%16?][${Shape.Dot}%-11?][${Shape.Rect(3, 4)}%12s]")
+        """, "Tone.Low High\n" +
+        "Shape.Dot Shape.Circle(r: 2) Shape.Rect(w: 3, h: 4)\n" +
+        "Shape.Named(label: \"q\", at: (5, 6))\n" +
+        "Dot Circle(2) Rect(3, 4)\n" +
+        "Wrap.One(v: \"s\") Wrap.Two(a: Node(v: 1, next: Some(Node(v: 2, next: None))), " +
+        "b: Node(v: 1, next: Some(Node(v: 2, next: None)))) Wrap.Nothing\n" +
+        "One(High) Two(1, 2) Nothing\n" +
+        "Tree.Pair(l: Tree.Leaf(v: 1), r: Tree.Pair(l: Tree.Leaf(v: 2), r: Tree.Leaf(v: 3)))\n" +
+        "Bits(a: 1, b: 2) Empty Empty Point(x: 1, y: \"z\") Point(1, z)\n" +
+        "[Shape.Rect(w: 3, h: 4)][Shape.Dot  ][  Rect(3, 4)]\n")
+end gfs_every_shape_shows_the_same
+
+@test("derived Eq, Ord and Hash answer as they did for every variant shape, at -O0 and optimized")
+gfs_derived_comparisons_answer_the_same()
+    if !gfs_ready() then return
+
+    gfs_prints(raw"""
+        enum Shape derives Eq, Hash, Ord
+            Dot
+            Circle(r: int)
+            Rect(w: int, h: int)
+            Named(label: string, at: int)
+
+        val all = [Shape.Dot, Shape.Circle(2), Shape.Circle(3), Shape.Rect(3, 4), Shape.Rect(3, 5),
+                   Shape.Named("a", 1), Shape.Named("b", 1)]
+        var line = ""
+
+        for i in 0..<all.len
+            for j in 0..<all.len
+                line += if all[i] == all[j] then "=" else if all[i] < all[j] then "<" else ">"
+
+            line += " "
+
+        print(line)
+        print(Shape.Rect(3, 4).hash() == Shape.Rect(3, 4).hash(), Shape.Rect(3, 4).hash() == Shape.Rect(4, 3).hash(),
+              Shape.Named("a", 1).hash() == Shape.Named("a", 1).hash())
+        """, "=<<<<<< >=<<<<< >>=<<<< >>>=<<< >>>>=<< >>>>>=< >>>>>>= \ntrue false true\n")
+end gfs_derived_comparisons_answer_the_same
+
+// -- the `match` that reads a local through its address -------------------------------------------
+
+@test("a match on a local binds counted payloads through it, survives the local's reassignment, and frees all")
+gfs_match_through_a_local_counts()
+    if !gfs_ready() then return
+
+    gfs_prints(raw"""
+        struct Cell
+            v: int
+
+        enum Held
+            Text(s: string)
+            Boxed(c: &Cell, tag: string)
+            Pair(a: string, b: string)
+            Nothing
+
+        show(h: Held) -> string = h match
+            Text(s) -> s
+            Boxed(c, t) -> s"$t${c.v}"
+            Pair(a, _) -> a
+            _ -> "-"
+
+        main()
+            var h = Held.Boxed(Cell(7), s"t${1 + 1}")
+            val kept = h match
+                Boxed(c, _) ->
+                    h = Held.Text(s"x${3}")
+                    c
+                _ -> Cell(0)
+
+            print(kept.v, show(h), show(Held.Pair(s"a${1}", "b")), show(Held.Nothing))
+
+            val f = () -> h match
+                Text(s) -> s + "!"
+                _ -> "?"
+
+            h = Held.Nothing
+            print(f(), show(h))
+        """, "7 x3 a1 -\n? -\n")
+end gfs_match_through_a_local_counts
+
+@test("a method's match on self, and a match with a guard or alternatives, still answer as written")
+gfs_match_shapes_not_read_through_still_answer()
+    if !gfs_ready() then return
+
+    gfs_prints(raw"""
+        enum Op
+            Add(a: int, b: int)
+            Neg(a: int)
+            Zero
+
+        impl Op
+            eval(self) -> int = self match
+                Add(a, b) -> a + b
+                Neg(a) -> -a
+                Zero -> 0
+
+            small(self) -> bool = self match
+                Add(a, b) if a + b < 10 -> true
+                Neg(_) | Zero -> true
+                _ -> false
+
+            whole(self) -> Op = self match
+                Add(a, b) -> Op.Add(a, b)
+                other -> other
+
+        val ops = [Op.Add(2, 3), Op.Add(20, 3), Op.Neg(4), Op.Zero]
+
+        for o in ops
+            print(o.eval(), o.small(), o.whole().eval())
+        """, "5 true 5\n23 false 23\n-4 true -4\n0 true 0\n")
+end gfs_match_shapes_not_read_through_still_answer
+
+// -- `x.(c)` on another variant -------------------------------------------------------------------
+
+private gfs_walk() -> string = raw"""
+    enum Shape
+        Dot
+        Circle(r: int)
+        Rect(w: int, h: int)
+
+    struct Holder
+        s: Shape
+
+    var made = 0
+
+    make(s: Shape) -> Shape
+        made += 1
+        s
+
+    radius_of_local(s: Shape) -> int
+        var out = 0
+
+        for const c in Shape::Variants
+            if const c.name == "Circle" then out = s.(c)
+
+        out
+
+    radius_of_call(s: Shape) -> int
+        var out = 0
+
+        for const c in Shape::Variants
+            if const c.name == "Circle" then out = make(s).(c)
+
+        out
+
+    radius_of_field(h: Holder) -> int
+        var out = 0
+
+        for const c in Shape::Variants
+            if const c.name == "Circle" then out = h.s.(c)
+
+        out
+
+    """
+
+@test("'x.(c)' on a local, a call and a field reads the payload, the call once")
+gfs_payload_reads_from_every_scrutinee()
+    if !gfs_ready() then return
+
+    gfs_prints(gfs_walk() + raw"""
+        main()
+            print(radius_of_local(Shape.Circle(4)), radius_of_call(Shape.Circle(5)), made,
+                  radius_of_field(Holder(Shape.Circle(6))))
+        """, "4 5 1 6\n")
+end gfs_payload_reads_from_every_scrutinee
+
+@test("'x.(c)' on another variant names the variant held, whether the value is a local, a call or a field")
+gfs_payload_failure_names_the_held_variant()
+    if !gfs_ready() then return
+
+    val cases = [("radius_of_local(Shape.Rect(1, 2))", "Shape.Rect"),
+                 ("radius_of_call(Shape.Dot)", "Shape.Dot"),
+                 ("radius_of_field(Holder(Shape.Rect(1, 2)))", "Shape.Rect")]
+
+    for item in cases
+        for level in ["0", DefaultOptimization]
+            val got = gfs_run(gfs_walk() + s"main()\n    print(${item.0})\n    print(\"not reached\")\n", level)
+
+            assert(!got.2, s"-O$level ${item.0} ran to the end: ${got.0}")
+            assert(!got.0.contains("not reached"), got.0)
+            assert(got.0.contains(s"variant 'Shape.Circle' was asked for, and the value is '${item.1}'") ||
+                   got.1.contains(s"variant 'Shape.Circle' was asked for, and the value is '${item.1}'"),
+                   s"-O$level ${item.0}: ${got.0}${got.1}")
+end gfs_payload_failure_names_the_held_variant
