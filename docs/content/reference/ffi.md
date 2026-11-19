@@ -344,10 +344,13 @@ signature, written exactly. AArch64's `llvm.aarch64.crc32cb`, `crc32ch` and `crc
 `.32.32` take the value at its own width, and `.64.64` is `(u64, u64) -> u64`. Each folds one value
 into a running remainder over the Castagnoli polynomial, with no inversion either side — that is
 `sysl.checksum`'s `crc32c` to add. **They are optional on both machines**, and a back end asked for
-one the build does not promise has no instruction to emit, so a declaration is accepted only where
-the `#if` symbol `crc32c` holds
-([attributes](/reference/attributes/#the-symbols-are-derived-from-the-target-and-the-set-is-closed)) —
-which is how a declaration is written, inside the condition:
+one in a body not compiled for it has no instruction to emit. So each declaration is compiled for its
+extension — `crc` on AArch64, `sse4.2` on x86-64 — as a function marked
+[`@extensions`](/reference/attributes/#extensions-a-body-compiled-for-instructions-the-build-does-not-promise)
+is, and each call is held to that rule: accepted where the build promises the extension (the `#if`
+symbol `crc32c`, [attributes](/reference/attributes/#the-symbols-are-derived-from-the-target-and-the-set-is-closed)),
+inside a function marked with it, or inside `@unchecked("crc")`. Where the whole program may use the
+instruction, the declaration is written inside the condition:
 
 ```sysl
 #if crc32c && aarch64
@@ -366,7 +369,8 @@ print(step(0, 0) == 0)
 true
 ```
 
-Outside the condition the declaration is refused, naming the way to promise the instruction:
+Outside the condition, a call from code without the extension is refused, naming the ways to make
+it:
 
 ```sysl target=x86_64-freestanding
 extern "llvm.x86.sse42.crc32.32.8" byte(crc: u32, b: u8) -> u32
@@ -375,7 +379,7 @@ print(byte(0, 1))
 ```
 
 ```error
-'llvm.x86.sse42.crc32.32.8' is an instruction 'x86_64-freestanding' does not promise, so the back end could not select it
+'byte' is called, and it is compiled for the processor's 'sse4.2' extension, which 'x86_64-freestanding' does not promise
 ```
 
 ### What crosses the boundary
@@ -964,6 +968,47 @@ data, so no count crosses it in either direction.
 Every refusal names the shape to write instead, because there always is one — a slice becomes the
 pointer and length C's own buffer functions already take, an array becomes a struct holding it. That
 is what makes the boundary writable rather than merely restricted.
+
+### A trap inside an export
+
+**A check that fails inside an exported function ends the process, and nothing after it runs.** A
+bounds check, an overflow check in a debug build, a `require` or other contract, an index past a
+container's count and `trap()` all stop exactly as they do in a sysl program
+([errors](/reference/errors/#what-stopping-looks-like)): the line the check reports goes to standard
+error, C's open output streams are flushed, and the trap instruction ends the process — status 133
+in a shell on AArch64, where the instruction raises SIGTRAP, and 132 on x86-64, where `ud2` raises
+SIGILL. Nothing is unwound: the statement of the C caller after the call never runs, no `defer` of
+the sysl frames between runs, a C frame sitting between two of them (a callback that calls back in)
+is never returned to, and no `atexit` handler runs. Since the stop is the process's, it is the same
+whether the C project linked the `build-c` archive statically, made a shared library of it, or
+opened the one `sysl build-c --shared` links:
+
+```c
+#include <stdio.h>
+#include "libmylib.a.h"
+
+int main(void) {
+    printf("before\n");          /* printed: the trap flushes stdout first */
+    mylib_lookup(5);             /* an index past the end: the process ends here */
+    printf("after\n");           /* never runs */
+}
+```
+
+**A C program that defines `sysl_trap` itself replaces the report, not the stop**
+([`sysl_trap`](/reference/errors/#reporting-a-failure-to-an-embedder-sysl-trap)). Its definition is
+called with the failure in place of the default line, and when it returns the check traps as it
+would have, so an embedder may log a failure its own way but cannot make the export return. The
+older `sysl_bounds_fail` does the same for the bounds and overflow forms. A host's definition
+replaces the hook of an archive it links, statically or as a shared library it made of the archive,
+but never the one inside a library `sysl build-c --shared` linked, which offers the loader only its
+module's exports; such a library hears its failures by exporting `sysl_trap` itself. An overflow
+wraps rather than trapping in a release build, so there the export returns the wrapped answer like
+any other.
+
+`panic` and the forcing members built on it (`unwrap`, `expect`, `assert`) end the process the way
+they end a program: their line goes to standard error and the process aborts, SIGABRT, status 134.
+`abort` runs no `atexit` handler either, so the caller's handlers, which a panic has no reason to
+trust, are never run against the state it reported.
 
 ### A variadic export
 
@@ -2228,7 +2273,7 @@ module image.png
 extern "png_create_read_struct" create(ver: *u8, err: *u8, fn: *u8) -> *u8
 ```
 
-**A directive names a library, and never a flag.** That is the whole of the design. Where a library
+**A directive names a library, or a framework, and never a flag.** That is the whole of the design. Where a library
 *lives* is a property of the machine being built for: the mathematics is a file of its own on ELF,
 part of `libSystem` on Darwin, inside the CRT on Windows, and absent from a freestanding target that
 has no libc for it to be in. A directive spelling `-lm` would be right on one of those and wrong on
@@ -2254,6 +2299,34 @@ A board whose manifest grants `libc` — newlib, picolibc — has its mathematic
 whose placement actually differs. An unrecognized name is passed straight through rather than
 guessed about. Being wrong in that direction produces a link error naming the *library*; being wrong
 in the other produces one naming a *function*, on a platform the author does not have.
+
+**A framework is the one other thing a directive may name.** On macOS a system API such as Metal
+or Foundation ships as a framework, which is not a `-l` library and has a flag of its own, so it has
+its own spelling:
+
+```sysl
+module gpu.metal
+#if macos
+@link(framework: "Metal")
+#endif
+
+extern "MTLCreateSystemDefaultDevice" create_device() -> *u8
+```
+
+`@link(framework: "Metal")` becomes `-framework Metal` on a macOS target, in the same place in the
+command line, in the same order, and through every path that links: `build`, `test`, `build-lib`
+(which only checks), `build-c` (which names the framework among the things the C project must
+link) and `build-c --shared` (which links it into the library). A framework and a library may share a
+name, and are different requirements. The name is checked as a library's is: not empty, no space, no
+leading dash.
+
+**A target with no frameworks refuses the directive, and does not drop it.** On Linux, Windows, WASI
+or a freestanding target `@link(framework: "Metal")` is an error — *names a macOS framework, and this
+target has none — gate it with '#if macos'*. Refusing loses nothing, since `#if macos` around the
+line says exactly what a portable binding means, and it keeps a build that silently lacked the
+framework from reaching a link error naming a function. There is no manifest form: a manifest's
+`pkg_config` names installed libraries, and a framework is a property of a file's `extern`s like any
+other `@link`.
 
 Four more rules:
 
@@ -3822,13 +3895,142 @@ the C compiler refused this file's 'c const' block
 ```
 
 Four more refusals go with it: a header that is not there, a value the declared type cannot hold
-(naming the value and both ends of the range), a type that is not a number, and a block written
-inside a body, which has no file's headers to be compiled against.
+(naming the value and both ends of the range), a type that is neither a number nor a string, and a
+block written inside a body, which has no file's headers to be compiled against.
 
-**A `string` from C is not written this way.** A number is a number in the compiler's output and
-reads straight off; a string constant is a block of storage and a different job, and it would have to
-be written `"\"foo\""` — two quotings for one value, which is a form nobody would guess. The refusal
-says so rather than leaving it to be found.
+**A whole number is C's own value, read at its own C type and width**, whatever the line is
+declared at — so the range check is made against the number the header means. `UINT64_MAX` is
+18446744073709551615 at any width that holds it, an `unsigned __int128` reads whole into a `u128`, and
+C's rules for a negative in an unsigned type are C's: `-1u` is the `unsigned int` 4294967295.
+
+```sysl
+@include("<stdint.h>")
+
+c const
+    TOP: u64   = "UINT64_MAX"
+    WIDE: u128 = "(unsigned __int128)UINT64_MAX << 8"
+    LOW: i128  = "(__int128)INT64_MIN * 4"
+    MASK: u32  = "-1u"
+
+print(s"$TOP $WIDE $LOW $MASK")
+```
+
+```output
+18446744073709551615 4722366482869645213440 -36893488147419103232 4294967295
+```
+
+Read at a type that cannot hold it, the same number is refused rather than wrapped into one that
+fits — `UINT64_MAX` is not the `i64` -1, and `-1` (an `int`) is no `u64`:
+
+```sysl
+@include("<stdint.h>")
+
+c const
+    N: i64 = "UINT64_MAX"
+```
+
+```error
+'UINT64_MAX' is 18446744073709551615 here, which 'i64' cannot hold
+```
+
+### A string is read too
+
+**The declared type may be `string`, or `*u8` for a C string** — the type a `c"…"` literal has. The
+case is the version macro a header spells out of other macros, which C joins into one literal and
+nobody can copy without doing the joining by hand:
+
+```c
+#define LUA_VERSION_MAJOR "5"
+#define LUA_VERSION_MINOR "4"
+#define LUA_VERSION       "Lua " LUA_VERSION_MAJOR "." LUA_VERSION_MINOR
+```
+
+```sysl
+c const
+    VERSION: string = "\"Lua \" \"5\" \".\" \"4\""
+
+print(VERSION, VERSION.bytes.len)
+```
+
+```output
+Lua 5.4 7
+```
+
+The line is written `"LUA_VERSION"` against the header; the block above writes the macro's own
+expansion out, since a page has no `lua.h` beside it. A literal written on the line itself is C, so
+it carries C's quotes inside sysl's — the one place the two quotings meet, and the reason a macro is
+the usual right-hand side.
+
+**A `*u8` line is the C string a C API takes**, which is what Vulkan's extension names are for: they
+go into an array of `const char *` and nowhere else.
+
+```sysl
+c const
+    SURFACE: *u8   = "\"VK_KHR_surface\""
+    SWAPCHAIN: *u8 = "\"VK_KHR_swapchain\""
+
+extern strlen(s: *u8) -> usize
+
+val wanted: [2]*u8 = [SURFACE, SWAPCHAIN]
+
+print(strlen(wanted[0]), strlen(wanted[1]))
+```
+
+```output
+14 16
+```
+
+A `string` line is a `const` holding the literal; a `*u8` line is a module `val` holding the
+`c"…"` literal, since a pointer is no `const` — and that `val` is
+[constant data](#what-constant-data-is), so an array of them, exported or not, is laid down as
+relocations on a bare machine exactly as `[c"VK_KHR_surface", c"VK_KHR_swapchain"]` would be.
+
+**The value is the whole literal, as C settles it**: the joining, every escape, and the bytes of the
+header's UTF-8. C's terminator is C's and not part of the value. **An embedded NUL** is kept by a
+`string`, which has a length — `"a\0b"` is three bytes — and refused by a `*u8`, which has none and
+would end there, as a `c"…"` literal's own is:
+
+```sysl
+c const
+    P: *u8 = "\"a\\0b\""
+
+val p = P
+```
+
+```error
+holds a NUL before its end, where a C string would stop
+```
+
+**Something C does not call a string is refused in sysl's words**, rather than in a C type error
+about an initializer — a number, a float, a struct, an address into the middle of a literal:
+
+```sysl
+c const
+    S: string = "504"
+
+print(S)
+```
+
+```error
+'504' is not a string in C, and this line reads one as 'string'
+```
+
+What C calls a string is a `char` array or a `char *` constant that is one: a literal, literals C
+joins, a macro that is either, and a `static const char NAME[]` in a header. A `string` holds UTF-8
+whatever it came from, so bytes that are not UTF-8 are refused; a `*u8` is held to the same, being a
+`c"…"` literal underneath. And the other way round, **a string read at a number type is refused**
+rather than read as the literal's address, which is a number only the linker knows:
+
+```sysl
+c const
+    N: u64 = "\"abc\""
+
+print(N)
+```
+
+```error
+is an address here rather than a number
+```
 
 ### A float is measured too, and it is the value hand-copying gets wrong
 

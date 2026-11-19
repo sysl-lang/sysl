@@ -804,3 +804,108 @@ tpk_prints_a_tuple_of_tuples()
     if !tpk_ready() then return
 
     assert_eq(tpk_ran("print(((1, 2), (3, 4, 5)))\n"), "((1, 2), (3, 4, 5))\n")
+
+// ---- a written list (`reference/generics.md § A written list spreads over a pack`) ----
+
+@test("a written list binds a pack to the types it names, however many")
+tpk_written_list_binds_a_pack()
+    if !tpk_ready() then return
+
+    assert_eq(tpk_ran(raw"""
+        count[..A]() -> usize = A.len
+        print(count[int, bool](), count[int]())
+        """), "2 1\n")
+
+// The trap a written list removes: one type named for a pack is a pack of that one type, never the
+// type's own parts, and a tuple named in the list is one type of the pack like any other.
+@test("one type named for a pack is a pack of one, and a tuple named there is one type")
+tpk_written_list_one_type()
+    if !tpk_ready() then return
+
+    assert_eq(tpk_ran(raw"""
+        struct Pos
+            x: int
+            y: int
+        count[..A]() -> usize = A.len
+        print(count[Pos](), count[(Pos, Pos)](), count[(int,)](), count[Pos, Pos]())
+        """), "1 1 1 2\n")
+
+@test("a written list instantiates the tuple parameter, which the argument is then checked against")
+tpk_written_list_checks_the_argument()
+    if !tpk_ready() then return
+
+    assert_eq(tpk_ran(raw"""
+        joined[..A: Display](t: (..A)) -> string
+            var s = ""
+            for const i in 0..<A.len
+                s = s + t.i.to_string()
+            s
+        print(joined[int, string]((1, "a")), joined[int]((5,)))
+        """), "1a 5\n")
+
+    tpk_refused(raw"""
+        joined[..A: Display](t: (..A)) -> string = ""
+        print(joined[int, int]((1, "a")))
+        """, "was given")
+
+@test("the parameters around a pack take one argument each, and the pack the run between")
+tpk_written_list_around_a_pack()
+    if !tpk_ready() then return
+
+    assert_eq(tpk_ran(raw"""
+        first[..A, T](t: (..A), x: T) -> T = x
+        last[T, ..A](x: T) -> usize = A.len
+        rep[const N: usize, ..A]() -> usize = N * A.len
+        print(first[int, int, string]((1, 2), "ok"), last[string, int, int, int]("s"), rep[3, int, bool]())
+        """), "ok 3 6\n")
+
+@test("a written list with nothing left for the pack is refused")
+tpk_written_list_too_short()
+    if !tpk_ready() then return
+
+    tpk_refused(raw"""
+        last[T, ..A](x: T) -> usize = A.len
+        print(last[string]("s"))
+        """, "'last' takes 2 type arguments or more ('T', 'A'), 'A' being a type pack that stands for one type or more, and 1 was written")
+
+@test("a written list over two packs is refused, and the arguments still settle them")
+tpk_written_list_two_packs()
+    if !tpk_ready() then return
+
+    tpk_refused(raw"""
+        two[..A, ..B](a: (..A), b: (..B)) -> usize = A.len + B.len
+        print(two[int, int, int]((1, 2), (3,)))
+        """, "'two' takes two type packs, '..A' and '..B', so a written list cannot say where one ends and the next begins — let the arguments settle them")
+
+    assert_eq(tpk_ran(raw"""
+        two[..A, ..B](a: (..A), b: (..B)) -> usize = A.len + B.len
+        print(two((1, 2), (3,)))
+        """), "3\n")
+
+@test("a written list is held to the pack's bound")
+tpk_written_list_bound()
+    if !tpk_ready() then return
+
+    tpk_refused(raw"""
+        struct P
+            x: int
+        shown[..A: Display]() -> usize = A.len
+        print(shown[int, P]())
+        """, "Display")
+
+@test("a member's written list spreads over its pack, on the type and through a bound")
+tpk_written_list_on_a_member()
+    if !tpk_ready() then return
+
+    assert_eq(tpk_ran(raw"""
+        trait Take
+            take[..A](self) -> usize
+        struct Row
+            n: usize
+            width[..A](self) -> usize = self.n + A.len
+        end Row
+        impl Take for Row
+            take[..A](self) -> usize = self.n + A.len
+        through[S: Take](s: S) -> usize = s.take[int, int]()
+        print(Row(1).width[int, bool, string](), Row(1).take[int](), through(Row(10)))
+        """), "4 2 12\n")

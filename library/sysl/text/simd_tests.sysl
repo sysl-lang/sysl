@@ -301,3 +301,193 @@ sut_mixed_valid()
             val s = text[start..<end]
 
             assert_eq(utf8_error_of(s), scalar_utf8(s))
+
+/** The last occurrence at or after `from`, one byte at a time. */
+private scalar_rfind(h: []const u8, b: u8, from: usize) -> Option[usize]
+    var i = h.len
+
+    while i > from
+        i -= 1
+
+        if h[i] == b then return Some(i)
+
+    None
+
+@test("rfind_byte_from: a match at every position, every length 0..80, every from")
+sut_rfind_every_position()
+    val top: usize = 81
+
+    for n in 0..<top
+        var b: Buf[u8] = buf()
+
+        for _ in 0..<n do b.push(u8('a'))
+
+        for p in 0..<n
+            b[p] = u8('x')
+
+            for from in 0..<(n + 1)
+                assert_eq(b.view().last_index_of_byte_from(u8('x'), from), scalar_rfind(b.view(), u8('x'), from))
+            assert_eq(b.view().last_index_of_byte(u8('x')), Some(p))
+
+            b[p] = u8('a')
+
+        assert_eq(b.view().last_index_of_byte(u8('x')), None)
+
+@test("rfind_byte_from: several matches and bytes with the high bit set agree with a scalar walk")
+sut_rfind_random()
+    var g = rng(20261117, 3)
+
+    for _ in 0..<3000
+        var b: Buf[u8] = buf()
+        val n = g.below(100)
+        val rate = 1 + g.below(30)
+
+        for _ in 0..<n
+            if g.below(100) < rate then b.push(u8(0xC3)) else b.push(u8(g.below(256)))
+
+        val from = g.below(n + 1)
+
+        for needle in [u8(0xC3), u8(0), u8(0xFF), u8('a')]
+            assert_eq(b.view().last_index_of_byte_from(needle, from), scalar_rfind(b.view(), needle, from))
+
+/** `from_utf8_lossy` one character at a time with Unicode's rule: one U+FFFD for each maximal
+ * ill-formed subsequence, which is the bytes consistent with a longer sequence before one was not.
+ */
+private scalar_lossy(b: []const u8) -> Buf[u8]
+    var out: Buf[u8] = buf()
+    var i: usize = 0
+
+    while i < b.len
+        val c = b[i]
+        var need: usize = 1
+        var lo: u8 = 128
+        var hi: u8 = 191
+
+        if c >= 128 && c < 194 || c >= 245 then
+            for r in "\u{FFFD}".bytes do out.push(r)
+            i += 1
+            continue
+
+        if c >= 240 then
+            need = 4
+            if c == 240 then lo = 144
+            if c == 244 then hi = 143
+        elif c >= 224 then
+            need = 3
+            if c == 224 then lo = 160
+            if c == 237 then hi = 159
+        elif c >= 194 then
+            need = 2
+
+        var k: usize = 1
+        var ok = true
+
+        while k < need
+            if i + k >= b.len then
+                ok = false
+                break
+
+            val t = b[i + k]
+
+            if t < (if k == 1 then lo else 128) || t > (if k == 1 then hi else 191) then
+                ok = false
+                break
+
+            k += 1
+
+        if ok then
+            for k2 in 0..<need do out.push(b[i + k2])
+        else
+            for r in "\u{FFFD}".bytes do out.push(r)
+
+        i += if ok then need else k
+
+    out
+
+private lossy_agrees(b: []const u8)
+    val got = from_utf8_lossy(b).bytes
+    val want = scalar_lossy(b)
+
+    assert_eq(got.len, want.len())
+
+    for i in 0..<got.len do assert_eq(got[i], want[i])
+
+@test("from_utf8_lossy: a bad byte at every position of every length 0..80, in ASCII and in accented text")
+sut_lossy_every_position()
+    val accents = "éüñ日😀".bytes
+    val top: usize = 81
+
+    for n in 0..<top
+        var b: Buf[u8] = buf()
+
+        for k in 0..<n do b.push(u8('a'))
+        lossy_agrees(b.view())
+
+        for q in 0..<n
+            for bad in [u8(0xFF), u8(0x80), u8(0xC3), u8(0xE2), u8(0xF0)]
+                val keep = b[q]
+
+                b[q] = bad
+                lossy_agrees(b.view())
+                b[q] = keep
+
+        var m: Buf[u8] = buf()
+
+        for k in 0..<n do m.push(accents[k % accents.len])
+        lossy_agrees(m.view())
+
+        for q in 0..<n
+            val keep = m[q]
+
+            m[q] = 0xFF
+            lossy_agrees(m.view())
+            m[q] = keep
+
+@test("from_utf8_lossy: a sequence truncated at the tail, after ASCII and after accents")
+sut_lossy_truncated_tail()
+    val leads: [3]u8 = [0xC3, 0xE2, 0xF0]
+    val conts: [9]u8 = [0xA9, 0xA9, 0xA9, 0x82, 0xAC, 0xAC, 0x9F, 0x98, 0x80]
+    val need: [3]usize = [2, 3, 4]
+    val pads: usize = 40
+
+    for pad in 0..<pads
+        for li in 0..<3usize
+            for cut in 0..<(need[li] - 1)
+                var b: Buf[u8] = buf()
+
+                for _ in 0..<pad do b.push(u8('q'))
+
+                b.push(leads[li])
+
+                for j in 0..<cut do b.push(conts[li * 3 + j])
+                lossy_agrees(b.view())
+
+                for c in "é".bytes do b.push(c)
+                lossy_agrees(b.view())
+
+@test("from_utf8_lossy: random bytes agree with the scalar rule, and valid input is returned unchanged")
+sut_lossy_random()
+    var g = rng(20261117, 9)
+
+    for _ in 0..<3000
+        var b: Buf[u8] = buf()
+        val n = g.below(140)
+        val rate = g.below(40)
+
+        for _ in 0..<n
+            val r = g.below(1000)
+
+            if r < rate then
+                b.push(u8(0xE2 + g.below(3)))
+            elif r < 2 * rate then
+                b.push(u8(0x80 + g.below(64)))
+            elif r < 2 * rate + 3 then
+                b.push(u8(g.below(256)))
+            else
+                b.push(u8(32 + g.below(95)))
+
+        lossy_agrees(b.view())
+
+    val ok = "héllo wörld → 日本語 😀 and back to ascii for a while longer, ünd noch mehr".bytes
+
+    assert_eq(from_utf8_lossy(ok).bytes.len, ok.len)

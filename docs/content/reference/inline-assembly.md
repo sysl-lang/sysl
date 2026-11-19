@@ -6,9 +6,9 @@ weight: 125
 
 **Inline assembly is experimental, and outside the [stability promise](/getting-started/stability/).**
 Everything below works and is checked against the compiler like every other page here. What it does
-not have yet is a settled surface: a read-modify-write operand, a floating-point register class, and
-the two forms that hand memory and the flags back to the compiler are not built, and each would add
-to the notation. Use it where it is needed, expect it to change between releases, and prefer a
+not have yet is a settled surface: a floating-point register class on the processors with no vector
+registers, and the two forms that hand memory and the flags back to the compiler, are not built, and
+each would add to the notation. Use it where it is needed, expect it to change between releases, and prefer a
 construct from the stable part of the language where one will do.
 
 `asm` reaches the instructions no library can wrap: privileged instructions, instructions that talk
@@ -205,9 +205,9 @@ print(copy(7))
 7
 ```
 
-`reg` means *any general-purpose register the allocator chooses*, and it is the only class. Where an
-instruction requires a particular register, name it, in quotes, because it is the assembler's name
-and not sysl's:
+`reg` means *any general-purpose register the allocator chooses*. The other class, `vreg`, is any
+vector register, and is [below](#a-vector-register). Where an instruction requires a particular
+register, name it, in quotes, because it is the assembler's name and not sysl's:
 
 ```sysl
 out_byte(port: u16, value: u8)
@@ -223,9 +223,8 @@ out_byte(port: u16, value: u8)
 case in the construct: `reg` is a class the language names, `"dx"` is a register only the assembler
 knows, and instruction text is quoted because sysl does not read it.
 
-The class slot is required even though `reg` is currently the only class. Writing it keeps every
-operand line the same shape, so a second class can be added alongside `reg` rather than as an
-exception to a hidden default.
+The class slot is required, even where `reg` is the obvious answer. Writing it keeps every operand
+line the same shape, so `vreg` is a peer of `reg` rather than an exception to a hidden default.
 
 **The `:` here is not a type annotation.** An operand names a variable that already has a type, so
 there is nothing to declare; the slot holds a class or a register.
@@ -263,8 +262,25 @@ true
 
 ### What an operand may be
 
-An operand must be a plain variable whose type fits a general-purpose register: an integer, a
-pointer or `bool`. A float would need a floating-point register class, which does not exist yet.
+An operand must be a plain variable whose type fits its class. A `reg` holds an integer, a pointer
+or `bool`; a `vreg` holds a vector or a float, on the processors that have one
+([below](#a-vector-register)). Each is told the other's name when it is given the wrong kind of
+value:
+
+```sysl
+f(v: <16>u8)
+    asm
+        [aarch64, x86_64]
+            "nop"
+            in v : reg
+        [riscv64, riscv32, thumb, craft, wasm32] unavailable "not shown here"
+
+f(1)
+```
+
+```error
+'v' is a vector, which lives in a vector register rather than a general-purpose one. Write 'vreg' for its class
+```
 
 **A name bound by `ref` is not an operand.** It names storage somewhere else rather than a variable
 of its own, so there is no slot for the register to be loaded from or stored back to:
@@ -329,8 +345,9 @@ f()
 1 42 3
 ```
 
-Reading and writing the same variable is refused, because that is two operands and possibly two
-registers; the instructions would read one and write the other:
+Reading and writing the same variable through an `in` and an `out` is refused, because that is two
+operands and possibly two registers; the instructions would read one and write the other. The
+spelling that means one register is [`inout`](#an-operand-both-read-and-written):
 
 ```sysl
 f()
@@ -355,6 +372,195 @@ both read and written here
 
 Only the **selected** arm's operands are checked, since the others describe machines this build does
 not target. A mistake in an arm is therefore reported by a build for that arm's processor.
+
+### An operand both read and written
+
+`inout` is one operand that arrives holding a variable and leaves holding what the instructions put
+in its register. It is the shape of every two-operand instruction, which overwrites its first
+operand, and of a read-modify-write on three-operand machines:
+
+```sysl
+bump(n: int) -> int
+    var v = n
+    asm
+        [aarch64, thumb, riscv64, riscv32, craft]
+            "add {v}, {v}, {v}"
+            inout v : reg
+        [x86_64]
+            "addl {v}, {v}"
+            inout v : reg
+        [wasm32] unavailable "there are no registers for an operand to land in"
+    v
+
+print(bump(21))
+```
+
+```output
+42
+```
+
+**`inout a -> b` reads `a` and leaves the result in `b`.** The two names are one register, so in
+the instructions `{a}` and `{b}` are the same text; write whichever reads better. `a` is only read,
+so it may be a `val` or a parameter, and `b` must be a `var`. This is a tied operand: the value goes
+in through one variable and comes out through another, and nothing is copied by hand:
+
+```sysl
+sum(acc: int, x: int) -> int
+    var total = 0
+    asm
+        [aarch64, thumb, riscv64, riscv32, craft]
+            "add {total}, {total}, {x}"
+            inout acc -> total : reg
+            in x : reg
+        [x86_64]
+            "addl {x}, {total}"
+            inout acc -> total : reg
+            in x : reg
+        [wasm32] unavailable "there are no registers for an operand to land in"
+    total
+
+print(sum(40, 2))
+```
+
+```output
+42
+```
+
+**The two sides of a tie are one type**, since they are one register, loaded at one type and
+stored back at the other:
+
+```sysl
+widen(a: u32) -> u64
+    var b: u64 = 0
+    asm
+        [aarch64, x86_64]
+            "nop"
+            inout a -> b : reg
+        [riscv64, riscv32, thumb, craft, wasm32] unavailable "not shown here"
+    b
+
+widen(1)
+```
+
+```error
+'a' is uint and 'b' is ulong, but an 'inout' leaves its result in the register it read, so the two sides are one type
+```
+
+**An empty block with an `inout` is a barrier.** The compiler cannot see what the block did to the
+value, so it cannot reason about what the value is afterwards. This is what constant-time code uses
+to stop the optimizer from turning a mask computed without branches back into a branch:
+
+```sysl
+opaque(x: usize) -> usize
+    var v = x
+    asm
+        [aarch64, x86_64, riscv64, riscv32, thumb, craft]
+            ""
+            inout v : reg
+        [wasm32] unavailable "a wasm module has no registers to hide a value in"
+    v
+
+// Every bit of the mask is the condition, and no branch reads the condition.
+select(bit: usize, a: usize, b: usize) -> usize
+    val mask = opaque(0 -% bit)
+    (a & mask) | (b & ~mask)
+
+print(select(1, 7, 9), select(0, 7, 9))
+```
+
+```output
+7 9
+```
+
+### A vector register
+
+`vreg` is any vector register: on AArch64 a `v` register, and on x86-64 an `xmm` register. It holds a
+[vector](/reference/vectors/) that is exactly one register wide, or an `f32` or `f64` as a scalar.
+This is where the instructions no library wraps generically are: AES, SHA, polynomial multiplication
+for CRCs and GCM, and the table lookups.
+
+`{name}` is spelled as the machine writes the register for its type. On AArch64 a vector is `v0` and
+the arrangement follows it in the text (`{s}.16b`); an `f32` is `s0` and an `f64` is `d0`. On x86-64
+every value in the class is `%xmm0`. Here is one round of AES on each machine, checked against the
+worked example in FIPS-197 (Appendix B, the state after the first round's MixColumns):
+
+```sysl
+aes_round(state: <16>u8, key: <16>u8) -> <16>u8
+    var s = state
+    asm
+        [aarch64]
+            "aese {s}.16b, {key}.16b"
+            "aesmc {s}.16b, {s}.16b"
+            inout s : vreg
+            in key : vreg
+        [x86_64]
+            "pxor {key}, {s}"
+            "pxor %xmm15, %xmm15"
+            "aesenc %xmm15, {s}"
+            inout s : vreg
+            in key : vreg
+            clobbers "xmm15"
+        [riscv64, riscv32, thumb, craft, wasm32] unavailable "no AES instructions in this class"
+    s
+
+val input: <16>u8 = [0x32, 0x43, 0xf6, 0xa8, 0x88, 0x5a, 0x30, 0x8d,
+                     0x31, 0x31, 0x98, 0xa2, 0xe0, 0x37, 0x07, 0x34]
+val key: <16>u8 = [0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6,
+                   0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c]
+val out = aes_round(input, key)
+
+print(out[0], out[1], out[2], out[3], out[15])
+```
+
+```output
+4 102 129 229 76
+```
+
+The two machines' instructions divide a round differently. AArch64's `aese` adds the key *before*
+substituting, and x86-64's `aesenc` adds it *after* mixing. The x86-64 arm therefore adds the key
+first itself, and gives `aesenc` a zero key.
+
+**One register's worth is the rule.** On AArch64 that is a vector of 64 bits (a `d` register, `.8b`
+or `.2s`) or 128 bits (a `q` register, `.16b` or `.4s`). On x86-64 it is 128 bits, because the wider
+`ymm` and `zmm` registers are not on every x86-64. A lane is an integer of 8 to 64 bits or a float. A
+vector of any other width is refused, and it goes through memory or is split into several operands:
+
+```sysl
+f(a: <4>u8)
+    asm
+        [aarch64]
+            "nop"
+            in a : vreg
+        [x86_64, riscv64, riscv32, thumb, craft, wasm32] unavailable "not shown here"
+
+f(1)
+```
+
+```error
+'a' is <4>byte, 32 bits, and a vector register here holds 64 or 128 bits
+```
+
+An integer, a pointer or `bool` is told to use `reg`:
+
+```sysl
+f(n: int)
+    asm
+        [aarch64, x86_64]
+            "nop"
+            in n : vreg
+        [riscv64, riscv32, thumb, craft, wasm32] unavailable "not shown here"
+
+f(1)
+```
+
+```error
+'n' is int, which lives in a general-purpose register — 'vreg' holds vectors and floats. Write 'reg' for its class
+```
+
+**The other processors have no vector register class**, and a `vreg` there is refused with a reason.
+Thumb's floating-point registers hold no vectors, RISC-V's vector registers have no fixed width, and
+a build with `general_regs_only` has turned the registers off. A float on those machines goes through
+an integer of the same width, as before.
 
 ## What the block destroys
 
@@ -430,20 +636,22 @@ print(seven_plus(1))
 ```
 
 The one exception is an output bound to the same machine register as an input, as in
-`in n : "eax"` and `out v : "eax"`, which states that the two share it.
+`in n : "eax"` and `out v : "eax"`, which states that the two share it. An `inout` is not an
+exception: its register is its own, and it shares it with no other input.
 
 **An output is a fresh value, made of none of the inputs.** For the same reason — the compiler does
 not read the instructions — it does not guess that an output is an input copied through. An arm that
 does copy an address from an input to an output takes that address out of the
 [borrow check's](/reference/memory/#a-borrowed-pointer-cannot-escape) sight, as an
 [address carried as an integer](/reference/memory/#an-address-as-an-integer-leaves-the-analysis)
-is out of it.
+is out of it. An `inout`'s result is no different: it is what the instructions left in the register,
+whatever arrived there.
 
 ## The words this construct uses
 
-None of them is reserved. `asm`, `unavailable`, `out`, `reg` and `clobbers` are contextual: each is
-recognized in exactly one position and is an ordinary identifier everywhere else, including in any
-other position inside an assembly block.
+None of them is reserved. `asm`, `unavailable`, `out`, `inout`, `reg`, `vreg` and `clobbers` are
+contextual: each is recognized in exactly one position and is an ordinary identifier everywhere
+else, including in any other position inside an assembly block.
 
 ```sysl
 f() -> int
@@ -451,13 +659,15 @@ f() -> int
     var reg = 2
     var clobbers = 3
     var asm = 4
-    out + reg + clobbers + asm
+    var inout = 5
+    var vreg = 6
+    out + reg + clobbers + asm + inout + vreg
 
 print(f())
 ```
 
 ```output
-10
+21
 ```
 
 `in` is already a reserved word, used in `for x in xs`, and is reused here.
@@ -1053,9 +1263,10 @@ The fourteen names apply only where nothing else claims them: if a function or a
 
 ## What is not here yet
 
-- **`inout`**, a read-modify-write operand. The instructions that need one are the exchange and
-  compare-exchange family, which [`sysl.sync`](/library/) already covers.
 - **Declaring that memory and the flags are preserved**, which would be an optimization over the
   current behaviour, which is always correct.
-- **A floating-point register class.** It cannot be a single class: bare-metal RISC-V has no
-  floating-point registers to name.
+- **A floating-point register class on Thumb and RISC-V.** On AArch64 and x86-64 a float is a
+  [`vreg`](#a-vector-register). The other two need a class of their own, because their
+  floating-point registers are a separate file, and bare-metal RISC-V has none to name.
+- **The wider x86-64 vector registers**, `ymm` and `zmm`, which need AVX and AVX-512, and an
+  `inout` whose result is thrown away (`-> _`).

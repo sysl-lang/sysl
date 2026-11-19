@@ -35,6 +35,13 @@ end Unshareable
 // The part of a type that may not be shared, or nothing where every count it reaches is atomic.
 unshareable(t: Type) -> Option[Unshareable] = share_walk(t, buf(), None, false, false, false)
 
+// The same question of an object **made** to be shared -- a `&sync T`, a closure erased into a `&sync
+// Fn` -- where every string in it is put in bytes with an atomic count as the box is filled
+// (`emit_cross.sysl`'s `share_payload`), so a string is not in the way. Everything else is asked as it
+// always is, and so is a string reached without being copied: a lent view's elements, a frozen
+// buffer's, what a pointer or a `@crossing` parameter or module storage reaches.
+formed_unshareable(t: Type) -> Option[Unshareable] = share_walk(t, buf(), None, false, false, false, true)
+
 // The same question of a value **handed over as a copy** (a `@crossing` parameter taken by value): every view in it,
 // at any depth, is copied into storage with a count of its own, so a view and a string are not in the
 // way -- what their elements hold still is. A guarded field and a frozen buffer's elements are not
@@ -60,7 +67,8 @@ send_refusal(t: Type) -> Option[Unshareable] = share_walk(t, buf(), None, false,
 share_refusal(t: Type) -> Option[Unshareable] = share_walk(t, buf(), None, false, false, true)
 
 private share_walk(t: Type, path: Buf[string], holder: Option[Type],
-                   laid: bool, copied: bool, named: bool) -> Option[Unshareable] = t match
+                   laid: bool, copied: bool, named: bool,
+                   formed: bool = false) -> Option[Unshareable] = t match
     Ref(_, sync) -> if sync || laid then None else Some(Unshareable(path, t, holder))
     Ptr(_, _) -> None
     Weak(_) -> if laid then None else Some(Unshareable(path, t, holder))
@@ -69,20 +77,20 @@ private share_walk(t: Type, path: Buf[string], holder: Option[Type],
         else if !laid then Some(Unshareable(path, t, holder))
         else if read_only then None
         else share_walk(*elem, path, holder, false, false, named)
-    Str -> if laid || copied then None else Some(Unshareable(path, t, holder))
+    Str -> if laid || copied || formed then None else Some(Unshareable(path, t, holder))
 
     // An array *is* its elements, so sharing one shares each of them; the path stops at the field,
     // since naming the element is what the reported type already does.
-    Array(_, elem) -> share_walk(*elem, path, holder, laid, copied, named)
+    Array(_, elem) -> share_walk(*elem, path, holder, laid, copied, named, formed)
 
-    Constrained(d) -> share_walk(d.base, path, holder, laid, copied, named)
+    Constrained(d) -> share_walk(d.base, path, holder, laid, copied, named, formed)
 
     // A parameter asked by a bound promises what its own bounds say: `Share` covers both questions,
     // `Send` the copy.
     Abstract(_, bounds) ->
         if !named || bound_promises_crossing(bounds, copied) then None
         else Some(Unshareable(path, t, holder))
-    Pack(elems) -> if named then share_walk_each(elems, path, holder, laid, copied, named) else None
+    Pack(elems) -> if named then share_walk_each(elems, path, holder, laid, copied, named, formed) else None
 
     // **A guarded field is not shared by sharing its struct**: `@guards(value)` promises that the
     // struct's own members are the only way to it, and those hold whatever leaves through them to
@@ -99,11 +107,11 @@ private share_walk(t: Type, path: Buf[string], holder: Option[Type],
     Struct(d) ->
         if promised_crossing(d.promised, copied) then None
         else if d.base == frozen_base() && d.targs.len() == 1 then share_walk(d.targs[0], path, Some(t), laid, false, named)
-        else if !laid && !copied && !named && is_lending_closure(d) then lent_walk_fields(d.fields, path, t)
-        else share_walk_fields(unguarded(d), path, "", t, laid, copied, named)
+        else if !laid && !copied && !named && is_lending_closure(d) then lent_walk_fields(d.fields, path, t, formed)
+        else share_walk_fields(unguarded(d), path, "", t, laid, copied, named, formed)
 
     // A data enum shares one payload region, so every variant's fields are reachable from it.
-    Enum(d) -> share_walk_variants(d.variants, path, t, laid, copied, named)
+    Enum(d) -> share_walk_variants(d.variants, path, t, laid, copied, named, formed)
 
     // A type parameter the crossing checks meet (above) promises nothing about its counts, and
     // nothing is decided there: the instantiation resolves this type again with an argument in its
@@ -128,9 +136,9 @@ promised_crossing(promised: Buf[string], copied: bool) -> bool
     holds_string(promised, "Share") || (copied && holds_string(promised, "Send"))
 
 private share_walk_each(ts: Buf[Type], path: Buf[string], holder: Option[Type],
-                        laid: bool, copied: bool, named: bool) -> Option[Unshareable]
+                        laid: bool, copied: bool, named: bool, formed: bool) -> Option[Unshareable]
     for item in ts
-        val found = share_walk(item, path, holder, laid, copied, named)
+        val found = share_walk(item, path, holder, laid, copied, named, formed)
 
         if found.is_some() then return found
 
@@ -161,12 +169,12 @@ end check_shared_result
 
 private share_walk_fields(fields: Buf[(string, Type)], path: Buf[string],
                           prefix: string, holder: Type, laid: bool, copied: bool,
-                          named: bool) -> Option[Unshareable]
+                          named: bool, formed: bool) -> Option[Unshareable]
     for item in fields
         // An anonymous member's fields are named as the holder's own, so the step into it is not
         // a step of the path a reader would write.
         if is_anonymous_field(item.0)
-            val inner = share_walk(item.1, path, Some(holder), laid, copied, named)
+            val inner = share_walk(item.1, path, Some(holder), laid, copied, named, formed)
 
             if inner.is_some() then return inner
 
@@ -174,7 +182,7 @@ private share_walk_fields(fields: Buf[(string, Type)], path: Buf[string],
         end if
 
         val step = if prefix == "" then item.0 else s"$prefix(${item.0})"
-        val found = share_walk(item.1, extended_path(path, step), Some(holder), laid, copied, named)
+        val found = share_walk(item.1, extended_path(path, step), Some(holder), laid, copied, named, formed)
 
         if found.is_some() then return found
 
@@ -204,23 +212,26 @@ end unguarded
 // **A struct or tuple holding a view is lent the same way** (`holds_lent_view`): every view in its
 // own storage has its owner nulled, so each is asked as a bare one would be, and every other field
 // as anything crossing is -- a `string` or a plain `&T` beside the view is still refused, by name.
-private lent_walk_fields(fields: Buf[(string, Type)], path: Buf[string], holder: Type) -> Option[Unshareable]
+private lent_walk_fields(fields: Buf[(string, Type)], path: Buf[string], holder: Type,
+                         formed: bool) -> Option[Unshareable]
     for item in fields
         val at = if is_anonymous_field(item.0) then path else extended_path(path, item.0)
-        val found = lent_walk(item.1, at, holder)
+        val found = lent_walk(item.1, at, holder, formed)
 
         if found.is_some() then return found
 
     None
 end lent_walk_fields
 
-private lent_walk(t: Type, path: Buf[string], holder: Type) -> Option[Unshareable] = t match
+// A lent view's elements are reached in place, not copied, so a string among them is asked strictly --
+// and so is one beside a view in a lent struct, which is borrowed whole and so never copied either.
+private lent_walk(t: Type, path: Buf[string], holder: Type, formed: bool) -> Option[Unshareable] = t match
     Slice(elem, _) -> if unshareable(*elem).is_none() then None else Some(Unshareable(path, t, Some(holder)))
-    Constrained(d) -> lent_walk(d.base, path, holder)
+    Constrained(d) -> lent_walk(d.base, path, holder, formed)
     Struct(d) ->
-        if holds_lent_view(t) then lent_walk_fields(d.fields, path, t)
-        else share_walk(t, path, Some(holder), false, false, false)
-    _ -> share_walk(t, path, Some(holder), false, false, false)
+        if holds_lent_view(t) then lent_walk_fields(d.fields, path, t, false)
+        else share_walk(t, path, Some(holder), false, false, false, formed)
+    _ -> share_walk(t, path, Some(holder), false, false, false, formed)
 
 // The part of a guarded field that may not be shared, or nothing where every guarded field of `d`
 // reaches only atomic counts -- in which case nothing a member hands out of it can carry one.
@@ -250,9 +261,9 @@ private just_field(name: string) -> Buf[string]
     out
 
 private share_walk_variants(variants: Buf[EnumVariant], path: Buf[string],
-                            holder: Type, laid: bool, copied: bool, named: bool) -> Option[Unshareable]
+                            holder: Type, laid: bool, copied: bool, named: bool, formed: bool) -> Option[Unshareable]
     for item in variants
-        val found = share_walk_fields(item.fields, path, item.name, holder, laid, copied, named)
+        val found = share_walk_fields(item.fields, path, item.name, holder, laid, copied, named, formed)
 
         if found.is_some() then return found
 
@@ -278,7 +289,7 @@ end extended_path
 // name the compiler filed it under: it is "a closure", and what is in the way is something "it
 // captures" (`reference/types.md § Function types`).
 share_complaint(inner: Type, a: &Analysis, scope: Scope) -> Option[string]
-    val part = unshareable(inner)
+    val part = formed_unshareable(inner)
 
     if part.is_none() then return None
 
@@ -501,7 +512,17 @@ end share_where
 share_remedy(head: string, ty: Type) -> string = ty match
     Ref(inner, _) -> head + s"whose count is not. Hold it as a '&sync ${type_show(*inner)}' ('06')"
     Weak(_) -> head + "and a weak count has no atomic form yet"
-    _ -> head + share_view_remedy(if ty == Str then "bytes" else "elements")
+    Str -> head + share_string_remedy()
+    _ -> head + share_view_remedy("elements")
+
+// **A string crosses where something copies it on the way**, and this is a place nothing does: a
+// pointer's pointee, a task's frame, a lent view's elements, a frozen buffer's, module storage, what
+// leaves a guard. The places that do are the remedy.
+private share_string_remedy() -> string =
+    "which owns its bytes through a count that is not atomic, and nothing copies it on the way here. " +
+    "A string crosses where it is copied: handed by value to a '@crossing' parameter, or made a " +
+    "field of a '&sync T' or a capture of a '&sync Fn', which put it in bytes of its own with an " +
+    "atomic count ('06')"
 
 private share_view_remedy(what: string) -> string =
     s"which owns its $what through a count that is not atomic. A literal's $what are immortal and " +

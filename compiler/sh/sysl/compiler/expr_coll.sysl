@@ -49,7 +49,11 @@ bytes_literal(cx: &Analyzer, span: Span, text: string, expected: Option[Type]) -
 end bytes_literal
 
 array_literal(cx: &Analyzer, span: Span, elems: Buf[Expr], expected: Option[Type]) -> TExpr
-    val elem_exp = expected.and_then(t -> element_wanted(t))
+    // **An element of `volatile T` is storage, and what goes into it is a `T` value**, so the
+    // elements are read at the plain type and the literal is laid out at the qualified one --
+    // `var bank: [4]volatile u32 = [1, 2, 3, 4]` as a constructor fills a qualified field.
+    val qualified = expected.and_then(t -> element_wanted(t))
+    val elem_exp = qualified.map(t -> unqualified(t))
     var ts: Buf[TExpr] = buf()
 
     // With nothing asked of it, the literal's elements are operands that must share one type, and
@@ -90,7 +94,10 @@ array_literal(cx: &Analyzer, span: Span, elems: Buf[Expr], expected: Option[Type
             cx.fault(span, s"an array literal needs one element type, got " +
                      s"${type_show(texpr_type(ts[0]))} and ${type_show(t)}")
 
-    val elem_ty = settled_element(ts, elem_exp)
+    val settled = settled_element(ts, elem_exp)
+    val elem_ty = qualified match
+        Some(Volatile(inner)) -> if type_eq(settled, *inner) then qualified.unwrap() else settled
+        _ -> settled
 
     if elem_ty == Unknown && ts.is_empty() then
         return cx.err(span, "an empty array literal takes its element type from its context, and " +
@@ -467,6 +474,61 @@ private parameter_writes(cx: &Analyzer, receiver: Type) -> Option[bool]
         _ -> None
 end parameter_writes
 
+// Whether a receiver a type parameter stands for at this instantiation is read in place: Some(true)
+// where its bounds promise `index_place`, Some(false) where they promise only `index`, None where the
+// receiver is no parameter's, or its bounds promise neither. **A bound names the member a subscript
+// calls**: the opaque reading of the body asked the bounds, so an instantiation at a type that ALSO
+// implements the other trait must not trade the bound's member for the richer one.
+//
+// **The decision is the source's**, as a member call's is (`member_call.sysl`'s `promised_member`):
+// the walk at the definition files which parameter each subscript's receiver was, so a `c: *Two` the
+// program wrote in a body instantiated at `T = Two` keeps the subscript a non-generic body gives it. A
+// body that walk never read -- the library's, a nested generic -- asks of the
+// parameters instantiated at the receiver's type instead.
+private parameter_reads(cx: &Analyzer, span: Span, receiver: Type) -> Option[bool]
+    val t = repr(receiver)
+
+    t match
+        Abstract(n, _) ->
+            if cx.at_definition then cx.an.tables.receiver_params.put(subscript_site_key(cx, span), n)
+            return None
+        _ -> ()
+
+    if cx.at_definition then cx.an.tables.receiver_params.put(subscript_site_key(cx, span), "")
+
+    val filed = cx.an.tables.receiver_params.get(subscript_site_key(cx, span))
+
+    if filed.is_some() && filed.unwrap() == "" then return None
+
+    // `Self` is asked too: a trait default's copy reads `self[i]` through what the trait requires, and
+    // in a method the type wrote itself `Self` has no bounds, so the type's own choice stands.
+    for b in cx.subst
+        val mine = if filed.is_some() then b.name == filed.unwrap() else repr(b.ty) == t
+
+        if mine
+            var bounds: Buf[Bound] = buf()
+
+            val keys = if b.name == "Self" && bound_traits(cx, b.name).is_empty() then default_self_traits(cx)
+                       else bound_traits(cx, b.name)
+
+            for key in keys
+                bounds.push(plain_bound(key, buf()))
+
+            if !bounds.is_empty()
+                val subject = Abstract(b.name, bounds)
+
+                if bound_member(cx.an, subject, bounds, "index_place").is_some() then return Some(true)
+                if bound_member(cx.an, subject, bounds, "index").is_some() then return Some(false)
+        end if
+
+    None
+end parameter_reads
+
+// A subscript, by its file and its whole span, under a name no member can have: `t[i][j]` holds two
+// that start at one place.
+private subscript_site_key(cx: &Analyzer, span: Span) -> string =
+    s"${cx.scope.src.name}:${span.start}:${span.end}:[]"
+
 private bounds_write(cx: &Analyzer, tparam: string) -> bool
     var bounds: Buf[Bound] = buf()
 
@@ -530,7 +592,14 @@ private index_non_vector(cx: &Analyzer, span: Span, raw: TExpr, tr: TExpr, index
         // is asked first, so a type that also has `Index` for generic code is still indexed in place.
         val place_key = catalog_key(cx.an, "IndexPlace")
 
-        if place_key.is_some() && indexes_through(cx.an, place_key.unwrap(), texpr_type(tr))
+        // A receiver a type parameter stands for is read through the member its bound names, never
+        // through whatever else the type it stands for this time happens to implement.
+        val decided = parameter_reads(cx, span, texpr_type(tr))
+
+        if decided.is_some() && !decided.unwrap() then return call_member(cx, span, raw, "index", args, expected)
+
+        if (decided.is_some() && decided.unwrap()) ||
+           (place_key.is_some() && indexes_through(cx.an, place_key.unwrap(), texpr_type(tr)))
             // A subscript the target being read writes through goes through the container's own
             // `index_place_mut` where it wrote one (`write_target.sysl`).
             val call = call_member(cx, span, raw, subscript_member(cx, span, texpr_type(tr)), args, None)
@@ -614,6 +683,13 @@ const SubscriptIndexOp: string = "subscript_index"
 
 // `index`, wrapped so that its method's argument is read as a subscript's index.
 subscript_index_arg(index: Expr) -> Expr
+    // A subscript of several indices arrives already wrapped (`multi_index.sysl`).
+    *index.kind match
+        Call(callee, _) -> *callee.kind match
+            Ident(name) -> if name == SubscriptIndex then return index
+            _ -> ()
+        _ -> ()
+
     var one: Buf[Expr] = buf()
 
     one.push(index)
@@ -622,6 +698,8 @@ end subscript_index_arg
 
 // The form itself, with `expected` the type of the parameter the index lands on.
 subscript_index_form(cx: &Analyzer, span: Span, args: Buf[Expr], expected: Option[Type]) -> TExpr
+    if args.len() > 1 then return multi_index_form(cx, span, args, expected)
+
     val index = args[0]
 
     val to_usize = expected match

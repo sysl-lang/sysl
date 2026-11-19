@@ -52,11 +52,12 @@ struct CoroCtx
     free_label: string
     out_label: string
 
-    // Whether the frame came from the aligned hook, so goes back through its free (`frame_align`).
-    aligned: bool
+    // The boundary the frame was taken on, which it is given back with (`frame_boundary`).
+    boundary: usize
 end CoroCtx
 
-// The two symbols a frame's storage comes from and goes back to.
+// The two symbols a frame's storage comes from and goes back to: `sysl_task_alloc(size, align)` and
+// `sysl_task_free(p, size, align)`, each told the frame's size and boundary.
 task_alloc_symbol() -> string = "sysl_task_alloc"
 task_free_symbol() -> string = "sysl_task_free"
 
@@ -379,23 +380,20 @@ begin_coroutine(e: *Emit, f: TFunc)
 
     coro_call(e, Some(size), word_lty(e), coro_size_name(e), buf())
 
-    var size_arg: Buf[IrArg] = buf()
-
-    size_arg.push(ir_arg(word_lty(e), size))
-
     val mem = fresh_reg(e)
-    val boundary = frame_align(e, f)
-    val aligned = boundary > e.layout.heap_align()
+    val boundary = frame_boundary(e, f)
 
-    if aligned
-        size_arg.push(ir_arg(word_lty(e), VInt(from_int(long(boundary)))))
-        coro_call(e, Some(mem), LPtr, aligned_alloc_symbol(), size_arg)
-        note_aligned_heap(e, s"the frame of the task '${f.name}' asks for the $boundary-byte boundary " +
-            "a value it holds is aligned on", boundary)
-    else
-        coro_call(e, Some(mem), LPtr, task_alloc_symbol(), size_arg)
-    end if
+    coro_call(e, Some(mem), LPtr, task_alloc_symbol(), sized_args(e, None, size, boundary))
 
+    if boundary > e.layout.heap_align() && e.aligned_frame.is_empty()
+        e.aligned_frame.push((s"the frame of the task '${f.name}' asks for the $boundary-byte boundary " +
+            "a value it holds is aligned on", e.self_name, boundary))
+
+    // A task's frame is a box like any other, and a null answer traps before it is stored.
+    val got = fresh_reg(e)
+
+    emit(e, InIntCmp(got, INe, LPtr, mem, VNull))
+    trap_unless(e, got, "alloc")
     emit(e, InStore(LPtr, mem, mem_slot, AccPlain, None))
     emit_term(e, InBr("task.begin"))
     emit_label(e, "task.begin")
@@ -418,13 +416,32 @@ begin_coroutine(e: *Emit, f: TFunc)
     emit(e, InStore(LPtr, hdl, field_addr(e, shape, promise, task_handle_field()), AccPlain, None))
     name_frame_slots(e, whole, promise, result, locals)
 
-    e.coro = Some(CoroCtx(promise, result, id, hdl, "task.final", "task.free", "task.out", aligned))
+    e.coro = Some(CoroCtx(promise, result, id, hdl, "task.final", "task.free", "task.out", boundary))
 end begin_coroutine
 
+// The arguments of a call to `sysl_task_alloc` (`p` absent) or `sysl_task_free` (`p` present): the
+// block, its size and its boundary.
+private sized_args(e: *Emit, p: Option[Val], size: Val, boundary: usize) -> Buf[IrArg]
+    var args: Buf[IrArg] = buf()
+
+    if p.is_some() then args.push(ir_arg(LPtr, p.unwrap()))
+
+    args.push(ir_arg(word_lty(e), size))
+    args.push(ir_arg(word_lty(e), VInt(from_int(long(boundary)))))
+    args
+end sized_args
+
+// The boundary a frame is taken on: what its values ask (`frame_align`), and never less than the
+// word its promise's header begins with.
+private frame_boundary(e: *Emit, f: TFunc) -> usize
+    val word = e.layout.pointer_bytes()
+    val a = frame_align(e, f)
+
+    if a > word then a else word
+end frame_boundary
+
 // The boundary a coroutine's frame has to begin on: the widest of its parameters, its locals and
-// every value its body computes, any of which LLVM may keep in the frame across a suspension. Where
-// that is beyond what the allocating pair promises, the frame comes from the aligned hook rather
-// than `sysl_task_alloc` (whose contract is the pair's boundary), and goes back through its free.
+// every value its body computes, any of which LLVM may keep in the frame across a suspension.
 private frame_align(e: *Emit, f: TFunc) -> usize
     val l = e.layout
     var seen: Buf[usize] = buf()
@@ -538,7 +555,11 @@ finish_coroutine(e: *Emit)
     emit(e, InIntCmp(none, IEq, LPtr, m, VNull))
     emit_term(e, InCondBr(none, c.out_label, give))
     emit_label(e, give)
-    coro_call(e, None, LVoid, if c.aligned then aligned_free_symbol() else task_free_symbol(), one_ptr(m))
+    // The size is asked again: the intrinsic answers the one frame size anywhere in the coroutine.
+    val size = fresh_reg(e)
+
+    coro_call(e, Some(size), word_lty(e), coro_size_name(e), buf())
+    coro_call(e, None, LVoid, task_free_symbol(), sized_args(e, Some(m), size, c.boundary))
     emit_term(e, InBr(c.out_label))
 
     emit_label(e, c.out_label)
@@ -891,10 +912,33 @@ private task_waker_text(e: *Emit) -> string
     "out:\n" +
     "  ret void\n" +
     "give:\n" +
-    s"  call void @${task_free_symbol()}(ptr %b)\n" +
+    s"  %bsz = getelementptr $shape, ptr null, i32 1\n" +
+    s"  %bn = ptrtoint ptr %bsz to $w\n" +
+    s"  call void @${task_free_symbol()}(ptr %b, $w %bn, $w ${e.layout.pointer_bytes()})\n" +
     "  ret void\n" +
     "}\n"
 end task_waker_text
+
+// A hand-written coroutine's frame taken from the task hook on the `a`-byte boundary, from the
+// `alloc` block to the `begin` one: a null answer traps before it is stored, as a compiled task's
+// does, and the block `begin` is reached from is `allocd`. `refused` is the stop, which the rest of the
+// text may branch to as well.
+private frame_alloc_text(e: *Emit, w: string, a: usize) -> string
+    e.traps = true
+
+    "alloc:\n" +
+    s"  %size = call $w @${coro_size_name(e)}()\n" +
+    s"  %mem = call ptr @${task_alloc_symbol()}($w %size, $w $a)\n" +
+    "  %given = icmp ne ptr %mem, null\n" +
+    "  br i1 %given, label %allocd, label %refused\n" +
+    "refused:\n" +
+    s"  call void @${trap_symbol(e)}()\n" +
+    "  unreachable\n" +
+    "allocd:\n" +
+    "  br label %begin\n" +
+    "begin:\n" +
+    "  %frame = phi ptr [ null, %entry ], [ %mem, %allocd ]\n"
+end frame_alloc_text
 
 // `park(register)`'s task. Started, it makes a waker over the step's own, hands it to `register` --
 // which keeps a share of it wherever the event it waits for will find it, or calls it at once -- and
@@ -914,12 +958,7 @@ private task_park_text(e: *Emit) -> string
     s"  %id = call token @llvm.coro.id(i32 $a, ptr %pr, ptr null, ptr null)\n" +
     "  %need = call i1 @llvm.coro.alloc(token %id)\n" +
     "  br i1 %need, label %alloc, label %begin\n" +
-    "alloc:\n" +
-    s"  %size = call $w @${coro_size_name(e)}()\n" +
-    s"  %mem = call ptr @${task_alloc_symbol()}($w %size)\n" +
-    "  br label %begin\n" +
-    "begin:\n" +
-    "  %frame = phi ptr [ null, %entry ], [ %mem, %alloc ]\n" +
+    frame_alloc_text(e, w, a) +
     "  %hdl = call ptr @llvm.coro.begin(token %id, ptr %frame)\n" +
     s"  store $w 1, ptr %pr\n" +
     s"  %hook = getelementptr ${header_text(e)}, ptr %pr, i32 0, i32 1\n" +
@@ -940,7 +979,10 @@ private task_park_text(e: *Emit) -> string
     "run:\n" +
     s"  %bsz = getelementptr $shape, ptr null, i32 1\n" +
     s"  %bn = ptrtoint ptr %bsz to $w\n" +
-    s"  %b = call ptr @${task_alloc_symbol()}($w %bn)\n" +
+    s"  %b = call ptr @${task_alloc_symbol()}($w %bn, $w $a)\n" +
+    "  %bgiven = icmp ne ptr %b, null\n" +
+    "  br i1 %bgiven, label %bgot, label %refused\n" +
+    "bgot:\n" +
     s"  store $w 1, ptr %b\n" +
     s"  %bh = getelementptr $shape, ptr %b, i32 0, i32 1\n" +
     "  store ptr @sysl.task.waker.hook, ptr %bh\n" +
@@ -998,7 +1040,8 @@ private task_park_text(e: *Emit) -> string
     "  %nomem = icmp eq ptr %m, null\n" +
     "  br i1 %nomem, label %out, label %give\n" +
     "give:\n" +
-    s"  call void @${task_free_symbol()}(ptr %m)\n" +
+    s"  %fsize = call $w @${coro_size_name(e)}()\n" +
+    s"  call void @${task_free_symbol()}(ptr %m, $w %fsize, $w $a)\n" +
     "  br label %out\n" +
     "out:\n" +
     "  call void @llvm.coro.end(ptr %hdl, i1 false, token none)\n" +
@@ -1019,12 +1062,7 @@ private task_yield_text(e: *Emit) -> string
     s"  %id = call token @llvm.coro.id(i32 $a, ptr %pr, ptr null, ptr null)\n" +
     "  %need = call i1 @llvm.coro.alloc(token %id)\n" +
     "  br i1 %need, label %alloc, label %begin\n" +
-    "alloc:\n" +
-    s"  %size = call $w @${coro_size_name(e)}()\n" +
-    s"  %mem = call ptr @${task_alloc_symbol()}($w %size)\n" +
-    "  br label %begin\n" +
-    "begin:\n" +
-    "  %frame = phi ptr [ null, %entry ], [ %mem, %alloc ]\n" +
+    frame_alloc_text(e, w, a) +
     "  %hdl = call ptr @llvm.coro.begin(token %id, ptr %frame)\n" +
     s"  store $w 1, ptr %pr\n" +
     s"  %hook = getelementptr ${header_text(e)}, ptr %pr, i32 0, i32 1\n" +
@@ -1061,7 +1099,8 @@ private task_yield_text(e: *Emit) -> string
     "  %none = icmp eq ptr %m, null\n" +
     "  br i1 %none, label %out, label %give\n" +
     "give:\n" +
-    s"  call void @${task_free_symbol()}(ptr %m)\n" +
+    s"  %fsize = call $w @${coro_size_name(e)}()\n" +
+    s"  call void @${task_free_symbol()}(ptr %m, $w %fsize, $w $a)\n" +
     "  br label %out\n" +
     "out:\n" +
     "  call void @llvm.coro.end(ptr %hdl, i1 false, token none)\n" +
@@ -1072,26 +1111,59 @@ end task_yield_text
 // The two hooks' defaults, over the program's own allocator, and `weak` so that a definition linked
 // in from anywhere else wins. One the program defines itself is left out, since a module may not
 // define a symbol twice.
+//
+// A pair told sizes (`heap_sized`) is handed the frame's size and boundary as they came. libc's is
+// called as libc declares it, and where the C library has an aligned allocation a frame past
+// `malloc`'s boundary goes to that instead (`emit_box.sysl`'s `sysl.heap.alloc_aligned`). Whether the
+// default can answer such a frame is the target's question, never the module's: every codegen unit
+// writes the same `weak` body, and the link keeps any one of them. Where it cannot, a frame that asks
+// for more is refused (`check_aligned_heap`).
 request_task_storage(e: *Emit, p: TProgram)
     if !e.uses_coro then return
 
     val w = s"i${e.word_bits}"
+    val pre = e.target.preemption()
+    val sized = heap_sized()
+    val wide = !sized && c_aligned_pair(e.target).is_some()
+    val split = s"  %wide = icmp ugt $w %align, ${e.layout.heap_align()}\n" +
+        "  br i1 %wide, label %aligned, label %plain\n"
 
     if !claimed_symbol(e, p, task_alloc_symbol())
+        val body = if sized
+            s"  %p = call ptr @${malloc_symbol()}($w %size, $w %align)\n  ret ptr %p\n"
+        else if wide
+            split + "aligned:\n" +
+            s"  %q = call ptr @${aligned_alloc_symbol()}($w %size, $w %align)\n  ret ptr %q\n" +
+            "plain:\n" +
+            s"  %p = call ptr @${malloc_symbol()}($w %size)\n  ret ptr %p\n"
+        else
+            s"  %p = call ptr @${malloc_symbol()}($w %size)\n  ret ptr %p\n"
+
         request_helper(e, task_alloc_symbol(), HrText(
-            s"define weak ${e.target.preemption()}ptr @${task_alloc_symbol()}($w %size) {\n" +
-            "entry:\n" +
-            s"  %p = call ptr @${malloc_symbol()}($w %size)\n" +
-            "  ret ptr %p\n" +
-            "}\n"))
+            s"define weak ${pre}ptr @${task_alloc_symbol()}($w %size, $w %align) {\n" +
+            "entry:\n" + body + "}\n"))
+
+        if wide then e.aligned_frees = true
+        else if !sized && !e.aligned_frame.is_empty() && e.aligned_heap.is_empty() then e.aligned_heap.push(e.aligned_frame[0])
+    end if
 
     if !claimed_symbol(e, p, task_free_symbol())
+        val body = if sized
+            s"  call void @${free_symbol()}(ptr %p, $w %size, $w %align)\n  ret void\n"
+        else if wide
+            split + "aligned:\n" +
+            s"  call void @${aligned_free_symbol()}(ptr %p)\n  ret void\n" +
+            "plain:\n" +
+            s"  call void @${free_symbol()}(ptr %p)\n  ret void\n"
+        else
+            s"  call void @${free_symbol()}(ptr %p)\n  ret void\n"
+
         request_helper(e, task_free_symbol(), HrText(
-            s"define weak ${e.target.preemption()}void @${task_free_symbol()}(ptr %p) {\n" +
-            "entry:\n" +
-            s"  call void @${free_symbol()}(ptr %p)\n" +
-            "  ret void\n" +
-            "}\n"))
+            s"define weak ${pre}void @${task_free_symbol()}(ptr %p, $w %size, $w %align) {\n" +
+            "entry:\n" + body + "}\n"))
+
+        if wide then e.aligned_frees = true
+    end if
 end request_task_storage
 
 // Whether the program already says what this symbol is, by exporting a function under it or by

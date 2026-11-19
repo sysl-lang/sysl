@@ -531,8 +531,112 @@ xrc_unwrap_once_per_type()
     assert_eq(defined, 2)
     assert(out.contains("define i32 @sysl$Option.unwrap.int("), out)
     assert(out.contains("define double @sysl$Option.unwrap.real("), out)
-    assert(out.contains("declare void @exit(i32)"), out)
+    xrc_stops_through_abort(out)
 end xrc_unwrap_once_per_type
+
+// A hosted panic stops through `abort`, never `exit(1)` (`check.sysl`'s `panic_stop`), so what a
+// forcing combinator reaches is `abort`, declared beside its call -- and `exit` appears nowhere.
+private xrc_stops_through_abort(out: string)
+    assert(out.contains("declare void @abort()"), out)
+    assert(out.contains("call void @abort()"), out)
+    assert(!out.contains("@exit"), out)
+    assert_eq(xrc_unstated_callee(out), "")
+
+// The callee a `call` line names directly, or "" for a call through a register. The callee is the
+// first word that opens an argument list and names a global or a register: a result type before it
+// (`%struct.X`) opens none, and a variadic call's function type (`(i32, ...)`) names neither.
+private xrc_callee(line: string) -> string
+    val at = line.index_of("call ")
+
+    if at.is_none() then return ""
+
+    val rest = line[at.unwrap() + 5..<line.len]
+
+    for word in split(rest, " ")
+        if word.starts_with("@") || word.starts_with("%")
+            val open = word.index_of("(")
+
+            if open.is_some()
+                if word.starts_with("%") then return ""
+
+                return word[1..<open.unwrap()]
+
+    ""
+end xrc_callee
+
+// The first function some `call` in `text` names that no `declare` or `define` line states, or "" --
+// LLVM refuses a module that calls a symbol it never stated.
+private xrc_unstated_callee(text: string) -> string
+    var stated: Buf[string] = buf()
+
+    for line in split(text, "\n")
+        if line.starts_with("declare ") || line.starts_with("define ")
+            for word in split(line, " ")
+                val open = word.index_of("(")
+
+                if word.starts_with("@") && open.is_some()
+                    stated.push(word[1..<open.unwrap()])
+                    break
+
+    for line in split(text, "\n")
+        val callee = xrc_callee(line.trim())
+
+        if callee.len > 0
+            var found = false
+
+            for s in stated
+                if s == callee then found = true
+
+            if !found then return callee
+
+    ""
+end xrc_unstated_callee
+
+@test("the callee check reads a direct, a variadic, a struct-returning and an indirect call")
+xrc_callee_reads_every_form()
+    assert_eq(xrc_callee("  call void @abort()"), "abort")
+    assert_eq(xrc_callee("  %t1 = call i32 (ptr, ...) @printf(ptr %t0, i32 1)"), "printf")
+    assert_eq(xrc_callee("  %t2 = call %struct.X @make$$sysl(i32 1)"), "make$$sysl")
+    assert_eq(xrc_callee("  %t3 = call i32 %t2(ptr @g)"), "")
+    assert_eq(xrc_callee("  tail call void @llvm.lifetime.end.p0(i64 8, ptr %x)"), "llvm.lifetime.end.p0")
+    assert_eq(xrc_callee("  store i32 1, ptr %x"), "")
+
+// The check can fail: a call whose symbol nothing states is named.
+@test("the callee check names a call nothing declares")
+xrc_unstated_callee_named()
+    assert_eq(xrc_unstated_callee("declare void @abort()\ndefine void @f() {\n  call void @abort()\n" +
+                                  "  call void @exit(i32 1)\n  ret void\n}\n"),
+              "exit")
+    assert_eq(xrc_unstated_callee("declare void @exit(i32)\ndefine void @f() {\n  call void @exit(i32 1)\n}\n"), "")
+
+@test("unwrap and expect of a Result stop through abort too, declared")
+xrc_result_forcing_stops_through_abort()
+    if xvr_no_library() then return
+
+    val out = xrc_ir("var r: Result[int, string] = Ok(1)\nprint(r.unwrap(), r.expect(\"here\"), r.unwrap_err())\n")
+
+    xrc_stops_through_abort(out)
+
+@test("expect of an Option stops through abort, declared")
+xrc_expect_stops_through_abort()
+    if xvr_no_library() then return
+
+    xrc_stops_through_abort(xrc_ir("var a: Option[int] = Some(1)\nprint(a.expect(\"here\"))\n"))
+
+// A bare machine has no `abort` to call: its panic stops through `exit(1)`, so that is what is
+// declared there, and every call is still to something stated.
+@test("on a freestanding target unwrap stops through exit, declared")
+xrc_freestanding_unwrap_stops_through_exit()
+    if xvr_no_library() then return
+
+    val out = xrc_ir_for("aarch64-freestanding", "var a: Option[int] = Some(1)\nprint(a.unwrap())\n")
+
+    assert(out.contains("define dso_local i32 @sysl$Option.unwrap.int("), out)
+    assert_eq(xrc_declares(out, "exit"), 1)
+    assert(out.contains("call void @exit(i32 1)"), out)
+    assert(!out.contains("@abort"), out)
+    assert_eq(xrc_unstated_callee(out), "")
+end xrc_freestanding_unwrap_stops_through_exit
 
 @test("unwrap and expect are separate members, each on demand")
 xrc_unwrap_and_expect()

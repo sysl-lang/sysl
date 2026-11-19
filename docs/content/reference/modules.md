@@ -1873,7 +1873,9 @@ it stands for.** `const window = 1 << 15` is the number 32768 written wherever t
 `u16` it is a `u16`, as an argument it is the parameter's type, as an index or a range bound a
 `usize`, and where nothing says otherwise an `int`. That holds in every place a literal takes its
 type from — arithmetic, a comparison, an argument, an initializer or an assignment, an index, a
-range bound, a `return`, an array length and a pattern. "No type of its own" means a literal,
+range bound, a `return`, an array length and a pattern — and wherever an
+[overload or an implementation is chosen](/reference/declarations/#overloading), where `g(window)`
+chooses exactly as `g(32768)` does. "No type of its own" means a literal,
 arithmetic or a shift over literals, an `if` or a `match` of them, or another untyped constant;
 `const K = 3 * 4` is untyped and `const B = u8(3)` is a byte. A float constant is the float format
 its position wants -- an `f32`, an `f128` or a fixed-point type, read from its text as the literal

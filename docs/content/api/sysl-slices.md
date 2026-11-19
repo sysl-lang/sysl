@@ -28,7 +28,7 @@ between the two; only what it costs does.
 
 ## Index
 
-[`INSERTION_LIMIT`](#insertion_limit) [`align_up`](#align_up) [`as_mut_ptr`](#as_mut_ptr) [`as_ptr`](#as_ptr) [`binary_search`](#binary_search) [`binary_search_by`](#binary_search_by) [`contains`](#contains) [`copy`](#copy) [`copy`](#copy-1) [`copy_exact`](#copy_exact) [`copy_exact`](#copy_exact-1) [`ends_with`](#ends_with) [`equal`](#equal) [`fill`](#fill) [`index_of`](#index_of) [`index_of_from`](#index_of_from) [`is_aligned`](#is_aligned) [`is_sorted`](#is_sorted) [`is_sorted_by`](#is_sorted_by) [`last_index_of`](#last_index_of) [`last_index_of_from`](#last_index_of_from) [`max_index`](#max_index) [`min_index`](#min_index) [`reverse`](#reverse) [`sort`](#sort) [`sort_by`](#sort_by) [`sort_stable`](#sort_stable) [`sort_stable_by`](#sort_stable_by) [`split_at`](#split_at) [`starts_with`](#starts_with) [`swap`](#swap)
+[`INSERTION_LIMIT`](#insertion_limit) [`align_up`](#align_up) [`as_mut_ptr`](#as_mut_ptr) [`as_ptr`](#as_ptr) [`binary_search`](#binary_search) [`binary_search_by`](#binary_search_by) [`contains`](#contains) [`copy`](#copy) [`copy`](#copy-1) [`copy_exact`](#copy_exact) [`copy_exact`](#copy_exact-1) [`dot`](#dot) [`ends_with`](#ends_with) [`equal`](#equal) [`fill`](#fill) [`index_of`](#index_of) [`index_of_from`](#index_of_from) [`is_aligned`](#is_aligned) [`is_sorted`](#is_sorted) [`is_sorted_by`](#is_sorted_by) [`last_index_of`](#last_index_of) [`last_index_of_from`](#last_index_of_from) [`max_index`](#max_index) [`min_index`](#min_index) [`reverse`](#reverse) [`sort`](#sort) [`sort_by`](#sort_by) [`sort_stable`](#sort_stable) [`sort_stable_by`](#sort_stable_by) [`split_at`](#split_at) [`starts_with`](#starts_with) [`sum`](#sum) [`swap`](#swap) [`zeroize`](#zeroize)
 
 ## Constants
 
@@ -226,6 +226,19 @@ copy_exact(dst: []u8, src: []const u8) -> bool
 
 The same over bytes, reaching `memmove` through the byte `copy` beside it.
 
+### `dot`
+
+```sysl
+const dot[T: Add + Mul + Zero](a: []const T, b: []const T) -> T
+```
+
+The sum of the products of the elements the two slices have at the same index -- over the pairs
+they have in common, as a zip is, so the longer slice's tail is not read.
+
+Over floats it is `@reassociate` as `sum` is, and each product meets its sum as one fused
+multiply-add where the machine has one: the result may differ from the left-to-right
+`a[0] * b[0] + a[1] * b[1] + …` in the last bits.
+
 ### `ends_with`
 
 ```sysl
@@ -363,6 +376,15 @@ The elements in the opposite order, in place.
 Walks from both ends toward the middle, so each element is written once and an odd middle element
 is left alone rather than swapped with itself.
 
+**A slice of 8-, 16-, 32- or 64-bit integers moves a vector register's worth from each end at a
+time**, turning each block's lanes around on the way, and finishes the middle one element at a
+time. LLVM leaves a two-ended swap scalar at every element type -- clang does the same with the C
+loop -- so the blocks are written out rather than left to the optimiser. They start at 64 bytes,
+where the block loop runs at least twice; a shorter slice costs less by elements than the blocks'
+setup saves. Every other element type takes the element loop, a counted one included, so what is
+written and in what order is the same as before for it. The answer is the same either way, and
+both paths fold where a constant asks for one.
+
 ### `sort`
 
 ```sysl
@@ -432,6 +454,21 @@ const starts_with[T: Eq](xs: []const T, prefix: []const T) -> bool
 Whether the slice begins with the given elements. An empty prefix is a prefix of everything, which
 falls out of the loop rather than being decided here.
 
+### `sum`
+
+```sysl
+const sum[T: Add + Zero](xs: []const T) -> T
+```
+
+Every element added together, starting from `T.zero()` -- which is what an empty slice answers.
+
+**Over floats the order is the back end's: the result may differ from a left-to-right sum in the
+last bits.** The function is `@reassociate`, so the optimizer may split the sum over several
+accumulators, held in vector registers, and add them together at the end -- which is what lets the
+additions overlap instead of each waiting for the one before. A sum that must be the written one
+is a loop written out.
+Integers are associative already, so over them nothing changes.
+
 ### `swap`
 
 ```sysl
@@ -442,3 +479,27 @@ Two elements exchanged, in place.
 
 Out-of-range indices trap, as any other subscript does: this is an operation on storage the caller
 named, and inventing an answer for an index that is not there would hide the caller's own mistake.
+
+### `zeroize`
+
+```sysl
+zeroize[T: Integer](xs: []volatile T)
+```
+
+Every element set to zero, in a way the optimizer may not remove.
+
+**This is for secrets** -- a key, a password, a session token, a cipher's key schedule -- whose
+buffer is about to be dropped or reused. A `fill(buf, 0)` of a buffer nothing reads afterwards is a
+dead store, and at `-O2` it is deleted, leaving the secret in memory for the next owner of the
+page. Here every store is through a `[]volatile T`, and a volatile store is an effect: it is
+emitted, once, in order, whether or not anything reads the element again.
+
+**Any integer element**: a `[]u8` of key bytes and a `[]u32` of round keys are both cleared at
+their own width, `T` read off the argument. A view is passed as it stands, since it widens to a
+view of the same elements as `volatile`, never the other way round; an array is passed as its
+whole view. A read-only view (`[]const u8`, a `val` array, a string's bytes) is refused, since
+this writes.
+
+It costs one store per element, which is what makes it unremovable; it is not a fast way to clear
+memory that holds nothing secret -- that is `fill`. It says nothing about copies the program made
+elsewhere, a register that still holds a value, or a page the system swapped out.

@@ -1,0 +1,533 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{join, Search}
+
+// `@unique` on a struct or an enum (`design/affine-values.md`, stage U-1): a value of it has one
+// owner, so a by-value use moves it and a use after a move is refused, on every path; only a local or
+// a parameter is moved out of; `(self)` is a copy that owns nothing and `@consumes` takes the
+// receiver; a declared holder is marked `@unique` too. Every form a later stage supports is refused
+// with a sentence saying it is not supported yet. Each design claim the stage makes true is pinned
+// here, then the edge matrix: branches, loops, match arms, return, parameters, reassignment, nested
+// containment, generics at a `@unique` type.
+
+private var unq_std_cache: Buf[Program] = buf()
+private var unq_std_read: bool = false
+
+private unq_std() -> Buf[Program]
+    if unq_std_read then return unq_std_cache
+
+    unq_std_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> unq_std_cache = units
+
+    unq_std_cache
+end unq_std
+
+private unq_skip() -> bool
+    if unq_std().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end unq_skip
+
+// Everything analysing one file said about that file, one message to a line.
+private unq_said(text: string) -> string
+    var units: Buf[Program] = buf()
+
+    for item in unq_std()
+        units.push(item)
+
+    units.push(parse(source_of("main.sysl", text)).program)
+
+    val done = analyze_bodies(units, host_target())
+    var out: Buf[string] = buf()
+
+    for item in done.reported
+        if item.src.name == "main.sysl" then out.push(item.diag.message)
+
+    join(out.view(), "\n")
+end unq_said
+
+private unq_refused(text: string, part: string)
+    val said = unq_said(text)
+
+    assert(said.contains(part), s"expected '$part' in: $said")
+
+private unq_clean(text: string)
+    val said = unq_said(text)
+
+    assert_eq(said, "")
+
+// What a program printed, or what stopped it building.
+private unq_ran(text: string) -> string
+    if !clang_available() then return "skipped"
+
+    val root = make_temp_dir("sysl-unq").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return s"it did not build: ${failure_text(why)}"
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text + out.err.unwrap_or("")
+end unq_ran
+
+private unq_runs(text: string, want: string)
+    val got = unq_ran(text)
+
+    if got != "skipped" then assert_eq(got, want)
+
+private val unq_token: string = "@unique\nstruct Token\n    n: int\n\n"
+
+private val unq_keep: string = "keep(t: Token) = print(\"kept\", t.n)\n\n"
+
+// The sentence a use after a move is refused with, from its head.
+private unq_after(name: string, into: string) -> string = s"'$name' is read here after it was moved into $into"
+
+private unq_tail(name: string, ty: string) -> string =
+    s"— '$ty' is '@unique', so a by-value use hands it over, and '$name' holds nothing until it is " +
+    "assigned again"
+
+// -- the attribute --------------------------------------------------------------------------------
+
+@test("'@unique' marks a struct or an enum, takes no arguments, and marks nothing else")
+unq_attribute()
+    assert_eq(pf_err("@unique\nstruct S\n    v: int\n"), "")
+    assert_eq(pf_err("@unique\nenum E\n    A\n    B\n"), "")
+    assert_eq(pf_err("@unique\n@pinned\nstruct S\n    v: int\n"), "")
+
+    assert_eq(pf_err("@unique\nf() -> int = 1\n"),
+              "'@unique' says a value of a type has one owner, so it marks a 'struct' or an 'enum' — and this declares neither")
+
+    assert_eq(pf_err("@unique(1)\nstruct S\n    v: int\n"),
+              "'@unique' takes no arguments — a value of the type has one owner, and nothing qualifies that")
+
+    assert(pf_err("struct S\n    v: int\n\n    @unique\n    get(self) -> int = self.v\n") != "",
+           "a member does not take '@unique'")
+
+@test("an annotation the program declares may not be named 'unique'")
+unq_annotation_name()
+    assert_eq(pf_err("@annotation\nstruct unique\n    v: int\n"),
+              "'@unique' is one of the language's own annotations, so an annotation a program declares may not take the name — a use of it would read as the built-in one")
+
+@test("the declaration printer shows the mark")
+unq_shown()
+    val r = parse(source_of("t.sysl", "@unique\nstruct S\n    v: int\n\n@unique\nenum E\n    A\n"))
+
+    assert(r.ok(), "it parses")
+
+    val shown = show_stmts(r.program.body)
+
+    assert_eq(shown.count_of("@unique"), 2)
+
+    // Unmarked, nothing is shown.
+    assert_eq(show_stmts(parse(source_of("t.sysl", "struct S\n    v: int\n")).program.body).count_of("@unique"), 0)
+
+// -- the design's claims ----------------------------------------------------------------------------
+
+@test("a by-value use hands the value over, and a use after it is refused naming the move")
+unq_use_after_move()
+    if unq_skip() then return
+
+    unq_refused(unq_token + raw"""
+        spend(t: Token) = print("spent", t.n)
+
+        main()
+            val t = Token(1)
+            val u = t
+
+            spend(u)
+            print(u.n)
+        """,
+        "'u' is read here after it was moved into 'spend' on line 11 — 'Token' is '@unique', so a by-value " +
+        "use hands it over, and 'u' holds nothing until it is assigned again")
+
+    // The binding is a move too.
+    unq_refused(unq_token + "main()\n    val t = Token(1)\n    val u = t\n\n    print(t.n, u.n)\n",
+                unq_after("t", "'u'"))
+
+@test("moves that never meet a later use compile and run, and reading a field copies the field")
+unq_moves_run()
+    if unq_skip() then return
+
+    val text = unq_token + unq_keep + raw"""
+        make(n: int) -> Token = Token(n)
+
+        pass(t: Token) -> Token = t
+
+        main()
+            val t = make(1)
+
+            print(t.n, t.n + 1)
+
+            val u = pass(t)
+
+            keep(u)
+        """
+
+    unq_clean(text)
+    unq_runs(text, "1 2\nkept 1\n")
+
+@test("a value that is not a local cannot be moved out of")
+unq_not_a_local()
+    if unq_skip() then return
+
+    val wallet = unq_token + "@unique\nstruct Wallet\n    t: Token\n\n"
+    val rule = "— only a local or a parameter can be moved out of, since whatever holds this would still hold it"
+
+    unq_refused(wallet + "take(w: *Wallet) -> Token = w.t\n",
+                "this moves 'w.t' out of what 'w' points at, and 'Token' is '@unique' " + rule)
+
+    // Module storage, an element, and what a pointer points at.
+    unq_refused(unq_token + "var g = Token(1)\n\nmain()\n    val t = g\n\n    print(t.n)\n",
+                "this moves 'g' out of module storage 'g', and 'Token' is '@unique' " + rule)
+    unq_refused(unq_token + "main()\n    val a = [Token(1), Token(2)]\n    val t = a[0]\n\n    print(t.n)\n",
+                "out of an element of 'a', and 'Token' is '@unique' " + rule)
+    unq_refused(unq_token + "take(p: *Token) -> Token = *p\n", "and 'Token' is '@unique' " + rule)
+
+    // Reaching through them moves nothing.
+    unq_clean(wallet + "peek(w: *Wallet) -> int = w.t.n\n\nvar g = Token(1)\n\nmain()\n    var w = Wallet(Token(2))\n\n" +
+              "    print(peek(&w), g.n)\n")
+
+@test("a value moved on one path only is maybe-moved after the paths meet")
+unq_maybe_moved()
+    if unq_skip() then return
+
+    val text = unq_token + unq_keep + raw"""
+        run(c: bool)
+            val r = Token(1)
+
+            if c then keep(r)
+            print("after")
+
+        main()
+            run(true)
+            run(false)
+        """
+
+    unq_clean(text)
+    unq_runs(text, "kept 1\nafter\nafter\n")
+
+    unq_refused(unq_token + unq_keep + "run(c: bool)\n    val r = Token(1)\n\n    if c then keep(r)\n    print(r.n)\n",
+                unq_after("r", "'keep'"))
+
+@test("a loop is followed round: a move on one turn is refused on the next")
+unq_loop_round()
+    if unq_skip() then return
+
+    unq_refused(unq_token + unq_keep + "main()\n    var r = Token(0)\n\n    for i in 0..<3\n        keep(r)\n",
+                "'r' is moved here on one turn of the loop and would be moved again on the next — 'Token' is " +
+                "'@unique'. Assign 'r' a new value before the turn ends, or leave the loop after the move")
+
+    // Assigned again before the turn ends, or left after the move.
+    val text = unq_token + unq_keep + raw"""
+        main()
+            var r = Token(0)
+
+            for i in 0..<3
+                keep(r)
+                r = Token(i + 1)
+
+            var s = Token(9)
+
+            loop
+                keep(s)
+                break
+        """
+
+    unq_clean(text)
+    unq_runs(text, "kept 0\nkept 1\nkept 2\nkept 9\n")
+
+    // A use after the loop of a value a turn moved.
+    unq_refused(unq_token + unq_keep + "main()\n    var r = Token(0)\n\n    while r.n < 1\n        keep(r)\n" +
+                "        break\n\n    print(r.n)\n", unq_after("r", "'keep'"))
+
+@test("'(self)' is a copy that owns nothing; '@consumes' takes the receiver")
+unq_receivers()
+    if unq_skip() then return
+
+    val res = raw"""
+        @unique
+        struct Res
+            n: int
+
+            peek(self) -> int = self.n
+
+            @consumes
+            close(self, why: string) = print("closing", self.n, why)
+
+        """
+
+    unq_refused(res + "main()\n    val r = Res(1)\n\n    print(r.peek())\n    r.close(\"done\")\n    print(r.peek())\n",
+                "'r' is read here after 'r.close()' took it — 'Res' is '@unique', so 'r' holds nothing until it is assigned again")
+
+    val text = res + "main()\n    val r = Res(1)\n\n    print(r.peek(), r.peek())\n    r.close(\"done\")\n"
+
+    unq_clean(text)
+    unq_runs(text, "1 1\nclosing 1 done\n")
+
+    // A '(self)' member may not hand its copy on.
+    val handing = "a '(self)' receiver is a copy that owns nothing, so it may be read but not stored, returned or passed on by value"
+
+    unq_refused("@unique\nstruct Res\n    n: int\n\n    again(self) -> Res = self\n", handing)
+    unq_refused("@unique\nstruct Res\n    n: int\n\n    give(self) = keep(self)\n\nkeep(r: Res) = print(r.n)\n", handing)
+
+    // A '@consumes' one owns it, and may.
+    unq_clean("@unique\nstruct Res\n    n: int\n\n    @consumes\n    again(self) -> Res = self\n")
+
+    // A '*self' member reads it where it is.
+    unq_clean("@unique\nstruct Res\n    n: int\n\n    bump(*self)\n        self.n += 1\n\nmain()\n    var r = Res(1)\n\n" +
+              "    r.bump()\n    r.bump()\n    print(r.n)\n")
+
+    // A '@consumes' '*self' member takes the receiver as well.
+    unq_refused("@unique\nstruct Res\n    n: int\n\n    @consumes\n    close(*self) = print(self.n)\n\nmain()\n" +
+                "    var r = Res(1)\n\n    r.close()\n    print(r.n)\n", "'r' is read here after 'r.close()' took it")
+
+@test("a declared struct or enum holding a '@unique' value by value is marked '@unique' too")
+unq_containment()
+    if unq_skip() then return
+
+    unq_refused("@unique\nstruct Guard\n    n: int\n\nstruct Holder\n    g: Guard\n\nmain()\n    print(Holder(Guard(1)).g.n)\n",
+                "field 'g' of 'Holder' holds 'Guard' by value, and 'Guard' is '@unique', so 'Holder' would be moved " +
+                "rather than copied too. Mark 'Holder' '@unique', or hold a '&Guard' or a '*Guard'")
+
+    // An enum's payload, and a tuple inside a field.
+    unq_refused("@unique\nstruct Guard\n    n: int\n\nenum Slot\n    Empty\n    Full(g: Guard)\n\nmain()\n" +
+                "    val s = Empty\n\n    print(\"made\")\n",
+                "variant 'Full' of 'Slot' carries 'Guard' by value, and 'Guard' is '@unique', so 'Slot' would be moved")
+    unq_refused("@unique\nstruct Guard\n    n: int\n\nstruct Pair\n    p: (Guard, int)\n\nmain()\n" +
+                "    print(Pair((Guard(1), 2)).p.1)\n", "field 'p' of 'Pair' holds 'Guard' by value, inside '(Guard, int)',")
+
+    // Nested: a marked holder held by an unmarked one.
+    unq_refused("@unique\nstruct Guard\n    n: int\n\n@unique\nstruct Inner\n    g: Guard\n\nstruct Outer\n    i: Inner\n\n" +
+                "main()\n    print(Outer(Inner(Guard(1))).i.g.n)\n", "field 'i' of 'Outer' holds 'Inner' by value")
+
+    // Marked, or held behind a pointer or a box, it is accepted, and the holder moves.
+    unq_clean("@unique\nstruct Guard\n    n: int\n\n@unique\nstruct Inner\n    g: Guard\n\n@unique\nstruct Outer\n    i: Inner\n\n" +
+              "struct ByPtr\n    g: *Guard\n\nstruct ByBox\n    g: &Guard\n\nmain()\n    val o = Outer(Inner(Guard(1)))\n\n" +
+              "    print(o.i.g.n)\n")
+    unq_refused("@unique\nstruct Guard\n    n: int\n\n@unique\nstruct Inner\n    g: Guard\n\nmain()\n" +
+                "    val a = Inner(Guard(1))\n    val b = a\n\n    print(a.g.n, b.g.n)\n", unq_after("a", "'b'"))
+
+@test("a tuple and an array are unique by what they hold")
+unq_by_what_they_hold()
+    if unq_skip() then return
+
+    unq_refused(unq_token + "main()\n    val p = (Token(1), 2)\n    val q = p\n\n    print(p.1, q.1)\n", unq_after("p", "'q'"))
+    unq_refused(unq_token + "main()\n    val a = [Token(1), Token(2)]\n    val b = a\n\n    print(a.len, b.len)\n",
+                unq_after("a", "'b'"))
+
+    // Building '[v; n]' copies one value n times; a literal of n built values does not.
+    unq_refused(unq_token + "main()\n    val a = [Token(1); 4]\n\n    print(a.len)\n",
+                "this copies one 'Token' into every element, and 'Token' is '@unique'")
+    unq_clean(unq_token + "main()\n    val a = [Token(1), Token(2)]\n\n    print(a[0].n + a[1].n)\n")
+
+@test("a generic body is checked at each '@unique' instance, and names the instance")
+unq_generics()
+    if unq_skip() then return
+
+    unq_refused("@unique\nstruct Guard\n    n: int\n\ntwice[T](x: T) -> (T, T) = (x, x)\n\nmain()\n    val p = twice(Guard(1))\n",
+                "'x' is read here after it was moved into the tuple — 'Guard' is '@unique' (in 'twice[Guard]', called from")
+
+    // At a copyable type it copies as it always did.
+    unq_clean("twice[T](x: T) -> (T, T) = (x, x)\n\nmain()\n    val p = twice(1)\n\n    print(p.0 + p.1)\n")
+
+    // One that moves once is fine at a '@unique' type.
+    val text = unq_token + "pass[T](x: T) -> T = x\n\nmain()\n    val t = pass(Token(4))\n\n    print(t.n)\n"
+
+    unq_clean(text)
+    unq_runs(text, "4\n")
+
+// -- what a later stage supports, refused until then -----------------------------------------------
+
+@test("a '@unique' type with a 'Drop' is refused, not supported yet")
+unq_no_destructor_yet()
+    if unq_skip() then return
+
+    unq_refused("@unique\nstruct Res\n    n: int\n\nimpl Drop for Res\n    drop(self) = print(\"drop\", self.n)\n\n" +
+                "main()\n    val r = Res(1)\n\n    print(r.n)\n",
+                "'Res' is '@unique' and has a 'Drop' — a '@unique' type with a destructor is not supported yet")
+
+    // A 'Drop' type without '@unique' is the reference type it always was.
+    unq_runs("struct Res\n    n: int\n\nimpl Drop for Res\n    drop(self) = print(\"drop\", self.n)\n\n" +
+             "main()\n    val r = Res(1)\n    val s = r\n\n    print(r.n, s.n)\n", "1 1\ndrop 1\n")
+
+@test("a pattern binding a '@unique' part, a part moved out of a local, a closure capture: not yet")
+unq_not_yet_forms()
+    if unq_skip() then return
+
+    val not_yet = "and 'Token' is '@unique' — this is not supported yet"
+
+    unq_refused(unq_token + "enum Slot\n    Empty\n    Full(t: Token)\n\n" +
+                "main()\n    val s = Full(Token(1))\n\n    s match\n        Full(t) -> print(t.n)\n        Empty -> ()\n",
+                "variant 'Full' of 'Slot' carries 'Token' by value")
+    unq_refused(unq_token + "@unique\nenum Slot\n    Empty\n    Full(t: Token)\n\n" +
+                "main()\n    val s = Full(Token(1))\n\n    s match\n        Full(t) -> print(t.n)\n        Empty -> ()\n",
+                "a pattern here binds a part by value, " + not_yet)
+
+    // Matching without binding the part moves nothing.
+    unq_clean(unq_token + "@unique\nenum Slot\n    Empty\n    Full(t: Token)\n\n" +
+              "main()\n    val s = Full(Token(1))\n\n    s match\n        Full(_) -> print(\"full\")\n        Empty -> ()\n\n" +
+              "    s match\n        Empty -> print(\"empty\")\n        _ -> print(\"still full\")\n")
+
+    unq_refused(unq_token + "@unique\nstruct Wallet\n    t: Token\n\nmain()\n    val w = Wallet(Token(1))\n    val t = w.t\n\n" +
+                "    print(t.n)\n", "this moves 'w.t' out of the local 'w', " + not_yet)
+
+    unq_refused(unq_token + "main()\n    val t = Token(1)\n    val f = () -> t.n\n\n    print(f())\n",
+                "this closure captures 't', and 'Token' is '@unique' — a closure capturing a '@unique' value is not supported yet")
+
+    // A closure taking one as a parameter is fine.
+    unq_clean(unq_token + "main()\n    val f = (t: Token) -> t.n\n\n    print(f(Token(3)))\n")
+
+    unq_refused(unq_token + "main()\n    var t = Token(1)\n    ref n = t.n\n    val u = t\n\n    print(n, u.n)\n",
+                "this moves 't' while the 'ref' 'n' borrows from it, " + not_yet)
+
+    unq_refused(unq_token + "main()\n    val a = [Token(1), Token(2)]\n\n    for t in a\n        print(t.n)\n",
+                "this loop copies each element into its variable, " + not_yet)
+
+@test("a '@unique' value crosses an 'extern' or an '@export' only behind a pointer")
+unq_c_boundary()
+    if unq_skip() then return
+
+    unq_refused(unq_token + "@export(\"take_token\")\ntake(t: Token) -> int = t.n\n",
+                "hands 'Token' across the C boundary by value, and 'Token' is '@unique'")
+    unq_refused(unq_token + "extern use_token(t: Token) -> int\n\nmain()\n    print(use_token(Token(1)))\n",
+                "hands 'Token' across the C boundary by value, and 'Token' is '@unique'")
+    unq_clean(unq_token + "@export(\"peek_token\")\npeek(t: *Token) -> int = t.n\n")
+
+// -- the edge matrix ----------------------------------------------------------------------------------
+
+@test("if/else: moved on both sides is moved; moved on each side and assigned again is not")
+unq_if_else()
+    if unq_skip() then return
+
+    unq_refused(unq_token + unq_keep + "run(c: bool)\n    val t = Token(1)\n\n    if c then keep(t) else keep(t)\n" +
+                "    print(t.n)\n", unq_after("t", "'keep'"))
+
+    val text = unq_token + unq_keep + raw"""
+        run(c: bool)
+            var t = Token(1)
+
+            if c
+                keep(t)
+                t = Token(2)
+            else
+                print("kept nothing")
+
+            keep(t)
+
+        main()
+            run(true)
+            run(false)
+        """
+
+    unq_clean(text)
+    unq_runs(text, "kept 1\nkept 2\nkept nothing\nkept 1\n")
+
+    // A side that moved and then left never reaches the use.
+    unq_clean(unq_token + unq_keep + "run(c: bool)\n    val t = Token(1)\n\n    if c\n        keep(t)\n        return\n\n    keep(t)\n")
+
+@test("match arms: a move in one arm is a maybe-move after the match")
+unq_match_arms()
+    if unq_skip() then return
+
+    unq_refused(unq_token + unq_keep + "run(n: int)\n    val t = Token(1)\n\n    n match\n        0 -> keep(t)\n" +
+                "        _ -> print(n)\n\n    print(t.n)\n", unq_after("t", "'keep'"))
+
+    val text = unq_token + unq_keep + "run(n: int)\n    val t = Token(n)\n\n    n match\n        0 -> keep(t)\n" +
+               "        _ -> print(\"left\", t.n)\n\nmain()\n    run(0)\n    run(1)\n"
+
+    unq_clean(text)
+    unq_runs(text, "kept 0\nleft 1\n")
+
+    // An if or a match whose value is handed on moves what each arm yields.
+    unq_refused(unq_token + "pick(c: bool) -> Token\n    val a = Token(1)\n    val b = if c then a else Token(2)\n\n" +
+                "    print(a.n)\n    b\n", unq_after("a", "'b'"))
+
+@test("return and a function's result move what they hand back")
+unq_return()
+    if unq_skip() then return
+
+    unq_refused(unq_token + "give() -> Token\n    val t = Token(1)\n    val u = t\n\n    return t\n",
+                unq_after("t", "'u'"))
+    unq_clean(unq_token + "give(c: bool) -> Token\n    val t = Token(1)\n\n    if c then return t\n\n    t\n")
+
+@test("a parameter is owned: moved once it is fine, moved twice it is refused")
+unq_parameters()
+    if unq_skip() then return
+
+    unq_refused(unq_token + unq_keep + "both(t: Token)\n    keep(t)\n    keep(t)\n",
+                "'t' is read here after it was moved into 'keep' on line 8")
+    unq_clean(unq_token + unq_keep + "once(t: Token) = keep(t)\n")
+
+@test("assigning a moved local fills it again")
+unq_reassignment()
+    if unq_skip() then return
+
+    val text = unq_token + unq_keep + raw"""
+        main()
+            var t = Token(1)
+
+            keep(t)
+            t = Token(2)
+            keep(t)
+
+            val u = Token(3)
+
+            t = u
+            keep(t)
+        """
+
+    unq_clean(text)
+    unq_runs(text, "kept 1\nkept 2\nkept 3\n")
+
+    // The local it was assigned from is moved.
+    unq_refused(unq_token + "main()\n    var t = Token(1)\n    val u = Token(2)\n\n    t = u\n    print(u.n)\n",
+                unq_after("u", "'t'"))
+
+@test("a box, a payload and a struct built from a local move it, and reading through a box moves nothing")
+unq_other_moves()
+    if unq_skip() then return
+
+    unq_refused(unq_token + "main()\n    val t = Token(1)\n    val b: &Token = t\n\n    print(t.n, b.n)\n", unq_after("t", "a box"))
+    unq_refused(unq_token + "main()\n    val t = Token(1)\n    val o = Some(t)\n\n    print(t.n)\n", unq_after("t", "'Some'"))
+    unq_refused(unq_token + "@unique\nstruct Wallet\n    t: Token\n\nmain()\n    val t = Token(1)\n    val w = Wallet(t)\n\n" +
+                "    print(t.n, w.t.n)\n", unq_after("t", "a 'Wallet'"))
+    unq_refused(unq_token + "main()\n    val b: &Token = Token(1)\n    val t = *b\n\n    print(t.n)\n",
+                "only a local or a parameter can be moved out of")
+    unq_clean(unq_token + "main()\n    val b: &Token = Token(1)\n\n    print(b.n)\n")
+
+@test("a type that is not '@unique' copies as it always did")
+unq_patch_rule()
+    if unq_skip() then return
+
+    val text = "struct Plain\n    n: int\n\nkeep(p: Plain) = print(p.n)\n\nmain()\n    val a = Plain(1)\n" +
+               "    val b = a\n\n    keep(a)\n    keep(a)\n    print(a.n, b.n)\n"
+
+    unq_clean(text)
+    unq_runs(text, "1\n1\n1 1\n")
+
+    // '@consumes' on a type that is not '@unique' keeps its own sentence.
+    unq_refused("struct Bag\n    n: int\n\n    @consumes\n    take(*self) -> int = self.n\n\nmain()\n    var g = Bag(3)\n\n" +
+                "    print(g.take())\n    print(g.n)\n", "'g' is read here after 'g.take()' took everything it held")

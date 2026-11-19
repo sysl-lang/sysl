@@ -50,8 +50,10 @@ enum Const
     // value, an array's or a slice's elements, a struct's fields, or a local's cell -- shared with
     // whatever else holds that buffer, so a write through it is seen there. It stands for a `&T`, a
     // `*T` and a `&sync T` alike, the evaluator keeping no counts. `owner` is the depth of the call
-    // whose local the slot is, or -1 for the heap, as a slice's is. Made only by an evaluation.
-    ConstPtr(cells: Buf[Const], at: usize, owner: int)
+    // whose local the slot is, or -1 for the heap, as a slice's is. `alone` marks a struct's field:
+    // its neighbours in `cells` are other fields, laid out with their own widths and padding, so the
+    // bytes the address names end with the slot's own. Made only by an evaluation.
+    ConstPtr(cells: Buf[Const], at: usize, owner: int, alone: bool)
     // A slot of storage `slot_storage` made that nothing has placed a value in yet: the bytes the
     // program would find there are whatever the allocator left, so reading one is refused.
     ConstUnset
@@ -59,8 +61,9 @@ enum Const
     // comes to once something asks for its value. Laid down as nothing.
     ConstUnit
     // An address the run owns, converted to a pointer to another type: it may be compared and
-    // converted back to the type it was taken at, `as_was`, but what it points at is a value of that
-    // type, so reading or writing through it is refused.
+    // converted back to the type it was taken at, `as_was`, and a read or a write through it works
+    // on the bytes the values there are laid out in, in the target's byte order (`const_bytes.sysl`)
+    // -- where every value it reaches is one whose bytes the evaluator lays out.
     ConstPun(addr: &Const, as_was: &Type)
     // A trait object -- a closure's `&Fn` among them: the value behind it, `data` (a pointer to its
     // box, or the pointer a `*Trait` was made of), and the table its calls go through, by name.
@@ -397,7 +400,7 @@ private const_binary(cx: &Analyzer, whole: Expr, op: string, l: Expr, r: Expr) -
         ConstView(_, _, _, _) -> None
         ConstWriter(_) -> None
         ConstLink(_) -> None
-        ConstPtr(_, _, _) -> None
+        ConstPtr(_, _, _, _) -> None
         ConstUnset -> None
         ConstUnit -> None
         ConstPun(_, _) -> None
@@ -899,7 +902,7 @@ private const_text(v: Const) -> string = v match
     ConstView(_, _, n, _) -> s"a slice of $n elements"
     ConstWriter(_) -> "a writer"
     ConstLink(_) -> "an address"
-    ConstPtr(_, _, _) -> "an address"
+    ConstPtr(_, _, _, _) -> "an address"
     ConstUnset -> "a slot nothing was placed in"
     ConstUnit -> "a unit"
     ConstPun(_, _) -> "an address"
@@ -954,7 +957,7 @@ const_kind(v: Const) -> string = v match
     ConstView(_, _, _, _) -> "a slice"
     ConstWriter(_) -> "a writer"
     ConstLink(_) -> "an address"
-    ConstPtr(_, _, _) -> "an address"
+    ConstPtr(_, _, _, _) -> "an address"
     ConstUnset -> "a slot nothing was placed in"
     ConstUnit -> "a unit"
     ConstPun(_, _) -> "an address"
@@ -1285,7 +1288,7 @@ private held_at(v: Const, ty: Type) -> Option[Const] = v match
     ConstView(_, _, _, _) -> None
     ConstWriter(_) -> None
     ConstLink(_) -> None
-    ConstPtr(_, _, _) -> None
+    ConstPtr(_, _, _, _) -> None
     ConstUnset -> None
     ConstUnit -> None
     ConstPun(_, _) -> None
@@ -1343,7 +1346,7 @@ private typed_binary(op: string, l: TExpr, r: TExpr, m: FoldMachine) -> Option[C
         ConstView(_, _, _, _) -> None
         ConstWriter(_) -> None
         ConstLink(_) -> None
-        ConstPtr(_, _, _) -> None
+        ConstPtr(_, _, _, _) -> None
         ConstUnset -> None
         ConstUnit -> None
         ConstPun(_, _) -> None
@@ -1467,7 +1470,7 @@ private typed_conversion(inner: TExpr, to: Type, m: FoldMachine) -> Option[Const
         ConstView(_, _, _, _) -> None
         ConstWriter(_) -> None
         ConstLink(_) -> None
-        ConstPtr(_, _, _) -> None
+        ConstPtr(_, _, _, _) -> None
         ConstUnset -> None
         ConstUnit -> None
         ConstPun(_, _) -> None
