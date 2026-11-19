@@ -1,0 +1,476 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **A type parameter may be qualified `volatile` where its bound closes it to the scalars**
+// (`reference/memory.md § Device memory`): `[T: Integer]` admits `[]volatile T`, `*volatile T` and a
+// field `volatile T`, and every other bound -- none, an open trait, `AnyBits` -- is refused at the
+// declaration. `T` is read through the widening, so a `[]u32` handed to a `[]volatile T` binds
+// `u32`, and `sysl.slices.zeroize` is generic over the integers on it.
+//
+// The axes: the bound (none, `Integer`, `Integer` with another, an open scalar trait, an open
+// operator trait, a compiler-settled family holding aggregates), the position (a parameter's
+// element, a pointee, a generic struct's field, a bare parameter), the argument (a view, a part, an
+// array, a `Buf`'s writable view, a read-only view, a nested view, a narrowing), the width (u8, u16,
+// u32, u64, i64, a sub-byte and a wide one), the element's kind (a `new` type, a checked subtype),
+// two instantiations in one program, and what clang's `-O2` leaves.
+//
+// Skipped: a trait default in another module and a method form -- the qualifier is resolved once in
+// `resolve_qualified`, whatever declares the parameter, and both reach it the way a function's
+// signature does; a supertrait reaching `Integer` (`trait Word: Integer`) is not taken as closing a
+// parameter, since only a bound naming the family directly is asked.
+
+private var vlg_library_cache: Buf[Program] = buf()
+private var vlg_library_read: bool = false
+
+private vlg_library() -> Buf[Program]
+    if vlg_library_read then return vlg_library_cache
+
+    vlg_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> vlg_library_cache = units
+
+    vlg_library_cache
+end vlg_library
+
+private vlg_ready() -> bool
+    if vlg_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    true
+end vlg_ready
+
+private vlg_can_run() -> bool
+    if !vlg_ready() then return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end vlg_can_run
+
+// The LLVM text of the whole module a source lowers to, or every message it was refused with.
+private vlg_ir(text: string) -> string
+    val parsed = parse(source_of("main.sysl", forms_imported(text)))
+
+    if !parsed.ok() then return parsed.first().message
+
+    var units: Buf[Program] = buf()
+
+    for item in vlg_library()
+        units.push(item)
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if !done.reported.is_empty()
+        var said = ""
+
+        for item in done.reported
+            said = said + item.diag.message + "\n"
+
+        return said
+    end if
+
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+    val said = errors_of(done.an.diagnostics())
+
+    if !said.is_empty() then return analysis_report(said)
+
+    val kept = prune(strip_tests(whole), program_own(units))
+
+    ir_print_module(codegen_with_gaps(kept, host_target(), promotions).0)
+end vlg_ir
+
+// What a refused program is told.
+private vlg_err(text: string) -> string = vlg_ir(text)
+
+// What clang's `-O2` leaves of a program.
+private vlg_optimized(text: string) -> string
+    val dir = make_temp_dir("sysl-vlg").unwrap()
+    val file = s"$dir/t.ll"
+
+    write_text(file, vlg_ir(text)).unwrap()
+
+    val got = capture("clang", ["-O2", "-S", "-emit-llvm", "-o", "-", file], "", [], true).unwrap()
+
+    remove_dir_all(dir).unwrap_or(())
+    assert(got.status.ok(), s"clang refused the emitted IR:\n${got.err.unwrap_or("")}")
+    got.text
+end vlg_optimized
+
+// The lines of the first definition whose `define` line names `name` the way a program writes it.
+private vlg_body(out: string, name: string) -> string
+    var body = ""
+    var inside = false
+
+    for l in lines_of(out)
+        if !inside && l.starts_with("define") && mentions_as_written(l, name) then inside = true
+
+        if inside
+            if l == "}" then return body
+
+            body = body + l + "\n"
+        end if
+
+    body
+end vlg_body
+
+// The lines of every definition whose `define` line holds `symbol`.
+private vlg_bodies(out: string, symbol: string) -> string
+    var body = ""
+    var inside = false
+
+    for l in lines_of(out)
+        if !inside && l.starts_with("define") && l.contains(symbol) then inside = true
+
+        if inside
+            body = body + l + "\n"
+
+            if l == "}" then inside = false
+        end if
+
+    body
+end vlg_bodies
+
+// **What a program PRINTS**, where it runs to the end.
+private vlg_ran(text: string) -> string
+    val root = make_temp_dir("sysl-vlg").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> if out.status.ok() then out.text else s"it did not exit zero: ${out.text}"
+end vlg_ran
+
+// A generic clear over any integer element, which counts what it wrote.
+private val vlg_clear = "clear[T: Integer](v: []volatile T) -> usize\n    for i in 0..<v.len\n        v[i] = 0\n    v.len\n"
+
+// The refusal every bound that does not close a parameter to the scalars meets.
+private vlg_unproven(t: string) -> string =
+    s"'volatile $t' is not a type: 'volatile' qualifies a scalar or a raw pointer, since it promises " +
+    "the one load or the one store the source wrote and nothing else -- and nothing bounds " +
+    s"'$t' to the scalars: unbounded, or bounded by a trait a struct, a string or a type of the " +
+    "program's own may meet, it may stand for one. Bound it by 'Integer', a family every member of " +
+    s"which is one integer, as '[$t: Integer]'"
+
+// -- the bound: what closes a parameter to the scalars ----------------------------------------------
+
+@test("'[T: Integer]' admits a '[]volatile T' parameter, and its stores are volatile at the width")
+vlg_integer_admits_an_element()
+    if !vlg_ready() then return
+
+    val out = vlg_ir(vlg_clear + "var a = [1u32, 2]\nprint(clear(a))")
+
+    assert(vlg_bodies(out, "clear").contains("store volatile i32 0"), out)
+end vlg_integer_admits_an_element
+
+@test("'Integer' beside another bound admits it too, and a const view of it is read")
+vlg_integer_with_another_bound()
+    if !vlg_can_run() then return
+
+    val src = "sum[T: Add + Integer](v: []const volatile T) -> T\n    var s: T = 0\n" +
+              "    for i in 0..<v.len\n        s = s + v[i]\n    s\n" +
+              "var a = [7i64, -9]\nprint(sum(a))"
+
+    assert_eq(vlg_ran(src), "-2\n")
+end vlg_integer_with_another_bound
+
+// A pointer does not widen as a view does -- `ptr_cast` goes between `*T` and `*volatile T` -- so
+// `T` is read off a pointer that is already qualified.
+@test("a '*volatile T' pointee under 'Integer' is admitted, and a store through it lands")
+vlg_integer_admits_a_pointee()
+    if !vlg_can_run() then return
+
+    val src = "import sysl.raw.ptr_cast\npoke[T: Integer](p: *volatile T)\n    *p = 0\n" +
+              "var x = 5u16\nval p: *volatile u16 = ptr_cast(&x)\npoke(p)\nprint(x)"
+
+    assert_eq(vlg_ran(src), "0\n")
+end vlg_integer_admits_a_pointee
+
+@test("and a plain '*T' is not taken for one without 'ptr_cast'")
+vlg_a_plain_pointer_is_not_widened()
+    if !vlg_ready() then return
+
+    val said = vlg_err("poke[T: Integer](p: *volatile T)\n    *p = 0\nvar x = 5u16\npoke(&x)\nprint(x)")
+
+    assert(said.contains("'p' of 'poke' is *volatile ushort, but *ushort was given"), said)
+end vlg_a_plain_pointer_is_not_widened
+
+@test("a generic struct's field 'volatile T' under 'Integer' is admitted at each instantiation")
+vlg_integer_admits_a_field()
+    if !vlg_can_run() then return
+
+    val src = "struct Reg[T: Integer]\n    v: volatile T\n" +
+              "var a = Reg[u32](5)\nvar b = Reg[i8](-3)\na.v = 9\nprint(a.v, b.v)"
+
+    assert_eq(vlg_ran(src), "9 -3\n")
+end vlg_integer_admits_a_field
+
+@test("an unbounded parameter is refused, with the reason and the bound to write")
+vlg_unbounded_is_refused()
+    if !vlg_ready() then return
+
+    assert_eq(vlg_err("f[T](xs: []volatile T) = ()\nprint(0)"), vlg_unproven("T") + "\n")
+end vlg_unbounded_is_refused
+
+@test("an unbounded struct parameter is refused once, though a derived member reads the field again")
+vlg_unbounded_field_is_refused_once()
+    if !vlg_ready() then return
+
+    val said = vlg_err("struct R[T]\n    v: volatile T\nprint(0)")
+
+    assert_eq(said, vlg_unproven("T") + "\n")
+end vlg_unbounded_field_is_refused_once
+
+@test("'Float' is refused: a program may implement it for a type of its own")
+vlg_float_is_refused()
+    if !vlg_ready() then return
+
+    assert_eq(vlg_err("import sysl.math.Float\nf[F: Float](xs: []volatile F) = ()\nprint(0)"),
+              vlg_unproven("F") + "\n")
+end vlg_float_is_refused
+
+@test("an operator trait is refused, since a struct may implement it")
+vlg_operator_trait_is_refused()
+    if !vlg_ready() then return
+
+    assert_eq(vlg_err("f[T: Add](xs: *volatile T) = ()\nprint(0)"), vlg_unproven("T") + "\n")
+end vlg_operator_trait_is_refused
+
+@test("'AnyBits' is refused: the compiler settles it, but a struct and an array are members")
+vlg_any_bits_is_refused()
+    if !vlg_ready() then return
+
+    assert_eq(vlg_err("f[T: AnyBits](xs: []volatile T) = ()\nprint(0)"), vlg_unproven("T") + "\n")
+end vlg_any_bits_is_refused
+
+@test("a bare 'volatile T' parameter is still a value, refused in the value's words")
+vlg_bare_parameter_is_still_a_value()
+    if !vlg_ready() then return
+
+    assert(vlg_err("f[T: Integer](x: volatile T) = ()\nprint(0)")
+               .contains("'volatile T' is the type of *storage*, and this is a value"))
+end vlg_bare_parameter_is_still_a_value
+
+// -- inference through the widening ----------------------------------------------------------------
+
+@test("T is read off the argument at u8, u16, u32, u64 and i64, and each is cleared")
+vlg_infers_every_width()
+    if !vlg_can_run() then return
+
+    val src = vlg_clear +
+              "var a = [1u8, 2]\nvar b = [3u16, 4]\nvar c = [5u32, 6]\nvar d = [7u64, 8]\nvar e = [-9i64, 10]\n" +
+              "print(clear(a), clear(b), clear(c), clear(d), clear(e))\n" +
+              "print(a[1], b[1], c[1], d[1], e[0])"
+
+    assert_eq(vlg_ran(src), "2 2 2 2 2\n0 0 0 0 0\n")
+end vlg_infers_every_width
+
+@test("two instantiations in one program are two bodies, each storing at its own width")
+vlg_two_instantiations()
+    if !vlg_ready() then return
+
+    val out = vlg_ir(vlg_clear + "var a = [1u8]\nvar b = [2u64]\nprint(clear(a), clear(b))")
+    val bodies = vlg_bodies(out, "clear")
+
+    assert(bodies.contains("store volatile i8 0"), out)
+    assert(bodies.contains("store volatile i64 0"), out)
+end vlg_two_instantiations
+
+@test("a part of a view is read through the widening, and only that part is written")
+vlg_infers_through_a_part()
+    if !vlg_can_run() then return
+
+    val src = vlg_clear + "var a = [1u32, 2, 3, 4]\nprint(clear(a[1..<3]), a[0], a[1], a[2], a[3])"
+
+    assert_eq(vlg_ran(src), "2 1 0 0 4\n")
+end vlg_infers_through_a_part
+
+@test("a Buf's writable view is read through the widening")
+vlg_infers_through_a_buf()
+    if !vlg_can_run() then return
+
+    val src = vlg_clear + "import sysl.buf.{Buf, buf}\nvar b: Buf[u32] = buf()\nb.push(7)\nb.push(8)\n" +
+              "print(clear(b.view_mut()), b[0], b[1])"
+
+    assert_eq(vlg_ran(src), "2 0 0\n")
+end vlg_infers_through_a_buf
+
+@test("a '[]const volatile T' is read off a read-only view and off a writable one")
+vlg_infers_a_const_volatile()
+    if !vlg_can_run() then return
+
+    val src = "first[T: Integer](v: []const volatile T) -> T = v[0]\n" +
+              "val a = [11u32, 12]\nvar b = [13i16]\nprint(first(a), first(b[..]))"
+
+    assert_eq(vlg_ran(src), "11 13\n")
+end vlg_infers_a_const_volatile
+
+@test("a 'new' integer is an integer, and is cleared as one")
+vlg_a_new_integer_is_cleared()
+    if !vlg_can_run() then return
+
+    val src = vlg_clear + "type Id = new u32\nvar a: [2]Id = [Id(3), Id(4)]\nprint(clear(a), u32(a[0]), u32(a[1]))"
+
+    assert_eq(vlg_ran(src), "2 0 0\n")
+end vlg_a_new_integer_is_cleared
+
+@test("a sub-byte and a wide integer are cleared at their own widths")
+vlg_odd_widths()
+    if !vlg_can_run() then return
+
+    val src = vlg_clear + "var a = [5u12, 6]\nvar b = [1u256, 2]\nprint(clear(a), clear(b), a[1], b[0])"
+
+    assert_eq(vlg_ran(src), "2 2 0 0\n")
+end vlg_odd_widths
+
+// -- what is still refused --------------------------------------------------------------------------
+
+@test("a view of checked values is refused at the call, not inside the callee")
+vlg_checked_subtype_is_refused_at_the_call()
+    if !vlg_ready() then return
+
+    val said = vlg_err(vlg_clear + "type Level = u8 within 1..10\nvar a: [2]Level = [3, 4]\nprint(clear(a))")
+
+    assert(said.contains("'v' of 'clear'"), said)
+    assert(!said.contains("is not a type"), said)
+end vlg_checked_subtype_is_refused_at_the_call
+
+@test("a read-only view is not a licence to write, generic or not")
+vlg_read_only_is_refused()
+    if !vlg_ready() then return
+
+    val said = vlg_err(vlg_clear + "val a = [1u32]\nprint(clear(a))")
+
+    assert(said.contains("a '[]const volatile uint' views elements it may not write, and a " +
+                         "'[]volatile uint' is a licence"), said)
+end vlg_read_only_is_refused
+
+@test("a nested view is not widened one level down")
+vlg_nested_is_refused()
+    if !vlg_ready() then return
+
+    val said = vlg_err("f[T: Integer](xs: [][]volatile T) = ()\nvar a = [1u32]\nvar v = [a[..]]\nf(v[..])\nprint(0)")
+
+    assert(said.contains("'xs' of 'f' is [][]volatile uint, but [][]uint was given"), said)
+end vlg_nested_is_refused
+
+@test("a volatile view is not narrowed to a plain one through a generic")
+vlg_narrowing_is_refused()
+    if !vlg_ready() then return
+
+    val said = vlg_err("f[T](xs: []T) = ()\ng(xs: []volatile u32) = f(xs)\nprint(0)")
+
+    assert(said.contains("'xs' of 'f' is []uint, but []volatile u32 was given"), said)
+end vlg_narrowing_is_refused
+
+@test("an element that is not an integer fails the bound, at the call")
+vlg_bool_fails_the_bound()
+    if !vlg_ready() then return
+
+    val said = vlg_err(vlg_clear + "var a = [true]\nprint(clear(a))")
+
+    assert(said.contains("'clear' requires its type parameter 'T' to implement 'Integer', but bool does not"), said)
+end vlg_bool_fails_the_bound
+
+// -- what clang's -O2 leaves ------------------------------------------------------------------------
+
+// A u32 key schedule in a frame array, read once and then cleared, so nothing reads the clearing.
+// The control clears it with a plain loop, a dead store that must go; the other with `zeroize`, whose
+// stores must all be there.
+private val vlg_schedule: string = raw"""
+    import sysl.slices.zeroize
+
+    @export
+    plain_wipe(seed: u32) -> u32
+        var ks: [16]u32
+        for i in 0..<ks.len
+            ks[i] = seed ^ u32(i)
+        var acc = seed
+        for i in 0..<ks.len
+            acc = acc ^ ks[i]
+        for i in 0..<ks.len
+            ks[i] = 0
+        acc
+
+    @export
+    volatile_wipe(seed: u32) -> u32
+        var ks: [16]u32
+        for i in 0..<ks.len
+            ks[i] = seed ^ u32(i)
+        var acc = seed
+        for i in 0..<ks.len
+            acc = acc ^ ks[i]
+        zeroize(ks)
+        acc
+
+    print(plain_wipe(1), volatile_wipe(1))
+    """
+
+@test("at -O2 a plain clearing loop over a dead u32 frame array is removed: the control")
+vlg_a_dead_loop_is_removed()
+    if !vlg_can_run() then return
+
+    val body = vlg_body(vlg_optimized(vlg_schedule), "plain_wipe")
+
+    assert(!body.is_empty(), "plain_wipe was not emitted")
+    assert(!body.contains("alloca"), body)
+    assert(!body.contains("store"), body)
+end vlg_a_dead_loop_is_removed
+
+@test("and generic zeroize in the same position keeps a 'store volatile i32 0' per element")
+vlg_zeroize_survives_o2()
+    if !vlg_can_run() then return
+
+    val out = vlg_optimized(vlg_schedule)
+    val body = vlg_body(out, "volatile_wipe")
+
+    assert(!body.is_empty(), "volatile_wipe was not emitted")
+
+    // Inlined, the loop is the stores themselves, unrolled or not; called, the call stands and the
+    // callee has them.
+    if body.contains("store volatile i32 0")
+        assert(body.contains("alloca"), body)
+    else
+        assert(body.contains("zeroize"), body)
+        assert(vlg_bodies(out, s"sysl.slices${ModuleSep}zeroize").contains("store volatile i32 0"), out)
+    end if
+end vlg_zeroize_survives_o2
+
+@test("zeroize instantiated at u8 still clears bytes, as before it was generic")
+vlg_bytes_callers_unchanged()
+    if !vlg_ready() then return
+
+    val out = vlg_ir("import sysl.slices.zeroize\nvar k = [1u8, 2, 3]\nzeroize(k)\nprint(k[0])")
+
+    assert(vlg_bodies(out, s"sysl.slices${ModuleSep}zeroize").contains("store volatile i8 0"), out)
+end vlg_bytes_callers_unchanged
