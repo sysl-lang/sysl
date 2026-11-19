@@ -111,12 +111,24 @@ private variant_test(e: *Emit, enum_ty: Type, variant: EnumVariant, args: Buf[TP
     r
 end variant_test
 
-// A value's tag: the value itself where the enum is simple, and the first slot otherwise.
+// A value's tag: the value itself where the enum is simple or where the `match` holds only the tag
+// (`tag_held`), and the first slot otherwise.
 private tag_of(e: *Emit, d: &EnumType, value: Val) -> Val
-    if d.simple then return value
+    if d.simple || bare_tag(e, value) then return value
 
     extracted_tag(e, d, value)
 end tag_of
+
+private bare_tag(e: *Emit, value: Val) -> bool
+    val name = value match
+        VReg(n) -> n
+        _ -> return false
+
+    for item in e.bare_tags
+        if item == name then return true
+
+    false
+end bare_tag
 
 private extracted_tag(e: *Emit, d: &EnumType, value: Val) -> Val
     val t = fresh_reg(e)
@@ -169,6 +181,59 @@ pattern_bind(e: *Emit, p: TPattern, value: Val) -> unit = p match
         if binds_any(*inner) then pattern_bind(e, *inner, held_by_ref(e, ref_ty, *inner, value))
 
     _ -> ()
+
+// A pattern's bindings made out of the enum at `at` rather than out of a loaded value: the variant's
+// payload is read straight from the local, with no copy of the whole enum to read it out of. Only the
+// shapes `binds_shallow` admits reach here.
+private bind_through(e: *Emit, p: TPattern, at: Val) -> unit = p match
+    TVariantPattern(enum_ty, variant, args) ->
+        if any_binds(args)
+            val d = enum_decl(enum_ty).unwrap()
+            val payload = fresh_reg(e)
+
+            emit(e, InLoad(payload, variant_lty(d, variant), payload_ptr(e, d, at), AccPlain, None))
+
+            for i in 0..<args.len()
+                pattern_bind(e, args[i], payload_field(e, d, variant, payload, i))
+        end if
+    _ -> ()
+
+// Whether every arm is one pattern -- `_`, or a variant whose fields are each bound by a name or let
+// go -- with no guard: what a `match` that reads a local through its address can bind.
+private binds_shallow(arms: Buf[TArm]) -> bool
+    for arm in arms
+        if arm.guard.is_some() || arm.patterns.len() != 1 then return false
+
+        arm.patterns[0] match
+            TWildPattern(_) -> ()
+            TVariantPattern(_, _, args) ->
+                for item in args
+                    item match
+                        TBindPattern(_, _) -> ()
+                        TWildPattern(_) -> ()
+                        _ -> return false
+            _ -> return false
+
+    true
+end binds_shallow
+
+// The tag of the enum at `at`, loaded alone and standing for the scrutinee: the one word a tag switch
+// or a tag test reads, and every reader of it asks `tag_of`, which answers the register as it is. No
+// value of the enum's type is built around it -- for a large enum that was a whole aggregate made an
+// LLVM value, by an `insertvalue` into `poison`, only for the switch to `extractvalue` the word back.
+// The `match` that asked for it lets it go where it ends (`gen_match`). A null-niche enum's tag is
+// read off its address (`enum_tag_load`).
+private tag_held(e: *Emit, d: &EnumType, at: Val) -> Val
+    val tag = fresh_reg(e)
+
+    enum_tag_load(e, d, tag, at)
+
+    tag match
+        VReg(name) -> e.bare_tags.push(name)
+        _ -> ()
+
+    tag
+end tag_held
 
 // One field of a variant's payload, or nothing where the field is zero-sized -- the same skipping
 // the layout does, seen from the reading side.
@@ -248,8 +313,37 @@ gen_match(e: *Emit, scrutinee: TExpr, arms: Buf[TArm], ty: Type, into: Option[Va
     // as a value, stored again for a payload to be read out of, and bound a third time.
     val sty = texpr_type(scrutinee)
     val moving = e.layout.indirect(sty) && any_moves(e, arms, into.is_some())
+    val tags_mark = e.bare_tags.len()
     var sv: Val = VNothing
     var at: Option[Val] = held
+
+    // **A local switched on by its tag is read through its address** where every arm binds at most
+    // a variant's fields: the tag is the one word loaded, and each arm reads its own payload out of
+    // the local. Loaded whole, the value was copied once for the `match` and again into a slot for
+    // the payload to be read from -- in an unoptimized build two stack slots the size of the enum for
+    // every `match`, which an `x.(c)` walk over the variants makes once per variant. An arm that
+    // moves its payload out moves it from the local, as above, where the enum is large; a small one
+    // with such an arm keeps the loaded value.
+    if held.is_none() && is_load(scrutinee) && binds_shallow(arms) &&
+       (moving || !any_moves(e, arms, into.is_some()))
+        enum_decl(sty) match
+            Some(d) ->
+                if !d.simple
+                    tag_switch(arms) match
+                        Some(dispatch) ->
+                            val h = address(e, scrutinee)
+                            val tag = tag_held(e, d, h)
+                            val done_l = fresh_label(e, "match.end")
+                            val merge = merge_for(e, ty, into, in_place)
+
+                            gen_tag_switch(e, dispatch, tag, Some(h), ty, merge, done_l, true)
+                            e.bare_tags.truncate(tags_mark)
+                            emit_label(e, done_l)
+                            ends_nowhere(e, ty)
+                            return merged_value(e, merge, ty)
+                        None -> ()
+                end if
+            None -> ()
 
     held match
         Some(h) -> sv = load_held(e, h, sty, arms, into.is_some())
@@ -272,6 +366,7 @@ gen_match(e: *Emit, scrutinee: TExpr, arms: Buf[TArm], ty: Type, into: Option[Va
         Some(d) -> gen_tag_switch(e, d, sv, at, ty, slot, end_l)
         None -> gen_arm_chain(e, arms, sv, at, ty, slot, end_l)
 
+    e.bare_tags.truncate(tags_mark)
     emit_label(e, end_l)
     ends_nowhere(e, ty)
 
@@ -355,22 +450,16 @@ end any_moves
 // slot's count being the one released.
 //
 // Where no arm reads anything but the tag -- each one moves its payload through the address, or tests
-// a variant without binding or testing what it carries -- only the tag is loaded, into an otherwise
-// empty value of the enum's type: loading the whole of it would be the second copy of the result this
-// exists to avoid, left to the optimizer to notice it is dead.
+// a variant without binding or testing what it carries -- only the tag is loaded, and stands for the
+// scrutinee (`tag_held`): loading the whole of it would be the second copy of the result this exists
+// to avoid, left to the optimizer to notice it is dead.
 private load_held(e: *Emit, at: Val, ty: Type, arms: Buf[TArm], into: bool) -> Val
-    val r = fresh_reg(e)
-
     enum_decl(ty) match
         Some(d) ->
-            if !d.simple && !null_niche(d) && tags_only(e, arms, into)
-                val tag = fresh_reg(e)
-
-                emit(e, InLoad(tag, l_i32(), at, AccPlain, None))
-                emit(e, InInsert(r, enum_lty(d), VPoison, l_i32(), tag, index_list(0)))
-                return r
-            end if
+            if !d.simple && tags_only(e, arms, into) then return tag_held(e, d, at)
         None -> ()
+
+    val r = fresh_reg(e)
 
     emit(e, InLoad(r, lty(e, ty), at, AccPlain, None))
     r
@@ -534,7 +623,7 @@ private switch_variant(p: TPattern) -> Option[(Type, BigInt)] = p match
 // fallthrough carried: the catch-all arm where the match has one, and otherwise the `unreachable` an
 // exhaustive match ends in -- for a statement match too, wherever the table names every variant.
 private gen_tag_switch(e: *Emit, d: TagDispatch, sv: Val, at: Option[Val], ty: Type, slot: Merge,
-                       end_l: string)
+                       end_l: string, through: bool = false)
     val tag_val = tag_of(e, d.en, sv)
 
     var arm_ls: Buf[string] = buf()
@@ -558,12 +647,12 @@ private gen_tag_switch(e: *Emit, d: TagDispatch, sv: Val, at: Option[Val], ty: T
 
     for i in 0..<d.arms.len()
         emit_label(e, arm_ls[i])
-        gen_arm_body(e, d.arms[i].0, sv, at, ty, slot, end_l)
+        gen_arm_body(e, d.arms[i].0, sv, at, ty, slot, end_l, through)
 
     d.catch_all match
         Some(arm) ->
             emit_label(e, none_l)
-            gen_arm_body(e, arm, sv, at, ty, slot, end_l)
+            gen_arm_body(e, arm, sv, at, ty, slot, end_l, through)
         None ->
             if none_l != end_l
                 emit_label(e, none_l)
@@ -648,12 +737,31 @@ private settle_owned(e: *Emit, j: usize, owned_n: *usize)
 
 // An arm's bindings and body, in the block the branch to it has already opened. Its alternatives
 // bind in blocks of their own (`bind_alternatives`), which is what lets one block serve several tags.
+//
+// `through` is a `match` reading a local through its address (`gen_match`): `sv` is then the tag
+// alone, and the arm's one pattern binds the fields out of the local at `at`.
 private gen_arm_body(e: *Emit, arm: TArm, sv: Val, at: Option[Val], ty: Type, slot: Merge,
-                     end_l: string)
+                     end_l: string, through: bool = false)
     // The arm is a region a slot's life is bounded by (`emit_lifetime.sysl`).
     val region = open_region(e)
 
     push_owned(e)
+
+    // An arm that hands a large payload back moves it out of the local as `payload_move` always did;
+    // only the whole-value rebuild, which needs the value loaded, is not open to it.
+    if through
+        if !payload_move(e, arm, slot, at)
+            bind_through(e, arm.patterns[0], at.unwrap())
+
+            if no_value(ty) then gen_block_void(e, arm.body)
+            else store_merged(e, arm.body, ty, slot)
+        end if
+
+        pop_owned(e)
+        emit_term(e, InBr(end_l))
+        close_region(e, region)
+        return
+    end if
 
     if rebuilt_whole(e, arm, sv, at, ty, slot)
         pop_owned(e)
