@@ -1,6 +1,8 @@
 module sysl.text
 
-import sysl.buf.{Buf, ByteSink, buf, buf_with_capacity}
+import sysl.alloc.{AllocError, try_box}
+import sysl.buf.{Buf, ByteSink, buf, buf_with_capacity, try_buf, try_buf_with_capacity}
+import sysl.raw.str_alias
 import sysl.slices.copy
 import sysl.{digits_long, digits_ulong}
 
@@ -83,6 +85,52 @@ struct StrBuilder
     const push_bool(*self, b: bool)
         self.push(if b then "true" else "false")
 
+    // -- the fallible twins (`sysl.alloc`): each answers `AllocError` where the buffer had to grow and
+    // the heap refused it, and gathers nothing where it does --------------------------------------
+
+    try_push(*self, s: string) -> Result[unit, AllocError] = self.bytes.try_extend(s.bytes)
+
+    try_push_char(*self, c: char) -> Result[unit, AllocError]
+        var tmp: [4]u8
+
+        self.bytes.try_extend(tmp[0..<encode_utf8(c, tmp[0..<4])])
+
+    try_push_int(*self, n: long) -> Result[unit, AllocError]
+        var tmp: [24]u8
+        val at = digits_long(n, tmp[0..<24])
+        self.bytes.try_extend(tmp[at..<24])
+
+    try_push_uint(*self, n: ulong) -> Result[unit, AllocError]
+        var tmp: [24]u8
+        val at = digits_ulong(n, tmp[0..<24])
+        self.bytes.try_extend(tmp[at..<24])
+
+    /** The rendering is written a run at a time, so a refusal part way through takes back the runs
+     * that went in before it.
+     */
+    try_push_real(*self, x: real) -> Result[unit, AllocError]
+        val had = self.bytes.len()
+        var sink = TrySink(self.bytes, false)
+
+        display_real(x, &sink, FormatSpec(0, -1, false))
+
+        if !sink.refused then return Ok(())
+
+        self.bytes.truncate(had)
+        Err(AllocError.OutOfMemory)
+    end try_push_real
+
+    try_push_bool(*self, b: bool) -> Result[unit, AllocError] = self.try_push(if b then "true" else "false")
+
+    /** `finish`, answering `AllocError` where the heap refused the string's storage. The bytes are
+     * copied once into storage of their own and the string is laid over it, sharing its owner.
+     */
+    try_finish(self) -> Result[string, AllocError]
+        var out: Buf[u8] = try_buf_with_capacity(self.bytes.len(), 0)?
+
+        out.extend(self.bytes.view())
+        Ok(str_alias(out.view()))
+
     const clear(*self)
         self.bytes.clear()
 
@@ -102,6 +150,30 @@ const str_builder() -> StrBuilder = StrBuilder(buf())
  * too large and the slack is freed with the rest when the builder goes.
  */
 const str_builder_with_capacity(n: usize) -> StrBuilder = StrBuilder(buf_with_capacity(n, 0))
+
+/** `str_builder()`, answering `AllocError` where the heap refused the buffer behind it. */
+try_str_builder() -> Result[StrBuilder, AllocError] = Ok(StrBuilder(try_box(try_buf()?)?))
+
+/** `str_builder_with_capacity(n)`, answering `AllocError` as `try_buf_with_capacity` does. */
+try_str_builder_with_capacity(n: usize) -> Result[StrBuilder, AllocError] =
+    Ok(StrBuilder(try_box(try_buf_with_capacity(n, u8(0))?)?))
+
+/** The sink `try_push_real` renders through: `ByteSink`'s write over `try_extend`, latching the first
+ * refusal. Once latched it writes nothing more, so what went in before the refusal is a prefix the
+ * caller can take back.
+ */
+private struct TrySink
+    bytes: &Buf[u8]
+    refused: bool
+
+impl Fallible for TrySink
+    override failed(*self) -> bool = self.refused
+
+impl Writer for TrySink
+    write(*self, bytes: []const u8)
+        if self.refused then return
+
+        self.refused = self.bytes.try_extend(bytes).is_err()
 
 /** A string copied into the NUL-terminated shape C reads, and the owner of that copy -- a language
  * with no manual free has to say who frees it, so the bytes belong to a value with a lifetime
@@ -124,3 +196,16 @@ cstring(s: string) -> CString
     copy(b, s.bytes)
 
     CString(b)
+
+/** `cstring(s)`, answering `AllocError` where the heap refused the copy -- `CapacityOverflow` where
+ * the text and its terminator do not fit in a `usize`.
+ */
+try_cstring(s: string) -> Result[CString, AllocError]
+    val n = s.len.checked_add(1).ok_or(AllocError.CapacityOverflow)?
+
+    var b: Buf[u8] = try_buf_with_capacity(n, 0)?
+
+    b.extend(s.bytes)
+    b.push(0)
+    Ok(CString(b.into_view()))
+end try_cstring

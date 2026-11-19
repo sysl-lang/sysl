@@ -50,30 +50,20 @@ trait Debug
 
         if const T::Kind == Kind.SimpleEnum
             for const c in T::Variants
-                if self is c
-                    out.write(T::BaseName.bytes)
-                    out.write(".".bytes)
-                    out.write(c.name.bytes)
-                end if
+                if self is c then debug_variant_name(T::BaseName, c.name, out)
         elif const T::Kind == Kind.DataEnum
             if debug_enter()
                 for const c in T::Variants
                     if self is c
                         val p = self.(c)
-                        var n = 0
 
-                        out.write(T::BaseName.bytes)
-                        out.write(".".bytes)
-                        out.write(c.name.bytes)
+                        debug_variant_name(T::BaseName, c.name, out)
 
                         for const f in c::Fields
-                            out.write((if n == 0 then "(" else ", ").bytes)
-                            out.write(f.name.bytes)
-                            out.write(": ".bytes)
+                            debug_field_label(f.index == 0, f.name, out)
                             `debug part`(p.(f), out, parts)
-                            n += 1
 
-                        if n > 0 then out.write(")".bytes)
+                        if const c::Fields.len > 0 then out.write(")".bytes)
                     end if
             else out.write("…".bytes)
 
@@ -88,12 +78,7 @@ trait Debug
 
                 for const m in T::Members
                     if const m.anonymous || m.name != "_"
-                        out.write((if n == 0 then "(" else ", ").bytes)
-
-                        if const !m.anonymous
-                            out.write(m.name.bytes)
-                            out.write(": ".bytes)
-
+                        debug_field_label(n == 0, m.name, out)
                         `debug part`(self.(m), out, parts)
                         n += 1
                     end if
@@ -297,3 +282,21 @@ debug_enter() -> bool
 
 debug_leave()
     debug_depth -= 1
+
+// `Base.Name`, the head of a supplied rendering of an enum variant.
+//
+// This and `debug_field_label` keep each copy of the walk over the variants or members a call or
+// two, so an unoptimized build's frame does not grow by every write's temporaries once per variant.
+private debug_variant_name(base: string, name: string, out: *Writer)
+    out.write(base.bytes)
+    out.write(".".bytes)
+    out.write(name.bytes)
+
+// What goes before a part in a supplied rendering: `(` before the first, `, ` before the rest, then
+// `name: ` -- nothing for an anonymous block, whose name is `""`.
+private debug_field_label(first: bool, name: string, out: *Writer)
+    out.write((if first then "(" else ", ").bytes)
+
+    if name != ""
+        out.write(name.bytes)
+        out.write(": ".bytes)

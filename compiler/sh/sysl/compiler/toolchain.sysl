@@ -1091,8 +1091,9 @@ end compile_c
 compile_object(cc: string, ir: string, obj: string, target: Target,
                level: string, piped: bool = true) -> Result[unit, string]
     val ll = s"$obj.ll"
+    val text = laid_out(cc, target, in_clang_dialect(cc, for_clang(ir, target, level)))
 
-    write_text(ll, laid_out(cc, target, in_clang_dialect(cc, for_clang(ir, target, level)))) match
+    write_text(ll, text) match
         Err(_) -> return Err(s"cannot write $ll")
         Ok(_) -> ()
 
@@ -1106,6 +1107,19 @@ compile_object(cc: string, ir: string, obj: string, target: Target,
     args.push(level_flag(level))
     args.push("-ffunction-sections")
     args.push("-fdata-sections")
+
+    // **The frames are checked and reported where they are laid out** (`frame_limit.sysl`): by this
+    // compile, or, where it writes bitcode, by one more compile without the pipeline.
+    val frames_here = piped && !frames_at_link()
+
+    if piped && frames_at_link() then frame_pass(cc, text, ll, target, level)?
+
+    if frames_here
+        val frames = frame_flags(text, ll)
+
+        for item in frames
+            args.push(item)
+    end if
 
     // Bitcode rather than an object, for a link that optimizes across every member.
     if piped
@@ -1131,7 +1145,9 @@ compile_object(cc: string, ir: string, obj: string, target: Target,
     args.push("-o")
     args.push(obj)
 
-    val said = as_tool(told(cc, args), cc)
+    val said = told(cc, args).map_err((f) -> framed_failure(cc, f))
+
+    if said.is_ok() && frames_here then frames_read(ll)
 
     // **The text is left behind where clang refused it**, and only there. A back end that rejects
     // generated IR is reporting a defect in the generator, and the one thing that diagnosis needs is
@@ -1246,7 +1262,7 @@ build_native(cc: string, ir: string, objects: Buf[string], exe: string, target: 
                 for item in objects
                     rest.push(item)
 
-                val said = link_objects(cc, made[0], rest, exe, target, level, links, probed)
+                val said = link_objects(cc, made[0], rest, exe, target, level, links, probed, buf())
 
                 for item in made
                     remove_file(item).unwrap_or(())
@@ -1255,12 +1271,20 @@ build_native(cc: string, ir: string, objects: Buf[string], exe: string, target: 
             None -> ()
 
     val ll = s"$exe.ll"
+    val text = laid_out(cc, target, in_clang_dialect(cc, for_clang(ir, target, level)))
 
-    write_text(ll, laid_out(cc, target, in_clang_dialect(cc, for_clang(ir, target, level)))) match
+    write_text(ll, text) match
         Err(_) -> return Err(s"cannot write $ll")
         Ok(_) -> ()
 
-    val said = link_objects(cc, ll, objects, exe, target, level, links, probed)
+    // The frames are laid out by the compile inside this link, or, under link-time optimization, by
+    // the linker, which reports none -- so then by one more compile (`frame_limit.sysl`).
+    frame_pass(cc, text, ll, target, level)?
+
+    val frames = if frames_at_link() then buf() else frame_flags(text, ll)
+    val said = link_objects(cc, ll, objects, exe, target, level, links, probed, frames)
+
+    if said.is_ok() && !frames_at_link() then frames_read(ll)
 
     // **The text is left behind where clang refused it**, and only there -- `compile_object` does the
     // same and for the same reason. A back end that rejects generated IR is reporting a defect in the
@@ -1377,9 +1401,14 @@ private tool_says(beside: Option[string], name: string, fallback: string) -> str
 
 // How a failed link reads: the tool's own report, and after it -- where the linker was killed by a
 // signal or the link was an LTO link, the two shapes a lld running on a libLLVM of another patch
-// version takes -- the sentence naming the mismatch if there is one.
+// version takes -- the sentence naming the mismatch if there is one. A link that compiled the
+// program's text and found frames over their limits says that instead (`frame_limit.sysl`).
 link_failure(cc: string, command: Buf[string], f: ToolFault) -> string
     if f.unrun then return f.said
+
+    frame_refusal(f.said) match
+        Some(why) -> return why
+        None -> ()
 
     val base = tool_failed(command[0], f.code, f.said)
     var lto = false
@@ -1396,8 +1425,14 @@ end link_failure
 
 // The link command run over `first` (the text, or the first unit's object) and `objects`.
 private link_objects(cc: string, first: string, objects: Buf[string], exe: string, target: Target,
-                     level: string, links: Buf[string], probed: PkgAnswer) -> Result[unit, string]
-    val command = link_command(cc, first, objects, exe, target, level, links, probed)
+                     level: string, links: Buf[string], probed: PkgAnswer,
+                     frames: Buf[string]) -> Result[unit, string]
+    var command = link_command(cc, first, objects, exe, target, level, links, probed)
+
+    // What the program's own text is compiled with for its frames (`frame_limit.sysl`), which only a
+    // link handed the text has.
+    for item in frames
+        command.push(item)
 
     linked_with = join(command.view(), " ")
 

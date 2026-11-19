@@ -1,0 +1,586 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.{Source, Span}
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+import sysl.fs.{read_text, remove_file, write_text}
+import sysl.slices.sort_by
+import sysl.text.{join, split, str_builder}
+
+// **How large a function's stack frame may be, and how large each one is** (`reference/packages.md §
+// A function's stack frame`, `reference/attributes.md § @frame_limit`).
+//
+// Nothing else in a build says how much stack a function takes, and a kernel thread, an interrupt
+// handler or a task on a microcontroller runs on a stack sized by hand. Two things answer it, both
+// LLVM's, which lays the frames out:
+//
+// - **A limit that fails the build.** A function given one carries LLVM's `"warn-stack-size"`
+//   attribute -- what clang's `-Wframe-larger-than` puts on every function -- and its back end
+//   reports a frame over it once the frame is laid out. Every clang that compiles text carrying the
+//   attribute is told `-Werror=frame-larger-than`, so the report is a failed compile, and what clang
+//   said is turned into a sysl error naming the function, its frame, the limit and what set it
+//   (`frame_refusal`).
+// - **A report of every frame**, from clang's `-stack-usage-file` -- what `-fstack-usage` writes: each
+//   function compiled, its frame in bytes, and whether the frame is all of it (`static`) or grows at
+//   run time (`dynamic`). `--stack-usage <file>` writes it, largest first.
+//
+// **Where a limit comes from, nearest first**: `@frame_limit(n)` above the function, or above the
+// function a closure or nested function is written in; then the `frame_limit` key of the manifest of
+// the package the function is written in; then the build's own limit, which is `--frame-limit` where
+// it was given and the root manifest's key where it was not. `@frame_limit(none)` is no limit at all.
+// The standard module's functions take none: they are compiled once into an artifact every build
+// shares.
+//
+// **Under link-time optimization the frames are laid out at the link**, where no linker reports one,
+// so the text is also compiled once without the pipeline flags to an object nothing uses, and that
+// compile is the one checked and reported (`frame_pass`).
+
+// One limit, and the words a refusal names its origin in.
+struct FrameSetting
+    bytes: long
+    origin: string
+end FrameSetting
+
+// The largest limit there is: LLVM's attribute is an unsigned 32-bit count.
+const MostFrameBytes: long = 4294967295
+
+// The LLVM function attribute a limit is written as.
+const FrameAttribute: string = "warn-stack-size"
+
+// A number of bytes as a limit is written -- on the command line, in a manifest -- a whole number
+// from 1 up, with `_` between digit groups if wanted. Anything else is not one.
+frame_bytes_operand(text: string) -> Option[long]
+    var n: long = 0
+    var digits = 0
+
+    for b in text.bytes
+        if b == u8('_') && digits > 0 then continue
+
+        if b < u8('0') || b > u8('9') then return None
+
+        n = n * 10 + long(b - u8('0'))
+        digits += 1
+
+        if n > MostFrameBytes then return None
+
+    if digits == 0 || n == 0 then None else Some(n)
+end frame_bytes_operand
+
+// What a limit that is not one is refused with, `what` naming where it was written.
+frame_bytes_refusal(what: string, written: string) -> string =
+    s"$what takes the most bytes one function's stack frame may take, a whole number from 1 to " +
+        s"$MostFrameBytes, and '$written' is not one"
+
+// -- what the build was told --------------------------------------------------------------------------
+
+// The build's own limit: `--frame-limit`, or the root manifest's key.
+private var fl_build: Option[FrameSetting] = None
+
+// Each file's own package's limit, by file name, where its manifest names one.
+private var fl_packages: Map[string, FrameSetting] = map()
+
+// Whether a compilation underway is the standard module's artifact, which takes no limit and is in no
+// report: it is compiled once and shared by every build, whatever any of them asked.
+private var fl_shared: int = 0
+
+// Each function the compilation being lowered marked `@frame_limit`, with where it was written and
+// what the mark said -- a closure or nested function written inside one takes the same.
+private var fl_marked: Buf[FrameMark] = buf()
+
+struct FrameMark
+    name: string
+    file: string
+    span: Span
+    setting: Option[FrameSetting]
+end FrameMark
+
+// Every function lowered with a limit or for a report, by the name LLVM knows it by: what a refusal
+// and a report name it as instead.
+private var fl_entries: Map[string, FrameEntry] = map()
+
+struct FrameEntry
+    shown: string
+    src: Option[Source]
+    span: Span
+    setting: Option[FrameSetting]
+end FrameEntry
+
+// The report's rows so far this command, each `(bytes, kind, LLVM name)`.
+private var fl_rows: Buf[(long, string, string)] = buf()
+
+// Forgets everything a command told the build, which every command line starts from.
+forget_frames()
+    fl_build = None
+    fl_packages = map()
+    fl_marked = buf()
+    fl_funcs = buf()
+    fl_entries = map()
+    fl_rows = buf()
+    fl_shared = 0
+end forget_frames
+
+// What the compilation of `units` holds its functions to: the build's limit, from `--frame-limit` or
+// else the root manifest's `frame_limit` (`root_limit`, written in `root_manifest`), and each
+// package's own key, read from the manifest each file was read under.
+note_frame_limits(units: Buf[Program], root_limit: Option[long], root_manifest: string)
+    fl_build = frame_limit_flag() match
+        Some(n) -> Some(FrameSetting(n, s"'--frame-limit $n'"))
+        None -> root_limit.map((n) -> FrameSetting(n, s"'frame_limit = $n' in ${shown_manifest(root_manifest)}"))
+
+    fl_packages = map()
+
+    var read: Map[string, Option[long]] = map()
+
+    for unit in units
+        val manifest = unit.pkg.manifest
+
+        // The project's own files are the root's, whose key is the build's above.
+        if manifest == "" || manifest == root_manifest then continue
+
+        val limit = read.get(manifest) match
+            Some(known) -> known
+            None ->
+                val said = manifest_frame_limit(manifest)
+
+                read.put(manifest, said)
+                said
+
+        limit match
+            Some(n) -> fl_packages.put(unit.src.name, FrameSetting(n, s"'frame_limit = $n' in $manifest"))
+            None -> ()
+end note_frame_limits
+
+// The project's own manifest, named by its file name alone: the build is standing in front of it.
+private shown_manifest(path: string) -> string = if path == "" then ManifestName else basename(path)
+
+// The `frame_limit` a manifest file names, or nothing -- where it names none, or will not read, which
+// the build has already refused by the time anything is lowered.
+private manifest_frame_limit(path: string) -> Option[long] = read_text(path) match
+    Err(_) -> None
+    Ok(text) -> read_manifest(text) match
+        Ok(m) -> m.frame_limit
+        Err(_) -> None
+
+// Begins and ends the standard module's compilation: no function in it takes a limit, and nothing
+// it compiles is reported.
+enter_shared_artifact()
+    fl_shared += 1
+
+leave_shared_artifact()
+    fl_shared -= 1
+
+// What each instance of a generic is shown as -- `largest[int]` -- by the name it was filed under,
+// which cannot be read back (`generic.sysl`'s `instantiate_func`).
+private var fl_instances: Map[string, (string, Buf[Type])] = map()
+
+note_instance_shown(name: string, base: string, targs: Buf[Type]) = fl_instances.put(name, (base, targs))
+
+// Every function of the compilation being lowered, where a closure's name is asked: the one it is
+// written in is the innermost of these around it.
+private var fl_funcs: Buf[FrameMark] = buf()
+
+// What a report and a refusal call a function: its qualified name, an instance with its arguments,
+// a closure after the function it is written in (`load.<closure>`).
+private frame_shown(name: string, file: string, span: Span) -> string
+    if !is_closure_symbol(name)
+        return fl_instances.get(name) match
+            Some(inst) -> qualified(readable_name(inst.0), inst.1)
+            None -> readable_name(name)
+    end if
+
+    var best: Option[FrameMark] = None
+
+    for g in fl_funcs
+        if g.file == file && inside(g.span, span)
+            best match
+                Some(b) -> if inside(b.span, g.span) then best = Some(g)
+                None -> best = Some(g)
+
+    best match
+        Some(owner) -> s"${frame_shown(owner.name, owner.file, owner.span)}.<closure>"
+        None -> "<closure>"
+end frame_shown
+
+// The functions of a compilation about to be lowered that are marked `@frame_limit`, and -- where
+// anything will be named -- every function, for the closures' owners.
+note_frame_marks(funcs: Buf[TFunc])
+    fl_marked = buf()
+    fl_funcs = buf()
+
+    if fl_shared > 0 then return
+
+    var any_mark = false
+
+    for f in funcs
+        if f.marks.frame_limit != 0 || f.marks.frame_exempt then any_mark = true
+
+    if !any_mark && stack_usage_flag().is_none() && fl_build.is_none() && fl_packages.is_empty() then return
+
+    for f in funcs
+        f.src match
+            Some(s) -> fl_funcs.push(FrameMark(f.name, s.name, f.span, None))
+            None -> ()
+
+    for f in funcs
+        if f.marks.frame_limit != 0 || f.marks.frame_exempt
+            val file = f.src match
+                Some(s) -> s.name
+                None -> ""
+
+            val n = f.marks.frame_limit
+            val setting = if f.marks.frame_exempt then None
+                          else Some(FrameSetting(n, s"'@frame_limit($n)' above '${frame_shown(f.name, file, f.span)}'"))
+
+            fl_marked.push(FrameMark(f.name, file, f.span, setting))
+end note_frame_marks
+
+// Whether `f`'s frame is checked or reported by this build, which keeps it out of the seal
+// (`seal_linkage.sysl`): a sealed function LLVM inlines at every call is deleted, and its frame with
+// it, so the limit would hold nothing and the report would not name it.
+frame_watched(f: TFunc) -> bool =
+    fl_shared == 0 && (frame_setting_of(f).is_some() || stack_usage_flag().is_some())
+
+// The limit `f` is held to, or nothing.
+frame_setting_of(f: TFunc) -> Option[FrameSetting]
+    if fl_shared > 0 then return None
+
+    marked_setting(f) match
+        Some(s) -> return s
+        None -> ()
+
+    f.src match
+        Some(src) ->
+            if src.name.starts_with(s"$StdPrefix/") then return None
+
+            fl_packages.get(src.name) match
+                Some(s) -> return Some(s)
+                None -> ()
+        None -> ()
+
+    fl_build
+end frame_setting_of
+
+// What a `@frame_limit` said for `f`: its own, or that of the innermost function it is written in.
+// The outer `Option` is whether any did.
+private marked_setting(f: TFunc) -> Option[Option[FrameSetting]]
+    if fl_marked.is_empty() then return None
+
+    for m in fl_marked
+        if m.name == f.name then return Some(m.setting)
+
+    val file = f.src match
+        Some(s) -> s.name
+        None -> return None
+
+    var best: Option[FrameMark] = None
+
+    for m in fl_marked
+        if m.file == file && inside(m.span, f.span)
+            best match
+                Some(b) -> if inside(b.span, m.span) then best = Some(m)
+                None -> best = Some(m)
+
+    best.map((m) -> m.setting)
+end marked_setting
+
+private inside(outer: Span, inner: Span) -> bool =
+    outer.start <= inner.start && inner.end <= outer.end && !(outer.start == inner.start && outer.end == inner.end)
+
+// The string attributes `f`'s definition carries for its frame, and a note of what LLVM will call it.
+// `symbol` is the name the definition is emitted under.
+frame_attributes(f: TFunc, symbol: string) -> Buf[(string, string)]
+    var out: Buf[(string, string)] = buf()
+
+    if fl_shared > 0 then return out
+
+    val setting = frame_setting_of(f)
+
+    setting match
+        Some(s) -> out.push((FrameAttribute, s"${s.bytes}"))
+        None -> ()
+
+    if setting.is_some() || stack_usage_flag().is_some()
+        val file = f.src match
+            Some(s) -> s.name
+            None -> ""
+
+        fl_entries.put(llvm_safe(symbol), FrameEntry(frame_shown(f.name, file, f.span), f.src, f.span, setting))
+
+    out
+end frame_attributes
+
+// -- what clang is told, and what it said ---------------------------------------------------------------
+
+// Whether `text` holds a definition with a limit.
+frame_limited(text: string) -> bool = text.contains(s"\"$FrameAttribute\"=")
+
+// Whether the command asked for the report, and this compile is one it covers.
+frame_reported() -> bool = fl_shared == 0 && stack_usage_flag().is_some()
+
+// The flags a clang compiling `text` from `ll` is given for frames: the limit made an error where the
+// text carries one, and the report's file -- `<ll>.su` -- where one was asked for.
+frame_flags(text: string, ll: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    if frame_limited(text) then out.push("-Werror=frame-larger-than")
+
+    if frame_reported()
+        out.push("-Xclang")
+        out.push("-stack-usage-file")
+        out.push("-Xclang")
+        out.push(s"$ll.su")
+    end if
+
+    out
+end frame_flags
+
+// Whether the frames of a compile are laid out at the link rather than by it: under link-time
+// optimization, whose compile writes bitcode.
+frames_at_link() -> bool = settled_lto().is_some()
+
+// **Under link-time optimization**, `text` compiled once more without the pipeline, to an object
+// nothing uses, so the limit is checked and the report read. Nothing where neither is asked for.
+frame_pass(cc: string, text: string, ll: string, target: Target, level: string) -> Result[unit, string]
+    if !frames_at_link() then return Ok(())
+    if !frame_limited(text) && !frame_reported() then return Ok(())
+
+    val obj = s"$ll.frames.o"
+    var args: Buf[string] = buf()
+
+    args.push(s"--target=${target.triple}")
+    args.push("-Wno-override-module")
+    args.push("-c")
+    args.push("-x")
+    args.push("ir")
+    args.push(s"-O$level")
+    args.push("-ffunction-sections")
+    args.push("-fdata-sections")
+
+    val extra = extra_cflags()
+
+    for item in extra
+        args.push(item)
+
+    val machine = machine_flags(target)
+
+    for item in machine
+        args.push(item)
+
+    val frames = frame_flags(text, ll)
+
+    for item in frames
+        args.push(item)
+
+    args.push(ll)
+    args.push("-o")
+    args.push(obj)
+
+    val said = told(cc, args)
+
+    remove_file(obj).unwrap_or(())
+
+    said match
+        Ok(_) -> ()
+        Err(f) -> return Err(framed_failure(cc, f))
+
+    frames_read(ll)
+    Ok(())
+end frame_pass
+
+// What a compile that failed reports: the frames over their limits where that is what clang said, and
+// its own words otherwise.
+framed_failure(cc: string, f: ToolFault) -> string
+    if f.unrun then return f.said
+
+    frame_refusal(f.said) match
+        Some(why) -> why
+        None -> tool_failed(cc, f.code, f.said)
+end framed_failure
+
+// The sysl error for every frame clang reported over its limit in `said`, or nothing where it reported
+// none. A line reads `stack frame size (65632) exceeds limit (2048) in function 'deep$$sysl'`.
+frame_refusal(said: string) -> Option[string]
+    var placed: Buf[Placed] = buf()
+    var bare: Buf[string] = buf()
+
+    for line in split(said, "\n")
+        frame_report_of(line) match
+            None -> ()
+            Some(r) ->
+                val (size, limit, symbol) = r
+
+                fl_entries.get(unpromoted(symbol)) match
+                    Some(e) ->
+                        val message = frame_message(e.shown, size, limit, e.setting)
+
+                        e.src match
+                            Some(src) -> placed.push(placed_error(src, e.span, message))
+                            None -> bare.push(s"error: $message")
+                    None -> bare.push(s"error: ${frame_message(readable_name(unpromoted(symbol)), size, limit, None)}")
+
+    if placed.is_empty() && bare.is_empty() then return None
+
+    var parts: Buf[string] = buf()
+
+    if !placed.is_empty() then parts.push(analysis_report(placed))
+
+    for item in bare
+        parts.push(item)
+
+    Some(join(parts.view(), "\n\n"))
+end frame_refusal
+
+// Whether a failure's text is `frame_refusal`'s, a report already rendered.
+is_frame_report(text: string) -> bool = text.starts_with("error: '") && text.contains(FrameWords)
+
+private const FrameWords: string = "' needs a stack frame of "
+
+// One function's frame over its limit, in words.
+private frame_message(shown: string, size: long, limit: long, setting: Option[FrameSetting]) -> string
+    val origin = setting match
+        Some(s) -> s", set by ${s.origin}"
+        None -> ""
+
+    s"'$shown' needs a stack frame of $size bytes, over its limit of $limit bytes$origin — move what " +
+        "makes it large off the stack, onto the heap or into module storage, or give this function " +
+        "a limit of its own with '@frame_limit(n)' above it"
+end frame_message
+
+// `(frame, limit, symbol)` out of one line of clang's, or nothing where the line is not that report.
+frame_report_of(line: string) -> Option[(long, long, string)]
+    val size = number_after(line, "stack frame size (")?
+    val limit = number_after(line, "exceeds limit (")?
+
+    // The symbol is the last quoted run on the line.
+    val bytes = line.bytes
+    var close = bytes.len
+
+    while close > 0
+        close -= 1
+
+        if bytes[close] == u8('\'') then break
+
+    if close == 0 then return None
+
+    var open = close
+
+    while open > 0
+        open -= 1
+
+        if bytes[open] == u8('\'') then break
+
+    if bytes[open] != u8('\'') || open == close then return None
+
+    Some((size, limit, line[open + 1..<close]))
+end frame_report_of
+
+// The whole number after the first `marker` in `line`.
+private number_after(line: string, marker: string) -> Option[long]
+    val bytes = line.bytes
+
+    for i in 0..<bytes.len
+        if bytes_at(line, i, marker)
+            var n: long = 0
+            var j = i + marker.bytes.len
+            var digits = 0
+
+            while j < bytes.len && bytes[j] >= u8('0') && bytes[j] <= u8('9')
+                n = n * 10 + long(bytes[j] - u8('0'))
+                j += 1
+                digits += 1
+
+            return if digits == 0 then None else Some(n)
+        end if
+
+    None
+end number_after
+
+// A symbol as the definition spelled it, where splitting the text into units promoted it
+// (`codegen_units.sysl`'s `Promoted`).
+private unpromoted(symbol: string) -> string =
+    if symbol.starts_with("sysl.cgu:") then symbol[9..<symbol.bytes.len] else symbol
+
+// -- the report -------------------------------------------------------------------------------------------
+
+// Reads the frames clang wrote beside `ll` into the report, and writes the report out again.
+frames_read(ll: string)
+    if !frame_reported() then return
+
+    val file = s"$ll.su"
+
+    read_text(file) match
+        Err(_) -> return
+        Ok(text) ->
+            for line in split(text, "\n")
+                stack_row(line, ll) match
+                    Some(row) -> fl_rows.push(row)
+                    None -> ()
+
+    remove_file(file).unwrap_or(())
+    write_stack_report()
+end frames_read
+
+// One line of a stack-usage file -- `<file>:<function>\t<bytes>\t<kind>` -- as a row.
+private stack_row(line: string, ll: string) -> Option[(long, string, string)]
+    val cells = split(line, "\t")
+
+    if cells.len != 3 then return None
+
+    val head = cells[0]
+    val prefix = s"$ll:"
+    val symbol = if head.starts_with(prefix) then head[prefix.bytes.len..<head.bytes.len] else head
+    val size = frame_number(cells[1])?
+
+    Some((size, cells[2], unpromoted(symbol)))
+end stack_row
+
+private frame_number(text: string) -> Option[long]
+    var n: long = 0
+
+    if text.is_empty() then return None
+
+    for b in text.bytes
+        if b < u8('0') || b > u8('9') then return None
+
+        n = n * 10 + long(b - u8('0'))
+
+    Some(n)
+end frame_number
+
+// The report as it stands, written to the file `--stack-usage` named: a line per function, largest
+// frame first and then by name, each `<bytes>\t<static|dynamic|dynamic,bounded>\t<function>\t<where>`.
+write_stack_report()
+    val path = stack_usage_flag() match
+        Some(p) -> p
+        None -> return
+
+    write_text(path, stack_report_text()).unwrap_or(())
+end write_stack_report
+
+// The report's text, from the rows read so far.
+stack_report_text() -> string
+    var rows: Buf[(long, string, string, string)] = buf()
+
+    for r in fl_rows
+        val (size, kind, symbol) = r
+
+        val (shown, where) = fl_entries.get(symbol) match
+            Some(e) -> (e.shown, entry_place(e))
+            None -> (symbol, "-")
+
+        rows.push((size, kind, shown, where))
+
+    sort_by(rows.view_mut(), (a, b) -> a.0 > b.0 || (a.0 == b.0 && (a.2 < b.2 || (a.2 == b.2 && a.3 < b.3))))
+
+    var b = str_builder()
+
+    for r in rows
+        b.push(s"${r.0}\t${r.1}\t${r.2}\t${r.3}\n")
+
+    b.finish()
+end stack_report_text
+
+// Where a function was written, as `file:line`, or `-` for one nothing wrote.
+private entry_place(e: FrameEntry) -> string = e.src match
+    Some(src) -> s"${src.name}:${src.locate(e.span.start).line}"
+    None -> "-"

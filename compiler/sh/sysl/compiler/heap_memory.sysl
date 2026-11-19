@@ -1,0 +1,37 @@
+module sh.sysl.compiler
+
+import sysl.process.{pid, resident_bytes}
+import sysl.slices.as_mut_ptr
+
+// What the process holds, for `SYSL_TIMINGS=1` (`timings.sysl`): its resident bytes, and the bytes the
+// allocator holds for live blocks.
+//
+// **The two part company after a large compilation, and nothing in the process can bring them back
+// together.** Measured on the compiler's own test build (`sysl test . --file tests_widening.sysl`,
+// macOS 27): 18.7 GB in use as the text is printed, 1.3 GB once the analysis and the lowered module
+// are freed -- every tree freed, none kept by a cycle or a cache -- and still 21.5 GB resident, an
+// 11.5 GB footprint, through the 200 seconds the clangs run. `malloc_zone_pressure_relief` gives back
+// nothing there, even from a zone whose every small block has been freed; only the end of the process
+// returns it.
+
+// The bytes the allocator holds for live blocks, where the platform says (macOS's zone statistics,
+// summed over every zone); `None` elsewhere.
+heap_in_use() -> Option[u64]
+#if macos
+    // `malloc_statistics_t`: a 32-bit block count (padded to a word), then the bytes in use, the most
+    // ever in use, and the bytes the zones hold.
+    var stats: []usize = [0; 4]
+
+    c_zone_statistics(null, as_mut_ptr(stats))
+    Some(u64(stats[1]))
+#else
+    None
+#endif
+end heap_in_use
+
+// This process's resident bytes, or zero where the platform will not say.
+own_resident() -> u64 = resident_bytes(int(pid())).unwrap_or(0)
+
+#if macos
+private extern "malloc_zone_statistics" c_zone_statistics(zone: *u8, into: *usize)
+#endif
