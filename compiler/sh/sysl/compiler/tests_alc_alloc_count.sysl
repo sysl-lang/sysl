@@ -2,7 +2,7 @@ module sh.sysl.compiler
 @tests
 
 import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
-import sysl.process.capture
+import sysl.process.{Var, capture}
 import sysl.text.Search
 
 // The counted heap (`alloc_count.sysl`): a program built with counting on says at exit how many
@@ -25,7 +25,10 @@ end alc_ready
 
 // The program built -- counted or not -- and run; a build that failed answers `ok` false with the
 // reason in `out`.
-private alc_run(text: string, counted: bool) -> AlcRun
+private alc_run(text: string, counted: bool) -> AlcRun = alc_run_with(text, counted, [])
+
+// The same, run with `env` added to the environment it inherits.
+private alc_run_with(text: string, counted: bool, env: []const Var) -> AlcRun
     val root = make_temp_dir("sysl-alc").unwrap()
 
     make_dir_all(root).unwrap()
@@ -44,14 +47,14 @@ private alc_run(text: string, counted: bool) -> AlcRun
             return AlcRun(false, failure_text(why), "")
         Ok(_) -> ()
 
-    val said = capture(s"$root/built", [], "", [], true)
+    val said = capture(s"$root/built", [], "", env, true)
 
     remove_dir_all(root).unwrap_or(())
 
     said match
         Err(_) -> AlcRun(false, "could not be started", "")
         Ok(o) -> AlcRun(o.status.ok(), o.text, o.err.unwrap_or(""))
-end alc_run
+end alc_run_with
 
 private alc_cycle() -> string = """
     struct Node
@@ -183,3 +186,77 @@ alc_the_report_reads_back()
     assert(alloc_count_reported(s"noise\nsysl: 127 ${alloc_count_said()}\n") == 127)
     assert(alloc_count_reported(s"sysl: -2 ${alloc_count_said()}\n") == -2)
 end alc_the_report_reads_back
+
+// ---- the bytes asked for, in all
+
+// A buffer of `n` bytes, given back before the program ends, so only the total can see it.
+private alc_sized(n: int) -> string = s"""
+    import sysl.buf.buf_with_capacity
+
+    var b = buf_with_capacity(${n}usize, u8(0))
+
+    b.push(u8(1))
+    print(b.len())
+    """
+
+private alc_bytes_asked() -> []const Var = [Var(alloc_bytes_variable(), "1")]
+
+@test("a counted program asked for its byte total says it, and the total counts what was given back")
+alc_the_byte_total_is_said_when_asked()
+    if !alc_ready() then return
+
+    val run = alc_run_with(alc_sized(1000000), true, alc_bytes_asked())
+
+    assert(run.ok, run.out)
+    assert(run.out == "1\n", run.out)
+    assert(!run.err.contains(alloc_count_said()), run.err)
+    assert(run.err.starts_with("sysl: ") && run.err.ends_with(s" ${alloc_bytes_said()}\n"), run.err)
+    assert(alloc_bytes_reported(run.err) >= 1000000, run.err)
+end alc_the_byte_total_is_said_when_asked
+
+// Never subtracted, so a larger allocation given back is still a larger total: the difference of two
+// runs is the difference of what they asked for, give or take nothing else.
+@test("the byte total grows by exactly what a program asks for beyond another")
+alc_the_byte_total_is_exact()
+    if !alc_ready() then return
+
+    val small = alloc_bytes_reported(alc_run_with(alc_sized(1000000), true, alc_bytes_asked()).err)
+    val large = alloc_bytes_reported(alc_run_with(alc_sized(3000000), true, alc_bytes_asked()).err)
+
+    assert_eq(large - small, 2000000)
+end alc_the_byte_total_is_exact
+
+@test("the byte total is a second line beside a leak, and neither appears unasked")
+alc_the_byte_total_beside_a_leak()
+    if !alc_ready() then return
+
+    val both = alc_run_with(alc_cycle(), true, alc_bytes_asked())
+
+    assert(both.ok, both.out)
+    assert(alloc_count_reported(both.err) == 2, both.err)
+    assert(alloc_bytes_reported(both.err) > 0, both.err)
+    assert(both.err.starts_with(s"sysl: 2 ${alloc_count_said()}\nsysl: "), both.err)
+
+    val clean = alc_run(alc_sized(1000), true)
+
+    assert(clean.ok, clean.out)
+    assert(clean.err == "", clean.err)
+end alc_the_byte_total_beside_a_leak
+
+@test("an uncounted build asked for its byte total says nothing: there is no total to say")
+alc_the_byte_total_needs_a_counted_build()
+    if !alc_ready() then return
+
+    val run = alc_run_with(alc_sized(1000), false, alc_bytes_asked())
+
+    assert(run.ok, run.out)
+    assert(run.err == "", run.err)
+end alc_the_byte_total_needs_a_counted_build
+
+@test("the byte total is read back as the number it states, and apart from the leak count")
+alc_the_byte_total_reads_back()
+    assert(alloc_bytes_reported("") == 0)
+    assert(alloc_bytes_reported(s"sysl: 3 ${alloc_count_said()}\n") == 0)
+    assert(alloc_bytes_reported(s"sysl: 3 ${alloc_count_said()}\nsysl: 4096 ${alloc_bytes_said()}\n") == 4096)
+    assert(alloc_count_reported(s"sysl: 3 ${alloc_count_said()}\nsysl: 4096 ${alloc_bytes_said()}\n") == 3)
+end alc_the_byte_total_reads_back

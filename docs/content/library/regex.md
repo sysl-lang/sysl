@@ -59,6 +59,10 @@ characters and eight million instructions, and one more factor is a billion. A p
 refused if it would lay out more than a hundred thousand — far past anything written on purpose, and
 what keeps a pattern arriving from somewhere untrusted from exhausting memory before it ever runs.
 
+What is built from the matches is linear as well. `replace_all` gathers its result in one
+`StrBuilder` rather than adding each piece to a string — which would copy everything written so far
+at every match — so it costs the matching plus the length of what it writes.
+
 ```sysl
 import sysl.regex.{regex, describe}
 

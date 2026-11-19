@@ -2744,6 +2744,66 @@ print(count())
 is resumed) and a variadic function are refused the same way, and so is an `extern`, whose body is
 compiled elsewhere. It takes no arguments.
 
+## `@frame_limit(n)` — the most stack one call of a function may take
+
+A function marked `@frame_limit(n)` may not have a stack frame larger than `n` bytes, and a build in
+which it does fails, naming the function, its frame and the limit. The frame is laid out by LLVM,
+so the check is made where clang compiles the program — here an archive's (`sysl build-c`):
+
+```sysl build=c
+@frame_limit(2048)
+@export("deep")
+deep(n: usize) -> u8
+    var block: [65536]u8 = [0; 65536]
+    block[n % 65536] = u8(n)
+    block[(n * 7) % 65536]
+```
+
+```error
+'deep' needs a stack frame of
+```
+
+The whole message reads `'deep' needs a stack frame of 65584 bytes, over its limit of 2048 bytes, set
+by '@frame_limit(2048)' above 'deep'` on an AArch64 Mac at the default level, the size being whatever
+the machine and the optimization level lay the frame out at. The frame is what the function's
+prologue reserves — its locals, the registers it saves, what it passes on the stack — and not what
+the functions it calls take: a bound over a whole call chain is a different question, which this
+does not answer.
+
+**The limit is the emitted function's, as clang's is.** A function the optimizer inlines takes its
+frame into its caller and is held to the caller's limit there; a function called once with a
+constant may be folded away entirely, array and all. An `@export`ed function's C entry point is
+held to the function's own limit, since its body is inlined into it.
+
+**It is the one function's answer to a limit set for many.** A package's `frame_limit` key and the
+`--frame-limit` flag hold every function a build compiles ([a function's stack
+frame](/reference/packages/#a-function-s-stack-frame)), and the attribute is nearer than either: a
+kernel holding every function to 2 KiB gives its entry point what that one needs, and
+`@frame_limit(none)` takes the function out of every limit at all:
+
+```sysl
+@frame_limit(none)
+setup() -> int
+    var scratch: [8192]u8 = [0; 8192]
+    scratch[100] = 7
+    int(scratch[100])
+
+print(setup())
+```
+
+```output
+7
+```
+
+**A closure or nested function written inside a marked function takes its mark**, being part of the
+body the mark was written about; one written anywhere else takes the limit of its own package. Every
+instance of a generic function carries the mark its declaration was written with, and so does every
+lowered copy of a method.
+
+The number is a literal from 1 to 4294967295, which is the most LLVM's attribute holds; `none` is the
+one word it takes. A limit is a fact about the code LLVM lays out, so it marks a function or a
+method, and an `extern` — whose frame is laid out by whoever compiled it — is refused it.
+
 ## `@renamed` and `@removed` — a name that is gone, and what became of it
 
 A module that renames or removes a declaration leaves a **tombstone** where it was, so a program
@@ -5101,10 +5161,10 @@ The boundary travels with every value of the type the compiler lays down: a modu
 a `static`, a local, an element of an array, a field of another struct — which begins on the
 boundary and raises its holder's to match — and the payload of an enum variant carrying one.
 **A value on the heap keeps it too.** A box (`&T`), a buffer or a task's frame takes its storage
-from the allocating pair, which promises only what `malloc` does — two words, sixteen bytes on a
-64-bit machine and eight on a 32-bit one — so storage of a type aligned beyond that comes from the
-aligned pair, `sysl_alloc_aligned(size, align)` and `sysl_free_aligned(p)`, and the payload is laid
-after the box's header on the boundary:
+on the type's boundary, and the payload is laid after the box's header on it. A heap the manifest
+names is handed the boundary with every block; under libc's pair, whose `malloc` promises only two
+words — sixteen bytes on a 64-bit machine and eight on a 32-bit one — storage of a type aligned
+beyond that comes from the C library's aligned allocation:
 
 ```sysl
 @align(4096)
@@ -5124,9 +5184,9 @@ print(usize(&*b) % 4096, b.e[3])
 ```
 
 Every access through an address of the type claims its whole boundary. With libc's `malloc` and
-`free` on a POSIX system, WASI or Windows the aligned pair needs nothing from the program; anywhere
-else the program answers it,
-as [`packages.md` § A type aligned beyond what the pair promises](/reference/packages/#a-type-aligned-beyond-what-the-pair-promises)
+`free` on a POSIX system, WASI or Windows this needs nothing from the program; on a machine with no
+C library the program names a heap of its own,
+as [`packages.md` § A type aligned beyond what `malloc` promises](/reference/packages/#a-type-aligned-beyond-what-malloc-promises)
 says.
 
 **The bound is folded rather than lexed**, so a program writes the name it already has for the number,
