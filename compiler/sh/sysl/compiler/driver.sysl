@@ -2248,6 +2248,26 @@ run_cache_key_for(command: string, path: string, named_target: Option[string], l
         Err(_) -> None
 end run_cache_key_for
 
+// The key for `command` and the key for `other` over the same tree, from one reading of it: a
+// narrowed test build looks for its own entry and then for the whole tree's (`test_project`).
+run_cache_keys_for(command: string, other: string, path: string, named_target: Option[string],
+                   level: string, cc: Option[string]) -> (Option[string], Option[string])
+    if explaining_drops() then return (None, None)
+
+    val t = target_for(path, named_target) match
+        Ok(found) -> found
+        Err(_) -> return (None, None)
+
+    run_cache_parts(command, path, t, level, cc) match
+        Ok(found) ->
+            var parts = found
+            val first = run_cache_key(parts)
+
+            parts[0] = other
+            (Some(first), Some(run_cache_key(parts)))
+        Err(_) -> (None, None)
+end run_cache_keys_for
+
 // What a shell hears when a child ends. A signal has no exit status of its own, and `128 + n` is what
 // every shell reports for one -- so it is what a caller reading this number will already be
 // expecting. A child stopped for outstaying its timeout is `124`, the status `timeout(1)` reports
@@ -2278,6 +2298,10 @@ struct TestBuild
     // Whether the tree being tested is itself the standard module, in which case there is no
     // artifact to link: the bodies the tests call are in the text above.
     standalone: bool
+
+    // How many `@tests` files `--file` left out of the build (`test_selection.sysl`); zero is the
+    // whole tree, which answers any `--file` and is kept under the whole tree's key.
+    dropped_files: usize
 end TestBuild
 
 // `sysl test [--target <name>] <path>` -- the same program lowered as a **test build**.
@@ -2288,13 +2312,24 @@ end TestBuild
 //
 // The analysis in front of it is the analysis every other build gets, and that is deliberate: a test
 // is code somebody wrote and is held to the same rules.
+//
+// **`within` is what `--file` named**: the `@tests` files nothing named and nothing kept needs are
+// left out before the analysis (`narrowed_test_units`), and their tests listed to be counted only.
 test_build_of(path: string, named_target: Option[string],
-              level: string = DefaultOptimization) -> Result[TestBuild, Failure]
+              level: string = DefaultOptimization,
+              within: Buf[string] = buf()) -> Result[TestBuild, Failure]
     val t = test_target_of(path, named_target)?
 
     headers_refused(path)?
 
-    Ok(test_build_from(packaged_compilation_of(path, t)?, false, level, path, true)?)
+    val program = packaged_compilation_of(path, t)?
+    val narrowed = narrowed_test_units(program.units, within)
+    val built = test_build_from(program with { units = narrowed.units }, false, level, path, true)?
+
+    for dropped in narrowed.dropped_tests
+        built.tests.push(dropped)
+
+    Ok(built with { dropped_files = narrowed.dropped_files })
 end test_build_of
 
 // The same for a tree that **is** the standard module (`sysl test <root> --std`), which is how the
@@ -2396,7 +2431,7 @@ private test_build_from(program: Compilation, standalone: bool, level: string,
     val emitted = Emitted(ir_print_module(lowered.0), report, lowered.1,
                           link_required(program.units), roots.archives)
 
-    Ok(TestBuild(emitted, kept.tests, t, standalone))
+    Ok(TestBuild(emitted, kept.tests, t, standalone, 0))
 end test_build_from
 
 // A test binary, linked exactly as a program is, in a directory of its own.
