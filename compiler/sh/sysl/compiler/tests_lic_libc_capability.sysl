@@ -155,8 +155,9 @@ lic_hosted_is_unchanged()
     assert_eq(printed, "1.50 1.5\n")
 end lic_hosted_is_unchanged
 
-// A box of a page-aligned struct, reached from an export: the lowering asks `sysl_alloc_aligned` for
-// it, and the defaults over `posix_memalign` and `free` are written only where a C library stands.
+// A box of a page-aligned struct, reached from an export: under libc's pair the lowering asks
+// `sysl.heap.alloc_aligned` for it, written over `posix_memalign` and `free` only where a C library
+// stands.
 private val lic_aligned_box: string = raw"""
     @align(4096)
     struct Page
@@ -186,11 +187,11 @@ lic_granted_libc_defaults_the_aligned_pair()
 
     lbr_drop([root])
     assert(lic_names(undefined, "posix_memalign") || lic_names(undefined, "_posix_memalign"), undefined)
-    assert(!lic_names(undefined, "sysl_alloc_aligned"), undefined)
-    assert(!lic_names(undefined, "sysl_free_aligned"), undefined)
+    assert(!lic_names(undefined, "sysl.heap.alloc_aligned"), undefined)
+    assert(!lic_names(undefined, "sysl.heap.free_aligned"), undefined)
 end lic_granted_libc_defaults_the_aligned_pair
 
-@test("without libc, a freestanding over-aligned box is refused, naming both aligned hooks")
+@test("without libc, a freestanding over-aligned box is refused, naming the allocator block")
 lic_no_libc_refuses_the_aligned_box()
     if !lbr_ready() then return
 
@@ -198,11 +199,55 @@ lic_no_libc_refuses_the_aligned_box()
     val (said, _) = lic_build_c(root)
 
     lbr_drop([root])
-    assert(said.0 != 0, "built an over-aligned box with no C library and no aligned hook")
+    assert(said.0 != 0, "built an over-aligned box with no C library and no heap of its own")
     assert(said.1.contains(s"'$lic_target' has no C library with an aligned allocation to answer it. " +
-        "Define 'sysl_alloc_aligned(size: usize, align: usize) -> *u8' and " +
-        "'sysl_free_aligned(p: *u8)' with '@export'"), said.1)
+        "Name a heap of your own in sysl.hocon's 'allocator' block: its " +
+        "'alloc(size: usize, align: usize) -> *u8' and 'free(p: *u8, size: usize, align: usize)' are " +
+        "handed every block's boundary"), said.1)
 end lic_no_libc_refuses_the_aligned_box
+
+// A task whose frame holds a page-aligned local, driven from an export.
+private val lic_aligned_task: string = raw"""
+    @align(4096)
+    struct Page
+        e: [512]u64
+
+    async hold(n: u64) -> int
+        var t: Page
+        t.e[1] = n
+        await yield_now()
+        int(t.e[1])
+
+    @export("probe")
+    probe() -> int = block_on(hold(3))
+    """
+
+@test("without libc, a task frame past malloc's boundary is refused where the default task hooks answer it")
+lic_no_libc_refuses_the_aligned_frame()
+    if !lbr_ready() then return
+
+    val root = lic_project(lic_aligned_task, "")
+    val (said, _) = lic_build_c(root)
+
+    lbr_drop([root])
+    assert(said.0 != 0, "built an over-aligned frame with no C library and no heap of its own")
+    assert(said.1.contains("the frame of the task '"), said.1)
+    assert(said.1.contains("asks for the 4096-byte boundary a value it holds is aligned on"), said.1)
+    assert(said.1.contains(s"'$lic_target' has no C library with an aligned allocation"), said.1)
+end lic_no_libc_refuses_the_aligned_frame
+
+@test("without libc, a task frame past malloc's boundary builds where the program answers the task hooks")
+lic_no_libc_own_task_hooks_take_the_frame()
+    if !lbr_ready() then return
+
+    val hooks = "\n@export(\"sysl_task_alloc\")\npool_take(size: usize, align: usize) -> *u8 = null\n\n" +
+        "@export(\"sysl_task_free\")\npool_give(p: *u8, size: usize, align: usize) = ()\n"
+    val root = lic_project(lic_aligned_task + hooks, "")
+    val (said, _) = lic_build_c(root)
+
+    lbr_drop([root])
+    assert(said.0 == 0, said.1)
+end lic_no_libc_own_task_hooks_take_the_frame
 
 @test("the run cache keys a freestanding build with libc granted apart from one without")
 lic_libc_changes_the_key()

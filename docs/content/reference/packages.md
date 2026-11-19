@@ -1512,9 +1512,9 @@ targets {
 
 What it makes legal is **C's own functions** and nothing more. Text needs no C library either way:
 every [formatted string](/reference/strings/) specifier, and every integer and float written or read,
-is rendered in sysl. What it does decide is storage aligned beyond what the allocating pair promises:
-where `libc` stands and the pair is libc's own, `sysl_alloc_aligned` and `sysl_free_aligned` default
-to `posix_memalign` and `free`; where it does not, the program defines them.
+is rendered in sysl. What it does decide is storage aligned beyond what `malloc` promises under
+libc's pair: where `libc` stands it comes from `posix_memalign` and goes back to `free`; where it
+does not, the program names a heap of its own, which is handed every block's boundary.
 
 **It is not an operating system, and it is not POSIX.** The three say different things: `os` is a
 machine with an environment to hand a program (files, variables, processes), `posix` is that
@@ -1592,8 +1592,36 @@ allocator {
 
 Saying it settles the pair for the whole program, not for the package that said it. Every allocation
 the compilation emits calls that pair — a string concatenation, a `Buf` growing, a box the reference
-counter builds — and every release gives the storage back to it. Declare nothing anywhere and the pair
-is libc's `malloc` and `free`, which is what a program depending on nothing that says otherwise gets.
+counter builds, a closure's captures, a task's frame — and every release gives the storage back to it.
+Declare nothing anywhere and the pair is libc's `malloc` and `free`, which is what a program depending
+on nothing that says otherwise gets.
+
+**A pair the manifest names is told every block's size and boundary, on both calls:**
+
+```
+alloc(size: usize, align: usize) -> *u8
+free(p: *u8, size: usize, align: usize)
+```
+
+`alloc` answers `size` bytes beginning on `align` — a power of two, never less than the machine's
+word — or null, which stops the program at the allocation. `free` is handed back exactly the `size`
+and `align` the block was taken with, so a heap that keeps no headers of its own (a slab, an arena, a
+pool of fixed sizes, a C API shaped `free(ptr, size, align)`) is the pair as it stands. libc's pair is
+called as libc declares it, `malloc(size)` and `free(p)`.
+
+A program writing the pair itself writes it in that shape, and one of another shape is refused at its
+definition rather than handed arguments it does not take:
+
+```
+'my_free' is exported as 'my_free', the half of the program's heap giving back every block, which is
+called as 'free(p: *u8, size: usize, align: usize)' — told the size and boundary the block was taken
+with. This one takes 1 parameter, so its arguments would not be the ones it is passed
+```
+
+Counting proves it: a pair that records each block it hands out and checks every free against the
+record sees every free match, whether the program is a program, a `build-c` archive or a `--shared`
+library a C host links. `SYSL_COUNT_ALLOCS=1` builds a program on such a pair of the compiler's own,
+which stops a program whose free names another size or boundary than its allocation did.
 
 **It is the program's pair rather than the package's, because there is one heap.** Ownership is
 settled by reference count, so which code frees a thing is not knowable when a package is written: a
@@ -1631,42 +1659,27 @@ declare a pair too, which covers an application with its own arena and no depend
 handed over as a `--lib` source root declare the same thing and settle the same question — this is a
 property of the package, not of the flag that reached it.
 
-### A type aligned beyond what the pair promises
+### A type aligned beyond what `malloc` promises
 
-The pair is held to `malloc`'s promise: a block begins on a boundary of two words — sixteen bytes on
-a 64-bit machine, eight on a 32-bit one. A box, a buffer or a task's frame holding a type that asks
-for more (an [`@align(n)`](/reference/attributes/#align-n-where-the-aggregate-begins) struct, or a
-`u128` on a 32-bit machine) is taken from a second pair instead:
+A box, a buffer or a task's frame holding a type that asks for a wide boundary (an
+[`@align(n)`](/reference/attributes/#align-n-where-the-aggregate-begins) struct, or a `u128` on a
+32-bit machine) needs nothing more from a pair the manifest names: the boundary is the `align` its
+`alloc` is handed.
 
-```sysl
-@export("sysl_alloc_aligned")
-my_alloc_aligned(size: usize, align: usize) -> *u8 = ...
-
-@export("sysl_free_aligned")
-my_free_aligned(p: *u8) = ...
-```
-
-The first answers `size` bytes beginning on `align` — a power of two, larger than the pair's own
-boundary — or null, and the second gives such a block back; the storage's destruction hook knows
-which pair made it.
-
-Where the allocating pair is libc's, the compiler writes `weak` defaults over the C library's own
-aligned allocation — `posix_memalign` and `free` on a POSIX system and WASI, `_aligned_malloc` and
-`_aligned_free` on Windows — and a program's own definitions displace them. Anywhere else — a pair
-the manifest named, or a machine with no C library under it — only the program knows how its heap
-answers a boundary, so a program that puts such a type on the heap and does not define both is
-refused when it is compiled, naming the storage and the two hooks:
+libc's `malloc` promises only two words — sixteen bytes on a 64-bit machine, eight on a 32-bit one.
+Under libc's pair a block asking for more is taken from the C library's aligned allocation instead,
+`posix_memalign` on a POSIX system and WASI and `_aligned_malloc` on Windows, and given back to the
+matching free. A machine with no C library under libc's pair has nothing to answer the boundary
+with, so a program that puts such a type on the heap there is refused when it is compiled, naming
+the storage and the way out:
 
 ```
 a box of 'Page' asks for the 4096-byte boundary its type is aligned on, and the allocating pair
-('img_alloc' and 'img_free') promises only 16 — 'aarch64-freestanding' has no C library with an
-aligned allocation to answer it. Define 'sysl_alloc_aligned(size: usize, align: usize) -> *u8'
-and 'sysl_free_aligned(p: *u8)' with '@export', the first answering a block on that boundary and
-the second giving one back
+('malloc' and 'free') promises only 16 — 'aarch64-freestanding' has no C library with an aligned
+allocation to answer it. Name a heap of your own in sysl.hocon's 'allocator' block: its
+'alloc(size: usize, align: usize) -> *u8' and 'free(p: *u8, size: usize, align: usize)' are handed
+every block's boundary
 ```
-
-A program that never puts such a type on the heap never names either, so a pair alone is still the
-whole of what a heap needs to supply.
 
 ### The compiled standard module is built for one allocator
 
