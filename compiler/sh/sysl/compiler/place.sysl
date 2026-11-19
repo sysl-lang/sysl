@@ -725,6 +725,15 @@ struct RefWatch
     // its callee and the argument's position: the watch holds only where every one of those answers
     // is made of what it was handed (`view_borrow.sysl`'s `settle_view_refusals`). Empty otherwise.
     via: Buf[(string, usize)]
+
+    // Where a `ref`'s place starts at a local or parameter of its own body held as a `&T` or a view,
+    // and no other step put that type into `types`: the local's unique name, and `slot_ty`, the type
+    // its own slot put in. **The slot holds its object alive for the whole call** (a parameter by the
+    // caller's guarantee or its own count, a local by its count), so the type stands only for a call
+    // writing the slot itself, which needs its address: `checks.sysl`'s `ref_call` drops it where the
+    // body never lets that out. Empty, and `Unknown`, otherwise.
+    slot: string
+    slot_ty: Type
 end RefWatch
 
 // Files a `ref` just bound, where anything another name could reach holds the storage it stands in.
@@ -735,20 +744,34 @@ watch_ref(cx: &Analyzer, span: Span, name: string, place: TExpr)
     // type of every owning step goes in beside the types that hold one.
     var at = step_before(cx, place)
     var through_call = false
+    var slot = ""
+    var slot_ty = Unknown
 
     while at.is_some()
         val step = at.unwrap()
         val ty = texpr_type(step)
-
-        if owning_step(ty) || (through_call && holds_storage(ty)) then add_type(&types, underlying(ty))
+        val container = through_call && holds_storage(ty)
 
         through_call = placed_by(cx, step).is_some()
         at = step_before(cx, step)
 
+        // **A local's own slot is written only where its address is let out**, which `checks.sysl`
+        // asks of the whole body; the type goes in, and the slot is named so that the question can
+        // take it back out. Only the root's slot, and only where nothing else put its type in.
+        if at.is_none() && owning_step(ty) && !container && !holders_have(types, underlying(ty))
+            *step.kind match
+                TLoad(local, _) ->
+                    slot = local
+                    slot_ty = underlying(ty)
+                _ -> ()
+        end if
+
+        if owning_step(ty) || container then add_type(&types, underlying(ty))
+
     if types.is_empty() then return
 
     cx.an.ref_watches.push(RefWatch(cx.watch_key(), name, types, span.end, None, cx.locals.len() - 1,
-                                    "", ref_hazards(cx, place), "", Unknown, buf()))
+                                    "", ref_hazards(cx, place), "", Unknown, buf(), slot, slot_ty))
 end watch_ref
 
 // The types whose values hold the owning steps a `ref` over `place` goes through: for a field the
