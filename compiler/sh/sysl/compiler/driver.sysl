@@ -659,6 +659,10 @@ end typed_compilation
 //
 // **`watched` is set by `run` alone**: the entry of a program it is about to start ends the program
 // once the runner is gone (`gen_runner_watch`).
+//
+// **`compact`, the default, prints each body as it is built** (`codegen.sysl`), since the text is all
+// that is wanted of the module; off, the module is built whole and printed at the end, which is the
+// same text and what the tests compare it with.
 // Whether a build at `level` is optimized, and so inlines: every level clang spells but `0`. An
 // `available_externally` copy at `-O0` is lowered and then dropped unread.
 imports_bodies(level: string) -> bool = level != "0"
@@ -668,7 +672,7 @@ emit_llvm_text(path: string, named_target: Option[string],
                also_auto_imported: Buf[string] = buf(),
                against: Option[Buf[string]] = None,
                linking: bool = false, keep_tests: bool = false,
-               watched: bool = false) -> Result[Emitted, Failure]
+               watched: bool = false, compact: bool = true) -> Result[Emitted, Failure]
     val t = target_for(path, named_target)?
 
     phase_start()
@@ -767,7 +771,7 @@ emit_llvm_text(path: string, named_target: Option[string],
     val lowered = codegen_with_gaps(kept with { precompiled = joined_names(linked.precompiled,
                                                                            roots.precompiled) },
                                     t, promotions, linking && imports_bodies(level), None, watched,
-                                    if linking then program.own else buf())
+                                    if linking then program.own else buf(), compact)
 
     phase_done("codegen")
 
@@ -2289,7 +2293,7 @@ end TestBuild
 // The analysis in front of it is the analysis every other build gets, and that is deliberate: a test
 // is code somebody wrote and is held to the same rules.
 test_build_of(path: string, named_target: Option[string],
-              level: string = DefaultOptimization) -> Result[TestBuild, Failure]
+              level: string = DefaultOptimization, compact: bool = true) -> Result[TestBuild, Failure]
     val t = test_target_of(path, named_target)?
 
     headers_refused(path)?
@@ -2301,8 +2305,36 @@ test_build_of(path: string, named_target: Option[string],
 
     phase_done("parse program")
 
-    Ok(test_build_from(program, false, level, path, true)?)
+    Ok(test_build_from(program, false, level, path, true, compact)?)
 end test_build_of
+
+// The suite a build child compiled, as the link child takes it up (`test_child.sysl`): the module's text
+// and the lists the link reads, from `stash`.
+//
+// **The project is read again first, and only read**: what the link asks of the packages -- their C,
+// their libraries, their config headers, the search paths -- is settled while the graph is resolved,
+// so the link child resolves it as the build child did and throws the parse away. It costs the parse,
+// a second or so for the compiler's own tree, and none of the analysis. What the build's C read is the
+// build child's list exactly, since the run cache keys the binary on it.
+test_build_restored(path: string, named_target: Option[string],
+                    stash: string) -> Result[TestBuild, Failure]
+    val t = test_target_of(path, named_target)?
+
+    headers_refused(path)?
+    _ = packaged_compilation_of(path, t)?
+
+    val s = stash_read(stash) match
+        Some(read) -> read
+        None -> return Err(said(Refusal(s"the compiled tests at $stash could not be read")))
+
+    clear_files_read()
+    note_files_read(s.files_read)
+
+    // The link is timed as the build child's phases were (`SYSL_TIMINGS=1`).
+    phase_start()
+
+    Ok(TestBuild(Emitted(s.text, buf(), buf(), s.links, s.archives), s.tests, t, false))
+end test_build_restored
 
 // The same for a tree that **is** the standard module (`sysl test <root> --std`), which is how the
 // library's own tests are run: there is no library beside it and no artifact to link, because the
@@ -2353,7 +2385,8 @@ end test_target_of
 // would refuse (`check_bare_metal_storage`) is worth nothing in a command that never shows it. A
 // `tests/refused/` program is compiled to be refused, and says nothing.
 private test_build_from(program: Compilation, standalone: bool, level: string,
-                        project: string = "", warns: bool = false) -> Result[TestBuild, Refusal]
+                        project: string = "", warns: bool = false,
+                        compact: bool = true) -> Result[TestBuild, Refusal]
     val t = program.target
 
     // A test binary links the roots' kept halves as a program does. A root whose own tests this build
@@ -2391,7 +2424,7 @@ private test_build_from(program: Compilation, standalone: bool, level: string,
 
     val lowered = codegen_with_gaps(kept with { precompiled = joined_names(precompiled,
                                                                            roots.precompiled) },
-                                    t, promotions, imports_bodies(level), None, false, program.own)
+                                    t, promotions, imports_bodies(level), None, false, program.own, compact)
 
     phase_done("codegen")
 

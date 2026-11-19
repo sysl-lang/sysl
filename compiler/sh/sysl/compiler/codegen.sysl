@@ -1,7 +1,7 @@
 module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
-import sysl.container.{Set, set}
+import sysl.container.{Map, map, Set, set}
 import sysl.text.{str_builder, StrBuilder, Search}
 
 // Lowering a whole program to a module of intermediate representation.
@@ -49,17 +49,24 @@ codegen_with_gaps(p: TProgram, t: Target, pr: Promotions,
                   imports: bool = false,
                   only: Option[Set[string]] = None,
                   watched: bool = false,
-                  sealing: Buf[string] = buf()) -> (IrModule, Buf[(string, string)])
+                  sealing: Buf[string] = buf(),
+                  compact: bool = false) -> (IrModule, Buf[(string, string)])
     var e = emitter_for(t, p.destructors)
 
-    codegen_into(&e, p, t, pr, imports, only, watched, sealing)
+    codegen_into(&e, p, t, pr, imports, only, watched, sealing, compact)
 end codegen_with_gaps
 
+// `compact` asks for every body printed as soon as it is built and its blocks let go of
+// (`printed_func`), for a caller that wants the module's text and nothing else of it -- a test build.
+// A machine whose `bf16` is lowered to bits after the module is built (`soft_bf16.sysl`) keeps its
+// blocks, since the lowering rewrites them.
 private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
                      imports: bool = false,
                      only: Option[Set[string]] = None,
                      watched: bool = false,
-                     sealing: Buf[string] = buf()) -> (IrModule, Buf[(string, string)])
+                     sealing: Buf[string] = buf(),
+                     compact_asked: bool = false) -> (IrModule, Buf[(string, string)])
+    val compact = compact_asked && !bf16_as_bits(t)
     val layout = e.layout
     val word_bits = int(t.pointer_bits())
 
@@ -180,10 +187,21 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
 
     // A `@ghost` function is not emitted at all: nothing executable may call one, and the clauses
     // that may are the ones a body never reaches.
+    // **A test build prints each body as soon as it is built and lets go of its blocks** (`compact`):
+    // held as instructions, the compiler's own suite was 12.6 GB of the 18.7 GB its codegen ended
+    // holding, for 0.7 GB of text. What sealing and the borrowing entries ask of a body afterwards is
+    // kept beside it: its shape (`CallShape`) and the globals it names.
+    var shapes: Map[string, CallShape] = map()
+    var printed_refs: Set[string] = set()
+    var compacted: usize = 0
+
     for i in 0..<p.funcs.len()
         val f = p.funcs[i]
 
         if f.ghost then continue
+
+        // What the function before this one added, let go of before this one is built.
+        if compact then compacted = compact_from(funcs, compacted, &shapes, &printed_refs)
 
         if !declared_elsewhere(p, f)
             set_promoted(e, pr, f.name)
@@ -223,6 +241,8 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
 
                         imported.add(f.name)
                 None -> ()
+
+    if compact then compacted = compact_from(funcs, compacted, &shapes, &printed_refs)
 
     // What is written from here on -- the thunks, the entry point, the helpers -- runs where its
     // caller does, and the caller's body is the one that checked.
@@ -371,7 +391,8 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
         for item in e.globals
             stored.push(item)
 
-        for item in named_entries(pending, everything, built_helpers, stored, module_asm_lines(p.module_asm))
+        for item in named_entries(pending, everything, built_helpers, stored, module_asm_lines(p.module_asm),
+                                  printed_refs)
             set_promoted(e, pr, item.f.name)
 
             val parts = split_disjoint(item.f, pending_entry(e, item))
@@ -388,6 +409,8 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
 
         made = drain_helpers(e, made, built_helpers, gaps)
     end if
+
+    if compact then compacted = compact_from(funcs, compacted, &shapes, &printed_refs)
 
     // The hand-written blocks go in front of the generated ones, and which of them the module needs
     // is settled only once every helper has been written -- a helper is as much a reason to hold the
@@ -433,7 +456,7 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
         globals.push(vtables[i])
 
     if !sealed.is_empty()
-        for name in run_once(funcs, sealed)
+        for name in run_once(funcs, sealed, shapes)
             sealed.remove(name)
 
         funcs = sealed_funcs(funcs, sealed)
@@ -445,6 +468,20 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
 
     (if bf16_as_bits(t) then soft_bf16_lower(m) else m, gaps)
 end codegen_into
+
+// Every function `funcs` holds from `from` on, printed and let go of (`printed_func`), with what
+// `run_once` and `named_entries` will ask of it kept beside. Answers how far `funcs` is compacted.
+private compact_from(funcs: Buf[IrFunc], from: usize, shapes: *Map[string, CallShape],
+                     refs: *Set[string]) -> usize
+    for i in from..<funcs.len()
+        val f = funcs[i]
+
+        shapes.put(f.sig.name, call_shape(f))
+        referenced_globals(f, refs)
+        funcs[i] = printed_func(f)
+
+    funcs.len()
+end compact_from
 
 // Every helper requested from `made` on, each of which may request another, until nothing new is.
 // Answers how far the queue has been built.

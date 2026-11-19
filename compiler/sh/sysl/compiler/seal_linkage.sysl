@@ -59,8 +59,9 @@ end note_sealed
 // taken as well may be called again through it; leaving such a one external costs only what sealing
 // would have gained. The entry itself stays sealed: only the platform's `main` calls it.
 //
-// Returns the names among `sealed` that run once.
-run_once(funcs: Buf[IrFunc], sealed: Set[string]) -> Buf[string]
+// Returns the names among `sealed` that run once. A function whose blocks were printed and let go of
+// (`printed_func`) is read through the shape kept for it in `shapes`, which says what its blocks did.
+run_once(funcs: Buf[IrFunc], sealed: Set[string], shapes: Map[string, CallShape] = map()) -> Buf[string]
     var once: Buf[string] = buf()
     var index: Map[string, usize] = map()
 
@@ -76,11 +77,19 @@ run_once(funcs: Buf[IrFunc], sealed: Set[string]) -> Buf[string]
     var once_calls: Map[string, int] = map()
 
     for f in funcs
-        for b in f.blocks
-            for inst in b.instrs
-                sealed_callee(inst, sealed) match
-                    Some(c) -> calls.put(c, calls.get(c).unwrap_or(0) + 1)
-                    None -> ()
+        if is_printed(f)
+            shapes.get(f.sig.name) match
+                Some(shape) ->
+                    for site in shape.calls
+                        if sealed.has(site.0) then calls.put(site.0, calls.get(site.0).unwrap_or(0) + 1)
+                None -> ()
+        else
+            for b in f.blocks
+                for inst in b.instrs
+                    sealed_callee(inst, sealed) match
+                        Some(c) -> calls.put(c, calls.get(c).unwrap_or(0) + 1)
+                        None -> ()
+    end for
 
     var todo: Buf[usize] = buf()
     var done: Set[string] = set()
@@ -89,38 +98,72 @@ run_once(funcs: Buf[IrFunc], sealed: Set[string]) -> Buf[string]
     done.add(entry_symbol())
 
     while todo.pop() is Some(at)
-        val blocks = funcs[at].blocks
-        var labels: Map[string, usize] = map()
+        val f = funcs[at]
+        val shape = if is_printed(f) then shapes.get(f.sig.name).unwrap_or(call_shape(f)) else call_shape(f)
+        var looped: Buf[Option[bool]] = buf()
 
-        for j in 0..<blocks.len()
-            labels.put(blocks[j].label, j)
+        for _ in 0..<shape.succ.len() do looped.push(None)
 
-        for j in 0..<blocks.len()
-            var looped: Option[bool] = None
+        // The calls in the order the blocks hold them, each asked about once its block is.
+        for site in shape.calls
+            val (c, j) = site
 
-            for inst in blocks[j].instrs
-                val c = sealed_callee(inst, sealed) match
-                    Some(c) -> c
-                    None -> continue
+            if !sealed.has(c) then continue
 
-                if looped.is_none() then looped = Some(on_a_loop(blocks, j, labels))
+            if looped[j].is_none() then looped[j] = Some(on_a_loop(shape.succ, j))
 
-                if looped == Some(true) then continue
+            if looped[j] == Some(true) then continue
 
-                val n = once_calls.get(c).unwrap_or(0) + 1
+            val n = once_calls.get(c).unwrap_or(0) + 1
 
-                once_calls.put(c, n)
+            once_calls.put(c, n)
 
-                if n == calls.get(c).unwrap_or(0) && !done.has(c)
-                    done.add(c)
-                    once.push(c)
+            if n == calls.get(c).unwrap_or(0) && !done.has(c)
+                done.add(c)
+                once.push(c)
 
-                    index.get(c) match
-                        Some(i) -> todo.push(i)
-                        None -> ()
+                index.get(c) match
+                    Some(i) -> todo.push(i)
+                    None -> ()
+        end for
 
     once
 end run_once
+
+// **What `run_once` asks of a body, kept where its blocks are not**: each block's successors by index,
+// and every direct call to a named function with the block it is in, in the order the blocks hold them.
+struct CallShape
+    succ: Buf[Buf[usize]]
+    calls: Buf[(string, usize)]
+end CallShape
+
+// A body's shape, read off its blocks.
+call_shape(f: IrFunc) -> CallShape
+    var labels: Map[string, usize] = map()
+
+    for j in 0..<f.blocks.len()
+        labels.put(f.blocks[j].label, j)
+
+    var succ: Buf[Buf[usize]] = buf()
+    var calls: Buf[(string, usize)] = buf()
+
+    for j in 0..<f.blocks.len()
+        var next: Buf[usize] = buf()
+
+        for l in successors(f.blocks[j].terminator)
+            labels.get(l) match
+                Some(k) -> next.push(k)
+                None -> ()
+
+        succ.push(next)
+
+        for inst in f.blocks[j].instrs
+            inst match
+                InCall(_, _, VGlobal(name), _, _, _, _, _) -> calls.push((name, j))
+                _ -> ()
+
+    CallShape(succ, calls)
+end call_shape
 
 // The sealed function a direct call names, if it names one.
 private sealed_callee(inst: Inst, sealed: Set[string]) -> Option[string] = inst match
@@ -128,20 +171,16 @@ private sealed_callee(inst: Inst, sealed: Set[string]) -> Option[string] = inst 
     _ -> None
 
 // Whether control can come back to block `at` once it has left it: whether `at` is on a loop.
-private on_a_loop(blocks: Buf[IrBlock], at: usize, labels: Map[string, usize]) -> bool
+private on_a_loop(succ: Buf[Buf[usize]], at: usize) -> bool
     var seen: Buf[bool] = buf()
     var todo: Buf[usize] = buf()
 
-    for _ in 0..<blocks.len() do seen.push(false)
+    for _ in 0..<succ.len() do seen.push(false)
 
     todo.push(at)
 
     while todo.pop() is Some(j)
-        for l in successors(blocks[j].terminator)
-            val k = labels.get(l) match
-                Some(k) -> k
-                None -> continue
-
+        for k in succ[j]
             if k == at then return true
 
             if !seen[k]

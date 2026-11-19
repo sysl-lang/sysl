@@ -93,6 +93,91 @@ tmg_a_test_build_says_its_phases()
     assert_eq(named, "parse std,parse program,declarations,bodies,checks,prune,std,codegen,print,link,", text)
     assert(text.contains("1 passed, 0 failed"), text)
 
+// Whether every phase line of `text` is followed -- past the checks' own lines -- by the line saying
+// what the process holds, with its resident megabytes and, on macOS, the megabytes in use. Answers
+// how many phases it found.
+private tmg_memory_lines(text: string) -> usize
+    val lines = split(text, "\n")
+    var phases: usize = 0
+
+    for i in 0..<lines.len
+        if !lines[i].starts_with("sysl: phase ") then continue
+
+        phases += 1
+
+        var j = i + 1
+
+        while j < lines.len && lines[j].starts_with("sysl:   check ")
+            j += 1
+
+        assert(j < lines.len, text)
+
+        val said = lines[j]
+
+        assert(said.starts_with("sysl:   memory ") && said.contains("MB resident"), text)
+
+        // The figure is the process's own, which is never nothing.
+        assert(!said.starts_with("sysl:   memory 0MB"), said)
+
+#if macos
+        assert(said.ends_with("MB in use"), said)
+#endif
+
+    phases
+end tmg_memory_lines
+
+@test("SYSL_TIMINGS=1 says what the process holds after every phase of a build and of a test build")
+tmg_every_phase_says_its_memory()
+    val binary = tmg_compiler() match
+        None ->
+            print("skipped: SYSL_STAGE2 names no compiler binary")
+            return
+        Some(b) -> b
+
+    val (built, built_text) = tmg_phases(binary, true)
+    val (tested, tested_text) = tmg_phases(binary, true, true)
+
+    assert_eq(tmg_memory_lines(built_text), built.len(), built_text)
+    assert_eq(tmg_memory_lines(tested_text), tested.len(), tested_text)
+
+    // A memory line is not a phase, so the lists the other tests compare are what they were.
+    assert(!built.is_empty() && !tested.is_empty(), built_text + tested_text)
+
+@test("the bytes in use count a live block and stop counting it once it is freed")
+tmg_heap_in_use_follows_a_block()
+#if macos
+    val before = heap_in_use().unwrap()
+    var held: Buf[u8] = buf()
+
+    for _ in 0..<(64 * 1048576)
+        held.push(1)
+
+    val during = heap_in_use().unwrap()
+
+    assert(during >= before + 60 * 1048576, s"$before before, $during with 64 MB held")
+    assert(own_resident() >= 60 * 1048576, s"${own_resident()} resident with 64 MB held")
+
+    held = buf()
+
+    val after = heap_in_use().unwrap()
+
+    assert(after + 60 * 1048576 <= during, s"$during with 64 MB held, $after after")
+#else
+    assert(heap_in_use().is_none(), "a platform with no zone statistics says a figure")
+#endif
+
+@test("without SYSL_TIMINGS a build says nothing of its memory")
+tmg_an_untimed_build_says_no_memory()
+    val binary = tmg_compiler() match
+        None ->
+            print("skipped: SYSL_STAGE2 names no compiler binary")
+            return
+        Some(b) -> b
+
+    val (_, text) = tmg_phases(binary, false)
+
+    assert(!text.contains("sysl:   memory"), text)
+
 @test("without SYSL_TIMINGS a test build says no phase")
 tmg_an_untimed_test_build_is_silent()
     val binary = tmg_compiler() match
