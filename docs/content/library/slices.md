@@ -152,12 +152,12 @@ both are `equal` over a sub-slice, and both stay for the same reason.
 
 ## Clearing a secret
 
-**`zeroize` sets every byte to zero in a way the optimizer may not remove.** A key or a password is
-cleared before its buffer is dropped, and that clearing is exactly the store an optimizer deletes:
-nothing reads the buffer again, so at `-O2` a `fill(key, 0)` there is gone and the secret stays in
-memory for whoever is handed the page next. `zeroize` takes a `[]volatile u8`, and every store
-through a [volatile](/reference/memory/#device-memory) view is emitted, once each, whether or not
-anything reads the byte again.
+**`zeroize` sets every element to zero in a way the optimizer may not remove.** A key or a password
+is cleared before its buffer is dropped, and that clearing is exactly the store an optimizer
+deletes: nothing reads the buffer again, so at `-O2` a `fill(key, 0)` there is gone and the secret
+stays in memory for whoever is handed the page next. `zeroize` takes a `[]volatile T` for any
+integer `T`, and every store through a [volatile](/reference/memory/#device-memory) view is
+emitted, once each, whether or not anything reads the element again.
 
 ```sysl
 import sysl.slices.zeroize
@@ -184,9 +184,38 @@ print(session)
 [7, 0, 0, 7]
 ```
 
-**A `[]u8` is handed over as it stands** — a view widens to a view of the same elements as
-`volatile`, the same way it widens to a `[]const` one. A view that may not be written is refused,
-since this writes: a `val` array, a string's bytes, a `[]const u8`.
+**A cipher's key schedule is cleared at its own width.** `T` is read off the argument, so a `[]u32`
+of round keys is cleared with one 32-bit store per word, and a byte buffer with one per byte:
+
+```sysl
+import sysl.slices.zeroize
+
+expand(key: u32) -> [8]u32
+    var ks: [8]u32
+    var w = key
+    for i in 0..<ks.len
+        w = (w << 5) ^ (w >> 3) ^ u32(i)
+        ks[i] = w
+    ks
+
+var schedule = expand(0x2b7e1516)
+var check = 0u32
+for w in schedule
+    check ^= w
+print(check != 0)
+
+zeroize(schedule)
+print(schedule)
+```
+
+```output
+true
+[0, 0, 0, 0, 0, 0, 0, 0]
+```
+
+**A view is handed over as it stands** — it widens to a view of the same elements as `volatile`, the
+same way it widens to a `[]const` one. A view that may not be written is refused, since this writes:
+a `val` array, a string's bytes, a `[]const u8`.
 
 ```sysl
 import sysl.slices.zeroize
@@ -199,9 +228,9 @@ zeroize(key)
 views elements it may not write
 ```
 
-It costs one store per byte, which is what makes it unremovable; memory that holds nothing secret
-is cleared with `fill`. It says nothing about copies the program made elsewhere, a register still
-holding a byte, or a page the system swapped out.
+It costs one store per element, which is what makes it unremovable; memory that holds nothing
+secret is cleared with `fill`. It says nothing about copies the program made elsewhere, a register
+still holding a value, or a page the system swapped out.
 
 ## Moving elements from one slice to another
 

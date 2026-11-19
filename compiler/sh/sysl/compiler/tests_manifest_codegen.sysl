@@ -112,10 +112,11 @@ mcg_the_pair_a_package_named()
     val out = mcg_llvm(root)
 
     use_allocator(mcg_libc)
-    assert(mcg_has(out, "declare ptr @pvPortMalloc("), out)
-    assert(mcg_has(out, "declare void @vPortFree(ptr)"), out)
-    assert(mcg_has(out, "call ptr @pvPortMalloc("), out)
-    assert(mcg_has(out, "call void @vPortFree("), out)
+    // A named pair is told every block's size and boundary, on both calls.
+    assert(mcg_has(out, "declare ptr @pvPortMalloc(i64, i64)"), out)
+    assert(mcg_has(out, "declare void @vPortFree(ptr, i64, i64)"), out)
+    assert(mcg_has(out, "call ptr @pvPortMalloc(i64 "), out)
+    assert(mcg_has(out, "call void @vPortFree(ptr %p, i64 "), out)
     remove_dir_all(root).unwrap_or(())
 end mcg_the_pair_a_package_named
 
@@ -134,10 +135,11 @@ mcg_libc_nowhere_once_another_is_named()
     remove_dir_all(root).unwrap_or(())
 end mcg_libc_nowhere_once_another_is_named
 
-// The plain drop hook is installed by reading the runtime helpers' text for a call to the allocator,
-// so the sniff has to be for the symbol in force rather than for a literal `@malloc`.
-@test("the emitted module still installs the plain drop hook, which is found by reading for the allocator")
-mcg_the_plain_drop_hook_either_way()
+// The plain drop hook is one for every payload, so it knows no size: libc's pair is given it, and a
+// named pair -- told every block's size -- never is. A string's bytes go back through a byte
+// buffer's hook, which reads its count back.
+@test("the plain drop hook serves libc's pair, and a named pair gets a hook that knows each size")
+mcg_the_plain_drop_hook_only_for_libc()
     if !mcg_library_here() then return
 
     val libc = mcg_project(mcg_allocates, "")
@@ -145,11 +147,13 @@ mcg_the_plain_drop_hook_either_way()
     val theirs = mcg_llvm(rtos)
     val ours = mcg_llvm(libc)
 
+    use_allocator(mcg_libc)
     assert(mcg_has(ours, "define private void @arc.drop.plain("), ours)
-    assert(mcg_has(theirs, "define private void @arc.drop.plain("), theirs)
+    assert(!mcg_has(theirs, "@arc.drop.plain"), theirs)
+    assert(mcg_has(theirs, "define private void @arc.dropbuf."), theirs)
     remove_dir_all(libc).unwrap_or(())
     remove_dir_all(rtos).unwrap_or(())
-end mcg_the_plain_drop_hook_either_way
+end mcg_the_plain_drop_hook_only_for_libc
 
 // A binding that names `pvPortMalloc` as the allocator *and* declares it -- which is exactly what a
 // FreeRTOS package does -- must not produce two declarations. Both externs are **called**, since one
@@ -239,11 +243,11 @@ private mcg_own_heap_project() -> string
         "extern \"free\" c_free(p: *u8)\n\n" +
         "var count: int = 0\n\n" +
         "@export(\"my_alloc\")\n" +
-        "my_alloc(n: usize) -> *u8\n" +
+        "my_alloc(n: usize, align: usize) -> *u8\n" +
         "    count += 1\n" +
         "    c_malloc(n)\n\n" +
         "@export(\"my_free\")\n" +
-        "my_free(p: *u8)\n" +
+        "my_free(p: *u8, n: usize, align: usize)\n" +
         "    c_free(p)\n").unwrap()
     root
 end mcg_own_heap_project
@@ -298,14 +302,14 @@ mcg_pair_in_c_is_still_declared()
 
     write_text(s"$root/rt.c",
         "#include <stdlib.h>\n\n" +
-        "void *my_alloc(size_t n) { return malloc(n); }\n" +
-        "void my_free(void *p) { free(p); }\n").unwrap()
+        "void *my_alloc(size_t n, size_t align) { return malloc(n); }\n" +
+        "void my_free(void *p, size_t n, size_t align) { free(p); }\n").unwrap()
 
     val out = mcg_llvm(root)
 
     use_allocator(mcg_libc)
-    assert(mcg_has(out, "declare ptr @my_alloc("), out)
-    assert(mcg_has(out, "declare void @my_free(ptr)"), out)
+    assert(mcg_has(out, "declare ptr @my_alloc(i64, i64)"), out)
+    assert(mcg_has(out, "declare void @my_free(ptr, i64, i64)"), out)
     assert(!mcg_has(out, "define ptr @my_alloc("), out)
     assert_eq(mcg_built_and_run(root), "42\n")
     remove_dir_all(root).unwrap_or(())

@@ -241,8 +241,9 @@ Ranges are limited to the numeric types and `char`, where a contiguous interval 
 Literals work on anything `==` can compare, including `string` and `bool`, so a `match` on a boolean
 with `true ->` and `false ->` arms is exhaustive without a catch-all.
 
-Field selection dereferences one level automatically, but `match` does not. Matching a `&Enum` is
-written `match *e`, which makes it explicit whether the reference or the value is being matched:
+A pattern reaches through a `&T` the way field selection does. Matching a `&Enum` against its
+variants matches what the reference holds, and so does a pattern nested inside a payload that is a
+`&T`:
 
 ```sysl
 enum Tree
@@ -250,9 +251,10 @@ enum Tree
     Node(left: &Tree, right: &Tree)
 
 total(t: &Tree) -> int
-    *t match
-        Leaf(v)    -> v
-        Node(l, r) -> total(l) + total(r)
+    t match
+        Leaf(v)             -> v
+        Node(Leaf(a), r)    -> a + total(r)
+        Node(l, r)          -> total(l) + total(r)
 
 var t: &Tree = Node(Leaf(1), Node(Leaf(2), Leaf(3)))
 
@@ -262,6 +264,9 @@ print("sum:", total(t))
 ```output
 sum: 6
 ```
+
+A name in an arm still binds the reference itself, and a raw `*T` is matched by writing its
+dereference, `*p match`.
 
 This is also how a recursive enum is written. A variant holding its own enum by value would have
 infinite size, so recursion goes through a `&T` or a `*T`, the same indirection the memory chapter

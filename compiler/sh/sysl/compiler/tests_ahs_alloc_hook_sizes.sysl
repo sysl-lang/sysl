@@ -1,0 +1,448 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{replace_all, Search}
+
+// **A heap a manifest names is told every block's size and boundary, on both calls**
+// (`reference/packages.md § One heap`): `alloc(size, align) -> *u8` and `free(p, size, align)`, the
+// free handed exactly what the alloc was. An embedder's heap that serves a C API of that shape --
+// terndb's `alloc(size, align)` and `free(ptr, size, align)` -- is then the pair as it stands.
+//
+// The instrument is an embedder in C, beside the package, that records each block it hands out with
+// the size and boundary it was asked for, and counts every free that names another size, another
+// boundary or a block it never made, and every block that missed its boundary
+// (`emit_box.sysl`'s `heap_take`/`heap_give`). The cells, each a workload of its own: a `Buf` growing
+// (slot storage, whose header counts only the live prefix -- `slot_lead`), of plain and counted
+// elements and of bytes; strings, concatenated and rendered past the writer's first growth; boxes,
+// weakened and compact, and a chain of them; an `@align(64)` box and buffers of it; a closure's
+// environment; a task's frame and its `yield_now`. Crossed with how the program is made: a program,
+// a `build-c` archive linked into a C host, and a `--shared` library a C host links against. The
+// counting runtime is the same check from the other side (`alloc_count.sysl`): a pair told sizes,
+// which stops a program whose free names another size.
+//
+// Skipped cells, and why: a pair written in sysl rather than C is the same calls -- one program cell
+// keeps it honest; a bare-metal target is the same lowering under another word, which
+// `tests_aah_aligned_alloc.sysl`'s image reads off the text; `Buf.shrink` and `reserve` reach the
+// heap only through `slot_storage` and the old storage's hook, both in the growing cell.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private ahs_ready() -> bool = lbr_ready() && (host_os() == MacOS || host_os() == Linux)
+
+private val ahs_manifest: string =
+    "package { name = \"ahs\", version = \"0.0.1\" }\nallocator {\n  alloc = \"rec_alloc\"\n" +
+    "  free  = \"rec_free\"\n}\n"
+
+// The embedder: every block recorded with what it was asked for, every free checked against it.
+private val ahs_hooks: string = raw"""
+    #include <stdio.h>
+    #include <stdlib.h>
+    #include <stdint.h>
+
+    static struct { void *p; size_t n, a; } held[16384];
+    static long taken, given, wrong, off;
+
+    void *rec_alloc(size_t n, size_t a) {
+      void *p;
+      if (posix_memalign(&p, a < 16 ? 16 : a, n ? n : 1)) return 0;
+      if ((uintptr_t)p % a) off++;
+      for (int i = 0; i < 16384; i++)
+        if (!held[i].p) { held[i].p = p; held[i].n = n; held[i].a = a; break; }
+      taken++;
+      return p;
+    }
+
+    void rec_free(void *p, size_t n, size_t a) {
+      int found = 0;
+      for (int i = 0; i < 16384; i++)
+        if (held[i].p == p) {
+          if (held[i].n != n || held[i].a != a) wrong++;
+          held[i].p = 0;
+          found = 1;
+          break;
+        }
+      if (!found) wrong++;
+      given++;
+      free(p);
+    }
+
+    void rec_report(long r) {
+      printf("%ld taken=%d given=%d wrong=%ld off=%ld\n", r, taken > 0, given > 0, wrong, off);
+    }
+    """
+
+// The workloads, one function per cell.
+private val ahs_work: string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    extern "rec_report" report(r: long)
+
+    @align(64)
+    struct Line
+        a: u64
+
+    struct P
+        x: int
+        name: string
+
+    struct Node
+        v: int
+        next: Option[&Node]
+
+    async add(a: int, b: int) -> int
+        await yield_now()
+        a + b
+
+    bufs() -> int
+        var xs: Buf[int] = buf()
+
+        for i in 0..<1000
+            xs.push(i)
+
+        var names: Buf[string] = buf()
+
+        for i in 0..<50
+            names.push(s"name $i")
+
+        var bytes: Buf[u8] = buf()
+
+        for i in 0..<300
+            bytes.push(u8(i % 256))
+
+        int(xs.len()) + int(names.len()) + int(bytes.len())
+    end bufs
+
+    strings() -> int
+        val long = "0123456789012345678901234567890123456789"
+        val s = "abc" + long + "def"
+        val t = s"$long and $s and ${long.len}"
+
+        int(s.len) + int(t.len)
+
+    boxes() -> int
+        val b: &P = P(5, "five")
+        val w: weak P = b
+        var list: Option[&Node] = None
+
+        for i in 0..<10
+            list = Some(Node(i, list))
+
+        b.x + int(b.name.len) + (if w.get().is_some() then 1 else 0) + list.unwrap().v
+
+    aligned() -> int
+        var l: Line
+        l.a = 9
+        val bl: &Line = l
+        val lines: []Line = [l, l, l]
+        var more: Buf[Line] = buf()
+
+        for i in 0..<20
+            more.push(l)
+
+        int(bl.a) + int(lines.len) + int(more.len())
+    end aligned
+
+    adder(k: int, s: string) -> &Fn(int) -> int = (n: int) -> n + k + int(s.len)
+
+    closures() -> int
+        var fs: Buf[&Fn(int) -> int] = buf()
+
+        fs.push(adder(4, "captured"))
+        fs[0](1)
+
+    tasks() -> int = block_on(add(2, 3))
+
+    everything() -> int = bufs() + strings() + boxes() + aligned() + closures() + tasks()
+    """
+
+// What every cell says when every free named what its alloc was asked, and every block was on its
+// boundary.
+private ahs_clean(n: int) -> string = s"$n taken=1 given=1 wrong=0 off=0\n"
+
+// The project under a fresh root, with the program's own `main` calling `call` where `program`.
+private ahs_project(call: string, program: bool) -> string
+    val root = lbr_temp("sysl-ahs")
+    val main_tail = s"\nmain()\n    report(long($call))\n"
+    val export_tail = s"\n@export(\"ahs_run\")\nahs_run() = report(long($call))\n"
+    val tail = if program then main_tail else export_tail
+
+    write_text(s"$root/sysl.hocon", ahs_manifest).unwrap()
+    write_text(s"$root/main.sysl", ahs_work + tail).unwrap()
+    write_text(s"$root/hooks.c", ahs_hooks).unwrap()
+    root
+end ahs_project
+
+// The program built and run: what it printed, or why it did not.
+private ahs_program(call: string) -> string
+    val root = ahs_project(call, true)
+    val out = lbr_temp("sysl-ahs-exe")
+    val said = lbr_cli(["sysl", "build", "-o", s"$out/program", root])
+    val ran = if said.0 != 0 then s"refused: ${said.1}" else ahs_ran(s"$out/program")
+
+    lbr_drop([root, out])
+    ran
+end ahs_program
+
+// What an executable printed, or how it stopped.
+private ahs_ran(exe: string) -> string = capture(exe, [], "", [], true) match
+    Ok(o) -> if o.status.ok() then o.text else s"stopped: ${o.text}${o.err.unwrap_or("")}"
+    Err(_) -> "it could not be run"
+
+// The library built with `build-c` (`shared` or an archive), a C host linked against it and run.
+private ahs_hosted(call: string, shared: bool) -> string
+    val root = ahs_project(call, false)
+    val out = lbr_temp("sysl-ahs-host")
+    val lib = if shared then s"$out/libahs${if host_os() == MacOS then ".dylib" else ".so"}" else s"$out/libahs.a"
+
+    var args: Buf[string] = buf()
+
+    for a in ["sysl", "build-c", root, "-o", lib]
+        args.push(a)
+
+    if shared then args.push("--shared")
+
+    val said = lbr_cli(args.view())
+
+    if said.0 != 0
+        lbr_drop([root, out])
+        return s"refused: ${said.1}"
+    end if
+
+    write_text(s"$out/host.c", "void ahs_run(void);\nint main(void) { ahs_run(); return 0; }\n").unwrap()
+
+    var cc: Buf[string] = buf()
+
+    for a in [s"$out/host.c", lib, "-o", s"$out/host", "-lm", "-pthread"]
+        cc.push(a)
+
+    if shared then cc.push(s"-Wl,-rpath,$out")
+
+    val built = capture("clang", cc.view(), "", [], true) match
+        Ok(o) -> if o.status.ok() then "" else s"the host failed to build: ${o.text}${o.err.unwrap_or("")}"
+        Err(_) -> "clang could not be run"
+
+    val ran = if built.is_empty() then ahs_ran(s"$out/host") else built
+
+    lbr_drop([root, out])
+    ran
+end ahs_hosted
+
+// -- every free names its alloc, cell by cell --------------------------------------------------------
+
+@test("a growing Buf of ints, strings and bytes gives every block back with its size and boundary")
+ahs_bufs()
+    if !ahs_ready() then return
+
+    assert_eq(ahs_program("bufs()"), ahs_clean(1350))
+
+@test("concatenated and rendered strings give every block back with its size and boundary")
+ahs_strings()
+    if !ahs_ready() then return
+
+    assert_eq(ahs_program("strings()"), ahs_clean(144))
+
+@test("boxes -- weakened, compact, and a chain -- give every block back with its size and boundary")
+ahs_boxes()
+    if !ahs_ready() then return
+
+    assert_eq(ahs_program("boxes()"), ahs_clean(19))
+
+@test("an @align(64) box and buffers of it are taken on 64 and given back with it")
+ahs_aligned()
+    if !ahs_ready() then return
+
+    assert_eq(ahs_program("aligned()"), ahs_clean(32))
+
+@test("a closure's environment gives its block back with its size and boundary")
+ahs_closures()
+    if !ahs_ready() then return
+
+    assert_eq(ahs_program("closures()"), ahs_clean(13))
+
+@test("a task's frame and its yield go back through the default task hooks with their size")
+ahs_tasks()
+    if !ahs_ready() then return
+
+    assert_eq(ahs_program("tasks()"), ahs_clean(5))
+
+// -- every way the program is made -----------------------------------------------------------------
+
+@test("a build-c archive linked into a C host gives every block back with its size and boundary")
+ahs_build_c_archive()
+    if !ahs_ready() then return
+
+    assert_eq(ahs_hosted("everything()", false), ahs_clean(1563))
+
+@test("a --shared library a C host links gives every block back with its size and boundary")
+ahs_build_c_shared()
+    if !ahs_ready() then return
+
+    assert_eq(ahs_hosted("everything()", true), ahs_clean(1563))
+
+@test("a pair written in sysl is called the same way, and every free matches")
+ahs_pair_in_sysl()
+    if !ahs_ready() then return
+
+    val root = lbr_temp("sysl-ahs-own")
+    val hooks = raw"""
+        extern "posix_memalign" c_memalign(out: **u8, align: usize, n: usize) -> int
+        extern "free" c_free(p: *u8)
+
+        var addrs: [4096]usize
+        var sizes: [4096]usize
+        var wrong = 0
+
+        @export("rec_alloc")
+        rec_alloc(size: usize, align: usize) -> *u8
+            var p: *u8 = null
+
+            if c_memalign(&p, if align < 16 then 16 else align, size) != 0 then return null
+
+            for i in 0..<4096
+                if addrs[i] == 0
+                    addrs[i] = usize(p)
+                    sizes[i] = size * 1000 + align
+                    break
+
+            p
+        end rec_alloc
+
+        @export("rec_free")
+        rec_free(p: *u8, size: usize, align: usize)
+            for i in 0..<4096
+                if addrs[i] == usize(p)
+                    if sizes[i] != size * 1000 + align then wrong += 1
+
+                    addrs[i] = 0
+                    break
+
+            c_free(p)
+        end rec_free
+
+        @export("rec_report")
+        rec_report(r: long) = print(r, wrong)
+        """
+
+    write_text(s"$root/sysl.hocon", ahs_manifest).unwrap()
+    write_text(s"$root/main.sysl", ahs_work + "\n" + hooks + "\nmain()\n    report(long(everything()))\n").unwrap()
+
+    val out = lbr_temp("sysl-ahs-exe")
+    val said = lbr_cli(["sysl", "build", "-o", s"$out/program", root])
+
+    assert(said.0 == 0, said.1)
+
+    val ran = ahs_ran(s"$out/program")
+
+    lbr_drop([root, out])
+    assert_eq(ran, "1563 0\n")
+
+@test("a task hook written in the old one-word shape is refused at its definition")
+ahs_old_task_hook_refused()
+    if !ahs_ready() then return
+
+    val root = lbr_temp("sysl-ahs-task")
+
+    write_text(s"$root/sysl.hocon", "package { name = \"t\", version = \"0.0.1\" }\n").unwrap()
+    write_text(s"$root/main.sysl", "extern \"free\" c_free(p: *u8)\n\n" +
+        "@export(\"sysl_task_free\")\ntask_free(p: *u8) = c_free(p)\n\n" +
+        "async inc(n: int) -> int\n    await yield_now()\n    n + 1\n\nmain()\n    print(block_on(inc(1)))\n").unwrap()
+
+    val out = lbr_temp("sysl-ahs-exe")
+    val said = lbr_cli(["sysl", "build", "-o", s"$out/program", root])
+
+    lbr_drop([root, out])
+    assert(said.0 != 0, said.1)
+    assert(said.1.contains("'task_free' is exported as 'sysl_task_free', the task hook giving every frame " +
+        "back, which is called as 'sysl_task_free(p: *u8, size: usize, align: usize)' — told the size and " +
+        "boundary the frame was taken with. This one takes 1 parameter"), said.1)
+
+// -- the counting runtime is a pair told sizes -------------------------------------------------------
+
+// A program built on the counted heap and run: what it printed on each stream, and whether it ended
+// by exiting zero.
+private ahs_counted(text: string) -> (string, string, bool)
+    val root = make_temp_dir("sysl-ahs-count").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    force_alloc_counting(true)
+
+    val made = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(s"$root/built"))
+
+    force_alloc_counting(false)
+
+    val exe = made match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return ("", s"refused: ${failure_text(why)}", false)
+        Ok(x) -> x
+
+    val ran = capture(exe, [], "", [], true) match
+        Ok(o) -> (o.text, o.err.unwrap_or(""), o.status.ok())
+        Err(_) -> ("", "could not be started", false)
+
+    remove_dir_all(root).unwrap_or(())
+    ran
+end ahs_counted
+
+@test("the counted heap stops a program whose free names another size than its alloc")
+ahs_counted_wrong_size_stops()
+    if !enm_ready() then return
+
+    val got = ahs_counted("extern \"sysl_count_alloc\" take(n: usize, a: usize) -> *u8\n" +
+        "extern \"sysl_count_free\" give(p: *u8, n: usize, a: usize)\n\n" +
+        "main()\n    val p = take(24, 8)\n    give(p, 32, 8)\n    print(\"given\")\n")
+
+    assert(!got.2, "it exited zero")
+    assert(got.1.contains("sysl: a block given back as 32 bytes on 8 was taken as 24 bytes on 8"), got.1)
+    assert(!got.0.contains("given"), got.0)
+
+@test("the counted heap stops a program whose free names another boundary than its alloc")
+ahs_counted_wrong_boundary_stops()
+    if !enm_ready() then return
+
+    val got = ahs_counted("extern \"sysl_count_alloc\" take(n: usize, a: usize) -> *u8\n" +
+        "extern \"sysl_count_free\" give(p: *u8, n: usize, a: usize)\n\n" +
+        "main()\n    val p = take(24, 64)\n    give(p, 24, 8)\n    print(\"given\")\n")
+
+    assert(!got.2, "it exited zero")
+    assert(got.1.contains("sysl: a block given back as 24 bytes on 8 was taken as 24 bytes on 64"), got.1)
+
+@test("the counted heap takes an over-aligned block on its boundary and lets a matching free go quietly")
+ahs_counted_aligned_matches()
+    if !enm_ready() then return
+
+    val got = ahs_counted("extern \"sysl_count_alloc\" take(n: usize, a: usize) -> *u8\n" +
+        "extern \"sysl_count_free\" give(p: *u8, n: usize, a: usize)\n\n" +
+        "main()\n    val p = take(100, 4096)\n    print(usize(p) % 4096)\n    give(p, 100, 4096)\n" +
+        "    print(\"given\")\n")
+
+    assert(got.2, got.1)
+    assert_eq(got.0, "0\ngiven\n")
+    assert_eq(got.1, "")
+
+@test("every workload runs clean on the counted heap: nothing leaked, every free matched")
+ahs_counted_workloads()
+    if !enm_ready() then return
+
+    val work = replace_all(ahs_work, "extern \"rec_report\" report(r: long)", "report(r: long) = print(r)")
+    val got = ahs_counted(work + "\nmain()\n    report(long(everything()))\n")
+
+    assert(got.2, got.1)
+    assert_eq(got.0, "1563\n")
+    assert_eq(got.1, "")
+
+// -- libc's pair is called as libc declares it ---------------------------------------------------------
+
+@test("under libc's pair malloc and free are called with no size and no boundary")
+ahs_libc_pair_unchanged()
+    if !enm_ready() then return
+
+    val ir = enm_ir("main()\n    val s = \"abc\" + \"def\"\n    print(s)\n")
+
+    assert(enm_says(ir, "call ptr @malloc(i64 %size)"), ir)
+    assert(enm_says(ir, "store ptr @arc.drop.plain"), ir)
+    assert(!enm_says(ir, "@free(ptr %p, i64"), ir)

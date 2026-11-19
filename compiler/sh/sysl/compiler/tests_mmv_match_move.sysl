@@ -199,15 +199,33 @@ mmv_into_a_local()
     assert(mmv_count(f, mmv_whole_copy()) == 0, f)
 end mmv_into_a_local
 
-@test("a payload moved out of a call's result is never bound: only the tag is read, into a poison value of the enum's type")
-mmv_only_the_tag_into_poison()
+// The tag is the one word read, and the switch reads the register it was loaded into: no value of the
+// enum's type is assembled around it to be taken apart again.
+@test("a payload moved out of a call's result is never bound: only the tag is read, and switched on as loaded")
+mmv_only_the_tag_is_read()
     if !mmv_ready() then return
 
     val f = mmv_body(mmv_ir(mmv_big()), "owned")
 
-    assert(mmv_lines(f, "insertvalue %enum.sysl$Result.Big.int poison, i32") == 1, f)
-    assert(!f.contains("insertvalue %enum.sysl$Result.Big.int undef"), f)
-end mmv_only_the_tag_into_poison
+    assert(!f.contains("insertvalue %enum.sysl$Result.Big.int"), f)
+    assert(!f.contains("extractvalue %enum.sysl$Result.Big.int"), f)
+    assert(!f.contains("load %enum.sysl$Result.Big.int"), f)
+    assert(mmv_switched_as_loaded(f), f)
+end mmv_only_the_tag_is_read
+
+// Whether the first `switch` in a body switches on a register an `i32` load defined.
+private mmv_switched_as_loaded(f: string) -> bool
+    for line in lines_of(f)
+        if line.starts_with("  switch i32 %")
+            val rest = line[13..<line.len]
+
+            return rest.index_of(",") match
+                Some(i) -> f.contains(s"  ${rest[0..<i]} = load i32, ptr ")
+                None -> false
+        end if
+
+    false
+end mmv_switched_as_loaded
 
 @test("a payload moved out of a call's result is never bound: and the program answers what it did")
 mmv_the_program_answers() = mmv_prints(mmv_big(), "255 255 255 1 1\n")

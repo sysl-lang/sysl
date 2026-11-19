@@ -2744,6 +2744,66 @@ print(count())
 is resumed) and a variadic function are refused the same way, and so is an `extern`, whose body is
 compiled elsewhere. It takes no arguments.
 
+## `@frame_limit(n)` — the most stack one call of a function may take
+
+A function marked `@frame_limit(n)` may not have a stack frame larger than `n` bytes, and a build in
+which it does fails, naming the function, its frame and the limit. The frame is laid out by LLVM,
+so the check is made where clang compiles the program — here an archive's (`sysl build-c`):
+
+```sysl build=c
+@frame_limit(2048)
+@export("deep")
+deep(n: usize) -> u8
+    var block: [65536]u8 = [0; 65536]
+    block[n % 65536] = u8(n)
+    block[(n * 7) % 65536]
+```
+
+```error
+'deep' needs a stack frame of
+```
+
+The whole message reads `'deep' needs a stack frame of 65584 bytes, over its limit of 2048 bytes, set
+by '@frame_limit(2048)' above 'deep'` on an AArch64 Mac at the default level, the size being whatever
+the machine and the optimization level lay the frame out at. The frame is what the function's
+prologue reserves — its locals, the registers it saves, what it passes on the stack — and not what
+the functions it calls take: a bound over a whole call chain is a different question, which this
+does not answer.
+
+**The limit is the emitted function's, as clang's is.** A function the optimizer inlines takes its
+frame into its caller and is held to the caller's limit there; a function called once with a
+constant may be folded away entirely, array and all. An `@export`ed function's C entry point is
+held to the function's own limit, since its body is inlined into it.
+
+**It is the one function's answer to a limit set for many.** A package's `frame_limit` key and the
+`--frame-limit` flag hold every function a build compiles ([a function's stack
+frame](/reference/packages/#a-function-s-stack-frame)), and the attribute is nearer than either: a
+kernel holding every function to 2 KiB gives its entry point what that one needs, and
+`@frame_limit(none)` takes the function out of every limit at all:
+
+```sysl
+@frame_limit(none)
+setup() -> int
+    var scratch: [8192]u8 = [0; 8192]
+    scratch[100] = 7
+    int(scratch[100])
+
+print(setup())
+```
+
+```output
+7
+```
+
+**A closure or nested function written inside a marked function takes its mark**, being part of the
+body the mark was written about; one written anywhere else takes the limit of its own package. Every
+instance of a generic function carries the mark its declaration was written with, and so does every
+lowered copy of a method.
+
+The number is a literal from 1 to 4294967295, which is the most LLVM's attribute holds; `none` is the
+one word it takes. A limit is a fact about the code LLVM lays out, so it marks a function or a
+method, and an `extern` — whose frame is laid out by whoever compiled it — is refused it.
+
 ## `@renamed` and `@removed` — a name that is gone, and what became of it
 
 A module that renames or removes a declaration leaves a **tombstone** where it was, so a program
@@ -3687,6 +3747,160 @@ twice(x: f32) -> f32 = x + x
 '@strict_fp' keeps every floating-point operation exactly where and how it is written, and '@reassociate' lets the back end regroup them
 ```
 
+## `@extensions` — a body compiled for instructions the build does not promise
+
+A build uses what its machine guarantees: a row's architecture, plus whatever
+[`codegen.extensions`](/reference/packages/#a-processors-extensions) and `--cpu` add for the whole
+image. A CRC, an AES round or a dot product often has an instruction only some processors of that
+architecture have, and a library that wants it cannot make the whole program require it.
+`@extensions` compiles **one function** for them, as Rust's `#[target_feature(enable = "…")]` and
+clang's `__attribute__((target("…")))` do:
+
+```sysl
+#if aarch64
+extern "llvm.aarch64.crc32cx" crc_word(crc: u32, word: u64) -> u32
+
+@extensions("crc")
+crc_words(words: []u64) -> u32
+    var crc: u32 = 0xffffffff
+    for w in words
+        crc = crc_word(crc, w)
+    crc ^ 0xffffffff
+#endif
+
+print("compiled")
+```
+
+```output
+compiled
+```
+
+Each name is the extension as LLVM names the feature, the names `codegen.extensions` takes — `crc`,
+`aes`, `sha3`, `dotprod`, `lse` on AArch64, `sse4.2`, `avx2`, `bmi2` on x86-64 — and each is asked of
+the clang that will build the program, which would only warn about a name it does not know:
+
+```sysl target=aarch64-freestanding
+@extensions("crcc")
+step(x: u32) -> u32 = x
+
+@export("main")
+start() -> i32 = i32(step(1))
+```
+
+```error
+'@extensions' names 'crcc', which the aarch64 back end does not know — an extension is spelled as LLVM spells the feature
+```
+
+The body's `define` line carries LLVM's `"target-features"`: the processor's own list, the build's,
+then the function's. So the back end may select the extension's instructions there, an intrinsic it
+calls is one the back end can select, and an [`asm`](/reference/inline-assembly/) block in it may
+name them — the assembler refuses `aese` in a body that does not say `aes`. **A closure or a nested
+function written inside is compiled the same way**: it can only be reached by running the body that
+made it.
+
+### A call is the promise, so a call is what is checked
+
+On a processor without the extension, the body's first such instruction faults. So a call is
+accepted only where the code making it is known to run on a processor that has every extension the
+callee names:
+
+- **code compiled for them itself** — a function marked with them, or written inside one;
+- **code the build promises them to everywhere** — `codegen.extensions`, `--cpu`, or the row's own
+  processor (`aarch64-macos` is built for the M1, which has `crc`, `aes`, `sha3` and `dotprod`);
+- **code inside an `@unchecked("…")` block naming them**, which is the program's word that it has
+  asked the processor first.
+
+Anywhere else the call is refused, naming both ways to make it:
+
+```sysl target=aarch64-freestanding
+@extensions("crc")
+step(x: u32) -> u32 = x
+
+@export("main")
+start() -> i32 = i32(step(1))
+```
+
+```error
+'step' is called, and it is compiled for the processor's 'crc' extension, which 'aarch64-freestanding' does not promise and the code here is not compiled for — on a processor without it its first such instruction faults. Mark the caller '@extensions("crc")', or make the call inside '@unchecked("crc")' once the program has asked the processor
+```
+
+That is Rust's rule — a `#[target_feature]` function is an `unsafe` call from a function without the
+features — said in the word sysl's unchecked tier already uses. **The block checks nothing while the
+program runs**: how a program asks its processor is the system's (`sysctlbyname` on macOS,
+`getauxval(AT_HWCAP)` on Linux, `cpuid` on x86), and the answer goes in an ordinary `if` around the
+block. It relaxes nothing else either — a subscript inside it is bounds-checked as anywhere:
+
+```sysl
+#if aarch64
+@extensions("crc")
+twice(x: u32) -> u32 = x * 2
+
+val asked = true
+
+if asked
+    @unchecked("crc")
+        print(twice(21))
+#else
+print(42)
+#endif
+```
+
+```output
+42
+```
+
+The block is lexical, as `@unchecked`'s is: a closure written inside is inside it, and a call after
+its last line is not. A block naming `aes` does not cover a callee that needs `sha3` as well, and the
+refusal names only what is missing. **Taking the function's address is held to the same rule**,
+since a call through the address names no callee; and a marked method may not fill a trait's table,
+for the same reason.
+
+**The CRC-32C `extern`s are such functions.** `llvm.aarch64.crc32cx` and SSE 4.2's `crc32` are
+compiled for `crc` and `sse4.2` ([ffi](/reference/ffi/#a-link-name-in-the-llvm-namespace-names-an-instruction)),
+so a declaration is accepted on its own processor and each call is held to this rule.
+
+### Inlining follows the features
+
+LLVM puts a body inside a caller only where the caller's features hold the body's, as clang's and
+rustc's do. A marked body is absorbed by a caller marked the same and stays a call from any other, and
+an ordinary helper is absorbed by a marked body as by any other — its list starts with the
+processor's, so it holds everything an ordinary function's does. `@inline` is the hint it always was;
+`@inline(always)` is refused beside `@extensions`, being a promise the back end would break at every
+call from code without them:
+
+```sysl
+@inline(always)
+@extensions("crc")
+step(x: u32) -> u32 = x
+```
+
+```error
+'@inline(always)' puts the body in place of every call, and a body compiled for a processor's extensions is only ever put inside a caller that has them too
+```
+
+### Where it applies
+
+`@extensions` is accepted on aarch64 and x86_64, where a function's list is added to its processor's.
+On Thumb the build's list carries the unit `-mfpu` named, and on RISC-V the extensions its triple
+names, and LLVM *replaces* a build's list with a function's — so there the manifest says it, for the
+whole image:
+
+```sysl target=thumb-freestanding
+@extensions("dsp")
+step(x: u32) -> u32 = x
+
+@export("main")
+start() -> i32 = i32(step(1))
+```
+
+```error
+'@extensions' is accepted on aarch64 and x86_64, where a function's extensions add to its processor's, and this build is for 'thumb-freestanding'
+```
+
+It marks a function or a method, whose body is sysl; an `extern`'s instructions are its compiler's.
+A name is written alone, as `codegen.extensions` writes it: `"+crc"`, `"crc,aes"` and an empty list
+are refused.
+
 ## `@no_fuse` — multiplies and adds rounded apart
 
 **A float multiply feeding an add in the same expression is one fused multiply-add** wherever the
@@ -3829,8 +4043,11 @@ print(squares)
 ```
 
 The block is lexical: a closure or a nested function written inside it is inside it, and one called
-from inside but written elsewhere is not. It takes no argument, and it does not mark a function, a
-member or a single statement on the same line:
+from inside but written elsewhere is not. Bare, it takes no argument — with the names of processor
+extensions in parentheses, `@unchecked("crc")`, it is the other block, which lets a call of a
+function [compiled for them](#extensions-a-body-compiled-for-instructions-the-build-does-not-promise)
+be made and leaves every subscript checked. It does not mark a function, a member or a single
+statement on the same line:
 
 ```sysl
 @unchecked
@@ -4944,10 +5161,10 @@ The boundary travels with every value of the type the compiler lays down: a modu
 a `static`, a local, an element of an array, a field of another struct — which begins on the
 boundary and raises its holder's to match — and the payload of an enum variant carrying one.
 **A value on the heap keeps it too.** A box (`&T`), a buffer or a task's frame takes its storage
-from the allocating pair, which promises only what `malloc` does — two words, sixteen bytes on a
-64-bit machine and eight on a 32-bit one — so storage of a type aligned beyond that comes from the
-aligned pair, `sysl_alloc_aligned(size, align)` and `sysl_free_aligned(p)`, and the payload is laid
-after the box's header on the boundary:
+on the type's boundary, and the payload is laid after the box's header on it. A heap the manifest
+names is handed the boundary with every block; under libc's pair, whose `malloc` promises only two
+words — sixteen bytes on a 64-bit machine and eight on a 32-bit one — storage of a type aligned
+beyond that comes from the C library's aligned allocation:
 
 ```sysl
 @align(4096)
@@ -4967,9 +5184,9 @@ print(usize(&*b) % 4096, b.e[3])
 ```
 
 Every access through an address of the type claims its whole boundary. With libc's `malloc` and
-`free` on a POSIX system, WASI or Windows the aligned pair needs nothing from the program; anywhere
-else the program answers it,
-as [`packages.md` § A type aligned beyond what the pair promises](/reference/packages/#a-type-aligned-beyond-what-the-pair-promises)
+`free` on a POSIX system, WASI or Windows this needs nothing from the program; on a machine with no
+C library the program names a heap of its own,
+as [`packages.md` § A type aligned beyond what `malloc` promises](/reference/packages/#a-type-aligned-beyond-what-malloc-promises)
 says.
 
 **The bound is folded rather than lexed**, so a program writes the name it already has for the number,
@@ -6343,7 +6560,8 @@ pointer (`codegen { thread_pointer = "tpidr_el0" }`). It is false on a board and
 no such setting. It is the one symbol the target alone does not settle, because the register is the
 program's to name; the compiler reads it before the first condition, a dependency's `if` included.
 
-**`crc32c` is true exactly where an `extern` naming a CRC-32C instruction is accepted**
+**`crc32c` is true exactly where the build promises the CRC-32C instructions everywhere**, so a call
+of an `extern` naming one needs neither an `@extensions` caller nor an `@unchecked("crc")` block
 ([ffi](/reference/ffi/)). The instructions are optional on both machines that have them: AArch64
 makes them mandatory only from Armv8.1, and SSE 4.2 is past the x86-64 baseline the x86 rows ask for.
 So the symbol is true on `aarch64-macos`, whose every processor has them, and elsewhere only where the

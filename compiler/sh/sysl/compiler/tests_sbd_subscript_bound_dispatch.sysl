@@ -1,0 +1,253 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **A subscript in a generic body calls the member its bound names.** `[T: Index[usize, int]]` reads
+// `t[i]` as `t.index(i)`, and an instantiation at a type that ALSO implements `IndexPlace` must still
+// call `index` rather than trade it for the richer `index_place` the type happens to have. The
+// fixture's two implementations disagree on purpose -- `index` answers `100 + i`, `index_place` the
+// field `i` names -- so every output below says which one ran.
+//
+// The decision is the source's: a receiver the program wrote as a concrete type in the same body keeps
+// the subscript a non-generic body gives it, and so does every non-generic call site.
+
+// What a program said, and whether it exited zero -- a refusal is the build's failure text.
+private sbd_outcome(text: string) -> (string, bool)
+    val root = make_temp_dir("sysl-subscript-bound").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", sbd_two() + text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), false)
+        Ok(_) -> ()
+
+    val said = capture("/bin/sh", ["-c", s"'$exe' < /dev/null"], "", [], true, 60000)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", false)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), out.status.ok())
+end sbd_outcome
+
+private sbd_can_run() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end sbd_can_run
+
+private sbd_ran(text: string) -> string
+    val out = sbd_outcome(text)
+
+    if !out.1 then return s"it did not exit zero: ${out.0}"
+
+    out.0
+
+private sbd_refused(text: string, part: string)
+    val out = sbd_outcome(text)
+
+    assert(!out.1, s"it built and ran: ${out.0}")
+    assert(out.0.contains(part), out.0)
+
+// A type with all three indexing traits, each answering differently: `index` is `100 + i`,
+// `index_place` the field `i` names, and `index_set` adds into `sets` and touches no field.
+private sbd_two() -> string = raw"""
+    struct Two
+        a: int
+        b: int
+        sets: int
+
+    impl Index[usize, int] for Two
+        index(self, i: usize) -> int = 100 + int(i)
+
+    impl IndexSet[usize, int] for Two
+        index_set(*self, i: usize, v: int)
+            self.sets = self.sets + v
+
+    impl IndexPlace[usize, int] for Two
+        index_place(*self, i: usize) -> *int = if i == 0 then &self.a else &self.b
+
+    trait Reader: Index[usize, int]
+        first(self) -> int = self[1]
+
+    impl Reader for Two
+
+    """
+
+// -- the regression ------------------------------------------------------------------------------
+
+@test("an Index bound reads through index at a type that also implements IndexPlace")
+sbd_index_bound_reads_index()
+    if !sbd_can_run() then return
+
+    assert_eq(sbd_ran(raw"""
+        read[T: Index[usize, int]](t: T) -> int = t[1]
+
+        print(read(Two(1, 2, 0)))
+        """), "101\n")
+
+@test("and a non-generic subscript on the same type still reads in place")
+sbd_plain_subscript_reads_in_place()
+    if !sbd_can_run() then return
+
+    assert_eq(sbd_ran(raw"""
+        read[T: Index[usize, int]](t: T) -> int = t[1]
+
+        var two = Two(1, 2, 0)
+        print(read(two), two[1])
+        two[0] = 9
+        print(two.a, two.sets)
+        """), "101 2\n9 0\n")
+
+// -- what else a bound's receiver can be ---------------------------------------------------------
+
+@test("a local the body declared at the parameter reads through the bound")
+sbd_local_at_the_parameter()
+    if !sbd_can_run() then return
+
+    assert_eq(sbd_ran(raw"""
+        read[T: Index[usize, int]](t: T) -> int
+            val u: T = t
+            u[1]
+
+        print(read(Two(1, 2, 0)))
+        """), "101\n")
+
+@test("a bound reached through a pointer or a reference reads through the bound")
+sbd_through_a_pointer_or_a_reference()
+    if !sbd_can_run() then return
+
+    assert_eq(sbd_ran(raw"""
+        struct Held
+            a: int
+            b: int
+
+        impl Index[usize, int] for Held
+            index(self, i: usize) -> int = 200 + int(i)
+
+        impl IndexPlace[usize, int] for Held
+            index_place(*self, i: usize) -> *int = if i == 0 then &self.a else &self.b
+
+        impl Drop for Held
+            drop(self) = ()
+
+        by_ptr[T: Index[usize, int]](t: *T) -> int = t[1]
+        by_ref[T: Index[usize, int]](t: &T) -> int = t[1]
+
+        var two = Two(1, 2, 0)
+        val held: &Held = Held(1, 2)
+        print(by_ptr(&two), by_ref(held), held[1])
+        """), "101 201 2\n")
+
+@test("a field a generic struct holds at its parameter reads through the bound")
+sbd_field_at_the_parameter()
+    if !sbd_can_run() then return
+
+    assert_eq(sbd_ran(raw"""
+        struct Wrap[T: Index[usize, int]]
+            inner: T
+
+            get(self) -> int = self.inner[1]
+
+        print(Wrap(Two(1, 2, 0)).get())
+        """), "101\n")
+
+@test("a bound of several traits reads through the one that indexes")
+sbd_several_traits()
+    if !sbd_can_run() then return
+
+    assert_eq(sbd_ran(raw"""
+        read[T: Index[usize, int] + IndexSet[usize, int]](t: T) -> int = t[1]
+
+        print(read(Two(1, 2, 0)))
+        """), "101\n")
+
+@test("a bound reaching Index through a supertrait reads through index")
+sbd_through_a_supertrait()
+    if !sbd_can_run() then return
+
+    assert_eq(sbd_ran(raw"""
+        read[T: Reader](t: T) -> int = t[1]
+
+        print(read(Two(1, 2, 0)))
+        """), "101\n")
+
+@test("a trait default reads self through what the trait requires")
+sbd_trait_default()
+    if !sbd_can_run() then return
+
+    assert_eq(sbd_ran(raw"""
+        through[T: Reader](t: T) -> int = t.first()
+
+        print(Two(1, 2, 0).first(), through(Two(1, 2, 0)))
+        """), "101 101\n")
+
+@test("a receiver the body wrote at a concrete type keeps the non-generic subscript")
+sbd_concrete_receiver_in_a_generic_body()
+    if !sbd_can_run() then return
+
+    assert_eq(sbd_ran(raw"""
+        read[T: Index[usize, int]](t: T, c: *Two) -> int = t[1] * 1000 + c[1]
+
+        var two = Two(1, 2, 0)
+        print(read(two, &two))
+        """), "101002\n")
+
+// -- the reverse, and writes ---------------------------------------------------------------------
+
+@test("an IndexPlace bound still reads in place at a type that also implements Index")
+sbd_place_bound_reads_in_place()
+    if !sbd_can_run() then return
+
+    assert_eq(sbd_ran(raw"""
+        read[T: IndexPlace[usize, int]](t: *T) -> int = t[1]
+
+        var two = Two(1, 2, 0)
+        print(read(&two))
+        """), "2\n")
+
+@test("an IndexSet bound writes through index_set, an IndexPlace bound through the place")
+sbd_writes_follow_the_bound()
+    if !sbd_can_run() then return
+
+    assert_eq(sbd_ran(raw"""
+        by_set[T: IndexSet[usize, int]](t: *T)
+            t[1] = 7
+
+        by_place[T: IndexPlace[usize, int]](t: *T)
+            t[1] = 5
+
+        var two = Two(1, 2, 0)
+        by_set(&two)
+        print(two.b, two.sets)
+        by_place(&two)
+        print(two.b, two.sets)
+        """), "2 7\n5 7\n")
+
+// An `Index` bound licenses a read: the instantiation at `Two` does not write through the place the
+// bound never promised, and is refused there as at a type with `Index` alone.
+@test("an Index bound alone licenses no write through the subscript")
+sbd_index_bound_does_not_write()
+    if !sbd_can_run() then return
+
+    sbd_refused(raw"""
+        poke[T: Index[usize, int]](t: *T)
+            t[1] = 7
+
+        var two = Two(1, 2, 0)
+        poke(&two)
+        print(two.b)
+        """, "assignment needs a variable, a field, an element, or a dereference")

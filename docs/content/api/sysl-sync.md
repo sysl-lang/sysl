@@ -4,7 +4,7 @@ layout: api-module
 headingShift: 0
 slugStyle: github
 module: sysl.sync
-summary: "What two threads may touch at once: `Atomic[T]`, `SpinLock`, and the five memory orderings."
+summary: "What two threads may touch at once: `Atomic[T]`, `SpinLock`, `SeqLock[T]`, and the five memory orderings."
 requires: "no alloc"
 ---
 
@@ -20,9 +20,41 @@ them exactly as much as a hosted one that shares it with a thread.
 
 ## Index
 
-[`spin_hint`](#spin_hint) [`Atomic`](#atomic) [`Guarded`](#guarded) [`IrqLock`](#irqlock) [`Ordering`](#ordering) [`SpinLock`](#spinlock) [`Lock`](#lock) [Lock for IrqLock](#lock-for-irqlock) [Lock for SpinLock](#lock-for-spinlock)
+[`load_relaxed`](#load_relaxed) [`spin_hint`](#spin_hint) [`store_relaxed`](#store_relaxed) [`Atomic`](#atomic) [`Guarded`](#guarded) [`IrqLock`](#irqlock) [`Ordering`](#ordering) [`SeqLock`](#seqlock) [`SpinLock`](#spinlock) [`Lock`](#lock) [Lock for IrqLock](#lock-for-irqlock) [Lock for SpinLock](#lock-for-spinlock)
 
 ## Functions
+
+### `load_relaxed`
+
+```sysl
+load_relaxed[T: Plain](src: *T) -> T
+```
+
+Reads the value at `src` a word at a time, each word one relaxed atomic load, and answers it.
+
+**This is the read another thread may be writing over while it runs**, and it is not a data race:
+every word is an atomic access, so the memory model gives each one some value a write stored
+there, and a plain copy of the same bytes would be undefined behaviour instead. What it does not
+give is a value **all of one write** -- two words may come from two different writes, which is a
+torn value. Something has to say whether that happened, and that is what a sequence number is for:
+`SeqLock[T]` is this read with the check around it, and the reason the read exists.
+
+**`T` is plain data** (`sysl.encoding.Plain`): integers, floats, fixed-point numbers, `bool`s,
+simple enums, and arrays and structs of them. Every byte of a torn value then still came from some
+value of its field, so holding one is harmless until it is thrown away. A counted reference, a
+string or a view is refused at the line that names the type: a copy of its bytes would be a second
+owner nobody counted. The answer is built in a local that starts at `T`'s zero value, so a `T`
+with none -- a simple enum none of whose variants is `= 0` -- is refused as well.
+
+**A word is as wide as the type's alignment allows**, up to the machine's pointer: a struct of
+`u64`s is copied in 64-bit loads on a 64-bit machine and in 32-bit ones on a 32-bit one, and a
+struct of bytes a byte at a time. The width is chosen while compiling, so the copy is a straight
+run of loads.
+
+No ordering is offered, because none would be right: an acquire on every word orders the words
+against each other, which the caller cannot use, and costs a barrier per word on a weak machine.
+The ordering a copy needs is around it -- an `atomic_fence(Acquire)` after it, or a release fence
+before `store_relaxed` -- and `SeqLock` places both.
 
 ### `spin_hint`
 
@@ -46,6 +78,19 @@ word it is waiting on; AArch64's `wfe`, which does sleep until the exclusive mon
 change, needs that load to be a load-exclusive, which is a kernel's own loop to write. A wasm
 module has no such instruction, and there it is nothing at all.
 
+### `store_relaxed`
+
+```sysl
+store_relaxed[T: Plain](dst: *T, v: T)
+```
+
+Writes `v` to `dst` a word at a time, each word one relaxed atomic store.
+
+The other half of `load_relaxed`, with the same words, the same bound on `T`, and the same reason
+for being: a reader on another thread may be copying `dst` while this runs, and with every word an
+atomic store neither side races. A reader may see some words of `v` and some of what was there,
+which is the torn value a sequence number exists to catch.
+
 ## Types
 
 ### `Atomic`
@@ -63,11 +108,12 @@ ordinary struct with a field and methods that take the address of it, which is t
 "built on `*T`" means, and it is why the type a program reaches for lives here in the library
 where a reader can see what it is made of rather than inside the compiler where they cannot.
 
-**`T` is an integer of 8, 16, 32 or 64 bits, or a pointer** -- what the machine has an instruction
+**`T` is an integer of 8, 16, 32 or 64 bits, a `bool`, or a pointer** -- what the machine has an instruction
 for. Nothing here declares a bound saying so, because there is no trait that means "a width a
 processor can touch indivisibly": sysl's integers are an open family, so `u12` is a type a program
-may name and no `impl` list could have covered. What refuses `Atomic[u12]` is the form inside,
-where the instruction would have had to be chosen, and it names the widths in its message. The
+may name and no `impl` list could have covered. What refuses `Atomic[u12]` is the instantiation, at
+the line that names it, and it names the widths in its message. A `bool` is held as the byte it is
+stored in and takes the bitwise members but not `add` or `sub`. The
 arithmetic members are refused on a pointer for the same kind of reason and in the same place.
 
 **Reading `a.v` directly is an ordinary non-atomic read.** The field is not hidden, because a
@@ -191,6 +237,53 @@ becomes a keyword in the instruction rather than a value the instruction reads. 
 |---|---|---|
 | `orders_a_load` | `orders_a_load(self) -> bool` | Whether a **load** can be ordered this way. |
 | `orders_a_store` | `orders_a_store(self) -> bool` | Whether a **store** can be ordered this way. |
+
+### `SeqLock`
+
+```sysl
+struct SeqLock[T: Plain]
+    private seq: usize
+    private value: T
+```
+
+A value many threads read and a few write, where a reader never waits for another reader and
+never makes a writer wait.
+
+**The value sits beside a sequence number.** A writer makes the number odd, writes the value, and
+makes it even again; a reader notes the number, copies the value, and looks at the number again. If
+it was odd, or has moved, a writer was in the middle and the copy may be torn, so the reader copies
+again. A copy the number did not move across is all of one write. Readers write nothing, so a
+hundred of them on a hundred cores never contend for the line the way a lock's readers do; what
+they pay is a retry when a write lands under them. That makes it the shape for a value read far
+more often than it is written -- a clock's calibration, a sensor's latest sample, a game's frame
+state -- and the wrong one for a value written constantly, where readers starve.
+
+**The copies are word-wise relaxed atomics** (`load_relaxed`, `store_relaxed`), so a reader copying
+while a writer writes is not a data race, only a torn copy the recheck throws away. The fences are
+the C++ model's:
+
+- **reading**: an acquire load of the number, the relaxed copy, an acquire fence, a relaxed load of
+  the number. A copy that saw any word of a write synchronises, through the writer's release fence
+  and this acquire fence, with that write's first step, so the recheck sees the number it moved to.
+- **writing**: the number incremented to odd, a release fence, the relaxed copy, a release store of
+  the number incremented to even. A reader whose first load sees that even number sees every word
+  before it.
+
+**Writers exclude each other**: making the number odd is a compare-and-swap from an even value, and
+a writer that finds it odd spins (`spin_hint`) until the writer before it has finished. So it is
+safe with any number of writers, and fast with one.
+
+**`T` is plain data** (`sysl.encoding.Plain`), for `load_relaxed`'s reason: a reader holds a torn
+copy before it knows to throw it away, and a copy of a counted reference's bytes would be an owner
+nobody counted. A struct holding a `&T`, a `string` or a slice is refused where it names the type.
+
+| Member | Signature | Description |
+|---|---|---|
+| `new` | `const new(value: T) -> SeqLock[T]` | A lock holding `value`, with no write under way. |
+| `read` | `read(*self) -> T` | A copy of the value that is all of one write, trying again for as long as writes land under it. |
+| `try_read` | `try_read(*self) -> Option[T]` | A copy of the value that is all of one write, or `None` where a write was under way. |
+| `write` | `write(*self, v: T)` | Replaces the value, waiting for a write already under way to finish first. |
+| `writes` | `writes(*self) -> usize` | How many writes have finished, which is half the sequence number. |
 
 ### `SpinLock`
 

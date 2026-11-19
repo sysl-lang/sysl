@@ -185,7 +185,7 @@ private call_read(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
                 if form == "from_raw" then return from_raw_call(cx, span, args, targ.map(t -> Ref(t, false)))
 
                 // `slot_storage[T](n)` names the ELEMENT; the position the form fills is a view.
-                if written == "slot_storage" then
+                if storage_form(written) then
                     return slot_call(cx, span, written, args, targ.map(t -> Slice(t, false)))
 
                 return cx.err(span, s"'$written' takes no type arguments")
@@ -922,6 +922,7 @@ private special_form(cx: &Analyzer, span: Span, written: string, args: Buf[Expr]
     if name == SubscriptIndex then return Some(subscript_index_form(cx, span, args, expected))
     if name == UncheckedBlock then return Some(unchecked_block_form(cx, span, args, expected))
     if name == ReassociateBlock then return Some(reassociate_block_form(cx, span, args, expected))
+    if name == ExtensionsBlock then return Some(extensions_block_form(cx, span, args, expected))
 
     if form == "str_cast" then return Some(str_cast_call(cx, span, args))
     if form == "str_alias" then return Some(str_alias_call(cx, span, args))
@@ -1207,7 +1208,7 @@ private special_form_name(cx: &Analyzer, name: string) -> bool =
     special_form_word(name) || atomic_form(cx, name) || task_form(cx, name) || slot_form(cx, name) ||
     null_test_form(cx, name) || release_form(cx, name) || sysreg_form(cx, name) ||
     embed_form(cx, name) || debug_form(cx, name) || name == DebugPart || name == SubscriptIndex ||
-    name == UncheckedBlock || name == ReassociateBlock
+    name == UncheckedBlock || name == ReassociateBlock || name == ExtensionsBlock
 
 // The words the compiler answers itself, the atomics aside: a form belongs to no module, so an import
 // naming one is told so rather than that the module lacks it.
@@ -2538,8 +2539,10 @@ private into_subtype(cx: &Analyzer, span: Span, target: Type, written: string,
             // widened to the base first would never reach the type's own `From` for it. So is an
             // integer literal where the type has its own `From[int]`: read at a float base it would be
             // that float, and wrapped rather than handed to the `from` the type wrote for it -- and
-            // arithmetic over integer literals is that literal (`Phase(1 + 2)` is `Phase(3)`).
-            val own_int = d.derived && literal_arith_default(args[0]).unwrap_or(Unknown) == int_type() &&
+            // arithmetic over integer literals is that literal (`Phase(1 + 2)` is `Phase(3)`), and so
+            // is an untyped constant (`Phase(K)`, `literal_shape`).
+            val own_int = d.derived &&
+                          literal_arith_default(literal_shape(cx, args[0])).unwrap_or(Unknown) == int_type() &&
                           from_conversion(cx, int_type(), target).is_some()
 
             // A conversion's value is not used at the type it is converted to, so a literal binding
@@ -3414,7 +3417,7 @@ private narrowed(cx: &Analyzer, fitting: Buf[string], fitted: Buf[Buf[Type]],
         declared.push(d.params.len())
         generic.push(!d.tparams.is_empty())
 
-    keys_at(fitting, narrowed_at(declared, generic, fitted, args, natural_types(cx, args)))
+    keys_at(fitting, narrowed_at(cx, declared, generic, fitted, args, natural_types(cx, args)))
 end narrowed
 
 // The tie-breaks over candidates described rather than named, answering the indices that survive:
@@ -3426,8 +3429,17 @@ end narrowed
 // Between exactness and the written-out step sits **a bare integer literal's preference for the
 // signed widening** (`signed_literal_preference`): where nothing is exact, `f(3)` over `f(x: long)`
 // and `f(x: u64)` means the `long` one.
-narrowed_at(declared: Buf[usize], generic: Buf[bool], fitted: Buf[Buf[Type]], args: Buf[Expr],
-            natural: Buf[Option[Type]]) -> Buf[usize]
+//
+// **An untyped constant is the literal it stands for at every step** (`literal_shape`): the steps
+// below read the arguments' shapes, never their values, and they read `K` as `3120` and `K * 2` as
+// `3120 * 2` where `const K = 3120`.
+narrowed_at(cx: &Analyzer, declared: Buf[usize], generic: Buf[bool], fitted: Buf[Buf[Type]],
+            written_args: Buf[Expr], natural: Buf[Option[Type]]) -> Buf[usize]
+    var args: Buf[Expr] = buf()
+
+    for e in written_args
+        args.push(literal_shape(cx, e))
+
     var written: Buf[usize] = buf()
 
     for i in 0..<declared.len()
@@ -3724,6 +3736,29 @@ literal_arith_default(e: Expr) -> Option[Type]
             else None
         _ -> None
 end literal_arith_default
+
+// **An untyped constant is the literal it stands for wherever an overload or an implementation is
+// chosen** (`untyped_const_read`, `reference/declarations.md § Constants`): at `const K = 3120`,
+// `g(K)` over `g(v: u32)` and `g(v: u64)` is as ambiguous as `g(3120)`, and `K * 2` is arithmetic
+// over literals as `3120 * 2` is. The expression with every such name in it -- alone, negated, or
+// an operand of arithmetic -- put as a bare literal of its kind, an integer or a float. Only the
+// SHAPE is meant to be read: the value stays the name's, so whatever reads the argument at a type
+// reads what was written. A constant declared with a type is a value of that type, and stays.
+literal_shape(cx: &Analyzer, e: Expr) -> Expr
+    if untyped_const_read(cx, e)
+        val t = untyped_const_type(cx, e)
+
+        if type_eq(t, int_type()) then return expr(e.span, IntLit("0", 10, ""))
+        if type_eq(t, real_type()) then return expr(e.span, FloatLit("0.0", ""))
+
+        return e
+    end if
+
+    *e.kind match
+        Unary(op, operand) -> expr(e.span, Unary(op, literal_shape(cx, operand)))
+        Binary(op, l, r) -> expr(e.span, Binary(op, literal_shape(cx, l), literal_shape(cx, r)))
+        _ -> e
+end literal_shape
 
 // An operator whose result over two numbers is a number of their type.
 private literal_arith_op(op: string) -> bool =

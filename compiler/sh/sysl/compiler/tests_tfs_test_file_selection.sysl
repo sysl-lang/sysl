@@ -1,0 +1,393 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, remove_dir_all, write_text}
+import sysl.text.{cstring, join, split, Search}
+
+// `sysl test --file <name>` builds the `@tests` files it names and what they need, and no other
+// (`test_selection.sysl`). Two halves: the selection itself over parsed files -- what keeps a file,
+// what does not -- and the command line over real projects, held to reporting exactly what the
+// whole build reports, to keeping its binary under a key of its own, and to being turned off.
+
+private extern "setenv" tfs_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" tfs_c_unsetenv(name: *u8) -> int
+
+private tfs_setenv(name: string, value: string)
+    val n = cstring(name)
+    val v = cstring(value)
+
+    tfs_c_setenv(n.ptr, v.ptr, 1)
+end tfs_setenv
+
+private tfs_unsetenv(name: string)
+    val n = cstring(name)
+
+    tfs_c_unsetenv(n.ptr)
+end tfs_unsetenv
+
+// -- the selection, over parsed files ---------------------------------------------------------------
+
+private tfs_unit(name: string, text: string) -> Program = parse(source(s"/p/$name", text.bytes)).program
+
+// The files a narrowing kept, by name, and how many tests it listed for the files it left out.
+private tfs_kept(units: Buf[Program], within: []const string) -> string
+    var names: Buf[string] = buf()
+
+    for w in within
+        names.push(w)
+
+    val got = narrowed_test_units(units, names)
+    var kept: Buf[string] = buf()
+
+    for u in got.units
+        kept.push(basename(u.src.name))
+
+    s"${join(kept.view(), " ")} | dropped ${got.dropped_files} files, ${got.dropped_tests.len()} tests"
+end tfs_kept
+
+private tfs_units(files: []const (string, string)) -> Buf[Program]
+    var out: Buf[Program] = buf()
+
+    for f in files
+        out.push(tfs_unit(f.0, f.1))
+
+    out
+end tfs_units
+
+@test("a --file run keeps the file it names and every file that is not @tests, and counts the rest")
+tfs_named_and_program_files()
+    val units = tfs_units([("lib.sysl", "twice(x: int) -> int = x * 2\n"),
+                           ("tests_a.sysl", "@tests\n\n@test\nta()\n    assert_eq(twice(2), 4)\n"),
+                           ("tests_b.sysl", "@tests\n\n@test\ntb()\n    assert_eq(1, 1)\n\n@test\ntb2()\n    assert_eq(2, 2)\n"),
+                           ("tests_c.sysl", "@tests\n\n@test\ntc()\n    assert_eq(3, 3)\n")])
+
+    assert_eq(tfs_kept(units, ["tests_a"]), "lib.sysl tests_a.sysl | dropped 2 files, 3 tests")
+    assert_eq(tfs_kept(units, ["tests_a", "tests_c.sysl"]), "lib.sysl tests_a.sysl tests_c.sysl | dropped 1 files, 2 tests")
+    // No name, and a name that is no file: nothing is narrowed by the first, everything by the second.
+    assert_eq(narrowed_test_units(units, buf()).units.len(), 4)
+    assert_eq(tfs_kept(units, ["tests_z"]), "lib.sysl | dropped 3 files, 4 tests")
+end tfs_named_and_program_files
+
+@test("a file declaring a name a kept @tests file spells is kept, and what that file spells in turn")
+tfs_transitive_names()
+    val units = tfs_units([("tests_a.sysl", "@tests\n\n@test\nta()\n    assert_eq(helper_b(), 7)\n"),
+                           ("tests_b.sysl", "@tests\n\nhelper_b() -> int = Seven(7).n\n"),
+                           ("tests_c.sysl", "@tests\n\nstruct Seven\n    n: int\n"),
+                           ("tests_d.sysl", "@tests\n\nunrelated() -> int = 1\n")])
+
+    assert_eq(tfs_kept(units, ["tests_a"]), "tests_a.sysl tests_b.sysl tests_c.sysl | dropped 1 files, 0 tests")
+end tfs_transitive_names
+
+@test("every file declaring one of a name's overloads is kept, so a call resolves among all of them")
+tfs_overloads_stay_whole()
+    val units = tfs_units([("tests_a.sysl", "@tests\n\n@test\nta()\n    assert_eq(pair(1), 2)\n"),
+                           ("tests_b.sysl", "@tests\n\npair(x: int) -> int = x * 2\n"),
+                           ("tests_c.sysl", "@tests\n\npair(x: i64) -> i64 = x * 3\n"),
+                           ("tests_d.sysl", "@tests\n\nstruct Holder\n    k: int\n\n    pair(self) -> int = self.k\n"),
+                           ("tests_e.sysl", "@tests\n\nnothing_here() = ()\n")])
+
+    assert_eq(tfs_kept(units, ["tests_a"]), "tests_a.sysl tests_b.sysl tests_c.sysl tests_d.sysl | dropped 1 files, 0 tests")
+end tfs_overloads_stay_whole
+
+@test("a private name is the file's own: spelling it elsewhere keeps nothing")
+tfs_private_names_keep_nothing()
+    val units = tfs_units([("tests_a.sysl", "@tests\n\n@test\nta()\n    assert_eq(own(), 1)\n\nprivate own() -> int = 1\n"),
+                           ("tests_b.sysl", "@tests\n\nprivate own() -> int = 2\n"),
+                           ("tests_c.sysl", "@tests\n\nprivate[m] own() -> int = 3\n")])
+
+    // `private[m]` is module-wide, so another file can reach it, and it is kept.
+    assert_eq(tfs_kept(units, ["tests_a"]), "tests_a.sysl tests_c.sysl | dropped 1 files, 0 tests")
+end tfs_private_names_keep_nothing
+
+@test("a name spelled only inside a string or a comment still keeps its file: an interpolated hole is in a string")
+tfs_words_in_strings_and_comments()
+    val units = tfs_units([("tests_a.sysl", "@tests\n\n@test\nta()\n    assert_eq(s\"${in_hole()}\", \"1\")\n"),
+                           ("tests_b.sysl", "@tests\n\nin_hole() -> int = 1\n"),
+                           ("tests_c.sysl", "@tests\n\n// mentions in_comment\n@test\ntc()\n    assert_eq(1, 1)\n"),
+                           ("tests_d.sysl", "@tests\n\nin_comment() -> int = 1\n")])
+
+    assert_eq(tfs_kept(units, ["tests_a"]), "tests_a.sysl tests_b.sysl | dropped 2 files, 1 tests")
+    assert_eq(tfs_kept(units, ["tests_c"]), "tests_c.sysl tests_d.sysl | dropped 2 files, 1 tests")
+end tfs_words_in_strings_and_comments
+
+@test("a member, a variant and a trait method keep the file that declares them: a value's type need not be spelled")
+tfs_members_variants_trait_methods()
+    val units = tfs_units([("tests_a.sysl", "@tests\n\n@test\nta()\n    assert_eq(made().describe(), 1)\n"),
+                           ("tests_b.sysl", "@tests\n\nmade() -> Shape = Shape(1)\n"),
+                           ("tests_c.sysl", "@tests\n\nstruct Shape\n    n: int\n"),
+                           ("tests_d.sysl", "@tests\n\ntrait Describe\n    describe(self) -> int\n"),
+                           ("tests_e.sysl", "@tests\n\nenum Light\n    Amber\n"),
+                           ("tests_f.sysl", "@tests\n\n@test\ntf()\n    assert(Amber == Amber)\n"),
+                           ("tests_g.sysl", "@tests\n\nstruct Mine\n    k: int\n\n    widen(self) -> int = self.k\n"),
+                           ("tests_h.sysl", "@tests\n\n@test\nth()\n    assert_eq(x.widen(), 1)\n")])
+
+    assert_eq(tfs_kept(units, ["tests_a"]), "tests_a.sysl tests_b.sysl tests_c.sysl tests_d.sysl | dropped 4 files, 2 tests")
+    assert_eq(tfs_kept(units, ["tests_f"]), "tests_e.sysl tests_f.sysl | dropped 6 files, 2 tests")
+    assert_eq(tfs_kept(units, ["tests_h"]), "tests_g.sysl tests_h.sysl | dropped 6 files, 2 tests")
+end tfs_members_variants_trait_methods
+
+@test("a @tests file that acts without being named is always kept: hooks, exports, sections, asm, header clauses")
+tfs_files_that_act_are_kept()
+    val acting = ["@tests\n\n@setup\nprep() = ()\n",
+                  "@tests\n\n@teardown_all\ndone() = ()\n",
+                  "@tests\n\n@export(\"tfs_sym\")\nexported() -> int = 1\n",
+                  "@tests\n\n@section(\".text.tfs\")\nplaced() -> int = 1\n",
+                  "@tests\n\n@export(\"tfs_val\")\nval Sym: int = 1\n",
+                  "@tests\n@link(\"m\")\n\nlinked() -> int = 1\n",
+                  "@tests\n\nasm\n    [x86_64] \"nop\"\n    [aarch64] \"nop\"\n"]
+
+    for i in 0..<acting.len
+        val units = tfs_units([("tests_a.sysl", "@tests\n\n@test\nta()\n    assert_eq(1, 1)\n"),
+                               ("tests_x.sysl", acting[i])])
+        val got = narrowed_test_units(units, tfs_names(["tests_a"]))
+
+        assert_eq(got.units.len(), 2, acting[i])
+        assert(!inert_unit(units[1]), acting[i])
+    end for
+
+    // The quiet shapes: a declaration of every kind, a test, an impl of its own type.
+    val quiet = tfs_unit("tests_q.sysl", "@tests\n\nimport sysl.buf.Buf\n\nstruct Q\n    n: int\n\n" +
+                         "impl Eq for Q\n    eq(self, o: Q) -> bool = self.n == o.n\n\nval K: int = 1\n" +
+                         "var counter: int = 0\n\n@test\ntq()\n    assert_eq(K, 1)\n")
+
+    assert(inert_unit(quiet))
+end tfs_files_that_act_are_kept
+
+private tfs_names(within: []const string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for w in within
+        out.push(w)
+
+    out
+end tfs_names
+
+@test("a dropped file's tests are listed as they would have been: name, file, line, and what the attribute says")
+tfs_dropped_tests_listed()
+    val u = tfs_unit("tests_b.sysl", "@tests\n\n@test(\"shown\")\ntb()\n    assert_eq(1, 1)\n\n" +
+                     "@test(ignore: \"later\")\ntb2()\n    assert_eq(1, 1)\n\nplain() = ()\n")
+    val got = dropped_tests_of(u)
+
+    assert_eq(got.len(), 2)
+    assert_eq(got[0].display, "shown")
+    assert_eq(got[0].file, "/p/tests_b.sysl")
+    assert_eq(got[0].line, 3)
+    assert_eq(got[1].func, "tb2")
+    assert_eq(got[1].ignored.unwrap_or(""), "later")
+end tfs_dropped_tests_listed
+
+@test("a narrowed build's cache command holds the names, sorted and once each")
+tfs_narrowed_command()
+    assert_eq(narrowed_test_command("test", tfs_names(["b", "a", "b"])), "test\n--file a\n--file b")
+    assert(narrowed_test_command("test", tfs_names(["a"])) != narrowed_test_command("test", tfs_names(["b"])))
+end tfs_narrowed_command
+
+@test("SYSL_TEST_EVERY_FILE turns the narrowing off")
+tfs_every_file_turns_it_off()
+    val units = tfs_units([("tests_a.sysl", "@tests\n\n@test\nta()\n    assert_eq(1, 1)\n"),
+                           ("tests_b.sysl", "@tests\n\n@test\ntb()\n    assert_eq(1, 1)\n")])
+
+    tfs_setenv("SYSL_TEST_EVERY_FILE", "1")
+    val off = tfs_kept(units, ["tests_a"])
+    tfs_unsetenv("SYSL_TEST_EVERY_FILE")
+
+    assert_eq(off, "tests_a.sysl tests_b.sysl | dropped 0 files, 0 tests")
+    assert_eq(tfs_kept(units, ["tests_a"]), "tests_a.sysl | dropped 1 files, 1 tests")
+end tfs_every_file_turns_it_off
+
+// -- the command line, over real projects -----------------------------------------------------------
+
+private tfs_ready() -> bool = std_root().is_ok() && clang_available()
+
+private tfs_tree(files: []const (string, string)) -> string
+    val root = lbr_temp("sysl-tfs")
+
+    for f in files
+        tfs_put(root, f.0, f.1)
+
+    root
+end tfs_tree
+
+private tfs_put(root: string, at: string, text: string)
+    make_dir_all(parent_of(s"$root/$at").unwrap()).unwrap()
+    write_text(s"$root/$at", text).unwrap()
+end tfs_put
+
+// `sysl test <root> <flags>`: the status, and the report with each row's time taken out.
+private tfs_test(root: string, flags: []const string) -> (int, string)
+    var args: Buf[string] = buf()
+
+    args.push("sysl")
+    args.push("test")
+    args.push(root)
+
+    for f in flags
+        args.push(f)
+
+    var said: Buf[string] = buf()
+    val sink = &said
+    val code = run_cli_reported(args.view(), piece -> sink.push(piece), piece -> sink.push(piece),
+                                piece -> sink.push(piece))
+    var lines: Buf[string] = buf()
+
+    for piece in said
+        for line in split(piece, "\n")
+            lines.push(tfs_untimed(line))
+
+    (code, join(lines.view(), "\n"))
+end tfs_test
+
+// A report line without the time a row and the summary end in (`4ms`).
+private tfs_untimed(line: string) -> string
+    var end_at = line.len
+
+    while end_at > 0 && line.bytes[end_at - 1] == u8(' ')
+        end_at -= 1
+
+    if !line[0..<end_at].ends_with("ms") then return line[0..<end_at]
+
+    var at = end_at - 2
+
+    while at > 0 && line.bytes[at - 1] >= u8('0') && line.bytes[at - 1] <= u8('9')
+        at -= 1
+
+    line[0..<at]
+end tfs_untimed
+
+private tfs_project() -> string =
+    tfs_tree([("package.hocon", "package { name = \"tfs\", version = \"1.0.0\" }\n"),
+              ("lib.sysl", "twice(x: int) -> int = x * 2\n"),
+              ("tests_a.sysl", "@tests\n\n@test\nta()\n    assert_eq(helper_b(), twice(21))\n\n@test\nta2()\n    assert_eq(1, 1)\n"),
+              ("tests_b.sysl", "@tests\n\nhelper_b() -> int = 42\n\n@test\ntb()\n    assert_eq(2, 2)\n"),
+              ("tests_c.sysl", "@tests\n\n@test\ntc()\n    assert_eq(3, 3)\n\n@test\ntc2()\n    assert_eq(4, 4)\n")])
+
+private tfs_caches() -> string
+    val cache = lbr_temp("sysl-tfs-cache")
+
+    use_run_cache_dir(Some(cache))
+    use_root_cache_dir(Some(cache))
+    use_c_object_cache_dir(Some(cache))
+    clear_run_cache_counts()
+    cache
+end tfs_caches
+
+private tfs_done(cache: string, root: string)
+    use_run_cache_dir(None)
+    use_root_cache_dir(None)
+    use_c_object_cache_dir(None)
+    remove_dir_all(cache).unwrap_or(())
+    remove_dir_all(root).unwrap_or(())
+end tfs_done
+
+private tfs_verdict(before: (int, int), after: (int, int)) -> string =
+    if after.1 > before.1 then "miss" else if after.0 > before.0 then "hit" else "none"
+
+@test("a narrowed run reports exactly what the whole build reports: the same rows, the same 'of N'")
+tfs_reports_match_the_whole_build()
+    if !tfs_ready() then return
+
+    val root = tfs_project()
+    val cache = tfs_caches()
+
+    // Every run builds, so the whole binary never answers for a narrowed one.
+    tfs_setenv("SYSL_NO_CACHE", "1")
+
+    for within in [["--file", "tests_a"], ["--file", "tests_c"], ["--file", "tests_zz"]]
+        val narrowed = tfs_test(root, within)
+
+        tfs_setenv("SYSL_TEST_EVERY_FILE", "1")
+        val whole = tfs_test(root, within)
+        tfs_unsetenv("SYSL_TEST_EVERY_FILE")
+
+        assert_eq(narrowed.0, whole.0, within[1])
+        assert_eq(narrowed.1, whole.1, within[1])
+    end for
+
+    val a = tfs_test(root, ["--file", "tests_a"])
+
+    tfs_unsetenv("SYSL_NO_CACHE")
+    assert_eq(a.0, 0)
+    assert(a.1.contains("running 2 tests of 5"), a.1)
+    tfs_done(cache, root)
+end tfs_reports_match_the_whole_build
+
+@test("a mistake in a @tests file a narrowed run does not need is not that run's: it is the whole build's")
+tfs_unneeded_mistake_not_reported()
+    if !tfs_ready() then return
+
+    val root = tfs_project()
+    val cache = tfs_caches()
+
+    tfs_put(root, "tests_c.sysl", "@tests\n\n@test\ntc()\n    val x: int = \"no\"\n")
+    tfs_setenv("SYSL_NO_CACHE", "1")
+
+    val narrowed = tfs_test(root, ["--file", "tests_a"])
+
+    assert_eq(narrowed.0, 0, narrowed.1)
+
+    // Named, or needed by what is named, the mistake is reported as ever.
+    assert(tfs_test(root, ["--file", "tests_c"]).0 != 0)
+    assert(tfs_test(root, ["--jobs", "2"]).0 != 0)
+
+    tfs_put(root, "tests_b.sysl", "@tests\n\nhelper_b() -> int = \"no\"\n")
+    tfs_put(root, "tests_c.sysl", "@tests\n\n@test\ntc()\n    assert_eq(3, 3)\n")
+    assert(tfs_test(root, ["--file", "tests_a"]).0 != 0)
+    tfs_unsetenv("SYSL_NO_CACHE")
+    tfs_done(cache, root)
+end tfs_unneeded_mistake_not_reported
+
+@test("a narrowed binary is kept under its names: replayed unchanged, missed on any edit, and a whole binary answers it")
+tfs_cache_seams()
+    if !tfs_ready() then return
+
+    val root = tfs_project()
+    val cache = tfs_caches()
+    var how: Buf[string] = buf()
+    val steps: []const (string, string) = [("a", ""), ("a", ""), ("c", ""), ("a", "edit b"), ("a", ""),
+                                           ("a", "edit lib"), ("a", "-O2"), ("a", ""), ("", ""), ("c", ""),
+                                           ("a", "")]
+
+    for step in steps
+        if step.1 == "edit b"
+            tfs_put(root, "tests_b.sysl", "@tests\n\nhelper_b() -> int = 42\n\n@test\ntb()\n    assert_eq(5, 5)\n")
+        else if step.1 == "edit lib"
+            tfs_put(root, "lib.sysl", "twice(x: int) -> int = x + x\n")
+
+        var flags: Buf[string] = buf()
+
+        if step.0 != ""
+            flags.push("--file")
+            flags.push(s"tests_${step.0}")
+        end if
+
+        if step.1 == "-O2" then flags.push("-O2")
+
+        val before = run_cache_counts()
+
+        assert_eq(tfs_test(root, flags.view()).0, 0, s"${step.0} ${step.1}")
+        how.push(tfs_verdict(before, run_cache_counts()))
+    end for
+
+    // a; a again; c is another build; b edited (a needs it); a again; the program edited; another
+    // level; a again at the first level, replayed; the whole tree; c, answered by it; a, its own.
+    assert_eq(join(how.view(), " "), "miss hit miss miss hit miss miss hit miss hit hit")
+    tfs_done(cache, root)
+end tfs_cache_seams
+
+@test("a @tests file nothing needs, edited, still misses: the tree is keyed whole, so no edit is ever replayed past")
+tfs_unneeded_edit_misses()
+    if !tfs_ready() then return
+
+    val root = tfs_project()
+    val cache = tfs_caches()
+    val before = run_cache_counts()
+
+    tfs_test(root, ["--file", "tests_a"])
+    tfs_put(root, "tests_c.sysl", "@tests\n\n@test\ntc()\n    assert_eq(9, 9)\n")
+    tfs_test(root, ["--file", "tests_a"])
+
+    assert_eq(run_cache_counts().1 - before.1, 2)
+    tfs_done(cache, root)
+end tfs_unneeded_edit_misses
