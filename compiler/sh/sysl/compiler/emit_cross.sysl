@@ -44,6 +44,38 @@ private variants_hold_view(variants: Buf[EnumVariant]) -> bool
     false
 end variants_hold_view
 
+// **Whether a `&sync` payload of `t` holds a string two domains would reach** -- what `share.copy`
+// replaces where the box is made. It follows the walk `sharing.sysl` asks of a `&sync T`: into arrays,
+// structs and enums, past a guarded field (reached only under its lock), a frozen buffer (its
+// elements are asked as they are), a struct promising `@unchecked(Share)` (taken at its word), a view
+// (lent to a scoped child, or refused) and any reference (a `&sync U` was settled where it was made).
+holds_shared_string(t: Type) -> bool = t match
+    Str -> true
+    Array(_, elem) -> holds_shared_string(*elem)
+    Constrained(d) -> holds_shared_string(d.base)
+    Struct(d) -> walks_into(d) && fields_hold_shared_string(copied_fields(d))
+    Enum(d) -> variants_hold_shared_string(d.variants)
+    _ -> false
+
+private walks_into(d: &StructType) -> bool = d.base != frozen_base() && !promised_crossing(d.promised, false)
+
+private fields_hold_shared_string(fields: Buf[(string, Type)]) -> bool
+    for item in fields
+        if holds_shared_string(item.1) then return true
+
+    false
+end fields_hold_shared_string
+
+private variants_hold_shared_string(variants: Buf[EnumVariant]) -> bool
+    for item in variants
+        if fields_hold_shared_string(item.fields) then return true
+
+    false
+end variants_hold_shared_string
+
+private variant_wanted(shared: bool, fields: Buf[(string, Type)]) -> bool =
+    if shared then fields_hold_shared_string(fields) else fields_hold_view(fields)
+
 // A struct's fields less the ones it guards, which the copy leaves shared.
 private copied_fields(d: &StructType) -> Buf[(string, Type)]
     if d.guarded.is_empty() then return d.fields
@@ -93,17 +125,24 @@ fresh_views_at(e: *Emit, ty: Type, p: Val) = underlying(ty) match
             each_element_end(e, ep.1, ep.2, ep.3)
     Struct(d) ->
         if d.base != frozen_base()
-            fresh_fields(e, d.fields, d.guarded, struct_lty(d), struct_gaps(e.layout, d), p)
-    Enum(d) -> fresh_variants(e, d, p)
+            fresh_fields(e, false, d.fields, d.guarded, struct_lty(d), struct_gaps(e.layout, d), p)
+    Enum(d) -> fresh_variants(e, false, d, p)
     _ -> ()
 
+// The walk's own question, asked for one pass or the other: a view for `cross.copy`, a string two
+// domains reach for `share.copy`.
+private wanted(shared: bool, t: Type) -> bool = if shared then holds_shared_string(t) else holds_view(t)
+
+private walk_call(e: *Emit, shared: bool, ty: Type, p: Val) =
+    if shared then share_strings_call(e, ty, p) else fresh_views_call(e, ty, p)
+
 // Each field that holds a view, at its address.
-private fresh_fields(e: *Emit, fields: Buf[(string, Type)], guarded: Buf[string], aggregate: LType,
-                     gaps: Option[Gaps], base: Val)
+private fresh_fields(e: *Emit, shared: bool, fields: Buf[(string, Type)], guarded: Buf[string],
+                     aggregate: LType, gaps: Option[Gaps], base: Val)
     for i in 0..<fields.len()
         val fty = fields[i].1
 
-        if holds_string(guarded, fields[i].0) || !holds_view(fty) then continue
+        if holds_string(guarded, fields[i].0) || !wanted(shared, fty) then continue
 
         val f = fresh_reg(e)
 
@@ -112,18 +151,18 @@ private fresh_fields(e: *Emit, fields: Buf[(string, Type)], guarded: Buf[string]
         idx.push(ir_arg(l_i32(), VInt(from_int(0))))
         idx.push(ir_arg(l_i32(), VInt(from_int(long(llvm_index(gaps, field_slot(fields, i)))))))
         emit(e, InGep(f, aggregate, base, idx))
-        fresh_views_call(e, fty, f)
+        walk_call(e, shared, fty, f)
 end fresh_fields
 
 // The variant the tag names, where it is one holding a view.
-private fresh_variants(e: *Emit, d: &EnumType, p: Val)
+private fresh_variants(e: *Emit, shared: bool, d: &EnumType, p: Val)
     val tag = fresh_reg(e)
     val end_l = fresh_label(e, "cross.done")
 
     emit(e, InLoad(tag, l_i32(), p, AccPlain, None))
 
     for variant in d.variants
-        if !fields_hold_view(variant.fields) then continue
+        if !variant_wanted(shared, variant.fields) then continue
 
         val hit_l = fresh_label(e, "cross.variant")
         val next_l = fresh_label(e, "cross.next")
@@ -135,7 +174,7 @@ private fresh_variants(e: *Emit, d: &EnumType, p: Val)
 
         var none: Buf[string] = buf()
 
-        fresh_fields(e, variant.fields, none, variant_lty(d, variant), variant_gaps(e.layout, variant),
+        fresh_fields(e, shared, variant.fields, none, variant_lty(d, variant), variant_gaps(e.layout, variant),
                      payload_ptr(e, d, p))
         emit_term(e, InBr(end_l))
         emit_label(e, next_l)
@@ -224,3 +263,115 @@ private fresh_view(e: *Emit, ty: Type, elem: Type, p: Val)
     emit(e, InInsert(whole, vt, with_ptr, word_lty(e), n, index_list(2)))
     emit(e, InStore(vt, whole, p, AccPlain, None))
 end fresh_view
+
+// -- a string two domains reach ------------------------------------------------------------------------
+
+// **What a `&sync` box's payload goes through where it is made: every string in it two domains could
+// reach is put in bytes whose count is atomic** (`arc_runtime.sysl`'s `arc_maybe`). A string's own
+// count is not atomic, and the string the program holds shares it -- with every other name for those
+// bytes, in this domain. So the box keeps a copy of the bytes instead, made here before the box is
+// handed to anyone, whose owner is marked shared: every share of it taken or given back from then on,
+// a slice of it included, is atomic, wherever it is made. A string with no owner (a literal) and one
+// whose owner is marked already (read out of another shared object) is left as it is, since it is
+// shared already.
+//
+// The walk runs on the payload in place, after the box holds a share of everything in it.
+share_payload(e: *Emit, inner: Type, slot: Val)
+    if holds_shared_string(inner) then share_strings_call(e, inner, slot)
+
+// Calls `share.copy.T` on the `T` at `p`.
+private share_strings_call(e: *Emit, ty: Type, p: Val)
+    val name = request_helper(e, s"share.copy.${mangle(ty)}", HrShare(ty))
+
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(LPtr, p))
+    emit(e, ir_call(None, LVoid, VGlobal(name), args))
+end share_strings_call
+
+// The body of `share.copy.T`.
+shared_strings_at(e: *Emit, ty: Type, p: Val) = underlying(ty) match
+    Str -> shared_string(e, p)
+    Array(n, elem) ->
+        if holds_shared_string(*elem)
+            val ep = each_element_begin(e, *elem, p, VInt(from_int(long(n))))
+
+            share_strings_call(e, *elem, ep.0)
+            each_element_end(e, ep.1, ep.2, ep.3)
+    Struct(d) ->
+        if walks_into(d)
+            fresh_fields(e, true, d.fields, unshared_fields(d), struct_lty(d), struct_gaps(e.layout, d), p)
+    Enum(d) -> fresh_variants(e, true, d, p)
+    _ -> ()
+
+// The fields the share pass leaves alone: the guarded ones, and a scoped child's borrowed captures,
+// which hold no share of their own to give back (`type_queries.sysl`'s `borrowed_capture`) -- a
+// string beside a lent view is refused there instead (`sharing.sysl`'s `lent_walk`).
+private unshared_fields(d: &StructType) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for name in d.guarded
+        out.push(name)
+
+    for item in d.fields
+        if borrowed_capture(d, item.1) then out.push(item.0)
+
+    out
+end unshared_fields
+
+// The string at `p`, put in bytes of its own marked shared, unless it is shared already.
+private shared_string(e: *Emit, p: Val)
+    e.heap = true
+    e.maybe_heap = true
+
+    val st = lty(e, Str)
+    val old = fresh_reg(e)
+
+    emit(e, InLoad(old, st, p, AccPlain, None))
+
+    val owner = fresh_reg(e)
+
+    emit(e, InExtract(owner, st, old, index_list(0)))
+
+    val wanted = fresh_reg(e)
+
+    var ask: Buf[IrArg] = buf()
+
+    ask.push(ir_arg(LPtr, owner))
+    emit(e, ir_call(Some(wanted), l_i1(), VGlobal("arc.share_wanted"), ask))
+
+    val copy_l = fresh_label(e, "share.copy")
+    val done_l = fresh_label(e, "share.done")
+
+    emit_term(e, InCondBr(wanted, copy_l, done_l))
+    emit_label(e, copy_l)
+
+    val data = fresh_reg(e)
+
+    emit(e, InExtract(data, st, old, index_list(1)))
+
+    val n = fresh_reg(e)
+
+    emit(e, InExtract(n, st, old, index_list(2)))
+
+    val r = fresh_reg(e)
+
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(LPtr, data))
+    args.push(ir_arg(word_lty(e), n))
+    emit(e, ir_call(Some(r), st, VGlobal(request_from_bytes(e)), args))
+
+    val made = fresh_reg(e)
+
+    emit(e, InExtract(made, st, r, index_list(0)))
+
+    var mark: Buf[IrArg] = buf()
+
+    mark.push(ir_arg(LPtr, made))
+    emit(e, ir_call(None, LVoid, VGlobal("arc.mark_shared"), mark))
+    release_value(e, Str, old)
+    emit(e, InStore(st, r, p, AccPlain, None))
+    emit_term(e, InBr(done_l))
+    emit_label(e, done_l)
+end shared_string

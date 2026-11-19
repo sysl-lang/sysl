@@ -28,13 +28,18 @@ module sysl.io.poll
  * Two threads waiting on one poller at once is allowed and each gets some of the events, but which is
  * the kernel's choice.
  *
+ * **A `WakeFd` is a wake that is itself a descriptor** -- `eventfd` on Linux, a pipe elsewhere --
+ * registered like any other and reported as an event, for waking a poller nested in another, or
+ * several, or a loop that is not this module's. `Poller.fd()` lends the set's own descriptor, which
+ * is what nests one poller in another.
+ *
  * A target with neither kqueue nor epoll answers every call with the error `sysl.fs.unsupported()`
  * stands for, as `sysl.io.wait` does for a system without `poll`. It needs an operating system: a
  * freestanding program reaching it answers the `sysl_io_poll_*` hooks itself (`sysl.io.sys`).
  */
 
 import sysl.fs.{IoError, from_status}
-import sysl.io.sys.{poll_close, poll_control, poll_open, poll_wait, poll_wake}
+import sysl.io.sys.{poll_close, poll_control, poll_open, poll_wait, poll_wake, wakefd_close, wakefd_drain, wakefd_open, wakefd_wake}
 import sysl.io.wait.{Interest, Readable, Writable}
 import sysl.raw.ptr_cast
 import sysl.slices.as_mut_ptr
@@ -177,6 +182,24 @@ struct Poller
      */
     waker(self) -> Waker = Waker(self.state)
 
+    /** The set's own descriptor -- the kqueue or the epoll instance -- for a call this module does not
+     * make: registering this poller in another one, which reports it readable once a `wait` here
+     * would find something, or handing it to an event loop that wants one descriptor to watch.
+     *
+     * **Readable is "look", not a promise**: a descriptor that was ready and no longer is may keep the
+     * set readable until a `wait` here looks again (kqueue rechecks only then), and that wait answers
+     * zero -- so the outer loop waits on the inner poller with a zero timeout and takes what it gets.
+     *
+     *     outer.register(inner.fd(), [Readable], 9)?
+     *
+     * **It is lent, not given**: the poller still closes it when its last copy -- and its last `Waker`
+     * -- goes, and a number kept past that names nothing. **A pending wake shows on it too**: the wake
+     * is something in the set -- kqueue's user event, epoll's `eventfd` -- until a `wait` here takes
+     * it, so an outer poller reports the inner one readable, and the inner `wait` that follows answers
+     * zero for it.
+     */
+    fd(self) -> int = self.state.fd
+
     private control(self, fd: int, op: int, interest: []const Interest, token: u64,
                     mode: Mode) -> Result[unit, IoError]
         var bits = 0
@@ -212,3 +235,80 @@ struct Waker
         val got = poll_wake(self.state.fd, self.state.wake_fd)
 
         if got < 0 then Err(from_status(got)) else Ok(())
+
+/** The descriptors behind a `WakeFd`, shared by every copy of it and closed when the last goes.
+ *
+ * A `&sync` for the reason `PollerState` is one: nothing in it changes after it is opened, so every
+ * thread holding a copy may wake it without a lock.
+ */
+private[poll] struct WakeState
+    fd: int
+    write_fd: int
+
+/** Both descriptors closed, unreported (`sysl.Drop`). */
+impl Drop for WakeState
+    drop(self)
+        _ = wakefd_close(self.fd, self.write_fd)
+
+/** A wake that is a descriptor: readable once something has called `wake`, and until `drain` takes
+ * the wakes back -- Linux's `eventfd`, and a pipe on a system without one.
+ *
+ * Where a `Waker` ends one poller's `wait` and is never itself an event, this is a descriptor like any
+ * other, so it is registered with a token and **comes back from `wait` as an event** -- in any poller,
+ * in several at once, in an outer poller watching inner ones, or in `sysl.io.wait.ready`:
+ *
+ *     val w = WakeFd.open()?
+ *
+ *     p.register(w.fd(), [Readable], QUEUE)?
+ *
+ *     // any thread:
+ *     w.wake()?
+ *
+ *     // the waiting thread, on QUEUE:
+ *     _ = w.drain()?
+ *
+ * **Wakes coalesce.** Any number of them before a `drain` leave the descriptor readable once, and one
+ * `drain` takes them all; a `wake` never blocks and never fails for there being too many. A program
+ * drains when it sees the event and then looks at its own state, rather than counting wakes.
+ *
+ * **It closes itself**, and every copy shares one: a copy is what another thread is handed -- the
+ * shared state is a `&sync`, so a `WakeFd` may be captured by a `&sync Fn` or a scoped thread's
+ * closure -- and the descriptors are closed when the last copy goes.
+ */
+struct WakeFd
+    private[poll] state: &sync WakeState
+
+    /** A new wake with none pending. Fails only as the system's descriptors run out -- a pipe takes
+     * two, an `eventfd` one -- or where the target has neither.
+     */
+    open() -> Result[WakeFd, IoError]
+        var write: i32 = -1
+        val fd = wakefd_open(&write)
+
+        if fd < 0 then return Err(from_status(fd))
+
+        val state: &sync WakeState = WakeState(fd, int(write))
+
+        Ok(WakeFd(state))
+    end open
+
+    /** The descriptor to watch: readable while a wake is pending. It is the one to `register` with a
+     * poller, and is lent, not given -- the `WakeFd` closes it when its last copy goes.
+     */
+    fd(self) -> int = self.state.fd
+
+    /** Make the descriptor readable, from any thread. A wake already pending is left as it is, so this
+     * succeeds however many came before it without a `drain`.
+     */
+    wake(self) -> Result[unit, IoError]
+        val got = wakefd_wake(self.state.fd, self.state.write_fd)
+
+        if got < 0 then Err(from_status(got)) else Ok(())
+
+    /** Take back every pending wake, leaving the descriptor not readable, and answer whether there was
+     * one. It never waits: with nothing pending it answers `false` at once.
+     */
+    drain(self) -> Result[bool, IoError]
+        val got = wakefd_drain(self.state.fd)
+
+        if got < 0 then Err(from_status(got)) else Ok(got > 0)

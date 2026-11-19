@@ -1536,7 +1536,7 @@ end slot_callees
 // of slots, and the value `slot_take` moves out is let go of where the body is done with it -- each a
 // count of the element given back. `slot_put` fills an empty slot and gives back nothing.
 private touch_slots(v: &Verdict, roots: &TypeSink, gives: &TypeSink, op: string, elem: Type)
-    if op == "slot_storage" then return
+    if storage_form(op) || op == "try_heap" then return
 
     val writes = op == "slot_place" || op == "slot_place_run" || op == "slot_vacate" ||
         op == "slot_take" || op == "slot_put"
@@ -1605,6 +1605,10 @@ private note_laundered(out: &CastSink, x: TExpr) = *x.kind match
     TViewAs(arg, ty) ->
         val a = view_elem(texpr_type(arg))
         val b = view_elem(ty)
+
+        // A view that only gains `volatile` reads the same type through the same storage, and
+        // launders nothing.
+        if a.is_some() && b.is_some() && underlying(a.unwrap()) == underlying(b.unwrap()) then return
 
         if a.is_some() then out.anywhere(underlying(a.unwrap()))
         if b.is_some() then out.anywhere(underlying(b.unwrap()))
@@ -2166,6 +2170,7 @@ private exposed_stmt(out: &NameSink, s: TStmt) = s match
     TAsm(_, operands, _, _) ->
         for op in operands
             out.add(op.slot)
+            out.add(op.into_slot)
     _ -> ()
 
 // **A local is exposed from the first statement that lets its address out, not from the top of the

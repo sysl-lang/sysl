@@ -173,6 +173,103 @@ lac_no_large_value_is_an_llvm_value()
     assert(ir.contains("i64 33016, i1 false)"), ir)
 end lac_no_large_value_is_an_llvm_value
 
+// =================================================================================================
+// A `match` on a large enum reads its tag as one word
+// =================================================================================================
+
+// Every way a `match` reaches a large enum: a local, a parameter, a field, a nested pattern, a call's
+// result whose payload one arm moves out (only the tag is read there, `load_held`), and a small enum
+// beside them. A `match` reading its scrutinee through its address loads the tag alone and switches
+// on it; it once put that word into an `insertvalue` of the whole enum's type over `poison` and took
+// it back out with an `extractvalue`, which made a 33 KB aggregate an LLVM value to carry one word.
+private lac_matches() -> string = raw"""
+    struct Big
+        data: [33000]u8
+        n: int
+
+    enum Shape
+        Blob(b: Big)
+        Dot
+
+    enum Outer
+        Has(s: Shape)
+        Empty
+
+    struct Holder
+        s: Shape
+        k: int
+
+    enum Small
+        Pair(a: int, b: int)
+        Unit
+
+    big(k: int) -> Big = Big([u8(k); 33000], k)
+
+    shape(k: int) -> Shape = if k > 0 then Shape.Blob(big(k)) else Shape.Dot
+
+    on_local(k: int) -> int
+        val sh = shape(k)
+
+        sh match
+            Shape.Blob(bb) -> bb.n + int(bb.data[32999])
+            Shape.Dot -> -1
+
+    on_param(sh: Shape) -> int = sh match
+        Shape.Blob(bb) -> bb.n
+        Shape.Dot -> -2
+
+    on_field(h: Holder) -> int = h.s match
+        Shape.Blob(bb) -> bb.n + h.k
+        Shape.Dot -> -3
+
+    nested(o: Outer) -> int = o match
+        Outer.Has(Shape.Blob(bb)) -> bb.n
+        Outer.Has(Shape.Dot) -> -4
+        Outer.Empty -> -5
+
+    moved(k: int) -> int
+        val b: Big = shape(k) match
+            Shape.Blob(bb) -> bb
+            Shape.Dot -> return -6
+
+        b.n
+
+    small(x: Small) -> int = x match
+        Small.Pair(a, b) -> a * 10 + b
+        Small.Unit -> -7
+
+    print(s"${on_local(9)} ${on_local(0)}")
+    print(s"${on_param(shape(5))} ${on_param(shape(0))}")
+    print(s"${on_field(Holder(shape(4), 100))} ${on_field(Holder(shape(0), 1))}")
+    print(s"${nested(Outer.Has(shape(3)))} ${nested(Outer.Has(shape(0)))} ${nested(Outer.Empty)}")
+    print(s"${moved(6)} ${moved(0)}")
+    print(s"${small(Small.Pair(1, 2))} ${small(Small.Unit)}")
+    """
+
+@test("a match on a large enum reads its tag as one word, never as the enum made a value")
+lac_a_match_reads_the_tag_alone()
+    if !lac_ready() then return
+
+    val ir = lac_ir(lac_matches())
+
+    assert(ir.contains("%enum.Shape = type"), ir)
+
+    for name in ["%struct.Big", "%enum.Shape", "%Shape.Blob", "%enum.Outer", "%Outer.Has", "%struct.Holder"]
+        assert(!ir.contains(s"load $name,"), s"load $name")
+        assert(!ir.contains(s"store $name "), s"store $name")
+        assert(!ir.contains(s"extractvalue $name "), s"extractvalue $name")
+        assert(!ir.contains(s"insertvalue $name "), s"insertvalue $name")
+
+    // Nor is a small enum's tag dressed up as the enum: it is switched on as it was loaded.
+    assert(!ir.contains("insertvalue %enum.Small poison"), ir)
+end lac_a_match_reads_the_tag_alone
+
+@test("and every one of those matches takes the arm its value's variant names")
+lac_the_matches_answer()
+    if !lac_ready() then return
+
+    assert_eq(lac_run(lac_matches()).0, "18 -1\n5 -2\n104 -3\n3 -4 -5\n6 -6\n12 -7\n")
+
 @test("a struct at or under the line is still loaded and stored as a value")
 lac_a_small_struct_is_still_a_value()
     if !lac_ready() then return

@@ -7,7 +7,7 @@ import sysl.env.{get as env_var}
 import sysl.fs.{IoError, remove_file, write_text}
 import sysl.process.{start, Child, Output}
 import sysl.time.{millis, sleep}
-import sysl.text.{from_utf8_unchecked, str_builder, StrBuilder, Search}
+import sysl.text.{from_utf8_unchecked, join, str_builder, StrBuilder, Search}
 
 // **A program's LLVM text compiled as several modules at once** -- codegen units, as rustc has them.
 //
@@ -330,10 +330,22 @@ end importable_define
 // `insertvalue` an aggregate is taken apart and put together with -- each of which the first passes
 // remove. Counting text bytes instead would charge a body for its long types and mangled names, and
 // emission spells every local as a slot, so an unoptimized body is mostly lines that cost nothing.
+//
+// **Only what survives is counted.** A block that ends in `unreachable` -- a failed bounds or overflow
+// check reporting itself and trapping -- is a cold exit the optimizer keeps out of the way of the
+// path that returns, so it costs nothing, unless the body has no `ret` at all: then every path is
+// such an exit and the whole of it is counted. And a scalar instruction every operand of which is a
+// constant, or a register an earlier one of those defined, folds away -- the guard a shift by a
+// constant amount is lowered with (`bounded_shift`'s `icmp uge i64 18, 64` and the selects on it) --
+// as does a `select` or a conditional branch on such a condition.
 body_cost(text: string, from: usize, to: usize) -> usize
     val b = text.bytes
     var at = from
     var cost: usize = 0
+    var block: usize = 0
+    var cold: usize = 0
+    var returns = false
+    var folded: Map[string, bool] = map()
 
     while at < to
         val eol = line_end(b, at)
@@ -342,7 +354,10 @@ body_cost(text: string, from: usize, to: usize) -> usize
         at = eol + 1
 
         // A label and the closing brace start in the first column; an instruction is indented.
-        if !line.starts_with("  ") then continue
+        if !line.starts_with("  ")
+            cost += block
+            block = 0
+            continue
 
         val inst = line[2..]
 
@@ -350,10 +365,85 @@ body_cost(text: string, from: usize, to: usize) -> usize
         if inst.contains(" = extractvalue ") || inst.contains(" = insertvalue ") then continue
         if (inst.contains(" = load ") || inst.starts_with("store ")) && slot_access(inst) then continue
 
-        cost += 1
+        if inst == "unreachable"
+            cold += block
+            block = 0
+            continue
 
+        if inst.starts_with("ret ") then returns = true
+        if folds(inst, &folded) then continue
+
+        block += 1
+
+    cost += block
+    if !returns then cost += cold
     cost
 end body_cost
+
+// The scalar instructions that fold when every operand does.
+private folding_op(op: string) -> bool = op match
+    "icmp" | "add" | "sub" | "mul" | "and" | "or" | "xor" | "shl" | "lshr" | "ashr" -> true
+    "trunc" | "zext" | "sext" | "select" | "freeze" -> true
+    _ -> false
+
+// Whether instruction `inst` folds away once its constants are propagated (`body_cost`), recording
+// the register it defines in `folded` when its value is itself a constant. A vector (`<`) or a global
+// (`@`) operand is never asked about; nor is an instruction past the scalar ones.
+private folds(inst: string, folded: *Map[string, bool]) -> bool
+    if inst.starts_with("br i1 ") then return condition_folds(inst[6..], folded)
+    if !inst.starts_with("%") then return false
+
+    val eq = inst.index_of(" = ") match
+        Some(k) -> k
+        None -> return false
+
+    val rhs = inst[eq + 3..]
+    val op = rhs[0..<word_stop(rhs.bytes, 0)]
+
+    if !folding_op(op) || rhs.contains("@") || rhs.contains("<") then return false
+
+    // A select on a constant condition is one of its operands: free, and itself a constant only
+    // when both of them are.
+    if op == "select" && rhs.starts_with("select i1 ") && condition_folds(rhs[10..], folded)
+        if registers_fold(rhs[10..], folded) then folded.put(inst[0..<eq], true)
+        return true
+
+    if !registers_fold(rhs, folded) then return false
+
+    folded.put(inst[0..<eq], true)
+    true
+end folds
+
+// Whether the operand that starts `s` (up to its comma) is a constant: `true`, `false`, or a
+// register a folded instruction defined.
+private condition_folds(s: string, folded: *Map[string, bool]) -> bool
+    val stop = s.index_of(",").unwrap_or(s.len)
+    val c = s[0..<stop]
+
+    c == "true" || c == "false" || folded.get(c).is_some()
+end condition_folds
+
+// Whether every register `s` names (`%x`) is one a folded instruction defined -- so that, its other
+// operands being literals, what it computes is a constant.
+private registers_fold(s: string, folded: *Map[string, bool]) -> bool
+    val b = s.bytes
+    var i: usize = 0
+
+    while i < b.len
+        if b[i] != u8('%')
+            i += 1
+            continue
+
+        var stop = i + 1
+
+        while stop < b.len && b[stop] != u8(',') && b[stop] != u8(' ') && b[stop] != u8(')')
+            stop += 1
+
+        if folded.get(s[i..<stop]).is_none() then return false
+        i = stop
+
+    true
+end registers_fold
 
 // Whether a load or a store's pointer -- its last `ptr` operand -- is one of the stack slots emission
 // gives a local (`%name.addr`).
@@ -884,7 +974,9 @@ compile_units(cc: string, parts: Buf[string], base: string, target: Target,
         // Keyed over the text clang is handed, not the text before marking, so a kept object made
         // without the function attributes is never taken for one made with them.
         val text = laid_out(cc, target, in_clang_dialect(cc, for_clang_unit(parts[i], target, libcalls, level)))
-        val key = unit_object_key(cc, text, args)
+
+        // A kept object's frames were never read, so a report compiles every unit again.
+        val key = if frame_reported() then "" else unit_object_key(cc, text, args)
 
         keys.push(key)
 
@@ -901,6 +993,16 @@ compile_units(cc: string, parts: Buf[string], base: string, target: Target,
         for arg in args
             line.push(arg)
 
+        // The unit's frames, checked and reported where they are laid out (`frame_limit.sysl`).
+        frame_pass(cc, text, ll, target, level)?
+
+        if !frames_at_link()
+            val frames = frame_flags(text, ll)
+
+            for item in frames
+                line.push(item)
+        end if
+
         line.push(ll)
         line.push("-o")
         line.push(obj)
@@ -908,21 +1010,32 @@ compile_units(cc: string, parts: Buf[string], base: string, target: Target,
         todo.push(i)
         lines.push(line)
 
+    // What the process holds as its clangs start, said under `SYSL_TIMINGS=1` (`heap_memory.sysl`).
+    if !lines.is_empty() then memory_before_clangs()
+
     val ran = units_ran(cc, lines)
     var failure = ""
+    var frames: Buf[string] = buf()
 
-    // Read in order once every clang is in, so the first failure in order is the one reported.
+    // Read in order once every clang is in, so the first failure in order is the one reported --
+    // except frames over their limits, which are every unit's (`frame_limit.sysl`).
     for j in 0..<todo.len()
-        if failure != "" then break
-
         told_by(cc, ran[j]) match
             Ok(_) -> ()
-            Err(f) -> failure = if f.unrun then f.said else tool_failed(cc, f.code, f.said)
+            Err(f) ->
+                val over = if f.unrun then None else frame_refusal(f.said)
 
+                over match
+                    Some(why) -> frames.push(why)
+                    None -> if failure == "" then failure = framed_failure(cc, f)
+
+    if !frames.is_empty() then return Err(join(frames.view(), "\n\n"))
     if failure != "" then return Err(failure)
 
     for i in todo
         val obj = objects[i]
+
+        if !frames_at_link() then frames_read(s"$obj.ll")
 
         remove_file(s"$obj.ll").unwrap_or(())
         unit_compiled()

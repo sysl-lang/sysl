@@ -1,6 +1,6 @@
 ---
 title: The slices module
-summary: "`sysl.slices` — the operations over a built-in slice: searching, comparing, reversing, a copy that is right where the two slices overlap, two sorts that neither of them allocates, a binary search that answers where a missing value belongs, a sum and a dot product whose float order is the back end's, and the pointer a C binding hands across."
+summary: "`sysl.slices` — the operations over a built-in slice: searching, comparing, reversing, a copy that is right where the two slices overlap, two sorts that neither of them allocates, a binary search that answers where a missing value belongs, a sum and a dot product whose float order is the back end's, a zeroize the optimizer may not remove, and the pointer a C binding hands across."
 weight: 55
 ---
 
@@ -149,6 +149,88 @@ under `@no_alloc`, reachable from a freestanding target — so a caller holding 
 a `bool` loses nothing by keeping it, and a binding that must not acquire an allocator has it
 whatever the core module gains. `starts_with` and `ends_with` are the same story one step along:
 both are `equal` over a sub-slice, and both stay for the same reason.
+
+## Clearing a secret
+
+**`zeroize` sets every element to zero in a way the optimizer may not remove.** A key or a password
+is cleared before its buffer is dropped, and that clearing is exactly the store an optimizer
+deletes: nothing reads the buffer again, so at `-O2` a `fill(key, 0)` there is gone and the secret
+stays in memory for whoever is handed the page next. `zeroize` takes a `[]volatile T` for any
+integer `T`, and every store through a [volatile](/reference/memory/#device-memory) view is
+emitted, once each, whether or not anything reads the element again.
+
+```sysl
+import sysl.slices.zeroize
+
+derive_tag(seed: u8) -> u8
+    var key: [16]u8
+    for i in 0..<key.len
+        key[i] = seed ^ u8(i)
+    var tag = seed
+    for b in key
+        tag = tag ^ b
+    zeroize(key)
+    tag
+
+print(derive_tag(42))
+
+var session = [7u8, 7, 7, 7]
+zeroize(session[1..<3])
+print(session)
+```
+
+```output
+42
+[7, 0, 0, 7]
+```
+
+**A cipher's key schedule is cleared at its own width.** `T` is read off the argument, so a `[]u32`
+of round keys is cleared with one 32-bit store per word, and a byte buffer with one per byte:
+
+```sysl
+import sysl.slices.zeroize
+
+expand(key: u32) -> [8]u32
+    var ks: [8]u32
+    var w = key
+    for i in 0..<ks.len
+        w = (w << 5) ^ (w >> 3) ^ u32(i)
+        ks[i] = w
+    ks
+
+var schedule = expand(0x2b7e1516)
+var check = 0u32
+for w in schedule
+    check ^= w
+print(check != 0)
+
+zeroize(schedule)
+print(schedule)
+```
+
+```output
+true
+[0, 0, 0, 0, 0, 0, 0, 0]
+```
+
+**A view is handed over as it stands** — it widens to a view of the same elements as `volatile`, the
+same way it widens to a `[]const` one. A view that may not be written is refused, since this writes:
+a `val` array, a string's bytes, a `[]const u8`.
+
+```sysl
+import sysl.slices.zeroize
+
+val key = [1u8, 2, 3]
+zeroize(key)
+```
+
+```error
+views elements it may not write
+```
+
+It costs one store per element, which is what makes it unremovable; memory that holds nothing
+secret is cleared with `fill`. It says nothing about copies the program made elsewhere, a register
+still holding a value, or a page the system swapped out.
 
 ## Moving elements from one slice to another
 

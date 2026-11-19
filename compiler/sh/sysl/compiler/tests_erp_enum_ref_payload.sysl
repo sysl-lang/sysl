@@ -318,7 +318,7 @@ erp_written_derive_refusal_at_clause()
     if erp_no_std() then return
 
     val got = erp_reported("", raw"""
-        struct T derives Eq, Ord
+        struct T derives Eq
             name: string
 
         enum Rule derives Eq, Ord
@@ -331,10 +331,23 @@ erp_written_derive_refusal_at_clause()
 
     assert(!got.is_empty(), said)
 
-    // The derived `PartialOrd` writes `lt` and `le`, and each compares the field with `<` and `<=`.
+    // The derived `PartialOrd` writes `lt` and `le`, and each compares the field with `<` and `<=`,
+    // which read the `&T` through to a `T` that has no order.
     for line in got
-        val tail = " between &T needs 'PartialOrd' — T implements it, but 'PartialOrd' is an " +
-                   "operator's, and an operator does not see through a reference (in the copy for " +
-                   "field 'Rule.B.t') (in the copy for variant 'Rule.B')"
+        assert(line.starts_with("main.sysl:4: '<") &&
+               line.ends_with("(in the copy for field 'Rule.B.t') (in the copy for variant 'Rule.B')"), said)
 
-        assert(line == "main.sysl:4: '<'" + tail || line == "main.sysl:4: '<='" + tail, said)
+@test("a derived Ord compares a '&T' payload as its referent, since an operator reads a reference through")
+erp_derived_ord_through_reference()
+    if !erp_ready() then return
+
+    erp_prints(raw"""
+        struct T derives Eq, Ord
+            n: int
+
+        enum Rule derives Eq, Ord
+            A(n: int)
+            B(t: &T)
+
+        print(A(1) < A(2), B(T(1)) < B(T(2)), B(T(3)) < B(T(2)), A(9) < B(T(0)))
+        """, "true true false true\n")

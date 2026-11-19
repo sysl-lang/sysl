@@ -451,10 +451,15 @@ const_val_image(cx: &Analyzer, name: string, init: TExpr) -> Option[TExpr] = con
 // `"hello"[1..<3]`, a payload a `match` binds -- since a field, an element or a slice of constant data
 // is constant data. Where such a run stops at something it does not hold, the initializer is left to
 // the parts below exactly as before, with nothing added to say why.
+//
+// **A vector is run too**, whatever it is built from -- a splat, arithmetic over literals, a
+// shuffle, a conversion -- and so is anything worked out from one (a lane, a reduction, its lanes as
+// an array), since the evaluator holds every vector operator lane by lane as the program's run does,
+// and the lanes it comes to are laid down as the vector's constant.
 const_val_run(cx: &Analyzer, name: string, init: TExpr) -> Result[Option[TExpr], unit]
     val runs = calls_const_fn(cx.an, init)
 
-    if !runs && !projects(init) then return Ok(None)
+    if !runs && !projects(init) && !holds_vector(init) then return Ok(None)
 
     evaluate(cx.an, cx.scope, s"'$name'", init, no_fuse_here(cx)) match
         EvValue(Some(v)) ->
@@ -598,6 +603,16 @@ end calls_anything
 // Whether a typed tree takes a part of a value -- a field, a tuple's part, an element, a slice, a
 // length, or the payload a `match` binds -- which the fold of scalars does not reach, and the
 // evaluator does.
+// Whether any part of a typed tree is a vector.
+private holds_vector(t: TExpr) -> bool
+    var found: Buf[bool] = buf()
+    val sink = &found
+
+    walk_texpr(t, expr_walk(true, x -> if is_vector(underlying(texpr_type(x))) then sink.push(true)))
+
+    !found.is_empty()
+end holds_vector
+
 private projects(t: TExpr) -> bool
     var found: Buf[bool] = buf()
     val sink = &found
@@ -1186,7 +1201,7 @@ private value_text(v: Const, t: Type) -> string = v match
     ConstLink(image) -> *image.kind match
         TNullLit(_) -> "null"
         _ -> s"&${link_key(image)}"
-    ConstPtr(xs, at, _) -> s"&${value_text(xs[at], pointee(t).unwrap_or(Unknown))}"
+    ConstPtr(xs, at, _, _) -> s"&${value_text(xs[at], pointee(t).unwrap_or(Unknown))}"
     ConstUnset -> "nothing"
     ConstUnit -> "()"
     ConstPun(addr, as_was) -> value_text(*addr, *as_was)
@@ -1278,7 +1293,7 @@ private copied_all(xs: Buf[Const]) -> Buf[Const]
 // through, so that it is never remembered either.
 private holds_view(v: Const) -> bool = v match
     ConstView(_, _, _, _) -> true
-    ConstPtr(_, _, _) -> true
+    ConstPtr(_, _, _, _) -> true
     ConstPun(_, _) -> true
     ConstErased(_, _) -> true
     ConstWriter(_) -> true
@@ -1296,7 +1311,7 @@ private any_view(xs: Buf[Const]) -> bool
 // outlive the storage it views, once that call returns.
 private dangles(v: Const, depth: int) -> bool = v match
     ConstView(_, _, _, owner) -> owner >= depth
-    ConstPtr(_, _, owner) -> owner >= depth
+    ConstPtr(_, _, owner, _) -> owner >= depth
     ConstPun(addr, _) -> dangles(*addr, depth)
     ConstErased(_, data) -> dangles(*data, depth)
     ConstArray(xs) -> any_dangles(xs, depth)
@@ -1352,7 +1367,7 @@ private value_literal(span: Span, v: Const, t: Type) -> Option[TExpr] = v match
     // array of their own, a box as the box, and a pointer into fresh elements -- a frozen buffer's --
     // as the address of the first of an array laid down for them.
     ConstView(xs, lo, n, _) -> frozen_view(span, viewed(xs, lo, n), t)
-    ConstPtr(cells, at, _) -> underlying(t) match
+    ConstPtr(cells, at, _, _) -> underlying(t) match
         Ref(inner, _) -> value_literal(span, cells[at], *inner).map(lit -> TExpr(span, TBox(lit, t)))
         Ptr(inner, _) ->
             var rest: Buf[Const] = buf()
@@ -1413,7 +1428,7 @@ private answer_refusal_in(v: Const, t: Type, in_frozen: bool, laying: *Laying) -
                                     s"'[]const ${type_show(*elem)}'")
             else elements_refusal(viewed(xs, lo, n), *elem, in_frozen, laying)
         _ -> None
-    ConstPtr(cells, at, _) -> underlying(t) match
+    ConstPtr(cells, at, _, _) -> underlying(t) match
         Ref(inner, _) ->
             if container_named(*inner) == "sysl.buf.Frozen" then answer_refusal_in(cells[at], *inner, true, laying)
             else if !laying.boxes then Some(s"holds a reference, ${laid_text()} — answer the value itself, or a " +
@@ -2037,10 +2052,13 @@ private address_of(r: &EvRun, at: Span, place: TExpr, ty: Type) -> Flow
     end if
 
     slot_of(r, place) match
-        Ok(SlotElem(xs, i, owner)) -> EvGave(ConstPtr(xs, i, owner))
+        Ok(SlotElem(xs, i, owner, alone)) -> EvGave(ConstPtr(xs, i, owner, alone))
         Ok(SlotLocal(name)) -> refuse_form(r, at, s"'$name' is read before anything was written to it")
         Ok(SlotUnion(_, _, _, _, _)) ->
             refuse_form(r, at, "the address of a union's field is not evaluated while compiling yet")
+        Ok(SlotPun(_, _, _, _, _, _, _, _)) ->
+            refuse_form(r, at, "the address of a place reached through a pointer converted to another type is " +
+                        "not evaluated while compiling yet")
         Err(f) -> f
 end address_of
 
@@ -2092,9 +2110,16 @@ private linked_place(r: &EvRun, place: TExpr) -> Result[Option[TExpr], Flow] = *
 // linker fills in, what is there exists only when the program runs.
 @noinline
 private read_through(r: &EvRun, operand: TExpr) -> Flow = eval_value(r, operand) match
-    Ok(ConstPtr(xs, at, _)) -> EvGave(xs[at])
+    Ok(ConstPtr(xs, at, _, _)) -> EvGave(xs[at])
+    Ok(ConstPun(addr, as_was)) -> pun_value(r, operand.span, *addr, *as_was, pointee(texpr_type(operand)), 0)
     Ok(v) -> through_unowned(r, operand.span, v)
     Err(f) -> f
+
+// A read through a pointer converted to another type: the bytes it covers, read as its type.
+private pun_value(r: &EvRun, at: Span, addr: Const, as_was: Type, to: Option[Type], k: long) -> Flow =
+    pun_slot(r, at, addr, as_was, to, k).and_then(s -> slot_value(r, at, s)) match
+        Ok(v) -> EvGave(v)
+        Err(f) -> f
 
 // A value put on the heap: a box of its own, which nothing frees while the evaluation runs.
 @noinline
@@ -2104,7 +2129,7 @@ private boxed(r: &EvRun, at: Span, value: TExpr) -> Flow
     if why.is_some() then return refuse_form(r, at, why.unwrap())
 
     eval_value(r, value) match
-        Ok(v) -> EvGave(ConstPtr(cell_of(copied(v)), 0, -1))
+        Ok(v) -> EvGave(ConstPtr(cell_of(copied(v)), 0, -1, false))
         Err(f) -> f
 end boxed
 
@@ -2112,7 +2137,7 @@ end boxed
 // program makes one in its frame.
 @noinline
 private temp_address(r: &EvRun, value: TExpr) -> Flow = eval_value(r, value) match
-    Ok(v) -> EvGave(ConstPtr(cell_of(copied(v)), 0, int(r.frames.len()) - 1))
+    Ok(v) -> EvGave(ConstPtr(cell_of(copied(v)), 0, int(r.frames.len()) - 1, false))
     Err(f) -> f
 
 // Why a box of this type is not made while compiling: **a type with a `Drop` runs it when its box's
@@ -2360,7 +2385,10 @@ private element_read(r: &EvRun, receiver: TExpr, index: TExpr) -> Flow
             Ok(i) -> EvGave(ConstInt(from_int(long(s.bytes[i]))))
             Err(f) -> f
         // A pointer's subscript counts from the slot it points at.
-        Ok(ConstPtr(found, at, _)) -> (found, at, found.len() - at)
+        Ok(ConstPtr(found, at, _, _)) -> (found, at, found.len() - at)
+        Ok(ConstPun(addr, as_was)) -> return pun_index(r, index) match
+            Ok(k) -> pun_value(r, receiver.span, *addr, *as_was, pointee(texpr_type(receiver)), k)
+            Err(f) -> f
         Ok(ConstLink(image)) -> return through_unowned(r, receiver.span, ConstLink(image))
         Ok(_) -> return refuse_form(r, receiver.span, s"an element of a '${type_show(texpr_type(receiver))}' " +
                                     "is not evaluated while compiling yet — a fixed array's, a slice's and a " +
@@ -2428,8 +2456,12 @@ private slots(r: &EvRun, at: Span, op: string, args: Buf[TExpr]) -> Flow
             Ok(v) -> vals.push(v)
             Err(f) -> return f
 
+    // A run at compile time is never refused storage, so `try_slot_storage` makes what `slot_storage`
+    // does.
+    if op == "try_heap" then return refuse_form(r, at, "'try_heap', whose answer is the heap's")
+
     op match
-        "slot_storage" ->
+        "slot_storage" | "try_slot_storage" ->
             val n = vals[0] match
                 ConstInt(k) -> k.to_long().unwrap_or(-1)
                 _ -> -1
@@ -3156,7 +3188,7 @@ private render(r: &EvRun, at: Span, value: TExpr, method: string, spec: TExpr, s
 
                     target.recv match
                         ByValue -> *data match
-                            ConstPtr(cells, i, _) -> (cells[i], target.target)
+                            ConstPtr(cells, i, _, _) -> (cells[i], target.target)
                             other -> return through_unowned(r, value.span, other)
                         _ -> (*data, target.target)
                 None -> return refuse_form(r, at, s"the table '$name', which this compilation does not have")
@@ -3647,9 +3679,11 @@ private global_value(r: &EvRun, at: Span, symbol: string, ty: Type, writable: bo
 end global_value
 
 // Whether module storage of this type is read by running its initializer rather than by folding it.
+// A vector is: the untyped fold reads a splat's scalar (`val s: <4>u16 = 7`) as the scalar itself.
 private held_whole(t: Type) -> bool = t match
     Str -> true
     Array(_, _) -> true
+    Vector(_, _) -> true
     Struct(_) -> true
     Enum(_) -> true
     _ -> false
@@ -3855,7 +3889,7 @@ private operate(r: &EvRun, at: Span, op: string, lt: Type, x: Const, y: Const,
                 else Err(s"'$op' on ${type_show(lt)}")
             _ -> Err(s"'$op' on ${type_show(lt)}")
         (ConstStr(a), ConstStr(b)) -> return str_operate(r, at, op, a, b)
-        (ConstPtr(_, _, _), _) -> same_address(op, x, y, lt)
+        (ConstPtr(_, _, _, _), _) -> same_address(op, x, y, lt)
         (ConstLink(_), _) -> same_address(op, x, y, lt)
         (ConstPun(_, _), _) -> same_address(op, x, y, lt)
         _ -> Err(s"'$op' on ${type_show(lt)}")
@@ -3876,7 +3910,7 @@ private same_address(op: string, x: Const, y: Const, lt: Type) -> Result[Const, 
     if op != "==" && op != "!=" then return Err(s"'$op' on ${type_show(lt)}")
 
     val same = (unpunned(x), unpunned(y)) match
-        (ConstPtr(xs, i, _), ConstPtr(ys, j, _)) -> usize(&xs.elems[i]) == usize(&ys.elems[j])
+        (ConstPtr(xs, i, _, _), ConstPtr(ys, j, _, _)) -> usize(&xs.elems[i]) == usize(&ys.elems[j])
         (ConstLink(a), ConstLink(b)) -> link_key(a) == link_key(b)
         _ -> false
 
@@ -3966,7 +4000,7 @@ end dispatched_comparison
 
 // The value a reference reaches, for a comparison that compares referents.
 private referent(r: &EvRun, at: Span, v: Const) -> Result[Const, Flow] = v match
-    ConstPtr(xs, i, _) -> Ok(xs[i])
+    ConstPtr(xs, i, _, _) -> Ok(xs[i])
     other -> Err(through_unowned(r, at, other))
 
 @noinline
@@ -3992,7 +4026,7 @@ private cast(r: &EvRun, at: Span, operand: TExpr, ty: Type) -> Flow
         // A slot stays the slot it is under a reference or pointer to the same type, and is the same
         // address under one to another type -- which may be compared, and converted back, but not read
         // through. As a number it is where storage falls in memory, decided when the program runs.
-        ConstPtr(_, _, _) -> return punned(r, at, v, texpr_type(operand), ty)
+        ConstPtr(_, _, _, _) -> return punned(r, at, v, texpr_type(operand), ty)
         ConstPun(addr, as_was) -> return punned(r, at, *addr, *as_was, ty)
         _ -> ()
 
@@ -4326,7 +4360,7 @@ private dispatched(r: &EvRun, at: Span, receiver: TExpr, slot: int, args: Buf[TE
 
     target.recv match
         ByValue -> data match
-            ConstPtr(cells, i, _) -> vals.push(cells[i])
+            ConstPtr(cells, i, _, _) -> vals.push(cells[i])
             other -> return through_unowned(r, receiver.span, other)
         _ -> vals.push(data)
 
@@ -4348,7 +4382,7 @@ end dispatched
 @noinline
 private atomic(r: &EvRun, at: Span, op: string, addr: TExpr, ops: Buf[TExpr], at_ty: Type) -> Flow
     val (xs, i) = eval_value(r, addr) match
-        Ok(ConstPtr(cells, k, _)) -> (cells, k)
+        Ok(ConstPtr(cells, k, _, _)) -> (cells, k)
         Ok(v) -> return through_unowned(r, addr.span, v)
         Err(f) -> return f
 
@@ -4428,9 +4462,9 @@ private frozen_view(shown: string) -> bool = shown == "sysl.buf.Frozen.view" || 
 private frozen_call(r: &EvRun, at: Span, routine: string, name: string, vals: Buf[Const]) -> Flow
     if frozen_view(routine)
         return vals[0] match
-            ConstPtr(cells, i, _) -> cells[i] match
+            ConstPtr(cells, i, _, _) -> cells[i] match
                 ConstRecord(_, fields) -> (fields[1], fields[2]) match
-                    (ConstPtr(xs, lo, _), ConstInt(n)) -> EvGave(ConstView(xs, lo, usize(n.to_long().unwrap_or(0)), -1))
+                    (ConstPtr(xs, lo, _, _), ConstInt(n)) -> EvGave(ConstView(xs, lo, usize(n.to_long().unwrap_or(0)), -1))
                     (_, _) -> EvGave(ConstView(buf(), 0, 0, -1))
                 _ -> refuse_form(r, at, "a frozen buffer the run did not make")
             _ -> refuse_form(r, at, "a frozen buffer the run did not make")
@@ -4442,7 +4476,7 @@ private frozen_call(r: &EvRun, at: Span, routine: string, name: string, vals: Bu
         _ -> return refuse_form(r, at, "a buffer the run did not make")
 
     val (core_cells, core_at) = core match
-        ConstPtr(xs, i, _) -> (xs, i)
+        ConstPtr(xs, i, _, _) -> (xs, i)
         _ -> return refuse_form(r, at, "a buffer that names no storage")
 
     val (elems, lo, count) = core_cells[core_at] match
@@ -4462,7 +4496,7 @@ private frozen_call(r: &EvRun, at: Span, routine: string, name: string, vals: Bu
     fields.push(ConstInt(from_int(0)))
 
     if count == 0 then fields.push(ConstLink(TExpr(at, TNullLit(data_ty))))
-    else fields.push(ConstPtr(items, 0, -1))
+    else fields.push(ConstPtr(items, 0, -1, false))
 
     fields.push(ConstInt(from_int(long(count))))
 
@@ -4473,7 +4507,7 @@ private frozen_call(r: &EvRun, at: Span, routine: string, name: string, vals: Bu
 
     core_fields[1] = ConstInt(from_int(0))
 
-    EvGave(ConstPtr(cell_of(ConstRecord(-1, fields)), 0, -1))
+    EvGave(ConstPtr(cell_of(ConstRecord(-1, fields)), 0, -1, false))
 end frozen_call
 
 // The type of a `Frozen`'s pointer to its first element, from the `&Frozen[T]` freezing answers.
@@ -4796,7 +4830,7 @@ private key_part(v: Const) -> string = v match
     // An address is the storage or function it names: two calls handed the same one answer alike.
     ConstLink(image) -> s"&${link_key(image)};"
     // Never part of a key: a call handed a pointer reads, and may write, wherever it points.
-    ConstPtr(_, _, _) -> "p"
+    ConstPtr(_, _, _, _) -> "p"
     ConstUnset -> "u"
     ConstUnit -> "()"
     ConstPun(_, _) -> "p"
@@ -4977,11 +5011,15 @@ end variant_check
 // a slice, a field of a struct, a box's value -- at any depth, with the depth of the call whose
 // storage it is (-1 for the heap); or a local not written yet. A union's field is a slot of its own:
 // a write into it changes which field the union was last written through, which is part of the
-// union's value and so lands in the slot that holds the union.
+// union's value and so lands in the slot that holds the union. `alone` marks a struct's field, whose
+// neighbours are other fields. A place reached through a pointer converted to another type is bytes
+// of its own: cells `first` to `last` (exclusive) of a buffer of `was` values, from byte `offset` of
+// the first, read and written as a `to` (`const_bytes.sysl`); `at` is the place's span.
 private enum EvSlot
     SlotLocal(name: string)
-    SlotElem(elems: Buf[Const], at: usize, owner: int)
+    SlotElem(elems: Buf[Const], at: usize, owner: int, alone: bool)
     SlotUnion(holder: &EvSlot, fields: Buf[Const], written: int, at: usize, ty: Type)
+    SlotPun(cells: Buf[Const], first: usize, last: usize, offset: usize, was: Type, to: Type, owner: int, at: Span)
 end EvSlot
 
 // The slot a place names, its indices worked out: a local, an element, a field, at any depth.
@@ -4993,7 +5031,7 @@ private slot_of(r: &EvRun, place: TExpr) -> Result[EvSlot, Flow]
         TLoad(name, _) ->
             val cell = running(r).locals.get(name)
 
-            if cell.is_some() then Ok(SlotElem(cell.unwrap(), 0, int(r.frames.len()) - 1))
+            if cell.is_some() then Ok(SlotElem(cell.unwrap(), 0, int(r.frames.len()) - 1, false))
             else Ok(SlotLocal(name))
         TIndex(receiver, index, _) ->
             // An index through a pointer counts from the slot it points at, in the buffer that slot
@@ -5001,8 +5039,11 @@ private slot_of(r: &EvRun, place: TExpr) -> Result[EvSlot, Flow]
             nameless(texpr_type(receiver)) match
                 Ptr(_, _) ->
                     return eval_value(r, receiver) match
-                        Ok(ConstPtr(xs, at, owner)) ->
-                            element_index(r, index, xs.len() - at).map(i -> SlotElem(xs, at + i, owner))
+                        Ok(ConstPtr(xs, at, owner, alone)) ->
+                            element_index(r, index, xs.len() - at).map(i -> SlotElem(xs, at + i, owner, alone))
+                        Ok(ConstPun(addr, as_was)) -> pun_index(r, index) match
+                            Ok(k) -> pun_slot(r, place.span, *addr, *as_was, pointee(texpr_type(receiver)), k)
+                            Err(f) -> Err(f)
                         Ok(v) -> Err(through_unowned(r, receiver.span, v))
                         Err(f) -> Err(f)
                 _ -> ()
@@ -5019,7 +5060,7 @@ private slot_of(r: &EvRun, place: TExpr) -> Result[EvSlot, Flow]
                 Ok(_) -> return Err(no_place(r, place))
                 Err(f) -> return Err(f)
 
-            element_index(r, index, n).map(i -> SlotElem(xs, lo + i, owner))
+            element_index(r, index, n).map(i -> SlotElem(xs, lo + i, owner, false))
         // A field is a slot in the struct's own fields, so a write into it lands where it is held.
         TField(receiver, index, _) ->
             val outer = slot_of(r, receiver) match
@@ -5027,22 +5068,149 @@ private slot_of(r: &EvRun, place: TExpr) -> Result[EvSlot, Flow]
                 Err(f) -> return Err(f)
 
             slot_value(r, receiver.span, outer) match
-                Ok(ConstRecord(-1, fields)) -> Ok(SlotElem(fields, usize(index), slot_owner(outer)))
+                Ok(ConstRecord(-1, fields)) -> Ok(SlotElem(fields, usize(index), slot_owner(outer), true))
                 Ok(ConstRecord(v, fields)) if v <= -2 ->
                     Ok(SlotUnion(outer, fields, union_written(v), usize(index), texpr_type(receiver)))
                 Ok(_) -> Err(no_place(r, place))
                 Err(f) -> Err(f)
         // What a pointer points at is the slot it names.
         TDeref(operand, _) -> eval_value(r, operand) match
-            Ok(ConstPtr(xs, at, owner)) -> Ok(SlotElem(xs, at, owner))
+            Ok(ConstPtr(xs, at, owner, alone)) -> Ok(SlotElem(xs, at, owner, alone))
+            Ok(ConstPun(addr, as_was)) -> pun_slot(r, place.span, *addr, *as_was, pointee(texpr_type(operand)), 0)
             Ok(v) -> Err(through_unowned(r, operand.span, v))
             Err(f) -> Err(f)
         _ -> Err(no_place(r, place))
 end slot_of
 
+// An index through a pointer converted to another type, as a count of elements either way: the
+// storage it reaches is checked by `pun_slot`, against the bytes the address is in.
+private pun_index(r: &EvRun, index: TExpr) -> Result[long, Flow] = eval_value(r, index) match
+    Ok(ConstInt(i)) -> i.to_long() match
+        Some(k) -> Ok(k)
+        None -> Err(refuse_form(r, index.span, s"an index of ${to_string(i)} is not evaluated while compiling"))
+    Ok(_) -> Err(refuse_form(r, index.span, "an index that is not an integer"))
+    Err(f) -> Err(f)
+
+// **A place reached through a pointer converted to another type**: the `to` that is `k` elements past
+// an address of storage the run owns, taken at `as_was`. The storage is a buffer of `was` values --
+// an array's elements, or a single slot where the address is a local's, a box's or a struct field's
+// -- laid out as bytes in the target's byte order (`const_bytes.sysl`). A place outside those bytes
+// is refused rather than read: what lies there is decided only when the program runs.
+@noinline
+private pun_slot(r: &EvRun, at: Span, addr: Const, as_was: Type, to_ptr: Option[Type],
+                 k: long) -> Result[EvSlot, Flow]
+    val (xs, base, owner, alone) = addr match
+        ConstPtr(cells, i, o, a) -> (cells, i, o, a)
+        other -> return Err(through_unowned(r, at, other))
+
+    val was = pointee(as_was).unwrap_or(Unknown)
+    val to = to_ptr.unwrap_or(Unknown)
+
+    val wsize = laid_size(was) match
+        Some(n) -> n
+        None -> return Err(refuse_form(r, at, s"memory a '${type_show(as_was)}' points at, read as another type, " +
+                                       s"is not evaluated while compiling — ${unlaid_text(was)}"))
+    val tsize = laid_size(to) match
+        Some(n) -> n
+        None -> return Err(refuse_form(r, at, s"memory read as a '${type_show(to)}' through a pointer converted from " +
+                                       s"a '${type_show(as_was)}' is not evaluated while compiling — ${unlaid_text(to)}"))
+
+    if wsize == 0 || tsize == 0 then
+        return Err(refuse_form(r, at, "memory of a type that takes no room, read as another type, is not evaluated " +
+                               "while compiling"))
+
+    // The bytes the address may reach: its own slot's, for a field; the whole buffer's, otherwise.
+    val lo_cell = if alone then base else usize(0)
+    val hi_cell = if alone then base + 1 else xs.len()
+    val room = long((hi_cell - lo_cell) * wsize)
+    val start = if k > room || k < -room then long(-1) else long(base * wsize) + k * long(tsize)
+
+    if start < long(lo_cell * wsize) || start + long(tsize) > long(hi_cell * wsize)
+        val unit_word = if room == 1 then "byte" else "bytes"
+
+        return Err(refuse_form(r, at, s"a '${type_show(to)}' read or written at element $k through a pointer " +
+                               s"converted from a '${type_show(as_was)}' reaches outside the storage the address is " +
+                               s"in, $room $unit_word long — what lies there exists only when the program runs"))
+    end if
+
+    val first = usize(start) / wsize
+    val last = (usize(start) + tsize - 1) / wsize + 1
+
+    Ok(SlotPun(xs, first, last, usize(start) - first * wsize, was, to, owner, at))
+end pun_slot
+
+// Why a type's bytes are not laid out while compiling.
+private unlaid_text(t: Type) -> string =
+    "the bytes of integers, floats, 'bool', 'char' and fixed arrays of them are laid out while compiling, " +
+    s"and a '${type_show(t)}' is none of those"
+
+private val not_a_value_text: string = "a 'bool' is 0 or 1, and a 'char' a Unicode scalar value"
+
+// The bytes cells `first` to `last` of a pun's storage are laid out in, or the refusal.
+private pun_bytes(r: &EvRun, at: Span, xs: Buf[Const], first: usize, last: usize,
+                  was: Type) -> Result[Buf[u8], Flow]
+    var bytes: Buf[u8] = buf()
+
+    for i in first..<last
+        val v = placed(r, at, xs[i]) match
+            EvGave(x) -> x
+            f -> return Err(f)
+
+        if !laid_bytes(v, was, r.a.tables.layout.little_endian, bytes) then
+            return Err(refuse_form(r, at, s"memory read as another type holds something that is not a " +
+                                   s"'${type_show(was)}' — ${unlaid_text(was)}"))
+    end for
+
+    Ok(bytes)
+end pun_bytes
+
+// What a pun's place holds: its bytes read back as the type it is read at.
+private pun_read(r: &EvRun, xs: Buf[Const], first: usize, last: usize, offset: usize, was: Type, to: Type,
+                 at: Span) -> Result[Const, Flow]
+    val bytes = pun_bytes(r, at, xs, first, last, was)?
+
+    value_of_bytes(bytes, offset, to, r.a.tables.layout.little_endian) match
+        Some(v) -> Ok(v)
+        None -> Err(refuse_form(r, at, s"the bytes read as a '${type_show(to)}' are not a value of it — " +
+                                not_a_value_text))
+end pun_read
+
+// A write into a pun's place: its storage's bytes, the value laid over them, read back as the values
+// the storage holds. Refused where those bytes would be no value of the storage's type.
+private pun_write(r: &EvRun, xs: Buf[Const], first: usize, last: usize, offset: usize, was: Type, to: Type,
+                  at: Span, v: Const) -> Option[Flow]
+    var bytes = pun_bytes(r, at, xs, first, last, was) match
+        Ok(b) -> b
+        Err(f) -> return Some(f)
+
+    val little = r.a.tables.layout.little_endian
+    var laid: Buf[u8] = buf()
+
+    if !laid_bytes(v, to, little, laid) then
+        return Some(refuse_form(r, at, s"a '${type_show(to)}' written as bytes — ${unlaid_text(to)}"))
+
+    for i in 0..<laid.len()
+        bytes[offset + i] = laid[i]
+
+    var back: Buf[Const] = buf()
+    val wsize = laid_size(was).unwrap_or(0)
+
+    for i in 0..<(last - first)
+        value_of_bytes(bytes, i * wsize, was, little) match
+            Some(cell) -> back.push(cell)
+            None -> return Some(refuse_form(r, at, s"a write through a pointer converted from a '${type_show(was)}' " +
+                                            s"leaves bytes that are no '${type_show(was)}' — $not_a_value_text"))
+
+    for i in 0..<back.len()
+        written_over(xs, first + i, back[i])
+
+    None
+end pun_write
+
 // Whose storage a slot is: the depth of the call that holds it, or -1 for the heap.
 private slot_owner(s: EvSlot) -> int = s match
-    SlotElem(_, _, owner) -> owner
+    SlotElem(_, _, owner, _) -> owner
+    SlotPun(_, _, _, _, _, _, owner, _) -> owner
     SlotUnion(holder, _, _, _, _) -> slot_owner(*holder)
     SlotLocal(_) -> -1
 
@@ -5050,8 +5218,8 @@ private slot_owner(s: EvSlot) -> int = s match
 // program runs; an address the linker fills in names storage that exists only then.
 private through_unowned(r: &EvRun, at: Span, v: Const) -> Flow = v match
     ConstPun(_, as_was) ->
-        refuse_form(r, at, s"memory a '${type_show(*as_was)}' points at, read as another type, is not evaluated " +
-                    "while compiling — the evaluator holds values, not the bytes they are laid out in")
+        refuse_form(r, at, s"memory a '${type_show(*as_was)}' points at, used as another type this way, is not " +
+                    "evaluated while compiling — a read or a write through the pointer is")
     ConstLink(image) -> *image.kind match
         TNullLit(_) -> trap(r, at, "a read or write through a null pointer")
         _ -> refuse_form(r, at, link_reason())
@@ -5060,23 +5228,29 @@ private through_unowned(r: &EvRun, at: Span, v: Const) -> Flow = v match
 // What a slot holds now.
 private slot_value(r: &EvRun, at: Span, s: EvSlot) -> Result[Const, Flow] = s match
     SlotLocal(name) -> Err(refuse_form(r, at, s"'$name' is read before anything was written to it"))
-    SlotElem(xs, i, _) -> placed(r, at, xs[i]) match
+    SlotElem(xs, i, _, _) -> placed(r, at, xs[i]) match
         EvGave(v) -> Ok(v)
         f -> Err(f)
     SlotUnion(_, xs, written, i, ty) ->
         if written == int(i) then Ok(xs[i])
         else Err(refuse_form(r, at, union_cross_read(ty, written, int(i))))
+    SlotPun(xs, first, last, offset, was, to, _, pat) -> pun_read(r, xs, first, last, offset, was, to, pat)
 
 // A value written into a slot, as a copy of its own. A union written through a field is the union
-// built with that field.
-private slot_write(r: &EvRun, s: EvSlot, v: Const) -> unit = s match
-    SlotLocal(name) -> assign(r, name, v)
-    SlotElem(xs, i, _) -> written_over(xs, i, v)
-    SlotUnion(holder, xs, _, i, _) ->
-        var held = xs
+// built with that field. A write as bytes may be refused (`pun_write`); nothing else is.
+private slot_write(r: &EvRun, s: EvSlot, v: Const) -> Option[Flow]
+    s match
+        SlotLocal(name) -> assign(r, name, v)
+        SlotElem(xs, i, _, _) -> written_over(xs, i, v)
+        SlotUnion(holder, xs, _, i, _) ->
+            var held = xs
 
-        held[i] = copied(v)
-        slot_write(r, *holder, ConstRecord(union_variant(int(i)), xs))
+            held[i] = copied(v)
+            return slot_write(r, *holder, ConstRecord(union_variant(int(i)), xs))
+        SlotPun(xs, first, last, offset, was, to, _, at) -> return pun_write(r, xs, first, last, offset, was, to, at, v)
+
+    None
+end slot_write
 
 private assign(r: &EvRun, name: string, v: Const)
     val frame = r.frames[r.frames.len() - 1]
@@ -5119,16 +5293,13 @@ private store(r: &EvRun, at: Span, place: TExpr, value: TExpr) -> Flow
         _ -> false
 
     if local && zeroless_init(value)
-        slot_write(r, slot, ConstUnset)
-        return EvNone
-    end if
+        return slot_write(r, slot, ConstUnset).unwrap_or(EvNone)
 
     val v = eval_value(r, value) match
         Ok(x) -> x
         Err(f) -> return f
 
-    slot_write(r, slot, v)
-    EvGave(v)
+    slot_write(r, slot, v).unwrap_or(EvGave(v))
 end store
 
 // What a compound assignment's operator makes of the place's value and the value on the right, and
@@ -5184,10 +5355,8 @@ private update(r: &EvRun, at: Span, place: TExpr, op: string, value: TExpr, ty: 
     val out = updated_value(r, at, op, ty, value, cur, check)
 
     ev_value_of(out) match
-        Some(nv) -> slot_write(r, slot, nv)
-        None -> ()
-
-    out
+        Some(nv) -> slot_write(r, slot, nv).unwrap_or(out)
+        None -> out
 end update
 
 // What a compound assignment makes of the place's value `cur` and the value on the right: one
@@ -5233,8 +5402,7 @@ private ev_inc_dec(r: &EvRun, at: Span, place: TExpr, op: string, pre: bool, ty:
                 return trap(r, at, s"${to_string(nv)} is not a value '${type_show(check.unwrap())}' admits")
         _ -> ()
 
-    slot_write(r, slot, ConstInt(nv))
-    EvGave(ConstInt(if pre then nv else cur))
+    slot_write(r, slot, ConstInt(nv)).unwrap_or(EvGave(ConstInt(if pre then nv else cur)))
 end ev_inc_dec
 
 @noinline
@@ -5308,7 +5476,9 @@ private ev_multi_assign(r: &EvRun, writes: Buf[TWrite]) -> Flow
         end if
 
     for item in landing
-        slot_write(r, item.0, item.1)
+        val refused = slot_write(r, item.0, item.1)
+
+        if refused.is_some() then return refused.unwrap()
 
     EvNone
 end ev_multi_assign
@@ -5384,6 +5554,11 @@ private matches(r: &EvRun, p: TPattern, v: Const) -> Result[bool, Flow] = p matc
     TStructPattern(_, args) -> v match
         ConstRecord(_, fields) -> fields_match(r, args, fields)
         _ -> Err(refuse_form(r, span_zero(), "a struct pattern over something that is not a struct"))
+
+    // A shape matched through a reference matches what the reference holds, read as `*x` reads it.
+    TDerefPattern(_, inner) -> v match
+        ConstPtr(xs, at, _, _) -> matches(r, *inner, xs[at])
+        _ -> Err(refuse_form(r, span_zero(), "a pattern through a reference over something that is not one"))
 
 @noinline
 private ev_if(r: &EvRun, at: Span, cond: Buf[TCondTerm], then_block: TBlock,

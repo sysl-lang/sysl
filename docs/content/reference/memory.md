@@ -152,9 +152,63 @@ print(*n + 1)
 
 **A reference is never null.** There is no null in the safe subset; something that may be absent is
 an `Option[&T]`, and a `match` is the only route to it. A box is made from what the allocator answers,
-and a null answer **traps** before anything is stored, exactly as a failed array allocation does. The
-one `&T` that reads as null is one in storage the language did not lay out and the program zeroed
+and a null answer **traps** before anything is stored, exactly as a failed array allocation does — a
+program that must answer the refusal instead asks with a fallible twin
+([below](#an-allocation-that-may-fail)). The one `&T` that reads as null is one in storage the language
+did not lay out and the program zeroed
 ([below](#storage-the-compiler-did-not-lay-out-may-not-hold-a-counted-value)).
+
+### An allocation that may fail
+
+**The allocator may answer null**: libc's `malloc` does for a size it cannot give, and a pair a
+manifest names (`allocator { alloc, free }`, [packages](/reference/packages/)) — a kernel's heap — may
+answer null whenever it is out of room. **Every allocation the language makes traps on that answer
+before anything is stored**: a box, a slice, a string (a concatenation, a rendering, `str_cast`), a
+buffer's growth, a task's frame. The trap is the one every other check stops with — status 133, no
+message — after what was printed so far is flushed.
+
+That is the right default for a program with nowhere to go when memory runs out, and the wrong one for
+a kernel, whose system calls answer `ENOMEM` and carry on. So **each allocating member of the library
+has exactly one fallible twin**, named `try_` and the member's own name, which answers
+`Result[_, AllocError]` ([`sysl.alloc`](/library/buf/#allocation-that-may-fail)) and never traps on the
+heap's refusal: `Buf.try_push`, `try_reserve`, `try_extend`, `try_insert`, `try_copy`, `try_buf`,
+`try_buf_with_capacity`, `try_buf_filled`; `StrBuilder.try_push` and its siblings, `try_finish`,
+`try_str_builder`, `try_cstring`; and `try_box(v)` for the box a `&T` of `v` would be. `AllocError` is
+`CapacityOverflow` — the size does not fit in a `usize`, and the heap was not asked — or `OutOfMemory`.
+
+```sysl
+import sysl.alloc.try_box
+import sysl.buf.{Buf, buf}
+
+struct Point
+    x: int
+    y: int
+
+main()
+    var b: Buf[u64] = buf()
+
+    b.try_reserve(usize(1) << 61) match
+        Ok(_) -> print("reserved")
+        Err(e) -> print("refused:", e, b.len())
+
+    val p = try_box(Point(1, 2))
+
+    print(p.is_ok(), p.unwrap().y)
+```
+
+```output
+refused: capacity overflow 0
+true 2
+```
+
+**A refused twin leaves nothing half-built**: the buffer keeps its elements, its count and its storage;
+the value it was handed is not kept; nothing allocated before the refusal stays allocated. Rust's
+`try_reserve` family and Rust for Linux's `try_push` and `Box::try_new` are the same bargain. A twin
+still traps on what is a mistake in the program rather than a refusal — an index past the end, a
+buffer never given storage.
+
+The twins are written over two raw-tier forms, `try_slot_storage(n)` and `try_heap(v)`
+([below](#slot-storage-room-that-holds-no-value-yet)); a program writes the twins.
 
 ### References compare through their referent
 
@@ -352,11 +406,12 @@ through a plain struct field are each refused, unless one of three things holds:
 
 - the field is an `Atomic`, written through its members — or a struct made only of atomics, locks
   and guarded fields, whose `*self` members can write nothing else;
-- a [`@guards`](#a-guarded-value-crosses-with-its-lock) names the field, so a write holds the lock (a
-  `Mutex` field is one, and the library's locks — `SpinLock`, `SleepLock`, `Condvar`, `Barrier`,
-  `Channel` — are used through their own members);
-- the type is `@unchecked(Share)`, the program's promise that its writes are synchronised another
-  way.
+- a [`@guards`](#a-guarded-value-crosses-with-its-lock) names a `private` field, so only the type's own members write it. **That
+  they take the lock is not checked**: the members are trusted. The library's `Mutex` and `Guarded`
+  take it in every member (a `Mutex` field is one, and the library's locks — `SpinLock`,
+  `SleepLock`, `Condvar`, `Barrier`, `Channel` — are used through their own members);
+- the type is `@unchecked(Share)`, the other trusted form: the program's promise that its writes are
+  synchronised another way.
 
 A field that is itself a `&sync U` may be read, and its own fields follow the same rule. A `*T`
 reached through one leads to storage the object does not hold, and is the raw tier's as everywhere. An
@@ -373,7 +428,7 @@ c.n += 1
 ```
 
 ```error
-this '+=' writes a field reached through a '&sync Cell', which is read-only: every thread holding the reference may reach it at once, and a plain write would race theirs. Make the field an 'Atomic', name it in a '@guards' so a write holds the lock, or write '@unchecked(Share)' above 'Cell' where its writes are synchronised another way
+this '+=' writes a field reached through a '&sync Cell', which is read-only: every thread holding the reference may reach it at once, and a plain write would race theirs. Make the field an 'Atomic', name it in a '@guards' (the field is then private, so only the type's own members write it, and they must take the lock, which is not checked), or write '@unchecked(Share)' above 'Cell' where its writes are synchronised another way
 ```
 
 The counter that is meant to be shared is an `Atomic`:
@@ -1810,8 +1865,10 @@ print(halves())
 ## A destructor
 
 **`impl Drop for T` says what a type does when the last reference to one of its values goes.** It
-declares one member, `drop(self)`, answering nothing. It is for the resource the language does not
-manage — a descriptor, a mapped region, a handle a C library made — said once, beside the type:
+declares one member, `drop(*self)`, answering nothing, which an implementation writes `drop(self)`
+where a copy of the value will do ([below](#a-destructor-handed-its-own-storage)). It is for the
+resource the language does not manage — a descriptor, a mapped region, a handle a C library made —
+said once, beside the type:
 
 ```sysl
 struct Handle
@@ -1851,8 +1908,9 @@ the hooks it would call are not asked for.
 - **The order is Rust's**: locals in reverse order of declaration at the end of their block, each
   deferred statement in its written place among them; temporaries at the end of their statement;
   fields and elements in declaration and index order.
-- **`drop(self)` runs before the object's own fields are released**, sees `self` intact, and may not
-  resurrect it.
+- **`drop` runs before the object's own fields are released**, sees `self` intact, and may not
+  resurrect it. A `drop(*self)` is handed the object's own storage, and its fields are released as
+  it leaves them.
 - **A type with `Drop` is a reference type**, so only `&T` of it exists.
 - **A copy of a value retains its `&T` fields.**
 - **Cycles leak unless broken with `weak`.**
@@ -1993,6 +2051,53 @@ print(peek(Thing(2)))
   and the value it builds takes a share rather than becoming a second owner.
 - **It is not called for a value in a reference cycle**, nor **for module storage at exit**: there is
   no exit pass, so a buffered writer held in a static is flushed by the program.
+
+### A destructor handed its own storage
+
+**`drop(self)` is handed a copy; `drop(*self)` is handed the object itself.** A `(self)` method
+copies the value it is called on, and for a destructor that reads a field to close what it names, a
+copy is all it needs. A destructor that gives C back *the address of the object* — a node it linked
+into a C list, a key it registered, storage it must wipe before it is freed — needs the address every
+`(*self)` method saw while the object lived, and `drop(*self)` is handed exactly that:
+
+```sysl
+static var registered: usize = 0
+
+struct Key
+    bytes: [4]u8
+
+impl Key
+    register(*self)
+        registered = usize(self)
+
+impl Drop for Key
+    drop(*self)
+        print("same storage:", usize(self) == registered)
+        self.bytes = [0, 0, 0, 0]
+
+hold()
+    val k = Key([1, 2, 3, 4])
+
+    k.register()
+    print("holding", k.bytes[0])
+
+hold()
+```
+
+```output
+holding 1
+same storage: true
+```
+
+- **The trait declares `drop(*self)`, and a `drop(self)` stands for it** as a `(self)` member stands
+  for any trait's `(*self)` one ([traits](/reference/traits/)); neither form replaces the other.
+- **It is the same address wherever the object lives**: a box on the heap, one laid in a frame, one a
+  module `var` holds, one a field of another object holds.
+- **A write through it is the object's own.** A field it replaces is released once, as any
+  assignment's old value is, and the fields are released as the destructor leaves them, not as they
+  were when it was called.
+- **`drop(&self)` is refused**, as any receiver the trait does not declare: a `&self` would take a
+  share of an object whose count has already reached zero.
 
 ### When a value is dropped
 
@@ -2211,10 +2316,11 @@ acquire`, or an acquire load under `-fsanitize=thread`, which does not model a s
 ### Module storage reached from another domain
 
 A closure erased into a `&sync Fn` is asked about what it captures **and about the module storage it
-reaches**, however many calls down. What may be reached is what may be captured: a scalar, an
-`Atomic`, a `&sync T`, a raw pointer, `@thread_local` storage, and a `val` laid down as constant data
-(a `val` over a slice literal is one; a `val` over a call is not, and a `[]T` without `const` is
-writable). An interrupt handler — the `interrupt` convention, or
+reaches**, however many calls down. What may be reached is what may be captured, less a string: a
+scalar, an `Atomic`, a `&sync T`, a raw pointer, `@thread_local` storage, and a `val` laid down as
+constant data (a `val` over a slice literal is one; a `val` over a call is not, and a `[]T` without
+`const` is writable). A string in module storage is refused where a captured one is not, because
+[nothing copies it](#a-string-crosses-into-a-shared-object) on the way. An interrupt handler — the `interrupt` convention, or
 [`@domain(interrupt)`](/reference/attributes/#domain-interrupt-a-function-entered-on-top-of-whatever-was-running)
 — is held to it too; a bare `@export` is not, since nothing says a second domain exists until `@domain`
 does.
@@ -2251,7 +2357,10 @@ function, its address taken — it is refused). A `.copy()` of a `Buf` is fresh 
 no count, and one of strings or `Buf`s copies only the handles. A value read out of the guarded one
 still shares its count, and is refused; the guarded value held as a `&sync Mutex[...]` and captured
 crosses whole. A struct of the program's
-own opts in with `@guards(field)` over a `private` field. **Not checked**: a closure that *stores*
+own opts in with `@guards(field)` over a `private` field: the compiler checks that the field is
+private, so only the type's own members write it, and trusts those members to take the lock, as
+`Mutex` and `Guarded` do in every member. **Not checked**: that a member of a program's own type
+takes the lock (the example below compiles and prints `1` with no lock taken), and a closure that *stores*
 something read out of the guarded value where it outlives the call.
 
 ```sysl
@@ -2265,6 +2374,29 @@ print(names.with((t) -> t.get("a").unwrap_or("none")))
 
 ```error
 'sysl.threads.Mutex.with' answers a value out of the 'value' it guards, and once the guard is let go that value is shared with whoever holds it next, so every count it reaches has to be atomic — but this answers a 'string', which may share its bytes' count with the guarded one. Answer a fresh string instead — '.copy()' inside the closure gives the string an owner of its own, and a literal is immortal
+```
+
+```sysl
+import sysl.sync.SpinLock
+
+@guards(n)
+struct Cell
+    lock: SpinLock
+    private n: u64
+
+    bump(*self)
+        self.n += 1
+
+    get(self) -> u64 = self.n
+
+val c: &sync Cell = Cell(SpinLock(0), 0)
+
+c.bump()
+print(c.get())
+```
+
+```output
+1
 ```
 
 ### A table whose every record has its own lock
@@ -2432,6 +2564,70 @@ job()
 a closure shared between two domains may be called from either, so every count it captures has to be atomic — but the 'f' it captures reaches a '&Frozen[int]', whose count is not. Hold it as a '&sync Frozen[int]' ('06')
 ```
 
+### A string crosses into a shared object
+
+**A string a `&sync Fn` captures, or a `&sync T` holds, is put in bytes of its own whose count is
+atomic, where the closure or the object is made.** Nothing is written for it: the type stays `string`,
+and the string the program holds keeps its ordinary count. The bytes are copied once, as the box is
+filled and before anyone else can reach it, and the copy's count carries a mark — its top bit — that
+every share of it reads. A share of a marked count is taken and given back atomically, as a
+`&sync T`'s is, wherever it is taken: in the closure's body, on another thread, in a slice of the
+string, in a string a channel carries.
+
+```sysl
+import sysl.threads.scope
+
+val n = 7
+val name = s"worker-$n"
+val job: &sync Fn() -> string = () -> name[0..<6]
+
+val lens = scope((s) ->
+    val a = s.spawn(() -> job().len)
+    val b = s.spawn(() -> (job() + name[6..<name.len]).len)
+
+    a.join() * 100 + b.join())
+
+scope((s) -> s.spawn(() -> print(job(), job() + name[6..<name.len])).join())
+print(lens, name)
+```
+
+```output
+worker worker-7
+608 worker-7
+```
+
+- **A literal is not copied**, nor a string already shared — one read out of another `&sync` object:
+  the first has no count at all, and the second's is atomic already.
+- **A field, an array element, an `Option` and an enum payload** of the object are followed, so a
+  `&sync Cfg` whose `names: [2]string` and `alias: Option[string]` were built at run time shares each.
+  A field a `@guards` guards, a frozen buffer's elements and a struct promising `@unchecked(Share)` are
+  left as they are, as the rule about what a `&sync T` may hold leaves them.
+- **What it costs**: the copy, once per string per object made, and on every share of any string a
+  test of the mark, made on the count it was about to change anyway. A program that shares nothing
+  never sets the mark, and its counts change as they always did.
+- **Where a word cannot be changed indivisibly** (Armv6-M) nothing is marked: the copy is still made,
+  and its count is an ordinary one.
+
+**A string is shared only where something copies it on the way.** Module storage is reached rather
+than captured, so a string there stays in its own domain, and so does a string among a view's
+elements, a frozen buffer's, a task's frame, or what a pointer handed to a `@crossing` parameter
+reaches:
+
+```sysl
+static var greeting: string = "hi"
+
+val job: &sync Fn() -> unit = () -> print(greeting)
+
+job()
+```
+
+```error
+the module storage 'greeting' it reaches is a 'string', which owns its bytes through a count that is not atomic, and nothing copies it on the way here
+```
+
+A string is therefore `Send` and still not `Share` (below): the bound asks about every place a value
+of the type may be put, and a pointer's pointee is one.
+
 ### `@crossing` — where the rule is asked
 
 **`@crossing(p)` is written above the function that hands `p` to another domain.**
@@ -2477,8 +2673,10 @@ what 's' of 'start' points at reaches another concurrency domain, so every count
 **`sysl.Send` and `sysl.Share` are the two questions above, as bounds a signature can write.** A type
 is **`Send`** where a value of it may be handed to another domain by value — the question a `@crossing`
 parameter taken by value asks, every view and string inside it copied on the way. It is **`Share`**
-where an object of it may be reached from two domains at once — the question `&sync T` asks, nothing
-copied, so a view and a `string` are out. `Share` is `Send` and more.
+where an object of it may be reached from two domains at once wherever it is — behind a pointer as
+well as a `&sync T` — with nothing copied, so a view and a `string` are out. (A `&sync T` holding a
+string copies it in where the object is made, which is a property of that place rather than of the
+type.) `Share` is `Send` and more.
 
 | type | `Send` | `Share` |
 |---|---|---|
@@ -2980,7 +3178,7 @@ print(a - b)
 ```
 
 ```error
-operator '-' is not defined for &Point
+operator '-' is not defined for Point
 ```
 
 **Bounds safety follows length, not pointers.** Arrays and views carry their length, so indexing is
@@ -2997,6 +3195,7 @@ none: `p[i]` and `p[0..<n]` are unchecked, as in C. A pointer to something with 
 | `usize(p)` | a pointer as a number | an ordinary conversion |
 | `ptr_cast(n)` | a number as a pointer | unsafe |
 | `ptr_cast(p)` | one pointee type as another | unsafe |
+| `xs.view_as[T]()` | a view's plain-data elements as other plain data, owner kept, boundary and tail checked | safe ([arrays](/reference/arrays/#reading-a-view-as-another-element)) |
 
 **`ptr_cast` is imported from `sysl.raw`**, beside `str_cast` and `str_alias`, so every
 reinterpretation is found by its imports; an alias, a wildcard and a module path reach it as they
@@ -3199,6 +3398,33 @@ print(nodes[0].n + nodes[1].n + nodes[2].n + nodes[3].n)
 6
 ```
 
+**Two forms answer the heap's refusal instead of trapping on it** ([above](#an-allocation-that-may-fail)):
+
+- **`try_slot_storage(n)`** is `slot_storage(n)`, except that where the heap answers null — or `n`
+  slots do not fit in a word, in which case the heap is not asked — it answers an **empty** view. A
+  caller asking for `n > 0` slots tells the two apart by the length.
+- **`try_heap(v)`** is the box a `&T` of `v` would be, as an `Option[&T]`: `None` where the heap
+  answered null, with nothing stored and no count of `v` taken.
+
+```sysl
+struct Node
+    n: int
+
+val xs: []&Node = try_slot_storage(4)
+val big = try_slot_storage[u64](usize::Max)
+
+print(xs.len, big.len)
+
+try_heap(Node(7)) match
+    Some(b) -> print((*b).n)
+    None -> print("refused")
+```
+
+```output
+4 0
+7
+```
+
 ### Moving one value through a raw pointer
 
 Storage whose live slots are not a prefix — a ring's run wraps — moves one value at a time, as Rust's
@@ -3348,6 +3574,63 @@ wait_for(n: u64)
 - **`volatile` is not reserved** — special only before a type, as `sync` is after `&`. `[]const
   volatile u32` is a read-only register view: `const` is the view's property, `volatile` the
   element's.
+- **A `[]T` is accepted where a `[]volatile T` is wanted**, and an array where its view would be — the
+  same elements, every access through the new view an effect. It keeps the view's `const`: a
+  `[]const T`, a `val` array or a string's bytes reach only a `[]const volatile T`. It is never taken
+  away, and it goes one level only: a `[][]u8` is not a `[][]volatile u8`, whose slots could then be
+  handed a view of device memory that the `[][]u8` holder reads as ordinary memory. This is what
+  [`sysl.slices.zeroize`](/library/slices/#clearing-a-secret) is built on — a clearing of a buffer
+  nothing reads again, kept at `-O2`:
+
+```sysl
+clear(v: []volatile u8)
+    for i in 0..<v.len
+        v[i] = 0
+
+var key = [3u8, 1, 4]
+clear(key)
+print(key)
+```
+
+```output
+[0, 0, 0]
+```
+
+- **A type parameter may be qualified where its bound closes it to the scalars** — `[T: Integer]`, a
+  family whose membership is the compiler's and every member of which is one integer. `T` is read
+  through the widening, so a `[]u32` handed to a `[]volatile T` binds `u32`, and every store is at that
+  width:
+
+```sysl
+clear[T: Integer](v: []volatile T) -> usize
+    for i in 0..<v.len
+        v[i] = 0
+    v.len
+
+var round_keys = [0x9e3779b9u32, 0x7f4a7c15]
+var mac = [0xffu8, 0x10, 0x20]
+print(clear(round_keys), clear(mac[1..<3]), round_keys, mac)
+```
+
+```output
+2 2 [0, 0] [255, 0, 0]
+```
+
+- **Any other bound is refused at the declaration**: an unbounded `T` may stand for a struct, and an
+  open trait — `Float`, `Add` — may be implemented by one, so neither is known to be a scalar. A view
+  of a constrained subtype is refused at the call, as the wrong elements, since a volatile place holds
+  whatever is written to it:
+
+```sysl
+f[T](v: []volatile T) = ()
+```
+
+```error
+'volatile T' is not a type: 'volatile' qualifies a scalar or a raw pointer, since it promises the one load or the one store the source wrote and nothing else -- and nothing bounds 'T' to the scalars
+```
+
+- **An array of qualified elements is filled from a literal** of the plain type, as a struct's
+  qualified field is from a constructor: `var bank: [4]volatile u32 = [1, 2, 3, 4]`.
 - **Memory a device reads by DMA is a library type**, [`sysl.dma`'s `Region`](/library/dma/), not a
   qualifier: it needs a device address and a cache-honest handover, neither a property of a place.
 
