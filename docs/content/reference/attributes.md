@@ -735,7 +735,35 @@ main()
 **`@keeps(self)` lets an implementation hold the object the call went through** past the call — a
 view registering itself, say. The object may have been made in the caller's frame, so without the
 mark an implementation that keeps `self` is refused where it is written, and with it every call
-through an object hands over an object that may be kept:
+through an object hands over an object that may be kept. The refusal names the mark, because the
+trait's borrowed receiver is its whole cause — it says the same for what the method reads through
+`self` and keeps, and for `self` handed on to a function that keeps it:
+
+```sysl
+trait Widget
+    register(&self) -> int
+
+struct Label
+    f: &Fn() -> int
+
+impl Widget for Label
+    register(&self) -> int
+        shown = Some(self)
+        self.f()
+
+var shown: Option[&Label] = None
+
+main()
+    val w: &Widget = Label(() -> 1)
+
+    w.register()
+```
+
+```error
+or let every implementation keep it by writing '@keeps(self)' above the declaration of 'register' in 'Widget'
+```
+
+With the mark on the trait's method the same implementation is accepted:
 
 ```sysl
 trait Widget
@@ -3094,6 +3122,11 @@ the body across that wall** for:
 - every function marked `@inline` or `@inline(always)`, whatever its length, and
 - every *small* function — a few statements' worth: an accessor, a comparison, a fixed-point
   multiply — whether marked or not.
+
+Small is measured by what the optimizer keeps of the body, not by its unoptimized length: the
+report and trap of a failed bounds or overflow check is a cold exit and does not count, and nor does
+the guard on a shift by a constant amount, which folds away. A getter that indexes an array and
+shifts the element is small.
 
 The calling module is given a copy of the body to inline (LLVM's `available_externally`) and never
 emits it, so the program still links the package's one definition, and a call the optimizer leaves

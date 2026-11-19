@@ -42,12 +42,65 @@ prefix_call(cx: &Analyzer, span: Span, op: string, t: TExpr) -> Option[TExpr]
     trait_operator(cx, span, spelling.unwrap(), op, None, t, None)
 end prefix_call
 
+// **An operator resolves through a `&T`** (`reference/generics.md § Operators see through a
+// reference`): an operand held as a counted reference is read through to what it reaches, one level,
+// as a member call's receiver is, and the operator is the referent's. A reference has no arithmetic
+// and no order of its own, so nothing a program could mean by the reference is lost -- and a type
+// with a `Drop`, which is only ever held as a `&T`, can have operators at all. A trait object is two
+// words and reaches no single referent, so it is left as it is.
+through_reference(cx: &Analyzer, t: TExpr) -> TExpr
+    if !reads_through(texpr_type(t)) then return t
+
+    auto_deref(cx, t)
+end through_reference
+
+// Whether an operand of type `t` is one an operator reads through: a `&T` or a `&sync T` that is not
+// a trait object.
+reads_through(t: Type) -> bool = underlying(t) match
+    Ref(_, _) -> !erased(underlying(t))
+    _ -> false
+
+// The right operand an implementation was written to take. An operand read through a reference
+// (`through_reference`) is handed back as the reference where the left operand's type implements the
+// operator **at the reference** and not at what it reaches -- `impl Add[&Big, &Big] for Big`, the
+// shape a type with a `Drop` writes, since it cannot take its other operand by value.
+private operand_as_written(cx: &Analyzer, tr_name: string, recv_ty: Type, t: TExpr) -> TExpr
+    val held = *t.kind match
+        TDeref(inner, _) -> inner
+        _ -> return t
+
+    if !reads_through(texpr_type(held)) then return t
+
+    recv_ty match
+        Abstract(_, _) -> return t
+        _ -> ()
+
+    if satisfies(cx.an, op_bound(cx.an, cx.scope, tr_name, recv_ty, Some(texpr_type(t))), recv_ty) then
+        return t
+
+    if satisfies(cx.an, op_bound(cx.an, cx.scope, tr_name, recv_ty, Some(texpr_type(held))), recv_ty) then
+        held
+    else t
+end operand_as_written
+
+// `operand_as_written` for an operator named by its token, where the right operand of a compound
+// assignment is read through a reference as the right operand of the binary form is.
+update_operand(cx: &Analyzer, op: string, place_ty: Type, t: TExpr) -> TExpr
+    val spelling = core_infix(op)
+
+    if spelling.is_none() then return t
+
+    operand_as_written(cx, library_key(spelling.unwrap()), place_ty, through_reference(cx, t))
+end update_operand
+
 // `spelling` is the trait as the catalog names it, which is what a program writes; the key the
 // tables hold it under is the library's for that spelling.
-private trait_operator(cx: &Analyzer, span: Span, spelling: string, op: string, operand: Option[TExpr],
+private trait_operator(cx: &Analyzer, span: Span, spelling: string, op: string, given: Option[TExpr],
                        recv: TExpr, written: Option[Expr]) -> Option[TExpr]
     val tr_name = library_key(spelling)
     val recv_ty = texpr_type(recv)
+    val operand = if given.is_some() then Some(operand_as_written(cx, tr_name, recv_ty, given.unwrap()))
+    else None
     val rhs = if operand.is_some() then Some(widened_operand(cx, span, op, recv_ty, operand.unwrap(), written))
     else None
 
@@ -271,6 +324,11 @@ private dispatch_for(cx: &Analyzer, span: Span, spelling: string, op: string, ty
 
     if core_builtin(spelling, ty) && !written_impl_at(cx.an, tr, ty) then return None
 
+    // A `&T` meets an operator's bound through its referent, but has no member of its own to
+    // dispatch to: an operand is read through one level before it gets here, so one still a reference
+    // is a second level, and the operator is refused as one on the reference.
+    if reads_through(ty) then return None
+
     ty match
         Abstract(_, _) ->
             if !satisfies(cx.an, tr, ty) then
@@ -352,13 +410,14 @@ compare_link(cx: &Analyzer, span: Span, op: string, l: TExpr, r: TExpr) -> Optio
     found
 end compare_link
 
-// The method an `==` or a `!=` between two values of `ty` dispatches to, where it is not the
-// machine's: the link of a comparison between two references, read through to what they reach.
+// The method a comparison between two values of `ty` dispatches to, where it is not the machine's:
+// the link of a comparison between two references, read through to what they reach -- `==` and `!=`
+// where the referent has an `Eq`, and an ordering always, since a reference has no order of its own.
 compare_at(cx: &Analyzer, span: Span, op: string, ty: Type) -> Option[TDispatch]
-    val tr_name = library_key("Eq")
-    val tr = op_bound(cx.an, cx.scope, tr_name, ty, Some(ty))
+    val spelling = core_infix(op).unwrap_or("Eq")
+    val tr = op_bound(cx.an, cx.scope, library_key(spelling), ty, Some(ty))
 
-    dispatch_for(cx, span, "Eq", op, ty, tr)
+    dispatch_for(cx, span, spelling, op, ty, tr)
 end compare_at
 
 // The right-hand type a type parameter's own **bounds** name for an operator, where one of them
@@ -632,7 +691,9 @@ widened_operand(cx: &Analyzer, span: Span, op: string, subject: Type, t: TExpr,
     val heads = subject match
         Abstract(_, bounds) -> bound_heads(a, tr_name, subject, bounds, d.unwrap())
         _ -> impl_heads(a, tr_name, subject, d.unwrap())
-    val literal = written.is_some() && is_literal(written.unwrap())
+    // Arithmetic over literals is the literal it comes to (`literal_arith_default`): `b + 60 * 52` is
+    // read at whichever implementation `b + 3120` is, and refused alike where that is ambiguous.
+    val literal = written.is_some() && literal_arith_default(written.unwrap()).is_some()
     var reached: Buf[Type] = buf()
 
     for h in heads
@@ -698,7 +759,8 @@ private plain_operand(t: Type) -> bool = t match
     Fixed(_, _, _) -> true
     _ -> false
 
-// The operand read at the right-hand type of the implementation it selected: a bare literal is read
+// The operand read at the right-hand type of the implementation it selected: a bare literal, or
+// arithmetic over literals, is read
 // at that type afresh, as an argument would be -- `2` over `Mul[f32]` is an `f32` two, where no
 // widening reaches from the `int` it was first read as -- and a typed operand is converted to it.
 private operand_at(cx: &Analyzer, t: TExpr, written: Option[Expr], literal: bool, at: Type) -> TExpr =

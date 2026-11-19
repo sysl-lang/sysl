@@ -1025,28 +1025,39 @@ private parse_asm_item(p: *Parser, lines: *Buf[string], operands: *Buf[AsmOperan
                 operands.push(parse_asm_operand(p))
 end parse_asm_item
 
-// `in name : reg` / `out name : "dx"`.
+// `in name : reg` / `out name : "dx"` / `inout name : vreg` / `inout name -> other : reg`.
 //
-// The class slot is required although `reg` is the only class there is, so that every operand line
-// has one shape and a second class arrives as a peer rather than as the exception to a default. Its
-// `:` is not a type annotation, so what follows is a class or a machine register and never a type.
+// The class slot is required, so that every operand line has one shape and each class is a peer
+// rather than the exception to a default. Its `:` is not a type annotation, so what follows is a
+// class or a machine register and never a type. An `inout`'s `-> other` names where its result goes
+// when that is not the variable it read -- the arrow sysl writes for "goes to" everywhere else.
 private parse_asm_operand(p: *Parser) -> AsmOperand
     val start = p.here()
     var dir = In
 
     if p.accept_kw("in") then dir = In
     elif p.accept_word("out") then dir = Out
-    else p.want("'in'")
+    elif p.accept_word("inout") then dir = InOut
+    else p.want("'in', 'out' or 'inout'")
 
     val name = parse_bound_name(p)
+    var into: Option[string] = None
+
+    if dir == InOut && p.accept_kw("->") then into = Some(parse_bound_name(p))
 
     p.expect_kw(":")
 
-    var reg: Option[string] = None
+    var place = PlaceReg
 
-    if !p.accept_word("reg") then reg = accept_string(p)
+    if p.accept_word("vreg") then place = PlaceVreg
+    elif !p.accept_word("reg")
+        p.peek() match
+            StrLit(r) ->
+                p.bump()
+                place = PlaceAt(r)
+            _ -> p.want("'reg', 'vreg' or a quoted machine register")
 
-    AsmOperand(start.to(p.just_taken()), dir, name, reg)
+    AsmOperand(start.to(p.just_taken()), dir, name, into, place)
 end parse_asm_operand
 
 // -- the expression statements ----------------------------------------------------------------------
@@ -1065,10 +1076,12 @@ private parse_expr_or_multi(p: *Parser, start: Span, inline: bool) -> Stmt
             // a call answers is let go of on purpose. Read as an expression, the `_` would close a
             // closure over the assignment instead.
             if discarding_place(target) then
-                return parse_paren_multi(p, start, inline, op, one_place(target), value)
+                return parse_paren_multi(p, start, inline, op, one_place(target), value, false)
 
+            // A tuple of places is only ever one place long as `(a,)`, the one-tuple's spelling.
             paren_places(target) match
-                Some(places) -> return parse_paren_multi(p, start, inline, op, places, value)
+                Some(places) ->
+                    return parse_paren_multi(p, start, inline, op, places, value, places.len() == 1)
                 None -> ()
         _ -> ()
 
@@ -1117,7 +1130,7 @@ private parse_expr_or_multi(p: *Parser, start: Span, inline: bool) -> Stmt
 
         if !p.accept_kw(",") then break
 
-    stmt(start.to(p.just_taken()), MultiAssign(op, parts, values))
+    stmt(start.to(p.just_taken()), MultiAssign(op, parts, values, false))
 end parse_expr_or_multi
 
 // Whether an assignment's whole left side is `_`.
@@ -1155,7 +1168,7 @@ private paren_places(target: Expr) -> Option[Buf[Expr]] = *target.kind match
 // has already taken the first value; the rest of the list follows its commas, which belong to a
 // bracket instead where an inline branch stands inside one.
 private parse_paren_multi(p: *Parser, start: Span, inline: bool, op: string, places: Buf[Expr],
-                          value: Expr) -> Stmt
+                          value: Expr, one_tuple: bool) -> Stmt
     var values: Buf[Expr] = buf()
 
     values.push(lift_placeholders(value))
@@ -1167,7 +1180,7 @@ private parse_paren_multi(p: *Parser, start: Span, inline: bool, op: string, pla
             values.push(lift_placeholders(parse_expr(p)))
     end if
 
-    stmt(start.to(p.just_taken()), MultiAssign(op, places, values))
+    stmt(start.to(p.just_taken()), MultiAssign(op, places, values, one_tuple))
 end parse_paren_multi
 
 // The assignment operator standing at the cursor, or `""` where there is none.
