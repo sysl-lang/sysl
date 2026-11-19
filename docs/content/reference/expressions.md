@@ -2425,8 +2425,48 @@ print(next(), next())
 ```
 
 Nothing is written for either: the compiler works it out from the bodies, as it does for every
-pointer a function is handed. **A `val` is copied either way**, since nothing can tell a copy of it
-from the variable, and so are a pattern's binding and a by-name parameter.
+pointer a function is handed. **A `val` is held the way it is cheapest**, since nothing but the cost
+can tell a copy of it from the variable: an array, a struct or tuple, a string, a slice or an enum with
+a payload is held by its address where the closure holds its `var`s so, and copied where it holds
+copies; a scalar or a reference is copied either way, as is a by-name parameter. So four closures over
+one large `val` array hold four addresses, not four copies of the array.
+
+**A scoped thread holds a `val` by address too, where the `val` outlives the scope.** A closure handed
+to a [`@scoped`](/reference/attributes/#scoped-f-a-member-that-finishes-what-it-starts-before-its-scope-closes)
+member such as `spawn` copies every `var` it captures — the body or another thread could write it
+while the thread runs — but holds by address each `val` aggregate it shares with the frame that
+opened the scope: one the body captured from outside, where that body is handed straight to the call
+that opens the scope (`scope((s) -> …)`). Every thread then reads the one array:
+
+```sysl
+import sysl.threads.scope
+
+total(xs: [4096]int) -> int
+    scope((s) ->
+        val parts = [s.spawn(() -> sum(xs, 0)), s.spawn(() -> sum(xs, 1)),
+                     s.spawn(() -> sum(xs, 2)), s.spawn(() -> sum(xs, 3))]
+        var all = 0
+
+        for p in parts do all += p.join()
+        all)
+
+sum(xs: [4096]int, quarter: int) -> int
+    var s = 0
+
+    for i in quarter * 1024..<(quarter + 1) * 1024 do s += xs[i]
+    s
+
+print(total([1; 4096]))
+```
+
+```output
+4096
+```
+
+A `val` the body declares itself, one a closure inside the body captures, and one reached by a body
+handed to a helper along with the scope are copied, since the thread may still be running when that
+frame has gone. **A snapshot is a `val` bound first**: `val snap = v` copies the `var` once, and every
+thread over `snap` shares that one copy, while a write to `v` after it is seen by none of them.
 
 **The choice is made where the closure goes, never by what the body does to that place later.** A
 closure handed to a parameter its function keeps, or stored in module storage, holds a copy even
@@ -2462,14 +2502,16 @@ print(a.len(), b.len())
 Each closure releases its own copy of the handle, and both variables keep their element, though the
 second call overwrites `kept` and the program then clears it. A write that only the variable could show is
 refused where it would reach the copy, and the refusal says which way the closure captures and why
-(below). `--explain-escapes` says it for every closure that holds a `var`: *a closure holds 'a' by
-value, because it is handed to 'keep' on line 11, which keeps its parameter 'f' (it is stored in
-'kept')*, or *a closure holds 'n' by reference, because nothing it is handed to or stored in keeps
-it*.
+(below). `--explain-escapes` says it for every closure that holds a `var` or a `val` aggregate: *a
+closure holds 'a' by value, because it is handed to 'keep' on line 11, which keeps its parameter 'f'
+(it is stored in 'kept')*, or *a closure holds 'n' by reference, because nothing it is handed to or
+stored in keeps it*. A scoped thread says first what it shares — *a closure holds 'xs' by reference,
+because it is a scoped child and each is a 'val' from outside the body it is written in, which
+outlives the scope* — then what it copies.
 
-**The copy of a `val` is read-only exactly as the `val` is**: the closure may read it, index it and
-view it as a `[]const T`, but a write to it, a `*self` method called on it, or a `[]T` view of an
-array it holds is refused, since every such write would reach only the closure's copy.
+**A `val` a closure holds is read-only exactly as the `val` is**, by copy or by address: the closure
+may read it, index it and view it as a `[]const T`, but a write to it, a `*self` method called on it,
+or a `[]T` view of an array it holds is refused, since a `val` is written once.
 
 ```sysl
 fill(xs: []real) = xs[0] = 9.0

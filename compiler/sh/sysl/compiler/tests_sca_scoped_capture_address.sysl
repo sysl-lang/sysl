@@ -1,0 +1,345 @@
+module sh.sysl.compiler
+@tests
+
+// **A closure holds a `val` aggregate by address wherever its captures need not outlive it**
+// (`closure.sysl`'s `held_by_address`, `scoped_val_refs`; `closure_mode.sysl`'s
+// `shares_outlive_scope`). Before, every `val` was copied into every closure that captured it, so
+// four scoped threads over one input array were four copies of it. Two kinds of closure gain it:
+//
+// - one nothing keeps -- handed to a parameter its function only calls, a local called in its
+//   block -- which held each `var` by reference already, and now each `val` array, struct, tuple,
+//   string, slice and enum with a payload too;
+// - a **scoped child** (a closure at a `@scoped` or `@bounded` parameter), which copied everything
+//   and still copies every `var`, but holds by address each `val` aggregate captured from outside
+//   the body it is written in, where that body was handed straight to the call that opened the
+//   scope.
+//
+// A `val` cannot change, so only its address tells the two apart: `usize(as_ptr(xs[..]))` read
+// inside the closure against the same read outside it. A snapshot of a `var` is a `val` bound from it
+// first, and every closure over that `val` shares the one snapshot.
+//
+// The cells cross what is captured (a `val` array, a `var` array, a struct, a tuple, a string, an
+// enum with a payload, a parameter, a `(self)` receiver, a `for` variable, a `match` binding, a
+// scalar) with where the closure goes (a parameter its function only calls, a local called in its
+// block, a closure written in a closure, a callee that keeps it, a return; a scoped thread over the
+// opener's `val`, over the body's own `val`, over a `var`, beside a lent view, from a closure inside
+// the body, from a body handed to a helper with the scope) and with what the capture holds (counted
+// storage, checked on the counted heap).
+//
+// Skipped cells, and why: an `async` body lays an address-taken local in the task's promise whatever
+// its binding form (`tests_cas_closure_async.sysl`); a `@pinned` `val` was held by reference already
+// (`tests_crm_closure_ref_mode.sysl`); a generic body is decided per instantiation, as a `var` is; a
+// string's or a slice's identity is not observable through its bytes, which a copy shares, so those
+// cells check the value only.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private const sca_callees: string = raw"""
+    import sysl.buf.{Buf, buf}
+    import sysl.slices.as_ptr
+    import sysl.threads.{scope, Scope}
+
+    var kept: Option[&Fn() -> bool] = None
+
+    call(f: &Fn() -> bool) -> bool = f()
+
+    keep(f: &Fn() -> bool) -> bool
+        kept = Some(f)
+        f()
+
+    """
+
+private sca_prints(text: string, want: string)
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(sca_callees + text), want)
+
+// `--explain-escapes` says a line holding each of `want` of the program's closures, in order.
+private sca_explains(text: string, want: []const string)
+    if xvr_no_library() then return
+
+    val got = cms_modes(sca_callees + text)
+
+    assert_eq(got.len(), want.len, got.join("\n"))
+
+    for i in 0..<want.len
+        assert(got[i].index_of(want[i]).is_some(), s"${got[i]}\n--- wanted ---\n${want[i]}")
+end sca_explains
+
+// --- the four copies that were -------------------------------------------------------------------
+
+@test("four scoped threads over one 'val' array the opener declared share it rather than copy it")
+sca_four_threads_one_array()
+    sca_prints(raw"""
+        main()
+            val xs = [7; 4096]
+            val at = usize(as_ptr(xs[..]))
+
+            val all = scope((s) ->
+                var same = 0
+
+                val hs = [s.spawn(() -> usize(as_ptr(xs[..])) == at && xs[0] == 7),
+                          s.spawn(() -> usize(as_ptr(xs[..])) == at && xs[1] == 7),
+                          s.spawn(() -> usize(as_ptr(xs[..])) == at && xs[2] == 7),
+                          s.spawn(() -> usize(as_ptr(xs[..])) == at && xs[4095] == 7)]
+
+                for h in hs
+                    if h.join() then same += 1
+
+                same)
+
+            print(all)
+        """, "4\n")
+
+@test("four closures nothing keeps, over one 'val' array, hold its address")
+sca_four_closures_one_array()
+    sca_prints(raw"""
+        main()
+            val xs = [7; 4096]
+            val at = usize(as_ptr(xs[..]))
+            val local = () -> usize(as_ptr(xs[..])) == at
+
+            print(call(() -> usize(as_ptr(xs[..])) == at), call(() -> xs[4095] == 7 && usize(as_ptr(xs[..])) == at),
+                  local(), local())
+        """, "true true true true\n")
+
+// --- each shape of capture ------------------------------------------------------------------------
+
+@test("a 'var' array is held by reference as before")
+sca_var_array()
+    sca_prints(raw"""
+        main()
+            var ys = [1; 64]
+            val at = usize(as_ptr(ys[..]))
+            ys[3] = 9
+            print(call(() -> usize(as_ptr(ys[..])) == at && ys[3] == 9))
+        """, "true\n")
+
+@test("a 'val' struct and a 'val' tuple are held by address")
+sca_struct_and_tuple()
+    sca_prints(raw"""
+        struct Big
+            n: int
+            xs: [32]int
+
+        main()
+            val b = Big(1, [2; 32])
+            val bat = usize(as_ptr(b.xs[..]))
+            val t = ([3; 8], "three")
+            val tat = usize(as_ptr(t.0[..]))
+            print(call(() -> usize(as_ptr(b.xs[..])) == bat && b.n == 1),
+                  call(() -> usize(as_ptr(t.0[..])) == tat && t.1 == "three"))
+        """, "true true\n")
+
+@test("a 'val' string, slice and enum with a payload read the same held by address; a scalar is copied")
+sca_string_slice_enum_scalar()
+    sca_prints(raw"""
+        main()
+            val s = "hello world"
+            val xs = [1, 2, 3]
+            val v = xs[1..]
+            val o: Option[[16]int] = Some([5; 16])
+            val n = 41
+            print(call(() -> s.len == 11 && v[0] == 2 && o.unwrap()[15] == 5 && n + 1 == 42))
+        """, "true\n")
+
+@test("a parameter and a '(self)' receiver are held by address")
+sca_parameter_and_self()
+    sca_prints(raw"""
+        struct Big
+            xs: [32]int
+
+            // '(self)' is this call's own copy, so the address is read in the same call.
+            same(self) -> bool
+                val at = usize(as_ptr(self.xs[..]))
+                call(() -> usize(as_ptr(self.xs[..])) == at && self.xs[31] == 4)
+
+        check(b: Big) -> bool
+            val at = usize(as_ptr(b.xs[..]))
+            call(() -> usize(as_ptr(b.xs[..])) == at && b.xs[0] == 4)
+
+        main()
+            val b = Big([4; 32])
+            print(check(b), b.same())
+        """, "true true\n")
+
+@test("a pattern's binding is held by address: a 'for' variable and a 'match' arm's binding")
+sca_pattern_bindings()
+    sca_prints(raw"""
+        struct Big
+            xs: [8]int
+
+        main()
+            val bs = [Big([1; 8]), Big([2; 8])]
+            var all = true
+
+            for b in bs
+                val at = usize(as_ptr(b.xs[..]))
+                if !call(() -> usize(as_ptr(b.xs[..])) == at && b.xs[7] > 0) then all = false
+
+            val o: Option[[8]int] = Some([2; 8])
+
+            val inner = o match
+                Some(arr) ->
+                    val at = usize(as_ptr(arr[..]))
+                    call(() -> usize(as_ptr(arr[..])) == at && arr[7] == 2)
+                None -> false
+
+            print(all, inner)
+        """, "true true\n")
+
+// --- where the closure goes ---------------------------------------------------------------------
+
+@test("a closure written in a closure reaches the same 'val' through both")
+sca_nested_closure()
+    sca_prints(raw"""
+        main()
+            val xs = [3; 512]
+            val at = usize(as_ptr(xs[..]))
+            print(call(() -> call(() -> usize(as_ptr(xs[..])) == at && xs[511] == 3)))
+        """, "true\n")
+
+@test("a closure a callee keeps, or one returned, still holds a copy")
+sca_kept_and_returned_copy()
+    sca_prints(raw"""
+        make(xs: [64]int) -> &Fn() -> int = () -> xs[63] + xs[0]
+
+        main()
+            val xs = [6; 64]
+            val at = usize(as_ptr(xs[..]))
+            print(keep(() -> usize(as_ptr(xs[..])) == at && xs[0] == 6), make(xs)(), kept.unwrap()())
+        """, "false 12 false\n")
+
+// --- what a scoped child copies --------------------------------------------------------------------
+
+@test("a scoped thread copies the body's own 'val' and every 'var', and still reads them right")
+sca_scoped_copies()
+    sca_prints(raw"""
+        main()
+            var n = 1
+
+            val got = scope((s) ->
+                val local = [3; 16]
+                val at = usize(as_ptr(local[..]))
+                val h1 = s.spawn(() -> usize(as_ptr(local[..])) != at && local[15] == 3)
+                val h2 = s.spawn(() -> n)
+                n = 5
+                (h1.join(), h2.join()))
+
+            print(got.0, got.1, n)
+        """, "true 1 5\n")
+
+@test("a scoped thread that lends a view shares the opener's 'val' beside it")
+sca_scoped_beside_a_view()
+    sca_prints(raw"""
+        main()
+            var v = [0; 8]
+            val all = v[..]
+            val xs = [9; 256]
+            val at = usize(as_ptr(xs[..]))
+
+            val same = scope((s) ->
+                s.spawn(() -> all[0] = xs[1])
+                s.spawn(() -> usize(as_ptr(xs[..])) == at).join())
+
+            print(same, v[0])
+        """, "true 9\n")
+
+@test("a child written in a closure inside the body, or in a body a helper is handed with the scope, copies")
+sca_scoped_not_the_opener()
+    sca_prints(raw"""
+        each(xs: [2]int, f: int -> unit)
+            for x in xs
+                f(x)
+
+        helper(s: *Scope, f: (*Scope) -> bool) -> bool = f(s)
+
+        main()
+            val xs = [4; 64]
+            val at = usize(as_ptr(xs[..]))
+
+            val got = scope((s) ->
+                val ys = [5; 64]
+                val yat = usize(as_ptr(ys[..]))
+                var copied = 0
+
+                each([1, 2], (i) ->
+                    if s.spawn(() -> usize(as_ptr(ys[..])) != yat && ys[0] == 5).join() then copied += i)
+
+                val far = helper(s, (s2) -> s2.spawn(() -> usize(as_ptr(xs[..])) != at && xs[0] == 4).join())
+                (copied, far))
+
+            print(got.0, got.1)
+        """, "3 true\n")
+
+// --- the snapshot a program asks for --------------------------------------------------------------
+
+@test("a 'val' bound from a 'var' is the snapshot: the threads read it, not the later 'var'")
+sca_snapshot_form()
+    sca_prints(raw"""
+        main()
+            var ys = [1; 4]
+            val snap = ys
+            val at = usize(as_ptr(snap[..]))
+            ys[0] = 100
+
+            val got = scope((s) ->
+                val a = s.spawn(() -> snap[0] + snap[3])
+                val b = s.spawn(() -> usize(as_ptr(snap[..])) == at)
+                (a.join(), b.join()))
+
+            print(got.0, got.1, ys[0] + ys[3])
+        """, "2 true 101\n")
+
+// --- counted storage ------------------------------------------------------------------------------
+
+@test("a 'val' holding counted storage, held by address, is neither leaked nor released twice")
+sca_counted_storage()
+    if !enm_ready() then return
+
+    val out = crm_counted(sca_callees + raw"""
+        struct Holder
+            items: Buf[int]
+            name: string
+
+        main()
+            var b: Buf[int] = buf()
+            b.push(1)
+            b.push(2)
+
+            val h = Holder(b, "h")
+            val t = (h, [b, b])
+
+            for _ in 0..<3
+                print(call(() -> h.items.len() == 2 && t.1[1].len() == 2), call(() -> t.0.name == "h"))
+
+            print(keep(() -> h.items.len() == 2))
+            kept = None
+        """)
+
+    assert_eq(out.0, "true true\ntrue true\ntrue true\ntrue\n")
+    assert_eq(out.1, "")
+
+// --- what `--explain-escapes` says ----------------------------------------------------------------
+
+@test("'--explain-escapes' names a 'val' aggregate held by reference, and says nothing of a scalar 'val'")
+sca_explained()
+    sca_explains(raw"""
+        main()
+            val xs = [1; 8]
+            val n = 3
+            print(call(() -> xs[0] == 1), call(() -> n == 3))
+        """, [": a closure holds 'xs' by reference, because nothing it is handed to or stored in keeps it"])
+
+@test("'--explain-escapes' says what a scoped thread shares, then what it copies")
+sca_explained_scoped()
+    sca_explains(raw"""
+        main()
+            val xs = [1; 8]
+            var n = 3
+            val got = scope((s) -> s.spawn(() -> xs[0] + n).join())
+            print(got)
+        """, [": a closure holds 'xs' and 'n' by reference, because nothing it is handed to or stored in keeps it",
+              ": a closure holds 'xs' by reference, because it is a scoped child and each is a 'val' from " +
+                  "outside the body it is written in, which outlives the scope",
+              ": a closure holds 'n' by value, because it is handed to '"])
