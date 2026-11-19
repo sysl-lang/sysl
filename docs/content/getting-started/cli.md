@@ -155,14 +155,23 @@ as each phase ends:
 
 ```
 sysl: phase parse std 130ms
+sysl:   memory 240MB resident, 117MB in use
 sysl: phase parse program 0ms
+sysl:   memory 251MB resident, 124MB in use
 sysl: phase declarations 52ms
+sysl:   memory 262MB resident, 133MB in use
 sysl: phase bodies 23ms
+sysl:   memory 270MB resident, 139MB in use
 sysl: phase checks 4ms
+sysl:   memory 270MB resident, 139MB in use
 sysl: phase prune 0ms
+sysl:   memory 270MB resident, 139MB in use
 sysl: phase std 33ms
+sysl:   memory 271MB resident, 139MB in use
 sysl: phase codegen 2ms
+sysl:   memory 272MB resident, 140MB in use
 sysl: phase link 90ms
+sysl:   memory 272MB resident, 120MB in use
 ```
 
 The phases sum to the whole compilation, with nothing counted twice. The `checks` phase is followed
@@ -170,6 +179,12 @@ by one indented line per whole-program check (`sysl:   check keeps 12ms`), which
 phase's time, not further phases. `std` is the time to find the
 standard module's compiled artifact, or to build it on first use. Use these timings to find out
 why a build is slow.
+
+**Each phase is followed by what the compiler holds as it ends**: its resident memory, and — on
+macOS — how much of that the allocator holds for live data. The gap between the two is memory that
+was freed and kept by the allocator rather than given back; only the end of a process returns it,
+which is why `sysl test` compiles a suite in one child process and links it in another (below). A
+large link also says what it holds as its clangs start (`sysl:   memory as the clangs start …`).
 
 **When a phase is slow, a sampling profiler shows which functions are responsible.** On a hosted
 target sysl keeps the frame pointer wherever the platform's C compiler does (Apple platforms, and
@@ -484,8 +499,9 @@ override it.
 **The same count bounds the build.** A large tree's link compiles its code in several pieces at once,
 and `--jobs <n>` keeps at most `n` of those compiles running too. The suite is compiled by a second
 `sysl` process, which exits before the first test starts. A long run therefore holds only what its
-tests need, not what the compile needed. Its notes and errors appear exactly as they would from one
-process.
+tests need, not what the compile needed. **A suite that has to be linked is linked by a third**, which
+takes up the compiled text once the second has exited, so the link's compiles never run beside the
+memory the compile left behind. Its notes and errors appear exactly as they would from one process.
 
 **`--features <list>` and `--option <name=value>`** choose what the package's own suite is built
 with. The `test` block's `features` and `options` are the defaults, `--features` replaces the block's

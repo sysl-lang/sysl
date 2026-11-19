@@ -3,7 +3,7 @@ module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
 import sysl.env.get as env_var
-import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.fs.{make_dir_all, make_temp_dir, read_text, remove_dir_all, remove_file, write_text}
 import sysl.process.{capture, pid}
 import sysl.text.{cstring, from_utf8_unchecked, split, Search}
 
@@ -278,6 +278,101 @@ tbc_damaged_plan_is_none()
     assert(decode_test_plan("999:abc").is_none(), "a length past the end")
 end tbc_damaged_plan_is_none
 
+// --- the compiled suite, handed to the link child ---------------------------------------------------
+
+private tbc_stash() -> StashedBuild
+    var links: Buf[string] = buf()
+
+    links.push("m")
+    links.push("")
+    links.push("with: a colon")
+
+    var archives: Buf[string] = buf()
+
+    archives.push("/a b/root.a")
+
+    var files: Buf[string] = buf()
+
+    files.push("/usr/include/stdio.h")
+
+    StashedBuild("define i32 @main() {\n  ret i32 0\n}\n\0 and past a NUL", links, archives, tbc_plan().tests,
+                 files)
+end tbc_stash
+
+// The stash as the build child writes it, in a directory of its own, read back.
+private tbc_stash_round(s: StashedBuild) -> Option[StashedBuild]
+    val dir = make_temp_dir("sysl-tbc-stash").unwrap()
+    val plan = s"$dir/plan"
+    var said = ""
+    val e = &said
+
+    val wrote = stash_written(plan, s, (line) -> *e = *e + line)
+
+    assert_eq(wrote, Fine, said)
+
+    val back = stash_read(s"$plan.built")
+
+    remove_dir_all(dir).unwrap_or(())
+    back
+end tbc_stash_round
+
+@test("tbc: a compiled suite reads back as the build child wrote it, its text byte for byte")
+tbc_stash_round_trips()
+    val s = tbc_stash()
+    val back = tbc_stash_round(s).unwrap()
+
+    assert_eq(back.text, s.text)
+    assert_eq(back.links.len(), 3)
+    assert_eq(back.links[1], "")
+    assert_eq(back.links[2], "with: a colon")
+    assert_eq(back.archives[0], "/a b/root.a")
+    assert_eq(back.files_read[0], "/usr/include/stdio.h")
+    assert_eq(back.tests.len(), 2)
+    assert_eq(back.tests[0].display, "a name: with a colon\nand a newline")
+    assert_eq(back.tests[0].hooks.setup_all.unwrap().func, "sa")
+    assert_eq(back.tests[1].ignored.unwrap(), "not yet — ünïcode")
+end tbc_stash_round_trips
+
+@test("tbc: an empty compiled suite reads back too -- no text, no lists")
+tbc_empty_stash_round_trips()
+    val back = tbc_stash_round(StashedBuild("", buf(), buf(), buf(), buf())).unwrap()
+
+    assert_eq(back.text, "")
+    assert(back.links.is_empty() && back.archives.is_empty() && back.tests.is_empty() &&
+           back.files_read.is_empty(), "every list empty")
+end tbc_empty_stash_round_trips
+
+@test("tbc: a compiled suite whose record is cut short, run on, or missing, or whose text is gone, is none")
+tbc_damaged_stash_is_none()
+    val dir = make_temp_dir("sysl-tbc-stash").unwrap()
+    val plan = s"$dir/plan"
+    val at = s"$plan.built"
+
+    assert_eq(stash_written(plan, tbc_stash(), (line) -> ()), Fine)
+
+    val record = read_text(at).unwrap()
+
+    write_text(at, record[0..<record.bytes.len - 1]).unwrap()
+    assert(stash_read(at).is_none(), "cut short by a byte")
+    write_text(at, record + "1:x").unwrap()
+    assert(stash_read(at).is_none(), "a field too many")
+    write_text(at, record).unwrap()
+    assert(stash_read(at).is_some(), "whole again")
+    remove_file(s"$at.ll").unwrap()
+    assert(stash_read(at).is_none(), "no text beside it")
+    remove_file(at).unwrap()
+    assert(stash_read(at).is_none(), "no record")
+    remove_dir_all(dir).unwrap_or(())
+end tbc_damaged_stash_is_none
+
+@test("tbc: a compiled suite that cannot be written is said, and fails the run")
+tbc_unwritable_stash_fails()
+    var said = ""
+    val e = &said
+
+    assert_eq(stash_written("/nonexistent-sysl-tbc/plan", tbc_stash(), (line) -> *e = *e + line), Failed)
+    assert(said.contains("cannot write the compiled tests at /nonexistent-sysl-tbc/plan.built"), said)
+
 // --- the switch -----------------------------------------------------------------------------------
 
 @test("tbc: in process, with no switch, a suite is built here and no child is started")
@@ -320,6 +415,119 @@ tbc_switch_builds_in_a_child()
     assert_eq(last_test_builder(), 0)
     remove_dir_all(root).unwrap_or(())
 end tbc_switch_builds_in_a_child
+
+// `args` run with the switch on, answering what it said and the children it started; with `fresh`,
+// with every cache off, so the suite is compiled and linked rather than replayed.
+private tbc_children(args: []const string, fresh: bool) -> (TbcAnswer, Buf[int])
+    val k = cstring("SYSL_NO_CACHE")
+    val v = cstring("1")
+
+    if fresh then tbc_c_setenv(k.ptr, v.ptr, 1)
+
+    build_tests_with(tbc_compiler())
+
+    val got = tbc_in_process(args)
+    val kids = test_builders()
+
+    build_tests_with(None)
+
+    if fresh then tbc_c_unsetenv(k.ptr)
+
+    (got, kids)
+end tbc_children
+
+@test("tbc: a suite that is linked is compiled by one child and linked by a second, and reports as one")
+tbc_linked_suite_takes_two_children()
+    if !tbc_ready() then return
+
+    val root = tbc_mixed()
+    val here = tbc_in_process([root, "--jobs", "2"])
+    val (there, kids) = tbc_children([root, "--jobs", "2"], true)
+
+    assert_eq(kids.len(), 2)
+    assert(kids[0] != kids[1], "two processes, not one twice")
+    assert(kids[0] != int(pid()) && kids[1] != int(pid()), "neither of them this process")
+    assert_eq(last_test_builder(), kids[1])
+    assert_eq(there.code, here.code)
+    assert(there.out == here.out, s"in two children:\n${there.out}\nagainst, here:\n${here.out}")
+    assert(there.err == here.err, s"in two children:\n${there.err}\nagainst, here:\n${here.err}")
+    remove_dir_all(root).unwrap_or(())
+end tbc_linked_suite_takes_two_children
+
+@test("tbc: a suite replayed from the cache has nothing to link, and takes one child")
+tbc_replayed_suite_takes_one_child()
+    if !tbc_ready() then return
+
+    // A run whose caches are off cannot replay, and says nothing about this.
+    if env_var("SYSL_NO_CACHE").unwrap_or("") == "1" then return
+
+    val root = tbc_mixed()
+    val (first, _) = tbc_children([root, "--filter", "adds"], false)
+    val (again, kids) = tbc_children([root, "--filter", "adds"], false)
+
+    assert_eq(first.code, Fine)
+    assert_eq(again.code, Fine)
+    assert(again.out.contains("1 passed, 0 failed"), again.out)
+    assert_eq(kids.len(), 1)
+    remove_dir_all(root).unwrap_or(())
+end tbc_replayed_suite_takes_one_child
+
+@test("tbc: a build error, a filter matching nothing, and a suite of only refused programs take one child")
+tbc_unlinked_suites_take_one_child()
+    if !tbc_ready() then return
+
+    val broken = tbc_broken()
+    val (failed, failed_kids) = tbc_children([broken], true)
+
+    assert_eq(failed.code, Failed)
+    assert_eq(failed_kids.len(), 1)
+
+    val mixed = tbc_mixed()
+    val (none, none_kids) = tbc_children([mixed, "--filter", "no such test"], true)
+
+    assert_eq(none.code, Fine)
+    assert_eq(none_kids.len(), 1)
+
+    val refusing = tbc_only_refused()
+    val (judged, judged_kids) = tbc_children([refusing], true)
+
+    assert_eq(judged.code, Fine)
+    assert_eq(judged_kids.len(), 1)
+    assert(judged.out.contains("1 passed, 0 failed"), judged.out)
+    remove_dir_all(broken).unwrap_or(())
+    remove_dir_all(mixed).unwrap_or(())
+    remove_dir_all(refusing).unwrap_or(())
+end tbc_unlinked_suites_take_one_child
+
+@test("tbc: a link child whose compiled suite is damaged says so and fails, rather than building again")
+tbc_damaged_handover_fails()
+    if !tbc_ready() then return
+
+    val root = tbc_mixed()
+    val dir = make_temp_dir("sysl-tbc-stash").unwrap()
+    val at = s"$dir/plan.built"
+
+    write_text(at, "1:x").unwrap()
+    write_text(s"$at.ll", "").unwrap()
+
+    val k = cstring("SYSL_TEST_BUILT")
+    val v = cstring(at)
+    val nc = cstring("SYSL_NO_CACHE")
+    val one = cstring("1")
+
+    tbc_c_setenv(k.ptr, v.ptr, 1)
+    tbc_c_setenv(nc.ptr, one.ptr, 1)
+
+    val got = tbc_in_process([root])
+
+    tbc_c_unsetenv(k.ptr)
+    tbc_c_unsetenv(nc.ptr)
+
+    assert_eq(got.code, Failed)
+    assert(got.err.contains(s"the compiled tests at $at could not be read"), got.err)
+    remove_dir_all(dir).unwrap_or(())
+    remove_dir_all(root).unwrap_or(())
+end tbc_damaged_handover_fails
 
 @test("tbc: a suite run with --jobs 2 links its codegen units two at a time")
 tbc_jobs_bound_the_link()
