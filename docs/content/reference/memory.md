@@ -190,7 +190,7 @@ true true
 ```
 
 So an `Option[*T]` is not C's nullable pointer, and an `extern` or `@export` naming one is refused
-([`ffi.md`](ffi.md#a-nullable-pointer-is-a-plain-t)). The guarantee is for a thin reference: a
+([`ffi.md`](/reference/ffi/#a-nullable-pointer-is-a-plain-t)). The guarantee is for a thin reference: a
 `&Shape` of a trait is two words, the value and its table, and an `Option` of one keeps its tag, as
 does an `Option` of a `weak T` and every other enum.
 

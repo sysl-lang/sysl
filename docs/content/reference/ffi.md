@@ -459,7 +459,7 @@ it.
 
 **A pointer C may make null is a `*T`, compared with `null`.** An `Option[*T]` keeps a tag beside the
 address so that `Some(null)` stays apart from `None`
-([`memory.md`](memory.md#an-option-of-a-reference-is-one-word)), so it is not the `T *` C declares,
+([`memory.md`](/reference/memory/#an-option-of-a-reference-is-one-word)), so it is not the `T *` C declares,
 and an `extern` or `@export` that names one is refused rather than read wrong:
 
 ```sysl
