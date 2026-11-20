@@ -525,13 +525,20 @@ lower_closure(cx: &Analyzer, span: Span, names: Buf[string], ptypes: Buf[Type],
     cx.an.closure_keeps.put(base, kept)
     forget_closure(cx.an, base)
 
-    // **A scoped child holds its captures by value** whatever else is true of it, so it is no
-    // candidate; any other closure may hold each `var` it captures by reference, decided once every
+    // **A scoped child that lends a view holds its captures by value** but for the `val`s it shares
+    // with the frame that opened the scope (`scoped_val_refs`), so it is no candidate; any other
+    // closure may hold each `var` and `val` aggregate it captures by reference, decided once every
     // body has been typed (`closure_mode.sysl`).
     val refs = if lends then buf() else referable_captures(cx, captured)
 
     if !lends && !captured.is_empty() then cx.an.closure_refs.put(base, refs)
     if refuse_pinned_captures(cx, span, captured, refs, base) then return bad_expr(span)
+
+    if cx.an.scoped_args.has(scoped_arg_key(cx, span))
+        val shared = scoped_val_refs(cx, captured)
+
+        if shared.is_some() then cx.an.scoped_val_refs.put(base, shared.unwrap())
+    end if
 
     val st = StructType(base, buf(), fields, false, None, None, false, None, buf(), false, buf(), buf())
 
@@ -575,6 +582,7 @@ end lower_closure
 // never makes, or held to captures it does not have.
 private forget_closure(a: &Analysis, base: string)
     a.closure_refs.remove(base)
+    a.scoped_val_refs.remove(base)
 
     var stale = false
 
@@ -591,18 +599,22 @@ private forget_closure(a: &Analysis, base: string)
     a.lost_writes = kept
 end forget_closure
 
-// Which captures a closure may hold by reference: a binding a write may reach -- not a `val`, a
-// pattern's binding or a by-name parameter -- of a type that has storage. A `val` is copied whatever
-// the closure's mode, since nothing can tell a copy of it from the variable; a value with no storage
-// has no address to hold, and changing its field to one would move every field after it.
+// Which captures a closure may hold by reference: a binding a write may reach, and a `val` -- or a
+// pattern's binding -- of an aggregate (`held_by_address`), of a type that has storage; never a
+// by-name parameter. **A `val` held by reference is read-only exactly as a copy of it is**, and
+// nothing can tell the two apart, so the address is a saving and not a change of meaning: four
+// closures over one array hold four addresses, not four copies. A scalar or a reference is copied,
+// which costs no more than its address would. A value with no storage has no address to hold, and
+// changing its field to one would move every field after it.
 private referable_captures(cx: &Analyzer, captured: Buf[string]) -> Buf[bool]
     var out: Buf[bool] = buf()
 
-    // A `@pinned` `val` is the exception: a copy of it is not the value C points into, so it is held
-    // by reference where the closure allows, read-only as every `val` is.
+    // A `@pinned` `val` of any shape is held by reference where the closure allows: a copy of it is
+    // not the value C points into.
     for item in captured
         val local = cx.lookup(item).unwrap()
-        val addressed = !local.read_only || (pinned_type(cx.an, local.ty) && !local.from_pattern)
+        val addressed = !local.read_only || held_by_address(local.ty) ||
+            (pinned_type(cx.an, local.ty) && !local.from_pattern)
 
         out.push(addressed && local.stands_for.is_none() && !reads_by_name(cx, item) &&
                  !holds_waker(cx, item) && !zero_sized(local.ty))
@@ -610,6 +622,52 @@ private referable_captures(cx: &Analyzer, captured: Buf[string]) -> Buf[bool]
 
     out
 end referable_captures
+
+// Whether a `val` captured is held by its address where the closure does not outlive it: an array, a
+// vector, a string, a slice, a struct or tuple, an enum with a payload -- every shape a copy of which
+// costs more than an address. A task is a handle, and copied as one.
+private held_by_address(t: Type) -> bool = underlying(t) match
+    Array(n, _) -> n > 0
+    Vector(_, _) -> true
+    Str -> true
+    Slice(_, _) -> true
+    Struct(d) -> d.base != TaskBase
+    Results(_) -> true
+    Enum(e) ->
+        for v in e.variants
+            if !v.fields.is_empty() then return true
+
+        false
+    _ -> false
+
+// **Which captures a scoped child holds by address**, and nothing where it holds none. A child runs
+// in another domain until the scope ends, which may be after the body it is written in has returned,
+// so it may hold the address only of storage that outlives the scope and that nothing writes while
+// it runs: a `val` aggregate the body it is written in captured from outside -- the frame that
+// opened the scope, blocked in that call -- never one of the body's own locals, and never a `var`,
+// which the body or a sibling could write under it. Four children over one array hold four
+// addresses rather than four copies; a snapshot of a `var` is a `val` bound from it first.
+private scoped_val_refs(cx: &Analyzer, captured: Buf[string]) -> Option[Buf[bool]]
+    var out: Buf[bool] = buf()
+    var any = false
+
+    for item in captured
+        val local = cx.lookup(item).unwrap()
+        var outside = false
+
+        for c in cx.captured
+            if c.0 == local.unique then outside = true
+
+        val shared = outside && local.read_only && held_by_address(local.ty) && local.stands_for.is_none() &&
+            !reads_by_name(cx, item) && !holds_waker(cx, item) && !zero_sized(local.ty)
+
+        if shared then any = true
+
+        out.push(shared)
+    end for
+
+    if any then Some(out) else None
+end scoped_val_refs
 
 // -- a write that reaches only the closure's copy ------------------------------------------------
 
@@ -1887,9 +1945,18 @@ private read_stmt(keep: &Fn(string) -> bool, s: Stmt, bound: *Buf[string], found
             _ -> read_stmt(keep, inner, bound, found)
         StaticDecl(inner) -> read_stmt(keep, inner, bound, found)
         CopiedDecl(_, inner) -> read_stmt(keep, inner, bound, found)
-        Require(cond, _) -> read_expr(keep, cond, *bound, found)
-        Ensure(cond, _) -> read_expr(keep, cond, *bound, found)
-        Invariant(cond, _) -> read_expr(keep, cond, *bound, found)
+        // A clause's message is read as an `@assert`'s is: a name it reaches from around the body is
+        // a name of that body, so a message the compiler cannot work out is refused in those words
+        // rather than as a name standing for nothing.
+        Require(cond, msg) ->
+            read_expr(keep, cond, *bound, found)
+            read_opt(keep, msg, *bound, found)
+        Ensure(cond, msg) ->
+            read_expr(keep, cond, *bound, found)
+            read_opt(keep, msg, *bound, found)
+        Invariant(cond, msg) ->
+            read_expr(keep, cond, *bound, found)
+            read_opt(keep, msg, *bound, found)
         Variant(measure) -> read_expr(keep, measure, *bound, found)
         AssertDecl(cond, message) ->
             read_expr(keep, cond, *bound, found)
@@ -2251,7 +2318,7 @@ with_struct_call_bounds(d: StructDecl) -> StructDecl
     StructDecl(d.name, d.tparams, d.fields, lowered_members(d.members), d.bounds, d.invariants,
                d.vis, d.tdefaults, d.opaque, d.tvalues, d.packed, d.alignment, d.cname, d.deriving,
                d.byte_order, d.guards, d.pinned, d.union_layout, d.anon, d.bits, d.annotation,
-               d.annots, d.promised, d.unique)
+               d.annots, d.promised, d.invariant_msgs, d.unique)
 
 with_enum_call_bounds(d: EnumDecl) -> EnumDecl
     EnumDecl(d.name, d.tparams, d.underlying, d.variants, lowered_members(d.members), d.bounds,

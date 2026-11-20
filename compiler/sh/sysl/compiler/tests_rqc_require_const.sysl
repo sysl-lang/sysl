@@ -187,3 +187,113 @@ rqc_invariant()
 
     rqc_has(rqc_ir_of("const WHY = \"stays small\"\nvar i = 0\nwhile i < 3\n    invariant i <= 3, WHY\n    i += 1\nprint(i)\n"),
             "stays small")
+
+// -- a struct's invariant follows the same rule ---------------------------------------------------
+
+private rqc_struct(clause: string) -> string =
+    "var why: string = \"lo must not pass hi\"\n\nstruct Window\n    lo: int\n    hi: int\n    " + clause +
+    "\n\nprint(Window(1, 2).hi)\n"
+
+@test("a struct invariant message read out of run-time storage is refused, as a require's is")
+rqc_invariant_not_constant()
+    if xvr_no_library() then return
+
+    var fs = rqc_files()
+
+    fs.push(("texts", "a.sysl", "module texts\nvar why: string = \"lo must not pass hi\"\n"))
+    fs.push(("", "main.sysl", "import texts.{why}\n\nstruct Window\n    lo: int\n    hi: int\n" +
+                              "    invariant lo <= hi, why\n\nprint(Window(1, 2).hi)\n"))
+    rqc_has(rqc_ir(fs),
+            "error: the message of this 'invariant' cannot be computed while compiling: 'texts.why' is " +
+            "filled when the program runs")
+
+@test("a struct invariant message that is not a string is refused, as a require's is")
+rqc_invariant_not_a_string()
+    if xvr_no_library() then return
+
+    rqc_has(rqc_ir_of(rqc_struct("invariant lo <= hi, 5")),
+            "error: the message of this 'invariant' is of type 'int', and a message is a 'string' — " +
+            "interpolate the value into one")
+
+@test("a struct invariant message may be a const, a concatenation or a computed constant")
+rqc_invariant_constant_forms()
+    if xvr_no_library() then return
+
+    val head = "const WHY = \"ordered\"\nconst cap() -> int = 7\n\nstruct Window\n    lo: int\n    hi: int\n"
+    val said = rqc_ir_of(head + "    invariant lo <= hi, WHY + \" pair\"\n    invariant hi < 100, s\"under ${cap()}00\"\n\n" +
+                         "print(Window(1, 2).hi)\n")
+
+    rqc_has(said, "ordered pair")
+    rqc_has(said, "under 700")
+
+@test("a struct invariant message naming an untyped module var written after the struct is refused for its storage")
+rqc_invariant_untyped_var_after()
+    if xvr_no_library() then return
+
+    val said = rqc_ir_of("struct Window\n    lo: int\n    hi: int\n    invariant lo <= hi, why\n\n" +
+                         "static var why = \"lo must not pass hi\"\n\nprint(Window(1, 2).hi)\n")
+
+    rqc_has(said, "error: the message of this 'invariant' cannot be computed while compiling: 'why' is " +
+                  "filled when the program runs")
+    assert(said.index_of("undefined name").is_none(), s"the var was not found: $said")
+
+@test("a struct invariant message naming an untyped var of another module is refused for its storage")
+rqc_invariant_untyped_var_imported()
+    if xvr_no_library() then return
+
+    var fs = rqc_files()
+
+    fs.push(("texts", "a.sysl", "module texts\nvar why = \"lo must not pass hi\"\n"))
+    fs.push(("", "main.sysl", "import texts.{why}\n\nstruct Window\n    lo: int\n    hi: int\n" +
+                              "    invariant lo <= hi, why\n\nprint(Window(1, 2).hi)\n"))
+    rqc_has(rqc_ir(fs),
+            "error: the message of this 'invariant' cannot be computed while compiling: 'texts.why' is " +
+            "filled when the program runs")
+
+@test("a struct invariant message cannot name a local of the entry file: the struct is the module's")
+rqc_invariant_entry_local()
+    if xvr_no_library() then return
+
+    rqc_has(rqc_ir_of(rqc_struct("invariant lo <= hi, why")), "error: undefined name 'why'")
+
+// -- a message naming a variable of the frame around a nested function -------------------------
+
+// The program's own variable `why`, read by a nested function's clause message and nowhere else.
+private rqc_framed(clause: string) -> string =
+    "var why = \"from the frame\"\n" + rqc_fn(clause, "why")
+
+@test("a require message naming a variable of the enclosing frame is refused as not constant, not as undefined")
+rqc_frame_require()
+    if xvr_no_library() then return
+
+    val said = rqc_ir_of(rqc_framed("require x > 0"))
+
+    rqc_has(said, "error: the message of this 'require' cannot be computed while compiling")
+    assert(said.index_of("undefined name").is_none(), s"the frame's variable was not found: $said")
+
+@test("an ensure message naming a variable of the enclosing frame is refused as not constant, not as undefined")
+rqc_frame_ensure()
+    if xvr_no_library() then return
+
+    val said = rqc_ir_of(rqc_framed("ensure result > 0"))
+
+    rqc_has(said, "error: the message of this 'ensure' cannot be computed while compiling")
+    assert(said.index_of("undefined name").is_none(), s"the frame's variable was not found: $said")
+
+@test("a loop invariant message in a nested function naming the frame's variable is refused as not constant")
+rqc_frame_loop_invariant()
+    if xvr_no_library() then return
+
+    val said = rqc_ir_of("var why = \"from the frame\"\nf(n: int) -> int\n    var i = 0\n    while i < n\n" +
+                         "        invariant i <= n, why\n        i += 1\n    i\nprint(f(3))\n")
+
+    rqc_has(said, "error: the message of this 'invariant' cannot be computed while compiling")
+    assert(said.index_of("undefined name").is_none(), s"the frame's variable was not found: $said")
+
+@test("a clause message naming a frame variable the body also reads is refused the same way")
+rqc_frame_read_by_body_too()
+    if xvr_no_library() then return
+
+    val said = rqc_ir_of("var why = \"from the frame\"\nf(x: int) -> string\n    require x > 0, why\n    why\nprint(f(1))\n")
+
+    rqc_has(said, "error: the message of this 'require' cannot be computed while compiling")
