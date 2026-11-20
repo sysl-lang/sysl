@@ -184,6 +184,36 @@ gdm_run_retains_only_when_shared()
     assert_eq(ir.count_of("call void @arc.retain("), 1)
     assert(gdm_block(ir, "drain.shared").contains("@arc.retain("), ir)
 
+// A struct with an `invariant` re-checks it after the replacing write, which wraps the write in the
+// re-check; the write is still the one that lets go of the old storage, so both forms are drained.
+@test("a growth into a struct with an invariant is drained, by a loop and by a run")
+gdm_invariant_struct_is_drained()
+    val text = gdm_node() + raw"""
+        struct V
+            storage: []&N
+            last: usize
+            invariant last <= storage.len
+
+        by_loop(v: *V, n: usize)
+            var fresh: []&N = slot_storage(n)
+            for i in 0..<v.last do slot_place(fresh, i, v.storage[i])
+            v.storage = fresh
+
+        by_run(v: *V, n: usize)
+            var fresh: []&N = slot_storage(n)
+            slot_place_run(fresh, 0, v.storage[0..<v.last])
+            v.storage = fresh
+        """
+
+    for name in ["by_loop", "by_run"]
+        val ir = emit_func_text(text, name)
+
+        assert(ir.starts_with("define"), ir)
+        assert(ir.contains("drain.sole"), ir)
+        assert(ir.contains("drain.tail"), ir)
+        assert(ir.contains("$inv"), ir)
+        assert_eq(ir.count_of("call void @arc.retain("), 1)
+
 // One function of a program lowered with the standard module beside it, or "skipped".
 private gdm_with_std(text: string, symbol: string) -> string
     val root = std_root()
@@ -335,6 +365,72 @@ gdm_unique_run()
         j.show()
         print("grown")
         """), "1 2 3 4 \ngrown\nlet go 1\nlet go 2\nlet go 3\nlet go 4\n")
+
+// The containers written with an `invariant` the growth's write re-checks: `limit` is what the
+// clause allows the storage to reach, so a growth past it breaks the clause after the drain.
+private gdm_kept_jobs() -> string = raw"""
+    struct Job
+        id: int
+
+    impl Drop for Job
+        drop(self) = print(f"let go ${self.id}")
+
+    struct Kept
+        storage: []&Job
+        last: usize
+        limit: usize
+        invariant last <= storage.len && storage.len <= limit
+
+        add(*self, id: int)
+            slot_place(self.storage, self.last, Job(id))
+            self.last += 1
+
+        grow(*self, n: usize)
+            var fresh: []&Job = slot_storage(n)
+            for i in 0..<self.last do slot_place(fresh, i, self.storage[i])
+            self.storage = fresh
+
+        grow_run(*self, n: usize)
+            var fresh: []&Job = slot_storage(n)
+            slot_place_run(fresh, 0, self.storage[0..<self.last])
+            self.storage = fresh
+    end Kept
+
+    """
+
+@test("a drained growth into a struct with an invariant lets go of each element once")
+gdm_invariant_unique()
+    if !gdm_ready() then return
+
+    gdm_clean(gdm_run(gdm_kept_jobs() + raw"""
+        var k = Kept(slot_storage(2), 0, 64)
+
+        k.add(1)
+        k.add(2)
+        k.grow(4)
+        k.add(3)
+        k.grow_run(8)
+        print(k.last, k.storage.len, k.storage[2].id)
+        """), "3 8 3\nlet go 1\nlet go 2\nlet go 3\n")
+
+@test("a drained growth that breaks the invariant traps at the re-check, after the write")
+gdm_invariant_broken_after_drain()
+    if !gdm_ready() then return
+
+    val start = raw"""
+        var k = Kept(slot_storage(2), 0, 4)
+
+        k.add(1)
+        k.add(2)
+        print("before")
+        """
+
+    for grow in ["k.grow(8)\n", "k.grow_run(8)\n"]
+        val run = gdm_run(gdm_kept_jobs() + start + grow + "print(\"after\")\n")
+
+        assert(!run.ok, run.out)
+        assert(run.out.starts_with("before\n"), run.out)
+        assert(!run.out.contains("after"), run.out)
 
 @test("a shared old storage keeps every element it holds, whichever form grew the container")
 gdm_shared_old_storage()
