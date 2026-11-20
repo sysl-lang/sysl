@@ -2101,7 +2101,17 @@ private lends_source(f: TFunc, decls: Buf[(string, TExpr)], e: TExpr, src: strin
         TBox(v, _) -> lends_source(f, decls, v, src, depth + 1)
         TErase(v, _, _) -> lends_source(f, decls, v, src, depth + 1)
         TCast(v, _) -> lends_source(f, decls, v, src, depth + 1)
-        TStructNew(_, args) -> any_lends_source(f, decls, args, src, depth)
+        TStructNew(st, args) ->
+            // **A closure that captures the array itself by value holds its own copy** (U1.6 copies
+            // into a closure that outlives the call making it), so the view its body takes is of that
+            // copy, which lives as long as the closure -- the thread's, not this body's. A capture held
+            // by address, or a view, still lends what it names.
+            if !is_closure_literal(Struct(st)) then return any_lends_source(f, decls, args, src, depth)
+
+            for x in args
+                if !is_array_type(texpr_type(x)) && lends_source(f, decls, x, src, depth + 1) then return true
+
+            false
         TEnumNew(_, _, args) -> any_lends_source(f, decls, args, src, depth)
         TLoad(n, _) ->
             for item in decls

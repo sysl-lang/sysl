@@ -131,6 +131,24 @@ sbe_captured_array_refused()
                 "that lent it holds it until the 'scope' call returns), and the closure views 'v', a local of 'call' — " +
                 SbeCure + ", and 'v' does not; declare 'v' before 'scope'")
 
+// The thread's own closure captures the body's `val` array itself: a closure that outlives the call
+// making it holds a copy of a captured `val` aggregate (`closure_mode.sysl`), so what the thread views
+// is its own copy, which lives as long as the thread -- the body's array is not borrowed.
+@test("a thread whose own closure captures the body's val array holds a copy, one and two closures deep")
+sbe_captured_copy_accepted()
+    sbe_prints("import sysl.slices.as_ptr\n" + SbeHead + "go() -> int =\n    scope((s) ->\n        val v = [3; 8]\n        val at = usize(as_ptr(v[..]))\n" +
+               "        var n = 0\n\n" +
+               "        each([1, 2][..], (i) -> if s.spawn(() -> v[i] == 3 && usize(as_ptr(v[..])) != at).join() then n += i)\n" +
+               "        each([1][..], (i) -> each([4][..], (j) -> if s.spawn(() -> v[0] + i + j == 8).join() then n += j))\n" +
+               "        n)\n\nprint(go())\n", "7\n")
+
+// The same closure handed a view of that copy rather than the copy is a view of the body's array again.
+@test("a thread whose closure captures a view of the body's val array taken in the closure is refused")
+sbe_captured_copy_view_refused()
+    sbe_refused(SbeHead + "go() -> int =\n    scope((s) ->\n        val v = [1; 8]\n\n" +
+                "        each([1][..], (i) ->\n            val w = v[..]\n\n            s.spawn(() -> print(w[i])))\n" +
+                "        0)\n\nprint(go())\n", "outlives the 'scope' call, and 'v' does not; declare 'v' before 'scope'")
+
 // The pointer rule already refused this road; its refusal now names the scope's cure.
 @test("a closure in the body lending the address of the body's local is refused with the scope's cure")
 sbe_pointer_closure_refused()
