@@ -1,0 +1,458 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Var}
+import sysl.text.{cstring, Search}
+
+// A `ref` whose place starts at a parameter or a local of its own body (`ref r = node.inner`, `node`
+// a `&Node` parameter) stands in an object that slot keeps alive for the whole call: a parameter by
+// the caller's guarantee (`reference/memory.md § Passing a reference to a call usually costs
+// nothing`), a local by its own count. A call that may write a `Node` -- `touch(o) = o.next = None`,
+// with `o` the same node by another name -- writes beside the ref, never frees what it stands on, so
+// it is accepted. What a call CAN still do is write the slot itself, and that needs its address: an
+// `&` of the slot, a `ref` bound to it, a nested function's environment, or a slot that is not the
+// body's own (module storage). Those stay refused, as does every owning step past the root (a
+// `&Child` field the callee replaces) and a `Buf` a callee may grow.
+//
+// Skipped cells, and why: a call through a trait object or a closure names no body and is refused
+// before the root is asked about (`tests_rfa_ref_alias`); a library build keeps such calls opaque the
+// same way; an interrupt handler is a call through C, which reaches every C-entered body.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private extern "setenv" rpc_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" rpc_c_unsetenv(name: *u8) -> int
+
+private struct RpcRun
+    out: string
+    err: string
+    hooks: usize
+end RpcRun
+
+// The program built and run: on the counted heap, or with `flags` handed to clang.
+private rpc_run(text: string, counted: bool, flags: string) -> RpcRun
+    val root = make_temp_dir("sysl-rpc").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    val exe = s"$root/built"
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+        val v = cstring(flags)
+
+        rpc_c_setenv(n.ptr, v.ptr, 1)
+    end if
+
+    force_alloc_counting(counted)
+
+    val made = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe))
+
+    force_alloc_counting(false)
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+
+        rpc_c_unsetenv(n.ptr)
+    end if
+
+    made match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return RpcRun(failure_text(why), "", 0)
+        Ok(_) -> ()
+
+    val hooks = capture("nm", ["-u", exe], "", [], true) match
+        Ok(o) -> o.text.count_of("__asan_report")
+        Err(_) -> 0
+
+    val ran = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    ran match
+        Err(_) -> RpcRun("could not be started", "", hooks)
+        Ok(o) -> RpcRun(o.text, o.err.unwrap_or(""), hooks)
+end rpc_run
+
+// The program printed `want` on the counted heap, with nothing left over and nothing given back twice.
+private rpc_prints(text: string, want: string)
+    if !enm_ready() then return
+
+    val got = rpc_run(text, true, "")
+
+    assert_eq(got.out, want)
+    assert_eq(got.err, "")
+end rpc_prints
+
+// The program printed `want` under AddressSanitizer, instrumented, and nothing was reported.
+private rpc_asan(text: string, want: string)
+    if !enm_ready() then return
+
+    val got = rpc_run(text, false, "-fsanitize=address -g")
+
+    assert(got.hooks > 0, s"not instrumented: ${got.out}")
+    assert_eq(got.out, want)
+    assert_eq(got.err, "")
+end rpc_asan
+
+// What analysing a program said, all of it, held to contain `part`.
+private rpc_refused(text: string, part: string)
+    if !enm_ready() then return
+
+    val root = make_temp_dir("sysl-rpc").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    assert(out.contains(part), s"expected '$part' in: $out")
+end rpc_refused
+
+private rpc_msg(holder: string, callee: string) -> string =
+    s"'r' is a 'ref' standing on storage held in a '$holder', and '$callee' may write a '$holder' — " +
+    "another name for the same object would leave the 'ref' pointing at freed memory"
+
+private const rpc_types: string = raw"""
+    struct Inner
+        n: int
+
+        bump(*self) = self.n += 1
+
+    struct Node
+        inner: Inner
+        next: Option[&Node]
+
+    touch(o: &Node) = o.next = None
+
+    """
+
+// -- the regression -------------------------------------------------------------------------------
+
+private const rpc_reduction: string = raw"""
+    walk(node: &Node, other: &Node)
+        ref r = node.inner
+        touch(other)
+        r.bump()
+
+    main()
+        val a: &Node = Node(Inner(1), None)
+        val b: &Node = Node(Inner(2), Some(a))
+
+        walk(a, b)
+        print(a.inner.n)
+    """
+
+@test("a ref through a '&Node' parameter is accepted across a call that may write a 'Node'")
+rpc_reduction_accepted()
+    rpc_prints(rpc_types + rpc_reduction, "2\n")
+
+// The callee drops the only count the program's own names hold on the node the ref stands in: the
+// caller's guarantee for `b.next.unwrap()` is all that keeps it, and it holds to the end of the call.
+private const rpc_freed_elsewhere: string = raw"""
+    struct Inner
+        n: int
+
+        bump(*self) = self.n += 1
+
+    struct Node
+        id: int
+        inner: Inner
+        next: Option[&Node]
+
+    impl Drop for Node
+        drop(self) = print(s"drop ${self.id}")
+
+    touch(o: &Node) = o.next = None
+
+    walk(node: &Node, other: &Node)
+        ref r = node.inner
+        touch(other)
+        r.bump()
+        print(s"bumped ${r.n}")
+
+    main()
+        val b: &Node = Node(2, Inner(20), Some(Node(1, Inner(10), None)))
+
+        walk(b.next.unwrap(), b)
+        print("back")
+    """
+
+@test("the callee lets go of the field that held the node: the ref still reads it, on the counted heap")
+rpc_field_cleared_counted()
+    rpc_prints(rpc_freed_elsewhere, "bumped 11\ndrop 1\nback\ndrop 2\n")
+
+@test("and under AddressSanitizer: instrumented, and no read of freed memory")
+rpc_field_cleared_under_asan()
+    rpc_asan(rpc_freed_elsewhere, "bumped 11\ndrop 1\nback\ndrop 2\n")
+
+// -- other roots its own body holds ---------------------------------------------------------------
+
+@test("a ref through a '&Node' local 'val' is accepted across the same call")
+rpc_local_val_accepted()
+    rpc_prints(rpc_types + raw"""
+        walk(other: &Node)
+            val node: &Node = Node(Inner(1), None)
+            ref r = node.inner
+            touch(other)
+            r.bump()
+            print(node.inner.n)
+
+        main() = walk(Node(Inner(2), None))
+        """, "2\n")
+
+@test("a ref through a '&Node' local 'var' whose address is never taken is accepted")
+rpc_local_var_accepted()
+    rpc_prints(rpc_types + raw"""
+        walk(first: &Node, other: &Node)
+            var node = first
+            ref r = node.inner
+            touch(other)
+            r.bump()
+            print(node.inner.n)
+
+        main()
+            val a: &Node = Node(Inner(4), None)
+
+            walk(a, Node(Inner(2), Some(a)))
+        """, "5\n")
+
+@test("a ref through '&self' in a method of a type with a destructor is accepted")
+rpc_method_self_accepted()
+    rpc_prints(raw"""
+        struct Inner
+            n: int
+
+            bump(*self) = self.n += 1
+
+        struct Node
+            inner: Inner
+            next: Option[&Node]
+
+            walk(&self, other: &Node)
+                ref r = self.inner
+                touch(other)
+                r.bump()
+        end Node
+
+        impl Drop for Node
+            drop(self) = ()
+
+        touch(o: &Node) = o.next = None
+
+        main()
+            val a: &Node = Node(Inner(6), None)
+
+            a.walk(Node(Inner(2), Some(a)))
+            print(a.inner.n)
+        """, "7\n")
+
+@test("a ref through a generic function's '&T' parameter, instantiated twice, is accepted")
+rpc_generic_accepted()
+    rpc_prints(rpc_types + raw"""
+        struct Cell[T]
+            inner: Inner
+            item: Option[T]
+
+        clear[T](o: &Cell[T]) = o.item = None
+
+        walk[T](node: &Cell[T], other: &Cell[T])
+            ref r = node.inner
+            clear(other)
+            r.bump()
+
+        main()
+            val a: &Cell[int] = Cell(Inner(1), Some(3))
+            val s: &Cell[string] = Cell(Inner(10), Some("x"))
+
+            walk(a, a)
+            walk(s, s)
+            print(s"${a.inner.n} ${s.inner.n}")
+        """, "2 11\n")
+
+@test("a ref into a view parameter is accepted across a call that may write a view of its type")
+rpc_view_param_accepted()
+    rpc_asan(raw"""
+        struct Holder
+            cell: []int
+
+        clear(h: &Holder) = h.cell = [0; 2]
+
+        walk(cell: []int, h: &Holder)
+            ref e = cell[0]
+            clear(h)
+            e += 1
+            print(e)
+
+        main()
+            val h: &Holder = Holder([41, 2, 3])
+
+            walk(h.cell, h)
+            print(h.cell[0])
+        """, "42\n0\n")
+
+// -- still refused: the slot itself written -------------------------------------------------------
+
+@test("a parameter whose address is handed to a callee that writes it is still refused")
+rpc_param_address_refused()
+    rpc_refused(rpc_types + raw"""
+        swap(p: *&Node, o: &Node) = *p = o
+
+        walk(node: &Node, other: &Node)
+            ref r = node.inner
+            swap(&node, other)
+            r.bump()
+
+        main()
+            val b: &Node = Node(Inner(2), None)
+
+            walk(Node(Inner(1), None), b)
+        """, rpc_msg("&Node", "swap"))
+
+@test("a local 'var' whose address is handed to a callee that reassigns it is still refused")
+rpc_var_address_refused()
+    rpc_refused(rpc_types + raw"""
+        swap(p: *&Node, o: &Node) = *p = o
+
+        walk(node: &Node, other: &Node)
+            var at = node
+            ref r = at.inner
+            swap(&at, other)
+            r.bump()
+
+        main()
+            val b: &Node = Node(Inner(2), None)
+
+            walk(Node(Inner(1), None), b)
+        """, rpc_msg("&Node", "swap"))
+
+@test("the address taken after the call still lets the slot out: the body is read whole")
+rpc_address_later_refused()
+    rpc_refused(rpc_types + raw"""
+        swap(p: *&Node, o: &Node) = *p = o
+
+        walk(node: &Node, other: &Node)
+            var at = node
+            ref r = at.inner
+            touch(other)
+            r.bump()
+            swap(&at, other)
+
+        main()
+            val b: &Node = Node(Inner(2), None)
+
+            walk(Node(Inner(1), None), b)
+        """, rpc_msg("&Node", "touch"))
+
+@test("a nested function that reassigns the local holds its address, so its call is refused")
+rpc_nested_reassign_refused()
+    rpc_refused(rpc_types + raw"""
+        walk(node: &Node, other: &Node)
+            var at = node
+
+            retarget() = at = other
+
+            ref r = at.inner
+            retarget()
+            r.bump()
+
+        main()
+            val b: &Node = Node(Inner(2), None)
+
+            walk(Node(Inner(1), None), b)
+        """, rpc_msg("&Node", "walk.retarget"))
+
+@test("a ref bound to the slot itself lets it out: its address is a pointer to the slot")
+rpc_ref_to_slot_refused()
+    rpc_refused(rpc_types + raw"""
+        swap(p: *&Node, o: &Node) = *p = o
+
+        walk(node: &Node, other: &Node)
+            var at = node
+            ref r = at.inner
+            ref whole = at
+            swap(&whole, other)
+            r.bump()
+
+        main()
+            val b: &Node = Node(Inner(2), None)
+
+            walk(Node(Inner(1), None), b)
+        """, rpc_msg("&Node", "swap"))
+
+@test("a ref through the entry file's top-level 'var' is refused across a function that reassigns it")
+rpc_entry_var_refused()
+    rpc_refused(rpc_types + raw"""
+        var g: &Node = Node(Inner(1), None)
+
+        reset() = g = Node(Inner(5), None)
+
+        ref r = g.inner
+
+        reset()
+        r.bump()
+        """, rpc_msg("&Node", "reset"))
+
+@test("a ref through module storage, from inside a function, is refused across a call that reassigns it")
+rpc_module_var_refused()
+    rpc_refused(rpc_types + raw"""
+        var g: &Node = Node(Inner(1), None)
+
+        reset() = g = Node(Inner(5), None)
+
+        run()
+            ref r = g.inner
+            reset()
+            r.bump()
+
+        run()
+        """, rpc_msg("&Node", "reset"))
+
+// -- still refused: an owning step past the root --------------------------------------------------
+
+@test("a ref through a '&Child' field of the parameter is refused across a call that replaces it")
+rpc_owned_field_refused()
+    rpc_refused(raw"""
+        struct Child
+            n: int
+
+        struct Node
+            child: &Child
+
+        reset(o: &Node) = o.child = Child(9)
+
+        walk(node: &Node, other: &Node)
+            ref r = node.child.n
+            reset(other)
+            r += 1
+
+        main()
+            val a: &Node = Node(Child(1))
+
+            walk(a, a)
+        """, "'r' is a 'ref' standing on storage held in a 'Node', and 'reset' may write a 'Node'")
+
+@test("a ref into a 'Buf' parameter's element is refused across a call that may grow the buffer")
+rpc_buf_element_refused()
+    rpc_refused(raw"""
+        import sysl.buf.{Buf, buf}
+
+        grow(b: Buf[int]) = b.push(9)
+
+        walk(b: Buf[int])
+            ref e = b[0]
+            grow(b)
+            e = 5
+
+        main()
+            val b: Buf[int] = buf()
+
+            b.push(1)
+            walk(b)
+        """, "'e' is a 'ref' standing on storage held in a 'Buf[int]', and 'grow' may write a 'Buf[int]'")

@@ -765,6 +765,7 @@ emit_llvm_text(path: string, named_target: Option[string],
                 Ok(None) -> ()
 
     phase_done("std")
+    forget_field_paths(done.an)
 
     // **A build that links and optimizes also carries a copy of each small or `@inline` function
     // those halves define** (`codegen.sysl`'s `importable`), so that a call into a package inlines as
@@ -2477,6 +2478,57 @@ private test_build_from(program: Compilation, standalone: bool, level: string,
     // A test binary links the roots' kept halves as a program does. A root whose own tests this build
     // runs is one the project declares into, which is exactly a root that is compiled from source.
     val roots = if standalone then no_roots_linked() else roots_linked(program, project, level)
+    val ready = tests_analyzed(program, standalone, project, warns)
+
+    var precompiled: Buf[string] = buf()
+
+    std_linked(t, level, standalone) match
+        Err(why) -> return Err(Refusal(why))
+        Ok(Some(found)) -> precompiled = found.precompiled
+        Ok(None) -> ()
+
+    phase_done("std")
+
+    val lowered = codegen_with_gaps(ready.kept with { precompiled = joined_names(precompiled,
+                                                                                 roots.precompiled) },
+                                    t, ready.promotions, imports_bodies(level), None, false, program.own,
+                                    compact)
+
+    phase_done("codegen")
+
+    check_aligned_heap(ready.an, ready.kept)
+
+    val report = errors_of(ready.an.diagnostics())
+
+    if warns then say_warnings(report, ready.an)
+
+    val emitted = Emitted(ir_print_module(lowered.0), report, lowered.1,
+                          link_required(program.units), roots.archives, buf(), buf())
+
+    phase_done("print")
+
+    Ok(TestBuild(emitted, ready.kept.tests, t, standalone, 0))
+end test_build_from
+
+// What lowering a test build reads of its analysis: the pruned program, what the escape analysis
+// promoted, and the analysis itself for the one check that follows the lowering and for the report.
+struct TestsAnalyzed
+    an: &Analysis
+    kept: TProgram
+    promotions: Promotions
+end TestsAnalyzed
+
+// A test build's program analyzed, checked and pruned to what its tests reach.
+//
+// **Everything the lowering does not read is let go of before it starts**, which is why this is a
+// function of its own: the typed bodies as the analysis answered them and the unpruned program are
+// this frame's, so they go when it returns, and the field-path analysis the checks kept on the
+// analysis -- a summary of every body, and more than a quarter of what the analysis holds -- is
+// dropped once the escape analysis has read it. The allocator never gives a freed block back to the
+// system, but the lowering reuses it, so what goes here is what the lowering would otherwise have
+// taken fresh. Every check that reads the unpruned program runs here, before the lowering.
+tests_analyzed(program: Compilation, standalone: bool, project: string, warns: bool) -> TestsAnalyzed
+    val t = program.target
 
     // **Every body the library declares is typed when the library is what is being built**, not only
     // the ones a test happens to reach. It is the same reading `library_build` asks for, and the
@@ -2496,24 +2548,6 @@ private test_build_from(program: Compilation, standalone: bool, level: string,
     val kept = tests_only(whole, program.own)
 
     check_library_hooks(done.an, kept)
-    phase_done("prune")
-
-    var precompiled: Buf[string] = buf()
-
-    std_linked(t, level, standalone) match
-        Err(why) -> return Err(Refusal(why))
-        Ok(Some(found)) -> precompiled = found.precompiled
-        Ok(None) -> ()
-
-    phase_done("std")
-
-    val lowered = codegen_with_gaps(kept with { precompiled = joined_names(precompiled,
-                                                                           roots.precompiled) },
-                                    t, promotions, imports_bodies(level), None, false, program.own, compact)
-
-    phase_done("codegen")
-
-    check_aligned_heap(done.an, kept)
 
     if warns
         val root = if is_directory(project) then project else parent_of(project).unwrap_or(".")
@@ -2522,17 +2556,11 @@ private test_build_from(program: Compilation, standalone: bool, level: string,
             check_bare_metal_storage(done.an, strip_tests(whole), program.own, root, false)
     end if
 
-    val report = errors_of(done.an.diagnostics())
+    phase_done("prune")
+    forget_field_paths(done.an)
 
-    if warns then say_warnings(report, done.an)
-
-    val emitted = Emitted(ir_print_module(lowered.0), report, lowered.1,
-                          link_required(program.units), roots.archives, buf(), buf())
-
-    phase_done("print")
-
-    Ok(TestBuild(emitted, kept.tests, t, standalone, 0))
-end test_build_from
+    TestsAnalyzed(done.an, kept, promotions)
+end tests_analyzed
 
 // A test binary, linked exactly as a program is, in a directory of its own.
 //

@@ -1028,7 +1028,7 @@ struct Untouched
     open: Buf[bool]
     laundered: Casts
     dropping: Buf[Type]
-    answers: Map[string, Set[string]]
+    answers: Map[string, Cleared]
     exits: Buf[Buf[string]]
     casts: Buf[Buf[Type]]
     reads: Buf[Set[string]]
@@ -1036,6 +1036,12 @@ struct Untouched
     moves: Buf[Option[Type]]
     open_answering: Buf[bool]
     releases: Buf[Buf[Type]]
+
+    // Each name's number in an answer's bits (`Cleared`), a name `names` holds twice numbered once, and
+    // how many of `names` were numbered -- every one of them, once a question has been asked.
+    ids: Map[string, usize]
+    id_count: usize
+    ids_for: usize
 
     // The edge-write summary (`edge_writes`): each body's own writes, the pointer casts a store could
     // go through, the program they were read from (for the foreign functions and what C can call), and
@@ -1052,7 +1058,44 @@ end Untouched
 // An empty summary, for an emitter that has not read a program yet.
 untouched_none() -> Untouched =
     Untouched(buf(), buf(), buf(), buf(), buf(), no_casts(), buf(), map(), buf(), buf(), buf(), buf(), buf(), buf(),
-              buf(), buf(), no_casts(), None, false, buf(), map(), map())
+              buf(), map(), 0, 0, buf(), no_casts(), None, false, buf(), map(), map())
+
+// The functions one question to `untouched_by` cleared, as one bit a name over the summary's numbering.
+//
+// **A bit a name, not a set of the names**: the answers are kept for the life of an emitter, one for
+// every type a call asks about, and a set of tens of thousands of names apiece was 5.6 GB of the
+// compiler's own test build at three quarters through its lowering -- nearly all of what the lowering
+// held. The bits are under 9 KB for 70,000 functions, and the numbering is the summary's, shared.
+//
+// A name the summary does not hold is not cleared, as a set of the names would not hold it either --
+// and nor is one numbered after the answer was made, which its bits do not reach.
+struct Cleared
+    ids: Map[string, usize]
+    bits: Buf[u64]
+
+    has(self, name: string) -> bool = holds_bit(self.ids, self.bits, name)
+end Cleared
+
+private holds_bit(ids: Map[string, usize], bits: Buf[u64], name: string) -> bool = ids.get(name) match
+    Some(i) -> i / 64 < bits.len() && ((bits[i / 64] >> u64(i % 64)) & 1) == 1
+    None -> false
+
+private set_bit(bits: Buf[u64], i: usize) = bits[i / 64] = bits[i / 64] | (u64(1) << u64(i % 64))
+
+private clear_bit(bits: Buf[u64], i: usize) = bits[i / 64] = bits[i / 64] & ~(u64(1) << u64(i % 64))
+
+// Every name of the summary numbered, where a function has been added since it last was.
+private number_names(u: *Untouched)
+    if u.ids_for == u.names.len() then return
+
+    for i in u.ids_for..<u.names.len()
+        if !u.ids.has(u.names[i])
+            u.ids.put(u.names[i], u.id_count)
+            u.id_count += 1
+        end if
+
+    u.ids_for = u.names.len()
+end number_names
 
 // What one body's walk gathers for the `Untouched` lists that say what it can run: the module storage
 // it names, whether it holds a node that may run code no call names, and the types of what it can let
@@ -1298,7 +1341,7 @@ end untouched_summary
 // question -- they live in the caller's frame, and a path that does not come back never resumes it, so
 // nothing reads through them afterwards, whatever that path released.
 untouched_by(u: *Untouched, t: Type, lent: Type = Unknown, relocation: bool = false,
-             answering: bool = false) -> Set[string]
+             answering: bool = false) -> Cleared
     val asked = if lent == Unknown then mangle(t) else s"${mangle(t)}|${mangle(lent)}"
     val moving = if relocation then s"$asked|moves" else asked
     val key = if answering then s"$moving|answering" else moving
@@ -1306,11 +1349,16 @@ untouched_by(u: *Untouched, t: Type, lent: Type = Unknown, relocation: bool = fa
 
     if known.is_some() then return known.unwrap()
 
+    number_names(u)
+
     var parts: Buf[Type] = buf()
     by_value_parts(t, &parts)
 
     var alive: Buf[bool] = buf()
-    var out: Set[string] = set()
+    var bits: Buf[u64] = buf()
+
+    for k in 0..<(u.id_count + 63) / 64
+        bits.push(0)
 
     // The same few root and given types recur across thousands of bodies, so each is judged once.
     var root_hits: Map[string, bool] = map()
@@ -1348,7 +1396,7 @@ untouched_by(u: *Untouched, t: Type, lent: Type = Unknown, relocation: bool = fa
 
         alive.push(ok)
 
-        if ok then out.add(u.names[i])
+        if ok then set_bit(bits, u.ids.get(u.names[i]).unwrap())
 
     var moved = true
 
@@ -1357,10 +1405,13 @@ untouched_by(u: *Untouched, t: Type, lent: Type = Unknown, relocation: bool = fa
 
         for i in 0..<u.names.len()
             for item in u.calls[i]
-                if alive[i] && !out.has(item)
+                if alive[i] && !holds_bit(u.ids, bits, item)
                     alive[i] = false
-                    out.remove(u.names[i])
+                    clear_bit(bits, u.ids.get(u.names[i]).unwrap())
                     moved = true
+
+    val out = Cleared(u.ids, bits)
+
     u.answers.put(key, out)
     out
 end untouched_by

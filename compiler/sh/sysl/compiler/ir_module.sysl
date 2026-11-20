@@ -1,7 +1,7 @@
 module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
-import sysl.text.{str_builder, StrBuilder}
+import sysl.text.{str_builder, str_builder_with_capacity, StrBuilder}
 
 // **A module, as data**, and the one function that writes one down as LLVM's textual form.
 //
@@ -240,6 +240,12 @@ end print_block
 // **A whole module as LLVM text.** The blank lines are part of the answer: a section that has
 // nothing in it contributes none, and the declarations at the top contribute one whether or not
 // there were any.
+//
+// **The functions are written into a builder given their room up front**, where every one of them is
+// already printed (`printed_func`): the text around them is written first, into builders of its own,
+// and the whole is then one allocation of exactly its size. Grown by doubling instead, the copies on
+// the way up were half of the 2 GB that printing added to the resident size of the compiler's own test
+// build, which the allocator keeps once freed.
 ir_print_module(m: IrModule) -> string
     var b = str_builder()
 
@@ -268,35 +274,56 @@ ir_print_module(m: IrModule) -> string
 
     b.push_char('\n')
 
-    for i in 0..<m.funcs.len()
-        b.push(ir_print_func(m.funcs[i]))
-
-    b.push_char('\n')
+    var tail = str_builder()
 
     for thunk in m.thunks
-        b.push(ir_print_func(thunk))
+        tail.push(ir_print_func(thunk))
 
-    b.push_char('\n')
+    tail.push_char('\n')
 
     m.entry match
-        Some(f) -> b.push(ir_print_func(f))
+        Some(f) -> tail.push(ir_print_func(f))
         None -> ()
 
     m.init match
         Some(i) ->
-            b.push(ir_print_func(i.func))
-            b.push(global_render(i.list))
-            b.push_char('\n')
+            tail.push(ir_print_func(i.func))
+            tail.push(global_render(i.list))
+            tail.push_char('\n')
         None -> ()
 
     m.used match
         Some(g) ->
-            b.push(global_render(g))
-            b.push_char('\n')
+            tail.push(global_render(g))
+            tail.push_char('\n')
         None -> ()
 
-    b.finish()
+    val head = b.finish()
+    val last = tail.finish()
+    var out = str_builder_with_capacity(head.len + printed_room(m.funcs) + 1 + last.len)
+
+    out.push(head)
+
+    for i in 0..<m.funcs.len()
+        out.push(ir_print_func(m.funcs[i]))
+
+    out.push_char('\n')
+    out.push(last)
+    out.finish()
 end ir_print_module
+
+// The bytes `ir_print_func` writes for each of `funcs`, where every one is already printed; nothing
+// where one is still blocks, whose text is not known until it is written.
+printed_room(funcs: Buf[IrFunc]) -> usize
+    var n: usize = 0
+
+    for f in funcs
+        if !is_printed(f) then return 0
+
+        n += sig_define(f.sig).len + 3 + f.printed.len + 2
+
+    n
+end printed_room
 
 private sig_lines(items: Buf[IrFuncSig], out: *StrBuilder, always: bool)
     for item in items
