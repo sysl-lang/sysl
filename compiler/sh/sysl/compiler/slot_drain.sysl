@@ -1,0 +1,236 @@
+module sh.sysl.compiler
+
+import sysl.buf.Buf
+
+// **Copying a container's elements into new storage and then dropping the old storage is a move.**
+//
+// A growable container grows by placing every element it holds into a bigger buffer and replacing
+// its storage with that buffer:
+//
+//     var fresh: []E = slot_storage(n)
+//     for i in 0..<self.count do slot_place(fresh, i, self.storage[i])
+//     self.storage = fresh
+//
+// Read as written, each `self.storage[i]` takes a count of its own for the slot it lands in, and the
+// replacement then lets go of the old storage, whose hook walks every element giving each count back
+// -- two passes of reference counting over the whole container for counts that end where they began.
+// Where the old storage has no other holder, the read can take over the share its slot held instead,
+// as `slot_take` does: nothing is retained, and the slot is left holding nothing for the hook to give
+// back. That is what this file finds and what `slots.sysl`'s drain lowering does.
+//
+// **What is found** is two statements of one list, the second possibly the block's value:
+//
+// - a counted loop `for i in lo..<hi` whose body is exactly `slot_place(d, j, s[i])`, or a single
+//   `slot_place_run(d, at, s[a..<b])` (or of the whole of `s`);
+// - then `s = x`, where `x` is a local -- with or without the re-check of an `invariant` the struct
+//   holding `s` states, which runs after the write.
+//
+// `s` is a place spelled as a path -- a local, its fields, a pointer's referent -- and `d` is a local
+// declared earlier in the list from `slot_storage`, named by nothing between its declaration and the
+// loop. `j` is the loop's variable, or that plus or minus an expression the loop cannot change.
+// Every other expression of the loop -- its bounds, `j`, the run's cut -- is arithmetic over locals and
+// fields, and never reads an element.
+//
+// **Why that is enough.** Taking a share out of a slot is sound wherever nothing reads that slot again
+// expecting the value: a taken slot holds zero, which every hook gives back as nothing. Nothing in the
+// loop reads `s` but the one read, which visits each slot once; nothing in it calls anything; and the
+// place into fresh storage at a slot index that grows every turn is the first free slot or a trap,
+// never an assignment over a live slot, so no destructor runs inside the loop that could look at `s`.
+// The statement after it lets go of `s`. Whether `s` has another holder -- a second copy of the
+// container, a view handed out earlier -- is a question only the count can answer, so it is asked at
+// run time, before the loop: where the count is above one the read retains exactly as written.
+//
+// A borrowed parameter view of the old storage holds no count, as it does not for `slot_vacate`; it is
+// a view of storage the replacement frees either way.
+
+// One copy found: the place `source` is read from and dropped, the node that reads it (the loop's
+// subscript, or the run's source), its element type, and for a counted loop its bounds and variable
+// type -- which is what lets the drain see, before the loop, whether it covers the whole live prefix.
+struct DrainPlan
+    source: TExpr
+    read: TExpr
+    elem: Type
+    bounds: Option[(TExpr, TExpr, Type)]
+end DrainPlan
+
+// The copy that statement `k` of `xs` is, where it is one. `tail` is the block's value, which follows
+// the last statement.
+drain_plan(e: *Emit, xs: Buf[TStmt], k: usize, tail: Option[TExpr]) -> Option[DrainPlan]
+    val copy = xs[k] match
+        TExprStmt(x) -> x
+        _ -> return None
+
+    val next = if k + 1 < xs.len() then stmt_store(xs[k + 1]) else tail.and_then(x -> expr_store(x))
+
+    if next.is_none() then return None
+
+    val dropped = next.unwrap()
+    val source = dropped.0
+    val root = path_root(source)
+
+    if root.is_none() then return None
+
+    val replaced_by = *dropped.1.kind match
+        TLoad(n, _) -> n
+        _ -> return None
+
+    if replaced_by == root.unwrap() then return None
+
+    val plan = *copy.kind match
+        TFor(name, var_ty, lo, hi, inclusive, body, else_block, _) ->
+            if else_block.is_some() || body.len() != 1 then return None
+
+            val placed = body[0] match
+                TExprStmt(x) -> x
+                _ -> return None
+
+            loop_copy(source, root.unwrap(), name, var_ty, lo, hi, inclusive, placed)
+        TSlots(op, args, elem, _) -> if op == "slot_place_run" then run_copy(source, args, elem) else None
+        _ -> None
+
+    if plan.is_none() then return None
+
+    val p = plan.unwrap()
+
+    if !contains_counted(p.0.elem) || zero_sized(p.0.elem) || e.layout.indirect(p.0.elem) then return None
+    if !fresh_storage(xs, k, p.1) || p.1 == root.unwrap() then return None
+
+    Some(p.0)
+end drain_plan
+
+// `place = value` as a statement: an ordinary write, or a store standing as one.
+private stmt_store(s: TStmt) -> Option[(TExpr, TExpr)] = s match
+    TWriteStmt(w) -> if w.op == "=" && w.dispatch.is_none() then Some((w.place, w.value)) else None
+    TExprStmt(x) -> expr_store(x)
+    _ -> None
+
+private expr_store(x: TExpr) -> Option[(TExpr, TExpr)] = *x.kind match
+    TStore(place, value, _, _) -> Some((place, value))
+    // A struct's `invariant` is re-checked after the write, which still lets go of the old storage
+    // first; the check reads the struct's fields, and the elements now live in the new storage.
+    TRecheck(after, _, _, _) -> expr_store(after)
+    _ -> None
+
+// The local a path starts from: `a`, `a.f`, `p.f.g` through a pointer.
+private path_root(x: TExpr) -> Option[string] = *x.kind match
+    TLoad(n, _) -> Some(n)
+    TField(r, _, _) -> path_root(r)
+    TDeref(r, _) -> path_root(r)
+    _ -> None
+
+// Whether two paths spell one place.
+private same_path(a: TExpr, b: TExpr) -> bool = (*a.kind, *b.kind) match
+    (TLoad(x, _), TLoad(y, _)) -> x == y
+    (TField(ra, ia, _), TField(rb, ib, _)) -> ia == ib && same_path(ra, rb)
+    (TDeref(ra, _), TDeref(rb, _)) -> same_path(ra, rb)
+    _ -> false
+
+// Arithmetic over locals and fields: it calls nothing, writes nothing and reads no element.
+private plain(x: TExpr) -> bool = *x.kind match
+    TIntLit(_, _) -> true
+    TBoolLit(_) -> true
+    TLoad(_, _) -> true
+    TField(r, _, _) -> plain(r)
+    TDeref(r, _) -> plain(r)
+    TBinary(_, l, r, _) -> plain(l) && plain(r)
+    TUnary(_, r, _) -> plain(r)
+    TCast(r, _) -> plain(r)
+    TLen(r, _) -> plain(r)
+    _ -> false
+
+// `for name in lo..<hi do slot_place(d, j, source[name])`, and the local `d`.
+private loop_copy(source: TExpr, root: string, name: string, var_ty: Type, lo: TExpr, hi: TExpr,
+                  inclusive: bool, placed: TExpr) -> Option[(DrainPlan, string)]
+    val parts = *placed.kind match
+        TSlots(op, args, elem, _) -> if op == "slot_place" && args.len() == 3 then (args, elem) else return None
+        _ -> return None
+
+    val args = parts.0
+    val read = args[2]
+
+    val read_ok = *read.kind match
+        TIndex(r, i, _) -> same_path(r, source) && is_load(i, name)
+        _ -> false
+
+    if !read_ok || root == name then return None
+
+    val d = *args[0].kind match
+        TLoad(n, _) -> n
+        _ -> return None
+
+    if d == name || !steps(args[1], name) || mentions(args[1], d) then return None
+    if !plain(lo) || !plain(hi) || mentions(lo, d) || mentions(hi, d) then return None
+
+    // A closed range is drained slot by slot; only a half-open one is measured against the prefix.
+    val bounds = if inclusive then None else Some((lo, hi, var_ty))
+
+    Some((DrainPlan(source, read, parts.1, bounds), d))
+end loop_copy
+
+// `slot_place_run(d, at, source[a..<b])`, or of the whole of `source`, and the local `d`.
+private run_copy(source: TExpr, args: Buf[TExpr], elem: Type) -> Option[(DrainPlan, string)]
+    if args.len() != 3 then return None
+
+    val src = args[2]
+
+    val read_ok = *src.kind match
+        TSlice(base, lo, hi, _, _) ->
+            same_path(base, source) && lo.map(x -> plain(x)).unwrap_or(true) &&
+                hi.map(x -> plain(x)).unwrap_or(true)
+        _ -> same_path(src, source)
+
+    if !read_ok || !plain(args[1]) then return None
+
+    val d = *args[0].kind match
+        TLoad(n, _) -> n
+        _ -> return None
+
+    if mentions(args[1], d) || mentions(src, d) then return None
+
+    Some((DrainPlan(source, src, elem, None), d))
+end run_copy
+
+private is_load(x: TExpr, name: string) -> bool = *x.kind match
+    TLoad(n, _) -> n == name
+    _ -> false
+
+// A slot index that grows by one every turn: the variable, or it plus or minus what the loop cannot
+// change -- plain, and not the variable.
+private steps(x: TExpr, name: string) -> bool = *x.kind match
+    TLoad(n, _) -> n == name
+    TBinary(op, l, r, _) ->
+        if op == "+" then (is_load(l, name) && fixed(r, name)) || (is_load(r, name) && fixed(l, name))
+        else op == "-" && is_load(l, name) && fixed(r, name)
+    _ -> false
+
+private fixed(x: TExpr, name: string) -> bool = plain(x) && !mentions(x, name)
+
+// Whether `d` is declared before statement `k` from `slot_storage`, and named by nothing between.
+private fresh_storage(xs: Buf[TStmt], k: usize, d: string) -> bool
+    var j = k
+
+    while j > 0
+        j -= 1
+
+        val made = xs[j] match
+            TVarDecl(n, _, init, _) -> if n == d then Some(init) else None
+            _ -> None
+
+        if made.is_some()
+            return *made.unwrap().kind match
+                TSlots(op, _, _, _) -> op == "slot_storage"
+                _ -> false
+
+        if stmt_mentions(xs[j], d) then return false
+
+    false
+end fresh_storage
+
+private stmt_mentions(s: TStmt, name: string) -> bool
+    val c: &SlotCount = SlotCount(0)
+
+    walk_stmt(s, expr_walk(true, y -> *y.kind match
+        TLoad(n, _) -> if n == name then c.bump()
+        _ -> ()))
+    c.n > 0
+end stmt_mentions

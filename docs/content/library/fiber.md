@@ -284,6 +284,110 @@ per thread, which belongs to the carrier**:
   on the carrier that runs it: `use_error_trace(&f.trace)` before the switch to the fiber, and
   `use_error_trace(null)` once it has switched back.
 - **The overflow report needs nothing per thread**, as above.
+- **A count that is not atomic is the carrier's too.** A view, a string, a `&T` or a closure held
+  across a switch is given back, once the fiber resumes, on whichever carrier resumed it — with a
+  plain decrement, racing anything on the first carrier that shares the same count.
+
+### A count held across a switch is refused
+
+So **a value whose count is not atomic may not be live across a call that can reach `switch`** —
+the switch itself, or any function that calls it, however many calls down. The refusal names the
+value and the call:
+
+```sysl
+import sysl.fiber.{Context, switch}
+
+struct Carrier
+    receiving: []u8
+
+var home = Context.new()
+var away = Context.new()
+
+wait()
+    switch(&away, &home)
+
+receive(k: &Carrier, want: usize) -> int
+    val room = k.receiving[0..<want]
+    wait()
+    int(room.len)
+```
+
+```error
+'wait' can reach 'sysl.fiber.switch', which may resume this fiber on another thread, and this frame holds 'room' across the call — a count that is not atomic, which would then be changed from that thread while the one it was made on may change it too. End it before the call (in a block of its own, or in a function that returns first), or hold it as a '&sync' reference, whose count is atomic; a function whose fiber is only ever resumed on the thread it began on says so with '@pinned(thread)'
+```
+
+What is held is what a frame owns a count of at the call: a local, a binding a `match` took a share
+of, a counted temporary of the expression around the call. A scalar, a `*T` and a `&sync T` are not
+— the last has an atomic count. A value whose block has ended before the call is not held either, so
+the fix is usually to give the value a block of its own:
+
+```sysl
+import sysl.fiber.{Context, switch}
+
+struct Carrier
+    receiving: []u8
+
+var home = Context.new()
+var away = Context.new()
+
+wait()
+    switch(&away, &home)
+
+receive(k: &Carrier, want: usize) -> int
+    var got = 0
+
+    loop
+        if want <= k.receiving.len
+            val room = k.receiving[0..<want]
+            got = int(room.len)
+        if got > 0 then return got
+        wait()
+
+val k: &Carrier = Carrier([1, 2, 3])
+
+print(receive(k, 2))
+```
+
+```output
+2
+```
+
+**A body whose fiber is only ever resumed on the thread it began on says so with
+`@pinned(thread)`**, and holds what it likes. The program's `main` and the entry file's statements
+need not: they run on the main thread's own stack, which is resumed only on that thread. Each body
+says it for itself — a function a pinned one calls is asked on its own, and so is a closure written
+inside one. Only a call the compiler can follow is asked about: a call through a function value or a
+trait object is not.
+
+```sysl
+import sysl.fiber.{Context, Stack, switch}
+
+struct Pair
+    home: Context
+    fiber: Context
+
+var pair = Pair(Context.new(), Context.new())
+
+greet(p: *Pair)
+    print("in the fiber")
+    switch(&p.fiber, &p.home)
+
+@pinned(thread)
+drive()
+    val stack = Stack.reserve(64 * 1024).unwrap()
+    val name = "home " + "side"
+
+    pair.fiber = Context.start(stack, &greet, &pair)
+    switch(&pair.home, &pair.fiber)
+    print(name)
+
+drive()
+```
+
+```output
+in the fiber
+home side
+```
 
 A context made with `Context.new()` for a thread's **own** stack is resumed only on that thread: the
 stack is the thread's, and the thread may end.

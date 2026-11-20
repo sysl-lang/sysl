@@ -416,6 +416,12 @@ struct FuncMarks
     frame_limit: long
     frame_exempt: bool
 
+    // `@pinned(thread)`: the fiber this body runs on is only ever resumed on the thread it began on,
+    // so a count it holds across a call that can reach `sysl.fiber.switch` is touched by one thread
+    // alone (`abandons.sysl`'s `check_switch_holds`). Not given to a closure or nested function
+    // written inside, which may be called from anywhere.
+    pinned_thread: bool
+
     // Whether any of the three was written.
     any(self) -> bool = self.noinline || self.cold || self.inline
 
@@ -434,7 +440,7 @@ end FuncMarks
 no_marks() -> FuncMarks = FuncMarks(false, false, false, None, buf(), false, None, false, false,
                                     false, false, false, false, false, false, buf(), false, buf(), buf(),
                                     false, false, false, false, buf(), buf(), buf(), false, false, buf(), 0,
-                                    false)
+                                    false, false)
 
 // A method of a struct, an enum, a trait or an `impl` block.
 struct MethodDecl
@@ -614,6 +620,9 @@ enum Attr
     MainThread
     Pinned
     Pins
+    // `@pinned(thread)` above a function or a member: its fiber is only ever resumed on the thread it
+    // began on.
+    PinnedThread
     // `@unique` above a struct or an enum: a value of it has one owner.
     Unique
     // `@no_alloc` above a function or a method: the capability it gives up, as the word after `no_`.
@@ -722,6 +731,7 @@ attr_word(a: Attr) -> string = a match
     MainThread -> "main_thread"
     Pinned -> "pinned"
     Pins -> "pins"
+    PinnedThread -> "pinned(thread)"
     Unique -> "unique"
     Forgoes(cap) -> s"no_$cap"
     Blocks -> "blocks"
@@ -810,6 +820,8 @@ struct StructDecl
     // cross, where its fields alone do not show it (`promises.sysl`).
     promised: Buf[string]
 
+    // The message each of `invariants` was written with (`invariant lo <= hi, "msg"`), by position.
+    invariant_msgs: Buf[Option[Expr]]
     // `@unique`: a value of it has one owner, so a by-value use moves it (`unique_moves.sysl`).
     unique: bool
 end StructDecl
