@@ -176,12 +176,24 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
     var printed_refs: Set[string] = set()
     var compacted: usize = 0
 
+    // **The same build lets go of each typed body once it is lowered**, which on the compiler's own
+    // suite is 2.3 GB of typed tree given up while the lowering grows. Nothing after a body's own
+    // lowering reads it: what the whole program asks of the bodies -- the owning parameters, the
+    // contracts, the operators, the place entries -- was read above, before the first one was built,
+    // and what comes after reads signatures. The slot keeps everything but the body, since the thunks
+    // and the checks after the lowering read the rest, and so does a borrowing entry left pending,
+    // which is built from the signature. `bodies` is the caller's own list, which is the point: a copy
+    // would leave the caller holding every body.
+    var bodies = p.funcs
+
     // A `@ghost` function is not emitted at all: nothing executable may call one, and the clauses
     // that may are the ones a body never reaches.
     for i in 0..<p.funcs.len()
         val f = p.funcs[i]
 
         if f.ghost then continue
+
+        val heading = if compact then f with { body = TBlock(buf(), None, f.body.ty) } else f
 
         // What the function before this one added, let go of before this one is built.
         if compact then compacted = compact_from(funcs, compacted, &printed_refs)
@@ -193,7 +205,7 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
 
             gen_function(e, f) match
                 Some(built) ->
-                    for whole in owned_split(e, f, built, lazy, false, pending)
+                    for whole in owned_split(e, heading, built, lazy, false, pending)
                         for item in split_disjoint(f, whole)
                             for part in split_self(e, f, item, self_bodies)
                                 funcs.push(part)
@@ -215,11 +227,13 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
                     if keeps_import(f, built)
                         // An owning function's entry and body are both copies of what the artifact
                         // defines (`owned_params.sysl`).
-                        for whole in owned_split(e, f, built, lazy, true, pending)
+                        for whole in owned_split(e, heading, built, lazy, true, pending)
                             push_copy(funcs, split_disjoint(f, whole))
 
                         imported.add(f.name)
                 None -> ()
+
+        if compact then bodies[i] = heading
 
     if compact then compacted = compact_from(funcs, compacted, &printed_refs)
 
