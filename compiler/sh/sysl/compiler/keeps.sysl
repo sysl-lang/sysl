@@ -1860,6 +1860,438 @@ private first_borrowed(ft: &FrameTrack, es: Buf[TExpr], depth: int) -> Option[st
     None
 end first_borrowed
 
+// -- a scope reached through a closure or a helper ----------------------------------------------------
+
+// **A view of this frame's own array reaches a scope through a closure the frame builds or a function
+// it calls as surely as through a scoped member's own argument** (`scope_view`): in a scope's body,
+// `each(xs, (i) -> s.spawn(() -> all[0] = i))` starts threads that borrow `all` from a closure the
+// body built, `with(s, (t) -> t.spawn(() -> all[0] = 1))` lends it to the very scope the body was
+// handed, and `helper(s, all)` hands it to a function that does. A view is no address the keeps walk
+// follows, so the body the view goes into is read for the scope it lends it to (`lend_of`). The one
+// sound way is a closure lent a scope its callee makes in its own frame, as `scope` and `scope_in` do
+// (`lends_own_scope`): that scope joins before the call returns, and so before this frame does.
+private scope_lends_at(ft: &FrameTrack, e: TExpr)
+    if ft.probe then return
+
+    *e.kind match
+        TCall(name, args, _, _) ->
+            for j in 0..<args.len()
+                // A scoped member's own argument is judged by `scope_view`.
+                if keeps_of(ft.cx, name, j).how.ends_with(SCOPE_HOW) then continue
+
+                closure_literal_of(args[j], ft.decls, 0) match
+                    Some(lit) -> *lit.kind match
+                        TStructNew(st, captured) -> literal_lends(ft, name, j, st, captured)
+                        _ -> ()
+                    None -> helper_lends(ft, name, j, args[j])
+            end for
+        _ -> ()
+end scope_lends_at
+
+// A closure literal handed to `name` at `j`, judged capture by capture.
+private literal_lends(ft: &FrameTrack, name: string, j: usize, st: &StructType, captured: Buf[TExpr])
+    if !is_closure_literal(Struct(st)) then return
+
+    for c in 0..<captured.len()
+        if c >= st.fields.len() then break
+
+        val local = captured_view(ft, captured[c])
+
+        if local.is_none() then continue
+
+        val lent = lend_of(ft.cx, s"${st.base}.call", s"e$c", 1)
+
+        if lent.0 == 0 || (lent.0 == 1 && lends_own_scope(ft.cx, name, j, lent.1, 0)) then continue
+
+        val field = st.fields[c].0
+        val n = local.unwrap()
+
+        // The array itself, captured, is viewed in the closure's body rather than held as a view.
+        val held = if is_array_type(texpr_type(captured_place(captured[c])))
+            s"the closure views '$field', a local of '${ft.owner}'"
+        else
+            s"'$field' holds a view of '$n', a local of '${ft.owner}'"
+
+        ft.faults.items.push((ft.scope, captured[c].span, s"a closure lets its capture '$field' outlive the call " +
+            s"(${lent.2}), and $held — a thread started on a scope may borrow only storage that outlives the " +
+            s"'scope' call, and '$n' does not; declare '$n' before 'scope'"))
+        return
+    end for
+end literal_lends
+
+// A view of this frame's own array handed to a function that lends it to a scope.
+private helper_lends(ft: &FrameTrack, name: string, j: usize, arg: TExpr)
+    val local = viewed_local(ft, arg, 0)
+
+    if local.is_none() then return
+
+    val found = ft.cx.find(name)
+
+    if found.is_none() || j >= found.unwrap().params.len() then return
+
+    val lent = lend_of(ft.cx, name, s"p${found.unwrap().params[j].0}", 1)
+
+    if lent.0 == 0 then return
+
+    ft.faults.items.push((ft.scope, arg.span, s"${callee_said(ft.cx.an, name)} keeps its parameter " +
+        s"'${param_name(ft.cx, name, j)}' (${lent.2}), and " +
+        argument_said(ft, arg, s"a view of '${local.unwrap()}', a local of '${ft.owner}'") + scope_cure(ft, lent.2, arg)))
+end helper_lends
+
+// The local array of this frame a closure's capture views: a view held by value, or by reference (the
+// address of a local view), or the array itself, which the closure's body may view (`lends_source`) --
+// held by reference, the frame's own; held by value, a copy that lasts only as long as the closure.
+private captured_view(ft: &FrameTrack, arg: TExpr) -> Option[string]
+    val place = captured_place(arg)
+
+    if !is_array_type(texpr_type(place)) then return viewed_local(ft, place, 0)
+
+    *place.kind match
+        TLoad(n, _) ->
+            for item in ft.decls
+                if item.0 == n then return Some(n)
+
+            None
+        _ -> None
+end captured_view
+
+// What a capture is of: the variable a capture by reference points at, or the value itself.
+private captured_place(arg: TExpr) -> TExpr = *arg.kind match
+    TAddrOf(p, _) -> p
+    _ -> arg
+
+// What a body lends a scope, the worst found so far: nothing (0), the scope its own parameter `at`
+// points at (1), the scope its environment's field `at` holds (2), or a scope it cannot name (3) --
+// with how the scope holds it, as a refusal says it.
+struct ScopeLend
+    kind: int
+    at: int
+    how: string
+
+    // Two parameters' scopes are no one scope the caller can name.
+    note(*self, kind: int, at: int, how: string)
+        if kind == 0 || self.kind >= 2 then return
+
+        if self.kind == 1 && kind == 1
+            if at != self.at then self.kind = 3
+
+            return
+        end if
+
+        self.kind = kind
+        self.at = at
+        self.how = how
+    end note
+end ScopeLend
+
+// **What the body of `fname` lends a scope of the view `src` names** -- a field of its environment
+// (`e3`) or a parameter (`pw`): read call by call, a scoped member handed the view (or a closure
+// holding it) is answered by the member's receiver, a closure literal handed on by what its own body
+// lends, and a function handed the view by what its body does with that parameter.
+private lend_of(cx: &KeepsCx, fname: string, src: string, depth: int) -> (int, int, string)
+    if depth > 8 then return (0, 0, "")
+
+    val found = cx.find(fname)
+
+    if found.is_none() then return (0, 0, "")
+
+    val f = found.unwrap()
+    val decls: &LendDecls = LendDecls(buf())
+
+    walk_block_stmts(f.body, stmt_walk(false, s -> s match
+        TVarDecl(n, _, init, _) -> decls.items.push((n, init))
+        _ -> ()))
+
+    val best: &ScopeLend = ScopeLend(0, 0, "")
+
+    walk_block_stmts(f.body, expr_walk(false, e -> *e.kind match
+        TCall(name, args, _, _) -> lend_in_call(cx, f, decls.items, src, name, args, depth, best)
+        _ -> ()))
+
+    (best.kind, best.at, best.how)
+end lend_of
+
+// The locals a body declares, each with what it was declared with.
+struct LendDecls
+    items: Buf[(string, TExpr)]
+
+private lend_in_call(cx: &KeepsCx, f: TFunc, decls: Buf[(string, TExpr)], src: string, name: string,
+                     args: Buf[TExpr], depth: int, best: &ScopeLend)
+    for j in 0..<args.len()
+        val arg = args[j]
+        val kw = keeps_of(cx, name, j)
+
+        if kw.how.ends_with(SCOPE_HOW)
+            if !lends_source(f, decls, arg, src, 0) then continue
+
+            val m = if kw.locs.is_empty() then -1 else param_of_loc(kw.locs[0].loc)
+            val held = if m >= 0 && usize(m) < args.len() then scope_source(f, decls, args[usize(m)], 0) else (3, 0)
+
+            best.note(held.0, held.1, passed_how(callee_said(cx.an, name), true, kw.how))
+            continue
+        end if
+
+        closure_literal_of(arg, decls, 0) match
+            Some(lit) -> *lit.kind match
+                TStructNew(st, captured) ->
+                    if !is_closure_literal(Struct(st)) then continue
+
+                    for c in 0..<captured.len()
+                        if !lends_source(f, decls, captured[c], src, 0) then continue
+
+                        val sub = lend_of(cx, s"${st.base}.call", s"e$c", depth + 1)
+
+                        if sub.0 == 3 then best.note(3, 0, sub.2)
+
+                        // The closure's own scope parameter is whatever `name` lends it there.
+                        if sub.0 == 1
+                            val lent = handed_scope(cx, name, j, sub.1, depth)
+                            val held = mapped_scope(f, decls, lent, args)
+
+                            best.note(held.0, held.1, sub.2)
+                        end if
+
+                        if sub.0 == 2 && usize(sub.1) < captured.len()
+                            val held = scope_source(f, decls, captured[usize(sub.1)], 0)
+
+                            best.note(held.0, held.1, sub.2)
+                        end if
+                    end for
+                _ -> ()
+            None ->
+                if !lends_source(f, decls, arg, src, 0) then continue
+
+                val callee = cx.find(name)
+
+                if callee.is_none() || j >= callee.unwrap().params.len() then continue
+
+                val sub = lend_of(cx, name, s"p${callee.unwrap().params[j].0}", depth + 1)
+
+                if sub.0 == 1 && usize(sub.1) < args.len()
+                    val held = scope_source(f, decls, args[usize(sub.1)], 0)
+
+                    best.note(held.0, held.1, passed_how(callee_said(cx.an, name), true, sub.2))
+                else if sub.0 != 0
+                    best.note(3, 0, passed_how(callee_said(cx.an, name), true, sub.2))
+                end if
+    end for
+end lend_in_call
+
+// Whether `e` views what `src` names (`lend_of`): a field of the environment, or a parameter, followed
+// through re-slices, the locals bound to them and what a closure or a struct is built of.
+private lends_source(f: TFunc, decls: Buf[(string, TExpr)], e: TExpr, src: string, depth: int) -> bool
+    if depth > 16 then return false
+
+    *e.kind match
+        TField(r, _, _) ->
+            val k = env_field_of(e)
+
+            if k >= 0 then s"e$k" == src else lends_source(f, decls, r, src, depth + 1)
+        TDeref(x, _) -> lends_source(f, decls, x, src, depth + 1)
+        TSlice(base, _, _, _, _) ->
+            // A slice of an array the closure holds by reference views its maker's array, and one it
+            // holds by value views the closure's own copy, which lasts no longer than the closure.
+            if !is_array_type(texpr_type(base)) then return lends_source(f, decls, base, src, depth + 1)
+
+            *base.kind match
+                TDeref(x, _) -> env_field_of(x) >= 0 && s"e${env_field_of(x)}" == src
+                TField(_, _, _) -> env_field_of(base) >= 0 && s"e${env_field_of(base)}" == src
+                _ -> false
+        TViewAs(v, _) -> lends_source(f, decls, v, src, depth + 1)
+        TBox(v, _) -> lends_source(f, decls, v, src, depth + 1)
+        TErase(v, _, _) -> lends_source(f, decls, v, src, depth + 1)
+        TCast(v, _) -> lends_source(f, decls, v, src, depth + 1)
+        TStructNew(_, args) -> any_lends_source(f, decls, args, src, depth)
+        TEnumNew(_, _, args) -> any_lends_source(f, decls, args, src, depth)
+        TLoad(n, _) ->
+            for item in decls
+                if item.0 == n then return lends_source(f, decls, item.1, src, depth + 1)
+
+            if n == "self" && is_closure_body(f) then return false
+
+            for p in f.params
+                if p.0 == n then return s"p$n" == src
+
+            false
+        _ -> false
+end lends_source
+
+private any_lends_source(f: TFunc, decls: Buf[(string, TExpr)], es: Buf[TExpr], src: string, depth: int) -> bool
+    for x in es
+        if lends_source(f, decls, x, src, depth + 1) then return true
+
+    false
+end any_lends_source
+
+// Where the scope a body names at `r` comes from (`ScopeLend`'s kinds): a parameter of the body, a
+// field of its environment, or somewhere it cannot say.
+private scope_source(f: TFunc, decls: Buf[(string, TExpr)], r: TExpr, depth: int) -> (int, int)
+    if depth > 8 then return (3, 0)
+
+    *r.kind match
+        TLoad(n, _) ->
+            for item in decls
+                if item.0 == n then return scope_source(f, decls, item.1, depth + 1)
+
+            for i in 0..<f.params.len()
+                if f.params[i].0 == n && !(i == 0 && is_closure_body(f)) then return (1, int(i))
+
+            (3, 0)
+        TAddrOf(place, _) -> scope_source(f, decls, place, depth + 1)
+        TDeref(x, _) -> if env_field_of(x) >= 0 then (2, env_field_of(x)) else (3, 0)
+        TField(_, _, _) -> if env_field_of(r) >= 0 then (2, env_field_of(r)) else (3, 0)
+        _ -> (3, 0)
+end scope_source
+
+// Whether `name` lends what it is handed at `k` -- a closure -- only a scope it makes in its own frame,
+// at the closure's parameter `m` (`handed_scope`).
+private lends_own_scope(cx: &KeepsCx, name: string, k: usize, m: int, depth: int) -> bool =
+    handed_scope(cx, name, k, m, depth).0 == 0
+
+// **The scope `name` lends the closure it is handed at `k`, at the closure's parameter `m`**
+// (`lent_scope`), in `ScopeLend`'s kinds: one it makes in its own frame (0), the one its parameter
+// `at` points at (1), or one it cannot say (3).
+private handed_scope(cx: &KeepsCx, name: string, k: usize, m: int, depth: int) -> (int, int)
+    val found = cx.find(name)
+
+    if found.is_none() || k >= found.unwrap().params.len() then return (3, 0)
+
+    lent_scope(cx, name, s"p${found.unwrap().params[k].0}", m, depth)
+end handed_scope
+
+// What a scope a callee lends comes to in the frame that called it with `args`: its own scope stays
+// its own, and its parameter's is what the frame handed it there.
+private mapped_scope(f: TFunc, decls: Buf[(string, TExpr)], lent: (int, int), args: Buf[TExpr]) -> (int, int)
+    if lent.0 == 0 then return (0, 0)
+    if lent.0 == 1 && usize(lent.1) < args.len() then return scope_source(f, decls, args[usize(lent.1)], 0)
+
+    (3, 0)
+end mapped_scope
+
+// **The scope the body of `fname` lends the closure `src` names** -- its parameter (`pf`) or a field of
+// its environment (`e2`) -- at the closure's parameter `m`. Every use of the closure must be one the
+// body can answer for: a call of it, answered by the argument at `m` (`scope`'s `body(&s)` is the
+// address of its own local); a handing on, answered by what the callee lends and then by what was
+// handed it there; or a capture in a closure literal handed on, answered by that closure's body the
+// same way. Any other use -- a store, a return -- lends a scope nobody can name.
+private lent_scope(cx: &KeepsCx, fname: string, src: string, m: int, depth: int) -> (int, int)
+    if depth > 6 || m < 1 then return (3, 0)
+
+    val found = cx.find(fname)
+
+    if found.is_none() then return (3, 0)
+
+    val g = found.unwrap()
+    val decls: &LendDecls = LendDecls(buf())
+
+    walk_block_stmts(g.body, stmt_walk(false, s -> s match
+        TVarDecl(n, _, init, _) -> decls.items.push((n, init))
+        _ -> ()))
+
+    val uses: &Counted = Counted(0)
+    val good: &Counted = Counted(0)
+    val worst: &ScopeLend = ScopeLend(0, 0, "")
+
+    walk_block_stmts(g.body, expr_walk(false, e ->
+        if is_source_node(e, src) then uses.n = uses.n + 1
+
+        *e.kind match
+            TCall(callee, args, _, _) -> lent_in_call(cx, g, decls.items, src, m, callee, args, depth, good, worst)
+            TVCall(recv, _, args, _, _) -> if is_source_expr(recv, src)
+                good.n = good.n + 1
+
+                val held = if usize(m) <= args.len() then own_or_source(g, decls.items, args[usize(m) - 1]) else (3, 0)
+
+                worst.note(held.0, held.1, "")
+            TCallPtr(callee, args, _, _) -> if is_source_expr(callee, src)
+                good.n = good.n + 1
+
+                val held = if usize(m) <= args.len() then own_or_source(g, decls.items, args[usize(m) - 1]) else (3, 0)
+
+                worst.note(held.0, held.1, "")
+            _ -> ()))
+
+    if uses.n == 0 || uses.n != good.n then (3, 0) else (worst.kind, worst.at)
+end lent_scope
+
+private lent_in_call(cx: &KeepsCx, g: TFunc, decls: Buf[(string, TExpr)], src: string, m: int, callee: string,
+                     args: Buf[TExpr], depth: int, good: &Counted, worst: &ScopeLend)
+    if closure_call(callee) && !args.is_empty() && is_source_expr(args[0], src)
+        good.n = good.n + 1
+
+        val held = if usize(m) < args.len() then own_or_source(g, decls, args[usize(m)]) else (3, 0)
+
+        worst.note(held.0, held.1, "")
+        return
+    end if
+
+    for j in 0..<args.len()
+        if is_source_expr(args[j], src)
+            good.n = good.n + 1
+
+            val held = mapped_scope(g, decls, handed_scope(cx, callee, j, m, depth + 1), args)
+
+            worst.note(held.0, held.1, "")
+            continue
+        end if
+
+        closure_literal_of(args[j], decls, 0) match
+            Some(lit) -> *lit.kind match
+                TStructNew(st, captured) ->
+                    if !is_closure_literal(Struct(st)) then continue
+
+                    for c in 0..<captured.len()
+                        if !is_source_expr(captured[c], src) then continue
+
+                        good.n = good.n + 1
+
+                        val sub = lent_scope(cx, s"${st.base}.call", s"e$c", m, depth + 1)
+                        val held = if sub.0 == 1
+                            mapped_scope(g, decls, handed_scope(cx, callee, j, sub.1, depth + 1), args)
+                        else if sub.0 == 2 && usize(sub.1) < captured.len()
+                            scope_source(g, decls, captured[usize(sub.1)], 0)
+                        else
+                            sub
+
+                        worst.note(held.0, held.1, "")
+                    end for
+                _ -> ()
+            None -> ()
+    end for
+end lent_in_call
+
+// A scope argument that is the address of the frame's own local, or where it comes from.
+private own_or_source(g: TFunc, decls: Buf[(string, TExpr)], e: TExpr) -> (int, int) =
+    if own_address(g, decls, e) then (0, 0) else scope_source(g, decls, e, 0)
+
+// The node naming what `src` names: the parameter's load, or the environment field's read.
+private is_source_node(e: TExpr, src: string) -> bool = *e.kind match
+    TLoad(n, _) -> s"p$n" == src
+    TField(r, index, _) -> *r.kind match
+        TDeref(x, _) -> is_environment_load(x) && s"e$index" == src
+        _ -> false
+    _ -> false
+
+// That node, or its address, or what it points at.
+private is_source_expr(e: TExpr, src: string) -> bool = *e.kind match
+    TAddrOf(place, _) -> is_source_node(place, src)
+    TDeref(x, _) -> is_source_node(x, src)
+    _ -> is_source_node(e, src)
+
+// The address of a local `g` declares, which no parameter names.
+private own_address(g: TFunc, decls: Buf[(string, TExpr)], e: TExpr) -> bool = *e.kind match
+    TAddrOf(place, _) -> *place.kind match
+        TLoad(n, _) ->
+            for p in g.params
+                if p.0 == n then return false
+
+            for item in decls
+                if item.0 == n then return true
+
+            false
+        _ -> false
+    _ -> false
+
 // Whether `@scoped` names a parameter that is a call rather than a pointer.
 private scopes_a_call(f: TFunc) -> bool
     for item in f.params
@@ -4267,12 +4699,13 @@ private frame_event_at(ft: &FrameTrack, evs: &EvBuf, e: TExpr)
         TStore(place, v, _, _) -> frame_stored(ft, evs, place, v)
         TAwait(task, _) -> await_clear(ft.hs, evs, task, e.span)
         TBlockOn(task, _) -> await_clear(ft.hs, evs, task, e.span)
-        TCall(_, args, _, _) ->
+        TCall(name, args, _, _) ->
             call_at(ft, evs, e)
-            closures_handed(ft, evs, args)
+            closures_handed(ft, evs, name, args)
+            scope_lends_at(ft, e)
         TVCall(recv, _, args, _, _) ->
             call_at(ft, evs, e)
-            closures_handed(ft, evs, with_receiver(recv, args))
+            closures_handed(ft, evs, "", with_receiver(recv, args))
         TCallPtr(_, _, _, _) -> call_at(ft, evs, e)
         TStep(_, wake) -> step_waker_at(ft, wake)
         TErase(v, _, ty) -> if ft.probe then probe_synced(ft, e.span, v, ty)
@@ -4284,14 +4717,15 @@ end frame_event_at
 // **A closure handed to a call is judged again there**, after whatever the call overwrites: the call
 // may run it, and a body storing its capture overwrites the very place it lets it out to, which
 // would otherwise read as taking back what the literal let out (`frame_top_clears`).
-private closures_handed(ft: &FrameTrack, evs: &EvBuf, args: Buf[TExpr])
+// `name` is the callee, or empty for a call through an object, whose closure is judged as it is written.
+private closures_handed(ft: &FrameTrack, evs: &EvBuf, name: string, args: Buf[TExpr])
     if ft.probe then return
 
-    for a in args
-        closure_literal_of(a, ft.inits, 0) match
+    for j in 0..<args.len()
+        closure_literal_of(args[j], ft.inits, 0) match
             Some(lit) ->
                 *lit.kind match
-                    TStructNew(st, captured) -> captures_let_out(ft, evs, st, captured)
+                    TStructNew(st, captured) -> captures_let_out(ft, evs, st, captured, name, j)
                     _ -> ()
             None -> ()
 end closures_handed
@@ -4318,7 +4752,14 @@ end closure_literal_of
 // -- into module storage, or anywhere -- outlives the frame however the closure is reached later: by
 // value, behind a `&Fn`, run by a `@scoped` member, or called long after the call that was handed it.
 // What it puts through a pointer it captured or was handed is asked where that pointer is.
-private captures_let_out(ft: &FrameTrack, evs: &EvBuf, st: &StructType, args: Buf[TExpr])
+//
+// **A scope the body is lent is let go before this frame returns only where the callee makes it**:
+// handed to `callee` at `at`, the body's scope parameter is one `scope` made in its own frame only if
+// the callee lends it that way (`lends_own_scope`); a helper handing on the scope it was handed --
+// `with(s, (t) -> t.spawn(…))` -- lends one that outlives this frame. Judged where the literal is
+// written, with no call in hand (`callee` empty), the scope is taken as the callee's own.
+private captures_let_out(ft: &FrameTrack, evs: &EvBuf, st: &StructType, args: Buf[TExpr], callee: string = "",
+                         at: usize = 0)
     if !is_closure_literal(Struct(st)) then return
 
     val body = s"${st.base}.call"
@@ -4349,12 +4790,18 @@ private captures_let_out(ft: &FrameTrack, evs: &EvBuf, st: &StructType, args: Bu
 
         for h in held
             for item in read_path_of(ft.cx, body, 0, h.0, s".$field${h.2}").locs
-                val loc = outlasting_loc(item.loc, item.how)
+                val scoped = item.how.ends_with(SCOPE_HOW)
+                val lent = if scoped then param_of_loc(item.loc) else -1
+                val loc = if lent >= 1 && callee != "" && !lends_own_scope(ft.cx, callee, at, lent, 0)
+                    Some("")
+                else
+                    outlasting_loc(item.loc, item.how)
 
                 if loc.is_none() || put_back_by_reference(ft, st, args, body, c, item) then continue
 
+                val cure = if scoped then scope_cure(ft, item.how, arg) else " — capture the value itself, or storage that lasts"
                 val said = s"a closure lets its capture '$field' outlive the call (${item.how}), and '$field' " +
-                    s"holds ${h.1} — capture the value itself, or storage that lasts"
+                    s"holds ${h.1}$cure"
 
                 if loc.unwrap() == ""
                     ft.faults.items.push((ft.scope, arg.span, said))
@@ -4366,7 +4813,7 @@ private captures_let_out(ft: &FrameTrack, evs: &EvBuf, st: &StructType, args: Bu
         end for
     end for
 
-    if ft.faults.items.len() + evs.items.len() == told then environment_let_out(ft, evs, st, args, body)
+    if ft.faults.items.len() + evs.items.len() == told then environment_let_out(ft, evs, st, args, body, callee, at)
 end captures_let_out
 
 // **A local captured by value is asked field by field, as a call handed its address is**
@@ -4485,7 +4932,11 @@ private in_frame_terms(place: TExpr, c: usize, local: TExpr) -> Option[TExpr] = 
 // storage -- a frame's local, or a copy in the frame of whatever runs it, gone with that frame. The
 // function that runs it (`m.with(…)`, or one of the program's own) is not told: what it hands over is
 // only the closure it was given, and the address is taken in the closure (`env_judged_at_literal`).
-private environment_let_out(ft: &FrameTrack, evs: &EvBuf, st: &StructType, args: Buf[TExpr], body: string)
+//
+// A scope the body is lent holds the closure's storage no longer than the closure lasts only where the
+// callee makes it (`captures_let_out`).
+private environment_let_out(ft: &FrameTrack, evs: &EvBuf, st: &StructType, args: Buf[TExpr], body: string,
+                            callee: string, handed: usize)
     val taken = by_value_address_taken(ft.cx, body)
 
     if taken < 0 || usize(taken) >= args.len() || usize(taken) >= st.fields.len() then return
@@ -4494,7 +4945,11 @@ private environment_let_out(ft: &FrameTrack, evs: &EvBuf, st: &StructType, args:
     val field = st.fields[usize(taken)].0
 
     for item in keeps_of(ft.cx, body, 0).locs
-        val loc = outlasting_loc(item.loc, item.how)
+        val lent = if item.how.ends_with(SCOPE_HOW) then param_of_loc(item.loc) else -1
+        val loc = if lent >= 1 && callee != "" && !lends_own_scope(ft.cx, callee, handed, lent, 0)
+            Some("")
+        else
+            outlasting_loc(item.loc, item.how)
 
         if loc.is_none() then continue
 

@@ -1,0 +1,312 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map, set}
+
+// **A `@unique` value with a destructor** (`design/affine-values.md` §§ 2, 6, 7): the value has one
+// owner, and its `drop` runs on the value when that owner lets go of it -- at the end of the owner's
+// scope, when the owner is assigned again, or at the end of the statement for a temporary.
+//
+// **It rides on the ownership machinery every counted value already has.** A value of such a type is
+// *owned* as a counted one is: a local's slot is registered with its scope (`own_slot`), a parameter
+// handed over is the callee's (`owned_params.sysl`), a call's result is a temporary of the statement
+// (`own_temp`). Letting go of one is its type's release walk, which for these types calls the
+// destructor first and then lets go of the fields in declaration order (`emit_arc.sysl`'s walks). What
+// differs is the other half: **such a value is never copied.** Every destination takes over what it is
+// handed -- a temporary leaves the statement's list, a local's drop flag is cleared -- and a copy asked
+// for anyway is a gap rather than a second owner (`emit_arc.sysl`'s `value_helper`).
+//
+// **A drop flag says whether a local still holds its value.** A local of such a type that some
+// expression may move is given one byte in the frame (`%<slot>.held`), set where the local is written
+// and cleared where it is moved; every place its scope lets go of it -- each way out, in order with the
+// `defer`s -- runs the walk only where the flag is set. A local nothing moves has no flag, and is let
+// go of exactly as any counted local is. Which locals may move is read off the body before it is
+// written (`begin_unique`): every by-value read of one, where the move check (`unique_moves.sysl`)
+// has already refused every read after a move.
+
+// Whether letting go of a value of this type runs a destructor **on the value**: it is, or holds by
+// value -- a field, an element, a payload -- a `@unique` type with a `Drop`.
+value_drops(e: *Emit, t: Type) -> bool
+    if e.destructors.is_empty() || !holds_unique_value(t) then return false
+
+    val key = mangle(t)
+    val known = e.drops_memo.get(key)
+
+    if known.is_some() then return known.unwrap()
+
+    var seen: Buf[string] = buf()
+    val answer = drops_in(e, t, &seen)
+
+    e.drops_memo.put(key, answer)
+    answer
+end value_drops
+
+private drops_in(e: *Emit, t: Type, seen: *Buf[string]) -> bool = t match
+    Struct(d) ->
+        if d.unique && destructor_of(e, t).is_some() then return true
+        if d.base == TaskBase || holds_string(*seen, mangle(t)) then return false
+
+        seen.push(mangle(t))
+        fields_drop(e, d.fields, seen)
+    Enum(d) ->
+        if d.unique && destructor_of(e, t).is_some() then return true
+        if d.simple || holds_string(*seen, mangle(t)) then return false
+
+        seen.push(mangle(t))
+
+        for v in d.variants
+            if fields_drop(e, v.fields, seen) then return true
+
+        false
+    Array(_, elem) -> drops_in(e, *elem, seen)
+    Results(d) -> fields_drop(e, d.fields, seen)
+    Constrained(d) -> drops_in(e, d.base, seen)
+    Volatile(inner) -> drops_in(e, *inner, seen)
+    _ -> false
+
+private fields_drop(e: *Emit, fields: Buf[(string, Type)], seen: *Buf[string]) -> bool
+    for item in fields
+        if drops_in(e, item.1, seen) then return true
+
+    false
+end fields_drop
+
+// Whether a value of this type is owned at all: it holds a count, or a value destructor.
+owns_value(e: *Emit, t: Type) -> bool = contains_counted(t) || value_drops(e, t)
+
+// The destructor of the `@unique` type itself, called on the value before its fields are let go of
+// (§ 6: `drop(self)` runs first and may read every field). `at` says `v` is the value's address.
+value_destructor(e: *Emit, ty: Type, v: Val, at: bool)
+    val unique = underlying(ty) match
+        Struct(d) -> d.unique
+        Enum(d) -> d.unique
+        _ -> false
+
+    if !unique then return
+
+    destructor_of(e, ty) match
+        Some(d) ->
+            var args: Buf[IrArg] = buf()
+
+            if e.layout.indirect(ty)
+                if at then args.push(ir_arg(LPtr, v))
+                else
+                    gap_here(e, s"a '@unique' value of '${type_show(ty)}' too large to hold in registers")
+                    return
+            else if at
+                val whole = fresh_reg(e)
+
+                emit(e, InLoad(whole, lty(e, ty), v, AccPlain, None))
+                args.push(ir_arg(lty(e, ty), whole))
+            else args.push(ir_arg(lty(e, ty), v))
+
+            emit(e, ir_call(None, LVoid, VGlobal(d), args))
+        None -> ()
+end value_destructor
+
+// A copy of such a value would be a second owner of it, whose release runs the destructor a second
+// time; every destination takes the value over instead, so one asked for is a form not lowered.
+refuse_copy(e: *Emit, ty: Type) =
+    if value_drops(e, ty) then gap_here(e, s"a copy of a '@unique' value of '${type_show(ty)}'")
+
+// Whether the parameter at `j` is a `(self)` receiver that reads: a copy that owns nothing (§ 3). A
+// `@consumes` member takes its receiver, and owns it as any parameter it is handed.
+reads_receiver(f: TFunc, j: usize) -> bool =
+    j == 0 && !f.params.is_empty() && f.params[0].0 == "self" && !f.marks.consumes
+
+// -- which locals may move ---------------------------------------------------------------------------
+
+// How often each local of such a type is read, and how often a read only reaches it where it is.
+private struct UniqueReads
+    names: Buf[string]
+    all: Map[string, int]
+    reached: Map[string, int]
+
+private bump(m: Map[string, int], name: string)
+    var counts = m
+
+    counts.put(name, m.get(name).unwrap_or(0) + 1)
+
+// Readies a body: the locals whose value some expression may hand over by value. A read that only
+// reaches the local where it is -- a field, an address, an element, a length, a comparison, the place
+// a write lands in -- moves nothing; every other read may be a move.
+begin_unique(e: *Emit, stmts: Buf[TStmt], result: Option[TExpr])
+    e.moved_locals = set()
+
+    if e.destructors.is_empty() then return
+
+    val reads: &UniqueReads = UniqueReads(buf(), map(), map())
+    val walk = TWalk(true, x -> note_read(e, reads, x), w -> reached_at(e, reads, w.place), s -> note_stmt(e, reads, s))
+
+    walk_stmts(stmts, walk)
+
+    if result.is_some() then walk_texpr(result.unwrap(), walk)
+
+    for name in reads.names
+        if reads.all.get(name).unwrap_or(0) > reads.reached.get(name).unwrap_or(0) then e.moved_locals.add(name)
+end begin_unique
+
+private note_read(e: *Emit, reads: &UniqueReads, x: TExpr) = *x.kind match
+    TLoad(name, ty) ->
+        if value_drops(e, ty)
+            if reads.all.get(name).is_none() then reads.names.push(name)
+
+            bump(reads.all, name)
+    TField(receiver, _, _) -> reached_at(e, reads, receiver)
+    TAddrOf(place, _) -> reached_at(e, reads, place)
+    TTempAddr(value, _) -> reached_at(e, reads, value)
+    TIndex(receiver, _, _) -> reached_at(e, reads, receiver)
+    TLen(receiver, _) -> reached_at(e, reads, receiver)
+    TBytes(receiver) -> reached_at(e, reads, receiver)
+    TTypeId(receiver, _) -> reached_at(e, reads, receiver)
+    TSlice(base, _, _, _, _) -> reached_at(e, reads, base)
+    TBinary(_, left, right, _) ->
+        reached_at(e, reads, left)
+        reached_at(e, reads, right)
+    TCompare(operands, _) ->
+        for item in operands
+            reached_at(e, reads, item)
+    TUnary(_, operand, _) -> reached_at(e, reads, operand)
+    TEnumAttr(_, _, arg, _) -> reached_at(e, reads, arg)
+    TStore(place, _, _, _) -> reached_at(e, reads, place)
+    TUpdate(place, _, _, _, _, _, _) -> reached_at(e, reads, place)
+    TIncDec(place, _, _, _, _) -> reached_at(e, reads, place)
+    TMatch(scrutinee, _, _) -> reached_at(e, reads, scrutinee)
+    _ -> ()
+
+private note_stmt(e: *Emit, reads: &UniqueReads, s: TStmt) = s match
+    TRefDecl(_, _, place) -> reached_at(e, reads, place)
+    _ -> ()
+
+// A read of a local where it is, through the views and checks that stand for it.
+private reached_at(e: *Emit, reads: &UniqueReads, x: TExpr) -> unit = *x.kind match
+    TLoad(name, ty) -> if value_drops(e, ty) then bump(reads.reached, name)
+    TConstView(arg) -> reached_at(e, reads, arg)
+    _ -> ()
+
+// -- the drop flag -------------------------------------------------------------------------------------
+
+// A local of such a type that may be moved is given its flag where its slot is registered, set: it
+// holds its value from here.
+flag_slot(e: *Emit, name: string, slot: Val, ty: Type)
+    if !value_drops(e, ty) || !e.moved_locals.has(name) then return
+
+    val r = slot_reg(slot)
+
+    if r == "" then return
+
+    val flag = named_alloca(e, s"$r.held", l_i1(), None)
+
+    emit(e, InStore(l_i1(), VBool(true), flag, AccPlain, None))
+    e.drop_flags.put(r, flag)
+end flag_slot
+
+// The flag of the slot at `p`, where it has one.
+held_flag(e: *Emit, p: Val) -> Option[Val]
+    if e.drop_flags.is_empty() then return None
+
+    e.drop_flags.get(slot_reg(p))
+
+// Sets the flag of a slot written whole, where it has one.
+mark_held(e: *Emit, p: Val)
+    held_flag(e, p) match
+        Some(flag) -> emit(e, InStore(l_i1(), VBool(true), flag, AccPlain, None))
+        None -> ()
+
+private slot_reg(v: Val) -> string = v match
+    VReg(n) -> n
+    _ -> ""
+
+// Lets go of the value at `p` only where its flag says the slot still holds one.
+release_held(e: *Emit, ty: Type, p: Val, flag: Val)
+    val held = fresh_reg(e)
+    val drop_l = fresh_label(e, "unique.drop")
+    val done_l = fresh_label(e, "unique.held")
+
+    emit(e, InLoad(held, l_i1(), flag, AccPlain, None))
+    emit_term(e, InCondBr(held, drop_l, done_l))
+    emit_label(e, drop_l)
+    release_unflagged(e, ty, p)
+    emit_term(e, InBr(done_l))
+    emit_label(e, done_l)
+end release_held
+
+// -- moves -----------------------------------------------------------------------------------------
+
+// **A value of such a type handed to a destination is moved**: what held it lets go of it without
+// running anything, and the destination owns it from here. `x` is what the value was worked out from
+// and `v` the value: a local's flag is cleared, and a value the statement made leaves the statement's
+// temporaries.
+take_unique(e: *Emit, x: TExpr, ty: Type, v: Val)
+    *x.kind match
+        TLoad(name, _) ->
+            held_flag(e, local_slot(e, name)) match
+                Some(flag) -> emit(e, InStore(l_i1(), VBool(false), flag, AccPlain, None))
+                None -> gap_here(e, s"a move of the '@unique' local '$name', which has no drop flag")
+            return
+        TConstView(arg) ->
+            take_unique(e, arg, ty, v)
+            return
+        TStructInvCheck(value, _, _) ->
+            take_unique(e, value, ty, v)
+            return
+        _ -> ()
+
+    if !forget_unique_temp(e, v, ty) then
+        gap_here(e, s"a '@unique' value of '${type_show(ty)}' moved from a ${texpr_kind_name(x)}, " +
+                 "which holds nothing to hand over")
+end take_unique
+
+// A value of such a type the statement made, taken out of its temporaries, innermost first.
+forget_unique_temp(e: *Emit, v: Val, ty: Type) -> bool
+    val r = slot_reg(v)
+
+    if r == "" then return false
+
+    var j = e.temps.len()
+
+    while j > 0
+        j -= 1
+
+        if slot_reg(e.temps[j].0) == r && e.temps[j].1 == ty
+            e.temps.remove(j)
+            return true
+        end if
+
+    false
+end forget_unique_temp
+
+// **A value of such a type built on the spot owns its parts**: each part of such a type is moved into
+// it, each counted part is taken over or retained as any destination's is, and the value is a
+// temporary of the statement until a destination takes it. Built and thrown away, it is let go of --
+// its destructor runs -- where the statement ends.
+//
+// **The value answered is the one to use from here.** A temporary is found again by its register, and
+// a value with nothing to compute -- a simple variant, a struct with no fields -- is a constant, which
+// is no register; such a one is given a register of its own, so two of them in one statement are two
+// temporaries a destination can tell apart.
+own_built(e: *Emit, ty: Type, v: Val, parts: Buf[TExpr], part_vals: Buf[Val], part_tys: Buf[Type]) -> Val
+    for i in 0..<parts.len()
+        if i < part_vals.len() && i < part_tys.len()
+            val pty = part_tys[i]
+
+            if value_drops(e, pty) then take_unique(e, parts[i], pty, part_vals[i])
+            else if contains_counted(pty) then retain_moving(e, parts[i], pty, part_vals[i])
+
+    if slot_reg(v) != "" then return own_temp(e, v, ty)
+
+    val r = fresh_reg(e)
+
+    emit(e, InSelect(r, VBool(true), lty(e, ty), v, v, l_i1()))
+    own_temp(e, r, ty)
+end own_built
+
+// The types of a list of fields, in order.
+field_types(fields: Buf[(string, Type)]) -> Buf[Type]
+    var out: Buf[Type] = buf()
+
+    for item in fields
+        out.push(item.1)
+
+    out
+end field_types

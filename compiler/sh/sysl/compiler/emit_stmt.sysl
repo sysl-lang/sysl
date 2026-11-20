@@ -116,7 +116,10 @@ private gen_stmt_body(e: *Emit, s: TStmt) = s match
             Some(t) ->
                 val v = gen_expr(e, t)
 
-                retain_value(e, texpr_type(t), v)
+                // A `@unique` value with a destructor is handed to the loop's result, not copied.
+                if value_drops(e, texpr_type(t)) then take_unique(e, t, texpr_type(t), v)
+                else retain_value(e, texpr_type(t), v)
+
                 emit(e, InStore(lty_of(e, t), v, enclosing.slot, AccPlain, None))
             None -> ()
 
@@ -523,7 +526,7 @@ private gen_multi_assign(e: *Emit, writes: Buf[TWrite])
         else fused_update(e, w.op, texpr_type(w.place), w.dispatch, curs[i], w.value)
 
         fused.push(f.is_some())
-        vals.push(if f.is_some() then f.unwrap() else held_for_statement(e, gen_expr(e, w.value), texpr_type(w.value)))
+        vals.push(if f.is_some() then f.unwrap() else held_for_statement_from(e, w.value))
 
     for i in 0..<writes.len()
         val w = writes[i]
@@ -605,6 +608,19 @@ private held_for_statement(e: *Emit, v: Val, ty: Type) -> Val
     retain_value(e, ty, v)
     own_temp(e, v, ty)
 end held_for_statement
+
+// The same for a value worked out from `x`. A `@unique` value with a destructor is not copied: it is
+// moved out of what it came from into the statement's temporaries, and the store takes it from there
+// (`retain_stored`).
+private held_for_statement_from(e: *Emit, x: TExpr) -> Val
+    val ty = texpr_type(x)
+    val v = gen_expr(e, x)
+
+    if !value_drops(e, ty) then return held_for_statement(e, v, ty)
+
+    take_unique(e, x, ty, v)
+    own_temp(e, v, ty)
+end held_for_statement_from
 
 // One place written from one value, with everything the write owes.
 private gen_write(e: *Emit, w: TWrite)

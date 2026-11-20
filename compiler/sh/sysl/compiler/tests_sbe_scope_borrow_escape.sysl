@@ -1,0 +1,276 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.cstring
+
+// A thread started on a scope borrows only storage that outlives the `scope` call
+// (`reference/memory.md § A thread borrows a frame only inside a scope`), however the borrowed storage
+// reaches the scope: as a scoped member's own argument, through a closure the frame builds and hands
+// on, or through a function the frame calls. The scope body's own locals are refused on every road;
+// the enclosing function's are accepted on every road, and so is anything lent to a scope a callee
+// makes in its own frame (`scope`, `scope_in`, and wrappers of them), which joins before the frame
+// returns (`keeps.sysl`'s `scope_lends_at`, `lend_of`, `lent_scope`).
+//
+// Axes: the road (a closure in the body, two closures deep, a closure bound to a local first, a
+// helper handed the scope and a body, a helper handed the scope and the view), what is borrowed (a
+// `val` view, a `var` view, the array itself captured, a pointer to a local), the access (a write
+// through a mutable view, a read), the scope (`scope`, `scope_in`), and what is still accepted (the
+// enclosing function's storage on every road, a nested scope, a helper opening its own scope, a
+// wrapper of `scope`), plus the build (plain, AddressSanitizer). Skipped: a view on `scope_in` --
+// `start` takes a `*T` and an `extern` function, so no view can be written there; a scope held in a
+// struct a helper is handed -- a scope's constructor is private, and a `*Scope` stored in a struct
+// is followed by the pointer rule (`tests_sev_scope_env.sysl`).
+
+private extern "setenv" sbe_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" sbe_c_unsetenv(name: *u8) -> int
+
+// What building `text` said, or what running it printed, its status, and the symbols the binary
+// leaves undefined (where a sanitizer's runtime shows itself).
+private sbe_outcome(text: string, flags: string) -> (string, int, string)
+    val root = make_temp_dir("sysl-sbe").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+    val name = cstring("SYSL_EXTRA_CFLAGS")
+    val value = cstring(flags)
+
+    if flags != "" then sbe_c_setenv(name.ptr, value.ptr, 1)
+
+    val made = build_native_program(root, None, None, DefaultOptimization, Some(exe))
+
+    if flags != "" then sbe_c_unsetenv(name.ptr)
+
+    made match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1, "")
+        Ok(_) -> ()
+
+    val undefined = capture("nm", ["-u", exe], "", [], true) match
+        Ok(out) -> out.text
+        Err(_) -> ""
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1, undefined)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status), undefined)
+end sbe_outcome
+
+private sbe_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = sbe_outcome(text, "")
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+
+private sbe_refused(text: string, part: string)
+    if xvr_no_library() then return
+
+    val out = sbe_outcome(text, "")
+
+    assert_eq(out.1, -1, out.0)
+    assert(out.0.index_of(part).is_some(), out.0)
+
+// The opening every program shares: the threads, and a helper that runs a closure on each element.
+private val SbeHead = "import sysl.sync.*\nimport sysl.threads.*\n\neach(xs: []int, f: &Fn(int) -> ()) = for x in xs do f(x)\n\n"
+
+// A scope body with `body` as its lines, after a local array `v` and a view `all` of it.
+private sbe_body(view: string, body: string) -> string =
+    SbeHead + "go() -> int =\n    scope((s) ->\n        var v = [1; 8]\n        " + view + " all = v[..]\n\n" + body +
+        "        0)\n\nprint(go())\n"
+
+private val SbeCure = "a thread started on a scope may borrow only storage that outlives the 'scope' call"
+
+// What a refusal of a closure lending `all` to `spawn` says.
+private val SbeAll = "error: a closure lets its capture 'all' outlive the call (it is passed to 'spawn', where the scope " +
+    "that lent it holds it until the 'scope' call returns), and 'all' holds a view of 'v', a local of 'call' — " +
+    SbeCure + ", and 'v' does not; declare 'v' before 'scope'"
+
+// -- refused: a closure in the body ------------------------------------------------------------------
+
+@test("a closure in a scope's body may not start a thread borrowing a view of the body's array")
+sbe_closure_in_body_refused()
+    sbe_refused(sbe_body("val", "        each([1, 2][..], (i) -> s.spawn(() -> all[0] = i))\n"), SbeAll)
+
+@test("a closure two closures deep in a scope's body may not lend the body's array")
+sbe_two_levels_refused()
+    sbe_refused(sbe_body("val", "        each([1][..], (i) -> each([2][..], (j) -> s.spawn(() -> all[0] = i + j)))\n"),
+                SbeAll)
+
+@test("a closure bound to a local of the body before it is handed on is refused the same")
+sbe_bound_closure_refused()
+    sbe_refused(sbe_body("val", "        val g = (i: int) ->\n            s.spawn(() -> all[0] = i)\n            ()\n\n" +
+                                "        each([1][..], g)\n"), SbeAll)
+
+// A `var` view is captured by reference, so the closure reads it through the body's own variable.
+@test("a var view of the body's array, lent from a closure, is refused")
+sbe_var_view_refused()
+    sbe_refused(sbe_body("var", "        each([1][..], (i) -> s.spawn(() -> all[0] = i))\n        all = v[1..]\n"),
+                SbeAll)
+
+@test("a read-only read of the body's array from a closure's thread is refused as a write is")
+sbe_read_refused()
+    sbe_refused(SbeHead + "go() -> int =\n    scope((s) ->\n        val v = [1; 8]\n        val all = v[..]\n\n" +
+                "        each([1][..], (i) -> s.spawn(() -> print(all[i])))\n        0)\n\nprint(go())\n", SbeAll)
+
+// The closure captures the array itself and views it in its own body: the view is of the body's
+// array, or of the closure's own copy of it, and neither outlives the body.
+@test("a closure that captures the body's array and views it in its own body is refused")
+sbe_captured_array_refused()
+    sbe_refused(SbeHead + "go() -> int =\n    scope((s) ->\n        var v = [1; 8]\n\n" +
+                "        each([1][..], (i) ->\n            val w = v[..]\n\n            s.spawn(() -> w[0] = i))\n" +
+                "        v[0] = 2\n        0)\n\nprint(go())\n",
+                "error: a closure lets its capture 'v' outlive the call (it is passed to 'spawn', where the scope " +
+                "that lent it holds it until the 'scope' call returns), and the closure views 'v', a local of 'call' — " +
+                SbeCure + ", and 'v' does not; declare 'v' before 'scope'")
+
+// The pointer rule already refused this road; its refusal now names the scope's cure.
+@test("a closure in the body lending the address of the body's local is refused with the scope's cure")
+sbe_pointer_closure_refused()
+    sbe_refused(SbeHead + "go() -> int\n    scope((s) ->\n        var x = 0\n        val px = &x\n\n" +
+                "        each([1, 2][..], (i) -> s.spawn(() -> atomic_add(px, i, SeqCst)))\n        ())\n\n    1\n\n" +
+                "print(go())\n",
+                "error: a closure lets its capture 'px' outlive the call (it is passed to 'spawn', where the scope " +
+                "that lent it holds it until the 'scope' call returns), and 'px' holds the address of a local of " +
+                "'call' — " + SbeCure + ", and 'x' does not; declare 'x' before 'scope'")
+
+// -- refused: a helper handed the scope ----------------------------------------------------------------
+
+// `with` hands on the scope it was handed, which outlives the body; `scope` lends one it makes itself.
+private val SbeWith = "with(s: *Scope, f: &Fn(*Scope) -> ()) = f(s)\n\n"
+
+@test("a body handed to a helper along with the scope may not lend the scope body's array")
+sbe_helper_body_refused()
+    sbe_refused(SbeHead + SbeWith + "go() -> int =\n    scope((s) ->\n        var v = [1; 8]\n        val all = v[..]\n\n" +
+                "        with(s, (t) -> t.spawn(() -> all[0] = 1))\n        0)\n\nprint(go())\n", SbeAll)
+
+@test("a body handed to a helper along with the scope may not lend the address of the scope body's local")
+sbe_helper_body_pointer_refused()
+    sbe_refused(SbeHead + SbeWith + "go() -> int\n    scope((s) ->\n        var x = 0\n        val px = &x\n\n" +
+                "        with(s, (t) -> t.spawn(() -> atomic_add(px, 1, SeqCst)))\n        ())\n\n    1\n\nprint(go())\n",
+                "error: a closure lets its capture 'px' outlive the call (it is passed to 'spawn', where the scope " +
+                "that lent it holds it until the 'scope' call returns), and 'px' holds the address of a local of " +
+                "'call' — " + SbeCure + ", and 'x' does not; declare 'x' before 'scope'")
+
+@test("a body handed to a helper along with scope_in's scope may not start on the address of its own storage")
+sbe_helper_body_slots_refused()
+    sbe_refused("import sysl.sync.*\nimport sysl.threads.*\n\nwork(p: *int)\n    atomic_add(p, 1, SeqCst)\n    ()\n\n" +
+                "with_slots(s: *SlotScope, f: &Fn(*SlotScope) -> ()) = f(s)\n\n" +
+                "go() -> int\n    var slots: [2]ScopeSlot = [ScopeSlot.new(); 2]\n\n    scope_in(slots[..], (s) ->\n" +
+                "        var x = 0\n\n        with_slots(s, (t) -> t.start(&work, &x)))\n\n    1\n\nprint(go())\n",
+                "error: a closure lets the address of its capture 'x' outlive the call (it is passed to 'start', where " +
+                "the scope that lent it holds it until the 'scope' call returns), and the closure holds 'x' by value, " +
+                "in its own storage")
+
+@test("a view of the scope body's array handed to a helper that spawns on the scope is refused")
+sbe_helper_view_refused()
+    sbe_refused(SbeHead + "helper(s: *Scope, w: []int) = s.spawn(() -> w[0] = 1)\n\n" +
+                "go() -> int =\n    scope((s) ->\n        var v = [1; 8]\n        val all = v[..]\n\n" +
+                "        helper(s, all)\n        0)\n\nprint(go())\n",
+                "error: 'helper' keeps its parameter 'w' (it is passed to 'spawn', where the scope that lent it holds " +
+                "it until the 'scope' call returns), and 'all' holds a view of 'v', a local of 'call' — " + SbeCure +
+                ", and 'v' does not; declare 'v' before 'scope'")
+
+// -- still accepted -------------------------------------------------------------------------------------
+
+@test("a thread spawned in the body itself borrows the enclosing function's array")
+sbe_direct_accepted()
+    sbe_prints(raw"""
+        import sysl.threads.scope
+
+        halves() -> int
+            var v = [0; 8]
+            val all = v[..]
+            val half = all.len / 2
+
+            scope((s) ->
+                s.spawn(() -> for i in 0..<half do all[i] = 1)
+                s.spawn(() -> for i in half..<all.len do all[i] = 2))
+
+            var sum = 0
+
+            for x in v do sum += x
+
+            sum
+
+        print(halves())
+        """, "12\n")
+
+@test("a closure in the body, one and two closures deep, lends the enclosing function's array")
+sbe_closure_enclosing_accepted()
+    sbe_prints(SbeHead + "go() -> int\n    var v = [0; 8]\n    val all = v[..]\n\n" +
+               "    scope((s) -> each([1, 2][..], (i) -> s.spawn(() -> all[i] = i)))\n" +
+               "    scope((s) -> each([3][..], (i) -> each([4][..], (j) -> s.spawn(() -> all[i] = j))))\n" +
+               "    v[1] + v[2] + v[3]\n\nprint(go())\n", "7\n")
+
+@test("a scope nested in the body lends the body's array from a closure")
+sbe_nested_scope_accepted()
+    sbe_prints(SbeHead + "go() -> int =\n    scope((s) ->\n        var v = [0; 8]\n        val all = v[..]\n\n" +
+               "        scope((t) -> each([1, 2][..], (i) -> t.spawn(() -> all[i] = i)))\n        all[1] + all[2])\n\n" +
+               "print(go())\n", "3\n")
+
+@test("a helper that opens its own scope lends the view it is handed from the body")
+sbe_helper_own_scope_accepted()
+    sbe_prints(SbeHead + "fill(w: []int) = scope((s) -> s.spawn(() -> w[0] = 5))\n\n" +
+               "go() -> int =\n    scope((s) ->\n        var v = [0; 8]\n        val all = v[..]\n\n" +
+               "        fill(all)\n        all[0])\n\nprint(go())\n", "5\n")
+
+@test("a helper handed the scope lends the enclosing function's view")
+sbe_helper_enclosing_accepted()
+    sbe_prints(SbeHead + "helper(s: *Scope, w: []int) = s.spawn(() -> w[0] = 7)\n\n" +
+               "go() -> int\n    var v = [0; 8]\n    val all = v[..]\n\n    scope((s) -> helper(s, all))\n    v[0]\n\n" +
+               "print(go())\n", "7\n")
+
+@test("a body handed to a helper along with the scope lends the enclosing function's view")
+sbe_with_enclosing_accepted()
+    sbe_prints(SbeHead + SbeWith + "go() -> int\n    var v = [0; 8]\n    val all = v[..]\n\n" +
+               "    scope((s) -> with(s, (t) -> t.spawn(() -> all[0] = 4)))\n    v[0]\n\nprint(go())\n", "4\n")
+
+// A wrapper of `scope` lends the scope `scope` made, through a closure of its own.
+@test("a wrapper of scope lends the enclosing function's view and a local's address")
+sbe_wrapper_accepted()
+    sbe_prints(SbeHead + "my_scope(f: &Fn(*Scope) -> ()) = scope((s) -> f(s))\n\n" +
+               "go() -> int\n    var v = [0; 8]\n    val all = v[..]\n    var x = 0\n    val px = &x\n\n" +
+               "    my_scope((s) -> s.spawn(() -> all[0] = 3))\n" +
+               "    my_scope((s) -> s.spawn(() -> atomic_add(px, 1, SeqCst)))\n    v[0] * 10 + x\n\nprint(go())\n", "31\n")
+
+// -- under AddressSanitizer -------------------------------------------------------------------------------
+
+private sbe_accepted_program() -> string = SbeHead + SbeWith +
+    "fill(w: []int) = scope((s) -> s.spawn(() -> w[0] += 5))\n\n" +
+    "my_scope(f: &Fn(*Scope) -> ()) = scope((s) -> f(s))\n\n" +
+    "go() -> int\n    var v = [0; 8]\n    val all = v[..]\n\n" +
+    "    scope((s) -> each([1, 2][..], (i) -> s.spawn(() -> all[i] = i)))\n" +
+    "    scope((s) -> with(s, (t) -> t.spawn(() -> all[3] = 3)))\n" +
+    "    my_scope((s) -> s.spawn(() -> all[4] = 4))\n" +
+    "    fill(all)\n\n" +
+    "    val inner = scope((s) ->\n        var u = [0; 4]\n        val us = u[..]\n\n" +
+    "        scope((t) -> each([1][..], (i) -> t.spawn(() -> us[i] = 10)))\n        us[1])\n\n" +
+    "    var sum = inner\n\n    for x in v do sum += x\n\n    sum\n\nprint(go())\n"
+
+@test("every accepted road to a scope runs")
+sbe_accepted_runs()
+    sbe_prints(sbe_accepted_program(), "25\n")
+
+@test("every accepted road to a scope is a clean AddressSanitizer run")
+sbe_asan_is_clean()
+    if xvr_no_library() then return
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return
+    end if
+
+    val out = sbe_outcome(sbe_accepted_program(), "-fsanitize=address -g")
+
+    assert(out.2.contains("__asan_report"), out.2)
+    assert_eq(out.0, "25\n")
+    assert_eq(out.1, 0)
+end sbe_asan_is_clean

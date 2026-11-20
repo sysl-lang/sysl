@@ -82,6 +82,32 @@ check_abandons_signature(a: &Analysis, scope: Scope, at: Span, name: string, for
             return
 end check_abandons_signature
 
+// What an `@abandons` function's parameters owe once every `impl` is in: none may hold a `@unique`
+// value with a destructor, which the callee owns and would never come back to drop. **Asked after the
+// members are hoisted**, not with the rest of the signature, since whether a type has a `Drop` is an
+// `impl` block's answer and the signatures are read before any `impl` is.
+check_abandons_unique(a: &Analysis)
+    if !any_unique(a) then return
+
+    for i in 0..<a.tables.funcs.len()
+        val f = a.tables.funcs.at(i)
+
+        if !f.decl.marks.abandons || !f.decl.tparams.is_empty() then continue
+
+        for p in resolved_params(a, f.scope, f.decl.params, false)
+            if contains_counted(p.1) then break
+
+            unique_drop_held(a, p.1) match
+                Some(held) ->
+                    a.fault(f.scope, f.span, s"'${f.decl.name}' is '@abandons', so it never comes back to drop its parameter '${p.0}' — a '${type_show(p.1)}' holds the '@unique' '${type_show(held)}', whose destructor would never run. Pass a '*${type_show(p.1)}' instead")
+                    break
+                None -> ()
+end check_abandons_unique
+
+// Whether a value of this type, held across a call that can abandon the frame, would be given back by
+// nothing: it carries a count, or holds a `@unique` value with a destructor.
+private held_across(a: &Analysis, t: Type) -> bool = contains_counted(t) || unique_drop_held(a, t).is_some()
+
 // -- the program --------------------------------------------------------------------------------------
 
 // Which functions can arrive at an abandoning call, worked out over the call graph until nothing new
@@ -164,7 +190,7 @@ check_abandons(a: &Analysis, funcs: Buf[TFunc], externs: Buf[TExtern], vtables: 
         cx.scope = func_home(a, f.name)
         cx.is_async = f.marks.is_async()
 
-        scan_block(a, cx, f.body, held_on_entry(cx, f))
+        scan_block(a, cx, f.body, held_on_entry(a, cx, f))
 end check_abandons
 
 // -- a fiber that may move -----------------------------------------------------------------------------
@@ -212,7 +238,7 @@ check_switch_holds(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable])
 
         cx.scope = func_home(a, f.name)
 
-        scan_block(a, cx, f.body, held_on_entry(cx, f))
+        scan_block(a, cx, f.body, held_on_entry(a, cx, f))
 end check_switch_holds
 
 // Whether a body runs on the main thread's own stack: the program's `main`, or the entry file's
@@ -261,8 +287,18 @@ private called_refs(out: &Refs, e: TExpr) = *e.kind match
 
 // What a frame holds before its body has run: nothing, because a parameter is its caller's to hold
 // (`borrowing.sysl`) -- except where something outside sysl's convention may call it, when the
-// count it arrived with is the frame's own.
-private held_on_entry(cx: &Abandoning, f: TFunc) -> string
+// count it arrived with is the frame's own, and a `@unique` value with a destructor, which the callee
+// is handed and drops (`design/affine-values.md` § 7). A `(self)` receiver of one owns nothing. Where
+// a fiber may move, only a count matters.
+private held_on_entry(a: &Analysis, cx: &Abandoning, f: TFunc) -> string
+    if !cx.fiber
+        for j in 0..<f.params.len()
+            val p = f.params[j]
+
+            if unique_drop_held(a, p.1).is_some() && !(j == 0 && p.0 == "self" && !f.marks.consumes)
+                return s"the parameter '${shown_local(p.0)}'"
+    end if
+
     if f.exported.is_none() && f.conv.is_none() then return ""
 
     for p in f.params
@@ -302,7 +338,7 @@ private scan_stmts(a: &Analysis, cx: &Abandoning, stmts: Buf[TStmt], held: strin
             TVarDecl(name, ty, init, _) ->
                 scan(a, cx, init, h)
 
-                if h == "" && holds_count(cx, ty) then h = s"'${shown_local(name)}'"
+                if h == "" && held_here(a, cx, ty) then h = s"'${shown_local(name)}'"
             TExprStmt(e) -> scan(a, cx, e, h)
             TInvariant(cond, _) -> scan(a, cx, cond, h)
             TVariantCheck(_, _, e) -> scan(a, cx, e, h)
@@ -394,7 +430,7 @@ private scan(a: &Analysis, cx: &Abandoning, e: TExpr, held: string)
 
             var h = with_temp(cx, held, seq)
 
-            if h == "" && holds_count(cx, elem_ty) then h = s"'${shown_local(name)}'"
+            if h == "" && held_here(a, cx, elem_ty) then h = s"'${shown_local(name)}'"
 
             val _ = scan_stmts(a, cx, body, h)
 
@@ -404,7 +440,7 @@ private scan(a: &Analysis, cx: &Abandoning, e: TExpr, held: string)
 
             var h = held
 
-            if h == "" && holds_count(cx, cursor_ty) then h = s"'${shown_local(cursor)}'"
+            if h == "" && held_here(a, cx, cursor_ty) then h = s"'${shown_local(cursor)}'"
 
             scan(a, cx, next, h)
 
@@ -521,6 +557,11 @@ end empty_variants
 // count that is not atomic where a fiber may move -- an atomic one is safe to change from any thread.
 private holds_count(cx: &Abandoning, t: Type) -> bool =
     if cx.fiber then unshareable(t).is_some() else contains_counted(t)
+
+// The same for a local the frame holds: where a frame is abandoned, a `@unique` value with a destructor
+// is held as well (`held_across`).
+private held_here(a: &Analysis, cx: &Abandoning, t: Type) -> bool =
+    if cx.fiber then unshareable(t).is_some() else held_across(a, t)
 
 private args_bind_counted(cx: &Abandoning, args: Buf[TPattern], fields: Buf[(string, Type)]) -> bool
     for i in 0..<args.len()
