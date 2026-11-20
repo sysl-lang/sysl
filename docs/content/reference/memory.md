@@ -3268,7 +3268,9 @@ allows. `ptr_cast` reaches between the two, as it reaches between any two pointe
 **`p - q` between two pointers of one pointee is an `isize` counting elements** — C's `ptrdiff_t`, the
 inverse of `&p[n]` — which is what turns `memchr`'s or `strstr`'s answer into an index. **Offsetting
 stays `&p[n]`**: `p + n` is not spelled, and `p + q` names no address. Two pointee types are refused by
-the ordinary matching-types rule, and **a `&T` has no arithmetic at all**. Whether two pointers into
+the ordinary matching-types rule, and **a `&T` has no arithmetic of its own**: an operator reads it
+through to its referent ([generics](/reference/generics/#operators-see-through-a-reference)), so two
+`&Point`s subtract only where `Point` does, and the refusal names `Point`. Whether two pointers into
 unrelated objects may be subtracted is the programmer's business.
 
 ```sysl
@@ -3451,7 +3453,9 @@ it names alive. Four forms give the raw tier that, and [`sysl.buf.Buf`](/library
 with them:
 
 - **`slot_storage(n)`** (or `slot_storage[T](n)`) is a `[]T` of `n` slots of which **none is live**;
-  the element type comes from the position, and with none it is refused.
+  the element type comes from the position, and with none it is refused. **`slot_storage(0)` allocates
+  nothing** — it is the empty view `[]` is, so a container made empty costs no storage until it grows —
+  and neither does `[v; n]` or `try_slot_storage(n)` when `n` is zero while running.
 - **`slot_place(xs, i, v)`** fills the first slot past the live run without letting go of anything; a
   live slot is an ordinary assignment; a slot further on would leave a gap, and **traps**.
 - **`slot_place_run(xs, at, src)`** is `slot_place(xs, at + k, src[k])` for every element of the view
