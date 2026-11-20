@@ -1,6 +1,10 @@
 module sysl.math.bigint
 
-// Multiplication: schoolbook below a threshold, Karatsuba above it.
+// Multiplication: schoolbook for the smallest operands, then Karatsuba, then Toom-3, and past those
+// the number-theoretic transform in `fft.sysl`. Each step up has its own threshold, measured.
+// Squaring has its own route: schoolbook, Karatsuba of squares, then the transform with one forward
+// transform per prime instead of two. (A Toom-3 square was measured too: between Karatsuba's
+// squares and the transform it was never faster than either.)
 //
 // **Schoolbook is one row per limb of the shorter operand**, each row an `addmul_1` over the longer
 // one -- quadratic, and the fastest there is for small operands because each step is a multiply and
@@ -47,6 +51,10 @@ end mul_mag
 private[bigint] mul_into(r: []Limb, a: []const Limb, an: usize, b: []const Limb, bn: usize)
     if bn < karatsuba_threshold
         schoolbook(r, a, an, b, bn)
+#if ptr64
+    elif bn >= fft_threshold
+        fft_mul(r, a, an, b, bn)
+#endif
     elif bn * 2 <= an + 1
         unbalanced(r, a, an, b, bn)
     elif bn >= toom_threshold && bn > ((an + 2) / 3) * 2
@@ -159,7 +167,7 @@ end karatsuba
 // algorithm their size chooses.
 
 /** Toom-3 for a balanced pair, `b` reaching into `a`'s top third. */
-private toom3(r: []Limb, a: []const Limb, an: usize, b: []const Limb, bn: usize)
+private[bigint] toom3(r: []Limb, a: []const Limb, an: usize, b: []const Limb, bn: usize)
     val k = (an + 2) / 3
     val a0 = piece(a, 0, k)
     val a1 = piece(a, k, k * 2)
@@ -232,6 +240,11 @@ private sqr_into(r: []Limb, a: []const Limb, n: usize)
     if n < karatsuba_threshold
         sqr_schoolbook(r, a, n)
         return
+#if ptr64
+    if n >= fft_sqr_threshold
+        fft_sqr(r, a, n)
+        return
+#endif
 
     val k = (n + 1) / 2
     val h = n - k
