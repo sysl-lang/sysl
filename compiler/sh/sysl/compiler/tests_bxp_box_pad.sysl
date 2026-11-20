@@ -212,9 +212,11 @@ bxp_static_box_aligned()
     assert(enm_says(ir, "%struct.A8 { i8 1, i64 2 } }\n"), ir)
     assert_eq(enm_ran(src), "0 0 0 0 0\n3 40 8 9 900 90000 true\n")
 
-// **A closure's frame box is laid on its payload's boundary**: the slot's own boundary was LLVM's for
-// the box type, sixteen, while the environment holding a `@align(64)` capture sat at 64 into it.
-@test("a frame box holding a raised capture is laid on the capture's boundary")
+// **A closure's frame box never holds a raised capture out of its own boundary**: a closure that does
+// not outlive its frame holds a `val` aggregate by address (`tests_sca_scoped_capture_address.sysl`),
+// so the `@align(64)` value stays in its own slot, laid on 64, and the box holds only its address --
+// eight bytes where a copy took sixty-four and a box raised to match.
+@test("a frame box over a raised capture holds its address, and the capture keeps its boundary")
 bxp_frame_box_aligned()
     if !enm_ready() then return
 
@@ -222,7 +224,9 @@ bxp_frame_box_aligned()
         "main()\n    val r = R(3, 4)\n    val k = 5\n    print(call(() -> int(r.b) + k))\n"
     val ir = enm_ir(src)
 
-    assert(enm_says(ir, "= alloca %arc.$closure0, align 64\n"), ir)
+    assert(enm_says(ir, "%r.addr = alloca %struct.R, align 64\n"), ir)
+    assert(enm_says(ir, "%struct.$closure0 = type { ptr, i32 }\n"), ir)
+    assert(enm_says(ir, "insertvalue %struct.$closure0 undef, ptr %r.addr, 0\n"), ir)
     assert_eq(enm_ran(src), "9\n")
 
 // **A table's split method lays its receiver's slot on the receiver's boundary**: the box-shaped slot
