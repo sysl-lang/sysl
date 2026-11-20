@@ -418,12 +418,17 @@ private gen_slot_place(e: *Emit, xs: TExpr, index: TExpr, value: TExpr, elem: Ty
     bounds_check(e, i, view.2, signed_index(index), index.span)
 
     val p = slot_at(e, elem, view.1, i)
-    val v = gen_expr(e, value)
+    val drained = drain_of(e, value)
+    val v = if drained.is_some() then drain_read(e, drained.unwrap(), value, elem) else gen_expr(e, value)
 
     if zero_sized(elem) then return
 
     if !contains_counted(elem)
         emit(e, InStore(lty(e, elem), v, p, side, None))
+        return
+
+    if drained.is_some()
+        place_counted(e, elem, view.0, p, v, side)
         return
 
     // **Only the first free slot is placed in line.** It is the case a container appending to its own
@@ -523,6 +528,10 @@ private gen_slot_place_run(e: *Emit, xs: TExpr, at: TExpr, src: TExpr, elem: Typ
 
     if zero_sized(elem) then return
 
+    val drained = drain_of(e, src)
+
+    if drained.is_some() then drain_run_prefix(e, drained.unwrap(), elem, from.0, from.1, n)
+
     val first = slot_at(e, elem, view.1, i)
 
     if !contains_counted(elem) && moves_bytes(e)
@@ -581,13 +590,15 @@ private gen_slot_place_run(e: *Emit, xs: TExpr, at: TExpr, src: TExpr, elem: Typ
     emit(e, InSelect(j, back, word_lty(e), down, k, l_i1()))
 
     val v = fresh_reg(e)
+    val read_at = slot_at(e, elem, from.1, j)
 
-    emit(e, InLoad(v, lty(e, elem), slot_at(e, elem, from.1, j), AccPlain, None))
+    emit(e, InLoad(v, lty(e, elem), read_at, AccPlain, None))
 
     val p = slot_at(e, elem, first, j)
 
     if contains_counted(elem)
-        retain_value(e, elem, v)
+        if drained.is_some() then drain_count(e, drained.unwrap(), elem, v, read_at) else retain_value(e, elem, v)
+
         place_counted(e, elem, view.0, p, v, side)
     else
         emit(e, InStore(lty(e, elem), v, p, side, None))
@@ -675,6 +686,201 @@ gen_slot_place_rest(e: *Emit, elem: Type)
 
     emit_term(e, InRet(None, None))
 end gen_slot_place_rest
+
+// -- draining storage the next statement lets go of --------------------------------------------------
+
+// **A copy out of storage whose last holder lets go of it next is a move** (`slot_drain.sysl` finds
+// it). Two flags decided once, before the copy: `take`, that the storage is a buffer of these slots
+// with a strong count of one, so each element read out of it takes over its slot's share instead of
+// retaining one; and `zero`, that a taken slot must be left zeroed for the storage's hook to give back
+// nothing for it. `zero` is cleared where the copy covers the rest of the live prefix from where it
+// starts: the prefix is cut back to that start before the copy, so the hook never walks the taken
+// slots, and the copy is a plain copy of the bytes, as C++'s is.
+struct Drain
+    read: TExpr
+    take: Val
+    zero: Val
+end Drain
+
+// The drain the statement being emitted reads through `x`, where `x` is the node it was found at.
+drain_of(e: *Emit, x: TExpr) -> Option[Drain] = e.moves.drain match
+    Some(d) -> if d.read.kind === x.kind then Some(d) else None
+    None -> None
+
+// The two flags, asked of the storage `p.source` names as it stands before the copy.
+drain_begin(e: *Emit, p: DrainPlan) -> Drain
+    val elem = p.elem
+    val take = alloca(e, fresh_reg(e), l_i1())
+    val zero = alloca(e, fresh_reg(e), l_i1())
+
+    emit(e, InStore(l_i1(), VBool(false), take, AccPlain, None))
+    emit(e, InStore(l_i1(), VBool(true), zero, AccPlain, None))
+
+    val owner = slot_view(e, p.source).0
+    val buffer_l = fresh_label(e, "drain.buffer")
+    val sole_l = fresh_label(e, "drain.sole")
+    val done_l = fresh_label(e, "drain.decided")
+
+    buffer_test(e, elem, owner, buffer_l, done_l, AccPlain)
+    emit_label(e, buffer_l)
+
+    // The strong count is the box's first word, as `slot_vacate` reads it: above one is a second
+    // container or a view still reading these slots, which keep their counts.
+    val strong = fresh_reg(e)
+
+    emit(e, InLoad(strong, word_lty(e), owner, AccPlain, None))
+
+    val sole = fresh_reg(e)
+
+    emit(e, InIntCmp(sole, IEq, word_lty(e), strong, VInt(from_int(1))))
+    emit_term(e, InCondBr(sole, sole_l, done_l))
+    emit_label(e, sole_l)
+    emit(e, InStore(l_i1(), VBool(true), take, AccPlain, None))
+
+    p.bounds match
+        Some(b) -> drain_loop_prefix(e, elem, owner, b.0, b.1, b.2, zero, done_l)
+        None -> ()
+
+    emit_term(e, InBr(done_l))
+    emit_label(e, done_l)
+    Drain(p.read, take, zero)
+end drain_begin
+
+// **A loop `lo ..< hi` that reaches the end of the live prefix takes every slot from `lo` on**, so the
+// prefix is cut back to `lo` and nothing is zeroed. Only where the range is a real one: `lo` not past
+// `hi`, and not negative, since a range that runs no turn takes nothing. A variable wider than an
+// address is left to the zeroing, its bounds being able to say something the slots cannot.
+private drain_loop_prefix(e: *Emit, elem: Type, owner: Val, lo: TExpr, hi: TExpr, ty: Type, zero: Val,
+                          done_l: string)
+    val shape = underlying(ty) match
+        Integer(bits, signed, _) -> (bits, signed)
+        _ -> return
+
+    if shape.0 > e.word_bits then return
+
+    val w = lty(e, ty)
+    val lo_v = gen_expr(e, lo)
+    val hi_v = gen_expr(e, hi)
+    val ordered = fresh_reg(e)
+
+    emit(e, InIntCmp(ordered, int_pred(e, "<=", underlying(ty)), w, lo_v, hi_v))
+
+    var ok = ordered
+
+    if shape.1
+        val from_zero = fresh_reg(e)
+
+        emit(e, InIntCmp(from_zero, ISge, w, lo_v, VZero))
+
+        val both = fresh_reg(e)
+
+        emit(e, InBin(both, OpAnd, l_i1(), ordered, from_zero))
+        ok = both
+    end if
+
+    val range_l = fresh_label(e, "drain.range")
+    val tail_l = fresh_label(e, "drain.tail")
+
+    emit_term(e, InCondBr(ok, range_l, done_l))
+    emit_label(e, range_l)
+
+    val lo_w = convert_int(e, shape.0, shape.1, e.word_bits, lo_v)
+    val hi_w = convert_int(e, shape.0, shape.1, e.word_bits, hi_v)
+    val lp = slot_header(e, elem, owner, header_fields())
+    val live = fresh_reg(e)
+
+    emit(e, InLoad(live, word_lty(e), lp, AccPlain, None))
+
+    val covers = fresh_reg(e)
+
+    emit(e, InIntCmp(covers, IUge, word_lty(e), hi_w, live))
+    emit_term(e, InCondBr(covers, tail_l, done_l))
+    emit_label(e, tail_l)
+    cut_prefix(e, lo_w, live, lp, zero)
+end drain_loop_prefix
+
+// **A run that reaches the end of the live prefix** is the loop's case, measured by address: the run's
+// first slot is where the prefix is cut back to.
+private drain_run_prefix(e: *Emit, d: Drain, elem: Type, owner: Val, start: Val, n: Val)
+    val check_l = fresh_label(e, "drain.check")
+    val tail_l = fresh_label(e, "drain.tail")
+    val go_l = fresh_label(e, "drain.go")
+    val take = fresh_reg(e)
+
+    emit(e, InLoad(take, l_i1(), d.take, AccPlain, None))
+    emit_term(e, InCondBr(take, check_l, go_l))
+    emit_label(e, check_l)
+
+    val lp = slot_header(e, elem, owner, header_fields())
+    val live = fresh_reg(e)
+
+    emit(e, InLoad(live, word_lty(e), lp, AccPlain, None))
+
+    val data = slot_header(e, elem, owner, buf_elems_field(e, elem))
+    val edge = slot_at(e, elem, data, live)
+    val past = slot_at(e, elem, start, n)
+    val covers = fresh_reg(e)
+
+    emit(e, InIntCmp(covers, IUge, LPtr, past, edge))
+    emit_term(e, InCondBr(covers, tail_l, go_l))
+    emit_label(e, tail_l)
+    cut_prefix(e, slot_distance(e, data, start, element_size(e, elem)), live, lp, d.zero)
+    emit_term(e, InBr(go_l))
+    emit_label(e, go_l)
+end drain_run_prefix
+
+// The live prefix at `lp` cut back to `at` where that is shorter, and the taken slots left as they are.
+private cut_prefix(e: *Emit, at: Val, live: Val, lp: Val, zero: Val)
+    val below = fresh_reg(e)
+
+    emit(e, InIntCmp(below, IUlt, word_lty(e), at, live))
+
+    val kept = fresh_reg(e)
+
+    emit(e, InSelect(kept, below, word_lty(e), at, live, l_i1()))
+    emit(e, InStore(word_lty(e), kept, lp, AccPlain, None))
+    emit(e, InStore(l_i1(), VBool(false), zero, AccPlain, None))
+end cut_prefix
+
+// The element `x` (`s[i]`) reads, taken where the drain takes and counted where it does not.
+private drain_read(e: *Emit, d: Drain, x: TExpr, elem: Type) -> Val
+    val parts = *x.kind match
+        TIndex(r, i, _) -> (r, i)
+        _ -> return gap_at(e, "a drained read that is not a subscript")
+
+    val p = element_addr(e, parts.0, parts.1, x.span)
+    val v = fresh_reg(e)
+
+    emit(e, InLoad(v, lty(e, elem), p, AccPlain, None))
+    drain_count(e, d, elem, v, p)
+    v
+end drain_read
+
+// The count `v`, read from the slot at `at`, owes: its slot's share where the drain takes -- the slot
+// zeroed behind it where the hook would still walk it -- and a retain where it does not.
+private drain_count(e: *Emit, d: Drain, elem: Type, v: Val, at: Val)
+    val taken_l = fresh_label(e, "drain.taken")
+    val shared_l = fresh_label(e, "drain.shared")
+    val clear_l = fresh_label(e, "drain.clear")
+    val join_l = fresh_label(e, "drain.read")
+    val take = fresh_reg(e)
+
+    emit(e, InLoad(take, l_i1(), d.take, AccPlain, None))
+    emit_term(e, InCondBr(take, taken_l, shared_l))
+    emit_label(e, shared_l)
+    retain_value(e, elem, v)
+    emit_term(e, InBr(join_l))
+    emit_label(e, taken_l)
+
+    val zero = fresh_reg(e)
+
+    emit(e, InLoad(zero, l_i1(), d.zero, AccPlain, None))
+    emit_term(e, InCondBr(zero, clear_l, join_l))
+    emit_label(e, clear_l)
+    emit(e, InStore(lty(e, elem), zero_of(e, elem), at, AccPlain, None))
+    emit_term(e, InBr(join_l))
+    emit_label(e, join_l)
+end drain_count
 
 private gen_slot_vacate(e: *Emit, xs: TExpr, from: TExpr, elem: Type)
     val view = slot_view(e, xs)

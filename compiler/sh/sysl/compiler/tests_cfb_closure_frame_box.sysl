@@ -409,19 +409,25 @@ cfb_frame_boxes_are_allocas()
 cfb_counted_payload_has_a_frame_hook()
     if xvr_no_library() then return
 
+    // A counted reference is copied into the closure, taking a share; a `val` string would be held
+    // by its address, so the closure would hold nothing counted (`tests_sca_scoped_capture_address.sysl`).
     val text = raw"""
+        struct Word
+            len: int
+
         apply(f: &Fn() -> int) -> int = f()
 
         main()
-            val word = "abcd"
+            val word: &Word = Word(4)
             val none = 3
 
-            print(apply(() -> int(word.bytes.len)), apply(() -> none))
+            print(apply(() -> word.len), apply(() -> none))
         """
     val ir = cfb_ir(text)
 
+    // The one allocation is the `&Word` the program builds; the closures' boxes are in the frame.
     assert_eq(cfb_lines_with(ir, "define private void @arc.dropframe."), 1)
-    assert_eq(cfb_lines_with(ir, "call ptr @malloc"), 0)
+    assert_eq(cfb_lines_with(ir, "call ptr @malloc"), 1)
     cfb_prints(text, "4 3\n")
 end cfb_counted_payload_has_a_frame_hook
 

@@ -17,6 +17,10 @@ import sysl.time.monotonic
 // control word (no sysl operation reads it) and an overflow on a carrier other than the main thread
 // (the same handler, reached through the signal stack the first switch gives a thread, which the
 // migration test exercises without faulting).
+//
+// Each test is the home side of its fibers: it runs on the test thread's own stack, which is resumed
+// only on that thread, so it says '@pinned(thread)' and holds its stacks and boxes across the
+// switches it makes (`fiber.md § A fiber may move between threads`).
 
 // -- ping-pong ---------------------------------------------------------------------------------------
 
@@ -31,6 +35,7 @@ private pong(p: *Pong)
         switch(&p.me, &p.home)
 
 @test("two contexts switch a million times each way, and every switch lands")
+@pinned(thread)
 fbr_ping_pong_a_million()
     val s = Stack.reserve(64 * 1024).unwrap()
     val p: &Pong = Pong(Context.new(), Context.new(), 0)
@@ -60,6 +65,7 @@ fbr_never_entered()
     assert_eq(p.n, 0)
 
 @test("one stack is started a second time once its first fiber is finished with")
+@pinned(thread)
 fbr_stack_reused()
     val s = Stack.reserve(16 * 1024).unwrap()
     val a: &Pong = Pong(Context.new(), Context.new(), 0)
@@ -94,6 +100,7 @@ private ring_b(r: *Ring)
         switch(&r.b, &r.home)
 
 @test("a context left for a third one comes back where it was")
+@pinned(thread)
 fbr_ring_of_three()
     val sa = Stack.reserve(32 * 1024).unwrap()
     val sb = Stack.reserve(32 * 1024).unwrap()
@@ -142,6 +149,7 @@ private on_another_thread(h: *Hop)
     switch(&h.away, &h.me)
 
 @test("a context parked on one thread resumes on another, and sees that thread's thread-locals")
+@pinned(thread)
 fbr_migrates_between_threads()
     carrier_tag = 1
 
@@ -191,6 +199,7 @@ private round_on_carrier(r: *Rounds)
     assert_eq(carrier_tag, r.next + 10)
 
 @test("a function that switches reads and writes the thread-locals of whichever carrier resumed it")
+@pinned(thread)
 fbr_thread_locals_follow_the_carrier()
     carrier_tag = 1
 
@@ -244,6 +253,7 @@ private dig_body(d: *Dig)
     switch(&d.me, &d.home)
 
 @test("a large stack costs only what is touched: 64 MiB reserved, about 1 MiB committed")
+@pinned(thread)
 fbr_commits_lazily()
     val s = Stack.reserve(64 * 1024 * 1024).unwrap()
 
@@ -281,6 +291,7 @@ fbr_zero_refused()
     assert_eq(r.unwrap_err().code(), 22)
 
 @test("ten thousand stacks reserved at once, every one usable, then all dropped")
+@pinned(thread)
 fbr_ten_thousand_stacks()
     var stacks: Buf[&Stack] = buf()
 
@@ -317,6 +328,7 @@ private modes(m: *Modes)
     switch(&m.me, &m.home)
 
 @test("the rounding mode is each context's own: a fiber starts with its starter's and keeps its own")
+@pinned(thread)
 fbr_rounding_mode_is_saved()
     set_rounding(Downward)
 
@@ -379,6 +391,7 @@ end trample
 // Floats live across a switch whose other side writes d8--d15: the values survive wherever the code
 // around the switch chose to keep them.
 @test("floats live across a switch survive the other side writing d8 to d15")
+@pinned(thread)
 fbr_live_floats_survive()
     val s = Stack.reserve(32 * 1024).unwrap()
     val f: &Floats = Floats(Context.new(), Context.new())
@@ -437,6 +450,7 @@ private busy(b: *Busy)
 end busy
 
 @test("integers and floats live across a switch survive, on both sides of it, round after round")
+@pinned(thread)
 fbr_live_values_survive()
     val s = Stack.reserve(32 * 1024).unwrap()
     val b: &Busy = Busy(Context.new(), Context.new(), 0)
@@ -467,6 +481,7 @@ fbr_live_values_survive()
     assert_eq(b.rounds, 4)
 
 @test("a switch called through a function value goes out of line, and lands where the inline one does")
+@pinned(thread)
 fbr_switch_through_a_function_value()
     val s = Stack.reserve(32 * 1024).unwrap()
     val p: &Pong = Pong(Context.new(), Context.new(), 0)
@@ -498,6 +513,7 @@ private walk(w: *Walk)
     switch(&w.me, &w.home)
 
 @test("a backtrace taken on a fiber stops at the fiber's entry")
+@pinned(thread)
 fbr_backtrace_ends_at_the_entry()
     val s = Stack.reserve(32 * 1024).unwrap()
     val w: &Walk = Walk(Context.new(), Context.new(), 0)
@@ -663,6 +679,7 @@ fbr_bounds_above_guard()
     assert(usize(s.low()) % page_size() == 0)
 
 @test("a running fiber's locals and both ends of its stack lie inside its bounds")
+@pinned(thread)
 fbr_bounds_hold_for_running_fiber()
     val s = Stack.reserve(256 * 1024).unwrap()
     val p: &Probe = Probe(Context.new(), Context.new(), s, false, false)

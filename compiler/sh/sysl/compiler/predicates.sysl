@@ -54,13 +54,53 @@ register_predicate(a: &Analysis, scope: Scope, s: Stmt)
             // parameters, with its bounds -- so the body is checked once against the bounds by the
             // definition-time pass, as any generic body is, and made real per instantiation by the
             // check site (`inv_fn_for`).
-            var f = lowered_func(inv_key(key), params, "string", first_broken(d.invariants, scope.src), s.span)
+            var f = lowered_func(inv_key(key), params, "string", first_broken(d.invariants, d.invariant_msgs, scope.src), s.span)
 
             f.tparams = d.tparams
             f.bounds = d.bounds
             f.tvalues = d.tvalues
             a.tables.funcs.put(inv_key(key), Func(f, s.span, scope))
         _ -> ()
+
+// **A clause's message is worked out while compiling, by the rule every contract message follows**
+// (`clause_message`): any `string` the compiler can compute, and a complaint, worded for the
+// 'invariant', where it cannot. The function registered with the clauses is made again with each
+// message the text it came to. A generic struct's is read in the struct's own terms.
+settle_invariant_messages(a: &Analysis, scope: Scope, key: string, d: StructDecl, span: Span)
+    if d.invariants.is_empty() then return
+
+    var written = false
+
+    for m in d.invariant_msgs
+        if m.is_some() then written = true
+
+    if !written then return
+
+    val old = a.tables.funcs.get(inv_key(key))
+
+    if old.is_none() then return
+
+    val cx = analyzer_for(a, scope)
+    var settled: Buf[Option[Expr]] = buf()
+
+    for i in 0..<d.invariants.len()
+        val m = if i < d.invariant_msgs.len() then d.invariant_msgs[i] else None
+
+        if m.is_none()
+            settled.push(None)
+        else
+            val text = clause_message(cx, m.unwrap().span, m.unwrap(), "invariant")
+
+            settled.push(Some(expr(m.unwrap().span, StrLit(text.unwrap_or("")))))
+
+    val was = old.unwrap()
+    var f = lowered_func(inv_key(key), was.decl.params, "string", first_broken(d.invariants, settled, scope.src), span)
+
+    f.tparams = d.tparams
+    f.bounds = d.bounds
+    f.tvalues = d.tvalues
+    a.tables.funcs.put(inv_key(key), Func(f, was.span, was.scope))
+end settle_invariant_messages
 
 // The declaration one of these lowers to: a plain function of the values, answering `ret`.
 private lowered_func(name: string, params: Buf[Param], ret: string, cond: Expr, span: Span) -> FuncDecl
@@ -72,14 +112,15 @@ end lowered_func
 // **A struct's clauses as the one answer a check needs: which of them does not hold.** The answer is
 // empty where every clause holds, and otherwise names the first that does not -- its text, and where
 // it is written (`clause_named`) -- for the failure to report beside the struct
-// (`invariant of 'Window' failed: clause 'lo <= hi' at main.sysl:4:15`).
+// (`invariant of 'Window' failed: clause 'lo <= hi' at main.sysl:4:15`), led by the message the
+// clause was written with (`invariant lo <= hi, "msg"`) where it has one.
 //
 // Each clause is the condition of an `if` of its own, in the order written, so the clauses run in
 // that order and stop at the first that fails, exactly as their conjunction would. A clause stands
 // in the `if` as a block, so the `if` takes it as the one `bool` it is -- it neither splits a clause
 // written with `&&` into terms nor lets an `is` in it bind -- and one that is not a `bool` is
 // refused as an invariant (`analyze_bool`).
-private first_broken(clauses: Buf[Expr], src: Source) -> Expr
+private first_broken(clauses: Buf[Expr], msgs: Buf[Option[Expr]], src: Source) -> Expr
     var out = expr(clauses[clauses.len() - 1].span, StrLit(""))
     var i = clauses.len()
 
@@ -88,7 +129,14 @@ private first_broken(clauses: Buf[Expr], src: Source) -> Expr
 
         val c = clauses[i]
         val cond = expr(c.span, Block(one_stmt(c)))
-        val broken = expr(c.span, StrLit(clause_named(src, c.span)))
+        val named = clause_named(src, c.span)
+        val said = if i < msgs.len() then msgs[i] else None
+
+        // A clause written with a message reports it ahead of the clause: the message is the
+        // expression written, which only a failure ever evaluates.
+        val broken = said match
+            Some(m) -> expr(c.span, Binary("+", m, expr(c.span, StrLit(s": $named"))))
+            None -> expr(c.span, StrLit(named))
 
         out = expr(c.span, IfExpr(cond, one_stmt(out), Some(one_stmt(broken)), false))
 

@@ -124,6 +124,10 @@ struct Abandoning
     scope: Scope
     is_async: bool
     said: Set[string]
+
+    // Whether the walk is `check_switch_holds`'s: what is held is a count that is not atomic, the call
+    // asked about is one that can reach `sysl.fiber.switch`, and a `defer` holds nothing.
+    fiber: bool
 end Abandoning
 
 // Holds every body to what an abandoning call needs of it.
@@ -154,23 +158,115 @@ check_abandons(a: &Analysis, funcs: Buf[TFunc], externs: Buf[TExtern], vtables: 
         reached.push(item)
 
     val cx: &Abandoning = Abandoning(seeds, mays, may_abandon(funcs, reached), vtables, empty_scope(),
-                                     false, set())
+                                     false, set(), false)
 
     for f in funcs
         cx.scope = func_home(a, f.name)
         cx.is_async = f.marks.is_async()
 
-        scan_block(a, cx, f.body, held_on_entry(f))
+        scan_block(a, cx, f.body, held_on_entry(cx, f))
 end check_abandons
+
+// -- a fiber that may move -----------------------------------------------------------------------------
+//
+// **A count that is not atomic belongs to the thread that changes it** (`library/fiber.md § A fiber
+// may move between threads`). A body that holds one across a call that can reach
+// `sysl.fiber.switch` may be resumed on another carrier, and gives it back there with a plain
+// decrement -- racing whatever on the first carrier still shares it (a view of the carrier's own
+// buffer, say), which corrupts the heap. So the walk above is asked again with the switch as its
+// seed and the counts `&sync` does not make atomic as what is held: a local, a binding a `match`
+// took a share of, a counted temporary of the enclosing expression. A `defer` holds nothing here.
+//
+// **Two bodies are not asked.** One marked `@pinned(thread)`, whose fiber the program says is only
+// ever resumed on the thread it began on; and the program's `main` and its entry statements, which
+// run on the main thread's own stack -- a context saved there is resumed only on that thread
+// (`fiber.md`), so the scheduler a program drives from `main` holds what it likes.
+//
+// **The call graph is the CALL graph**: a function that only takes the switch's address -- to start
+// a fiber on it, say -- does not switch by being called, and a call through a value is not followed,
+// as a call through one is not for `@abandons`. A program that never calls the switch pays for no
+// walk at all.
+check_switch_holds(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable])
+    var key = ""
+
+    for f in funcs
+        if qualified_name(f.name) == "sysl.fiber.switch"
+            key = f.name
+            break
+
+    if key == "" then return
+
+    var seeds: Set[string] = set()
+
+    seeds.add(key)
+
+    var reached: Buf[string] = buf()
+
+    reached.push(key)
+
+    val cx: &Abandoning = Abandoning(seeds, set(), may_switch(funcs, reached), vtables, empty_scope(),
+                                     false, set(), true)
+
+    for f in funcs
+        if f.marks.pinned_thread || f.name == key || on_main_stack(f.name) then continue
+
+        cx.scope = func_home(a, f.name)
+
+        scan_block(a, cx, f.body, held_on_entry(cx, f))
+end check_switch_holds
+
+// Whether a body runs on the main thread's own stack: the program's `main`, or the entry file's
+// statements (`analyze_body.sysl`'s `entry_check_name`).
+private on_main_stack(name: string) -> bool
+    val bare = module_bare(name)
+
+    bare == "main" || bare == "entry file"
+
+// `may_abandon`'s fixpoint over the functions a body CALLS, leaving out the ones it only takes the
+// address of.
+private may_switch(funcs: Buf[TFunc], seeds: Buf[string]) -> Set[string]
+    var out: Set[string] = set()
+
+    for item in seeds
+        out.add(item)
+
+    var calls: Buf[(string, Buf[string])] = buf()
+
+    for f in funcs
+        val refs = no_refs()
+
+        walk_block_stmts(f.body, TWalk(false, e -> called_refs(refs, e), w -> write_refs(refs, w), st -> ()))
+        calls.push((f.name, refs.calls))
+
+    var growing = true
+
+    while growing
+        growing = false
+
+        for item in calls
+            if out.has(item.0) then continue
+
+            for callee in item.1
+                if out.has(callee)
+                    out.add(item.0)
+                    growing = true
+                    break
+
+    out
+end may_switch
+
+private called_refs(out: &Refs, e: TExpr) = *e.kind match
+    TFuncAddr(_, _, _) -> ()
+    _ -> node_refs(out, e)
 
 // What a frame holds before its body has run: nothing, because a parameter is its caller's to hold
 // (`borrowing.sysl`) -- except where something outside sysl's convention may call it, when the
 // count it arrived with is the frame's own.
-private held_on_entry(f: TFunc) -> string
+private held_on_entry(cx: &Abandoning, f: TFunc) -> string
     if f.exported.is_none() && f.conv.is_none() then return ""
 
     for p in f.params
-        if contains_counted(p.1) then return s"the parameter '${shown_local(p.0)}'"
+        if holds_count(cx, p.1) then return s"the parameter '${shown_local(p.0)}'"
 
     ""
 end held_on_entry
@@ -206,7 +302,7 @@ private scan_stmts(a: &Analysis, cx: &Abandoning, stmts: Buf[TStmt], held: strin
             TVarDecl(name, ty, init, _) ->
                 scan(a, cx, init, h)
 
-                if h == "" && contains_counted(ty) then h = s"'${shown_local(name)}'"
+                if h == "" && holds_count(cx, ty) then h = s"'${shown_local(name)}'"
             TExprStmt(e) -> scan(a, cx, e, h)
             TInvariant(cond, _) -> scan(a, cx, cond, h)
             TVariantCheck(_, _, e) -> scan(a, cx, e, h)
@@ -228,7 +324,7 @@ private scan_stmts(a: &Analysis, cx: &Abandoning, stmts: Buf[TStmt], held: strin
             TDefer(body, _) ->
                 val _ = scan_stmts(a, cx, body, h)
 
-                if h == "" then h = "a 'defer' still to run"
+                if h == "" && !cx.fiber then h = "a 'defer' still to run"
             TAsm(_, _, _, _) -> ()
 
     h
@@ -251,14 +347,14 @@ private scan(a: &Analysis, cx: &Abandoning, e: TExpr, held: string)
             scan(a, cx, scrutinee, held)
 
             val sty = texpr_type(scrutinee)
-            val after = with_temp(held, scrutinee)
+            val after = with_temp(cx, held, scrutinee)
 
             for arm in arms
-                var h = after
+                var h = if empty_variants(cx, arm.patterns) then held else after
 
                 if h == ""
                     for p in arm.patterns
-                        if binds_counted(p, sty) then h = "a binding this arm took a share of"
+                        if binds_counted(cx, p, sty) then h = "a binding this arm took a share of"
 
                 if arm.guard.is_some() then scan(a, cx, arm.guard.unwrap(), h)
 
@@ -296,9 +392,9 @@ private scan(a: &Analysis, cx: &Abandoning, e: TExpr, held: string)
         TForEach(name, elem_ty, seq, body, else_block, _) ->
             scan(a, cx, seq, held)
 
-            var h = with_temp(held, seq)
+            var h = with_temp(cx, held, seq)
 
-            if h == "" && contains_counted(elem_ty) then h = s"'${shown_local(name)}'"
+            if h == "" && holds_count(cx, elem_ty) then h = s"'${shown_local(name)}'"
 
             val _ = scan_stmts(a, cx, body, h)
 
@@ -308,11 +404,11 @@ private scan(a: &Analysis, cx: &Abandoning, e: TExpr, held: string)
 
             var h = held
 
-            if h == "" && contains_counted(cursor_ty) then h = s"'${shown_local(cursor)}'"
+            if h == "" && holds_count(cx, cursor_ty) then h = s"'${shown_local(cursor)}'"
 
             scan(a, cx, next, h)
 
-            if h == "" && binds_counted(bind, texpr_type(next)) then h = "a binding this loop took a share of"
+            if h == "" && binds_counted(cx, bind, texpr_type(next)) then h = "a binding this loop took a share of"
 
             val _ = scan_stmts(a, cx, body, h)
 
@@ -332,7 +428,7 @@ private scan_kids(a: &Analysis, cx: &Abandoning, e: TExpr, held: string)
 
     for k in kids(e)
         scan(a, cx, k, h)
-        h = with_temp(h, k)
+        h = with_temp(cx, h, k)
 
     check_node(a, cx, e, h)
 end scan_kids
@@ -346,14 +442,14 @@ private scan_terms(a: &Analysis, cx: &Abandoning, terms: Buf[TCondTerm], held: s
         t match
             TCondTest(c) ->
                 scan(a, cx, c, h)
-                h = with_temp(h, c)
+                h = with_temp(cx, h, c)
             TCondIs(subject, patterns, _) ->
                 scan(a, cx, subject, h)
-                h = with_temp(h, subject)
+                h = with_temp(cx, h, subject)
 
                 if h == ""
                     for p in patterns
-                        if binds_counted(p, texpr_type(subject)) then h = "a binding this condition took a share of"
+                        if binds_counted(cx, p, texpr_type(subject)) then h = "a binding this condition took a share of"
 
     h
 end scan_terms
@@ -368,13 +464,18 @@ end scan_terms
 // else counted is a temporary. A field of a struct or an element of an array held IN a module `val`
 // is part of that same storage; one reached through a reference or a `Buf` is not, since what the
 // handle points at can be assigned while the `val` itself never changes.
-private with_temp(held: string, x: TExpr) -> string
+private with_temp(cx: &Abandoning, held: string, x: TExpr) -> string
     if held != "" then return held
-    if !contains_counted(texpr_type(x)) then return ""
+    if !holds_count(cx, texpr_type(x)) then return ""
 
     *x.kind match
         TLoad(_, _) -> ""
         TStrLit(_) -> ""
+
+        // `*r match`, which a shape matched through a `&T` is read as, matches the referent where it
+        // lies: what its arms bind is the share they take, and the frame holds no copy of the whole --
+        // only what the reference itself was, which the operand says.
+        TDeref(operand, _) -> if cx.fiber then with_temp(cx, "", operand) else "a counted temporary the enclosing expression is still holding"
         TGlobal(symbol, _, true) -> s"a share of the module 'var' '${qualified_name(symbol)}'"
         _ -> if in_module_val(x) then "" else "a counted temporary the enclosing expression is still holding"
 end with_temp
@@ -392,19 +493,40 @@ private in_module_val(x: TExpr) -> bool = *x.kind match
     _ -> false
 
 // Whether a pattern binds anything that carries a count, read against the type of what it matches.
-private binds_counted(p: TPattern, ty: Type) -> bool = p match
-    TBindPattern(_, t) -> contains_counted(t)
-    TAtPattern(_, inner) -> contains_counted(ty) || binds_counted(*inner, ty)
-    TVariantPattern(_, variant, args) -> args_bind_counted(args, variant.fields)
-    TStructPattern(decl, args) -> args_bind_counted(args, decl.fields)
-    TDerefPattern(ref_ty, inner) -> binds_counted(*inner, ref_inner(ref_ty))
+private binds_counted(cx: &Abandoning, p: TPattern, ty: Type) -> bool = p match
+    TBindPattern(_, t) -> holds_count(cx, t)
+    TAtPattern(_, inner) -> holds_count(cx, ty) || binds_counted(cx, *inner, ty)
+    TVariantPattern(_, variant, args) -> args_bind_counted(cx, args, variant.fields)
+    TStructPattern(decl, args) -> args_bind_counted(cx, args, decl.fields)
+    TDerefPattern(ref_ty, inner) -> binds_counted(cx, *inner, ref_inner(ref_ty))
     _ -> false
 
-private args_bind_counted(args: Buf[TPattern], fields: Buf[(string, Type)]) -> bool
+// Whether every pattern of an arm is a variant that carries nothing counted -- `None`, `Err(code)`
+// with a scalar code -- so the value matched holds no count while the arm runs. Asked only where a
+// fiber may move: an abandoned frame's scrutinee is no different, but nothing has needed it there.
+private empty_variants(cx: &Abandoning, patterns: Buf[TPattern]) -> bool
+    if !cx.fiber || patterns.is_empty() then return false
+
+    for p in patterns
+        p match
+            TVariantPattern(_, variant, _) ->
+                for f in variant.fields
+                    if holds_count(cx, f.1) then return false
+            _ -> return false
+
+    true
+end empty_variants
+
+// Whether a value of `t` holds what the walk asks about: any count where a frame is abandoned, and a
+// count that is not atomic where a fiber may move -- an atomic one is safe to change from any thread.
+private holds_count(cx: &Abandoning, t: Type) -> bool =
+    if cx.fiber then unshareable(t).is_some() else contains_counted(t)
+
+private args_bind_counted(cx: &Abandoning, args: Buf[TPattern], fields: Buf[(string, Type)]) -> bool
     for i in 0..<args.len()
         val ty = if i < fields.len() then fields[i].1 else Unknown
 
-        if binds_counted(args[i], ty) then return true
+        if binds_counted(cx, args[i], ty) then return true
 
     false
 end args_bind_counted
@@ -412,6 +534,21 @@ end args_bind_counted
 // -- the node itself ---------------------------------------------------------------------------------
 
 private check_node(a: &Analysis, cx: &Abandoning, e: TExpr, held: string)
+    if cx.fiber
+        // Taking an address is no call; a call through a value is not followed (`check_switch_holds`).
+        if held == "" then return
+
+        *e.kind match
+            TFuncAddr(_, _, _) -> return
+            _ -> ()
+
+        for name in own_refs(e).calls
+            if cx.reach.has(name)
+                say(a, cx, e.span, switch_refusal(cx, name, held))
+                return
+        return
+    end if
+
     *e.kind match
         // **Taken as an `@abandons *extern` the address is the call's own mark**: every call through
         // it is reached as an abandoning one, and its caller held to holding nothing across.
@@ -485,6 +622,13 @@ private erased_refusal(cx: &Abandoning, name: string) -> string
 
 private async_refusal(name: string) -> string =
     s"'${qualified_name(name)}' is '@abandons', so its caller gives back its frame before the call — and an 'async' function's frame is its task's, which may still be awaited. Call it from an ordinary function"
+
+private switch_refusal(cx: &Abandoning, name: string, held: string) -> string
+    val callee = if cx.seeds.has(name) then s"'${qualified_name(name)}' may resume this fiber on another thread"
+    else s"'${qualified_name(name)}' can reach 'sysl.fiber.switch', which may resume this fiber on another thread"
+
+    s"$callee, and this frame holds ${held} across the call — a count that is not atomic, which would then be changed from that thread while the one it was made on may change it too. End it before the call (in a block of its own, or in a function that returns first), or hold it as a '&sync' reference, whose count is atomic; a function whose fiber is only ever resumed on the thread it began on says so with '@pinned(thread)'"
+end switch_refusal
 
 // -- the operands of a node with no block under it, in the order they run ------------------------------
 
