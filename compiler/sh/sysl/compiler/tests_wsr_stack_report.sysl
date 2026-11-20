@@ -1,0 +1,404 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{replace_all, Search}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+
+// `sysl stack` and `@stack(n, calls: m)` (`reference/attributes.md § @stack`): the deepest stack a
+// way into the program can need, from the optimized text's calls and the back end's frames.
+//
+// The first half reads hand-written texts -- a written text, an optimized one and a `.su` file -- so
+// each rule is seen alone: the frames added up, the deepest way taken, a cycle, a call through a
+// pointer with and without `calls:`, a frame sized at run time, the C left uncounted, inlining moving a
+// pointer call into a caller. The second half builds real programs, where the back end is the
+// oracle: `@stack(n)` refused above its depth and passed under it, at the annotation.
+
+private wsr_says(text: string, part: string) -> bool = text.index_of(part).is_some()
+
+private wsr_check(said: string, part: string) = assert(wsr_says(said, part), said)
+
+// A `.su` line per function, as clang writes one.
+private wsr_su(rows: Buf[(string, int, string)]) -> string
+    var out = ""
+
+    for r in rows
+        out = out + s"x.ll:${r.0}\t${r.1}\t${r.2}\n"
+
+    out
+end wsr_su
+
+private wsr_rows() -> Buf[(string, int, string)] = buf()
+
+// One report line, with no `@stack(calls:)` said anywhere and the optimized text the written one.
+private wsr_line(ir: string, su: string, entry: string) -> string
+    var entries: Buf[(string, string)] = buf()
+
+    entries.push((entry, entry))
+    stack_report_text(stack_analysis(ir, StackUsage(su, ir, "x.ll"), buf()), entries)
+end wsr_line
+
+private const wsr_chain: string =
+    "define i32 @main(i32 %argc, ptr %argv) {\n  %t1 = call i32 @a(i32 1)\n  %t2 = call i32 @b(i32 2)\n  ret i32 0\n}\n" +
+    "define i32 @a(i32 %x) {\n  %t = call i32 @c(i32 %x)\n  ret i32 %t\n}\n" +
+    "define i32 @b(i32 %x) {\n  ret i32 %x\n}\n" +
+    "define i32 @c(i32 %x) {\n  call void @llvm.lifetime.start.p0(i64 8, ptr %p)\n  ret i32 %x\n}\n"
+
+@test("the deepest way down is the sum of its frames, and the way is named")
+wsr_frames_add_up()
+    var rows = wsr_rows()
+
+    rows.push(("main", 16, "static"))
+    rows.push(("a", 32, "static"))
+    rows.push(("b", 400, "static"))
+    rows.push(("c", 64, "static"))
+
+    assert_eq(wsr_line(wsr_chain, wsr_su(rows), "main"), "main: 416 bytes, by 'main' → 'b'")
+
+@test("the deeper of two ways is taken, however many calls it is")
+wsr_deeper_way()
+    var rows = wsr_rows()
+
+    rows.push(("main", 16, "static"))
+    rows.push(("a", 32, "static"))
+    rows.push(("b", 40, "static"))
+    rows.push(("c", 64, "static"))
+
+    assert_eq(wsr_line(wsr_chain, wsr_su(rows), "main"), "main: 112 bytes, by 'main' → 'a' → 'c'")
+
+@test("a function the back end left no frame for counts as nothing, and its calls are still followed")
+wsr_inlined_away()
+    var rows = wsr_rows()
+
+    rows.push(("main", 16, "static"))
+    rows.push(("c", 64, "static"))
+
+    assert_eq(wsr_line(wsr_chain, wsr_su(rows), "main"), "main: 80 bytes, by 'main' → 'a' → 'c'")
+
+@test("a cycle of calls makes the depth unbounded, and the report names the cycle")
+wsr_recursion()
+    val ir = "define i32 @main(i32 %a, ptr %b) {\n  %t = call i32 @f(i32 1)\n  ret i32 0\n}\n" +
+             "define i32 @f(i32 %x) {\n  %t = call i32 @g(i32 %x)\n  ret i32 %t\n}\n" +
+             "define i32 @g(i32 %x) {\n  %t = tail call i32 @f(i32 %x)\n  ret i32 %t\n}\n"
+
+    assert_eq(wsr_line(ir, "", "main"), "main: unbounded — 'f' recurses by the cycle 'f' → 'g' → 'f'")
+
+@test("a call through a register with nothing said is unbounded, naming the function that makes it")
+wsr_indirect()
+    val ir = "define i32 @main(i32 %a, ptr %b) {\n  %t = call i32 @run(ptr %b)\n  ret i32 0\n}\n" +
+             "define i32 @run(ptr %f) {\n  %t = call i32 %f(i32 1)\n  ret i32 %t\n}\n"
+
+    assert_eq(wsr_line(ir, "", "main"),
+              "main: unbounded — 'run' calls through a pointer — a trait object, a '&Fn' closure or a " +
+              "function pointer — whose target is not known, and it says nothing with '@stack(calls: n)'")
+
+@test("'@stack(calls: m)' makes a call through a pointer count m bytes, and the way says so")
+wsr_indirect_assumed()
+    val ir = "define i32 @main(i32 %a, ptr %b) {\n  %t = call i32 @run(ptr %b)\n  ret i32 0\n}\n" +
+             "define i32 @run(ptr %f) {\n  %t = call i32 %f(i32 1)\n  ret i32 %t\n}\n"
+    var rows = wsr_rows()
+
+    rows.push(("main", 16, "static"))
+    rows.push(("run", 32, "static"))
+
+    var assumed: Buf[(string, u64)] = buf()
+
+    assumed.push(("run", 512))
+
+    var entries: Buf[(string, string)] = buf()
+
+    entries.push(("main", "main"))
+    assert_eq(stack_report_text(stack_analysis(ir, StackUsage(wsr_su(rows), ir, "x.ll"), assumed), entries),
+              "main: 560 bytes, by 'main' → 'run' → a call through a pointer, taken as 512 bytes")
+
+@test("inlining moves a call through a pointer into its caller, and the bound said of the written body follows it")
+wsr_indirect_inlined()
+    val written = "define i32 @main(i32 %a, ptr %b) {\n  %t = call i32 @run(ptr %b)\n  ret i32 0\n}\n" +
+                  "define i32 @run(ptr %f) {\n  %t = call i32 %f(i32 1)\n  ret i32 %t\n}\n"
+    val optimized = "define i32 @main(i32 %a, ptr %b) {\n  %t = call i32 %b(i32 1)\n  ret i32 0\n}\n"
+    var rows = wsr_rows()
+
+    rows.push(("main", 48, "static"))
+
+    var assumed: Buf[(string, u64)] = buf()
+
+    assumed.push(("run", 512))
+
+    var entries: Buf[(string, string)] = buf()
+
+    entries.push(("main", "main"))
+    assert_eq(stack_report_text(stack_analysis(written, StackUsage(wsr_su(rows), optimized, "x.ll"), assumed), entries),
+              "main: 560 bytes, by 'main' → a call through a pointer, taken as 512 bytes")
+
+    // Unsaid, the inlined call is the written body's, and the reason names that body.
+    assert_eq(stack_report_text(stack_analysis(written, StackUsage(wsr_su(rows), optimized, "x.ll"), buf()), entries),
+              "main: unbounded — 'run' calls through a pointer — a trait object, a '&Fn' closure or a " +
+              "function pointer — whose target is not known, and it says nothing with '@stack(calls: n)'")
+
+@test("a frame sized at run time is unbounded; one the back end bounded is a number")
+wsr_dynamic_frame()
+    val ir = "define i32 @main(i32 %a, ptr %b) {\n  %t = call i32 @f(i32 1)\n  ret i32 0\n}\n" +
+             "define i32 @f(i32 %x) {\n  ret i32 %x\n}\n"
+    var rows = wsr_rows()
+
+    rows.push(("main", 16, "static"))
+    rows.push(("f", 32, "dynamic"))
+    assert_eq(wsr_line(ir, wsr_su(rows), "main"), "main: unbounded — 'f' sizes its frame at run time")
+
+    var bounded = wsr_rows()
+
+    bounded.push(("main", 16, "static"))
+    bounded.push(("f", 32, "dynamic,bounded"))
+    assert_eq(wsr_line(ir, wsr_su(bounded), "main"), "main: 48 bytes, by 'main' → 'f'")
+
+@test("the frames are read as '--stack-usage' reads them: a promoted symbol as written, a stray line skipped")
+wsr_frames_shared_reader()
+    val su = "x.ll:sysl.cgu:f\t32\tstatic\nx.ll:g\t8\tdynamic\nnot a row\nx.ll:h\tmany\tstatic\n"
+    val frames = frames_of(su, "x.ll")
+
+    assert_eq(frames.get("f").map((p) -> p.0), Some(u64(32)))
+    assert_eq(frames.get("g").map((p) -> p.1), Some(true))
+    assert(frames.get("sysl.cgu:f").is_none())
+    assert(frames.get("h").is_none())
+
+    // A file of another source keeps the whole head as the name, so nothing is read under a guess.
+    assert(frames_of(su, "y.ll").get("g").is_none())
+
+@test("a C function is counted as nothing and named; an LLVM intrinsic is neither")
+wsr_c_named()
+    val ir = "define i32 @main(i32 %a, ptr %b) {\n  %t = call i64 @write(i32 1, ptr %b, i64 2)\n" +
+             "  call void @llvm.memset.p0.i64(ptr %b, i8 0, i64 4, i1 false)\n" +
+             "  %u = call i32 (ptr, ...) @printf(ptr %b)\n  ret i32 0\n}\n"
+    var rows = wsr_rows()
+
+    rows.push(("main", 16, "static"))
+    assert_eq(wsr_line(ir, wsr_su(rows), "main"), "main: 16 bytes, by 'main', not counting the C it calls: 'printf', 'write'")
+
+@test("a root function's symbol reads as its name, and an export's thunk and body are one step")
+wsr_root_symbols()
+    val ir = "define i32 @tick(i32 %c.0) {\n  %t1 = call i32 @tick$$sysl(i32 %c.0)\n  ret i32 %t1\n}\n" +
+             "define i32 @tick$$sysl(i32 %x) {\n  %t = call i32 @\"deep$$sysl\"(i32 %x)\n  ret i32 %t\n}\n" +
+             "define i32 @deep$$sysl(i32 %x) {\n  ret i32 %x\n}\n"
+    var rows = wsr_rows()
+
+    rows.push(("tick", 16, "static"))
+    rows.push(("tick$$sysl", 16, "static"))
+    rows.push(("deep$$sysl", 4144, "static"))
+    assert_eq(wsr_line(ir, wsr_su(rows), "tick"), "tick: 4176 bytes, by 'tick' → 'deep'")
+
+@test("inline assembly is no call, and an argument naming a function is not the callee")
+wsr_callee_parse()
+    val ir = "define void @main() {\n  call void asm sideeffect \"mov %0, x0\", \"r\"(i64 1)\n" +
+             "  call void %fp(ptr @other)\n  ret void\n}\n" +
+             "define void @other() {\n  ret void\n}\n"
+    val fns = ir_calls_of(ir)
+
+    assert_eq(fns.len(), 2)
+    assert(fns[0].calls.is_empty())
+    assert(fns[0].indirect)
+
+@test("an entry the text does not define is said to have no code, and no entry at all is said too")
+wsr_missing_entry()
+    assert_eq(wsr_line(wsr_chain, "", "nowhere"), "nowhere: no code of its own in this build")
+    assert_eq(stack_report_text(stack_analysis(wsr_chain, StackUsage("", wsr_chain, "x.ll"), buf()), buf()),
+              "this program has no entry point and exports nothing, so nothing enters it")
+
+// -- real programs ---------------------------------------------------------------------------------
+
+private var wsr_library_checked: bool = false
+private var wsr_library_there: bool = false
+
+private wsr_ready() -> bool
+    if !wsr_library_checked
+        wsr_library_checked = true
+        wsr_library_there = std_root().is_ok()
+
+    if !wsr_library_there
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end wsr_ready
+
+private wsr_project(main: string) -> string
+    val root = make_temp_dir("sysl-stack").unwrap()
+
+    write_text(s"$root/main.sysl", main).unwrap()
+    root
+end wsr_project
+
+// What the build had to say about a program, or "" where it had nothing.
+private wsr_err(main: string, level: string = DefaultOptimization) -> string
+    val root = wsr_project(main)
+
+    val out = emit_llvm_text(root, None, level) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end wsr_err
+
+// `sysl stack`'s report on a program.
+private wsr_report(main: string, level: string = DefaultOptimization) -> string
+    val root = wsr_project(main)
+    val t = host_target()
+
+    val out = emit_llvm_text(root, None, level, buf(), Some(buf())) match
+        Err(why) -> why.message
+        Ok(made) ->
+            if !made.report.is_empty() then analysis_report(made.report)
+            else stack_usage_of(made.text, t, level) match
+                Err(why) -> why
+                Ok(usage) -> stack_report_text(stack_analysis(made.text, usage, made.stack_assumed), made.entries)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end wsr_report
+
+// A frame of 4 KiB, which every level keeps.
+private const wsr_deep: string =
+    "deep(n: usize) -> u8\n    var block: [4096]u8 = [0; 4096]\n    block[n % 4096] = u8(n)\n" +
+    "    block[(n * 7) % 4096]\n\n"
+
+@test("'@stack(n)' under what a function needs is refused at the annotation, with the way down")
+wsr_bound_exceeded()
+    if !wsr_ready() then return
+
+    val said = wsr_err(wsr_deep + "@stack(1024)\nhandler(x: usize) -> u8 = deep(x)\n\nprint(handler(3))\n")
+
+    wsr_check(said, "'handler' declared '@stack(1024)', and it can need ")
+    wsr_check(said, "bytes at -O1, by 'handler'")
+    wsr_check(said, "main.sysl:6:1")
+
+@test("'@stack(n)' over what a function needs builds, at every level")
+wsr_bound_kept()
+    if !wsr_ready() then return
+
+    val main = wsr_deep + "@stack(65536)\nhandler(x: usize) -> u8 = deep(x)\n\nprint(handler(3))\n"
+
+    for level in ["0", "1", "2"]
+        assert_eq(wsr_err(main, level), "")
+
+// A recursion no optimizer turns into a loop: two calls, neither in tail position.
+private const wsr_fib: string = "fib(n: int) -> int = if n < 2 then n else fib(n - 1) + fib(n - 2)\n\n"
+
+@test("'@stack(n)' over a recursive function is refused, naming the cycle, at every level")
+wsr_bound_recursion()
+    if !wsr_ready() then return
+
+    for level in ["0", "2"]
+        val said = wsr_err("f() -> int = 1\n\n" + wsr_fib + "@stack(65536)\nhandler(n: int) -> int = fib(n)\n\n" +
+                           "print(handler(5))\n", level)
+
+        wsr_check(said, "'handler' declared '@stack(65536)', and how deep its stack goes has no bound — 'fib' recurses by the cycle 'fib' → 'fib'")
+
+@test("a recursion the optimizer turned into a loop is a frame, not a cycle")
+wsr_recursion_made_a_loop()
+    if !wsr_ready() then return
+
+    val main = "f() -> int = 1\n\nfact(n: int) -> int = if n <= 1 then 1 else n * fact(n - 1)\n\n" +
+               "@stack(65536)\nhandler(n: int) -> int = fact(n)\n\nprint(handler(5))\n"
+
+    wsr_check(wsr_err(main, "0"), "'fact' recurses by the cycle 'fact' → 'fact'")
+    assert_eq(wsr_err(main, "2"), "")
+
+// Kept out of line, so no level can see which closure it calls and turn the call into a direct one.
+private const wsr_lock: string =
+    "struct Lock\n    n: int\n\n" +
+    "@noinline\nwith_lock(l: *Lock, op: &Fn() -> int) -> int\n    l.n += 1\n    val r = op()\n    l.n -= 1\n    r\n\n"
+
+// The lock with what its body's calls through a pointer need said above it.
+private wsr_lock_said(bytes: int) -> string =
+    replace_all(wsr_lock, "with_lock(l:", s"@stack(calls: $bytes)\nwith_lock(l:")
+
+private const wsr_handler: string =
+    "@stack(65536)\nhandler(x: int) -> int\n    var l = Lock(0)\n    with_lock(&l, () -> x + 1)\n\nprint(handler(1))\n"
+
+@test("'@stack(n)' over a body that calls a closure through '&Fn' is refused until 'calls:' says what it needs")
+wsr_bound_closure()
+    if !wsr_ready() then return
+
+    for level in ["0", "2"]
+        val said = wsr_err(wsr_lock + wsr_handler, level)
+
+        wsr_check(said, "'handler' declared '@stack(65536)', and how deep its stack goes has no bound — 'with_lock' calls through a pointer")
+
+        // Said on the function whose body makes the call, the bound holds wherever the optimizer
+        // put that call -- and the closure's release, which runs its destructor through the object's
+        // header, is answered by the runtime's hooks rather than refused.
+        assert_eq(wsr_err(wsr_lock_said(1024) + wsr_handler, level), "")
+
+@test("a closure call the optimizer made direct needs nothing said: the frames are the optimized program's")
+wsr_closure_made_direct()
+    if !wsr_ready() then return
+
+    val inlined = replace_all(wsr_lock, "@noinline\n", "")
+
+    wsr_check(wsr_err(inlined + wsr_handler, "0"), "'with_lock' calls through a pointer")
+    assert_eq(wsr_err(inlined + wsr_handler, "2"), "")
+
+@test("'calls:' bounds the calls through a pointer, and the depth is held to it: a bound too small is refused")
+wsr_bound_closure_counted()
+    if !wsr_ready() then return
+
+    val said = wsr_err(wsr_lock_said(100000) + wsr_handler)
+
+    wsr_check(said, "'handler' declared '@stack(65536)', and it can need ")
+    wsr_check(said, "a call through a pointer, taken as 100000 bytes")
+
+@test("the report names every entry: main and each export, by its symbol")
+wsr_report_entries()
+    if !wsr_ready() then return
+
+    val said = wsr_report(wsr_deep + wsr_fib + "@export(\"tick\")\ntick(x: int) -> int = int(deep(usize(x)))\n\n" +
+                          "@export(\"rec\")\nrec(x: int) -> int = fib(x)\n\nprint(deep(3))\n", "0")
+
+    wsr_check(said, "main: ")
+    wsr_check(said, "rec: unbounded — 'fib' recurses by the cycle 'fib' → 'fib'")
+    wsr_check(said, "tick: ")
+    wsr_check(said, "by 'tick' → 'deep'")
+
+@test("a destructor run through an object's header is answered by every destructor, not refused")
+wsr_hooks_answered()
+    val ir = "define i32 @main(i32 %a, ptr %b) {\n  call void @arc.destroy(ptr %b, ptr null)\n  ret i32 0\n}\n" +
+             "define private void @arc.destroy(ptr %p, ptr %s) noinline {\nentry:\n  call void %f(ptr %p, i1 false, ptr %s)\n  ret void\n}\n" +
+             "define private void @Big.drop(ptr %p, i1 %free, ptr %s) {\n  ret void\n}\n" +
+             "define private void @Small.drop(ptr noundef %p, i1 zeroext %free, ptr %s) {\n  ret void\n}\n" +
+             "define private void @other(ptr %p, i32 %n, ptr %s) {\n  ret void\n}\n"
+    var rows = wsr_rows()
+
+    rows.push(("main", 16, "static"))
+    rows.push(("arc.destroy", 32, "static"))
+    rows.push(("Big.drop", 300, "static"))
+    rows.push(("Small.drop", 20, "static"))
+    rows.push(("other", 9000, "static"))
+
+    assert_eq(wsr_line(ir, wsr_su(rows), "main"), "main: 348 bytes, by 'main' → 'arc.destroy' → 'Big.drop'")
+
+@test("'@stack' takes a byte count, 'calls:' and nothing else, and marks only a function")
+wsr_attribute_shapes()
+    if !wsr_ready() then return
+
+    val shape = "'@stack' bounds the stack in bytes, in parentheses"
+
+    wsr_check(wsr_err("@stack\nf() -> int = 1\n\nprint(f())\n"), shape)
+    wsr_check(wsr_err("@stack(big)\nf() -> int = 1\n\nprint(f())\n"), shape)
+    wsr_check(wsr_err("@stack(1, 2)\nf() -> int = 1\n\nprint(f())\n"), shape)
+    wsr_check(wsr_err("@stack(calls: 1, calls: 2)\nf() -> int = 1\n\nprint(f())\n"), shape)
+    wsr_check(wsr_err("f() -> int = 1\n\n@stack(64)\nstruct P\n    x: int\n\nprint(f())\n"),
+              "'@stack(...)' bounds the stack a call needs, so it marks a function or a method whose body is sysl")
+    assert_eq(wsr_err("@stack(0x4000, calls: 256)\nf() -> int = 1\n\nprint(f())\n"), "")
+
+@test("a method may carry '@stack', and is held to it")
+wsr_method()
+    if !wsr_ready() then return
+
+    val said = wsr_err(wsr_deep + "struct H\n    n: usize\n\n    @stack(128)\n    run(self) -> u8 = deep(self.n)\n\n" +
+                       "print(H(3).run())\n")
+
+    wsr_check(said, "'H.run' declared '@stack(128)', and it can need ")

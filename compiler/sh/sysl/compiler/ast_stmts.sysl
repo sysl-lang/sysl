@@ -396,6 +396,16 @@ struct FuncMarks
     // traps on overflow whatever the build mode (`checked.sysl`). Carried to every lowered copy, and
     // reaching every closure and nested function written inside, by span.
     checked: bool
+
+    // `@stack(n, calls: m)` above a function or a member: the deepest stack a call of it may need,
+    // the build refusing it where the call graph and the back end's frames say more, and what each
+    // call its own body makes through a pointer is taken to need (`stack_bound.sysl`). Either may be
+    // absent; `stack_at` is where the annotation was written, which a refusal points at. Carried to
+    // every lowered copy.
+    stack: Option[u64]
+    stack_calls: Option[u64]
+    stack_at: Option[Span]
+
     // `@no_fuse`, or a body that inherits it -- a closure or a nested function written inside a marked
     // one, or any body of a module whose header says it: a multiply feeding an add is two operations,
     // rounded twice (`no_fuse.sysl`). Carried to every lowered copy and every instantiation.
@@ -439,8 +449,8 @@ end FuncMarks
 // A definition nothing was said about.
 no_marks() -> FuncMarks = FuncMarks(false, false, false, None, buf(), false, None, false, false,
                                     false, false, false, false, false, false, buf(), false, buf(), buf(),
-                                    false, false, false, false, buf(), buf(), buf(), false, false, buf(), 0,
-                                    false, false)
+                                    false, false, false, false, buf(), buf(), buf(), false, None, None, None,
+                                    false, buf(), 0, false, false)
 
 // A method of a struct, an enum, a trait or an `impl` block.
 struct MethodDecl
@@ -649,6 +659,9 @@ enum Attr
     NoFuse
     // `@track_caller` above a function or a member: what it reports names the line that called it.
     TrackCaller
+    // `@stack(n, calls: m)` above a function or a member: the deepest stack a call may need, and what
+    // each call through a pointer in its body is taken to need. Each part is optional, not both.
+    StackBound(bytes: Option[u64], calls: Option[u64], at: Span)
     // `@frame_limit(n)` above a function or a member: the most bytes its stack frame may take, or no
     // limit where `limit` is nothing (`@frame_limit(none)`).
     FrameLimit(limit: Option[long])
@@ -740,6 +753,7 @@ attr_word(a: Attr) -> string = a match
     Checked -> "checked"
     NoFuse -> NoFuseWord
     TrackCaller -> "track_caller"
+    StackBound(_, _, _) -> "stack"
     FrameLimit(_) -> "frame_limit"
     Relocates -> "relocates"
     Views(_) -> "views"

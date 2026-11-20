@@ -872,6 +872,10 @@ root is compiled into the build rather than linked from its kept artifact, so ev
 lists is one this build laid out. **The standard module's precompiled functions are not in it**;
 `--no-std-lib` compiles them into the build, and into the report.
 
+A frame is one function's; the stack a call needs is the frames added up the whole way down, which
+[`sysl stack`](/getting-started/cli/#stack) prints for each way into a program and
+[`@stack(n)`](/reference/attributes/#stack-a-bound-on-the-stack-a-call-needs) holds a function to.
+
 ## Linking a freestanding image
 
 A kernel, or a board's firmware, is an ELF image nothing loads: an emulator or a debug probe puts it

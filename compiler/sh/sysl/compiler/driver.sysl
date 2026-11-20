@@ -790,6 +790,14 @@ emit_llvm_text(path: string, named_target: Option[string],
     phase_done("std")
     forget_field_paths(done.an)
 
+    // **The text a `@stack(n)` is checked against holds every body the build reaches** -- the
+    // library's too, which the lowering below only declares where the artifact has them. Where it does,
+    // that text is lowered here, BEFORE it: a compact lowering leaves each function it has printed
+    // without its body, so nothing could be lowered from the program after it (`stack_bound.sysl`).
+    val nothing_precompiled = linked.precompiled.is_empty() && roots.precompiled.is_empty()
+    val stack_text = if nothing_precompiled || !stack_marked(kept) then None
+    else Some(ir_print_module(codegen_with_gaps(kept with { precompiled = buf() }, t, promotions).0))
+
     // **A build that links and optimizes also carries a copy of each small or `@inline` function
     // those halves define** (`codegen.sysl`'s `importable`), so that a call into a package inlines as
     // a call within the program does. The text `emit-llvm` prints has none, and nor does `-O0`.
@@ -807,15 +815,45 @@ emit_llvm_text(path: string, named_target: Option[string],
     // hook**, where nothing writes it a default (`check_aligned_heap`).
     check_aligned_heap(done.an, kept)
 
+    val text = ir_print_module(lowered.0)
+
+    // **And a function marked `@stack(n)` is held to it**, against the frames the back end lays out
+    // (`stack_bound.sysl`). The text is reused where it already holds the library's bodies.
+    val whole_text = if nothing_precompiled then Some(text) else stack_text
+
+    check_stack_bounds(done.an, kept, t, level, promotions, whole_text)
+
     // Read back out of the analysis rather than off the snapshot the body pass answered with: the
     // checks above have just added to it.
     val report = errors_of(done.an.diagnostics())
 
     say_warnings(report, done.an)
 
-    Ok(Emitted(ir_print_module(lowered.0), report, lowered.1, link_required(program.units),
-               roots.archives))
+    Ok(Emitted(text, report, lowered.1, link_required(program.units),
+               roots.archives, entries_of(kept, image_entry_named(root, t)), stack_assumptions(kept.funcs)))
 end emit_llvm_text
+
+// The symbols a program is entered by, in the order `sysl stack` reports them: `main`, a bare
+// image's named entry, then the program's exports by symbol.
+private entries_of(p: TProgram, image_entry: string) -> Buf[(string, string)]
+    var out: Buf[(string, string)] = buf()
+
+    if p.entry_point then out.push(("main", "main"))
+    if image_entry != "" && image_entry != "main" then out.push((image_entry, image_entry))
+
+    var exported: Buf[string] = buf()
+
+    for f in p.funcs
+        if f.exported.is_some() && !std_module(f.declared_in) then exported.push(f.exported.unwrap())
+
+    for symbol in sort_names(exported)
+        for f in p.funcs
+            if f.exported.is_some() && f.exported.unwrap() == symbol
+                out.push((symbol, qualified_name(f.name)))
+                break
+
+    out
+end entries_of
 
 // **Whether a project could be built for a bare machine**, which is what a hosted build's warning
 // about computed module storage is for. The rule:
@@ -1244,6 +1282,15 @@ struct Emitted
     // The `--lib` roots' kept halves the text declares rather than defines (`root_artifact.sysl`),
     // each an archive for the link. Empty for every command but the ones that link.
     archives: Buf[string]
+
+    // The symbols code outside the program enters it by -- `main`, a bare image's own entry, and each
+    // function the program exports -- each beside the name a reader wrote it under. Only
+    // `emit_llvm_text` fills it; `sysl stack` reads it.
+    entries: Buf[(string, string)]
+
+    // What `@stack(calls: m)` says each call through a pointer needs, by the symbol of the function
+    // whose body makes it.
+    stack_assumed: Buf[(string, u64)]
 end Emitted
 
 // The typed tree: every body this compilation could type, in the `funcs:` section the reference
@@ -1266,7 +1313,7 @@ private typed_text(c: Compilation, tables: bool, spans: bool) -> Emitted
     val text = if tables then show_tables(shown) else show_typed_program(shown)
 
     set_typed_spans(was)
-    Emitted(text, report, buf(), buf(), buf())
+    Emitted(text, report, buf(), buf(), buf(), buf(), buf())
 end typed_text
 
 // The typed tree a compilation answers with, and what its analysis reported -- the tree `emit-typed`
@@ -1522,7 +1569,7 @@ build_c_archive(path: string, named_target: Option[string], cc: Option[string], 
 
     headers_refused(path).map_err(said)?
 
-    val lowered = lower_for_c(path, t)?
+    val lowered = lower_for_c(path, t, Some(level))?
 
     if !lowered.emitted.report.is_empty()
         return Err(Reported(analysis_report(lowered.emitted.report)))
@@ -1954,7 +2001,10 @@ end LoweredForC
 // not a C artifact: it is linked by a program that has one, and the library build has already
 // deferred every function reaching computed storage to it. An archive has nobody to defer to, so it
 // carries a constructor of its own where the platform runs one.
-private lower_for_c(path: string, t: Target) -> Result[LoweredForC, Failure]
+//
+// `level` is the optimization the archive is built at, which a `@stack(n)` is checked at; the header
+// alone builds nothing, and checks nothing.
+private lower_for_c(path: string, t: Target, level: Option[string] = None) -> Result[LoweredForC, Failure]
     val program = packaged_compilation_of(path, t, false)?
 
     // **Told there is no entry point before a declaration is read, and that is not a detail.** A
@@ -1993,13 +2043,14 @@ private lower_for_c(path: string, t: Target) -> Result[LoweredForC, Failure]
     val lowered = codegen_with_gaps(kept, t, promotions)
 
     check_aligned_heap(done.an, kept)
+    if level.is_some() then check_stack_bounds(done.an, kept, t, level.unwrap(), promotions, None)
 
     val report = errors_of(done.an.diagnostics())
 
     say_warnings(report, done.an)
 
     Ok(LoweredForC(Emitted(ir_print_module(archive_internalized(lowered.0)), report, lowered.1,
-                           link_required(program.units), buf()),
+                           link_required(program.units), buf(), buf(), buf()),
                    offered_exports(kept.funcs), offered_storage(kept.vals), done.an.header_defines))
 end lower_for_c
 
@@ -2398,7 +2449,8 @@ test_build_restored(path: string, named_target: Option[string],
     // The link is timed as the build child's phases were (`SYSL_TIMINGS=1`).
     phase_start()
 
-    Ok(TestBuild(Emitted(s.text, buf(), buf(), s.links, s.archives), s.tests, t, false, s.dropped_files))
+    Ok(TestBuild(Emitted(s.text, buf(), buf(), s.links, s.archives, buf(), buf()), s.tests, t, false,
+                 s.dropped_files))
 end test_build_restored
 
 // The same for a tree that **is** the standard module (`sysl test <root> --std`), which is how the
@@ -2482,7 +2534,7 @@ private test_build_from(program: Compilation, standalone: bool, level: string,
     if warns then say_warnings(report, ready.an)
 
     val emitted = Emitted(ir_print_module(lowered.0), report, lowered.1,
-                          link_required(program.units), roots.archives)
+                          link_required(program.units), roots.archives, buf(), buf())
 
     phase_done("print")
 

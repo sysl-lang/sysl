@@ -1,0 +1,564 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+import sysl.fs.{make_temp_dir, read_text, remove_dir_all}
+import sysl.text.{join, split, Search}
+
+// `sysl stack`: the deepest stack each way into a program can need, worked out before it runs.
+//
+// **Two facts, each from the stage that knows it.** The program is lowered with the standard
+// module's bodies in the text, so a call into the library is followed rather than guessed at, and
+// clang is handed it at the level and for the machine asked about: once for each function's frame
+// (the stack-usage file `--stack-usage` reads too) and once for the optimized text those frames belong to, whose calls are the call
+// graph. The deepest way down the graph, its frames added up, is the answer.
+//
+// **What cannot be bounded is said to be, with the reason**, never answered with a number:
+//
+//   - a cycle of calls reachable from the entry -- the depth is the recursion's, which no reading
+//     bounds (`@no_recursion` is how a program promises there is none);
+//   - a call through a pointer -- a trait object, a `&Fn` closure, a function pointer -- whose target
+//     the text does not name, in a body that did not say what such a call needs (`@stack(calls: m)`);
+//   - a frame sized at run time, which the back end reports as dynamic.
+//
+// **A C function's frame is not known** -- its code is not in the text -- so it is counted as
+// nothing, and the answer names every C function it reaches.
+
+// One function of the text: its symbol, the functions it calls by name, and whether it calls through
+// a pointer.
+struct IrCalls
+    name: string
+    calls: Buf[string]
+    indirect: bool
+end IrCalls
+
+// What one function needs below its caller.
+enum Depth
+    // A number of bytes, the deepest way down that needs it, and the C functions under it that the
+    // number does not count.
+    Bounded(bytes: u64, path: Buf[string], unknown: Buf[string])
+    Unbounded(why: string)
+
+// Everything the walk down the graph reads, and the answers it has worked out so far.
+struct StackFacts
+    fns: Buf[IrCalls]
+    index: Map[string, usize]
+    frames: Map[string, (u64, bool)]
+
+    // What a call through a pointer is taken to need, by the symbol of the function that makes it,
+    // and why there is no such bound where one is refused.
+    assumed: Map[string, u64]
+    refused: Map[string, string]
+
+    done: Buf[Option[Depth]]
+    on_stack: Buf[bool]
+end StackFacts
+
+// The graph of one text and the frames of the `.su` file, with what each function's calls through a
+// pointer are taken to need.
+private stack_facts(ir: string, frames: Map[string, (u64, bool)], assumed: Map[string, u64],
+                    refused: Map[string, string]) -> &StackFacts
+    val fns = ir_calls_of(ir)
+    var index: Map[string, usize] = map()
+
+    for i in 0..<fns.len()
+        index.put(fns[i].name, i)
+
+    val facts: &StackFacts = StackFacts(fns, index, frames, assumed, refused, buf(), buf())
+
+    for _ in 0..<fns.len()
+        facts.done.push(None)
+        facts.on_stack.push(false)
+
+    facts
+end stack_facts
+
+// What the back end answers with: each function's frame, as the stack-usage file `--stack-usage`
+// reads (`frame_limit.sysl`) writes it, the text its optimizer made of the program at the same level,
+// and the file clang compiled, which each line of the stack-usage file names before the function.
+struct StackUsage
+    su: string
+    optimized: string
+    source: string
+end StackUsage
+
+// The two graphs a depth is asked of.
+//
+// **The optimized text is the one the frames belong to**: a function inlined into three callers has
+// its locals in each of their frames, and walking the written text would count them four times. So
+// the walk is the optimized text's. **What `@stack(calls: m)` says is about the WRITTEN body**,
+// though, and inlining moves a call through a pointer into whatever called it. So each optimized
+// function's calls through a pointer are taken to need the most any function its written self reaches
+// was said to -- and where one of those makes such a call and said nothing, they have no bound. That
+// asks too much only of a body already unbounded for the same reason. A function the optimizer
+// removed is asked of the written text instead, counting its callees' frames in full.
+struct StackAnalysis
+    optimized: &StackFacts
+    written: &StackFacts
+end StackAnalysis
+
+stack_analysis(written_ir: string, usage: StackUsage, assumed: Buf[(string, u64)]) -> &StackAnalysis
+    val frames = frames_of(usage.su, usage.source)
+    var taken: Map[string, u64] = map()
+
+    for item in assumed
+        taken.put(item.0, item.1)
+
+    val written = stack_facts(written_ir, frames, taken, map())
+    val reach = pointer_bounds(written)
+
+    StackAnalysis(stack_facts(usage.optimized, frames, reach.0, reach.1), written)
+end stack_analysis
+
+// The deepest stack a call of one symbol can need, or nothing where neither text defines it.
+depth_of_symbol(an: &StackAnalysis, symbol: string) -> Option[Depth]
+    for facts in [an.optimized, an.written]
+        val at = facts.index.get(symbol)
+
+        if at.is_none() then continue
+
+        var stack: Buf[usize] = buf()
+
+        return Some(depth_of(facts, at.unwrap(), &stack))
+
+    None
+end depth_of_symbol
+
+// For each function of the written text, the most a call through a pointer anywhere it reaches is
+// said to need -- or, where one of them said nothing, why there is no bound.
+private pointer_bounds(written: &StackFacts) -> (Map[string, u64], Map[string, string])
+    var memo: Buf[Option[(bool, u64, string)]] = buf()
+    var on_stack: Buf[bool] = buf()
+
+    for _ in 0..<written.fns.len()
+        memo.push(None)
+        on_stack.push(false)
+
+    var bounded: Map[string, u64] = map()
+    var refused: Map[string, string] = map()
+
+    for i in 0..<written.fns.len()
+        val b = pointer_bound(written, i, &memo, &on_stack)
+
+        if b.0 then bounded.put(written.fns[i].name, b.1) else refused.put(written.fns[i].name, b.2)
+
+    (bounded, refused)
+end pointer_bounds
+
+private pointer_bound(w: &StackFacts, i: usize, memo: *Buf[Option[(bool, u64, string)]],
+                      on_stack: *Buf[bool]) -> (bool, u64, string)
+    if memo[i].is_some() then return memo[i].unwrap()
+
+    // A cycle adds no call through a pointer that the way into it did not already meet.
+    if on_stack[i] then return (true, 0, "")
+
+    val f = w.fns[i]
+    var out: (bool, u64, string) = (true, 0, "")
+
+    if f.indirect
+        out = w.assumed.get(assumed_key(f.name)) match
+            Some(m) -> (true, m, "")
+            None -> (false, 0, unsaid_pointer(f.name))
+    end if
+
+    on_stack[i] = true
+
+    for callee in f.calls
+        if !out.0 then break
+
+        w.index.get(callee) match
+            Some(j) ->
+                val b = pointer_bound(w, j, memo, on_stack)
+
+                if !b.0 then out = b
+                elif b.1 > out.1 then out = (true, b.1, "")
+            None -> ()
+
+    on_stack[i] = false
+    memo[i] = Some(out)
+    out
+end pointer_bound
+
+private unsaid_pointer(symbol: string) -> string =
+    s"'${ir_display(symbol)}' calls through a pointer — a trait object, a '&Fn' closure or a function " +
+    "pointer — whose target is not known, and it says nothing with '@stack(calls: n)'"
+
+// The report for every entry, one line each.
+stack_report_text(an: &StackAnalysis, entries: Buf[(string, string)]) -> string
+    if entries.is_empty() then return "this program has no entry point and exports nothing, so nothing enters it"
+
+    var lines: Buf[string] = buf()
+
+    for entry in entries
+        val head = if entry.0 == entry.1 || entry.1 == "" then entry.0 else s"${entry.0} ('${entry.1}')"
+
+        depth_of_symbol(an, entry.0) match
+            Some(d) -> lines.push(s"$head: ${d.said()}")
+            None -> lines.push(s"$head: no code of its own in this build")
+
+    join(lines.view(), "\n")
+end stack_report_text
+
+impl Depth
+    // The answer as a report line says it.
+    said(self) -> string = self match
+        Bounded(bytes, path, unknown) ->
+            var out = s"$bytes bytes, by ${arrows_text(path)}"
+
+            if !unknown.is_empty()
+                var quoted: Buf[string] = buf()
+
+                for item in sort_names(unknown)
+                    quoted.push(s"'$item'")
+
+                out = out + s", not counting the C it calls: ${join(quoted.view(), ", ")}"
+            end if
+
+            out
+        Unbounded(why) -> s"unbounded — $why"
+end Depth
+
+arrows_text(path: Buf[string]) -> string
+    var quoted: Buf[string] = buf()
+    var last = ""
+
+    for item in path
+        val step = if item.starts_with(PointerStep) then
+            s"a call through a pointer, taken as ${item[PointerStep.len..<item.len]} bytes"
+        else s"'${ir_display(item)}'"
+
+        // An export's thunk and the function it calls are two symbols with one name, and one step to a
+        // reader. A function calling itself is one symbol twice, and two steps.
+        if quoted.is_empty() || quoted[quoted.len() - 1] != step || item == last then quoted.push(step)
+
+        last = item
+
+    join(quoted.view(), " → ")
+end arrows_text
+
+// What a symbol of the text was written as: a root function without its `$$sysl`, every key read as
+// the qualified name a diagnostic gives it.
+ir_display(symbol: string) -> string
+    val suffix = root_symbol("")
+    val at = symbol.index_of(suffix)
+
+    if at.is_some() then
+        return qualified_name(symbol[0..<at.unwrap()] + symbol[at.unwrap() + suffix.len..<symbol.len])
+
+    qualified_name(symbol)
+end ir_display
+
+// **A remembered answer is sound to reuse** even though it was worked out with other functions on the
+// stack: a function that met one of them came back unbounded, and it is -- the cycle it met is
+// reachable from it.
+private depth_of(facts: &StackFacts, i: usize, stack: *Buf[usize]) -> Depth
+    if facts.done[i].is_some() then return facts.done[i].unwrap()
+
+    val f = facts.fns[i]
+    val name = ir_display(f.name)
+
+    if facts.on_stack[i]
+        var cycle: Buf[string] = buf()
+        var from: usize = 0
+
+        for j in 0..<stack.len()
+            if stack[j] == i then from = j
+
+        for j in from..<stack.len()
+            cycle.push(facts.fns[stack[j]].name)
+
+        cycle.push(f.name)
+        return Unbounded(s"'$name' recurses by the cycle ${arrows_text(cycle)}")
+    end if
+
+    val frame = facts.frames.get(f.name).unwrap_or((0, false))
+
+    if frame.1 then return remembered(facts, i, Unbounded(s"'$name' sizes its frame at run time"))
+
+    var best: u64 = 0
+    var best_path: Buf[string] = buf()
+
+    if f.indirect
+        val taken = facts.assumed.get(assumed_key(f.name))
+
+        if taken.is_none() then
+            return remembered(facts, i, Unbounded(facts.refused.get(assumed_key(f.name))
+                                                       .unwrap_or(unsaid_pointer(f.name))))
+
+        best = taken.unwrap()
+        best_path.push(s"$PointerStep${taken.unwrap()}")
+    end if
+
+    facts.on_stack[i] = true
+    stack.push(i)
+
+    var unknown: Buf[string] = buf()
+    var answer: Option[Depth] = None
+
+    for callee in f.calls
+        val j = facts.index.get(callee)
+
+        if j.is_none()
+            if !callee.starts_with("llvm.") && !holds_string(unknown, callee) then unknown.push(callee)
+            continue
+        end if
+
+        depth_of(facts, j.unwrap(), stack) match
+            Unbounded(why) ->
+                answer = Some(Unbounded(why))
+                break
+            Bounded(bytes, path, more) ->
+                if best_path.is_empty() || bytes > best
+                    best = bytes
+                    best_path = path
+
+                for item in more
+                    if !holds_string(unknown, item) then unknown.push(item)
+
+    stack.truncate(stack.len() - 1)
+    facts.on_stack[i] = false
+
+    if answer.is_some() then return remembered(facts, i, answer.unwrap())
+
+    var path: Buf[string] = buf()
+
+    path.push(f.name)
+
+    for item in best_path
+        path.push(item)
+
+    remembered(facts, i, Bounded(frame.0 + best, path, unknown))
+end depth_of
+
+private remembered(facts: &StackFacts, i: usize, d: Depth) -> Depth
+    facts.done[i] = Some(d)
+    d
+
+// A step of a path that is a call through a pointer, taken as the bytes after it.
+private const PointerStep: string = "\t"
+
+// The symbol an assumption is filed under: a function's own, which its owned body (`f.owned`) shares.
+assumed_key(symbol: string) -> string = if symbol.ends_with(".owned") then symbol[0..<symbol.len - 6] else symbol
+
+// -- reading the two texts ------------------------------------------------------------------------
+
+// Every function the text defines, with what its body calls.
+ir_calls_of(ir: string) -> Buf[IrCalls]
+    var out: Buf[IrCalls] = buf()
+    var hooks: Buf[string] = buf()
+    var name = ""
+    var calls: Buf[string] = buf()
+    var indirect = false
+    var inside = false
+
+    for line in lines_of(ir)
+        if line.starts_with("define ")
+            name = symbol_after(line, line.index_of("@").unwrap_or(0))
+            calls = buf()
+            indirect = false
+            inside = true
+
+            if hook_shaped(line) then hooks.push(name)
+
+            continue
+        end if
+
+        if !inside then continue
+
+        if line == "}"
+            out.push(IrCalls(name, calls, indirect))
+            inside = false
+            continue
+        end if
+
+        val at = call_at(line)
+
+        if at.is_none() then continue
+
+        callee_of(line, at.unwrap()) match
+            Some(c) ->
+                if c.0 && !holds_string(calls, c.1) then calls.push(c.1)
+                if !c.0 then indirect = true
+            None -> ()
+
+    // **A destructor is called through the header of the object it tears down**, by the two runtime
+    // functions that read the header (`arc_runtime.sysl`, which keeps both out of line). Which
+    // destructor is the object's is decided at run time, so each of the two calls every function shaped
+    // as a hook is -- `void (ptr, i1, ptr)` -- by name, and makes no call through a pointer the program
+    // could be asked to bound.
+    var answered: Buf[IrCalls] = buf()
+
+    for f in out
+        if holds_string(hook_callers(), f.name) then
+            answered.push(IrCalls(f.name, joined_calls(f.calls, hooks), false))
+        else answered.push(f)
+
+    answered
+end ir_calls_of
+
+// The runtime functions whose one call through a pointer runs a destructor.
+private hook_callers() -> Buf[string]
+    var out: Buf[string] = buf()
+
+    out.push("arc.destroy")
+    out.push("arc.unshare")
+    out
+end hook_callers
+
+private joined_calls(a: Buf[string], b: Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for item in a
+        out.push(item)
+
+    for item in b
+        if !holds_string(out, item) then out.push(item)
+
+    out
+end joined_calls
+
+// Whether a `define` line is shaped as a destructor hook: it answers nothing and takes a pointer, a
+// flag and a pointer. A parameter's type is the first word of it, whatever attributes the optimizer
+// wrote after.
+private hook_shaped(line: string) -> bool
+    val at = line.index_of("@")
+
+    if at.is_none() || line[0..<at.unwrap()].index_of(" void ").is_none() then return false
+
+    val open = line[at.unwrap()..<line.len].index_of("(")
+    val close = line.index_of(")")
+
+    if open.is_none() || close.is_none() then return false
+
+    val inner = line[at.unwrap() + open.unwrap() + 1..<close.unwrap()]
+    var types: Buf[string] = buf()
+
+    for part in split(inner, ", ")
+        val space = part.index_of(" ")
+
+        types.push(if space.is_some() then part[0..<space.unwrap()] else part)
+
+    types.len() == 3 && types[0] == "ptr" && types[1] == "i1" && types[2] == "ptr"
+end hook_shaped
+
+// Where a line's `call` or `invoke` begins, or nothing where the line makes no call.
+private call_at(line: string) -> Option[usize]
+    for word in [" call ", " invoke "]
+        val at = line.index_of(word)
+
+        if at.is_some() then return Some(at.unwrap() + word.len)
+
+    None
+
+// The callee of a call: `(true, symbol)` for one by name, `(false, "")` for one through a register.
+// Inline assembly calls nothing. The callee is the first `@name` or `%name` followed by `(`; a
+// function type written before it (`i32 (ptr, ...)`) holds neither.
+private callee_of(line: string, from: usize) -> Option[(bool, string)]
+    val bytes = line.bytes
+    var i = from
+
+    if line[from..<line.len].index_of(" asm ").is_some() || line[from..<line.len].starts_with("asm ") then
+        return None
+
+    while i < bytes.len
+        val c = bytes[i]
+
+        if c == u8('@') || c == u8('%')
+            val name = symbol_after(line, i)
+            val after = i + 1 + name_span(line, i)
+
+            if after < bytes.len && bytes[after] == u8('(') then
+                return Some((c == u8('@'), if c == u8('@') then name else ""))
+
+            i = after
+            continue
+        end if
+
+        i += 1
+
+    None
+end callee_of
+
+// The name a sigil at `at` introduces, unquoted.
+private symbol_after(line: string, at: usize) -> string
+    val bytes = line.bytes
+    val start = at + 1
+
+    if start < bytes.len && bytes[start] == u8('"')
+        val close = line[start + 1..<line.len].index_of("\"").unwrap_or(0)
+
+        return line[start + 1..<start + 1 + close]
+    end if
+
+    var end_at = start
+
+    while end_at < bytes.len && name_byte(bytes[end_at])
+        end_at += 1
+
+    line[start..<end_at]
+end symbol_after
+
+// How many bytes after the sigil the name takes, its quotes included.
+private name_span(line: string, at: usize) -> usize
+    val bytes = line.bytes
+    val start = at + 1
+
+    if start < bytes.len && bytes[start] == u8('"') then
+        return line[start + 1..<line.len].index_of("\"").unwrap_or(0) + 2
+
+    var end_at = start
+
+    while end_at < bytes.len && name_byte(bytes[end_at])
+        end_at += 1
+
+    end_at - start
+end name_span
+
+private name_byte(b: u8) -> bool =
+    (b >= u8('a') && b <= u8('z')) || (b >= u8('A') && b <= u8('Z')) || (b >= u8('0') && b <= u8('9')) ||
+    b == u8('$') || b == u8('.') || b == u8('_') || b == u8('-')
+
+// Each function's frame out of the stack-usage file clang wrote compiling `source`, read as
+// `--stack-usage` reads it (`frame_rows`), with whether the back end sized it at run time.
+// `dynamic,bounded` is a frame whose size is a bound, and is one.
+frames_of(su: string, source: string) -> Map[string, (u64, bool)]
+    var out: Map[string, (u64, bool)] = map()
+
+    for row in frame_rows(su, source)
+        out.put(row.2, (u64(row.0), row.1 == "dynamic"))
+
+    out
+end frames_of
+
+// -- the build that answers -----------------------------------------------------------------------
+
+// The frames the back end lays out for a lowered text, in the stack-usage file `--stack-usage` asks
+// for the same way (`stack_usage_flags`).
+//
+// Two runs of the same clang line: the object, for the frames, and the optimized text, for the calls
+// the frames belong to. `-S` stops the second short of the object the `-c` before it asks for.
+stack_usage_of(ir: string, t: Target, level: string) -> Result[StackUsage, string]
+    val cc = find_clang(t, None)?
+    val dir = make_temp_dir("sysl-stack").map_err(_ -> "cannot make a scratch directory")?
+    val frames_flags = stack_usage_flags(s"$dir/stack.su")
+    var text_flags: Buf[string] = buf()
+
+    text_flags.push("-S")
+    text_flags.push("-emit-llvm")
+    text_flags.push("-Wno-unused-command-line-argument")
+
+    val made = compile_object(cc, ir, s"$dir/stack.o", t, level, false, frames_flags)
+    val su = read_text(s"$dir/stack.su")
+    val shown = if made.is_ok() then compile_object(cc, ir, s"$dir/optimized.ll", t, level, false, text_flags)
+    else Ok(())
+    val optimized = read_text(s"$dir/optimized.ll")
+
+    remove_dir_all(dir).unwrap_or(())
+    made?
+    shown?
+
+    val frames = su.map_err(_ -> s"$cc wrote no stack-usage file — it may not be a clang that supports '-stack-usage-file'")?
+
+    // `compile_object` hands clang the text as `<obj>.ll`, which each line of the file names.
+    Ok(StackUsage(frames, optimized.map_err(_ -> s"$cc wrote no optimized text")?, s"$dir/stack.o.ll"))
+end stack_usage_of

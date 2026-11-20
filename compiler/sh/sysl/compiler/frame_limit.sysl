@@ -325,14 +325,25 @@ frame_flags(text: string, ll: string) -> Buf[string]
     if frame_limited(text) then out.push("-Werror=frame-larger-than")
 
     if frame_reported()
-        out.push("-Xclang")
-        out.push("-stack-usage-file")
-        out.push("-Xclang")
-        out.push(s"$ll.su")
-    end if
+        val asked = stack_usage_flags(s"$ll.su")
+
+        for item in asked
+            out.push(item)
 
     out
 end frame_flags
+
+// What a clang is told to write every frame it lays out to `file` with: the one way both this
+// report and `sysl stack` (`stack_report.sysl`) ask for the frames, read back by `frame_rows`.
+stack_usage_flags(file: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    out.push("-Xclang")
+    out.push("-stack-usage-file")
+    out.push("-Xclang")
+    out.push(file)
+    out
+end stack_usage_flags
 
 // Whether the frames of a compile are laid out at the link rather than by it: under link-time
 // optimization, whose compile writes bitcode.
@@ -511,14 +522,28 @@ frames_read(ll: string)
     read_text(file) match
         Err(_) -> return
         Ok(text) ->
-            for line in split(text, "\n")
-                stack_row(line, ll) match
-                    Some(row) -> fl_rows.push(row)
-                    None -> ()
+            val rows = frame_rows(text, ll)
+
+            for row in rows
+                fl_rows.push(row)
 
     remove_file(file).unwrap_or(())
     write_stack_report()
 end frames_read
+
+// Every row of a stack-usage file clang wrote compiling `ll`, each `(bytes, kind, symbol)`: the
+// symbol as the definition spelled it, the kind `static`, `dynamic` or `dynamic,bounded`. A line
+// that is not one is skipped. `sysl stack` reads its frames with it too (`stack_report.sysl`).
+frame_rows(text: string, ll: string) -> Buf[(long, string, string)]
+    var out: Buf[(long, string, string)] = buf()
+
+    for line in split(text, "\n")
+        stack_row(line, ll) match
+            Some(row) -> out.push(row)
+            None -> ()
+
+    out
+end frame_rows
 
 // One line of a stack-usage file -- `<file>:<function>\t<bytes>\t<kind>` -- as a row.
 private stack_row(line: string, ll: string) -> Option[(long, string, string)]
