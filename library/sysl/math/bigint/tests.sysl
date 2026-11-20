@@ -1025,6 +1025,220 @@ squaring_against_plain()
     assert_eq(square(from_int(-3)), from_int(9))
 end squaring_against_plain
 
+/** `n` limbs, every bit set. */
+private all_ones(n: usize) -> BigInt = sub(shl(one(), n * limb_bits), one())
+
+/** `limbs` limbs of which long runs are all `fill` and the rest random, the top limb non-zero. Built
+ * limb by limb, like `random_big`, so the multiply under test does not shape it.
+ */
+private random_runs(g: *Rng, limbs: usize, fill: Limb) -> BigInt
+    var out: Buf[Limb] = buf()
+    var run: usize = 0
+
+    for i in 0..<limbs
+        if run == 0 && g.next_u64() % 4 == 0 then run = usize(g.next_u64() % (limbs / 4 + 2))
+
+        if run > 0 && i + 1 < limbs
+            out.push(fill)
+            run -= 1
+        else
+            out.push(Limb(g.next_u64()) | 1)
+
+    BigInt(false, trimmed(out))
+end random_runs
+
+// -- the transform ----------------------------------------------------------------------------------
+//
+// **The transform is checked three ways.** Its constants against their definitions, since a wrong
+// root of unity is a transform of the wrong thing at every size. Its products at small sizes against
+// the plain product, by calling it directly -- every length up to a few hundred limbs, the ones
+// whose product length is exactly a power of two among them, where the cyclic transform has no
+// spare coefficient. And its products at its own threshold against Toom-3 called directly, with
+// every bit set (the largest coefficients a convolution can have, which is what the three primes'
+// size is for) and with long runs of zero limbs.
+
+#if ptr64
+
+/** `a * b` by the transform, at any size. */
+private by_transform(a: BigInt, b: BigInt) -> BigInt
+    if a.is_zero() || b.is_zero() then return zero()
+    if a.mag.len < b.mag.len then return by_transform(b, a)
+
+    val len = a.mag.len + b.mag.len
+    var out = fresh(len)
+
+    fft_mul(out, a.mag, a.mag.len, b.mag, b.mag.len)
+    BigInt(a.minus != b.minus, finished(out, len))
+end by_transform
+
+/** `a * a` by the transform's squaring, at any size. */
+private square_by_transform(a: BigInt) -> BigInt
+    if a.is_zero() then return zero()
+
+    var out = fresh(a.mag.len * 2)
+
+    fft_sqr(out, a.mag, a.mag.len)
+    BigInt(false, finished(out, a.mag.len * 2))
+end square_by_transform
+
+/** `a * b` by Toom-3 at the top, for `a` at least as long as `b` and `b` reaching its top third. */
+private by_toom(a: BigInt, b: BigInt) -> BigInt
+    val len = a.mag.len + b.mag.len
+    var out = fresh(len)
+
+    toom3(out, a.mag, a.mag.len, b.mag, b.mag.len)
+    BigInt(a.minus != b.minus, finished(out, len))
+end by_toom
+
+@test("the transform's primes, roots and remainder constants are what they claim")
+ntt_prime_constants()
+    for pr in [prime1, prime2, prime3]
+        assert(pr.p < u64(1) << 62)
+        assert_eq((pr.p - 1) % (u64(1) << pr.log_order), 0)
+        assert_eq(pr.p *% pr.neg_inv, ~u64(0))
+        assert_eq(u128(pr.r2), (~u128(0) % u128(pr.p) + 1) % u128(pr.p))
+
+        // Of order exactly `2^k`: its `2^(k - 1)`th power is -1, not 1.
+        var w = pr.root
+
+        for _ in 0..<(pr.log_order - 1) do w = mul_mod(w, w, pr)
+
+        assert_eq(w, pr.p - 1)
+
+        // Of order exactly 3.
+        assert_eq((pr.p - 1) % 3, 0)
+        assert(pr.cube != 1)
+        assert_eq(mul_mod(mul_mod(pr.cube, pr.cube, pr), pr.cube, pr), 1)
+
+    assert(prime1.p < prime2.p && prime2.p < prime3.p)
+    assert_eq(u128(prime1.p) * u128(inv_p1_mod_p2) % u128(prime2.p), 1)
+
+    val p12 = u128(prime1.p) * u128(prime2.p)
+
+    assert_eq(p12, u128(p12_hi) << 64 | u128(p12_lo))
+    assert_eq(p12 % u128(prime3.p) * u128(inv_p12_mod_p3) % u128(prime3.p), 1)
+end ntt_prime_constants
+
+@test("a transform is the shortest power of two or three times one that holds the product")
+transform_lengths()
+    for need in 1..<5000
+        val s = shape_for(need)
+        val n = if s.three then s.m * 3 else s.m
+
+        assert_eq(s.m & (s.m - 1), 0)
+
+        // The shortest of every `2^k` and every `3 2^k` at least `need` long, found by trying them.
+        var best: usize = 0
+        var k: usize = 1
+
+        while best == 0 || k < best
+            if k >= need && (best == 0 || k < best) then best = k
+            if k >= 2 && k * 3 >= need && (best == 0 || k * 3 < best) then best = k * 3
+            k *= 2
+
+        assert_eq(n, best)
+
+    assert_eq(shape_for(6).three, true)
+    assert_eq(shape_for(6).m, 2)
+    assert_eq(shape_for(7).m, 8)
+    assert_eq(shape_for(24576).m, 8192)
+    assert_eq(shape_for(24577).three, false)
+    assert_eq(shape_for(24577).m, 32768)
+end transform_lengths
+
+@test("the transform agrees with the plain product at small sizes, lengths exactly full included")
+transform_against_plain()
+    var g = rng(2026, 11)
+
+    // `(5, 4)`, `(9, 8)`, `(17, 16)`, `(33, 32)` and `(65, 64)` have products exactly a power of two
+    // coefficients long, and `(4, 3)`, `(7, 6)`, `(13, 12)`, `(25, 24)` and `(49, 48)` exactly three
+    // times one -- the transform's every point is a coefficient and the top limb is carry.
+    val a_lens: [21]usize = [1, 2, 3, 4, 5, 7, 8, 9, 12, 13, 16, 17, 25, 31, 33, 49, 64, 65, 97, 100, 257]
+    val b_lens: [21]usize = [1, 2, 3, 4, 5, 6, 8, 9, 12, 13, 15, 16, 17, 24, 25, 32, 33, 48, 49, 64, 100]
+
+    for an in a_lens
+        for bn in b_lens
+            if bn > an then continue
+
+            val a = random_big(&g, an, an % 2 == 0)
+            val b = random_big(&g, bn, bn % 3 == 0)
+
+            assert_eq(by_transform(a, b), naive_mul(a, b))
+
+        val a = random_big(&g, an, false)
+        val ones = all_ones(an)
+
+        assert_eq(by_transform(ones, ones), naive_mul(ones, ones))
+        assert_eq(by_transform(ones, a), naive_mul(ones, a))
+        assert_eq(square_by_transform(a), naive_mul(a, a))
+        assert_eq(square_by_transform(ones), naive_mul(ones, ones))
+
+    // The largest coefficients a few hundred limbs can make, and a power of two: one non-zero
+    // coefficient, the rest exactly zero.
+    val big_ones = all_ones(600)
+
+    assert_eq(square_by_transform(big_ones), naive_mul(big_ones, big_ones))
+    assert_eq(square_by_transform(shl(one(), 300 * limb_bits + 5)), shl(one(), 600 * limb_bits + 10))
+end transform_against_plain
+
+@test("the transform agrees with Toom-3 across its threshold, balanced and not, zero runs and all ones")
+transform_against_toom()
+    var g = rng(118, 2)
+    val t = fft_threshold
+
+    for an in [t - 1, t, t + 1, t * 2 + 3]
+        // From `a`'s own length down to the shortest `b` that Toom-3 still takes.
+        for bn in [an, an - an / 7, an * 2 / 3 + 3]
+            val a = random_big(&g, an, false)
+            val b = random_big(&g, bn, true)
+            val want = by_toom(a, b)
+
+            assert_eq(by_transform(a, b), want)
+            assert_eq(mul(a, b), want)
+
+            val z = random_runs(&g, an, 0)
+            val o = random_runs(&g, bn, ~Limb(0))
+
+            assert_eq(mul(z, o), by_toom(z, o))
+
+        val ones = all_ones(an)
+
+        assert_eq(mul(ones, ones), by_toom(ones, ones))
+
+    // Unbalanced past the threshold, which the transform takes whole rather than in pieces.
+    val a = random_big(&g, t * 3 + 5, false)
+    val b = random_big(&g, t, false)
+
+    assert_eq(mul(a, b), naive_mul(a, b))
+end transform_against_toom
+
+@test("a square agrees with the plain product across the transform's squaring threshold")
+transform_square_against_plain()
+    var g = rng(9, 9)
+    val t = fft_sqr_threshold
+
+    for n in [t - 1, t, t + 1, t * 2 + 1]
+        val a = random_big(&g, n, true)
+        val want = naive_mul(a, a)
+
+        assert_eq(square(a), want)
+        assert_eq(square_by_transform(a), want)
+
+        val ones = all_ones(n)
+
+        assert_eq(square(ones), naive_mul(ones, ones))
+
+        val z = random_runs(&g, n, 0)
+
+        assert_eq(square(z), naive_mul(z, z))
+
+        val o = random_runs(&g, n, ~Limb(0))
+
+        assert_eq(square(o), naive_mul(o, o))
+end transform_square_against_plain
+
+#endif
+
 @test("the recursive division agrees with algorithm D, and with the identity, across its threshold")
 recursive_division_against_algorithm_d()
     var g = rng(42, 17)
@@ -1195,3 +1409,277 @@ lehmer_fibonacci()
     assert_eq(gcd(fib[4500], fib[4499]), one())
     assert_eq(gcd(fib[2310], fib[1001]), fib[77])
 end lehmer_fibonacci
+
+// -- the half-gcd, the extended gcd and the modular inverse ----------------------------------------
+//
+// `gcd`, `gcd_ext` and `mod_inverse` reduce through `half_gcd.sysl` from `gcd_dc_threshold` limbs,
+// which a debug suite cannot afford at every shape. So the internal entries take the thresholds as
+// parameters, and these tests push them down to a handful of limbs: every route of the recursion --
+// both recursive calls, the steps between them, the Lehmer step held above the floor and the division
+// that takes one quotient less -- then runs on values a few dozen limbs long, against Lehmer's loop
+// with the half-gcd switched off. Agreement with GMP from 1 to 20,000 limbs, across the real
+// thresholds, is checked outside the suite against the `gmp` package; what pins GMP's answer here is
+// that its cofactors are the unique pair inside the bounds `check_ext` asserts.
+
+private big_of(m: []const Limb) -> BigInt = normalized(false, m)
+
+/** A threshold no test value reaches: the half-gcd off, Lehmer's loop alone. */
+private val never: usize = 1 << 40
+
+/** Lehmer's gcd with the half-gcd switched off -- the reference the half-gcd is checked against. */
+private lehmer_gcd(a: BigInt, b: BigInt) -> BigInt = big_of(gcd_mag(a.mag, b.mag, never, never))
+
+/** Asserts what `hgcd` promises of `(a, b)` at `threshold`, answering whether it moved: the pair is
+ * `M (alpha; beta)` exactly, `M` has determinant one, both values are more than `s` limbs long, and
+ * the reduction went as far as it goes -- the two are within `2^(s w)` of each other.
+ */
+private check_hgcd(a: BigInt, b: BigInt, threshold: usize) -> bool
+    val r = hgcd(a.mag, b.mag, threshold)
+    val n = if a.mag.len > b.mag.len then a.mag.len else b.mag.len
+    val s = n / 2 + 1
+    val alpha = big_of(r.a)
+    val beta = big_of(r.b)
+    val u00 = big_of(r.u00)
+    val u01 = big_of(r.u01)
+    val u10 = big_of(r.u10)
+    val u11 = big_of(r.u11)
+
+    assert_eq(add(mul(u00, alpha), mul(u01, beta)), a)
+    assert_eq(add(mul(u10, alpha), mul(u11, beta)), b)
+    assert_eq(sub(mul(u00, u11), mul(u01, u10)), one())
+
+    if !r.moved then return false
+
+    assert(r.a.len > s && r.b.len > s)
+    assert(abs(sub(alpha, beta)).mag.len <= s)
+
+    true
+end check_hgcd
+
+/** The first `count` Fibonacci numbers, from F(0). */
+private fibonacci(count: usize) -> Buf[BigInt]
+    var fib: Buf[BigInt] = buf()
+
+    fib.push(zero())
+    fib.push(one())
+
+    for i in 2..<count do fib.push(add(fib[i - 1], fib[i - 2]))
+
+    fib
+
+@test("Lehmer's window reaches past two limbs when the top limb is short, at every shift")
+lehmer_window_shifts()
+    // The window is two limbs less two bits read from the top bit down, so a top limb with `k`
+    // leading zeros puts `k - 2` of its bits in the third limb from the top. A window that stopped
+    // at two limbs read those as zeros and certified quotients that were wrong.
+    var g = rng(6502, 8)
+
+    for k in 0..<limb_bits
+        val top = random_big(&g, 1, false)
+        val x = add(shl(shr(top, k), 4 * limb_bits), random_big(&g, 4, false))
+        val y = add(shl(shr(random_big(&g, 1, false), k), 4 * limb_bits), random_big(&g, 4, false))
+
+        if x.is_zero() || y.is_zero() then continue
+
+        assert_eq(lehmer_gcd(x, y), plain_gcd(x, y))
+        assert_eq(lehmer_gcd(mul(x, top), mul(y, top)), plain_gcd(mul(x, top), mul(y, top)))
+end lehmer_window_shifts
+
+@test("the half-gcd's reduction is exact, unimodular, above its floor and as far as it goes")
+hgcd_invariants()
+    var g = rng(4242, 8)
+    var moved = 0
+
+    for k in 0..<90
+        val n = 3 + usize(k % 45)
+        val m = if k % 3 == 0 then n else n - usize(k % 4)
+        val a = random_big(&g, n, false)
+        val b = random_big(&g, if m == 0 then 1 else m, false)
+
+        // The same pair, recursing from 4 limbs and from 8, and stepping only.
+        for t in [4, 8, never]
+            if check_hgcd(a, b, t) then moved += 1
+
+    // Not a vacuous pass: nearly every pair has a top half to reduce.
+    assert(moved > 200)
+end hgcd_invariants
+
+@test("the half-gcd reduces Fibonacci pairs, every quotient one, exactly")
+hgcd_fibonacci()
+    val fib = fibonacci(3001)
+
+    for i in [400, 1000, 2999]
+        assert(check_hgcd(fib[i + 1], fib[i], 4))
+        assert(check_hgcd(fib[i], fib[i + 1], 6))
+
+@test("the half-gcd refuses a pair already at its floor, and leaves it as it was")
+hgcd_at_floor()
+    var g = rng(77, 8)
+    val a = random_big(&g, 20, false)
+
+    // Equal operands, an operand of `s` limbs or fewer, and two within 2^(s w) of each other.
+    assert(!check_hgcd(a, a, 4))
+    assert(!check_hgcd(a, random_big(&g, 11, false), 4))
+    assert(!check_hgcd(a, add(a, random_big(&g, 10, false)), 4))
+    assert(!check_hgcd(zero(), a, 4))
+
+@test("gcd through the half-gcd agrees with Lehmer's loop around every threshold")
+hgcd_gcd_against_lehmer()
+    var g = rng(9001, 8)
+    val splits: [3]usize = [4, 9, 24]
+
+    for k in 0..<80
+        val n = 1 + usize(k % 70)
+        val m = if k % 4 == 0 then n else 1 + usize((k * 7) % 70)
+        val c = random_big(&g, 1 + usize(k % 5), false)
+        val a = mul(random_big(&g, n, k % 2 == 0), c)
+        val b = mul(random_big(&g, m, k % 3 == 0), c)
+        val want = lehmer_gcd(a, b)
+
+        for dc in splits
+            for t in [4, 7, 16, never]
+                assert_eq(big_of(gcd_mag(a.mag, b.mag, dc, t)), want)
+
+        assert_eq(gcd(a, b), want)
+end hgcd_gcd_against_lehmer
+
+@test("gcd through the half-gcd on Fibonacci pairs, a shared factor, and the uneven shapes")
+hgcd_gcd_shapes()
+    val fib = fibonacci(4501)
+    var g = rng(31337, 8)
+    val big = random_big(&g, 60, false)
+    val small = random_big(&g, 2, false)
+    val f = random_big(&g, 25, false)
+    val thresholds: [3]usize = [4, 6, 12]
+
+    for t in thresholds
+        assert_eq(big_of(gcd_mag(fib[4500].mag, fib[4499].mag, 4, t)), one())
+        assert_eq(big_of(gcd_mag(fib[4500].mag, fib[3000].mag, 4, t)), fib[1500])
+        assert_eq(big_of(gcd_mag(fib[2310].mag, fib[1001].mag, 4, t)), fib[77])
+
+        // One a multiple of the other, equal, one zero, and huge against small.
+        assert_eq(big_of(gcd_mag(mul(big, f).mag, big.mag, 4, t)), big)
+        assert_eq(big_of(gcd_mag(big.mag, big.mag, 4, t)), big)
+        assert_eq(big_of(gcd_mag(big.mag, empty(), 4, t)), big)
+        assert_eq(big_of(gcd_mag(empty(), big.mag, 4, t)), big)
+        assert_eq(big_of(gcd_mag(big.mag, small.mag, 4, t)), lehmer_gcd(big, small))
+
+        // A large common factor, so the answer is many limbs long.
+        val a = mul(f, random_big(&g, 30, false))
+        val b = mul(f, random_big(&g, 31, false))
+
+        assert_eq(big_of(gcd_mag(a.mag, b.mag, 4, t)), lehmer_gcd(a, b))
+end hgcd_gcd_shapes
+
+/** Asserts that `(gv, s, t)` is `gcd_ext(a, b)`: the gcd, Bézout's identity, and GMP's choice of
+ * cofactors -- `|s| < |b| / 2g` and `|t| < |a| / 2g`, with the cases the bounds leave empty decided
+ * the way `gcd_ext`'s docstring says.
+ */
+private check_ext(a: BigInt, b: BigInt, gv: BigInt, s: BigInt, t: BigInt)
+    assert_eq(gv, lehmer_gcd(a, b))
+    assert_eq(add(mul(a, s), mul(b, t)), gv)
+
+    val sa = from_int(long(a.sign()))
+    val sb = from_int(long(b.sign()))
+    val two_g = mul_long(gv, 2)
+
+    if cmp(abs(a), abs(b)) == 0
+        assert_eq(s, zero())
+        assert_eq(t, sb)
+    elif b.is_zero()
+        assert_eq(s, sa)
+        assert_eq(t, zero())
+    elif a.is_zero()
+        assert_eq(s, zero())
+        assert_eq(t, sb)
+    else
+        if cmp(abs(b), two_g) == 0 then assert_eq(s, sa) else assert(cmp(mul(abs(s), two_g), abs(b)) < 0)
+        if cmp(abs(a), two_g) == 0 then assert_eq(t, sb) else assert(cmp(mul(abs(t), two_g), abs(a)) < 0)
+end check_ext
+
+@test("the extended gcd on values a reader can check, and every case the bounds leave empty")
+gcd_ext_named()
+    val (g1, s1, t1) = gcd_ext(from_int(240), from_int(46))
+
+    assert_eq(g1, from_int(2))
+    assert_eq(s1, from_int(-9))
+    assert_eq(t1, from_int(47))
+
+    for (a, b) in [(240, 46), (-240, 46), (240, -46), (-240, -46), (0, 0), (0, 5), (0, -5), (5, 0),
+            (-5, 0), (7, 7), (7, -7), (-7, 7), (6, 4), (4, 6), (3, 6), (6, 3), (2, 3), (3, 2),
+            (1, 1), (1, 0), (0, 1), (12, 18), (17, 5), (-17, 5), (10, 4), (-10, 4)]
+        val x = from_int(a)
+        val y = from_int(b)
+        val (gv, s, t) = gcd_ext(x, y)
+
+        check_ext(x, y, gv, s, t)
+
+    val (g0, s0, t0) = gcd_ext(zero(), zero())
+
+    assert_eq(g0, zero())
+    assert_eq(s0, zero())
+    assert_eq(t0, zero())
+end gcd_ext_named
+
+@test("the extended gcd through the half-gcd keeps Bézout's identity and GMP's cofactors")
+gcd_ext_against_bounds()
+    var g = rng(271828, 8)
+
+    for k in 0..<60
+        val n = 1 + usize(k % 50)
+        val m = if k % 3 == 0 then n else 1 + usize((k * 5) % 50)
+        val c = random_big(&g, 1 + usize(k % 4), false)
+        val a = mul(random_big(&g, n, k % 2 == 0), c)
+        val b = mul(random_big(&g, m, k % 5 == 0), c)
+
+        for (dc, t) in [(4, 4), (6, 9), (never, never)]
+            val (gv, s, tt) = gcd_ext_with(a, b, dc, t)
+
+            check_ext(a, b, gv, s, tt)
+end gcd_ext_against_bounds
+
+@test("the extended gcd on Fibonacci pairs, multiples, equal values and huge against small")
+gcd_ext_shapes()
+    val fib = fibonacci(2001)
+    var g = rng(161803, 8)
+    val big = random_big(&g, 40, true)
+    val small = random_big(&g, 1, false)
+    val thresholds: [2]usize = [4, 7]
+
+    for (a, b) in [(fib[2000], fib[1999]), (fib[1999], fib[2000]), (fib[2000], fib[1000]),
+            (mul(big, small), big), (big, mul(big, small)), (big, big), (big, negate(big)),
+            (big, small), (small, big), (big, zero()), (zero(), big), (mul_long(small, 2), small)]
+        for t in thresholds
+            val (gv, s, tt) = gcd_ext_with(a, b, 4, t)
+
+            check_ext(a, b, gv, s, tt)
+
+        val (gv, s, tt) = gcd_ext(a, b)
+
+        check_ext(a, b, gv, s, tt)
+end gcd_ext_shapes
+
+@test("the modular inverse, where there is one and where there is not")
+mod_inverse_cases()
+    assert_eq(mod_inverse(from_int(3), from_int(7)), Some(from_int(5)))
+    assert_eq(mod_inverse(from_int(-3), from_int(7)), Some(from_int(2)))
+    assert_eq(mod_inverse(from_int(3), from_int(-7)), Some(from_int(-2)))
+    assert_eq(mod_inverse(from_int(10), from_int(7)), Some(from_int(5)))
+    assert_eq(mod_inverse(from_int(2), from_int(4)), None)
+    assert_eq(mod_inverse(zero(), from_int(7)), None)
+    assert_eq(mod_inverse(from_int(5), one()), Some(zero()))
+    assert_eq(mod_inverse(from_int(5), from_int(-1)), Some(zero()))
+
+    var g = rng(1729, 8)
+    val p = sub(two_pow(521), one())
+
+    for k in 0..<30
+        val a = random_big(&g, 1 + usize(k % 40), k % 2 == 0)
+        val m = if k % 3 == 0 then p else random_big(&g, 1 + usize((k * 3) % 40), false)
+
+        mod_inverse(a, m) match
+            Some(x) ->
+                assert(cmp(x, zero()) >= 0 && cmp(x, m) < 0)
+                assert_eq(mod_floor(mul(a, x), m), mod_floor(one(), m))
+            None -> assert(cmp(gcd(a, m), one()) != 0)
+end mod_inverse_cases

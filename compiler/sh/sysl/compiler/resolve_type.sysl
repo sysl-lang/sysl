@@ -246,6 +246,10 @@ private volatile_admits(a: &Analysis, scope: Scope, span: Span, t: Type) -> bool
             s"'$shown' carries a payload beside its tag, so touching one is more than the single " +
             "access the qualifier promises. A register field that is a set of named values is a " +
             "simple enum, which is one integer"
+        Abstract(name, bounds) ->
+            if scalar_family(bounds) then return true
+
+            volatile_refusal(Unknown, shown) + unproven_scalar(name)
         _ ->
             if erased(t)
                 "an object over a trait is a pair of words, so touching one is two accesses whatever " +
@@ -273,10 +277,38 @@ private volatile_refusal(t: Type, shown: string) -> string = t match
     _ -> "'volatile' qualifies a scalar or a raw pointer, since it promises the one load or the " +
          "one store the source wrote and nothing else"
 
+// Whether every type a parameter with these bounds can stand for is a scalar: one of them names a
+// **closed** family whose members are all scalars. `Integer` is the one -- its membership is the
+// compiler's, and every member is one integer. An open trait (`Float`, `Bits`, `Add`) is not
+// enough however scalar its implementations are today, since a program may implement it for a type
+// of its own, and the instantiation at that type would be a `volatile` the position refuses.
+private scalar_family(bounds: Buf[Bound]) -> bool
+    for b in bounds
+        val spelling = library_spelling(b.name)
+
+        if spelling.is_some() && core_closed(spelling.unwrap()) then return true
+
+    false
+end scalar_family
+
+// Why a parameter is not known to be a scalar. It names no bound: a generic struct's fields are read
+// again under the bounds a derived member adds, and one wording is what lets the two readings report
+// once.
+private unproven_scalar(name: string) -> string =
+    s" -- and nothing bounds '$name' to the scalars: unbounded, or bounded by a trait a struct, a " +
+    "string or a type of the program's own may meet, it may stand for one. Bound it by 'Integer', " +
+    s"a family every member of which is one integer, as '[$name: Integer]'"
+
 private volatile_counted() -> string =
     "the qualifier says every access is emitted exactly as written, and a counted value's accesses " +
     "come with retains and releases that no rule here could hold still — device memory is reached " +
     "with a raw pointer"
+
+// The type a `volatile T` parameter reads `T` as from an element of type `t`: `t` itself, unless it is
+// a subtype whose values were checked, which no volatile place may hold -- then the scalar under it,
+// so that a `[]Level` handed to a `[]volatile T` is refused at the call, as a view of the wrong
+// elements, rather than inside the callee as a `volatile Level` its signature never wrote.
+volatile_base(t: Type) -> Type = if volatile_constrains(t) then underlying(t) else t
 
 // Whether a type constrains which VALUES it has, as against merely having an identity of its own: a
 // bare `new` derivation asserts nothing about a value.
@@ -795,7 +827,7 @@ tuple_type(written: Buf[Type]) -> &StructType
     for i in 0..<ts.len()
         fields.push((i.to_string(), ts[i]))
 
-    StructType(tuple_base(ts.len()), ts, fields, false, None, None, false, None, buf(), false, buf(), buf())
+    StructType(tuple_base(ts.len()), ts, fields, false, None, None, false, None, buf(), false, buf(), buf(), false)
 end tuple_type
 
 // The same, recorded -- so that one `(string, string)` is one type wherever it is written, and so
@@ -1949,7 +1981,7 @@ private opaque_c_type(a: &Analysis, key: string) -> Type
 
     if already.is_some() then return already.unwrap()
 
-    val made = Struct(StructType(key, buf(), buf(), false, None, None, false, None, buf(), false, buf(), buf()))
+    val made = Struct(StructType(key, buf(), buf(), false, None, None, false, None, buf(), false, buf(), buf(), false))
 
     a.tables.struct_insts.put(key, made)
     made
@@ -2144,7 +2176,7 @@ instantiate_struct(a: &Analysis, scope: Scope, span: Span, written: string, key:
     val made: &StructType = StructType(key, targs, buf(), d.packed,
                                        aligned_to(a, scope, span, written, d.alignment),
                                        exported_c_name(d), d.opaque, d.byte_order, d.guards,
-                                       d.union_layout, buf(), d.promised)
+                                       d.union_layout, buf(), d.promised, d.unique)
     val ty = Struct(made)
 
     a.tables.in_progress.put(inst, ty)
@@ -2244,7 +2276,7 @@ instantiate_enum(a: &Analysis, scope: Scope, span: Span, written: string, key: s
                     underlying = int_type()
     end if
 
-    val made: &EnumType = EnumType(key, targs, simple, buf(), underlying)
+    val made: &EnumType = EnumType(key, targs, simple, buf(), underlying, d.unique)
     val ty = Enum(made)
 
     a.tables.in_progress.put(inst, ty)

@@ -115,29 +115,46 @@ closure_expr(cx: &Analyzer, span: Span, written: Buf[LambdaParam], body: Buf[Stm
     var ptypes: Buf[Type] = buf()
     var names: Buf[string] = buf()
 
+    // What each parameter's annotation spelled its type as, for the body's diagnostics to quote; one
+    // the context supplied is spelled as the position's written callable type spelled it, where the
+    // position declared one (`f: Fn(u8) -> u8`), and has none otherwise.
+    var spells: Buf[Option[Spelling]] = buf()
+    val tparams = subst_names(cx)
+    val told: Buf[Spelling] = cx.declared match
+        Some(d) ->
+            if expected.is_some() && type_eq(behind_ref(d.ty), behind_ref(expected.unwrap())) then d.spelled.params
+            else buf()
+        None -> buf()
+
     for i in 0..<params.len()
         val p = params[i]
 
         names.push(p.name)
 
         if p.typ.is_some()
-            ptypes.push(resolve_type(cx.an, cx.scope, p.typ.unwrap(), cx.subst))
+            val pty = resolve_type(cx.an, cx.scope, p.typ.unwrap(), cx.subst)
+
+            ptypes.push(pty)
+            spells.push(spelling_of(p.typ.unwrap(), pty, tparams))
         else if want.is_some() && i < want.unwrap().0.len()
             ptypes.push(want.unwrap().0[i])
+            spells.push(if i < told.len() then Some(told[i]) else None)
         // A position whose own type was refused has already said what is wrong, and the closure at
         // it is not a second mistake.
         else if expected.is_some() && expected.unwrap() == Unknown
             ptypes.push(Unknown)
+            spells.push(None)
         else
             cx.fault(p.span, missing_parameter_type(p.name))
             ptypes.push(Unknown)
+            spells.push(None)
 
     val result = if want.is_none() then None else want.unwrap().1
     var kept: Buf[(string, Type)] = buf()
 
     if expected.is_some() then kept = callable_marks(cx.an, expected.unwrap())
 
-    val lowered = lower_closure(cx, span, names, ptypes, result, body, "", kept)
+    val lowered = lower_closure(cx, span, names, ptypes, result, body, "", kept, spells)
 
     *lowered.kind match
         TStructNew(st, _) -> cx.an.closures_written.put(st.base, ClosureWritten(cx.scope, params, ptypes))
@@ -145,6 +162,12 @@ closure_expr(cx: &Analyzer, span: Span, written: Buf[LambdaParam], body: Buf[Stm
 
     lowered
 end closure_expr
+
+// A callable type with the reference a boxed slot (`&Fn(u8) -> u8`) puts around it taken off, so a
+// position's declared type and the type a closure literal is read against compare as one callable.
+private behind_ref(t: Type) -> Type = t match
+    Ref(inner, _) -> *inner
+    _ -> t
 
 // **A by-name parameter forwarded as itself is the callable it already is**, not a closure around a
 // call of it. `f(n - 1, value)` at a by-name `value` would otherwise thunk the read into a new
@@ -448,6 +471,25 @@ refuse_ref_captures(cx: &Analyzer, span: Span, captured: Buf[string]) -> bool
     false
 end refuse_ref_captures
 
+// A closure that captures a `@unique` value would borrow it or take it, by whether the closure is
+// kept (`design/affine-values.md § 5`); neither is followed yet, so the capture is refused.
+private refuse_unique_captures(cx: &Analyzer, span: Span, captured: Buf[string]) -> bool
+    for name in captured
+        val local = cx.lookup(name)
+
+        if local.is_none() || !is_unique(cx.an, local.unwrap().ty) then continue
+
+        val held = type_show(local.unwrap().ty)
+
+        cx.fault(span, s"this closure captures '$name', and '$held' is '@unique' — a closure capturing " +
+                 "a '@unique' value is not supported yet. Pass it to the closure as a parameter, or " +
+                 s"capture a pointer to it ('val p = &$name')")
+        return true
+    end for
+
+    false
+end refuse_unique_captures
+
 // A capture held by value is a copy, so a local whose type is `@pinned` cannot be captured by a
 // closure that holds it so: the closure would carry a second value of it, which nothing C holds a
 // pointer into. **One held by reference is the variable itself**, so whether the capture is refused
@@ -488,10 +530,12 @@ end refuse_pinned_captures
 // that *is* the closure -- its captures, in the order the fields hold them. `named` is the function a
 // program passed where the closure stands for one, and empty for a closure literal.
 lower_closure(cx: &Analyzer, span: Span, names: Buf[string], ptypes: Buf[Type],
-              result: Option[Type], body: Buf[Stmt], named: string = "", kept: Buf[(string, Type)] = buf()) -> TExpr
+              result: Option[Type], body: Buf[Stmt], named: string = "", kept: Buf[(string, Type)] = buf(),
+              spells: Buf[Option[Spelling]] = buf()) -> TExpr
     val captured = captures(cx, body, names)
 
     if refuse_ref_captures(cx, span, captured) then return bad_expr(span)
+    if refuse_unique_captures(cx, span, captured) then return bad_expr(span)
 
     var fields: Buf[(string, Type)] = buf()
 
@@ -505,20 +549,27 @@ lower_closure(cx: &Analyzer, span: Span, names: Buf[string], ptypes: Buf[Type],
     cx.an.closure_keeps.put(base, kept)
     forget_closure(cx.an, base)
 
-    // **A scoped child holds its captures by value** whatever else is true of it, so it is no
-    // candidate; any other closure may hold each `var` it captures by reference, decided once every
+    // **A scoped child that lends a view holds its captures by value** but for the `val`s it shares
+    // with the frame that opened the scope (`scoped_val_refs`), so it is no candidate; any other
+    // closure may hold each `var` and `val` aggregate it captures by reference, decided once every
     // body has been typed (`closure_mode.sysl`).
     val refs = if lends then buf() else referable_captures(cx, captured)
 
     if !lends && !captured.is_empty() then cx.an.closure_refs.put(base, refs)
     if refuse_pinned_captures(cx, span, captured, refs, base) then return bad_expr(span)
 
-    val st = StructType(base, buf(), fields, false, None, None, false, None, buf(), false, buf(), buf())
+    if cx.an.scoped_args.has(scoped_arg_key(cx, span))
+        val shared = scoped_val_refs(cx, captured)
+
+        if shared.is_some() then cx.an.scoped_val_refs.put(base, shared.unwrap())
+    end if
+
+    val st = StructType(base, buf(), fields, false, None, None, false, None, buf(), false, buf(), buf(), false)
 
     cx.an.tables.struct_insts.put(base, Struct(st))
 
     val fname = s"$base.call"
-    val lowered = closure_body(cx, span, st, fname, names, ptypes, result, captured, body, named)
+    val lowered = closure_body(cx, span, st, fname, names, ptypes, result, captured, body, named, spells)
 
     cx.an.tables.members.func_insts.put(fname, FuncSig(lowered.params, lowered.ret_ty))
     cx.an.closure_funcs.push(lowered)
@@ -555,6 +606,7 @@ end lower_closure
 // never makes, or held to captures it does not have.
 private forget_closure(a: &Analysis, base: string)
     a.closure_refs.remove(base)
+    a.scoped_val_refs.remove(base)
 
     var stale = false
 
@@ -571,18 +623,22 @@ private forget_closure(a: &Analysis, base: string)
     a.lost_writes = kept
 end forget_closure
 
-// Which captures a closure may hold by reference: a binding a write may reach -- not a `val`, a
-// pattern's binding or a by-name parameter -- of a type that has storage. A `val` is copied whatever
-// the closure's mode, since nothing can tell a copy of it from the variable; a value with no storage
-// has no address to hold, and changing its field to one would move every field after it.
+// Which captures a closure may hold by reference: a binding a write may reach, and a `val` -- or a
+// pattern's binding -- of an aggregate (`held_by_address`), of a type that has storage; never a
+// by-name parameter. **A `val` held by reference is read-only exactly as a copy of it is**, and
+// nothing can tell the two apart, so the address is a saving and not a change of meaning: four
+// closures over one array hold four addresses, not four copies. A scalar or a reference is copied,
+// which costs no more than its address would. A value with no storage has no address to hold, and
+// changing its field to one would move every field after it.
 private referable_captures(cx: &Analyzer, captured: Buf[string]) -> Buf[bool]
     var out: Buf[bool] = buf()
 
-    // A `@pinned` `val` is the exception: a copy of it is not the value C points into, so it is held
-    // by reference where the closure allows, read-only as every `val` is.
+    // A `@pinned` `val` of any shape is held by reference where the closure allows: a copy of it is
+    // not the value C points into.
     for item in captured
         val local = cx.lookup(item).unwrap()
-        val addressed = !local.read_only || (pinned_type(cx.an, local.ty) && !local.from_pattern)
+        val addressed = !local.read_only || held_by_address(local.ty) ||
+            (pinned_type(cx.an, local.ty) && !local.from_pattern)
 
         out.push(addressed && local.stands_for.is_none() && !reads_by_name(cx, item) &&
                  !holds_waker(cx, item) && !zero_sized(local.ty))
@@ -590,6 +646,52 @@ private referable_captures(cx: &Analyzer, captured: Buf[string]) -> Buf[bool]
 
     out
 end referable_captures
+
+// Whether a `val` captured is held by its address where the closure does not outlive it: an array, a
+// vector, a string, a slice, a struct or tuple, an enum with a payload -- every shape a copy of which
+// costs more than an address. A task is a handle, and copied as one.
+private held_by_address(t: Type) -> bool = underlying(t) match
+    Array(n, _) -> n > 0
+    Vector(_, _) -> true
+    Str -> true
+    Slice(_, _) -> true
+    Struct(d) -> d.base != TaskBase
+    Results(_) -> true
+    Enum(e) ->
+        for v in e.variants
+            if !v.fields.is_empty() then return true
+
+        false
+    _ -> false
+
+// **Which captures a scoped child holds by address**, and nothing where it holds none. A child runs
+// in another domain until the scope ends, which may be after the body it is written in has returned,
+// so it may hold the address only of storage that outlives the scope and that nothing writes while
+// it runs: a `val` aggregate the body it is written in captured from outside -- the frame that
+// opened the scope, blocked in that call -- never one of the body's own locals, and never a `var`,
+// which the body or a sibling could write under it. Four children over one array hold four
+// addresses rather than four copies; a snapshot of a `var` is a `val` bound from it first.
+private scoped_val_refs(cx: &Analyzer, captured: Buf[string]) -> Option[Buf[bool]]
+    var out: Buf[bool] = buf()
+    var any = false
+
+    for item in captured
+        val local = cx.lookup(item).unwrap()
+        var outside = false
+
+        for c in cx.captured
+            if c.0 == local.unique then outside = true
+
+        val shared = outside && local.read_only && held_by_address(local.ty) && local.stands_for.is_none() &&
+            !reads_by_name(cx, item) && !holds_waker(cx, item) && !zero_sized(local.ty)
+
+        if shared then any = true
+
+        out.push(shared)
+    end for
+
+    if any then Some(out) else None
+end scoped_val_refs
 
 // -- a write that reaches only the closure's copy ------------------------------------------------
 
@@ -1482,7 +1584,8 @@ end holds_index
 // closure has no name a reader wrote.
 private closure_body(cx: &Analyzer, span: Span, st: &StructType, fname: string,
                      names: Buf[string], ptypes: Buf[Type], given: Option[Type],
-                     captured: Buf[string], body: Buf[Stmt], named: string) -> TFunc
+                     captured: Buf[string], body: Buf[Stmt], named: string,
+                     spells: Buf[Option[Spelling]]) -> TFunc
     val inner = analyzer_for(cx.an, cx.scope)
 
     inner.subst = cx.subst
@@ -1516,6 +1619,8 @@ private closure_body(cx: &Analyzer, span: Span, st: &StructType, fname: string,
         val unique = inner.bind(names[i], ptypes[i])
 
         params.push((unique, ptypes[i]))
+
+        if i < spells.len() then inner.spell_binding(unique, spells[i])
 
         // The registrar a `park` was handed takes the task's waker as its one parameter.
         if cx.reading_registrar && names.len() == 1 && type_eq(ptypes[i], waker_type(cx))
@@ -1620,6 +1725,7 @@ private closure_body(cx: &Analyzer, span: Span, st: &StructType, fname: string,
     inner.try_shape = None
 
     check_consumes(inner, block)
+    check_unique_moves(inner, block, true)
     check_counted_pointers(inner, block)
     hand_up_copy_writes(cx, inner, span, captured)
 
@@ -1866,9 +1972,18 @@ private read_stmt(keep: &Fn(string) -> bool, s: Stmt, bound: *Buf[string], found
             _ -> read_stmt(keep, inner, bound, found)
         StaticDecl(inner) -> read_stmt(keep, inner, bound, found)
         CopiedDecl(_, inner) -> read_stmt(keep, inner, bound, found)
-        Require(cond, _) -> read_expr(keep, cond, *bound, found)
-        Ensure(cond, _) -> read_expr(keep, cond, *bound, found)
-        Invariant(cond, _) -> read_expr(keep, cond, *bound, found)
+        // A clause's message is read as an `@assert`'s is: a name it reaches from around the body is
+        // a name of that body, so a message the compiler cannot work out is refused in those words
+        // rather than as a name standing for nothing.
+        Require(cond, msg) ->
+            read_expr(keep, cond, *bound, found)
+            read_opt(keep, msg, *bound, found)
+        Ensure(cond, msg) ->
+            read_expr(keep, cond, *bound, found)
+            read_opt(keep, msg, *bound, found)
+        Invariant(cond, msg) ->
+            read_expr(keep, cond, *bound, found)
+            read_opt(keep, msg, *bound, found)
         Variant(measure) -> read_expr(keep, measure, *bound, found)
         AssertDecl(cond, message) ->
             read_expr(keep, cond, *bound, found)
@@ -2230,11 +2345,11 @@ with_struct_call_bounds(d: StructDecl) -> StructDecl
     StructDecl(d.name, d.tparams, d.fields, lowered_members(d.members), d.bounds, d.invariants,
                d.vis, d.tdefaults, d.opaque, d.tvalues, d.packed, d.alignment, d.cname, d.deriving,
                d.byte_order, d.guards, d.pinned, d.union_layout, d.anon, d.bits, d.annotation,
-               d.annots, d.promised)
+               d.annots, d.promised, d.invariant_msgs, d.unique)
 
 with_enum_call_bounds(d: EnumDecl) -> EnumDecl
     EnumDecl(d.name, d.tparams, d.underlying, d.variants, lowered_members(d.members), d.bounds,
-             d.vis, d.tdefaults, d.tvalues, d.deriving, d.annots, d.export)
+             d.vis, d.tdefaults, d.tvalues, d.deriving, d.annots, d.export, d.unique)
 
 private lowered_members(ms: Buf[MethodDecl]) -> Buf[MethodDecl]
     var out: Buf[MethodDecl] = buf()

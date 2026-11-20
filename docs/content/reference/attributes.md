@@ -10,7 +10,7 @@ has a name and a spelling of its own:
 | written | is | read by |
 |---|---|---|
 | `T::Attr` | an **attribute** — a question a type's own name answers | the analyzer, at the use |
-| `@test`, `@tailrec`, `@pure`, `@ghost`, `@export`, `@reads`, `@writes`, `@crossing`, `@domain`, `@noinline`, `@inline`, `@cold`, `@disjoint`, `@no_alloc`, `@no_block`, `@blocks`, `@abandons`, `@track_caller` | an **annotation** — a fact about the free function under it | the grammar |
+| `@test`, `@tailrec`, `@pure`, `@ghost`, `@export`, `@reads`, `@writes`, `@crossing`, `@domain`, `@noinline`, `@inline`, `@cold`, `@disjoint`, `@no_alloc`, `@no_block`, `@no_recursion`, `@blocks`, `@stack`, `@abandons`, `@track_caller` | an **annotation** — a fact about the free function under it | the grammar |
 | `@setup`, `@teardown`, `@setup_all`, `@teardown_all` | an **annotation** — a hook `sysl test` runs around a module's tests | the grammar |
 | `@keeps(...)` | an **annotation** on an `extern` — the parameters the C function holds on to past the call; see [`@keeps`](/reference/ffi/#keeps-a-c-function-that-holds-on-to-a-pointer). On a trait's own method declaration, with `@answers(...)`, what a call through an object is told; see [below](#keeps-and-answers-on-a-trait-method) | the grammar |
 | `@abandons *extern(A) -> R` | a **mark on a type** — a C function pointer a call through which may abandon every frame below it; see [`@abandons *extern`](/reference/ffi/#abandons-extern-a-callback-that-may-jump-past-c) | the grammar |
@@ -22,7 +22,7 @@ has a name and a spelling of its own:
 | `@renamed("...", "...")`, `@removed("...", "...")` | an **annotation** — the declaration under it is a tombstone, a name that is gone; see [`@renamed` and `@removed`](#renamed-and-removed-a-name-that-is-gone-and-what-became-of-it) | the grammar |
 | `@export("...")` on a module `var` or `val` | an **annotation** — the C symbol the storage is published under | the grammar |
 | `@export("...")` on a `const` or a simple `enum` | an **annotation** — the macro a generated C header defines for the value, or the prefix of one per variant; see [constants in the header](/reference/ffi/#constants-in-the-header) | the grammar |
-| `@no_alloc`, `@requires`, `@link`, `@include`, `@tests`, `@no_fuse` | an **annotation** — a fact about the whole file, in its header | the grammar |
+| `@no_alloc`, `@no_block`, `@no_recursion`, `@requires`, `@link`, `@include`, `@tests`, `@no_fuse` | an **annotation** — a fact about the whole file, in its header | the grammar |
 | `@assert` | an **annotation** that describes nothing but itself — a condition settled while compiling | the analyzer, once |
 | `#if` | a **directive** — a gate on lines | a pass before the lexer |
 
@@ -104,8 +104,8 @@ print(c.send(&n))
 7
 ```
 
-Beside them a member takes the six about the function it lowers to — `@noinline`, `@inline`, `@cold`,
-`@no_alloc`, `@no_block` and `@blocks` — and `@relocates`, which says a call may move the storage its
+Beside them a member takes the seven about the function it lowers to — `@noinline`, `@inline`, `@cold`,
+`@no_alloc`, `@no_block`, `@no_recursion` and `@blocks` — and `@relocates`, which says a call may move the storage its
 receiver's elements live in, so a live `ref` to one of them is refused the call
 ([memory](/reference/memory/#the-one-rule-what-may-move-underneath-it)), and `@views(self)`, which says
 the view a call answers is borrowed from its receiver, so the view may not outlive it
@@ -2623,6 +2623,254 @@ print(f())
 'block' is what a module does, not something a machine has, and no machine takes it away
 ```
 
+## `@no_recursion` — a path that never calls itself again
+
+Flight software, a kernel's interrupt path and every safety-critical rule set forbid recursion for
+one reason: a function that can reach itself again before it returns has a stack depth nobody can
+bound by reading it. **`@no_recursion` is that promise.** Above a function or a method it says no
+call the definition makes, however many calls away and in whoever's code, ever arrives back at a
+function already on the stack; in a file's header it says it of every body in the module. A cycle
+is refused at the call that begins the way to it, and the refusal names the cycle:
+
+```sysl
+f() -> int = 1
+
+@no_recursion
+fact(n: int) -> int = if n <= 1 then 1 else n * fact(n - 1)
+
+print(fact(5))
+```
+
+```error
+this call recurses by the cycle 'fact' → 'fact', and 'fact' declared '@no_recursion'
+```
+
+**Any cycle counts, not only a function calling itself.** Where the promised body reaches a cycle it
+is not on, the refusal names the call the body wrote, the way from it to the cycle, and the cycle:
+
+```sysl
+f() -> int = 1
+
+even(n: int) -> bool = if n == 0 then true else odd(n - 1)
+odd(n: int) -> bool = if n == 0 then false else even(n - 1)
+middle(n: int) -> bool = even(n)
+
+@no_recursion
+top(n: int) -> bool = middle(n)
+
+print(top(4))
+```
+
+```error
+this reaches 'middle', which recurses by the call path 'middle' → 'even' and the cycle 'even' → 'odd' → 'even', and 'top' declared '@no_recursion'
+```
+
+A body that keeps the promise builds, and a sibling beside it may recurse as it likes:
+
+```sysl
+fact(n: int) -> int = if n <= 1 then 1 else n * fact(n - 1)
+
+@no_recursion
+square(n: int) -> int = n * n
+
+print(square(3), fact(4))
+```
+
+```output
+9 24
+```
+
+**A call whose target is decided at run time is followed to everything it could reach**, since a
+cycle missed would be a promise broken in silence:
+
+- a call through a trait object, a `&Fn` closure among them, reaches **every** implementation of
+  that method in the program — the value behind it is chosen wherever it was erased, often in a body
+  the promised one never reaches;
+- a call through a function pointer reaches every function whose address the program takes at that
+  pointer's type;
+- taking a function's address is a call of it, since whoever is handed the address — a C function
+  among them — may call it while the body that took it is still on the stack.
+
+```sysl
+trait Shape
+    area(self) -> int
+
+struct Sq
+    n: int
+
+impl Shape for Sq
+    area(self) -> int = if self.n == 0 then 0 else measure(Sq(self.n - 1))
+
+measure(s: &Shape) -> int = s.area()
+
+@no_recursion
+top(n: int) -> int = measure(Sq(n))
+
+print(top(3))
+```
+
+```error
+this reaches 'measure', which recurses by the cycle 'measure' → 'Sq.area' → 'measure', and 'top' declared '@no_recursion'
+```
+
+A closure handed to a generic or a bare-arrow parameter is an ordinary call in the instance, and a
+generic is held at each instance, so a cycle that only one type argument closes is refused there,
+naming the instance. **The library is held too**: `sysl.slices.sort` recurses, and a promised body
+that sorts is refused naming it. What a C function does is not read, but a C function can only call
+back into sysl through an address the program took, and that address is already a call.
+
+**One cycle is one refusal.** Where several promised functions are on one cycle — a module's clause
+holds every function in it — the first by name is told; a promised function that only reaches a
+cycle some promised function is on says nothing more. A `@tailrec` self-call is a cycle like any
+other: it is lowered as a jump, but the promise is about what the program says, and a loop says it
+plainly. The rules for where it stands are `@no_alloc`'s: directly under the header it is the
+module's clause, a method may promise it, and a function declared inside another may not — the
+function around it, whose promise covers every call the inner one makes, carries it. Recursing is
+conduct, not a facility, so `@requires(recursion)` and `@needs(recursion)` are refused:
+
+```sysl
+@needs(recursion)
+f() -> int = 1
+
+print(f())
+```
+
+```error
+'recursion' is what a module does, not something a machine has, and no machine takes it away
+```
+
+## `@stack` — a bound on the stack a call needs
+
+A kernel sizes every thread's stack, and an interrupt pushes its frame on top of whichever thread it
+lands on, so a handler that needs more than the room left writes into the guard below. **`@stack(n)`
+above a function or a method fails the build when a call of it can need more than `n` bytes of
+stack**, counted the whole way down: the call graph is the program's, the library's bodies
+included, and each frame is the one the back end lays out at the level and for the machine being
+built — the frame [`@frame_limit(n)`](#frame-limit-n-the-most-stack-one-call-of-a-function-may-take)
+limits one function to, and `--stack-usage` lists
+([the frame of every function](/reference/packages/#the-frame-of-every-function)). A bound too small
+is refused at the annotation, with the depth and the way down that needs it:
+
+```sysl
+deep(n: usize) -> u8
+    var block: [4096]u8 = [0; 4096]
+    block[n % 4096] = u8(n)
+    block[(n * 7) % 4096]
+
+@stack(1024)
+handler(x: usize) -> u8 = deep(x)
+
+print(handler(3))
+```
+
+```error
+'handler' declared '@stack(1024)', and it can need
+```
+
+A bound the depth fits under builds as if it were not there:
+
+```sysl
+deep(n: usize) -> u8
+    var block: [4096]u8 = [0; 4096]
+    block[n % 4096] = u8(n)
+    block[(n * 7) % 4096]
+
+@stack(65536)
+handler(x: usize) -> u8 = deep(x)
+
+print(handler(3))
+```
+
+```output
+0
+```
+
+**A depth with no bound is refused, with the reason**: a cycle of calls reachable from the function,
+a frame the back end sizes at run time, or a call through a pointer — a trait object, a `&Fn`
+closure, a function pointer — whose target the text does not name. `with_lock` is kept out of line
+here; where the optimizer can see which closure a call runs, the call is a direct one and needs
+nothing said:
+
+```sysl
+struct Lock
+    n: int
+
+@noinline
+with_lock(l: *Lock, op: &Fn() -> int) -> int
+    l.n += 1
+    val r = op()
+    l.n -= 1
+    r
+
+@stack(16384)
+handler(x: int) -> int
+    var l = Lock(0)
+    with_lock(&l, () -> x + 1)
+
+print(handler(1))
+```
+
+```error
+'handler' declared '@stack(16384)', and how deep its stack goes has no bound — 'with_lock' calls through a pointer
+```
+
+**`@stack(calls: m)` is what the program says a call through a pointer needs**: above the function
+whose body makes the call, it makes each such call count `m` bytes. It is the program's word for code
+the text cannot name — the closure behind the object is chosen elsewhere — so it is an assumption,
+and every report that leans on it says so. The two parts combine, `@stack(8192, calls: 1024)`, and a
+byte count may be written in hexadecimal:
+
+```sysl
+struct Lock
+    n: int
+
+@noinline
+@stack(calls: 1024)
+with_lock(l: *Lock, op: &Fn() -> int) -> int
+    l.n += 1
+    val r = op()
+    l.n -= 1
+    r
+
+@stack(16384)
+handler(x: int) -> int
+    var l = Lock(0)
+    with_lock(&l, () -> x + 1)
+
+print(handler(1))
+```
+
+```output
+2
+```
+
+The assumption follows the call wherever the optimizer moves it: a body inlined into its caller takes
+its calls through a pointer with it, and they still count `m`. **A function the optimizer inlined is
+counted once**, in the frame it was inlined into, and a recursion it turned into a loop is a frame
+rather than a cycle — so a bound checked at `-O2` may hold where the same bound at `-O0` does not, and
+the build checks the level it builds at. A destructor, run through the header of the object it tears
+down, is answered by every destructor in the program rather than refused; teardown never recurses
+([memory](/reference/memory/)). **A C function's frame is not in the text** and counts as nothing;
+`sysl stack` names every C function each entry reaches. Every build checks the bound — `build`,
+`run`, `build-c` and `emit-llvm` — and `@stack` marks a function or a method and nothing else:
+
+```sysl
+f() -> int = 1
+
+@stack(64)
+struct P
+    x: int
+
+print(f())
+```
+
+```error
+'@stack(...)' bounds the stack a call needs, so it marks a function or a method whose body is sysl
+```
+
+[`sysl stack`](/getting-started/cli/#stack) prints the same depth for every way into a program —
+`main`, a bare image's entry and each export — and why where there is none.
+
 ## `@track_caller` — a function that reports its caller's line
 
 A function marked `@track_caller` is handed the location of each call — `file:line:column` — and
@@ -2743,6 +2991,67 @@ print(count())
 `main`, a `@test` or a hook, an interrupt handler, an `async` function (whose body runs when its task
 is resumed) and a variadic function are refused the same way, and so is an `extern`, whose body is
 compiled elsewhere. It takes no arguments.
+
+## `@frame_limit(n)` — the most stack one call of a function may take
+
+A function marked `@frame_limit(n)` may not have a stack frame larger than `n` bytes, and a build in
+which it does fails, naming the function, its frame and the limit. The frame is laid out by LLVM,
+so the check is made where clang compiles the program — here an archive's (`sysl build-c`):
+
+```sysl build=c
+@frame_limit(2048)
+@export("deep")
+deep(n: usize) -> u8
+    var block: [65536]u8 = [0; 65536]
+    block[n % 65536] = u8(n)
+    block[(n * 7) % 65536]
+```
+
+```error
+'deep' needs a stack frame of
+```
+
+The whole message reads `'deep' needs a stack frame of 65584 bytes, over its limit of 2048 bytes, set
+by '@frame_limit(2048)' above 'deep'` on an AArch64 Mac at the default level, the size being whatever
+the machine and the optimization level lay the frame out at. The frame is what the function's
+prologue reserves — its locals, the registers it saves, what it passes on the stack — and not what
+the functions it calls take: a bound over a whole call chain is
+[`@stack(n)`](#stack-a-bound-on-the-stack-a-call-needs), which adds these frames up the whole way
+down.
+
+**The limit is the emitted function's, as clang's is.** A function the optimizer inlines takes its
+frame into its caller and is held to the caller's limit there; a function called once with a
+constant may be folded away entirely, array and all. An `@export`ed function's C entry point is
+held to the function's own limit, since its body is inlined into it.
+
+**It is the one function's answer to a limit set for many.** A package's `frame_limit` key and the
+`--frame-limit` flag hold every function a build compiles ([a function's stack
+frame](/reference/packages/#a-function-s-stack-frame)), and the attribute is nearer than either: a
+kernel holding every function to 2 KiB gives its entry point what that one needs, and
+`@frame_limit(none)` takes the function out of every limit at all:
+
+```sysl
+@frame_limit(none)
+setup() -> int
+    var scratch: [8192]u8 = [0; 8192]
+    scratch[100] = 7
+    int(scratch[100])
+
+print(setup())
+```
+
+```output
+7
+```
+
+**A closure or nested function written inside a marked function takes its mark**, being part of the
+body the mark was written about; one written anywhere else takes the limit of its own package. Every
+instance of a generic function carries the mark its declaration was written with, and so does every
+lowered copy of a method.
+
+The number is a literal from 1 to 4294967295, which is the most LLVM's attribute holds; `none` is the
+one word it takes. A limit is a fact about the code LLVM lays out, so it marks a function or a
+method, and an `extern` — whose frame is laid out by whoever compiled it — is refused it.
 
 ## `@renamed` and `@removed` — a name that is gone, and what became of it
 
@@ -3687,6 +3996,160 @@ twice(x: f32) -> f32 = x + x
 '@strict_fp' keeps every floating-point operation exactly where and how it is written, and '@reassociate' lets the back end regroup them
 ```
 
+## `@extensions` — a body compiled for instructions the build does not promise
+
+A build uses what its machine guarantees: a row's architecture, plus whatever
+[`codegen.extensions`](/reference/packages/#a-processors-extensions) and `--cpu` add for the whole
+image. A CRC, an AES round or a dot product often has an instruction only some processors of that
+architecture have, and a library that wants it cannot make the whole program require it.
+`@extensions` compiles **one function** for them, as Rust's `#[target_feature(enable = "…")]` and
+clang's `__attribute__((target("…")))` do:
+
+```sysl
+#if aarch64
+extern "llvm.aarch64.crc32cx" crc_word(crc: u32, word: u64) -> u32
+
+@extensions("crc")
+crc_words(words: []u64) -> u32
+    var crc: u32 = 0xffffffff
+    for w in words
+        crc = crc_word(crc, w)
+    crc ^ 0xffffffff
+#endif
+
+print("compiled")
+```
+
+```output
+compiled
+```
+
+Each name is the extension as LLVM names the feature, the names `codegen.extensions` takes — `crc`,
+`aes`, `sha3`, `dotprod`, `lse` on AArch64, `sse4.2`, `avx2`, `bmi2` on x86-64 — and each is asked of
+the clang that will build the program, which would only warn about a name it does not know:
+
+```sysl target=aarch64-freestanding
+@extensions("crcc")
+step(x: u32) -> u32 = x
+
+@export("main")
+start() -> i32 = i32(step(1))
+```
+
+```error
+'@extensions' names 'crcc', which the aarch64 back end does not know — an extension is spelled as LLVM spells the feature
+```
+
+The body's `define` line carries LLVM's `"target-features"`: the processor's own list, the build's,
+then the function's. So the back end may select the extension's instructions there, an intrinsic it
+calls is one the back end can select, and an [`asm`](/reference/inline-assembly/) block in it may
+name them — the assembler refuses `aese` in a body that does not say `aes`. **A closure or a nested
+function written inside is compiled the same way**: it can only be reached by running the body that
+made it.
+
+### A call is the promise, so a call is what is checked
+
+On a processor without the extension, the body's first such instruction faults. So a call is
+accepted only where the code making it is known to run on a processor that has every extension the
+callee names:
+
+- **code compiled for them itself** — a function marked with them, or written inside one;
+- **code the build promises them to everywhere** — `codegen.extensions`, `--cpu`, or the row's own
+  processor (`aarch64-macos` is built for the M1, which has `crc`, `aes`, `sha3` and `dotprod`);
+- **code inside an `@unchecked("…")` block naming them**, which is the program's word that it has
+  asked the processor first.
+
+Anywhere else the call is refused, naming both ways to make it:
+
+```sysl target=aarch64-freestanding
+@extensions("crc")
+step(x: u32) -> u32 = x
+
+@export("main")
+start() -> i32 = i32(step(1))
+```
+
+```error
+'step' is called, and it is compiled for the processor's 'crc' extension, which 'aarch64-freestanding' does not promise and the code here is not compiled for — on a processor without it its first such instruction faults. Mark the caller '@extensions("crc")', or make the call inside '@unchecked("crc")' once the program has asked the processor
+```
+
+That is Rust's rule — a `#[target_feature]` function is an `unsafe` call from a function without the
+features — said in the word sysl's unchecked tier already uses. **The block checks nothing while the
+program runs**: how a program asks its processor is the system's (`sysctlbyname` on macOS,
+`getauxval(AT_HWCAP)` on Linux, `cpuid` on x86), and the answer goes in an ordinary `if` around the
+block. It relaxes nothing else either — a subscript inside it is bounds-checked as anywhere:
+
+```sysl
+#if aarch64
+@extensions("crc")
+twice(x: u32) -> u32 = x * 2
+
+val asked = true
+
+if asked
+    @unchecked("crc")
+        print(twice(21))
+#else
+print(42)
+#endif
+```
+
+```output
+42
+```
+
+The block is lexical, as `@unchecked`'s is: a closure written inside is inside it, and a call after
+its last line is not. A block naming `aes` does not cover a callee that needs `sha3` as well, and the
+refusal names only what is missing. **Taking the function's address is held to the same rule**,
+since a call through the address names no callee; and a marked method may not fill a trait's table,
+for the same reason.
+
+**The CRC-32C `extern`s are such functions.** `llvm.aarch64.crc32cx` and SSE 4.2's `crc32` are
+compiled for `crc` and `sse4.2` ([ffi](/reference/ffi/#a-link-name-in-the-llvm-namespace-names-an-instruction)),
+so a declaration is accepted on its own processor and each call is held to this rule.
+
+### Inlining follows the features
+
+LLVM puts a body inside a caller only where the caller's features hold the body's, as clang's and
+rustc's do. A marked body is absorbed by a caller marked the same and stays a call from any other, and
+an ordinary helper is absorbed by a marked body as by any other — its list starts with the
+processor's, so it holds everything an ordinary function's does. `@inline` is the hint it always was;
+`@inline(always)` is refused beside `@extensions`, being a promise the back end would break at every
+call from code without them:
+
+```sysl
+@inline(always)
+@extensions("crc")
+step(x: u32) -> u32 = x
+```
+
+```error
+'@inline(always)' puts the body in place of every call, and a body compiled for a processor's extensions is only ever put inside a caller that has them too
+```
+
+### Where it applies
+
+`@extensions` is accepted on aarch64 and x86_64, where a function's list is added to its processor's.
+On Thumb the build's list carries the unit `-mfpu` named, and on RISC-V the extensions its triple
+names, and LLVM *replaces* a build's list with a function's — so there the manifest says it, for the
+whole image:
+
+```sysl target=thumb-freestanding
+@extensions("dsp")
+step(x: u32) -> u32 = x
+
+@export("main")
+start() -> i32 = i32(step(1))
+```
+
+```error
+'@extensions' is accepted on aarch64 and x86_64, where a function's extensions add to its processor's, and this build is for 'thumb-freestanding'
+```
+
+It marks a function or a method, whose body is sysl; an `extern`'s instructions are its compiler's.
+A name is written alone, as `codegen.extensions` writes it: `"+crc"`, `"crc,aes"` and an empty list
+are refused.
+
 ## `@no_fuse` — multiplies and adds rounded apart
 
 **A float multiply feeding an add in the same expression is one fused multiply-add** wherever the
@@ -3829,8 +4292,11 @@ print(squares)
 ```
 
 The block is lexical: a closure or a nested function written inside it is inside it, and one called
-from inside but written elsewhere is not. It takes no argument, and it does not mark a function, a
-member or a single statement on the same line:
+from inside but written elsewhere is not. Bare, it takes no argument — with the names of processor
+extensions in parentheses, `@unchecked("crc")`, it is the other block, which lets a call of a
+function [compiled for them](#extensions-a-body-compiled-for-instructions-the-build-does-not-promise)
+be made and leaves every subscript checked. It does not mark a function, a member or a single
+statement on the same line:
 
 ```sysl
 @unchecked
@@ -3843,6 +4309,99 @@ first(xs: []int) -> int = xs[0]
 
 What it does to a subscript, `get_unchecked` and `set_unchecked` for one subscript at a time, and what
 stays checked are in [arrays](/reference/arrays/#unchecked-access).
+
+## `@checked` — integer overflow that traps in every build
+
+**What a plain integer `+`, `-` or `*` does when the answer does not fit is the
+[build mode's](/reference/types/#arithmetic-wraps)**: a debug build stops the program, and a release
+build wraps. Code whose overflow is a fault however it was built — flight software, a counter whose
+wrap would read as a small number — says so with `@checked` above a function or a method. Every plain
+`+`, `-`, `*`, unary `-`, compound assignment, `++` and `--` and every written integer conversion in
+its body is then checked in a release build exactly as a debug build checks it, with the same report:
+
+```sysl
+@checked
+total(a: u8, b: u8) -> u8 = a + b
+
+print(total(200, 55))
+print(total(200, 56))
+```
+
+```output trap
+255
+```
+
+The second call stops the program with `integer overflow: u8 + u8 (main.sysl:2:29)` whether it was
+built by `sysl run` or by `sysl build`.
+
+**Written on a line of its own above an indented block, it marks the block instead**, and only what is
+written inside it is checked — what comes before and after keeps the mode's meaning:
+
+```sysl
+var level: u8 = 250
+
+@checked
+    level = level + 5
+
+print(level)
+```
+
+```output
+255
+```
+
+It never makes anything wrap, and it changes nothing that already says what it does:
+[`+%` and `+|`](/reference/expressions/#wrapping-and-saturating-operators) wrap and saturate,
+[`u8.wrap(n)`](/reference/expressions/#a-wrapping-conversion-keeps-the-bit-pattern) keeps the bit
+pattern, `checked_add` answers `None`, a shift is
+[defined](/reference/expressions/#shifting-by-the-width-or-more) at every count, and a vector's lanes
+wrap as the machine's lane instructions do. Division by zero traps everywhere already.
+
+### What it covers
+
+The region is **lexical**, as [`@reassociate`](#reassociate-float-sums-the-back-end-may-regroup)'s
+is: the operations written in the function or the block, and in any closure or nested function
+written inside it. A function *called* from inside but written elsewhere keeps the mode's meaning,
+inlined or not. A generic `@checked` function is checked at every instantiation, and a method marked
+`@checked` is checked while its siblings are not.
+
+**It is independent of [`@unchecked`](#unchecked-a-block-whose-subscripts-are-not-bounds-checked)**,
+which is about subscripts: an `@unchecked` block inside a `@checked` function reads its subscripts
+with no bounds check and still traps on overflow, and a `@checked` block inside an `@unchecked` one is
+checked the same way.
+
+**A value worked out while compiling agrees.** A `const` function marked `@checked`, or one written
+inside a `@checked` block, is held to the same promise when a constant runs it: an overflow that would
+stop the running program refuses the constant instead of folding a wrapped value into it. Unmarked, a
+`const` function folds the value a release build would compute.
+
+```sysl
+@checked
+const add(a: u8, b: u8) -> u8 = a + b
+
+const K = add(200, 100)
+```
+
+```error
+'K' traps while it is being compiled: 200 + 100 overflows byte
+```
+
+A whole package is checked with [`checked_overflow = true`](/reference/packages/#overflow-that-traps-in-every-build)
+in its manifest, which does for every file of the package what `@checked` does for one function.
+
+It takes no argument, and it marks a function, a method or a block — nothing else:
+
+```sysl
+@checked
+struct P
+    x: int
+```
+
+```error
+'@checked' makes the integer arithmetic written in a body trap on overflow in every build, so it marks a function, a method, or — on a line of its own — the block indented under it
+```
+
+A closure takes no annotations; it is checked when it is written inside a marked function or block.
 
 ## `@disjoint` — parameters whose memory nothing else reaches
 
@@ -4944,10 +5503,10 @@ The boundary travels with every value of the type the compiler lays down: a modu
 a `static`, a local, an element of an array, a field of another struct — which begins on the
 boundary and raises its holder's to match — and the payload of an enum variant carrying one.
 **A value on the heap keeps it too.** A box (`&T`), a buffer or a task's frame takes its storage
-from the allocating pair, which promises only what `malloc` does — two words, sixteen bytes on a
-64-bit machine and eight on a 32-bit one — so storage of a type aligned beyond that comes from the
-aligned pair, `sysl_alloc_aligned(size, align)` and `sysl_free_aligned(p)`, and the payload is laid
-after the box's header on the boundary:
+on the type's boundary, and the payload is laid after the box's header on it. A heap the manifest
+names is handed the boundary with every block; under libc's pair, whose `malloc` promises only two
+words — sixteen bytes on a 64-bit machine and eight on a 32-bit one — storage of a type aligned
+beyond that comes from the C library's aligned allocation:
 
 ```sysl
 @align(4096)
@@ -4967,9 +5526,9 @@ print(usize(&*b) % 4096, b.e[3])
 ```
 
 Every access through an address of the type claims its whole boundary. With libc's `malloc` and
-`free` on a POSIX system, WASI or Windows the aligned pair needs nothing from the program; anywhere
-else the program answers it,
-as [`packages.md` § A type aligned beyond what the pair promises](/reference/packages/#a-type-aligned-beyond-what-the-pair-promises)
+`free` on a POSIX system, WASI or Windows this needs nothing from the program; on a machine with no
+C library the program names a heap of its own,
+as [`packages.md` § A type aligned beyond what `malloc` promises](/reference/packages/#a-type-aligned-beyond-what-malloc-promises)
 says.
 
 **The bound is folded rather than lexed**, so a program writes the name it already has for the number,
@@ -5998,6 +6557,21 @@ the other. The words are the program's claim, as an `@export`'s symbol is — th
 register being written — but they put the claim at the function, where a reader can check it against
 the code, and they carry it up the call tree to the place that keeps the core still.
 
+**`@pinned(thread)`** is the same claim one level up, and asks nothing of callers: the fiber the body
+runs on is only ever resumed on the thread it began on, so it may hold a count that is not atomic
+across a call that can reach `sysl.fiber.switch`
+([fiber § A count held across a switch is refused](/library/fiber/#a-count-held-across-a-switch-is-refused)).
+`@pinned` takes no other argument:
+
+```sysl
+@pinned(core)
+depth() -> int = 3
+```
+
+```error
+'@pinned' takes no argument but 'thread' — '@pinned' alone says every caller keeps the function on one core, and '@pinned(thread)' that the fiber it runs on is only ever resumed on the thread it began on
+```
+
 The rule is not about storage, so it runs anywhere a `@pinned` function is written:
 
 ```sysl
@@ -6343,7 +6917,8 @@ pointer (`codegen { thread_pointer = "tpidr_el0" }`). It is false on a board and
 no such setting. It is the one symbol the target alone does not settle, because the register is the
 program's to name; the compiler reads it before the first condition, a dependency's `if` included.
 
-**`crc32c` is true exactly where an `extern` naming a CRC-32C instruction is accepted**
+**`crc32c` is true exactly where the build promises the CRC-32C instructions everywhere**, so a call
+of an `extern` naming one needs neither an `@extensions` caller nor an `@unchecked("crc")` block
 ([ffi](/reference/ffi/)). The instructions are optional on both machines that have them: AArch64
 makes them mandatory only from Armv8.1, and SSE 4.2 is past the x86-64 baseline the x86 rows ask for.
 So the symbol is true on `aarch64-macos`, whose every processor has them, and elsewhere only where the

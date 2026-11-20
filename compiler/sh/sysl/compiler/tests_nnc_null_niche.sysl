@@ -1,0 +1,402 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// **An `Option` of a thin reference has a null niche** (`layout.sysl`'s `null_niche`,
+// `reference/memory.md § An Option of a reference is one word`): `Option[&T]` and `Option[&sync T]`
+// are the address alone, and `None` is null. A raw `*T` may be null, so its `Option` keeps the tag,
+// as Rust's does, and an `extern` or `@export` that names one is refused.
+//
+// The axes: the size wherever the value sits (a local, a field, an array element, nested in another
+// `Option`), next to the shapes that keep the tag (a raw pointer, a trait object, a weak reference,
+// an integer); every way a tag is read (a `match`, its `switch`, `?`, `unwrap`, the library's
+// generic methods instantiated at a reference and crossing to a tagged `Option`); ARC of a `&T`
+// inside `Some` in a local, a field, an array element, reassigned, passed and returned, counted to
+// zero; module storage (`None`, a zeroed one, an array of them); a `Some` of a null `*T` staying a
+// `Some`; the C boundary (an extern handed an `Option[&T]` and NULL, its signature, the refusals of
+// `Option[*T]` and `Option[*extern]` on an extern and of `Option[*T]` and `Option[&T]` on an export);
+// and a 32-bit target.
+//
+// Skipped cells, and why: separate compilation does not change a layout, which every unit asks of
+// the same `TargetLayout`; an extern ANSWERING an `Option[&T]` hands back a count exactly as one
+// answering a bare `&T` does, which is that rule's to test.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private nnc_ready() -> bool = std_root().is_ok() && clang_available()
+
+// The program built (counted, and with a C file beside it where one is given) and run: what it
+// printed on both streams, and its status, or the build's complaint and -1.
+private nnc_outcome(text: string, c: string) -> (string, int)
+    val root = make_temp_dir("sysl-nnc").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    if c != "" then write_text(s"$root/probe.c", c).unwrap()
+
+    val exe = s"$root/built"
+
+    force_alloc_counting(true)
+
+    val built = build_native_program(root, None, None, DefaultOptimization, Some(exe))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end nnc_outcome
+
+private nnc_prints(text: string, c: string, want: string)
+    if !nnc_ready() then return
+
+    val out = nnc_outcome(text, c)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+end nnc_prints
+
+// What a compilation for `t` came to: the first thing it said about the program, or nothing, its
+// LLVM text and its functions.
+private nnc_build(text: string, t: Target) -> (string, string, Buf[TFunc])
+    var units: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, t) match
+            Err(_) -> ()
+            Ok(found) -> units = found
+
+    val parsed = parse(source_of("test.sysl", text), t)
+
+    if !parsed.ok() then return (parsed.report.at(0).message, "", buf())
+
+    units.push(parsed.program)
+
+    val done = analyze_produced(units, t, buf(), true)
+    val early = nnc_first_of(done.reported)
+
+    if early != "" then return (early, "", buf())
+
+    val whole = program_of(done, done.main_module)
+    var own: Buf[string] = buf()
+
+    own.push("")
+
+    val pr = post_analysis_checks(done.an, whole, own)
+    val late = nnc_first_of(done.an.diagnostics())
+
+    if late != "" then return (late, "", buf())
+
+    val kept = prune(strip_tests(whole), own)
+
+    ("", ir_print_module(codegen_with_gaps(kept, t, pr).0), kept.funcs)
+end nnc_build
+
+private nnc_first_of(said: Buf[Placed]) -> string
+    for item in said
+        if !item.src.name.starts_with("library/") then return item.diag.message
+
+    ""
+end nnc_first_of
+
+private nnc_says(text: string, part: string) = assert(text.contains(part), s"expected '$part' in:\n$text")
+
+// -- the size -------------------------------------------------------------------------------------
+
+@test("an Option of a reference is one word; a raw pointer, a trait object, a weak edge and an int keep the tag")
+nnc_sizes()
+    nnc_prints(raw"""
+        struct Node
+            v: int
+
+        trait Shape
+            area(self) -> int
+
+        struct Pair
+            a: Option[&Node]
+            b: int
+
+        print(sizeof(Option[&Node]), alignof(Option[&Node]), sizeof(Option[&sync Node]))
+        print(sizeof(Option[*int]), sizeof(Option[*u8]), sizeof(Option[int]), sizeof(Option[*Shape]),
+              sizeof(Option[weak Node]))
+        print(sizeof(Option[Option[&Node]]), sizeof(Pair), sizeof([4]Option[&Node]))
+        """, "", "8 8 8\n16 16 8 24 16\n16 16 32\n")
+
+@test("on a 32-bit target the Option of a reference is the four-byte address and no tag")
+nnc_thirty_two_bits()
+    if std_root().is_err() then return
+
+    val b = nnc_build(raw"""
+        struct Cell
+            v: int
+
+        @assert(sizeof(Option[&Cell]) == 4, "one address")
+        @assert(sizeof(Option[*Cell]) == 8, "a tag beside the address")
+
+        first(o: Option[&Cell]) -> int = o match
+            Some(c) -> c.v
+            None -> -1
+
+        @export("pick")
+        pick() -> int = first(None)
+        """, target_named("thumb-freestanding").unwrap())
+
+    assert_eq(b.0, "")
+    nnc_says(b.1, "%enum.sysl$Option.ref.Cell = type { [1 x i32] }")
+// -- every way the variant is read ----------------------------------------------------------------
+
+@test("a match, unwrap, unwrap_or, is_none and ? read an Option of a reference by its address")
+nnc_reads()
+    nnc_prints(raw"""
+        struct Node
+            v: int
+
+        first_over(a: [3]&Node, k: int) -> Option[&Node]
+            for n in a
+                if n.v > k then return Some(n)
+
+            None
+
+        twice(a: [3]&Node, k: int) -> Option[int]
+            val n = first_over(a, k)?
+
+            Some(n.v * 2)
+
+        val a: [3]&Node = [Node(1), Node(5), Node(9)]
+
+        print(first_over(a, 4).unwrap().v, first_over(a, 9).is_none(), twice(a, 0).unwrap_or(-1),
+              twice(a, 9).unwrap_or(-1))
+
+        for k in [0, 6, 100]
+            first_over(a, k) match
+                Some(n) -> print(n.v)
+                None -> print("none")
+        """, "", "5 true 2 -1\n1\n9\nnone\n")
+
+@test("the library's generic methods instantiated at an address, and crossing to a tagged Option and back")
+nnc_generic_methods()
+    nnc_prints(raw"""
+        struct Node
+            v: int
+
+        wrap[T](x: T) -> Option[T] = Some(x)
+
+        val some: Option[&Node] = wrap(Node(4))
+        val none: Option[&Node] = None
+        val nums: Option[int] = some.map(n -> n.v + 1)
+        val back: Option[&Node] = nums.map(v -> Node(v * 10))
+
+        print(nums.unwrap(), back.unwrap().v, none.map(n -> n.v).is_none())
+        print(some.filter(n -> n.v > 9).is_none(), some.filter(n -> n.v < 9).unwrap().v)
+        print(some.ok_or("gone").is_ok(), none.ok_or("gone").is_err())
+        print(wrap(3).unwrap(), wrap(none).unwrap().is_none(), wrap(some).unwrap().unwrap().v)
+        """, "", "5 50 true\ntrue 4\ntrue true\n3 true 4\n")
+
+// -- ownership ------------------------------------------------------------------------------------
+
+@test("a reference inside Some is counted in a local, a field, an array element, reassigned, passed and returned")
+nnc_counted()
+    nnc_prints(raw"""
+        struct Node
+            v: int
+
+        impl Drop for Node
+            drop(self) = print("drop", self.v)
+
+        struct Holder
+            item: Option[&Node]
+            n: int
+
+        wrap[T](x: T) -> Option[T] = Some(x)
+
+        pass(o: Option[&Node]) -> Option[&Node] = o
+
+        run()
+            var h = Holder(Some(Node(1)), 0)
+            var arr: [2]Option[&Node] = [None, wrap(Node(2))]
+
+            print(h.item.unwrap().v, arr[1].unwrap().v, arr[0].is_none())
+            h.item = None
+            print("cleared")
+            arr[0] = pass(arr[1])
+            arr[1] = None
+            print(arr[0].unwrap().v)
+
+        run()
+        print("end")
+        """, "", "1 2 true\ndrop 1\ncleared\n2\ndrop 2\nend\n")
+
+@test("an Option of a reference bound out of a match outlives the value it was read from")
+nnc_bound_share()
+    nnc_prints(raw"""
+        struct Node
+            v: int
+
+        impl Drop for Node
+            drop(self) = print("drop", self.v)
+
+        keep() -> &Node
+            var o: Option[&Node] = Some(Node(7))
+
+            o match
+                Some(n) ->
+                    o = None
+                    print("taken")
+                    return n
+                None -> return Node(0)
+
+        val k = keep()
+
+        print(k.v)
+        """, "", "taken\n7\ndrop 7\n")
+
+// -- module storage and the zero value ------------------------------------------------------------
+
+@test("None, a zeroed one and an array of them in module storage, beside a tagged constant Some of an address")
+nnc_module_storage()
+    nnc_prints(raw"""
+        struct Cell
+            v: int
+
+        var c = Cell(7)
+        var held: Option[*Cell] = Some(&c)
+        var nothing: Option[&Cell] = None
+        var later: Option[&Cell]
+        var many: [3]Option[&Cell]
+
+        print(held.unwrap().v, nothing.is_none(), later.is_none(), many[2].is_none())
+        later = Some(Cell(8))
+        print(later.unwrap().v)
+        """, "", "7 true true true\n8\n")
+
+// -- a raw pointer keeps its tag ------------------------------------------------------------------
+
+@test("a Some of a null raw pointer stays a Some, in a local, through generic code and in a Buf")
+nnc_some_null_stays_some()
+    nnc_prints(raw"""
+        import sysl.buf.{Buf, buf}
+
+        wrap[T](x: T) -> Option[T] = Some(x)
+
+        val p: *int = null
+        val o: Option[*int] = Some(p)
+
+        print(o.is_some(), o.unwrap() == null, wrap(p).is_some())
+
+        var x = 5
+        var b: Buf[*int] = buf()
+
+        b.push(&x)
+        b.push(null)
+        print(b.pop().is_some(), b.pop().is_some(), b.pop().is_none())
+
+        val f: *extern(i32) -> i32 = null
+
+        print(Some(f).is_some())
+        """, "", "true true true\ntrue true true\ntrue\n")
+
+// -- the C boundary -------------------------------------------------------------------------------
+
+// An `Option` of a reference on an `extern` crosses where a bare `&T` does, as the one address C
+// sees -- the very address the bare `&T` hands over -- with `None` the null C may be handed.
+@test("an extern taking an Option of a reference is handed the bare reference's address, and NULL for None")
+nnc_extern_option_ref()
+    nnc_prints(raw"""
+        struct Node
+            v: i32
+
+        extern c_same(a: Option[&Node], b: &Node) -> i32
+        extern c_is_null(a: Option[&Node]) -> i32
+
+        val n: &Node = Node(41)
+        val m: &Node = Node(7)
+
+        print(c_same(Some(n), n), c_same(Some(m), n), c_is_null(None), c_is_null(Some(n)), n.v)
+        """, raw"""
+        #include <stdint.h>
+        #include <stddef.h>
+
+        int32_t c_same(void *a, void *b) { return a == b; }
+        int32_t c_is_null(void *a) { return a == NULL; }
+        """, "1 0 1 0 41\n")
+
+@test("and its signature is a plain ptr, nothing through memory")
+nnc_extern_option_ref_signature()
+    if std_root().is_err() then return
+
+    val b = nnc_build(raw"""
+        struct Node
+            v: i32
+
+        extern c_value_or(n: Option[&Node], d: i32) -> i32
+
+        print(c_value_or(None, 0))
+        """, host_target())
+
+    assert_eq(b.0, "")
+    nnc_says(b.1, "declare i32 @c_value_or(ptr, i32)\n")
+
+// An `Option` of a raw pointer is tagged, so it is not C's nullable pointer; before, the tag was read
+// out of the address's low bits.
+@test("an extern taking or answering an Option of a raw pointer is refused, naming the plain pointer")
+nnc_extern_option_ptr_refused()
+    if std_root().is_err() then return
+
+    val taking = nnc_build("extern c_is_null(p: Option[*i32]) -> i32\n", host_target()).0
+
+    nnc_says(taking, "'p' of the 'extern' 'c_is_null' is ")
+    nnc_says(taking, "which C has no spelling for — an 'Option' of a raw pointer is a tag beside the address")
+    nnc_says(taking, "A pointer C may make null is a plain '*int', compared with 'null'")
+
+    val answering = nnc_build("extern c_find(want: i32) -> Option[*u8]\n", host_target()).0
+
+    nnc_says(answering, "the 'extern' 'c_find' returns ")
+    nnc_says(answering, "A pointer C may make null is a plain '*byte', compared with 'null'")
+
+    val callback = nnc_build("extern c_set(f: Option[*extern(i32) -> i32])\n", host_target()).0
+
+    nnc_says(callback, "'f' of the 'extern' 'c_set' is ")
+    nnc_says(callback, "compared with 'null'")
+
+@test("an exported Option of a raw pointer is refused, naming the plain pointer")
+nnc_export_option_ptr_refused()
+    if std_root().is_err() then return
+
+    val b = nnc_build(raw"""
+        @export("s_pick")
+        pick(p: Option[*i32]) -> int = 0
+        """, host_target())
+
+    nnc_says(b.0, "which C has no way to spell")
+    nnc_says(b.0, "A pointer C may make null is a plain '*int', compared with 'null'")
+
+@test("an exported Option of a counted reference is refused with the counted reference's advice")
+nnc_export_counted_refused()
+    if std_root().is_err() then return
+
+    val b = nnc_build(raw"""
+        struct Node
+            v: int
+
+        @export("s_bad")
+        bad(n: Option[&Node]) -> int = 0
+        """, host_target())
+
+    nnc_says(b.0, "which C has no way to spell")
+    nnc_says(b.0, "A counted reference has a header C would have to know the layout of")

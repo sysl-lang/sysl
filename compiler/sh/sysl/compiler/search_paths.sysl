@@ -64,6 +64,9 @@ reset_search_paths()
     sp_no_error_traces = false
     sp_build_mode = None
     sp_const_steps = None
+    sp_frame_limit = None
+    sp_stack_usage = None
+    forget_frames()
     sp_error_limit = None
     sp_general_regs_only = false
     sp_strict_align = false
@@ -112,6 +115,18 @@ private const_steps_operand(text: string) -> Option[long]
 
     if digits == 0 || n == 0 then None else Some(n)
 end const_steps_operand
+
+// What `--frame-limit <bytes>` gave: the most bytes one function's stack frame may take, for every
+// function the build compiles that says nothing nearer (`frame_limit.sysl`). It beats the root
+// manifest's `frame_limit` key.
+private var sp_frame_limit: Option[long] = None
+
+frame_limit_flag() -> Option[long] = sp_frame_limit
+
+// What `--stack-usage <file>` gave: where the report of every function's frame is written.
+private var sp_stack_usage: Option[string] = None
+
+stack_usage_flag() -> Option[string] = sp_stack_usage
 
 // What `--error-limit <n>` gave: how many errors a failed compilation reports (`diag.sysl`), `0` for
 // every one of them.
@@ -170,6 +185,9 @@ link_flag_refusal(args: []const string) -> Option[string]
             return Some(s"'--const-steps' takes how many steps a compile-time evaluation may run, a " +
                         s"whole number above zero, and '${args[i + 1]}' is not one")
         end if
+
+        if args[i] == "--frame-limit" && i + 1 < args.len && frame_bytes_operand(args[i + 1]).is_none()
+            return Some(frame_bytes_refusal("'--frame-limit'", args[i + 1]))
 
         if args[i] == "--error-limit" && i + 1 < args.len && error_limit_operand(args[i + 1]).is_none()
             return Some(s"'--error-limit' takes how many errors to show, a whole number with '0' for " +
@@ -526,6 +544,23 @@ took_search_flag(args: []const string, i: usize) -> int
             Some(n) -> sp_const_steps = Some(n)
             None -> return 0
 
+        return 2
+    end if
+
+    if arg == "--frame-limit"
+        if i + 1 >= args.len then return 0
+
+        frame_bytes_operand(args[i + 1]) match
+            Some(n) -> sp_frame_limit = Some(n)
+            None -> return 0
+
+        return 2
+    end if
+
+    if arg == "--stack-usage"
+        if i + 1 >= args.len || args[i + 1].is_empty() then return 0
+
+        sp_stack_usage = Some(args[i + 1])
         return 2
     end if
 

@@ -120,7 +120,7 @@ lower_nested_group(cx: &Analyzer, span: Span, group: Buf[FuncDecl]) -> Buf[TStmt
 
     cx.an.env_count += 1
 
-    val st = StructType(base, buf(), fields, false, None, None, false, None, buf(), false, buf(), buf())
+    val st = StructType(base, buf(), fields, false, None, None, false, None, buf(), false, buf(), buf(), false)
     val env = Struct(st)
 
     cx.an.tables.struct_insts.put(base, env)
@@ -459,6 +459,13 @@ private nested_body_in(a: &Analysis, f: &NestedFrame, fname: string, d: FuncDecl
 
     params.push((inner.bind("self", self_ty), self_ty))
 
+    // A parameter's written type is its spelling unless it names a type parameter -- the function's
+    // own, or one of the function around it -- which is no spelling of the instantiation.
+    var tparams = subst_names(inner)
+
+    for t in d.tparams
+        tparams.push(t)
+
     for param in d.params
         val ty = resolve_type(a, f.scope, param.typ, subst)
 
@@ -468,6 +475,7 @@ private nested_body_in(a: &Analysis, f: &NestedFrame, fname: string, d: FuncDecl
         if holds_string(d.marks.copies, param.name) then inner.copied.push(unique)
 
         params.push((unique, ty))
+        inner.spell_binding(unique, spelling_of(param.typ, ty, tparams))
 
     for i in 0..<f.captured.len()
         val stored = f.env.fields[i].1

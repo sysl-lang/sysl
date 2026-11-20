@@ -238,6 +238,28 @@ private location_roots_of(root: string, packages: Buf[string]) -> Buf[(string, s
     out
 end location_roots_of
 
+// The package roots a compilation reads, each with whether its own manifest says
+// `checked_overflow = true` (`checked.sysl`): the project's, each `--lib` root and each package the
+// graph resolved. A file is the package's whose root is the longest that holds it.
+private checked_roots_of(root: string, m: &Manifest, packages: Buf[string]) -> Buf[(string, bool)]
+    var out: Buf[(string, bool)] = buf()
+
+    out.push((absolute_path(root) + "/", m.checked_overflow.unwrap_or(false)))
+
+    for item in lib_roots()
+        out.push((absolute_path(item) + "/", said_checked(item)))
+
+    for item in packages
+        out.push((absolute_path(item) + "/", said_checked(item)))
+
+    out
+end checked_roots_of
+
+// Whether the manifest in `dir` says `checked_overflow = true`.
+private said_checked(dir: string) -> bool = manifest_at(dir) match
+    Ok(theirs) -> theirs.checked_overflow.unwrap_or(false)
+    Err(_) -> false
+
 // The package an **example** belongs to: the root two levels above a program that sits in a
 // package's `examples/` directory, or nothing (`reference/packages.md § A package may carry
 // examples`). `root` is the project root a command was given -- the directory named, or the one a
@@ -366,6 +388,7 @@ packaged_compilation_of(path: string, t: Target, keep_tests: bool = true,
     val handed = lib_root_units(t, fetched)?
 
     use_location_roots(location_roots_of(root, fetched.roots))
+    use_checked_packages(checked_roots_of(root, manifest, fetched.roots))
 
     var theirs: Buf[Program] = buf()
 
@@ -447,6 +470,10 @@ packaged_compilation_of(path: string, t: Target, keep_tests: bool = true,
 
         unit.pkg = mine_pkg
         units.push(unit)
+
+    // What every function's frame is held to: the build's limit and each package's own
+    // (`frame_limit.sysl`).
+    note_frame_limits(units, manifest.frame_limit, own_manifest)
 
     Ok(Compilation(units, own, t))
 end packaged_compilation_of
@@ -761,6 +788,15 @@ emit_llvm_text(path: string, named_target: Option[string],
                 Ok(None) -> ()
 
     phase_done("std")
+    forget_field_paths(done.an)
+
+    // **The text a `@stack(n)` is checked against holds every body the build reaches** -- the
+    // library's too, which the lowering below only declares where the artifact has them. Where it does,
+    // that text is lowered here, BEFORE it: a compact lowering leaves each function it has printed
+    // without its body, so nothing could be lowered from the program after it (`stack_bound.sysl`).
+    val nothing_precompiled = linked.precompiled.is_empty() && roots.precompiled.is_empty()
+    val stack_text = if nothing_precompiled || !stack_marked(kept) then None
+    else Some(ir_print_module(codegen_with_gaps(kept with { precompiled = buf() }, t, promotions).0))
 
     // **A build that links and optimizes also carries a copy of each small or `@inline` function
     // those halves define** (`codegen.sysl`'s `importable`), so that a call into a package inlines as
@@ -779,15 +815,45 @@ emit_llvm_text(path: string, named_target: Option[string],
     // hook**, where nothing writes it a default (`check_aligned_heap`).
     check_aligned_heap(done.an, kept)
 
+    val text = ir_print_module(lowered.0)
+
+    // **And a function marked `@stack(n)` is held to it**, against the frames the back end lays out
+    // (`stack_bound.sysl`). The text is reused where it already holds the library's bodies.
+    val whole_text = if nothing_precompiled then Some(text) else stack_text
+
+    check_stack_bounds(done.an, kept, t, level, promotions, whole_text)
+
     // Read back out of the analysis rather than off the snapshot the body pass answered with: the
     // checks above have just added to it.
     val report = errors_of(done.an.diagnostics())
 
     say_warnings(report, done.an)
 
-    Ok(Emitted(ir_print_module(lowered.0), report, lowered.1, link_required(program.units),
-               roots.archives))
+    Ok(Emitted(text, report, lowered.1, link_required(program.units),
+               roots.archives, entries_of(kept, image_entry_named(root, t)), stack_assumptions(kept.funcs)))
 end emit_llvm_text
+
+// The symbols a program is entered by, in the order `sysl stack` reports them: `main`, a bare
+// image's named entry, then the program's exports by symbol.
+private entries_of(p: TProgram, image_entry: string) -> Buf[(string, string)]
+    var out: Buf[(string, string)] = buf()
+
+    if p.entry_point then out.push(("main", "main"))
+    if image_entry != "" && image_entry != "main" then out.push((image_entry, image_entry))
+
+    var exported: Buf[string] = buf()
+
+    for f in p.funcs
+        if f.exported.is_some() && !std_module(f.declared_in) then exported.push(f.exported.unwrap())
+
+    for symbol in sort_names(exported)
+        for f in p.funcs
+            if f.exported.is_some() && f.exported.unwrap() == symbol
+                out.push((symbol, qualified_name(f.name)))
+                break
+
+    out
+end entries_of
 
 // **Whether a project could be built for a bare machine**, which is what a hosted build's warning
 // about computed module storage is for. The rule:
@@ -1216,6 +1282,15 @@ struct Emitted
     // The `--lib` roots' kept halves the text declares rather than defines (`root_artifact.sysl`),
     // each an archive for the link. Empty for every command but the ones that link.
     archives: Buf[string]
+
+    // The symbols code outside the program enters it by -- `main`, a bare image's own entry, and each
+    // function the program exports -- each beside the name a reader wrote it under. Only
+    // `emit_llvm_text` fills it; `sysl stack` reads it.
+    entries: Buf[(string, string)]
+
+    // What `@stack(calls: m)` says each call through a pointer needs, by the symbol of the function
+    // whose body makes it.
+    stack_assumed: Buf[(string, u64)]
 end Emitted
 
 // The typed tree: every body this compilation could type, in the `funcs:` section the reference
@@ -1238,7 +1313,7 @@ private typed_text(c: Compilation, tables: bool, spans: bool) -> Emitted
     val text = if tables then show_tables(shown) else show_typed_program(shown)
 
     set_typed_spans(was)
-    Emitted(text, report, buf(), buf(), buf())
+    Emitted(text, report, buf(), buf(), buf(), buf(), buf())
 end typed_text
 
 // The typed tree a compilation answers with, and what its analysis reported -- the tree `emit-typed`
@@ -1494,7 +1569,7 @@ build_c_archive(path: string, named_target: Option[string], cc: Option[string], 
 
     headers_refused(path).map_err(said)?
 
-    val lowered = lower_for_c(path, t)?
+    val lowered = lower_for_c(path, t, Some(level))?
 
     if !lowered.emitted.report.is_empty()
         return Err(Reported(analysis_report(lowered.emitted.report)))
@@ -1926,7 +2001,10 @@ end LoweredForC
 // not a C artifact: it is linked by a program that has one, and the library build has already
 // deferred every function reaching computed storage to it. An archive has nobody to defer to, so it
 // carries a constructor of its own where the platform runs one.
-private lower_for_c(path: string, t: Target) -> Result[LoweredForC, Failure]
+//
+// `level` is the optimization the archive is built at, which a `@stack(n)` is checked at; the header
+// alone builds nothing, and checks nothing.
+private lower_for_c(path: string, t: Target, level: Option[string] = None) -> Result[LoweredForC, Failure]
     val program = packaged_compilation_of(path, t, false)?
 
     // **Told there is no entry point before a declaration is read, and that is not a detail.** A
@@ -1965,13 +2043,14 @@ private lower_for_c(path: string, t: Target) -> Result[LoweredForC, Failure]
     val lowered = codegen_with_gaps(kept, t, promotions)
 
     check_aligned_heap(done.an, kept)
+    if level.is_some() then check_stack_bounds(done.an, kept, t, level.unwrap(), promotions, None)
 
     val report = errors_of(done.an.diagnostics())
 
     say_warnings(report, done.an)
 
     Ok(LoweredForC(Emitted(ir_print_module(archive_internalized(lowered.0)), report, lowered.1,
-                           link_required(program.units), buf()),
+                           link_required(program.units), buf(), buf(), buf()),
                    offered_exports(kept.funcs), offered_storage(kept.vals), done.an.header_defines))
 end lower_for_c
 
@@ -2247,10 +2326,33 @@ run_cache_key_for(command: string, path: string, named_target: Option[string], l
     // for it has no entry to replay.
     if explaining_drops() then return None
 
+    // Nor was the report of every frame, which is read off the compile.
+    if stack_usage_flag().is_some() then return None
+
     target_for(path, named_target) match
         Ok(t) -> run_cache_key_of(command, path, t, level, cc)
         Err(_) -> None
 end run_cache_key_for
+
+// The key for `command` and the key for `other` over the same tree, from one reading of it: a
+// narrowed test build looks for its own entry and then for the whole tree's (`test_project`).
+run_cache_keys_for(command: string, other: string, path: string, named_target: Option[string],
+                   level: string, cc: Option[string]) -> (Option[string], Option[string])
+    if explaining_drops() then return (None, None)
+
+    val t = target_for(path, named_target) match
+        Ok(found) -> found
+        Err(_) -> return (None, None)
+
+    run_cache_parts(command, path, t, level, cc) match
+        Ok(found) ->
+            var parts = found
+            val first = run_cache_key(parts)
+
+            parts[0] = other
+            (Some(first), Some(run_cache_key(parts)))
+        Err(_) -> (None, None)
+end run_cache_keys_for
 
 // What a shell hears when a child ends. A signal has no exit status of its own, and `128 + n` is what
 // every shell reports for one -- so it is what a caller reading this number will already be
@@ -2282,6 +2384,10 @@ struct TestBuild
     // Whether the tree being tested is itself the standard module, in which case there is no
     // artifact to link: the bodies the tests call are in the text above.
     standalone: bool
+
+    // How many `@tests` files `--file` left out of the build (`test_selection.sysl`); zero is the
+    // whole tree, which answers any `--file` and is kept under the whole tree's key.
+    dropped_files: usize
 end TestBuild
 
 // `sysl test [--target <name>] <path>` -- the same program lowered as a **test build**.
@@ -2292,8 +2398,12 @@ end TestBuild
 //
 // The analysis in front of it is the analysis every other build gets, and that is deliberate: a test
 // is code somebody wrote and is held to the same rules.
+//
+// **`within` is what `--file` named**: the `@tests` files nothing named and nothing kept needs are
+// left out before the analysis (`narrowed_test_units`), and their tests listed to be counted only.
 test_build_of(path: string, named_target: Option[string],
-              level: string = DefaultOptimization, compact: bool = true) -> Result[TestBuild, Failure]
+              level: string = DefaultOptimization,
+              within: Buf[string] = buf(), compact: bool = true) -> Result[TestBuild, Failure]
     val t = test_target_of(path, named_target)?
 
     headers_refused(path)?
@@ -2305,7 +2415,13 @@ test_build_of(path: string, named_target: Option[string],
 
     phase_done("parse program")
 
-    Ok(test_build_from(program, false, level, path, true, compact)?)
+    val narrowed = narrowed_test_units(program.units, within)
+    val built = test_build_from(program with { units = narrowed.units }, false, level, path, true, compact)?
+
+    for dropped in narrowed.dropped_tests
+        built.tests.push(dropped)
+
+    Ok(built with { dropped_files = narrowed.dropped_files })
 end test_build_of
 
 // The suite a build child compiled, as the link child takes it up (`test_child.sysl`): the module's text
@@ -2333,7 +2449,8 @@ test_build_restored(path: string, named_target: Option[string],
     // The link is timed as the build child's phases were (`SYSL_TIMINGS=1`).
     phase_start()
 
-    Ok(TestBuild(Emitted(s.text, buf(), buf(), s.links, s.archives), s.tests, t, false))
+    Ok(TestBuild(Emitted(s.text, buf(), buf(), s.links, s.archives, buf(), buf()), s.tests, t, false,
+                 s.dropped_files))
 end test_build_restored
 
 // The same for a tree that **is** the standard module (`sysl test <root> --std`), which is how the
@@ -2392,6 +2509,57 @@ private test_build_from(program: Compilation, standalone: bool, level: string,
     // A test binary links the roots' kept halves as a program does. A root whose own tests this build
     // runs is one the project declares into, which is exactly a root that is compiled from source.
     val roots = if standalone then no_roots_linked() else roots_linked(program, project, level)
+    val ready = tests_analyzed(program, standalone, project, warns)
+
+    var precompiled: Buf[string] = buf()
+
+    std_linked(t, level, standalone) match
+        Err(why) -> return Err(Refusal(why))
+        Ok(Some(found)) -> precompiled = found.precompiled
+        Ok(None) -> ()
+
+    phase_done("std")
+
+    val lowered = codegen_with_gaps(ready.kept with { precompiled = joined_names(precompiled,
+                                                                                 roots.precompiled) },
+                                    t, ready.promotions, imports_bodies(level), None, false, program.own,
+                                    compact)
+
+    phase_done("codegen")
+
+    check_aligned_heap(ready.an, ready.kept)
+
+    val report = errors_of(ready.an.diagnostics())
+
+    if warns then say_warnings(report, ready.an)
+
+    val emitted = Emitted(ir_print_module(lowered.0), report, lowered.1,
+                          link_required(program.units), roots.archives, buf(), buf())
+
+    phase_done("print")
+
+    Ok(TestBuild(emitted, ready.kept.tests, t, standalone, 0))
+end test_build_from
+
+// What lowering a test build reads of its analysis: the pruned program, what the escape analysis
+// promoted, and the analysis itself for the one check that follows the lowering and for the report.
+struct TestsAnalyzed
+    an: &Analysis
+    kept: TProgram
+    promotions: Promotions
+end TestsAnalyzed
+
+// A test build's program analyzed, checked and pruned to what its tests reach.
+//
+// **Everything the lowering does not read is let go of before it starts**, which is why this is a
+// function of its own: the typed bodies as the analysis answered them and the unpruned program are
+// this frame's, so they go when it returns, and the field-path analysis the checks kept on the
+// analysis -- a summary of every body, and more than a quarter of what the analysis holds -- is
+// dropped once the escape analysis has read it. The allocator never gives a freed block back to the
+// system, but the lowering reuses it, so what goes here is what the lowering would otherwise have
+// taken fresh. Every check that reads the unpruned program runs here, before the lowering.
+tests_analyzed(program: Compilation, standalone: bool, project: string, warns: bool) -> TestsAnalyzed
+    val t = program.target
 
     // **Every body the library declares is typed when the library is what is being built**, not only
     // the ones a test happens to reach. It is the same reading `library_build` asks for, and the
@@ -2411,24 +2579,6 @@ private test_build_from(program: Compilation, standalone: bool, level: string,
     val kept = tests_only(whole, program.own)
 
     check_library_hooks(done.an, kept)
-    phase_done("prune")
-
-    var precompiled: Buf[string] = buf()
-
-    std_linked(t, level, standalone) match
-        Err(why) -> return Err(Refusal(why))
-        Ok(Some(found)) -> precompiled = found.precompiled
-        Ok(None) -> ()
-
-    phase_done("std")
-
-    val lowered = codegen_with_gaps(kept with { precompiled = joined_names(precompiled,
-                                                                           roots.precompiled) },
-                                    t, promotions, imports_bodies(level), None, false, program.own, compact)
-
-    phase_done("codegen")
-
-    check_aligned_heap(done.an, kept)
 
     if warns
         val root = if is_directory(project) then project else parent_of(project).unwrap_or(".")
@@ -2437,17 +2587,11 @@ private test_build_from(program: Compilation, standalone: bool, level: string,
             check_bare_metal_storage(done.an, strip_tests(whole), program.own, root, false)
     end if
 
-    val report = errors_of(done.an.diagnostics())
+    phase_done("prune")
+    forget_field_paths(done.an)
 
-    if warns then say_warnings(report, done.an)
-
-    val emitted = Emitted(ir_print_module(lowered.0), report, lowered.1,
-                          link_required(program.units), roots.archives)
-
-    phase_done("print")
-
-    Ok(TestBuild(emitted, kept.tests, t, standalone))
-end test_build_from
+    TestsAnalyzed(done.an, kept, promotions)
+end tests_analyzed
 
 // A test binary, linked exactly as a program is, in a directory of its own.
 //

@@ -408,6 +408,10 @@ struct StashedBuild
 
     // Every file the build's C read, which the run cache keys the binary on (`c_object_cache.sysl`).
     files_read: Buf[string]
+
+    // How many `@tests` files `--file` left out of the build (`TestBuild.dropped_files`), which picks
+    // the key the linked binary is kept under.
+    dropped_files: usize
 end StashedBuild
 
 // Where the build child writes the compiled suite: beside the plan, in the runner's directory, which
@@ -436,6 +440,7 @@ stash_written(plan: string, s: StashedBuild, note: string -> unit) -> int
         plan_test(&b, t)
 
     plan_list(&b, s.files_read)
+    plan_field(&b, s"${s.dropped_files}")
 
     val wrote = write_text(s"$at.ll", s.text).is_ok() && write_text_atomic(at, b.finish()).is_ok()
 
@@ -458,10 +463,11 @@ stash_read(at: string) -> Option[StashedBuild]
         tests.push(r.test())
 
     val files = r.fields()
+    val dropped = r.number()
 
-    if !r.ok || r.at != record.bytes.len then return None
+    if !r.ok || r.at != record.bytes.len || dropped < 0 then return None
 
-    Some(StashedBuild(text, links, archives, tests, files))
+    Some(StashedBuild(text, links, archives, tests, files, usize(dropped)))
 end stash_read
 
 private plan_list(b: *StrBuilder, items: Buf[string])

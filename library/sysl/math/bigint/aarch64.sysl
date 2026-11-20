@@ -1,0 +1,348 @@
+module sysl.math.bigint
+
+// The five carrying kernels in AArch64 assembly, which `kernels.sysl` dispatches to on that
+// processor. Each takes `n > 0` (the dispatcher answers `n == 0` itself, since `&r[0]` of an empty
+// run is no address) and is the portable loop's contract exactly: the same result, the same carry
+// out, `r` allowed to be `a` (and `b`, for the two-run kernels). Every load of a step comes before
+// its store, which is what makes the aliasing safe.
+//
+// **The carry lives in the flags across the loop's back edge**, which is what the portable loops
+// cannot get from the back end. Nothing between one `adcs` and the next touches the flags: `ldp`,
+// `stp`, `mul`, `umulh`, a `sub` without `s`, `lsr`, `tbz`, `cbz`/`cbnz`, `mov` and `cinc` all leave
+// them alone.
+//
+// **The `n % 4` limbs below the four-limb blocks are taken in straight-line code**, one limb if bit 0
+// of `n` is set and two if bit 1 is, inside the same carry chain, rather than by a scalar loop: a
+// thirty-limb run is two of them and seven blocks, and nothing branches back.
+
+#if aarch64
+
+/** `add_n` for `n > 0`. */
+private[bigint] add_n_asm(r: []Limb, a: []const Limb, b: []const Limb, n: usize) -> Limb
+    var rp = &r[0]
+    var ap = &a[0]
+    var bp = &b[0]
+    var k = n
+    var carry: Limb = 0
+
+    asm
+        [aarch64]
+            "cmn xzr, xzr"                  // the carry starts clear
+            "tbz {k}, #0, 1f"
+            "ldr x4, [{ap}], #8"
+            "ldr x5, [{bp}], #8"
+            "adcs x4, x4, x5"
+            "str x4, [{rp}], #8"
+            "1:"
+            "tbz {k}, #1, 2f"
+            "ldp x4, x5, [{ap}], #16"
+            "ldp x6, x7, [{bp}], #16"
+            "adcs x4, x4, x6"
+            "adcs x5, x5, x7"
+            "stp x4, x5, [{rp}], #16"
+            "2:"
+            "lsr {k}, {k}, #2"              // the count of four-limb blocks
+            "cbz {k}, 4f"
+            "3:"
+            "ldp x4, x5, [{ap}], #16"
+            "ldp x6, x7, [{bp}], #16"
+            "ldp x8, x9, [{ap}], #16"
+            "ldp x10, x11, [{bp}], #16"
+            "adcs x4, x4, x6"
+            "adcs x5, x5, x7"
+            "adcs x8, x8, x10"
+            "adcs x9, x9, x11"
+            "stp x4, x5, [{rp}], #16"
+            "stp x8, x9, [{rp}], #16"
+            "sub {k}, {k}, #1"
+            "cbnz {k}, 3b"
+            "4:"
+            "cset {carry}, hs"
+            inout rp : reg
+            inout ap : reg
+            inout bp : reg
+            inout k : reg
+            out carry : reg
+            clobbers "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11"
+        [x86_64, riscv64, riscv32, thumb, craft, wasm32] unavailable "the AArch64 kernel; the portable loop serves the rest"
+
+    carry
+end add_n_asm
+
+/** `sub_n` for `n > 0`. On AArch64 the carry flag SET means no borrow, so the chain starts set. */
+private[bigint] sub_n_asm(r: []Limb, a: []const Limb, b: []const Limb, n: usize) -> Limb
+    var rp = &r[0]
+    var ap = &a[0]
+    var bp = &b[0]
+    var k = n
+    var borrow: Limb = 0
+
+    asm
+        [aarch64]
+            "cmp xzr, xzr"                  // no borrow yet: the carry flag starts set
+            "tbz {k}, #0, 1f"
+            "ldr x4, [{ap}], #8"
+            "ldr x5, [{bp}], #8"
+            "sbcs x4, x4, x5"
+            "str x4, [{rp}], #8"
+            "1:"
+            "tbz {k}, #1, 2f"
+            "ldp x4, x5, [{ap}], #16"
+            "ldp x6, x7, [{bp}], #16"
+            "sbcs x4, x4, x6"
+            "sbcs x5, x5, x7"
+            "stp x4, x5, [{rp}], #16"
+            "2:"
+            "lsr {k}, {k}, #2"
+            "cbz {k}, 4f"
+            "3:"
+            "ldp x4, x5, [{ap}], #16"
+            "ldp x6, x7, [{bp}], #16"
+            "ldp x8, x9, [{ap}], #16"
+            "ldp x10, x11, [{bp}], #16"
+            "sbcs x4, x4, x6"
+            "sbcs x5, x5, x7"
+            "sbcs x8, x8, x10"
+            "sbcs x9, x9, x11"
+            "stp x4, x5, [{rp}], #16"
+            "stp x8, x9, [{rp}], #16"
+            "sub {k}, {k}, #1"
+            "cbnz {k}, 3b"
+            "4:"
+            "cset {borrow}, lo"
+            inout rp : reg
+            inout ap : reg
+            inout bp : reg
+            inout k : reg
+            out borrow : reg
+            clobbers "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11"
+        [x86_64, riscv64, riscv32, thumb, craft, wasm32] unavailable "the AArch64 kernel; the portable loop serves the rest"
+
+    borrow
+end sub_n_asm
+
+/** `mul_1` for `n > 0`. Each limb is the product's low half plus the high half before it plus the
+ * carry, and the carry chain runs unbroken from the first limb to the last; the last high half
+ * cannot overflow when the final carry is added, since a product's high half is at most `2^w - 2`.
+ */
+private[bigint] mul_1_asm(r: []Limb, a: []const Limb, n: usize, m: Limb, c: Limb) -> Limb
+    var rp = &r[0]
+    var ap = &a[0]
+    var k = n
+    var hi: Limb = 0
+
+    asm
+        [aarch64]
+            "cmn xzr, xzr"
+            "tbz {k}, #0, 1f"
+            "ldr x4, [{ap}], #8"
+            "mul x5, x4, {m}"
+            "umulh x6, x4, {m}"
+            "adcs x5, x5, {hi}"
+            "mov {hi}, x6"
+            "str x5, [{rp}], #8"
+            "1:"
+            "tbz {k}, #1, 2f"
+            "ldp x4, x5, [{ap}], #16"
+            "mul x6, x4, {m}"
+            "umulh x7, x4, {m}"
+            "mul x8, x5, {m}"
+            "umulh x9, x5, {m}"
+            "adcs x6, x6, {hi}"
+            "adcs x8, x8, x7"
+            "mov {hi}, x9"
+            "stp x6, x8, [{rp}], #16"
+            "2:"
+            "lsr {k}, {k}, #2"
+            "cbz {k}, 4f"
+            "3:"
+            "ldp x4, x5, [{ap}], #16"
+            "ldp x6, x7, [{ap}], #16"
+            "mul x8, x4, {m}"
+            "umulh x9, x4, {m}"
+            "mul x10, x5, {m}"
+            "umulh x11, x5, {m}"
+            "adcs x8, x8, {hi}"
+            "mul x12, x6, {m}"
+            "umulh x13, x6, {m}"
+            "adcs x10, x10, x9"
+            "mul x14, x7, {m}"
+            "umulh {hi}, x7, {m}"
+            "adcs x12, x12, x11"
+            "adcs x14, x14, x13"
+            "stp x8, x10, [{rp}], #16"
+            "stp x12, x14, [{rp}], #16"
+            "sub {k}, {k}, #1"
+            "cbnz {k}, 3b"
+            "4:"
+            "adc {hi}, {hi}, xzr"
+            inout rp : reg
+            inout ap : reg
+            inout k : reg
+            inout c -> hi : reg
+            in m : reg
+            clobbers "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14"
+        [x86_64, riscv64, riscv32, thumb, craft, wasm32] unavailable "the AArch64 kernel; the portable loop serves the rest"
+
+    hi
+end mul_1_asm
+
+// `addmul_1` and `submul_1` have two carry chains per limb -- into `r[i]`, and from the high half
+// below -- and one flags register. Each block therefore runs them one after the other and folds both
+// carries into its top high half with `cinc` before the next block starts: first `r` against the low
+// halves, whose carry goes into the top high half, then the result against the high half below each
+// limb (the incoming one, then the block's own three), whose carry goes in too. The incoming high
+// half is all the second chain waits on, so the first runs ahead of it. Neither fold can overflow:
+// the high half is at most `2^w - 2`, and the sum of all three is the true carry out, which fits.
+
+/** `addmul_1` for `n > 0`. */
+private[bigint] addmul_1_asm(r: []Limb, a: []const Limb, n: usize, m: Limb) -> Limb
+    var rp = &r[0]
+    var ap = &a[0]
+    var k = n
+    var hi: Limb = 0
+
+    asm
+        [aarch64]
+            "tbz {k}, #0, 1f"
+            "ldr x4, [{ap}], #8"
+            "ldr x5, [{rp}]"
+            "mul x6, x4, {m}"
+            "umulh {hi}, x4, {m}"           // the first limb has no high half below it
+            "adds x6, x6, x5"
+            "cinc {hi}, {hi}, hs"
+            "str x6, [{rp}], #8"
+            "1:"
+            "tbz {k}, #1, 2f"
+            "ldp x4, x5, [{ap}], #16"
+            "ldp x8, x9, [{rp}]"
+            "mul x6, x4, {m}"
+            "umulh x7, x4, {m}"
+            "mul x10, x5, {m}"
+            "umulh x11, x5, {m}"
+            "adds x6, x6, x8"
+            "adcs x10, x10, x9"
+            "cinc x11, x11, hs"
+            "adds x6, x6, {hi}"
+            "adcs x10, x10, x7"
+            "cinc {hi}, x11, hs"
+            "stp x6, x10, [{rp}], #16"
+            "2:"
+            "lsr {k}, {k}, #2"
+            "cbz {k}, 4f"
+            "3:"
+            "ldp x4, x5, [{ap}], #16"
+            "ldp x6, x7, [{ap}], #16"
+            "ldp x8, x9, [{rp}]"
+            "ldp x10, x11, [{rp}, #16]"
+            "mul x12, x4, {m}"
+            "umulh x4, x4, {m}"
+            "mul x13, x5, {m}"
+            "umulh x5, x5, {m}"
+            "mul x14, x6, {m}"
+            "umulh x6, x6, {m}"
+            "mul x15, x7, {m}"
+            "umulh x7, x7, {m}"
+            "adds x12, x12, x8"             // r + the low halves
+            "adcs x13, x13, x9"
+            "adcs x14, x14, x10"
+            "adcs x15, x15, x11"
+            "cinc x7, x7, hs"
+            "adds x12, x12, {hi}"           // + the high half below each limb
+            "adcs x13, x13, x4"
+            "adcs x14, x14, x5"
+            "adcs x15, x15, x6"
+            "cinc {hi}, x7, hs"
+            "stp x12, x13, [{rp}], #16"
+            "stp x14, x15, [{rp}], #16"
+            "sub {k}, {k}, #1"
+            "cbnz {k}, 3b"
+            "4:"
+            inout rp : reg
+            inout ap : reg
+            inout k : reg
+            inout hi : reg
+            in m : reg
+            clobbers "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15"
+        [x86_64, riscv64, riscv32, thumb, craft, wasm32] unavailable "the AArch64 kernel; the portable loop serves the rest"
+
+    hi
+end addmul_1_asm
+
+/** `submul_1` for `n > 0`: `addmul_1_asm` with each add a subtract, and a borrow (the carry flag
+ * CLEAR, condition `lo`) folded where that one folds a carry.
+ */
+private[bigint] submul_1_asm(r: []Limb, a: []const Limb, n: usize, m: Limb) -> Limb
+    var rp = &r[0]
+    var ap = &a[0]
+    var k = n
+    var hi: Limb = 0
+
+    asm
+        [aarch64]
+            "tbz {k}, #0, 1f"
+            "ldr x4, [{ap}], #8"
+            "ldr x5, [{rp}]"
+            "mul x6, x4, {m}"
+            "umulh {hi}, x4, {m}"           // the first limb has no high half below it
+            "subs x5, x5, x6"
+            "cinc {hi}, {hi}, lo"
+            "str x5, [{rp}], #8"
+            "1:"
+            "tbz {k}, #1, 2f"
+            "ldp x4, x5, [{ap}], #16"
+            "ldp x8, x9, [{rp}]"
+            "mul x6, x4, {m}"
+            "umulh x7, x4, {m}"
+            "mul x10, x5, {m}"
+            "umulh x11, x5, {m}"
+            "subs x8, x8, x6"
+            "sbcs x9, x9, x10"
+            "cinc x11, x11, lo"
+            "subs x8, x8, {hi}"
+            "sbcs x9, x9, x7"
+            "cinc {hi}, x11, lo"
+            "stp x8, x9, [{rp}], #16"
+            "2:"
+            "lsr {k}, {k}, #2"
+            "cbz {k}, 4f"
+            "3:"
+            "ldp x4, x5, [{ap}], #16"
+            "ldp x6, x7, [{ap}], #16"
+            "ldp x8, x9, [{rp}]"
+            "ldp x10, x11, [{rp}, #16]"
+            "mul x12, x4, {m}"
+            "umulh x4, x4, {m}"
+            "mul x13, x5, {m}"
+            "umulh x5, x5, {m}"
+            "mul x14, x6, {m}"
+            "umulh x6, x6, {m}"
+            "mul x15, x7, {m}"
+            "umulh x7, x7, {m}"
+            "subs x8, x8, x12"              // r - the low halves
+            "sbcs x9, x9, x13"
+            "sbcs x10, x10, x14"
+            "sbcs x11, x11, x15"
+            "cinc x7, x7, lo"
+            "subs x8, x8, {hi}"             // - the high half below each limb
+            "sbcs x9, x9, x4"
+            "sbcs x10, x10, x5"
+            "sbcs x11, x11, x6"
+            "cinc {hi}, x7, lo"
+            "stp x8, x9, [{rp}], #16"
+            "stp x10, x11, [{rp}], #16"
+            "sub {k}, {k}, #1"
+            "cbnz {k}, 3b"
+            "4:"
+            inout rp : reg
+            inout ap : reg
+            inout k : reg
+            inout hi : reg
+            in m : reg
+            clobbers "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15"
+        [x86_64, riscv64, riscv32, thumb, craft, wasm32] unavailable "the AArch64 kernel; the portable loop serves the rest"
+
+    hi
+end submul_1_asm
+
+#endif

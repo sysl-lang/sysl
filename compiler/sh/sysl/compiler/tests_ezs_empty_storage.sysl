@@ -1,0 +1,312 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.process.capture
+import sysl.text.Search
+
+// **Storage of no elements is no allocation** (`emit_box.sysl`'s `skip_if_empty`): `slot_storage(n)`
+// and `[v; n]` with `n` zero answer the all-zero view an empty literal is -- no owner, nothing to
+// retain, release or free -- so a container made empty and filled later costs what C++'s empty
+// `std::vector` does. Found by the Havlak benchmark, whose `vector()` was `slot_storage(0)`: one
+// `malloc` and a header written for every container that was never appended to.
+//
+// The claim is a number of allocations, so it is counted, not timed: each program is a project whose
+// heap is its own pair (`allocator { … }` in the manifest), and the pair counts what it hands out and
+// what comes back. Every cell runs inside a function of its own and reports, once that function has
+// returned, how many blocks it took and how many it gave back -- so a cell that leaked, or freed the
+// empty view, shows in the second number. Each program runs at `-O0`, where the count is a run-time
+// value the test cannot see past, and at the default level.
+
+private ezs_manifest() -> string =
+    "package { name = \"ezs\", version = \"0.0.1\" }\nallocator {\n  alloc = \"own_alloc\"\n" +
+    "  free  = \"own_free\"\n}\n"
+
+// The counting pair, a value whose destructor is counted, and `report`, which says what the last
+// cell took and gave back.
+private ezs_runtime() -> string = raw"""
+    import sysl.buf.{Buf, buf, buf_with_capacity}
+
+    extern "malloc" c_malloc(n: usize) -> *u8
+    extern "free" c_free(p: *u8)
+
+    var made: usize = 0
+    var freed: usize = 0
+    var drops = 0
+    var m0: usize = 0
+    var f0: usize = 0
+
+    @export("own_alloc")
+    own_alloc(size: usize, align: usize) -> *u8
+        made += 1
+        c_malloc(size)
+
+    @export("own_free")
+    own_free(p: *u8, size: usize, align: usize)
+        freed += 1
+        c_free(p)
+
+    struct N
+        v: int
+
+    impl Drop for N
+        drop(self)
+            drops += 1
+
+    struct Holder
+        xs: []&N
+
+    mark()
+        m0 = made
+        f0 = freed
+        drops = 0
+
+    report(name: string, answer: int)
+        val took = made - m0
+        val gave = freed - f0
+        val d = drops
+
+        print(name, took, gave, d, answer)
+
+    """
+
+// What the project prints, built at `-O0` and at the default level, which must agree.
+private ezs_ran(program: string) -> string
+    val p = lbr_tree(lbr_two("main.sysl", ezs_runtime() + program, "sysl.hocon", ezs_manifest()))
+    var said: Buf[string] = buf()
+
+    for level in [ "-O0", s"-O$DefaultOptimization" ]
+        val out = lbr_temp("sysl-ezs-exe")
+        val built = lbr_cli(["sysl", "build", level, "-o", s"$out/program", p])
+
+        if built.0 != 0
+            said.push(s"refused at $level: ${built.1}")
+        else
+            said.push(capture(s"$out/program", [], "", [], true) match
+                Ok(o) -> if o.status.ok() then o.text else s"it did not exit zero at $level: ${o.text}"
+                Err(_) -> "the program that was built could not be run")
+        end if
+
+        lbr_drop([out])
+
+    lbr_drop([p])
+    assert_eq(said[0], said[1])
+    said[0]
+end ezs_ran
+
+@test("slot_storage of a constant or a run-time zero takes no allocation and gives none back")
+ezs_zero_slot_storage_allocates_nothing()
+    if !lbr_ready() then return
+
+    val got = ezs_ran(raw"""
+        constant() -> int
+            val s: []&N = slot_storage(0)
+            int(s.len)
+
+        counted(n: usize) -> int
+            val s: []&N = slot_storage(n)
+            int(s.len)
+
+        plain(n: usize) -> int
+            val s: []int = slot_storage(n)
+            int(s.len)
+
+        main(args: []string)
+            // Zero while running, and nothing the compiler can know.
+            val z = args.len - 1
+
+            mark()
+            report("constant", constant())
+            mark()
+            report("runtime", counted(z))
+            mark()
+            report("plain", plain(z))
+            mark()
+            report("three", counted(z + 3))
+        """)
+
+    // A count that is not zero still takes its one block and gives it back.
+    assert_eq(got, "constant 0 0 0 0\nruntime 0 0 0 0\nplain 0 0 0 0\nthree 1 1 0 3\n")
+end ezs_zero_slot_storage_allocates_nothing
+
+@test("empty slot storage grown, shared, sliced and held in a dropped field is released exactly once")
+ezs_empty_storage_in_use()
+    if !lbr_ready() then return
+
+    val got = ezs_ran(raw"""
+        // Grown the way a container grows: new storage of its own, the empty view let go of.
+        grown(z: usize) -> int
+            var s: []&N = slot_storage(z)
+            var bigger: []&N = slot_storage(s.len + 2)
+
+            slot_place(bigger, 0, N(7))
+            slot_place(bigger, 1, N(8))
+            s = bigger
+            s[0].v + s[1].v
+
+        // Two owners and a view of the one empty storage, each let go of.
+        shared(z: usize) -> int
+            val a: []&N = slot_storage(z)
+            val b = a
+            val c = a[0..<0]
+            val d = b[..]
+
+            int(a.len + b.len + c.len + d.len)
+
+        // A field holding it, in a box that is dropped: the box is the one block.
+        in_field(z: usize) -> int
+            val h: &Holder = Holder(slot_storage(z))
+
+            int(h.xs.len)
+
+        // A vacate of nothing, on storage with no owner, does nothing.
+        vacated(z: usize) -> int
+            var s: []&N = slot_storage(z)
+
+            slot_vacate(s, 0)
+            int(s.len)
+
+        main(args: []string)
+            val z = args.len - 1
+
+            mark()
+            report("grown", grown(z))
+            mark()
+            report("shared", shared(z))
+            mark()
+            report("field", in_field(z))
+            mark()
+            report("vacated", vacated(z))
+        """)
+
+    assert_eq(got, "grown 3 3 2 15\nshared 0 0 0 0\nfield 1 1 0 0\nvacated 0 0 0 0\n")
+end ezs_empty_storage_in_use
+
+@test("a Buf given room for none costs what buf() does, and grows, pops and freezes from there")
+ezs_buf_with_no_room()
+    if !lbr_ready() then return
+
+    val got = ezs_ran(raw"""
+        empty() -> int
+            val b: Buf[int] = buf()
+            int(b.len())
+
+        no_room(z: usize) -> int
+            val b: Buf[int] = buf_with_capacity(z, 0)
+            int(b.len())
+
+        pushed(z: usize) -> int
+            var b: Buf[&N] = buf_with_capacity(z, N(0))
+
+            b.push(N(1))
+            b.push(N(2))
+            b.pop()
+            int(b.len())
+
+        frozen(z: usize) -> int
+            val b: Buf[&N] = buf_with_capacity(z, N(0))
+            val f = b.freeze()
+
+            int(f.len())
+
+        main(args: []string)
+            val z = args.len - 1
+
+            mark()
+            report("buf", empty())
+            mark()
+            report("room0", no_room(z))
+            mark()
+            val n = pushed(z)
+            report("pushed", n)
+            mark()
+            report("frozen", frozen(z))
+        """)
+
+    // The handle, the fill, the two values and the storage the first push made: every one given back,
+    // and the three values dropped. A frozen buffer of nothing has no storage either.
+    assert_eq(got, "buf 1 1 0 0\nroom0 1 1 0 0\npushed 5 5 3 1\nfrozen 3 3 1 0\n")
+end ezs_buf_with_no_room
+
+@test("a run-time fill of zero elements takes no storage, the fill value still made and dropped")
+ezs_zero_fill_allocates_nothing()
+    if !lbr_ready() then return
+
+    val got = ezs_ran(raw"""
+        ints(z: usize) -> int
+            val xs: []int = [0; z]
+            int(xs.len)
+
+        counted(z: usize) -> int
+            val xs: []&N = [N(1); z]
+            int(xs.len)
+
+        some(z: usize) -> int
+            val xs: []&N = [N(1); z + 2]
+            xs[0].v + xs[1].v
+
+        main(args: []string)
+            val z = args.len - 1
+
+            mark()
+            report("ints", ints(z))
+            mark()
+            report("counted", counted(z))
+            mark()
+            report("some", some(z))
+        """)
+
+    assert_eq(got, "ints 0 0 0 0\ncounted 1 1 1 0\nsome 2 2 1 2\n")
+end ezs_zero_fill_allocates_nothing
+
+// `try_slot_storage(0)` answers the same empty view whether the heap is asked or not, so it is not
+// asked; a count that does not fit in a word is still refused with an empty view, and a count that
+// fits still takes its block.
+@test("try_slot_storage of zero asks the heap for nothing, and a refusal or a real count is unchanged")
+ezs_zero_try_slot_storage_allocates_nothing()
+    if !lbr_ready() then return
+
+    val got = ezs_ran(raw"""
+        constant() -> int
+            val s: []&N = try_slot_storage(0)
+            int(s.len)
+
+        counted(n: usize) -> int
+            val s: []&N = try_slot_storage(n)
+            int(s.len)
+
+        huge(z: usize) -> int
+            val s: []u64 = try_slot_storage(usize::Max - z)
+            int(s.len)
+
+        main(args: []string)
+            val z = args.len - 1
+
+            mark()
+            report("constant", constant())
+            mark()
+            report("runtime", counted(z))
+            mark()
+            report("huge", huge(z))
+            mark()
+            report("three", counted(z + 3))
+        """)
+
+    assert_eq(got, "constant 0 0 0 0\nruntime 0 0 0 0\nhuge 0 0 0 0\nthree 1 1 0 3\n")
+end ezs_zero_try_slot_storage_allocates_nothing
+
+@test("a constant zero lowers to the empty view with no call, and a run-time count tests before it allocates")
+ezs_lowered_shape()
+    if !enm_ready() then return
+
+    val constant = enm_ir("size() -> usize\n    val s: []int = slot_storage(0)\n    s.len\n\nprint(size())\n")
+
+    assert(!enm_says(constant, "call ptr @malloc("), constant)
+    assert(!enm_says(constant, "buf.make"), constant)
+
+    val runtime = enm_ir("size(n: usize) -> usize\n    val s: []int = slot_storage(n)\n    s.len\n\n" +
+                         "print(size(3))\n")
+
+    assert(enm_says(runtime, "buf.make"), runtime)
+    assert(enm_says(runtime, "call ptr @malloc("), runtime)
+end ezs_lowered_shape

@@ -1,0 +1,457 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+
+// `@checked` and `checked_overflow` (`checked.sysl`, `reference/attributes.md § @checked`): a plain
+// integer `+`, `-`, `*`, unary `-`, compound assignment, `++`/`--` and written conversion inside a
+// `@checked` function, member or block -- or anywhere in a package whose manifest says
+// `checked_overflow = true` -- traps on overflow in a RELEASE build exactly as a debug build traps,
+// with the same report. Every trapping cell is built in both modes; what lies outside a region is
+// asserted to wrap, digit for digit, in the same release program, so "it trapped" is never the
+// mode's doing. The compile-time cells run a `const` function, which must refuse where the running
+// program would have trapped.
+
+private cko_ready() -> bool = std_root().is_ok() && clang_available()
+
+// `files` laid out under a fresh directory, each `(relative path, text)`; answers the directory.
+private cko_lay(files: [](string, string)) -> string
+    val root = absolute_path(make_temp_dir("sysl-cko").unwrap())
+
+    for item in files
+        val at = s"$root/${item.0}"
+
+        make_dir_all(parent_of(at).unwrap_or(root)).unwrap()
+        write_text(at, item.1).unwrap()
+
+    root
+end cko_lay
+
+// The project at `dir`, built in the mode `flag` names at `level` and run: its status, its standard
+// output and its standard error -- or the compiler's refusal as the error, with status -1.
+private cko_build_run(dir: string, flag: string, level: string) -> (Status, string, string)
+    var flags: [1]string = [flag]
+
+    assert_eq(took_search_flag(flags[..], 0), 1)
+
+    val exe = s"$dir/built"
+    val built = build_native_program(dir, None, None, level, Some(exe))
+
+    reset_search_paths()
+
+    built match
+        Err(why) -> return (Status.Exited(-1), "", failure_text(why))
+        Ok(_) -> ()
+
+    capture(exe, [], "", [], true) match
+        Err(_) -> (Status.Exited(-1), "", "the program that was built could not be run")
+        Ok(out) -> (out.status, out.text, out.err.unwrap_or(""))
+end cko_build_run
+
+// `text` as a lone `main.sysl`, built and run in the mode `flag` names at `level`.
+private cko_run(text: string, flag: string, level: string) -> (Status, string, string)
+    var files: [1](string, string) = [("main.sysl", text)]
+    val root = cko_lay(files[..])
+    val out = cko_build_run(root, flag, level)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end cko_run
+
+// In BOTH modes the program prints `before` and then stops on SIGTRAP having written exactly
+// `report` -- at the default level and at `-O0` and `-O2`, so an optimizer folding the check to its
+// outcome must still make the call.
+private cko_traps(text: string, before: string, report: string)
+    if !cko_ready() then return
+
+    for level in ["0", DefaultOptimization, "2"]
+        for flag in ["--release", "--debug"]
+            val (state, printed, err) = cko_run(text, flag, level)
+
+            assert_eq(err, report)
+            assert_eq(printed, before)
+            assert(state == Status.Signalled(5), s"$flag -O$level stopped with $state, having printed '$printed'")
+end cko_traps
+
+// A release build prints `expected` and exits cleanly with nothing on standard error.
+private cko_release_prints(text: string, expected: string)
+    if !cko_ready() then return
+
+    val (state, printed, err) = cko_run(text, "--release", DefaultOptimization)
+
+    assert_eq(err, "")
+    assert_eq(printed, expected)
+    assert(state.ok(), s"release stopped with $state, having printed '$printed'")
+end cko_release_prints
+
+// The compiler refuses `text`, saying something containing `part`.
+private cko_refused(text: string, part: string)
+    if !cko_ready() then return
+
+    val (state, _, err) = cko_run(text, "--release", DefaultOptimization)
+
+    assert(state == Status.Exited(-1), s"built and ran with $state")
+    assert(err.contains(part), err)
+end cko_refused
+
+// -- the operators, signed and unsigned, narrow and wide, in a @checked function ----------------------
+
+@test("a @checked function's u8 addition traps in a release build, where the same sum unmarked wraps")
+cko_u8_add()
+    cko_traps("@checked\nadd(a: u8) -> u8 = a + 100\n\nprint(add(155))\nprint(add(200))\n",
+              "255\n", "integer overflow: u8 + u8 (main.sysl:2:20)\n")
+    cko_release_prints("plain(a: u8) -> u8 = a + 100\n\n@checked\nadd(a: u8) -> u8 = a + 100\n\n" +
+                       "print(plain(200))\nprint(add(155))\n",
+                       "44\n255\n")
+
+@test("a @checked function's i16 subtraction below the minimum traps in every build")
+cko_i16_sub()
+    cko_traps("@checked\nsub(a: i16) -> i16 = a - 1\n\nprint(sub(-32767))\nprint(sub(-32768))\n",
+              "-32768\n", "integer overflow: i16 - i16 (main.sysl:2:22)\n")
+
+@test("a @checked function's int multiplication past 32 bits traps in every build")
+cko_int_mul()
+    cko_traps("@checked\nmul(a: int) -> int = a * 65536\n\nprint(mul(2))\nprint(mul(65536))\n",
+              "131072\n", "integer overflow: int * int (main.sysl:2:22)\n")
+
+@test("a @checked function's i64 and u64 overflow traps in every build")
+cko_64_bit()
+    cko_traps("@checked\nnext(a: i64) -> i64 = a + 1\n\nprint(next(9223372036854775807))\n", "",
+              "integer overflow: i64 + i64 (main.sysl:2:23)\n")
+    cko_traps("@checked\nprev(a: u64) -> u64 = a - 1\n\nprint(prev(0))\n", "",
+              "integer overflow: u64 - u64 (main.sysl:2:23)\n")
+
+@test("a width no machine has, u12 and i5, traps at its own width")
+cko_odd_widths()
+    cko_traps("@checked\nbump(a: u12) -> u12 = a + 1\n\nprint(bump(4094))\nprint(bump(4095))\n", "4095\n",
+              "integer overflow: u12 + u12 (main.sysl:2:23)\n")
+    cko_traps("@checked\ndouble(a: i5) -> i5 = a * 2\n\nprint(double(-8))\nprint(double(8))\n", "-16\n",
+              "integer overflow: i5 * i5 (main.sysl:2:23)\n")
+
+@test("i128 and u256, inline expansions, trap in a @checked function in every build")
+cko_wide_widths()
+    cko_traps("@checked\ndouble(a: i128) -> i128 = a * 2\n\n" +
+              "print(double(170141183460469231731687303715884105727))\n", "",
+              "integer overflow: i128 * i128 (main.sysl:2:27)\n")
+    cko_traps("@checked\nnext(a: u256) -> u256 = a + 1\n\nval top: u256 = " +
+              "115792089237316195423570985008687907853269984665640564039457584007913129639935\n" +
+              "print(next(top - 1))\nprint(next(top))\n",
+              "115792089237316195423570985008687907853269984665640564039457584007913129639935\n",
+              "integer overflow: u256 + u256 (main.sysl:2:25)\n")
+
+@test("a @checked function's unary minus of a signed minimum traps in every build")
+cko_negate()
+    cko_traps("@checked\nneg(a: i8) -> i8 = -a\n\nprint(neg(127))\nprint(neg(-128))\n", "-127\n",
+              "integer overflow: -i8 (main.sysl:2:20)\n")
+
+@test("a @checked function's compound assignment, increment and decrement trap in every build")
+cko_compound_and_steps()
+    cko_traps("@checked\nf(a: u8) -> u8\n    var b = a\n    b += 10\n    b\n\nprint(f(245))\nprint(f(250))\n",
+              "255\n", "integer overflow: u8 += u8 (main.sysl:4:5)\n")
+    cko_traps("@checked\nf(a: u8) -> u8\n    var b = a\n    b++\n    b\n\nprint(f(254))\nprint(f(255))\n",
+              "255\n", "integer overflow: u8++ (main.sysl:4:5)\n")
+    cko_traps("@checked\nf(a: i8) -> i8\n    var b = a\n    b--\n    b\n\nprint(f(-127))\nprint(f(-128))\n",
+              "-128\n", "integer overflow: i8-- (main.sysl:4:5)\n")
+    cko_traps("@checked\nf(a: i32) -> i32\n    var b = a\n    b *= 2\n    b\n\nprint(f(-1073741824))\nprint(f(1073741824))\n",
+              "-2147483648\n", "integer overflow: i32 *= i32 (main.sysl:4:5)\n")
+
+@test("a @checked function's written conversion that cannot hold its value traps, across width and sign")
+cko_conversions()
+    cko_traps("@checked\nlow(n: int) -> u8 = u8(n)\n\nprint(low(255))\nprint(low(256))\n", "255\n",
+              "integer overflow: u8(int) (main.sysl:2:21)\n")
+    cko_traps("@checked\nbits(n: i8) -> u8 = u8(n)\n\nprint(bits(0))\nprint(bits(-1))\n", "0\n",
+              "integer overflow: u8(i8) (main.sysl:2:21)\n")
+    cko_traps("@checked\nsigned(n: u32) -> i32 = i32(n)\n\nprint(signed(7))\nprint(signed(4294967295))\n", "7\n",
+              "integer overflow: i32(u32) (main.sysl:2:25)\n")
+
+@test("unmarked, the same operators wrap in a release build: the mode decides outside a region")
+cko_unmarked_wraps()
+    cko_release_prints("f(a: u8, n: int, s: i8) -> (u8, u8, i8, u8)\n    var b = a\n    b++\n" +
+                       "    (a + 100, u8(n), -s, b)\n\nprint(f(255, 300, -128))\n",
+                       "(99, 44, -128, 0)\n")
+
+// -- what @checked leaves alone -------------------------------------------------------------------------
+
+@test("inside @checked the wrapping and saturating operators, wrap, checked_add, shifts and division keep their meaning")
+cko_spelled_operators_keep_their_meaning()
+    cko_release_prints("@checked\nf(a: u8, n: int) -> string\n" +
+                       "    s\"${a +% 10} ${a +| 10} ${a -% 255} ${a *| 2} ${u8.wrap(n)} ${a.checked_add(10)} ${a << 4} ${a / 3}\"\n\n" +
+                       "print(f(250, 300))\n",
+                       "4 255 251 255 44 None 160 83\n")
+
+@test("inside @checked a vector's lanes wrap, as the machine's lane instructions do")
+cko_vector_lanes_wrap()
+    cko_release_prints("@checked\nf(v: <4>u8) -> <4>u8 = v + v\n\nval v: <4>u8 = [200, 1, 128, 0]\nval r = f(v)\n" +
+                       "print(r[0], r[1], r[2], r[3])\n",
+                       "144 2 0 0\n")
+
+@test("values that fit never trap inside @checked, at -O0 or optimized")
+cko_fitting_values()
+    if !cko_ready() then return
+
+    for level in ["0", "2"]
+        val (state, printed, err) = cko_run("@checked\nf(a: u8, b: i8) -> (u8, i8, u8) = (a + 5, -b, u8(b + 127))\n\n" +
+                                            "print(f(250, -127))\n", "--release", level)
+
+        assert_eq(err, "")
+        assert_eq(printed, "(255, 127, 0)\n")
+        assert(state.ok(), s"-O$level stopped with $state")
+end cko_fitting_values
+
+// -- the region is lexical ----------------------------------------------------------------------------
+
+@test("a @checked block checks what is written inside it and nothing before or after it")
+cko_block()
+    cko_traps("var a: u8 = 250\nprint(a + 1)\n\n@checked\n    var b: u8 = 200\n    print(b + 50)\n" +
+              "    print(b + 60)\n\nprint(a + 2)\n",
+              "251\n250\n", "integer overflow: u8 + u8 (main.sysl:7:11)\n")
+    cko_release_prints("var a: u8 = 250\nprint(a + 10)\n\n@checked\n    print(a + 5)\n\nprint(a + 20)\n",
+                       "4\n255\n14\n")
+
+@test("a @checked block inside a function, and a block that yields its last line's value")
+cko_block_in_a_function()
+    cko_traps("f(a: u8) -> u8\n    val pre = a / 2\n\n    @checked\n        pre + a\n\n" +
+              "print(f(10))\nprint(f(200))\n",
+              "15\n", "integer overflow: u8 + u8 (main.sysl:5:9)\n")
+
+@test("a @checked method traps, and a sibling method unmarked wraps")
+cko_method()
+    val methods = "struct C\n    n: u8\n\n    @checked\n    up(self) -> u8 = self.n + 1\n\n" +
+                  "    raw(self) -> u8 = self.n + 1\n\n"
+
+    cko_traps(methods + "print(C(254).up())\nprint(C(255).up())\n",
+              "255\n", "integer overflow: u8 + u8 (main.sysl:5:22)\n")
+    cko_release_prints(methods + "print(C(255).raw())\n", "0\n")
+
+@test("a closure and a nested function written inside a @checked function are inside it")
+cko_closure_and_nested()
+    cko_traps("@checked\nf(a: u8) -> u8\n    val g = (x: u8) -> x * 2\n\n    g(a)\n\nprint(f(127))\nprint(f(128))\n",
+              "254\n", "integer overflow: u8 * u8 (main.sysl:3:24)\n")
+    cko_traps("@checked\nf(a: u8) -> u8\n    inner(x: u8) -> u8 = x - 1\n\n    inner(a)\n\nprint(f(1))\nprint(f(0))\n",
+              "0\n", "integer overflow: u8 - u8 (main.sysl:3:26)\n")
+    cko_traps("f(a: u8) -> u8\n    @checked\n        val g = (x: u8) -> x + 1\n\n        g(a)\n\nprint(f(254))\nprint(f(255))\n",
+              "255\n", "integer overflow: u8 + u8 (main.sysl:3:28)\n")
+
+// A report names an operand's type as its declaration wrote it, and a closure's or nested function's
+// parameter is a declaration like any other: it once fell back to the friendly word for the width.
+@test("an overflow inside a closure or a nested function names the parameter's type as it was written")
+cko_closure_names_as_written()
+    // Written as `byte`, it stays `byte`; written as an alias, the alias.
+    cko_traps("@checked\nf(a: u8) -> u8\n    val g = (x: byte) -> x + 200\n\n    g(a)\n\nprint(f(55))\nprint(f(56))\n",
+              "255\n", "integer overflow: byte + byte (main.sysl:3:26)\n")
+    cko_traps("type Octet = u8\n\n@checked\nf(a: Octet) -> Octet\n    inner(x: Octet) -> Octet = x * 2\n\n" +
+              "    inner(a)\n\nprint(f(100))\nprint(f(200))\n",
+              "200\n", "integer overflow: Octet * Octet (main.sysl:5:32)\n")
+    // A parameter the context typed is spelled as the position's written callable type spelled it.
+    cko_traps("@checked\napply(h: &Fn(u16) -> u16, v: u16) -> u16 = h(v)\n\n@checked\n" +
+              "f(a: u16) -> u16 = apply((x) -> x * 2, a)\n\nprint(f(30000))\nprint(f(40000))\n",
+              "60000\n", "integer overflow: u16 * u16 (main.sysl:5:33)\n")
+
+@test("a function called from a @checked one but written elsewhere keeps the mode's meaning, inlined or not")
+cko_callee_written_elsewhere()
+    cko_release_prints("@inline(always)\nbump(x: u8) -> u8 = x + 1\n\n@noinline\nstep(x: u8) -> u8 = x + 1\n\n" +
+                       "@checked\nf(a: u8) -> (u8, u8) = (bump(a), step(a))\n\nprint(f(255))\n",
+                       "(0, 0)\n")
+
+@test("a @checked generic traps at each instantiation that overflows")
+cko_generic()
+    cko_traps("@checked\ntwice[T: Add](x: T) -> T = x + x\n\nval w: u16 = 200\nval n: u8 = 200\n" +
+              "print(twice(w))\nprint(twice(n))\n",
+              "400\n", "integer overflow: u8 + u8 (main.sysl:2:28)\n")
+
+// An operand typed by a type parameter has no spelling the program chose for the instantiation -- every
+// call reaching it shares it -- so it is named by its width, never by the friendly word for that width.
+@test("an overflow in a generic names a type parameter's operand by the width it was instantiated at")
+cko_generic_names_the_width()
+    // Instantiated at `int`, the width is `i32`; a closure and a nested function inside take the same.
+    cko_traps("@checked\ntwice[T: Mul](x: T) -> T = x * x\n\nprint(twice(40000))\nprint(twice(50000))\n",
+              "1600000000\n", "integer overflow: i32 * i32 (main.sysl:2:28)\n")
+    cko_traps("@checked\nbump[T: Add](x: T) -> T\n    val g = (y: T) -> y + y\n\n    g(x)\n\n" +
+              "val n: byte = 100\nval m: byte = 200\nprint(bump(n))\nprint(bump(m))\n",
+              "200\n", "integer overflow: u8 + u8 (main.sysl:3:23)\n")
+    cko_traps("@checked\nbump[T: Add](x: T) -> T\n    inner(y: T) -> T = y + y\n\n    inner(x)\n\n" +
+              "val n: u16 = 30000\nval m: u16 = 40000\nprint(bump(n))\nprint(bump(m))\n",
+              "60000\n", "integer overflow: u16 + u16 (main.sysl:3:24)\n")
+    // An operand the generic body declared with a width of its own keeps that spelling.
+    cko_traps("@checked\nscaled[T](x: T, k: byte) -> byte = k * 2\n\nprint(scaled(1, 100))\nprint(scaled(1, 200))\n",
+              "200\n", "integer overflow: byte * byte (main.sysl:2:36)\n")
+
+// -- with @unchecked ------------------------------------------------------------------------------------
+
+@test("@unchecked inside @checked skips the bounds check and the arithmetic still traps")
+cko_unchecked_inside_checked()
+    cko_traps("@checked\nf(xs: []u8, i: int) -> u8\n    @unchecked\n        xs[i] + xs[i]\n\n" +
+              "var xs: [2]u8 = [100, 200]\nprint(f(xs[..], 0))\nprint(f(xs[..], 1))\n",
+              "200\n", "integer overflow: u8 + u8 (main.sysl:4:9)\n")
+
+@test("@checked inside @unchecked traps too, and a bounds check outside it is still made")
+cko_checked_inside_unchecked()
+    cko_traps("var xs: [2]u8 = [100, 200]\n\n@unchecked\n    print(xs[0] + 1)\n\n    @checked\n" +
+              "        print(xs[1] + xs[1])\n",
+              "101\n", "integer overflow: u8 + u8 (main.sysl:7:15)\n")
+
+@test("an overflow of elements read by subscript names the element type the array or slice was declared with")
+cko_element_names_as_written()
+    // A slice of an alias, and an array written with `byte`.
+    cko_traps("type Octet = u8\n\n@checked\nf(xs: []Octet) -> Octet = xs[0] * xs[1]\n\n" +
+              "var a: [2]Octet = [10, 20]\nvar b: [2]Octet = [20, 20]\nprint(f(a[..]))\nprint(f(b[..]))\n",
+              "200\n", "integer overflow: Octet * Octet (main.sysl:4:27)\n")
+    cko_traps("var xs: [2]byte = [100, 200]\n\n@checked\n    print(xs[0] + xs[0])\n    print(xs[1] + xs[1])\n",
+              "200\n", "integer overflow: byte + byte (main.sysl:5:11)\n")
+    cko_traps("@checked\nf(xs: []u8, i: int) -> u8 = xs[i]\n\nvar xs: [2]u8 = [1, 2]\nprint(f(xs[..], 1))\nprint(f(xs[..], 2))\n",
+              "2\n", "index 2 out of bounds for length 2 (main.sysl:2:31)\n")
+
+@test("a @checked block nested inside a @checked function, and inside another block, is the same region")
+cko_nested_checked()
+    cko_traps("@checked\nf(a: i8) -> i8\n    @checked\n        @checked\n            -a\n\nprint(f(-127))\nprint(f(-128))\n",
+              "127\n", "integer overflow: -i8 (main.sysl:5:13)\n")
+
+// -- what @checked marks, and how it is written -----------------------------------------------------------
+
+@test("@checked above a struct, an extern or a binding is refused, naming what it marks")
+cko_refused_off_a_body()
+    cko_refused("@checked\nstruct P\n    x: int\nprint(P(1).x)\n",
+                "'@checked' makes the integer arithmetic written in a body trap on overflow in every build, so it marks a function, a method, or — on a line of its own — the block indented under it")
+    cko_refused("@checked\nextern \"abs\" c_abs(x: i32) -> i32\nprint(c_abs(-4))\n", "'@checked' makes the integer arithmetic")
+    cko_refused("@checked\nval k: u8 = 1\nprint(k)\n", "'@checked' makes the integer arithmetic")
+
+@test("@checked with an argument, or written twice, is refused")
+cko_refused_arguments_and_repeats()
+    cko_refused("@checked(always)\nf(x: int) -> int = x + x\nprint(f(1))\n", "'@checked' takes no arguments")
+    cko_refused("@checked\n@checked\nf(x: int) -> int = x + x\nprint(f(1))\n",
+                "'@checked' is written twice above one declaration")
+
+@test("@checked in front of a closure is refused, naming the function or block to mark")
+cko_refused_on_a_closure()
+    cko_refused("main(args: []string)\n    val f = @checked (x: int) -> x + x\n    print(f(1))\n",
+                "a closure takes no annotations, and '@checked' reaches one through the function or the block it is written in")
+
+// -- compile-time evaluation ----------------------------------------------------------------------------
+
+@test("a @checked const function whose sum overflows refuses the constant; unmarked it folds the wrapped value")
+cko_const_fold_refuses()
+    cko_refused("@checked\nconst add(a: u8, b: u8) -> u8 = a + b\n\nconst K = add(200, 100)\nprint(K)\n",
+                "'K' traps while it is being compiled: 200 + 100 overflows byte")
+    cko_release_prints("const add(a: u8, b: u8) -> u8 = a + b\n\nconst K = add(200, 100)\nprint(K)\n", "44\n")
+    cko_release_prints("@checked\nconst add(a: u8, b: u8) -> u8 = a + b\n\nconst K = add(200, 55)\nprint(K)\n", "255\n")
+
+@test("compile-time evaluation in a @checked const function refuses a negation, a step, a compound assignment and a conversion that overflow")
+cko_const_fold_every_operator()
+    cko_refused("@checked\nconst neg(a: i8) -> i8 = -a\n\nconst K = neg(-128)\nprint(K)\n", "traps while it is being compiled: negating -128 overflows")
+    cko_refused("@checked\nconst up(a: u8) -> u8\n    var b = a\n    b++\n    b\n\nconst K = up(255)\nprint(K)\n",
+                "traps while it is being compiled: 255 ++ overflows byte")
+    cko_refused("@checked\nconst up(a: u8) -> u8\n    var b = a\n    b *= 2\n    b\n\nconst K = up(200)\nprint(K)\n",
+                "traps while it is being compiled: 200 * 2 overflows byte")
+    cko_refused("@checked\nconst low(n: int) -> u8 = u8(n)\n\nconst K = low(300)\nprint(K)\n", "traps while it is being compiled: 300 overflows")
+    cko_release_prints("@checked\nconst f(a: u8, n: int) -> u8 = (a +% 100) +% u8.wrap(n)\n\nconst K = f(200, 300)\nprint(K)\n",
+                       "88\n")
+
+@test("a @checked block inside a const function checks only what is written inside it, while compiling")
+cko_const_fold_block()
+    cko_release_prints("const f(a: u8) -> u8\n    val w = a + a\n\n    @checked\n        w + 1\n\nconst K = f(200)\nprint(K)\n",
+                       "145\n")
+    cko_refused("const f(a: u8) -> u8\n    val w = a + a\n\n    @checked\n        w + 200\n\nconst K = f(200)\nprint(K)\n",
+                "traps while it is being compiled: 144 + 200 overflows byte")
+
+// -- the manifest ---------------------------------------------------------------------------------------
+
+private cko_project(files: [](string, string), flag: string) -> (Status, string, string)
+    val root = cko_lay(files)
+    val out = cko_build_run(s"$root/app", flag, DefaultOptimization)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end cko_project
+
+@test("checked_overflow = true makes every plain overflow in the package trap in a release build")
+cko_manifest_root()
+    if !cko_ready() then return
+
+    var files: [2](string, string) = [
+        ("app/sysl.hocon", "package {\n  name = \"app\"\n}\n\nchecked_overflow = true\n"),
+        ("app/main.sysl", "var a: u8 = 250\nprint(a +% 10)\nvar s: i8 = -128\nprint(-s)\nprint(a + 10)\n")]
+
+    for flag in ["--release", "--debug"]
+        val (state, printed, err) = cko_project(files[..], flag)
+
+        assert_eq(err, "integer overflow: -i8 (main.sysl:4:7)\n")
+        assert_eq(printed, "4\n")
+        assert(state == Status.Signalled(5), s"$flag stopped with $state")
+end cko_manifest_root
+
+@test("checked_overflow = false, and no key at all, leave a release build to wrap")
+cko_manifest_off()
+    if !cko_ready() then return
+
+    for key in ["checked_overflow = false\n", ""]
+        var files: [2](string, string) = [
+            ("app/sysl.hocon", s"package {\n  name = \"app\"\n}\n\n$key"),
+            ("app/main.sysl", "var a: u8 = 250\nprint(a + 10)\n")]
+        val (state, printed, err) = cko_project(files[..], "--release")
+
+        assert_eq(err, "")
+        assert_eq(printed, "4\n")
+        assert(state.ok(), s"stopped with $state")
+end cko_manifest_off
+
+@test("a dependency's checked_overflow covers its own files and not the program using it")
+cko_manifest_dependency()
+    if !cko_ready() then return
+
+    var files: [4](string, string) = [
+        ("app/sysl.hocon", "package {\n  name = \"app\"\n}\n\ndependencies { dep { path = \"../dep\" } }\n"),
+        ("app/main.sysl", "import dep.*\n\nvar a: u8 = 250\nprint(a + 10)\nprint(dep.bump(254))\nprint(dep.bump(255))\n"),
+        ("dep/sysl.hocon", "package {\n  name = \"dep\"\n  version = \"1.0.0\"\n}\n\nchecked_overflow = true\n"),
+        ("dep/dep/dep.sysl", "module dep\n\nbump(a: u8) -> u8 = a + 1\n")]
+    val (state, printed, err) = cko_project(files[..], "--release")
+
+    assert(err.starts_with("integer overflow: u8 + u8 ("), err)
+    assert(err.contains("dep.sysl:3:21)"), err)
+    assert_eq(printed, "4\n255\n")
+    assert(state == Status.Signalled(5), s"stopped with $state")
+end cko_manifest_dependency
+
+@test("a root's checked_overflow does not reach a dependency that does not say it")
+cko_manifest_root_not_dependency()
+    if !cko_ready() then return
+
+    var files: [4](string, string) = [
+        ("app/sysl.hocon", "package {\n  name = \"app\"\n}\n\nchecked_overflow = true\n\n" +
+         "dependencies { dep { path = \"../dep\" } }\n"),
+        ("app/main.sysl", "import dep.*\n\nvar a: u8 = 250\nprint(dep.bump(255))\nprint(a + 10)\n"),
+        ("dep/sysl.hocon", "package {\n  name = \"dep\"\n  version = \"1.0.0\"\n}\n"),
+        ("dep/dep/dep.sysl", "module dep\n\nbump(a: u8) -> u8 = a + 1\n")]
+    val (state, printed, err) = cko_project(files[..], "--release")
+
+    assert_eq(err, "integer overflow: u8 + u8 (main.sysl:5:7)\n")
+    assert_eq(printed, "0\n")
+    assert(state == Status.Signalled(5), s"stopped with $state")
+end cko_manifest_root_not_dependency
+
+@test("checked_overflow folds a const function of the package the same way @checked does")
+cko_manifest_const_fold()
+    if !cko_ready() then return
+
+    var files: [2](string, string) = [
+        ("app/sysl.hocon", "package {\n  name = \"app\"\n}\n\nchecked_overflow = true\n"),
+        ("app/main.sysl", "const add(a: u8, b: u8) -> u8 = a + b\n\nconst K = add(200, 100)\nprint(K)\n")]
+    val (state, _, err) = cko_project(files[..], "--release")
+
+    assert(state == Status.Exited(-1), s"built and ran with $state")
+    assert(err.contains("'K' traps while it is being compiled: 200 + 100 overflows byte"), err)
+end cko_manifest_const_fold
+
+@test("checked_overflow must be true or false")
+cko_manifest_value()
+    if !cko_ready() then return
+
+    var files: [2](string, string) = [
+        ("app/sysl.hocon", "package {\n  name = \"app\"\n}\n\nchecked_overflow = \"yes\"\n"),
+        ("app/main.sysl", "print(1)\n")]
+    val (state, _, err) = cko_project(files[..], "--release")
+
+    assert(state == Status.Exited(-1), s"built and ran with $state")
+    assert(err.contains("'checked_overflow' says whether every plain integer '+', '-', '*', unary '-' and written conversion in this package traps on overflow in every build, so it is true or false"), err)
+end cko_manifest_value

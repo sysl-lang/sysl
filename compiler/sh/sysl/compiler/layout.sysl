@@ -15,6 +15,32 @@ import sysl.container.{Map, map}
 // A struct pads every field onto its own alignment and then pads its end onto the widest of them, so
 // that an array of it steps by its size.
 
+// **An `Option` of a thin reference has a null niche**: it is the address alone, one word, and `None`
+// is the null address -- the guarantee Rust makes. A `&T` (or `&sync T`) is never null, so nothing is
+// lost and there is no tag. A raw `*T` may be null, so an `Option` of one keeps its tag and a
+// `Some(null)` stays apart from `None`; a trait object, being two words, keeps the tag too, and so does
+// every other enum.
+null_niche(d: &EnumType) -> bool = option_of(d) match
+    Some(inner) -> underlying(inner) match
+        Ref(_, _) -> !erased(underlying(inner))
+        _ -> false
+    None -> false
+
+// Whether a type is an `Option` of a raw pointer or a `*extern` -- tagged, so not the nullable
+// pointer C declares, which is a plain `*T` compared with `null`.
+option_of_raw_pointer(t: Type) -> bool = underlying(t) match
+    Enum(d) -> option_of(d) match
+        Some(inner) -> underlying(inner) match
+            Ptr(_, _) -> true
+            CFn(_, _, _) -> true
+            _ -> false
+        None -> false
+    _ -> false
+
+// The element type of an `Option`, where the enum is one.
+private option_of(d: &EnumType) -> Option[Type] =
+    if !d.simple && d.targs.len() == 1 && d.base == library_key("Option") then Some(d.targs[0]) else None
+
 // A run of bits inside a packed struct's container.
 struct BitRange
     name: string
@@ -458,13 +484,17 @@ struct TargetLayout
         self.aggregate(members)
     end variant_aggregate
 
+    // A null-niche enum is its payload alone: the address, with no tag beside it.
     private enum_size(self, e: &EnumType) -> usize
         val both = self.payload(e)
+
+        if null_niche(e) then return round_up(both.0, both.1)
 
         round_up(round_up(4, both.1) + both.0, max_usize(4, both.1))
     end enum_size
 
-    private enum_align(self, e: &EnumType) -> usize = max_usize(4, self.payload_align(e))
+    private enum_align(self, e: &EnumType) -> usize =
+        if null_niche(e) then self.payload_align(e) else max_usize(4, self.payload_align(e))
 
     // -- a boundary `@align(n)` raises -------------------------------------------------------------
     //

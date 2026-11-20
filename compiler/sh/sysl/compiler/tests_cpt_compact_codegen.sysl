@@ -8,12 +8,11 @@ import sysl.text.{replace_all, Search}
 // **A body printed as soon as it is built is the body printed at the end** (`codegen.sysl`'s
 // `compact`). Every build that only wants the module's text -- `build`, `run`, `emit-llvm`, a test
 // build -- prints each function as it is lowered and lets go of its blocks; what is asked of a body
-// after that is asked of what was kept beside it: its shape, for `run_once`'s sealing, and the globals
-// it names, for the borrowing entries something names. So the text is compared, whole and byte for
-// byte, with the module built whole and printed once, over what each of those reads: sealing (a call
-// that runs once, one in a loop, one the entry makes twice), the borrowing entries a program names and
-// the ones it does not, closures, generics, exports, a test build with its dispatcher and hooks, and
-// both optimization levels that differ in what they import.
+// after that is asked of what was kept beside it: the globals it names, for the borrowing entries
+// something names. So the text is compared, whole and byte for byte, with the module built whole and
+// printed once: calls once, in a loop and twice, the borrowing entries a program names and the ones it
+// does not, closures, generics, exports, a test build with its dispatcher and hooks, and both
+// optimization levels that differ in what they import.
 //
 // Not here: a `bf16` target lowered to bits, which keeps its blocks (`codegen_into`); an inline `asm`
 // naming a borrowing entry, which `referenced_globals` keeps as text and reads as `named_entries`
@@ -41,7 +40,7 @@ private cpt_text(root: string, linking: bool, level: string, compact: bool) -> s
         Err(why) -> s"refused: ${failure_text(why)}"
         Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
 
-// Both ways, for a build that links (sealed) and for `emit-llvm`'s text, at `level`.
+// Both ways, for a build that links and for `emit-llvm`'s text, at `level`.
 // `must` is text the module has to hold, so a cell is known to reach what it is about.
 private cpt_same(files: []const (string, string), level: string = DefaultOptimization, must: string = "define ")
     val root = cpt_root(files)
@@ -57,9 +56,9 @@ private cpt_same(files: []const (string, string), level: string = DefaultOptimiz
     remove_dir_all(root).unwrap_or(())
 end cpt_same
 
-// Sealing's cases: `once` is called once from the entry outside any loop and so runs once, `inner`
-// once from it, `hot` from a loop, and `twice` from two calls of the entry's.
-private val cpt_sealing: []const (string, string) = [("main.sysl", raw"""
+// Calls of each kind: `once` from the entry outside any loop, `inner` once from it, `hot` from a loop,
+// and `twice` from two calls of the entry's.
+private val cpt_calls: []const (string, string) = [("main.sysl", raw"""
     inner(n: int) -> int = n * 7
     once(n: int) -> int = inner(n) + 1
     hot(n: int) -> int = n + 3
@@ -75,47 +74,17 @@ private val cpt_sealing: []const (string, string) = [("main.sysl", raw"""
         print(total)
     """)]
 
-@test("cpt: a program's text is the same printed as each body is built as printed at the end, sealed or not")
-cpt_sealing_text_is_the_same()
+@test("cpt: a program's text is the same printed as each body is built as printed at the end, linked or not")
+cpt_calls_text_is_the_same()
     if !cpt_ready() then return
 
-    cpt_same(cpt_sealing)
+    cpt_same(cpt_calls)
 
 @test("cpt: and at -O0, which imports no copies")
 cpt_unoptimized_text_is_the_same()
     if !cpt_ready() then return
 
-    cpt_same(cpt_sealing, "0")
-
-@test("cpt: what runs once keeps its linkage and the rest is sealed, read through the kept shapes")
-cpt_run_once_reads_the_shapes()
-    if !cpt_ready() then return
-
-    val root = cpt_root(cpt_sealing)
-    val text = cpt_text(root, true, DefaultOptimization, true)
-
-    remove_dir_all(root).unwrap_or(())
-
-    // `once` runs once and `inner`, called once from it, too: both keep the linkage they were written
-    // with. `hot` is called from a loop and is sealed. Were the shapes lost, nothing would be found to
-    // run once and every one of them would be internal.
-    // A root module's function is `<name>$$sysl` (`tests_ilk_internal_linkage.sysl`).
-    for name in ["once$$sysl", "inner$$sysl", "hot$$sysl"]
-        assert(cpt_define(text, name) != "", s"no define of $name in\n$text")
-
-    assert(!cpt_define(text, "once$$sysl").starts_with("define internal "), cpt_define(text, "once$$sysl"))
-    assert(!cpt_define(text, "inner$$sysl").starts_with("define internal "), cpt_define(text, "inner$$sysl"))
-    assert(cpt_define(text, "hot$$sysl").starts_with("define internal "), cpt_define(text, "hot$$sysl"))
-end cpt_run_once_reads_the_shapes
-
-// The `define` line of `symbol`, or `""`.
-private cpt_define(text: string, symbol: string) -> string
-    for line in lines_of(text)
-        if line.starts_with("define ") && (line.contains(s"@$symbol(") || line.contains(s"@\"$symbol\"("))
-            return line
-
-    ""
-end cpt_define
+    cpt_same(cpt_calls, "0")
 
 @test("cpt: the borrowing entries a program names, and the ones it leaves out, are the same either way")
 cpt_borrowing_entries_are_the_same()
@@ -209,8 +178,8 @@ cpt_test_build_text_is_the_same()
     val root = cpt_root(cpt_suite)
 
     for level in [DefaultOptimization, "0"]
-        val whole = test_build_of(root, None, level, false)
-        val streamed = test_build_of(root, None, level, true)
+        val whole = test_build_of(root, None, level, buf(), false)
+        val streamed = test_build_of(root, None, level, buf(), true)
 
         assert(whole.is_ok() && streamed.is_ok(), "both built")
 

@@ -7,7 +7,7 @@ import sysl.env.{get as env_var}
 import sysl.fs.{IoError, remove_file, write_text}
 import sysl.process.{start, Child, Output}
 import sysl.time.{millis, sleep}
-import sysl.text.{from_utf8_unchecked, str_builder, StrBuilder, Search}
+import sysl.text.{from_utf8_unchecked, join, str_builder, StrBuilder, Search}
 
 // **A program's LLVM text compiled as several modules at once** -- codegen units, as rustc has them.
 //
@@ -975,7 +975,9 @@ compile_units(cc: string, parts: Buf[string], base: string, target: Target,
         // Keyed over the text clang is handed, not the text before marking, so a kept object made
         // without the function attributes is never taken for one made with them.
         val text = laid_out(cc, target, in_clang_dialect(cc, for_clang_unit(parts[i], target, libcalls, level)))
-        val key = unit_object_key(cc, text, args)
+
+        // A kept object's frames were never read, so a report compiles every unit again.
+        val key = if frame_reported() then "" else unit_object_key(cc, text, args)
 
         keys.push(key)
 
@@ -992,6 +994,16 @@ compile_units(cc: string, parts: Buf[string], base: string, target: Target,
         for arg in args
             line.push(arg)
 
+        // The unit's frames, checked and reported where they are laid out (`frame_limit.sysl`).
+        frame_pass(cc, text, ll, target, level)?
+
+        if !frames_at_link()
+            val frames = frame_flags(text, ll)
+
+            for item in frames
+                line.push(item)
+        end if
+
         line.push(ll)
         line.push("-o")
         line.push(obj)
@@ -1004,19 +1016,27 @@ compile_units(cc: string, parts: Buf[string], base: string, target: Target,
 
     val ran = units_ran(cc, lines)
     var failure = ""
+    var frames: Buf[string] = buf()
 
-    // Read in order once every clang is in, so the first failure in order is the one reported.
+    // Read in order once every clang is in, so the first failure in order is the one reported --
+    // except frames over their limits, which are every unit's (`frame_limit.sysl`).
     for j in 0..<todo.len()
-        if failure != "" then break
-
         told_by(cc, ran[j]) match
             Ok(_) -> ()
-            Err(f) -> failure = if f.unrun then f.said else tool_failed(cc, f.code, f.said)
+            Err(f) ->
+                val over = if f.unrun then None else frame_refusal(f.said)
 
+                over match
+                    Some(why) -> frames.push(why)
+                    None -> if failure == "" then failure = framed_failure(cc, f)
+
+    if !frames.is_empty() then return Err(join(frames.view(), "\n\n"))
     if failure != "" then return Err(failure)
 
     for i in todo
         val obj = objects[i]
+
+        if !frames_at_link() then frames_read(s"$obj.ll")
 
         remove_file(s"$obj.ll").unwrap_or(())
         unit_compiled()

@@ -1,0 +1,505 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+
+// A function, a method or a module that promised never to recurse, and the cycle that breaks it.
+//
+// **The promise is about the stack**: a body that can reach itself again before it returns has a
+// depth nobody can bound by reading it, which is why flight and safety-critical rule sets forbid it
+// outright. So the question is asked of every call a promised body can arrive at, however many calls
+// away and in whoever's code, and any cycle among them is refused -- not only a function calling
+// itself.
+//
+// **Every way a body can call is an edge, and the uncertain ones are followed to everything they
+// could reach**, since a cycle missed is a promise broken in silence:
+//
+//   - a call by name, a dispatched operator, an invariant's check -- the function named;
+//   - taking a function's address -- the function, since whoever is handed the address may call it
+//     while the body that took it is still on the stack;
+//   - a call through a trait object, a `&Fn` closure among them -- every table in the program for
+//     that trait, at that slot. Which value is behind the object is decided wherever it was erased,
+//     often in a body the promised one never reaches, so the tables this walk saw would not do;
+//   - a call through a function pointer -- every function in the program whose address is taken at
+//     a pointer of the same type.
+//
+// A closure handed to a generic is an ordinary call in the instance, and a generic is held at each
+// instance, so a cycle that only one type argument closes is refused at that instance. What a C
+// function does is not read: one that calls back into sysl does so through an address the program
+// took, and that address is already an edge.
+//
+// **One cycle is one refusal.** The cycles are the strongly connected parts of the call graph; a
+// promised function on one is told at the call that begins its cycle, and a promised function that
+// only reaches one is told at the call by which it arrives -- unless a function on that cycle promised
+// as well, whose own refusal already names it.
+
+// The word `@no_recursion` is recorded under on a function's marks: what follows `no_`.
+const NoRecursionWord: string = "recursion"
+
+// The call graph of one compilation, with every uncertain call resolved to everything it could reach.
+struct CallGraph
+    funcs: Buf[TFunc]
+    index: Map[string, usize]
+    vtables: Buf[TVtable]
+
+    // Every function whose address the program takes, and the pointer type it is taken at.
+    addressed: Buf[(usize, Type)]
+
+    // What each function can call, by index, in the order its body first names them.
+    edges: Buf[Buf[usize]]
+
+    // The strongly connected part each function is in, and whether that part is a cycle -- more than
+    // one function, or one that calls itself.
+    part: Buf[usize]
+    cyclic: Buf[bool]
+end CallGraph
+
+// Reports every cycle of calls a body that promised never to recurse can arrive at.
+check_no_recursion(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TVtable])
+    var names: Buf[string] = buf()
+
+    for i in 0..<funcs.len()
+        if recursion_promise(a, funcs[i]).is_some() then names.push(funcs[i].name)
+
+    // Almost no compilation promises anything, and the graph reads every body.
+    if names.is_empty() then return
+
+    // **In name order**, so which promised function on a cycle is told about it does not depend on
+    // the order the bodies were typed in.
+    var promised: Buf[usize] = buf()
+
+    for name in sort_names(names)
+        for i in 0..<funcs.len()
+            if funcs[i].name == name && !holds_index(promised, i)
+                promised.push(i)
+                break
+
+    val g = call_graph(funcs, vals, vtables)
+    var told: Buf[usize] = buf()
+    var spans: Buf[(string, usize)] = buf()
+
+    for r in promised
+        if g.cyclic[g.part[r]]
+            if holds_index(told, g.part[r]) then continue
+
+            told.push(g.part[r])
+            report_recursion(a, g, r, cycle_from(g, r), buf(), &spans)
+            continue
+        end if
+
+        val path = path_to_cycle(g, r)
+
+        if path.is_empty() then continue
+
+        val entry = path[path.len() - 1]
+
+        // A function on the cycle that promised as well is told about it at its own call.
+        if part_promised(g, promised, g.part[entry]) then continue
+
+        report_recursion(a, g, r, cycle_from(g, entry), path, &spans)
+end check_no_recursion
+
+// Whose promise a function answers to, said as a refusal ends: its own word, its generic's, or its
+// module's clause. Nothing where it made none.
+private recursion_promise(a: &Analysis, f: TFunc) -> Option[string]
+    val origin = a.tables.members.func_origin.get(f.name)
+    val scope = func_home(a, f.name)
+    val module_name = home_module(a, f.name)
+    val scaffolding = test_only_file(a, scope.src.name) || runner_func(a, f.name)
+
+    if module_no_recursion(a, scope, module_name, scaffolding) then
+        return Some(module_recursion_why(a, scope, module_name, scaffolding))
+
+    if !f.marks.gives_up(NoRecursionWord) then return None
+
+    if origin.is_some() then
+        return Some(s"'${qualified_name(origin.unwrap())}' declared '@no_recursion' (instance " +
+                    s"'${qualified_name(f.name)}')")
+
+    Some(s"'${qualified_name(f.name)}' declared '@no_recursion'")
+end recursion_promise
+
+private module_no_recursion(a: &Analysis, scope: Scope, module_name: string, scaffolding: bool) -> bool =
+    if scaffolding then module_tests_narrowed(a, tests_key(a, module_name, scope), CapRecursion)
+    else module_narrowed(a, module_name, CapRecursion)
+
+private module_recursion_why(a: &Analysis, scope: Scope, module_name: string, scaffolding: bool) -> string
+    if scaffolding && module_tests_own_narrowing(a, tests_key(a, module_name, scope), CapRecursion) then
+        return s"this module's '@tests' file ${tests_file_named(scope)} declared '@no_recursion'"
+
+    "this module declared '@no_recursion'"
+
+// -- the graph ------------------------------------------------------------------------------------
+
+// The program's call graph, every body read once.
+call_graph(funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TVtable]) -> &CallGraph
+    var index: Map[string, usize] = map()
+
+    for i in 0..<funcs.len()
+        index.put(funcs[i].name, i)
+
+    val g: &CallGraph = CallGraph(funcs, index, vtables, buf(), buf(), buf(), buf())
+
+    // The addresses first: a call through a pointer anywhere is answered with all of them.
+    for i in 0..<funcs.len()
+        walk_func(funcs[i], e -> note_address(g, e), w -> ())
+
+    for i in 0..<vals.len()
+        if vals[i].init.is_some() then
+            walk_texpr(vals[i].init.unwrap(), expr_walk(true, e -> note_address(g, e)))
+
+    for i in 0..<funcs.len()
+        val out: &Targets = Targets(buf())
+
+        walk_func(funcs[i], e -> out.add_all(node_targets(g, e)), w -> out.add_all(write_targets(g, w)))
+        g.edges.push(out.items)
+
+    strongly_connected(g)
+    g
+end call_graph
+
+// A set of indices kept in the order they were first added, which a closure can grow.
+struct Targets
+    items: Buf[usize]
+
+    add_all(self, more: Buf[usize])
+        for item in more
+            if !holds_index(self.items, item) then self.items.push(item)
+end Targets
+
+// Every expression and write of a function's body and its contract clauses, which run in its frame.
+private walk_func(f: TFunc, on_expr: &Fn(TExpr) -> unit, on_write: &Fn(TWrite) -> unit)
+    val v: &TWalk = TWalk(true, on_expr, on_write, st -> ())
+
+    walk_block_stmts(f.body, v)
+
+    for c in f.requires
+        walk_texpr(c.cond, v)
+
+    for c in f.ensures
+        walk_texpr(c.cond, v)
+end walk_func
+
+private note_address(g: &CallGraph, e: TExpr)
+    *e.kind match
+        TFuncAddr(name, _, ty) ->
+            g.index.get(name) match
+                Some(i) -> g.addressed.push((i, ty))
+                None -> ()
+        _ -> ()
+
+// The functions one node can call, without descending.
+private node_targets(g: &CallGraph, e: TExpr) -> Buf[usize]
+    val refs = no_refs()
+
+    node_refs(refs, e)
+
+    var out = named_targets(g, refs)
+
+    *e.kind match
+        TCallPtr(callee, _, _, _) ->
+            for item in pointer_targets(g, texpr_type(callee))
+                if !holds_index(out, item) then out.push(item)
+        _ -> ()
+
+    out
+end node_targets
+
+private write_targets(g: &CallGraph, w: TWrite) -> Buf[usize]
+    val refs = no_refs()
+
+    write_refs(refs, w)
+    named_targets(g, refs)
+end write_targets
+
+// The functions a node's own names arrive at: each one named, and every table's answer at each slot
+// it calls through.
+private named_targets(g: &CallGraph, refs: &Refs) -> Buf[usize]
+    var out: Buf[usize] = buf()
+
+    for name in refs.calls
+        g.index.get(name) match
+            Some(i) -> if !holds_index(out, i) then out.push(i)
+            None -> ()
+
+    for site in refs.sites
+        for t in g.vtables
+            if t.trait_name != site.0 || usize(site.1) >= t.slots.len() then continue
+
+            g.index.get(t.slots[usize(site.1)].target) match
+                Some(i) -> if !holds_index(out, i) then out.push(i)
+                None -> ()
+
+    out
+end named_targets
+
+// The functions a call through a pointer of this type can arrive at: every one whose address the
+// program took at the same type, or every one whose address it took at all where the type is not a
+// function pointer's.
+private pointer_targets(g: &CallGraph, ty: Type) -> Buf[usize]
+    var out: Buf[usize] = buf()
+
+    for item in g.addressed
+        if pointer_fits(ty, item.1) && !holds_index(out, item.0) then out.push(item.0)
+
+    out
+end pointer_targets
+
+private pointer_fits(called: Type, taken: Type) -> bool = called match
+    CFn(cps, cr, _) -> taken match
+        CFn(tps, tr, _) -> types_eq(cps, tps) && type_eq(*cr, *tr)
+        _ -> true
+    _ -> true
+
+private holds_index(items: Buf[usize], item: usize) -> bool
+    for x in items
+        if x == item then return true
+
+    false
+
+// Tarjan's strongly connected parts, without recursion: the graph of a large program is deeper than
+// a thread's stack is willing to follow.
+private strongly_connected(g: &CallGraph)
+    val n = g.funcs.len()
+    var order: Buf[isize] = buf()
+    var low: Buf[isize] = buf()
+    var on_stack: Buf[bool] = buf()
+
+    for _ in 0..<n
+        order.push(-1)
+        low.push(0)
+        on_stack.push(false)
+        g.part.push(0)
+
+    var stack: Buf[usize] = buf()
+    var work: Buf[(usize, usize)] = buf()
+    var counter: isize = 0
+    var parts: usize = 0
+
+    for s in 0..<n
+        if order[s] >= 0 then continue
+
+        order[s] = counter
+        low[s] = counter
+        counter += 1
+        stack.push(s)
+        on_stack[s] = true
+        work.push((s, 0))
+
+        while !work.is_empty()
+            val top = work.len() - 1
+            val v = work[top].0
+            val k = work[top].1
+
+            if k < g.edges[v].len()
+                work[top] = (v, k + 1)
+
+                val w = g.edges[v][k]
+
+                if order[w] < 0
+                    order[w] = counter
+                    low[w] = counter
+                    counter += 1
+                    stack.push(w)
+                    on_stack[w] = true
+                    work.push((w, 0))
+                elif on_stack[w] && order[w] < low[v]
+                    low[v] = order[w]
+
+                continue
+            end if
+
+            work.truncate(top)
+
+            if top > 0 && low[v] < low[work[top - 1].0] then low[work[top - 1].0] = low[v]
+
+            if low[v] == order[v]
+                var size: usize = 0
+
+                loop
+                    val w = stack[stack.len() - 1]
+
+                    stack.truncate(stack.len() - 1)
+                    on_stack[w] = false
+                    g.part[w] = parts
+                    size += 1
+
+                    if w == v then break
+
+                g.cyclic.push(size > 1 || holds_index(g.edges[v], v))
+                parts += 1
+            end if
+end strongly_connected
+
+// -- the cycle, and the way to it ----------------------------------------------------------------
+
+// The shortest cycle through one function: it, each function the cycle calls in turn, and it again.
+private cycle_from(g: &CallGraph, start: usize) -> Buf[usize]
+    val part = g.part[start]
+    var names: Buf[usize] = buf()
+    var parents: Buf[isize] = buf()
+
+    for item in g.edges[start]
+        if item == start then return ringed(start, buf())
+
+        if g.part[item] == part && !holds_index(names, item)
+            names.push(item)
+            parents.push(-1)
+
+    var i: usize = 0
+
+    while i < names.len()
+        val v = names[i]
+
+        for w in g.edges[v]
+            if w == start then return ringed(start, back_from(names, parents, i))
+
+            if g.part[w] == part && !holds_index(names, w)
+                names.push(w)
+                parents.push(isize(i))
+
+        i += 1
+
+    buf()
+end cycle_from
+
+// A cycle written out as a reader follows it: the function it starts at, the way round, and the
+// function again.
+private ringed(start: usize, between: Buf[usize]) -> Buf[usize]
+    var out: Buf[usize] = buf()
+
+    out.push(start)
+
+    for item in between
+        out.push(item)
+
+    out.push(start)
+    out
+end ringed
+
+// The shortest way from a function to one on a cycle, both ends included -- or nothing where it
+// reaches none.
+private path_to_cycle(g: &CallGraph, start: usize) -> Buf[usize]
+    var names: Buf[usize] = buf()
+    var parents: Buf[isize] = buf()
+
+    names.push(start)
+    parents.push(-1)
+
+    var i: usize = 0
+
+    while i < names.len()
+        val v = names[i]
+
+        if g.cyclic[g.part[v]] then return back_from(names, parents, i)
+
+        for w in g.edges[v]
+            if !holds_index(names, w)
+                names.push(w)
+                parents.push(isize(i))
+
+        i += 1
+
+    buf()
+end path_to_cycle
+
+// The chain a breadth-first walk recorded, read from where it began to where it ended.
+private back_from(names: Buf[usize], parents: Buf[isize], last: usize) -> Buf[usize]
+    var backwards: Buf[usize] = buf()
+    var at = isize(last)
+
+    while at >= 0
+        backwards.push(names[usize(at)])
+        at = parents[usize(at)]
+
+    var out: Buf[usize] = buf()
+
+    for j in 0..<backwards.len()
+        out.push(backwards[backwards.len() - 1 - j])
+
+    out
+end back_from
+
+private part_promised(g: &CallGraph, promised: Buf[usize], part: usize) -> bool
+    for item in promised
+        if g.part[item] == part then return true
+
+    false
+
+// -- the refusal ----------------------------------------------------------------------------------
+
+// One refusal, at the call in the promised body that begins the way to the cycle: the cycle itself
+// where the body is on it, and otherwise the function the body called and the chain from it.
+private report_recursion(a: &Analysis, g: &CallGraph, r: usize, cycle: Buf[usize], path: Buf[usize],
+                         spans: *Buf[(string, usize)])
+    val f = g.funcs[r]
+    val why = recursion_promise(a, f).unwrap_or("")
+    val next = if path.is_empty() then cycle[1] else path[1]
+    val scope = written_home(a, f)
+    val at = call_site(g, f, next).unwrap_or(f.span)
+
+    for item in *spans
+        if item.0 == scope.src.name && item.1 == at.start then return
+
+    spans.push((scope.src.name, at.start))
+
+    val chain = arrows(g, cycle)
+
+    if path.is_empty()
+        a.fault(scope, at, s"this call recurses by the cycle $chain, and $why")
+        return
+    end if
+
+    val callee = s"'${qualified_name(g.funcs[next].name)}'"
+
+    if path.len() == 2
+        a.fault(scope, at, s"this reaches $callee, which recurses by the cycle $chain, and $why")
+        return
+    end if
+
+    var way: Buf[usize] = buf()
+
+    for j in 1..<path.len()
+        way.push(path[j])
+
+    a.fault(scope, at, s"this reaches $callee, which recurses by the call path ${arrows(g, way)} and " +
+            s"the cycle $chain, and $why")
+end report_recursion
+
+// The file a body was written in: an instance's is its generic's.
+private written_home(a: &Analysis, f: TFunc) -> Scope
+    val origin = a.tables.members.func_origin.get(f.name)
+
+    if origin.is_some()
+        val written = abstract_named(a, origin.unwrap())
+
+        if written.is_some() then return func_home(a, written.unwrap().name)
+    end if
+
+    func_home(a, f.name)
+end written_home
+
+private arrows(g: &CallGraph, names: Buf[usize]) -> string
+    var out = ""
+
+    for j in 0..<names.len()
+        if j > 0 then out = out + " → "
+
+        out = out + s"'${qualified_name(g.funcs[names[j]].name)}'"
+
+    out
+end arrows
+
+// The first node of a body that can call `target`, which is where the reader changes something.
+private call_site(g: &CallGraph, f: TFunc, target: usize) -> Option[Span]
+    val found: &FoundAt = FoundAt(None)
+
+    walk_func(f, e -> if found.at.is_none() && holds_index(node_targets(g, e), target) then found.at = Some(e.span),
+              w -> if found.at.is_none() && holds_index(write_targets(g, w), target) then
+                       found.at = Some(w.place.span))
+    found.at
+end call_site
+
+struct FoundAt
+    at: Option[Span]

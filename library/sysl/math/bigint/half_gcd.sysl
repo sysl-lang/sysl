@@ -1,0 +1,287 @@
+module sysl.math.bigint
+
+// The subquadratic gcd: Schönhage's half-gcd in the form Möller gives it ("On Schönhage's algorithm
+// and subquadratic integer gcd computation", Mathematics of Computation 77, 2008), which is the form
+// GMP's `mpn_hgcd` implements.
+//
+// **Lehmer's gcd (`theory.sysl`) takes about sixty bits of progress per pass over the limbs**, so a
+// pair of `n` limbs costs `n` passes of `n` limbs -- quadratic, however good each pass is. The
+// half-gcd's observation is that the quotients Euclid takes on the top half of a pair are, almost
+// all of them, the quotients it would take on the whole pair. So the top half is reduced
+// recursively, the product of every quotient it took is kept as a two-by-two matrix, and the matrix
+// is applied to the whole pair once, by multiplication. That turns the gcd into a sequence of
+// multiplies, and it costs what a multiply costs times a logarithm.
+//
+// ## The reduction, and why it is correct by construction
+//
+// A **reduction** of a pair `(a, b)` is a matrix `M = [[u00, u01], [u10, u11]]` of non-negative
+// entries with determinant one, and a pair `(alpha, beta)` with `(a; b) = M (alpha; beta)`. Every
+// step of Euclid is one -- `a - q b` is `M = [[1, q], [0, 1]]` -- and so is any product of them. A
+// determinant of one makes the inverse a matrix of integers, so `gcd(a, b) = gcd(alpha, beta)`
+// whatever `M` is: **no reduction can change the answer**, only how far it is from being found.
+//
+// `hgcd` reduces a pair whose larger has `n` limbs as far as it can while keeping both of `alpha`
+// and `beta` above `2^(s w)` for `s = n / 2 + 1` -- each of them MORE than `s` limbs. That floor is
+// what makes the top half's reduction good for the whole: with `A` and `B` the pair's top limbs from
+// `p` up, a reduction of `(A, B)` with both values over `2^(s1 w)`, `2 s1 w` past `A`'s bit length,
+// has `u01 <= A / beta < alpha` and `u10 <= B / alpha < beta`, so applying `M` to the WHOLE pair,
+// low limbs and all,
+//
+//     alpha' = 2^(p w) alpha + u11 a_lo - u01 b_lo  >=  2^(p w) (alpha - u01)
+//
+// is positive and over `2^((p + s1) w - 1)` -- and the two places `hgcd` recurses choose `p` so that
+// `p + s1 > s`, which keeps the outer call's floor. No step here is a guess that has to be checked
+// and undone; the floor is what each step is checked against before it is taken.
+//
+// ## The steps between the recursions
+//
+// A **step** is one Lehmer matrix (`lehmer_matrix` with a floor: it stops before the remainder its
+// window certifies could fall under `2^(s w)`), or where the leading bits cannot decide a quotient,
+// one division. A division whose remainder would cross the floor takes one quotient less, leaving
+// the remainder plus the divisor -- still a reduction, and the last one there is. Where even that
+// crosses it, `a - b` itself is under the floor and the pair is reduced as far as it goes.
+//
+// **The extended gcd rides the same machinery.** Its cofactors are carried through every matrix the
+// reduction applies (`gcd_ext` in `theory.sysl`), so it is subquadratic in the same places.
+
+/** The size, in limbs of the larger operand, at which `hgcd` recurses rather than stepping. Below
+ * it each step is a Lehmer pass over the limbs. Measured on an Apple M-series core with 64-bit limbs.
+ */
+private[bigint] val hgcd_threshold: usize = 60
+
+/** The size, in limbs of the smaller operand, at which `gcd` and `gcd_ext` reduce through `hgcd`
+ * rather than Lehmer's loop. Measured as `hgcd_threshold` is.
+ */
+private[bigint] val gcd_dc_threshold: usize = 150
+
+/** A reduction `(a; b) = M (alpha; beta)` in progress: the matrix, and the pair as it now stands in
+ * `a` and `b`. `moved` says whether any step was taken -- a reduction that took none is the identity
+ * and says the pair could not be reduced above its floor at all.
+ */
+private[bigint] struct Reduction
+    u00: []const Limb
+    u01: []const Limb
+    u10: []const Limb
+    u11: []const Limb
+    a: []const Limb
+    b: []const Limb
+    moved: bool
+
+/** The identity reduction of `(a, b)`. */
+private[bigint] identity(a: []const Limb, b: []const Limb) -> Reduction =
+    Reduction(mag_of_u64(1), empty(), empty(), mag_of_u64(1), a, b, false)
+
+/** The limbs of `x` from `p` up -- `x >> (p w)`, trimmed because `x` is. */
+private[bigint] limbs_above(x: []const Limb, p: usize) -> []const Limb = if x.len > p then x[p..] else empty()
+
+/** The limbs of `x` below `p` -- `x mod 2^(p w)` -- trimmed. */
+private[bigint] limbs_below(x: []const Limb, p: usize) -> []const Limb
+    val k = if x.len < p then x.len else p
+
+    x[0..<top_of(x, k)]
+
+/** `x * 2^(p w) + y`. */
+private shifted_add(x: []const Limb, p: usize, y: []const Limb) -> []const Limb
+    if x.len == 0 then return y
+
+    var out: []Limb = [0; x.len + p]
+
+    copy_n(out[p..], x, x.len)
+    add_mag(finished(out, x.len + p), y)
+
+/** `x p + y q` for magnitudes `x`, `y` and limbs `p`, `q` -- one entry of a matrix times a matrix of
+ * single limbs. At most one limb longer than the longer of the two.
+ */
+private lin(x: []const Limb, p: Limb, y: []const Limb, q: Limb) -> []const Limb
+    val n = (if x.len > y.len then x.len else y.len) + 1
+    var out: []Limb = [0; n]
+
+    if x.len > 0
+        val c = addmul_1(out, x, x.len, p)
+
+        add_1(out[x.len..], out[x.len..], n - x.len, c)
+
+    if y.len > 0
+        val c = addmul_1(out, y, y.len, q)
+
+        add_1(out[y.len..], out[y.len..], n - y.len, c)
+
+    finished(out, n)
+end lin
+
+/** `x p + y q` for magnitudes throughout. */
+private dot(x: []const Limb, p: []const Limb, y: []const Limb, q: []const Limb) -> []const Limb =
+    add_mag(mul_mag(x, p), mul_mag(y, q))
+
+/** The larger of the two sizes -- the `n` every floor is measured from. */
+private size_of(a: []const Limb, b: []const Limb) -> usize = if a.len > b.len then a.len else b.len
+
+/** `(alpha', beta')`: the reduction `inner` -- of the pair's limbs from `p` up -- applied to the whole
+ * pair `(a, b)`, its low limbs and all. Each is positive by the argument at the head of this file,
+ * so the subtraction cannot borrow out of the top.
+ */
+private[bigint] applied(inner: Reduction, a: []const Limb, b: []const Limb, p: usize) -> ([]const Limb, []const Limb)
+    val alo = limbs_below(a, p)
+    val blo = limbs_below(b, p)
+    val alpha = sub_mag(shifted_add(inner.a, p, mul_mag(inner.u11, alo)), mul_mag(inner.u01, blo))
+    val beta = sub_mag(shifted_add(inner.b, p, mul_mag(inner.u00, blo)), mul_mag(inner.u10, alo))
+
+    (alpha, beta)
+
+/** `r` followed by `inner`, a reduction of `r`'s pair's limbs from `p` up: the pair becomes the
+ * whole pair reduced, and the matrix becomes `M * M_inner`.
+ */
+private compose(r: *Reduction, inner: Reduction, p: usize)
+    val (alpha, beta) = applied(inner, r.a, r.b, p)
+
+    r.a = alpha
+    r.b = beta
+
+    if r.moved
+        val n00 = dot(r.u00, inner.u00, r.u01, inner.u10)
+        val n01 = dot(r.u00, inner.u01, r.u01, inner.u11)
+        val n10 = dot(r.u10, inner.u00, r.u11, inner.u10)
+        val n11 = dot(r.u10, inner.u01, r.u11, inner.u11)
+
+        r.u00 = n00
+        r.u01 = n01
+        r.u10 = n10
+        r.u11 = n11
+    else
+        r.u00 = inner.u00
+        r.u01 = inner.u01
+        r.u10 = inner.u10
+        r.u11 = inner.u11
+
+    r.moved = true
+end compose
+
+/** `M` times the single-limb matrix `[[t00, t01], [t10, t11]]`, in place. */
+private times_small(r: *Reduction, t00: Limb, t01: Limb, t10: Limb, t11: Limb)
+    val n00 = lin(r.u00, t00, r.u01, t10)
+    val n01 = lin(r.u00, t01, r.u01, t11)
+    val n10 = lin(r.u10, t00, r.u11, t10)
+    val n11 = lin(r.u10, t01, r.u11, t11)
+
+    r.u00 = n00
+    r.u01 = n01
+    r.u10 = n10
+    r.u11 = n11
+
+/** One step of the reduction that keeps both values over `2^(s w)`, answering whether it took one.
+ *
+ * A Lehmer matrix where the two are within a limb of each other and the leading bits decide a
+ * quotient, else a single division. Lehmer's matrix `C` takes the larger and smaller `(x, y)` to
+ * `(x', y')`; its inverse `[[|d|, |b|], [|c|, |a|]]` is the reduction, and where `C`'s determinant
+ * and the pair's order disagree, the new values go in the other way round so that the reduction's
+ * determinant stays one.
+ */
+private[bigint] hgcd_step(r: *Reduction, s: usize) -> bool
+    val a_big = cmp_mag(r.a, r.b) >= 0
+    val x = if a_big then r.a else r.b
+    val y = if a_big then r.b else r.a
+
+    if x.len == y.len || x.len == y.len + 1
+        val m = lehmer_matrix(x, y, s * limb_bits)
+
+        if m.b != 0
+            var yp: []Limb = [0; x.len]
+
+            copy_n(yp, y, y.len)
+
+            val nx = combine(x, yp, m.a, m.b)
+            val ny = combine(x, yp, m.c, m.d)
+            val ca = Limb(if m.a < 0 then -m.a else m.a)
+            val cb = Limb(if m.b < 0 then -m.b else m.b)
+            val cc = Limb(if m.c < 0 then -m.c else m.c)
+            val cd = Limb(if m.d < 0 then -m.d else m.d)
+
+            // An odd number of quotients -- a determinant of -1 -- is the one with `b` positive.
+            val odd = m.b > 0
+
+            if a_big && !odd
+                r.a = nx
+                r.b = ny
+                times_small(r, cd, cb, cc, ca)
+            elif a_big
+                r.a = ny
+                r.b = nx
+                times_small(r, cb, cd, ca, cc)
+            elif odd
+                r.a = nx
+                r.b = ny
+                times_small(r, cc, ca, cd, cb)
+            else
+                r.a = ny
+                r.b = nx
+                times_small(r, ca, cc, cb, cd)
+
+            r.moved = true
+
+            return true
+
+    // A division, taking one quotient less where the remainder would cross the floor -- unless even
+    // `x - y` would, in which case no step stays above it.
+    if sub_mag(x, y).len <= s then return false
+
+    val (q0, r0) = divmod_mag(x, y)
+    var q = q0
+    var rem = r0
+
+    if rem.len <= s
+        q = sub_mag(q, mag_of_u64(1))
+        rem = add_mag(rem, y)
+
+    if a_big
+        r.a = rem
+        r.u01 = add_mag(r.u01, mul_mag(r.u00, q))
+        r.u11 = add_mag(r.u11, mul_mag(r.u10, q))
+    else
+        r.b = rem
+        r.u00 = add_mag(r.u00, mul_mag(r.u01, q))
+        r.u10 = add_mag(r.u10, mul_mag(r.u11, q))
+
+    r.moved = true
+
+    true
+end hgcd_step
+
+/** The half-gcd of `(a, b)`: a reduction as far as it goes with both values kept MORE than `s` limbs
+ * long, `s = n / 2 + 1` for `n` the larger's length. `moved` is false where the pair is at its floor
+ * already -- either operand `s` limbs or fewer, or the two within `2^(s w)` of each other.
+ *
+ * At `threshold` limbs and above it recurses twice, on the top half and then on the top of what that
+ * left, with steps between to bring the size to where the second recursion's floor lands on `s`;
+ * below it, it steps.
+ */
+private[bigint] hgcd(a: []const Limb, b: []const Limb, threshold: usize) -> Reduction
+    val n = size_of(a, b)
+    val s = n / 2 + 1
+    var r = identity(a, b)
+
+    if a.len <= s || b.len <= s then return r
+
+    if n >= threshold && n >= 4
+        val p = n / 2
+        val first = hgcd(limbs_above(a, p), limbs_above(b, p), threshold)
+
+        if first.moved then compose(&r, first, p)
+
+        val n2 = 3 * n / 4 + 1
+
+        while size_of(r.a, r.b) > n2
+            if !hgcd_step(&r, s) then return r
+
+        val nn = size_of(r.a, r.b)
+
+        if nn > s + 2
+            val p2 = 2 * s - nn + 1
+            val second = hgcd(limbs_above(r.a, p2), limbs_above(r.b, p2), threshold)
+
+            if second.moved then compose(&r, second, p2)
+
+    loop
+        if !hgcd_step(&r, s) then break
+
+    r
+end hgcd

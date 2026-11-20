@@ -15,7 +15,7 @@ sink is `x.to_string()`, and that goes through storage the compiler lays out rat
 
 ## Index
 
-[`buf`](#buf) [`buf_filled`](#buf_filled) [`buf_with_capacity`](#buf_with_capacity) [`buffer`](#buffer) [`byte_sink`](#byte_sink) [`Buf`](#buf-1) [`ByteSink`](#bytesink) [`Frozen`](#frozen) [`FrozenWalk`](#frozenwalk) [`Buffer`](#buffer-1) [Buf[T]](#buft) [Debug for Buf[T]](#debug-for-buft) [Debug for Frozen[T]](#debug-for-frozent) [Display for Buf[T]](#display-for-buft) [Display for Frozen[T]](#display-for-frozent) [Drop for Frozen[T]](#drop-for-frozent) [Eq for Buf[T]](#eq-for-buft) [Fallible for ByteSink](#fallible-for-bytesink) [Index for Buf[T]](#index-for-buft) [Index for Frozen[T]](#index-for-frozent) [IndexPlace for Buf[T]](#indexplace-for-buft) [IndexSet for Buf[T]](#indexset-for-buft) [Iterate for FrozenWalk[T]](#iterate-for-frozenwalkt) [Walk for Buf[T]](#walk-for-buft) [Walk for Frozen[T]](#walk-for-frozent) [Writer for ByteSink](#writer-for-bytesink)
+[`buf`](#buf) [`buf_filled`](#buf_filled) [`buf_with_capacity`](#buf_with_capacity) [`buffer`](#buffer) [`byte_sink`](#byte_sink) [`try_buf`](#try_buf) [`try_buf_filled`](#try_buf_filled) [`try_buf_with_capacity`](#try_buf_with_capacity) [`Buf`](#buf-1) [`ByteSink`](#bytesink) [`Frozen`](#frozen) [`FrozenWalk`](#frozenwalk) [`Buffer`](#buffer-1) [Buf[T]](#buft) [Debug for Buf[T]](#debug-for-buft) [Debug for Frozen[T]](#debug-for-frozent) [Display for Buf[T]](#display-for-buft) [Display for Frozen[T]](#display-for-frozent) [Drop for Frozen[T]](#drop-for-frozent) [Eq for Buf[T]](#eq-for-buft) [Fallible for ByteSink](#fallible-for-bytesink) [Index for Buf[T]](#index-for-buft) [Index for Frozen[T]](#index-for-frozent) [IndexPlace for Buf[T]](#indexplace-for-buft) [IndexSet for Buf[T]](#indexset-for-buft) [Iterate for FrozenWalk[T]](#iterate-for-frozenwalkt) [Walk for Buf[T]](#walk-for-buft) [Walk for Frozen[T]](#walk-for-frozent) [Writer for ByteSink](#writer-for-bytesink)
 
 ## Functions
 
@@ -65,6 +65,32 @@ const buffer[T]() -> Buf[T]
 ```sysl
 byte_sink() -> ByteSink
 ```
+
+### `try_buf`
+
+```sysl
+try_buf[T]() -> Result[Buf[T], AllocError]
+```
+
+`buf()`, answering `AllocError` where the heap refused the box every handle shares.
+
+### `try_buf_filled`
+
+```sysl
+try_buf_filled[T](n: usize, value: T) -> Result[Buf[T], AllocError]
+```
+
+`buf_filled(n, value)`, answering `AllocError` as `try_buf_with_capacity` does.
+
+### `try_buf_with_capacity`
+
+```sysl
+try_buf_with_capacity[T](n: usize, fill: T) -> Result[Buf[T], AllocError]
+```
+
+`buf_with_capacity(n, fill)`, answering `AllocError` where the heap refused the storage or the
+box -- with neither left allocated -- and `CapacityOverflow` where `n` elements do not fit in a
+`usize` of bytes.
 
 ## Types
 
@@ -130,8 +156,13 @@ the caller's line.
 | `clear` | `const clear(self)` |  |
 | `insert` | `const insert(self, i: usize, v: T)` |  |
 | `reserve` | `const reserve(self, more: usize)` | Room for at least `more` elements past `len()`, so that many pushes -- or that many slots written through `spare()` -- need no growth. |
+| `try_push` | `try_push(self, v: T) -> Result[unit, AllocError]` | `push`, answering `AllocError` where the storage had to grow and the heap refused it -- the buffer then holds what it held, and `v` is not kept. |
+| `try_extend` | `try_extend(self, xs: []const T) -> Result[unit, AllocError]` | `extend`, answering `AllocError` -- `CapacityOverflow` where the count plus the run passes the largest size -- with nothing appended where it does. |
+| `try_insert` | `try_insert(self, i: usize, v: T) -> Result[unit, AllocError]` | `insert`, answering `AllocError` where the storage had to grow; an index past `len()` still traps, as it does in `insert`. |
+| `try_reserve` | `try_reserve(self, more: usize) -> Result[unit, AllocError]` | `reserve`, answering `AllocError`: `CapacityOverflow` where `len() + more` passes the largest size, `OutOfMemory` where the heap refused the storage. |
 | `remove` | `const remove(self, i: usize) -> T` |  |
 | `copy` | `const copy(self) -> Buf[T]` | A second buffer holding the same elements, sized to them -- the one way to get a buffer that is not this one, every other way of handing a `Buf` on handing on this one. |
+| `try_copy` | `try_copy(self) -> Result[Buf[T], AllocError]` | `copy`, answering `AllocError` where the heap refused the second buffer or its storage, with nothing of either left allocated. |
 | `freeze` | `const freeze(self) -> &Frozen[T]` | The elements, frozen: a `&Frozen[T]` nothing writes, and this buffer -- through this name and every other -- left empty (`Frozen`). |
 | `view` | `const view(self) -> []const T` | The elements as a read-only slice, which is what everything reading a `Buf` in bulk goes through. |
 | `view_mut` | `view_mut(*self) -> []T` | The elements as a slice that may be written, the same storage `view()` gives -- so a write through it is seen through the buffer. |
@@ -365,6 +396,11 @@ impl[T] Walk for Buf[T]
 `for x in b` walks `view()`: the elements the buffer held when the loop began, read by index as a
 slice's are, rather than through a cursor that would cost a call apiece. An element pushed during
 the walk is not visited, the view having been taken before the first turn.
+
+**A walk only reads**, so it takes the view itself rather than through `into_view()`: that member
+gives its receiver up and is `@relocates`, and a loop reaching it would make every function that
+walks a buffer count as one that may move a buffer's storage -- refusing a `ref` into a `Buf[T]`
+across any call that loops over one.
 
 ### Walk for Frozen[T]
 

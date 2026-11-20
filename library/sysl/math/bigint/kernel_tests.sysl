@@ -1,0 +1,210 @@
+module sysl.math.bigint
+@tests
+
+import sysl.rand.{Rng, rng}
+
+// The five carrying kernels against their portable loops, and against values worked by hand.
+//
+// On AArch64 `add_n` and its siblings are assembly and `add_n_portable` and its siblings are the
+// loops every other processor runs, so these say the two agree; elsewhere the two are one loop and
+// the comparisons are trivially true, and the worked values carry the weight. Every count from 1 to
+// 66 is covered because the assembly takes `n % 4` limbs in two straight-line pieces before its
+// four-limb blocks: each of the sixteen combinations of head and block count is reached several
+// times. The limb shapes are the ones carries live in -- all ones (a carry through every limb), zero
+// (a borrow through every limb), random, and runs of ones and zeros mixed.
+
+/** One limb of shape `kind`: 0 random, 1 all ones, 2 zero, 3 all ones or zero at random. */
+private limb_of(g: *Rng, kind: int) -> Limb
+    if kind == 1
+        return ~Limb(0)
+    if kind == 2
+        return 0
+    if kind == 3
+        return if g.next_u64() & 1 == 1 then ~Limb(0) else 0
+    Limb.wrap(g.next_u64())
+end limb_of
+
+private filled(g: *Rng, n: usize, kind: int) -> []Limb
+    val x = fresh(n)
+    for i in 0..<n do x[i] = limb_of(g, kind)
+    x
+
+private copied(a: []const Limb, n: usize) -> []Limb
+    val x = fresh(n)
+    copy_n(x, a, n)
+    x
+
+private same(x: []const Limb, y: []const Limb, n: usize) -> bool
+    for i in 0..<n
+        if x[i] != y[i]
+            return false
+    true
+
+/** The multipliers that reach every corner of a product: none, the identity, a shift, the largest
+ * (whose high half is the largest a product has), the top bit alone, a small odd one and a random one.
+ */
+private multiplier(g: *Rng, i: int) -> Limb
+    if i == 0
+        return 0
+    if i == 1
+        return 1
+    if i == 2
+        return 2
+    if i == 3
+        return ~Limb(0)
+    if i == 4
+        return Limb(1) << (limb_bits - 1)
+    if i == 5
+        return 12345
+    Limb.wrap(g.next_u64())
+end multiplier
+
+@test("add_n and sub_n answer what their portable loops do, at every count, shape and aliasing")
+two_run_kernels_match_the_loops()
+    var g = rng(20261118, 41)
+
+    for ka in 0..<4
+        for kb in 0..<4
+            for n in 1..<67
+                val a = filled(&g, n, ka)
+                val b = filled(&g, n, kb)
+                val r1 = fresh(n)
+                val r2 = fresh(n)
+
+                assert_eq(add_n(r1, a, b, n), add_n_portable(r2, a, b, n))
+                assert(same(r1, r2, n))
+                assert_eq(sub_n(r1, a, b, n), sub_n_portable(r2, a, b, n))
+                assert(same(r1, r2, n))
+
+                // `r` is `a`, then `r` is `b`.
+                val x1 = copied(a, n)
+                val x2 = copied(a, n)
+
+                assert_eq(add_n(x1, x1, b, n), add_n_portable(x2, x2, b, n))
+                assert(same(x1, x2, n))
+                assert_eq(sub_n(x1, x1, b, n), sub_n_portable(x2, x2, b, n))
+                assert(same(x1, x2, n))
+
+                val y1 = copied(b, n)
+                val y2 = copied(b, n)
+
+                assert_eq(add_n(y1, a, y1, n), add_n_portable(y2, a, y2, n))
+                assert(same(y1, y2, n))
+                assert_eq(sub_n(y1, a, y1, n), sub_n_portable(y2, a, y2, n))
+                assert(same(y1, y2, n))
+end two_run_kernels_match_the_loops
+
+@test("mul_1, addmul_1 and submul_1 answer what their portable loops do, at every count and multiplier")
+one_limb_kernels_match_the_loops()
+    var g = rng(20261118, 43)
+    val ins: [3]Limb = [0, 1, ~Limb(0)]
+
+    for kind in 0..<4
+        for mi in 0..<7
+            for n in 1..<67
+                val m = multiplier(&g, mi)
+                val a = filled(&g, n, kind)
+                val r = filled(&g, n, (kind + 1) % 4)
+
+                // `mul_1` takes any limb as the carry in, the largest included.
+                for c in ins
+                    val r1 = fresh(n)
+                    val r2 = fresh(n)
+
+                    assert_eq(mul_1(r1, a, n, m, c), mul_1_portable(r2, a, n, m, c))
+                    assert(same(r1, r2, n))
+
+                val x1 = copied(a, n)
+                val x2 = copied(a, n)
+
+                assert_eq(mul_1(x1, x1, n, m, 7), mul_1_portable(x2, x2, n, m, 7))
+                assert(same(x1, x2, n))
+
+                val s1 = copied(r, n)
+                val s2 = copied(r, n)
+
+                assert_eq(addmul_1(s1, a, n, m), addmul_1_portable(s2, a, n, m))
+                assert(same(s1, s2, n))
+
+                val t1 = copied(r, n)
+                val t2 = copied(r, n)
+
+                assert_eq(submul_1(t1, a, n, m), submul_1_portable(t2, a, n, m))
+                assert(same(t1, t2, n))
+end one_limb_kernels_match_the_loops
+
+@test("the kernels' carries and borrows out, on values worked by hand")
+kernel_carries_by_hand()
+    val max = ~Limb(0)
+    var g = rng(1, 1)
+
+    for n in 1..<67
+        val ones = filled(&g, n, 1)
+        val zeros = filled(&g, n, 2)
+        val r = fresh(n)
+
+        // All ones plus all ones is all ones shifted up one: every limb but the lowest ones, a carry.
+        assert_eq(add_n(r, ones, ones, n), 1)
+        assert_eq(r[0], max - 1)
+        for i in 1..<n do assert_eq(r[i], max)
+
+        // Plus zero carries nothing; zero minus zero borrows nothing.
+        assert_eq(add_n(r, ones, zeros, n), 0)
+        assert(same(r, ones, n))
+        assert_eq(sub_n(r, zeros, zeros, n), 0)
+        assert(same(r, zeros, n))
+
+        // Zero minus all ones borrows through every limb and leaves one.
+        assert_eq(sub_n(r, zeros, ones, n), 1)
+        assert_eq(r[0], 1)
+        for i in 1..<n do assert_eq(r[i], 0)
+
+        // All ones times the largest limb, `(B^n - 1)(B - 1) = B^(n+1) - 2 B^n + B^n - B + 1`: a
+        // low run of one then all ones, and `B - 2` carried out.
+        assert_eq(mul_1(r, ones, n, max), max - 1)
+        assert_eq(r[0], 1)
+        for i in 1..<n do assert_eq(r[i], max)
+
+        // Times zero is zero, and the carry in comes straight out the top.
+        assert_eq(mul_1(r, ones, n, 0, max), 0)
+        assert_eq(r[0], max)
+        for i in 1..<n do assert_eq(r[i], 0)
+
+        // `B^n - 1` plus `(B^n - 1)(B - 1)` is `B^(n+1) - B = (B - 1) B^n + B^n - B`: a low run of
+        // zero then all ones, and `B - 1` carried.
+        val s = copied(ones, n)
+
+        assert_eq(addmul_1(s, ones, n, max), max)
+        assert_eq(s[0], 0)
+        for i in 1..<n do assert_eq(s[i], max)
+
+        // Zero minus `(B^n - 1)(B - 1)` is `B - 1` less `B - 1` lots of `B^n`: a low run of
+        // `max` then zeros, and a borrow of `max`.
+        val t = copied(zeros, n)
+
+        assert_eq(submul_1(t, ones, n, max), max)
+        assert_eq(t[0], max)
+        for i in 1..<n do assert_eq(t[i], 0)
+
+    // A single limb carries and borrows on its own.
+    val one = filled(&g, 1, 2)
+    val top = filled(&g, 1, 1)
+    val r = fresh(1)
+
+    one[0] = 1
+    assert_eq(add_n(r, top, one, 1), 1)
+    assert_eq(r[0], 0)
+    assert_eq(sub_n(r, r, one, 1), 1)
+    assert_eq(r[0], max)
+end kernel_carries_by_hand
+
+@test("a run of no limbs carries nothing, and mul_1 hands its carry in straight back")
+kernels_at_zero_limbs()
+    val e = fresh(0)
+
+    assert_eq(add_n(e, e, e, 0), 0)
+    assert_eq(sub_n(e, e, e, 0), 0)
+    assert_eq(mul_1(e, e, 0, 3, 9), 9)
+    assert_eq(addmul_1(e, e, 0, 3), 0)
+    assert_eq(submul_1(e, e, 0, 3), 0)
+end kernels_at_zero_limbs

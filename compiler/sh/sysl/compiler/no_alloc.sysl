@@ -97,7 +97,7 @@ allocates(a: &Analysis, e: TExpr) -> Option[string] = *e.kind match
         if elems.is_empty() || read_only_literal(elems, slice_ty) then None
         else Some("a slice with storage of its own")
     TBufFill(_, _, _) -> Some("a slice with storage of its own")
-    TSlots(op, _, _, _) -> if op == "slot_storage" then Some("a slice with storage of its own") else None
+    TSlots(op, _, _, _) -> if storage_form(op) then Some("a slice with storage of its own") else None
     TStr(_) -> Some("the string a value renders as")
     TRender(_, _, _, _) -> Some("the string a value renders as")
     TFormat(_, _, _) -> Some("the string a formatted value renders as")
@@ -163,7 +163,11 @@ check_no_alloc(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TV
 
     var seeds: Buf[string] = buf()
     var made: Buf[(string, string)] = buf()
-    val graph = with_abstract_callees(a, funcs)
+
+    // A body that lets go of a `@unique` value reaches its destructor, which the drop glue calls
+    // without a word in the body (`unique_moves.sysl`'s `with_value_drops`).
+    val bodies = with_value_drops(a, funcs)
+    val graph = with_abstract_callees(a, bodies)
 
     for item in graph
         first_allocation(a, item.body) match
@@ -174,8 +178,8 @@ check_no_alloc(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TV
 
     val walk = reaches_over(graph, vtables, seeds)
 
-    for i in 0..<funcs.len()
-        val f = funcs[i]
+    for i in 0..<bodies.len()
+        val f = bodies[i]
 
         // **A GENERIC IS ANSWERED FOR BY THE BODY IT WAS WRITTEN AS, AND AN INSTANTIATION OF ONE BY
         // NOBODY** (`reference/modules.md § A generic answers for what it wrote, not for what its
@@ -455,7 +459,7 @@ abstract_key(a: &Analysis, f: TFunc) -> string =
     if f.name.contains("$") then f.name else module_qualify(func_home(a, f.name).module_name, f.name)
 
 // The generic body an instance was made from, by the key the instance names as its origin.
-private abstract_named(a: &Analysis, origin: string) -> Option[TFunc]
+abstract_named(a: &Analysis, origin: string) -> Option[TFunc]
     for f in a.tables.abstracts
         if abstract_key(a, f) == origin then return Some(f)
 

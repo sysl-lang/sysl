@@ -30,7 +30,7 @@ end header_attr_word
 // **In the header the word is still the module's clause**: the header is read first, so a file whose
 // first declaration is the function writes an `import` or another declaration above it, or the
 // module's clause is what it wrote.
-fn_forgo_word(w: string) -> bool = w == "no_alloc" || w == "no_block"
+fn_forgo_word(w: string) -> bool = w == "no_alloc" || w == "no_block" || w == "no_recursion"
 
 // The word a `@` is followed by, or `""` where it is followed by no name at all.
 attr_name(p: *Parser) -> string = p.peek_at(1) match
@@ -55,8 +55,15 @@ parse_at_stmt(p: *Parser, start: Span) -> Stmt
         return parse_reassociate_block(p, start)
 
     // `@unchecked` marks the block under it rather than a declaration (`unchecked.sysl`) -- unless
-    // parentheses follow it, where it is a struct's promise to cross (`promises.sysl`).
+    // parentheses follow it, where it is a struct's promise to cross (`promises.sysl`), or, with a
+    // string in them, a block's promise that the processor has those extensions (`extensions.sysl`).
     if word == "unchecked" && !p.kw_at(2, "(") then return parse_unchecked_block(p, start)
+
+    if word == "unchecked" && at_string(p, 3) then return parse_extensions_block(p, start)
+
+    // `@checked` the same way: over an indented block it marks the block (`checked.sysl`).
+    if word == "checked" && p.peek_at(2) == Newline && p.peek_at(3) == Indent then
+        return parse_checked_block(p, start)
 
     parse_attributed_decl(p, start)
 end parse_at_stmt
@@ -140,7 +147,11 @@ parse_member_attrs(p: *Parser, in_trait: bool) -> Buf[Attr]
             break
         end if
 
-        if !member_attr_word(word) && !(in_trait && (word == "keeps" || word == "answers"))
+        // `@pinned(thread)` is about the body a member has as much as a function's; the bare
+        // `@pinned` is about per-core storage, which a member is not asked about.
+        val thread_pin = word == "pinned" && p.kw_at(2, "(")
+
+        if !member_attr_word(word) && !thread_pin && !(in_trait && (word == "keeps" || word == "answers"))
             if word == "assert"
                 p.fault(at, "'@assert' stands where a declaration stands, and a type's body holds its members — write it beside the type rather than inside it, where 'sizeof' and 'offsetof' still name what it is about")
             else if word == "align" || word == "packed" || word == "byte_order"
@@ -195,7 +206,7 @@ answers_off_extern() -> string =
     "'@answers(...)' names the parameters the pointer a C function answers may point into, so it marks an 'extern' — a function's or a method's body is right here, and the compiler reads what its answer is made of out of it. A trait's own method declaration may carry it too, for the calls through an object, which see no body"
 
 private member_attr_refusal() -> string =
-    "the only annotations a member may carry are the ones about a parameter — '@crossing', '@reads' and '@writes' — and the six about the function it lowers to, '@noinline', '@inline', '@cold', '@no_alloc', '@no_block' and '@blocks', and '@relocates', '@views(self)' and '@consumes' about its receiver's storage, and '@track_caller' about the line what it reports names. What the rest say is about a free function or about a type: what 'sysl test' calls, what recurses, what a symbol names, how fields are laid out. A member is neither, so it goes above a free function instead ('06')"
+    "the only annotations a member may carry are the ones about a parameter — '@crossing', '@reads' and '@writes' — and the seven about the function it lowers to, '@noinline', '@inline', '@cold', '@no_alloc', '@no_block', '@no_recursion' and '@blocks', and '@relocates', '@views(self)' and '@consumes' about its receiver's storage, and '@track_caller' about the line what it reports names. What the rest say is about a free function or about a type: what 'sysl test' calls, what recurses, what a symbol names, how fields are laid out. A member is neither, so it goes above a free function instead ('06')"
 
 // A layout annotation above a field (or any member) is about the wrong thing rather than about a
 // function: `@packed` and `@align(n)` lay out a whole struct, and `@align(n)` marks one binding's
@@ -216,7 +227,7 @@ private member_attr_word(w: string) -> bool
 
     for word in ["crossing", "reads", "writes", "noinline", "inline", "cold", "blocks",
                  "relocates", "views", "consumes", "disjoint", "scoped", "bounded", "joined", "strict_fp",
-                 "reassociate", "track_caller", NoFuseWord]
+                 "reassociate", "checked", "track_caller", NoFuseWord, "extensions", "frame_limit", "stack"]
         if word == w then return true
 
     false
@@ -272,8 +283,9 @@ builtin_attr_word(w: string) -> bool
                  "tailrec", "pure", "ghost", "packed", "reads", "writes", "align", "byte_order", "export",
                  "section", "crossing", "domain", "keeps", "answers", "disjoint", "guards", "needs",
                  "noinline", "inline", "cold", "thread_local", "abandons", "per_cpu", "main_thread",
-                 "pinned", "pins", "relocates", "views", "consumes", "blocks", "scoped", "bounded", "joined",
-                 "strict_fp", "reassociate", "track_caller", "returns_twice", "renamed", "removed", "unchecked"]
+                 "pinned", "pins", "unique", "relocates", "views", "consumes", "blocks", "scoped", "bounded", "joined",
+                 "strict_fp", "reassociate", "checked", "track_caller", "returns_twice", "renamed", "removed",
+                 "unchecked", "extensions", "frame_limit", "stack"]
         if word == w then return true
 
     false
@@ -407,6 +419,7 @@ parse_attribute(p: *Parser) -> Option[Attr]
     if word == "byte_order" then return parse_byte_order_attr(p)
     if word == "export" then return Some(parse_export_attr(p, at))
     if word == "section" then return Some(parse_section_attr(p))
+    if word == "stack" then return parse_stack_attr(p, at)
     if word == "crossing" then return Some(parse_crossing_attr(p))
     if word == "domain" then return parse_domain_attr(p)
     if word == "keeps" then return Some(Keeps(parse_named_list(p, "keeps")))
@@ -418,6 +431,7 @@ parse_attribute(p: *Parser) -> Option[Attr]
     if word == "unchecked" && p.at_kw("(") then
         return Some(Promises(promise_names(p, p.here(), parse_named_list(p, "unchecked"))))
     if word == "needs" then return Some(Needs(parse_named_list(p, "needs")))
+    if word == "extensions" then return Some(Extensions(parse_extension_names(p, "extensions")))
     if word == "noinline" then return no_inlining_args(p, NoInline, "whether a call stays a call is the whole of what it says")
     if word == "inline" then return parse_inline_attr(p)
     if word == "cold" then return no_inlining_args(p, Cold, "how rare a rare path is is not a number a program has")
@@ -435,8 +449,11 @@ parse_attribute(p: *Parser) -> Option[Attr]
 
     // `@main_thread` takes none: which thread is the main one is the program's, not the binding's.
     if word == "main_thread" then return Some(MainThread)
-    if word == "pinned" then return Some(Pinned)
+    if word == "pinned" then return parse_pinned_attr(p)
     if word == "pins" then return Some(Pins)
+
+    // `@unique` takes none: a value has one owner or it does not.
+    if word == "unique" then return no_inlining_args(p, Unique, "a value of the type has one owner, and nothing qualifies that")
     if fn_forgo_word(word) then return Some(Forgoes(word[3..<word.len]))
 
     // `@blocks` takes no parentheses: what it says is that a call may wait, and how long is not a
@@ -451,11 +468,14 @@ parse_attribute(p: *Parser) -> Option[Attr]
     if word == "strict_fp" then return no_inlining_args(p, StrictFp, "the rounding mode and the exceptions are whatever the floating-point environment holds when the body runs, which is what the annotation says to follow")
     // `@reassociate` takes none: the order is the back end's to choose, so there is nothing to name.
     if word == "reassociate" then return no_inlining_args(p, Reassociate, "the order a regrouped sum is computed in is the back end's to choose, so there is no order to name")
+    // `@checked` takes none: what an overflow does there is trap, so there is nothing to choose.
+    if word == "checked" then return no_inlining_args(p, Checked, "an overflow in a checked body always traps, so there is nothing to choose")
     // `@no_fuse` takes none: what it turns off is one thing, and there is no degree of it to name.
     if word == NoFuseWord then return no_inlining_args(p, NoFuse, "what it turns off is the fusing of a multiply with the add it feeds, which a body either has or does not")
     // `@track_caller` takes none: the location it hands on is the call's, which is not something a
     // declaration could name.
     if word == "track_caller" then return no_inlining_args(p, TrackCaller, "the location it hands on is the line of each call, which the call supplies")
+    if word == "frame_limit" then return parse_frame_limit_attr(p)
     if word == "annotation" then return no_inlining_args(p, AnnotationMark, "what a use of the annotation says is written where it is used, as the values of the struct's fields")
     if word == "renamed" || word == "removed" then return parse_gone_attr(p, at, word)
 
@@ -527,6 +547,29 @@ private parse_inline_attr(p: *Parser) -> Option[Attr]
     skip_line(p)
     None
 end parse_inline_attr
+
+// `@pinned`, or `@pinned(thread)`: the bare word says every caller keeps the function on one core
+// (`@per_cpu`); with `thread` it says the fiber the body runs on is only ever resumed on the thread it
+// began on, so a count it holds across a switch is not touched from two threads
+// (`library/fiber.md § A fiber may move between threads`).
+private parse_pinned_attr(p: *Parser) -> Option[Attr]
+    if !p.accept_kw("(") then return Some(Pinned)
+
+    val at = p.here()
+    val word = p.peek() match
+        Ident(n) -> n
+        _ -> ""
+
+    if word == "thread"
+        p.bump()
+
+        if p.accept_kw(")") then return Some(PinnedThread)
+    end if
+
+    p.fault(at, "'@pinned' takes no argument but 'thread' — '@pinned' alone says every caller keeps the function on one core, and '@pinned(thread)' that the fiber it runs on is only ever resumed on the thread it began on")
+    skip_line(p)
+    None
+end parse_pinned_attr
 
 private hook_attr(p: *Parser, at: Span, kind: HookKind) -> Attr
     if p.at_kw("(")
@@ -794,6 +837,54 @@ private parse_byte_order_attr(p: *Parser) -> Option[Attr]
     Some(ByteOrder(word == "big"))
 end parse_byte_order_attr
 
+// `@frame_limit(32768)` or `@frame_limit(none)` -- the most bytes a function's stack frame may take,
+// or no limit (`frame_limit.sysl`). The number is a literal, as `@test(timeout: n)`'s is: it is read
+// before anything is typed, and a limit is a fact about one function rather than a value a program
+// computes.
+private parse_frame_limit_attr(p: *Parser) -> Option[Attr]
+    val bad = s"'@frame_limit' names the most bytes the function's stack frame may take, in parentheses " +
+        s"— '@frame_limit(32768)', a whole number from 1 to $MostFrameBytes — or '@frame_limit(none)' " +
+        "for no limit at all"
+
+    if !p.accept_kw("(")
+        p.fault(p.here(), bad)
+        skip_line(p)
+        return None
+    end if
+
+    val at = p.here()
+
+    val limit = p.peek() match
+        Ident(n) ->
+            if n != "none"
+                p.fault(at, bad)
+                skip_line(p)
+                return None
+            end if
+
+            p.bump()
+            None
+        IntLit(digits, base, suffix) ->
+            p.bump()
+
+            val bytes = literal_value(digits, base).to_long()
+
+            if suffix != "" || bytes.is_none() || bytes.unwrap() < 1 || bytes.unwrap() > MostFrameBytes
+                p.fault(at, bad)
+                skip_line(p)
+                return None
+            end if
+
+            bytes
+        _ ->
+            p.fault(at, bad)
+            skip_line(p)
+            return None
+
+    p.expect_kw(")")
+    Some(FrameLimit(limit))
+end parse_frame_limit_attr
+
 // `@export`, `@export("mylib_parse")` -- the symbol a function is visible under from C, or the name
 // a struct's `typedef` carries in a generated header. `weak` after the symbol, or alone
 // (`@export("write", weak)`, `@export(weak)`), publishes the function as a default any strong
@@ -836,6 +927,70 @@ private refuse_weak_export(p: *Parser, attrs: Buf[Attr], why: string)
         attr match
             Export(e) -> if e.weakly then p.fault(e.span, s"only a function's '@export' may be 'weak' — $why")
             _ -> ()
+
+// `@stack(8192)`, `@stack(calls: 2048)` or `@stack(8192, calls: 2048)` -- the deepest stack a call
+// may need, and what each call the body makes through a pointer is taken to need. Byte counts are
+// written as numbers: what they bound is the machine's stack, not a value the program has.
+private parse_stack_attr(p: *Parser, at: Span) -> Option[Attr]
+    val bad = "'@stack' bounds the stack in bytes, in parentheses — '@stack(8192)' for the deepest a call may need, '@stack(calls: 2048)' for what each call the body makes through a pointer — a closure, a trait object, a function pointer — is taken to need, or both, '@stack(8192, calls: 2048)'"
+
+    if !p.accept_kw("(")
+        p.fault(p.here(), bad)
+        return None
+    end if
+
+    var bytes: Option[u64] = None
+    var calls: Option[u64] = None
+
+    loop
+        val named_calls = p.peek() match
+            Ident(n) -> n == "calls"
+            _ -> false
+
+        if named_calls
+            p.bump()
+            p.expect_kw(":")
+        end if
+
+        val number = p.peek() match
+            IntLit(digits, base, _) -> stack_bytes(digits, base)
+            _ -> None
+
+        if number.is_none() || (named_calls && calls.is_some()) || (!named_calls && (bytes.is_some() || calls.is_some()))
+            p.fault(p.here(), bad)
+            skip_line(p)
+            return None
+        end if
+
+        p.bump()
+
+        if named_calls then calls = number else bytes = number
+
+        if !p.accept_kw(",") then break
+
+    p.expect_kw(")")
+    Some(StackBound(bytes, calls, at.to(p.just_taken())))
+end parse_stack_attr
+
+// A byte count as its digits spell it, or nothing where it overflows.
+private stack_bytes(digits: string, base: int) -> Option[u64]
+    var out: u64 = 0
+
+    for b in digits.bytes
+        if b == u8('_') then continue
+
+        var d: u64 = 16
+
+        if b >= u8('0') && b <= u8('9') then d = u64(b - u8('0'))
+        elif b >= u8('a') && b <= u8('f') then d = u64(b - u8('a')) + 10
+        elif b >= u8('A') && b <= u8('F') then d = u64(b - u8('A')) + 10
+
+        if d >= u64(base) || out > (0xFFFF_FFFF_FFFF_FFFF - d) / u64(base) then return None
+
+        out = out * u64(base) + d
+
+    Some(out)
+end stack_bytes
 
 private parse_section_attr(p: *Parser) -> Attr
     val bad = "'@section' names the linker section as a string — '@section(\".vectors\")' on the storage or the definition that goes there. The spelling is the target's: '.noinit' and '.ramfunc' are ELF's, '__DATA,__mysection' is Mach-O's"
@@ -1027,12 +1182,22 @@ apply_func_attrs(f: *FuncDecl, attrs: Buf[Attr])
             Abandons -> f.marks.abandons = true
             Pinned -> f.marks.pinned = true
             Pins -> f.marks.pins = true
+            PinnedThread -> f.marks.pinned_thread = true
             Forgoes(cap) -> f.marks.forgoes.push(cap)
             Blocks -> f.marks.blocks = true
             StrictFp -> f.marks.strict_fp = true
             Reassociate -> f.marks.reassociate = true
+            Checked -> f.marks.checked = true
             NoFuse -> f.marks.no_fuse = true
             TrackCaller -> f.marks.track_caller = true
+            StackBound(bytes, calls, at) ->
+                f.marks.stack = bytes
+                f.marks.stack_calls = calls
+                f.marks.stack_at = Some(at)
+            Extensions(ns) -> f.marks.extensions = ns
+            FrameLimit(limit) -> limit match
+                Some(n) -> f.marks.frame_limit = n
+                None -> f.marks.frame_exempt = true
             Scoped(ns) -> f.marks.scoped = ns
             Bounded(ns) -> f.marks.bounded = ns
             _ -> ()
@@ -1056,12 +1221,22 @@ apply_member_attrs(m: *MethodDecl, attrs: Buf[Attr])
             Cold -> m.marks.cold = true
             Pinned -> m.marks.pinned = true
             Pins -> m.marks.pins = true
+            PinnedThread -> m.marks.pinned_thread = true
             Forgoes(cap) -> m.marks.forgoes.push(cap)
             Blocks -> m.marks.blocks = true
             StrictFp -> m.marks.strict_fp = true
             Reassociate -> m.marks.reassociate = true
+            Checked -> m.marks.checked = true
             NoFuse -> m.marks.no_fuse = true
             TrackCaller -> m.marks.track_caller = true
+            StackBound(bytes, calls, at) ->
+                m.marks.stack = bytes
+                m.marks.stack_calls = calls
+                m.marks.stack_at = Some(at)
+            Extensions(ns) -> m.marks.extensions = ns
+            FrameLimit(limit) -> limit match
+                Some(n) -> m.marks.frame_limit = n
+                None -> m.marks.frame_exempt = true
             Relocates -> m.marks.relocates = true
             Views(_) -> m.marks.views = true
             Consumes -> m.marks.consumes = true
@@ -1160,10 +1335,10 @@ private parse_attributed_decl(p: *Parser, start: Span) -> Stmt
         return from_first(start, laid_out(p, at, parse_struct_decl(p, at, vis, false, a_union), attrs))
     end if
 
-    // An enum takes the annotations a program declares, and `@export("PREFIX")`, which defines its
-    // variants as constants in a generated header. Its layout is the compiler's, and it names no
-    // symbol.
-    if p.at_kw("enum") && (any_user(attrs) || has_export(attrs))
+    // An enum takes the annotations a program declares, `@unique`, and `@export("PREFIX")`, which
+    // defines its variants as constants in a generated header. Its layout is the compiler's, and it
+    // names no symbol.
+    if p.at_kw("enum") && (any_user(attrs) || has_export(attrs) || any_is(attrs, "unique"))
         refuse_unless(p, at, attrs, "enum")
         refuse_weak_export(p, attrs, "an enum's '@export' defines constants in a generated header, which is no definition the link could replace")
         return from_first(start, annotated_enum(parse_enum_decl(p, at, vis), attrs))
@@ -1286,10 +1461,10 @@ private refuse_unless(p: *Parser, at: Span, attrs: Buf[Attr], form: string)
 private may_carry(form: string, a: Attr) -> bool
     if form == "struct"
         return is_layout(a) || attr_word(a) == "export" || attr_word(a) == "guards" || attr_word(a) == "unchecked" ||
-            attr_word(a) == "pinned" || is_user(a) || is_annotation_mark(a)
+            attr_word(a) == "pinned" || attr_word(a) == "unique" || is_user(a) || is_annotation_mark(a)
     end if
 
-    if form == "enum" then return is_user(a) || attr_word(a) == "export"
+    if form == "enum" then return is_user(a) || attr_word(a) == "export" || attr_word(a) == "unique"
     if form == "type" then return is_user(a) || attr_word(a) == "export"
 
     if form == "binding" then return is_storage(a) || attr_word(a) == "export"
@@ -1298,7 +1473,7 @@ private may_carry(form: string, a: Attr) -> bool
         attr_word(a) == "returns_twice"
 
     !is_layout(a) && attr_word(a) != "keeps" && attr_word(a) != "returns_twice" && attr_word(a) != "answers" && attr_word(a) != "guards" &&
-        attr_word(a) != "unchecked" &&
+        attr_word(a) != "unchecked" && attr_word(a) != "unique" &&
         attr_word(a) != "relocates" && attr_word(a) != "views" && attr_word(a) != "consumes" &&
         !is_user(a) && !is_annotation_mark(a)
 end may_carry
@@ -1321,6 +1496,9 @@ private attributed_refusal(attrs: Buf[Attr]) -> string
     if all_are(attrs, "blocks")
         return "'@blocks' says a call may wait, so it marks a function, a method or an 'extern' — and this declares none of them"
 
+    if any_is(attrs, "stack")
+        return "'@stack(...)' bounds the stack a call needs, so it marks a function or a method whose body is sysl — and this declares neither"
+
     if all_are(attrs, "byte_order")
         return "'@byte_order(...)' is the order a struct's integer fields keep their bytes in, so it can only mark a struct — and this declares none. A lone value is put in an order with 'to_be' and 'from_be', the members 'sysl.math.ByteOrder' gives every whole-byte integer"
 
@@ -1335,7 +1513,13 @@ private attributed_refusal(attrs: Buf[Attr]) -> string
         return "'@strict_fp' says how a body's floating-point operations are compiled, so it marks a function or a method, whose body is sysl — and this declares neither. An 'extern''s operations are compiled by whoever compiled it"
 
     if any_is(attrs, "reassociate") then return reassociate_not_a_body()
+    if any_is(attrs, "checked") then return checked_not_a_body()
     if any_is(attrs, NoFuseWord) then return no_fuse_not_a_body()
+    if any_is(attrs, "extensions") then return extensions_not_a_body()
+
+    // An `extern`'s frame is laid out by whoever compiled it.
+    if any_is(attrs, "frame_limit")
+        return "'@frame_limit' bounds the stack frame of a body this build compiles, so it marks a function or a method — and this declares neither. An 'extern''s frame is laid out by whoever compiled it"
 
     if any_is(attrs, "inline(always)")
         return "'@inline(always)' puts a function's body in place of every call to it, so it marks a function or a method — and this declares neither. An 'extern' has no body in this program to put anywhere: its definition is in the object it is linked from"
@@ -1369,6 +1553,9 @@ private attributed_refusal(attrs: Buf[Attr]) -> string
 
     if any_is(attrs, "consumes")
         return "'@consumes' says a call takes everything its receiver holds, so it marks a method — and this declares none"
+
+    if any_is(attrs, "unique")
+        return "'@unique' says a value of a type has one owner, so it marks a 'struct' or an 'enum' — and this declares neither"
 
     if all_are(attrs, "needs")
         return "'@needs(...)' names what reaching a declaration requires, so it marks a function or an 'extern' — and this declares neither"
@@ -1504,6 +1691,13 @@ private refuse_impossible_pairs(p: *Parser, attrs: Buf[Attr])
         return
     end if
 
+    // A body compiled for an extension is put inside a caller only where the caller has it too --
+    // anywhere else the call stays a call -- so `always` is a promise LLVM would break.
+    if always && any_is(attrs, "extensions")
+        p.fault(p.here(), extensions_beside_always())
+        return
+    end if
+
     // `@ghost` erases the function before codegen, so there is no definition for the optimizer to be
     // told anything about.
     if ghost && marks != ""
@@ -1589,7 +1783,7 @@ end refuse_layout_beside_function
 private marks_a_function(attrs: Buf[Attr]) -> bool
     for attr in attrs
         if !is_layout(attr) && attr_word(attr) != "section" && attr_word(attr) != "pinned" &&
-                !is_user(attr) && !is_annotation_mark(attr) then
+                attr_word(attr) != "unique" && !is_user(attr) && !is_annotation_mark(attr) then
             return true
 
     false
@@ -1760,6 +1954,7 @@ private laid_out(p: *Parser, at: Span, s: Stmt, attrs: Buf[Attr]) -> Stmt
                     Guards(ns) -> decl.guards = guarded_fields(p, at, decl, ns)
                     Promises(ns) -> decl.promised = ns
                     Pinned -> decl.pinned = true
+                    Unique -> decl.unique = true
                     AnnotationMark -> decl.annotation = true
                     User(u) -> decl.annots.push(u)
                     _ -> ()
@@ -1806,6 +2001,7 @@ private annotated_enum(s: Stmt, attrs: Buf[Attr]) -> Stmt
                 attr match
                     User(u) -> decl.annots.push(u)
                     Export(e) -> decl.export = Some(e)
+                    Unique -> decl.unique = true
                     _ -> ()
 
             stmt(s.span, EnumDecl(decl))

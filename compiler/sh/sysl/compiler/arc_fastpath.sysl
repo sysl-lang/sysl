@@ -25,11 +25,13 @@ import sysl.math.bigint.from_int
 // large value's walk has been turned into the one that takes its address.
 
 // The test that says a value holds a count: its tag is this one; its bit is set in this mask, of an
-// integer this wide; or it lies in this run of tags.
+// integer this wide; or it lies in this run of tags; or, for a null-niche enum, its one word -- an
+// integer of this type -- is not zero.
 enum TagTest
     TagIs(tag: long)
     TagAmong(mask: long, bits: int)
     TagWithin(low: long, count: long)
+    TagNonNull(unit: LType)
 
 // The blocks, with every guarded walk's call moved into an arm of its own.
 guard_enum_walks(e: *Emit, blocks: Buf[IrBlock]) -> Buf[IrBlock]
@@ -85,12 +87,24 @@ private guarded_walk(e: *Emit, inst: Inst) -> Option[(TagTest, bool, IrArg)] = i
 private tag_holds(e: *Emit, test: TagTest, at: bool, arg: IrArg, into: *Buf[Inst]) -> Val
     val tag = fresh_reg(e)
 
-    if at then into.push(InLoad(tag, l_i32(), arg.value, AccPlain, None))
-    else into.push(InExtract(tag, arg.ty, arg.value, index_list(0)))
+    // A null-niche enum has no tag: its one word is the address.
+    test match
+        TagNonNull(unit) ->
+            var idx: Buf[int] = buf()
+
+            idx.push(0)
+            idx.push(0)
+
+            if at then into.push(InLoad(tag, unit, arg.value, AccPlain, None))
+            else into.push(InExtract(tag, arg.ty, arg.value, idx))
+        _ ->
+            if at then into.push(InLoad(tag, l_i32(), arg.value, AccPlain, None))
+            else into.push(InExtract(tag, arg.ty, arg.value, index_list(0)))
 
     val held = fresh_reg(e)
 
     test match
+        TagNonNull(unit) -> into.push(InIntCmp(held, INe, unit, tag, VInt(from_int(0))))
         TagIs(k) -> into.push(InIntCmp(held, IEq, l_i32(), tag, VInt(from_int(k))))
         TagWithin(low, n) ->
             val off = fresh_reg(e)

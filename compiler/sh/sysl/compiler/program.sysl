@@ -259,11 +259,27 @@ dropping_reached(a: &Analysis) -> Buf[Type]
     for item in reached_structs(a)
         if has_destructor_key(keys, mangle(item)) then out.push(item)
 
-    for item in reached_enums(a)
+    for item in dropping_enums(a)
         if has_destructor_key(keys, mangle(item)) then out.push(item)
 
     out
 end dropping_reached
+
+// The enums a destructor may be filed for: every one a program lists, and a simple one marked
+// `@unique` besides -- a simple enum is no box and has no layout entry, but a `@unique` one is a
+// value its owner lets go of, and its destructor runs then.
+private dropping_enums(a: &Analysis) -> Buf[Type]
+    var out = reached_enums(a)
+
+    for i in 0..<a.tables.enum_insts.len()
+        val t = a.tables.enum_insts.at(i)
+
+        t match
+            Enum(d) -> if d.simple && d.unique && !instantiated_abstract(t) then out.push(t)
+            _ -> ()
+
+    out
+end dropping_enums
 
 private has_destructor_key(keys: Buf[(string, string, bool)], key: string) -> bool
     for item in keys
@@ -279,7 +295,7 @@ private destructors_of(a: &Analysis) -> Buf[(string, string, bool)]
     if drops.is_empty() then return out
 
     val made = reached_structs(a)
-    val enums = reached_enums(a)
+    val enums = dropping_enums(a)
 
     for item in made
         push_destructor(a, drops, &out, item)
@@ -778,24 +794,19 @@ private is_crc32c_intrinsic(base: string) -> bool
     false
 end is_crc32c_intrinsic
 
-// A CRC-32C instruction, held to three things the back end would otherwise fail on with no line to
-// point at: **the processor** -- an AArch64 instruction on an x86 machine is no instruction at all --
-// **the feature**, since the back end cannot select one where the build does not promise it (`#if
-// crc32c`, which reads the same `crc32c_instruction`), and **the signature**, which is not
-// overloaded: each name has exactly one, so the name is emitted as written.
+// A CRC-32C instruction, held to the two things the back end would otherwise fail on with no line
+// to point at: **the processor** -- an AArch64 instruction on an x86 machine is no instruction at
+// all -- and **the signature**, which is not overloaded: each name has exactly one, so the name is
+// emitted as written. **The feature is each call's question, not the declaration's**: the
+// declaration is compiled for the extension (`crc`, `sse4.2`) as a function marked `@extensions` is,
+// so a call is accepted where the build promises it (`#if crc32c`, `crc32c_instruction`), inside a
+// function marked with it, or inside `@unchecked("...")` naming it (`extensions.sysl`).
 private resolve_crc32c(t: Target, base: string, params: Buf[Type], ret: Type) -> Result[string, string]
     val aarch64 = base.starts_with("llvm.aarch64.")
     val machine = if aarch64 then "AArch64" else "x86-64"
 
     if (aarch64 && t.cpu != Aarch64) || (!aarch64 && t.cpu != X86_64)
         return Err(s"'$base' is an $machine instruction, and this build is for '${t.name}'")
-
-    if !crc32c_instruction(t)
-        val ext = if aarch64 then "crc" else "sse4.2"
-
-        return Err(s"'$base' is an instruction '${t.name}' does not promise, so the back end could not " +
-                   s"select it — guard the declaration and its uses with '#if crc32c', or name the " +
-                   s"extension in sysl.hocon: 'codegen { extensions = [\"$ext\"] }'")
 
     val shape = crc32c_shape(base)
     val wanted = s"(${type_show(shape.0)}, ${type_show(shape.1)}) -> ${type_show(shape.2)}"

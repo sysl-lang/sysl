@@ -335,6 +335,15 @@ private gen_expr_kind(e: *Emit, x: TExpr) -> Val = *x.kind match
                              index_list(int(i))))
             acc = r
 
+        if value_drops(e, array_ty)
+            var tys: Buf[Type] = buf()
+
+            for item in elems
+                tys.push(texpr_type(item))
+
+            acc = own_built(e, array_ty, acc, elems, vals, tys)
+        end if
+
         acc
 
     // **Every element is a copy of one evaluation**, so the value is generated once, above the loop
@@ -391,12 +400,17 @@ private gen_expr_kind(e: *Emit, x: TExpr) -> Val = *x.kind match
 
         // A fill of zeros is storage taken zeroed, and nothing written into it (`heap_call`), where
         // the target has the C library that is lowered to (`lays_bytes`).
+        // A count of zero takes no storage at all (`emit_box.sysl`'s `skip_if_empty`).
         val zeros = lays_bytes(e) && is_zero_const(v)
+
+        if is_zero_const(n) then return VZero
+
+        val skip = skip_if_empty(e, slice_ty, n)
         val made = gen_buffer_zeroed(e, elem, n, zeros)
 
         if !zeros then fill_elements(e, elem, made.1, n, v)
 
-        buffer_view(e, slice_ty, made.0, made.1, n)
+        join_unless_empty(e, slice_ty, skip, view_parts(e, slice_ty, made.0, made.1, n))
 
     // **A view of some of what a place holds.** A temporary array whose view *outlives it* is the
     // one case that is not a narrowing: the value the frame just computed is written into a buffer
@@ -788,7 +802,7 @@ private gen_binary(e: *Emit, op: string, l: TExpr, r: TExpr, ty: Type, site: Spa
             // A sum proved not to wrap is the `nuw` add in either mode: there is nothing to check.
             val proved = op == "+" && nowrap_add(e, l, r, bt)
 
-            if overflow_checked(op, l, r, bits, signed) || (!proved && plain_checked(op, bt))
+            if overflow_checked(op, l, r, bits, signed) || (!proved && plain_checked(e, op, bt, site))
                 return checked_arith(e, op, bits, signed, lv, rv, arith_text(op, texpr_type(l), texpr_type(r)), site)
 
             if proved
@@ -933,8 +947,9 @@ private gen_unary(e: *Emit, op: string, operand: TExpr, ty: Type, site: Span) ->
                 underlying(ty) match
                     Vector(_, _) -> emit(e, InBin(r, OpSub, ety, VZero, v))
                     _ ->
-                        // In a debug build, negating the most negative value is the overflow it is.
-                        if overflow_checks()
+                        // In a debug build, or inside a `@checked` region, negating the most
+                        // negative value is the overflow it is.
+                        if checked_at(e, site)
                             return checked_arith(e, "-", bits, signed, VInt(from_int(0)), v,
                                                  s"-${type_show(ty)}", site)
 
@@ -1242,7 +1257,7 @@ private gen_inc_dec(e: *Emit, place: TExpr, op: string, pre: bool, ty: Type,
     val bin = if op == "++" then "+" else "-"
 
     val nv = underlying(ty) match
-        Integer(bits, signed, _) if plain_checked(bin, ty) ->
+        Integer(bits, signed, _) if plain_checked(e, bin, ty, site) ->
             checked_arith(e, bin, bits, signed, cur, VInt(from_int(1)), s"${type_show(ty)}$op", site)
         _ ->
             val r = fresh_reg(e)
@@ -1284,7 +1299,7 @@ combine(e: *Emit, op: string, ty: Type, value_ty: Type, dispatch: Option[TDispat
         Integer(bits, signed, _) ->
             if bin == "<<" && is_ranged(ty) then return checked_shl(e, bits, signed, cur, rv)
 
-            if ((bin == "+" || bin == "-" || bin == "*") && is_ranged(ty)) || plain_checked(bin, bt)
+            if ((bin == "+" || bin == "-" || bin == "*") && is_ranged(ty)) || plain_checked(e, bin, bt, site)
                 return checked_arith(e, bin, bits, signed, cur, rv, arith_text(op, ty, value_ty), site)
         _ -> ()
 
@@ -1441,6 +1456,9 @@ private gen_enum_new(e: *Emit, at: Span, enum_ty: Type, variant: EnumVariant, ar
     val made = enum_value(e, enum_ty, d, variant, vals)
 
     note_parts(e, at, made, vals)
+
+    if value_drops(e, enum_ty) then return own_built(e, enum_ty, made, args, vals, field_types(variant.fields))
+
     made
 end gen_enum_new
 
@@ -1493,6 +1511,9 @@ private gen_struct_new(e: *Emit, at: Span, decl: &StructType, args: Buf[TExpr]) 
             end if
 
     note_parts(e, at, acc, vals)
+
+    if value_drops(e, Struct(decl)) then return own_built(e, Struct(decl), acc, args, vals, field_types(decl.fields))
+
     acc
 end gen_struct_new
 
@@ -1842,7 +1863,9 @@ private guaranteed_arg(e: *Emit, a: TExpr, callee: string, written: Set[string],
     val ty = texpr_type(a)
     val big = e.layout.indirect(ty) || lent
     val still = held_unless(e, a, written) || (big || contains_counted(ty)) && lends_in_place(e, callee, ty)
-    val guarantee = contains_counted(ty) && !still
+    // A `@unique` value with a destructor has one owner, so no count of the caller's can stand for
+    // it: a reading receiver is lent as it lies (`emit_unique.sysl`).
+    val guarantee = contains_counted(ty) && !still && !value_drops(e, ty)
 
     if borrows && !big && lent_view(e, a, callee, written) then return gen_lent_view(e, a, callee, written)
 
@@ -1916,13 +1939,14 @@ end no_fast_math
 // -- conversions and zeros ----------------------------------------------------------------------------
 
 // A conversion in the tree. **A written integer conversion that can lose a value is checked in a
-// debug build** (`build_mode.sysl`) -- unless what it converts is a constant, which is the bit
-// pattern written down (`u32(-1)`) and converts as it does in a `const`, the same in every build.
+// debug build** (`build_mode.sysl`), and inside a `@checked` region in every build (`checked.sysl`)
+// -- unless what it converts is a constant, which is the bit pattern written down (`u32(-1)`) and
+// converts as it does in a `const`, the same in every build.
 private gen_cast(e: *Emit, operand: TExpr, ty: Type, site: Span) -> Val
     val from = underlying(texpr_type(operand))
     val v = gen_expr(e, operand)
 
-    if !overflow_checks() then return convert(e, from, ty, v)
+    if !checked_at(e, site) then return convert(e, from, ty, v)
 
     val constant = *operand.kind match
         TIntLit(_, _) -> true
@@ -2135,7 +2159,7 @@ private gen_try(e: *Emit, operand: TExpr, ok: EnumVariant, fail: EnumVariant, re
     val v = gen_expr(e, operand)
     val tag = fresh_reg(e)
 
-    emit(e, InExtract(tag, enum_lty(en), v, index_list(0)))
+    enum_tag_into(e, en, tag, v)
 
     val is_ok = fresh_reg(e)
 

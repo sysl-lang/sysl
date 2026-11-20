@@ -483,21 +483,23 @@ named, and inventing an answer for an index that is not there would hide the cal
 ### `zeroize`
 
 ```sysl
-zeroize(xs: []volatile u8)
+zeroize[T: Integer](xs: []volatile T)
 ```
 
-Every byte set to zero, in a way the optimizer may not remove.
+Every element set to zero, in a way the optimizer may not remove.
 
-**This is for secrets** -- a key, a password, a session token -- whose buffer is about to be
-dropped or reused. A `fill(buf, 0)` of a buffer nothing reads afterwards is a dead store, and at
-`-O2` it is deleted, leaving the secret in memory for the next owner of the page. Here every store
-is through a `[]volatile u8`, and a volatile store is an effect: it is emitted, once, in order,
-whether or not anything reads the byte again.
+**This is for secrets** -- a key, a password, a session token, a cipher's key schedule -- whose
+buffer is about to be dropped or reused. A `fill(buf, 0)` of a buffer nothing reads afterwards is a
+dead store, and at `-O2` it is deleted, leaving the secret in memory for the next owner of the
+page. Here every store is through a `[]volatile T`, and a volatile store is an effect: it is
+emitted, once, in order, whether or not anything reads the element again.
 
-**A `[]u8` is passed as it stands**: a view widens to a view of the same elements as
-`volatile`, never the other way round. A read-only view (`[]const u8`, a `val` array, a string's
-bytes) is refused, since this writes.
+**Any integer element**: a `[]u8` of key bytes and a `[]u32` of round keys are both cleared at
+their own width, `T` read off the argument. A view is passed as it stands, since it widens to a
+view of the same elements as `volatile`, never the other way round; an array is passed as its
+whole view. A read-only view (`[]const u8`, a `val` array, a string's bytes) is refused, since
+this writes.
 
-It costs one store per byte, which is what makes it unremovable; it is not a fast way to clear
+It costs one store per element, which is what makes it unremovable; it is not a fast way to clear
 memory that holds nothing secret -- that is `fill`. It says nothing about copies the program made
-elsewhere, a register that still holds a byte, or a page the system swapped out.
+elsewhere, a register that still holds a value, or a page the system swapped out.

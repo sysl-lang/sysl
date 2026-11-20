@@ -162,10 +162,20 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
     // (`emit_strict_fp.sysl`).
     e.strict_fns = strict_fp_names(p.funcs)
 
+    // The functions marked `@frame_limit`, which the closures written in them inherit
+    // (`frame_limit.sysl`).
+    note_frame_marks(p.funcs)
+
     if !e.strict_fns.is_empty() then e.forwarders = intrinsic_forwarders(e, p)
 
     // The stretches of source whose float sums may be regrouped (`reassociate.sysl`).
     e.reassoc_all = reassoc_regions(p)
+    // And every function marked `@checked`, as the region its closures and nested functions lie in
+    // (`checked.sysl`).
+    note_checked_functions(p.funcs)
+
+    // The bodies compiled for a processor's extensions (`extensions.sysl`).
+    e.ext_fns = extension_sets(p.funcs)
 
     var funcs: Buf[IrFunc] = buf()
     var gaps: Buf[(string, string)] = buf()
@@ -185,23 +195,36 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
     // artifact's table is the one that reaches its body.
     val self_bodies = self_forms(e, p)
 
-    // A `@ghost` function is not emitted at all: nothing executable may call one, and the clauses
-    // that may are the ones a body never reaches.
-    // **A test build prints each body as soon as it is built and lets go of its blocks** (`compact`):
-    // held as instructions, the compiler's own suite was 12.6 GB of the 18.7 GB its codegen ended
-    // holding, for 0.7 GB of text. What sealing and the borrowing entries ask of a body afterwards is
-    // kept beside it: its shape (`CallShape`) and the globals it names.
-    var shapes: Map[string, CallShape] = map()
+    // **A build that wants only the text prints each body as soon as it is built and lets go of its
+    // blocks** (`compact`): held as instructions, the compiler's own suite was 12.6 GB of the 18.7 GB
+    // its codegen ended holding, for 0.7 GB of text. What the borrowing entries ask of a body
+    // afterwards is kept beside it: the globals it names; and what the seal asks of it, the direct
+    // calls it makes and whether each sits on a loop (`seal_linkage.sysl`'s `run_once`).
     var printed_refs: Set[string] = set()
+    var printed_calls: Map[string, Buf[(string, bool)]] = map()
     var compacted: usize = 0
 
+    // **The same build lets go of each typed body once it is lowered**, which on the compiler's own
+    // suite is 2.3 GB of typed tree given up while the lowering grows. Nothing after a body's own
+    // lowering reads it: what the whole program asks of the bodies -- the owning parameters, the
+    // contracts, the operators, the place entries -- was read above, before the first one was built,
+    // and what comes after reads signatures. The slot keeps everything but the body, since the thunks
+    // and the checks after the lowering read the rest, and so does a borrowing entry left pending,
+    // which is built from the signature. `bodies` is the caller's own list, which is the point: a copy
+    // would leave the caller holding every body.
+    var bodies = p.funcs
+
+    // A `@ghost` function is not emitted at all: nothing executable may call one, and the clauses
+    // that may are the ones a body never reaches.
     for i in 0..<p.funcs.len()
         val f = p.funcs[i]
 
         if f.ghost then continue
 
+        val heading = if compact then f with { body = TBlock(buf(), None, f.body.ty) } else f
+
         // What the function before this one added, let go of before this one is built.
-        if compact then compacted = compact_from(funcs, compacted, &shapes, &printed_refs)
+        if compact then compacted = compact_from(funcs, compacted, &printed_refs, &printed_calls)
 
         if !declared_elsewhere(p, f)
             set_promoted(e, pr, f.name)
@@ -212,7 +235,7 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
                 Some(built) ->
                     val from = funcs.len()
 
-                    for whole in owned_split(e, f, built, lazy, false, pending)
+                    for whole in owned_split(e, heading, built, lazy, false, pending)
                         for item in split_disjoint(f, whole)
                             for part in split_self(e, f, item, self_bodies)
                                 funcs.push(part)
@@ -236,13 +259,15 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
                     if keeps_import(f, built)
                         // An owning function's entry and body are both copies of what the artifact
                         // defines (`owned_params.sysl`).
-                        for whole in owned_split(e, f, built, lazy, true, pending)
+                        for whole in owned_split(e, heading, built, lazy, true, pending)
                             push_copy(funcs, split_disjoint(f, whole))
 
                         imported.add(f.name)
                 None -> ()
 
-    if compact then compacted = compact_from(funcs, compacted, &shapes, &printed_refs)
+        if compact then bodies[i] = heading
+
+    if compact then compacted = compact_from(funcs, compacted, &printed_refs, &printed_calls)
 
     // What is written from here on -- the thunks, the entry point, the helpers -- runs where its
     // caller does, and the caller's body is the one that checked.
@@ -350,7 +375,12 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
     request_task_storage(e, p)
 
     // And where a block on a boundary beyond the pair's comes from (`emit_box.sysl`).
-    request_aligned_heap(e, p)
+    request_aligned_heap(e)
+
+    made = drain_helpers(e, made, built_helpers, gaps)
+
+    // Asked again, since a hook just built may be the module's only call giving such a block back.
+    request_aligned_heap(e)
 
     made = drain_helpers(e, made, built_helpers, gaps)
 
@@ -410,7 +440,7 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
         made = drain_helpers(e, made, built_helpers, gaps)
     end if
 
-    if compact then compacted = compact_from(funcs, compacted, &shapes, &printed_refs)
+    if compact then compacted = compact_from(funcs, compacted, &printed_refs, &printed_calls)
 
     // The hand-written blocks go in front of the generated ones, and which of them the module needs
     // is settled only once every helper has been written -- a helper is as much a reason to hold the
@@ -456,7 +486,7 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
         globals.push(vtables[i])
 
     if !sealed.is_empty()
-        for name in run_once(funcs, sealed, shapes)
+        for name in run_once(funcs, sealed, printed_calls)
             sealed.remove(name)
 
         funcs = sealed_funcs(funcs, sealed)
@@ -469,15 +499,16 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
     (if bf16_as_bits(t) then soft_bf16_lower(m) else m, gaps)
 end codegen_into
 
-// Every function `funcs` holds from `from` on, printed and let go of (`printed_func`), with what
-// `run_once` and `named_entries` will ask of it kept beside. Answers how far `funcs` is compacted.
-private compact_from(funcs: Buf[IrFunc], from: usize, shapes: *Map[string, CallShape],
-                     refs: *Set[string]) -> usize
+// Every function `funcs` holds from `from` on, printed and let go of (`printed_func`), with the globals
+// it names kept beside for `named_entries`, and the calls it makes for the seal (`call_sites`). Answers
+// how far `funcs` is compacted.
+private compact_from(funcs: Buf[IrFunc], from: usize, refs: *Set[string],
+                     calls: *Map[string, Buf[(string, bool)]]) -> usize
     for i in from..<funcs.len()
         val f = funcs[i]
 
-        shapes.put(f.sig.name, call_shape(f))
         referenced_globals(f, refs)
+        calls.put(f.sig.name, call_sites(f))
         funcs[i] = printed_func(f)
 
     funcs.len()
@@ -496,13 +527,13 @@ private drain_helpers(e: *Emit, from: usize, built_helpers: Buf[IrRuntime], gaps
 
         what match
             HrText(llvm) ->
-                if text_allocates(llvm, malloc_symbol()) then plain_drop_fn(e)
+                if !heap_sized() && text_allocates(llvm, malloc_symbol()) then plain_drop_fn(e)
 
                 built_helpers.push(RtTemplate(name, llvm))
             _ ->
                 gen_helper(e, what, name) match
                     Some(built) ->
-                        if allocates(built, malloc_symbol()) then plain_drop_fn(e)
+                        if !heap_sized() && allocates(built, malloc_symbol()) then plain_drop_fn(e)
 
                         built_helpers.push(RtEmitted(built))
                     None -> gaps.push((name, gap_text(e)))
@@ -1013,22 +1044,32 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
     // name a pair the program writes itself with `@export` (a kernel's heap, an application's own
     // arena), and a `declare` beside that `define` is `invalid redefinition of function`. A pair a
     // prebuilt module or the C beside a package supplies is still declared, for the linker to find.
+    //
+    // **A pair told sizes is declared with them** (`heap_sized`): `alloc(size, align)` and
+    // `free(p, size, align)`.
     if e.heap && !defines_alloc_count(e)
         if !emits_export(p, malloc_symbol())
             var alloc_params: Buf[IrParam] = buf()
 
             alloc_params.push(ir_param(word_lty(e)))
+
+            if heap_sized() then alloc_params.push(ir_param(word_lty(e)))
+
             out.push(declared_sig(e, malloc_symbol(), ir_fn_type(LPtr, alloc_params)))
 
         if !emits_export(p, free_symbol())
             var free_params: Buf[IrParam] = buf()
 
             free_params.push(ir_param(LPtr))
+
+            if heap_sized()
+                free_params.push(ir_param(word_lty(e)))
+                free_params.push(ir_param(word_lty(e)))
+
             out.push(declared_sig(e, free_symbol(), ir_fn_type(LVoid, free_params)))
 
-    // The zeroing half, on the same terms: `calloc(count, size)`, or the counting runtime's twin of it
-    // where that runtime is defined elsewhere.
-    if e.uses_calloc && !defines_alloc_count(e)
+    // The zeroing half, on the same terms: libc's `calloc(count, size)`.
+    if e.uses_calloc
         val zeroing = calloc_symbol().unwrap_or("calloc")
 
         if !emits_export(p, zeroing)
@@ -1038,16 +1079,15 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
             zero_params.push(ir_param(word_lty(e)))
             out.push(declared_sig(e, zeroing, ir_fn_type(LPtr, zero_params)))
 
-    // The aligned pair, on the same terms -- and not where this module writes its default or the
-    // counting runtime defines it.
-    if aligned_hook_declared(e, p, aligned_alloc_symbol())
+    // The aligned pair, where this module calls it and does not write it.
+    if aligned_hook_declared(e, aligned_alloc_symbol())
         var aligned_params: Buf[IrParam] = buf()
 
         aligned_params.push(ir_param(word_lty(e)))
         aligned_params.push(ir_param(word_lty(e)))
         out.push(declared_sig(e, aligned_alloc_symbol(), ir_fn_type(LPtr, aligned_params)))
 
-    if aligned_hook_declared(e, p, aligned_free_symbol())
+    if aligned_hook_declared(e, aligned_free_symbol())
         var aligned_free_params: Buf[IrParam] = buf()
 
         aligned_free_params.push(ir_param(LPtr))
@@ -1164,7 +1204,7 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
 
     if e.uses_calloc then seen.push(calloc_symbol().unwrap_or("calloc"))
 
-    if !e.aligned_heap.is_empty()
+    if aligned_heap_used(e)
         seen.push(aligned_alloc_symbol())
         seen.push(aligned_free_symbol())
 
@@ -1245,11 +1285,10 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
     out
 end declares
 
-// Whether one half of the aligned pair is declared here: something asked for it, and it is not this
-// module's own `@export`, the default written beside it, or the counting runtime's.
-private aligned_hook_declared(e: *Emit, p: TProgram, sym: string) -> bool =
-    !e.aligned_heap.is_empty() && !defines_alloc_count(e) && !emits_export(p, sym) &&
-        !e.requested_set.has(sym)
+// Whether one half of the aligned pair is declared here: something called it, and the default is not
+// written beside it -- which only a machine with no C library leaves unwritten, where the build is
+// refused, and the module is still whole for `emit-llvm` to print.
+private aligned_hook_declared(e: *Emit, sym: string) -> bool = aligned_heap_used(e) && !e.requested_set.has(sym)
 
 // A whole module as LLVM text, which is what `emit-llvm` prints.
 codegen_text(p: TProgram, t: Target) -> string = ir_print_module(codegen_module(p, t))
