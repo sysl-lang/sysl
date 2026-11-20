@@ -4061,6 +4061,99 @@ first(xs: []int) -> int = xs[0]
 What it does to a subscript, `get_unchecked` and `set_unchecked` for one subscript at a time, and what
 stays checked are in [arrays](/reference/arrays/#unchecked-access).
 
+## `@checked` — integer overflow that traps in every build
+
+**What a plain integer `+`, `-` or `*` does when the answer does not fit is the
+[build mode's](/reference/types/#arithmetic-wraps)**: a debug build stops the program, and a release
+build wraps. Code whose overflow is a fault however it was built — flight software, a counter whose
+wrap would read as a small number — says so with `@checked` above a function or a method. Every plain
+`+`, `-`, `*`, unary `-`, compound assignment, `++` and `--` and every written integer conversion in
+its body is then checked in a release build exactly as a debug build checks it, with the same report:
+
+```sysl
+@checked
+total(a: u8, b: u8) -> u8 = a + b
+
+print(total(200, 55))
+print(total(200, 56))
+```
+
+```output trap
+255
+```
+
+The second call stops the program with `integer overflow: u8 + u8 (main.sysl:2:29)` whether it was
+built by `sysl run` or by `sysl build`.
+
+**Written on a line of its own above an indented block, it marks the block instead**, and only what is
+written inside it is checked — what comes before and after keeps the mode's meaning:
+
+```sysl
+var level: u8 = 250
+
+@checked
+    level = level + 5
+
+print(level)
+```
+
+```output
+255
+```
+
+It never makes anything wrap, and it changes nothing that already says what it does:
+[`+%` and `+|`](/reference/expressions/#wrapping-and-saturating-operators) wrap and saturate,
+[`u8.wrap(n)`](/reference/expressions/#a-wrapping-conversion-keeps-the-bit-pattern) keeps the bit
+pattern, `checked_add` answers `None`, a shift is
+[defined](/reference/expressions/#shifting-by-the-width-or-more) at every count, and a vector's lanes
+wrap as the machine's lane instructions do. Division by zero traps everywhere already.
+
+### What it covers
+
+The region is **lexical**, as [`@reassociate`](#reassociate-float-sums-the-back-end-may-regroup)'s
+is: the operations written in the function or the block, and in any closure or nested function
+written inside it. A function *called* from inside but written elsewhere keeps the mode's meaning,
+inlined or not. A generic `@checked` function is checked at every instantiation, and a method marked
+`@checked` is checked while its siblings are not.
+
+**It is independent of [`@unchecked`](#unchecked-a-block-whose-subscripts-are-not-bounds-checked)**,
+which is about subscripts: an `@unchecked` block inside a `@checked` function reads its subscripts
+with no bounds check and still traps on overflow, and a `@checked` block inside an `@unchecked` one is
+checked the same way.
+
+**A value worked out while compiling agrees.** A `const` function marked `@checked`, or one written
+inside a `@checked` block, is held to the same promise when a constant runs it: an overflow that would
+stop the running program refuses the constant instead of folding a wrapped value into it. Unmarked, a
+`const` function folds the value a release build would compute.
+
+```sysl
+@checked
+const add(a: u8, b: u8) -> u8 = a + b
+
+const K = add(200, 100)
+```
+
+```error
+'K' traps while it is being compiled: 200 + 100 overflows byte
+```
+
+A whole package is checked with [`checked_overflow = true`](/reference/packages/#overflow-that-traps-in-every-build)
+in its manifest, which does for every file of the package what `@checked` does for one function.
+
+It takes no argument, and it marks a function, a method or a block — nothing else:
+
+```sysl
+@checked
+struct P
+    x: int
+```
+
+```error
+'@checked' makes the integer arithmetic written in a body trap on overflow in every build, so it marks a function, a method, or — on a line of its own — the block indented under it
+```
+
+A closure takes no annotations; it is checked when it is written inside a marked function or block.
+
 ## `@disjoint` — parameters whose memory nothing else reaches
 
 A kernel that writes through one view and reads through another is the loop a vectorizer exists

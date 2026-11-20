@@ -238,6 +238,28 @@ private location_roots_of(root: string, packages: Buf[string]) -> Buf[(string, s
     out
 end location_roots_of
 
+// The package roots a compilation reads, each with whether its own manifest says
+// `checked_overflow = true` (`checked.sysl`): the project's, each `--lib` root and each package the
+// graph resolved. A file is the package's whose root is the longest that holds it.
+private checked_roots_of(root: string, m: &Manifest, packages: Buf[string]) -> Buf[(string, bool)]
+    var out: Buf[(string, bool)] = buf()
+
+    out.push((absolute_path(root) + "/", m.checked_overflow.unwrap_or(false)))
+
+    for item in lib_roots()
+        out.push((absolute_path(item) + "/", said_checked(item)))
+
+    for item in packages
+        out.push((absolute_path(item) + "/", said_checked(item)))
+
+    out
+end checked_roots_of
+
+// Whether the manifest in `dir` says `checked_overflow = true`.
+private said_checked(dir: string) -> bool = manifest_at(dir) match
+    Ok(theirs) -> theirs.checked_overflow.unwrap_or(false)
+    Err(_) -> false
+
 // The package an **example** belongs to: the root two levels above a program that sits in a
 // package's `examples/` directory, or nothing (`reference/packages.md § A package may carry
 // examples`). `root` is the project root a command was given -- the directory named, or the one a
@@ -366,6 +388,7 @@ packaged_compilation_of(path: string, t: Target, keep_tests: bool = true,
     val handed = lib_root_units(t, fetched)?
 
     use_location_roots(location_roots_of(root, fetched.roots))
+    use_checked_packages(checked_roots_of(root, manifest, fetched.roots))
 
     var theirs: Buf[Program] = buf()
 

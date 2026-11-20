@@ -61,6 +61,10 @@ parse_at_stmt(p: *Parser, start: Span) -> Stmt
 
     if word == "unchecked" && at_string(p, 3) then return parse_extensions_block(p, start)
 
+    // `@checked` the same way: over an indented block it marks the block (`checked.sysl`).
+    if word == "checked" && p.peek_at(2) == Newline && p.peek_at(3) == Indent then
+        return parse_checked_block(p, start)
+
     parse_attributed_decl(p, start)
 end parse_at_stmt
 
@@ -223,7 +227,7 @@ private member_attr_word(w: string) -> bool
 
     for word in ["crossing", "reads", "writes", "noinline", "inline", "cold", "blocks",
                  "relocates", "views", "consumes", "disjoint", "scoped", "bounded", "joined", "strict_fp",
-                 "reassociate", "track_caller", NoFuseWord, "extensions", "frame_limit"]
+                 "reassociate", "checked", "track_caller", NoFuseWord, "extensions", "frame_limit"]
         if word == w then return true
 
     false
@@ -280,8 +284,8 @@ builtin_attr_word(w: string) -> bool
                  "section", "crossing", "domain", "keeps", "answers", "disjoint", "guards", "needs",
                  "noinline", "inline", "cold", "thread_local", "abandons", "per_cpu", "main_thread",
                  "pinned", "pins", "unique", "relocates", "views", "consumes", "blocks", "scoped", "bounded", "joined",
-                 "strict_fp", "reassociate", "track_caller", "returns_twice", "renamed", "removed", "unchecked",
-                 "extensions", "frame_limit"]
+                 "strict_fp", "reassociate", "checked", "track_caller", "returns_twice", "renamed", "removed",
+                 "unchecked", "extensions", "frame_limit"]
         if word == w then return true
 
     false
@@ -463,6 +467,8 @@ parse_attribute(p: *Parser) -> Option[Attr]
     if word == "strict_fp" then return no_inlining_args(p, StrictFp, "the rounding mode and the exceptions are whatever the floating-point environment holds when the body runs, which is what the annotation says to follow")
     // `@reassociate` takes none: the order is the back end's to choose, so there is nothing to name.
     if word == "reassociate" then return no_inlining_args(p, Reassociate, "the order a regrouped sum is computed in is the back end's to choose, so there is no order to name")
+    // `@checked` takes none: what an overflow does there is trap, so there is nothing to choose.
+    if word == "checked" then return no_inlining_args(p, Checked, "an overflow in a checked body always traps, so there is nothing to choose")
     // `@no_fuse` takes none: what it turns off is one thing, and there is no degree of it to name.
     if word == NoFuseWord then return no_inlining_args(p, NoFuse, "what it turns off is the fusing of a multiply with the add it feeds, which a body either has or does not")
     // `@track_caller` takes none: the location it hands on is the call's, which is not something a
@@ -1116,6 +1122,7 @@ apply_func_attrs(f: *FuncDecl, attrs: Buf[Attr])
             Blocks -> f.marks.blocks = true
             StrictFp -> f.marks.strict_fp = true
             Reassociate -> f.marks.reassociate = true
+            Checked -> f.marks.checked = true
             NoFuse -> f.marks.no_fuse = true
             TrackCaller -> f.marks.track_caller = true
             Extensions(ns) -> f.marks.extensions = ns
@@ -1150,6 +1157,7 @@ apply_member_attrs(m: *MethodDecl, attrs: Buf[Attr])
             Blocks -> m.marks.blocks = true
             StrictFp -> m.marks.strict_fp = true
             Reassociate -> m.marks.reassociate = true
+            Checked -> m.marks.checked = true
             NoFuse -> m.marks.no_fuse = true
             TrackCaller -> m.marks.track_caller = true
             Extensions(ns) -> m.marks.extensions = ns
@@ -1429,6 +1437,7 @@ private attributed_refusal(attrs: Buf[Attr]) -> string
         return "'@strict_fp' says how a body's floating-point operations are compiled, so it marks a function or a method, whose body is sysl — and this declares neither. An 'extern''s operations are compiled by whoever compiled it"
 
     if any_is(attrs, "reassociate") then return reassociate_not_a_body()
+    if any_is(attrs, "checked") then return checked_not_a_body()
     if any_is(attrs, NoFuseWord) then return no_fuse_not_a_body()
     if any_is(attrs, "extensions") then return extensions_not_a_body()
 

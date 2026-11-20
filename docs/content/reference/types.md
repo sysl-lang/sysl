@@ -142,6 +142,10 @@ and the line. The same holds of a unary `-` (negating `i8`'s −128) and of a wr
 cannot hold its value (`u8(n)` with `n` at 300). The mode is never the reason a program is right:
 code that means to wrap says so — and a conversion that means the bit pattern is
 [`u8.wrap(n)`](/reference/expressions/#a-wrapping-conversion-keeps-the-bit-pattern), unchecked in every build.
+Code whose overflow is a fault in every build says that too: a
+[`@checked`](/reference/attributes/#checked-integer-overflow-that-traps-in-every-build) function or
+block, or a package's [`checked_overflow = true`](/reference/packages/#overflow-that-traps-in-every-build),
+checks it in a release build as well.
 
 ```sysl
 var small: byte = 250

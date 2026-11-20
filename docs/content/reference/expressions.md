@@ -307,7 +307,10 @@ wraps at the declared width, which is defined, and a debug build — `sysl run` 
 the program with `integer overflow: int + int (main.sysl:4:9)`; see
 [types](/reference/types/#arithmetic-wraps) and [debug and
 release](/getting-started/cli/#debug-and-release). A compound assignment (`+=`, `*=`) and `++`/`--`
-are the same operation and are checked the same way. Integer division by zero traps in every build. Arithmetic written out of literals alone is the exception to both: it is computed
+are the same operation and are checked the same way. Inside a
+[`@checked`](/reference/attributes/#checked-integer-overflow-that-traps-in-every-build) function or
+block, and anywhere in a package whose manifest says `checked_overflow = true`, every build checks them
+as a debug build does. Integer division by zero traps in every build. Arithmetic written out of literals alone is the exception to both: it is computed
 exactly, a value that does not fit its type is refused, and so is a division by a literal zero —
 see [arithmetic over literals](/reference/types/#arithmetic-over-literals-is-exact).
 
