@@ -256,7 +256,7 @@ print(q.x)
 ```
 
 ```error
-'+' needs matching types, got &Point and int
+'+' needs matching types, got Point and int
 ```
 
 Walking memory is the job of a `*T`, and most of the time a `[]T` is the better choice: it is the

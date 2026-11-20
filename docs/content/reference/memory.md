@@ -1624,6 +1624,55 @@ e = 5
 'e' is a 'ref' standing on storage held in a 'Node', and this assignment writes one that may be the same object by another name
 ```
 
+**A root the body holds is no other name's to free.** A ref whose place starts at a parameter or a
+local of its own body, through a `&T` or a view, stands in an object that slot keeps alive for the
+whole call — a parameter by the caller's
+[guarantee](#passing-a-reference-to-a-call-usually-costs-nothing), a local by its own count — so a call
+that may write a `T` by another name writes beside the ref, never under it. Only writing the slot
+itself could let the object go, and a call can do that only through the slot's address: an `&` of it,
+a `ref` bound to it, or a nested function's environment, anywhere in the body. Such a body is asked
+about the slot's type as before, and so is a root in module storage; an owning step past the root (a
+`&Child` field) is asked about by its holder's type whatever the root is.
+
+```sysl
+struct Inner
+    n: int
+
+    bump(*self) = self.n += 1
+
+struct Node
+    id: int
+    inner: Inner
+    next: Option[&Node]
+
+impl Drop for Node
+    drop(self) = print(s"drop ${self.id}")
+
+touch(o: &Node) = o.next = None
+
+walk(node: &Node, other: &Node)
+    ref r = node.inner
+
+    touch(other)
+    r.bump()
+    print(s"bumped ${r.n}")
+
+val b: &Node = Node(2, Inner(20), Some(Node(1, Inner(10), None)))
+
+walk(b.next.unwrap(), b)
+print("back")
+```
+
+```output
+bumped 11
+drop 1
+back
+drop 2
+```
+
+`touch` lets go of the only field that held node 1, and the caller's guarantee for
+`b.next.unwrap()` is what keeps it until `walk` returns.
+
 What stays open is everything that cannot be the ref's storage: other fields of the ref's own object
 along its path (`h.node.count = 2` beside `ref e = h.node.cell[0]`), values of unrelated types, calls
 whose bodies only read, and anything once the ref's block has closed. A view of a buffer is not a

@@ -1,0 +1,344 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.text.replace_all
+
+// **What a build lets go of before and while it lowers, and that letting go changes no answer.** Four
+// things a large build held for nothing, each pinned where it can be: the field-path analysis the
+// checks keep on the analysis (`forget_field_paths`), each typed body once a build that wants only the
+// text has lowered it (`codegen_into`'s `compact`), the answers `untouched_by` keeps for every type a
+// call asks about (`Cleared`, one bit a function), and the room the module's text is written into
+// (`printed_room`).
+//
+// The text each build prints is compared, whole, between the build that lets go and the one that
+// keeps everything in `tests_cpt_compact_codegen.sysl`, the test build's included; the borrowing
+// entries a program leaves pending are built there from a body-less heading. Not here: how many
+// bytes any of it is, which is a measurement on the compiler's own test build (`SYSL_TIMINGS=1`'s
+// memory lines), not something a program small enough for a test shows -- what is pinned instead is
+// that the memory is no longer reachable from what outlives it. A `@ghost` function is skipped by
+// the lowering before anything is let go of, and keeps its body.
+
+// A function that writes a `Cell` through a pointer, one that only reads one, one that reaches the
+// writer through a call, a body that returns a view of its own array through a function handing its
+// argument straight back -- which is what the field paths answer -- and one that only reads a view.
+private val mlg_source = raw"""
+    struct Cell
+        n: int
+
+    bump(c: *Cell) = c.n += 1
+    peek(c: *Cell) -> int = c.n
+    twice(c: *Cell) = bump(c)
+
+    pass(xs: []int) -> []int = xs
+
+    make() -> []int
+        var a = [1, 2, 3]
+        pass(a[0..<2])
+
+    look(xs: []int) -> int = xs[0]
+
+    quiet() -> int
+        var b = [4, 5, 6]
+        look(b[0..<2])
+
+    main()
+        var c = Cell(1)
+        bump(&c)
+        twice(&c)
+        print(peek(&c) + make()[0] + quiet())
+    """
+
+// The program's function written as `name`.
+private mlg_func(p: TProgram, name: string) -> string
+    for f in p.funcs
+        if names_as_written(f.name, name) then return f.name
+
+    ""
+end mlg_func
+
+// What the escape analysis promoted, every body's names in order and the notes, as one text.
+private mlg_promoted(pr: Promotions) -> string
+    var out = ""
+
+    for item in pr.by_func
+        out = out + item.0 + ":"
+
+        for name in item.1
+            out = out + " " + name
+
+        out = out + "\n"
+
+    for item in pr.notes
+        out = out + item.0 + " -- " + item.1 + "\n"
+
+    out
+end mlg_promoted
+
+// The source read as a program with the standard library under it, every body typed and the checks
+// run; nothing where there is no library to read.
+private mlg_typed() -> Option[TypedBodies]
+    if xvr_no_library() then return None
+
+    val root = make_temp_dir("sysl-mlg").unwrap()
+
+    write_text(s"$root/main.sysl", mlg_source).unwrap()
+
+    val program = packaged_compilation_of(root, host_target())
+
+    remove_dir_all(root).unwrap_or(())
+
+    program match
+        Err(why) ->
+            assert(false, failure_text(why))
+            None
+        Ok(read) ->
+            val done = analyze_bodies(read.units, read.target)
+
+            assert(done.reported.is_empty(), s"the source analyzes: ${analysis_report(done.reported)}")
+            Some(done)
+end mlg_typed
+
+// What a lowering could not lower, one line each.
+private mlg_gaps(gaps: Buf[(string, string)]) -> string
+    var out = ""
+
+    for item in gaps
+        out = out + item.0 + ": " + item.1 + "\n"
+
+    out
+end mlg_gaps
+
+@test("mlg: the field paths the checks kept are let go of, and the escape analysis answers the same without them")
+mlg_field_paths_forgotten_same_answer()
+    val typed = mlg_typed()
+
+    if typed.is_none() then return
+
+    val done = typed.unwrap()
+
+    assert(done.an.field_paths.is_some(), "the checks keep the field paths on the analysis")
+
+    val p = strip_tests(program_of(done, done.main_module))
+    val make = mlg_func(p, "make")
+    val quiet = mlg_func(p, "quiet")
+    val first = check_escapes(done.an, p)
+    val kept = mlg_promoted(first)
+
+    assert(holds_string(first.for_func(make), "a"), s"the view of 'a' that 'make' hands back is promoted:\n$kept")
+    assert(first.for_func(quiet).is_empty(), s"the view 'quiet' only lends is not:\n$kept")
+
+    forget_field_paths(done.an)
+
+    assert(done.an.field_paths.is_none(), "nothing holds the field paths once they are let go of")
+
+    val second = check_escapes(done.an, p)
+    val again = mlg_promoted(second)
+
+    assert(holds_string(second.for_func(make), "a") && second.for_func(quiet).is_empty(), again)
+    assert(again == kept, s"without the kept field paths\n$again\nagainst, with them\n$kept")
+
+    // A second question after letting go asks the analysis again, and is still the same answer.
+    assert(mlg_promoted(check_escapes(done.an, p)) == kept, "asked twice")
+end mlg_field_paths_forgotten_same_answer
+
+// How many of the program's functions still hold a body -- statements or a result -- leaving out a
+// `@ghost` one, which nothing lowers.
+private mlg_bodies(p: TProgram) -> usize
+    var n: usize = 0
+
+    for f in p.funcs
+        if !f.ghost && (!f.body.stmts.is_empty() || f.body.result.is_some()) then n += 1
+
+    n
+end mlg_bodies
+
+@test("mlg: a build that wants only the text lets go of each body once it is lowered, and keeps every heading")
+mlg_compact_lowering_lets_bodies_go()
+    val typed = mlg_typed()
+
+    if typed.is_none() then return
+
+    val done = typed.unwrap()
+    val t = done.an.tables.target
+    val p = strip_tests(program_of(done, done.main_module))
+    val names = buf_of_names(p)
+    val pr = check_escapes(done.an, p)
+
+    assert(mlg_bodies(p) > 5, "the program has bodies to lower")
+
+    val lowered = codegen_with_gaps(p, t, pr, false, None, false, true)
+
+    assert(lowered.1.is_empty(), mlg_gaps(lowered.1))
+    assert(mlg_bodies(p) == 0, s"${mlg_bodies(p)} bodies still held after a compact lowering")
+    assert(buf_of_names(p) == names, "every heading is where it was, under its name")
+end mlg_compact_lowering_lets_bodies_go
+
+@test("mlg: a lowering that keeps the module whole keeps every body")
+mlg_whole_lowering_keeps_bodies()
+    val typed = mlg_typed()
+
+    if typed.is_none() then return
+
+    val done = typed.unwrap()
+    val p = strip_tests(program_of(done, done.main_module))
+    val before = mlg_bodies(p)
+
+    val lowered = codegen_with_gaps(p, done.an.tables.target, check_escapes(done.an, p))
+
+    assert(lowered.1.is_empty(), mlg_gaps(lowered.1))
+    assert(mlg_bodies(p) == before, s"$before bodies before, ${mlg_bodies(p)} after")
+end mlg_whole_lowering_keeps_bodies
+
+// The program's function names, one line each, in order.
+private buf_of_names(p: TProgram) -> string
+    var out = ""
+
+    for f in p.funcs
+        out = out + f.name + "\n"
+
+    out
+end buf_of_names
+
+// The function of the summary written as `name`.
+private mlg_named(u: Untouched, name: string) -> string
+    for item in u.names
+        if names_as_written(item, name) then return item
+
+    ""
+end mlg_named
+
+@test("mlg: what untouched_by clears is one bit a function, and answers as the set of names it replaced")
+mlg_untouched_answers_are_bits()
+    val typed = mlg_typed()
+
+    if typed.is_none() then return
+
+    val done = typed.unwrap()
+    val p = strip_tests(program_of(done, done.main_module))
+
+    var u = untouched_summary(p, dropping_reached(done.an))
+    var cell: Option[Type] = None
+
+    for item in p.structs
+        if type_show(item).contains("Cell") then cell = Some(item)
+
+    assert(cell.is_some(), "the program makes a 'Cell'")
+
+    val bump = mlg_named(u, "bump")
+    val peek = mlg_named(u, "peek")
+    val twice = mlg_named(u, "twice")
+
+    assert(bump != "" && peek != "" && twice != "", "the three are in the summary")
+
+    val answer = untouched_by(&u, cell.unwrap())
+
+    assert(answer.has(peek), "a body that only reads a Cell is cleared")
+    assert(!answer.has(bump), "one that writes a Cell is not")
+    assert(!answer.has(twice), "nor one that calls the writer")
+    assert(!answer.has("no.such.function"), "a name the summary does not hold is not cleared")
+    assert(!answer.has(""), "nor is the empty name")
+
+    // One bit a distinct name, and the numbering is the summary's own.
+    assert(u.id_count > 0 && u.id_count <= u.names.len(), s"${u.id_count} numbered of ${u.names.len()}")
+    assert(answer.bits.len() == (u.id_count + 63) / 64,
+           s"${answer.bits.len()} words for ${u.id_count} functions")
+
+    // Asked again, the kept answer is the one handed back.
+    val again = untouched_by(&u, cell.unwrap())
+
+    assert(again.has(peek) && !again.has(bump) && !again.has(twice), "the kept answer")
+    assert(again.bits.len() == answer.bits.len(), "the same bits")
+
+    // Another question about the same type -- the paths that come back -- is its own answer.
+    val answering = untouched_by(&u, cell.unwrap(), Unknown, false, true)
+
+    assert(answering.has(peek) && !answering.has(bump), "the paths that come back judge the same bodies")
+end mlg_untouched_answers_are_bits
+
+@test("mlg: a test build's analysis reaches its lowering with the field paths let go of and its tests kept")
+mlg_test_build_analysis_lets_go()
+    if !(std_root().is_ok() && clang_available()) then return
+
+    val root = absolute_path(replace_all(make_temp_dir("sysl-mlg").unwrap(), "//", "/"))
+
+    write_text(s"$root/sysl.hocon", "package { name = \"mlg\", version = \"0.1.0\" }\n").unwrap()
+    write_text(s"$root/main.sysl", mlg_source + raw"""
+
+        @test("peeks")
+        peeks()
+            var c = Cell(2)
+            assert_eq(peek(&c), 2)
+        """).unwrap()
+
+    for warns in [false, true]
+        val program = packaged_compilation_of(root, host_target())
+
+        assert(program.is_ok(), "the package reads")
+
+        val ready = tests_analyzed(program.unwrap(), false, root, warns)
+
+        assert(ready.an.field_paths.is_none(), s"warns $warns: the field paths are let go of before the lowering")
+        assert(ready.kept.tests.len() == 1, s"warns $warns: the one test is kept")
+        assert(errors_of(ready.an.diagnostics()).is_empty(), s"warns $warns: nothing refused")
+
+    remove_dir_all(root).unwrap_or(())
+end mlg_test_build_analysis_lets_go
+
+@test("mlg: the room a module's text is written into is exactly the functions' text, once every one is printed")
+mlg_printed_room_is_exact()
+    val typed = mlg_typed()
+
+    if typed.is_none() then return
+
+    val done = typed.unwrap()
+    val p = strip_tests(program_of(done, done.main_module))
+    val m = codegen_with_gaps(p, done.an.tables.target, check_escapes(done.an, p), false, None, false, true).0
+
+    var n: usize = 0
+
+    for f in m.funcs
+        assert(is_printed(f), s"${f.sig.name} is printed in a compact lowering")
+        n += ir_print_func(f).len
+
+    assert(n > 0, "the module has functions")
+    assert(printed_room(m.funcs) == n, s"room ${printed_room(m.funcs)} for $n bytes of functions")
+end mlg_printed_room_is_exact
+
+@test("mlg: a module whose functions are still blocks is given no room up front, and prints the same text")
+mlg_blocks_get_no_room()
+    val typed = mlg_typed()
+
+    if typed.is_none() then return
+
+    // One reading lowered twice -- whole, then compact -- since a location a check reports names the
+    // file the reading read. Each lowering has a program of its own, so the compact one lets go of
+    // bodies only from its own list.
+    val done = typed.unwrap()
+    val p = strip_tests(program_of(done, done.main_module))
+    val whole = codegen_with_gaps(p, done.an.tables.target, check_escapes(done.an, p)).0
+
+    assert(printed_room(whole.funcs) == 0, "a function still blocks has no known length")
+
+    val p2 = strip_tests(program_of(done, done.main_module))
+    val compact = codegen_with_gaps(p2, done.an.tables.target, check_escapes(done.an, p2), false, None, false,
+                                    true).0
+
+    val a = ir_print_module(compact)
+    val b = ir_print_module(whole)
+
+    assert(a == b, s"given its room or grown into it: ${mlg_first_difference(a, b)}")
+end mlg_blocks_get_no_room
+
+// Where two texts first part company, as the line of each.
+private mlg_first_difference(a: string, b: string) -> string
+    val xs = lines_of(a)
+    val ys = lines_of(b)
+
+    for i in 0..<xs.len()
+        if i >= ys.len() then return s"line ${i + 1}: '${xs[i]}' against the end"
+        if xs[i] != ys[i] then return s"line ${i + 1}: '${xs[i]}' against '${ys[i]}'"
+
+    s"${xs.len()} lines against ${ys.len()}"
+end mlg_first_difference
