@@ -23,9 +23,13 @@ import sysl.buf.{Buf, buf}
 // generic type are unique by what they hold; a struct or an enum the program declares says so with
 // its own `@unique`, so a reader of the declaration sees that `val b = a` moves.
 //
+// **A destructor on a `@unique` type runs on the value** (`emit_unique.sysl`), where its owner lets go
+// of it; the forms that stage does not lower yet are refused here (`unique_destructors`).
+//
 // What later stages of the design add is refused here with a sentence saying it is not supported
-// yet: a destructor on a `@unique` type, taking one apart with a pattern, moving a part out of a
-// local, a closure capturing one, a borrow that a move would end, and one crossing to C by value.
+// yet: taking one apart with a pattern, moving a part out of a local, a closure capturing one, a
+// borrow that a move would end, one crossing to C by value, and one with a destructor inside a type
+// the library declares, or handed on through a function pointer, a trait object or a `become`.
 
 // -- which types are unique ------------------------------------------------------------------------
 
@@ -151,37 +155,253 @@ end unique_receiver
 
 // -- declarations ----------------------------------------------------------------------------------
 
-// A declared struct or enum holding a `@unique` value by value says so; a `@unique` type has no
-// destructor yet; and none crosses to C by value.
+// A declared struct or enum holding a `@unique` value by value says so; a destructor on one runs on
+// the value, in the forms this stage lowers; and none crosses to C by value.
 check_unique_decls(a: &Analysis, funcs: Buf[TFunc])
     if !any_unique(a) then return
 
-    unique_destructors(a)
+    unique_destructors(a, funcs)
     unique_holders(a)
     unique_c_signatures(a, funcs)
 end check_unique_decls
 
-private unique_destructors(a: &Analysis)
+// A `@unique` type's destructor runs on the value (`emit_unique.sysl`). What this stage cannot yet
+// honour is refused, naming the form: a `@consumes` member taking `*self` (the callee would have to
+// drop what its caller's local holds), a value too large to be held in registers, a function that
+// cannot be handed one -- an `async` one, a closure's body -- and a `@unique` value with a destructor
+// held by value inside a type the library declares (`Option`, `Buf`, …), whose members are checked
+// at each instance by a later stage.
+private unique_destructors(a: &Analysis, funcs: Buf[TFunc])
+    if catalog_key(a, "Drop").is_none() || !any_unique(a) then return
+
+    for i in 0..<a.tables.struct_insts.len()
+        large_unique(a, a.tables.struct_insts.at(i))
+
+    for i in 0..<a.tables.enum_insts.len()
+        large_unique(a, a.tables.enum_insts.at(i))
+
+    for f in funcs
+        consuming_pointer(a, f)
+        unhanded_params(a, f)
+end unique_destructors
+
+// A `@consumes` member taking `*self` of such a type.
+private consuming_pointer(a: &Analysis, f: TFunc)
+    if !f.marks.consumes || f.params.is_empty() || f.params[0].0 != "self" then return
+
+    val held = f.params[0].1 match
+        Ptr(inner) -> unique_drop_held(a, *inner)
+        _ -> None
+
+    if held.is_none() then return
+
+    val name = type_show(held.unwrap())
+
+    a.fault(func_home(a, f.name), f.span, s"'${last_part(qualified_name(f.name))}' is '@consumes' and takes " +
+            s"'*self', and '$name' is '@unique' with a 'Drop' — a '@consumes' member taking its receiver " +
+            "through a pointer is not supported yet. Take '(self)': the member then owns the value and " +
+            "drops it at its end")
+end consuming_pointer
+
+// A value of such a type is held in registers and moved as one; one too large for that is refused at
+// the declaration that makes it so.
+private large_unique(a: &Analysis, t: Type)
+    if mentions_abstract(t) then return
+
+    val held = unique_drop_held(a, t)
+
+    if held.is_none() || !a.tables.layout.indirect(t) then return
+
+    val decl = a.tables.types.get(owner_key(t))
+
+    if decl.is_none() then return
+
+    a.fault(decl.unwrap().scope, decl.unwrap().span,
+            s"'${type_show(t)}' holds the '@unique' '${type_show(held.unwrap())}', whose destructor runs on " +
+            s"the value, and is ${a.tables.layout.size(t)} bytes — a '@unique' value with a destructor " +
+            "larger than 128 bytes is not supported yet. Hold the large part behind a '&T'")
+end large_unique
+
+// A function handed such a value owns it and drops it at its end (`owned_params.sysl`); a body that
+// cannot be handed one is refused where it is declared.
+private unhanded_params(a: &Analysis, f: TFunc)
+    val what = if f.marks.is_async() then "an 'async' function"
+               else if is_closure_body(f) then "a closure"
+               else ""
+
+    if what == "" then return
+
+    for j in 0..<f.params.len()
+        val p = f.params[j]
+
+        if j == 0 && p.0 == "self" && !f.marks.consumes then continue
+
+        unique_drop_held(a, p.1) match
+            Some(held) ->
+                a.fault(func_home(a, f.name), f.span,
+                        s"$what taking '${written_local(p.0)}' by value, and '${type_show(held)}' is " +
+                        "'@unique' with a 'Drop' — handing one to $what is not supported yet. Pass a " +
+                        s"'*${type_show(p.1)}' instead")
+                return
+            None -> ()
+end unhanded_params
+
+// The first `@unique` type with a `Drop` a value of this type holds by value -- itself, a field, an
+// element, a payload, at any depth -- where one is.
+unique_drop_held(a: &Analysis, t: Type) -> Option[Type]
+    if !any_unique(a) then return None
+
     val drop_trait = catalog_key(a, "Drop")
 
-    if drop_trait.is_none() then return
+    if drop_trait.is_none() then return None
 
-    for i in 0..<a.tables.types.len()
-        val d = a.tables.types.at(i)
+    var seen: Buf[string] = buf()
 
-        if !unique_decl(d) then continue
+    drop_held_at(a, drop_trait.unwrap(), t, &seen)
+end unique_drop_held
 
-        val key = a.tables.types.key_at(i)
+private drop_held_at(a: &Analysis, dt: string, t: Type, seen: *Buf[string]) -> Option[Type] = t match
+    Struct(d) ->
+        if d.unique && !impls_of(a, dt, owner_key(t)).is_empty() then return Some(t)
+        if holds_string(*seen, d.name()) then return None
 
-        if impls_of(a, drop_trait.unwrap(), key).is_empty() then continue
+        seen.push(d.name())
+        drop_held_in(a, dt, d.fields, seen)
+    Enum(d) ->
+        if d.unique && !impls_of(a, dt, owner_key(t)).is_empty() then return Some(t)
+        if d.simple || holds_string(*seen, d.name()) then return None
 
-        val name = qualified_name(key)
+        seen.push(d.name())
 
-        a.fault(d.scope, d.span, s"'$name' is '@unique' and has a 'Drop' — a '@unique' type with a " +
-                "destructor is not supported yet. Drop the '@unique' to make it a reference type, " +
-                "built as a '&" + name + "', or release what it holds with a '@consumes' member")
+        for v in d.variants
+            val found = drop_held_in(a, dt, v.fields, seen)
+
+            if found.is_some() then return found
+
+        None
+    Array(_, elem) -> drop_held_at(a, dt, *elem, seen)
+    Constrained(d) -> drop_held_at(a, dt, d.base, seen)
+    Volatile(inner) -> drop_held_at(a, dt, *inner, seen)
+    _ -> None
+
+private drop_held_in(a: &Analysis, dt: string, fields: Buf[(string, Type)], seen: *Buf[string]) -> Option[Type]
+    for item in fields
+        val found = drop_held_at(a, dt, item.1, seen)
+
+        if found.is_some() then return found
+
+    None
+end drop_held_in
+
+// -- what a body's drops reach ---------------------------------------------------------------------
+
+// The bodies a whole-program walk reads (`no_alloc.sysl`), each with a call to every destructor it
+// runs on a `@unique` value it lets go of. The calls are the drop glue's and written nowhere, so the
+// walk would not see them; a body that drops such a value reaches what its destructor does (§ U26). A
+// body is asked about what it owns: a parameter it is handed, a local it binds, a value a call or a
+// construction makes for it.
+with_value_drops(a: &Analysis, funcs: Buf[TFunc]) -> Buf[TFunc]
+    val drop_trait = catalog_key(a, "Drop")
+
+    if !any_unique(a) || drop_trait.is_none() then return funcs
+
+    var out: Buf[TFunc] = buf()
+
+    for f in funcs
+        val names: &DropNames = DropNames(buf())
+
+        for j in 0..<f.params.len()
+            if !(j == 0 && f.params[j].0 == "self" && !f.marks.consumes) then
+                drop_names(a, drop_trait.unwrap(), f.params[j].1, names)
+
+        walk_block_stmts(f.body, TWalk(false, e -> made_here(a, drop_trait.unwrap(), e, names), w -> (),
+                                       s -> bound_here(a, drop_trait.unwrap(), s, names)))
+
+        if names.all.is_empty()
+            out.push(f)
+            continue
+        end if
+
+        var stmts: Buf[TStmt] = buf()
+
+        for s in f.body.stmts
+            stmts.push(s)
+
+        for n in names.all
+            stmts.push(TExprStmt(TExpr(f.span, TCall(n, buf(), Unit, false))))
+
+        out.push(f with { body = f.body with { stmts = stmts } })
     end for
-end unique_destructors
+
+    out
+end with_value_drops
+
+private struct DropNames
+    all: Buf[string]
+
+private made_here(a: &Analysis, dt: string, e: TExpr, names: &DropNames) = *e.kind match
+    TCall(_, _, ty, _) -> drop_names(a, dt, ty, names)
+    TStructNew(_, _) -> drop_names(a, dt, texpr_type(e), names)
+    TEnumNew(_, _, _) -> drop_names(a, dt, texpr_type(e), names)
+    TArrayLit(_, _) -> drop_names(a, dt, texpr_type(e), names)
+    _ -> ()
+
+private bound_here(a: &Analysis, dt: string, s: TStmt, names: &DropNames) = s match
+    TVarDecl(_, ty, _, _) -> drop_names(a, dt, ty, names)
+    _ -> ()
+
+// The destructor of every `@unique` type a value of `t` holds by value, at any depth.
+private drop_names(a: &Analysis, dt: string, t: Type, names: &DropNames)
+    var seen: Buf[string] = buf()
+
+    names_at(a, dt, t, &seen, names)
+
+private names_at(a: &Analysis, dt: string, t: Type, seen: *Buf[string], names: &DropNames) -> unit = t match
+    Struct(d) ->
+        if !holds_string(*seen, d.name())
+            seen.push(d.name())
+
+            if d.unique && !impls_of(a, dt, owner_key(t)).is_empty() then note_destructor(a, t, names)
+
+            for item in d.fields
+                names_at(a, dt, item.1, seen, names)
+        end if
+    Enum(d) ->
+        if !holds_string(*seen, d.name())
+            seen.push(d.name())
+
+            if d.unique && !impls_of(a, dt, owner_key(t)).is_empty() then note_destructor(a, t, names)
+
+            for v in d.variants
+                for item in v.fields
+                    names_at(a, dt, item.1, seen, names)
+        end if
+    Array(_, elem) -> names_at(a, dt, *elem, seen, names)
+    Constrained(d) -> names_at(a, dt, d.base, seen, names)
+    Volatile(inner) -> names_at(a, dt, *inner, seen, names)
+    _ -> ()
+
+// The lowered name of a type's destructor, as `program.sysl`'s list files it.
+private note_destructor(a: &Analysis, t: Type, names: &DropNames)
+    val made = a.tables.members.generic_drops.get(mangle(t))
+    val filed = if made.is_some() then made else a.tables.members.funcs.get(member_key_of(owner_key(t), "drop"))
+
+    if filed.is_some() && !holds_string(names.all, filed.unwrap()) then names.all.push(filed.unwrap())
+end note_destructor
+
+// Whether `t` is an instance of a generic type the standard library declares.
+private library_instance(t: Type) -> bool
+    val base = t match
+        Struct(d) -> if d.targs.is_empty() then "" else d.base
+        Enum(d) -> if d.targs.is_empty() then "" else d.base
+        _ -> ""
+
+    if base == "" then return false
+
+    val m = module_of(base)
+
+    m == AutoImportedModule || starts_with_module(m, AutoImportedModule)
+end library_instance
 
 // The containment rule, told at the field: a declared struct or enum holding a `@unique` value by
 // value is marked `@unique` too. An instance of a generic one is unique by what it holds.
@@ -625,6 +845,12 @@ private moved_out(w: &MoveWalk, e: TExpr, f: MoveFlow) -> MoveFlow
                                  s"'@unique'${instance_note(w)} — a '(self)' receiver is a copy that owns " +
                                  "nothing, so no part of it may be moved out. Mark the member '@consumes' " +
                                  "to take its receiver")
+                        else if written_local(unique) == "$parts"
+                            // The tuple a destructuring `val`/`var` or assignment takes apart is a
+                            // local the compiler made; the form is what the program wrote.
+                            not_yet(w, e.span, ty, "this takes a tuple apart, moving a part out of it",
+                                    "Move each value in a statement of its own (a swap is 'val t = a', " +
+                                    "'a = b', 'b = t')")
                         else
                             not_yet(w, e.span, ty, s"this moves '$shown' out of the local " +
                                     s"'${written_local(unique)}'", "Name the part with a 'ref', or reach " +
@@ -746,6 +972,12 @@ private flow_stmt(w: &MoveWalk, s: TStmt, f: MoveFlow) -> MoveFlow = s match
 
         flow_dead()
     TBecome(call) ->
+        *call.kind match
+            TCall(_, args, _, _) ->
+                handed_indirectly(w, args, "a 'become', whose frame is given back first",
+                                  "Call the function without 'become'")
+            _ -> ()
+
         flow_expr(w, call, f)
         flow_dead()
     TBreak(value, depth) ->
@@ -914,15 +1146,47 @@ private flow_expr(w: &MoveWalk, e: TExpr, f: MoveFlow) -> MoveFlow
         TEnumNew(_, variant, args) -> flow_all(w, args, f, s"'${variant.name}'")
         TArrayLit(elems, _) -> flow_all(w, elems, f, "an array")
         TBox(value, _) -> flow_move(w, value, f, "a box")
-        TCallPtr(callee, args, _, _) -> flow_all(w, args, flow_expr(w, callee, f), "a call through a pointer")
+        TCallPtr(callee, args, _, _) ->
+            handed_indirectly(w, args, "a call through a pointer")
+            flow_all(w, args, flow_expr(w, callee, f), "a call through a pointer")
         TVCall(receiver, _, args, _, _) ->
+            handed_indirectly(w, args, "a call through a trait object")
             flow_all(w, args, flow_place(w, receiver, f), "a call through a trait object")
         _ -> flow_all(w, texpr_children(e), f, "this expression")
+
+    library_holder(w, e)
 
     if texpr_type(e) == Never then return flow_dead()
 
     out
 end flow_expr
+
+// A `@unique` value with a destructor handed on by value where no direct call names the body that
+// takes it: the body is handed it only by a direct call (`owned_params.sysl`).
+private handed_indirectly(w: &MoveWalk, args: Buf[TExpr], what: string,
+                           instead: string = "Call the function by its name, or pass a pointer")
+    for item in args
+        val held = unique_drop_held(w.cx.an, texpr_type(item))
+
+        if held.is_some()
+            not_yet(w, item.span, held.unwrap(), s"this hands '${type_show(texpr_type(item))}' by value to $what",
+                    instead)
+            return
+end handed_indirectly
+
+// A `@unique` value with a destructor held by value in a type the library declares, whose members a
+// later stage checks at each instance.
+private library_holder(w: &MoveWalk, e: TExpr)
+    val ty = texpr_type(e)
+
+    if !library_instance(ty) then return
+
+    val held = unique_drop_held(w.cx.an, ty)
+
+    if held.is_some()
+        not_yet(w, e.span, held.unwrap(), s"this makes a '${type_show(ty)}', which holds " +
+                s"'${type_show(held.unwrap())}' by value", "Keep it in a '@unique' struct of your own, or behind a '&T'")
+end library_holder
 
 // Every operand, in order, each handed `into` the node that takes it.
 private flow_all(w: &MoveWalk, es: Buf[TExpr], f: MoveFlow, into: string) -> MoveFlow

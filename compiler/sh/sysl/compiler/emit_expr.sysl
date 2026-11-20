@@ -325,6 +325,15 @@ private gen_expr_kind(e: *Emit, x: TExpr) -> Val = *x.kind match
                              index_list(int(i))))
             acc = r
 
+        if value_drops(e, array_ty)
+            var tys: Buf[Type] = buf()
+
+            for item in elems
+                tys.push(texpr_type(item))
+
+            acc = own_built(e, array_ty, acc, elems, vals, tys)
+        end if
+
         acc
 
     // **Every element is a copy of one evaluation**, so the value is generated once, above the loop
@@ -1396,6 +1405,9 @@ private gen_enum_new(e: *Emit, at: Span, enum_ty: Type, variant: EnumVariant, ar
     val made = enum_value(e, enum_ty, d, variant, vals)
 
     note_parts(e, at, made, vals)
+
+    if value_drops(e, enum_ty) then return own_built(e, enum_ty, made, args, vals, field_types(variant.fields))
+
     made
 end gen_enum_new
 
@@ -1448,6 +1460,9 @@ private gen_struct_new(e: *Emit, at: Span, decl: &StructType, args: Buf[TExpr]) 
             end if
 
     note_parts(e, at, acc, vals)
+
+    if value_drops(e, Struct(decl)) then return own_built(e, Struct(decl), acc, args, vals, field_types(decl.fields))
+
     acc
 end gen_struct_new
 
@@ -1796,7 +1811,9 @@ private guaranteed_arg(e: *Emit, a: TExpr, callee: string, written: Set[string],
     val ty = texpr_type(a)
     val big = e.layout.indirect(ty) || lent
     val still = held_unless(e, a, written) || (big || contains_counted(ty)) && lends_in_place(e, callee, ty)
-    val guarantee = contains_counted(ty) && !still
+    // A `@unique` value with a destructor has one owner, so no count of the caller's can stand for
+    // it: a reading receiver is lent as it lies (`emit_unique.sysl`).
+    val guarantee = contains_counted(ty) && !still && !value_drops(e, ty)
 
     if borrows && !big && lent_view(e, a, callee, written) then return gen_lent_view(e, a, callee, written)
 

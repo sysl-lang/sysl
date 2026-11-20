@@ -245,12 +245,18 @@ note_parts(e: *Emit, at: Span, made: Val, vals: Buf[Val])
 // The count a destination of type `ty` needs for `v`, the value of `x`: taken over where `x` is
 // something this frame was going to give back, and retained otherwise. A destination that may be
 // gone before the scope ends is not `lasting`, and takes no local whose release runs a destructor.
+//
+// **A `@unique` local's moves are not optional** (`emit_unique.sysl`): a value whose release runs a
+// destructor on it is never copied, so whatever it came from always hands it over, last use or not.
 retain_moving(e: *Emit, x: TExpr, ty: Type, v: Val, lasting: bool = true)
-    if e.moves.ready && !e.layout.indirect(ty) && texpr_type(x) == ty then take_over(e, x, ty, v, lasting)
+    if value_drops(e, ty) then take_unique(e, x, ty, v)
+    else if e.moves.ready && !e.layout.indirect(ty) && texpr_type(x) == ty then take_over(e, x, ty, v, lasting)
     else retain_value(e, ty, v)
 end retain_moving
 
-// The same for a store, whose value `gen_write` named before the store was emitted.
+// The same for a store, whose value `gen_write` named before the store was emitted. A `@unique` value
+// with no source named was made a temporary of the statement where it was worked out
+// (`gen_multi_assign`), and is taken from there.
 retain_stored(e: *Emit, ty: Type, v: Val)
     val from = e.moves.source
 
@@ -258,7 +264,10 @@ retain_stored(e: *Emit, ty: Type, v: Val)
 
     from match
         Some(x) -> retain_moving(e, x, ty, v)
-        None -> retain_value(e, ty, v)
+        None ->
+            if value_drops(e, ty)
+                if !forget_unique_temp(e, v, ty) then refuse_copy(e, ty)
+            else retain_value(e, ty, v)
 end retain_stored
 
 // **Nothing at all to take over is one copy**, through the type's own helper, so a value built only
