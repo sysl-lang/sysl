@@ -295,7 +295,9 @@ private note_tag_test(e: *Emit, ty: Type)
     if value_drops(e, ty) then return
 
     val test = underlying(ty) match
-        Enum(d) -> tag_test(d)
+        Enum(d) ->
+            if null_niche(d) && tag_test(d).is_some() then Some(TagNonNull(payload_area(d, e.layout).0))
+            else tag_test(d)
         _ -> None
 
     if test.is_none() then return
@@ -440,6 +442,10 @@ private empties(e: *Emit, payload: Type) -> Option[Buf[Val]]
         _ -> None
 end empties
 
+// The tag of the enum a box of `payload` holds, read into `tag`.
+private boxed_tag(e: *Emit, payload: Type, bn: LType, tag: Val) =
+    enum_tag_load(e, enum_decl(payload).unwrap(), tag, header_word(e, bn, box_payload_field(e, payload)))
+
 // The body of `arc.push.<T>`. At zero, **a box whose storage this module's own hook for `T` gives
 // back, that no weak reference holds, and that holds nothing counted, is freed on the spot**: tearing
 // it down through the drain would call that hook to walk nothing and then again to free exactly this.
@@ -499,7 +505,7 @@ private gen_push(e: *Emit, payload: Type, queued: bool = true)
         val tag = fresh_reg(e)
         var empty = VInt(from_int(0))
 
-        emit(e, InLoad(tag, l_i32(), header_word(e, bn, box_payload_field(e, payload)), AccPlain, None))
+        boxed_tag(e, payload, bn, tag)
 
         for t in tags
             val is = fresh_reg(e)
@@ -710,7 +716,7 @@ private gen_compact_push(e: *Emit, payload: Type)
                 val tag = fresh_reg(e)
                 var empty = VInt(from_int(0))
 
-                emit(e, InLoad(tag, l_i32(), header_word(e, bn, box_payload_field(e, payload)), AccPlain, None))
+                boxed_tag(e, payload, bn, tag)
 
                 for t in listed
                     val is = fresh_reg(e)
@@ -839,7 +845,7 @@ private walk_value_parts(e: *Emit, ty: Type, v: Val, retain: bool) = underlying(
     Enum(d) ->
         val tag = fresh_reg(e)
 
-        emit(e, InExtract(tag, enum_lty(d), v, index_list(0)))
+        enum_tag_into(e, d, tag, v)
         arc_enum(e, d, tag, v, VNothing, retain, false)
 
     _ -> ()
@@ -860,7 +866,7 @@ private walk_slot_parts(e: *Emit, ty: Type, p: Val, retain: bool) = underlying(t
     Enum(d) ->
         val tag = fresh_reg(e)
 
-        emit(e, InLoad(tag, l_i32(), p, AccPlain, None))
+        enum_tag_load(e, d, tag, p)
         arc_enum(e, d, tag, VNothing, p, retain, true)
 
     _ -> ()
@@ -1812,7 +1818,7 @@ private failure_run(e: *Emit, exit: ExitMode, run: Buf[TStmt])
             val run_l = fresh_label(e, "errdefer.run")
             val past_l = fresh_label(e, "errdefer.past")
 
-            emit(e, InExtract(tag, enum_lty(d.unwrap()), v, index_list(0)))
+            enum_tag_into(e, d.unwrap(), tag, v)
             emit(e, InIntCmp(failed, IEq, l_i32(), tag, VInt(parts.unwrap().1.tag)))
             emit_term(e, InCondBr(failed, run_l, past_l))
             emit_label(e, run_l)

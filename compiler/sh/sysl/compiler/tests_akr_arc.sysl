@@ -237,9 +237,9 @@ akr_copying_an_aggregate_shares_its_references()
     akr_has(out, "define private void @arc.copy.Node(%struct.Node %v) {")
     akr_has(out, "call void @arc.copy.sysl$Option.ref.Node(%enum.sysl$Option.ref.Node %t1)")
 
-// The tag is read straight off the value, being the aggregate's own first member; the payload shares
-// one region with every other variant, so reaching it is a store and a load back at this variant's
-// type (`reference/types.md § Enums`).
+// An `Option` of a reference has a null niche, so its tag is read as whether the address is null and
+// numbered as the variant it picks; the payload is the region itself, so reaching it is a store and a
+// load back at this variant's type (`reference/memory.md § An Option of a reference is one word`).
 @test("a data enum walks only the variants that carry a reference, behind a tag test")
 akr_a_data_enum_walks_behind_a_tag_test()
     if akr_no_library() then return
@@ -247,10 +247,11 @@ akr_a_data_enum_walks_behind_a_tag_test()
     val out = akr_ir(akr_linked() + "var n: &Node = Node(1, None)\nvar o: Option[&Node] = Some(n)\n\no = None\n")
 
     akr_has(out, "define private void @arc.dispose.sysl$Option.ref.Node(%enum.sysl$Option.ref.Node %v) {")
-    akr_has(out, "  %t1 = extractvalue %enum.sysl$Option.ref.Node %v, 0\n  %t2 = icmp eq i32 %t1, 1\n")
-    akr_has(out, "  %t4 = getelementptr %enum.sysl$Option.ref.Node, ptr %t3, i32 0, i32 1\n" +
-                 "  %t5 = load %sysl$Option.ref.Node.Some, ptr %t4\n")
-    akr_has(out, "  %t6 = extractvalue %sysl$Option.ref.Node.Some %t5, 0\n  call void @arc.release.Node(ptr %t6)\n")
+    akr_has(out, "  %t2 = extractvalue %enum.sysl$Option.ref.Node %v, 0, 0\n  %t3 = icmp ne i64 %t2, 0\n" +
+                 "  %t1 = select i1 %t3, i32 1, i32 0\n  %t4 = icmp eq i32 %t1, 1\n")
+    akr_has(out, "  %t6 = getelementptr %enum.sysl$Option.ref.Node, ptr %t5, i32 0, i32 0\n" +
+                 "  %t7 = load %sysl$Option.ref.Node.Some, ptr %t6\n")
+    akr_has(out, "  %t8 = extractvalue %sysl$Option.ref.Node.Some %t7, 0\n  call void @arc.release.Node(ptr %t8)\n")
 
 @test("an ordinary reference counts with a plain load and store")
 akr_an_ordinary_reference_counts_plainly()

@@ -424,7 +424,7 @@ end variant_gaps
 
 // A data enum: the tag, and the payload region where the layout puts it.
 enum_gaps(l: TargetLayout, d: &EnumType) -> Option[Gaps]
-    if d.simple || !l.enum_holds_raised(d) then return None
+    if d.simple || null_niche(d) || !l.enum_holds_raised(d) then return None
 
     val unit = l.payload_align(d)
     var offsets: Buf[usize] = buf()
@@ -526,8 +526,10 @@ end stored_to_declared
 // The index of a variant payload's `k`th stored field.
 variant_field_index(l: TargetLayout, v: EnumVariant, k: usize) -> int = llvm_index(variant_gaps(l, v), k)
 
-// The index of a data enum's payload region, behind its tag.
-enum_payload_index(l: TargetLayout, d: &EnumType) -> int = llvm_index(enum_gaps(l, d), 1)
+// The index of a data enum's payload region, behind its tag -- or first, where a null niche means
+// there is no tag.
+enum_payload_index(l: TargetLayout, d: &EnumType) -> int =
+    if null_niche(d) then 0 else llvm_index(enum_gaps(l, d), 1)
 
 // A data enum's definitions: one aggregate per variant that carries something, and then the enum
 // itself.
@@ -560,7 +562,8 @@ enum_type_defs(d: &EnumType, l: TargetLayout) -> Buf[IrTypeDef]
     val area = payload_area(d, l)
     var body: Buf[LType] = buf()
 
-    body.push(LInt(32))
+    if !null_niche(d) then body.push(LInt(32))
+
     body.push(LArr(area.1, area.0))
 
     val laid = enum_gaps(l, d) match

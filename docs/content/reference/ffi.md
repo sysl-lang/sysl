@@ -455,6 +455,51 @@ lays it out in is marked [`@pinned`](/reference/attributes/#pinned-on-a-struct-a
 kept in module storage or a `&T` box, and passed to C as `&fs`. The compiler then refuses every copy of
 it.
 
+### A nullable pointer is a plain `*T`
+
+**A pointer C may make null is a `*T`, compared with `null`.** An `Option[*T]` keeps a tag beside the
+address so that `Some(null)` stays apart from `None`
+([`memory.md`](memory.md#an-option-of-a-reference-is-one-word)), so it is not the `T *` C declares,
+and an `extern` or `@export` that names one is refused rather than read wrong:
+
+```sysl
+extern strchr(s: *u8, c: i32) -> Option[*u8]
+```
+
+```error
+A pointer C may make null is a plain '*byte', compared with 'null'
+```
+
+```sysl
+import sysl.text.cstring
+
+extern strchr(s: *u8, c: i32) -> *u8
+
+val text = cstring("hello")
+
+for c in ['l', 'z']
+    val at = strchr(text.ptr, i32(c))
+
+    if at == null
+        print("absent")
+    else
+        print(at - text.ptr)
+```
+
+```output
+2
+absent
+```
+
+The same holds for a `*extern` function pointer: a callback C may leave unset is a plain one,
+compared with `null`.
+
+**An `Option[&T]` is one word, with `None` as null**, so an `extern` takes or answers one wherever
+it takes or answers a bare `&T` — the very address the bare `&T` hands over, and `NULL` for `None` —
+under the same promise a `&T` handed to C already makes: the counted box is a sysl layout C has no
+notion of, and a C struct reads an object only through [`into_raw`](#handing-c-an-object-to-hold). An `@export` taking or answering one is refused, as one
+taking a bare `&T` is: a counted reference is not something C may hold.
+
 ### Handing C an object to hold
 
 A C API that hands out a handle — `db_open` answering a `Db *` that the caller passes back to every
