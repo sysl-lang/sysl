@@ -1827,6 +1827,11 @@ print(halves())
   own locals, a nested block's and its temporaries are refused (Rust's `'env` against `'scope`). A
   helper handed `s`, and a wrapper forwarding to `spawn`, are held the same way. A scope nested in the
   body may borrow the outer body's locals.
+- **Every road to the scope is held the same way**: a closure the body builds and hands on — to a
+  loop's helper, two closures deep, or bound to a local first — and a body handed to a helper along
+  with `s` lend what they capture to `s` itself, so the body's locals are refused there too. A closure
+  handed to `scope` or `scope_in`, or to a wrapper of them, is lent a scope that call makes in its own
+  frame and joins before it returns, so it may borrow the frame that wrote it.
 - **A fan-out needs no joining loop**: whatever the body leaves unjoined, the scope joins. A handle's
   `join` answers what its closure answered, and `scope` what its body answered. A function handed the
   `*Scope` may start threads with its own caller's storage; one opening a scope of its own keeps
@@ -1856,6 +1861,28 @@ print(halves())
 
 ```error
 '() -> all[0] = 1' holds a view of 'v', a local of 'call' — a thread started on a scope may borrow only storage that outlives the 'scope' call, and 'v' does not; declare 'v' before 'scope'
+```
+
+A closure the body hands on starts its threads on the same scope:
+
+```sysl
+import sysl.threads.scope
+
+each(xs: []int, f: &Fn(int) -> ()) = for x in xs do f(x)
+
+halves() -> int
+    scope((s) ->
+        var v = [0; 8]
+        val all = v[..]
+
+        each([1, 2], (i) -> s.spawn(() -> all[i] = i))
+        v[1])
+
+print(halves())
+```
+
+```error
+a closure lets its capture 'all' outlive the call (it is passed to 'spawn', where the scope that lent it holds it until the 'scope' call returns), and 'all' holds a view of 'v', a local of 'call' — a thread started on a scope may borrow only storage that outlives the 'scope' call, and 'v' does not; declare 'v' before 'scope'
 ```
 
 ## A destructor
