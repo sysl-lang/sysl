@@ -104,6 +104,40 @@ dml_present_when_asked_for()
 
     assert_eq(dml_names(ms[0].symbols), dml_strs(["helper"]))
 
+@test("an impl of a private type is absent, since it lists members of a type no reader can name")
+dml_an_impl_of_a_private_type_is_absent()
+    val m = dml_only("module m\n\nprivate struct Hidden\n    n: int\n\nimpl Hidden\n    get(self) -> int = self.n\n\n" +
+        "impl Eq for Hidden\n    eq(self, o: Hidden) -> bool = self.n == o.n\n\n" +
+        "struct Shown\n    n: int\n\nimpl Shown\n    get(self) -> int = self.n\n")
+
+    assert_eq(dml_names(m.of(DocKind.DkImplementation)), dml_strs(["Shown"]))
+    assert_eq(dml_names(m.of(DocKind.DkType)), dml_strs(["Shown"]))
+
+@test("and it takes its type's visibility: module-wide, generic, in another of the module's files")
+dml_an_impl_takes_its_types_visibility()
+    val m = dml_named(["a.sysl", "module m\n\nprivate[m] struct Box[T]\n    v: T\n\nprivate[m] enum Mode\n    On\n    Off\n",
+        "b.sysl", "module m\n\nimpl[T] Box[T]\n    get(self) -> T = self.v\n\nimpl Mode\n    on(self) -> bool = self == Mode.On\n\n" +
+        "impl Display for Mode\n    fmt(self, w: &Writer) = ()\n"])
+
+    assert(m.of(DocKind.DkImplementation).is_empty())
+
+    // A maintainer's page lists them, marked as the type is.
+    var us: Buf[Program] = buf()
+
+    us.push(dml_unit("t.sysl", "module m\n\nprivate struct Hidden\n    n: int\n\nimpl Hidden\n    get(self) -> int = self.n\n"))
+
+    val all = build_doc_modules(us, true)[0].of(DocKind.DkImplementation)
+
+    assert_eq(dml_names(all), dml_strs(["Hidden"]))
+    assert(all[0].access == DocAccess.DaFile)
+end dml_an_impl_takes_its_types_visibility
+
+@test("an impl for a type declared elsewhere stays public, its own module deciding what is shown")
+dml_an_impl_for_a_foreign_type_stays_public()
+    val m = dml_only("module m\n\nimpl Display for Other\n    fmt(self, w: &Writer) = ()\n")
+
+    assert_eq(dml_names(m.of(DocKind.DkImplementation)), dml_strs(["Display for Other"]))
+
 @test("a module's files are merged, and symbols sort by name rather than by file order")
 dml_files_merged_sorted_by_name()
     var us: Buf[Program] = buf()

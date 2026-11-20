@@ -39,11 +39,11 @@ allocation per operation. A program doing this in a loop is doing something a bi
 is not the fastest way to do.
 
 **Each operation picks a published algorithm by the size of its operands**: schoolbook,
-Karatsuba and Toom-3 multiplication (`multiply.sysl`), Knuth's algorithm D and Burnikel and
-Ziegler's recursive division (`divide.sysl`, `recursive.sysl`), divide-and-conquer conversion to
-and from text (`text.sysl`), and Lehmer's gcd (`theory.sysl`) with Möller's half-gcd above it
-(`half_gcd.sysl`), all over the limb loops in `kernels.sysl`. None changes an answer. Nothing is FFT-based, so far past ten thousand limbs a
-library with a Schönhage-Strassen multiply is the faster.
+Karatsuba and Toom-3 multiplication (`multiply.sysl`) and a number-theoretic transform for the
+largest products (`fft.sysl`), Knuth's algorithm D and Burnikel and Ziegler's recursive division
+(`divide.sysl`, `recursive.sysl`), divide-and-conquer conversion to and from text (`text.sysl`),
+and Lehmer's gcd (`theory.sysl`), all over the limb loops in `kernels.sysl`. None changes an
+answer.
 
 ## The bit operations, and the reading they settled on
 
@@ -67,7 +67,7 @@ here needs one, and a wrong answer from a primality test is the expensive kind.
 
 ## Index
 
-[`abs`](#abs) [`add`](#add) [`add_long`](#add_long) [`and`](#and) [`bit_length`](#bit_length) [`cmp`](#cmp) [`cmp_long`](#cmp_long) [`div`](#div) [`div_floor`](#div_floor) [`div_rem`](#div_rem) [`div_rem_floor`](#div_rem_floor) [`div_rem_long`](#div_rem_long) [`fits_long`](#fits_long) [`from_int`](#from_int) [`from_real`](#from_real) [`from_u64`](#from_u64) [`gcd`](#gcd) [`gcd_ext`](#gcd_ext) [`is_even`](#is_even) [`is_odd`](#is_odd) [`isqrt`](#isqrt) [`lcm`](#lcm) [`mod_floor`](#mod_floor) [`mod_inverse`](#mod_inverse) [`mod_pow`](#mod_pow) [`mul`](#mul) [`mul_long`](#mul_long) [`negate`](#negate) [`not`](#not) [`one`](#one) [`or`](#or) [`parse`](#parse) [`parse_radix`](#parse_radix) [`pow`](#pow) [`rem`](#rem) [`shl`](#shl) [`shr`](#shr) [`sub`](#sub) [`sub_long`](#sub_long) [`test_bit`](#test_bit) [`to_real`](#to_real) [`to_string`](#to_string) [`to_string_radix`](#to_string_radix) [`to_u64`](#to_u64) [`trailing_zeros`](#trailing_zeros) [`xor`](#xor) [`zero`](#zero) [`BigInt`](#bigint) [Add for BigInt](#add-for-bigint) [BitAnd for BigInt](#bitand-for-bigint) [BitOr for BigInt](#bitor-for-bigint) [BitXor for BigInt](#bitxor-for-bigint) [Display for BigInt](#display-for-bigint) [Div for BigInt](#div-for-bigint) [Eq for BigInt](#eq-for-bigint) [From for BigInt](#from-for-bigint) [From for BigInt](#from-for-bigint-1) [Hash for BigInt](#hash-for-bigint) [Mul for BigInt](#mul-for-bigint) [Neg for BigInt](#neg-for-bigint) [Not for BigInt](#not-for-bigint) [One for BigInt](#one-for-bigint) [Ord for BigInt](#ord-for-bigint) [Rem for BigInt](#rem-for-bigint) [Shl for BigInt](#shl-for-bigint) [Shr for BigInt](#shr-for-bigint) [Sub for BigInt](#sub-for-bigint) [Zero for BigInt](#zero-for-bigint)
+[`abs`](#abs) [`add`](#add) [`add_long`](#add_long) [`and`](#and) [`bit_length`](#bit_length) [`cmp`](#cmp) [`cmp_long`](#cmp_long) [`div`](#div) [`div_floor`](#div_floor) [`div_rem`](#div_rem) [`div_rem_floor`](#div_rem_floor) [`div_rem_long`](#div_rem_long) [`fits_long`](#fits_long) [`from_int`](#from_int) [`from_real`](#from_real) [`from_u64`](#from_u64) [`gcd`](#gcd) [`is_even`](#is_even) [`is_odd`](#is_odd) [`isqrt`](#isqrt) [`lcm`](#lcm) [`mod_floor`](#mod_floor) [`mod_pow`](#mod_pow) [`mul`](#mul) [`mul_long`](#mul_long) [`negate`](#negate) [`not`](#not) [`one`](#one) [`or`](#or) [`parse`](#parse) [`parse_radix`](#parse_radix) [`pow`](#pow) [`rem`](#rem) [`shl`](#shl) [`shr`](#shr) [`sub`](#sub) [`sub_long`](#sub_long) [`test_bit`](#test_bit) [`to_real`](#to_real) [`to_string`](#to_string) [`to_string_radix`](#to_string_radix) [`to_u64`](#to_u64) [`trailing_zeros`](#trailing_zeros) [`xor`](#xor) [`zero`](#zero) [`BigInt`](#bigint) [Add for BigInt](#add-for-bigint) [BitAnd for BigInt](#bitand-for-bigint) [BitOr for BigInt](#bitor-for-bigint) [BitXor for BigInt](#bitxor-for-bigint) [Display for BigInt](#display-for-bigint) [Div for BigInt](#div-for-bigint) [Eq for BigInt](#eq-for-bigint) [From for BigInt](#from-for-bigint) [From for BigInt](#from-for-bigint-1) [Hash for BigInt](#hash-for-bigint) [Mul for BigInt](#mul-for-bigint) [Neg for BigInt](#neg-for-bigint) [Not for BigInt](#not-for-bigint) [One for BigInt](#one-for-bigint) [Ord for BigInt](#ord-for-bigint) [Rem for BigInt](#rem-for-bigint) [Shl for BigInt](#shl-for-bigint) [Shr for BigInt](#shr-for-bigint) [Sub for BigInt](#sub-for-bigint) [Zero for BigInt](#zero-for-bigint)
 
 ## Functions
 
@@ -278,36 +278,11 @@ dividing zero, and `gcd(0, 0)` is zero.
 
 **It is Lehmer's form of it** (Knuth, *The Art of Computer Programming* volume 2, §4.5.2,
 algorithm L). Most of Euclid's quotients are small and depend only on the leading bits, so the
-steps are run on the top `2w - 2` bits of the pair in double-width machine arithmetic, recording
-what they did as a two-by-two matrix of cofactors, and the matrix is applied to the whole pair once
--- one pass over the limbs for about a limb of progress, where plain Euclid makes a pass, and an
-allocation, per quotient. (A window of one limb gets half that: Knuth's test stops the cofactors
-at about the square root of the window.) Where the leading bits cannot decide even one quotient, a full division step is
+steps are run on the top `w - 1` bits of the pair in machine arithmetic, recording what they did as a
+two-by-two matrix of cofactors, and the matrix is applied to the whole pair once -- one pass over
+the limbs for about sixty bits of progress, where plain Euclid makes a pass, and an allocation,
+per quotient. Where the leading bits cannot decide even one quotient, a full division step is
 taken instead. Below two limbs it is plain Euclid in machine words.
-
-**From `gcd_dc_threshold` limbs it is the half-gcd** (`half_gcd.sysl`): the top of the pair is
-reduced recursively and the reduction applied to the whole by multiplication, which makes the cost
-a multiply's times a logarithm rather than quadratic. Lehmer's loop finishes what it leaves.
-
-### `gcd_ext`
-
-```sysl
-gcd_ext(a: BigInt, b: BigInt) -> (BigInt, BigInt, BigInt)
-```
-
-`(g, s, t)` with `g = gcd(a, b)` and `a s + b t = g` -- the extended gcd, Bézout's cofactors:
-`gcd_ext(240, 46)` is `(2, -9, 47)`.
-
-**The cofactors are the smallest pair, and the pair is GMP's** (`mpz_gcdext`), so that two
-implementations agree on more than the gcd: `|s| < |b| / (2g)` and `|t| < |a| / (2g)`, which
-between them leave one pair. Where those bounds leave none, the answer is the one the definition
-forces: `|a| == |b|` gives `s = 0`, `t = sign(b)`; `b` of zero gives `s = sign(a)`, `t = 0`; `a`
-of zero gives `s = 0`, `t = sign(b)`; `|b| == 2g` gives `s = sign(a)`. `gcd_ext(0, 0)` is
-`(0, 0, 0)`.
-
-**It is the same reduction `gcd` is** -- the half-gcd from `gcd_dc_threshold` limbs, Lehmer's
-matrices below it -- with `s` carried through every matrix the reduction applies, and `t` found
-once at the end as `(g - a s) / b`, one exact division, rather than carried as well.
 
 ### `is_even`
 
@@ -367,21 +342,6 @@ mod_floor(a: BigInt, b: BigInt) -> BigInt
 
 `a` modulo `b`, taking the divisor's sign: `mod_floor(-7, 2)` is `1`.
 
-### `mod_inverse`
-
-```sysl
-mod_inverse(a: BigInt, m: BigInt) -> Option[BigInt]
-```
-
-`a`'s inverse modulo `m` -- the `x` with `a x` congruent to 1 -- or `None` where `a` and `m` share
-a factor and there is none: `mod_inverse(3, 7)` is `Some(5)`, `mod_inverse(2, 4)` is `None`.
-
-**The answer takes the modulus's sign**, as `mod_pow`'s does: it lands in `0..<m` for a positive
-`m`. Modulo 1 everything is congruent to everything, and the answer is `Some(0)`. A zero modulus
-traps, as `mod_pow`'s does.
-
-It is `gcd_ext`'s reduction, carrying only the one cofactor it needs.
-
 ### `mod_pow`
 
 ```sysl
@@ -411,7 +371,8 @@ function rather than a flag on this one -- saying which one a caller got is the 
 mul(a: BigInt, b: BigInt) -> BigInt
 ```
 
-`a * b`, schoolbook. Allocates.
+`a * b`. Allocates. The algorithm is chosen by size -- schoolbook, Karatsuba, Toom-3, or a
+number-theoretic transform for the largest.
 
 The sign is the sign of the product and the magnitudes multiply, with the one special case every
 sign-and-magnitude implementation has: a zero result must not be negative, and here it cannot be,
