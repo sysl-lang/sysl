@@ -767,6 +767,14 @@ emit_llvm_text(path: string, named_target: Option[string],
     phase_done("std")
     forget_field_paths(done.an)
 
+    // **The text a `@stack(n)` is checked against holds every body the build reaches** -- the
+    // library's too, which the lowering below only declares where the artifact has them. Where it does,
+    // that text is lowered here, BEFORE it: a compact lowering leaves each function it has printed
+    // without its body, so nothing could be lowered from the program after it (`stack_bound.sysl`).
+    val nothing_precompiled = linked.precompiled.is_empty() && roots.precompiled.is_empty()
+    val stack_text = if nothing_precompiled || !stack_marked(kept) then None
+    else Some(ir_print_module(codegen_with_gaps(kept with { precompiled = buf() }, t, promotions).0))
+
     // **A build that links and optimizes also carries a copy of each small or `@inline` function
     // those halves define** (`codegen.sysl`'s `importable`), so that a call into a package inlines as
     // a call within the program does. The text `emit-llvm` prints has none, and nor does `-O0`.
@@ -788,7 +796,7 @@ emit_llvm_text(path: string, named_target: Option[string],
 
     // **And a function marked `@stack(n)` is held to it**, against the frames the back end lays out
     // (`stack_bound.sysl`). The text is reused where it already holds the library's bodies.
-    val whole_text = if linked.precompiled.is_empty() && roots.precompiled.is_empty() then Some(text) else None
+    val whole_text = if nothing_precompiled then Some(text) else stack_text
 
     check_stack_bounds(done.an, kept, t, level, promotions, whole_text)
 
