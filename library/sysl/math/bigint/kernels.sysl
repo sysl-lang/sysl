@@ -11,8 +11,24 @@ module sysl.math.bigint
 // They are the same seven GMP's `mpn` layer is built on (`add_n`, `sub_n`, `mul_1`, `addmul_1`,
 // `submul_1`, `lshift`, `rshift`), and they answer the carry or borrow out of the top instead of
 // writing it, which is what lets a caller decide whether there is a limb for it.
+//
+// **On AArch64 the five carrying loops are assembly** (the `*_asm` functions below), and every other
+// processor runs the portable loops. The reason is one the back end cannot be talked out of: LLVM
+// keeps a carry in the flags only inside one basic block, so across a loop's back edge it always
+// moves the carry out to a register and back in again, and that round trip is the whole difference
+// from GMP's assembly. Measured on an M4 at a thousand limbs: `add_n` 0.41 ns a limb portable, 0.23
+// in assembly and in GMP; `mul_1` 0.41 against 0.24. The portable loops stay as the reference the
+// assembly is tested against (`add_n_portable` and its four siblings).
 
-/** `r[0..<n] = a[0..<n] + b[0..<n]`, answering the carry out (0 or 1). `r` may be `a` or `b`.
+/** `r[0..<n] = a[0..<n] + b[0..<n]`, answering the carry out (0 or 1). `r` may be `a` or `b`. */
+private[bigint] add_n(r: []Limb, a: []const Limb, b: []const Limb, n: usize) -> Limb
+#if aarch64
+    if n == 0 then 0 else add_n_asm(r, a, b, n)
+#else
+    add_n_portable(r, a, b, n)
+#endif
+
+/** The loop `add_n` runs on every processor without an assembly form.
  *
  * **Written with the two limbs' sum first and the carry added to it second**, each overflow read off
  * as a comparison, rather than as one double-width sum. The two say the same thing, but in this
@@ -22,7 +38,7 @@ module sysl.math.bigint
  * M4, in C through the same back end: the double-width loop 0.78 ns a limb, this order 0.54, this
  * order four at a time 0.41, GMP's assembly 0.25.)
  */
-private[bigint] add_n(r: []Limb, a: []const Limb, b: []const Limb, n: usize) -> Limb
+private[bigint] add_n_portable(r: []Limb, a: []const Limb, b: []const Limb, n: usize) -> Limb
     var carry: Limb = 0
     var i: usize = 0
 
@@ -38,7 +54,7 @@ private[bigint] add_n(r: []Limb, a: []const Limb, b: []const Limb, n: usize) -> 
         i += 1
 
     carry
-end add_n
+end add_n_portable
 
 /** One limb of `add_n`: `r[i] = a[i] + b[i] + carry`, answering the carry out. */
 private add_step(r: []Limb, a: []const Limb, b: []const Limb, i: usize, carry: Limb) -> Limb
@@ -69,12 +85,20 @@ private[bigint] add_1(r: []Limb, a: []const Limb, n: usize, c: Limb) -> Limb
     Limb(carry)
 end add_1
 
-/** `r[0..<n] = a[0..<n] - b[0..<n]`, answering the borrow out (0 or 1). `r` may be `a` or `b`.
- *
- * The mirror of `add_n`, in the same order for the same reason: a difference that goes below zero
- * wraps, and the wrap is what the comparison reads as a borrow.
- */
+/** `r[0..<n] = a[0..<n] - b[0..<n]`, answering the borrow out (0 or 1). `r` may be `a` or `b`. */
 private[bigint] sub_n(r: []Limb, a: []const Limb, b: []const Limb, n: usize) -> Limb
+#if aarch64
+    if n == 0 then 0 else sub_n_asm(r, a, b, n)
+#else
+    sub_n_portable(r, a, b, n)
+#endif
+
+/** The loop `sub_n` runs on every processor without an assembly form.
+ *
+ * The mirror of `add_n_portable`, in the same order for the same reason: a difference that goes
+ * below zero wraps, and the wrap is what the comparison reads as a borrow.
+ */
+private[bigint] sub_n_portable(r: []Limb, a: []const Limb, b: []const Limb, n: usize) -> Limb
     var borrow: Limb = 0
     var i: usize = 0
 
@@ -90,7 +114,7 @@ private[bigint] sub_n(r: []Limb, a: []const Limb, b: []const Limb, n: usize) -> 
         i += 1
 
     borrow
-end sub_n
+end sub_n_portable
 
 /** One limb of `sub_n`: `r[i] = a[i] - b[i] - borrow`, answering the borrow out. */
 private sub_step(r: []Limb, a: []const Limb, b: []const Limb, i: usize, borrow: Limb) -> Limb
@@ -118,7 +142,15 @@ private[bigint] sub_1(r: []Limb, a: []const Limb, n: usize, c: Limb) -> Limb
     Limb(borrow)
 end sub_1
 
-/** `r[0..<n] = a[0..<n] * m + c`, answering the limb that carries out of the top. `r` may be `a`.
+/** `r[0..<n] = a[0..<n] * m + c`, answering the limb that carries out of the top. `r` may be `a`. */
+private[bigint] mul_1(r: []Limb, a: []const Limb, n: usize, m: Limb, c: Limb = 0) -> Limb
+#if aarch64
+    if n == 0 then c else mul_1_asm(r, a, n, m, c)
+#else
+    mul_1_portable(r, a, n, m, c)
+#endif
+
+/** The loop `mul_1` runs on every processor without an assembly form.
  *
  * This and the two below split the product into its halves and add to the LOW half as a limb, the
  * overflow read off as a comparison, for the reason `add_n` gives: the product does not wait for the
@@ -126,7 +158,7 @@ end sub_1
  * measured 22% faster on an M4 than one carry of a limb. The high half plus the overflows cannot
  * itself overflow: a product's high half is at most `2^w - 2`.
  */
-private[bigint] mul_1(r: []Limb, a: []const Limb, n: usize, m: Limb, c: Limb = 0) -> Limb
+private[bigint] mul_1_portable(r: []Limb, a: []const Limb, n: usize, m: Limb, c: Limb) -> Limb
     val mw = Wide(m)
 
     // The previous product's high half and the one-bit carry ride separately, so that each limb is
@@ -147,7 +179,7 @@ private[bigint] mul_1(r: []Limb, a: []const Limb, n: usize, m: Limb, c: Limb = 0
         i += 1
 
     hi + cf
-end mul_1
+end mul_1_portable
 
 /** One limb of `mul_1`: `r[i]` is the low half of `a[i] m` plus the high half before it plus the
  * carry, answering this limb's high half and the carry out.
@@ -166,11 +198,20 @@ end mul_step
 
 /** `r[0..<n] += a[0..<n] * m`, answering the limb that carries out of the top -- one row of a
  * schoolbook product. One carry, at most a limb: the step's total is at most `2^(2w) - 1`.
+ */
+private[bigint] addmul_1(r: []Limb, a: []const Limb, n: usize, m: Limb) -> Limb
+#if aarch64
+    if n == 0 then 0 else addmul_1_asm(r, a, n, m)
+#else
+    addmul_1_portable(r, a, n, m)
+#endif
+
+/** The loop `addmul_1` runs on every processor without an assembly form.
  *
  * (Unlike `mul_1`, splitting this into two one-bit chains four limbs at a time measured SLOWER --
  * 30-limb products 47% slower on an M4 -- so it stays a single chain.)
  */
-private[bigint] addmul_1(r: []Limb, a: []const Limb, n: usize, m: Limb) -> Limb
+private[bigint] addmul_1_portable(r: []Limb, a: []const Limb, n: usize, m: Limb) -> Limb
     val mw = Wide(m)
     var carry: Limb = 0
 
@@ -185,13 +226,23 @@ private[bigint] addmul_1(r: []Limb, a: []const Limb, n: usize, m: Limb) -> Limb
             carry = Limb(p >> limb_bits) + Limb(s1 < lo) + Limb(s < s1)
 
     carry
-end addmul_1
+end addmul_1_portable
 
 /** `r[0..<n] -= a[0..<n] * m`, answering what has to be taken from the limb above -- the
- * multiply-and-subtract step of a long division. The product's high half and the two borrows are
- * carried together, which is at most `m` and so never more than a limb's worth.
+ * multiply-and-subtract step of a long division. The borrow out is at most `m`, so never more than
+ * a limb's worth.
  */
 private[bigint] submul_1(r: []Limb, a: []const Limb, n: usize, m: Limb) -> Limb
+#if aarch64
+    if n == 0 then 0 else submul_1_asm(r, a, n, m)
+#else
+    submul_1_portable(r, a, n, m)
+#endif
+
+/** The loop `submul_1` runs on every processor without an assembly form. The product's high half
+ * and the two borrows are carried together.
+ */
+private[bigint] submul_1_portable(r: []Limb, a: []const Limb, n: usize, m: Limb) -> Limb
     val mw = Wide(m)
     var carry: Limb = 0
 
@@ -207,7 +258,7 @@ private[bigint] submul_1(r: []Limb, a: []const Limb, n: usize, m: Limb) -> Limb
             carry = Limb(p >> limb_bits) + Limb(d1 > x) + Limb(d > d1)
 
     carry
-end submul_1
+end submul_1_portable
 
 /** `r[0..<n] = a[0..<n] << s` for `0 < s < limb_bits`, answering the bits shifted out of the top.
  * Runs from the top down, so `r` may be `a`.
