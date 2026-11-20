@@ -110,7 +110,7 @@ private gen_block_into(e: *Emit, b: TBlock, dest: Val, inherit: Buf[(Val, Type)]
     push_temps(e)
     push_owned(e)
     inherit_slots(e, inherit)
-    gen_stmts_with(e, b.stmts, lasts.0, lasts.2)
+    gen_stmts_with(e, b.stmts, lasts.0, lasts.2, b.result)
     e.moves.last_uses = lasts.1
     e.moves.dying = dying_for(b.result.unwrap(), lasts.3)
     gen_into(e, dest, b.result.unwrap())
@@ -868,7 +868,7 @@ gen_block_void(e: *Emit, b: TBlock, inherit: Buf[(Val, Type)] = buf())
     push_temps(e)
     push_owned(e)
     inherit_slots(e, inherit)
-    gen_stmts_with(e, b.stmts, lasts.0, lasts.2)
+    gen_stmts_with(e, b.stmts, lasts.0, lasts.2, b.result)
     e.moves.last_uses = lasts.1
 
     b.result match
@@ -894,7 +894,7 @@ gen_block_value(e: *Emit, b: TBlock, inherit: Buf[(Val, Type)] = buf()) -> Val
     push_temps(e)
     push_owned(e)
     inherit_slots(e, inherit)
-    gen_stmts_with(e, b.stmts, lasts.0, lasts.2)
+    gen_stmts_with(e, b.stmts, lasts.0, lasts.2, b.result)
     e.moves.last_uses = lasts.1
 
     val v = b.result match
@@ -921,7 +921,11 @@ gen_stmts(e: *Emit, xs: Buf[TStmt]) = gen_stmts_with(e, xs, buf())
 // The same, each statement told which locals it uses for the last time (`emit_moves.sysl`); a list
 // shorter than the block tells the rest that none are. Whatever the enclosing statement was told is
 // put back afterwards, since its own destination is reached only once this block is done.
-gen_stmts_with(e: *Emit, xs: Buf[TStmt], lasts: Buf[Set[string]], dying: Buf[Set[string]] = buf())
+//
+// `tail` is the block's value, which follows the last statement: a copy out of storage that the next
+// statement lets go of is drained rather than copied (`slot_drain.sysl`), and that next one may be it.
+gen_stmts_with(e: *Emit, xs: Buf[TStmt], lasts: Buf[Set[string]], dying: Buf[Set[string]] = buf(),
+               tail: Option[TExpr] = None)
     val mark = nowrap_mark(e)
     val was = e.moves.last_uses
     val none: Set[string] = set()
@@ -932,7 +936,16 @@ gen_stmts_with(e: *Emit, xs: Buf[TStmt], lasts: Buf[Set[string]], dying: Buf[Set
         nowrap_before(e, item)
         e.moves.last_uses = if i < lasts.len() then lasts[i] else none
         e.moves.dying = if i < dying.len() then dying_for_stmt(item, dying[i]) else none
+        // A drain is matched by the node it reads, so the one a loop is being emitted for stays set
+        // while its body's own statements are.
+        val outer = e.moves.drain
+
+        drain_plan(e, xs, i, tail) match
+            Some(p) -> e.moves.drain = Some(drain_begin(e, p))
+            None -> ()
+
         gen_stmt(e, item)
+        e.moves.drain = outer
         e.moves.dying = none
         nowrap_after(e, item)
 

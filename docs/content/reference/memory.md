@@ -1636,8 +1636,12 @@ cast, is the raw tier's bargain.
 **A borrowed closure refers to its captures, and a kept closure holds copies.** A closure that is
 returned, stored where it outlives the block, handed to a parameter that keeps it, built in an `async`
 body, or erased into a `&sync Fn` holds a copy of each variable, taken when it is built; otherwise it
-holds each variable by reference, and a write in it is a write to the variable. A reference to a local
-costs a pointer and takes no count, and a borrowed closure handed on as a `&Fn` is built in the frame:
+holds each variable by reference, and a write in it is a write to the variable. A `val` array, struct,
+string or other aggregate is held the same way, by reference where the closure is borrowed, and so is
+one a scoped thread shares with the frame that opened its scope
+([expressions](/reference/expressions/#a-closure-that-does-not-outlive-its-variables-captures-them-by-reference)).
+A reference to a local costs a pointer and takes no count, and a borrowed closure handed on as a `&Fn`
+is built in the frame:
 
 ```sysl
 import sysl.buf.{Buf, buf}

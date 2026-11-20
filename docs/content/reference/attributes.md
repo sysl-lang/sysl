@@ -6464,6 +6464,21 @@ the other. The words are the program's claim, as an `@export`'s symbol is — th
 register being written — but they put the claim at the function, where a reader can check it against
 the code, and they carry it up the call tree to the place that keeps the core still.
 
+**`@pinned(thread)`** is the same claim one level up, and asks nothing of callers: the fiber the body
+runs on is only ever resumed on the thread it began on, so it may hold a count that is not atomic
+across a call that can reach `sysl.fiber.switch`
+([fiber § A count held across a switch is refused](/library/fiber/#a-count-held-across-a-switch-is-refused)).
+`@pinned` takes no other argument:
+
+```sysl
+@pinned(core)
+depth() -> int = 3
+```
+
+```error
+'@pinned' takes no argument but 'thread' — '@pinned' alone says every caller keeps the function on one core, and '@pinned(thread)' that the fiber it runs on is only ever resumed on the thread it began on
+```
+
 The rule is not about storage, so it runs anywhere a `@pinned` function is written:
 
 ```sysl
