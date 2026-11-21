@@ -231,13 +231,38 @@ vpc_nested_function_and_closure_refused()
 
     val closure = vpc_ran(vpc_box() + raw"""
         apply[T, U](b: Box[T]) -> int
-            val f: Box[T] -> Box[U] = x -> x
+            val f: &Fn(Box[T]) -> Box[U] = x -> x
             1
         print(1)
         """)
 
-    assert(closure.index_of("'T' and 'U' are different type parameters").is_some(), closure)
-    assert_eq(vpc_errors(closure), 1, closure)
+    vpc_refused(closure, "this closure should yield Box[U], but its body yields Box[T] — 'T' and 'U' are " +
+                "different type parameters", "main.sysl", 5)
+
+    // The value parameter's twin, which the closure's own position missed as well.
+    val by_value = vpc_ran(raw"""
+        struct Buf[const N: usize]
+            used: usize
+        apply[const N: usize, const M: usize](b: Buf[N]) -> usize
+            val f: &Fn(Buf[N]) -> Buf[M] = x -> x
+            f(b).used
+        print(1)
+        """)
+
+    vpc_refused(by_value, "this closure should yield Buf[M], but its body yields Buf[N] — 'N' and 'M' are " +
+                "different value parameters", "main.sysl", 4)
+
+@test("a closure handed to a generic method inside a generic of the same parameter names is accepted")
+vpc_closure_through_generic_call_accepted()
+    if vpc_skip() then return
+
+    assert_eq(vpc_ran(vpc_box() + raw"""
+        impl[T] Box[T]
+            map[U](self, f: &Fn(T) -> U) -> Box[U] = Box(f(self.v))
+        wrap[T, U](b: Box[T], g: &Fn(T) -> U) -> Box[Box[U]] = b.map(x -> Box(g(x)))
+        swap[U, T](b: Box[U], g: &Fn(U) -> T) -> Box[T] = b.map(g)
+        print(wrap(Box(2), x -> x * 5).v.v, swap(Box(3), x -> x > 2).v)
+        """), "10 true\n")
 
 @test("a generic in a file other than the entry, never called")
 vpc_other_file_refused()
