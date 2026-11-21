@@ -237,7 +237,7 @@ private param_view(r: TExpr, b: Body) -> int = *r.kind match
 // fields and elements of arrays held by value from there. Anything else, -1.
 private through_param(place: TExpr, b: Body) -> int = *place.kind match
     TIndex(r, _, _) -> repr(texpr_type(r)) match
-        Array(_, _) -> through_param(r, b)
+        Array(_, _, _) -> through_param(r, b)
         _ -> param_view(r, b)
     TField(r, _, _) -> if pointee(texpr_type(r)).is_some() then param_view(r, b) else through_param(r, b)
     TDeref(r, _) -> param_view(r, b)
@@ -260,7 +260,7 @@ end write_at
 private own_arg(a: TExpr, b: Body) -> bool = *a.kind match
     TAddrOf(place, _) -> own_place(place, b.locals)
     TSlice(base, _, _, _, _) -> repr(texpr_type(base)) match
-        Array(_, _) -> own_place(base, b.locals)
+        Array(_, _, _) -> own_place(base, b.locals)
         _ -> false
     _ -> false
 
@@ -295,8 +295,8 @@ private lends_nothing(t: Type) -> bool
             Bool -> true
             Unit -> true
             Never -> true
-            Array(_, _) -> true
-            Vector(_, _) -> true
+            Array(_, _, _) -> true
+            Vector(_, _, _) -> true
             Struct(d) -> d.base != TaskBase
             Results(_) -> true
             Enum(_) -> true
@@ -761,7 +761,7 @@ private own_place(place: TExpr, locals: Set[string]) -> bool = *place.kind match
     TLoad(name, _) -> locals.has(name)
     TField(r, _, _) -> own_place(r, locals)
     TIndex(r, _, _) -> repr(texpr_type(r)) match
-        Array(_, _) -> own_place(r, locals)
+        Array(_, _, _) -> own_place(r, locals)
         _ -> false
     _ -> false
 
@@ -1476,8 +1476,8 @@ by_value_parts(t: Type, out: *Buf[Type])
     out.push(u)
 
     u match
-        Array(_, elem) -> by_value_parts(*elem, out)
-        Vector(_, elem) -> by_value_parts(*elem, out)
+        Array(_, elem, _) -> by_value_parts(*elem, out)
+        Vector(_, elem, _) -> by_value_parts(*elem, out)
         Struct(d) ->
             for item in d.fields
                 by_value_parts(item.1, out)
@@ -1673,7 +1673,7 @@ private write_root(place: TExpr) -> Option[Type] = *place.kind match
     TDeref(operand, ty) -> Some(pointee(texpr_type(operand)).unwrap_or(ty))
     TField(r, _, _) -> write_root(r)
     TIndex(r, _, ty) -> repr(texpr_type(r)) match
-        Array(_, _) -> write_root(r)
+        Array(_, _, _) -> write_root(r)
         _ -> Some(element(texpr_type(r)).unwrap_or(ty))
     _ -> None
 
@@ -1720,7 +1720,7 @@ private direct_root(place: TExpr) -> Option[Type] = *place.kind match
         Struct(_) -> direct_root(r)
         _ -> None
     TIndex(r, _, _) -> repr(texpr_type(r)) match
-        Array(_, _) -> direct_root(r)
+        Array(_, _, _) -> direct_root(r)
         _ -> None
     _ -> None
 
@@ -1791,7 +1791,7 @@ private holds_dropping(t: Type, dropping: Buf[Type], seen: *Set[string]) -> bool
     if has_type(dropping, t) then return true
 
     t match
-        Array(_, elem) -> holds_dropping(*elem, dropping, seen)
+        Array(_, elem, _) -> holds_dropping(*elem, dropping, seen)
         Ref(inner, _) -> holds_dropping(*inner, dropping, seen)
         Slice(elem, _) -> holds_dropping(*elem, dropping, seen)
         Constrained(d) -> holds_dropping(d.base, dropping, seen)
@@ -1845,7 +1845,7 @@ private holds_erased(t: Type, seen: *Set[string]) -> bool = t match
     Trait(_, _, _) -> true
     Abstract(_, _) -> true
     Unknown -> true
-    Array(_, elem) -> holds_erased(*elem, seen)
+    Array(_, elem, _) -> holds_erased(*elem, seen)
     Ref(inner, _) -> holds_erased(*inner, seen)
     Slice(elem, _) -> holds_erased(*elem, seen)
     Constrained(d) -> holds_erased(d.base, seen)
@@ -1995,7 +1995,7 @@ end read_by_address
 private viewed_root(out: &NameSink, x: TExpr) = *x.kind match
     TSlice(base, _, _, _, slice_ty) -> repr(slice_ty) match
         Slice(_, false) -> repr(texpr_type(base)) match
-            Array(_, _) -> add_root(out, base)
+            Array(_, _, _) -> add_root(out, base)
             _ -> ()
         _ -> ()
     _ -> ()
@@ -2137,8 +2137,8 @@ private address_free(t: Type) -> bool
             Struct(_) -> true
             Results(_) -> true
             Enum(_) -> true
-            Array(_, _) -> true
-            Vector(_, _) -> true
+            Array(_, _, _) -> true
+            Vector(_, _, _) -> true
             _ -> false
 
         if !ok then return false
@@ -2181,7 +2181,7 @@ private add_root(out: &NameSink, place: TExpr) -> unit = *place.kind match
     TLoad(name, _) -> out.add(name)
     TField(r, _, _) -> add_root(out, r)
     TIndex(r, _, _) -> underlying(texpr_type(r)) match
-        Array(_, _) -> add_root(out, r)
+        Array(_, _, _) -> add_root(out, r)
         _ -> ()
     TLane(r, _, _) -> add_root(out, r)
     _ -> ()
@@ -2629,7 +2629,7 @@ private own_base(place: TExpr, aliases: Set[string]) -> bool = *place.kind match
     TLoad(name, _) -> !aliases.has(name)
     TField(r, _, _) -> own_base(r, aliases)
     TIndex(r, _, _) -> repr(texpr_type(r)) match
-        Array(_, _) -> own_base(r, aliases)
+        Array(_, _, _) -> own_base(r, aliases)
         _ -> false
     _ -> false
 
@@ -2643,7 +2643,7 @@ private note_climb(sink: &EdgeSink, aliases: Set[string], place: TExpr, counted:
 
         note_climb(sink, aliases, r, counted)
     TIndex(r, _, _) -> repr(texpr_type(r)) match
-        Array(_, _) -> note_climb(sink, aliases, r, counted)
+        Array(_, _, _) -> note_climb(sink, aliases, r, counted)
         _ ->
             val elem = element(repr(texpr_type(r))).unwrap_or(place_type(place))
 

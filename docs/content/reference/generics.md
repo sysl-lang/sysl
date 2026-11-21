@@ -2158,6 +2158,52 @@ print(join[2, 3](Buf[2](1)).inner.room())
 4
 ```
 
+**An array's length and a vector's lane count are symbols there too.** `[N]int` and `[M]int` are two
+types inside the declaration, and neither is `[3]int`, so a result, a local's declared type, an
+argument or a field that meets the wrong one is refused at the declaration, called or not:
+
+```sysl
+cast[const N: usize, const M: usize](xs: [N]int) -> [M]int = xs
+
+print(1)
+```
+
+```error
+function 'cast' should return [M]int, but its body yields [N]int — 'N' and 'M' are different value parameters
+```
+
+```sysl
+f[const N: usize]() -> usize
+    val ys: [N]int = [1, 2, 3]
+    ys.len
+
+print(1)
+```
+
+```error
+cannot initialize 'ys': declared [N]int but the value is [3]int — 'N' stands for every value an instantiation chooses, not only 3
+```
+
+A vector's lane count is held the same way (`<N>f32` is not `<M>f32`, and a four-lane literal does
+not fill `<N>f32`). What carries the length carries the symbol: a repeat `[x; N]` is an `[N]T`, a
+lane-wise comparison of two `<W>f32` is a `<W>bool`, and a generic called with an `[N]T` solves its
+own parameter to `N`, so its result is an `[N]T` again:
+
+```sysl
+same[const M: usize](xs: [M]int) -> [M]int = xs
+
+fill[const N: usize](x: int) -> [N]int = same([x; N])
+
+print(fill[3](7)[2])
+```
+
+```output
+7
+```
+
+A length the reading cannot follow — one a `shuffle` or a `lookup` makes, or a written `[0]T` —
+stays a number there, and each instantiation answers for it.
+
 **A type parameter held in a type is a symbol in the same way.** A `Box[T]` where a `Box[U]` was
 declared is refused at the declaration, in every position above, and a call at `[int, int]` — where
 the two happen to be one type — does not make the body right:
@@ -2181,9 +2227,6 @@ other: `widen[T: Integer, U: Integer](x: T) -> U = x` widens at `[u8, int]` and 
 twin, which is why under a type the two must be one. A parameter against a concrete type
 (`-> Box[int] = b`) and an associated type a bound fixes (`S::Error` with `S: Source[Error = E]`)
 are also answered by the instantiations, which know what they are.
-
-An array's length and a vector's lane count are still numbers while the declaration is read, so
-`[N]int` against `[M]int` in a body is answered by each instantiation rather than at the declaration.
 
 Writing a **type** parameter where a length belongs is refused for the opposite reason, since a
 length is a value:
