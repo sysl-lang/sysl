@@ -3680,7 +3680,7 @@ enum Mode
     Idle
     Busy
 
-alternate(n: int) -> Result[[4]Mode, string]
+alternate(n: usize) -> Result[[4]Mode, string]
     var out: [4]Mode = slot_empty()
 
     for i in 0..<out.len
