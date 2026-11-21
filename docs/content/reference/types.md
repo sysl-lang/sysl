@@ -281,8 +281,25 @@ val z = 1 + 10 / (3 - 3)
 a constant divided by zero
 ```
 
-**A name anywhere in the expression makes it ordinary arithmetic**, which overflows as the build
-mode says. A `const` is a name, so the arithmetic built on it is the arithmetic of its type:
+**An untyped integer `const` is the literal it stands for**, so it takes part in all of this:
+`const Half = 200` makes `Half * 2` the exact 400, and it is refused at `u8` as `200 * 2` is. So are
+a chain of such constants (`const Quad = Half * 2`), a constant of a constant, one from another
+module, and negative values and shifts of them. Such an expression also chooses an overload as the
+literal spelling does: `h(Half * 2)` over `h(v: u8)` and `h(v: u16)` is the `u16` one.
+
+```sysl
+const Half = 200
+
+val b: u8 = Half * 2
+```
+
+```error
+the value 400 does not fit u8
+```
+
+**Any other name in the expression makes it ordinary arithmetic**, which overflows as the build
+mode says. A `val`, a variable, and a `const` declared with a type are names of a value of that type,
+so the arithmetic built on them is the arithmetic of the type, and the constant is not exact:
 
 ```sysl
 const Base: u8 = 200
