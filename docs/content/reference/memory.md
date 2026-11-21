@@ -3598,6 +3598,79 @@ holding a count). **`slot_put(p, v)`** moves `v` into an **empty** slot, giving 
 slot must be live, a put slot empty, and nothing reads an empty slot — the caller's to keep. Both
 refuse what is not a `*T`.
 
+### An empty local: one slot in the frame
+
+A generic body sometimes has to hold a `T` before it has one — a copy made a word at a time into
+storage of its own — and a `T` may have **no zero value** to start it at: a simple enum with no
+variant written `= 0`, a constrained subtype, a `&T`. **`var out: T = slot_empty()`** declares a local
+that is an **empty slot**, the one storage the other forms leave behind: it holds no value, and
+nothing is let go of for it until one is put there. Its storage is the frame's, aligned as `T` is
+(an `@align(64)` type starts on a 64-byte boundary), like Rust's `MaybeUninit<T>`.
+
+- **What it holds is `slot_take`'s empty**: the zero where `T` holds a count, so the local's release
+  at the end of its block gives back nothing, and otherwise bytes nobody wrote — no store at all.
+- **It is filled like any local**: an assignment (to the whole or to a part), `slot_put(&out, v)`, or a
+  copy through `&out`. An assignment to an empty slot of a counted type lets go of nothing; a later
+  one lets go of what the first put there. A `Drop` value put in is dropped once, when the local goes,
+  and one never put in is never dropped.
+- **Its first mention writes it.** Read in the order the body is written, the first thing done with
+  the name must be a write — an assignment, `&out`, a `ref` to it — and a read before one is refused;
+  so is a write whose own value reads it (`out = out + 1`, `out += 1`) and a closure capturing it. A
+  write on one arm of an `if` followed by a read after it is the caller's to get right, as a slot
+  past a buffer's live run is.
+- **It stands only as a `var`'s initial value**, with the type on the declaration or in
+  `slot_empty[T]()`: a `val`, an argument, an assignment's value or a `var` with no type is refused.
+
+```sysl
+enum Mode
+    Idle
+    Busy
+
+struct Res
+    n: int
+
+impl Drop for Res
+    drop(self) = print(s"drop ${self.n}")
+
+fill[T](v: T) -> T
+    var out: T = slot_empty()
+
+    out = v
+    out
+
+keep[T](v: T)
+    var out: T = slot_empty()
+
+    slot_put(&out, v)
+    print("kept")
+
+print(fill(Busy) == Busy, fill(7))
+keep(Res(1))
+```
+
+```output
+true 7
+kept
+drop 1
+```
+
+```sysl
+f() -> int
+    var x: int = slot_empty()
+
+    x += 1
+    x
+```
+
+```error
+'x' is an empty slot, read here before anything was written to it
+```
+
+`sysl.sync`'s `load_relaxed` and `SeqLock[T]` build their answer in one, so they copy a `Plain` type
+with no zero value as they copy any other. **A `var out: T` with no initial value at such a `T` is
+refused at the call that chose the type**, naming the instance and the declaration's line, since the
+line in the generic's body is the same for every instance and may be the library's.
+
 ### A counted reference given up as a pointer
 
 **`r.into_raw()` gives up a `&T` as a `*T`** — the address of the object itself, so its fields read and
