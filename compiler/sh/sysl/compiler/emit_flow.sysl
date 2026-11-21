@@ -938,13 +938,24 @@ gen_stmts_with(e: *Emit, xs: Buf[TStmt], lasts: Buf[Set[string]], dying: Buf[Set
         e.moves.dying = if i < dying.len() then dying_for_stmt(item, dying[i]) else none
         // A drain is matched by the node it reads, so the one a loop is being emitted for stays set
         // while its body's own statements are.
+        // A drained loop that may be relocated whole runs only where the relocation could not be.
         val outer = e.moves.drain
+        var relocated: Option[string] = None
 
         drain_plan(e, xs, i, tail) match
-            Some(p) -> e.moves.drain = Some(drain_begin(e, p))
+            Some(p) ->
+                val d = drain_begin(e, p)
+
+                e.moves.drain = Some(d)
+                relocated = drain_relocate_loop(e, p, d)
             None -> ()
 
         gen_stmt(e, item)
+
+        relocated match
+            Some(l) -> relocate_join(e, l)
+            None -> ()
+
         e.moves.drain = outer
         e.moves.dying = none
         nowrap_after(e, item)

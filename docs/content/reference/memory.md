@@ -3518,6 +3518,50 @@ print(nodes[0].n + nodes[1].n + nodes[2].n + nodes[3].n)
 6
 ```
 
+**A growth relocates.** A copy of every element into fresh slot storage — a `slot_place_run`, or a
+counted loop of `slot_place`s whose slot index steps with the loop — followed at once by a write of
+that fresh storage over the place the elements were read from, moves them: the old storage is let go
+of on the next line, so the counts the copy would take and the old storage's destructor would give
+back end where they began. Where the old storage has no other holder, the copy hands each slot's count
+over untouched and the old storage frees without visiting them; where it covers the rest of the old
+live run and starts at the fresh storage's first free slot, it is one `memmove` of the elements'
+bytes, as C++'s growth is. Where a view handed out earlier still holds the old storage, the copy
+counts each element as written, and the view keeps them. Either way a program sees the same thing:
+each element let go of once, when the last holder lets go of it. This is a `Buf`'s growth, whether
+it traps on a refusal (`push`) or answers it (`try_push`, whose storage comes from `try_slot_storage`
+and is checked by its length before the copy).
+
+```sysl
+struct Job
+    id: int
+
+impl Drop for Job
+    drop(self) = print(f"let go ${self.id}")
+
+struct Jobs
+    storage: []&Job
+    last: usize
+
+    grow(*self, n: usize)
+        var fresh: []&Job = slot_storage(n)
+        slot_place_run(fresh, 0, self.storage[0..<self.last])
+        self.storage = fresh
+
+var j = Jobs(slot_storage(2), 0)
+
+slot_place(j.storage, 0, Job(1))
+slot_place(j.storage, 1, Job(2))
+j.last = 2
+j.grow(4)
+print(j.storage.len, j.storage[1].id)
+```
+
+```output
+4 2
+let go 1
+let go 2
+```
+
 **Two forms answer the heap's refusal instead of trapping on it** ([above](#an-allocation-that-may-fail)):
 
 - **`try_slot_storage(n)`** is `slot_storage(n)`, except that where the heap answers null — or `n`

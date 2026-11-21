@@ -560,6 +560,11 @@ private gen_slot_place_run(e: *Emit, xs: TExpr, at: TExpr, src: TExpr, elem: Typ
         return
     end if
 
+    // A drained run that took the rest of the old prefix is relocated as a whole where it can be.
+    val relocated = if drained.is_some() && contains_counted(elem) && moves_bytes(e)
+        then Some(relocate(e, drained.unwrap().zero, elem, view.0, i, first, from.1, n, side))
+        else None
+
     // **The loop runs back to front only where the run overlaps the slots it fills from below**, so
     // each element is read before it is written over, as `memmove` reads them. Every other run goes
     // front to back, so a counted run fills the first free slot each time, as the loop of places does.
@@ -627,6 +632,10 @@ private gen_slot_place_run(e: *Emit, xs: TExpr, at: TExpr, src: TExpr, elem: Typ
     emit(e, InStore(word_lty(e), next, k_slot, AccPlain, None))
     emit_term(e, InBr(test_l))
     emit_label(e, done_l)
+
+    relocated match
+        Some(l) -> relocate_join(e, l)
+        None -> ()
 end gen_slot_place_run
 
 // Whether a run of bytes may be handed to `llvm.memmove`: where a C library is under the program,
@@ -899,6 +908,178 @@ private drain_count(e: *Emit, d: Drain, elem: Type, v: Val, at: Val)
     emit_term(e, InBr(join_l))
     emit_label(e, join_l)
 end drain_count
+
+// -- relocating: a drain that takes the rest of the prefix moves the bytes ---------------------------------
+
+// **A drain whose `zero` was cleared has taken every slot from the copy's start to the end of the old
+// live prefix, and that prefix was cut back to the start** (`cut_prefix`), so the old storage lets go
+// of none of them: each element's count is the slot's share, handed over whole. Placed slot by slot,
+// each lands in the first free slot of the fresh storage and raises its prefix by one, so where the
+// destination's first free slot is exactly where the copy starts, the whole copy is the elements' bytes
+// moved at once and the prefix raised by the run's length -- a relocation, as C++'s growth is. The
+// caller has found that every destination slot the copy reaches exists; anything else here (`zero`
+// still set, storage that is not a buffer of these slots, a first free slot elsewhere) goes to `slow_l`,
+// the copy as written. Branches to `moved_l` once moved.
+private relocate_to(e: *Emit, zero: Val, elem: Type, owner: Val, at: Val, first: Val, src: Val, n: Val,
+                    side: IrAccess, moved_l: string, slow_l: string)
+    val whole_l = fresh_label(e, "drain.whole")
+    val buffer_l = fresh_label(e, "drain.into")
+    val go_l = fresh_label(e, "drain.relocate")
+    val z = fresh_reg(e)
+
+    emit(e, InLoad(z, l_i1(), zero, AccPlain, None))
+    emit_term(e, InCondBr(z, slow_l, whole_l))
+    emit_label(e, whole_l)
+    buffer_test(e, elem, owner, buffer_l, slow_l, side)
+    emit_label(e, buffer_l)
+
+    val lp = slot_header(e, elem, owner, header_fields())
+    val live = fresh_reg(e)
+
+    emit(e, InLoad(live, word_lty(e), lp, side, None))
+
+    val at_edge = fresh_reg(e)
+
+    emit(e, InIntCmp(at_edge, IEq, word_lty(e), live, at))
+    emit_term(e, InCondBr(at_edge, go_l, slow_l))
+    emit_label(e, go_l)
+
+    val bytes = fresh_reg(e)
+
+    emit(e, InBin(bytes, OpMul, word_lty(e), n, element_size(e, elem)))
+    emit_memmove(e, first, src, bytes, int(e.layout.align(elem)))
+
+    val grown = fresh_reg(e)
+
+    emit(e, InBin(grown, OpAdd, word_lty(e), at, n))
+    emit(e, InStore(word_lty(e), grown, lp, side, None))
+    emit_term(e, InBr(moved_l))
+end relocate_to
+
+// `relocate_to` for a drained `slot_place_run`, whose bounds are already tested: the emitter is left
+// on the slot-by-slot copy, and the label answered is where the relocation rejoins it.
+private relocate(e: *Emit, zero: Val, elem: Type, owner: Val, at: Val, first: Val, src: Val, n: Val,
+                 side: IrAccess) -> string
+    val moved_l = fresh_label(e, "drain.relocated")
+    val slow_l = fresh_label(e, "drain.each")
+
+    relocate_to(e, zero, elem, owner, at, first, src, n, side, moved_l, slow_l)
+    emit_label(e, slow_l)
+    moved_l
+end relocate
+
+// The end of the copy as written, joined by the relocation that went around it.
+relocate_join(e: *Emit, moved_l: string)
+    emit_term(e, InBr(moved_l))
+    emit_label(e, moved_l)
+end relocate_join
+
+// `x`, an integer of `shape`, at the width of an address.
+private word_of(e: *Emit, x: TExpr, shape: (int, bool)) -> Val =
+    convert_int(e, shape.0, shape.1, e.word_bits, gen_expr(e, x))
+
+// A branch to `slow_l` unless `ok`.
+private or_slow(e: *Emit, ok: Val, slow_l: string)
+    val next_l = fresh_label(e, "drain.fits")
+
+    emit_term(e, InCondBr(ok, next_l, slow_l))
+    emit_label(e, next_l)
+end or_slow
+
+/** **A drained counted loop, relocated where it can be**: emitted just before the loop, which follows
+ * it as the slow path. The turns `lo ..< hi` place at `j(lo) ..< j(lo) + (hi - lo)`, so the relocation
+ * asks what the loop's own bounds tests would: that `hi` is within the old storage and every slot from
+ * `j(lo)` on exists in the destination. A shift that wraps or is negative is left to the loop. Answers
+ * the label the loop must branch to once it ends, or None where nothing was emitted -- a loop that
+ * steps no shape this reads, a variable wider than an address, or a machine with nothing to move bytes.
+ */
+drain_relocate_loop(e: *Emit, p: DrainPlan, d: Drain) -> Option[string]
+    if !moves_bytes(e) || p.bounds.is_none() || p.into.is_none() then return None
+
+    val b = p.bounds.unwrap()
+    val into = p.into.unwrap()
+    val shape = underlying(b.2) match
+        Integer(bits, signed, _) -> (bits, signed)
+        _ -> return None
+
+    if shape.0 > e.word_bits then return None
+
+    val same = into.2 match
+        Some(c) -> underlying(texpr_type(c)) match
+            Integer(bits, signed, _) -> bits == shape.0 && signed == shape.1
+            _ -> false
+        None -> true
+
+    if !same then return None
+
+    val elem = p.elem
+    val moved_l = fresh_label(e, "drain.relocated")
+    val slow_l = fresh_label(e, "drain.each")
+    val decided_l = fresh_label(e, "drain.bounds")
+    val z = fresh_reg(e)
+
+    // The bounds are read only where the drain covered the prefix, which is where `lo <= hi` holds.
+    emit(e, InLoad(z, l_i1(), d.zero, AccPlain, None))
+    emit_term(e, InCondBr(z, slow_l, decided_l))
+    emit_label(e, decided_l)
+
+    val lo = word_of(e, b.0, shape)
+    val hi = word_of(e, b.1, shape)
+    val n = fresh_reg(e)
+
+    emit(e, InBin(n, OpSub, word_lty(e), hi, lo))
+
+    val start = into.2 match
+        None -> lo
+        Some(c) ->
+            val cw = word_of(e, c, shape)
+            val at = fresh_reg(e)
+
+            if shape.1
+                val nonneg = fresh_reg(e)
+
+                emit(e, InIntCmp(nonneg, ISge, word_lty(e), cw, VZero))
+                or_slow(e, nonneg, slow_l)
+            end if
+
+            val kept = fresh_reg(e)
+
+            if into.1 == "+"
+                emit(e, InBin(at, OpAdd, word_lty(e), lo, cw))
+                emit(e, InIntCmp(kept, IUge, word_lty(e), at, lo))
+            else
+                emit(e, InIntCmp(kept, IUle, word_lty(e), cw, lo))
+                emit(e, InBin(at, OpSub, word_lty(e), lo, cw))
+            end if
+
+            or_slow(e, kept, slow_l)
+            at
+
+    val from = slot_view(e, p.source)
+    val read_fits = fresh_reg(e)
+
+    emit(e, InIntCmp(read_fits, IUle, word_lty(e), hi, from.2))
+    or_slow(e, read_fits, slow_l)
+
+    val to = slot_view(e, into.0)
+    val start_fits = fresh_reg(e)
+
+    emit(e, InIntCmp(start_fits, IUle, word_lty(e), start, to.2))
+    or_slow(e, start_fits, slow_l)
+
+    val room = fresh_reg(e)
+
+    emit(e, InBin(room, OpSub, word_lty(e), to.2, start))
+
+    val run_fits = fresh_reg(e)
+
+    emit(e, InIntCmp(run_fits, IUle, word_lty(e), n, room))
+    or_slow(e, run_fits, slow_l)
+    relocate_to(e, d.zero, elem, to.0, start, slot_at(e, elem, to.1, start), slot_at(e, elem, from.1, lo),
+                n, AccPlain, moved_l, slow_l)
+    emit_label(e, slow_l)
+    Some(moved_l)
+end drain_relocate_loop
 
 private gen_slot_vacate(e: *Emit, xs: TExpr, from: TExpr, elem: Type)
     val view = slot_view(e, xs)
