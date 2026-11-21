@@ -26,6 +26,15 @@ end bdh_call
 
 private bdh_load(d: string, p: string) -> Inst = InLoad(VReg(d), LPtr, VReg(p), AccPlain, None)
 
+// `%p = getelementptr ptr, ptr %self, i64 1`: a field of what a parameter refers to, which is where
+// `self.input` lies -- a load through it is a field read, which a window may hold.
+private bdh_field_at(p: string) -> Inst
+    var at: Buf[IrArg] = buf()
+
+    at.push(ir_arg(LInt(64), VReg("one")))
+    InGep(VReg(p), LPtr, VReg("self"), at)
+end bdh_field_at
+
 private bdh_store(v: string, p: string) -> Inst = InStore(LPtr, VReg(v), VReg(p), AccPlain, None)
 
 // `%d = call ptr @unwrap-place(ptr %slot)`: the address of the payload in the slot's own bytes.
@@ -70,6 +79,8 @@ private bdh_held(prefix: Buf[Inst], between: Buf[Inst]) -> Buf[IrBlock]
     var entry: Buf[Inst] = buf()
 
     entry.push(InAlloca(VReg("m.addr"), LPtr, None))
+    entry.push(bdh_field_at("input"))
+    entry.push(bdh_field_at("other"))
     entry.push(bdh_load("v", "input"))
     entry.push(bdh_call("arc.retain", "v"))
     entry.push(bdh_store("v", "m.addr"))
@@ -215,6 +226,7 @@ private bdh_field(between: Buf[Inst], closing: string) -> Buf[IrBlock]
     var at: Buf[IrArg] = buf()
 
     at.push(ir_arg(LInt(64), VReg("i")))
+    entry.push(bdh_field_at("other"))
     entry.push(InGep(VReg("x.at"), LPtr, VReg("base"), at))
     entry.push(bdh_load("x", "x.at"))
     entry.push(bdh_call("arc.retain", "x"))

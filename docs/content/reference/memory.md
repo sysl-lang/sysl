@@ -4035,6 +4035,44 @@ growing a `Buf[Value]` cannot touch a `Machine`. An `await` keeps the count, as 
 returning, capturing or keeping the value; a tuple built on the spot for a keeping call is handed over
 whole.
 
+**A release between them does not always keep the count.** Where letting go of the released value
+runs no destructor, the share goes when nothing that release can tear down is of the share's type — an
+old `Option[&Tag]` given back cannot free a `Packet` — or when the reference was read out of a local
+that holds a count of its own on it, such as Richards' `message.unwrap()` while the old `self.input`
+is given back:
+
+```sysl
+struct Packet
+    id: int
+    link: Option[&Packet]
+
+struct Task
+    input: Option[&Packet]
+
+impl Task
+    run(*self) -> int
+        var message: Option[&Packet] = None
+
+        message = self.input
+        self.input = message.unwrap().link   // message holds the packet: no share for the read
+        message.unwrap().id
+
+main()
+    var t = Task(Some(Packet(1, Some(Packet(2, None)))))
+
+    print(t.run(), t.run())
+```
+
+```output
+1 2
+```
+
+The local must hold a count on everything stored into it and be read only where it lies. A parameter
+does not qualify: what a borrowed one holds is its caller's, and the share keeps its count.
+Reading the payload straight out of the place being written (`self.input = self.input.unwrap().link`)
+keeps the share, since that release may be the packet's last, and so does a release whose teardown
+runs a destructor.
+
 ### A loop lends each element to a body that lets go of nothing
 
 **`for x in seq` over elements with counted parts takes no count per element where the body cannot
