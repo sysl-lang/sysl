@@ -132,6 +132,7 @@ struct IcModel
     follow: Buf[string]
     fmacros: Buf[IcMacro]
     reach_on: bool
+    non_literal: Buf[int]
 
 // The file clang's JSON is talking about. It writes a location's `file` only where it differs from
 // the location written before it, so the walk has to visit every location in document order to know
@@ -351,9 +352,10 @@ import_c_generate(header: string, opts: IcOptions) -> Result[IcOutput, string]
             Err(_) -> ()
 
     var m = IcModel(full, probe, opts.prefix, buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(),
-                    false, false, follow, fmacros, false)
+                    false, false, follow, fmacros, false, buf())
 
     ic_collect(doc, &m)
+    m.non_literal = ic_pointer_macros(m.macro_types, candidates, flags, clang, full)
 
     var refused: Buf[string] = buf()
     var shim = str_builder()
@@ -362,6 +364,68 @@ import_c_generate(header: string, opts: IcOptions) -> Result[IcOutput, string]
 
     Ok(IcOutput(ic_finish(rendered, refused), refused, shim.finish()))
 end import_c_generate
+
+// Which candidate macros are `char` pointers that are NOT a string literal -- an address, a variable's
+// name -- by asking clang to initialise a `char` array from each one: only a literal (or literals C
+// joins) can. Those are not a constant `c const` can read as a string.
+private ic_pointer_macros(types: Buf[(int, string)], candidates: Buf[string], flags: Buf[string], clang: string,
+                          full: string) -> Buf[int]
+    var asked: Buf[int] = buf()
+
+    for mt in types
+        if ic_is_char_pointer(ic_parse(mt.1)) then asked.push(mt.0)
+
+    var found: Buf[int] = buf()
+
+    if asked.len() == 0 then return found
+
+    val dir = make_temp_dir("sysl-import-c") match
+        Err(_) -> return found
+        Ok(made) -> made
+
+    val probe = s"$dir/strings.c"
+    var text = str_builder()
+
+    text.push(s"#include \"$full\"\n")
+
+    for i in 0..<asked.len()
+        text.push(s"static const char __sysl_import_c_s_${i}[] = ${candidates[asked[i]]};\n")
+
+    write_text(probe, text.finish()) match
+        Err(_) ->
+            remove_dir_all(dir).unwrap_or(())
+            return found
+        Ok(_) -> ()
+
+    var args = flags.copy()
+
+    for item in ["-fsyntax-only", "-w", "-ferror-limit=0", probe]
+        args.push(item)
+
+    val said = capture(clang, args.view(), "", [], true)
+
+    remove_dir_all(dir).unwrap_or(())
+
+    said match
+        Err(_) -> found
+        Ok(got) ->
+            for line in split(got.err.unwrap_or(""), "\n")
+                if !line.contains(" error: ") || !line.starts_with(probe + ":") then continue
+
+                val rest = line[probe.len + 1..<line.len]
+
+                rest.index_of(":") match
+                    Some(at) ->
+                        parse_long(rest[0..<at]) match
+                            Ok(n) -> if n >= 2 && n - 2 < long(asked.len()) then found.push(asked[usize(n - 2)])
+                            Err(_) -> ()
+                    None -> ()
+
+            found
+end ic_pointer_macros
+
+// Whether a type is a pointer to `char`, which is what a C string literal has.
+ic_is_char_pointer(t: IcType) -> bool = t.kind == IcPtr && t.parts[0].kind == IcNamed && t.parts[0].name == "char"
 
 // Whether a declaration's file is one `--follow` named.
 private ic_is_followed(file: string, follow: Buf[string]) -> bool

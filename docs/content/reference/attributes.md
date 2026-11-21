@@ -4110,6 +4110,28 @@ for the same reason.
 compiled for `crc` and `sse4.2` ([ffi](/reference/ffi/#a-link-name-in-the-llvm-namespace-names-an-instruction)),
 so a declaration is accepted on its own processor and each call is held to this rule.
 
+**So are the AES, SHA-3 and dot-product instructions**, which take and answer vectors
+([ffi](/reference/ffi/#a-link-name-in-the-llvm-namespace-names-an-instruction)): AArch64's `aese`,
+`aesd`, `aesmc` and `aesimc` are `aes`, its `eor3`, `bcax` and `rax1` are `sha3`, and `sdot` and `udot` are
+`dotprod`; x86's AES-NI rounds are `aes` and the VNNI dot products `avxvnni`. A function that calls
+one is marked with its extension, or the call is inside an `@unchecked` naming it (the row
+`aarch64-macos` promises the first three), and a mark naming another extension does not cover it —
+the refusal names the one that is missing:
+
+```sysl target=aarch64-freestanding
+extern "llvm.aarch64.crypto.aese" aese(state: <16>u8, key: <16>u8) -> <16>u8
+
+@extensions("sha3")
+round(state: <16>u8, key: <16>u8) -> <16>u8 = aese(state, key)
+
+@export("main")
+start() -> i32 = 0
+```
+
+```error
+'aese' is called, and it is compiled for the processor's 'aes' extension, which 'aarch64-freestanding' does not promise and the code here is not compiled for — on a processor without it its first such instruction faults. Mark the caller '@extensions("aes")', or make the call inside '@unchecked("aes")' once the program has asked the processor
+```
+
 ### Asking the processor — `sysl.cpu`
 
 [`sysl.cpu`](/library/cpu/) is the asking. `cpu.has("sha3")` answers whether the processor the

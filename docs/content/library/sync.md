@@ -855,8 +855,29 @@ var held = SeqLock.new(Holder(1, Node(2)))
 ```
 
 `load_relaxed` and `store_relaxed` hold their type to the same bound, for the same reason. The copy
-builds its answer in a local that starts at `T`'s zero value, so a `T` with none — a simple enum none
-of whose variants is written `= 0`, or a struct holding one — is refused too.
+builds its answer in an [empty slot](/reference/memory/#an-empty-local-one-slot-in-the-frame) — a
+local nothing is written into before the words are — so a `T` with no zero value, a simple enum none
+of whose variants is written `= 0` or a struct holding one, is copied like any other:
+
+```sysl
+import sysl.sync.*
+
+enum Mode
+    Idle
+    Busy
+
+var m = Idle
+var l = SeqLock.new(Idle)
+
+store_relaxed(&m, Busy)
+l.write(Busy)
+
+print(load_relaxed(&m) == Busy, l.read() == Busy)
+```
+
+```output
+true true
+```
 
 ## What is not here
 
