@@ -30,8 +30,8 @@ private[bigint] add_n(r: []Limb, a: []const Limb, b: []const Limb, n: usize) -> 
 
 /** The loop `add_n` runs on every processor without an assembly form.
  *
- * **Written with the two limbs' sum first and the carry added to it second**, each overflow read off
- * as a comparison, rather than as one double-width sum. The two say the same thing, but in this
+ * **Written with `add_carry`**, which is the two limbs' sum first and the carry added to it second,
+ * each overflow a `with.overflow` flag rather than a comparison and not one double-width sum. In this
  * order the limbs' sum does not wait for the carry, so the chain from one limb to the next is one
  * add and one flag -- half what the double-width form leaves on it. **Four limbs a turn** lets the
  * back end keep the carry in the flags between them, as an add-with-carry chain. (Measured on an
@@ -39,7 +39,7 @@ private[bigint] add_n(r: []Limb, a: []const Limb, b: []const Limb, n: usize) -> 
  * order four at a time 0.41, GMP's assembly 0.25.)
  */
 private[bigint] add_n_portable(r: []Limb, a: []const Limb, b: []const Limb, n: usize) -> Limb
-    var carry: Limb = 0
+    var carry = false
     var i: usize = 0
 
     while i + 4 <= n
@@ -53,19 +53,17 @@ private[bigint] add_n_portable(r: []Limb, a: []const Limb, b: []const Limb, n: u
         carry = add_step(r, a, b, i, carry)
         i += 1
 
-    carry
+    Limb(carry)
 end add_n_portable
 
 /** One limb of `add_n`: `r[i] = a[i] + b[i] + carry`, answering the carry out. */
-private add_step(r: []Limb, a: []const Limb, b: []const Limb, i: usize, carry: Limb) -> Limb
+private add_step(r: []Limb, a: []const Limb, b: []const Limb, i: usize, carry: bool) -> bool
     @unchecked
-        val x = a[i]
-        val s1 = x +% b[i]
-        val s = s1 +% carry
+        val (s, out) = a[i].add_carry(b[i], carry)
 
         r[i] = s
 
-        return Limb(s1 < x) | Limb(s < s1)
+        return out
 end add_step
 
 /** `r[0..<n] = a[0..<n] + c`, `c` a carry or any single limb, answering the carry out. `r` may be
@@ -95,11 +93,10 @@ private[bigint] sub_n(r: []Limb, a: []const Limb, b: []const Limb, n: usize) -> 
 
 /** The loop `sub_n` runs on every processor without an assembly form.
  *
- * The mirror of `add_n_portable`, in the same order for the same reason: a difference that goes
- * below zero wraps, and the wrap is what the comparison reads as a borrow.
+ * The mirror of `add_n_portable`, in the same order for the same reason, with `sub_borrow`.
  */
 private[bigint] sub_n_portable(r: []Limb, a: []const Limb, b: []const Limb, n: usize) -> Limb
-    var borrow: Limb = 0
+    var borrow = false
     var i: usize = 0
 
     while i + 4 <= n
@@ -113,19 +110,17 @@ private[bigint] sub_n_portable(r: []Limb, a: []const Limb, b: []const Limb, n: u
         borrow = sub_step(r, a, b, i, borrow)
         i += 1
 
-    borrow
+    Limb(borrow)
 end sub_n_portable
 
 /** One limb of `sub_n`: `r[i] = a[i] - b[i] - borrow`, answering the borrow out. */
-private sub_step(r: []Limb, a: []const Limb, b: []const Limb, i: usize, borrow: Limb) -> Limb
+private sub_step(r: []Limb, a: []const Limb, b: []const Limb, i: usize, borrow: bool) -> bool
     @unchecked
-        val x = a[i]
-        val d1 = x -% b[i]
-        val d = d1 -% borrow
+        val (d, out) = a[i].sub_borrow(b[i], borrow)
 
         r[i] = d
 
-        return Limb(d1 > x) | Limb(d > d1)
+        return out
 end sub_step
 
 /** `r[0..<n] = a[0..<n] - c`, answering the borrow out. `r` may be `a`. */

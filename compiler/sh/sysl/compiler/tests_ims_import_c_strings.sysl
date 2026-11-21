@@ -1,0 +1,178 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.buf
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.join
+
+// `sysl import-c` reads a C string macro as a `c const` at `string` (`reference/ffi.md § A string is
+// read too`): the line's C expression is the macro's own name, so the joining, the escapes and the
+// reference to another macro are the C compiler's, at build time. A wide string, an address and a
+// function-like macro are not strings and are refused by name. Each case generates a module from a
+// small header, then builds and runs a program using it.
+
+private ims_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end ims_ready
+
+private ims_generated(dir: string, header: string) -> IcOutput
+    write_text(s"$dir/t.h", header).unwrap()
+    import_c_generate(s"$dir/t.h", IcOptions("", "", "", "", None, buf(), "")).unwrap()
+
+// The generated module with `uses` appended as the program, built and run: what it printed, or the
+// build's complaint.
+private ims_run(header: string, uses: string) -> Result[string, string]
+    val dir = make_temp_dir("sysl-ims").unwrap()
+    val out = ims_generated(dir, header)
+
+    write_text(s"$dir/package.hocon", "package {\n  name = \"ims\"\n  version = \"0.0.1\"\n}\n").unwrap()
+    write_text(s"$dir/main.sysl", out.text + "\n" + uses).unwrap()
+
+    val (code, _, err) = clx_ran(["sysl", "build", dir, "-o", s"$dir/ims"])
+    val result = if code != Fine then Err(err) else Ok(capture(s"$dir/ims", [], "", [], true).unwrap().text)
+
+    remove_dir_all(dir).unwrap_or(())
+    result
+
+private ims_refused(header: string) -> (string, string)
+    val dir = make_temp_dir("sysl-ims").unwrap()
+    val out = ims_generated(dir, header)
+
+    remove_dir_all(dir).unwrap_or(())
+    (out.text, join(out.refused.view(), "\n"))
+
+private ims_prints(header: string, uses: string, want: string)
+    ims_run(header, uses) match
+        Ok(got) -> assert_eq(got, want)
+        Err(e) -> assert(false, e)
+
+@test("a plain string macro is a 'c const' at string, and reads back")
+ims_plain()
+    if !ims_ready() then return
+
+    val header = "#define VERSION \"1.2\"\n"
+    val (text, why) = ims_refused(header)
+
+    assert(text.contains("VERSION: string = \"VERSION\""), text)
+    assert_eq(why, "")
+    ims_prints(header, "print(VERSION, VERSION.bytes.len)\n", "1.2 3\n")
+
+@test("an empty string macro is a string of no bytes, not a flag")
+ims_empty()
+    if !ims_ready() then return
+
+    val header = "#define NOTHING \"\"\n#define FLAG\n"
+    val (text, why) = ims_refused(header)
+
+    assert(text.contains("NOTHING: string = \"NOTHING\""), text)
+    assert(!text.contains("FLAG"), text)
+    assert_eq(why, "")
+    ims_prints(header, "print(NOTHING.bytes.len)\n", "0\n")
+
+@test("escapes are C's: a newline, a hex escape and an octal one")
+ims_escapes()
+    if !ims_ready() then return
+
+    val header = "#define ESC \"a\\n\\x41\\101\\t|\"\n"
+
+    ims_prints(header, "print(ESC.bytes.len, ESC.bytes[1], ESC.bytes[2], ESC.bytes[3], ESC.bytes[4])\n", "6 10 65 65 9\n")
+
+@test("an escaped quote and backslash survive both quotings")
+ims_quote_and_backslash()
+    if !ims_ready() then return
+
+    val header = "#define Q \"say \\\"hi\\\" \\\\ ok\"\n"
+
+    ims_prints(header, "print(Q, Q.bytes.len)\n", "say \"hi\" \\ ok 13\n")
+
+@test("literals C joins are one string")
+ims_adjacent()
+    if !ims_ready() then return
+
+    val header = "#define AB \"a\" \"b\"\n#define SPLIT \"x\\x41\" \"B\"\n"
+
+    ims_prints(header, "print(AB, AB.bytes.len, SPLIT, SPLIT.bytes.len)\n", "ab 2 xAB 3\n")
+
+@test("a string macro made of other string macros is joined by C")
+ims_refers_to_another()
+    if !ims_ready() then return
+
+    val header = "#define MAJOR \"5\"\n#define MINOR \"4\"\n#define FULL \"Lua \" MAJOR \".\" MINOR\n#define ALIAS FULL\n"
+    val (text, why) = ims_refused(header)
+
+    assert(text.contains("MAJOR: string = \"MAJOR\""), text)
+    assert(text.contains("ALIAS: string = \"ALIAS\""), text)
+    assert_eq(why, "")
+    ims_prints(header, "print(FULL, FULL.bytes.len, ALIAS)\n", "Lua 5.4 7 Lua 5.4\n")
+
+@test("an embedded NUL is kept, since a string has a length")
+ims_embedded_nul()
+    if !ims_ready() then return
+
+    ims_prints("#define Z \"a\\0b\"\n", "print(Z.bytes.len)\n", "3\n")
+
+@test("a u8 literal is the same bytes, and a string")
+ims_u8_prefix()
+    if !ims_ready() then return
+
+    val header = "#define U \"\\xc3\\xa9\"\n"
+
+    ims_prints(header, "print(U, U.bytes.len)\n", "é 2\n")
+
+@test("a wide string is refused by name, and the rest of the header is still bound")
+ims_wide_refused()
+    if !ims_ready() then return
+
+    val header = "#define W L\"wide\"\n#define N 3\n#define OK \"ok\"\n"
+    val (text, why) = ims_refused(header)
+
+    assert(why.contains("W: a 'const int *'") || why.contains("W: a '"), why)
+    assert(why.contains("not a char string or a number"), why)
+    assert(!text.contains("W: string"), text)
+    assert(text.contains("N: i32"), text)
+    assert(text.contains("OK: string"), text)
+
+@test("a pointer that is no literal is refused, not read as a string")
+ims_address_refused()
+    if !ims_ready() then return
+
+    val header = "static char buf[4];\n#define ADDR (buf)\n#define LIT \"lit\"\n"
+    val (text, why) = ims_refused(header)
+
+    assert(!text.contains("ADDR: string"), text)
+    assert(why.contains("ADDR"), why)
+    assert(text.contains("LIT: string"), text)
+
+@test("a function-like macro is skipped as before, a string macro beside it is bound")
+ims_function_like_skipped()
+    if !ims_ready() then return
+
+    val header = "#define NAME \"n\"\n#define SHOW(x) (x)\n"
+    val (text, why) = ims_refused(header)
+
+    assert(text.contains("NAME: string"), text)
+    assert(!text.contains("SHOW: string"), text)
+    assert(why.contains("SHOW: a function-like macro"), why)
+
+@test("a prefix is taken off a string macro's name, and a number macro is unchanged")
+ims_prefix()
+    if !ims_ready() then return
+
+    val dir = make_temp_dir("sysl-ims").unwrap()
+
+    write_text(s"$dir/t.h", "#define FX_NAME \"fx\"\n#define FX_N 7\n").unwrap()
+
+    val out = import_c_generate(s"$dir/t.h", IcOptions("fx_", "", "", "", None, buf(), "")).unwrap()
+
+    remove_dir_all(dir).unwrap_or(())
+    assert(out.text.contains("NAME: string = \"FX_NAME\""), out.text)
+    assert(out.text.contains("N: i32 = \"FX_N\""), out.text)

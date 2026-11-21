@@ -1186,6 +1186,64 @@ zeroed_drop_elements()
     assert_eq(dropped_count, before + 2)
     assert_eq(raw[0], 0)
 
+// A growth moves the elements into the bigger storage rather than counting each one into it and back
+// out of the old one, by `push` and by `try_push` alike; what is observable is that every element is
+// still there, in order, and its destructor runs once, when the buffer lets go of it.
+@test("relocating growth: try_push across several growths keeps every element and drops each once")
+relocating_try_push()
+    val before = dropped_count
+
+    var b: Buf[&Dropped] = buf()
+
+    for i in 0..<40 do assert(b.try_push(Dropped(i)).is_ok())
+
+    assert_eq(b.len(), 40)
+    assert(b.cap() >= 40)
+    for i in 0..<40 do assert_eq(b[i].n, i)
+    assert_eq(dropped_count, before)
+
+    b.clear()
+    assert_eq(dropped_count, before + 40)
+
+@test("relocating growth: try_push while a view holds the old storage leaves both whole")
+relocating_try_push_shared()
+    val before = dropped_count
+
+    var b: Buf[&Dropped] = buf()
+
+    for i in 0..<8 do assert(b.try_push(Dropped(i)).is_ok())
+
+    val old = b.view()
+
+    for i in 8..<20 do assert(b.try_push(Dropped(i)).is_ok())
+
+    assert_eq(old.len, 8)
+    assert_eq(old[7].n, 7)
+    assert_eq(b[19].n, 19)
+    b.clear()
+    assert_eq(dropped_count, before + 12)
+    assert_eq(old[0].n, 0)
+
+@test("relocating growth: push and extend across growths keep counted elements and drop each once")
+relocating_push_extend()
+    val before = dropped_count
+
+    var b: Buf[&Dropped] = buf()
+
+    for i in 0..<9 do b.push(Dropped(i))
+
+    var more: Buf[&Dropped] = buf()
+
+    for i in 9..<30 do more.push(Dropped(i))
+    b.extend(more.view())
+    more.clear()
+    assert_eq(dropped_count, before)
+    assert_eq(b.len(), 30)
+    for i in 0..<30 do assert_eq(b[i].n, i)
+
+    b.clear()
+    assert_eq(dropped_count, before + 30)
+
 @test(should_trap)
 zeroed_push_drop_panics()
     var raw = zeroed_word()
