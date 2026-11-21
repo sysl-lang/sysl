@@ -129,7 +129,7 @@ reading in both cases. Preference decides nothing on its own here, because the m
 branch; it decides which thread is already at a program counter when a second one arrives there,
 which is what makes the answer the longest one rather than merely a matching one.
 
-        private walk(*self, n: &Node)
+        private walk(*self, n: &Node, back: bool)
             if self.over then return
 
             *n match
@@ -146,12 +146,16 @@ which is what makes the answer the longest one rather than merely a matching one
                 InSet(cls) ->
                     self.emit(MatchSet(cls))
                 Seq(l, r) ->
-                    self.walk(l)
-                    self.walk(r)
+                    if back then
+                        self.walk(r, back)
+                        self.walk(l, back)
+                    else
+                        self.walk(l, back)
+                        self.walk(r, back)
                 Star(inner) ->
                     var l1 = self.emit(Split(0, 0))
 
-                    self.walk(inner)
+                    self.walk(inner, back)
                     self.emit(Jump(l1))
 
                     var l3 = self.len()
@@ -160,7 +164,7 @@ which is what makes the answer the longest one rather than merely a matching one
                 Plus(inner) ->
                     var l1 = self.len()
 
-                    self.walk(inner)
+                    self.walk(inner, back)
 
                     var l3 = self.len() + 1
 
@@ -168,7 +172,7 @@ which is what makes the answer the longest one rather than merely a matching one
                 Quest(inner) ->
                     var split = self.emit(Split(0, 0))
 
-                    self.walk(inner)
+                    self.walk(inner, back)
 
                     var l2 = self.len()
 
@@ -176,12 +180,12 @@ which is what makes the answer the longest one rather than merely a matching one
                 Alt(l, r) ->
                     var split = self.emit(Split(0, 0))
 
-                    self.walk(l)
+                    self.walk(l, back)
 
                     var jmp = self.emit(Jump(0))
                     var l2 = self.len()
 
-                    self.walk(r)
+                    self.walk(r, back)
 
                     var l3 = self.len()
 
@@ -190,9 +194,12 @@ which is what makes the answer the longest one rather than merely a matching one
                 Group(inner, k) ->
                     var slot = usize(k) * 2
 
-                    self.emit(Save(slot))
-                    self.walk(inner)
-                    self.emit(Save(slot + 1))
+                    if back then
+                        self.walk(inner, back)
+                    else
+                        self.emit(Save(slot))
+                        self.walk(inner, back)
+                        self.emit(Save(slot + 1))
         end walk
     end Program
 
@@ -204,12 +211,27 @@ any other, and reporting it is reading slots 0 and 1.
         var p = Program(buf(), groups, false)
 
         p.emit(Save(0))
-        p.walk(root)
+        p.walk(root, false)
         p.emit(Save(1))
         p.emit(Accept)
 
         if p.over then Err(PatternTooLarge) else Ok(p)
     end compile
+
+The same tree read right to left, for the DFA's backward search (`dfa`): each concatenation is laid
+down with its sides swapped, and nothing else changes — an alternation, a repetition and a class
+match the same text in either direction. A group writes no slots, since that search reports only
+where the match begins. The anchors keep their meaning, because they speak about positions in the
+text rather than about which way it is read.
+
+    private[regex] compile_reverse(root: &Node) -> Result[Program, RegexError]
+        var p = Program(buf(), 0, false)
+
+        p.walk(root, true)
+        p.emit(Accept)
+
+        if p.over then Err(PatternTooLarge) else Ok(p)
+    end compile_reverse
 
     compile_pattern(pattern: string) -> Result[Program, RegexError]
         var t = parse_counted(pattern)?

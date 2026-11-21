@@ -46,8 +46,8 @@ union_field_refusal(t: Type, drops: Buf[string]) -> Option[string] = t match
         if d.simple then None
         else Some(s"'${type_show(t)}' carries data, and which variant it is decides what its other " +
                   "bytes mean")
-    Array(_, elem) -> union_field_refusal(*elem, drops)
-    Vector(_, elem) -> any_bits_refusal(*elem)
+    Array(_, elem, _) -> union_field_refusal(*elem, drops)
+    Vector(_, elem, _) -> any_bits_refusal(*elem)
     Struct(d) -> struct_union_refusal(d, drops)
     Str -> Some(s"a string is counted, ${no_tag_to_release()}")
     Slice(_, _) -> Some("a slice is a view of storage the program keeps, and nothing in a union says " +
@@ -160,7 +160,7 @@ holds_union(t: Type) -> bool = underlying(t) match
             if holds_union(f.1) then return true
 
         false
-    Array(_, elem) -> holds_union(*elem)
+    Array(_, elem, _) -> holds_union(*elem)
     _ -> false
 
 // What a pattern that takes a union apart is told. Binding one whole is fine.
@@ -179,7 +179,7 @@ needs_union_check(t: Type) -> bool = t match
     Bool -> true
     Enum(_) -> true
     Char -> true
-    Array(_, elem) -> needs_union_check(*elem)
+    Array(_, elem, _) -> needs_union_check(*elem)
     Struct(d) ->
         // A C bitfield is checked where it is read, as a bitfield struct's fields are.
         if d.union_layout || bitfield_ranges(d).is_some() || !d.c_bits.is_empty() then false
@@ -202,7 +202,7 @@ end any_part_checked
 read_under_union(x: TExpr) -> bool = *x.kind match
     TField(receiver, _, _) -> is_union(texpr_type(receiver)) || read_under_union(receiver)
     TIndex(receiver, _, _) -> underlying(texpr_type(receiver)) match
-        Array(_, _) -> read_under_union(receiver)
+        Array(_, _, _) -> read_under_union(receiver)
         _ -> false
     _ -> false
 
@@ -262,7 +262,7 @@ emit_union_check(e: *Emit, p: Val, t: Type, site: Span)
                     idx.push(ir_arg(l_i32(), VInt(from_int(long(struct_field_index(e.layout, d, d.slot(i)))))))
                     emit(e, InGep(fp, struct_lty(d), p, idx))
                     emit_union_check(e, fp, ft, site)
-        Array(n, elem) -> each_checked(e, p, n, *elem, site)
+        Array(n, elem, _) -> each_checked(e, p, n, *elem, site)
         _ -> ()
 end emit_union_check
 

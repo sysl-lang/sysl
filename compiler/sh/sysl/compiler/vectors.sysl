@@ -34,7 +34,7 @@ is_vector_memory(name: string) -> bool = name == "load" || name == "store" || na
 
 // Whether the type is a vector, asked of a representation.
 is_vector(t: Type) -> bool = t match
-    Vector(_, _) -> true
+    Vector(_, _, _) -> true
     _ -> false
 
 // Whether a type may be a lane.
@@ -70,13 +70,13 @@ balance_lanes(l: TExpr, r: TExpr) -> (TExpr, TExpr)
     val rt = repr(texpr_type(r))
 
     lt match
-        Vector(_, e) ->
+        Vector(_, e, _) ->
             if !is_vector(rt) && type_eq(rt, repr(*e)) then
                 return (l, TExpr(r.span, TSplat(r, lt)))
         _ -> ()
 
     rt match
-        Vector(_, e) ->
+        Vector(_, e, _) ->
             if !is_vector(lt) && type_eq(lt, repr(*e)) then
                 return (TExpr(l.span, TSplat(l, rt)), r)
         _ -> ()
@@ -107,8 +107,8 @@ vec_compare(cx: &Analyzer, span: Span, ts: Buf[TExpr], ops: Buf[string]) -> TExp
                       s"${type_show(texpr_type(r))}")
 
     val lanes = lty match
-        Vector(n, e) -> (n, underlying(*e))
-        other -> (0, other)
+        Vector(n, e, term) -> (n, underlying(*e), term)
+        other -> (0, other, buf())
 
     val equality = op == "==" || op == "!="
     val ok = lanes.1 match
@@ -124,7 +124,7 @@ vec_compare(cx: &Analyzer, span: Span, ts: Buf[TExpr], ops: Buf[string]) -> TExp
     // ordering, exactly as a scalar `bool` does.
     if !ok then return cx.err(span, s"'$op' is not defined for ${type_show(texpr_type(l))}")
 
-    TExpr(span, TVecCompare(op, l, r, Vector(lanes.0, Bool)))
+    TExpr(span, TVecCompare(op, l, r, Vector(lanes.0, Bool, lanes.2)))
 end vec_compare
 
 // One of the six, checked and lowered.
@@ -136,7 +136,7 @@ end vec_compare
 vector_method(cx: &Analyzer, span: Span, v: Type, tr: TExpr, name: string,
               args: Buf[Expr]) -> TExpr
     val parts = v match
-        Vector(n, e) -> (n, *e)
+        Vector(n, e, _) -> (n, *e)
         _ -> (0, Unknown)
 
     val elem = parts.1
@@ -245,7 +245,7 @@ private vector_dot(cx: &Analyzer, span: Span, v: Type, n: int, elem: Type, lane:
     val (bits, signed) = info.unwrap()
     val width = if bits <= 16 then 32 else if bits <= 32 then 64 else bits
     val acc = Integer(width, signed, false)
-    val wide = Vector(n, acc)
+    val wide = Vector(n, acc, buf())
     val product = TExpr(span, TBinary("*%", TExpr(span, TCast(tr, wide)), TExpr(span, TCast(b, wide)), wide))
 
     TExpr(span, TReduce("add", product, acc))
@@ -316,7 +316,7 @@ end vector_lane_float
 // Whether a `bits` node reads a mask (its lanes packed into an integer) rather than a float vector
 // (its lanes' encodings, one bitcast).
 is_mask_bits(operands: Buf[TExpr]) -> bool = texpr_type(operands[0]) match
-    Vector(_, elem) -> underlying(*elem) == Bool
+    Vector(_, elem, _) -> underlying(*elem) == Bool
     _ -> false
 
 // The unsigned integer of a float lane's own width: what `FloatBits` calls its `Word`.
@@ -340,7 +340,7 @@ private vector_bits(cx: &Analyzer, span: Span, v: Type, n: int, lane: Type, tr: 
         cx.fault(span, s"'bits' takes no arguments — it reads the encoding of each lane of the " +
                  s"${type_show(v)} it is read off")
 
-    TExpr(span, TVecOp("bits", one_operand(tr), Vector(n, word.unwrap())))
+    TExpr(span, TVecOp("bits", one_operand(tr), Vector(n, word.unwrap(), buf())))
 end vector_bits
 
 // Where `<4>f32.from_bits` was written: the parser reads the dot as part of a qualified lane name, so
@@ -375,7 +375,7 @@ end vector_selection
 // vector `bits()` answers and nothing else, as the scalar takes its `Word`.
 vector_static(cx: &Analyzer, span: Span, v: Type, name: string, args: Buf[Expr]) -> TExpr
     val parts = repr(v) match
-        Vector(n, e) -> (n, underlying(*e))
+        Vector(n, e, _) -> (n, underlying(*e))
         _ -> (0, Unknown)
     val word = float_word(parts.1)
 
@@ -387,7 +387,7 @@ vector_static(cx: &Analyzer, span: Span, v: Type, name: string, args: Buf[Expr])
                       s"'${type_show(v)}.from_bits(b)', and ${quantity(args.len(), "argument")} " +
                       s"${if args.len() == 1 then "was" else "were"} given")
 
-    val want = Vector(parts.0, word.unwrap())
+    val want = Vector(parts.0, word.unwrap(), buf())
     val b = type_expr(cx, args[0], Some(want))
 
     if !type_eq(repr(texpr_type(b)), want) then
@@ -539,7 +539,7 @@ private vector_select(cx: &Analyzer, span: Span, v: Type, lanes: int, tr: TExpr,
                       s"${type_show(texpr_type(pair.0))} and ${type_show(texpr_type(pair.1))}")
 
     val n = at match
-        Vector(k, _) -> k
+        Vector(k, _, _) -> k
         _ -> 0
 
     if n != lanes then
@@ -604,7 +604,7 @@ private vector_shuffle(cx: &Analyzer, span: Span, v: Type, n: int, elem: Type, t
 
     if lanes.is_none() then return bad_expr(span)
 
-    TExpr(span, TShuffle(tr, second, lanes.unwrap(), Vector(int(lanes.unwrap().len()), elem)))
+    TExpr(span, TShuffle(tr, second, lanes.unwrap(), Vector(int(lanes.unwrap().len()), elem, buf())))
 end vector_shuffle
 
 // The vector of positions a `lookup` or a `gather` reads at: an integer vector, read as itself. A
@@ -626,7 +626,7 @@ private lane_positions(cx: &Analyzer, span: Span, name: string, form: string,
     if xt == Unknown then return None
 
     val parts = xt match
-        Vector(n, e) -> (n, underlying(*e))
+        Vector(n, e, _) -> (n, underlying(*e))
         _ -> (0, Unknown)
 
     val integral = parts.1 match
@@ -635,7 +635,7 @@ private lane_positions(cx: &Analyzer, span: Span, name: string, form: string,
 
     if !integral
         val instead = xt match
-            Array(_, _) -> " — positions known while compiling are a 'shuffle', and positions computed " +
+            Array(_, _, _) -> " — positions known while compiling are a 'shuffle', and positions computed " +
                            "at run time are a vector of them, such as '<16>u8'"
             _ -> ""
 
@@ -665,7 +665,7 @@ private vector_lookup(cx: &Analyzer, span: Span, v: Type, n: int, elem: Type, tr
 
     ops.push(tr)
     ops.push(idx)
-    TExpr(span, TVecOp("lookup", ops, Vector(m, elem)))
+    TExpr(span, TVecOp("lookup", ops, Vector(m, elem, buf())))
 end vector_lookup
 
 // `v.compress(m)` -- the lanes of `v` where `m` is true, in order, packed into the low lanes, and
@@ -683,7 +683,7 @@ private vector_compress(cx: &Analyzer, span: Span, v: Type, n: int, tr: TExpr,
 
     if mt == Unknown then return bad_expr(span)
 
-    val want = Vector(n, Bool)
+    val want = Vector(n, Bool, buf())
 
     if !type_eq(mt, want) then
         return cx.err(args[0].span, s"'compress' keeps the lanes a mask says to, so it takes the " +
@@ -734,7 +734,7 @@ swizzle_read(cx: &Analyzer, span: Span, tr: TExpr, name: string, lanes: int, ele
                           s"'${swizzle_letter(lane)}' is lane $lane")
 
     if picks.len() == 1 then TExpr(span, TLane(tr, picks[0], unqualified(elem)))
-    else TExpr(span, TShuffle(tr, None, picks, Vector(int(picks.len()), elem)))
+    else TExpr(span, TShuffle(tr, None, picks, Vector(int(picks.len()), elem, buf())))
 end swizzle_read
 
 // A shuffle's list, folded to lane numbers and each checked against the lanes there are to pick
@@ -830,7 +830,7 @@ private not_a_lane_list(t: Type) -> string =
 
 // Whether a type is what a list of lane numbers is held in: an array of integers.
 private is_lane_list(t: Type) -> bool = repr(t) match
-    Array(_, e) -> repr(*e) match
+    Array(_, e, _) -> repr(*e) match
         Integer(_, _, _) -> true
         _ -> false
     _ -> false
@@ -994,7 +994,7 @@ private vector_gather(cx: &Analyzer, span: Span, rty: Type, tr: TExpr, elem: Typ
     if found.is_none() then return bad_expr(span)
 
     val (idx, m) = found.unwrap()
-    val v = Vector(m, elem)
+    val v = Vector(m, elem, buf())
 
     if !lanes_or_err(cx, span, rty, elem, v) then return bad_expr(span)
 

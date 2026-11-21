@@ -214,6 +214,8 @@ struct Program
 struct Regex
     pattern: string
     prog: Program
+    private fwd: &Dfa
+    private rev: &Dfa
 ```
 
 | Member | Signature | Description |

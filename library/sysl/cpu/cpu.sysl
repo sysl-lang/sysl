@@ -1,0 +1,268 @@
+module sysl.cpu
+
+import sysl.sync.Ordering
+
+/** Asking the processor a program is running on which instruction-set extensions it has.
+ *
+ * **It is the question an `@unchecked("…")` block promises was asked**
+ * (`reference/attributes.md § @extensions`). A function marked `@extensions("sha3")` is compiled for
+ * an instruction some processors of its architecture lack, and a call of it from code the build does
+ * not promise `sha3` to is accepted only inside `@unchecked("sha3")`. This module is what goes in the
+ * `if` around that block:
+ *
+ * ```
+ * if cpu.has("sha3")
+ *     @unchecked("sha3")
+ *         digest_fast(data)
+ * else
+ *     digest_portable(data)
+ * ```
+ *
+ * **The names are `@extensions`'s**: each extension as LLVM names the feature, the names
+ * `codegen.extensions` takes. `names()` lists the ones this target's processor can be asked about.
+ * A literal outside that list is refused while compiling, as `@extensions` refuses it; a name that
+ * arrives at run time and is not in the list answers false.
+ *
+ * **How it asks is the system's, and the answer is asked once.** On macOS each name is a
+ * `sysctlbyname("hw.optional.arm.FEAT_…")`; on Linux and Android on AArch64 it is a bit of
+ * `getauxval(AT_HWCAP)` or `getauxval(AT_HWCAP2)`, which is what the kernel has decided user code may
+ * run; on x86-64 it is `cpuid`, with `xgetbv` saying whether the operating system saves the AVX and
+ * AVX-512 registers -- a processor that has AVX under a system that does not save its registers does
+ * not have AVX for a program. The first call asks every name at once and keeps the answer; every call
+ * after it is a load and a mask.
+ *
+ * **Only a hosted program asks.** A bare-metal image is built for one processor and has no operating
+ * system to ask, so there the build says what the processor has (`codegen.extensions`, `--cpu`), and a
+ * call of `has` is refused while compiling, naming that. The module still builds there, so a package
+ * that dispatches puts its query under `#if hosted`.
+ */
+
+#if aarch64
+// Every extension an AArch64 processor can be asked about, as LLVM names it.
+private val table: [36]string = [
+    "fp-armv8", "neon", "crc", "aes", "sha2", "sha3", "sm4", "lse", "lse2", "rdm", "dotprod",
+    "fullfp16", "fp16fml", "rcpc", "rcpc-immo", "jsconv", "complxnum", "flagm", "altnzcv", "fptoint",
+    "ssbs", "sb", "pauth", "dit", "bf16", "i8mm", "sve", "sve2", "bti", "rand", "sme", "sme2", "cssc",
+    "wfxt", "hbc", "mops"]
+#elif x86_64
+// Every extension an x86-64 processor can be asked about, as LLVM names it.
+private val table: [40]string = [
+    "sse", "sse2", "sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "pclmul", "aes", "cx16", "movbe",
+    "xsave", "rdrnd", "avx", "fma", "f16c", "bmi", "bmi2", "avx2", "adx", "rdseed", "sha", "avx512f",
+    "avx512dq", "avx512ifma", "avx512cd", "avx512bw", "avx512vl", "avx512vbmi", "avx512vbmi2", "gfni",
+    "vaes", "vpclmulqdq", "avx512vnni", "avx512bitalg", "avx512vpopcntdq", "avxvnni", "lzcnt",
+    "avx512bf16", "avx512fp16"]
+#else
+// `@extensions` is accepted on aarch64 and x86_64 only, so elsewhere there is nothing to ask about.
+private val table: [0]string = []
+#endif
+
+/** Every name `has` can be asked about on this target's processor, in a fixed order.
+ *
+ * They are `@extensions`'s names for the architecture: on AArch64 `crc`, `aes`, `sha2`, `sha3`,
+ * `dotprod`, `lse` and the rest; on x86-64 `sse4.2`, `avx2`, `bmi2`, `avx512f` and the rest. On every
+ * other processor the list is empty, as `@extensions` is refused there.
+ */
+names() -> []const string = table[..]
+
+/** Whether the processor this program is running on has the extension `name`.
+ *
+ * `name` is one of `names()`. Written as a literal, any other name is refused while compiling, naming
+ * the ones there are; arriving at run time, any other name answers false. The first call asks the
+ * processor about every name and keeps the answers, so each call after it costs a load.
+ *
+ * It needs an operating system to ask, and is refused on a bare-metal target, where the build's own
+ * `codegen.extensions` says what the processor has.
+ */
+@needs(os)
+has(name: string) -> bool
+    for i in 0..<table.len
+        if table[i] == name then return (answers() >> u64(i)) & 1 == 1
+
+    false
+end has
+
+// The bit that says the answers have been asked for. No table is 63 names long.
+private const asked: u64 = 1 << 63
+
+#if hosted && (aarch64 || x86_64)
+// Every answer at once, a bit per name in `table`'s order, and `asked`. Two threads making the first
+// call at once both ask and both store the same word, so the race is harmless and no lock is needed.
+private var cache: u64 = 0
+
+@needs(os)
+private answers() -> u64
+    val kept = atomic_load(&cache, Ordering.Relaxed)
+
+    if kept != 0 then return kept
+
+    val fresh = ask() | asked
+
+    atomic_store(&cache, fresh, Ordering.Relaxed)
+    fresh
+end answers
+#else
+// No operating system to ask (a call is refused while compiling), or no extension to ask about.
+private answers() -> u64 = asked
+#endif
+
+// -- AArch64: macOS's sysctl per name, Linux's and Android's auxiliary vector -------------------------
+
+#if hosted
+#if aarch64
+#if macos
+@needs(os)
+private extern "sysctlbyname" c_sysctlbyname(name: *u8, old: *i32, old_len: *usize, new: *u8,
+                                             new_len: usize) -> i32
+
+// Each name's key, in `table`'s order. A key the running system does not have answers false.
+private val mac_keys: [36]*u8 = [
+    c"hw.optional.floatingpoint", c"hw.optional.arm.AdvSIMD", c"hw.optional.arm.FEAT_CRC32",
+    c"hw.optional.arm.FEAT_AES", c"hw.optional.arm.FEAT_SHA256", c"hw.optional.arm.FEAT_SHA3",
+    c"hw.optional.arm.FEAT_SM4", c"hw.optional.arm.FEAT_LSE", c"hw.optional.arm.FEAT_LSE2",
+    c"hw.optional.arm.FEAT_RDM", c"hw.optional.arm.FEAT_DotProd", c"hw.optional.arm.FEAT_FP16",
+    c"hw.optional.arm.FEAT_FHM", c"hw.optional.arm.FEAT_LRCPC", c"hw.optional.arm.FEAT_LRCPC2",
+    c"hw.optional.arm.FEAT_JSCVT", c"hw.optional.arm.FEAT_FCMA", c"hw.optional.arm.FEAT_FlagM",
+    c"hw.optional.arm.FEAT_FlagM2", c"hw.optional.arm.FEAT_FRINTTS", c"hw.optional.arm.FEAT_SSBS",
+    c"hw.optional.arm.FEAT_SB", c"hw.optional.arm.FEAT_PAuth", c"hw.optional.arm.FEAT_DIT",
+    c"hw.optional.arm.FEAT_BF16", c"hw.optional.arm.FEAT_I8MM", c"hw.optional.arm.FEAT_SVE",
+    c"hw.optional.arm.FEAT_SVE2", c"hw.optional.arm.FEAT_BTI", c"hw.optional.arm.FEAT_RNG",
+    c"hw.optional.arm.FEAT_SME", c"hw.optional.arm.FEAT_SME2", c"hw.optional.arm.FEAT_CSSC",
+    c"hw.optional.arm.FEAT_WFxT", c"hw.optional.arm.FEAT_HBC", c"hw.optional.arm.FEAT_MOPS"]
+
+@needs(os)
+private ask() -> u64
+    var out: u64 = 0
+
+    for i in 0..<mac_keys.len
+        var v: i32 = 0
+        var n: usize = 4
+
+        if c_sysctlbyname(mac_keys[i], &v, &n, null, 0) == 0 && v != 0
+            out |= u64(1) << u64(i)
+
+    out
+end ask
+#elif linux || android
+@needs(os)
+private extern "getauxval" c_getauxval(kind: u64) -> u64
+
+private const at_hwcap: u64 = 16
+private const at_hwcap2: u64 = 26
+
+// Each name's bit, in `table`'s order: below 64 a bit of AT_HWCAP, from 64 one of AT_HWCAP2.
+private val hwcap_bits: [36]u8 = [
+    0, 1, 7, 3, 6, 17, 19, 8, 25, 12, 20, 9, 23, 15, 26, 13, 14, 27, 71, 72, 28, 29, 30, 24, 78, 77, 22,
+    65, 81, 80, 87, 101, 98, 95, 108, 107]
+
+@needs(os)
+private ask() -> u64
+    val caps = c_getauxval(at_hwcap)
+    val caps2 = c_getauxval(at_hwcap2)
+    var out: u64 = 0
+
+    for i in 0..<hwcap_bits.len
+        val b = u64(hwcap_bits[i])
+        val word = if b < 64 then caps else caps2
+
+        if (word >> (b % 64)) & 1 == 1 then out |= u64(1) << u64(i)
+
+    out
+end ask
+#else
+private ask() -> u64 = 0
+#endif
+#elif x86_64
+// -- x86-64: cpuid and xgetbv -------------------------------------------------------------------------
+
+// Where each name's bit is, in `table`'s order: the leaf (1, 7 for leaf 7 subleaf 0, 71 for leaf 7
+// subleaf 1, 81 for 0x80000001), the register (0 eax, 1 ebx, 2 ecx, 3 edx), the bit, and the register
+// state the system must save for it (0 none, 1 AVX's, 2 AVX-512's).
+private val cpuid_bits: [40](u8, u8, u8, u8) = [
+    (1, 3, 25, 0), (1, 3, 26, 0), (1, 2, 0, 0), (1, 2, 9, 0), (1, 2, 19, 0), (1, 2, 20, 0),
+    (1, 2, 23, 0), (1, 2, 1, 0), (1, 2, 25, 0), (1, 2, 13, 0), (1, 2, 22, 0), (1, 2, 26, 0),
+    (1, 2, 30, 0), (1, 2, 28, 1), (1, 2, 12, 1), (1, 2, 29, 1), (7, 1, 3, 0), (7, 1, 8, 0),
+    (7, 1, 5, 1), (7, 1, 19, 0), (7, 1, 18, 0), (7, 1, 29, 0), (7, 1, 16, 2), (7, 1, 17, 2),
+    (7, 1, 21, 2), (7, 1, 28, 2), (7, 1, 30, 2), (7, 1, 31, 2), (7, 2, 1, 2), (7, 2, 6, 2),
+    (7, 2, 8, 0), (7, 2, 9, 1), (7, 2, 10, 1), (7, 2, 11, 2), (7, 2, 12, 2), (7, 2, 14, 2),
+    (71, 0, 4, 1), (81, 2, 5, 0), (71, 0, 5, 2), (7, 3, 23, 2)]
+
+// One `cpuid`: the four registers it answers for `leaf` and `sub`.
+private cpuid(leaf: u32, sub: u32) -> (u32, u32, u32, u32)
+    var a: u32 = 0
+    var b: u32 = 0
+    var c: u32 = 0
+    var d: u32 = 0
+
+    asm
+        [x86_64]
+            "cpuid"
+            inout leaf -> a : "eax"
+            inout sub -> c : "ecx"
+            out b : "ebx"
+            out d : "edx"
+        [aarch64, riscv64, riscv32, thumb, craft, wasm32] unavailable "cpuid is x86's"
+
+    (a, b, c, d)
+end cpuid
+
+// XCR0, which says which register state the system saves on a switch. Asked only where `cpuid` says
+// the system has turned `xgetbv` on (OSXSAVE); elsewhere the instruction faults.
+private xcr0() -> u64
+    var lo: u32 = 0
+    var hi: u32 = 0
+    val zero: u32 = 0
+
+    asm
+        [x86_64]
+            "xgetbv"
+            in zero : "ecx"
+            out lo : "eax"
+            out hi : "edx"
+        [aarch64, riscv64, riscv32, thumb, craft, wasm32] unavailable "xgetbv is x86's"
+
+    u64(hi) << 32 | u64(lo)
+end xcr0
+
+private ask() -> u64
+    val top = cpuid(0, 0).0
+    val one = cpuid(1, 0)
+    val seven = if top >= 7 then cpuid(7, 0) else (0, 0, 0, 0)
+    val seven1 = if top >= 7 && seven.0 >= 1 then cpuid(7, 1) else (0, 0, 0, 0)
+    val ext = if cpuid(0x80000000, 0).0 >= 0x80000001 then cpuid(0x80000001, 0) else (0, 0, 0, 0)
+    val xcr = if (one.2 >> 27) & 1 == 1 then xcr0() else 0
+    val avx_saved = xcr & 6 == 6
+
+#if macos
+    // Darwin saves the AVX-512 registers from a thread's first use of them, so XCR0 does not show
+    // them until then; LLVM's own `__builtin_cpu_supports` trusts it the same way.
+    val avx512_saved = avx_saved
+#else
+    val avx512_saved = xcr & 0xe6 == 0xe6
+#endif
+
+    var out: u64 = 0
+
+    for i in 0..<cpuid_bits.len
+        val (leaf, reg, bit, state) = cpuid_bits[i]
+        val regs = leaf match
+            1 -> one
+            7 -> seven
+            71 -> seven1
+            _ -> ext
+        val word = reg match
+            0 -> regs.0
+            1 -> regs.1
+            2 -> regs.2
+            _ -> regs.3
+        val saved = state match
+            0 -> true
+            1 -> avx_saved
+            _ -> avx512_saved
+
+        if saved && (word >> u32(bit)) & 1 == 1 then out |= u64(1) << u64(i)
+
+    out
+end ask
+#endif
+#endif
