@@ -1345,6 +1345,13 @@ analyze_instance_in(a: &Analysis, cx: &Analyzer, name: string, d: FuncDecl) -> T
         cx.fault(misfit_literal(body.result.unwrap(), ret).map(l -> l.span).unwrap_or(span),
                  body_disagreement(declared_key(a, cx.scope, d), ret, body.ty, cx.ret_is_list))
 
+    // **An instantiation made over a type that was never worked out says nothing.** The call that
+    // asked for it was refused where it was written -- a closure argument with a type error leaves
+    // the result parameter `?` -- so whatever the library's body then complains of (`None` with no
+    // `Option` to settle, `[]` with no element type) is a consequence, and would point at the
+    // library's line instead of the user's.
+    if mentions_unknown(ret) || any_param_unknown(params) then a.restore_complaints(said)
+
     // A `-> ref` member answers its place's address (`ref_result.sysl`).
     val answered = if d.marks.answers_place then answer_place(cx, decl_anchor(d), name, params, body, ret)
                    else body
@@ -1377,6 +1384,13 @@ analyze_instance_in(a: &Analysis, cx: &Analyzer, name: string, d: FuncDecl) -> T
           exported_symbol(d), d.section, body_marks(cx, d.marks), cx.owner, d.const_fn, Some(cx.scope.src),
           export_hidden(d))
 end analyze_instance_in
+
+private any_param_unknown(params: Buf[(string, Type)]) -> bool
+    for p in params
+        if mentions_unknown(p.1) then return true
+
+    false
+end any_param_unknown
 
 // The key a declaration was filed under, for a diagnostic naming the declaration an instantiation
 // came from rather than the instantiation itself. A member's own name is already a key; a free
