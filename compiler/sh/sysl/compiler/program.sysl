@@ -506,6 +506,7 @@ private linked_symbol(a: &Analysis, home: ExternHome, d: ExternDecl, params: Buf
                 "be declared with '...'")
 
     val resolved = if is_crc32c_intrinsic(written) then resolve_crc32c(a.tables.target, written, params, ret)
+                   else if is_vector_intrinsic(written) then resolve_vector_intrinsic(a.tables.target, written, params, ret)
                    else resolve_intrinsic(written, params, ret)
 
     resolved match
@@ -700,8 +701,8 @@ private intrinsic_arity(base: string) -> Option[usize] = base match
     "llvm.maximum" -> Some(2)
     _ -> None
 
-// The ones there are, in the order a refusal lists them: the registry's library floats, then the
-// CRC-32C instructions.
+// The ones there are, in the order a refusal lists them: the registry's library floats, the
+// CRC-32C instructions, then the vector ones.
 supported_intrinsics() -> Buf[string]
     var out: Buf[string] = buf()
 
@@ -709,6 +710,9 @@ supported_intrinsics() -> Buf[string]
         out.push(name)
 
     for name in llvm_crc32c_intrinsics()
+        out.push(name)
+
+    for name in llvm_vector_intrinsics()
         out.push(name)
 
     out
@@ -837,6 +841,107 @@ private crc32c_shape(base: string) -> (Type, Type, Type)
                                          Integer(64, false, false))
         _ -> (w, w, w)
 end crc32c_shape
+
+// Whether `base` is one of the vector intrinsics (`llvm_registry.sysl`).
+is_vector_intrinsic(base: string) -> bool = llvm_vector_intrinsic_extension(base) != ""
+
+// A vector intrinsic, held to the processor and to the signatures it has. **A vector is the right
+// type here, though it may not cross a C boundary** (`analyze.sysl`): the back end hands an intrinsic
+// its registers directly, so no calling convention is in play. Each name has a short list of forms --
+// the AES rounds one, `eor3` four lane widths, `sdot` two -- and the declaration is one of them; the
+// overload suffix LLVM spells (`.v2i64`, `.v4i32.v16i8`) is built from the form, so the width is
+// written once. **The feature is each call's question, not the declaration's**, as it is for the
+// CRC-32C instructions (`extensions.sysl`).
+private resolve_vector_intrinsic(t: Target, base: string, params: Buf[Type], ret: Type) -> Result[string, string]
+    val aarch64 = base.starts_with("llvm.aarch64.")
+    val machine = if aarch64 then "AArch64" else "x86-64"
+
+    if (aarch64 && t.cpu != Aarch64) || (!aarch64 && t.cpu != X86_64)
+        return Err(s"'$base' is an $machine instruction, and this build is for '${t.name}'")
+
+    val forms = vector_forms(base)
+    val stated = crc32c_stated(params, ret)
+    var listed = ""
+
+    for i in 0..<forms.len()
+        val one = forms[i]
+        val shown = crc32c_stated(one.0, one.1)
+
+        if shown == stated then return Ok(base + vector_suffix(base, one.0, one.1))
+
+        listed = listed + (if i > 0 then ", " else "") + shown
+
+    Err(s"'$base' is ${if forms.len() == 1 then "" else "one of "}$listed, and this declaration states '$stated'")
+end resolve_vector_intrinsic
+
+private vec_of(n: int, bits: int, signed: bool) -> Type = Vector(n, Integer(bits, signed, false))
+
+// The signatures a vector intrinsic has, as parameters and the answer.
+private vector_forms(base: string) -> Buf[(Buf[Type], Type)]
+    var out: Buf[(Buf[Type], Type)] = buf()
+    val bytes = vec_of(16, 8, false)
+    val pair = vec_of(2, 64, false)
+
+    if base == "llvm.aarch64.crypto.aese" || base == "llvm.aarch64.crypto.aesd"
+        out.push(form(2, bytes, bytes, bytes, bytes))
+    else if base == "llvm.aarch64.crypto.aesmc" || base == "llvm.aarch64.crypto.aesimc"
+        out.push(form(1, bytes, bytes, bytes, bytes))
+    else if base == "llvm.aarch64.crypto.rax1"
+        out.push(form(2, pair, pair, pair, pair))
+    else if base.starts_with("llvm.aarch64.crypto.")
+        // eor3 and bcax: three registers of one lane width, signedness as the name says.
+        val signed = base.ends_with("s")
+
+        for lane in [8, 16, 32, 64]
+            val v = vec_of(128 / lane, lane, signed)
+
+            out.push(form(3, v, v, v, v))
+    else if base.starts_with("llvm.aarch64.neon.")
+        // sdot and udot: an accumulator of 32-bit lanes and two registers of the bytes folded into it.
+        val signed = base.ends_with("sdot")
+
+        out.push(form(3, vec_of(4, 32, signed), vec_of(16, 8, signed), vec_of(16, 8, signed), vec_of(4, 32, signed)))
+        out.push(form(3, vec_of(2, 32, signed), vec_of(8, 8, signed), vec_of(8, 8, signed), vec_of(2, 32, signed)))
+    else if base == "llvm.x86.aesni.aesimc"
+        out.push(form(1, pair, pair, pair, pair))
+    else if base.starts_with("llvm.x86.aesni.")
+        out.push(form(2, pair, pair, pair, pair))
+    else
+        // VNNI: an accumulator and two registers of 32-bit lanes, each holding four bytes or two halves.
+        val v = vec_of(if base.ends_with(".128") then 4 else 8, 32, true)
+
+        out.push(form(3, v, v, v, v))
+
+    out
+end vector_forms
+
+// The first `n` of `a`, `b`, `c` as parameters, and the answer.
+private form(n: int, a: Type, b: Type, c: Type, ret: Type) -> (Buf[Type], Type)
+    var ps: Buf[Type] = buf()
+
+    ps.push(a)
+
+    if n > 1 then ps.push(b)
+    if n > 2 then ps.push(c)
+
+    (ps, ret)
+end form
+
+// The overload suffix LLVM spells for `ret` and, for `sdot`, the operands: `.v2i64`, `.v4i32.v16i8`.
+private vector_suffix(base: string, params: Buf[Type], ret: Type) -> string
+    if base.starts_with("llvm.aarch64.crypto.e") || base.starts_with("llvm.aarch64.crypto.b")
+        return "." + lane_suffix(ret)
+
+    if base.starts_with("llvm.aarch64.neon.") then return "." + lane_suffix(ret) + "." + lane_suffix(params[1])
+
+    ""
+end vector_suffix
+
+private lane_suffix(t: Type) -> string = t match
+    Vector(n, e) -> *e match
+        Integer(bits, _, _) -> s"v${n}i$bits"
+        _ -> ""
+    _ -> ""
 
 // A declaration's signature as the refusal writes it.
 private crc32c_stated(params: Buf[Type], ret: Type) -> string
