@@ -892,7 +892,7 @@ private read_depth(cx: &KeepsCx, t: Type, seen: *Buf[string], depth: int) -> int
         Ref(inner, _) -> deeper(read_depth(cx, *inner, seen, depth + 1))
         Weak(inner) -> deeper(read_depth(cx, *inner, seen, depth + 1))
         Volatile(inner) -> read_depth(cx, *inner, seen, depth + 1)
-        Array(_, elem) -> read_depth(cx, *elem, seen, depth + 1)
+        Array(_, elem, _) -> read_depth(cx, *elem, seen, depth + 1)
         Trait(_, _, _) -> -1
         Struct(d) ->
             if is_closure_literal(t) && !d.fields.is_empty() then return -1
@@ -1495,7 +1495,7 @@ read_through(t: Type, depth: int) -> bool
         Ptr(inner, _) -> !is_opaque_struct(*inner)
         Slice(_, _) -> true
         Volatile(inner) -> read_through(*inner, depth + 1)
-        Array(_, elem) -> read_through(*elem, depth + 1)
+        Array(_, elem, _) -> read_through(*elem, depth + 1)
         Struct(d) ->
             if is_closure_literal(t) then return false
 
@@ -3246,7 +3246,7 @@ private gather_steps(t: &Track, e: TExpr, out: *Buf[int], depth: int)
         TDeref(x, _) -> steps_on(t, x, out, depth)
         TField(r, _, _) -> if path_ok(t, e) then gather_steps(t, r, out, depth + 1)
         TIndex(r, _, _) -> texpr_type(r) match
-            Array(_, _) -> if path_ok(t, e) then gather_steps(t, r, out, depth + 1)
+            Array(_, _, _) -> if path_ok(t, e) then gather_steps(t, r, out, depth + 1)
             _ -> steps_on(t, r, out, depth)
         TCast(v, _) -> gather_steps(t, v, out, depth + 1)
         TSlice(base, _, _, _, _) -> view_steps(t, base, out, depth)
@@ -3854,7 +3854,7 @@ local_root(refs: Buf[(string, TExpr)], place: TExpr) -> Option[string]
             Some(n)
         TField(r, _, _) -> local_root(refs, r)
         TIndex(r, _, _) -> texpr_type(r) match
-            Array(_, _) -> local_root(refs, r)
+            Array(_, _, _) -> local_root(refs, r)
             _ -> None
         _ -> None
 end local_root
@@ -3967,7 +3967,7 @@ private into_pointee(t: &Track, place: TExpr) -> bool = *place.kind match
     // An element in place is inside the pointee; one of a view or a pointer read out of it is in
     // whatever storage that points at, which is not the pointee's.
     TIndex(r, _, _) -> texpr_type(r) match
-        Array(_, _) -> into_pointee(t, r)
+        Array(_, _, _) -> into_pointee(t, r)
         Ptr(_, _) -> carries(t, r)
         _ -> false
     _ -> false
@@ -3999,7 +3999,7 @@ private boxed(ty: Type) -> bool = ty match
     _ -> false
 
 is_array_type(ty: Type) -> bool = ty match
-    Array(_, _) -> true
+    Array(_, _, _) -> true
     _ -> false
 
 private call_carries(t: &Track, name: string, args: Buf[TExpr], ty: Type) -> bool
@@ -4098,7 +4098,7 @@ may_hold_pointer(cx: &KeepsCx, t: Type) -> bool = t match
     Ref(inner, _) -> may_hold_pointer(cx, *inner)
     Weak(inner) -> may_hold_pointer(cx, *inner)
     Volatile(inner) -> may_hold_pointer(cx, *inner)
-    Array(_, elem) -> may_hold_pointer(cx, *elem)
+    Array(_, elem, _) -> may_hold_pointer(cx, *elem)
     Slice(elem, _) -> may_hold_pointer(cx, *elem)
     Struct(d) -> aggregate_holds(cx, t, if d.targs.is_empty() then d.base else type_show(t))
     Enum(d) -> aggregate_holds(cx, t, if d.targs.is_empty() then d.base else type_show(t))
@@ -4124,7 +4124,7 @@ private holds_pointer_within(t: Type, seen: *Buf[string]) -> bool = t match
     Ref(inner, _) -> holds_pointer_within(*inner, seen)
     Weak(inner) -> holds_pointer_within(*inner, seen)
     Volatile(inner) -> holds_pointer_within(*inner, seen)
-    Array(_, elem) -> holds_pointer_within(*elem, seen)
+    Array(_, elem, _) -> holds_pointer_within(*elem, seen)
     Slice(elem, _) -> holds_pointer_within(*elem, seen)
     // **A closure literal with captures may hold the address of each `var` it captures** (`closure_mode.sysl`),
     // and whether it does is what this analysis is asked to decide -- so its value is followed
@@ -4149,7 +4149,7 @@ private holds_raw_pointer(t: Type, depth: int) -> bool
     t match
         Ptr(inner, _) -> !is_opaque_struct(*inner)
         Volatile(inner) -> holds_raw_pointer(*inner, depth + 1)
-        Array(_, elem) -> holds_raw_pointer(*elem, depth + 1)
+        Array(_, elem, _) -> holds_raw_pointer(*elem, depth + 1)
         Slice(elem, _) -> holds_raw_pointer(*elem, depth + 1)
         Struct(d) ->
             if is_closure_literal(t) then return false
@@ -6937,7 +6937,7 @@ frame_root_of(refs: Buf[(string, TExpr)], place: TExpr) -> Option[(string, Span)
             Some((name, place.span))
         TField(r, _, _) -> frame_root_of(refs, r)
         TIndex(r, _, _) -> texpr_type(r) match
-            Array(_, _) -> frame_root_of(refs, r)
+            Array(_, _, _) -> frame_root_of(refs, r)
             _ -> None
         _ -> None
 end frame_root_of

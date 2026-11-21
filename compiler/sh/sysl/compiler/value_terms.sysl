@@ -48,6 +48,23 @@ value_args_agree(av: BigInt, astood: bool, aterm: Buf[Mono], bv: BigInt, bstood:
     av == bv
 end value_args_agree
 
+// Whether two array lengths, or two lane counts, are one -- by VP1's rule, with one difference: a
+// length carrying no form that stands at zero agrees with a symbol, as a stand-in does. A length is
+// rebuilt in many places (a lane-wise result, a literal read at an expected type), and one rebuilt
+// without its form is the zero it stood at, not a zero anybody wrote; calling that unequal would
+// refuse what nothing proved wrong, so it is left to the instantiations, as every length was. A
+// written `[0]T` against `[N]T` is therefore answered there too.
+extents_agree(an: int, aterm: Buf[Mono], bn: int, bterm: Buf[Mono]) -> bool =
+    value_args_agree(from_int(long(an)), true, aterm, from_int(long(bn)), true, bterm)
+
+// A length or lane count as a reader writes it: its form where it has one, its number otherwise.
+extent_text(n: int, term: Buf[Mono]) -> string = if term.is_empty() then s"$n" else term_text(term)
+
+// A length as the value argument `term_difference` compares, so a length and a value argument are
+// told apart in one voice.
+private extent_arg(n: int, term: Buf[Mono]) -> Type =
+    ConstArg(from_int(long(n)), int_type(), !term.is_empty(), term)
+
 terms_eq(p: Buf[Mono], q: Buf[Mono]) -> bool
     if p.len() != q.len() then return false
 
@@ -436,10 +453,24 @@ private clash_in(want: Type, got: Type) -> (bool, Option[(Type, Type)])
         (Weak(w), Weak(g)) -> clash_in(*w, *g)
         (Volatile(w), Volatile(g)) -> clash_in(*w, *g)
         (Slice(w, wro), Slice(g, gro)) -> if wro == gro then clash_in(*w, *g) else (false, None)
-        (Array(wn, w), Array(gn, g)) -> if wn == gn then clash_in(*w, *g) else (false, None)
-        (Vector(wn, w), Vector(gn, g)) -> if wn == gn then clash_in(*w, *g) else (false, None)
+        (Array(wn, w, wterm), Array(gn, g, gterm)) -> extent_clash(wn, wterm, gn, gterm, *w, *g)
+        (Vector(wn, w, wterm), Vector(gn, g, gterm)) -> extent_clash(wn, wterm, gn, gterm, *w, *g)
         _ -> (false, None)
 end clash_in
+
+// Two arrays, or two vectors, at their lengths and then their elements: a length that disagrees by
+// form is the clash where the elements agree, as a value argument's is.
+private extent_clash(wn: int, wterm: Buf[Mono], gn: int, gterm: Buf[Mono], w: Type,
+                     g: Type) -> (bool, Option[(Type, Type)])
+    if extents_agree(wn, wterm, gn, gterm) then return clash_in(w, g)
+    if wterm.is_empty() && gterm.is_empty() then return (false, None)
+
+    val inner = clash_in(w, g)
+
+    if !inner.0 then return (false, None)
+
+    (true, Some((extent_arg(wn, wterm), extent_arg(gn, gterm))))
+end extent_clash
 
 private clash_list(ws: Buf[Type], gs: Buf[Type]) -> (bool, Option[(Type, Type)])
     if ws.len() != gs.len() then return (false, None)

@@ -1130,7 +1130,7 @@ private unheld_in(t: Type, seen: *Buf[string]) -> Option[string] = t match
     Integer(_, _, _) -> None
     Floating(_, _) -> None
     Fixed(_, _, _) -> None
-    Array(_, elem) -> unheld_in(*elem, seen)
+    Array(_, elem, _) -> unheld_in(*elem, seen)
     Struct(d) ->
         if d.opaque then return Some(s"an opaque '${d.name()}' is not evaluated while compiling")
 
@@ -1162,7 +1162,7 @@ private unheld_in(t: Type, seen: *Buf[string]) -> Option[string] = t match
     Unknown -> None
     Str -> None
     Slice(elem, _) -> unheld_in(*elem, seen)
-    Vector(_, elem) -> unheld_in(*elem, seen)
+    Vector(_, elem, _) -> unheld_in(*elem, seen)
     // The writer a rendering hands its `display` (`ConstWriter`), and an address the linker fills
     // in (`ConstLink`): held and handed on, never read through.
     Ptr(_, _) -> None
@@ -1263,9 +1263,9 @@ end array_text
 
 // The element type of a fixed array or a slice type, or `Unknown`.
 private element_type(t: Type) -> Type = underlying(t) match
-    Array(_, elem) -> *elem
+    Array(_, elem, _) -> *elem
     Slice(elem, _) -> *elem
-    Vector(_, elem) -> *elem
+    Vector(_, elem, _) -> *elem
     _ -> Unknown
 
 // A value a place takes, as a copy of its own: an array's elements are a buffer, and two places
@@ -1360,7 +1360,7 @@ private value_literal(span: Span, v: Const, t: Type) -> Option[TExpr] = v match
     ConstQuad(hi, lo) -> Some(TExpr(span, TQuadLit(hi, lo, underlying(t))))
     ConstUnit -> Some(TExpr(span, TUnitLit))
     ConstArray(xs) -> underlying(t) match
-        Vector(_, _) -> vector_literal(span, xs, t)
+        Vector(_, _, _) -> vector_literal(span, xs, t)
         _ -> array_literal(span, xs, t)
     ConstRecord(variant, fields) -> record_literal(span, variant, fields, t)
     // An address is laid down as the relocation it is: the folded place's address, or the function's.
@@ -1377,7 +1377,7 @@ private value_literal(span: Span, v: Const, t: Type) -> Option[TExpr] = v match
             for i in at..<cells.len()
                 rest.push(cells[i])
 
-            array_literal(span, rest, Array(int(rest.len()), inner)).map(arr ->
+            array_literal(span, rest, Array(int(rest.len()), inner, buf())).map(arr ->
                 TExpr(span, TAddrOf(TExpr(span, TIndex(arr, TExpr(span, TIntLit(from_int(0), int_type())), *inner)), t)))
         _ -> None
     _ -> None
@@ -2092,7 +2092,7 @@ private linked_place(r: &EvRun, place: TExpr) -> Result[Option[TExpr], Flow] = *
             other -> other
     TIndex(receiver, index, ty) ->
         val length = nameless(texpr_type(receiver)) match
-            Array(n, _) -> usize(n)
+            Array(n, _, _) -> usize(n)
             _ -> return Ok(None)
 
         val inside = linked_place(r, receiver) match
@@ -2215,7 +2215,7 @@ private zero_value(r: &EvRun, at: Span, ty: Type) -> Flow = underlying(ty) match
     Slice(_, _) -> EvGave(ConstView(buf(), 0, 0, -1))
     // A pointer's zero is null.
     Ptr(_, _) -> EvGave(ConstLink(TExpr(at, TNullLit(ty))))
-    Array(n, elem) ->
+    Array(n, elem, _) ->
         if !sized(r, at, long(n)) then return EvStop
 
         val z = zero_value(r, at, *elem) match
@@ -2242,7 +2242,7 @@ private holds_zero(ty: Type) -> bool = underlying(ty) match
     Str -> true
     Slice(_, _) -> true
     Ptr(_, _) -> true
-    Array(_, elem) -> holds_zero(*elem)
+    Array(_, elem, _) -> holds_zero(*elem)
     Struct(d) -> record_holds_zero(d)
     Enum(d) -> d.zero_variant().is_some()
     _ -> false
@@ -2349,7 +2349,7 @@ private array_fill(r: &EvRun, at: Span, value: TExpr, ty: Type) -> Flow
     if why.is_some() then return refuse_form(r, at, why.unwrap())
 
     val n = underlying(ty) match
-        Array(count, _) -> count
+        Array(count, _, _) -> count
         _ -> return refuse_form(r, at, s"a '${type_show(ty)}' is not evaluated while compiling yet")
 
     val v = eval_value(r, value) match
@@ -2543,7 +2543,7 @@ private lanes_of(v: Const) -> Buf[Const] = v match
 
 // How many lanes a vector type has.
 private lane_count(t: Type) -> int = underlying(t) match
-    Vector(n, _) -> n
+    Vector(n, _, _) -> n
     _ -> 0
 
 // `[a, b, c, d]` at a vector type: each lane computed in order.
@@ -3684,8 +3684,8 @@ end global_value
 // A vector is: the untyped fold reads a splat's scalar (`val s: <4>u16 = 7`) as the scalar itself.
 private held_whole(t: Type) -> bool = t match
     Str -> true
-    Array(_, _) -> true
-    Vector(_, _) -> true
+    Array(_, _, _) -> true
+    Vector(_, _, _) -> true
     Struct(_) -> true
     Enum(_) -> true
     _ -> false
@@ -3720,7 +3720,7 @@ private unary(r: &EvRun, at: Span, op: string, operand: TExpr, ty: Type) -> Flow
         Err(f) -> return f
 
     underlying(ty) match
-        Vector(_, _) ->
+        Vector(_, _, _) ->
             var out: Buf[Const] = buf()
 
             for x in lanes_of(v)
@@ -3784,7 +3784,7 @@ private binary(r: &EvRun, at: Span, op: string, l: TExpr, rt: TExpr, ty: Type) -
         Err(f) -> return f
 
     underlying(texpr_type(l)) match
-        Vector(_, _) -> return lanewise(r, at, op, texpr_type(l), texpr_type(rt), ty, x, y)
+        Vector(_, _, _) -> return lanewise(r, at, op, texpr_type(l), texpr_type(rt), ty, x, y)
         _ -> ()
 
     if fixed_arith_op(op, texpr_type(l), texpr_type(rt), ty) then
@@ -3829,7 +3829,7 @@ private ev_contracted(r: &EvRun, at: Span, k: Contraction, addend: Option[TExpr]
         _ -> 0
 
     underlying(ty) match
-        Vector(_, _) ->
+        Vector(_, _, _) ->
             val xs = lanes_of(x)
             val ys = lanes_of(y)
             val cs = lanes_of(c)
@@ -4051,7 +4051,7 @@ private cast(r: &EvRun, at: Span, operand: TExpr, ty: Type) -> Flow
         _ -> ()
 
     (repr(texpr_type(operand)), repr(ty)) match
-        (Vector(_, a), Vector(_, b)) -> return lanes_converted(r, at, v, *a, *b)
+        (Vector(_, a, _), Vector(_, b, _)) -> return lanes_converted(r, at, v, *a, *b)
         _ -> ()
 
     // A bare enum converts as the integer its variant's tag is, at the enum's underlying type.

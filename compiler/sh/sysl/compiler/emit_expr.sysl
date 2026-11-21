@@ -385,7 +385,7 @@ private gen_expr_kind(e: *Emit, x: TExpr) -> Val = *x.kind match
 
         if !elems.is_empty() && is_framed_lit(e, x.span)
             val elem = element(slice_ty).unwrap_or(int_type())
-            val array = TExpr(x.span, TArrayLit(elems, Array(int(elems.len()), elem)))
+            val array = TExpr(x.span, TArrayLit(elems, Array(int(elems.len()), elem, buf())))
 
             return gen_slice(e, array, None, None, false, slice_ty, x.span)
 
@@ -658,7 +658,7 @@ has_address(x: TExpr) -> bool = *x.kind match
 // How many elements something has. An array's length is its type's, so the receiver is evaluated for
 // its effects and the constant answered.
 gen_len(e: *Emit, receiver: TExpr) -> Val = underlying(texpr_type(receiver)) match
-    Array(n, _) ->
+    Array(n, _, _) ->
         gen_expr(e, receiver)
         VInt(from_int(long(n)))
     Slice(_, _) -> view_len(e, receiver)
@@ -733,7 +733,7 @@ end gen_promoted_slice
 zero_sized_elements(ty: Type) -> bool = element(ty).map(t -> zero_sized(t)).unwrap_or(false)
 
 private array_len_of(ty: Type) -> int = underlying(ty) match
-    Array(n, _) -> n
+    Array(n, _, _) -> n
     _ -> 0
 
 private view_len(e: *Emit, receiver: TExpr) -> Val
@@ -931,7 +931,7 @@ private gen_unary(e: *Emit, op: string, operand: TExpr, ty: Type, site: Span) ->
 
     if op == "~"
         underlying(ty) match
-            Vector(n, elem) ->
+            Vector(n, elem, _) ->
                 emit(e, InBin(r, OpXor, ety, v, VSplat(int(n), lty(e, underlying(*elem)), VInt(from_int(-1)))))
             _ -> emit(e, InBin(r, OpXor, ety, v, VInt(from_int(-1))))
 
@@ -945,7 +945,7 @@ private gen_unary(e: *Emit, op: string, operand: TExpr, ty: Type, site: Span) ->
         vector_lane_of(ty) match
             Integer(bits, signed, _) ->
                 underlying(ty) match
-                    Vector(_, _) -> emit(e, InBin(r, OpSub, ety, VZero, v))
+                    Vector(_, _, _) -> emit(e, InBin(r, OpSub, ety, VZero, v))
                     _ ->
                         // In a debug build, or inside a `@checked` region, negating the most
                         // negative value is the overflow it is.
@@ -964,7 +964,7 @@ end gen_unary
 
 // The lane a vector's operation is chosen from, or the type itself where it is not one.
 vector_lane_of(t: Type) -> Type = underlying(t) match
-    Vector(_, elem) -> underlying(*elem)
+    Vector(_, elem, _) -> underlying(*elem)
     other -> other
 
 // `&&` and `||`, which do not evaluate their right operand unless they must.
@@ -2111,8 +2111,8 @@ zero_of(e: *Emit, ty: Type) -> Val
         Weak(inner) -> if is_trait(*inner) then VZero else VNull
         CFn(_, _, _) -> VNull
         Struct(_) -> VZero
-        Array(_, _) -> VZero
-        Vector(_, _) -> VZero
+        Array(_, _, _) -> VZero
+        Vector(_, _, _) -> VZero
         Slice(_, _) -> VZero
         Str -> VZero
         VaList -> VZero
