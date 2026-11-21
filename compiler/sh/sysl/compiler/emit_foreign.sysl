@@ -106,9 +106,10 @@ end align_attrs
 
 // Lowers a call to a foreign function. `what` is what the `call` names between the keyword and the
 // callee -- the result type, or the callee's whole function type where it is variadic. `abandons`
-// is a callee declared `@abandons`, before which the frame gives back what it holds.
+// is a callee declared `@abandons`, before which the frame gives back what it holds. `kept` flags the
+// parameters the callee's `@keeps` names, one per parameter; it may be shorter than `args`.
 gen_foreign_call(e: *Emit, what: CallForm, callee: Val, args: Buf[TExpr], ty: Type,
-                 abandons: bool, twice: bool = false) -> Val
+                 abandons: bool, kept: Buf[bool], twice: bool = false) -> Val
     val result = c_result(e.layout, ty, e.target)
 
     // The storage a big result is written into is the caller's, so it exists before the call, and it
@@ -126,9 +127,10 @@ gen_foreign_call(e: *Emit, what: CallForm, callee: Val, args: Buf[TExpr], ty: Ty
 
     // An argument past the declared parameters is a variadic extra, and C classifies one exactly as
     // it classifies a declared parameter -- so both take the same path, each at its own type.
-    for a in args
+    for i in 0..<args.len()
+        val a = args[i]
         val at = texpr_type(a)
-        val v = gen_expr(e, a)
+        val v = to_c(e, gen_expr(e, a), at, i < kept.len() && kept[i])
 
         if !zero_sized(at)
             c_param(e.layout, at, e.target) match
@@ -151,7 +153,7 @@ gen_foreign_call(e: *Emit, what: CallForm, callee: Val, args: Buf[TExpr], ty: Ty
             val r = fresh_reg(e)
 
             emit(e, InLoad(r, coerced, returned.unwrap(), AccPlain, None))
-            own_temp(e, r, ty)
+            own_temp(e, from_c(e, r, ty), ty)
 
         CrCoerced(coerced) ->
             val r = fresh_reg(e)
@@ -162,7 +164,7 @@ gen_foreign_call(e: *Emit, what: CallForm, callee: Val, args: Buf[TExpr], ty: Ty
             // reinterpret and the round trip through memory would be a copy for its own sake.
             val same = l_render(coerced) == l_render(c_lty(e.layout, ty))
 
-            own_temp(e, if same then r else gather(e, r, coerced, ty), ty)
+            own_temp(e, from_c(e, if same then r else gather(e, r, coerced, ty), ty), ty)
 
         CrPlain ->
             if no_value(ty)
@@ -177,8 +179,52 @@ gen_foreign_call(e: *Emit, what: CallForm, callee: Val, args: Buf[TExpr], ty: Ty
                 val r = fresh_reg(e)
 
                 emit(e, form_call(what, Some(r), callee, arguments, twice))
-                own_temp(e, r, ty)
+                own_temp(e, from_c(e, r, ty), ty)
 end gen_foreign_call
+
+// Which of `n` arguments a call through a `*extern` pointer of type `t` hands to a parameter the type
+// writes `@keeps` -- `*extern(@keeps string) -> unit` -- one flag each.
+pointer_kept(t: Type, n: usize) -> Buf[bool]
+    var out: Buf[bool] = buf()
+
+    underlying(t) match
+        CFn(_, _, marks) ->
+            for i in 0..<n
+                out.push(marks_kept(marks, i))
+        _ -> ()
+
+    out
+end pointer_kept
+
+// **A string crosses to C in the long form, always** (`docs/design/short-strings.md` § 5.6). C reads
+// the three words as an owner, an address and a length, and a short string has no address -- its
+// bytes are the value. So one handed over by value is first made long: lent for the call, its bytes
+// are copied to a frame slot and C is given `{null, &slot, n}`, which is exactly what a null-owner
+// view promises; handed to a parameter the `extern`'s `@keeps` names, it is copied to the heap
+// instead, and that copy's one count goes with it to C, which may hold it past the call. A long string
+// crosses as it always has. Where the short form is off every string is long and nothing is done.
+//
+// Only the string *itself* is normalised. One inside a struct, a tuple or an enum handed by value
+// crosses in whichever form it holds, as one C reads through a pointer does (`strings.md` documents
+// the form).
+private to_c(e: *Emit, v: Val, at: Type, kept: bool) -> Val
+    if !short_strings_on() || underlying(at) != Str then return v
+
+    if kept then str_kept_for_c(e, v) else str_lent_to_c(e, v)
+end to_c
+
+// **A string C answers is in the long form**, since nothing outside sysl makes the short one: its
+// length word's top bit is the tag, and no length a C library holds reaches it. Checked rather than
+// trusted, because reading a C-made string as short would read its address as text.
+private from_c(e: *Emit, v: Val, ty: Type) -> Val
+    if !short_strings_on() || underlying(ty) != Str then return v
+
+    val long_form = fresh_reg(e)
+
+    emit(e, InBin(long_form, OpXor, l_i1(), str_is_short(e, v), VBool(true)))
+    trap_unless(e, long_form, "c_string")
+    v
+end from_c
 
 // A value of `t`, spread into the registers the convention hands it over in. Several registers are
 // read back out of a literal struct of them, which lays each piece out at the offset of the

@@ -1,0 +1,115 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// `sysl.regex` on every width of address. The lazy DFA bounds its cache by a count of states and a
+// count of instructions, and the bounds are `usize` constants: a bound that does not fit a 16-bit
+// `usize` shuts the whole standard library out of `craft`, every program with it, regex or not. So
+// the library is read for each machine, a program that searches is lowered against it, and the bound
+// the 16-bit machine was given is told from the one every other machine keeps.
+
+// The LLVM text of the whole module a source lowers to for one machine, or the first thing it was
+// refused with. The library is read for that machine, since a selector directory differs by target.
+private rxw_ir_for(t: Target, text: string) -> string
+    val parsed = parse(source_of("t.sysl", text))
+
+    if !parsed.ok() then return parsed.first().message
+
+    var units: Buf[Program] = buf()
+
+    std_root() match
+        Err(why) -> return why
+        Ok(root) -> std_units(root, t) match
+            Err(why) -> return why
+            Ok(library) ->
+                for item in library
+                    units.push(item)
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, t)
+
+    if !done.reported.is_empty() then return done.reported[0].diag.message
+
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+    val said = errors_of(done.an.diagnostics())
+
+    if !said.is_empty() then return analysis_report(said)
+
+    val kept = prune(strip_tests(whole), program_own(units))
+
+    ir_print_module(codegen_with_gaps(kept, t, promotions).0)
+end rxw_ir_for
+
+private rxw_no_library() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end rxw_no_library
+
+// A search forward and one that has to find where the match begins, so both of a pattern's DFAs are
+// built and both reach the cache's bounds.
+private val rxw_search: string = raw"""
+    import sysl.regex.{regex}
+
+    @export("rxw_hits")
+    rxw_hits(upto: usize) -> usize
+        val s = "xaab c12"[0..<upto]
+        val r = regex("a+b|c[0-9]*").unwrap()
+
+        var n: usize = 0
+
+        if r.is_match(s) then n += 1
+
+        r.find(s) match
+            Some(m) -> n += m.end()
+            None -> ()
+
+        n
+    """
+
+private rxw_lowers(name: string) -> string
+    val out = rxw_ir_for(target_named(name).unwrap(), rxw_search)
+
+    assert(out.contains("@rxw_hits("), s"$name did not lower a search:\n$out")
+    out
+
+@test("a program that searches lowers for a 16-bit machine, and the cache bound is its own")
+rxw_sixteen_bit()
+    if rxw_no_library() then return
+
+    assert_eq(target_named("craft-freestanding").unwrap().pointer_bits(), 16)
+
+    val out = rxw_lowers("craft-freestanding")
+
+    assert(!out.contains("1048576"), "a 16-bit machine was given the 64-bit cache bound")
+
+@test("and for a 32-bit board, which keeps the wide bound because it fits")
+rxw_thirty_two_bit()
+    if rxw_no_library() then return
+
+    assert_eq(target_named("thumb-freestanding").unwrap().pointer_bits(), 32)
+    assert(rxw_lowers("thumb-freestanding").contains("1048576"), "a 32-bit board lost the wide cache bound")
+
+@test("and for a 64-bit machine")
+rxw_sixty_four_bit()
+    if rxw_no_library() then return
+
+    assert(rxw_lowers("aarch64-freestanding").contains("1048576"), "a 64-bit machine lost the wide cache bound")
+
+// Over the whole registry, so a target added later with a width of its own is held to it too.
+@test("and every supported target lowers it")
+rxw_every_target()
+    if rxw_no_library() then return
+
+    for t in all_targets()
+        if t.supported()
+            val out = rxw_ir_for(t, rxw_search)
+
+            assert(out.contains("@rxw_hits("), s"${t.name} did not lower a search:\n$out")
+end rxw_every_target

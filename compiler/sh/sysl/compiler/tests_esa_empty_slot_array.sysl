@@ -1,0 +1,332 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// An empty ARRAY local (`var out: [N]E = slot_empty()`, `slots.sysl`) is written element by element:
+// it is settled once every element is -- by element assignments at constant indices among its block's
+// own statements, or by a counted loop `for i in 0..<out.len` there whose own statements assign
+// `out[i]` -- and its `.len` reads nothing. Which is what lets the codec decode `[N]E` where `E` has no
+// zero value.
+//
+// The axes: how the elements are written (a counted loop, constant indices, a whole row and a loop,
+// nested loops, the whole array, an element's address), how a fill falls short (a range short of the
+// length or not from zero, a `break`, a `continue`, a write under an `if`, at the wrong index, a fill
+// under an `if`, a gap among constant indices, a row of a grid), where a read lands (in the fill's own
+// value, a compound assignment, after a partial fill), the element type (a plain enum with no zero, a
+// counted string, a `&T` with a `Drop`, an array of arrays, an enum carrying a string), the generic
+// twins (a generic body, a method, the library's decoder), and the early ways out of a fill (`?`,
+// `return`) on the counted heap.
+//
+// Cells skipped: an inclusive range (its upper bound is never `out.len` itself, so it is the "short of
+// the length" cell); a `continue` after the element's write, which is refused though it could be
+// accepted (the rule asks for no `break` or `continue` anywhere in the body, the simple form that a
+// labelled `continue` of an outer loop cannot slip past); bare metal and separate compilation (the
+// check is analysis only and lowers nothing new).
+
+private struct EsaRun
+    ok: bool
+    out: string
+    err: string
+
+private esa_ready() -> bool = std_root().is_ok() && clang_available()
+
+// A program built with the heap counted and run, or the refusal as the command line renders it.
+private esa_run(text: string) -> EsaRun
+    val root = make_temp_dir("sysl-esa").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+    force_alloc_counting(true)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization,
+                                     Some(s"$root/built"))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return EsaRun(false, failure_text(why), "")
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> EsaRun(false, "could not be started", "")
+        Ok(o) -> EsaRun(o.status.ok(), o.text.trim(), o.err.unwrap_or(""))
+end esa_run
+
+// The run printed `expected` and gave back every allocation.
+private esa_clean(text: string, expected: string)
+    val run = esa_run(text)
+
+    assert(run.ok, run.out)
+    assert_eq(run.out, expected)
+    assert(!run.err.contains(alloc_count_said()), run.err)
+end esa_clean
+
+private esa_said(name: string) -> string =
+    s"'$name' is an empty slot, read here before anything was written to it"
+
+// A function over an empty `[3]u64` named `out`: `body` writes it, and then element 1 is read.
+private esa_over_three(body: string) -> string =
+    emit_func_text("f(p: *u64)\n    var out: [3]u64 = slot_empty()\n\n" + body + "\n    *p = out[1]\n", "f")
+
+private esa_accepted(body: string)
+    val text = esa_over_three(body)
+
+    assert(text.starts_with("define"), s"$body\n$text")
+
+private esa_refused(body: string)
+    assert_eq(esa_over_three(body), esa_said("out"))
+
+private esa_mode() -> string = raw"""
+    enum Mode
+        Idle
+        Busy
+
+    """
+
+// -- what settles it -----------------------------------------------------------------------------------
+
+@test("esa: an empty array's len is its type's and reads nothing, before any element is written")
+esa_len_first()
+    if !esa_ready() then return
+
+    esa_clean(esa_mode() + raw"""
+        f() -> [3]Mode
+            var out: [3]Mode = slot_empty()
+
+            print(out.len, out.len * 2)
+
+            for i in 0..<out.len do out[i] = if i == 1 then Busy else Idle
+
+            out
+
+        val m = f()
+
+        print(m[0] == Idle, m[1] == Busy, m[2] == Idle, m.len)
+        """, "3 6\ntrue true true 3")
+
+@test("esa: a counted loop, constant indices covering every element, or a whole write settle the array")
+esa_settled()
+    esa_accepted("    for i in 0..<out.len do out[i] = 1")
+    esa_accepted("    for i in 0..<out.len\n        val v = u64(i) * 2\n\n        out[i] = v\n        *p = v")
+    esa_accepted("    out[2] = 1\n    out[0] = 2\n    out[1] = 3")
+    esa_accepted("    out[0] = 1\n    out[0] = 4\n    out[1] = 2\n    out[2] = 3")
+    esa_accepted("    out[0] = 1\n    out = [1, 2, 3]")
+    // An element's address is a write the program vouches for, as the local's own address is.
+    esa_accepted("    slot_put(&out[0], 1)")
+    // A read in a later statement of the fill's own body is after the write of the same turn, but
+    // still before the rest are written.
+    esa_refused("    for i in 0..<out.len\n        out[i] = 1\n        *p = out[0]")
+
+@test("esa: a fill that can fall short leaves the array unwritten, and a read after it is refused")
+esa_short_fills()
+    esa_refused("    out[0] = 1\n    out[2] = 3")
+    esa_refused("    for i in 0..<2 do out[i] = 1")
+    esa_refused("    for i in 1..<out.len do out[i] = 1")
+    esa_refused("    for i in 0..<out.len\n        if i == 2 then break\n\n        out[i] = 1")
+    esa_refused("    for i in 0..<out.len\n        if i == 1 then continue\n\n        out[i] = 1")
+    esa_refused("    for i in 0..<out.len\n        out[i] = 1\n\n        if i == 1 then continue")
+    esa_refused("    for i in 0..<out.len\n        if i > 0 then out[i] = 1")
+    esa_refused("    for i in 0..<out.len do out[0] = 1")
+    esa_refused("    val n: usize = 0\n\n    for i in 0..<out.len do out[n] = 1")
+    esa_refused("    if *p > 0\n        for i in 0..<out.len do out[i] = 1")
+    esa_refused("    for i in 0..<out.len\n        for j in 0..<out.len do out[i] = 1")
+
+@test("esa: a fill whose own value or a compound assignment reads the array is refused there")
+esa_fill_reads()
+    esa_refused("    for i in 0..<out.len do out[i] = out[0] + 1")
+    esa_refused("    for i in 0..<out.len do out[i] += 1")
+    esa_refused("    out[0] = 1\n    out[1] = out[0]\n    out[2] = 3")
+
+@test("esa: a partial fill followed by a read is refused where it is read")
+esa_partial_then_read()
+    if !esa_ready() then return
+
+    val run = esa_run(esa_mode() + raw"""
+        f() -> Mode
+            var out: [3]Mode = slot_empty()
+
+            for i in 0..<2 do out[i] = Busy
+
+            out[2]
+
+        print(f() == Busy)
+        """)
+
+    assert(!run.ok, run.out)
+    assert(run.out.contains(esa_said("out")), run.out)
+    assert(run.out.contains("main.sysl:10:5"), run.out)
+
+// -- arrays of arrays ---------------------------------------------------------------------------------
+
+@test("esa: an array of arrays fills by nested loops, or a row at a time and a loop over a row")
+esa_nested()
+    if !esa_ready() then return
+
+    esa_clean(esa_mode() + raw"""
+        grid() -> [2][3]Mode
+            var g: [2][3]Mode = slot_empty()
+
+            for i in 0..<g.len
+                for j in 0..<g[i].len do g[i][j] = if (i + j) % 2 == 0 then Idle else Busy
+
+            g
+
+        rows() -> [2][2]Mode
+            var g: [2][2]Mode = slot_empty()
+
+            g[0] = [Idle, Busy]
+
+            for j in 0..<g[1].len do g[1][j] = Busy
+
+            g
+
+        val g = grid()
+        val r = rows()
+
+        print(g[0][0] == Idle, g[0][1] == Busy, g[1][0] == Busy, g[1][2] == Busy)
+        print(r[0][0] == Idle, r[0][1] == Busy, r[1][0] == Busy, r[1][1] == Busy)
+        """, "true true true true\ntrue true true true")
+
+@test("esa: a grid with a row or a column short is refused")
+esa_nested_short()
+    val head = "f(p: *u64)\n    var g: [2][3]u64 = slot_empty()\n\n"
+
+    assert_eq(emit_func_text(head + "    for i in 0..<g.len\n        for j in 0..<2 do g[i][j] = 1\n\n" +
+                             "    *p = g[0][0]\n", "f"), esa_said("g"))
+    assert_eq(emit_func_text(head + "    for j in 0..<g[0].len do g[0][j] = 1\n\n    *p = g[0][0]\n", "f"),
+              esa_said("g"))
+    assert_eq(emit_func_text(head + "    g[0] = [1, 2, 3]\n    g[1][0] = 4\n    g[1][1] = 5\n\n" +
+                             "    *p = g[0][0]\n", "f"), esa_said("g"))
+
+    val whole = emit_func_text(head + "    g[0] = [1, 2, 3]\n    g[1][0] = 4\n    g[1][1] = 5\n    g[1][2] = 6\n\n" +
+                               "    *p = g[0][0]\n", "f")
+
+    assert(whole.starts_with("define"), whole)
+end esa_nested_short
+
+// -- the generic twins and counted elements -----------------------------------------------------------
+
+@test("esa: a generic body and a method fill an array of their type parameter")
+esa_generic_twins()
+    if !esa_ready() then return
+
+    esa_clean(esa_mode() + raw"""
+        repeat[T](v: T) -> [3]T
+            var out: [3]T = slot_empty()
+
+            for i in 0..<out.len do out[i] = v
+
+            out
+
+        struct Two[T]
+            a: T
+            b: T
+
+        impl[T] Two[T]
+            both(self) -> [2]T
+                var out: [2]T = slot_empty()
+
+                out[1] = self.b
+                out[0] = self.a
+                out
+
+        // A length that is the generic's own value parameter.
+        spread[const N: usize](v: Mode) -> [N]Mode
+            var out: [N]Mode = slot_empty()
+
+            for i in 0..<out.len do out[i] = if i == 0 then Idle else v
+
+            out
+
+        val s = repeat(s"made ${repeat(4)[1]}")
+        val w = spread[5](Busy)
+
+        print(repeat(Busy)[2] == Busy, s[0], s[2], Two(Idle, Busy).both()[1] == Busy, Two("x", "y").both()[0])
+        print(w.len, w[0] == Idle, w[4] == Busy, spread[1](Busy)[0] == Idle)
+        """, "true made 4 made 4 true x\n5 true true true")
+
+private esa_res() -> string = raw"""
+    struct Res
+        n: int
+
+    impl Drop for Res
+        drop(self) = print(s"drop ${self.n}")
+
+    """
+
+@test("esa: a fill left by ? or return drops the elements written once and the unwritten ones not at all")
+esa_early_exits()
+    if !esa_ready() then return
+
+    esa_clean(esa_res() + raw"""
+        make(i: usize, stop: int) -> Result[&Res, string] =
+            if int(i) == stop then Err(s"stop $i") else Ok(Res(int(i)))
+
+        some(stop: int) -> Result[[3]&Res, string]
+            var out: [3]&Res = slot_empty()
+
+            for i in 0..<out.len do out[i] = make(i, stop)?
+
+            Ok(out)
+
+        first(stop: int) -> int
+            var out: [3]&Res = slot_empty()
+
+            for i in 0..<out.len
+                if int(i) == stop then return -1
+
+                out[i] = Res(10 + int(i))
+
+            out[2].n
+
+        run(stop: int)
+            print(s"run $stop")
+
+            some(stop) match
+                Ok(all) -> print(all[2].n)
+                Err(why) -> print(why)
+
+        run(0)
+        run(2)
+        run(5)
+        print(first(1))
+        print(first(5))
+        """, "run 0\nstop 0\nrun 2\ndrop 0\ndrop 1\nstop 2\nrun 5\n2\ndrop 0\ndrop 1\ndrop 2\n" +
+             "drop 10\n-1\ndrop 10\ndrop 11\ndrop 12\n12")
+
+// -- the codec ----------------------------------------------------------------------------------------
+
+@test("esa: an array of an enum with no zero value decodes and round-trips, and a short one is refused")
+esa_codec()
+    if !esa_ready() then return
+
+    esa_clean(raw"""
+        import sysl.codec.Codec
+        import sysl.encoding.json.{from_json, to_json}
+
+        enum Mode derives Codec
+            Idle
+            Busy
+
+        enum Note derives Codec, Eq
+            Said(text: string)
+            Quiet
+
+        val m = from_json[[2]Mode]("[\"Busy\", \"Idle\"]").unwrap()
+        val grid = from_json[[2][2]Mode](to_json([[Idle, Busy], [Busy, Busy]]).unwrap()).unwrap()
+
+        print(m[0] == Busy, m[1] == Idle, to_json(m).unwrap(), grid[0][1] == Busy, grid[1][0] == Busy)
+        print(from_json[[2]Mode]("[\"Busy\"]").is_ok(), from_json[[2]Mode]("[\"Busy\", \"Idle\", \"Busy\"]").is_ok())
+
+        val notes = from_json[[3]Note](to_json([Said("a"), Quiet, Said("b")]).unwrap()).unwrap()
+
+        print(notes[0] == Said("a"), notes[2] == Said("b"))
+        print(from_json[[3]Note]("[{\"Said\":{\"text\":\"a\"}}, 7]").is_ok())
+        """, "true true [\"Busy\",\"Idle\"] true true\nfalse false\ntrue true\nfalse")
