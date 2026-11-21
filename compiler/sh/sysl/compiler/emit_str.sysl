@@ -383,10 +383,12 @@ private is_spec_digit(c: u8) -> bool = c >= u8('0') && c <= u8('9')
 
 // -- rendering into a buffer -------------------------------------------------------------------------
 
-// **A value written into a growable buffer, and what landed there as a string.** A zeroed stack slot
-// becomes the sink, the value writes itself into it, and the bytes are copied into a string the
-// statement owns. The slot is re-zeroed on every arrival rather than once, since an alloca is hoisted
-// to the entry block and a render inside a loop meets the same one each time round.
+// **A value written into a growable buffer, and what landed there as a string.** A stack slot -- a
+// zeroed header and `buffer_scratch()` bytes of frame storage the first bytes land in -- becomes the
+// sink, the value writes itself into it, and the bytes are copied into a string the statement owns.
+// The header is re-zeroed on every arrival rather than once, since an alloca is hoisted to the entry
+// block and a render inside a loop meets the same one each time round; the scratch needs no zeroing,
+// as nothing reads it past the length the header counts.
 gen_render(e: *Emit, value: TExpr, method: string, spec: TExpr, vslot: Option[int]) -> Val
     e.heap = true
 
@@ -403,10 +405,14 @@ gen_render(e: *Emit, value: TExpr, method: string, spec: TExpr, vslot: Option[in
     val v = if big then indirect_arg(e, value, held(e, value) || lent)
     else gen_expr(e, value)
     val s = gen_expr(e, spec)
-    val slot_lty = buffer_lty(e)
-    val slot = alloca(e, fresh_reg(e), slot_lty)
+    val slot = alloca(e, fresh_reg(e), buffer_lty(e))
 
-    emit(e, InStore(slot_lty, VZero, slot, AccPlain, None))
+    // The slot holds a frame's worth of scratch, and its address goes into a trait object, so the
+    // lifetime pass never bounds it; it is bounded here instead, by the rendering itself -- nothing
+    // points into it once `finish` has copied the bytes out -- so that a body with many holes, or a
+    // recursion through one, does not keep a scratch per hole alive across the whole frame.
+    mark_slot_life(e, lifetime_start_symbol(), slot)
+    emit(e, InStore(buffer_header_lty(e), VZero, slot, AccPlain, None))
 
     val a = fresh_reg(e)
 
@@ -455,5 +461,16 @@ gen_render(e: *Emit, value: TExpr, method: string, spec: TExpr, vslot: Option[in
 
     finish.push(ir_arg(LPtr, slot))
     emit(e, ir_call(Some(r), lty(e, Str), VGlobal("sysl.w.buf.finish"), finish))
+    mark_slot_life(e, lifetime_end_symbol(), slot)
     own_temp(e, r, Str)
 end gen_render
+
+// One lifetime marker over the whole of `slot`, with the module told it declares the pair.
+private mark_slot_life(e: *Emit, symbol: string, slot: Val)
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(LInt(64), VInt(from_int(-1))))
+    args.push(ir_arg(LPtr, slot))
+    emit(e, ir_call(None, LVoid, VGlobal(symbol), args))
+    e.uses_lifetime = true
+end mark_slot_life

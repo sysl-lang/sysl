@@ -27,28 +27,46 @@ writer_members() -> Buf[string]
     out
 end writer_members
 
-// The buffer's layout -- the bytes, how many are used, and how many fit. It is written literally
+// How many bytes a rendering holds in its own frame before its buffer moves to the heap.
+buffer_scratch() -> int = 64
+
+// The buffer's header -- the bytes, how many are used, and how many fit. It is written literally
 // rather than declared as a named type because nothing outside this file ever names it.
 //
 // The two counts are the machine's word: a length that outgrew an address would name storage the
 // machine cannot address, and the string this buffer finishes into carries its length as a `usize`
-// anyway.
-buffer_lty(e: *Emit) -> LType
+// anyway. A zeroed header is a fresh buffer.
+buffer_header_lty(e: *Emit) -> LType
     var fields: Buf[LType] = buf()
 
     fields.push(LPtr)
     fields.push(word_lty(e))
     fields.push(word_lty(e))
     LStruct(fields)
+end buffer_header_lty
+
+// The whole slot: the header, then the frame's own scratch the bytes land in until they outgrow it.
+// The header leads, so zeroing the header alone at the slot's address makes the slot a fresh buffer.
+buffer_lty(e: *Emit) -> LType
+    var fields: Buf[LType] = buf()
+
+    fields.push(LPtr)
+    fields.push(word_lty(e))
+    fields.push(word_lty(e))
+    fields.push(LArr(buffer_scratch(), LInt(8)))
+    LStruct(fields)
 end buffer_lty
 
 // Writing into a growable buffer, and finishing with one.
 //
-// Capacity doubles, with a floor, so rendering a value costs a bounded number of allocations rather
-// than one per chunk written. The buffer starts as a zeroed stack slot -- no allocation at all until
-// the first byte arrives -- and `finish` copies what landed there into an ordinary string buffer and
-// gives the working storage back, so the string that comes out owns its own bytes and the slot is
-// inert again.
+// **The bytes land in the frame first.** The slot carries `buffer_scratch()` bytes of its own after
+// the header, and the first write into a fresh (zeroed) buffer points the header at them, so a
+// rendering that never outgrows them takes nothing from the heap for its working storage. Past them
+// the bytes move to the heap, and from there capacity doubles, so rendering a value costs a bounded
+// number of allocations rather than one per chunk written. `finish` copies what landed into an
+// ordinary string and gives heap working storage back -- never the scratch -- so the string that
+// comes out owns its own bytes, nothing points into the frame once the rendering is over, and the
+// slot is inert again.
 //
 // Neither of these can fail in a way a caller could act on: an allocator returning null is the
 // program's end rather than this writer's business -- it traps (`trap`, the module's stop) before the
@@ -69,6 +87,7 @@ writer_buffer(e: *Emit, str: string, slot: string, id: string) -> string
     val give_old = heap_give_text(e, "%old", "%cap", 1)
     val give_buf = heap_give_text(e, "%buf", "%cap", 1)
     val trap = trap_symbol(e)
+    val room = buffer_scratch()
 
     e.traps = true
 
@@ -80,17 +99,24 @@ writer_buffer(e: *Emit, str: string, slot: string, id: string) -> string
       %bufp = getelementptr $slot, ptr %self, i32 0, i32 0
       %lenp = getelementptr $slot, ptr %self, i32 0, i32 1
       %capp = getelementptr $slot, ptr %self, i32 0, i32 2
+      %scratch = getelementptr $slot, ptr %self, i32 0, i32 3
       %len = load $word, ptr %lenp
-      %cap = load $word, ptr %capp
+      %held = load $word, ptr %capp
+      %fresh = icmp eq $word %held, 0
+      br i1 %fresh, label %adopt, label %check
+    adopt:
+      store ptr %scratch, ptr %bufp
+      store $word $room, ptr %capp
+      br label %check
+    check:
+      %cap = phi $word [ %held, %entry ], [ $room, %adopt ]
       %need = add $word %len, %n
       %fits = icmp ule $word %need, %cap
       br i1 %fits, label %copy, label %grow
     grow:
       %twice = mul $word %cap, 2
       %bigger = icmp ugt $word %need, %twice
-      %want = select i1 %bigger, $word %need, $word %twice
-      %tiny = icmp ult $word %want, 32
-      %newcap = select i1 %tiny, $word 32, $word %want
+      %newcap = select i1 %bigger, $word %need, $word %twice
     $take  %given = icmp ne ptr %new, null
       br i1 %given, label %grown, label %refused
     refused:
@@ -111,8 +137,8 @@ writer_buffer(e: *Emit, str: string, slot: string, id: string) -> string
       %inext = add $word %i, 1
       br label %move
     swap:
-      %had = icmp ne ptr %old, null
-      br i1 %had, label %drop, label %install
+      %inframe = icmp eq ptr %old, %scratch
+      br i1 %inframe, label %install, label %drop
     drop:
     $give_old  br label %install
     install:
@@ -153,8 +179,8 @@ writer_buffer(e: *Emit, str: string, slot: string, id: string) -> string
       %len = load $word, ptr %lenp
       %cap = load $word, ptr %capp
       %s = call $str @sysl.str.from_bytes(ptr %buf, $word %len)
-      %had = icmp ne ptr %buf, null
-      br i1 %had, label %drop, label %done
+      %onheap = icmp ugt $word %cap, $room
+      br i1 %onheap, label %drop, label %done
     drop:
     $give_buf  br label %done
     done:

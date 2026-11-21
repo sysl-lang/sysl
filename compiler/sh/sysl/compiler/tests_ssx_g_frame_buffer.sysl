@@ -1,0 +1,260 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.write_text
+import sysl.process.capture
+import sysl.text.Search
+
+// **A rendering's bytes land in its own frame first** (`writer_runtime.sysl`'s `buffer_scratch`): the
+// buffer an interpolation hole or a `to_string` writes a `Display` into carries 64 bytes of scratch,
+// and moves to the heap only past them. A rendering of 64 bytes or fewer then costs one allocation --
+// the string it finishes into -- where it cost two.
+//
+// The instrument is the program's heap, named by its manifest and written in sysl
+// (`reference/packages.md § One heap`): the pair counts every block taken and given, and the program
+// prints, for each rendering, its length, whether its bytes are the ones written, and the blocks it
+// took. At exit it prints the blocks still held, which is the leak check of a pair that is not the
+// counted heap's.
+//
+// The cells: lengths 0, 1, 15, 16, 63, 64, 65 and 130, each written in one piece and in pieces of ten
+// (so the spill comes mid-stream, with bytes already in the scratch to move); a two-byte character
+// straddling the boundary; a nested rendering (a `Display` that interpolates a `Display`), short and
+// spilling; a rendering in a loop, whose one slot is met afresh every round; and a rendering that
+// escapes -- returned, stored in a field, captured by a closure -- read after a recursion through
+// renderings has written over the frames it came from. Each is crossed with debug, `-O2` and thin LTO.
+//
+// Skipped cells, and why: a 32-bit word is `tests_xtb_cross_target_build.sysl`'s rendering sweep,
+// which verifies and assembles the slot on every target; `str_builder` never reaches this buffer (it
+// is the library's own `Buf`), so nothing here can change it; `@no_alloc` refuses a rendering for the
+// string it finishes into (`no_alloc.sysl`), which the scratch does not remove.
+
+private val ssx_g_manifest: string =
+    "package { name = \"ssxg\", version = \"0.0.1\" }\nallocator {\n  alloc = \"ssx_alloc\"\n" +
+    "  free  = \"ssx_free\"\n}\n"
+
+private val ssx_g_program: string = raw"""
+    extern "posix_memalign" c_memalign(out: **u8, align: usize, n: usize) -> int
+    extern "free" c_free(p: *u8)
+
+    var taken = 0
+    var given = 0
+
+    @export("ssx_alloc")
+    ssx_alloc(size: usize, align: usize) -> *u8
+        var p: *u8 = null
+
+        if c_memalign(&p, if align < 16 then 16 else align, if size == 0 then 1 else size) != 0 then return null
+
+        taken += 1
+        p
+    end ssx_alloc
+
+    @export("ssx_free")
+    ssx_free(p: *u8, size: usize, align: usize)
+        given += 1
+        c_free(p)
+
+    val text = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-_" +
+        "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-_" +
+        "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-_"
+
+    struct Run
+        n: int
+        chunk: int
+
+    impl Display for Run
+        display(self, out: *Writer, spec: FormatSpec)
+            var at = 0
+
+            while at < self.n
+                val k = if self.n - at < self.chunk then self.n - at else self.chunk
+
+                out.write(text.bytes[at..<at + k])
+                at += k
+        end display
+
+    struct Accent
+        n: int
+
+    impl Display for Accent
+        display(self, out: *Writer, spec: FormatSpec)
+            out.write(text.bytes[0..<self.n])
+            out.write("é".bytes)
+
+    struct Outer
+        inner: Run
+
+    impl Display for Outer
+        display(self, out: *Writer, spec: FormatSpec) = out.write(f"<${self.inner}>".bytes)
+
+    struct Holder
+        s: string
+
+    measure(n: int, chunk: int)
+        val before = taken
+        val s = f"${Run(n, chunk)}"
+        val cost = taken - before
+
+        print(n, chunk, s.len, s == text[0..<n], cost)
+
+    made(n: int) -> string = f"${Run(n, 7)}"
+
+    held(n: int) -> &Holder = Holder(f"${Run(n, 9)}")
+
+    kept(n: int) -> &Fn() -> string
+        val s = f"${Run(n, 5)}"
+
+        () -> s
+
+    churn(depth: int) -> int
+        if depth == 0 then return 0
+
+        val s = f"${Run(depth % 80, 3)}"
+
+        int(s.len) + churn(depth - 1)
+    end churn
+
+    main()
+        work()
+        print("live", taken - given)
+
+    work()
+        for n in [0, 1, 15, 16, 63, 64, 65, 130]
+            measure(n, n + 1)
+            measure(n, 10)
+
+        var before = taken
+        val accent = f"${Accent(62)}"
+
+        print("accent 64", taken - before, accent.len, accent == text[0..<62] + "é")
+
+        before = taken
+
+        val spill = f"${Accent(63)}"
+
+        print("accent 65", taken - before, spill.len, spill == text[0..<63] + "é")
+
+        before = taken
+
+        val nested = f"${Outer(Run(10, 3))}"
+
+        print("nested", nested, taken - before)
+
+        before = taken
+
+        val deep = f"${Outer(Run(70, 3))}"
+
+        print("nested spill", taken - before, deep.len, deep == "<" + text[0..<70] + ">")
+
+        before = taken
+
+        var good = 0
+
+        for i in 0..<100
+            val s = f"${Run(i, 7)}"
+
+            if s == text[0..<i] then good += 1
+
+        print("loop", good, taken - before)
+
+        val r = made(40)
+        val h = held(70)
+        val c = kept(20)
+        val depth = churn(200)
+
+        print("escaped", r == text[0..<40], h.s == text[0..<70], c() == text[0..<20], depth)
+    end work
+    """
+
+// What the program prints. A rendering of up to 64 bytes takes the one block of its string; past 64 it
+// takes a working buffer too, and a second at 129 when it doubles. The nested short one is the inner
+// string, two joins and the outer string; the loop is a hundred strings and a buffer for each of the
+// 35 past 64. (Before the scratch: every non-empty rendering took one more, the pieces-of-ten ones
+// more again, and the loop 301.)
+private val ssx_g_expected: string =
+    "0 1 0 true 1\n0 10 0 true 1\n1 2 1 true 1\n1 10 1 true 1\n15 16 15 true 1\n15 10 15 true 1\n" +
+    "16 17 16 true 1\n16 10 16 true 1\n63 64 63 true 1\n63 10 63 true 1\n64 65 64 true 1\n" +
+    "64 10 64 true 1\n65 66 65 true 2\n65 10 65 true 2\n130 131 130 true 2\n130 10 130 true 3\n" +
+    "accent 64 1 64 true\naccent 65 2 65 true\nnested <abcdefghij> 4\nnested spill 6 72 true\n" +
+    "loop 100 135\nescaped true true true 7140\nlive 0\n"
+
+// The program built with `flags` and run: what it printed, or why it did not.
+private ssx_g_run(flags: []const string) -> string
+    val root = lbr_temp("sysl-ssxg")
+    val out = lbr_temp("sysl-ssxg-exe")
+
+    write_text(s"$root/sysl.hocon", ssx_g_manifest).unwrap()
+    write_text(s"$root/main.sysl", ssx_g_program).unwrap()
+
+    var args: Buf[string] = buf()
+
+    args.push("sysl")
+    args.push("build")
+
+    for f in flags
+        args.push(f)
+
+    args.push("-o")
+    args.push(s"$out/program")
+    args.push(root)
+
+    val said = lbr_cli(args.view())
+    val ran = if said.0 != 0 then s"refused: ${said.1}"
+    else capture(s"$out/program", [], "", [], true) match
+        Ok(o) -> if o.status.ok() then o.text else s"stopped: ${o.text}${o.err.unwrap_or("")}"
+        Err(_) -> "it could not be run"
+
+    lbr_drop([root, out])
+    ran
+end ssx_g_run
+
+private ssx_g_ready() -> bool = lbr_ready() && (host_os() == MacOS || host_os() == Linux)
+
+@test("ssx_g: a rendering of up to 64 bytes takes only its string from the heap, and past 64 spills")
+ssx_g_counts_debug()
+    if !ssx_g_ready() then return
+
+    assert_eq(ssx_g_run([]), ssx_g_expected)
+
+@test("ssx_g: the frame's scratch counts the same at -O2")
+ssx_g_counts_optimized()
+    if !ssx_g_ready() then return
+
+    assert_eq(ssx_g_run(["-O2"]), ssx_g_expected)
+
+@test("ssx_g: the frame's scratch counts the same under thin LTO")
+ssx_g_counts_lto()
+    if !ssx_g_ready() then return
+
+    assert_eq(ssx_g_run(["--lto", "thin"]), ssx_g_expected)
+
+// The text: the slot is the header and the scratch, only the header is zeroed, the slot's life is the
+// rendering's, a fresh buffer adopts the scratch, and only heap storage is given back.
+@test("ssx_g: the slot carries 64 bytes after its header and lives only as long as the rendering")
+ssx_g_slot_text()
+    if !lbr_ready() then return
+
+    val root = lbr_temp("sysl-ssxg-ir")
+    val file = s"$root/main.sysl"
+
+    write_text(file, "struct P\n    x: int\n\nimpl Display for P\n" +
+        "    display(self, out: *Writer, spec: FormatSpec) = out.write(\"p\".bytes)\n\n" +
+        "two(p: P) -> string = f\"${p}-${p}\"\n\nmain() = print(two(P(1)))\n").unwrap()
+
+    val ir = lbr_text(file, [])
+
+    lbr_drop([root])
+
+    val slot = "{ ptr, i64, i64, [64 x i8] }"
+
+    // Two holes, two slots, each bounded by its own rendering.
+    assert_eq(ir.count_of(s" = alloca $slot\n"), 2)
+    assert_eq(ir.count_of("  store { ptr, i64, i64 } zeroinitializer, ptr "), 2)
+    assert_eq(ir.count_of("@sysl.w.buf.finish(ptr "), 2 + 1)
+    assert(ir.count_of("call void @llvm.lifetime.end.p0(i64 -1, ptr ") >= 2, ir)
+    assert(ir.contains(s"%scratch = getelementptr $slot, ptr %self, i32 0, i32 3\n"), ir)
+    assert(ir.contains("  store ptr %scratch, ptr %bufp\n  store i64 64, ptr %capp\n"), ir)
+    assert(ir.contains("  %inframe = icmp eq ptr %old, %scratch\n"), ir)
+    assert(ir.contains("  %onheap = icmp ugt i64 %cap, 64\n"), ir)
+end ssx_g_slot_text

@@ -547,7 +547,11 @@ undefined function 'str'
 ```
 
 A `string` is returned as it is, and a `bool` renders to one of two immortal literals, so neither
-allocates; every other case allocates a fresh buffer. Every number is rendered without the
+allocates; every other case allocates a fresh buffer. A value that renders itself through its
+`Display` or `Debug` writes into 64 bytes of scratch in the rendering's own frame, so a rendering of
+up to 64 bytes allocates only the string it ends in; a longer one moves its bytes to the heap as it
+grows past them, and that working storage is given back once the string is made. Nothing points into
+the frame afterwards, so the string may be returned, stored or captured like any other. Every number is rendered without the
 C library. An integer's digits are divided out into a scratch buffer, which is correct even for the
 most negative value because the magnitude is taken in unsigned arithmetic. A float goes through the
 library's [`sysl.fmt.format_real_plain`](/library/fmt/#floats) (or its sibling at the float's width),
