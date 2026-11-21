@@ -3618,6 +3618,15 @@ nothing is let go of for it until one is put there. Its storage is the frame's, 
   so is a write whose own value reads it (`out = out + 1`, `out += 1`) and a closure capturing it. A
   write on one arm of an `if` followed by a read after it is the caller's to get right, as a slot
   past a buffer's live run is.
+- **An empty array is written element by element, and is written once every element is.** An
+  assignment to one element does not settle it; what does is the statements of its own block
+  assigning elements at constant indices that between them cover every one (`out[0] = a`, `out[1] =
+  b`), or a counted loop there, `for i in 0..<out.len`, one of whose own statements assigns `out[i]`
+  — or is itself such a loop over `out[i]`, for an array of arrays — and that holds no `break` or
+  `continue`. Until then any read of it is refused, a read inside the fill included. Its `.len` is its
+  type's and reads nothing. A fill left early by `?` or `return` leaves the rest as the slot did, so
+  the elements written are let go of once and the others not at all. An element's address
+  (`slot_put(&out[0], v)`) is a write the program vouches for, as the local's own address is.
 - **It stands only as a `var`'s initial value**, with the type on the declaration or in
   `slot_empty[T]()`: a `val`, an argument, an assignment's value or a `var` with no type is refused.
 
@@ -3666,8 +3675,44 @@ f() -> int
 'x' is an empty slot, read here before anything was written to it
 ```
 
+```sysl
+enum Mode
+    Idle
+    Busy
+
+alternate(n: usize) -> Result[[4]Mode, string]
+    var out: [4]Mode = slot_empty()
+
+    for i in 0..<out.len
+        if i == n then return Err(s"stopped at $i of ${out.len}")
+
+        out[i] = if i % 2 == 0 then Idle else Busy
+
+    Ok(out)
+
+print(alternate(9).unwrap()[3] == Busy, alternate(2).unwrap_err())
+```
+
+```output
+true stopped at 2 of 4
+```
+
+```sysl
+f() -> int
+    var out: [3]int = slot_empty()
+
+    for i in 0..<2 do out[i] = i
+
+    out[0]
+```
+
+```error
+'out' is an empty slot, read here before anything was written to it
+```
+
 `sysl.sync`'s `load_relaxed` and `SeqLock[T]` build their answer in one, so they copy a `Plain` type
-with no zero value as they copy any other. **A `var out: T` with no initial value at such a `T` is
+with no zero value as they copy any other, and `sysl.codec` decodes an array of one element at a
+time into one. **A `var out: T` with no initial value at such a `T` is
 refused at the call that chose the type**, naming the instance and the declaration's line, since the
 line in the generic's body is the same for every instance and may be the library's.
 
@@ -4034,6 +4079,54 @@ except a function handed only numbers. A call writing memory is judged by the ty
 growing a `Buf[Value]` cannot touch a `Machine`. An `await` keeps the count, as does storing,
 returning, capturing or keeping the value; a tuple built on the spot for a keeping call is handed over
 whole.
+
+### A read of a place that is written over next takes the place's count
+
+**A reference read out of a field or an element that is written before it is read again moves out of
+it**: the read takes no count and the write gives none back, since the count the place held is the one
+the new name needs. Popping the top of a stack is one move, not a retain and a release:
+
+```sysl
+struct Node
+    id: int
+    next: Option[&Node]
+
+struct Stack
+    top: Option[&Node]
+
+impl Stack
+    push(*self, n: &Node)
+        n.next = self.top
+        self.top = Some(n)
+
+    pop(*self) -> &Node
+        val n = self.top match
+            Some(t) -> t
+            None -> panic("an empty stack")
+
+        self.top = n.next
+        n.next = None
+        n
+
+main()
+    var s = Stack(None)
+
+    for i in 1..3
+        s.push(Node(i, None))
+
+    print(s.pop().id, s.pop().id, s.pop().id)
+```
+
+```output
+3 2 1
+```
+
+It moves only where nothing can see that the place and the name share one count. Every way on from the
+read must reach the write, or end the program as a failed check or a `panic` does; an early `return`,
+a write on one branch only, or a read inside a loop written after it keeps both counts. Between the two
+nothing may read the place again, write anything that might be it (a field of another struct, or a
+slot of the frame, cannot be), call a function that writes outside its own frame or releases anything,
+suspend, or let go of a value whose teardown runs a destructor or that holds the count just read.
 
 ### A loop lends each element to a body that lets go of nothing
 

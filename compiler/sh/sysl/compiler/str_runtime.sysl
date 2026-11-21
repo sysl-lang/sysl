@@ -28,7 +28,7 @@ import sysl.math.bigint.{BigInt, from_int, pow, sub as big_sub, to_string}
 // **A null answer traps before anything is stored**, as every box's does (`emit_box.sysl`'s
 // `allocate_box`); the trap is the module's stop (`trap_symbol`), and the block the header ends in is
 // `got`, which is what a `phi` after it names as its way in.
-private str_buf_header(e: *Emit, n: string) -> string
+str_buf_header(e: *Emit, n: string) -> string
     val word = s"i${e.word_bits}"
     val trap = trap_symbol(e)
     val hook = drop_buf_fn(e, byte_type()) match
@@ -55,7 +55,7 @@ private str_buf_header(e: *Emit, n: string) -> string
 end str_buf_header
 
 // The bytes in front of a `StrBuf`'s first byte: its header and the count.
-private str_buf_lead(word: string) -> string
+str_buf_lead(word: string) -> string
     s"""
       %hend = getelementptr { %arc.header, $word }, ptr null, i32 1
       %hsize = ptrtoint ptr %hend to $word
@@ -480,12 +480,26 @@ private digit_capacity(bits: int) -> int =
 // of stack in one frame and will overflow it. Nothing reaches that by accident, so the size is left
 // as the honest consequence of the width rather than being capped into a wrong answer.
 str_int_text(bits: int, word: string, str: string) -> string
-    val ty = s"i$bits"
-    val cap = digit_capacity(bits)
     val name = str_int_name(bits)
 
+    int_digits_text(bits, word, s"define private $str @$name(i$bits %v, i1 %signed) {",
+                    s"  %res = call $str @sysl.str.from_bytes(ptr %start, $word %len)\n  ret $str %res\n")
+end str_int_text
+
+// **The same digits written into a rendering's buffer** (`writer_runtime.sysl`), where an
+// interpolation's integer hole lands: nothing is made but the bytes appended.
+writer_int_text(word: string) -> string =
+    int_digits_text(64, word, "define private void @sysl.w.buf.int(ptr %self, i64 %v, i1 %signed) {",
+                    s"  call void @sysl.w.buf.put(ptr %self, ptr %start, $word %len)\n  ret void\n")
+
+// The digit loop both share: `head` is the `define` line, binding `%v` and `%signed`, and `tail` is
+// what is done with the `%len` bytes at `%start`.
+private int_digits_text(bits: int, word: string, head: string, tail: string) -> string
+    val ty = s"i$bits"
+    val cap = digit_capacity(bits)
+
     s"""
-    define private $str @$name($ty %v, i1 %signed) {
+    $head
     entry:
       %isneg = icmp slt $ty %v, 0
       %neg = and i1 %isneg, %signed
@@ -516,11 +530,9 @@ str_int_text(bits: int, word: string, str: string) -> string
       %si = ptrtoint ptr %start to $word
       %ei = ptrtoint ptr %end to $word
       %len = sub $word %ei, %si
-      %res = call $str @sysl.str.from_bytes(ptr %start, $word %len)
-      ret $str %res
-    }
+    ${tail}}
     """
-end str_int_text
+end int_digits_text
 
 // Whether a byte offset falls between characters rather than inside one. The caller has already
 // checked that the offset is within the string, so this only has to look at the byte it names: a

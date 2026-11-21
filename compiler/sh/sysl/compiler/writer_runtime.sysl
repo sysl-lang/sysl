@@ -27,28 +27,54 @@ writer_members() -> Buf[string]
     out
 end writer_members
 
-// The buffer's layout -- the bytes, how many are used, and how many fit. It is written literally
+// How many bytes a rendering holds in its own frame before its buffer moves to the heap.
+buffer_scratch() -> int = 64
+
+// The buffer's header -- the bytes, how many are used, and how many fit. It is written literally
 // rather than declared as a named type because nothing outside this file ever names it.
 //
 // The two counts are the machine's word: a length that outgrew an address would name storage the
 // machine cannot address, and the string this buffer finishes into carries its length as a `usize`
-// anyway.
-buffer_lty(e: *Emit) -> LType
+// anyway. A zeroed header is a fresh buffer.
+buffer_header_lty(e: *Emit) -> LType
     var fields: Buf[LType] = buf()
 
     fields.push(LPtr)
     fields.push(word_lty(e))
     fields.push(word_lty(e))
     LStruct(fields)
+end buffer_header_lty
+
+// The whole slot: the header, then the frame's own scratch the bytes land in until they outgrow it.
+// The header leads, so zeroing the header alone at the slot's address makes the slot a fresh buffer.
+buffer_lty(e: *Emit) -> LType
+    var fields: Buf[LType] = buf()
+
+    fields.push(LPtr)
+    fields.push(word_lty(e))
+    fields.push(word_lty(e))
+    fields.push(LArr(buffer_scratch(), LInt(8)))
+    LStruct(fields)
 end buffer_lty
 
 // Writing into a growable buffer, and finishing with one.
 //
-// Capacity doubles, with a floor, so rendering a value costs a bounded number of allocations rather
-// than one per chunk written. The buffer starts as a zeroed stack slot -- no allocation at all until
-// the first byte arrives -- and `finish` copies what landed there into an ordinary string buffer and
-// gives the working storage back, so the string that comes out owns its own bytes and the slot is
-// inert again.
+// **The bytes land in the frame first.** The slot carries `buffer_scratch()` bytes of its own after
+// the header, and the first write into a fresh (zeroed) buffer points the header at them, so a
+// rendering that never outgrows them takes nothing from the heap for its working storage. Past them
+// the bytes move to the heap, and from there capacity doubles, so rendering a value costs a bounded
+// number of allocations rather than one per chunk written. A write past double the capacity takes
+// what it needs rounded up to the scratch's size, so the short piece that usually follows a long one
+// (`f"<${long}>"`) still fits.
+//
+// **The heap storage is a `StrBuf` from the start** (`str_runtime.sysl`'s `str_buf_header`), its
+// count the capacity, so `finish` hands it over as the string's owner rather than copying out of it:
+// a string views the first `len` bytes of a buffer that may hold more, as any string over a `[]u8`
+// does, and the buffer's hook gives back the block it was taken as. Bytes still in the scratch are
+// copied into a string of their own (`sysl.str.from_bytes`, which makes a short one where the form
+// is on). Either way nothing points into the frame once the rendering is over, and the slot is inert
+// again. `put` is the one append; `write` is the `Writer` slot over it, and an interpolation's
+// literal pieces and integer holes call `put` directly (`emit_str.sysl`'s `gen_interp`).
 //
 // Neither of these can fail in a way a caller could act on: an allocator returning null is the
 // program's end rather than this writer's business -- it traps (`trap`, the module's stop) before the
@@ -65,10 +91,9 @@ end buffer_lty
 // old bytes are moved.
 writer_buffer(e: *Emit, str: string, slot: string, id: string) -> string
     val word = s"i${e.word_bits}"
-    val take = heap_take_text(e, "%new", "%newcap", 1)
-    val give_old = heap_give_text(e, "%old", "%cap", 1)
-    val give_buf = heap_give_text(e, "%buf", "%cap", 1)
-    val trap = trap_symbol(e)
+    val give_old = heap_give_text(e, "%oldbase", "%oldsize", e.layout.pointer_bytes())
+    val room = buffer_scratch()
+    val room_less = room - 1
     val read_first = str_read_text(str, e.word_bits, "%b")
     val read_ptr = str_ptr_text(str, "%b")
     val read_len = str_len_text(str, e.word_bits, "%b")
@@ -80,46 +105,59 @@ writer_buffer(e: *Emit, str: string, slot: string, id: string) -> string
     entry:
     ${read_first}  %src = $read_ptr
       %n = $read_len
+      call void @sysl.w.buf.put(ptr %self, ptr %src, $word %n)
+      ret void
+    }
+
+    define private void @sysl.w.buf.put(ptr %self, ptr %src, $word %n) {
+    entry:
       %bufp = getelementptr $slot, ptr %self, i32 0, i32 0
       %lenp = getelementptr $slot, ptr %self, i32 0, i32 1
       %capp = getelementptr $slot, ptr %self, i32 0, i32 2
+      %scratch = getelementptr $slot, ptr %self, i32 0, i32 3
       %len = load $word, ptr %lenp
-      %cap = load $word, ptr %capp
+      %held = load $word, ptr %capp
+      %fresh = icmp eq $word %held, 0
+      br i1 %fresh, label %adopt, label %check
+    adopt:
+      store ptr %scratch, ptr %bufp
+      store $word $room, ptr %capp
+      br label %check
+    check:
+      %cap = phi $word [ %held, %entry ], [ $room, %adopt ]
       %need = add $word %len, %n
       %fits = icmp ule $word %need, %cap
       br i1 %fits, label %copy, label %grow
     grow:
       %twice = mul $word %cap, 2
-      %bigger = icmp ugt $word %need, %twice
-      %want = select i1 %bigger, $word %need, $word %twice
-      %tiny = icmp ult $word %want, 32
-      %newcap = select i1 %tiny, $word 32, $word %want
-    $take  %given = icmp ne ptr %new, null
-      br i1 %given, label %grown, label %refused
-    refused:
-      call void @$trap()
-      unreachable
-    grown:
-      %old = load ptr, ptr %bufp
+      %padded = add $word %need, $room_less
+      %rounded = and $word %padded, -$room
+      %bigger = icmp ugt $word %rounded, %twice
+      %newcap = select i1 %bigger, $word %rounded, $word %twice
+    ${str_buf_lead(word)}  %size = add $word %hsize, %newcap
+    ${str_buf_header(e, "%newcap")}  %old = load ptr, ptr %bufp
       br label %move
     move:
-      %i = phi $word [ 0, %grown ], [ %inext, %step ]
+      %i = phi $word [ 0, %got ], [ %inext, %step ]
       %more = icmp ult $word %i, %len
       br i1 %more, label %step, label %swap
     step:
       %sp = getelementptr i8, ptr %old, $word %i
       %sb = load i8, ptr %sp
-      %dp = getelementptr i8, ptr %new, $word %i
+      %dp = getelementptr i8, ptr %bytes, $word %i
       store i8 %sb, ptr %dp
       %inext = add $word %i, 1
       br label %move
     swap:
-      %had = icmp ne ptr %old, null
-      br i1 %had, label %drop, label %install
+      %inframe = icmp eq ptr %old, %scratch
+      br i1 %inframe, label %install, label %drop
     drop:
+      %backhs = sub $word 0, %hsize
+      %oldbase = getelementptr i8, ptr %old, $word %backhs
+      %oldsize = add $word %hsize, %cap
     $give_old  br label %install
     install:
-      store ptr %new, ptr %bufp
+      store ptr %bytes, ptr %bufp
       store $word %newcap, ptr %capp
       br label %copy
     copy:
@@ -155,18 +193,42 @@ writer_buffer(e: *Emit, str: string, slot: string, id: string) -> string
       %buf = load ptr, ptr %bufp
       %len = load $word, ptr %lenp
       %cap = load $word, ptr %capp
+      %onheap = icmp ugt $word %cap, $room
+      br i1 %onheap, label %adopt, label %copy
+    copy:
       %s = call $str @sysl.str.from_bytes(ptr %buf, $word %len)
-      %had = icmp ne ptr %buf, null
-      br i1 %had, label %drop, label %done
-    drop:
-    $give_buf  br label %done
-    done:
       ret $str %s
+    adopt:
+    ${str_buf_lead(word)}  %backhs = sub $word 0, %hsize
+      %base = getelementptr i8, ptr %buf, $word %backhs
+      %v0 = insertvalue $str undef, ptr %base, 0
+      %v1 = insertvalue $str %v0, ptr %buf, 1
+      %v2 = insertvalue $str %v1, $word %len, 2
+      ret $str %v2
     }
 
     @sysl.vt.buf = private constant { $word, [2 x ptr] } { $word $id, [2 x ptr] [ptr @sysl.w.buf.failed, ptr @sysl.w.buf.write] }
     """
 end writer_buffer
+
+// A `char` appended as its UTF-8 bytes, laid down by the encoder printing one uses -- the length
+// from the codepoint's range, as `sysl.str.char` reads it.
+writer_char_text(word: string) -> string
+    s"""
+    define private void @sysl.w.buf.char(ptr %self, i32 %cp) {
+    entry:
+      %buf = alloca [5 x i8]
+      call ptr @sysl.utf8(i32 %cp, ptr %buf)
+      %lt1 = icmp ult i32 %cp, 128
+      %lt2 = icmp ult i32 %cp, 2048
+      %lt3 = icmp ult i32 %cp, 65536
+      %l34 = select i1 %lt3, $word 3, $word 4
+      %l234 = select i1 %lt2, $word 2, $word %l34
+      %len = select i1 %lt1, $word 1, $word %l234
+      call void @sysl.w.buf.put(ptr %self, ptr %buf, $word %len)
+      ret void
+    }
+    """
 
 // The table a fresh buffer's data word is reached through, asked for once per module.
 buffer_table(e: *Emit) -> string

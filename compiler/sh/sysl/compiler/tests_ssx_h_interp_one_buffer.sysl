@@ -1,0 +1,401 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.write_text
+import sysl.process.capture
+import sysl.text.Search
+
+// **A whole interpolation is written into one buffer and finished once** (`emit_str.sysl`'s
+// `gen_interp`): the literal pieces are appended as bytes, an integer and a `char` render straight
+// into the buffer, a `Display` or `Debug` hole writes itself into it, a nested interpolation's pieces
+// are this one's, and anything else is read as its string and appended. Up to 64 bytes the buffer is
+// the frame's scratch, and the interpolation costs the one string `finish` makes -- or nothing, where
+// that string is short; past 64 the buffer's heap storage is handed over as the string's own.
+//
+// The instrument is the program's heap, named by its manifest and written in sysl, as in
+// `tests_ssx_g_frame_buffer.sysl`: each interpolation prints its length, its text or whether its bytes
+// are the concatenation of its pieces, and the blocks it took; at exit, the blocks still held.
+//
+// The cells: lengths 0, 15, 16, 64, 65 and 1000; every hole kind (an `i64` at its minimum, a `u64` at
+// its maximum, a `u128`, a negative literal, a `u8`, a float of each width, a `bool`, a `char` of one and
+// two bytes, a string short and long, a `Display`, a `Debug`, a `%?` and a `%5d` specifier, a nested
+// interpolation); a loop; a closure; an `async` body with an `await` in each of two holes; a `?` in a
+// hole, which keeps the join (`interp_straight`) and must give back every block either way; and a
+// hole whose `Display` panics after spilling. Each runs with the short form off and on, in debug and
+// at `-O2`. A thumb `build-c` of a probe compiles every piece kind for a 32-bit bare core.
+//
+// Skipped cells, and why: thin LTO (`ssx_g` crosses the same buffer with it, and the pieces are calls
+// into the same runtime); `@no_alloc`, which refuses the string an interpolation renders as
+// (`tests_capability_clause.sysl`); `str_builder`, which never reaches this buffer, is checked by its
+// IR here rather than by counts.
+
+private val ssx_h_manifest: string =
+    "package { name = \"ssxh\", version = \"0.0.1\" }\nallocator {\n  alloc = \"ssx_alloc\"\n" +
+    "  free  = \"ssx_free\"\n}\n"
+
+private val ssx_h_heap: string = raw"""
+    extern "posix_memalign" c_memalign(out: **u8, align: usize, n: usize) -> int
+    extern "free" c_free(p: *u8)
+
+    var taken = 0
+    var given = 0
+
+    @export("ssx_alloc")
+    ssx_alloc(size: usize, align: usize) -> *u8
+        var p: *u8 = null
+
+        if c_memalign(&p, if align < 16 then 16 else align, if size == 0 then 1 else size) != 0 then return null
+
+        taken += 1
+        p
+    end ssx_alloc
+
+    @export("ssx_free")
+    ssx_free(p: *u8, size: usize, align: usize)
+        given += 1
+        c_free(p)
+
+    val text = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-_" +
+        "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-_" +
+        "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-_"
+
+    struct Name
+        s: string
+
+    impl Display for Name
+        display(self, out: *Writer, spec: FormatSpec) = out.write(self.s.bytes)
+
+    struct Point
+        x: int
+        y: int
+
+    """
+
+private val ssx_h_program: string = ssx_h_heap + raw"""
+    pick(ok: bool) -> Result[string, int] = if ok then Ok("yes") else Err(7)
+
+    joined(ok: bool) -> Result[string, int] = Ok(f"${text}|${pick(ok)?}|")
+
+    async tag(n: int) -> string = f"#${n}-${Name("a")}#"
+
+    async both() -> string = f"${await tag(1)}+${await tag(2)}"
+
+    main()
+        work()
+        print("live", taken - given)
+
+    work()
+        val e = ""
+        val lo: i64 = -9223372036854775807 - 1
+        val hi: u64 = 18446744073709551615
+        var b = taken
+        val z = f"${e}${e}"
+
+        print("len 0", z.len, taken - b)
+        b = taken
+
+        val s15 = f"abcdefgh${1234567}"
+
+        print("len 15", s15.len, taken - b, s15)
+        b = taken
+
+        val s16 = f"abcdefgh${12345678}"
+
+        print("len 16", s16.len, taken - b, s16)
+        b = taken
+
+        val s64 = f"${text[0..<30]}-${text[0..<33]}"
+
+        print("len 64", s64.len, taken - b, s64 == text[0..<30] + "-" + text[0..<33])
+        b = taken
+
+        val s65 = f"${text[0..<30]}-${text[0..<34]}"
+
+        print("len 65", s65.len, taken - b, s65 == text[0..<30] + "-" + text[0..<34])
+        b = taken
+
+        val s1000 = f"${text}${text}${text}${text}${text}[${text[0..<38]}]"
+
+        print("len 1000", s1000.len, taken - b, s1000 == text + text + text + text + text + "[" + text[0..<38] + "]")
+        b = taken
+
+        val ints = f"<${lo}|${hi}|${-5}|${u8(255)}|${u128(1) << 100}>"
+
+        print(ints, taken - b)
+        b = taken
+
+        val floats = f"<${2.5}|${f32(0.1)}>"
+
+        print(floats, taken - b)
+        b = taken
+
+        val small = f"<${true}|${false}|${'x'}|${'é'}|${"hi"}|${e}>"
+
+        print(small, taken - b)
+        b = taken
+
+        val long = f"<${text}>"
+
+        print("long", long.len, taken - b, long == "<" + text + ">")
+        b = taken
+
+        val shown = f"<${Name("nm")}|${Point(1, 2)}|${Point(3, 4)}%?|${42}%5d>"
+
+        print(shown, taken - b)
+        b = taken
+
+        val nested = f"<${f"[${1}${Name("x")}${f"(${'y'})"}]"}>"
+
+        print(nested, taken - b)
+        b = taken
+
+        var good = 0
+
+        for i in 0..<100
+            val s = f"${i}:${text[0..<i]}"
+
+            if s == i.to_string() + ":" + text[0..<i] then good += 1
+
+        print("loop", good, taken - b)
+        b = taken
+
+        val mk = (n: int) -> f"<${n}:${Name("q")}>"
+
+        print(mk(5), mk(-6), taken - b)
+        b = taken
+
+        val awaited = block_on(both())
+
+        print(awaited, taken - b)
+
+        val fine = joined(true)
+        val failed = joined(false)
+
+        print("try", fine.is_ok(), fine.unwrap_or("").len, failed.is_err())
+    end work
+    """
+
+// What the program prints with the short form off. Up to 64 bytes an interpolation takes the one
+// block of its string -- the empty one too, which `from_bytes` makes with the form off; past 64 its
+// buffer is handed over as the string, so the 65-byte one and the 194-byte one take one block each
+// (the spill is rounded up to 256, so the `>` after the long hole fits), and the 1000-byte one a block
+// per growth of its buffer (192, 384, 768, 1536), each given back as the next replaces it. The `u128`
+// hole is read as a string of its own (one block) and pushes its interpolation past 64 (one more).
+// What the library's float and specifier renderers take is theirs: the floats' line counts those
+// alone, and `shown` its `%?` and `%5d`. The loop is one block per interpolation and three for the
+// concatenation it is compared with; the closure two strings; the `async` line three strings and
+// three tasks.
+private val ssx_h_expected_off: string =
+    "len 0 0 1\nlen 15 15 1 abcdefgh1234567\nlen 16 16 1 abcdefgh12345678\nlen 64 64 1 true\n" +
+    "len 65 65 1 true\nlen 1000 1000 4 true\n" +
+    "<-9223372036854775808|18446744073709551615|-5|255|1267650600228229401496703205376> 2\n" +
+    "<2.5|0.1> 9\n<true|false|x|é|hi|> 1\nlong 194 1 true\n" +
+    "<nm|Point(x: 1, y: 2)|Point(x: 3, y: 4)|   42> 9\n<[1x(y)]> 1\nloop 100 400\n<5:q> <-6:q> 2\n" +
+    "#1-a#+#2-a# 6\ntry true 197 true\nlive 0\n"
+
+// The same with the form on: a string of 15 bytes or fewer is short and costs nothing -- the empty
+// one, the 15-byte one, the nested one, the closure's, the tasks' strings and every small piece the
+// library renders.
+private val ssx_h_expected_on: string =
+    "len 0 0 0\nlen 15 15 0 abcdefgh1234567\nlen 16 16 1 abcdefgh12345678\nlen 64 64 1 true\n" +
+    "len 65 65 1 true\nlen 1000 1000 4 true\n" +
+    "<-9223372036854775808|18446744073709551615|-5|255|1267650600228229401496703205376> 2\n" +
+    "<2.5|0.1> 6\n<true|false|x|é|hi|> 1\nlong 194 1 true\n" +
+    "<nm|Point(x: 1, y: 2)|Point(x: 3, y: 4)|   42> 1\n<[1x(y)]> 0\nloop 100 174\n<5:q> <-6:q> 0\n" +
+    "#1-a#+#2-a# 3\ntry true 197 true\nlive 0\n"
+
+// The program built with `flags`, the short form `short` or not, and run: what it printed, or why not.
+private ssx_h_run(program: string, flags: []const string, short: bool) -> (bool, string)
+    val root = lbr_temp("sysl-ssxh")
+    val out = lbr_temp("sysl-ssxh-exe")
+
+    write_text(s"$root/sysl.hocon", ssx_h_manifest).unwrap()
+    write_text(s"$root/main.sysl", program).unwrap()
+
+    var args: Buf[string] = buf()
+
+    args.push("sysl")
+    args.push("build")
+
+    for f in flags
+        args.push(f)
+
+    args.push("-o")
+    args.push(s"$out/program")
+    args.push(root)
+
+    force_short_strings(short)
+
+    val said = lbr_cli(args.view())
+
+    force_short_strings(false)
+
+    val ran = if said.0 != 0 then (false, s"refused: ${said.1}")
+    else capture(s"$out/program", [], "", [], true) match
+        Ok(o) -> (o.status.ok(), o.text + o.err.unwrap_or(""))
+        Err(_) -> (false, "it could not be run")
+
+    lbr_drop([root, out])
+    ran
+end ssx_h_run
+
+private ssx_h_ready() -> bool = lbr_ready() && (host_os() == MacOS || host_os() == Linux)
+
+private ssx_h_counts(flags: []const string, short: bool, want: string)
+    val ran = ssx_h_run(ssx_h_program, flags, short)
+
+    assert(ran.0, ran.1)
+    assert_eq(ran.1, want)
+
+@test("ssx_h: an interpolation of any length and every hole kind builds one buffer, form off")
+ssx_h_counts_off()
+    if !ssx_h_ready() then return
+
+    ssx_h_counts([], false, ssx_h_expected_off)
+
+@test("ssx_h: an interpolation of any length and every hole kind builds one buffer, form on")
+ssx_h_counts_on()
+    if !ssx_h_ready() then return
+
+    ssx_h_counts([], true, ssx_h_expected_on)
+
+@test("ssx_h: the one buffer counts the same at -O2, form off and on")
+ssx_h_counts_optimized()
+    if !ssx_h_ready() then return
+
+    ssx_h_counts(["-O2"], false, ssx_h_expected_off)
+    ssx_h_counts(["-O2"], true, ssx_h_expected_on)
+
+// A hole whose `Display` panics once the buffer has spilled stops the program there, with what was
+// printed before it and the panic's message.
+@test("ssx_h: a hole that panics after spilling stops the program with its message")
+ssx_h_panicking_hole()
+    if !ssx_h_ready() then return
+
+    val program = ssx_h_heap + raw"""
+        struct Boom
+            n: int
+
+        impl Display for Boom
+            display(self, out: *Writer, spec: FormatSpec)
+                out.write(text.bytes[0..<self.n])
+                panic("boom")
+
+        main()
+            print("before")
+
+            val s = f"a${text}${Boom(100)}z"
+
+            print("after", s.len)
+        """
+
+    for short in [false, true]
+        val ran = ssx_h_run(program, [], short)
+
+        assert(!ran.0, ran.1)
+        assert(ran.1.starts_with("before\n"), ran.1)
+        assert(ran.1.contains("boom"), ran.1)
+        assert(!ran.1.contains("after"), ran.1)
+end ssx_h_panicking_hole
+
+// The text: one slot and one `finish` for a whole interpolation, its literal pieces and integer
+// holes appended in place, and no concatenation; a `?` in a hole keeps the join.
+@test("ssx_h: an interpolation lowers to one slot, appends its pieces and joins nothing")
+ssx_h_one_slot_text()
+    if !lbr_ready() then return
+
+    val root = lbr_temp("sysl-ssxh-ir")
+    val file = s"$root/main.sysl"
+
+    write_text(file, "struct P\n    x: int\n\nimpl Display for P\n" +
+        "    display(self, out: *Writer, spec: FormatSpec) = out.write(\"p\".bytes)\n\n" +
+        "two(p: P, n: int, c: char) -> string = f\"${p}-${p} ${n}${c}\"\n\nmain() = print(two(P(1), 7, 'c'))\n").unwrap()
+
+    val ir = lbr_text(file, [])
+
+    val slot = "{ ptr, i64, i64, [64 x i8] }"
+
+    assert_eq(ir.count_of(s" = alloca $slot\n"), 1)
+    assert_eq(ir.count_of("  store { ptr, i64, i64 } zeroinitializer, ptr "), 1)
+    assert_eq(ir.count_of("@sysl.w.buf.finish(ptr "), 1 + 1)
+    assert_eq(ir.count_of("call void @sysl.w.buf.put(ptr "), 2 + 1 + 1 + 1)
+    assert_eq(ir.count_of("call void @sysl.w.buf.int(ptr "), 1)
+    assert_eq(ir.count_of("call void @sysl.w.buf.char(ptr "), 1)
+    assert(!ir.contains("@sysl.str.concat("), ir)
+    assert(!ir.contains("call { ptr, ptr, i64 } @sysl.str.int("), ir)
+    assert(ir.contains("  %onheap = icmp ugt i64 %cap, 64\n"), ir)
+    assert(ir.contains("  %padded = add i64 %need, 63\n  %rounded = and i64 %padded, -64\n"), ir)
+    assert(ir.contains("  %base = getelementptr i8, ptr %buf, i64 %backhs\n"), ir)
+
+    write_text(file, "pick(ok: bool) -> Result[string, int] = if ok then Ok(\"y\") else Err(7)\n\n" +
+        "f(ok: bool) -> Result[string, int] = Ok(f\"a${pick(ok)?}b\")\n\nmain() = print(f(true).unwrap_or(\"\"))\n").unwrap()
+
+    val joined = lbr_text(file, [])
+
+    lbr_drop([root])
+
+    assert(joined.contains("@sysl.str.concat("), joined)
+    assert(!joined.contains("@sysl.w.buf.put("), joined)
+end ssx_h_one_slot_text
+
+@test("ssx_h: str_builder never reaches the rendering buffer")
+ssx_h_builder_untouched()
+    if !lbr_ready() then return
+
+    val root = lbr_temp("sysl-ssxh-sb")
+    val file = s"$root/main.sysl"
+
+    write_text(file, "import sysl.text.str_builder\n\nvar sb = str_builder()\n\nsb.push(\"n=\")\n" +
+        "sb.push_int(42)\nsb.push_char('!')\n\nprint(sb.finish())\n").unwrap()
+
+    val ir = lbr_text(file, [])
+
+    lbr_drop([root])
+
+    assert(ir.contains("@sysl.text$str_builder("), ir)
+    assert(!ir.contains("@sysl.w.buf."), ir)
+end ssx_h_builder_untouched
+
+// Every piece kind, built as a C archive for a 32-bit bare Thumb core, form off and on.
+@test("ssx_h: an interpolation of every piece kind builds for thumb-freestanding-softfp")
+ssx_h_thumb_build_c()
+    if !lbr_ready() then return
+
+    val program = raw"""
+        extern "board_take" board_take(size: usize, align: usize) -> *u8
+        extern "board_give" board_give(p: *u8, size: usize, align: usize)
+
+        @export("h_alloc")
+        h_alloc(size: usize, align: usize) -> *u8 = board_take(size, align)
+
+        @export("h_free")
+        h_free(p: *u8, size: usize, align: usize) = board_give(p, size, align)
+
+        struct Name
+            s: string
+
+        impl Display for Name
+            display(self, out: *Writer, spec: FormatSpec) = out.write(self.s.bytes)
+
+        @export("probe")
+        probe(n: int, w: i64, c: char) -> usize
+            val s = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-_"[0..<usize(n & 63)]
+
+            f"n=${n} w=${w} ${c}${true} <${s}> ${Name(s)} ${f"[${n}]"}".len
+        """
+
+    for short in [false, true]
+        val root = lbr_temp("sysl-ssxh-thumb")
+
+        write_text(s"$root/sysl.hocon", "package { name = \"ssxht\", version = \"0.0.1\" }\nallocator {\n" +
+            "  alloc = \"h_alloc\"\n  free  = \"h_free\"\n}\n").unwrap()
+        write_text(s"$root/main.sysl", program).unwrap()
+        force_short_strings(short)
+
+        val said = lbr_cli(["sysl", "build-c", "--target", "thumb-freestanding-softfp", "-o", s"$root/probe.a", root])
+
+        force_short_strings(false)
+        lbr_drop([root])
+        assert_eq(said.0, 0, s"short=$short: ${said.1}")
+end ssx_h_thumb_build_c

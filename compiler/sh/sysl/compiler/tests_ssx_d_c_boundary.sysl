@@ -1,0 +1,439 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, read_text, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+import sysl.text.{Search, join}
+
+// **A string at the C boundary where the short form is on** (`emit_foreign.sysl`'s `to_c` and
+// `from_c`, `docs/design/short-strings.md` § 5.6 item 3). A string handed to an `extern` by value
+// always arrives in the long form -- `{owner, address, length}` -- whatever form sysl held it in: lent
+// for the call, a short one's bytes are a frame slot's; handed to a parameter `@keeps` names, they are
+// a heap copy whose count goes with them to C. A string an `extern` answers is checked to be long.
+//
+// The C beside each program reads the three words itself, so what it sees is the convention's, not
+// this compiler's. Every run is on the counted heap and must give back every allocation.
+//
+// Cells: the lengths 0, 1, 14 (2W - 2), 15 (the capacity), 16, and 14 ASCII bytes plus a two-byte
+// character; a concatenation and a slice of a short string, a literal; lent by name and through a
+// `*extern` pointer; kept by name and through a `*extern(@keeps string)` pointer, read by C after the
+// frame that made it is gone and handed back; a forged short answer trapped; `cstring` of every
+// length; the 32-bit split convention (thumb, `[3 x i32]`) and wasm32 in the IR; the IR with the form
+// off; `@export` of a string parameter still refused; a `build-c` header unchanged by the form.
+//
+// Skipped cells, with the reason: running a 32-bit program (no 32-bit runner in the suite; the IR is
+// read instead); a string inside a struct, tuple or enum handed by value (it crosses in the form it
+// holds, as one read through a pointer does -- the design's § 5.6 item 3); a variadic extra (it is
+// classified by the same path as a declared parameter, so the lent cell covers it); a long string
+// handed to a kept parameter (it crosses unchanged, as it did before, and C holds no count of it, so
+// handing it back would release a count C never had -- a property of `@keeps` itself, not of the
+// form); `--release` and LTO (the normalisation is a pair of `insertvalue`s on the value C is handed,
+// which optimisation cannot reorder past the call that reads it).
+
+private val ssx_d_c = raw"""
+    #include <stdint.h>
+    #include <string.h>
+
+    typedef struct { void *owner; const uint8_t *ptr; intptr_t len; } sysl_str;
+
+    static uint64_t fnv(const uint8_t *p, intptr_t n) {
+        uint64_t h = 1469598103934665603ull;
+        for (intptr_t i = 0; i < n; i++) { h ^= p[i]; h *= 1099511628211ull; }
+        return h;
+    }
+
+    int64_t ssx_len(sysl_str s) { return s.len; }
+
+    uint64_t ssx_hash(sysl_str s) { return s.len < 0 ? 0 : fnv(s.ptr, s.len); }
+
+    int64_t ssx_strlen(const char *p) { return (int64_t)strlen(p); }
+
+    static sysl_str held[8];
+    static int nheld;
+
+    void ssx_keep(sysl_str s) { held[nheld++] = s; }
+
+    int64_t ssx_held_len(int64_t i) { return held[i].len; }
+
+    uint64_t ssx_held_hash(int64_t i) { return held[i].len < 0 ? 0 : fnv(held[i].ptr, held[i].len); }
+
+    sysl_str ssx_give(void) { return held[--nheld]; }
+
+    sysl_str ssx_forged(void) {
+        sysl_str s = { 0, 0, (intptr_t)((uintptr_t)1 << (sizeof(intptr_t) * 8 - 1)) | 3 };
+        return s;
+    }
+    """
+
+private struct SsxdRun
+    ok: bool
+    code: int
+    out: string
+    err: string
+
+private ssx_d_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end ssx_d_ready
+
+// The program built with the C beside it on the counted heap, with the short form `short` or not,
+// and run.
+private ssx_d_run(text: string, short: bool) -> SsxdRun
+    val root = make_temp_dir("sysl-ssx-d").unwrap()
+
+    write_text(s"$root/sysl.hocon", "package { name = \"t\", version = \"0.0.1\" }\n").unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    write_text(s"$root/probe.c", ssx_d_c).unwrap()
+
+    force_alloc_counting(true)
+    force_short_strings(short)
+
+    val built = build_native_program(root, None, None, "0", Some(s"$root/built"))
+
+    force_short_strings(false)
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return SsxdRun(false, -1, failure_text(why), "")
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> SsxdRun(false, -1, "could not be started", "")
+        Ok(o) -> SsxdRun(o.status.ok(), ssx_d_code(o.status), o.text, o.err.unwrap_or(""))
+end ssx_d_run
+
+// Run with the form `short`: prints `want` and gives back every allocation.
+private ssx_d_prints(text: string, short: bool, want: string)
+    val run = ssx_d_run(text, short)
+
+    assert(run.ok, s"short=$short: ${run.out} ${run.err}")
+    assert_eq(run.out, want, s"short=$short")
+    assert_eq(alloc_count_reported(run.err), 0, s"short=$short: ${run.err}")
+end ssx_d_prints
+
+// The IR of `text` for `target`, with the form `short` or not.
+private ssx_d_ir(text: string, short: bool, target: string) -> string
+    val root = make_temp_dir("sysl-ssx-d").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+
+    force_short_strings(short)
+
+    val code = run_cli(["sysl", "emit-llvm", s"$root/main.sysl", "--target", target], (line) -> sink.push(line))
+
+    force_short_strings(false)
+    remove_dir_all(root).unwrap_or(())
+
+    val text_out = join(lines.view(), "\n")
+
+    assert_eq(code, 0, text_out)
+    text_out
+end ssx_d_ir
+
+private ssx_d_count(text: string, needle: string) -> usize = text.count_of(needle)
+
+// The body of the function whose `define` line names `name`, from that line to its closing brace.
+private ssx_d_body(ir: string, name: string) -> string
+    var out: Buf[string] = buf()
+    var inside = false
+
+    for line in ir.split("\n")
+        if !inside && line.starts_with("define") && holds_text(line, name) then inside = true
+
+        if inside
+            out.push(line)
+
+            if line == "}" then break
+
+    assert(inside, s"no body names $name:\n$ir")
+    join(out.view(), "\n")
+end ssx_d_body
+
+// How a run ended, as a shell would number it: the exit code, or 128 and the signal.
+private ssx_d_code(s: Status) -> int = s match
+    Status.Exited(c) -> c
+    Status.Signalled(n) -> 128 + n
+    Status.TimedOut -> -1
+
+// -- lent for the call ------------------------------------------------------------------------------
+
+private val ssx_d_lent = """
+    extern ssx_len(s: string) -> i64
+    extern ssx_hash(s: string) -> u64
+
+    fnv(s: string) -> u64
+        var h = 1469598103934665603u64
+
+        for b in s.bytes
+            h = (h ^ u64(b)) *% 1099511628211
+
+        h
+
+    made(n: int) -> string = "abcdefghijklmnopqrstuvwxyz"[0..<n].copy()
+
+    check(tag: string, s: string)
+        print(s"$tag ${ssx_len(s)} ${ssx_hash(s) == fnv(s)}")
+
+    through(tag: string, s: string)
+        val len: *extern(string) -> i64 = &ssx_len
+        val hash: *extern(string) -> u64 = &ssx_hash
+
+        print(s"$tag ${len(s)} ${hash(s) == fnv(s)}")
+
+    for n in [0, 1, 14, 15, 16]
+        check(s"made$n", made(n))
+        through(s"ptr$n", made(n))
+
+    check("accent", made(14) + "é")
+    check("concat", made(7) + made(8))
+    check("lit", "hello")
+    check("slice", made(15)[2..<9])
+    """
+
+private ssx_d_lent_want() -> string
+    var out = ""
+
+    for n in [0, 1, 14, 15, 16]
+        out = out + s"made$n $n true\nptr$n $n true\n"
+
+    out + "accent 16 true\nconcat 15 true\nlit 5 true\nslice 7 true\n"
+end ssx_d_lent_want
+
+@test("ssx_d a string lent to an extern arrives long at every length, by name and through a pointer, form off and on")
+ssx_d_lent_at_every_length()
+    if !ssx_d_ready() then return
+
+    for short in [false, true]
+        ssx_d_prints(ssx_d_lent, short, ssx_d_lent_want())
+
+// -- kept past the call -------------------------------------------------------------------------------
+
+// Strings made in a frame that is gone, and a stack written over, before C reads them; then C hands
+// each back and the caller gives its count back. Only with the form on: with it off, the kept strings
+// are long and C holds no count of them (see the skipped cells).
+private val ssx_d_kept = """
+    @keeps(s)
+    extern ssx_keep(s: string)
+    extern ssx_held_len(i: i64) -> i64
+    extern ssx_held_hash(i: i64) -> u64
+    extern ssx_give() -> string
+
+    fnv(s: string) -> u64
+        var h = 1469598103934665603u64
+
+        for b in s.bytes
+            h = (h ^ u64(b)) *% 1099511628211
+
+        h
+
+    made(n: int) -> string = "abcdefghijklmnopqrstuvwxyz"[0..<n].copy()
+
+    keep_some()
+        ssx_keep(made(0))
+        ssx_keep(made(1))
+        ssx_keep(made(14))
+
+        val keep: *extern(@keeps string) -> unit = &ssx_keep
+
+        keep(made(15))
+        keep("literal")
+
+    clobber(depth: int) -> int
+        var junk: [64]int = [depth; 64]
+
+        if depth == 0 then junk[3] else clobber(depth - 1) + junk[5]
+
+    keep_some()
+    print(clobber(8))
+
+    val lens = [0, 1, 14, 15, 7]
+
+    for i in 0..<5
+        val want = if i == 4 then "literal" else made(lens[i])
+
+        print(s"held$i ${ssx_held_len(i)} ${ssx_held_hash(i) == fnv(want)}")
+
+    for i in 0..<5
+        val s = ssx_give()
+
+        print(s"back ${s.len} [$s]")
+    """
+
+@test("ssx_d a short string handed to a @keeps parameter is a heap copy C reads after the frame and hands back")
+ssx_d_kept_past_the_call()
+    if !ssx_d_ready() then return
+
+    ssx_d_prints(ssx_d_kept, true,
+                 "36\nheld0 0 true\nheld1 1 true\nheld2 14 true\nheld3 15 true\nheld4 7 true\n" +
+                 "back 7 [literal]\nback 15 [abcdefghijklmno]\nback 14 [abcdefghijklmn]\nback 1 [a]\nback 0 []\n")
+
+// -- what C answers -----------------------------------------------------------------------------------
+
+private val ssx_d_forged = """
+    extern ssx_forged() -> string
+
+    print("before")
+
+    val s = ssx_forged()
+
+    print(s.len)
+    """
+
+@test("ssx_d a string an extern answers with the short tag set traps where the form is on, and is a length where it is off")
+ssx_d_forged_answer_traps()
+    if !ssx_d_ready() then return
+
+    val on = ssx_d_run(ssx_d_forged, true)
+
+    assert_eq(on.code, 133, on.out + on.err)
+    assert_eq(on.out, "before\n")
+    assert(holds_text(on.err, "a string a C function answered has the short-string tag in its length"), on.err)
+
+    val off = ssx_d_run(ssx_d_forged, false)
+
+    assert(off.ok, off.out + off.err)
+    assert_eq(off.out, "before\n9223372036854775811\n")
+
+// -- cstring --------------------------------------------------------------------------------------------
+
+private val ssx_d_cstring = """
+    import sysl.text.cstring
+
+    extern ssx_strlen(p: *u8) -> i64
+
+    made(n: int) -> string = "abcdefghijklmnopqrstuvwxyz"[0..<n].copy()
+
+    for n in [0, 1, 14, 15, 16]
+        val c = cstring(made(n))
+
+        print(s"$n ${ssx_strlen(c.ptr)}")
+
+    val wide = cstring(made(14) + "é")
+
+    print(ssx_strlen(wide.ptr))
+    """
+
+@test("ssx_d cstring of a short string is its bytes and a NUL at every length, form off and on")
+ssx_d_cstring_at_every_length()
+    if !ssx_d_ready() then return
+
+    for short in [false, true]
+        ssx_d_prints(ssx_d_cstring, short, "0 0\n1 1\n14 14\n15 15\n16 16\n16\n")
+
+// -- the IR at both word sizes ----------------------------------------------------------------------
+
+private val ssx_d_ir_text = """
+    extern take(s: string) -> i32
+    @keeps(s)
+    extern hold(s: string)
+
+    use(s: string) -> i32
+        hold(s)
+        take(s)
+
+    @export("ssx_entry")
+    entry() -> i32 = use("abc")
+    """
+
+// The 32-bit split convention hands the three words over as `[3 x i32]`; the long form is laid into
+// the value first (two `insertvalue`s on the string's type that the form off does not have), the kept
+// parameter goes through the heap copy, and the answer of neither is checked, since neither is a
+// string. With the form off nothing of it is there.
+@test("ssx_d the long form is laid in before a 32-bit split call and a wasm32 call, and only where the form is on")
+ssx_d_ir_at_32_bits()
+    if !clang_available() then return
+
+    for (t, word) in [("thumb-freestanding-softfp", "i32"), ("wasm32-freestanding", "i32"), ("aarch64-macos", "i64")]
+        val on = ssx_d_body(ssx_d_ir(ssx_d_ir_text, true, t), "use$$sysl")
+        val off = ssx_d_body(ssx_d_ir(ssx_d_ir_text, false, t), "use$$sysl")
+        val shape = s"insertvalue { ptr, ptr, $word }"
+
+        assert_eq(ssx_d_count(on, shape), 2, s"$t\n$on")
+        assert_eq(ssx_d_count(off, "insertvalue"), 0, s"$t\n$off")
+        assert(holds_text(on, s"call { ptr, ptr, $word } @sysl.str.for_c("), s"$t\n$on")
+        assert(!holds_text(off, "sysl.str.for_c"), s"$t\n$off")
+
+        if t == "thumb-freestanding-softfp" then assert(holds_text(on, "@take([3 x i32]"), on)
+
+// -- what does not change -----------------------------------------------------------------------------
+
+@test("ssx_d an exported function still refuses a string parameter")
+ssx_d_export_refuses_a_string()
+    if !ssx_d_ready() then return
+
+    val root = make_temp_dir("sysl-ssx-d").unwrap()
+    val dir = s"$root/mylib"
+
+    make_dir_all(s"$dir/mylib").unwrap()
+    write_text(s"$dir/sysl.hocon", "package { name = \"mylib\", version = \"0.0.1\" }\n").unwrap()
+    write_text(s"$dir/mylib/lib.sysl", "module mylib\n\n@export\ngreet(s: string) -> i32 = 0\n").unwrap()
+
+    for short in [false, true]
+        force_short_strings(short)
+
+        val (code, out, err) = clx_ran(["sysl", "build-c", dir, "-o", s"$root/mylib.a"])
+
+        force_short_strings(false)
+
+        assert(code != Fine, out + err)
+        assert(holds_text(out + err, "'s' of the exported 'mylib.greet' is string, which C has no way to spell"),
+               out + err)
+
+    remove_dir_all(root).unwrap_or(())
+
+@test("ssx_d a build-c archive's header is byte-identical with the form off and on")
+ssx_d_header_unchanged()
+    if !ssx_d_ready() then return
+
+    val root = make_temp_dir("sysl-ssx-d").unwrap()
+    val dir = s"$root/mylib"
+
+    make_dir_all(s"$dir/mylib").unwrap()
+    write_text(s"$dir/sysl.hocon", "package { name = \"mylib\", version = \"0.0.1\" }\n").unwrap()
+    write_text(s"$dir/mylib/lib.sysl", raw"""
+        module mylib
+
+        struct Pair
+            a: i32
+            b: f64
+
+        extern take(s: string) -> i32
+
+        @export
+        named(n: i32) -> i32 = take(s"n${n}") + take("lit")
+
+        @export
+        swap(p: Pair) -> Pair = Pair(i32(p.b), f64(p.a))
+        """).unwrap()
+    write_text(s"$dir/take.c", "#include <stdint.h>\nint32_t take(void *s) { return 1; }\n").unwrap()
+
+    var headers: Buf[string] = buf()
+
+    for short in [false, true]
+        force_short_strings(short)
+
+        val (code, out, err) = clx_ran(["sysl", "build-c", dir, "-o", s"$root/mylib$short.a"])
+
+        force_short_strings(false)
+
+        assert_eq(code, Fine, out + err)
+        headers.push(read_text(s"$root/mylib$short.a.h").unwrap())
+
+    assert(holds_text(headers[0], "named"), headers[0])
+    assert_eq(headers[1], headers[0])
+
+    remove_dir_all(root).unwrap_or(())
