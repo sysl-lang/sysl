@@ -68,11 +68,30 @@ import sysl.math.bigint.from_int
 //   the form's one argument, so every analysis that reads a box reads this one; only the lowering
 //   knows the box may not be made. Nothing is stored and no count is taken on the refused arm.
 
-// The eight names, whatever claims them.
+// **One more makes a single slot on the stack**, for a generic body that has to hold a `T` before it
+// has one -- a copy made a word at a time into storage of its own, where `T` may have no zero value:
+//
+// - `var out: T = slot_empty()` (or `slot_empty[T]()`) declares a local that is an **empty slot**: no
+//   value is in it, and nothing is let go of for it unless one is put there. It is `slot_take`'s
+//   empty: zeroed where `T` holds a count -- the state the local's release at the end of its block
+//   gives back nothing for -- and bytes nobody wrote where it holds none, which costs nothing. Its
+//   storage is the frame's, aligned as `T` is, as any local's is.
+//
+// The form stands only as a `var`'s initial value: a slot is storage, and only a local is storage a
+// value can be put into afterwards. **The local's first mention, in reading order, writes it**: an
+// assignment to it (or to a part of it), `&out` -- the address a copy or `slot_put` writes through --
+// or a `ref` to it; a read before that is refused (`empty_slot_reads`). What the check cannot see is
+// the caller's, as a slot past the live run is: a write on one arm of an `if` and a read after it.
+
+// The nine names, whatever claims them.
 slot_form_word(name: string) -> bool =
     name == "slot_storage" || name == "slot_place" || name == "slot_place_run" ||
         name == "slot_vacate" || name == "slot_take" || name == "slot_put" ||
-        name == "try_slot_storage" || name == "try_heap"
+        name == "try_slot_storage" || name == "try_heap" || name == "slot_empty"
+
+// The form that makes an empty local. Every analysis asks this rather than naming it: it makes no
+// storage of its own and writes none, so to each of them it is a value nothing is in.
+empty_form(op: string) -> bool = op == "slot_empty"
 
 // The two forms that make new storage of slots: the trapping one and the one that answers an empty
 // view where the heap refused. Every analysis asks this rather than naming either.
@@ -87,6 +106,7 @@ slot_form(cx: &Analyzer, name: string) -> bool =
 slot_call(cx: &Analyzer, span: Span, name: string, args: Buf[Expr], expected: Option[Type]) -> TExpr
     if storage_form(name) then return slot_storage_call(cx, span, name, args, expected)
     if name == "try_heap" then return try_heap_call(cx, span, args)
+    if empty_form(name) then return slot_empty_call(cx, span, args, expected)
     if name == "slot_take" || name == "slot_put" then return slot_move_call(cx, span, name, args)
 
     slot_write_call(cx, span, name, args)
@@ -136,6 +156,137 @@ private slot_move_call(cx: &Analyzer, span: Span, name: string, args: Buf[Expr])
 
     TExpr(span, TSlots(name, all, elem, if take then elem else Unit))
 end slot_move_call
+
+// `slot_empty()` -- the slot's type is the `var`'s, which is the one position the form stands in.
+private slot_empty_call(cx: &Analyzer, span: Span, args: Buf[Expr], expected: Option[Type]) -> TExpr
+    if cx.empty_slot_at.is_none() then
+        return cx.err(span, "'slot_empty' makes a local that holds nothing yet, so it is written only as " +
+                      "a 'var''s initial value — 'var name: T = slot_empty()'")
+
+    if !args.is_empty() then
+        return cx.err(span, s"'slot_empty' takes no arguments — the local's type says what the slot " +
+                      s"holds — but ${supplied(args.len(), "argument")}")
+
+    val written = cx.empty_slot_at.unwrap()
+    val ty = if written != Unknown then written else expected.unwrap_or(Unknown)
+
+    if written == Unknown && expected.is_none() then
+        return cx.err(span, "'slot_empty' makes a slot for a value of some type, and nothing here says " +
+                      "which — write 'var name: T = slot_empty()' or 'slot_empty[T]()'")
+
+    if ty == Unknown then return bad_expr(span)
+
+    TExpr(span, TSlots("slot_empty", buf(), ty, ty))
+end slot_empty_call
+
+// **An empty local is written before it is read** -- the refusal `slot_empty` makes the one promise
+// it can check. Each `var` of the block declared over the form is followed through the statements
+// after it, in reading order, to its first mention: a write (an assignment to it or a part of it,
+// its address, a `ref` to it) settles it, and a read is refused. A write's value is read before the
+// write, so `out = out + 1` is a read.
+empty_slot_reads(cx: &Analyzer, stmts: Buf[TStmt], tail: Option[TExpr])
+    for i in 0..<stmts.len()
+        stmts[i] match
+            TVarDecl(name, _, init, _) -> if empty_init(init) then first_mention(cx, name, stmts, i + 1, tail)
+            _ -> ()
+
+// Whether a `var`'s initial value is written as the form -- `slot_empty()` or `slot_empty[T]()` --
+// which is what lets the reading of it take the form there (`Analyzer.empty_slot_at`).
+writes_empty_form(e: Expr) -> bool = *e.kind match
+    Call(callee, _) -> *callee.kind match
+        Ident(n) -> empty_form(n)
+        TypeArgs(head, _, _) -> named_empty_form(head)
+        // One type argument has no comma to tell it from a subscript, so it arrives as an index.
+        Index(head, _, _) -> named_empty_form(head)
+        _ -> false
+    _ -> false
+
+private named_empty_form(head: Expr) -> bool = *head.kind match
+    Ident(n) -> empty_form(n)
+    _ -> false
+
+// Whether a `var`'s initial value, read, is `slot_empty()`.
+empty_init(init: TExpr) -> bool = *init.kind match
+    TSlots(op, _, _, _) -> empty_form(op)
+    _ -> false
+
+private first_mention(cx: &Analyzer, name: string, stmts: Buf[TStmt], from: usize, tail: Option[TExpr])
+    val settled: &Settled = Settled(false)
+    val walk = TWalk(false, e -> mention_in(cx, name, settled, e), w -> write_stmt(cx, name, settled, w),
+                     s -> ref_stmt(name, settled, s))
+
+    for i in from..<stmts.len()
+        if settled.yes then return
+
+        walk_stmt(stmts[i], walk)
+
+    if !settled.yes && tail.is_some() then walk_texpr(tail.unwrap(), walk)
+end first_mention
+
+// The one flag the walk's callbacks share, set by the first mention either way.
+private struct Settled
+    yes: bool
+
+// One expression met before the local was settled, outermost first: a store or an address of it
+// settles it as written, and a load of it is the read the check is for.
+private mention_in(cx: &Analyzer, name: string, settled: &Settled, e: TExpr)
+    if settled.yes then return
+
+    *e.kind match
+        TStore(place, value, _, _) -> if slot_root(place, name) then written(cx, name, settled, value)
+        TAddrOf(place, _) -> if slot_root(place, name) then settled.yes = true
+        TLoad(n, _) ->
+            if n == name
+                cx.fault(e.span, s"'${written_name(cx, name)}' is an empty slot, read here before " +
+                         "anything was written to it")
+                settled.yes = true
+        _ -> ()
+end mention_in
+
+// An assignment statement: `out = v` (or to a part of it) writes the local; a compound one reads it
+// first, which the walk of its place then finds.
+private write_stmt(cx: &Analyzer, name: string, settled: &Settled, w: TWrite)
+    if !settled.yes && w.op == "=" && slot_root(w.place, name) then written(cx, name, settled, w.value)
+
+// `ref r = out` is a second name for the storage, and writes through it are the local's.
+private ref_stmt(name: string, settled: &Settled, s: TStmt)
+    if settled.yes then return
+
+    s match
+        TRefDecl(_, _, place) -> if slot_root(place, name) then settled.yes = true
+        _ -> ()
+end ref_stmt
+
+// The local as the program wrote it, rather than the name it was bound under.
+private written_name(cx: &Analyzer, unique: string) -> string
+    for item in cx.locals
+        if item.unique == unique then return item.name
+
+    unique
+
+// A write to the local, its value read first: a read of the local in the value is refused there.
+private written(cx: &Analyzer, name: string, settled: &Settled, value: TExpr)
+    walk_texpr(value, expr_walk(false, e -> mention_in(cx, name, settled, e)))
+    settled.yes = true
+
+// Whether a place is the local's own storage or part of it -- a field of it, an element of an array of
+// it -- rather than storage reached through an address it holds.
+private slot_root(place: TExpr, name: string) -> bool = *place.kind match
+    TLoad(n, _) -> n == name
+    TField(recv, _, _) -> !holds_address(texpr_type(recv)) && slot_root(recv, name)
+    TIndex(recv, _, _) -> holds_elements(texpr_type(recv)) && slot_root(recv, name)
+    _ -> false
+
+private holds_address(t: Type) -> bool = repr(t) match
+    Ref(_, _) -> true
+    Weak(_) -> true
+    Ptr(_, _) -> true
+    _ -> false
+
+private holds_elements(t: Type) -> bool = repr(t) match
+    Array(_, _) -> true
+    Vector(_, _) -> true
+    _ -> false
 
 // `slot_storage(n)` and `try_slot_storage(n)` -- the element type comes from the position, the way
 // `ptr_cast`'s does.
@@ -315,6 +466,11 @@ gen_slots(e: *Emit, op: string, args: Buf[TExpr], elem: Type, ty: Type) -> Val
     if op == "try_slot_storage" then return gen_try_slot_storage(e, args[0], elem, ty)
     if op == "try_heap" then return gen_try_heap(e, args[0], ty)
     if op == "slot_take" then return gen_slot_take(e, args[0], elem)
+
+    // The empty slot's contents: `slot_take`'s zero where the element holds a count, so the local's
+    // release at the end of its block gives back nothing, and otherwise nothing at all -- a store of
+    // `undef` is no instruction.
+    if empty_form(op) then return if contains_counted(elem) then zero_of(e, elem) else VUndef
 
     if op == "slot_put" then gen_slot_put(e, args[0], args[1], elem)
     else if op == "slot_place" then gen_slot_place(e, args[0], args[1], args[2], elem)

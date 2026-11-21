@@ -43,8 +43,9 @@ torn value. Something has to say whether that happened, and that is what a seque
 simple enums, and arrays and structs of them. Every byte of a torn value then still came from some
 value of its field, so holding one is harmless until it is thrown away. A counted reference, a
 string or a view is refused at the line that names the type: a copy of its bytes would be a second
-owner nobody counted. The answer is built in a local that starts at `T`'s zero value, so a `T`
-with none -- a simple enum none of whose variants is `= 0` -- is refused as well.
+owner nobody counted. The answer is built in an empty slot (`slot_empty()`), so a `T` with no zero
+value -- a simple enum none of whose variants is `= 0` -- is copied like any other, and nothing is
+written into the local before the words are.
 
 **A word is as wide as the type's alignment allows**, up to the machine's pointer: a struct of
 `u64`s is copied in 64-bit loads on a 64-bit machine and in 32-bit ones on a 32-bit one, and a
