@@ -1,0 +1,833 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map, Set, set}
+
+// **A local that only walks storage holds no count** (`docs/design/borrow-inference.md` §3, §4.1;
+// `tests_bli_borrowed_locals.sysl`).
+//
+// A counted value read out of storage is alive for as long as the storage holds it: its referents
+// are held by the edge it was read along, and that edge by the root the walk started from. So a
+// local -- a `var`, a `val`, a `match` arm's binding, an `is` binding -- whose every value is read
+// that way, and whose chain nothing can cut while it is alive, needs no count of its own. Taking one
+// could never be what keeps the object alive, so leaving it out changes nothing a program prints or
+// when a destructor runs; it only removes a retain and a release, which LLVM cannot cancel across a
+// loop (`x_tail = xt.next` retains in one trip and releases in the next).
+//
+// **Backing.** Each candidate's values get a provenance: `Fresh` (a call's answer, a box, module
+// storage -- anything that arrives with a count), or backed by **roots** along **edge keys**
+// (`EdgeKey`, the summary's own): a field read through a reference adds `(owner, field)`, a payload
+// bound out of a value that is not in the frame adds the payload's key, a value built on the spot is
+// backed by its parts, and a copy of another +0 local is backed as that local is. A value still in
+// a root's own slot (`frame`) adds no key: nothing but writing the root can change it.
+//
+// **Roots** are the slots only this frame can change and whose changes it sees: a parameter (the
+// caller holds it for the activation -- unless the body jumps back to its own entry, which writes
+// them), and a local of the function's top block (alive to the end of the body). Neither may have its
+// address taken or a `ref` bound to it, nor be promoted to the heap. An owned one -- a local, or a
+// parameter the body owns -- must also not be used where its count could move (handed to a call,
+// copied into a counted local, matched on): only read through.
+//
+// **Validity** is checked over the candidate's whole scope (its block from the declaration on, an
+// arm, an `if`'s or `while`'s body after its condition): a store or a callee's edge-write summary
+// (`edge_writes`) meeting a key, code nobody can see (a closure or table call, a function value, a
+// foreign call not trusted, a suspension, a destructor -- any value in the scope whose release may
+// run one), a slot form that reads a count of a chain type, and the root written or used where its
+// count could move. One kill anywhere in the scope keeps the count -- a local is +0 for the whole of
+// its life or not at all (decision 5), so no merge of differently-counted values is ever needed.
+//
+// **Keeping** a +0 value takes the count where it is kept (decision 6): a store, `return`, `break`,
+// a copy into a counted local, an owned argument, a value built from it -- each goes through
+// `retain_moving`, which finds no slot of the frame's to take the count over from, exactly as for a
+// lent `for` variable (`lent_element`) and a borrowed parameter. A candidate named in a `defer`, a
+// compound assignment, a multiple assignment, or whose address is taken, is counted.
+//
+// The answer is the set of +0 names, which the emitter reads through `e.lent_decls`: a declaration
+// and a binding of one take no count and register no slot, and an assignment to one is a plain
+// store (`store_over`).
+
+// Where a candidate's values come from: roots, the edge keys between them and the value, and whether
+// the value still sits in a root's own slot.
+private struct Back
+    roots: Set[string]
+    keys: Buf[EdgeKey]
+    named: Set[string]
+    frame: bool
+end Back
+
+private back_empty() -> Back = Back(set(), buf(), set(), true)
+
+private back_root(name: string) -> Back
+    var roots: Set[string] = set()
+
+    roots.add(name)
+    Back(roots, buf(), set(), true)
+end back_root
+
+private back_copy(b: Back) -> Back
+    var roots: Set[string] = set()
+    var keys: Buf[EdgeKey] = buf()
+    var named: Set[string] = set()
+
+    for item in b.roots
+        roots.add(item)
+
+    for item in b.keys
+        keys.push(item)
+        named.add(item.text)
+
+    Back(roots, keys, named, b.frame)
+end back_copy
+
+private back_key(b: Back, k: EdgeKey) -> Back
+    val out = back_copy(b)
+
+    if !out.named.has(k.text)
+        out.named.add(k.text)
+        out.keys.push(k)
+
+    Back(out.roots, out.keys, out.named, false)
+end back_key
+
+// Both: every root and key of either, in the frame only where both are.
+private back_join(a: Back, b: Back) -> Back
+    val out = back_copy(a)
+
+    for item in b.roots
+        out.roots.add(item)
+
+    for item in b.keys
+        if !out.named.has(item.text)
+            out.named.add(item.text)
+            out.keys.push(item)
+
+    Back(out.roots, out.keys, out.named, a.frame && b.frame)
+end back_join
+
+private back_size(b: Option[Back]) -> usize = b match
+    Some(x) -> x.roots.len() + x.keys.len() + (if x.frame then 0usize else 1usize) + 1
+    None -> 0
+
+// One way a candidate is given a value: an expression it is assigned (`var x = v`, `x = v`), or a
+// part bound out of a subject along `steps`, each the edge key of a payload field or struct field.
+private enum Def
+    DValue(x: TExpr)
+    DPart(subject: TExpr, steps: Buf[EdgeKey])
+
+// What can cut a candidate's chain inside its scope: a store or a call's summary (`w`, with `what`
+// naming it for the report), or a root's slot written or used where its count could move (`root`). A
+// root's use that is the value of a candidate's own definition (`def_of`) is harmless where that
+// candidate is +0 -- the copy takes no count -- and moves the count otherwise.
+private struct Event
+    w: EdgeWrites
+    root: string
+    written: bool
+    def_of: string
+    what: string
+    at: Span
+end Event
+
+private struct Cand
+    name: string
+    at: Span
+    defs: Buf[Def]
+    stmts: Buf[TStmt]
+    exprs: Buf[TExpr]
+end Cand
+
+// Gathers the candidates of one body, the names disqualified, and the definitions.
+private struct Gather
+    cands: Buf[Cand]
+    index: Map[string, usize]
+    barred: Set[string]
+    stores: Buf[(string, TExpr)]
+
+    add(*self, c: Cand)
+        if self.index.has(c.name) then return
+
+        self.index.put(c.name, self.cands.len())
+        self.cands.push(c)
+
+    bar(*self, name: string)
+        self.barred.add(name)
+
+    store(*self, name: string, value: TExpr)
+        self.stores.push((name, value))
+end Gather
+
+// One +0 local's or counted candidate's line of the `--explain-borrows` report, for the driver to say
+// once the program is lowered.
+struct LocalNote
+    file: string
+    start: usize
+    text: string
+end LocalNote
+
+private var pzl_notes: Buf[LocalNote] = buf()
+private var pzl_seen: Set[string] = set()
+
+// The local lines gathered since the last call, handed over once.
+take_local_notes() -> Buf[LocalNote]
+    val out = pzl_notes
+
+    pzl_notes = buf()
+    pzl_seen = set()
+    out
+end take_local_notes
+
+// **The +0 locals of `f`**, emitted with the parameters `owned` owns, `jumps` where the body jumps
+// back to its own entry.
+plus0_locals(e: *Emit, f: TFunc, owned: Set[string], jumps: bool) -> Set[string]
+    var out: Set[string] = set()
+    val g: &Gather = Gather(buf(), map(), set(), buf())
+
+    gather_body(e, g, f)
+
+    if g.cands.is_empty() then return out
+
+    // Every definition an assignment makes, and the candidates that cannot be +0 whatever their values.
+    for item in g.stores
+        g.index.get(item.0) match
+            Some(i) -> g.cands[i].defs.push(DValue(item.1))
+            None -> ()
+
+    var alive: Buf[bool] = buf()
+
+    for c in g.cands
+        alive.push(!g.barred.has(c.name) && !c.defs.is_empty() && eligible(e, c.name))
+
+    // The roots: parameters a body that never jumps back holds for the whole activation, and the
+    // locals of its top block, alive to its end.
+    val aliases = ref_names(f)
+    var params: Set[string] = set()
+    var tops: Set[string] = set()
+    val unrooted = unrootable(f, aliases)
+
+    for p in f.params
+        if !jumps && !unrooted.has(p.0) then params.add(p.0)
+
+    for s in f.body.stmts
+        s match
+            TVarDecl(name, _, _, _) -> if !unrooted.has(name) && !is_promoted(e, name) then tops.add(name)
+            _ -> ()
+
+    // Each scope's events, once: they do not depend on which candidates are +0.
+    var events: Buf[Buf[Event]] = buf()
+
+    for i in 0..<g.cands.len()
+        events.push(if alive[i] then scope_events(e, g, g.cands[i], aliases, params, tops) else buf())
+
+    var shaped: Buf[bool] = buf()
+    var why: Buf[string] = buf()
+    var backs: Buf[Option[Back]] = buf()
+
+    for i in 0..<g.cands.len()
+        shaped.push(false)
+        why.push("")
+        backs.push(None)
+
+    var moved = true
+
+    while moved
+        moved = false
+        settle(g, alive, params, tops, &backs)
+
+        for i in 0..<g.cands.len()
+            if !alive[i] then continue
+
+            val said = refusal(e, g, alive, backs, events[i], params, owned, tops, i)
+
+            if said != ""
+                alive[i] = false
+                why[i] = said
+                moved = true
+    end while
+
+    // The report speaks of the candidates read out of storage: the +0 ones, and the counted ones one of
+    // whose values is backed -- never of a local every value of which arrives with a count.
+    for i in 0..<g.cands.len()
+        if alive[i] then out.add(g.cands[i].name)
+
+        if why[i] != ""
+            for d in g.cands[i].defs
+                if def_back(g, alive, backs, params, tops, d).is_some() then shaped[i] = true
+
+        shaped[i] = shaped[i] || alive[i]
+
+    if explaining_borrows() then note_locals(f, g, alive, shaped, why, backs)
+
+    out
+end plus0_locals
+
+// A local whose storage the emitter lays down in a way of its own is never a candidate: a promoted
+// one, a frame array's, the one built in the caller's result storage, a large one, a `@unique` one.
+private eligible(e: *Emit, name: string) -> bool
+    if is_promoted(e, name) || e.frame_slots.has(name) then return false
+
+    e.return_slot match
+        Some(plan) -> if plan.name == name then return false
+        None -> ()
+
+    true
+end eligible
+
+private counted_local(e: *Emit, ty: Type) -> bool =
+    contains_counted(ty) && !zero_sized(ty) && !e.layout.indirect(ty) && !value_drops(e, ty)
+
+// -- the candidates ---------------------------------------------------------------------------------
+
+private gather_body(e: *Emit, g: &Gather, f: TFunc)
+    gather_list(e, g, f.body.stmts, f.body.result)
+    walk_block_stmts(f.body, TWalk(true, x -> gather_node(e, g, x), w -> gather_write(g, w),
+                                   s -> gather_stmt(g, s)))
+end gather_body
+
+// Each `var`/`val` of a list, its scope the statements after it and the list's result.
+private gather_list(e: *Emit, g: &Gather, stmts: Buf[TStmt], result: Option[TExpr])
+    for k in 0..<stmts.len()
+        stmts[k] match
+            TVarDecl(name, ty, init, align) ->
+                if align.is_none() && counted_local(e, ty)
+                    var rest: Buf[TStmt] = buf()
+                    var tail: Buf[TExpr] = buf()
+
+                    for j in k + 1..<stmts.len()
+                        rest.push(stmts[j])
+
+                    if result.is_some() then tail.push(result.unwrap())
+
+                    var defs: Buf[Def] = buf()
+
+                    defs.push(DValue(init))
+                    g.add(Cand(name, init.span, defs, rest, tail))
+            _ -> ()
+end gather_list
+
+private gather_block(e: *Emit, g: &Gather, b: Option[TBlock])
+    if b.is_some() then gather_list(e, g, b.unwrap().stmts, b.unwrap().result)
+
+private gather_node(e: *Emit, g: &Gather, x: TExpr) = *x.kind match
+    TIf(cond, then_block, else_block, _) ->
+        gather_terms(e, g, cond, then_block.stmts, then_block.result)
+        gather_list(e, g, then_block.stmts, then_block.result)
+        gather_block(e, g, else_block)
+    TMatch(scrutinee, arms, _) ->
+        for arm in arms
+            if arm.patterns.len() == 1
+                var stmts: Buf[TStmt] = buf()
+                var exprs: Buf[TExpr] = buf()
+
+                for s in arm.body.stmts
+                    stmts.push(s)
+
+                if arm.guard.is_some() then exprs.push(arm.guard.unwrap())
+                if arm.body.result.is_some() then exprs.push(arm.body.result.unwrap())
+
+                gather_binds(e, g, scrutinee, arm.patterns[0], buf(), stmts, exprs)
+
+            gather_list(e, g, arm.body.stmts, arm.body.result)
+    TBlockExpr(block) -> gather_list(e, g, block.stmts, block.result)
+    TWhile(cond, body, else_block, _) ->
+        gather_terms(e, g, cond, body, None)
+        gather_list(e, g, body, None)
+        gather_block(e, g, else_block)
+    TDoWhile(body, _, else_block, _) ->
+        gather_list(e, g, body, None)
+        gather_block(e, g, else_block)
+    TLoop(body, _) -> gather_list(e, g, body, None)
+    TFor(_, _, _, _, _, body, else_block, _) ->
+        gather_list(e, g, body, None)
+        gather_block(e, g, else_block)
+    TForEach(_, _, _, body, else_block, _) ->
+        gather_list(e, g, body, None)
+        gather_block(e, g, else_block)
+    TIterate(_, _, _, _, _, body, else_block, _) ->
+        gather_list(e, g, body, None)
+        gather_block(e, g, else_block)
+    TStore(place, value, _, _) -> gather_place(g, place, value, true)
+    TUpdate(place, _, _, _, _, _, _) -> bar_place(g, place)
+    TIncDec(place, _, _, _, _) -> bar_place(g, place)
+    TAddrOf(place, _) -> bar_place(g, place)
+    _ -> ()
+
+// The `is` bindings of a condition, each one's scope the terms after it and the body it guards.
+private gather_terms(e: *Emit, g: &Gather, cond: Buf[TCondTerm], body: Buf[TStmt], result: Option[TExpr])
+    for k in 0..<cond.len()
+        cond[k] match
+            TCondIs(subject, patterns, negated) ->
+                if !negated && patterns.len() == 1
+                    var stmts: Buf[TStmt] = buf()
+                    var exprs: Buf[TExpr] = buf()
+
+                    for s in body
+                        stmts.push(s)
+
+                    for j in k + 1..<cond.len()
+                        cond[j] match
+                            TCondTest(c) -> exprs.push(c)
+                            TCondIs(s, _, _) -> exprs.push(s)
+
+                    if result.is_some() then exprs.push(result.unwrap())
+
+                    gather_binds(e, g, subject, patterns[0], buf(), stmts, exprs)
+            TCondTest(_) -> ()
+end gather_terms
+
+// The names a pattern binds out of `subject`, each through the payload and struct fields that lead to
+// it. A binding under a `ref` pattern or an `@` is not followed: those are counted as today.
+private gather_binds(e: *Emit, g: &Gather, subject: TExpr, p: TPattern, steps: Buf[EdgeKey], stmts: Buf[TStmt],
+                     exprs: Buf[TExpr]) -> unit = p match
+    TBindPattern(name, ty) ->
+        if counted_local(e, ty)
+            var defs: Buf[Def] = buf()
+
+            defs.push(DPart(subject, steps))
+            g.add(Cand(name, subject.span, defs, stmts, exprs))
+    TVariantPattern(enum_ty, variant, args) ->
+        for i in 0..<args.len()
+            if i < variant.fields.len()
+                val field = variant.fields[i]
+
+                gather_binds(e, g, subject, args[i], steps_with(steps, edge_key(enum_ty, s"${variant.name}.${field.0}",
+                                                                                  field.1)),
+                             stmts, exprs)
+    TStructPattern(decl, args) ->
+        for i in 0..<args.len()
+            field_key(Struct(decl), int(i)) match
+                Some(k) -> gather_binds(e, g, subject, args[i], steps_with(steps, k), stmts, exprs)
+                None -> ()
+    _ -> ()
+
+private steps_with(steps: Buf[EdgeKey], k: EdgeKey) -> Buf[EdgeKey]
+    var out: Buf[EdgeKey] = buf()
+
+    for item in steps
+        out.push(item)
+
+    out.push(k)
+    out
+end steps_with
+
+private gather_write(g: &Gather, w: TWrite)
+    if w.op == "=" then gather_place(g, w.place, w.value, true) else bar_place(g, w.place)
+
+private gather_stmt(g: &Gather, s: TStmt) = s match
+    TMultiAssign(writes) ->
+        for item in writes
+            bar_place(g, item.place)
+    TRefDecl(_, _, place) -> bar_place(g, place)
+    TDefer(stmts, _) -> walk_stmts(stmts, expr_walk(true, x -> bar_load(g, x)))
+    _ -> ()
+
+// An assignment to a candidate is one of its definitions; one to a part of it bars it.
+private gather_place(g: &Gather, place: TExpr, value: TExpr, plain: bool) = *place.kind match
+    TLoad(name, _) -> if plain then g.store(name, value) else g.bar(name)
+    _ -> bar_place(g, place)
+
+private bar_place(g: &Gather, place: TExpr) = place_base(place) match
+    Some(name) -> g.bar(name)
+    None -> ()
+
+private bar_load(g: &Gather, x: TExpr) = *x.kind match
+    TLoad(name, _) -> g.bar(name)
+    _ -> ()
+
+// The local a place is part of, reached without a dereference.
+private place_base(place: TExpr) -> Option[string] = *place.kind match
+    TLoad(name, _) -> Some(name)
+    TField(r, _, _) -> place_base(r)
+    TIndex(r, _, _) -> repr(texpr_type(r)) match
+        Array(_, _) -> place_base(r)
+        _ -> None
+    _ -> None
+
+// The names no root may be: one whose address is taken, or a `ref` is bound to, anywhere in the body.
+private unrootable(f: TFunc, aliases: Set[string]) -> Set[string]
+    val out = name_sink()
+
+    for item in aliases
+        out.add(item)
+
+    walk_block_stmts(f.body, TWalk(true, x -> unroot_node(out, x), w -> (), s -> unroot_stmt(out, s)))
+    out.names
+end unrootable
+
+private unroot_node(out: &NameSink, x: TExpr) = *x.kind match
+    TAddrOf(place, _) -> place_base(place) match
+        Some(name) -> out.add(name)
+        None -> ()
+    _ -> ()
+
+private unroot_stmt(out: &NameSink, s: TStmt) = s match
+    TRefDecl(_, _, place) -> place_base(place) match
+        Some(name) -> out.add(name)
+        None -> ()
+    _ -> ()
+
+// -- what a scope can do to a chain -----------------------------------------------------------------
+
+private struct EventSink
+    events: Buf[Event]
+    benign: Buf[&TExprKind]
+    defs: Buf[(&TExprKind, string)]
+
+    mark(*self, k: &TExprKind)
+        self.benign.push(k)
+
+    def(*self, k: &TExprKind, name: string)
+        self.defs.push((k, name))
+
+    is_benign(self, k: &TExprKind) -> bool
+        for item in self.benign
+            if item === k then return true
+
+        false
+
+    def_of(self, k: &TExprKind) -> string
+        for item in self.defs
+            if item.0 === k then return item.1
+
+        ""
+end EventSink
+
+private scope_events(e: *Emit, g: &Gather, c: Cand, aliases: Set[string], params: Set[string],
+                     tops: Set[string]) -> Buf[Event]
+    val sink: &EventSink = EventSink(buf(), buf(), buf())
+    val walk = TWalk(true, x -> event_node(e, g, sink, aliases, params, tops, x),
+                     w -> event_write(e, g, sink, aliases, params, tops, w),
+                     s -> event_stmt(e, g, sink, s))
+
+    walk_stmts(c.stmts, walk)
+
+    for x in c.exprs
+        walk_texpr(x, walk)
+
+    sink.events
+end scope_events
+
+private hidden_event(sink: &EventSink, why: string, at: Span)
+    var w = edge_writes_none()
+
+    w.hide(why, "")
+    sink.events.push(Event(w, "", false, "", why, at))
+end hidden_event
+
+private root_name(n: string, params: Set[string], tops: Set[string]) -> bool = params.has(n) || tops.has(n)
+
+private event_stmt(e: *Emit, g: &Gather, sink: &EventSink, s: TStmt) = s match
+    TVarDecl(name, ty, init, _) ->
+        if may_run_drop(ty, e.untouched.dropping) then
+            hidden_event(sink, s"a destructor of '${type_show(ty)}'", init.span)
+
+        if g.index.has(name) then sink.def(init.kind, name)
+    TAsm(_, _, clobbers, span) ->
+        for item in clobbers
+            if item == "memory" then hidden_event(sink, "inline assembly that may write memory", span)
+    _ -> ()
+
+private event_write(e: *Emit, g: &Gather, sink: &EventSink, aliases: Set[string], params: Set[string],
+                    tops: Set[string], w: TWrite)
+    event_store(e, g, sink, aliases, params, tops, w.place, w.value)
+
+    if w.dispatch.is_some() then event_call(e, sink, w.dispatch.unwrap().name, w.place.span)
+
+    for item in w.check
+        event_call(e, sink, item.inv_fn, w.place.span)
+end event_write
+
+// A store: to a local of the frame's own it writes no edge, but it writes that local -- a root's
+// death where the local is one. Anywhere else, the edges `note_store` names.
+private event_store(e: *Emit, g: &Gather, sink: &EventSink, aliases: Set[string], params: Set[string],
+                    tops: Set[string], place: TExpr, value: TExpr)
+    *place.kind match
+        TLoad(name, _) ->
+            sink.mark(place.kind)
+
+            if g.index.has(name) then sink.def(value.kind, name)
+        _ -> ()
+
+    if own_base(place, aliases)
+        place_base(place) match
+            Some(name) ->
+                if root_name(name, params, tops) then
+                    sink.events.push(Event(edge_writes_none(), name, true, "", s"the root '${shown(name)}' is written",
+                                           place.span))
+            None -> ()
+
+        return
+    end if
+
+    val es = edge_sink()
+
+    note_store(es, aliases, place)
+
+    val w = edge_finish(es.w, e.untouched.edge_casts)
+
+    sink.events.push(Event(w, "", false, "", "a store", place.span))
+end event_store
+
+private event_call(e: *Emit, sink: &EventSink, name: string, at: Span)
+    val w = edge_writes(&e.untouched, name)
+
+    sink.events.push(Event(w, "", false, "", s"'${qualified_name(name)}'", at))
+end event_call
+
+private event_node(e: *Emit, g: &Gather, sink: &EventSink, aliases: Set[string], params: Set[string],
+                   tops: Set[string], x: TExpr)
+    if may_run_drop(texpr_type(x), e.untouched.dropping) then
+        hidden_event(sink, s"a destructor of '${type_show(texpr_type(x))}'", x.span)
+
+    *x.kind match
+        TField(r, _, _) -> mark_load(sink, r)
+        TDeref(r, _) -> mark_load(sink, r)
+        TLoad(name, _) ->
+            if root_name(name, params, tops) && !sink.is_benign(x.kind)
+                sink.events.push(Event(edge_writes_none(), name, false, sink.def_of(x.kind),
+                                       s"'${shown(name)}' is used where its count may move", x.span))
+        TStore(place, value, _, _) -> event_store(e, g, sink, aliases, params, tops, place, value)
+        TIncDec(place, _, _, _, _) -> event_store(e, g, sink, aliases, params, tops, place, place)
+        TUpdate(place, _, _, _, dispatch, _, _) ->
+            event_store(e, g, sink, aliases, params, tops, place, place)
+
+            if dispatch.is_some() then event_call(e, sink, dispatch.unwrap().name, x.span)
+        TCall(name, _, _, _) -> event_call(e, sink, name, x.span)
+        TCompare(_, cmps) ->
+            for cmp in cmps
+                if cmp.dispatch.is_some() then event_call(e, sink, cmp.dispatch.unwrap().name, x.span)
+        TRecheck(_, _, _, inv_fn) -> event_call(e, sink, inv_fn, x.span)
+        TStructInvCheck(_, _, inv_fn) -> event_call(e, sink, inv_fn, x.span)
+        TTry(_, _, _, _, _, _, convert) -> if convert.is_some() then event_call(e, sink, convert.unwrap(), x.span)
+        TRender(_, method, _, slot) ->
+            if slot.is_none() then event_call(e, sink, method, x.span)
+            else hidden_event(sink, "a rendering through a trait object's table", x.span)
+        TVCall(recv, _, _, _, _) ->
+            hidden_event(sink, if closure_table(texpr_type(recv)) then "a call through a closure"
+                               else "a call through a trait object's table", x.span)
+        TCallPtr(_, _, _, _) -> hidden_event(sink, "a call through a function value", x.span)
+        TSlots(op, _, elem, _) ->
+            val es = edge_sink()
+
+            note_slots(es, op, elem)
+            sink.events.push(Event(es.w, "", false, "", s"'$op'", x.span))
+        TAtomic(op, _, _, _, at, _) ->
+            if op != "load"
+                val es = edge_sink()
+
+                es.pointer(at)
+                sink.events.push(Event(edge_finish(es.w, e.untouched.edge_casts), "", false, "", "an atomic store", x.span))
+        TVecStore(_, _, _) -> hidden_event(sink, "a vector store", x.span)
+        TAwait(_, _) -> hidden_event(sink, "an await", x.span)
+        TBlockOn(_, _) -> hidden_event(sink, "a suspension", x.span)
+        TStep(_, _) -> hidden_event(sink, "a suspension", x.span)
+        TPark(_) -> hidden_event(sink, "a fiber switch", x.span)
+        TYieldNow -> hidden_event(sink, "a fiber switch", x.span)
+        _ -> ()
+end event_node
+
+// A root read through keeps its count where it is. One matched on is not marked: an owned local's
+// count may be handed into the arm that binds it, and given back where that arm ends.
+private mark_load(sink: &EventSink, r: TExpr) = *r.kind match
+    TLoad(_, _) -> sink.mark(r.kind)
+    _ -> ()
+
+// -- the fixed point -------------------------------------------------------------------------------
+
+// Every alive candidate's backing, the least fixed point over their definitions: each starts empty and
+// grows, and one that meets a fresh value is `None` from then on.
+private settle(g: &Gather, alive: Buf[bool], params: Set[string], tops: Set[string], backs: *Buf[Option[Back]])
+    for i in 0..<g.cands.len()
+        (*backs)[i] = if alive[i] then Some(back_empty()) else None
+
+    var moved = true
+
+    while moved
+        moved = false
+
+        for i in 0..<g.cands.len()
+            if !alive[i] || (*backs)[i].is_none() then continue
+
+            var b: Option[Back] = Some(back_empty())
+
+            for d in g.cands[i].defs
+                if b.is_none() then break
+
+                val one = def_back(g, alive, *backs, params, tops, d)
+
+                b = if one.is_none() then None else Some(back_join(b.unwrap(), one.unwrap()))
+
+            // Each answer only grows (a fresh value is absorbing), so a size that did not change is an
+            // answer that did not.
+            if back_size(b) != back_size((*backs)[i])
+                moved = true
+                (*backs)[i] = b
+end settle
+
+private def_back(g: &Gather, alive: Buf[bool], backs: Buf[Option[Back]], params: Set[string], tops: Set[string],
+                 d: Def) -> Option[Back] = d match
+    DValue(x) -> backing(g, alive, backs, params, tops, x)
+    DPart(subject, steps) ->
+        var b = backing(g, alive, backs, params, tops, subject)
+
+        if b.is_some() && !b.unwrap().frame
+            for k in steps
+                b = Some(back_key(b.unwrap(), k))
+
+        b
+
+// Where the value of `x` comes from, or `None` where it arrives with a count of its own.
+private backing(g: &Gather, alive: Buf[bool], backs: Buf[Option[Back]], params: Set[string], tops: Set[string],
+                x: TExpr) -> Option[Back] = *x.kind match
+    // A candidate of the top block that is about to be refused for a fresh value of its own is a root:
+    // counted, it holds what it holds until it is written. In the round that settles, every alive
+    // candidate has an answer, so this stands in only for one this round refuses.
+    TLoad(name, _) ->
+        g.index.get(name) match
+            Some(i) -> if alive[i] && (backs[i].is_some() || !tops.has(name)) then return backs[i]
+            None -> ()
+
+        if root_name(name, params, tops) then Some(back_root(name)) else None
+    // Through a `&sync` another domain may write the chain, so nothing read through one is backed.
+    TDeref(operand, _) -> underlying(texpr_type(operand)) match
+        Ref(_, sync) ->
+            if sync then return None
+
+            backing(g, alive, backs, params, tops, operand).map(b -> Back(b.roots, b.keys, b.named, false))
+        _ -> None
+    TField(r, i, _) ->
+        val b = backing(g, alive, backs, params, tops, r)
+
+        if b.is_none() || b.unwrap().frame then return b
+
+        field_key(texpr_type(r), i).map(k -> back_key(b.unwrap(), k))
+    TEnumNew(_, _, args) -> built_back(g, alive, backs, params, tops, args)
+    TStructNew(_, args) -> built_back(g, alive, backs, params, tops, args)
+    _ -> None
+
+// A value built on the spot is backed by the union of its counted parts; one with none holds nothing.
+private built_back(g: &Gather, alive: Buf[bool], backs: Buf[Option[Back]], params: Set[string], tops: Set[string],
+                   args: Buf[TExpr]) -> Option[Back]
+    var b = back_empty()
+
+    for item in args
+        if !contains_counted(texpr_type(item)) then continue
+
+        val one = backing(g, alive, backs, params, tops, item)
+
+        if one.is_none() then return None
+
+        b = back_join(b, one.unwrap())
+
+    Some(b)
+end built_back
+
+// Why candidate `i` must keep its count, or empty where it need not.
+private refusal(e: *Emit, g: &Gather, alive: Buf[bool], backs: Buf[Option[Back]], events: Buf[Event],
+                params: Set[string], owned: Set[string], tops: Set[string], i: usize) -> string
+    val c = g.cands[i]
+
+    if backs[i].is_none() then return fresh_reason(e, g, alive, backs, params, tops, c)
+
+    val b = backs[i].unwrap()
+
+    for r in b.roots
+        val owns = tops.has(r) || owned.has(r)
+
+        for ev in events
+            if ev.root != r then continue
+
+            if ev.written then return s"${ev.what} at ${line_col(e, ev.at)}"
+
+            if owns
+                val harmless = ev.def_of != "" && g.index.get(ev.def_of).map(j -> alive[j]).unwrap_or(false)
+
+                if !harmless then return s"${ev.what} at ${line_col(e, ev.at)}"
+
+    for ev in events
+        if ev.root != "" then continue
+
+        if ev.w.opaque != "" then return s"${ev.what} at ${line_col(e, ev.at)} runs code nobody can see (${ev.w.opaque})"
+
+        for k in b.keys
+            if writes_edge(ev.w, k) then return s"${ev.what} at ${line_col(e, ev.at)} may write ${edge_text(k)}"
+
+            if has_type(ev.w.counts, k.owner) || has_type(ev.w.counts, underlying(k.held)) then
+                return s"${ev.what} at ${line_col(e, ev.at)} may read the count of ${type_show(k.held)}"
+
+    ""
+end refusal
+
+private fresh_reason(e: *Emit, g: &Gather, alive: Buf[bool], backs: Buf[Option[Back]], params: Set[string],
+                     tops: Set[string], c: Cand) -> string
+    for d in c.defs
+        if def_back(g, alive, backs, params, tops, d).is_none()
+            val at = d match
+                DValue(x) -> x.span
+                DPart(subject, _) -> subject.span
+
+            return s"it is assigned a value with a count of its own at ${line_col(e, at)}"
+
+    "it is assigned a value with a count of its own"
+end fresh_reason
+
+private line_col(e: *Emit, at: Span) -> string = e.src match
+    Some(src) ->
+        val where = src.locate(at.start)
+
+        s"${where.line}:${where.col + literate_shift(src)}"
+    None -> "?"
+
+// A local's name as the program wrote it.
+private shown(name: string) -> string
+    var n = 0usize
+
+    for b in name.bytes
+        if b == u8('$') || b == u8('#') || b == u8('%') || b == u8('.') then break
+
+        n += 1
+
+    if n == name.len then name else name[0..<n]
+end shown
+
+// -- the report --------------------------------------------------------------------------------------
+
+// One line per candidate whose values are read out of storage: the +0 ones with their roots and
+// edges, and the counted ones with the first thing that keeps them counted.
+private note_locals(f: TFunc, g: &Gather, alive: Buf[bool], shaped: Buf[bool], why: Buf[string],
+                    backs: Buf[Option[Back]])
+    if f.src.is_none() || is_closure_body(f) || std_module(f.declared_in) then return
+
+    val src = f.src.unwrap()
+
+    for i in 0..<g.cands.len()
+        if !shaped[i] then continue
+
+        val c = g.cands[i]
+        val at = src.locate(c.at.start)
+        val head = s"${src.name}:${at.line}:${at.col + literate_shift(src)}: '${shown(c.name)}'"
+        val text = if alive[i] then s"$head holds no count: ${borrowed_from(backs[i])}" else s"$head is counted: ${why[i]}"
+
+        // A generic body is lowered once per instance; its first instance speaks for the line.
+        if pzl_seen.has(head) then continue
+
+        pzl_seen.add(head)
+        pzl_notes.push(LocalNote(src.name, c.at.start, text))
+end note_locals
+
+private borrowed_from(b: Option[Back]) -> string
+    if b.is_none() then return "borrowed"
+
+    var roots = ""
+
+    for item in b.unwrap().roots
+        roots = if roots == "" then s"'${shown(item)}'" else s"$roots, '${shown(item)}'"
+
+    if roots == "" then return "it holds nothing counted"
+
+    var keys = ""
+
+    for item in b.unwrap().keys
+        keys = if keys == "" then edge_text(item) else s"$keys, ${edge_text(item)}"
+
+    if keys == "" then s"borrowed from $roots" else s"borrowed from $roots through $keys"
+end borrowed_from

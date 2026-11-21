@@ -612,8 +612,14 @@ store_over(e: *Emit, place: TExpr, p: Val, v: Val, cur: Option[Val]) -> unit = b
         val bits = place_reversal(e, place)
 
         // A reversed field holds an integer, which carries no count, so the bytes are all there is.
+        //
+        // **A local that holds no count is given its value as bytes** (`plus0_locals.sysl`): it had
+        // nothing to give back, and the value it takes is held by the storage it was read from.
         if bits > 0
             emit(e, InStore(lty(e, ty), swap_bytes_of(e, bits, v), p, acc, None))
+        else if lent_local(e, place)
+            e.moves.source = None
+            emit(e, InStore(lty(e, ty), v, p, acc, None))
         else
             cur match
                 None -> store_into(e, ty, p, v, acc)
@@ -623,6 +629,10 @@ store_over(e: *Emit, place: TExpr, p: Val, v: Val, cur: Option[Val]) -> unit = b
                         emit(e, InStore(lty(e, ty), v, p, acc, None))
                         release_value(e, ty, old)
                     else emit(e, InStore(lty(e, ty), v, p, acc, None))
+
+private lent_local(e: *Emit, place: TExpr) -> bool = *place.kind match
+    TLoad(name, _) -> e.lent_decls.has(name) && !e.frame_slots.has(name)
+    _ -> false
 
 // Writes `v` into the storage at `p`. A slot that holds a count takes one for the value arriving
 // and lets go of the one leaving, **in that order**, so assigning something to itself never briefly

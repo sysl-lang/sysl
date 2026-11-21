@@ -1,0 +1,796 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{cstring, str_builder}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **A local that only walks storage holds no count** (`plus0_locals.sysl`,
+// `docs/design/borrow-inference.md` §3, §4.1, §10's rows P1-P5, P11, P13, A1, A2, A4-A9, A12-A15, A17).
+//
+// Two proofs, as §10 asks: the IR of the named function (the count operations `@arc.retain`,
+// `@arc.release`, `@arc.copy.`, `@arc.dispose.`), and runs of every adversarial program on the counted
+// heap at both ends of the optimizer and under AddressSanitizer with the instrumentation confirmed -- a
+// local wrongly left +0 is a use-after-free ASan reports. Every adversarial row asserts the count IS
+// still taken, through the `--explain-borrows` line where the analysis reports one, and the run is
+// clean and prints what the counted program prints.
+//
+// The axes: the local's kind (a `var`, a `val`, a `match` arm's binding, an `is` binding), its root
+// (a borrowed parameter, an owned local of the top block), what the scope does (nothing, an inert
+// read, a write to an unrelated field, a write to the walked field through an alias, a callee, a
+// global, a destructor, a closure call, an `await`, a function-value call, a foreign variadic call,
+// a buffer's `pop`), what keeps the value (`return`, a `push`), and the root's fate (reassigned,
+// `ref`-bound). Cells not written: a closure capturing the walked local (P11's last cell) -- building
+// one makes a counted trait object whose release may run code, which keeps the count until BI5
+// follows destructor bodies; a `@unique` root moved (A10) -- such a root is never a top-block local
+// read through a field without its move being a use the scope sees; the self-jump and argument rows
+// (P6-P10, A3, A11, A16) belong to BI3 and BI4.
+
+private extern "setenv" bli_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" bli_c_unsetenv(name: *u8) -> int
+
+private struct BliRun
+    ok: bool
+    out: string
+    err: string
+    hooks: usize
+
+private bli_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end bli_ready
+
+// The list every program walks: `make(5)` is 4, 3, 2, 1, 0.
+private bli_head() -> string = """
+    struct Node
+        v: int
+        next: Option[&Node]
+
+    struct List
+        head: Option[&Node]
+
+    make(n: int) -> Option[&Node]
+        var head: Option[&Node] = None
+
+        for i in 0..<n
+            head = Some(Node(i, head))
+
+        head
+
+    """
+
+private bli_ir(text: string, level: string) -> string
+    val root = make_temp_dir("sysl-bli").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None, level) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end bli_ir
+
+// One function's emitted text, from its `define` to the brace that closes it.
+private bli_body(out: string, name: string) -> string
+    var b = str_builder()
+    var inside = false
+
+    for line in lines_of(out)
+        if !inside && line.starts_with("define ") && line.contains("@" + name + "$$sysl") then inside = true
+
+        if inside
+            if line == "}" then return b.finish()
+
+            b.push(line)
+            b.push_char('\n')
+
+    if inside then b.finish() else s"no definition of '$name' in:\n$out"
+end bli_body
+
+// The count operations of a body: every retain, release, copy and dispose it calls.
+private bli_ops(body: string) -> usize =
+    body.count_of("call void @arc.retain") + body.count_of("call void @arc.release") +
+        body.count_of("call void @arc.copy.") + body.count_of("call void @arc.dispose.")
+
+// `name`'s body at both ends of the optimizer holds exactly `n` count operations.
+private bli_counts(text: string, name: string, n: usize)
+    if !bli_ready() then return
+
+    for level in ["0", "2"]
+        val f = bli_body(bli_ir(text, level), name)
+
+        assert(f.starts_with("define"), f)
+
+        if level == "0" then assert_eq(bli_ops(f), n, s"-O$level:\n$f")
+        else assert(bli_ops(f) <= n, s"-O$level:\n$f")
+end bli_counts
+
+// `name`'s unoptimized body still counts: at least one count operation is left in it.
+private bli_still_counts(text: string, name: string)
+    if !bli_ready() then return
+
+    val f = bli_body(bli_ir(text, "0"), name)
+
+    assert(f.starts_with("define"), f)
+    assert(bli_ops(f) > 0, f)
+end bli_still_counts
+
+private bli_run(text: string, level: string, counted: bool, flags: string) -> BliRun
+    val root = make_temp_dir("sysl-bli").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    if counted then force_alloc_counting(true)
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+        val v = cstring(flags)
+
+        bli_c_setenv(n.ptr, v.ptr, 1)
+    end if
+
+    val built = build_native_program(s"$root/main.sysl", None, None, level, Some(exe))
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+
+        bli_c_unsetenv(n.ptr)
+
+    if counted then force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return BliRun(false, failure_text(why), "", 0)
+        Ok(_) -> ()
+
+    val hooks = capture("nm", ["-u", exe], "", [], true) match
+        Ok(o) -> o.text.count_of("__asan_report")
+        Err(_) -> 0
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> BliRun(false, "could not be started", "", 0)
+        Ok(o) -> BliRun(o.status.ok(), o.text, o.err.unwrap_or(""), hooks)
+end bli_run
+
+// Printed exactly `expected` at both ends of the optimizer on the counted heap, giving everything back,
+// and again under AddressSanitizer with the instrumentation in the binary.
+private bli_prints(text: string, expected: string)
+    if !bli_ready() then return
+
+    for level in ["0", "2"]
+        val run = bli_run(text, level, true, "")
+
+        assert(run.ok, s"-O$level: ${run.out}${run.err}")
+        assert_eq(run.out, expected)
+        assert(alloc_count_reported(run.err) == 0, s"-O$level: ${run.err}")
+
+    val asan = bli_run(text, "0", false, "-fsanitize=address -g")
+
+    assert(asan.hooks > 0, "the AddressSanitizer build carries no instrumentation")
+    assert(asan.ok, s"asan: ${asan.out}${asan.err}")
+    assert_eq(asan.out, expected)
+end bli_prints
+
+// The `--explain-borrows` lines about locals, each without the file it names.
+private bli_explain(text: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    if !bli_ready() then return out
+
+    val root = make_temp_dir("sysl-bli").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    var notes: Buf[string] = buf()
+    val noted = &notes
+    val file = s"$root/main.sysl"
+    var args: Buf[string] = buf()
+
+    args.push("sysl")
+    args.push("emit-llvm")
+    args.push("--explain-borrows")
+    args.push(file)
+    run_cli_noted(args.view(), (line) -> sink.push(line), (line) -> noted.push(line))
+    remove_dir_all(root).unwrap_or(())
+
+    for item in notes
+        if item.starts_with(file + ":") && (item.contains("holds no count") || item.contains(" is counted: ")) then
+            out.push(item[file.len + 1..<item.len])
+
+    out
+end bli_explain
+
+// The line naming `local` (as `'local' `), or a complaint listing every line.
+private bli_line(lines: Buf[string], local: string) -> string
+    for item in lines
+        if item.contains(s"'$local' ") then return item
+
+    s"no line for '$local' in: $lines"
+end bli_line
+
+// -- what holds no count --------------------------------------------------------------------------
+
+private bli_p1() -> string = bli_head() + """
+    is_shorter_than(x: Option[&Node], y: Option[&Node]) -> bool
+        var x_tail = x
+        var y_tail = y
+
+        while y_tail is Some(yt)
+            x_tail match
+                None -> return true
+                Some(xt) -> x_tail = xt.next
+
+            y_tail = yt.next
+
+        false
+
+    print(is_shorter_than(make(3), make(4)), is_shorter_than(make(4), make(3)))
+
+    """
+
+@test("P1: AWFY's is_shorter_than walks two lists with no count operation at all")
+bli_p1_is_shorter_than()
+    bli_counts(bli_p1(), "is_shorter_than", 0)
+    bli_prints(bli_p1(), "true false\n")
+
+@test("P1: --explain-borrows says each walking local holds no count, and where it is borrowed from")
+bli_p1_explained()
+    if !bli_ready() then return
+
+    val lines = bli_explain(bli_p1())
+
+    assert_eq(bli_line(lines, "x_tail"),
+              "17:18: 'x_tail' holds no count: borrowed from 'x' through Node.next, sysl.Option[&Node].Some.value")
+    assert_eq(bli_line(lines, "xt"),
+              "21:9: 'xt' holds no count: borrowed from 'x' through Node.next, sysl.Option[&Node].Some.value")
+    assert(bli_line(lines, "yt").contains("holds no count: borrowed from 'y'"), s"$lines")
+
+private bli_p2() -> string = bli_head() + """
+    total(l: &List) -> int
+        var cur = l.head
+        var s = 0
+
+        while cur is Some(c)
+            s += c.v
+            cur = c.next
+
+        s
+
+    print(total(List(make(5))))
+
+    """
+
+@test("P2: a walk from a parameter's field takes no count")
+bli_p2_walk_from_a_parameter()
+    bli_counts(bli_p2(), "total", 0)
+    bli_prints(bli_p2(), "10\n")
+
+private bli_p3() -> string = bli_head() + """
+    total_own(n: int) -> int
+        val l = make(n)
+        var cur = l
+        var s = 0
+
+        while cur is Some(c)
+            s += c.v
+            cur = c.next
+
+        s
+
+    print(total_own(5))
+
+    """
+
+@test("P3: a walk from an owned local of the top block counts only that local")
+bli_p3_walk_from_an_owned_local()
+    if !bli_ready() then return
+
+    val f = bli_body(bli_ir(bli_p3(), "0"), "total_own")
+
+    assert(!f.contains("@arc.copy.") && !f.contains("call void @arc.retain"), f)
+    assert_eq(f.count_of("call void @arc.dispose."), 1, f)
+    bli_prints(bli_p3(), "10\n")
+
+private bli_p4() -> string = bli_head() + """
+    weight(n: &Node) -> int = n.v * 2
+
+    total(l: &List) -> int
+        var cur = l.head
+        var s = 0
+
+        while cur is Some(c)
+            s += weight(c)
+            cur = c.next
+
+        s
+
+    print(total(List(make(5))))
+
+    """
+
+@test("P4: a walk calling a reader per node takes no count")
+bli_p4_walk_calling_a_reader()
+    bli_counts(bli_p4(), "total", 0)
+    bli_prints(bli_p4(), "20\n")
+
+private bli_p5() -> string = bli_head() + """
+    struct Tag
+        label: Option[&Tag]
+
+    retag(t: &Tag)
+        t.label = None
+
+    total(l: &List, t: &Tag) -> int
+        var cur = l.head
+        var s = 0
+
+        while cur is Some(c)
+            s += c.v
+            retag(t)
+            cur = c.next
+
+        s
+
+    print(total(List(make(5)), Tag(Some(Tag(None)))))
+
+    """
+
+@test("P5: a walk calling a function that writes an unrelated field takes no count")
+bli_p5_unrelated_write()
+    bli_counts(bli_p5(), "total", 0)
+    bli_prints(bli_p5(), "10\n")
+
+private bli_p11_return() -> string = bli_head() + """
+    first_big(l: &List) -> Option[&Node]
+        var cur = l.head
+
+        while cur is Some(c)
+            if c.v < 3 then return cur
+
+            cur = c.next
+
+        None
+
+    print(first_big(List(make(5))).unwrap().v)
+
+    """
+
+@test("P11: a +0 local returned takes exactly one count, at the return")
+bli_p11_return_keeps()
+    bli_counts(bli_p11_return(), "first_big", 1)
+    bli_prints(bli_p11_return(), "2\n")
+
+private bli_p11_push() -> string = bli_head() + """
+    import sysl.buf.{Buf, buf}
+
+    collect(l: &List, out: *Buf[&Node])
+        var cur = l.head
+
+        while cur is Some(c)
+            if c.v % 2 == 0 then out.push(c)
+
+            cur = c.next
+
+    var kept: Buf[&Node] = buf()
+
+    collect(List(make(5)), &kept)
+    print(kept.len(), kept[0].v, kept[2].v)
+
+    """
+
+// The buffer handle `out` points at is copied for the call and disposed after it, as before; what is
+// counted of the walk is the one retain the pushed element takes.
+@test("P11: a +0 binding pushed takes exactly one count, at the push -- a push writes no edge")
+bli_p11_push_keeps()
+    if !bli_ready() then return
+
+    val f = bli_body(bli_ir(bli_p11_push(), "0"), "collect")
+
+    assert(!f.contains("@arc.copy.sysl$Option") && !f.contains("@arc.dispose.sysl$Option"), f)
+    assert_eq(f.count_of("call void @arc.retain("), 1, f)
+    bli_prints(bli_p11_push(), "3 4 0\n")
+
+private bli_p13() -> string = bli_head() + """
+    head_value(l: &List) -> int = l.head match
+        Some(n) -> n.v
+        None -> -1
+
+    second_value(l: &List) -> int =
+        if l.head is Some(n) && n.next is Some(m) then m.v else -1
+
+    val l = List(make(5))
+
+    print(head_value(l), second_value(l))
+
+    """
+
+@test("P13: an arm's binding and an is binding of a backed value take no count at the bind")
+bli_p13_bindings()
+    bli_counts(bli_p13(), "head_value", 0)
+    bli_counts(bli_p13(), "second_value", 0)
+    bli_prints(bli_p13(), "4 3\n")
+
+// -- what keeps its count ---------------------------------------------------------------------------
+
+// Each adversarial walk frees a node a +0 local would still be reading: the counted program sums all
+// five, 10, and stays clean.
+private bli_a1() -> string = bli_head() + """
+    cut_ahead(l: &List, other: &Node) -> int
+        var cur = l.head
+        var s = 0
+
+        while cur is Some(c)
+            s += c.v
+            cur = c.next
+
+            if c.v == 4 then other.next = None
+
+        s
+
+    val l = List(make(5))
+
+    print(cut_ahead(l, l.head.unwrap()))
+
+    """
+
+@test("A1: a walk whose list is cut ahead of it through an alias keeps its count")
+bli_a1_cut_through_an_alias()
+    bli_still_counts(bli_a1(), "cut_ahead")
+    bli_prints(bli_a1(), "10\n")
+
+    val lines = bli_explain(bli_a1())
+
+    assert(bli_line(lines, "cur").contains("'cur' is counted: a store at ") &&
+           bli_line(lines, "cur").contains("may write Node.next"), s"$lines")
+
+private bli_a2() -> string = bli_head() + """
+    var G: Option[&Node] = None
+
+    cut()
+        G match
+            Some(n) -> n.next = None
+            None -> ()
+
+    walk(l: &List) -> int
+        var cur = l.head
+        var s = 0
+
+        while cur is Some(c)
+            s += c.v
+            cur = c.next
+
+            if c.v == 4 then cut()
+
+        s
+
+    val l = List(make(5))
+
+    G = l.head
+    print(walk(l))
+    G = None
+
+    """
+
+@test("A2: a walk calling a function that cuts the list through a global keeps its count")
+bli_a2_cut_by_a_callee()
+    bli_still_counts(bli_a2(), "walk")
+    bli_prints(bli_a2(), "10\n")
+    assert(bli_line(bli_explain(bli_a2()), "cur").contains("'cut' at "), s"${bli_explain(bli_a2())}")
+
+private bli_a4() -> string = bli_head() + """
+    var G: Option[&Node] = None
+
+    forget()
+        G = None
+
+    walk() -> int
+        var cur = G
+        var s = 0
+
+        while cur is Some(c)
+            s += c.v
+            forget()
+            cur = c.next
+
+        s
+
+    G = make(5)
+    print(walk())
+
+    """
+
+@test("A4: a walk from module storage another function clears keeps its count")
+bli_a4_module_storage_is_no_root()
+    bli_still_counts(bli_a4(), "walk")
+    bli_prints(bli_a4(), "10\n")
+
+private bli_a5() -> string = bli_head() + """
+    struct Res
+        l: &List
+
+    impl Drop for Res
+        drop(self)
+            self.l.head = None
+
+    hold(l: &List) -> &Res = Res(l)
+
+    walk(l: &List) -> int
+        var cur = l.head
+        var s = 0
+
+        while cur is Some(c)
+            s += c.v
+            cur = c.next
+
+            if c.v == 4 then hold(l)
+
+        s
+
+    print(walk(List(make(5))))
+
+    """
+
+@test("A5: a walk releasing a value whose destructor clears the list keeps its count")
+bli_a5_destructor()
+    bli_still_counts(bli_a5(), "walk")
+    bli_prints(bli_a5(), "10\n")
+    assert(bli_line(bli_explain(bli_a5()), "cur").contains("runs code nobody can see"), s"${bli_explain(bli_a5())}")
+
+private bli_a6() -> string = bli_head() + """
+    walk(l: &List) -> int
+        val clear = () -> l.head = None
+        var cur = l.head
+        var s = 0
+
+        while cur is Some(c)
+            s += c.v
+            cur = c.next
+
+            if c.v == 4 then clear()
+
+        s
+
+    print(walk(List(make(5))))
+
+    """
+
+@test("A6: a walk calling a closure that cuts the list keeps its count")
+bli_a6_closure_call()
+    bli_still_counts(bli_a6(), "walk")
+    bli_prints(bli_a6(), "10\n")
+
+private bli_a7() -> string = bli_head() + """
+    async walk(l: &List) -> int
+        var cur = l.head
+        var s = 0
+
+        while cur is Some(c)
+            s += c.v
+            await yield_now()
+            cur = c.next
+
+        s
+
+    print(block_on(walk(List(make(5)))))
+
+    """
+
+@test("A7: a task's walk across an await keeps its count, and the analysis says nothing of it")
+bli_a7_await()
+    bli_prints(bli_a7(), "10\n")
+
+    val lines = bli_explain(bli_a7())
+
+    assert(!bli_line(lines, "cur").contains("holds no count"), s"$lines")
+
+private bli_a8() -> string = bli_head() + """
+    walk(n: int) -> int
+        var l = make(n)
+        var cur = l
+        var s = 0
+
+        while cur is Some(c)
+            s += c.v
+            cur = c.next
+
+            if c.v == 4 then l = None
+
+        s
+
+    print(walk(5))
+
+    """
+
+@test("A8: a walk whose owned root is reassigned mid-walk keeps its count")
+bli_a8_root_reassigned()
+    bli_still_counts(bli_a8(), "walk")
+    bli_prints(bli_a8(), "10\n")
+    assert(bli_line(bli_explain(bli_a8()), "cur").contains("the root 'l' is written at "), s"${bli_explain(bli_a8())}")
+
+private bli_a9() -> string = bli_head() + """
+    walk(n: int) -> int
+        var l = make(n)
+        ref r = l
+        var cur = l
+        var s = 0
+
+        while cur is Some(c)
+            s += c.v
+            cur = c.next
+
+            if c.v == 4 then r = None
+
+        s
+
+    print(walk(5))
+
+    """
+
+@test("A9: a walk whose root has a ref bound to it keeps its count")
+bli_a9_root_ref_bound()
+    bli_still_counts(bli_a9(), "walk")
+    bli_prints(bli_a9(), "10\n")
+
+private bli_a12() -> string = bli_head() + """
+    import sysl.buf.{Buf, buf}
+
+    walk(b: *Buf[&Node]) -> int
+        var cur: Option[&Node] = Some(b[0])
+        var s = 0
+
+        while cur is Some(c)
+            s += c.v
+            cur = c.next
+
+            if c.v == 4 then b.pop()
+
+        s
+
+    var b: Buf[&Node] = buf()
+
+    b.push(make(5).unwrap())
+    print(walk(&b))
+
+    """
+
+@test("A12: a walk over a buffer's element whose loop pops that buffer keeps its count")
+bli_a12_buffer_pop()
+    bli_still_counts(bli_a12(), "walk")
+    bli_prints(bli_a12(), "10\n")
+
+private bli_a13() -> string = bli_head() + """
+    struct Shared
+        n: int
+        next: Option[&sync Shared]
+
+    total(l: Option[&sync Shared]) -> int
+        var cur = l
+        var s = 0
+
+        while cur is Some(c)
+            s += c.n
+            cur = c.next
+
+        s
+
+    val b: &sync Shared = Shared(2, None)
+    val a: &sync Shared = Shared(1, Some(b))
+
+    print(total(Some(a)))
+
+    """
+
+@test("A13: a walk through a &sync list is never backed")
+bli_a13_sync()
+    bli_still_counts(bli_a13(), "total")
+    bli_prints(bli_a13(), "3\n")
+
+private bli_a14() -> string = bli_head() + """
+    extern printf(fmt: *u8, ...) -> int
+
+    noop(n: &Node) = ()
+
+    walk_foreign(l: &List) -> int
+        var cur = l.head
+        var s = 0
+
+        while cur is Some(c)
+            s += c.v
+            printf(c"")
+            cur = c.next
+
+        s
+
+    walk_value(l: &List, f: &Fn(&Node) -> unit) -> int
+        var cur = l.head
+        var s = 0
+
+        while cur is Some(c)
+            s += c.v
+            f(c)
+            cur = c.next
+
+        s
+
+    val l = List(make(5))
+
+    print(walk_foreign(l), walk_value(l, n -> noop(n)))
+
+    """
+
+@test("A14: a walk making a variadic foreign call, or a call through a function value, keeps its count")
+bli_a14_foreign_and_function_value()
+    bli_still_counts(bli_a14(), "walk_foreign")
+    bli_still_counts(bli_a14(), "walk_value")
+    bli_prints(bli_a14(), "10 10\n")
+
+private bli_a15() -> string = bli_head() + """
+    show(cur: Option[&Node]) = cur match
+        Some(c) -> print(c.v)
+        None -> print("end")
+
+    walk(l: &List) -> int
+        var cur = l.head
+        var s = 0
+
+        defer show(cur)
+
+        while cur is Some(c)
+            s += c.v
+            cur = c.next
+
+        s
+
+    print(walk(List(make(5))))
+
+    """
+
+@test("A15: a walking local named in a defer keeps its count")
+bli_a15_defer()
+    bli_still_counts(bli_a15(), "walk")
+    bli_prints(bli_a15(), "end\n10\n")
+
+private bli_a17() -> string = bli_head() + """
+    unlink(l: &List) -> int
+        var x_tail = l.head
+        var s = 0
+
+        while x_tail is Some(xt)
+            x_tail = xt.next
+            xt.next = None
+
+            x_tail match
+                Some(n) -> s += n.v
+                None -> ()
+
+        s
+
+    print(unlink(List(make(5))))
+
+    """
+
+@test("A17: a +0 candidate live across a store to the field it was read from keeps its count")
+bli_a17_own_chain_written()
+    bli_still_counts(bli_a17(), "unlink")
+    bli_prints(bli_a17(), "6\n")
+    assert(bli_line(bli_explain(bli_a17()), "x_tail").contains("may write Node.next"), s"${bli_explain(bli_a17())}")
