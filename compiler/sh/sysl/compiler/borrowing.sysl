@@ -1053,12 +1053,17 @@ struct Untouched
     edge_fix: Buf[EdgeWrites]
     edge_index: Map[string, usize]
     edge_foreign: Map[string, EdgeWrites]
+
+    // In a program that sees every table (`untouched_summary`'s `closed`), the tables -- what a call
+    // through one can run, and what an object behind one can hold -- and each type's answer to `drops`.
+    edge_tables: Option[Buf[TVtable]]
+    drop_answers: Map[string, bool]
 end Untouched
 
 // An empty summary, for an emitter that has not read a program yet.
 untouched_none() -> Untouched =
     Untouched(buf(), buf(), buf(), buf(), buf(), no_casts(), buf(), map(), buf(), buf(), buf(), buf(), buf(), buf(),
-              buf(), map(), 0, 0, buf(), no_casts(), None, false, buf(), map(), map())
+              buf(), map(), 0, 0, buf(), no_casts(), None, false, buf(), map(), map(), None, map())
 
 // The functions one question to `untouched_by` cleared, as one bit a name over the summary's numbering.
 //
@@ -1232,6 +1237,10 @@ untouched_summary(p: TProgram, dropping: Buf[Type], owning: Set[string] = set(),
 
     val wlaundered = cast_sink()
 
+    // `drops` is asked during the walk, of the program's own tables.
+    u.dropping = dropping
+    u.edge_tables = tables
+
     for i in 0..<p.funcs.len()
         val f = p.funcs[i]
         val calls: &CallSink = CallSink(buf())
@@ -1289,8 +1298,13 @@ untouched_summary(p: TProgram, dropping: Buf[Type], owning: Set[string] = set(),
         u.releases.push(reach.releases)
 
         // **A release that may run a destructor runs code this summary does not read** (BI5 refines it
-        // to the destructor bodies' own summaries).
-        if !reach.releases.is_empty() then reach.writes.hide(s"a destructor of '${type_show(reach.releases[0])}'")
+        // to the destructor bodies' own summaries). Where the program sees every table, an object
+        // behind a trait or a closure's environment runs one only where a type erased into it holds
+        // one (`drops`).
+        for item in reach.releases
+            if drops(&u, item)
+                reach.writes.hide(s"a destructor of '${type_show(item)}'")
+                break
 
         u.edge_own.push(reach.writes.w)
 
@@ -1317,7 +1331,6 @@ untouched_summary(p: TProgram, dropping: Buf[Type], owning: Set[string] = set(),
         u.casts.push(made)
 
     u.laundered = laundered.c
-    u.dropping = dropping
     u.edge_casts = wlaundered.c
     u.edge_program = Some(p)
     u.edge_closed = tables.is_some()
@@ -1521,7 +1534,7 @@ private touch_node(v: &Verdict, calls: &CallSink, exits: &CallSink, ending: &Kin
                    dropping: Buf[Type], locals: Set[string], tables: Option[Buf[TVtable]], x: TExpr,
                    aliases: Set[string], fills: Fills)
     note_laundered(laundered, x)
-    edge_node(reach, aliases, fills, x)
+    edge_node(reach, aliases, fills, tables.is_some(), x)
 
     if makes_dropping(x, dropping) then v.refuse()
     reach.release(texpr_type(x), dropping)
@@ -1599,25 +1612,23 @@ private hidden(v: &Verdict, reach: &ReachSink, why: string)
     reach.hide(why)
 
 // A call through slot `slot` of a trait object, in a program that sees every table: a call to what
-// that slot holds in each table of the trait. A receiver whose trait cannot be named is refused.
+// that slot holds in each table of the trait at the receiver's arguments (`trait_tables`) -- a
+// closure's call to each closure of its type. A receiver whose trait cannot be named is refused.
 //
 // **What such a call can run is then what those bodies run**, and nothing more: a receiver whose trait
 // cannot be named, or a slot a table does not have, is hidden code as a call through a pointer is.
 private slot_callees(v: &Verdict, calls: &CallSink, reach: &ReachSink, tables: Buf[TVtable], recv: TExpr,
                      slot: int)
-    val name = erased_trait(texpr_type(recv)) match
-        Some(Trait(n, _, _)) -> n
-        _ -> ""
+    val tr = erased_trait(underlying(texpr_type(recv)))
 
-    if name == "" || slot < 0
+    if tr.is_none() || slot < 0
         hidden(v, reach, "a call through a trait object's table")
         return
     end if
 
-    for vt in tables
-        if vt.trait_name == name
-            if usize(slot) < vt.slots.len() then calls.add(vt.slots[usize(slot)].target)
-            else hidden(v, reach, "a call through a trait object's table")
+    for vt in trait_tables(tables, tr.unwrap())
+        if usize(slot) < vt.slots.len() then calls.add(vt.slots[usize(slot)].target)
+        else hidden(v, reach, "a call through a trait object's table")
 end slot_callees
 
 // The slot forms (`slots.sysl`), which are how a growable container writes its storage: `slot_storage`
@@ -1889,6 +1900,142 @@ private holds_erased(t: Type, seen: *Set[string]) -> bool = t match
 
         false
     _ -> false
+
+// -- the closed world: what a table can hold and run ------------------------------------------------
+
+// Whether letting go of a value of `t` may run a destructor, as the edge-write summary judges it.
+//
+// **In a program that sees every table, an object behind a trait is one of the types erased into
+// it**, and a closure's environment holds its captures and nothing else: so a `&Fn` runs a destructor
+// only where some closure the program makes of that type captured a value that may run one, and a
+// `&Step` only where some type erased to a `Step` holds one. Anywhere else -- a library, which can be
+// handed an object whose table it never saw -- it is `may_run_drop`, which says yes to every object
+// behind a trait. A type not settled may hold anything, in either.
+drops(u: *Untouched, t: Type) -> bool
+    val all = u.edge_tables
+
+    if all.is_none() then return may_run_drop(t, u.dropping)
+
+    val k = mangle(t)
+
+    u.drop_answers.get(k) match
+        Some(known) -> return known
+        None -> ()
+
+    var held: Set[string] = set()
+    var opened: Set[string] = set()
+    val out = holds_dropping(t, u.dropping, &held) || closed_erased(t, u.dropping, all.unwrap(), &opened)
+
+    u.drop_answers.put(k, out)
+    out
+end drops
+
+// `holds_erased` where every table is known: a trait object is opened into the types its tables were
+// built for, each judged as a value of it is, and a closure's environment into its captures.
+private closed_erased(t: Type, dropping: Buf[Type], tables: Buf[TVtable], seen: *Set[string]) -> bool = t match
+    Trait(_, _, _) ->
+        val k = s"trait ${mangle(t)}"
+
+        if seen.has(k) then return false
+
+        seen.add(k)
+
+        for vt in trait_tables(tables, t)
+            var held: Set[string] = set()
+
+            if holds_dropping(vt.for_type, dropping, &held) then return true
+            if closed_erased(vt.for_type, dropping, tables, seen) then return true
+
+        false
+    Abstract(_, _) -> true
+    Unknown -> true
+    Array(_, elem) -> closed_erased(*elem, dropping, tables, seen)
+    Ref(inner, _) -> closed_erased(*inner, dropping, tables, seen)
+    Slice(elem, _) -> closed_erased(*elem, dropping, tables, seen)
+    Constrained(d) -> closed_erased(d.base, dropping, tables, seen)
+    Volatile(inner) -> closed_erased(*inner, dropping, tables, seen)
+    Pack(elems) ->
+        for item in elems
+            if closed_erased(item, dropping, tables, seen) then return true
+
+        false
+    Results(parts) -> closed_erased(Struct(parts), dropping, tables, seen)
+    Struct(d) ->
+        val k = mangle(t)
+
+        if seen.has(k) then return false
+
+        seen.add(k)
+
+        for item in d.fields
+            if closed_erased(item.1, dropping, tables, seen) then return true
+
+        for item in d.targs
+            if closed_erased(item, dropping, tables, seen) then return true
+
+        false
+    Enum(d) ->
+        val k = mangle(t)
+
+        if seen.has(k) then return false
+
+        seen.add(k)
+
+        for item in d.variants
+            for field in item.fields
+                if closed_erased(field.1, dropping, tables, seen) then return true
+
+        for item in d.targs
+            if closed_erased(item, dropping, tables, seen) then return true
+
+        false
+    _ -> false
+
+// The tables a value of the trait type `tr` can carry, of all the program's: those built for that trait
+// at exactly its arguments, which is the spelling each table is named by (`erase.sysl`'s `vtable_for`).
+// Where none is -- a trait whose arguments are not settled spells no table -- every table of the trait,
+// whatever its arguments.
+trait_tables(tables: Buf[TVtable], tr: Type) -> Buf[TVtable]
+    var out: Buf[TVtable] = buf()
+    var named: Buf[TVtable] = buf()
+    val n = tr match
+        Trait(name, _, _) -> name
+        _ -> ""
+
+    val m = mangle(tr)
+
+    for vt in tables
+        if vt.trait_name != n then continue
+
+        named.push(vt)
+
+        val own = member_symbol(vt.for_type)
+
+        if vt.name == s"vt.$m.$own" || vt.name == s"vt.ref.$m.$own" then out.push(vt)
+
+    if out.is_empty() then named else out
+end trait_tables
+
+// What a call through slot `slot` of the table `recv` carries may write before it returns: in a
+// program that sees every table, what the function in that slot of each table `trait_tables` finds
+// writes, joined; elsewhere, or where the receiver's trait cannot be named or a table has no such slot,
+// opaque, for `why`.
+table_writes(u: *Untouched, recv: TExpr, slot: int, why: string) -> EdgeWrites
+    var out = edge_writes_none()
+    val all = u.edge_tables
+    val tr = erased_trait(underlying(texpr_type(recv)))
+
+    if all.is_none() || tr.is_none() || slot < 0
+        out.hide(why, "")
+        return out
+    end if
+
+    for vt in trait_tables(all.unwrap(), tr.unwrap())
+        if usize(slot) < vt.slots.len() then out.join(edge_writes(u, vt.slots[usize(slot)].target))
+        else out.hide(why, "")
+
+    out
+end table_writes
 
 // -- the callee: which large parameters it reads where the caller put them ---------------------------
 
@@ -2584,10 +2731,13 @@ private touch_statement(v: &Verdict, reach: &ReachSink, s: TStmt)
 end touch_statement
 
 // One node's part of its body's edge writes: a store, a slot form, a pointer cast a store could go
-// through, an atomic or a vector store through a pointer, and a call through a closure's table --
-// which this summary does not follow into the closures it could be, whether or not the program sees
-// every table (`slot_callees` still names them for `untouched_by`).
-private edge_node(reach: &ReachSink, aliases: Set[string], fills: Fills, x: TExpr) = *x.kind match
+// through, an atomic or a vector store through a pointer, and a call through a closure's table.
+//
+// **A closure call is a call to every closure the program erased into its type** where the program
+// sees every table (`closed`): `slot_callees` names the `call` in that slot of each table, and the
+// summary joins theirs as it joins any callee's. A library, which can be handed a closure whose table
+// it never saw, finds it opaque.
+private edge_node(reach: &ReachSink, aliases: Set[string], fills: Fills, closed: bool, x: TExpr) = *x.kind match
     TStore(place, value, _, _) -> if !relocation(fills, place, value) then note_store(reach.writes, aliases, place)
     TIncDec(place, _, _, _, _) -> note_store(reach.writes, aliases, place)
     TUpdate(place, _, _, _, _, _, _) -> note_store(reach.writes, aliases, place)
@@ -2596,7 +2746,7 @@ private edge_node(reach: &ReachSink, aliases: Set[string], fills: Fills, x: TExp
     TVecStore(receiver, _, _) -> element(repr(texpr_type(receiver))) match
         Some(e) -> reach.writes.pointer(e)
         None -> reach.writes.hide("a vector store the summary cannot name")
-    TVCall(recv, _, _, _, _) -> if closure_table(texpr_type(recv)) then reach.writes.hide("a call through a closure")
+    TVCall(recv, _, _, _, _) -> if !closed && closure_table(texpr_type(recv)) then reach.writes.hide("a call through a closure")
     TCast(_, _) -> note_wcast(reach.wcasts, x)
     TViewAs(_, _) -> note_wcast(reach.wcasts, x)
     _ -> ()

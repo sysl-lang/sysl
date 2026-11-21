@@ -31,9 +31,10 @@ import sysl.container.{Map, map, Set, set}
 //
 // **Validity** is checked over the candidate's whole scope (its block from the declaration on, an
 // arm, an `if`'s or `while`'s body after its condition): a store or a callee's edge-write summary
-// (`edge_writes`) meeting a key, code nobody can see (a closure or table call, a function value, a
-// foreign call not trusted, a suspension, a destructor -- any value in the scope whose release may
-// run one), a slot form that reads a count of a chain type, and the root written or used where its
+// (`edge_writes`) meeting a key -- a closure or table call is a call to every function its slot can
+// hold where the program sees every table (`table_writes`) --, code nobody can see (a closure or table
+// call in a library, a function value, a foreign call not trusted, a suspension, a destructor -- any
+// value in the scope whose release may run one, `drops`), a slot form that reads a count of a chain type, and the root written or used where its
 // count could move. One kill anywhere in the scope keeps the count -- a local is +0 for the whole of
 // its life or not at all (decision 5), so no merge of differently-counted values is ever needed.
 //
@@ -550,7 +551,7 @@ private root_name(n: string, params: Set[string], tops: Set[string]) -> bool = p
 
 private event_stmt(e: *Emit, g: &Gather, sink: &EventSink, s: TStmt) = s match
     TVarDecl(name, ty, init, _) ->
-        if may_run_drop(ty, e.untouched.dropping) then
+        if drops(&e.untouched, ty) then
             hidden_event(sink, s"a destructor of '${type_show(ty)}'", init.span)
 
         if g.index.has(name) then sink.def(init.kind, name)
@@ -606,9 +607,14 @@ private event_call(e: *Emit, sink: &EventSink, name: string, at: Span)
     sink.events.push(Event(w, "", false, "", s"'${qualified_name(name)}'", at))
 end event_call
 
+// A call through a table: in a program that sees every table, what each function that slot can hold
+// writes (`table_writes`); elsewhere, code nobody can see.
+private table_event(e: *Emit, sink: &EventSink, recv: TExpr, slot: int, what: string, at: Span) =
+    sink.events.push(Event(table_writes(&e.untouched, recv, slot, what), "", false, "", what, at))
+
 private event_node(e: *Emit, g: &Gather, sink: &EventSink, aliases: Set[string], params: Set[string],
                    tops: Set[string], x: TExpr)
-    if may_run_drop(texpr_type(x), e.untouched.dropping) then
+    if drops(&e.untouched, texpr_type(x)) then
         hidden_event(sink, s"a destructor of '${type_show(texpr_type(x))}'", x.span)
 
     *x.kind match
@@ -631,12 +637,12 @@ private event_node(e: *Emit, g: &Gather, sink: &EventSink, aliases: Set[string],
         TRecheck(_, _, _, inv_fn) -> event_call(e, sink, inv_fn, x.span)
         TStructInvCheck(_, _, inv_fn) -> event_call(e, sink, inv_fn, x.span)
         TTry(_, _, _, _, _, _, convert) -> if convert.is_some() then event_call(e, sink, convert.unwrap(), x.span)
-        TRender(_, method, _, slot) ->
+        TRender(value, method, _, slot) ->
             if slot.is_none() then event_call(e, sink, method, x.span)
-            else hidden_event(sink, "a rendering through a trait object's table", x.span)
-        TVCall(recv, _, _, _, _) ->
-            hidden_event(sink, if closure_table(texpr_type(recv)) then "a call through a closure"
-                               else "a call through a trait object's table", x.span)
+            else table_event(e, sink, value, slot.unwrap(), "a rendering through a trait object's table", x.span)
+        TVCall(recv, slot, _, _, _) ->
+            table_event(e, sink, recv, slot, if closure_table(texpr_type(recv)) then "a call through a closure"
+                                             else "a call through a trait object's table", x.span)
         TCallPtr(_, _, _, _) -> hidden_event(sink, "a call through a function value", x.span)
         TSlots(op, _, elem, _) ->
             val es = edge_sink()
