@@ -95,6 +95,10 @@ private is_library_result(t: Type) -> bool = repr(t) match
 // supplies a type, this is the analysis it always was.
 if_expr(cx: &Analyzer, span: Span, cond: Expr, then_body: Buf[Stmt],
         else_body: Option[Buf[Stmt]], expected: Option[Type], discarded: bool) -> TExpr
+    // The branches are read under the condition, which `chosen_by_constant` asks of a trap only
+    // where the trap lies outside the condition itself.
+    cx.choices.push(cond)
+
     val else_guesses = else_body.is_some() && guessing(cx, else_body.unwrap())
     val then_guesses = guessing_in(cx, then_body, then_scope(cond))
     val else_leans = else_body.is_some() && leaning(cx, else_body.unwrap())
@@ -188,6 +192,7 @@ if_expr(cx: &Analyzer, span: Span, cond: Expr, then_body: Buf[Stmt],
 
     val ty = if_type(cx, span, then_block, t_else)
 
+    cx.choices.truncate(cx.choices.len() - 1)
     TExpr(span, TIf(tc, then_block, t_else, ty))
 end if_expr
 
@@ -521,8 +526,12 @@ match_expr(cx: &Analyzer, span: Span, scrut: Expr, arms: Buf[MatchArm], expected
     cx.pattern_roots = pattern_view_roots(cx, ts)
 
     val said = cx.an.complaints()
+
+    cx.choices.push(scrut)
+
     val tarms = analyze_arms(cx, texpr_type(ts), arms, expected, discarded)
 
+    cx.choices.truncate(cx.choices.len() - 1)
     cx.pattern_roots = held
 
     // A pattern that was refused stands as a wildcard, so the arms are only read for dead ones when
