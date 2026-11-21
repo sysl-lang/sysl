@@ -26,7 +26,10 @@ import sysl.text.{replace_all, Search, split}
 // NUL-terminated, or null where the build dropped the locations or the body has none to give.
 //
 // **The call is followed by the trap rather than relying on the callee never to return**, so an
-// override that returns -- one that only counts, say -- still stops the program where it was.
+// override that returns -- one that only counts, say -- still stops the program where it was. Both
+// sit in one private `cold noinline noreturn` stub, `sysl.bounds.fail` (`bounds_stop`), so the
+// failure block at a check is a single call and `unreachable`, and a small function with a check
+// is still cheap enough to inline.
 //
 // **On a hosted target the default renders the message itself and writes it to standard error** with
 // one `write`, then stops through `@sysl.trap`, which flushes standard output and traps
@@ -201,11 +204,35 @@ bounds_unless(e: *Emit, ok: Val, what: string, kind: int, a: Val, b: Val, n: Val
     args.push(ir_arg(w, b))
     args.push(ir_arg(w, n))
     args.push(ir_arg(LPtr, location_of(e, site)))
-    emit(e, ir_call(None, LVoid, VGlobal(bounds_fail_symbol()), args))
-    emit(e, ir_call(None, LVoid, VGlobal(trap_symbol(e)), no_ir_args()))
-    emit_term(e, InUnreachable)
+    bounds_stop(e, args)
     emit_label(e, ok_l)
 end bounds_unless
+
+// **A failure block is ONE call, to `sysl.bounds.fail`, and `unreachable`.** The stub is a private
+// `cold noinline noreturn` function per module that makes the report through `sysl_bounds_fail` and
+// then the stop, so what a check adds to the body it guards is the comparison, the branch and one
+// call LLVM prices as cold and never-returning -- a small function with a check still inlines. The
+// report and the stop are the ones the block used to make itself, in the same order: the same
+// message, the same exit, and an override of `sysl_bounds_fail` that returns is still stopped.
+private bounds_stop(e: *Emit, args: Buf[IrArg])
+    request_text(e, bounds_stub_symbol(), bounds_stub_text(e.word_bits, trap_symbol(e)))
+    emit(e, ir_call(None, LVoid, VGlobal(bounds_stub_symbol()), args))
+    emit_term(e, InUnreachable)
+end bounds_stop
+
+// The stub every failed bounds check, overflow and checked read calls.
+bounds_stub_symbol() -> string = "sysl.bounds.fail"
+
+// The stub: the report through `sysl_bounds_fail` with the five values it was handed, then the stop.
+bounds_stub_text(word_bits: int, stop: string) -> string
+    val word = s"i$word_bits"
+
+    s"define private void @${bounds_stub_symbol()}(i32 %kind, $word %a, $word %b, $word %n, ptr %at) " +
+        "cold noinline noreturn {\nentry:\n" +
+        s"  call void @${bounds_fail_symbol()}(i32 %kind, $word %a, $word %b, $word %n, ptr %at)\n" +
+        s"  call void @$stop()\n" +
+        "  unreachable\n}\n"
+end bounds_stub_text
 
 // **Every other check the compiler inserts reports too** -- a contract, a constrained type's range
 // or predicate, a division by zero, a checked cast -- through `sysl_trap`, with the sentence saying
@@ -514,9 +541,7 @@ private two_texts_fail(e: *Emit, kind: int, first: Val, second: Val, site: Span)
     args.push(ir_arg(w, b))
     args.push(ir_arg(w, bounds_none()))
     args.push(ir_arg(LPtr, location_of(e, site)))
-    emit(e, ir_call(None, LVoid, VGlobal(bounds_fail_symbol()), args))
-    emit(e, ir_call(None, LVoid, VGlobal(trap_symbol(e)), no_ir_args()))
-    emit_term(e, InUnreachable)
+    bounds_stop(e, args)
     VNothing
 end two_texts_fail
 
