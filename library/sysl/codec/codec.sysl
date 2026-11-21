@@ -361,25 +361,22 @@ decode[T, D: Decoder](d: *D) -> Result[T, CodecError]
 
         Ok(T::Make(p))
     elif const T::Kind == Kind.Array
-        var out: T
-        var i: usize = 0
+        // An element type may have no zero value, so the array starts empty and every element is
+        // written before it is read; a refusal part way leaves the rest unwritten, with nothing to drop.
+        var out: T = slot_empty()
 
         d.begin_seq()?
 
-        loop
+        for i in 0..<out.len
             val at = d.offset()
 
-            if !d.next_item()?
-                if i < out.len then return Err(refusal(Expected(s"an array of ${out.len}, and it has $i"), at))
-
-                break
-
-            if i == out.len then return Err(refusal(Expected(s"the end of an array of ${out.len}"), d.offset()))
+            if !d.next_item()? then return Err(refusal(Expected(s"an array of ${out.len}, and it has $i"), at))
 
             out[i] = decode(d) match
                 Ok(v) -> v
                 Err(e) -> return Err(within(e, 2, "", i))
-            i += 1
+
+        if d.next_item()? then return Err(refusal(Expected(s"the end of an array of ${out.len}"), d.offset()))
 
         Ok(out)
     elif const T::Kind == Kind.Fixed

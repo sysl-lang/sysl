@@ -65,6 +65,9 @@ and a derived body calls those for every field.
 | a fixed-point number | its value as a real, read back only where it is exact |
 | `unit` | null |
 
+An array is read into storage that starts [empty](/reference/memory/#an-empty-local-one-slot-in-the-frame),
+so its element may be a type with no zero value — an enum carrying data, a reference — and a sequence
+of the wrong length, or an element refused part way, lets go of only the elements already read.
 An integer is held to its type's range when it is read, so `300` read into a `u8` is refused rather
 than wrapped; a width past 64 bits is refused when the program is compiled. A reference is written as
 what it refers to, so a recursive enum — every syntax tree — reads and writes with nothing written

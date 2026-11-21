@@ -82,6 +82,15 @@ import sysl.math.bigint.from_int
 // assignment to it (or to a part of it), `&out` -- the address a copy or `slot_put` writes through --
 // or a `ref` to it; a read before that is refused (`empty_slot_reads`). What the check cannot see is
 // the caller's, as a slot past the live run is: a write on one arm of an `if` and a read after it.
+//
+// **An empty ARRAY is written element by element**, so for a local of array type an element
+// assignment is not the write that settles it: the local is written once every element is -- by
+// statements of its own block assigning elements at constant indices, between them covering every
+// one, or by a counted loop `for i in 0..<out.len` there whose body assigns `out[i]` as one of its own
+// statements (or is itself such a loop over `out[i]`, for an array of arrays) and holds no `break` or
+// `continue`. Until then any read of it is refused. Its `.len` is its type's and reads nothing. An
+// early way out of a fill (`?`, `return`) leaves the unwritten elements as the slot left them --
+// zeroed where they hold a count -- so the local's release gives back nothing for them.
 
 // The nine names, whatever claims them.
 slot_form_word(name: string) -> bool =
@@ -187,7 +196,8 @@ end slot_empty_call
 empty_slot_reads(cx: &Analyzer, stmts: Buf[TStmt], tail: Option[TExpr])
     for i in 0..<stmts.len()
         stmts[i] match
-            TVarDecl(name, _, init, _) -> if empty_init(init) then first_mention(cx, name, stmts, i + 1, tail)
+            TVarDecl(name, ty, init, _) ->
+                if empty_init(init) then first_mention(cx, name, ty, stmts, i + 1, tail)
             _ -> ()
 
 // Whether a `var`'s initial value is written as the form -- `slot_empty()` or `slot_empty[T]()` --
@@ -210,8 +220,9 @@ empty_init(init: TExpr) -> bool = *init.kind match
     TSlots(op, _, _, _) -> empty_form(op)
     _ -> false
 
-private first_mention(cx: &Analyzer, name: string, stmts: Buf[TStmt], from: usize, tail: Option[TExpr])
-    val settled: &Settled = Settled(false)
+private first_mention(cx: &Analyzer, name: string, ty: Type, stmts: Buf[TStmt], from: usize,
+                      tail: Option[TExpr])
+    val settled: &Settled = Settled(false, is_array(ty), false, buf())
     val walk = TWalk(false, e -> mention_in(cx, name, settled, e), w -> write_stmt(cx, name, settled, w),
                      s -> ref_stmt(name, settled, s))
 
@@ -220,12 +231,21 @@ private first_mention(cx: &Analyzer, name: string, stmts: Buf[TStmt], from: usiz
 
         walk_stmt(stmts[i], walk)
 
+        if !settled.yes && settled.elements then filled_by(name, ty, settled, stmts[i])
+
     if !settled.yes && tail.is_some() then walk_texpr(tail.unwrap(), walk)
 end first_mention
 
-// The one flag the walk's callbacks share, set by the first mention either way.
+// What the walk's callbacks share. `yes` is set by the first mention either way. `elements` says the
+// local is an array, written element by element; `skip` passes over the next load of the local, which
+// is the root of a place that names its storage without reading it (`out.len`, `out[i] = v`); and
+// `filled` holds the elements the block's own statements have written so far, each as its path of
+// constant indices (`/#0/#2`).
 private struct Settled
     yes: bool
+    elements: bool
+    skip: bool
+    filled: Buf[string]
 
 // One expression met before the local was settled, outermost first: a store or an address of it
 // settles it as written, and a load of it is the read the check is for.
@@ -233,10 +253,19 @@ private mention_in(cx: &Analyzer, name: string, settled: &Settled, e: TExpr)
     if settled.yes then return
 
     *e.kind match
-        TStore(place, value, _, _) -> if slot_root(place, name) then written(cx, name, settled, value)
+        TStore(place, value, _, _) ->
+            if slot_root(place, name)
+                if element_place(settled, place) then settled.skip = true
+                else written(cx, name, settled, value)
         TAddrOf(place, _) -> if slot_root(place, name) then settled.yes = true
+        // An array's length is its type's: the receiver is named, not read.
+        TLen(recv, _) -> if is_array(texpr_type(recv)) && slot_root(recv, name) then settled.skip = true
         TLoad(n, _) ->
             if n == name
+                if settled.skip
+                    settled.skip = false
+                    return
+
                 cx.fault(e.span, s"'${written_name(cx, name)}' is an empty slot, read here before " +
                          "anything was written to it")
                 settled.yes = true
@@ -244,9 +273,142 @@ private mention_in(cx: &Analyzer, name: string, settled: &Settled, e: TExpr)
 end mention_in
 
 // An assignment statement: `out = v` (or to a part of it) writes the local; a compound one reads it
-// first, which the walk of its place then finds.
+// first, which the walk of its place then finds. An element of an empty array, assigned, is written
+// but does not settle the local (`filled_by` counts it), and the place names the local without
+// reading it; the value is walked after the place.
 private write_stmt(cx: &Analyzer, name: string, settled: &Settled, w: TWrite)
-    if !settled.yes && w.op == "=" && slot_root(w.place, name) then written(cx, name, settled, w.value)
+    if settled.yes || w.op != "=" || !slot_root(w.place, name) then return
+
+    if element_place(settled, w.place) then settled.skip = true else written(cx, name, settled, w.value)
+
+// A place inside an empty array rather than the whole of it.
+private element_place(settled: &Settled, place: TExpr) -> bool = settled.elements && !whole_local(place)
+
+private whole_local(place: TExpr) -> bool = *place.kind match
+    TLoad(_, _) -> true
+    _ -> false
+
+private is_array(t: Type) -> bool = repr(t) match
+    Array(_, _, _) -> true
+    _ -> false
+
+// After one statement of the local's block: the element it is sure to have written wholly, if any, is
+// counted, and the local is settled once every element has been.
+private filled_by(name: string, ty: Type, settled: &Settled, s: TStmt)
+    val at = fills(name, s)
+
+    if at.is_none() then return
+
+    var key = ""
+
+    for step in at.unwrap()
+        if !step.starts_with("#") then return
+
+        key = key + "/" + step
+
+    settled.filled.push(key)
+
+    if covered(settled.filled, "", ty) then settled.yes = true
+end filled_by
+
+// The place of the local a statement writes wholly, as its index steps from the local -- `#k` for a
+// constant index, a loop variable's name for its turn -- or none. An element assignment writes its
+// element; a counted loop `for i in 0..<p.len` writes all of `p` where its body holds no `break` or
+// `continue` and one of its own statements writes `p[i]` wholly.
+private fills(name: string, s: TStmt) -> Option[Buf[string]] = s match
+    TWriteStmt(w) -> if w.op == "=" then index_steps(name, w.place) else None
+    TExprStmt(e) -> *e.kind match
+        // An assignment written as a statement arrives as a store whose value is thrown away.
+        TStore(place, _, _, _) -> index_steps(name, place)
+        TFor(var_name, _, lo, hi, inclusive, body, else_block, _) ->
+            if inclusive || else_block.is_some() || !literal_zero(lo) || leaves_turn(body) then return None
+
+            val whole = *hi.kind match
+                TLen(recv, _) -> index_steps(name, recv)
+                _ -> None
+
+            if whole.is_none() then return None
+
+            for b in body
+                val part = fills(name, b)
+
+                if part.is_some() && one_step_more(whole.unwrap(), part.unwrap(), var_name) then return whole
+
+            None
+        _ -> None
+    _ -> None
+
+// The index steps of a place made only of indexing the local, or none.
+private index_steps(name: string, place: TExpr) -> Option[Buf[string]] = *place.kind match
+    TLoad(n, _) -> if n == name then Some(buf()) else None
+    TIndex(recv, index, _) ->
+        if !is_array(texpr_type(recv)) then return None
+
+        val outer = index_steps(name, recv)
+
+        if outer.is_none() then return None
+
+        val step = *index.kind match
+            TIntLit(v, _) -> s"#$v"
+            TLoad(n, _) -> n
+            _ -> return None
+
+        val steps: Buf[string] = buf()
+
+        for item in outer.unwrap()
+            steps.push(item)
+
+        steps.push(step)
+        Some(steps)
+    _ -> None
+
+// Whether `part` is `whole` indexed once more, by the loop's variable.
+private one_step_more(whole: Buf[string], part: Buf[string], var_name: string) -> bool
+    if part.len() != whole.len() + 1 || part[whole.len()] != var_name then return false
+
+    for i in 0..<whole.len()
+        if part[i] != whole[i] then return false
+
+    true
+
+private literal_zero(e: TExpr) -> bool = *e.kind match
+    TIntLit(v, _) -> s"$v" == "0"
+    _ -> false
+
+// Whether a loop body could end a turn, or the loop, before reaching its last statement.
+private leaves_turn(body: Buf[TStmt]) -> bool
+    val seen: &Settled = Settled(false, false, false, buf())
+
+    walk_stmts(body, stmt_walk(false, s -> s match
+        TBreak(_, _) -> seen.yes = true
+        TContinue(_) -> seen.yes = true
+        _ -> ()))
+
+    seen.yes
+end leaves_turn
+
+// Whether every element under `key`, a place of type `t`, has been written.
+private covered(filled: Buf[string], key: string, t: Type) -> bool
+    var under = false
+
+    for item in filled
+        if item == key then return true
+        if item.starts_with(key + "/") then under = true
+
+    if !under then return false
+
+    // A length that is a generic's own parameter (`[N]T` read at its declaration) stands at zero, so
+    // only a fill of the whole covers it.
+    repr(t) match
+        Array(n, e, term) ->
+            if !term.is_empty() then return false
+
+            for k in 0..<n
+                if !covered(filled, s"$key/#$k", *e) then return false
+
+            true
+        _ -> false
+end covered
 
 // `ref r = out` is a second name for the storage, and writes through it are the local's.
 private ref_stmt(name: string, settled: &Settled, s: TStmt)
