@@ -39,8 +39,8 @@ subst_params(a: &Analysis, t: Type, subst: Buf[Binding]) -> Type
         Ptr(inner, ro) -> Ptr(subst_params(a, *inner, subst), ro)
         Ref(inner, sync) -> Ref(subst_params(a, *inner, subst), sync)
         Weak(inner) -> Weak(subst_params(a, *inner, subst))
-        Array(n, elem) -> Array(n, subst_params(a, *elem, subst))
-        Vector(n, elem) -> Vector(n, subst_params(a, *elem, subst))
+        Array(n, elem, term) -> Array(n, subst_params(a, *elem, subst), term)
+        Vector(n, elem, term) -> Vector(n, subst_params(a, *elem, subst), term)
         Slice(elem, ro) -> Slice(subst_params(a, *elem, subst), ro)
         Volatile(inner) -> Volatile(subst_params(a, *inner, subst))
         Pack(es) -> Pack(subst_list(a, es, subst))
@@ -192,7 +192,7 @@ private unify_nameless(a: &Analysis, scope: Scope, want: TypeRef, actual: Type, 
                 // infer the type argument".
                 actual match
                     Slice(e, _) -> unify(a, scope, elem, *e, tparams, sub)
-                    Array(_, e) -> unify(a, scope, elem, *e, tparams, sub)
+                    Array(_, e, _) -> unify(a, scope, elem, *e, tparams, sub)
                     _ -> ()
             else
                 // The **length binds a value parameter** the way the element binds a type one: a
@@ -200,8 +200,8 @@ private unify_nameless(a: &Analysis, scope: Scope, want: TypeRef, actual: Type, 
                 // the length already lives. Only a bare name is read -- a length written as
                 // arithmetic over a parameter is refused at resolution rather than solved here.
                 actual match
-                    Array(n, e) ->
-                        bind_extent(length.unwrap(), n, tparams, sub)
+                    Array(n, e, term) ->
+                        bind_extent(length.unwrap(), n, term, tparams, sub)
                         unify(a, scope, elem, *e, tparams, sub)
                     _ -> ()
 
@@ -209,8 +209,8 @@ private unify_nameless(a: &Analysis, scope: Scope, want: TypeRef, actual: Type, 
         // is the case the whole feature turns on: a kernel written at `<W>f32` handed an `<8>f32`
         // reads 8 off the argument, with no width written at the call.
         VectorType(lanes, elem) -> actual match
-            Vector(n, e) ->
-                bind_extent(lanes, n, tparams, sub)
+            Vector(n, e, term) ->
+                bind_extent(lanes, n, term, tparams, sub)
                 unify(a, scope, elem, *e, tparams, sub)
             _ -> ()
 
@@ -423,12 +423,15 @@ private sole_pack(parts: Buf[TypeRef]) -> Option[string]
         _ -> None
 end sole_pack
 
-// A value parameter bound to the extent an argument's type carried.
-private bind_extent(written: Expr, n: int, tparams: Buf[string], sub: *Buf[Binding])
+// A value parameter bound to the extent an argument's type carried -- its form too, where the
+// argument is a length a generic's own declaration stands in for, so calling `f[M]([M]T)` with a
+// `[N]T` binds `M` to `N` there, not to the zero `N` stands at.
+private bind_extent(written: Expr, n: int, term: Buf[Mono], tparams: Buf[string], sub: *Buf[Binding])
     *written.kind match
         Ident(v) ->
             if holds_string(tparams, v) && bound_type(*sub, v).is_none() then
-                sub.push(Binding(v, ConstArg(from_int(long(n)), Integer(64, false, true), false, buf())))
+                sub.push(Binding(v, ConstArg(from_int(long(n)), Integer(64, false, true), !term.is_empty(),
+                                             term)))
         _ -> ()
 
 holds_string(xs: Buf[string], name: string) -> bool

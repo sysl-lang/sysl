@@ -82,9 +82,15 @@ Compiling is separated from matching because it is the expensive half and a patt
 more than once. A program matching in a loop compiles once outside it; one matching a pattern it was
 handed compiles each time and pays for it honestly.
 
+A compiled pattern carries the lazy DFA's two caches (`dfa`), one for each direction a search reads
+the text in. They are filled while matching, so every copy of a `Regex` shares them and a state one
+search builds is there for the next.
+
     struct Regex
         pattern: string
         prog: Program
+        private fwd: &Dfa
+        private rev: &Dfa
 
         // How many capture groups the pattern has, not counting the whole match.
         group_count(self) -> int = self.prog.groups
@@ -95,11 +101,20 @@ The leftmost match at or after a starting position. The position does not shorte
 anchors still speak about the whole of it -- so walking a text with this gives the same answers as
 one pass over it would.
 
-        find_at(self, s: string, from: usize) -> Option[Match] = exec_from(self.prog, s, from) match
-            Some(slots) -> Some(Match(s, slots))
-            None -> None
+The DFA finds it; the VM is asked only where the DFA says it cannot answer, and the two agree on
+every answer the DFA does give.
 
-        is_match(self, s: string) -> bool = self.find(s).is_some()
+        find_at(self, s: string, from: usize) -> Option[Match] = dfa_find(self.prog, self.fwd, self.rev, s, from) match
+            Spans(slots) -> Some(Match(s, slots))
+            Nothing -> None
+            AskTheVm -> exec_from(self.prog, s, from) match
+                Some(slots) -> Some(Match(s, slots))
+                None -> None
+
+Whether there is a match at all is the forward search stopped at the first accept, which is all the
+question needs: it neither looks for the longest nor walks back for the start.
+
+        is_match(self, s: string) -> bool = self.fwd.find_end(s.bytes, 0, true) >= 0
 
 Every match, left to right and non-overlapping. The next search starts where the last match ended,
 except after an **empty** match, which would otherwise be found again forever at the same place; there
@@ -170,9 +185,11 @@ character, which is the same rule `find_all` follows and the reason both are wri
     end Regex
 
     regex(pattern: string) -> Result[Regex, RegexError]
-        var p = compile_pattern(pattern)?
+        var t = parse_counted(pattern)?
+        var p = compile(t.0, t.1)?
+        var r = compile_reverse(t.0)?
 
-        Ok(Regex(pattern, p))
+        Ok(Regex(pattern, p, new_dfa(p, false), new_dfa(r, true)))
     end regex
 
 
