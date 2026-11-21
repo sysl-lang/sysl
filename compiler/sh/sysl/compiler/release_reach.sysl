@@ -1,0 +1,124 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map, Set, set}
+
+// **What a release can let go of** -- the question a share held across it asks (`arc_cover.sysl`).
+//
+// A release gives back one count, and where that was the last, the object's teardown gives back every
+// count it held in turn, and so on down. A share of a reference is safe across it when nothing that
+// cascade can reach is the object shared: then the release cannot take that object's count anywhere,
+// whatever else it frees. That is a question about types where no code runs: a teardown that is a
+// destructor of the program's, or a trait object's or a task's, whose teardown is not in sight, is
+// code that could do anything, and the release is judged as code.
+
+// What letting go of one value of a type can do: run code (`code`), let go of an object of a type it
+// cannot name (`wide` -- the owner of a string or a slice, which may be any box), and the payload types
+// of every object it can let go of, as `mangle` names them (`keys`).
+struct ReleaseWalk
+    code: bool
+    wide: bool
+    keys: Set[string]
+
+// Notes the type a release helper lets go of, as it is asked for: `arc.dispose.<V>` lets go of a value
+// of `V`, `arc.release.<T>` of a `&T` (`emit_arc.sysl`'s `request_helper`).
+note_release_type(e: *Emit, name: string, what: HelperReq)
+    what match
+        HrValue(ty, false) -> e.release_types.put(name, ty)
+        HrPlainRelease(payload) -> e.release_types.put(name, Ref(payload, false))
+        HrCompactRelease(payload) -> e.release_types.put(name, Ref(payload, false))
+        _ -> ()
+end note_release_type
+
+// The walk of every release helper the function's blocks call that this module asked for by type. A
+// release named nowhere here -- the generic `arc.release`, whose teardown is a hook -- is left out,
+// and so is judged as code.
+release_walks(e: *Emit, blocks: Buf[IrBlock]) -> Map[string, ReleaseWalk]
+    var out: Map[string, ReleaseWalk] = map()
+
+    for b in blocks
+        for inst in b.instrs
+            arc_call_of(inst) match
+                Some((name, _)) ->
+                    if is_release(name) && !out.has(name)
+                        e.release_types.get(name) match
+                            Some(ty) -> out.put(name, walk_of(e, ty))
+                            None -> ()
+                None -> ()
+
+    out
+end release_walks
+
+// The walk letting go of a value of `t`: the release helpers are named by type, so it is the same for
+// every function and is worked out once.
+walk_of(e: *Emit, t: Type) -> ReleaseWalk
+    val key = mangle(t)
+
+    e.walk_cache.get(key) match
+        Some(w) -> return w
+        None -> ()
+
+    var w = ReleaseWalk(false, false, set())
+    var seen: Set[string] = set()
+
+    reach_into(e, t, &w, &seen)
+    e.walk_cache.put(key, w)
+    w
+end walk_of
+
+// Adds what letting go of a value of `t` reaches to `w`. A type met again adds nothing new, so a
+// recursive type settles.
+private reach_into(e: *Emit, t: Type, w: *ReleaseWalk, seen: *Set[string]) = underlying(t) match
+    Integer(_, _, _) -> ()
+    Floating(_, _) -> ()
+    Fixed(_, _, _) -> ()
+    Char -> ()
+    Bool -> ()
+    Unit -> ()
+    Never -> ()
+    Ptr(_, _) -> ()
+    CFn(_, _, _) -> ()
+    Vector(_, _) -> ()
+    ConstArg(_, _, _, _) -> ()
+    // A weak reference's release gives back no strong count, so it tears nothing down.
+    Weak(_) -> ()
+    Ref(inner, _) ->
+        if is_trait(*inner)
+            w.code = true
+            return
+
+        w.keys.add(mangle(*inner))
+        reach_into(e, *inner, w, seen)
+    Array(_, elem) -> reach_into(e, *elem, w, seen)
+    Pack(elems) ->
+        for item in elems
+            reach_into(e, item, w, seen)
+    Results(parts) -> reach_into(e, Struct(parts), w, seen)
+    Struct(d) ->
+        if d.base == TaskBase || destructor_of(e, t).is_some()
+            w.code = true
+            return
+
+        if !seen.add(mangle(t)) then return
+
+        for item in d.fields
+            reach_into(e, item.1, w, seen)
+    Enum(d) ->
+        if destructor_of(e, t).is_some()
+            w.code = true
+            return
+
+        if !seen.add(mangle(t)) then return
+
+        for variant in d.variants
+            for item in variant.fields
+                reach_into(e, item.1, w, seen)
+    // The owner of a string's or a slice's bytes may be any box: a buffer, or an object a view of
+    // whose array was taken -- and a slice's elements are torn down with the buffer they are in.
+    Str -> w.wide = true
+    Slice(elem, _) ->
+        w.wide = true
+        reach_into(e, *elem, w, seen)
+    // Anything else is not in sight.
+    _ -> w.code = true
+end reach_into

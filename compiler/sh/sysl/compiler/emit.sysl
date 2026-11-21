@@ -496,6 +496,16 @@ struct Emit
     // The `s.bytes` the body being lowered takes into a slot of its frame rather than through
     // `sysl.str.unshort`, which the escape analysis settled (`Promotions.bytes_framed_for`).
     bytes_framed: Buf[Span]
+
+    // The type each release helper lets go of, by name, and what letting go of a value of a type can
+    // reach, by `mangle` (`release_reach.sysl`) -- what a share held across a release asks.
+    release_types: Map[string, Type]
+    walk_cache: Map[string, ReleaseWalk]
+
+    // The place entries whose answer lies in the bytes of the storage they are handed, with no
+    // reference followed on the way (`place_entry.sysl`'s `in_own_storage`), each with the index of
+    // that address among a call's arguments (-2 before a call is written, -1 where calls disagree).
+    inplace_symbols: Map[string, int]
 end Emit
 
 // What a runtime helper is built from. A helper is asked for by name while a body is being written
@@ -706,7 +716,8 @@ emitter_for(t: Target, destructors: Buf[(string, string, bool)]) -> Emit
          no_wrap_none(), map(), buf(), Leaving, false, "", set(), buf(), map(), map(), 0, moves_none(), set(), set(), set(), set(),
          set(), map(), 0, map(), set(), map(), false, set(), map(), set(), false, false, false, buf(), set(),
           "", set(), false, None, None, set(), None, map(), buf(), buf(), buf(), false, set(), None,
-          buf(), buf(), false, false, false, false, buf(), map(), map(), set(), map(), buf(), buf())
+          buf(), buf(), false, false, false, false, buf(), map(), map(), set(), map(), buf(), buf(),
+          map(), map(), map())
 end emitter_for
 
 // -- what a body could not say --------------------------------------------------------------------
@@ -1080,7 +1091,7 @@ finish_func(e: *Emit, sig: IrFuncSig) -> IrFunc
     //
     // A slot's life is bounded last, over the finished blocks, so the slots the large-value pass made
     // and the blocks the guards opened are bounded with the rest.
-    val elided = elide_arc_pairs(out, e.inert_symbols)
+    val elided = elide_arc_pairs_with(out, e.inert_symbols, release_walks(e, out), e.inplace_symbols)
     var before: Set[string] = set()
 
     for inst in elided[0].instrs

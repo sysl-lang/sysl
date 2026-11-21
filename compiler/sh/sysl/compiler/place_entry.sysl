@@ -72,6 +72,29 @@ place_entries(e: *Emit, p: TProgram, answers: Map[string, usize])
 
     if e.places.is_empty() then return
 
+    // The entries whose answer lies in the bytes of the storage they are handed: a share read through
+    // one out of a slot of the frame is held by that slot's own count (`arc_cover.sysl`). Grown the
+    // same way, since one such entry may call another.
+    var own: Set[string] = set()
+
+    grew = true
+
+    while grew
+        grew = false
+
+        for c in cands
+            val name = c.0.name
+
+            if !e.places.has(name) || own.has(name) then continue
+
+            if in_own_storage(e, own, c.0.body.result.unwrap(), one_root(c.0.params[c.1].0))
+                own.add(name)
+                grew = true
+
+    // Where the address sits among a call's arguments is noted by the first call (`call_place`).
+    for name in own
+        e.inplace_symbols.put(place_symbol(e, name), -2)
+
     // **A place entry owns nothing**, so it is judged as its body would be were it handed its
     // parameters rather than owning them: `quad(self)` owns `self` and gives it back, and so releases
     // something, but `quad-place` is handed an address and releases nothing -- and a share read before
@@ -190,6 +213,65 @@ private arm_shape(e: *Emit, arm: TArm, roots: Buf[string]) -> bool
     place_shape(e, arm.body.result.unwrap(), inner)
 end arm_shape
 
+// Whether the place `x` (one `place_shape` admits) lies in the bytes of its root's own storage: a
+// field or an array element of a value held by value, a `match` payload bound out of one, or what a
+// call to an entry of `own` answers on one -- never through a reference, a pointer or a view.
+private in_own_storage(e: *Emit, own: Set[string], x: TExpr, roots: Buf[string]) -> bool = *x.kind match
+    TLoad(name, _) -> has_root(roots, name)
+    TField(r, _, _) -> by_value(texpr_type(r)) && in_own_storage(e, own, r, roots)
+    TIndex(r, _, _) -> by_value(texpr_type(r)) && in_own_storage(e, own, r, roots)
+    TBlockExpr(b) -> b.stmts.is_empty() && b.result.is_some() && in_own_storage(e, own, b.result.unwrap(), roots)
+    TCall(name, args, _, _) ->
+        if !own.has(name) then return false
+
+        e.places.get(name) match
+            Some(c) -> in_own_storage(e, own, args[c.1], roots)
+            None -> false
+    TMatch(scrutinee, arms, _) ->
+        if !in_own_storage(e, own, scrutinee, roots) then return false
+
+        for arm in arms
+            if is_never_type(arm.body.ty) then continue
+
+            var inner: Buf[string] = buf()
+
+            for r in roots
+                inner.push(r)
+
+            for name in pattern_names(arm.patterns[0])
+                inner.push(name)
+
+            if !in_own_storage(e, own, arm.body.result.unwrap(), inner) then return false
+
+        true
+    _ -> false
+
+// Whether a value of `t` is held where it is written: not a reference, a pointer or a view of
+// storage somewhere else.
+private by_value(t: Type) -> bool = underlying(t) match
+    Ref(_, _) -> false
+    Weak(_) -> false
+    Ptr(_, _) -> false
+    Slice(_, _) -> false
+    Str -> false
+    _ -> true
+
+// The names a flat pattern binds.
+private pattern_names(p: TPattern) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    p match
+        TBindPattern(name, ty) -> if !zero_sized(ty) then out.push(name)
+        TVariantPattern(_, _, args) ->
+            for a in args
+                a match
+                    TBindPattern(name, ty) -> if !zero_sized(ty) then out.push(name)
+                    _ -> ()
+        _ -> ()
+
+    out
+end pattern_names
+
 // A pattern whose only test is the subject's variant: a `_`, a name, or a variant of an enum with a
 // payload whose fields are each a `_` or a name.
 private flat_pattern(p: TPattern) -> bool = p match
@@ -285,13 +367,25 @@ private call_place(e: *Emit, name: string, args: Buf[TExpr], at: Val, span: Span
     val k = e.places.get(name).unwrap().1
     var arg_vals: Buf[IrArg] = buf()
 
+    var at_index = -1
+
     for j in 0..<args.len()
-        if j == k then arg_vals.push(ir_arg(LPtr, at))
+        if j == k
+            at_index = int(arg_vals.len())
+            arg_vals.push(ir_arg(LPtr, at))
         else arg_value(e, args[j], &arg_vals, set())
 
     push_caller_arg(e, name, span, &arg_vals)
 
     val symbol = request_helper(e, place_symbol(e, name), HrPlace(name))
+
+    // Where the address sits among the call's arguments, for `arc_cover.sysl`; a call that put it
+    // anywhere else makes it no entry that pass reads.
+    e.inplace_symbols.get(symbol) match
+        Some(was) ->
+            if was == -2 then e.inplace_symbols.put(symbol, at_index)
+            else if was != at_index then e.inplace_symbols.put(symbol, -1)
+        None -> ()
     val r = fresh_reg(e)
 
     emit(e, InCall(Some(r), LPtr, VGlobal(symbol), arg_vals, no_ir_attrs(), None, no_fast_math(), false))

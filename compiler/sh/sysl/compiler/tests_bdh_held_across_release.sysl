@@ -1,0 +1,463 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map, Set, set}
+import sysl.process.capture
+import sysl.text.Search
+
+// A share whose window holds a release (`arc_cover.sysl`'s `holds_across`): dropped where the release
+// runs no code and either the share is held by a slot of the frame whose own count it cannot give
+// back -- Richards' `run_task`, whose `message.unwrap()` is read out of the `var` while the old
+// `self.input` is given back -- or nothing the release can let go of is of the share's type.
+//
+// The pass on blocks built by hand, each thing that keeps the share; then the emitted text of the
+// shapes it is for and of the ones that must still count; then the program run on the counted heap.
+
+// -- the pass, on blocks built by hand ------------------------------------------------------------------
+
+private bdh_call(name: string, v: string) -> Inst
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(LPtr, VReg(v)))
+    ir_call(None, LVoid, VGlobal(name), args)
+end bdh_call
+
+private bdh_load(d: string, p: string) -> Inst = InLoad(VReg(d), LPtr, VReg(p), AccPlain, None)
+
+private bdh_store(v: string, p: string) -> Inst = InStore(LPtr, VReg(v), VReg(p), AccPlain, None)
+
+// `%d = call ptr @unwrap-place(ptr %slot)`: the address of the payload in the slot's own bytes.
+private bdh_place(d: string, slot: string) -> Inst
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(LPtr, VReg(slot)))
+    InCall(Some(VReg(d)), LPtr, VGlobal("unwrap-place"), args, no_ir_attrs(), None, no_fast_math(), false)
+end bdh_place
+
+private bdh_walk(code: bool, wide: bool, keys: []string) -> ReleaseWalk
+    var ks: Set[string] = set()
+
+    for k in keys
+        ks.add(k)
+
+    ReleaseWalk(code, wide, ks)
+end bdh_walk
+
+private bdh_pass(blocks: Buf[IrBlock], walks: Map[string, ReleaseWalk], own: Map[string, int]) -> string
+    var out = ""
+
+    for b in elide_arc_pairs_with(blocks, set(), walks, own)
+        out = s"$out${b.label}:\n"
+
+        for i in b.instrs
+            out = s"$out  ${inst_render(i)}\n"
+
+        b.terminator match
+            Some(t) -> out = s"$out  ${inst_render(t)}\n"
+            None -> ()
+
+    out
+end bdh_pass
+
+private bdh_count(text: string, needle: string) -> int = int(text.count_of(needle))
+
+// Richards' `run_task` lowered to what the pass reads: `message` given the old `self.input` with a
+// count, the payload read out of `message` through the place entry and its share taken, `between`, then
+// in a block of its own the share given back.
+private bdh_held(prefix: Buf[Inst], between: Buf[Inst]) -> Buf[IrBlock]
+    var entry: Buf[Inst] = buf()
+
+    entry.push(InAlloca(VReg("m.addr"), LPtr, None))
+    entry.push(bdh_load("v", "input"))
+    entry.push(bdh_call("arc.retain", "v"))
+    entry.push(bdh_store("v", "m.addr"))
+
+    for inst in prefix
+        entry.push(inst)
+
+    entry.push(bdh_place("a", "m.addr"))
+    entry.push(bdh_load("x", "a"))
+    entry.push(bdh_call("arc.retain", "x"))
+
+    for inst in between
+        entry.push(inst)
+
+    var done: Buf[Inst] = buf()
+
+    done.push(bdh_call("arc.release.Packet", "x"))
+
+    var blocks: Buf[IrBlock] = buf()
+
+    blocks.push(IrBlock("entry", entry, Some(InCondBr(VReg("c"), "done", "done"))))
+    blocks.push(IrBlock("done", done, Some(InRet(None, None))))
+    blocks
+end bdh_held
+
+// The old `self.input` read and given back: a release of a `Packet`, the very type the share is.
+private bdh_old_input() -> Buf[Inst]
+    var out: Buf[Inst] = buf()
+
+    out.push(bdh_load("old", "input"))
+    out.push(bdh_store("new", "input"))
+    out.push(bdh_call("arc.release.Packet", "old"))
+    out
+end bdh_old_input
+
+private bdh_walks() -> Map[string, ReleaseWalk]
+    var walks: Map[string, ReleaseWalk] = map()
+
+    walks.put("arc.release.Packet", bdh_walk(false, false, ["Packet"]))
+    walks.put("arc.release.Noisy", bdh_walk(true, false, ["Noisy"]))
+    walks.put("arc.release.Tag", bdh_walk(false, false, ["Tag"]))
+    walks.put("arc.release.Bytes", bdh_walk(false, true, ["Bytes"]))
+    walks
+end bdh_walks
+
+private bdh_own() -> Map[string, int]
+    var own: Map[string, int] = map()
+
+    own.put("unwrap-place", 0)
+    own
+end bdh_own
+
+private bdh_kept(text: string) -> bool = bdh_count(text, "@arc.retain(ptr %x)") == 1 && bdh_count(text, "@arc.release.Packet(ptr %x)") == 1
+
+private bdh_gone(text: string) -> bool = bdh_count(text, "%x)") == 0
+
+@test("a share held by a slot's count goes although the window gives back another count of its type")
+bdh_slot_holds()
+    val after = bdh_pass(bdh_held(buf(), bdh_old_input()), bdh_walks(), bdh_own())
+
+    assert(bdh_gone(after), after)
+    // The slot's own share, and the old value's release, stay.
+    assert_eq(bdh_count(after, "@arc.retain(ptr %v)"), 1, after)
+    assert_eq(bdh_count(after, "@arc.release.Packet(ptr %old)"), 1, after)
+
+@test("a share read through a place entry not known to answer in the slot's own bytes keeps its count")
+bdh_not_in_own_bytes()
+    val after = bdh_pass(bdh_held(buf(), bdh_old_input()), bdh_walks(), map())
+
+    assert(bdh_kept(after), after)
+
+    var elsewhere: Map[string, int] = map()
+
+    elsewhere.put("unwrap-place", 1)
+
+    val wrong_arg = bdh_pass(bdh_held(buf(), bdh_old_input()), bdh_walks(), elsewhere)
+
+    assert(bdh_kept(wrong_arg), wrong_arg)
+
+@test("a slot handed to anything but the place entry, or given a value no count was taken for, holds nothing")
+bdh_slot_does_not_hold()
+    var handed: Buf[Inst] = buf()
+
+    handed.push(bdh_call("anything", "m.addr"))
+
+    // A second store, of a value with no count taken for it: what a borrowed value leaves in a slot.
+    var bare: Buf[Inst] = buf()
+
+    bare.push(bdh_store("w", "m.addr"))
+
+    var param: Buf[Inst] = buf()
+
+    param.push(InStore(LPtr, VReg("m.param"), VReg("m.addr"), AccPlain, None))
+
+    for after in [bdh_pass(bdh_held(handed, bdh_old_input()), bdh_walks(), bdh_own()),
+                  bdh_pass(bdh_held(bare, bdh_old_input()), bdh_walks(), bdh_own()),
+                  bdh_pass(bdh_held(param, bdh_old_input()), bdh_walks(), bdh_own())]
+        assert(bdh_kept(after), after)
+
+@test("a release of the slot's own value, or a read or write of the slot in the window, keeps the share")
+bdh_slot_touched()
+    // The release gives back what was read out of the slot before the window: the slot's own count.
+    var early: Buf[Inst] = buf()
+
+    early.push(bdh_load("own", "m.addr"))
+
+    var gives: Buf[Inst] = buf()
+
+    gives.push(bdh_call("arc.release.Packet", "own"))
+
+    var read: Buf[Inst] = bdh_old_input()
+
+    read.push(bdh_load("again", "m.addr"))
+
+    var written: Buf[Inst] = bdh_old_input()
+
+    written.push(bdh_store("new", "m.addr"))
+
+    for after in [bdh_pass(bdh_held(early, gives), bdh_walks(), bdh_own()),
+                  bdh_pass(bdh_held(buf(), read), bdh_walks(), bdh_own()),
+                  bdh_pass(bdh_held(buf(), written), bdh_walks(), bdh_own())]
+        assert(bdh_kept(after), after)
+
+@test("a release that may run code, or one whose walk is not known, keeps a share a slot holds")
+bdh_release_runs_code()
+    var noisy: Buf[Inst] = buf()
+
+    noisy.push(bdh_load("old", "input"))
+    noisy.push(bdh_call("arc.release.Noisy", "old"))
+
+    var unknown: Buf[Inst] = buf()
+
+    unknown.push(bdh_load("old", "input"))
+    unknown.push(bdh_call("arc.release", "old"))
+
+    for after in [bdh_pass(bdh_held(buf(), noisy), bdh_walks(), bdh_own()),
+                  bdh_pass(bdh_held(buf(), unknown), bdh_walks(), bdh_own())]
+        assert(bdh_kept(after), after)
+
+// A share of a field read out of storage (no slot of the frame), `between` in its window.
+private bdh_field(between: Buf[Inst], closing: string) -> Buf[IrBlock]
+    var entry: Buf[Inst] = buf()
+    var at: Buf[IrArg] = buf()
+
+    at.push(ir_arg(LInt(64), VReg("i")))
+    entry.push(InGep(VReg("x.at"), LPtr, VReg("base"), at))
+    entry.push(bdh_load("x", "x.at"))
+    entry.push(bdh_call("arc.retain", "x"))
+
+    for inst in between
+        entry.push(inst)
+
+    var done: Buf[Inst] = buf()
+
+    done.push(bdh_call(closing, "x"))
+
+    var blocks: Buf[IrBlock] = buf()
+
+    blocks.push(IrBlock("entry", entry, Some(InCondBr(VReg("c"), "done", "done"))))
+    blocks.push(IrBlock("done", done, Some(InRet(None, None))))
+    blocks
+end bdh_field
+
+private bdh_releasing(name: string) -> Buf[Inst]
+    var out: Buf[Inst] = buf()
+
+    out.push(bdh_load("old", "other"))
+    out.push(bdh_call(name, "old"))
+    out
+end bdh_releasing
+
+@test("a release that can let go of nothing of the share's type may sit in its window")
+bdh_other_type()
+    val after = bdh_pass(bdh_field(bdh_releasing("arc.release.Tag"), "arc.release.Packet"), bdh_walks(), map())
+
+    assert(bdh_gone(after), after)
+    assert_eq(bdh_count(after, "@arc.release.Tag(ptr %old)"), 1, after)
+
+@test("a release that may reach the share's type, may let go of any box, may run code or is unknown keeps it")
+bdh_type_could_meet()
+    for name in ["arc.release.Packet", "arc.release.Bytes", "arc.release.Noisy", "arc.release", "arc.dispose.Unseen"]
+        val after = bdh_pass(bdh_field(bdh_releasing(name), "arc.release.Packet"), bdh_walks(), map())
+
+        assert(bdh_kept(after), after)
+
+    // A share given back through the generic release says nothing of its type.
+    val generic = bdh_pass(bdh_field(bdh_releasing("arc.release.Tag"), "arc.release"), bdh_walks(), map())
+
+    assert_eq(bdh_count(generic, "@arc.retain(ptr %x)"), 1, generic)
+
+// -- the emitted text ---------------------------------------------------------------------------------------
+
+private bdh_source() -> string = raw"""
+    struct Noisy
+        id: int
+        link: Option[&Noisy]
+
+    impl Drop for Noisy
+        drop(self) = print("drop", self.id)
+
+    struct Tag
+        id: int
+
+    struct Packet
+        id: int
+        link: Option[&Packet]
+        tag: Option[&Tag]
+
+    struct Chain
+        id: int
+        back: Option[&Packet]
+
+    struct Task
+        input: Option[&Packet]
+        noisy: Option[&Noisy]
+        tag: Option[&Tag]
+        chain: Option[&Chain]
+        flag: bool
+
+    impl Task
+        // Richards' `run_task`: the old `self.input` given back while `message`'s payload is shared.
+        run_task(*self) -> int
+            var message: Option[&Packet] = None
+
+            if self.flag
+                message = self.input
+                self.input = message.unwrap().link
+
+            if message is Some(p) then p.id else 0
+
+        run_named(*self) -> int
+            val message = self.input
+
+            self.input = message.unwrap().link
+            message.unwrap().id
+
+        // The share read out of the place being written: the release may be its last count.
+        run_in_place(*self) -> int
+            self.input = self.input.unwrap().link
+
+            if self.input is Some(p) then p.id else 0
+
+        // The old value's teardown runs a destructor.
+        run_noisy(*self) -> int
+            var message: Option[&Noisy] = None
+
+            if self.flag
+                message = self.noisy
+                self.noisy = message.unwrap().link
+
+            if message is Some(p) then p.id else 0
+
+        // A parameter's slot holds what its caller lent it.
+        run_param(*self, message: Option[&Packet]) -> int
+            self.input = message.unwrap().link
+
+            if self.input is Some(p) then p.id else 0
+
+        // The old tag cannot be the packet, nor reach one.
+        retag(*self) -> int
+            self.tag = self.input.unwrap().tag
+
+            if self.tag is Some(t) then t.id else 0
+
+        // The old chain can reach a packet.
+        rechain(*self) -> int
+            self.chain = Some(Chain(self.input.unwrap().id, self.input))
+
+            if self.chain is Some(c) then c.id else 0
+
+    main()
+        var t = Task(Some(Packet(1, Some(Packet(2, Some(Packet(3, None, Some(Tag(30)))), Some(Tag(20)))), Some(Tag(10)))),
+                     Some(Noisy(31, Some(Noisy(32, None)))), Some(Tag(5)), Some(Chain(7, None)), true)
+
+        print("task", t.run_task())
+        print("named", t.run_named())
+        print("noisy", t.run_noisy())
+        print("noisy", t.run_noisy())
+        print("retag", t.retag())
+        print("rechain", t.rechain())
+        print("in place", t.run_in_place())
+        print("param", t.run_param(Some(Packet(4, Some(Packet(5, None, None)), None))))
+        print("end")
+    """
+
+// The functions of the source lowered beside the standard library, each as its symbol and its text;
+// nothing when the library cannot be found.
+private bdh_funcs() -> Buf[(string, string)]
+    var none: Buf[(string, string)] = buf()
+
+    std_root() match
+        Err(_) -> return none
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> return none
+            Ok(units) ->
+                var all: Buf[Program] = buf()
+
+                for item in units
+                    all.push(item)
+
+                val parsed = parse(source_of("test.sysl", bdh_source()))
+
+                all.push(parsed.program)
+
+                val done = analyze_bodies(all, host_target())
+
+                if !done.reported.is_empty() then assert(false, done.reported[0].diag.message)
+
+                val whole = program_of(done, "")
+                val promotions = post_analysis_checks(done.an, whole, buf())
+                val lowered = codegen_with_gaps(prune(strip_tests(whole), program_own(all)), host_target(), promotions)
+
+                func_texts(ir_print_module(lowered.0))
+end bdh_funcs
+
+private bdh_ir(fs: Buf[(string, string)], symbol: string) -> string
+    for item in fs
+        if names_as_written(item.0, symbol) then return item.1
+
+    assert(false, s"no function '$symbol'")
+    ""
+end bdh_ir
+
+@test("Richards' run_task, and the same with a val, share the unwrapped payload for nothing")
+bdh_emitted_held()
+    val fs = bdh_funcs()
+
+    if fs.is_empty()
+        assert(std_root().is_err(), "the standard library is in sight, so the source must lower")
+        return
+
+    for name in ["Task.run_task", "Task.run_named"]
+        val ir = bdh_ir(fs, name)
+
+        assert_eq(bdh_count(ir, "call void @arc.retain("), 0, ir)
+        assert_eq(bdh_count(ir, "call void @arc.release.Packet("), 0, ir)
+
+@test("a payload read out of the place written, a destructor, a parameter's slot or an old value that can reach the type keeps the share")
+bdh_emitted_kept()
+    val fs = bdh_funcs()
+
+    if fs.is_empty()
+        assert(std_root().is_err(), "the standard library is in sight, so the source must lower")
+        return
+
+    for name in ["Task.run_in_place", "Task.run_param", "Task.rechain"]
+        val ir = bdh_ir(fs, name)
+
+        assert_eq(bdh_count(ir, "call void @arc.retain("), 1, ir)
+
+    val noisy = bdh_ir(fs, "Task.run_noisy")
+
+    assert_eq(bdh_count(noisy, "call void @arc.retain("), 1, noisy)
+
+@test("an old value of a type that cannot reach the share's goes without the share")
+bdh_emitted_other_type()
+    val fs = bdh_funcs()
+
+    if fs.is_empty()
+        assert(std_root().is_err(), "the standard library is in sight, so the source must lower")
+        return
+
+    val ir = bdh_ir(fs, "Task.retag")
+
+    assert_eq(bdh_count(ir, "call void @arc.retain("), 0, ir)
+
+@test("every shape runs on the counted heap with its destructors in order and nothing left live")
+bdh_counted_heap()
+    if !lbr_ready() then return
+
+    val prog = lbr_program(bdh_source())
+    val out_dir = lbr_temp("sysl-bdh-exe")
+
+    force_alloc_counting(true)
+
+    val built = build_native_program(prog, None, None, DefaultOptimization, Some(s"$out_dir/program"))
+
+    force_alloc_counting(false)
+
+    val ran = built match
+        Err(why) -> (failure_text(why), "")
+        Ok(made) ->
+            capture(made, [], "", [], true) match
+                Err(_) -> ("could not be started", "")
+                Ok(o) -> (o.text, o.err.unwrap_or(""))
+
+    lbr_drop([prog, out_dir])
+
+    assert_eq(ran.0, "task 1\nnamed 2\ndrop 31\nnoisy 31\ndrop 32\nnoisy 32\nretag 30\nrechain 3\n" +
+                     "in place 0\nparam 5\nend\n", ran.1)
+    assert(!ran.1.contains("still live"), ran.1)
