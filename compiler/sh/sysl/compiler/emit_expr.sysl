@@ -50,11 +50,9 @@ private gen_expr_kind(e: *Emit, x: TExpr) -> Val = *x.kind match
     TEmbed(file, bytes, align) -> embed_const(e, file, bytes, align)
 
     // Rendering a value. A `string` is itself and everything else lands in a fresh buffer, which is
-    // why only the second case is a temporary the statement owns.
-    TStr(arg) ->
-        val v = gen_str(e, arg)
-
-        if underlying(texpr_type(arg)) == Str then v else own_temp(e, v, Str)
+    // why only the second case is a temporary the statement owns. A join of strings rendered -- an
+    // interpolation of more than one piece -- is written into one buffer whole (`gen_interp`).
+    TStr(arg) -> if interp_join(arg) then gen_interp(e, arg) else gen_rendered(e, arg)
 
     TFormat(arg, spec, counts) -> own_temp(e, gen_format(e, arg, spec, counts), Str)
     TRender(value, method, spec, slot) -> gen_render(e, value, method, spec, slot)
@@ -737,6 +735,12 @@ zero_sized_elements(ty: Type) -> bool = element(ty).map(t -> zero_sized(t)).unwr
 private array_len_of(ty: Type) -> int = underlying(ty) match
     Array(n, _) -> n
     _ -> 0
+
+// A scalar rendered on its own: a `string` is itself, anything else a string the statement owns.
+private gen_rendered(e: *Emit, arg: TExpr) -> Val
+    val v = gen_str(e, arg)
+
+    if underlying(texpr_type(arg)) == Str then v else own_temp(e, v, Str)
 
 // -- arithmetic ---------------------------------------------------------------------------------
 

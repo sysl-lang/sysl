@@ -167,17 +167,19 @@ private val ssx_g_program: string = raw"""
     end work
     """
 
-// What the program prints. A rendering of up to 64 bytes takes the one block of its string; past 64 it
-// takes a working buffer too, and a second at 129 when it doubles. The nested short one is the inner
-// string, two joins and the outer string; the loop is a hundred strings and a buffer for each of the
-// 35 past 64. (Before the scratch: every non-empty rendering took one more, the pieces-of-ten ones
-// more again, and the loop 301.)
+// What the program prints. A rendering of up to 64 bytes takes the one block of its string; past 64 its
+// working buffer becomes the string (`finish` hands it over), so it still takes one, and two when the
+// pieces of ten grow it again at 129. The nested ones are the inner interpolation's string and the
+// outer rendering's, each one buffer (`tests_ssx_h_interp_one_buffer.sysl`); the loop is a hundred
+// strings. (Before the scratch: every non-empty rendering took one more, the pieces-of-ten ones more
+// again, and the loop 301; before the whole interpolation was one buffer, a spill took one more and
+// the nested ones 4 and 6.)
 private val ssx_g_expected: string =
     "0 1 0 true 1\n0 10 0 true 1\n1 2 1 true 1\n1 10 1 true 1\n15 16 15 true 1\n15 10 15 true 1\n" +
     "16 17 16 true 1\n16 10 16 true 1\n63 64 63 true 1\n63 10 63 true 1\n64 65 64 true 1\n" +
-    "64 10 64 true 1\n65 66 65 true 2\n65 10 65 true 2\n130 131 130 true 2\n130 10 130 true 3\n" +
-    "accent 64 1 64 true\naccent 65 2 65 true\nnested <abcdefghij> 4\nnested spill 6 72 true\n" +
-    "loop 100 135\nescaped true true true 7140\nlive 0\n"
+    "64 10 64 true 1\n65 66 65 true 1\n65 10 65 true 1\n130 131 130 true 1\n130 10 130 true 2\n" +
+    "accent 64 1 64 true\naccent 65 1 65 true\nnested <abcdefghij> 2\nnested spill 2 72 true\n" +
+    "loop 100 100\nescaped true true true 7140\nlive 0\n"
 
 // The program built with `flags` and run: what it printed, or why it did not.
 private ssx_g_run(flags: []const string) -> string
@@ -248,11 +250,11 @@ ssx_g_slot_text()
 
     val slot = "{ ptr, i64, i64, [64 x i8] }"
 
-    // Two holes, two slots, each bounded by its own rendering.
-    assert_eq(ir.count_of(s" = alloca $slot\n"), 2)
-    assert_eq(ir.count_of("  store { ptr, i64, i64 } zeroinitializer, ptr "), 2)
-    assert_eq(ir.count_of("@sysl.w.buf.finish(ptr "), 2 + 1)
-    assert(ir.count_of("call void @llvm.lifetime.end.p0(i64 -1, ptr ") >= 2, ir)
+    // Two holes, one interpolation: one slot, bounded by the rendering.
+    assert_eq(ir.count_of(s" = alloca $slot\n"), 1)
+    assert_eq(ir.count_of("  store { ptr, i64, i64 } zeroinitializer, ptr "), 1)
+    assert_eq(ir.count_of("@sysl.w.buf.finish(ptr "), 1 + 1)
+    assert(ir.count_of("call void @llvm.lifetime.end.p0(i64 -1, ptr ") >= 1, ir)
     assert(ir.contains(s"%scratch = getelementptr $slot, ptr %self, i32 0, i32 3\n"), ir)
     assert(ir.contains("  store ptr %scratch, ptr %bufp\n  store i64 64, ptr %capp\n"), ir)
     assert(ir.contains("  %inframe = icmp eq ptr %old, %scratch\n"), ir)
