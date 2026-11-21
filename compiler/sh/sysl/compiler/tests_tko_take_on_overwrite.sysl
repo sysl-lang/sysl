@@ -1,0 +1,457 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.process.capture
+import sysl.text.Search
+
+// A reference read out of a place that is written before it is read again takes the place's count
+// (`arc_take.sysl`): the retain at the read and the release of the old value at the write are dropped.
+//
+// One program holds every shape: the AWFY Towers moves the pass is for, the shapes it takes (a whole
+// value, a `match` payload, a plain reference, a read past a `panic` that is not taken, a read and write
+// in every round of a loop, Richards' `var` assigned from a place written through `unwrap`) and the
+// shapes that must keep both counts (an early `return`, a write on one branch only, a read inside a loop
+// written after it, a call that writes the place through another name, a second read, a write to the
+// same field of what may be the same object, the name's own count given back through a field in the
+// window, a release in the window that runs a destructor -- another object's, or the `var`'s old
+// value, whose type has one). Its
+// lowered text says which pairs went; run on the counted heap, its destructors say when each object
+// died -- a wrong take frees the object while the place or the name still holds it, so its `drop` line
+// comes early, twice, or never -- and nothing is left live.
+
+private tko_source() -> string = raw"""
+    struct Noisy
+        id: int
+
+    impl Drop for Noisy
+        drop(self) = print("drop", self.id)
+
+    struct Holder
+        slot: Option[&Noisy]
+
+    struct RefHolder
+        r: &Noisy
+
+    struct Keeper
+        slot: Option[&Noisy]
+
+    struct Packet
+        id: int
+        link: Option[&Packet]
+
+    struct Queue
+        input: Option[&Packet]
+
+    struct Disk
+        size: int
+        next: Option[&Disk]
+
+    struct Towers
+        piles: [3]Option[&Disk]
+        moves: int
+
+    impl Towers
+        push_disk(*self, disk: &Disk, pile: int)
+            val top = self.piles[pile]
+
+            top match
+                Some(t) -> if disk.size >= t.size then panic("a big disk on a smaller one")
+                None -> ()
+
+            disk.next = top
+            self.piles[pile] = Some(disk)
+
+        pop_disk_from(*self, pile: int) -> &Disk
+            val top = self.piles[pile] match
+                Some(t) -> t
+                None -> panic("an empty pile")
+
+            self.piles[pile] = top.next
+            top.next = None
+            top
+
+        move_top_disk(*self, from_pile: int, to_pile: int)
+            self.push_disk(self.pop_disk_from(from_pile), to_pile)
+            self.moves += 1
+
+        build_tower_at(*self, pile: int, disks: int)
+            for var i = disks; i >= 0; i -= 1
+                self.push_disk(Disk(i, None), pile)
+
+        move_disks(*self, disks: int, from_pile: int, to_pile: int)
+            if disks == 1
+                self.move_top_disk(from_pile, to_pile)
+            else
+                val other_pile = 3 - from_pile - to_pile
+
+                self.move_disks(disks - 1, from_pile, other_pile)
+                self.move_top_disk(from_pile, to_pile)
+                self.move_disks(disks - 1, other_pile, to_pile)
+
+    id_of(o: Option[&Noisy]) -> int = o match
+        Some(n) -> n.id
+        None -> 0
+
+    take_whole(h: &Holder) -> int
+        val d = h.slot
+
+        h.slot = None
+        print("cleared")
+        id_of(d)
+
+    take_payload(h: &Holder) -> int
+        val d = h.slot match
+            Some(n) -> n
+            None -> panic("empty")
+
+        h.slot = None
+        print("cleared")
+        d.id
+
+    take_ref(h: &RefHolder) -> int
+        val d = h.r
+
+        h.r = Noisy(90)
+        print("replaced")
+        d.id
+
+    take_past_panic(h: &Holder, limit: int) -> int
+        val d = h.slot
+
+        if limit < 0 then panic("a negative limit")
+
+        h.slot = None
+        print("cleared")
+        id_of(d)
+
+    take_each_round(h: &Holder, n: int)
+        for i in 0..<n
+            val d = h.slot
+
+            h.slot = Some(Noisy(100 + i))
+            print("round", i, id_of(d))
+
+    keep_assigned(h: &Holder, go: bool) -> int
+        var d: Option[&Noisy] = None
+
+        if go
+            d = h.slot
+            h.slot = None
+
+        print("assigned")
+        id_of(d)
+
+    take_unwrapped(q: &Queue) -> int
+        var message: Option[&Packet] = None
+
+        message = q.input
+        q.input = message.unwrap().link
+        message.unwrap().id
+
+    keep_on_return(h: &Holder, early: bool) -> int
+        val d = h.slot
+
+        if early then return id_of(d)
+
+        h.slot = None
+        print("cleared")
+        id_of(d)
+
+    keep_on_maybe(h: &Holder, clear: bool) -> int
+        val d = h.slot
+
+        if clear then h.slot = None
+
+        print("maybe")
+        id_of(d)
+
+    keep_in_loop(h: &Holder, n: int) -> int
+        var d: Option[&Noisy] = None
+        var i = 0
+
+        while i < n
+            d = h.slot
+            i += 1
+
+        h.slot = None
+        print("cleared")
+        id_of(d)
+
+    clobber(k: &Holder)
+        k.slot = None
+        print("clobbered")
+
+    keep_across_call(h: &Holder, other: &Holder) -> int
+        val d = h.slot
+
+        clobber(other)
+        h.slot = None
+        print("cleared")
+        id_of(d)
+
+    keep_reread(h: &Holder) -> int
+        val d = h.slot
+        val e = h.slot
+
+        h.slot = None
+        print("cleared")
+        id_of(d) + id_of(e)
+
+    keep_other_object(a: &Holder, b: &Holder) -> int
+        val d = a.slot
+
+        b.slot = None
+        print("b cleared")
+        a.slot = None
+        print("a cleared")
+        id_of(d)
+
+    keep_released_name(h: &Holder, k: &Keeper)
+        val d = h.slot
+
+        k.slot = d
+        k.slot = None
+        print("keeper cleared")
+        h.slot = None
+        print("cleared")
+
+    keep_destructor(h: &Holder, k: &Keeper) -> int
+        val d = h.slot
+
+        k.slot = None
+        h.slot = None
+        print("cleared")
+        id_of(d)
+
+    main()
+        print("whole", take_whole(Holder(Some(Noisy(1)))))
+        print("payload", take_payload(Holder(Some(Noisy(2)))))
+        print("ref", take_ref(RefHolder(Noisy(3))))
+        print("past panic", take_past_panic(Holder(Some(Noisy(4))), 1))
+        take_each_round(Holder(Some(Noisy(5))), 3)
+        print("assigned", keep_assigned(Holder(Some(Noisy(15))), true))
+
+        val q: &Queue = Queue(Some(Packet(21, Some(Packet(22, None)))))
+
+        print("unwrapped", take_unwrapped(q), take_unwrapped(q), q.input is None)
+
+        val f: &Holder = Holder(Some(Noisy(6)))
+
+        print("return", keep_on_return(f, true), id_of(f.slot))
+
+        val g: &Holder = Holder(Some(Noisy(7)))
+
+        print("maybe", keep_on_maybe(g, false), id_of(g.slot))
+        print("loop", keep_in_loop(Holder(Some(Noisy(8))), 3))
+
+        val m: &Holder = Holder(Some(Noisy(9)))
+
+        print("call", keep_across_call(m, m))
+        print("reread", keep_reread(Holder(Some(Noisy(10)))))
+
+        val o: &Holder = Holder(Some(Noisy(11)))
+
+        print("other", keep_other_object(o, o))
+        keep_released_name(Holder(Some(Noisy(12))), Keeper(None))
+        print("destructor", keep_destructor(Holder(Some(Noisy(13))), Keeper(Some(Noisy(14)))))
+
+        var t = Towers([None, None, None], 0)
+
+        t.build_tower_at(0, 6)
+        t.move_disks(6, 0, 1)
+        print("towers", t.moves)
+        print("end")
+    """
+
+// The functions of the source lowered beside the standard library, each as its symbol and its text;
+// nothing when the library cannot be found.
+private tko_funcs() -> Buf[(string, string)]
+    var none: Buf[(string, string)] = buf()
+
+    std_root() match
+        Err(_) -> return none
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> return none
+            Ok(units) ->
+                var all: Buf[Program] = buf()
+
+                for item in units
+                    all.push(item)
+
+                val parsed = parse(source_of("test.sysl", tko_source()))
+
+                all.push(parsed.program)
+
+                val done = analyze_bodies(all, host_target())
+
+                if !done.reported.is_empty() then assert(false, done.reported[0].diag.message)
+
+                val whole = program_of(done, "")
+                val promotions = post_analysis_checks(done.an, whole, buf())
+                val lowered = codegen_with_gaps(prune(strip_tests(whole), program_own(all)), host_target(), promotions)
+
+                func_texts(ir_print_module(lowered.0))
+end tko_funcs
+
+// The body of the function written `symbol`: its owned body where it keeps a parameter.
+private tko_ir(fs: Buf[(string, string)], symbol: string) -> string
+    for item in fs
+        if names_as_written(item.0, s"$symbol.owned") then return item.1
+
+    for item in fs
+        if names_as_written(item.0, symbol) then return item.1
+
+    assert(false, s"no function '$symbol'")
+    ""
+end tko_ir
+
+private tko_count(text: string, needle: string) -> int = int(text.count_of(needle))
+
+private tko_shares(text: string) -> int = tko_count(text, "call void @arc.retain(") + tko_count(text, "call void @arc.copy.")
+
+@test("Towers' pop takes both places' counts, and push the pile's")
+tko_towers()
+    val fs = tko_funcs()
+
+    if fs.is_empty()
+        assert(std_root().is_err(), "the standard library is in sight, so the source must lower")
+        return
+
+    val pop = tko_ir(fs, "Towers.pop_disk_from")
+
+    assert_eq(tko_count(pop, "call void @arc."), 0, pop)
+
+    // What is left in push is the old `disk.next` given back, which is no read of the pile.
+    val push = tko_ir(fs, "Towers.push_disk")
+
+    assert_eq(tko_count(push, "call void @arc."), 1, push)
+    assert_eq(tko_shares(push), 0, push)
+
+@test("a whole value, a match payload, a plain reference, a read past a panic and a read in every round take the count")
+tko_taken()
+    val fs = tko_funcs()
+
+    if fs.is_empty()
+        assert(std_root().is_err(), "the standard library is in sight, so the source must lower")
+        return
+
+    for name in ["take_whole", "take_payload", "take_ref", "take_past_panic", "take_each_round"]
+        val ir = tko_ir(fs, name)
+
+        assert_eq(tko_shares(ir), 0, ir)
+
+    // The write's release is gone with the share: the only release left in `take_whole` is the name's
+    // own, at its end.
+    val whole = tko_ir(fs, "take_whole")
+
+    assert_eq(tko_count(whole, "call void @arc.dispose."), 1, whole)
+
+    // Richards' `run_task`: a `var` assigned from the place, whose old value is given back in the
+    // window, and the place written with a field read through a place entry (`unwrap`). The copy left
+    // is the new value's.
+    val unwrapped = tko_ir(fs, "take_unwrapped")
+
+    assert_eq(tko_count(unwrapped, "call void @arc.copy."), 1, unwrapped)
+
+@test("an early return, a one-branch write, a read in a loop, a call, a second read, another object, the name given back and a destructor keep the count")
+tko_kept()
+    val fs = tko_funcs()
+
+    if fs.is_empty()
+        assert(std_root().is_err(), "the standard library is in sight, so the source must lower")
+        return
+
+    for name in ["keep_on_return", "keep_on_maybe", "keep_in_loop", "keep_across_call", "keep_reread",
+                 "keep_other_object", "keep_released_name", "keep_destructor", "keep_assigned"]
+        val ir = tko_ir(fs, name)
+
+        assert(tko_shares(ir) >= 1, s"$name\n$ir")
+
+@test("every shape run on the counted heap: each object dies once, where it did before, and nothing is left live")
+tko_counted_heap()
+    if !lbr_ready() then return
+
+    val prog = lbr_program(tko_source())
+    val out_dir = lbr_temp("sysl-tko-exe")
+
+    force_alloc_counting(true)
+
+    val built = build_native_program(prog, None, None, DefaultOptimization, Some(s"$out_dir/program"))
+
+    force_alloc_counting(false)
+
+    val ran = built match
+        Err(why) -> (failure_text(why), "")
+        Ok(made) ->
+            capture(made, [], "", [], true) match
+                Err(_) -> ("could not be started", "")
+                Ok(o) -> (o.text, o.err.unwrap_or(""))
+
+    lbr_drop([prog, out_dir])
+
+    assert_eq(ran.0, "cleared\ndrop 1\nwhole 1\n" +
+                     "cleared\ndrop 2\npayload 2\n" +
+                     "replaced\ndrop 3\nref 3\ndrop 90\n" +
+                     "cleared\ndrop 4\npast panic 4\n" +
+                     "round 0 5\ndrop 5\nround 1 100\ndrop 100\nround 2 101\ndrop 101\ndrop 102\n" +
+                     "assigned\ndrop 15\nassigned 15\n" +
+                     "unwrapped 21 22 true\n" +
+                     "return 6 6\n" +
+                     "maybe\nmaybe 7 7\n" +
+                     "cleared\ndrop 8\nloop 8\n" +
+                     "clobbered\ncleared\ndrop 9\ncall 9\n" +
+                     "cleared\ndrop 10\nreread 20\n" +
+                     "b cleared\na cleared\ndrop 11\nother 11\n" +
+                     "keeper cleared\ndrop 12\ncleared\n" +
+                     "drop 14\ncleared\ndrop 13\ndestructor 13\n" +
+                     "towers 63\nend\ndrop 7\ndrop 6\n", ran.1)
+    assert(!ran.1.contains("still live"), ran.1)
+
+@test("a read whose window runs into a panic that is taken ends the program with the panic and nothing else")
+tko_panic_taken()
+    if !lbr_ready() then return
+
+    val prog = lbr_program(raw"""
+        struct Noisy
+            id: int
+
+        impl Drop for Noisy
+            drop(self) = print("drop", self.id)
+
+        struct Holder
+            slot: Option[&Noisy]
+
+        id_of(o: Option[&Noisy]) -> int = o match
+            Some(n) -> n.id
+            None -> 0
+
+        take_past_panic(h: &Holder, limit: int) -> int
+            val d = h.slot
+
+            if limit < 0 then panic("a negative limit")
+
+            h.slot = None
+            id_of(d)
+
+        main()
+            val h: &Holder = Holder(Some(Noisy(1)))
+
+            print("before")
+            print(take_past_panic(h, -1))
+        """)
+    val out_dir = lbr_temp("sysl-tko-panic")
+    val built = build_native_program(prog, None, None, DefaultOptimization, Some(s"$out_dir/program"))
+
+    val ran = built match
+        Err(why) -> (failure_text(why), "")
+        Ok(made) ->
+            capture(made, [], "", [], true) match
+                Err(_) -> ("could not be started", "")
+                Ok(o) -> (o.text, o.err.unwrap_or(""))
+
+    lbr_drop([prog, out_dir])
+
+    assert_eq(ran.0, "before\n", ran.1)
+    assert(ran.1.contains("a negative limit"), ran.1)

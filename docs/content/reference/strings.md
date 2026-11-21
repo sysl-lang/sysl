@@ -547,7 +547,12 @@ undefined function 'str'
 ```
 
 A `string` is returned as it is, and a `bool` renders to one of two immortal literals, so neither
-allocates; every other case allocates a fresh buffer. Every number is rendered without the
+allocates; every other case allocates a fresh buffer. A value that renders itself through its
+`Display` or `Debug` writes into 64 bytes of scratch in the rendering's own frame, so a rendering of
+up to 64 bytes allocates only the string it ends in; a longer one moves its bytes to the heap as it
+grows past them, and that storage becomes the string, so a rendering that outgrows the frame once
+still costs one allocation. Nothing points into the frame afterwards, so the string may be returned,
+stored or captured like any other. Every number is rendered without the
 C library. An integer's digits are divided out into a scratch buffer, which is correct even for the
 most negative value because the magnitude is taken in unsigned arithmetic. A float goes through the
 library's [`sysl.fmt.format_real_plain`](/library/fmt/#floats) (or its sibling at the float's width),
@@ -696,6 +701,34 @@ operations already described — `s"a${e}b"` is exactly `"a" + e.to_string() + "
 not a new kind of value, only a concise way to write a concatenation. A hole holds a full expression, which may itself
 interpolate, and an empty literal segment beside a hole is dropped, since it is the identity under
 `+`.
+
+**The concatenation is the meaning; the cost is one string.** A whole interpolation is built in one
+buffer: its text is copied in, a number or a character renders straight into it, a value with a
+`Display` or `Debug` writes itself into it, a nested interpolation's pieces join it, and the string
+comes out once at the end. It starts in the same 64 bytes of frame scratch as any rendering, so an
+interpolation of up to 64 bytes allocates only its result, and a longer one the storage it grew into,
+which becomes the result. No intermediate string is made for each `+`. A hole that can leave the
+expression early, with `?`, is the one exception: there the pieces are joined as written, so that
+nothing built so far is lost on the way out.
+
+```sysl
+struct Point
+    x: int
+    y: int
+
+impl Display for Point
+    display(self, out: *Writer, fmt: FormatSpec) = out.write(f"(${self.x}, ${self.y})".bytes)
+
+val p = Point(3, -4)
+val c = 'é'
+val n: i64 = -9223372036854775807 - 1
+
+print(f"p=${p} c=$c n=$n nested=${f"[${p.x}]"} ok=${true}")
+```
+
+```output
+p=(3, -4) c=é n=-9223372036854775808 nested=[3] ok=true
+```
 
 The form is like Scala's interpolators rather than a `printf`-style format string: the value and the
 text around it stay together where they are read, and the conversion is `to_string` applied at the splice
