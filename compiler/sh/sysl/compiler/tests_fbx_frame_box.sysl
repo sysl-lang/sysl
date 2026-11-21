@@ -1,0 +1,659 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Var}
+import sysl.text.{cstring, Search}
+
+// A `&T` nothing keeps past the frame that builds it is laid in that frame (`stack_box.sysl`,
+// `emit_box.sysl`'s `gen_frame_box`, `reference/memory.md § A box nothing keeps is laid in the
+// frame`): written directly, or answered by a factory whose frame entry lays it in the caller's slot.
+//
+// **The soundness model is the list of ways a box can get out**, each pinned by a cell that must stay
+// on the heap: a store into module storage (`fbx_global`), into a field reached through a reference
+// (`fbx_field`), a return that is not a factory's (`fbx_returned`), a factory's answer the caller keeps
+// (`fbx_factory_kept`), a capture by a closure (`fbx_captured`), a callee that keeps it (`fbx_pushed`),
+// a callee answering it into module storage (`fbx_answer_kept`), a pointer to a local holding it
+// read by a callee that keeps what it reads (`fbx_through_pointer`), a weakening (`fbx_weakened`), a
+// raw count given up (`fbx_into_raw`), a trait object's table (`fbx_erased`), a `break` out of a loop
+// (`fbx_broken`), a holder outliving the loop turn that builds it (`fbx_loop_outer`), and a payload
+// too large for a frame (`fbx_large`). The frame cells cross what is done with a box that stays: a
+// reading callee, a `&self` method writing it, a callee answering it, a factory, a generic factory
+// instantiated twice, a loop body's local, an enum payload, a box holding a heap box, and a destructor
+// that still runs at the end of the scope.
+//
+// Each cell is run on the counted heap with `SYSL_COUNT_BYTES`: a frame cell allocates NO bytes, a heap
+// cell some, and every cell prints what the heap would have and gives back everything it took. The
+// frame cells run again under AddressSanitizer.
+//
+// Skipped cells, and why: an `async` body never lays a box (`frame_shaped`) and a body that jumps to
+// its own entry neither, the same test as the closure boxes' (`tests_cfb_closure_frame_box.sysl`);
+// a precompiled `.syslib` callee is answered from the same body a program's own is; codegen units and
+// a bare-metal target change no decision, which is made on the typed tree before either is asked.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private struct FbxRun
+    out: string
+    err: string
+    bytes: long
+end FbxRun
+
+// The program built on the counted heap and run with `SYSL_COUNT_BYTES`, or with `flags` handed to
+// clang.
+private fbx_run(text: string, flags: string) -> FbxRun
+    val root = make_temp_dir("sysl-fbx").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    val exe = s"$root/built"
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+        val v = cstring(flags)
+
+        fbx_c_setenv(n.ptr, v.ptr, 1)
+    end if
+
+    force_alloc_counting(flags == "")
+
+    val made = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe))
+
+    force_alloc_counting(false)
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+
+        fbx_c_unsetenv(n.ptr)
+    end if
+
+    made match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return FbxRun(failure_text(why), "", -1)
+        Ok(_) -> ()
+
+    val ran = capture(exe, [], "", [Var(alloc_bytes_variable(), "1")], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    ran match
+        Err(_) -> FbxRun("could not be started", "", -1)
+        Ok(o) -> FbxRun(o.text, o.err.unwrap_or(""), alloc_bytes_reported(o.err.unwrap_or("")))
+end fbx_run
+
+private extern "setenv" fbx_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" fbx_c_unsetenv(name: *u8) -> int
+
+// The program printed `want`, gave back everything it took, and allocated nothing where its box is
+// `framed` -- something where it is not.
+private fbx_check(name: string, text: string, want: string, framed: bool)
+    val got = fbx_run(text, "")
+
+    assert_eq(got.out, want)
+    assert_eq(alloc_count_reported(got.err), 0)
+
+    if framed then assert(got.bytes == 0, s"$name allocated ${got.bytes} bytes:\n${got.err}")
+    else assert(got.bytes > 0, s"$name allocated nothing, so its box was laid in the frame")
+end fbx_check
+
+// The LLVM text of a program, or its report.
+private fbx_ir(text: string) -> string
+    val root = make_temp_dir("sysl-fbx").unwrap()
+
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end fbx_ir
+
+private fbx_lines_with(ir: string, part: string) -> int
+    var n = 0
+
+    for line in lines_of(ir).view()
+        if line.contains(part) then n += 1
+
+    n
+end fbx_lines_with
+
+// -- the cells that stay in the frame ---------------------------------------------------------------
+
+private const fbx_read: string = raw"""
+    struct Point
+        x: int
+        y: int
+
+    sum(p: &Point) -> int = p.x + p.y
+
+    main()
+        val p: &Point = Point(3, 4)
+
+        print(sum(p))
+    """
+
+private const fbx_method: string = raw"""
+    struct Counter
+        n: int
+
+        bump(&self) = self.n += 1
+
+    main()
+        val c: &Counter = Counter(1)
+
+        c.bump()
+        c.bump()
+        print(c.n)
+    """
+
+private const fbx_answered: string = raw"""
+    struct Acc
+        n: int
+
+    same(a: &Acc) -> &Acc = a
+
+    main()
+        val a: &Acc = Acc(2)
+        val b = same(a)
+
+        print(b.n)
+    """
+
+private const fbx_factory: string = raw"""
+    struct Counter
+        n: int
+
+    counter(start: int) -> &Counter = Counter(start)
+
+    main()
+        val c = counter(5)
+
+        c.n += 2
+        print(c.n)
+    """
+
+private const fbx_generic_factory: string = raw"""
+    struct Cell[T]
+        v: T
+
+    cell[T](v: T) -> &Cell[T] = Cell(v)
+
+    main()
+        val a = cell(3)
+        val b = cell("hi")
+
+        print(a.v, b.v)
+    """
+
+private const fbx_loop: string = raw"""
+    struct Acc
+        n: int
+
+    total(a: &Acc) -> int = a.n
+
+    counter(start: int) -> &Acc = Acc(start)
+
+    main()
+        var sum = 0
+
+        for i in 0..<4
+            val a: &Acc = Acc(i)
+            val b = counter(i * 10)
+
+            sum += total(a) + total(b)
+
+        print(sum)
+    """
+
+private const fbx_enum: string = raw"""
+    enum Shape
+        Circle(r: int)
+        Square(s: int)
+
+    area(s: &Shape) -> int = *s match
+        Circle(r) -> 3 * r * r
+        Square(k) -> k * k
+
+    main()
+        val s: &Shape = Circle(2)
+
+        print(area(s))
+    """
+
+// `a` stays in the frame while `b`, stored into it through a parameter, goes to the heap: the frame
+// box's hook gives `b` back.
+private const fbx_holds_heap: string = raw"""
+    struct Node
+        v: int
+        next: Option[&Node]
+
+    link(a: &Node, b: &Node) = a.next = Some(b)
+
+    main()
+        val a: &Node = Node(1, None)
+        val b: &Node = Node(2, None)
+
+        link(a, b)
+        print(a.next.unwrap().v)
+    """
+
+private const fbx_destructor: string = raw"""
+    struct Res
+        n: int
+
+    impl Drop for Res
+        drop(self) = print("closed", self.n)
+
+    read(r: &Res) -> int = r.n
+
+    main()
+        val r: &Res = Res(1)
+
+        print(read(r))
+        print("end")
+    """
+
+@test("a box read, written through '&self', answered back, or built by a factory allocates nothing")
+fbx_frame_cells_allocate_nothing()
+    if !enm_ready() then return
+
+    fbx_check("fbx_read", fbx_read, "7\n", true)
+    fbx_check("fbx_method", fbx_method, "3\n", true)
+    fbx_check("fbx_answered", fbx_answered, "2\n", true)
+    fbx_check("fbx_factory", fbx_factory, "7\n", true)
+    fbx_check("fbx_generic_factory", fbx_generic_factory, "3 hi\n", true)
+    fbx_check("fbx_loop", fbx_loop, "66\n", true)
+    fbx_check("fbx_enum", fbx_enum, "12\n", true)
+    fbx_check("fbx_destructor", fbx_destructor, "1\nend\nclosed 1\n", true)
+end fbx_frame_cells_allocate_nothing
+
+@test("a frame box holding a heap box gives it back at its last release")
+fbx_frame_box_holds_a_heap_box()
+    if !enm_ready() then return
+
+    fbx_check("fbx_holds_heap", fbx_holds_heap, "2\n", false)
+
+    // One box on the heap, `b`; `a` is laid in the frame. `Node` keeps its compact layout, and its
+    // release knows a frame box by the mark its count comes back down to.
+    val ir = fbx_ir(fbx_holds_heap)
+
+    assert_eq(fbx_lines_with(ir, "call ptr @malloc"), 1)
+    assert_eq(fbx_lines_with(ir, "%arc.Node = type { i64, %struct.Node }"), 1)
+    assert_eq(fbx_lines_with(ir, "store i64 2305843009213693953, ptr"), 1)
+    assert_eq(fbx_lines_with(ir, ", 2305843009213693952"), 1)
+end fbx_frame_box_holds_a_heap_box
+
+// A destructor makes the payload's box the full header, laid in the frame with a hook that runs the
+// destructor and frees nothing.
+@test("a frame box of a type with a destructor has a hook that frees nothing")
+fbx_frame_box_with_a_destructor_has_a_frame_hook()
+    if xvr_no_library() then return
+
+    val ir = fbx_ir(fbx_destructor)
+
+    assert_eq(fbx_lines_with(ir, "call ptr @malloc"), 0)
+    assert_eq(fbx_lines_with(ir, "define private void @arc.dropframe.Res("), 1)
+end fbx_frame_box_with_a_destructor_has_a_frame_hook
+
+private const fbx_view_read: string = raw"""
+    struct Grid
+        rows: [2][3]int
+
+    total(xs: []int) -> int
+        var t = 0
+
+        for x in xs
+            t += x
+
+        t
+
+    main()
+        val g: &Grid = Grid([[1, 2, 3], [4, 5, 6]])
+
+        print(total(g.rows[1][0..<2]))
+    """
+
+// A view of an array inside a box owns the box, counted: returning one keeps the box alive.
+private const fbx_view_returned: string = raw"""
+    struct Grid
+        rows: [2][3]int
+
+    pull() -> []int
+        val g: &Grid = Grid([[1, 2, 3], [4, 5, 6]])
+
+        g.rows[1][0..<2]
+
+    main()
+        val s = pull()
+
+        print(s[0], s[1])
+    """
+
+private const fbx_aligned: string = raw"""
+    @align(64)
+    struct Line
+        a: u64
+
+    main()
+        var l: Line
+
+        l.a = 7
+
+        val b: &Line = l
+
+        print(usize(&*b) % 64, b.a)
+    """
+
+@test("a view of a box's array read by a callee stays in the frame; one returned keeps its box on the heap")
+fbx_views_of_a_box()
+    if !enm_ready() then return
+
+    fbx_check("fbx_view_read", fbx_view_read, "9\n", true)
+    fbx_check("fbx_view_returned", fbx_view_returned, "4 5\n", false)
+end fbx_views_of_a_box
+
+@test("a frame box of a raised boundary lands on it")
+fbx_aligned_frame_box()
+    if !enm_ready() then return
+
+    fbx_check("fbx_aligned", fbx_aligned, "0 7\n", true)
+
+    val got = fbx_run(fbx_aligned, "-fsanitize=address -g")
+
+    assert_eq(got.out, "0 7\n")
+end fbx_aligned_frame_box
+
+@test("and under AddressSanitizer: instrumented, and nothing read outside a live frame")
+fbx_frame_cells_run_clean_under_asan()
+    if !enm_ready() then return
+
+    for item in [(fbx_read, "7\n"), (fbx_factory, "7\n"), (fbx_loop, "66\n"), (fbx_holds_heap, "2\n"),
+                 (fbx_destructor, "1\nend\nclosed 1\n"), (fbx_generic_factory, "3 hi\n")]
+        val got = fbx_run(item.0, "-fsanitize=address -g")
+
+        assert_eq(got.out, item.1)
+        assert_eq(got.err, "")
+    end for
+end fbx_frame_cells_run_clean_under_asan
+
+@test("a box laid in the frame is an alloca with no malloc; a factory's call reaches its frame entry")
+fbx_frame_cells_are_allocas()
+    if xvr_no_library() then return
+
+    val read = fbx_ir(fbx_read)
+
+    assert_eq(fbx_lines_with(read, "call ptr @malloc"), 0)
+    assert_eq(fbx_lines_with(read, "= alloca %arc."), 1)
+
+    // The ordinary entry still builds on the heap, for a caller that keeps the answer.
+    val made = fbx_ir(fbx_factory)
+
+    assert_eq(fbx_lines_with(made, "-frame(ptr %frame$slot, i32 %start.param)"), 1)
+    assert_eq(fbx_lines_with(made, "-frame(ptr %t"), 1)
+    assert_eq(fbx_lines_with(made, "call ptr @malloc"), 1)
+end fbx_frame_cells_are_allocas
+
+// -- the ways out, each on the heap ------------------------------------------------------------------
+
+private const fbx_global: string = raw"""
+    struct Point
+        x: int
+
+    var kept: Option[&Point] = None
+
+    main()
+        val p: &Point = Point(5)
+
+        kept = Some(p)
+        print(kept.unwrap().x)
+        kept = None
+    """
+
+private const fbx_returned: string = raw"""
+    struct Point
+        x: int
+
+    wrap(x: int) -> Option[&Point]
+        val p: &Point = Point(x)
+
+        Some(p)
+
+    main()
+        print(wrap(4).unwrap().x)
+    """
+
+private const fbx_factory_kept: string = raw"""
+    struct Counter
+        n: int
+
+    counter(start: int) -> &Counter = Counter(start)
+
+    var kept: Option[&Counter] = None
+
+    main()
+        val c = counter(5)
+
+        kept = Some(c)
+        print(kept.unwrap().n)
+        kept = None
+    """
+
+private const fbx_captured: string = raw"""
+    struct Point
+        x: int
+
+    apply(f: &Fn() -> int) -> int = f()
+
+    main()
+        val p: &Point = Point(6)
+
+        print(apply(() -> p.x))
+    """
+
+private const fbx_pushed: string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct Point
+        x: int
+
+    main()
+        var all: Buf[&Point] = buf()
+        val p: &Point = Point(7)
+
+        all.push(p)
+        print(all[0].x)
+    """
+
+private const fbx_answer_kept: string = raw"""
+    struct Acc
+        n: int
+
+    same(a: &Acc) -> &Acc = a
+
+    var kept: Option[&Acc] = None
+
+    main()
+        val a: &Acc = Acc(2)
+
+        kept = Some(same(a))
+        print(kept.unwrap().n)
+        kept = None
+    """
+
+private const fbx_through_pointer: string = raw"""
+    struct Acc
+        n: int
+
+    struct Holder
+        a: &Acc
+
+    var kept: Option[&Acc] = None
+
+    steal(h: *Holder) = kept = Some(h.a)
+
+    main()
+        var h = Holder(Acc(4))
+
+        steal(&h)
+        print(kept.unwrap().n)
+        kept = None
+    """
+
+private const fbx_weakened: string = raw"""
+    struct Acc
+        n: int
+
+    main()
+        val a: &Acc = Acc(3)
+        val w: weak Acc = a
+
+        print(a.n, w.get().is_some())
+    """
+
+private const fbx_into_raw: string = raw"""
+    import sysl.raw.from_raw
+
+    struct Db
+        n: int
+
+    open(n: int) -> *Db
+        val d: &Db = Db(n)
+
+        d.into_raw()
+
+    close(p: *Db)
+        val d: &Db = from_raw(p)
+
+    main()
+        val p = open(5)
+
+        print(p.n)
+        close(p)
+    """
+
+private const fbx_erased: string = raw"""
+    trait Shape
+        area(self) -> int
+
+    struct Square
+        s: int
+
+    impl Shape for Square
+        area(self) -> int = self.s * self.s
+
+    main()
+        val s: &Shape = Square(3)
+
+        print(s.area())
+    """
+
+private const fbx_broken: string = raw"""
+    struct Acc
+        n: int
+
+    main()
+        var k = 0
+
+        val found = loop
+            k += 1
+
+            val a: &Acc = Acc(k * 3)
+
+            if k == 3 then break a
+
+        print(found.n)
+    """
+
+private const fbx_loop_outer: string = raw"""
+    struct Acc
+        n: int
+
+    main()
+        var last: &Acc = Acc(0)
+
+        for i in 1..<4
+            last = Acc(i)
+
+        print(last.n)
+    """
+
+private const fbx_large: string = raw"""
+    struct Big
+        data: [400]int
+
+    first(b: &Big) -> int = b.data[0]
+
+    main()
+        val b: &Big = Big([7; 400])
+
+        print(first(b))
+    """
+
+@test("every way out keeps its box on the heap, and each prints what it did and gives back all it took")
+fbx_ways_out_stay_on_the_heap()
+    if !enm_ready() then return
+
+    fbx_check("fbx_global", fbx_global, "5\n", false)
+    fbx_check("fbx_returned", fbx_returned, "4\n", false)
+    fbx_check("fbx_factory_kept", fbx_factory_kept, "5\n", false)
+    fbx_check("fbx_captured", fbx_captured, "6\n", false)
+    fbx_check("fbx_pushed", fbx_pushed, "7\n", false)
+    fbx_check("fbx_answer_kept", fbx_answer_kept, "2\n", false)
+    fbx_check("fbx_through_pointer", fbx_through_pointer, "4\n", false)
+    fbx_check("fbx_weakened", fbx_weakened, "3 true\n", false)
+    fbx_check("fbx_into_raw", fbx_into_raw, "5\n", false)
+    fbx_check("fbx_erased", fbx_erased, "9\n", false)
+    fbx_check("fbx_broken", fbx_broken, "9\n", false)
+    fbx_check("fbx_loop_outer", fbx_loop_outer, "3\n", false)
+    fbx_check("fbx_large", fbx_large, "7\n", false)
+end fbx_ways_out_stay_on_the_heap
+
+// A destructor that kept its own address would keep a slot of a frame that is gone. It cannot be
+// written: `drop` is reached through the hook, which sees no body, so the keep is refused where it is
+// written -- and `drop(self)` is handed a copy, never the box. The frame walk asks the destructor's
+// summary all the same (`site_payload_ok`).
+@test("a destructor cannot keep its own address, so a frame box's slot is never reached after it")
+fbx_keeping_destructor_is_refused()
+    if !enm_ready() then return
+
+    val got = fbx_run(raw"""
+        struct Res
+            n: int
+
+        var seen: Option[*Res] = None
+
+        impl Drop for Res
+            drop(*self) = seen = Some(self)
+
+        main()
+            val r: &Res = Res(4)
+
+            print(r.n)
+        """, "")
+
+    assert(got.out.contains("'drop' keeps its parameter 'self'"), got.out)
+end fbx_keeping_destructor_is_refused
+
+// The walk answers "escapes" for a callee still being worked out, so a recursive reader keeps its
+// argument's box on the heap: an imprecision, never a wrong answer.
+@test("a box handed to a recursive callee stays on the heap")
+fbx_recursive_callee_stays_on_the_heap()
+    if !enm_ready() then return
+
+    fbx_check("fbx_recursive", raw"""
+        struct Acc
+            n: int
+
+        depth(a: &Acc, k: int) -> int = if k == 0 then a.n else 1 + depth(a, k - 1)
+
+        main()
+            val a: &Acc = Acc(2)
+
+            print(depth(a, 3))
+        """, "5\n", false)
+end fbx_recursive_callee_stays_on_the_heap

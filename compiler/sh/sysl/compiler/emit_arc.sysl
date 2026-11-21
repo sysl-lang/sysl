@@ -562,6 +562,10 @@ private release_compact(e: *Emit, payload: Type, p: Val)
                         args))
 end release_compact
 
+// The count a compact box laid in a frame comes to once its last share is given back: far above any
+// heap box's, and far below a laid-down box's `1 << (word - 2)`.
+frame_mark(e: *Emit) -> long = long(1) << long(e.word_bits - 3)
+
 // The body of `arc.release.<T>` for a compact `T`: a count given back, and at zero the teardown the
 // drain would have made, found by the type rather than through a hook.
 //
@@ -606,7 +610,34 @@ private gen_compact_release(e: *Emit, payload: Type)
     emit(e, InBin(n, OpSub, word, c, VInt(from_int(1))))
     emit(e, InStore(word, n, p, AccPlain, None))
     emit(e, InIntCmp(z, IEq, word, n, VInt(from_int(0))))
-    emit_term(e, InCondBr(z, zero, live))
+
+    // **A box of this payload laid in a frame** (`stack_box.sysl`) starts one past `frame_mark`, so the
+    // release that gives back its last share leaves the mark rather than zero: its payload is let go of
+    // and nothing is freed. No heap box's count ever reaches the mark, and a laid-down one's sits far
+    // above it.
+    if e.stack.payloads.has(mangle(payload))
+        val marked = fresh_label(e, "arc.marked")
+        val framed = fresh_label(e, "arc.framed")
+        val m = fresh_reg(e)
+
+        emit_term(e, InCondBr(z, zero, marked))
+        emit_label(e, marked)
+        emit(e, InIntCmp(m, IEq, word, n, VInt(from_int(frame_mark(e)))))
+        emit_term(e, InCondBr(m, framed, live))
+        emit_label(e, framed)
+
+        val fa = fresh_reg(e)
+        var fidx: Buf[IrArg] = buf()
+
+        fidx.push(ir_arg(l_i32(), VInt(from_int(0))))
+        fidx.push(ir_arg(l_i32(), VInt(from_int(long(box_payload_field(e, payload))))))
+        emit(e, InGep(fa, bn, p, fidx))
+        walk_slot(e, payload, fa, false)
+        emit_term(e, InBr(live))
+    else
+        emit_term(e, InCondBr(z, zero, live))
+    end if
+
     emit_label(e, zero)
     emit(e, InStore(LPtr, VNull, p, AccPlain, None))
     emit(e, InStore(LPtr, p, list, AccPlain, None))
@@ -1965,6 +1996,10 @@ set_promoted(e: *Emit, pr: Promotions, name: string)
 
     for at in pr.framed_for(name)
         e.framed_lits.push(at)
+
+    // The boxes and the factory calls it lays in its frame (`stack_box.sysl`).
+    e.framed_boxes = e.stack.sites.get(name).unwrap_or(buf())
+    e.framed_calls = e.stack.calls.get(name).unwrap_or(buf())
 end set_promoted
 
 // Whether the array literal at this span is laid in the frame of the body being lowered.

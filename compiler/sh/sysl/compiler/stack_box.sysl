@@ -1,0 +1,894 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map, Set, set}
+
+// **A `&T` nothing keeps past its frame is laid in that frame** (`reference/memory.md § A box nothing
+// keeps is laid in the frame`).
+//
+// A construction written where a `&T` is expected puts the object on the heap. Where the box provably
+// never leaves the frame that builds it -- it is not stored anywhere but a local of that frame, not
+// returned, not captured, not handed to a parameter that may keep it, not weakened, not given up as a
+// raw count, not put behind a table or a callable that says nothing of what it keeps -- it is laid in
+// a slot of the frame instead (`emit_box.sysl`'s `gen_frame_box`): the header and the payload a heap
+// box has, counted exactly as a heap box is, with a hook that lets go of what the payload holds and
+// runs its destructor and gives no storage back. Nothing can tell the two apart but the allocator.
+//
+// **Two kinds of site are followed.** A `TBox` the body writes, keyed by its payload's span, and a
+// call of a **factory** -- a function every way out of which may answer one box it built and kept
+// nowhere else, like `vector() -> &Vector[E] = Vector(slot_storage(0), 0, 0)` -- keyed by the call's
+// span. A factory call laid in the frame reaches the factory's **frame entry** (`<symbol>-frame`),
+// the same body taking one more parameter first: the caller's slot, which that one box is laid in.
+//
+// **The question is a may-escape question, so every unknown answers "escapes".** A box is followed
+// through the locals that may hold it (a fixed point), each value built around it, each answer that
+// may be it. The one place a holder may be is a local of the frame, reached without a dereference;
+// anything else -- a field through a pointer or a reference, module storage, a buffer's slot, another
+// box -- is an escape. A call keeps what it is handed unless its body, walked the same way with the
+// parameter as the thing followed, never lets the parameter out but by answering it (`summary`); a
+// call with no body (an `extern`, a table, a callable, a function pointer), a task, recursion still
+// being worked out, and every node this walk does not know answer "escapes".
+//
+// **A loop builds into the same slot every turn**, so a box built in a loop's body may be held only by
+// locals declared inside that loop's body, which are gone by the next turn.
+//
+// **A raw pointer into the payload is not followed**: it holds no count, so whatever reads through it
+// after the box is gone reads freed storage on the heap exactly as it reads a dead slot here. What a
+// raw pointer to a local HOLDING the box is followed, since it reaches the box.
+
+// What the walk found for a whole program: per body, the payload spans of the boxes it lays in its
+// frame and the spans of the factory calls it lays there; per factory, the payload span of the box
+// its frame entry lays in the caller's slot; and every payload so laid, whose compact release
+// (`emit_arc.sysl`'s `gen_compact_release`) has to know a frame box's count from a heap box's.
+struct StackBoxes
+    sites: Map[string, Buf[Span]]
+    calls: Map[string, Buf[Span]]
+    entries: Map[string, Span]
+    payloads: Set[string]
+end StackBoxes
+
+no_stack_boxes() -> StackBoxes = StackBoxes(map(), map(), map(), set())
+
+// The largest payload laid in a frame. A frame box in a recursive body costs its payload in every
+// frame of the recursion, so a big one stays on the heap.
+private stack_box_limit() -> usize = 1024
+
+// Every body's frame boxes, and the factories whose frame entries some caller reaches.
+stack_boxes(e: *Emit, p: TProgram) -> StackBoxes
+    var out = no_stack_boxes()
+    val cx: &BoxCx = BoxCx(map(), p.funcs, map(), set(), map(), set(), map())
+
+    for i in 0..<p.funcs.len()
+        cx.index.put(p.funcs[i].name, i)
+
+    for item in e.destructors
+        cx.dtors.add(item.0)
+
+    // A payload whose own destructor may let the payload's address out is never laid in a frame: the
+    // destructor runs as the last count goes, and what it kept would outlive the slot.
+    for item in e.destructors
+        cx.dtor_fns.put(item.0, item.1)
+
+    for f in p.funcs
+        if !factory_shaped(p, f) || drops_a_param(e, f) then continue
+
+        for site in box_sites(f)
+            if !site_payload_ok(e, cx, site.1) || mangle(site.1) != mangle(ref_inner(f.ret_ty)) then continue
+
+            val w = follow_site(cx, f, site.0, false, true)
+
+            if !w.escaped && w.answers
+                cx.factories.put(f.name, site.0)
+                break
+            end if
+        end for
+    end for
+
+    for f in p.funcs
+        if !frame_shaped(f) then continue
+
+        var good: Buf[Span] = buf()
+        var bad: Buf[Span] = buf()
+        var good_calls: Buf[Span] = buf()
+
+        for site in box_sites(f)
+            val laid = site_payload_ok(e, cx, site.1) && !follow_site(cx, f, site.0, false, false).escaped
+
+            if laid then good.push(site.0) else bad.push(site.0)
+            if laid then out.payloads.add(mangle(site.1))
+        end for
+
+        for site in factory_calls(cx, f)
+            if follow_site(cx, f, site.0, true, false).escaped then continue
+
+            good_calls.push(site.0)
+            out.payloads.add(mangle(ref_inner(site_ret(cx, site.1))))
+
+            if !out.entries.has(site.1) then out.entries.put(site.1, cx.factories.get(site.1).unwrap())
+        end for
+
+        // Two boxes written at one span are told apart by nothing the emitter sees: either both are
+        // laid in the frame or neither is.
+        var kept: Buf[Span] = buf()
+
+        for s in good
+            if !holds_span(bad, s) && !holds_span(kept, s) then kept.push(s)
+
+        if !kept.is_empty() then out.sites.put(f.name, kept)
+        if !good_calls.is_empty() then out.calls.put(f.name, good_calls)
+    end for
+
+    out
+end stack_boxes
+
+// Takes back every factory call whose factory cannot have a frame entry after all -- one with a
+// parameter lent by address or read where it arrived, which the entry's convention does not take
+// (`codegen.sysl` settles those after the boxes are laid out).
+drop_unentered(e: *Emit, p: TProgram, sb: StackBoxes) -> StackBoxes
+    var gone: Set[string] = set()
+
+    for f in p.funcs
+        if !sb.entries.has(f.name) then continue
+
+        for j in 0..<f.params.len()
+            if e.lent_params.has(owned_key(f.name, j)) || e.in_place.has(f.name + "\n" + f.params[j].0) then
+                gone.add(f.name)
+    end for
+
+    if gone.is_empty() then return sb
+
+    var calls: Map[string, Buf[Span]] = map()
+
+    for f in p.funcs
+        sb.calls.get(f.name) match
+            Some(spans) ->
+                var left: Buf[Span] = buf()
+
+                for s in spans
+                    if !called_at(f, s, gone) then left.push(s)
+
+                if !left.is_empty() then calls.put(f.name, left)
+            None -> ()
+    end for
+
+    var entries: Map[string, Span] = map()
+
+    for f in p.funcs
+        if sb.entries.has(f.name) && !gone.has(f.name) then entries.put(f.name, sb.entries.get(f.name).unwrap())
+
+    StackBoxes(sb.sites, calls, entries, sb.payloads)
+end drop_unentered
+
+// Whether the call at `at` in `f` names one of `names`.
+private called_at(f: TFunc, at: Span, names: Set[string]) -> bool
+    val hit: &SbFlag = SbFlag(false)
+
+    walk_block_stmts(f.body, expr_walk(true, x -> *x.kind match
+        TCall(name, _, _, _) -> if x.span == at && names.has(name) then hit.yes = true
+        _ -> ()))
+
+    hit.yes
+end called_at
+
+private struct SbFlag
+    yes: bool
+
+// The frame entry of a factory: the symbol it is defined and called at, local to the module. No
+// function's own symbol holds a `-` (`zero_entry.sysl`).
+frame_symbol(e: *Emit, name: string) -> string = symbol_of(e, name) + "-frame"
+
+// The name of the frame entry's first parameter: the caller's slot.
+frame_slot_param() -> string = "frame$slot"
+
+// -- which bodies and which payloads ---------------------------------------------------------------
+
+// A body whose frame may hold a box: one that is its own frame for as long as it runs. A task's frame
+// is laid out by the coroutine split, which keeps no slot across an `await`; a body that jumps back to
+// its own entry or becomes another reuses the frame its slots are in.
+private frame_shaped(f: TFunc) -> bool =
+    !f.ghost && !f.marks.is_async() && tail_calls_of(f).is_empty()
+
+// A body that may have a frame entry: one whose callers all reach it by a direct call the compiler
+// writes, which the frame entry can then stand in for.
+private factory_shaped(p: TProgram, f: TFunc) -> bool
+    if !frame_shaped(f) || f.variadic || f.exported.is_some() || f.section.is_some() || f.conv.is_some() then
+        return false
+    if f.variant.is_some() || f.marks.track_caller || is_closure_body(f) then return false
+    if !f.requires.is_empty() || !f.ensures.is_empty() || !f.olds.is_empty() then return false
+    if !f.internal && holds_string(p.precompiled, f.name) then return false
+
+    for item in f.params
+        if underlying(item.1) == VaList then return false
+
+    underlying(f.ret_ty) match
+        Ref(_, sync) -> !sync
+        _ -> false
+end factory_shaped
+
+// A `@unique` value with a destructor is handed over or read where it lies; the frame entry, owning
+// nothing, would do neither (`emit_unique.sysl`).
+private drops_a_param(e: *Emit, f: TFunc) -> bool
+    for item in f.params
+        if value_drops(e, item.1) then return true
+
+    false
+end drops_a_param
+
+// A payload that may be laid in a frame: small, and whose destructor, where it has one, keeps nothing
+// of what it is handed.
+private site_payload_ok(e: *Emit, cx: &BoxCx, inner: Type) -> bool
+    if e.layout.size(inner) > stack_box_limit() then return false
+
+    cx.dtor_fns.get(mangle(inner)) match
+        Some(name) -> !summary(cx, name, 0, 1).0
+        None -> true
+end site_payload_ok
+
+// The boxes a body writes, each with its payload's type, keyed by the payload's span. A `&sync` box
+// may be held by another domain, and a closure literal's box is decided where its capture mode is
+// (`closure_mode.sysl`).
+private box_sites(f: TFunc) -> Buf[(Span, Type)]
+    val out: &SbSites = SbSites(buf())
+
+    walk_block_stmts(f.body, expr_walk(true, x -> *x.kind match
+        TBox(v, ref_ty) -> underlying(ref_ty) match
+            Ref(inner, sync) ->
+                if !sync && !is_closure_literal(texpr_type(v)) then out.items.push((v.span, *inner))
+            _ -> ()
+        _ -> ()))
+
+    out.items
+end box_sites
+
+private struct SbSites
+    items: Buf[(Span, Type)]
+
+// The calls of factories a body makes, each with the factory's name, keyed by the call's span.
+private factory_calls(cx: &BoxCx, f: TFunc) -> Buf[(Span, string)]
+    val out: &SbCalls = SbCalls(buf())
+
+    walk_block_stmts(f.body, expr_walk(true, x -> *x.kind match
+        TCall(name, _, _, _) -> if cx.factories.has(name) then out.items.push((x.span, name))
+        _ -> ()))
+
+    out.items
+end factory_calls
+
+private struct SbCalls
+    items: Buf[(Span, string)]
+
+private site_ret(cx: &BoxCx, name: string) -> Type = cx.funcs[cx.index.get(name).unwrap()].ret_ty
+
+private holds_span(xs: Buf[Span], s: Span) -> bool
+    for x in xs
+        if x == s then return true
+
+    false
+end holds_span
+
+// Whether a value of this type can hold a count or an address, and so a box: a number cannot.
+private may_carry(t: Type) -> bool = underlying(t) match
+    Ref(_, _) -> true
+    Weak(_) -> true
+    Slice(_, _) -> true
+    Str -> true
+    Ptr(_, _) -> true
+    Trait(_, _, _) -> true
+    Abstract(_, _) -> true
+    Unknown -> true
+    Volatile(inner) -> may_carry(*inner)
+    Array(_, elem) -> may_carry(*elem)
+    Vector(_, elem) -> may_carry(*elem)
+    Struct(d) ->
+        if d.base == TaskBase then return true
+
+        for item in d.fields
+            if may_carry(item.1) then return true
+
+        false
+    Results(parts) ->
+        for item in parts.fields
+            if may_carry(item.1) then return true
+
+        false
+    Enum(d) ->
+        for v in d.variants
+            for field in v.fields
+                if may_carry(field.1) then return true
+
+        false
+    _ -> false
+
+private is_ref_type(t: Type) -> bool = underlying(t) match
+    Ref(_, _) -> true
+    _ -> false
+
+private is_sync_ref(t: Type) -> bool = underlying(t) match
+    Ref(_, sync) -> sync
+    _ -> false
+
+// -- the walk ----------------------------------------------------------------------------------------
+
+// What the walks of one program share: the bodies by name, each parameter's answer once worked out
+// (`summary`), the functions being worked out now, and the factories found.
+private struct BoxCx
+    index: Map[string, usize]
+    funcs: Buf[TFunc]
+    memo: Map[string, (bool, bool)]
+    busy: Set[string]
+    factories: Map[string, Span]
+    dtors: Set[string]
+    dtor_fns: Map[string, string]
+end BoxCx
+
+// One walk of one body, following one thing: a site of this body (`site`, a box's payload span or a
+// factory call's span) or a parameter (`param`). `holders` is every local that may hold it; `homes`
+// the loops each local is declared in, as `,1,4,`; `site_loop` the innermost loop the site is built
+// in (-1 for none). `answers` is set where a way out may answer it, which is an escape only for a
+// site that is not its factory's.
+private struct BoxWalk
+    cx: &BoxCx
+    site: Span
+    call_site: bool
+    param: bool
+    factory: bool
+    holders: Set[string]
+    refs: Set[string]
+    homes: Map[string, string]
+    loops: Buf[int]
+    next_loop: int
+    site_loop: int
+    escaped: bool
+    answers: bool
+    changed: bool
+
+    hold(*self, name: string)
+        if !self.holders.has(name)
+            self.holders.add(name)
+            self.changed = true
+    end hold
+
+    declare(*self, name: string)
+        var text = ","
+
+        for l in self.loops
+            text = text + s"$l,"
+
+        self.homes.put(name, text)
+    end declare
+
+    enter_loop(*self)
+        self.loops.push(self.next_loop)
+        self.next_loop += 1
+    end enter_loop
+
+    leave_loop(*self)
+        _ = self.loops.pop()
+    end leave_loop
+end BoxWalk
+
+// Follows a site of `f`, or (with `param` set to the parameter's name through `follow_param`) a
+// parameter, to a fixed point over the locals that may hold it.
+private follow_site(cx: &BoxCx, f: TFunc, site: Span, call_site: bool, factory: bool) -> &BoxWalk
+    val w: &BoxWalk = BoxWalk(cx, site, call_site, false, factory, set(), set(), map(), buf(), 0, -1, false,
+                              false, true)
+
+    run_walk(w, f)
+    w
+end follow_site
+
+private follow_param(cx: &BoxCx, f: TFunc, j: usize) -> &BoxWalk
+    val w: &BoxWalk = BoxWalk(cx, span_zero(), false, true, false, set(), set(), map(), buf(), 0, -1, false,
+                              false, true)
+
+    w.holders.add(f.params[j].0)
+    run_walk(w, f)
+    w
+end follow_param
+
+private run_walk(w: &BoxWalk, f: TFunc)
+    for item in f.params
+        w.homes.put(item.0, ",")
+
+    while w.changed && !w.escaped
+        w.changed = false
+        w.next_loop = 0
+        w.loops.clear()
+
+        if sb_block(w, f.body) then sb_returned(w)
+    end while
+
+    // A loop builds into one slot every turn: every holder has to be gone by the next.
+    if !w.escaped && w.site_loop >= 0
+        val mark = s",${w.site_loop},"
+
+        for name in w.holders
+            if !w.homes.get(name).unwrap_or("").contains(mark) then w.escaped = true
+    end if
+end run_walk
+
+private sb_escape(w: &BoxWalk) = w.escaped = true
+
+private sb_returned(w: &BoxWalk) = if w.param || w.factory then w.answers = true else w.escaped = true
+
+private sb_block(w: &BoxWalk, b: TBlock) -> bool
+    for s in b.stmts
+        sb_stmt(w, s)
+
+    b.result.is_some() && sb_carry(w, b.result.unwrap())
+end sb_block
+
+private sb_opt_block(w: &BoxWalk, b: Option[TBlock]) -> bool = b.is_some() && sb_block(w, b.unwrap())
+
+private sb_stmts(w: &BoxWalk, stmts: Buf[TStmt])
+    for s in stmts
+        sb_stmt(w, s)
+end sb_stmts
+
+private sb_stmt(w: &BoxWalk, s: TStmt) = s match
+    TVarDecl(n, _, init, _) ->
+        w.declare(n)
+
+        if sb_carry(w, init) then w.hold(n)
+    TExprStmt(x) -> sb_see(w, x)
+    TInvariant(cond, _) -> sb_see(w, cond)
+    TVariantCheck(_, _, x) -> sb_see(w, x)
+    TRefDecl(n, _, place) ->
+        w.declare(n)
+        w.refs.add(n)
+
+        if sb_carry(w, place) then w.hold(n)
+    TWriteStmt(wr) -> sb_write(w, wr)
+    TMultiAssign(writes) ->
+        for wr in writes
+            sb_write(w, wr)
+    TReturn(v) -> if v.is_some() && sb_carry(w, v.unwrap()) then sb_returned(w)
+    TBecome(call) -> if sb_carry(w, call) then sb_returned(w)
+    TBreak(v, _) -> if v.is_some() && sb_carry(w, v.unwrap()) then sb_escape(w)
+    TContinue(_) -> ()
+    TDefer(stmts, _) -> sb_stmts(w, stmts)
+    TAsm(_, _, _, _) -> sb_escape(w)
+
+private sb_write(w: &BoxWalk, wr: TWrite)
+    sb_see(w, wr.place)
+
+    val c = sb_carry(w, wr.value)
+
+    for item in wr.check
+        sb_see(w, item.value)
+
+    if c
+        if wr.dispatch.is_some() then sb_escape(w) else sb_store(w, wr.place)
+end sb_write
+
+// A value that may be what is followed, written into `place`: a local's own storage holds it, and
+// anything else keeps it.
+private sb_store(w: &BoxWalk, place: TExpr) = sb_root(w, place) match
+    Some(n) -> w.hold(n)
+    None -> sb_escape(w)
+
+// The local a place is inside of by value: a chain of field and element steps, never through a
+// pointer, a reference or a `ref`.
+private sb_root(w: &BoxWalk, place: TExpr) -> Option[string] = *place.kind match
+    TLoad(n, _) -> if w.refs.has(n) then None else Some(n)
+    TField(r, _, _) -> underlying(texpr_type(r)) match
+        Struct(_) -> sb_root(w, r)
+        _ -> None
+    TIndex(r, _, _) -> underlying(texpr_type(r)) match
+        Array(_, _) -> sb_root(w, r)
+        _ -> None
+    _ -> None
+
+// Every name a pattern binds holds what the subject may be.
+private sb_bind(w: &BoxWalk, p: TPattern, holds: bool)
+    var names: Buf[string] = buf()
+
+    pattern_names(p, &names)
+
+    for n in names
+        w.declare(n)
+
+        if holds then w.hold(n)
+    end for
+end sb_bind
+
+private sb_terms(w: &BoxWalk, cond: Buf[TCondTerm])
+    for term in cond
+        term match
+            TCondTest(c) -> sb_see(w, c)
+            TCondIs(subject, patterns, _) ->
+                val c = sb_carry(w, subject)
+
+                for p in patterns
+                    sb_bind(w, p, c)
+    end for
+end sb_terms
+
+// Walks every value in `xs`, and whether any may be what is followed.
+private sb_all(w: &BoxWalk, xs: Buf[TExpr]) -> bool
+    var any = false
+
+    for x in xs
+        if sb_carry(w, x) then any = true
+
+    any
+end sb_all
+
+// Whether the value of `x` may be, or hold, what is followed -- noting every escape inside it on the
+// way. A value whose type holds no count and no address holds nothing.
+private sb_carry(w: &BoxWalk, x: TExpr) -> bool = sb_kind(w, x) && may_carry(texpr_type(x))
+
+private sb_is_site(w: &BoxWalk, x: TExpr, payload: TExpr) -> bool =
+    !w.param && !w.call_site && payload.span == w.site
+
+private sb_kind(w: &BoxWalk, x: TExpr) -> bool = *x.kind match
+    TLoad(n, _) -> w.holders.has(n)
+    TBox(v, _) ->
+        val inside = sb_carry(w, v)
+
+        if inside then sb_escape(w)
+
+        if sb_is_site(w, x, v)
+            if w.site_loop < 0 && !w.loops.is_empty() then w.site_loop = w.loops[w.loops.len() - 1]
+
+            return true
+        end if
+
+        false
+    TCall(name, args, _, _) ->
+        var answered = false
+
+        for k in 0..<args.len()
+            if sb_carry(w, args[k])
+                val s = summary(w.cx, name, k, args.len())
+
+                if s.0 then sb_escape(w)
+                if s.1 then answered = true
+            end if
+        end for
+
+        if w.call_site && !w.param && x.span == w.site
+            if w.site_loop < 0 && !w.loops.is_empty() then w.site_loop = w.loops[w.loops.len() - 1]
+
+            return true
+        end if
+
+        answered
+    TStructNew(st, args) ->
+        val c = sb_all(w, args)
+
+        if c && w.cx.dtors.has(mangle(Struct(st))) then sb_escape(w)
+
+        c
+    TEnumNew(ty, _, args) ->
+        val c = sb_all(w, args)
+
+        if c && w.cx.dtors.has(mangle(ty)) then sb_escape(w)
+
+        c
+    TArrayLit(elems, _) -> sb_all(w, elems)
+    TArrayFill(v, _) -> sb_carry(w, v)
+    TErase(v, _, _) -> sb_carry(w, v)
+    TCast(v, ty) ->
+        val c = sb_carry(w, v)
+
+        if c && is_sync_ref(ty) then sb_escape(w)
+
+        c
+    TConstView(v) -> sb_view(w, v)
+    TViewAs(v, _) -> sb_view(w, v)
+    TTempAddr(v, _) -> sb_carry(w, v)
+    TSlice(base, lo, hi, _, _) ->
+        if lo.is_some() then sb_see(w, lo.unwrap())
+        if hi.is_some() then sb_see(w, hi.unwrap())
+
+        sb_view(w, base)
+
+    // A step into a reference's payload reads what the payload holds, which the box can be part of only
+    // by a store this walk has already called an escape.
+    TField(r, _, _) -> sb_carry(w, r) && !is_ref_type(texpr_type(r))
+    TIndex(r, i, _) ->
+        sb_see(w, i)
+        sb_carry(w, r) && !is_ref_type(texpr_type(r))
+    TDeref(r, _) -> sb_carry(w, r) && !is_ref_type(texpr_type(r))
+    TAddrOf(place, _) -> sb_carry(w, place)
+    TLen(r, _) -> sb_read(w, r)
+    TBytes(r) -> sb_read(w, r)
+    TTypeId(r, _) -> sb_read(w, r)
+    TBinary(_, l, r, _) -> sb_read(w, l) || sb_read(w, r)
+    TUnary(_, o, _) -> sb_read(w, o)
+    TLogical(_, l, r) -> sb_read(w, l) || sb_read(w, r)
+
+    // A comparison reached through an implementation hands its operands to it, unless it reads them
+    // through their references first.
+    TCompare(operands, cmps) ->
+        var handed = false
+
+        for c in cmps
+            if c.dispatch.is_some() && c.through == 0 then handed = true
+
+        if sb_all(w, operands) && handed then sb_escape(w)
+
+        false
+    TSeq(exprs) ->
+        var last = false
+
+        for item in exprs
+            last = sb_carry(w, item)
+
+        last
+    TBlockExpr(b) -> sb_block(w, b)
+    TIf(cond, tb, eb, _) ->
+        sb_terms(w, cond)
+
+        val a = sb_block(w, tb)
+        val b = sb_opt_block(w, eb)
+
+        a || b
+    TMatch(scrutinee, arms, _) ->
+        val c = sb_carry(w, scrutinee)
+        var any = false
+
+        for arm in arms
+            for p in arm.patterns
+                sb_bind(w, p, c)
+
+            if arm.guard.is_some() then sb_see(w, arm.guard.unwrap())
+            if sb_block(w, arm.body) then any = true
+        end for
+
+        any
+    TWhile(cond, body, eb, _) ->
+        w.enter_loop()
+        sb_terms(w, cond)
+        sb_stmts(w, body)
+        w.leave_loop()
+        sb_opt_block(w, eb)
+    TDoWhile(body, cond, eb, _) ->
+        w.enter_loop()
+        sb_stmts(w, body)
+        sb_see(w, cond)
+        w.leave_loop()
+        sb_opt_block(w, eb)
+    TLoop(body, _) ->
+        w.enter_loop()
+        sb_stmts(w, body)
+        w.leave_loop()
+        false
+    TFor(name, _, lo, hi, _, body, eb, _) ->
+        sb_see(w, lo)
+        sb_see(w, hi)
+        w.enter_loop()
+        w.declare(name)
+        sb_stmts(w, body)
+        w.leave_loop()
+        sb_opt_block(w, eb)
+    TCFor(init, cond, step, body, eb, _) ->
+        sb_stmts(w, init)
+        w.enter_loop()
+
+        if cond.is_some() then sb_see(w, cond.unwrap())
+
+        sb_stmts(w, step)
+        sb_stmts(w, body)
+        w.leave_loop()
+        sb_opt_block(w, eb)
+    TForEach(name, _, seq, body, eb, _) ->
+        val c = sb_carry(w, seq)
+
+        w.enter_loop()
+        w.declare(name)
+
+        if c then w.hold(name)
+
+        sb_stmts(w, body)
+        w.leave_loop()
+        sb_opt_block(w, eb)
+    TIterate(cursor, _, init, next, bind, body, eb, _) ->
+        w.declare(cursor)
+
+        if sb_carry(w, init) then w.hold(cursor)
+
+        w.enter_loop()
+
+        val c = sb_carry(w, next)
+
+        sb_bind(w, bind, c)
+        sb_stmts(w, body)
+        w.leave_loop()
+        sb_opt_block(w, eb)
+    TStore(place, v, _, yields) ->
+        sb_see(w, place)
+
+        val c = sb_carry(w, v)
+
+        if c then sb_store(w, place)
+
+        c && yields
+    TUpdate(place, _, v, _, _, _, _) ->
+        sb_see(w, place)
+
+        if sb_carry(w, v) then sb_escape(w)
+
+        false
+    TIncDec(place, _, _, _, _) -> sb_read(w, place)
+    TUpgrade(v, _, _, _) -> sb_carry(w, v)
+    TDowncast(v, _, _, _, _, _) -> sb_carry(w, v)
+    TFromRaw(v, _) -> sb_carry(w, v)
+    _ ->
+        for k in sb_kids(x)
+            if sb_carry(w, k) then sb_escape(w)
+
+        false
+
+// What every other node is made of. Each is a place the walk does not follow a value into, so a part
+// that may be what is followed is an escape: a weakening, a raw count, a buffer, a slot, a table or a
+// callable, a task, a rendering, a `?`.
+private sb_kids(x: TExpr) -> Buf[TExpr]
+    var out: Buf[TExpr] = buf()
+
+    *x.kind match
+        TDowngrade(v, _) -> out.push(v)
+        TIntoRaw(v, _) -> out.push(v)
+        TVectorLit(lanes, _) -> sb_push_all(&out,lanes)
+        TSplat(v, _) -> out.push(v)
+        TLanesAs(v, _) -> out.push(v)
+        TLane(r, _, _) -> out.push(r)
+        TVecCompare(_, l, r, _) ->
+            out.push(l)
+            out.push(r)
+        TSelect(m, a, b, _) ->
+            out.push(m)
+            out.push(a)
+            out.push(b)
+        TShuffle(r, second, _, _) ->
+            out.push(r)
+
+            if second.is_some() then out.push(second.unwrap())
+        TLaneSet(r, _, v, _) ->
+            out.push(r)
+            out.push(v)
+        TReduce(_, r, _) -> out.push(r)
+        TVecOp(_, operands, _) -> sb_push_all(&out,operands)
+        TVecLoad(r, i, _) ->
+            out.push(r)
+            out.push(i)
+        TVecStore(r, i, v) ->
+            out.push(r)
+            out.push(i)
+            out.push(v)
+        TBufLit(elems, _) -> sb_push_all(&out,elems)
+        TBufFill(v, n, _) ->
+            out.push(v)
+            out.push(n)
+        TFloorCast(v, _) -> out.push(v)
+        TConstrainedCheck(v, _) -> out.push(v)
+        TConstrainedValid(v, _) -> out.push(v)
+        TConstrainedStep(v, _, _, _) -> out.push(v)
+        TIntOp(_, v, amount, _, _) ->
+            out.push(v)
+
+            if amount.is_some() then out.push(amount.unwrap())
+        TAtomic(_, addr, ops, _, _, _) ->
+            out.push(addr)
+            sb_push_all(&out,ops)
+        TSlots(_, args, _, _) -> sb_push_all(&out,args)
+        TSysOp(_, _, args) -> sb_push_all(&out,args)
+        TVariantFailHeld(_, held) -> out.push(held)
+        TStr(v) -> out.push(v)
+        TFromBytes(v) -> out.push(v)
+        TStrView(v) -> out.push(v)
+        TCrossCopy(v, _, _, _) -> out.push(v)
+        TFormat(v, _, counts) ->
+            out.push(v)
+            sb_push_all(&out,counts)
+        TRender(v, _, spec, _) ->
+            out.push(v)
+            out.push(spec)
+        TCallPtr(callee, args, _, _) ->
+            out.push(callee)
+            sb_push_all(&out,args)
+        TVCall(r, _, args, _, _) ->
+            out.push(r)
+            sb_push_all(&out,args)
+        TVaStart(ap) -> out.push(ap)
+        TVaEnd(ap) -> out.push(ap)
+        TVaArg(ap, _) -> out.push(ap)
+        TVaCopy(d, s) ->
+            out.push(d)
+            out.push(s)
+        TVaPass(ap) -> out.push(ap)
+        TStructInvCheck(v, _, _) -> out.push(v)
+        TRecheck(after, recv, _, _) ->
+            out.push(after)
+            out.push(recv)
+        TEnumFromInt(v, _) -> out.push(v)
+        TEnumTry(v, _, _, _, _) -> out.push(v)
+        TDecode(b, _, _, _, _) -> out.push(b)
+        TEncode(v, o) ->
+            out.push(v)
+            out.push(o)
+        TEnumAttr(_, _, a, _) -> out.push(a)
+        TTry(v, _, _, _, _, _, _) -> out.push(v)
+        TAwait(v, _) -> out.push(v)
+        TBlockOn(v, _) -> out.push(v)
+        TStep(t, wake) ->
+            out.push(t)
+            out.push(wake)
+        TPark(r) -> out.push(r)
+        TQuantifier(_, _, _, lo, hi, _, pred) ->
+            out.push(lo)
+            out.push(hi)
+            out.push(pred)
+        TCheckedLoop(_, _, l) -> out.push(l)
+        _ -> ()
+
+    out
+end sb_kids
+
+private sb_push_all(out: *Buf[TExpr], xs: Buf[TExpr])
+    for x in xs
+        out.push(x)
+end sb_push_all
+
+// **A view of an array inside a box holds the box**: its owner word is the box, counted, so
+// `g.rows[i][0..<2]` carries `g` however many steps through a reference it took to reach the array.
+private sb_view(w: &BoxWalk, base: TExpr) -> bool
+    val c = sb_carry(w, base)
+
+    c || sb_view_root(w, base)
+end sb_view
+
+private sb_view_root(w: &BoxWalk, x: TExpr) -> bool = *x.kind match
+    TField(r, _, _) -> sb_view_root(w, r)
+    TIndex(r, _, _) -> sb_view_root(w, r)
+    TDeref(r, _) -> sb_view_root(w, r)
+    TLoad(n, _) -> w.holders.has(n)
+    _ -> sb_carry(w, x)
+
+// Walks a value that is only read, and answers `false`: nothing it is read into holds it.
+private sb_read(w: &BoxWalk, x: TExpr) -> bool
+    sb_see(w, x)
+    false
+end sb_read
+
+// Walks a value for what it does, whatever it holds.
+private sb_see(w: &BoxWalk, x: TExpr)
+    _ = sb_carry(w, x)
+end sb_see
+
+// -- what a callee does with a parameter --------------------------------------------------------------
+
+// What the function `name` does with its parameter `k`: whether it may let it out (`.0`), and whether
+// its answer may be it or hold it (`.1`). Where no body is in sight, the arguments do not line up, the
+// body is a task's or is being worked out further up this very question, the answer is "it escapes".
+private summary(cx: &BoxCx, name: string, k: usize, given: usize) -> (bool, bool)
+    val key = s"$name|$k"
+
+    cx.memo.get(key) match
+        Some(known) -> return known
+        None -> ()
+
+    if cx.busy.has(name) then return (true, true)
+
+    val at = cx.index.get(name)
+
+    if at.is_none() then return (true, true)
+
+    val f = cx.funcs[at.unwrap()]
+
+    if f.ghost || f.variadic || f.marks.is_async() || k >= f.params.len() || given != f.params.len() then
+        return (true, true)
+
+    cx.busy.add(name)
+
+    val w = follow_param(cx, f, k)
+
+    cx.busy.remove(name)
+
+    val out = (w.escaped, w.answers)
+
+    cx.memo.put(key, out)
+    out
+end summary
