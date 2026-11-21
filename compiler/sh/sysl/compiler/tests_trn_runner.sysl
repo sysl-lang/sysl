@@ -4,7 +4,7 @@ module sh.sysl.compiler
 import sh.sysl.parsing.source_of
 import sysl.buf.{Buf, buf}
 import sysl.fs.{is_file, make_dir_all, make_temp_dir, remove_dir_all, write_text}
-import sysl.process.capture
+import sysl.process.{capture, Exited}
 import sysl.text.{split, Search}
 
 // `sysl test` end to end: the hooks a module writes, the verdict a run reads off a process, the
@@ -717,6 +717,120 @@ trn_an_unknown_name_is_status_two()
     trn_test_ir("@test\nt() = 0\n") match
         None -> ()
         Some(ir) -> assert(trn_main_of(ir).contains("ret i32 2"), trn_main_of(ir))
+
+// -- the dispatcher's arms, cut into functions ----------------------------------------------------------
+
+// The source of `n` tests, `t0` up, with a `@setup` and a `@teardown` where `hooked` says. Under
+// `module m` where `m` is said, each test asserts the setup ran; a top-level file has no storage a test
+// may read (a `var` there is its body's), so there each test asserts arithmetic and the hooks do nothing.
+private trn_many(n: int, hooked: bool, m: bool) -> string
+    var text = if m then "module m\n\nvar ran: int = 0\n\n" else ""
+
+    if hooked && m then text = text + "@setup\ns() =\n    ran = 1\n\n@teardown\nd() =\n    ran = 2\n\n"
+
+    if hooked && !m then text = text + "@setup\ns() = 0\n\n@teardown\nd() = 0\n\n"
+
+    for i in 0..<n
+        val body = if m && hooked then s"    assert(ran == 1, \"the setup ran for t${i}\")\n"
+        else "    assert(1 + 1 == 2, \"arithmetic\")\n"
+
+        text = text + s"@test\nt${i}() =\n" + body + "\n"
+
+    text
+end trn_many
+
+// How many of the dispatcher's arm functions `ir` defines.
+private trn_arm_functions(ir: string) -> usize
+    var n: usize = 0
+    val lines = split(ir, "\n")
+
+    for i in 0..<lines.len
+        if lines[i].starts_with("define ") && lines[i].contains("@sysl.test.arms.") then n += 1
+
+    n
+end trn_arm_functions
+
+@test("trn: the dispatcher's arms are in functions of their own, which '@main' asks in turn")
+trn_arms_are_out_of_main()
+    trn_test_ir("@test\nt() = 0\n") match
+        None -> ()
+        Some(ir) ->
+            val entry = trn_main_of(ir)
+
+            assert_eq(trn_arm_functions(ir), 1)
+            assert(ir.contains("@sysl.test.arms.0(ptr %want)"), ir)
+            assert(entry.contains("call i32 @sysl.test.arms.0(ptr "), entry)
+            assert(!entry.contains("sysl.test.named"), entry)
+            assert(!ir.contains("define private i32 @sysl.test.arms.") &&
+                   !ir.contains("define internal i32 @sysl.test.arms."), "external, so the units place each by its name")
+
+@test("trn: 256 arms are one function, and the 257th starts a second")
+trn_arms_cut_at_256()
+    val full = trn_test_ir(trn_many(256, false, false)) match
+        None -> return
+        Some(ir) -> ir
+
+    val over = trn_test_ir(trn_many(257, false, false)).unwrap()
+
+    assert_eq(trn_arm_functions(full), 1)
+    assert_eq(trn_arm_functions(over), 2)
+    assert(trn_main_of(over).contains("call i32 @sysl.test.arms.1(ptr "), trn_main_of(over))
+
+@test("trn: the hooks' arms count among the arms, so 255 tests and two hooks are two functions")
+trn_hook_arms_count()
+    trn_test_ir(trn_many(255, true, false)) match
+        None -> ()
+        Some(ir) -> assert_eq(trn_arm_functions(ir), 2)
+
+@test("trn: every test of a suite cut into two arm functions runs, under its module's hooks")
+trn_arms_in_two_functions_all_run()
+    // 300 tests and two hooks: the last 44 tests and both hooks are in the second function, and the last
+    // test traps, so its `@teardown` is asked for by name, from the second function, in a process of its own.
+    val text = trn_many(299, true, true) + "@test(should_trap)\nlast() =\n    assert(ran == 1, \"setup ran\")\n" +
+               "    assert(false, \"and now the process ends\")\n"
+
+    trn_outcomes_m(text) match
+        None -> ()
+        Some(ran) ->
+            assert_eq(ran.len(), 300)
+            trn_all_passed(ran)
+
+@test("trn: a binary cut into two arm functions runs a test from the second and answers 2 for a name in neither")
+trn_arms_status_across_functions()
+    if !trn_ready() then return
+
+    val root = trn_project(trn_one("main.sysl", trn_many(257, false, false)))
+
+    val build = test_build_of(root, None) match
+        Err(refusal) ->
+            remove_dir_all(root).unwrap_or(())
+            assert(false, failure_text(refusal))
+            return
+        Ok(made) -> made
+
+    assert(build.emitted.report.is_empty(), analysis_report(build.emitted.report))
+    assert_eq(build.tests.len(), 257)
+
+    val exe = build_test_binary(root, build, None, DefaultOptimization) match
+        Err(refusal) ->
+            remove_dir_all(root).unwrap_or(())
+            assert(false, refusal.message)
+            return
+        Ok(built) -> built
+
+    val first = capture(exe, [build.tests[0].func])
+    val second = capture(exe, [build.tests[256].func])
+    val neither = capture(exe, ["no_such_test"])
+    val none = capture(exe, [])
+
+    discard_test_binary(exe)
+    remove_dir_all(root).unwrap_or(())
+
+    assert(first.unwrap().status.ok(), "t0, from the first function")
+    assert(second.unwrap().status.ok(), "t256, from the second")
+    assert(neither.unwrap().status == Exited(2), "a name no function has")
+    assert(none.unwrap().status == Exited(2), "no name at all")
+end trn_arms_status_across_functions
 
 // -- an ordinary build has no tests in it ---------------------------------------------------------------
 

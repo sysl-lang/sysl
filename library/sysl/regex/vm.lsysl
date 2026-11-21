@@ -110,6 +110,76 @@ on patterns like `(a|ab)(c|bcd)` — worth knowing before relying on a group.
 
     exec(prog: Program, input: string) -> Option[[]int] = exec_from(prog, input, 0)
 
+
+Where a match can begin
+-----------------------
+
+Starting a thread at a position is the expensive part of a step that finds nothing: the closure
+from the first instruction is walked, the `Save` of group 0 copies a capture array, and the list is
+filled only for every thread to die on the next character. In a long text searched for something
+rare that is nearly every position, so it is the whole cost of the search.
+
+When no thread is alive, though, the only thing a position can contribute is that new start, and
+whether it survives the character is decided by the instructions the closure from the first
+instruction lands on. Those are worked out once per run; while the list is empty and nothing has
+matched, the run steps over every character none of them admits, without starting anything. That is
+the same answer the full step would have reached at each of those positions: every thread it started
+would have died on that character.
+
+It holds only where the closure cannot accept or assert without a character. A pattern that can
+match empty (`a*`) accepts at every position, and an anchor is decided by where the position is
+rather than by what is there, so for either the answer is "no prefilter" and every position is
+stepped as before. A `.` among the first instructions admits everything, and stepping over nothing
+is not worth the check, so it answers the same.
+
+    private first_instructions(prog: Program) -> Option[&Buf[usize]]
+        var firsts: &Buf[usize] = buf()
+        var seen: []bool = [false; prog.len()]
+        var todo: &Buf[usize] = buf()
+
+        todo.push(0)
+
+        while todo.len() > 0
+            var pc = todo.pop().unwrap()
+
+            if pc >= prog.len() || seen[pc] then continue
+
+            seen[pc] = true
+
+            prog.at(pc) match
+                Jump(to) -> todo.push(to)
+                Split(a, b) ->
+                    todo.push(b)
+                    todo.push(a)
+                Save(_) -> todo.push(pc + 1)
+                MatchChar(_) -> firsts.push(pc)
+                MatchSet(_) -> firsts.push(pc)
+                else return None
+
+        Some(firsts)
+    end first_instructions
+
+    private can_begin(prog: Program, firsts: &Buf[usize], c: char) -> bool
+        for i in 0..<firsts.len()
+            val hit = prog.at(firsts[i]) match
+                MatchChar(want) -> c == want
+                MatchSet(cls) -> cls.admits(c)
+                else true
+
+            if hit then return true
+
+        false
+    end can_begin
+
+    private skip_to_begin(prog: Program, firsts: &Buf[usize], cur: *Chars)
+        loop
+            val c = cur.peek()
+
+            if c.is_none() || can_begin(prog, firsts, c.unwrap()) then return
+
+            cur.next()
+    end skip_to_begin
+
 A run may be told to begin part way in, which is what a caller walking every match in a text needs.
 It is a *starting position*, not a smaller input: `^` still means the beginning of the whole text and
 `$` its end, so the second match in a line is not handed a `^` that suddenly holds. Slicing the input
@@ -130,8 +200,15 @@ and searching the remainder — the obvious way to write `find_all` — gets exa
         var cur = Chars(src, from)
         var gen = 0
         var going = true
+        val firsts = first_instructions(prog)
+        val fresh: []int = [unset; slots]
 
         while going
+            if !matched && clist.len() == 0
+                firsts match
+                    Some(fs) -> skip_to_begin(prog, fs, &cur)
+                    None -> ()
+
             var at = cur.offset
             var here = cur.peek()
             var look = cur
@@ -141,7 +218,7 @@ and searching the remainder — the obvious way to write `find_all` — gets exa
             var after = look.offset
 
             if !matched
-                vm.add(clist, 0, [unset; slots], gen, at)
+                vm.add(clist, 0, fresh, gen, at)
 
             nlist.clear()
 
