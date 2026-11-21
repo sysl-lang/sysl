@@ -1,0 +1,166 @@
+module sysl.cpu
+@tests
+@requires(heap)
+
+import sysl.buf.{Buf, buf}
+import sysl.text.from_utf8
+
+// What `has` claims at run time on the machine running the suite: every name answers without a
+// trap, twice the same, an extension the build is compiled for answers true, a name that arrives at
+// run time and is not in the list answers false, and the pattern the module exists for -- a branch on
+// the answer around an `@unchecked` block -- takes the fast path exactly where the answer is true and
+// computes the same value either way. What is refused while compiling (a literal outside the list, a
+// call on a bare-metal target) is `compiler/…/tests_cpq_cpu_query.sysl`'s.
+
+@test("every name in the list answers, and answers the same the second time")
+cpq_every_name_answers()
+    var first: Buf[bool] = buf()
+
+    for n in names()
+        first.push(has(n))
+
+    for i in 0..<names().len
+        assert_eq(has(names()[i]), first[i])
+
+@test("the list holds no name twice and is in reach of the answer's bits")
+cpq_names_are_distinct()
+    val all = names()
+
+    assert(all.len < 63)
+
+    for i in 0..<all.len
+        for j in i + 1..<all.len
+            assert(all[i] != all[j], all[i])
+
+@test("an extension every build for this processor is compiled with answers true")
+cpq_compiled_extensions_answer_true()
+#if aarch64
+    assert(has("fp-armv8"))
+    assert(has("neon"))
+#if macos
+    // `aarch64-macos` is built for the M1, which promises these four.
+    assert(has("crc"))
+    assert(has("aes"))
+    assert(has("sha3"))
+    assert(has("dotprod"))
+#endif
+#elif x86_64
+    assert(has("sse"))
+    assert(has("sse2"))
+#else
+    assert(names().is_empty())
+#endif
+
+@test("a name that arrives at run time and is not in the list answers false")
+cpq_unknown_name_at_run_time_is_false()
+    var spelled: Buf[u8] = buf()
+
+    for b in "crcc".bytes
+        spelled.push(b)
+
+    val name = from_utf8(spelled.view()).unwrap()
+
+    assert(!has(name))
+    assert(!has(name[0..<0]))
+    // A prefix of a real name, a name with a sign, and one in capitals are not the name.
+    assert(!has("crc"[0..<2]))
+    assert(!has("+crc"[0..<4]))
+    assert(!has("CRC"[0..<3]))
+
+@test("a name sliced from a longer string is asked as the name it spells")
+cpq_sliced_name()
+    val text = "neon,sse2"
+    val first = names()[0]
+
+    // Not terminated where it ends, so a reading that ran on to a zero would see "neon,sse2".
+    assert_eq(has(text[0..<4]), has("neon"))
+    assert_eq(has(text[5..<9]), has("sse2"))
+    assert_eq(has((first + "!")[0..<first.len]), has(first))
+
+#if aarch64
+extern "llvm.aarch64.crc32cx" crc_word_hw(crc: u32, word: u64) -> u32
+
+@extensions("crc")
+private crc_fast(word: u64) -> u32 = crc_word_hw(0xffffffff, word) ^ 0xffffffff
+
+// A body compiled for an extension the M1 row does not promise: `i8mm` came with the M2.
+@extensions("i8mm")
+private i8mm_path() -> int = 1
+#elif x86_64
+extern "llvm.x86.sse42.crc32.64.64" crc_word_hw(crc: u64, word: u64) -> u64
+
+@extensions("sse4.2")
+private crc_fast(word: u64) -> u32 = u32(crc_word_hw(0xffffffff, word) ^ 0xffffffff)
+
+// A body compiled for an extension no x86-64 row promises.
+@extensions("avx2")
+private avx2_path() -> int = 1
+#endif
+
+// CRC-32C of a word's eight bytes, least significant first, a bit at a time.
+private crc_portable(word: u64) -> u32
+    var crc: u32 = 0xffffffff
+
+    for i in 0..<8
+        crc ^= u32((word >> u64(8 * i)) & 0xff)
+
+        for _ in 0..<8
+            crc = if crc & 1 == 1 then (crc >> 1) ^ 0x82f63b78 else crc >> 1
+
+    crc ^ 0xffffffff
+end crc_portable
+
+@test("the dispatch pattern: the fast path where the processor answers yes, the same value either way")
+cpq_dispatch_end_to_end()
+    val word: u64 = 0x0123_4567_89ab_cdef
+    var fast = false
+    var got: u32 = 0
+
+#if aarch64
+    if has("crc")
+        @unchecked("crc")
+            got = crc_fast(word)
+            fast = true
+    else
+        got = crc_portable(word)
+#elif x86_64
+    if has("sse4.2")
+        @unchecked("sse4.2")
+            got = crc_fast(word)
+            fast = true
+    else
+        got = crc_portable(word)
+#else
+    got = crc_portable(word)
+#endif
+
+    assert_eq(got, crc_portable(word))
+#if aarch64
+    assert_eq(fast, has("crc"))
+#elif x86_64
+    assert_eq(fast, has("sse4.2"))
+#else
+    assert(!fast)
+#endif
+
+@test("an extension the row does not promise is called only where the processor said yes")
+cpq_dispatch_beyond_the_row()
+#if aarch64
+    var path = 2
+
+    if has("i8mm")
+        @unchecked("i8mm")
+            path = i8mm_path()
+
+    assert_eq(path, if has("i8mm") then 1 else 2)
+#elif x86_64
+    var path = 2
+
+    if has("avx2")
+        @unchecked("avx2")
+            path = avx2_path()
+
+    assert_eq(path, if has("avx2") then 1 else 2)
+#else
+    assert(names().is_empty())
+#endif
