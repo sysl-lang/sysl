@@ -1,0 +1,874 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map, Set, set}
+import sysl.text.Search
+
+// **A reference read out of a place that is written before it is read again takes the place's
+// count**: the retain at the read and the release of the old value at the write are one count moved,
+// so both are dropped.
+//
+//     val d = self.top          // retain d
+//     self.top = d.next         // release what self.top held -- d
+//
+// The emitter counts each half where it stands: the read retains for the new name, the write releases
+// what the place held. Where the place holds the very value the read took, nothing between them read
+// it again and every way on from the read writes it, the place's count is the one the name needs, and
+// the pair moves it instead of taking a second and giving the first back.
+//
+// **The rule.** A retain of a reference read by a plain load `L` from an address `A` that is not a slot
+// of this frame -- the value itself, or the payload a `match` on it binds -- is dropped with the release
+// of the value a later write to the same address loads and gives back (`S`, the load, the store and the
+// release in one block), when:
+//
+// - `A` and the write's address are one computation: the same field steps from the same frame slots,
+//   each written once and never inside a loop (`take_canon`);
+// - the value is a reference or an `Option` of one, whose release lets go of exactly the count the
+//   retain took (`Emit.take_walks`);
+// - every path from the retain reaches `S` or ends the program, never returns, never runs the retain
+//   again, and every path into `S` comes through the retain, and into the retain through `L`. So an
+//   early `return`, a conditional write and a loop around the read all keep the pair;
+// - nothing in that window reads `A` again, writes anything that may be `A` (a store is told apart
+//   from `A` by the struct field it is the last step into, or by being a slot of the frame), calls
+//   anything but a function that writes nothing outside its own frame and releases nothing, or
+//   suspends;
+// - a release in the window runs no code (no destructor anywhere its teardown reaches) and lets go of
+//   a value read before the count taken at the retain was put anywhere a load could find it again.
+//
+// **Why it is sound.** Inside the window the count is one lower than it was, and both the place and
+// the name stand for it. Nothing writes the place, so it never gives its count back while the name
+// lives on it, and the name's count is never given back before the write -- the only release that
+// could reach it would be of a value read after it was stored somewhere, which keeps the pair. Every
+// other holder is unchanged, so the count stays at least one through the window; nothing in it looks
+// at a count; and after the write the place holds the new value and the name holds the old one's count,
+// as with both kept. A path that ends the program (a failed check, a `panic`) gives nothing back, so
+// the window may run into one: nothing after it reads either name.
+take_on_overwrite(blocks: Buf[IrBlock], inert: Set[string], walks: Map[string, (bool, bool)]) -> Buf[IrBlock]
+    val c = take_ctx(blocks, inert, walks)
+    var writes: Buf[TakeWrite] = buf()
+
+    for b in 0..<blocks.len()
+        val instrs = blocks[b].instrs
+
+        for i in 0..<instrs.len()
+            take_write_at(c, b, i) match
+                Some(w) -> writes.push(w)
+                None -> ()
+
+    if writes.is_empty() then return blocks
+
+    var dropped: Set[string] = set()
+
+    for b in 0..<blocks.len()
+        val instrs = blocks[b].instrs
+
+        for i in 0..<instrs.len()
+            take_read_at(c, b, i) match
+                Some(r) ->
+                    for w in writes
+                        if !dropped.has(w.release_at) && take_pairs(c, r, w)
+                            dropped.add(s"$b:$i")
+                            dropped.add(w.release_at)
+                            break
+                None -> ()
+
+    if dropped.len() == 0 then return blocks
+
+    var out: Buf[IrBlock] = buf()
+
+    for b in 0..<blocks.len()
+        var kept: Buf[Inst] = buf()
+        val instrs = blocks[b].instrs
+
+        for i in 0..<instrs.len()
+            if !dropped.has(s"$b:$i") then kept.push(instrs[i])
+
+        out.push(IrBlock(blocks[b].label, kept, blocks[b].terminator))
+
+    out
+end take_on_overwrite
+
+// What every candidate is judged against: the blocks, where each register is defined and by what, the
+// frame slots no address of which left the frame, how often and where each is written, and who
+// branches where.
+private struct TakeCtx
+    blocks: Buf[IrBlock]
+    defs: Map[string, Inst]
+    at: Map[string, (usize, usize)]
+    labels: Map[string, usize]
+    preds: Buf[Buf[usize]]
+    succs: Buf[Buf[usize]]
+    clean: Set[string]
+    roots: Map[string, string]
+    slot_stores: Map[string, (usize, usize, Val, int)]
+    inert: Set[string]
+    walks: Map[string, (bool, bool)]
+end TakeCtx
+
+private take_ctx(blocks: Buf[IrBlock], inert: Set[string], walks: Map[string, (bool, bool)]) -> TakeCtx
+    val (clean, roots) = take_slots(blocks, inert)
+    var defs: Map[string, Inst] = map()
+    var at: Map[string, (usize, usize)] = map()
+    var labels: Map[string, usize] = map()
+    var slot_stores: Map[string, (usize, usize, Val, int)] = map()
+
+    for b in 0..<blocks.len()
+        labels.put(blocks[b].label, b)
+
+        val instrs = blocks[b].instrs
+
+        for i in 0..<instrs.len()
+            val inst = instrs[i]
+
+            take_dest(inst) match
+                Some(d) ->
+                    defs.put(v_render(d), inst)
+                    at.put(v_render(d), (b, i))
+                None -> ()
+
+    for b in 0..<blocks.len()
+        val instrs = blocks[b].instrs
+
+        for i in 0..<instrs.len()
+            val inst = instrs[i]
+
+            // A write of part of a slot, through a step, counts as two: the slot is then never one
+            // written once with a whole value.
+            inst match
+                InStore(_, v, p, _, _) ->
+                    val slot = roots.get(v_render(p)).unwrap_or("")
+                    val weight = if slot == v_render(p) then 1 else 2
+
+                    if clean.has(slot)
+                        slot_stores.get(slot) match
+                            Some(s) -> slot_stores.put(slot, (s.0, s.1, s.2, s.3 + weight))
+                            None -> slot_stores.put(slot, (b, i, v, weight))
+                _ -> ()
+
+    var preds: Buf[Buf[usize]] = buf()
+    var succs: Buf[Buf[usize]] = buf()
+
+    for _ in 0..<blocks.len()
+        preds.push(buf())
+        succs.push(buf())
+
+    for b in 0..<blocks.len()
+        for l in take_targets(blocks[b].terminator)
+            labels.get(l) match
+                Some(to) ->
+                    succs[b].push(to)
+                    preds[to].push(b)
+                None -> ()
+
+    TakeCtx(blocks, defs, at, labels, preds, succs, clean, roots, slot_stores, inert, walks)
+end take_ctx
+
+// The stack slots no address into which left the frame: the slot and every field address stepped from
+// it are used only as the address of a load, a store or a further step. `unescaped_slots` asks more --
+// no step at all -- since the pairs it cancels read a slot whole; a `match` reads its scrutinee's slot
+// through a step.
+private take_slots(blocks: Buf[IrBlock], inert: Set[string]) -> (Set[string], Map[string, string])
+    var root: Map[string, string] = map()
+    var slots: Buf[string] = buf()
+
+    for b in blocks
+        for inst in b.instrs
+            inst match
+                InAlloca(d, _, _) ->
+                    root.put(v_render(d), v_render(d))
+                    slots.push(v_render(d))
+                _ -> ()
+
+    // A step may be written in a block printed before the one its base is made in, so the steps are
+    // followed until a round finds none new; a body that does not settle has no slot this pass trusts.
+    var rounds = 0
+
+    loop
+        var grew = false
+
+        for b in blocks
+            for inst in b.instrs
+                val (d, base) = inst match
+                    InGep(d, _, p, _) -> (v_render(d), root.get(v_render(p)).unwrap_or(""))
+                    InGepInBounds(d, _, p, _) -> (v_render(d), root.get(v_render(p)).unwrap_or(""))
+                    // A place entry answers an address inside the one place it was handed
+                    // (`place_entry.sysl`).
+                    InCall(Some(d), _, VGlobal(n), args, _, _, _, _) ->
+                        val within = take_frame_args(root, args)
+
+                        if is_place_symbol(n) && inert.has(n) && within.len() == 1 then (v_render(d), within[0])
+                        else ("", "")
+                    _ -> ("", "")
+
+                if base != "" && root.get(d).is_none()
+                    root.put(d, base)
+                    grew = true
+
+        rounds += 1
+
+        if !grew then break
+        if rounds == 8 then return (set(), root)
+
+    var escaped: Set[string] = set()
+
+    for b in blocks
+        for inst in b.instrs
+            val stepped = inst match
+                InGep(_, _, _, idx) -> take_index_escapes(root, idx, &escaped)
+                InGepInBounds(_, _, _, idx) -> take_index_escapes(root, idx, &escaped)
+                // A function that writes nothing outside its own frame cannot keep an address it is
+                // handed. What it answers can be one, unless it is a place entry's, followed above.
+                InCall(d, ret, VGlobal(n), args, _, _, _, _) ->
+                    if !inert.has(n) then false
+                    else
+                        val within = take_frame_args(root, args)
+                        val answers = if d.is_none() then false
+                                      else ret match
+                                          LInt(_) -> false
+                                          LFloat(_, _) -> false
+                                          LVoid -> false
+                                          _ -> true
+
+                        if answers && !(is_place_symbol(n) && within.len() == 1)
+                            for r in within
+                                escaped.add(r)
+
+                        true
+                _ -> false
+
+            if !stepped
+                for v in escaping_operands(inst)
+                    root.get(v_render(v)) match
+                        Some(r) -> escaped.add(r)
+                        None -> ()
+
+        b.terminator match
+            Some(t) ->
+                for v in escaping_operands(t)
+                    root.get(v_render(v)) match
+                        Some(r) -> escaped.add(r)
+                        None -> ()
+            None -> ()
+
+    var clean: Set[string] = set()
+
+    for s in slots
+        if !escaped.has(s) then clean.add(s)
+
+    (clean, root)
+end take_slots
+
+// The slots the arguments of a call are addresses into.
+private take_frame_args(root: Map[string, string], args: Buf[IrArg]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for a in args
+        root.get(v_render(a.value)) match
+            Some(r) -> out.push(r)
+            None -> ()
+
+    out
+end take_frame_args
+
+// A step's indices may not be an address of the frame either; answers true, the step being judged.
+private take_index_escapes(root: Map[string, string], idx: Buf[IrArg], escaped: *Set[string]) -> bool
+    for a in idx
+        root.get(v_render(a.value)) match
+            Some(r) -> escaped.add(r)
+            None -> ()
+
+    true
+end take_index_escapes
+
+// The register an instruction defines, if it defines one.
+private take_dest(inst: Inst) -> Option[Val] = inst match
+    InBin(d, _, _, _, _) -> Some(d)
+    InNeg(d, _, _) -> Some(d)
+    InIntCmp(d, _, _, _, _) -> Some(d)
+    InFloatCmp(d, _, _, _, _) -> Some(d)
+    InCast(d, _, _, _, _) -> Some(d)
+    InAlloca(d, _, _) -> Some(d)
+    InLoad(d, _, _, _, _) -> Some(d)
+    InGep(d, _, _, _) -> Some(d)
+    InGepInBounds(d, _, _, _) -> Some(d)
+    InExtract(d, _, _, _) -> Some(d)
+    InInsert(d, _, _, _, _, _) -> Some(d)
+    InSelect(d, _, _, _, _, _) -> Some(d)
+    InCall(d, _, _, _, _, _, _, _) -> d
+    _ -> None
+
+// The labels a terminator may branch to; nothing for one that leaves the function.
+private take_targets(t: Option[Inst]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    t match
+        Some(InBr(l)) -> out.push(l)
+        Some(InCondBr(_, l, r)) ->
+            out.push(l)
+            out.push(r)
+        Some(InSwitch(_, _, d, cases)) ->
+            out.push(d)
+
+            for k in cases
+                out.push(k.1)
+        _ -> ()
+
+    out
+end take_targets
+
+// Every block some path of at least one edge reaches from `b`.
+private take_reach(succs: Buf[Buf[usize]], b: usize) -> Set[usize]
+    var seen: Set[usize] = set()
+    var work: Buf[usize] = buf()
+
+    for s in succs[b]
+        if seen.add(s) then work.push(s)
+
+    while !work.is_empty()
+        val x = work.pop().unwrap()
+
+        for s in succs[x]
+            if seen.add(s) then work.push(s)
+
+    seen
+end take_reach
+
+// -- the address --------------------------------------------------------------------------------------
+
+// The address `v` computes, written so that two computations of one address read alike, or "" where
+// that cannot be told. A register read out of a frame slot stands for the slot when the slot is
+// written exactly once and that write is on no cycle, so every read of it after the write reads one
+// value; `used` gathers those slots.
+private take_canon(c: TakeCtx, v: Val, used: *Set[string]) -> string = v match
+    VGlobal(n) -> s"@$n"
+    VInt(_) -> v_render(v)
+    VBool(_) -> v_render(v)
+    VReg(_) -> c.defs.get(v_render(v)) match
+        Some(InGep(_, ty, p, idx)) -> take_canon_gep(c, ty, p, idx, used)
+        Some(InGepInBounds(_, ty, p, idx)) -> take_canon_gep(c, ty, p, idx, used)
+        Some(InCast(_, op, from, x, to)) ->
+            val inner = take_canon(c, x, used)
+
+            if inner == "" then "" else inst_render(InCast(VReg("_"), op, from, VReg(inner), to))
+        Some(InLoad(_, _, p, acc, _)) ->
+            val slot = v_render(p)
+
+            if is_plain_access(acc) && take_settled(c, slot)
+                used.add(slot)
+                s"[$slot]"
+            else ""
+        _ -> ""
+    _ -> ""
+
+private take_canon_gep(c: TakeCtx, ty: LType, p: Val, idx: Buf[IrArg], used: *Set[string]) -> string
+    val base = take_canon(c, p, used)
+
+    if base == "" then return ""
+
+    var parts: Buf[IrArg] = buf()
+
+    for a in idx
+        val k = take_canon(c, a.value, used)
+
+        if k == "" then return ""
+
+        parts.push(ir_arg(a.ty, VReg(k)))
+
+    inst_render(InGep(VReg("_"), ty, VReg(base), parts))
+end take_canon_gep
+
+// Whether every read of the frame slot `slot` reads one value: it is written once, on no cycle.
+private take_settled(c: TakeCtx, slot: string) -> bool
+    if !c.clean.has(slot) then return false
+
+    c.slot_stores.get(slot) match
+        Some(s) -> s.3 == 1 && !take_reach(c.succs, s.0).has(s.0)
+        None -> false
+end take_settled
+
+// The struct field an address is the last step into, as the struct's name and the field's index
+// (`struct.S|1`), with `[]` after it for an element of an array that field is; "" where the address is
+// not a field of a struct the program laid out. Two addresses with different fields are two objects or
+// one inside the other -- never the same object of the same type, and never part of a reference.
+private take_field(c: TakeCtx, v: Val) -> string = v match
+    VReg(_) -> c.defs.get(v_render(v)) match
+        Some(InGep(_, ty, p, idx)) -> take_field_of(c, ty, p, idx)
+        Some(InGepInBounds(_, ty, p, idx)) -> take_field_of(c, ty, p, idx)
+        _ -> ""
+    _ -> ""
+
+private take_field_of(c: TakeCtx, ty: LType, p: Val, idx: Buf[IrArg]) -> string
+    if idx.len() == 1
+        val base = take_field(c, p)
+
+        return if base == "" then "" else s"$base[]"
+
+    val name = ty match
+        LNamed(n) -> n
+        _ -> ""
+
+    if !name.starts_with("%struct.") || idx.len() < 2 then return ""
+
+    var key = name
+
+    for k in 1..<idx.len()
+        idx[k].value match
+            VInt(_) -> key = s"$key|${v_render(idx[k].value)}"
+            _ -> key = s"$key|*"
+
+    key
+end take_field_of
+
+// The frame slot an address is a part of, or "" where it is not one no address of which left the
+// frame.
+private take_frame(c: TakeCtx, v: Val) -> string = c.roots.get(v_render(v)) match
+    Some(r) -> if c.clean.has(r) then r else ""
+    None -> ""
+
+// -- the two halves -----------------------------------------------------------------------------------
+
+private val TakeReach: usize = 64
+
+// A write that gives back what the place held: the load of the old value, the store over it and the
+// release of that value, in one block, with the address and the type.
+private struct TakeWrite
+    block: usize
+    load: usize
+    store: usize
+    release: usize
+    release_at: string
+    release_name: string
+    canon: string
+    ty: string
+
+private take_write_at(c: TakeCtx, b: usize, i: usize) -> Option[TakeWrite]
+    val instrs = c.blocks[b].instrs
+    val (w, ty, p) = instrs[i] match
+        InLoad(d, t, p, acc, _) -> if is_plain_access(acc) then (d, t, p) else return None
+        _ -> return None
+
+    // Only a reference or an enum of one is a place this pass moves out of.
+    val shaped = ty match
+        LPtr -> true
+        LNamed(_) -> true
+        _ -> false
+
+    if !shaped || take_frame(c, p) != "" then return None
+
+    val ws = v_render(w)
+    val ps = v_render(p)
+    // The three are written one after another; a bound keeps a long block from being walked once per
+    // load in it.
+    val last = if instrs.len() < i + TakeReach then instrs.len() else i + TakeReach
+    var store: usize = 0
+    var found = false
+
+    for j in i + 1..<last
+        instrs[j] match
+            InStore(_, _, q, acc, _) ->
+                if v_render(q) == ps
+                    if !is_plain_access(acc) then return None
+
+                    store = j
+                    found = true
+                    break
+            _ -> ()
+
+    if !found then return None
+
+    val end = if instrs.len() < store + TakeReach then instrs.len() else store + TakeReach
+
+    for k in store + 1..<end
+        arc_call_of(instrs[k]) match
+            Some((name, x)) ->
+                if is_release(name) && v_render(x) == ws
+                    var used: Set[string] = set()
+                    val canon = take_canon(c, p, &used)
+
+                    if canon == "" then return None
+
+                    return Some(TakeWrite(b, i, store, k, s"$b:$k", name, canon, l_render(ty)))
+            None -> ()
+
+    None
+end take_write_at
+
+// A retain of a reference read out of a place: where it is, the load that read it, the frame slot a
+// `match` put the value in on the way (and where that slot is written), what release gives the count
+// back, whether it took the payload of an `Option` rather than the whole value, and the place.
+private struct TakeRead
+    block: usize
+    at: usize
+    value: string
+    load: (usize, usize)
+    via: Option[(usize, usize)]
+    release: string
+    payload: bool
+    addr: Val
+    canon: string
+    used: Set[string]
+    ty: LType
+
+private take_read_at(c: TakeCtx, b: usize, i: usize) -> Option[TakeRead]
+    val (name, x) = arc_call_of(c.blocks[b].instrs[i])?
+
+    if name != "arc.retain" && name != "arc.retain_sync" && !name.starts_with("arc.copy.") then return None
+
+    val release = release_for(name)?
+    val (leaf, path, through) = value_origin(c.defs, x)
+
+    if path == "" && through == ""
+        take_place_load(c, leaf) match
+            Some((ty, p)) -> return take_read(c, b, i, v_render(x), leaf, None, release, false, ty, p)
+            None -> ()
+
+    if name.starts_with("arc.copy.") then return None
+
+    // The payload a `match` binds: the enum stored to a slot of its own, its first field read back as
+    // the variant's fields, and the reference taken out of that.
+    val (s, field) = c.defs.get(v_render(x)) match
+        Some(InExtract(_, _, agg, idx)) -> (agg, idx)
+        _ -> return None
+
+    if field.len() != 1 || field[0] != 0 then return None
+
+    val g = c.defs.get(v_render(s)) match
+        Some(InLoad(_, _, g, acc, _)) -> if is_plain_access(acc) then g else return None
+        _ -> return None
+
+    val (slot, idx) = c.defs.get(v_render(g)) match
+        Some(InGep(_, _, p, idx)) -> (p, idx)
+        Some(InGepInBounds(_, _, p, idx)) -> (p, idx)
+        _ -> return None
+
+    if idx.len() != 2 || v_render(idx[0].value) != "0" || v_render(idx[1].value) != "0" then return None
+
+    val ss = v_render(slot)
+
+    if !c.clean.has(ss) then return None
+
+    val (sb, si, v, count) = c.slot_stores.get(ss)?
+
+    if count != 1 then return None
+
+    val whole = v_render(v)
+    val (ty, p) = take_place_load(c, whole)?
+
+    take_read(c, b, i, v_render(x), whole, Some((sb, si)), release, true, ty, p)
+end take_read_at
+
+// The type and address of the plain load `leaf` is, where it reads storage that is not a slot of the
+// frame.
+private take_place_load(c: TakeCtx, leaf: string) -> Option[(LType, Val)] = c.defs.get(leaf) match
+    Some(InLoad(_, ty, p, acc, _)) ->
+        if is_plain_access(acc) && take_frame(c, p) == "" then Some((ty, p)) else None
+    _ -> None
+
+private take_read(c: TakeCtx, b: usize, i: usize, value: string, leaf: string, via: Option[(usize, usize)],
+                  release: string, payload: bool, ty: LType, p: Val) -> Option[TakeRead]
+    val load = c.at.get(leaf)?
+    var used: Set[string] = set()
+    val canon = take_canon(c, p, &used)
+
+    if canon == "" then return None
+
+    Some(TakeRead(b, i, value, load, via, release, payload, p, canon, used, ty))
+end take_read
+
+// -- the window ---------------------------------------------------------------------------------------
+
+// Whether the read `r` and the write `w` are one count moved (see the head of this file).
+private take_pairs(c: TakeCtx, r: TakeRead, w: TakeWrite) -> bool
+    if r.canon != w.canon || l_render(r.ty) != w.ty then return false
+
+    // What the write's release gives back must be the one count the retain took.
+    val single = c.walks.get(w.release_name) match
+        Some(facts) -> facts.1
+        None -> false
+
+    if r.payload
+        if !single then return false
+    else
+        val reference = r.ty match
+            LPtr -> true
+            _ -> false
+
+        if !releases_as(r.release, w.release_name) || !reference && !single then return false
+
+    var win: Buf[(usize, usize)] = buf()
+    val here = (r.block, r.at)
+    val write = (w.block, w.load)
+
+    if !take_forward(c, here, write, &win) || !take_back(c, write, here, &win) then return false
+
+    r.via match
+        Some(via) ->
+            if !take_back(c, here, via, &win) || !take_back(c, via, r.load, &win) then return false
+
+            // The store into the `match`'s slot is where the value went; it is part of the window.
+            win.push(via)
+        None -> if !take_back(c, here, r.load, &win) then return false
+
+    for k in w.load + 1..<w.release
+        if k != w.store then win.push((w.block, k))
+
+    take_window_clear(c, r, win)
+end take_pairs
+
+// Whether every path from just past `from` reaches `to` or ends at `unreachable`, without returning
+// and without coming back into the block of `from`; what it passes is added to `win`.
+private take_forward(c: TakeCtx, from: (usize, usize), to: (usize, usize), win: *Buf[(usize, usize)]) -> bool
+    var seen: Set[usize] = set()
+    var work: Buf[(usize, usize)] = buf()
+
+    work.push((from.0, from.1 + 1))
+
+    while !work.is_empty()
+        val (b, start) = work.pop().unwrap()
+        val instrs = c.blocks[b].instrs
+        var reached = false
+
+        for i in start..<instrs.len()
+            if b == to.0 && i == to.1
+                reached = true
+                break
+
+            win.push((b, i))
+
+        if reached then continue
+
+        c.blocks[b].terminator match
+            Some(InUnreachable) -> continue
+            Some(InBr(_)) -> ()
+            Some(InCondBr(_, _, _)) -> ()
+            Some(InSwitch(_, _, _, _)) -> ()
+            _ -> return false
+
+        if c.succs[b].len() != take_targets(c.blocks[b].terminator).len() then return false
+
+        for s in c.succs[b]
+            if s == from.0 then return false
+            if seen.add(s) then work.push((s, 0))
+
+    true
+end take_forward
+
+// Whether every path that reaches `from` came through `to`, with no way round it from the function's
+// entry and none through the block of `from` again; what lies between is added to `win`.
+private take_back(c: TakeCtx, from: (usize, usize), to: (usize, usize), win: *Buf[(usize, usize)]) -> bool
+    var seen: Set[usize] = set()
+    var work: Buf[(usize, usize)] = buf()
+
+    work.push((from.0, from.1))
+
+    while !work.is_empty()
+        val (b, end) = work.pop().unwrap()
+        var found = false
+        var i = end
+
+        while i > 0
+            i -= 1
+
+            if b == to.0 && i == to.1
+                found = true
+                break
+
+            win.push((b, i))
+
+        if found then continue
+        if c.preds[b].is_empty() then return false
+
+        for p in c.preds[b]
+            if p == from.0 then return false
+            if seen.add(p) then work.push((p, c.blocks[p].instrs.len()))
+
+    true
+end take_back
+
+// Whether nothing in the window could see that the place and the name share one count: no second read
+// of the place, no write that may be it, no call that could do either or look at a count, no
+// suspension, and no release that runs code or could give back the count the retain took.
+private take_window_clear(c: TakeCtx, r: TakeRead, win: Buf[(usize, usize)]) -> bool
+    val field = take_field(c, r.addr)
+    var carried: Set[string] = set()
+    var inside: Set[string] = set()
+
+    for pos in win
+        inside.add(s"${pos.0}:${pos.1}")
+
+    carried.add(r.value)
+
+    c.blocks[r.load.0].instrs[r.load.1] match
+        InLoad(d, _, _, _, _) -> carried.add(v_render(d))
+        _ -> return false
+
+    // Where the value read was put somewhere a load could find it again, with the slot of the frame
+    // it went into ("" for other memory). A load of that slot after such a store reads it back.
+    var escapes: Buf[(usize, usize, string)] = buf()
+    var escaped: Set[string] = set()
+    var releases: Buf[(usize, usize)] = buf()
+    var rounds = 0
+
+    loop
+        val before = carried.len() + escapes.len()
+
+        for pos in win
+            val inst = c.blocks[pos.0].instrs[pos.1]
+
+            inst match
+                InExtract(d, _, agg, _) -> if carried.has(v_render(agg)) then carried.add(v_render(d))
+                InInsert(d, _, agg, _, v, _) ->
+                    if carried.has(v_render(agg)) || carried.has(v_render(v)) then carried.add(v_render(d))
+                InCast(d, _, _, v, _) -> if carried.has(v_render(v)) then carried.add(v_render(d))
+                InSelect(d, _, _, a, b, _) ->
+                    if carried.has(v_render(a)) || carried.has(v_render(b)) then carried.add(v_render(d))
+                InLoad(d, _, p, _, _) ->
+                    val f = take_frame(c, p)
+
+                    if f != "" && take_found_again(c, escapes, f, pos) then carried.add(v_render(d))
+                InStore(_, v, p, _, _) ->
+                    if carried.has(v_render(v)) && escaped.add(s"${pos.0}:${pos.1}")
+                        escapes.push((pos.0, pos.1, take_frame(c, p)))
+                _ -> ()
+
+        rounds += 1
+
+        if carried.len() + escapes.len() == before || rounds == 8 then break
+
+    for pos in win
+        val inst = c.blocks[pos.0].instrs[pos.1]
+
+        inst match
+            InLoad(_, _, p, acc, _) ->
+                if !is_plain_access(acc) then return false
+
+                var used: Set[string] = set()
+
+                if take_canon(c, p, &used) == r.canon then return false
+                if !count_blind(c.defs, c.inert, inst) then return false
+            InStore(ty, _, p, acc, _) ->
+                if !is_plain_access(acc) then return false
+                if !take_store_clear(c, r, ty, p, field, inside) then return false
+            InCall(_, _, VGlobal(name), args, _, _, _, _) ->
+                arc_call_of(inst) match
+                    Some((n, _)) ->
+                        if is_release(n) then releases.push(pos)
+                        else if release_for(n).is_none() && !take_call_clear(c, name, args) then return false
+                    None -> if !take_call_clear(c, name, args) then return false
+            _ -> if !count_blind(c.defs, c.inert, inst) then return false
+
+    for pos in releases
+        val (name, x) = arc_call_of(c.blocks[pos.0].instrs[pos.1]).unwrap()
+
+        val quiet = c.walks.get(name) match
+            Some(facts) -> facts.0
+            None -> name.starts_with("arc.release.")
+
+        if !quiet then return false
+        if carried.has(v_render(x)) then return false
+
+        val leaf = value_origin(c.defs, x).0
+        val at = c.at.get(leaf) match
+            Some(at) -> at
+            None -> return false
+
+        val from = c.defs.get(leaf) match
+            Some(InLoad(_, _, p, acc, _)) ->
+                if !is_plain_access(acc) then return false
+
+                var used: Set[string] = set()
+
+                if take_canon(c, p, &used) == r.canon then return false
+
+                take_frame(c, p)
+            _ -> return false
+
+        if take_found_again(c, escapes, from, at) then return false
+
+    true
+end take_window_clear
+
+// Whether a load at `at` of the frame slot `f` ("" for memory outside the frame) can read what one of
+// the `escapes` stored: a store into a slot of the frame is found again only by a load of that slot,
+// one into other memory by any load of other memory, and only on a path from the store.
+private take_found_again(c: TakeCtx, escapes: Buf[(usize, usize, string)], f: string, at: (usize, usize)) -> bool
+    for e in escapes
+        if e.2 == f && (e.0 == at.0 && e.1 < at.1 || take_reach(c.succs, e.0).has(at.0)) then return true
+
+    false
+end take_found_again
+
+// Whether a store in the window cannot be the place: a slot of the frame (the place is never one) the
+// place's address was not read through, or a field of a struct other than the place's own, holding a
+// number, an address or a value of the place's own type -- so that neither can hold the other.
+private take_store_clear(c: TakeCtx, r: TakeRead, ty: LType, p: Val, field: string, inside: Set[string]) -> bool
+    val f = take_frame(c, p)
+
+    if f != "" then return !r.used.has(f)
+    if take_fresh(c, p, inside) then return true
+
+    val key = take_field(c, p)
+
+    if key == "" || field == "" || key == field then return false
+
+    ty match
+        LInt(_) -> true
+        LFloat(_, _) -> true
+        LPtr -> true
+        _ -> l_render(ty) == l_render(r.ty)
+end take_store_clear
+
+// Whether a call in the window writes nothing outside its own frame, releases nothing and looks at no
+// count: what `count_blind` admits, less an intrinsic that writes memory or suspends.
+private take_call_clear(c: TakeCtx, name: string, args: Buf[IrArg]) -> bool
+    if name.starts_with("llvm.coro.") then return false
+
+    // A copy or a fill writes memory; only one into a slot of the frame is known not to be the place.
+    if name.starts_with("llvm.mem") then return !args.is_empty() && take_frame(c, args[0].value) != ""
+    if name.starts_with("llvm.") then return true
+
+    take_allocator(name) || name == "sysl_bounds_fail" || name == trap_hook_symbol() || name == trap_stop_symbol() ||
+        name.starts_with("sysl.check.") || c.inert.has(name)
+end take_call_clear
+
+// Whether `name` is the C library's heap, or the counting runtime's: a call that hands back a block no
+// other name reaches and does nothing else a program can see. A manifest's own pair may be code of the
+// program's, and is admitted only where it is inert.
+private take_allocator(name: string) -> bool =
+    name == "malloc" || name == "sysl_count_alloc" || name == aligned_alloc_symbol()
+
+// Whether an address is a step into a block such a heap call handed back inside the window (`inside`,
+// as `block:index`): storage that did not exist when the place was read, so never the place.
+private take_fresh(c: TakeCtx, p: Val, inside: Set[string]) -> bool
+    var cur = p
+
+    loop
+        val n = v_render(cur)
+
+        c.defs.get(n) match
+            Some(InGep(_, _, q, _)) -> cur = q
+            Some(InGepInBounds(_, _, q, _)) -> cur = q
+            Some(InCall(Some(_), _, VGlobal(callee), _, _, _, _, _)) ->
+                if !take_allocator(callee) then return false
+
+                return c.at.get(n) match
+                    Some(at) -> inside.has(s"${at.0}:${at.1}")
+                    None -> false
+            _ -> return false
+end take_fresh
+
+// -- what the emitter tells this pass ------------------------------------------------------------------
+
+// Notes two facts of the release walk `name` of `ty`: whether letting go of a value of it runs no code
+// -- no destructor anywhere its teardown reaches, no trait object or task -- and whether what it lets
+// go of is one reference: an `Option` of a reference, whose payload is the address alone.
+note_take_walk(e: *Emit, ty: Type, name: string)
+    if e.take_walks.get(name).is_some() then return
+
+    var seen: Set[string] = set()
+    val single = underlying(ty) match
+        Enum(d) -> null_niche(d)
+        _ -> false
+
+    e.take_walks.put(name, (!tears_down(e, ty, &seen), single))
+end note_take_walk

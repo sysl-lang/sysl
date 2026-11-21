@@ -3918,6 +3918,54 @@ growing a `Buf[Value]` cannot touch a `Machine`. An `await` keeps the count, as 
 returning, capturing or keeping the value; a tuple built on the spot for a keeping call is handed over
 whole.
 
+### A read of a place that is written over next takes the place's count
+
+**A reference read out of a field or an element that is written before it is read again moves out of
+it**: the read takes no count and the write gives none back, since the count the place held is the one
+the new name needs. Popping the top of a stack is one move, not a retain and a release:
+
+```sysl
+struct Node
+    id: int
+    next: Option[&Node]
+
+struct Stack
+    top: Option[&Node]
+
+impl Stack
+    push(*self, n: &Node)
+        n.next = self.top
+        self.top = Some(n)
+
+    pop(*self) -> &Node
+        val n = self.top match
+            Some(t) -> t
+            None -> panic("an empty stack")
+
+        self.top = n.next
+        n.next = None
+        n
+
+main()
+    var s = Stack(None)
+
+    for i in 1..3
+        s.push(Node(i, None))
+
+    print(s.pop().id, s.pop().id, s.pop().id)
+```
+
+```output
+3 2 1
+```
+
+It moves only where nothing can see that the place and the name share one count. Every way on from the
+read must reach the write, or end the program as a failed check or a `panic` does; an early `return`,
+a write on one branch only, or a read inside a loop written after it keeps both counts. Between the two
+nothing may read the place again, write anything that might be it (a field of another struct, or a
+slot of the frame, cannot be), call a function that writes outside its own frame or releases anything,
+suspend, or let go of a value whose teardown runs a destructor or that holds the count just read.
+
 ### A loop lends each element to a body that lets go of nothing
 
 **`for x in seq` over elements with counted parts takes no count per element where the body cannot
