@@ -160,6 +160,68 @@ private str_unshort_text(e: *Emit, str: string) -> string
     """
 end str_unshort_text
 
+// **A string lent to C for one call, in the long form** (`emit_foreign.sysl`'s `to_c`): the same
+// words with the address and the length read through `str_data`. A long string comes out as it went
+// in. A short one comes out as `{null, &slot, n}` -- its owner word is already null -- where the slot
+// is the frame's own copy of the value, which outlives the call.
+str_lent_to_c(e: *Emit, v: Val) -> Val
+    val st = lty(e, Str)
+    val data = str_data(e, v)
+    val with_ptr = fresh_reg(e)
+
+    emit(e, InInsert(with_ptr, st, v, LPtr, data.0, index_list(1)))
+
+    val r = fresh_reg(e)
+
+    emit(e, InInsert(r, st, with_ptr, word_lty(e), data.1, index_list(2)))
+    r
+end str_lent_to_c
+
+// **A string handed to a parameter an `extern`'s `@keeps` names** (`emit_foreign.sysl`'s `to_c`): a
+// short one is copied into a `StrBuf`, whose one count goes to C with it, so C may hold the string
+// past the call and hand it back -- a string an `extern` answers is owned by the caller, which then
+// gives that count back. A long one crosses as it always has, its count untouched.
+str_kept_for_c(e: *Emit, v: Val) -> Val
+    e.heap = true
+    e.maybe_heap = true
+
+    val st = lty(e, Str)
+    val fn = request_text(e, "sysl.str.for_c", str_for_c_text(e, str_llvm(e)))
+    val r = fresh_reg(e)
+
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(st, v))
+    emit(e, ir_call(Some(r), st, VGlobal(fn), args))
+    r
+end str_kept_for_c
+
+// **`sysl.str.for_c`**, the copy `str_kept_for_c` makes: a short string's bytes in a `StrBuf` of
+// their own, and a long string as it is.
+private str_for_c_text(e: *Emit, str: string) -> string
+    val word = s"i${e.word_bits}"
+
+    request_text(e, "sysl.str.heap", str_heap_text(e, str))
+
+    val read = str_read_text(str, e.word_bits, "%s")
+    val p = str_ptr_text(str, "%s")
+    val n = str_len_text(str, e.word_bits, "%s")
+
+    s"""
+    define private $str @sysl.str.for_c($str %s) {
+    entry:
+    ${read}  br i1 %s.sh, label %copy, label %keep
+    copy:
+      %from = $p
+      %n = $n
+      %made = call $str @sysl.str.heap(ptr %from, $word %n)
+      ret $str %made
+    keep:
+      ret $str %s
+    }
+    """
+end str_for_c_text
+
 // The string whose bytes `x` reads, where `x` is `s.bytes` and the short form is on: a read that only
 // lends them for one operation takes them from the string directly (`str_data`), so it neither
 // copies a short string nor takes a share of a long one.
