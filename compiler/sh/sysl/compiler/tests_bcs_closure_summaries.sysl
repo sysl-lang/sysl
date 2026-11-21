@@ -465,6 +465,74 @@ bcs_generic()
 
     assert(counted == 1 && plain == 1, s"counted $counted plain $plain")
 
+// -- bounded growth ---------------------------------------------------------------------------------
+
+// A struct of `n` counted fields and, for each, a closure of one type that clears it, all handed to
+// `apply_big` -- the shape of a program whose walks take a closure at one type from everywhere.
+private bcs_many(n: int) -> string
+    var b = str_builder()
+
+    b.push(bcs_head())
+    b.push("struct Big\n")
+
+    for i in 0..<n
+        b.push(s"    f$i: Option[&Node]\n")
+
+    b.push("\napply_big(f: &Fn(&Big) -> unit, g: &Big) = f(g)\n\nouter(g: &Big) = apply_big(x -> (), g)\n\nuse(g: &Big)\n")
+
+    for i in 0..<n
+        b.push(s"    apply_big(x -> x.f$i = None, g)\n")
+
+    b.push("\nmain()\n    val n: &Node = Node(1, None)\n    use(Big(")
+
+    for i in 0..<n
+        b.push(if i == 0 then "Some(n)" else ", Some(n)")
+
+    b.push("))\n    outer(Big(")
+
+    for i in 0..<n
+        b.push(if i == 0 then "None" else ", None")
+
+    b.push("))\n")
+    b.finish()
+end bcs_many
+
+@test("a summary naming more than its limit is widened to opaque, and an opaque one keeps no list")
+bcs_bounded()
+    if bcs_no_library() then return
+
+    // Ten fields: each one's edge, and the payload edge they share.
+    var few = bcs_summary(bcs_program(bcs_many(10)), true)
+    val w = bcs_of(&few, "apply_big")
+
+    assert(w.opaque == "" && w.keys.len() == 11, bcs_says(w))
+
+    // More edges than the limit: widened, so neither it nor its callers carry them.
+    var many = bcs_summary(bcs_program(bcs_many(int(EdgeLimit) + 4)), true)
+    val big = bcs_of(&many, "apply_big")
+
+    assert_eq(big.opaque, s"more than $EdgeLimit edges and types to follow", bcs_says(big))
+    assert(big.keys.is_empty() && big.within.is_empty() && big.counts.is_empty(), bcs_says(big))
+    assert_eq(bcs_of(&many, "outer").opaque, big.opaque, bcs_says(bcs_of(&many, "outer")))
+    assert(bcs_of(&many, "outer").keys.is_empty(), bcs_says(bcs_of(&many, "outer")))
+
+@test("joining into an opaque summary adds nothing, and joining an opaque one empties the lists")
+bcs_opaque_absorbs()
+    var w = edge_writes_none()
+    var other = edge_writes_none()
+
+    other.key(slot_key(Unknown))
+    assert(w.join(other), bcs_says(w))
+    assert_eq(w.keys.len(), 1, bcs_says(w))
+
+    var top = edge_writes_none()
+
+    top.hide("why", "here")
+    assert(w.join(top), bcs_says(w))
+    assert(w.keys.is_empty() && w.opaque == "why", bcs_says(w))
+    assert(!w.join(other), bcs_says(w))
+    assert(!w.key(slot_key(Unknown)) && w.keys.is_empty(), bcs_says(w))
+
 // -- what letting go of an object behind a table can run --------------------------------------------
 
 private bcs_res() -> string = """

@@ -1057,7 +1057,7 @@ struct Untouched
 
     // In a program that sees every table (`untouched_summary`'s `closed`), the tables -- what a call
     // through one can run, and what an object behind one can hold -- and each type's answer to `drops`.
-    edge_tables: Option[Buf[TVtable]]
+    edge_tables: Option[TraitTables]
     drop_answers: Map[string, bool]
 end Untouched
 
@@ -1234,7 +1234,7 @@ untouched_summary(p: TProgram, dropping: Buf[Type], owning: Set[string] = set(),
     var u = untouched_none()
     val laundered = cast_sink()
     val quiet = quiet_callees(p, call_summary(p, owning))
-    val tables: Option[Buf[TVtable]] = if closed && p.entry_point then Some(p.vtables) else None
+    val tables: Option[TraitTables] = if closed && p.entry_point then Some(tables_by_trait(p.vtables)) else None
 
     val wlaundered = cast_sink()
 
@@ -1532,7 +1532,7 @@ private touch_stmt(s: TStmt) -> bool = s match
 
 private touch_node(v: &Verdict, calls: &CallSink, exits: &CallSink, ending: &KindSink,
                    roots: &TypeSink, gives: &TypeSink, laundered: &CastSink, reach: &ReachSink,
-                   dropping: Buf[Type], locals: Set[string], tables: Option[Buf[TVtable]], x: TExpr,
+                   dropping: Buf[Type], locals: Set[string], tables: Option[TraitTables], x: TExpr,
                    aliases: Set[string], fills: Fills)
     note_laundered(laundered, x)
     edge_node(reach, aliases, fills, tables.is_some(), x)
@@ -1618,7 +1618,7 @@ private hidden(v: &Verdict, reach: &ReachSink, why: string)
 //
 // **What such a call can run is then what those bodies run**, and nothing more: a receiver whose trait
 // cannot be named, or a slot a table does not have, is hidden code as a call through a pointer is.
-private slot_callees(v: &Verdict, calls: &CallSink, reach: &ReachSink, tables: Buf[TVtable], recv: TExpr,
+private slot_callees(v: &Verdict, calls: &CallSink, reach: &ReachSink, tables: TraitTables, recv: TExpr,
                      slot: int)
     val tr = erased_trait(underlying(texpr_type(recv)))
 
@@ -1933,7 +1933,7 @@ end drops
 
 // `holds_erased` where every table is known: a trait object is opened into the types its tables were
 // built for, each judged as a value of it is, and a closure's environment into its captures.
-private closed_erased(t: Type, dropping: Buf[Type], tables: Buf[TVtable], seen: *Set[string]) -> bool = t match
+private closed_erased(t: Type, dropping: Buf[Type], tables: TraitTables, seen: *Set[string]) -> bool = t match
     Trait(_, _, _) ->
         val k = s"trait ${mangle(t)}"
 
@@ -1996,26 +1996,36 @@ private closed_erased(t: Type, dropping: Buf[Type], tables: Buf[TVtable], seen: 
 // at exactly its arguments, which is the spelling each table is named by (`erase.sysl`'s `vtable_for`).
 // Where none is -- a trait whose arguments are not settled spells no table -- every table of the trait,
 // whatever its arguments.
-trait_tables(tables: Buf[TVtable], tr: Type) -> Buf[TVtable]
+trait_tables(tables: TraitTables, tr: Type) -> Buf[TVtable]
     var out: Buf[TVtable] = buf()
-    var named: Buf[TVtable] = buf()
-    val n = tr match
-        Trait(name, _, _) -> name
-        _ -> ""
+    val named = tr match
+        Trait(name, _, _) -> tables.get(name).unwrap_or(buf())
+        _ -> buf()
 
     val m = mangle(tr)
 
-    for vt in tables
-        if vt.trait_name != n then continue
-
-        named.push(vt)
-
+    for vt in named
         val own = member_symbol(vt.for_type)
 
         if vt.name == s"vt.$m.$own" || vt.name == s"vt.ref.$m.$own" then out.push(vt)
 
     if out.is_empty() then named else out
 end trait_tables
+
+// A program's tables by the name of the trait each is for.
+type TraitTables = Map[string, Buf[TVtable]]
+
+tables_by_trait(tables: Buf[TVtable]) -> TraitTables
+    var out: TraitTables = map()
+
+    for vt in tables
+        var some = out.get(vt.trait_name).unwrap_or(buf())
+
+        some.push(vt)
+        out.put(vt.trait_name, some)
+
+    out
+end tables_by_trait
 
 // What a call through slot `slot` of the table `recv` carries may write before it returns: in a
 // program that sees every table, what the function in that slot of each table `trait_tables` finds
@@ -2588,6 +2598,13 @@ edge_text(k: EdgeKey) -> string =
 //
 // **The answer is shared, not copied**: its lists are the summary's own, so a caller reads it and
 // never changes it.
+//
+// **Opaque is the top, and it absorbs**: an opaque summary may write every edge and read every count,
+// so it keeps no list -- they are let go of when it becomes opaque, and nothing is added after. **A
+// summary that would name more than `EdgeLimit` things is widened to opaque**, which bounds both what
+// each function's answer holds and how many times the fixed point can grow it: a call through a
+// closure of a type the whole program makes many closures at (the compiler's own walks) reaches most
+// of the program, and following every edge all of that writes is worth nothing to a caller anyway.
 struct EdgeWrites
     keys: Buf[EdgeKey]
     named: Set[string]
@@ -2597,40 +2614,52 @@ struct EdgeWrites
     opaque_in: string
 
     key(*self, k: EdgeKey) -> bool
-        if self.named.has(k.text) then return false
+        if self.opaque != "" || self.named.has(k.text) then return false
 
         self.named.add(k.text)
         self.keys.push(k)
-        true
+        self.bound()
 
     inside(*self, t: Type) -> bool
         val u = underlying(t)
 
-        if has_type(self.within, u) then return false
+        if self.opaque != "" || has_type(self.within, u) then return false
 
         self.within.push(u)
-        true
+        self.bound()
 
     count(*self, t: Type) -> bool
         val u = underlying(t)
 
-        if has_type(self.counts, u) then return false
+        if self.opaque != "" || has_type(self.counts, u) then return false
 
         self.counts.push(u)
-        true
+        self.bound()
 
     hide(*self, why: string, at: string) -> bool
         if self.opaque != "" then return false
 
         self.opaque = why
         self.opaque_in = at
+        self.keys = buf()
+        self.named = set()
+        self.within = buf()
+        self.counts = buf()
+        true
+
+    // Something was added: widened to opaque where it now names more than `EdgeLimit` things.
+    bound(*self) -> bool
+        if self.keys.len() + self.within.len() + self.counts.len() > EdgeLimit
+            self.hide(s"more than $EdgeLimit edges and types to follow", "")
+
         true
 
     // Adds what `other` may write; whether anything was new.
     join(*self, other: EdgeWrites) -> bool
-        var grew = false
+        if self.opaque != "" then return false
+        if other.opaque != "" then return self.hide(other.opaque, other.opaque_in)
 
-        if other.opaque != "" then grew = self.hide(other.opaque, other.opaque_in) || grew
+        var grew = false
 
         for item in other.keys
             grew = self.key(item) || grew
@@ -2643,6 +2672,10 @@ struct EdgeWrites
 
         grew
 end EdgeWrites
+
+// The most edges, written-through types and count-read types one summary names before it is widened
+// to opaque.
+const EdgeLimit: usize = 64
 
 edge_writes_none() -> EdgeWrites = EdgeWrites(buf(), set(), buf(), buf(), "", "")
 
@@ -3092,14 +3125,20 @@ private edge_solve(u: *Untouched, abandoning: Set[string]) -> Buf[EdgeWrites]
         fix.push(w)
         callers.push(buf())
 
+    // Each callee once: a call through a closure names every closure of its type, at every such call.
     for i in 0..<u.names.len()
         var callees: Buf[string] = buf()
+        var named: Set[string] = set()
 
         for item in u.calls[i]
-            callees.push(item)
+            if !named.has(item)
+                named.add(item)
+                callees.push(item)
 
         for item in u.exits[i]
-            if abandoning.has(item) then callees.push(item)
+            if abandoning.has(item) && !named.has(item)
+                named.add(item)
+                callees.push(item)
 
         for item in callees
             u.edge_index.get(item) match
