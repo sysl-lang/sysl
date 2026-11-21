@@ -185,7 +185,18 @@ It is a *starting position*, not a smaller input: `^` still means the beginning 
 `$` its end, so the second match in a line is not handed a `^` that suddenly holds. Slicing the input
 and searching the remainder — the obvious way to write `find_all` — gets exactly that wrong.
 
-    exec_from(prog: Program, input: string, from: usize) -> Option[[]int]
+    exec_from(prog: Program, input: string, from: usize) -> Option[[]int] =
+        run(prog, input, from, false, input.bytes.len)
+
+The lazy DFA beside this file finds where a match lies, and when the pattern has groups this fills
+them in: a run **anchored** at the match's start — a thread is started there and nowhere else — and
+stopped once the match's end has been looked at, since nothing past it can be part of this match.
+`$` still means the end of the whole text.
+
+    private[regex] exec_span(prog: Program, input: string, start: usize, stop: usize) -> Option[[]int] =
+        run(prog, input, start, true, stop)
+
+    private run(prog: Program, input: string, from: usize, anchored: bool, stop: usize) -> Option[[]int]
         var src = input.bytes
         var slots = prog.slots()
         var vm = Vm(prog, src, slots, [unset; prog.len()])
@@ -204,7 +215,7 @@ and searching the remainder — the obvious way to write `find_all` — gets exa
         val fresh: []int = [unset; slots]
 
         while going
-            if !matched && clist.len() == 0
+            if !matched && clist.len() == 0 && !anchored
                 firsts match
                     Some(fs) -> skip_to_begin(prog, fs, &cur)
                     None -> ()
@@ -217,7 +228,7 @@ and searching the remainder — the obvious way to write `find_all` — gets exa
 
             var after = look.offset
 
-            if !matched
+            if !matched && (!anchored || at == from)
                 vm.add(clist, 0, fresh, gen, at)
 
             nlist.clear()
@@ -252,12 +263,12 @@ and searching the remainder — the obvious way to write `find_all` — gets exa
             nlist = swap
             gen += 1
 
-            if here.is_none() then going = false
-            elif clist.len() == 0 && matched then going = false
+            if here.is_none() || at >= stop then going = false
+            elif clist.len() == 0 && (matched || anchored) then going = false
             else cur.next()
 
         if matched then Some(best) else None
-    end exec_from
+    end run
 
 The last arm cannot be reached. Everything that does not consume a character is followed by the
 closure and never lands in the list, so an instruction arriving here means the closure and this loop

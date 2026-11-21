@@ -74,7 +74,7 @@ buf_side(x: TExpr) -> IrAccess = *x.kind match
                     else AccPlain
                 other -> other
     TIndex(receiver, _, _) -> nameless(texpr_type(receiver)) match
-        Array(_, _) -> buf_side(receiver)
+        Array(_, _, _) -> buf_side(receiver)
         Slice(_, _) -> if is_core_elems(receiver) then AccBufElement else AccPlain
         _ -> AccPlain
     _ -> AccPlain
@@ -262,7 +262,7 @@ element_addr(e: *Emit, receiver: TExpr, index: TExpr, site: Span) -> Val
     val rty = nameless(texpr_type(receiver))
 
     val parts = rty match
-        Array(n, elem) -> (address(e, receiver), Some(VInt(from_int(long(n)))), *elem)
+        Array(n, elem, _) -> (address(e, receiver), Some(VInt(from_int(long(n)))), *elem)
         Slice(elem, _) -> view_parts(e, receiver, *elem)
         Str -> view_parts(e, receiver, byte_type())
         Ptr(elem, _) -> (gen_expr(e, receiver), None, *elem)
@@ -311,7 +311,7 @@ run_addr(e: *Emit, receiver: TExpr, index: TExpr, lanes: int, site: Span) -> Val
     val rty = texpr_type(receiver)
 
     val parts = rty match
-        Array(n, elem) -> (address(e, receiver), VInt(from_int(long(n))), *elem)
+        Array(n, elem, _) -> (address(e, receiver), VInt(from_int(long(n))), *elem)
         Slice(elem, _) ->
             val v = view_parts(e, receiver, *elem)
 
@@ -363,7 +363,7 @@ end run_addr
 // anyway; the SLP vectoriser is free to merge them where the target has one.
 gen_gather(e: *Emit, receiver: TExpr, idx: TExpr, vec_ty: Type, checked: bool, site: Span) -> Val
     val parts = texpr_type(receiver) match
-        Array(n, elem) -> (address(e, receiver), VInt(from_int(long(n))), *elem)
+        Array(n, elem, _) -> (address(e, receiver), VInt(from_int(long(n))), *elem)
         Slice(elem, _) ->
             val v = view_parts(e, receiver, *elem)
 
@@ -384,7 +384,7 @@ gen_gather(e: *Emit, receiver: TExpr, idx: TExpr, vec_ty: Type, checked: bool, s
         _ -> (e.word_bits, false)
 
     val n = repr(vec_ty) match
-        Vector(k, _) -> k
+        Vector(k, _, _) -> k
         _ -> 0
 
     var out = VPoison
@@ -942,7 +942,7 @@ end whole_from_bits
 spine_root(place: TExpr) -> Option[TExpr] = *place.kind match
     TField(r, _, _) -> spine_root(r)
     TIndex(r, _, _) -> underlying(texpr_type(r)) match
-        Array(_, _) -> spine_root(r)
+        Array(_, _, _) -> spine_root(r)
         Slice(_, _) -> Some(place)
         _ -> None
     TDeref(_, _) -> Some(place)
@@ -1065,7 +1065,7 @@ private address_under(e: *Emit, place: TExpr, root: TExpr, at: Val) -> Val
 
         TIndex(r, index, _) ->
             val parts = underlying(texpr_type(r)) match
-                Array(n, elem) -> (long(n), *elem)
+                Array(n, elem, _) -> (long(n), *elem)
                 _ -> (long(0), int_type())
             val base = address_under(e, r, root, at)
             val i = widen_index(e, index, place.span)
@@ -1176,7 +1176,7 @@ private view_base_stands(e: *Emit, base: TExpr, callee: string, written: Set[str
         Str -> stands_for_call(e, base, callee, written)
         Ref(_, _) -> stands_for_call(e, base, callee, written)
         Ptr(_, _) -> true
-        Array(_, _) ->
+        Array(_, _, _) ->
             val root = spine_root(base)
 
             if root.is_none() then return true
@@ -1353,7 +1353,7 @@ end gen_slice_of
 private slice_base(e: *Emit, base: TExpr, slice_ty: Type) -> (Val, Val, Option[Val]) = nameless(texpr_type(base)) match
     // A `&sync` array's view owns nothing of the box, as a view of storage inside one does.
     Ref(inner, sync) -> underlying(*inner) match
-        Array(n, _) ->
+        Array(n, _, _) ->
             val r = gen_expr(e, base)
             val p = fresh_reg(e)
 
@@ -1374,13 +1374,13 @@ private slice_base(e: *Emit, base: TExpr, slice_ty: Type) -> (Val, Val, Option[V
     // frame-backed array has no owner, so counting it is a no-op -- unless the escape analysis moved
     // it to the heap, in which case the buffer it moved into is exactly what a view of it must count
     // against. Nothing makes a `*T` region safe; that is what `*T` is.
-    Array(n, _) ->
+    Array(n, _, _) ->
         val owned = address_owned(e, base)
 
         (owned.0, owned.1, Some(VInt(from_int(long(n)))))
 
     Ptr(inner, _) -> underlying(*inner) match
-        Array(n, _) ->
+        Array(n, _, _) ->
             if views_pointees(slice_ty, *inner) then return (VNull, gen_expr(e, base), None)
 
             (VNull, gen_expr(e, base), Some(VInt(from_int(long(n)))))
