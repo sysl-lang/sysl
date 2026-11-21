@@ -110,10 +110,20 @@ private back_size(b: Option[Back]) -> usize = b match
     None -> 0
 
 // One way a candidate is given a value: an expression it is assigned (`var x = v`, `x = v`), or a
-// part bound out of a subject along `steps`, each the edge key of a payload field or struct field.
+// part bound out of a subject along `steps`, each the edge key of a payload field or struct field. A
+// rewritten parameter has two more: the value it arrived with (`DEntry`, backed by its entry root),
+// and each argument a self-jump stages for it (`DJump`).
 private enum Def
     DValue(x: TExpr)
     DPart(subject: TExpr, steps: Buf[EdgeKey])
+    DEntry(name: string)
+    DJump(x: TExpr)
+
+// The root that stands for the value parameter `name` arrived with: the caller's, held for the whole
+// activation, jumps included, however often the parameter's own slot is written.
+private entry_root(name: string) -> string = name + "@entry"
+
+private is_entry_root(r: string) -> bool = r.ends_with("@entry")
 
 // What can cut a candidate's chain inside its scope: a store or a call's summary (`w`, with `what`
 // naming it for the report), or a root's slot written or used where its count could move (`root`). A
@@ -142,6 +152,11 @@ private struct Gather
     index: Map[string, usize]
     barred: Set[string]
     stores: Buf[(string, TExpr)]
+    // The function's parameters, the self-calls it jumps at (by span, as the emitter finds them), and
+    // what each jump stages for each parameter.
+    params: Buf[(string, Type)]
+    sites: Buf[Span]
+    jumps: Buf[(string, TExpr)]
 
     add(*self, c: Cand)
         if self.index.has(c.name) then return
@@ -176,15 +191,49 @@ take_local_notes() -> Buf[LocalNote]
     out
 end take_local_notes
 
+// What the analysis answers for one body: the names that hold no count -- locals, and rewritten
+// parameters borrowed throughout -- and the rewritten parameters that are counted but every one of
+// whose self-jump arguments arrives with a count of its own, which a peel can borrow on entry
+// (`borrow-inference.md` §4.3 (b)).
+struct Plus0
+    names: Set[string]
+    fresh: Set[string]
+end Plus0
+
 // **The +0 locals of `f`**, emitted with the parameters `owned` owns, `jumps` where the body jumps
 // back to its own entry.
-plus0_locals(e: *Emit, f: TFunc, owned: Set[string], jumps: bool) -> Set[string]
+//
+// **A rewritten parameter** (`rewritten`: one the body assigns or jumps with, which `owning` would
+// own) is a candidate as a local is, its definitions the value it arrived with -- backed by its entry
+// root, the caller's for the whole activation -- every assignment, and every argument a self-jump
+// stages for it. Borrowed throughout where every one is backed by entry roots (or, in a body that
+// never jumps, by another parameter) and nothing in the body cuts the chain: no entry retain, no exit
+// release, a plain store at each assignment and no count staged at a jump. Never a local root: a
+// jump gives up the frame's locals, and the parameter outlives each one.
+//
+// `peelable` is whether the function may be peeled at all (`emit_func.sysl`'s `peel_shape`); only then
+// is a parameter answered in `fresh`, and only one whose type cannot run a destructor -- such a one
+// keeps its entry retain, as the design leaves it.
+plus0_locals(e: *Emit, f: TFunc, owned: Set[string], jumps: bool, rewritten: Set[string] = set(),
+             peelable: bool = false) -> Plus0
     var out: Set[string] = set()
-    val g: &Gather = Gather(buf(), map(), set(), buf())
+    var fresh: Set[string] = set()
+    val g: &Gather = Gather(buf(), map(), set(), buf(), f.params, tail_calls_of(f), buf())
+    var result: Buf[TExpr] = buf()
+
+    if f.body.result.is_some() then result.push(f.body.result.unwrap())
+
+    for p in f.params
+        if rewritten.has(p.0)
+            var defs: Buf[Def] = buf()
+
+            defs.push(DEntry(p.0))
+            g.add(Cand(p.0, f.span, defs, f.body.stmts, result))
+    end for
 
     gather_body(e, g, f)
 
-    if g.cands.is_empty() then return out
+    if g.cands.is_empty() then return Plus0(out, fresh)
 
     // Every definition an assignment makes, and the candidates that cannot be +0 whatever their values.
     for item in g.stores
@@ -192,14 +241,21 @@ plus0_locals(e: *Emit, f: TFunc, owned: Set[string], jumps: bool) -> Set[string]
             Some(i) -> g.cands[i].defs.push(DValue(item.1))
             None -> ()
 
+    for item in g.jumps
+        g.index.get(item.0) match
+            Some(i) -> if rewritten.has(item.0) then g.cands[i].defs.push(DJump(item.1))
+            None -> ()
+
     // **Only a local that is read through is a candidate** -- a field read off it, a deref of it, a
     // `match` on it, an `is` test of it. One that is only passed along is better counted: its count
-    // moves from what it was built of to where it is handed, and a +0 one would take a count there.
+    // moves from what it was built of to where it is handed, and a +0 one would take a count there. A
+    // rewritten parameter is the exception: counted, it pays at entry and at exit whatever it does.
     val read = read_through(f)
     var alive: Buf[bool] = buf()
 
     for c in g.cands
-        alive.push(!g.barred.has(c.name) && !c.defs.is_empty() && read.has(c.name) && eligible(e, c.name))
+        alive.push(!g.barred.has(c.name) && !c.defs.is_empty() && (read.has(c.name) || rewritten.has(c.name)) &&
+                   eligible(e, c.name))
 
     // The roots: parameters a body that never jumps back holds for the whole activation, and the
     // locals of its top block, alive to its end.
@@ -240,7 +296,9 @@ plus0_locals(e: *Emit, f: TFunc, owned: Set[string], jumps: bool) -> Set[string]
         for i in 0..<g.cands.len()
             if !alive[i] then continue
 
-            val said = refusal(e, g, alive, backs, events[i], params, owned, tops, i)
+            var said = refusal(e, g, alive, backs, events[i], params, owned, tops, i)
+
+            if said == "" && rewritten.has(g.cands[i].name) then said = local_root(backs[i], params)
 
             if said != ""
                 alive[i] = false
@@ -262,10 +320,71 @@ plus0_locals(e: *Emit, f: TFunc, owned: Set[string], jumps: bool) -> Set[string]
 
         shaped[i] = shaped[i] || alive[i]
 
-    if explaining_borrows() then note_locals(f, g, alive, shaped, why, backs)
+    // A counted parameter that only self-jumps, every argument it is staged arriving with a count of
+    // its own: the peel's (§4.3 (b)). One the body also assigns stays owned, the assignment needing a
+    // slot that holds a count.
+    if jumps && peelable
+        for i in 0..<g.cands.len()
+            val c = g.cands[i]
 
-    out
+            if alive[i] || !rewritten.has(c.name) || g.barred.has(c.name) then continue
+
+            var drops = false
+
+            for p in f.params
+                if p.0 == c.name && may_run_drop(p.1, e.untouched.dropping) then drops = true
+
+            if drops then continue
+
+            var jumped = false
+            var all_fresh = true
+
+            for d in c.defs
+                d match
+                    DJump(x) ->
+                        jumped = true
+
+                        if !fresh_arg(x) then all_fresh = false
+                    DValue(_) -> all_fresh = false
+                    DPart(_, _) -> all_fresh = false
+                    DEntry(_) -> ()
+
+            if jumped && all_fresh then fresh.add(c.name)
+    end if
+
+    if explaining_borrows() then note_locals(f, g, alive, shaped, why, backs, rewritten, fresh)
+
+    Plus0(out, fresh)
 end plus0_locals
+
+// Why a rewritten parameter may not be borrowed although its chain is intact: a value of it is backed
+// by a local of the frame, which a jump gives up and the parameter outlives. Empty where every root is
+// an entry root or a parameter.
+private local_root(b: Option[Back], params: Set[string]) -> string
+    if b.is_none() then return ""
+
+    for r in b.unwrap().roots
+        if !is_entry_root(r) && !params.has(r) then return s"it is assigned a value borrowed from the local '${shown(r)}'"
+
+    ""
+end local_root
+
+// Whether a self-jump's argument arrives with a count of its own: anything but a value read out of a
+// place -- a call's answer, a box, a literal -- or a value built on the spot of such parts.
+private fresh_arg(x: TExpr) -> bool = *x.kind match
+    TLoad(_, _) -> false
+    TField(_, _, _) -> false
+    TDeref(_, _) -> false
+    TIndex(_, _, _) -> false
+    TEnumNew(_, _, args) -> all_fresh_args(args)
+    TStructNew(_, args) -> all_fresh_args(args)
+    _ -> true
+
+private all_fresh_args(args: Buf[TExpr]) -> bool
+    for item in args
+        if contains_counted(texpr_type(item)) && !fresh_arg(item) then return false
+
+    true
 
 // A local whose storage the emitter lays down in a way of its own is never a candidate: a promoted
 // one, a frame array's, the one built in the caller's result storage, a large one, a `@unique` one.
@@ -353,6 +472,11 @@ private gather_node(e: *Emit, g: &Gather, x: TExpr) = *x.kind match
         gather_list(e, g, body, None)
         gather_block(e, g, else_block)
     TStore(place, value, _, _) -> gather_place(g, place, value, true)
+    // A self-call `tail_calls_of` names is a jump: it stages each argument into its parameter's slot.
+    TCall(_, args, _, _) ->
+        if is_tail_call(g.sites, x.span)
+            for j in 0..<args.len()
+                if j < g.params.len() then g.jumps.push((g.params[j].0, args[j]))
     TUpdate(place, _, _, _, _, _, _) -> bar_place(g, place)
     TIncDec(place, _, _, _, _) -> bar_place(g, place)
     TAddrOf(place, _) -> bar_place(g, place)
@@ -699,6 +823,8 @@ end settle
 private def_back(g: &Gather, alive: Buf[bool], backs: Buf[Option[Back]], params: Set[string], tops: Set[string],
                  d: Def) -> Option[Back] = d match
     DValue(x) -> backing(g, alive, backs, params, tops, x)
+    DJump(x) -> backing(g, alive, backs, params, tops, x)
+    DEntry(name) -> Some(back_root(entry_root(name)))
     DPart(subject, steps) ->
         var b = backing(g, alive, backs, params, tops, subject)
 
@@ -792,10 +918,24 @@ end refusal
 
 private fresh_reason(e: *Emit, g: &Gather, alive: Buf[bool], backs: Buf[Option[Back]], params: Set[string],
                      tops: Set[string], c: Cand) -> string
+    // A value that arrives with a count by itself names the cause better than one read out of another
+    // candidate that was refused for it.
+    for d in c.defs
+        val x = d match
+            DValue(v) -> Some(v)
+            DJump(v) -> Some(v)
+            _ -> None
+
+        if x.is_some() && fresh_arg(x.unwrap()) && def_back(g, alive, backs, params, tops, d).is_none() then
+            return s"it is assigned a value with a count of its own at ${line_col(e, x.unwrap().span)}"
+    end for
+
     for d in c.defs
         if def_back(g, alive, backs, params, tops, d).is_none()
             val at = d match
                 DValue(x) -> x.span
+                DJump(x) -> x.span
+                DEntry(_) -> c.at
                 DPart(subject, _) -> subject.span
 
             return s"it is assigned a value with a count of its own at ${line_col(e, at)}"
@@ -815,7 +955,7 @@ private shown(name: string) -> string
     var n = 0usize
 
     for b in name.bytes
-        if b == u8('$') || b == u8('#') || b == u8('%') || b == u8('.') then break
+        if b == u8('$') || b == u8('#') || b == u8('%') || b == u8('.') || b == u8('@') then break
 
         n += 1
 
@@ -826,19 +966,27 @@ end shown
 
 // One line per candidate whose values are read out of storage: the +0 ones with their roots and
 // edges, and the counted ones with the first thing that keeps them counted.
+//
+// A rewritten parameter's line names its function: borrowed throughout, borrowed on entry and owned
+// after the first jump (the peel), or counted and why.
 private note_locals(f: TFunc, g: &Gather, alive: Buf[bool], shaped: Buf[bool], why: Buf[string],
-                    backs: Buf[Option[Back]])
+                    backs: Buf[Option[Back]], rewritten: Set[string], fresh: Set[string])
     if f.src.is_none() || is_closure_body(f) || std_module(f.declared_in) then return
 
     val src = f.src.unwrap()
 
     for i in 0..<g.cands.len()
-        if !shaped[i] then continue
-
         val c = g.cands[i]
+        val param = rewritten.has(c.name)
+
+        if !shaped[i] && !(param && fresh.has(c.name)) then continue
+
         val at = src.locate(c.at.start)
-        val head = s"${src.name}:${at.line}:${at.col + literate_shift(src)}: '${shown(c.name)}'"
-        val text = if alive[i] then s"$head holds no count: ${borrowed_from(backs[i])}" else s"$head is counted: ${why[i]}"
+        val place = s"${src.name}:${at.line}:${at.col + literate_shift(src)}: "
+        val head = if param then s"$place'${module_bare(f.name)}' parameter '${shown(c.name)}'" else s"$place'${shown(c.name)}'"
+        val text = if alive[i] then s"$head holds no count: ${borrowed_from(backs[i])}"
+                   else if param && fresh.has(c.name) then s"$head borrowed on entry; owned after the self-call at ${line_col_of(src, g.sites)} (fresh arguments)"
+                   else s"$head is counted: ${why[i]}"
 
         // A generic body is lowered once per instance; its first instance speaks for the line.
         if pzl_seen.has(head) then continue
@@ -846,6 +994,15 @@ private note_locals(f: TFunc, g: &Gather, alive: Buf[bool], shaped: Buf[bool], w
         pzl_seen.add(head)
         pzl_notes.push(LocalNote(src.name, c.at.start, text))
 end note_locals
+
+// Where the first of a body's self-jumps was written.
+private line_col_of(src: Source, sites: Buf[Span]) -> string
+    if sites.is_empty() then return "?"
+
+    val where = src.locate(sites[0].start)
+
+    s"${where.line}:${where.col + literate_shift(src)}"
+end line_col_of
 
 private borrowed_from(b: Option[Back]) -> string
     if b.is_none() then return "borrowed"

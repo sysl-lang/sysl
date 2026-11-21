@@ -1,0 +1,621 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{cstring, str_builder}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **A rewritten parameter whose every value is backed takes no count; a self-jumping one handed fresh
+// values is peeled** (`plus0_locals.sysl`, `emit_func.sysl`'s `rewritten_params`/`peel_shape`,
+// `docs/design/borrow-inference.md` §4.3, decisions 8-9, §10's rows P6, P7, P8's entry half, A11).
+//
+// Two proofs, as §10 asks: the IR of the named function -- its count operations, and whether an owned
+// half `<symbol>.owned` is defined beside it -- and runs on the counted heap at both ends of the
+// optimizer and under AddressSanitizer with the instrumentation confirmed, each printing what the
+// installed compiler's build of the same program prints.
+//
+// The axes: how the parameter is rewritten (assigned in a loop, a self-jump with a backed value, with
+// a fresh one, with both), what reaches the function (a direct call, a table, a function value, a
+// call from another package's artifact -- `-O2` copying the body in, `-O0` calling the artifact's), the
+// parameter's type (a reference, a `Drop` reference), and jumps that swap or re-stage parameters
+// (`tail_calls`' `go(next, list)`). Cells not written: a generic jumping function per instance --
+// the analysis is asked per instance as BI2's locals are, and nothing about a parameter differs; a
+// rewritten `async` or `@export` parameter -- refused by `rewritten_params` before anything is asked,
+// as `owning` already keeps every one; the argument half of P8 -- BI3's (held arguments).
+
+private extern "setenv" blj_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" blj_c_unsetenv(name: *u8) -> int
+
+private struct BljRun
+    ok: bool
+    out: string
+    err: string
+    hooks: usize
+
+private blj_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end blj_ready
+
+// The list every program walks: `make(5)` is 4, 3, 2, 1, 0.
+private blj_head() -> string = """
+    struct Node
+        v: int
+        next: Option[&Node]
+
+    make(n: int) -> Option[&Node]
+        var head: Option[&Node] = None
+
+        for i in 0..<n
+            head = Some(Node(i, head))
+
+        head
+
+    length(p: Option[&Node]) -> int
+        var n = 0
+        var cur = p
+
+        while cur is Some(c)
+            n += 1
+            cur = c.next
+
+        n
+
+    """
+
+private blj_ir(text: string, level: string) -> string
+    val root = make_temp_dir("sysl-blj").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None, level) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end blj_ir
+
+// The definition of exactly `symbol` (a root function's is `name$$sysl`, its owned half
+// `name$$sysl.owned`), from its `define` to the closing brace, or empty where there is none.
+private blj_define(out: string, symbol: string) -> string
+    var b = str_builder()
+    var inside = false
+
+    for line in lines_of(out)
+        if !inside && line.starts_with("define ") && (line.contains(s"@$symbol(") || line.contains(s"@\"$symbol\"(")) then
+            inside = true
+
+        if inside
+            if line == "}" then return b.finish()
+
+            b.push(line)
+            b.push_char('\n')
+
+    b.finish()
+end blj_define
+
+// A root function's symbol, and its owned half's.
+private blj_sym(name: string) -> string = name + "$$sysl"
+
+private blj_owned(name: string) -> string = name + "$$sysl.owned"
+
+private blj_body(out: string, name: string) -> string
+    val f = blj_define(out, blj_sym(name))
+
+    if f == "" then s"no definition of '$name' in:\n$out" else f
+
+// The count operations of a body: every retain, release, copy and dispose it calls.
+private blj_ops(body: string) -> usize =
+    body.count_of("call void @arc.retain") + body.count_of("call void @arc.release") +
+        body.count_of("call void @arc.copy.") + body.count_of("call void @arc.dispose.")
+
+// The prologue of a body: from `entry:` to the first label after it that is not one of the blocks a
+// count of an `Option` is taken in (`arc.held…`, `arc.walked…`).
+private blj_entry(body: string) -> string
+    var b = str_builder()
+    var inside = false
+
+    for line in lines_of(body)
+        if line == "entry:"
+            inside = true
+            continue
+        end if
+
+        if inside && line.ends_with(":") && !line.starts_with(" ") && !line.starts_with("arc.") then return b.finish()
+
+        if inside
+            b.push(line)
+            b.push_char('\n')
+
+    b.finish()
+end blj_entry
+
+// `name`'s body at both ends of the optimizer holds exactly `n` count operations (at most `n` once
+// optimized), and has no owned half.
+private blj_counts(text: string, name: string, n: usize)
+    if !blj_ready() then return
+
+    for level in ["0", "2"]
+        val out = blj_ir(text, level)
+        val f = blj_body(out, name)
+
+        assert(f.starts_with("define"), f)
+
+        if level == "0" then assert_eq(blj_ops(f), n, s"-O$level:\n$f")
+        else assert(blj_ops(f) <= n, s"-O$level:\n$f")
+
+        assert_eq(blj_define(out, blj_owned(name)), "", s"-O$level: '$name' was peeled")
+end blj_counts
+
+// `name` is peeled: its entry block takes no count, and its owned half is defined beside it.
+private blj_peeled(text: string, name: string)
+    if !blj_ready() then return
+
+    val out = blj_ir(text, "0")
+    val f = blj_body(out, name)
+
+    assert(f.starts_with("define"), f)
+    assert_eq(blj_ops(blj_entry(f)), 0, f)
+    assert(blj_define(out, blj_owned(name)).starts_with("define internal"), out)
+    assert(f.contains("@" + blj_owned(name) + "("), f)
+end blj_peeled
+
+// `name` is neither borrowed nor peeled: its entry block takes a count, and it has no owned half.
+private blj_still_owned(text: string, name: string)
+    if !blj_ready() then return
+
+    val out = blj_ir(text, "0")
+    val f = blj_body(out, name)
+
+    assert(f.starts_with("define"), f)
+    assert(blj_ops(blj_entry(f)) > 0, f)
+    assert_eq(blj_define(out, blj_owned(name)), "", out)
+end blj_still_owned
+
+private blj_run(text: string, level: string, counted: bool, flags: string) -> BljRun
+    val root = make_temp_dir("sysl-blj").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    if counted then force_alloc_counting(true)
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+        val v = cstring(flags)
+
+        blj_c_setenv(n.ptr, v.ptr, 1)
+    end if
+
+    val built = build_native_program(s"$root/main.sysl", None, None, level, Some(exe))
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+
+        blj_c_unsetenv(n.ptr)
+
+    if counted then force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return BljRun(false, failure_text(why), "", 0)
+        Ok(_) -> ()
+
+    val hooks = capture("nm", ["-u", exe], "", [], true) match
+        Ok(o) -> o.text.count_of("__asan_report")
+        Err(_) -> 0
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> BljRun(false, "could not be started", "", 0)
+        Ok(o) -> BljRun(o.status.ok(), o.text, o.err.unwrap_or(""), hooks)
+end blj_run
+
+// Printed exactly `expected` at both ends of the optimizer on the counted heap, giving everything back,
+// and again under AddressSanitizer with the instrumentation in the binary.
+private blj_prints(text: string, expected: string)
+    if !blj_ready() then return
+
+    for level in ["0", "2"]
+        val run = blj_run(text, level, true, "")
+
+        assert(run.ok, s"-O$level: ${run.out}${run.err}")
+        assert_eq(run.out, expected)
+        assert(alloc_count_reported(run.err) == 0, s"-O$level: ${run.err}")
+
+    val asan = blj_run(text, "0", false, "-fsanitize=address -g")
+
+    assert(asan.hooks > 0, "the AddressSanitizer build carries no instrumentation")
+    assert(asan.ok, s"asan: ${asan.out}${asan.err}")
+    assert_eq(asan.out, expected)
+end blj_prints
+
+// The `--explain-borrows` line about parameter `param` of `func`, without the file it names.
+private blj_explain(text: string, func: string, param: string) -> string
+    if !blj_ready() then return ""
+
+    val root = make_temp_dir("sysl-blj").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    var notes: Buf[string] = buf()
+    val noted = &notes
+    val file = s"$root/main.sysl"
+    var args: Buf[string] = buf()
+
+    args.push("sysl")
+    args.push("emit-llvm")
+    args.push("--explain-borrows")
+    args.push(file)
+    run_cli_noted(args.view(), (line) -> (), (line) -> noted.push(line))
+    remove_dir_all(root).unwrap_or(())
+
+    for item in notes
+        if item.starts_with(file + ":") && item.contains(s"'$func' parameter '$param' ") then
+            return item[file.len + 1..<item.len]
+
+    s"no line for '$func' parameter '$param' in: $notes"
+end blj_explain
+
+// -- borrowed throughout (§4.3 (a)) ------------------------------------------------------------------
+
+private blj_p6() -> string = blj_head() + """
+    go(p: Option[&Node], acc: int) -> int = p match
+        Some(n) -> go(n.next, acc + n.v)
+        None -> acc
+
+    print(go(make(5), 0))
+
+    """
+
+@test("P6: a self-jump whose argument is read out of what the caller handed over takes no count, and is not peeled")
+blj_p6_jump_with_a_backed_argument()
+    blj_counts(blj_p6(), "go", 0)
+    blj_prints(blj_p6(), "10\n")
+
+@test("P6: --explain-borrows says the jumping parameter holds no count, and where it is borrowed from")
+blj_p6_explained()
+    if !blj_ready() then return
+
+    assert_eq(blj_explain(blj_p6(), "go", "p"),
+              "23:1: 'go' parameter 'p' holds no count: borrowed from 'p' through Node.next, sysl.Option[&Node].Some.value")
+
+private blj_p7() -> string = blj_head() + """
+    total(p: Option[&Node]) -> int
+        var sum = 0
+
+        while p is Some(n)
+            sum += n.v
+            p = n.next
+
+        sum
+
+    print(total(make(5)))
+
+    """
+
+@test("P7: a parameter assigned in a loop that walks what it was handed takes no count at all")
+blj_p7_assigned_in_a_loop()
+    blj_counts(blj_p7(), "total", 0)
+    blj_prints(blj_p7(), "10\n")
+
+// A parameter returned is kept: the one count is taken at the return, as for a +0 local.
+private blj_p7_return() -> string = blj_head() + """
+    last(p: Option[&Node]) -> Option[&Node]
+        while p is Some(n)
+            if n.next.is_none() then return p
+
+            p = n.next
+
+        p
+
+    print(last(make(5)).unwrap().v)
+
+    """
+
+@test("P7: a walking parameter that is returned takes its count only at the return")
+blj_p7_returned()
+    blj_prints(blj_p7_return(), "0\n")
+
+// A walking parameter whose list is cut through an alias mid-walk (A1's shape): the store writes
+// `Node.next`, so the parameter keeps the count that holds the rest of the list alive.
+private blj_cut() -> string = blj_head() + """
+    cut_walk(p: Option[&Node], other: &Node) -> int
+        var sum = 0
+
+        while p is Some(n)
+            sum += n.v
+
+            if n.v == 3 then other.next = None
+
+            p = n.next
+
+        sum
+
+    main()
+        val l = make(5)
+
+        print(cut_walk(l, l.unwrap()))
+
+    """
+
+@test("A1: a parameter walking a list another reference cuts mid-walk keeps its count")
+blj_cut_keeps_its_count()
+    blj_still_owned(blj_cut(), "cut_walk")
+    blj_prints(blj_cut(), "10\n")
+
+// A parameter assigned a list it made: counted as before.
+private blj_refill() -> string = blj_head() + """
+    refill(p: Option[&Node], k: int) -> int
+        var sum = 0
+        var left = k
+
+        while p is Some(n)
+            sum += n.v
+            p = n.next
+
+            if p.is_none() && left > 0
+                left -= 1
+                p = make(2)
+
+        sum
+
+    print(refill(make(3), 2))
+
+    """
+
+@test("a parameter assigned a value it made keeps its count")
+blj_refill_keeps_its_count()
+    blj_still_owned(blj_refill(), "refill")
+    blj_prints(blj_refill(), "5\n")
+
+// -- `tail_calls`' `go(next, list)`: jumps that re-stage and swap their parameters ---------------------
+
+private blj_swap() -> string = blj_head() + """
+    alt(a: Option[&Node], b: Option[&Node], k: int) -> int
+        if k == 0 then return length(a) * 10 + length(b)
+
+        a match
+            Some(n) -> alt(b, n.next, k - 1)
+            None -> alt(b, a, k - 1)
+
+    print(alt(make(4), make(2), 5))
+
+    """
+
+@test("go(next, list): two borrowed parameters swapped by every jump stay borrowed and read what they should")
+blj_swap_borrowed()
+    blj_counts(blj_swap(), "alt", 0)
+    blj_prints(blj_swap(), "1\n")
+
+private blj_restage() -> string = blj_head() + """
+    go(next: Option[&Node], list: Option[&Node], k: int) -> int
+        if k == 0 then return length(next) * 10 + length(list)
+
+        go(list, make(k), k - 1)
+
+    print(go(make(1), make(2), 3))
+
+    """
+
+// `next` is handed the parameter the same jump hands a fresh list to: its count must be taken while
+// the frame is whole, or the release of `list`'s slot frees what `next` is about to hold.
+@test("go(next, list): a jump handing one parameter the other's value while the other gets a fresh one")
+blj_restage_owned()
+    blj_peeled(blj_restage(), "go")
+    blj_prints(blj_restage(), "21\n")
+
+// -- the peel (§4.3 (b), decision 9) -----------------------------------------------------------------
+
+private blj_p8() -> string = blj_head() + """
+    is_shorter_than(x: Option[&Node], y: Option[&Node]) -> bool
+        var x_tail = x
+        var y_tail = y
+
+        while y_tail is Some(yt)
+            x_tail match
+                None -> return true
+                Some(xt) -> x_tail = xt.next
+
+            y_tail = yt.next
+
+        false
+
+    tail(x: Option[&Node], y: Option[&Node], z: Option[&Node]) -> Option[&Node] =
+        if is_shorter_than(y, x) then tail(tail(x.unwrap().next, y, z), tail(y.unwrap().next, z, x), tail(z.unwrap().next, x, y))
+        else z
+
+    print(length(tail(make(12), make(8), make(4))))
+
+    """
+
+@test("P8: AWFY's tail reads its first round's parameters through the caller's counts, and owns only what it jumps with")
+blj_p8_tail_peeled()
+    blj_peeled(blj_p8(), "tail")
+    blj_prints(blj_p8(), "5\n")
+
+@test("P8: --explain-borrows says each of tail's parameters is borrowed on entry and owned after the self-call")
+blj_p8_explained()
+    if !blj_ready() then return
+
+    for param in ["x", "y", "z"]
+        assert_eq(blj_explain(blj_p8(), "tail", param),
+                  s"36:1: 'tail' parameter '$param' borrowed on entry; owned after the self-call at 37:35 (fresh arguments)")
+
+private blj_a11() -> string = blj_head() + """
+    walk(p: Option[&Node], k: int) -> int
+        if k == 0 then return length(p)
+
+        p match
+            Some(n) -> walk(n.next, k - 1)
+            None -> walk(make(3), k - 1)
+
+    print(walk(make(2), 4))
+
+    """
+
+@test("A11: a self-jump whose argument is fresh at one site and backed at another stays owned, staged as before")
+blj_a11_mixed()
+    blj_still_owned(blj_a11(), "walk")
+    blj_prints(blj_a11(), "2\n")
+
+@test("A11: --explain-borrows says the mixed parameter is counted, and which value has a count of its own")
+blj_a11_explained()
+    if !blj_ready() then return
+
+    assert_eq(blj_explain(blj_a11(), "walk", "p"),
+              "23:1: 'walk' parameter 'p' is counted: it is assigned a value with a count of its own at 28:22")
+
+private blj_drop() -> string = """
+    struct Res
+        id: int
+
+    impl Drop for Res
+        drop(self)
+            print(s"drop ${self.id}")
+
+    spin(r: &Res, k: int) -> int
+        if k == 0 then return r.id
+
+        spin(Res(k * 10), k - 1)
+
+    print(spin(Res(1), 2))
+
+    """
+
+@test("a jumping parameter whose release may run a destructor keeps its entry count, and every drop runs where it did")
+blj_drop_capable_keeps_its_count()
+    blj_still_owned(blj_drop(), "spin")
+    blj_prints(blj_drop(), "drop 20\ndrop 10\n10\ndrop 1\n")
+
+// -- what reaches a peeled function -----------------------------------------------------------------
+
+private blj_reached() -> string = blj_head() + """
+    trait Walker
+        walk(self, p: Option[&Node], n: int) -> int
+
+    struct Counter
+        step: int
+
+    rest(n: &Node) -> Option[&Node] = n.next
+
+    impl Walker for Counter
+        walk(self, p: Option[&Node], n: int) -> int = p match
+            Some(x) -> self.walk(rest(x), n + self.step)
+            None -> n
+
+    count(p: Option[&Node], n: int) -> int = p match
+        Some(x) -> count(rest(x), n + 1)
+        None -> n
+
+    apply(f: &Fn(Option[&Node], int) -> int, p: Option[&Node]) -> int = f(p, 0)
+
+    main()
+        var ws: [1]&Walker = [Counter(2)]
+
+        print(ws[0].walk(make(4), 0), apply(count, make(3)), count(make(5), 0))
+
+    """
+
+@test("a peeled function reached through a table and through a function value enters its borrowing symbol")
+blj_reached_through_a_table_and_a_function_value()
+    blj_peeled(blj_reached(), "count")
+    blj_prints(blj_reached(), "8 3 5\n")
+
+// -- separate compilation ---------------------------------------------------------------------------
+
+private blj_temp(prefix: string) -> string = absolute_path(make_temp_dir(prefix).unwrap())
+
+private blj_write(root: string, rel: string, text: string)
+    val at = s"$root/$rel"
+
+    make_dir_all(parent_of(at).unwrap_or(root)).unwrap()
+    write_text(at, text).unwrap()
+end blj_write
+
+// A program in a workspace whose member package `walks` defines the jumping functions: the program is
+// linked against the package's artifact, and at -O2 copies its small bodies in to inline them.
+@test("a package's peeled and borrowed jumping functions, called from a program linked against its artifact")
+blj_artifact_agreement()
+    if !blj_ready() then return
+
+    val ws = blj_temp("sysl-blj-ws")
+
+    blj_write(ws, "sysl.hocon", "package { name = \"app\", version = \"0.1.0\" }\n" +
+              "workspace = [\"walks\"]\n" +
+              "dependencies { walks { workspace = true } }\n")
+    blj_write(ws, "walks/sysl.hocon", "package { name = \"walks\", version = \"0.1.0\" }\n")
+    blj_write(ws, "walks/walks/walks.sysl", """
+        module walks
+
+        struct Node
+            v: int
+            next: Option[&Node]
+
+        make(n: int) -> Option[&Node]
+            var head: Option[&Node] = None
+
+            for i in 0..<n
+                head = Some(Node(i, head))
+
+            head
+
+        rest(n: &Node) -> Option[&Node] = n.next
+
+        count(p: Option[&Node], n: int) -> int = p match
+            Some(x) -> count(rest(x), n + 1)
+            None -> n
+
+        go(p: Option[&Node], acc: int) -> int = p match
+            Some(x) -> go(x.next, acc + x.v)
+            None -> acc
+
+        """)
+    blj_write(ws, "main.sysl", """
+        import walks.*
+
+        main()
+            val l = make(6)
+
+            print(count(l, 0), go(l, 0), count(make(3), 1))
+
+        """)
+
+    for level in ["0", "2"]
+        val out_dir = blj_temp("sysl-blj-exe")
+
+        force_alloc_counting(true)
+
+        val built = build_native_program(ws, None, None, level, Some(s"$out_dir/program"))
+
+        force_alloc_counting(false)
+
+        val said = built match
+            Err(why) -> s"refused: ${failure_text(why)}"
+            Ok(made) ->
+                capture(made, [], "", [], true) match
+                    Err(_) -> "the program that was built could not be run"
+                    Ok(o) ->
+                        assert(alloc_count_reported(o.err.unwrap_or("")) == 0, s"-O$level: ${o.err.unwrap_or("")}")
+                        if o.status.ok() then o.text else s"exited badly: ${o.text}"
+
+        remove_dir_all(out_dir).unwrap_or(())
+        assert_eq(said, "6 15 4\n", s"-O$level")
+
+    remove_dir_all(ws).unwrap_or(())
+end blj_artifact_agreement

@@ -641,8 +641,8 @@ end a_pattern_in_a_condition_binds_on_the_edge_that_took_it
 
 // That is what makes a `&T` destructured out of a value outlive the value it was read from: the arm
 // is its own ownership region, opened where the bindings are made and closed where the arm hands
-// its value over. Where nothing in the arm could give back the subject's count, the binding's share
-// and its release are one pair with nothing between them, and neither is emitted (`arc_elide.sysl`).
+// its value over. Where nothing in the arm could give back the subject's count, the binding takes no
+// share at all and its slot is never read again for a release (`plus0_locals.sysl`).
 @test("a name bound out of a variant reads through the subject's count when nothing in the arm can give it back")
 a_binding_that_holds_a_reference_takes_a_share_of_it()
     if no_form_library() then return
@@ -692,7 +692,6 @@ a_binding_that_holds_a_reference_takes_a_share_of_it()
               "  %t8 = getelementptr %struct.Node, ptr %t7, i32 0, i32 0\n" +
               "  %t9 = load i32, ptr %t8\n" +
               "  store i32 %t9, ptr %t2\n" +
-              "  %t10 = load ptr, ptr %n.addr\n" +
               "  call void @llvm.lifetime.end.p0(i64 -1, ptr %n.addr)\n" +
               "  br label %match.end1\n" +
               "match.arm3:\n" +
@@ -701,14 +700,15 @@ a_binding_that_holds_a_reference_takes_a_share_of_it()
               "match.none4:\n" +
               "  unreachable\n" +
               "match.end1:\n" +
-              "  %t11 = load i32, ptr %t2\n" +
-              "  ret i32 %t11\n" +
+              "  %t10 = load i32, ptr %t2\n" +
+              "  ret i32 %t10\n" +
               "}\n")
 end a_binding_that_holds_a_reference_takes_a_share_of_it
 
 // The bind retains out of the subject, so the subject has to still be held when it runs. That puts
 // the release after the branch on the taken edge, and in a block of its own on the other. Here the
-// taken edge only reads a field before it returns, so the share and its release cancel.
+// taken edge only reads a field before it returns, so the binding holds no count (`plus0_locals.sysl`)
+// and there is no release to place on either edge.
 @test("a reference bound by an 'is' in a condition takes no share where the taken edge cannot give one back")
 a_condition_that_binds_a_reference_releases_it_on_every_edge()
     if no_form_library() then return
@@ -759,10 +759,7 @@ a_condition_that_binds_a_reference_releases_it_on_every_edge()
               "  %t9 = getelementptr %arc.Node, ptr %t8, i32 0, i32 1\n" +
               "  %t10 = getelementptr %struct.Node, ptr %t9, i32 0, i32 0\n" +
               "  %t11 = load i32, ptr %t10\n" +
-              "  %t12 = load ptr, ptr %n.addr\n" +
               "  ret i32 %t11\n" +
-              "cond.unbind4:\n" +
-              "  unreachable\n" +
               "if.end3:\n" +
               "  ret i32 0\n" +
               "}\n")
@@ -1443,8 +1440,10 @@ fsat_u32_over_an_f32_saturates()
 // **A counted argument to a tail call takes its count while the frame is still whole**, and the
 // frame gives up everything it holds only after that. Written the other way round, `go(next, list)`
 // would free the list at the moment the parameter holding it was reassigned, and hand the second
-// argument a dangling reference. Where the argument IS the binding it replaces, as `s` is here, the
-// retain and the release are of one reference with nothing between them, and both go.
+// argument a dangling reference. Where the argument IS the binding it replaces, as `s` is here, every
+// value the parameter ever holds is the one its caller handed over, so it is borrowed throughout
+// (`plus0_locals.sysl`, borrow-inference.md §4.3 (a)): no count at entry, at the jump or at the exit.
+// The orders that matter when a count IS staged are `tests_blj_rewritten_params.sysl`'s `go(next, list)`.
 @test("a counted argument to a tail call that is the binding it replaces costs no count")
 a_counted_tail_call_argument_is_retained_first()
     if no_form_library() then return
@@ -1464,29 +1463,21 @@ a_counted_tail_call_argument_is_retained_first()
               "  %s.addr = alloca { ptr, ptr, i64 }\n" +
               "  store i32 %n.param, ptr %n.addr\n" +
               "  store { ptr, ptr, i64 } %s.param, ptr %s.addr\n" +
-              "  %t1 = extractvalue { ptr, ptr, i64 } %s.param, 0\n" +
-              "  call void @arc.retain_maybe(ptr %t1)\n" +
               "  br label %tailrec1\n" +
               "tailrec1:\n" +
-              "  %t2 = load i32, ptr %n.addr\n" +
-              "  %t3 = icmp eq i32 %t2, 0\n" +
-              "  br i1 %t3, label %if.then2, label %if.end4\n" +
+              "  %t1 = load i32, ptr %n.addr\n" +
+              "  %t2 = icmp eq i32 %t1, 0\n" +
+              "  br i1 %t2, label %if.then2, label %if.end4\n" +
               "if.then2:\n" +
-              "  %t4 = load { ptr, ptr, i64 }, ptr %s.addr\n" +
-              "  %t5 = extractvalue { ptr, ptr, i64 } %t4, 2\n" +
-              "  %t6 = load { ptr, ptr, i64 }, ptr %s.addr\n" +
-              "  %t7 = extractvalue { ptr, ptr, i64 } %t6, 0\n" +
-              "  call void @arc.release_maybe(ptr %t7)\n" +
-              "  ret i64 %t5\n" +
+              "  %t3 = load { ptr, ptr, i64 }, ptr %s.addr\n" +
+              "  %t4 = extractvalue { ptr, ptr, i64 } %t3, 2\n" +
+              "  ret i64 %t4\n" +
               "if.end4:\n" +
-              "  %t8 = load i32, ptr %n.addr\n" +
-              "  %t9 = sub i32 %t8, 1\n" +
-              "  %t10 = load { ptr, ptr, i64 }, ptr %s.addr\n" +
-              "  %t11 = extractvalue { ptr, ptr, i64 } %t10, 0\n" +
-              "  %t12 = load { ptr, ptr, i64 }, ptr %s.addr\n" +
-              "  %t13 = extractvalue { ptr, ptr, i64 } %t12, 0\n" +
-              "  store i32 %t9, ptr %n.addr\n" +
-              "  store { ptr, ptr, i64 } %t10, ptr %s.addr\n" +
+              "  %t5 = load i32, ptr %n.addr\n" +
+              "  %t6 = sub i32 %t5, 1\n" +
+              "  %t7 = load { ptr, ptr, i64 }, ptr %s.addr\n" +
+              "  store i32 %t6, ptr %n.addr\n" +
+              "  store { ptr, ptr, i64 } %t7, ptr %s.addr\n" +
               "  br label %tailrec1\n" +
               "}\n")
 end a_counted_tail_call_argument_is_retained_first

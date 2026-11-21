@@ -1753,6 +1753,17 @@ A local's line points at its first value: the initializer of a `var` or `val`, t
 binds out of. A generic function speaks for its first instance. A local each value of which arrives
 with a count — a call's answer, a constant — gets no line.
 
+A **parameter the function assigns or calls itself with** gets a line of the same kind, naming its
+function and pointing at the function's declaration: it holds no count when every value it is given is
+borrowed from what the caller handed over; it is borrowed on entry and owned after the first self-call
+when every self-call hands it a value of its own making; otherwise it is counted, and the line says why:
+
+```
+list.sysl:30:1: 'go' parameter 'p' holds no count: borrowed from 'p' through Node.next, sysl.Option[&Node].Some.value
+list.sysl:41:1: 'tail' parameter 'x' borrowed on entry; owned after the self-call at 43:9 (fresh arguments)
+list.sysl:52:1: 'mix' parameter 'p' is counted: it is assigned a value with a count of its own at 56:13
+```
+
 ### `-O2` is written the way clang writes it
 
 A short option normally takes its value as the next argument, but C compilers write the

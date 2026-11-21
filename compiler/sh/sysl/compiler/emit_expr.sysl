@@ -1587,7 +1587,10 @@ gen_tail_self_call(e: *Emit, args: Buf[TExpr]) -> Val
         else
             val v = gen_expr(e, args[i])
 
-            retain_value(e, ty, v)
+            // A parameter borrowed throughout (`plus0_locals.sysl`) is staged with no count: the value
+            // is backed by an entry root, which the frame does not give up (borrow-inference.md §4.3 (a)).
+            if !e.lent_decls.has(e.tail_params[i].0) then retain_value(e, ty, v)
+
             staged.push((StagedValue, v))
 
     // The measure is checked while the frame is still whole, since it reads the parameters and the
@@ -1597,6 +1600,14 @@ gen_tail_self_call(e: *Emit, args: Buf[TExpr]) -> Val
 
     trace_jump(e)
     release_all(e)
+
+    // **The entry of a peeled function jumps into its owned half** (`emit_func.sysl`'s `peel_shape`):
+    // the staged values are its arguments, each with the count staging took for it, and its answer is
+    // this one's. Every parameter crosses in registers there, so nothing but `StagedValue` reaches it.
+    if e.peel == PeelEntry
+        peel_jump(e, staged)
+        return VNothing
+    end if
 
     for i in 0..<e.tail_params.len()
         val p = e.tail_params[i]
@@ -1613,6 +1624,37 @@ gen_tail_self_call(e: *Emit, args: Buf[TExpr]) -> Val
     emit_term(e, InBr(e.tail_target))
     VNothing
 end gen_tail_self_call
+
+// The jump of a peeled function's entry: its owned half called with the staged values and this frame's
+// answer made that call's. The frame has given everything up already, so nothing follows the call.
+private peel_jump(e: *Emit, staged: Buf[(int, Val)])
+    val f = e.body_func.unwrap()
+    val ty = sysl_fn_type(e, defined_result(f), f.params, f.variadic, Some(f), f.marks.track_caller, lent_names(e, f))
+    var args: Buf[IrArg] = buf()
+
+    for p in ty.params
+        var v = p.name.unwrap_or(VUndef)
+        val n = p.name match
+            Some(VReg(s)) -> s
+            _ -> ""
+
+        for i in 0..<e.tail_params.len()
+            if n == s"${e.tail_params[i].0}.param" then v = staged[i].1
+
+        args.push(IrArg(p.ty, v, p.attrs))
+
+    val callee = VGlobal(owned_symbol(symbol_of(e, f.name)))
+
+    ty.ret match
+        LVoid ->
+            emit(e, InCall(None, LVoid, callee, args, ty.ret_attrs, None, no_fast_math(), false))
+            emit_term(e, InRet(None, None))
+        _ ->
+            val r = fresh_reg(e)
+
+            emit(e, InCall(Some(r), ty.ret, callee, args, ty.ret_attrs, None, no_fast_math(), false))
+            emit_term(e, InRet(Some(ty.ret), Some(r)))
+end peel_jump
 
 const StagedNothing: int = 0
 const StagedSlot: int = 1
