@@ -1,0 +1,354 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A **value parameter is a symbol** while its own declaration is read (`value_terms.sysl`,
+// `reference/generics.md § What may be written with N`): `Buf[N]` is not `Buf[M]`, and a body
+// yielding `Buf[N + 1]` where `Buf[N]` was declared is wrong for every instantiation -- so it is
+// refused at the declaration, whether or not anything calls it. Two arguments computed over the
+// parameters are one exactly when their canonical polynomials are: `N + M` is `M + N`.
+//
+// The axes: the position the two meet at (a result, a local's declared type, an argument, a field,
+// a trait member's signature), the declaration (a free function in the entry file or in another
+// file, a member of an `impl`, a nested function), the depth (`Box[Arr[N]]`), the kind of the
+// argument (an integer, a `bool`), and the form (a parameter, an offset, a commuted sum, an exact
+// division, an atom). Not built: an array's length and a vector's lane count stay numbers in
+// `Type`, so `[N]int` against `[M]int` is still answered by the instantiations alone; a `.syslib`
+// carries generic bodies as source, read again by whoever instantiates them.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private vpq_skip() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return true
+
+    false
+end vpq_skip
+
+private vpq_write(main: string, other: string) -> string
+    val root = make_temp_dir("sysl-vpq").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(root + "/main.sysl", main).unwrap()
+
+    if other != "" then write_text(root + "/other.sysl", other).unwrap()
+
+    root
+end vpq_write
+
+// What the program PRINTS, or what the build had to say about it.
+private vpq_ran(main: string, other: string = "") -> string
+    val root = vpq_write(main, other)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end vpq_ran
+
+// The program is refused with this message, at this line of `file`.
+private vpq_refused(said: string, message: string, file: string, line: int)
+    assert(said.index_of(s"error: $message\n").is_some(), s"expected 'error: $message', got: $said")
+    assert(said.index_of(s"/$file:$line:").is_some(), s"expected it at $file:$line, got: $said")
+
+private vpq_errors(said: string) -> int
+    var n = 0
+    var rest = said
+
+    loop
+        rest.index_of("error: ") match
+            None -> break
+            Some(i) ->
+                n += 1
+                rest = rest[i + 7..<rest.bytes.len]
+
+    n
+end vpq_errors
+
+private vpq_buf() -> string = "struct Buf[const N: usize]\n    used: usize\n\n    room(self) -> usize = N - self.used\n"
+
+// -- refused at the declaration -------------------------------------------------------------------
+
+@test("two value parameters are two types, refused at a generic nothing calls")
+vpq_two_parameters_refused_uncalled()
+    if vpq_skip() then return
+
+    val said = vpq_ran(vpq_buf() + "cast[const N: usize, const M: usize](b: Buf[N]) -> Buf[M] = b\nprint(1)\n")
+
+    vpq_refused(said, "function 'cast' should return Buf[M], but its body yields Buf[N] — 'N' and 'M' " +
+                "are different value parameters", "main.sysl", 5)
+
+@test("an offset form is not the parameter, refused at a generic nothing calls")
+vpq_offset_refused_uncalled()
+    if vpq_skip() then return
+
+    val said = vpq_ran(vpq_buf() + "wrong[const N: usize](b: Buf[N]) -> Buf[N] = Buf[N + 1](b.used)\nprint(1)\n")
+
+    vpq_refused(said, "function 'wrong' should return Buf[N], but its body yields Buf[N + 1] — the two " +
+                "differ by 1 for every N", "main.sysl", 5)
+
+@test("called, the offset is told once, in the declaration's terms")
+vpq_offset_told_once_when_called()
+    if vpq_skip() then return
+
+    val said = vpq_ran(vpq_buf() + "wrong[const N: usize](b: Buf[N]) -> Buf[N] = Buf[N + 1](b.used)\n" +
+                       "print(wrong(Buf[3](1)).used)\n")
+
+    vpq_refused(said, "function 'wrong' should return Buf[N], but its body yields Buf[N + 1] — the two " +
+                "differ by 1 for every N", "main.sysl", 5)
+    assert_eq(vpq_errors(said), 1)
+    assert(said.index_of("Buf[3]").is_none(), said)
+
+@test("two value parameters swapped")
+vpq_swapped_refused()
+    if vpq_skip() then return
+
+    val said = vpq_ran(raw"""
+        struct Two[const A: usize, const B: usize]
+            x: usize
+        swap[const A: usize, const B: usize](t: Two[A, B]) -> Two[A, B] = Two[B, A](t.x)
+        print(1)
+        """)
+
+    vpq_refused(said, "function 'swap' should return Two[A, B], but its body yields Two[B, A] — 'B' and " +
+                "'A' are different value parameters", "main.sysl", 3)
+
+@test("a value parameter inside a nested generic")
+vpq_nested_refused()
+    if vpq_skip() then return
+
+    val said = vpq_ran(raw"""
+        struct Arr[const N: usize]
+            n: usize
+        struct Box[T]
+            v: T
+        nest[const N: usize, const M: usize](b: Box[Arr[N]]) -> Box[Arr[M]] = b
+        print(1)
+        """)
+
+    vpq_refused(said, "function 'nest' should return Box[Arr[M]], but its body yields Box[Arr[N]] — 'N' " +
+                "and 'M' are different value parameters", "main.sysl", 5)
+
+@test("a trait member's signature is held to the trait's parameter")
+vpq_trait_member_refused()
+    if vpq_skip() then return
+
+    val said = vpq_ran(vpq_buf() + raw"""
+        trait Grow[const N: usize]
+            grow(self) -> Buf[N]
+        struct Holder[const M: usize, const K: usize]
+            used: usize
+        impl[const M: usize, const K: usize] Grow[M] for Holder[M, K]
+            grow(self) -> Buf[K] = Buf(self.used)
+        print(1)
+        """)
+
+    vpq_refused(said, "method 'grow' returns Buf[K], but trait 'Grow' declares Buf[M]", "main.sysl", 9)
+
+@test("a member of an impl over Buf[N]")
+vpq_impl_member_refused()
+    if vpq_skip() then return
+
+    val said = vpq_ran(vpq_buf() + raw"""
+        impl[const N: usize] Buf[N]
+            bump(self) -> Buf[N] = Buf[N + 1](self.used)
+        print(1)
+        """)
+
+    vpq_refused(said, "function 'Buf.bump' should return Buf[N], but its body yields Buf[N + 1] — the two " +
+                "differ by 1 for every N", "main.sysl", 6)
+
+@test("a local's declared type and an argument")
+vpq_local_and_argument_refused()
+    if vpq_skip() then return
+
+    val local = vpq_ran(vpq_buf() + raw"""
+        local[const N: usize](b: Buf[N]) -> usize
+            val g: Buf[N] = Buf[N + 1](b.used)
+            g.used
+        print(1)
+        """)
+
+    vpq_refused(local, "cannot initialize 'g': declared Buf[N] but the value is Buf[N + 1] — the two " +
+                "differ by 1 for every N", "main.sysl", 6)
+
+    val arg = vpq_ran(vpq_buf() + raw"""
+        takes[const M: usize](b: Buf[M]) -> usize = b.used
+        arg[const N: usize](b: Buf[N]) -> usize = takes[N + 1](b)
+        print(1)
+        """)
+
+    vpq_refused(arg, "'b' of 'takes' is Buf[N + 1], but Buf[N] was given — the two differ by 1 for every N",
+                "main.sysl", 6)
+
+@test("a parameter is not the constant an instantiation might choose")
+vpq_constant_refused()
+    if vpq_skip() then return
+
+    val said = vpq_ran(vpq_buf() + "fixed[const N: usize](b: Buf[N]) -> Buf[3] = b\nprint(1)\n")
+
+    vpq_refused(said, "function 'fixed' should return Buf[3], but its body yields Buf[N] — 'N' stands for " +
+                "every value an instantiation chooses, not only 3", "main.sysl", 5)
+
+@test("a division that is not exact is an atom, compared as written")
+vpq_atom_refused()
+    if vpq_skip() then return
+
+    val said = vpq_ran(vpq_buf() + raw"""
+        atom[const N: usize](b: Buf[N]) -> usize
+            val h: Buf[N] = Buf[N / 2 * 2](b.used)
+            h.used
+        print(1)
+        """)
+
+    vpq_refused(said, "cannot initialize 'h': declared Buf[N] but the value is Buf[2 * (N / 2)] — " +
+                "'2 * (N / 2)' and 'N' are not the same value for every N", "main.sysl", 6)
+
+@test("a bool parameter's negation is not the parameter")
+vpq_bool_negation_refused()
+    if vpq_skip() then return
+
+    val said = vpq_ran(raw"""
+        struct Flag[const B: bool]
+            v: int
+        flip[const B: bool](f: Flag[B]) -> Flag[B] = Flag[!B](f.v)
+        print(1)
+        """)
+
+    vpq_refused(said, "function 'flip' should return Flag[B], but its body yields Flag[!B] — '!B' and 'B' " +
+                "are not the same value for every B", "main.sysl", 3)
+
+@test("a nested generic function, read where it is written")
+vpq_nested_function_refused()
+    if vpq_skip() then return
+
+    val said = vpq_ran(vpq_buf() + raw"""
+        outer() -> int
+            inner[const N: usize](b: Buf[N]) -> Buf[N] = Buf[N + 1](b.used)
+            1
+        print(outer())
+        """)
+
+    vpq_refused(said, "this closure should yield Buf[N], but its body yields Buf[N + 1] — the two differ " +
+                "by 1 for every N", "main.sysl", 6)
+
+@test("a generic in a file other than the entry, never called")
+vpq_other_file_refused()
+    if vpq_skip() then return
+
+    val said = vpq_ran("print(1)\n", vpq_buf() +
+                       "cast[const N: usize, const M: usize](b: Buf[N]) -> Buf[M] = b\n")
+
+    vpq_refused(said, "function 'cast' should return Buf[M], but its body yields Buf[N] — 'N' and 'M' " +
+                "are different value parameters", "other.sysl", 5)
+
+// -- accepted, and right --------------------------------------------------------------------------
+
+@test("the correct versions are accepted and run")
+vpq_correct_versions_run()
+    if vpq_skip() then return
+
+    assert_eq(vpq_ran(vpq_buf() + raw"""
+        struct Arr[const N: usize]
+            n: usize
+        struct Box[T]
+            v: T
+        struct Two[const A: usize, const B: usize]
+            x: usize
+        trait Grow[const N: usize]
+            grow(self) -> Buf[N]
+        struct Holder[const M: usize]
+            used: usize
+        impl[const M: usize] Grow[M] for Holder[M]
+            grow(self) -> Buf[M] = Buf(self.used)
+        impl[const N: usize] Buf[N]
+            same(self) -> Buf[N] = Buf(self.used)
+        cast[const N: usize](b: Buf[N]) -> Buf[N] = b
+        nest[const N: usize](b: Box[Arr[N]]) -> Box[Arr[N]] = b
+        order[const A: usize, const B: usize](t: Two[A, B]) -> Two[A, B] = Two(t.x)
+        print(cast(Buf[5](2)).room(), Buf[4](1).same().room(), nest(Box(Arr[4](7))).v.n)
+        print(Holder[6](2).grow().room(), order(Two[1, 2](9)).x)
+        """), "3 3 7\n4 9\n")
+
+@test("N + M is M + N, and every other identity of the ring")
+vpq_commuted_forms_agree()
+    if vpq_skip() then return
+
+    assert_eq(vpq_ran(vpq_buf() + raw"""
+        struct S2[const N: usize, const M: usize]
+            inner: Buf[N + M]
+        commute[const N: usize, const M: usize](b: Buf[N]) -> S2[N, M]
+            val d: Buf[2 * N] = Buf[N + N](b.used)
+            val p: Buf[N * (M + 1)] = Buf[N * M + N](b.used)
+            val q: Buf[N] = Buf[(2 * N + 4) / 2 - 2](b.used)
+            val z: Buf[N - N + 1] = Buf[1](b.used)
+            S2(Buf[M + N](d.used + p.used + q.used + z.used))
+        print(commute[2, 3](Buf[2](1)).inner.room())
+        """), "1\n")
+
+@test("an instance still computes N + 1")
+vpq_instance_computes()
+    if vpq_skip() then return
+
+    assert_eq(vpq_ran(vpq_buf() + raw"""
+        struct W[const N: usize]
+            inner: Buf[N + 1]
+        impl[const N: usize] Buf[N]
+            bigger(self) -> W[N] = W(Buf[N + 1](self.used))
+        print(Buf[3](1).bigger().inner.room())
+        val w: W[2] = W(Buf(0))
+        print(w.inner.room())
+        """), "3\n3\n")
+
+    vpq_refused(vpq_ran(vpq_buf() + "struct W[const N: usize]\n    inner: Buf[N + 1]\n" +
+                        "val w: W[2] = W(Buf[7](0))\nprint(1)\n"),
+                "'inner' of 'W[2]' is Buf[3], but Buf[7] was given", "main.sysl", 7)
+
+// -- what a signature may not compute, named for what it is ---------------------------------------
+
+@test("a struct's value argument is called one, not a length")
+vpq_value_argument_wording()
+    if vpq_skip() then return
+
+    val said = vpq_ran(raw"""
+        struct Q[const L: i8, const T: i8]
+            v: int
+        impl[const L1: i8, const T1: i8] Q[L1, T1]
+            per[const L2: i8, const T2: i8](self, o: Q[L2, T2]) -> Q[L1 - L2, T1 - T2] = Q(self.v)
+        print(1)
+        """)
+
+    assert(said.index_of("the value argument 'L1 - L2' computes with the value parameter 'L1', and a " +
+                         "type may name a value parameter but not compute with one — deciding that two " +
+                         "such value arguments are one type").is_some(), said)
+    assert(said.index_of("the length").is_none(), said)
+
+    val lanes = vpq_ran("f[const N: usize](v: <N>f32) -> <(N * 2)>f32 = v\nprint(1)\n")
+
+    assert(lanes.index_of("the lane count 'N * 2' computes with the value parameter 'N'").is_some(), lanes)
+
+    val length = vpq_ran("f[const N: usize](xs: [N]int) -> [N + 1]int = xs\nprint(1)\n")
+
+    assert(length.index_of("the length 'N + 1' computes with the value parameter 'N'").is_some(), length)
