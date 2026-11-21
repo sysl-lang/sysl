@@ -4075,20 +4075,22 @@ start() -> i32 = i32(step(1))
 
 That is Rust's rule — a `#[target_feature]` function is an `unsafe` call from a function without the
 features — said in the word sysl's unchecked tier already uses. **The block checks nothing while the
-program runs**: how a program asks its processor is the system's (`sysctlbyname` on macOS,
-`getauxval(AT_HWCAP)` on Linux, `cpuid` on x86), and the answer goes in an ordinary `if` around the
-block. It relaxes nothing else either — a subscript inside it is bounds-checked as anywhere:
+program runs**: the program asks its processor with [`sysl.cpu.has`](#asking-the-processor-sysl-cpu),
+and the answer goes in an ordinary `if` around the block. It relaxes nothing else either — a
+subscript inside it is bounds-checked as anywhere:
 
 ```sysl
+import sysl.cpu
+
 #if aarch64
 @extensions("crc")
 twice(x: u32) -> u32 = x * 2
 
-val asked = true
-
-if asked
+if cpu.has("crc")
     @unchecked("crc")
         print(twice(21))
+else
+    print(21 * 2)
 #else
 print(42)
 #endif
@@ -4107,6 +4109,28 @@ for the same reason.
 **The CRC-32C `extern`s are such functions.** `llvm.aarch64.crc32cx` and SSE 4.2's `crc32` are
 compiled for `crc` and `sse4.2` ([ffi](/reference/ffi/#a-link-name-in-the-llvm-namespace-names-an-instruction)),
 so a declaration is accepted on its own processor and each call is held to this rule.
+
+### Asking the processor — `sysl.cpu`
+
+[`sysl.cpu`](/library/cpu/) is the asking. `cpu.has("sha3")` answers whether the processor the
+program is running on has the extension, by the system's own means — `sysctlbyname` on macOS,
+`getauxval(AT_HWCAP)` on Linux and Android, `cpuid` and `xgetbv` on x86-64 — asked once and kept.
+Its names are this attribute's, so the name in the `if` is the name in the block under it, and a
+literal name the target's processor cannot be asked about is refused as `@extensions` refuses it:
+
+```sysl
+import sysl.cpu
+
+print(cpu.has("sha33"))
+```
+
+```error
+'sysl.cpu.has' is asked about 'sha33', which is not an extension an aarch64 processor can be asked about
+```
+
+A bare-metal target has no operating system to ask, so there a call of `has` is refused, and the
+build's own [`codegen.extensions`](/reference/packages/#a-processor-s-extensions) or `--cpu` says what
+the processor has.
 
 ### Inlining follows the features
 

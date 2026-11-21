@@ -1,0 +1,125 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+
+// `sysl.cpu.has`, which the compiler knows (`docs/content/library/cpu.md`): the run-time question an
+// `@unchecked("...")` block promises was asked (`reference/attributes.md § @extensions`).
+//
+// **Its names are `@extensions`'s, and a literal one is checked as `@extensions` checks it.** The
+// library holds the names a processor can be asked about (`library/sysl/cpu/cpu.sysl`'s `table`), and
+// `cpu_query_names` below is the same list, which `tests_cpq_cpu_query.sysl` holds the library to. A
+// string literal outside it is refused at the call, naming the names, because a misspelling that read
+// as false would quietly take the portable path for ever -- the one failure the query must not have.
+// A name that arrives at run time cannot be checked, and answers false.
+//
+// **A bare-metal target has no operating system to ask**, so a call that reaches the query there is
+// refused at the program's own line, as `sysl.fenv`'s calls are (`strict_fp.sysl`): the module is
+// built whole wherever the library is, and a program that never asks hears nothing. A bare-metal
+// image is built for one processor, and `codegen.extensions` or `--cpu` says what it has -- which
+// lets the calls through with no `@unchecked` block and no branch at all.
+
+// The query's qualified name.
+private const CpuHas: string = "sysl.cpu.has"
+
+// The extensions a processor of `cpu` can be asked about, as LLVM names them -- `cpu.sysl`'s `table`,
+// in its order. Empty where `@extensions` is refused.
+cpu_query_names(cpu: Cpu) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    if cpu == Aarch64
+        for n in ["fp-armv8", "neon", "crc", "aes", "sha2", "sha3", "sm4", "lse", "lse2", "rdm", "dotprod",
+                  "fullfp16", "fp16fml", "rcpc", "rcpc-immo", "jsconv", "complxnum", "flagm", "altnzcv",
+                  "fptoint", "ssbs", "sb", "pauth", "dit", "bf16", "i8mm", "sve", "sve2", "bti", "rand",
+                  "sme", "sme2", "cssc", "wfxt", "hbc", "mops"]
+            out.push(n)
+    else if cpu == X86_64
+        for n in ["sse", "sse2", "sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "pclmul", "aes", "cx16",
+                  "movbe", "xsave", "rdrnd", "avx", "fma", "f16c", "bmi", "bmi2", "avx2", "adx", "rdseed",
+                  "sha", "avx512f", "avx512dq", "avx512ifma", "avx512cd", "avx512bw", "avx512vl",
+                  "avx512vbmi", "avx512vbmi2", "gfni", "vaes", "vpclmulqdq", "avx512vnni", "avx512bitalg",
+                  "avx512vpopcntdq", "avxvnni", "lzcnt", "avx512bf16", "avx512fp16"]
+            out.push(n)
+    end if
+
+    out
+end cpu_query_names
+
+// Every call of the query a program makes: refused on a bare-metal target, and where its name is a
+// literal no processor of the target's kind can be asked about.
+check_cpu_query(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable])
+    var key = ""
+
+    for f in funcs
+        if qualified_name(f.name) == CpuHas
+            key = f.name
+            break
+
+    if key == "" then return
+
+    val t = a.tables.target
+
+    if t.os == Freestanding
+        refuse_bare_cpu_query(a, funcs, vtables, key)
+        return
+    end if
+
+    val known = cpu_query_names(t.cpu)
+
+    for f in funcs
+        if standard_body_module(module_of(f.name)) then continue
+
+        val scope = func_home(a, f.name)
+
+        walk_block_stmts(f.body, expr_walk(false, e -> literal_query(a, t, scope, key, known, e)))
+end check_cpu_query
+
+// A call of the query whose name is a literal: refused where the name is none the processor can be
+// asked about.
+private literal_query(a: &Analysis, t: Target, scope: Scope, key: string, known: Buf[string], e: TExpr)
+    val name = *e.kind match
+        TCall(callee, args, _, _) -> if callee != key || args.len() != 1 then return else *args[0].kind match
+            TStrLit(v) -> v
+            _ -> return
+        _ -> return
+
+    if holds_string(known, name) then return
+
+    if known.is_empty()
+        a.fault(scope, e.span, s"'$CpuHas' is asked about '$name', and '${t.name}' has no extension to ask about — '@extensions' is accepted on aarch64 and x86_64, and 'names()' is empty everywhere else")
+        return
+    end if
+
+    a.fault(scope, e.span, s"'$CpuHas' is asked about '$name', which is not an extension ${cpu_article(t.cpu)} processor can be asked about — the names are the ones '@extensions' takes, as LLVM spells each feature: ${quoted_names(known)}")
+end literal_query
+
+private cpu_article(cpu: Cpu) -> string = if cpu == Aarch64 then "an aarch64" else "an x86_64"
+
+// Every line of the program that reaches the query, on a target with no operating system to ask.
+private refuse_bare_cpu_query(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable], key: string)
+    var seeds: Buf[string] = buf()
+
+    seeds.push(key)
+
+    val graph = with_abstract_callees(a, funcs)
+    val walk = reaches_over(graph, vtables, seeds)
+    val reach = program_reach(a, funcs)
+    val t = a.tables.target
+
+    for f in funcs
+        if a.tables.members.func_origin.has(f.name) then continue
+        if standard_body_module(module_of(f.name)) then continue
+
+        val scope = func_home(a, f.name)
+
+        if !reached_module(reach, scope.module_name) then continue
+
+        walk_block_stmts(f.body, expr_walk(false, e -> blame_bare_query(a, t, scope, walk, e)))
+end refuse_bare_cpu_query
+
+private blame_bare_query(a: &Analysis, t: Target, scope: Scope, walk: &Reaches, e: TExpr)
+    val hit = named_reach(walk, own_refs(e))
+
+    if hit.is_none() || reaches_a_seed(walk, strict_refs(e)) then return
+
+    a.fault(scope, e.span, s"'$CpuHas' asks the operating system which extensions the processor has, and '${t.name}' has none to ask — a bare-metal image is built for one processor, so say what it has in 'codegen.extensions' or with '--cpu', and its calls need no '@unchecked' block")
+end blame_bare_query
