@@ -1142,19 +1142,19 @@ private walk_pack_spellings(a: &Analysis, scope: Scope, span: Span, tparams: Buf
         VolatileType(inner) -> walk_pack_spellings(a, scope, span, tparams, packs, lengths, inner)
         ArrayType(length, elem, _) ->
             if length.is_some()
-                length_arithmetic(a, scope, span, length.unwrap(), lengths.values)
+                length_arithmetic(a, scope, span, length.unwrap(), lengths.values, "length")
                 length_not_a_type(a, scope, span, length.unwrap(), lengths.types)
             end if
 
             walk_pack_spellings(a, scope, span, tparams, packs, lengths, elem)
         VectorType(lanes, elem) ->
-            length_arithmetic(a, scope, span, lanes, lengths.values)
+            length_arithmetic(a, scope, span, lanes, lengths.values, "lane count")
             length_not_a_type(a, scope, span, lanes, lengths.types)
             walk_pack_spellings(a, scope, span, tparams, packs, lengths, elem)
         // A written value argument is held to the rule a length is, for the same reason: `Buf[N + 1]`
         // puts a computation where an identity belongs.
         ValueArgType(e) ->
-            length_arithmetic(a, scope, span, e, lengths.values)
+            length_arithmetic(a, scope, span, e, lengths.values, "value argument")
             length_not_a_type(a, scope, span, e, lengths.types)
         TupleType(parts, _) ->
             if parts.len() == 1
@@ -1194,7 +1194,11 @@ end walk_pack_spellings
 // arithmetic and a separate feature. Left alone, the length resolves to whatever the placeholder
 // made it and the array is silently the wrong size. A length measuring a TYPE parameter,
 // `[sizeof(T) * 2]u8`, is a number the type argument fixes outright and is not asked about.
-length_arithmetic(a: &Analysis, scope: Scope, span: Span, len: Expr, names: Buf[string])
+//
+// `kind` is what the written expression is -- an array's `length`, a vector's `lane count`, or a
+// struct's, an enum's or a trait's `value argument` (`Q[L1 - L2, T1 - T2]`) -- since the reader is
+// told about the one they wrote.
+length_arithmetic(a: &Analysis, scope: Scope, span: Span, len: Expr, names: Buf[string], kind: string)
     *len.kind match
         Ident(_) -> return
         _ -> ()
@@ -1207,9 +1211,9 @@ length_arithmetic(a: &Analysis, scope: Scope, span: Span, len: Expr, names: Buf[
 
     val n = found[0]
     val text = doc_expr_text(len)
-    val subject = if text.index_of("\u{2026}").is_some() then "a length" else s"the length '$text'"
+    val subject = if text.index_of("\u{2026}").is_some() then s"a $kind" else s"the $kind '$text'"
     val message = s"$subject computes with the value parameter '$n', and a type may name a value " +
-                  "parameter but not compute with one — deciding that two such lengths are one type " +
+                  s"parameter but not compute with one — deciding that two such ${kind}s are one type " +
                   s"is type-level arithmetic, which is a separate feature. A body may compute with '$n' freely"
 
     // A signature is walked here at its declaration and resolved again later; the declaration is

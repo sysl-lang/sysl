@@ -451,6 +451,7 @@ sysl test <path> --filter <text>
 sysl test <path> --file <name>
 sysl test <path> --fail-fast
 sysl test <path> --jobs <n>
+sysl test <path> --build-jobs <n>
 sysl test <path> --timeout <seconds>
 sysl test <path> --std
 ```
@@ -582,8 +583,12 @@ own, with a temporary directory or a port the system picks, or be listed in its 
 alongside. The manifest's `test` block can also set the run's `jobs` and `timeout`, and the flags
 override it.
 
-**The same count bounds the build.** A large tree's link compiles its code in several pieces at once,
-and `--jobs <n>` keeps at most `n` of those compiles running too. The suite is compiled by a second
+**The same count bounds the build, unless `--build-jobs <n>` gives the build its own.** A large tree's
+link compiles its code in several pieces at once, and `--jobs <n>` keeps at most `n` of those compiles
+running too. `--build-jobs <n>` (or the `test` block's `build_jobs`) bounds the compiles alone, and
+`--build-jobs 1` compiles the pieces one after another — the slower build that holds the least memory
+at once, for a machine running other work. The pieces and the binary are the same at any count, so
+neither flag makes a different cached build. The suite is compiled by a second
 `sysl` process, which exits before the first test starts. A long run therefore holds only what its
 tests need, not what the compile needed. **A suite that has to be linked is linked by a third**, which
 takes up the compiled text once the second has exited, so the link's compiles never run beside the
