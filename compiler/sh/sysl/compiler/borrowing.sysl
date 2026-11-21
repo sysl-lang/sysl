@@ -2441,6 +2441,10 @@ edge_text(k: EdgeKey) -> string =
 //
 // **The answer is shared, not copied**: its lists are the summary's own, so a caller reads it and
 // never changes it.
+//
+// **`within` and `counts` are found by their spelling, not by a scan** (`TypeIndex`): the fixed point
+// joins every callee's lists into every caller's, over the whole program, so a membership test that
+// walked the list made the solve cubic in the types a body writes.
 struct EdgeWrites
     keys: Buf[EdgeKey]
     named: Set[string]
@@ -2448,6 +2452,8 @@ struct EdgeWrites
     counts: Buf[Type]
     opaque: string
     opaque_in: string
+    within_at: TypeIndex
+    counts_at: TypeIndex
 
     key(*self, k: EdgeKey) -> bool
         if self.named.has(k.text) then return false
@@ -2459,18 +2465,35 @@ struct EdgeWrites
     inside(*self, t: Type) -> bool
         val u = underlying(t)
 
-        if has_type(self.within, u) then return false
+        self.inside_spelled(u, mangle(u))
 
+    inside_spelled(*self, u: Type, spelled: string) -> bool
+        if self.within_at.has(self.within, u, spelled) then return false
+
+        self.within_at.add(spelled, self.within.len())
         self.within.push(u)
         true
 
     count(*self, t: Type) -> bool
         val u = underlying(t)
 
-        if has_type(self.counts, u) then return false
+        self.count_spelled(u, mangle(u))
 
+    count_spelled(*self, u: Type, spelled: string) -> bool
+        if self.counts_at.has(self.counts, u, spelled) then return false
+
+        self.counts_at.add(spelled, self.counts.len())
         self.counts.push(u)
         true
+
+    // Whether a value of `t` may have its count read.
+    has_count(self, t: Type) -> bool
+        val u = underlying(t)
+
+        self.counts_at.has(self.counts, u, mangle(u))
+
+    // Whether `counts` holds `t` itself, as written.
+    holds_count_of(self, t: Type) -> bool = self.counts_at.has(self.counts, t, mangle(t))
 
     hide(*self, why: string, at: string) -> bool
         if self.opaque != "" then return false
@@ -2488,16 +2511,50 @@ struct EdgeWrites
         for item in other.keys
             grew = self.key(item) || grew
 
-        for item in other.within
-            grew = self.inside(item) || grew
+        for i in 0..<other.within.len()
+            grew = self.inside_spelled(other.within[i], other.within_at.spelled[i]) || grew
 
-        for item in other.counts
-            grew = self.count(item) || grew
+        for i in 0..<other.counts.len()
+            grew = self.count_spelled(other.counts[i], other.counts_at.spelled[i]) || grew
 
         grew
 end EdgeWrites
 
-edge_writes_none() -> EdgeWrites = EdgeWrites(buf(), set(), buf(), buf(), "", "")
+edge_writes_none() -> EdgeWrites = EdgeWrites(buf(), set(), buf(), buf(), "", "", type_index(), type_index())
+
+// **A list of types found by spelling**: each item's `mangle` is its bucket, and a bucket is a chain
+// through the items that share it, each compared whole (`==`) -- a spelling is shared by types the
+// compiler tells apart (a trait's associated types, a name-only subtype), so it narrows the search and
+// never decides it. Two types that are equal spell alike, as they must: the spelling is the symbol a
+// lowered program names the type by. `first` holds one past the bucket's newest item, `next` one past the item before it,
+// 0 ending the chain.
+struct TypeIndex
+    spelled: Buf[string]
+    first: Map[string, usize]
+    next: Buf[usize]
+
+    // Whether `items` (the list this indexes) holds `t`, spelled `spelling`.
+    has(self, items: Buf[Type], t: Type, spelling: string) -> bool = self.find(items, t, spelling).is_some()
+
+    // Where in `items` `t` is.
+    find(self, items: Buf[Type], t: Type, spelling: string) -> Option[usize]
+        var at = self.first.get(spelling).unwrap_or(0)
+
+        while at > 0
+            if items[at - 1] == t then return Some(at - 1)
+
+            at = self.next[at - 1]
+
+        None
+
+    // Files the item at `i` under `spelling`.
+    add(*self, spelling: string, i: usize)
+        self.spelled.push(spelling)
+        self.next.push(self.first.get(spelling).unwrap_or(0))
+        self.first.put(spelling, i + 1)
+end TypeIndex
+
+type_index() -> TypeIndex = TypeIndex(buf(), map(), buf())
 
 // Whether a summary may overwrite edge `k`: it is opaque, names it, or writes through a pointer a value
 // of a type the edge's value lays out by value.
@@ -2524,7 +2581,7 @@ first_written(w: EdgeWrites, ks: Buf[EdgeKey]) -> Option[EdgeKey]
 end first_written
 
 // Whether a summary may read the count of a value of type `t`, or run code that may.
-reads_count(w: EdgeWrites, t: Type) -> bool = w.opaque != "" || has_type(w.counts, underlying(t))
+reads_count(w: EdgeWrites, t: Type) -> bool = w.opaque != "" || w.has_count(t)
 
 // One body's own writes, gathered through the box its walk captured. `within` holds every type the
 // body writes through a pointer, counted or not, until `edge_finish` judges them against the casts.
