@@ -205,6 +205,35 @@ types only: a [ranged type](/reference/errors/#constrained-types)'s overflow is 
 traps, and a float has no overflow to report. There is no `checked_shl` or `checked_shr`, because a
 shift by the width or more is [defined](/reference/expressions/#shifting-by-the-width-or-more).
 
+### Carrying from one word to the next
+
+A number wider than any integer type is added a word at a time, and each word's sum needs the carry
+the word below it produced. Every unsigned integer type answers that with the prelude trait
+`Carrying`: `x.add_carry(y, c)` is `x + y + c` and `x.sub_borrow(y, c)` is `x - y - c`, where `c` is
+a `bool`, and each answers the pair of the low bits and whether the operation carried (or borrowed)
+out of the type.
+
+```sysl
+val top: u8 = 255
+val zero: u8 = 0
+
+print(top.add_carry(0, false), top.add_carry(0, true), top.add_carry(top, true))
+print(zero.sub_borrow(0, true), zero.sub_borrow(1, false), top.sub_borrow(top, false))
+```
+
+```output
+(255, false) (0, true) (255, true)
+(255, true) (255, true) (0, false)
+```
+
+Chained from the lowest word up, the carry out of each call is the carry in of the next. The members
+are defined at every unsigned width, `u12` and `u128` included, and each is **two `with.overflow`
+calls and an `or`** (`llvm.uadd.with.overflow` and `llvm.usub.with.overflow` at the receiver's
+width), so the back end can form an add-with-carry instruction. The two operands are the receiver's
+type and the carry a `bool`; anything else is refused as `checked_add`'s operand is. A signed type is
+not a member, since the carry out of a word means something only where the word is a magnitude: ask
+a signed type whether it fit with `Checked`. A generic body asks for them with `[T: Carrying]`.
+
 ### Arithmetic over literals is exact
 
 An expression written out of integer literals alone — `65536 * 65536`, `(1 << 16) - 1`,
@@ -281,8 +310,25 @@ val z = 1 + 10 / (3 - 3)
 a constant divided by zero
 ```
 
-**A name anywhere in the expression makes it ordinary arithmetic**, which overflows as the build
-mode says. A `const` is a name, so the arithmetic built on it is the arithmetic of its type:
+**An untyped integer `const` is the literal it stands for**, so it takes part in all of this:
+`const Half = 200` makes `Half * 2` the exact 400, and it is refused at `u8` as `200 * 2` is. So are
+a chain of such constants (`const Quad = Half * 2`), a constant of a constant, one from another
+module, and negative values and shifts of them. Such an expression also chooses an overload as the
+literal spelling does: `h(Half * 2)` over `h(v: u8)` and `h(v: u16)` is the `u16` one.
+
+```sysl
+const Half = 200
+
+val b: u8 = Half * 2
+```
+
+```error
+the value 400 does not fit u8
+```
+
+**Any other name in the expression makes it ordinary arithmetic**, which overflows as the build
+mode says. A `val`, a variable, and a `const` declared with a type are names of a value of that type,
+so the arithmetic built on them is the arithmetic of the type, and the constant is not exact:
 
 ```sysl
 const Base: u8 = 200

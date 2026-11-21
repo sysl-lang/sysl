@@ -1,0 +1,476 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `var out: T = slot_empty()` (`slots.sysl`): a local that is an empty slot -- stack storage of the
+// frame, aligned as `T` is, holding no value until one is written -- which is what lets a generic body
+// hold a `T` that has no zero value. And the refusal of a `var out: T` at such a `T`, which points at
+// the call that chose `T` rather than into the generic's body.
+//
+// The axes: what `T` is (a scalar, a simple enum with no zero, a struct, an array, a constrained
+// subtype, a counted string, a `&T` with a `Drop`, an over-aligned struct), how the slot is filled (an
+// assignment, a part at a time, `slot_put`, a copy through `&out`, not at all), the generic twins (one
+// body at several `T`, a method, the library's `load_relaxed` and `SeqLock`), how it may be read (after
+// a write, before one, in the write's own value, by a compound assignment, by a capture), where the
+// form may stand (a `var`, a `val`, an argument, with no type, with arguments, under a function of the
+// name), and what it lowers to (no store over a value that holds no count, the zero over one that does).
+//
+// Cells skipped: a module-level `var` (the form is a local's, and a module `var` is refused before it
+// is read as one -- `esl_only_a_var`); the bare-metal build (the form adds no instruction and no
+// libcall: an `undef` store is none, and the counted case is the zero store any local already makes);
+// separate compilation (the library's `load_relaxed`, built into every program that copies through it,
+// is the instance across a module boundary).
+
+private struct EslRun
+    ok: bool
+    out: string
+    err: string
+
+private esl_ready() -> bool = std_root().is_ok() && clang_available()
+
+// A program built with the heap counted and run, or the refusal as the command line renders it.
+private esl_run(text: string) -> EslRun
+    val root = make_temp_dir("sysl-esl").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+    force_alloc_counting(true)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization,
+                                     Some(s"$root/built"))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return EslRun(false, failure_text(why), "")
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> EslRun(false, "could not be started", "")
+        Ok(o) -> EslRun(o.status.ok(), o.text.trim(), o.err.unwrap_or(""))
+end esl_run
+
+// The run printed `expected` and gave back every allocation.
+private esl_clean(text: string, expected: string)
+    val run = esl_run(text)
+
+    assert(run.ok, run.out)
+    assert_eq(run.out, expected)
+    assert(!run.err.contains(alloc_count_said()), run.err)
+end esl_clean
+
+// The program was refused, the report holding each of `parts`.
+private esl_refused(text: string, parts: []string)
+    val run = esl_run(text)
+
+    assert(!run.ok, run.out)
+
+    for p in parts
+        assert(run.out.contains(p), s"expected '$p' in:\n${run.out}")
+end esl_refused
+
+private esl_read_said(name: string) -> string =
+    s"'$name' is an empty slot, read here before anything was written to it"
+
+private esl_place_said() -> string =
+    "'slot_empty' makes a local that holds nothing yet, so it is written only as a 'var''s initial value"
+
+// -- what it holds ---------------------------------------------------------------------------------------
+
+@test("esl: one generic body holds a T with no zero, a struct, an array, a subtype and a string")
+esl_several_types()
+    if !esl_ready() then return
+
+    esl_clean(raw"""
+        enum Mode
+            Idle
+            Busy
+
+        struct Pos
+            x: int
+            y: int
+
+        type Age = int within 1..150
+
+        fill[T](v: T) -> T
+            var out: T = slot_empty()
+
+            out = v
+            out
+
+        val a: Age = 30
+
+        print(fill(7), fill(Busy) == Busy, fill(Pos(1, 2)).y, fill([4, 5, 6])[2], int(fill(a)))
+        print(fill("text"), fill(s"made ${fill(3)}"))
+        """, "7 true 2 6 30\ntext made 3")
+
+@test("esl: a method fills an empty slot of its own type parameter, part by part")
+esl_method_and_parts()
+    if !esl_ready() then return
+
+    esl_clean(raw"""
+        enum Mode
+            Idle
+            Busy
+
+        struct Pair[T]
+            a: T
+            b: T
+
+        struct Holder[T]
+            v: T
+
+        impl[T] Holder[T]
+            pair(self) -> Pair[T]
+                var p: Pair[T] = slot_empty()
+
+                p.a = self.v
+                p.b = self.v
+                p
+
+        val p = Holder(Busy).pair()
+
+        print(p.a == Busy, p.b == Busy, Holder(9).pair().b)
+        """, "true true 9")
+
+@test("esl: slot_put and a copy through the address fill an empty slot")
+esl_put_and_copy()
+    if !esl_ready() then return
+
+    esl_clean(raw"""
+        import sysl.raw.ptr_cast
+
+        enum Mode
+            Idle
+            Busy
+
+        put[T](v: T) -> T
+            var out: T = slot_empty()
+
+            slot_put(&out, v)
+            out
+
+        copy[T](src: *T) -> T
+            var out: T = slot_empty()
+            val to: *u8 = ptr_cast(&out)
+            val from: *u8 = ptr_cast(src)
+
+            for i in 0..<sizeof(T) do to[i] = from[i]
+
+            out
+
+        var m = Busy
+
+        print(put(Busy) == Busy, put("s"), copy(&m) == Busy, copy(&m) != Idle)
+        """, "true s true true")
+
+@test("esl: the library's relaxed copy and SeqLock take a plain type with no zero value")
+esl_relaxed_copy_no_zero()
+    if !esl_ready() then return
+
+    esl_clean(raw"""
+        import sysl.sync.*
+
+        enum Mode
+            Idle
+            Busy
+
+        struct Both
+            m: Mode
+            n: u32
+
+        var m = Idle
+        var b = Both(Idle, 1)
+
+        store_relaxed(&m, Busy)
+        store_relaxed(&b, Both(Busy, 7))
+
+        var l = SeqLock.new(Both(Idle, 2))
+
+        l.write(Both(Busy, 3))
+
+        print(load_relaxed(&m) == Busy, load_relaxed(&b).n, l.read().m == Busy, l.read().n)
+        """, "true 7 true 3")
+
+// -- a destructor --------------------------------------------------------------------------------------
+
+private esl_res() -> string = raw"""
+    struct Res
+        n: int
+
+    impl Drop for Res
+        drop(self) = print(s"drop ${self.n}")
+
+    """
+
+@test("esl: an empty slot of a Drop type that is never filled runs no destructor and frees nothing")
+esl_drop_never_filled()
+    if !esl_ready() then return
+
+    esl_clean(esl_res() + raw"""
+        hold[T]()
+            var out: T = slot_empty()
+
+            print("held")
+
+        run()
+            var r: &Res = slot_empty()
+
+            print("ran")
+
+        hold[&Res]()
+        run()
+        print("end")
+        """, "held\nran\nend")
+
+@test("esl: a Drop value put into an empty slot is dropped once, when the local goes")
+esl_drop_put_once()
+    if !esl_ready() then return
+
+    esl_clean(esl_res() + raw"""
+        keep[T](v: T)
+            var out: T = slot_empty()
+
+            slot_put(&out, v)
+            print("kept")
+
+        run()
+            var r: &Res = slot_empty()
+
+            slot_put(&r, Res(1))
+            print("in", r.n)
+
+        run()
+        keep(Res(2))
+        print("end")
+        """, "in 1\ndrop 1\nkept\ndrop 2\nend")
+
+@test("esl: assigning an empty slot lets go of nothing, and assigning it again drops the first value")
+esl_drop_assigned_twice()
+    if !esl_ready() then return
+
+    esl_clean(esl_res() + raw"""
+        run()
+            var r: &Res = slot_empty()
+
+            r = Res(1)
+            print("first")
+            r = Res(2)
+            print("second")
+
+        run()
+        print("end")
+        """, "first\ndrop 1\nsecond\ndrop 2\nend")
+
+// -- alignment -----------------------------------------------------------------------------------------
+
+@test("esl: an empty slot of an over-aligned type starts on its boundary")
+esl_over_aligned()
+    if !esl_ready() then return
+
+    esl_clean(raw"""
+        @align(64)
+        struct Line
+            bytes: [64]u8
+
+        struct Wide
+            a: u8
+            b: u64
+
+        offset[T]() -> usize
+            var b: u8 = 1
+            var out: T = slot_empty()
+
+            usize(&out) % alignof(T) + usize(&b) % 1
+
+        run() -> usize
+            var b: u8 = 1
+            var l: Line = slot_empty()
+
+            usize(&l) % 64 + usize(&b) % 1
+
+        print(offset[Line](), offset[Wide](), alignof(Line), run())
+        """, "0 0 64 0")
+
+// -- what it lowers to ----------------------------------------------------------------------------------
+
+@test("esl: an empty slot of a value with no count is not written, and one with a count is zeroed")
+esl_lowering()
+    val plain = emit_func_text("f(p: *u64)\n    var out: [16]u64 = slot_empty()\n\n    out[0] = 1\n" +
+                               "    *p = out[0]\n", "f")
+
+    assert(plain.starts_with("define"), plain)
+    assert(!plain.contains("zeroinitializer"), plain)
+    assert(!plain.contains("memset"), plain)
+
+    val counted = emit_func_text("f() -> string\n    var out: string = slot_empty()\n\n    out = \"a\"\n" +
+                                 "    out\n", "f")
+
+    assert(counted.starts_with("define"), counted)
+    assert(counted.contains("zeroinitializer"), counted)
+
+// -- reading before writing ------------------------------------------------------------------------------
+
+@test("esl: a read of an empty slot before anything is written to it is refused where it is read")
+esl_read_before_write()
+    if !esl_ready() then return
+
+    esl_refused("f() -> int\n    var x: int = slot_empty()\n\n    x\n\nprint(f())\n",
+                [esl_read_said("x"), "main.sysl:4:5"])
+    esl_refused("f()\n    var x: int = slot_empty()\n\n    print(x)\n    x = 1\n\nf()\n",
+                [esl_read_said("x"), "main.sysl:4:11"])
+
+@test("esl: a write whose value reads the slot, and a compound assignment, read it first")
+esl_write_reads_first()
+    assert_eq(emit_func_text("f() -> int\n    var x: int = slot_empty()\n\n    x = x + 1\n    x\n", "f"),
+              esl_read_said("x"))
+    assert_eq(emit_func_text("f() -> int\n    var x: int = slot_empty()\n\n    x += 1\n    x\n", "f"),
+              esl_read_said("x"))
+
+@test("esl: a closure capturing an empty slot reads it")
+esl_capture_reads()
+    if !esl_ready() then return
+
+    esl_refused("f() -> int\n    var x: int = slot_empty()\n    val g = () -> x + 1\n\n    x = 2\n    g()\n\n" +
+                    "print(f())\n", [esl_read_said("x"), "main.sysl:3:13"])
+
+@test("esl: a read after a write, its address or a ref is accepted, as is a write on one arm")
+esl_reads_after_writes()
+    if !esl_ready() then return
+
+    esl_clean(raw"""
+        set(p: *int)
+            *p = 4
+
+        a() -> int
+            var x: int = slot_empty()
+
+            set(&x)
+            x
+
+        b() -> int
+            var x: int = slot_empty()
+            ref r = x
+
+            r = 5
+            x
+
+        c(on: bool) -> int
+            var x: int = slot_empty()
+
+            if on then x = 6
+
+            if on then x else 0
+
+        print(a(), b(), c(true), c(false))
+        """, "4 5 6 0")
+
+// -- where it stands ---------------------------------------------------------------------------------
+
+@test("esl: slot_empty stands only as a var's initial value")
+esl_only_a_var()
+    if !esl_ready() then return
+
+    esl_refused(raw"""
+        g(n: int) = ()
+
+        f1()
+            val x: int = slot_empty()
+
+        f2() = g(slot_empty())
+
+        f3()
+            var x: int = 1 + slot_empty()
+
+        f4()
+            var x: int
+
+            x = slot_empty()
+
+        f1()
+        f2()
+        f3()
+        f4()
+        """, [esl_place_said(), "main.sysl:4:18", "main.sysl:6:10", "main.sysl:9:22", "main.sysl:14:9"])
+
+@test("esl: slot_empty needs a type and takes no arguments, and slot_empty[T]() names the type")
+esl_type_and_arguments()
+    assert_eq(emit_func_text("f()\n    var x = slot_empty()\n", "f"),
+              "'slot_empty' makes a slot for a value of some type, and nothing here says which — write " +
+                  "'var name: T = slot_empty()' or 'slot_empty[T]()'")
+    assert_eq(emit_func_text("f()\n    var x: int = slot_empty(1)\n", "f"),
+              "'slot_empty' takes no arguments — the local's type says what the slot holds — but 1 " +
+                  "argument was given")
+
+    if !esl_ready() then return
+
+    esl_clean("f() -> int\n    var x = slot_empty[int]()\n\n    x = 3\n    x\n\nprint(f())\n", "3")
+
+@test("esl: a function named slot_empty is what a call of the name reaches")
+esl_name_yields()
+    if !esl_ready() then return
+
+    esl_clean("slot_empty() -> int = 8\n\nf() -> int\n    var x: int = slot_empty()\n\n    x + 1\n\nprint(f())\n",
+              "9")
+
+// -- the refusal of a `var` with no zero, at the call that chose the type -----------------------------------
+
+@test("esl: a var with no zero value in a generic body is refused at the call that chose the type")
+esl_no_zero_at_the_call()
+    if !esl_ready() then return
+
+    esl_refused(raw"""
+        enum Mode
+            Idle
+            Busy
+
+        make[T]() -> T
+            var x: T
+
+            x
+
+        print(make[int]())
+        print(make[Mode]() == Idle)
+        """, ["Mode has no zero value, so 'x' needs an initial value (in 'make[Mode]', declared at ",
+              "main.sysl:6)", "main.sysl:11:"])
+
+@test("esl: a var with no zero value in a library generic is refused at the program's own call")
+esl_no_zero_library_at_the_call()
+    if !esl_ready() then return
+
+    val run = esl_run(raw"""
+        import sysl.encoding.json.from_json
+
+        enum Mode
+            Idle
+            Busy
+
+        print(from_json[[2]Mode]("[0, 1]").is_ok())
+        """)
+
+    assert(!run.ok, run.out)
+    assert(run.out.contains("[2]Mode has no zero value, so 'out' needs an initial value (in "), run.out)
+    assert(run.out.contains("main.sysl:7:"), run.out)
+    assert(!run.out.contains("library/sysl/codec/codec.sysl:364:"), run.out)
+
+@test("esl: a var with no zero value outside a generic is still refused at the declaration")
+esl_no_zero_concrete()
+    if !esl_ready() then return
+
+    esl_refused(raw"""
+        enum Mode
+            Idle
+            Busy
+
+        f()
+            var x: Mode
+
+        f()
+        """, ["Mode has no zero value, so 'x' needs an initial value", "main.sysl:6:"])
