@@ -3,7 +3,7 @@ module sh.sysl.compiler
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.container.{Map, map, Set, set}
-import sysl.hash.ByAddress
+import sysl.ByAddress
 
 // **A local that only walks storage holds no count** (`docs/design/borrow-inference.md` §3, §4.1;
 // `tests_bli_borrowed_locals.sysl`).
@@ -180,6 +180,19 @@ end LocalNote
 private var pzl_notes: Buf[LocalNote] = buf()
 private var pzl_seen: Set[string] = set()
 
+// **What the analysis has done since the last call**: the events its walks made and the +0 locals it
+// answered -- the work a test holds to the size of the bodies it reads (`tests_pzg_plus0_growth.sysl`).
+private var pzl_events_made: usize = 0
+private var pzl_plus0_found: usize = 0
+
+take_plus0_work() -> (usize, usize)
+    val out = (pzl_events_made, pzl_plus0_found)
+
+    pzl_events_made = 0
+    pzl_plus0_found = 0
+    out
+end take_plus0_work
+
 // The local lines gathered since the last call, handed over once.
 take_local_notes() -> Buf[LocalNote]
     val out = pzl_notes
@@ -280,7 +293,9 @@ plus0_locals(e: *Emit, f: TFunc, owned: Set[string], jumps: bool) -> Set[string]
     // whose values is read from a root -- never of a local each value of which arrives with a count or
     // is a constant.
     for i in 0..<g.cands.len()
-        if alive[i] then out.add(g.cands[i].name)
+        if alive[i]
+            out.add(g.cands[i].name)
+            pzl_plus0_found += 1
 
         if why[i] != ""
             for d in g.cands[i].defs
@@ -464,7 +479,7 @@ private place_base(place: TExpr) -> Option[string] = *place.kind match
     TLoad(name, _) -> Some(name)
     TField(r, _, _) -> place_base(r)
     TIndex(r, _, _) -> repr(texpr_type(r)) match
-        Array(_, _) -> place_base(r)
+        Array(_, _, _) -> place_base(r)
         _ -> None
     _ -> None
 
@@ -620,6 +635,8 @@ private scope_list(e: *Emit, g: &Gather, drops: &DropMemo, id: usize, aliases: S
 
     if g.results[id].is_some() then walk_texpr(g.results[id].unwrap(), walk)
 
+    pzl_events_made += sink.events.len()
+
     var out = Scoped(sink.events, starts, 0, map(), buf(), type_index(), buf(), buf(), type_index(), buf(), map(),
                      map(), map(), buf(), buf())
 
@@ -679,6 +696,7 @@ private extra_events(e: *Emit, g: &Gather, drops: &DropMemo, exprs: Buf[TExpr], 
     for x in exprs
         walk_texpr(x, walk)
 
+    pzl_events_made += sink.events.len()
     sink.events
 end extra_events
 
