@@ -77,6 +77,52 @@ gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
 
     var owned_names: Set[string] = set()
 
+    for j in 0..<f.params.len()
+        val p = f.params[j]
+        val handed = !e.zero_body && e.owned_params.has(owned_key(f.name, j))
+
+        if !zero_sized(p.1) && !(value_drops(e, p.1) && reads_receiver(f, j)) && (owns.has(p.0) || handed) then
+            owned_names.add(p.0)
+    end for
+
+    // **A local that only walks storage holds no count** (`plus0_locals.sysl`): its declaration, its
+    // bindings and its assignments take none and give none back, and whatever keeps it takes one there.
+    // A task's body runs after its caller has let go of what it lent, so it walks nothing borrowed.
+    //
+    // **So does a rewritten parameter whose every value is backed** (borrow-inference.md §4.3 (a)): one
+    // `owning` owns only because the body assigns it or jumps with it. And a self-jumping body with a
+    // parameter every jump hands a fresh value is **peeled** (§4.3 (b), decision 9): this symbol borrows
+    // that parameter on entry and its jump calls `<symbol>.owned`, the same body owning what the jump
+    // staged (`peel_parts`).
+    val rewritten = if is_async || e.zero_body then set() else rewritten_params(e, f, owns, !found.is_empty())
+    val answer = if is_async then Plus0(set(), set())
+                 else plus0_locals(e, f, owned_names, !found.is_empty(), rewritten,
+                                   e.peel == PeelNone && peel_shape(e, f))
+
+    if e.peel == PeelNone && !answer.fresh.is_empty()
+        e.peel = PeelEntry
+        e.peel_wanted = true
+        e.peel_handed = set()
+
+        for n in owned_names
+            if !answer.names.has(n) then e.peel_handed.add(n)
+    end if
+
+    // The entry borrows what it peels; the owned half is handed a count for it, and for every other
+    // parameter neither half borrows.
+    for n in answer.names
+        owned_names.remove(n)
+
+    if e.peel == PeelEntry
+        for n in answer.fresh
+            owned_names.remove(n)
+
+    // Both halves read the same body with the same answers, so the owned half borrows exactly what the
+    // entry's jump stages without a count. A difference would be a miscount, so it is refused instead.
+    if e.peel == PeelOwned
+        for n in e.peel_handed
+            if answer.names.has(n) then gap_here(e, s"the peel of '${qualified_name(f.name)}', whose halves disagree on '$n'")
+
     // A zero-sized parameter is not an argument: there is nothing to receive and nothing to keep, so
     // it takes no slot and the emitted signature does not mention it.
     //
@@ -87,15 +133,17 @@ gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
 
         if !zero_sized(p.1)
             val ty = p.1
-            val handed = !e.zero_body && e.owned_params.has(owned_key(f.name, j))
+
+            // The owned half of a peel is handed its count by the entry's jump, as a direct caller
+            // hands an owned parameter's.
+            val handed = !e.zero_body && (e.owned_params.has(owned_key(f.name, j)) ||
+                                          e.peel == PeelOwned && e.peel_handed.has(p.0))
 
             // A `@unique` value with a destructor is the callee's to drop only where it was handed
             // over (`owned_params.sysl`); a `(self)` receiver is a copy that owns nothing, and takes
             // no count of its own either -- one would be a second owner (`emit_unique.sysl`).
             val reader = value_drops(e, ty) && reads_receiver(f, j)
-            val owned = !reader && (owns.has(p.0) || handed)
-
-            if owned then owned_names.add(p.0)
+            val owned = owned_names.has(p.0)
 
             if value_drops(e, ty) && !reader && !handed && !e.zero_body
                 gap_here(e, s"the '@unique' parameter '${p.0}', which this function cannot be handed")
@@ -140,10 +188,7 @@ gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
 
             if owned then own_slot(e, p.0, ty)
 
-    // **A local that only walks storage holds no count** (`plus0_locals.sysl`): its declaration, its
-    // bindings and its assignments take none and give none back, and whatever keeps it takes one there.
-    // A task's body runs after its caller has let go of what it lent, so it walks nothing borrowed.
-    e.lent_decls = if is_async then set() else plus0_locals(e, f, owned_names, !found.is_empty())
+    e.lent_decls = answer.names
 
     // Where the function calls itself as the last thing it does, that call is a jump to here rather
     // than a second frame. The target sits *after* the parameter slots are written and *before*
@@ -278,6 +323,69 @@ gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
 
     Some(if strict then strict_fp_body(e, built) else built)
 end gen_function
+
+// **The parameters `owning` owns only because the body rewrites them** (borrow-inference.md §4.3):
+// assigns them, or jumps back to its own entry with a new value for them. Each is a candidate the
+// +0 analysis may borrow throughout (`plus0_locals.sysl`). Never where something outside the program
+// may call the function, nor a closure's body, a variadic one, one with a contract or a measure -- each
+// keeps the convention it has (§4.3's last bullet) -- nor a parameter handed over with a count, a
+// `@scoped` one, a large one, a `@unique` one with a destructor, or a `va_list`.
+rewritten_params(e: *Emit, f: TFunc, owns: Set[string], jumps: bool) -> Set[string]
+    var out: Set[string] = set()
+
+    if e.address_taken.has(f.name) || f.exported.is_some() || f.section.is_some() || f.conv.is_some() ||
+       f.variadic || is_closure_body(f) || f.variant.is_some() || !f.requires.is_empty() ||
+       !f.ensures.is_empty() || !f.olds.is_empty() then
+        return out
+
+    val bound = rebound(f)
+
+    if bound.has(OPAQUE) then return out
+
+    for j in 0..<f.params.len()
+        val p = f.params[j]
+        val ty = p.1
+
+        if !owns.has(p.0) || (!jumps && !bound.has(p.0)) then continue
+        if e.owned_params.has(owned_key(f.name, j)) || scoped_at(f, j) then continue
+        if !contains_counted(ty) || zero_sized(ty) || e.layout.indirect(ty) || value_drops(e, ty) then continue
+        if underlying(ty) == VaList || e.lent_params.has(owned_key(f.name, j)) then continue
+
+        out.add(p.0)
+
+    out
+end rewritten_params
+
+// **Whether a self-jumping body may be peeled** (decision 9): emitted as two functions, this symbol
+// borrowing on entry and jumping into `<symbol>.owned`, which owns what each jump staged. The call
+// carries every parameter as it crosses in registers, so a body with a large one, a hidden caller's
+// location, a `@disjoint` split, or an owning or lent split of its own is not peeled; nor is a copy of
+// a precompiled body (`peel_off`), whose owned half the artifact holds under its own answer.
+peel_shape(e: *Emit, f: TFunc) -> bool
+    if e.peel_off || e.zero_body || e.split_funcs.has(f.name) || f.marks.track_caller ||
+       !f.marks.disjoint.is_empty() || f.marks.is_async() then
+        return false
+
+    for p in f.params
+        if !zero_sized(p.1) && e.layout.indirect(p.1) then return false
+
+    !e.layout.indirect(f.ret_ty)
+end peel_shape
+
+// **The owned half of a peeled function**: the same body, under `<symbol>.owned` and local to its
+// module, handed a count for every parameter in `peel_handed`. Only the entry's jump calls it.
+gen_peel_owned(e: *Emit, f: TFunc) -> Option[IrFunc]
+    e.peel = PeelOwned
+
+    val built = gen_function(e, f)
+
+    e.peel = PeelNone
+    e.peel_wanted = false
+
+    val made = built?
+
+    Some(made with { sig = made.sig with { name = owned_symbol(made.sig.name), linkage = LinkInternal } })
+end gen_peel_owned
 
 // **A `va_list` parameter is received as C receives one**, so the body walks on from wherever its
 // caller -- sysl or C -- had reached. The slot the body reads as `ap` is the walk's storage: where the

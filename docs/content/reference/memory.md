@@ -4038,8 +4038,41 @@ main()
 1 1 9
 ```
 
-A callee still takes a count for **a parameter it assigns to**, and for every parameter of a function
-something outside the program may call (`@export`, a `@section`, one whose address is taken).
+A callee still takes a count for **a parameter it assigns a value it made** — a walk that only follows
+fields of what it was handed (`p = p.next`, or a call to itself with `n.next` that is lowered as a
+jump) takes none — and for every parameter of a function something outside the program may call
+(`@export`, a `@section`, one whose address is taken). A function that calls itself last with values
+it made reads its first round's parameters through its caller's count, and takes one only for what
+each later round is handed. Both of these walk the list with no count operation at all:
+
+```sysl
+struct Node
+    v: int
+    next: Option[&Node]
+
+count(p: Option[&Node], n: int) -> int = p match
+    Some(node) -> count(node.next, n + 1)
+    None -> n
+
+total(p: Option[&Node]) -> int
+    var sum = 0
+
+    while p is Some(node)
+        sum += node.v
+        p = node.next
+
+    sum
+
+main()
+    val list: Option[&Node] = Some(Node(1, Some(Node(2, Some(Node(3, None))))))
+
+    print(count(list, 0), total(list))
+```
+
+```output
+3 6
+```
+
 **A call to an `async` function moves a temporary into its task**, which lets it go at its `return`,
 not at the end of the caller's statement:
 
