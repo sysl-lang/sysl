@@ -4529,6 +4529,32 @@ int sysl_fx_twice(int x) {
 }
 ```
 
+**A macro that is a C string is a `c const` at `string`** ([a string is read too](#a-string-is-read-too)),
+its right-hand side the macro's own name, so the joining of adjacent literals, every escape (`\n`,
+`\x41`, octal) and a macro written out of other string macros are C's, settled when the module is built:
+
+```c
+#define FX_MAJOR "5"
+#define FX_NAME "fx " FX_MAJOR "\n"
+#define FX_NONE ""
+```
+
+becomes, with `--prefix fx_`,
+
+```sysl
+c const
+    MAJOR: string = "FX_MAJOR"
+    NAME: string = "FX_NAME"
+    NONE: string = "FX_NONE"
+```
+
+An empty string is a string of no bytes, where an empty `#define` is a flag and bound to nothing. A
+`u8"…"` literal is the same bytes as the plain one and binds the same. **A wide literal (`L"…"`,
+`u"…"`, `U"…"`) is refused by name**, since its elements are not bytes and a `string` holds UTF-8 —
+as is a macro of `char` pointer type that is no literal, an address (`#define P (buf)`), which no
+`string` can hold. A function-like macro is wrapped or refused as before. Bytes that are not UTF-8
+(`"\xff"`) are bound and then stopped by the line's own check when the module is built.
+
 **The checks are the point.** Built for a target where `fx_word` or `struct fx_bits` is laid out
 otherwise, the module stops at that record's `@assert`, naming it, rather than reading the wrong
 bytes. What the generator cannot express it says, by name, on stderr and at the foot of the module —
