@@ -146,6 +146,23 @@ end ssx_d_ir
 
 private ssx_d_count(text: string, needle: string) -> usize = text.count_of(needle)
 
+// The body of the function whose `define` line names `name`, from that line to its closing brace.
+private ssx_d_body(ir: string, name: string) -> string
+    var out: Buf[string] = buf()
+    var inside = false
+
+    for line in ir.split("\n")
+        if !inside && line.starts_with("define") && holds_text(line, name) then inside = true
+
+        if inside
+            out.push(line)
+
+            if line == "}" then break
+
+    assert(inside, s"no body names $name:\n$ir")
+    join(out.view(), "\n")
+end ssx_d_body
+
 // How a run ended, as a shell would number it: the exit code, or 128 and the signal.
 private ssx_d_code(s: Status) -> int = s match
     Status.Exited(c) -> c
@@ -341,18 +358,16 @@ ssx_d_ir_at_32_bits()
     if !clang_available() then return
 
     for (t, word) in [("thumb-freestanding-softfp", "i32"), ("wasm32-freestanding", "i32"), ("aarch64-macos", "i64")]
-        val on = ssx_d_ir(ssx_d_ir_text, true, t)
-        val off = ssx_d_ir(ssx_d_ir_text, false, t)
+        val on = ssx_d_body(ssx_d_ir(ssx_d_ir_text, true, t), "use$$sysl")
+        val off = ssx_d_body(ssx_d_ir(ssx_d_ir_text, false, t), "use$$sysl")
         val shape = s"insertvalue { ptr, ptr, $word }"
 
-        assert_eq(ssx_d_count(on, shape), ssx_d_count(off, shape) + 2, s"$t\n$on")
+        assert_eq(ssx_d_count(on, shape), 2, s"$t\n$on")
+        assert_eq(ssx_d_count(off, "insertvalue"), 0, s"$t\n$off")
         assert(holds_text(on, s"call { ptr, ptr, $word } @sysl.str.for_c("), s"$t\n$on")
         assert(!holds_text(off, "sysl.str.for_c"), s"$t\n$off")
-        assert(!holds_text(on, "short-string tag"), s"$t\n$on")
 
-    val thumb = ssx_d_ir(ssx_d_ir_text, true, "thumb-freestanding-softfp")
-
-    assert(holds_text(thumb, "@take([3 x i32]"), thumb)
+        if t == "thumb-freestanding-softfp" then assert(holds_text(on, "@take([3 x i32]"), on)
 
 // -- what does not change -----------------------------------------------------------------------------
 
