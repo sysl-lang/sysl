@@ -1,6 +1,6 @@
 ---
 title: Regular expressions
-summary: "`sysl.regex` — POSIX Extended Regular Expressions, matched by a Pike VM whose cost is the input length times the pattern length and never anything worse."
+summary: "`sysl.regex` — POSIX Extended Regular Expressions, found by a lazy DFA at a table lookup per byte, with a Pike VM behind it whose cost is the input length times the pattern length and never anything worse."
 weight: 25
 ---
 
@@ -52,6 +52,27 @@ false
 
 The price of that guarantee is the feature backtracking buys and this cannot have: there are **no
 backreferences**. `(a)\1` is not a pattern that matches a doubled character; `\1` is an escaped `1`.
+
+### The DFA in front of it
+
+The VM is the engine of record, but it is not what runs first. A pattern has only so many ways of
+being part way through a match, and a long search spends nearly all its time rebuilding the same few
+thread lists, so a **lazy DFA** remembers them: the first time a search is in some set of
+instructions and reads some character, the set it moves to is worked out and kept, and every later
+time that step is one load from a table. Only the states a text actually reaches are ever built, so
+a pattern whose full DFA would be exponential costs no more than the VM did — and the cache is
+bounded, emptied and rebuilt when a pattern reaches more states than it holds.
+
+A search runs it twice: forward to find where the leftmost-longest match **ends**, then over the
+pattern reversed, backward from there, to find where it **begins**. When the pattern has capture
+groups the VM is run over exactly that span to fill them in, so groups cost in proportion to the
+match rather than to the text searched. `is_match` stops at the first accept and does neither of the
+other two.
+
+The answers are the VM's answers, span for span and group for group; the DFA only gets to them
+faster. A byte outside ASCII is stepped without the table, which is slower and exactly as correct. A
+search the DFA cannot answer on its own — one started part way into a character, or over bytes that
+are not well-formed UTF-8 — is handed to the VM whole.
 
 The bound is on *matching*, and the other end needs bounding too. An interval is expanded into that
 many copies of what precedes it, so intervals stack multiplicatively: `a{200}{200}{200}` is sixteen
