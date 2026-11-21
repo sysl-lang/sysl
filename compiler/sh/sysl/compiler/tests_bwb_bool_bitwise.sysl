@@ -1,0 +1,222 @@
+module sh.sysl.compiler
+@tests
+
+// `bool`'s `&`, `|` and `^` (`reference/expressions.md`, "Bitwise operators on `bool`") and the
+// refusal of a comparison chain whose middle operand is an unparenthesised bitwise expression.
+//
+// **Both sides of `&`, `|` and `^` always run**, which `&&` and `||` do not: every cell that says so
+// counts the calls a side effect makes. The helpers are `tests_enm_enum_run.sysl`'s.
+//
+// Skipped cells: a `new` type over `bool` and a constrained `bool` (neither is a type with the
+// operators of its own), a generic `T: Bool` (no such bound exists), and a const used as an array
+// length (a length is an integer, so a `bool` const never reaches one).
+
+private bwb_prelude() -> string = raw"""
+    var calls = 0
+
+    hit(v: bool) -> bool
+        calls += 1
+        v
+
+    struct Flags
+        ok: bool
+
+    """
+
+private bwb_ran(body: string) -> string = enm_ran(bwb_prelude() + body)
+
+private bwb_refused(text: string, want: string)
+    val said = enm_err(bwb_prelude() + text)
+
+    assert(enm_says(said, want), said)
+
+    val first = said.index_of(want).unwrap()
+
+    assert(said[first + want.bytes.len..<said.bytes.len].index_of(want).is_none(), said)
+end bwb_refused
+
+private bwb_chain(op: string) -> string =
+    s"'$op' in the middle of a comparison chain binds tighter than the comparisons"
+
+@test("the truth tables of & | and ^ over two bool")
+bwb_truth_tables()
+    if !enm_ready() then return
+
+    assert_eq(bwb_ran(raw"""
+        main()
+            for a in [false, true]
+                for b in [false, true]
+                    print(a & b, a | b, a ^ b)
+        """), "false false false\nfalse true true\nfalse true true\ntrue true false\n")
+
+@test("both sides of & and | are evaluated, where && and || stop at the left")
+bwb_both_sides_run()
+    if !enm_ready() then return
+
+    assert_eq(bwb_ran(raw"""
+        main()
+            val a = hit(false) & hit(true)
+            print(a, calls)
+            calls = 0
+            val b = hit(false) && hit(true)
+            print(b, calls)
+            calls = 0
+            val c = hit(true) | hit(false)
+            print(c, calls)
+            calls = 0
+            val d = hit(true) || hit(false)
+            print(d, calls)
+            calls = 0
+            val e = hit(true) ^ hit(true)
+            print(e, calls)
+        """), "false 2\nfalse 1\ntrue 2\ntrue 1\nfalse 2\n")
+
+@test("|= &= and ^= evaluate their right side whatever the place holds")
+bwb_compound_assignment()
+    if !enm_ready() then return
+
+    assert_eq(bwb_ran(raw"""
+        main()
+            var f = false
+
+            f |= hit(true)
+            print(f, calls)
+            f |= hit(false)
+            print(f, calls)
+            f &= hit(true)
+            print(f, calls)
+            f &= hit(false)
+            print(f, calls)
+            f ^= hit(true)
+            print(f, calls)
+            f ^= hit(true)
+            print(f, calls)
+        """), "true 1\ntrue 2\ntrue 3\nfalse 4\ntrue 5\nfalse 6\n")
+
+@test("the compound forms write a field and an array element, evaluating the right side once")
+bwb_compound_places()
+    if !enm_ready() then return
+
+    assert_eq(bwb_ran(raw"""
+        main()
+            var s = Flags(false)
+            var xs = [false, true, false]
+
+            s.ok |= hit(true)
+            xs[1] &= hit(false)
+            xs[2] ^= hit(true)
+            print(s.ok, xs[0], xs[1], xs[2], calls)
+        """), "true false false true 3\n")
+
+@test("& and | and ^ bind as bitwise operators do: tighter than && and ||, looser than comparisons' operands")
+bwb_precedence()
+    if !enm_ready() then return
+
+    assert_eq(bwb_ran(raw"""
+        main()
+            print(true || false & false)
+            print(false && true | true)
+            print(true | false && false)
+            print(true ^ true || true)
+            print(false & true ^ true)
+            print(true ^ false | true)
+            print(!false & false)
+            print(true | false != true)
+        """), "true\nfalse\nfalse\ntrue\ntrue\ntrue\nfalse\nfalse\n")
+
+@test("a comparison chain with an unparenthesised bitwise middle operand is refused, each operator")
+bwb_chain_refused()
+    if !enm_ready() then return
+
+    bwb_refused("f(a: int, b: int, c: int, d: int) -> bool = a < b | c < d\n", bwb_chain("|"))
+    bwb_refused("f(a: int, b: int, c: int, d: int) -> bool = a < b & c < d\n", bwb_chain("&"))
+    bwb_refused("f(a: int, b: int, c: int, d: int) -> bool = a < b ^ c < d\n", bwb_chain("^"))
+
+@test("a bool chain, a longer chain and a half-parenthesised middle operand are refused too")
+bwb_chain_refused_neighbours()
+    if !enm_ready() then return
+
+    bwb_refused("f(a: bool, b: bool, c: bool, d: bool) -> bool = a == b | c == d\n", bwb_chain("|"))
+    bwb_refused("f(a: int, b: int, c: int, d: int) -> bool = a < b < c ^ d < 9\n", bwb_chain("^"))
+    bwb_refused("f(a: int, b: int, c: int, d: int) -> bool = a < (b) | (c) < d\n", bwb_chain("|"))
+    bwb_refused("f(a: int, b: int, c: int, d: int) -> bool = a < (b | c) & d < 9\n", bwb_chain("&"))
+
+@test("the refusal names the parenthesised forms")
+bwb_chain_hint()
+    if !enm_ready() then return
+
+    bwb_refused("f(a: int, b: int, c: int, d: int) -> bool = a < b | c < d\n",
+                "as in 'a < (b | c) < d'. Parenthesise it to say so, or write the two comparisons apart " +
+                "and join them, as in '(a < b) | (c < d)'")
+
+@test("the parenthesised forms, and a bitwise operand at either end or in a single comparison, are accepted")
+bwb_chain_accepted()
+    if !enm_ready() then return
+
+    assert_eq(bwb_ran(raw"""
+        main()
+            val a = 1
+            val b = 2
+            val c = 3
+            val d = 4
+
+            print(a < (b | c) < d)
+            print(a < ((b | c)) < d)
+            print((a < b) | (c < d))
+            print((a < b) & (c > d))
+            print(a | b < c < d)
+            print(a < b < c | d)
+            print(a & 1 == 1)
+            print(a < b | c)
+            print(a < b < (c | a) < 4)
+        """), "true\ntrue\ntrue\nfalse\nfalse\ntrue\ntrue\ntrue\ntrue\n")
+
+@test("a chain of bool comparisons joined by | is the two comparisons when written with parentheses")
+bwb_chain_bool_joined()
+    if !enm_ready() then return
+
+    assert_eq(bwb_ran(raw"""
+        main()
+            val a = true
+            val b = false
+            print((a == b) | (b == b))
+            print((a == b) ^ (b == b))
+        """), "true\ntrue\n")
+
+@test("the operators fold in a const, with the same precedence")
+bwb_const_fold()
+    if !enm_ready() then return
+
+    assert_eq(bwb_ran(raw"""
+        const T: bool = true
+        const F: bool = false
+        const A: bool = T & F
+        const B: bool = T | F
+        const C: bool = T ^ T
+        const D: bool = A | B & !C ^ F
+
+        main()
+            print(A, B, C, D)
+        """), "false true false true\n")
+
+@test("the operators on a mask of bool lanes are unchanged")
+bwb_mask_lanes_unchanged()
+    if !enm_ready() then return
+
+    assert_eq(bwb_ran(raw"""
+        main()
+            val a: <4>int = [1, 2, 3, 4]
+            val b: <4>int = [4, 3, 2, 1]
+            val lt = a < b
+            val gt = a > b
+
+            print((lt | gt).any(), (lt & gt).any(), (lt ^ gt).all())
+        """), "true false true\n")
+
+@test("the other operators stay refused on bool, and a bool does not meet an int")
+bwb_other_operators_refused()
+    if !enm_ready() then return
+
+    bwb_refused("f(a: bool, b: bool) -> bool = a << b\n", "operator '<<' is not defined for bool")
+    bwb_refused("f(a: bool, b: bool) -> bool = a + b\n", "operator '+' is not defined for bool")
+    bwb_refused("f(a: bool, b: int) -> bool = a & b\n", "'&' needs matching types, got bool and int")
