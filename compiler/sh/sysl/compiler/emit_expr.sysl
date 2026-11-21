@@ -63,7 +63,7 @@ private gen_expr_kind(e: *Emit, x: TExpr) -> Val = *x.kind match
     // A string and a `[]u8` are the same three words, so looking at one as the other is nothing at
     // all -- the guarantee that was given up is the analyzer's business, not the machine's. Dropping
     // the ability to write is a fact about the type in exactly the same way.
-    TBytes(receiver) -> gen_expr(e, receiver)
+    TBytes(receiver) -> gen_bytes(e, x, receiver)
     TConstView(arg) -> gen_expr(e, arg)
     // The element type changed, and a view's pointer carries none; where the sizes or the boundaries
     // differ, the length is counted again and the address checked (`view_as.sysl`).
@@ -450,6 +450,7 @@ private gen_expr_kind(e: *Emit, x: TExpr) -> Val = *x.kind match
     TFromRaw(ptr, ref_ty) -> gen_from_raw(e, ptr, ref_ty)
     TEnumAttr(kind, en, arg, _) -> gen_enum_attr(e, kind, en, arg)
     TIntOp(op, operand, amount, width, ty) -> gen_int_op(e, op, operand, amount, width, ty)
+    TCarryOp(op, operands, width, ty) -> gen_carry_op(e, op, operands, width, ty)
 
     // A large one is built where it is going to live and read back out only because this caller
     // asked for a value -- the same rule a large array literal is under, and for the same reason: an
@@ -661,8 +662,10 @@ gen_len(e: *Emit, receiver: TExpr) -> Val = underlying(texpr_type(receiver)) mat
     Array(n, _, _) ->
         gen_expr(e, receiver)
         VInt(from_int(long(n)))
-    Slice(_, _) -> view_len(e, receiver)
-    Str -> view_len(e, receiver)
+    Slice(_, _) -> bytes_receiver(receiver) match
+        Some(s) -> str_len(e, gen_expr(e, s))
+        None -> view_len(e, gen_expr(e, receiver), texpr_type(receiver))
+    Str -> str_len(e, gen_expr(e, receiver))
     other -> gap_at(e, s"length of ${type_show(other)}")
 
 private gen_buf_lit(e: *Emit, elems: Buf[TExpr], slice_ty: Type) -> Val
@@ -735,15 +738,6 @@ zero_sized_elements(ty: Type) -> bool = element(ty).map(t -> zero_sized(t)).unwr
 private array_len_of(ty: Type) -> int = underlying(ty) match
     Array(n, _, _) -> n
     _ -> 0
-
-private view_len(e: *Emit, receiver: TExpr) -> Val
-    val wty = lty(e, texpr_type(receiver))
-    val v = gen_expr(e, receiver)
-    val r = fresh_reg(e)
-
-    emit(e, InExtract(r, wty, v, index_list(2)))
-    r
-end view_len
 
 // -- arithmetic ---------------------------------------------------------------------------------
 

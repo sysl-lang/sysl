@@ -149,6 +149,14 @@ form, the values are reduced lazily (Harvey, 2014), and a transform is a power o
 times one, so a product never pays for a transform more than a third longer than it needs. It needs
 a 64-bit limb: on a 32-bit target Toom-3 carries the largest products.
 
+**The carrying loops are written with `add_carry` and `sub_borrow`.** A limb of a sum is
+`a[i].add_carry(b[i], carry)`, the prelude's `Carrying` members on the unsigned integers
+([reference](/reference/types/#carrying-from-one-word-to-the-next)), which lower to a pair of
+`llvm.uadd.with.overflow` calls whose carry out is the next limb's carry in, so the back end forms an
+add-with-carry chain without the loop reading either overflow back off a comparison. On AArch64 the
+five carrying loops are assembly and these are the portable reference the assembly is tested against;
+every other processor runs them.
+
 **Division by a single limb never divides.** No 64-bit machine has an instruction for a two-limb by
 one-limb division, and a `u128 / u128` is a call into the runtime; Möller and Granlund's method
 ("Improved division by invariant integers", 2011) replaces it with two multiplications by a reciprocal

@@ -184,7 +184,10 @@ private[buf] struct BufCore[T]
      *
      * **The new storage's slots start out empty** (`slot_storage`), and the elements already here
      * are placed into it as one run (`slot_place_run`): one block move for an element that holds no
-     * count, and one by one, each taking a count of its own, for one that does. Nothing fills the rest: a
+     * count, and for one that does, one block move too where this buffer is the old storage's only
+     * holder -- the run is followed by the storage's replacement, so the compiler relocates the
+     * elements, their counts handed over untouched (`reference/memory.md`). Where a view still holds
+     * the old storage they are placed one by one, each taking a count of its own. Nothing fills the rest: a
      * repeated fill value would hold a count in every spare slot, keeping whatever it refers to alive
      * until the storage itself goes. The old storage is not emptied, since a view handed out earlier
      * may still be reading it; it lets go of its elements when its last holder does.
@@ -325,11 +328,15 @@ private[buf] struct BufCore[T]
 
     // -- the fallible twins (`sysl.alloc`) ------------------------------------------------------------
     //
-    // Each asks for its storage with `try_storage` and answers a refusal before anything here has
+    // Each asks for its storage with `try_slot_storage` and answers a refusal before anything here has
     // changed: the storage is replaced only once the new storage exists and holds every element.
 
     /** `grow`, answering a refusal. The doubling stops at `need` where doubling again would pass the
      * largest size, so the arithmetic itself is never what fails.
+     *
+     * The storage is asked for with `try_slot_storage` itself, its refusal told by its length, and the
+     * elements placed as one run the line before the storage is replaced -- the shape `grow` has, so
+     * the copy relocates the elements rather than counting each one twice.
      */
     @noinline
     @cold
@@ -339,11 +346,11 @@ private[buf] struct BufCore[T]
         while bigger_len < need
             bigger_len = if bigger_len <= usize::Max / 2 then bigger_len * 2 else need
 
-        val bigger: []T = try_storage(bigger_len)?
+        val bigger: []T = try_slot_storage(bigger_len)
 
-        for i in 0..<self.count
-            slot_place(bigger, i, self.elems[i])
+        if bigger.len != bigger_len then return Err(storage_refused(bigger_len, sizeof(T)))
 
+        slot_place_run(bigger, 0, self.elems[0..<self.count])
         self.elems = bigger
         Ok(())
     end try_grow
@@ -935,11 +942,13 @@ end try_buf_filled
 private[buf] try_storage[T](n: usize) -> Result[[]T, AllocError]
     val got: []T = try_slot_storage(n)
 
-    if got.len == n then return Ok(got)
-    if sizeof(T) > 0 && n > usize::Max / sizeof(T) then return Err(AllocError.CapacityOverflow)
+    if got.len == n then Ok(got) else Err(storage_refused(n, sizeof(T)))
 
-    Err(AllocError.OutOfMemory)
-end try_storage
+/** Why `try_slot_storage` answered no storage for `n` elements of `size` bytes each: the bytes do not
+ * fit in a word, or the heap refused them.
+ */
+private[buf] storage_refused(n: usize, size: usize) -> AllocError =
+    if size > 0 && n > usize::Max / size then AllocError.CapacityOverflow else AllocError.OutOfMemory
 
 /** The box a handle holds, or `OutOfMemory`. */
 private try_core[T](core: BufCore[T]) -> Result[&BufCore[T], AllocError] = try_heap(core) match

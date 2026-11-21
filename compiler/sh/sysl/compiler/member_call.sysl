@@ -3844,6 +3844,32 @@ private builtin_method(cx: &Analyzer, span: Span, written: TExpr, rty: Type,
 
     if slots.is_none() then return Some(bad_expr(span))
 
+    if numeric.unwrap() == "Carrying"
+        // Two operands of the receiver's type and a `bool` carry in, each held to the declared type.
+        var operands: Buf[TExpr] = buf()
+
+        operands.push(receiver)
+
+        for i in 0..<decl.params.len()
+            val want = resolve_type(cx.an, scope, decl.params[i].typ, subst)
+
+            if slots.unwrap()[i].is_none() then return Some(bad_expr(span))
+
+            val given = type_expr(cx, slots.unwrap()[i].unwrap(), Some(want))
+            val got = texpr_type(given)
+
+            if got != Unknown && disagree(got, want) then
+                return Some(cx.err(slots.unwrap()[i].unwrap().span,
+                                   s"'${decl.params[i].name}' of method '${module_bare(tr_name)}.$name' " +
+                                   s"is ${type_show(want)}, but ${type_show(got)} was given"))
+
+            operands.push(given)
+
+        val pair = resolve_result(cx.an, scope, decl.ret_type.unwrap(), subst)
+
+        return Some(TExpr(span, TCarryOp(name, operands, op_subject(rty), pair)))
+    end if
+
     var amount: Option[TExpr] = None
 
     if !decl.params.is_empty() && slots.unwrap()[0].is_some()

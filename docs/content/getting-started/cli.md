@@ -1113,8 +1113,8 @@ the first `-I` holding it, or its file name. `--module` and `--link-lib` put a `
 again in a comment at the foot of the module. A record with a flexible array member, one laid out
 under `#pragma pack`, one with an `aligned` whose value is not a literal, and one with a bitfield
 whose unit is not an integer of 8 to 64 bits (`long x : 3`) stay `opaque`, with `SIZEOF_`/`ALIGNOF_`
-constants so a caller can still allocate one. A string macro, and a record passed by value or an enum
-from another header without `--follow`, are refused by name. The command still succeeds: a header with one unbindable macro is worth the
+constants so a caller can still allocate one. A record passed by value or an enum
+from another header without `--follow`, a wide string macro (`L"…"`) and a macro that is an address, are refused by name. The command still succeeds: a header with one unbindable macro is worth the
 rest.
 
 ### `targets`

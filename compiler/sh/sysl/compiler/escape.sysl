@@ -64,6 +64,14 @@ struct Promotions
     // entries (`zero_entry.sysl`).
     zero_answers: Map[string, usize]
 
+    // **The `.bytes` this body may take into a slot of its frame**, keyed as `framed` is: every
+    // `s.bytes` of a string that may be short whose view never outlives the frame
+    // (`docs/design/short-strings.md § 5.4`). A `.bytes` not named here is made by `sysl.str.unshort`,
+    // which copies a short string to the heap -- so a body this analysis never walked (a module
+    // initializer) is safe by default. Empty unless the short form is on.
+    bytes_framed: Buf[(string, Buf[Span])]
+    bytes_framed_main: Buf[Span]
+
     // The arrays this body must move, in the terms the emitter asks: a function's name, or the empty
     // string for the statements a program runs.
     for_func(self, name: string) -> Buf[string]
@@ -85,6 +93,16 @@ struct Promotions
         buf()
     end framed_for
 
+    // The `.bytes` this body takes into its frame, in the same terms.
+    bytes_framed_for(self, name: string) -> Buf[Span]
+        if name == "" then return self.bytes_framed_main
+
+        for item in self.bytes_framed
+            if item.0 == name then return item.1
+
+        buf()
+    end bytes_framed_for
+
     holds_temp(self, at: Span) -> bool
         for temporarie in self.temporaries
             if temporarie == at then return true
@@ -102,7 +120,7 @@ no_promotions() -> Promotions
     var framed: Buf[(string, Buf[Span])] = buf()
     var framed_main: Buf[Span] = buf()
 
-    Promotions(by_func, in_main, temporaries, framed, framed_main, notes, set(), map(), map())
+    Promotions(by_func, in_main, temporaries, framed, framed_main, notes, set(), map(), map(), buf(), buf())
 end no_promotions
 
 // What one body's walk found: the arrays it must move, the temporaries it must give storage to,
@@ -156,6 +174,13 @@ struct EscapeWalk
     // (`kept_in_local`): such a view is good only inside the block of the local holding its box.
     body: Buf[TStmt]
     block_scopes: Option[&BlockScopes]
+
+    // Every `s.bytes` of the body whose string may be short (`bytes_temp`), by span: each is a
+    // temporary of the frame, a slot the bytes are copied into. And the span of every loop of the
+    // body, since a slot is written again by each round that reaches it (`kept_in_local`). Both are
+    // empty unless the short form is on.
+    bytes_sites: Buf[Span]
+    loops: Buf[Span]
 end EscapeWalk
 
 // One promotion, with its parts still separate.
@@ -309,6 +334,10 @@ check_escapes(a: &Analysis, p: TProgram) -> Promotions
 
         if !framed.is_empty() then out.framed.push((f.name, framed))
 
+        val bytes = framed_bytes(w)
+
+        if !bytes.is_empty() then out.bytes_framed.push((f.name, bytes))
+
         for temp in w.temps
             out.temporaries.push(temp.0)
 
@@ -323,6 +352,19 @@ check_escapes(a: &Analysis, p: TProgram) -> Promotions
             None -> ()
 
     out.framed_main = settled_frames(mw)
+    // A module initializer is laid down by the entry too, and nothing walked it: its `.bytes` are
+    // never framed, and one sharing a span with a statement's (another file) keeps both off the frame.
+    val init_bytes: &BytesSites = BytesSites(buf(), buf())
+
+    if short_strings_on()
+        for v in p.vals
+            v.init match
+                Some(init) -> walk_texpr(init, expr_walk(false, x ->
+                    if bytes_temp(x) then init_bytes.sites.push(x.span)))
+                None -> ()
+
+    for at in framed_bytes(mw)
+        if !holds_span(init_bytes.sites, at) then out.bytes_framed_main.push(at)
 
     val entry = entry_home(a)
 
@@ -372,6 +414,16 @@ private note_promotions(into: *Buf[(string, string)], home: Scope, w: EscapeWalk
                 s"${site.how}"
 
             into.push((home.src.name, line))
+        else if holds_span(w.bytes_sites, site.at)
+            // A `.bytes` has no declaration, but it is a heap copy a reader did not write, so it is
+            // said all the same, at the `.bytes` itself.
+            val at = home.src.locate(site.at.start)
+
+            into.push((home.src.name, s"${home.src.name}:${at.line}:${at.col + literate_shift(home.src)}: " +
+                s"${site.what} is the bytes of a string that may be held in the string itself, so it is " +
+                s"copied to the heap, because this view of it ${site.how}"))
+        end if
+    end for
 end note_promotions
 
 // **Whether a callee lets an argument outlive the call is read off the field-path analysis**
@@ -445,11 +497,52 @@ private fresh_walk(stmts: Buf[TStmt]) -> &EscapeWalk
     val found = scopes(stmts)
     var lits: Buf[Span] = buf()
     var framed: Buf[Span] = buf()
+    val bytes = short_bytes_sites(stmts)
 
     EscapeWalk(confined, promoted, temps, sites, None, local_arrays(stmts), ref_bindings(stmts),
                aligned_arrays(stmts), lits, framed, found.0, found.1, buf(), rebound_locals(stmts), stmts,
-               None)
+               None, bytes.0, bytes.1)
 end fresh_walk
+
+// **`s.bytes` of a string that may be short is a temporary of the frame**
+// (`docs/design/short-strings.md § 5.4`): a short string's bytes are the value itself, which has no
+// address, so the view is over a slot they are copied into -- free while it is lent, iterated or
+// indexed, and promoted to `sysl.str.unshort`'s heap copy where it would outlive the frame. A string
+// known to hold its bytes elsewhere (`string_known_long`) is its own view and no temporary at all.
+bytes_temp(x: TExpr) -> bool
+    if !short_strings_on() then return false
+
+    *x.kind match
+        TBytes(r) -> !string_known_long(r)
+        _ -> false
+end bytes_temp
+
+// The body's `.bytes` temporaries and its loops, or nothing where the short form is off.
+private short_bytes_sites(stmts: Buf[TStmt]) -> (Buf[Span], Buf[Span])
+    val found: &BytesSites = BytesSites(buf(), buf())
+
+    if short_strings_on()
+        walk_stmts(stmts, expr_walk(false, x ->
+            if bytes_temp(x) then found.sites.push(x.span)
+            if is_loop(x) then found.loops.push(x.span)))
+
+    (found.sites, found.loops)
+end short_bytes_sites
+
+private struct BytesSites
+    sites: Buf[Span]
+    loops: Buf[Span]
+
+private is_loop(x: TExpr) -> bool = *x.kind match
+    TWhile(_, _, _, _) -> true
+    TDoWhile(_, _, _, _) -> true
+    TLoop(_, _) -> true
+    TFor(_, _, _, _, _, _, _, _) -> true
+    TCFor(_, _, _, _, _, _) -> true
+    TForEach(_, _, _, _, _, _) -> true
+    TIterate(_, _, _, _, _, _, _, _) -> true
+    TCheckedLoop(_, _, _) -> true
+    _ -> false
 
 // **A body's value is walked as one more statement of it.** A body that ends in an expression -- a
 // trailing `for`, `if` or `match`, whatever its type -- declares locals in that expression's blocks
@@ -623,9 +716,21 @@ private kept_in_local(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, name: str
             w.promoted.push(item)
 
     for t in seen.temps
-        if !holds_temp_span(w.temps, t.0)
-            w.sites.push(EscapeSite("", t.1, t.0, how, "its statement"))
-            w.temps.push(t)
+        if holds_temp_span(w.temps, t.0) then continue
+
+        // **A `.bytes` slot lasts as long as the frame**, so a local may keep it -- unless a loop
+        // takes it again while the local still holds the last round's view (`prev = cur` over two
+        // rounds would read one slot twice). That is a loop around the `.bytes` that does not also
+        // hold the local's declaration.
+        if holds_span(w.bytes_sites, t.0)
+            if retaken_while_kept(w, t.0, name)
+                w.sites.push(EscapeSite("", t.1, t.0, how, "the round of the loop that took it"))
+                w.temps.push(t)
+            continue
+        end if
+
+        w.sites.push(EscapeSite("", t.1, t.0, how, "its statement"))
+        w.temps.push(t)
 
     // **A view of `&sync` storage cannot move**: it counts nothing of the box, so the local holding
     // the box is what keeps it, and that local ends with its block (L1).
@@ -650,6 +755,27 @@ private kept_in_local(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, name: str
         end if
     end for
 end kept_in_local
+
+// Whether a loop around the `.bytes` at `at` leaves the declaration of the local `holder` outside it --
+// a parameter or a module name being outside every loop. Two locals of one name in sibling blocks are
+// both asked about, so the answer is never the one that happens to be inside.
+private retaken_while_kept(w: &EscapeWalk, at: Span, holder: string) -> bool
+    for l in w.loops
+        if l.start <= at.start && at.end <= l.end
+            var declared = false
+
+            for item in w.decl_at
+                if item.0 == holder
+                    declared = true
+
+                    if !(l.start <= item.1.start && item.1.end <= l.end) then return true
+
+            if !declared then return true
+        end if
+    end for
+
+    false
+end retaken_while_kept
 
 // Where a refusal of a view of storage inside the box `root` holds points: the slice taken through
 // `root` where `v` writes one -- a block's value, an `if` arm -- and otherwise `v` itself.
@@ -944,6 +1070,16 @@ private settled_frames(w: EscapeWalk) -> Buf[Span]
     out
 end settled_frames
 
+// The `.bytes` a body takes into its frame: every one it met that no view carried out.
+private framed_bytes(w: EscapeWalk) -> Buf[Span]
+    var out: Buf[Span] = buf()
+
+    for at in w.bytes_sites
+        if !holds_temp_span(w.temps, at) && !holds_span(out, at) then out.push(at)
+
+    out
+end framed_bytes
+
 private holds_span(xs: Buf[Span], at: Span) -> bool = count_span(xs, at) > 0
 
 private count_span(xs: Buf[Span], at: Span) -> usize
@@ -1083,7 +1219,10 @@ private views_value(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, e: TExpr) -
     TBufFill(v, _, _) -> views(p, keeps, w, v)
     TField(r, _, _) -> views(p, keeps, w, r)
     TIndex(r, _, _) -> views(p, keeps, w, r)
-    TBytes(r) -> views(p, keeps, w, r)
+    // The bytes of a string that may be short are a slot of the frame (`bytes_temp`).
+    TBytes(r) ->
+        if bytes_temp(e) then join_views(views(p, keeps, w, r), temp_view(e.span, bytes_what(r)))
+        else views(p, keeps, w, r)
 
     // A view read at another element type is the same storage, so it views what its argument views.
     TViewAs(r, _) -> views(p, keeps, w, r)
@@ -1325,6 +1464,11 @@ private describe_temp(base: TExpr) -> string = *base.kind match
     TArrayFill(_, _) -> "an array literal"
     TCall(name, _, _, _) -> s"the array '$name' answered with"
     _ -> "a temporary array"
+
+// What to call `.bytes` of a string: by the local it reads where it reads one.
+private bytes_what(r: TExpr) -> string = *r.kind match
+    TLoad(name, _) -> s"'${shown_block_local(name)}.bytes'"
+    _ -> "'.bytes'"
 
 // -- what a body declares ------------------------------------------------------------------------------
 
@@ -1638,6 +1782,19 @@ private refuse_no_alloc(a: &Analysis, p: TProgram, scope: Scope, who: Option[str
 
     for site in w.sites
         val subject = if site.name == "" then site.what else s"'${shown_block_local(site.name)}'"
+
+        // **A `.bytes` that outlives its slot is a heap copy of a short string**
+        // (`docs/design/short-strings.md § 5.4`), which a string known to hold its bytes elsewhere --
+        // a literal, a cut of one, a `str_view` -- never needs.
+        if site.name == "" && holds_span(w.bytes_sites, site.at)
+            a.fault(scope, site.at,
+                s"this view of $subject ${site.how}, and the string may hold its bytes in itself, so " +
+                s"they would be copied to the heap to outlive ${site.outlives} — and $nothing, so there " +
+                s"is nothing to copy them into. Keep the view inside ${site.outlives}, take the bytes " +
+                "from a caller as a '[]const u8' parameter, or take them of a literal, whose bytes are " +
+                "never held in the string")
+            continue
+        end if
 
         a.fault(scope, site.at,
             s"this view of $subject ${site.how}, so the array would move to the heap to outlive " +

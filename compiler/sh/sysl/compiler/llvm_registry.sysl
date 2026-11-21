@@ -223,6 +223,41 @@ llvm_crc32c_intrinsics() -> []const string =
      "llvm.x86.sse42.crc32.32.8", "llvm.x86.sse42.crc32.32.16", "llvm.x86.sse42.crc32.32.32",
      "llvm.x86.sse42.crc32.64.64"]
 
+// The cryptographic and dot-product instructions an `extern` may name, over vectors: AArch64's AES
+// rounds (`aes`), its three-way XOR, bit-clear and rotate of the SHA-3 extension (`sha3`) and its
+// `sdot`/`udot` (`dotprod`), and x86's AES-NI rounds (`aes`) and the VNNI dot products (`avxvnni`,
+// which LLVM selects in its VEX encoding and `avx512vnni` + `avx512vl` select in EVEX). Each takes
+// and answers whole registers, so the declaration's signature is vectors (`program.sysl`'s
+// `resolve_vector_intrinsic`), and each is compiled for its extension as a CRC-32C instruction is: a
+// call is held to `@extensions`, the build's promise or `@unchecked` (`extensions.sysl`).
+llvm_vector_intrinsics() -> []const string =
+    ["llvm.aarch64.crypto.aese", "llvm.aarch64.crypto.aesd", "llvm.aarch64.crypto.aesmc",
+     "llvm.aarch64.crypto.aesimc", "llvm.aarch64.crypto.eor3u", "llvm.aarch64.crypto.eor3s",
+     "llvm.aarch64.crypto.bcaxu", "llvm.aarch64.crypto.bcaxs", "llvm.aarch64.crypto.rax1",
+     "llvm.aarch64.neon.sdot", "llvm.aarch64.neon.udot",
+     "llvm.x86.aesni.aesenc", "llvm.x86.aesni.aesenclast", "llvm.x86.aesni.aesdec",
+     "llvm.x86.aesni.aesdeclast", "llvm.x86.aesni.aesimc",
+     "llvm.x86.avx512.vpdpbusd.128", "llvm.x86.avx512.vpdpbusd.256", "llvm.x86.avx512.vpdpbusds.128",
+     "llvm.x86.avx512.vpdpbusds.256", "llvm.x86.avx512.vpdpwssd.128", "llvm.x86.avx512.vpdpwssd.256",
+     "llvm.x86.avx512.vpdpwssds.128", "llvm.x86.avx512.vpdpwssds.256"]
+
+// The extension a vector intrinsic is compiled for, or `""` where `symbol` is not one. `symbol` is a
+// base or the name an overloaded one is emitted under, its suffix (`.v4i32.v16i8`) after the base.
+llvm_vector_intrinsic_extension(symbol: string) -> string
+    var known = false
+
+    for name in llvm_vector_intrinsics()
+        if symbol == name || symbol.starts_with(name + ".") then known = true
+
+    if !known then return ""
+
+    if symbol.starts_with("llvm.aarch64.crypto.aes") || symbol.starts_with("llvm.x86.aesni.") then return "aes"
+    if symbol.starts_with("llvm.aarch64.crypto.") then return "sha3"
+    if symbol.starts_with("llvm.aarch64.neon.") then return "dotprod"
+
+    "avxvnni"
+end llvm_vector_intrinsic_extension
+
 // -- the reserved globals ---------------------------------------------------------------------------
 
 // The list the platform's loader runs before `main`.
@@ -290,6 +325,11 @@ llvm_callable() -> Buf[string]
 
     for i in 0..<crcs.len
         out.push(crcs[i])
+
+    val vectors = llvm_vector_intrinsics()
+
+    for i in 0..<vectors.len
+        out.push(vectors[i])
 
     out
 end llvm_callable
