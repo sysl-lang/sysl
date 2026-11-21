@@ -902,7 +902,7 @@ private const_decl(cx: &Analyzer, span: Span, name: string, typ: Option[TypeRef]
                     Integer(_, _, _) -> usize_type(word_bits(cx))
                     _ -> declared
 
-                subst.push(Binding(name, ConstArg(arg.unwrap(), width, false)))
+                subst.push(Binding(name, ConstArg(arg.unwrap(), width, false, buf())))
 
                 for b in cx.subst
                     subst.push(b)
@@ -974,12 +974,20 @@ private check_binding(cx: &Analyzer, at: Span, name: string, declared: Option[Ty
     if diverges(cx, ti) then
         cx.fault(at, s"cannot bind '$name' to an expression that never returns")
 
+    // Read at a generic's definition, a value parameter's form that disagrees is wrong for every
+    // instantiation, so it is kept (`value_terms.sysl`): `val g: Buf[N] = Buf[N + 1](…)`. Asked
+    // before the ordinary refusal, which ends the region a kept one could still be said in.
+    if declared.is_some() then
+        keep_value_clash(cx, at, s"cannot initialize '$name': declared ${type_show(decl_ty)} but the " +
+                         s"value is ${type_show(texpr_type(ti))}", decl_ty, texpr_type(ti))
+
     // An `if` of literals is wrong only at the one literal the others disagree with (`misfit_literal`).
     if declared.is_some() && disagree(texpr_type(ti), decl_ty) then
         cx.fault(misfit_literal(ti, decl_ty).map(l -> l.span).unwrap_or(at),
                  s"cannot initialize '$name': declared ${spelled_show(decl_ty, spelled)} but the value is " +
                  s"${spelled_show(texpr_type(ti), texpr_spelling(cx, ti))}${await_hint(texpr_type(ti), decl_ty)}" +
                  mismatch_hint(cx, texpr_type(ti), decl_ty))
+end check_binding
 
 // `ref name = place` -- another name for storage that already exists. The place is read once, here,
 // and what the name means afterwards is the storage it found.
