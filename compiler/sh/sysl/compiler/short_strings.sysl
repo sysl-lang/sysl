@@ -1,0 +1,46 @@
+module sh.sysl.compiler
+
+import sysl.env.{get as env_var}
+
+// **Whether a string may hold its bytes in the value itself** (`docs/design/short-strings.md`,
+// option A), asked with `SYSL_SHORT_STRINGS=1` while the form is being built.
+//
+// A short string is the three words of every string, laid out as
+//
+// ```
+// [ 0 (null owner) | bytes 0 .. 2W-2 | top byte 0x80|n ]
+// ```
+//
+// so its length `n` (1 to `2W - 1`) and its tag sit in the top byte of the length word, whose top bit
+// no long string can set. The owner word is null, so every count of it is the no-op a literal's is.
+// The empty string is never short. With the switch off no string is short and every emitted byte is
+// what it was before the form existed.
+
+// Set by a test that builds in-process, where setting the environment would reach every other test.
+private var short_strings_forced: bool = false
+
+force_short_strings(on: bool)
+    short_strings_forced = on
+
+private var short_strings_read: bool = false
+private var short_strings_env: bool = false
+
+// Whether this build makes and reads the short form.
+short_strings_on() -> bool
+    if short_strings_forced then return true
+
+    if !short_strings_read
+        short_strings_env = env_var("SYSL_SHORT_STRINGS").unwrap_or("") == "1"
+        short_strings_read = true
+    end if
+
+    short_strings_env
+end short_strings_on
+
+// What the switch adds to an artifact's key: nothing when it is off, so every key made before the
+// form existed is unchanged.
+short_strings_key() -> string = if short_strings_on() then "-ss" else ""
+
+// The most bytes a short string holds on a machine of `word_bits`: every byte of the two words after
+// the owner but the tag's.
+short_string_capacity(word_bits: int) -> int = 2 * word_bits / 8 - 1
