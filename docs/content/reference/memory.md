@@ -3978,7 +3978,7 @@ total(p: Option[&Node]) -> int
     sum
 
 main()
-    val list = Some(Node(1, Some(Node(2, Some(Node(3, None))))))
+    val list: Option[&Node] = Some(Node(1, Some(Node(2, Some(Node(3, None))))))
 
     print(count(list, 0), total(list))
 ```

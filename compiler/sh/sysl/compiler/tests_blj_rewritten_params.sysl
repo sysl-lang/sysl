@@ -155,15 +155,16 @@ private blj_counts(text: string, name: string, n: usize)
         assert_eq(blj_define(out, blj_owned(name)), "", s"-O$level: '$name' was peeled")
 end blj_counts
 
-// `name` is peeled: its entry block takes no count, and its owned half is defined beside it.
-private blj_peeled(text: string, name: string)
+// `name` is peeled: its prologue takes `entry_ops` counts -- none unless a parameter it does not peel
+// is owned -- and its owned half is defined beside it.
+private blj_peeled(text: string, name: string, entry_ops: usize = 0)
     if !blj_ready() then return
 
     val out = blj_ir(text, "0")
     val f = blj_body(out, name)
 
     assert(f.starts_with("define"), f)
-    assert_eq(blj_ops(blj_entry(f)), 0, f)
+    assert_eq(blj_ops(blj_entry(f)), entry_ops, f)
     assert(blj_define(out, blj_owned(name)).starts_with("define internal"), out)
     assert(f.contains("@" + blj_owned(name) + "("), f)
 end blj_peeled
@@ -414,10 +415,11 @@ private blj_restage() -> string = blj_head() + """
     """
 
 // `next` is handed the parameter the same jump hands a fresh list to: its count must be taken while
-// the frame is whole, or the release of `list`'s slot frees what `next` is about to hold.
+// the frame is whole, or the release of `list`'s slot frees what `next` is about to hold. `list` is
+// peeled; `next`, handed a value read out of a slot, stays owned and keeps its one entry count.
 @test("go(next, list): a jump handing one parameter the other's value while the other gets a fresh one")
 blj_restage_owned()
-    blj_peeled(blj_restage(), "go")
+    blj_peeled(blj_restage(), "go", 1)
     blj_prints(blj_restage(), "21\n")
 
 // -- the peel (§4.3 (b), decision 9) -----------------------------------------------------------------
