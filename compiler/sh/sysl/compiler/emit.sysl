@@ -493,6 +493,10 @@ struct Emit
     // it, which for a large enum would be a whole aggregate made an LLVM value to carry one word.
     bare_tags: Buf[string]
 
+    // The release walks (`arc.dispose.T`) by name, each with whether it runs no code and whether what it
+    // lets go of is one reference -- an `Option` of one (`arc_take.sysl`'s `note_take_walk`).
+    take_walks: Map[string, (bool, bool)]
+
     // The `s.bytes` the body being lowered takes into a slot of its frame rather than through
     // `sysl.str.unshort`, which the escape analysis settled (`Promotions.bytes_framed_for`).
     bytes_framed: Buf[Span]
@@ -711,7 +715,7 @@ emitter_for(t: Target, destructors: Buf[(string, string, bool)]) -> Emit
          no_wrap_none(), map(), buf(), Leaving, false, "", set(), buf(), map(), map(), 0, moves_none(), set(), set(), set(), set(),
          set(), map(), 0, map(), set(), map(), false, set(), map(), set(), false, false, false, buf(), set(),
           "", set(), false, None, None, set(), None, map(), buf(), buf(), buf(), false, set(), None,
-          buf(), buf(), false, false, false, false, buf(), map(), map(), set(), map(), buf(), buf(), map())
+          buf(), buf(), false, false, false, false, buf(), map(), map(), set(), map(), buf(), map(), buf(), map())
 end emitter_for
 
 // -- what a body could not say --------------------------------------------------------------------
@@ -1085,7 +1089,9 @@ finish_func(e: *Emit, sig: IrFuncSig) -> IrFunc
     //
     // A slot's life is bounded last, over the finished blocks, so the slots the large-value pass made
     // and the blocks the guards opened are bounded with the rest.
-    val elided = elide_arc_pairs(out, e.inert_symbols)
+    // A read of a place the function then writes over takes the place's count (`arc_take.sysl`); it
+    // asks about the pairs the cancelling left.
+    val elided = take_on_overwrite(elide_arc_pairs(out, e.inert_symbols), e.inert_symbols, e.take_walks)
     var before: Set[string] = set()
 
     for inst in elided[0].instrs
