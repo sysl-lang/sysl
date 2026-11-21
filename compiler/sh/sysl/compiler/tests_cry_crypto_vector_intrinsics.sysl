@@ -1,0 +1,422 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// The AES, SHA-3 and dot-product instructions an `extern` may name (`llvm_registry.sysl`'s
+// `llvm_vector_intrinsics`, `program.sysl`'s `resolve_vector_intrinsic`, `reference/attributes.md §
+// @extensions`). Each is compiled for its extension as a CRC-32C instruction is, so a call is held to
+// `@extensions`, the build's promise or `@unchecked`.
+//
+// **The axes**: the instruction (AES rounds, `eor3`/`bcax`/`rax1`, `sdot`/`udot`, AES-NI, VNNI), its
+// lane width (the overloaded ones), where the call is (a marked body, an `@unchecked` block, a plain
+// body, a body marked with another extension), the machine (aarch64 run here, x86_64 built and read,
+// the wrong processor), and the declaration (right signature, wrong one, a vector on an ordinary C
+// `extern`). Answers are the oracles' own: FIPS-197 Appendix B's first round for AES, hand-computed
+// Keccak theta (`rax1`), `eor3` and `bcax` lanes, and hand-summed dot products. Not crossed: the 256-bit
+// VAES forms and `xar` (a rotate that is an immediate) are not in the registry.
+
+private cry_for(t: Target, text: string) -> string
+    use_codegen_features(no_codegen_features())
+    use_cpu("", buf())
+
+    var units: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, t) match
+            Err(_) -> ()
+            Ok(library) -> units = library
+
+    if units.is_empty() then return "the library could not be read for this machine"
+
+    val parsed = parse(source_of("main.sysl", text), t)
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, t)
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+
+    for item in errors_of(done.an.diagnostics())
+        if !item.src.name.starts_with("library/") then return item.render()
+
+    ir_print_module(codegen_with_gaps(prune(strip_tests(whole), program_own(units)), t, promotions).0)
+end cry_for
+
+// What clang makes of `ll` for `t` at -O1: whether it compiled, and the assembly or the complaint.
+private cry_asm(t: Target, ll: string) -> (bool, string)
+    val clang = find_clang(t, None).unwrap()
+    val dir = make_temp_dir("sysl-cry").unwrap()
+    val src = s"$dir/m.ll"
+
+    write_text(src, ll).unwrap()
+
+    val got = capture(clang, [s"--target=${t.triple}", "-S", "-O1", "-Wno-override-module", "-o", "-", src],
+                      "", [], true)
+
+    remove_dir_all(dir).unwrap_or(())
+
+    got match
+        Err(_) -> (false, "clang could not be run")
+        Ok(out) -> (out.status.ok(), out.text + out.err.unwrap_or(""))
+end cry_asm
+
+private cry_row(name: string) -> Target = target_named(name).unwrap()
+
+private cry_aarch64_externs() -> string =
+    "private extern \"llvm.aarch64.crypto.aese\" aese(d: <16>u8, k: <16>u8) -> <16>u8\n" +
+    "private extern \"llvm.aarch64.crypto.aesd\" aesd(d: <16>u8, k: <16>u8) -> <16>u8\n" +
+    "private extern \"llvm.aarch64.crypto.aesmc\" aesmc(d: <16>u8) -> <16>u8\n" +
+    "private extern \"llvm.aarch64.crypto.aesimc\" aesimc(d: <16>u8) -> <16>u8\n" +
+    "private extern \"llvm.aarch64.crypto.eor3u\" eor3(a: <2>u64, b: <2>u64, c: <2>u64) -> <2>u64\n" +
+    "private extern \"llvm.aarch64.crypto.eor3s\" eor3s(a: <16>i8, b: <16>i8, c: <16>i8) -> <16>i8\n" +
+    "private extern \"llvm.aarch64.crypto.bcaxu\" bcax(a: <2>u64, b: <2>u64, c: <2>u64) -> <2>u64\n" +
+    "private extern \"llvm.aarch64.crypto.rax1\" rax1(a: <2>u64, b: <2>u64) -> <2>u64\n" +
+    "private extern \"llvm.aarch64.neon.sdot\" sdot(acc: <4>i32, a: <16>i8, b: <16>i8) -> <4>i32\n" +
+    "private extern \"llvm.aarch64.neon.udot\" udot(acc: <4>u32, a: <16>u8, b: <16>u8) -> <4>u32\n" +
+    "private extern \"llvm.aarch64.neon.sdot\" sdot8(acc: <2>i32, a: <8>i8, b: <8>i8) -> <2>i32\n"
+
+// One marked function per instruction, and a main that reaches each from a block that names them.
+private cry_aarch64_program() -> string =
+    cry_aarch64_externs() + "\n" +
+    "@extensions(\"aes\")\nf_aese(a: <16>u8, b: <16>u8) -> <16>u8 = aese(a, b)\n" +
+    "@extensions(\"aes\")\nf_aesd(a: <16>u8, b: <16>u8) -> <16>u8 = aesd(a, b)\n" +
+    "@extensions(\"aes\")\nf_aesmc(a: <16>u8) -> <16>u8 = aesmc(a)\n" +
+    "@extensions(\"aes\")\nf_aesimc(a: <16>u8) -> <16>u8 = aesimc(a)\n" +
+    "@extensions(\"sha3\")\nf_eor3(a: <2>u64, b: <2>u64, c: <2>u64) -> <2>u64 = eor3(a, b, c)\n" +
+    "@extensions(\"sha3\")\nf_eor3s(a: <16>i8, b: <16>i8, c: <16>i8) -> <16>i8 = eor3s(a, b, c)\n" +
+    "@extensions(\"sha3\")\nf_bcax(a: <2>u64, b: <2>u64, c: <2>u64) -> <2>u64 = bcax(a, b, c)\n" +
+    "@extensions(\"sha3\")\nf_rax1(a: <2>u64, b: <2>u64) -> <2>u64 = rax1(a, b)\n" +
+    "@extensions(\"dotprod\")\nf_sdot(acc: <4>i32, a: <16>i8, b: <16>i8) -> <4>i32 = sdot(acc, a, b)\n" +
+    "@extensions(\"dotprod\")\nf_udot(acc: <4>u32, a: <16>u8, b: <16>u8) -> <4>u32 = udot(acc, a, b)\n" +
+    "@extensions(\"dotprod\")\nf_sdot8(acc: <2>i32, a: <8>i8, b: <8>i8) -> <2>i32 = sdot8(acc, a, b)\n\n" +
+    "@unchecked(\"aes\", \"sha3\", \"dotprod\")\n" +
+    "    val z: <16>u8 = 0\n    val w: <2>u64 = 0\n    val y: <16>i8 = 0\n    val q: <4>i32 = 0\n" +
+    "    val p: <4>u32 = 0\n    val h: <2>i32 = 0\n    val s: <8>i8 = 0\n" +
+    "    print(f_aese(z, z)[0], f_aesd(z, z)[0], f_aesmc(z)[0], f_aesimc(z)[0])\n" +
+    "    print(f_eor3(w, w, w)[0], f_eor3s(y, y, y)[0], f_bcax(w, w, w)[0], f_rax1(w, w)[0])\n" +
+    "    print(f_sdot(q, y, y)[0], f_udot(p, z, z)[0], f_sdot8(h, s, s)[0])\n"
+
+// -- the answers, run here --------------------------------------------------------------------------
+
+private cry_hex() -> string =
+    "hex(v: <16>u8) -> string\n    val digits = \"0123456789abcdef\"\n    var out = \"\"\n\n" +
+    "    val lanes: [16]u8 = v\n\n    for i in 0..<16\n        val b = int(lanes[i])\n        val hi = usize(b >> 4)\n" +
+    "        val lo = usize(b & 15)\n        val hi1 = hi + 1\n        val lo1 = lo + 1\n" +
+    "        out = out + digits[hi..<hi1] + digits[lo..<lo1]\n\n    out\n\n"
+
+@test("AES rounds compute FIPS-197 Appendix B's first round, and aesd/aesimc undo aese/aesmc")
+cry_aes_fips197_round()
+    if xvr_no_library() then return
+    if host_target().cpu != Aarch64 then return
+
+    val out = xvr_ran([("main.sysl",
+        "private extern \"llvm.aarch64.crypto.aese\" aese(d: <16>u8, k: <16>u8) -> <16>u8\n" +
+        "private extern \"llvm.aarch64.crypto.aesd\" aesd(d: <16>u8, k: <16>u8) -> <16>u8\n" +
+        "private extern \"llvm.aarch64.crypto.aesmc\" aesmc(d: <16>u8) -> <16>u8\n" +
+        "private extern \"llvm.aarch64.crypto.aesimc\" aesimc(d: <16>u8) -> <16>u8\n\n" + cry_hex() +
+        // SubBytes after ShiftRows, MixColumns, then AddRoundKey with round key 1.
+        "@extensions(\"aes\")\nsub_shift(s: <16>u8) -> <16>u8\n    val zero: <16>u8 = 0\n\n    aese(s, zero)\n\n" +
+        "@extensions(\"aes\")\nunsub_unshift(s: <16>u8) -> <16>u8\n    val zero: <16>u8 = 0\n\n    aesd(s, zero)\n\n" +
+        "@extensions(\"aes\")\nmix(s: <16>u8) -> <16>u8 = aesmc(s)\n\n" +
+        "@extensions(\"aes\")\nunmix(s: <16>u8) -> <16>u8 = aesimc(s)\n\n" +
+        "val start: <16>u8 = [0x19, 0x3d, 0xe3, 0xbe, 0xa0, 0xf4, 0xe2, 0x2b, 0x9a, 0xc6, 0x8d, 0x2a, 0xe9, 0xf8, 0x48, 0x08]\n" +
+        "val key1: <16>u8 = [0xa0, 0xfa, 0xfe, 0x17, 0x88, 0x54, 0x2c, 0xb1, 0x23, 0xa3, 0x39, 0x39, 0x2a, 0x6c, 0x76, 0x05]\n\n" +
+        "@unchecked(\"aes\")\n    val a = sub_shift(start)\n    val b = mix(a)\n    print(hex(a))\n    print(hex(b))\n" +
+        "    print(hex(b ^ key1))\n    print(hex(unsub_unshift(a)))\n    print(hex(unmix(b)))\n")])
+
+    assert_eq(out, "d4bf5d30e0b452aeb84111f11e2798e5\n046681e5e0cb199a48f8d37a2806264c\n" +
+                   "a49c7ff2689f352b6b5bea43026a5049\n193de3bea0f4e22b9ac68d2ae9f84808\n" +
+                   "d4bf5d30e0b452aeb84111f11e2798e5\n")
+end cry_aes_fips197_round
+
+@test("eor3, bcax and rax1 compute the Keccak lane operations, over 64-bit and byte lanes")
+cry_sha3_lane_operations()
+    if xvr_no_library() then return
+    if host_target().cpu != Aarch64 then return
+
+    val out = xvr_ran([("main.sysl",
+        "private extern \"llvm.aarch64.crypto.eor3u\" eor3(a: <2>u64, b: <2>u64, c: <2>u64) -> <2>u64\n" +
+        "private extern \"llvm.aarch64.crypto.eor3s\" eor3s(a: <16>i8, b: <16>i8, c: <16>i8) -> <16>i8\n" +
+        "private extern \"llvm.aarch64.crypto.bcaxu\" bcax(a: <2>u64, b: <2>u64, c: <2>u64) -> <2>u64\n" +
+        "private extern \"llvm.aarch64.crypto.rax1\" rax1(a: <2>u64, b: <2>u64) -> <2>u64\n\n" +
+        "@extensions(\"sha3\")\nk_eor3(a: <2>u64, b: <2>u64, c: <2>u64) -> <2>u64 = eor3(a, b, c)\n\n" +
+        "@extensions(\"sha3\")\nk_eor3s(a: <16>i8, b: <16>i8, c: <16>i8) -> <16>i8 = eor3s(a, b, c)\n\n" +
+        "@extensions(\"sha3\")\nk_bcax(a: <2>u64, b: <2>u64, c: <2>u64) -> <2>u64 = bcax(a, b, c)\n\n" +
+        "@extensions(\"sha3\")\nk_rax1(a: <2>u64, b: <2>u64) -> <2>u64 = rax1(a, b)\n\n" +
+        "@unchecked(\"sha3\")\n" +
+        "    val a: <2>u64 = [0xff00ff00ff00ff00, 0x0123456789abcdef]\n" +
+        "    val b: <2>u64 = [0x0ff00ff00ff00ff0, 0xffffffffffffffff]\n" +
+        "    val c: <2>u64 = [0x00ff00ff00ff00ff, 0x1111111111111111]\n" +
+        "    val x = k_eor3(a, b, c)\n" +
+        "    print(x[0] == 0xf00ff00ff00ff00f, x[1] == 0xefcdab8967452301)\n" +
+        "    val y: <16>i8 = -1\n    val m: <16>i8 = 0x0f\n    val n: <16>i8 = 0x3c\n" +
+        "    val s = k_eor3s(y, m, n)\n    print(s[0], s[15])\n" +
+        "    val ba: <2>u64 = [0x00ff00ff00ff00ff, 0xabcd]\n" +
+        "    val bb: <2>u64 = [0xffffffffffffffff, 0x1234]\n" +
+        "    val bc: <2>u64 = [0x0f0f0f0f0f0f0f0f, 0x00ff]\n" +
+        "    val bx = k_bcax(ba, bb, bc)\n" +
+        "    print(bx[0] == 0xf00ff00ff00ff00f, bx[1] == 0xb9cd)\n" +
+        // Theta's D = C ^ rotl(C', 1): rotl 0x8000000000000001 is 3, rotl 0x4000000000000000 is 1 << 63.
+        "    val ra: <2>u64 = [0x0123456789abcdef, 0xfedcba9876543210]\n" +
+        "    val rb: <2>u64 = [0x8000000000000001, 0x4000000000000000]\n" +
+        "    val r = k_rax1(ra, rb)\n" +
+        "    print(r[0] == 0x0123456789abcdec, r[1] == 0x7edcba9876543210)\n")])
+
+    assert_eq(out, "true true\n-52 -52\ntrue true\ntrue true\n")
+end cry_sha3_lane_operations
+
+@test("sdot and udot add each group of four byte products into a 32-bit lane, at both register widths")
+cry_dot_product_known_answers()
+    if xvr_no_library() then return
+    if host_target().cpu != Aarch64 then return
+
+    val out = xvr_ran([("main.sysl",
+        "private extern \"llvm.aarch64.neon.sdot\" sdot(acc: <4>i32, a: <16>i8, b: <16>i8) -> <4>i32\n" +
+        "private extern \"llvm.aarch64.neon.udot\" udot(acc: <4>u32, a: <16>u8, b: <16>u8) -> <4>u32\n" +
+        "private extern \"llvm.aarch64.neon.sdot\" sdot8(acc: <2>i32, a: <8>i8, b: <8>i8) -> <2>i32\n\n" +
+        "@extensions(\"dotprod\")\nk_sdot(acc: <4>i32, a: <16>i8, b: <16>i8) -> <4>i32 = sdot(acc, a, b)\n\n" +
+        "@extensions(\"dotprod\")\nk_udot(acc: <4>u32, a: <16>u8, b: <16>u8) -> <4>u32 = udot(acc, a, b)\n\n" +
+        "@extensions(\"dotprod\")\nk_sdot8(acc: <2>i32, a: <8>i8, b: <8>i8) -> <2>i32 = sdot8(acc, a, b)\n\n" +
+        "@unchecked(\"dotprod\")\n" +
+        "    val acc: <4>i32 = [1, 2, 3, 4]\n" +
+        "    val a: <16>i8 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]\n" +
+        "    val neg: <16>i8 = -1\n" +
+        "    val r = k_sdot(acc, a, neg)\n    print(r[0], r[1], r[2], r[3])\n" +
+        "    val uacc: <4>u32 = [0, 1, 2, 3]\n    val big: <16>u8 = 200\n    val two: <16>u8 = 2\n" +
+        "    val u = k_udot(uacc, big, two)\n    print(u[0], u[1], u[2], u[3])\n" +
+        "    val acc2: <2>i32 = [10, 20]\n    val a8: <8>i8 = [1, 2, 3, 4, 5, 6, 7, 8]\n    val one: <8>i8 = 1\n" +
+        "    val d = k_sdot8(acc2, a8, one)\n    print(d[0], d[1])\n")])
+
+    assert_eq(out, "-9 -24 -39 -54\n1600 1601 1602 1603\n20 46\n")
+end cry_dot_product_known_answers
+
+// -- what reaches the text, on this machine's row ---------------------------------------------------
+
+@test("each AArch64 instruction is emitted under LLVM's name, the overload suffix built from the lanes")
+cry_aarch64_names_and_suffixes()
+    if xvr_no_library() then return
+
+    val out = cry_for(cry_row("aarch64-linux"), cry_aarch64_program())
+
+    assert(out.contains("declare <16 x i8> @llvm.aarch64.crypto.aese(<16 x i8>, <16 x i8>)"), out)
+    assert(out.contains("declare <16 x i8> @llvm.aarch64.crypto.aesd(<16 x i8>, <16 x i8>)"), out)
+    assert(out.contains("declare <16 x i8> @llvm.aarch64.crypto.aesmc(<16 x i8>)"), out)
+    assert(out.contains("declare <16 x i8> @llvm.aarch64.crypto.aesimc(<16 x i8>)"), out)
+    assert(out.contains("declare <2 x i64> @llvm.aarch64.crypto.eor3u.v2i64(<2 x i64>, <2 x i64>, <2 x i64>)"), out)
+    assert(out.contains("declare <16 x i8> @llvm.aarch64.crypto.eor3s.v16i8(<16 x i8>, <16 x i8>, <16 x i8>)"), out)
+    assert(out.contains("declare <2 x i64> @llvm.aarch64.crypto.bcaxu.v2i64(<2 x i64>, <2 x i64>, <2 x i64>)"), out)
+    assert(out.contains("declare <2 x i64> @llvm.aarch64.crypto.rax1(<2 x i64>, <2 x i64>)"), out)
+    assert(out.contains("declare <4 x i32> @llvm.aarch64.neon.sdot.v4i32.v16i8(<4 x i32>, <16 x i8>, <16 x i8>)"), out)
+    assert(out.contains("declare <4 x i32> @llvm.aarch64.neon.udot.v4i32.v16i8(<4 x i32>, <16 x i8>, <16 x i8>)"), out)
+    assert(out.contains("declare <2 x i32> @llvm.aarch64.neon.sdot.v2i32.v8i8(<2 x i32>, <8 x i8>, <8 x i8>)"), out)
+end cry_aarch64_names_and_suffixes
+
+@test("the marked bodies carry the extension, and the back end selects each instruction in them")
+cry_aarch64_back_end_selects()
+    if xvr_no_library() then return
+
+    val t = cry_row("aarch64-linux")
+    val ll = cry_for(t, cry_aarch64_program())
+
+    assert(ll.contains("+aes") && ll.contains("+sha3") && ll.contains("+dotprod"), ll)
+
+    val built = cry_asm(t, ll)
+
+    assert(built.0, built.1)
+
+    for insn in ["aese", "aesd", "aesmc", "aesimc", "eor3", "bcax", "rax1", "sdot", "udot"]
+        assert(built.1.contains(insn), s"$insn: ${built.1}")
+end cry_aarch64_back_end_selects
+
+@test("every eor3 and bcax lane width has its suffix, and an @unchecked block alone lets a plain body call")
+cry_lane_widths_and_unchecked()
+    if xvr_no_library() then return
+
+    val t = cry_row("aarch64-linux")
+    val out = cry_for(t,
+        "private extern \"llvm.aarch64.crypto.eor3u\" e8(a: <16>u8, b: <16>u8, c: <16>u8) -> <16>u8\n" +
+        "private extern \"llvm.aarch64.crypto.eor3u\" e16(a: <8>u16, b: <8>u16, c: <8>u16) -> <8>u16\n" +
+        "private extern \"llvm.aarch64.crypto.eor3u\" e32(a: <4>u32, b: <4>u32, c: <4>u32) -> <4>u32\n" +
+        "private extern \"llvm.aarch64.crypto.bcaxs\" b16(a: <8>i16, b: <8>i16, c: <8>i16) -> <8>i16\n\n" +
+        "@unchecked(\"sha3\")\n    val a: <16>u8 = 1\n    val b: <8>u16 = 1\n    val c: <4>u32 = 1\n    val d: <8>i16 = 1\n" +
+        "    print(e8(a, a, a)[0], e16(b, b, b)[0], e32(c, c, c)[0], b16(d, d, d)[0])\n")
+
+    assert(out.contains("@llvm.aarch64.crypto.eor3u.v16i8("), out)
+    assert(out.contains("@llvm.aarch64.crypto.eor3u.v8i16("), out)
+    assert(out.contains("@llvm.aarch64.crypto.eor3u.v4i32("), out)
+    assert(out.contains("@llvm.aarch64.crypto.bcaxs.v8i16("), out)
+end cry_lane_widths_and_unchecked
+
+@test("the build's promise needs no block: the M1 row has aes, sha3 and dotprod, and a row without refuses")
+cry_promised_by_the_row()
+    if xvr_no_library() then return
+
+    val text = "private extern \"llvm.aarch64.crypto.aese\" aese(d: <16>u8, k: <16>u8) -> <16>u8\n\n" +
+               "val z: <16>u8 = 0\nprint(aese(z, z)[0])\n"
+    val mac = cry_for(cry_row("aarch64-macos"), text)
+    val linux = cry_for(cry_row("aarch64-linux"), text)
+
+    assert(mac.contains("@llvm.aarch64.crypto.aese("), mac)
+    assert(linux.contains("'aese' is called, and it is compiled for the processor's 'aes' extension, which " +
+           "'aarch64-linux' does not promise and the code here is not compiled for"), linux)
+end cry_promised_by_the_row
+
+// -- the refusals ------------------------------------------------------------------------------------
+
+@test("a call outside a marked body is refused for each family, naming the extension and both ways out")
+cry_refused_outside_extensions()
+    if xvr_no_library() then return
+
+    val t = cry_row("aarch64-linux")
+    val sha = cry_for(t, "private extern \"llvm.aarch64.crypto.rax1\" r(a: <2>u64, b: <2>u64) -> <2>u64\n\n" +
+                         "val z: <2>u64 = 0\nprint(r(z, z)[0])\n")
+    val dot = cry_for(t, "private extern \"llvm.aarch64.neon.udot\" d(a: <4>u32, b: <16>u8, c: <16>u8) -> <4>u32\n\n" +
+                         "val z: <16>u8 = 0\nval a: <4>u32 = 0\nprint(d(a, z, z)[0])\n")
+
+    assert(sha.contains("'r' is called, and it is compiled for the processor's 'sha3' extension, which " +
+           "'aarch64-linux' does not promise"), sha)
+    assert(sha.contains("Mark the caller '@extensions(\"sha3\")', or make the call inside '@unchecked(\"sha3\")'"), sha)
+    assert(dot.contains("compiled for the processor's 'dotprod' extension"), dot)
+
+    val x86 = cry_for(cry_row("x86_64-linux"), "private extern \"llvm.x86.aesni.aesenc\" r(a: <2>u64, b: <2>u64) -> <2>u64\n\n" +
+                                              "val z: <2>u64 = 0\nprint(r(z, z)[0])\n")
+    val vnni = cry_for(cry_row("x86_64-linux"),
+        "private extern \"llvm.x86.avx512.vpdpbusd.128\" v(a: <4>i32, b: <4>i32, c: <4>i32) -> <4>i32\n\n" +
+        "val z: <4>i32 = 0\nprint(v(z, z, z)[0])\n")
+
+    assert(x86.contains("'r' is called, and it is compiled for the processor's 'aes' extension, which " +
+           "'x86_64-linux' does not promise"), x86)
+    assert(vnni.contains("compiled for the processor's 'avxvnni' extension"), vnni)
+end cry_refused_outside_extensions
+
+@test("a feature string that is not the intrinsic's is refused, marked or in a block, naming what is missing")
+cry_mismatched_feature_string()
+    if xvr_no_library() then return
+
+    val t = cry_row("aarch64-linux")
+    val decl = "private extern \"llvm.aarch64.crypto.aese\" aese(d: <16>u8, k: <16>u8) -> <16>u8\n\n"
+    val marked = cry_for(t, decl + "@extensions(\"sha3\")\nf(a: <16>u8) -> <16>u8 = aese(a, a)\n\n" +
+                            "@unchecked(\"sha3\", \"aes\")\n    val z: <16>u8 = 0\n    print(f(z)[0])\n")
+
+    assert(marked.contains("compiled for the processor's 'aes' extension") &&
+           marked.contains("Mark the caller '@extensions(\"aes\")'"), marked)
+
+    val block = cry_for(t, decl + "val z: <16>u8 = 0\n\n@unchecked(\"sha3\")\n    print(aese(z, z)[0])\n")
+
+    assert(block.contains("'aese' is called, and it is compiled for the processor's 'aes' extension"), block)
+
+    // The one that is named wins, though another is named beside it.
+    val both = cry_for(t, decl + "val z: <16>u8 = 0\n\n@unchecked(\"sha3\", \"aes\")\n    print(aese(z, z)[0])\n")
+
+    assert(!both.contains("error") && both.contains("@llvm.aarch64.crypto.aese("), both)
+
+    // An extension the back end does not know is refused as `codegen.extensions` refuses it.
+    val unknown = cry_for(t, decl + "@extensions(\"aess\")\nf(a: <16>u8) -> <16>u8 = aese(a, a)\n")
+
+    assert(unknown.contains("'@extensions' names 'aess', which the aarch64 back end does not know"), unknown)
+end cry_mismatched_feature_string
+
+@test("a declaration states one of the signatures the instruction has, and a vector on a C extern is still refused")
+cry_signatures()
+    if xvr_no_library() then return
+
+    val t = cry_row("aarch64-macos")
+    val narrow = cry_for(t, "private extern \"llvm.aarch64.crypto.aese\" f(d: <8>u8, k: <8>u8) -> <8>u8\n\n" +
+                            "val z: <8>u8 = 0\nprint(f(z, z)[0])\n")
+    val signed = cry_for(t, "private extern \"llvm.aarch64.neon.udot\" f(a: <4>i32, b: <16>i8, c: <16>i8) -> <4>i32\n\n" +
+                            "val z: <16>i8 = 0\nval a: <4>i32 = 0\nprint(f(a, z, z)[0])\n")
+    val lanes = cry_for(t, "private extern \"llvm.aarch64.crypto.eor3u\" f(a: <2>u64, b: <2>u64) -> <2>u64\n\n" +
+                           "val z: <2>u64 = 0\nprint(f(z, z)[0])\n")
+    val scalar = cry_for(t, "private extern \"llvm.aarch64.crypto.rax1\" f(a: u64, b: u64) -> u64\n\nprint(f(1, 2))\n")
+    val c = cry_for(t, "private extern \"process_lanes\" f(a: <2>u64) -> <2>u64\n\nval z: <2>u64 = 0\nprint(f(z)[0])\n")
+
+    assert(narrow.contains("'llvm.aarch64.crypto.aese' is (<16>byte, <16>byte) -> <16>byte, and this " +
+           "declaration states '(<8>byte, <8>byte) -> <8>byte'"), narrow)
+    assert(signed.contains("'llvm.aarch64.neon.udot' is one of (<4>uint, <16>byte, <16>byte) -> <4>uint, ") &&
+           signed.contains("and this declaration states '(<4>int, <16>i8, <16>i8) -> <4>int'"), signed)
+    assert(lanes.contains("'llvm.aarch64.crypto.eor3u' is one of ") && lanes.contains("and this declaration states"), lanes)
+    assert(scalar.contains("'llvm.aarch64.crypto.rax1' is (<2>ulong, <2>ulong) -> <2>ulong, and this declaration " +
+           "states '(ulong, ulong) -> ulong'"), scalar)
+    assert(c.contains("how a vector reaches a C function differs by target"), c)
+end cry_signatures
+
+@test("an instruction for the other processor is refused, and the name is in the refusal's list")
+cry_wrong_processor_and_list()
+    if xvr_no_library() then return
+
+    val x86 = cry_for(cry_row("x86_64-linux"),
+        "private extern \"llvm.aarch64.crypto.aese\" f(d: <16>u8, k: <16>u8) -> <16>u8\n\n" +
+        "val z: <16>u8 = 0\nprint(f(z, z)[0])\n")
+    val arm = cry_for(cry_row("aarch64-macos"),
+        "private extern \"llvm.x86.aesni.aesenc\" f(d: <2>u64, k: <2>u64) -> <2>u64\n\n" +
+        "val z: <2>u64 = 0\nprint(f(z, z)[0])\n")
+    val unknown = cry_for(cry_row("aarch64-macos"),
+        "private extern \"llvm.aarch64.crypto.sha1h\" f(d: u32) -> u32\n\nprint(f(1))\n")
+
+    assert(x86.contains("'llvm.aarch64.crypto.aese' is an AArch64 instruction, and this build is for 'x86_64-linux'"), x86)
+    assert(arm.contains("'llvm.x86.aesni.aesenc' is an x86-64 instruction, and this build is for 'aarch64-macos'"), arm)
+    assert(unknown.contains("llvm.aarch64.crypto.aese, llvm.aarch64.crypto.aesd") &&
+           unknown.contains("llvm.x86.avx512.vpdpwssds.256"), unknown)
+end cry_wrong_processor_and_list
+
+// -- x86_64, built and read, never run ---------------------------------------------------------------
+
+private cry_x86_program() -> string =
+    "private extern \"llvm.x86.aesni.aesenc\" aesenc(a: <2>u64, k: <2>u64) -> <2>u64\n" +
+    "private extern \"llvm.x86.aesni.aesenclast\" aesenclast(a: <2>u64, k: <2>u64) -> <2>u64\n" +
+    "private extern \"llvm.x86.aesni.aesdec\" aesdec(a: <2>u64, k: <2>u64) -> <2>u64\n" +
+    "private extern \"llvm.x86.aesni.aesdeclast\" aesdeclast(a: <2>u64, k: <2>u64) -> <2>u64\n" +
+    "private extern \"llvm.x86.aesni.aesimc\" aesimc(a: <2>u64) -> <2>u64\n" +
+    "private extern \"llvm.x86.avx512.vpdpbusd.128\" busd(a: <4>i32, b: <4>i32, c: <4>i32) -> <4>i32\n" +
+    "private extern \"llvm.x86.avx512.vpdpbusd.256\" busd256(a: <8>i32, b: <8>i32, c: <8>i32) -> <8>i32\n" +
+    "private extern \"llvm.x86.avx512.vpdpbusds.128\" busds(a: <4>i32, b: <4>i32, c: <4>i32) -> <4>i32\n" +
+    "private extern \"llvm.x86.avx512.vpdpwssd.128\" wssd(a: <4>i32, b: <4>i32, c: <4>i32) -> <4>i32\n" +
+    "private extern \"llvm.x86.avx512.vpdpwssds.256\" wssds256(a: <8>i32, b: <8>i32, c: <8>i32) -> <8>i32\n\n" +
+    "@extensions(\"aes\")\nf_enc(a: <2>u64, k: <2>u64) -> <2>u64 = aesenc(a, k)\n" +
+    "@extensions(\"aes\")\nf_enclast(a: <2>u64, k: <2>u64) -> <2>u64 = aesenclast(a, k)\n" +
+    "@extensions(\"aes\")\nf_dec(a: <2>u64, k: <2>u64) -> <2>u64 = aesdec(a, k)\n" +
+    "@extensions(\"aes\")\nf_declast(a: <2>u64, k: <2>u64) -> <2>u64 = aesdeclast(a, k)\n" +
+    "@extensions(\"aes\")\nf_imc(a: <2>u64) -> <2>u64 = aesimc(a)\n" +
+    "@extensions(\"avxvnni\")\nf_busd(a: <4>i32, b: <4>i32, c: <4>i32) -> <4>i32 = busd(a, b, c)\n" +
+    "@extensions(\"avxvnni\")\nf_busd256(a: <8>i32, b: <8>i32, c: <8>i32) -> <8>i32 = busd256(a, b, c)\n" +
+    "@extensions(\"avxvnni\")\nf_busds(a: <4>i32, b: <4>i32, c: <4>i32) -> <4>i32 = busds(a, b, c)\n" +
+    "@extensions(\"avxvnni\")\nf_wssd(a: <4>i32, b: <4>i32, c: <4>i32) -> <4>i32 = wssd(a, b, c)\n" +
+    "@extensions(\"avxvnni\")\nf_wssds256(a: <8>i32, b: <8>i32, c: <8>i32) -> <8>i32 = wssds256(a, b, c)\n\n" +
+    "@unchecked(\"aes\", \"avxvnni\")\n" +
+    "    val v: <2>u64 = 1\n    val w: <4>i32 = 1\n    val x: <8>i32 = 1\n" +
+    "    print(f_enc(v, v)[0], f_enclast(v, v)[0], f_dec(v, v)[0], f_declast(v, v)[0], f_imc(v)[0])\n" +
+    "    print(f_busd(w, w, w)[0], f_busd256(x, x, x)[0], f_busds(w, w, w)[0], f_wssd(w, w, w)[0], f_wssds256(x, x, x)[0])\n"
+
+@test("x86's AES-NI and VNNI instructions are emitted under LLVM's names and assemble for x86_64")
+cry_x86_ir_and_assembly()
+    if xvr_no_library() then return
+
+    val t = cry_row("x86_64-linux")
+    val ll = cry_for(t, cry_x86_program())
+
+    assert(ll.contains("declare <2 x i64> @llvm.x86.aesni.aesenc(<2 x i64>, <2 x i64>)"), ll)
+    assert(ll.contains("declare <2 x i64> @llvm.x86.aesni.aesenclast(<2 x i64>, <2 x i64>)"), ll)
+    assert(ll.contains("declare <2 x i64> @llvm.x86.aesni.aesdec(<2 x i64>, <2 x i64>)"), ll)
+    assert(ll.contains("declare <2 x i64> @llvm.x86.aesni.aesdeclast(<2 x i64>, <2 x i64>)"), ll)
+    assert(ll.contains("declare <2 x i64> @llvm.x86.aesni.aesimc(<2 x i64>)"), ll)
+    assert(ll.contains("declare <4 x i32> @llvm.x86.avx512.vpdpbusd.128(<4 x i32>, <4 x i32>, <4 x i32>)"), ll)
+    assert(ll.contains("declare <8 x i32> @llvm.x86.avx512.vpdpbusd.256(<8 x i32>, <8 x i32>, <8 x i32>)"), ll)
+    assert(ll.contains("@llvm.x86.avx512.vpdpbusds.128(") && ll.contains("@llvm.x86.avx512.vpdpwssd.128("), ll)
+    assert(ll.contains("@llvm.x86.avx512.vpdpwssds.256("), ll)
+    assert(ll.contains("+aes") && ll.contains("+avxvnni"), ll)
+
+    val built = cry_asm(t, ll)
+
+    assert(built.0, built.1)
+
+    for insn in ["aesenc", "aesenclast", "aesdec", "aesdeclast", "aesimc", "vpdpbusd", "vpdpbusds", "vpdpwssd", "vpdpwssds"]
+        assert(built.1.contains(insn), s"$insn: ${built.1}")
+end cry_x86_ir_and_assembly
