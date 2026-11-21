@@ -38,11 +38,34 @@ str_data(e: *Emit, v: Val) -> (Val, Val)
 end str_data
 
 // The address of a string's first byte.
+//
+// **A short string's bytes are in the value, which has no address**, so the value is spilled to a
+// slot of its own and the bytes are read at the slot's second word. The slot is this read's alone: two
+// strings read for one call (`a == b`) must not share one, and a view taken of the bytes keeps
+// pointing at them while the frame lasts. Where the value is long the spill is dead and LLVM drops it.
 str_ptr(e: *Emit, v: Val) -> Val
     val p = fresh_reg(e)
 
     emit(e, InExtract(p, lty(e, Str), v, index_list(1)))
-    p
+
+    if !short_strings_on() then return p
+
+    val st = lty(e, Str)
+    val slot = alloca(e, fresh_reg(e), st)
+
+    emit(e, InStore(st, v, slot, AccPlain, None))
+
+    val held_at = fresh_reg(e)
+
+    var idx: Buf[IrArg] = buf()
+
+    idx.push(ir_arg(l_i32(), VInt(from_int(long(e.word_bits / 8)))))
+    emit(e, InGep(held_at, LInt(8), slot, idx))
+
+    val r = fresh_reg(e)
+
+    emit(e, InSelect(r, str_is_short(e, v), LPtr, held_at, p, l_i1()))
+    r
 end str_ptr
 
 // How many bytes a string holds.
@@ -50,8 +73,215 @@ str_len(e: *Emit, v: Val) -> Val
     val n = fresh_reg(e)
 
     emit(e, InExtract(n, lty(e, Str), v, index_list(2)))
-    n
+
+    if !short_strings_on() then return n
+
+    val top = fresh_reg(e)
+
+    emit(e, InBin(top, OpLShr, word_lty(e), n, VInt(from_int(long(e.word_bits - 8)))))
+
+    val held = fresh_reg(e)
+
+    emit(e, InBin(held, OpAnd, word_lty(e), top, VInt(from_int(127))))
+
+    val r = fresh_reg(e)
+
+    emit(e, InSelect(r, str_is_short(e, v), word_lty(e), held, n, l_i1()))
+    r
 end str_len
+
+// Whether a string holds its bytes in the value: the top bit of its length word, which no long
+// string's length can reach. Only asked where the short form is on.
+str_is_short(e: *Emit, v: Val) -> Val
+    val n = fresh_reg(e)
+
+    emit(e, InExtract(n, lty(e, Str), v, index_list(2)))
+
+    val sh = fresh_reg(e)
+
+    emit(e, InIntCmp(sh, ISlt, word_lty(e), n, VInt(from_int(0))))
+    sh
+end str_is_short
+
+// **A string's bytes as a `[]u8` view** -- what `s.bytes` is. With the short form off it is the value
+// itself, the same three words.
+//
+// **Where a string may be short, a view of its bytes that may be kept needs them at an address that
+// lasts**, and a short string's bytes have none: they are the value. So the view is made by
+// `sysl.str.unshort`, which copies a short string into a `StrBuf` and takes a share of a long one, and
+// the statement owns that count like any other temporary -- a binding, a field or a `return` that
+// keeps the view takes a share of its own, exactly as it would of a substring. The reads that only
+// lend the bytes for the length of one operation -- an index, a length, a `for` over them -- never
+// come here: they read the string itself (`bytes_receiver`). Copying only the views that escape is the
+// escape analysis's (`docs/design/short-strings.md § 5.4`).
+str_bytes_view(e: *Emit, v: Val, ty: Type) -> Val
+    if !short_strings_on() then return v
+
+    e.heap = true
+    e.maybe_heap = true
+
+    val st = lty(e, Str)
+    val fn = request_text(e, "sysl.str.unshort", str_unshort_text(e, str_llvm(e)))
+    val r = fresh_reg(e)
+
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(st, v))
+    emit(e, ir_call(Some(r), st, VGlobal(fn), args))
+    own_temp(e, r, ty)
+end str_bytes_view
+
+// **`sysl.str.unshort`**, the view `str_bytes_view` makes: the string's words as a view that owns a
+// count of its own, which the statement gives back. A long string is its own view, with a share
+// taken; a short one is copied into a `StrBuf`, whose one count is that share.
+private str_unshort_text(e: *Emit, str: string) -> string
+    val word = s"i${e.word_bits}"
+
+    request_text(e, "sysl.str.heap", str_heap_text(e, str))
+
+    val read = str_read_text(str, e.word_bits, "%s")
+    val p = str_ptr_text(str, "%s")
+    val n = str_len_text(str, e.word_bits, "%s")
+
+    s"""
+    define private $str @sysl.str.unshort($str %s) {
+    entry:
+    ${read}  br i1 %s.sh, label %copy, label %keep
+    copy:
+      %from = $p
+      %n = $n
+      %made = call $str @sysl.str.heap(ptr %from, $word %n)
+      ret $str %made
+    keep:
+      %owner = extractvalue $str %s, 0
+      call void @arc.retain_maybe(ptr %owner)
+      ret $str %s
+    }
+    """
+end str_unshort_text
+
+// The string whose bytes `x` reads, where `x` is `s.bytes` and the short form is on: a read that only
+// lends them for one operation takes them from the string directly (`str_data`), so it neither
+// copies a short string nor takes a share of a long one.
+bytes_receiver(x: TExpr) -> Option[TExpr]
+    if !short_strings_on() then return None
+
+    *x.kind match
+        TBytes(r) -> Some(r)
+        _ -> None
+end bytes_receiver
+
+// **A short string made of a long one's run of bytes, `n` of them from byte `start`**, without a call
+// or a loop: the two words after the owner read as one integer, shifted down by the start and masked
+// to the length, with the tag laid in the top byte. Only a run of a short string is ever given here
+// (`gen_slice_of` selects this where the source is short and the run is not empty), so the shift and
+// the mask are clamped to the capacity rather than trusted to stay inside the integer.
+str_short_run(e: *Emit, v: Val, start: Val, n: Val) -> Val
+    val st = lty(e, Str)
+    val w = word_lty(e)
+    val bits = e.word_bits
+    val pair = LInt(2 * bits)
+
+    val p1 = fresh_reg(e)
+
+    emit(e, InExtract(p1, st, v, index_list(1)))
+
+    val lo = fresh_reg(e)
+
+    emit(e, InCast(lo, CastPtrToInt, LPtr, p1, w))
+
+    val hi = fresh_reg(e)
+
+    emit(e, InExtract(hi, st, v, index_list(2)))
+
+    val lo2 = fresh_reg(e)
+
+    emit(e, InCast(lo2, CastZExt, w, lo, pair))
+
+    val hi2 = fresh_reg(e)
+
+    emit(e, InCast(hi2, CastZExt, w, hi, pair))
+
+    val hi_up = fresh_reg(e)
+
+    emit(e, InBin(hi_up, OpShl, pair, hi2, VInt(from_int(long(bits)))))
+
+    val both = fresh_reg(e)
+
+    emit(e, InBin(both, OpOr, pair, hi_up, lo2))
+
+    // The start and the length, clamped to what a short string can hold.
+    val cap = short_string_capacity(bits)
+    val start_c = fresh_reg(e)
+
+    emit(e, InBin(start_c, OpAnd, w, start, VInt(from_int(long(cap)))))
+
+    val n_c = fresh_reg(e)
+
+    emit(e, InBin(n_c, OpAnd, w, n, VInt(from_int(long(cap)))))
+
+    val start2 = fresh_reg(e)
+
+    emit(e, InCast(start2, CastZExt, w, start_c, pair))
+
+    val shift = fresh_reg(e)
+
+    emit(e, InBin(shift, OpShl, pair, start2, VInt(from_int(3))))
+
+    val down = fresh_reg(e)
+
+    emit(e, InBin(down, OpLShr, pair, both, shift))
+
+    val n2 = fresh_reg(e)
+
+    emit(e, InCast(n2, CastZExt, w, n_c, pair))
+
+    val nbits = fresh_reg(e)
+
+    emit(e, InBin(nbits, OpShl, pair, n2, VInt(from_int(3))))
+
+    val one_up = fresh_reg(e)
+
+    emit(e, InBin(one_up, OpShl, pair, VInt(from_int(1)), nbits))
+
+    val mask = fresh_reg(e)
+
+    emit(e, InBin(mask, OpSub, pair, one_up, VInt(from_int(1))))
+
+    val kept = fresh_reg(e)
+
+    emit(e, InBin(kept, OpAnd, pair, down, mask))
+
+    // The tag: `0x80 | n` in the top byte.
+    val tag = fresh_reg(e)
+
+    emit(e, InBin(tag, OpOr, pair, n2, VInt(from_int(128))))
+
+    val tag_up = fresh_reg(e)
+
+    emit(e, InBin(tag_up, OpShl, pair, tag, VInt(from_int(long(2 * bits - 8)))))
+
+    val whole = fresh_reg(e)
+
+    emit(e, InBin(whole, OpOr, pair, kept, tag_up))
+
+    val new_lo = fresh_reg(e)
+
+    emit(e, InCast(new_lo, CastTrunc, pair, whole, w))
+
+    val new_p = fresh_reg(e)
+
+    emit(e, InCast(new_p, CastIntToPtr, w, new_lo, LPtr))
+
+    val shifted = fresh_reg(e)
+
+    emit(e, InBin(shifted, OpLShr, pair, whole, VInt(from_int(long(bits)))))
+
+    val new_hi = fresh_reg(e)
+
+    emit(e, InCast(new_hi, CastTrunc, pair, shifted, w))
+    str_view(e, VNull, new_p, new_hi)
+end str_short_run
 
 // Whether a view of type `ty` is a string rather than a slice.
 private is_string_view(ty: Type) -> bool = underlying(unqualified(ty)) == Str
@@ -88,9 +318,35 @@ end view_len
 // The runtime's hand-written IR reads a string through these spellings, so what a template says
 // about the two words is said here too. `str_ptr_text(str, "%b")` is the right-hand side of an
 // instruction that reads the pointer of the string value `%b` of LLVM type `str`.
-str_ptr_text(str: string, v: string) -> string = s"extractvalue $str $v, 1"
+//
+// **Where the short form is on, the two need lines of their own first** (`str_read_text`), laid down
+// before either is used; they name their registers after `v`, so a template reads one string this
+// way once.
+str_ptr_text(str: string, v: string) -> string =
+    if short_strings_on() then s"select i1 ${v}.sh, ptr ${v}.held, ptr ${v}.p1" else s"extractvalue $str $v, 1"
 
-str_len_text(str: string, v: string) -> string = s"extractvalue $str $v, 2"
+str_len_text(str: string, bits: int, v: string) -> string =
+    if short_strings_on() then s"select i1 ${v}.sh, i$bits ${v}.n7, i$bits ${v}.w2"
+    else s"extractvalue $str $v, 2"
+
+// The lines `str_ptr_text` and `str_len_text` read, each ending in a newline and indented as a
+// template's body is; nothing at all where the short form is off. The spill is an `alloca`, so a
+// template lays these down in its entry block. `bits` is the machine's word.
+str_read_text(str: string, bits: int, v: string) -> string
+    if !short_strings_on() then return ""
+
+    val top = bits - 8
+    val wb = bits / 8
+
+    s"  ${v}.w2 = extractvalue $str $v, 2\n" +
+    s"  ${v}.sh = icmp slt i$bits ${v}.w2, 0\n" +
+    s"  ${v}.top = lshr i$bits ${v}.w2, $top\n" +
+    s"  ${v}.n7 = and i$bits ${v}.top, 127\n" +
+    s"  ${v}.slot = alloca $str\n" +
+    s"  store $str $v, ptr ${v}.slot\n" +
+    s"  ${v}.held = getelementptr i8, ptr ${v}.slot, i32 $wb\n" +
+    s"  ${v}.p1 = extractvalue $str $v, 1\n"
+end str_read_text
 
 // The same two words of element `at` of an array of strings at `table`, as the address of each: the
 // right-hand side of a `getelementptr`, to be loaded as a `ptr` and as a `word`.
@@ -330,8 +586,11 @@ gen_from_bytes(e: *Emit, arg: TExpr) -> Val
     e.heap = true
 
     val fn = request_from_bytes(e)
-    val v = gen_expr(e, arg)
-    val (p, n) = view_data(e, v, texpr_type(arg))
+
+    // `s.copy()` is the bytes of `s` copied, and the copy only reads them: from the string itself.
+    val (p, n) = bytes_receiver(arg) match
+        Some(s) -> str_data(e, gen_expr(e, s))
+        None -> view_data(e, gen_expr(e, arg), texpr_type(arg))
     val r = fresh_reg(e)
 
     emit(e, ir_call(Some(r), lty(e, Str), VGlobal(fn), str_args(e, p, n)))

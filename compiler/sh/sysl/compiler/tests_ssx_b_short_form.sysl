@@ -1,0 +1,524 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{Var, capture}
+import sysl.text.{Search, join}
+
+// **The short form of a string** (`short_strings.sysl`, `docs/design/short-strings.md` option A),
+// asked of real programs built on the counted heap and run: each program is built with the form off
+// and with it on, and both must print the same thing and give back every allocation. A string of 1
+// to 15 bytes that a producer makes (a copy, `from_utf8`, a concatenation, an interpolation, a
+// builder, a rendered number or character) is short where the form is on; a literal, a slice of a
+// long string and `str_alias` are never short; the empty string is never short.
+//
+// The lengths each producer is asked at are the design's axis: 0, 1, 14 (2W - 2), 15 (the capacity),
+// 16 (one past it), and 14 ASCII bytes plus a two-byte character, which is 16 bytes and must not be
+// cut inside the character.
+//
+// Skipped cells, with the reason: running a 32-bit program (no 32-bit host runner in the suite -- the
+// 32-bit form is checked by its IR and by `build-c` for a thumb target instead); `--release` and LTO
+// (the form is chosen per value at run time, and the same IR is optimized, so the debug run is the
+// one that sees an unoptimized read of every select); `async` (a string live across `await` is a field
+// of the task's frame, which the struct-field cell already covers); and `@no_alloc` with `.bytes`,
+// whose refusal is SS1-3's.
+
+private struct SsxRun
+    ok: bool
+    out: string
+    err: string
+
+private ssx_b_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end ssx_b_ready
+
+// The program built on the counted heap, with the short form `short` or not, and run with `env`.
+private ssx_b_run(text: string, short: bool, env: []const Var) -> SsxRun
+    val root = make_temp_dir("sysl-ssx-b").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    force_alloc_counting(true)
+    force_short_strings(short)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization,
+                                     Some(s"$root/built"))
+
+    force_short_strings(false)
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return SsxRun(false, failure_text(why), "")
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", env, true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> SsxRun(false, "could not be started", "")
+        Ok(o) -> SsxRun(o.status.ok(), o.text, o.err.unwrap_or(""))
+end ssx_b_run
+
+// The program run with the form off and on: both print `want`, and both give back every allocation.
+private ssx_b_both(text: string, want: string)
+    for short in [false, true]
+        val run = ssx_b_run(text, short, [])
+
+        assert(run.ok, s"short=$short: ${run.out} ${run.err}")
+        assert_eq(run.out, want, s"short=$short")
+        assert_eq(alloc_count_reported(run.err), 0, s"short=$short: ${run.err}")
+end ssx_b_both
+
+// The bytes a program allocated in all, with the form `short` or not.
+private ssx_b_bytes(text: string, short: bool) -> long
+    val run = ssx_b_run(text, short, [Var(alloc_bytes_variable(), "1")])
+
+    assert(run.ok, s"short=$short: ${run.out} ${run.err}")
+    alloc_bytes_reported(run.err)
+end ssx_b_bytes
+
+// The IR of a program, with the form `short` or not, for `target` (or the host).
+private ssx_b_ir(text: string, short: bool, target: Option[string]) -> string
+    val root = make_temp_dir("sysl-ssx-b").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+
+    force_short_strings(short)
+
+    val code = target match
+        Some(t) -> run_cli(["sysl", "emit-llvm", s"$root/main.sysl", "--target", t], (line) -> sink.push(line))
+        None -> run_cli(["sysl", "emit-llvm", s"$root/main.sysl"], (line) -> sink.push(line))
+
+    force_short_strings(false)
+    remove_dir_all(root).unwrap_or(())
+
+    val text_out = join(lines.view(), "\n")
+
+    assert_eq(code, 0, text_out)
+    text_out
+end ssx_b_ir
+
+// -- the producers, at every length -------------------------------------------------------------------
+
+private val ssx_b_producers = """
+    import sysl.text.{from_utf8, str_builder}
+
+    show(tag: string, s: string)
+        print(s"$tag ${s.len} [$s]")
+
+    num(v: i64) -> string = s"$v"
+
+    ch(c: char) -> string = s"$c"
+
+    main()
+        val base = "abcdefghijklmnopq"
+
+        for n in [0, 1, 14, 15, 16]
+            val lit = base[0..<n]
+
+            show("copy", lit.copy())
+            show("utf8", from_utf8(lit.bytes).unwrap())
+            show("cat", lit[0..<n / 2] + lit[n / 2..<n])
+            show("interp", s"<$lit>")
+
+            var b = str_builder()
+
+            b.push(lit)
+            show("built", b.finish())
+
+        val wide = "abcdefghijklmné"
+
+        show("wide", wide.copy())
+        show("wcat", wide[0..<14].copy() + "é")
+        show("w15", "abcdefghijklmé".copy())
+        show("int", num(-9223372036854775807 - 1))
+        show("int", num(0))
+        show("int", num(123456789012345))
+        show("int", num(1234567890123456))
+        show("char", ch('a'))
+        show("char", ch('é'))
+        show("char", ch('€'))
+        show("char", ch('😀'))
+    """
+
+private ssx_b_producers_want() -> string
+    var out = ""
+    val base = "abcdefghijklmnopq"
+
+    for n in [0, 1, 14, 15, 16]
+        val lit = base[0..<n]
+
+        out = out + s"copy $n [$lit]\nutf8 $n [$lit]\ncat $n [$lit]\ninterp ${n + 2} [<$lit>]\nbuilt $n [$lit]\n"
+
+    out + "wide 16 [abcdefghijklmné]\nwcat 16 [abcdefghijklmné]\nw15 15 [abcdefghijklmé]\n" +
+        "int 20 [-9223372036854775808]\nint 1 [0]\nint 15 [123456789012345]\nint 16 [1234567890123456]\n" +
+        "char 1 [a]\nchar 2 [é]\nchar 3 [€]\nchar 4 [😀]\n"
+end ssx_b_producers_want
+
+@test("ssx_b every producer at 0, 1, 14, 15, 16 bytes and a straddling character, short form off and on")
+ssx_b_producers_at_every_length()
+    if !ssx_b_ready() then return
+
+    ssx_b_both(ssx_b_producers, ssx_b_producers_want())
+
+// **The form is really on**: a program making a thousand strings of five bytes allocates for each of
+// them with the form off, and for none of them with it on.
+@test("ssx_b short strings allocate nothing: a thousand five-byte copies cost bytes only with the form off")
+ssx_b_short_allocates_nothing()
+    if !ssx_b_ready() then return
+
+    val text = """
+        main()
+            val src = "abcdefghij"
+            var total = 0
+
+            for i in 0..<1000
+                val s = src[i % 5..<i % 5 + 5].copy()
+
+                total += s.len
+
+            print(total)
+        """
+
+    val off = ssx_b_bytes(text, false)
+    val on = ssx_b_bytes(text, true)
+
+    assert(off >= 1000 * 5, s"off: $off")
+    assert(on < 1000, s"on: $on, off: $off")
+
+// -- comparison, hashing, match, a map key across the two forms ------------------------------------------
+
+private val ssx_b_compare = """
+    import sysl.container.{Map, map}
+
+    kind(s: string) -> string = s match
+        "abc" -> "abc!"
+        "abcdefghijklmnop" -> "sixteen!"
+        "abcdefghijklmno" -> "fifteen!"
+        _ -> "other"
+
+    main()
+        val alpha = "abcdefghijklmnopqrstuvwxyz"
+        val short3 = alpha[0..<3].copy()
+        val long3 = alpha[0..<3]
+        val s15 = alpha[0..<15].copy()
+        val l16 = alpha[0..<16].copy()
+
+        print(short3 == long3, long3 == short3, short3 == "abc", short3 != long3)
+        print(short3 < "abd", "abd" > short3, short3 < long3, s15 < l16, l16 > s15, s15 == l16[0..<15])
+        print(short3.hash() == long3.hash(), s15.hash() == l16[0..<15].hash(), short3.hash() == "abc".hash())
+        print(kind(short3), kind(long3), kind(l16), kind(s15), kind(alpha[0..<15]), kind(s15[0..<2]))
+
+        var m: Map[string, int] = map()
+
+        m.put(short3, 1)
+        m.put(l16, 2)
+        m.put(alpha[3..<6], 3)
+        print(m.get(long3).unwrap_or(0), m.get("abc").unwrap_or(0), m.get(alpha[0..<16]).unwrap_or(0),
+              m.get(s15).unwrap_or(0), m.get("def".copy()).unwrap_or(0))
+    """
+
+private val ssx_b_compare_want =
+    "true true true false\ntrue true false true true true\ntrue true true\n" +
+    "abc! abc! sixteen! fifteen! fifteen! other\n1 1 2 0 3\n"
+
+@test("ssx_b ==, <, hash, match and a map key agree across short, long and literal strings")
+ssx_b_compare_across_forms()
+    if !ssx_b_ready() then return
+
+    ssx_b_both(ssx_b_compare, ssx_b_compare_want)
+
+// The same `match`, dispatched through the sorted table rather than a chain of comparisons.
+@test("ssx_b a match through the string table finds a short scrutinee")
+ssx_b_match_through_the_table()
+    if !ssx_b_ready() then return
+
+    pin_string_table_arms(Some(2))
+    ssx_b_both(ssx_b_compare, ssx_b_compare_want)
+    pin_string_table_arms(None)
+
+// -- substrings -------------------------------------------------------------------------------------------
+
+private val ssx_b_slices = """
+    import sysl.buf.{Buf, buf}
+
+    cut(s: string, a: usize, b: usize) -> string = s[a..<b]
+
+    main()
+        val x = "hello, world!!".copy()
+
+        print(cut(x, 0, 5), cut(x, 7, 14), cut(x, 3, 3).len, cut(x, 0, 14), x[1..<4], x[1..3])
+
+        val y = "abcdefghijklmé".copy()
+
+        print(cut(y, 13, 15), cut(y, 0, 13), y[13..<y.len].len, y[..<2], y[13..])
+        print(cut(cut(x, 2, 12), 1, 4))
+
+        var src = "0123456789abcde".copy()
+        var parts: Buf[string] = buf()
+
+        for i in 0..<5
+            parts.push(src[i * 3..<i * 3 + 3])
+
+        src = "zzzzzzzzzzzzzzz".copy()
+        print(parts[0], parts[4], parts.len(), src)
+
+        val big = "abcdefghijklmnopqrstuvwxyz".copy()
+
+        print(cut(big, 0, 3), cut(big, 20, 26), cut(cut(big, 0, 15), 3, 5))
+        print(x.bytes[0], x.bytes.len, x[4..<5] == "o", cut(x, 0, 0) == "")
+    """
+
+@test("ssx_b a substring of a short string is short, outlives its frame and its source, and reads right")
+ssx_b_slices_of_short_strings()
+    if !ssx_b_ready() then return
+
+    ssx_b_both(ssx_b_slices,
+               "hello world!! 0 hello, world!! ell ell\n" +
+               "é abcdefghijklm 2 ab é\n" +
+               "lo,\n" +
+               "012 cde 5 zzzzzzzzzzzzzzz\n" +
+               "abc uvwxyz de\n" +
+               "104 14 true true\n")
+
+// A cut inside a character of a short string still traps, and says where.
+@test("ssx_b a cut inside a character of a short string traps as a long one's does")
+ssx_b_split_character_traps()
+    if !ssx_b_ready() then return
+
+    val text = """
+        cut(s: string, a: usize, b: usize) -> string = s[a..<b]
+
+        main()
+            val y = "abcdefghijklmé".copy()
+
+            print(cut(y, 0, 13))
+            print(cut(y, 0, 14))
+        """
+
+    for short in [false, true]
+        val run = ssx_b_run(text, short, [])
+
+        assert(!run.ok, s"short=$short")
+        assert(run.err.contains("range end 14 is not on a character boundary"), s"short=$short: ${run.err}")
+
+// -- where a short string is held ---------------------------------------------------------------------------
+
+private val ssx_b_positions = """
+    import sysl.buf.{Buf, buf}
+
+    struct Pair
+        a: string
+        b: string
+
+    enum Shape
+        Named(name: string)
+        Blank
+
+    var g: string = ""
+
+    mk(n: int) -> string = "abcdefghijklmnopqrstuvwxyz"[0..<n].copy()
+
+    main()
+        val p = Pair(mk(3), mk(16))
+        val o: Option[string] = Some(mk(7))
+        val sh = Named(mk(15))
+        val t = (mk(1), mk(2))
+        val f = () -> p.a + t.1
+
+        var bs: Buf[string] = buf()
+
+        for i in 0..<40
+            bs.push(mk(i % 17))
+
+        g = mk(5) + "!"
+
+        var v = mk(4)
+
+        v = v + v
+
+        print(p.a, p.b, o.unwrap(), t.0, t.1, f(), bs[15], bs[16], bs[39].len, g, v)
+
+        sh match
+            Named(n) -> print(n, n.len)
+            Blank -> print("blank")
+
+        // Module storage is never given back, and the count marks it only where it was filled
+        // before `main`, so the long form's heap string would be counted as live at exit.
+        g = ""
+    """
+
+@test("ssx_b a short string in a field, an Option, an enum payload, a tuple, a capture, a grown Buf and a module var")
+ssx_b_short_in_every_position()
+    if !ssx_b_ready() then return
+
+    ssx_b_both(ssx_b_positions,
+               "abc abcdefghijklmnop abcdefg a ab abcab abcdefghijklmno abcdefghijklmnop 5 abcde! abcdabcd\n" +
+               "abcdefghijklmno 15\n")
+
+// -- the bytes of a short string, lent --------------------------------------------------------------------
+
+@test("ssx_b .bytes and .chars of a short string, lent, iterated and indexed, see the bytes it held then")
+ssx_b_bytes_lent()
+    if !ssx_b_ready() then return
+
+    ssx_b_both("""
+        total(b: []const u8) -> int
+            var t = 0
+
+            for x in b
+                t += int(x)
+
+            t
+        end total
+
+        mk(n: int) -> string = "abcdefghijklmnopqrstuvwxyz"[0..<n].copy()
+
+        main()
+            val s = mk(5)
+
+            print(total(s.bytes), s.bytes[4], s.bytes.len, s[2])
+
+            var n = 0
+
+            for c in s.chars
+                if c >= 'b' then n += 1
+
+            var v = mk(3)
+            val b = v.bytes
+
+            v = mk(7)
+            print(n, b.len, b[0], b[2], v.len, total(mk(15).bytes) - total(mk(14).bytes))
+        """,
+        "495 101 5 99\n4 3 97 99 7 111\n")
+
+// **A view of a short string's bytes that is kept** -- returned, stored in a struct, held past the
+// string's reassignment -- views a copy of its own (`str_bytes_view`), so it is still the bytes when
+// read; the library's `Search` defaults are all written this way (`view(self) = self.bytes`).
+@test("ssx_b .bytes of a short string returned, stored and kept past a reassignment still reads its bytes")
+ssx_b_bytes_kept()
+    if !ssx_b_ready() then return
+
+    ssx_b_both("""
+        import sysl.text.Search
+
+        struct Held
+            b: []const u8
+
+        view_of(s: string) -> []const u8 = s.bytes
+
+        strip(t: string) -> string
+            var m = t
+
+            while m.ends_with("0")
+                m = m[0..<m.len - 1]
+
+            m
+        end strip
+
+        mk(n: int) -> string = "abcdefghijklmnopqrstuvwxyz"[0..<n].copy()
+
+        main()
+            val a = view_of(mk(6))
+            val b = view_of(mk(3))
+            val h = Held(view_of(mk(15)))
+            val l = view_of(mk(20))
+
+            print(a.len, a[5], b.len, b[2], h.b.len, h.b[14], l.len, l[19])
+            print(strip("-7.20620".copy()), strip("12345678901234500000".copy()), mk(4).starts_with("ab"),
+                  mk(4).ends_with("cd"), mk(4).ends_with(mk(3)))
+
+            var s = mk(5)
+            val kept = s.bytes
+
+            s = mk(9)
+            print(kept.len, kept[4], s.bytes[8], s.bytes.len)
+        """,
+        "6 102 3 99 15 111 20 116\n-7.2062 123456789012345 true true false\n5 101 105 9\n")
+
+// -- crossing threads ---------------------------------------------------------------------------------------
+
+@test("ssx_b a short string crosses into a &sync object and a scoped thread as it is, a long one is shared")
+ssx_b_short_crosses_threads()
+    if !ssx_b_ready() then return
+
+    ssx_b_both("""
+        import sysl.threads.scope
+
+        struct Reg
+            a: string
+            b: string
+
+        mk(n: int) -> string = "abcdefghijklmnopqrstuvwxyz"[0..<n].copy()
+
+        main()
+            val r: &sync Reg = Reg(mk(1), mk(16))
+            val job: &sync Fn() -> string = () -> r.a + r.b[0..<14]
+
+            print(job(), r.a, r.b)
+
+            val n = scope((s) ->
+                val h = s.spawn(() -> (r.a + r.b[0..<14]).len + r.b[1..<4].len + r.a[0..<1].len)
+                h.join())
+
+            print(n)
+        """,
+        "aabcdefghijklmn a abcdefghijklmnop\n19\n")
+
+// -- the IR: nothing changes with the form off, and the 32-bit form ---------------------------------------
+
+private val ssx_b_ir_probe = """
+    join2(a: string, b: string) -> string = a + b
+
+    cut(s: string, i: usize) -> string = s[0..<i]
+
+    main()
+        val s = join2("ab", "cd")
+
+        print(s, s.len, cut(s, 2), s.bytes[1])
+    """
+
+@test("ssx_b with the form off no string is read, made or cut through the short form")
+ssx_b_off_emits_no_short_form()
+    if std_root().is_err() then return
+
+    val ir = ssx_b_ir(ssx_b_ir_probe, false, None)
+
+    assert(!ir.contains("sysl.str.short"), "the short producer")
+    assert(!ir.contains("sysl.str.empty"), "the empty constant")
+    assert(!ir.contains(".held"), "a template's short read")
+
+@test("ssx_b with the form on, a 32-bit target holds seven bytes, tagged in the top of a 32-bit length")
+ssx_b_on_at_32_bits()
+    if std_root().is_err() then return
+
+    val ir = ssx_b_ir(ssx_b_ir_probe, true, Some("thumb-freestanding-softfp"))
+
+    assert(ir.contains("@sysl.str.short(ptr %ap, i32 %an, ptr %bp, i32 %bn)"), "the 32-bit producer")
+    assert(ir.contains("%small = icmp ule i32 %total, 7"), "the capacity is 7")
+    assert(ir.contains("getelementptr i8, ptr %slot, i32 11"), "the tag is the twelfth byte")
+    assert(ir.contains("lshr i32 "), "the length read from the top byte")
+    assert(ir.contains("icmp slt i32 "), "the tag read from the top bit")
+
+@test("ssx_b with the form on, a 64-bit host holds fifteen bytes, tagged in the top of a 64-bit length")
+ssx_b_on_at_64_bits()
+    if std_root().is_err() then return
+
+    val ir = ssx_b_ir(ssx_b_ir_probe, true, None)
+
+    assert(ir.contains("%small = icmp ule i64 %total, 15"), "the capacity is 15")
+    assert(ir.contains("getelementptr i8, ptr %slot, i32 23"), "the tag is the twenty-fourth byte")
+    assert(ir.contains("lshr i128 "), "a substring shifts the two words as one")
