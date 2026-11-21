@@ -32,7 +32,7 @@ private uninhabited_at(t: Type, depth: int) -> bool
         Never -> true
         Struct(d) -> any_uninhabited(d.fields, depth + 1)
         Results(parts) -> any_uninhabited(parts.fields, depth + 1)
-        Array(n, elem) -> n > 0 && uninhabited_at(*elem, depth + 1)
+        Array(n, elem, _) -> n > 0 && uninhabited_at(*elem, depth + 1)
         Enum(d) ->
             if d.variants.is_empty() then return false
 
@@ -65,8 +65,8 @@ mentions_abstract(t: Type) -> bool = t match
     Ptr(inner, _) -> mentions_abstract(*inner)
     Ref(inner, _) -> mentions_abstract(*inner)
     Weak(inner) -> mentions_abstract(*inner)
-    Array(_, elem) -> mentions_abstract(*elem)
-    Vector(_, elem) -> mentions_abstract(*elem)
+    Array(_, elem, _) -> mentions_abstract(*elem)
+    Vector(_, elem, _) -> mentions_abstract(*elem)
     Slice(elem, _) -> mentions_abstract(*elem)
     Volatile(inner) -> mentions_abstract(*inner)
     CFn(ps, r, _) -> any_mentions_abstract(ps) || mentions_abstract(*r)
@@ -96,14 +96,17 @@ stand_in_tag(t: Type) -> string = t match
     Ptr(inner, _) -> stand_in_tag(*inner)
     Ref(inner, _) -> stand_in_tag(*inner)
     Weak(inner) -> stand_in_tag(*inner)
-    Array(_, elem) -> stand_in_tag(*elem)
-    Vector(_, elem) -> stand_in_tag(*elem)
+    // A length's form likewise, so `[N]T` and `[M]T` are two.
+    Array(_, elem, term) -> s"${extent_tag(term)}${stand_in_tag(*elem)}"
+    Vector(_, elem, term) -> s"${extent_tag(term)}${stand_in_tag(*elem)}"
     Slice(elem, _) -> stand_in_tag(*elem)
     Volatile(inner) -> stand_in_tag(*inner)
     CFn(ps, r, _) -> s"${tag_list(ps)}${stand_in_tag(*r)}"
     // A value parameter's form, so `Buf[N]` and `Buf[M]` -- both standing at zero -- are two.
-    ConstArg(_, _, _, term) -> if term.is_empty() then "" else s"{=${term_text(term)}}"
+    ConstArg(_, _, _, term) -> extent_tag(term)
     _ -> ""
+
+private extent_tag(term: Buf[Mono]) -> string = if term.is_empty() then "" else s"{=${term_text(term)}}"
 
 private bound_keys(bounds: Buf[Bound]) -> string
     var out = ""
@@ -157,8 +160,8 @@ mentions_unknown(t: Type) -> bool = t match
     Ptr(inner, _) -> mentions_unknown(*inner)
     Ref(inner, _) -> mentions_unknown(*inner)
     Weak(inner) -> mentions_unknown(*inner)
-    Array(_, elem) -> mentions_unknown(*elem)
-    Vector(_, elem) -> mentions_unknown(*elem)
+    Array(_, elem, _) -> mentions_unknown(*elem)
+    Vector(_, elem, _) -> mentions_unknown(*elem)
     Slice(elem, _) -> mentions_unknown(*elem)
     Volatile(inner) -> mentions_unknown(*inner)
     CFn(ps, r, _) -> any_mentions_unknown(ps) || mentions_unknown(*r)
@@ -182,7 +185,7 @@ unqualified(t: Type) -> Type = t match
 // Whether a qualifier is anywhere inside, which is what says an aggregate may not be copied whole.
 volatile_in(t: Type) -> bool = t match
     Volatile(_) -> true
-    Array(_, elem) -> volatile_in(*elem)
+    Array(_, elem, _) -> volatile_in(*elem)
     Struct(d) -> fields_volatile(d.fields)
     Enum(d) -> variants_volatile(d.variants)
     Constrained(d) -> volatile_in(d.base)
@@ -236,8 +239,8 @@ private holds_name_only(t: Type) -> bool = t match
     Ptr(inner, _) -> holds_name_only(*inner)
     Ref(inner, _) -> holds_name_only(*inner)
     Weak(inner) -> holds_name_only(*inner)
-    Array(_, elem) -> holds_name_only(*elem)
-    Vector(_, elem) -> holds_name_only(*elem)
+    Array(_, elem, _) -> holds_name_only(*elem)
+    Vector(_, elem, _) -> holds_name_only(*elem)
     Slice(elem, _) -> holds_name_only(*elem)
     Volatile(inner) -> holds_name_only(*inner)
     CFn(ps, r, _) -> any_name_only(ps) || holds_name_only(*r)
@@ -256,8 +259,8 @@ private stripped_names(t: Type) -> Type = t match
     Ptr(inner, ro) -> Ptr(nameless(*inner), ro)
     Ref(inner, sync) -> Ref(nameless(*inner), sync)
     Weak(inner) -> Weak(nameless(*inner))
-    Array(n, elem) -> Array(n, nameless(*elem))
-    Vector(n, elem) -> Vector(n, nameless(*elem))
+    Array(n, elem, term) -> Array(n, nameless(*elem), term)
+    Vector(n, elem, term) -> Vector(n, nameless(*elem), term)
     Slice(elem, ro) -> Slice(nameless(*elem), ro)
     Volatile(inner) -> Volatile(nameless(*inner))
     CFn(ps, r, k) -> CFn(nameless_all(ps), nameless(*r), k)
@@ -308,7 +311,7 @@ private unique_inside(t: Type, depth: int) -> bool
                     if unique_inside(item.1, depth + 1) then return true
 
             false
-        Array(_, elem) -> unique_inside(*elem, depth + 1)
+        Array(_, elem, _) -> unique_inside(*elem, depth + 1)
         Constrained(d) -> unique_inside(d.base, depth + 1)
         Volatile(inner) -> unique_inside(*inner, depth + 1)
         _ -> false
@@ -320,7 +323,7 @@ contains_counted(t: Type) -> bool = t match
     Weak(_) -> true
     Slice(_, _) -> true
     Str -> true
-    Array(_, elem) -> contains_counted(*elem)
+    Array(_, elem, _) -> contains_counted(*elem)
     // A task holds a share of its coroutine's frame, which is freed when the last share goes.
     Struct(d) -> d.base == TaskBase || struct_fields_counted(d)
     Enum(d) -> variants_counted(d.variants)
@@ -423,8 +426,8 @@ read_only_of(t: Type) -> Type = t match
 
 // The element of anything indexable.
 element(t: Type) -> Option[Type] = t match
-    Array(_, e) -> Some(*e)
-    Vector(_, e) -> Some(*e)
+    Array(_, e, _) -> Some(*e)
+    Vector(_, e, _) -> Some(*e)
     Slice(e, _) -> Some(*e)
     Str -> Some(byte_type())
     Ptr(e, _) -> Some(*e)
@@ -493,7 +496,7 @@ is_numeric(t: Type) -> bool = underlying(t) match
 
 // The type an operator is really applied to: a vector's lane, and otherwise the type itself.
 op_subject(t: Type) -> Type = underlying(t) match
-    Vector(_, lane) -> underlying(*lane)
+    Vector(_, lane, _) -> underlying(*lane)
     other -> other
 
 // Whether an operator on this type computes rather than dispatches.
@@ -580,8 +583,8 @@ has_zero(t: Type) -> bool = t match
     Str -> true
     Weak(_) -> true
     Volatile(inner) -> has_zero(*inner)
-    Array(_, elem) -> has_zero(*elem)
-    Vector(_, elem) -> has_zero(*elem)
+    Array(_, elem, _) -> has_zero(*elem)
+    Vector(_, elem, _) -> has_zero(*elem)
     Struct(d) -> every_field_has_zero(d.fields)
     // A subtype that CHECKS something has none, whether or not its range holds a zero: the rule is
     // the type's, so widening or narrowing a range never changes whether a declaration elsewhere
