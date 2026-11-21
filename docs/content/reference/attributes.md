@@ -3999,7 +3999,7 @@ twice(x: f32) -> f32 = x + x
 ## `@extensions` — a body compiled for instructions the build does not promise
 
 A build uses what its machine guarantees: a row's architecture, plus whatever
-[`codegen.extensions`](/reference/packages/#a-processors-extensions) and `--cpu` add for the whole
+[`codegen.extensions`](/reference/packages/#a-processor-s-extensions) and `--cpu` add for the whole
 image. A CRC, an AES round or a dot product often has an instruction only some processors of that
 architecture have, and a library that wants it cannot make the whole program require it.
 `@extensions` compiles **one function** for them, as Rust's `#[target_feature(enable = "…")]` and
