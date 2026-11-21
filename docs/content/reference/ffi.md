@@ -407,14 +407,11 @@ the build promises. The 256-bit VAES forms and `xar`, whose rotate is an immedia
 `avxvnni` is LLVM's VEX encoding of VNNI; a build for `avx512vnni` and `avx512vl` promises it by
 naming `avxvnni` as well.
 
-```sysl target=aarch64-freestanding
+```sysl
 extern "llvm.aarch64.crypto.aese" aese(state: <16>u8, key: <16>u8) -> <16>u8
 
 @extensions("aes")
 round(state: <16>u8, key: <16>u8) -> <16>u8 = aese(state, key)
-
-@export("main")
-start() -> i32 = 0
 ```
 
 Called from a body that is neither marked nor in a block, the same declaration is refused:
