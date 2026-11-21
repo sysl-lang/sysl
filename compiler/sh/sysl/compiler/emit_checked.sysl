@@ -62,6 +62,51 @@ gen_checked(e: *Emit, op: string, width: Type, ty: Type, v: Val, rhs: Option[Val
         _ -> gap_at(e, s"the integer operation '$op'")
 end gen_checked
 
+// `x.add_carry(y, c)` and `x.sub_borrow(y, c)`: a limb of a multi-word sum or difference. The result is
+// the pair (wrapped value, carry or borrow out), and the carry out is **two `with.overflow` calls
+// joined by an `or`**: the operands' own, then the carry in's. Written as a pair of intrinsics rather
+// than comparisons so the back end sees the add-with-carry shape directly, and the first call does
+// not wait for the carry in.
+gen_carry_op(e: *Emit, op: string, operands: Buf[TExpr], width: Type, ty: Type) -> Val
+    val bits = width match
+        Integer(b, _, _) -> b
+        _ -> return gap_at(e, s"'$op' on ${type_show(width)}")
+
+    val decl = ty match
+        Struct(d) -> d
+        _ -> return gap_at(e, s"'$op' whose answer is not a pair")
+
+    val x = gen_expr(e, operands[0])
+    val y = gen_expr(e, operands[1])
+    val c = gen_expr(e, operands[2])
+    val ll = LInt(bits)
+    val name = if op == "add_carry" then "add" else "sub"
+    val wide = fresh_reg(e)
+
+    emit(e, InCast(wide, CastZExt, l_i1(), c, ll))
+
+    val (s1, o1) = with_overflow(e, name, bits, false, x, y)
+    val (s2, o2) = with_overflow(e, name, bits, false, s1, wide)
+    val out = fresh_reg(e)
+
+    emit(e, InBin(out, OpOr, l_i1(), o1, o2))
+
+    val pair_ty = struct_lty(decl)
+    val a = fresh_reg(e)
+
+    emit(e, InInsert(a, pair_ty, VUndef, lty(e, decl.fields[0].1), s2,
+                     index_list(struct_field_index(e.layout, decl, decl.slot(0)))))
+
+    val b = fresh_reg(e)
+
+    emit(e, InInsert(b, pair_ty, a, lty(e, decl.fields[1].1), out,
+                     index_list(struct_field_index(e.layout, decl, decl.slot(1)))))
+    b
+end gen_carry_op
+
+// Whether `add_carry` or `sub_borrow` is this member name.
+is_carry_member(op: string) -> bool = op == "add_carry" || op == "sub_borrow"
+
 // Whether `checked_*` applies to this member name.
 is_checked_member(op: string) -> bool =
     op == "checked_add" || op == "checked_sub" || op == "checked_mul" || op == "checked_div" ||

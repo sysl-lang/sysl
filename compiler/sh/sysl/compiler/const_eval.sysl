@@ -1873,6 +1873,7 @@ private eval_rest(r: &EvRun, e: TExpr) -> Flow
         // `null` is the one address known before the linker runs, and is held the same way.
         TNullLit(_) -> EvGave(ConstLink(e))
         TDeref(operand, _) -> read_through(r, operand)
+        TCarryOp(op, operands, width, ty) -> carry_member(r, e.span, op, operands, width, ty)
         TIntOp(op, operand, amount, width, ty) ->
             if op == "fixed_bits" || op == "fixed_from_bits" then fixed_bits(r, operand, ty)
             else if op == SubscriptIndexOp then subscript_index(r, operand, ty)
@@ -3578,6 +3579,37 @@ private checked_member(r: &EvRun, at: Span, op: string, operand: TExpr, amount: 
 
     EvGave(ConstRecord(variant_position(ty, variant.unwrap()), parts))
 end checked_member
+
+// `x.add_carry(y, c)` and `x.sub_borrow(y, c)` (`library/sysl/checked.sysl`), evaluated exactly: the
+// true sum or difference with the carry in is computed at no width, and the pair is the low bits of
+// it and whether it left the type's range.
+@noinline
+private carry_member(r: &EvRun, at: Span, op: string, operands: Buf[TExpr], width: Type, ty: Type) -> Flow
+    val bits = width match
+        Integer(b, _, _) -> b
+        _ -> return refuse_form(r, at, s"'$op' is not evaluated while compiling yet")
+
+    var xs: Buf[BigInt] = buf()
+    var carry_in = false
+
+    for i in 0..<operands.len()
+        eval_value(r, operands[i]) match
+            Ok(ConstInt(n)) -> xs.push(n)
+            Ok(ConstBool(b)) -> carry_in = b
+            Ok(_) -> return refuse_form(r, at, s"'$op' is not evaluated while compiling yet")
+            Err(f) -> return f
+
+    if xs.len() != 2 then return refuse_form(r, at, s"'$op' is not evaluated while compiling yet")
+
+    val c = from_int(if carry_in then 1 else 0)
+    val exact = if op == "add_carry" then add(add(xs[0], xs[1]), c) else sub(sub(xs[0], xs[1]), c)
+    val fits = cmp(exact, from_int(0)) >= 0 && cmp(exact, base_max(bits, false)) <= 0
+    var parts: Buf[Const] = buf()
+
+    parts.push(ConstInt(wrap(exact, bits, false)))
+    parts.push(ConstBool(!fits))
+    EvGave(ConstRecord(-1, parts))
+end carry_member
 
 // `x.bits` and `T::Bits(n)`: the same integer, read at the other type.
 @noinline
