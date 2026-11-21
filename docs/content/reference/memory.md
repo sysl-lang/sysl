@@ -4307,9 +4307,13 @@ copy into a counted local or a value built from it takes the count where it keep
 path only. **The local keeps its count, for the whole of its life, where its scope may cut the
 chain**: a write to a field it was read along (through any reference), a call to a function that may
 write one — however deep — or may read a count of it, a release that may run a destructor, a call
-through a closure, a trait object's table or a function value, a foreign call the program cannot
-trust, an `await`, and a write to the root itself, or a use of an owned root that could hand its count
-away. A local read from module storage, or through a `&sync`, is always counted, and so is one named in
+through a C function pointer, a foreign call the program cannot trust, an `await`, and a write to the
+root itself, or a use of an owned root that could hand its count away. **A program sees every closure
+and every trait object it makes**, so a call through a closure or a trait object's table is judged as
+a call to each function the program put at that type — the closures made at that `&Fn` type, the
+functions named as values of it, each implementation erased into that trait — and letting one go runs
+a destructor only where one of them holds a value with one. A library, which may be handed an object
+made elsewhere, cannot see them all: there such a call or release keeps the count. A local read from module storage, or through a `&sync`, is always counted, and so is one named in
 a `defer`, assigned with a compound operator, or whose address is taken. `--explain-borrows` says,
 for each local read out of storage, which way it went and why.
 
@@ -4353,7 +4357,8 @@ What a compiler maintainer needs and a program rarely meets:
   may write other `Buf[u8]`s while a view of it is held. A call through a pointer anywhere in that could
   run anything, so every cast and all module storage count. **A call through a trait object, in a
   program's own build** (`sysl build`, `run`, `test`), runs the method in that slot of each table the
-  program has for the trait — one per type it put behind the trait, and none where it put none — so
+  program has for the trait at the object's arguments — one per type it put behind a `Visit[int]`, not
+  those behind a `Visit[&Node]`, and none where it put none — so
   its reach is those methods' reach, each handed the object as its own type, so a field the trait
   hides (a `Clearer` holding a `&Keep` of owners) counts as an argument would. That holds of a call
   in the frame holding the ref or view as much as of one deep in a callee (a `Display` rendered
