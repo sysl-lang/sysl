@@ -1,0 +1,280 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+import sysl.text.split
+
+// **A failed check is one call to a cold, never-returning stub** (`bounds_fail.sysl`'s `bounds_stop`):
+// the block a check branches to on failure holds `call void @sysl.bounds.fail(...)` and `unreachable`
+// and nothing else of the report, and the stub -- `private`, `cold noinline noreturn` -- makes the
+// report through `sysl_bounds_fail` and then the stop. That keeps the check cheap enough at its site
+// for a small function holding one to inline.
+//
+// The axes: the kind of check (an index, a slice range, a string's character boundary, an integer
+// overflow in a debug build, a partial value's unset field -- the two-text form), the build mode
+// (debug, release) and the level (`-O0`, the default), and what is asserted (the IR's shape, the
+// stub's own text, what the program says and how it stops, and that an optimizer now inlines a
+// function holding checks).
+//
+// Cells skipped, with the reason: `x.(c)` on another variant goes through the same two-text path as
+// the unset field (`two_texts_fail`), so the field stands for both; an enum read from a bitfield
+// (`check_variant`) already reports from inside a private helper of its own, which this does not
+// change; an override of `sysl_bounds_fail` that returns is `tests_bfm_bounds_message.sysl`'s and
+// `tests_tfl_trap_flush.sysl`'s, and a bare-metal build with checks `tests_bmd_build_modes.sysl`'s.
+
+private bfc_ready() -> bool = std_root().is_ok() && clang_available()
+
+private bfc_main(text: string) -> []const (string, string) = [("main.sysl", text)]
+
+// The column of the first byte of `part` in `line`, counting from one.
+private bfc_col(line: string, part: string) -> usize = line.index_of(part).unwrap() + 1
+
+// -- the shape at the check ------------------------------------------------------------------------
+
+// Every call of the stub in `ir` is followed at once by `unreachable`, and there is at least one. No
+// failure block calls the hook or the stop itself: the only call of `sysl_bounds_fail` is the stub's.
+private bfc_shape(ir: string)
+    val lines = split(ir, "\n")
+    var calls = 0
+
+    for i in 0..<lines.len
+        if lines[i].starts_with("  call void @sysl.bounds.fail(")
+            calls += 1
+            assert(i + 1 < lines.len && lines[i + 1] == "  unreachable", s"after '${lines[i]}':\n$ir")
+        end if
+
+    assert(calls > 0, ir)
+    assert_eq(bfc_count(ir, "call void @sysl_bounds_fail("), 1)
+    assert_eq(bfc_count(ir, "define private void @sysl.bounds.fail("), 1)
+    assert(ir.contains("define private void @sysl.bounds.fail(i32 %kind, i64 %a, i64 %b, i64 %n, ptr %at) " +
+                       "cold noinline noreturn {\nentry:\n" +
+                       "  call void @sysl_bounds_fail(i32 %kind, i64 %a, i64 %b, i64 %n, ptr %at)\n" +
+                       "  call void @sysl.trap()\n  unreachable\n}\n"), ir)
+end bfc_shape
+
+private bfc_count(text: string, part: string) -> int
+    var n = 0
+    var rest = text
+
+    loop
+        rest.index_of(part) match
+            None -> return n
+            Some(at) ->
+                n += 1
+                rest = rest[at + part.bytes.len..]
+end bfc_count
+
+@test("an index's failure block is one call to the cold stub and unreachable")
+bfc_index_shape()
+    if !bfc_ready() then return
+
+    bfc_shape(xvr_ir(bfc_main("swap(a: []int, i: int, j: int)\n    val t = a[i]\n    a[i] = a[j]\n" +
+                              "    a[j] = t\n\nvar xs = [1, 2, 3]\nswap(xs[..], 0, 2)\nprint(xs[0])\n")))
+
+@test("a slice range's failure block is one call to the cold stub and unreachable")
+bfc_range_shape()
+    if !bfc_ready() then return
+
+    bfc_shape(xvr_ir(bfc_main("head(xs: []const int, n: int) -> []const int = xs[0..<n]\n\n" +
+                              "val xs = [1, 2, 3]\nprint(head(xs[..], 2).len)\n")))
+
+@test("a string cut's boundary check fails through the same one call")
+bfc_boundary_shape()
+    if !bfc_ready() then return
+
+    val ir = xvr_ir(bfc_main("cut(s: string, n: int) -> string = s[0..<n]\n\nprint(cut(\"héllo\", 1))\n"))
+
+    assert(ir.contains("boundary.bad"), ir)
+    bfc_shape(ir)
+
+@test("a debug build's overflow check fails through the same one call")
+bfc_overflow_shape()
+    if !bfc_ready() then return
+
+    use_overflow_checks(true)
+
+    val ir = xvr_ir(bfc_main("step(a: i32, b: i32) -> i32 = a * b\n\nprint(step(3, 4))\n"))
+
+    use_overflow_checks(false)
+    assert(ir.contains("overflow.bad"), ir)
+    bfc_shape(ir)
+
+@test("a partial value's unset field fails through the same one call")
+bfc_field_unset_shape()
+    if !bfc_ready() then return
+
+    bfc_shape(xvr_ir(bfc_main("struct P\n    x: int\n    y: int\n\nvar p: P::Partial\n\n" +
+                              "p.1 = Some(2)\nprint(P::Make(p).y)\n")))
+
+@test("the stub is the report and the stop, at the target's word and with the target's stop")
+bfc_stub_text()
+    assert_eq(bounds_stub_text(32, "llvm.trap"),
+              "define private void @sysl.bounds.fail(i32 %kind, i32 %a, i32 %b, i32 %n, ptr %at) " +
+              "cold noinline noreturn {\nentry:\n" +
+              "  call void @sysl_bounds_fail(i32 %kind, i32 %a, i32 %b, i32 %n, ptr %at)\n" +
+              "  call void @llvm.trap()\n  unreachable\n}\n")
+
+// -- what it buys: a small function holding checks inlines ----------------------------------------
+
+// The `define` in `out` whose head holds `name`, through its closing brace.
+private bfc_define(out: string, name: string) -> string
+    var body = ""
+    var inside = false
+
+    for l in split(out, "\n")
+        if !inside && l.starts_with("define") && l.contains(name) then inside = true
+
+        if inside
+            body = body + l + "\n"
+
+            if l == "}" then return body
+        end if
+
+    s"no define of $name in:\n$out"
+end bfc_define
+
+// `rot3` holds six checks. With the report and the stop at every check, clang's `-O2` priced it at
+// 280 against a threshold of 225 and kept both calls; with one call to the cold stub it is 190 and
+// both are inlined -- the shape of AWFY Permute's `swap`.
+@test("a function holding six index checks is inlined by -O2 into its caller")
+bfc_checks_do_not_block_inlining()
+    if !bfc_ready() then return
+
+    val ir = xvr_ir(bfc_main("rot3(a: []int, i: int, j: int, k: int)\n    val t = a[i]\n    a[i] = a[j]\n" +
+                             "    a[j] = a[k]\n    a[k] = t\n\nwalk(a: []int, n: int)\n    for i in 0..<n\n" +
+                             "        rot3(a, i, i + 1, i + 2)\n        rot3(a, i + 2, i + 1, i)\n\n" +
+                             "var xs = [1, 2, 3, 4, 5, 6]\nwalk(xs[..], 3)\nprint(xs[0])\n"))
+    val dir = make_temp_dir("sysl-bfc").unwrap()
+    val file = s"$dir/t.ll"
+
+    write_text(file, ir).unwrap()
+
+    val flags = ["-O2", "-S", "-emit-llvm", "-Wno-override-module", "-o", "-", file]
+    val got = capture("clang", flags, "", [], true).unwrap()
+
+    remove_dir_all(dir).unwrap_or(())
+    assert(got.status.ok(), s"clang refused the emitted IR:\n${got.err.unwrap_or("")}")
+
+    // clang quotes a name holding `$`: `@"walk$$sysl"(`.
+    val walk = bfc_define(got.text, "walk$$sysl")
+
+    assert(walk.starts_with("define"), walk)
+    assert(!walk.contains("rot3$$sysl\"(") && !walk.contains("@rot3$$sysl("), walk)
+    // The checks are still there: each failure ends the path (the optimizer may split it out cold).
+    assert(walk.contains("unreachable"), walk)
+end bfc_checks_do_not_block_inlining
+
+// -- what the program says, and how it stops -------------------------------------------------------
+
+// `text` as `main.sysl`, built in the mode `flag` names at `level`, and run: its status, its standard
+// output and its standard error.
+private bfc_run(text: string, flag: string, level: string) -> (Status, string, string)
+    val root = make_temp_dir("sysl-bfc").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    var flags: [1]string = [flag]
+
+    assert_eq(took_search_flag(flags[..], 0), 1)
+
+    val exe = s"$root/built"
+    val built = build_native_program(root, None, None, level, Some(exe))
+
+    reset_search_paths()
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (Status.Exited(-1), "", failure_text(why))
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> (Status.Exited(-1), "", "the program that was built could not be run")
+        Ok(out) -> (out.status, out.text, out.err.unwrap_or(""))
+end bfc_run
+
+// In every mode `modes` names and at both levels: the program prints `before`, then stops on SIGTRAP
+// having written exactly `said` to standard error.
+private bfc_traps(modes: []const string, text: string, before: string, said: string)
+    if !bfc_ready() then return
+
+    for mode in modes
+        for level in ["0", DefaultOptimization]
+            val (state, printed, err) = bfc_run(text, mode, level)
+
+            assert_eq(err, said)
+            assert_eq(printed, before)
+            assert(state == Status.Signalled(5), s"$mode -O$level stopped with $state, having printed '$printed'")
+        end for
+end bfc_traps
+
+private val BfcBoth: [2]string = ["--debug", "--release"]
+
+@test("an index past the end says the same and stops the same, debug and release, at -O0 and the default")
+bfc_index_runs()
+    val line = "    a[i] = a[j]"
+
+    bfc_traps(BfcBoth[..], s"swap(a: []int, i: int, j: int)\n    val t = a[i]\n$line\n    a[j] = t\n\n" +
+                           "var xs = [1, 2, 3]\nswap(xs[..], 0, 2)\nprint(xs[0])\nswap(xs[..], 1, 7)\n" +
+                           "print(\"not reached\")\n",
+              "3\n", s"index 7 out of bounds for length 3 (main.sysl:3:${bfc_col(line, "[j]")})\n")
+
+@test("a slice range past the end says the same and stops the same, debug and release")
+bfc_range_runs()
+    val line = "head(xs: []const int, n: int) -> []const int = xs[0..<n]"
+
+    bfc_traps(BfcBoth[..], s"$line\n\nval xs = [1, 2, 3]\nprint(head(xs[..], 2).len)\n" +
+                           "print(head(xs[..], 9).len)\nprint(\"not reached\")\n",
+              "2\n", s"range 0..<9 out of bounds for length 3 (main.sysl:1:${bfc_col(line, "[0")})\n")
+
+@test("a string cut inside a character says the same and stops the same, debug and release")
+bfc_boundary_runs()
+    val line = "cut(s: string, n: int) -> string = s[0..<n]"
+
+    bfc_traps(BfcBoth[..], s"$line\n\nprint(cut(\"héllo\", 1))\nprint(cut(\"héllo\", 2))\n" +
+                           "print(\"not reached\")\n",
+              "h\n", s"range end 2 is not on a character boundary (main.sysl:1:${bfc_col(line, "[0")})\n")
+
+@test("an overflow in a debug build says the same and stops the same, and a release build wraps")
+bfc_overflow_runs()
+    val line = "step(a: i32, b: i32) -> i32 = a * b"
+    val text = s"$line\n\nprint(step(3, 4))\nprint(step(2147483647, 2))\n"
+    var debug: [1]string = ["--debug"]
+
+    bfc_traps(debug[..], text, "12\n",
+              s"integer overflow: i32 * i32 (main.sysl:1:${bfc_col(line, "a * b")})\n")
+
+    if !bfc_ready() then return
+
+    for level in ["0", DefaultOptimization]
+        val (state, printed, err) = bfc_run(text, "--release", level)
+
+        assert_eq(err, "")
+        assert_eq(printed, "12\n-2\n")
+        assert(state.ok(), s"release -O$level stopped with $state")
+    end for
+end bfc_overflow_runs
+
+@test("a partial value's unset field says the same and stops the same, debug and release")
+bfc_field_unset_runs()
+    if !bfc_ready() then return
+
+    val text = "struct P\n    x: int\n    y: int\n\nvar p: P::Partial\n\np.1 = Some(2)\n" +
+               "print(\"before\")\nprint(P::Make(p).y)\nprint(\"not reached\")\n"
+
+    for mode in BfcBoth
+        for level in ["0", DefaultOptimization]
+            val (state, printed, err) = bfc_run(text, mode, level)
+
+            assert(err.starts_with("'P' was made from a partial value whose field 'P.x' is None (main.sysl:9:"),
+                   err)
+            assert_eq(printed, "before\n")
+            assert(state == Status.Signalled(5), s"$mode -O$level stopped with $state")
+        end for
+end bfc_field_unset_runs

@@ -15,8 +15,10 @@ import sysl.math.bigint.{BigInt, add, cmp, div_rem, from_int, mul, negate, sub, 
 //
 // **The outermost such expression is the one checked**: `enter_literal_arithmetic` marks the
 // analyzer while it is read, so the operators inside it type as before and say nothing of their own.
-// Only literals qualify. A typed value, a `val` or a `const` name anywhere inside keeps the run-time
-// rule, under which integer arithmetic wraps at the declared width (`reference/types.md`).
+// Literals qualify, and so does **an untyped integer constant, which is the literal it stands for**
+// (`untyped_const_read`): `Half * 2` at `const Half = 200` is the 400 that `u8` does not hold, refused
+// as `200 * 2` is. A typed value, a `val` or a constant declared with a type anywhere inside keeps the
+// run-time rule, under which integer arithmetic wraps at the declared width (`reference/types.md`).
 //
 // `~` is the complement at the type's own width -- `~0` at `u32` is 4294967295 -- since that is what
 // the operator means on an unsigned value. **A left shift is a bit operation, as in C and Rust**: the
@@ -27,7 +29,7 @@ import sysl.math.bigint.{BigInt, add, cmp, div_rem, from_int, mul, negate, sub, 
 // division it is, and by a count at or past the width the defined full shift
 // (`reference/expressions.md`).
 enter_literal_arithmetic(cx: &Analyzer, e: Expr) -> bool
-    if cx.in_literal_arithmetic || !literals_only(e) then return false
+    if cx.in_literal_arithmetic || !literals_only(cx, e) then return false
 
     cx.in_literal_arithmetic = true
     true
@@ -140,12 +142,18 @@ private unheld_operand(cx: &Analyzer, l: TExpr, r: TExpr, ty: Type) -> Option[(S
     _ -> None
 
 // Whether an expression is integer literals and the integer operators over them, and nothing else.
-// Parentheses are not a node, so `(1 << 31) - 1` is one.
-literals_only(e: Expr) -> bool = *e.kind match
+// Parentheses are not a node, so `(1 << 31) - 1` is one. An untyped constant counts where its value
+// is an integer; a float one is read as any float arithmetic is.
+literals_only(cx: &Analyzer, e: Expr) -> bool = *e.kind match
     IntLit(_, _, _) -> true
-    Unary(op, operand) -> (op == "-" || op == "~") && literals_only(operand)
-    Binary(op, l, r) -> exact_operator(op) && literals_only(l) && literals_only(r)
+    Ident(_) -> untyped_int_const(cx, e)
+    Field(_, _, _) -> untyped_int_const(cx, e)
+    Unary(op, operand) -> (op == "-" || op == "~") && literals_only(cx, operand)
+    Binary(op, l, r) -> exact_operator(op) && literals_only(cx, l) && literals_only(cx, r)
     _ -> false
+
+private untyped_int_const(cx: &Analyzer, e: Expr) -> bool =
+    untyped_const_read(cx, e) && type_eq(untyped_const_type(cx, e), int_type())
 
 private exact_operator(op: string) -> bool =
     op == "+" || op == "-" || op == "*" || op == "/" || op == "%" || op == "&" || op == "|" ||
