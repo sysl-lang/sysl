@@ -1745,8 +1745,14 @@ staged_args(e: *Emit, args: Buf[TExpr], out: *Buf[IrArg], callee: string) -> Buf
         // the call, and an `@abandons` callee runs after the frame has given everything back.
         val borrows = callee != "" && !e.owned_params.has(owned_key(callee, i)) &&
                       !e.asyncs.has(callee) && !e.abandoning.has(callee)
+
+        // One read out of storage nothing the call does can overwrite needs no count of its own for it
+        // (`plus0_locals.sysl`'s `held_backed`).
+        val held_for = if callee != "" && !lent && !e.layout.indirect(aty) && contains_counted(aty) &&
+                          !held_unless(e, a, written) then held_backed(e, args, i, callee, written, borrows)
+                       else None
         val v = guaranteed_arg(e, a, if asks && quiet_after(e, args, i) then callee else "", written, lent,
-                               borrows)
+                               borrows, held_for)
 
         if e.layout.indirect(aty) || lent
             out.push(ir_arg(LPtr, v))
@@ -1858,11 +1864,15 @@ end changes_nothing
 // **A view of part of a place a borrowed parameter takes is narrowed with no count at all** where what
 // keeps its elements alive already stands for the call (`emit_place.sysl`'s `lent_view`): the count
 // slicing takes would only be given back when the statement ends.
+//
+// **An argument held for its call by its backing takes none either** (`held_for`, from `held_backed`):
+// it is worked out with the place calls on its spine read through with no count of their own.
 private guaranteed_arg(e: *Emit, a: TExpr, callee: string, written: Set[string], lent: bool = false,
-                       borrows: bool = false) -> Val
+                       borrows: bool = false, held_for: Option[Buf[(Span, string)]] = None) -> Val
     val ty = texpr_type(a)
     val big = e.layout.indirect(ty) || lent
-    val still = held_unless(e, a, written) || (big || contains_counted(ty)) && lends_in_place(e, callee, ty)
+    val still = held_for.is_some() || held_unless(e, a, written) ||
+                (big || contains_counted(ty)) && lends_in_place(e, callee, ty)
     // A `@unique` value with a destructor has one owner, so no count of the caller's can stand for
     // it: a reading receiver is lent as it lies (`emit_unique.sysl`).
     val guarantee = contains_counted(ty) && !still && !value_drops(e, ty)
@@ -1871,7 +1881,13 @@ private guaranteed_arg(e: *Emit, a: TExpr, callee: string, written: Set[string],
 
     if big then return indirect_arg(e, a, still, lent && !e.layout.indirect(ty))
 
+    val outer = e.held_args.lent_calls
+
+    e.held_args.lent_calls = held_for.unwrap_or(buf())
+
     val v = gen_expr(e, a)
+
+    e.held_args.lent_calls = outer
 
     if guarantee
         retain_value(e, ty, v)
