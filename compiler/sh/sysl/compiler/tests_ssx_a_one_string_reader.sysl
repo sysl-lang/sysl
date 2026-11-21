@@ -1,0 +1,200 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{entries, read_text}
+import sysl.text.Search
+
+// **One reader of a string's words** (`emit_str.sysl`, "the one reader").
+//
+// A string is three words: an owner, the address of its first byte and its length. Only the owner is
+// ARC's business; the other two say where the bytes are, and the representation may change what they
+// hold only if every read of them is made in one place. So no compiler file but `emit_str.sysl`
+// builds an `InExtract` of a word other than the first, or writes a runtime template that reads a
+// `$str` with `extractvalue` or `getelementptr` -- except at the sites listed here, each of which is
+// shown never to see a string.
+//
+// **A site that may see a string is routed through `str_data`/`str_ptr`/`str_len`, or `view_data`/
+// `view_ptr`/`view_len` for a view of either kind** -- never added to the list.
+
+// What every file but `emit_str.sysl` is allowed to read past a value's first word, with why each
+// site never reads a string. A site appears once for each time it is written.
+private ssx_a_allowed() -> Buf[(string, string)]
+    var out: Buf[(string, string)] = buf()
+
+    // A trait object's two words: the table and the data.
+    out.push(("emit_arc.sysl", "InExtract(b, l_fat(), v, index_list(1))"))
+    out.push(("emit_expr.sysl", "InExtract(d, l_fat(), v, index_list(1))"))
+    out.push(("emit_scalar.sysl", "InExtract(da, l_fat(), av, index_list(1))"))
+    out.push(("emit_scalar.sysl", "InExtract(db, l_fat(), bv, index_list(1))"))
+    out.push(("emit_vtable.sysl", "InExtract(data, l_fat(), obj, index_list(1))"))
+
+    // An overflow intrinsic's `{ value, flag }`.
+    out.push(("emit_box.sysl", "InExtract(ovf, both, pair, index_list(1))"))
+    out.push(("emit_checked.sysl", "InExtract(flag, both, pair, one_index(1))"))
+    out.push(("emit_scalar.sysl", "InExtract(ovf, both, pair, one_index(1))"))
+    out.push(("emit_scalar.sysl", "InExtract(ovf, both, pair, one_index(1))"))
+
+    // A field of a struct, an enum's payload or tag, an `asm` result's part, a vector's lane: a string
+    // held there comes out whole, as one field, and is read by whoever reads it next.
+    out.push(("emit_arc.sysl", "InExtract(f, aggregate, acc, at)"))
+    out.push(("emit_arc.sysl", "InExtract(f, aggregate, value, index_list(llvm_index(gaps, field_slot(fields, i))))"))
+    out.push(("emit_asm.sysl", "InExtract(part, shape, r, index_list(int(i)))"))
+    out.push(("emit_enum.sysl", "InExtract(word, enum_lty(d), value, idx)"))
+    out.push(("emit_enum.sysl",
+              "InExtract(f, variant_lty(d, v), p, index_list(variant_field_index(e.layout, v, v.slot(i))))"))
+    out.push(("emit_pattern.sysl",
+              "InExtract(fv, variant_lty(d, v), payload, index_list(variant_field_index(e.layout, v, v.slot(i))))"))
+    out.push(("emit_place.sysl", "InExtract(r, agg, v, index_list(at))"))
+    out.push(("emit_vector.sysl", "InExtract(lane, fty, v, index_list(i))"))
+    out.push(("arc_fastpath.sysl", "InExtract(tag, arg.ty, arg.value, idx)"))
+
+    // A rewrite that hands every extract on at the indices it was given, reading nothing itself.
+    out.push(("soft_bf16.sysl", "InExtract(d, sb_ty(t), sb_value(agg, t), idx)"))
+
+    // **A view parameter split into its three words** so the middle one can carry `noalias`: each
+    // word is passed on unchanged and put back together in the body, so no byte is read here. A
+    // string parameter is one such view, and where a string may be short no string is split
+    // (`emit_disjoint.sysl`'s `read_string_params` says why).
+    out.push(("emit_disjoint.sysl", "InExtract(taken, p.ty, VReg(s\"$n.param\"), index_list(k))"))
+    out
+end ssx_a_allowed
+
+// Every place in one file's text that reads past a value's first word: each `InExtract` that is
+// built rather than matched on, and does not read word 0; and each line of a runtime template that
+// reads a `$str` with `extractvalue` or `getelementptr`.
+ssx_a_readers(text: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for line in lines_of(text)
+        if line.contains("$str") && (line.contains("extractvalue") || line.contains("getelementptr"))
+            out.push(line)
+            continue
+
+        var from: usize = 0
+
+        loop
+            val found = line[from..<line.bytes.len].index_of("InExtract(")
+
+            if found.is_none() then break
+
+            val at = from + found.unwrap()
+            val call = ssx_a_call(line, at)
+            val after = line[at + call.bytes.len..<line.bytes.len]
+
+            // A match arm's pattern is followed by its arrow; the variant's declaration names types.
+            val built = !after.contains("->") && !call.contains(": ")
+
+            if built && !call.ends_with("index_list(0))") && !call.ends_with("one_index(0))") then out.push(call)
+
+            from = at + call.bytes.len
+        end loop
+
+    out
+end ssx_a_readers
+
+// The call that begins at `at`, up to the parenthesis that closes it (or the end of the line).
+private ssx_a_call(line: string, at: usize) -> string
+    var depth = 0
+
+    for i in at..<line.bytes.len
+        if line.bytes[i] == u8('(') then depth += 1
+
+        if line.bytes[i] == u8(')')
+            depth -= 1
+
+            if depth == 0 then return line[at..<i + 1]
+
+    line[at..<line.bytes.len]
+end ssx_a_call
+
+// Every reader in the compiler's own source outside `emit_str.sysl` and the tests, as its file and
+// its text.
+private ssx_a_found() -> Buf[(string, string)]
+    var out: Buf[(string, string)] = buf()
+    val dir = parent_of(__FILE__).unwrap()
+
+    for name in entries(dir).unwrap()
+        if !name.ends_with(".sysl") || name.starts_with("tests_") || name == "emit_str.sysl" then continue
+
+        for reader in ssx_a_readers(read_text(s"$dir/$name").unwrap())
+            out.push((name, reader))
+
+    out
+end ssx_a_found
+
+@test("no compiler file but emit_str.sysl reads a string's pointer or length, and every listed site is still there")
+ssx_a_one_reader()
+    val allowed = ssx_a_allowed()
+    var used: Buf[bool] = buf()
+
+    for _ in allowed
+        used.push(false)
+
+    var unlisted = ""
+
+    for item in ssx_a_found()
+        var matched = false
+
+        for k in 0..<allowed.len()
+            if !used[k] && allowed[k].0 == item.0 && allowed[k].1 == item.1
+                used[k] = true
+                matched = true
+                break
+
+        if !matched then unlisted = s"$unlisted\n  ${item.0}: ${item.1}"
+
+    var stale = ""
+
+    for k in 0..<allowed.len()
+        if !used[k] then stale = s"$stale\n  ${allowed[k].0}: ${allowed[k].1}"
+
+    assert(unlisted == "", s"read past a value's first word outside emit_str.sysl -- route a string through " +
+                           s"str_data/view_data, or list the site with why it never sees one:$unlisted")
+    assert(stale == "", s"listed in ssx_a_allowed but no longer written -- remove it:$stale")
+end ssx_a_one_reader
+
+@test("the scan finds a direct read of either word, in the lowering and in a runtime template")
+ssx_a_scan_finds_direct_reads()
+    val text = "    emit(e, InExtract(p, lty(e, Str), v, index_list(1)))\n" +
+        "    emit(e, InExtract(n, wty, v, index_list(2)))\n" +
+        "      %src = extractvalue $str %b, 1\n" +
+        "      %bp = getelementptr $str, ptr %t, $word %mid, i32 2\n"
+    val got = ssx_a_readers(text)
+
+    assert_eq(got.len(), 4)
+    assert_eq(got[0], "InExtract(p, lty(e, Str), v, index_list(1))")
+    assert_eq(got[1], "InExtract(n, wty, v, index_list(2))")
+    assert_eq(got[2], "      %src = extractvalue $str %b, 1")
+end ssx_a_scan_finds_direct_reads
+
+@test("the scan passes over the owner word, a match arm and the variant's declaration")
+ssx_a_scan_passes_over_the_rest()
+    val text = "    emit(e, InExtract(o, wty, v, index_list(0)))\n" +
+        "    emit(e, InExtract(v, both, pair, one_index(0)))\n" +
+        "        InExtract(d, _, agg, idx) ->\n" +
+        "    InExtract(dest: Val, ty: LType, agg: Val, indices: Buf[int])\n" +
+        "      %n = extractvalue { ptr, ptr } %c, 1\n"
+
+    assert_eq(ssx_a_readers(text).len(), 0)
+end ssx_a_scan_passes_over_the_rest
+
+@test("a rewrite that matches one extract and builds another on the same line is counted once")
+ssx_a_scan_two_on_a_line()
+    val got = ssx_a_readers("    InExtract(d, t, agg, idx) -> sb_emit(s, InExtract(d, sb_ty(t), agg, idx))\n")
+
+    assert_eq(got.len(), 1)
+    assert_eq(got[0], "InExtract(d, sb_ty(t), agg, idx)")
+
+@test("emit_str.sysl itself is where the reads are, so the exemption covers real ones")
+ssx_a_the_reader_reads()
+    val dir = parent_of(__FILE__).unwrap()
+    val got = ssx_a_readers(read_text(s"$dir/emit_str.sysl").unwrap())
+    var words = 0
+
+    for item in got
+        if item.contains("lty(e, Str)") then words += 1
+
+    // `str_ptr`, `str_len`, and `str_is_short` asking the short form's tag.
+    assert_eq(words, 3)
+end ssx_a_the_reader_reads

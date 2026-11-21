@@ -296,7 +296,8 @@ sides of `v << w` have to agree.
 ### What has arithmetic
 
 Arithmetic is defined on the numeric types and nowhere else. `char` has equality and ordering and no
-arithmetic at all; `bool` has equality, no ordering, and no arithmetic.
+arithmetic at all; `bool` has equality, no ordering, no arithmetic, and the three bitwise operators
+(§ [Bitwise operators on `bool`](#bitwise-operators-on-bool)).
 
 Unary `-` needs a type with a sign, so it applies to the signed integers and the floats; negating an
 unsigned value is written as the subtraction it actually is. Unary `~` is defined on every integer
@@ -653,6 +654,39 @@ false
 The first line calls `bump` **once** although its value is compared twice. The second stops at the
 first comparison that fails, so the `bump(6)` on its right never runs at all.
 
+### A bitwise middle operand has to be parenthesised
+
+Bitwise operators bind tighter than comparisons, so in a chain `a < b | c < d` the `|` is taken first
+and the chain runs **through its result**: `a < (b | c) < d`. That is almost never what was meant —
+two comparisons joined by the `|` — so a chain whose middle operand is an unparenthesised `&`, `|` or
+`^` is **refused**, and parentheses say either reading. This holds for every operand type; the
+operand of a *single* comparison (`x & mask == 0`) and the first or last operand of a chain
+(`a | b < c < d`) are not middle operands and read as they always have.
+
+```sysl
+f(a: int, b: int, c: int, d: int) -> bool = a < b | c < d
+```
+
+```error
+'|' in the middle of a comparison chain binds tighter than the comparisons, so this compares against its result, as in 'a < (b | c) < d'. Parenthesise it to say so, or write the two comparisons apart and join them, as in '(a < b) | (c < d)'
+```
+
+```sysl
+f(a: int, b: int, c: int, d: int) -> unit
+    print(a < (b | c) < d)
+    print((a < b) | (c < d))
+
+f(1, 2, 3, 4)
+```
+
+```output
+true
+true
+```
+
+**Behaviour change in 0.13:** a chain like `a < b | c < d` was accepted before, reading as
+`a < (b | c) < d`. It is now an error; write the parentheses for the reading the code has.
+
 ### A vector comparison is not a chain
 
 Comparing two [vectors](/reference/vectors/) yields a mask rather than a `bool`, and a chain of them
@@ -707,6 +741,43 @@ where it is written, is marked
 
 `&&` and `||` take `bool` and short-circuit; `!` is prefix on a `bool`. Nothing coerces to `bool`, so
 there is no integer-as-condition rule and no `if (p)` idiom — write `p != null`.
+
+### Bitwise operators on `bool`
+
+`&`, `|` and `^` take two `bool`s and answer a `bool`, and so do `&=`, `|=` and `^=`. **They do not
+short-circuit: both sides are always evaluated**, as in Rust, which is what tells them from `&&` and
+`||`. They keep the precedence of the bitwise operators (levels 7 to 9): tighter than `&&` and `||`
+and tighter than a comparison, so `a | b != c` is `(a | b) != c`. Use them where the right side must
+run for its effect or where a branch is not wanted; `&&` and `||` stay the way to guard one condition
+with another.
+
+```sysl
+var calls = 0
+
+hit(v: bool) -> bool
+    calls += 1
+    v
+
+val a = hit(false) & hit(true)
+val b = hit(false) && hit(true)
+
+print(a, b, calls)
+
+var seen = false
+
+seen |= hit(true)
+seen ^= hit(true)
+print(seen, calls)
+```
+
+```output
+false false 3
+false 5
+```
+
+Nothing else changes: `+`, `<<` and the rest stay undefined on `bool`, and `a & b` between a `bool` and
+an integer is the usual mismatch. A mask of `<N>bool` lanes has had these three since
+[vectors](/reference/vectors/), lane by lane.
 
 ## Ranges
 

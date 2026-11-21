@@ -1524,7 +1524,9 @@ lanes that exist. Write a scalar tail, as the kernel above does.
 **A place in a C signature.** A vector may not be passed to or returned from a C function. The
 register it would occupy differs by target and by the instruction-set extensions the C side was
 compiled with, and a mismatch would produce a call that links but corrupts its arguments. Pass the
-lanes through memory instead — a `*f32` and a count, as C's own SIMD functions usually take:
+lanes through memory instead — a `*f32` and a count, as C's own SIMD functions usually take. (An
+`extern` naming an AES, SHA-3 or dot-product instruction is the exception: the back end hands it
+registers directly, so [its signature is vectors](/reference/ffi/#a-link-name-in-the-llvm-namespace-names-an-instruction).)
 
 ```sysl
 extern "process_lanes" process(v: <4>f32) -> unit

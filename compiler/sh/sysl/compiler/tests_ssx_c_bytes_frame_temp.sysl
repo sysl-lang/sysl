@@ -1,0 +1,510 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{Var, capture}
+import sysl.text.join
+
+// **`s.bytes` of a string that may be short is a slot of the frame** (`docs/design/short-strings.md
+// § 5.4`, `emit_str.sysl`'s `gen_bytes`, `escape.sysl`'s `bytes_temp`): a view lent to a call,
+// iterated, indexed or held in a local reads a copy of the value laid in the frame and costs nothing;
+// a view returned, stored on the heap, kept by a `@keeps` C parameter, or held across rounds of a loop
+// that takes it again is `sysl.str.unshort`'s heap copy. A literal, a cut of one and `str_view` are
+// their own view. Under `@no_alloc` the heap copy is refused.
+//
+// Every program runs with the form off and on, on the counted heap: both print the same thing, which
+// is asserted, and both give back every allocation. The lengths are the design's axis -- 0, 1, 14,
+// 15 (the capacity), 16 -- and 15 and 16 bytes ending in a two-byte character.
+//
+// Skipped cells, with the reason: running a 32-bit program (no 32-bit runner here; the 32-bit form is
+// checked by its IR for a thumb target); LTO (the choice between the slot and the heap copy is made
+// before LLVM sees the body, and `--release` already runs the optimized slot reads); `async` (a slot
+// live across `await` is a coroutine frame's alloca, which LLVM moves into the frame like any other).
+
+private struct SsxRun
+    ok: bool
+    out: string
+    err: string
+
+private ssx_c_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end ssx_c_ready
+
+// The program built on the counted heap at `level`, with the short form `short` or not, and run with
+// `env`. A refusal is the build's message, with `ok` false.
+private ssx_c_run(text: string, short: bool, level: string, env: []const Var) -> SsxRun
+    val root = make_temp_dir("sysl-ssx-c").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    force_alloc_counting(true)
+    force_short_strings(short)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, level, Some(s"$root/built"))
+
+    force_short_strings(false)
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return SsxRun(false, failure_text(why), "")
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", env, true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> SsxRun(false, "could not be started", "")
+        Ok(o) -> SsxRun(o.status.ok(), o.text, o.err.unwrap_or(""))
+end ssx_c_run
+
+// The program run with the form off and on, in debug and at `-O3` with the form on: every run prints
+// `want` and gives back every allocation.
+private ssx_c_all(text: string, want: string)
+    for run_of in [(false, DefaultOptimization), (true, DefaultOptimization), (true, "3")]
+        val run = ssx_c_run(text, run_of.0, run_of.1, [])
+        val what = s"short=${run_of.0} -O${run_of.1}"
+
+        assert(run.ok, s"$what: ${run.out} ${run.err}")
+        assert_eq(run.out, want, what)
+        assert_eq(alloc_count_reported(run.err), 0, s"$what: ${run.err}")
+end ssx_c_all
+
+// The bytes a program allocated in all, with the form `short` or not.
+private ssx_c_bytes(text: string, short: bool) -> long
+    val run = ssx_c_run(text, short, DefaultOptimization, [Var(alloc_bytes_variable(), "1")])
+
+    assert(run.ok, s"short=$short: ${run.out} ${run.err}")
+    alloc_bytes_reported(run.err)
+end ssx_c_bytes
+
+// The IR of a program, with the form `short` or not, for `target` (or the host), and whether it was
+// accepted.
+private ssx_c_emit(text: string, short: bool, target: Option[string]) -> (int, string)
+    val root = make_temp_dir("sysl-ssx-c").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+
+    force_short_strings(short)
+
+    val code = target match
+        Some(t) -> run_cli(["sysl", "emit-llvm", s"$root/main.sysl", "--target", t], (line) -> sink.push(line))
+        None -> run_cli(["sysl", "emit-llvm", s"$root/main.sysl"], (line) -> sink.push(line))
+
+    force_short_strings(false)
+    remove_dir_all(root).unwrap_or(())
+
+    (code, join(lines.view(), "\n"))
+end ssx_c_emit
+
+private ssx_c_ir(text: string, short: bool, target: Option[string]) -> string
+    val got = ssx_c_emit(text, short, target)
+
+    assert_eq(got.0, 0, got.1)
+    got.1
+end ssx_c_ir
+
+// What `--explain-escapes` says about the program's own file, with the form on.
+private ssx_c_notes(text: string) -> Buf[string]
+    val root = make_temp_dir("sysl-ssx-c").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    var out: Buf[string] = buf()
+
+    force_short_strings(true)
+
+    packaged_compilation_of(root, host_target()) match
+        Err(why) -> assert(false, failure_text(why))
+        Ok(program) ->
+            val done = analyze_bodies(program.units, program.target)
+            val whole = program_of(done, done.main_module)
+            val moved = post_analysis_checks(done.an, whole, program.own)
+
+            assert(errors_of(done.an.diagnostics()).is_empty())
+
+            for item in moved.notes
+                if item.0.ends_with("main.sysl") then out.push(item.1)
+
+    force_short_strings(false)
+    remove_dir_all(root).unwrap_or(())
+    out
+end ssx_c_notes
+
+// The sum of the first `n` letters' bytes, which is what every view of `mk(n)` totals to.
+private ssx_c_total(n: int) -> int = 97 * n + n * (n - 1) / 2
+
+// -- every way a view of the bytes is used, at every length ----------------------------------------------
+
+private val ssx_c_uses = """
+    import sysl.buf.{Buf, buf}
+
+    struct Held
+        b: []const u8
+
+    total(b: []const u8) -> int
+        var t = 0
+
+        for x in b
+            t += int(x)
+
+        t
+    end total
+
+    show(tag: string, b: []const u8)
+        print(s"$tag ${b.len} ${total(b)}")
+
+    mk(n: int) -> string = "abcdefghijklmnopqrstuvwxyz"[0..<n].copy()
+
+    view_of(s: string) -> []const u8 = s.bytes
+
+    boxed(s: string) -> &Held = Held(s.bytes)
+
+    main()
+        var kept: Buf[[]const u8] = buf()
+
+        for n in [0, 1, 14, 15, 16]
+            val s = mk(n)
+
+            show("lent", s.bytes)
+            print(if n > 0 then int(s.bytes[n - 1]) else 0)
+
+            var it = 0
+
+            for x in s.bytes
+                it += int(x)
+
+            print(it)
+            show("ret", view_of(mk(n)))
+
+            val h = boxed(mk(n))
+
+            show("box", h.b)
+            kept.push(mk(n).bytes)
+
+            var v = mk(n)
+            val b = v.bytes
+
+            v = mk(26 - n)
+            show("held", b)
+
+            var outer = "".bytes
+
+            if n >= 0
+                val inner = mk(n)
+
+                outer = inner.bytes
+
+            show("scope", outer)
+        end for
+
+        for b in kept
+            show("buf", b)
+
+        var prev = "".bytes
+        var cur = "".bytes
+
+        for n in [3, 5, 7]
+            prev = cur
+            cur = mk(n).bytes
+
+        show("prev", prev)
+        show("cur", cur)
+
+        for w in [mk(13) + "é", mk(14) + "é"]
+            show("wide", w.bytes)
+            show("wret", view_of(w))
+    """
+
+private ssx_c_uses_want() -> string
+    var out = ""
+
+    for n in [0, 1, 14, 15, 16]
+        val t = ssx_c_total(n)
+        val last = if n > 0 then 96 + n else 0
+
+        out += s"lent $n $t\n$last\n$t\nret $n $t\nbox $n $t\nheld $n $t\nscope $n $t\n"
+
+    for n in [0, 1, 14, 15, 16]
+        out += s"buf $n ${ssx_c_total(n)}\n"
+
+    out += s"prev 5 ${ssx_c_total(5)}\ncur 7 ${ssx_c_total(7)}\n"
+    out += s"wide 15 ${ssx_c_total(13) + 364}\nwret 15 ${ssx_c_total(13) + 364}\n"
+    out += s"wide 16 ${ssx_c_total(14) + 364}\nwret 16 ${ssx_c_total(14) + 364}\n"
+    out
+end ssx_c_uses_want
+
+@test("ssx_c .bytes lent, iterated, indexed, held, returned, boxed, pushed, reassigned and kept across rounds, at every length")
+ssx_c_every_use_at_every_length()
+    if !ssx_c_ready() then return
+
+    ssx_c_all(ssx_c_uses, ssx_c_uses_want())
+
+// A module initializer is laid down by the entry but never walked by the escape analysis, so its
+// `.bytes` is never taken into a slot: the view outlives every frame. Its heap copy is held for the
+// life of the program, which is why only the output is asserted here.
+@test("ssx_c a module val holding .bytes of a short string reads its bytes after the entry's frame moved on")
+ssx_c_module_val_keeps_a_copy()
+    if !ssx_c_ready() then return
+
+    for short in [false, true]
+        val run = ssx_c_run("""
+            mk(n: int) -> string = "abcdefghijklmnopqrstuvwxyz"[0..<n].copy()
+
+            val held: []const u8 = mk(4).bytes
+
+            churn(n: int) -> int
+                val s = mk(n)
+
+                int(s.bytes[0]) + int(s.bytes.len)
+            end churn
+
+            main()
+                print(churn(9) + churn(2), held.len, held[3])
+            """, short, DefaultOptimization, [])
+
+        assert(run.ok, s"short=$short: ${run.out} ${run.err}")
+        assert_eq(run.out, "205 4 100\n", s"short=$short")
+
+// -- .chars and char_indices, walked and returned ---------------------------------------------------------
+
+@test("ssx_c .chars and char_indices of a short string, walked in a loop and returned from a function")
+ssx_c_chars_walked_and_returned()
+    if !ssx_c_ready() then return
+
+    ssx_c_all("""
+        import sysl.text.{Chars, CharIndices, char_indices}
+
+        mk(n: int) -> string = "abcdefghijklmnopqrstuvwxyz"[0..<n].copy()
+
+        chars_back(s: string) -> Chars = s.chars
+
+        indices_back(s: string) -> CharIndices = char_indices(s.bytes)
+
+        main()
+            for s in [mk(0), mk(1), mk(14), mk(15), mk(16), mk(13) + "é", mk(14) + "é"]
+                var n = 0
+
+                for c in s.chars
+                    if c != '?' then n += 1
+
+                var last = 0
+
+                for p in char_indices(s.bytes)
+                    last = int(p.0)
+
+                var m = 0
+
+                for c in chars_back(s.copy())
+                    if c != '?' then m += 1
+
+                var q = 0
+
+                for p in indices_back(s.copy())
+                    q = int(p.0)
+
+                print(n, last, m, q)
+            end for
+        """,
+        "0 0 0 0\n1 0 1 0\n14 13 14 13\n15 14 15 14\n16 15 16 15\n14 13 14 13\n15 14 15 14\n")
+
+// -- what pays nothing, and what is copied -------------------------------------------------------------------
+
+@test("ssx_c printing a thousand short strings allocates nothing with the form on")
+ssx_c_print_allocates_nothing()
+    if !ssx_c_ready() then return
+
+    val text = """
+        main()
+            val src = "abcdefghij"
+
+            for i in 0..<1000
+                print(src[i % 5..<i % 5 + 5].copy())
+        """
+
+    val off = ssx_c_bytes(text, false)
+    val on = ssx_c_bytes(text, true)
+
+    assert(off >= 1000 * 5, s"off: $off")
+    assert(on < 1000, s"on: $on, off: $off")
+
+private val ssx_c_lent_probe = """
+    total(b: []const u8) -> int
+        var t = 0
+
+        for x in b
+            t += int(x)
+
+        t
+    end total
+
+    mk(n: int) -> string = "abcdefghijklmnopqrstuvwxyz"[0..<n].copy()
+
+    main()
+        var s = mk(5)
+        val b = s.bytes
+
+        s = mk(3)
+        print(total(b), total(s.bytes), s.bytes[1], b.len)
+    """
+
+private val ssx_c_kept_probe = """
+    view_of(s: string) -> []const u8 = s.bytes
+
+    main()
+        print(view_of("abcdefghij"[0..<5].copy()).len)
+    """
+
+@test("ssx_c a .bytes lent or held in the frame is the slot, and only a returned one is copied")
+ssx_c_only_the_returned_view_is_copied()
+    if std_root().is_err() then return
+
+    assert(!ssx_c_ir(ssx_c_lent_probe, true, None).contains("sysl.str.unshort"), "lent")
+    assert(ssx_c_ir(ssx_c_kept_probe, true, None).contains("call { ptr, ptr, i64 } @sysl.str.unshort("),
+           "returned")
+
+    for probe in [ssx_c_lent_probe, ssx_c_kept_probe]
+        assert(!ssx_c_ir(probe, false, None).contains("sysl.str.unshort"), "the form off")
+
+@test("ssx_c with the form on, a 32-bit target takes a lent .bytes into the frame and copies a returned one")
+ssx_c_on_at_32_bits()
+    if std_root().is_err() then return
+
+    val target = Some("thumb-freestanding-softfp")
+
+    assert(!ssx_c_ir(ssx_c_lent_probe, true, target).contains("sysl.str.unshort"), "lent")
+    assert(ssx_c_ir(ssx_c_kept_probe, true, target).contains("call { ptr, ptr, i32 } @sysl.str.unshort("),
+           "returned")
+
+@test("ssx_c a .bytes handed to an extern is copied only where the extern says '@keeps'")
+ssx_c_keeps_extern_copies()
+    if std_root().is_err() then return
+
+    val lent = """
+        extern look(b: []const u8)
+
+        main()
+            look("abcdefghij"[0..<5].copy().bytes)
+        """
+    val kept = """
+        @keeps(b)
+        extern hold(b: []const u8)
+
+        main()
+            hold("abcdefghij"[0..<5].copy().bytes)
+        """
+
+    assert(!ssx_c_ir(lent, true, None).contains("sysl.str.unshort"), "borrowed")
+    assert(ssx_c_ir(kept, true, None).contains("@sysl.str.unshort("), "kept")
+
+@test("ssx_c the bytes of a literal, a cut of one and a str_view are their own view, never a slot or a copy")
+ssx_c_known_long_is_its_own_view()
+    if std_root().is_err() then return
+
+    val ir = ssx_c_ir("""
+        import sysl.text.str_view
+
+        lit() -> []const u8 = "abc".bytes
+
+        cut() -> []const u8 = "abcdef"[1..<4].bytes
+
+        viewed(b: []u8) -> []const u8 = str_view(b).bytes
+
+        main()
+            var a: [3]u8 = [97, 98, 99]
+
+            print(lit().len, cut().len, viewed(a[..]).len)
+        """, true, None)
+
+    assert(!ir.contains("sysl.str.unshort"), "no copy")
+
+// -- @no_alloc ---------------------------------------------------------------------------------------------------
+
+private val ssx_c_no_alloc_ok = """
+    total(b: []const u8) -> int
+        var t = 0
+
+        for x in b
+            t += int(x)
+
+        t
+    end total
+
+    @no_alloc
+    lit_view() -> []const u8 = "abc".bytes
+
+    @no_alloc
+    cut_view() -> []const u8 = "abcdef"[1..<4].bytes
+
+    @no_alloc
+    lent(s: string) -> int = total(s.bytes)
+
+    main()
+        print(lit_view().len, cut_view()[0], lent("abcdefghij"[0..<3]))
+    """
+
+@test("ssx_c @no_alloc takes a literal's bytes, a cut of a literal's, and a lent .bytes of a parameter")
+ssx_c_no_alloc_accepts_what_never_copies()
+    if !ssx_c_ready() then return
+
+    ssx_c_all(ssx_c_no_alloc_ok, "3 98 294\n")
+
+private val ssx_c_no_alloc_refused = """
+    @no_alloc
+    param_view(s: string) -> []const u8 = s.bytes
+
+    main()
+        print(param_view("abcdefgh"[0..<3]).len)
+    """
+
+@test("ssx_c @no_alloc refuses a .bytes of a parameter that is returned, where the form is on")
+ssx_c_no_alloc_refuses_a_kept_parameter_view()
+    if !ssx_c_ready() then return
+
+    val off = ssx_c_run(ssx_c_no_alloc_refused, false, DefaultOptimization, [])
+
+    assert(off.ok, off.out)
+    assert_eq(off.out, "3\n")
+
+    val on = ssx_c_run(ssx_c_no_alloc_refused, true, DefaultOptimization, [])
+
+    assert(!on.ok, on.out)
+    assert(on.out.contains("this view of 's.bytes' is returned, and the string may hold its bytes in " +
+                           "itself, so they would be copied to the heap to outlive the frame — and " +
+                           "this module declared '@no_alloc', so there is nothing to copy them into. " +
+                           "Keep the view inside the frame, take the bytes from a caller as a " +
+                           "'[]const u8' parameter, or take them of a literal, whose bytes are never " +
+                           "held in the string"), on.out)
+
+// -- --explain-escapes ---------------------------------------------------------------------------------------
+
+@test("ssx_c --explain-escapes names a copied .bytes and the route its view took out")
+ssx_c_explain_escapes_names_the_copy()
+    if std_root().is_err() then return
+
+    val notes = ssx_c_notes(raw"""
+        view_of(s: string) -> []const u8 = s.bytes
+
+        lent(s: string) -> int = int(s.bytes.len)
+
+        main()
+            print(view_of("abcdefghij"[0..<5].copy()).len, lent("ab".copy()))
+        """)
+
+    assert_eq(notes.len(), 1)
+    assert(notes[0].ends_with("main.sysl:1:38: 's.bytes' is the bytes of a string that may be held in " +
+                              "the string itself, so it is copied to the heap, because this view of it " +
+                              "is returned"), notes[0])
