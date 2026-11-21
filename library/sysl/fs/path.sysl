@@ -25,8 +25,10 @@ private const dir_mode: u32 = 0o777
  */
 private const name_room: usize = 1024
 
-/** A path as the two halves `sysl.fs.sys` takes it in. */
-private[sysl] bytes_at(path: string) -> *u8 = as_ptr(path.bytes)
+// A path is handed to `sysl.fs.sys` as `as_ptr(path.bytes), path.bytes.len`, written at the call: the
+// bytes of a string of 15 bytes or fewer may be a slot of the frame that takes them
+// (`docs/design/short-strings.md § 5.4`), so a pointer to them is good for the call that frame makes
+// and never for the caller of a helper that took it.
 
 /** Whether there is anything at all at this path.
  *
@@ -35,11 +37,11 @@ private[sysl] bytes_at(path: string) -> *u8 = as_ptr(path.bytes)
  * be told from absence without a second call whose answer would already be stale, and every caller
  * that matters -- one about to open the file -- gets the truth from the open.
  */
-exists(path: string) -> bool = fsys.access(bytes_at(path), path.bytes.len, fsys.access_exists) == 0
+exists(path: string) -> bool = fsys.access(as_ptr(path.bytes), path.bytes.len, fsys.access_exists) == 0
 
-readable(path: string) -> bool = fsys.access(bytes_at(path), path.bytes.len, fsys.access_read) == 0
+readable(path: string) -> bool = fsys.access(as_ptr(path.bytes), path.bytes.len, fsys.access_read) == 0
 
-writable(path: string) -> bool = fsys.access(bytes_at(path), path.bytes.len, fsys.access_write) == 0
+writable(path: string) -> bool = fsys.access(as_ptr(path.bytes), path.bytes.len, fsys.access_write) == 0
 
 /** Whether the path names a directory, asked of `stat` -- which follows a symbolic link, as every
  * other question here does. A directory the program may not read or search is still a directory;
@@ -57,7 +59,7 @@ is_dir(path: string) -> bool = metadata(path) match
 private opens_as_dir(path: string) -> bool
     var d: usize = 0
 
-    if fsys.opendir(bytes_at(path), path.bytes.len, &d) != 0 then return false
+    if fsys.opendir(as_ptr(path.bytes), path.bytes.len, &d) != 0 then return false
 
     fsys.closedir(d)
     true
@@ -99,7 +101,7 @@ end entries
  */
 entry_bytes(path: string) -> Result[Buf[[]u8], IoError]
     var d: usize = 0
-    val opened = fsys.opendir(bytes_at(path), path.bytes.len, &d)
+    val opened = fsys.opendir(as_ptr(path.bytes), path.bytes.len, &d)
 
     if opened != 0 then return Err(from_status(opened))
 
@@ -161,19 +163,19 @@ end size_of
  * separators, and where a separator *is* is a question about paths rather than about the
  * filesystem, which this module does not answer.
  */
-make_dir(path: string) -> Result[unit, IoError] = answered(fsys.mkdir(bytes_at(path), path.bytes.len, dir_mode))
+make_dir(path: string) -> Result[unit, IoError] = answered(fsys.mkdir(as_ptr(path.bytes), path.bytes.len, dir_mode))
 
 /** Removes a file, and refuses a directory rather than removing it: `unlink` is the call that draws
  * that line, where C's own `remove` quietly does either. Two names for two intentions is what lets
  * a program that meant one of them find out it had the other.
  */
-remove_file(path: string) -> Result[unit, IoError] = answered(fsys.unlink(bytes_at(path), path.bytes.len))
+remove_file(path: string) -> Result[unit, IoError] = answered(fsys.unlink(as_ptr(path.bytes), path.bytes.len))
 
 /** Removes a directory, which has to be empty. A directory with anything in it reports
  * `DirectoryNotEmpty` -- the one error code in the set whose number the two platforms disagree
  * about, which is why `error.sysl` reads it through a call rather than a literal.
  */
-remove_dir(path: string) -> Result[unit, IoError] = answered(fsys.rmdir(bytes_at(path), path.bytes.len))
+remove_dir(path: string) -> Result[unit, IoError] = answered(fsys.rmdir(as_ptr(path.bytes), path.bytes.len))
 
 /** Moves a path to another name, replacing whatever was at the destination.
  *
@@ -182,4 +184,4 @@ remove_dir(path: string) -> Result[unit, IoError] = answered(fsys.rmdir(bytes_at
  * and worth knowing, since a program moving a file across devices has to read and write it itself.
  */
 rename(from: string, to: string) -> Result[unit, IoError] =
-    answered(fsys.rename(bytes_at(from), from.bytes.len, bytes_at(to), to.bytes.len))
+    answered(fsys.rename(as_ptr(from.bytes), from.bytes.len, as_ptr(to.bytes), to.bytes.len))

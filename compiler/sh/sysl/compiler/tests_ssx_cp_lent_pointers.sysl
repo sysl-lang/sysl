@@ -1,0 +1,178 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{Var, capture}
+
+// **A raw pointer to the bytes of a string that may be short is good only in the frame that took the
+// `.bytes`** (`docs/design/short-strings.md § 5.4`): with the short form on, those bytes are a slot of
+// that frame, and a pointer counts nothing, so a helper that answers `as_ptr(s.bytes)` -- or a struct
+// carrying it -- hands its caller a pointer into a frame that has returned. The library did exactly
+// that in two places: `sysl.fs`'s `bytes_at(path)`, behind every path a filesystem call takes, and
+// `sysl.process`'s `lent(s)` and `exec`'s loop, behind every argument and environment line a child is
+// started with. A compiler built with the form on spawned clang with garbage for its arguments.
+//
+// The library now writes `as_ptr(path.bytes)` at the call that lends it, and holds the `.bytes` of
+// every argument in a `Buf[[]const u8]` -- each pushed view a counted copy -- for as long as the texts
+// made of them are lent.
+//
+// Every program is built with the form off and on, and at `-O3` with it on, on the counted heap; the
+// strings are made at run time (`.copy()` of a cut) so that they may be short, at 1, 2, 5, 14 and 16
+// bytes. Skipped cells, with the reason: a 32-bit target (no 32-bit runner here, and the library code
+// is the same at every width); `sysl.net` (its `as_ptr(host.bytes)` is written at the call already).
+
+private struct SsxCpRun
+    ok: bool
+    out: string
+    err: string
+
+private ssx_cp_run(text: string, short: bool, level: string, env: []const Var) -> SsxCpRun
+    val root = make_temp_dir("sysl-ssx-cp").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    force_alloc_counting(true)
+    force_short_strings(short)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, level, Some(s"$root/built"))
+
+    force_short_strings(false)
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return SsxCpRun(false, failure_text(why), "")
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", env, true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> SsxCpRun(false, "could not be started", "")
+        Ok(o) -> SsxCpRun(o.status.ok(), o.text, o.err.unwrap_or(""))
+end ssx_cp_run
+
+// The program run with the form off and on, and at `-O3` with it on: each prints `want` and, where
+// `counted`, gives back every allocation.
+private ssx_cp_all(text: string, want: string, env: []const Var, counted: bool)
+    for run_of in [(false, DefaultOptimization), (true, DefaultOptimization), (true, "3")]
+        val run = ssx_cp_run(text, run_of.0, run_of.1, env)
+        val what = s"short=${run_of.0} -O${run_of.1}"
+
+        assert(run.ok, s"$what: ${run.out} ${run.err}")
+        assert_eq(run.out, want, what)
+
+        if counted then assert_eq(alloc_count_reported(run.err), 0, s"$what: ${run.err}")
+end ssx_cp_all
+
+private ssx_cp_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end ssx_cp_ready
+
+@test("ssx_cp a child is started with every short argument and environment line it was given")
+ssx_cp_spawn_lends_short_arguments()
+    if !ssx_cp_ready() then return
+
+    ssx_cp_all("""
+        import sysl.process.{Var, capture}
+
+        made(from: string, n: int) -> string = from[0..<n].copy()
+
+        main()
+            val out = capture(made("/bin/sh", 7), [made("-c", 2), made("echo $AB $CD $1 $2 $3", 21),
+                              made("sh", 2), made("x", 1), made("0123456789abcd", 14),
+                              made("0123456789abcdef", 16)],
+                              "", [Var(made("AB", 2), made("q", 1)), Var(made("CD", 2), made("rstuv", 5))])
+                              .unwrap()
+
+            print(out.text.trim())
+        """, "q rstuv x 0123456789abcd 0123456789abcdef\n", [], true)
+
+@test("ssx_cp exec becomes the program with every short argument and environment line it was given")
+ssx_cp_exec_lends_short_arguments()
+    if !ssx_cp_ready() then return
+
+    // A program that becomes another never returns to give its allocations back, so only what it
+    // prints is asserted.
+    ssx_cp_all("""
+        import sysl.process.{Var, exec}
+
+        made(from: string, n: int) -> string = from[0..<n].copy()
+
+        main()
+            exec(made("/bin/sh", 7), [made("-c", 2), made("echo $AB $1 $2", 14), made("sh", 2),
+                 made("x", 1), made("0123456789abcdef", 16)], [Var(made("AB", 2), made("q", 1))])
+            print("not replaced")
+        """, "q x 0123456789abcdef\n", [], false)
+
+@test("ssx_cp every filesystem call takes a short path where it is lent")
+ssx_cp_paths_are_lent_where_they_are_taken()
+    if !ssx_cp_ready() then return
+
+    ssx_cp_all("""
+        import sysl.env.get
+        import sysl.fs.{exists, is_dir, make_dir, make_temp_dir, read_link, read_text, remove_dir,
+                        remove_dir_all, remove_file, rename, set_current_dir, set_permissions, symlink,
+                        truncate, write_text}
+
+        made(from: string, n: int) -> string = from[0..<n].copy()
+
+        main()
+            print(get(made("AB", 2)).unwrap_or("none"))
+
+            val root = make_temp_dir(made("ssxcp", 5)).unwrap()
+
+            set_current_dir(root).unwrap()
+            make_dir(made("d1", 2)).unwrap()
+            rename(made("d1", 2), made("d2", 2)).unwrap()
+            print(exists(made("d1", 2)), is_dir(made("d2", 2)))
+            remove_dir(made("d2", 2)).unwrap()
+            write_text(made("f", 1), "hello").unwrap()
+            set_permissions(made("f", 1), 0o600).unwrap()
+            truncate(made("f", 1), 4).unwrap()
+            symlink(made("f", 1), made("l", 1)).unwrap()
+            print(read_link(made("l", 1)).unwrap(), read_text(made("l", 1)).unwrap())
+            remove_file(made("l", 1)).unwrap()
+            remove_file(made("f", 1)).unwrap()
+            print(exists(made("f", 1)))
+            set_current_dir(made("/", 1)).unwrap()
+            remove_dir_all(root).unwrap()
+        end main
+        """, "q\nfalse true\nf hell\nfalse\n", [Var("AB", "q")], true)
+
+// **The language question this item leaves open** (reported, not decided here): user code shaped as
+// the library's was -- a helper answering a pointer into `s.bytes` -- reads a dead frame with the form
+// on. The escape analysis can see it (a pointer, a struct of one, taken from a `.bytes` slot), but no
+// storage it could give the bytes outlives the call: a heap copy is counted by the view that is
+// dropped with the statement, so the pointer would dangle into the heap instead. Whether such a
+// program is refused, leaks a copy, or stays the programmer's `*T` responsibility is the user's call.
+@test("ssx_cp a helper answering a pointer into a short string's bytes", ignore: "TODO: un-ignore when the design settles what an escaping raw pointer into a short string's .bytes gets")
+ssx_cp_helper_answers_a_pointer()
+    if !ssx_cp_ready() then return
+
+    ssx_cp_all("""
+        import sysl.slices.as_ptr
+
+        struct Text
+            p: *u8
+            n: usize
+
+        made(n: int) -> string = "abcdefghijklmnopqrstuvwxyz"[0..<n].copy()
+
+        lent(s: string) -> Text = Text(as_ptr(s.bytes), s.bytes.len)
+
+        show(t: Text)
+            for i in 0..<t.n
+                print(t.p[i])
+
+        main()
+            show(lent(made(4)))
+        """, "97\n98\n99\n100\n", [], true)
