@@ -48,7 +48,7 @@ struct NameSink
         self.names.add(name)
 end NameSink
 
-private name_sink() -> &NameSink = NameSink(set())
+name_sink() -> &NameSink = NameSink(set())
 
 // A flag a walk lowers through the box it captured.
 struct Verdict
@@ -1245,14 +1245,15 @@ untouched_summary(p: TProgram, dropping: Buf[Type], owning: Set[string] = set(),
         val own = cast_sink()
         val reach = reach_sink()
         val aliases = ref_names(f)
+        val fills = fills_of(f)
 
         // A parameter is let go of at the return, or handed on, whether or not the body names it.
         for item in f.params
             reach.release(item.1, dropping)
 
         val walk = TWalk(true, x -> touch_node(v, calls, exits, ending, roots, gives, own, reach, dropping,
-                                               locals, tables, x, aliases),
-                         w -> touch_write(v, calls, roots, gives, locals, w, reach, aliases),
+                                               locals, tables, x, aliases, fills),
+                         w -> touch_write(v, calls, roots, gives, locals, w, reach, aliases, fills),
                          s -> touch_statement(v, reach, s))
 
         walk_block_stmts(f.body, walk)
@@ -1491,7 +1492,7 @@ by_value_parts(t: Type, out: *Buf[Type])
         _ -> ()
 end by_value_parts
 
-private has_type(ts: Buf[Type], t: Type) -> bool
+has_type(ts: Buf[Type], t: Type) -> bool
     for item in ts
         if item == t then return true
 
@@ -1519,9 +1520,9 @@ private touch_stmt(s: TStmt) -> bool = s match
 private touch_node(v: &Verdict, calls: &CallSink, exits: &CallSink, ending: &KindSink,
                    roots: &TypeSink, gives: &TypeSink, laundered: &CastSink, reach: &ReachSink,
                    dropping: Buf[Type], locals: Set[string], tables: Option[Buf[TVtable]], x: TExpr,
-                   aliases: Set[string])
+                   aliases: Set[string], fills: Fills)
     note_laundered(laundered, x)
-    edge_node(reach, aliases, x)
+    edge_node(reach, aliases, fills, x)
 
     if makes_dropping(x, dropping) then v.refuse()
     reach.release(texpr_type(x), dropping)
@@ -1642,9 +1643,10 @@ private touch_slots(v: &Verdict, roots: &TypeSink, gives: &TypeSink, op: string,
 end touch_slots
 
 private touch_write(v: &Verdict, calls: &CallSink, roots: &TypeSink, gives: &TypeSink, locals: Set[string],
-                    w: TWrite, reach: &ReachSink, aliases: Set[string])
+                    w: TWrite, reach: &ReachSink, aliases: Set[string], fills: Fills)
     touch_place(v, roots, gives, locals, w.place)
-    note_store(reach.writes, aliases, w.place)
+
+    if w.op != "=" || !relocation(fills, w.place, w.value) then note_store(reach.writes, aliases, w.place)
 
     if w.dispatch.is_some() then calls.add(w.dispatch.unwrap().name)
 end touch_write
@@ -1831,7 +1833,7 @@ end holds_dropping
 // Whether letting go of a value of `t` may run a destructor: it holds a type with one
 // (`holds_dropping`), or something whose type does not say what it holds -- an object behind a trait,
 // a closure's environment, a type not settled -- which may hold anything.
-private may_run_drop(t: Type, dropping: Buf[Type]) -> bool
+may_run_drop(t: Type, dropping: Buf[Type]) -> bool
     var seen: Set[string] = set()
 
     if holds_dropping(t, dropping, &seen) then return true
@@ -2439,6 +2441,10 @@ edge_text(k: EdgeKey) -> string =
 //
 // **The answer is shared, not copied**: its lists are the summary's own, so a caller reads it and
 // never changes it.
+//
+// **`within` and `counts` are found by their spelling, not by a scan** (`TypeIndex`): the fixed point
+// joins every callee's lists into every caller's, over the whole program, so a membership test that
+// walked the list made the solve cubic in the types a body writes.
 struct EdgeWrites
     keys: Buf[EdgeKey]
     named: Set[string]
@@ -2446,6 +2452,8 @@ struct EdgeWrites
     counts: Buf[Type]
     opaque: string
     opaque_in: string
+    within_at: TypeIndex
+    counts_at: TypeIndex
 
     key(*self, k: EdgeKey) -> bool
         if self.named.has(k.text) then return false
@@ -2457,18 +2465,35 @@ struct EdgeWrites
     inside(*self, t: Type) -> bool
         val u = underlying(t)
 
-        if has_type(self.within, u) then return false
+        self.inside_spelled(u, mangle(u))
 
+    inside_spelled(*self, u: Type, spelled: string) -> bool
+        if self.within_at.has(self.within, u, spelled) then return false
+
+        self.within_at.add(spelled, self.within.len())
         self.within.push(u)
         true
 
     count(*self, t: Type) -> bool
         val u = underlying(t)
 
-        if has_type(self.counts, u) then return false
+        self.count_spelled(u, mangle(u))
 
+    count_spelled(*self, u: Type, spelled: string) -> bool
+        if self.counts_at.has(self.counts, u, spelled) then return false
+
+        self.counts_at.add(spelled, self.counts.len())
         self.counts.push(u)
         true
+
+    // Whether a value of `t` may have its count read.
+    has_count(self, t: Type) -> bool
+        val u = underlying(t)
+
+        self.counts_at.has(self.counts, u, mangle(u))
+
+    // Whether `counts` holds `t` itself, as written.
+    holds_count_of(self, t: Type) -> bool = self.counts_at.has(self.counts, t, mangle(t))
 
     hide(*self, why: string, at: string) -> bool
         if self.opaque != "" then return false
@@ -2486,16 +2511,50 @@ struct EdgeWrites
         for item in other.keys
             grew = self.key(item) || grew
 
-        for item in other.within
-            grew = self.inside(item) || grew
+        for i in 0..<other.within.len()
+            grew = self.inside_spelled(other.within[i], other.within_at.spelled[i]) || grew
 
-        for item in other.counts
-            grew = self.count(item) || grew
+        for i in 0..<other.counts.len()
+            grew = self.count_spelled(other.counts[i], other.counts_at.spelled[i]) || grew
 
         grew
 end EdgeWrites
 
-edge_writes_none() -> EdgeWrites = EdgeWrites(buf(), set(), buf(), buf(), "", "")
+edge_writes_none() -> EdgeWrites = EdgeWrites(buf(), set(), buf(), buf(), "", "", type_index(), type_index())
+
+// **A list of types found by spelling**: each item's `mangle` is its bucket, and a bucket is a chain
+// through the items that share it, each compared whole (`==`) -- a spelling is shared by types the
+// compiler tells apart (a trait's associated types, a name-only subtype), so it narrows the search and
+// never decides it. Two types that are equal spell alike, as they must: the spelling is the symbol a
+// lowered program names the type by. `first` holds one past the bucket's newest item, `next` one past the item before it,
+// 0 ending the chain.
+struct TypeIndex
+    spelled: Buf[string]
+    first: Map[string, usize]
+    next: Buf[usize]
+
+    // Whether `items` (the list this indexes) holds `t`, spelled `spelling`.
+    has(self, items: Buf[Type], t: Type, spelling: string) -> bool = self.find(items, t, spelling).is_some()
+
+    // Where in `items` `t` is.
+    find(self, items: Buf[Type], t: Type, spelling: string) -> Option[usize]
+        var at = self.first.get(spelling).unwrap_or(0)
+
+        while at > 0
+            if items[at - 1] == t then return Some(at - 1)
+
+            at = self.next[at - 1]
+
+        None
+
+    // Files the item at `i` under `spelling`.
+    add(*self, spelling: string, i: usize)
+        self.spelled.push(spelling)
+        self.next.push(self.first.get(spelling).unwrap_or(0))
+        self.first.put(spelling, i + 1)
+end TypeIndex
+
+type_index() -> TypeIndex = TypeIndex(buf(), map(), buf())
 
 // Whether a summary may overwrite edge `k`: it is opaque, names it, or writes through a pointer a value
 // of a type the edge's value lays out by value.
@@ -2522,11 +2581,11 @@ first_written(w: EdgeWrites, ks: Buf[EdgeKey]) -> Option[EdgeKey]
 end first_written
 
 // Whether a summary may read the count of a value of type `t`, or run code that may.
-reads_count(w: EdgeWrites, t: Type) -> bool = w.opaque != "" || has_type(w.counts, underlying(t))
+reads_count(w: EdgeWrites, t: Type) -> bool = w.opaque != "" || w.has_count(t)
 
 // One body's own writes, gathered through the box its walk captured. `within` holds every type the
 // body writes through a pointer, counted or not, until `edge_finish` judges them against the casts.
-private struct EdgeSink
+struct EdgeSink
     w: EdgeWrites
 
     key(*self, k: EdgeKey)
@@ -2542,7 +2601,7 @@ private struct EdgeSink
         self.w.hide(why, "")
 end EdgeSink
 
-private edge_sink() -> &EdgeSink = EdgeSink(edge_writes_none())
+edge_sink() -> &EdgeSink = EdgeSink(edge_writes_none())
 
 // Whether a value of `t` holds a count -- or may, where its type does not say.
 private holds_count(t: Type) -> bool
@@ -2561,7 +2620,7 @@ private holds_count(t: Type) -> bool
 end holds_count
 
 // The names a body binds with `ref`: a place one of them names is wherever it was bound to.
-private ref_names(f: TFunc) -> Set[string]
+ref_names(f: TFunc) -> Set[string]
     val out = name_sink()
 
     walk_block_stmts(f.body, stmt_walk(true, s -> note_ref(out, s)))
@@ -2586,11 +2645,11 @@ end touch_statement
 // through, an atomic or a vector store through a pointer, and a call through a closure's table --
 // which this summary does not follow into the closures it could be, whether or not the program sees
 // every table (`slot_callees` still names them for `untouched_by`).
-private edge_node(reach: &ReachSink, aliases: Set[string], x: TExpr) = *x.kind match
-    TStore(place, _, _, _) -> note_store(reach.writes, aliases, place)
+private edge_node(reach: &ReachSink, aliases: Set[string], fills: Fills, x: TExpr) = *x.kind match
+    TStore(place, value, _, _) -> if !relocation(fills, place, value) then note_store(reach.writes, aliases, place)
     TIncDec(place, _, _, _, _) -> note_store(reach.writes, aliases, place)
     TUpdate(place, _, _, _, _, _, _) -> note_store(reach.writes, aliases, place)
-    TSlots(op, _, elem, _) -> note_slots(reach.writes, op, elem)
+    TSlots(op, args, elem, _) -> if !fills_only(fills, op, args) then note_slots(reach.writes, op, elem)
     TAtomic(op, _, _, _, at, _) -> if op != "load" then reach.writes.pointer(at)
     TVecStore(receiver, _, _) -> element(repr(texpr_type(receiver))) match
         Some(e) -> reach.writes.pointer(e)
@@ -2600,8 +2659,94 @@ private edge_node(reach: &ReachSink, aliases: Set[string], x: TExpr) = *x.kind m
     TViewAs(_, _) -> note_wcast(reach.wcasts, x)
     _ -> ()
 
+// -- filling and relocating a buffer's storage ------------------------------------------------------
+
+// **What a body knows of the storage it fills**, which is what tells `push` and `grow` from an
+// overwrite: the locals it made new storage into (`var bigger: []T = slot_storage(n)`, never written
+// again), and the locals it read a `BufCore`'s count into (`val n = self.count`, likewise).
+struct Fills
+    fresh: Set[string]
+    counts: Set[string]
+end Fills
+
+fills_of(f: TFunc) -> Fills
+    val made = name_sink()
+    val counted = name_sink()
+    val written = name_sink()
+
+    walk_block_stmts(f.body, TWalk(true, x -> fill_write(written, x), w -> fill_written(written, w.place),
+                                   s -> fill_decl(made, counted, s)))
+
+    var fresh: Set[string] = set()
+    var counts: Set[string] = set()
+
+    for item in made.names
+        if !written.names.has(item) then fresh.add(item)
+
+    for item in counted.names
+        if !written.names.has(item) then counts.add(item)
+
+    Fills(fresh, counts)
+end fills_of
+
+private fill_decl(made: &NameSink, counted: &NameSink, s: TStmt) = s match
+    TVarDecl(name, _, init, _) -> *init.kind match
+        TSlots(op, _, _, _) -> if op == "slot_storage" then made.add(name)
+        TField(_, _, _) -> if core_field(init, "count") then counted.add(name)
+        _ -> ()
+    _ -> ()
+
+private fill_write(out: &NameSink, x: TExpr) = *x.kind match
+    TStore(place, _, _, _) -> fill_written(out, place)
+    TIncDec(place, _, _, _, _) -> fill_written(out, place)
+    TUpdate(place, _, _, _, _, _, _) -> fill_written(out, place)
+    TAddrOf(place, _) -> fill_written(out, place)
+    _ -> ()
+
+private fill_written(out: &NameSink, place: TExpr) -> unit = *place.kind match
+    TLoad(name, _) -> out.add(name)
+    TField(r, _, _) -> fill_written(out, r)
+    TIndex(r, _, _) -> fill_written(out, r)
+    _ -> ()
+
+// Whether `x` reads the field `name` of a `BufCore`.
+private core_field(x: TExpr, name: string) -> bool = *x.kind match
+    TField(receiver, i, _) -> underlying(texpr_type(receiver)) match
+        Struct(d) -> d.base == module_qualify("sysl.buf", "BufCore") && i >= 0 && usize(i) < d.fields.len() &&
+            d.fields[usize(i)].0 == name
+        _ -> false
+    _ -> false
+
+// **A slot form that fills storage no reader could have read writes no edge.** That is a form into
+// storage this body made and has not handed out, and a `slot_place` into a `BufCore`'s own storage at
+// its count: the count is the storage's live prefix, so that slot is the first empty one (`push`).
+private fills_only(fills: Fills, op: string, args: Buf[TExpr]) -> bool
+    if args.is_empty() || (op != "slot_place" && op != "slot_place_run" && op != "slot_put") then return false
+
+    *args[0].kind match
+        TLoad(name, _) -> if fills.fresh.has(name) then return true
+        _ -> ()
+
+    if op != "slot_place" || args.len() != 3 || !is_core_elems(args[0]) then return false
+
+    *args[1].kind match
+        TLoad(name, _) -> fills.counts.has(name)
+        _ -> core_field(args[1], "count")
+end fills_only
+
+// **Storage a body filled replacing a `BufCore`'s own is a relocation, not an overwrite**: every live
+// element was placed into the new storage with a count of its own first (`grow`), so letting the old
+// storage go gives back counts and frees nothing a reader holds.
+private relocation(fills: Fills, place: TExpr, value: TExpr) -> bool
+    if !is_core_elems(place) then return false
+
+    *value.kind match
+        TLoad(name, _) -> fills.fresh.has(name)
+        _ -> false
+end relocation
+
 // Whether a trait object is a closure: one of the `FnN` traits every closure is erased to.
-private closure_table(t: Type) -> bool = erased_trait(underlying(t)) match
+closure_table(t: Type) -> bool = erased_trait(underlying(t)) match
     Some(Trait(name, _, _)) -> fn_is_call(name)
     _ -> false
 
@@ -2612,7 +2757,7 @@ private closure_table(t: Type) -> bool = erased_trait(underlying(t)) match
 // writes every counted edge of the value it overwrites, since each of those holds a new value after.
 // A store of a value that holds no count changes no edge; the pointer it may go through is still
 // noted, because a pointer a cast made may lay that value over a counted one (`edge_finish`).
-private note_store(sink: &EdgeSink, aliases: Set[string], place: TExpr)
+note_store(sink: &EdgeSink, aliases: Set[string], place: TExpr)
     if own_base(place, aliases) then return
 
     val t = place_type(place)
@@ -2625,7 +2770,7 @@ end note_store
 
 // Whether a place is in a local or a parameter of the body's own, reached without a dereference: the
 // frame's own slot, which is no edge. A `ref` names somebody else's storage.
-private own_base(place: TExpr, aliases: Set[string]) -> bool = *place.kind match
+own_base(place: TExpr, aliases: Set[string]) -> bool = *place.kind match
     TLoad(name, _) -> !aliases.has(name)
     TField(r, _, _) -> own_base(r, aliases)
     TIndex(r, _, _) -> repr(texpr_type(r)) match
@@ -2679,7 +2824,7 @@ private note_fields(sink: &EdgeSink, owner: Type, fields: Buf[(string, Type)], p
 // `slot_place_run`, `slot_take`, `slot_vacate`), and `slot_vacate` reads the storage's count first.
 // Making storage (`slot_storage`) and filling an empty slot (`slot_put`) overwrite nothing a reader
 // could have read, and neither does relocating storage, which moves counts and gives none back.
-private note_slots(sink: &EdgeSink, op: string, elem: Type)
+note_slots(sink: &EdgeSink, op: string, elem: Type)
     if op == "slot_storage" || op == "slot_put" || empty_form(op) then return
 
     if op != "slot_place" && op != "slot_place_run" && op != "slot_take" && op != "slot_vacate"
@@ -2715,7 +2860,7 @@ private note_wcast(out: &CastSink, x: TExpr) = *x.kind match
 // a cast made from anything may land anywhere, so it is opaque; one to a type made from the address of
 // a named object lands in that object, whose counted edges it may then overwrite; and the rest is kept
 // where the type holds a count, since only then can it change an edge.
-private edge_finish(own: EdgeWrites, casts: Casts) -> EdgeWrites
+edge_finish(own: EdgeWrites, casts: Casts) -> EdgeWrites
     var out = edge_writes_none()
     val sink = edge_sink()
 
@@ -2841,10 +2986,15 @@ private foreign_into(sink: &EdgeSink, name: string, elem: Type, read_only: bool)
         sink.pointer(elem)
 
 // The least fixed point: each body starts from its own writes and those of the callees with no body in
-// sight, and a body's answer is joined into each caller's until nothing grows.
+// sight, and gets every write of every body it calls.
+//
+// **Each call is joined once** (`edge_scc`): the call graph's strongly connected components are solved
+// callees first, so a body's callees are settled before it is, and the bodies of one cycle -- which all
+// reach one another, so all write the same -- share one answer, made once. Joining a callee's answer
+// into its callers again each time it grew joined the program's largest answers thousands of times.
 private edge_solve(u: *Untouched, abandoning: Set[string]) -> Buf[EdgeWrites]
     var fix: Buf[EdgeWrites] = buf()
-    var callers: Buf[Buf[usize]] = buf()
+    var callees: Buf[Buf[usize]] = buf()
 
     for i in 0..<u.names.len()
         var w = edge_finish(u.edge_own[i], u.edge_casts)
@@ -2852,20 +3002,20 @@ private edge_solve(u: *Untouched, abandoning: Set[string]) -> Buf[EdgeWrites]
         if w.opaque != "" && w.opaque_in == "" then w.opaque_in = u.names[i]
 
         fix.push(w)
-        callers.push(buf())
+        callees.push(buf())
 
     for i in 0..<u.names.len()
-        var callees: Buf[string] = buf()
+        var called: Buf[string] = buf()
 
         for item in u.calls[i]
-            callees.push(item)
+            called.push(item)
 
         for item in u.exits[i]
-            if abandoning.has(item) then callees.push(item)
+            if abandoning.has(item) then called.push(item)
 
-        for item in callees
+        for item in called
             u.edge_index.get(item) match
-                Some(j) -> if j != i then callers[j].push(i)
+                Some(j) -> if j != i then callees[i].push(j)
                 None ->
                     var w = fix[i]
                     var other = u.edge_foreign.get(item).unwrap_or(unseen_edges(item))
@@ -2875,32 +3025,116 @@ private edge_solve(u: *Untouched, abandoning: Set[string]) -> Buf[EdgeWrites]
                     w.join(other)
                     fix[i] = w
 
-    var work: Buf[usize] = buf()
-    var queued: Buf[bool] = buf()
-
-    for i in 0..<u.names.len()
-        work.push(i)
-        queued.push(true)
-
-    loop
-        val next = work.pop()
-
-        if next.is_none() then break
-
-        val j = next.unwrap()
-
-        queued[j] = false
-
-        for c in callers[j]
-            var w = fix[c]
-
-            if w.join(fix[j])
-                fix[c] = w
-
-                if !queued[c]
-                    queued[c] = true
-                    work.push(c)
-    end loop
-
+    edge_scc(&fix, callees)
     fix
 end edge_solve
+
+// Tarjan's components over `callees`, each solved as it is closed -- which is after every component it
+// reaches. `seen` is one past a body's visiting order (0 unvisited), `low` the least order its part of
+// the walk reaches, `comp` its component's number once closed.
+private edge_scc(fix: *Buf[EdgeWrites], callees: Buf[Buf[usize]])
+    val n = callees.len()
+    var seen: Buf[usize] = buf()
+    var low: Buf[usize] = buf()
+    var on: Buf[bool] = buf()
+    var comp: Buf[usize] = buf()
+    var stack: Buf[usize] = buf()
+    var order = 1usize
+    var comps = 1usize
+
+    for i in 0..<n
+        seen.push(0)
+        low.push(0)
+        on.push(false)
+        comp.push(0)
+
+    for root in 0..<n
+        if seen[root] != 0 then continue
+
+        var walk: Buf[(usize, usize)] = buf()
+
+        seen[root] = order
+        low[root] = order
+        order += 1
+        stack.push(root)
+        on[root] = true
+        walk.push((root, 0))
+
+        while !walk.is_empty()
+            val top = walk.len() - 1
+            val v = walk[top].0
+            val k = walk[top].1
+
+            if k < callees[v].len()
+                walk[top] = (v, k + 1)
+
+                val w = callees[v][k]
+
+                if seen[w] == 0
+                    seen[w] = order
+                    low[w] = order
+                    order += 1
+                    stack.push(w)
+                    on[w] = true
+                    walk.push((w, 0))
+                else if on[w] && seen[w] < low[v]
+                    low[v] = seen[w]
+
+                continue
+            end if
+
+            walk.pop()
+
+            if !walk.is_empty()
+                val parent = walk[walk.len() - 1].0
+
+                if low[v] < low[parent] then low[parent] = low[v]
+
+            if low[v] != seen[v] then continue
+
+            var members: Buf[usize] = buf()
+
+            loop
+                val x = stack.pop().unwrap()
+
+                on[x] = false
+                comp[x] = comps
+                members.push(x)
+
+                if x == v then break
+
+            edge_component(fix, callees, comp, comps, members)
+            comps += 1
+        end while
+end edge_scc
+
+// One component's answer: each member's own writes, then everything the component writes and every
+// callee outside it does. A member keeps the first reason it is opaque for its own.
+private edge_component(fix: *Buf[EdgeWrites], callees: Buf[Buf[usize]], comp: Buf[usize], at: usize,
+                       members: Buf[usize])
+    if members.len() == 1
+        val f = members[0]
+        var w = (*fix)[f]
+
+        for j in callees[f]
+            w.join((*fix)[j])
+
+        (*fix)[f] = w
+        return
+    end if
+
+    var all = edge_writes_none()
+
+    for k in 0..<members.len()
+        all.join((*fix)[members[members.len() - 1 - k]])
+
+    for k in 0..<members.len()
+        for j in callees[members[members.len() - 1 - k]]
+            if comp[j] != at then all.join((*fix)[j])
+
+    for f in members
+        var w = (*fix)[f]
+
+        w.join(all)
+        (*fix)[f] = w
+end edge_component

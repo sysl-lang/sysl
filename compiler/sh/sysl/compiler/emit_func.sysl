@@ -1,7 +1,7 @@
 module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
-import sysl.container.set
+import sysl.container.{Set, set}
 import sysl.math.bigint.from_int
 
 // **One whole function**: the frame its parameters are copied into, the body, and the return.
@@ -75,6 +75,8 @@ gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
     val owns = if e.zero_body then set()
                else owning(f, e.address_taken.has(f.name), is_async || !found.is_empty(), e.inert.has(f.name))
 
+    var owned_names: Set[string] = set()
+
     // A zero-sized parameter is not an argument: there is nothing to receive and nothing to keep, so
     // it takes no slot and the emitted signature does not mention it.
     //
@@ -92,6 +94,8 @@ gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
             // no count of its own either -- one would be a second owner (`emit_unique.sysl`).
             val reader = value_drops(e, ty) && reads_receiver(f, j)
             val owned = !reader && (owns.has(p.0) || handed)
+
+            if owned then owned_names.add(p.0)
 
             if value_drops(e, ty) && !reader && !handed && !e.zero_body
                 gap_here(e, s"the '@unique' parameter '${p.0}', which this function cannot be handed")
@@ -135,6 +139,11 @@ gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
                 if owned && !handed then retain_value(e, ty, VReg(s"${p.0}.param"))
 
             if owned then own_slot(e, p.0, ty)
+
+    // **A local that only walks storage holds no count** (`plus0_locals.sysl`): its declaration, its
+    // bindings and its assignments take none and give none back, and whatever keeps it takes one there.
+    // A task's body runs after its caller has let go of what it lent, so it walks nothing borrowed.
+    e.lent_decls = if is_async then set() else plus0_locals(e, f, owned_names, !found.is_empty())
 
     // Where the function calls itself as the last thing it does, that call is a jump to here rather
     // than a second frame. The target sits *after* the parameter slots are written and *before*

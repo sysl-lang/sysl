@@ -4186,6 +4186,59 @@ print(sum(tags), fields(row))
 3 16
 ```
 
+### A local that walks storage takes no count
+
+**A `var`, a `val`, a `match` arm's binding or an `is` binding whose every value is read out of storage
+— through fields and payloads, starting from a parameter or a local of the function's top block — takes
+no count where nothing in its scope can cut that chain.** The object such a local names is held by the
+field it was read from, and that field by the root the walk started at, so a count of the local's own
+could never be the one that keeps the object alive; leaving it out changes nothing a program prints or
+when a destructor runs. A walk down a list then costs no retain and no release per step:
+
+```sysl
+struct Element
+    v: int
+    next: Option[&Element]
+
+is_shorter_than(x: Option[&Element], y: Option[&Element]) -> bool
+    var x_tail = x
+    var y_tail = y
+
+    while y_tail is Some(yt)
+        x_tail match
+            None -> return true
+            Some(xt) -> x_tail = xt.next
+
+        y_tail = yt.next
+
+    false
+
+make(n: int) -> Option[&Element]
+    var head: Option[&Element] = None
+
+    for i in 0..<n
+        head = Some(Element(i, head))
+
+    head
+
+print(is_shorter_than(make(3), make(4)), is_shorter_than(make(4), make(3)))
+```
+
+```output
+true false
+```
+
+Keeping such a local is no reason to count it: a `return`, a `break` with it, a `push`, a store, a
+copy into a counted local or a value built from it takes the count where it keeps the value, on that
+path only. **The local keeps its count, for the whole of its life, where its scope may cut the
+chain**: a write to a field it was read along (through any reference), a call to a function that may
+write one — however deep — or may read a count of it, a release that may run a destructor, a call
+through a closure, a trait object's table or a function value, a foreign call the program cannot
+trust, an `await`, and a write to the root itself, or a use of an owned root that could hand its count
+away. A local read from module storage, or through a `&sync`, is always counted, and so is one named in
+a `defer`, assigned with a compound operator, or whose address is taken. `--explain-borrows` says,
+for each local read out of storage, which way it went and why.
+
 ### A method's answer borrowed from its receiver
 
 **A function whose answer is read out of a parameter's storage is called so that the caller reads it
@@ -4367,6 +4420,7 @@ print(fill(&sram))
 | segfault source | prevented in the safe subset by |
 |---|---|
 | use-after-free / double-free | ARC on `&T`; `weak` degrades to `Option` and never dangles |
+| a walk whose list is rewritten mid-walk | a local that walks storage keeps its count wherever its scope may write a field it walked, or call what may |
 | null dereference | non-null references; nullable is `Option` |
 | out-of-bounds | length-carrying arrays and views, checked everywhere |
 | a view or address outliving its storage | block lifetimes; the view's `owner` word; escaping frame arrays are promoted |

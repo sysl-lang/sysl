@@ -1741,6 +1741,23 @@ function whose answer is a place or +0 is read where the answer lies, with no co
 ([a method's answer borrowed from its receiver](/reference/memory/#a-method-s-answer-borrowed-from-its-receiver)).
 When no function answers a borrow, the flag says so.
 
+After the functions, once the program is lowered, it reports **each local read out of storage** — a
+`var`, `val`, arm binding or `is` binding one of whose values is read from a parameter or a local of the
+function's top block: either that it holds no count, with the roots and the fields it is borrowed
+through, or that it is counted, with the first thing in its scope that could cut the chain
+([a local that walks storage takes no count](/reference/memory/#a-local-that-walks-storage-takes-no-count)):
+
+```
+list.sysl:18:22: 'x_tail' holds no count: borrowed from 'x' through Element.next, sysl.Option[&Element].Some.value
+list.sysl:21:15: 'yt' holds no count: borrowed from 'y' through Element.next, sysl.Option[&Element].Some.value
+walk.sysl:12:15: 'cur' is counted: 'clear' at 14:9 may write Node.next
+walk.sysl:20:15: 'cur' is counted: the root 'l' is written at 22:13
+```
+
+A local's line points at its first value: the initializer of a `var` or `val`, the subject a pattern
+binds out of. A generic function speaks for its first instance. A local each value of which arrives
+with a count — a call's answer, a constant — gets no line.
+
 ### `-O2` is written the way clang writes it
 
 A short option normally takes its value as the next argument, but C compilers write the

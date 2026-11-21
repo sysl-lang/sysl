@@ -804,12 +804,15 @@ emit_llvm_text(path: string, named_target: Option[string],
     //
     // **And one that links is an executable, which keeps its own functions to itself**
     // (`seal_linkage.sysl`); the text `emit-llvm` prints keeps every linkage as written.
+    take_local_notes()
+
     val lowered = codegen_with_gaps(kept with { precompiled = joined_names(linked.precompiled,
                                                                            roots.precompiled) },
                                     t, promotions, linking && imports_bodies(level), None, watched,
                                     if linking then program.own else buf(), compact)
 
     phase_done("codegen")
+    explain_local_notes(program, done.an)
 
     // **And one that put a type aligned beyond the pair's promise on the heap answers the aligned
     // hook**, where nothing writes it a default (`check_aligned_heap`).
@@ -982,6 +985,36 @@ private explain_borrow_notes(whole: TProgram, program: Compilation, an: &Analysi
 
     explain_borrows(lines)
 end explain_borrow_notes
+
+// What `--explain-borrows` reports about the locals of the program's own files, once they are lowered
+// (`plus0_locals.sysl`): each one read out of storage, +0 or counted and why, in the order written.
+private explain_local_notes(program: Compilation, an: &Analysis)
+    val notes = take_local_notes()
+
+    if !explaining_borrows() || !errors_of(an.diagnostics()).is_empty() then return
+
+    val files = own_files(program)
+    var kept: Buf[LocalNote] = buf()
+
+    for item in notes
+        for f in files
+            if f == item.file
+                var k = kept.len()
+
+                while k > 0 && (kept[k - 1].file > item.file ||
+                                (kept[k - 1].file == item.file && kept[k - 1].start > item.start))
+                    k -= 1
+
+                kept.insert(k, item)
+                break
+
+    var lines: Buf[string] = buf()
+
+    for item in kept
+        lines.push(item.text)
+
+    explain_borrow_lines(lines)
+end explain_local_notes
 
 // The machine a command line asked for: the one it named, the manifest's default, or this host --
 // with the floor the manifest states checked before anything is read.
