@@ -18,18 +18,87 @@ import sysl.math.bigint.from_int
 // appear *inside* one as an ordinary byte.
 string_value(e: *Emit, s: string) -> Val = string_const(e, s)
 
+// -- the one reader ------------------------------------------------------------------------------
+//
+// **Every read of a string's first-byte pointer (word 1) and its length (word 2) is made here**, in
+// the lowering and in the runtime text alike. A string's owner word (word 0) is ARC's and is read
+// where ARC reads it; the other two words say where the bytes are, and the representation is free to
+// change what they hold only because no other file reads them. `tests_ssx_a_one_string_reader.sysl`
+// holds every other file to that, so a new reader is routed through these or is listed there with
+// the reason it can never see a string.
+//
+// A view that may be either a string or a slice (`[]T`) is read through `view_data`, `view_len` and
+// `view_ptr`, which send a string here and read a slice's words directly.
+
 // The bytes of a string and how many there are -- what every operation on its content needs.
-str_bytes(e: *Emit, v: Val) -> (Val, Val)
-    val lt = lty(e, Str)
+str_data(e: *Emit, v: Val) -> (Val, Val)
+    val p = str_ptr(e, v)
+    val n = str_len(e, v)
+    (p, n)
+end str_data
+
+// The address of a string's first byte.
+str_ptr(e: *Emit, v: Val) -> Val
     val p = fresh_reg(e)
 
-    emit(e, InExtract(p, lt, v, index_list(1)))
+    emit(e, InExtract(p, lty(e, Str), v, index_list(1)))
+    p
+end str_ptr
+
+// How many bytes a string holds.
+str_len(e: *Emit, v: Val) -> Val
+    val n = fresh_reg(e)
+
+    emit(e, InExtract(n, lty(e, Str), v, index_list(2)))
+    n
+end str_len
+
+// Whether a view of type `ty` is a string rather than a slice.
+private is_string_view(ty: Type) -> bool = underlying(unqualified(ty)) == Str
+
+// The first element and the length of the view `v` of type `ty`, a string's through `str_data`.
+view_data(e: *Emit, v: Val, ty: Type) -> (Val, Val)
+    if is_string_view(ty) then return str_data(e, v)
+
+    val p = view_ptr(e, v, ty)
+    val n = view_len(e, v, ty)
+    (p, n)
+end view_data
+
+// The first element of the view `v` of type `ty`.
+view_ptr(e: *Emit, v: Val, ty: Type) -> Val
+    if is_string_view(ty) then return str_ptr(e, v)
+
+    val p = fresh_reg(e)
+
+    emit(e, InExtract(p, lty(e, ty), v, index_list(1)))
+    p
+end view_ptr
+
+// The length of the view `v` of type `ty`.
+view_len(e: *Emit, v: Val, ty: Type) -> Val
+    if is_string_view(ty) then return str_len(e, v)
 
     val n = fresh_reg(e)
 
-    emit(e, InExtract(n, lt, v, index_list(2)))
-    (p, n)
-end str_bytes
+    emit(e, InExtract(n, lty(e, ty), v, index_list(2)))
+    n
+end view_len
+
+// The runtime's hand-written IR reads a string through these spellings, so what a template says
+// about the two words is said here too. `str_ptr_text(str, "%b")` is the right-hand side of an
+// instruction that reads the pointer of the string value `%b` of LLVM type `str`.
+str_ptr_text(str: string, v: string) -> string = s"extractvalue $str $v, 1"
+
+str_len_text(str: string, v: string) -> string = s"extractvalue $str $v, 2"
+
+// The same two words of element `at` of an array of strings at `table`, as the address of each: the
+// right-hand side of a `getelementptr`, to be loaded as a `ptr` and as a `word`.
+str_ptr_at_text(str: string, word: string, table: string, at: string) -> string =
+    s"getelementptr $str, ptr $table, $word $at, i32 1"
+
+str_len_at_text(str: string, word: string, table: string, at: string) -> string =
+    s"getelementptr $str, ptr $table, $word $at, i32 2"
 
 // A string's bytes as a call's two arguments. Every helper in the runtime takes them in that order
 // and at those types, which is what makes this worth naming once.
@@ -52,8 +121,8 @@ request_text(e: *Emit, name: string, text: string) -> string = request_helper(e,
 str_concat(e: *Emit, av: Val, bv: Val) -> Val
     e.heap = true
 
-    val a = str_bytes(e, av)
-    val b = str_bytes(e, bv)
+    val a = str_data(e, av)
+    val b = str_data(e, bv)
     e.traps = true
 
     val fn = request_text(e, "sysl.str.concat", str_concat_text(e, str_llvm(e)))
@@ -73,8 +142,8 @@ end str_concat
 // Compares two strings by their bytes, yielding the usual -1 / 0 / 1 so that every comparison
 // operator is one `icmp` against the result.
 str_cmp(e: *Emit, av: Val, bv: Val) -> Val
-    val a = str_bytes(e, av)
-    val b = str_bytes(e, bv)
+    val a = str_data(e, av)
+    val b = str_data(e, bv)
     val fn = request_text(e, "sysl.str.cmp", str_cmp_text(word_llvm_of(e)))
     val r = fresh_reg(e)
 
@@ -92,8 +161,8 @@ end str_cmp
 // Whether two strings hold the same bytes, as an `i1` -- what `==` and `!=` lower to, rather than
 // `str_cmp`'s order read against zero (`str_eq_text` says why).
 str_eq(e: *Emit, av: Val, bv: Val) -> Val
-    val a = str_bytes(e, av)
-    val b = str_bytes(e, bv)
+    val a = str_data(e, av)
+    val b = str_data(e, bv)
     val fn = request_text(e, "sysl.str.eq", str_eq_text(word_llvm_of(e)))
     val r = fresh_reg(e)
 
@@ -109,7 +178,7 @@ end str_eq
 // The position of a string in a sorted constant table of `count` strings, or `count` where it is not
 // there -- one call, whose search asks `str_cmp`'s comparison, so the comparison is requested first.
 str_search(e: *Emit, table: Val, count: usize, v: Val) -> Val
-    val s = str_bytes(e, v)
+    val s = str_data(e, v)
 
     request_text(e, "sysl.str.cmp", str_cmp_text(word_llvm_of(e)))
 
@@ -262,15 +331,7 @@ gen_from_bytes(e: *Emit, arg: TExpr) -> Val
 
     val fn = request_from_bytes(e)
     val v = gen_expr(e, arg)
-    val at = lty(e, texpr_type(arg))
-    val p = fresh_reg(e)
-
-    emit(e, InExtract(p, at, v, index_list(1)))
-
-    val n = fresh_reg(e)
-
-    emit(e, InExtract(n, at, v, index_list(2)))
-
+    val (p, n) = view_data(e, v, texpr_type(arg))
     val r = fresh_reg(e)
 
     emit(e, ir_call(Some(r), lty(e, Str), VGlobal(fn), str_args(e, p, n)))
