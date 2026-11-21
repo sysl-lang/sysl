@@ -796,30 +796,52 @@ private is_spec_digit(c: u8) -> bool = c >= u8('0') && c <= u8('9')
 
 // -- rendering into a buffer -------------------------------------------------------------------------
 
-// **A value written into a growable buffer, and what landed there as a string.** A zeroed stack slot
-// becomes the sink, the value writes itself into it, and the bytes are copied into a string the
-// statement owns. The slot is re-zeroed on every arrival rather than once, since an alloca is hoisted
-// to the entry block and a render inside a loop meets the same one each time round.
+// **A value written into a growable buffer, and what landed there as a string.** A stack slot -- a
+// zeroed header and `buffer_scratch()` bytes of frame storage the first bytes land in -- becomes the
+// sink, the value writes itself into it, and the bytes are copied into a string the statement owns.
+// The header is re-zeroed on every arrival rather than once, since an alloca is hoisted to the entry
+// block and a render inside a loop meets the same one each time round; the scratch needs no zeroing,
+// as nothing reads it past the length the header counts.
 gen_render(e: *Emit, value: TExpr, method: string, spec: TExpr, vslot: Option[int]) -> Val
+    val (v, s) = render_operands(e, value, method, spec)
+    val (slot, w) = open_render_slot(e)
+
+    render_into(e, value, method, vslot, v, s, spec, w)
+    close_render_slot(e, slot)
+end gen_render
+
+// The value a rendering writes, and its spec, read.
+//
+// **A large receiver crosses as the address of storage nothing can change during the call**
+// (`indirect_arg`), exactly as it does at any other call -- a value past the indirect boundary is
+// passed and received through memory, so its parameter is a pointer. Producing it as a first-class
+// aggregate and handing that over instead puts the struct's first word where the callee reads an
+// address.
+private render_operands(e: *Emit, value: TExpr, method: string, spec: TExpr) -> (Val, Val)
+    val big = e.layout.indirect(texpr_type(value))
+    val lent = changes_nothing(spec) && lends_in_place(e, method, texpr_type(value))
+    val v = if big then indirect_arg(e, value, held(e, value) || lent)
+    else gen_expr(e, value)
+
+    (v, gen_expr(e, spec))
+end render_operands
+
+// A fresh buffer in the frame, and the `*Writer` over it: the slot, and the trait object.
+//
+// The slot holds a frame's worth of scratch, and its address goes into a trait object, so the
+// lifetime pass never bounds it; it is bounded here instead, by the rendering itself -- nothing
+// points into it once `finish` has handed the bytes over -- so that a body with many holes, or a
+// recursion through one, does not keep a scratch per hole alive across the whole frame.
+private open_render_slot(e: *Emit) -> (Val, Val)
     e.heap = true
 
     request_from_bytes(e)
 
     val table = buffer_table(e)
+    val slot = alloca(e, fresh_reg(e), buffer_lty(e))
 
-    // **A large receiver crosses as the address of storage nothing can change during the call**
-    // (`indirect_arg`), exactly as it does at any other call -- a value past the indirect boundary is
-    // passed and received through memory, so its parameter is a pointer. Producing it as a first-class aggregate and handing that over
-    // instead puts the struct's first word where the callee reads an address.
-    val big = e.layout.indirect(texpr_type(value))
-    val lent = changes_nothing(spec) && lends_in_place(e, method, texpr_type(value))
-    val v = if big then indirect_arg(e, value, held(e, value) || lent)
-    else gen_expr(e, value)
-    val s = gen_expr(e, spec)
-    val slot_lty = buffer_lty(e)
-    val slot = alloca(e, fresh_reg(e), slot_lty)
-
-    emit(e, InStore(slot_lty, VZero, slot, AccPlain, None))
+    mark_slot_life(e, lifetime_start_symbol(), slot)
+    emit(e, InStore(buffer_header_lty(e), VZero, slot, AccPlain, None))
 
     val a = fresh_reg(e)
 
@@ -828,8 +850,26 @@ gen_render(e: *Emit, value: TExpr, method: string, spec: TExpr, vslot: Option[in
     val w = fresh_reg(e)
 
     emit(e, InInsert(w, l_fat(), a, LPtr, slot, index_list(1)))
+    (slot, w)
+end open_render_slot
 
+// What landed in the slot, as a string the statement owns; the slot's life ends with it.
+private close_render_slot(e: *Emit, slot: Val) -> Val
+    val r = fresh_reg(e)
+
+    var finish: Buf[IrArg] = buf()
+
+    finish.push(ir_arg(LPtr, slot))
+    emit(e, ir_call(Some(r), lty(e, Str), VGlobal("sysl.w.buf.finish"), finish))
+    mark_slot_life(e, lifetime_end_symbol(), slot)
+    own_temp(e, r, Str)
+end close_render_slot
+
+// `value` (already read: `v`, its spec `s`) writing itself through `method` into the `*Writer` `w`.
+private render_into(e: *Emit, value: TExpr, method: string, vslot: Option[int], v: Val, s: Val,
+                    spec: TExpr, w: Val)
     var args: Buf[IrArg] = buf()
+    val big = e.layout.indirect(texpr_type(value))
 
     // A trait object renders through the table it carries, so the callee and the receiver both come
     // out of the value: the data word is the receiver a slot's entry expects, exactly as it is for
@@ -861,12 +901,165 @@ gen_render(e: *Emit, value: TExpr, method: string, spec: TExpr, vslot: Option[in
     if vslot.is_none() then push_caller_unplaced(e, method, &args)
 
     emit(e, ir_call(None, LVoid, callee, args))
+end render_into
 
-    val r = fresh_reg(e)
+// -- a whole interpolation into one buffer -------------------------------------------------------------
 
-    var finish: Buf[IrArg] = buf()
+// Whether `x` is a join of strings -- what an interpolation of more than one piece is, under the
+// `$str` the parser puts round it (`parse_expr.sysl`'s `desugar_interp`).
+interp_join(x: TExpr) -> bool = *x.kind match
+    TBinary(_, _, _, ty) -> underlying(ty) == Str
+    _ -> false
 
-    finish.push(ir_arg(LPtr, slot))
-    emit(e, ir_call(Some(r), lty(e, Str), VGlobal("sysl.w.buf.finish"), finish))
-    own_temp(e, r, Str)
-end gen_render
+// **A whole interpolation written into one buffer, then finished once.** The pieces are the leaves of
+// the join, in the order the join reads them: a literal piece is appended as bytes, an integer of up
+// to 64 bits and a `char` are rendered straight into the buffer, a `Display` or `Debug` hole writes
+// itself into it through the same `*Writer`, a nested interpolation's pieces are pieces of this one,
+// and anything else -- a float, a specifier's rendering, a string -- is read as the string it is and
+// its bytes appended. The string that comes out is the concatenation of the pieces, which is what the
+// join meant: only the intermediate strings are gone. With every piece in the frame's scratch the
+// interpolation costs the one string `finish` makes, or nothing where that string is short.
+//
+// **A join with a piece that can leave the statement early -- a `?`, a `return`, a `break` --
+// is lowered as the join** (`interp_straight`): the buffer owns its heap storage only until
+// `finish`, and an exit between would lose it, where the join's own strings are the statement's
+// temporaries and are released on the way out.
+gen_interp(e: *Emit, join: TExpr) -> Val
+    var pieces: Buf[TExpr] = buf()
+
+    interp_pieces(join, &pieces)
+
+    if !interp_straight(pieces) then return gen_expr(e, join)
+
+    val (slot, w) = open_render_slot(e)
+
+    for piece in pieces
+        interp_piece(e, slot, w, piece)
+
+    close_render_slot(e, slot)
+end gen_interp
+
+// The leaves of a join, left to right: a nested join, and a string rendered as itself, are opened.
+private interp_pieces(x: TExpr, out: *Buf[TExpr])
+    if interp_join(x)
+        *x.kind match
+            TBinary(_, l, r, _) ->
+                interp_pieces(l, out)
+                interp_pieces(r, out)
+            _ -> ()
+
+        return
+    end if
+
+    *x.kind match
+        TStr(arg) ->
+            if underlying(texpr_type(arg)) == Str
+                interp_pieces(arg, out)
+                return
+        _ -> ()
+
+    out.push(x)
+end interp_pieces
+
+// Whether nothing among the pieces can leave the statement before the buffer is finished.
+private interp_straight(pieces: Buf[TExpr]) -> bool
+    val seen: &InterpExit = InterpExit(false)
+    val walk: &TWalk = TWalk(false, x -> interp_exit_expr(seen, x), w -> (), s -> interp_exit_stmt(seen, s))
+
+    for piece in pieces
+        walk_texpr(piece, walk)
+
+    !seen.leaves
+end interp_straight
+
+// Whether a walk met a way out of the statement.
+private struct InterpExit
+    leaves: bool
+
+private interp_exit_expr(seen: &InterpExit, x: TExpr) = *x.kind match
+    TTry(_, _, _, _, _, _, _) -> seen.leaves = true
+    _ -> ()
+
+private interp_exit_stmt(seen: &InterpExit, s: TStmt) = s match
+    TReturn(_) -> seen.leaves = true
+    TBecome(_) -> seen.leaves = true
+    TBreak(_, _) -> seen.leaves = true
+    TContinue(_) -> seen.leaves = true
+    _ -> ()
+
+// One piece appended to the buffer at `slot` (`w` the `*Writer` over it).
+private interp_piece(e: *Emit, slot: Val, w: Val, piece: TExpr)
+    *piece.kind match
+        TStrLit(s) ->
+            if s != "" then interp_put(e, slot, string_value(e, s))
+
+            return
+        TRender(value, method, spec, vslot) ->
+            val (v, s) = render_operands(e, value, method, spec)
+
+            render_into(e, value, method, vslot, v, s, spec, w)
+            return
+        TStr(arg) ->
+            underlying(texpr_type(arg)) match
+                Integer(bits, signed, _) ->
+                    if bits <= 64
+                        interp_int(e, slot, arg, signed)
+                        return
+                    end if
+                Char ->
+                    interp_char(e, slot, arg)
+                    return
+                _ -> ()
+        _ -> ()
+
+    interp_put(e, slot, gen_expr(e, piece))
+end interp_piece
+
+// A string's bytes appended.
+private interp_put(e: *Emit, slot: Val, v: Val)
+    val (p, n) = str_data(e, v)
+
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(LPtr, slot))
+    args.push(ir_arg(LPtr, p))
+    args.push(ir_arg(word_lty(e), n))
+    emit(e, ir_call(None, LVoid, VGlobal("sysl.w.buf.put"), args))
+end interp_put
+
+// An integer of up to 64 bits, its digits written into the buffer.
+private interp_int(e: *Emit, slot: Val, arg: TExpr, signed: bool)
+    val fn = request_text(e, "sysl.w.buf.int", writer_int_text(word_llvm_of(e)))
+    val wide = convert(e, underlying(texpr_type(arg)), Integer(64, signed, false), gen_expr(e, arg))
+
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(LPtr, slot))
+    args.push(ir_arg(LInt(64), wide))
+    args.push(ir_arg(l_i1(), VInt(from_int(if signed then 1 else 0))))
+    emit(e, ir_call(None, LVoid, VGlobal(fn), args))
+end interp_int
+
+// A `char`, its UTF-8 bytes written into the buffer.
+private interp_char(e: *Emit, slot: Val, arg: TExpr)
+    e.char_buf = true
+
+    val fn = request_text(e, "sysl.w.buf.char", writer_char_text(word_llvm_of(e)))
+    val cp = gen_expr(e, arg)
+
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(LPtr, slot))
+    args.push(ir_arg(l_i32(), cp))
+    emit(e, ir_call(None, LVoid, VGlobal(fn), args))
+end interp_char
+
+// One lifetime marker over the whole of `slot`, with the module told it declares the pair.
+private mark_slot_life(e: *Emit, symbol: string, slot: Val)
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(LInt(64), VInt(from_int(-1))))
+    args.push(ir_arg(LPtr, slot))
+    emit(e, ir_call(None, LVoid, VGlobal(symbol), args))
+    e.uses_lifetime = true
+end mark_slot_life

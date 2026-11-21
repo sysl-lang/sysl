@@ -1365,7 +1365,8 @@ can_begin_pattern(t: Tok) -> bool = t match
 
 // -- string interpolation ----------------------------------------------------------------------------
 
-// `s"a ${x} b"` becomes the concatenation it means, and `f"${n}%04d"` renders through `format`.
+// `s"a ${x} b"` becomes the concatenation it means, rendered whole -- `$str("a " + $str(x) + " b")`
+// -- and `f"${n}%04d"` renders through `format`.
 //
 // **The holes are lexed and parsed here**, the lexer having kept each one as the source between its
 // braces: what a hole says is the grammar's business and not that pass's.
@@ -1412,10 +1413,18 @@ private desugar_interp(p: *Parser, at: Span, parts: Buf[string], exprs: Buf[stri
 
     var out = terms[0]
 
+    if terms.len() == 1 then return out
+
     for i in 1..<terms.len()
         out = expr(at, Binary("+", out, terms[i]))
 
-    out
+    // **The join is rendered as a whole** -- `$str` of a string is the string -- which is what tells
+    // the lowering to write every piece into one buffer and finish it once (`emit_str.sysl`'s
+    // `gen_interp`) rather than making a string per `+`.
+    var whole: Buf[Expr] = buf()
+
+    whole.push(out)
+    expr(at, Call(expr(at, Ident(HoleRender)), whole))
 end desugar_interp
 
 // A hole, read as an expression of its own.
