@@ -2204,6 +2204,30 @@ print(fill[3](7)[2])
 A length the reading cannot follow — one a `shuffle` or a `lookup` makes, or a written `[0]T` —
 stays a number there, and each instantiation answers for it.
 
+**A type parameter held in a type is a symbol in the same way.** A `Box[T]` where a `Box[U]` was
+declared is refused at the declaration, in every position above, and a call at `[int, int]` — where
+the two happen to be one type — does not make the body right:
+
+```sysl
+struct Box[T]
+    v: T
+
+cast[T, U](b: Box[T]) -> Box[U] = b
+
+print(cast[int, int](Box(1)).v)
+```
+
+```error
+function 'cast' should return Box[U], but its body yields Box[T] — 'T' and 'U' are different type parameters
+```
+
+A **bare** `T` where `U` was asked for is left to each instantiation, because one may convert the
+other: `widen[T: Integer, U: Integer](x: T) -> U = x` widens at `[u8, int]` and is refused at
+`[int, u8]`. Nothing converts a `Box[u8]`, an `Option[u8]`, a `[2]u8` or a `&u8` into its `int`
+twin, which is why under a type the two must be one. A parameter against a concrete type
+(`-> Box[int] = b`) and an associated type a bound fixes (`S::Error` with `S: Source[Error = E]`)
+are also answered by the instantiations, which know what they are.
+
 Writing a **type** parameter where a length belongs is refused for the opposite reason, since a
 length is a value:
 
