@@ -14,10 +14,19 @@ import sysl.math.bigint.{BigInt, cmp, from_int, to_string}
 
 // The element type a position wants out of a sequence.
 private element_wanted(t: Type) -> Option[Type] = repr(t) match
-    Array(_, e) -> Some(*e)
+    Array(_, e, _) -> Some(*e)
     Slice(e, _) -> Some(*e)
-    Vector(_, e) -> Some(*e)
+    Vector(_, e, _) -> Some(*e)
     _ -> None
+
+// A literal or a repeat that does not fill the length asked of it. Where that length is a value
+// parameter's form, read at the generic's own definition, the mismatch holds at every instantiation
+// and is kept there (`value_terms.sysl`); any other is told by the instantiations, as before.
+private length_fault(cx: &Analyzer, span: Span, message: string, symbolic: bool)
+    if symbolic && cx.at_definition then cx.an.bound_fault(cx.scope, span, message)
+
+    cx.fault(span, message)
+end length_fault
 
 // A string literal where a `[N]u8` is wanted: the literal's UTF-8 bytes, one element each, as the
 // array literal they spell. It is an array literal from here on, so it folds to constant data
@@ -29,22 +38,25 @@ bytes_literal(cx: &Analyzer, span: Span, text: string, expected: Option[Type]) -
     val want = expected.unwrap()
 
     repr(want) match
-        Array(n, elem) ->
+        Array(n, elem, term) ->
             if repr(*elem) != Integer(8, false, false) then return None
 
             val bytes = text.bytes
 
-            if int(bytes.len) != n then
-                return Some(cx.err(span, s"this string literal is ${bytes.len} bytes and " +
-                                   s"${type_show(want)} holds $n — a string literal fills a byte " +
-                                   "array only when its UTF-8 length is exactly the array's"))
+            if !extents_agree(int(bytes.len), buf(), n, term)
+                length_fault(cx, span, s"this string literal is ${bytes.len} bytes and " +
+                             s"${type_show(want)} holds ${extent_text(n, term)} — a string literal " +
+                             "fills a byte array only when its UTF-8 length is exactly the array's",
+                             !term.is_empty())
+                return Some(bad_expr(span))
+            end if
 
             var ts: Buf[TExpr] = buf()
 
             for b in bytes
                 ts.push(TExpr(span, TIntLit(from_int(long(b)), *elem)))
 
-            Some(TExpr(span, TArrayLit(ts, Array(n, *elem))))
+            Some(TExpr(span, TArrayLit(ts, Array(int(bytes.len), *elem, buf()))))
         _ -> None
 end bytes_literal
 
@@ -103,7 +115,8 @@ array_literal(cx: &Analyzer, span: Span, elems: Buf[Expr], expected: Option[Type
         return cx.err(span, "an empty array literal takes its element type from its context, and " +
                       "there is none here")
 
-    if expected.is_none() then return TExpr(span, TArrayLit(ts, Array(int(ts.len()), elem_ty)))
+    if expected.is_none() then
+        return TExpr(span, TArrayLit(ts, Array(int(ts.len()), elem_ty, buf())))
 
     repr(expected.unwrap()) match
         // The buffer is storage this expression makes, so nobody else can be holding a writable
@@ -111,14 +124,14 @@ array_literal(cx: &Analyzer, span: Span, elems: Buf[Expr], expected: Option[Type
         Slice(_, read_only) -> TExpr(span, TBufLit(ts, Slice(elem_ty, read_only)))
         // The lane count is part of the type, so a literal that does not fill it is a mistake with
         // an exact number in it -- unlike an array, whose length the literal is free to decide.
-        Vector(n, _) ->
-            if int(ts.len()) != n then
-                cx.fault(span, s"${type_show(expected.unwrap())} has $n lanes and this literal has " +
-                         s"${ts.len()} — a vector's width is part of its type, so the two have to " +
-                         "agree")
+        Vector(n, _, term) ->
+            if !extents_agree(int(ts.len()), buf(), n, term) then
+                length_fault(cx, span, s"${type_show(expected.unwrap())} has ${extent_text(n, term)} " +
+                             s"lanes and this literal has ${ts.len()} — a vector's width is part of " +
+                             "its type, so the two have to agree", !term.is_empty())
 
-            TExpr(span, TVectorLit(ts, Vector(n, elem_ty)))
-        _ -> TExpr(span, TArrayLit(ts, Array(int(ts.len()), elem_ty)))
+            TExpr(span, TVectorLit(ts, Vector(n, elem_ty, term)))
+        _ -> TExpr(span, TArrayLit(ts, Array(int(ts.len()), elem_ty, buf())))
 end array_literal
 
 // `[v; n]` -- the form for an array whose element type has no zero, or has one that is not the
@@ -133,7 +146,8 @@ array_fill(cx: &Analyzer, span: Span, value: Expr, count: Expr, expected: Option
 
     if expected.is_some() then
         repr(expected.unwrap()) match
-            Vector(n, elem) -> return vector_fill(cx, span, tv, count, n, *elem, expected.unwrap())
+            Vector(n, elem, term) -> return vector_fill(cx, span, tv, count, n, term, *elem,
+                                                        expected.unwrap())
             Slice(_, read_only) -> return buffer_fill(cx, span, tv, count, read_only)
             _ -> ()
 
@@ -154,22 +168,34 @@ array_fill(cx: &Analyzer, span: Span, value: Expr, count: Expr, expected: Option
     if cmp(n.unwrap(), from_int(0)) < 0 || too_many_elements(n.unwrap()) then
         return cx.err(span, s"an array cannot have ${to_string(n.unwrap())} elements")
 
-    TExpr(span, TArrayFill(tv, Array(int(n.unwrap().to_long().unwrap_or(0)), vt)))
+    // A count naming a value parameter is that parameter's form at the generic's own definition, so
+    // `[v; N]` is a `[N]T` there rather than an array of the zero `N` stands at.
+    TExpr(span, TArrayFill(tv, Array(int(n.unwrap().to_long().unwrap_or(0)), vt,
+                                     extent_term(cx.an, cx.scope, count, cx.subst))))
 end array_fill
 
 // `[v; n]` where a vector was asked for is the splat written out, accepted because the reader has
 // written the array form of a thing a vector also has. The count is still checked against the lane
 // count, since a vector that does not fill its width is the same mistake as a literal that does not.
-private vector_fill(cx: &Analyzer, span: Span, tv: TExpr, count: Expr, lanes: int, elem: Type,
-                    vec: Type) -> TExpr
+private vector_fill(cx: &Analyzer, span: Span, tv: TExpr, count: Expr, lanes: int, term: Buf[Mono],
+                    elem: Type, vec: Type) -> TExpr
     val n = const_int(cx, count)
+    val shown = extent_text(lanes, term)
 
     if n.is_none() then
-        cx.fault(span, s"${type_show(vec)} has $lanes lanes, which is part of its type — so a " +
+        cx.fault(span, s"${type_show(vec)} has $shown lanes, which is part of its type — so a " +
                  "repeat filling one needs a constant count")
-    else if n.unwrap().to_long().unwrap_or(-1) != long(lanes) then
-        cx.fault(span, s"${type_show(vec)} has $lanes lanes and this repeat makes " +
-                 s"${to_string(n.unwrap())}")
+    else
+        val made = extent_term(cx.an, cx.scope, count, cx.subst)
+        val k = n.unwrap().to_long().unwrap_or(-1)
+        // A count past any lane count is told by its number, never narrowed to be compared.
+        val agree = k >= 0 && k <= long(lanes) && extents_agree(int(k), made, lanes, term)
+
+        if !agree then
+            length_fault(cx, span, s"${type_show(vec)} has $shown lanes and this repeat makes " +
+                         (if made.is_empty() then to_string(n.unwrap()) else term_text(made)),
+                         !term.is_empty() || !made.is_empty())
+    end if
 
     TExpr(span, TSplat(coerce(cx, tv, elem), vec))
 end vector_fill
@@ -280,7 +306,7 @@ private parts_meet(cx: &Analyzer, es: Buf[Expr]) -> Option[Type]
 
         val t = parts_meet(cx, all)
 
-        return if t.is_some() then Some(Array(int(rows), t.unwrap())) else None
+        return if t.is_some() then Some(Array(int(rows), t.unwrap(), buf())) else None
     end if
 
     val ts = analyze_operands(cx, es, None, true)
@@ -366,7 +392,7 @@ index_expr(cx: &Analyzer, span: Span, receiver: Expr, index: Expr,
     repr(texpr_type(tr)) match
         // A lane is read out of a register rather than through an address, so the index is held to
         // being a constant and checked here, where there is a number to name.
-        Vector(lanes, elem) -> lane_expr(cx, span, tr, index, lanes, *elem)
+        Vector(lanes, elem, _) -> lane_expr(cx, span, tr, index, lanes, *elem)
         _ -> index_non_vector(cx, span, raw, tr, index, expected)
 end index_expr
 
@@ -388,7 +414,7 @@ pointee_indexes(cx: &Analyzer, inner: Type) -> bool
                 if b.name != "Self" && repr(b.ty) == t then return parameter_indexes(cx, b.name)
 
     t match
-        Array(_, _) -> return true
+        Array(_, _, _) -> return true
         Abstract(_, bounds) ->
             return bound_member(cx.an, t, bounds, "index_place").is_some() ||
                    bound_member(cx.an, t, bounds, "index").is_some()
@@ -924,7 +950,7 @@ private elem_hint(receiver: Expr, expected: Option[Type]) -> Option[Type]
 
     *receiver.kind match
         ArrayLit(es) -> expected.unwrap() match
-            Slice(elem, _) -> Some(Array(int(es.len()), *elem))
+            Slice(elem, _) -> Some(Array(int(es.len()), *elem, buf()))
             _ -> None
         _ -> None
 end elem_hint
@@ -936,7 +962,7 @@ private pointee_array(cx: &Analyzer, inner: Type) -> Option[Type]
         if b.name != "Self" && repr(b.ty) == repr(inner) then return None
 
     inner match
-        Array(_, e) -> Some(*e)
+        Array(_, e, _) -> Some(*e)
         _ -> None
 end pointee_array
 
@@ -947,9 +973,9 @@ private slice_elem(cx: &Analyzer, span: Span, rt: Type, hi: Option[Expr]) -> Opt
         // A `&sync` array's view takes no count of the box, and may only be lent (`escape.sysl`).
         Ref(inner, _) ->
             *inner match
-                Array(_, e) -> return Some(*e)
+                Array(_, e, _) -> return Some(*e)
                 _ -> ()
-        Array(_, e) -> return Some(*e)
+        Array(_, e, _) -> return Some(*e)
         Slice(e, _) -> return Some(*e)
         // A view of a `*T` region -- the shape every C function that fills a buffer hands back. The
         // pointer carries no length, so the end must be written and is taken on trust.

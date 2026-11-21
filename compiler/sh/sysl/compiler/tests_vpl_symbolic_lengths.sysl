@@ -1,0 +1,348 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// An **array's length and a vector's lane count are symbols** while a generic's own declaration is
+// read, as a value parameter is (`value_terms.sysl`, `reference/generics.md § What may be written
+// with N`): `[N]int` is not `[M]int` and not `[3]int`, so a body yielding one where the other was
+// declared is wrong for every instantiation and refused at the declaration, called or not.
+//
+// The axes: the position the two meet at (a result, a local's declared type, an argument, a struct
+// field), the shape (an array, a vector, an array inside a value-generic struct), what made the
+// value (a parameter, a literal, a repeat `[v; N]`, a lane-wise comparison, a call to another
+// generic that solves its own parameter from the length), the declaration (a free function, an
+// `impl` over `[N]T`, a struct with a defaulted value parameter), and the build (one program, a
+// `--lib` root, `build-lib`). A length that computes with a parameter is refused where it is written
+// (`[N + 1]int`), as before.
+//
+// Skipped: a written `[0]T` against `[N]T` is still left to the instantiations (`extents_agree`: a
+// zero with no form is read as a stand-in that lost its form), pinned below; a lane-wise operation
+// that changes or recomputes a count (`shuffle`, `bits`, `lookup`) makes a vector with no form, so
+// it is answered by the instantiations, as every count was.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private vpl_skip() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return true
+
+    false
+end vpl_skip
+
+// What the program PRINTS, or what the build had to say about it.
+private vpl_ran(main: string) -> string
+    val root = make_temp_dir("sysl-vpl").unwrap()
+    val exe = root + "/built"
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(root + "/main.sysl", main).unwrap()
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end vpl_ran
+
+// The program is refused with this message, at this line of `main.sysl`.
+private vpl_refused(said: string, message: string, line: int)
+    assert(said.index_of(s"error: $message\n").is_some(), s"expected 'error: $message', got: $said")
+    assert(said.index_of(s"/main.sysl:$line:").is_some(), s"expected it at main.sysl:$line, got: $said")
+
+private vpl_errors(said: string) -> int
+    var n = 0
+    var rest = said
+
+    loop
+        rest.index_of("error: ") match
+            None -> break
+            Some(i) ->
+                n += 1
+                rest = rest[i + 7..<rest.bytes.len]
+
+    n
+end vpl_errors
+
+// -- arrays, refused at the declaration -----------------------------------------------------------
+
+@test("two lengths are two types, refused at a generic nothing calls")
+vpl_two_lengths_refused_uncalled()
+    if vpl_skip() then return
+
+    val said = vpl_ran("cast[const N: usize, const M: usize](xs: [N]int) -> [M]int = xs\nprint(1)\n")
+
+    vpl_refused(said, "function 'cast' should return [M]int, but its body yields [N]int — 'N' and 'M' " +
+                "are different value parameters", 1)
+
+@test("a length is not the one constant an instantiation might choose")
+vpl_length_not_a_constant()
+    if vpl_skip() then return
+
+    val said = vpl_ran("three[const N: usize](xs: [N]int) -> [3]int = xs\nprint(1)\n")
+
+    vpl_refused(said, "function 'three' should return [3]int, but its body yields [N]int — 'N' stands " +
+                "for every value an instantiation chooses, not only 3", 1)
+
+@test("a local's declared length against the parameter's")
+vpl_local_refused()
+    if vpl_skip() then return
+
+    val said = vpl_ran(raw"""
+        f[const N: usize, const M: usize](xs: [N]int) -> usize
+            val ys: [M]int = xs
+            ys.len
+        print(1)
+        """)
+
+    vpl_refused(said, "cannot initialize 'ys': declared [M]int but the value is [N]int — 'N' and 'M' " +
+                "are different value parameters", 2)
+
+@test("a literal's length is a constant, not the parameter")
+vpl_literal_refused()
+    if vpl_skip() then return
+
+    val said = vpl_ran(raw"""
+        f[const N: usize]() -> usize
+            val ys: [N]int = [1, 2, 3]
+            ys.len
+        print(1)
+        """)
+
+    vpl_refused(said, "cannot initialize 'ys': declared [N]int but the value is [3]int — 'N' stands for " +
+                "every value an instantiation chooses, not only 3", 2)
+
+@test("an argument whose length is the parameter where a fixed length is taken")
+vpl_argument_refused()
+    if vpl_skip() then return
+
+    val said = vpl_ran(raw"""
+        four(xs: [4]int) -> int = xs[0]
+        f[const N: usize](xs: [N]int) -> int = four(xs)
+        print(1)
+        """)
+
+    assert(said.index_of("is [4]int, but [N]int was given — 'N' stands for every value an " +
+                         "instantiation chooses, not only 4\n").is_some(), said)
+    assert(said.index_of("/main.sysl:2:").is_some(), said)
+
+@test("a repeat's count is the parameter it names")
+vpl_repeat_refused()
+    if vpl_skip() then return
+
+    val said = vpl_ran("fill[const N: usize, const M: usize](x: int) -> [N]int = [x; M]\nprint(1)\n")
+
+    vpl_refused(said, "function 'fill' should return [N]int, but its body yields [M]int — 'M' and 'N' " +
+                "are different value parameters", 1)
+
+@test("called, the mismatch is told once, in the declaration's terms")
+vpl_told_once_when_called()
+    if vpl_skip() then return
+
+    val said = vpl_ran("three[const N: usize](xs: [N]int) -> [3]int = xs\nprint(three([1, 2, 3])[0])\n")
+
+    vpl_refused(said, "function 'three' should return [3]int, but its body yields [N]int — 'N' stands " +
+                "for every value an instantiation chooses, not only 3", 1)
+    assert_eq(vpl_errors(said), 1)
+
+@test("a length computed with a parameter is still refused where it is written")
+vpl_length_arithmetic_refused()
+    if vpl_skip() then return
+
+    val said = vpl_ran("f[const N: usize](xs: [N]int) -> [N + 1]int = xs\nprint(1)\n")
+
+    assert(said.index_of("the length 'N + 1' computes with the value parameter 'N'").is_some(), said)
+
+// -- arrays, accepted ----------------------------------------------------------------------------
+
+@test("a length handed to another generic comes back as the same symbol")
+vpl_through_a_generic_call()
+    if vpl_skip() then return
+
+    assert_eq(vpl_ran(raw"""
+        same[const M: usize](xs: [M]int) -> [M]int = xs
+        outer[const N: usize](xs: [N]int) -> [N]int = same(xs)
+        named[const N: usize](xs: [N]int) -> [N]int = same[N](xs)
+        print(outer([1, 2, 3])[2], named([4, 5])[1])
+        """), "3 5\n")
+
+@test("a repeat of the parameter's count, and an array the parameter sizes")
+vpl_repeat_accepted()
+    if vpl_skip() then return
+
+    assert_eq(vpl_ran(raw"""
+        fill[const N: usize](x: int) -> [N]int = [x; N]
+        sized[const N: usize](xs: [N]int) -> usize
+            val ys: [N]int = xs
+            ys.len
+        print(fill[3](7)[2], sized([1, 2, 3, 4]))
+        """), "7 4\n")
+
+@test("a written zero length is still left to the instantiations")
+vpl_written_zero_left_to_instances()
+    if vpl_skip() then return
+
+    assert_eq(vpl_ran("z[const N: usize](xs: [N]int) -> [0]int = xs\nprint(1)\n"), "1\n")
+
+// -- vectors ---------------------------------------------------------------------------------------
+
+@test("two lane counts are two types, refused at a generic nothing calls")
+vpl_two_lane_counts_refused()
+    if vpl_skip() then return
+
+    val said = vpl_ran("vcast[const N: usize, const M: usize](v: <N>f32) -> <M>f32 = v\nprint(1)\n")
+
+    vpl_refused(said, "function 'vcast' should return <M>f32, but its body yields <N>f32 — 'N' and 'M' " +
+                "are different value parameters", 1)
+
+@test("a vector literal does not fill a lane count that is a parameter")
+vpl_vector_literal_refused()
+    if vpl_skip() then return
+
+    val said = vpl_ran("four[const N: usize]() -> <N>f32 = [1, 2, 3, 4]\nprint(1)\n")
+
+    vpl_refused(said, "<N>f32 has N lanes and this literal has 4 — a vector's width is part of its type, " +
+                "so the two have to agree", 1)
+
+@test("a vector read as an array of another parameter's length")
+vpl_lanes_as_refused()
+    if vpl_skip() then return
+
+    val said = vpl_ran("va[const N: usize, const M: usize](v: <N>f32) -> [M]f32 = v\nprint(1)\n")
+
+    assert(said.index_of("<N>f32 has N lanes and [M]f32 has M elements").is_some(), said)
+    assert(said.index_of("/main.sysl:1:").is_some(), said)
+
+@test("a lane-wise comparison keeps the lane count, and a splat its vector's")
+vpl_lane_wise_accepted()
+    if vpl_skip() then return
+
+    assert_eq(vpl_ran(raw"""
+        below[const W: usize](a: <W>f32, b: <W>f32) -> <W>bool = a < b
+        floor[const W: usize](v: <W>f32, lo: f32) -> <W>f32 = (v < lo).select(lo, v)
+        val a: <4>f32 = [1, 2, 3, 4]
+        val b: <4>f32 = [2, 3, 4, 5]
+        print(below(a, b).all(), floor(a, 2.5)[0])
+        """), "true 2.5\n")
+
+// -- with traits, defaults and value-generic structs ----------------------------------------------
+
+@test("a member of an impl over [N]T is held to its own length")
+vpl_impl_member_refused()
+    if vpl_skip() then return
+
+    val said = vpl_ran(raw"""
+        trait Twice
+            twice(self) -> Self
+        impl[const N: usize] Twice for [N]int
+            twice(self) -> [N]int = [0; 2]
+        print(1)
+        """)
+
+    assert(said.index_of("— 'N' stands for every value an instantiation chooses, not only 2\n").is_some(),
+           said)
+
+@test("a trait over [N]T reached from another generic's [N]T")
+vpl_impl_reached_accepted()
+    if vpl_skip() then return
+
+    assert_eq(vpl_ran(raw"""
+        trait Doubled
+            doubled(self) -> Self
+        impl[const N: usize] Doubled for [N]int
+            doubled(self) -> [N]int
+                var out = self
+                for i in 0..<N
+                    out[i] = self[i] * 2
+                out
+        twice_over[const N: usize](xs: [N]int) -> [N]int = xs.doubled().doubled()
+        print(twice_over([1, 2, 3])[2])
+        """), "12\n")
+
+@test("a defaulted value parameter sizes a field, and the field is its symbol")
+vpl_default_field()
+    if vpl_skip() then return
+
+    val bad = vpl_ran(raw"""
+        struct Ring[const N: usize = 4]
+            slots: [N]int
+        four[const N: usize](r: Ring[N]) -> [4]int = r.slots
+        print(1)
+        """)
+
+    vpl_refused(bad, "function 'four' should return [4]int, but its body yields [N]int — 'N' stands for " +
+                "every value an instantiation chooses, not only 4", 3)
+
+    assert_eq(vpl_ran(raw"""
+        struct Ring[const N: usize = 4]
+            slots: [N]int
+        slots_of[const N: usize](r: Ring[N]) -> [N]int = r.slots
+        val r: Ring = Ring([1, 2, 3, 4])
+        print(slots_of(r)[3], slots_of(Ring[2]([5, 6]))[1])
+        """), "4 6\n")
+
+@test("a struct's field length against a value argument's form")
+vpl_value_struct_field()
+    if vpl_skip() then return
+
+    val said = vpl_ran(raw"""
+        struct Held[const N: usize]
+            data: [N]int
+        mk[const N: usize, const M: usize](xs: [M]int) -> Held[N] = Held(xs)
+        print(1)
+        """)
+
+    assert(said.index_of("but [M]int was given — 'M' and 'N' are different value parameters\n").is_some(),
+           said)
+
+    assert_eq(vpl_ran(raw"""
+        struct Held[const N: usize]
+            data: [N]int
+        wrap[const N: usize](xs: [N]int) -> Held[N] = Held(xs)
+        print(wrap([1, 2]).data[1])
+        """), "2\n")
+
+// -- separate compilation ---------------------------------------------------------------------------
+
+@test("build-lib refuses a generic whose lengths disagree, called by nothing")
+vpl_build_lib_refuses()
+    if !lbr_ready() then return
+
+    val root = lbr_tree(lbr_one("demo/demo.sysl",
+                                "module demo\n\ncast[const N: usize, const M: usize](xs: [N]int) -> [M]int = xs\n"))
+    val got = lbr_cli(["sysl", "build-lib", root])
+
+    lbr_drop([root])
+    assert(got.0 != 0, got.1)
+    assert(got.1.index_of("'N' and 'M' are different value parameters").is_some(), got.1)
+
+@test("a library's generic over [N]T instantiates in a program at two lengths")
+vpl_library_instances_agree()
+    if !lbr_ready() then return
+
+    val lib = lbr_tree(lbr_one("demo/demo.sysl", "module demo\n\n" +
+                               "same[const M: usize](xs: [M]int) -> [M]int = xs\n\n" +
+                               "last[const N: usize](xs: [N]int) -> int = same(xs)[N - 1]\n"))
+    val prog = lbr_program("import demo.*\n\nprint(last([1, 2, 3]), last([4, 5]), same([6])[0])\n")
+    val said = lbr_run(prog, [lib])
+
+    lbr_drop([lib, prog])
+    assert_eq(said, "3 5 6\n")

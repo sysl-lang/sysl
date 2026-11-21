@@ -1,0 +1,327 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A **type parameter is a symbol** while its own declaration is read, as a value parameter is
+// (`value_terms.sysl`, `reference/generics.md § What may be written with N`): `Box[T]` is not
+// `Box[U]`, so a body handing a `Box[T]` where a `Box[U]` was declared is refused at the
+// declaration, whether or not anything calls it -- and a call at `[int, int]`, where the two happen
+// to be one type, does not make it right.
+//
+// The axes: the position the two meet at (a result, a local's declared type, an argument, a field, a
+// closure's result), the declaration (a free function in the entry file or in another file, a method
+// of a generic `impl`, a nested function), the depth (`Box[Option[T]]`), a parameter bare or under a
+// type, a bound on the parameters, a struct with both a type and a value parameter, and what is left
+// to the instantiations: a bare parameter against another (an instantiation may widen `u8` into
+// `int`, which nothing does under a `Box`), an associated type fixed to a parameter by a bound
+// (`S::Error` is `E` only once `S` is chosen) and a parameter against a concrete type. Not built: a
+// pack's two stand-ins are not the declaration's own parameters, so they are never compared here.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private vpc_skip() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return true
+
+    false
+end vpc_skip
+
+private vpc_write(main: string, other: string) -> string
+    val root = make_temp_dir("sysl-vpc").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(root + "/main.sysl", main).unwrap()
+
+    if other != "" then write_text(root + "/other.sysl", other).unwrap()
+
+    root
+end vpc_write
+
+// What the program PRINTS, or what the build had to say about it.
+private vpc_ran(main: string, other: string = "") -> string
+    val root = vpc_write(main, other)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end vpc_ran
+
+// The program is refused with this message, at this line of `file`, and with nothing else.
+private vpc_refused(said: string, message: string, file: string, line: int)
+    assert(said.index_of(s"error: $message\n").is_some(), s"expected 'error: $message', got: $said")
+    assert(said.index_of(s"/$file:$line:").is_some(), s"expected it at $file:$line, got: $said")
+    assert_eq(vpc_errors(said), 1, said)
+
+private vpc_errors(said: string) -> int
+    var n = 0
+    var rest = said
+
+    loop
+        rest.index_of("error: ") match
+            None -> break
+            Some(i) ->
+                n += 1
+                rest = rest[i + 7..<rest.bytes.len]
+
+    n
+end vpc_errors
+
+private vpc_box() -> string = "struct Box[T]\n    v: T\n\n"
+
+// -- refused at the declaration -------------------------------------------------------------------
+
+@test("Box[T] handed back as Box[U], refused at a generic nothing calls")
+vpc_box_cast_refused_uncalled()
+    if vpc_skip() then return
+
+    val said = vpc_ran(vpc_box() + "cast[T, U](b: Box[T]) -> Box[U] = b\nprint(1)\n")
+
+    vpc_refused(said, "function 'cast' should return Box[U], but its body yields Box[T] — 'T' and 'U' " +
+                "are different type parameters", "main.sysl", 4)
+
+@test("called at [int, int], where the two are one type, it is still refused, once")
+vpc_box_cast_refused_called()
+    if vpc_skip() then return
+
+    val said = vpc_ran(vpc_box() + "cast[T, U](b: Box[T]) -> Box[U] = b\nprint(cast[int, int](Box(1)).v)\n")
+
+    vpc_refused(said, "function 'cast' should return Box[U], but its body yields Box[T] — 'T' and 'U' " +
+                "are different type parameters", "main.sysl", 4)
+
+@test("&T handed back as &U is refused; a bare T as U is left to the instantiation, which may widen")
+vpc_bare_parameters_left_to_instances()
+    if vpc_skip() then return
+
+    val boxed = vpc_ran("f[T, U](x: &T) -> &U = x\nprint(1)\n")
+
+    vpc_refused(boxed, "function 'f' should return &U, but its body yields &T — 'T' and 'U' are different " +
+                "type parameters", "main.sysl", 1)
+
+    val widen = "widen[T: Integer, U: Integer](x: T) -> U = x\n"
+
+    assert_eq(vpc_ran(widen + "print(widen[u8, int](u8(3)))\n"), "3\n")
+
+    val narrow = vpc_ran(widen + "print(widen[int, u8](3))\n")
+
+    assert(narrow.index_of("different type parameters").is_none(), narrow)
+    assert(narrow.index_of("error: ").is_some(), narrow)
+
+@test("two parameters under two generic types")
+vpc_nested_refused()
+    if vpc_skip() then return
+
+    val said = vpc_ran(vpc_box() + "nest[T, U](b: Box[Option[T]]) -> Box[Option[U]] = b\nprint(1)\n")
+
+    vpc_refused(said, "function 'nest' should return Box[Option[U]], but its body yields Box[Option[T]] — " +
+                "'T' and 'U' are different type parameters", "main.sysl", 4)
+
+@test("a struct of a type and a value parameter, parting at either")
+vpc_type_and_value_parameters_refused()
+    if vpc_skip() then return
+
+    val row = "struct Row[T, const L: usize]\n    v: T\n\n"
+    val by_value = vpc_ran(row + "grow[T, const L: usize, const M: usize](r: Row[T, L]) -> Row[T, M] = r\n" +
+                           "print(1)\n")
+
+    vpc_refused(by_value, "function 'grow' should return Row[T, M], but its body yields Row[T, L] — 'L' and " +
+                "'M' are different value parameters", "main.sysl", 4)
+
+    val by_type = vpc_ran(row + "retype[T, U, const L: usize](r: Row[T, L]) -> Row[U, L] = r\nprint(1)\n")
+
+    vpc_refused(by_type, "function 'retype' should return Row[U, L], but its body yields Row[T, L] — 'T' and " +
+                "'U' are different type parameters", "main.sysl", 4)
+
+@test("bounds on the parameters do not make them one")
+vpc_bounded_refused()
+    if vpc_skip() then return
+
+    val said = vpc_ran(vpc_box() + raw"""
+        trait Show
+            show(self) -> int
+        cast[T: Show, U: Show](b: Box[T]) -> Box[U] = b
+        print(1)
+        """)
+
+    vpc_refused(said, "function 'cast' should return Box[U], but its body yields Box[T] — 'T' and 'U' " +
+                "are different type parameters", "main.sysl", 6)
+
+@test("a generic method of a generic impl, its own parameter against the impl's")
+vpc_impl_method_refused()
+    if vpc_skip() then return
+
+    val said = vpc_ran(vpc_box() + raw"""
+        impl[T] Box[T]
+            conv[U](self) -> Box[U] = self
+        print(1)
+        """)
+
+    vpc_refused(said, "function 'Box.conv' should return Box[U], but its body yields Box[T] — 'T' and 'U' " +
+                "are different type parameters", "main.sysl", 5)
+
+@test("a local's declared type, an argument and a field")
+vpc_local_argument_field_refused()
+    if vpc_skip() then return
+
+    val local = vpc_ran(vpc_box() + raw"""
+        local[T, U](b: Box[T]) -> int
+            val g: Box[U] = b
+            1
+        print(1)
+        """)
+
+    vpc_refused(local, "cannot initialize 'g': declared Box[U] but the value is Box[T] — 'T' and 'U' are " +
+                "different type parameters", "main.sysl", 5)
+
+    val arg = vpc_ran(vpc_box() + raw"""
+        takes[U](b: Box[U]) -> int = 1
+        arg[T, U](b: Box[T]) -> int = takes[U](b)
+        print(1)
+        """)
+
+    vpc_refused(arg, "'b' of 'takes' is Box[U], but Box[T] was given — 'T' and 'U' are different type " +
+                "parameters", "main.sysl", 5)
+
+    val field = vpc_ran(vpc_box() + raw"""
+        struct Pair[T, U]
+            a: Box[T]
+            b: Box[U]
+        swap[T, U](x: Box[T], y: Box[U]) -> Pair[T, U] = Pair[T, U](y, x)
+        print(1)
+        """)
+
+    vpc_refused(field, "'a' of 'Pair[T, U]' is Box[T], but Box[U] was given — 'U' and 'T' are different type " +
+                "parameters", "main.sysl", 7)
+
+@test("a nested function and a closure, read where they are written")
+vpc_nested_function_and_closure_refused()
+    if vpc_skip() then return
+
+    val nested = vpc_ran(vpc_box() + raw"""
+        outer(n: int) -> int
+            inner[T, U](b: Box[T]) -> Box[U] = b
+            n
+        print(outer(1))
+        """)
+
+    vpc_refused(nested, "this closure should yield Box[U], but its body yields Box[T] — 'T' and 'U' are " +
+                "different type parameters", "main.sysl", 5)
+
+    val closure = vpc_ran(vpc_box() + raw"""
+        apply[T, U](b: Box[T]) -> int
+            val f: &Fn(Box[T]) -> Box[U] = x -> x
+            1
+        print(1)
+        """)
+
+    vpc_refused(closure, "this closure should yield Box[U], but its body yields Box[T] — 'T' and 'U' are " +
+                "different type parameters", "main.sysl", 5)
+
+    // The value parameter's twin, which the closure's own position missed as well.
+    val by_value = vpc_ran(raw"""
+        struct Buf[const N: usize]
+            used: usize
+        apply[const N: usize, const M: usize](b: Buf[N]) -> usize
+            val f: &Fn(Buf[N]) -> Buf[M] = x -> x
+            f(b).used
+        print(1)
+        """)
+
+    vpc_refused(by_value, "this closure should yield Buf[M], but its body yields Buf[N] — 'N' and 'M' are " +
+                "different value parameters", "main.sysl", 4)
+
+@test("a closure handed to a generic method inside a generic of the same parameter names is accepted")
+vpc_closure_through_generic_call_accepted()
+    if vpc_skip() then return
+
+    assert_eq(vpc_ran(vpc_box() + raw"""
+        impl[T] Box[T]
+            map[U](self, f: &Fn(T) -> U) -> Box[U] = Box(f(self.v))
+        wrap[T, U](b: Box[T], g: &Fn(T) -> U) -> Box[Box[U]] = b.map(x -> Box(g(x)))
+        swap[U, T](b: Box[U], g: &Fn(U) -> T) -> Box[T] = b.map(g)
+        print(wrap(Box(2), x -> x * 5).v.v, swap(Box(3), x -> x > 2).v)
+        """), "10 true\n")
+
+@test("a generic in a file other than the entry, never called")
+vpc_other_file_refused()
+    if vpc_skip() then return
+
+    val said = vpc_ran("print(1)\n", vpc_box() + "cast[T, U](b: Box[T]) -> Box[U] = b\n")
+
+    vpc_refused(said, "function 'cast' should return Box[U], but its body yields Box[T] — 'T' and 'U' " +
+                "are different type parameters", "other.sysl", 4)
+
+// -- accepted ------------------------------------------------------------------------------------
+
+@test("Box[T] to Box[T], bounded or not, as a function and as a method, is accepted and runs")
+vpc_same_parameter_accepted()
+    if vpc_skip() then return
+
+    assert_eq(vpc_ran(vpc_box() + raw"""
+        trait Show
+            show(self) -> int
+        impl Show for int
+            show(self) -> int = self * 10
+        same[T](b: Box[T]) -> Box[T] = b
+        shown[T: Show](b: Box[T]) -> Box[T]
+            val kept: Box[T] = b
+            kept
+        impl[T] Box[T]
+            keep(self) -> Box[T] = self
+            map[U](self, f: T -> U) -> Box[U] = Box(f(self.v))
+        print(same(Box(1)).v, shown(Box(2)).v.show(), Box(3).keep().v, Box(4).map(x -> x + 1).v)
+        """), "1 20 3 5\n")
+
+@test("an associated type a bound fixes to a parameter is left to the instantiation")
+vpc_associated_type_accepted()
+    if vpc_skip() then return
+
+    assert_eq(vpc_ran(raw"""
+        trait Source
+            type Error
+            get(self) -> Result[int, Self::Error]
+        enum Fault
+            Empty
+        struct Box
+            v: int
+        impl Source for Box
+            type Error = Fault
+            get(self) -> Result[int, Self::Error] = if self.v == 0 then Err(Fault.Empty) else Ok(self.v)
+        tripled[S: Source[Error = E], E](s: S) -> Result[int, E]
+            val v = s.get()?
+            Ok(v * 3)
+        print(tripled(Box(2)).unwrap())
+        """), "6\n")
+
+@test("a parameter against a concrete type is still answered by each instantiation")
+vpc_concrete_left_to_instances()
+    if vpc_skip() then return
+
+    // Not wrong as written for every choice, so the declaration says nothing; the instantiation at
+    // `bool` is refused in its own terms.
+    val said = vpc_ran(vpc_box() + "pin[T](b: Box[T]) -> Box[int] = b\nprint(pin[bool](Box(true)).v)\n")
+
+    assert(said.index_of("different type parameters").is_none(), said)
+    assert(said.index_of("error: ").is_some(), said)

@@ -207,14 +207,15 @@ private storage_aggregate(t: Type, inner: TypeRef, written: string) -> string = 
         s"'$written' is a struct. Write 'volatile' on its fields instead, as 'n: volatile u64', and " +
         s"declare the storage as a plain '$written'"
     Results(_) -> "a tuple is several. Declare a struct whose fields are volatile, as 'n: volatile u64'"
-    Array(n, _) ->
+    Array(n, _, term) ->
         val elem = *inner.kind match
             ArrayType(_, e, _) -> type_text(e)
             _ -> "T"
 
-        s"an array is several. Qualify the element instead, as '[$n]volatile $elem', or declare a " +
+        s"an array is several. Qualify the element instead, as " +
+        s"'[${extent_text(n, term)}]volatile $elem', or declare a " +
         "struct whose fields are volatile"
-    Vector(_, _) -> "a vector is several lanes. Declare a struct whose fields are volatile, as 'n: volatile u64'"
+    Vector(_, _, _) -> "a vector is several lanes. Declare a struct whose fields are volatile, as 'n: volatile u64'"
     _ -> ""
 
 // Whether a `volatile` may qualify this type. The qualifier promises exactly the one load or the one
@@ -389,7 +390,7 @@ private resolve_vector(a: &Analysis, scope: Scope, span: Span, lanes: Expr, elem
         // A count over a value parameter stands at zero for the walk of the generic body itself,
         // as an array's length does; each instantiation reads it again with the value bound.
         if awaits_instantiation(a, scope, lanes, subst) then
-            return Vector(0, resolve_qualified(a, scope, elem, subst))
+            return Vector(0, resolve_qualified(a, scope, elem, subst), extent_term(a, scope, lanes, subst))
 
         a.fault(scope, span, "a vector's lane count must be a constant — a literal, or a 'const' naming one")
         return Unknown
@@ -421,8 +422,14 @@ private resolve_vector(a: &Analysis, scope: Scope, span: Span, lanes: Expr, elem
         return Unknown
     end if
 
-    Vector(int(n), lane)
+    Vector(int(n), lane, extent_term(a, scope, lanes, subst))
 end resolve_vector
+
+// What a written length or lane count IS while a generic's own declaration is read: the form of the
+// value parameter it names (`value_terms.sysl`), so `[N]T` and `[M]T` are two types there. Nothing
+// for a length that names no stand-in, which is the number it folds to.
+extent_term(a: &Analysis, scope: Scope, e: Expr, subst: Buf[Binding]) -> Buf[Mono] =
+    if names_stand_in(e, subst) then value_term(a, scope, e, subst) else buf()
 
 // Whether a written count or value argument reads a value parameter that is only standing in --
 // the generic declaration being read in its own terms rather than instantiated.
@@ -503,7 +510,7 @@ private resolve_array(a: &Analysis, scope: Scope, span: Span, length: Option[Exp
         return Unknown
     end if
 
-    Array(int(const_extent(a, scope, span, written, subst)), e)
+    Array(int(const_extent(a, scope, span, written, subst)), e, extent_term(a, scope, written, subst))
 end resolve_array
 
 // Whether a written length is a bare name standing for a **type** -- `[T]int` where `T` is a type
@@ -770,7 +777,7 @@ private reached_by_value(a: &Analysis, t: Type, seen: *Buf[string], found: *Buf[
                 for v in d.variants
                     for j in 0..<v.fields.len()
                         reached_by_value(a, v.fields[j].1, seen, found)
-        Array(_, elem) -> reached_by_value(a, *elem, seen, found)
+        Array(_, elem, _) -> reached_by_value(a, *elem, seen, found)
         Constrained(d) -> reached_by_value(a, d.base, seen, found)
         _ -> ()
 
@@ -3172,8 +3179,8 @@ private const_type_refused(a: &Analysis, v: ValueDecl, t: Type) -> bool
     if named then return true
 
     val storage = t match
-        Array(_, _) -> true
-        Vector(_, _) -> true
+        Array(_, _, _) -> true
+        Vector(_, _, _) -> true
         Struct(_) -> true
         Enum(_) -> true
         _ -> false
