@@ -46,9 +46,15 @@ struct StackBoxes
     calls: Map[string, Buf[Span]]
     entries: Map[string, Span]
     payloads: Set[string]
+
+    // Every `name|k` whose answer may be its parameter `k`, as the walk worked it out. A frame box
+    // handed to a call reaches only parameters the walk asked about (the others answer "escapes"), so
+    // a call none of whose parameters is here answers something that is not the box
+    // (`frame_counts.sysl`).
+    answering: Set[string]
 end StackBoxes
 
-no_stack_boxes() -> StackBoxes = StackBoxes(map(), map(), map(), set())
+no_stack_boxes() -> StackBoxes = StackBoxes(map(), map(), map(), set(), set())
 
 // The largest payload laid in a frame. A frame box in a recursive body costs its payload in every
 // frame of the recursion, so a big one stays on the heap.
@@ -57,7 +63,7 @@ private stack_box_limit() -> usize = 1024
 // Every body's frame boxes, and the factories whose frame entries some caller reaches.
 stack_boxes(e: *Emit, p: TProgram) -> StackBoxes
     var out = no_stack_boxes()
-    val cx: &BoxCx = BoxCx(map(), p.funcs, map(), set(), map(), set(), map())
+    val cx: &BoxCx = BoxCx(map(), p.funcs, map(), set(), map(), set(), map(), set())
 
     for i in 0..<p.funcs.len()
         cx.index.put(p.funcs[i].name, i)
@@ -119,6 +125,7 @@ stack_boxes(e: *Emit, p: TProgram) -> StackBoxes
         if !good_calls.is_empty() then out.calls.put(f.name, good_calls)
     end for
 
+    out.answering = cx.answering
     out
 end stack_boxes
 
@@ -157,7 +164,7 @@ drop_unentered(e: *Emit, p: TProgram, sb: StackBoxes) -> StackBoxes
     for f in p.funcs
         if sb.entries.has(f.name) && !gone.has(f.name) then entries.put(f.name, sb.entries.get(f.name).unwrap())
 
-    StackBoxes(sb.sites, calls, entries, sb.payloads)
+    StackBoxes(sb.sites, calls, entries, sb.payloads, sb.answering)
 end drop_unentered
 
 // Whether the call at `at` in `f` names one of `names`.
@@ -320,6 +327,9 @@ private struct BoxCx
     factories: Map[string, Span]
     dtors: Set[string]
     dtor_fns: Map[string, string]
+
+    // Every `name|k` of `memo` whose answer may be the parameter.
+    answering: Set[string]
 end BoxCx
 
 // One walk of one body, following one thing: a site of this body (`site`, a box's payload span or a
@@ -890,5 +900,8 @@ private summary(cx: &BoxCx, name: string, k: usize, given: usize) -> (bool, bool
     val out = (w.escaped, w.answers)
 
     cx.memo.put(key, out)
+
+    if out.1 then cx.answering.add(key)
+
     out
 end summary

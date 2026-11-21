@@ -1402,6 +1402,15 @@ does a task's body and a payload over a kilobyte, which every frame of a recursi
 `&sync T` is never laid in a frame. Nothing here is visible to the program but the allocator: a
 frame box prints, compares and drops exactly as a heap box does.
 
+**Where every share of a frame box is taken and given back by the body that laid it, the compiler
+counts them, not the program.** No count is taken or given back at run time: the point where the
+last share would have gone runs the destructor and lets go of what the payload holds, exactly where
+it ran before, on every way out of the scope — the end of a block, a `return`, a `?`, a `break` or
+`continue` out of the loop turn that built it. Both boxes above, a box held by two locals, a
+temporary handed to a call, a box a closure captures, a box lent to a callee that takes shares of its
+own: each is counted by the compiler. A local that may hold one of two boxes, or the answer of a call that may be the box
+itself, leaves that box counted at run time, as above; the program cannot tell the two apart.
+
 #### Promotion is silent, not hidden
 
 **`--explain-escapes`** reports every promotion and the route that forced it — one line per array, in

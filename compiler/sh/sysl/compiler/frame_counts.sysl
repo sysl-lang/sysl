@@ -34,7 +34,13 @@ import sysl.container.{Map, map, Set, set}
 //
 // **Whatever a call answers when it was handed the box may be the box** -- a second holder this walk
 // cannot see would be torn down under it -- so an answer that can carry an address is followed: it may
-// be read through, and nothing else. A place entry's answer (`place_entry.sysl`) is an address inside
+// be read through, and nothing else. The escape walk already asked, of every parameter a frame box
+// reaches, whether the callee may answer it (`StackBoxes.answering`); a call none of whose parameters
+// may be answered (`answer_of`, `Emit.fresh_answers`) answers something else, and is not followed.
+//
+// **An aggregate holding the box once** -- a closure capturing it -- is followed too: it may be lent
+// to a callee, and its `arc.copy.<T>` / `arc.dispose.<T>` stay, counted as shares of the box that are
+// given back at run time. Every one of them must be given back before the box's last share is. A place entry's answer (`place_entry.sysl`) is an address inside
 // the box or the holder itself, so it may be read and written through, but no address may be read out
 // of it or written into it.
 //
@@ -93,7 +99,7 @@ drop_frame_counts(e: *Emit, blocks: Buf[IrBlock]) -> Buf[IrBlock]
 end drop_frame_counts
 
 private uncounted(e: *Emit, blocks: Buf[IrBlock], root: FrameRoot) -> Option[Buf[IrBlock]]
-    val held = frame_holders(blocks, root)
+    val held = frame_holders(blocks, root, e.fresh_answers)
     val uses = frame_uses(e, blocks, root, held)?
     val finals = frame_finals(blocks, uses)?
 
@@ -169,7 +175,7 @@ private carries_address(t: LType) -> bool = t match
 // The registers and slots that hold the box, to a fixed point: a slot of the frame stored with it, a
 // load of such a slot, a frame entry's answer, a place entry's answer and what is reached from it, and
 // the answer of any other call it was handed that can carry an address.
-private frame_holders(blocks: Buf[IrBlock], root: FrameRoot) -> Map[string, Held]
+private frame_holders(blocks: Buf[IrBlock], root: FrameRoot, fresh: Set[string]) -> Map[string, Held]
     var slots: Set[string] = set()
 
     for b in blocks
@@ -187,7 +193,7 @@ private frame_holders(blocks: Buf[IrBlock], root: FrameRoot) -> Map[string, Held
 
         for b in blocks
             for inst in b.instrs
-                held_by(inst, held, root, slots) match
+                held_by(inst, held, root, slots, fresh) match
                     Some(found) ->
                         if !held.has(found.0)
                             held.put(found.0, found.1)
@@ -202,7 +208,8 @@ private frame_holders(blocks: Buf[IrBlock], root: FrameRoot) -> Map[string, Held
     held
 end frame_holders
 
-private held_by(inst: Inst, held: Map[string, Held], root: FrameRoot, slots: Set[string]) -> Option[(string, Held)]
+private held_by(inst: Inst, held: Map[string, Held], root: FrameRoot, slots: Set[string],
+                fresh: Set[string]) -> Option[(string, Held)]
     inst match
         InStore(_, v, p, _, _) ->
             if is_held(held, v, HeldBox) && slots.has(v_render(p)) then return Some((v_render(p), HeldSlot))
@@ -224,11 +231,24 @@ private held_by(inst: Inst, held: Map[string, Held], root: FrameRoot, slots: Set
 
             if !handed then return None
             if name.ends_with("-place") then return Some((v_render(d), HeldPlace))
-            if carries_address(ret) then return Some((v_render(d), HeldMaybe))
+            if carries_address(ret) && !fresh.has(v_render(d)) then return Some((v_render(d), HeldMaybe))
         _ -> ()
 
     None
 end held_by
+
+// Notes a call's answer as one that is never a box it was handed, where the escape walk found none
+// of the callee's parameters may be answered (`StackBoxes.answering`).
+answer_of(e: *Emit, name: string, given: usize, v: Val) -> Val
+    for k in 0..<given
+        if e.stack.answering.has(s"$name|$k") then return v
+
+    v match
+        VReg(_) -> e.fresh_answers.add(v_render(v))
+        _ -> ()
+
+    v
+end answer_of
 
 // -- what touches the count --------------------------------------------------------------------------
 
