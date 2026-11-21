@@ -415,6 +415,15 @@ end gen_gather
 
 // A view's pointer and its length, lifted out of the three words it is.
 private view_parts(e: *Emit, receiver: TExpr, elem: Type) -> (Val, Option[Val], Type)
+    // An element of `s.bytes` is read from the string itself, which lends the bytes for the read.
+    val bytes_of = bytes_receiver(receiver)
+
+    if bytes_of.is_some()
+        val (p, l) = str_data(e, gen_expr(e, bytes_of.unwrap()))
+
+        return (p, Some(l), elem)
+    end if
+
     val v = gen_expr(e, receiver)
     val (p, l) = view_data(e, v, texpr_type(receiver))
     (p, Some(l), elem)
@@ -1079,15 +1088,27 @@ private same_node(a: TExpr, b: TExpr) -> bool = a.span == b.span && texpr_kind_n
 // first.
 gen_slice(e: *Emit, base: TExpr, lo: Option[TExpr], hi: Option[TExpr], inclusive: bool,
           slice_ty: Type, site: Span) -> Val
+    if short_substring(slice_ty, base)
+        val v = gen_expr(e, base)
+
+        return gen_slice_of(e, view_parts(e, v, slice_ty), lo, hi, inclusive, slice_ty, site, true, Some(v))
+    end if
+
     gen_slice_of(e, slice_base(e, base, slice_ty), lo, hi, inclusive, slice_ty, site, true)
 end gen_slice
+
+// Whether a substring is taken of a string that may be short, and so may be short itself
+// (`gen_slice_of`'s `source`).
+private short_substring(slice_ty: Type, base: TExpr) -> bool =
+    short_strings_on() && slice_ty == Str && nameless(texpr_type(base)) == Str
 
 // A slice of a view already made: what keeps its elements alive, where the first is, and how many.
 // A temporary promoted for a part of it is this -- the whole array moved into a buffer, and the
 // part narrowed over that buffer.
 gen_slice_of_view(e: *Emit, whole: Val, lo: Option[TExpr], hi: Option[TExpr], inclusive: bool,
                   slice_ty: Type, site: Span) -> Val =
-    gen_slice_of(e, view_parts(e, whole, slice_ty), lo, hi, inclusive, slice_ty, site, true)
+    gen_slice_of(e, view_parts(e, whole, slice_ty), lo, hi, inclusive, slice_ty, site, true,
+                 if short_strings_on() && slice_ty == Str then Some(whole) else None)
 
 // A view taken apart: what keeps its elements alive, where the first is, and how many.
 private view_parts(e: *Emit, whole: Val, ty: Type) -> (Val, Val, Option[Val])
@@ -1106,12 +1127,21 @@ end view_parts
 // A base that is itself such a view is lent the same way, so `a[i..<j][k..<l]` takes no count either.
 gen_lent_view(e: *Emit, x: TExpr, callee: string, written: Set[string]) -> Val = *x.kind match
     TSlice(base, lo, hi, inclusive, slice_ty) ->
-        val parts = if lent_view(e, base, callee, written) then
-            view_parts(e, gen_lent_view(e, base, callee, written), texpr_type(base))
-        else
-            slice_base(e, base, slice_ty)
+        // A substring of a string that may be short is narrowed from the string's own value
+        // (`gen_slice_of`'s `source`), lent or not.
+        if short_substring(slice_ty, base)
+            val v = if lent_view(e, base, callee, written) then gen_lent_view(e, base, callee, written)
+                    else gen_expr(e, base)
 
-        gen_slice_of(e, parts, lo, hi, inclusive, slice_ty, x.span, false)
+            gen_slice_of(e, view_parts(e, v, texpr_type(base)), lo, hi, inclusive, slice_ty, x.span, false,
+                         Some(v))
+        else
+            val parts = if lent_view(e, base, callee, written) then
+                view_parts(e, gen_lent_view(e, base, callee, written), texpr_type(base))
+            else
+                slice_base(e, base, slice_ty)
+
+            gen_slice_of(e, parts, lo, hi, inclusive, slice_ty, x.span, false)
     TConstView(arg) -> gen_lent_view(e, arg, callee, written)
     _ -> gen_expr(e, x)
 
@@ -1161,7 +1191,8 @@ private stands_for_call(e: *Emit, x: TExpr, callee: string, written: Set[string]
     held_unless(e, x, written) || lends_in_place(e, callee, texpr_type(x))
 
 private gen_slice_of(e: *Emit, parts: (Val, Val, Option[Val]), lo: Option[TExpr], hi: Option[TExpr],
-                     inclusive: bool, slice_ty: Type, site: Span, counted: bool) -> Val
+                     inclusive: bool, slice_ty: Type, site: Span, counted: bool,
+                     source: Option[Val] = None) -> Val
     val elem = element(slice_ty).unwrap_or(byte_type())
     val owner = parts.0
     val first = parts.1
@@ -1274,9 +1305,30 @@ private gen_slice_of(e: *Emit, parts: (Val, Val, Option[Val]), lo: Option[TExpr]
 
     emit(e, InInsert(with_ptr, lt, with_owner, LPtr, p, index_list(1)))
 
-    val whole = fresh_reg(e)
+    val long_view = fresh_reg(e)
 
-    emit(e, InInsert(whole, lt, with_ptr, word_lty(e), n, index_list(2)))
+    emit(e, InInsert(long_view, lt, with_ptr, word_lty(e), n, index_list(2)))
+
+    // **A run of a short string is short itself**: the bytes `p` names are the frame's copy
+    // `str_ptr` spilled, which the substring must not outlive, so the run is moved into the value
+    // instead (`str_short_run`). Its owner is null either way, so the share taken above was nothing.
+    // An empty run is the long form, as an empty string always is.
+    val whole = source match
+        Some(src) ->
+            val held = str_short_run(e, src, start, n)
+            val some = fresh_reg(e)
+
+            emit(e, InIntCmp(some, INe, word_lty(e), n, VInt(from_int(0))))
+
+            val both = fresh_reg(e)
+
+            emit(e, InBin(both, OpAnd, l_i1(), str_is_short(e, src), some))
+
+            val r = fresh_reg(e)
+
+            emit(e, InSelect(r, both, lt, held, long_view, l_i1()))
+            r
+        None -> long_view
 
     if counted then own_temp(e, whole, slice_ty) else whole
 end gen_slice_of

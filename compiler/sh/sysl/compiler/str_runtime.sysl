@@ -269,12 +269,13 @@ end str_search_text
 // concatenation, so the validity invariant needs no re-checking.
 str_concat_text(e: *Emit, str: string) -> string
     val word = s"i${e.word_bits}"
+    val pick = short_pick(e, str, "%total", s"ptr %ap, $word %an, ptr %bp, $word %bn")
 
     s"""
     define private $str @sysl.str.concat(ptr %ap, $word %an, ptr %bp, $word %bn) {
     entry:
       %total = add $word %an, %bn
-    ${str_buf_lead(word)}  %size = add $word %hsize, %total
+    ${pick}${str_buf_lead(word)}  %size = add $word %hsize, %total
     ${str_buf_header(e, "%total")}  br label %acond
     acond:
       %i = phi $word [ 0, %got ], [ %inext, %abody ]
@@ -307,15 +308,108 @@ str_concat_text(e: *Emit, str: string) -> string
     }
     """
 
+// **Where the short form is on, a producer making no more bytes than a short string holds makes one**
+// (`short_strings.sysl`): these lines, laid down at the top of the producer's entry block, branch to
+// `@sysl.str.short` with the producer's own bytes, and the producer's body goes on under `long:`.
+// Nothing at all where the form is off, so the producer's text is what it always was. `count` is the
+// register holding how many bytes are made; `args` is the two runs, as `@sysl.str.short` takes them.
+private short_pick(e: *Emit, str: string, count: string, args: string) -> string
+    if !short_strings_on() then return ""
+
+    request_text(e, "sysl.str.short", str_short_text(e, str))
+
+    val word = s"i${e.word_bits}"
+    val cap = short_string_capacity(e.word_bits)
+
+    s"  %small = icmp ule $word $count, $cap\n" +
+    s"  br i1 %small, label %short, label %long\n" +
+    s"short:\n" +
+    s"  %made = call $str @sysl.str.short($args)\n" +
+    s"  ret $str %made\n" +
+    s"long:\n"
+end short_pick
+
+// **A short string of two runs of bytes laid end to end**, no more than a short string holds: the
+// three words built in a slot -- a null owner, the bytes from the second word on, the rest zero, and
+// `0x80 | n` in the last byte -- and loaded back as the value. No bytes at all is the empty string,
+// which is never short: a null owner and an empty constant, so it costs no allocation either.
+private str_short_text(e: *Emit, str: string) -> string
+    val word = s"i${e.word_bits}"
+    val wb = e.word_bits / 8
+    val last = 3 * wb - 1
+
+    s"""
+    @sysl.str.empty = private unnamed_addr constant [1 x i8] zeroinitializer
+
+    define private $str @sysl.str.short(ptr %ap, $word %an, ptr %bp, $word %bn) {
+    entry:
+      %slot = alloca $str
+      %n = add $word %an, %bn
+      %none = icmp eq $word %n, 0
+      br i1 %none, label %empty, label %fill
+    empty:
+      %e0 = insertvalue $str undef, ptr null, 0
+      %e1 = insertvalue $str %e0, ptr @sysl.str.empty, 1
+      %e2 = insertvalue $str %e1, $word 0, 2
+      ret $str %e2
+    fill:
+      store $str zeroinitializer, ptr %slot
+      %bytes = getelementptr i8, ptr %slot, i32 $wb
+      br label %acond
+    acond:
+      %i = phi $word [ 0, %fill ], [ %inext, %abody ]
+      %amore = icmp ult $word %i, %an
+      br i1 %amore, label %abody, label %bcond
+    abody:
+      %asrc = getelementptr i8, ptr %ap, $word %i
+      %abyte = load i8, ptr %asrc
+      %adst = getelementptr i8, ptr %bytes, $word %i
+      store i8 %abyte, ptr %adst
+      %inext = add $word %i, 1
+      br label %acond
+    bcond:
+      %j = phi $word [ 0, %acond ], [ %jnext, %bbody ]
+      %bmore = icmp ult $word %j, %bn
+      br i1 %bmore, label %bbody, label %tag
+    bbody:
+      %bsrc = getelementptr i8, ptr %bp, $word %j
+      %bbyte = load i8, ptr %bsrc
+      %off = add $word %an, %j
+      %bdst = getelementptr i8, ptr %bytes, $word %off
+      store i8 %bbyte, ptr %bdst
+      %jnext = add $word %j, 1
+      br label %bcond
+    tag:
+      %tagp = getelementptr i8, ptr %slot, i32 $last
+      %n8 = trunc $word %n to i8
+      %t = or i8 %n8, -128
+      store i8 %t, ptr %tagp
+      %r = load $str, ptr %slot
+      ret $str %r
+    }
+    """
+end str_short_text
+
 // Copies a run of bytes into a fresh owning string. Every `str(x)` that renders into a scratch
 // buffer finishes through here, so the allocation and the copy live in one place.
 str_from_bytes_text(e: *Emit, str: string) -> string
     val word = s"i${e.word_bits}"
 
+    heap_copy_text(e, str, "sysl.str.from_bytes", short_pick(e, str, "%n", s"ptr %src, $word %n, ptr null, $word 0"))
+
+// The same copy, always into a `StrBuf` whatever its length: what `s.bytes` of a short string views
+// (`emit_str.sysl`'s `str_unshort_text`), since a view's bytes must have an address of their own.
+str_heap_text(e: *Emit, str: string) -> string = heap_copy_text(e, str, "sysl.str.heap", "")
+
+// A copy of `%n` bytes at `%src` into a fresh `StrBuf`, under the name `name`, with `pick` laid down
+// first in its entry block (`short_pick`, or nothing).
+private heap_copy_text(e: *Emit, str: string, name: string, pick: string) -> string
+    val word = s"i${e.word_bits}"
+
     s"""
-    define private $str @sysl.str.from_bytes(ptr %src, $word %n) {
+    define private $str @$name(ptr %src, $word %n) {
     entry:
-    ${str_buf_lead(word)}  %size = add $word %hsize, %n
+    ${pick}${str_buf_lead(word)}  %size = add $word %hsize, %n
     ${str_buf_header(e, "%n")}  br label %cond
     cond:
       %i = phi $word [ 0, %got ], [ %next, %body ]
