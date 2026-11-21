@@ -43,9 +43,9 @@ struct Scope
      */
     @scoped(f)
     spawn[R](*self, f: &sync Fn() -> R) -> ScopedThread[R]
-        val out: &sync Out[R] = Out(Mutex.new(None))
+        val out: &sync Out[R] = Out(Mutex.new(Pending))
         val joiner: &sync Joiner = Joiner(Mutex.new(Joint(None, false)))
-        val job: &sync Job = Job(() -> out.value.with((v) -> *v = Some(f())), joiner)
+        val job: &sync Job = Job(() -> out.value.with((v) -> *v = Ready(f())), joiner)
         val started = spawn(&run_job, &*job)
 
         if started.is_none() then panic("sysl.threads: the system would not start another thread")
@@ -77,8 +77,15 @@ end Scope
  * It holds the thread's joiner and the slot its answer is left in, and nothing of the closure, which
  * stays in the scope's own list -- so a handle is as plain to keep as the value it carries back. Copying
  * one copies the handle, and it may be handed to another scoped thread; joining any copy waits for the
- * one thread. Joining **is** checked here, unlike `Thread.join`: a second join answers the same value
- * without waiting again, and the scope does not join a thread that is already joined.
+ * one thread. Joining **is** checked here, unlike `Thread.join`: the scope does not join a thread that
+ * is already joined, and a second join of a handle whose answer is `Share` -- an `int`, a tuple of
+ * scalars, a `&sync T` -- answers the same value again without waiting.
+ *
+ * **An answer that is not `Share` is moved out by the first join** -- a `string`, a `Buf`, a `&T`, a
+ * struct or `Option` holding one. The thread has ended, so the slot is its one owner, and the join
+ * hands that ownership over whole: no count is taken, and nothing is left behind for another domain
+ * to touch. A second join of such a handle stops the program with a message, since the value it would
+ * answer now belongs to whoever joined first.
  */
 struct ScopedThread[R]
 
@@ -89,10 +96,29 @@ struct ScopedThread[R]
     @blocks
     join(self) -> R
         self.joiner.join()
-        self.out.value.with((v) -> v.unwrap())
+
+        if const R: Share
+            self.out.value.with((v) -> *v match
+                Ready(r) -> r
+                _ -> panic("sysl.threads: a joined scoped thread left no answer"))
+        else
+            // The lock is held for the move only so that two joins of copies of this handle take the
+            // answer one after the other; the slot is left `Taken`, so the value has one owner again.
+            val held = self.out.value.lock_raw()
+            val answer = slot_take(held)
+
+            slot_put(held, Taken)
+            self.out.value.unlock_raw()
+
+            answer match
+                Ready(r) -> r
+                _ -> panic("sysl.threads: a scoped thread's answer was moved out by an earlier join")
+    end join
 
     /** Whether the thread's closure has answered, without waiting for it. */
-    is_finished(self) -> bool = self.out.value.with((v) -> v.is_some())
+    is_finished(self) -> bool = self.out.value.with((v) -> *v match
+        Pending -> false
+        _ -> true)
 
 end ScopedThread
 
@@ -258,4 +284,11 @@ private run_job(j: *Job) -> unit = j.run()
 // Where a thread's closure leaves its answer for `ScopedThread.join`, shared by the handle and the
 // closure the thread runs.
 private struct Out[R]
-    value: Mutex[Option[R]]
+    value: Mutex[Answer[R]]
+
+// What the slot holds: nothing yet, the closure's answer, or -- once a join has moved an answer that is
+// not `Share` out -- the mark that it has gone.
+private enum Answer[R]
+    Pending
+    Ready(value: R)
+    Taken

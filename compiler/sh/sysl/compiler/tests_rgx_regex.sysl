@@ -691,6 +691,112 @@ rgx_gathering_is_linear()
         assert(large * 10 <= small * 22, s"${cases[i]}: $small bytes at 2000, $large at 4000")
 end rgx_gathering_is_linear
 
+// **A position that cannot begin a match costs no allocation.** Each case is a long run of text the
+// pattern's first instructions refuse, then (mostly) one match. Run at n and 2n, the extra bytes must
+// be what the longer *text* costs to build (the repeat, the concatenation, the replacement's
+// builder: a few bytes a character), never a per-position cost: starting a thread at every position
+// allocated two capture arrays there, 64 bytes or more, and regex-redux asked for ~1,400 bytes per
+// input byte over its fifteen passes. `lines` matches on every line (the header-and-newline pass),
+// so it is held to linearity only.
+@test("a run steps over the positions where no match can begin, at no cost per position")
+rgx_start_skip_costs_nothing_per_position()
+    if !rgx_ready() then return
+
+    val text = raw"""
+        import sysl.regex.regex
+        import sysl.text.{parse_long, repeat}
+
+        main(args: []const string)
+            val n = usize(parse_long(args[2]).unwrap())
+
+            args[1] match
+                "literal" -> print(regex("agggtaaa|tttaccct").unwrap().find_all(repeat("c", n) + "tttaccct").len())
+                "class" -> print(regex("[cgt]gggtaaa|tttaccc[acg]").unwrap().find_all(repeat("a", n) + "tttaccca").len())
+                "negated" -> print(regex("<[^>]*>").unwrap().find_all(repeat("a", n) + "<x>").len())
+                "wide" -> print(regex("é+").unwrap().find_all(repeat("ü", n) + "éé").len())
+                "none" -> print(regex("q[rs]").unwrap().find_all(repeat("ab", n)).len())
+                "grow" -> print(regex("x").unwrap().replace_all(repeat("ab", n) + "x", "LONGER").len)
+                "shrink" -> print(regex("xyz").unwrap().replace_all(repeat("ab", n) + "xyz", "").len)
+                "lines" -> print(regex(">[^\n]*\n|\n").unwrap().replace_all(repeat(">h\nacgt\n", n), "").len)
+                else print("?")
+        """
+
+    val cases = ["literal", "class", "negated", "wide", "none", "grow", "shrink", "lines"]
+    val got = rgx_bytes(text, cases, ["2000", "4000"])
+
+    if got.len() != cases.len * 2 then return
+
+    for i in 0..<cases.len
+        val small = got[i * 2]
+        val large = got[i * 2 + 1]
+
+        assert(small > 0, s"${cases[i]}: no byte total was reported")
+        assert(large * 10 <= small * 22, s"${cases[i]}: $small bytes at 2000, $large at 4000")
+
+        if cases[i] != "lines"
+            assert(large - small <= 16 * 2000, s"${cases[i]}: $small bytes at 2000, $large at 4000")
+end rgx_start_skip_costs_nothing_per_position
+
+// Where the run steps over positions, and where it must not: a literal or a class first (plain,
+// negated, named), a first character of more than one byte, the longest of two alternatives sharing
+// a start, a group after a skip, and the closures that turn the step-over off -- one that accepts at
+// once (`b*`), or holds an anchor (`x|$`, `(^|c)a`) -- each answering where a position-by-position
+// run would.
+@test("a match found after stepping over positions is the one every position would have found")
+rgx_start_skip_finds_the_same_match() = rgx_matches([
+    ("agggtaaa|tttaccct", "cctttaccctg"),
+    ("[cgt]gggtaaa|tttaccc[acg]", "aatttacccg"),
+    ("é+", "aüéé"),
+    ("[^a]b", "aacb"),
+    ("[^a]x", "aéx"),
+    ("ab|abcd", "xxabcd"),
+    ("x(y+)", "aaxyy"),
+    ("[[:digit:]]+", "ab12c"),
+    ("a.c|b", "xxabc"),
+    ("ab|b", "aab"),
+    ("d", "abcd"),
+    ("q", "abc"),
+    ("x|$", "ab"),
+    ("(^|c)a", "bca"),
+    ("b*", "aab"),
+], "2:10\n2:10\n3:7\n2:4\n1:4\n2:6\n2:5 3:5\n2:4\n2:5\n1:3\n3:4\nno\n2:2\n1:3 1:2\n0:0\n")
+
+@test("walking a text steps over the gaps between matches and keeps the anchors whole")
+rgx_start_skip_walks_the_text() = rgx_uses(raw"""
+    c(pat: string, s: string)
+        var all = regex(pat).unwrap().find_all(s)
+        var out = ""
+
+        for i in 0usize..<all.len() do out += s"${all[i].start()}-${all[i].end()} "
+        print(s"[$out]")
+
+    c("agggtaaa|tttaccct", "agggtaaaxxtttaccctagggtaaa")
+    c("[cgt]gggtaaa|tttaccc[acg]", "ggggtaaatttaccca")
+    c("<[^>]*>", "a<b>cc<>d")
+    c("é", "aébé")
+    c("^a|b", "aab")
+    c("a$|c", "acaa")
+    c("x*", "ab")
+    c("q", "abc")
+    print(regex("ab").unwrap().find_at("abab", 1).unwrap().start())
+    """, "[0-8 10-18 18-26 ]\n[0-8 8-16 ]\n[1-4 6-8 ]\n[1-3 4-6 ]\n[0-1 2-3 ]\n[1-2 3-4 ]\n[0-0 1-1 2-2 ]\n[]\n2\n")
+
+// regex-redux's substitution chain, each pattern on its own, and a replacement growing and shrinking
+// the text around matches that sit apart from one another.
+@test("replacing with the regex-redux patterns, and with growing and shrinking text between gaps")
+rgx_start_skip_replaces() = rgx_uses(raw"""
+    r(pat: string, s: string, with: string) = print(s"[${regex(pat).unwrap().replace_all(s, with)}]")
+
+    r("tHa[Nt]", "xtHaNytHatz", "<4>")
+    r("aND|caN|Ha[DS]|WaS", "aNDcaNHaSWaSq", "<3>")
+    r("a[NSt]|BY", "aNBYat", "<2>")
+    r("<[^>]*>", "a<4>b<>c", "|")
+    r("\\|[^|][^|]*\\|", "a|bc|d||e", "-")
+    r("x", "aaxaa", "LONG")
+    r("xyz", "aaxyzbb", "")
+    r("[xy]", "éxéyé", "ü")
+    """, "[x<4>y<4>z]\n[<3><3><3><3>q]\n[<2><2><2>]\n[a|b|c]\n[a-d||e]\n[aaLONGaa]\n[aabb]\n[éüéüé]\n")
+
 // ---- splitting
 
 // Four pieces from three separators, the empty one between the doubled comma included.
