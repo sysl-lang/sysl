@@ -521,6 +521,16 @@ struct Emit
     peel_handed: Set[string]
     peel_wanted: bool
     peel_off: bool
+
+    // The type each release helper lets go of, by name, and what letting go of a value of a type can
+    // reach, by `mangle` (`release_reach.sysl`) -- what a share held across a release asks.
+    release_types: Map[string, Type]
+    walk_cache: Map[string, ReleaseWalk]
+
+    // The place entries whose answer lies in the bytes of the storage they are handed, with no
+    // reference followed on the way (`place_entry.sysl`'s `in_own_storage`), each with the index of
+    // that address among a call's arguments (-2 before a call is written, -1 where calls disagree).
+    inplace_symbols: Map[string, int]
 end Emit
 
 const PeelNone: int = 0
@@ -736,7 +746,7 @@ emitter_for(t: Target, destructors: Buf[(string, string, bool)]) -> Emit
          set(), map(), 0, map(), set(), map(), false, set(), map(), set(), false, false, false, buf(), set(),
           "", set(), false, None, None, set(), None, map(), buf(), buf(), buf(), false, set(), None,
           buf(), buf(), false, false, false, false, buf(), map(), map(), set(), map(), buf(), map(), buf(), map(),
-          held_args_none(), PeelNone, set(), false, false)
+          held_args_none(), PeelNone, set(), false, false, map(), map(), map())
 end emitter_for
 
 // -- what a body could not say --------------------------------------------------------------------
@@ -1113,7 +1123,8 @@ finish_func(e: *Emit, sig: IrFuncSig) -> IrFunc
     // and the blocks the guards opened are bounded with the rest.
     // A read of a place the function then writes over takes the place's count (`arc_take.sysl`); it
     // asks about the pairs the cancelling left.
-    val elided = take_on_overwrite(elide_arc_pairs(out, e.inert_symbols), e.inert_symbols, e.take_walks)
+    val elided = take_on_overwrite(elide_arc_pairs_with(out, e.inert_symbols, release_walks(e, out), e.inplace_symbols),
+                                   e.inert_symbols, e.take_walks)
     var before: Set[string] = set()
 
     for inst in elided[0].instrs
