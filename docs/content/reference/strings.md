@@ -721,8 +721,9 @@ impl Display for Point
 
 val p = Point(3, -4)
 val c = 'é'
+val n: i64 = -9223372036854775807 - 1
 
-print(f"p=${p} c=$c n=${-9223372036854775807 - 1} nested=${f"[${p.x}]"} ok=${true}")
+print(f"p=${p} c=$c n=$n nested=${f"[${p.x}]"} ok=${true}")
 ```
 
 ```output
