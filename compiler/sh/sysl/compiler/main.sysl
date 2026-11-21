@@ -1143,10 +1143,10 @@ where_flags() -> string =
 private emit_typed_usage() -> string =
     "usage: sysl emit-typed [--no-spans] [--tables] [--target <name>] " + where_flags() + " <path>"
 
-// `sysl test [--filter <text>] [--file <name>] [--fail-fast] [--jobs <n>] [--timeout <seconds>]
-// [--target <name>] [--cc <path>] [-O<level>] <path>` --
+// `sysl test [--filter <text>] [--file <name>] [--fail-fast] [--jobs <n>] [--build-jobs <n>]
+// [--timeout <seconds>] [--target <name>] [--cc <path>] [-O<level>] <path>` --
 // the `@test` functions of a tree, built into one binary and run one process each, `--jobs` of them at
-// once. `--file` keeps the
+// once, with `--build-jobs` of the build's compiles at once (`settled_build_jobs`). `--file` keeps the
 // tests written in the one file it names (`file_named`), beside whatever `--filter` keeps.
 //
 // **The report is written as the run goes rather than at the end**, which is why it does not go
@@ -1165,6 +1165,7 @@ private test_command(args: []const string, say: string -> unit, note: string -> 
     var std = false
     var seconds: Option[int] = None
     var jobs: Option[usize] = None
+    var build_jobs: Option[usize] = None
     var named_level: Option[string] = None
     var picked: Option[string] = None
     var file = ""
@@ -1212,6 +1213,19 @@ private test_command(args: []const string, say: string -> unit, note: string -> 
                 Some(n) -> jobs = Some(n)
                 None ->
                     mistakes.push(bad_jobs(args[i]))
+                    break
+        else if args[i] == "--build-jobs"
+            if i + 1 >= args.len
+                mistakes.push(missing_value(args[i]))
+                break
+            end if
+
+            i += 1
+
+            test_jobs(args[i]) match
+                Some(n) -> build_jobs = Some(n)
+                None ->
+                    mistakes.push(bad_build_jobs(args[i]))
                     break
         else if args[i] == "--target" || args[i] == "--cc" || args[i] == "--filter" || args[i] == "--file" ||
                 args[i] == "--keep-binary"
@@ -1288,7 +1302,7 @@ private test_command(args: []const string, say: string -> unit, note: string -> 
 
     // `jobs` and the limit are settled per project, where its manifest is read (`test_project`).
     val opts = TestOptions(filter, fail_fast, 0, buf())
-    val asked = TestAsked(jobs, seconds)
+    val asked = TestAsked(jobs, seconds, build_jobs)
 
     // A build child builds the one project the runner named: a workspace's members are the runner's
     // to go through, a child each.
@@ -1345,7 +1359,17 @@ end test_jobs
 private struct TestAsked
     jobs: Option[usize]
     seconds: Option[int]
+    build_jobs: Option[usize]
 end TestAsked
+
+// **How many of the test build's clangs may run at once** (`limit_unit_jobs`): `--build-jobs`, then
+// the `test` block's `build_jobs`, then `jobs` as the suite settled it -- so a run that names neither
+// builds exactly as it did when `--jobs` bounded both. The build's own key beats `--jobs` wherever it
+// is written, because it is the narrower answer: `--jobs` is about the tests, and bounds the build
+// only for want of anything said about the build itself. One is a serial build: the units are the same
+// units, compiled one after another, so the binary is the same at any count.
+settled_build_jobs(asked: Option[usize], block: Option[usize], jobs: usize) -> usize =
+    asked.unwrap_or(block.unwrap_or(jobs))
 
 // The `test` block of the manifest beside `path` -- a project directory, or a file in one -- or none
 // where there is no readable manifest there; a manifest that cannot be read is said by the build.
@@ -1359,6 +1383,10 @@ end test_settings_of
 
 private bad_jobs(text: string) -> string =
     s"'--jobs' takes how many tests may run at once, a whole number from 1 up, and '$text' is not one"
+
+private bad_build_jobs(text: string) -> string =
+    s"'--build-jobs' takes how many of the test build's compiles may run at once, a whole number from 1 " +
+    s"up, and '$text' is not one"
 
 private bad_timeout(text: string) -> string =
     s"'--timeout' takes the seconds each test may run, a whole number from 0 to $MostTestSeconds " +
@@ -1424,8 +1452,9 @@ private test_project(file: string, named: Option[string], cc: Option[string], gi
     val opts = TestOptions(given.filter, given.fail_fast,
                            asked.jobs.unwrap_or(settings.jobs.unwrap_or(cpu_count())), settings.alone)
 
-    // The link's clangs are held to the same count as the tests, so `--jobs` bounds the build too.
-    limit_unit_jobs(opts.jobs)
+    // The link's clangs are held to `--build-jobs` (`settled_build_jobs`), and to the tests' count where
+    // nothing names the build's own.
+    limit_unit_jobs(settled_build_jobs(asked.build_jobs, settings.build_jobs, opts.jobs))
 
     val level = build_level(file, named_level) match
         Err(why) ->
@@ -1617,7 +1646,7 @@ private tests_run(file: string, exe: string, all: Buf[TTest], opts: TestOptions,
         None -> plan_run(plan, report)
 end tests_run
 
-private test_usage() -> string = "usage: sysl test [--filter <text>] [--file <name>] [--keep-binary <dir>] [--fail-fast] [--jobs <n>] [--timeout <seconds>] [--std] " +
+private test_usage() -> string = "usage: sysl test [--filter <text>] [--file <name>] [--keep-binary <dir>] [--fail-fast] [--jobs <n>] [--build-jobs <n>] [--timeout <seconds>] [--std] " +
     "[-p <member>] [--target <name>] [--cc <path>] [-O<level>] " + where_flags() + " " + feature_flags() + " " +
     "[--option <name=value>] " + pipeline_usage() + " [<path>]"
 
@@ -1884,7 +1913,7 @@ usage() -> string = "usage: sysl --version | --help | emit-ast [--no-spans] <fil
     "build-c [--target <name>] [--cc <path>] [-O<level>] [-o <archive>] [--header <path>] " +
     "[--emit-llvm <out.ll>] [--lto thin|full] [--shared] <path> | emit-header [--target <name>] <path> | " +
     "run [--target <name>] [--cc <path>] [-O<level>] <path> [-- <args>] | " +
-    "test [--filter <text>] [--file <name>] [--fail-fast] [--jobs <n>] [--timeout <seconds>] [--target <name>] [--cc <path>] [-O<level>] <path> | " +
+    "test [--filter <text>] [--file <name>] [--fail-fast] [--jobs <n>] [--build-jobs <n>] [--timeout <seconds>] [--target <name>] [--cc <path>] [-O<level>] <path> | " +
     "add <coordinate>[@<version>] [<path>] | config <command> [--dry-run] [-C <dir>] | deps <path> | vendor <path> | tidy [--check] [<path>] | init [<dir>] | " +
     "weave [-o <path>] <path> | tangle [-o <path>] <path> | prove [--emit-whyml] [--overflow check|ignore] [--target <name>] <path> | " +
     "doc [-o <dir>] [-t <title>] [-n <note>] [-w <n>] [-V <version>] [--private] [--check] [<dir>] | " +
