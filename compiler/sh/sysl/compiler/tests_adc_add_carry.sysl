@@ -1,0 +1,194 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// `x.add_carry(y, c)` and `x.sub_borrow(y, c)` (`library/sysl/checked.sysl`, `emit_checked.sysl`'s
+// `gen_carry_op`): a limb of a multi-word sum or difference, at every unsigned width, with the carry in
+// either way, chained across limbs against a wider reference, evaluated while compiling, through a
+// bound, and lowered to a pair of `with.overflow` calls. The helpers are `tests_enm_enum_run.sysl`'s.
+//
+// The cells skipped, with the reason: a signed receiver is a refusal (tested), and a ranged type is not
+// an `Integer` so it is refused by the same row; separate compilation (the member lowers in the
+// caller's unit, as `checked_add` does, so there is no symbol to cross).
+
+@test("every width at its top and bottom, with the carry in both ways")
+adc_every_width()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        val a8: u8 = 255
+        val a12: u12 = 4095
+        val a16: u16 = 65535
+        val a32: u32 = 4294967295
+        val a64: u64 = 18446744073709551615
+        val a128: u128 = u128(18446744073709551615) * 18446744073709551616 + 18446744073709551615
+        val z8: u8 = 0
+        val z12: u12 = 0
+        val z16: u16 = 0
+        val z32: u32 = 0
+        val z64: u64 = 0
+        val z128: u128 = 0
+        print(a8.add_carry(0, false), a8.add_carry(0, true), a8.add_carry(1, false), a8.add_carry(a8, true))
+        print(a12.add_carry(0, false), a12.add_carry(0, true), a12.add_carry(1, false), a12.add_carry(a12, true))
+        print(a16.add_carry(0, true), a32.add_carry(0, true), a64.add_carry(0, true), a64.add_carry(a64, true))
+        print(a128.add_carry(0, false), a128.add_carry(0, true), a128.add_carry(a128, true))
+        print(z8.sub_borrow(0, false), z8.sub_borrow(0, true), z8.sub_borrow(1, false), z8.sub_borrow(a8, true))
+        print(z12.sub_borrow(0, true), z16.sub_borrow(0, true), z32.sub_borrow(0, true), z64.sub_borrow(0, true))
+        print(z128.sub_borrow(0, true), z128.sub_borrow(1, false), a64.sub_borrow(a64, false), a64.sub_borrow(a64, true))
+        """),
+        "(255, false) (0, true) (0, true) (255, true)\n" +
+        "(4095, false) (0, true) (0, true) (4095, true)\n" +
+        "(0, true) (0, true) (0, true) (18446744073709551615, true)\n" +
+        "(340282366920938463463374607431768211455, false) (0, true) (340282366920938463463374607431768211455, true)\n" +
+        "(0, false) (255, true) (255, true) (0, true)\n" +
+        "(4095, true) (65535, true) (4294967295, true) (18446744073709551615, true)\n" +
+        "(340282366920938463463374607431768211455, true) (340282366920938463463374607431768211455, true) (0, false) (18446744073709551615, true)\n")
+
+@test("the carry in alone makes the carry out: 255 + 0 + 1 and 0 - 0 - 1")
+adc_carry_in_alone()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        val m: u8 = 254
+        print(m.add_carry(0, true), m.add_carry(1, true), m.sub_borrow(254, true), m.sub_borrow(253, true))
+        """), "(255, false) (0, true) (255, true) (0, false)\n")
+
+@test("a chain across limbs equals the wider arithmetic")
+adc_chain_against_reference()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        add_limbs(a: u64, b: u64) -> (u64, bool)
+            var carry = false
+            var out: u64 = 0
+
+            for i in 0..<8
+                val x = u8.wrap(a >> (8 * i))
+                val y = u8.wrap(b >> (8 * i))
+                val (s, c) = x.add_carry(y, carry)
+
+                out |= u64(s) << (8 * i)
+                carry = c
+
+            (out, carry)
+
+        sub_limbs(a: u64, b: u64) -> (u64, bool)
+            var borrow = false
+            var out: u64 = 0
+
+            for i in 0..<8
+                val x = u8.wrap(a >> (8 * i))
+                val y = u8.wrap(b >> (8 * i))
+                val (d, c) = x.sub_borrow(y, borrow)
+
+                out |= u64(d) << (8 * i)
+                borrow = c
+
+            (out, borrow)
+
+        val samples: [8]u64 = [0, 1, 255, 256, 65535, 4294967296, 9223372036854775808, 18446744073709551615]
+        var bad = 0
+
+        for a in samples
+            for b in samples
+                val want_sum = u128(a) + u128(b)
+                val got = add_limbs(a, b)
+
+                if u128(got.0) + (if got.1 then u128(1) << 64 else u128(0)) != want_sum then bad += 1
+
+                val want_diff = a -% b
+                val got_diff = sub_limbs(a, b)
+
+                if got_diff.0 != want_diff || got_diff.1 != (a < b) then bad += 1
+
+        print(bad)
+        """), "0\n")
+
+@test("evaluated while compiling")
+adc_while_compiling()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        const sum(a: u8, b: u8, c: bool) -> u8 = a.add_carry(b, c).0
+        const carried(a: u8, b: u8, c: bool) -> bool = a.add_carry(b, c).1
+        const diff(a: u12, b: u12, c: bool) -> u12 = a.sub_borrow(b, c).0
+        const borrowed(a: u12, b: u12, c: bool) -> bool = a.sub_borrow(b, c).1
+
+        @assert(sum(255, 0, true) == 0)
+        @assert(carried(255, 0, true))
+        @assert(!carried(254, 0, true))
+        @assert(sum(200, 100, false) == 44)
+        @assert(diff(0, 0, true) == 4095)
+        @assert(borrowed(0, 0, true))
+        @assert(!borrowed(5, 5, false))
+        @assert(borrowed(5, 5, true))
+
+        print("folded")
+        """), "folded\n")
+
+@test("through a bound the compiler's membership satisfies")
+adc_through_a_bound()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        twice[T: Carrying](x: T, c: bool) -> (T, bool) = x.add_carry(x, c)
+
+        print(twice(u8(200), true), twice(u64(1), false), twice(u12(2048), false))
+        """), "(145, true) (2, false) (0, true)\n")
+
+@test("each operand is evaluated once and in order")
+adc_operands_once_in_order()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        tracked(n: u8, name: string) -> u8
+            print(name)
+            n
+
+        flag(b: bool) -> bool
+            print("c")
+            b
+
+        print(tracked(250, "x").add_carry(tracked(5, "y"), flag(true)))
+        """), "x\ny\nc\n(0, true)\n")
+
+@test("the answer is a pair of with.overflow calls at the receiver's width")
+adc_is_two_intrinsics()
+    if !enm_ready() then return
+
+    val ir = enm_ir(raw"""
+        val a: u64 = 5
+        val b: u12 = 7
+        print(a.add_carry(1, true), b.sub_borrow(2, false))
+        """)
+
+    assert(ir.contains("@llvm.uadd.with.overflow.i64"), ir)
+    assert(ir.contains("@llvm.usub.with.overflow.i12"), ir)
+    // one declaration and the two calls of the pair
+    assert_eq(ir.count_of("@llvm.uadd.with.overflow.i64("), 3)
+    assert_eq(ir.count_of("@llvm.usub.with.overflow.i12("), 3)
+
+@test("a signed receiver is not a member")
+adc_signed_is_refused()
+    val msg = enm_err(raw"""
+        val a: int = 5
+        print(a.add_carry(1, false))
+        """)
+
+    assert(msg.contains("add_carry"), msg)
+
+@test("the carry in is a bool, and the other operand the receiver's type")
+adc_operand_types_are_held()
+    val a = enm_err(raw"""
+        val a: u8 = 5
+        print(a.add_carry(1, 1))
+        """)
+    val b = enm_err(raw"""
+        val a: u8 = 5
+        val w: u16 = 1
+        print(a.add_carry(w, false))
+        """)
+
+    assert(a.contains("carry"), a)
+    assert(b.contains("rhs"), b)
