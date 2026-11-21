@@ -426,9 +426,9 @@ end resolve_vector
 
 // Whether a written count or value argument reads a value parameter that is only standing in --
 // the generic declaration being read in its own terms rather than instantiated.
-private names_stand_in(e: Expr, subst: Buf[Binding]) -> bool = *e.kind match
+names_stand_in(e: Expr, subst: Buf[Binding]) -> bool = *e.kind match
     Ident(n) -> bound_type(subst, n) match
-        Some(ConstArg(_, _, stood)) -> stood
+        Some(ConstArg(_, _, stood, _)) -> stood
         _ -> false
     Unary(_, operand) -> names_stand_in(operand, subst)
     Binary(_, l, r) -> names_stand_in(l, subst) || names_stand_in(r, subst)
@@ -458,7 +458,7 @@ private resolve_array(a: &Analysis, scope: Scope, span: Span, length: Option[Exp
     // The rule the declaration asks of a written length, asked again of the substitution -- which is
     // what reaches a length written inside a BODY, where the declaration-time walk never looks: a
     // name bound to a value may be the length but not be computed with.
-    length_arithmetic(a, scope, span, written, const_arg_names(subst))
+    length_arithmetic(a, scope, span, written, const_arg_names(subst), "length")
 
     // A length over a type parameter has no value during the walk that checks the generic body
     // itself, there being no `T` yet — and that is not a mistake to report, since the body is
@@ -583,7 +583,7 @@ private const_arg_names(subst: Buf[Binding]) -> Buf[string]
 
     for item in subst
         item.ty match
-            ConstArg(_, _, _) -> out.push(item.name)
+            ConstArg(_, _, _, _) -> out.push(item.name)
             _ -> ()
 
     out
@@ -1047,12 +1047,13 @@ private const_argument(a: &Analysis, scope: Scope, span: Span, e: Expr,
     // An argument written over a parameter that is only standing in is a stand-in too, so a generic
     // declaration naming `Lanes[W]` is not read as one that asked for `Lanes[0]`.
     val stood = names_stand_in(e, subst)
+    val term = if stood then value_term(a, scope, e, subst) else buf()
 
     folded match
-        Some(ConstBool(b)) -> ConstArg(from_int(if b then 1 else 0), Bool, stood)
-        Some(ConstChar(c)) -> ConstArg(from_int(long(int(u32(c)))), Char, stood)
-        Some(ConstInt(v)) -> ConstArg(v, int_type(), stood)
-        _ -> ConstArg(from_int(long(const_extent(a, scope, span, e, subst))), int_type(), stood)
+        Some(ConstBool(b)) -> ConstArg(from_int(if b then 1 else 0), Bool, stood, term)
+        Some(ConstChar(c)) -> ConstArg(from_int(long(int(u32(c)))), Char, stood, term)
+        Some(ConstInt(v)) -> ConstArg(v, int_type(), stood, term)
+        _ -> ConstArg(from_int(long(const_extent(a, scope, span, e, subst))), int_type(), stood, term)
 end const_argument
 
 private digits_value(digits: string, base: int) -> usize
@@ -1256,10 +1257,10 @@ private at_declared_widths(a: &Analysis, key: string, targs: Buf[Type]) -> Buf[T
         val written = if i < pair.0.len() then binding_named(pair.1, pair.0[i]) else None
 
         targs[i] match
-            ConstArg(v, ty, stood) ->
-                if written.is_none() then out.push(ConstArg(v, *ty, stood))
+            ConstArg(v, ty, stood, term) ->
+                if written.is_none() then out.push(ConstArg(v, *ty, stood, term))
                 else out.push(ConstArg(v, resolve_type(a, home, written.unwrap(), no_bindings()),
-                                       stood))
+                                       stood, term))
             other -> out.push(other)
 
     out
@@ -1330,7 +1331,8 @@ trait_args_read(a: &Analysis, scope: Scope, span: Span, key: string, args: Buf[T
 
         if declared.is_none() then out.push(Unknown)
         else out.push(ConstArg(from_int(0), resolve_type(a, a.tables.types.get(key).unwrap().scope,
-                                                         declared.unwrap(), no_bindings()), true))
+                                                         declared.unwrap(), no_bindings()), true,
+                                  buf()))
 
     out
 end trait_args_read
@@ -1433,7 +1435,7 @@ private value_arg(a: &Analysis, scope: Scope, span: Span, arg: TypeRef, ty: Type
     // `High` is that enum's, whatever else the name might mean.
     val tag = variant_tag(a, scope, e, ty)
 
-    if tag.is_some() then return Some(ConstArg(tag.unwrap(), ty, false))
+    if tag.is_some() then return Some(ConstArg(tag.unwrap(), ty, false, buf()))
 
     val refusals = a.const_refusals
     val folded = const_arg_value(a, scope, e, ty, subst)
@@ -1454,14 +1456,17 @@ private value_arg(a: &Analysis, scope: Scope, span: Span, arg: TypeRef, ty: Type
                 end if
             _ -> ()
 
-        return Some(ConstArg(folded.unwrap(), ty, names_stand_in(e, subst)))
+        val stood = names_stand_in(e, subst)
+
+        return Some(ConstArg(folded.unwrap(), ty, stood,
+                             if stood then value_term(a, scope, e, subst) else buf()))
     end if
 
-    if awaits_instantiation(a, scope, e, subst) then return Some(ConstArg(from_int(0), ty, true))
+    if awaits_instantiation(a, scope, e, subst) then return Some(ConstArg(from_int(0), ty, true, buf()))
 
     // A parameter whose declared type no value parameter may have was refused at the declaration,
     // and that is the one mistake: its arguments stand at zero, as a refused argument's do.
-    if value_type_refusal(nameless(ty)).is_some() then return Some(ConstArg(from_int(0), ty, true))
+    if value_type_refusal(nameless(ty)).is_some() then return Some(ConstArg(from_int(0), ty, true, buf()))
 
     // A simple enum's parameter takes one of ITS variants; any other name -- another enum's
     // variant, qualified or bare, or a word naming nothing -- is refused with the list it chooses from.
