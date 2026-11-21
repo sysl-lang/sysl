@@ -1,5 +1,6 @@
 module sh.sysl.compiler
 
+import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
 import sysl.math.bigint.{BigInt, from_int}
 
@@ -15,7 +16,12 @@ import sysl.math.bigint.{BigInt, from_int}
 // Puts a value on the heap: one count for the reference this yields, the hook that will destroy it,
 // and a copy of the payload -- whose own references the box now holds a share of.
 gen_box(e: *Emit, value: TExpr, ref_ty: Type) -> Val
-    if frame_boxed(e, value) then return gen_frame_box(e, value, ref_ty)
+    // The one box a factory's frame entry answers is laid in the slot its caller handed it.
+    if e.frame_site.is_some() && e.frame_site.unwrap() == value.span then
+        return gen_frame_box(e, value, ref_ty, Some(VReg(frame_slot_param())))
+
+    if frame_boxed(e, value) || laid_in_frame(e.framed_boxes, value.span) then
+        return gen_frame_box(e, value, ref_ty, None)
 
     val inner = ref_inner(ref_ty)
 
@@ -168,17 +174,23 @@ private frame_boxed(e: *Emit, value: TExpr) -> bool = *value.kind match
 // holds and gives no storage back: a payload holding nothing has no hook at all, which the runtime
 // reads as nothing to do. Nothing reaches the box after the frame, nor after the turn of a loop that
 // built it, so the slot is never asked about once it has been reused or given up.
-private gen_frame_box(e: *Emit, value: TExpr, ref_ty: Type) -> Val
+//
+// **The same box is laid in a caller's frame** where a factory's frame entry is written (`at`, the
+// slot its caller handed it, `stack_box.sysl`), and in this frame wherever the escape walk found
+// nothing keeps a box past it.
+private gen_frame_box(e: *Emit, value: TExpr, ref_ty: Type, at: Option[Val]) -> Val
     val inner = ref_inner(ref_ty)
     val bn = box_lty(e, inner)
-    val p = emit_alloca(e, fresh_reg(e), bn, box_storage_align(e, inner))
-    val holds = owns_value(e, inner) || destructor_of(e, inner).is_some()
-    val hook = if holds then VGlobal(request_helper(e, s"arc.dropframe.${mangle(inner)}", HrFrameDrop(inner)))
-               else VNull
+    val p = at match
+        Some(slot) -> slot
+        None ->
+            val made = emit_alloca(e, fresh_reg(e), bn, box_storage_align(e, inner))
 
-    emit(e, InStore(word_lty(e), VInt(from_int(1)), p, AccPlain, None))
-    store_header_word(e, bn, p, 1, LPtr, hook)
-    store_header_word(e, bn, p, 2, word_lty(e), VInt(from_int(1)))
+            // Its count is the compiler's to take out where it can (`frame_counts.sysl`).
+            e.frame_roots.push(FrameRoot(v_render(made), inner, false))
+            made
+
+    frame_box_header(e, inner, p)
 
     val slot = fresh_reg(e)
 
@@ -199,6 +211,85 @@ private gen_frame_box(e: *Emit, value: TExpr, ref_ty: Type) -> Val
     shared_box_payload(e, ref_ty, inner, slot)
     own_temp(e, p, ref_ty)
 end gen_frame_box
+
+// The header of a box laid in a frame: one count, the hook that lets go of what the payload holds and
+// gives no storage back -- none where the payload holds nothing, which the runtime reads as nothing to
+// do -- and the weak count every box starts with.
+//
+// **A compact box has the count alone** (`compact_box.sysl`), so one laid in a frame starts one past
+// `frame_mark`: its type's release lets go of the payload when the count comes back down to the mark,
+// and frees nothing (`emit_arc.sysl`'s `gen_compact_release`).
+private frame_box_header(e: *Emit, inner: Type, p: Val)
+    if is_compact(e, inner)
+        emit(e, InStore(word_lty(e), VInt(from_int(frame_mark(e) + 1)), p, AccPlain, None))
+        return
+    end if
+
+    val bn = box_lty(e, inner)
+    val holds = owns_value(e, inner) || destructor_of(e, inner).is_some()
+    val hook = if holds then VGlobal(request_helper(e, s"arc.dropframe.${mangle(inner)}", HrFrameDrop(inner)))
+               else VNull
+
+    emit(e, InStore(word_lty(e), VInt(from_int(1)), p, AccPlain, None))
+    store_header_word(e, bn, p, 1, LPtr, hook)
+    store_header_word(e, bn, p, 2, word_lty(e), VInt(from_int(1)))
+end frame_box_header
+
+// Whether the node at this span is one the body being written lays in its frame.
+private laid_in_frame(spans: Buf[Span], at: Span) -> bool
+    for s in spans
+        if s == at then return true
+
+    false
+end laid_in_frame
+
+// **A factory's frame entry** (`stack_box.sysl`): its body written again, under `<symbol>-frame`
+// and local to the module, taking the caller's slot first and laying the one box it may answer
+// there. It owns no parameter, as a +0 entry owns none (`zero_entry.sysl`): its caller lends it
+// every argument, whatever the ordinary entry owns.
+gen_frame_entry(e: *Emit, f: TFunc) -> Option[IrFunc]
+    e.frame_site = e.stack.entries.get(f.name)
+
+    val built = gen_function(e, f)
+
+    e.frame_site = None
+
+    val made = built?
+    var params: Buf[IrParam] = buf()
+
+    params.push(IrParam(LPtr, no_ir_attrs(), Some(VReg(frame_slot_param()))))
+
+    for item in made.sig.ty.params
+        params.push(item)
+
+    val ty = made.sig.ty with { params = params }
+
+    Some(made with { sig = made.sig with { name = frame_symbol(e, f.name), linkage = LinkInternal, ty = ty } })
+end gen_frame_entry
+
+// A call of a factory this body lays in its frame: a slot for the box here, and the factory's frame
+// entry handed it first and every argument lent. The answer is the box with the one count the entry
+// built it with, owned by the statement as any call's result is. `None` where the call is not one.
+gen_frame_call(e: *Emit, name: string, args: Buf[TExpr], ty: Type, span: Span) -> Option[Val]
+    if !laid_in_frame(e.framed_calls, span) || !e.stack.entries.has(name) then return None
+
+    val inner = ref_inner(ty)
+    val slot = emit_alloca(e, fresh_reg(e), box_lty(e, inner), box_storage_align(e, inner))
+    var arg_vals: Buf[IrArg] = buf()
+    val written = written_by(args)
+
+    arg_vals.push(ir_arg(LPtr, slot))
+
+    // The answer is the box in `slot` only where every way out of the factory answers it; elsewhere
+    // it may be a box the entry put on the heap, which only its count at run time can tell apart.
+    if e.stack.whole.has(name) then e.frame_roots.push(FrameRoot(v_render(slot), inner, true))
+    else e.counted_frames.add(mangle(inner))
+
+    for j in 0..<args.len()
+        arg_value(e, args[j], &arg_vals, written, "")
+
+    Some(gen_sysl_call(e, VGlobal(frame_symbol(e, name)), arg_vals, ty))
+end gen_frame_call
 
 // A box for `inner` with its header written and its payload not yet: the box, and the address its
 // payload goes at. `gen_box` fills it from an expression; a `match` arm moving a large payload out of

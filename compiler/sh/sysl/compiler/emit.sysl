@@ -531,6 +531,25 @@ struct Emit
     // reference followed on the way (`place_entry.sysl`'s `in_own_storage`), each with the index of
     // that address among a call's arguments (-2 before a call is written, -1 where calls disagree).
     inplace_symbols: Map[string, int]
+
+    // The boxes nothing keeps past their frame (`stack_box.sysl`): the whole program's answer, and for
+    // the body being written the payload spans of the boxes and the spans of the factory calls it lays
+    // in its frame. `frame_site` is set while a factory's frame entry is written: the payload span of
+    // the box it lays in the caller's slot, its first parameter.
+    stack: StackBoxes
+    framed_boxes: Buf[Span]
+    framed_calls: Buf[Span]
+    frame_site: Option[Span]
+
+    // The frame boxes the body being written laid, whose counts `finish_func` takes out where the
+    // compiler can count them (`frame_counts.sysl`); and the payloads, by mangled name, of a frame box
+    // some body left counted, whose compact release must still know the frame mark.
+    frame_roots: Buf[FrameRoot]
+    counted_frames: Set[string]
+
+    // The registers of the body being written holding the answer of a call none of whose parameters
+    // the escape walk found may be answered (`StackBoxes.answering`): never a box handed to it.
+    fresh_answers: Set[string]
 end Emit
 
 const PeelNone: int = 0
@@ -554,6 +573,10 @@ enum HelperReq
     // The hook of a box laid in a frame (`emit_box.sysl`'s `gen_frame_box`): it lets go of what the
     // payload holds, and gives no storage back.
     HrFrameDrop(payload: Type)
+
+    // What the release of a frame box's last share would have done, where the compiler counted its
+    // shares (`frame_counts.sysl`): the payload's destructor and the release of what it holds.
+    HrFrameDown(payload: Type)
 
     // How a drain lets go of one `&T` its walk reaches (`emit_arc.sysl`'s `gen_push`): a count given
     // back, and at zero the storage freed on the spot where nothing in it is left to tear down, or the
@@ -746,7 +769,8 @@ emitter_for(t: Target, destructors: Buf[(string, string, bool)]) -> Emit
          set(), map(), 0, map(), set(), map(), false, set(), map(), set(), false, false, false, buf(), set(),
           "", set(), false, None, None, set(), None, map(), buf(), buf(), buf(), false, set(), None,
           buf(), buf(), false, false, false, false, buf(), map(), map(), set(), map(), buf(), map(), buf(), map(),
-          held_args_none(), PeelNone, set(), false, false, map(), map(), map())
+          held_args_none(), PeelNone, set(), false, false, map(), map(), map(), no_stack_boxes(), buf(), buf(),
+          None, buf(), set(), set())
 end emitter_for
 
 // -- what a body could not say --------------------------------------------------------------------
@@ -795,6 +819,8 @@ start_function(e: *Emit)
     e.falls.clear()
     e.scratch.clear()
     e.ensures.clear()
+    e.frame_roots.clear()
+    e.fresh_answers.clear()
     e.result_ssa = None
     e.tail_target = ""
     e.tail_calls.clear()
@@ -1123,8 +1149,11 @@ finish_func(e: *Emit, sig: IrFuncSig) -> IrFunc
     // and the blocks the guards opened are bounded with the rest.
     // A read of a place the function then writes over takes the place's count (`arc_take.sysl`); it
     // asks about the pairs the cancelling left.
-    val elided = take_on_overwrite(elide_arc_pairs_with(out, e.inert_symbols, release_walks(e, out), e.inplace_symbols),
-                                   e.inert_symbols, e.take_walks)
+    //
+    // A frame box's count goes after both, which see only what a box's holders do
+    // (`frame_counts.sysl`).
+    val paired = elide_arc_pairs_with(out, e.inert_symbols, release_walks(e, out), e.inplace_symbols)
+    val elided = drop_frame_counts(e, take_on_overwrite(paired, e.inert_symbols, e.take_walks))
     var before: Set[string] = set()
 
     for inst in elided[0].instrs

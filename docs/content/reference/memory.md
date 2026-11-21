@@ -1348,6 +1348,69 @@ print(first())
 this view of an array literal is kept in 'keep', which outlives it, so the array would move to the heap to outlive its statement — and this module declared '@no_alloc', so there is nothing to move it into
 ```
 
+#### A box nothing keeps is laid in the frame
+
+The same analysis runs the other way for a `&T`. **A box the frame builds and nothing keeps past the
+frame is laid in the frame**, not on the heap: the header and the payload a heap box has, counted the
+same way, in a slot of the frame. The destructor still runs when the last count goes, at the end of
+the scope as before; only the allocation is gone. A **factory** — a function whose answer is a box it
+built and kept nowhere else — lays that box in its caller's frame wherever the caller keeps it no
+longer than itself:
+
+```sysl
+struct Counter
+    n: int
+
+counter(start: int) -> &Counter = Counter(start)
+
+struct Res
+    n: int
+
+impl Drop for Res
+    drop(self) = print("closed", self.n)
+
+read(r: &Res) -> int = r.n
+
+main()
+    val c = counter(5)
+
+    c.n += 2
+    print(c.n)
+
+    val r: &Res = Res(1)
+
+    print(read(r))
+    print("end")
+```
+
+```output
+7
+1
+end
+closed 1
+```
+
+Neither box above touches the heap. **A box stays on the heap wherever it may get out**: stored
+anywhere but a local of the frame (module storage, a field reached through a reference or a pointer,
+a buffer, another box), returned other than as a factory's answer, captured by a closure, handed to a
+parameter whose body may let it out or answer it into something that does, weakened, given up with
+`into_raw`, put behind a trait object, carried out of a loop by `break`, or held by a local that
+outlives the loop turn that built it. A view of an array inside a box owns the box, so a view that
+gets out keeps its box on the heap. A call with no body in sight — through a trait object, a callable,
+a function pointer, an `extern` — or a recursion still being worked out answers "it may get out", as
+does a task's body and a payload over a kilobyte, which every frame of a recursion would pay for. A
+`&sync T` is never laid in a frame. Nothing here is visible to the program but the allocator: a
+frame box prints, compares and drops exactly as a heap box does.
+
+**Where every share of a frame box is taken and given back by the body that laid it, the compiler
+counts them, not the program.** No count is taken or given back at run time: the point where the
+last share would have gone runs the destructor and lets go of what the payload holds, exactly where
+it ran before, on every way out of the scope — the end of a block, a `return`, a `?`, a `break` or
+`continue` out of the loop turn that built it. Both boxes above, a box held by two locals, a
+temporary handed to a call, a box a closure captures, a box lent to a callee that takes shares of its
+own: each is counted by the compiler. A local that may hold one of two boxes, or the answer of a call that may be the box
+itself, leaves that box counted at run time, as above; the program cannot tell the two apart.
+
 #### Promotion is silent, not hidden
 
 **`--explain-escapes`** reports every promotion and the route that forced it — one line per array, in

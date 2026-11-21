@@ -1,0 +1,713 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Var}
+import sysl.text.{cstring, Search}
+
+// A frame box whose every share the body that laid it can count is counted by the compiler
+// (`frame_counts.sysl`, `reference/memory.md § A box nothing keeps is laid in the frame`): no retain,
+// no release, and the release that would have given back its last share is `arc.framedown.<T>` --
+// the destructor and the release of what the payload holds -- at the same point, or nothing where the
+// payload holds nothing.
+//
+// Each cell is run on the counted heap: its output (destructor order included) is the output it had
+// when the box was counted at run time, it gives back everything it took, and the IR of the body that
+// lays the box names no retain or release of it. The axes: the frame cells of `tests_fbx_frame_box`
+// (read, `&self`, factory, generic factory, loop body, enum, holding a heap box, destructor); the
+// ways out of the scope (early `return`, `?`, `break` and `continue`, `defer`, a recursive body); the
+// holders (a second local, a statement temporary, a `match` on it, a closure capturing it, a callee
+// it is lent to that takes shares of its own); compact payloads (`Point`, `Node`, `Tally`) and full
+// headers (`Res`, a destructor); and the three shapes left counted: a holder that may hold one of two
+// boxes, a callee whose answer may be the box, and a factory whose other ways out answer a heap box.
+//
+// Skipped cells, and why: a `panic` path gives nothing back with the box counted or not; a box
+// handed to a body that owns it is a keep, which `stack_box.sysl` already refuses to lay in a frame;
+// codegen units and a library build change nothing, the pass running on each body as it is finished.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private struct FbcRun
+    out: string
+    err: string
+    bytes: long
+    instrumented: bool
+end FbcRun
+
+// The program built on the counted heap, or with `flags` handed to clang, and run.
+private fbc_run(text: string, flags: string) -> FbcRun
+    val root = make_temp_dir("sysl-fbc").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    val exe = s"$root/built"
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+        val v = cstring(flags)
+
+        fbc_c_setenv(n.ptr, v.ptr, 1)
+    end if
+
+    force_alloc_counting(flags == "")
+
+    val made = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe))
+
+    force_alloc_counting(false)
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+
+        fbc_c_unsetenv(n.ptr)
+    end if
+
+    made match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return FbcRun(failure_text(why), "", -1, false)
+        Ok(_) -> ()
+
+    // The sanitizer is in the binary only if it calls the sanitizer's report functions.
+    val symbols = capture("/usr/bin/nm", ["-u", exe], "", [], true)
+    val instrumented = symbols match
+        Ok(o) -> o.text.contains("___asan_report")
+        Err(_) -> false
+
+    val ran = capture(exe, [], "", [Var(alloc_bytes_variable(), "1")], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    ran match
+        Err(_) -> FbcRun("could not be started", "", -1, false)
+        Ok(o) -> FbcRun(o.text, o.err.unwrap_or(""), alloc_bytes_reported(o.err.unwrap_or("")), instrumented)
+end fbc_run
+
+private extern "setenv" fbc_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" fbc_c_unsetenv(name: *u8) -> int
+
+// The program printed `want` and gave back everything it took.
+private fbc_check(text: string, want: string)
+    val got = fbc_run(text, "")
+
+    assert_eq(got.out, want)
+    assert_eq(alloc_count_reported(got.err), 0)
+end fbc_check
+
+// The LLVM text of a program, or its report.
+private fbc_ir(text: string) -> string
+    val root = make_temp_dir("sysl-fbc").unwrap()
+
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end fbc_ir
+
+// The lines of the function defined at `@<symbol>(`.
+private fbc_body(ir: string, symbol: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    var inside = false
+
+    for line in lines_of(ir).view()
+        if !inside && line.starts_with("define") && line.contains(s"@$symbol(") then inside = true
+
+        if inside
+            out.push(line)
+
+            if line == "}" then break
+        end if
+    end for
+
+    out
+end fbc_body
+
+private fbc_count(lines: Buf[string], part: string) -> int
+    var n = 0
+
+    for line in lines.view()
+        if line.contains(part) then n += 1
+
+    n
+end fbc_count
+
+private fbc_text(lines: Buf[string]) -> string
+    var all = ""
+
+    for line in lines.view()
+        all = all + line + "\n"
+
+    all
+end fbc_text
+
+// The retains and releases of a reference a body makes.
+private fbc_shares(lines: Buf[string]) -> int =
+    fbc_count(lines, "@arc.retain(") + fbc_count(lines, "@arc.release(") + fbc_count(lines, "@arc.release.")
+
+// The body defined at `symbol` takes and gives back no share of a reference, and stands
+// `framedown` calls of `arc.framedown.<T>` where a last share was given back.
+private fbc_uncounted(name: string, text: string, symbol: string, framedown: int)
+    val body = fbc_body(fbc_ir(text), symbol)
+
+    assert(!body.is_empty(), s"$name: no body at @$symbol")
+    assert(fbc_shares(body) == 0, s"$name takes or gives back a share:\n${fbc_text(body)}")
+    assert(fbc_count(body, "@arc.framedown.") == framedown, s"$name:\n${fbc_text(body)}")
+end fbc_uncounted
+
+// -- the cells --------------------------------------------------------------------------------------
+
+private const fbc_read: string = raw"""
+    struct Point
+        x: int
+        y: int
+
+    sum(p: &Point) -> int = p.x + p.y
+
+    main()
+        val p: &Point = Point(3, 4)
+
+        print(sum(p))
+    """
+
+private const fbc_method: string = raw"""
+    struct Counter
+        n: int
+
+        bump(&self) = self.n += 1
+
+    main()
+        val c: &Counter = Counter(1)
+
+        c.bump()
+        c.bump()
+        print(c.n)
+    """
+
+private const fbc_factory: string = raw"""
+    struct Counter
+        n: int
+
+    counter(start: int) -> &Counter = Counter(start)
+
+    main()
+        val c = counter(5)
+
+        c.n += 2
+        print(c.n)
+    """
+
+private const fbc_generic_factory: string = raw"""
+    struct Cell[T]
+        v: T
+
+    cell[T](v: T) -> &Cell[T] = Cell(v)
+
+    main()
+        val a = cell(3)
+        val b = cell("hi")
+
+        print(a.v, b.v)
+    """
+
+private const fbc_loop: string = raw"""
+    struct Acc
+        n: int
+
+    total(a: &Acc) -> int = a.n
+
+    counter(start: int) -> &Acc = Acc(start)
+
+    main()
+        var sum = 0
+
+        for i in 0..<4
+            val a: &Acc = Acc(i)
+            val b = counter(i * 10)
+
+            sum += total(a) + total(b)
+
+        print(sum)
+    """
+
+private const fbc_enum: string = raw"""
+    enum Shape
+        Circle(r: int)
+        Square(s: int)
+
+    main()
+        val s: &Shape = Circle(2)
+        val t = s
+        val k = *t match
+            Circle(r) -> r
+            Square(q) -> q
+
+        print(k)
+    """
+
+private const fbc_holds_heap: string = raw"""
+    struct Node
+        v: int
+        next: Option[&Node]
+
+    link(a: &Node, b: &Node) = a.next = Some(b)
+
+    main()
+        val a: &Node = Node(1, None)
+        val b: &Node = Node(2, None)
+
+        link(a, b)
+        print(a.next.unwrap().v)
+    """
+
+private const fbc_destructor: string = raw"""
+    struct Res
+        n: int
+
+    impl Drop for Res
+        drop(self) = print("closed", self.n)
+
+    read(r: &Res) -> int = r.n
+
+    main()
+        val r: &Res = Res(1)
+        val q = r
+
+        print(read(r))
+        print(read(q))
+        print("end")
+    """
+
+private const fbc_order: string = raw"""
+    struct Res
+        n: int
+
+    impl Drop for Res
+        drop(self) = print("closed", self.n)
+
+    main()
+        val a: &Res = Res(1)
+        val b: &Res = Res(2)
+        val c = a
+
+        print(a.n + b.n + c.n)
+    """
+
+private const fbc_temp: string = raw"""
+    struct Res
+        n: int
+
+    impl Drop for Res
+        drop(self) = print("closed", self.n)
+
+    read(r: &Res) -> int = r.n
+
+    main()
+        print(read(Res(6)))
+        print("after")
+    """
+
+private const fbc_lent: string = raw"""
+    struct Res
+        n: int
+
+    impl Drop for Res
+        drop(self) = print("closed", self.n)
+
+    look(r: &Res) -> int
+        val q = r
+        val w = q
+
+        w.n + q.n
+
+    main()
+        val r: &Res = Res(4)
+
+        print(look(r))
+        print("end")
+    """
+
+private const fbc_made: string = raw"""
+    struct Res
+        n: int
+
+    impl Drop for Res
+        drop(self) = print("closed", self.n)
+
+    make(n: int) -> &Res = Res(n)
+
+    main()
+        val r = make(3)
+        val q = r
+
+        print(r.n + q.n)
+    """
+
+private const fbc_early: string = raw"""
+    struct Res
+        n: int
+
+    impl Drop for Res
+        drop(self) = print("closed", self.n)
+
+    pick(c: bool) -> int
+        val r: &Res = Res(1)
+
+        if c then return 5
+
+        r.n + 10
+
+    main()
+        print(pick(true))
+        print(pick(false))
+    """
+
+private const fbc_try: string = raw"""
+    struct Res
+        n: int
+
+    impl Drop for Res
+        drop(self) = print("closed", self.n)
+
+    half(n: int) -> Result[int, string]
+        if n % 2 == 1 then return Err("odd")
+
+        Ok(n / 2)
+
+    work(n: int) -> Result[int, string]
+        val r: &Res = Res(n)
+        val h = half(n)?
+
+        Ok(h + r.n)
+
+    main()
+        print(work(4).unwrap_or(-1))
+        print(work(3).unwrap_or(-1))
+    """
+
+private const fbc_turns: string = raw"""
+    struct Res
+        n: int
+
+    impl Drop for Res
+        drop(self) = print("closed", self.n)
+
+    main()
+        for i in 0..<5
+            val r: &Res = Res(i)
+
+            if i == 1 then continue
+            if i == 3 then break
+
+            print("turn", r.n)
+
+        print("done")
+    """
+
+private const fbc_deferred: string = raw"""
+    struct Res
+        n: int
+
+    impl Drop for Res
+        drop(self) = print("closed", self.n)
+
+    main()
+        val r: &Res = Res(1)
+
+        defer print("deferred")
+        print("body", r.n)
+    """
+
+private const fbc_depth: string = raw"""
+    struct Res
+        n: int
+
+    impl Drop for Res
+        drop(self) = print("closed", self.n)
+
+    depth(n: int)
+        val r: &Res = Res(n)
+
+        if n > 0 then depth(n - 1)
+
+        print("leave", r.n)
+
+    main()
+        depth(2)
+    """
+
+private const fbc_captured: string = raw"""
+    struct Res
+        n: int
+
+    impl Drop for Res
+        drop(self) = print("closed", self.n)
+
+    each(xs: []int, f: int -> unit)
+        for x in xs
+            f(x)
+
+    main()
+        val r: &Res = Res(10)
+
+        each([1, 2, 3], x -> print(r.n + x))
+        print("end")
+    """
+
+private const fbc_tally: string = raw"""
+    struct Tally
+        n: int
+
+    each(xs: []int, f: int -> unit)
+        for x in xs
+            f(x)
+
+    main()
+        val t: &Tally = Tally(0)
+
+        each([1, 2, 3], x -> t.n += x)
+        print(t.n)
+    """
+
+private const fbc_named: string = raw"""
+    struct Named
+        name: string
+
+    main()
+        val k = 7
+        val n: &Named = Named(s"item $k")
+
+        print(n.name)
+    """
+
+// Left counted: `r` holds one of two boxes, so no release of it is the last share of either.
+private const fbc_mixed: string = raw"""
+    struct Res
+        n: int
+
+    impl Drop for Res
+        drop(self) = print("closed", self.n)
+
+    flag(n: int) -> bool = n > 2
+
+    main()
+        val r: &Res = if flag(3) then Res(1) else Res(2)
+
+        print(r.n)
+    """
+
+// Left counted: `same` may answer the box, so `b` is a second holder the pass does not follow.
+private const fbc_answered: string = raw"""
+    struct Acc
+        n: int
+
+    same(a: &Acc) -> &Acc = a
+
+    main()
+        val a: &Acc = Acc(2)
+        val b = same(a)
+
+        print(b.n)
+    """
+
+// The last share of a factory's answer a condition's term takes goes at the end of that term.
+private const fbc_term: string = raw"""
+    struct Res
+        n: int
+
+    impl Drop for Res
+        drop(self) = print("closed", self.n)
+
+    make(n: int) -> &Res = Res(n)
+
+    ok(n: int) -> bool = n > 0
+
+    check(n: int) -> bool
+        if ok(n) && make(n).n > 1 then return true
+
+        print("after the term")
+        false
+
+    main()
+        print(check(2))
+        print(check(1))
+    """
+
+// Left counted: `make`'s frame entry lays `Leaf` in the caller's slot but answers a `Node` it put on
+// the heap, so only the count at run time tells the two apart.
+private const fbc_tree: string = raw"""
+    enum Tree
+        Leaf
+        Node(left: &Tree, right: &Tree)
+
+    make(depth: int) -> &Tree
+        if depth == 0 then Leaf else Node(make(depth - 1), make(depth - 1))
+
+    check(t: &Tree) -> int
+        *t match
+            Leaf -> 1
+            Node(l, r) -> 1 + check(l) + check(r)
+
+    main()
+        var total = 0
+
+        for _ in 0..<4 do total += check(make(5))
+
+        print(total)
+    """
+
+// Every counted cell with what it prints: the output it had when its box was counted at run time.
+private fbc_cells() -> Buf[(string, string)]
+    var out: Buf[(string, string)] = buf()
+
+    out.push((fbc_read, "7\n"))
+    out.push((fbc_method, "3\n"))
+    out.push((fbc_factory, "7\n"))
+    out.push((fbc_generic_factory, "3 hi\n"))
+    out.push((fbc_loop, "66\n"))
+    out.push((fbc_enum, "2\n"))
+    out.push((fbc_holds_heap, "2\n"))
+    out.push((fbc_destructor, "1\n1\nend\nclosed 1\n"))
+    out.push((fbc_order, "4\nclosed 2\nclosed 1\n"))
+    out.push((fbc_temp, "6\nclosed 6\nafter\n"))
+    out.push((fbc_lent, "8\nend\nclosed 4\n"))
+    out.push((fbc_made, "6\nclosed 3\n"))
+    out.push((fbc_early, "closed 1\n5\nclosed 1\n11\n"))
+    out.push((fbc_try, "closed 4\n6\nclosed 3\n-1\n"))
+    out.push((fbc_turns, "turn 0\nclosed 0\nclosed 1\nturn 2\nclosed 2\nclosed 3\ndone\n"))
+    out.push((fbc_deferred, "body 1\ndeferred\nclosed 1\n"))
+    out.push((fbc_depth, "leave 0\nclosed 0\nleave 1\nclosed 1\nleave 2\nclosed 2\n"))
+    out.push((fbc_captured, "11\n12\n13\nend\nclosed 10\n"))
+    out.push((fbc_tally, "6\n"))
+    out.push((fbc_named, "item 7\n"))
+    out.push((fbc_mixed, "1\nclosed 1\n"))
+    out.push((fbc_answered, "2\n"))
+    out.push((fbc_term, "closed 2\ntrue\nclosed 1\nafter the term\nfalse\n"))
+    out.push((fbc_tree, "252\n"))
+    out
+end fbc_cells
+
+@test("a frame box counted by the compiler prints what it printed counted, and gives back all it took")
+fbc_cells_print_what_they_did()
+    if !enm_ready() then return
+
+    for cell in fbc_cells()
+        fbc_check(cell.0, cell.1)
+end fbc_cells_print_what_they_did
+
+@test("the frame cells of tests_fbx take and give back no share of their box")
+fbc_frame_cells_take_no_share()
+    if xvr_no_library() then return
+
+    fbc_uncounted("fbc_read", fbc_read, "$$main", 0)
+    fbc_uncounted("fbc_method", fbc_method, "$$main", 0)
+    fbc_uncounted("fbc_factory", fbc_factory, "$$main", 0)
+    fbc_uncounted("fbc_generic_factory", fbc_generic_factory, "$$main", 1)
+    fbc_uncounted("fbc_loop", fbc_loop, "$$main", 0)
+    fbc_uncounted("fbc_enum", fbc_enum, "$$main", 0)
+    fbc_uncounted("fbc_destructor", fbc_destructor, "$$main", 1)
+    fbc_uncounted("fbc_tally", fbc_tally, "$$main", 0)
+end fbc_frame_cells_take_no_share
+
+@test("a box read only through place entries has no header written: nothing can read it")
+fbc_unread_header_is_not_written()
+    if xvr_no_library() then return
+
+    val body = fbc_body(fbc_ir(fbc_destructor), "$$main")
+
+    assert_eq(fbc_count(body, "store i64"), 0)
+    assert_eq(fbc_count(body, "@arc.dropframe.Res"), 0)
+
+    // A box lent to a callee keeps its header: the callee counts its own shares on it.
+    val lent = fbc_body(fbc_ir(fbc_lent), "$$main")
+
+    assert_eq(fbc_count(lent, "store ptr @arc.dropframe.Res"), 1)
+end fbc_unread_header_is_not_written
+
+@test("the last share's release is the teardown, once, on every way out of the scope")
+fbc_teardown_on_every_way_out()
+    if xvr_no_library() then return
+
+    fbc_uncounted("fbc_order", fbc_order, "$$main", 2)
+    fbc_uncounted("fbc_temp", fbc_temp, "$$main", 1)
+    fbc_uncounted("fbc_lent", fbc_lent, "$$main", 1)
+    fbc_uncounted("fbc_made", fbc_made, "$$main", 1)
+    fbc_uncounted("fbc_early", fbc_early, "pick$$sysl", 2)
+    fbc_uncounted("fbc_try", fbc_try, "work$$sysl", 2)
+    fbc_uncounted("fbc_turns", fbc_turns, "$$main", 3)
+    fbc_uncounted("fbc_deferred", fbc_deferred, "$$main", 1)
+    fbc_uncounted("fbc_depth", fbc_depth, "depth$$sysl", 1)
+    fbc_uncounted("fbc_named", fbc_named, "$$main", 1)
+    fbc_uncounted("fbc_term", fbc_term, "check$$sysl", 1)
+
+    // The teardown is in the term's own block, before the branch on it.
+    val term = fbc_body(fbc_ir(fbc_term), "check$$sysl")
+    var in_term = false
+    var torn = false
+
+    for line in term.view()
+        if line.starts_with("cond.and") then in_term = true
+        if in_term && line.contains("@arc.framedown.Res(") then torn = true
+        if in_term && line.starts_with("  br ") then break
+
+    assert(torn, "fbc_term: the teardown is not in the term's block")
+end fbc_teardown_on_every_way_out
+
+@test("a closure capturing a frame box keeps its copy and dispose, and the box's own shares go")
+fbc_captured_box()
+    if xvr_no_library() then return
+
+    val body = fbc_body(fbc_ir(fbc_captured), "$$main")
+
+    assert_eq(fbc_shares(body), 0)
+    assert_eq(fbc_count(body, "@arc.framedown.Res("), 1)
+end fbc_captured_box
+
+@test("a compact frame box holding a heap box gives it back in its teardown, and no release knows the mark")
+fbc_compact_holding_heap()
+    if xvr_no_library() then return
+
+    val ir = fbc_ir(fbc_holds_heap)
+
+    assert_eq(fbc_count(fbc_body(ir, "$$main"), "@arc.framedown.Node("), 1)
+    assert_eq(fbc_count(lines_of(ir), ", 2305843009213693952"), 0)
+end fbc_compact_holding_heap
+
+@test("a holder of one of two boxes, a callee that may answer the box, and a factory that may answer a heap box leave it counted")
+fbc_left_counted()
+    if xvr_no_library() then return
+
+    val mixed = fbc_body(fbc_ir(fbc_mixed), "$$main")
+
+    assert_eq(fbc_count(mixed, "@arc.framedown."), 0)
+    assert(fbc_shares(mixed) > 0, "fbc_mixed: its releases are gone")
+
+    // The compact release of a payload some body left counted still knows the frame mark.
+    val answered = fbc_ir(fbc_answered)
+
+    assert(fbc_shares(fbc_body(answered, "$$main")) > 0, "fbc_answered: its releases are gone")
+    assert_eq(fbc_count(lines_of(answered), ", 2305843009213693952"), 1)
+
+    // A factory answering its frame box on one way out and a heap box on another.
+    val tree = fbc_ir(fbc_tree)
+
+    assert_eq(fbc_count(fbc_body(tree, "$$main"), "@arc.framedown."), 0)
+    assert_eq(fbc_count(lines_of(tree), ", 2305843009213693952"), 1)
+end fbc_left_counted
+
+@test("and under AddressSanitizer: instrumented, and nothing read outside a live frame")
+fbc_cells_run_clean_under_asan()
+    if !enm_ready() then return
+
+    for cell in fbc_cells()
+        val got = fbc_run(cell.0, "-fsanitize=address -g")
+
+        assert(got.instrumented, "the binary calls no AddressSanitizer report")
+        assert_eq(got.out, cell.1)
+        assert_eq(got.err, "")
+    end for
+end fbc_cells_run_clean_under_asan

@@ -72,14 +72,15 @@ gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
     //
     // **A +0 entry owns nothing** (`zero_entry.sysl`): its caller hands every parameter over borrowed.
     val found = tail_calls_of(f)
-    val owns = if e.zero_body then set()
+    val lends_all = e.zero_body || e.frame_site.is_some()
+    val owns = if lends_all then set()
                else owning(f, e.address_taken.has(f.name), is_async || !found.is_empty(), e.inert.has(f.name))
 
     var owned_names: Set[string] = set()
 
     for j in 0..<f.params.len()
         val p = f.params[j]
-        val handed = !e.zero_body && e.owned_params.has(owned_key(f.name, j))
+        val handed = !lends_all && e.owned_params.has(owned_key(f.name, j))
 
         if !zero_sized(p.1) && !(value_drops(e, p.1) && reads_receiver(f, j)) && (owns.has(p.0) || handed) then
             owned_names.add(p.0)
@@ -94,7 +95,7 @@ gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
     // parameter every jump hands a fresh value is **peeled** (§4.3 (b), decision 9): this symbol borrows
     // that parameter on entry and its jump calls `<symbol>.owned`, the same body owning what the jump
     // staged (`peel_parts`).
-    val rewritten = if is_async || e.zero_body then set() else rewritten_params(e, f, owns, !found.is_empty())
+    val rewritten = if is_async || lends_all then set() else rewritten_params(e, f, owns, !found.is_empty())
     val answer = if is_async then Plus0(set(), set())
                  else plus0_locals(e, f, owned_names, !found.is_empty(), rewritten,
                                    e.peel == PeelNone && peel_shape(e, f))
@@ -136,8 +137,8 @@ gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
 
             // The owned half of a peel is handed its count by the entry's jump, as a direct caller
             // hands an owned parameter's.
-            val handed = !e.zero_body && (e.owned_params.has(owned_key(f.name, j)) ||
-                                          e.peel == PeelOwned && e.peel_handed.has(p.0))
+            val handed = !lends_all && (e.owned_params.has(owned_key(f.name, j)) ||
+                                        e.peel == PeelOwned && e.peel_handed.has(p.0))
 
             // A `@unique` value with a destructor is the callee's to drop only where it was handed
             // over (`owned_params.sysl`); a `(self)` receiver is a copy that owns nothing, and takes
@@ -145,7 +146,7 @@ gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
             val reader = value_drops(e, ty) && reads_receiver(f, j)
             val owned = owned_names.has(p.0)
 
-            if value_drops(e, ty) && !reader && !handed && !e.zero_body
+            if value_drops(e, ty) && !reader && !handed && !lends_all
                 gap_here(e, s"the '@unique' parameter '${p.0}', which this function cannot be handed")
 
             if reader && rebound(f).has(p.0)
