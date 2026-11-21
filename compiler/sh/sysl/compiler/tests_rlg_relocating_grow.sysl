@@ -1,0 +1,428 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// A drained growth that takes the rest of the old live prefix is a RELOCATION (`slots.sysl`'s
+// `relocate_to`, `drain_relocate_loop`): where the fresh storage's first free slot is where the copy
+// starts and every slot it reaches exists, the elements' bytes move in one `memmove`, no count is
+// touched, and the loop of places is skipped. Every other case runs the copy as written. The claims:
+// what it lowers to, for a run and for a loop at each slot index shape the drain accepts; what keeps the
+// slow path (a closed range, a variable wider than an address, a destination not at its first free
+// slot, a shared old storage); that the standard `Buf`'s fallible growth is drained and relocated too;
+// and that a program sees the same counts, contents and drops it saw before.
+//
+// Axes: the copy's form (counted loop / `slot_place_run`); the slot index (`i`, `i + c`, `c + i`,
+// `i - c`); the loop variable (unsigned / signed / wider than an address); the element (a reference
+// with a `Drop`, a counted reference without one, a string, a struct holding a counted field, a plain
+// scalar, a nested `Buf`); the old storage's holders (one / two); the growth path (`push`'s, `try_push`'s,
+// a generic container's own); the destination (at its first free slot / past it). The cells crossed with
+// partial copies and with an `invariant` are `tests_gdm_grow_drain_move.sysl`'s, which now run through
+// the relocation. Not crossed: a freestanding target other than Thumb, which has no `memmove` to call and
+// so is the loop as written (nothing new to show); separate compilation, since the lowering is per body
+// and `Buf`'s growth is reached from the standard module's own `.syslib` in every runtime cell here.
+
+private struct RlgRun
+    ok: bool
+    out: string
+    err: string
+
+private rlg_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end rlg_ready
+
+// A program built with the heap counted and run.
+private rlg_run(text: string) -> RlgRun
+    val root = make_temp_dir("sysl-rlg").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    force_alloc_counting(true)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization,
+                                     Some(s"$root/built"))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return RlgRun(false, failure_text(why), "")
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> RlgRun(false, "could not be started", "")
+        Ok(o) -> RlgRun(o.status.ok(), o.text, o.err.unwrap_or(""))
+end rlg_run
+
+private rlg_clean(run: RlgRun, expected: string)
+    assert(run.ok, run.out + run.err)
+    assert_eq(run.out, expected)
+    assert(!run.err.contains(alloc_count_said()), run.err)
+
+// The IR text of every block a label opens, each up to the next label: the label and then its number,
+// so `drain.relocate` is not `drain.relocated`.
+private rlg_block(ir: string, label: string) -> string
+    var out = ""
+    var inside = false
+
+    for line in ir.split("\n")
+        val opens = line.len > 0 && !line.starts_with(" ") && line.ends_with(":")
+
+        if opens
+            inside = false
+            for d in 0..<10
+                if line.starts_with(f"$label$d") then inside = true
+        end if
+
+        if inside then out = out + line + "\n"
+
+    out
+end rlg_block
+
+private rlg_node() -> string = "struct N\n    v: int\n\n"
+
+// A relocation is there: one block moves the bytes and touches no count, and the slot-by-slot copy
+// beside it still retains only where the storage is shared.
+private rlg_relocates(ir: string)
+    assert(ir.starts_with("define"), ir)
+
+    val moved = rlg_block(ir, "drain.relocate")
+
+    assert(moved.contains("@llvm.memmove"), ir)
+    assert(!moved.contains("@arc."), ir)
+    assert_eq(ir.count_of("call void @arc.retain("), 1)
+
+// -- what it lowers to ---------------------------------------------------------------------------------
+
+@test("a drained run relocates its elements in one move")
+rlg_run_relocates()
+    rlg_relocates(emit_func_text(rlg_node() + raw"""
+        grow(old: *[]&N, last: usize, n: usize)
+            var fresh: []&N = slot_storage(n)
+            slot_place_run(fresh, 0, (*old)[0..<last])
+            *old = fresh
+        """, "grow"))
+
+@test("a drained loop relocates at every slot index shape the drain accepts")
+rlg_loop_shapes_relocate()
+    val shapes = ["i", "i + k", "k + i", "i - k"]
+
+    for at in shapes
+        val ir = emit_func_text(rlg_node() + "grow(old: *[]&N, k: usize, last: usize, n: usize)\n" +
+                                "    var fresh: []&N = slot_storage(n)\n" +
+                                s"    for i in k..<last do slot_place(fresh, $at, (*old)[i])\n" +
+                                "    *old = fresh\n", "grow")
+
+        rlg_relocates(ir)
+
+@test("a signed loop variable relocates, its shift tested for sign")
+rlg_signed_loop_relocates()
+    val ir = emit_func_text(rlg_node() + raw"""
+        grow(old: *[]&N, k: int, last: int, n: usize)
+            var fresh: []&N = slot_storage(n)
+            for i in k..<last do slot_place(fresh, i - k, (*old)[i])
+            *old = fresh
+        """, "grow")
+
+    rlg_relocates(ir)
+    assert(ir.contains("icmp sge"), ir)
+
+@test("a closed range or a variable wider than an address is drained but not relocated")
+rlg_slow_shapes()
+    val closed = emit_func_text(rlg_node() + raw"""
+        grow(old: *[]&N, last: usize, n: usize)
+            var fresh: []&N = slot_storage(n)
+            for i in 0..last do slot_place(fresh, i, (*old)[i])
+            *old = fresh
+        """, "grow")
+
+    assert(closed.contains("drain.sole"), closed)
+    assert(!closed.contains("drain.relocate"), closed)
+
+    val wide = emit_func_text(rlg_node() + raw"""
+        grow(old: *[]&N, last: u128, n: usize)
+            var fresh: []&N = slot_storage(n)
+            for i in 0u128..<last do slot_place(fresh, i, (*old)[i])
+            *old = fresh
+        """, "grow")
+
+    assert(wide.contains("drain.sole"), wide)
+    assert(!wide.contains("drain.relocate"), wide)
+
+@test("storage from try_slot_storage, its length read before the copy, is drained and relocated")
+rlg_try_storage_drained()
+    val ir = emit_func_text(rlg_node() + raw"""
+        grow(old: *[]&N, last: usize, n: usize) -> bool
+            var fresh: []&N = try_slot_storage(n)
+            if fresh.len != n then return false
+            slot_place_run(fresh, 0, (*old)[0..<last])
+            *old = fresh
+            true
+        """, "grow")
+
+    assert(ir.contains("drain.sole"), ir)
+    rlg_relocates(ir)
+
+@test("fresh storage named between its making and the copy, other than by its length, is not drained")
+rlg_named_between_is_left_alone()
+    val ir = emit_func_text(rlg_node() + raw"""
+        look(xs: []&N) -> usize = xs.len
+
+        grow(old: *[]&N, last: usize, n: usize)
+            var fresh: []&N = try_slot_storage(n)
+            if look(fresh) == 0 then return
+            slot_place_run(fresh, 0, (*old)[0..<last])
+            *old = fresh
+        """, "grow")
+
+    assert(ir.starts_with("define"), ir)
+    assert(!ir.contains("drain."), ir)
+
+// One function of a program lowered with the standard module beside it, or "skipped".
+private rlg_with_std(text: string, symbol: string) -> string
+    val root = std_root()
+
+    if root.is_err() then return "skipped"
+
+    val std = std_units(root.unwrap(), host_target())
+
+    if std.is_err() then return "skipped"
+
+    var units: Buf[Program] = buf()
+
+    for item in std.unwrap()
+        units.push(item)
+
+    units.push(parse(source_of("test.sysl", text)).program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if !done.reported.is_empty() then return done.reported[0].diag.message
+
+    val whole = program_of(done, "")
+    val lowered = codegen_with_gaps(strip_tests(whole), host_target(),
+                                    post_analysis_checks(done.an, whole, buf()))
+    var names = ""
+
+    for item in func_texts(ir_print_module(lowered.0))
+        if names_as_written(item.0, symbol) then return item.1
+        if item.0.contains("grow") then names = names + item.0 + " "
+
+    s"no function '$symbol' among: $names"
+end rlg_with_std
+
+@test("the standard Buf's growth, trapping and fallible, relocates")
+rlg_buf_growths_relocate()
+    val text = rlg_node() + raw"""
+        import sysl.buf.{Buf, buf}
+
+        main()
+            var b: Buf[&N] = buf()
+
+            for i in 0..<20 do b.push(N(i))
+            for i in 0..<20
+                if b.try_push(N(i)).is_err() then return
+            print(b.len())
+        """
+
+    for symbol in ["sysl.buf$BufCore.grow.ref.N", "sysl.buf$BufCore.try_grow.ref.N"]
+        val ir = rlg_with_std(text, symbol)
+
+        if ir == "skipped" then return
+
+        assert(ir.contains("drain.sole"), ir)
+        rlg_relocates(ir)
+
+// -- what a program sees ------------------------------------------------------------------------------
+
+// A generic container grown by a loop, as the benchmarks' `Vector` is, and the element kinds it holds.
+private rlg_kinds() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct Job
+        id: int
+
+    impl Drop for Job
+        drop(self) = print(f"let go ${self.id}")
+
+    struct N
+        v: int
+
+    struct Pair
+        job: &Job
+        n: int
+
+    struct Vec[E]
+        storage: []E
+        last: usize
+
+        append(*self, x: E)
+            if self.last >= self.storage.len
+                self.grow_to(if self.storage.len == 0 then 2 else self.storage.len * 2)
+            slot_place(self.storage, self.last, x)
+            self.last += 1
+
+        grow_to(*self, n: usize)
+            var fresh: []E = slot_storage(n)
+            for i in 0..<self.last do slot_place(fresh, i, self.storage[i])
+            self.storage = fresh
+    end Vec
+
+    """
+
+@test("a generic container grown many times over Drop elements keeps each and lets go of each once")
+rlg_drop_elements()
+    if !rlg_ready() then return
+
+    rlg_clean(rlg_run(rlg_kinds() + raw"""
+        jobs()
+            var a: Vec[&Job] = Vec(slot_storage(0), 0)
+
+            for i in 1..5 do a.append(Job(i))
+            print(a.last, a.storage.len, a.storage[0].id, a.storage[4].id)
+
+        jobs()
+        print("done")
+        """), "5 8 1 5\nlet go 1\nlet go 2\nlet go 3\nlet go 4\nlet go 5\ndone\n")
+
+@test("counted elements held elsewhere too keep their holders' counts across growth")
+rlg_counted_elements()
+    if !rlg_ready() then return
+
+    rlg_clean(rlg_run(rlg_kinds() + raw"""
+        fill(keep: &N)
+            var a: Vec[&N] = Vec(slot_storage(0), 0)
+
+            for i in 0..<9 do a.append(keep)
+            print(a.last, a.storage[8].v)
+
+        shared()
+            val keep: &N = N(7)
+
+            fill(keep)
+            fill(keep)
+            print(keep.v)
+
+        strings()
+            var s: Vec[string] = Vec(slot_storage(0), 0)
+
+            for i in 0..<9 do s.append(f"s$i")
+            print(s.last, s.storage[0], s.storage[8])
+
+        pairs()
+            var p: Vec[Pair] = Vec(slot_storage(0), 0)
+
+            for i in 10..12 do p.append(Pair(Job(i), i * 2))
+            print(p.last, p.storage[2].job.id, p.storage[2].n)
+
+        shared()
+        strings()
+        pairs()
+        print("done")
+        """), "9 7\n9 7\n7\n9 s0 s8\n3 12 24\nlet go 10\nlet go 11\nlet go 12\ndone\n")
+
+@test("plain scalars and nested buffers come through growth whole")
+rlg_scalars_and_nested()
+    if !rlg_ready() then return
+
+    rlg_clean(rlg_run(rlg_kinds() + raw"""
+        scalars()
+            var q: Vec[int] = Vec(slot_storage(0), 0)
+
+            for i in 0..<9 do q.append(i * i)
+            print(q.last, q.storage[3], q.storage[8])
+
+        nested()
+            var outer: Vec[Buf[&Job]] = Vec(slot_storage(0), 0)
+
+            for i in 0..<3
+                var b: Buf[&Job] = buf()
+
+                b.push(Job(20 + i))
+                outer.append(b)
+
+            print(outer.last, outer.storage[2][0].id)
+
+        scalars()
+        nested()
+        print("done")
+        """), "9 9 64\n3 22\nlet go 20\nlet go 21\nlet go 22\ndone\n")
+
+@test("a Buf grown by try_push keeps its count and lets go of each element once")
+rlg_try_push_growth()
+    if !rlg_ready() then return
+
+    rlg_clean(rlg_run(rlg_kinds() + raw"""
+        grown()
+            var b: Buf[&Job] = buf()
+
+            for i in 0..<20
+                if b.try_push(Job(i)).is_err() then print("refused")
+            print(b.len(), b[0].id, b[19].id)
+
+        grown()
+        print("done")
+        """), "20 0 19\n" + rlg_let_go(0, 20) + "done\n")
+
+@test("a Buf grown by try_push while a view holds the old storage leaves the view whole")
+rlg_try_push_shared()
+    if !rlg_ready() then return
+
+    rlg_clean(rlg_run(rlg_kinds() + raw"""
+        grown()
+            var b: Buf[&Job] = buf()
+
+            for i in 0..<8
+                if b.try_push(Job(i)).is_err() then print("refused")
+
+            val view = b.view()
+
+            for i in 8..<12
+                if b.try_push(Job(i)).is_err() then print("refused")
+            print(view.len, view[7].id, b.len(), b[11].id)
+
+        grown()
+        print("done")
+        """), "8 7 12 11\n" + rlg_let_go(0, 12) + "done\n")
+
+private rlg_let_go(lo: int, hi: int) -> string
+    var out = ""
+
+    for i in lo..<hi do out = out + f"let go $i\n"
+    out
+
+@test("a copy that starts past the destination's first free slot still traps there")
+rlg_past_first_free_traps()
+    if !rlg_ready() then return
+
+    for form in ["for i in 0..<v.last do slot_place(fresh, i + 1, v.storage[i])",
+                 "slot_place_run(fresh, 1, v.storage[0..<v.last])"]
+        val off = "off(v: *Vec[&Job])\n    var fresh: []&Job = slot_storage(8)\n" +
+                  s"    $form\n    v.storage = fresh\n\n"
+        val run = rlg_run(rlg_kinds() + off + raw"""
+            var v: Vec[&Job] = Vec(slot_storage(0), 0)
+
+            for i in 1..3 do v.append(Job(i))
+            print("before")
+            off(&v)
+            print("after")
+            """)
+
+        assert(!run.ok, run.out)
+        assert(run.out.starts_with("before\n"), run.out)
+        assert(!run.out.contains("after"), run.out)

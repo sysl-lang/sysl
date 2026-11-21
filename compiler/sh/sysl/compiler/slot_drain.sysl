@@ -26,8 +26,8 @@ import sysl.buf.Buf
 //   holding `s` states, which runs after the write.
 //
 // `s` is a place spelled as a path -- a local, its fields, a pointer's referent -- and `d` is a local
-// declared earlier in the list from `slot_storage`, named by nothing between its declaration and the
-// loop. `j` is the loop's variable, or that plus or minus an expression the loop cannot change.
+// declared earlier in the list from `slot_storage` or `try_slot_storage`, named by nothing between its
+// declaration and the loop but a read of its length. `j` is the loop's variable, or that plus or minus an expression the loop cannot change.
 // Every other expression of the loop -- its bounds, `j`, the run's cut -- is arithmetic over locals and
 // fields, and never reads an element.
 //
@@ -42,15 +42,27 @@ import sysl.buf.Buf
 //
 // A borrowed parameter view of the old storage holds no count, as it does not for `slot_vacate`; it is
 // a view of storage the replacement frees either way.
+//
+// **Where the drain takes and covers the rest of the live prefix, the copy is a RELOCATION** (`slots.sysl`'s
+// `drain_relocate_loop` and the run's twin): when the destination's first free slot is where the copy
+// starts and every slot it reaches exists, the elements' bytes are moved in one `memmove` and the
+// destination's live prefix raised past them -- no count is touched, no slot is visited one by one, and
+// the old storage, its prefix cut back, frees without walking them. Anything else (a shared old storage,
+// a copy that stops short of the prefix's end, a destination too small, one not at its first free slot)
+// runs the loop as before, so the trap a too-small destination reaches is the one it reached.
 
 // One copy found: the place `source` is read from and dropped, the node that reads it (the loop's
 // subscript, or the run's source), its element type, and for a counted loop its bounds and variable
 // type -- which is what lets the drain see, before the loop, whether it covers the whole live prefix.
+// For a counted loop `into` is where its first turn places: the destination, and the slot index the
+// loop variable steps as -- the variable itself (`""`), or it plus or minus a fixed expression (`"+"`,
+// `"-"`) -- which is what lets the whole loop be one relocation of the bytes (`drain_relocate_loop`).
 struct DrainPlan
     source: TExpr
     read: TExpr
     elem: Type
     bounds: Option[(TExpr, TExpr, Type)]
+    into: Option[(TExpr, string, Option[TExpr])]
 end DrainPlan
 
 // The copy that statement `k` of `xs` is, where it is one. `tail` is the block's value, which follows
@@ -163,9 +175,21 @@ private loop_copy(source: TExpr, root: string, name: string, var_ty: Type, lo: T
 
     // A closed range is drained slot by slot; only a half-open one is measured against the prefix.
     val bounds = if inclusive then None else Some((lo, hi, var_ty))
+    val into = shift_of(args[1], name).map(s -> (args[0], s.0, s.1))
 
-    Some((DrainPlan(source, read, parts.1, bounds), d))
+    Some((DrainPlan(source, read, parts.1, bounds, into), d))
 end loop_copy
+
+// How a slot index `steps` accepts moves with the loop variable: it is the variable, or the variable
+// plus or minus the fixed expression answered.
+private shift_of(x: TExpr, name: string) -> Option[(string, Option[TExpr])] = *x.kind match
+    TLoad(n, _) -> if n == name then Some(("", None)) else None
+    TBinary(op, l, r, _) ->
+        if op == "+" && is_load(l, name) && fixed(r, name) then Some(("+", Some(r)))
+        else if op == "+" && is_load(r, name) && fixed(l, name) then Some(("+", Some(l)))
+        else if op == "-" && is_load(l, name) && fixed(r, name) then Some(("-", Some(r)))
+        else None
+    _ -> None
 
 // `slot_place_run(d, at, source[a..<b])`, or of the whole of `source`, and the local `d`.
 private run_copy(source: TExpr, args: Buf[TExpr], elem: Type) -> Option[(DrainPlan, string)]
@@ -187,7 +211,7 @@ private run_copy(source: TExpr, args: Buf[TExpr], elem: Type) -> Option[(DrainPl
 
     if mentions(args[1], d) || mentions(src, d) then return None
 
-    Some((DrainPlan(source, src, elem, None), d))
+    Some((DrainPlan(source, src, elem, None, None), d))
 end run_copy
 
 private is_load(x: TExpr, name: string) -> bool = *x.kind match
@@ -205,7 +229,9 @@ private steps(x: TExpr, name: string) -> bool = *x.kind match
 
 private fixed(x: TExpr, name: string) -> bool = plain(x) && !mentions(x, name)
 
-// Whether `d` is declared before statement `k` from `slot_storage`, and named by nothing between.
+// Whether `d` is declared before statement `k` from `slot_storage` or `try_slot_storage`, and named by
+// nothing between but a read of its length -- the test a refusal of `try_slot_storage` is told by,
+// which places nothing and keeps no second name for the storage.
 private fresh_storage(xs: Buf[TStmt], k: usize, d: string) -> bool
     var j = k
 
@@ -218,7 +244,7 @@ private fresh_storage(xs: Buf[TStmt], k: usize, d: string) -> bool
 
         if made.is_some()
             return *made.unwrap().kind match
-                TSlots(op, _, _, _) -> op == "slot_storage"
+                TSlots(op, _, _, _) -> storage_form(op)
                 _ -> false
 
         if stmt_mentions(xs[j], d) then return false
@@ -226,11 +252,14 @@ private fresh_storage(xs: Buf[TStmt], k: usize, d: string) -> bool
     false
 end fresh_storage
 
+// Whether `name` is read anywhere in `s` other than as the operand of a length.
 private stmt_mentions(s: TStmt, name: string) -> bool
-    val c: &SlotCount = SlotCount(0)
+    val loads: &SlotCount = SlotCount(0)
+    val lengths: &SlotCount = SlotCount(0)
 
     walk_stmt(s, expr_walk(true, y -> *y.kind match
-        TLoad(n, _) -> if n == name then c.bump()
+        TLoad(n, _) -> if n == name then loads.bump()
+        TLen(r, _) -> if is_load(r, name) then lengths.bump()
         _ -> ()))
-    c.n > 0
+    loads.n > lengths.n
 end stmt_mentions
