@@ -192,10 +192,14 @@ plus0_locals(e: *Emit, f: TFunc, owned: Set[string], jumps: bool) -> Set[string]
             Some(i) -> g.cands[i].defs.push(DValue(item.1))
             None -> ()
 
+    // **Only a local that is read through is a candidate** -- a field read off it, a deref of it, a
+    // `match` on it, an `is` test of it. One that is only passed along is better counted: its count
+    // moves from what it was built of to where it is handed, and a +0 one would take a count there.
+    val read = read_through(f)
     var alive: Buf[bool] = buf()
 
     for c in g.cands
-        alive.push(!g.barred.has(c.name) && !c.defs.is_empty() && eligible(e, c.name))
+        alive.push(!g.barred.has(c.name) && !c.defs.is_empty() && read.has(c.name) && eligible(e, c.name))
 
     // The roots: parameters a body that never jumps back holds for the whole activation, and the
     // locals of its top block, alive to its end.
@@ -245,13 +249,16 @@ plus0_locals(e: *Emit, f: TFunc, owned: Set[string], jumps: bool) -> Set[string]
     end while
 
     // The report speaks of the candidates read out of storage: the +0 ones, and the counted ones one of
-    // whose values is backed -- never of a local every value of which arrives with a count.
+    // whose values is read from a root -- never of a local each value of which arrives with a count or
+    // is a constant.
     for i in 0..<g.cands.len()
         if alive[i] then out.add(g.cands[i].name)
 
         if why[i] != ""
             for d in g.cands[i].defs
-                if def_back(g, alive, backs, params, tops, d).is_some() then shaped[i] = true
+                def_back(g, alive, backs, params, tops, d) match
+                    Some(b) -> if !b.roots.is_empty() then shaped[i] = true
+                    None -> ()
 
         shaped[i] = shaped[i] || alive[i]
 
@@ -441,6 +448,32 @@ private place_base(place: TExpr) -> Option[string] = *place.kind match
         Array(_, _) -> place_base(r)
         _ -> None
     _ -> None
+
+// The locals the body reads through: a field or a deref of one, a `match` on one, an `is` test of one.
+private read_through(f: TFunc) -> Set[string]
+    val out = name_sink()
+
+    walk_block_stmts(f.body, expr_walk(true, x -> read_node(out, x)))
+    out.names
+end read_through
+
+private read_node(out: &NameSink, x: TExpr) = *x.kind match
+    TField(r, _, _) -> read_load(out, r)
+    TDeref(r, _) -> read_load(out, r)
+    TMatch(scrutinee, _, _) -> read_load(out, scrutinee)
+    TIf(cond, _, _, _) -> read_terms(out, cond)
+    TWhile(cond, _, _, _) -> read_terms(out, cond)
+    _ -> ()
+
+private read_terms(out: &NameSink, cond: Buf[TCondTerm])
+    for item in cond
+        item match
+            TCondIs(subject, _, _) -> read_load(out, subject)
+            TCondTest(_) -> ()
+
+private read_load(out: &NameSink, r: TExpr) = *r.kind match
+    TLoad(name, _) -> out.add(name)
+    _ -> ()
 
 // The names no root may be: one whose address is taken, or a `ref` is bound to, anywhere in the body.
 private unrootable(f: TFunc, aliases: Set[string]) -> Set[string]
