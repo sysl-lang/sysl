@@ -1,0 +1,229 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+
+// `sysl.cpu.has` (`cpu_query.sysl`, `docs/content/library/cpu.md`): the run-time question an
+// `@unchecked("...")` block promises was asked, and what the compiler holds a call of it to.
+//
+// **The axes**: the argument (a known literal, an unknown one, the other architecture's, one that
+// arrives at run time, a `val` bound to a literal), where the call is (a plain body, a helper the
+// program calls, a closure, a generic's instance, a method), and the machine (aarch64 and x86_64 on
+// each system, a hosted processor with no extensions to ask about, a bare-metal target of each kind).
+// The list itself is crossed with `@extensions` -- every name is one clang knows for the processor --
+// and with the library's own `table`. What `has` answers at run time is `library/sysl/cpu/tests.sysl`'s.
+// Not crossed: separate compilation (the query is the standard module's, and the check reads the
+// caller's body, which a `.syslib` never holds for a program's own code).
+
+// Every complaint a program draws for `t`, outside the library, one per line.
+private cpq_said(t: Target, text: string) -> string
+    use_codegen_features(no_codegen_features())
+    use_cpu("", buf())
+
+    var units: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, t) match
+            Err(_) -> ()
+            Ok(library) -> units = library
+
+    if units.is_empty() then return "the library could not be read for this machine"
+
+    val parsed = parse(source_of("main.sysl", text), t)
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, t)
+
+    post_analysis_checks(done.an, program_of(done, ""), buf())
+
+    var out = ""
+
+    for item in errors_of(done.an.diagnostics())
+        if !item.src.name.starts_with("library/") then out = out + item.render() + "\n"
+
+    out
+end cpq_said
+
+private cpq_row(name: string) -> Target = target_named(name).unwrap()
+
+private cpq_count(text: string, part: string) -> int
+    val t = text.bytes
+    val p = part.bytes
+    var n = 0
+
+    for i in 0..<t.len
+        if i + p.len > t.len then break
+
+        var same = true
+
+        for j in 0..<p.len
+            if t[i + j] != p[j]
+                same = false
+                break
+
+        if same then n += 1
+
+    n
+end cpq_count
+
+private cpq_unknown(name: string, article: string) -> string =
+    s"'sysl.cpu.has' is asked about '$name', which is not an extension $article processor can be asked about"
+
+private cpq_bare(row: string) -> string =
+    s"'sysl.cpu.has' asks the operating system which extensions the processor has, and '$row' has none to ask"
+
+// A program asking `has` once per name of `names`, each as a literal.
+private cpq_asking(names: Buf[string]) -> string
+    var text = "import sysl.cpu\n\nvar n = 0\n"
+
+    for name in names
+        text = text + s"if cpu.has(\"$name\") then n += 1\n"
+
+    text + "print(n)\n"
+end cpq_asking
+
+@test("every name in the list is accepted as a literal on its own processor, on every system")
+cpq_every_name_is_accepted()
+    for row in ["aarch64-macos", "aarch64-linux", "aarch64-android"]
+        assert_eq(cpq_said(cpq_row(row), cpq_asking(cpu_query_names(Aarch64))), "")
+
+    for row in ["x86_64-macos", "x86_64-linux", "x86_64-windows"]
+        assert_eq(cpq_said(cpq_row(row), cpq_asking(cpu_query_names(X86_64))), "")
+
+@test("a literal name nobody spells is refused, naming the list")
+cpq_unknown_literal_is_refused()
+    val said = cpq_said(cpq_row("aarch64-macos"), "import sysl.cpu\n\nprint(cpu.has(\"crcc\"))\n")
+
+    assert(said.contains(cpq_unknown("crcc", "an aarch64")), said)
+    assert(said.contains("'fp-armv8', 'neon', 'crc', "), said)
+    assert_eq(cpq_count(said, "'sysl.cpu.has'"), 1)
+
+@test("a name is held to its own spelling: a sign, capitals, and a list are refused")
+cpq_spelling_is_exact()
+    for name in ["+crc", "CRC", "crc,aes", " crc", ""]
+        val said = cpq_said(cpq_row("aarch64-linux"), s"import sysl.cpu\n\nprint(cpu.has(\"$name\"))\n")
+
+        assert(said.contains(cpq_unknown(name, "an aarch64")), said)
+
+@test("the other architecture's name is refused, as '@extensions' refuses it")
+cpq_other_architecture_is_refused()
+    val arm = cpq_said(cpq_row("aarch64-macos"), "import sysl.cpu\n\nprint(cpu.has(\"avx2\"))\n")
+    val x86 = cpq_said(cpq_row("x86_64-linux"), "import sysl.cpu\n\nprint(cpu.has(\"crc\"))\n")
+
+    assert(arm.contains(cpq_unknown("avx2", "an aarch64")), arm)
+    assert(x86.contains(cpq_unknown("crc", "an x86_64")), x86)
+    assert(x86.contains("'sse', 'sse2', "), x86)
+    // `aes` is a name on both, and accepted on both.
+    assert_eq(cpq_said(cpq_row("x86_64-linux"), "import sysl.cpu\n\nprint(cpu.has(\"aes\"))\n"), "")
+
+@test("a hosted processor '@extensions' is refused on has no name to ask about")
+cpq_hosted_without_extensions()
+    val said = cpq_said(cpq_row("riscv64-linux"), "import sysl.cpu\n\nprint(cpu.has(\"m\"))\n")
+
+    assert(said.contains("'sysl.cpu.has' is asked about 'm', and 'riscv64-linux' has no extension to ask about"), said)
+    // A name that arrives at run time is not checked there either.
+    assert_eq(cpq_said(cpq_row("riscv64-linux"), "import sysl.cpu\n\nval n = \"m\" + \"\"\nprint(cpu.has(n))\n"), "")
+
+@test("a name that arrives at run time is not checked, whatever it holds")
+cpq_run_time_name_is_not_checked()
+    val t = cpq_row("aarch64-macos")
+
+    assert_eq(cpq_said(t, "import sysl.cpu\n\nval n = \"cr\" + \"cc\"\nprint(cpu.has(n))\n"), "")
+    assert_eq(cpq_said(t, "import sysl.cpu\n\nval n = \"crcc\"\nprint(cpu.has(n))\n"), "")
+    assert_eq(cpq_said(t, "import sysl.cpu\n\nask(n: string) -> bool = cpu.has(n)\n\nprint(ask(\"crcc\"))\n"), "")
+    assert_eq(cpq_said(t, "import sysl.cpu\n\nfor n in cpu.names()\n    print(cpu.has(n))\n"), "")
+
+@test("a literal is checked wherever the call is written: a helper, a closure, a generic, a method")
+cpq_literal_in_every_body()
+    val t = cpq_row("aarch64-macos")
+    val helper = cpq_said(t, "import sysl.cpu\n\nfast() -> bool = cpu.has(\"crcc\")\n\nprint(fast())\n")
+    val closure = cpq_said(t, "import sysl.cpu\n\nval f = () -> cpu.has(\"crcc\")\nprint(f())\n")
+    val generic = cpq_said(t, "import sysl.cpu\n\npick[T](a: T, b: T) -> T = if cpu.has(\"crcc\") then a else b\n\nprint(pick(1, 2), pick(\"a\", \"b\"))\n")
+    val method = cpq_said(t, "import sysl.cpu\n\nstruct Box\n    n: int\n\nimpl Box\n    fast(self) -> bool = cpu.has(\"crcc\")\n\nprint(Box(1).fast())\n")
+
+    assert(helper.contains(cpq_unknown("crcc", "an aarch64")), helper)
+    assert(closure.contains(cpq_unknown("crcc", "an aarch64")), closure)
+    assert(generic.contains(cpq_unknown("crcc", "an aarch64")), generic)
+    assert(method.contains(cpq_unknown("crcc", "an aarch64")), method)
+
+@test("a bare-metal target has nothing to ask, so a call is refused at the program's line")
+cpq_bare_metal_is_refused()
+    val direct = "import sysl.cpu\n\n@export(\"main\")\nstart() -> i32 = if cpu.has(\"crc\") then 1 else 0\n"
+
+    for row in ["aarch64-freestanding", "x86_64-freestanding", "thumb-freestanding", "riscv32-freestanding"]
+        val said = cpq_said(cpq_row(row), direct)
+
+        assert(said.contains(cpq_bare(row)), said)
+        assert(said.contains("'codegen.extensions'"), said)
+
+@test("on a bare-metal target a name that arrives at run time is refused as well, and through a helper")
+cpq_bare_metal_through_a_helper()
+    val t = cpq_row("aarch64-freestanding")
+    val run_time = cpq_said(t, "import sysl.cpu\n\nask(n: string) -> bool = cpu.has(n)\n\n@export(\"main\")\nstart() -> i32 = if ask(\"crc\") then 1 else 0\n")
+
+    assert(run_time.contains(cpq_bare("aarch64-freestanding")), run_time)
+
+@test("on a bare-metal target the list answers, and a program that never asks hears nothing")
+cpq_bare_metal_names_build()
+    for row in ["aarch64-freestanding", "thumb-freestanding-softfp"]
+        assert_eq(cpq_said(cpq_row(row), "import sysl.cpu\n\n@export(\"main\")\nstart() -> i32 = i32(cpu.names().len)\n"), "")
+
+@test("every name in the list is an extension '@extensions' accepts on that processor")
+cpq_names_are_extensions_names()
+    for pair in [("aarch64-linux", Aarch64), ("x86_64-linux", X86_64)]
+        var text = ""
+        var i = 0
+
+        for name in cpu_query_names(pair.1)
+            text = text + s"@extensions(\"$name\")\nf$i() -> int = $i\n\n"
+            i += 1
+
+        assert_eq(cpq_said(cpq_row(pair.0), text + "print(1)\n"), "")
+
+@test("the compiler's list is the library's, name for name and in order")
+cpq_lists_agree()
+    for pair in [("aarch64-macos", Aarch64), ("x86_64-linux", X86_64), ("riscv64-linux", Riscv64)]
+        val t = cpq_row(pair.0)
+        var units: Buf[Program] = buf()
+
+        std_root() match
+            Err(_) -> ()
+            Ok(root) -> std_units(root, t) match
+                Err(_) -> ()
+                Ok(library) -> units = library
+
+        assert(!units.is_empty())
+
+        val parsed = parse(source_of("main.sysl", "import sysl.cpu\n\nfor n in cpu.names()\n    print(cpu.has(n))\n"), t)
+
+        units.push(parsed.program)
+
+        val whole = program_of(analyze_bodies(units, t), "")
+        var found = false
+
+        for v in whole.vals
+            if qualified_name(v.symbol) != "sysl.cpu.table" then continue
+
+            found = true
+
+            var library: Buf[string] = buf()
+
+            v.init match
+                Some(init) -> *init.kind match
+                    TArrayLit(elems, _) ->
+                        for e in elems
+                            *e.kind match
+                                TStrLit(s) -> library.push(s)
+                                _ -> library.push("<not a literal>")
+                    _ -> ()
+                None -> ()
+
+            assert_eq(library, cpu_query_names(pair.1))
+
+        assert(found, pair.0)
+end cpq_lists_agree

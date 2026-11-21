@@ -1,0 +1,535 @@
+sysl.regex — the lazy DFA
+=========================
+
+    module sysl.regex
+
+    import sysl.buf.{Buf, buf}
+    import sysl.text.{Chars, is_char_boundary}
+
+The Pike VM in `vm` keeps a list of threads and walks every one of them at every character. That is
+what bounds it, and it is also what makes it slow: a search of a long text spends nearly all its time
+rebuilding the same few lists over and over, because a pattern has only so many ways of being part
+way through. This file remembers them.
+
+A **state** here is the set of instructions the VM's list would hold at some position, and the
+**transition** from one state on a character is the list the VM would build for the next position.
+Both are worked out the first time they are needed and kept, so the second time a search is in that
+state and reads that character, the step is one lookup in a table. That is Thompson's construction
+again, determinised lazily — only the states a text actually reaches are ever built, which is what
+keeps a pattern whose full DFA would be exponential from costing more than the VM it replaces.
+
+The VM is still the engine of record. This answers only **where** the leftmost-longest match is, and
+whenever a pattern has capture groups the VM is run again over exactly that span to fill them in.
+
+
+What a state has to remember
+----------------------------
+
+The VM's list is ordered, and the order is what decides the answer: threads started earlier sit in
+front of threads started later, so an earlier start claims an instruction first. A state keeps that
+much of the order and no more — its instructions are kept in **groups, one per starting position**,
+earliest first, and each group is a sorted set. Order *within* a group decides only which thread
+carries which capture positions, and this engine reports none.
+
+That the groups may be sets rests on one fact: an instruction at a position that some earlier start
+also reaches can never lead to the leftmost match, because if it led to an accept, the earlier start
+would have matched first. So the VM dropping the later thread there loses nothing, and neither does
+dropping the instruction from the later group.
+
+A group is laid down as its instructions followed by `-1`, and a state is its groups end to end.
+
+Instructions that look at the input land in a state, and so does `accept`. The assertions are
+decided by the position, and the position is not part of a state — the same state is reached at
+many positions — so one of them is decided by where the step happens and the other is **kept
+pending**. Searching forward, `^` can only hold where the search began, so it is settled there; `$`
+holds only at the end of the text and stays in the state until the end is reached. Searching
+backward the two swap roles.
+
+Three facts about a state are read on every step, so each is a bit of one word:
+
+    private const has_accept: int = 1
+    private const is_dead: int = 2
+    private const no_starts: int = 4
+
+`has_accept` — some group holds `accept`, so a match ends here. `no_starts` — something has already
+matched, so no later position may begin one (the VM's own rule: nothing that begins later can win).
+`is_dead` — no group is left and none can begin, so the search is over.
+
+A table row has a slot for every ASCII byte. A character outside ASCII is stepped without the table,
+which is slower and exactly as correct; text that is mostly ASCII is what a table is worth building
+for.
+
+    private const row: usize = 128
+
+The cache is bounded by states and by the instructions they hold together. Reaching either bound
+throws every state away and carries on from the one the search is in, so a pattern whose reachable
+states outnumber the cache costs more per character but never more memory.
+
+    private const cache_states: usize = 2048
+    private const cache_pool: usize = 1048576
+
+    private[regex] struct Dfa
+        prog: Program
+
+        // Searching toward the start of the text: the program is the pattern reversed, it is
+        // anchored where the search begins, and `^` is the assertion left pending.
+        backward: bool
+
+        pool: &Buf[int]
+        first: &Buf[int]
+        count: &Buf[int]
+        flags: &Buf[int]
+        trans: &Buf[int]
+        table: &Buf[int]
+        starts: &Buf[int]
+        marks: &Buf[int]
+        work: &Buf[int]
+        gen: int
+        flushes: int
+
+The closure, as the VM's `add` computes it, written into `work`. The marks are the VM's marks — one
+stamp per instruction, compared against the step's own — and they are shared by every group built
+in one step, which is what lets an earlier group claim an instruction before a later one can.
+
+        private follow(*self, pc: usize, at_start: bool, at_end: bool)
+            if pc >= self.prog.len() || self.marks[pc] == self.gen then return
+
+            self.marks[pc] = self.gen
+
+            self.prog.at(pc) match
+                Jump(to) -> self.follow(to, at_start, at_end)
+                Split(a, b) ->
+                    self.follow(a, at_start, at_end)
+                    self.follow(b, at_start, at_end)
+                Save(_) -> self.follow(pc + 1, at_start, at_end)
+                AssertStart ->
+                    if at_start then
+                        self.follow(pc + 1, at_start, at_end)
+                    elif self.backward then
+                        self.work.push(int(pc))
+                AssertEnd ->
+                    if at_end then
+                        self.follow(pc + 1, at_start, at_end)
+                    elif !self.backward then
+                        self.work.push(int(pc))
+                else self.work.push(int(pc))
+        end follow
+
+A group is closed by sorting what was added since `lo` and writing the separator, so two groups
+holding the same instructions in different orders are one state. An empty group is not written at
+all: a start that has nothing left alive is not a start any more.
+
+        private close_group(*self, lo: usize)
+            val hi = self.work.len()
+
+            if hi == lo then return
+
+            for i in (lo + 1)..<hi
+                val v = self.work[i]
+                var j = i
+
+                while j > lo && self.work[j - 1] > v
+                    self.work[j] = self.work[j - 1]
+                    j -= 1
+
+                self.work[j] = v
+
+            self.work.push(-1)
+        end close_group
+
+Finding a state again. `work` holds the candidate; an open-addressed table of state numbers, keyed
+by a hash of the groups and the `no_starts` bit, answers whether it was built before.
+
+        private same(self, s: usize, starts_done: bool) -> bool
+            if ((self.flags[s] & no_starts) != 0) != starts_done then return false
+
+            val n = usize(self.count[s])
+
+            if n != self.work.len() then return false
+
+            val at = usize(self.first[s])
+
+            for i in 0..<n
+                if self.pool[at + i] != self.work[i] then return false
+
+            true
+        end same
+
+        private intern(*self, starts_done: bool) -> int
+            var h: u64 = if starts_done then 7 else 3
+
+            for i in 0..<self.work.len()
+                h = (h ^ u64.wrap(self.work[i])) *% 1099511628211
+
+            val mask = self.table.len() - 1
+            var slot = usize(h & u64(mask))
+
+            loop
+                val e = self.table[slot]
+
+                if e == 0 then break
+
+                if self.same(usize(e - 1), starts_done) then return e - 1
+
+                slot = (slot + 1) & mask
+
+            val full = self.first.len() >= cache_states || self.pool.len() + self.work.len() > cache_pool
+
+            if full && self.first.len() > 0
+                self.flush()
+                return self.intern(starts_done)
+
+            val id = int(self.first.len())
+            var f = if starts_done then no_starts else 0
+
+            for i in 0..<self.work.len()
+                val pc = self.work[i]
+
+                if pc >= 0 && is_accept(self.prog.at(usize(pc))) then f |= has_accept
+
+            if self.work.len() == 0 && (starts_done || self.backward) then f |= is_dead
+
+            self.first.push(int(self.pool.len()))
+            self.count.push(int(self.work.len()))
+            self.pool.extend(self.work.view())
+            self.flags.push(f)
+
+            for _ in 0..<row
+                self.trans.push(-1)
+
+            self.table[slot] = id + 1
+            id
+        end intern
+
+        private flush(*self)
+            self.pool.clear()
+            self.first.clear()
+            self.count.clear()
+            self.flags.clear()
+            self.trans.clear()
+
+            for i in 0..<self.table.len()
+                self.table[i] = 0
+
+            for i in 0..<self.starts.len()
+                self.starts[i] = -1
+
+            self.flushes += 1
+        end flush
+
+The state a search begins in. Where it begins is known exactly, so both assertions are decided
+there rather than left pending, and the four ways that can come out are each kept.
+
+        private start(*self, at_start: bool, at_end: bool) -> int
+            val k = (if at_start then 2 else 0) + (if at_end then 1 else 0)
+
+            if self.starts[k] >= 0 then return self.starts[k]
+
+            self.gen += 1
+            self.work.clear()
+            self.follow(0, at_start, at_end)
+            self.close_group(0)
+
+            val s = self.intern(false)
+
+            self.starts[k] = s
+            s
+        end start
+
+One step: each group in order moves over the character, and a new group begins behind them unless
+something has matched. A group holding `accept` is the leftmost match so far, so **every group after
+it is dropped** — they began later and cannot win — while the group itself keeps going, since a
+longer match from the same start beats the one just found. That is the VM's "leftmost, then longest"
+in terms of groups.
+
+        private step(*self, s: usize, c: char) -> int
+            self.gen += 1
+            self.work.clear()
+
+            var i = usize(self.first[s])
+            val stop = i + usize(self.count[s])
+            var accepted = false
+
+            while i < stop && !accepted
+                val lo = self.work.len()
+
+                while self.pool[i] >= 0
+                    val pc = usize(self.pool[i])
+
+                    self.prog.at(pc) match
+                        MatchChar(want) -> if c == want then self.follow(pc + 1, false, false)
+                        MatchAny -> self.follow(pc + 1, false, false)
+                        MatchSet(cls) -> if cls.admits(c) then self.follow(pc + 1, false, false)
+                        Accept -> accepted = true
+                        else ()
+
+                    i += 1
+
+                i += 1
+                self.close_group(lo)
+
+            val starts_done = (self.flags[s] & no_starts) != 0 || accepted
+
+            if !starts_done && !self.backward
+                val lo = self.work.len()
+
+                self.follow(0, false, false)
+                self.close_group(lo)
+
+            self.intern(starts_done)
+        end step
+
+The step through the table, building the entry the first time. A flush in the middle of building
+it leaves `s` naming nothing, so the entry is only written when the cache survived.
+
+An entry is written so that the inner loops below need one load and one comparison per byte. A
+target state with nothing remarkable about it is stored as **where its own row begins** (`t * row`),
+so the loop goes on from there without a multiplication; one that accepts or is dead is stored as
+`-2 - t`, and an entry not yet built as `-1`. Any negative number sends the loop out to here.
+
+        private next(*self, s: int, b: u8) -> int
+            val slot = usize(s) * row + usize(b)
+            val t = self.trans[slot]
+
+            if t >= 0 then return t / int(row)
+
+            if t < -1 then return -2 - t
+
+            val before = self.flushes
+            val built = self.step(usize(s), char(u32(b)))
+
+            if self.flushes == before
+                val plain = (self.flags[usize(built)] & (has_accept | is_dead)) == 0
+
+                self.trans[slot] = if plain then built * int(row) else -2 - built
+
+            built
+        end next
+
+Whether a match ends at the last position the search reaches, where the pending assertion is
+finally decided. It is asked once per search, so it is worked out rather than kept.
+
+        private ends_here(*self, s: int, at_start: bool, at_end: bool) -> bool
+            if (self.flags[usize(s)] & has_accept) != 0 then return true
+
+            self.gen += 1
+            self.work.clear()
+
+            val lo = usize(self.first[usize(s)])
+
+            for i in lo..<(lo + usize(self.count[usize(s)]))
+                val pc = self.pool[i]
+
+                if pc >= 0
+                    self.prog.at(usize(pc)) match
+                        AssertStart -> self.follow(usize(pc) + 1, at_start, at_end)
+                        AssertEnd -> self.follow(usize(pc) + 1, at_start, at_end)
+                        else ()
+
+            for i in 0..<self.work.len()
+                if is_accept(self.prog.at(usize(self.work[i]))) then return true
+
+            false
+        end ends_here
+
+
+Forward: where the match ends
+-----------------------------
+
+The search runs until no group is left alive, remembering the last position a match ended at. That
+is the end of the leftmost-longest match: once a group matches, every later one is gone, so a match
+seen afterwards comes either from that same group, ending later, or from an earlier one, beginning
+sooner — and either beats what was remembered.
+
+`first_only` stops at the first match instead, which is all `is_match` needs to know.
+
+The inner loop is the reason for all of the above: while the table already knows the way and the
+state is unremarkable, a character costs one load from the table and one comparison.
+
+        private[regex] find_end(*self, src: []const u8, from: usize, first_only: bool) -> int
+            val n = src.len
+            var s = self.start(from == 0, from == n)
+            var i = from
+            var last = -1
+
+            loop
+                val f = self.flags[usize(s)]
+
+                if (f & has_accept) != 0
+                    last = int(i)
+
+                    if first_only then return last
+
+                if (f & is_dead) != 0 then return last
+
+                if i >= n
+                    if self.ends_here(s, n == 0, true) then last = int(n)
+
+                    return last
+
+                val b = src[i]
+
+                if b < 128
+                    s = self.next(s, b)
+                    i += 1
+
+                    if (self.flags[usize(s)] & (has_accept | is_dead)) == 0
+                        val tr = self.trans.view()
+                        var o = usize(s) * row
+
+                        while i < n
+                            val c = src[i]
+
+                            if c >= 128 then break
+
+                            val t = tr[o + usize(c)]
+
+                            if t < 0 then break
+
+                            o = usize(t)
+                            i += 1
+
+                        s = int(o / row)
+                else
+                    var cur = Chars(src, i)
+                    val c = cur.peek().unwrap()
+
+                    cur.next()
+                    s = self.step(usize(s), c)
+                    i = cur.offset
+        end find_end
+
+
+Backward: where it begins
+-------------------------
+
+Knowing where the leftmost-longest match ends, where it begins is the earliest position from which
+the pattern matches up to exactly there — anything earlier would have been the leftmost match
+itself. The reversed program read right to left from the end, anchored there and taking the longest
+match it can without passing where the search started, finds exactly that.
+
+A character outside ASCII is found by stepping back to the byte that begins it. If decoding from
+there does not land back where it started, the text is not well-formed UTF-8 and the answer is `-2`,
+which sends the caller to the VM; a `string` never gives that.
+
+        private[regex] find_start(*self, src: []const u8, from: usize, at: usize) -> int
+            val n = src.len
+            var s = self.start(at == 0, at == n)
+            var i = at
+            var last = -1
+
+            loop
+                val f = self.flags[usize(s)]
+
+                if (f & has_accept) != 0 then last = int(i)
+
+                if (f & is_dead) != 0 then return last
+
+                if i <= from
+                    if from == 0 && self.ends_here(s, true, n == 0) then last = 0
+
+                    return last
+
+                val b = src[i - 1]
+
+                if b < 128
+                    s = self.next(s, b)
+                    i -= 1
+
+                    if (self.flags[usize(s)] & (has_accept | is_dead)) == 0
+                        val tr = self.trans.view()
+                        var o = usize(s) * row
+
+                        while i > from
+                            val c = src[i - 1]
+
+                            if c >= 128 then break
+
+                            val t = tr[o + usize(c)]
+
+                            if t < 0 then break
+
+                            o = usize(t)
+                            i -= 1
+
+                        s = int(o / row)
+                else
+                    var k = i - 1
+
+                    while k > from && !is_char_boundary(src[k])
+                        k -= 1
+
+                    var cur = Chars(src, k)
+                    val c = cur.peek().unwrap()
+
+                    cur.next()
+
+                    if cur.offset != i then return -2
+
+                    s = self.step(usize(s), c)
+                    i = k
+        end find_start
+    end Dfa
+
+    private is_accept(i: Inst) -> bool = i match
+        Accept -> true
+        else false
+
+    private[regex] new_dfa(prog: Program, backward: bool) -> &Dfa
+        var d: &Dfa = Dfa(prog, backward, buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, 0)
+
+        for _ in 0..<prog.len()
+            d.marks.push(-1)
+
+        for _ in 0..<4
+            d.starts.push(-1)
+
+        for _ in 0..<(cache_states * 2)
+            d.table.push(0)
+
+        d
+    end new_dfa
+
+
+What a search answers
+---------------------
+
+The match as the VM would report it, or that there is none, or that this engine cannot say and the
+VM has to be asked — a starting position that is not on a character boundary, or text that is not
+well-formed. The last case exists so that answering it is a decision made here, in the open, rather
+than a guess.
+
+    private[regex] enum Found
+        Spans(slots: []int)
+        Nothing
+        AskTheVm
+    end Found
+
+    private[regex] dfa_find(prog: Program, fwd: &Dfa, rev: &Dfa, input: string, from: usize) -> Found
+        val src = input.bytes
+
+        if from > src.len || (from < src.len && !is_char_boundary(src[from])) then return AskTheVm
+
+        val e = fwd.find_end(src, from, false)
+
+        if e < 0 then return Nothing
+
+        val b = rev.find_start(src, from, usize(e))
+
+        if b < 0 then return AskTheVm
+
+        if prog.groups == 0
+            var slots: []int = [b, e]
+
+            return Spans(slots)
+
+        exec_span(prog, input, usize(b), usize(e)) match
+            Some(slots) -> Spans(slots)
+            None -> AskTheVm
+    end dfa_find
+
+The capture positions come from the VM, run from where the match begins and stopped where it ends.
+Starting it there rather than at `from` gives the same groups: a thread the full run would have
+started earlier never reaches an accept (the match would begin there otherwise), so the only thing
+it could do in the full run is hold an instruction that a thread from the real start would then
+find taken — and an instruction such a thread holds cannot lead to an accept either.

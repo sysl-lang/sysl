@@ -1051,13 +1051,14 @@ private check_abstract_body(a: &Analysis, scope: Scope, d: FuncDecl, keep: bool 
     // (`lost_writes.sysl`).
     check_lost_writes(cx, bound, body, contract.1)
 
-    // **A body yielding what its signature's value parameters do not name is wrong for every
-    // instantiation**, so it is told here and kept -- `-> Buf[N] = Buf[N + 1](…)` is refused
-    // whether or not anything calls it (`value_terms.sysl`). Any other disagreement is left for the
-    // instantiations, which read the body again with every argument bound.
+    // **A body yielding what its signature's parameters do not name is wrong as written**, so it is
+    // told here and kept -- `-> Buf[N] = Buf[N + 1](…)` and `-> Box[U] = b` of a `Box[T]` are
+    // refused whether or not anything calls them (`value_terms.sysl`). Any other disagreement is left
+    // for the instantiations, which read the body again with every argument bound.
     if ret != Unit && body.result.is_some()
         val told = value_clash_told(body_disagreement(declared_key(a, scope, d), ret, body.ty,
-                                                      cx.ret_is_list), ret, body.ty)
+                                                      cx.ret_is_list), ret, body.ty,
+                                    own_type_params(subst))
 
         if told.is_some() then a.bound_fault(scope, body_span(rest, decl_anchor(d)), told.unwrap())
     end if
@@ -2366,7 +2367,7 @@ private storage_root(place: TExpr) -> Option[string] = *place.kind match
     TGlobal(symbol, _, _) -> Some(symbol)
     TField(receiver, _, _) -> storage_root(receiver)
     TIndex(receiver, _, _) -> nameless(texpr_type(receiver)) match
-        Array(_, _) -> storage_root(receiver)
+        Array(_, _, _) -> storage_root(receiver)
         _ -> None
     _ -> None
 
@@ -2861,7 +2862,7 @@ private device_place(cx: &Analyzer, name: string, place: TExpr) -> Option[long] 
             None -> None
     TIndex(receiver, index, _) ->
         val (length, elem) = nameless(texpr_type(receiver)) match
-            Array(n, el) -> (long(n), *el)
+            Array(n, el, _) -> (long(n), *el)
             _ -> return None
 
         val at = const_fold_typed(index, fold_machine_in(cx)) match
@@ -2937,7 +2938,7 @@ private place_image(cx: &Analyzer, place: TExpr) -> Option[TExpr] = *place.kind 
         place_image(cx, receiver).map(r -> TExpr(place.span, TField(r, index, ty)))
     TIndex(receiver, index, ty) ->
         val length = nameless(texpr_type(receiver)) match
-            Array(n, _) -> long(n)
+            Array(n, _, _) -> long(n)
             _ -> return None
 
         val at = const_fold_typed(index, fold_machine_in(cx)) match
