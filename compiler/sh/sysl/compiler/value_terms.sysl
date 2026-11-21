@@ -379,13 +379,24 @@ private spoken_list(xs: Buf[string]) -> string
     out
 end spoken_list
 
-// -- where two types differ only in a value argument's form ------------------------------------------
+// -- where two types differ only at a parameter --------------------------------------------------------
 
-// The first pair of value arguments, one of them symbolic, at which two types part while agreeing
-// everywhere else -- `Buf[N]` and `Buf[N + 1]`, `Pair[Arr[N], M]` and `Pair[Arr[M], M]`. Nothing
-// where the types are one, or part anywhere else: that mismatch is not this rule's to tell.
-value_clash(want: Type, got: Type) -> Option[(Type, Type)]
-    val found = clash_in(want, got)
+// The first pair at which two types part while agreeing everywhere else, where that pair is two
+// value arguments, one of them symbolic -- `Buf[N]` and `Buf[N + 1]`, `Pair[Arr[N], M]` and
+// `Pair[Arr[M], M]` -- or two of the declaration's own type parameters, `Box[T]` and `Box[U]`.
+// `own` names those type parameters. Nothing where the types are one, or part anywhere else: that
+// mismatch is not this rule's to tell.
+//
+// **Two type parameters are a clash only under a type that holds them.** Bare, `T` where `U` was
+// asked for is not wrong as written: an instantiation at `[u8, int]` widens the one into the other.
+// Nothing converts a `Box[u8]` (or an `Option`, a `[2]`, a `&`) into its `int` twin, so there the two
+// parameters must be one.
+value_clash(want: Type, got: Type, own: Buf[string]) -> Option[(Type, Type)]
+    (want, got) match
+        (Abstract(_, _), Abstract(_, _)) -> return None
+        _ -> ()
+
+    val found = clash_in(want, got, own)
 
     found.1 match
         Some(pair) -> if found.0 then Some(pair) else None
@@ -393,33 +404,53 @@ value_clash(want: Type, got: Type) -> Option[(Type, Type)]
 end value_clash
 
 // A refusal of `got` where `want` was asked for, KEPT where the walk is a generic's own definition and
-// the two part only at a value parameter's form: that is wrong at every instantiation, and an
-// instantiation may never be made. Any other mismatch there is left for the instantiations.
+// the two part only at a parameter: inside its declaration a parameter is a symbol, so that is wrong
+// as written, and an instantiation may never be made. Any other mismatch there is left for the
+// instantiations.
 keep_value_clash(cx: &Analyzer, at: Span, refusal: string, want: Type, got: Type)
     if !cx.at_definition then return
 
-    val told = value_clash_told(refusal, want, got)
+    val told = value_clash_told(refusal, want, got, own_type_params(cx.subst))
 
     if told.is_some() then cx.an.bound_fault(cx.scope, at, told.unwrap())
 end keep_value_clash
 
+// The type parameters a definition's walk stands in for themselves: each binding of a name to the
+// stand-in of that same name. A pack's two stand-ins, an associated type's projection and a `some`
+// result's stand-in are not among them -- what those are is settled by an instantiation, so two of
+// them, or one of them and a parameter, may turn out to be one type.
+own_type_params(subst: Buf[Binding]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for b in subst
+        b.ty match
+            Abstract(n, _) -> if n == b.name then out.push(n)
+            _ -> ()
+
+    out
+end own_type_params
+
 // `refusal` with what tells the two apart after it, where `got` stands where `want` was asked for and
-// the two part only at a symbolic value argument; nothing otherwise. A value standing where a
-// reference to it was asked for is compared with what the reference holds, as boxing would.
-value_clash_told(refusal: string, want: Type, got: Type) -> Option[string]
-    var found = value_clash(want, got)
+// the two part only at a parameter; nothing otherwise. A value standing where a reference to it was
+// asked for is compared with what the reference holds, as boxing would.
+value_clash_told(refusal: string, want: Type, got: Type, own: Buf[string]) -> Option[string]
+    var found = value_clash(want, got, own)
 
     if found.is_none()
         want match
-            Ref(inner, _) -> found = value_clash(*inner, got)
+            Ref(inner, _) -> found = value_clash(*inner, got, own)
             _ -> ()
     end if
 
-    found.map(pair -> s"$refusal — ${term_difference(pair.0, pair.1)}")
+    found.map(pair -> s"$refusal — ${clash_difference(pair.0, pair.1)}")
 end value_clash_told
 
-// (whether the two agree outside value arguments, the first symbolic pair that differs).
-private clash_in(want: Type, got: Type) -> (bool, Option[(Type, Type)])
+private clash_difference(want: Type, got: Type) -> string = (want, got) match
+    (Abstract(wn, _), Abstract(gn, _)) -> s"'$gn' and '$wn' are different type parameters"
+    _ -> term_difference(want, got)
+
+// (whether the two agree outside the parameters, the first pair of parameters that differs).
+private clash_in(want: Type, got: Type, own: Buf[string]) -> (bool, Option[(Type, Type)])
     if type_eq(want, got) then return (true, None)
 
     (want, got) match
@@ -428,26 +459,28 @@ private clash_in(want: Type, got: Type) -> (bool, Option[(Type, Type)])
             if wterm.is_empty() && gterm.is_empty() then return (false, None)
 
             (true, Some((want, got)))
-        (Struct(w), Struct(g)) -> if w.base == g.base then clash_list(w.targs, g.targs) else (false, None)
-        (Enum(w), Enum(g)) -> if w.base == g.base then clash_list(w.targs, g.targs) else (false, None)
-        (Trait(wn, wa, _), Trait(gn, ga, _)) -> if wn == gn then clash_list(wa, ga) else (false, None)
-        (Ptr(w, wro), Ptr(g, gro)) -> if wro == gro then clash_in(*w, *g) else (false, None)
-        (Ref(w, ws), Ref(g, gs)) -> if ws == gs then clash_in(*w, *g) else (false, None)
-        (Weak(w), Weak(g)) -> clash_in(*w, *g)
-        (Volatile(w), Volatile(g)) -> clash_in(*w, *g)
-        (Slice(w, wro), Slice(g, gro)) -> if wro == gro then clash_in(*w, *g) else (false, None)
-        (Array(wn, w), Array(gn, g)) -> if wn == gn then clash_in(*w, *g) else (false, None)
-        (Vector(wn, w), Vector(gn, g)) -> if wn == gn then clash_in(*w, *g) else (false, None)
+        (Abstract(wn, _), Abstract(gn, _)) ->
+            if holds_string(own, wn) && holds_string(own, gn) then (true, Some((want, got))) else (false, None)
+        (Struct(w), Struct(g)) -> if w.base == g.base then clash_list(w.targs, g.targs, own) else (false, None)
+        (Enum(w), Enum(g)) -> if w.base == g.base then clash_list(w.targs, g.targs, own) else (false, None)
+        (Trait(wn, wa, _), Trait(gn, ga, _)) -> if wn == gn then clash_list(wa, ga, own) else (false, None)
+        (Ptr(w, wro), Ptr(g, gro)) -> if wro == gro then clash_in(*w, *g, own) else (false, None)
+        (Ref(w, ws), Ref(g, gs)) -> if ws == gs then clash_in(*w, *g, own) else (false, None)
+        (Weak(w), Weak(g)) -> clash_in(*w, *g, own)
+        (Volatile(w), Volatile(g)) -> clash_in(*w, *g, own)
+        (Slice(w, wro), Slice(g, gro)) -> if wro == gro then clash_in(*w, *g, own) else (false, None)
+        (Array(wn, w), Array(gn, g)) -> if wn == gn then clash_in(*w, *g, own) else (false, None)
+        (Vector(wn, w), Vector(gn, g)) -> if wn == gn then clash_in(*w, *g, own) else (false, None)
         _ -> (false, None)
 end clash_in
 
-private clash_list(ws: Buf[Type], gs: Buf[Type]) -> (bool, Option[(Type, Type)])
+private clash_list(ws: Buf[Type], gs: Buf[Type], own: Buf[string]) -> (bool, Option[(Type, Type)])
     if ws.len() != gs.len() then return (false, None)
 
     var first: Option[(Type, Type)] = None
 
     for i in 0..<ws.len()
-        val one = clash_in(ws[i], gs[i])
+        val one = clash_in(ws[i], gs[i], own)
 
         if !one.0 then return (false, None)
         if first.is_none() then first = one.1
