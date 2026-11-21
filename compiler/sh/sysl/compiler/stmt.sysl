@@ -266,6 +266,7 @@ private block_body_once(cx: &Analyzer, stmts: Buf[Stmt], expected: Option[Type],
         cx.unit_tail = tail_ok
         val ty = if discarded && texpr_type(tr) != Never then Unit else texpr_type(tr)
 
+        empty_slot_reads(cx, init, Some(tr))
         return TBlock(init, Some(tr), ty)
     end if
 
@@ -275,6 +276,7 @@ private block_body_once(cx: &Analyzer, stmts: Buf[Stmt], expected: Option[Type],
         push_all(&out, recover_stmt(cx, item))
 
     cx.unit_tail = tail_ok
+    empty_slot_reads(cx, out, None)
     TBlock(out, None, if last == TrailingJump then Never else Unit)
 end block_body_once
 
@@ -764,8 +766,7 @@ private var_decl(cx: &Analyzer, span: Span, name: string, typ: Option[TypeRef],
 
         val ty = declared.unwrap()
 
-        if !has_zero(ty) then
-            cx.fault(span, s"${type_show(ty)} has no zero value, so '$name' needs an initial value")
+        if !has_zero(ty) then no_zero_refusal(cx, span, name, ty)
 
         return one(TVarDecl(cx.bind(name, ty, name_after_keyword(cx, span.start, name)), ty, checked_zero(cx, span, ty),
                             boundary(cx, name, align)))
@@ -774,8 +775,14 @@ private var_decl(cx: &Analyzer, span: Span, name: string, typ: Option[TypeRef],
     // A bare literal is read at the type a use fixed, where an earlier reading found one.
     val fixed = fixed_type(cx, span, name, typ, init.unwrap())
     val saved = told_by(cx, typ, declared, subst_names(cx))
+    val outer_slot = cx.empty_slot_at
+
+    // A `var`'s initial value is the one place `slot_empty()` stands (`slots.sysl`).
+    cx.empty_slot_at = if writes_empty_form(init.unwrap()) then Some(declared.unwrap_or(Unknown)) else None
+
     val ti = type_expr(cx, init.unwrap(), if fixed.is_some() then fixed else declared)
 
+    cx.empty_slot_at = outer_slot
     cx.declared = saved
 
     val decl_ty = settled_binding_type(declared, ti)
@@ -792,6 +799,56 @@ private var_decl(cx: &Analyzer, span: Span, name: string, typ: Option[TypeRef],
     note_view_binding(cx, span, name, unique, ti)
     one(TVarDecl(unique, decl_ty, ti, boundary(cx, name, align)))
 end var_decl
+
+// **A `var` with no initial value whose type has no zero, refused where the type was CHOSEN.** In a
+// body read at type arguments the line that declares the local is the same line for every instance,
+// and in the library it is a line the reader cannot change -- `load_relaxed`'s `var out: T` at an enum
+// with no `= 0` variant. So the refusal points at the first call along the chain that asked for the
+// instance from outside the library (`AskedFrom`), naming the instance and the declaration's line; a
+// body read at no type arguments, or one nothing asked for from a call, is told at the declaration.
+private no_zero_refusal(cx: &Analyzer, span: Span, name: string, ty: Type)
+    val message = s"${type_show(ty)} has no zero value, so '$name' needs an initial value"
+    val asker = outside_asker(cx)
+
+    if asker.is_none()
+        cx.fault(span, message)
+        return
+
+    val line = cx.scope.src.locate(span.start).line
+
+    cx.an.fault(asker.unwrap().site, asker.unwrap().at,
+                s"$message (in '${instance_shown(cx.an, cx.func_name, cx.subst)}', declared at " +
+                    s"${cx.scope.src.name}:$line)")
+end no_zero_refusal
+
+// The first call, walking back along what asked for the instance being read, that the library did not
+// write -- or none, where the body is read at no type arguments or the chain never leaves the library.
+private outside_asker(cx: &Analyzer) -> Option[AskedFrom]
+    var any = false
+
+    for b in cx.subst
+        if b.name != "Self" then any = true
+
+    if !any then return None
+
+    val table = cx.an.tables.members.asked_from
+    var at = cx.func_name
+    var steps = 0
+
+    // Bounded, because a recursive generic asks for itself.
+    while steps < 64
+        val from = table.get(at)
+
+        if from.is_none() then return None
+        if !from_library(cx.an, from.unwrap().site) then return from
+        if from.unwrap().by == at then return None
+
+        at = from.unwrap().by
+        steps += 1
+    end while
+
+    None
+end outside_asker
 
 private val_decl(cx: &Analyzer, span: Span, name: string, typ: Option[TypeRef], value: Expr,
                  align: Option[Expr], section: Option[string], copies: Copies,

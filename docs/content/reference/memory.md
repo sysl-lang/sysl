@@ -3518,6 +3518,50 @@ print(nodes[0].n + nodes[1].n + nodes[2].n + nodes[3].n)
 6
 ```
 
+**A growth relocates.** A copy of every element into fresh slot storage — a `slot_place_run`, or a
+counted loop of `slot_place`s whose slot index steps with the loop — followed at once by a write of
+that fresh storage over the place the elements were read from, moves them: the old storage is let go
+of on the next line, so the counts the copy would take and the old storage's destructor would give
+back end where they began. Where the old storage has no other holder, the copy hands each slot's count
+over untouched and the old storage frees without visiting them; where it covers the rest of the old
+live run and starts at the fresh storage's first free slot, it is one `memmove` of the elements'
+bytes, as C++'s growth is. Where a view handed out earlier still holds the old storage, the copy
+counts each element as written, and the view keeps them. Either way a program sees the same thing:
+each element let go of once, when the last holder lets go of it. This is a `Buf`'s growth, whether
+it traps on a refusal (`push`) or answers it (`try_push`, whose storage comes from `try_slot_storage`
+and is checked by its length before the copy).
+
+```sysl
+struct Job
+    id: int
+
+impl Drop for Job
+    drop(self) = print(f"let go ${self.id}")
+
+struct Jobs
+    storage: []&Job
+    last: usize
+
+    grow(*self, n: usize)
+        var fresh: []&Job = slot_storage(n)
+        slot_place_run(fresh, 0, self.storage[0..<self.last])
+        self.storage = fresh
+
+var j = Jobs(slot_storage(2), 0)
+
+slot_place(j.storage, 0, Job(1))
+slot_place(j.storage, 1, Job(2))
+j.last = 2
+j.grow(4)
+print(j.storage.len, j.storage[1].id)
+```
+
+```output
+4 2
+let go 1
+let go 2
+```
+
 **Two forms answer the heap's refusal instead of trapping on it** ([above](#an-allocation-that-may-fail)):
 
 - **`try_slot_storage(n)`** is `slot_storage(n)`, except that where the heap answers null — or `n`
@@ -3553,6 +3597,79 @@ result's, **no count is taken or given back**, and the slot is left **empty** (z
 holding a count). **`slot_put(p, v)`** moves `v` into an **empty** slot, giving nothing back. A taken
 slot must be live, a put slot empty, and nothing reads an empty slot — the caller's to keep. Both
 refuse what is not a `*T`.
+
+### An empty local: one slot in the frame
+
+A generic body sometimes has to hold a `T` before it has one — a copy made a word at a time into
+storage of its own — and a `T` may have **no zero value** to start it at: a simple enum with no
+variant written `= 0`, a constrained subtype, a `&T`. **`var out: T = slot_empty()`** declares a local
+that is an **empty slot**, the one storage the other forms leave behind: it holds no value, and
+nothing is let go of for it until one is put there. Its storage is the frame's, aligned as `T` is
+(an `@align(64)` type starts on a 64-byte boundary), like Rust's `MaybeUninit<T>`.
+
+- **What it holds is `slot_take`'s empty**: the zero where `T` holds a count, so the local's release
+  at the end of its block gives back nothing, and otherwise bytes nobody wrote — no store at all.
+- **It is filled like any local**: an assignment (to the whole or to a part), `slot_put(&out, v)`, or a
+  copy through `&out`. An assignment to an empty slot of a counted type lets go of nothing; a later
+  one lets go of what the first put there. A `Drop` value put in is dropped once, when the local goes,
+  and one never put in is never dropped.
+- **Its first mention writes it.** Read in the order the body is written, the first thing done with
+  the name must be a write — an assignment, `&out`, a `ref` to it — and a read before one is refused;
+  so is a write whose own value reads it (`out = out + 1`, `out += 1`) and a closure capturing it. A
+  write on one arm of an `if` followed by a read after it is the caller's to get right, as a slot
+  past a buffer's live run is.
+- **It stands only as a `var`'s initial value**, with the type on the declaration or in
+  `slot_empty[T]()`: a `val`, an argument, an assignment's value or a `var` with no type is refused.
+
+```sysl
+enum Mode
+    Idle
+    Busy
+
+struct Res
+    n: int
+
+impl Drop for Res
+    drop(self) = print(s"drop ${self.n}")
+
+fill[T](v: T) -> T
+    var out: T = slot_empty()
+
+    out = v
+    out
+
+keep[T](v: T)
+    var out: T = slot_empty()
+
+    slot_put(&out, v)
+    print("kept")
+
+print(fill(Busy) == Busy, fill(7))
+keep(Res(1))
+```
+
+```output
+true 7
+kept
+drop 1
+```
+
+```sysl
+f() -> int
+    var x: int = slot_empty()
+
+    x += 1
+    x
+```
+
+```error
+'x' is an empty slot, read here before anything was written to it
+```
+
+`sysl.sync`'s `load_relaxed` and `SeqLock[T]` build their answer in one, so they copy a `Plain` type
+with no zero value as they copy any other. **A `var out: T` with no initial value at such a `T` is
+refused at the call that chose the type**, naming the instance and the declaration's line, since the
+line in the generic's body is the same for every instance and may be the library's.
 
 ### A counted reference given up as a pointer
 

@@ -227,14 +227,15 @@ private strictly_encloses(outer: Span, inner: Span) -> bool =
 
 private within(outer: Span, inner: Span) -> bool = outer.start <= inner.start && inner.end <= outer.end
 
-// The extension a CRC-32C instruction's `extern` is compiled for, where `symbol` names one, or `""`.
-// It is held to the rule a marked function is: a call is accepted where the code making it has it.
-crc32c_extension(symbol: string) -> string
+// The extension an instruction's `extern` is compiled for, where `symbol` names a CRC-32C or a
+// vector (AES, SHA-3, dot-product) one, or `""`. It is held to the rule a marked function is: a call
+// is accepted where the code making it has it.
+intrinsic_extension(symbol: string) -> string
     for name in llvm_crc32c_intrinsics()
         if name == symbol then return if symbol.starts_with("llvm.aarch64.") then "crc" else "sse4.2"
 
-    ""
-end crc32c_extension
+    llvm_vector_intrinsic_extension(symbol)
+end intrinsic_extension
 
 // -- the check ----------------------------------------------------------------------------------------
 
@@ -254,7 +255,7 @@ check_extensions(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable], externs
     var crc: Map[string, string] = map()
 
     for x in externs
-        val ext = crc32c_extension(x.symbol)
+        val ext = intrinsic_extension(x.symbol)
 
         if ext != "" then crc.put(x.name, ext)
 
@@ -367,7 +368,7 @@ private ext_reach(a: &Analysis, cx: &ExtCheck, scope: Scope, f: TFunc, own: Buf[
             cx.externs.get(name) match
                 Some(ext) ->
                     // A CRC-32C instruction the row promises is the build's (`#if crc32c`).
-                    if crc32c_instruction(cx.t) then return
+                    if (ext == "crc" || ext == "sse4.2") && crc32c_instruction(cx.t) then return
 
                     needs.push(ext)
                 None -> return

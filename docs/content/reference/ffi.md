@@ -235,7 +235,7 @@ print(bogus(1.0))
 ```
 
 ```error
-'llvm.nosuchthing' is not an intrinsic sysl supports — it has llvm.ceil, llvm.copysign, llvm.fabs, llvm.floor, llvm.fma, llvm.maximum, llvm.maxnum, llvm.minimum, llvm.minnum, llvm.nearbyint, llvm.rint, llvm.round, llvm.roundeven, llvm.sqrt, llvm.trunc, llvm.aarch64.crc32cb, llvm.aarch64.crc32ch, llvm.aarch64.crc32cw, llvm.aarch64.crc32cx, llvm.x86.sse42.crc32.32.8, llvm.x86.sse42.crc32.32.16, llvm.x86.sse42.crc32.32.32, llvm.x86.sse42.crc32.64.64
+'llvm.nosuchthing' is not an intrinsic sysl supports — it has llvm.ceil, llvm.copysign, llvm.fabs, llvm.floor, llvm.fma, llvm.maximum, llvm.maxnum, llvm.minimum, llvm.minnum, llvm.nearbyint, llvm.rint, llvm.round, llvm.roundeven, llvm.sqrt, llvm.trunc, llvm.aarch64.crc32cb, llvm.aarch64.crc32ch, llvm.aarch64.crc32cw, llvm.aarch64.crc32cx, llvm.x86.sse42.crc32.32.8, llvm.x86.sse42.crc32.32.16, llvm.x86.sse42.crc32.32.32, llvm.x86.sse42.crc32.64.64, llvm.aarch64.crypto.aese, llvm.aarch64.crypto.aesd, llvm.aarch64.crypto.aesmc, llvm.aarch64.crypto.aesimc, llvm.aarch64.crypto.eor3u, llvm.aarch64.crypto.eor3s, llvm.aarch64.crypto.bcaxu, llvm.aarch64.crypto.bcaxs, llvm.aarch64.crypto.rax1, llvm.aarch64.neon.sdot, llvm.aarch64.neon.udot, llvm.x86.aesni.aesenc, llvm.x86.aesni.aesenclast, llvm.x86.aesni.aesdec, llvm.x86.aesni.aesdeclast, llvm.x86.aesni.aesimc, llvm.x86.avx512.vpdpbusd.128, llvm.x86.avx512.vpdpbusd.256, llvm.x86.avx512.vpdpbusds.128, llvm.x86.avx512.vpdpbusds.256, llvm.x86.avx512.vpdpwssd.128, llvm.x86.avx512.vpdpwssd.256, llvm.x86.avx512.vpdpwssds.128, llvm.x86.avx512.vpdpwssds.256
 ```
 
 **`llvm.fma` is `a * b + c` rounded once.** The product is never rounded on its own, so the
@@ -380,6 +380,53 @@ print(byte(0, 1))
 
 ```error
 'byte' is called, and it is compiled for the processor's 'sse4.2' extension, which 'x86_64-freestanding' does not promise
+```
+
+**The AES, SHA-3 and dot-product instructions are the third family, and their signatures are
+[vectors](/reference/vectors/)** — a register in and a register out, which the back end hands the
+instruction directly, so no calling convention is in play and a vector is allowed here though it is
+refused on a C function. Each is compiled for its extension as the CRC-32C ones are, and each call is
+held to the same rule (`@extensions`, the build's promise, or `@unchecked`):
+
+| name | signature (lanes as sysl spells them) | extension |
+|---|---|---|
+| `llvm.aarch64.crypto.aese`, `aesd` | `(<16>u8, <16>u8) -> <16>u8`: one AES round without MixColumns, the state XORed with the key first | `aes` |
+| `llvm.aarch64.crypto.aesmc`, `aesimc` | `(<16>u8) -> <16>u8`: MixColumns and its inverse | `aes` |
+| `llvm.aarch64.crypto.eor3u`, `eor3s` | three 128-bit registers of one lane width (8 to 64 bits), unsigned or signed as the name says: `a ^ b ^ c` | `sha3` |
+| `llvm.aarch64.crypto.bcaxu`, `bcaxs` | the same shapes: `a ^ (b & ~c)` | `sha3` |
+| `llvm.aarch64.crypto.rax1` | `(<2>u64, <2>u64) -> <2>u64`: `a ^ rotl(b, 1)`, Keccak's theta step | `sha3` |
+| `llvm.aarch64.neon.sdot`, `udot` | `(<4>i32, <16>i8, <16>i8) -> <4>i32` or `(<2>i32, <8>i8, <8>i8) -> <2>i32` (unsigned for `udot`): each accumulator lane gains the sum of four byte products | `dotprod` |
+| `llvm.x86.aesni.aesenc`, `aesenclast`, `aesdec`, `aesdeclast` | `(<2>u64, <2>u64) -> <2>u64`: a full round, the key XORed last | `aes` |
+| `llvm.x86.aesni.aesimc` | `(<2>u64) -> <2>u64` | `aes` |
+| `llvm.x86.avx512.vpdpbusd`, `vpdpbusds`, `vpdpwssd`, `vpdpwssds`, each `.128` or `.256` | `(<4>i32, <4>i32, <4>i32) -> <4>i32` (`<8>i32` for `.256`): an accumulator and two registers whose 32-bit lanes each hold four bytes or two halves; the `s` forms saturate | `avxvnni` |
+
+The overload suffix LLVM spells is built from the signature, as it is for the floats (`eor3u` over
+`<2>u64` is `llvm.aarch64.crypto.eor3u.v2i64`). A declaration that is none of an instruction's
+signatures is refused with the ones it has, and a name for the other processor is refused whatever
+the build promises. The 256-bit VAES forms and `xar`, whose rotate is an immediate, are not offered.
+`avxvnni` is LLVM's VEX encoding of VNNI; a build for `avx512vnni` and `avx512vl` promises it by
+naming `avxvnni` as well.
+
+```sysl
+extern "llvm.aarch64.crypto.aese" aese(state: <16>u8, key: <16>u8) -> <16>u8
+
+@extensions("aes")
+round(state: <16>u8, key: <16>u8) -> <16>u8 = aese(state, key)
+```
+
+Called from a body that is neither marked nor in a block, the same declaration is refused:
+
+```sysl target=aarch64-freestanding
+extern "llvm.aarch64.crypto.rax1" rax1(a: <2>u64, b: <2>u64) -> <2>u64
+
+val z: <2>u64 = 0
+
+@export("main")
+start() -> i32 = i32(rax1(z, z)[0])
+```
+
+```error
+'rax1' is called, and it is compiled for the processor's 'sha3' extension, which 'aarch64-freestanding' does not promise
 ```
 
 ### What crosses the boundary
@@ -4528,6 +4575,32 @@ int sysl_fx_twice(int x) {
     return fx_twice(x);
 }
 ```
+
+**A macro that is a C string is a `c const` at `string`** ([a string is read too](#a-string-is-read-too)),
+its right-hand side the macro's own name, so the joining of adjacent literals, every escape (`\n`,
+`\x41`, octal) and a macro written out of other string macros are C's, settled when the module is built:
+
+```c
+#define FX_MAJOR "5"
+#define FX_NAME "fx " FX_MAJOR "\n"
+#define FX_NONE ""
+```
+
+becomes, with `--prefix fx_`,
+
+```sysl
+c const
+    MAJOR: string = "FX_MAJOR"
+    NAME: string = "FX_NAME"
+    NONE: string = "FX_NONE"
+```
+
+An empty string is a string of no bytes, where an empty `#define` is a flag and bound to nothing. A
+`u8"…"` literal is the same bytes as the plain one and binds the same. **A wide literal (`L"…"`,
+`u"…"`, `U"…"`) is refused by name**, since its elements are not bytes and a `string` holds UTF-8 —
+as is a macro of `char` pointer type that is no literal, an address (`#define P (buf)`), which no
+`string` can hold. A function-like macro is wrapped or refused as before. Bytes that are not UTF-8
+(`"\xff"`) are bound and then stopped by the line's own check when the module is built.
 
 **The checks are the point.** Built for a target where `fx_word` or `struct fx_bits` is laid out
 otherwise, the module stops at that record's `@assert`, naming it, rather than reading the wrong
