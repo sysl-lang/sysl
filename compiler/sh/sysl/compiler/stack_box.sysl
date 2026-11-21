@@ -52,9 +52,14 @@ struct StackBoxes
     // a call none of whose parameters is here answers something that is not the box
     // (`frame_counts.sysl`).
     answering: Set[string]
+
+    // The factories every way out of which answers the box laid in the caller's slot. Another's frame
+    // entry may answer a box it put on the heap on some other way out, so its caller cannot count the
+    // answer's shares itself (`frame_counts.sysl`).
+    whole: Set[string]
 end StackBoxes
 
-no_stack_boxes() -> StackBoxes = StackBoxes(map(), map(), map(), set(), set())
+no_stack_boxes() -> StackBoxes = StackBoxes(map(), map(), map(), set(), set(), set())
 
 // The largest payload laid in a frame. A frame box in a recursive body costs its payload in every
 // frame of the recursion, so a big one stays on the heap.
@@ -86,6 +91,9 @@ stack_boxes(e: *Emit, p: TProgram) -> StackBoxes
 
             if !w.escaped && w.answers
                 cx.factories.put(f.name, site.0)
+
+                if answers_only_site(f, site.0) then out.whole.add(f.name)
+
                 break
             end if
         end for
@@ -164,7 +172,7 @@ drop_unentered(e: *Emit, p: TProgram, sb: StackBoxes) -> StackBoxes
     for f in p.funcs
         if sb.entries.has(f.name) && !gone.has(f.name) then entries.put(f.name, sb.entries.get(f.name).unwrap())
 
-    StackBoxes(sb.sites, calls, entries, sb.payloads, sb.answering)
+    StackBoxes(sb.sites, calls, entries, sb.payloads, sb.answering, sb.whole)
 end drop_unentered
 
 // Whether the call at `at` in `f` names one of `names`.
@@ -180,6 +188,34 @@ end called_at
 
 private struct SbFlag
     yes: bool
+
+// Whether every way out of a factory answers its one site: the site is the body's value, and nothing
+// in the body returns, becomes another call, or leaves through `?`.
+private answers_only_site(f: TFunc, site: Span) -> bool
+    val last = f.body.result
+
+    if last.is_none() then return false
+
+    val direct = *last.unwrap().kind match
+        TBox(v, _) -> v.span == site
+        _ -> false
+
+    if !direct then return false
+
+    val left: &SbFlag = SbFlag(false)
+
+    val on_expr: &Fn(TExpr) -> unit = x -> *x.kind match
+        TTry(_, _, _, _, _, _, _) -> left.yes = true
+        _ -> ()
+    val on_stmt: &Fn(TStmt) -> unit = st -> st match
+        TReturn(_) -> left.yes = true
+        TBecome(_) -> left.yes = true
+        _ -> ()
+
+    walk_block_stmts(f.body, TWalk(true, on_expr, w -> (), on_stmt))
+
+    !left.yes
+end answers_only_site
 
 // The frame entry of a factory: the symbol it is defined and called at, local to the module. No
 // function's own symbol holds a `-` (`zero_entry.sysl`).

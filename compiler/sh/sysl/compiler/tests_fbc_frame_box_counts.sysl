@@ -19,8 +19,8 @@ import sysl.text.{cstring, Search}
 // ways out of the scope (early `return`, `?`, `break` and `continue`, `defer`, a recursive body); the
 // holders (a second local, a statement temporary, a `match` on it, a closure capturing it, a callee
 // it is lent to that takes shares of its own); compact payloads (`Point`, `Node`, `Tally`) and full
-// headers (`Res`, a destructor); and the two shapes left counted: a holder that may hold one of two
-// boxes, and a callee whose answer may be the box.
+// headers (`Res`, a destructor); and the three shapes left counted: a holder that may hold one of two
+// boxes, a callee whose answer may be the box, and a factory whose other ways out answer a heap box.
 //
 // Skipped cells, and why: a `panic` path gives nothing back with the box counted or not; a box
 // handed to a body that owns it is a keep, which `stack_box.sysl` already refuses to lay in a frame;
@@ -505,6 +505,52 @@ private const fbc_answered: string = raw"""
         print(b.n)
     """
 
+// The last share of a factory's answer a condition's term takes goes at the end of that term.
+private const fbc_term: string = raw"""
+    struct Res
+        n: int
+
+    impl Drop for Res
+        drop(self) = print("closed", self.n)
+
+    make(n: int) -> &Res = Res(n)
+
+    ok(n: int) -> bool = n > 0
+
+    check(n: int) -> bool
+        if ok(n) && make(n).n > 1 then return true
+
+        print("after the term")
+        false
+
+    main()
+        print(check(2))
+        print(check(1))
+    """
+
+// Left counted: `make`'s frame entry lays `Leaf` in the caller's slot but answers a `Node` it put on
+// the heap, so only the count at run time tells the two apart.
+private const fbc_tree: string = raw"""
+    enum Tree
+        Leaf
+        Node(left: &Tree, right: &Tree)
+
+    make(depth: int) -> &Tree
+        if depth == 0 then Leaf else Node(make(depth - 1), make(depth - 1))
+
+    check(t: &Tree) -> int
+        *t match
+            Leaf -> 1
+            Node(l, r) -> 1 + check(l) + check(r)
+
+    main()
+        var total = 0
+
+        for _ in 0..<4 do total += check(make(5))
+
+        print(total)
+    """
+
 // Every counted cell with what it prints: the output it had when its box was counted at run time.
 private fbc_cells() -> Buf[(string, string)]
     var out: Buf[(string, string)] = buf()
@@ -531,6 +577,8 @@ private fbc_cells() -> Buf[(string, string)]
     out.push((fbc_named, "item 7\n"))
     out.push((fbc_mixed, "1\nclosed 1\n"))
     out.push((fbc_answered, "2\n"))
+    out.push((fbc_term, "closed 2\ntrue\nclosed 1\nafter the term\nfalse\n"))
+    out.push((fbc_tree, "252\n"))
     out
 end fbc_cells
 
@@ -556,13 +604,14 @@ fbc_frame_cells_take_no_share()
     fbc_uncounted("fbc_tally", fbc_tally, "$$main", 0)
 end fbc_frame_cells_take_no_share
 
-@test("a box read only by place entries has no header written: nothing can read it")
+@test("a box read only through place entries has no header written: nothing can read it")
 fbc_unread_header_is_not_written()
     if xvr_no_library() then return
 
-    val body = fbc_body(fbc_ir(fbc_read), "$$main")
+    val body = fbc_body(fbc_ir(fbc_destructor), "$$main")
 
     assert_eq(fbc_count(body, "store i64"), 0)
+    assert_eq(fbc_count(body, "@arc.dropframe.Res"), 0)
 
     // A box lent to a callee keeps its header: the callee counts its own shares on it.
     val lent = fbc_body(fbc_ir(fbc_lent), "$$main")
@@ -584,6 +633,19 @@ fbc_teardown_on_every_way_out()
     fbc_uncounted("fbc_deferred", fbc_deferred, "$$main", 1)
     fbc_uncounted("fbc_depth", fbc_depth, "depth$$sysl", 1)
     fbc_uncounted("fbc_named", fbc_named, "$$main", 1)
+    fbc_uncounted("fbc_term", fbc_term, "check$$sysl", 1)
+
+    // The teardown is in the term's own block, before the branch on it.
+    val term = fbc_body(fbc_ir(fbc_term), "check$$sysl")
+    var in_term = false
+    var torn = false
+
+    for line in term.view()
+        if line.starts_with("cond.and") then in_term = true
+        if in_term && line.contains("@arc.framedown.Res(") then torn = true
+        if in_term && line.starts_with("  br ") then break
+
+    assert(torn, "fbc_term: the teardown is not in the term's block")
 end fbc_teardown_on_every_way_out
 
 @test("a closure capturing a frame box keeps its copy and dispose, and the box's own shares go")
@@ -606,7 +668,7 @@ fbc_compact_holding_heap()
     assert_eq(fbc_count(lines_of(ir), ", 2305843009213693952"), 0)
 end fbc_compact_holding_heap
 
-@test("a holder of one of two boxes, and a callee that may answer the box, leave it counted")
+@test("a holder of one of two boxes, a callee that may answer the box, and a factory that may answer a heap box leave it counted")
 fbc_left_counted()
     if xvr_no_library() then return
 
@@ -620,6 +682,12 @@ fbc_left_counted()
 
     assert(fbc_shares(fbc_body(answered, "$$main")) > 0, "fbc_answered: its releases are gone")
     assert_eq(fbc_count(lines_of(answered), ", 2305843009213693952"), 1)
+
+    // A factory answering its frame box on one way out and a heap box on another.
+    val tree = fbc_ir(fbc_tree)
+
+    assert_eq(fbc_count(fbc_body(tree, "$$main"), "@arc.framedown."), 0)
+    assert_eq(fbc_count(lines_of(tree), ", 2305843009213693952"), 1)
 end fbc_left_counted
 
 @test("and under AddressSanitizer: instrumented, and nothing read outside a live frame")
