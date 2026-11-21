@@ -501,6 +501,12 @@ struct Emit
     framed_boxes: Buf[Span]
     framed_calls: Buf[Span]
     frame_site: Option[Span]
+
+    // The frame boxes the body being written laid, whose counts `finish_func` takes out where the
+    // compiler can count them (`frame_counts.sysl`); and the payloads, by mangled name, of a frame box
+    // some body left counted, whose compact release must still know the frame mark.
+    frame_roots: Buf[FrameRoot]
+    counted_frames: Set[string]
 end Emit
 
 // What a runtime helper is built from. A helper is asked for by name while a body is being written
@@ -520,6 +526,10 @@ enum HelperReq
     // The hook of a box laid in a frame (`emit_box.sysl`'s `gen_frame_box`): it lets go of what the
     // payload holds, and gives no storage back.
     HrFrameDrop(payload: Type)
+
+    // What the release of a frame box's last share would have done, where the compiler counted its
+    // shares (`frame_counts.sysl`): the payload's destructor and the release of what it holds.
+    HrFrameDown(payload: Type)
 
     // How a drain lets go of one `&T` its walk reaches (`emit_arc.sysl`'s `gen_push`): a count given
     // back, and at zero the storage freed on the spot where nothing in it is left to tear down, or the
@@ -712,7 +722,7 @@ emitter_for(t: Target, destructors: Buf[(string, string, bool)]) -> Emit
          set(), map(), 0, map(), set(), map(), false, set(), map(), set(), false, false, false, buf(), set(),
           "", set(), false, None, None, set(), None, map(), buf(), buf(), buf(), false, set(), None,
           buf(), buf(), false, false, false, false, buf(), map(), map(), set(), map(), buf(), no_stack_boxes(),
-          buf(), buf(), None)
+          buf(), buf(), None, buf(), set())
 end emitter_for
 
 // -- what a body could not say --------------------------------------------------------------------
@@ -761,6 +771,7 @@ start_function(e: *Emit)
     e.falls.clear()
     e.scratch.clear()
     e.ensures.clear()
+    e.frame_roots.clear()
     e.result_ssa = None
     e.tail_target = ""
     e.tail_calls.clear()
@@ -1086,7 +1097,10 @@ finish_func(e: *Emit, sig: IrFuncSig) -> IrFunc
     //
     // A slot's life is bounded last, over the finished blocks, so the slots the large-value pass made
     // and the blocks the guards opened are bounded with the rest.
-    val elided = elide_arc_pairs(out, e.inert_symbols)
+    //
+    // A frame box's count goes after the cancelling, which sees only what a box's holders do
+    // (`frame_counts.sysl`).
+    val elided = drop_frame_counts(e, elide_arc_pairs(out, e.inert_symbols))
     var before: Set[string] = set()
 
     for inst in elided[0].instrs

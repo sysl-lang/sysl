@@ -615,7 +615,12 @@ private gen_compact_release(e: *Emit, payload: Type)
     // release that gives back its last share leaves the mark rather than zero: its payload is let go of
     // and nothing is freed. No heap box's count ever reaches the mark, and a laid-down one's sits far
     // above it.
-    if e.stack.payloads.has(mangle(payload))
+    //
+    // **Only where some body left such a box counted** (`frame_counts.sysl`): one whose shares the
+    // compiler counted gives its last back through `arc.framedown.<T>`, and every share a callee takes
+    // of it lands above its first, so its count never comes down to the mark. The bodies are all
+    // written before the helpers are, so the set is whole here.
+    if e.stack.payloads.has(mangle(payload)) && e.counted_frames.has(mangle(payload))
         val marked = fresh_label(e, "arc.marked")
         val framed = fresh_label(e, "arc.framed")
         val m = fresh_reg(e)
@@ -1106,6 +1111,7 @@ gen_helper(e: *Emit, what: HelperReq, name: string) -> Option[IrFunc]
         HrDropBuf(_) -> helper_sig(name, hook_params())
         HrPlainDrop -> helper_sig(name, hook_params())
         HrFrameDrop(_) -> helper_sig(name, hook_params())
+        HrFrameDown(_) -> helper_sig(name, one_param("p", LPtr))
         HrPush(_) -> helper_sig(name, push_params())
         HrPlainRelease(_) -> helper_sig(name, one_param("p", LPtr))
         HrCompactRelease(_) -> helper_sig(name, one_param("p", LPtr))
@@ -1135,6 +1141,7 @@ gen_helper(e: *Emit, what: HelperReq, name: string) -> Option[IrFunc]
         HrDropBuf(elem) -> gen_drop_buf_hook(e, elem, false)
         HrPlainDrop -> gen_plain_hook(e)
         HrFrameDrop(payload) -> gen_drop_hook(e, payload, false)
+        HrFrameDown(payload) -> gen_frame_down(e, payload)
         HrPush(payload) -> gen_push(e, payload)
         HrPlainRelease(payload) -> gen_push(e, payload, false)
         HrCompactRelease(payload) -> gen_compact_release(e, payload)
@@ -1174,7 +1181,6 @@ end gen_plain_hook
 
 // `frees` is false for a box laid in a frame, whose storage is the frame's and goes nowhere.
 private gen_drop_hook(e: *Emit, payload: Type, frees: bool)
-    val bn = box_lty(e, payload)
     val give = fresh_label(e, "arc.give")
     val over = fresh_label(e, "arc.over")
 
@@ -1192,21 +1198,45 @@ private gen_drop_hook(e: *Emit, payload: Type, frees: bool)
         return
     end if
 
+    let_go_of_payload(e, payload, payload_of(e, payload, VReg("p")), true)
+    emit_term(e, InRet(None, None))
+    emit_label(e, give)
+
+    if frees then emit_free(e, payload)
+
+    emit_term(e, InRet(None, None))
+end gen_drop_hook
+
+// The address of a box's payload.
+private payload_of(e: *Emit, payload: Type, p: Val) -> Val
     val pa = fresh_reg(e)
 
     var idx: Buf[IrArg] = buf()
 
     idx.push(ir_arg(l_i32(), VInt(from_int(0))))
     idx.push(ir_arg(l_i32(), VInt(from_int(long(box_payload_field(e, payload))))))
-    emit(e, InGep(pa, bn, VReg("p"), idx))
+    emit(e, InGep(pa, box_lty(e, payload), p, idx))
+    pa
+end payload_of
 
+// `arc.framedown.<T>`: what the release of a frame box's last share does, where the compiler counted
+// its shares (`frame_counts.sysl`) -- the payload let go of as a hook lets go of it, outside any
+// drain, and nothing freed.
+private gen_frame_down(e: *Emit, payload: Type)
+    let_go_of_payload(e, payload, payload_of(e, payload, VReg("p")), false)
+    emit_term(e, InRet(None, None))
+end gen_frame_down
+
+// What a payload at `pa` holds, let go of: its destructor, then a release of everything it holds.
+// `drain` is a hook's, whose walk may queue on the drain's slot.
+private let_go_of_payload(e: *Emit, payload: Type, pa: Val, drain: bool)
     // **With no destructor, the walk queues what it lets go of on the drain's slot itself**, freeing
     // on the spot whatever has nothing left in it to tear down (`push_ref`). Nothing but releases runs
     // between the drain naming its slot and the walk using it, so the slot is still this thread's. A
     // destructor is the program's own code, which may move the body to another thread
     // (`fiber_switch.sysl`), so a walk after one releases as any other code does.
     if destructor_of(e, payload).is_none()
-        e.draining = true
+        e.draining = drain
 
         if e.layout.indirect(payload) then walk_slot(e, payload, pa, false)
         else
@@ -1216,12 +1246,6 @@ private gen_drop_hook(e: *Emit, payload: Type, frees: bool)
             release_value(e, payload, whole)
 
         e.draining = false
-        emit_term(e, InRet(None, None))
-        emit_label(e, give)
-
-        if frees then emit_free(e, payload)
-
-        emit_term(e, InRet(None, None))
         return
     end if
 
@@ -1258,13 +1282,7 @@ private gen_drop_hook(e: *Emit, payload: Type, frees: bool)
     if by_address then emit(e, InLoad(v, lty(e, payload), pa, AccPlain, None))
 
     release_value(e, payload, v)
-    emit_term(e, InRet(None, None))
-    emit_label(e, give)
-
-    if frees then emit_free(e, payload)
-
-    emit_term(e, InRet(None, None))
-end gen_drop_hook
+end let_go_of_payload
 
 // `slot` is storage `slot_storage` made, which is given back from in front of its header
 // (`slot_buf_free`).
