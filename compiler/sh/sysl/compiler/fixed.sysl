@@ -606,7 +606,7 @@ fixed_operator_type(cx: &Analyzer, span: Span, op: string, a: Type, b: Type,
     // products. Registers of two widths are left to the ordinary rule, which names both, and so is a
     // quotient, which a register of lanes does not have.
     (repr(a), repr(b)) match
-        (Vector(n, la), Vector(m, lb)) ->
+        (Vector(n, la, term), Vector(m, lb, _)) ->
             if op == "/" || n != m || (!is_fixed(*la) && !is_fixed(*lb)) then return None
 
             // Lanes of two formats with no position to name the product's: the message speaks of the
@@ -632,7 +632,7 @@ fixed_operator_type(cx: &Analyzer, span: Span, op: string, a: Type, b: Type,
             if lane.is_none() then return None
             if lane.unwrap() == Unknown then return lane
 
-            return Some(Vector(n, lane.unwrap()))
+            return Some(Vector(n, lane.unwrap(), term))
         _ -> ()
 
     val fa = is_fixed(a)
@@ -685,7 +685,7 @@ private lane_of_width(expected: Option[Type], n: int) -> Option[Type]
     if expected.is_none() then return None
 
     repr(expected.unwrap()) match
-        Vector(k, lane) -> if k == n then Some(*lane) else None
+        Vector(k, lane, _) -> if k == n then Some(*lane) else None
         _ -> None
 end lane_of_width
 
@@ -711,22 +711,23 @@ sum_receiver(cx: &Analyzer, receiver: Expr, member: string, args: Buf[Expr],
     if texpr_type(tr) == Unknown
         val width = *receiver.kind match
             Binary(_, l, _) -> repr(texpr_type(sandboxed_read(cx, l, None))) match
-                Vector(n, lane) -> if is_fixed(*lane) then n else 0
+                Vector(n, lane, _) -> if is_fixed(*lane) then n else 0
                 _ -> 0
             _ -> 0
 
         if width == 0 then return tr
 
-        val again = analyze_expected(cx, receiver, Some(Vector(width, want)))
+        val again = analyze_expected(cx, receiver, Some(Vector(width, want, buf())))
 
-        if texpr_type(again) == Unknown || disagree(texpr_type(again), Vector(width, want)) then return tr
+        if texpr_type(again) == Unknown || disagree(texpr_type(again), Vector(width, want, buf())) then
+            return tr
 
         cx.an.restore_complaints(mark)
         return again
     end if
 
     repr(texpr_type(tr)) match
-        Vector(n, lane) -> if is_fixed(*lane) then reread(cx, tr, receiver, Vector(n, want)) else tr
+        Vector(n, lane, term) -> if is_fixed(*lane) then reread(cx, tr, receiver, Vector(n, want, term)) else tr
         _ -> tr
 end sum_receiver
 

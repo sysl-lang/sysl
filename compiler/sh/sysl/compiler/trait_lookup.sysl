@@ -118,38 +118,43 @@ shape_owners(t: Type) -> Buf[(string, Buf[Type])]
         // The length is dropped from the second key and handed back as an **argument**, exactly as
         // the element type is: a `[3]int` matches `[N]T` at `N = 3` and `T = int`, and the block's
         // members are instantiated from that pair the way a slice's are from one.
-        Array(n, elem) ->
-            var fixed: Buf[Type] = buf()
+        //
+        // A length a generic's declaration stands in for (`term`) is no particular length, so it has
+        // no fixed length's shape, and the argument handed back is that form rather than the zero.
+        Array(n, elem, term) ->
+            if term.is_empty()
+                var fixed: Buf[Type] = buf()
 
-            fixed.push(*elem)
-            out.push((s"[$n]", fixed))
+                fixed.push(*elem)
+                out.push((s"[$n]", fixed))
+            end if
 
             // Every array of this element, `[N]u8`, hands back the length alone. It is never beside
             // `[3]T` in one trait (`hoist_impl` refuses the pair: each would cover a `[3]u8` with
             // neither more specific), so its place after the length's shape decides nothing.
             var count: Buf[Type] = buf()
 
-            count.push(ConstArg(from_int(long(n)), usize_marker(), false))
+            count.push(extent_marker(n, term))
             out.push((elements_shape(*elem), count))
 
             var open: Buf[Type] = buf()
 
-            open.push(ConstArg(from_int(long(n)), usize_marker(), false))
+            open.push(extent_marker(n, term))
             open.push(*elem)
             out.push((ArrayShape, open))
         // A vector's two shapes drop the lane count first and the lane type second, so a block for
         // every vector of `f32` is found before one for every vector. The lane count is the argument
         // both hand back, as an array's length is; there is no shape keeping the count and dropping
         // the lane, since `<4>T` and `<N>f32` would both cover a `<4>f32` with neither more specific.
-        Vector(n, elem) ->
+        Vector(n, elem, term) ->
             var count: Buf[Type] = buf()
 
-            count.push(ConstArg(from_int(long(n)), usize_marker(), false))
+            count.push(extent_marker(n, term))
             out.push((lanes_shape(*elem), count))
 
             var open: Buf[Type] = buf()
 
-            open.push(ConstArg(from_int(long(n)), usize_marker(), false))
+            open.push(extent_marker(n, term))
             open.push(*elem)
             out.push((VectorShape, open))
         Struct(d) ->
@@ -172,6 +177,10 @@ end shape_owners
 // `usize`, and the width is the target's -- read off nothing here, since two lengths agree whenever
 // their values do.
 private usize_marker() -> Type = Integer(64, false, true)
+
+// A length handed back as a shape's argument: its value, and its form where it has one.
+private extent_marker(n: int, term: Buf[Mono]) -> Type =
+    ConstArg(from_int(long(n)), usize_marker(), !term.is_empty(), term)
 
 // The blanket keys a type is covered by, each paired with the type itself -- the pair a shape gives,
 // since a blanket's one type argument is the receiver.
@@ -296,9 +305,9 @@ end viewed_const
 // a type could otherwise register a member of the same name that nothing would ever find, which is
 // why this is asked at the declaration.
 builtin_member(t: Type, name: string) -> bool = t match
-    Array(_, _) -> name == "len"
+    Array(_, _, _) -> name == "len"
     Slice(_, _) -> name == "len"
-    Vector(_, _) -> name == "len" || is_vector_method(name)
+    Vector(_, _, _) -> name == "len" || is_vector_method(name)
     Str -> name == "len" || name == "bytes" || name == "chars" || name == "copy"
     Weak(_) -> name == "get"
     _ -> false
@@ -531,8 +540,8 @@ private stands_settled(t: Type, settled: Buf[Binding]) -> bool = t match
     Ptr(inner, _) -> stands_settled(*inner, settled)
     Ref(inner, _) -> stands_settled(*inner, settled)
     Weak(inner) -> stands_settled(*inner, settled)
-    Array(_, elem) -> stands_settled(*elem, settled)
-    Vector(_, elem) -> stands_settled(*elem, settled)
+    Array(_, elem, _) -> stands_settled(*elem, settled)
+    Vector(_, elem, _) -> stands_settled(*elem, settled)
     Slice(elem, _) -> stands_settled(*elem, settled)
     Volatile(inner) -> stands_settled(*inner, settled)
     CFn(ps, r, _) -> all_settled(ps, settled) && stands_settled(*r, settled)

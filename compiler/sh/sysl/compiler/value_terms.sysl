@@ -1,0 +1,520 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.{BigInt, abs as big_abs, div_rem, from_int, mul as big_mul, negate, to_string}
+
+// What a value parameter IS while its own declaration is read: a symbol, and an argument computed
+// over symbols is a polynomial in them (`docs/content/reference/generics.md § What may be written
+// with N`).
+//
+// **The stand-in zero answers numbers and the term answers identity.** A layout, a `sizeof` or a
+// loop bound in a generic body still reads `N` as zero, as it always has, and every instantiation
+// reads the body again with `N` bound; what the term adds is that `Buf[N]` and `Buf[M]` are two
+// types at the definition, and `Buf[N + M]` and `Buf[M + N]` one.
+//
+// **The form is canonical**: a sum of monomials with non-zero integer coefficients, each a sorted
+// product of factors, the monomials sorted by their factors, so two arguments are equal exactly when
+// their forms are. `+`, `-`, unary `-` and `*` are the ring operations over ℤ; `/` and `%` by a
+// constant that divides every coefficient are exact division (`(2 * N + 4) / 2` is `N + 2`, and its
+// `%` is `0`); any other operator over a parameter is an ATOM, a factor compared by its structure.
+// An argument the form cannot describe (a call, an `if`) carries no term, and is compared as before.
+
+// One monomial: a coefficient times a product of factors. A factor is a value parameter's name, or
+// an atom's text in parentheses; a factor repeated is a power. The constant monomial has no factors.
+struct Mono
+    coeff: BigInt
+    factors: Buf[string]
+
+// The most monomials, and the highest degree, a form is built to. Past either, the argument carries
+// no term, and is compared as it was before value parameters were symbols.
+private const MaxMonos: usize = 64
+private const MaxDegree: usize = 8
+
+// -- equality ----------------------------------------------------------------------------------------
+
+// Whether two value arguments are one: by form where both are symbolic, by value where neither is.
+//
+// **A stand-in with no form agrees by value, as every stand-in did before**: it is an argument the
+// form could not describe, or one whose refusal was already told, and calling it unequal would
+// refuse what nothing proved wrong. A symbol against an argument an instantiation gave is a
+// mismatch: `N` is every value the instantiations choose, not the one written.
+value_args_agree(av: BigInt, astood: bool, aterm: Buf[Mono], bv: BigInt, bstood: bool,
+                 bterm: Buf[Mono]) -> bool
+    if !aterm.is_empty() && !bterm.is_empty() then return terms_eq(aterm, bterm)
+    if !aterm.is_empty() then return bstood && av == bv
+    if !bterm.is_empty() then return astood && av == bv
+
+    av == bv
+end value_args_agree
+
+// Whether two array lengths, or two lane counts, are one -- by VP1's rule, with one difference: a
+// length carrying no form that stands at zero agrees with a symbol, as a stand-in does. A length is
+// rebuilt in many places (a lane-wise result, a literal read at an expected type), and one rebuilt
+// without its form is the zero it stood at, not a zero anybody wrote; calling that unequal would
+// refuse what nothing proved wrong, so it is left to the instantiations, as every length was. A
+// written `[0]T` against `[N]T` is therefore answered there too.
+extents_agree(an: int, aterm: Buf[Mono], bn: int, bterm: Buf[Mono]) -> bool =
+    value_args_agree(from_int(long(an)), true, aterm, from_int(long(bn)), true, bterm)
+
+// A length or lane count as a reader writes it: its form where it has one, its number otherwise.
+extent_text(n: int, term: Buf[Mono]) -> string = if term.is_empty() then s"$n" else term_text(term)
+
+// A length as the value argument `term_difference` compares, so a length and a value argument are
+// told apart in one voice.
+private extent_arg(n: int, term: Buf[Mono]) -> Type =
+    ConstArg(from_int(long(n)), int_type(), !term.is_empty(), term)
+
+terms_eq(p: Buf[Mono], q: Buf[Mono]) -> bool
+    if p.len() != q.len() then return false
+
+    for i in 0..<p.len()
+        if p[i].coeff != q[i].coeff || mono_key(p[i]) != mono_key(q[i]) then return false
+
+    true
+end terms_eq
+
+// -- the ring --------------------------------------------------------------------------------------
+
+private mono_key(m: Mono) -> string = factors_text(m.factors)
+
+private factors_text(fs: Buf[string]) -> string
+    var out = ""
+
+    for i in 0..<fs.len()
+        out = if i == 0 then fs[i] else s"$out * ${fs[i]}"
+
+    out
+end factors_text
+
+// A constant as a form: no monomials for zero.
+private term_const(c: BigInt) -> Buf[Mono]
+    var out: Buf[Mono] = buf()
+
+    if !c.is_zero() then out.push(Mono(c, buf()))
+
+    out
+end term_const
+
+// A value parameter, or an atom, as a form of its own.
+term_symbol(name: string) -> Buf[Mono]
+    var fs: Buf[string] = buf()
+
+    fs.push(name)
+
+    var out: Buf[Mono] = buf()
+
+    out.push(Mono(from_int(1), fs))
+    out
+end term_symbol
+
+// `m` added into the sorted `out`, merged with the monomial of the same factors.
+private add_mono(out: *Buf[Mono], m: Mono)
+    val key = mono_key(m)
+
+    for i in 0..<out.len()
+        val here = mono_key(out[i])
+
+        if here == key
+            val sum = out[i].coeff + m.coeff
+
+            if sum.is_zero()
+                out.remove(i)
+            else
+                out[i] = Mono(sum, out[i].factors)
+
+            return
+        end if
+
+        if key < here
+            out.insert(i, m)
+            return
+        end if
+    end for
+
+    out.push(m)
+end add_mono
+
+private term_add(p: Buf[Mono], q: Buf[Mono]) -> Buf[Mono]
+    var out: Buf[Mono] = buf()
+
+    for m in p
+        add_mono(&out, m)
+
+    for m in q
+        add_mono(&out, m)
+
+    out
+end term_add
+
+private term_neg(p: Buf[Mono]) -> Buf[Mono]
+    var out: Buf[Mono] = buf()
+
+    for m in p
+        out.push(Mono(negate(m.coeff), m.factors))
+
+    out
+end term_neg
+
+private term_mul(p: Buf[Mono], q: Buf[Mono]) -> Buf[Mono]
+    var out: Buf[Mono] = buf()
+
+    for x in p
+        for y in q
+            add_mono(&out, Mono(big_mul(x.coeff, y.coeff), merged_factors(x.factors, y.factors)))
+
+    out
+end term_mul
+
+private merged_factors(xs: Buf[string], ys: Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+    var i: usize = 0
+    var j: usize = 0
+
+    while i < xs.len() || j < ys.len()
+        if j == ys.len() || (i < xs.len() && xs[i] <= ys[j])
+            out.push(xs[i])
+            i += 1
+        else
+            out.push(ys[j])
+            j += 1
+        end if
+    end while
+
+    out
+end merged_factors
+
+// `p / c` where `c` divides every coefficient -- exact, so it agrees with the truncating division
+// an instantiation evaluates at every argument -- or nothing.
+private term_div_exact(p: Buf[Mono], c: BigInt) -> Option[Buf[Mono]]
+    if c.is_zero() then return None
+
+    var out: Buf[Mono] = buf()
+
+    for m in p
+        val qr = div_rem(m.coeff, c)
+
+        if !qr.1.is_zero() then return None
+
+        out.push(Mono(qr.0, m.factors))
+
+    Some(out)
+end term_div_exact
+
+private term_constant(p: Buf[Mono]) -> Option[BigInt]
+    if p.is_empty() then return Some(from_int(0))
+    if p.len() == 1 && p[0].factors.is_empty() then return Some(p[0].coeff)
+
+    None
+end term_constant
+
+// Whether a form is within the cap.
+private term_fits(p: Buf[Mono]) -> bool
+    if p.len() > MaxMonos then return false
+
+    for m in p
+        if m.factors.len() > MaxDegree then return false
+
+    true
+end term_fits
+
+// -- reading one ------------------------------------------------------------------------------------
+
+// The form of a written value argument over the stand-ins `subst` binds, or nothing where it names
+// none, comes to a constant, or holds something the form cannot describe.
+value_term(a: &Analysis, scope: Scope, e: Expr, subst: Buf[Binding]) -> Buf[Mono]
+    val read = term_of(a, scope, e, subst)
+
+    if read.is_none() || !term_fits(read.unwrap()) || term_constant(read.unwrap()).is_some() then
+        return buf()
+
+    read.unwrap()
+end value_term
+
+private term_of(a: &Analysis, scope: Scope, e: Expr, subst: Buf[Binding]) -> Option[Buf[Mono]]
+    if !names_stand_in(e, subst) then return folded_term(a, scope, e, subst)
+
+    *e.kind match
+        Ident(n) -> bound_type(subst, n) match
+            Some(ConstArg(_, _, _, term)) -> if term.is_empty() then None else Some(term)
+            _ -> None
+        Unary(op, x) ->
+            val inner = term_of(a, scope, x, subst)
+
+            if inner.is_none() then return None
+            if op == "-" then return Some(term_neg(inner.unwrap()))
+
+            // `!B` stays as written; an operand of more than one symbol keeps its parentheses.
+            val shown = term_text(inner.unwrap())
+
+            Some(term_symbol(if bare_symbol(inner.unwrap()) then s"$op$shown" else s"$op($shown)"))
+        Binary(op, l, r) -> binary_term(a, scope, op, l, r, subst)
+        _ -> None
+end term_of
+
+private binary_term(a: &Analysis, scope: Scope, op: string, l: Expr, r: Expr,
+                    subst: Buf[Binding]) -> Option[Buf[Mono]]
+    val lt = term_of(a, scope, l, subst)
+    val rt = term_of(a, scope, r, subst)
+
+    if lt.is_none() || rt.is_none() then return None
+
+    val p = lt.unwrap()
+    val q = rt.unwrap()
+
+    if !term_fits(p) || !term_fits(q) then return None
+
+    if op == "+" then return Some(term_add(p, q))
+    if op == "-" then return Some(term_add(p, term_neg(q)))
+    if op == "*" then return Some(term_mul(p, q))
+
+    val divisor = term_constant(q)
+
+    if divisor.is_some() && (op == "/" || op == "%")
+        val exact = term_div_exact(p, divisor.unwrap())
+
+        if exact.is_some() then return if op == "/" then exact else Some(term_const(from_int(0)))
+    end if
+
+    Some(term_symbol(s"(${term_text(p)} $op ${term_text(q)})"))
+end binary_term
+
+// A part naming no stand-in, folded as the constant it is.
+private folded_term(a: &Analysis, scope: Scope, e: Expr, subst: Buf[Binding]) -> Option[Buf[Mono]]
+    val inner = analyzer_for(a, scope)
+
+    inner.subst = subst
+
+    val mark = a.complaints()
+    val folded = const_fold(inner, e)
+
+    a.restore_complaints(mark)
+
+    folded match
+        Some(ConstInt(v)) -> Some(term_const(v))
+        Some(ConstBool(b)) -> Some(term_const(from_int(if b then 1 else 0)))
+        _ -> None
+end folded_term
+
+// -- showing one ------------------------------------------------------------------------------------
+
+// A form as a reader writes it: the monomials in order, the constant last -- `N + 1`, `M + N`,
+// `2 * N - 3`.
+term_text(p: Buf[Mono]) -> string
+    if p.is_empty() then return "0"
+
+    var out = ""
+    var first = true
+
+    for pass in 0..<2
+        for m in p
+            if (pass == 0) == m.factors.is_empty() then continue
+
+            val negative = m.coeff.sign() < 0
+            val size = big_abs(m.coeff)
+            val one = size == from_int(1) && !m.factors.is_empty()
+            val shown = if m.factors.is_empty() then to_string(size)
+                        else if one then factors_text(m.factors)
+                        else s"${to_string(size)} * ${factors_text(m.factors)}"
+
+            out = if first then (if negative then s"-$shown" else shown)
+                  else s"$out ${if negative then "-" else "+"} $shown"
+            first = false
+    end for
+
+    out
+end term_text
+
+// The value parameters a form names, each once, in order.
+private term_params(p: Buf[Mono], out: *Buf[string])
+    for m in p
+        for f in m.factors
+            if !names_a_param(f) then continue
+
+            var seen = false
+
+            for i in 0..<out.len()
+                if out[i] == f then seen = true
+
+            if !seen then out.push(f)
+end term_params
+
+// What tells two value arguments apart, said after a refusal that quotes both: they differ by a
+// constant, they are two parameters, a parameter is not the constant written, or the two forms
+// are simply not one. `want` and `got` are the two `ConstArg`s.
+term_difference(want: Type, got: Type) -> string
+    val w = term_of_arg(want)
+    val g = term_of_arg(got)
+    var names: Buf[string] = buf()
+
+    term_params(w, &names)
+    term_params(g, &names)
+
+    val every = if names.is_empty() then "at every instantiation" else s"for every ${spoken_list(names)}"
+
+    if w.is_empty() || g.is_empty()
+        val symbolic = if w.is_empty() then got else want
+        val fixed = if w.is_empty() then want else got
+
+        return s"'${type_show(symbolic)}' stands for every value an instantiation chooses, not " +
+               s"only ${type_show(fixed)}"
+    end if
+
+    if bare_symbol(w) && bare_symbol(g) then
+        return s"'${term_text(g)}' and '${term_text(w)}' are different value parameters"
+
+    val gap = term_constant(term_add(g, term_neg(w)))
+
+    if gap.is_some() then return s"the two differ by ${to_string(big_abs(gap.unwrap()))} $every"
+
+    s"'${term_text(g)}' and '${term_text(w)}' are not the same value $every"
+end term_difference
+
+private term_of_arg(t: Type) -> Buf[Mono] = t match
+    ConstArg(_, _, _, term) -> term
+    _ -> buf()
+
+private bare_symbol(p: Buf[Mono]) -> bool =
+    p.len() == 1 && p[0].factors.len() == 1 && p[0].coeff == from_int(1) && names_a_param(p[0].factors[0])
+
+// Whether a factor is a value parameter rather than an atom: an atom begins with an operator or a
+// parenthesis, a parameter with a letter or an underscore.
+private names_a_param(f: string) -> bool
+    if f.bytes.len == 0 then return false
+
+    val c = f.bytes[0]
+
+    c == u8('_') || (c >= u8('a') && c <= u8('z')) || (c >= u8('A') && c <= u8('Z'))
+end names_a_param
+
+private spoken_list(xs: Buf[string]) -> string
+    var out = ""
+
+    for i in 0..<xs.len()
+        out = if i == 0 then xs[i] else if i + 1 == xs.len() then s"$out and ${xs[i]}" else s"$out, ${xs[i]}"
+
+    out
+end spoken_list
+
+// -- where two types differ only at a parameter --------------------------------------------------------
+
+// The first pair at which two types part while agreeing everywhere else, where that pair is two
+// value arguments, one of them symbolic -- `Buf[N]` and `Buf[N + 1]`, `Pair[Arr[N], M]` and
+// `Pair[Arr[M], M]` -- or two of the declaration's own type parameters, `Box[T]` and `Box[U]`.
+// `own` names those type parameters. Nothing where the types are one, or part anywhere else: that
+// mismatch is not this rule's to tell.
+//
+// **Two type parameters are a clash only under a type that holds them.** Bare, `T` where `U` was
+// asked for is not wrong as written: an instantiation at `[u8, int]` widens the one into the other.
+// Nothing converts a `Box[u8]` (or an `Option`, a `[2]`, a `&`) into its `int` twin, so there the two
+// parameters must be one.
+value_clash(want: Type, got: Type, own: Buf[string]) -> Option[(Type, Type)]
+    (want, got) match
+        (Abstract(_, _), Abstract(_, _)) -> return None
+        _ -> ()
+
+    val found = clash_in(want, got, own)
+
+    found.1 match
+        Some(pair) -> if found.0 then Some(pair) else None
+        None -> None
+end value_clash
+
+// A refusal of `got` where `want` was asked for, KEPT where the walk is a generic's own definition and
+// the two part only at a parameter: inside its declaration a parameter is a symbol, so that is wrong
+// as written, and an instantiation may never be made. Any other mismatch there is left for the
+// instantiations.
+keep_value_clash(cx: &Analyzer, at: Span, refusal: string, want: Type, got: Type)
+    if !cx.at_definition then return
+
+    val told = value_clash_told(refusal, want, got, own_type_params(cx.subst))
+
+    if told.is_some() then cx.an.bound_fault(cx.scope, at, told.unwrap())
+end keep_value_clash
+
+// The type parameters a definition's walk stands in for themselves: each binding of a name to the
+// stand-in of that same name. A pack's two stand-ins, an associated type's projection and a `some`
+// result's stand-in are not among them -- what those are is settled by an instantiation, so two of
+// them, or one of them and a parameter, may turn out to be one type.
+own_type_params(subst: Buf[Binding]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for b in subst
+        b.ty match
+            Abstract(n, _) -> if n == b.name then out.push(n)
+            _ -> ()
+
+    out
+end own_type_params
+
+// `refusal` with what tells the two apart after it, where `got` stands where `want` was asked for and
+// the two part only at a parameter; nothing otherwise. A value standing where a reference to it was
+// asked for is compared with what the reference holds, as boxing would.
+value_clash_told(refusal: string, want: Type, got: Type, own: Buf[string]) -> Option[string]
+    var found = value_clash(want, got, own)
+
+    if found.is_none()
+        want match
+            Ref(inner, _) -> found = value_clash(*inner, got, own)
+            _ -> ()
+    end if
+
+    found.map(pair -> s"$refusal — ${clash_difference(pair.0, pair.1)}")
+end value_clash_told
+
+private clash_difference(want: Type, got: Type) -> string = (want, got) match
+    (Abstract(wn, _), Abstract(gn, _)) -> s"'$gn' and '$wn' are different type parameters"
+    _ -> term_difference(want, got)
+
+// (whether the two agree outside the parameters, the first pair of parameters that differs).
+private clash_in(want: Type, got: Type, own: Buf[string]) -> (bool, Option[(Type, Type)])
+    if type_eq(want, got) then return (true, None)
+
+    (want, got) match
+        (ConstArg(_, wt, _, wterm), ConstArg(_, gt, _, gterm)) ->
+            if !type_eq(*wt, *gt) then return (false, None)
+            if wterm.is_empty() && gterm.is_empty() then return (false, None)
+
+            (true, Some((want, got)))
+        (Abstract(wn, _), Abstract(gn, _)) ->
+            if holds_string(own, wn) && holds_string(own, gn) then (true, Some((want, got))) else (false, None)
+        (Struct(w), Struct(g)) -> if w.base == g.base then clash_list(w.targs, g.targs, own) else (false, None)
+        (Enum(w), Enum(g)) -> if w.base == g.base then clash_list(w.targs, g.targs, own) else (false, None)
+        (Trait(wn, wa, _), Trait(gn, ga, _)) -> if wn == gn then clash_list(wa, ga, own) else (false, None)
+        (Ptr(w, wro), Ptr(g, gro)) -> if wro == gro then clash_in(*w, *g, own) else (false, None)
+        (Ref(w, ws), Ref(g, gs)) -> if ws == gs then clash_in(*w, *g, own) else (false, None)
+        (Weak(w), Weak(g)) -> clash_in(*w, *g, own)
+        (Volatile(w), Volatile(g)) -> clash_in(*w, *g, own)
+        (Slice(w, wro), Slice(g, gro)) -> if wro == gro then clash_in(*w, *g, own) else (false, None)
+        (Array(wn, w, wterm), Array(gn, g, gterm)) -> extent_clash(wn, wterm, gn, gterm, *w, *g, own)
+        (Vector(wn, w, wterm), Vector(gn, g, gterm)) -> extent_clash(wn, wterm, gn, gterm, *w, *g, own)
+        _ -> (false, None)
+end clash_in
+
+// Two arrays, or two vectors, at their lengths and then their elements: a length that disagrees by
+// form is the clash where the elements agree, as a value argument's is.
+private extent_clash(wn: int, wterm: Buf[Mono], gn: int, gterm: Buf[Mono], w: Type, g: Type,
+                     own: Buf[string]) -> (bool, Option[(Type, Type)])
+    if extents_agree(wn, wterm, gn, gterm) then return clash_in(w, g, own)
+    if wterm.is_empty() && gterm.is_empty() then return (false, None)
+
+    val inner = clash_in(w, g, own)
+
+    if !inner.0 then return (false, None)
+
+    (true, Some((extent_arg(wn, wterm), extent_arg(gn, gterm))))
+end extent_clash
+
+private clash_list(ws: Buf[Type], gs: Buf[Type], own: Buf[string]) -> (bool, Option[(Type, Type)])
+    if ws.len() != gs.len() then return (false, None)
+
+    var first: Option[(Type, Type)] = None
+
+    for i in 0..<ws.len()
+        val one = clash_in(ws[i], gs[i], own)
+
+        if !one.0 then return (false, None)
+        if first.is_none() then first = one.1
+
+    (true, first)
+end clash_list

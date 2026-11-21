@@ -21,6 +21,7 @@ These pages are generated from the library's own doc comments: every declaration
 | [`sysl.codec`](sysl-codec/) | Turning a value into a format and back, written once for every type and every format. |
 | [`sysl.container`](sysl-container/) | Five containers, each with a shape a slice and a `Buf` cannot give you. |
 | [`sysl.container.ring`](sysl-container-ring/) | A queue of a **fixed** capacity, laid over storage the caller supplies, cheap to take from at either end and needing no allocator at all. |
+| [`sysl.cpu`](sysl-cpu/) | Asking the processor a program is running on which instruction-set extensions it has. |
 | [`sysl.crypto`](sysl-crypto/) | Cryptographic hashing: the SHA-2 family, SHA-1 and MD5, HMAC over any of them, and PBKDF2. |
 | [`sysl.debug`](sysl-debug/) | The error return trace: where a failure was made, and each `?` that handed it one frame further up on its way to the code that reported it. |
 | [`sysl.dma`](sysl-dma/) | Memory a device can reach by address, and the handover that makes it safe to share with one. |

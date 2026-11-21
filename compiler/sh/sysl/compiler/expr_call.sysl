@@ -1390,13 +1390,14 @@ end convert_to
 private convert_lanes(cx: &Analyzer, span: Span, t: TExpr, to: Type) -> TExpr
     val got = texpr_type(t)
     val source = repr(got) match
-        Array(n, a) ->
-            if can_be_lane(*a) && !is_quad(*a) then Some((n, *a, TExpr(t.span, TLanesAs(t, Vector(n, *a)))))
+        Array(n, a, term) ->
+            if can_be_lane(*a) && !is_quad(*a) then
+                Some((n, *a, TExpr(t.span, TLanesAs(t, Vector(n, *a, term)))))
             else None
-        Vector(n, a) -> Some((n, *a, t))
+        Vector(n, a, _) -> Some((n, *a, t))
         _ -> None
     val target = repr(to) match
-        Vector(m, b) -> Some((m, *b))
+        Vector(m, b, _) -> Some((m, *b))
         _ -> None
 
     // A scalar of the lane's own type is the splat the language writes implicitly at a binding or an
@@ -2659,6 +2660,9 @@ refused_field(cx: &Analyzer, span: Span, shown: string, fields: Buf[(string, Typ
             // Where `fields` is every field of a struct in its declared order, each is quoted as the
             // struct's declaration wrote it.
             val wanted = every_field_of.and_then(d -> field_spelling(cx, d, int(i), fields[i].1))
+
+            keep_value_clash(cx, given[i].span, s"'${fields[i].0}' of '$shown' is ${type_show(fields[i].1)}, " +
+                             s"but ${type_show(got)} was given", fields[i].1, got)
 
             return Some(cx.err(given[i].span, s"'${fields[i].0}' of '$shown' is " +
                                s"${spelled_show(fields[i].1, wanted)}, but " +
@@ -4098,6 +4102,9 @@ refused_argument(cx: &Analyzer, span: Span, quoted: string, params: Buf[Param],
                                  then Some(receiver.unwrap().spelled)
                                  else None
 
+                    keep_value_clash(cx, at, s"'${params[i].name}' of $shown is ${type_show(wants[i])}, " +
+                                     s"but ${type_show(got)} was given", wants[i], got)
+
                     return Some(cx.err(at, s"'${params[i].name}' of $shown is " +
                                        s"${spelled_show(wants[i], wanted)}, but " +
                                        s"${spelled_show(got, texpr_spelling(cx, ts[i]))} was given" +
@@ -4597,7 +4604,7 @@ private tail_peeled(t: Type) -> Type = t match
 // `c_aggregate` without the layout, which analysis does not have.
 private tail_aggregate(t: Type) -> bool = underlying(t) match
     Struct(_) -> true
-    Array(_, _) -> true
+    Array(_, _, _) -> true
     Slice(_, _) -> true
     Str -> true
     VaList -> true

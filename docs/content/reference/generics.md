@@ -2070,7 +2070,8 @@ to be one value.
 ### What may be written with `N`
 
 `N` may be used as an array's length, and a body may compute with it freely. A computed result may
-not be carried into a **type**:
+not be carried into a **signature** — an array's length, a vector's lane count, or a type's value
+argument:
 
 ```sysl
 f[const N: usize](xs: [N]int) -> [N + 1]int = xs
@@ -2082,8 +2083,150 @@ print(1)
 the length 'N + 1' computes with the value parameter 'N'
 ```
 
-Deciding that `N + 1` and `1 + N` are one type, or that `2 * N` and `N + N` are, requires type-level
+```sysl
+struct Buf[const N: usize]
+    used: usize
+
+grow[const N: usize](b: Buf[N]) -> Buf[N + 1] = Buf(b.used)
+
+print(1)
+```
+
+```error
+the value argument 'N + 1' computes with the value parameter 'N'
+```
+
+A signature's types are what a call is solved from, and solving `N` out of `Buf[N + 1]` is type-level
 arithmetic, which sysl does not provide.
+
+**Inside its own declaration a value parameter is a symbol.** `Buf[N]` and `Buf[M]` are two types
+there, just as `Box[T]` and `Box[U]` are, and a struct's value argument computed in a field or a body
+— `Buf[N + 1]` — is that computation over the symbols. Two such arguments are one type when they are
+the same polynomial: `N + M` is `M + N`, `2 * N` is `N + N`, `N * (M + 1)` is `N * M + N`, and a
+division by a constant that divides every coefficient is exact (`(2 * N + 4) / 2` is `N + 2`). Any
+other operation over a parameter (`N / 2` alone, `!B`) is compared as written.
+
+So a body that yields what its signature does not name is wrong for every instantiation, and it is
+refused at the declaration, whether or not anything calls it:
+
+```sysl
+struct Buf[const N: usize]
+    used: usize
+
+wrong[const N: usize](b: Buf[N]) -> Buf[N] = Buf[N + 1](b.used)
+
+print(1)
+```
+
+```error
+function 'wrong' should return Buf[N], but its body yields Buf[N + 1] — the two differ by 1 for every N
+```
+
+```sysl
+struct Buf[const N: usize]
+    used: usize
+
+cast[const N: usize, const M: usize](b: Buf[N]) -> Buf[M] = b
+
+print(1)
+```
+
+```error
+function 'cast' should return Buf[M], but its body yields Buf[N] — 'N' and 'M' are different value parameters
+```
+
+The same holds where a local's declared type, an argument or a field meets such a value, and a
+parameter is never the constant one instantiation might choose: `-> Buf[3] = b` is refused with
+*"'N' stands for every value an instantiation chooses, not only 3"*. Forms that agree are accepted,
+and each instantiation computes its own:
+
+```sysl
+struct Buf[const N: usize]
+    used: usize
+
+    room(self) -> usize = N - self.used
+
+struct Pair[const N: usize, const M: usize]
+    inner: Buf[N + M]
+
+join[const N: usize, const M: usize](b: Buf[N]) -> Pair[N, M] = Pair(Buf[M + N](b.used))
+
+print(join[2, 3](Buf[2](1)).inner.room())
+```
+
+```output
+4
+```
+
+**An array's length and a vector's lane count are symbols there too.** `[N]int` and `[M]int` are two
+types inside the declaration, and neither is `[3]int`, so a result, a local's declared type, an
+argument or a field that meets the wrong one is refused at the declaration, called or not:
+
+```sysl
+cast[const N: usize, const M: usize](xs: [N]int) -> [M]int = xs
+
+print(1)
+```
+
+```error
+function 'cast' should return [M]int, but its body yields [N]int — 'N' and 'M' are different value parameters
+```
+
+```sysl
+f[const N: usize]() -> usize
+    val ys: [N]int = [1, 2, 3]
+    ys.len
+
+print(1)
+```
+
+```error
+cannot initialize 'ys': declared [N]int but the value is [3]int — 'N' stands for every value an instantiation chooses, not only 3
+```
+
+A vector's lane count is held the same way (`<N>f32` is not `<M>f32`, and a four-lane literal does
+not fill `<N>f32`). What carries the length carries the symbol: a repeat `[x; N]` is an `[N]T`, a
+lane-wise comparison of two `<W>f32` is a `<W>bool`, and a generic called with an `[N]T` solves its
+own parameter to `N`, so its result is an `[N]T` again:
+
+```sysl
+same[const M: usize](xs: [M]int) -> [M]int = xs
+
+fill[const N: usize](x: int) -> [N]int = same([x; N])
+
+print(fill[3](7)[2])
+```
+
+```output
+7
+```
+
+A length the reading cannot follow — one a `shuffle` or a `lookup` makes, or a written `[0]T` —
+stays a number there, and each instantiation answers for it.
+
+**A type parameter held in a type is a symbol in the same way.** A `Box[T]` where a `Box[U]` was
+declared is refused at the declaration, in every position above, and a call at `[int, int]` — where
+the two happen to be one type — does not make the body right:
+
+```sysl
+struct Box[T]
+    v: T
+
+cast[T, U](b: Box[T]) -> Box[U] = b
+
+print(cast[int, int](Box(1)).v)
+```
+
+```error
+function 'cast' should return Box[U], but its body yields Box[T] — 'T' and 'U' are different type parameters
+```
+
+A **bare** `T` where `U` was asked for is left to each instantiation, because one may convert the
+other: `widen[T: Integer, U: Integer](x: T) -> U = x` widens at `[u8, int]` and is refused at
+`[int, u8]`. Nothing converts a `Box[u8]`, an `Option[u8]`, a `[2]u8` or a `&u8` into its `int`
+twin, which is why under a type the two must be one. A parameter against a concrete type
+(`-> Box[int] = b`) and an associated type a bound fixes (`S::Error` with `S: Source[Error = E]`)
+are also answered by the instantiations, which know what they are.
 
 Writing a **type** parameter where a length belongs is refused for the opposite reason, since a
 length is a value:
@@ -2748,7 +2891,7 @@ takes the place of expansion, in the one direction the catalog needs.
 
 | absent | why, and what to write instead |
 |---|---|
-| type-level arithmetic (`[N + 1]T`) | a value parameter may be used as a length but not computed with in a type; deciding that `N + 1` and `1 + N` are one type would need type-level arithmetic |
+| type-level arithmetic in a signature (`-> [N + 1]T`, `Buf[N + 1]`) | a value parameter may be named in a signature but not computed with there, since a call is solved from it; a body and a field may compute a struct's value argument, compared by its polynomial |
 | pack expansion (`f(..a)`, `(..A, int)`) | a pack may be matched and walked, not spread into an argument list or appended to; use `for const` instead |
 | higher-kinded parameters (`F[_]`) | **excluded** by design: they push inference toward undecidability, and traits and bounds already serve abstraction over containers |
 

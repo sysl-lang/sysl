@@ -95,6 +95,10 @@ private is_library_result(t: Type) -> bool = repr(t) match
 // supplies a type, this is the analysis it always was.
 if_expr(cx: &Analyzer, span: Span, cond: Expr, then_body: Buf[Stmt],
         else_body: Option[Buf[Stmt]], expected: Option[Type], discarded: bool) -> TExpr
+    // The branches are read under the condition, which `chosen_by_constant` asks of a trap only
+    // where the trap lies outside the condition itself.
+    cx.choices.push(cond)
+
     val else_guesses = else_body.is_some() && guessing(cx, else_body.unwrap())
     val then_guesses = guessing_in(cx, then_body, then_scope(cond))
     val else_leans = else_body.is_some() && leaning(cx, else_body.unwrap())
@@ -188,6 +192,7 @@ if_expr(cx: &Analyzer, span: Span, cond: Expr, then_body: Buf[Stmt],
 
     val ty = if_type(cx, span, then_block, t_else)
 
+    cx.choices.truncate(cx.choices.len() - 1)
     TExpr(span, TIf(tc, then_block, t_else, ty))
 end if_expr
 
@@ -521,8 +526,12 @@ match_expr(cx: &Analyzer, span: Span, scrut: Expr, arms: Buf[MatchArm], expected
     cx.pattern_roots = pattern_view_roots(cx, ts)
 
     val said = cx.an.complaints()
+
+    cx.choices.push(scrut)
+
     val tarms = analyze_arms(cx, texpr_type(ts), arms, expected, discarded)
 
+    cx.choices.truncate(cx.choices.len() - 1)
     cx.pattern_roots = held
 
     // A pattern that was refused stands as a wildcard, so the arms are only read for dead ones when
@@ -1599,7 +1608,7 @@ private iterated(cx: &Analyzer, span: Span, seq: TExpr, name: string, body: Buf[
 end iterated
 
 private walked_by_index(t: Type) -> bool = t match
-    Array(_, _) -> true
+    Array(_, _, _) -> true
     Slice(_, _) -> true
     _ -> false
 
@@ -1736,7 +1745,7 @@ end option_of
 // What one turn of a `for` binds, or nothing where the value is not something a loop walks.
 private walked_element(cx: &Analyzer, span: Span, seq: TExpr, iter: Expr, name: string) -> Option[Type]
     texpr_type(seq) match
-        Array(_, elem) -> Some(*elem)
+        Array(_, elem, _) -> Some(*elem)
         Slice(elem, _) -> Some(*elem)
 
         // A string has two granularities and no reason to prefer one silently, so which one is
@@ -1817,7 +1826,7 @@ private answers_a_walk(cx: &Analyzer, seq: TExpr, mname: string, iterate: Option
     if refused then return false
 
     t match
-        Array(_, _) -> true
+        Array(_, _, _) -> true
         Slice(_, _) -> true
         Unknown -> false
         _ ->
@@ -1989,7 +1998,7 @@ const_for_expr(cx: &Analyzer, span: Span, name: string, iter: Expr, body: Buf[St
     while v <= last
         var one: Buf[Binding] = buf()
 
-        one.push(Binding(name, ConstArg(from_int(v), usize_type(word_bits(cx)), false)))
+        one.push(Binding(name, ConstArg(from_int(v), usize_type(word_bits(cx)), false, buf())))
         each.push(one)
         v = v + 1
 
