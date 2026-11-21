@@ -634,6 +634,147 @@ scope_handles_in_heap_storage() -> unit
 
     assert_eq(got, 23)
 
+// An answer that is not `Share` -- a string, a struct or `Option` holding one, a `Buf`, a `&T` -- is
+// moved out of the thread's slot by `join`, which is the one owner left once the thread has ended.
+
+@test("sjm_ a scoped thread's join answers a string its closure built")
+sjm_join_answers_a_string() -> unit
+    val n = 7
+    val got = scope((s) -> s.spawn(() -> f"worker-$n").join())
+
+    assert_eq(got, "worker-7")
+    assert_eq(got + "!", "worker-7!")
+
+@test("sjm_ a Share answer is not moved out: every join of the handle answers the same value")
+sjm_share_answer_joined_twice() -> unit
+    val n = 5
+    val (a, b) = scope((s) ->
+        val h = s.spawn(() -> (n * 2, n + 1))
+
+        (h.join(), h.join()))
+
+    assert_eq(a, (10, 6))
+    assert_eq(b, (10, 6))
+
+private struct SjmNamed
+    name: string
+    n: int
+
+@test("sjm_ a scoped thread's join answers a struct holding a string")
+sjm_join_answers_a_struct_of_a_string() -> unit
+    val got = scope((s) -> s.spawn(() -> SjmNamed(f"n${3 * 4}", 12)).join())
+
+    assert_eq(got.name, "n12")
+    assert_eq(got.n, 12)
+
+@test("sjm_ a scoped thread's join answers a Buf the caller then owns and grows")
+sjm_join_answers_a_buf() -> unit
+    var got = scope((s) -> s.spawn(() ->
+        var b: Buf[u8] = buf()
+        for i in 0..<5 do b.push(u8(i * 2))
+        b).join())
+
+    got.push(10)
+    assert_eq(got.len(), 6)
+    assert_eq(got[0], 0)
+    assert_eq(got[4], 8)
+    assert_eq(got[5], 10)
+
+@test("sjm_ a scoped thread's join answers an Option of a string, Some and None alike")
+sjm_join_answers_an_option_of_a_string() -> unit
+    val n = 2
+    val (some, none) = scope((s) ->
+        val a = s.spawn(() -> if n > 1 then Some(f"x$n") else None)
+        val b = s.spawn(() -> if n > 5 then Some(f"y$n") else None)
+
+        (a.join(), b.join()))
+
+    assert_eq(some, Some("x2"))
+    assert_eq(none, None)
+
+@test("sjm_ strings answered by several scoped threads are joined in the order asked")
+sjm_join_several_strings_in_order() -> unit
+    val got = scope((s) ->
+        var hs: Buf[ScopedThread[string]] = buf()
+
+        for i in 0..<6
+            hs.push(s.spawn(() -> f"<$i>"))
+
+        var all = ""
+        var k = hs.len()
+
+        while k > 0
+            k -= 1
+            all = all + hs[k].join()
+
+        all)
+
+    assert_eq(got, "<5><4><3><2><1><0>")
+
+private var sjm_tracked_drops: Atomic[int] = Atomic(0)
+
+private struct SjmTracked
+    id: int
+
+impl Drop for SjmTracked
+    drop(self)
+        sjm_tracked_drops.add(1)
+
+@test("sjm_ a &T answered by a scoped thread is the caller's, and is dropped exactly once")
+sjm_join_answers_a_ref_dropped_once() -> unit
+    val id = scope((s) ->
+        val t = s.spawn(() -> SjmTracked(41)).join()
+
+        assert_eq(sjm_tracked_drops.load(), 0)
+        t.id + 1)
+
+    assert_eq(id, 42)
+    assert_eq(sjm_tracked_drops.load(), 1)
+
+private var sjm_unjoined_drops: Atomic[int] = Atomic(0)
+
+private struct SjmUnjoined
+    id: int
+
+impl Drop for SjmUnjoined
+    drop(self)
+        sjm_unjoined_drops.add(1)
+
+@test("sjm_ a &T no handle joins is dropped exactly once, with its slot, after the scope joins the thread")
+sjm_unjoined_ref_dropped_once() -> unit
+    scope((s) ->
+        s.spawn(() -> SjmUnjoined(1))
+        s.spawn(() -> SjmUnjoined(2))
+        0)
+
+    assert_eq(sjm_unjoined_drops.load(), 2)
+
+@test("sjm_ a string's handle joined on a sibling thread moves the string to the sibling")
+sjm_string_joined_by_a_sibling() -> unit
+    val got = scope((s) ->
+        val h = s.spawn(() -> f"from-${20 + 1}")
+        val k = s.spawn(() -> h.join().len)
+
+        k.join())
+
+    assert_eq(got, 7)
+
+@test("sjm_ a second join of a string's handle stops the program, the string being the first joiner's",
+      should_trap: "moved out by an earlier join")
+sjm_second_join_of_a_string_traps()
+    scope((s) ->
+        val h = s.spawn(() -> f"once-${1}")
+
+        assert_eq(h.join(), "once-1")
+        h.join())
+
+@test("sjm_ a scoped thread whose closure panics stops the program, as every panic does",
+      should_trap: "sjm worker gave up")
+sjm_panicking_closure_traps()
+    val n = 3
+
+    scope((s) -> s.spawn(() -> if n < 0 then f"left-$n" else panic("sjm worker gave up")).join())
+
 private slot_add(p: *Atomic[int])
     p.add(1)
 
