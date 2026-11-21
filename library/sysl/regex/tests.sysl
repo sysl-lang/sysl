@@ -1,0 +1,303 @@
+module sysl.regex
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.rand.{Rng, rng}
+import sysl.text.{is_char_boundary, str_builder, str_view}
+
+// The lazy DFA (`dfa.lsysl`) against the Pike VM (`vm.lsysl`), which stays the engine of record:
+// every answer the DFA gives has to be the VM's answer, spans and groups alike, from every starting
+// position. A test here reads the DFA's own verdict (`dfa_find`) as well as the `Regex` surface, so
+// a quiet fall back to the VM -- which would make the surface right and the DFA untested -- fails
+// as loudly as a wrong span.
+
+rxs_show(o: Option[[]int]) -> string = o match
+    None -> "none"
+    Some(sl) ->
+        var out = str_builder()
+
+        for i in 0..<sl.len
+            if i > 0 then out.push(" ")
+
+            out.push(s"${sl[i]}")
+
+        out.finish()
+
+// The DFA for a pattern, built the way `regex` builds it, kept so a test can look at its cache.
+private struct RxsEngine
+    prog: Program
+    fwd: &Dfa
+    rev: &Dfa
+
+private rxs_engine(p: string) -> RxsEngine
+    val t = parse_counted(p).unwrap()
+    val prog = compile(t.0, t.1).unwrap()
+
+    RxsEngine(prog, new_dfa(prog, false), new_dfa(compile_reverse(t.0).unwrap(), true))
+
+private rxs_dfa_says(e: RxsEngine, s: string, from: usize) -> string =
+    dfa_find(e.prog, e.fwd, e.rev, s, from) match
+        Spans(sl) -> rxs_show(Some(sl))
+        Nothing -> "none"
+        AskTheVm -> "asked the vm"
+
+// The VM's answer and the DFA's from every position a search may start at, plus `is_match`. Answers
+// the number of positions that disagreed, so a random sweep can count; the fixed tests assert zero.
+rxs_disagreements(p: string, s: string) -> int
+    val e = rxs_engine(p)
+    val re = regex(p).unwrap()
+    var bad = 0
+
+    for from in 0..(s.len)
+        if from < s.len && !is_char_boundary(s.bytes[from]) then continue
+
+        val want = rxs_show(exec_from(e.prog, s, from))
+        val got = rxs_dfa_says(e, s, from)
+        val surface = re.find_at(s, from) match
+            Some(m) -> rxs_show(Some(m.slots))
+            None -> "none"
+
+        if got != want || surface != want
+            print(s"/$p/ on \"$s\" from $from: vm $want, dfa $got, find_at $surface")
+            bad += 1
+
+    if re.is_match(s) != exec_from(e.prog, s, 0).is_some()
+        print(s"/$p/ on \"$s\": is_match disagrees")
+        bad += 1
+
+    bad
+
+rxs_agree(cases: []const (string, string))
+    var bad = 0
+
+    for (p, s) in cases
+        bad += rxs_disagreements(p, s)
+
+    assert_eq(bad, 0)
+
+// What the DFA answers from position 0, spelled out, for the cases where the expected answer is
+// worth reading in the test itself rather than only being equal to the VM's.
+rxs_spans(p: string, s: string) -> string = rxs_dfa_says(rxs_engine(p), s, 0)
+
+
+@test("a literal and an alternation of literals, found where they are")
+rxs_literals()
+    assert_eq(rxs_spans("agggtaaa|tttaccct", "cagggtaaatt"), "1 9")
+    assert_eq(rxs_spans("agggtaaa|tttaccct", "ctttaccctt"), "1 9")
+    assert_eq(rxs_spans("agggtaaa|tttaccct", "agggtaa"), "none")
+    rxs_agree([("abc", "xxabcyyabc"), ("agggtaaa|tttaccct", "agggtaaatttaccctagggtaaa"), ("a", ""), ("ab", "a")])
+
+@test("the longest alternative wins, and an earlier start beats a longer later one")
+rxs_leftmost_longest()
+    assert_eq(rxs_spans("a|ab|abc", "abcd"), "0 3")
+    assert_eq(rxs_spans("abc|a", "abc"), "0 3")
+    assert_eq(rxs_spans("x|abcd", "zabcdx"), "1 5")
+    assert_eq(rxs_spans("bcd|abcdef|ab", "abcdx"), "0 2")
+    rxs_agree([("a|ab", "xxabab"), ("ab|a", "ab"), ("b|abc", "abd"), ("aa|a", "aaa"), ("ab|bcd", "abcd")])
+
+@test("bracket expressions: ranges, negation, named classes, and an upper-and-lower pair")
+rxs_classes()
+    assert_eq(rxs_spans("[cgt]gggtaaa", "aagggtaaatgggtaaa"), "9 17")
+    assert_eq(rxs_spans("[^a]+", "aabca"), "2 4")
+    assert_eq(rxs_spans("[[:digit:]]+", "ab123cd"), "2 5")
+    assert_eq(rxs_spans("[aA][bB]", "xAbab"), "1 3")
+    rxs_agree([("[a-c]+", "zzabcabz"), ("[^>]*>", "a<b>c"), ("<[^>]*>", "a<b>c<>d<"), ("[[:space:]]", "a b"),
+               ("[[:alpha:][:digit:]]+", "--a1b2--"), ("\\|[^|][^|]*\\|", "a|b|c||d|ef|"),
+               ("tHa[Nt]", "tHaNtHattHa"), ("aND|caN|Ha[DS]|WaS", "aNDcaNHaSWaSHaD")])
+
+@test("the dot takes any character, a newline included")
+rxs_dot()
+    assert_eq(rxs_spans("a.c", "a\nc"), "0 3")
+    rxs_agree([("a.c", "abcadcaéc"), (".", ""), ("..", "é"), (">.*\n", ">x\ny\n"), (">[^\n]*\n|\n", ">one\nacgt\nac\n")])
+
+@test("the anchors speak about the whole text, whatever position the search starts from")
+rxs_anchors()
+    assert_eq(rxs_spans("^a", "aa"), "0 1")
+    assert_eq(rxs_spans("a$", "aba"), "2 3")
+    assert_eq(rxs_spans("^$", ""), "0 0")
+    assert_eq(rxs_spans("$", "ab"), "2 2")
+    assert_eq(rxs_dfa_says(rxs_engine("^a"), "aa", 1), "none")
+    rxs_agree([("^a", "aba"), ("a$", "aba"), ("^abc$", "abc"), ("^abc$", "xabc"), ("^$", "a"), ("^", "ab"),
+               ("(^a|b)+", "aab"), ("a|$", "bb"), ("b*$", "abb"), ("^b*", "bba"), ("$^", ""), ("a$|^b", "ba"),
+               ("(a$)*", "aa"), ("x*$", "")])
+
+@test("a pattern that can match empty matches at every position, as the VM does")
+rxs_empty_matches()
+    assert_eq(rxs_spans("a*", "baaa"), "0 0")
+    assert_eq(rxs_spans("", "abc"), "0 0")
+    assert_eq(rxs_dfa_says(rxs_engine("a*"), "baaa", 1), "1 4")
+    assert_eq(rxs_dfa_says(rxs_engine("x*"), "ab", 2), "2 2")
+    rxs_agree([("a*", "bab"), ("x*", ""), ("", ""), ("a?", "ba"), ("(a*)*", "b"), ("a|", "c"), ("(|a)+", "aa"),
+               ("a{0}", "bbb"), ("()", "ab")])
+
+@test("capture groups still come from the VM, run over the span the DFA found")
+rxs_captures()
+    assert_eq(rxs_spans("(a+)(b+)", "xaabbbc"), "1 6 1 3 3 6")
+    assert_eq(rxs_spans("(a)|(b)", "b"), "0 1 -1 -1 0 1")
+    assert_eq(rxs_spans("(ab)*", "ababab"), "0 6 4 6")
+    assert_eq(rxs_spans("(a|ab)(c|bcd)(d*)", "abcd"), "0 4 0 1 1 4 4 4")
+    rxs_agree([("(a)(b)?", "a"), ("(a*)b", "b"), ("((((a))))", "za"), ("(a(b(c(d))))", "abcd"),
+               ("(a|ab)(c|bcd)(d*)", "xabcdabcd"), ("(x*)", "ab"), ("(^a)|(b$)", "ab"), ("([^a]*)a", "bbba"),
+               ("(é+)(ü)", "aééüb")])
+
+@test("characters outside ASCII are one step each, and spans land on their boundaries")
+rxs_unicode()
+    assert_eq(rxs_spans("é+", "aééb"), "1 5")
+    assert_eq(rxs_spans("[é-ü]+", "aéñüb"), "1 7")
+    assert_eq(rxs_spans("[^a]", "aé"), "1 3")
+    rxs_agree([(".", "é"), ("..", "éü"), ("[^é]+", "éab"), ("a.b", "aéb"), ("é|ü", "xüé"), ("[[:alpha:]]", "é"),
+               ("[^[:alpha:]]", "é"), ("a*é", "aaéaé"), ("(é)*$", "ééé")])
+
+@test("matches that touch and matches that overlap are found as find_all finds them")
+rxs_adjacent_and_overlapping()
+    val re = regex("aa|a").unwrap()
+    val all = re.find_all("aaaaa")
+
+    assert_eq(all.len(), 3)
+    assert_eq(all[2].start(), 4)
+    assert_eq(regex("aba").unwrap().find_all("ababababa").len(), 2)
+    assert_eq(regex("a*").unwrap().find_all("bb").len(), 3)
+    rxs_agree([("aba", "ababababa"), ("aa|a", "aaaaa"), ("ab|ba", "ababa"), ("a*", "baab"), ("b*", "aaa")])
+
+// The surface's walking functions against the same walk done with the VM by hand: the rule for an
+// empty match is theirs, and the DFA must find every match in between.
+rxs_walk_with_vm(p: string, s: string) -> string
+    val prog = compile_pattern(p).unwrap()
+    var out = str_builder()
+    var at: usize = 0
+
+    loop
+        if at > s.len then break
+
+        exec_from(prog, s, at) match
+            None -> break
+            Some(sl) ->
+                out.push(s"${sl[0]}-${sl[1]} ")
+
+                if usize(sl[1]) > at then
+                    at = usize(sl[1])
+                else
+                    at = usize(sl[1]) + 1
+
+                    while at < s.len && !is_char_boundary(s.bytes[at])
+                        at += 1
+
+    out.finish()
+end rxs_walk_with_vm
+
+rxs_walk_with_regex(p: string, s: string) -> string
+    var out = str_builder()
+    val ms = regex(p).unwrap().find_all(s)
+
+    for i in 0..<ms.len()
+        out.push(s"${ms[i].start()}-${ms[i].end()} ")
+
+    out.finish()
+
+@test("find_all, replace_all and split walk the text exactly as the VM would")
+rxs_walks()
+    val cases = [("agggtaaa|tttaccct", "agggtaaatttaccctxagggtaaa"), ("a*", "baaacaa"), ("x*", "éaé"),
+                 (">[^\n]*\n|\n", ">head\nacgt\nacgt\n>two\nac"), ("<[^>]*>", "a<1><22>b<>"), ("$", "ab"),
+                 ("^a*", "aab"), ("a|b|", "acb")]
+
+    for (p, s) in cases
+        assert_eq(rxs_walk_with_regex(p, s), rxs_walk_with_vm(p, s))
+
+    assert_eq(regex(">[^\n]*\n|\n").unwrap().replace_all(">head\nac\ngt\n>two\nta", ""), "acgtta")
+    assert_eq(regex("(a)(b)").unwrap().replace_all("xabyab", "\\2\\1"), "xbayba")
+    assert_eq(regex("tHa[Nt]").unwrap().replace_all("tHaNxtHat", "<4>"), "<4>x<4>")
+
+    val parts = regex(",+").unwrap().split("a,,b,c")
+
+    assert_eq(parts.len(), 3)
+    assert_eq(parts[1], "b")
+
+@test("the patterns that are exponential to a backtracking engine are linear here")
+rxs_pathological()
+    var hay = ""
+
+    for _ in 0..<3000 do hay += "a"
+
+    assert_eq(rxs_dfa_says(rxs_engine("(a|a)*b"), hay, 0), "none")
+    assert_eq(rxs_dfa_says(rxs_engine("(a+a+)+b"), hay, 0), "none")
+    assert_eq(rxs_dfa_says(rxs_engine("(a*)*b"), hay, 0), "none")
+    assert(regex("(a|aa)*$").unwrap().is_match(hay), "the whole run is a match")
+    assert_eq(rxs_dfa_says(rxs_engine("a{100}"), hay, 2900), "2900 3000")
+    assert_eq(rxs_dfa_says(rxs_engine("a{100}"), hay, 2901), "none")
+    rxs_agree([("(a|a)*b", "aaaaaaaaaaaaaaaa"), ("(a*)*b", "aaaaaaaab"), ("(x+x+)+y", "xxxxxxxxxxy")])
+
+@test("a pattern whose states outnumber the cache throws them away and still answers the VM's answer")
+rxs_cache_overflow()
+    // The ninth character from the end decides a match, so every 2^9 window of the text is its own
+    // state and the forward cache must be emptied and rebuilt many times over.
+    val p = "(a|b)*a(a|b)(a|b)(a|b)(a|b)(a|b)(a|b)(a|b)(a|b)(a|b)(a|b)(a|b)c"
+    var g = rng(11, 3)
+    var s = ""
+
+    for _ in 0..<6000
+        s += if g.next_u32() % 2 == 0 then "a" else "b"
+
+    s += "c"
+
+    val e = rxs_engine(p)
+
+    assert_eq(rxs_dfa_says(e, s, 0), rxs_show(exec_from(e.prog, s, 0)))
+    assert(e.fwd.flushes > 0, "the cache never filled, so this tested nothing")
+
+@test("a search starting inside a character, or over bytes that are not text, is answered by the VM")
+rxs_falls_back_to_the_vm()
+    val e = rxs_engine("é")
+
+    assert_eq(rxs_dfa_says(e, "aé", 2), "asked the vm")
+
+    val inside = regex("é").unwrap().find_at("aé", 2) match
+        Some(m) -> rxs_show(Some(m.slots))
+        None -> "none"
+
+    assert_eq(inside, rxs_show(exec_from(e.prog, "aé", 2)))
+
+    var bytes: []u8 = [u8('a'), 128, u8('a')]
+    val bad = str_view(bytes)
+    val dot = rxs_engine("a.")
+
+    assert_eq(rxs_dfa_says(dot, bad, 0), "asked the vm")
+
+    val surface = regex("a.").unwrap().find_at(bad, 0) match
+        Some(m) -> rxs_show(Some(m.slots))
+        None -> "none"
+
+    assert_eq(surface, rxs_show(exec_from(dot.prog, bad, 0)))
+
+// A random pattern over a small alphabet, every construct the parser knows reachable from it.
+val rxs_atoms = ["a", "b", "c", ".", "[ab]", "[^a]", "^", "$", "é", "(a)", "(b|)", "x", "[[:alpha:]]"]
+
+rxs_pattern(g: *Rng, depth: int) -> string
+    val k = g.next_u32() % 10
+
+    if depth > 3 || k < 3 then return rxs_atoms[usize(g.next_u32() % 13)]
+
+    if k < 5 then return rxs_pattern(g, depth + 1) + rxs_pattern(g, depth + 1)
+    if k < 6 then return rxs_pattern(g, depth + 1) + "|" + rxs_pattern(g, depth + 1)
+    if k < 7 then return "(" + rxs_pattern(g, depth + 1) + ")*"
+    if k < 8 then return "(" + rxs_pattern(g, depth + 1) + ")+"
+    if k < 9 then return "(" + rxs_pattern(g, depth + 1) + ")?"
+
+    "(" + rxs_pattern(g, depth + 1) + "){1,2}"
+end rxs_pattern
+
+@test("random patterns over random text: the DFA and the VM agree from every starting position")
+rxs_differential()
+    var g = rng(2026, 11)
+    val letters = ["a", "b", "c", "é", "\n", "x"]
+    var bad = 0
+
+    for _ in 0..<1500
+        val p = rxs_pattern(&g, 0)
+        var s = ""
+
+        for _ in 0..<(g.next_u32() % 10)
+            s += letters[usize(g.next_u32() % 6)]
+
+        bad += rxs_disagreements(p, s)
+
+    assert_eq(bad, 0)
