@@ -208,6 +208,7 @@ plus0_locals(e: *Emit, f: TFunc, owned: Set[string], jumps: bool) -> Set[string]
     var out: Set[string] = set()
     val g: &Gather = Gather(buf(), map(), set(), buf(), buf(), buf())
 
+    e.held_args = held_args_for(f, owned)
     gather_body(e, g, f)
 
     if g.cands.is_empty() then return out
@@ -1096,3 +1097,424 @@ private borrowed_from(b: Option[Back]) -> string
 
     if keys == "" then s"borrowed from $roots" else s"borrowed from $roots through $keys"
 end borrowed_from
+
+// -- held arguments ----------------------------------------------------------------------------------
+
+// **An argument read out of storage needs no count of its own for its call** (`docs/design/
+// borrow-inference.md` §4.4, decision 10; `tests_bla_held_args.sysl`).
+//
+// A caller takes a guarantee count for an argument its frame does not hold -- a field or an element
+// read through a reference (`held`) -- only because the call might overwrite the storage the value was
+// read out of and let it go. Where the argument is backed (§3) -- read along edge keys from roots the
+// frame holds for the whole call: a local or parameter whose slot nothing reaches, a statement's
+// temporary, or what a pointer parameter points at -- and neither the callee's edge-write summary
+// (`edge_writes`, which follows everything it calls) nor the arguments worked out after it meet one
+// of those keys, read a count of a type on the chain, or run code nobody can see, the edge still
+// holds the value when the callee reads it, so the count could never have been the one keeping it
+// alive. Leaving it out changes nothing a program prints or when anything is freed.
+//
+// **Only a borrowed parameter of a direct call** is asked: one the callee owns is handed a count,
+// which it keeps (the count is genuine); an `async` callee's task and an `@abandons` callee outlive
+// the frame; and a call through a table, a closure or a function value, or into C, has no summary.
+// An argument crossing by address is a by-value promise about every byte, not only the counted ones,
+// so it keeps today's snapshot.
+//
+// **A place call on the argument's spine is read with no count** (`place_entry.sysl`): its answer is
+// backed by its argument along the path its one-expression body names (`place_back`), and the call is
+// recorded for `gen_place_call` in `HeldArgs.lent_calls` while the argument is worked out. A call that
+// answers a value of its own is a root: the statement's temporary holds it to after the call.
+//
+// **A pointer parameter's pointee is a root** only where nothing in the window can write an edge or
+// hand over a value whose type reaches the pointee's: unlike a borrowed reference, the caller holds no
+// count of it, so what keeps it alive is storage this frame cannot name.
+
+// What the body being written lets an argument stand on: whether it was asked (`ready`, never in a
+// task's body), the names no root may be and the `ref`-bound ones, its parameters, the pointer ones,
+// the ones it owns, and the place calls of the argument being worked out that take no count.
+struct HeldArgs
+    ready: bool
+    unrooted: Set[string]
+    aliases: Set[string]
+    params: Set[string]
+    pointers: Set[string]
+    owned: Set[string]
+    lent_calls: Buf[(Span, string)]
+end HeldArgs
+
+held_args_none() -> HeldArgs = HeldArgs(false, set(), set(), set(), set(), set(), buf())
+
+private held_args_for(f: TFunc, owned: Set[string]) -> HeldArgs
+    val aliases = ref_names(f)
+    var params: Set[string] = set()
+    var pointers: Set[string] = set()
+
+    for p in f.params
+        params.add(p.0)
+
+        repr(p.1) match
+            Ptr(_, _) -> pointers.add(p.0)
+            _ -> ()
+
+    HeldArgs(true, unrootable(f, aliases), aliases, params, pointers, owned, buf())
+end held_args_for
+
+// Whether the place call to `name` at `at` is on the spine of an argument held for its call.
+lent_place_call(e: *Emit, at: Span, name: string) -> bool
+    for item in e.held_args.lent_calls
+        if item.0 == at && item.1 == name then return true
+
+    false
+end lent_place_call
+
+// What one argument's backing gathers beside the roots and keys: the types pointer roots point at,
+// the place calls read with no count, and what the call's arguments assign.
+private struct ArgWalk
+    pointees: Buf[Type]
+    calls: Buf[(Span, string)]
+    written: Set[string]
+end ArgWalk
+
+private temp_back() -> Back = Back(set(), buf(), set(), false)
+
+// **The `i`th argument of a direct call to `callee` held for the call with no count of its own**:
+// the place calls on its spine to read with none, or `None` where it keeps the guarantee count.
+// `borrows` is whether the parameter is one the callee borrows. Where `--explain-borrows` is on, an
+// argument read through storage gets its line either way.
+held_backed(e: *Emit, args: Buf[TExpr], i: usize, callee: string, written: Set[string],
+            borrows: bool) -> Option[Buf[(Span, string)]]
+    if !e.held_args.ready then return None
+
+    val w: &ArgWalk = ArgWalk(buf(), buf(), written)
+    val b = arg_back(e, w, args[i])?
+
+    // A value with no edge between it and its roots is what `held` already judges.
+    if b.keys.is_empty() && w.pointees.is_empty() then return None
+
+    val why = arg_refusal(e, w, b, args, i, callee, borrows)
+
+    if explaining_borrows() then note_argument(e, args[i], callee, why)
+
+    if why != "" then None else Some(w.calls)
+end held_backed
+
+// Where an argument's value comes from at the moment it is read, or `None` where it is not read out of
+// storage the frame can stand on. Only the spine is followed: a field, a dereference, an element at an
+// index that changes nothing, a place call; anything that arrives with a count is a root of its own.
+private arg_back(e: *Emit, w: &ArgWalk, x: TExpr) -> Option[Back] = *x.kind match
+    TLoad(name, _) ->
+        if e.held_args.unrooted.has(name) || !held_unless(e, x, w.written) then None else Some(back_root(name))
+    TDeref(operand, _) -> repr(texpr_type(operand)) match
+        Ref(_, sync) ->
+            if sync then return None
+
+            arg_back(e, w, operand).map(b -> Back(b.roots, b.keys, b.named, false))
+        Ptr(inner, _) -> pointer_back(e, w, operand, *inner)
+        _ -> None
+    TField(r, i, _) ->
+        val b = arg_back(e, w, r)?
+
+        if b.frame then Some(b) else field_key(texpr_type(r), i).map(k -> back_key(b, k))
+    TIndex(r, index, _) ->
+        if !changes_nothing(index) then return None
+
+        repr(texpr_type(r)) match
+            Array(_, _, _) -> arg_back(e, w, r)
+            Slice(elem, _) -> arg_back(e, w, r).map(b -> back_key(b, slot_key(*elem)))
+            _ -> None
+    TCall(name, args, _, _) -> call_back(e, w, x, name, args)
+    TVCall(_, _, _, _, _) -> Some(temp_back())
+    TCallPtr(_, _, _, _) -> Some(temp_back())
+    TBox(_, _) -> Some(temp_back())
+    _ -> None
+
+// What a pointer parameter points at, as a root: nothing in this frame counts it.
+private pointer_back(e: *Emit, w: &ArgWalk, operand: TExpr, pointee: Type) -> Option[Back] = *operand.kind match
+    TLoad(name, _) ->
+        if !e.held_args.pointers.has(name) || e.held_args.unrooted.has(name) || !held_unless(e, operand, w.written) then
+            return None
+
+        w.pointees.push(underlying(pointee))
+        Some(Back(back_root(name).roots, buf(), set(), false))
+    _ -> None
+
+// A call on the spine: read through its place entry where the call will use one and its body's place
+// is backed, the value the statement's temporary holds otherwise.
+private call_back(e: *Emit, w: &ArgWalk, x: TExpr, name: string, args: Buf[TExpr]) -> Option[Back]
+    val c = place_call_target(e, name, args) match
+        Some(found) -> found
+        None -> return Some(temp_back())
+
+    val mark = w.calls.len()
+    val inner = arg_back(e, w, args[c.1])
+
+    if inner.is_some()
+        var env: Buf[(string, Back)] = buf()
+
+        env.push((c.0.params[c.1].0, inner.unwrap()))
+
+        val b = place_back(e, c.0.body.result.unwrap(), env)
+
+        if b.is_some()
+            w.calls.push((x.span, name))
+            return b
+    end if
+
+    while w.calls.len() > mark
+        w.calls.pop()
+
+    Some(temp_back())
+end call_back
+
+// The backing of a place body's answer, its parameters' backings in `env` (`place_entry.sysl`'s
+// `place_shape`): a field chain, an element of a fixed array, a referent, a payload a `match` binds,
+// or another place call.
+private place_back(e: *Emit, x: TExpr, env: Buf[(string, Back)]) -> Option[Back] = *x.kind match
+    TLoad(name, _) ->
+        var k = env.len()
+
+        while k > 0
+            k -= 1
+
+            if env[k].0 == name then return Some(env[k].1)
+
+        None
+    TField(r, i, _) ->
+        val b = place_back(e, r, env)?
+
+        if b.frame then Some(b) else field_key(texpr_type(r), i).map(k -> back_key(b, k))
+    TIndex(r, _, _) -> repr(texpr_type(r)) match
+        Array(_, _, _) -> place_back(e, r, env)
+        _ -> None
+    TDeref(operand, _) -> repr(texpr_type(operand)) match
+        Ref(_, sync) -> if sync then None else place_back(e, operand, env).map(b -> Back(b.roots, b.keys, b.named, false))
+        _ -> None
+    TBlockExpr(b) -> if b.stmts.is_empty() && b.result.is_some() then place_back(e, b.result.unwrap(), env) else None
+    TCall(name, args, _, _) ->
+        val c = e.places.get(name)?
+        val inner = place_back(e, args[c.1], env)?
+        var next: Buf[(string, Back)] = buf()
+
+        next.push((c.0.params[c.1].0, inner))
+        place_back(e, c.0.body.result.unwrap(), next)
+    TMatch(scrutinee, arms, _) ->
+        val s = place_back(e, scrutinee, env)?
+        var out: Option[Back] = None
+
+        for arm in arms
+            if ends_program(arm.body.ty) then continue
+            if arm.patterns.len() != 1 || arm.body.result.is_none() then return None
+
+            var inner: Buf[(string, Back)] = buf()
+
+            for item in env
+                inner.push(item)
+
+            bind_back(s, arm.patterns[0], &inner)
+
+            val one = place_back(e, arm.body.result.unwrap(), inner)?
+
+            out = if out.is_none() then Some(one) else Some(back_join(out.unwrap(), one))
+
+        out
+    _ -> None
+
+private ends_program(t: Type) -> bool = t match
+    Never -> true
+    _ -> false
+
+// The names a flat pattern binds out of a subject backed by `s`: the whole of it, or a payload field.
+private bind_back(s: Back, p: TPattern, env: *Buf[(string, Back)]) = p match
+    TBindPattern(name, _) -> env.push((name, s))
+    TVariantPattern(enum_ty, variant, args) ->
+        for i in 0..<args.len()
+            if i >= variant.fields.len() then break
+
+            val field = variant.fields[i]
+
+            args[i] match
+                TBindPattern(name, _) ->
+                    env.push((name, if s.frame then s else back_key(s, edge_key(enum_ty, s"${variant.name}.${field.0}",
+                                                                                 field.1))))
+                _ -> ()
+    _ -> ()
+
+// Why the argument must keep its count, or empty where it need not.
+private arg_refusal(e: *Emit, w: &ArgWalk, b: Back, args: Buf[TExpr], i: usize, callee: string,
+                    borrows: bool) -> string
+    val f = callee_shown(callee)
+
+    if !borrows
+        if e.asyncs.has(callee) then return s"'$f' is async: its task outlives the call"
+        if e.abandoning.has(callee) then return s"'$f' abandons the frame"
+
+        return s"'$f' keeps it"
+    end if
+
+    // A root handed over to the callee by another argument may be let go inside the call; so may what
+    // a pointer root points at, through a value handed over whose type reaches it.
+    for j in 0..<args.len()
+        if j == i || !e.owned_params.has(owned_key(callee, j)) then continue
+
+        for r in b.roots
+            if mentions(args[j], r) then return s"the root '${shown(r)}' is handed to '$f'"
+
+        for t in w.pointees
+            if type_reaches(texpr_type(args[j]), t) then return s"a value reaching ${type_show(t)} is handed to '$f'"
+
+    val said = kills(e, w, b, edge_writes(&e.untouched, callee), s"'$f'")
+
+    if said != "" then return said
+
+    // What the arguments after it do between the read and the call.
+    for j in i + 1..<args.len()
+        val g: &Gather = Gather(buf(), map(), set(), buf())
+        val sink: &EventSink = EventSink(buf(), buf(), buf())
+        val walk = TWalk(true, x -> event_node(e, g, sink, e.held_args.aliases, b.roots, set(), x),
+                         w2 -> event_write(e, g, sink, e.held_args.aliases, b.roots, set(), w2),
+                         s -> event_stmt(e, g, sink, s))
+
+        walk_texpr(args[j], walk)
+
+        for ev in sink.events
+            if ev.root != ""
+                val counted = !e.held_args.params.has(ev.root) || e.held_args.owned.has(ev.root)
+
+                if ev.written || counted && !e.lent_decls.has(ev.root) then return s"${ev.what} at ${line_col(e, ev.at)}"
+
+                continue
+            end if
+
+            val one = kills(e, w, b, ev.w, s"${ev.what} at ${line_col(e, ev.at)}")
+
+            if one != "" then return one
+
+    ""
+end arg_refusal
+
+// What a summary `cw` (a callee's, or a later argument's store or call, named `what`) does to the chain.
+private kills(e: *Emit, w: &ArgWalk, b: Back, cw: EdgeWrites, what: string) -> string
+    if cw.opaque != "" then return s"$what runs code nobody can see (${cw.opaque})"
+
+    for k in b.keys
+        if writes_edge(cw, k) then return s"$what may write ${edge_text(k)}"
+
+        if has_type(cw.counts, k.owner) || has_type(cw.counts, underlying(k.held)) then
+            return s"$what may read the count of ${type_show(k.held)}"
+
+    for t in w.pointees
+        for k in cw.keys
+            if type_reaches(k.held, t) then return s"$what may write ${edge_text(k)}, which may reach ${type_show(t)}"
+
+        for item in cw.within
+            if type_reaches(item, t) then return s"$what may write through a pointer to ${type_show(item)}"
+
+        for item in cw.counts
+            if type_reaches(item, t) then return s"$what may read the count of ${type_show(item)}"
+
+    ""
+end kills
+
+// Whether `x` names the local `name` anywhere inside it.
+private mentions(x: TExpr, name: string) -> bool
+    val v: &Verdict = Verdict(true)
+
+    walk_texpr(x, expr_walk(true, n -> *n.kind match
+        TLoad(m, _) -> if m == name then v.refuse()
+        _ -> ()))
+
+    !v.ok
+end mentions
+
+// Whether a value of `from` may hold, or reach through what it refers to, storage of type `target`.
+// A type nobody can see inside -- a trait object, a closure, a generic parameter -- may reach anything.
+private type_reaches(from: Type, target: Type) -> bool
+    val goal = underlying(target)
+    var seen: Buf[Type] = buf()
+    var todo: Buf[Type] = buf()
+
+    todo.push(underlying(from))
+
+    while !todo.is_empty()
+        val t = todo.pop().unwrap()
+
+        if has_type(seen, t) then continue
+        if seen.len() > 256 then return true
+
+        seen.push(t)
+
+        var parts: Buf[Type] = buf()
+
+        by_value_parts(t, &parts)
+
+        for p in parts
+            if p == goal then return true
+
+            p match
+                Ref(inner, _) -> todo.push(underlying(*inner))
+                Ptr(inner, _) -> todo.push(underlying(*inner))
+                Weak(inner) -> todo.push(underlying(*inner))
+                Volatile(inner) -> todo.push(underlying(*inner))
+                Slice(elem, _) -> todo.push(underlying(*elem))
+                Trait(_, _, _) -> return true
+                Abstract(_, _) -> return true
+                Unknown -> return true
+                _ -> ()
+    end while
+
+    false
+end type_reaches
+
+// The argument's `--explain-borrows` line: held, or the first thing that keeps its count.
+private note_argument(e: *Emit, x: TExpr, callee: string, why: string)
+    val f = e.body_func match
+        Some(found) -> found
+        None -> return
+
+    if f.src.is_none() || is_closure_body(f) || std_module(f.declared_in) then return
+
+    val src = f.src.unwrap()
+    val at = src.locate(x.span.start)
+    val name = callee_shown(callee)
+    val head = s"${src.name}:${at.line}:${at.col + literate_shift(src)}: argument '${arg_text(x)}' of '$name'"
+    val text = if why == "" then s"$head needs no count: '$name' writes no field on its way"
+               else s"$head takes a count: $why"
+
+    if pzl_seen.has(head) then return
+
+    pzl_seen.add(head)
+    pzl_notes.push(LocalNote(src.name, x.span.start, text))
+end note_argument
+
+// An argument as the report shows it: the names and fields it reads, `[_]` for an element.
+private arg_text(x: TExpr) -> string = *x.kind match
+    TLoad(name, _) -> shown(name)
+    TField(r, i, _) -> s"${arg_text(r)}.${field_label(texpr_type(r), i)}"
+    TDeref(r, _) -> arg_text(r)
+    TIndex(r, _, _) -> s"${arg_text(r)}[_]"
+    TCall(name, args, _, _) ->
+        val receiver = if args.is_empty() then "…" else arg_text(args[0])
+
+        if receiver == "…" then s"${callee_shown(name)}(…)" else s"$receiver.${callee_shown(name)}()"
+    _ -> "…"
+
+// A callee as the program wrote it: a function the entry file's statements reach through their
+// environment is lowered as `$env0.both`, and a reader wrote `both`.
+private callee_shown(name: string) -> string
+    val b = name.bytes
+
+    for k in 0..<b.len
+        if b[k] == u8('$') && name[k..<name.len].starts_with("$env")
+            var j = k + 4
+
+            while j < b.len && b[j] >= u8('0') && b[j] <= u8('9')
+                j += 1
+
+            if j < b.len && b[j] == u8('.') then return method_name(name[j + 1..<name.len])
+
+    method_name(name)
+end callee_shown
+
+private field_label(t: Type, i: int) -> string = underlying(t) match
+    Struct(d) -> if i >= 0 && usize(i) < d.fields.len() then d.fields[usize(i)].0 else s"$i"
+    Results(d) -> if i >= 0 && usize(i) < d.fields.len() then d.fields[usize(i)].0 else s"$i"
+    _ -> s"$i"

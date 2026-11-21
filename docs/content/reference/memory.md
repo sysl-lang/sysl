@@ -3995,7 +3995,48 @@ reads it through the caller's count — Swift's `guaranteed` convention. The cal
 - a **local or parameter** whose address has not been let out yet keeps its count where the callee
   cannot reach it: nothing to do ("yet" counts a statement at a time; a loop is one statement);
 - **anything else** — a field, an element, a global, something behind a `ref` or a `&` — costs a retain
-  before and a release after, since the call may write that memory.
+  before and a release after, since the call may write that memory, **unless the call can write no
+  field on the way to it**: a field or an element read through a parameter, a local or a call's
+  answer, handed to a parameter the callee borrows, takes no count where neither the callee (nor
+  anything it calls) nor a later argument may write a field the read went through, run code nobody
+  can see, or let go of the root it was read from. `tail(x.unwrap().next, y, z)` takes none when
+  `tail` writes no `next`; `f(a.b)` takes one when `f` may write `A.b` through another name for `a`.
+  A global's value, a `&sync` or `weak` one, and an argument that crosses by address keep the count.
+
+Which of the two a call is changes nothing it prints: the count left out could never have been the one
+keeping the value alive. `length(a.b.next)` below takes no count, since `length` writes no field;
+`replace(a.b)` takes one, since `replace` overwrites `A.b` through the global, and reads what it was
+handed after that (`--explain-borrows` says which, and why):
+
+```sysl
+struct Node
+    v: int
+    next: Option[&Node]
+
+struct A
+    b: &Node
+
+var SEEN: Option[&A] = None
+
+length(n: Option[&Node]) -> int = n match
+    Some(x) -> 1 + length(x.next)
+    None -> 0
+
+replace(n: &Node) -> int
+    SEEN.unwrap().b = Node(9, None)
+    n.v
+
+main()
+    val a: &A = A(Node(1, Some(Node(2, None))))
+
+    SEEN = Some(a)
+    print(length(a.b.next), replace(a.b), a.b.v)
+    SEEN = None
+```
+
+```output
+1 1 9
+```
 
 A callee still takes a count for **a parameter it assigns to**, and for every parameter of a function
 something outside the program may call (`@export`, a `@section`, one whose address is taken).

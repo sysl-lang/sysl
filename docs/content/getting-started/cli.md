@@ -1758,6 +1758,22 @@ A local's line points at its first value: the initializer of a `var` or `val`, t
 binds out of. A generic function speaks for its first instance. A local each value of which arrives
 with a count — a call's answer, a constant — gets no line.
 
+It reports **each argument read out of storage** too — a field or an element read through a reference,
+handed to a direct call: either that it needs no count, since the call writes no field on its way, or
+that it takes one, with the first thing that could cut the chain between the read and the call's
+return — the parameter being one the callee keeps, a field the callee or a later argument may write,
+code nobody can see
+([passing a reference to a call usually costs nothing](/reference/memory/#passing-a-reference-to-a-call-usually-costs-nothing)):
+
+```
+list.sysl:32:28: argument 'x.unwrap().next' of 'tail' needs no count: 'tail' writes no field on its way
+havlak.sysl:263:9: argument 'self.nodes[_]' of 'init_node' needs no count: 'init_node' writes no field on its way
+dfs.sysl:24:37: argument 'outs[_]' of 'walk' takes a count: 'walk' keeps it
+walk.sysl:9:10: argument 'h.next' of 'pair' takes a count: 'cut' at 9:18 may write Node.next
+```
+
+An argument that is a local, a parameter or a call's answer gets no line: it needs no count anyway.
+
 ### `-O2` is written the way clang writes it
 
 A short option normally takes its value as the next argument, but C compilers write the

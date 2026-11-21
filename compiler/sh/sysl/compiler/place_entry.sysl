@@ -220,11 +220,17 @@ private is_never_type(t: Type) -> bool = t match
 // A call to `name` made through its place entry, where it has one and the call can use it: the value
 // read out of the place, with its counts taken, owned by the statement as a call's result is. `None`
 // where the ordinary entry is called instead.
+//
+// **A place call on the way to an argument held for its call takes no count at all**
+// (`plus0_locals.sysl`'s `held_backed`): what it answers is read out of storage the argument's backing
+// already stands on, so the value is the place's own, as a field read through it would be.
 gen_place_call(e: *Emit, name: string, args: Buf[TExpr], ty: Type, span: Span) -> Option[Val]
     val at = place_call_at(e, name, args, span)?
     val r = fresh_reg(e)
 
     emit(e, InLoad(r, lty(e, ty), at, AccPlain, None))
+
+    if lent_place_call(e, span, name) then return Some(r)
 
     if contains_counted(ty) then retain_value(e, ty, r)
 
@@ -245,14 +251,22 @@ end gen_place_call_into
 
 // The address the place entry answers, where the call may use it.
 private place_call_at(e: *Emit, name: string, args: Buf[TExpr], span: Span) -> Option[Val]
+    val c = place_call_target(e, name, args)?
+
+    Some(call_place(e, name, args, address(e, args[c.1]), span))
+end place_call_at
+
+// The body a call to `name` is read through and the parameter whose place it answers, where the call
+// may use the place entry.
+place_call_target(e: *Emit, name: string, args: Buf[TExpr]) -> Option[(TFunc, usize)]
     val c = e.places.get(name)?
     val k = c.1
 
     if k >= args.len() || e.abandoning.has(name) then return None
     if !nameable(e, args[k]) || !others_quiet(args, k) then return None
 
-    Some(call_place(e, name, args, address(e, args[k]), span))
-end place_call_at
+    Some(c)
+end place_call_target
 
 // Whether `x` is storage the caller can hand over by address as it stands: a local or module `val`
 // with a slot, what a reference or a pointer refers to, or a field or array element of one of those.
