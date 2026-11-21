@@ -281,7 +281,30 @@ private posix_machine(os: Os) -> bool = os match
 // The status says which of three things happened, and the runner reads all three: `0` for a test
 // that returned, whatever the platform makes of a trap for one that did not, and `2` for a name that
 // matches nothing here -- which is a runner and a binary that disagree, not a test result.
-gen_test_main(e: *Emit, p: TProgram) -> Option[IrFunc]
+//
+// **The arms are not in `@main`: they are cut into functions of `TestArmsPerFunction` each**
+// (`gen_test_arms`), which `@main` asks in turn. One function of an arm per test was a single body of
+// two blocks per test -- 52,000 blocks for the compiler's own suite -- and clang spent 140 s and 5.6 GB
+// on it alone, in one unit, while the rest of the build waited. Each arm function is external under a
+// name nothing can spell, so the units place it by its name's hash (`codegen_units.sysl`) and the cost
+// is spread over all of them. `arm_functions` receives them, and the answer is `@main` itself.
+gen_test_main(e: *Emit, p: TProgram, arm_functions: *Buf[IrFunc]) -> Option[IrFunc]
+    val arms = test_arms_of(p)
+    var asks: Buf[string] = buf()
+    var from: usize = 0
+
+    while from < arms.len()
+        val to = if arms.len() - from > TestArmsPerFunction then from + TestArmsPerFunction else arms.len()
+        val name = test_arms_symbol(asks.len())
+
+        gen_test_arms(e, p, arms, from, to, name) match
+            Some(f) -> arm_functions.push(f)
+            None -> return None
+
+        asks.push(name)
+        from = to
+    end while
+
     start_function(e)
 
     var no_stmts: Buf[TStmt] = buf()
@@ -313,62 +336,22 @@ gen_test_main(e: *Emit, p: TProgram) -> Option[IrFunc]
 
     emit(e, InLoad(want, LPtr, slot, AccPlain, None))
 
-    // Each arm compares the wanted name against one test's key and calls it on a match. The keys are
-    // interned with the terminator the comparison reads to, which an ordinary sysl string constant
-    // does not carry: a `string` knows its own length and has never had a use for one.
-    for t in p.tests
-        val run = fresh_label(e, "test.run")
+    // Each arm function answers what the one arm it found answered, or `2` where it found none, and
+    // only then is the next one asked.
+    for ask in asks
+        val answered = fresh_reg(e)
+        val found = fresh_reg(e)
+        val done = fresh_label(e, "test.found")
         val next = fresh_label(e, "test.next")
 
-        dispatch_on(e, want, t.func, run, next)
-        emit_label(e, run)
+        var args: Buf[IrArg] = buf()
 
-        // The test's own process is where its module's `@setup` runs, and it has to be: a setup
-        // exists to leave something behind for the test to find, and module storage is one
-        // process's.
-        t.hooks.setup match
-            Some(h) ->
-                emit(e, ir_call(None, LVoid, VGlobal(symbol_of(e, h.func)), no_ir_args()))
-                emit_mark(e, setup_mark())
-            None -> ()
-
-        // A test answering with a `Result` is called for its answer, which is handed to the library's
-        // reporter as `main`'s is: an `Err` is said, with its error return trace, and exits 1.
-        p.test_reporters.get(t.func) match
-            Some(reported) ->
-                val (reporter, ty) = reported
-                val r = fresh_reg(e)
-
-                var args: Buf[IrArg] = buf()
-
-                emit(e, ir_call(Some(r), lty(e, ty), VGlobal(symbol_of(e, t.func)), no_ir_args()))
-                args.push(ir_arg(lty(e, ty), r))
-                emit(e, ir_call(None, LVoid, VGlobal(reporter), args))
-            None -> emit(e, ir_call(None, LVoid, VGlobal(symbol_of(e, t.func)), no_ir_args()))
-
-        // `@teardown` runs here only where the test **returned**, which is the whole of what the
-        // mark records. A test that trapped took this process with it, so the runner starts a fresh
-        // one for the teardown instead.
-        t.hooks.teardown match
-            Some(h) ->
-                emit_mark(e, test_mark())
-                emit(e, ir_call(None, LVoid, VGlobal(symbol_of(e, h.func)), no_ir_args()))
-            None -> ()
-
-        emit_term(e, InRet(Some(l_i32()), Some(VInt(from_int(0)))))
-        emit_label(e, next)
-
-    // An arm per hook as well, so that the runner can ask for one by name: the two `_all` hooks are
-    // invocations of their own, and so is a `@teardown` after a test that did not come back. Keys
-    // are distinct, so an arm for a hook cannot be reached by a test's name or the other way round.
-    for h in p.hooks
-        val run = fresh_label(e, "hook.run")
-        val next = fresh_label(e, "hook.next")
-
-        dispatch_on(e, want, h.func, run, next)
-        emit_label(e, run)
-        emit(e, ir_call(None, LVoid, VGlobal(symbol_of(e, h.func)), no_ir_args()))
-        emit_term(e, InRet(Some(l_i32()), Some(VInt(from_int(0)))))
+        args.push(ir_arg(LPtr, want))
+        emit(e, ir_call(Some(answered), l_i32(), VGlobal(ask), args))
+        emit(e, InIntCmp(found, INe, l_i32(), answered, VInt(from_int(2))))
+        emit_term(e, InCondBr(found, done, next))
+        emit_label(e, done)
+        emit_term(e, InRet(Some(l_i32()), Some(answered)))
         emit_label(e, next)
 
     // Falling off the end of the arms and arriving with no name at all are the same answer: this
@@ -382,6 +365,118 @@ gen_test_main(e: *Emit, p: TProgram) -> Option[IrFunc]
 
     Some(finish_func(e, entry_sig(e.target)))
 end gen_test_main
+
+// How many arms one of the dispatcher's arm functions holds. The cost clang pays for a function grows
+// faster than its blocks do, so many small ones are cheaper than one large one, and a function a call
+// per arm is not worth cutting finer: below a few hundred arms the call from `@main` is the cost.
+private const TestArmsPerFunction: usize = 256
+
+// One arm of the dispatcher: a test, or a hook the runner may ask for by name.
+private enum TestArm
+    ArmTest(test: TTest)
+    ArmHook(func: string)
+
+// Every arm, the tests first and then the hooks, in the order the dispatcher used to compare them.
+//
+// An arm per hook as well, so that the runner can ask for one by name: the two `_all` hooks are
+// invocations of their own, and so is a `@teardown` after a test that did not come back. Keys are
+// distinct, so an arm for a hook cannot be reached by a test's name or the other way round.
+private test_arms_of(p: TProgram) -> Buf[TestArm]
+    var arms: Buf[TestArm] = buf()
+
+    for t in p.tests
+        arms.push(ArmTest(t))
+
+    for h in p.hooks
+        arms.push(ArmHook(h.func))
+
+    arms
+end test_arms_of
+
+// The name of the dispatcher's `n`th arm function: external, so the units place it by its hash, and
+// dotted, so no sysl or C name is it.
+test_arms_symbol(n: usize) -> string = s"sysl.test.arms.$n"
+
+// `i32 (ptr %want)`: the arms `from` up to `to`, each comparing the wanted name against its key and
+// running on a match. It answers `0` where an arm ran and returned, and `2` where no key matched.
+//
+// The keys are interned with the terminator the comparison reads to, which an ordinary sysl string
+// constant does not carry: a `string` knows its own length and has never had a use for one.
+private gen_test_arms(e: *Emit, p: TProgram, arms: Buf[TestArm], from: usize, to: usize,
+                      name: string) -> Option[IrFunc]
+    start_function(e)
+
+    var no_stmts: Buf[TStmt] = buf()
+
+    e.caller_exposed = exposed_in(no_stmts, None, p.vals)
+    e.exposed_now = exposed_in(no_stmts, None, p.vals)
+    push_temps(e)
+    push_owned(e)
+
+    val want = VReg("want")
+
+    for i in from..<to
+        val run = fresh_label(e, "test.run")
+        val next = fresh_label(e, "test.next")
+
+        arms[i] match
+            ArmTest(t) ->
+                dispatch_on(e, want, t.func, run, next)
+                emit_label(e, run)
+                gen_test_arm(e, p, t)
+            ArmHook(hook) ->
+                dispatch_on(e, want, hook, run, next)
+                emit_label(e, run)
+                emit(e, ir_call(None, LVoid, VGlobal(symbol_of(e, hook)), no_ir_args()))
+
+        emit_term(e, InRet(Some(l_i32()), Some(VInt(from_int(0)))))
+        emit_label(e, next)
+    end for
+
+    emit_term(e, InRet(Some(l_i32()), Some(VInt(from_int(2)))))
+
+    if has_gap(e) then return None
+
+    var params: Buf[IrParam] = buf()
+
+    params.push(IrParam(LPtr, no_ir_attrs(), Some(want)))
+
+    Some(finish_func(e, bound_sig(ir_sig(name, ir_fn_type(l_i32(), params)), e.target.symbols_bind_locally())))
+end gen_test_arms
+
+// What a test's arm runs once its name matched.
+private gen_test_arm(e: *Emit, p: TProgram, t: TTest)
+    // The test's own process is where its module's `@setup` runs, and it has to be: a setup exists to
+    // leave something behind for the test to find, and module storage is one process's.
+    t.hooks.setup match
+        Some(h) ->
+            emit(e, ir_call(None, LVoid, VGlobal(symbol_of(e, h.func)), no_ir_args()))
+            emit_mark(e, setup_mark())
+        None -> ()
+
+    // A test answering with a `Result` is called for its answer, which is handed to the library's
+    // reporter as `main`'s is: an `Err` is said, with its error return trace, and exits 1.
+    p.test_reporters.get(t.func) match
+        Some(reported) ->
+            val (reporter, ty) = reported
+            val r = fresh_reg(e)
+
+            var args: Buf[IrArg] = buf()
+
+            emit(e, ir_call(Some(r), lty(e, ty), VGlobal(symbol_of(e, t.func)), no_ir_args()))
+            args.push(ir_arg(lty(e, ty), r))
+            emit(e, ir_call(None, LVoid, VGlobal(reporter), args))
+        None -> emit(e, ir_call(None, LVoid, VGlobal(symbol_of(e, t.func)), no_ir_args()))
+
+    // `@teardown` runs here only where the test **returned**, which is the whole of what the mark
+    // records. A test that trapped took this process with it, so the runner starts a fresh one for
+    // the teardown instead.
+    t.hooks.teardown match
+        Some(h) ->
+            emit_mark(e, test_mark())
+            emit(e, ir_call(None, LVoid, VGlobal(symbol_of(e, h.func)), no_ir_args()))
+        None -> ()
+end gen_test_arm
 
 // **A test process keeps what it prints and does not outlive the runner that started it.** The first
 // thing a test build's entry does on a machine with processes is `testprocess.c`'s start: standard

@@ -42,11 +42,17 @@ literal_arithmetic(cx: &Analyzer, outermost: bool, t: TExpr) -> TExpr
 
     val zero = zero_divisor(t)
 
-    if zero.is_some() then return cx.err(zero.unwrap(), "a constant divided by zero")
+    if zero.is_some()
+        if chosen_by_constant(cx, zero.unwrap()) then return t
+
+        return cx.err(zero.unwrap(), "a constant divided by zero")
 
     val shift = bad_shift(cx, t)
 
-    if shift.is_some() then return cx.err(shift.unwrap().0, shift.unwrap().1)
+    if shift.is_some()
+        if chosen_by_constant(cx, shift.unwrap().0) then return t
+
+        return cx.err(shift.unwrap().0, shift.unwrap().1)
 
     val node = node_of(t)
     val ty = texpr_type(node)
@@ -66,6 +72,30 @@ literal_arithmetic(cx: &Analyzer, outermost: bool, t: TExpr) -> TExpr
         TConstrainedCheck(_, target) -> TExpr(t.span, TConstrainedCheck(folded, target))
         _ -> folded
 end literal_arithmetic
+
+// Whether a trap at `at` lies in a branch of an `if` or a `match` over a constant
+// (`reference/modules.md`): only the branch the constant chooses is computed, so a branch that would
+// trap is harmless when it is not taken, and the one taken is refused by the run that computes it,
+// which names the constant ("'A' traps while it is being compiled"). A trap in the condition itself is
+// computed whatever is chosen, so it is refused here as anywhere.
+private chosen_by_constant(cx: &Analyzer, at: Span) -> bool
+    for cond in cx.choices
+        val s = cond.span
+
+        if s.start <= at.start && at.end <= s.end then continue
+
+        val mark = cx.an.complaints()
+        val refusals = cx.an.const_refusals
+        val folded = const_fold(cx, cond)
+
+        cx.an.restore_complaints(mark)
+        cx.an.const_refusals = refusals
+
+        if folded.is_some() then return true
+    end for
+
+    false
+end chosen_by_constant
 
 // The first division or remainder inside whose divisor is a literal zero.
 private zero_divisor(t: TExpr) -> Option[Span] = *t.kind match

@@ -119,6 +119,45 @@ ice_taken_branch_traps()
     ice_refused(ice_does(ice_head() + "const A = if Z == 0 then 10 / Z else 0\nprint(A)\n"),
                 "'A' traps while it is being compiled: integer division by zero")
 
+// An untyped constant is the literal it stands for (`reference/types.md`), so `10 / Z` is `10 / 0`;
+// in a branch a constant does not choose it is never computed, whatever arithmetic it sits in.
+@test("if/match constant: a dead match arm, a dead remainder and a dead shift over constants are not run")
+ice_dead_exact_traps()
+    if !ice_ready() then return
+
+    assert_eq(ice_does(ice_head() + "const C = Z match\n    0 -> 5\n    _ -> 10 % Z\n" +
+                       "const D = 1 + (if Z == 0 then 2 else 10 / Z) * 3\n" +
+                       "const E = if N > 1 then 1 else 1 << (N * 20)\n" +
+                       "const F = if Z == 0 then 4 else 10 / 0\nprint(C, D, E, F)\n"), "0: 5 7 1 4\n")
+
+@test("if/match constant: a dead branch over constants in a local const and a run-time position")
+ice_dead_exact_local()
+    if !ice_ready() then return
+
+    assert_eq(ice_does(ice_head() + "main()\n    const k = if Z == 0 then 3 else 10 / Z\n" +
+                       "    val m = Z match\n        0 -> 6\n        _ -> 1 << (N * 20)\n" +
+                       "    print(k, m, if N > 1 then 9 else 10 % Z)\n"), "0: 3 6 9\n")
+
+@test("if/match constant: a taken arm that traps over constants is refused at the constant")
+ice_taken_exact_traps()
+    if !ice_ready() then return
+
+    ice_refused(ice_does(ice_head() + "const B = Z match\n    0 -> 10 % Z\n    _ -> 1\nprint(B)\n"),
+                "'B' traps while it is being compiled: integer division by zero")
+    ice_refused(ice_does(ice_head() + "const B = 1 + (if Z == 0 then 10 / Z else 0)\nprint(B)\n"),
+                "'B' traps while it is being compiled: integer division by zero")
+
+// The condition is computed whichever branch it chooses, so a trap in it is the literal's refusal.
+@test("if/match constant: a condition that divides by a zero constant is refused")
+ice_condition_traps()
+    if !ice_ready() then return
+
+    ice_refused(ice_does(ice_head() + "const A = if 10 / Z == 0 then 1 else 2\nprint(A)\n"),
+                "a constant divided by zero")
+    ice_refused(ice_does(ice_head() + "const A = (10 % Z) match\n    0 -> 1\n    _ -> 2\nprint(A)\n"),
+                "a constant divided by zero")
+    ice_refused(ice_does(ice_head() + "val v = 10 / Z\nprint(v)\n"), "a constant divided by zero")
+
 @test("if/match constant: nested inside arithmetic")
 ice_in_arithmetic()
     if !ice_ready() then return

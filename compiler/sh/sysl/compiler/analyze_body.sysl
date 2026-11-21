@@ -1044,11 +1044,23 @@ private check_abstract_body(a: &Analysis, scope: Scope, d: FuncDecl, keep: bool 
     val split = contract_length(d.body)
 
     val contract = analyze_contract(cx, decl_anchor(d), d.body, split, ret)
-    val body = body_block(cx, statements_from(d.body, split), ret)
+    val rest = statements_from(d.body, split)
+    val body = body_block(cx, rest, ret)
 
     // A generic body's lost writes are told here, once, as its dropped `Result`s are
     // (`lost_writes.sysl`).
     check_lost_writes(cx, bound, body, contract.1)
+
+    // **A body yielding what its signature's value parameters do not name is wrong for every
+    // instantiation**, so it is told here and kept -- `-> Buf[N] = Buf[N + 1](…)` is refused
+    // whether or not anything calls it (`value_terms.sysl`). Any other disagreement is left for the
+    // instantiations, which read the body again with every argument bound.
+    if ret != Unit && body.result.is_some()
+        val told = value_clash_told(body_disagreement(declared_key(a, scope, d), ret, body.ty,
+                                                      cx.ret_is_list), ret, body.ty)
+
+        if told.is_some() then a.bound_fault(scope, body_span(rest, decl_anchor(d)), told.unwrap())
+    end if
 
     var params: Buf[(string, Type)] = buf()
 
@@ -1345,6 +1357,16 @@ analyze_instance_in(a: &Analysis, cx: &Analyzer, name: string, d: FuncDecl) -> T
         cx.fault(misfit_literal(body.result.unwrap(), ret).map(l -> l.span).unwrap_or(span),
                  body_disagreement(declared_key(a, cx.scope, d), ret, body.ty, cx.ret_is_list))
 
+    // **An instantiation made over a type that was never worked out says nothing.** The call that
+    // asked for it was refused where it was written -- a closure argument with a type error leaves
+    // the result parameter `?` -- so whatever the library's body then complains of (`None` with no
+    // `Option` to settle, `[]` with no element type) is a consequence, and would point at the
+    // library's line instead of the user's. What says so is the instantiation's own type arguments
+    // (or a parameter), never its result alone: a result the body is to settle (`= value`, a `some`
+    // result) is `?` here for its own reason, and that body's faults are the program's.
+    if any_param_unknown(params) || any_binding_unknown(a.tables.members.func_substs.get(name)) then
+        a.restore_complaints(said)
+
     // A `-> ref` member answers its place's address (`ref_result.sysl`).
     val answered = if d.marks.answers_place then answer_place(cx, decl_anchor(d), name, params, body, ret)
                    else body
@@ -1377,6 +1399,22 @@ analyze_instance_in(a: &Analysis, cx: &Analyzer, name: string, d: FuncDecl) -> T
           exported_symbol(d), d.section, body_marks(cx, d.marks), cx.owner, d.const_fn, Some(cx.scope.src),
           export_hidden(d))
 end analyze_instance_in
+
+private any_param_unknown(params: Buf[(string, Type)]) -> bool
+    for p in params
+        if mentions_unknown(p.1) then return true
+
+    false
+end any_param_unknown
+
+private any_binding_unknown(subst: Option[Buf[Binding]]) -> bool
+    if subst.is_none() then return false
+
+    for b in subst.unwrap()
+        if mentions_unknown(b.ty) then return true
+
+    false
+end any_binding_unknown
 
 // The key a declaration was filed under, for a diagnostic naming the declaration an instantiation
 // came from rather than the instantiation itself. A member's own name is already a key; a free

@@ -2070,7 +2070,8 @@ to be one value.
 ### What may be written with `N`
 
 `N` may be used as an array's length, and a body may compute with it freely. A computed result may
-not be carried into a **type**:
+not be carried into a **signature** — an array's length, a vector's lane count, or a type's value
+argument:
 
 ```sysl
 f[const N: usize](xs: [N]int) -> [N + 1]int = xs
@@ -2082,8 +2083,83 @@ print(1)
 the length 'N + 1' computes with the value parameter 'N'
 ```
 
-Deciding that `N + 1` and `1 + N` are one type, or that `2 * N` and `N + N` are, requires type-level
+```sysl
+struct Buf[const N: usize]
+    used: usize
+
+grow[const N: usize](b: Buf[N]) -> Buf[N + 1] = Buf(b.used)
+
+print(1)
+```
+
+```error
+the value argument 'N + 1' computes with the value parameter 'N'
+```
+
+A signature's types are what a call is solved from, and solving `N` out of `Buf[N + 1]` is type-level
 arithmetic, which sysl does not provide.
+
+**Inside its own declaration a value parameter is a symbol.** `Buf[N]` and `Buf[M]` are two types
+there, just as `Box[T]` and `Box[U]` are, and a struct's value argument computed in a field or a body
+— `Buf[N + 1]` — is that computation over the symbols. Two such arguments are one type when they are
+the same polynomial: `N + M` is `M + N`, `2 * N` is `N + N`, `N * (M + 1)` is `N * M + N`, and a
+division by a constant that divides every coefficient is exact (`(2 * N + 4) / 2` is `N + 2`). Any
+other operation over a parameter (`N / 2` alone, `!B`) is compared as written.
+
+So a body that yields what its signature does not name is wrong for every instantiation, and it is
+refused at the declaration, whether or not anything calls it:
+
+```sysl
+struct Buf[const N: usize]
+    used: usize
+
+wrong[const N: usize](b: Buf[N]) -> Buf[N] = Buf[N + 1](b.used)
+
+print(1)
+```
+
+```error
+function 'wrong' should return Buf[N], but its body yields Buf[N + 1] — the two differ by 1 for every N
+```
+
+```sysl
+struct Buf[const N: usize]
+    used: usize
+
+cast[const N: usize, const M: usize](b: Buf[N]) -> Buf[M] = b
+
+print(1)
+```
+
+```error
+function 'cast' should return Buf[M], but its body yields Buf[N] — 'N' and 'M' are different value parameters
+```
+
+The same holds where a local's declared type, an argument or a field meets such a value, and a
+parameter is never the constant one instantiation might choose: `-> Buf[3] = b` is refused with
+*"'N' stands for every value an instantiation chooses, not only 3"*. Forms that agree are accepted,
+and each instantiation computes its own:
+
+```sysl
+struct Buf[const N: usize]
+    used: usize
+
+    room(self) -> usize = N - self.used
+
+struct Pair[const N: usize, const M: usize]
+    inner: Buf[N + M]
+
+join[const N: usize, const M: usize](b: Buf[N]) -> Pair[N, M] = Pair(Buf[M + N](b.used))
+
+print(join[2, 3](Buf[2](1)).inner.room())
+```
+
+```output
+4
+```
+
+An array's length and a vector's lane count are still numbers while the declaration is read, so
+`[N]int` against `[M]int` in a body is answered by each instantiation rather than at the declaration.
 
 Writing a **type** parameter where a length belongs is refused for the opposite reason, since a
 length is a value:
@@ -2748,7 +2824,7 @@ takes the place of expansion, in the one direction the catalog needs.
 
 | absent | why, and what to write instead |
 |---|---|
-| type-level arithmetic (`[N + 1]T`) | a value parameter may be used as a length but not computed with in a type; deciding that `N + 1` and `1 + N` are one type would need type-level arithmetic |
+| type-level arithmetic in a signature (`-> [N + 1]T`, `Buf[N + 1]`) | a value parameter may be named in a signature but not computed with there, since a call is solved from it; a body and a field may compute a struct's value argument, compared by its polynomial |
 | pack expansion (`f(..a)`, `(..A, int)`) | a pack may be matched and walked, not spread into an argument list or appended to; use `for const` instead |
 | higher-kinded parameters (`F[_]`) | **excluded** by design: they push inference toward undecidability, and traits and bounds already serve abstraction over containers |
 
