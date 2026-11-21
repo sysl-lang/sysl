@@ -806,13 +806,23 @@ private led_word(lhs: Expr, at: Span, w: string, p: *Parser) -> Expr
 end led_word
 
 // A chain of comparisons is one node: `a < b <= c` keeps all three operands and both operators.
+//
+// **A middle operand that is an unparenthesised `&`, `|` or `^` is refused.** Bitwise binds tighter
+// than comparison, so `a < b | c < d` is `a < (b | c) < d` -- a chain through the result of the `|` --
+// where the reader almost surely meant two comparisons joined by it. Parentheses say either reading.
 private led_compare(lhs: Expr, first: string, p: *Parser) -> Expr
     var operands: Buf[Expr] = buf()
     var ops: Buf[string] = buf()
+    var grouped: Buf[bool] = buf()
 
     operands.push(lhs)
+    grouped.push(false)
     ops.push(first)
+
+    val from = p.toks.position
+
     operands.push(parse_expr_bp(p, ComparePower))
+    grouped.push(wholly_grouped(p, from, p.toks.position))
 
     loop
         val more = p.peek() match
@@ -823,10 +833,49 @@ private led_compare(lhs: Expr, first: string, p: *Parser) -> Expr
 
         p.bump()
         ops.push(more)
-        operands.push(parse_expr_bp(p, ComparePower))
 
+        val begin = p.toks.position
+
+        operands.push(parse_expr_bp(p, ComparePower))
+        grouped.push(wholly_grouped(p, begin, p.toks.position))
+
+    refuse_bitwise_middle(p, operands, grouped)
     expr(left_start(lhs, p).to(p.just_taken()), Compare(operands, ops))
 end led_compare
+
+// Whether the tokens `from` up to `to` are one parenthesised group, `(` first and its own `)` last:
+// the tree keeps no parentheses, so this is how a written `(b | c)` is told from `b | c`, and
+// `(b) | (c)` from both.
+private wholly_grouped(p: *Parser, from: usize, to: usize) -> bool
+    if to < from + 2 then return false
+
+    var depth = 0
+
+    for i in from..<to
+        p.toks.items[i].value match
+            Keyword(w) ->
+                if w == "(" then depth += 1
+                else if w == ")" then depth -= 1
+            _ -> ()
+
+        if depth == 0 && i + 1 < to then return false
+
+    depth == 0 && p.toks.items[from].value == Keyword("(")
+end wholly_grouped
+
+private refuse_bitwise_middle(p: *Parser, operands: Buf[Expr], grouped: Buf[bool])
+    for i in 1..<operands.len() - 1
+        if grouped[i] then continue
+
+        *operands[i].kind match
+            Binary(op, _, _) ->
+                if op == "&" || op == "|" || op == "^"
+                    p.fault(operands[i].span, s"'$op' in the middle of a comparison chain binds tighter than " +
+                            "the comparisons, so this compares against its result, as in 'a < (b | c) < d'. " +
+                            "Parenthesise it to say so, or write the two comparisons apart and join them, as " +
+                            "in '(a < b) | (c < d)'")
+            _ -> ()
+end refuse_bitwise_middle
 
 // `a..b` and `a..<b`, with the upper bound optional.
 private led_range(lhs: Expr, at: Span, inclusive: bool, p: *Parser) -> Expr

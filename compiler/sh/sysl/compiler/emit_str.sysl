@@ -103,17 +103,48 @@ str_is_short(e: *Emit, v: Val) -> Val
     sh
 end str_is_short
 
-// **A string's bytes as a `[]u8` view** -- what `s.bytes` is. With the short form off it is the value
-// itself, the same three words.
+// **`s.bytes`, a string's bytes as a `[]u8` view.** With the short form off, or of a string known to
+// hold its bytes elsewhere (`string_known_long`), it is the value itself, the same three words.
 //
-// **Where a string may be short, a view of its bytes that may be kept needs them at an address that
-// lasts**, and a short string's bytes have none: they are the value. So the view is made by
-// `sysl.str.unshort`, which copies a short string into a `StrBuf` and takes a share of a long one, and
-// the statement owns that count like any other temporary -- a binding, a field or a `return` that
-// keeps the view takes a share of its own, exactly as it would of a substring. The reads that only
-// lend the bytes for the length of one operation -- an index, a length, a `for` over them -- never
-// come here: they read the string itself (`bytes_receiver`). Copying only the views that escape is the
-// escape analysis's (`docs/design/short-strings.md § 5.4`).
+// **Where a string may be short, its bytes have no address: they are the value.** So the view is
+// over a **slot of the frame** they are copied into (`str_frame_bytes`) -- unless the escape analysis
+// found a view of it that outlives the frame (`escape.sysl`'s `bytes_temp`), which is made by
+// `sysl.str.unshort` instead (`str_bytes_view`). `docs/design/short-strings.md § 5.4`.
+gen_bytes(e: *Emit, x: TExpr, receiver: TExpr) -> Val
+    val v = gen_expr(e, receiver)
+
+    if !short_strings_on() || string_known_long(receiver) then return v
+    if is_framed_bytes(e, x.span) then return str_frame_bytes(e, v)
+
+    str_bytes_view(e, v, texpr_type(x))
+end gen_bytes
+
+// **The view of a string's bytes over a slot of the frame**: the string's own words with the pointer
+// and the length its reader answers, so a short string's view points at the copy of the value
+// `str_ptr` spilled, and a long string's is itself. The slot is laid in the entry block, written each
+// time this `.bytes` is reached, and its address is put into the view, so it is never bounded to a
+// region (`emit_lifetime.sysl`): a view kept in a local reads it for as long as the frame lasts, and a
+// later write to the string never reaches it. The owner word is the string's, a short string's
+// being null, so the view counts exactly what the string itself would.
+private str_frame_bytes(e: *Emit, v: Val) -> Val
+    val (p, n) = str_data(e, v)
+    val st = lty(e, Str)
+    val v1 = fresh_reg(e)
+
+    emit(e, InInsert(v1, st, v, LPtr, p, index_list(1)))
+
+    val v2 = fresh_reg(e)
+
+    emit(e, InInsert(v2, st, v1, word_lty(e), n, index_list(2)))
+    v2
+end str_frame_bytes
+
+// **A view of a string's bytes that outlives the frame** needs them at an address that lasts. So it
+// is made by `sysl.str.unshort`, which copies a short string into a `StrBuf` and takes a share of a
+// long one, and the statement owns that count like any other temporary -- a binding, a field or a
+// `return` that keeps the view takes a share of its own, exactly as it would of a substring. The
+// reads that only lend the bytes for the length of one operation -- an index, a length, a `for` over
+// them -- never come here or to the slot: they read the string itself (`bytes_receiver`).
 str_bytes_view(e: *Emit, v: Val, ty: Type) -> Val
     if !short_strings_on() then return v
 
