@@ -1,0 +1,132 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.text.str_builder
+
+// A closure the program wrote, refused, hands its generic callee an unsolved result type. The
+// callee's body is then read over that type, and used to say a second, wrong thing about the
+// LIBRARY's own line -- `None` at `scope.sysl:46`, `[]` at `seq.sysl:192` -- where the only mistake
+// is the user's. The user's line is the whole report.
+
+private sua_ready() -> bool
+    std_root() match
+        Ok(_) -> true
+        Err(_) ->
+            print("skipped: the standard module's source is not on this machine")
+            false
+
+// Every diagnostic a one-file program earns: `line:col message` for the program's own file, and
+// `LIBRARY file message` for any other.
+private sua_diags(text: string) -> string
+    val root = make_temp_dir("sysl-sua").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    var b = str_builder()
+
+    emit_llvm_text(src, None) match
+        Err(why) -> b.push(s"refused: ${why.message}")
+        Ok(made) ->
+            val ordered = in_source_order(made.report)
+
+            for i in 0..<ordered.len()
+                if i > 0 then b.push("\n")
+
+                b.push(ordered[i].diag.message)
+
+    remove_dir_all(root).unwrap_or(())
+    b.finish()
+end sua_diags
+
+private sua_only(text: string, expected: string)
+    if !sua_ready() then return
+
+    assert_eq(sua_diags(text), expected)
+
+@test("a type error in a closure passed to spawn is the only thing reported")
+sua_spawn_type_error()
+    sua_only("import sysl.threads.*\n\nmain() -> unit\n    scope((s) -> s.spawn(() -> 1 + \"x\"))\n",
+             "'+' needs matching types, got int and string")
+
+@test("an undefined name in a closure passed to spawn is the only thing reported")
+sua_spawn_undefined_name()
+    sua_only("import sysl.threads.*\n\nmain() -> unit\n    scope((s) -> s.spawn(() -> nope))\n",
+             "undefined name 'nope'")
+
+@test("a type error in a closure passed to Buf.map is the only thing reported")
+sua_map_type_error()
+    sua_only("import sysl.buf.*\n\nmain() -> unit\n    var b: Buf[int] = buf()\n" +
+             "    val m = b.map((x) -> x + \"x\")\n",
+             "'+' needs matching types, got int and string")
+
+@test("an undefined name in a closure passed to Buf.map is the only thing reported")
+sua_map_undefined_name()
+    sua_only("import sysl.buf.*\n\nmain() -> unit\n    var b: Buf[int] = buf()\n" +
+             "    val m = b.map((x) -> nope)\n",
+             "undefined name 'nope'")
+
+@test("a type error in a closure passed to Buf.fold is the only thing reported")
+sua_fold_type_error()
+    sua_only("import sysl.buf.*\n\nmain() -> unit\n    var b: Buf[int] = buf()\n" +
+             "    val f = b.fold(0, (a, x) -> a + \"s\")\n",
+             "'+' needs matching types, got int and string")
+
+@test("a type error in a closure passed to find or filter is the only thing reported")
+sua_find_filter_type_error()
+    sua_only("import sysl.buf.*\n\nmain() -> unit\n    var b: Buf[int] = buf()\n" +
+             "    val c = b.find((x) -> x == \"s\")\n",
+             "cannot compare int with string")
+    sua_only("import sysl.buf.*\n\nmain() -> unit\n    var b: Buf[int] = buf()\n" +
+             "    val c = b.filter((x) -> nope)\n",
+             "undefined name 'nope'")
+
+@test("two refused closures are both told, and still nothing from the library")
+sua_two_refused_closures()
+    sua_only("import sysl.buf.*\n\nmain() -> unit\n    var b: Buf[int] = buf()\n" +
+             "    val m = b.map((x) -> x + \"x\")\n    val n = b.map((x) -> nope)\n",
+             "'+' needs matching types, got int and string\nundefined name 'nope'")
+
+// The quiet is for an instantiation whose PARAMETERS were never worked out. A result left for the
+// body to settle is unknown too while the body is read, and that body's faults are the program's.
+private sua_has(text: string, wanted: Buf[string], unwanted: string)
+    if !sua_ready() then return
+
+    val got = sua_diags(text)
+
+    for w in wanted
+        assert(got.index_of(w).is_some(), s"want '$w' in: $got")
+
+    assert(got.index_of(unwanted).is_none(), s"want no '$unwanted' in: $got")
+end sua_has
+
+@test("a generic whose body settles its result still reports that body's own error at its instantiation")
+sua_inferred_result_still_told()
+    var wanted: Buf[string] = buf()
+
+    wanted.push("'+' needs matching types, got int and string")
+    sua_has("twice[T](x: T) = x + \"s\"\n\nmain() -> unit\n    val y = twice(1)\n", wanted,
+            "empty array literal")
+
+@test("a 'some' result left for the body is not a type never worked out: its body's fault is told")
+sua_some_result_still_told()
+    var wanted: Buf[string] = buf()
+
+    wanted.push("if branches have different types")
+    sua_has("trait Render\n    render(self) -> string\nstruct A\nend A\nstruct B\nend B\nimpl Render for A\n" +
+            "    render(self) -> string = \"a\"\nimpl Render for B\n    render(self) -> string = \"b\"\n" +
+            "pick[T](x: T, c: bool) -> some Render = if c then A() else B()\n\n" +
+            "main() -> unit\n    val r = pick(1, true)\n", wanted, "empty array literal")
+
+@test("a refused closure beside a generic whose body settles its result: each is told, the library is not")
+sua_refused_closure_beside_inferred()
+    var wanted: Buf[string] = buf()
+
+    wanted.push("undefined name 'nope'")
+    wanted.push("'+' needs matching types, got int and string")
+    sua_has("import sysl.buf.*\n\ntwice[T](x: T) = x + \"s\"\n\nmain() -> unit\n" +
+            "    var b: Buf[int] = buf()\n    val m = b.map((x) -> nope)\n    val y = twice(1)\n",
+            wanted, "empty array literal")

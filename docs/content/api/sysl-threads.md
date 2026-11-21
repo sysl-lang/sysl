@@ -458,8 +458,15 @@ A thread started by `Scope.spawn`, and the value its closure answers.
 It holds the thread's joiner and the slot its answer is left in, and nothing of the closure, which
 stays in the scope's own list -- so a handle is as plain to keep as the value it carries back. Copying
 one copies the handle, and it may be handed to another scoped thread; joining any copy waits for the
-one thread. Joining **is** checked here, unlike `Thread.join`: a second join answers the same value
-without waiting again, and the scope does not join a thread that is already joined.
+one thread. Joining **is** checked here, unlike `Thread.join`: the scope does not join a thread that
+is already joined, and a second join of a handle whose answer is `Share` -- an `int`, a tuple of
+scalars, a `&sync T` -- answers the same value again without waiting.
+
+**An answer that is not `Share` is moved out by the first join** -- a `string`, a `Buf`, a `&T`, a
+struct or `Option` holding one. The thread has ended, so the slot is its one owner, and the join
+hands that ownership over whole: no count is taken, and nothing is left behind for another domain
+to touch. A second join of such a handle stops the program with a message, since the value it would
+answer now belongs to whoever joined first.
 
 | Member | Signature | Description |
 |---|---|---|

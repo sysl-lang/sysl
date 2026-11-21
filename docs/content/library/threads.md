@@ -849,7 +849,11 @@ print(cells[0], cells[2], cells[3], cells[5])
 
 `s.spawn(f)` answers a `ScopedThread[R]`, and **its `join` carries back what `f` answered** — the
 value comes out of the thread the scope was holding anyway, so nothing crosses that a scoped closure
-could not already have reached. A handle joined twice answers the same value without waiting again,
+could not already have reached. The answer may be anything the closure can answer: a `string`, a
+`Buf`, a `&T`, a struct or `Option` holding one. **An answer that is not `Share` is moved out by the
+first join**, since the ended thread's slot is its one owner, so nothing it shares a count with is
+left behind; joining such a handle a second time stops the program with a message. A `Share` answer —
+an `int`, a tuple of scalars, a `&sync T` — joined twice answers the same value without waiting again,
 and the scope does not join a thread that is already joined. `scope` answers what `body` answered:
 
 ```sysl
