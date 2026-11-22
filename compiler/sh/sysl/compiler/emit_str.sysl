@@ -535,6 +535,8 @@ end str_cmp
 // Whether two strings hold the same bytes, as an `i1` -- what `==` and `!=` lower to, rather than
 // `str_cmp`'s order read against zero (`str_eq_text` says why).
 str_eq(e: *Emit, av: Val, bv: Val) -> Val
+    if short_strings_on() then return str_eq_words(e, av, bv)
+
     val a = str_data(e, av)
     val b = str_data(e, bv)
     val fn = request_text(e, "sysl.str.eq", str_eq_text(word_llvm_of(e)))
@@ -548,6 +550,84 @@ str_eq(e: *Emit, av: Val, bv: Val) -> Val
     emit(e, ir_call(Some(r), l_i1(), VGlobal(fn), args))
     r
 end str_eq
+
+// `==` where the short form is on: both strings handed over as their two words, unspilled, and the
+// form asked inside `@sysl.str.eq.words` (`str_eq_words_text` says why).
+private str_eq_words(e: *Emit, av: Val, bv: Val) -> Val
+    request_text(e, "sysl.str.eq", str_eq_text(word_llvm_of(e)))
+
+    val fn = request_text(e, "sysl.str.eq.words", str_eq_words_text(word_llvm_of(e), e.word_bits))
+    val r = fresh_reg(e)
+
+    var args = str_word_args(e, av)
+
+    for item in str_word_args(e, bv)
+        args.push(item)
+
+    emit(e, ir_call(Some(r), l_i1(), VGlobal(fn), args))
+    r
+end str_eq_words
+
+// A string's pointer word and length word as they stand -- for a short string, its bytes and its tag,
+// not a pointer and a length -- as a call's two arguments. Only a helper that asks the form itself
+// (`@sysl.str.eq.words`, `@sysl.str.boundary.words`) is handed these.
+private str_word_args(e: *Emit, v: Val) -> Buf[IrArg]
+    val (w1, w2) = str_words(e, v)
+
+    str_args(e, w1, w2)
+end str_word_args
+
+// A string's pointer word and length word as they stand, unread by the form.
+private str_words(e: *Emit, v: Val) -> (Val, Val)
+    val w1 = fresh_reg(e)
+
+    emit(e, InExtract(w1, lty(e, Str), v, index_list(1)))
+
+    val w2 = fresh_reg(e)
+
+    emit(e, InExtract(w2, lty(e, Str), v, index_list(2)))
+    (w1, w2)
+end str_words
+
+// **What a substring of a string that may be short is narrowed from** (`gen_slice_of`'s `source`):
+// the owner, the pointer word as it stands, and the length. The pointer word is a pointer only where the
+// string is long; where it is short the substring is made from the words (`str_short_run`) and the
+// long view built from this pointer is never chosen except as an empty run, which `str_run_ptr` points
+// at the empty constant. So nothing is spilled.
+str_source_parts(e: *Emit, v: Val) -> (Val, Val, Option[Val])
+    val o = fresh_reg(e)
+
+    emit(e, InExtract(o, lty(e, Str), v, index_list(0)))
+
+    val (w1, _) = str_words(e, v)
+    (o, w1, Some(str_len(e, v)))
+end str_source_parts
+
+// The first byte of a run starting at `p` (the pointer word of `source` stepped by the start): itself
+// where `source` is long, and the empty constant where it is short -- the one case the long view of a
+// short source is chosen is an empty run, and the empty string is never short.
+str_run_ptr(e: *Emit, source: Val, p: Val) -> Val
+    request_text(e, "sysl.str.short", str_short_text_of(e))
+
+    val r = fresh_reg(e)
+
+    emit(e, InSelect(r, str_is_short(e, source), LPtr, VGlobal("sysl.str.empty"), p, l_i1()))
+    r
+end str_run_ptr
+
+// `str_boundary` of a string that may be short, from its words as they stand: nothing spilled.
+str_boundary_words(e: *Emit, source: Val, n: Val, i: Val) -> Val
+    val fn = request_text(e, "sysl.str.boundary.words",
+                          str_boundary_words_text(word_llvm_of(e), e.word_bits))
+    val r = fresh_reg(e)
+
+    var args = str_word_args(e, source)
+
+    args.push(ir_arg(word_lty(e), n))
+    args.push(ir_arg(word_lty(e), i))
+    emit(e, ir_call(Some(r), l_i1(), VGlobal(fn), args))
+    r
+end str_boundary_words
 
 // The position of a string in a sorted constant table of `count` strings, or `count` where it is not
 // there -- one call, whose search asks `str_cmp`'s comparison, so the comparison is requested first.
