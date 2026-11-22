@@ -171,9 +171,10 @@ own body holds it (`opaque_in`) — the words `--explain-borrows` will quote. A 
   `(slot of E)` and the counted edges inside an `E`; `slot_put` (fills an empty slot) and
   `slot_storage` write nothing a reader could have read, and neither does relocation;
 - each count read (`slot_vacate`; there is no other uniqueness test today): the element type;
-- **`opaque`** for: a call through a closure (an erased `FnN` table — not followed into the closures
-  it could be, even in a closed program; a closure called directly by its own type is an ordinary
-  call), a call through a function value, a table call not resolved by `slot_callees` in a closed
+- **`opaque`** for: a call through a closure or a trait object's table where the build does not see
+  every table (a library or archive; in a program's own build each is the join of the functions that
+  slot holds in the tables of that trait at its arguments, `table_writes`; a closure called directly
+  by its own type is an ordinary call), a table call not resolved by `slot_callees` in a closed
   program, a store through a laundered cast, a suspension (`await`, `block_on`, a step) and a fiber
   switch, inline `asm` that clobbers memory, a store to a place the analysis cannot name, and **any
   release that may run a destructor** (`may_run_drop` on what the body holds; BI5 refines this to the
@@ -223,7 +224,14 @@ as `type_show` names it (`m.Node.next`, `sysl.Option[&m.Node].Some.value`, `the 
 nothing killed so far), passed to a borrowed parameter of a direct call whose summary and the later
 arguments' (`written_by` already collects their local writes; their calls' summaries join) meet no
 key of `E` and are not opaque, is held. Never to an owned parameter, an `async` or `@abandons`
-callee, a vtable/closure/function-value call, or a C function (the same list `lent_view` refuses).
+callee, or a C function or C function pointer.
+
+A call through a closure or a trait object's table is asked the same, of the functions its slot
+holds (`table_targets`: one per table of the trait at the receiver's arguments). Each is entered
+through its borrowing entry `S`, which takes its own count of what it keeps, so no argument is handed
+over and the owned-parameter rules do not arise; the summary is `table_writes`, the join of theirs.
+Where the build sees no tables (a library, an archive), a table lacks the slot, or a slot holds an
+`async` or `@abandons` function, the argument keeps its count.
 
 ## 5. ABI, separate compilation, codegen units
 

@@ -1347,7 +1347,37 @@ private temp_back() -> Back = Back(set(), buf(), set(), false)
 // `borrows` is whether the parameter is one the callee borrows. Where `--explain-borrows` is on, an
 // argument read through storage gets its line either way.
 held_backed(e: *Emit, args: Buf[TExpr], i: usize, callee: string, written: Set[string],
-            borrows: bool) -> Option[Buf[(Span, string)]]
+            borrows: bool) -> Option[Buf[(Span, string)]] =
+    held_backed_at(e, args, i, HeldSite(callee, None, -1, callee_shown(callee), borrows), written)
+
+// **The same for a call through slot `slot` of the table `recv` carries** -- a trait object's method
+// or a closure. Every function the slot can hold in the program's tables is reached through its
+// borrowing entry (`S`), which takes a count of its own of what it keeps, so no argument is handed
+// over; what is left to judge is what those functions write (`table_writes`). A build that sees no
+// table (a library or archive), a slot some table lacks, and an `async` or `@abandons` target keep
+// the count.
+held_backed_table(e: *Emit, args: Buf[TExpr], i: usize, recv: TExpr, slot: int,
+                  written: Set[string]) -> Option[Buf[(Span, string)]]
+    val targets = table_targets(&e.untouched, recv, slot).unwrap_or(buf())
+    val shown = if closure_table(texpr_type(recv)) || targets.is_empty() then arg_text(recv)
+                else s"${arg_text(recv)}.${callee_shown(targets[0])}"
+
+    held_backed_at(e, args, i, HeldSite("", Some(recv), slot, shown, true), written)
+end held_backed_table
+
+// Who an argument is held for: a function by name (`callee`), or slot `slot` of the table `recv`
+// carries; `shown` is how the report names it, and `borrows` whether a named callee borrows the
+// parameter.
+private struct HeldSite
+    callee: string
+    recv: Option[TExpr]
+    slot: int
+    shown: string
+    borrows: bool
+end HeldSite
+
+private held_backed_at(e: *Emit, args: Buf[TExpr], i: usize, site: HeldSite,
+                       written: Set[string]) -> Option[Buf[(Span, string)]]
     if !e.held_args.ready then return None
 
     val w: &ArgWalk = ArgWalk(buf(), buf(), written)
@@ -1356,12 +1386,12 @@ held_backed(e: *Emit, args: Buf[TExpr], i: usize, callee: string, written: Set[s
     // A value with no edge between it and its roots is what `held` already judges.
     if b.keys.is_empty() && w.pointees.is_empty() then return None
 
-    val why = arg_refusal(e, w, b, args, i, callee, borrows)
+    val why = arg_refusal(e, w, b, args, i, site)
 
-    if explaining_borrows() then note_argument(e, args[i], callee, why)
+    if explaining_borrows() then note_argument(e, args[i], site.shown, why)
 
     if why != "" then None else Some(w.calls)
-end held_backed
+end held_backed_at
 
 // Where an argument's value comes from at the moment it is read, or `None` where it is not read out of
 // storage the frame can stand on. Only the spine is followed: a field, a dereference, an element at an
@@ -1505,29 +1535,41 @@ private bind_back(s: Back, p: TPattern, env: *Buf[(string, Back)]) = p match
     _ -> ()
 
 // Why the argument must keep its count, or empty where it need not.
-private arg_refusal(e: *Emit, w: &ArgWalk, b: Back, args: Buf[TExpr], i: usize, callee: string,
-                    borrows: bool) -> string
-    val f = callee_shown(callee)
+private arg_refusal(e: *Emit, w: &ArgWalk, b: Back, args: Buf[TExpr], i: usize, site: HeldSite) -> string
+    val f = site.shown
+    val callee = site.callee
 
-    if !borrows
-        if e.asyncs.has(callee) then return s"'$f' is async: its task outlives the call"
-        if e.abandoning.has(callee) then return s"'$f' abandons the frame"
+    val summary = site.recv match
+        Some(recv) ->
+            for t in table_targets(&e.untouched, recv, site.slot).unwrap_or(buf())
+                if e.asyncs.has(t) then return s"'${callee_shown(t)}' is async: its task outlives the call"
+                if e.abandoning.has(t) then return s"'${callee_shown(t)}' abandons the frame"
 
-        return s"'$f' keeps it"
-    end if
+            table_writes(&e.untouched, recv, site.slot, if closure_table(texpr_type(recv)) then "a call through a closure"
+                                                        else "a call through a trait object's table")
+        None ->
+            if !site.borrows
+                if e.asyncs.has(callee) then return s"'$f' is async: its task outlives the call"
+                if e.abandoning.has(callee) then return s"'$f' abandons the frame"
 
-    // A root handed over to the callee by another argument may be let go inside the call; so may what
-    // a pointer root points at, through a value handed over whose type reaches it.
-    for j in 0..<args.len()
-        if j == i || !e.owned_params.has(owned_key(callee, j)) then continue
+                return s"'$f' keeps it"
+            end if
 
-        for r in b.roots
-            if mentions(args[j], r) then return s"the root '${shown(r)}' is handed to '$f'"
+            // A root handed over to the callee by another argument may be let go inside the call; so
+            // may what a pointer root points at, through a value handed over whose type reaches it.
+            for j in 0..<args.len()
+                if j == i || !e.owned_params.has(owned_key(callee, j)) then continue
 
-        for t in w.pointees
-            if type_reaches(texpr_type(args[j]), t) then return s"a value reaching ${type_show(t)} is handed to '$f'"
+                for r in b.roots
+                    if mentions(args[j], r) then return s"the root '${shown(r)}' is handed to '$f'"
 
-    val said = kills(e, w, b, edge_writes(&e.untouched, callee), s"'$f'")
+                for t in w.pointees
+                    if type_reaches(texpr_type(args[j]), t) then
+                        return s"a value reaching ${type_show(t)} is handed to '$f'"
+
+            edge_writes(&e.untouched, callee)
+
+    val said = kills(e, w, b, summary, s"'$f'")
 
     if said != "" then return said
 
@@ -1633,7 +1675,7 @@ private type_reaches(from: Type, target: Type) -> bool
 end type_reaches
 
 // The argument's `--explain-borrows` line: held, or the first thing that keeps its count.
-private note_argument(e: *Emit, x: TExpr, callee: string, why: string)
+private note_argument(e: *Emit, x: TExpr, name: string, why: string)
     val f = e.body_func match
         Some(found) -> found
         None -> return
@@ -1642,7 +1684,6 @@ private note_argument(e: *Emit, x: TExpr, callee: string, why: string)
 
     val src = f.src.unwrap()
     val at = src.locate(x.span.start)
-    val name = callee_shown(callee)
     val head = s"${src.name}:${at.line}:${at.col + literate_shift(src)}: argument '${arg_text(x)}' of '$name'"
     val text = if why == "" then s"$head needs no count: '$name' writes no field on its way"
                else s"$head takes a count: $why"

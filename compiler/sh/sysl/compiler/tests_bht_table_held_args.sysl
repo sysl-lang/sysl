@@ -1,0 +1,534 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{cstring, str_builder}
+import sysl.fs.{make_dir_all, make_temp_dir, read_text, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **An argument of a call through a table -- a closure's or a trait object's -- needs no count of its
+// own where no function the slot can hold writes its chain** (`plus0_locals.sysl`'s
+// `held_backed_table`, `docs/design/borrow-inference.md` §4.4). In a program's build every table is in
+// sight (`table_targets`); each function a slot holds is entered through its borrowing entry, so the
+// call hands nothing over and what is left to judge is what those functions write (`table_writes`).
+//
+// Two proofs, as for `tests_bla_held_args.sysl`: the IR of the function making the call (its count
+// operations), and every program run on the counted heap at both ends of the optimizer and under
+// AddressSanitizer with the instrumentation confirmed. Every refused row asserts its `--explain-borrows`
+// line and that the count is still taken.
+//
+// The axes: the table (a closure, a trait object through a pointer, a counted trait object, a generic
+// trait at two argument lists), what the slot can hold (one function that reads, one of two that
+// writes the edge, a function that calls back through the same table), what else is in the window (a
+// later argument's call that writes the edge), and the build (a program, a C archive, where no table
+// is in sight). Beside them, a call through a C function pointer, which is never asked. Cells not
+// written: an `async` or `@abandons` function in a slot -- an `async` method is not object-safe and a
+// closure body cannot be either, so no table holds one (the arm refuses it all the same); an argument
+// crossing by address -- never asked, it keeps the snapshot a direct call's does; a `.syslib` build --
+// it has no tables exactly as the archive has none (`untouched_summary`'s `closed && entry_point`).
+
+private extern "setenv" bht_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" bht_c_unsetenv(name: *u8) -> int
+
+private struct BhtRun
+    ok: bool
+    out: string
+    err: string
+    hooks: usize
+
+private bht_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end bht_ready
+
+// A two-node list and a reader of what an `Option` holds.
+private bht_head() -> string = """
+    struct Node
+        v: int
+        next: Option[&Node]
+
+    peek(x: Option[&Node]) -> int = x match
+        Some(m) -> m.v
+        None -> 0
+
+    """
+
+private bht_ir(text: string) -> string
+    val root = make_temp_dir("sysl-bht").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None, "0") match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end bht_ir
+
+// One function's text, from its `define` to the brace that closes it.
+private bht_body(out: string, name: string) -> string
+    for head in ["@" + name + "$$sysl", "@$env0." + name + "(", "@" + name + "(", "." + name + "$$sysl"]
+        var b = str_builder()
+        var inside = false
+
+        for line in lines_of(out)
+            if !inside && line.starts_with("define ") && line.contains(head) then inside = true
+
+            if inside
+                if line == "}" then return b.finish()
+
+                b.push(line)
+                b.push_char('\n')
+
+    s"no definition of '$name' in:\n$out"
+end bht_body
+
+// The count operations of `name`'s unoptimized body in a program.
+private bht_ops(text: string, name: string) -> usize
+    val f = bht_body(bht_ir(text), name)
+
+    assert(f.starts_with("define"), f)
+    bht_count_ops(f)
+end bht_ops
+
+private bht_count_ops(body: string) -> usize =
+    body.count_of("call void @arc.retain") + body.count_of("call void @arc.release") +
+        body.count_of("call void @arc.copy.") + body.count_of("call void @arc.dispose.")
+
+private bht_run(text: string, level: string, counted: bool, flags: string) -> BhtRun
+    val root = make_temp_dir("sysl-bht").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    if counted then force_alloc_counting(true)
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+        val v = cstring(flags)
+
+        bht_c_setenv(n.ptr, v.ptr, 1)
+    end if
+
+    val built = build_native_program(s"$root/main.sysl", None, None, level, Some(exe))
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+
+        bht_c_unsetenv(n.ptr)
+
+    if counted then force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return BhtRun(false, failure_text(why), "", 0)
+        Ok(_) -> ()
+
+    val hooks = capture("nm", ["-u", exe], "", [], true) match
+        Ok(o) -> o.text.count_of("__asan_report")
+        Err(_) -> 0
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> BhtRun(false, "could not be started", "", 0)
+        Ok(o) -> BhtRun(o.status.ok(), o.text, o.err.unwrap_or(""), hooks)
+end bht_run
+
+// Printed exactly `expected` at both ends of the optimizer on the counted heap, giving everything back,
+// and again under AddressSanitizer with the instrumentation in the binary.
+private bht_prints(text: string, expected: string)
+    if !bht_ready() then return
+
+    for level in ["0", "2"]
+        val run = bht_run(text, level, true, "")
+
+        assert(run.ok, s"-O$level: ${run.out}${run.err}")
+        assert_eq(run.out, expected)
+        assert(alloc_count_reported(run.err) == 0, s"-O$level: ${run.err}")
+
+    val asan = bht_run(text, "0", false, "-fsanitize=address -g")
+
+    assert(asan.hooks > 0, "the AddressSanitizer build carries no instrumentation")
+    assert(asan.ok, s"asan: ${asan.out}${asan.err}")
+    assert_eq(asan.out, expected)
+end bht_prints
+
+// The `--explain-borrows` lines about arguments, each without the file it names.
+private bht_explain(text: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    if !bht_ready() then return out
+
+    val root = make_temp_dir("sysl-bht").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    var notes: Buf[string] = buf()
+    val noted = &notes
+    val file = s"$root/main.sysl"
+    var args: Buf[string] = buf()
+
+    args.push("sysl")
+    args.push("emit-llvm")
+    args.push("--explain-borrows")
+    args.push(file)
+    run_cli_noted(args.view(), (line) -> sink.push(line), (line) -> noted.push(line))
+    remove_dir_all(root).unwrap_or(())
+
+    for item in notes
+        if item.starts_with(file + ":") && item.contains(": argument '") then out.push(item[file.len + 1..<item.len])
+
+    out
+end bht_explain
+
+// The line about the argument `arg` of the call shown as `callee`, or a complaint listing every line.
+private bht_line(lines: Buf[string], arg: string, callee: string) -> string
+    for item in lines
+        if item.contains(s"argument '$arg' of '$callee' ") then return item
+
+    s"no line for '$arg' of '$callee' in: $lines"
+end bht_line
+
+// -- a closure --------------------------------------------------------------------------------------
+
+private bht_closure() -> string = bht_head() + """
+    sum(f: &Fn(Option[&Node]) -> int, n: &Node) -> int = f(n.next)
+
+    main()
+        val n: &Node = Node(1, Some(Node(2, None)))
+
+        print(sum(x -> peek(x), n))
+
+    """
+
+@test("a call through a closure that only reads hands n.next over with no count, in a program")
+bht_closure_held()
+    if !bht_ready() then return
+
+    // Before, `n.next` took the guarantee count every argument read out of storage takes.
+    assert_eq(bht_ops(bht_closure(), "sum"), 0)
+    assert(bht_line(bht_explain(bht_closure()), "n.next", "f")
+               .ends_with("argument 'n.next' of 'f' needs no count: 'f' writes no field on its way"),
+           s"${bht_explain(bht_closure())}")
+    bht_prints(bht_closure(), "2\n")
+
+// Two closures of one type, the second cutting the list it is handed the head of through a global.
+private bht_closure_cut() -> string = bht_head() + """
+    var HEAD: Option[&Node] = None
+
+    sum(f: &Fn(Option[&Node]) -> int, n: &Node) -> int = f(n.next)
+
+    cut(x: Option[&Node]) -> int
+        HEAD.unwrap().next = None
+        peek(x)
+
+    main()
+        val n: &Node = Node(1, Some(Node(2, None)))
+
+        HEAD = Some(n)
+        print(sum(x -> peek(x), n))
+        print(sum(x -> cut(x), n))
+        HEAD = None
+
+    """
+
+@test("a call through a closure one of whose bodies writes Node.next keeps the count")
+bht_closure_writes()
+    if !bht_ready() then return
+
+    assert(bht_line(bht_explain(bht_closure_cut()), "n.next", "f").ends_with("takes a count: 'f' may write Node.next"),
+           s"${bht_explain(bht_closure_cut())}")
+    assert(bht_ops(bht_closure_cut(), "sum") > 0, "the guarantee count is gone")
+    bht_prints(bht_closure_cut(), "2\n2\n")
+
+// -- a trait object ---------------------------------------------------------------------------------
+
+// `$also` is erased beside the `Sum` that always is.
+private bht_looks(also: string) -> string = bht_head() + s"""
+    var HEAD: Option[&Node] = None
+
+    trait Look
+        look(*self, n: Option[&Node]) -> int
+
+    struct Sum
+        total: int
+
+    impl Look for Sum
+        look(*self, n: Option[&Node]) -> int
+            val v = peek(n)
+
+            self.total += v
+            v
+
+    struct Cut
+        k: int
+
+    impl Look for Cut
+        look(*self, n: Option[&Node]) -> int
+            HEAD.unwrap().next = None
+            peek(n)
+
+    walk(w: *Look, n: &Node) -> int = w.look(n.next)
+
+    main()
+        val n: &Node = Node(1, Some(Node(2, None)))
+        var s = Sum(0)
+
+        HEAD = Some(n)
+        print(walk(&s, n))
+        $also
+        HEAD = None
+
+    """
+
+@test("a trait object's call whose one implementation only reads holds its argument with no count")
+bht_trait_held()
+    if !bht_ready() then return
+
+    val text = bht_looks("")
+
+    assert_eq(bht_ops(text, "walk"), 0)
+    assert(bht_line(bht_explain(text), "n.next", "w.look").ends_with("needs no count: 'w.look' writes no field on its way"),
+           s"${bht_explain(text)}")
+    bht_prints(text, "2\n")
+
+@test("a trait object's call one of whose implementations writes Node.next keeps the count")
+bht_trait_writes()
+    if !bht_ready() then return
+
+    val text = bht_looks("var c = Cut(0)\n    print(walk(&c, n))")
+
+    assert(bht_line(bht_explain(text), "n.next", "w.look").ends_with("takes a count: 'w.look' may write Node.next"),
+           s"${bht_explain(text)}")
+    assert(bht_ops(text, "walk") > 0, "the guarantee count is gone")
+    bht_prints(text, "2\n2\n")
+
+// A later argument that writes the edge keeps the count, whatever the table's functions do.
+private bht_later() -> string = bht_head() + """
+    trait Pair
+        pair(*self, a: Option[&Node], b: int) -> int
+
+    struct Add
+        k: int
+
+    impl Pair for Add
+        pair(*self, a: Option[&Node], b: int) -> int = peek(a) + b
+
+    snip(n: &Node) -> int
+        n.next = None
+        0
+
+    both(p: *Pair, n: &Node) -> int = p.pair(n.next, snip(n))
+
+    main()
+        var a = Add(0)
+
+        print(both(&a, Node(1, Some(Node(2, None)))))
+
+    """
+
+@test("an argument of a table call that a later argument's call overwrites keeps its count")
+bht_later_argument_writes()
+    if !bht_ready() then return
+
+    val line = bht_line(bht_explain(bht_later()), "n.next", "p.pair")
+
+    assert(line.contains("takes a count: 'snip' at ") && line.ends_with(" may write Node.next"), line)
+    assert(bht_ops(bht_later(), "both") > 0, "the guarantee count is gone")
+    bht_prints(bht_later(), "2\n")
+
+// A counted trait object: the call is judged by the tables as a pointer's is.
+private bht_counted() -> string = bht_head() + """
+    trait Step
+        step(self, n: Option[&Node]) -> int
+
+    struct Look
+        k: int
+
+    impl Step for Look
+        step(self, n: Option[&Node]) -> int = peek(n) + self.k
+
+    run(s: &Step, n: &Node) -> int = s.step(n.next)
+
+    main()
+        print(run(Look(10), Node(1, Some(Node(2, None)))))
+
+    """
+
+@test("a counted trait object's call holds its argument where no implementation writes or drops")
+bht_counted_trait()
+    if !bht_ready() then return
+
+    assert(bht_line(bht_explain(bht_counted()), "n.next", "s.step").ends_with("needs no count: 's.step' writes no field on its way"),
+           s"${bht_explain(bht_counted())}")
+    assert_eq(bht_ops(bht_counted(), "run"), 0)
+    bht_prints(bht_counted(), "12\n")
+
+// -- a trait at two argument lists ------------------------------------------------------------------
+
+// `Take[&Node]` writes the edge; `Take[Option[&Node]]` only reads. Both are erased.
+private bht_takes() -> string = bht_head() + """
+    trait Take[T]
+        take(*self, x: T) -> int
+
+    struct Cutter
+        k: int
+
+    struct Reader
+        k: int
+
+    impl Take[&Node] for Cutter
+        take(*self, x: &Node) -> int
+            x.next = None
+            0
+
+    impl Take[Option[&Node]] for Reader
+        take(*self, x: Option[&Node]) -> int = peek(x)
+
+    read_next(t: *Take[Option[&Node]], n: &Node) -> int = t.take(n.next)
+
+    cut_at(t: *Take[&Node], n: &Node) -> int = t.take(n)
+
+    main()
+        val n: &Node = Node(1, Some(Node(2, None)))
+        var c = Cutter(0)
+        var r = Reader(0)
+
+        print(read_next(&r, n))
+        print(cut_at(&c, n))
+        print(read_next(&r, n))
+
+    """
+
+@test("a generic trait's call is judged by its tables at its own arguments: Take[&Node]'s cut is not")
+bht_trait_arguments()
+    if !bht_ready() then return
+
+    assert(bht_line(bht_explain(bht_takes()), "n.next", "t.take").ends_with("needs no count: 't.take' writes no field on its way"),
+           s"${bht_explain(bht_takes())}")
+    assert_eq(bht_ops(bht_takes(), "read_next"), 0)
+    bht_prints(bht_takes(), "2\n0\n0\n")
+
+// -- recursion through a table ----------------------------------------------------------------------
+
+// `run` calls through the table into `Deep.go`, which calls `run` again; `$bottom` is what the last
+// node does.
+private bht_deep(bottom: string) -> string = bht_head() + s"""
+    trait Go
+        go(*self, n: Option[&Node]) -> int
+
+    struct Deep
+        k: int
+
+    impl Go for Deep
+        go(*self, n: Option[&Node]) -> int = n match
+            Some(m) -> 1 + run(self, m)
+            None -> $bottom
+
+    run(g: *Go, m: &Node) -> int = g.go(m.next)
+
+    var HEAD: Option[&Node] = None
+
+    main()
+        val n: &Node = Node(1, Some(Node(2, Some(Node(3, None)))))
+        var d = Deep(0)
+
+        HEAD = Some(n)
+        print(run(&d, n))
+        HEAD = None
+
+    """
+
+@test("recursion through a table settles on what the bodies write: nothing, so the argument is held")
+bht_recursion_held()
+    if !bht_ready() then return
+
+    val text = bht_deep("0")
+
+    assert(bht_line(bht_explain(text), "m.next", "g.go").ends_with("needs no count: 'g.go' writes no field on its way"),
+           s"${bht_explain(text)}")
+    assert_eq(bht_ops(text, "run"), 0)
+    bht_prints(text, "2\n")
+
+@test("recursion through a table whose last call cuts the list keeps the count")
+bht_recursion_writes()
+    if !bht_ready() then return
+
+    val text = bht_deep("cut_head()") + """
+    cut_head() -> int
+        HEAD.unwrap().next = None
+        0
+
+    """
+
+    assert(bht_line(bht_explain(text), "m.next", "g.go").ends_with("takes a count: 'g.go' may write Node.next"),
+           s"${bht_explain(text)}")
+    assert(bht_ops(text, "run") > 0, "the guarantee count is gone")
+    bht_prints(text, "2\n")
+
+// -- what is never asked ----------------------------------------------------------------------------
+
+private bht_pointer() -> string = bht_head() + """
+    peek_at(x: &Node) -> int = x.v
+
+    via(f: *extern(&Node) -> int, n: &Node) -> int = f(n.next.unwrap())
+
+    main()
+        print(via(&peek_at, Node(1, Some(Node(2, None)))))
+
+    """
+
+@test("a call through a C function pointer keeps the count: no table answers for it")
+bht_function_pointer()
+    if !bht_ready() then return
+
+    assert(bht_ops(bht_pointer(), "via") > 0, "the guarantee count is gone")
+    bht_prints(bht_pointer(), "2\n")
+
+// The closure program as a C archive: the export is the only way in, and C can hand it anything.
+private bht_archive() -> string = bht_head() + """
+    sum(f: &Fn(Option[&Node]) -> int, n: &Node) -> int = f(n.next)
+
+    @export("bht_go")
+    go() -> int = sum(x -> peek(x), Node(1, Some(Node(2, None))))
+
+    """
+
+@test("in a C archive, which sees no table, a call through a closure keeps the count")
+bht_archive_refused()
+    if !bht_ready() then return
+
+    val root = make_temp_dir("sysl-bht").unwrap()
+
+    write_text(s"$root/sysl.hocon", "package { name = \"bht\" }\n").unwrap()
+    write_text(s"$root/main.sysl", bht_archive()).unwrap()
+
+    val (code, out, err) = clx_ran(["sysl", "build-c", root, "-o", s"$root/bht.a", "--emit-llvm", s"$root/out.ll"])
+    val ll = read_text(s"$root/out.ll").unwrap_or("")
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(code, 0, s"$out$err")
+
+    val f = bht_body(ll, "sum")
+
+    assert(f.starts_with("define"), f)
+    assert(bht_count_ops(f) > 0, s"the guarantee count is gone:\n$f")
+
+    // The same function in a program holds it with none.
+    assert_eq(bht_ops(bht_closure(), "sum"), 0)
