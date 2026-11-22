@@ -4,7 +4,6 @@ module sysl.process
 import sysl.buf.{Buf, buf}
 import sysl.fs.{IoError, from_status}
 import sysl.process.sys as psys
-import sysl.process.sys.Text
 import sysl.slices.as_ptr
 
 /** Replaces this program with `program`, run with `args`, and answers only if that failed.
@@ -31,24 +30,20 @@ import sysl.slices.as_ptr
  */
 exec(program: string, args: []const string = [], env: []const Var = [],
      inherit_env: bool = true) -> IoError
-    var argv: Buf[Text] = buf()
+    // The bytes of every argument and every `NAME=VALUE` are held here until the call is over, so no
+    // text lent below outlives what it points into (`lent`).
+    var args_held: Buf[[]const u8] = buf()
 
-    argv.push(Text(as_ptr(program.bytes), program.bytes.len))
+    args_held.push(program.bytes)
 
-    for a in args do argv.push(Text(as_ptr(a.bytes), a.bytes.len))
+    for a in args do args_held.push(a.bytes)
 
-    // Each `NAME=VALUE` is made here and held in `lines` until the call is over, so no text lent
-    // below outlives what it points into.
-    var lines: Buf[string] = buf()
+    var env_held: Buf[[]const u8] = buf()
 
-    for v in env do lines.push(s"${v.name}=${v.value}")
+    for v in env do env_held.push(s"${v.name}=${v.value}".bytes)
 
-    var envp: Buf[Text] = buf()
-
-    for i in 0..<lines.len()
-        val line = lines[i]
-
-        envp.push(Text(as_ptr(line.bytes), line.bytes.len))
+    val argv = lent(args_held)
+    val envp = lent(env_held)
 
     val e = psys.exec(as_ptr(program.bytes), program.bytes.len, as_ptr(argv.view()), argv.len(),
                       as_ptr(envp.view()), envp.len(), if inherit_env then 1 else 0)
