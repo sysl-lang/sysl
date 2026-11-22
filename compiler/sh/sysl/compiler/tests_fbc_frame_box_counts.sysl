@@ -4,7 +4,7 @@ module sh.sysl.compiler
 import sysl.buf.{Buf, buf}
 import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
 import sysl.process.{capture, Var}
-import sysl.text.{cstring, Search}
+import sysl.text.{cstring, replace_all, Search}
 
 // A frame box whose every share the body that laid it can count is counted by the compiler
 // (`frame_counts.sysl`, `reference/memory.md § A box nothing keeps is laid in the frame`): no retain,
@@ -711,3 +711,225 @@ fbc_cells_run_clean_under_asan()
         assert_eq(got.err, "")
     end for
 end fbc_cells_run_clean_under_asan
+
+// -- a teardown that runs the program's code goes through the reaper -------------------------------
+//
+// `arc.framedown.<T>` of a payload whose teardown runs a destructor hands the box to `arc.reap`, as a
+// heap box's last release does, so what a destructor lets go of waits for the destructor to finish,
+// and a box let go of inside another's destructor waits its turn. Each cell is run with the box laid
+// in the frame and with the box kept on the heap by a weak reference, and the two print the same.
+
+// `drop(*self)` replacing a field: the old one goes after the destructor, the new one after that.
+// `KEEP` is where the heap variant weakens the box.
+private val fbc_replacing: string = raw"""
+    struct Handle
+        id: int
+
+    impl Drop for Handle
+        drop(*self) = print("drop", self.id)
+
+    struct Swap
+        inner: &Handle
+
+    impl Drop for Swap
+        drop(*self)
+            self.inner = Handle(99)
+            print("swapped")
+
+    check() -> string
+        val s = Swap(Handle(6))
+
+        KEEP
+        print("holding", s.inner.id)
+        "end"
+
+    main()
+        print(check())
+    """
+
+@test("a frame box's drop(*self) replacing a field releases the old one after the destructor, as on the heap")
+fbc_replaced_field_waits_for_the_destructor()
+    if !enm_ready() then return
+
+    val framed = replace_all(fbc_replacing, "KEEP", "val n = 0")
+    val heap = replace_all(fbc_replacing, "KEEP", "val w: weak Swap = s")
+    val want = "holding 6\nswapped\ndrop 6\ndrop 99\nend\n"
+
+    assert_eq(fbc_count(fbc_body(fbc_ir(framed), "check$$sysl"), "@arc.framedown.Swap("), 1)
+    fbc_check(framed, want)
+    fbc_check(heap, want)
+
+// A frame box with a destructor let go of inside a heap box's destructor, which runs inside the
+// drain: its frame ends with the destructor, so it is torn down at the end of its scope, where a heap
+// box would wait for the drain to reach it.
+private val fbc_inside: string = raw"""
+    struct Inner
+        id: int
+
+    impl Drop for Inner
+        drop(self) = print("inner", self.id)
+
+    struct Outer
+        id: int
+
+    impl Drop for Outer
+        drop(self)
+            if self.id > 0
+                val t: &Inner = Inner(self.id * 10)
+
+                KEEP
+                print("made", t.id)
+
+            print("outer", self.id)
+
+    main()
+        val o: &Outer = Outer(1)
+        val wo: weak Outer = o
+
+        print("start")
+    """
+
+@test("a frame box let go of inside a destructor's drain is torn down with its frame, never after it")
+fbc_inside_a_destructor_goes_with_its_frame()
+    if !enm_ready() then return
+
+    fbc_check(replace_all(fbc_inside, "KEEP", "val n = 0"), "start\nmade 10\ninner 10\nouter 1\n")
+    fbc_check(replace_all(fbc_inside, "KEEP", "val w: weak Inner = t"), "start\nmade 10\nouter 1\ninner 10\n")
+
+    val got = fbc_run(replace_all(fbc_inside, "KEEP", "val n = 0"), "-fsanitize=address -g")
+
+    assert(got.instrumented, "the binary calls no AddressSanitizer report")
+    assert_eq(got.out, "start\nmade 10\ninner 10\nouter 1\n")
+    assert_eq(got.err, "")
+
+// A payload with no destructor of its own whose fields have one: the walk's releases queue as a heap
+// hook's do, so the fields' destructors run in the heap's order.
+@test("a frame box with no destructor whose fields have one tears them down in the heap's order")
+fbc_fields_with_destructors()
+    if !enm_ready() then return
+
+    val text = raw"""
+        struct Leaf
+            id: int
+
+        impl Drop for Leaf
+            drop(self) = print("leaf", self.id)
+
+        struct Twig
+            id: int
+            leaf: &Leaf
+
+        impl Drop for Twig
+            drop(self) = print("twig", self.id)
+
+        struct Pair
+            a: &Twig
+            b: &Twig
+
+        main()
+            val p: &Pair = Pair(Twig(1, Leaf(11)), Twig(2, Leaf(22)))
+
+            print(p.a.id + p.b.id)
+        """
+    val heap = replace_all(text, "print(p.a.id", "val w: weak Pair = p\n    print(p.a.id")
+    val want = "3\ntwig 1\nleaf 11\ntwig 2\nleaf 22\n"
+
+    fbc_check(text, want)
+    fbc_check(heap, want)
+
+// -- a box read as something else stays on the heap --------------------------------------------------
+
+// `sysl.buf`'s `view_shared` shape: the box's address read out through a cast pointer and answered
+// inside a slice. Laid in the frame, the slice would name a dead slot.
+private val fbc_cast_out: string = raw"""
+    struct Pin
+        n: int
+
+    impl Drop for Pin
+        drop(self) = print("unpinned", self.n)
+
+    pinned(n: int) -> usize
+        var pin: &Pin = Pin(n)
+        val raw: *usize = ptr_cast(&pin)
+
+        *raw
+
+    main()
+        print(pinned(4) != 0)
+    """
+
+@test("a box whose address is read through a cast to another pointer type is not laid in the frame")
+fbc_cast_address_stays_on_the_heap()
+    if xvr_no_library() then return
+
+    val body = fbc_body(fbc_ir(fbc_cast_out), "pinned$$sysl")
+
+    assert(body.len() > 0)
+    assert_eq(fbc_count(body, "alloca %arc.Pin"), 0, fbc_text(body))
+
+@test("a frozen buffer shared across threads and viewed gives everything back with a later allocation")
+fbc_shared_view_balanced()
+    if !enm_ready() then return
+
+    fbc_check(raw"""
+        import sysl.buf.{Buf, buf, Frozen}
+
+        main()
+            var b: Buf[int] = buf()
+
+            b.push(2)
+
+            val g: &sync Frozen[int] = b.freeze()
+            val w = g.view()
+            val s = "x" + "y"
+
+            print(w[0], s)
+        """, "2 xy\n")
+
+// A heap box's destructor runs inside the drain, and the boxes it lays in its own frame are let go of
+// as it ends -- counted at run time here, held by a struct of the frame. Queued, they would be torn
+// down after the frame was gone; the frame mark in their weak count has `arc.reap` tear them down at
+// once.
+private val fbc_destructor_frame: string = raw"""
+    struct Res
+        name: string
+
+    impl Drop for Res
+        drop(self) = print("drop " + self.name)
+
+    struct Two
+        x: &Res
+        y: &Res
+
+    struct Node
+        n: int
+
+    impl Drop for Node
+        drop(self)
+            val t = Two(Res("x"), Res("y"))
+
+            print("drop node", self.n)
+
+    run()
+        val n = Node(1)
+
+        KEEP
+
+    run()
+    print("done")
+    """
+
+@test("boxes a heap box's destructor lays in its own frame are torn down before that frame ends")
+fbc_destructor_frame_boxes_in_a_drain()
+    if !enm_ready() then return
+
+    val want = "drop node 1\ndrop x\ndrop y\ndone\n"
+
+    fbc_check(replace_all(fbc_destructor_frame, "KEEP", "val w: weak Node = n"), want)
+    fbc_check(replace_all(fbc_destructor_frame, "KEEP", "val k = 0"), want)
+
+    val got = fbc_run(replace_all(fbc_destructor_frame, "KEEP", "val w: weak Node = n"), "-fsanitize=address -g")
+
+    assert(got.instrumented, "the binary calls no AddressSanitizer report")
+    assert_eq(got.out, want)
+    assert_eq(got.err, "")

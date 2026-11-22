@@ -158,7 +158,22 @@ arc_core(t: Target, reaper_exported: bool, switches: bool = false) -> string
     "  store ptr %p, ptr %head\n" +
     "  %d = load i8, ptr %flag\n" +
     "  %in = icmp ne i8 %d, 0\n" +
-    "  br i1 %in, label %done, label %drain\n" +
+    "  br i1 %in, label %inside, label %drain\n" +
+    // **A box laid in a frame cannot wait its turn in a drain already running** -- a destructor's own
+    // local, let go of as the destructor ends -- since its frame ends before the drain could reach
+    // it. Its weak count carries the frame mark (`emit_box.sysl`'s `frame_weak_mark`), which no heap
+    // box's ever does, and it is taken back off the list and torn down at once; what its teardown lets
+    // go of joins the drain.
+    "inside:\n" +
+    "  %wk = getelementptr %arc.header, ptr %p, i32 0, i32 2\n" +
+    s"  %m = load $word, ptr %wk\n" +
+    s"  %framed = icmp eq $word %m, -1\n" +
+    "  br i1 %framed, label %now, label %done\n" +
+    "now:\n" +
+    "  store ptr %w, ptr %head\n" +
+    s"  store $word 0, ptr %p\n" +
+    s"  call void @arc.destroy(ptr %p, ptr $slot)\n" +
+    "  ret void\n" +
     "drain:\n" +
     "  store i8 1, ptr %flag\n" +
     "  br label %loop\n" +

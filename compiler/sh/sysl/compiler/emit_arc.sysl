@@ -1223,9 +1223,29 @@ private payload_of(e: *Emit, payload: Type, p: Val) -> Val
 end payload_of
 
 // `arc.framedown.<T>`: what the release of a frame box's last share does, where the compiler counted
-// its shares (`frame_counts.sysl`) -- the payload let go of as a hook lets go of it, outside any
-// drain, and nothing freed.
+// its shares (`frame_counts.sysl`) -- the payload let go of as a hook lets go of it, and nothing freed.
+//
+// **A payload whose teardown runs the program's code is handed to the reaper**, as a heap box's last
+// release hands it: the header the frame entry may have left unwritten is written (the frame hook,
+// the frame mark for a weak count), and `arc.reap` starts a drain with it. A destructor's own releases -- a field
+// `drop(*self)` replaces -- and the destructors of what the walk lets go of then run in the order
+// they run for a heap box, after the destructor and in the drain's order. Torn down outside the
+// drain, each release in the destructor would run its own destructor on the spot. Inside a drain
+// already running (a frame box of a destructor's own) the box is torn down at once, since its frame
+// ends before the drain could reach it. A payload that runs no code tears down directly: nothing it
+// frees can tell the order.
 private gen_frame_down(e: *Emit, payload: Type)
+    if !is_compact(e, payload) && (destructor_of(e, payload).is_some() || runs_code(e, payload))
+        val bn = box_lty(e, payload)
+        val hook = request_helper(e, s"arc.dropframe.${mangle(payload)}", HrFrameDrop(payload))
+
+        store_header_word(e, bn, VReg("p"), 1, LPtr, VGlobal(hook))
+        store_header_word(e, bn, VReg("p"), 2, word_lty(e), VInt(from_int(frame_weak_mark())))
+        arc_call(e, "arc.reap", VReg("p"))
+        emit_term(e, InRet(None, None))
+        return
+    end if
+
     let_go_of_payload(e, payload, payload_of(e, payload, VReg("p")), false)
     emit_term(e, InRet(None, None))
 end gen_frame_down

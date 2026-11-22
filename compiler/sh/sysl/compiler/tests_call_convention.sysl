@@ -323,9 +323,29 @@ cc_a_module_writer_reads_what_it_was_given()
     assert(cc_run(cc_clobber()).contains("1\n"))
 end cc_a_module_writer_reads_what_it_was_given
 
+// The assignment on one path only: the count taken at entry is what the assignment gives back.
 @test("a reader that reassigns its own parameter keeps its count, because the assignment gives one back")
 cc_a_reassigned_parameter_keeps_its_count()
     if cc_no_library() then return
+
+    val src = cc_node() + raw"""
+        peek(h: Holder, c: bool) -> int
+            val a = h.r.v
+            if c then h = Holder(Node(2))
+            a + h.r.v
+        var n: &Node = Node(1)
+        print(peek(Holder(n), false), peek(Holder(n), true))
+        """
+
+    assert(cc_body(cc_ir(src), "peek").contains(cc_entry_retain()))
+end cc_a_reassigned_parameter_keeps_its_count
+
+// Assigned before anything reads it, the entry's count and the release the assignment makes are one
+// pair with nothing between them, and both go (`arc_elide.sysl`): the old value is never released
+// by the callee, the new one once, at the end.
+@test("a parameter overwritten before it is read takes no count it would give straight back")
+cc_an_overwritten_parameter_takes_nothing()
+    if !cc_can_run() then return
 
     val src = cc_node() + raw"""
         peek(h: Holder) -> int
@@ -333,10 +353,12 @@ cc_a_reassigned_parameter_keeps_its_count()
             h.r.v
         var n: &Node = Node(1)
         print(peek(Holder(n)))
+        print(n.v)
         """
 
-    assert(cc_body(cc_ir(src), "peek").contains(cc_entry_retain()))
-end cc_a_reassigned_parameter_keeps_its_count
+    assert(!cc_body(cc_ir(src), "peek").contains(cc_entry_retain()))
+    assert_eq(cc_run(src), "dropped 2\n2\n1\ndropped 1\n")
+end cc_an_overwritten_parameter_takes_nothing
 
 @test("a reader that calls something")
 cc_a_reader_that_calls_takes_nothing()
@@ -499,12 +521,16 @@ cc_a_temporary_is_not_retained()
     assert(!cc_body(cc_ir(cc_temp_src()), "report").contains("@arc.copy.Holder("))
 end cc_a_temporary_is_not_retained
 
-// The one release is the temporary's own, at the end of the statement that made it.
+// The one release is the temporary's own, at the end of the statement that made it. `make` is a
+// factory whose box `report` keeps no longer than itself, so it is laid in `report`'s frame and its
+// last share is the compiler's to count: the release is `arc.framedown.Node` (`frame_counts.sysl`).
 @test("and the single release is the caller's, after the call")
 cc_a_temporary_is_released_once()
     if cc_no_library() then return
 
-    assert_eq(cc_count(cc_body(cc_ir(cc_temp_src()), "report"), "@arc.release("), 1)
+    val body = cc_body(cc_ir(cc_temp_src()), "report")
+
+    assert_eq(cc_count(body, "@arc.release(") + cc_count(body, "@arc.framedown.Node("), 1)
 end cc_a_temporary_is_released_once
 
 @test("and the temporary is destroyed exactly once, after the call returns")
