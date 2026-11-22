@@ -1,0 +1,208 @@
+module sh.sysl.compiler
+@tests
+
+// What the +0 locals analysis (`plus0_locals.sysl`) and the edge-write summary it asks
+// (`borrowing.sysl`'s `edge_writes`) cost as a body and a program grow.
+//
+// **Both have to be no worse than linear in what they read.** The analysis walked each candidate's
+// scope once per candidate, so a body of `n` locals read through cost `n` squared; and the summary's
+// fixed point found a type in a body's `within` and `counts` by scanning them, so joining callee into
+// caller over the whole program cost the square of the types a body writes. The compiler's own tree --
+// a test dispatcher of thousands of statements, bodies that write through hundreds of types -- went
+// from four minutes to past fifteen under both.
+//
+// The analysis is held to a count of the events its walks make, which does not depend on the machine;
+// the summary to a ratio of processor time (`tests_lgr_linear_growth.sysl`). Beside each, the answers
+// the faster form must keep: every candidate +0 where nothing in its scope cuts its chain, and every one
+// counted where the cut is the last statement of a long scope.
+
+import sysl.buf.{Buf, buf}
+import sysl.container.set
+
+// -- the +0 analysis -------------------------------------------------------------------------------
+
+// One body of `n` locals, each read out of `h.leaf` and read through, each statement calling a function
+// that writes nothing. `cut` puts a store to `h.leaf` -- which cuts every local's chain -- before the
+// locals ("before": no scope holds it), after them ("after": every scope does), or nowhere ("").
+private pzg_body(n: usize, cut: string) -> string
+    var lines: Buf[string] = buf()
+
+    lines.push("struct Leaf\n    v: int\n\nstruct Holder\n    leaf: &Leaf\n    other: &Leaf\n\n")
+    lines.push("peek(l: &Leaf) -> int = l.v\n\n")
+    lines.push("big(h: &Holder) -> int\n    var s = 0\n")
+
+    if cut == "before" then lines.push("    h.leaf = Leaf(0)\n")
+
+    for i in 0..<n
+        lines.push(s"    val a$i = h.leaf\n    s += a$i.v + peek(h.other)\n")
+
+    if cut == "after" then lines.push("    h.leaf = Leaf(0)\n")
+
+    lines.push("    s\n\nvar got = 0\n\ngot = big(Holder(Leaf(1), Leaf(2)))\n")
+
+    var text = ""
+
+    for line in lines
+        text = text + line
+
+    text
+end pzg_body
+
+// The analysis's work over one lowering of `text`: the events it made and the +0 locals it found.
+private pzg_lowered(text: string) -> (usize, usize)
+    val done = typed_of(text)
+
+    assert(done.reported.is_empty(), pzg_unsound(done))
+
+    val p = strip_tests(program_of(done, done.main_module))
+    val promotions = check_escapes(done.an, p)
+
+    take_plus0_work()
+
+    val lowered = codegen_with_gaps(p, done.an.tables.target, promotions)
+
+    assert(lowered.1.is_empty(), "the generated program lowers whole")
+    take_plus0_work()
+end pzg_lowered
+
+@test("a body of eight times as many +0 locals makes about eight times as many events, not sixty-four")
+pzg_events_grow_with_the_body()
+    val small = pzg_lowered(pzg_body(50, ""))
+    val large = pzg_lowered(pzg_body(400, ""))
+
+    assert(small.0 > 0, "the analysis walked the body")
+    assert(large.0 < 10 * small.0, s"events: ${small.0} at 50 locals, ${large.0} at 400")
+
+@test("every local of a long body is +0 where nothing in its scope cuts its chain")
+pzg_long_body_all_plus0()
+    val none = pzg_lowered(pzg_body(400, "after"))
+    val all = pzg_lowered(pzg_body(400, ""))
+    val early = pzg_lowered(pzg_body(400, "before"))
+
+    // What the rest of the program contributes is the same in all three.
+    assert(all.1 == none.1 + 400, s"+0 locals: ${all.1} uncut, ${none.1} cut at the end")
+    assert(early.1 == all.1, s"+0 locals: ${early.1} cut before the locals, ${all.1} uncut")
+
+@test("a cut at the end of a long scope keeps every local of it counted")
+pzg_cut_at_the_end_counts_them_all()
+    val cut = pzg_lowered(pzg_body(400, "after"))
+    val few = pzg_lowered(pzg_body(1, "after"))
+
+    assert(cut.1 == few.1, s"+0 locals: ${cut.1} over 400 locals, ${few.1} over one")
+
+// -- the edge-write summary ------------------------------------------------------------------------
+
+// `n` functions each storing through a pointer to a struct type of its own, one hub calling them all,
+// and `depth` more hubs each calling the one before: every hub's summary writes within all `n` types,
+// so each is joined `n` types at a time.
+private pzg_hubs(n: usize, depth: usize) -> string
+    var lines: Buf[string] = buf()
+
+    lines.push("struct Leaf\n    v: int\n\n")
+
+    for i in 0..<n
+        lines.push(s"struct T$i\n    leaf: &Leaf\n\nw$i(p: *T$i, l: &Leaf)\n    *p = T$i(l)\n\n")
+
+    lines.push("hub0(l: &Leaf)\n")
+
+    for i in 0..<n
+        lines.push(s"    var t$i = T$i(l)\n    w$i(&t$i, l)\n")
+
+    for k in 1..depth
+        lines.push(s"\nhub$k(l: &Leaf)\n    hub${k - 1}(l)\n")
+
+    lines.push(s"\nhub$depth(Leaf(1))\n")
+
+    var text = ""
+
+    for line in lines
+        text = text + line
+
+    text
+end pzg_hubs
+
+private pzg_program(text: string) -> TProgram
+    val done = typed_of(text)
+
+    assert(done.reported.is_empty(), pzg_unsound(done))
+    program_of(done, done.main_module)
+end pzg_program
+
+private pzg_unsound(done: TypedBodies) -> string =
+    if done.reported.is_empty() then "" else s"the generated program is refused: ${done.reported[0].diag.message}"
+
+// The program's function whose own name is `name`.
+private pzg_named(p: TProgram, name: string) -> string
+    for f in p.funcs
+        if f.name == name || f.name.ends_with(s"$ModuleSep$name") then return f.name
+
+    ""
+end pzg_named
+
+// The summary of the last hub, solved afresh.
+private pzg_solved(p: TProgram, hub: string) -> EdgeWrites
+    var u = untouched_summary(p, buf(), set(), true)
+
+    edge_writes(&u, hub)
+end pzg_solved
+
+private pzg_solving(n: usize) -> &Fn() -> long
+    val p = pzg_program(pzg_hubs(n, 40))
+    val hub = pzg_named(p, "hub40")
+    val w = pzg_solved(p, hub)
+
+    assert(hub != "", "the program has a function 'hub40'")
+    // Past `EdgeLimit` the summary is widened to opaque, which keeps no list: the solve still walks
+    // every body and every call, and that is what is timed.
+    val listed = w.opaque == "" && w.within.len() == n
+    val widened = n > EdgeLimit && w.opaque.starts_with("more than") && w.within.is_empty()
+
+    assert(listed || widened, s"the last hub writes within ${w.within.len()} types of $n, opaque '${w.opaque}'")
+
+    () -> processor_micros(() -> pzg_solved(p, hub))
+end pzg_solving
+
+@test("solving the edge summary of eight times as many written types costs about eight times as much, not sixty-four")
+pzg_edge_solve_is_linear_in_the_types()
+    val g = growth_of(pzg_solving(150), pzg_solving(150 * GrowthFactor))
+
+    assert(g.linear(), g.said("solving the edge summary"))
+
+// -- finding a type by its spelling ----------------------------------------------------------------
+
+@test("a type is found by its spelling and then compared whole, so types that share a spelling stay apart")
+pzg_shared_spelling_stays_apart()
+    var at = type_index()
+    var items: Buf[Type] = buf()
+
+    for t in [Bool, Char, Str]
+        at.add("same", items.len())
+        items.push(t)
+
+    assert(at.find(items, Char, "same").unwrap_or(9) == 1, "the second of three under one spelling")
+    assert(at.find(items, Bool, "same").unwrap_or(9) == 0, "the first, at the end of the chain")
+    assert(at.find(items, Str, "same").unwrap_or(9) == 2, "the newest, at its head")
+    assert(at.find(items, Unit, "same").is_none(), "a type not in the list, under a spelling that is")
+    assert(at.find(items, Bool, "other").is_none(), "a type in the list, under a spelling that is not")
+
+@test("a summary keeps each type it writes within or reads the count of once, and a join says when it grew")
+pzg_summary_lists_stay_sets()
+    var w = edge_writes_none()
+
+    assert(w.inside(Bool), "new")
+    assert(!w.inside(Bool), "again")
+    assert(w.count(Char), "new")
+    assert(!w.count(Char), "again")
+    assert(w.has_count(Char) && !w.has_count(Bool), "counts holds what was counted")
+
+    var v = edge_writes_none()
+
+    v.inside(Bool)
+    v.inside(Str)
+    v.count(Char)
+    v.count(Unit)
+
+    assert(w.join(v), "the join brought Str and Unit")
+    assert(!w.join(v), "a second join brings nothing")
+    assert(w.within.len() == 2 && w.counts.len() == 2, s"within ${w.within.len()}, counts ${w.counts.len()}")
+    assert(w.has_count(Unit), "a count joined in is found")

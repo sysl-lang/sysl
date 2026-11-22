@@ -359,7 +359,9 @@ bls_recursion()
     assert_eq(bls_keys(bls_of(&u, "ping")), cut, bls_says(bls_of(&u, "ping")))
     assert_eq(bls_keys(bls_of(&u, "pong")), cut, bls_says(bls_of(&u, "pong")))
 
-@test("a call through a closure is opaque, and so is its caller")
+// In a program a call through a closure is a call to each closure of its type
+// (`tests_bcs_closure_summaries.sysl`); a library cannot see them all.
+@test("in a library a call through a closure is opaque, and so is its caller")
 bls_closure_call()
     if bls_no_library() then return
 
@@ -374,7 +376,8 @@ bls_closure_call()
             use(n)
 
         """
-    var u = bls_summary(bls_program(text))
+    val p = bls_program(text)
+    var u = untouched_summary(p, bls_dropping(p), set(), false)
 
     // The call is the first thing `apply` hides; letting go of `f` at the return is another.
     assert_eq(bls_of(&u, "apply").opaque, "a call through a closure", bls_says(bls_of(&u, "apply")))
@@ -497,8 +500,10 @@ bls_table_call()
     assert_eq(bls_keys(w), "sysl.Option[&m.Node].Some.value, m.Node.next", bls_says(w))
     assert(w.opaque == "", bls_says(w))
 
-    // A counted trait object is let go of at the return, and its type does not say what that runs.
-    assert_eq(bls_of(&u, "held").opaque, "a destructor of '&m.Step'", bls_says(bls_of(&u, "held")))
+    // A counted trait object is let go of at the return: neither type behind it has a destructor
+    // (`tests_bcs_closure_summaries.sysl` has the one that does).
+    assert_eq(bls_keys(bls_of(&u, "held")), "sysl.Option[&m.Node].Some.value, m.Node.next", bls_says(bls_of(&u, "held")))
+    assert(bls_of(&u, "held").opaque == "", bls_says(bls_of(&u, "held")))
 
     var lib = untouched_summary(p, bls_dropping(p), set(), false)
 
@@ -620,18 +625,78 @@ bls_slots()
     assert(popped.counts.len() == 1 && popped.opaque == "", bls_says(popped))
     assert(pushed.counts.is_empty() && pushed.opaque == "", bls_says(pushed))
 
-// `push` fills the slot past the count with `slot_place`, which the summary cannot tell from an
-// overwrite of a live slot, and growing stores new storage into `BufCore.elems`, which moves counts
-// and gives none back but is a store of a counted field to the summary.
-@test("pushing writes no edge: it fills an empty slot, and growing moves counts", ignore: "push's slot_place and grow's elems store read as overwrites")
+// `push` fills the slot at the count with `slot_place` -- the first empty one -- and growing places
+// the live elements into storage it made, then stores that storage into `BufCore.elems`: a relocation
+// that moves counts and gives none back (`borrowing.sysl`'s `fills_only`, `relocation`).
+@test("pushing writes no edge: it fills an empty slot, and growing moves counts")
 bls_push_writes_nothing()
-    // TODO: un-ignore when the edge-write summary tells a push's fill and a growth's relocation from an overwrite
     if bls_no_library() then return
 
     var u = bls_summary(bls_program(bls_buffers()))
     val pushed = bls_of(&u, "add")
 
     assert(pushed.keys.is_empty() && pushed.opaque == "", bls_says(pushed))
+
+// The neighbours of the fill rule: storage the body made fills with no write, storage it was handed
+// (or made and then wrote, or handed out by address) writes its slots, and so does a `slot_place` at an
+// index that is not a `BufCore`'s count.
+private bls_fills() -> string = bls_head() + """
+    fresh(n: &Node) -> []&Node
+        var s: []&Node = slot_storage(4)
+
+        slot_place(s, 0, n)
+        s
+
+    handed(s: []&Node, n: &Node)
+        slot_place(s, 0, n)
+
+    rewritten(n: &Node, t: []&Node) -> []&Node
+        var s: []&Node = slot_storage(4)
+
+        s = t
+        slot_place(s, 0, n)
+        s
+
+    """
+
+@test("filling storage the body made writes no edge; storage it was handed, or wrote again, writes its slots")
+bls_fill_neighbours()
+    if bls_no_library() then return
+
+    var u = bls_summary(bls_program(bls_fills()))
+    val fresh = bls_of(&u, "fresh")
+    val handed = bls_of(&u, "handed")
+    val rewritten = bls_of(&u, "rewritten")
+
+    assert(fresh.keys.is_empty() && fresh.opaque == "", bls_says(fresh))
+    assert(bls_has(handed, "the slots of &m.Node"), bls_says(handed))
+    assert(bls_has(rewritten, "the slots of &m.Node"), bls_says(rewritten))
+
+// Popping still writes the slots after pushing stopped: `pop`'s `slot_vacate` is no fill, and a
+// buffer's `[i] = v` is an overwrite of a live slot -- a store through the address `index_place`
+// answers, so a write within `&m.Node` that meets every edge holding one.
+private bls_buffer_writes() -> string = bls_head() + """
+    import sysl.buf.{Buf, buf}
+
+    both(b: *Buf[&Node], n: &Node) -> Option[&Node]
+        b.push(n)
+        b.pop()
+
+    set(b: *Buf[&Node], n: &Node)
+        b[0] = n
+
+    """
+
+@test("a buffer's pop and its element store still write its slots, beside a push that writes none")
+bls_pop_and_store_still_write()
+    if bls_no_library() then return
+
+    var u = bls_summary(bls_program(bls_buffer_writes()))
+    val both = bls_of(&u, "both")
+    val set = bls_of(&u, "set")
+
+    assert(bls_has(both, "the slots of &m.Node") && both.counts.len() == 1, bls_says(both))
+    assert(bls_has(set, "the slots of &m.Node") || !set.within.is_empty(), bls_says(set))
 
 // -- generics --------------------------------------------------------------------------------------
 
