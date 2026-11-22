@@ -31,8 +31,11 @@ which costs every signature a choice between two types. sysl uses one type of th
 
 ### A string of a few bytes holds them in itself
 
-**A string the program makes of 15 bytes or fewer — 7 on a 32-bit machine — keeps its bytes in its
-own three words** and costs no allocation at all. The owner word is null, as a literal's is, so
+**This form is off by default, and `SYSL_SHORT_STRINGS=1` turns it on for a build.** It allocates
+less but is not yet faster on every program, so it stays a choice until it is.
+
+**With it on, a string the program makes of 15 bytes or fewer — 7 on a 32-bit machine — keeps its
+bytes in its own three words** and costs no allocation at all. The owner word is null, as a literal's is, so
 counting it costs nothing; the bytes fill the next two words but one byte; and that last byte, the top
 byte of the length word, holds the length with its top bit set, which no length a long string could
 have can reach. Every reader of a string asks that bit first, so a program sees one type:
@@ -83,9 +86,8 @@ view is live. That is how `Search` reads its receiver: its members ask `view_in_
 still takes the receiver by value, so it is asked of a `val`, a temporary or a `[]u8` as before.
 
 **A compiled library records which form it was built with**, and a build in the other form refuses it
-by name rather than linking bodies that read a string's words two ways. `SYSL_SHORT_STRINGS=0` turns
-the form off for a build, for diagnosing; every string is then long, byte for byte as before the form
-existed.
+by name rather than linking bodies that read a string's words two ways. With the form off, the
+default, every string is long, byte for byte as before the form existed.
 
 ## Validity
 
@@ -1224,11 +1226,13 @@ print(full)
 the string two strings join into needs an allocator, and this module declared '@no_alloc'
 ```
 
-**A `.bytes` that would outlive the frame needs one too, unless the string is known to hold its bytes
-elsewhere.** A string handed in may be [short](#a-string-of-a-few-bytes-holds-them-in-itself), and a
-short string's bytes are copied to the heap to outlive the frame that took them, so a module with no
-allocator may lend, index and iterate `s.bytes` but not return or store it. A literal's bytes, a cut
-of a literal's and `str_view`'s are never copied, and pass:
+**With the [short form](#a-string-of-a-few-bytes-holds-them-in-itself) on, a `.bytes` that would
+outlive the frame needs one too, unless the string is known to hold its bytes elsewhere.** A string
+handed in may then be short, and a short string's bytes are copied to the heap to outlive the frame
+that took them, so a module with no allocator may lend, index and iterate `s.bytes` but not return or
+store it; returning it is refused with *"this view of 's.bytes' is returned, and the string may hold
+its bytes in itself"*. A literal's bytes, a cut of a literal's and `str_view`'s are never copied, and
+pass. With the form off, the default, every string's bytes are elsewhere, so this compiles:
 
 ```sysl
 @no_alloc
@@ -1238,8 +1242,8 @@ param_view(s: string) -> []const u8 = s.bytes
 print(param_view("abcdefgh"[0..<3]).len)
 ```
 
-```error
-this view of 's.bytes' is returned, and the string may hold its bytes in itself
+```output
+3
 ```
 
 The rule that makes the subset usable is that such a module **may hold and release storage made
