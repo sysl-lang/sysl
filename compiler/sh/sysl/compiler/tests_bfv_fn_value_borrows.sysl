@@ -1,0 +1,298 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+
+// **Answer borrowing through a closure or a trait object's table** (`borrow_summary.sysl`'s
+// `table_ans`): in a program, which sees every table, the call answers as each body the slot holds in
+// the tables of the trait at the receiver's arguments, and is borrowed only where every one of them is;
+// a library or an archive (`emit-header`, `build-c`) and a C function pointer have no body in sight.
+// The axes: callee kind (closure literal, function named as a value, trait method), how many bodies
+// (one, two agreeing, one disagreeing), answer kind (place, +0), the trait's arguments, recursion
+// through a table, a call reaching the table call through a direct one, the build (program, archive),
+// and the lowering (no second entry for a body a table call runs through).
+
+// What one run came to: each line on standard output, each report line, and the file. `None`
+// without the library.
+private bfv_run(command: string, text: string) -> Option[(Buf[string], Buf[string], string)]
+    if xvr_no_library() then return None
+
+    val root = make_temp_dir("sysl-bfv").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    var notes: Buf[string] = buf()
+    val noted = &notes
+    val file = s"$root/main.sysl"
+    var args: Buf[string] = buf()
+
+    args.push("sysl")
+    args.push(command)
+    args.push("--explain-borrows")
+    args.push(file)
+
+    val code = run_cli_noted(args.view(), (line) -> sink.push(line), (line) -> noted.push(line))
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(code, Fine, s"$notes")
+    Some((lines, notes, file))
+end bfv_run
+
+// The report's line about the function written at `where`, without the file it names.
+private bfv_line(notes: Buf[string], file: string, where: string) -> string
+    for item in notes
+        if item.starts_with(s"$file:$where: ") then return item[file.len + where.len + 3..<item.len]
+
+    s"no line at $where in: $notes"
+end bfv_line
+
+// The program's IR, lowered in-process at -O0.
+private bfv_ir(text: string) -> string
+    val root = make_temp_dir("sysl-bfv").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None, "0") match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end bfv_ir
+
+private bfv_defines(ir: string, name: string) -> bool
+    for item in lines_of(ir)
+        if item.starts_with("define ") && item.contains(name) then return true
+
+    false
+end bfv_defines
+
+private bfv_head() -> string = """
+    struct Leaf
+        v: int
+
+    struct Pair
+        a: &Leaf
+        b: &Leaf
+
+    trait Get
+        get(self) -> &Leaf
+
+    struct A
+        leaf: &Leaf
+
+    impl Get for A
+        get(self) -> &Leaf = self.leaf
+
+    """
+
+private bfv_unshared() -> string = ", but its body may write or release what it was handed"
+
+// Two closure bodies (a literal and a function named as a value) both answering a place of what they
+// are handed; two implementations of a trait both answering a place of `self`, and of an `Option`
+// built of one (+0); a direct call reaching the table call; a closure of another type answering
+// something made here, which the call through `&Fn(&Pair) -> &Leaf` never reaches.
+private bfv_agreeing() -> string = bfv_head() + """
+    struct Other
+        o: &Leaf
+
+    struct B
+        one: &Leaf
+        two: &Leaf
+
+    impl Get for B
+        get(self) -> &Leaf = self.two
+
+    trait Opt
+        opt(self) -> Option[&Leaf]
+
+    impl Opt for A
+        opt(self) -> Option[&Leaf] = Some(self.leaf)
+
+    impl Opt for B
+        opt(self) -> Option[&Leaf] = Some(self.one)
+
+    via(p: &Pair, f: &Fn(&Pair) -> &Leaf) -> &Leaf = f(p)
+    dyn_get(x: &Get) -> &Leaf = x.get()
+    dyn_opt(x: &Opt) -> Option[&Leaf] = x.opt()
+    twice(x: &Get) -> &Leaf = dyn_get(x)
+    pick_b(p: &Pair) -> &Leaf = p.b
+    other(o: &Other, f: &Fn(&Other) -> &Leaf) -> &Leaf = f(o)
+
+    val p = Pair(Leaf(1), Leaf(2))
+
+    print(via(p, (q) -> q.a).v + via(p, pick_b).v)
+    print(dyn_get(A(Leaf(4))).v + twice(B(Leaf(5), Leaf(6))).v)
+    print(dyn_opt(A(Leaf(4))).is_some() && dyn_opt(B(Leaf(3), Leaf(2))).is_some())
+    print(other(Other(Leaf(7)), (o) -> Leaf(o.o.v)).v)
+    """
+
+@test("a call through a closure answers a place where every closure of its type does")
+bfv_closure_place()
+    bfv_run("emit-llvm", bfv_agreeing()) match
+        None -> ()
+        Some((_, notes, file)) ->
+            assert_eq(bfv_line(notes, file, "36:1"), "'via' answers a place of 'p': p.a | p.b" + bfv_unshared())
+            assert_eq(bfv_line(notes, file, "40:1"), "'pick_b' answers a place of 'p': p.b")
+end bfv_closure_place
+
+@test("a call through a trait object answers a place, or +0, where every implementation does")
+bfv_trait_place()
+    bfv_run("emit-llvm", bfv_agreeing()) match
+        None -> ()
+        Some((_, notes, file)) ->
+            assert_eq(bfv_line(notes, file, "37:1"),
+                      "'dyn_get' answers a place of 'x': x.leaf | x.two" + bfv_unshared())
+            assert_eq(bfv_line(notes, file, "38:1"),
+                      "'dyn_opt' answers +0 from 'x': x.leaf | x.one" + bfv_unshared())
+            assert_eq(bfv_line(notes, file, "39:1"),
+                      "'twice' answers a place of 'x': x.leaf | x.two" + bfv_unshared())
+end bfv_trait_place
+
+@test("a closure of another callable type is not followed: its fresh answer is its own call's")
+bfv_other_type()
+    bfv_run("emit-llvm", bfv_agreeing()) match
+        None -> ()
+        Some((_, notes, file)) ->
+            assert_eq(bfv_line(notes, file, "41:1"), "'other' is not borrowed: what 'closure2.call' answers, " +
+                      "which is not borrowed: a reference made here, at 41:54")
+end bfv_other_type
+
+// The answer through a table is a summary, not a second entry: the body in the slot answers through its
+// ordinary entry with a count, so a +0 entry for `via` would only move that count. `A.opt`, a body of
+// its own, still gets one, and `pick_b` its place entry.
+@test("a function borrowing through a table call gets no place or +0 entry; its callees keep theirs")
+bfv_no_second_entry()
+    if xvr_no_library() then return
+
+    val ir = bfv_ir(bfv_agreeing())
+
+    assert(!bfv_defines(ir, "@via$$sysl-"), "via has a second entry")
+    assert(!bfv_defines(ir, "@dyn_get$$sysl-"), "dyn_get has a second entry")
+    assert(!bfv_defines(ir, "@dyn_opt$$sysl-"), "dyn_opt has a second entry")
+    assert(bfv_defines(ir, "@A.opt-zero("), s"A.opt lost its +0 entry:\n$ir")
+    assert(bfv_defines(ir, "@pick_b$$sysl-place("), "pick_b lost its place entry")
+end bfv_no_second_entry
+
+// One body in the slot answering something made here, recursion through a closure (`k` calls `via`,
+// which calls `k`), and a C function pointer.
+private bfv_disagreeing() -> string = bfv_head() + """
+    struct C
+        n: int
+
+    impl Get for C
+        get(self) -> &Leaf = Leaf(self.n)
+
+    via(p: &Pair, f: &Fn(&Pair) -> &Leaf) -> &Leaf = f(p)
+    dyn_get(x: &Get) -> &Leaf = x.get()
+    pick_b(p: &Pair) -> &Leaf = p.b
+    c_pick(p: &Pair) -> &Leaf = p.a
+
+    by_pointer(p: &Pair) -> &Leaf
+        val f: *extern(&Pair) -> &Leaf = &c_pick
+
+        f(p)
+    end by_pointer
+
+    val p = Pair(Leaf(1), Leaf(2))
+    val k: &Fn(&Pair) -> &Leaf = (q) -> via(q, pick_b)
+
+    print(via(p, (q) -> q.a).v + via(p, pick_b).v + via(p, k).v)
+    print(dyn_get(A(Leaf(4))).v + dyn_get(C(5)).v + by_pointer(p).v)
+    """
+
+@test("one implementation answering something made here makes the call through the table not borrowed")
+bfv_one_disagrees()
+    bfv_run("emit-llvm", bfv_disagreeing()) match
+        None -> ()
+        Some((_, notes, file)) ->
+            assert_eq(bfv_line(notes, file, "24:1"), "'dyn_get' is not borrowed: what 'C.get' answers, which is " +
+                      "not borrowed: a reference made here, at 24:31")
+end bfv_one_disagrees
+
+@test("recursion through a closure settles on not borrowed")
+bfv_recursion()
+    bfv_run("emit-llvm", bfv_disagreeing()) match
+        None -> ()
+        Some((_, notes, file)) ->
+            assert_eq(bfv_line(notes, file, "23:1"),
+                      "'via' is not borrowed: what 'closure0.call' answers, which is not borrowed, at 23:50")
+end bfv_recursion
+
+@test("a call through a C function pointer has no body in sight")
+bfv_pointer()
+    bfv_run("emit-llvm", bfv_disagreeing()) match
+        None -> ()
+        Some((_, notes, file)) ->
+            assert_eq(bfv_line(notes, file, "26:1"), "'c_pick' answers a place of 'p': p.a")
+            assert_eq(bfv_line(notes, file, "28:1"), "'by_pointer' is not borrowed: a call through a function value, at 31:5")
+end bfv_pointer
+
+// The tables a generic trait's object can carry are those at its own arguments: `&Fetch[&Pair]`
+// reaches the implementation answering a place, never the one at `int` answering something made here.
+@test("a generic trait's object is answered by the implementations at its own arguments")
+bfv_trait_arguments()
+    bfv_run("emit-llvm", """
+        struct Leaf
+            v: int
+
+        struct Pair
+            a: &Leaf
+            b: &Leaf
+
+        trait Fetch[T]
+            fetch(self, t: T) -> &Leaf
+
+        struct A
+            k: int
+
+        impl Fetch[&Pair] for A
+            fetch(self, t: &Pair) -> &Leaf = t.b
+
+        impl Fetch[int] for A
+            fetch(self, t: int) -> &Leaf = Leaf(t + self.k)
+
+        by_pair(p: &Pair, x: &Fetch[&Pair]) -> &Leaf = x.fetch(p)
+        by_int(n: int, x: &Fetch[int]) -> &Leaf = x.fetch(n)
+
+        val p = Pair(Leaf(1), Leaf(2))
+
+        print(by_pair(p, A(1)).v + by_int(3, A(1)).v)
+        """) match
+        None -> ()
+        Some((_, notes, file)) ->
+            assert_eq(bfv_line(notes, file, "20:1"), "'by_pair' answers a place of 'p': p.b" + bfv_unshared())
+            assert_eq(bfv_line(notes, file, "21:1"), "'by_int' is not borrowed: what 'A.fetch.2' answers, which " +
+                      "is not borrowed: a reference made here, at 21:45")
+end bfv_trait_arguments
+
+// An archive may be handed an object whose table it never saw, so the same bodies a program follows
+// are not followed there -- by the header's analysis and by the archive's.
+private bfv_archive() -> string = bfv_head() + """
+    via(p: &Pair, f: &Fn(&Pair) -> &Leaf) -> &Leaf = f(p)
+    dyn_get(x: &Get) -> &Leaf = x.get()
+
+    @export("use_both")
+    use_both(n: int) -> int = via(Pair(Leaf(n), Leaf(2)), (q) -> q.a).v + dyn_get(A(Leaf(3))).v
+    """
+
+@test("in an archive a call through a closure or a trait object is not borrowed")
+bfv_archive_opaque()
+    for command in ["emit-header", "emit-llvm"]
+        bfv_run(command, bfv_archive()) match
+            None -> ()
+            Some((_, notes, file)) ->
+                if command == "emit-header"
+                    assert_eq(bfv_line(notes, file, "17:1"), "'via' is not borrowed: a call through a function value, at 17:50")
+                    assert_eq(bfv_line(notes, file, "18:1"), "'dyn_get' is not borrowed: a call through a trait object, at 18:31")
+                else
+                    // The same file built as a program sees its tables.
+                    assert_eq(bfv_line(notes, file, "17:1"), "'via' answers a place of 'p': p.a" + bfv_unshared())
+                    assert_eq(bfv_line(notes, file, "18:1"), "'dyn_get' answers a place of 'x': x.leaf" + bfv_unshared())
+end bfv_archive_opaque
