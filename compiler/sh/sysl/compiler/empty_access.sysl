@@ -1,0 +1,129 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.container.{Set, set}
+
+// **No load or store of a type that holds no bytes leaves the compiler.**
+//
+// A struct with no fields -- or with only such fields, or a `[0 x T]` -- is a type LLVM gives a size
+// of zero, and the emitters read and write it like any other value: a method's receiver is loaded out
+// of its box, a field is stored into its slot. Such an access touches no memory, but an address
+// sanitizer does not know that: at `-O0` it checks the bytes around the address, and the payload of
+// a box whose payload is empty sits exactly at the end of its allocation, so the check lands in the
+// red zone and the sanitizer faults while describing an access of no size.
+//
+// So every function is rewritten once, after it is built and before it is printed: a store of an
+// empty type is dropped, and a load of one becomes the empty value itself (a `select` of two
+// `zeroinitializer`s, the one instruction that defines a register of an aggregate type from
+// constants). The register keeps its name, so nothing that reads it changes.
+
+// The names, among these definitions, of every type that holds no bytes -- a definition whose fields
+// all hold none, including the one with no fields at all. A field may name a type defined later in the
+// list, so the walk repeats until it finds nothing new.
+empty_type_names(defs: Buf[IrTypeDef]) -> Set[string]
+    var out: Set[string] = set()
+    var grew = true
+
+    while grew
+        grew = false
+
+        for d in defs
+            if !out.has(d.name) && all_hold_nothing(d.fields, out)
+                out.add(d.name)
+                grew = true
+
+    out
+end empty_type_names
+
+// Whether a value of this type occupies no bytes, given the named types already known to hold none.
+holds_nothing(ty: LType, empty: Set[string]) -> bool = ty match
+    LStruct(fields) -> all_hold_nothing(fields, empty)
+    LPackedStruct(fields) -> all_hold_nothing(fields, empty)
+    LArr(n, elem) -> n == 0 || holds_nothing(*elem, empty)
+    LNamed(name) -> empty.has(name)
+    _ -> false
+
+private all_hold_nothing(fields: Buf[LType], empty: Set[string]) -> bool
+    for f in fields
+        if !holds_nothing(f, empty) then return false
+
+    true
+end all_hold_nothing
+
+// One function with every access of an empty type taken out (see the top of this file). A function
+// already printed is answered as it is: it was rewritten before it was printed.
+without_empty_accesses(f: IrFunc, empty: Set[string]) -> IrFunc
+    if empty.is_empty() || is_printed(f) || !touches_empty(f, empty) then return f
+
+    var blocks: Buf[IrBlock] = buf()
+
+    for bl in f.blocks
+        var instrs: Buf[Inst] = buf()
+
+        for i in bl.instrs
+            i match
+                InStore(ty, _, _, _, _) -> if !holds_nothing(ty, empty) then instrs.push(i)
+                InLoad(d, ty, _, _, _) ->
+                    instrs.push(if holds_nothing(ty, empty) then InSelect(d, VBool(true), ty, VZero, VZero, l_i1())
+                                else i)
+                _ -> instrs.push(i)
+
+        blocks.push(IrBlock(bl.label, instrs, bl.terminator))
+
+    f with { blocks = blocks }
+end without_empty_accesses
+
+private touches_empty(f: IrFunc, empty: Set[string]) -> bool
+    for bl in f.blocks
+        for i in bl.instrs
+            val hit = i match
+                InStore(ty, _, _, _, _) -> holds_nothing(ty, empty)
+                InLoad(_, ty, _, _, _) -> holds_nothing(ty, empty)
+                _ -> false
+
+            if hit then return true
+
+    false
+end touches_empty
+
+// Every function of a module rewritten, the empty types read from the module's own definitions.
+module_without_empty_accesses(m: IrModule) -> IrModule
+    var defs: Buf[IrTypeDef] = buf()
+
+    for d in m.structs
+        defs.push(d)
+
+    for d in m.enums
+        defs.push(d)
+
+    val empty = empty_type_names(defs)
+
+    if empty.is_empty() then return m
+
+    var funcs: Buf[IrFunc] = buf()
+
+    for f in m.funcs
+        funcs.push(without_empty_accesses(f, empty))
+
+    var thunks: Buf[IrFunc] = buf()
+
+    for f in m.thunks
+        thunks.push(without_empty_accesses(f, empty))
+
+    var runtime: Buf[IrRuntime] = buf()
+
+    for r in m.runtime
+        runtime.push(r match
+            RtEmitted(f) -> RtEmitted(without_empty_accesses(f, empty))
+            other -> other)
+
+    val entry = m.entry match
+        Some(f) -> Some(without_empty_accesses(f, empty))
+        None -> None
+
+    val init = m.init match
+        Some(i) -> Some(i with { func = without_empty_accesses(i.func, empty) })
+        None -> None
+
+    m with { funcs = funcs, thunks = thunks, runtime = runtime, entry = entry, init = init }
+end module_without_empty_accesses

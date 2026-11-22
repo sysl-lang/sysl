@@ -211,6 +211,10 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
     var printed_calls: Map[string, Buf[(string, bool)]] = map()
     var compacted: usize = 0
 
+    // A body printed early is rewritten first (`empty_access.sysl`), against the same definitions the
+    // module is given below; the module's own rewrite then passes it by.
+    val empty = if compact then empty_type_names(struct_and_enum_defs(p, layout)) else set()
+
     // **The same build lets go of each typed body once it is lowered**, which on the compiler's own
     // suite is 2.3 GB of typed tree given up while the lowering grows. Nothing after a body's own
     // lowering reads it: what the whole program asks of the bodies -- the owning parameters, the
@@ -231,7 +235,7 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
         val heading = if compact then f with { body = TBlock(buf(), None, f.body.ty) } else f
 
         // What the function before this one added, let go of before this one is built.
-        if compact then compacted = compact_from(funcs, compacted, &printed_refs, &printed_calls)
+        if compact then compacted = compact_from(funcs, compacted, &printed_refs, &printed_calls, empty)
 
         if !declared_elsewhere(p, f)
             set_promoted(e, pr, f.name)
@@ -306,7 +310,7 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
 
         if compact then bodies[i] = heading
 
-    if compact then compacted = compact_from(funcs, compacted, &printed_refs, &printed_calls)
+    if compact then compacted = compact_from(funcs, compacted, &printed_refs, &printed_calls, empty)
 
     // What is written from here on -- the thunks, the entry point, the helpers -- runs where its
     // caller does, and the caller's body is the one that checked.
@@ -479,7 +483,7 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
         made = drain_helpers(e, made, built_helpers, gaps)
     end if
 
-    if compact then compacted = compact_from(funcs, compacted, &printed_refs, &printed_calls)
+    if compact then compacted = compact_from(funcs, compacted, &printed_refs, &printed_calls, empty)
 
     // The hand-written blocks go in front of the generated ones, and which of them the module needs
     // is settled only once every helper has been written -- a helper is as much a reason to hold the
@@ -534,17 +538,29 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
                      box_defs(e, word_bits), imported_sigs(e, p, imported), globals, helpers, funcs, thunks,
                      entry, used_of(e, p, funcs), init, asm_lines,
                      if sealing.is_empty() then "" else SealedSource)
+    val emptied = module_without_empty_accesses(m)
 
-    (if bf16_as_bits(t) then soft_bf16_lower(m) else m, gaps)
+    (if bf16_as_bits(t) then soft_bf16_lower(emptied) else emptied, gaps)
 end codegen_into
+
+// The struct definitions and then the enum ones, as `empty_type_names` reads them.
+private struct_and_enum_defs(p: TProgram, layout: TargetLayout) -> Buf[IrTypeDef]
+    var out = struct_defs(p, layout)
+
+    for d in enum_defs(p, layout)
+        out.push(d)
+
+    out
+end struct_and_enum_defs
 
 // Every function `funcs` holds from `from` on, printed and let go of (`printed_func`), with the globals
 // it names kept beside for `named_entries`, and the calls it makes for the seal (`call_sites`). Answers
-// how far `funcs` is compacted.
+// how far `funcs` is compacted. Each is first rid of its accesses of the types in `empty`
+// (`empty_access.sysl`).
 private compact_from(funcs: Buf[IrFunc], from: usize, refs: *Set[string],
-                     calls: *Map[string, Buf[(string, bool)]]) -> usize
+                     calls: *Map[string, Buf[(string, bool)]], empty: Set[string]) -> usize
     for i in from..<funcs.len()
-        val f = funcs[i]
+        val f = without_empty_accesses(funcs[i], empty)
 
         referenced_globals(f, refs)
         calls.put(f.sig.name, call_sites(f))
