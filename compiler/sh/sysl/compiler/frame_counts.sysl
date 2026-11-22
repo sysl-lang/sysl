@@ -1,0 +1,500 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map, Set, set}
+
+// **A box laid in a frame whose every share this body can count is counted by the compiler, not at
+// run time** (`reference/memory.md § A box nothing keeps is laid in the frame`, `fbc_`).
+//
+// A frame box (`stack_box.sysl`) is built with the header a heap box has and counted as one is: each
+// holder retains it, each gives its share back, and the release that leaves nothing lets go of what
+// the payload holds. Where every share is taken and given back by this body, the count at each of
+// those calls is a number the compiler can work out, so none of them is made: the retains go, the
+// releases that leave a share go, and the release that leaves none becomes `arc.framedown.<T>` --
+// the payload's destructor and the release of what it holds, at exactly the point the count would
+// have reached zero, so nothing runs earlier or later than it did. A payload that holds nothing has
+// no teardown at all. Where nothing but this body can read the header, the header is not written
+// either.
+//
+// **The count is followed as a value along every path** (`frame_finals`): unbuilt before the box is
+// laid (and again once its last share is given back), one once it is, one more for each retain, one
+// less for each release. Two paths meeting with different counts, a retain or a release of a box not
+// built, a box laid again while still held, or a `ret` reached while it is held answers "counted at
+// run time" -- the body is left as it was.
+//
+// **What may hold the box is followed through the body's own IR** (`frame_holders`): the box's slot,
+// the frame-entry call's answer, a slot of the frame it is stored in and every load of one. A frame
+// slot is a holder only while every store into it stores the box; a box stored anywhere else, put in
+// an aggregate, cast, selected, returned, or handed to any `arc.` helper but the plain retain and
+// release answers "counted at run time". A callee the box is lent to counts its own shares, which it
+// gives back before it returns: the header is then written as it always was, so those shares land on
+// a count that never comes down to zero or to the mark. A share HANDED to a body that owns its
+// parameter (`.owned`) is never given back here, so the path that hands it reaches `ret` with the box
+// still held, and the body is left counted.
+//
+// **Whatever a call answers when it was handed the box may be the box** -- a second holder this walk
+// cannot see would be torn down under it -- so an answer that can carry an address is followed: it may
+// be read through, and nothing else. The escape walk already asked, of every parameter a frame box
+// reaches, whether the callee may answer it (`StackBoxes.answering`); a call none of whose parameters
+// may be answered (`answer_of`, `Emit.fresh_answers`) answers something else, and is not followed.
+//
+// **An aggregate holding the box once** -- a closure capturing it -- is followed too: it may be lent
+// to a callee, and its `arc.copy.<T>` / `arc.dispose.<T>` stay, counted as shares of the box that are
+// given back at run time. Every one of them must be given back before the box's last share is. A place entry's answer (`place_entry.sysl`) is an address inside
+// the box or the holder itself, so it may be read and written through, but no address may be read out
+// of it or written into it.
+//
+// The compact release (`emit_arc.sysl`'s `gen_compact_release`) compares against the frame mark only
+// for a payload some body left counted (`Emit.counted_frames`): a box whose shares the compiler counted
+// never brings its count down to the mark.
+
+// A box this body laid in its frame: the slot it was laid in (`v_render`), its payload, and whether a
+// factory's frame entry laid it (the call is where it is built) rather than this body.
+struct FrameRoot
+    slot: string
+    payload: Type
+    by_call: bool
+end FrameRoot
+
+// What a register or a slot is to the box being followed.
+private enum Held
+    HeldBox
+    HeldSlot
+    HeldPlace
+    HeldMaybe
+    HeldAgg
+
+// What one instruction does to the box's count. A kept step is an `arc.copy.<T>` or `arc.dispose.<T>`
+// of an aggregate holding the box once -- a closure's captures -- which shares the box along with
+// whatever else the aggregate holds, so it stays and is counted at run time as it always was.
+private enum CountStep
+    StepNone
+    StepInit
+    StepRetain
+    StepRelease
+    StepKeptRetain
+    StepKeptRelease
+
+// The instructions of a body that touch a box's count, flattened over its blocks (`starts[i]` is the
+// position of block `i`'s first instruction), the positions of the header's writes, and whether any
+// callee is handed the box.
+private struct FrameUses
+    steps: Buf[CountStep]
+    starts: Buf[usize]
+    header: Set[usize]
+    observed: bool
+end FrameUses
+
+// Every frame box of the body just written, its count taken out where the compiler can count it.
+// Runs in `finish_func` after `elide_arc_pairs`, so it sees only the pairs the cancelling left.
+drop_frame_counts(e: *Emit, blocks: Buf[IrBlock]) -> Buf[IrBlock]
+    var out = blocks
+
+    for root in e.frame_roots
+        uncounted(e, out, root) match
+            Some(done) -> out = done
+            None -> e.counted_frames.add(mangle(root.payload))
+
+    out
+end drop_frame_counts
+
+private uncounted(e: *Emit, blocks: Buf[IrBlock], root: FrameRoot) -> Option[Buf[IrBlock]]
+    val held = frame_holders(blocks, root, e.fresh_answers)
+    val uses = frame_uses(e, blocks, root, held)?
+    val finals = frame_finals(blocks, uses)?
+
+    // A kept share lands on the count at run time, so the header must be there to take it.
+    var observed = uses.observed
+
+    for step in uses.steps
+        if step == StepKeptRetain then observed = true
+
+    val payload = root.payload
+    val holds = owns_value(e, payload) || destructor_of(e, payload).is_some()
+    val down = if holds then request_helper(e, s"arc.framedown.${mangle(payload)}", HrFrameDown(payload))
+               else ""
+
+    var out: Buf[IrBlock] = buf()
+
+    for i in 0..<blocks.len()
+        val b = blocks[i]
+        var instrs: Buf[Inst] = buf()
+
+        for j in 0..<b.instrs.len()
+            val at = uses.starts[i] + j
+            val inst = b.instrs[j]
+
+            uses.steps[at] match
+                StepRetain -> ()
+                StepRelease ->
+                    if holds && finals.has(at) then instrs.push(framedown_call(down, inst))
+                _ ->
+                    if observed || !uses.header.has(at) then instrs.push(inst)
+        end for
+
+        out.push(IrBlock(b.label, instrs, b.terminator))
+    end for
+
+    Some(out)
+end uncounted
+
+// `arc.framedown.<T>` of what the release it stands in for let go of.
+private framedown_call(down: string, release: Inst) -> Inst
+    var args: Buf[IrArg] = buf()
+
+    release match
+        InCall(_, _, _, given, _, _, _, _) -> args.push(ir_arg(LPtr, given[0].value))
+        _ -> ()
+
+    ir_call(None, LVoid, VGlobal(down), args)
+end framedown_call
+
+// -- what holds the box ----------------------------------------------------------------------------
+
+private held_as(held: Map[string, Held], v: Val) -> Option[Held] = held.get(v_render(v))
+
+private is_held(held: Map[string, Held], v: Val, k: Held) -> bool = held_as(held, v) match
+    Some(h) -> h == k
+    None -> false
+
+// The plain retain and release of a reference, the only calls whose count this pass works out.
+private count_name(name: string) -> bool =
+    name == "arc.retain" || name == "arc.release" || name.starts_with("arc.release.")
+
+// The walks that share or give back everything an aggregate holds.
+private kept_name(name: string) -> bool = name.starts_with("arc.copy.") || name.starts_with("arc.dispose.")
+
+// Whether a value of this type can be or hold an address.
+private carries_address(t: LType) -> bool = t match
+    LInt(_) -> false
+    LFloat(_, _) -> false
+    LVoid -> false
+    LVec(_, _) -> false
+    _ -> true
+
+// The registers and slots that hold the box, to a fixed point: a slot of the frame stored with it, a
+// load of such a slot, a frame entry's answer, a place entry's answer and what is reached from it, and
+// the answer of any other call it was handed that can carry an address.
+private frame_holders(blocks: Buf[IrBlock], root: FrameRoot, fresh: Set[string]) -> Map[string, Held]
+    var slots: Set[string] = set()
+
+    for b in blocks
+        for inst in b.instrs
+            inst match
+                InAlloca(d, _, _) -> slots.add(v_render(d))
+                _ -> ()
+
+    var held: Map[string, Held] = map()
+
+    held.put(root.slot, HeldBox)
+
+    loop
+        var grew = false
+
+        for b in blocks
+            for inst in b.instrs
+                held_by(inst, held, root, slots, fresh) match
+                    Some(found) ->
+                        if !held.has(found.0)
+                            held.put(found.0, found.1)
+                            grew = true
+                        end if
+                    None -> ()
+        end for
+
+        if !grew then break
+    end loop
+
+    held
+end frame_holders
+
+private held_by(inst: Inst, held: Map[string, Held], root: FrameRoot, slots: Set[string],
+                fresh: Set[string]) -> Option[(string, Held)]
+    inst match
+        InStore(_, v, p, _, _) ->
+            if is_held(held, v, HeldBox) && slots.has(v_render(p)) then return Some((v_render(p), HeldSlot))
+        InLoad(d, _, p, _, _) -> if is_held(held, p, HeldSlot) then return Some((v_render(d), HeldBox))
+        InGep(d, _, p, _) -> if is_held(held, p, HeldPlace) then return Some((v_render(d), HeldPlace))
+        InGepInBounds(d, _, p, _) -> if is_held(held, p, HeldPlace) then return Some((v_render(d), HeldPlace))
+        InInsert(d, _, agg, _, v, _) ->
+            if is_held(held, v, HeldBox) || is_held(held, agg, HeldAgg) then return Some((v_render(d), HeldAgg))
+        InCall(Some(d), ret, VGlobal(name), args, _, _, _, _) ->
+            if name.ends_with("-frame") && !args.is_empty() && v_render(args[0].value) == root.slot
+                return Some((v_render(d), HeldBox))
+
+            if count_name(name) then return None
+
+            var handed = false
+
+            for a in args
+                if held_as(held, a.value).is_some() then handed = true
+
+            if !handed then return None
+            if name.ends_with("-place") then return Some((v_render(d), HeldPlace))
+            if carries_address(ret) && !fresh.has(v_render(d)) then return Some((v_render(d), HeldMaybe))
+        _ -> ()
+
+    None
+end held_by
+
+// Notes a call's answer as one that is never a box it was handed, where the escape walk found none
+// of the callee's parameters may be answered (`StackBoxes.answering`).
+answer_of(e: *Emit, name: string, given: usize, v: Val) -> Val
+    for k in 0..<given
+        if e.stack.answering.has(s"$name|$k") then return v
+
+    v match
+        VReg(_) -> e.fresh_answers.add(v_render(v))
+        _ -> ()
+
+    v
+end answer_of
+
+// -- what touches the count --------------------------------------------------------------------------
+
+// Every instruction's step, or `None` where something the box reaches is one this pass cannot count.
+private frame_uses(e: *Emit, blocks: Buf[IrBlock], root: FrameRoot, held: Map[string, Held]) -> Option[FrameUses]
+    val payload_at = box_payload_field(e, root.payload)
+    var steps: Buf[CountStep] = buf()
+    var starts: Buf[usize] = buf()
+    var header: Set[usize] = set()
+    var header_regs: Set[string] = set()
+    var observed = false
+
+    // The header's words are reached by a step from the slot itself to a field before the payload.
+    for b in blocks
+        for inst in b.instrs
+            inst match
+                InGep(d, _, p, idx) -> if header_step(root, p, idx, payload_at) then header_regs.add(v_render(d))
+                InGepInBounds(d, _, p, idx) -> if header_step(root, p, idx, payload_at) then header_regs.add(v_render(d))
+                _ -> ()
+
+    var at: usize = 0
+
+    for b in blocks
+        starts.push(at)
+
+        for inst in b.instrs
+            var step = StepNone
+
+            inst match
+                InStore(ty, v, p, _, _) ->
+                    if tracked(held, header_regs, v) && !is_held(held, v, HeldBox) then return None
+
+                    if header_regs.has(v_render(p))
+                        header.add(at)
+                    elif is_held(held, p, HeldBox)
+                        if v_render(p) != root.slot || root.by_call || tracked(held, header_regs, v) then return None
+
+                        step = StepInit
+                        header.add(at)
+                    elif is_held(held, v, HeldBox)
+                        if !is_held(held, p, HeldSlot) then return None
+                    elif is_held(held, p, HeldSlot) || is_held(held, p, HeldMaybe)
+                        return None
+                    elif is_held(held, p, HeldPlace) && carries_address(ty)
+                        return None
+                    end if
+                InLoad(_, ty, p, _, _) ->
+                    if is_held(held, p, HeldBox) || header_regs.has(v_render(p)) then return None
+                    if is_held(held, p, HeldPlace) && carries_address(ty) then return None
+                InGep(d, _, p, idx) ->
+                    if !step_ok(held, header_regs, root, d, p, idx, payload_at) then return None
+                    if header_regs.has(v_render(d)) then header.add(at)
+                InGepInBounds(d, _, p, idx) ->
+                    if !step_ok(held, header_regs, root, d, p, idx, payload_at) then return None
+                    if header_regs.has(v_render(d)) then header.add(at)
+                InIntCmp(_, _, _, a, c) ->
+                    if header_regs.has(v_render(a)) || header_regs.has(v_render(c)) then return None
+
+                // An aggregate holds the box once: a second insertion would make one copy of it two
+                // shares, which the walk counts as one.
+                InInsert(_, _, agg, _, v, _) ->
+                    if header_regs.has(v_render(v)) then return None
+                    if tracked(held, header_regs, v) && !is_held(held, v, HeldBox) then return None
+                    if tracked(held, header_regs, agg) && !is_held(held, agg, HeldAgg) then return None
+                    if is_held(held, agg, HeldAgg) && is_held(held, v, HeldBox) then return None
+                InCall(_, _, VGlobal(name), args, _, _, _, _) ->
+                    if kept_name(name) && args.len() == 1 && is_held(held, args[0].value, HeldAgg)
+                        step = if name.starts_with("arc.copy.") then StepKeptRetain else StepKeptRelease
+                    elif count_name(name) && args.len() == 1
+                        if is_held(held, args[0].value, HeldBox)
+                            step = if name == "arc.retain" then StepRetain else StepRelease
+                        elif tracked(held, header_regs, args[0].value)
+                            return None
+                        end if
+                    else
+                        for k in 0..<args.len()
+                            val a = args[k].value
+
+                            if k == 0 && root.by_call && name.ends_with("-frame") && v_render(a) == root.slot
+                                step = StepInit
+                            elif header_regs.has(v_render(a))
+                                return None
+                            else
+                                held_as(held, a) match
+                                    Some(HeldBox) ->
+                                        if name.starts_with("arc.") then return None
+                                        if !name.ends_with("-place") then observed = true
+                                    Some(HeldMaybe) -> return None
+
+                                    // An aggregate is lent as the box is, but never handed over: its
+                                    // share would be given back where this walk cannot see it.
+                                    Some(HeldAgg) ->
+                                        if name.starts_with("arc.") || name.ends_with(".owned") then return None
+
+                                        observed = true
+                                    Some(_) -> if !name.ends_with("-place") then return None
+                                    None -> ()
+                            end if
+                        end for
+                    end if
+                _ ->
+                    for v in escaping_operands(inst)
+                        if tracked(held, header_regs, v) then return None
+
+            steps.push(step)
+            at += 1
+        end for
+
+        b.terminator match
+            Some(t) ->
+                for v in escaping_operands(t)
+                    if tracked(held, header_regs, v) then return None
+            None -> ()
+    end for
+
+    Some(FrameUses(steps, starts, header, observed))
+end frame_uses
+
+// Whether a value is anything that holds the box or a word of its header.
+private tracked(held: Map[string, Held], header_regs: Set[string], v: Val) -> bool =
+    held_as(held, v).is_some() || header_regs.has(v_render(v))
+
+// Whether a step is from the box's own slot to a word of its header.
+private header_step(root: FrameRoot, p: Val, idx: Buf[IrArg], payload_at: int) -> bool
+    if root.by_call || v_render(p) != root.slot || idx.len() != 2 then return false
+
+    for k in 0..<payload_at
+        if v_render(idx[1].value) == s"$k" then return true
+
+    false
+end header_step
+
+// Whether a step through what holds the box is one this pass can follow: into the payload of the box,
+// from a place entry's answer, or through an answer that may be the box. A holder's own address is
+// stepped from by nothing.
+private step_ok(held: Map[string, Held], header_regs: Set[string], root: FrameRoot, d: Val, p: Val,
+                idx: Buf[IrArg], payload_at: int) -> bool
+    for a in idx
+        if held_as(held, a.value).is_some() || header_regs.has(v_render(a.value)) then return false
+
+    if header_regs.has(v_render(p)) || is_held(held, p, HeldSlot) then return false
+    if !is_held(held, p, HeldBox) then return true
+    if header_regs.has(v_render(d)) then return true
+    if idx.len() < 2 || v_render(idx[0].value) != "0" then return false
+
+    for k in 0..<payload_at
+        if v_render(idx[1].value) == s"$k" then return false
+
+    true
+end step_ok
+
+// -- the count along every path ----------------------------------------------------------------------
+
+// The count before a block is entered: a block no path reaches yet, two paths that disagree, or the
+// count -- zero while the box is not built. A count is `shares * per_share() + kept`: every share
+// this body holds, and how many of them are kept steps, counted at run time. The kept ones must all
+// be given back before the last share is: the release the compiler replaces is never one of them,
+// and at run time the box's own count never comes down to zero.
+private unreached() -> int = -2
+private disagree() -> int = -1
+private per_share() -> int = 32
+
+// The most shares, and the most kept shares, one body may hold at once before the walk stops
+// counting them.
+private most_shares() -> int = 16
+
+private joined(a: int, b: int) -> int =
+    if a == unreached() then b elif b == unreached() || a == b then a else disagree()
+
+private stepped(s: int, step: CountStep) -> int
+    if s < 0 then return if step == StepNone then s else disagree()
+
+    val shares = s / per_share()
+    val kept = s % per_share()
+
+    step match
+        StepNone -> s
+        StepInit -> if s == 0 then per_share() else disagree()
+        StepRetain -> if shares >= 1 && shares < most_shares() then s + per_share() else disagree()
+        StepRelease ->
+            if shares > 1 || (shares == 1 && kept == 0) then s - per_share() else disagree()
+        StepKeptRetain ->
+            if shares >= 1 && shares < most_shares() && kept < most_shares() then s + per_share() + 1
+            else disagree()
+        StepKeptRelease -> if shares > 1 && kept >= 1 then s - per_share() - 1 else disagree()
+end stepped
+
+// The positions of the releases that give back the box's last share, or `None` where some path
+// counts it in a way this walk cannot (see the file's head).
+private frame_finals(blocks: Buf[IrBlock], uses: FrameUses) -> Option[Set[usize]]
+    var index: Map[string, usize] = map()
+
+    for i in 0..<blocks.len()
+        index.put(blocks[i].label, i)
+
+    var entry: Buf[int] = buf()
+
+    for _ in 0..<blocks.len()
+        entry.push(unreached())
+
+    entry[0] = 0
+
+    var work: Buf[usize] = buf()
+
+    work.push(0)
+
+    while !work.is_empty()
+        val i = work.pop().unwrap()
+        var s = entry[i]
+
+        for j in 0..<blocks[i].instrs.len()
+            s = stepped(s, uses.steps[uses.starts[i] + j])
+
+        for l in successors(blocks[i].terminator)
+            val k = index.get(l)?
+            val m = joined(entry[k], s)
+
+            if m != entry[k]
+                entry[k] = m
+                work.push(k)
+            end if
+        end for
+    end while
+
+    var finals: Set[usize] = set()
+
+    for i in 0..<blocks.len()
+        if entry[i] == unreached() then continue
+
+        var s = entry[i]
+
+        for j in 0..<blocks[i].instrs.len()
+            val at = uses.starts[i] + j
+            val step = uses.steps[at]
+            val next = stepped(s, step)
+
+            if step != StepNone && next == disagree() then return None
+            if step == StepRelease && next == 0 then finals.add(at)
+
+            s = next
+        end for
+
+        blocks[i].terminator match
+            Some(InRet(_, _)) -> if s != 0 then return None
+            _ -> ()
+    end for
+
+    Some(finals)
+end frame_finals

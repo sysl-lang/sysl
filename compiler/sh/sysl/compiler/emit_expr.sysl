@@ -202,7 +202,7 @@ private gen_expr_kind(e: *Emit, x: TExpr) -> Val = *x.kind match
 
         expansion_at(e, x) match
             Some(t) -> gen_expr(e, t)
-            None -> gen_call(e, name, args, ty, x.span)
+            None -> answer_of(e, name, args.len(), gen_call(e, name, args, ty, x.span))
     TAtomic(op, addr, ops, ordering, at, ty) -> gen_atomic(e, op, addr, ops, ordering, at, ty)
     TFence(ordering) -> gen_fence(e, ordering)
     TSlots(op, args, elem, ty) -> gen_slots(e, op, args, elem, ty)
@@ -1586,7 +1586,10 @@ gen_tail_self_call(e: *Emit, args: Buf[TExpr]) -> Val
         else
             val v = gen_expr(e, args[i])
 
-            retain_value(e, ty, v)
+            // A parameter borrowed throughout (`plus0_locals.sysl`) is staged with no count: the value
+            // is backed by an entry root, which the frame does not give up (borrow-inference.md §4.3 (a)).
+            if !e.lent_decls.has(e.tail_params[i].0) then retain_value(e, ty, v)
+
             staged.push((StagedValue, v))
 
     // The measure is checked while the frame is still whole, since it reads the parameters and the
@@ -1596,6 +1599,14 @@ gen_tail_self_call(e: *Emit, args: Buf[TExpr]) -> Val
 
     trace_jump(e)
     release_all(e)
+
+    // **The entry of a peeled function jumps into its owned half** (`emit_func.sysl`'s `peel_shape`):
+    // the staged values are its arguments, each with the count staging took for it, and its answer is
+    // this one's. Every parameter crosses in registers there, so nothing but `StagedValue` reaches it.
+    if e.peel == PeelEntry
+        peel_jump(e, staged)
+        return VNothing
+    end if
 
     for i in 0..<e.tail_params.len()
         val p = e.tail_params[i]
@@ -1612,6 +1623,37 @@ gen_tail_self_call(e: *Emit, args: Buf[TExpr]) -> Val
     emit_term(e, InBr(e.tail_target))
     VNothing
 end gen_tail_self_call
+
+// The jump of a peeled function's entry: its owned half called with the staged values and this frame's
+// answer made that call's. The frame has given everything up already, so nothing follows the call.
+private peel_jump(e: *Emit, staged: Buf[(int, Val)])
+    val f = e.body_func.unwrap()
+    val ty = sysl_fn_type(e, defined_result(f), f.params, f.variadic, Some(f), f.marks.track_caller, lent_names(e, f))
+    var args: Buf[IrArg] = buf()
+
+    for p in ty.params
+        var v = p.name.unwrap_or(VUndef)
+        val n = p.name match
+            Some(VReg(s)) -> s
+            _ -> ""
+
+        for i in 0..<e.tail_params.len()
+            if n == s"${e.tail_params[i].0}.param" then v = staged[i].1
+
+        args.push(IrArg(p.ty, v, p.attrs))
+
+    val callee = VGlobal(owned_symbol(symbol_of(e, f.name)))
+
+    ty.ret match
+        LVoid ->
+            emit(e, InCall(None, LVoid, callee, args, ty.ret_attrs, None, no_fast_math(), false))
+            emit_term(e, InRet(None, None))
+        _ ->
+            val r = fresh_reg(e)
+
+            emit(e, InCall(Some(r), ty.ret, callee, args, ty.ret_attrs, None, no_fast_math(), false))
+            emit_term(e, InRet(Some(ty.ret), Some(r)))
+end peel_jump
 
 const StagedNothing: int = 0
 const StagedSlot: int = 1
@@ -1653,6 +1695,11 @@ private gen_call(e: *Emit, name: string, args: Buf[TExpr], ty: Type, span: Span)
         return gen_foreign_call(e, CallForm(form.ret, form.ret_attrs, variadic_type_of(e, name)),
                                 VGlobal(symbol), args, ty, e.abandoning.has(name),
                                 e.kept_params.get(name).unwrap_or(buf()), e.twice.has(name))
+
+    // A factory whose answer this frame holds no longer than itself lays it here (`stack_box.sysl`).
+    gen_frame_call(e, name, args, ty, span) match
+        Some(v) -> return v
+        None -> ()
 
     // A function answering a place of its argument is read through its place entry where it can be
     // (`place_entry.sysl`).
@@ -1745,8 +1792,14 @@ staged_args(e: *Emit, args: Buf[TExpr], out: *Buf[IrArg], callee: string) -> Buf
         // the call, and an `@abandons` callee runs after the frame has given everything back.
         val borrows = callee != "" && !e.owned_params.has(owned_key(callee, i)) &&
                       !e.asyncs.has(callee) && !e.abandoning.has(callee)
+
+        // One read out of storage nothing the call does can overwrite needs no count of its own for it
+        // (`plus0_locals.sysl`'s `held_backed`).
+        val held_for = if callee != "" && !lent && !e.layout.indirect(aty) && contains_counted(aty) &&
+                          !held_unless(e, a, written) then held_backed(e, args, i, callee, written, borrows)
+                       else None
         val v = guaranteed_arg(e, a, if asks && quiet_after(e, args, i) then callee else "", written, lent,
-                               borrows)
+                               borrows, held_for)
 
         if e.layout.indirect(aty) || lent
             out.push(ir_arg(LPtr, v))
@@ -1858,11 +1911,15 @@ end changes_nothing
 // **A view of part of a place a borrowed parameter takes is narrowed with no count at all** where what
 // keeps its elements alive already stands for the call (`emit_place.sysl`'s `lent_view`): the count
 // slicing takes would only be given back when the statement ends.
+//
+// **An argument held for its call by its backing takes none either** (`held_for`, from `held_backed`):
+// it is worked out with the place calls on its spine read through with no count of their own.
 private guaranteed_arg(e: *Emit, a: TExpr, callee: string, written: Set[string], lent: bool = false,
-                       borrows: bool = false) -> Val
+                       borrows: bool = false, held_for: Option[Buf[(Span, string)]] = None) -> Val
     val ty = texpr_type(a)
     val big = e.layout.indirect(ty) || lent
-    val still = held_unless(e, a, written) || (big || contains_counted(ty)) && lends_in_place(e, callee, ty)
+    val still = held_for.is_some() || held_unless(e, a, written) ||
+                (big || contains_counted(ty)) && lends_in_place(e, callee, ty)
     // A `@unique` value with a destructor has one owner, so no count of the caller's can stand for
     // it: a reading receiver is lent as it lies (`emit_unique.sysl`).
     val guarantee = contains_counted(ty) && !still && !value_drops(e, ty)
@@ -1871,7 +1928,13 @@ private guaranteed_arg(e: *Emit, a: TExpr, callee: string, written: Set[string],
 
     if big then return indirect_arg(e, a, still, lent && !e.layout.indirect(ty))
 
+    val outer = e.held_args.lent_calls
+
+    e.held_args.lent_calls = held_for.unwrap_or(buf())
+
     val v = gen_expr(e, a)
+
+    e.held_args.lent_calls = outer
 
     if guarantee
         retain_value(e, ty, v)
