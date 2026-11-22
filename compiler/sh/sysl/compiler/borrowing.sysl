@@ -94,13 +94,8 @@ end Verdict
 // still runs: `die(t)` that overwrites the global holding `t` and then reads `t` frees it under its
 // own feet. What that path may call is anything that releases nothing on the way out -- which, unlike
 // here, takes in a foreign function, so `unwrap`'s report and `Buf.at`'s bounds failure stay inert.
-//
-// **`closed` is a program's own build, which sees every table there is** (as `untouched_summary`'s):
-// a call through a closure or a trait object is then a call to what that slot holds in each table of
-// the trait at the receiver's arguments (`trait_tables`), so the body is inert where every one of
-// those is. Elsewhere such a call is code nobody can see, and the body is not.
-inert_callees(p: TProgram, owning: Set[string] = set(), closed: bool = false) -> Set[string]
-    val s = call_summary(p, owning, closed)
+inert_callees(p: TProgram, owning: Set[string] = set()) -> Set[string]
+    val s = call_summary(p, owning)
     val quiet = quiet_callees(p, s)
     var seed: Buf[bool] = buf()
 
@@ -166,9 +161,8 @@ private struct QuietSink
         self.exit_sites.push(s)
 end QuietSink
 
-private call_summary(p: TProgram, owning: Set[string], closed: bool = false) -> CallSummary
+private call_summary(p: TProgram, owning: Set[string]) -> CallSummary
     var out = CallSummary(buf(), buf(), buf(), buf(), buf(), buf(), buf())
-    val tables: Option[TraitTables] = if closed && p.entry_point then Some(tables_by_trait(p.vtables)) else None
 
     for i in 0..<p.funcs.len()
         val f = p.funcs[i]
@@ -179,7 +173,7 @@ private call_summary(p: TProgram, owning: Set[string], closed: bool = false) -> 
         val q: &QuietSink = QuietSink(v.ok, buf(), buf(), buf())
 
         if v.ok
-            val b = Body(f.params, own_locals(f), declared_names(f), exit_kinds(f.body), tables)
+            val b = Body(f.params, own_locals(f), declared_names(f), exit_kinds(f.body))
 
             walk_block_stmts(f.body, TWalk(true, x -> inert_node(v, sink, exits, q, b, x),
                                            w -> both_refuse(v, q),
@@ -206,9 +200,6 @@ private struct Body
     locals: Set[string]
     declared: Set[string]
     ending: &KindSink
-
-    // The program's tables where it sees every one (`inert_callees`' `closed`), else `None`.
-    tables: Option[TraitTables]
 end Body
 
 // Every name a body declares, `var`, `val` or `ref`: a parameter one of them shadows is not reliably
@@ -747,14 +738,6 @@ private inert_node(v: &Verdict, calls: &CallSink, exits: &CallSink, q: &QuietSin
 
             q.site(site)
 
-        // A call through a table, where the program sees every table, is a call to each body that slot
-        // holds; `quiet_callees` does not follow it (it numbers no receiver), so it refuses the body.
-        TVCall(recv, slot, _, _, _) -> b.tables match
-            Some(all) ->
-                if b.ending.has(x.kind) then both_refuse(v, q)
-                else table_calls(v, q, calls, all, recv, slot)
-            None -> both_refuse(v, q)
-
         TStore(place, _, _, _) -> write_at(v, q, b, place)
         TIncDec(place, _, _, _, _) -> write_at(v, q, b, place)
         TUpdate(place, _, _, _, dispatch, _, _) ->
@@ -772,27 +755,6 @@ private inert_node(v: &Verdict, calls: &CallSink, exits: &CallSink, q: &QuietSin
                     q.site(Site(cmp.dispatch.unwrap().name, buf(), buf()))
 
         _ -> if !inert_leaf(x) then both_refuse(v, q)
-
-// What a call through slot `slot` of `recv`'s table may run, for `inert_node`: the body in that slot of
-// each table of the trait at the receiver's arguments. A receiver whose trait cannot be named, a slot a
-// table lacks, or a trait with no table at all is refused.
-private table_calls(v: &Verdict, q: &QuietSink, calls: &CallSink, tables: TraitTables, recv: TExpr, slot: int)
-    q.refuse()
-
-    val tr = erased_trait(underlying(texpr_type(recv)))
-
-    if tr.is_none() || slot < 0
-        v.refuse()
-        return
-    end if
-
-    val all = trait_tables(tables, tr.unwrap())
-
-    if all.is_empty() then v.refuse()
-
-    for vt in all
-        if usize(slot) < vt.slots.len() then calls.add(vt.slots[usize(slot)].target) else v.refuse()
-end table_calls
 
 // The place a write lands in, where that is one of `locals` reached without a dereference.
 private own_place(place: TExpr, locals: Set[string]) -> bool = *place.kind match
@@ -960,7 +922,7 @@ lent_element(e: *Emit, name: string, elem_ty: Type, seq: TExpr, body: Buf[TStmt]
     val calls: &CallSink = CallSink(buf())
     val q: &QuietSink = QuietSink(true, buf(), buf(), buf())
     val none: &KindSink = KindSink(buf())
-    val b = Body(buf(), locals, set(), none, None)
+    val b = Body(buf(), locals, set(), none)
 
     walk_stmts(body, TWalk(true, x -> inert_node(v, calls, calls, q, b, x),
                            w -> lent_write(v, calls, locals, w),
