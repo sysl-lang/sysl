@@ -26,9 +26,11 @@ import sysl.container.{Map, map, Set, set}
 // may be it. The one place a holder may be is a local of the frame, reached without a dereference;
 // anything else -- a field through a pointer or a reference, module storage, a buffer's slot, another
 // box -- is an escape. A call keeps what it is handed unless its body, walked the same way with the
-// parameter as the thing followed, never lets the parameter out but by answering it (`summary`); a
-// call with no body (an `extern`, a table, a callable, a function pointer), a task, recursion still
-// being worked out, and every node this walk does not know answer "escapes".
+// parameter as the thing followed, never lets the parameter out but by answering it (`summary`). A
+// call through a table or a callable, in a program that sees every table, is a call of each body that
+// slot may hold (`table_callees`), each asked the same way. A call with no body in sight (an `extern`,
+// a function pointer, a table in a library or an archive), a task, recursion still being worked out,
+// and every node this walk does not know answer "escapes".
 //
 // **A loop builds into the same slot every turn**, so a box built in a loop's body may be held only by
 // locals declared inside that loop's body, which are gone by the next turn.
@@ -68,7 +70,8 @@ private stack_box_limit() -> usize = 1024
 // Every body's frame boxes, and the factories whose frame entries some caller reaches.
 stack_boxes(e: *Emit, p: TProgram) -> StackBoxes
     var out = no_stack_boxes()
-    val cx: &BoxCx = BoxCx(map(), p.funcs, map(), set(), map(), set(), map(), set())
+    val tables: Option[TraitTables] = if p.entry_point then Some(tables_by_trait(p.vtables)) else None
+    val cx: &BoxCx = BoxCx(map(), p.funcs, map(), set(), map(), set(), map(), set(), tables)
 
     for i in 0..<p.funcs.len()
         cx.index.put(p.funcs[i].name, i)
@@ -366,6 +369,11 @@ private struct BoxCx
 
     // Every `name|k` of `memo` whose answer may be the parameter.
     answering: Set[string]
+
+    // A program's own tables by trait (`borrowing.sysl`'s `tables_by_trait`), where it sees every one
+    // there is; `None` for a library or an archive, which may be handed an object whose table it never
+    // saw.
+    tables: Option[TraitTables]
 end BoxCx
 
 // One walk of one body, following one thing: a site of this body (`site`, a box's payload span or a
@@ -762,6 +770,38 @@ private sb_kind(w: &BoxWalk, x: TExpr) -> bool = *x.kind match
     TUpgrade(v, _, _, _) -> sb_carry(w, v)
     TDowncast(v, _, _, _, _, _) -> sb_carry(w, v)
     TFromRaw(v, _) -> sb_carry(w, v)
+
+    // **A call through a table, in a program that sees every table, is a call of what that slot holds
+    // in each of them** (`table_callees`), the receiver its parameter 0 and the arguments the rest,
+    // each judged as a direct call is. Elsewhere, or where the tables cannot be named, it is a call
+    // with no body in sight.
+    TVCall(r, slot, args, _, _) ->
+        val callees = table_callees(w.cx, r, slot)
+
+        if callees.is_none()
+            for k in sb_kids(x)
+                if sb_carry(w, k) then sb_escape(w)
+
+            return false
+        end if
+
+        var answered = false
+        val given = args.len() + 1
+
+        for k in 0..<given
+            val arg = if k == 0 then r else args[k - 1]
+
+            if sb_carry(w, arg)
+                for name in callees.unwrap()
+                    val s = summary(w.cx, name, k, given)
+
+                    if s.0 then sb_escape(w)
+                    if s.1 then answered = true
+                end for
+            end if
+        end for
+
+        answered
     _ ->
         for k in sb_kids(x)
             if sb_carry(w, k) then sb_escape(w)
@@ -905,6 +945,26 @@ private sb_see(w: &BoxWalk, x: TExpr)
 end sb_see
 
 // -- what a callee does with a parameter --------------------------------------------------------------
+
+// The functions a call through slot `slot` of the object `recv` may run: what that slot holds in each
+// table of the receiver's trait at its arguments (`trait_tables`, every table of the trait where none
+// is spelled at them). `None` -- a call with no body in sight -- in a library or an archive, for a
+// receiver whose trait cannot be named, a slot a table does not have, or a trait with no table at all.
+private table_callees(cx: &BoxCx, recv: TExpr, slot: int) -> Option[Buf[string]]
+    val tr = erased_trait(underlying(texpr_type(recv)))
+
+    if cx.tables.is_none() || tr.is_none() || slot < 0 then return None
+
+    var out: Buf[string] = buf()
+
+    for vt in trait_tables(cx.tables.unwrap(), tr.unwrap())
+        if usize(slot) >= vt.slots.len() then return None
+
+        out.push(vt.slots[usize(slot)].target)
+    end for
+
+    if out.is_empty() then None else Some(out)
+end table_callees
 
 // What the function `name` does with its parameter `k`: whether it may let it out (`.0`), and whether
 // its answer may be it or hold it (`.1`). Where no body is in sight, the arguments do not line up, the
