@@ -57,7 +57,7 @@ on code that only **reads**:
 | 8 | a rewritten parameter (R2) | a parameter assigned in its body — by `=` or by a self-jump — whose every assigned value is backed by roots valid for the activation **stays borrowed**: no entry retain, no exit release | the original argument is the caller's for the whole activation; the walk only reads behind it |
 | 9 | a self-jump whose arguments are fresh (`tail`) | **peel**: the borrowing entry `S` becomes a full copy of the body whose jump lands in `S.owned`, the body that owns its parameters. Today `S` would retain and call `S.owned`; it already exists as a symbol | the first activation reads its arguments through the caller's counts; only the jumped-into ones own what they were handed |
 | 10 | an argument (H5) | an argument expression that is **backed**, passed to a **borrowed** parameter, is `held` when the call — and the later arguments' evaluation — kills none of its chain | the guarantee retain exists only because "the call may write that memory"; the callee's edge-write summary says whether it can |
-| 11 | ABI | **unchanged.** Every decision is in the caller's body or the callee's own body; `S` keeps its signature and stays the entry vtables, closures and C reach; R2/peel only change which of `S`/`S.owned` is a thunk | separate compilation and codegen units see nothing new (§5) |
+| 11 | ABI | **unchanged as seen from outside the program.** Every decision is in the caller's body or the callee's own body; `S` keeps its signature and stays the entry C, a library, an archive and every ordinary table slot reach; R2/peel only change which of `S`/`S.owned` is a thunk. **In a whole program** (`Analysis.closed`) a table slot every body of which answers +0 also gets a **+0 slot after the ordinary ones**, holding the bodies' `-zero` entries, which the program's own call sites reach (§5) | separate compilation and codegen units see nothing new; the ordinary slots and the identity word never move, so whatever reads a table without knowing of +0 slots reads what it read before (§5) |
 | 12 | summaries | **one new interprocedural answer**: each function's *edge writes* (set of edge keys, plus `opaque`, plus count-reading types), a least fixed point over the call graph, computed in the same walk as `untouched_summary` | the call graph already has every other question asked of it once per build |
 | 13 | where it is decided | on the typed tree, before emission, generalising `lent_element` (`e.lent_decls`) from a `for` variable to every local and binding | the emitter already knows "a name with no count"; `--explain-borrows` can say why |
 
@@ -247,6 +247,25 @@ Where the build sees no tables (a library, an archive), a table lacks the slot, 
   does in an archive.
 - **Codegen units**: every answer is computed on the whole program before the module is split; a
   unit receives decisions about its own bodies only.
+- **A table may carry +0 slots, in a whole program only** (`table_zero.sysl`). A call through a
+  closure or a trait object reaches the slot's ordinary entry, which answers with a count, so a +0
+  answer through a table (BI7's `table_ans`) moved the count but could not drop it. Where every body
+  a slot holds, in every table of the trait at the receiver's arguments, answers +0, is inert with
+  the +0 entries owning nothing, and is a shape a +0 entry takes, each table gets a **second slot
+  after all the ordinary ones**, in slot order: the body's `-zero` entry itself where the ordinary
+  slot holds the body itself, and otherwise a forwarder `vt.zero.[ref.]<target>` that brings the
+  receiver to the entry's shape (the object where it lies for a receiver lent by address -- an inert
+  body changes nothing it holds). The call site loads that slot (ordinary slot count + its place
+  among the +0 slots) and takes the answer's count itself, which the count elision drops with its
+  release where nothing between can release, as for a direct +0 call. **A second slot rather than a
+  `-zero` adapter in the ordinary slot**: the ordinary slot must keep answering +1 for whatever calls
+  it without knowing (a precompiled caller of a closure the program made), and an appended slot moves
+  no index any other reader uses. **Where it is never given**: a library build and an archive
+  (`emit-header`, `build-c`), which may be handed a table they never saw; a C function pointer, which
+  has no table; a trait any of whose tables reaches a body of a precompiled module, whose private
+  copy of the table has no +0 slot; a slot one of whose bodies is not +0, not inert (a call through
+  a table in it -- recursion through a table included), `@track_caller`, async, `@abandons`, or
+  answers through memory.
 
 ## 6. Hazards, each mapped
 

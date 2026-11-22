@@ -4512,8 +4512,13 @@ is in sight. So `quad(self) -> Kids = self.kids.unwrap()` costs what `n.kids mat
 costs: no count at all. A generic is decided per instance. In a program, which sees every closure and
 trait object it makes, a call through a closure or a trait object's table answers what each function
 the program put at that type answers, and is borrowed only where every one of them is; a library, or
-a call through a C function pointer, has no body in sight. Such a function still keeps the ordinary
-call, since the body in the slot is reached through its own ordinary entry. `--explain-borrows`
+a call through a C function pointer, has no body in sight. **Where every one of them answers so and
+releases and writes nothing, the call itself reads the answer where it lies**: the program's tables
+carry a second entry for that slot, after the ordinary ones, and the call reaches the bodies through
+it, so `peek(x: &Get) -> int = x.get().v` costs no count when every `get` answers a field. A table is
+laid out as before wherever something outside the program may read it -- a library, an archive C
+links, a table a precompiled module may have made -- and a function whose answer is borrowed only
+through such a call still keeps its ordinary call. `--explain-borrows`
 ([the CLI](/getting-started/cli/#explain-borrows)) reports each — here for a `Table` whose `find`
 answers `Some(it)` for an element of its `items`, a `look` built on it, and a `drained` that clears
 the buffer after asking:

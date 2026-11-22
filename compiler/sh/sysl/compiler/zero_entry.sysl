@@ -39,38 +39,57 @@ import sysl.container.{Map, Set, set}
 
 // The functions of `p` given a +0 entry, read from what the whole-program check found (`answers`,
 // `Promotions.zero_answers`), each added to what a call may lend its arguments to in place and to the
-// symbols the count elision may cross.
-zero_entries(e: *Emit, p: TProgram, answers: Map[string, usize])
+// symbols the count elision may cross. In a whole program (`closed`), the slots of its tables every
+// body of which answers +0 are given a +0 slot as well (`table_zero.sysl`).
+zero_entries(e: *Emit, p: TProgram, answers: Map[string, usize], closed: bool)
     if answers.is_empty() then return
 
     var cands: Buf[TFunc] = buf()
+    var named: Set[string] = set()
 
     for f in p.funcs
-        if answers.has(f.name) && !e.places.has(f.name) && zero_candidate(e, p, f) then cands.push(f)
-
-    if cands.is_empty() then return
+        if answers.has(f.name) && !e.places.has(f.name) && zero_candidate(e, p, f)
+            cands.push(f)
+            named.add(f.name)
 
     // **A +0 entry owns nothing**, so it is judged as its body would be were it handed its parameters
     // rather than owning them, as a place entry is.
+    if !named.is_empty()
+        val quiet = quiet_without(e, p, named)
+
+        for f in cands
+            if !quiet.has(f.name) then continue
+
+            e.zeros.add(f.name)
+            e.inert.add(zero_key(f.name))
+            e.inert_symbols.add(zero_symbol(e, f.name))
+    end if
+
+    if !closed || !p.entry_point then return
+
+    // The bodies a table's +0 slot would reach are judged the same way, with every one of them owning
+    // nothing too.
+    val slots = zero_slot_candidates(e, p, answers)
+
+    if slots.is_empty() then return
+
+    for group in slots
+        for item in group.slots
+            for target in item.1
+                named.add(target)
+
+    settle_zero_slots(e, slots, quiet_without(e, p, named))
+end zero_entries
+
+// What `inert_callees` answers with the functions `named` owning nothing.
+private quiet_without(e: *Emit, p: TProgram, named: Set[string]) -> Set[string]
     var owning: Set[string] = set()
 
     for name in e.owning_funcs
-        var entry = false
+        if !named.has(name) then owning.add(name)
 
-        for f in cands
-            if f.name == name then entry = true
-
-        if !entry then owning.add(name)
-
-    val quiet = if owning.len() == e.owning_funcs.len() then e.inert else inert_callees(p, owning)
-
-    for f in cands
-        if !quiet.has(f.name) then continue
-
-        e.zeros.add(f.name)
-        e.inert.add(zero_key(f.name))
-        e.inert_symbols.add(zero_symbol(e, f.name))
-end zero_entries
+    if owning.len() == e.owning_funcs.len() then e.inert else inert_callees(p, owning)
+end quiet_without
 
 // The symbol a function's +0 entry is defined and called at. No function's own symbol holds a `-`:
 // a sysl name is an identifier, and a module path and a generic's arguments are joined by `.` and `$`.
@@ -102,7 +121,9 @@ private zero_candidate(e: *Emit, p: TProgram, f: TFunc) -> bool
     for j in 0..<f.params.len()
         if value_drops(e, f.params[j].1) then return false
         if underlying(f.params[j].1) == VaList then return false
-        if e.lent_params.has(owned_key(f.name, j)) then return false
+        // A parameter lent by address is lent to the +0 entry the same way (`gen_zero_call`); one
+        // otherwise read where the caller put it keeps the ordinary entry.
+        if e.lent_params.has(owned_key(f.name, j)) then continue
         if e.in_place.has(f.name + "\n" + f.params[j].0) then return false
 
     true
@@ -148,8 +169,14 @@ gen_zero_call(e: *Emit, name: string, args: Buf[TExpr], ty: Type, span: Span) ->
     var arg_vals: Buf[IrArg] = buf()
     val written = written_by(args)
 
+    // A parameter the body is lent by address crosses at an address, as it does to the ordinary body;
+    // the entry is inert, so a place nothing after it changes goes over as it stands.
     for j in 0..<args.len()
-        arg_value(e, args[j], &arg_vals, written, if quiet_args_after(args, j) then zero_key(name) else "")
+        val judge = if quiet_args_after(args, j) then zero_key(name) else ""
+
+        if e.lent_params.has(owned_key(name, j))
+            arg_vals.push(ir_arg(LPtr, guaranteed_arg(e, args[j], judge, written, true, true, None)))
+        else arg_value(e, args[j], &arg_vals, written, judge)
 
     push_caller_arg(e, name, span, &arg_vals)
 
