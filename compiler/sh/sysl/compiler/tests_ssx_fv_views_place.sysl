@@ -1,0 +1,324 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{Var, capture}
+import sysl.text.{Search, join}
+
+// **A `@views(self)` member's `self.bytes` of its own `*self` is read at the caller's place**
+// (`reference/memory.md § A view borrowed from its receiver`, `short_strings.sysl`'s
+// `bytes_at_receiver`, `emit_str.sysl`'s `gen_bytes`): where it was a slot of the member's frame,
+// promoted to `sysl.str.unshort`'s heap copy because the view is the member's answer, it is now the
+// caller's own storage, short or long, with no slot and no copy. The mark's rules carry the soundness:
+// the view lives no longer than the name it was asked through, and that name is not written while the
+// view is held. `Search.view` is such a member, so every search of a short string stops allocating.
+//
+// Every program runs with the form off and on, and at `-O3` with it on, on the counted heap: each
+// prints the same thing and gives back every allocation.
+//
+// Skipped cells, with the reason: running a 32-bit program (no 32-bit runner; its IR for a thumb target
+// is asked instead); a `(self)` member and a member without the mark (both keep the frame slot and its
+// promotion, which `tests_ssx_c_bytes_frame_temp` pins -- the rule names neither); a closure inside the
+// member (a body of its own, never marked).
+
+private struct SsxFvRun
+    ok: bool
+    out: string
+    err: string
+
+private ssx_fv_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end ssx_fv_ready
+
+private ssx_fv_run(text: string, short: bool, level: string, env: []const Var) -> SsxFvRun
+    val root = make_temp_dir("sysl-ssx-fv").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    force_alloc_counting(true)
+    force_short_strings(short)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, level, Some(s"$root/built"))
+
+    unforce_short_strings()
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return SsxFvRun(false, failure_text(why), "")
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", env, true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> SsxFvRun(false, "could not be started", "")
+        Ok(o) -> SsxFvRun(o.status.ok(), o.text, o.err.unwrap_or(""))
+end ssx_fv_run
+
+// Form off, on, and on at `-O3`: each prints `want` and gives back every allocation.
+private ssx_fv_all(text: string, want: string)
+    for run_of in [(false, DefaultOptimization), (true, DefaultOptimization), (true, "3")]
+        val run = ssx_fv_run(text, run_of.0, run_of.1, [])
+        val what = s"short=${run_of.0} -O${run_of.1}"
+
+        assert(run.ok, s"$what: ${run.out} ${run.err}")
+        assert_eq(run.out, want, what)
+        assert_eq(alloc_count_reported(run.err), 0, s"$what: ${run.err}")
+end ssx_fv_all
+
+// The bytes the program allocated in all, with the form `short` or not.
+private ssx_fv_bytes(text: string, short: bool) -> long
+    val run = ssx_fv_run(text, short, DefaultOptimization, [Var(alloc_bytes_variable(), "1")])
+
+    assert(run.ok, s"short=$short: ${run.out} ${run.err}")
+    alloc_bytes_reported(run.err)
+end ssx_fv_bytes
+
+// What a build of `text` with the form on said, for `target` (or the host), and whether it was accepted.
+private ssx_fv_emit(text: string, target: Option[string]) -> (int, string)
+    val root = make_temp_dir("sysl-ssx-fv").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+
+    force_short_strings(true)
+
+    val code = target match
+        Some(t) -> run_cli(["sysl", "emit-llvm", s"$root/main.sysl", "--target", t], (line) -> sink.push(line))
+        None -> run_cli(["sysl", "emit-llvm", s"$root/main.sysl"], (line) -> sink.push(line))
+
+    unforce_short_strings()
+    remove_dir_all(root).unwrap_or(())
+    (code, join(lines.view(), "\n"))
+end ssx_fv_emit
+
+// -- the member of the report: no copy per call --------------------------------------------------------
+
+private val ssx_fv_member = """
+    trait V
+        @views(self)
+        look(*self) -> []const u8
+
+        first(self) -> u8 = self.look()[0]
+
+    impl V for string
+        @views(self)
+        look(*self) -> []const u8 = self.bytes
+
+    run(n: int, rounds: int) -> int
+        var s = n.to_string()
+        var t = 0
+
+        for i in 0..<rounds do t += int(s.first())
+
+        t
+
+    """
+
+private ssx_fv_rounds(rounds: int) -> string = ssx_fv_member + s"print(run(1234, $rounds))\n"
+
+@test("ssx_fv a short string's bytes through a '@views(self)' '*self' member are the caller's: no allocation per call")
+ssx_fv_member_allocates_nothing()
+    if !ssx_fv_ready() then return
+
+    // Before the rule: 36 bytes a call (a 4-byte string's heap copy), 36000 for a thousand.
+    assert_eq(ssx_fv_bytes(ssx_fv_rounds(1000), true), 0)
+    assert_eq(ssx_fv_bytes(ssx_fv_rounds(2000), true), 0)
+
+@test("ssx_fv and the member answers the same bytes with the form off and on, at every optimization")
+ssx_fv_member_answers_the_bytes()
+    if !ssx_fv_ready() then return
+
+    ssx_fv_all(ssx_fv_rounds(1000), "49000\n")
+
+// -- Search ---------------------------------------------------------------------------------------------
+
+private val ssx_fv_search = """
+    import sysl.text.Search
+
+    run(n: int, rounds: int) -> int
+        val s = n.to_string()
+        var hits = 0
+
+        for i in 0..<rounds
+            if s.index_of("4").is_some() then hits += 1
+            if s.starts_with("1") then hits += 1
+
+        hits
+
+    """
+
+@test("ssx_fv a search of a short string allocates nothing however often it is asked")
+ssx_fv_search_allocates_nothing()
+    if !ssx_fv_ready() then return
+
+    // Before the rule: 72000 bytes for the thousand rounds -- two heap copies of the receiver a round.
+    for rounds in [1000, 2000]
+        assert_eq(ssx_fv_bytes(ssx_fv_search + s"print(run(1234, $rounds))\n", true), 0, s"$rounds")
+
+@test("ssx_fv every search answers the same for short, long, literal and byte receivers, form off and on")
+ssx_fv_search_answers()
+    if !ssx_fv_ready() then return
+
+    ssx_fv_all("""
+        import sysl.text.Search
+
+        show(tag: string, s: string)
+            print(s"$tag ${s.index_of("é").unwrap_or(99)} ${s.last_index_of("a").unwrap_or(99)} " +
+                  s"${s.starts_with("ab")} ${s.ends_with("é")} ${s.count_of("a")} [${s.trim()}]")
+
+        main()
+            val base = "abcdefghijklmnaé  "
+
+            for n in [0, 1, 14, 15, 17, 18, 19]
+                show(s"copy$n", base[0..<n].copy())
+
+            show("lit", "abaé")
+            show("long", s"${base}${base}")
+
+            val b: []const u8 = "xaxa".bytes
+
+            print(b.index_of("a".bytes).unwrap_or(99), b.count_of("a".bytes))
+        """, "copy0 99 99 false false 0 []\n" +
+             "copy1 99 0 false false 1 [a]\n" +
+             "copy14 99 0 true false 1 [abcdefghijklmn]\n" +
+             "copy15 99 14 true false 2 [abcdefghijklmna]\n" +
+             "copy17 15 14 true true 2 [abcdefghijklmnaé]\n" +
+             "copy18 15 14 true false 2 [abcdefghijklmnaé]\n" +
+             "copy19 15 14 true false 2 [abcdefghijklmnaé]\n" +
+             "lit 3 2 true true 2 [abaé]\n" +
+             "long 15 33 true false 4 [abcdefghijklmnaé  abcdefghijklmnaé]\n" +
+             "1 2\n")
+
+@test("ssx_fv a generic over Search reads its receiver's bytes in place too")
+ssx_fv_generic_receiver()
+    if !ssx_fv_ready() then return
+
+    ssx_fv_all("""
+        import sysl.text.Search
+
+        first_of[T: Search](x: T) -> usize = x.index_of(x.slice(0, 1)).unwrap_or(99)
+
+        main()
+            val s = 77.to_string()
+            val b: []const u8 = "q".bytes
+
+            print(first_of(s), first_of(b))
+        """, "0 0\n")
+
+// -- what the mark still refuses ------------------------------------------------------------------------
+
+@test("ssx_fv the view may not leave the function holding its receiver")
+ssx_fv_view_may_not_leave()
+    if !ssx_fv_ready() then return
+
+    val got = ssx_fv_emit("""
+        import sysl.text.Search
+
+        leaks(s: string) -> []const u8
+            var t = s
+            t.view()
+
+        print(leaks("abc").len)
+        """, None)
+
+    assert(got.0 != 0, got.1)
+    assert(got.1.contains("this returns a view borrowed from 't'"), got.1)
+
+@test("ssx_fv nor be stored where it outlives the receiver")
+ssx_fv_view_may_not_be_stored()
+    if !ssx_fv_ready() then return
+
+    val got = ssx_fv_emit("""
+        import sysl.text.Search
+
+        var kept: []const u8 = "".bytes
+
+        keep(n: int)
+            var s = n.to_string()
+            kept = s.view()
+
+        main()
+            keep(12)
+            print(kept.len)
+        """, None)
+
+    assert(got.0 != 0, got.1)
+    assert(got.1.contains("'s'"), got.1)
+
+@test("ssx_fv nor may its receiver be written while it is held")
+ssx_fv_receiver_not_written_while_held()
+    if !ssx_fv_ready() then return
+
+    val got = ssx_fv_emit("""
+        import sysl.text.Search
+
+        main()
+            var s = 12.to_string()
+            val v = s.view()
+
+            s = "other"
+            print(v[0])
+        """, None)
+
+    assert(got.0 != 0, got.1)
+    assert(got.1.contains("'v' is a view borrowed from 's', and this assignment could free what it views"), got.1)
+
+@test("ssx_fv a view held past a write once its block has closed is accepted")
+ssx_fv_view_closed_before_the_write()
+    if !ssx_fv_ready() then return
+
+    ssx_fv_all("""
+        import sysl.text.Search
+
+        main()
+            var s = 12.to_string()
+
+            if true
+                val v = s.view()
+
+                print(v[0])
+
+            s = "other"
+            print(s.view().len)
+        """, "49\n5\n")
+
+// -- the IR -----------------------------------------------------------------------------------------------
+
+@test("ssx_fv the member reads the second word of its receiver's storage, with no slot and no unshort, at 64 and 32 bits")
+ssx_fv_ir_reads_the_place()
+    if !ssx_fv_ready() then return
+
+    for target in [None, Some("thumb-freestanding-softfp")]
+        // The member as the rule reads it, and the same member taking `self` by value, which keeps the
+        // frame slot and copies it out -- the control that shows the IR can tell the two apart.
+        for receiver in ["*self", "self"]
+            val got = ssx_fv_emit("""
+                trait V
+                    @views(self)
+                    look(RECV) -> []const u8
+
+                impl V for string
+                    @views(self)
+                    look(RECV) -> []const u8 = self.bytes
+
+                main()
+                    var s = "abcdefghij"[0..<5].copy()
+
+                    print(s.look().len)
+                """.replace_all("RECV", receiver), target)
+
+            assert_eq(got.0, 0, got.1)
+            assert_eq(got.1.contains("sysl.str.unshort"), receiver == "self", s"$target $receiver: ${got.1}")
