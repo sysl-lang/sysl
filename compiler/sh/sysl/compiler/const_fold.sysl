@@ -256,8 +256,23 @@ private const_compare(cx: &Analyzer, e: Expr, op: string, l: Expr, r: Expr) -> O
 
     if folded.is_some() || const_refused_since(cx.an, refusals) then return folded
 
-    if is_record(const_fold(cx, l)) || is_record(const_fold(cx, r)) then const_run(cx, e, true) else None
+    if is_record(const_fold(cx, l)) || is_record(const_fold(cx, r)) then return const_run(cx, e, true)
+
+    // An enum value parameter against a variant written bare -- `M == A` -- is read as the analyzer
+    // reads it: the parameter's enum is the type the bare name is a variant of. The fold holds the
+    // parameter as its variant's position and has no type to read `A` in, so the comparison is typed
+    // and run whole, as one against `Mode.A` is.
+    if enum_param(cx, l) || enum_param(cx, r) then const_run(cx, e, true) else None
 end const_compare
+
+// Whether `e` is the name of a value parameter whose type is an enum.
+private enum_param(cx: &Analyzer, e: Expr) -> bool = *e.kind match
+    Ident(name) -> bound_type(cx.subst, name) match
+        Some(ConstArg(_, ty, _, _)) -> underlying(*ty) match
+            Enum(_) -> true
+            _ -> false
+        _ -> false
+    _ -> false
 
 // A chain, `a < b <= c`, over operands that each fold: typed and run whole, each link compared in
 // turn as the program compares it. One operand that does not fold leaves the chain unfolded.
