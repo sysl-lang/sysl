@@ -72,6 +72,10 @@ struct Promotions
     bytes_framed: Buf[(string, Buf[Span])]
     bytes_framed_main: Buf[Span]
 
+    // **The `.bytes` a `@views(self)` member takes of its own `*self`** (`bytes_at_receiver`), by
+    // function: read at the caller's place, with neither a slot nor a copy.
+    bytes_at_place: Buf[(string, Buf[Span])]
+
     // Whether the compilation sees every table a trait object can carry (`Analysis.closed`), which is
     // what lets a table carry +0 slots (`table_zero.sysl`).
     closed: bool
@@ -107,6 +111,15 @@ struct Promotions
         buf()
     end bytes_framed_for
 
+    // The `.bytes` this body reads at its receiver's place, in the same terms. The statements a
+    // program runs belong to no member, so they have none.
+    bytes_at_place_for(self, name: string) -> Buf[Span]
+        for item in self.bytes_at_place
+            if item.0 == name then return item.1
+
+        buf()
+    end bytes_at_place_for
+
     holds_temp(self, at: Span) -> bool
         for temporarie in self.temporaries
             if temporarie == at then return true
@@ -124,7 +137,8 @@ no_promotions() -> Promotions
     var framed: Buf[(string, Buf[Span])] = buf()
     var framed_main: Buf[Span] = buf()
 
-    Promotions(by_func, in_main, temporaries, framed, framed_main, notes, set(), map(), map(), buf(), buf(), false)
+    Promotions(by_func, in_main, temporaries, framed, framed_main, notes, set(), map(), map(), buf(), buf(),
+               buf(), false)
 end no_promotions
 
 // What one body's walk found: the arrays it must move, the temporaries it must give storage to,
@@ -185,6 +199,10 @@ struct EscapeWalk
     // empty unless the short form is on.
     bytes_sites: Buf[Span]
     loops: Buf[Span]
+
+    // The `.bytes` of the body read at its receiver's place (`bytes_at_receiver`), which are no
+    // temporaries at all: the view is the caller's storage, held to the caller's name by `@views`.
+    at_place: Buf[Span]
 end EscapeWalk
 
 // One promotion, with its parts still separate.
@@ -338,7 +356,7 @@ check_escapes(a: &Analysis, p: TProgram) -> Promotions
 
     for i in 0..<p.funcs.len()
         val f = p.funcs[i]
-        val w = walk_body(p, keeps, f.body.stmts, f.body.result)
+        val w = walk_body(p, keeps, f.body.stmts, f.body.result, f.marks.views)
         val home = func_home(a, f.name)
 
         report_body(a, p, home, Some(f.name), f.marks.gives_up("alloc"), w)
@@ -354,6 +372,7 @@ check_escapes(a: &Analysis, p: TProgram) -> Promotions
         val bytes = framed_bytes(w)
 
         if !bytes.is_empty() then out.bytes_framed.push((f.name, bytes))
+        if !w.at_place.is_empty() then out.bytes_at_place.push((f.name, w.at_place))
 
         for temp in w.temps
             out.temporaries.push(temp.0)
@@ -371,7 +390,7 @@ check_escapes(a: &Analysis, p: TProgram) -> Promotions
     out.framed_main = settled_frames(mw)
     // A module initializer is laid down by the entry too, and nothing walked it: its `.bytes` are
     // never framed, and one sharing a span with a statement's (another file) keeps both off the frame.
-    val init_bytes: &BytesSites = BytesSites(buf(), buf())
+    val init_bytes: &BytesSites = BytesSites(buf(), buf(), buf())
 
     if short_strings_on()
         for v in p.vals
@@ -507,7 +526,7 @@ end kept_by
 // Propagates through the body's own locals to a fixpoint, then looks for the places a confined view
 // could get out.
 // A walk of `stmts` that has found nothing yet.
-private fresh_walk(stmts: Buf[TStmt]) -> &EscapeWalk
+private fresh_walk(stmts: Buf[TStmt], views: bool = false) -> &EscapeWalk
     var confined: Buf[(string, EView)] = buf()
     var promoted: Buf[string] = buf()
     var temps: Buf[(Span, string)] = buf()
@@ -515,11 +534,11 @@ private fresh_walk(stmts: Buf[TStmt]) -> &EscapeWalk
     val found = scopes(stmts)
     var lits: Buf[Span] = buf()
     var framed: Buf[Span] = buf()
-    val bytes = short_bytes_sites(stmts)
+    val bytes = short_bytes_sites(stmts, views)
 
     EscapeWalk(confined, promoted, temps, sites, None, local_arrays(stmts), ref_bindings(stmts),
                aligned_arrays(stmts), lits, framed, found.0, found.1, buf(), rebound_locals(stmts), stmts,
-               None, bytes.0, bytes.1)
+               None, bytes.sites, bytes.loops, bytes.at_place)
 end fresh_walk
 
 // **`s.bytes` of a string that may be short is a temporary of the frame**
@@ -535,21 +554,35 @@ bytes_temp(x: TExpr) -> bool
         _ -> false
 end bytes_temp
 
-// The body's `.bytes` temporaries and its loops, or nothing where the short form is off.
-private short_bytes_sites(stmts: Buf[TStmt]) -> (Buf[Span], Buf[Span])
-    val found: &BytesSites = BytesSites(buf(), buf())
+// The body's `.bytes` temporaries and its loops, and the `.bytes` it reads at its receiver's place
+// where it is a `@views(self)` member (`views`), or nothing where the short form is off.
+private short_bytes_sites(stmts: Buf[TStmt], views: bool) -> &BytesSites
+    val found: &BytesSites = BytesSites(buf(), buf(), buf())
 
     if short_strings_on()
         walk_stmts(stmts, expr_walk(false, x ->
-            if bytes_temp(x) then found.sites.push(x.span)
+            if read_at_receiver(views, x) then found.at_place.push(x.span)
+            else if bytes_temp(x) then found.sites.push(x.span)
+
             if is_loop(x) then found.loops.push(x.span)))
 
-    (found.sites, found.loops)
+    found
 end short_bytes_sites
+
+// Whether `x` is a `.bytes` of a string that may be short, read at the receiver's place of a
+// `@views(self)` member (`views`).
+private read_at_receiver(views: bool, x: TExpr) -> bool
+    if !bytes_temp(x) then return false
+
+    *x.kind match
+        TBytes(r) -> bytes_at_receiver(views, r)
+        _ -> false
+end read_at_receiver
 
 private struct BytesSites
     sites: Buf[Span]
     loops: Buf[Span]
+    at_place: Buf[Span]
 
 private is_loop(x: TExpr) -> bool = *x.kind match
     TWhile(_, _, _, _) -> true
@@ -568,9 +601,10 @@ private is_loop(x: TExpr) -> bool = *x.kind match
 // binds its locals have to see it too: an array declared there is one this body may move, and a
 // view bound there is one whose escape has to be caught. Only what is left once the value is walked
 // is the value's own: whether it is returned holding a view.
-private walk_body(p: TProgram, keeps: &KeptParams, stmts: Buf[TStmt], result: Option[TExpr]) -> EscapeWalk
+private walk_body(p: TProgram, keeps: &KeptParams, stmts: Buf[TStmt], result: Option[TExpr],
+                  marked_views: bool = false) -> EscapeWalk
     val whole = with_result(stmts, result)
-    val w = fresh_walk(whole)
+    val w = fresh_walk(whole, marked_views)
     val prog = p
     val kp = keeps
     var changed = true
@@ -1374,7 +1408,8 @@ private views_value(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, e: TExpr) -
     TIndex(r, _, _) -> views(p, keeps, w, r)
     // The bytes of a string that may be short are a slot of the frame (`bytes_temp`).
     TBytes(r) ->
-        if bytes_temp(e) then join_views(views(p, keeps, w, r), temp_view(e.span, bytes_what(r)))
+        if bytes_temp(e) && !holds_span(w.at_place, e.span) then
+            join_views(views(p, keeps, w, r), temp_view(e.span, bytes_what(r)))
         else views(p, keeps, w, r)
 
     // A view read at another element type is the same storage, so it views what its argument views.

@@ -1394,22 +1394,55 @@ Neither box above touches the heap. **A box stays on the heap wherever it may ge
 anywhere but a local of the frame (module storage, a field reached through a reference or a pointer,
 a buffer, another box), returned other than as a factory's answer, captured by a closure, handed to a
 parameter whose body may let it out or answer it into something that does, weakened, given up with
-`into_raw`, put behind a trait object, carried out of a loop by `break`, or held by a local that
-outlives the loop turn that built it. A view of an array inside a box owns the box, so a view that
-gets out keeps its box on the heap. A call with no body in sight — through a trait object, a callable,
-a function pointer, an `extern` — or a recursion still being worked out answers "it may get out", as
-does a task's body and a payload over a kilobyte, which every frame of a recursion would pay for. A
-`&sync T` is never laid in a frame. Nothing here is visible to the program but the allocator: a
+`into_raw`, carried out of a loop by `break`, or held by a local that outlives the loop turn that
+built it. A view of an array inside a box owns the box, so a view that gets out keeps its box on the
+heap. **A call through a trait object or a callable is a call of every body its table may hold** — in
+a program, which sees every table there is, each method or closure of that trait at the receiver's own
+arguments; the box stays in the frame where none of them lets it out. A call with no body in sight — a
+C function pointer, an `extern`, a trait object or a callable in a library, which may be handed one
+whose table it never saw — or a recursion still being worked out answers "it may get out", as does a
+task's body and a payload over a kilobyte, which every frame of a recursion would pay for. A
+`&sync T` is never laid in a frame.
+
+```sysl
+trait Reader
+    read(self, p: &Point) -> int
+
+struct Point
+    x: int
+    y: int
+
+struct Sum
+    k: int
+
+impl Reader for Sum
+    read(self, p: &Point) -> int = p.x + p.y + self.k
+
+main()
+    val r: &Reader = Sum(1)
+    val p: &Point = Point(3, 4)
+
+    print(r.read(p))
+```
+
+```output
+8
+```
+
+Neither `r` nor `p` touches the heap: the one table of `Reader` holds a `read` that only reads both. Nothing here is visible to the program but the allocator: a
 frame box prints, compares and drops exactly as a heap box does.
 
 **Where every share of a frame box is taken and given back by the body that laid it, the compiler
 counts them, not the program.** No count is taken or given back at run time: the point where the
 last share would have gone runs the destructor and lets go of what the payload holds, exactly where
 it ran before, on every way out of the scope — the end of a block, a `return`, a `?`, a `break` or
-`continue` out of the loop turn that built it. Both boxes above, a box held by two locals, a
+`continue` out of the loop turn that built it. `c` and `r` of the first example, a box held by two locals, a
 temporary handed to a call, a box a closure captures, a box lent to a callee that takes shares of its
-own: each is counted by the compiler. A local that may hold one of two boxes, or the answer of a call that may be the box
-itself, leaves that box counted at run time, as above; the program cannot tell the two apart.
+own, a box handed to a call through a trait object or a callable whose every body leaves it alone (`p`
+above): each is counted by the compiler. A local that may hold one of two boxes, or the answer of a call that may be the box
+itself, leaves that box counted at run time, as above; the program cannot tell the two apart. So
+does a trait object or a callable that is itself a frame box and the receiver of the call (`r` above),
+and a closure capturing a box handed through a table.
 
 #### Promotion is silent, not hidden
 
@@ -1422,6 +1455,17 @@ compiler then enforces it rather than reporting it.
 $ sysl build --explain-escapes tty.sysl
 tty.sysl:31:12: 'buf' is promoted to the heap, because this view of it is returned
 ```
+
+The `.bytes` of a string that may [hold its bytes in itself](/reference/strings/#a-string-of-a-few-bytes-holds-them-in-itself)
+is a slot of the frame in the same way, and a view of it that outlives the frame is a copy, reported
+on its own line at the `.bytes`:
+
+```
+name.sysl:8:5: 's.bytes' is the bytes of a string that may be held in the string itself, so it is copied to the heap, because this view of it is returned
+```
+
+`sysl test` takes the flag as a build does, and `sysl test <library> --std --explain-escapes` is how
+the standard library's own promotions are listed.
 
 The idiom worth reaching for first, even with an allocator, is **return a count and let the caller
 slice its own buffer** — what `snprintf` does, and what most kernel code wants.
@@ -1511,8 +1555,8 @@ run()
 freed
 ```
 
-The view is an ordinary `[]const u8`; nothing changes at run time. The mark adds one lexical fact:
-**the view lives no longer than the name it was called through**, and four things are refused:
+The view is an ordinary `[]const u8`. The mark adds one lexical fact: **the view lives no longer than
+the name it was called through**, and four things are refused:
 
 1. **a receiver that is not a name** — a temporary is freed at the end of its statement;
 2. **the view leaving the function that holds its receiver** — returned, or what the body comes to,
@@ -1522,6 +1566,35 @@ The view is an ordinary `[]const u8`; nothing changes at run time. The mark adds
    one holds, closes first and is fine);
 4. **freeing the receiver while a local holding the view is in scope** — assigning the name, a
    `*self` call on it, or a call that may write an object of its type.
+
+**One thing changes at run time, and it is what those four rules make safe: a member that takes
+`*self` reads `self.bytes` of a string where the caller holds it.** A string of a few bytes
+[holds them in itself](/reference/strings/#a-string-of-a-few-bytes-holds-them-in-itself), so
+`s.bytes` is ordinarily a copy in the frame that took it, and a member answering that copy would
+have to copy it again to the heap to hand it back. In a `@views(self)` member taking `*self` the
+string is at the caller's address, which the view may not outlive and which may not be written while
+it is held, so the view is made over that storage — no slot and no copy, short or long. A `(self)`
+member, or one without the mark, keeps the copy. `Search.view_in_place` is written this way, which is
+why a search of a short string allocates nothing:
+
+```sysl
+trait Bytes
+    @views(self)
+    lend(*self) -> []const u8
+
+impl Bytes for string
+    @views(self)
+    lend(*self) -> []const u8 = self.bytes
+
+var s = 1234.to_string()
+val b = s.lend()
+
+print(b.len, b[0])
+```
+
+```output
+4 49
+```
 
 What a view is copied into — a sub-slice, a struct or `Option` around it, a closure capturing it, a
 name a pattern binds, a loop variable over a view of views — is borrowed from the same receiver; a

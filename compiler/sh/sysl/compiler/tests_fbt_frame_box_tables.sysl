@@ -1,0 +1,485 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Var}
+import sysl.text.{cstring, Search}
+
+// A box handed through a trait object's table or a closure is laid in the frame where the program sees
+// every table (`stack_box.sysl`'s `table_callees`): the call is then a call of what that slot holds in
+// each table of the receiver's trait at its arguments, the receiver the callee's parameter 0, and the
+// box stays in the frame when none of them lets that parameter out.
+//
+// The cells: a trait object's method reading the box it is handed and its own receiver; a `&self`
+// method writing its receiver; a closure reading what it is handed; one of two tables keeping it (heap);
+// a callee answering it, read locally (frame) and kept (heap); a generic trait at two arguments, only
+// one of which keeps; a payload with a destructor erased and called through its table; recursion
+// through a table (heap: the walk answers "escapes" for a callee still being worked out); a C function
+// pointer (heap: no body in sight); and the same program built as a library, which may be handed an
+// object whose table it never saw (heap). Each runs on the counted heap with `SYSL_COUNT_BYTES`, the
+// frame cells again under AddressSanitizer.
+//
+// Skipped cells, and why: a rendering through a table (`TRender`) is still a call with no body in
+// sight -- interpolation of a trait object is not this walk's arm; an `async` body lays nothing
+// (`frame_shaped`); codegen units and a bare-metal target change no decision, which is made on the
+// typed tree before either is asked; a precompiled `.syslib` callee answers "escapes" (no body in the
+// program's index), the same as before.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private struct FbtRun
+    out: string
+    err: string
+    bytes: long
+end FbtRun
+
+private fbt_run(text: string, flags: string) -> FbtRun
+    val root = make_temp_dir("sysl-fbt").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    val exe = s"$root/built"
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+        val v = cstring(flags)
+
+        fbt_c_setenv(n.ptr, v.ptr, 1)
+    end if
+
+    force_alloc_counting(flags == "")
+
+    val made = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe))
+
+    force_alloc_counting(false)
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+
+        fbt_c_unsetenv(n.ptr)
+    end if
+
+    made match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return FbtRun(failure_text(why), "", -1)
+        Ok(_) -> ()
+
+    val ran = capture(exe, [], "", [Var(alloc_bytes_variable(), "1")], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    ran match
+        Err(_) -> FbtRun("could not be started", "", -1)
+        Ok(o) -> FbtRun(o.text, o.err.unwrap_or(""), alloc_bytes_reported(o.err.unwrap_or("")))
+end fbt_run
+
+private extern "setenv" fbt_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" fbt_c_unsetenv(name: *u8) -> int
+
+// The program printed `want`, gave back everything it took, and allocated nothing where its boxes are
+// `framed` -- something where they are not.
+private fbt_check(name: string, text: string, want: string, framed: bool)
+    val got = fbt_run(text, "")
+
+    assert_eq(got.out, want)
+    assert_eq(alloc_count_reported(got.err), 0)
+
+    if framed then assert(got.bytes == 0, s"$name allocated ${got.bytes} bytes:\n${got.err}")
+    else assert(got.bytes > 0, s"$name allocated nothing, so its box was laid in the frame")
+end fbt_check
+
+// The LLVM text of a program, or its report.
+private fbt_ir(text: string) -> string
+    val root = make_temp_dir("sysl-fbt").unwrap()
+
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end fbt_ir
+
+private fbt_lines_with(ir: string, part: string) -> int
+    var n = 0
+
+    for line in lines_of(ir).view()
+        if line.contains(part) then n += 1
+
+    n
+end fbt_lines_with
+
+// The boxes laid in a frame: an alloca of a box's whole shape, less the copy of a by-value receiver a
+// table's adapter stages (`%self.object`), which is no box of the program's.
+private fbt_frame_boxes(ir: string) -> int =
+    fbt_lines_with(ir, "= alloca %arc.") - fbt_lines_with(ir, "%self.object = alloca %arc.")
+
+// -- the cells that stay in the frame ---------------------------------------------------------------
+
+private const fbt_trait_reads: string = raw"""
+    trait Reader
+        read(self, p: &Point) -> int
+
+    struct Point
+        x: int
+        y: int
+
+    struct Sum
+        k: int
+
+    impl Reader for Sum
+        read(self, p: &Point) -> int = p.x + p.y + self.k
+
+    main()
+        val r: &Reader = Sum(1)
+        val p: &Point = Point(3, 4)
+
+        print(r.read(p))
+    """
+
+private const fbt_self_writes: string = raw"""
+    trait Bump
+        bump(&self)
+        get(&self) -> int
+
+    struct Counter
+        n: int
+
+    impl Bump for Counter
+        bump(&self) = self.n += 1
+        get(&self) -> int = self.n
+
+    main()
+        val c: &Bump = Counter(1)
+
+        c.bump()
+        c.bump()
+        print(c.get())
+    """
+
+private const fbt_closure_reads: string = raw"""
+    struct Point
+        x: int
+        y: int
+
+    apply(f: &Fn(&Point) -> int, p: &Point) -> int = f(p)
+
+    main()
+        val p: &Point = Point(3, 4)
+
+        print(apply(q -> q.x + q.y, p))
+    """
+
+private const fbt_answered_read: string = raw"""
+    trait Pick
+        pick(self, p: &Point) -> &Point
+
+    struct Point
+        x: int
+
+    struct Same
+        k: int
+
+    impl Pick for Same
+        pick(self, p: &Point) -> &Point = p
+
+    main()
+        val s: &Pick = Same(0)
+        val p: &Point = Point(5)
+        val q = s.pick(p)
+
+        print(q.x)
+    """
+
+private const fbt_destructor: string = raw"""
+    trait Named
+        name(self) -> int
+
+    struct Res
+        n: int
+
+    impl Drop for Res
+        drop(self) = print("closed", self.n)
+
+    impl Named for Res
+        name(self) -> int = self.n
+
+    read(r: &Named) -> int = r.name()
+
+    main()
+        val r: &Named = Res(1)
+
+        print(read(r))
+        print("end")
+    """
+
+@test("a box handed through a table or a closure whose bodies only read it allocates nothing")
+fbt_frame_cells_allocate_nothing()
+    if !enm_ready() then return
+
+    fbt_check("fbt_trait_reads", fbt_trait_reads, "8\n", true)
+    fbt_check("fbt_self_writes", fbt_self_writes, "3\n", true)
+    fbt_check("fbt_closure_reads", fbt_closure_reads, "7\n", true)
+    fbt_check("fbt_answered_read", fbt_answered_read, "5\n", true)
+    fbt_check("fbt_destructor", fbt_destructor, "1\nend\nclosed 1\n", true)
+end fbt_frame_cells_allocate_nothing
+
+@test("and under AddressSanitizer: instrumented, and nothing read outside a live frame")
+fbt_frame_cells_run_clean_under_asan()
+    if !enm_ready() then return
+
+    for item in [(fbt_trait_reads, "8\n"), (fbt_self_writes, "3\n"), (fbt_closure_reads, "7\n"),
+                 (fbt_answered_read, "5\n"), (fbt_destructor, "1\nend\nclosed 1\n")]
+        val got = fbt_run(item.0, "-fsanitize=address -g")
+
+        assert_eq(got.out, item.1)
+        assert_eq(got.err, "")
+    end for
+end fbt_frame_cells_run_clean_under_asan
+
+@test("a box handed through a table is an alloca with no malloc")
+fbt_table_call_is_an_alloca()
+    if xvr_no_library() then return
+
+    val ir = fbt_ir(fbt_trait_reads)
+
+    assert_eq(fbt_lines_with(ir, "call ptr @malloc"), 0)
+    assert_eq(fbt_frame_boxes(ir), 2)
+end fbt_table_call_is_an_alloca
+
+// -- the ways out, each on the heap ------------------------------------------------------------------
+
+// The receivers are laid in the frame (neither body keeps its own), so what is allocated is the one
+// box a table keeps.
+private const fbt_one_keeps: string = raw"""
+    trait Reader
+        read(self, p: &Point) -> int
+
+    struct Point
+        x: int
+        y: int
+
+    struct Sum
+        k: int
+
+    struct Keeper
+        k: int
+
+    var kept: Option[&Point] = None
+    var reading = true
+
+    impl Reader for Sum
+        read(self, p: &Point) -> int = p.x + p.y
+
+    impl Reader for Keeper
+        read(self, p: &Point) -> int
+            kept = Some(p)
+            p.x
+
+    main()
+        val r: &Reader = if reading then Sum(0) else Keeper(0)
+        val p: &Point = Point(3, 4)
+
+        print(r.read(p), kept.is_some())
+    """
+
+private const fbt_answer_kept: string = raw"""
+    trait Pick
+        pick(self, p: &Point) -> &Point
+
+    struct Point
+        x: int
+
+    struct Same
+        k: int
+
+    impl Pick for Same
+        pick(self, p: &Point) -> &Point = p
+
+    var kept: Option[&Point] = None
+
+    main()
+        val s: &Pick = Same(0)
+        val p: &Point = Point(5)
+
+        kept = Some(s.pick(p))
+        print(kept.unwrap().x)
+        kept = None
+    """
+
+private const fbt_closure_keeps: string = raw"""
+    struct Point
+        x: int
+
+    var kept: Option[&Point] = None
+
+    apply(f: &Fn(@keeps &Point) -> int, p: &Point) -> int = f(p)
+
+    keep(q: &Point) -> int
+        kept = Some(q)
+        q.x
+
+    main()
+        val p: &Point = Point(6)
+
+        print(apply(q -> keep(q), p))
+        kept = None
+    """
+
+// The walk answers "escapes" for a callee still being worked out, a table's included.
+private const fbt_recursive: string = raw"""
+    trait Walk
+        depth(self, me: &Walk, a: &Acc, k: int) -> int
+
+    struct Acc
+        n: int
+
+    struct W
+        n: int
+
+    impl Walk for W
+        depth(self, me: &Walk, a: &Acc, k: int) -> int =
+            if k == 0 then a.n else 1 + me.depth(me, a, k - 1)
+
+    main()
+        val w: &Walk = W(0)
+        val a: &Acc = Acc(2)
+
+        print(w.depth(w, a, 3))
+    """
+
+@test("a table or closure that keeps or answers out its argument, or recursion through one, keeps it on the heap")
+fbt_ways_out_stay_on_the_heap()
+    if !enm_ready() then return
+
+    fbt_check("fbt_one_keeps", fbt_one_keeps, "7 false\n", false)
+    fbt_check("fbt_answer_kept", fbt_answer_kept, "5\n", false)
+    fbt_check("fbt_closure_keeps", fbt_closure_keeps, "6\n", false)
+    fbt_check("fbt_recursive", fbt_recursive, "5\n", false)
+end fbt_ways_out_stay_on_the_heap
+
+// Only the table at the receiver's own arguments is followed: `Visit[&Acc]`'s keeping body never
+// reaches a `&Visit[&Point]` call, so `Point` is laid in the frame and `Acc` is not.
+private const fbt_generic: string = raw"""
+    trait Visit[T]
+        visit(self, x: T) -> int
+
+    struct Point
+        x: int
+
+    struct Acc
+        n: int
+
+    struct Look
+        k: int
+
+    struct Keep
+        k: int
+
+    var kept: Option[&Acc] = None
+
+    impl Visit[&Point] for Look
+        visit(self, x: &Point) -> int = x.x + self.k
+
+    impl Visit[&Acc] for Keep
+        visit(self, x: &Acc) -> int
+            kept = Some(x)
+            x.n
+
+    main()
+        val v: &Visit[&Point] = Look(1)
+        val p: &Point = Point(2)
+        val k: &Visit[&Acc] = Keep(0)
+        val a: &Acc = Acc(4)
+
+        print(v.visit(p), k.visit(a))
+        kept = None
+    """
+
+@test("a generic trait at two arguments: each call follows only its own arguments' tables")
+fbt_generic_trait_at_two_arguments()
+    if !enm_ready() then return
+
+    fbt_check("fbt_generic", fbt_generic, "3 4\n", false)
+
+    val ir = fbt_ir(fbt_generic)
+
+    // `Look`, `Point` and `Keep` in the frame; `Acc` on the heap.
+    assert_eq(fbt_frame_boxes(ir), 3)
+    assert_eq(fbt_lines_with(ir, "call ptr @malloc"), 1)
+end fbt_generic_trait_at_two_arguments
+
+// A C function pointer has no body in sight.
+private const fbt_c_pointer: string = raw"""
+    struct Point
+        x: int
+
+    sum(p: &Point) -> int = p.x
+
+    main()
+        val f: *extern(&Point) -> int = &sum
+        val p: &Point = Point(5)
+
+        print(f(p))
+    """
+
+@test("a box handed to a C function pointer stays on the heap")
+fbt_c_pointer_stays_on_the_heap()
+    if !enm_ready() then return
+
+    fbt_check("fbt_c_pointer", fbt_c_pointer, "5\n", false)
+end fbt_c_pointer_stays_on_the_heap
+
+// -- the build: a library sees only some of the tables ----------------------------------------------
+
+private var fbt_std_cache: Buf[Program] = buf()
+private var fbt_std_read: bool = false
+
+private fbt_std() -> Buf[Program]
+    if fbt_std_read then return fbt_std_cache
+
+    fbt_std_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> fbt_std_cache = units
+
+    fbt_std_cache
+end fbt_std
+
+private fbt_program(text: string) -> TProgram
+    var units: Buf[Program] = buf()
+
+    for item in fbt_std()
+        units.push(item)
+
+    units.push(parse(source_of("test.sysl", text)).program)
+    program_of(analyze_bodies(units, host_target()), "")
+end fbt_program
+
+@test("the same program built as a library keeps a box handed through a table on the heap")
+fbt_library_build_stays_on_the_heap()
+    if fbt_std().is_empty() || !clang_available() then return
+
+    val text = "module m\n\n" + forms_imported(fbt_trait_reads)
+    var p = fbt_program(text)
+    val closed = codegen_text(p, host_target())
+
+    assert_eq(fbt_frame_boxes(closed), 2)
+
+    p.entry_point = false
+
+    val open = codegen_text(p, host_target())
+
+    // Both the receiver and the argument are handed through the table, which a library cannot see all
+    // of: both go back to the heap.
+    assert_eq(fbt_frame_boxes(open), 0)
+end fbt_library_build_stays_on_the_heap
