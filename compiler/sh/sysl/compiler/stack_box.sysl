@@ -348,6 +348,12 @@ private holds_span(xs: Buf[Span], s: Span) -> bool
 end holds_span
 
 // Whether a value of this type can hold a count or an address, and so a box: a number cannot.
+// Whether a cast from `from` to `to` reads a value as another type: to a raw pointer of another
+// type, or to something that holds no address (an integer).
+private reinterprets(from: Type, to: Type) -> bool = underlying(to) match
+    Ptr(_, _) -> mangle(underlying(from)) != mangle(underlying(to))
+    _ -> !may_carry(to)
+
 private may_carry(t: Type) -> bool = underlying(t) match
     Ref(_, _) -> true
     Weak(_) -> true
@@ -661,10 +667,13 @@ private sb_kind(w: &BoxWalk, x: TExpr) -> bool = *x.kind match
     TArrayLit(elems, _) -> sb_all(w, elems)
     TArrayFill(v, _) -> sb_carry(w, v)
     TErase(v, _, _) -> sb_carry(w, v)
+    // **A cast that reads the box as something else lets it out**: `ptr_cast(&pin)` to a `*usize`, then
+    // a load, carries the box's address as a number nothing here follows (`sysl.buf`'s `view_shared`
+    // hands its pin to the slice it answers that way). A cast to the same type changes nothing.
     TCast(v, ty) ->
         val c = sb_carry(w, v)
 
-        if c && is_sync_ref(ty) then sb_escape(w)
+        if c && (is_sync_ref(ty) || reinterprets(texpr_type(v), ty)) then sb_escape(w)
 
         c
     TConstView(v) -> sb_view(w, v)
