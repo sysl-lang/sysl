@@ -3,7 +3,8 @@ module sh.sysl.compiler
 import sysl.env.{get as env_var}
 
 // **Whether a string may hold its bytes in the value itself** (`docs/design/short-strings.md`,
-// option A), asked with `SYSL_SHORT_STRINGS=1` while the form is being built.
+// option A). The form is on unless `SYSL_SHORT_STRINGS=0` turns it off, which is the diagnostic
+// switch: a build with it off emits every string byte for byte as before the form existed.
 //
 // A short string is the three words of every string, laid out as
 //
@@ -16,21 +17,28 @@ import sysl.env.{get as env_var}
 // The empty string is never short. With the switch off no string is short and every emitted byte is
 // what it was before the form existed.
 
-// Set by a test that builds in-process, where setting the environment would reach every other test.
-private var short_strings_forced: bool = false
+// Set by a test that builds in-process, where setting the environment would reach every other test:
+// the form it asked for, on or off, until `unforce_short_strings` hands the choice back.
+private var short_strings_forced: Option[bool] = None
 
 force_short_strings(on: bool)
-    short_strings_forced = on
+    short_strings_forced = Some(on)
+
+unforce_short_strings()
+    short_strings_forced = None
 
 private var short_strings_read: bool = false
-private var short_strings_env: bool = false
+private var short_strings_env: bool = true
 
-// Whether this build makes and reads the short form.
+// Whether this build makes and reads the short form: on, unless a test forced it or
+// `SYSL_SHORT_STRINGS=0` turned it off.
 short_strings_on() -> bool
-    if short_strings_forced then return true
+    short_strings_forced match
+        Some(on) -> return on
+        None -> ()
 
     if !short_strings_read
-        short_strings_env = env_var("SYSL_SHORT_STRINGS").unwrap_or("") == "1"
+        short_strings_env = env_var("SYSL_SHORT_STRINGS").unwrap_or("") != "0"
         short_strings_read = true
     end if
 
