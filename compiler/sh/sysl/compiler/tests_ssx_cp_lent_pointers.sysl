@@ -148,17 +148,16 @@ ssx_cp_paths_are_lent_where_they_are_taken()
         end main
         """, "q\nfalse true\nf hell\nfalse\n", [Var("AB", "q")], true)
 
-// **The language question this item leaves open** (reported, not decided here): user code shaped as
-// the library's was -- a helper answering a pointer into `s.bytes` -- reads a dead frame with the form
-// on. The escape analysis can see it (a pointer, a struct of one, taken from a `.bytes` slot), but no
-// storage it could give the bytes outlives the call: a heap copy is counted by the view that is
-// dropped with the statement, so the pointer would dangle into the heap instead. Whether such a
-// program is refused, leaks a copy, or stays the programmer's `*T` responsibility is the user's call.
-@test("ssx_cp a helper answering a pointer into a short string's bytes", ignore: "TODO: un-ignore when the design settles what an escaping raw pointer into a short string's .bytes gets")
+// User code shaped as the library's was -- a helper answering a pointer into `s.bytes` -- would read a
+// dead frame with the form on, and no storage the compiler could give the bytes outlives the call (a
+// heap copy is counted by the view the statement drops). So it is refused with the form on
+// (`escape.sysl`'s `raw_refusal`; every route out is in `tests_ssx_cr_raw_pointers`), and runs as it
+// always did with the form off.
+@test("ssx_cp a helper answering a pointer into a short string's bytes is refused with the form on")
 ssx_cp_helper_answers_a_pointer()
     if !ssx_cp_ready() then return
 
-    ssx_cp_all("""
+    val text = """
         import sysl.slices.as_ptr
 
         struct Text
@@ -174,5 +173,19 @@ ssx_cp_helper_answers_a_pointer()
                 print(t.p[i])
 
         main()
-            show(lent(made(4)))
-        """, "97\n98\n99\n100\n", [], true)
+            val s = made(4)
+
+            show(lent(s))
+        """
+
+    val off = ssx_cp_run(text, false, DefaultOptimization, [])
+
+    assert(off.ok, s"${off.out} ${off.err}")
+    assert_eq(off.out, "97\n98\n99\n100\n")
+    assert_eq(alloc_count_reported(off.err), 0, off.err)
+
+    val on = ssx_cp_run(text, true, DefaultOptimization, [])
+
+    assert(!on.ok, on.out)
+    assert(on.out.contains("a raw pointer this value carries points into 's.bytes', the bytes of a " +
+                           "string that may be held in the string itself, and it is returned"), on.out)
