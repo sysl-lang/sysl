@@ -1,0 +1,378 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.join
+
+// **A raw pointer into the bytes of a string that may be short is refused where it would outlive
+// them** (`docs/design/short-strings.md § 5.4`, `escape.sysl`'s `raw_bytes_views` and `raw_refusal`).
+// With the short form on, `s.bytes` is a slot of the frame that takes it, and no storage the compiler
+// could give the bytes instead outlives a pointer: a heap copy is counted by the view the statement
+// drops, and a pointer counts nothing. So `as_ptr(s.bytes)`, `&s.bytes[0]`, a cast, `&p[n]` on one,
+// or a struct, an enum or a closure carrying one is refused where it is returned, stored somewhere the
+// frame does not own, handed to a `@keeps` parameter, captured by a closure that is boxed, or kept
+// across the rounds of a loop that takes the bytes again. Lent to a call, or held in a local of the
+// frame, it is the slot and costs nothing. With the form off nothing is tracked and nothing changes.
+//
+// Skipped cells, with the reason: running a 32-bit program (no 32-bit runner here; the refusal is
+// made before any target is consulted, and one cell checks it under a thumb target); `async` (a task
+// that holds a pointer is a call that keeps its argument, the `@keeps` cell's route); a trait object
+// and a function pointer (the same `gets_out` site as `@keeps`, with its own reason in the sentence).
+
+private struct SsxCrRun
+    ok: bool
+    out: string
+    err: string
+
+private ssx_cr_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end ssx_cr_ready
+
+private ssx_cr_run(text: string, short: bool, level: string) -> SsxCrRun
+    val root = make_temp_dir("sysl-ssx-cr").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    force_alloc_counting(true)
+    force_short_strings(short)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, level, Some(s"$root/built"))
+
+    force_short_strings(false)
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return SsxCrRun(false, failure_text(why), "")
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> SsxCrRun(false, "could not be started", "")
+        Ok(o) -> SsxCrRun(o.status.ok(), o.text, o.err.unwrap_or(""))
+end ssx_cr_run
+
+// The program run with the form off and on, and at `-O3` with it on: each prints `want` and gives back
+// every allocation.
+private ssx_cr_all(text: string, want: string)
+    for run_of in [(false, DefaultOptimization), (true, DefaultOptimization), (true, "3")]
+        val run = ssx_cr_run(text, run_of.0, run_of.1)
+        val what = s"short=${run_of.0} -O${run_of.1}"
+
+        assert(run.ok, s"$what: ${run.out} ${run.err}")
+        assert_eq(run.out, want, what)
+        assert_eq(alloc_count_reported(run.err), 0, s"$what: ${run.err}")
+end ssx_cr_all
+
+// The IR of a program, with the form `short` or not, for `target` (or the host), and the exit code.
+private ssx_cr_emit(text: string, short: bool, target: Option[string]) -> (int, string)
+    val root = make_temp_dir("sysl-ssx-cr").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+
+    force_short_strings(short)
+
+    val code = target match
+        Some(t) -> run_cli(["sysl", "emit-llvm", s"$root/main.sysl", "--target", t], (line) -> sink.push(line))
+        None -> run_cli(["sysl", "emit-llvm", s"$root/main.sysl"], (line) -> sink.push(line))
+
+    force_short_strings(false)
+    remove_dir_all(root).unwrap_or(())
+
+    (code, join(lines.view(), "\n"))
+end ssx_cr_emit
+
+// Accepted with the form off, and refused with it on, with a message holding `said` and the advice.
+private ssx_cr_refused(text: string, said: string)
+    val off = ssx_cr_emit(text, false, None)
+
+    assert_eq(off.0, 0, s"the form off: ${off.1}")
+    assert(!off.1.contains("sysl.str.unshort"), "the form off")
+
+    val on = ssx_cr_emit(text, true, None)
+
+    assert(on.0 != 0, s"the form on was accepted: ${on.1}")
+    assert(on.1.contains(said), on.1)
+    assert(on.1.contains("the bytes of a string that may be held in the string itself"), on.1)
+    assert(on.1.contains("Lend the pointer at the call that reads it ('f(as_ptr(s.bytes))'), or copy " +
+                         "the bytes into a 'Buf[u8]' the caller owns"), on.1)
+end ssx_cr_refused
+
+private val ssx_cr_head = """
+    import sysl.slices.as_ptr
+
+    made(n: int) -> string = "abcdefghijklmnopqrstuvwxyz"[0..<n].copy()
+    """
+
+// -- refused ------------------------------------------------------------------------------------------------
+
+@test("ssx_cr a raw pointer into a short string's bytes, returned in a struct, is refused naming it")
+ssx_cr_returned_in_a_struct()
+    if std_root().is_err() then return
+
+    val text = ssx_cr_head + """
+        struct Text
+            p: *u8
+            n: usize
+
+        lent(s: string) -> Text = Text(as_ptr(s.bytes), s.bytes.len)
+
+        main()
+            val s = made(4)
+
+            print(lent(s).p[0])
+        """
+
+    ssx_cr_refused(text,
+        "a raw pointer this value carries points into 's.bytes', the bytes of a string that may be " +
+        "held in the string itself, and it is returned — those bytes are a slot of this frame, and a " +
+        "pointer takes no count of them, so it would outlive them. Lend the pointer at the call that " +
+        "reads it ('f(as_ptr(s.bytes))'), or copy the bytes into a 'Buf[u8]' the caller owns")
+
+@test("ssx_cr a raw pointer into a short string's bytes, returned bare, in an enum or through a cast, is refused")
+ssx_cr_returned_bare_enum_cast()
+    if std_root().is_err() then return
+
+    ssx_cr_refused(ssx_cr_head + """
+        first(s: string) -> *u8 = &s.bytes[0]
+
+        main()
+            print(first(made(4))[0])
+        """, "this raw pointer points into 's.bytes'")
+
+    ssx_cr_refused(ssx_cr_head + """
+        first(s: string) -> Option[*u8] = if s.len == 0 then None else Some(as_ptr(s.bytes))
+
+        main()
+            print(first(made(4)).unwrap()[0])
+        """, "points into 's.bytes'")
+
+    ssx_cr_refused("""
+        import sysl.raw.ptr_cast
+        import sysl.slices.as_ptr
+
+        made(n: int) -> string = "abcdefghijklmnopqrstuvwxyz"[0..<n].copy()
+
+        first(s: string) -> *i8 = ptr_cast(as_ptr(s.bytes))
+
+        main()
+            print(first(made(4))[0])
+        """, "points into 's.bytes'")
+
+    // `&p[n]` on a held pointer, returned.
+    ssx_cr_refused(ssx_cr_head + """
+        second(s: string) -> *u8
+            val p = as_ptr(s.bytes)
+
+            &p[1]
+
+        main()
+            print(second(made(4))[0])
+        """, "points into 's.bytes'")
+
+// `sysl.cstd`'s `strerror` is this shape: the string a function answers may be short, so its bytes
+// are a slot of the frame that takes them.
+@test("ssx_cr a pointer into the bytes of what a call answered, returned, is refused naming the call")
+ssx_cr_returned_from_an_answer()
+    if std_root().is_err() then return
+
+    ssx_cr_refused("""
+        import sysl.slices.as_ptr
+
+        message(code: int) -> string = if code == 0 then "Success" else "Unknown error"
+
+        describe(code: int) -> *u8 = as_ptr(message(code).bytes)
+
+        main()
+            print(describe(0)[0])
+        """, "this raw pointer points into the '.bytes' of what 'message' answered, the bytes of a string")
+
+@test("ssx_cr a raw pointer into a short string's bytes stored in a heap struct's field or a module var is refused")
+ssx_cr_stored()
+    if std_root().is_err() then return
+
+    ssx_cr_refused(ssx_cr_head + """
+        struct Holder
+            p: *u8
+
+        keep(h: &Holder, s: string)
+            h.p = as_ptr(s.bytes)
+
+        main()
+            val h = Holder(null)
+
+            keep(h, made(4))
+            print(h.p != null)
+        """, "this raw pointer points into 's.bytes', the bytes of a string that may be held in the " +
+             "string itself, and it is stored somewhere the frame does not own")
+
+    ssx_cr_refused(ssx_cr_head + """
+        var last: *u8 = null
+
+        note(s: string)
+            last = &s.bytes[0]
+
+        main()
+            note(made(4))
+            print(last != null)
+        """, "and it is stored somewhere the frame does not own")
+
+@test("ssx_cr a raw pointer into a short string's bytes handed to a @keeps parameter is refused, at 64 and 32 bits")
+ssx_cr_kept_by_c()
+    if std_root().is_err() then return
+
+    val text = ssx_cr_head + """
+        @keeps(p)
+        extern hold(p: *u8)
+
+        main()
+            val s = made(4)
+
+            hold(as_ptr(s.bytes))
+        """
+
+    ssx_cr_refused(text, "this raw pointer points into 's.bytes', the bytes of a string that may be " +
+                         "held in the string itself, and it is passed to 'hold', which holds on to it")
+
+    val thumb = ssx_cr_emit(text, true, Some("thumb-freestanding-softfp"))
+
+    assert(thumb.0 != 0 && thumb.1.contains("is passed to 'hold', which holds on to it"), thumb.1)
+
+@test("ssx_cr a raw pointer into a short string's bytes kept across the rounds of a loop that retakes them is refused")
+ssx_cr_kept_across_rounds()
+    if std_root().is_err() then return
+
+    ssx_cr_refused(ssx_cr_head + """
+        main()
+            val all = [made(2), made(3), made(4)]
+            var prev: *u8 = null
+
+            for i in 0..<3
+                val s = all[i]
+                val cur = as_ptr(s.bytes)
+
+                if prev != null then print(prev[0], cur[0])
+
+                prev = cur
+        """, "the pointer 'cur' points into 's.bytes', the bytes of a string that may be held in the " +
+             "string itself, and it is kept in 'prev', which outlives it, across the rounds of a loop " +
+             "that takes the bytes again")
+
+@test("ssx_cr a raw pointer into a short string's bytes captured by a closure that is answered is refused")
+ssx_cr_captured()
+    if std_root().is_err() then return
+
+    ssx_cr_refused(ssx_cr_head + """
+        reader(s: string) -> &Fn(usize) -> u8
+            val p = as_ptr(s.bytes)
+
+            i -> p[i]
+
+        main()
+            val s = made(4)
+            val f = reader(s)
+
+            print(f(0), f(3))
+        """, "a raw pointer this value carries points into 's.bytes', the bytes of a string that may " +
+             "be held in the string itself, and it is put on the heap")
+
+// -- accepted ------------------------------------------------------------------------------------------------
+
+private val ssx_cr_lent = """
+    import sysl.slices.as_ptr
+
+    extern memchr(p: *u8, c: i32, n: usize) -> *u8
+
+    struct Text
+        p: *u8
+        n: usize
+
+    made(n: int) -> string = "abcdefghijklmnopqrstuvwxyz"[0..<n].copy()
+
+    sum(p: *u8, n: usize) -> int
+        var t = 0
+
+        for i in 0..<n
+            t += int(p[i])
+
+        t
+
+    total(t: Text) -> int = sum(t.p, t.n)
+
+    main()
+        for n in [2, 14, 15, 16]
+            val s = made(n)
+            val at = memchr(as_ptr(s.bytes), 98, s.bytes.len)
+
+            print(at[0], memchr(&s.bytes[0], 97, 1)[0], sum(as_ptr(s.bytes), s.bytes.len),
+                  total(Text(as_ptr(s.bytes), s.bytes.len)))
+
+            val p = as_ptr(s.bytes)
+            val q = &p[1]
+            val t = Text(p, s.bytes.len)
+
+            print(p[0], q[0], total(t))
+    """
+
+@test("ssx_cr a raw pointer into a short string's bytes lent at the call or held in the frame is the slot, at every length")
+ssx_cr_lent_and_held()
+    if !ssx_cr_ready() then return
+
+    ssx_cr_all(ssx_cr_lent,
+        "98 97 195 195\n97 98 195\n" +
+        "98 97 1449 1449\n97 98 1449\n" +
+        "98 97 1560 1560\n97 98 1560\n" +
+        "98 97 1672 1672\n97 98 1672\n")
+
+    // Nothing is copied: the pointer reads the slot.
+    assert(!ssx_cr_emit(ssx_cr_lent, true, None).1.contains("sysl.str.unshort"), "on")
+    assert(!ssx_cr_emit(ssx_cr_lent, false, None).1.contains("sysl.str.unshort"), "off")
+
+// `opendir(as_ptr(path.bytes))` answers a `*DIR` that is no part of the path: a call's pointer answer
+// points into an argument only where it can hold a pointer to what the argument points at.
+@test("ssx_cr a pointer a call answers that cannot point at bytes, and a literal's bytes, may be returned")
+ssx_cr_unrelated_answers_and_literals()
+    if !ssx_cr_ready() then return
+
+    ssx_cr_all("""
+        import sysl.slices.as_ptr
+
+        struct Handle
+            id: *i32
+
+        extern malloc(n: usize) -> *i32
+        extern free(p: *i32)
+
+        open_one(name: *u8, n: usize) -> *i32
+            val h = malloc(4)
+
+            h[0] = i32(name[0]) + i32(n)
+            h
+
+        opened(s: string) -> Handle = Handle(open_one(as_ptr(s.bytes), s.bytes.len))
+
+        literal_ptr() -> *u8 = as_ptr("hello".bytes)
+
+        cut_ptr() -> *u8 = as_ptr("hello"[1..<3].bytes)
+
+        main()
+            val h = opened("abcdefghij"[0..<5].copy())
+
+            print(h.id[0], literal_ptr()[1], cut_ptr()[0])
+            free(h.id)
+        """, "102 101 101\n")

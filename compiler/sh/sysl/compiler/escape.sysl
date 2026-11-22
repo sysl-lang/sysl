@@ -223,7 +223,13 @@ struct EView
     // view lives, so the view may not be held past their block.
     holders: Buf[string]
 
-    non_empty(self) -> bool = !self.named.is_empty() || self.anonymous || !self.temps.is_empty()
+    // The `.bytes` slots a **raw pointer** in the value points into (`raw_bytes_views`). Such a slot
+    // cannot be promoted -- a heap copy is counted by the view the statement drops, and a pointer
+    // counts nothing -- so a pointer that would outlive the slot is refused rather than moved.
+    raw: Buf[(Span, string)]
+
+    non_empty(self) -> bool =
+        !self.named.is_empty() || self.anonymous || !self.temps.is_empty() || !self.raw.is_empty()
 end EView
 
 private no_view() -> EView
@@ -231,8 +237,9 @@ private no_view() -> EView
     var temps: Buf[(Span, string)] = buf()
 
     var holders: Buf[string] = buf()
+    var raw: Buf[(Span, string)] = buf()
 
-    EView(named, false, temps, "", "", holders)
+    EView(named, false, temps, "", "", holders, raw)
 end no_view
 
 // A view of storage inside a `&sync` box, which owns nothing of it, reached through the local
@@ -297,6 +304,12 @@ private join_views(a: EView, b: EView) -> EView
 
     for h in b.holders
         push_name(&out.holders, h)
+
+    for r in a.raw
+        if !holds_temp_span(out.raw, r.0) then out.raw.push(r)
+
+    for r in b.raw
+        if !holds_temp_span(out.raw, r.0) then out.raw.push(r)
 
     out
 end join_views
@@ -648,7 +661,7 @@ end set_confined
 private view_eq(a: EView, b: EView) -> bool
     if a.anonymous != b.anonymous || a.sync != b.sync then return false
     if a.named.len() != b.named.len() || a.temps.len() != b.temps.len() then return false
-    if a.holders.len() != b.holders.len() then return false
+    if a.holders.len() != b.holders.len() || a.raw.len() != b.raw.len() then return false
 
     for i in 0..<a.named.len()
         if a.named[i] != b.named[i] then return false
@@ -731,6 +744,13 @@ private kept_in_local(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, name: str
 
         w.sites.push(EscapeSite("", t.1, t.0, how, "its statement"))
         w.temps.push(t)
+
+    // A raw pointer into a `.bytes` slot may be kept by a local for the frame, as the slot is -- but
+    // not across rounds of a loop that writes the slot again.
+    for r in seen.raw
+        if retaken_while_kept(w, r.0, name)
+            raw_refusal(w, v, r, s"$how, across the rounds of a loop that takes the bytes again")
+            break
 
     // **A view of `&sync` storage cannot move**: it counts nothing of the box, so the local holding
     // the box is what keeps it, and that local ends with its block (L1).
@@ -987,6 +1007,8 @@ private gets_out(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, at: TExpr, how
             w.sites.push(EscapeSite("", t.1, t.0, how, "the frame"))
             w.temps.push(t)
 
+    if !v.raw.is_empty() then raw_refusal(w, at, v.raw[0], how)
+
     if v.sync != "" && w.refusal.is_none()
         w.refusal = Some((view_anchor(at),
             s"a view of storage inside a '${v.sync}' $how, but such a view takes no count of the box — " +
@@ -1010,6 +1032,27 @@ private holds_temp_span(temps: Buf[(Span, string)], at: Span) -> bool
 
     false
 end holds_temp_span
+
+// **A raw pointer into the bytes of a string that may be short is refused where it would outlive
+// them** (`docs/design/short-strings.md § 5.4`). Those bytes are a slot of the frame that took the
+// `.bytes`, and no storage the compiler could give them instead outlives a pointer: a heap copy is
+// counted by the view the statement drops, and a pointer counts nothing. So the pointer is lent at
+// the call that reads it, or the bytes go into storage the program owns.
+private raw_refusal(w: &EscapeWalk, at: TExpr, slot: (Span, string), how: string)
+    if w.refusal.is_some() then return
+
+    val subject = *at.kind match
+        TLoad(name, _) -> s"the pointer '${shown_block_local(name)}'"
+        TStructNew(_, _) -> "a raw pointer this value carries"
+        TEnumNew(_, _, _) -> "a raw pointer this value carries"
+        _ -> "this raw pointer"
+
+    w.refusal = Some((view_anchor(at),
+        s"$subject points into ${slot.1}, the bytes of a string that may be held in the string " +
+        s"itself, and it $how — those bytes are a slot of this frame, and a pointer takes no count " +
+        s"of them, so it would outlive them. Lend the pointer at the call that reads it " +
+        s"('f(as_ptr(s.bytes))'), or copy the bytes into a 'Buf[u8]' the caller owns"))
+end raw_refusal
 
 // -- array literals laid in the frame -----------------------------------------------------------------
 
@@ -1138,12 +1181,117 @@ private views(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, e: TExpr) -> EVie
     val t = texpr_type(e)
 
     if carries_view(t) then return views_value(p, keeps, w, e)
-    if !points_at_view(t, 0) then return no_view()
+    if !points_at_view(t, 0) then return raw_bytes_views(p, keeps, w, e)
 
     *e.kind match
         TAddrOf(place, _) -> views(p, keeps, w, place)
         _ -> views_value(p, keeps, w, e)
 end views
+
+// **A raw pointer into a `.bytes` slot is followed to the slot**: `as_ptr(s.bytes)`, `&s.bytes[0]`, a
+// cast of either, pointer arithmetic on one, a struct or an enum carrying one. A `*T` into a local
+// array is the programmer's to keep alive and views nothing here, but a `.bytes` slot is one the
+// compiler made and the reader never wrote, so the pointer is tracked to the slot (`EView.raw`) and
+// refused where it would outlive it (`raw_refusal`). Nothing is tracked with the short form off.
+private raw_bytes_views(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, e: TExpr) -> EView
+    if w.bytes_sites.is_empty() || !holds_raw_pointer(texpr_type(e), 0) then return no_view()
+
+    val all = pointer_source_views(p, keeps, w, e)
+    var out = no_view()
+
+    for t in all.temps
+        if holds_span(w.bytes_sites, t.0) && !holds_temp_span(out.raw, t.0) then out.raw.push(t)
+
+    for t in all.raw
+        if !holds_temp_span(out.raw, t.0) then out.raw.push(t)
+
+    out
+end raw_bytes_views
+
+// What storage a raw pointer value was taken from: through an address, a cast and pointer arithmetic,
+// and otherwise whatever its form's operands view. **A call's answer points into an argument only
+// where it can hold a pointer to what that argument points at** -- `strchr` hands back a pointer into
+// the bytes it was given, while `opendir` answers a `*DIR` that is no part of its path.
+private pointer_source_views(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, e: TExpr) -> EView =
+    *e.kind match
+        TAddrOf(place, _) -> views_value(p, keeps, w, place)
+        TCast(operand, _) -> raw_or_view(p, keeps, w, operand)
+        TBinary(_, left, right, _) -> join_views(raw_or_view(p, keeps, w, left), raw_or_view(p, keeps, w, right))
+        TCall(_, args, ty, _) -> answer_views(p, keeps, w, args, ty)
+        TVCall(_, _, args, ty, _) -> answer_views(p, keeps, w, args, ty)
+        TCallPtr(_, args, _, ty) -> answer_views(p, keeps, w, args, ty)
+        _ -> views_value(p, keeps, w, e)
+
+private raw_or_view(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, e: TExpr) -> EView =
+    if holds_raw_pointer(texpr_type(e), 0) then pointer_source_views(p, keeps, w, e) else views(p, keeps, w, e)
+
+private answer_views(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, args: Buf[TExpr], answer: Type) -> EView
+    var out = no_view()
+    var held: Buf[Type] = buf()
+
+    pointees(answer, 0, &held)
+
+    for arg in args
+        var given: Buf[Type] = buf()
+
+        pointees(texpr_type(arg), 0, &given)
+
+        if shares_pointee(held, given) then out = join_views(out, views(p, keeps, w, arg))
+
+    out
+end answer_views
+
+// What a value of this type may point at: the target of each raw pointer and the element of each
+// view in it, through the fields of a struct or an enum.
+private pointees(t: Type, depth: int, into: *Buf[Type])
+    if depth > 4 then return
+
+    t match
+        Ptr(inner, _) -> into.push(*inner)
+        Slice(elem, _) -> into.push(*elem)
+        Struct(d) ->
+            for item in d.fields
+                pointees(item.1, depth + 1, into)
+        Enum(d) ->
+            for v in d.variants
+                for item in v.fields
+                    pointees(item.1, depth + 1, into)
+        _ -> ()
+end pointees
+
+// Whether two lists of targets share one, a byte of either signedness being a byte.
+private shares_pointee(a: Buf[Type], b: Buf[Type]) -> bool
+    for x in a
+        for y in b
+            if type_eq(x, y) || (is_byte(x) && is_byte(y)) then return true
+
+    false
+end shares_pointee
+
+private is_byte(t: Type) -> bool = t match
+    Integer(bits, _, _) -> bits == 8
+    _ -> false
+
+// Whether a value of this type can carry a raw pointer: one, or a struct or enum with one among its
+// fields. The depth bounds the walk through a type that holds itself.
+private holds_raw_pointer(t: Type, depth: int) -> bool
+    if depth > 4 then return false
+
+    t match
+        Ptr(_, _) -> true
+        Struct(d) ->
+            for item in d.fields
+                if holds_raw_pointer(item.1, depth + 1) then return true
+
+            false
+        Enum(d) ->
+            for v in d.variants
+                for item in v.fields
+                    if holds_raw_pointer(item.1, depth + 1) then return true
+
+            false
+        _ -> false
+end holds_raw_pointer
 
 // Whether a value of this type can reach a view through a raw pointer: a pointer to something that
 // carries one or reaches one, or a struct with such a pointer among its fields. The depth bounds the
@@ -1465,9 +1613,10 @@ private describe_temp(base: TExpr) -> string = *base.kind match
     TCall(name, _, _, _) -> s"the array '$name' answered with"
     _ -> "a temporary array"
 
-// What to call `.bytes` of a string: by the local it reads where it reads one.
+// What to call `.bytes` of a string: by the local it reads, or the function whose answer it reads.
 private bytes_what(r: TExpr) -> string = *r.kind match
     TLoad(name, _) -> s"'${shown_block_local(name)}.bytes'"
+    TCall(name, _, _, _) -> s"the '.bytes' of what '${last_segment(name)}' answered"
     _ -> "'.bytes'"
 
 // -- what a body declares ------------------------------------------------------------------------------

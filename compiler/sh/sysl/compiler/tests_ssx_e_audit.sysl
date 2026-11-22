@@ -1,0 +1,157 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.text.{join, Search}
+
+// **What SS1-5's audit changed** (`docs/design/short-strings.md` § 6, SS1-5): a compiled library
+// records which string form its bodies read, and one built with the other form is refused rather than
+// linked (`syslib.sysl`'s `syslib_metadata` and `syslib_read`).
+//
+// A body built with the short form on reads a string's last word as a tag and a length; one built with
+// it off reads the same word as a length. Linked together, each reads the other's short strings as an
+// address. Every path to an artifact the compiler makes itself is keyed by the form already
+// (`short_strings_key`, `toolchain_parts`), so the refusal is what stands behind a key that misses: a
+// standard module at a path the build was told to use (`set_std_search`), which carries no key.
+//
+// Cells: the metadata with the form off and on, and its mode still read; every pairing of a library's
+// form with a build's (off/off, on/on accepted; on/off, off/on refused, with the diagnostic); a
+// library written before the line existed, read by a build with the form on (refused) and off
+// (accepted); the standard module at a fixed path built with one form, then asked for by a build with
+// the other (replaced, and the replacement says the new form), both ways round.
+//
+// Skipped cells, with the reason: a `--lib` source root's artifact (its cache key carries the form
+// through `toolchain_parts`, so the two forms never meet at one path -- the same `syslib_read` would
+// refuse it); a 32-bit target (the line is the same text whatever the machine).
+
+private val ssx_e_fp = "feedfacecafebeef"
+
+// The metadata a build with the form `short` writes for a library defining `names`.
+private ssx_e_meta(short: bool) -> string
+    var names: Buf[string] = buf()
+
+    names.push("sysl$f")
+    names.push("sysl$g")
+    force_short_strings(short)
+
+    val meta = syslib_metadata(host_target(), ssx_e_fp, names)
+
+    force_short_strings(false)
+    meta
+end ssx_e_meta
+
+// What a build with the form `short` makes of `meta`.
+private ssx_e_read(meta: string, short: bool) -> Result[(Buf[string], string), string]
+    force_short_strings(short)
+
+    val got = syslib_read("x.syslib", meta, host_target())
+
+    force_short_strings(false)
+    got
+end ssx_e_read
+
+@test("ssx_e a library's metadata says the short form only where it was built with it, and its mode still reads")
+ssx_e_metadata_records_the_form()
+    val off = ssx_e_meta(false)
+    val on = ssx_e_meta(true)
+
+    assert(off.index_of("strings short").is_none(), off)
+    assert(on.index_of("\nstrings short\n").is_some(), on)
+    assert_eq(syslib_mode(off), syslib_mode(on))
+    assert(on.ends_with(s"mode ${syslib_mode(off)}\n"), on)
+
+@test("ssx_e a library is read by a build of its own form, with its symbols and fingerprint")
+ssx_e_same_form_is_read()
+    for short in [false, true]
+        ssx_e_read(ssx_e_meta(short), short) match
+            Err(why) -> assert(false, s"short=$short: $why")
+            Ok(answer) ->
+                assert_eq(answer.1, ssx_e_fp, s"short=$short")
+                assert_eq(answer.0.len(), 2, s"short=$short")
+                assert_eq(answer.0[1], "sysl$g", s"short=$short")
+
+@test("ssx_e a library built with the short form is refused by a build without it, and the other way round")
+ssx_e_other_form_is_refused()
+    ssx_e_read(ssx_e_meta(true), false) match
+        Ok(_) -> assert(false, "a short-form library is refused by a long-form build")
+        Err(why) -> assert_eq(why, "x.syslib holds a short string in the string itself and this program " +
+            "holds every string on the heap or in a literal -- every body reads a string's words one " +
+            "way, so a library compiled with the other form cannot be linked into it. Rebuild the " +
+            "library with SYSL_SHORT_STRINGS set as this build has it")
+
+    ssx_e_read(ssx_e_meta(false), true) match
+        Ok(_) -> assert(false, "a long-form library is refused by a short-form build")
+        Err(why) ->
+            assert(why.starts_with("x.syslib holds every string on the heap or in a literal and this " +
+                "program holds a short string in the string itself"), why)
+            assert(why.index_of("cannot be linked into it").is_some(), why)
+
+// Metadata as every library before SS1-5 wrote it: no line for the form, and the mode last.
+@test("ssx_e a library written before the form was recorded holds long strings: read without the form, refused with it")
+ssx_e_a_library_without_the_line_is_long()
+    val t = host_target()
+    val old = s"${t.name}\n${allocator_pair()}\n$ssx_e_fp\n1\nsysl$$f\nmode debug\n"
+
+    assert(ssx_e_read(old, false).is_ok(), "read with the form off")
+    assert(ssx_e_read(old, true).is_err(), "refused with the form on")
+
+// A symbol is never the line: the count says where the symbols end, and only what follows is read for
+// the form.
+@test("ssx_e the form is read after the symbols, never from among them")
+ssx_e_the_line_follows_the_symbols()
+    val t = host_target()
+    val listed = s"${t.name}\n${allocator_pair()}\n$ssx_e_fp\n2\nstrings short\nsysl$$f\nmode debug\n"
+
+    ssx_e_read(listed, false) match
+        Err(why) -> assert(false, why)
+        Ok(answer) -> assert_eq(answer.0[0], "strings short")
+
+    assert(ssx_e_read(listed, true).is_err(), "no form line after the symbols")
+
+// -- the standard module at a path the build was told to use ------------------------------------------
+
+private ssx_e_emit(program: string, short: bool) -> (int, string)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+
+    force_short_strings(short)
+
+    val code = run_cli(["sysl", "emit-llvm", program], (line) -> sink.push(line))
+
+    force_short_strings(false)
+    (code, join(lines.view(), "\n"))
+end ssx_e_emit
+
+// The standard module's artifact is kept at a path the build names (`set_std_search`), which no form
+// keys: the first build writes it, and each build of the other form finds it, refuses it and builds
+// its own over it -- where before it would have been linked.
+@test("ssx_e a standard module at a fixed path built with one form is replaced by a build with the other")
+ssx_e_std_at_a_fixed_path_follows_the_form()
+    if std_root().is_err() || !clang_available() then return
+
+    val root = make_temp_dir("sysl-ssx-e").unwrap()
+    val program = s"$root/main.sysl"
+    val at = s"$root/std$SyslibExtension"
+
+    write_text(program, "print(\"abc\" + \"def\")\n").unwrap()
+    set_std_search(Some(at))
+
+    var forms: Buf[bool] = buf()
+
+    for short in [false, true, false]
+        val got = ssx_e_emit(program, short)
+
+        assert_eq(got.0, 0, s"short=$short: ${got.1}")
+
+        syslib_metadata_at(at) match
+            Err(why) -> assert(false, why)
+            Ok(meta) ->
+                forms.push(meta.index_of("\nstrings short\n").is_some())
+                assert(ssx_e_read(meta, short).is_ok(), s"short=$short: the artifact is this form's")
+
+    set_std_search(None)
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(forms.len(), 3)
+    assert(!forms[0] && forms[1] && !forms[2], "off, on, off")
+end ssx_e_std_at_a_fixed_path_follows_the_form

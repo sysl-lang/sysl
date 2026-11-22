@@ -189,8 +189,19 @@ enum Stdio
     FromFile(file: File)
     FromPath(path: string)
 
-/** The text `s` lent, as the hooks take it. */
-private lent(s: string) -> Text = Text(as_ptr(s.bytes), s.bytes.len)
+/** The texts the hooks take, one lent from each of `held`. A pointer counts nothing, so it is the views
+ * in `held` that keep the bytes alive, and `held` must outlive the call the texts are lent to. A text
+ * is never made of a string's `.bytes` in a helper that answers it: the bytes of a short string are a
+ * slot of the frame that takes them (`docs/design/short-strings.md § 5.4`), gone when it returns,
+ * while a view pushed into `held` is a copy that lives as long as `held` does.
+ */
+private[process] lent(held: Buf[[]const u8]) -> Buf[Text]
+    var out: Buf[Text] = buf()
+
+    for b in held do out.push(Text(as_ptr(b), b.len))
+
+    out
+end lent
 
 /** A hook's negative answer as the case it stands for: the code negated, or `UNSUPPORTED` for a call
  * this target cannot make at all.
@@ -207,21 +218,20 @@ private failure(answer: i64) -> IoError = from_status(int(answer))
 private begun(program: string, args: []const string, env: []const Var, inherit_env: bool,
               dir: string, in_fd: int, out_fd: int, err_fd: int, pgid: i64,
               foreground: bool) -> Result[(i32, i64), IoError]
-    var argv: Buf[Text] = buf()
+    // The bytes of every argument and every `NAME=VALUE` are held here until the call is over, so no
+    // text lent below outlives what it points into.
+    var args_held: Buf[[]const u8] = buf()
 
-    argv.push(lent(program))
+    args_held.push(program.bytes)
 
-    for a in args do argv.push(lent(a))
+    for a in args do args_held.push(a.bytes)
 
-    // Each `NAME=VALUE` is made here and held in `lines` until the call is over, so no text lent
-    // below outlives what it points into.
-    var lines: Buf[string] = buf()
+    var env_held: Buf[[]const u8] = buf()
 
-    for v in env do lines.push(s"${v.name}=${v.value}")
+    for v in env do env_held.push(s"${v.name}=${v.value}".bytes)
 
-    var envp: Buf[Text] = buf()
-
-    for i in 0..<lines.len() do envp.push(lent(lines[i]))
+    val argv = lent(args_held)
+    val envp = lent(env_held)
 
     var at: i64 = 0
     val pid = psys.spawn(as_ptr(program.bytes), program.bytes.len, as_ptr(argv.view()), argv.len(),

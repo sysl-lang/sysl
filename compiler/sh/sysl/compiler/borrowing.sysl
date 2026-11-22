@@ -2033,20 +2033,34 @@ end tables_by_trait
 // opaque, for `why`.
 table_writes(u: *Untouched, recv: TExpr, slot: int, why: string) -> EdgeWrites
     var out = edge_writes_none()
-    val all = u.edge_tables
-    val tr = erased_trait(underlying(texpr_type(recv)))
 
-    if all.is_none() || tr.is_none() || slot < 0
-        out.hide(why, "")
-        return out
-    end if
-
-    for vt in trait_tables(all.unwrap(), tr.unwrap())
-        if usize(slot) < vt.slots.len() then out.join(edge_writes(u, vt.slots[usize(slot)].target))
-        else out.hide(why, "")
+    table_targets(u, recv, slot) match
+        Some(targets) ->
+            for t in targets
+                out.join(edge_writes(u, t))
+        None -> out.hide(why, "")
 
     out
 end table_writes
+
+// The functions a call through slot `slot` of the table `recv` carries can reach, one per table
+// `trait_tables` finds -- or `None` where the program's tables are not in sight (a library or archive
+// build), the receiver's trait cannot be named, or some table has no such slot.
+table_targets(u: *Untouched, recv: TExpr, slot: int) -> Option[Buf[string]]
+    val all = u.edge_tables
+    val tr = erased_trait(underlying(texpr_type(recv)))
+
+    if all.is_none() || tr.is_none() || slot < 0 then return None
+
+    var out: Buf[string] = buf()
+
+    for vt in trait_tables(all.unwrap(), tr.unwrap())
+        if usize(slot) >= vt.slots.len() then return None
+
+        out.push(vt.slots[usize(slot)].target)
+
+    Some(out)
+end table_targets
 
 // -- the callee: which large parameters it reads where the caller put them ---------------------------
 
