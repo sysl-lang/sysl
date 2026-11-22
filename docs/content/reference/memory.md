@@ -1439,10 +1439,12 @@ it ran before, on every way out of the scope — the end of a block, a `return`,
 `continue` out of the loop turn that built it. `c` and `r` of the first example, a box held by two locals, a
 temporary handed to a call, a box a closure captures, a box lent to a callee that takes shares of its
 own, a box handed to a call through a trait object or a callable whose every body leaves it alone (`p`
-above): each is counted by the compiler. A local that may hold one of two boxes, or the answer of a call that may be the box
-itself, leaves that box counted at run time, as above; the program cannot tell the two apart. So
-does a trait object or a callable that is itself a frame box and the receiver of the call (`r` above),
-and a closure capturing a box handed through a table.
+above), and a trait object or a callable that is itself a frame box, held in a local and called or
+handed to a call that leaves it alone (`r` above): each is counted by the compiler. A local that may
+hold one of two boxes — one assigned again — or the answer of a call that may be the box itself,
+leaves that box counted at run time, as above; the program cannot tell the two apart. So does a trait
+object held inside another value (an `Option[&Reader]`), and a closure capturing a box handed through
+a table.
 
 #### Promotion is silent, not hidden
 

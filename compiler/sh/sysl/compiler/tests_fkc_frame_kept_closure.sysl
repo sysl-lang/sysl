@@ -14,7 +14,8 @@ import sysl.text.cstring
 // answered garbage ("got 4, want 2", " Lovelace" for "Ada Lovelace").
 //
 // The axes: what the callee answers (a generic factory's frame box, a concrete factory's, a struct by
-// value), what the closure answers (a short string, a long one, an int, an interpolation of two
+// value), how the closure reaches it (a literal argument, a local it was first called through), what
+// the closure answers (a short string, a long one, an int, an interpolation of two
 // captures), the syslUI shape (an epoch, a write through `*self`, a recomputation on read), and the
 // builds (-O0, -O2, the counted heap, AddressSanitizer). A capture with a destructor prints when its
 // last share goes, so an early teardown shows in the output and not only as a crash. The one shape the
@@ -229,6 +230,37 @@ private const fkc_concrete: string = raw"""
         print("end")
     """
 
+// The closure held in a local and called through it (a receiver `frame_counts` follows through the
+// local's two words), then handed to a factory that keeps it.
+private const fkc_local_receiver: string = raw"""
+    struct Res
+        name: string
+
+    impl Drop for Res
+        drop(self) = print("closed", self.name)
+
+    struct Named
+        compute: &Fn() -> string
+        cached: string
+
+        read(*self) -> string
+            self.cached = (self.compute)()
+            self.cached
+
+    named(f: &Fn() -> string) -> &Named = Named(f, f())
+
+    main()
+        val r: &Res = Res("Augusta Ada King, Countess of Lovelace")
+        val f: &Fn() -> string = () -> r.name
+
+        print(f())
+
+        val n = named(f)
+
+        print(n.read())
+        print("end")
+    """
+
 // A struct answered by value holds the closure: it is the answer that keeps the share.
 private const fkc_by_value: string = raw"""
     struct Res
@@ -327,6 +359,8 @@ private fkc_cells() -> Buf[(string, string)]
     out.push((fkc_generic_long, "Augusta Ada King, Countess of Lovelace\n"))
     out.push((fkc_generic_int, "42\n"))
     out.push((fkc_concrete, "built\nAda\nend\nclosed Ada\n"))
+    out.push((fkc_local_receiver, "Augusta Ada King, Countess of Lovelace\nAugusta Ada King, Countess of Lovelace\nend\n" +
+              "closed Augusta Ada King, Countess of Lovelace\n"))
     out.push((fkc_by_value, "built\nAda\nend\nclosed Ada\n"))
     out.push((fkc_signals, "Ada Lovelace\nAugusta Lovelace\n4\n"))
     out.push((fkc_lent, "11\nend\nclosed 10\n"))
@@ -364,7 +398,7 @@ end fkc_kept_closure_under_asan
 fkc_which_closures_are_counted()
     if xvr_no_library() then return
 
-    for text in [fkc_generic_short, fkc_concrete, fkc_by_value]
+    for text in [fkc_generic_short, fkc_concrete, fkc_local_receiver, fkc_by_value]
         val body = fkc_main(text)
 
         assert_eq(fkc_count(body, "@arc.framedown.$closure"), 0)
