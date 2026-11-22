@@ -12,7 +12,9 @@ import sysl.text.{Search, join}
 // promoted to `sysl.str.unshort`'s heap copy because the view is the member's answer, it is now the
 // caller's own storage, short or long, with no slot and no copy. The mark's rules carry the soundness:
 // the view lives no longer than the name it was asked through, and that name is not written while the
-// view is held. `Search.view` is such a member, so every search of a short string stops allocating.
+// view is held. `Search.view_in_place` is such a member, and every member `Search` answers for itself
+// reads through it, so a search of a short string stops allocating; `Search.view` keeps taking its
+// receiver by value, so it is still asked of a `val`, a temporary or a `[]u8` as before.
 //
 // Every program runs with the form off and on, and at `-O3` with it on, on the counted heap: each
 // prints the same thing and gives back every allocation.
@@ -218,6 +220,20 @@ ssx_fv_generic_receiver()
             print(first_of(s), first_of(b))
         """, "0 0\n")
 
+@test("ssx_fv 'view' is still asked of a val, a temporary and a []u8, with no change at the call")
+ssx_fv_view_is_still_by_value()
+    if !ssx_fv_ready() then return
+
+    ssx_fv_all("""
+        import sysl.text.Search
+
+        main()
+            val s = 12.to_string()
+            var a: [3]u8 = [1, 2, 3]
+
+            print(s.view().len, "ab".copy().view().len, a[0..<2].view().len)
+        """, "2 2 2\n")
+
 // -- what the mark still refuses ------------------------------------------------------------------------
 
 @test("ssx_fv the view may not leave the function holding its receiver")
@@ -229,7 +245,7 @@ ssx_fv_view_may_not_leave()
 
         leaks(s: string) -> []const u8
             var t = s
-            t.view()
+            t.view_in_place()
 
         print(leaks("abc").len)
         """, None)
@@ -248,7 +264,7 @@ ssx_fv_view_may_not_be_stored()
 
         keep(n: int)
             var s = n.to_string()
-            kept = s.view()
+            kept = s.view_in_place()
 
         main()
             keep(12)
@@ -267,7 +283,7 @@ ssx_fv_receiver_not_written_while_held()
 
         main()
             var s = 12.to_string()
-            val v = s.view()
+            val v = s.view_in_place()
 
             s = "other"
             print(v[0])
@@ -287,12 +303,12 @@ ssx_fv_view_closed_before_the_write()
             var s = 12.to_string()
 
             if true
-                val v = s.view()
+                val v = s.view_in_place()
 
                 print(v[0])
 
             s = "other"
-            print(s.view().len)
+            print(s.view_in_place().len)
         """, "49\n5\n")
 
 // -- the IR -----------------------------------------------------------------------------------------------
