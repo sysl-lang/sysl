@@ -2,25 +2,25 @@ module sh.sysl.compiler
 @tests
 
 import sysl.buf.{Buf, buf}
-import sysl.container.{Set, set}
 import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
 import sysl.process.{capture, Var}
 import sysl.text.{cstring, Search}
 
-// A type that holds no bytes -- a struct with no fields, or only such fields -- was loaded and stored
-// like any other: a method's receiver out of its box, a field into its slot. LLVM gives the access no
-// size, but AddressSanitizer at -O0 checks the bytes around its address, and the payload of a box
-// whose payload is empty sits exactly at the end of the allocation: the check fell in the red zone and
-// the sanitizer faulted while describing an access of no size ("this program faulted on an address it
-// does not own"). `empty_access.sysl` now takes every such access out before a body is printed.
+// A type that holds no bytes -- a struct with no fields, or only such fields -- was not `zero_sized`
+// (only `unit` and `never` were), so it was loaded and stored like any other: a method's receiver out
+// of its box, a field into its slot. LLVM gives the access no size, but AddressSanitizer at -O0 checks
+// the bytes around its address, and the payload of a box whose payload is empty sits exactly at the
+// end of the allocation: the check fell in the red zone and the sanitizer faulted while describing an
+// access of no size ("this program faulted on an address it does not own"). `zero_sized` now answers
+// true for it, so every emitter that stores, passes and reads nothing for `unit` does the same for it,
+// and its value is the constant of its LLVM type (`zero_of`).
 //
 // Every program is built and run under AddressSanitizer at -O0 (where it faulted) and -O2, and on the
 // counted heap at -O0 (the right output, nothing left over, nothing given back twice).
 //
-// Skipped cells, and why: an empty enum variant's payload is never loaded as a whole (a pattern reads
-// fields, and it has none), and a `[0 x T]` field is reached only through an index the bounds check
-// refuses; both are covered by `holds_nothing`'s cases in the unit tests below. Separate compilation
-// prints a library body through the same `codegen_into`, so it is not crossed again here.
+// Skipped cells, and why: an empty enum variant (it has no payload struct to take room); a `[0]T`
+// read by index (the bounds check refuses every index first), covered by the `zero_sized` answer
+// below; separate compilation (a library body is lowered by the same emitters).
 
 // -- the harness ----------------------------------------------------------------------------------
 
@@ -305,6 +305,43 @@ private const zsa_generic: string = raw"""
         print(a.visit() + b.visit())
     """
 
+private const zsa_values: string = raw"""
+    struct Mark
+    end Mark
+
+    impl Mark
+        tell(self) -> int = 7
+
+    var kept = Mark()
+
+    made() -> Mark = Mark()
+
+    pick(c: bool) -> Mark = if c then Mark() else made()
+
+    which(n: int) -> Mark = n match
+        0 -> Mark()
+        _ -> made()
+
+    found(o: Option[Mark]) -> int = o match
+        Some(m) -> m.tell()
+        None -> 0
+
+    main()
+        print(made().tell())
+        print(pick(true).tell())
+        print(which(1).tell())
+
+        var i = 0
+
+        val broke = loop
+            i += 1
+            if i == 3 then break made()
+
+        print(broke.tell())
+        print(found(Some(kept)))
+        print(found(None))
+    """
+
 // -- the regression -------------------------------------------------------------------------------
 
 @test("a trait object over an empty struct runs under ASan at -O0 and -O2, and on the counted heap")
@@ -328,7 +365,7 @@ zsa_ir_has_no_empty_access()
     assert(ir.contains("%struct.Twice = type"), ir)
     assert(!ir.contains("load %struct.Twice"), ir)
     assert(!ir.contains("store %struct.Twice"), ir)
-    assert(ir.contains("select i1 true, %struct.Twice zeroinitializer, %struct.Twice zeroinitializer"), ir)
+    assert(!ir.contains("%struct.Twice %self"), ir)
 
 // -- the neighbours -------------------------------------------------------------------------------
 
@@ -360,48 +397,46 @@ zsa_nested_empty_struct()
 zsa_generic_empty_struct()
     zsa_everywhere(zsa_generic, "18\n")
 
-// -- the rewrite, in process ----------------------------------------------------------------------
+@test("an empty struct answered by a function, yielded by an if, a match and a break, and matched in an Option")
+zsa_empty_as_a_value()
+    zsa_everywhere(zsa_values, "7\n7\n7\n7\n7\n0\n")
 
-private zsa_types(xs: []LType) -> Buf[LType]
-    var out: Buf[LType] = buf()
+// -- the answer, in process -----------------------------------------------------------------------
 
-    for x in xs
-        out.push(x)
+private zsa_struct(name: string, fields: Buf[(string, Type)], opaque: bool = false) -> &StructType =
+    StructType(name, buf(), fields, false, None, None, opaque, None, buf(), false, buf(), buf(), false)
+
+private zsa_fields(a: Type, b: Option[Type]) -> Buf[(string, Type)]
+    var out: Buf[(string, Type)] = buf()
+
+    out.push(("a", a))
+
+    b match
+        Some(t) -> out.push(("b", t))
+        None -> ()
 
     out
-end zsa_types
+end zsa_fields
 
-@test("empty_type_names finds a type whose fields are all empty, in any order of definition")
-zsa_empty_type_names_fixpoint()
-    var defs: Buf[IrTypeDef] = buf()
+@test("zero_sized: a struct with no fields, or only fields that take no room, and an empty array")
+zsa_zero_sized_takes_no_room()
+    val inner = Struct(zsa_struct("Inner", buf()))
 
-    defs.push(ir_type_def("%struct.Outer", zsa_types([LNamed("%struct.Middle"), LArr(0, LInt(64))])))
-    defs.push(ir_type_def("%struct.Middle", zsa_types([LNamed("%struct.Inner"), LStruct(buf())])))
-    defs.push(ir_type_def("%struct.Inner", buf()))
-    defs.push(ir_type_def("%struct.Full", zsa_types([LNamed("%struct.Inner"), LInt(8)])))
-    defs.push(ir_type_def("%struct.Arr", zsa_types([LArr(4, LNamed("%struct.Inner"))])))
+    assert(zero_sized(inner))
+    assert(zero_sized(Struct(zsa_struct("Outer", zsa_fields(inner, Some(inner))))))
+    assert(zero_sized(Struct(zsa_struct("Held", zsa_fields(Unit, Some(inner))))))
+    assert(zero_sized(Array(0, Integer(64, true, false), buf())))
+    assert(zero_sized(Array(3, inner, buf())))
+    assert(zero_sized(Struct(zsa_struct("Rows", zsa_fields(Array(0, Bool, buf()), None)))))
 
-    val empty = empty_type_names(defs)
+@test("zero_sized: a stored field, an opaque struct, a task, a pointer to an empty struct take room")
+zsa_zero_sized_takes_room()
+    val inner = Struct(zsa_struct("Inner", buf()))
 
-    assert(empty.has("%struct.Outer"))
-    assert(empty.has("%struct.Middle"))
-    assert(empty.has("%struct.Inner"))
-    assert(empty.has("%struct.Arr"))
-    assert(!empty.has("%struct.Full"))
-
-@test("holds_nothing: a scalar, a pointer, an unknown name and a non-empty array hold something")
-zsa_holds_nothing_cases()
-    var empty: Set[string] = set()
-
-    empty.add("%struct.E")
-
-    assert(holds_nothing(LStruct(buf()), empty))
-    assert(holds_nothing(LPackedStruct(buf()), empty))
-    assert(holds_nothing(LNamed("%struct.E"), empty))
-    assert(holds_nothing(LArr(3, LNamed("%struct.E")), empty))
-    assert(holds_nothing(LArr(0, LPtr), empty))
-    assert(!holds_nothing(LInt(1), empty))
-    assert(!holds_nothing(LPtr, empty))
-    assert(!holds_nothing(LNamed("%struct.Other"), empty))
-    assert(!holds_nothing(LArr(1, LInt(8)), empty))
-    assert(!holds_nothing(LStruct(zsa_types([LNamed("%struct.E"), LInt(8)])), empty))
+    assert(!zero_sized(Struct(zsa_struct("Pair", zsa_fields(inner, Some(Bool))))))
+    assert(!zero_sized(Struct(zsa_struct("FILE", buf(), true))))
+    assert(!zero_sized(Struct(zsa_struct(TaskBase, buf()))))
+    assert(!zero_sized(Ref(inner, false)))
+    assert(!zero_sized(Ptr(inner, false)))
+    assert(!zero_sized(Array(1, Bool, buf())))
+    assert(!no_value(inner))

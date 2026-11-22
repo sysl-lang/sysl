@@ -1242,6 +1242,7 @@ private let_go_of_payload(e: *Emit, payload: Type, pa: Val, drain: bool)
         e.draining = drain
 
         if e.layout.indirect(payload) then walk_slot(e, payload, pa, false)
+        else if zero_sized(payload) then release_value(e, payload, zero_of(e, payload))
         else
             val whole = fresh_reg(e)
 
@@ -1252,10 +1253,13 @@ private let_go_of_payload(e: *Emit, payload: Type, pa: Val, drain: bool)
         return
     end if
 
+    // A payload that takes no room is never read: its value is its type's one value, and a
+    // destructor taking it by value has no parameter for it (`emit_sig.sysl`).
+    val empty = zero_sized(payload)
     val by_address = destructor_by_address(e, payload)
-    val v = fresh_reg(e)
+    val v = if empty then zero_of(e, payload) else fresh_reg(e)
 
-    if !by_address then emit(e, InLoad(v, lty(e, payload), pa, AccPlain, None))
+    if !by_address && !empty then emit(e, InLoad(v, lty(e, payload), pa, AccPlain, None))
 
     // **Before the walk, not after.** The destructor is handed the value as it stands, so it may
     // read a field to close what that field names; releasing first would hand it a value whose
@@ -1277,12 +1281,12 @@ private let_go_of_payload(e: *Emit, payload: Type, pa: Val, drain: bool)
             var args: Buf[IrArg] = buf()
 
             if e.layout.indirect(payload) || by_address then args.push(ir_arg(LPtr, pa))
-            else args.push(ir_arg(lty(e, payload), v))
+            else if !empty then args.push(ir_arg(lty(e, payload), v))
 
             emit(e, ir_call(None, LVoid, VGlobal(d), args))
         None -> ()
 
-    if by_address then emit(e, InLoad(v, lty(e, payload), pa, AccPlain, None))
+    if by_address && !empty then emit(e, InLoad(v, lty(e, payload), pa, AccPlain, None))
 
     release_value(e, payload, v)
 end let_go_of_payload

@@ -94,7 +94,7 @@ private gen_expr_kind(e: *Emit, x: TExpr) -> Val = *x.kind match
 
     // Nothing is stored for a zero-sized binding, so there is nothing to read back.
     TLoad(name, ty) ->
-        if zero_sized(ty) then return VNothing
+        if zero_sized(ty) then return zero_of(e, ty)
 
         val r = fresh_reg(e)
 
@@ -115,6 +115,9 @@ private gen_expr_kind(e: *Emit, x: TExpr) -> Val = *x.kind match
 
     TGlobal(symbol, ty, _) ->
         val at = global_address(e, symbol)
+
+        if zero_sized(ty) then return zero_of(e, ty)
+
         val r = fresh_reg(e)
 
         emit(e, InLoad(r, lty(e, ty), at, access_of(ty), None))
@@ -124,7 +127,7 @@ private gen_expr_kind(e: *Emit, x: TExpr) -> Val = *x.kind match
     // whatever its operand does, and the value is the one value its type has.
     TDeref(operand, ty) ->
         val p = payload_addr(e, operand)
-        if zero_sized(ty) then return VNothing
+        if zero_sized(ty) then return zero_of(e, ty)
 
         val r = fresh_reg(e)
 
@@ -165,7 +168,7 @@ private gen_expr_kind(e: *Emit, x: TExpr) -> Val = *x.kind match
         val p = element_addr(e, receiver, index, x.span)
 
         // The index is still checked; the element is the one value its type has.
-        if zero_sized(ty) then return VNothing
+        if zero_sized(ty) then return zero_of(e, ty)
 
         val r = fresh_reg(e)
 
@@ -230,7 +233,7 @@ private gen_expr_kind(e: *Emit, x: TExpr) -> Val = *x.kind match
     TBlockExpr(b) ->
         if zero_sized(b.ty)
             gen_block_void(e, b)
-            VNothing
+            zero_of(e, b.ty)
         else own_temp(e, gen_block_value(e, b), b.ty)
 
     TIf(cond, then_block, else_block, ty) -> gen_if(e, cond, then_block, else_block, ty)
@@ -547,7 +550,7 @@ end bitfield_field_bits
 private gen_field(e: *Emit, x: TExpr, receiver: TExpr, index: int, ty: Type) -> Val
     if zero_sized(ty)
         gen_expr(e, receiver)
-        return VNothing
+        return zero_of(e, ty)
 
     val rty = texpr_type(receiver)
 
@@ -1131,7 +1134,7 @@ end through_comparison
 
 // The value a reference `p` of type `ty` reaches.
 private referent_value(e: *Emit, ty: Type, inner: Type, p: Val) -> Val
-    if zero_sized(inner) then return VNothing
+    if zero_sized(inner) then return zero_of(e, inner)
 
     val at = box_payload_addr(e, p, ty)
     val r = fresh_reg(e)
@@ -1196,7 +1199,7 @@ private gen_store(e: *Emit, place: TExpr, value: TExpr, ty: Type) -> Val
     if zero_sized(ty)
         gen_expr(e, value)
         address(e, place)
-        return VNothing
+        return zero_of(e, ty)
 
     val v = gen_expr(e, value)
     val p = place_addr(e, place)
@@ -2156,9 +2159,11 @@ checked_char(e: *Emit, from_bits: int, from_signed: bool, v: Val) -> Val
     r
 end checked_char
 
-// The zero value of a type: what a declaration with no initializer starts at.
+// The zero value of a type: what a declaration with no initializer starts at. A type that takes no
+// room has one value and nothing to hold it: `unit`'s is no operand at all, and an empty struct's (or
+// an empty array's) is the constant of its LLVM type, which is a value without a load.
 zero_of(e: *Emit, ty: Type) -> Val
-    if zero_sized(ty) then return VNothing
+    if zero_sized(ty) then return if no_value(ty) then VNothing else VZero
 
     ty match
         Constrained(_) -> return zero_of(e, underlying(ty))

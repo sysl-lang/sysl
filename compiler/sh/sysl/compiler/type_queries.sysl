@@ -13,10 +13,30 @@ import sysl.math.bigint.{BigInt, from_int, pow, sub, negate, cmp, rem, add, zero
 // no room to hold it, and `never`, which does not come back at all.
 no_value(t: Type) -> bool = t == Unit || t == Never
 
-// Whether a value of this type takes no room, so that a field of it is not stored. `never` takes none
-// either: it reaches a field only through a type argument (`Box[never]`), and no value of it is ever
-// there to store.
-zero_sized(t: Type) -> bool = t == Unit || t == Never
+// Whether a value of this type takes no room, so that a field of it is not stored, a parameter of it
+// is not passed, and nothing loads or stores one. `never` takes none either: it reaches a field only
+// through a type argument (`Box[never]`), and no value of it is ever there to store.
+//
+// **A struct every field of which takes no room takes none itself** -- one with no fields at all, or
+// only such fields -- and so does an array of no elements or of elements that take none. Each is
+// stored, passed and read as `unit` is: never, its value being the constant of its LLVM type
+// (`zero_of`). Loaded and stored as a value of its own type instead, an empty struct was read at its
+// box's payload, which is exactly the end of the allocation, and AddressSanitizer faulted on the
+// access of no size. An `opaque` struct is someone else's storage of a size this program is not
+// told, and a task is the address of its promise.
+zero_sized(t: Type) -> bool = t match
+    Unit -> true
+    Never -> true
+    Struct(d) -> !d.opaque && d.base != TaskBase && all_zero_sized(d.fields)
+    Array(n, elem, _) -> n == 0 || zero_sized(*elem)
+    _ -> false
+
+private all_zero_sized(fields: Buf[(string, Type)]) -> bool
+    for f in fields
+        if !zero_sized(f.1) then return false
+
+    true
+end all_zero_sized
 
 // Whether no value of this type can exist: `never`, and anything that would have to hold one by
 // value -- a struct or a tuple with such a field, an array of at least one such element, an enum
