@@ -342,8 +342,7 @@ private ans(t: &BTrack, e: TExpr) -> BAns
         TConstView(arg) -> made_of(ans(t, arg), e, ty)
         TViewAs(arg, _) -> made_of(ans(t, arg), e, ty)
         TCall(name, args, _, _) -> call_ans(t, name, args, e, ty)
-        TVCall(r, _, _, _, _) -> if calls_a_closure(texpr_type(r)) then b_not("a call through a function value", e.span)
-        else b_not("a call through a trait object", e.span)
+        TVCall(r, slot, args, _, _) -> table_ans(t, r, slot, args, e, ty)
         TCallPtr(_, _, _, _) -> b_not("a call through a function value", e.span)
         TStructNew(_, args) -> built(t, args, e)
         TEnumNew(_, _, args) -> built(t, args, e)
@@ -517,6 +516,40 @@ private call_ans(t: &BTrack, name: string, args: Buf[TExpr], e: TExpr, ty: Type)
         b_not(s"what '$shown' answers, which is not borrowed", e.span)
     else b_not(s"what '$shown' answers, which is not borrowed: $reason", e.span)
 end call_ans
+
+// **A call through a closure or a trait object's table, in a program that sees every table**
+// (`Analysis.closed`): a call to what slot `slot` holds in each table of the trait at the receiver's
+// arguments (`borrowing.sysl`'s `trait_tables`, every table of the trait name where none is at them),
+// each answered as a direct call is, with the receiver handed over first -- and borrowed only where
+// every one of them is. A library build, which may be handed an object whose table it never saw, a
+// receiver whose trait cannot be named, a slot a table lacks and a trait with no table at all have no
+// body in sight, and answer "not borrowed".
+private table_ans(t: &BTrack, recv: TExpr, slot: int, args: Buf[TExpr], e: TExpr, ty: Type) -> BAns
+    val why = if calls_a_closure(texpr_type(recv)) then "a call through a function value"
+    else "a call through a trait object"
+
+    val tr = erased_trait(underlying(texpr_type(recv)))
+
+    if !t.cx.an.closed || tr.is_none() || slot < 0 then return b_not(why, e.span)
+
+    val tables = trait_tables(t.cx.tables, tr.unwrap())
+
+    if tables.is_empty() then return b_not(why, e.span)
+
+    val handed = with_receiver(recv, args)
+    var out = b_never()
+
+    for vt in tables
+        if usize(slot) >= vt.slots.len() then return b_not(why, e.span)
+
+        val one = call_ans(t, vt.slots[usize(slot)].target, handed, e, ty)
+
+        if one.kind == BNot then return one
+
+        out = join(out, one)
+
+    out
+end table_ans
 
 // Whether the function called `name` was declared in the module of the body being asked about.
 private in_module(t: &BTrack, name: string) -> bool = t.cx.find(name) match
