@@ -1,0 +1,479 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Var}
+import sysl.text.{cstring, Search}
+
+// A frame box handed to a call through a trait object's table or a closure is counted by the compiler
+// (`frame_counts.sysl`) where the escape walk named every body that slot may hold and found none keeps
+// it (`StackBoxes.table_args`, noted per call in `Emit.table_calls`): the call lends the box as a
+// direct call does, so the body that laid it takes and gives back no share of it.
+//
+// The cells: a trait object's method handed the box, the same box handed twice in one call, a box laid
+// in a loop's body and handed each turn, a closure handed the box, a payload with a destructor (its
+// last release is `arc.framedown.<T>`, the destructor running once, where it ran), a table answering
+// the box (left counted: the answer may be the box) and one answering a box of its own (counted by the
+// compiler: its answer is not followed). Left counted because the box is on the heap: one of two
+// tables keeping it, a C function pointer, and the same program built as a library. Each runs on the
+// counted heap at -O1, again at -O0 and -O2, and under AddressSanitizer.
+//
+// Skipped cells, and why: a trait object or closure that is ITSELF a frame box and the receiver of the
+// call stays counted -- its fat pointer is stored in a local, which `frame_counts.sysl` does not follow
+// (an aggregate stored into a slot) for a direct call either; a rendering through a table (`TRender`)
+// is no table call this walk names; an aggregate holding the box (a closure capturing it) handed to a
+// table call stays counted, since whether the slot's body owns what it is handed is not in sight;
+// codegen units change nothing, the pass running on each body as it is finished.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private struct FtcRun
+    out: string
+    err: string
+    instrumented: bool
+end FtcRun
+
+// The program built at `level` on the counted heap, or with `flags` handed to clang, and run.
+private ftc_run(text: string, level: string, flags: string) -> FtcRun
+    val root = make_temp_dir("sysl-ftc").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    val exe = s"$root/built"
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+        val v = cstring(flags)
+
+        ftc_c_setenv(n.ptr, v.ptr, 1)
+    end if
+
+    force_alloc_counting(flags == "")
+
+    val made = build_native_program(s"$root/main.sysl", None, None, level, Some(exe))
+
+    force_alloc_counting(false)
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+
+        ftc_c_unsetenv(n.ptr)
+    end if
+
+    made match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return FtcRun(failure_text(why), "", false)
+        Ok(_) -> ()
+
+    val symbols = capture("/usr/bin/nm", ["-u", exe], "", [], true)
+    val instrumented = symbols match
+        Ok(o) -> o.text.contains("___asan_report")
+        Err(_) -> false
+
+    val ran = capture(exe, [], "", [Var(alloc_bytes_variable(), "1")], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    ran match
+        Err(_) -> FtcRun("could not be started", "", false)
+        Ok(o) -> FtcRun(o.text, o.err.unwrap_or(""), instrumented)
+end ftc_run
+
+private extern "setenv" ftc_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" ftc_c_unsetenv(name: *u8) -> int
+
+// The LLVM text of a program, or its report.
+private ftc_ir(text: string) -> string
+    val root = make_temp_dir("sysl-ftc").unwrap()
+
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end ftc_ir
+
+// The lines of the function defined at `@<symbol>(`.
+private ftc_body(ir: string, symbol: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    var inside = false
+
+    for line in lines_of(ir).view()
+        if !inside && line.starts_with("define") && line.contains(s"@$symbol(") then inside = true
+
+        if inside
+            out.push(line)
+
+            if line == "}" then break
+        end if
+    end for
+
+    out
+end ftc_body
+
+private ftc_count(lines: Buf[string], part: string) -> int
+    var n = 0
+
+    for line in lines.view()
+        if line.contains(part) then n += 1
+
+    n
+end ftc_count
+
+private ftc_text(lines: Buf[string]) -> string
+    var all = ""
+
+    for line in lines.view()
+        all = all + line + "\n"
+
+    all
+end ftc_text
+
+// The retains and releases of a reference a body makes.
+private ftc_shares(lines: Buf[string]) -> int =
+    ftc_count(lines, "@arc.retain(") + ftc_count(lines, "@arc.release(") + ftc_count(lines, "@arc.release.")
+
+// The body at `symbol` lays a box in its frame and takes and gives back no share of it, and stands
+// `framedown` calls of `arc.framedown.<T>` where its last share was given back.
+private ftc_uncounted(name: string, ir: string, symbol: string, framedown: int)
+    val body = ftc_body(ir, symbol)
+
+    assert(ftc_count(body, "= alloca %arc.") >= 1, s"$name lays no box in the frame of @$symbol")
+    assert(ftc_shares(body) == 0, s"$name takes or gives back a share:\n${ftc_text(body)}")
+    assert(ftc_count(body, "@arc.framedown.") == framedown, s"$name:\n${ftc_text(body)}")
+end ftc_uncounted
+
+// The body at `symbol` still takes or gives back a share at run time.
+private ftc_counted(name: string, ir: string, symbol: string)
+    val body = ftc_body(ir, symbol)
+
+    assert(!body.is_empty(), s"$name: no body at @$symbol")
+    assert(ftc_shares(body) > 0, s"$name gives back no share:\n${ftc_text(body)}")
+end ftc_counted
+
+// -- the cells counted by the compiler --------------------------------------------------------------
+
+private const ftc_trait: string = raw"""
+    trait Reader
+        read(self, p: &Point) -> int
+        both(self, p: &Point, q: &Point) -> int
+
+    struct Point
+        x: int
+        y: int
+
+    struct Sum
+        k: int
+
+    impl Reader for Sum
+        read(self, p: &Point) -> int = p.x + p.y + self.k
+        both(self, p: &Point, q: &Point) -> int = p.x + q.y
+
+    run(r: &Reader) -> int
+        val p: &Point = Point(3, 4)
+
+        r.read(p) + r.both(p, p)
+
+    turns(r: &Reader) -> int
+        var total = 0
+
+        for i in 0..<3
+            val p: &Point = Point(i, 1)
+
+            total += r.read(p)
+        end for
+
+        total
+
+    main()
+        print(run(Sum(1)), turns(Sum(0)))
+    """
+
+private const ftc_closure: string = raw"""
+    struct Point
+        x: int
+        y: int
+
+    run(f: &Fn(&Point) -> int) -> int
+        val p: &Point = Point(3, 4)
+
+        f(p)
+
+    main()
+        val k = 1
+
+        print(run(q -> q.x + q.y + k))
+    """
+
+private const ftc_drop: string = raw"""
+    trait Look
+        look(self, r: &Res) -> int
+
+    struct Res
+        n: int
+
+    impl Drop for Res
+        drop(self) = print("closed", self.n)
+
+    struct Eye
+        k: int
+
+    impl Look for Eye
+        look(self, r: &Res) -> int = r.n + self.k
+
+    run(l: &Look)
+        val r: &Res = Res(1)
+
+        print(l.look(r))
+        print("end")
+
+    main()
+        run(Eye(0))
+        print("after")
+    """
+
+// The answer is a box of the callee's own, never the argument: it is not followed.
+private const ftc_fresh: string = raw"""
+    trait Make
+        make(self, p: &Point) -> &Other
+
+    struct Point
+        x: int
+
+    struct Other
+        y: int
+
+    struct Inc
+        k: int
+
+    var made: Option[&Other] = None
+
+    impl Make for Inc
+        make(self, p: &Point) -> &Other
+            val o: &Other = Other(p.x + self.k)
+
+            made = Some(o)
+            o
+
+    run(m: &Make) -> int
+        val p: &Point = Point(5)
+        val o = m.make(p)
+
+        o.y
+
+    main()
+        print(run(Inc(1)))
+        made = None
+    """
+
+private ftc_cells() -> Buf[(string, string)]
+    var out: Buf[(string, string)] = buf()
+
+    out.push((ftc_trait, "15 6\n"))
+    out.push((ftc_closure, "8\n"))
+    out.push((ftc_drop, "1\nend\nclosed 1\nafter\n"))
+    out.push((ftc_fresh, "6\n"))
+    out
+end ftc_cells
+
+@test("a frame box handed through a table or a closure that leaves it alone takes and gives back no share")
+ftc_table_calls_take_no_share()
+    if xvr_no_library() then return
+
+    val trait_ir = ftc_ir(ftc_trait)
+
+    ftc_uncounted("ftc_trait", trait_ir, "run$$sysl", 0)
+    ftc_uncounted("ftc_trait loop", trait_ir, "turns$$sysl", 0)
+    ftc_uncounted("ftc_closure", ftc_ir(ftc_closure), "run$$sysl", 0)
+    ftc_uncounted("ftc_drop", ftc_ir(ftc_drop), "run$$sysl", 1)
+
+    val fresh = ftc_body(ftc_ir(ftc_fresh), "run$$sysl")
+
+    assert(ftc_count(fresh, "@arc.release.Point") == 0, s"ftc_fresh:\n${ftc_text(fresh)}")
+    assert(ftc_count(fresh, "@arc.retain(") == 0, s"ftc_fresh:\n${ftc_text(fresh)}")
+end ftc_table_calls_take_no_share
+
+@test("each prints what it printed counted and gives back all it took, at -O0, -O1 and -O2")
+ftc_cells_run_at_every_level()
+    if !enm_ready() then return
+
+    for level in ["0", "1", "2"]
+        for cell in ftc_cells()
+            val got = ftc_run(cell.0, level, "")
+
+            assert_eq(got.out, cell.1)
+            assert_eq(alloc_count_reported(got.err), 0)
+        end for
+    end for
+end ftc_cells_run_at_every_level
+
+@test("and under AddressSanitizer: instrumented, the destructor once, nothing read outside a live frame")
+ftc_cells_run_clean_under_asan()
+    if !enm_ready() then return
+
+    for cell in ftc_cells()
+        val got = ftc_run(cell.0, "1", "-fsanitize=address -g")
+
+        assert(got.instrumented, "the binary calls no AddressSanitizer report")
+        assert_eq(got.out, cell.1)
+        assert_eq(got.err, "")
+    end for
+end ftc_cells_run_clean_under_asan
+
+// -- the cells left counted ---------------------------------------------------------------------------
+
+// The table may answer the box, so the answer is a second holder this pass cannot count.
+private const ftc_answered: string = raw"""
+    trait Pick
+        pick(self, p: &Point) -> &Point
+
+    struct Point
+        x: int
+
+    struct Same
+        k: int
+
+    impl Pick for Same
+        pick(self, p: &Point) -> &Point = p
+
+    run(s: &Pick) -> int
+        val p: &Point = Point(5)
+        val q = s.pick(p)
+
+        q.x
+
+    main()
+        print(run(Same(0)))
+    """
+
+// One of the two tables keeps the box, so it is on the heap.
+private const ftc_one_keeps: string = raw"""
+    trait Reader
+        read(self, p: &Point) -> int
+
+    struct Point
+        x: int
+        y: int
+
+    struct Sum
+        k: int
+
+    struct Keeper
+        k: int
+
+    var kept: Option[&Point] = None
+    var reading = true
+
+    impl Reader for Sum
+        read(self, p: &Point) -> int = p.x + p.y
+
+    impl Reader for Keeper
+        read(self, p: &Point) -> int
+            kept = Some(p)
+            p.x
+
+    run(r: &Reader) -> int
+        val p: &Point = Point(3, 4)
+
+        r.read(p)
+
+    main()
+        print(run(if reading then Sum(0) else Keeper(0)), kept.is_some())
+    """
+
+// A C function pointer has no body in sight.
+private const ftc_c_pointer: string = raw"""
+    struct Point
+        x: int
+
+    sum(p: &Point) -> int = p.x
+
+    run(f: *extern(&Point) -> int) -> int
+        val p: &Point = Point(5)
+
+        f(p)
+
+    main()
+        print(run(&sum))
+    """
+
+@test("a table that may answer the box, one of two keeping it, and a C function pointer leave it counted")
+ftc_ways_left_counted()
+    if xvr_no_library() then return
+
+    ftc_counted("ftc_answered", ftc_ir(ftc_answered), "run$$sysl")
+    ftc_counted("ftc_one_keeps", ftc_ir(ftc_one_keeps), "run$$sysl")
+    ftc_counted("ftc_c_pointer", ftc_ir(ftc_c_pointer), "run$$sysl")
+
+    if !enm_ready() then return
+
+    for cell in [(ftc_answered, "5\n"), (ftc_one_keeps, "7 false\n"), (ftc_c_pointer, "5\n")]
+        val got = ftc_run(cell.0, "1", "")
+
+        assert_eq(got.out, cell.1)
+        assert_eq(alloc_count_reported(got.err), 0)
+    end for
+end ftc_ways_left_counted
+
+// -- the build: a library sees only some of the tables ----------------------------------------------
+
+private var ftc_std_cache: Buf[Program] = buf()
+private var ftc_std_read: bool = false
+
+private ftc_std() -> Buf[Program]
+    if ftc_std_read then return ftc_std_cache
+
+    ftc_std_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> ftc_std_cache = units
+
+    ftc_std_cache
+end ftc_std
+
+private ftc_program(text: string) -> TProgram
+    var units: Buf[Program] = buf()
+
+    for item in ftc_std()
+        units.push(item)
+
+    units.push(parse(source_of("test.sysl", text)).program)
+    program_of(analyze_bodies(units, host_target()), "")
+end ftc_program
+
+@test("the same program built as a library gives the box handed through a table its shares back at run time")
+ftc_library_build_stays_counted()
+    if ftc_std().is_empty() || !clang_available() then return
+
+    val text = "module m\n\n" + forms_imported(ftc_trait)
+    var p = ftc_program(text)
+    val closed = lines_of(codegen_text(p, host_target()))
+
+    assert_eq(ftc_point_releases(closed), 0)
+
+    p.entry_point = false
+
+    val open = lines_of(codegen_text(p, host_target()))
+
+    assert(ftc_point_releases(open) > 0, s"the library build gives back no share of Point:\n${ftc_text(open)}")
+end ftc_library_build_stays_counted
+
+// The calls that give back a share of a `Point`, under whatever module its name is mangled in.
+private ftc_point_releases(lines: Buf[string]) -> int
+    var n = 0
+
+    for line in lines.view()
+        if line.contains("call void @arc.release") && line.contains("Point(ptr") then n += 1
+
+    n
+end ftc_point_releases
