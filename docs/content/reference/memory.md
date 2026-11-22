@@ -4064,6 +4064,11 @@ reads it through the caller's count — Swift's `guaranteed` convention. The cal
   anything it calls) nor a later argument may write a field the read went through, run code nobody
   can see, or let go of the root it was read from. `tail(x.unwrap().next, y, z)` takes none when
   `tail` writes no `next`; `f(a.b)` takes one when `f` may write `A.b` through another name for `a`.
+  A call through a closure or a trait object asks the same of every function the program put at that
+  type (each closure made at that `&Fn` type, each function named as a value of it, each
+  implementation erased into that trait at the object's arguments), so in a program's own build
+  `f(n.next)` through a `&Fn(Option[&Node]) -> int` takes none where none of them writes a `next`. A
+  library's build cannot see them all, and a C function pointer names no body: there the count stays.
   A global's value, a `&sync` or `weak` one, and an argument that crosses by address keep the count.
 
 Which of the two a call is changes nothing it prints: the count left out could never have been the one
