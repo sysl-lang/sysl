@@ -1,0 +1,368 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{cstring, str_builder}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **A +0 local keeps its count only for a kill while it is alive** (`plus0_locals.sysl`'s `live_end`,
+// `docs/design/borrow-inference.md` decision 5 / §4.1, decision D-BI2b).
+//
+// A kill -- a store, a callee's edge writes, code nobody can see -- counts only in a statement at or
+// before the last one that reads the local; a statement that reads it is alive throughout (a loop in it
+// comes round, a temporary it hands on lives as long as it), except a plain store's own event, which
+// happens once its place and value are computed. Each row is proved twice: the `--explain-borrows`
+// line says whether the local holds a count, and the program runs on the counted heap at both ends of
+// the optimizer and under AddressSanitizer with the instrumentation confirmed -- a local wrongly left
+// +0 is a use-after-free ASan reports.
+//
+// The axes: where the kill stands against the last read (a later statement, the store the last read
+// feeds, an earlier evaluation in the read's own statement, before the read), control flow between them
+// (a loop that comes round, a branch rejoining, a branch the read is not on, an early `return`), and
+// the local's kind (an `is` binding, a `val` matched on, an arm's binding). Cells not written: a closure
+// capturing the local -- building one is a value built from it, which takes the count where it is
+// built; `defer` -- a local named in one is never a candidate (`bli_a15`); `break`/`continue` -- they
+// only leave a statement the local is alive throughout or end its life, as `return` does.
+
+private extern "setenv" blv_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" blv_c_unsetenv(name: *u8) -> int
+
+private struct BlvRun
+    ok: bool
+    out: string
+    err: string
+    hooks: usize
+
+private blv_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end blv_ready
+
+// A scheduler's run list: `make(5)` is tasks 4, 3, 2, 1, 0, each held only by the one before it (the
+// first by the scheduler), so a store over `s.current` frees the task it held.
+private blv_head() -> string = """
+    struct Task
+        v: int
+        next: Option[&Task]
+
+        run_task(self) -> Option[&Task] = self.next
+
+    struct Sched
+        current: Option[&Task]
+
+    make(n: int) -> Option[&Task]
+        var head: Option[&Task] = None
+
+        for i in 0..<n
+            head = Some(Task(i, head))
+
+        head
+
+    clear(s: &Sched) -> int
+        s.current = None
+        0
+
+    """
+
+private blv_run(text: string, level: string, counted: bool, flags: string) -> BlvRun
+    val root = make_temp_dir("sysl-blv").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    if counted then force_alloc_counting(true)
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+        val v = cstring(flags)
+
+        blv_c_setenv(n.ptr, v.ptr, 1)
+    end if
+
+    val built = build_native_program(s"$root/main.sysl", None, None, level, Some(exe))
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+
+        blv_c_unsetenv(n.ptr)
+
+    if counted then force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return BlvRun(false, failure_text(why), "", 0)
+        Ok(_) -> ()
+
+    val hooks = capture("nm", ["-u", exe], "", [], true) match
+        Ok(o) -> o.text.count_of("__asan_report")
+        Err(_) -> 0
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> BlvRun(false, "could not be started", "", 0)
+        Ok(o) -> BlvRun(o.status.ok(), o.text, o.err.unwrap_or(""), hooks)
+end blv_run
+
+// Printed exactly `expected` at both ends of the optimizer on the counted heap, giving everything back,
+// and again under AddressSanitizer with the instrumentation in the binary.
+private blv_prints(text: string, expected: string)
+    if !blv_ready() then return
+
+    for level in ["0", "2"]
+        val run = blv_run(text, level, true, "")
+
+        assert(run.ok, s"-O$level: ${run.out}${run.err}")
+        assert_eq(run.out, expected)
+        assert(alloc_count_reported(run.err) == 0, s"-O$level: ${run.err}")
+
+    val asan = blv_run(text, "0", false, "-fsanitize=address -g")
+
+    assert(asan.hooks > 0, "the AddressSanitizer build carries no instrumentation")
+    assert(asan.ok, s"asan: ${asan.out}${asan.err}")
+    assert_eq(asan.out, expected)
+end blv_prints
+
+// The `--explain-borrows` line about `local`, without the file it names, or a complaint listing every
+// line.
+private blv_line(text: string, local: string) -> string
+    val root = make_temp_dir("sysl-blv").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    var notes: Buf[string] = buf()
+    val noted = &notes
+    val file = s"$root/main.sysl"
+    var args: Buf[string] = buf()
+
+    args.push("sysl")
+    args.push("emit-llvm")
+    args.push("--explain-borrows")
+    args.push(file)
+    run_cli_noted(args.view(), (line) -> sink.push(line), (line) -> noted.push(line))
+    remove_dir_all(root).unwrap_or(())
+
+    var all = str_builder()
+
+    for item in notes
+        if item.starts_with(file + ":") && item.contains(s"'$local' ") then return item[file.len + 1..<item.len]
+
+        all.push(item)
+        all.push_char('\n')
+
+    s"no line for '$local' in:\n${all.finish()}"
+end blv_line
+
+private blv_plus0(text: string, local: string)
+    if !blv_ready() then return
+
+    val line = blv_line(text, local)
+
+    assert(line.contains(s"'$local' holds no count"), line)
+
+private blv_counted(text: string, local: string, why: string)
+    if !blv_ready() then return
+
+    val line = blv_line(text, local)
+
+    assert(line.contains(s"'$local' is counted: ") && line.contains(why), line)
+
+// -- a kill after the last read --------------------------------------------------------------------
+
+private blv_richards() -> string = blv_head() + """
+    step(s: &Sched) -> int
+        var n = 0
+
+        while s.current is Some(current)
+            n += current.v
+            s.current = current.run_task()
+
+        n
+
+    print(step(Sched(make(5))))
+
+    """
+
+@test("Richards: a store over the field an is binding was read from, after its last read, leaves it +0")
+blv_store_after_last_read()
+    blv_plus0(blv_richards(), "current")
+    blv_prints(blv_richards(), "10\n")
+
+private blv_later() -> string = blv_head() + """
+    later(s: &Sched) -> int
+        val first = s.current
+        val v = first match
+            Some(t) -> t.v
+            None -> -1
+
+        s.current = None
+        v
+
+    print(later(Sched(make(5))))
+
+    """
+
+@test("a kill in a statement after the last read leaves a val and the arm binding read out of it +0")
+blv_kill_in_a_later_statement()
+    blv_plus0(blv_later(), "first")
+    blv_plus0(blv_later(), "t")
+    blv_prints(blv_later(), "4\n")
+
+private blv_early() -> string = blv_head() + """
+    early(s: &Sched, c: bool) -> int
+        val first = s.current
+
+        if c
+            first match
+                Some(t) -> return t.v
+                None -> return -1
+
+        s.current = None
+        0
+
+    print(early(Sched(make(5)), true), early(Sched(make(5)), false))
+
+    """
+
+@test("a kill after a branch that reads the local and returns leaves it +0: no path reads it after the kill")
+blv_early_return()
+    blv_plus0(blv_early(), "first")
+    blv_prints(blv_early(), "4 0\n")
+
+// -- a kill while the local is alive -----------------------------------------------------------------
+
+private blv_before() -> string = blv_head() + """
+    step(s: &Sched) -> int
+        var n = 0
+
+        while s.current is Some(current)
+            s.current = current.run_task()
+            n += current.v
+
+        n
+
+    print(step(Sched(make(5))))
+
+    """
+
+@test("a store before the last read keeps the count")
+blv_store_before_last_read()
+    blv_counted(blv_before(), "current", "may write Sched.current")
+    blv_prints(blv_before(), "10\n")
+
+private blv_loop() -> string = blv_head() + """
+    rounds(s: &Sched) -> int
+        val first = s.current
+        var n = 0
+
+        for i in 0..<3
+            first match
+                Some(t) -> n += t.v
+                None -> ()
+
+            s.current = None
+
+        n
+
+    print(rounds(Sched(make(5))))
+
+    """
+
+@test("a kill after the read in a loop body keeps the count: the next trip reads the local again")
+blv_loop_carried()
+    blv_counted(blv_loop(), "first", "may write Sched.current")
+    blv_prints(blv_loop(), "12\n")
+
+private blv_join() -> string = blv_head() + """
+    joined(s: &Sched, c: bool) -> int
+        val first = s.current
+
+        if c then s.current = None
+
+        first match
+            Some(t) -> t.v
+            None -> -1
+
+    print(joined(Sched(make(5)), true), joined(Sched(make(5)), false))
+
+    """
+
+@test("a kill on one branch keeps the count where the read comes after the branches join")
+blv_kill_in_a_branch_read_after_join()
+    blv_counted(blv_join(), "first", "may write Sched.current")
+    blv_prints(blv_join(), "4 4\n")
+
+private blv_other() -> string = blv_head() + """
+    either(s: &Sched, c: bool) -> int
+        val first = s.current
+
+        if c
+            s.current = None
+            0
+        else
+            first match
+                Some(t) -> t.v
+                None -> -1
+
+    print(either(Sched(make(5)), true), either(Sched(make(5)), false))
+
+    """
+
+// No path reads `first` after the kill, but the statement that kills it also reads it, and liveness is
+// asked per statement of the list: the count is kept. Sound, not the tightest answer.
+@test("a kill on one branch whose other branch reads the local keeps the count: one statement does both")
+blv_kill_on_the_branch_the_read_is_not_on()
+    blv_counted(blv_other(), "first", "may write Sched.current")
+    blv_prints(blv_other(), "0 4\n")
+
+private blv_same() -> string = blv_head() + """
+    same(s: &Sched) -> int
+        var n = 0
+
+        while s.current is Some(cur)
+            n = clear(s) + cur.v
+
+        n
+
+    print(same(Sched(make(5))))
+
+    """
+
+@test("a call that kills, evaluated before the last read in the same store's value, keeps the count")
+blv_kill_earlier_in_the_same_expression()
+    blv_counted(blv_same(), "cur", "clear' at ")
+    blv_prints(blv_same(), "4\n")
+
+private blv_arg() -> string = blv_head() + """
+    pair(a: int, b: int) -> int = a * 10 + b
+
+    argued(s: &Sched) -> int
+        val first = s.current
+
+        first match
+            Some(t) -> pair(t.v, clear(s))
+            None -> -1
+
+    print(argued(Sched(make(5))))
+
+    """
+
+// `t` is read out of `first` while `first` is still in its slot, so it adds no edge of its own: `first`'s
+// count is the one that keeps the task.
+@test("a kill in a later argument than the read keeps the count: the read's statement is alive throughout")
+blv_kill_in_a_later_argument()
+    blv_counted(blv_arg(), "first", "clear' at ")
+    blv_prints(blv_arg(), "40\n")
