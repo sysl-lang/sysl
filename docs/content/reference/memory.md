@@ -4064,6 +4064,11 @@ reads it through the caller's count — Swift's `guaranteed` convention. The cal
   anything it calls) nor a later argument may write a field the read went through, run code nobody
   can see, or let go of the root it was read from. `tail(x.unwrap().next, y, z)` takes none when
   `tail` writes no `next`; `f(a.b)` takes one when `f` may write `A.b` through another name for `a`.
+  A call through a closure or a trait object asks the same of every function the program put at that
+  type (each closure made at that `&Fn` type, each function named as a value of it, each
+  implementation erased into that trait at the object's arguments), so in a program's own build
+  `f(n.next)` through a `&Fn(Option[&Node]) -> int` takes none where none of them writes a `next`. A
+  library's build cannot see them all, and a C function pointer names no body: there the count stays.
   A global's value, a `&sync` or `weak` one, and an argument that crosses by address keep the count.
 
 Which of the two a call is changes nothing it prints: the count left out could never have been the one
@@ -4406,7 +4411,10 @@ true false
 Keeping such a local is no reason to count it: a `return`, a `break` with it, a `push`, a store, a
 copy into a counted local or a value built from it takes the count where it keeps the value, on that
 path only. **The local keeps its count, for the whole of its life, where its scope may cut the
-chain**: a write to a field it was read along (through any reference), a call to a function that may
+chain while the local may still be read** — in a statement of its block at or before the last one
+that reads it, which a loop coming round or an argument handed on keeps alive throughout. A store that
+statement ends with is not such a cut: `self.current = current.run_task()` reads `current` in the call,
+and the store comes after, so `current` holds no count. The cuts are: a write to a field it was read along (through any reference), a call to a function that may
 write one — however deep — or may read a count of it, a release that may run a destructor, a call
 through a C function pointer, a foreign call the program cannot trust, an `await`, and a write to the
 root itself, or a use of an owned root that could hand its count away. **A program sees every closure
@@ -4426,7 +4434,11 @@ there**: a place of a parameter (a field, an element of a fixed array or of a he
 built on the spot out of references read from it ("+0"). It keeps the ordinary call where some path
 answers a reference made there, where the body may release or write what it answers, and where no body
 is in sight. So `quad(self) -> Kids = self.kids.unwrap()` costs what `n.kids match Some(q) -> …`
-costs: no count at all. A generic is decided per instance. `--explain-borrows`
+costs: no count at all. A generic is decided per instance. In a program, which sees every closure and
+trait object it makes, a call through a closure or a trait object's table answers what each function
+the program put at that type answers, and is borrowed only where every one of them is; a library, or
+a call through a C function pointer, has no body in sight. Such a function still keeps the ordinary
+call, since the body in the slot is reached through its own ordinary entry. `--explain-borrows`
 ([the CLI](/getting-started/cli/#explain-borrows)) reports each — here for a `Table` whose `find`
 answers `Some(it)` for an element of its `items`, a `look` built on it, and a `drained` that clears
 the buffer after asking:

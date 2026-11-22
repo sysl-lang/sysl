@@ -1770,7 +1770,9 @@ list.sysl:52:1: 'mix' parameter 'p' is counted: it is assigned a value with a co
 ```
 
 It reports **each argument read out of storage** too — a field or an element read through a reference,
-handed to a direct call: either that it needs no count, since the call writes no field on its way, or
+handed to a direct call, or in a program's own build to a call through a closure or a trait object
+(named as the program wrote it, `f` or `w.look`): either that it needs no count, since the call writes
+no field on its way, or
 that it takes one, with the first thing that could cut the chain between the read and the call's
 return — the parameter being one the callee keeps, a field the callee or a later argument may write,
 code nobody can see
@@ -1781,6 +1783,7 @@ list.sysl:32:28: argument 'x.unwrap().next' of 'tail' needs no count: 'tail' wri
 havlak.sysl:263:9: argument 'self.nodes[_]' of 'init_node' needs no count: 'init_node' writes no field on its way
 dfs.sysl:24:37: argument 'outs[_]' of 'walk' takes a count: 'walk' keeps it
 walk.sysl:9:10: argument 'h.next' of 'pair' takes a count: 'cut' at 9:18 may write Node.next
+look.sysl:20:46: argument 'n.next' of 'w.look' takes a count: 'w.look' may write Node.next
 ```
 
 An argument that is a local, a parameter or a call's answer gets no line: it needs no count anyway.
