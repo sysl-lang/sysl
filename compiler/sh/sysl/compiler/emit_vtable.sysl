@@ -515,7 +515,11 @@ end gen_erase
 // The receiver is borrowed from wherever it is held, which is sound while nothing lets go of it
 // before the call is made. An argument that assigns the receiver's local does exactly that, so there
 // the object is held by a count of the call's own (`held_unless`).
-gen_vcall(e: *Emit, receiver: TExpr, slot: int, args: Buf[TExpr], ty: Type) -> Val
+//
+// `node` is the call's `node_id`, under which the escape walk left what the bodies the slot may hold
+// do with each argument it followed in (`StackBoxes.table_args`); each value handed is noted beside
+// the function's register for `frame_counts.sysl`.
+gen_vcall(e: *Emit, receiver: TExpr, slot: int, args: Buf[TExpr], ty: Type, node: usize) -> Val
     val written = written_by(args)
     val obj = gen_expr(e, receiver)
     val rty = texpr_type(receiver)
@@ -534,6 +538,7 @@ gen_vcall(e: *Emit, receiver: TExpr, slot: int, args: Buf[TExpr], ty: Type) -> V
     emit(e, InExtract(data, l_fat(), obj, index_list(1)))
 
     var arg_vals: Buf[IrArg] = buf()
+    var ends: Buf[usize] = buf()
 
     // An argument read out of storage nothing any function the slot can hold writes needs no count of
     // its own for the call (`plus0_locals.sysl`'s `held_backed_table`).
@@ -545,6 +550,8 @@ gen_vcall(e: *Emit, receiver: TExpr, slot: int, args: Buf[TExpr], ty: Type) -> V
                        else None
 
         arg_value(e, a, &arg_vals, written, "", held_for)
+        ends.push(arg_vals.len())
+    end for
 
     val fn = vtable_entry(e, table, slot)
 
@@ -555,8 +562,42 @@ gen_vcall(e: *Emit, receiver: TExpr, slot: int, args: Buf[TExpr], ty: Type) -> V
     for arg_val in arg_vals
         all.push(arg_val)
 
+    note_table_call(e, fn, node, all, ends)
     gen_sysl_call(e, fn, all, ty)
 end gen_vcall
+
+// Notes, beside the register of the function a table call calls, each value handed it and what the
+// bodies that slot may hold do with that argument; one the walk never followed in is noted as kept.
+// The receiver's data word is argument 0; declared argument `i` is argument `i + 1`, the values
+// `arg_value` pushed for it, which end before `ends[i]` of the declared ones.
+private note_table_call(e: *Emit, fn: Val, node: usize, all: Buf[IrArg], ends: Buf[usize])
+    var any = false
+
+    for k in 0..ends.len()
+        if e.stack.table_args.has(s"$node|$k") then any = true
+
+    if !any then return
+
+    var noted: Buf[TableArg] = buf()
+    var i: usize = 0
+
+    for j in 0..<all.len()
+        var k: usize = 0
+
+        if j > 0
+            while i < ends.len() && j - 1 >= ends[i]
+                i += 1
+
+            k = i + 1
+        end if
+
+        val seen = e.stack.table_args.get(s"$node|$k").unwrap_or((true, true))
+
+        noted.push(TableArg(v_render(all[j].value), seen.0, seen.1))
+    end for
+
+    e.table_calls.put(v_render(fn), noted)
+end note_table_call
 
 // The function one slot of a table holds, loaded. The indexing type has **no** entries in it: a table
 // is as long as its trait and a call site knows only which slot it wants.

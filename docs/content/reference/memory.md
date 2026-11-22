@@ -1394,22 +1394,55 @@ Neither box above touches the heap. **A box stays on the heap wherever it may ge
 anywhere but a local of the frame (module storage, a field reached through a reference or a pointer,
 a buffer, another box), returned other than as a factory's answer, captured by a closure, handed to a
 parameter whose body may let it out or answer it into something that does, weakened, given up with
-`into_raw`, put behind a trait object, carried out of a loop by `break`, or held by a local that
-outlives the loop turn that built it. A view of an array inside a box owns the box, so a view that
-gets out keeps its box on the heap. A call with no body in sight — through a trait object, a callable,
-a function pointer, an `extern` — or a recursion still being worked out answers "it may get out", as
-does a task's body and a payload over a kilobyte, which every frame of a recursion would pay for. A
-`&sync T` is never laid in a frame. Nothing here is visible to the program but the allocator: a
+`into_raw`, carried out of a loop by `break`, or held by a local that outlives the loop turn that
+built it. A view of an array inside a box owns the box, so a view that gets out keeps its box on the
+heap. **A call through a trait object or a callable is a call of every body its table may hold** — in
+a program, which sees every table there is, each method or closure of that trait at the receiver's own
+arguments; the box stays in the frame where none of them lets it out. A call with no body in sight — a
+C function pointer, an `extern`, a trait object or a callable in a library, which may be handed one
+whose table it never saw — or a recursion still being worked out answers "it may get out", as does a
+task's body and a payload over a kilobyte, which every frame of a recursion would pay for. A
+`&sync T` is never laid in a frame.
+
+```sysl
+trait Reader
+    read(self, p: &Point) -> int
+
+struct Point
+    x: int
+    y: int
+
+struct Sum
+    k: int
+
+impl Reader for Sum
+    read(self, p: &Point) -> int = p.x + p.y + self.k
+
+main()
+    val r: &Reader = Sum(1)
+    val p: &Point = Point(3, 4)
+
+    print(r.read(p))
+```
+
+```output
+8
+```
+
+Neither `r` nor `p` touches the heap: the one table of `Reader` holds a `read` that only reads both. Nothing here is visible to the program but the allocator: a
 frame box prints, compares and drops exactly as a heap box does.
 
 **Where every share of a frame box is taken and given back by the body that laid it, the compiler
 counts them, not the program.** No count is taken or given back at run time: the point where the
 last share would have gone runs the destructor and lets go of what the payload holds, exactly where
 it ran before, on every way out of the scope — the end of a block, a `return`, a `?`, a `break` or
-`continue` out of the loop turn that built it. Both boxes above, a box held by two locals, a
+`continue` out of the loop turn that built it. `c` and `r` of the first example, a box held by two locals, a
 temporary handed to a call, a box a closure captures, a box lent to a callee that takes shares of its
-own: each is counted by the compiler. A local that may hold one of two boxes, or the answer of a call that may be the box
-itself, leaves that box counted at run time, as above; the program cannot tell the two apart.
+own, a box handed to a call through a trait object or a callable whose every body leaves it alone (`p`
+above): each is counted by the compiler. A local that may hold one of two boxes, or the answer of a call that may be the box
+itself, leaves that box counted at run time, as above; the program cannot tell the two apart. So
+does a trait object or a callable that is itself a frame box and the receiver of the call (`r` above),
+and a closure capturing a box handed through a table.
 
 #### Promotion is silent, not hidden
 
