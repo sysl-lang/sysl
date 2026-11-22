@@ -1348,6 +1348,69 @@ print(first())
 this view of an array literal is kept in 'keep', which outlives it, so the array would move to the heap to outlive its statement — and this module declared '@no_alloc', so there is nothing to move it into
 ```
 
+#### A box nothing keeps is laid in the frame
+
+The same analysis runs the other way for a `&T`. **A box the frame builds and nothing keeps past the
+frame is laid in the frame**, not on the heap: the header and the payload a heap box has, counted the
+same way, in a slot of the frame. The destructor still runs when the last count goes, at the end of
+the scope as before; only the allocation is gone. A **factory** — a function whose answer is a box it
+built and kept nowhere else — lays that box in its caller's frame wherever the caller keeps it no
+longer than itself:
+
+```sysl
+struct Counter
+    n: int
+
+counter(start: int) -> &Counter = Counter(start)
+
+struct Res
+    n: int
+
+impl Drop for Res
+    drop(self) = print("closed", self.n)
+
+read(r: &Res) -> int = r.n
+
+main()
+    val c = counter(5)
+
+    c.n += 2
+    print(c.n)
+
+    val r: &Res = Res(1)
+
+    print(read(r))
+    print("end")
+```
+
+```output
+7
+1
+end
+closed 1
+```
+
+Neither box above touches the heap. **A box stays on the heap wherever it may get out**: stored
+anywhere but a local of the frame (module storage, a field reached through a reference or a pointer,
+a buffer, another box), returned other than as a factory's answer, captured by a closure, handed to a
+parameter whose body may let it out or answer it into something that does, weakened, given up with
+`into_raw`, put behind a trait object, carried out of a loop by `break`, or held by a local that
+outlives the loop turn that built it. A view of an array inside a box owns the box, so a view that
+gets out keeps its box on the heap. A call with no body in sight — through a trait object, a callable,
+a function pointer, an `extern` — or a recursion still being worked out answers "it may get out", as
+does a task's body and a payload over a kilobyte, which every frame of a recursion would pay for. A
+`&sync T` is never laid in a frame. Nothing here is visible to the program but the allocator: a
+frame box prints, compares and drops exactly as a heap box does.
+
+**Where every share of a frame box is taken and given back by the body that laid it, the compiler
+counts them, not the program.** No count is taken or given back at run time: the point where the
+last share would have gone runs the destructor and lets go of what the payload holds, exactly where
+it ran before, on every way out of the scope — the end of a block, a `return`, a `?`, a `break` or
+`continue` out of the loop turn that built it. Both boxes above, a box held by two locals, a
+temporary handed to a call, a box a closure captures, a box lent to a callee that takes shares of its
+own: each is counted by the compiler. A local that may hold one of two boxes, or the answer of a call that may be the box
+itself, leaves that box counted at run time, as above; the program cannot tell the two apart.
+
 #### Promotion is silent, not hidden
 
 **`--explain-escapes`** reports every promotion and the route that forced it — one line per array, in
@@ -3995,10 +4058,84 @@ reads it through the caller's count — Swift's `guaranteed` convention. The cal
 - a **local or parameter** whose address has not been let out yet keeps its count where the callee
   cannot reach it: nothing to do ("yet" counts a statement at a time; a loop is one statement);
 - **anything else** — a field, an element, a global, something behind a `ref` or a `&` — costs a retain
-  before and a release after, since the call may write that memory.
+  before and a release after, since the call may write that memory, **unless the call can write no
+  field on the way to it**: a field or an element read through a parameter, a local or a call's
+  answer, handed to a parameter the callee borrows, takes no count where neither the callee (nor
+  anything it calls) nor a later argument may write a field the read went through, run code nobody
+  can see, or let go of the root it was read from. `tail(x.unwrap().next, y, z)` takes none when
+  `tail` writes no `next`; `f(a.b)` takes one when `f` may write `A.b` through another name for `a`.
+  A global's value, a `&sync` or `weak` one, and an argument that crosses by address keep the count.
 
-A callee still takes a count for **a parameter it assigns to**, and for every parameter of a function
-something outside the program may call (`@export`, a `@section`, one whose address is taken).
+Which of the two a call is changes nothing it prints: the count left out could never have been the one
+keeping the value alive. `length(a.b.next)` below takes no count, since `length` writes no field;
+`replace(a.b)` takes one, since `replace` overwrites `A.b` through the global, and reads what it was
+handed after that (`--explain-borrows` says which, and why):
+
+```sysl
+struct Node
+    v: int
+    next: Option[&Node]
+
+struct A
+    b: &Node
+
+var SEEN: Option[&A] = None
+
+length(n: Option[&Node]) -> int = n match
+    Some(x) -> 1 + length(x.next)
+    None -> 0
+
+replace(n: &Node) -> int
+    SEEN.unwrap().b = Node(9, None)
+    n.v
+
+main()
+    val a: &A = A(Node(1, Some(Node(2, None))))
+
+    SEEN = Some(a)
+    print(length(a.b.next), replace(a.b), a.b.v)
+    SEEN = None
+```
+
+```output
+1 1 9
+```
+
+A callee still takes a count for **a parameter it assigns a value it made** — a walk that only follows
+fields of what it was handed (`p = p.next`, or a call to itself with `n.next` that is lowered as a
+jump) takes none — and for every parameter of a function something outside the program may call
+(`@export`, a `@section`, one whose address is taken). A function that calls itself last with values
+it made reads its first round's parameters through its caller's count, and takes one only for what
+each later round is handed. Both of these walk the list with no count operation at all:
+
+```sysl
+struct Node
+    v: int
+    next: Option[&Node]
+
+count(p: Option[&Node], n: int) -> int = p match
+    Some(node) -> count(node.next, n + 1)
+    None -> n
+
+total(p: Option[&Node]) -> int
+    var sum = 0
+
+    while p is Some(node)
+        sum += node.v
+        p = node.next
+
+    sum
+
+main()
+    val list: Option[&Node] = Some(Node(1, Some(Node(2, Some(Node(3, None))))))
+
+    print(count(list, 0), total(list))
+```
+
+```output
+3 6
+```
+
 **A call to an `async` function moves a temporary into its task**, which lets it go at its `return`,
 not at the end of the caller's statement:
 
@@ -4079,6 +4216,44 @@ except a function handed only numbers. A call writing memory is judged by the ty
 growing a `Buf[Value]` cannot touch a `Machine`. An `await` keeps the count, as does storing,
 returning, capturing or keeping the value; a tuple built on the spot for a keeping call is handed over
 whole.
+
+**A release between them does not always keep the count.** Where letting go of the released value
+runs no destructor, the share goes when nothing that release can tear down is of the share's type — an
+old `Option[&Tag]` given back cannot free a `Packet` — or when the reference was read out of a local
+that holds a count of its own on it, such as Richards' `message.unwrap()` while the old `self.input`
+is given back:
+
+```sysl
+struct Packet
+    id: int
+    link: Option[&Packet]
+
+struct Task
+    input: Option[&Packet]
+
+impl Task
+    run(*self) -> int
+        var message: Option[&Packet] = None
+
+        message = self.input
+        self.input = message.unwrap().link   // message holds the packet: no share for the read
+        message.unwrap().id
+
+main()
+    var t = Task(Some(Packet(1, Some(Packet(2, None)))))
+
+    print(t.run(), t.run())
+```
+
+```output
+1 2
+```
+
+The local must hold a count on everything stored into it and be read only where it lies. A parameter
+does not qualify: what a borrowed one holds is its caller's, and the share keeps its count.
+Reading the payload straight out of the place being written (`self.input = self.input.unwrap().link`)
+keeps the share, since that release may be the packet's last, and so does a release whose teardown
+runs a destructor.
 
 ### A read of a place that is written over next takes the place's count
 

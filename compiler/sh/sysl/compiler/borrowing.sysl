@@ -2637,6 +2637,10 @@ edge_text(k: EdgeKey) -> string =
 // **The answer is shared, not copied**: its lists are the summary's own, so a caller reads it and
 // never changes it.
 //
+// **`within` and `counts` are found by their spelling, not by a scan** (`TypeIndex`): the fixed point
+// joins every callee's lists into every caller's, over the whole program, so a membership test that
+// walked the list made the solve cubic in the types a body writes.
+//
 // **Opaque is the top, and it absorbs**: an opaque summary may write every edge and read every count,
 // so it keeps no list -- they are let go of when it becomes opaque, and nothing is added after. **A
 // summary that would name more than `EdgeLimit` things is widened to opaque**, which bounds both what
@@ -2650,6 +2654,8 @@ struct EdgeWrites
     counts: Buf[Type]
     opaque: string
     opaque_in: string
+    within_at: TypeIndex
+    counts_at: TypeIndex
 
     key(*self, k: EdgeKey) -> bool
         if self.opaque != "" || self.named.has(k.text) then return false
@@ -2661,18 +2667,39 @@ struct EdgeWrites
     inside(*self, t: Type) -> bool
         val u = underlying(t)
 
-        if self.opaque != "" || has_type(self.within, u) then return false
+        if self.opaque != "" then return false
 
+        self.inside_spelled(u, mangle(u))
+
+    inside_spelled(*self, u: Type, spelled: string) -> bool
+        if self.opaque != "" || self.within_at.has(self.within, u, spelled) then return false
+
+        self.within_at.add(spelled, self.within.len())
         self.within.push(u)
         self.bound()
 
     count(*self, t: Type) -> bool
         val u = underlying(t)
 
-        if self.opaque != "" || has_type(self.counts, u) then return false
+        if self.opaque != "" then return false
 
+        self.count_spelled(u, mangle(u))
+
+    count_spelled(*self, u: Type, spelled: string) -> bool
+        if self.opaque != "" || self.counts_at.has(self.counts, u, spelled) then return false
+
+        self.counts_at.add(spelled, self.counts.len())
         self.counts.push(u)
         self.bound()
+
+    // Whether a value of `t` may have its count read.
+    has_count(self, t: Type) -> bool
+        val u = underlying(t)
+
+        self.counts_at.has(self.counts, u, mangle(u))
+
+    // Whether `counts` holds `t` itself, as written.
+    holds_count_of(self, t: Type) -> bool = self.counts_at.has(self.counts, t, mangle(t))
 
     hide(*self, why: string, at: string) -> bool
         if self.opaque != "" then return false
@@ -2683,6 +2710,8 @@ struct EdgeWrites
         self.named = set()
         self.within = buf()
         self.counts = buf()
+        self.within_at = type_index()
+        self.counts_at = type_index()
         true
 
     // Something was added: widened to opaque where it now names more than `EdgeLimit` things.
@@ -2702,20 +2731,54 @@ struct EdgeWrites
         for item in other.keys
             grew = self.key(item) || grew
 
-        for item in other.within
-            grew = self.inside(item) || grew
+        for i in 0..<other.within.len()
+            grew = self.inside_spelled(other.within[i], other.within_at.spelled[i]) || grew
 
-        for item in other.counts
-            grew = self.count(item) || grew
+        for i in 0..<other.counts.len()
+            grew = self.count_spelled(other.counts[i], other.counts_at.spelled[i]) || grew
 
         grew
 end EdgeWrites
 
+edge_writes_none() -> EdgeWrites = EdgeWrites(buf(), set(), buf(), buf(), "", "", type_index(), type_index())
+
+// **A list of types found by spelling**: each item's `mangle` is its bucket, and a bucket is a chain
+// through the items that share it, each compared whole (`==`) -- a spelling is shared by types the
+// compiler tells apart (a trait's associated types, a name-only subtype), so it narrows the search and
+// never decides it. Two types that are equal spell alike, as they must: the spelling is the symbol a
+// lowered program names the type by. `first` holds one past the bucket's newest item, `next` one past the item before it,
+// 0 ending the chain.
+struct TypeIndex
+    spelled: Buf[string]
+    first: Map[string, usize]
+    next: Buf[usize]
+
+    // Whether `items` (the list this indexes) holds `t`, spelled `spelling`.
+    has(self, items: Buf[Type], t: Type, spelling: string) -> bool = self.find(items, t, spelling).is_some()
+
+    // Where in `items` `t` is.
+    find(self, items: Buf[Type], t: Type, spelling: string) -> Option[usize]
+        var at = self.first.get(spelling).unwrap_or(0)
+
+        while at > 0
+            if items[at - 1] == t then return Some(at - 1)
+
+            at = self.next[at - 1]
+
+        None
+
+    // Files the item at `i` under `spelling`.
+    add(*self, spelling: string, i: usize)
+        self.spelled.push(spelling)
+        self.next.push(self.first.get(spelling).unwrap_or(0))
+        self.first.put(spelling, i + 1)
+end TypeIndex
+
+type_index() -> TypeIndex = TypeIndex(buf(), map(), buf())
+
 // The most edges, written-through types and count-read types one summary names before it is widened
 // to opaque.
 const EdgeLimit: usize = 64
-
-edge_writes_none() -> EdgeWrites = EdgeWrites(buf(), set(), buf(), buf(), "", "")
 
 // Whether a summary may overwrite edge `k`: it is opaque, names it, or writes through a pointer a value
 // of a type the edge's value lays out by value.
@@ -2742,7 +2805,7 @@ first_written(w: EdgeWrites, ks: Buf[EdgeKey]) -> Option[EdgeKey]
 end first_written
 
 // Whether a summary may read the count of a value of type `t`, or run code that may.
-reads_count(w: EdgeWrites, t: Type) -> bool = w.opaque != "" || has_type(w.counts, underlying(t))
+reads_count(w: EdgeWrites, t: Type) -> bool = w.opaque != "" || w.has_count(t)
 
 // One body's own writes, gathered through the box its walk captured. `within` holds every type the
 // body writes through a pointer, counted or not, until `edge_finish` judges them against the casts.
@@ -3150,10 +3213,15 @@ private foreign_into(sink: &EdgeSink, name: string, elem: Type, read_only: bool)
         sink.pointer(elem)
 
 // The least fixed point: each body starts from its own writes and those of the callees with no body in
-// sight, and a body's answer is joined into each caller's until nothing grows.
+// sight, and gets every write of every body it calls.
+//
+// **Each call is joined once** (`edge_scc`): the call graph's strongly connected components are solved
+// callees first, so a body's callees are settled before it is, and the bodies of one cycle -- which all
+// reach one another, so all write the same -- share one answer, made once. Joining a callee's answer
+// into its callers again each time it grew joined the program's largest answers thousands of times.
 private edge_solve(u: *Untouched, abandoning: Set[string]) -> Buf[EdgeWrites]
     var fix: Buf[EdgeWrites] = buf()
-    var callers: Buf[Buf[usize]] = buf()
+    var callees: Buf[Buf[usize]] = buf()
 
     for i in 0..<u.names.len()
         var w = edge_finish(u.edge_own[i], u.edge_casts)
@@ -3161,26 +3229,26 @@ private edge_solve(u: *Untouched, abandoning: Set[string]) -> Buf[EdgeWrites]
         if w.opaque != "" && w.opaque_in == "" then w.opaque_in = u.names[i]
 
         fix.push(w)
-        callers.push(buf())
+        callees.push(buf())
 
     // Each callee once: a call through a closure names every closure of its type, at every such call.
     for i in 0..<u.names.len()
-        var callees: Buf[string] = buf()
+        var called: Buf[string] = buf()
         var named: Set[string] = set()
 
         for item in u.calls[i]
             if !named.has(item)
                 named.add(item)
-                callees.push(item)
+                called.push(item)
 
         for item in u.exits[i]
             if abandoning.has(item) && !named.has(item)
                 named.add(item)
-                callees.push(item)
+                called.push(item)
 
-        for item in callees
+        for item in called
             u.edge_index.get(item) match
-                Some(j) -> if j != i then callers[j].push(i)
+                Some(j) -> if j != i then callees[i].push(j)
                 None ->
                     var w = fix[i]
                     var other = u.edge_foreign.get(item).unwrap_or(unseen_edges(item))
@@ -3190,32 +3258,116 @@ private edge_solve(u: *Untouched, abandoning: Set[string]) -> Buf[EdgeWrites]
                     w.join(other)
                     fix[i] = w
 
-    var work: Buf[usize] = buf()
-    var queued: Buf[bool] = buf()
-
-    for i in 0..<u.names.len()
-        work.push(i)
-        queued.push(true)
-
-    loop
-        val next = work.pop()
-
-        if next.is_none() then break
-
-        val j = next.unwrap()
-
-        queued[j] = false
-
-        for c in callers[j]
-            var w = fix[c]
-
-            if w.join(fix[j])
-                fix[c] = w
-
-                if !queued[c]
-                    queued[c] = true
-                    work.push(c)
-    end loop
-
+    edge_scc(&fix, callees)
     fix
 end edge_solve
+
+// Tarjan's components over `callees`, each solved as it is closed -- which is after every component it
+// reaches. `seen` is one past a body's visiting order (0 unvisited), `low` the least order its part of
+// the walk reaches, `comp` its component's number once closed.
+private edge_scc(fix: *Buf[EdgeWrites], callees: Buf[Buf[usize]])
+    val n = callees.len()
+    var seen: Buf[usize] = buf()
+    var low: Buf[usize] = buf()
+    var on: Buf[bool] = buf()
+    var comp: Buf[usize] = buf()
+    var stack: Buf[usize] = buf()
+    var order = 1usize
+    var comps = 1usize
+
+    for i in 0..<n
+        seen.push(0)
+        low.push(0)
+        on.push(false)
+        comp.push(0)
+
+    for root in 0..<n
+        if seen[root] != 0 then continue
+
+        var walk: Buf[(usize, usize)] = buf()
+
+        seen[root] = order
+        low[root] = order
+        order += 1
+        stack.push(root)
+        on[root] = true
+        walk.push((root, 0))
+
+        while !walk.is_empty()
+            val top = walk.len() - 1
+            val v = walk[top].0
+            val k = walk[top].1
+
+            if k < callees[v].len()
+                walk[top] = (v, k + 1)
+
+                val w = callees[v][k]
+
+                if seen[w] == 0
+                    seen[w] = order
+                    low[w] = order
+                    order += 1
+                    stack.push(w)
+                    on[w] = true
+                    walk.push((w, 0))
+                else if on[w] && seen[w] < low[v]
+                    low[v] = seen[w]
+
+                continue
+            end if
+
+            walk.pop()
+
+            if !walk.is_empty()
+                val parent = walk[walk.len() - 1].0
+
+                if low[v] < low[parent] then low[parent] = low[v]
+
+            if low[v] != seen[v] then continue
+
+            var members: Buf[usize] = buf()
+
+            loop
+                val x = stack.pop().unwrap()
+
+                on[x] = false
+                comp[x] = comps
+                members.push(x)
+
+                if x == v then break
+
+            edge_component(fix, callees, comp, comps, members)
+            comps += 1
+        end while
+end edge_scc
+
+// One component's answer: each member's own writes, then everything the component writes and every
+// callee outside it does. A member keeps the first reason it is opaque for its own.
+private edge_component(fix: *Buf[EdgeWrites], callees: Buf[Buf[usize]], comp: Buf[usize], at: usize,
+                       members: Buf[usize])
+    if members.len() == 1
+        val f = members[0]
+        var w = (*fix)[f]
+
+        for j in callees[f]
+            w.join((*fix)[j])
+
+        (*fix)[f] = w
+        return
+    end if
+
+    var all = edge_writes_none()
+
+    for k in 0..<members.len()
+        all.join((*fix)[members[members.len() - 1 - k]])
+
+    for k in 0..<members.len()
+        for j in callees[members[members.len() - 1 - k]]
+            if comp[j] != at then all.join((*fix)[j])
+
+    for f in members
+        var w = (*fix)[f]
+
+        w.join(all)
+        (*fix)[f] = w
+end edge_component

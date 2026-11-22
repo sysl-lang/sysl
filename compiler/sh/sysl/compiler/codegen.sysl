@@ -75,6 +75,10 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
     e.framed_closures = pr.framed_closures
     note_type_shapes(e, p)
 
+    // Which boxes nothing keeps past their frame, which are laid in it (`stack_box.sysl`); their
+    // payloads keep the full header, so they are settled before the compact ones.
+    e.stack = stack_boxes(e, p)
+
     // Which boxes carry the strong count alone, which every box's layout below is read from.
     e.compact = compact_boxes(e, p)
 
@@ -138,6 +142,9 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
     // The functions whose answer a call takes with no count of the callee's (`zero_entry.sysl`),
     // once it is known which parameters cross by address.
     zero_entries(e, p, pr.zero_answers)
+
+    // A factory whose parameter crosses by address has no frame entry, and its calls stay heap boxes.
+    e.stack = drop_unentered(e, p, e.stack)
 
     // The `@ghost` functions of this program, read once: nothing emitted may name one, and a clause
     // that does is dropped whole rather than laid down against a symbol that will not be there.
@@ -230,22 +237,46 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
             set_promoted(e, pr, f.name)
 
             e.main_thread_checks = e.off_main.has(f.name)
+            e.peel = PeelNone
+            e.peel_wanted = false
 
             gen_function(e, f) match
                 Some(built) ->
                     val from = funcs.len()
+                    val peeled = e.peel_wanted
+
+                    e.peel = PeelNone
 
                     for whole in owned_split(e, heading, built, lazy, false, pending)
                         for item in split_disjoint(f, whole)
                             for part in split_self(e, f, item, self_bodies)
                                 funcs.push(part)
 
+                    // A peeled function's owned half, which only its entry's jump calls
+                    // (`emit_func.sysl`'s `peel_shape`).
+                    if peeled
+                        gen_peel_owned(e, f) match
+                            Some(owned) -> funcs.push(owned)
+                            None -> gaps.push((f.name, gap_text(e)))
+                    end if
+
                     if sealable(f, sealing) then note_sealed(funcs, from, asm_lines, &sealed)
-                None -> gaps.push((f.name, gap_text(e)))
+                None ->
+                    e.peel = PeelNone
+                    gaps.push((f.name, gap_text(e)))
 
             // Its +0 entry beside it, where it has one.
             if e.zeros.has(f.name)
                 gen_zero_entry(e, f) match
+                    Some(built) -> funcs.push(built)
+                    None -> gaps.push((f.name, gap_text(e)))
+            end if
+
+            // And its frame entry, where a caller lays the box it answers in its own frame.
+            if e.stack.entries.has(f.name)
+                set_promoted(e, pr, f.name)
+
+                gen_frame_entry(e, f) match
                     Some(built) -> funcs.push(built)
                     None -> gaps.push((f.name, gap_text(e)))
             end if
@@ -254,7 +285,15 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
 
             e.main_thread_checks = e.off_main.has(f.name)
 
-            gen_function(e, f) match
+            // A copy of a precompiled body is never peeled: the artifact's entry names its own owned
+            // half, under the answer the artifact's build gave.
+            e.peel_off = true
+
+            val copied = gen_function(e, f)
+
+            e.peel_off = false
+
+            copied match
                 Some(built) ->
                     if keeps_import(f, built)
                         // An owning function's entry and body are both copies of what the artifact
