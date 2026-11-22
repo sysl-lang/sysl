@@ -1101,7 +1101,7 @@ gen_slice(e: *Emit, base: TExpr, lo: Option[TExpr], hi: Option[TExpr], inclusive
     if short_substring(slice_ty, base)
         val v = gen_expr(e, base)
 
-        return gen_slice_of(e, view_parts(e, v, slice_ty), lo, hi, inclusive, slice_ty, site, true, Some(v))
+        return gen_slice_of(e, str_source_parts(e, v), lo, hi, inclusive, slice_ty, site, true, Some(v))
     end if
 
     gen_slice_of(e, slice_base(e, base, slice_ty), lo, hi, inclusive, slice_ty, site, true)
@@ -1116,9 +1116,12 @@ private short_substring(slice_ty: Type, base: TExpr) -> bool =
 // A temporary promoted for a part of it is this -- the whole array moved into a buffer, and the
 // part narrowed over that buffer.
 gen_slice_of_view(e: *Emit, whole: Val, lo: Option[TExpr], hi: Option[TExpr], inclusive: bool,
-                  slice_ty: Type, site: Span) -> Val =
-    gen_slice_of(e, view_parts(e, whole, slice_ty), lo, hi, inclusive, slice_ty, site, true,
-                 if short_strings_on() && slice_ty == Str then Some(whole) else None)
+                  slice_ty: Type, site: Span) -> Val
+    if short_strings_on() && slice_ty == Str
+        return gen_slice_of(e, str_source_parts(e, whole), lo, hi, inclusive, slice_ty, site, true,
+                            Some(whole))
+
+    gen_slice_of(e, view_parts(e, whole, slice_ty), lo, hi, inclusive, slice_ty, site, true)
 
 // A view taken apart: what keeps its elements alive, where the first is, and how many.
 private view_parts(e: *Emit, whole: Val, ty: Type) -> (Val, Val, Option[Val])
@@ -1143,8 +1146,7 @@ gen_lent_view(e: *Emit, x: TExpr, callee: string, written: Set[string]) -> Val =
             val v = if lent_view(e, base, callee, written) then gen_lent_view(e, base, callee, written)
                     else gen_expr(e, base)
 
-            gen_slice_of(e, view_parts(e, v, texpr_type(base)), lo, hi, inclusive, slice_ty, x.span, false,
-                         Some(v))
+            gen_slice_of(e, str_source_parts(e, v), lo, hi, inclusive, slice_ty, x.span, false, Some(v))
         else
             val parts = if lent_view(e, base, callee, written) then
                 view_parts(e, gen_lent_view(e, base, callee, written), texpr_type(base))
@@ -1277,34 +1279,44 @@ private gen_slice_of(e: *Emit, parts: (Val, Val, Option[Val]), lo: Option[TExpr]
 
     // A substring has to be a string, so both ends must fall between characters. This runs after the
     // bounds checks, which is what makes reading the byte at either end safe.
+    // A source that may be short is read from its words as they stand (`str_source_parts`), so its
+    // boundaries are too.
     if slice_ty == Str
         len match
             Some(l) ->
-                bounds_unless(e, str_boundary(e, first, l, start), "boundary",
-                              bounds_kind(BoundsStartSplitsChar, lo_signed, false), start, zero, l, site)
-                bounds_unless(e, str_boundary(e, first, l, end), "boundary",
-                              bounds_kind(BoundsEndSplitsChar, false, false), zero, end, l, site)
+                val at_start = source match
+                    Some(src) -> str_boundary_words(e, src, l, start)
+                    None -> str_boundary(e, first, l, start)
+
+                bounds_unless(e, at_start, "boundary", bounds_kind(BoundsStartSplitsChar, lo_signed, false),
+                              start, zero, l, site)
+
+                val at_end = source match
+                    Some(src) -> str_boundary_words(e, src, l, end)
+                    None -> str_boundary(e, first, l, end)
+
+                bounds_unless(e, at_end, "boundary", bounds_kind(BoundsEndSplitsChar, false, false), zero,
+                              end, l, site)
             None -> ()
 
-    val p = fresh_reg(e)
+    val stepped = fresh_reg(e)
 
     var idx: Buf[IrArg] = buf()
 
     idx.push(ir_arg(word_lty(e), start))
-    emit(e, InGep(p, stride_lty(e, elem), first, idx))
+    emit(e, InGep(stepped, stride_lty(e, elem), first, idx))
+
+    val p = source match
+        Some(src) -> str_run_ptr(e, src, stepped)
+        None -> stepped
 
     val n = fresh_reg(e)
 
     emit(e, InBin(n, OpSub, word_lty(e), end, start))
 
-    if counted
-        var args: Buf[IrArg] = buf()
-
-        args.push(ir_arg(LPtr, owner))
-        emit(e, ir_call(None, LVoid, VGlobal("arc.retain_maybe"), args))
-
-        e.maybe_heap = true
-        e.heap = true
+    // The share of a source that may be short is taken where the arms meet (below), in the block that
+    // writes the owner into the substring.
+    if counted && source.is_none() then share_owner(e, owner)
 
     val lt = lty(e, slice_ty)
     val with_owner = fresh_reg(e)
@@ -1319,19 +1331,22 @@ private gen_slice_of(e: *Emit, parts: (Val, Val, Option[Val]), lo: Option[TExpr]
 
     emit(e, InInsert(long_view, lt, with_ptr, word_lty(e), n, index_list(2)))
 
-    // **A run of a short string is short itself**: the bytes `p` names are the frame's copy
-    // `str_ptr` spilled, which the substring must not outlive, so the run is moved into the value
-    // instead (`str_short_run`). Its owner is null either way, so the share taken above was nothing.
-    // An empty run is the long form, as an empty string always is.
+    // **A run of a short string is short itself**: its bytes are in the source's words, which have no
+    // address, so the run is moved into the value (`str_short_run`). Its owner is null either way, so
+    // the share taken above was nothing. An empty run is the long form, as an empty string always is,
+    // over the empty constant (`str_run_ptr`).
     //
-    // **The owner is written into the chosen value once more, after the select**: it is null in both
+    // **The owner is written into the chosen value once more, after the arms meet**: it is null in both
     // arms where the source is short, so the value is the same, and the substring is then visibly
     // built by writing the shared owner into its field -- the shape `arc_cover.sysl` follows from the
-    // share to the release that gives it back. Through the select alone it sees no owner at all, and
+    // share to the release that gives it back. Through the meeting alone it sees no owner at all, and
     // a substring taken in a checked loop keeps a count it does not need.
+    //
+    // **The run is made on a branch of its own, not computed and then selected**: a substring of a long
+    // string -- every cut of a long input -- would otherwise pay the run's two-word shift and mask each
+    // time and throw it away. The two arms meet in a slot, which LLVM makes a register again.
     val whole = source match
         Some(src) ->
-            val held = str_short_run(e, src, start, n)
             val some = fresh_reg(e)
 
             emit(e, InIntCmp(some, INe, word_lty(e), n, VInt(from_int(0))))
@@ -1340,9 +1355,26 @@ private gen_slice_of(e: *Emit, parts: (Val, Val, Option[Val]), lo: Option[TExpr]
 
             emit(e, InBin(both, OpAnd, l_i1(), str_is_short(e, src), some))
 
+            val slot = alloca(e, fresh_reg(e), lt)
+            val short_l = fresh_label(e, "run.short")
+            val long_l = fresh_label(e, "run.long")
+            val join_l = fresh_label(e, "run.join")
+
+            emit_term(e, InCondBr(both, short_l, long_l))
+            emit_label(e, short_l)
+            emit(e, InStore(lt, str_short_run(e, src, start, n), slot, AccPlain, None))
+            emit_term(e, InBr(join_l))
+            emit_label(e, long_l)
+            emit(e, InStore(lt, long_view, slot, AccPlain, None))
+            emit_term(e, InBr(join_l))
+            emit_label(e, join_l)
+
             val chosen = fresh_reg(e)
 
-            emit(e, InSelect(chosen, both, lt, held, long_view, l_i1()))
+            emit(e, InLoad(chosen, lt, slot, AccPlain, None))
+
+            // `arc_cover.sysl` pairs a share with the field write that carries it within one block.
+            if counted then share_owner(e, owner)
 
             val r = fresh_reg(e)
 
@@ -1352,6 +1384,17 @@ private gen_slice_of(e: *Emit, parts: (Val, Val, Option[Val]), lo: Option[TExpr]
 
     if counted then own_temp(e, whole, slice_ty) else whole
 end gen_slice_of
+
+// A view's share of what keeps its elements alive.
+private share_owner(e: *Emit, owner: Val)
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(LPtr, owner))
+    emit(e, ir_call(None, LVoid, VGlobal("arc.retain_maybe"), args))
+
+    e.maybe_heap = true
+    e.heap = true
+end share_owner
 
 // What a slice's base gives up: what keeps the elements alive, where the first of them is, and how
 // many there are -- which a `*T` region does not know.
