@@ -4426,7 +4426,11 @@ there**: a place of a parameter (a field, an element of a fixed array or of a he
 built on the spot out of references read from it ("+0"). It keeps the ordinary call where some path
 answers a reference made there, where the body may release or write what it answers, and where no body
 is in sight. So `quad(self) -> Kids = self.kids.unwrap()` costs what `n.kids match Some(q) -> …`
-costs: no count at all. A generic is decided per instance. `--explain-borrows`
+costs: no count at all. A generic is decided per instance. In a program, which sees every closure and
+trait object it makes, a call through a closure or a trait object's table answers what each function
+the program put at that type answers, and is borrowed only where every one of them is; a library, or
+a call through a C function pointer, has no body in sight. Such a function still keeps the ordinary
+call, since the body in the slot is reached through its own ordinary entry. `--explain-borrows`
 ([the CLI](/getting-started/cli/#explain-borrows)) reports each — here for a `Table` whose `find`
 answers `Some(it)` for an element of its `items`, a `look` built on it, and a `drained` that clears
 the buffer after asking:
