@@ -13,8 +13,8 @@ module sh.sysl.compiler
 //
 // The analysis is held to a count of the events its walks make, which does not depend on the machine;
 // the summary to a ratio of processor time (`tests_lgr_linear_growth.sysl`). Beside each, the answers
-// the faster form must keep: every candidate +0 where nothing in its scope cuts its chain, and every one
-// counted where the cut is the last statement of a long scope.
+// the faster form must keep: every candidate +0 where nothing in its scope cuts its chain while it is
+// alive, and every one counted where the cut comes late in a long scope with every local read after it.
 
 import sysl.buf.{Buf, buf}
 import sysl.container.set
@@ -23,7 +23,9 @@ import sysl.container.set
 
 // One body of `n` locals, each read out of `h.leaf` and read through, each statement calling a function
 // that writes nothing. `cut` puts a store to `h.leaf` -- which cuts every local's chain -- before the
-// locals ("before": no scope holds it), after them ("after": every scope does), or nowhere ("").
+// locals ("before": no scope holds it), after them with each read again after it ("after": every local
+// is alive across it), after them with nothing reading them after it ("end":
+// every scope holds it, no local is alive across it), or nowhere ("").
 private pzg_body(n: usize, cut: string) -> string
     var lines: Buf[string] = buf()
 
@@ -36,7 +38,11 @@ private pzg_body(n: usize, cut: string) -> string
     for i in 0..<n
         lines.push(s"    val a$i = h.leaf\n    s += a$i.v + peek(h.other)\n")
 
-    if cut == "after" then lines.push("    h.leaf = Leaf(0)\n")
+    if cut == "after" || cut == "end" then lines.push("    h.leaf = Leaf(0)\n")
+
+    if cut == "after"
+        for i in 0..<n
+            lines.push(s"    s += a$i.v\n")
 
     lines.push("    s\n\nvar got = 0\n\ngot = big(Holder(Leaf(1), Leaf(2)))\n")
 
@@ -78,12 +84,21 @@ pzg_long_body_all_plus0()
     val none = pzg_lowered(pzg_body(400, "after"))
     val all = pzg_lowered(pzg_body(400, ""))
     val early = pzg_lowered(pzg_body(400, "before"))
+    val ended = pzg_lowered(pzg_body(400, "end"))
 
-    // What the rest of the program contributes is the same in all three.
-    assert(all.1 == none.1 + 400, s"+0 locals: ${all.1} uncut, ${none.1} cut at the end")
+    // What the rest of the program contributes is the same in all four.
+    assert(all.1 == none.1 + 400, s"+0 locals: ${all.1} uncut, ${none.1} cut with every local alive")
     assert(early.1 == all.1, s"+0 locals: ${early.1} cut before the locals, ${all.1} uncut")
+    assert(ended.1 == all.1, s"+0 locals: ${ended.1} cut after every last read, ${all.1} uncut")
 
-@test("a cut at the end of a long scope keeps every local of it counted")
+@test("a body cut after every last read makes about as many events as one never cut")
+pzg_cut_after_the_reads_stays_linear()
+    val small = pzg_lowered(pzg_body(50, "end"))
+    val large = pzg_lowered(pzg_body(400, "end"))
+
+    assert(large.0 < 10 * small.0, s"events: ${small.0} at 50 locals, ${large.0} at 400")
+
+@test("a cut every local of a long scope is alive across keeps every one of them counted")
 pzg_cut_at_the_end_counts_them_all()
     val cut = pzg_lowered(pzg_body(400, "after"))
     val few = pzg_lowered(pzg_body(1, "after"))

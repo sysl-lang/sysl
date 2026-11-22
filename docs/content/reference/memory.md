@@ -4406,7 +4406,10 @@ true false
 Keeping such a local is no reason to count it: a `return`, a `break` with it, a `push`, a store, a
 copy into a counted local or a value built from it takes the count where it keeps the value, on that
 path only. **The local keeps its count, for the whole of its life, where its scope may cut the
-chain**: a write to a field it was read along (through any reference), a call to a function that may
+chain while the local may still be read** — in a statement of its block at or before the last one
+that reads it, which a loop coming round or an argument handed on keeps alive throughout. A store that
+statement ends with is not such a cut: `self.current = current.run_task()` reads `current` in the call,
+and the store comes after, so `current` holds no count. The cuts are: a write to a field it was read along (through any reference), a call to a function that may
 write one — however deep — or may read a count of it, a release that may run a destructor, a call
 through a C function pointer, a foreign call the program cannot trust, an `await`, and a write to the
 root itself, or a use of an owned root that could hand its count away. **A program sees every closure

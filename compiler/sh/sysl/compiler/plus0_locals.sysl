@@ -30,14 +30,17 @@ import sysl.ByAddress
 // parameter the body owns -- must also not be used where its count could move (handed to a call,
 // copied into a counted local, matched on): only read through.
 //
-// **Validity** is checked over the candidate's whole scope (its block from the declaration on, an
-// arm, an `if`'s or `while`'s body after its condition): a store or a callee's edge-write summary
-// (`edge_writes`) meeting a key -- a closure or table call is a call to every function its slot can
-// hold where the program sees every table (`table_writes`) --, code nobody can see (a closure or table
-// call in a library, a function value, a foreign call not trusted, a suspension, a destructor -- any
-// value in the scope whose release may run one, `drops`), a slot form that reads a count of a chain type, and the root written or used where its
-// count could move. One kill anywhere in the scope keeps the count -- a local is +0 for the whole of
-// its life or not at all (decision 5), so no merge of differently-counted values is ever needed.
+// **Validity** is checked over the stretch of the candidate's scope (its block from the declaration on,
+// an arm, an `if`'s or `while`'s body after its condition) where it is alive (`live_end`): a store or a
+// callee's edge-write summary (`edge_writes`) meeting a key -- a closure or table call is a call to
+// every function its slot can hold where the program sees every table (`table_writes`) --, code nobody
+// can see (a closure or table call in a library, a function value, a foreign call not trusted, a
+// suspension, a destructor -- any value in the scope whose release may run one, `drops`), a slot form
+// that reads a count of a chain type, and the root written or used where its count could move. One
+// kill while it is alive keeps the count -- a local is +0 for the whole of its life or not at all
+// (decision 5), so no merge of differently-counted values is ever needed. A kill after its last read
+// cuts nothing it still needs: Richards' `self.current = current.run_task()` reads `current` in the
+// call and stores after it.
 //
 // **Keeping** a +0 value takes the count where it is kept (decision 6): a store, `return`, `break`,
 // a copy into a counted local, an owned argument, a value built from it -- each goes through
@@ -308,6 +311,8 @@ plus0_locals(e: *Emit, f: TFunc, owned: Set[string], jumps: bool, rewritten: Set
     val drops = drop_memo(e)
     var scoped: Buf[Option[Scoped]] = buf()
     var extras: Buf[Buf[Event]] = buf()
+    var ends: Buf[usize] = buf()
+    val total = loads_of(f, g, drops)
 
     for k in 0..<g.lists.len()
         scoped.push(None)
@@ -318,7 +323,10 @@ plus0_locals(e: *Emit, f: TFunc, owned: Set[string], jumps: bool, rewritten: Set
         if alive[i] && scoped[c.list].is_none()
             scoped[c.list] = Some(scope_list(e, g, drops, c.list, aliases, params, tops))
 
-        extras.push(if alive[i] then extra_events(e, g, drops, c.extra, aliases, params, tops) else buf())
+        val extra = if alive[i] then extra_events(e, g, drops, c, aliases, params, tops) else (buf(), 0)
+
+        extras.push(extra.0)
+        ends.push(if alive[i] then live_end(scoped[c.list].unwrap(), c, total, extra.1) else 0)
 
     val parts = parts_memo()
 
@@ -340,8 +348,8 @@ plus0_locals(e: *Emit, f: TFunc, owned: Set[string], jumps: bool, rewritten: Set
         for i in 0..<g.cands.len()
             if !alive[i] then continue
 
-            var said = refusal(e, g, alive, backs, scoped[g.cands[i].list].unwrap(), extras[i], parts, params,
-                               owned, tops, i)
+            var said = refusal(e, g, alive, backs, scoped[g.cands[i].list].unwrap(), ends[i], extras[i], parts,
+                               params, owned, tops, i)
 
             if said == "" && rewritten.has(g.cands[i].name) then said = local_root(backs[i], params)
 
@@ -663,12 +671,23 @@ private unroot_stmt(out: &NameSink, s: TStmt) = s match
 // -- what a scope can do to a chain -----------------------------------------------------------------
 
 // The nodes a walk has met, found by identity: a load read through or stored to (`benign`), and the
-// value of a candidate's definition (`defs`).
+// value of a candidate's definition (`defs`). Where a candidate is read: the statement of the list the
+// walk is in (`stmt`) of each candidate's last load, and how many loads it has met. `armed` asks the
+// next store to say which event is its own (`top`): the store a statement of the list is.
 private struct EventSink
     events: Buf[Event]
     benign: Set[ByAddress[TExprKind]]
     defs: Map[ByAddress[TExprKind], string]
     drops: &DropMemo
+    stmt: usize
+    uses_last: Map[string, usize]
+    uses: Map[string, usize]
+    armed: bool
+    top: Option[usize]
+
+    used(*self, name: string)
+        self.uses_last.put(name, self.stmt)
+        self.uses.put(name, self.uses.get(name).unwrap_or(0) + 1)
 
     mark(*self, k: &TExprKind)
         self.benign.add(ByAddress(k))
@@ -683,7 +702,7 @@ private struct EventSink
     def_of(self, k: &TExprKind) -> string = self.defs.get(ByAddress(k)).unwrap_or("")
 end EventSink
 
-private event_sink(drops: &DropMemo) -> &EventSink = EventSink(buf(), set(), map(), drops)
+private event_sink(drops: &DropMemo) -> &EventSink = EventSink(buf(), set(), map(), drops, 0, map(), map(), false, None)
 
 // **Whether letting go of a value of a type may run a destructor, once per type** (`drops`, which
 // opens a trait object or closure into what the program erased into it where it sees every table): a
@@ -725,29 +744,80 @@ end PartsMemo
 
 private parts_memo() -> &PartsMemo = PartsMemo(map())
 
+// Where in a list's events each of a few named things occurs, in order (`at[slot[name]]`).
+private struct Occurs
+    slot: Map[string, usize]
+    at: Buf[Buf[usize]]
+
+    note(*self, name: string, j: usize)
+        self.slot.get(name) match
+            Some(i) -> self.at[i].push(j)
+            None ->
+                var one: Buf[usize] = buf()
+
+                one.push(j)
+                self.slot.put(name, self.at.len())
+                self.at.push(one)
+
+    // Whether `name` occurs at an event in `lo..<hi`.
+    between(self, name: string, lo: usize, hi: usize) -> bool = self.slot.get(name) match
+        Some(i) -> any_between(self.at[i], lo, hi)
+        None -> false
+end Occurs
+
+private occurs() -> Occurs = Occurs(map(), buf())
+
+// Whether the ascending `xs` holds a value in `lo..<hi`.
+private any_between(xs: Buf[usize], lo: usize, hi: usize) -> bool
+    var a: usize = 0
+    var b = xs.len()
+
+    while a < b
+        val m = a + (b - a) / 2
+
+        if xs[m] < lo then a = m + 1 else b = m
+
+    a < xs.len() && xs[a] < hi
+end any_between
+
 // **One statement list's events, walked once for every candidate whose scope is a suffix of it**, with
 // where each statement's begin (`starts`, then the result's), and for each thing that refuses a
-// candidate the last event that does it, one past, so that whether a suffix holds one is a comparison:
-// code nobody can see (`opaque_last`), an edge key named, a type written through a pointer or whose
-// count is read, a root written, a root used where its count may move, and the uses that are the value
-// of a candidate's definition (`defs_*`, a chain newest first), harmless while that candidate is +0.
+// candidate the events that do it, in order, so that whether a candidate's live stretch holds one is a
+// search: code nobody can see (`opaque_at`), an edge key named, a type written through a pointer or
+// whose count is read, a root written, a root used where its count may move, and the uses that are the
+// value of a candidate's definition (`defs_*`, a chain newest first), harmless while that candidate is
+// +0. Where each candidate is last read (`uses_last`, a statement's index, the statement count for the
+// result) and how often (`uses`), and the statements that are a plain store (`stored`), whose own event
+// is moved to the statement's end: the store happens once its place and value are computed.
 private struct Scoped
     events: Buf[Event]
     starts: Buf[usize]
-    opaque_last: usize
-    keys_last: Map[string, usize]
+    stored: Buf[bool]
+    uses_last: Map[string, usize]
+    uses: Map[string, usize]
+    opaque_at: Buf[usize]
+    keys: Occurs
     within: Buf[Type]
-    within_at: TypeIndex
-    within_last: Buf[usize]
+    within_ix: TypeIndex
+    within_at: Buf[Buf[usize]]
     counts: Buf[Type]
-    counts_at: TypeIndex
-    counts_last: Buf[usize]
-    written_last: Map[string, usize]
-    used_last: Map[string, usize]
+    counts_ix: TypeIndex
+    counts_at: Buf[Buf[usize]]
+    written: Occurs
+    used: Occurs
     defs_first: Map[string, usize]
     defs_next: Buf[usize]
     defs_event: Buf[usize]
 end Scoped
+
+// A statement that is one plain store, with no operator or invariant to call after it: the last thing
+// it does is the store.
+private plain_store(s: TStmt) -> bool = s match
+    TWriteStmt(w) -> w.op == "=" && w.dispatch.is_none() && w.check.is_empty()
+    TExprStmt(x) -> *x.kind match
+        TStore(_, _, _, _) -> true
+        _ -> false
+    _ -> false
 
 private scope_list(e: *Emit, g: &Gather, drops: &DropMemo, id: usize, aliases: Set[string], params: Set[string],
                    tops: Set[string]) -> Scoped
@@ -755,27 +825,47 @@ private scope_list(e: *Emit, g: &Gather, drops: &DropMemo, id: usize, aliases: S
     val walk = event_walk(e, g, sink, aliases, params, tops)
     val stmts = g.lists[id]
     var starts: Buf[usize] = buf()
+    var stored: Buf[bool] = buf()
 
-    for s in stmts
-        starts.push(sink.events.len())
-        walk_stmt(s, walk)
+    for k in 0..<stmts.len()
+        val begin = sink.events.len()
+
+        starts.push(begin)
+        sink.stmt = k
+        sink.armed = plain_store(stmts[k])
+        sink.top = None
+        walk_stmt(stmts[k], walk)
+        sink.armed = false
+
+        // The store's own event goes last among its statement's: what its place and value read is read
+        // before it, so a candidate last read there is not alive across it.
+        sink.top match
+            Some(j) ->
+                val ev = sink.events[j]
+
+                for t in j..<sink.events.len() - 1
+                    sink.events[t] = sink.events[t + 1]
+
+                sink.events[sink.events.len() - 1] = ev
+                stored.push(true)
+            None -> stored.push(false)
 
     starts.push(sink.events.len())
+    sink.stmt = stmts.len()
 
     if g.results[id].is_some() then walk_texpr(g.results[id].unwrap(), walk)
 
     pzl_events_made += sink.events.len()
 
-    var out = Scoped(sink.events, starts, 0, map(), buf(), type_index(), buf(), buf(), type_index(), buf(), map(),
-                     map(), map(), buf(), buf())
+    var out = Scoped(sink.events, starts, stored, sink.uses_last, sink.uses, buf(), occurs(), buf(), type_index(),
+                     buf(), buf(), type_index(), buf(), occurs(), occurs(), map(), buf(), buf())
 
     for j in 0..<out.events.len()
         val ev = out.events[j]
-        val past = j + 1
 
         if ev.root != ""
-            if ev.written then out.written_last.put(ev.root, past)
-            else if ev.def_of == "" then out.used_last.put(ev.root, past)
+            if ev.written then out.written.note(ev.root, j)
+            else if ev.def_of == "" then out.used.note(ev.root, j)
             else
                 out.defs_next.push(out.defs_first.get(ev.root).unwrap_or(0))
                 out.defs_event.push(j)
@@ -785,49 +875,88 @@ private scope_list(e: *Emit, g: &Gather, drops: &DropMemo, id: usize, aliases: S
             continue
         end if
 
-        if ev.w.opaque != "" then out.opaque_last = past
+        if ev.w.opaque != "" then out.opaque_at.push(j)
 
         for k in ev.w.keys
-            out.keys_last.put(k.text, past)
+            out.keys.note(k.text, j)
 
         for i in 0..<ev.w.within.len()
-            last_at(&out.within, &out.within_at, &out.within_last, ev.w.within[i], ev.w.within_at.spelled[i], past)
+            occurs_at(&out.within, &out.within_ix, &out.within_at, ev.w.within[i], ev.w.within_at.spelled[i], j)
 
         for i in 0..<ev.w.counts.len()
-            last_at(&out.counts, &out.counts_at, &out.counts_last, ev.w.counts[i], ev.w.counts_at.spelled[i], past)
+            occurs_at(&out.counts, &out.counts_ix, &out.counts_at, ev.w.counts[i], ev.w.counts_at.spelled[i], j)
 
     out
 end scope_list
 
-// Records that the event one before `past` names `t`.
-private last_at(items: *Buf[Type], at: *TypeIndex, last: *Buf[usize], t: Type, spelling: string, past: usize)
-    at.find(*items, t, spelling) match
-        Some(i) -> (*last)[i] = past
+// Records that event `j` names `t`.
+private occurs_at(items: *Buf[Type], ix: *TypeIndex, at: *Buf[Buf[usize]], t: Type, spelling: string, j: usize)
+    ix.find(*items, t, spelling) match
+        Some(i) -> (*at)[i].push(j)
         None ->
-            at.add(spelling, items.len())
-            items.push(t)
-            last.push(past)
+            var one: Buf[usize] = buf()
 
-// Whether an event at or after `from` names `t` (`last` as `last_at` keeps it).
-private named_since(items: Buf[Type], at: TypeIndex, last: Buf[usize], t: Type, from: usize) -> bool =
-    at.find(items, t, mangle(t)) match
-        Some(i) -> last[i] > from
+            one.push(j)
+            ix.add(spelling, items.len())
+            items.push(t)
+            at.push(one)
+
+// Whether an event in `lo..<hi` names `t` (`at` as `occurs_at` keeps it).
+private named_between(items: Buf[Type], ix: TypeIndex, at: Buf[Buf[usize]], t: Type, lo: usize, hi: usize) -> bool =
+    ix.find(items, t, mangle(t)) match
+        Some(i) -> any_between(at[i], lo, hi)
         None -> false
 
-// A candidate's own expressions' events.
-private extra_events(e: *Emit, g: &Gather, drops: &DropMemo, exprs: Buf[TExpr], aliases: Set[string],
-                     params: Set[string], tops: Set[string]) -> Buf[Event]
-    if exprs.is_empty() then return buf()
+// **The end of the stretch of a list's events where candidate `c` is alive** (decision 5, as
+// borrow-inference.md §4.1 has it: a kill counts only while the local may still be read). Statements run
+// in order and a statement's events are all in it, so a kill in a statement after the last one that
+// reads `c` cuts nothing `c` still needs. A statement that reads it is alive throughout -- a loop in
+// it may come round to the read again, and what a read hands on (an argument, a temporary) lives as
+// long as the statement -- except a plain store's own event, moved to its end. Where `c` is read
+// outside its list and its own expressions as well (`total`), it is alive to the end.
+private live_end(s: Scoped, c: Cand, total: Map[string, usize], extra_uses: usize) -> usize
+    val all = s.events.len()
+    val here = s.uses.get(c.name).unwrap_or(0)
+
+    if here + extra_uses != total.get(c.name).unwrap_or(0) then return all
+
+    val n = s.stored.len()
+
+    s.uses_last.get(c.name) match
+        None -> s.starts[c.from]
+        Some(k) ->
+            if k >= n then all
+            else if k < c.from then s.starts[c.from]
+            else if s.stored[k] then s.starts[k + 1] - 1
+            else s.starts[k + 1]
+end live_end
+
+// A candidate's own expressions' events, and how often they read it.
+private extra_events(e: *Emit, g: &Gather, drops: &DropMemo, c: Cand, aliases: Set[string], params: Set[string],
+                     tops: Set[string]) -> (Buf[Event], usize)
+    if c.extra.is_empty() then return (buf(), 0)
 
     val sink = event_sink(drops)
     val walk = event_walk(e, g, sink, aliases, params, tops)
 
-    for x in exprs
+    for x in c.extra
         walk_texpr(x, walk)
 
     pzl_events_made += sink.events.len()
-    sink.events
+    (sink.events, sink.uses.get(c.name).unwrap_or(0))
 end extra_events
+
+// How often the body reads each candidate.
+private loads_of(f: TFunc, g: &Gather, drops: &DropMemo) -> Map[string, usize]
+    val sink = event_sink(drops)
+
+    walk_block_stmts(f.body, expr_walk(true, x -> count_load(g, sink, x)))
+    sink.uses
+end loads_of
+
+private count_load(g: &Gather, sink: &EventSink, x: TExpr) = *x.kind match
+    TLoad(name, _) -> if g.index.has(name) then sink.used(name)
+    _ -> ()
 
 private event_walk(e: *Emit, g: &Gather, sink: &EventSink, aliases: Set[string], params: Set[string],
                    tops: Set[string]) -> &TWalk =
@@ -869,6 +998,11 @@ end event_write
 // death where the local is one. Anywhere else, the edges `note_store` names.
 private event_store(e: *Emit, g: &Gather, sink: &EventSink, aliases: Set[string], params: Set[string],
                     tops: Set[string], place: TExpr, value: TExpr)
+    // The first store a statement that is one store meets is that store (the walk is outermost first).
+    val top = sink.armed
+
+    sink.armed = false
+
     *place.kind match
         TLoad(name, _) ->
             sink.mark(place.kind)
@@ -879,7 +1013,9 @@ private event_store(e: *Emit, g: &Gather, sink: &EventSink, aliases: Set[string]
     if own_base(place, aliases)
         place_base(place) match
             Some(name) ->
-                if root_name(name, params, tops) then
+                if root_name(name, params, tops)
+                    if top then sink.top = Some(sink.events.len())
+
                     sink.events.push(Event(edge_writes_none(), name, true, "", s"the root '${shown(name)}' is written",
                                            place.span))
             None -> ()
@@ -892,6 +1028,8 @@ private event_store(e: *Emit, g: &Gather, sink: &EventSink, aliases: Set[string]
     note_store(es, aliases, place)
 
     val w = edge_finish(es.w, e.untouched.edge_casts)
+
+    if top then sink.top = Some(sink.events.len())
 
     sink.events.push(Event(w, "", false, "", "a store", place.span))
 end event_store
@@ -916,6 +1054,8 @@ private event_node(e: *Emit, g: &Gather, sink: &EventSink, aliases: Set[string],
         TField(r, _, _) -> mark_load(sink, r)
         TDeref(r, _) -> mark_load(sink, r)
         TLoad(name, _) ->
+            if g.index.has(name) then sink.used(name)
+
             if root_name(name, params, tops) && !sink.is_benign(x.kind)
                 sink.events.push(Event(edge_writes_none(), name, false, sink.def_of(x.kind),
                                        s"'${shown(name)}' is used where its count may move", x.span))
@@ -1060,7 +1200,7 @@ end built_back
 // Why candidate `i` must keep its count, or empty where it need not. **Whether it must is answered from
 // the list's last events** (`Scoped`), in time for the roots and keys of its backing whatever the length
 // of its scope; the event that does it is looked for in order only where the report names it.
-private refusal(e: *Emit, g: &Gather, alive: Buf[bool], backs: Buf[Option[Back]], scoped: Scoped,
+private refusal(e: *Emit, g: &Gather, alive: Buf[bool], backs: Buf[Option[Back]], scoped: Scoped, upto: usize,
                 extra: Buf[Event], parts: &PartsMemo, params: Set[string], owned: Set[string], tops: Set[string],
                 i: usize) -> string
     val c = g.cands[i]
@@ -1069,24 +1209,24 @@ private refusal(e: *Emit, g: &Gather, alive: Buf[bool], backs: Buf[Option[Back]]
 
     val b = backs[i].unwrap()
 
-    if !refused_since(g, alive, b, scoped, scoped.starts[c.from], parts, owned, tops) &&
+    if !refused_between(g, alive, b, scoped, scoped.starts[c.from], upto, parts, owned, tops) &&
        first_refusal(e, g, alive, b, extra, owned, tops) == "" then
         return ""
 
     if !explaining_borrows() then return "counted"
 
-    // The scope in order: the list's statements from the candidate's on, its own expressions, the
-    // list's result.
+    // The live stretch in order: the list's statements from the candidate's on, its own expressions,
+    // the list's result -- each as far as `upto`.
     var events: Buf[Event] = buf()
     val result_at = scoped.starts[scoped.starts.len() - 1]
 
-    for j in scoped.starts[c.from]..<result_at
+    for j in scoped.starts[c.from]..<(if upto < result_at then upto else result_at)
         events.push(scoped.events[j])
 
     for ev in extra
         events.push(ev)
 
-    for j in result_at..<scoped.events.len()
+    for j in result_at..<(if upto > result_at then upto else result_at)
         events.push(scoped.events[j])
 
     val said = first_refusal(e, g, alive, b, events, owned, tops)
@@ -1094,39 +1234,42 @@ private refusal(e: *Emit, g: &Gather, alive: Buf[bool], backs: Buf[Option[Back]]
     if said == "" then "counted" else said
 end refusal
 
-// Whether an event of the list at or after `from` refuses a candidate backed by `b`: the event-for-event
-// test of `first_refusal`, asked of the list's last events.
-private refused_since(g: &Gather, alive: Buf[bool], b: Back, s: Scoped, from: usize, parts: &PartsMemo,
-                      owned: Set[string], tops: Set[string]) -> bool
+// Whether an event of the list in `from..<upto` refuses a candidate backed by `b`: the event-for-event
+// test of `first_refusal`, asked of where the list's events occur.
+private refused_between(g: &Gather, alive: Buf[bool], b: Back, s: Scoped, from: usize, upto: usize,
+                        parts: &PartsMemo, owned: Set[string], tops: Set[string]) -> bool
+    if upto <= from then return false
+
     for r in b.roots
-        if s.written_last.get(r).unwrap_or(0) > from then return true
+        if s.written.between(r, from, upto) then return true
 
         if tops.has(r) || owned.has(r)
-            if s.used_last.get(r).unwrap_or(0) > from then return true
+            if s.used.between(r, from, upto) then return true
 
             var at = s.defs_first.get(r).unwrap_or(0)
 
             while at > 0 && s.defs_event[at - 1] >= from
-                val d = s.events[s.defs_event[at - 1]].def_of
+                if s.defs_event[at - 1] < upto
+                    val d = s.events[s.defs_event[at - 1]].def_of
 
-                if !g.index.get(d).map(j -> alive[j]).unwrap_or(false) then return true
+                    if !g.index.get(d).map(j -> alive[j]).unwrap_or(false) then return true
 
                 at = s.defs_next[at - 1]
 
-    if s.opaque_last > from then return true
+    if any_between(s.opaque_at, from, upto) then return true
 
     for k in b.keys
-        if s.keys_last.get(k.text).unwrap_or(0) > from then return true
+        if s.keys.between(k.text, from, upto) then return true
 
         for p in parts.of(k)
-            if named_since(s.within, s.within_at, s.within_last, p, from) then return true
+            if named_between(s.within, s.within_ix, s.within_at, p, from, upto) then return true
 
-        if named_since(s.counts, s.counts_at, s.counts_last, k.owner, from) ||
-           named_since(s.counts, s.counts_at, s.counts_last, underlying(k.held), from) then
+        if named_between(s.counts, s.counts_ix, s.counts_at, k.owner, from, upto) ||
+           named_between(s.counts, s.counts_ix, s.counts_at, underlying(k.held), from, upto) then
             return true
 
     false
-end refused_since
+end refused_between
 
 // The first of `events` that refuses a candidate backed by `b`, as the report names it, or empty.
 private first_refusal(e: *Emit, g: &Gather, alive: Buf[bool], b: Back, events: Buf[Event], owned: Set[string],
