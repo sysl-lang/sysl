@@ -745,11 +745,22 @@ private sub_patterns(cx: &Analyzer, args: Buf[Pattern], fields: Buf[(string, Typ
     out
 end sub_patterns
 
-// Whether the name a pattern wrote is the struct the value turned out to be.
-private names_this_type(cx: &Analyzer, written: string, d: &StructType) -> bool
+// Whether the name a pattern wrote is the struct the value turned out to be -- in a `match` arm here,
+// and in a binding's destructuring (`stmt_bind.sysl`), which asks the same question.
+//
+// **An alias is another spelling of what it names** (`reference/types.md § Type aliases`), so `P(a, b)`
+// over `type P = Point` matches a `Point`. An alias names one instantiation, which is what it matches:
+// `G3(x)` over `type G3 = G[3]` matches a `G[3]` and is refused against a `G[4]`, as the type `G3`
+// would be.
+private[compiler] names_this_type(cx: &Analyzer, written: string, d: &StructType) -> bool
     val key = lookup_type_key(cx.an, cx.scope, written)
 
-    key.is_some() && key.unwrap() == d.base
+    if key.is_none() then return false
+    if key.unwrap() == d.base then return true
+
+    cx.an.tables.constrained_insts.get(key.unwrap()) match
+        Some(Struct(named)) -> type_eq(Struct(named), Struct(d))
+        _ -> false
 end names_this_type
 
 // Every field of a positional form has to be visible, since naming them all is reading them all.
