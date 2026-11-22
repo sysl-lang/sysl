@@ -208,16 +208,23 @@ str_lent_to_c(e: *Emit, v: Val) -> Val
     r
 end str_lent_to_c
 
-// **A string handed to a parameter an `extern`'s `@keeps` names** (`emit_foreign.sysl`'s `to_c`): a
-// short one is copied into a `StrBuf`, whose one count goes to C with it, so C may hold the string
-// past the call and hand it back -- a string an `extern` answers is owned by the caller, which then
-// gives that count back. A long one crosses as it always has, its count untouched.
+// **A string handed to a parameter an `extern`'s `@keeps` names** (`emit_foreign.sysl`'s `to_c`):
+// C is given one count of what it holds, whatever form the string is in, so it may read the string
+// past the call for as long as it holds it, and hand it back -- a string an `extern` answers is owned
+// by the caller, which gives that count back (`reference/ffi.md § @keeps`, decision D-SS1-4). A short
+// one is copied into a `StrBuf`, whose one count is C's; a long one has a share taken, as
+// `sysl.str.unshort` does for a kept view; a literal's null owner counts nothing and lives for ever.
+// Where the short form is off, every string is long and only the share is taken.
 str_kept_for_c(e: *Emit, v: Val) -> Val
+    if !short_strings_on()
+        retain_value(e, Str, v)
+        return v
+
     e.heap = true
     e.maybe_heap = true
 
     val st = lty(e, Str)
-    val fn = request_text(e, "sysl.str.for_c", str_for_c_text(e, str_llvm(e)))
+    val fn = request_text(e, "sysl.str.unshort", str_unshort_text(e, str_llvm(e)))
     val r = fresh_reg(e)
 
     var args: Buf[IrArg] = buf()
@@ -226,32 +233,6 @@ str_kept_for_c(e: *Emit, v: Val) -> Val
     emit(e, ir_call(Some(r), st, VGlobal(fn), args))
     r
 end str_kept_for_c
-
-// **`sysl.str.for_c`**, the copy `str_kept_for_c` makes: a short string's bytes in a `StrBuf` of
-// their own, and a long string as it is.
-private str_for_c_text(e: *Emit, str: string) -> string
-    val word = s"i${e.word_bits}"
-
-    request_text(e, "sysl.str.heap", str_heap_text(e, str))
-
-    val read = str_read_text(str, e.word_bits, "%s")
-    val p = str_ptr_text(str, "%s")
-    val n = str_len_text(str, e.word_bits, "%s")
-
-    s"""
-    define private $str @sysl.str.for_c($str %s) {
-    entry:
-    ${read}  br i1 %s.sh, label %copy, label %keep
-    copy:
-      %from = $p
-      %n = $n
-      %made = call $str @sysl.str.heap(ptr %from, $word %n)
-      ret $str %made
-    keep:
-      ret $str %s
-    }
-    """
-end str_for_c_text
 
 // The string whose bytes `x` reads, where `x` is `s.bytes` and the short form is on: a read that only
 // lends them for one operation takes them from the string directly (`str_data`), so it neither
