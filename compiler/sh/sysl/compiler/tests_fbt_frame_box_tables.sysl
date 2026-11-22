@@ -115,6 +115,11 @@ private fbt_lines_with(ir: string, part: string) -> int
     n
 end fbt_lines_with
 
+// The boxes laid in a frame: an alloca of a box's whole shape, less the copy of a by-value receiver a
+// table's adapter stages (`%self.object`), which is no box of the program's.
+private fbt_frame_boxes(ir: string) -> int =
+    fbt_lines_with(ir, "= alloca %arc.") - fbt_lines_with(ir, "%self.object = alloca %arc.")
+
 // -- the cells that stay in the frame ---------------------------------------------------------------
 
 private const fbt_trait_reads: string = raw"""
@@ -245,7 +250,7 @@ fbt_table_call_is_an_alloca()
     val ir = fbt_ir(fbt_trait_reads)
 
     assert_eq(fbt_lines_with(ir, "call ptr @malloc"), 0)
-    assert_eq(fbt_lines_with(ir, "= alloca %arc."), 2)
+    assert_eq(fbt_frame_boxes(ir), 2)
 end fbt_table_call_is_an_alloca
 
 // -- the ways out, each on the heap ------------------------------------------------------------------
@@ -316,10 +321,14 @@ private const fbt_closure_keeps: string = raw"""
 
     apply(f: &Fn(@keeps &Point) -> int, p: &Point) -> int = f(p)
 
+    keep(q: &Point) -> int
+        kept = Some(q)
+        q.x
+
     main()
         val p: &Point = Point(6)
 
-        print(apply(q -> { kept = Some(q); q.x }, p))
+        print(apply(q -> keep(q), p))
         kept = None
     """
 
@@ -402,7 +411,7 @@ fbt_generic_trait_at_two_arguments()
     val ir = fbt_ir(fbt_generic)
 
     // `Look`, `Point` and `Keep` in the frame; `Acc` on the heap.
-    assert_eq(fbt_lines_with(ir, "= alloca %arc."), 3)
+    assert_eq(fbt_frame_boxes(ir), 3)
     assert_eq(fbt_lines_with(ir, "call ptr @malloc"), 1)
 end fbt_generic_trait_at_two_arguments
 
@@ -464,7 +473,7 @@ fbt_library_build_stays_on_the_heap()
     var p = fbt_program(text)
     val closed = codegen_text(p, host_target())
 
-    assert_eq(fbt_lines_with(closed, "= alloca %arc."), 2)
+    assert_eq(fbt_frame_boxes(closed), 2)
 
     p.entry_point = false
 
@@ -472,5 +481,5 @@ fbt_library_build_stays_on_the_heap()
 
     // Both the receiver and the argument are handed through the table, which a library cannot see all
     // of: both go back to the heap.
-    assert_eq(fbt_lines_with(open, "= alloca %arc."), 0)
+    assert_eq(fbt_frame_boxes(open), 0)
 end fbt_library_build_stays_on_the_heap
