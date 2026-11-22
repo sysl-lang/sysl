@@ -46,7 +46,10 @@ import sysl.container.{Map, map, Set, set}
 //
 // **An aggregate holding the box once** -- a closure capturing it -- is followed too: it may be lent
 // to a callee, and its `arc.copy.<T>` / `arc.dispose.<T>` stay, counted as shares of the box that are
-// given back at run time. Every one of them must be given back before the box's last share is. A place entry's answer (`place_entry.sysl`) is an address inside
+// given back at run time. Every one of them must be given back before the box's last share is. **A
+// trait object or a closure is such an aggregate**: its two words may be stored in a slot of the frame
+// that holds nothing else (`HeldAggSlot`), loaded, and taken apart, the word the box sits in
+// (`Holders.boxed`) being the box itself -- so one held in a local and called through is counted. A place entry's answer (`place_entry.sysl`) is an address inside
 // the box or the holder itself, so it may be read and written through, but no address may be read out
 // of it or written into it.
 //
@@ -77,6 +80,14 @@ private enum Held
     HeldPlace
     HeldMaybe
     HeldAgg
+    HeldAggSlot
+
+// What holds the box, and where in each aggregate (and each slot of the frame holding one) the box
+// sits, as the indices `extractvalue` takes (`path_of`).
+private struct Holders
+    held: Map[string, Held]
+    boxed: Map[string, string]
+end Holders
 
 // What one instruction does to the box's count. A kept step is an `arc.copy.<T>` or `arc.dispose.<T>`
 // of an aggregate holding the box once -- a closure's captures -- which shares the box along with
@@ -113,8 +124,8 @@ drop_frame_counts(e: *Emit, blocks: Buf[IrBlock]) -> Buf[IrBlock]
 end drop_frame_counts
 
 private uncounted(e: *Emit, blocks: Buf[IrBlock], root: FrameRoot) -> Option[Buf[IrBlock]]
-    val held = frame_holders(blocks, root, e.fresh_answers, e.table_calls)
-    val uses = frame_uses(e, blocks, root, held)?
+    val holders = frame_holders(blocks, root, e.fresh_answers, e.table_calls)
+    val uses = frame_uses(e, blocks, root, holders.held, holders.boxed)?
     val finals = frame_finals(blocks, uses)?
 
     // A kept share lands on the count at run time, so the header must be there to take it.
@@ -190,7 +201,7 @@ private carries_address(t: LType) -> bool = t match
 // load of such a slot, a frame entry's answer, a place entry's answer and what is reached from it, and
 // the answer of any other call it was handed that can carry an address.
 private frame_holders(blocks: Buf[IrBlock], root: FrameRoot, fresh: Set[string],
-                      calls: Map[string, Buf[TableArg]]) -> Map[string, Held]
+                      calls: Map[string, Buf[TableArg]]) -> Holders
     var slots: Set[string] = set()
 
     for b in blocks
@@ -200,6 +211,7 @@ private frame_holders(blocks: Buf[IrBlock], root: FrameRoot, fresh: Set[string],
                 _ -> ()
 
     var held: Map[string, Held] = map()
+    var boxed: Map[string, string] = map()
 
     held.put(root.slot, HeldBox)
 
@@ -208,10 +220,11 @@ private frame_holders(blocks: Buf[IrBlock], root: FrameRoot, fresh: Set[string],
 
         for b in blocks
             for inst in b.instrs
-                held_by(inst, held, root, slots, fresh, calls) match
+                held_by(inst, held, boxed, root, slots, fresh, calls) match
                     Some(found) ->
                         if !held.has(found.0)
                             held.put(found.0, found.1)
+                            if found.1 == HeldAgg || found.1 == HeldAggSlot then boxed.put(found.0, found.2)
                             grew = true
                         end if
                     None -> ()
@@ -220,22 +233,53 @@ private frame_holders(blocks: Buf[IrBlock], root: FrameRoot, fresh: Set[string],
         if !grew then break
     end loop
 
-    held
+    Holders(held, boxed)
 end frame_holders
 
-private held_by(inst: Inst, held: Map[string, Held], root: FrameRoot, slots: Set[string],
-                fresh: Set[string], calls: Map[string, Buf[TableArg]]) -> Option[(string, Held)]
+// The indices of an `extractvalue` or `insertvalue`, as one key: `1.` for `1`, `0.2.` for `0, 2`.
+private path_of(idx: Buf[int]) -> string
+    var s = ""
+
+    for k in idx
+        s = s"$s$k."
+
+    s
+end path_of
+
+// Where the box sits in an aggregate or a slot holding one.
+private boxed_at(boxed: Map[string, string], v: Val) -> string = boxed.get(v_render(v)).unwrap_or("")
+
+private held_by(inst: Inst, held: Map[string, Held], boxed: Map[string, string], root: FrameRoot,
+                slots: Set[string], fresh: Set[string],
+                calls: Map[string, Buf[TableArg]]) -> Option[(string, Held, string)]
     inst match
         InStore(_, v, p, _, _) ->
-            if is_held(held, v, HeldBox) && slots.has(v_render(p)) then return Some((v_render(p), HeldSlot))
-        InLoad(d, _, p, _, _) -> if is_held(held, p, HeldSlot) then return Some((v_render(d), HeldBox))
-        InGep(d, _, p, _) -> if is_held(held, p, HeldPlace) then return Some((v_render(d), HeldPlace))
-        InGepInBounds(d, _, p, _) -> if is_held(held, p, HeldPlace) then return Some((v_render(d), HeldPlace))
-        InInsert(d, _, agg, _, v, _) ->
-            if is_held(held, v, HeldBox) || is_held(held, agg, HeldAgg) then return Some((v_render(d), HeldAgg))
+            if !slots.has(v_render(p)) then return None
+            if is_held(held, v, HeldBox) then return Some((v_render(p), HeldSlot, ""))
+
+            // A trait object's or a closure's two words, stored in a local of the frame.
+            if is_held(held, v, HeldAgg) then return Some((v_render(p), HeldAggSlot, boxed_at(boxed, v)))
+        InLoad(d, _, p, _, _) ->
+            if is_held(held, p, HeldSlot) then return Some((v_render(d), HeldBox, ""))
+            if is_held(held, p, HeldAggSlot) then return Some((v_render(d), HeldAgg, boxed_at(boxed, p)))
+        InGep(d, _, p, _) -> if is_held(held, p, HeldPlace) then return Some((v_render(d), HeldPlace, ""))
+        InGepInBounds(d, _, p, _) -> if is_held(held, p, HeldPlace) then return Some((v_render(d), HeldPlace, ""))
+        InInsert(d, _, agg, _, v, idx) ->
+            if is_held(held, v, HeldBox) then return Some((v_render(d), HeldAgg, path_of(idx)))
+            if is_held(held, agg, HeldAgg) then return Some((v_render(d), HeldAgg, boxed_at(boxed, agg)))
+
+        // The word of an aggregate the box sits in is the box; a part holding that word holds it.
+        InExtract(d, _, agg, idx) ->
+            if !is_held(held, agg, HeldAgg) then return None
+
+            val at = path_of(idx)
+            val inner = boxed_at(boxed, agg)
+
+            if at == inner then return Some((v_render(d), HeldBox, ""))
+            if inner.starts_with(at) then return Some((v_render(d), HeldAgg, inner[at.bytes.len..<inner.bytes.len]))
         InCall(Some(d), ret, VGlobal(name), args, _, _, _, _) ->
             if name.ends_with("-frame") && !args.is_empty() && v_render(args[0].value) == root.slot
-                return Some((v_render(d), HeldBox))
+                return Some((v_render(d), HeldBox, ""))
 
             if count_name(name) then return None
 
@@ -245,8 +289,8 @@ private held_by(inst: Inst, held: Map[string, Held], root: FrameRoot, slots: Set
                 if held_as(held, a.value).is_some() then handed = true
 
             if !handed then return None
-            if name.ends_with("-place") then return Some((v_render(d), HeldPlace))
-            if carries_address(ret) && !fresh.has(v_render(d)) then return Some((v_render(d), HeldMaybe))
+            if name.ends_with("-place") then return Some((v_render(d), HeldPlace, ""))
+            if carries_address(ret) && !fresh.has(v_render(d)) then return Some((v_render(d), HeldMaybe, ""))
 
         // A table call's answer may be the box where some body the slot may hold may answer an
         // argument it was handed, or where the call is not one the walk named every body of.
@@ -257,7 +301,7 @@ private held_by(inst: Inst, held: Map[string, Held], root: FrameRoot, slots: Set
                 if held_as(held, a.value).is_some()
                     val noted = table_arg(calls, callee, a.value)
 
-                    if noted.is_none() || noted.unwrap().answered then return Some((v_render(d), HeldMaybe))
+                    if noted.is_none() || noted.unwrap().answered then return Some((v_render(d), HeldMaybe, ""))
                 end if
             end for
         _ -> ()
@@ -299,7 +343,8 @@ end answer_of
 // -- what touches the count --------------------------------------------------------------------------
 
 // Every instruction's step, or `None` where something the box reaches is one this pass cannot count.
-private frame_uses(e: *Emit, blocks: Buf[IrBlock], root: FrameRoot, held: Map[string, Held]) -> Option[FrameUses]
+private frame_uses(e: *Emit, blocks: Buf[IrBlock], root: FrameRoot, held: Map[string, Held],
+                   boxed: Map[string, string]) -> Option[FrameUses]
     val payload_at = box_payload_field(e, root.payload)
     var steps: Buf[CountStep] = buf()
     var starts: Buf[usize] = buf()
@@ -325,9 +370,13 @@ private frame_uses(e: *Emit, blocks: Buf[IrBlock], root: FrameRoot, held: Map[st
 
             inst match
                 InStore(ty, v, p, _, _) ->
-                    if tracked(held, header_regs, v) && !is_held(held, v, HeldBox) then return None
-
-                    if header_regs.has(v_render(p))
+                    // A slot holding a trait object or a closure holds nothing else: every store into
+                    // it stores an aggregate with the box at the one place.
+                    if is_held(held, p, HeldAggSlot)
+                        if !is_held(held, v, HeldAgg) || boxed_at(boxed, v) != boxed_at(boxed, p) then return None
+                    elif tracked(held, header_regs, v) && !is_held(held, v, HeldBox)
+                        return None
+                    elif header_regs.has(v_render(p))
                         header.add(at)
                     elif is_held(held, p, HeldBox)
                         if v_render(p) != root.slot || root.by_call || tracked(held, header_regs, v) then return None
@@ -355,11 +404,25 @@ private frame_uses(e: *Emit, blocks: Buf[IrBlock], root: FrameRoot, held: Map[st
 
                 // An aggregate holds the box once: a second insertion would make one copy of it two
                 // shares, which the walk counts as one.
-                InInsert(_, _, agg, _, v, _) ->
+                InInsert(_, _, agg, _, v, idx) ->
                     if header_regs.has(v_render(v)) then return None
                     if tracked(held, header_regs, v) && !is_held(held, v, HeldBox) then return None
                     if tracked(held, header_regs, agg) && !is_held(held, agg, HeldAgg) then return None
                     if is_held(held, agg, HeldAgg) && is_held(held, v, HeldBox) then return None
+
+                    // Writing over the box's word, or a part holding it, would leave an aggregate
+                    // read as holding the box that does not.
+                    if is_held(held, agg, HeldAgg)
+                        val at = path_of(idx)
+                        val inner = boxed_at(boxed, agg)
+
+                        if inner.starts_with(at) || at.starts_with(inner) then return None
+                    end if
+
+                // A part of an aggregate holding the box is the box, a part holding it, or nothing
+                // of it (`held_by`); only an aggregate is taken apart.
+                InExtract(_, _, agg, _) ->
+                    if tracked(held, header_regs, agg) && !is_held(held, agg, HeldAgg) then return None
                 InCall(_, _, VGlobal(name), args, _, _, _, _) ->
                     if kept_name(name) && args.len() == 1 && is_held(held, args[0].value, HeldAgg)
                         step = if name.starts_with("arc.copy.") then StepKeptRetain else StepKeptRelease
@@ -451,7 +514,7 @@ private step_ok(held: Map[string, Held], header_regs: Set[string], root: FrameRo
     for a in idx
         if held_as(held, a.value).is_some() || header_regs.has(v_render(a.value)) then return false
 
-    if header_regs.has(v_render(p)) || is_held(held, p, HeldSlot) then return false
+    if header_regs.has(v_render(p)) || is_held(held, p, HeldSlot) || is_held(held, p, HeldAggSlot) then return false
     if !is_held(held, p, HeldBox) then return true
     if header_regs.has(v_render(d)) then return true
     if idx.len() < 2 || v_render(idx[0].value) != "0" then return false

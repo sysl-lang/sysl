@@ -123,6 +123,12 @@ stack_boxes(e: *Emit, p: TProgram) -> StackBoxes
             if laid then out.payloads.add(mangle(site.1))
         end for
 
+        // A closure laid in the frame where its capture mode is decided is followed too, for what the
+        // tables it is handed to and called through do with it (`table_args`): it is laid there
+        // whatever this walk finds.
+        for site in framed_closure_sites(e, f)
+            follow_site(cx, f, site, false, false)
+
         for site in factory_calls(cx, f)
             if follow_site(cx, f, site.0, true, false).escaped then continue
 
@@ -297,6 +303,26 @@ end box_sites
 
 private struct SbSites
     items: Buf[(Span, Type)]
+
+// The closure boxes a body writes that `closure_mode.sysl` lays in the frame, keyed by the payload's
+// span.
+private framed_closure_sites(e: *Emit, f: TFunc) -> Buf[Span]
+    val out: &SbSpans = SbSpans(buf())
+    val framed = e.framed_closures
+
+    if framed.is_empty() then return out.items
+
+    walk_block_stmts(f.body, expr_walk(true, x -> *x.kind match
+        TBox(v, _) -> *v.kind match
+            TStructNew(st, _) -> if framed.has(st.base) then out.items.push(v.span)
+            _ -> ()
+        _ -> ()))
+
+    out.items
+end framed_closure_sites
+
+private struct SbSpans
+    items: Buf[Span]
 
 // The calls of factories a body makes, each with the factory's name, keyed by the call's span.
 private factory_calls(cx: &BoxCx, f: TFunc) -> Buf[(Span, string)]
