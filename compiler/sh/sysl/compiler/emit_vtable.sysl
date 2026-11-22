@@ -31,7 +31,11 @@ gen_vtable(e: *Emit, vt: TVtable) -> IrGlobal
     for item in vt.slots
         entries.push(ir_arg(LPtr, VGlobal(slot_fn(e, vt, item))))
 
-    val slots = LArr(int(vt.slots.len()), LPtr)
+    // In a whole program, the +0 slots after the ordinary ones (`table_zero.sysl`).
+    for item in zero_slot_fns(e, vt)
+        entries.push(ir_arg(LPtr, VGlobal(item)))
+
+    val slots = LArr(int(entries.len()), LPtr)
 
     var fields: Buf[IrArg] = buf()
 
@@ -546,7 +550,10 @@ gen_vcall(e: *Emit, receiver: TExpr, slot: int, args: Buf[TExpr], ty: Type) -> V
 
         arg_value(e, a, &arg_vals, written, "", held_for)
 
-    val fn = vtable_entry(e, table, slot)
+    // **A slot whose every body answers +0 is called at its +0 slot where the table has one**
+    // (`table_zero.sysl`), and the answer's count is taken here, as a direct call to a +0 entry's is.
+    val zero = zero_slot_index(e, rty, slot)
+    val fn = if zero.is_some() then zero_vtable_entry(e, table, zero.unwrap()) else vtable_entry(e, table, slot)
 
     var all: Buf[IrArg] = buf()
 
@@ -555,7 +562,11 @@ gen_vcall(e: *Emit, receiver: TExpr, slot: int, args: Buf[TExpr], ty: Type) -> V
     for arg_val in arg_vals
         all.push(arg_val)
 
-    gen_sysl_call(e, fn, all, ty)
+    val r = gen_sysl_call(e, fn, all, ty)
+
+    if zero.is_some() then retain_value(e, ty, r)
+
+    r
 end gen_vcall
 
 // The function one slot of a table holds, loaded. The indexing type has **no** entries in it: a table

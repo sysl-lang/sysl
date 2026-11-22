@@ -1,0 +1,540 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{cstring, join, str_builder}
+import sysl.fs.{make_dir_all, make_temp_dir, read_text, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **A table's +0 slot** (`table_zero.sysl`): in a whole program, a slot every body of which answers +0
+// -- in every table of the trait at the receiver's arguments -- gets a second entry after the ordinary
+// ones, holding the bodies' +0 entries, and a call through the table reaches it there and takes the
+// answer's count itself, which the count elision drops with its release. The axes: the callee kind
+// (trait method with its receiver by value, lent by address, or behind a pointer; closure literal;
+// function named as a value), how many bodies (one, several agreeing, one disagreeing), the answer
+// (a place, +0 from an argument other than the receiver), the trait's arguments, recursion through a
+// table, the build (program, archive), a C function pointer, and the run (-O0, -O2, the counted heap,
+// AddressSanitizer).
+
+private extern "setenv" tze_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" tze_c_unsetenv(name: *u8) -> int
+
+private struct TzeRun
+    ok: bool
+    out: string
+    err: string
+    hooks: usize
+
+private tze_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end tze_ready
+
+// The program's IR, lowered in-process at -O0.
+private tze_ir(text: string) -> string
+    val root = make_temp_dir("sysl-tze").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None, "0") match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end tze_ir
+
+// One function's emitted text, from its `define` to the brace that closes it.
+private tze_body(out: string, symbol: string) -> string
+    var b = str_builder()
+    var inside = false
+
+    for line in lines_of(out)
+        if !inside && line.starts_with("define ") && line.contains("@" + symbol + "(") then inside = true
+
+        if inside
+            if line == "}" then return b.finish()
+
+            b.push(line)
+            b.push_char('\n')
+
+    if inside then b.finish() else s"no definition of '$symbol' in:\n$out"
+end tze_body
+
+// The line laying down the table named, whole.
+private tze_table_line(out: string, name: string) -> string
+    for line in lines_of(out)
+        if line.starts_with("@" + name + " = ") then return line
+
+    s"no table '$name' in:\n$out"
+end tze_table_line
+
+// Whether a body takes or gives back a count of anything.
+private tze_counts(body: string) -> bool =
+    body.contains("@arc.copy.") || body.contains("@arc.dispose.") || body.contains("@arc.retain(") ||
+        body.contains("@arc.release")
+
+// Whether a body calls through a table's +0 slot.
+private tze_through_zero(body: string) -> bool = body.contains("-zero(")
+
+private tze_run(text: string, level: string, counted: bool, flags: string) -> TzeRun
+    val root = make_temp_dir("sysl-tze").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    if counted then force_alloc_counting(true)
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+        val v = cstring(flags)
+
+        tze_c_setenv(n.ptr, v.ptr, 1)
+    end if
+
+    val built = build_native_program(s"$root/main.sysl", None, None, level, Some(exe))
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+
+        tze_c_unsetenv(n.ptr)
+
+    if counted then force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return TzeRun(false, failure_text(why), "", 0)
+        Ok(_) -> ()
+
+    val hooks = capture("nm", ["-u", exe], "", [], true) match
+        Ok(o) -> o.text.count_of("__asan_report")
+        Err(_) -> 0
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> TzeRun(false, "could not be started", "", 0)
+        Ok(o) -> TzeRun(o.status.ok(), o.text, o.err.unwrap_or(""), hooks)
+end tze_run
+
+// Printed exactly `expected` at -O0 and -O2 on the counted heap, giving everything back, and under
+// AddressSanitizer.
+private tze_prints(text: string, expected: string)
+    if !tze_ready() then return
+
+    for level in ["0", "2"]
+        val run = tze_run(text, level, true, "")
+
+        assert(run.ok, s"-O$level: ${run.out}${run.err}")
+        assert_eq(run.out, expected)
+        assert(alloc_count_reported(run.err) == 0, s"-O$level: ${run.err}")
+
+    val asan = tze_run(text, "0", false, "-fsanitize=address -g")
+
+    assert(asan.hooks > 0, "the AddressSanitizer build carries no instrumentation")
+    assert(asan.ok, s"asan: ${asan.out}${asan.err}")
+    assert_eq(asan.out, expected)
+end tze_prints
+
+// A leaf says when it is freed, so a count gone missing shows as a `drop` printed too early, and one
+// taken twice as a leak. `A` hands its receiver over in registers, `B` (three words) is lent by
+// address, and `B` answers one of two fields.
+private tze_head() -> string = raw"""
+    struct Leaf
+        v: int
+
+    impl Drop for Leaf
+        drop(self) = print("drop", self.v)
+
+    trait Get
+        get(self) -> &Leaf
+
+    struct A
+        leaf: &Leaf
+
+    impl Get for A
+        get(self) -> &Leaf = self.leaf
+
+    struct B
+        one: &Leaf
+        two: &Leaf
+        first: bool
+
+    impl Get for B
+        get(self) -> &Leaf = if self.first then self.one else self.two
+
+    """
+
+// -- the trait object ---------------------------------------------------------------------------------
+
+private tze_trait() -> string = tze_head() + raw"""
+    peek(x: &Get) -> int = x.get().v
+    both(x: &Get, y: &Get) -> int = x.get().v + y.get().v
+
+    val a = A(Leaf(1))
+    val b = B(Leaf(2), Leaf(3), false)
+
+    print(peek(a) + peek(b) + both(a, b))
+    """
+
+@test("a call through a trait object whose every body answers +0 reaches the +0 slot and takes no count")
+tze_trait_takes_no_count()
+    if !tze_ready() then return
+
+    val ir = tze_ir(tze_trait())
+    val peek = tze_body(ir, "peek$$sysl")
+
+    assert(tze_through_zero(peek), peek)
+    assert(!tze_counts(peek), peek)
+
+    // A second call through a +0 slot inside the first answer's stretch releases nothing either.
+    val both = tze_body(ir, "both$$sysl")
+
+    assert(tze_through_zero(both), both)
+    assert(!tze_counts(both), both)
+
+    // The +0 slot follows the ordinary ones (`get` and the `debug` every table carries), and the
+    // ordinary slot still answers with a count.
+    val table = tze_table_line(ir, "vt.ref.Get.A")
+
+    assert(table.contains("[3 x ptr]"), table)
+    assert(table.contains("@vt.zero.ref.A.get"), table)
+    assert(tze_table_line(ir, "vt.ref.Get.B").contains("@vt.zero.ref.B.get"), ir)
+    assert(tze_body(ir, "A.get.self").contains("@arc.retain("), ir)
+
+    // B's receiver is lent by address: its forwarder hands the entry the object where it lies.
+    val fwd = tze_body(ir, "vt.zero.ref.B.get")
+
+    assert(fwd.contains("@B.get-zero(ptr"), fwd)
+    assert(!tze_counts(fwd), fwd)
+    assert(!tze_counts(tze_body(ir, "B.get-zero")), ir)
+end tze_trait_takes_no_count
+
+@test("and the calls through the +0 slot add up, freeing every leaf once, at the end")
+tze_trait_runs()
+    tze_prints(tze_trait(), "8\ndrop 2\ndrop 3\ndrop 1\n")
+
+// -- a body reaching its answer through another lent body -------------------------------------------
+
+// DeltaBlue's shape: an implementation answering what a helper of a field answers, both lent by
+// address. The helper is called through its own +0 entry, lent the field where it lies, so the slot's
+// +0 entry takes no count anywhere -- and a direct call outside any table does the same.
+private tze_lent_chain() -> string = tze_head() + raw"""
+    struct Two
+        l: &Leaf
+        r: &Leaf
+        left: bool
+
+        pick(self) -> &Leaf = if self.left then self.l else self.r
+
+    struct Eq
+        two: Two
+        n: int
+
+    impl Get for Eq
+        get(self) -> &Leaf = self.two.pick()
+
+    peek(x: &Get) -> int = x.get().v
+    direct(t: &Two) -> int = t.pick().v
+
+    val e = Eq(Two(Leaf(1), Leaf(2), false), 0)
+
+    print(peek(e) + peek(A(Leaf(5))) + direct(Two(Leaf(3), Leaf(4), true)))
+    """
+
+@test("a body answering what a lent helper of its field answers reaches the helper's +0 entry, lent in place")
+tze_lent_chain_takes_no_count()
+    if !tze_ready() then return
+
+    val ir = tze_ir(tze_lent_chain())
+    val entry = tze_body(ir, "Eq.get-zero")
+
+    assert(entry.contains("@Two.pick-zero(ptr"), entry)
+    assert(!tze_counts(entry), entry)
+
+    for name in ["peek$$sysl", "direct$$sysl"]
+        val body = tze_body(ir, name)
+
+        assert(tze_through_zero(body), body)
+        assert(!tze_counts(body), body)
+end tze_lent_chain_takes_no_count
+
+@test("and the lent chain runs, freeing every leaf once")
+tze_lent_chain_runs()
+    tze_prints(tze_lent_chain(), "10\ndrop 4\ndrop 3\ndrop 5\ndrop 1\ndrop 2\n")
+
+// -- closures and functions named as values -----------------------------------------------------------
+
+private tze_closure() -> string = tze_head() + raw"""
+    pick(f: &Fn(&B) -> &Leaf, b: &B) -> int = f(b).v
+    second(q: &B) -> &Leaf = q.two
+
+    val b = B(Leaf(5), Leaf(6), true)
+
+    print(pick((q) -> q.one, b) + pick(second, b) + pick((q) -> q.get(), b))
+    """
+
+@test("a call through a closure whose every body answers +0 reaches the +0 slot and takes no count")
+tze_closure_takes_no_count()
+    if !tze_ready() then return
+
+    val ir = tze_ir(tze_closure())
+    val pick = tze_body(ir, "pick$$sysl")
+
+    assert(tze_through_zero(pick), pick)
+    assert(!tze_counts(pick), pick)
+end tze_closure_takes_no_count
+
+@test("and the closures' answers add up, freeing every leaf once, at the end")
+tze_closure_runs()
+    tze_prints(tze_closure(), "16\ndrop 5\ndrop 6\n")
+
+// -- what keeps the ordinary slot -----------------------------------------------------------------------
+
+// One body of each slot answers something made here: the call site cannot know it will not be handed
+// that table, so neither trait nor closure type gets a +0 slot, and the count stays.
+private tze_mixed() -> string = tze_head() + raw"""
+    struct C
+        n: int
+
+    impl Get for C
+        get(self) -> &Leaf = Leaf(self.n)
+
+    peek(x: &Get) -> int = x.get().v
+    pick(f: &Fn(&A) -> &Leaf, a: &A) -> int = f(a).v
+
+    val a = A(Leaf(1))
+
+    print(peek(a) + peek(C(7)))
+    print(pick((q) -> q.leaf, a) + pick((q) -> Leaf(q.leaf.v + 10), a))
+    """
+
+@test("a slot one body of which does not answer +0 keeps the ordinary entry and the count")
+tze_mixed_keeps_count()
+    if !tze_ready() then return
+
+    val ir = tze_ir(tze_mixed())
+
+    for name in ["peek$$sysl", "pick$$sysl"]
+        val body = tze_body(ir, name)
+
+        assert(!tze_through_zero(body), body)
+        assert(body.contains("@arc.release"), body)
+
+    assert(!ir.contains("@vt.zero."), ir)
+    assert(tze_table_line(ir, "vt.ref.Get.A").contains("[2 x ptr]"), ir)
+end tze_mixed_keeps_count
+
+@test("and the mixed calls free what each made, and the leaves once")
+tze_mixed_runs()
+    tze_prints(tze_mixed(), "drop 7\n8\ndrop 11\n12\ndrop 1\n")
+
+// A body calling back through a table of its own trait is not inert, so the slot keeps its ordinary
+// entry; the recursion itself runs as before.
+private tze_recursion() -> string = tze_head() + raw"""
+    struct Wrap
+        inner: &Get
+        depth: int
+
+    impl Get for Wrap
+        get(self) -> &Leaf = self.inner.get()
+
+    peek(x: &Get) -> int = x.get().v
+
+    val w = Wrap(Wrap(A(Leaf(4)), 1), 2)
+
+    print(peek(w))
+    """
+
+@test("recursion through a table keeps the ordinary slot and runs")
+tze_recursion_keeps_slot()
+    if tze_ready()
+        val ir = tze_ir(tze_recursion())
+
+        assert(!tze_through_zero(tze_body(ir, "peek$$sysl")), ir)
+    end if
+
+    tze_prints(tze_recursion(), "4\ndrop 4\n")
+end tze_recursion_keeps_slot
+
+// -- a generic trait at two arguments ---------------------------------------------------------------
+
+// `&Fetch[&B]` reaches only the implementation answering +0 from its argument; `&Fetch[int]` only the
+// one answering something made here. The first gets a +0 slot; the second does not.
+private tze_generic() -> string = tze_head() + raw"""
+    trait Fetch[T]
+        fetch(self, t: T) -> &Leaf
+
+    struct K
+        k: int
+
+    impl Fetch[&B] for K
+        fetch(self, t: &B) -> &Leaf = t.two
+
+    impl Fetch[int] for K
+        fetch(self, t: int) -> &Leaf = Leaf(t + self.k)
+
+    by_b(b: &B, x: &Fetch[&B]) -> int = x.fetch(b).v
+    by_int(n: int, x: &Fetch[int]) -> int = x.fetch(n).v
+
+    val b = B(Leaf(1), Leaf(2), true)
+
+    print(by_b(b, K(1)) + by_int(3, K(1)))
+    """
+
+@test("a generic trait's object reaches a +0 slot at the arguments whose bodies all answer +0 only")
+tze_generic_per_arguments()
+    if !tze_ready() then return
+
+    val ir = tze_ir(tze_generic())
+    val by_b = tze_body(ir, "by_b$$sysl")
+    val by_int = tze_body(ir, "by_int$$sysl")
+
+    assert(tze_through_zero(by_b), by_b)
+    assert(!tze_counts(by_b), by_b)
+    assert(!tze_through_zero(by_int), by_int)
+    assert(by_int.contains("@arc.release"), by_int)
+end tze_generic_per_arguments
+
+@test("and both instantiations run, freeing every leaf once")
+tze_generic_runs()
+    tze_prints(tze_generic(), "drop 4\n6\ndrop 1\ndrop 2\n")
+
+// -- a C function pointer ---------------------------------------------------------------------------
+
+@test("a call through a C function pointer is unchanged: no +0 slot, and the count")
+tze_pointer_unchanged()
+    val text = tze_head() + raw"""
+        c_pick(b: &B) -> &Leaf = b.one
+
+        by_pointer(b: &B) -> int
+            val f: *extern(&B) -> &Leaf = &c_pick
+
+            f(b).v
+        end by_pointer
+
+        print(by_pointer(B(Leaf(8), Leaf(9), true)))
+        """
+
+    if tze_ready()
+        val body = tze_body(tze_ir(text), "by_pointer$$sysl")
+
+        assert(!tze_through_zero(body), body)
+        assert(body.contains("@arc.release"), body)
+    end if
+
+    tze_prints(text, "8\ndrop 9\ndrop 8\n")
+end tze_pointer_unchanged
+
+// -- an archive -------------------------------------------------------------------------------------
+
+@test("an archive C links lays its tables out as before: one entry per slot, and the count")
+tze_archive_unchanged()
+    if !tze_ready() then return
+
+    val root = make_temp_dir("sysl-tze-").unwrap()
+
+    write_text(s"$root/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(s"$root/main.sysl", tze_head() + raw"""
+        peek(x: &Get) -> int = x.get().v
+
+        @export("use_it")
+        use_it(n: int) -> int = peek(A(Leaf(n))) + peek(B(Leaf(n), Leaf(n + 1), false))
+        """).unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    var args: [7]string = ["sysl", "build-c", "--emit-llvm", s"$root/out.ll", "-o", s"$root/out.a", root]
+    val code = run_cli(args[..], (line) -> sink.push(line))
+
+    reset_search_paths()
+    assert(code == 0, join(lines.view(), "\n"))
+
+    val ir = read_text(s"$root/out.ll").unwrap()
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert(tze_table_line(ir, "vt.ref.Get.A").contains("[2 x ptr]"), ir)
+    // No table call reaches a +0 entry (a direct call may: those entries are the archive's own).
+    assert(!ir.contains("vt.zero."), ir)
+    assert(!ir.contains("-zero = load"), ir)
+end tze_archive_unchanged
+
+// -- a scheduler over trait objects -------------------------------------------------------------------
+
+// Richards' shape: a queue of tasks behind a trait, each asked for the packet it holds and the next task
+// to run, round after round, the packets moved between tasks as it goes.
+private tze_scheduler() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct Packet
+        id: int
+        work: int
+
+    impl Drop for Packet
+        drop(self) = print("free", self.id)
+
+    trait Task
+        packet(self) -> &Packet
+        name(self) -> &Packet
+
+    struct Worker
+        held: &Packet
+        spare: &Packet
+        busy: bool
+
+    impl Task for Worker
+        packet(self) -> &Packet = if self.busy then self.held else self.spare
+        name(self) -> &Packet = self.held
+
+    struct Idle
+        held: &Packet
+
+    impl Task for Idle
+        packet(self) -> &Packet = self.held
+        name(self) -> &Packet = self.held
+
+    run(tasks: Buf[&Task], rounds: int) -> int
+        var sum = 0
+
+        for r in 0..<rounds
+            for t in tasks
+                sum += t.packet().work + t.name().id
+
+        sum
+    end run
+
+    var tasks: Buf[&Task] = buf()
+
+    tasks.push(Worker(Packet(1, 10), Packet(2, 20), true))
+    tasks.push(Idle(Packet(3, 30)))
+    tasks.push(Worker(Packet(4, 40), Packet(5, 50), false))
+
+    print(run(tasks, 100))
+    """
+
+@test("a scheduler's loop over trait objects calls the +0 slots and takes no count for their answers")
+tze_scheduler_no_count()
+    if !tze_ready() then return
+
+    val ir = tze_ir(tze_scheduler())
+    val body = tze_body(ir, "run$$sysl")
+
+    assert(tze_through_zero(body), body)
+    assert(!body.contains("@arc.release.Packet"), body)
+end tze_scheduler_no_count
+
+@test("and it runs the same at -O0 and -O2, on the counted heap and under AddressSanitizer")
+tze_scheduler_runs()
+    tze_prints(tze_scheduler(), "9800\nfree 1\nfree 2\nfree 3\nfree 4\nfree 5\n")

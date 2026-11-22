@@ -1,0 +1,298 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, Set, map, set}
+import sysl.math.bigint.from_int
+
+// **A call through a table answered without a count** (`docs/design/borrow-inference.md`, decision 11
+// and § 5).
+//
+// A call through a closure or a trait object reaches whatever the slot holds, and the slot holds the
+// body's ordinary entry, which answers with a count of its own. In a whole program, which sees every
+// table a value of the trait can carry (`Analysis.closed`), the answer of such a call is known: it is
+// +0 where every body the slot holds in each of those tables answers +0 (`borrow_summary.sysl`'s
+// `table_ans`). Calling the bodies' +0 entries (`zero_entry.sysl`) instead would leave the caller with
+// a +0 answer to take its count of at once, as a direct call to a +0 entry does -- and the count
+// elision drops that one with its release where nothing between them can release
+// (`arc_cover.sysl`), so the pair the ordinary entry's answer costs is gone.
+//
+// **So such a slot gets a second entry in the table, after all the ordinary ones**: the +0 slot. Every
+// table of the trait at those arguments carries it, in the same order, so a call site that knows the
+// trait knows where it is: the ordinary slots' count, then the slot's place among the +0 ones. The
+// ordinary slots and the identity word before them do not move, so whatever reads a table without
+// knowing of the +0 slots -- a caller compiled elsewhere, an `o::Id` -- reads exactly what it read
+// before. A slot holds the target's +0 entry itself where the ordinary slot would hold the target
+// itself, and otherwise a forwarder that brings the receiver to the shape the entry takes
+// (`gen_zero_adapter`).
+//
+// **Only where nothing else can have made a table of that trait.** A library build, and an archive C
+// links, may be handed an object whose table it never saw, so neither has +0 slots: only a program
+// (`closed`) does. And within a program, a table made by code compiled elsewhere -- a precompiled
+// module's private copy of a table, which has no +0 slots -- could reach a call site of this module: so
+// a trait any of whose tables reaches a body of a precompiled module keeps its slots as they are.
+//
+// **What makes the answer alive is that every entry is inert**, as for a direct call to a +0 entry: a
+// body that writes or releases what it answers keeps the slot's ordinary entry only, and so does a
+// slot one of whose bodies is not +0 -- the call site cannot tell which table it will be handed.
+
+// The +0 slots one trait at its arguments might carry: the tables' ordinary slot count, and each
+// candidate slot with the bodies it holds.
+struct ZeroSlotGroup
+    key: string
+    count: usize
+    slots: Buf[(int, Buf[string])]
+end ZeroSlotGroup
+
+// The key a call site and a table both spell a trait at its arguments by: the table's name less its
+// prefix and the type it is for (`erase.sysl`'s `vtable_for`, `borrowing.sysl`'s `trait_tables`). Empty
+// where the name is not spelled that way.
+table_key(vt: TVtable) -> string
+    val own = "." + member_symbol(vt.for_type)
+
+    if !vt.name.ends_with(own) then return ""
+
+    val stem = vt.name[0..<vt.name.len - own.len]
+
+    if stem.starts_with("vt.ref.") then return stem[7..<stem.len]
+    if stem.starts_with("vt.") then return stem[3..<stem.len]
+
+    ""
+end table_key
+
+// Each trait of the program's tables at its arguments, with the slots every table of it holds a body
+// at that may be given a +0 entry: one answering +0 (`answers`) whose shape a +0 entry can take.
+zero_slot_candidates(e: *Emit, p: TProgram, answers: Map[string, usize]) -> Buf[ZeroSlotGroup]
+    var out: Buf[ZeroSlotGroup] = buf()
+
+    if p.vtables.is_empty() then return out
+
+    var index: Map[string, usize] = map()
+    var elsewhere: Set[string] = set()
+
+    for i in 0..<p.funcs.len()
+        index.put(p.funcs[i].name, i)
+
+        if !p.funcs[i].internal && holds_string(p.precompiled, p.funcs[i].name) then
+            elsewhere.add(p.funcs[i].declared_in)
+
+    var keys: Buf[string] = buf()
+    var groups: Map[string, Buf[TVtable]] = map()
+
+    for vt in p.vtables
+        val key = table_key(vt)
+
+        if key == "" then continue
+
+        if !groups.has(key) then keys.push(key)
+
+        var some = groups.get(key).unwrap_or(buf())
+
+        some.push(vt)
+        groups.put(key, some)
+
+    for key in keys
+        val tables = groups.get(key).unwrap()
+        val count = tables[0].slots.len()
+        var whole = true
+
+        // A table of the trait that reaches a precompiled module's body may have been made there too.
+        for vt in tables
+            if vt.slots.len() != count then whole = false
+
+            for slot in vt.slots
+                index.get(slot.target) match
+                    Some(i) -> if elsewhere.has(p.funcs[i].declared_in) then whole = false
+                    None -> whole = false
+
+        if !whole then continue
+
+        var slots: Buf[(int, Buf[string])] = buf()
+
+        for s in 0..<count
+            var targets: Buf[string] = buf()
+            var all = true
+
+            for vt in tables
+                val target = vt.slots[s].target
+                val f = p.funcs[index.get(target).unwrap()]
+
+                if !answers.has(target) || !table_zero_candidate(e, p, f) then all = false
+                else if !holds_string(targets, target) then targets.push(target)
+
+            if all then slots.push((int(s), targets))
+
+        if !slots.is_empty() then out.push(ZeroSlotGroup(key, count, slots))
+
+    out
+end zero_slot_candidates
+
+// Whether `f` may have a +0 entry a table reaches: what `zero_candidate` asks, less what only a
+// direct call needs -- a closure's body, a parameter lent by address or read in place, and a place
+// answer are all fine where the forwarder hands the receiver over as the entry takes it.
+private table_zero_candidate(e: *Emit, p: TProgram, f: TFunc) -> bool
+    if f.ghost || f.marks.is_async() || f.exported.is_some() || f.section.is_some() || f.conv.is_some() then
+        return false
+    if f.variadic || f.variant.is_some() || !f.marks.disjoint.is_empty() || f.marks.track_caller then return false
+    if !f.requires.is_empty() || !f.ensures.is_empty() || !f.olds.is_empty() then return false
+    if holds_string(p.precompiled, f.name) || e.abandoning.has(f.name) || e.tracked.has(f.name) then return false
+    if !tail_calls_of(f).is_empty() then return false
+    if no_value(f.ret_ty) || e.layout.indirect(f.ret_ty) || !contains_counted(f.ret_ty) then return false
+    if value_drops(e, f.ret_ty) then return false
+
+    for j in 0..<f.params.len()
+        if value_drops(e, f.params[j].1) then return false
+        if underlying(f.params[j].1) == VaList then return false
+
+    true
+end table_zero_candidate
+
+// The +0 slots kept: those every body of which is inert with the +0 entries owning nothing (`quiet`).
+// Each body gets a +0 entry for the tables where it has none for its callers.
+settle_zero_slots(e: *Emit, groups: Buf[ZeroSlotGroup], quiet: Set[string])
+    for g in groups
+        var kept: Buf[int] = buf()
+
+        for item in g.slots
+            var all = true
+
+            for target in item.1
+                if !quiet.has(target) then all = false
+
+            if !all then continue
+
+            kept.push(item.0)
+
+            for target in item.1
+                if e.zeros.has(target) || e.table_zeros.has(target) then continue
+
+                e.table_zeros.add(target)
+                e.inert_symbols.add(zero_symbol(e, target))
+
+        if !kept.is_empty() then e.zero_slots.put(g.key, (g.count, kept))
+end settle_zero_slots
+
+// -- the table --------------------------------------------------------------------------------------
+
+// The functions the +0 slots of `vt` hold, after its ordinary ones, in order.
+zero_slot_fns(e: *Emit, vt: TVtable) -> Buf[string]
+    var out: Buf[string] = buf()
+    val key = table_key(vt)
+
+    if key == "" then return out
+
+    e.zero_slots.get(key) match
+        Some(z) ->
+            for s in z.1
+                out.push(zero_slot_fn(e, vt, vt.slots[usize(s)]))
+        None -> ()
+
+    out
+end zero_slot_fns
+
+// What one +0 slot holds: the target's +0 entry itself where the ordinary slot holds the target
+// itself and no parameter crosses by address, and a forwarder otherwise.
+private zero_slot_fn(e: *Emit, vt: TVtable, slot: TVSlot) -> string
+    if !lends_any(e, slot)
+        slot.recv match
+            ByPtr -> if !vt.boxed then return zero_symbol(e, slot.target)
+            ByRef(_) -> if vt.boxed then return zero_symbol(e, slot.target)
+            ByValue -> ()
+    end if
+
+    request_helper(e, s"vt.zero.${if vt.boxed then "ref." else ""}${slot.target}", HrZeroAdapter(vt, slot))
+end zero_slot_fn
+
+// Whether any parameter of a slot's body, its receiver first, is lent by address (`read_by_address`).
+private lends_any(e: *Emit, slot: TVSlot) -> bool
+    for j in 0..slot.params.len()
+        if e.lent_params.has(owned_key(slot.target, j)) then return true
+
+    false
+end lends_any
+
+// **The forwarder a +0 slot holds**: the receiver brought to the shape the +0 entry takes -- the
+// object's own bytes where the entry reads it at its address, since an inert body changes nothing the
+// object holds while it runs -- and every other argument forwarded, a lent one at the address of a
+// copy of its own. The answer is handed back as the entry gave it, with no count.
+gen_zero_adapter(e: *Emit, vt: TVtable, slot: TVSlot)
+    val payload = if !vt.boxed then VReg("d") else
+        val p = fresh_reg(e)
+
+        var idx: Buf[IrArg] = buf()
+
+        idx.push(ir_arg(l_i32(), VInt(from_int(0))))
+        idx.push(ir_arg(l_i32(), VInt(from_int(long(box_payload_field(e, vt.for_type))))))
+        emit(e, InGep(p, box_lty(e, vt.for_type), VReg("d"), idx))
+        p
+
+    var call: Buf[IrArg] = buf()
+
+    slot.recv match
+        ByValue ->
+            if !zero_sized(vt.for_type)
+                if e.layout.indirect(vt.for_type) || e.lent_params.has(owned_key(slot.target, 0))
+                    call.push(ir_arg(LPtr, payload))
+                else
+                    val v = fresh_reg(e)
+
+                    emit(e, InLoad(v, lty(e, vt.for_type), payload, AccPlain, None))
+                    call.push(ir_arg(lty(e, vt.for_type), v))
+            end if
+        ByPtr -> call.push(ir_arg(LPtr, payload))
+        ByRef(_) ->
+            if vt.boxed then call.push(ir_arg(LPtr, VReg("d")))
+            else gap_here(e, "a +0 slot for a '&self' method of an object with no count")
+
+    for i in 0..<slot.params.len()
+        val ty = slot.params[i]
+
+        if zero_sized(ty) then continue
+
+        if e.lent_params.has(owned_key(slot.target, i + 1))
+            val at = alloca(e, fresh_reg(e), lty(e, ty))
+
+            emit(e, InStore(lty(e, ty), VReg(s"a$i"), at, AccPlain, None))
+            call.push(ir_arg(LPtr, at))
+        else call.push(ir_arg(sysl_param_lty(e, ty), VReg(s"a$i")))
+
+    val r = fresh_reg(e)
+
+    emit(e, InCall(Some(r), lty(e, slot.ret_ty), VGlobal(zero_symbol(e, slot.target)), call,
+                   c_extension(slot.ret_ty, e.target), None, no_fast_math(), false))
+    emit_term(e, InRet(Some(sysl_result_lty(e, slot.ret_ty)), Some(r)))
+end gen_zero_adapter
+
+// -- the call site -----------------------------------------------------------------------------------
+
+// Where in the table of a receiver of type `rty` the +0 slot of `slot` is, if it has one.
+zero_slot_index(e: *Emit, rty: Type, slot: int) -> Option[int]
+    if e.zero_slots.is_empty() || slot < 0 then return None
+
+    val tr = erased_trait(underlying(rty))?
+    val z = e.zero_slots.get(mangle(tr))?
+
+    for k in 0..<z.1.len()
+        if z.1[k] == slot then return Some(int(z.0 + k))
+
+    None
+end zero_slot_index
+
+// The function a table's +0 slot holds, loaded into a register whose name says so: what the call
+// answers is read out of storage, as a +0 entry's answer is (`arc_cover.sysl`'s `zero_answer`).
+zero_vtable_entry(e: *Emit, table: Val, index: int) -> Val
+    val entry = fresh_reg(e)
+
+    var idx: Buf[IrArg] = buf()
+
+    idx.push(ir_arg(l_i32(), VInt(from_int(0))))
+    idx.push(ir_arg(l_i32(), VInt(from_int(1))))
+    idx.push(ir_arg(word_lty(e), VInt(from_int(long(index)))))
+    emit(e, InGep(entry, vtable_lty(e), table, idx))
+
+    e.temp += 1
+
+    val fn = VReg(s"t${e.temp}-zero")
+
+    emit(e, InLoad(fn, LPtr, entry, AccPlain, None))
+    fn
+end zero_vtable_entry

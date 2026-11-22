@@ -172,6 +172,10 @@ elide_covered(blocks: Buf[IrBlock], clean: Set[string], inert: Set[string], walk
                 // is read out of storage (`zero_entry.sysl`).
                 InCall(Some(d), _, VGlobal(callee), _, _, _, _, _) ->
                     if is_place_symbol(callee) || is_zero_symbol(callee) then defs.put(v_render(d), inst)
+                // A table's +0 slot's answer, called through the register it was loaded into
+                // (`table_zero.sysl`).
+                InCall(Some(d), _, VReg(callee), _, _, _, _, _) ->
+                    if is_zero_symbol(callee) then defs.put(v_render(d), inst)
                 InStore(_, v, p, _, _) ->
                     val slot = v_render(p)
 
@@ -283,6 +287,7 @@ end cover_at
 // Whether the reference at `from` is what a +0 entry answered, or a part of it.
 private zero_answer(defs: Map[string, Inst], from: Origin) -> bool = defs.get(from.leaf) match
     Some(InCall(_, _, VGlobal(callee), _, _, _, _, _)) -> is_zero_symbol(callee)
+    Some(InCall(_, _, VReg(callee), _, _, _, _, _)) -> is_zero_symbol(callee)
     _ -> false
 
 // Whether `v` is a value put together on the spot by field writes into nothing, each counted field
@@ -699,6 +704,9 @@ count_blind(defs: Map[string, Inst], inert: Set[string], inst: Inst) -> bool = i
             name.starts_with("llvm.") || name == "sysl_bounds_fail" || name == trap_hook_symbol() ||
             name.starts_with("sysl.check.") || name == trap_stop_symbol() || name == bounds_stub_symbol() ||
             inert.has(name)
+    // A call through a table's +0 slot: every body such a slot holds is inert, and so is the
+    // forwarder in front of it (`table_zero.sysl`).
+    InCall(_, _, VReg(r), _, _, _, _, _) -> is_zero_symbol(r)
     InCall(_, _, _, _, _, _, _, _) -> false
     InAsm(_, _, _, _, _) -> false
     InAtomicRmw(_, _, _, _, _, _) -> false
