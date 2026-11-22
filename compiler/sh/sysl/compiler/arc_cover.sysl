@@ -147,6 +147,238 @@ private struct Reach
     walks: Map[string, ReleaseWalk]
     placed: Map[string, string]
 
+// **What `cover_at` asks of a block, found by key instead of by walking the block**: once per retain,
+// a walk of the rest of its block (for the stores and field writes its share goes into) or of the
+// block up to a slot's store (for the count the slot holds) is a cost that grows with the square of
+// a long block -- an entry file's body with thousands of statements is one. Each list is ascending.
+//
+// - `retains`: the first retain or copy of an origin in a block, by `site_key(b, leaf, path)`.
+// - `stores`: the stores of a block whose value may carry a reference out of `leaf`, by `"b|leaf"` --
+//   every value the walk back from the stored value meets (`reached`), which holds every leaf
+//   `carried` can answer.
+// - `inserts`: the field writes of a block of a value, by `"b|value"`.
+//
+// And what `window_ends` asks, where a walk on from each retain to the end of its window is the same
+// square: the first instruction at or after each one that ends any window (`stops[b][i]`: neither
+// blind to counts nor a release, or a suspension), the stores of a block to a pointer (`stored_to`,
+// `"b|ptr"`), the instructions that read, write or hand on a slot (`touched`, `"b|slot"`, every root
+// `rooted_at` answers for), and the releases of a block (`releases`, by `"b"`), of an origin's leaf
+// (`"b|leaf"`) and of a value read out of a slot (`"b|=slot"`) -- the only ones `gives_back` can match.
+private struct Sites
+    retains: Map[string, usize]
+    stores: Lists
+    inserts: Lists
+    stops: Buf[Buf[usize]]
+    stored_to: Lists
+    touched: Lists
+    releases: Lists
+
+// Lists of instruction indexes by key, each in the order noted.
+private struct Lists
+    slot: Map[string, usize]
+    at: Buf[Buf[usize]]
+
+    note(*self, key: string, j: usize)
+        self.slot.get(key) match
+            Some(i) -> self.at[i].push(j)
+            None ->
+                var one: Buf[usize] = buf()
+
+                one.push(j)
+                self.slot.put(key, self.at.len())
+                self.at.push(one)
+
+    // The indexes noted under `key` in `lo..<hi`, in order.
+    within(self, key: string, lo: usize, hi: usize) -> Buf[usize]
+        var out: Buf[usize] = buf()
+
+        self.slot.get(key) match
+            Some(i) ->
+                val xs = self.at[i]
+
+                for k in first_at_least(xs, lo)..<xs.len()
+                    if xs[k] >= hi then break
+
+                    out.push(xs[k])
+            None -> ()
+
+        out
+
+    // The first index noted under `key` in `lo..<hi`, or `hi`.
+    first(self, key: string, lo: usize, hi: usize) -> usize = self.slot.get(key) match
+        Some(i) ->
+            val xs = self.at[i]
+            val k = first_at_least(xs, lo)
+
+            if k < xs.len() && xs[k] < hi then xs[k] else hi
+        None -> hi
+end Lists
+
+// Where in the ascending `xs` the first value at least `lo` is (`xs.len()` for none).
+private first_at_least(xs: Buf[usize], lo: usize) -> usize
+    var a: usize = 0
+    var b = xs.len()
+
+    while a < b
+        val m = a + (b - a) / 2
+
+        if xs[m] < lo then a = m + 1 else b = m
+
+    a
+end first_at_least
+
+private site_key(b: usize, leaf: string, path: string) -> string = s"$b|$leaf|$path"
+
+// The first retain or copy of each origin in each block, by `site_key` (`Sites.retains`).
+private first_retains(blocks: Buf[IrBlock], defs: Map[string, Inst]) -> Map[string, usize]
+    var retains: Map[string, usize] = map()
+
+    for b in 0..<blocks.len()
+        val instrs = blocks[b].instrs
+
+        for i in 0..<instrs.len()
+            arc_call_of(instrs[i]) match
+                Some((name, v)) ->
+                    if name != "arc.weak_retain" && release_for(name).is_some()
+                        val o = origin_of(defs, v, "", "")
+                        val k = site_key(b, o.leaf, o.path)
+
+                        if !retains.has(k) then retains.put(k, i)
+                None -> ()
+
+    retains
+end first_retains
+
+// Whether a retain of the value at `o` is among the first `n` instructions of block `b`.
+private taken_in(retains: Map[string, usize], b: usize, n: usize, o: Origin) -> bool =
+    retains.get(site_key(b, o.leaf, o.path)).map(j -> j < n).unwrap_or(false)
+
+private sites_of(blocks: Buf[IrBlock], defs: Map[string, Inst], inert: Set[string], reach: Reach,
+                 retains: Map[string, usize]) -> Sites
+    var stores = Lists(map(), buf())
+    var inserts = Lists(map(), buf())
+    var stops: Buf[Buf[usize]] = buf()
+    var stored_to = Lists(map(), buf())
+    var touched = Lists(map(), buf())
+    var releases = Lists(map(), buf())
+
+    for b in 0..<blocks.len()
+        val instrs = blocks[b].instrs
+        var stopping: Buf[bool] = buf()
+
+        for i in 0..<instrs.len()
+            val inst = instrs[i]
+            var released = false
+
+            inst match
+                InInsert(_, _, _, _, v, _) -> inserts.note(s"$b|${v_render(v)}", i)
+                InStore(_, v, p, _, _) ->
+                    for leaf in reached(defs, v)
+                        stores.note(s"$b|$leaf", i)
+
+                    stored_to.note(s"$b|${v_render(p)}", i)
+                _ ->
+                    arc_call_of(inst) match
+                        Some((name, v)) ->
+                            if is_release(name)
+                                val o = origin_of(defs, v, "", "")
+                                val slot = loaded_slot(defs, o.leaf)
+
+                                released = true
+                                releases.note(s"$b", i)
+                                releases.note(s"$b|${o.leaf}", i)
+
+                                if slot != "" then releases.note(s"$b|=$slot", i)
+                        None -> ()
+
+            for s in touched_roots(defs, reach, inst)
+                touched.note(s"$b|$s", i)
+
+            stopping.push(!released && (!count_blind(defs, inert, inst) || suspends(inst)))
+
+        var next: Buf[usize] = buf()
+        var at = instrs.len()
+
+        for k in 0..<instrs.len()
+            next.push(0)
+
+        for k in 0..<instrs.len()
+            val i = instrs.len() - 1 - k
+
+            if stopping[i] then at = i
+
+            next[i] = at
+
+        stops.push(next)
+
+    Sites(retains, stores, inserts, stops, stored_to, touched, releases)
+end sites_of
+
+// Every slot `inst` reads, writes or hands on: the roots (`rooted_at`) of what it loads from or stores
+// to, and of every operand it hands on.
+private touched_roots(defs: Map[string, Inst], reach: Reach, inst: Inst) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    inst match
+        InLoad(_, _, p, _, _) ->
+            roots_into(defs, reach, p, &out)
+            return out
+        InStore(_, _, p, _, _) -> roots_into(defs, reach, p, &out)
+        _ -> ()
+
+    for v in escaping_operands(inst)
+        roots_into(defs, reach, v, &out)
+
+    out
+end touched_roots
+
+// Every `s` that `rooted_at(defs, reach, v, s)` answers true for.
+private roots_into(defs: Map[string, Inst], reach: Reach, v: Val, out: *Buf[string])
+    var cur = v
+
+    loop
+        val n = v_render(cur)
+
+        out.push(n)
+
+        reach.placed.get(n) match
+            Some(s) -> out.push(s)
+            None -> ()
+
+        defs.get(n) match
+            Some(InGep(_, _, p, _)) -> cur = p
+            Some(InGepInBounds(_, _, p, _)) -> cur = p
+            _ -> return
+end roots_into
+
+// Every value a walk back from `v` through `extractvalue` and `insertvalue` meets, `v` among them: the
+// values `origin_of` from `v` can stop at, whatever the field asked for.
+private reached(defs: Map[string, Inst], v: Val) -> Buf[string]
+    var out: Buf[string] = buf()
+    var seen: Set[string] = set()
+    var work: Buf[Val] = buf()
+
+    work.push(v)
+
+    while !work.is_empty()
+        val cur = work.pop().unwrap()
+        val n = v_render(cur)
+
+        if seen.has(n) then continue
+
+        seen.add(n)
+        out.push(n)
+
+        defs.get(n) match
+            Some(InExtract(_, _, agg, _)) -> work.push(agg)
+            Some(InInsert(_, _, agg, _, value, _)) ->
+                work.push(agg)
+                work.push(value)
+            _ -> ()
+
+    out
+end reached
+
 elide_covered(blocks: Buf[IrBlock], clean: Set[string], inert: Set[string], walks: Map[string, ReleaseWalk],
               own: Map[string, int]) -> Buf[IrBlock]
     var defs: Map[string, Inst] = map()
@@ -181,7 +413,9 @@ elide_covered(blocks: Buf[IrBlock], clean: Set[string], inert: Set[string], walk
                             None -> stores.put(slot, SlotStore(b, i, v, 1))
                 _ -> ()
 
-    val reach = Reach(walks, held_slots(blocks, defs, own))
+    val retains = first_retains(blocks, defs)
+    val reach = Reach(walks, held_slots(blocks, defs, own, retains))
+    val sites = sites_of(blocks, defs, inert, reach, retains)
     var dropped: Set[string] = set()
     var claimed: Set[string] = set()
 
@@ -189,9 +423,9 @@ elide_covered(blocks: Buf[IrBlock], clean: Set[string], inert: Set[string], walk
         val instrs = blocks[b].instrs
 
         for i in 0..<instrs.len()
-            cover_at(blocks, defs, stores, clean, reach, b, i) match
+            cover_at(blocks, defs, stores, clean, reach, sites, b, i) match
                 Some(c) ->
-                    val ends = window_ends(blocks, defs, labels, inert, reach, c)
+                    val ends = window_ends(blocks, defs, labels, reach, sites, c)
 
                     if !ends.is_empty()
                         var fresh = true
@@ -227,7 +461,7 @@ end elide_covered
 // of storage, or the copy of a value put together from such reads, whose new count goes nowhere but
 // into values and one clean slot.
 private cover_at(blocks: Buf[IrBlock], defs: Map[string, Inst], stores: Map[string, SlotStore],
-                 clean: Set[string], reach: Reach, b: usize, i: usize) -> Option[Cover]
+                 clean: Set[string], reach: Reach, sites: Sites, b: usize, i: usize) -> Option[Cover]
     val (name, x) = arc_call_of(blocks[b].instrs[i])?
 
     if name == "arc.weak_retain" then return None
@@ -246,20 +480,25 @@ private cover_at(blocks: Buf[IrBlock], defs: Map[string, Inst], stores: Map[stri
     // storage of an argument, by a body that released nothing, so each is alive when the retain runs.
     if slot == ""
         if !zero_answer(defs, from) && (!name.starts_with("arc.copy.") ||
-                                         !built_of_places(blocks, defs, stores, clean, x)) then
+                                         !built_of_places(blocks, defs, stores, clean, sites, x)) then
             return None
-    else if !held_where_read(blocks, defs, stores, clean, from)
+    else if !held_where_read(defs, stores, clean, sites, from)
         return None
 
-    val xs = v_render(x)
     val instrs = blocks[b].instrs
     var inserts: Set[string] = set()
     var into = ""
     var into_path = ""
 
-    for j in i + 1..<instrs.len()
+    // The rest of the block's field writes of `x`, and its stores of a value that may carry it
+    // (`Sites`): no other store can, so the walk of the block they stand for meets these alone.
+    for j in sites.inserts.within(s"$b|${v_render(x)}", i + 1, instrs.len())
         instrs[j] match
-            InInsert(d, _, _, _, v, _) -> if v_render(v) == xs then inserts.add(v_render(d))
+            InInsert(d, _, _, _, _, _) -> inserts.add(v_render(d))
+            _ -> ()
+
+    for j in sites.stores.within(s"$b|${from.leaf}", i + 1, instrs.len())
+        instrs[j] match
             InStore(_, v, p, _, _) ->
                 carried(defs, v, from) match
                     Some(at) ->
@@ -291,7 +530,7 @@ private zero_answer(defs: Map[string, Inst], from: Origin) -> bool = defs.get(fr
 // A field of a plain number counts nothing; any other value -- a call's result, a fresh box, a
 // constant -- is a count no place holds, and keeps the share.
 private built_of_places(blocks: Buf[IrBlock], defs: Map[string, Inst], stores: Map[string, SlotStore],
-                        clean: Set[string], v: Val) -> bool
+                        clean: Set[string], sites: Sites, v: Val) -> bool
     var cur = v
     var fields = 0
 
@@ -306,9 +545,9 @@ private built_of_places(blocks: Buf[IrBlock], defs: Map[string, Inst], stores: M
                 if counted
                     val from = origin_of(defs, value, "", "")
                     val read = if loaded_slot(defs, from.leaf) == "" then false
-                               else held_where_read(blocks, defs, stores, clean, from)
+                               else held_where_read(defs, stores, clean, sites, from)
 
-                    if !read && !built_of_places(blocks, defs, stores, clean, value) then return false
+                    if !read && !built_of_places(blocks, defs, stores, clean, sites, value) then return false
 
                 fields += 1
                 cur = agg
@@ -327,20 +566,20 @@ end built_of_places
 // does when it covers: written once, with a value that holds a count. Any other place -- a field, an
 // element, a global, a slot whose address has left the frame -- is storage the reference was kept
 // in, and storage keeps a count on what it holds.
-private held_where_read(blocks: Buf[IrBlock], defs: Map[string, Inst], stores: Map[string, SlotStore],
-                        clean: Set[string], from: Origin) -> bool
+private held_where_read(defs: Map[string, Inst], stores: Map[string, SlotStore], clean: Set[string], sites: Sites,
+                        from: Origin) -> bool
     val slot = loaded_slot(defs, from.leaf)
 
     if !clean.has(slot) then return true
 
     stores.get(slot) match
-        Some(held) -> held.count == 1 && holds_a_count(blocks, defs, held, from.path)
+        Some(held) -> held.count == 1 && holds_a_count(defs, sites, held, from.path)
         None -> false
 end held_where_read
 
 // Whether the one value stored to a covering slot holds a count on field `path`: a parameter does,
 // and so does a value whose field had a count taken for it earlier in the store's own block.
-private holds_a_count(blocks: Buf[IrBlock], defs: Map[string, Inst], held: SlotStore, path: string) -> bool
+private holds_a_count(defs: Map[string, Inst], sites: Sites, held: SlotStore, path: string) -> bool
     held.value match
         VReg(n) -> if held.block == 0 && n.ends_with(".param") then return true
         _ -> ()
@@ -348,19 +587,13 @@ private holds_a_count(blocks: Buf[IrBlock], defs: Map[string, Inst], held: SlotS
     val want = origin_of(defs, held.value, path, "")
     // A copy of the whole value takes a count on every field of it.
     val whole = origin_of(defs, held.value, "", "")
-    val instrs = blocks[held.block].instrs
 
-    for j in 0..<held.at
-        arc_call_of(instrs[j]) match
-            Some((name, v)) ->
-                if name != "arc.weak_retain" && release_for(name).is_some()
-                    val got = origin_of(defs, v, "", "")
-
-                    if same_place(got, want) || same_place(got, whole) then return true
-            None -> ()
-
-    false
+    // A retain of either before the store, found by the first one of each in the block (`Sites`).
+    taken_before(sites, held, want) || taken_before(sites, held, whole)
 end holds_a_count
+
+private taken_before(sites: Sites, held: SlotStore, o: Origin) -> bool =
+    taken_in(sites.retains, held.block, held.at, o)
 
 // The field of `v` that holds the reference `xs` (read out of `from`), if `v` carries it: a value
 // built by writing it into a field, or a read of the slot field it is part of.
@@ -397,8 +630,8 @@ private same_place(a: Origin, b: Origin) -> bool = a.leaf == b.leaf && a.path ==
 // Every release that gives back the count `c` took, as `block:index`, when each path from the retain
 // reaches one before it returns, runs the retain again, gives back the covering slot's own count or
 // stores to that slot; otherwise nothing.
-private window_ends(blocks: Buf[IrBlock], defs: Map[string, Inst], labels: Map[string, usize],
-                     inert: Set[string], reach: Reach, c: Cover) -> Buf[string]
+private window_ends(blocks: Buf[IrBlock], defs: Map[string, Inst], labels: Map[string, usize], reach: Reach,
+                     sites: Sites, c: Cover) -> Buf[string]
     var ends: Buf[string] = buf()
     var end_names: Buf[string] = buf()
     var others: Buf[(string, Val)] = buf()
@@ -408,43 +641,57 @@ private window_ends(blocks: Buf[IrBlock], defs: Map[string, Inst], labels: Map[s
 
     work.push((c.block, c.at + 1))
 
+    // Each block's stretch is found by key (`Sites`), not walked: where it stops, the release that gives
+    // the share back before that, and only then the other releases in it.
     while !work.is_empty()
         val (b, start) = work.pop().unwrap()
         val instrs = blocks[b].instrs
-        var stopped = false
+        val len = instrs.len()
 
-        for i in start..<instrs.len()
-            if b == c.block && i == c.at then return none
+        // The first instruction that ends the window empty-handed: the retain itself come round again,
+        // a store to the covering slot, a touch of the slot whose count holds the reference (no store
+        // to it, and no read of it, which could hand its count on), or anything not blind to counts.
+        var stop = if start < len then sites.stops[b][start] else len
 
-            val inst = instrs[i]
+        if b == c.block && c.at >= start && c.at < stop then stop = c.at
 
-            inst match
-                InStore(_, _, p, _, _) -> if v_render(p) == c.slot then return none
-                _ -> ()
+        if c.slot != "" then stop = sites.stored_to.first(s"$b|${c.slot}", start, stop)
 
-            // A slot whose count holds the reference is not touched in the window: no store to it, and
-            // no read of it, which could hand its count on.
-            if c.held != "" && touches(defs, reach, inst, c.held) then return none
+        if c.held != "" then stop = sites.touched.first(s"$b|${c.held}", start, stop)
 
-            // The release that gives the share back ends the window. Any other is judged once the
-            // window is known (`holds_across`): it may let go of nothing the share could be, or the
-            // share may be held by a slot's count it cannot give back.
-            arc_call_of(inst) match
-                Some((name, v)) ->
-                    if is_release(name)
-                        if releases_as(c.release, name) && gives_back(defs, c, origin_of(defs, v, "", ""))
-                            ends.push(s"$b:$i")
-                            end_names.push(name)
-                            stopped = true
-                            break
+        // The release that gives the share back ends the window. Any other is judged once the window is
+        // known (`holds_across`): it may let go of nothing the share could be, or the share may be held
+        // by a slot's count it cannot give back.
+        var closing = stop
 
-                        others.push((name, v))
-                        continue
+        for i in sites.releases.within(s"$b|${c.leaf}", start, stop)
+            if i < closing && gives_back_at(defs, c, instrs[i]) then closing = i
+
+        if c.into != ""
+            for i in sites.releases.within(s"$b|=${c.into}", start, stop)
+                if i < closing && gives_back_at(defs, c, instrs[i]) then closing = i
+
+        if closing == stop && stop < len then return none
+
+        // A window running off the block's end goes on only through a branch; anything else ends it.
+        if closing == stop
+            blocks[b].terminator match
+                Some(InBr(_)) -> ()
+                Some(InCondBr(_, _, _)) -> ()
+                Some(InSwitch(_, _, _, _)) -> ()
+                Some(InUnreachable) -> ()
+                _ -> return none
+
+        for i in sites.releases.within(s"$b", start, closing)
+            arc_call_of(instrs[i]) match
+                Some(other) -> others.push(other)
                 None -> ()
 
-            if !count_blind(defs, inert, inst) || suspends(inst) then return none
-
-        if stopped then continue
+        if closing < stop
+            ends.push(s"$b:$closing")
+            end_names.push(arc_call_of(instrs[closing]).unwrap().0)
+            continue
+        end if
 
         var next: Buf[string] = buf()
 
@@ -522,7 +769,8 @@ end holds_across
 // nothing -- and that address is only loaded from; every store to it is of the whole value, and the
 // value stored holds a count on everything in it (`stored_counted`). A `var` given a value read out of
 // storage, as Richards' `run_task` gives `message` the old `self.input`, is one.
-private held_slots(blocks: Buf[IrBlock], defs: Map[string, Inst], own: Map[string, int]) -> Map[string, string]
+private held_slots(blocks: Buf[IrBlock], defs: Map[string, Inst], own: Map[string, int],
+                   retains: Map[string, usize]) -> Map[string, string]
     var placed: Map[string, string] = map()
     var calls: Buf[string] = buf()
 
@@ -562,7 +810,7 @@ private held_slots(blocks: Buf[IrBlock], defs: Map[string, Inst], own: Map[strin
                     val target = v_render(p)
 
                     if placed.has(target) then out_of_reach.add(placed.get(target).unwrap())
-                    if slots.has(target) && !stored_counted(blocks, defs, b, i, v) then out_of_reach.add(target)
+                    if slots.has(target) && !stored_counted(defs, retains, b, i, v) then out_of_reach.add(target)
                 _ -> ()
 
             var first = at_k != ""
@@ -601,33 +849,16 @@ end held_slots
 // that holds nothing, or a value a count was taken for earlier in the store's block (the pass runs
 // before `arc_fastpath.sysl` puts a copy behind its tag test). A parameter is not taken as one: what a
 // borrowed one holds is its caller's.
-private stored_counted(blocks: Buf[IrBlock], defs: Map[string, Inst], b: usize, i: usize, v: Val) -> bool
+// Found by the first retain of the value in the block (`first_retains`), not by a walk of the block up
+// to the store, which costs the square of a long block.
+private stored_counted(defs: Map[string, Inst], retains: Map[string, usize], b: usize, i: usize, v: Val) -> bool =
     v match
-        VZero -> return true
-        VNull -> return true
-        VUndef -> return true
-        VPoison -> return true
-        VReg(_) -> ()
-        _ -> return false
-
-    val whole = origin_of(defs, v, "", "")
-
-    if copies(defs, blocks[b].instrs, i, whole) then return true
-
-    false
-end stored_counted
-
-// Whether a retain of the value at `whole` is among the first `n` of `instrs`.
-private copies(defs: Map[string, Inst], instrs: Buf[Inst], n: usize, whole: Origin) -> bool
-    for j in 0..<n
-        arc_call_of(instrs[j]) match
-            Some((name, x)) ->
-                if name != "arc.weak_retain" && release_for(name).is_some() && same_place(origin_of(defs, x, "", ""), whole)
-                    return true
-            None -> ()
-
-    false
-end copies
+        VZero -> true
+        VNull -> true
+        VUndef -> true
+        VPoison -> true
+        VReg(_) -> taken_in(retains, b, i, origin_of(defs, v, "", ""))
+        _ -> false
 
 // Whether the address `v` is the slot `s` or lies in it: a field address of it, or what a place entry
 // answered on it.
@@ -642,18 +873,10 @@ private rooted_at(defs: Map[string, Inst], reach: Reach, v: Val, s: string) -> b
         _ -> false
 end rooted_at
 
-// Whether `inst` reads, writes or hands on the slot `s`.
-private touches(defs: Map[string, Inst], reach: Reach, inst: Inst, s: string) -> bool
-    inst match
-        InLoad(_, _, p, _, _) -> return rooted_at(defs, reach, p, s)
-        InStore(_, _, p, _, _) -> if rooted_at(defs, reach, p, s) then return true
-        _ -> ()
-
-    for v in escaping_operands(inst)
-        if rooted_at(defs, reach, v, s) then return true
-
-    false
-end touches
+// Whether the release `inst` gives back the count `c` took.
+private gives_back_at(defs: Map[string, Inst], c: Cover, inst: Inst) -> bool = arc_call_of(inst) match
+    Some((name, v)) -> releases_as(c.release, name) && gives_back(defs, c, origin_of(defs, v, "", ""))
+    None -> false
 
 // Whether any part of the value `v` was read out of the slot `s`: followed back through field reads
 // and writes to the loads it was put together from. A register made any other way may be one, so it

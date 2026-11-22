@@ -1,0 +1,219 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map, Set, set}
+import sysl.text.Search
+
+// What dropping a covered share costs as a block grows (`arc_cover.sysl`).
+//
+// **Each question the pass asks of a retain is answered by key, not by walking the block**: the stores
+// and field writes after it its share may go into, the count a slot was given before its store, whether
+// a slot's one store holds a count, and where its window stops. Walked, each is as long as the block, and
+// a block with a retain in every statement -- an entry file's body of thousands of statements, each
+// reading a field into a global -- cost the square of its length (`tests_helper_request.sysl`'s
+// "distinct counted types" grew 55--66x for 8x). Here the pass is run on such a block built by hand, so
+// that the claim is the pass's own and not the lowering's around it; and, beside the measure, the
+// answers the keyed form must keep: the same for each group however many come before and after it, and
+// for a window's stop or end however far from the retain it lies.
+
+// -- blocks built by hand ---------------------------------------------------------------------------
+
+private acg_call(name: string, v: string) -> Inst
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(LPtr, VReg(v)))
+    ir_call(None, LVoid, VGlobal(name), args)
+end acg_call
+
+private acg_load(d: string, p: string) -> Inst = InLoad(VReg(d), LPtr, VReg(p), AccPlain, None)
+
+private acg_store(v: string, p: string) -> Inst = InStore(LPtr, VReg(v), VReg(p), AccPlain, None)
+
+// `%p = getelementptr ptr, ptr %self, i64 %k`: a field of what a parameter refers to.
+private acg_field_at(p: string, k: string) -> Inst
+    var at: Buf[IrArg] = buf()
+
+    at.push(ir_arg(LInt(64), VReg(k)))
+    InGep(VReg(p), LPtr, VReg("self"), at)
+end acg_field_at
+
+// `%d = call ptr @unwrap-place(ptr %slot)`: the address of the payload in the slot's own bytes.
+private acg_place(d: string, slot: string) -> Inst
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(LPtr, VReg(slot)))
+    InCall(Some(VReg(d)), LPtr, VGlobal("unwrap-place"), args, no_ir_attrs(), None, no_fast_math(), false)
+end acg_place
+
+private acg_walks() -> Map[string, ReleaseWalk]
+    var walks: Map[string, ReleaseWalk] = map()
+
+    walks.put("arc.release.Leaf", ReleaseWalk(false, false, set()))
+    walks
+end acg_walks
+
+private acg_own() -> Map[string, int]
+    var own: Map[string, int] = map()
+
+    own.put("unwrap-place", 0)
+    own
+end acg_own
+
+// Group `g`, every question the pass asks in one: a field read into a slot with a count of its own
+// (`v`), the slot's payload read through a place entry (`x`, held by the slot's count) and the slot read
+// whole (`y`, which the slot covers) -- each with its share taken, none given back in the block.
+private acg_group(g: usize, out: *Buf[Inst])
+    out.push(InAlloca(VReg(s"m$g.addr"), LPtr, None))
+    out.push(acg_field_at(s"in$g", s"k$g"))
+    out.push(acg_load(s"v$g", s"in$g"))
+    out.push(acg_call("arc.retain", s"v$g"))
+    out.push(acg_store(s"v$g", s"m$g.addr"))
+    out.push(acg_place(s"a$g", s"m$g.addr"))
+    out.push(acg_load(s"x$g", s"a$g"))
+    out.push(acg_call("arc.retain", s"x$g"))
+    out.push(acg_load(s"y$g", s"m$g.addr"))
+    out.push(acg_call("arc.retain", s"y$g"))
+end acg_group
+
+// `n` groups in one block, which returns (`branch` false) or branches to an empty block that does: every
+// window runs off the block's end, as the entry file's do.
+private acg_groups(n: usize, branch: bool) -> Buf[IrBlock]
+    var entry: Buf[Inst] = buf()
+
+    for g in 0..<n
+        acg_group(g, &entry)
+
+    var blocks: Buf[IrBlock] = buf()
+
+    if branch
+        blocks.push(IrBlock("entry", entry, Some(InCondBr(VReg("c"), "done", "done"))))
+        blocks.push(IrBlock("done", buf(), Some(InRet(None, None))))
+    else
+        blocks.push(IrBlock("entry", entry, Some(InRet(None, None))))
+    end if
+
+    blocks
+end acg_groups
+
+private acg_pass(blocks: Buf[IrBlock]) -> string
+    var inert: Set[string] = set()
+
+    inert.add("quiet")
+
+    var out = ""
+
+    for b in elide_arc_pairs_with(blocks, inert, acg_walks(), acg_own())
+        out = s"$out${b.label}:\n"
+
+        for i in b.instrs
+            out = s"$out  ${inst_render(i)}\n"
+
+        b.terminator match
+            Some(t) -> out = s"$out  ${inst_render(t)}\n"
+            None -> ()
+
+    out
+end acg_pass
+
+private acg_count(text: string, needle: string) -> usize = text.count_of(needle)
+
+// The pass over `n` groups, as work to measure.
+private acg_measure(n: usize) -> &Fn() -> long
+    val blocks = acg_groups(n, false)
+    val walks = acg_walks()
+    val own = acg_own()
+
+    () -> processor_micros(() -> elide_arc_pairs_with(blocks, set(), walks, own))
+end acg_measure
+
+@test("dropping covered shares in a block eight times as long costs about eight times as much, not sixty-four")
+acg_pass_is_linear_in_the_block()
+    val g = growth_of(acg_measure(400), acg_measure(400 * GrowthFactor))
+
+    assert(g.linear(), g.said("the cover pass over one long block"))
+
+@test("each group of a long block keeps what it keeps alone, whether the block returns or branches")
+acg_answers_do_not_depend_on_the_length()
+    for branch in [false, true]
+        val one = acg_pass(acg_groups(1, branch))
+        val many = acg_pass(acg_groups(200, branch))
+
+        assert_eq(acg_count(many, "@arc.retain("), 200 * acg_count(one, "@arc.retain("), many)
+
+        for g in [0, 99, 199]
+            for v in ["v", "x", "y"]
+                assert_eq(acg_count(many, s"@arc.retain(ptr %$v$g)"), acg_count(one, s"@arc.retain(ptr %${v}0)"),
+                          s"$v$g")
+
+// -- a window's stop and end, far from the retain -----------------------------------------------------
+
+// `val e = self.k` read into a local and its share taken, `fill` reads of other fields after it in the
+// block, then in a block of its own `between` and the local given back.
+private acg_far(fill: int, between: Buf[Inst]) -> string
+    var entry: Buf[Inst] = buf()
+
+    entry.push(InAlloca(VReg("e.addr"), LPtr, None))
+    entry.push(acg_field_at("t1.at", "k"))
+    entry.push(acg_load("t1", "t1.at"))
+    entry.push(acg_call("arc.retain", "t1"))
+    entry.push(acg_store("t1", "e.addr"))
+
+    for f in 0..<fill
+        entry.push(acg_field_at(s"f$f.at", s"j$f"))
+        entry.push(acg_load(s"f$f", s"f$f.at"))
+
+    var done: Buf[Inst] = buf()
+
+    for inst in between
+        done.push(inst)
+
+    done.push(acg_load("t9", "e.addr"))
+    done.push(acg_call("arc.release.Leaf", "t9"))
+
+    var blocks: Buf[IrBlock] = buf()
+
+    blocks.push(IrBlock("entry", entry, Some(InCondBr(VReg("c"), "done", "done"))))
+    blocks.push(IrBlock("done", done, Some(InRet(None, None))))
+    acg_pass(blocks)
+end acg_far
+
+private acg_kept(text: string) -> bool = acg_count(text, "@arc.retain(ptr %t1)") == 1
+
+@test("a share given back past a long stretch of field reads goes, as it does past none")
+acg_far_release_ends_the_window()
+    for fill in [0, 1, 300]
+        assert(!acg_kept(acg_far(fill, buf())), s"$fill reads")
+
+@test("a store to the place the reference was read from, a call or an unknown release far into the window keeps the share")
+acg_far_stop_keeps_it()
+    var store: Buf[Inst] = buf()
+
+    store.push(acg_store("other", "t1.at"))
+
+    var call: Buf[Inst] = buf()
+
+    call.push(acg_call("user", "other"))
+
+    var noisy: Buf[Inst] = buf()
+
+    noisy.push(acg_call("arc.release.Noisy", "other"))
+
+    for fill in [0, 300]
+        assert(acg_kept(acg_far(fill, store)), s"a store after $fill reads")
+        assert(acg_kept(acg_far(fill, call)), s"a call after $fill reads")
+        assert(acg_kept(acg_far(fill, noisy)), s"an unknown release after $fill reads")
+
+@test("a call that releases nothing, or a release that holds across, far into the window leaves it whole")
+acg_far_blind_inside()
+    var quiet: Buf[Inst] = buf()
+
+    quiet.push(acg_call("quiet", "other"))
+
+    var leaf: Buf[Inst] = buf()
+
+    leaf.push(acg_call("arc.release.Leaf", "other"))
+
+    for fill in [0, 300]
+        assert(!acg_kept(acg_far(fill, quiet)), s"a quiet call after $fill reads")
+        assert(!acg_kept(acg_far(fill, leaf)), s"a release that holds across after $fill reads")
