@@ -113,3 +113,90 @@ rac_pattern_other_instantiation()
     assert(bound.contains("'G3(…)' does not match a G[4] value"), bound)
     assert(armed.contains("'G3{…}' does not match a G[4] value"), armed)
 end rac_pattern_other_instantiation
+
+// -- a generic alias (`reference/declarations.md`: "just as transparent") -----------------------------
+
+@test("a generic alias of a struct infers its argument from the values")
+rac_generic_inferred()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("struct Bx[T]\n    v: T\n\ntype BA[T] = Bx[T]\n\nval b = BA(5)\nval c: Bx[int] = b\n" +
+                      "print(c.v)\n"), "5\n")
+
+@test("a generic alias of a struct takes its argument from the expected type")
+rac_generic_expected()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("struct Ph[T]\n    n: int\n\ntype PA[T] = Ph[T]\n\nval p: PA[int] = PA(5)\n" +
+                      "val q: Ph[int] = p\nprint(q.n)\n"), "5\n")
+
+@test("a generic alias of a struct constructs at an argument written on it")
+rac_generic_explicit()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("struct Ph[T]\n    n: int\n\ntype PA[T] = Ph[T]\n\nval q: Ph[int] = PA[int](6)\n" +
+                      "print(q.n, PA[string](n = 7).n)\n"), "6 7\n")
+
+@test("a generic alias's default type parameter fills what nothing said")
+rac_generic_default()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("struct Ph[T]\n    n: int\n\ntype PD[T = long] = Ph[T]\n\nval p = PD(5)\n" +
+                      "val q: Ph[long] = p\nprint(q.n)\n"), "5\n")
+
+@test("a generic alias's fixed arguments hold at the call, a value parameter among them")
+rac_generic_fixed_args()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("struct M[T, const N: usize]\n    x: T\n    n: int\n\ntype Q[T] = M[T, 3]\n\n" +
+                      "val m = Q(\"a\", 2)\nval k: M[string, 3] = m\nprint(k.x, k.n)\n"), "a 2\n")
+
+@test("a generic alias's bound is held at the call")
+rac_generic_bound()
+    if !enm_ready() then return
+
+    val said = enm_err("struct Bx[T]\n    v: T\n\ntype NB[T: Integer] = Bx[T]\n\nval b = NB(\"s\")\nprint(b.v)\n")
+
+    assert(said.contains("'NB' requires its type parameter 'T' to implement 'Integer', but string does not"),
+           said)
+
+@test("a value of the wrong type through a generic alias is refused against what the alias fixed")
+rac_generic_wrong_type()
+    if !enm_ready() then return
+
+    val said = enm_err("struct Two[A, B]\n    a: A\n    b: B\n\ntype PS[T] = Two[T, string]\n\n" +
+                       "val p = PS(1, 2)\nprint(p.a)\n")
+
+    assert(said.contains("'b' of 'Two[int, string]' is string, but int was given"), said)
+
+@test("a generic alias with nothing to say what its parameter is asks for the expected type")
+rac_generic_uninferable()
+    if !enm_ready() then return
+
+    val said = enm_err("struct Ph[T]\n    n: int\n\ntype PA[T] = Ph[T]\n\nval p = PA(5)\nprint(p.n)\n")
+
+    assert(said.contains("cannot infer the type argument 'T' of 'PA' here — annotate the expected type"), said)
+
+@test("a generic alias matches as a pattern, and refuses an instantiation it cannot name")
+rac_generic_pattern()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("struct Bx[T]\n    v: T\n\ntype BA[T] = Bx[T]\n\nmain()\n    val BA(x) = Bx(7)\n\n" +
+                      "    Bx(\"s\") match\n        BA{v} -> print(x, v)\n"), "7 s\n")
+
+    val said = enm_err("struct M[T, const N: usize]\n    x: T\n\ntype Q[T] = M[T, 3]\n\nmain()\n" +
+                       "    val Q(a) = M[int, 4](1)\n    print(a)\n")
+
+    assert(said.contains("'Q(…)' does not match a M[int, 4] value"), said)
+end rac_generic_pattern
+
+@test("a generic alias of a tuple is still not called, with or without its arguments")
+rac_generic_tuple_not_called()
+    if !enm_ready() then return
+
+    val bare = enm_err("type Pair[A, B] = (A, B)\n\nprint(Pair(1, 2).0)\n")
+    val applied = enm_err("type Pair[A, B] = (A, B)\n\nprint(Pair[int, int](1, 2).0)\n")
+
+    assert(bare.contains("'Pair' is an alias, and an alias is not something that is called"), bare)
+    assert(applied.contains("this is not something that can be called"), applied)
+end rac_generic_tuple_not_called

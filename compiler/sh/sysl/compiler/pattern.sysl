@@ -759,7 +759,32 @@ private[compiler] names_this_type(cx: &Analyzer, written: string, d: &StructType
     if key.unwrap() == d.base then return true
 
     cx.an.tables.constrained_insts.get(key.unwrap()) match
-        Some(Struct(named)) -> type_eq(Struct(named), Struct(d))
+        Some(Struct(named)) -> return type_eq(Struct(named), Struct(d))
+        _ -> ()
+
+    // **A generic alias matches every instantiation it can name**: `PA(x)` over `type PA[T] = Ph[T]`
+    // matches a `Ph[int]`, its parameters read off the value as a call's are off its arguments, and
+    // the alias at them must BE the value's type -- so `type Q[T] = M[T, 3]` refuses an `M[int, 4]`.
+    val decl = cx.an.tables.types.get(key.unwrap())
+
+    if decl.is_none() then return false
+
+    decl.unwrap().kind match
+        TypeOf(td) ->
+            if !is_plain_alias(td) || td.tp.names.is_empty() then return false
+
+            val home = decl.unwrap().scope
+
+            if alias_struct_head(cx.an, home, td).is_none() then return false
+
+            var bound: Buf[Binding] = buf()
+
+            unify(cx.an, home, td.base, Struct(d), td.tp.names, &bound)
+
+            alias_targs(td, bound) match
+                Ok(targs) if targs.len() == td.tp.names.len() ->
+                    type_eq(resolve_qualified(cx.an, home, td.base, bound), Struct(d))
+                _ -> false
         _ -> false
 end names_this_type
 
