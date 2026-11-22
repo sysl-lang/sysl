@@ -1,0 +1,607 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{cstring, str_builder}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **An argument read out of storage needs no count of its own for its call** (`plus0_locals.sysl`'s
+// `held_backed`, `docs/design/borrow-inference.md` §4.4, decision 10, §10's rows P8's argument half,
+// P9, P10, A3, A16, and an argument to an owned parameter).
+//
+// Two proofs, as §10 asks: the IR of the named function (the count operations `@arc.retain`,
+// `@arc.release`, `@arc.copy.`, `@arc.dispose.`), and runs of every program on the counted heap at
+// both ends of the optimizer and under AddressSanitizer with the instrumentation confirmed -- an
+// argument wrongly held is a use-after-free ASan reports. Every adversarial row asserts the count IS
+// still taken, through its `--explain-borrows` line, and that the run is clean.
+//
+// The axes: the argument's spine (a field through a reference, an element of a slice, a place call's
+// answer, a call's answer held by the statement), its root (a borrowed parameter, an owned local, a +0
+// binding, a pointer parameter, a temporary), the parameter (borrowed, owned), what may kill the chain
+// in the window (the callee's own store, a store through a global, a table call one implementation of
+// which writes the edge, a later argument's store, a later argument handing the root over, a callee's
+// store of a value reaching a pointer root's pointee), and the callee's shape (recursive, generic,
+// jumping to itself). Cells not written: an `async` or `@abandons` callee and a call through a closure,
+// a table or C -- none is ever asked (`staged_args` passes no callee); an argument crossing by address
+// -- never asked, it keeps today's snapshot; a callee in a precompiled `.syslib` -- its summary is
+// opaque (`tests_bls_borrow_edge_summary.sysl`), so it is asked and refused like A16.
+
+private extern "setenv" bla_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" bla_c_unsetenv(name: *u8) -> int
+
+private struct BlaRun
+    ok: bool
+    out: string
+    err: string
+    hooks: usize
+
+private bla_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end bla_ready
+
+// The list most programs walk: `make(5)` is 4, 3, 2, 1, 0.
+private bla_head() -> string = """
+    struct Node
+        v: int
+        next: Option[&Node]
+
+    make(n: int) -> Option[&Node]
+        var head: Option[&Node] = None
+
+        for i in 0..<n
+            head = Some(Node(i, head))
+
+        head
+
+    """
+
+private bla_ir(text: string, level: string) -> string
+    val root = make_temp_dir("sysl-bla").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None, level) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end bla_ir
+
+// One function's emitted text, from its `define` to the brace that closes it: a plain function's
+// `@name$$sysl`, a method's `@Type.name(` (`@Type.name.owned(` for its owning body), or a member of
+// the entry's environment (`@$env0.name(`).
+private bla_body(out: string, name: string) -> string
+    for head in ["@" + name + "$$sysl", "@$env0." + name + "(", "@" + name + "("]
+        var b = str_builder()
+        var inside = false
+
+        for line in lines_of(out)
+            if !inside && line.starts_with("define ") && line.contains(head) then inside = true
+
+            if inside
+                if line == "}" then return b.finish()
+
+                b.push(line)
+                b.push_char('\n')
+
+    s"no definition of '$name' in:\n$out"
+end bla_body
+
+// The count operations of a body: every retain, release, copy and dispose it calls.
+private bla_ops(body: string) -> usize =
+    body.count_of("call void @arc.retain") + body.count_of("call void @arc.release") +
+        body.count_of("call void @arc.copy.") + body.count_of("call void @arc.dispose.")
+
+// `name`'s unoptimized body.
+private bla_f(text: string, name: string) -> string
+    val f = bla_body(bla_ir(text, "0"), name)
+
+    assert(f.starts_with("define"), f)
+    f
+end bla_f
+
+private bla_run(text: string, level: string, counted: bool, flags: string) -> BlaRun
+    val root = make_temp_dir("sysl-bla").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    if counted then force_alloc_counting(true)
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+        val v = cstring(flags)
+
+        bla_c_setenv(n.ptr, v.ptr, 1)
+    end if
+
+    val built = build_native_program(s"$root/main.sysl", None, None, level, Some(exe))
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+
+        bla_c_unsetenv(n.ptr)
+
+    if counted then force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return BlaRun(false, failure_text(why), "", 0)
+        Ok(_) -> ()
+
+    val hooks = capture("nm", ["-u", exe], "", [], true) match
+        Ok(o) -> o.text.count_of("__asan_report")
+        Err(_) -> 0
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> BlaRun(false, "could not be started", "", 0)
+        Ok(o) -> BlaRun(o.status.ok(), o.text, o.err.unwrap_or(""), hooks)
+end bla_run
+
+// Printed exactly `expected` at both ends of the optimizer on the counted heap, giving everything back,
+// and again under AddressSanitizer with the instrumentation in the binary.
+private bla_prints(text: string, expected: string)
+    if !bla_ready() then return
+
+    for level in ["0", "2"]
+        val run = bla_run(text, level, true, "")
+
+        assert(run.ok, s"-O$level: ${run.out}${run.err}")
+        assert_eq(run.out, expected)
+        assert(alloc_count_reported(run.err) == 0, s"-O$level: ${run.err}")
+
+    val asan = bla_run(text, "0", false, "-fsanitize=address -g")
+
+    assert(asan.hooks > 0, "the AddressSanitizer build carries no instrumentation")
+    assert(asan.ok, s"asan: ${asan.out}${asan.err}")
+    assert_eq(asan.out, expected)
+end bla_prints
+
+// The `--explain-borrows` lines about arguments, each without the file it names.
+private bla_explain(text: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    if !bla_ready() then return out
+
+    val root = make_temp_dir("sysl-bla").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    var notes: Buf[string] = buf()
+    val noted = &notes
+    val file = s"$root/main.sysl"
+    var args: Buf[string] = buf()
+
+    args.push("sysl")
+    args.push("emit-llvm")
+    args.push("--explain-borrows")
+    args.push(file)
+    run_cli_noted(args.view(), (line) -> sink.push(line), (line) -> noted.push(line))
+    remove_dir_all(root).unwrap_or(())
+
+    for item in notes
+        if item.starts_with(file + ":") && item.contains(": argument '") then out.push(item[file.len + 1..<item.len])
+
+    out
+end bla_explain
+
+// The line about the argument written `arg` (as `argument 'arg' `), or a complaint listing every line.
+private bla_line(lines: Buf[string], arg: string) -> string
+    for item in lines
+        if item.contains(s"argument '$arg' ") then return item
+
+    s"no line for '$arg' in: $lines"
+end bla_line
+
+// -- what is held -------------------------------------------------------------------------------------
+
+private bla_p8() -> string = bla_head() + """
+    is_shorter_than(x: Option[&Node], y: Option[&Node]) -> bool
+        var x_tail = x
+        var y_tail = y
+
+        while y_tail is Some(yt)
+            x_tail match
+                None -> return true
+                Some(xt) -> x_tail = xt.next
+
+            y_tail = yt.next
+
+        false
+
+    tail(x: Option[&Node], y: Option[&Node], z: Option[&Node]) -> Option[&Node] =
+        if is_shorter_than(y, x)
+            tail(tail(x.unwrap().next, y, z), tail(y.unwrap().next, z, x), tail(z.unwrap().next, x, y))
+        else z
+
+    length(n: Option[&Node]) -> int = n match
+        Some(x) -> 1 + length(x.next)
+        None -> 0
+
+    print(length(tail(make(12), make(8), make(4))))
+
+    """
+
+@test("P8: AWFY's tail hands each inner call x.unwrap().next with no count, not even the unwrap's")
+bla_p8_tail_arguments()
+    if !bla_ready() then return
+
+    // Before, each `x.unwrap()` answer was retained at the place call and released at the statement's
+    // end; the field read through it was never counted. Neither is now.
+    val f = bla_f(bla_p8(), "tail")
+
+    assert_eq(f.count_of("call void @arc.retain("), 0, f)
+    assert_eq(f.count_of("call void @arc.release.Node("), 0, f)
+    bla_prints(bla_p8(), "5\n")
+
+@test("P8: --explain-borrows says each inner argument needs no count, and names the call")
+bla_p8_explained()
+    if !bla_ready() then return
+
+    val lines = bla_explain(bla_p8())
+
+    for arg in ["x.unwrap().next", "y.unwrap().next", "z.unwrap().next"]
+        assert(bla_line(lines, arg).ends_with(s"argument '$arg' of 'tail' needs no count: 'tail' writes no field on its way"),
+               s"$lines")
+
+    assert(bla_line(lines, "x.next").contains("of 'length' needs no count"), s"$lines")
+
+private bla_p9() -> string = """
+    struct Block
+        id: int
+        outs: []&Block
+
+    struct Slot
+        dfs: int
+        bb: Option[&Block]
+
+        init(&self, bb: &Block, dfs: int)
+            self.dfs = dfs
+            self.bb = Some(bb)
+
+    struct Finder
+        slots: []&Slot
+        last: []int
+
+        walk(*self, current_node: &Block, current: int) -> int
+            self.slots[current].init(current_node, current)
+
+            var last_id = current
+            val outs = current_node.outs
+
+            for i in 0..<outs.len
+                last_id = self.walk(outs[i], last_id + 1)
+
+            self.last[current] = last_id
+            last_id
+
+    leaf(id: int) -> &Block = Block(id, [])
+
+    var f = Finder([Slot(0, None), Slot(0, None), Slot(0, None)], [0, 0, 0])
+    val root = Block(0, [leaf(1), leaf(2)])
+
+    print(f.walk(root, 0), f.slots[2].dfs)
+
+    """
+
+@test("P9: Havlak's do_dfs receiver self.nodes[i] is held through *self; the kept block is still retained")
+bla_p9_receiver_held()
+    if !bla_ready() then return
+
+    // Two retains are left, each a genuine count handed over to a parameter that keeps it:
+    // `current_node` to `init`, and `outs[i]` to the recursive `walk`. The receiver's is gone.
+    val f = bla_f(bla_p9(), "Finder.walk.owned")
+
+    assert_eq(f.count_of("call void @arc.retain("), 2, f)
+    assert_eq(f.count_of("call void @arc.release.Slot("), 0, f)
+
+    val lines = bla_explain(bla_p9())
+
+    assert(bla_line(lines, "self.slots[_]").ends_with("of 'init' needs no count: 'init' writes no field on its way"),
+           s"$lines")
+    assert(bla_line(lines, "outs[_]").ends_with("of 'walk' takes a count: 'walk' keeps it"), s"$lines")
+    bla_prints(bla_p9(), "2 2\n")
+
+private bla_p10() -> string = """
+    struct Note
+        n: int
+
+    struct Edge
+        to: &Vert
+        next: Option[&Edge]
+
+    struct Vert
+        mark: int
+        note: Option[&Note]
+        edge: Option[&Edge]
+
+    count(p: &Vert) -> int
+        p.mark += 1
+        p.note = Some(Note(p.mark))
+
+        val e = p.edge
+
+        e match
+            Some(x) -> if x.to.mark == 0 then count(x.to) + 1 else 1
+            None -> 1
+
+    val c: &Vert = Vert(0, None, None)
+    val b: &Vert = Vert(0, None, Some(Edge(c, None)))
+    val a: &Vert = Vert(0, None, Some(Edge(b, None)))
+
+    print(count(a), a.note.unwrap().n)
+
+    """
+
+@test("P10: val e = p.edge across a recursive call that writes other fields holds no count, nor does x.to")
+bla_p10_recursive_call()
+    if !bla_ready() then return
+
+    // `count` writes `Vert.note` and an integer; `e` walks `Vert.edge` and `Edge.to`, which it never
+    // writes, so the recursion's summary misses the chain. The one count left is the new `Note`'s
+    // stored over the old one -- the store's release.
+    val f = bla_f(bla_p10(), "count")
+
+    assert_eq(f.count_of("call void @arc.retain("), 0, f)
+    assert(bla_line(bla_explain(bla_p10()), "x.to").ends_with("of 'count' needs no count: 'count' writes no field on its way"),
+           s"${bla_explain(bla_p10())}")
+    bla_prints(bla_p10(), "3 1\n")
+
+private bla_temp() -> string = bla_head() + """
+    first(n: Option[&Node]) -> int = n match
+        Some(x) -> x.v
+        None -> -1
+
+    box(n: int) -> &Node = Node(n, make(n))
+
+    main()
+        print(first(box(3).next))
+
+    """
+
+@test("a call's answer is a root: its field is held for the call by the statement's temporary")
+bla_temporary_root()
+    if !bla_ready() then return
+
+    assert(bla_line(bla_explain(bla_temp()), "box(…).next").contains("needs no count"), s"${bla_explain(bla_temp())}")
+    bla_prints(bla_temp(), "2\n")
+
+private bla_generic() -> string = """
+    struct Cell[T]
+        item: T
+        next: Option[&Cell[T]]
+
+    size[T](c: Option[&Cell[T]]) -> int = c match
+        Some(x) -> 1 + size(x.next)
+        None -> 0
+
+    val ints: &Cell[int] = Cell(1, Some(Cell(2, None)))
+    val words: &Cell[string] = Cell("a", Some(Cell("b", Some(Cell("c", None)))))
+
+    print(size(ints.next), size(words.next))
+
+    """
+
+@test("a generic callee instantiated twice holds its argument in each instance")
+bla_generic_twice()
+    if !bla_ready() then return
+
+    val lines = bla_explain(bla_generic())
+
+    assert(bla_line(lines, "ints.next").contains("of 'size' needs no count"), s"$lines")
+    assert(bla_line(lines, "words.next").contains("of 'size' needs no count"), s"$lines")
+    bla_prints(bla_generic(), "1 2\n")
+
+// -- what keeps its count -----------------------------------------------------------------------------
+
+private bla_owned() -> string = bla_head() + """
+    struct Keep
+        held: Option[&Node]
+
+    keep(k: &Keep, n: Option[&Node])
+        k.held = n
+
+    main()
+        val l = make(3)
+        val k: &Keep = Keep(None)
+
+        keep(k, l.unwrap().next)
+        print(k.held.unwrap().v)
+
+    """
+
+@test("an argument to an owned parameter is still retained: the callee keeps it")
+bla_owned_parameter()
+    if !bla_ready() then return
+
+    assert(bla_line(bla_explain(bla_owned()), "l.unwrap().next").ends_with("of 'keep' takes a count: 'keep' keeps it"),
+           s"${bla_explain(bla_owned())}")
+    bla_prints(bla_owned(), "1\n")
+
+private bla_a3() -> string = """
+    struct B
+        v: int
+
+    struct A
+        b: &B
+
+    var A_GLOBAL: Option[&A] = None
+
+    f(x: &B) -> int
+        A_GLOBAL.unwrap().b = B(99)
+        x.v
+
+    main()
+        val a: &A = A(B(1))
+
+        A_GLOBAL = Some(a)
+        print(f(a.b), a.b.v)
+        A_GLOBAL = None
+
+    """
+
+@test("A3: f(a.b) where f overwrites a.b through a global keeps the argument's count")
+bla_a3_overwritten_through_a_global()
+    if !bla_ready() then return
+
+    assert(bla_line(bla_explain(bla_a3()), "a.b").ends_with("of 'f' takes a count: 'f' may write A.b"),
+           s"${bla_explain(bla_a3())}")
+    assert(bla_f(bla_a3(), "$$main").contains("call void @arc.retain("), "the guarantee count is gone")
+    bla_prints(bla_a3(), "1 99\n")
+
+private bla_a16() -> string = """
+    struct Node
+        v: int
+        next: Option[&Node]
+
+    trait Visit
+        visit(*self, n: &Node)
+
+    struct Cut
+        hits: int
+
+    impl Visit for Cut
+        visit(*self, n: &Node)
+            self.hits += 1
+            n.next = None
+
+    struct Look
+        hits: int
+
+    impl Visit for Look
+        visit(*self, n: &Node)
+            self.hits += n.v
+
+    walk(w: *Visit, head: &Node, rest: Option[&Node]) -> int
+        w.visit(head)
+
+        rest match
+            Some(r) -> r.v
+            None -> -1
+
+    main()
+        var cut = Cut(0)
+        var look = Look(0)
+        val head: &Node = Node(1, Some(Node(2, None)))
+
+        print(walk(&look, head, head.next))
+        print(walk(&cut, head, head.next))
+
+    """
+
+@test("A16: a callee making a table call one implementation of which writes next keeps the count")
+bla_a16_table_call()
+    if !bla_ready() then return
+
+    val lines = bla_explain(bla_a16())
+
+    assert(lines.len() == 2, s"$lines")
+
+    for item in lines
+        assert(item.ends_with("argument 'head.next' of 'walk' takes a count: 'walk' may write Node.next"), s"$lines")
+
+    bla_prints(bla_a16(), "2\n2\n")
+
+private bla_later() -> string = bla_head() + """
+    cut(n: &Node) -> int
+        n.next = None
+        n.v
+
+    pair(rest: Option[&Node], v: int) -> int = rest match
+        Some(r) -> r.v * 10 + v
+        None -> v
+
+    main()
+        val h = make(3).unwrap()
+
+        print(pair(h.next, cut(h)))
+
+    """
+
+@test("an argument a later argument's call overwrites keeps its count")
+bla_later_argument_writes()
+    if !bla_ready() then return
+
+    val line = bla_line(bla_explain(bla_later()), "h.next")
+
+    assert(line.contains("of 'pair' takes a count: 'cut' at ") && line.ends_with("may write Node.next"), line)
+    bla_prints(bla_later(), "12\n")
+
+private bla_handed() -> string = bla_head() + """
+    struct Keep
+        held: Option[&Node]
+
+    var K: &Keep = Keep(None)
+
+    both(rest: Option[&Node], n: Option[&Node]) -> int
+        K.held = n
+        rest match
+            Some(r) -> r.v
+            None -> -1
+
+    run() -> int
+        val l = make(3)
+
+        both(l.unwrap().next, l)
+
+    print(run())
+    K.held = None
+
+    """
+
+@test("an argument whose root another argument hands to an owned parameter keeps its count")
+bla_root_handed_over()
+    if !bla_ready() then return
+
+    assert(bla_line(bla_explain(bla_handed()), "l.unwrap().next").ends_with("the root 'l' is handed to 'both'"),
+           s"${bla_explain(bla_handed())}")
+    bla_prints(bla_handed(), "1\n")
+
+private bla_pointer() -> string = """
+    struct Slot
+        v: int
+
+    struct Fin
+        slots: []&Slot
+
+        run(*self) -> int = clear(self.slots[0])
+
+    var G: Option[&Fin] = None
+
+    clear(s: &Slot) -> int
+        G = None
+        s.v
+
+    main()
+        G = Some(Fin([Slot(7)]))
+        print(G.unwrap().run())
+
+    """
+
+@test("a pointer root keeps the count where the callee may let go of what reaches its pointee")
+bla_pointer_root_reached()
+    if !bla_ready() then return
+
+    assert(bla_line(bla_explain(bla_pointer()), "self.slots[_]").contains("of 'clear' takes a count: 'clear' may write ") &&
+           bla_line(bla_explain(bla_pointer()), "self.slots[_]").ends_with("which may reach Fin"),
+           s"${bla_explain(bla_pointer())}")
+    bla_prints(bla_pointer(), "7\n")

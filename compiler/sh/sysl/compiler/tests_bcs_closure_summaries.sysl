@@ -1,0 +1,909 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.container.set
+import sysl.text.{cstring, str_builder}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **Closed-world summaries for a call through a table** (`borrowing.sysl`'s `trait_tables`,
+// `table_writes`, `drops`; `docs/design/borrow-inference.md` §4.2): in a program that sees every table,
+// a call through a closure or a trait object is a call to the function in that slot of each table
+// built for the receiver's trait at its arguments, and letting go of such an object runs a destructor
+// only where a type erased into it holds one. A library, which can be handed an object whose table it
+// never saw, keeps both opaque.
+//
+// Two kinds of proof: the summaries of programs typed in-process, and the emitted count operations,
+// output, counted heap and AddressSanitizer run of the shape Richards' scheduler has
+// (`self.function(message, self.handle)` called from a walk over the task list).
+//
+// The axes: how the callee is reached (a closure literal handed to a parameter, a function named as a
+// value, a trait object with one implementation and with two, a generic trait at two argument lists);
+// what the callee set holds (a body that writes an edge, one that only reads, a foreign call, a call
+// through a C function pointer, a body not in the build, a slot a table does not have); recursion
+// through the closure; a generic instantiated twice; the build (a program, a library); and what the
+// object's release can run (captures with a destructor, an implementation with one, a capture behind
+// another trait, a cycle of types back to the closure's own). Cells not written: a `.syslib` linked
+// into a program -- the program's analysis reads every body it reaches, so a table over a precompiled
+// body is still in its view, and the one that is not is the hand-made table below; codegen units --
+// every answer is made on the whole program before it is split (§5).
+
+private extern "setenv" bcs_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" bcs_c_unsetenv(name: *u8) -> int
+
+// -- summaries of a program typed in-process --------------------------------------------------------
+
+private var bcs_library_cache: Buf[Program] = buf()
+private var bcs_library_read: bool = false
+
+private bcs_library() -> Buf[Program]
+    if bcs_library_read then return bcs_library_cache
+
+    bcs_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> bcs_library_cache = units
+
+    bcs_library_cache
+end bcs_library
+
+private bcs_no_library() -> bool
+    if bcs_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end bcs_no_library
+
+private bcs_program(text: string) -> TProgram
+    var units: Buf[Program] = buf()
+
+    for item in bcs_library()
+        units.push(item)
+
+    units.push(parse(source_of("test.sysl", text)).program)
+    program_of(analyze_bodies(units, host_target()), "")
+end bcs_program
+
+private bcs_dropping(p: TProgram) -> Buf[Type]
+    var out: Buf[Type] = buf()
+
+    for item in p.structs
+        for d in p.destructors
+            if d.0 == mangle(item) then out.push(item)
+
+    for item in p.enums
+        for d in p.destructors
+            if d.0 == mangle(item) then out.push(item)
+
+    out
+end bcs_dropping
+
+private bcs_summary(p: TProgram, closed: bool) -> Untouched = untouched_summary(p, bcs_dropping(p), set(), closed)
+
+private bcs_key(name: string) -> string = s"m${ModuleSep}$name"
+
+private bcs_of(u: *Untouched, name: string) -> EdgeWrites = edge_writes(u, bcs_key(name))
+
+private bcs_keys(w: EdgeWrites) -> string
+    var out = ""
+
+    for item in w.keys
+        out = if out == "" then edge_text(item) else s"$out, ${edge_text(item)}"
+
+    out
+end bcs_keys
+
+private bcs_quiet(w: EdgeWrites) -> bool =
+    w.opaque == "" && w.keys.is_empty() && w.within.is_empty() && w.counts.is_empty()
+
+private bcs_says(w: EdgeWrites) -> string =
+    s"keys [${bcs_keys(w)}] within ${w.within.len()} counts ${w.counts.len()} opaque '${w.opaque}' in '${w.opaque_in}'"
+
+// The edge a cut writes, and the `Option` payload it overwrites.
+private const BcsCut: string = "sysl.Option[&m.Node].Some.value, m.Node.next"
+
+private bcs_head() -> string = """
+    module m
+
+    struct Node
+        v: int
+        next: Option[&Node]
+
+    apply(f: &Fn(&Node) -> unit, n: &Node) = f(n)
+
+    """
+
+// `use` hands `apply` the closures `made`; `main` reaches every erasure.
+private bcs_closures(made: string) -> string = bcs_head() + s"""
+    use(n: &Node)
+        $made
+
+    main()
+        use(Node(1, None))
+
+    """
+
+@test("a closure literal handed to a parameter: the call is that closure's body, in a program")
+bcs_closure_literal()
+    if bcs_no_library() then return
+
+    var u = bcs_summary(bcs_program(bcs_closures("apply(x -> x.next = None, n)")), true)
+
+    assert_eq(bcs_keys(bcs_of(&u, "apply")), BcsCut, bcs_says(bcs_of(&u, "apply")))
+    assert_eq(bcs_of(&u, "apply").opaque, "", bcs_says(bcs_of(&u, "apply")))
+
+    // Letting go of the closure runs no destructor: it captured nothing.
+    assert_eq(bcs_of(&u, "use").opaque, "", bcs_says(bcs_of(&u, "use")))
+    assert_eq(bcs_keys(bcs_of(&u, "use")), BcsCut, bcs_says(bcs_of(&u, "use")))
+
+@test("a closure that only reads makes the call through it write nothing")
+bcs_closure_reader()
+    if bcs_no_library() then return
+
+    var u = bcs_summary(bcs_program(bcs_closures("apply(x -> print(x.v), n)")), true)
+
+    assert(bcs_quiet(bcs_of(&u, "apply")), bcs_says(bcs_of(&u, "apply")))
+    assert(bcs_quiet(bcs_of(&u, "use")), bcs_says(bcs_of(&u, "use")))
+
+@test("two closures of one type: the call writes what either writes")
+bcs_closure_two()
+    if bcs_no_library() then return
+
+    var u = bcs_summary(bcs_program(bcs_closures("apply(x -> print(x.v), n)\n    apply(x -> x.next = None, n)")),
+                        true)
+
+    assert_eq(bcs_keys(bcs_of(&u, "apply")), BcsCut, bcs_says(bcs_of(&u, "apply")))
+    assert_eq(bcs_of(&u, "apply").opaque, "", bcs_says(bcs_of(&u, "apply")))
+
+@test("a closure of another type is not followed: a call through a '&Fn(int) -> unit' is not a cut")
+bcs_closure_other_type()
+    if bcs_no_library() then return
+
+    val text = bcs_closures("apply(x -> x.next = None, n)\n    count(k -> print(k), n.v)") + """
+        count(f: &Fn(int) -> unit, k: int) = f(k)
+
+        """
+    var u = bcs_summary(bcs_program(text), true)
+
+    assert(bcs_quiet(bcs_of(&u, "count")), bcs_says(bcs_of(&u, "count")))
+    assert_eq(bcs_keys(bcs_of(&u, "apply")), BcsCut, bcs_says(bcs_of(&u, "apply")))
+
+@test("in a library a call through a closure is opaque, whatever the closures it can see")
+bcs_closure_library()
+    if bcs_no_library() then return
+
+    var p = bcs_program(bcs_closures("apply(x -> print(x.v), n)"))
+
+    var lib = bcs_summary(p, false)
+
+    assert_eq(bcs_of(&lib, "apply").opaque, "a call through a closure", bcs_says(bcs_of(&lib, "apply")))
+
+    // A build that is not a program is not closed even when asked to be.
+    p.entry_point = false
+
+    var asked = bcs_summary(p, true)
+
+    assert_eq(bcs_of(&asked, "apply").opaque, "a call through a closure", bcs_says(bcs_of(&asked, "apply")))
+
+// `pick` answers `$picked`, functions named as values.
+private bcs_picks(picked: string) -> string = bcs_head() + s"""
+    cut(n: &Node) = n.next = None
+
+    look(n: &Node) = print(n.v)
+
+    pick(k: bool) -> &Fn(&Node) -> unit = $picked
+
+    run(n: &Node, k: bool) = pick(k)(n)
+
+    main()
+        run(Node(1, None), true)
+
+    """
+
+@test("a function named as a value: the call is each function the program erases into that type")
+bcs_function_value()
+    if bcs_no_library() then return
+
+    var u = bcs_summary(bcs_program(bcs_picks("if k then cut else look")), true)
+
+    assert_eq(bcs_keys(bcs_of(&u, "run")), BcsCut, bcs_says(bcs_of(&u, "run")))
+    assert_eq(bcs_of(&u, "run").opaque, "", bcs_says(bcs_of(&u, "run")))
+
+    // With only the reader erased there is nothing to write.
+    var looks = bcs_summary(bcs_program(bcs_picks("look")), true)
+
+    assert(bcs_quiet(bcs_of(&looks, "run")), bcs_says(bcs_of(&looks, "run")))
+
+// A trait at two argument lists, each implemented once; `$erased` says which objects are made.
+private bcs_visits(erased: string) -> string = bcs_head() + s"""
+    trait Visit[T]
+        visit(self, t: T)
+
+    struct Cutter
+        k: int
+
+    struct Counter
+        k: int
+
+    impl Visit[&Node] for Cutter
+        visit(self, t: &Node) = t.next = None
+
+    impl Visit[int] for Counter
+        visit(self, t: int) = print(t + self.k)
+
+    go_int(v: *Visit[int], k: int) = v.visit(k)
+
+    go_node(v: *Visit[&Node], n: &Node) = v.visit(n)
+
+    main()
+        var a = Cutter(0)
+        var b = Counter(1)
+        val n = Node(1, None)
+
+        $erased
+
+    """
+
+@test("a trait object's call is the tables of its trait at its own arguments, not at others")
+bcs_trait_arguments()
+    if bcs_no_library() then return
+
+    var u = bcs_summary(bcs_program(bcs_visits("go_int(&b, 3)\n    go_node(&a, n)")), true)
+
+    assert(bcs_quiet(bcs_of(&u, "go_int")), bcs_says(bcs_of(&u, "go_int")))
+    assert_eq(bcs_keys(bcs_of(&u, "go_node")), BcsCut, bcs_says(bcs_of(&u, "go_node")))
+
+// `$cut_with` says whether a `Cut` is erased beside the `Look` that always is.
+private bcs_steps(cut_with: string) -> string = bcs_head() + s"""
+    trait Step
+        step(self, n: &Node)
+
+    struct Cut
+        k: int
+
+    struct Look
+        k: int
+
+    impl Step for Cut
+        step(self, n: &Node) = n.next = None
+
+    impl Step for Look
+        step(self, n: &Node) = print(n.v)
+
+    held(s: &Step, n: &Node) = s.step(n)
+
+    main()
+        val n = Node(1, None)
+
+        held(Look(0), n)
+        $cut_with
+
+    """
+
+@test("a counted trait object with one implementation: its call and its release are that type's")
+bcs_trait_one()
+    if bcs_no_library() then return
+
+    var u = bcs_summary(bcs_program(bcs_steps("")), true)
+
+    // Before, the release alone made it opaque: "a destructor of '&m.Step'".
+    assert(bcs_quiet(bcs_of(&u, "held")), bcs_says(bcs_of(&u, "held")))
+
+@test("a counted trait object with two implementations: its call writes what either writes")
+bcs_trait_two()
+    if bcs_no_library() then return
+
+    var u = bcs_summary(bcs_program(bcs_steps("held(Cut(0), n)")), true)
+
+    assert_eq(bcs_keys(bcs_of(&u, "held")), BcsCut, bcs_says(bcs_of(&u, "held")))
+    assert_eq(bcs_of(&u, "held").opaque, "", bcs_says(bcs_of(&u, "held")))
+
+    var lib = bcs_summary(bcs_program(bcs_steps("held(Cut(0), n)")), false)
+
+    assert_eq(bcs_of(&lib, "held").opaque, "a call through a trait object's table", bcs_says(bcs_of(&lib, "held")))
+
+// -- what the callee set holds that stays opaque ----------------------------------------------------
+
+@test("a closure making a foreign call that is not trusted makes the call through it opaque")
+bcs_closure_foreign()
+    if bcs_no_library() then return
+
+    val text = bcs_head() + """
+        extern "bcs_dots" c_dots(n: int, ...) -> int
+
+        use(n: &Node)
+            apply(x -> print(c_dots(x.v, 2)), n)
+
+        main()
+            use(Node(1, None))
+
+        """
+    var u = bcs_summary(bcs_program(text), true)
+
+    assert_eq(bcs_of(&u, "apply").opaque, "a foreign call to 'm.c_dots'", bcs_says(bcs_of(&u, "apply")))
+
+@test("a closure calling through a C function pointer makes the call through it opaque")
+bcs_closure_pointer()
+    if bcs_no_library() then return
+
+    val text = bcs_head() + """
+        cut(n: &Node)
+            n.next = None
+
+        use(n: &Node)
+            val f: *extern(&Node) -> unit = &cut
+
+            apply(x -> f(x), n)
+
+        main()
+            use(Node(1, None))
+
+        """
+    var u = bcs_summary(bcs_program(text), true)
+
+    assert_eq(bcs_of(&u, "apply").opaque, "a call through a function value", bcs_says(bcs_of(&u, "apply")))
+
+// The table of the program's one closure, of `apply`'s type.
+private bcs_node_table(p: TProgram) -> Option[TVtable]
+    for vt in p.vtables
+        if fn_is_call(vt.trait_name) then return Some(vt)
+
+    None
+end bcs_node_table
+
+@test("a table whose slot names a body not in this build, or has no such slot, is opaque")
+bcs_unseen_table()
+    if bcs_no_library() then return
+
+    var p = bcs_program(bcs_closures("apply(x -> print(x.v), n)"))
+    val found = bcs_node_table(p)
+
+    assert(found.is_some(), s"no closure table among ${p.vtables.len()}")
+
+    // The program's own table: what its closure writes, which is nothing.
+    val vt = found.unwrap()
+    var u = bcs_summary(p, true)
+    val recv = bcs_receiver(p)
+
+    assert(bcs_quiet(table_writes(&u, recv, 0, "a call through a closure")),
+           bcs_says(table_writes(&u, recv, 0, "a call through a closure")))
+
+    // A table over a precompiled body, as an archive's would be.
+    var slots: Buf[TVSlot] = buf()
+
+    slots.push(vt.slots[0] with { target = bcs_key("elsewhere") })
+    p.vtables.push(vt with { slots = slots })
+
+    var v = bcs_summary(p, true)
+    val w = table_writes(&v, recv, 0, "a call through a closure")
+
+    assert_eq(w.opaque, "a call to 'm.elsewhere', whose body is not in this build", bcs_says(w))
+
+    // A slot no table has.
+    val past = table_writes(&u, recv, 9, "a call through a closure")
+
+    assert_eq(past.opaque, "a call through a closure", bcs_says(past))
+end bcs_unseen_table
+
+// The receiver of `apply`'s call, `f`.
+private bcs_receiver(p: TProgram) -> TExpr
+    val sink = bcs_box()
+
+    for f in p.funcs
+        if f.name == bcs_key("apply")
+            walk_block_stmts(f.body, TWalk(true, x -> bcs_note_vcall(sink, x), w -> (), s -> ()))
+
+    assert(sink.x.is_some(), "no call through a table in 'apply'")
+    sink.x.unwrap()
+end bcs_receiver
+
+private struct TExprBox
+    x: Option[TExpr]
+
+private bcs_box() -> &TExprBox = TExprBox(None)
+
+private bcs_note_vcall(sink: &TExprBox, x: TExpr) = *x.kind match
+    TVCall(recv, _, _, _, _) -> sink.x = Some(recv)
+    _ -> ()
+
+// -- recursion and generics -------------------------------------------------------------------------
+
+private bcs_recursive(bottom: string) -> string = bcs_head() + s"""
+    again(n: &Node, depth: int)
+        if depth > 0 then apply(x -> again(x, depth - 1), n) else $bottom
+
+    main()
+        again(Node(1, None), 3)
+
+    """
+
+@test("recursion through a closure settles on what the bodies write")
+bcs_recursion()
+    if bcs_no_library() then return
+
+    var reads = bcs_summary(bcs_program(bcs_recursive("print(n.v)")), true)
+
+    assert(bcs_quiet(bcs_of(&reads, "again")), bcs_says(bcs_of(&reads, "again")))
+    assert(bcs_quiet(bcs_of(&reads, "apply")), bcs_says(bcs_of(&reads, "apply")))
+
+    var cuts = bcs_summary(bcs_program(bcs_recursive("n.next = None")), true)
+
+    assert_eq(bcs_keys(bcs_of(&cuts, "again")), BcsCut, bcs_says(bcs_of(&cuts, "again")))
+    assert_eq(bcs_keys(bcs_of(&cuts, "apply")), BcsCut, bcs_says(bcs_of(&cuts, "apply")))
+
+@test("a generic calling a closure is summarised per instance: each instance follows its own closures")
+bcs_generic()
+    if bcs_no_library() then return
+
+    val text = bcs_head() + """
+        each[T](f: &Fn(T) -> unit, x: T) = f(x)
+
+        main()
+            val n: &Node = Node(1, None)
+
+            each(x -> x.next = None, n)
+            each(k -> print(k), 3)
+
+        """
+    var u = bcs_summary(bcs_program(text), true)
+    var counted = 0
+    var plain = 0
+
+    for name in u.names
+        if name.starts_with(bcs_key("each"))
+            val w = edge_writes(&u, name)
+
+            if bcs_keys(w) == BcsCut && w.opaque == "" then counted += 1
+            else if bcs_quiet(w) then plain += 1
+            else assert(false, s"$name: ${bcs_says(w)}")
+
+    assert(counted == 1 && plain == 1, s"counted $counted plain $plain")
+
+// -- bounded growth ---------------------------------------------------------------------------------
+
+// A struct of `n` counted fields and, for each, a closure of one type that clears it, all handed to
+// `apply_big` -- the shape of a program whose walks take a closure at one type from everywhere.
+private bcs_many(n: int) -> string
+    var b = str_builder()
+
+    b.push(bcs_head())
+    b.push("struct Big\n")
+
+    for i in 0..<n
+        b.push(s"    f$i: Option[&Node]\n")
+
+    b.push("\napply_big(f: &Fn(&Big) -> unit, g: &Big) = f(g)\n\nouter(g: &Big) = apply_big(x -> (), g)\n\nuse(g: &Big)\n")
+
+    for i in 0..<n
+        b.push(s"    apply_big(x -> x.f$i = None, g)\n")
+
+    b.push("\nmain()\n    val n: &Node = Node(1, None)\n    use(Big(")
+
+    for i in 0..<n
+        b.push(if i == 0 then "Some(n)" else ", Some(n)")
+
+    b.push("))\n    outer(Big(")
+
+    for i in 0..<n
+        b.push(if i == 0 then "None" else ", None")
+
+    b.push("))\n")
+    b.finish()
+end bcs_many
+
+@test("a summary naming more than its limit is widened to opaque, and an opaque one keeps no list")
+bcs_bounded()
+    if bcs_no_library() then return
+
+    // Ten fields: each one's edge, and the payload edge they share.
+    var few = bcs_summary(bcs_program(bcs_many(10)), true)
+    val w = bcs_of(&few, "apply_big")
+
+    assert(w.opaque == "" && w.keys.len() == 11, bcs_says(w))
+
+    // More edges than the limit: widened, so neither it nor its callers carry them.
+    var many = bcs_summary(bcs_program(bcs_many(int(EdgeLimit) + 4)), true)
+    val big = bcs_of(&many, "apply_big")
+
+    assert_eq(big.opaque, s"more than $EdgeLimit edges and types to follow", bcs_says(big))
+    assert(big.keys.is_empty() && big.within.is_empty() && big.counts.is_empty(), bcs_says(big))
+    assert_eq(bcs_of(&many, "outer").opaque, big.opaque, bcs_says(bcs_of(&many, "outer")))
+    assert(bcs_of(&many, "outer").keys.is_empty(), bcs_says(bcs_of(&many, "outer")))
+
+@test("joining into an opaque summary adds nothing, and joining an opaque one empties the lists")
+bcs_opaque_absorbs()
+    var w = edge_writes_none()
+    var other = edge_writes_none()
+
+    other.key(slot_key(Unknown))
+    assert(w.join(other), bcs_says(w))
+    assert_eq(w.keys.len(), 1, bcs_says(w))
+
+    var top = edge_writes_none()
+
+    top.hide("why", "here")
+    assert(w.join(top), bcs_says(w))
+    assert(w.keys.is_empty() && w.opaque == "why", bcs_says(w))
+    assert(!w.join(other), bcs_says(w))
+    assert(!w.key(slot_key(Unknown)) && w.keys.is_empty(), bcs_says(w))
+
+// -- what letting go of an object behind a table can run --------------------------------------------
+
+private bcs_res() -> string = """
+    struct Res
+        id: int
+
+    impl Drop for Res
+        drop(self) = print("gone", self.id)
+
+    """
+
+@test("a closure that captured a value with a destructor: letting go of one may run it")
+bcs_drop_capture()
+    if bcs_no_library() then return
+
+    val text = bcs_closures("val r: &Res = Res(1)\n    apply(x -> print(x.v + r.id), n)") + bcs_res()
+    var u = bcs_summary(bcs_program(text), true)
+
+    assert_eq(bcs_of(&u, "apply").opaque, "a destructor of '&Fn(&m.Node) -> unit'", bcs_says(bcs_of(&u, "apply")))
+
+@test("a trait object one of whose implementations has a destructor may run it")
+bcs_drop_trait()
+    if bcs_no_library() then return
+
+    val text = bcs_steps("more(n)") + bcs_res() + """
+        impl Step for Res
+            step(self, n: &Node) = print(self.id)
+
+        more(n: &Node) = held(Res(2), n)
+
+        """
+    var u = bcs_summary(bcs_program(text), true)
+
+    assert_eq(bcs_of(&u, "held").opaque, "a destructor of '&m.Step'", bcs_says(bcs_of(&u, "held")))
+
+@test("a destructor behind a trait a closure captured is found; a cycle of types back to the closure ends")
+bcs_drop_nested()
+    if bcs_no_library() then return
+
+    // The closure holds a `&Step` whose one implementation has a destructor.
+    val nested = bcs_steps("wrap(n)") + bcs_res() + """
+        impl Step for Res
+            step(self, n: &Node) = print(self.id)
+
+        wrap(n: &Node)
+            val s: &Step = Res(3)
+
+            apply(x -> s.step(x), n)
+
+        """
+    var u = bcs_summary(bcs_program(nested), true)
+
+    assert(bcs_of(&u, "apply").opaque.starts_with("a destructor of '"), bcs_says(bcs_of(&u, "apply")))
+
+    // A closure capturing a holder of its own type: the walk ends, and finds nothing.
+    val cyclic = bcs_head() + """
+        struct Holder
+            f: Option[&Fn(&Node) -> unit]
+
+        use(n: &Node)
+            val h = Holder(None)
+
+            apply(x -> if h.f is None then print(x.v), n)
+
+        main()
+            use(Node(1, None))
+
+        """
+    var c = bcs_summary(bcs_program(cyclic), true)
+
+    assert(bcs_quiet(bcs_of(&c, "apply")), bcs_says(bcs_of(&c, "apply")))
+
+// -- Richards' scheduler: counts, output, the counted heap, AddressSanitizer -----------------------
+
+private struct BcsRun
+    ok: bool
+    out: string
+    err: string
+    hooks: usize
+
+private bcs_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end bcs_ready
+
+// A two-task scheduler of Richards' shape: `schedule` walks the task list through `current`, and each
+// task's `run_task` calls its function through the closure it holds, `self.function(message,
+// self.handle)`. `$extra` declares `more`, which adds what other tasks the program has.
+private bcs_richards(extra: string) -> string = s"""
+    struct Packet
+        link: Option[&Packet]
+        datum: int
+
+    struct Rec
+        n: int
+
+    enum TaskData
+        Count(record: &Rec)
+        Plain(k: int)
+
+    type TaskFunction = &Fn(Option[&Packet], TaskData) -> Option[&Task]
+
+    struct Task
+        link: Option[&Task]
+        id: int
+        input: Option[&Packet]
+        function: TaskFunction
+        handle: TaskData
+
+        run_task(*self) -> Option[&Task]
+            var message: Option[&Packet] = None
+
+            if self.input is Some(p)
+                message = self.input
+                self.input = p.link
+
+            self.function(message, self.handle)
+
+    struct Scheduler
+        list: Option[&Task]
+        current: Option[&Task]
+        steps: int
+
+        schedule(&self)
+            self.current = self.list
+
+            while self.current is Some(current)
+                self.steps += 1
+                self.current = current.run_task()
+
+        run_all(&self)
+            var t = self.list
+
+            while t is Some(task)
+                task.run_task()
+                t = task.link
+
+        add(&self, id: int, function: TaskFunction, handle: TaskData)
+            self.list = Some(Task(self.list, id, Some(Packet(None, id)), function, handle))
+
+    counting(s: &Scheduler) -> TaskFunction = (message, data) ->
+        data match
+            Count(r) ->
+                r.n += 1
+                if message is Some(p) then r.n += p.datum
+                if r.n < 20 then s.current else None
+            Plain(_) -> None
+
+    passing(s: &Scheduler) -> TaskFunction = (message, data) ->
+        data match
+            Plain(_) -> s.current match
+                Some(t) -> t.link
+                None -> None
+            Count(_) -> None
+
+    $extra
+
+    val s: &Scheduler = Scheduler(None, None, 0)
+
+    s.add(1, counting(s), Count(Rec(0)))
+    s.add(2, passing(s), Plain(0))
+    more(s)
+    s.schedule()
+    s.run_all()
+    print(s.steps)
+    s.list = None
+    s.current = None
+
+    """
+
+// The two tasks alone.
+private bcs_two() -> string = "more(s: &Scheduler) = ()\n"
+
+// A third task, run first, whose closure may empty the scheduler's task list -- the edge `run_all`'s
+// walk starts from -- so the call through `self.function` may write it.
+private bcs_clearing() -> string = """
+    clearing(s: &Scheduler) -> TaskFunction = (message, data) ->
+        if s.steps > 1000 then s.list = None
+
+        s.current match
+            Some(t) -> t.link
+            None -> None
+
+    more(s: &Scheduler) = s.add(3, clearing(s), Plain(0))
+    """
+
+private bcs_ir(text: string, level: string) -> string
+    val root = make_temp_dir("sysl-bcs").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None, level) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end bcs_ir
+
+private bcs_body(out: string, name: string) -> string
+    var b = str_builder()
+    var inside = false
+
+    for line in lines_of(out)
+        if !inside && line.starts_with("define ") &&
+           (line.contains("@" + name + "$$sysl") || line.contains("@$env0." + name + "(") ||
+            line.contains("." + name + "(")) then inside = true
+
+        if inside
+            if line == "}" then return b.finish()
+
+            b.push(line)
+            b.push_char('\n')
+
+    if inside then b.finish() else s"no definition of '$name' in:\n$out"
+end bcs_body
+
+private bcs_ops(body: string) -> usize =
+    body.count_of("call void @arc.retain") + body.count_of("call void @arc.release") +
+        body.count_of("call void @arc.copy.") + body.count_of("call void @arc.dispose.")
+
+private bcs_explain(text: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    if !bcs_ready() then return out
+
+    val root = make_temp_dir("sysl-bcs").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    var notes: Buf[string] = buf()
+    val noted = &notes
+    val file = s"$root/main.sysl"
+    var args: Buf[string] = buf()
+
+    args.push("sysl")
+    args.push("emit-llvm")
+    args.push("--explain-borrows")
+    args.push(file)
+    run_cli_noted(args.view(), (line) -> sink.push(line), (line) -> noted.push(line))
+    remove_dir_all(root).unwrap_or(())
+
+    for item in notes
+        if item.starts_with(file + ":") && (item.contains("holds no count") || item.contains(" is counted: ")) then
+            out.push(item[file.len + 1..<item.len])
+
+    out
+end bcs_explain
+
+private bcs_line(lines: Buf[string], local: string) -> string
+    for item in lines
+        if item.contains(s"'$local' ") then return item
+
+    s"no line for '$local' in: $lines"
+end bcs_line
+
+private bcs_run(text: string, level: string, counted: bool, flags: string) -> BcsRun
+    val root = make_temp_dir("sysl-bcs").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    if counted then force_alloc_counting(true)
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+        val v = cstring(flags)
+
+        bcs_c_setenv(n.ptr, v.ptr, 1)
+    end if
+
+    val built = build_native_program(s"$root/main.sysl", None, None, level, Some(exe))
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+
+        bcs_c_unsetenv(n.ptr)
+
+    if counted then force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return BcsRun(false, failure_text(why), "", 0)
+        Ok(_) -> ()
+
+    val hooks = capture("nm", ["-u", exe], "", [], true) match
+        Ok(o) -> o.text.count_of("__asan_report")
+        Err(_) -> 0
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> BcsRun(false, "could not be started", "", 0)
+        Ok(o) -> BcsRun(o.status.ok(), o.text, o.err.unwrap_or(""), hooks)
+end bcs_run
+
+// Printed exactly `expected` at both ends of the optimizer on the counted heap, giving everything back,
+// and again under AddressSanitizer with the instrumentation in the binary.
+private bcs_prints(text: string, expected: string)
+    if !bcs_ready() then return
+
+    for level in ["0", "2"]
+        val run = bcs_run(text, level, true, "")
+
+        assert(run.ok, s"-O$level: ${run.out}${run.err}")
+        assert_eq(run.out, expected)
+        assert(alloc_count_reported(run.err) == 0, s"-O$level: ${run.err}")
+
+    val asan = bcs_run(text, "0", false, "-fsanitize=address -g")
+
+    assert(asan.hooks > 0, "the AddressSanitizer build carries no instrumentation")
+    assert(asan.ok, s"asan: ${asan.out}${asan.err}")
+    assert_eq(asan.out, expected)
+end bcs_prints
+
+@test("Richards' tasks: a walk calling each task's closure holds no count, and says where it borrows from")
+bcs_richards_walk()
+    if !bcs_ready() then return
+
+    val lines = bcs_explain(bcs_richards(bcs_two()))
+
+    assert(bcs_line(lines, "task").contains("holds no count: borrowed from 'self' through Scheduler.list, Task.link"),
+           s"$lines")
+    assert(bcs_line(lines, "t").contains("holds no count"), s"$lines")
+
+    // `schedule`'s `current` is no longer kept by the call: what keeps it is the store of the call's
+    // answer to the very edge it was read from, after its last use (the whole-scope rule of +0 locals).
+    assert(bcs_line(lines, "current").contains("a store at ") &&
+           bcs_line(lines, "current").contains("may write Scheduler.current"), s"$lines")
+
+@test("Richards' tasks: the walk's only count operation is letting go of the answer it does not keep")
+bcs_richards_counts()
+    if !bcs_ready() then return
+
+    for level in ["0", "2"]
+        val f = bcs_body(bcs_ir(bcs_richards(bcs_two()), level), "run_all")
+
+        assert(f.starts_with("define"), f)
+
+        // Seven before, with the call opaque: the two locals' retains and releases, and the answer's.
+        if level == "0" then assert_eq(bcs_ops(f), 1, s"-O$level:\n$f")
+        else assert(bcs_ops(f) <= 1, s"-O$level:\n$f")
+
+@test("Richards' tasks with a closure that may empty the task list: the walk keeps its counts, and says why")
+bcs_richards_clearing()
+    if !bcs_ready() then return
+
+    val lines = bcs_explain(bcs_richards(bcs_clearing()))
+
+    assert(bcs_line(lines, "t").contains(" is counted: ") && bcs_line(lines, "t").contains("Scheduler.list"),
+           s"$lines")
+
+    val f = bcs_body(bcs_ir(bcs_richards(bcs_clearing()), "0"), "run_all")
+
+    assert(bcs_ops(f) > 1, f)
+
+@test("Richards' scheduler prints the same on the counted heap at -O0 and -O2, and under ASan")
+bcs_richards_runs()
+    bcs_prints(bcs_richards(bcs_two()), "20\n")
+    bcs_prints(bcs_richards(bcs_clearing()), "21\n")

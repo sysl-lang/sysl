@@ -127,6 +127,8 @@ private struct SlotStore
 // A retain this pass may drop: where it is, the release that gives its count back, the slot whose
 // count covers it and the field of the slot the reference is, the field writes that put the reference
 // into a new value, and the slot that new value was stored into ("" for none) with the field of it.
+// `held` is the slot of the frame whose own count holds the reference, where it was read through a
+// place entry out of that slot's bytes ("" for none): what lets a release sit in the window.
 private struct Cover
     block: usize
     at: usize
@@ -137,8 +139,16 @@ private struct Cover
     inserts: Set[string]
     into: string
     into_path: string
+    held: string
 
-elide_covered(blocks: Buf[IrBlock], clean: Set[string], inert: Set[string]) -> Buf[IrBlock]
+// What a window holding a release asks: the release helpers' walks, and the slots of the frame read
+// only through a place entry answering in their own bytes, by the register each such call answered.
+private struct Reach
+    walks: Map[string, ReleaseWalk]
+    placed: Map[string, string]
+
+elide_covered(blocks: Buf[IrBlock], clean: Set[string], inert: Set[string], walks: Map[string, ReleaseWalk],
+              own: Map[string, int]) -> Buf[IrBlock]
     var defs: Map[string, Inst] = map()
     var stores: Map[string, SlotStore] = map()
     var labels: Map[string, usize] = map()
@@ -171,6 +181,7 @@ elide_covered(blocks: Buf[IrBlock], clean: Set[string], inert: Set[string]) -> B
                             None -> stores.put(slot, SlotStore(b, i, v, 1))
                 _ -> ()
 
+    val reach = Reach(walks, held_slots(blocks, defs, own))
     var dropped: Set[string] = set()
     var claimed: Set[string] = set()
 
@@ -178,9 +189,9 @@ elide_covered(blocks: Buf[IrBlock], clean: Set[string], inert: Set[string]) -> B
         val instrs = blocks[b].instrs
 
         for i in 0..<instrs.len()
-            cover_at(blocks, defs, stores, clean, b, i) match
+            cover_at(blocks, defs, stores, clean, reach, b, i) match
                 Some(c) ->
-                    val ends = window_ends(blocks, defs, labels, inert, c)
+                    val ends = window_ends(blocks, defs, labels, inert, reach, c)
 
                     if !ends.is_empty()
                         var fresh = true
@@ -216,7 +227,7 @@ end elide_covered
 // of storage, or the copy of a value put together from such reads, whose new count goes nowhere but
 // into values and one clean slot.
 private cover_at(blocks: Buf[IrBlock], defs: Map[string, Inst], stores: Map[string, SlotStore],
-                 clean: Set[string], b: usize, i: usize) -> Option[Cover]
+                 clean: Set[string], reach: Reach, b: usize, i: usize) -> Option[Cover]
     val (name, x) = arc_call_of(blocks[b].instrs[i])?
 
     if name == "arc.weak_retain" then return None
@@ -262,7 +273,11 @@ private cover_at(blocks: Buf[IrBlock], defs: Map[string, Inst], stores: Map[stri
                     None -> ()
             _ -> ()
 
-    Some(Cover(b, i, release, slot, from.path, from.leaf, inserts, into, into_path))
+    // A reference read through a place entry out of the bytes of a slot that holds a count on all it is
+    // ever given is held by that count (`held_slots`).
+    val held = if slot == "" then "" else reach.placed.get(slot).unwrap_or("")
+
+    Some(Cover(b, i, release, slot, from.path, from.leaf, inserts, into, into_path, held))
 end cover_at
 
 // Whether the reference at `from` is what a +0 entry answered, or a part of it.
@@ -383,8 +398,10 @@ private same_place(a: Origin, b: Origin) -> bool = a.leaf == b.leaf && a.path ==
 // reaches one before it returns, runs the retain again, gives back the covering slot's own count or
 // stores to that slot; otherwise nothing.
 private window_ends(blocks: Buf[IrBlock], defs: Map[string, Inst], labels: Map[string, usize],
-                     inert: Set[string], c: Cover) -> Buf[string]
+                     inert: Set[string], reach: Reach, c: Cover) -> Buf[string]
     var ends: Buf[string] = buf()
+    var end_names: Buf[string] = buf()
+    var others: Buf[(string, Val)] = buf()
     var none: Buf[string] = buf()
     var seen: Set[usize] = set()
     var work: Buf[(usize, usize)] = buf()
@@ -405,17 +422,24 @@ private window_ends(blocks: Buf[IrBlock], defs: Map[string, Inst], labels: Map[s
                 InStore(_, _, p, _, _) -> if v_render(p) == c.slot then return none
                 _ -> ()
 
-            // The release that gives the share back ends the window; any other runs a destructor,
-            // which is code that could read a count, and so ends the search.
+            // A slot whose count holds the reference is not touched in the window: no store to it, and
+            // no read of it, which could hand its count on.
+            if c.held != "" && touches(defs, reach, inst, c.held) then return none
+
+            // The release that gives the share back ends the window. Any other is judged once the
+            // window is known (`holds_across`): it may let go of nothing the share could be, or the
+            // share may be held by a slot's count it cannot give back.
             arc_call_of(inst) match
                 Some((name, v)) ->
                     if is_release(name)
                         if releases_as(c.release, name) && gives_back(defs, c, origin_of(defs, v, "", ""))
                             ends.push(s"$b:$i")
+                            end_names.push(name)
                             stopped = true
                             break
 
-                        return none
+                        others.push((name, v))
+                        continue
                 None -> ()
 
             if !count_blind(defs, inert, inst) || suspends(inst) then return none
@@ -445,8 +469,209 @@ private window_ends(blocks: Buf[IrBlock], defs: Map[string, Inst], labels: Map[s
                         work.push((to, 0))
                 None -> return none
 
+    for o in others
+        if !holds_across(defs, reach, c, end_names, o.0, o.1) then return none
+
     ends
 end window_ends
+
+// Whether the share `c` takes may go although the release `name` of `v` runs inside its window. That
+// release runs no code -- no destructor, no trait object's or task's teardown, nothing that could read
+// a count or write a place -- and either:
+//
+// - **the reference is held by a slot of the frame** (`c.held`) that holds a count on all it is ever
+//   given, is neither written nor read in the window, and is not what `v` was read out of: the release
+//   gives back some other count, and whatever it lets go of, the slot's count keeps the object; or
+// - **nothing the release can let go of is of the share's type**: its teardown, followed down every
+//   reference it holds, never reaches an object the share could be, so it cannot take that count.
+//
+// Either way the count stays at least one to the window's end, as with no release in it.
+private holds_across(defs: Map[string, Inst], reach: Reach, c: Cover, end_names: Buf[string], name: string,
+                     v: Val) -> bool
+    val w = reach.walks.get(name) match
+        Some(found) -> found
+        None -> return false
+
+    if w.code then return false
+
+    if c.held != "" then return !fed_from(defs, reach, v, c.held, 0)
+
+    if w.wide || end_names.is_empty() then return false
+
+    for closing in end_names
+        if closing.starts_with("arc.release.")
+            if w.keys.has(closing[12..<closing.bytes.len]) then return false
+        else if closing.starts_with("arc.dispose.")
+            val shared = reach.walks.get(closing) match
+                Some(found) -> found
+                None -> return false
+
+            if shared.wide then return false
+
+            for k in shared.keys
+                if w.keys.has(k) then return false
+        else
+            return false
+
+    true
+end holds_across
+
+// **The slots of the frame whose own count holds what is read out of them**, by the register each
+// place call reading one answered. Such a slot is handed to nothing but a place entry answering an
+// address in the bytes it was handed (`own`, `place_entry.sysl`'s `in_own_storage`) -- which writes
+// nothing -- and that address is only loaded from; every store to it is of the whole value, and the
+// value stored holds a count on everything in it (`stored_counted`). A `var` given a value read out of
+// storage, as Richards' `run_task` gives `message` the old `self.input`, is one.
+private held_slots(blocks: Buf[IrBlock], defs: Map[string, Inst], own: Map[string, int]) -> Map[string, string]
+    var placed: Map[string, string] = map()
+    var calls: Buf[string] = buf()
+
+    if own.is_empty() then return placed
+
+    var slots: Set[string] = set()
+
+    for b in blocks
+        for inst in b.instrs
+            inst match
+                InAlloca(d, _, _) -> slots.add(v_render(d))
+                InCall(Some(d), _, VGlobal(callee), args, _, _, _, _) ->
+                    val k = own.get(callee).unwrap_or(-1)
+
+                    if k >= 0 && usize(k) < args.len()
+                        val s = v_render(args[usize(k)].value)
+
+                        if slots.has(s)
+                            placed.put(v_render(d), s)
+                            calls.push(v_render(d))
+                _ -> ()
+
+    if placed.is_empty() then return placed
+
+    var out_of_reach: Set[string] = set()
+
+    for b in 0..<blocks.len()
+        val instrs = blocks[b].instrs
+
+        for i in 0..<instrs.len()
+            val inst = instrs[i]
+            var at_k = ""
+
+            inst match
+                InCall(Some(d), _, VGlobal(_), args, _, _, _, _) -> if placed.has(v_render(d)) then at_k = placed.get(v_render(d)).unwrap()
+                InStore(_, v, p, _, _) ->
+                    val target = v_render(p)
+
+                    if placed.has(target) then out_of_reach.add(placed.get(target).unwrap())
+                    if slots.has(target) && !stored_counted(blocks, defs, b, i, v) then out_of_reach.add(target)
+                _ -> ()
+
+            var first = at_k != ""
+
+            for v in escaping_operands(inst)
+                val n = v_render(v)
+
+                // The one argument of a place call that is the slot it reads, once.
+                if first && n == at_k
+                    first = false
+                    continue
+
+                if slots.has(n) then out_of_reach.add(n)
+                if placed.has(n) then out_of_reach.add(placed.get(n).unwrap())
+
+        blocks[b].terminator match
+            Some(t) ->
+                for v in escaping_operands(t)
+                    val n = v_render(v)
+
+                    if slots.has(n) then out_of_reach.add(n)
+                    if placed.has(n) then out_of_reach.add(placed.get(n).unwrap())
+            None -> ()
+
+    var held: Map[string, string] = map()
+
+    for d in calls
+        val s = placed.get(d).unwrap()
+
+        if !out_of_reach.has(s) then held.put(d, s)
+
+    held
+end held_slots
+
+// Whether the value `v` stored at `blocks[b].instrs[i]` holds a count on everything in it: a constant
+// that holds nothing, or a value a count was taken for earlier in the store's block (the pass runs
+// before `arc_fastpath.sysl` puts a copy behind its tag test). A parameter is not taken as one: what a
+// borrowed one holds is its caller's.
+private stored_counted(blocks: Buf[IrBlock], defs: Map[string, Inst], b: usize, i: usize, v: Val) -> bool
+    v match
+        VZero -> return true
+        VNull -> return true
+        VUndef -> return true
+        VPoison -> return true
+        VReg(_) -> ()
+        _ -> return false
+
+    val whole = origin_of(defs, v, "", "")
+
+    if copies(defs, blocks[b].instrs, i, whole) then return true
+
+    false
+end stored_counted
+
+// Whether a retain of the value at `whole` is among the first `n` of `instrs`.
+private copies(defs: Map[string, Inst], instrs: Buf[Inst], n: usize, whole: Origin) -> bool
+    for j in 0..<n
+        arc_call_of(instrs[j]) match
+            Some((name, x)) ->
+                if name != "arc.weak_retain" && release_for(name).is_some() && same_place(origin_of(defs, x, "", ""), whole)
+                    return true
+            None -> ()
+
+    false
+end copies
+
+// Whether the address `v` is the slot `s` or lies in it: a field address of it, or what a place entry
+// answered on it.
+private rooted_at(defs: Map[string, Inst], reach: Reach, v: Val, s: string) -> bool
+    val n = v_render(v)
+
+    if n == s || reach.placed.get(n).unwrap_or("") == s then return true
+
+    defs.get(n) match
+        Some(InGep(_, _, p, _)) -> rooted_at(defs, reach, p, s)
+        Some(InGepInBounds(_, _, p, _)) -> rooted_at(defs, reach, p, s)
+        _ -> false
+end rooted_at
+
+// Whether `inst` reads, writes or hands on the slot `s`.
+private touches(defs: Map[string, Inst], reach: Reach, inst: Inst, s: string) -> bool
+    inst match
+        InLoad(_, _, p, _, _) -> return rooted_at(defs, reach, p, s)
+        InStore(_, _, p, _, _) -> if rooted_at(defs, reach, p, s) then return true
+        _ -> ()
+
+    for v in escaping_operands(inst)
+        if rooted_at(defs, reach, v, s) then return true
+
+    false
+end touches
+
+// Whether any part of the value `v` was read out of the slot `s`: followed back through field reads
+// and writes to the loads it was put together from. A register made any other way may be one, so it
+// answers yes; a constant answers no.
+private fed_from(defs: Map[string, Inst], reach: Reach, v: Val, s: string, depth: int) -> bool
+    if depth > 64 then return true
+
+    v match
+        VReg(_) -> ()
+        _ -> return false
+
+    defs.get(v_render(v)) match
+        Some(InLoad(_, _, p, _, _)) -> rooted_at(defs, reach, p, s)
+        Some(InExtract(_, _, agg, _)) -> fed_from(defs, reach, agg, s, depth + 1)
+        Some(InInsert(_, _, agg, _, value, _)) -> fed_from(defs, reach, agg, s, depth + 1) ||
+                                                    fed_from(defs, reach, value, s, depth + 1)
+        _ -> true
+end fed_from
 
 // Whether `inst` can neither read a count nor act on what one says. **A count can be read**: storage
 // is let go of by `slot_vacate` only where the strong count is one, so a share dropped from inside
