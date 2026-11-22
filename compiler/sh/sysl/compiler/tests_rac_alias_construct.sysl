@@ -1,0 +1,202 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// A struct is constructed and matched through its alias (`reference/types.md § Type aliases`). An
+// alias of a generic struct names ONE instantiation, so a construction through it has nothing to
+// infer and builds exactly that instantiation -- at a value parameter, a type parameter, or both --
+// and a pattern through it matches exactly that instantiation. The helpers are
+// `tests_enm_enum_run.sysl`'s.
+
+private rac_g() -> string = "struct G[const N: usize]\n    x: int\n\ntype G3 = G[3]\n\n"
+
+@test("an alias of a value-generic struct constructs it")
+rac_value_param()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(rac_g() + "val g = G3(5)\nprint(g.x)\n"), "5\n")
+
+@test("an alias of a type-generic struct whose fields never mention the parameter constructs it")
+rac_phantom_type_param()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("struct Ph[T]\n    n: int\n\ntype PI = Ph[int]\n\nval p = PI(5)\n" +
+                      "val q: Ph[int] = p\nprint(q.n)\n"), "5\n")
+
+// What the values alone would have inferred is not what the alias names: `5` alone is an `int`.
+@test("an alias's own arguments win over what the values would infer")
+rac_alias_args_win()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("struct Bx[T]\n    v: T\n\ntype BI = Bx[long]\n\nval b = BI(5)\n" +
+                      "val c: Bx[long] = b\nprint(c.v)\n"), "5\n")
+
+@test("an alias of an alias constructs what the chain ends at")
+rac_alias_of_alias()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(rac_g() + "type G3b = G3\n\nval g = G3b(5)\nprint(g.x)\n"), "5\n")
+
+@test("an alias mixing a type and a value argument constructs that instantiation")
+rac_type_and_value_params()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("struct M[T, const N: usize]\n    x: T\n    n: int\n\ntype M3 = M[string, 3]\n\n" +
+                      "val m = M3(\"a\", 2)\nval k: M[string, 3] = m\nprint(k.x, k.n)\n"), "a 2\n")
+
+@test("an alias constructs in a function's result, as an argument, and by field name")
+rac_positions()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("struct G[const N: usize]\n    x: int\n    y: int\n\ntype G3 = G[3]\n\n" +
+                      "mk(n: int) -> G3 = G3(n, n)\nuse(g: G[3]) -> int = g.x + g.y\n\n" +
+                      "print(mk(7).x, use(G3(1, 2)), G3(y = 2, x = 1).y)\n"), "7 3 2\n")
+
+@test("an alias whose argument is itself an alias constructs through both")
+rac_nested_alias_arg()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(rac_g() + "struct Bx[T]\n    v: T\n\ntype GB = Bx[G3]\n\nval b = GB(G3(4))\n" +
+                      "print(b.v.x)\n"), "4\n")
+
+@test("an alias of a generic struct with a Drop constructs a counted reference that dies once")
+rac_drop()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("struct R[T]\n    v: T\n\nimpl[T] Drop for R[T]\n    drop(self)\n" +
+                      "        print(\"dropped\")\n\ntype RI = R[long]\n\nmain()\n    val r = RI(5)\n" +
+                      "    val s: &R[long] = r\n    print(s.v)\n"), "5\ndropped\n")
+end rac_drop
+
+@test("a construction through an alias is the instantiation it names, and no other")
+rac_other_instantiation_refused()
+    if !enm_ready() then return
+
+    val said = enm_err(rac_g() + "val g: G[4] = G3(5)\nprint(g.x)\n")
+
+    assert(said.contains("cannot initialize 'g': declared G[4] but the value is G[3]"), said)
+
+@test("a field given the wrong type through an alias is refused against the instantiation")
+rac_wrong_field_refused()
+    if !enm_ready() then return
+
+    val said = enm_err(rac_g() + "val g = G3(\"s\")\nprint(g.x)\n")
+
+    assert(said.contains("'x' of 'G[3]' is int, but string was given"), said)
+
+@test("a plain struct's alias matches in a binding and in an arm, positionally and by name")
+rac_pattern_plain()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("struct Point\n    x: int\n    y: int\n\ntype P = Point\n\nmain()\n" +
+                      "    val P(a, b) = Point(1, 2)\n    val P{y} = Point(3, 4)\n\n    P(5, 6) match\n" +
+                      "        P(c, _) -> print(a, b, y, c)\n\n    P(7, 8) match\n" +
+                      "        P{y: d} -> print(d)\n"), "1 2 4 5\n8\n")
+end rac_pattern_plain
+
+@test("a generic struct's alias matches its instantiation in a binding and in an arm")
+rac_pattern_generic()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(rac_g() + "type G3b = G3\n\nmain()\n    val G3(a) = G3(5)\n\n    G3b(6) match\n" +
+                      "        G3(b) -> print(a, b)\n\n    G[3](7) match\n        G3b{x} -> print(x)\n"),
+              "5 6\n7\n")
+
+@test("an alias's pattern refuses another instantiation of the same struct")
+rac_pattern_other_instantiation()
+    if !enm_ready() then return
+
+    val bound = enm_err(rac_g() + "main()\n    val g: G[4] = G[4](1)\n    val G3(a) = g\n    print(a)\n")
+    val armed = enm_err(rac_g() + "main()\n    G[4](1) match\n        G3{x} -> print(x)\n")
+
+    assert(bound.contains("'G3(…)' does not match a G[4] value"), bound)
+    assert(armed.contains("'G3{…}' does not match a G[4] value"), armed)
+end rac_pattern_other_instantiation
+
+// -- a generic alias (`reference/declarations.md`: "just as transparent") -----------------------------
+
+@test("a generic alias of a struct infers its argument from the values")
+rac_generic_inferred()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("struct Bx[T]\n    v: T\n\ntype BA[T] = Bx[T]\n\nval b = BA(5)\nval c: Bx[int] = b\n" +
+                      "print(c.v)\n"), "5\n")
+
+@test("a generic alias of a struct takes its argument from the expected type")
+rac_generic_expected()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("struct Ph[T]\n    n: int\n\ntype PA[T] = Ph[T]\n\nval p: PA[int] = PA(5)\n" +
+                      "val q: Ph[int] = p\nprint(q.n)\n"), "5\n")
+
+@test("a generic alias of a struct constructs at an argument written on it")
+rac_generic_explicit()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("struct Ph[T]\n    n: int\n\ntype PA[T] = Ph[T]\n\nval q: Ph[int] = PA[int](6)\n" +
+                      "print(q.n, PA[string](n = 7).n)\n"), "6 7\n")
+
+@test("a generic alias's default type parameter fills what nothing said")
+rac_generic_default()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("struct Ph[T]\n    n: int\n\ntype PD[T = long] = Ph[T]\n\nval p = PD(5)\n" +
+                      "val q: Ph[long] = p\nprint(q.n)\n"), "5\n")
+
+@test("a generic alias's fixed arguments hold at the call, a value parameter among them")
+rac_generic_fixed_args()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("struct M[T, const N: usize]\n    x: T\n    n: int\n\ntype Q[T] = M[T, 3]\n\n" +
+                      "val m = Q(\"a\", 2)\nval k: M[string, 3] = m\nprint(k.x, k.n)\n"), "a 2\n")
+
+@test("a generic alias's bound is held at the call")
+rac_generic_bound()
+    if !enm_ready() then return
+
+    val said = enm_err("struct Bx[T]\n    v: T\n\ntype NB[T: Integer] = Bx[T]\n\nval b = NB(\"s\")\nprint(b.v)\n")
+
+    assert(said.contains("'NB' requires its type parameter 'T' to implement 'Integer', but string does not"),
+           said)
+
+@test("a value of the wrong type through a generic alias is refused against what the alias fixed")
+rac_generic_wrong_type()
+    if !enm_ready() then return
+
+    val said = enm_err("struct Two[A, B]\n    a: A\n    b: B\n\ntype PS[T] = Two[T, string]\n\n" +
+                       "val p = PS(1, 2)\nprint(p.a)\n")
+
+    assert(said.contains("'b' of 'Two[int, string]' is string, but int was given"), said)
+
+@test("a generic alias with nothing to say what its parameter is asks for the expected type")
+rac_generic_uninferable()
+    if !enm_ready() then return
+
+    val said = enm_err("struct Ph[T]\n    n: int\n\ntype PA[T] = Ph[T]\n\nval p = PA(5)\nprint(p.n)\n")
+
+    assert(said.contains("cannot infer the type argument 'T' of 'PA' here — annotate the expected type"), said)
+
+@test("a generic alias matches as a pattern, and refuses an instantiation it cannot name")
+rac_generic_pattern()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("struct Bx[T]\n    v: T\n\ntype BA[T] = Bx[T]\n\nmain()\n    val BA(x) = Bx(7)\n\n" +
+                      "    Bx(\"s\") match\n        BA{v} -> print(x, v)\n"), "7 s\n")
+
+    val said = enm_err("struct M[T, const N: usize]\n    x: T\n\ntype Q[T] = M[T, 3]\n\nmain()\n" +
+                       "    val Q(a) = M[int, 4](1)\n    print(a)\n")
+
+    assert(said.contains("'Q(…)' does not match a M[int, 4] value"), said)
+end rac_generic_pattern
+
+@test("a generic alias of a tuple is still not called, with or without its arguments")
+rac_generic_tuple_not_called()
+    if !enm_ready() then return
+
+    val bare = enm_err("type Pair[A, B] = (A, B)\n\nprint(Pair(1, 2).0)\n")
+    val applied = enm_err("type Pair[A, B] = (A, B)\n\nprint(Pair[int, int](1, 2).0)\n")
+
+    assert(bare.contains("'Pair' is an alias, and an alias is not something that is called"), bare)
+    assert(applied.contains("this is not something that can be called"), applied)
+end rac_generic_tuple_not_called

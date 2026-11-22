@@ -554,7 +554,22 @@ private applied_type_call(cx: &Analyzer, span: Span, bracket: Span, name: string
                    s"is what carries a value, as '$name[…].Name(…)'")
         // `UserPtr[Frame](n)`: a `new` type at the arguments written, converted to as the type
         // with no parameters would be.
+        //
+        // `PA[int](6)` over `type PA[T] = Ph[T]`: a generic alias at the arguments written IS the
+        // struct it expands to, so this is that struct's constructor, at that instantiation. One
+        // that expands to anything else -- a tuple, a function type -- has no constructor to name.
         TypeOf(d) ->
+            val home = cx.an.tables.types.get(key).unwrap().scope
+
+            if !d.tp.names.is_empty() && is_plain_alias(d) && alias_struct_head(cx.an, home, d).is_some()
+                val made = instantiate(cx.an, cx.scope, bracket, name, key, targs)
+
+                made match
+                    Struct(sd) -> return struct_call(cx, span, sd.base, name, args, expected, sd.targs)
+                    Unknown -> return bad_expr(span)
+                    _ -> return cx.err(span, "this is not something that can be called")
+            end if
+
             if d.tp.names.is_empty() || !is_phantom_new(d) then
                 return cx.err(span, "this is not something that can be called")
 
@@ -804,16 +819,27 @@ private named_call(cx: &Analyzer, span: Span, callee: Expr, name: string, args: 
             // write everywhere, since an alias is how a package names its own C layer's ABI types
             // without moving them. A *constrained* subtype is a different thing and keeps the
             // conversion it always had: it has a check to run, which is why it is worth writing.
+            //
+            // **An alias of a generic struct names one instantiation**, so its arguments are the
+            // written list the constructor takes, exactly as `G[3](5)` spelled out: `type G3 = G[3]`
+            // makes `G3(5)` a `G[3]` with nothing to infer, and never whatever the values or the
+            // position would have made of `G` alone.
             TypeOf(d) ->
                 if is_plain_alias(d)
                     behind_alias(cx, tkey.unwrap()) match
                         Some(Struct(sd)) ->
-                            return struct_call(cx, span, sd.base, name, args, expected)
+                            return struct_call(cx, span, sd.base, name, args, expected, sd.targs)
                         Some(Enum(ed)) -> return enum_cast_at(cx, span, Enum(ed), name, args)
                         // Any other base is converted to exactly as its own name would be:
                         // `Tick(n)` over a `u32` is `u32(n)`, refusals included.
                         Some(other) -> return convert_call(cx, span, name, other, args)
                         None -> ()
+
+                if is_plain_alias(d) && !d.tp.names.is_empty()
+                    val built = generic_alias_call(cx, span, tkey.unwrap(), d, name, args, expected)
+
+                    if built.is_some() then return built.unwrap()
+                end if
 
                 return constrained_call(cx, span, tkey.unwrap(), name, args, expected)
             _ -> ()
@@ -2479,6 +2505,114 @@ end format_count
 // is what makes it transparent: there is no check to carry and nothing to be a second name for.
 private behind_alias(cx: &Analyzer, key: string) -> Option[Type] =
     cx.an.tables.constrained_insts.get(key)
+
+// The struct a generic alias expands to, where its right-hand side names one: the struct's key, its
+// declaration, and the arguments the alias writes on it, in the alias's own terms. None for an alias
+// of anything else -- a tuple, a function type -- which has no constructor to call.
+private[compiler] alias_struct_head(a: &Analysis, home: Scope,
+                                    td: TypeDecl) -> Option[(string, StructDecl, Buf[TypeRef])]
+    *td.base.kind match
+        NamedType(n, arg_refs) ->
+            val key = lookup_type_key(a, home, n)
+
+            if key.is_none() then return None
+
+            a.tables.types.get(key.unwrap()) match
+                Some(decl) -> decl.kind match
+                    StructOf(sd) -> Some((key.unwrap(), sd, arg_refs))
+                    _ -> None
+                None -> None
+        _ -> None
+end alias_struct_head
+
+// The arguments a generic alias is applied at, read off what its parameters bound: each in order,
+// and where every one left is unbound and has a default, the list stops there so the defaults fill
+// them in. An error names the first parameter nothing said anything about.
+private[compiler] alias_targs(td: TypeDecl, bound: Buf[Binding]) -> Result[Buf[Type], string]
+    var out: Buf[Type] = buf()
+
+    for i in 0..<td.tp.names.len()
+        val t = bound_type(bound, td.tp.names[i])
+
+        if t.is_none()
+            for j in i..<td.tp.names.len()
+                if bound_type(bound, td.tp.names[j]).is_some() || !has_default(td, td.tp.names[j]) then
+                    return Err(td.tp.names[i])
+
+            return Ok(out)
+        end if
+
+        out.push(t.unwrap())
+
+    Ok(out)
+end alias_targs
+
+private has_default(td: TypeDecl, name: string) -> bool
+    for item in td.tp.defaults
+        if item.name == name then return true
+
+    false
+end has_default
+
+// `PA(5)` over `type PA[T] = Ph[T]`: **a generic alias is as transparent as a plain one**
+// (`reference/declarations.md`), so a call through it is the constructor of the struct it expands
+// to, at the alias's arguments worked out the way a generic struct's are -- from the type the
+// position expects, then from the values read against the struct's fields -- and carried back
+// through the alias's right-hand side. The alias is then applied at what was found, so its own
+// fixed arguments, defaults and bounds hold exactly as where it is written as a type. None where
+// the alias names no struct, which leaves the refusal it always had.
+private generic_alias_call(cx: &Analyzer, span: Span, key: string, td: TypeDecl, written: string,
+                           args: Buf[Expr], expected: Option[Type]) -> Option[TExpr]
+    val home = cx.an.tables.types.get(key).unwrap().scope
+    val head = alias_struct_head(cx.an, home, td)
+
+    if head.is_none() then return None
+
+    val (skey, sd, arg_refs) = head.unwrap()
+    val shome = cx.an.tables.types.get(skey).unwrap().scope
+    var bound: Buf[Binding] = buf()
+
+    if expected.is_some()
+        expected.unwrap() match
+            Struct(e) -> if e.base == skey then unify(cx.an, home, td.base, Struct(e), td.tp.names, &bound)
+            _ -> ()
+    end if
+
+    var from_values: Buf[Binding] = buf()
+
+    for item in field_args(sd, args)
+        if item.0 < 0 then continue
+
+        val typ = sd.fields[usize(item.0)].typ
+
+        if ref_mentions(typ, sd.tparams)
+            val read = texpr_type(sandboxed_read(cx, item.1, None))
+
+            // A value that could not be read has been, or will be, told about; the parameter it
+            // leaves open is a consequence, voiced as the struct's own constructor voices it.
+            if mentions_unknown(read)
+                voice_unknown_fields(cx, sd, args)
+                return Some(bad_expr(span))
+            end if
+
+            unify(cx.an, shome, typ, read, sd.tparams, &from_values)
+        end if
+
+    for i in 0..<arg_refs.len()
+        if i < sd.tparams.len()
+            bound_type(from_values, sd.tparams[i]) match
+                Some(t) -> unify(cx.an, home, arg_refs[i], t, td.tp.names, &bound)
+                None -> ()
+
+    alias_targs(td, bound) match
+        Err(open) ->
+            Some(cx.err(Span(span.start, span.start + written.bytes.len),
+                        s"cannot infer the type argument '$open' of '$written' here — annotate the " +
+                        "expected type"))
+        Ok(targs) -> instantiate(cx.an, cx.scope, span, written, key, targs) match
+            Struct(made) -> Some(struct_call(cx, span, made.base, written, args, expected, made.targs))
+            _ -> Some(bad_expr(span))
+end generic_alias_call
 
 private constrained_call(cx: &Analyzer, span: Span, key: string, written: string,
                          args: Buf[Expr], expected: Option[Type]) -> TExpr
