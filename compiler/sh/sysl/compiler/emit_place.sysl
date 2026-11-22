@@ -1323,6 +1323,12 @@ private gen_slice_of(e: *Emit, parts: (Val, Val, Option[Val]), lo: Option[TExpr]
     // `str_ptr` spilled, which the substring must not outlive, so the run is moved into the value
     // instead (`str_short_run`). Its owner is null either way, so the share taken above was nothing.
     // An empty run is the long form, as an empty string always is.
+    //
+    // **The owner is written into the chosen value once more, after the select**: it is null in both
+    // arms where the source is short, so the value is the same, and the substring is then visibly
+    // built by writing the shared owner into its field -- the shape `arc_cover.sysl` follows from the
+    // share to the release that gives it back. Through the select alone it sees no owner at all, and
+    // a substring taken in a checked loop keeps a count it does not need.
     val whole = source match
         Some(src) ->
             val held = str_short_run(e, src, start, n)
@@ -1334,9 +1340,13 @@ private gen_slice_of(e: *Emit, parts: (Val, Val, Option[Val]), lo: Option[TExpr]
 
             emit(e, InBin(both, OpAnd, l_i1(), str_is_short(e, src), some))
 
+            val chosen = fresh_reg(e)
+
+            emit(e, InSelect(chosen, both, lt, held, long_view, l_i1()))
+
             val r = fresh_reg(e)
 
-            emit(e, InSelect(r, both, lt, held, long_view, l_i1()))
+            emit(e, InInsert(r, lt, chosen, LPtr, owner, index_list(0)))
             r
         None -> long_view
 
