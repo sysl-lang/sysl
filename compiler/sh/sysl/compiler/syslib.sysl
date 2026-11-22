@@ -257,6 +257,12 @@ is_artifact(path: string) -> bool = path.ends_with(SyslibExtension)
 // links: each compiled body keeps the mode it was compiled in, and both modes are defined behaviour.
 // It follows the symbols so that a reader that knows nothing of it reads the rest unchanged, and a
 // library with no such line was built before there were modes, when every build wrapped.
+//
+// **The string form is recorded and matched** (`short_strings.sysl`): a body built with the short
+// form on reads a string's last word as a tag, and one built with it off reads it as a length, so a
+// library and a program that disagree read each other's strings as garbage. The line `strings short`
+// sits between the symbols and the mode, and only where the form is on -- a library without it holds
+// every string long, which is what every library built before the form existed does.
 syslib_metadata(t: Target, fingerprint: string, symbols: Buf[string]) -> string
     var b = str_builder()
 
@@ -273,9 +279,14 @@ syslib_metadata(t: Target, fingerprint: string, symbols: Buf[string]) -> string
         b.push(item)
         b.push("\n")
 
+    if short_strings_on() then b.push(s"$SyslibShortLine\n")
+
     b.push(s"mode ${build_mode_name()}\n")
     b.finish()
 end syslib_metadata
+
+// The line a library built with the short string form carries (`syslib_metadata`).
+val SyslibShortLine = "strings short"
 
 // The build mode a library's metadata records: `debug` or `release`.
 syslib_mode(meta: string) -> string =
@@ -499,8 +510,24 @@ syslib_read(name: string, meta: string, t: Target) -> Result[(Buf[string], strin
 
     if symbols.len() < count.unwrap() then return Err(s"$name is a truncated sysl library")
 
+    var short = false
+
+    while i < lines.len()
+        if lines[i] == SyslibShortLine then short = true
+
+        i += 1
+
+    if short != short_strings_on()
+        return Err(s"$name ${strings_held(short)} and this program ${strings_held(short_strings_on())} -- " +
+            "every body reads a string's words one way, so a library compiled with the other form " +
+            "cannot be linked into it. Rebuild the library with SYSL_SHORT_STRINGS set as this build has it")
+
     Ok((symbols, fingerprint))
 end syslib_read
+
+// How a build holds its strings, for `syslib_read`'s refusal.
+private strings_held(short: bool) -> string =
+    if short then "holds a short string in the string itself" else "holds every string on the heap or in a literal"
 
 private split_lines(text: string) -> Buf[string]
     var out: Buf[string] = buf()

@@ -720,6 +720,15 @@ run()
 'register' keeps its parameter 'ctx' (its declaration says '@keeps(ctx)'), and '&count' is the address of a local of 'run'
 ```
 
+**A `string` handed to a kept parameter carries one count to C**, as
+[`into_raw`](#handing-c-an-object-to-hold) does for an object: what C keeps stays alive for as long as
+C holds it, however soon the program lets go of its own copy. C hands the count back by answering the
+string from an `extern` — an answered string is the caller's, and goes when the caller's reference
+does — and one C never hands back is held for the rest of the program. The rule is the same whatever
+the string holds: one whose bytes live in the string itself is copied to the heap for C first, and a
+literal, whose bytes live in read-only data, needs no count at all. A string lent to a parameter
+`@keeps` does not name crosses for the call only, and carries nothing.
+
 **It marks an `extern` function and nothing else**: a sysl body is read for the answer, and a
 variable is never called. It names the function's own parameters, each once, and there is no empty
 form — an `extern` that keeps nothing says so by not writing it:

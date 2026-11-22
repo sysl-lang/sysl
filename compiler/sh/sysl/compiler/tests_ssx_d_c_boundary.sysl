@@ -9,8 +9,9 @@ import sysl.text.{Search, join}
 // **A string at the C boundary where the short form is on** (`emit_foreign.sysl`'s `to_c` and
 // `from_c`, `docs/design/short-strings.md` § 5.6 item 3). A string handed to an `extern` by value
 // always arrives in the long form -- `{owner, address, length}` -- whatever form sysl held it in: lent
-// for the call, a short one's bytes are a frame slot's; handed to a parameter `@keeps` names, they are
-// a heap copy whose count goes with them to C. A string an `extern` answers is checked to be long.
+// for the call, a short one's bytes are a frame slot's; handed to a parameter `@keeps` names, a short
+// one is a heap copy and a long one has a share taken, and either way that one count goes to C. A
+// string an `extern` answers is checked to be long.
 //
 // The C beside each program reads the three words itself, so what it sees is the convention's, not
 // this compiler's. Every run is on the counted heap and must give back every allocation.
@@ -25,10 +26,7 @@ import sysl.text.{Search, join}
 // Skipped cells, with the reason: running a 32-bit program (no 32-bit runner in the suite; the IR is
 // read instead); a string inside a struct, tuple or enum handed by value (it crosses in the form it
 // holds, as one read through a pointer does -- the design's § 5.6 item 3); a variadic extra (it is
-// classified by the same path as a declared parameter, so the lent cell covers it); a long string
-// handed to a kept parameter (it crosses unchanged, as it did before, and C holds no count of it, so
-// handing it back would release a count C never had -- a property of `@keeps` itself, not of the
-// form); `--release` and LTO (the normalisation is a pair of `insertvalue`s on the value C is handed,
+// classified by the same path as a declared parameter, so the lent cell covers it); `--release` and LTO (the normalisation is a pair of `insertvalue`s on the value C is handed,
 // which optimisation cannot reorder past the call that reads it).
 
 private val ssx_d_c = raw"""
@@ -223,8 +221,10 @@ ssx_d_lent_at_every_length()
 // -- kept past the call -------------------------------------------------------------------------------
 
 // Strings made in a frame that is gone, and a stack written over, before C reads them; then C hands
-// each back and the caller gives its count back. Only with the form on: with it off, the kept strings
-// are long and C holds no count of them (see the skipped cells).
+// each back and the caller gives its count back. With the form off and on, short and long alike: C
+// holds one count of each kept string whatever its form (decision D-SS1-4), so handing every one back
+// is net zero both ways. Before SS1-5 a long one carried no count, and handing it back released one
+// the program still held.
 private val ssx_d_kept = """
     @keeps(s)
     extern ssx_keep(s: string)
@@ -250,6 +250,8 @@ private val ssx_d_kept = """
         val keep: *extern(@keeps string) -> unit = &ssx_keep
 
         keep(made(15))
+        ssx_keep(made(16))
+        keep(made(20) + made(20))
         keep("literal")
 
     clobber(depth: int) -> int
@@ -260,26 +262,30 @@ private val ssx_d_kept = """
     keep_some()
     print(clobber(8))
 
-    val lens = [0, 1, 14, 15, 7]
+    val lens = [0, 1, 14, 15, 16, 40, 7]
 
-    for i in 0..<5
-        val want = if i == 4 then "literal" else made(lens[i])
+    for i in 0..<7
+        val want = if i == 6 then "literal" else if i == 5 then made(20) + made(20) else made(lens[i])
 
         print(s"held$i ${ssx_held_len(i)} ${ssx_held_hash(i) == fnv(want)}")
 
-    for i in 0..<5
+    for i in 0..<7
         val s = ssx_give()
 
-        print(s"back ${s.len} [$s]")
+        val head = if s.len < 3 then s else s[0..<3]
+
+        print(s"back ${s.len} [$head]")
     """
 
-@test("ssx_d a short string handed to a @keeps parameter is a heap copy C reads after the frame and hands back")
+@test("ssx_d a string handed to a @keeps parameter carries one count to C in either form, read after the frame and handed back")
 ssx_d_kept_past_the_call()
     if !ssx_d_ready() then return
 
-    ssx_d_prints(ssx_d_kept, true,
-                 "36\nheld0 0 true\nheld1 1 true\nheld2 14 true\nheld3 15 true\nheld4 7 true\n" +
-                 "back 7 [literal]\nback 15 [abcdefghijklmno]\nback 14 [abcdefghijklmn]\nback 1 [a]\nback 0 []\n")
+    for short in [false, true]
+        ssx_d_prints(ssx_d_kept, short,
+                     "36\nheld0 0 true\nheld1 1 true\nheld2 14 true\nheld3 15 true\nheld4 16 true\n" +
+                     "held5 40 true\nheld6 7 true\nback 7 [lit]\nback 40 [abc]\nback 16 [abc]\n" +
+                     "back 15 [abc]\nback 14 [abc]\nback 1 [a]\nback 0 []\n")
 
 // -- what C answers -----------------------------------------------------------------------------------
 
@@ -351,8 +357,9 @@ private val ssx_d_ir_text = """
 
 // The 32-bit split convention hands the three words over as `[3 x i32]`; the long form is laid into
 // the value first (two `insertvalue`s on the string's type that the form off does not have), the kept
-// parameter goes through the heap copy, and the answer of neither is checked, since neither is a
-// string. With the form off nothing of it is there.
+// parameter goes through `sysl.str.unshort` (a heap copy of a short one, a share of a long one), and
+// the answer of neither is checked, since neither is a string. With the form off the kept parameter
+// has a share taken and nothing else is there.
 @test("ssx_d the long form is laid in before a 32-bit split call and a wasm32 call, and only where the form is on")
 ssx_d_ir_at_32_bits()
     if !clang_available() then return
@@ -364,8 +371,11 @@ ssx_d_ir_at_32_bits()
 
         assert_eq(ssx_d_count(on, shape), 2, s"$t\n$on")
         assert_eq(ssx_d_count(off, "insertvalue"), 0, s"$t\n$off")
-        assert(holds_text(on, s"call { ptr, ptr, $word } @sysl.str.for_c("), s"$t\n$on")
-        assert(!holds_text(off, "sysl.str.for_c"), s"$t\n$off")
+        assert(holds_text(on, s"call { ptr, ptr, $word } @sysl.str.unshort("), s"$t\n$on")
+        assert(!holds_text(off, "sysl.str.unshort"), s"$t\n$off")
+
+        // The kept parameter's count for C: a share of the long string where the form is off.
+        assert(holds_text(off, "@arc.retain_maybe("), s"$t\n$off")
 
         if t == "thumb-freestanding-softfp" then assert(holds_text(on, "@take([3 x i32]"), on)
 
