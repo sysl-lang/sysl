@@ -62,12 +62,16 @@ struct TableArg
     answered: bool
 end TableArg
 
-// A box this body laid in its frame: the slot it was laid in (`v_render`), its payload, and whether a
-// factory's frame entry laid it (the call is where it is built) rather than this body.
+// A box this body laid in its frame: the slot it was laid in (`v_render`), its payload, whether a
+// factory's frame entry laid it (the call is where it is built) rather than this body, and whether the
+// escape walk followed it (`stack_box.sysl`). A closure the closure analysis framed
+// (`closure_mode.sysl`'s `framed_box`) was not followed, so no call it was handed had its parameters
+// asked about, and no answer of one is known to be something else.
 struct FrameRoot
     slot: string
     payload: Type
     by_call: bool
+    walked: bool
 end FrameRoot
 
 // What a register or a slot is to the box being followed.
@@ -113,7 +117,10 @@ drop_frame_counts(e: *Emit, blocks: Buf[IrBlock]) -> Buf[IrBlock]
 end drop_frame_counts
 
 private uncounted(e: *Emit, blocks: Buf[IrBlock], root: FrameRoot) -> Option[Buf[IrBlock]]
-    val held = frame_holders(blocks, root, e.fresh_answers, e.table_calls)
+    // `fresh_answers` says a call answers something other than a box it was handed only of the
+    // parameters the walk asked about, which are those some walked box reached.
+    val fresh: Set[string] = if root.walked then e.fresh_answers else set()
+    val held = frame_holders(blocks, root, fresh, e.table_calls)
     val uses = frame_uses(e, blocks, root, held)?
     val finals = frame_finals(blocks, uses)?
 
