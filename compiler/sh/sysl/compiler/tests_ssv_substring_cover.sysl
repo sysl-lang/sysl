@@ -1,0 +1,175 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A substring of a string that may be short is chosen between the short run and the long view
+// (`gen_slice_of`), and the owner it shares is written into the chosen value once more so the
+// covered-count pass (`arc_cover.sysl`) can follow it from the share to the release. These tests pin
+// that a substring of a parameter taken in a checked loop takes no count with the short form on and
+// off, read by index or empty; that one kept beyond the loop keeps its count; and that
+// the programs print what they did and leave the counted heap at zero for a long heap string, a short
+// heap string, a literal and an empty run.
+
+private ssv_source() -> string = raw"""
+    count_param(s: string) -> usize
+        var n: usize = 0
+
+        for i in 0..<s.len
+            val v = s[i..<i + 1]
+
+            n += v.len
+
+        n
+
+    count_while(s: string) -> usize
+        var n: usize = 0
+        var i: usize = 0
+
+        while i < s.len
+            val v = s[i..<i + 1]
+
+            n += usize(v.bytes[0])
+            i += 1
+
+        n
+
+    count_empty(s: string) -> usize
+        var n: usize = 0
+
+        for i in 0..<s.len
+            val v = s[i..<i]
+
+            n += v.len + 1
+
+        n
+
+    keep_last(s: string) -> string
+        var last = ""
+
+        for i in 0..<s.len
+            last = s[i..<i + 1]
+
+        last
+    """
+
+private ssv_ir(name: string, short: bool) -> string
+    force_short_strings(short)
+
+    val ir = emit_func_text(ssv_source(), name)
+
+    unforce_short_strings()
+    assert(ir.starts_with("define"), ir)
+    ir
+end ssv_ir
+
+private ssv_pairless(name: string, short: bool)
+    if xvr_no_library() then return
+
+    val ir = ssv_ir(name, short)
+
+    assert_eq(ir.contains("@arc.retain"), false, ir)
+    assert_eq(ir.contains("@arc.release"), false, ir)
+    assert(ir.contains("@sysl.trap") || ir.contains("@sysl.bounds.fail("), ir)
+
+// -- the IR -------------------------------------------------------------------------------------------
+
+@test("ssv a substring of a parameter in a checked for loop takes no count, short form on")
+ssv_param_on() = ssv_pairless("count_param", true)
+
+@test("ssv a substring of a parameter in a checked for loop takes no count, short form off")
+ssv_param_off() = ssv_pairless("count_param", false)
+
+@test("ssv a substring read by index in a while loop takes no count, short form on")
+ssv_while_on() = ssv_pairless("count_while", true)
+
+@test("ssv an empty substring in a checked loop takes no count, short form on")
+ssv_empty_on() = ssv_pairless("count_empty", true)
+
+@test("ssv a substring kept beyond the loop keeps its count, short form on and off")
+ssv_kept()
+    if xvr_no_library() then return
+
+    for short in [true, false]
+        val ir = ssv_ir("keep_last", short)
+
+        assert(ir.contains("@arc.retain"), ir)
+
+// -- the program --------------------------------------------------------------------------------------
+
+private struct SsvRun
+    ok: bool
+    code: int
+    out: string
+    err: string
+
+private ssv_run(main: string, short: bool) -> SsvRun
+    val root = make_temp_dir("sysl-ssv").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", main).unwrap()
+    force_alloc_counting(true)
+    force_short_strings(short)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization,
+                                     Some(s"$root/built"))
+
+    unforce_short_strings()
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return SsvRun(false, -1, failure_text(why), "")
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> SsvRun(false, -1, "could not be started", "")
+        Ok(o) -> SsvRun(true, shell_status(o.status), o.text, o.err.unwrap_or(""))
+end ssv_run
+
+private ssv_main() -> string = ssv_source() + "\n" + raw"""
+    val word = "abcdefghij"
+    val long = s"$word$word$word"
+    val small = s"${word[0..<3]}xy"
+
+    print(count_param(long))
+    print(count_param(small))
+    print(count_param("hello"))
+    print(count_while(long))
+    print(count_while(small))
+    print(count_empty(long))
+    print(count_empty(""))
+    print(keep_last(long))
+    print(keep_last(small))
+    print(keep_last("hello"))
+    """
+
+private ssv_expect() -> string = "30\n5\n5\n3045\n535\n30\n0\nj\ny\no\n"
+
+@test("ssv the substring loops print what they should and leave the counted heap at zero, short form on")
+ssv_run_on()
+    if xvr_no_library() || !clang_available() then return
+
+    val run = ssv_run(ssv_main(), true)
+
+    assert(run.ok, run.out)
+    assert_eq(run.code, 0, run.out + run.err)
+    assert_eq(run.out, ssv_expect())
+    assert_eq(run.err.contains(alloc_count_said()), false, run.err)
+
+@test("ssv the substring loops print what they should and leave the counted heap at zero, short form off")
+ssv_run_off()
+    if xvr_no_library() || !clang_available() then return
+
+    val run = ssv_run(ssv_main(), false)
+
+    assert(run.ok, run.out)
+    assert_eq(run.code, 0, run.out + run.err)
+    assert_eq(run.out, ssv_expect())
+    assert_eq(run.err.contains(alloc_count_said()), false, run.err)
