@@ -28,11 +28,25 @@ gen_expr(e: *Emit, x: TExpr) -> Val
 
     e.trap_site = Some(x.span)
 
-    val v = gen_expr_kind(e, x)
+    val v = gen_operator_or_kind(e, x)
 
     e.trap_site = outer
     v
 end gen_expr
+
+// **An operator does not pass through `gen_expr_kind`**, whose frame holds the locals of every arm
+// at once -- some 32 KiB of stack. A chain of operators is lowered by recursion on its operands, one
+// level per operator, so that frame paid once per level put a 300-term sum past the system's stack
+// (`tests_dpn_deep_operators.sysl`); the operators' own lowerings cost a few KiB a level, as the
+// analyzer's do. What nesting of any kind still needs is the stack the compiler runs on
+// (`compiler_stack.sysl`).
+private gen_operator_or_kind(e: *Emit, x: TExpr) -> Val = *x.kind match
+    TBinary(op, l, r, ty) -> expansion_at(e, x) match
+        Some(t) -> gen_expr(e, t)
+        None -> gen_binary(e, op, l, r, ty, x.span)
+    TUnary(op, operand, ty) -> gen_unary(e, op, operand, ty, x.span)
+    TLogical(op, l, r) -> gen_logical(e, op, l, r)
+    _ -> gen_expr_kind(e, x)
 
 private gen_expr_kind(e: *Emit, x: TExpr) -> Val = *x.kind match
     TIntLit(v, _) -> VInt(v)
@@ -182,11 +196,9 @@ private gen_expr_kind(e: *Emit, x: TExpr) -> Val = *x.kind match
 
         VNothing
 
-    TBinary(op, l, r, ty) -> expansion_at(e, x) match
-        Some(t) -> gen_expr(e, t)
-        None -> gen_binary(e, op, l, r, ty, x.span)
-    TUnary(op, operand, ty) -> gen_unary(e, op, operand, ty, x.span)
-    TLogical(op, l, r) -> gen_logical(e, op, l, r)
+    TBinary(_, _, _, _) -> gen_operator_or_kind(e, x)
+    TUnary(_, _, _) -> gen_operator_or_kind(e, x)
+    TLogical(_, _, _) -> gen_operator_or_kind(e, x)
     TCompare(operands, cmps) -> gen_compare(e, operands, cmps)
 
     TStore(place, value, ty, yields) -> yielded(yields, gen_store(e, place, value, ty))

@@ -5,6 +5,8 @@ import sysl.buf.{Buf, buf}
 import sysl.fs.read_bytes
 import sysl.cpu_count
 import sysl.prints
+import sysl.slices.as_ptr
+import sysl.sync.Atomic
 import sysl.text.{join, split, Search}
 
 // The driver: what the shell asked for, and what it hears back.
@@ -2084,7 +2086,26 @@ main(args: []string)
             build_tests_with(executable_path())
     end if
 
-    val code = run_cli_noted(args,
+    val run: &sync CliRun = CliRun(as_ptr(args), args.len, Atomic(i32(Fine)))
+
+    on_compiler_stack(&run_cli_here, &*run)
+    flush_report()
+
+    val code = int(run.code.load())
+
+    if code != Fine then exit(code)
+end main
+
+// What the thread the command line runs on is handed (`compiler_stack.sysl`): the arguments, as their
+// storage and their count -- a slice may not cross to another thread, a pointer may, and `main` waits
+// on the thread with the slice alive -- and where its exit status is left.
+private struct CliRun
+    args: *string
+    count: usize
+    code: Atomic[i32]
+
+private run_cli_here(run: *CliRun)
+    val code = run_cli_noted(run.args[0..<run.count],
         line ->
             flush_report()
             said_to_terminal(line),
@@ -2092,6 +2113,4 @@ main(args: []string)
             flush_report()
             eprints(line + "\n"))
 
-    flush_report()
-
-    if code != Fine then exit(code)
+    run.code.store(i32(code))
