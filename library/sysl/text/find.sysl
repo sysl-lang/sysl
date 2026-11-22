@@ -47,6 +47,22 @@ trait Search
     /** The bytes to look at. This is the whole of what a `string` and a `[]const u8` disagree about. */
     view(self) -> []const u8
 
+    /** **The same bytes, lent from where the caller holds the receiver**, which is what every member
+     * below reads. `view` takes the receiver by value, so a `string` of fifteen bytes or fewer -- one
+     * holding its bytes in the value itself -- has them only in the member's own frame, and handing
+     * them back from there costs a heap copy on every call. This member takes `*self` and is marked
+     * `@views(self)`, so its `self.bytes` is read at the caller's storage with no copy, and the view
+     * it answers lives no longer than the name it was asked through and is refused if that name is
+     * written while it is held (`reference/memory.md § A view borrowed from its receiver`).
+     *
+     * `view` stays as it was because it is called on anything: a `val`, a pattern binding, a
+     * temporary, and a `[]u8` asked for its `[]const u8`. A `*self` member needs a `var` to point at,
+     * and a `@views(self)` one a name. The default answers `view`, which is right for any receiver
+     * whose bytes are not in the value; `string` overrides it.
+     */
+    @views(self)
+    view_in_place(*self) -> []const u8 = self.view()
+
     /** A piece of the receiver, as the receiver's own type -- what lets a trim answer with a view
      * rather than a copy, and what a default cannot do for itself because it does not know how to
      * build a `Self`.
@@ -58,22 +74,22 @@ trait Search
     /** There is deliberately no `len` here: both implementations already have one the compiler
      * provides, and a trait member of that name would hide it rather than agree with it.
      */
-    is_empty(self) -> bool = self.view().len == 0
+    is_empty(self) -> bool = self.view_in_place().len == 0
 
     /** The empty prefix is a prefix of everything, which falls out of the comparison rather than
      * being said: two slices of no elements are equal.
      */
     starts_with(self, prefix: Self) -> bool
-        var h = self.view()
-        var n = prefix.view()
+        var h = self.view_in_place()
+        var n = prefix.view_in_place()
 
         if n.len > h.len then return false
 
         h[0..<n.len] == n
 
     ends_with(self, suffix: Self) -> bool
-        var h = self.view()
-        var n = suffix.view()
+        var h = self.view_in_place()
+        var n = suffix.view_in_place()
 
         if n.len > h.len then return false
 
@@ -86,7 +102,7 @@ trait Search
      * the convention every library shares and the one that makes `split` on an empty separator
      * terminate.
      */
-    index_of(self, needle: Self) -> Option[usize] = find_from(self.view(), needle.view(), 0)
+    index_of(self, needle: Self) -> Option[usize] = find_from(self.view_in_place(), needle.view_in_place(), 0)
 
     /** The same search begun part-way along, which is what walks every occurrence without cutting
      * the haystack up: `index_of_from(n, k + 1)` is the next one after `k`.
@@ -103,27 +119,27 @@ trait Search
      * needle is found at `from` while `from` is a position at all, and `h.len` is a position.
      */
     index_of_from(self, needle: Self, from: usize) -> Option[usize] =
-        find_from(self.view(), needle.view(), from)
+        find_from(self.view_in_place(), needle.view_in_place(), from)
 
     /** The empty needle is found at the end here rather than at 0, which is the same convention read
      * from the other side: the last place it occurs.
      */
-    last_index_of(self, needle: Self) -> Option[usize] = rfind_from(self.view(), needle.view(), 0)
+    last_index_of(self, needle: Self) -> Option[usize] = rfind_from(self.view_in_place(), needle.view_in_place(), 0)
 
     /** The last occurrence at or after `from` -- the backward search over the same suffix the
      * forward one takes, per the rule on `index_of_from`.
      */
     last_index_of_from(self, needle: Self, from: usize) -> Option[usize] =
-        rfind_from(self.view(), needle.view(), from)
+        rfind_from(self.view_in_place(), needle.view_in_place(), from)
 
-    index_of_byte(self, b: u8) -> Option[usize] = find_byte_from(self.view(), b, 0)
+    index_of_byte(self, b: u8) -> Option[usize] = find_byte_from(self.view_in_place(), b, 0)
 
-    index_of_byte_from(self, b: u8, from: usize) -> Option[usize] = find_byte_from(self.view(), b, from)
+    index_of_byte_from(self, b: u8, from: usize) -> Option[usize] = find_byte_from(self.view_in_place(), b, from)
 
-    last_index_of_byte(self, b: u8) -> Option[usize] = rfind_byte_from(self.view(), b, 0)
+    last_index_of_byte(self, b: u8) -> Option[usize] = rfind_byte_from(self.view_in_place(), b, 0)
 
     last_index_of_byte_from(self, b: u8, from: usize) -> Option[usize] =
-        rfind_byte_from(self.view(), b, from)
+        rfind_byte_from(self.view_in_place(), b, from)
 
     contains(self, needle: Self) -> bool = self.index_of(needle).is_some()
 
@@ -133,7 +149,7 @@ trait Search
      * this once per byte trimmed.
      */
     has_byte(self, b: u8) -> bool
-        for x in self.view()
+        for x in self.view_in_place()
             if x == b then return true
 
         false
@@ -142,7 +158,7 @@ trait Search
      * them -- so `count_of` and the number of replacements `replace_all` makes always agree. In
      * `"aaa"` there is one `"aa"`, not two.
      */
-    count_of(self, needle: Self) -> usize = count_bytes(self.view(), needle.view())
+    count_of(self, needle: Self) -> usize = count_bytes(self.view_in_place(), needle.view_in_place())
 
     // --- Trimming, which answers with a view of the receiver rather than a copy. ---
 
@@ -160,7 +176,7 @@ trait Search
      * bound left behind is one the receiver already had.
      */
     trim_start(self) -> Self
-        var h = self.view()
+        var h = self.view_in_place()
         var i: usize = 0
 
         while i < h.len && h[i].is_space()
@@ -170,7 +186,7 @@ trait Search
     end trim_start
 
     trim_end(self) -> Self
-        var h = self.view()
+        var h = self.view_in_place()
         var n = h.len
 
         while n > 0 && h[n - 1].is_space()
@@ -180,7 +196,7 @@ trait Search
     end trim_end
 
     trim(self) -> Self
-        var h = self.view()
+        var h = self.view_in_place()
         var i: usize = 0
         var n = h.len
 
@@ -205,7 +221,7 @@ trait Search
      * asking it of the cutset rather than of the receiver is the whole difference.
      */
     trim_start_matches(self, cutset: Self) -> Self
-        var h = self.view()
+        var h = self.view_in_place()
         var i: usize = 0
 
         while i < h.len && cutset.has_byte(h[i])
@@ -215,7 +231,7 @@ trait Search
     end trim_start_matches
 
     trim_end_matches(self, cutset: Self) -> Self
-        var h = self.view()
+        var h = self.view_in_place()
         var n = h.len
 
         while n > 0 && cutset.has_byte(h[n - 1])
@@ -235,6 +251,9 @@ end Search
  */
 impl Search for string
     view(self) -> []const u8 = self.bytes
+
+    @views(self)
+    override view_in_place(*self) -> []const u8 = self.bytes
 
     slice(self, lo: usize, hi: usize) -> string = self[lo..<hi]
 

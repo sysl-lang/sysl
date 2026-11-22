@@ -3,7 +3,8 @@ module sh.sysl.compiler
 import sysl.env.{get as env_var}
 
 // **Whether a string may hold its bytes in the value itself** (`docs/design/short-strings.md`,
-// option A), asked with `SYSL_SHORT_STRINGS=1` while the form is being built.
+// option A). The form is on unless `SYSL_SHORT_STRINGS=0` turns it off, which is the diagnostic
+// switch: a build with it off emits every string byte for byte as before the form existed.
 //
 // A short string is the three words of every string, laid out as
 //
@@ -16,26 +17,36 @@ import sysl.env.{get as env_var}
 // The empty string is never short. With the switch off no string is short and every emitted byte is
 // what it was before the form existed.
 
-// Set by a test that builds in-process, where setting the environment would reach every other test.
-private var short_strings_forced: bool = false
+// Set by a test that builds in-process, where setting the environment would reach every other test:
+// the form it asked for, on or off, until `unforce_short_strings` hands the choice back.
+private var short_strings_forced: Option[bool] = None
 
 force_short_strings(on: bool)
-    short_strings_forced = on
+    short_strings_forced = Some(on)
+
+unforce_short_strings()
+    short_strings_forced = None
 
 private var short_strings_read: bool = false
-private var short_strings_env: bool = false
+private var short_strings_env: bool = true
 
-// Whether this build makes and reads the short form.
+// Whether this build makes and reads the short form: on, unless a test forced it or
+// `SYSL_SHORT_STRINGS=0` turned it off.
 short_strings_on() -> bool
-    if short_strings_forced then return true
+    short_strings_forced match
+        Some(on) -> return on
+        None -> ()
 
     if !short_strings_read
-        short_strings_env = env_var("SYSL_SHORT_STRINGS").unwrap_or("") == "1"
+        short_strings_env = short_strings_asked(env_var("SYSL_SHORT_STRINGS"))
         short_strings_read = true
     end if
 
     short_strings_env
 end short_strings_on
+
+// What a value of `SYSL_SHORT_STRINGS` asks for: the form, unless the value is `0`.
+short_strings_asked(value: Option[string]) -> bool = value.unwrap_or("") != "0"
 
 // What the switch adds to an artifact's key: nothing when it is off, so every key made before the
 // form existed is unchanged.
@@ -54,6 +65,23 @@ string_known_long(x: TExpr) -> bool = *x.kind match
     TStr(arg) -> underlying(texpr_type(arg)) == Str && string_known_long(arg)
     TSlice(base, _, _, _, _) -> underlying(texpr_type(base)) == Str && string_known_long(base)
     _ -> false
+
+// **Whether `.bytes` of `receiver`, in a member marked `@views(self)`, is read at the receiver's own
+// place** (`reference/memory.md § A view borrowed from its receiver`): the receiver is the member's
+// `*self`, a string the caller holds at an address, so its bytes -- in the value or not -- already
+// have one, and the view is made over that storage with no slot and no copy. The mark's rules keep it
+// sound: the caller calls through a name, the view never outlives that name, and the name is not
+// written while the view is held. `views` is whether the body is such a member.
+bytes_at_receiver(views: bool, receiver: TExpr) -> bool
+    if !views then return false
+
+    *receiver.kind match
+        TDeref(inner, _) -> *inner.kind match
+            TLoad(name, ty) -> name == "self" && underlying(texpr_type(receiver)) == Str &&
+                               pointee(ty).is_some()
+            _ -> false
+        _ -> false
+end bytes_at_receiver
 
 // The most bytes a short string holds on a machine of `word_bits`: every byte of the two words after
 // the owner but the tag's.

@@ -1458,6 +1458,17 @@ $ sysl build --explain-escapes tty.sysl
 tty.sysl:31:12: 'buf' is promoted to the heap, because this view of it is returned
 ```
 
+The `.bytes` of a string that may [hold its bytes in itself](/reference/strings/#a-string-of-a-few-bytes-holds-them-in-itself)
+is a slot of the frame in the same way, and a view of it that outlives the frame is a copy, reported
+on its own line at the `.bytes`:
+
+```
+name.sysl:8:5: 's.bytes' is the bytes of a string that may be held in the string itself, so it is copied to the heap, because this view of it is returned
+```
+
+`sysl test` takes the flag as a build does, and `sysl test <library> --std --explain-escapes` is how
+the standard library's own promotions are listed.
+
 The idiom worth reaching for first, even with an allocator, is **return a count and let the caller
 slice its own buffer** — what `snprintf` does, and what most kernel code wants.
 
@@ -1546,8 +1557,8 @@ run()
 freed
 ```
 
-The view is an ordinary `[]const u8`; nothing changes at run time. The mark adds one lexical fact:
-**the view lives no longer than the name it was called through**, and four things are refused:
+The view is an ordinary `[]const u8`. The mark adds one lexical fact: **the view lives no longer than
+the name it was called through**, and four things are refused:
 
 1. **a receiver that is not a name** — a temporary is freed at the end of its statement;
 2. **the view leaving the function that holds its receiver** — returned, or what the body comes to,
@@ -1557,6 +1568,35 @@ The view is an ordinary `[]const u8`; nothing changes at run time. The mark adds
    one holds, closes first and is fine);
 4. **freeing the receiver while a local holding the view is in scope** — assigning the name, a
    `*self` call on it, or a call that may write an object of its type.
+
+**One thing changes at run time, and it is what those four rules make safe: a member that takes
+`*self` reads `self.bytes` of a string where the caller holds it.** A string of a few bytes
+[holds them in itself](/reference/strings/#a-string-of-a-few-bytes-holds-them-in-itself), so
+`s.bytes` is ordinarily a copy in the frame that took it, and a member answering that copy would
+have to copy it again to the heap to hand it back. In a `@views(self)` member taking `*self` the
+string is at the caller's address, which the view may not outlive and which may not be written while
+it is held, so the view is made over that storage — no slot and no copy, short or long. A `(self)`
+member, or one without the mark, keeps the copy. `Search.view_in_place` is written this way, which is
+why a search of a short string allocates nothing:
+
+```sysl
+trait Bytes
+    @views(self)
+    lend(*self) -> []const u8
+
+impl Bytes for string
+    @views(self)
+    lend(*self) -> []const u8 = self.bytes
+
+var s = 1234.to_string()
+val b = s.lend()
+
+print(b.len, b[0])
+```
+
+```output
+4 49
+```
 
 What a view is copied into — a sub-slice, a struct or `Option` around it, a closure capturing it, a
 name a pattern binds, a loop variable over a view of views — is borrowed from the same receiver; a

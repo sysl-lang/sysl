@@ -452,6 +452,15 @@ print(strlen(cs.ptr))
 `cstring` copies the text into the NUL-terminated shape C reads and *owns* that copy, which is how a
 language with no manual free says who frees it.
 
+**A `string` handed by value is lent for the call.** A string of a few bytes
+[holds them in its own words](/reference/strings/#a-string-of-a-few-bytes-holds-them-in-itself), and
+C has no notion of that form, so such a string crosses as three long-shaped words whose pointer is a
+copy in the caller's frame — good until the call returns. A C function that keeps the string past the
+call is declared [`@keeps`](#keeps-a-c-function-that-holds-on-to-a-pointer) and gets a heap copy
+instead. A raw pointer taken of a string's bytes (`as_ptr(s.bytes)`) follows the same rule and is
+refused where it would outlive the frame; lend it at the call. C that reads a `string` through memory
+— a field of a struct it holds a pointer to — reads the form itself, laid out on the strings page.
+
 **What crosses by value is not the programmer's business.** A struct, a tuple, a view, an enum —
 every aggregate — is handed over in whichever registers the machine's C convention names, which is
 not the same as the registers a sysl-to-sysl call would use and is not what LLVM does with an

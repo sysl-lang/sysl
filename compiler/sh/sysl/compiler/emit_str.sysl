@@ -54,19 +54,36 @@ str_ptr(e: *Emit, v: Val) -> Val
     val slot = alloca(e, fresh_reg(e), st)
 
     emit(e, InStore(st, v, slot, AccPlain, None))
+    str_ptr_held(e, v, p, slot)
+end str_ptr
 
+// The address of the first byte of the string `v` read from the storage at `place`: a short string's
+// bytes are already there, at the place's second word, so nothing is spilled.
+str_ptr_at(e: *Emit, v: Val, place: Val) -> Val
+    val p = fresh_reg(e)
+
+    emit(e, InExtract(p, lty(e, Str), v, index_list(1)))
+
+    if !short_strings_on() then return p
+
+    str_ptr_held(e, v, p, place)
+end str_ptr_at
+
+// The first byte of `v`: its pointer word `p` where it is long, and the second word of the storage at
+// `held` -- which holds `v` -- where it is short.
+private str_ptr_held(e: *Emit, v: Val, p: Val, held: Val) -> Val
     val held_at = fresh_reg(e)
 
     var idx: Buf[IrArg] = buf()
 
     idx.push(ir_arg(l_i32(), VInt(from_int(long(e.word_bits / 8)))))
-    emit(e, InGep(held_at, LInt(8), slot, idx))
+    emit(e, InGep(held_at, LInt(8), held, idx))
 
     val r = fresh_reg(e)
 
     emit(e, InSelect(r, str_is_short(e, v), LPtr, held_at, p, l_i1()))
     r
-end str_ptr
+end str_ptr_held
 
 // How many bytes a string holds.
 str_len(e: *Emit, v: Val) -> Val
@@ -110,7 +127,17 @@ end str_is_short
 // over a **slot of the frame** they are copied into (`str_frame_bytes`) -- unless the escape analysis
 // found a view of it that outlives the frame (`escape.sysl`'s `bytes_temp`), which is made by
 // `sysl.str.unshort` instead (`str_bytes_view`). `docs/design/short-strings.md § 5.4`.
+//
+// **A `@views(self)` member's `self.bytes` of its own `*self` is read at the caller's place**
+// (`is_place_bytes`, `bytes_at_receiver`): the bytes already have an address there, so the view is
+// over it, with neither a slot nor a copy.
 gen_bytes(e: *Emit, x: TExpr, receiver: TExpr) -> Val
+    if short_strings_on() && is_place_bytes(e, x.span)
+        *receiver.kind match
+            TDeref(at, _) -> return str_place_bytes(e, gen_expr(e, receiver), gen_expr(e, at))
+            _ -> ()
+    end if
+
     val v = gen_expr(e, receiver)
 
     if !short_strings_on() || string_known_long(receiver) then return v
@@ -118,6 +145,23 @@ gen_bytes(e: *Emit, x: TExpr, receiver: TExpr) -> Val
 
     str_bytes_view(e, v, texpr_type(x))
 end gen_bytes
+
+// **The view of a string's bytes at the storage `place` it was read from**: the string's own words with
+// the pointer its reader answers there, so a short string's view points into the place itself and a
+// long string's is itself. The owner word is the string's, as `str_frame_bytes`'s is.
+private str_place_bytes(e: *Emit, v: Val, place: Val) -> Val
+    val p = str_ptr_at(e, v, place)
+    val n = str_len(e, v)
+    val st = lty(e, Str)
+    val v1 = fresh_reg(e)
+
+    emit(e, InInsert(v1, st, v, LPtr, p, index_list(1)))
+
+    val v2 = fresh_reg(e)
+
+    emit(e, InInsert(v2, st, v1, word_lty(e), n, index_list(2)))
+    v2
+end str_place_bytes
 
 // **The view of a string's bytes over a slot of the frame**: the string's own words with the pointer
 // and the length its reader answers, so a short string's view points at the copy of the value
