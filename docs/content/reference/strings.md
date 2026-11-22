@@ -29,6 +29,64 @@ discriminator, always require an allocator, and use a grapheme-cluster element t
 tables do not belong in a kernel. Rust splits the job between a `&str` view and an owning `String`,
 which costs every signature a choice between two types. sysl uses one type of three words.
 
+### A string of a few bytes holds them in itself
+
+**A string the program makes of 15 bytes or fewer — 7 on a 32-bit machine — keeps its bytes in its
+own three words** and costs no allocation at all. The owner word is null, as a literal's is, so
+counting it costs nothing; the bytes fill the next two words but one byte; and that last byte, the top
+byte of the length word, holds the length with its top bit set, which no length a long string could
+have can reach. Every reader of a string asks that bit first, so a program sees one type:
+
+| | a long string | a short string |
+|---|---|---|
+| word 0 | the owner, or null | null |
+| word 1 | the first byte's address | bytes 0 to 7 (0 to 3 on 32 bits) |
+| word 2 | the length | bytes 8 to 14 (4 to 6), then `0x80` + the length in the top byte |
+
+The short form is what a copy, `from_utf8`, a concatenation, an interpolation, a builder's `finish`,
+a rendered number or a character comes to when its bytes fit; past that it is a counted buffer as
+before. **A literal is never short** — its bytes are already in read-only data, with nothing to save
+— and neither is the empty string, a cut of a long string (it shares its parent's bytes) or
+[`str_view`](#a-string-that-shares-a-buffer). A cut of a short string is short. Comparison, hashing,
+`match`, slicing and every library call answer exactly as they would for the long form; only the
+allocation counts differ.
+
+**`s.bytes` of a short string is a copy of the bytes in a slot of the frame**, since bytes held in a
+value have no address of their own. A view lent to a call, indexed, iterated or held in a local
+costs nothing, and a later write to `s` never reaches it:
+
+```sysl
+var s = 1234.to_string()
+val b = s.bytes
+
+s = "zz"
+print(b.len, b[0], s)
+```
+
+```output
+4 49 zz
+```
+
+A view that outlives the frame — returned, stored on the heap, handed to a parameter that keeps it —
+is copied to the heap once, which [`--explain-escapes`](/reference/memory/#promotion-is-silent-not-hidden)
+names: *"is the bytes of a string that may be held in the string itself, so it is copied to the
+heap"*. Two `.bytes` of one short string are two different addresses. A **raw pointer** into those
+bytes (`as_ptr(s.bytes)`, `&s.bytes[0]`) cannot be given a copy that lasts — a pointer counts
+nothing — so one that would outlive the frame is refused: lend it at the call that reads it
+(`f(as_ptr(s.bytes))`) or copy the bytes into a `Buf[u8]` the caller owns.
+
+**A member marked [`@views(self)`](/reference/memory/#a-view-borrowed-from-its-receiver) that takes
+`*self` reads `self.bytes` where the caller holds the string**, with no slot and no copy, short or
+long: the mark already holds the view to the caller's name and refuses a write to that name while the
+view is live. That is how `Search` reads its receiver: its members ask `view_in_place`, so
+`s.index_of(…)`, `s.starts_with(…)` and the rest of a short string allocate nothing. `view` itself
+still takes the receiver by value, so it is asked of a `val`, a temporary or a `[]u8` as before.
+
+**A compiled library records which form it was built with**, and a build in the other form refuses it
+by name rather than linking bodies that read a string's words two ways. `SYSL_SHORT_STRINGS=0` turns
+the form off for a build, for diagnosing; every string is then long, byte for byte as before the form
+existed.
+
 ## Validity
 
 **Every `string` is well-formed UTF-8.** This matches `char`, which already guarantees that its
@@ -1097,6 +1155,14 @@ a C string ends at its first NUL, so it cannot contain one
 An ordinary `"a\u{0}b"` is unaffected — it carries its length, so it has three bytes and prints all
 three. Only the allocation-free route to C is refused, and the diagnostic is reported there.
 
+**A `string` handed by value to an `extern` is lent for the call.** A long string's three words cross
+as they are; a [short one](#a-string-of-a-few-bytes-holds-them-in-itself) crosses as a long-shaped
+copy whose pointer is a slot of the caller's frame, valid until the call returns. A C function that
+holds the string past the call says so with [`@keeps`](/reference/ffi/#keeps-a-c-function-that-holds-on-to-a-pointer),
+and then gets a heap copy carrying a count of its own. C that reads a sysl string's words **through
+memory** — a `string` field of a struct it was handed a pointer to — sees the form itself, and reads
+the table above: the top bit of the length word's top byte says which.
+
 ## The allocator-free subset
 
 **The type is not gated; the operations that make new bytes are.** Legal under `no alloc`: holding,
@@ -1158,6 +1224,24 @@ print(full)
 the string two strings join into needs an allocator, and this module declared '@no_alloc'
 ```
 
+**A `.bytes` that would outlive the frame needs one too, unless the string is known to hold its bytes
+elsewhere.** A string handed in may be [short](#a-string-of-a-few-bytes-holds-them-in-itself), and a
+short string's bytes are copied to the heap to outlive the frame that took them, so a module with no
+allocator may lend, index and iterate `s.bytes` but not return or store it. A literal's bytes, a cut
+of a literal's and `str_view`'s are never copied, and pass:
+
+```sysl
+@no_alloc
+
+param_view(s: string) -> []const u8 = s.bytes
+
+print(param_view("abcdefgh"[0..<3]).len)
+```
+
+```error
+this view of 's.bytes' is returned, and the string may hold its bytes in itself
+```
+
 The rule that makes the subset usable is that such a module **may hold and release storage made
 elsewhere, and may make none of its own.** So a module that only ever uses
 literals sees only immortal strings and its retain and release compile away entirely; one that is
@@ -1185,14 +1269,19 @@ is the general slice rule rather than a string special case, and ownership cross
 boundary for the general reason: every counted object carries a pointer to the function that frees
 it.
 
-The one string-specific addition is the validity invariant. A `[]u8` may hold any bytes and a
+The string-specific additions are two. The first is the
+[short form](#a-string-of-a-few-bytes-holds-them-in-itself): a slice's three words always name storage
+elsewhere, while a string's may *be* its bytes, which is why `s.bytes` of one is a copy in the frame
+and why a slice is never short.
+
+The second is the validity invariant. A `[]u8` may hold any bytes and a
 `string` is the subset that is well-formed UTF-8, which is why converting between them is checked in
 one direction and free in the other.
 
 | | Go | Swift | Rust | sysl |
 |---|---|---|---|---|
 | size | 16 B | 16 B packed | 24 B / 16 B | 24 B |
-| representations | 1 | 3 | 2 types | 1 |
+| representations | 1 | 3 | 2 types | 2, one type (≤ 15 bytes in the value) |
 | owns its bytes | the collector does | yes | `String` yes, `&str` no | yes |
 | O(1) substring | yes | yes, `Substring` | yes, `&str` | yes |
 | valid UTF-8 guaranteed | no | yes | yes | yes |

@@ -1,0 +1,93 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.env.{get as env_var}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.text.{Search, join}
+
+// **The short form is the default** (`short_strings.sysl`, `docs/design/short-strings.md` § 6, SS1-6):
+// a build makes and reads it unless `SYSL_SHORT_STRINGS=0` turns it off, and a test that forces the
+// form either way hands the choice back to the environment when it is done.
+//
+// Skipped cells, with the reason: the environment variable itself is read once per process, so the
+// values it may hold are asked of `short_strings_asked`, the function that reads it, rather than by
+// re-running the compiler under each; whether a build's artifacts are keyed by the form is
+// `tests_ssx_e_audit`'s.
+
+@test("ssx_f the form is asked for by every value of SYSL_SHORT_STRINGS but 0")
+ssx_f_every_value_but_zero_asks_for_the_form()
+    assert(short_strings_asked(None), "unset")
+    assert(!short_strings_asked(Some("0")), "0")
+    assert(short_strings_asked(Some("1")), "1")
+    assert(short_strings_asked(Some("")), "empty")
+    assert(short_strings_asked(Some("00")), "00 is not 0")
+    assert(short_strings_asked(Some("yes")), "yes")
+
+@test("ssx_f a forced form holds, off as well as on, until it is handed back")
+ssx_f_forcing_holds_both_ways_and_hands_back()
+    val ambient = short_strings_on()
+
+    force_short_strings(false)
+    assert(!short_strings_on(), "forced off")
+    force_short_strings(true)
+    assert(short_strings_on(), "forced on")
+    force_short_strings(false)
+    assert(!short_strings_on(), "forced off again after on")
+    unforce_short_strings()
+    assert_eq(short_strings_on(), ambient)
+
+@test("ssx_f with the variable unset, the form is on")
+ssx_f_unset_is_on()
+    if env_var("SYSL_SHORT_STRINGS").is_some()
+        print("skipped: SYSL_SHORT_STRINGS is set in this run")
+        return
+    end if
+
+    assert(short_strings_on(), "the default")
+
+// The IR of `text` with the form as this run has it, or forced to `short`.
+private ssx_f_ir(text: string, short: Option[bool]) -> string
+    val root = make_temp_dir("sysl-ssx-f").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+
+    short match
+        Some(on) -> force_short_strings(on)
+        None -> ()
+
+    val code = run_cli(["sysl", "emit-llvm", s"$root/main.sysl"], (line) -> sink.push(line))
+
+    unforce_short_strings()
+    remove_dir_all(root).unwrap_or(())
+
+    val out = join(lines.view(), "\n")
+
+    assert_eq(code, 0, out)
+    out
+end ssx_f_ir
+
+private val ssx_f_program = """
+    main()
+        val n = 1234
+        val s = s"$n"
+
+        print(s.len, s)
+    """
+
+@test("ssx_f a build that asks nothing emits what a build forced to the short form emits, and not the long form")
+ssx_f_unforced_build_is_the_short_form()
+    if env_var("SYSL_SHORT_STRINGS").is_some()
+        print("skipped: SYSL_SHORT_STRINGS is set in this run")
+        return
+    end if
+
+    val plain = ssx_f_ir(ssx_f_program, None)
+    val on = ssx_f_ir(ssx_f_program, Some(true))
+    val off = ssx_f_ir(ssx_f_program, Some(false))
+
+    assert_eq(plain, on)
+    assert(plain != off, "the long form is the off switch's, not the default's")

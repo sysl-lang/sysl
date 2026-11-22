@@ -1,0 +1,139 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.remove_dir_all
+import sysl.text.Search
+
+// **`sysl test` answers `--explain-escapes` and `--explain-borrows` as a build does.** The test build
+// analyzed, checked and lowered the suite without ever handing the report its lines, so the flag was
+// taken and nothing was said -- which is how `sysl test <library> --std --explain-escapes`, the only
+// way to ask the standard library's own promotions, printed nothing at all. And a suite the run cache
+// already held was replayed without compiling, so a second asking said nothing either.
+//
+// The `--std` build goes through the same `tests_analyzed` as a project's, so a one-file project is
+// what these ask; the library suite itself is too large to build inside a test.
+//
+// Skipped cells, with the reason: `--explain-drop-order` under `test` (it was already reported there,
+// and never replayed: `run_cache_key_for`); a workspace (each member is its own `test_project`).
+
+private val xet_promoting = """
+    first() -> []u8
+        var buf: [8]u8
+        buf[0..<3]
+
+    @test
+    holds() =
+        assert(first().len == 3, "three")
+    """
+
+private val xet_quiet = """
+    @test
+    holds() =
+        assert(1 + 1 == 2, "two")
+    """
+
+private val xet_borrowing = """
+    struct P
+        a: int
+
+    read(p: P) -> int = p.a
+
+    @test
+    holds() =
+        assert(read(P(4)) == 4, "four")
+    """
+
+// What `sysl test` said with `flags` over a project of `text`, asked `times` times over the same
+// tree: the status of the last, and every report line of every run.
+private xet_test(text: string, flags: []const string, times: int) -> Option[(int, Buf[string])]
+    if std_root().is_err() || !clang_available() then return None
+
+    val root = runner_project("main.sysl", text)
+    var notes: Buf[string] = buf()
+    val noted = &notes
+    var code = 0
+
+    for i in 0..<times
+        var args: Buf[string] = buf()
+
+        args.push("sysl")
+        args.push("test")
+
+        for f in flags do args.push(f)
+
+        args.push(s"$root/main.sysl")
+        code = run_cli_noted(args.view(), (line) -> (), (line) -> noted.push(line))
+    end for
+
+    remove_dir_all(root).unwrap_or(())
+    Some((code, notes))
+end xet_test
+
+private xet_promoted(notes: Buf[string]) -> int
+    var n = 0
+
+    for item in notes
+        if item.ends_with("'buf' is promoted to the heap, because this view of it is returned") then n += 1
+
+    n
+end xet_promoted
+
+@test("xet a test build asked for its escapes reports the array it promoted")
+xet_test_reports_a_promotion()
+    xet_test(xet_promoting, ["--explain-escapes"], 1) match
+        None -> ()
+        Some((code, notes)) ->
+            assert_eq(code, 0)
+            assert_eq(xet_promoted(notes), 1)
+
+@test("xet and one that promoted nothing says so")
+xet_test_reports_none()
+    xet_test(xet_quiet, ["--explain-escapes"], 1) match
+        None -> ()
+        Some((code, notes)) ->
+            assert_eq(code, 0)
+            var found = false
+
+            for item in notes
+                if item == "no arrays were promoted to the heap" then found = true
+
+            assert(found, xet_joined(notes))
+
+@test("xet without the flag a test build reports nothing")
+xet_test_without_the_flag_is_quiet()
+    xet_test(xet_promoting, [], 1) match
+        None -> ()
+        Some((code, notes)) ->
+            assert_eq(code, 0)
+            assert_eq(xet_promoted(notes), 0)
+
+@test("xet a suite the run cache holds compiles again when the report is asked for, and reports again")
+xet_cached_suite_reports_again()
+    xet_test(xet_promoting, ["--explain-escapes"], 2) match
+        None -> ()
+        Some((code, notes)) ->
+            assert_eq(code, 0)
+            assert_eq(xet_promoted(notes), 2)
+
+@test("xet a test build asked for its borrows reports each function's answer")
+xet_test_reports_borrows()
+    xet_test(xet_borrowing, ["--explain-borrows"], 1) match
+        None -> ()
+        Some((code, notes)) ->
+            assert_eq(code, 0)
+
+            var found = false
+
+            for item in notes
+                if item.ends_with("'read' answers a place of 'p': p.a") then found = true
+
+            assert(found, xet_joined(notes))
+
+private xet_joined(notes: Buf[string]) -> string
+    var b = ""
+
+    for item in notes do b = b + item + "\n"
+
+    b
+end xet_joined
