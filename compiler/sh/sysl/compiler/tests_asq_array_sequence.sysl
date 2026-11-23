@@ -91,7 +91,7 @@ private asq_body(out: string, name: string) -> string
     var inside = false
 
     for line in lines_of(out)
-        if !inside && line.starts_with("define ") && line.contains("@" + name + "(") then inside = true
+        if !inside && line.starts_with("define ") && mentions_as_written(line, name) then inside = true
 
         if inside
             if line == "}" then return b.finish()
@@ -105,7 +105,7 @@ end asq_body
 // The line that opens one function's definition.
 private asq_define(out: string, name: string) -> string
     for line in lines_of(out)
-        if line.starts_with("define ") && line.contains("@" + name + "(") then return line
+        if line.starts_with("define ") && mentions_as_written(line, name) then return line
 
     s"no definition of '$name' in:\n$out"
 end asq_define
@@ -406,6 +406,7 @@ asq_large_module_val_not_copied()
     val out = asq_ir(asq_large())
     val caller = asq_body(out, "from_module")
 
+    assert(caller.starts_with("define "), caller)
     assert(caller.contains("(ptr @BIG,"), caller)
     assert(!caller.contains("load [20 x i64]"), caller)
 
@@ -426,9 +427,13 @@ asq_large_local_val_not_copied()
 
     val body = asq_body(asq_ir(asq_large()), "from_local")
 
+    assert(body.starts_with("define "), body)
     assert_eq(asq_lines_with(body, "alloca [20 x i64]"), 1)
     assert_eq(asq_lines_with(body, "i64 160, i1"), 0)
-    assert(body.contains("(ptr %xs.addr,"), body)
+
+    // The closure captures nothing, so it takes no room and is not an argument: the array is all
+    // the member is handed.
+    assert(body.contains("(ptr %xs.addr)"), body)
 
 @test("a view taken at a receiver whose member reads a '[]const T' lets a large parameter be read in place")
 asq_receiver_view_is_read_only()
