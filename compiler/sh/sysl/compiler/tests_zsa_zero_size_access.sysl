@@ -1,0 +1,564 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Var}
+import sysl.text.{cstring, Search}
+
+// A type that holds no bytes -- a struct with no fields, or only such fields -- was not `zero_sized`
+// (only `unit` and `never` were), so it was loaded and stored like any other: a method's receiver out
+// of its box, a field into its slot. LLVM gives the access no size, but AddressSanitizer at -O0 checks
+// the bytes around its address, and the payload of a box whose payload is empty sits exactly at the
+// end of the allocation: the check fell in the red zone and the sanitizer faulted while describing an
+// access of no size ("this program faulted on an address it does not own"). `zero_sized` now answers
+// true for it, so every emitter that stores, passes and reads nothing for `unit` does the same for it,
+// and its value is the constant of its LLVM type (`zero_of`).
+//
+// Every program is built and run under AddressSanitizer at -O0 (where it faulted) and -O2, and on the
+// counted heap at -O0 (the right output, nothing left over, nothing given back twice).
+//
+// Skipped cells, and why: an empty enum variant (it has no payload struct to take room); a `[0]T`
+// read by index (the bounds check refuses every index first), covered by the `zero_sized` answer
+// below; separate compilation (a library body is lowered by the same emitters).
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private extern "setenv" zsa_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" zsa_c_unsetenv(name: *u8) -> int
+
+private struct ZsaRun
+    out: string
+    err: string
+    hooks: usize
+end ZsaRun
+
+// The program built at `level` and run: on the counted heap, or with `flags` handed to clang.
+private zsa_run(text: string, counted: bool, flags: string, level: string) -> ZsaRun
+    val root = make_temp_dir("sysl-zsa").unwrap()
+
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    val exe = s"$root/built"
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+        val v = cstring(flags)
+
+        zsa_c_setenv(n.ptr, v.ptr, 1)
+    end if
+
+    force_alloc_counting(counted)
+
+    val made = build_native_program(s"$root/main.sysl", None, None, level, Some(exe))
+
+    force_alloc_counting(false)
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+
+        zsa_c_unsetenv(n.ptr)
+    end if
+
+    made match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return ZsaRun(failure_text(why), "", 0)
+        Ok(_) -> ()
+
+    val hooks = capture("nm", ["-u", exe], "", [], true) match
+        Ok(o) -> o.text.count_of("__asan_report")
+        Err(_) -> 0
+
+    val ran = capture(exe, [], "", [Var("ASAN_OPTIONS", "detect_stack_use_after_return=1")], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    ran match
+        Err(_) -> ZsaRun("could not be started", "", hooks)
+        Ok(o) -> ZsaRun(o.text, o.err.unwrap_or(""), hooks)
+end zsa_run
+
+// The program printed `want` under AddressSanitizer at `level`, instrumented, and nothing was reported.
+private zsa_asan_at(text: string, want: string, level: string)
+    if !enm_ready() then return
+
+    val got = zsa_run(text, false, "-fsanitize=address -g", level)
+
+    assert(got.hooks > 0, s"not instrumented: ${got.out}")
+    assert_eq(got.out, want)
+    assert_eq(got.err, "")
+end zsa_asan_at
+
+// The program printed `want` on the counted heap at -O0, and left nothing over.
+private zsa_counted(text: string, want: string)
+    if !enm_ready() then return
+
+    val got = zsa_run(text, true, "", "0")
+
+    assert_eq(got.out, want)
+    assert_eq(got.err, "")
+end zsa_counted
+
+// All three runs.
+private zsa_everywhere(text: string, want: string)
+    zsa_asan_at(text, want, "0")
+    zsa_asan_at(text, want, "2")
+    zsa_counted(text, want)
+end zsa_everywhere
+
+// The IR of a program, or its analysis report where it was refused.
+private zsa_ir(text: string) -> string
+    val root = make_temp_dir("sysl-zsa").unwrap()
+
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    val ir = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    ir
+end zsa_ir
+
+// -- the programs ---------------------------------------------------------------------------------
+
+private const zsa_object: string = raw"""
+    trait Visitor
+        visit(self) -> int
+
+    struct Twice
+    end Twice
+
+    impl Visitor for Twice
+        visit(self) -> int = 3
+
+    main()
+        val obj: &Visitor = Twice()
+
+        print(obj.visit())
+    """
+
+private const zsa_object_in_option: string = raw"""
+    trait Visitor
+        visit(self) -> int
+
+    struct Twice
+    end Twice
+
+    impl Visitor for Twice
+        visit(self) -> int = 3
+
+    main()
+        val obj: &Visitor = Twice()
+        val keep: Option[&Visitor] = Some(obj)
+
+        print(obj.visit())
+        print(keep.unwrap().visit() + 1)
+    """
+
+private const zsa_object_with_closure: string = raw"""
+    trait Visitor
+        visit(self, f: &Fn(int) -> int) -> int
+
+    struct Twice
+    end Twice
+
+    impl Visitor for Twice
+        visit(self, f: &Fn(int) -> int) -> int = f(f(1))
+
+    main()
+        var n = 1
+        val obj: &Visitor = Twice()
+
+        print(obj.visit(x -> x + n))
+    """
+
+private const zsa_plain_box: string = raw"""
+    struct Mark
+    end Mark
+
+    impl Mark
+        tell(self) -> int = 7
+
+    main()
+        val m: &Mark = Mark()
+
+        print(m.tell())
+    """
+
+private const zsa_captured: string = raw"""
+    struct Mark
+    end Mark
+
+    impl Mark
+        tell(self) -> int = 7
+
+    main()
+        val m = Mark()
+        val boxed: &Mark = Mark()
+        val f = () -> m.tell() + boxed.tell()
+
+        print(f())
+    """
+
+private const zsa_in_buf: string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct Mark
+    end Mark
+
+    impl Mark
+        tell(self) -> int = 7
+
+    main()
+        var marks: Buf[&Mark] = buf()
+
+        for i in 0..<3
+            marks.push(Mark())
+
+        var sum = 0
+
+        for m in marks
+            sum += m.tell()
+
+        print(sum)
+    """
+
+private const zsa_dropped: string = raw"""
+    struct Gone
+    end Gone
+
+    impl Drop for Gone
+        drop(self)
+            print("dropped")
+
+    impl Gone
+        tell(self) -> int = 5
+
+    main()
+        val g = Gone()
+
+        print(g.tell())
+    """
+
+private const zsa_dropped_boxes: string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    trait Visitor
+        visit(self) -> int
+
+    struct Gone
+    end Gone
+
+    impl Drop for Gone
+        drop(self)
+            print("dropped")
+
+    impl Visitor for Gone
+        visit(self) -> int = 5
+
+    main()
+        val obj: &Visitor = Gone()
+        val keep: Option[&Visitor] = Some(obj)
+        var all: Buf[&Gone] = buf()
+
+        all.push(Gone())
+        all.push(Gone())
+        print(keep.unwrap().visit())
+        print(all.len())
+    """
+
+private const zsa_array_of_empties: string = raw"""
+    struct Mark
+    end Mark
+
+    impl Mark
+        tell(self) -> int = 7
+
+    struct Row
+        marks: [3]Mark
+        none: [0]int
+    end Row
+
+    trait Visitor
+        visit(self) -> int
+
+    impl Visitor for Row
+        visit(self) -> int
+            var sum = 0
+
+            for m in self.marks
+                sum += m.tell()
+
+            sum
+        end visit
+
+    main()
+        val marks = [Mark(), Mark()]
+        var sum = 0
+
+        for m in marks
+            sum += m.tell()
+
+        val obj: &Visitor = Row([Mark(), Mark(), Mark()], [])
+
+        print(sum + obj.visit())
+    """
+
+private const zsa_storage_and_align: string = raw"""
+    @align(16)
+    struct Wide
+    end Wide
+
+    struct Mark
+    end Mark
+
+    impl Mark
+        tell(self) -> int = 7
+
+    struct Holds
+        a: u8
+        w: Wide
+    end Holds
+
+    val names: [0]string = []
+    val mark = Mark()
+    var spare = Mark()
+
+    main()
+        print(sizeof(Wide))
+        print(alignof(Wide))
+        print(sizeof(Holds))
+        print(alignof(Holds))
+        print(sizeof(Mark))
+        print(names.len)
+
+        for n in names
+            print(n)
+
+        spare = mark
+        print(mark.tell() + spare.tell())
+
+        val h: &Holds = Holds(1, Wide())
+
+        print(h.a)
+    """
+
+private const zsa_trailing_field: string = raw"""
+    struct Mark
+    end Mark
+
+    struct Pair
+        n: int
+        m: Mark
+    end Pair
+
+    impl Mark
+        tell(self) -> int = 7
+
+    main()
+        val p: &Pair = Pair(35, Mark())
+        val m = p.m
+
+        print(p.n + m.tell())
+    """
+
+private const zsa_nested_empty: string = raw"""
+    struct Outer
+        a: Inner
+        b: Inner
+    end Outer
+
+    struct Inner
+    end Inner
+
+    impl Inner
+        tell(self) -> int = 4
+
+    trait Visitor
+        visit(self) -> int
+
+    impl Visitor for Outer
+        visit(self) -> int = self.a.tell() + self.b.tell()
+
+    main()
+        val obj: &Visitor = Outer(Inner(), Inner())
+
+        print(obj.visit())
+    """
+
+private const zsa_generic: string = raw"""
+    struct Tag[T]
+    end Tag
+
+    impl[T] Tag[T]
+        tell(self) -> int = 9
+
+    trait Visitor
+        visit(self) -> int
+
+    impl[T] Visitor for Tag[T]
+        visit(self) -> int = self.tell()
+
+    main()
+        val a: &Visitor = Tag[int]()
+        val b: &Visitor = Tag[string]()
+
+        print(a.visit() + b.visit())
+    """
+
+private const zsa_values: string = raw"""
+    struct Mark
+    end Mark
+
+    impl Mark
+        tell(self) -> int = 7
+
+    var kept = Mark()
+
+    made() -> Mark = Mark()
+
+    pick(c: bool) -> Mark = if c then Mark() else made()
+
+    which(n: int) -> Mark = n match
+        0 -> Mark()
+        _ -> made()
+
+    found(o: Option[Mark]) -> int = o match
+        Some(m) -> m.tell()
+        None -> 0
+
+    main()
+        print(made().tell())
+        print(pick(true).tell())
+        print(which(1).tell())
+
+        var i = 0
+
+        val broke = loop
+            i += 1
+            if i == 3 then break made()
+
+        print(broke.tell())
+        print(found(Some(kept)))
+        print(found(None))
+    """
+
+// -- the regression -------------------------------------------------------------------------------
+
+@test("a trait object over an empty struct runs under ASan at -O0 and -O2, and on the counted heap")
+zsa_trait_object_over_empty_struct()
+    zsa_everywhere(zsa_object, "3\n")
+
+@test("and kept in an Option, the heap box")
+zsa_trait_object_in_option()
+    zsa_everywhere(zsa_object_in_option, "3\n4\n")
+
+@test("and called with a closure that captures a local")
+zsa_trait_object_with_closure()
+    zsa_everywhere(zsa_object_with_closure, "3\n")
+
+@test("its IR loads and stores no empty struct")
+zsa_ir_has_no_empty_access()
+    if !enm_ready() then return
+
+    val ir = zsa_ir(zsa_object)
+
+    assert(ir.contains("%struct.Twice = type"), ir)
+    assert(!ir.contains("load %struct.Twice"), ir)
+    assert(!ir.contains("store %struct.Twice"), ir)
+    assert(!ir.contains("%struct.Twice %self"), ir)
+
+// -- the neighbours -------------------------------------------------------------------------------
+
+@test("an empty struct as a plain &T box, no trait")
+zsa_plain_box_of_empty()
+    zsa_everywhere(zsa_plain_box, "7\n")
+
+@test("an empty struct captured by a closure, by value and as a box")
+zsa_empty_captured()
+    zsa_everywhere(zsa_captured, "14\n")
+
+@test("a Buf of boxes of an empty struct")
+zsa_buf_of_empty_boxes()
+    zsa_everywhere(zsa_in_buf, "21\n")
+
+@test("an empty struct with a Drop is dropped exactly once")
+zsa_empty_with_drop()
+    zsa_everywhere(zsa_dropped, "5\ndropped\n")
+
+@test("an empty struct with a Drop in a heap box and in a Buf of boxes is dropped once each")
+zsa_empty_with_drop_boxed()
+    zsa_everywhere(zsa_dropped_boxes, "5\n2\ndropped\ndropped\ndropped\n")
+
+@test("an array of empty structs, local and as a boxed struct's field beside an empty array")
+zsa_array_of_empties_runs()
+    zsa_everywhere(zsa_array_of_empties, "35\n")
+
+@test("module storage of an empty struct and a [0]T is a val, and an @align(n) empty struct keeps its room")
+zsa_module_storage_and_align()
+    zsa_everywhere(zsa_storage_and_align, "16\n16\n32\n16\n0\n0\n14\n1\n")
+
+@test("an empty struct as the last field of a boxed struct, at the end of the allocation")
+zsa_empty_trailing_field()
+    zsa_everywhere(zsa_trailing_field, "42\n")
+
+@test("a struct holding only empty structs is empty too, declared before them")
+zsa_nested_empty_struct()
+    zsa_everywhere(zsa_nested_empty, "8\n")
+
+@test("a generic empty struct, instantiated twice")
+zsa_generic_empty_struct()
+    zsa_everywhere(zsa_generic, "18\n")
+
+@test("an empty struct answered by a function, yielded by an if, a match and a break, and matched in an Option")
+zsa_empty_as_a_value()
+    zsa_everywhere(zsa_values, "7\n7\n7\n7\n7\n0\n")
+
+// -- the answer, in process -----------------------------------------------------------------------
+
+private zsa_struct(name: string, fields: Buf[(string, Type)], opaque: bool = false,
+                   align: Option[usize] = None) -> &StructType =
+    StructType(name, buf(), fields, false, align, None, opaque, None, buf(), false, buf(), buf(), false)
+
+private zsa_fields(a: Type, b: Option[Type]) -> Buf[(string, Type)]
+    var out: Buf[(string, Type)] = buf()
+
+    out.push(("a", a))
+
+    b match
+        Some(t) -> out.push(("b", t))
+        None -> ()
+
+    out
+end zsa_fields
+
+@test("zero_sized: a struct with no fields, or only fields that take no room, and an empty array")
+zsa_zero_sized_takes_no_room()
+    val inner = Struct(zsa_struct("Inner", buf()))
+
+    assert(zero_sized(inner))
+    assert(zero_sized(Struct(zsa_struct("Outer", zsa_fields(inner, Some(inner))))))
+    assert(zero_sized(Struct(zsa_struct("Held", zsa_fields(Unit, Some(inner))))))
+    assert(zero_sized(Array(0, Integer(64, true, false), buf())))
+    assert(zero_sized(Array(3, inner, buf())))
+    assert(zero_sized(Struct(zsa_struct("Rows", zsa_fields(Array(0, Bool, buf()), None)))))
+
+@test("zero_sized: a stored field, an opaque struct, a task, a pointer to an empty struct take room")
+zsa_zero_sized_takes_room()
+    val inner = Struct(zsa_struct("Inner", buf()))
+
+    assert(!zero_sized(Struct(zsa_struct("Pair", zsa_fields(inner, Some(Bool))))))
+    assert(!zero_sized(Struct(zsa_struct("FILE", buf(), true))))
+    assert(!zero_sized(Struct(zsa_struct(TaskBase, buf()))))
+    assert(!zero_sized(Ref(inner, false)))
+    assert(!zero_sized(Ptr(inner, false)))
+    assert(!zero_sized(Array(1, Bool, buf())))
+    assert(!no_value(inner))
+
+    val aligned = Struct(zsa_struct("Wide", buf(), false, Some(16)))
+
+    assert(!zero_sized(aligned))
+    assert(!zero_sized(Struct(zsa_struct("Holds", zsa_fields(aligned, None)))))
+    assert(!zero_sized(Array(2, aligned, buf())))
