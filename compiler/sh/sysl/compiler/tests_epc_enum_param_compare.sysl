@@ -1,0 +1,157 @@
+module sh.sysl.compiler
+@tests
+
+// **An enum value parameter compares with a variant written bare** (`reference/generics.md § Which
+// values` writes the variant bare wherever the parameter's enum is the expected type, and `§ if const`
+// takes a value parameter): `if const M == A` picks its arm per instance, as `M == Mode.A` does. The
+// fold holds the parameter as its variant's position, so the comparison is typed and run whole.
+
+private epc_mode() -> string = raw"""
+    enum Mode
+        A
+        B
+        C
+    """
+
+@test("'if const M == A' over an enum value parameter picks each instance's arm")
+epc_bare_variant_picks_the_arm()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(epc_mode() + raw"""
+
+        struct W[const M: Mode]
+            v: int
+
+            get(self) -> int
+                if const M == A
+                    1
+                else
+                    2
+
+        print(W[A](0).get(), W[B](0).get())
+        """), "1 2\n")
+end epc_bare_variant_picks_the_arm
+
+@test("the variant on the left, '!=', and an 'elif const' chain over bare variants")
+epc_left_unequal_and_elif()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(epc_mode() + raw"""
+
+        f[const M: Mode]() -> int
+            if const A == M
+                10
+            elif const M != C
+                20
+            else
+                30
+
+        print(f[A](), f[B](), f[C]())
+        """), "10 20 30\n")
+end epc_left_unequal_and_elif
+
+@test("two enum parameters, joined by '&&', and an 'if const' nested in another")
+epc_two_parameters_nested()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(epc_mode() + raw"""
+
+        enum Side
+            Left
+            Right
+
+        g[const M: Mode, const S: Side]() -> int
+            if const M == B && S == Right
+                return 1
+            if const M == A
+                if const S == Left
+                    return 2
+                else
+                    return 3
+            0
+
+        print(g[B, Right](), g[B, Left](), g[A, Left](), g[A, Right](), g[C, Right]())
+        """), "1 0 2 3 0\n")
+end epc_two_parameters_nested
+
+@test("the arm an instance does not take is never read, and a 'match' over the parameter takes bare arms")
+epc_untaken_arm_and_match()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(epc_mode() + raw"""
+
+        struct Holder[const M: Mode]
+            v: int
+
+            show(self) -> string
+                if const M == B
+                    self.no_such_member()
+                else
+                    "fine"
+
+            pick(self) -> int = M match
+                A -> 1
+                B -> 2
+                C -> 3
+
+        print(Holder[A](0).show(), Holder[C](0).show(), Holder[A](0).pick(), Holder[C](0).pick())
+        """), "fine fine 1 3\n")
+end epc_untaken_arm_and_match
+
+@test("an integer value parameter still folds beside an enum one")
+epc_int_parameter_beside()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(epc_mode() + raw"""
+
+        h[const M: Mode, const K: int]() -> int = if const K == 3 && M != A then K else 0
+
+        print(h[B, 3](), h[A, 3](), h[B, 4]())
+        """), "3 0 0\n")
+end epc_int_parameter_beside
+
+@test("a variant of another enum, or a name that is no variant, is still refused")
+epc_wrong_name_refused()
+    if !enm_ready() then return
+
+    val other = enm_outcome(epc_mode() + raw"""
+
+        enum Tide
+            Low
+            Slack
+
+        f[const M: Mode]() -> int = if const M == Slack then 1 else 2
+
+        print(f[A]())
+        """)
+
+    assert(!other.1, other.0)
+    assert(enm_says(other.0, "Slack"), other.0)
+
+    val none = enm_outcome(epc_mode() + raw"""
+
+        f[const M: Mode]() -> int = if const M == Q then 1 else 2
+
+        print(f[A]())
+        """)
+
+    assert(!none.1, none.0)
+    assert(enm_says(none.0, "Q"), none.0)
+end epc_wrong_name_refused
+
+@test("a local holding a variant is no constant, so comparing the parameter with it is refused")
+epc_local_variant_refused()
+    if !enm_ready() then return
+
+    val said = enm_outcome(epc_mode() + raw"""
+
+        f[const M: Mode]() -> int
+            val chosen = Mode.A
+            if const M == chosen then 1 else 2
+
+        print(f[A]())
+        """)
+
+    assert(!said.1, said.0)
+    assert(enm_says(said.0, "an 'if const' is decided while compiling, so its condition has to be known then"), said.0)
+end epc_local_variant_refused

@@ -513,8 +513,41 @@ private with_temp(cx: &Abandoning, held: string, x: TExpr) -> string
         // only what the reference itself was, which the operand says.
         TDeref(operand, _) -> if cx.fiber then with_temp(cx, "", operand) else "a counted temporary the enclosing expression is still holding"
         TGlobal(symbol, _, true) -> s"a share of the module 'var' '${qualified_name(symbol)}'"
-        _ -> if in_module_val(x) then "" else "a counted temporary the enclosing expression is still holding"
+        _ -> if in_module_val(x) || cx.fiber && owns_no_count(x) then ""
+             else "a counted temporary the enclosing expression is still holding"
 end with_temp
+
+// Whether a view the expression builds owns no count of its own (`memory.md § Views own their heap
+// storage, and a lent view takes no count`): a literal's bytes, a view of a raw pointer or of an array
+// laid in the frame or in module storage -- whose owner is null -- and a view of a view the frame
+// already holds, which is lent with no count while its parent's holds the storage. A view of a
+// container's storage is not: holding a `Buf`'s name does not hold its storage, so the view takes a
+// count of the storage itself. Asked only where a fiber may move.
+private owns_no_count(x: TExpr) -> bool = *x.kind match
+    TStrLit(_) -> true
+    TLoad(_, _) -> true
+    TBytes(receiver) -> owns_no_count(receiver)
+    TConstView(arg) -> owns_no_count(arg)
+    TSlice(base, _, _, _, _) -> underlying(texpr_type(base)) match
+        Ptr(_, _) -> true
+        Array(_, _, _) -> laid_in_place(base)
+        Slice(_, _) -> owns_no_count(base)
+        Str -> owns_no_count(base)
+        _ -> false
+    _ -> in_module_val(x)
+
+// Whether an array is laid by value in a local or in module storage, not reached through a reference,
+// a pointer or a container.
+private laid_in_place(x: TExpr) -> bool = *x.kind match
+    TLoad(_, _) -> true
+    TGlobal(_, _, _) -> true
+    TField(receiver, _, _) -> underlying(texpr_type(receiver)) match
+        Struct(_) -> laid_in_place(receiver)
+        _ -> false
+    TIndex(base, _, _) -> underlying(texpr_type(base)) match
+        Array(_, _, _) -> laid_in_place(base)
+        _ -> false
+    _ -> false
 
 // Whether `x` names a module `val`, or a field or element laid inside one by value -- storage nothing
 // assigns and nothing releases.

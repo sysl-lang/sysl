@@ -217,6 +217,133 @@ str_eq_text(word: string) -> string
     """
 end str_eq_text
 
+// **Equality where the short form is on, read from each string's two words as they stand** -- the
+// pointer word and the length word, never a spilled copy. A reader of a string's bytes needs their
+// address, and a short string's bytes have none until the value is written to a slot; spilling every
+// string `==` reads, long or short, kept a frame slot and a store on every comparison and made every
+// function comparing strings too big to inline. So the form is asked first, here, and only a short
+// string meeting a long one is ever spilled:
+//
+// - **both long** -- `@sysl.str.eq` with the words as they are, which is the comparison the form-off
+//   build makes;
+// - **both short** -- the lengths are equal, so the two values' byte runs are compared as one integer
+//   each, masked to the length (the tag byte and anything past the run never take part);
+// - **one of each** -- the short one is written to a slot and its bytes compared from there.
+//
+// **The both-long test is `alwaysinline`, and the short cases are a call of their own
+// (`@sysl.str.eq.short`, `noinline`)**: inlined whole, the short cases made every caller too big to
+// be inlined in turn, and left out of line whole, every `==` was a call -- the form-off build inlines
+// `@sysl.str.eq` into each comparison and folds a literal's length into it, and so does this.
+str_eq_words_text(word: string, bits: int) -> string
+    val pair = s"i${2 * bits}"
+    val top = bits - 8
+    val wb = bits / 8
+
+    s"""
+    define private i1 @sysl.str.eq.words(ptr %a1, $word %a2, ptr %b1, $word %b2) alwaysinline {
+    entry:
+      %tags = or $word %a2, %b2
+      %either = icmp slt $word %tags, 0
+      br i1 %either, label %short, label %long
+    long:
+      %r = call i1 @sysl.str.eq(ptr %a1, $word %a2, ptr %b1, $word %b2)
+      ret i1 %r
+    short:
+      %s = call i1 @sysl.str.eq.short(ptr %a1, $word %a2, ptr %b1, $word %b2)
+      ret i1 %s
+    }
+
+    define private i1 @sysl.str.eq.short(ptr %a1, $word %a2, ptr %b1, $word %b2) noinline {
+    entry:
+      %slot = alloca [2 x $word]
+      %ash = icmp slt $word %a2, 0
+      %bsh = icmp slt $word %b2, 0
+      %atop = lshr $word %a2, $top
+      %an7 = and $word %atop, 127
+      %an = select i1 %ash, $word %an7, $word %a2
+      %btop = lshr $word %b2, $top
+      %bn7 = and $word %btop, 127
+      %bn = select i1 %bsh, $word %bn7, $word %b2
+      %samelen = icmp eq $word %an, %bn
+      br i1 %samelen, label %short, label %no
+    short:
+      %both = and i1 %ash, %bsh
+      br i1 %both, label %pair, label %mixed
+    pair:
+      %ai = ptrtoint ptr %a1 to $word
+      %bi = ptrtoint ptr %b1 to $word
+      %x1 = xor $word %ai, %bi
+      %x2 = xor $word %a2, %b2
+      %x1w = zext $word %x1 to $pair
+      %x2w = zext $word %x2 to $pair
+      %x2u = shl $pair %x2w, $bits
+      %x = or $pair %x2u, %x1w
+      %nw = zext $word %an to $pair
+      %nb = shl $pair %nw, 3
+      %one = shl $pair 1, %nb
+      %mask = sub $pair %one, 1
+      %diff = and $pair %x, %mask
+      %peq = icmp eq $pair %diff, 0
+      ret i1 %peq
+    mixed:
+      %sw1 = select i1 %ash, ptr %a1, ptr %b1
+      %sw2 = select i1 %ash, $word %a2, $word %b2
+      store ptr %sw1, ptr %slot
+      %slot2 = getelementptr i8, ptr %slot, i32 $wb
+      store $word %sw2, ptr %slot2
+      %pa = select i1 %ash, ptr %slot, ptr %a1
+      %pb = select i1 %ash, ptr %b1, ptr %slot
+      %m = call i1 @sysl.str.eq(ptr %pa, $word %an, ptr %pb, $word %bn)
+      ret i1 %m
+    no:
+      ret i1 false
+    }
+    """
+end str_eq_words_text
+
+// **`@sysl.str.boundary` of a string that may be short, read from its two words as they stand** (the
+// pointer word, the length word, the length `n` already read): a short string's byte `i` is taken out
+// of the words themselves, a long one's loaded through the pointer, so a substring's boundary check
+// spills nothing (`gen_slice_of`). `i` is within the string, which the caller has checked. It is
+// `alwaysinline`, as `@sysl.str.boundary` is inlined: two checks of a substring are on every cut.
+str_boundary_words_text(word: string, bits: int) -> string
+    val pair = s"i${2 * bits}"
+
+    s"""
+    define private i1 @sysl.str.boundary.words(ptr %w1, $word %w2, $word %n, $word %i) alwaysinline {
+    entry:
+      %end = icmp eq $word %i, %n
+      br i1 %end, label %yes, label %check
+    check:
+      %sh = icmp slt $word %w2, 0
+      br i1 %sh, label %held, label %load
+    load:
+      %ep = getelementptr i8, ptr %w1, $word %i
+      %lb = load i8, ptr %ep
+      br label %test
+    held:
+      %lo = ptrtoint ptr %w1 to $word
+      %lo2 = zext $word %lo to $pair
+      %hi2 = zext $word %w2 to $pair
+      %hiu = shl $pair %hi2, $bits
+      %both = or $pair %hiu, %lo2
+      %iw = zext $word %i to $pair
+      %ib = shl $pair %iw, 3
+      %down = lshr $pair %both, %ib
+      %hb = trunc $pair %down to i8
+      br label %test
+    test:
+      %b = phi i8 [ %lb, %load ], [ %hb, %held ]
+      %top = and i8 %b, -64
+      %cont = icmp eq i8 %top, -128
+      %ok = xor i1 %cont, true
+      ret i1 %ok
+    yes:
+      ret i1 true
+    }
+    """
+end str_boundary_words_text
+
 // Where a string sits in a sorted table of strings: the position of the entry holding the same bytes,
 // or the table's length where none does. The table is an array of strings in the order `str_cmp`
 // gives them, so a binary search over it asks the very comparison the chain of `==`s would have
@@ -328,6 +455,10 @@ private short_pick(e: *Emit, str: string, count: string, args: string) -> string
     s"  ret $str %made\n" +
     s"long:\n"
 end short_pick
+
+// `@sysl.str.short`'s text, with `@sysl.str.empty` beside it, for a lowering that names the empty
+// constant (`str_run_ptr`).
+str_short_text_of(e: *Emit) -> string = str_short_text(e, l_render(lty(e, Str)))
 
 // **A short string of two runs of bytes laid end to end**, no more than a short string holds: the
 // three words built in a slot -- a null owner, the bytes from the second word on, the rest zero, and
