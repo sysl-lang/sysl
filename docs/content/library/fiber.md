@@ -318,8 +318,12 @@ receive(k: &Carrier, want: usize) -> int
 
 What is held is what a frame owns a count of at the call: a local, a binding a `match` took a share
 of, a counted temporary of the expression around the call. A scalar, a `*T` and a `&sync T` are not
-— the last has an atomic count. A value whose block has ended before the call is not held either, so
-the fix is usually to give the value a block of its own:
+— the last has an atomic count. Nor is a local holding a view that owns no count: a literal's bytes,
+a view of a `*T`, of an array laid in the frame or in module storage, or of another such local, so
+long as nothing writes it a counted value, takes its address or binds a `ref` to it. A view of a view
+parameter or of storage reached through a `&T` is lent with no count as an argument, but bound to a
+local it takes a count of its owner, and is held. A value whose block has ended before the call is
+not held either, so the fix is usually to give the value a block of its own:
 
 ```sysl
 import sysl.fiber.{Context, switch}

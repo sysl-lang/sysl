@@ -440,6 +440,14 @@ private fcr_lent(body: string)
     fcr_accepted(body)
     unforce_short_strings()
 
+// The same refusal, asked with the short string form off and on.
+private fcr_held_both(body: string, held: string, callee: string)
+    force_short_strings(false)
+    fcr_refused(body, held, callee)
+    force_short_strings(true)
+    fcr_refused(body, held, callee)
+    unforce_short_strings()
+
 private fcr_send() -> string = raw"""
     send(b: []const u8) -> usize
         wait()
@@ -533,7 +541,7 @@ fcr_fresh_string_argument()
 
 @test("a fresh heap string's bytes, or a view of one, are still refused")
 fcr_fresh_string_view()
-    fcr_refused(fcr_send() + raw"""
+    fcr_held_both(fcr_send() + raw"""
         work(a: string) -> usize = send((a + "!").bytes[0..<1])
         """, "a counted temporary the enclosing expression is still holding", "send")
 
@@ -544,4 +552,207 @@ fcr_buf_view_refused()
     fcr_refused("import sysl.buf.Buf\n\n" + fcr_send() + raw"""
         work(b: Buf[u8]) -> usize = send(b.view()[0..<1])
         """, "a counted temporary the enclosing expression is still holding", "send")
+
+// An array inside the referent of a `&T` parameter, lent as a temporary, is lent while the caller's
+// count holds the box -- the view takes none. Behind a second reference it is not: the first referent
+// may let go of the second while the fiber is parked.
+@test("a view of an array inside a '&T' parameter's referent, lent as a temporary, holds no count")
+fcr_lent_reference_parameter_array()
+    fcr_lent(fcr_send() + raw"""
+        struct Inner
+            data: [8]u8
+
+        struct Holder
+            data: [8]u8
+            inner: Inner
+            rows: [2][4]u8
+
+        work(h: &Holder) -> usize = send(h.data[0..<4]) + send(h.inner.data[1..<3]) + send(h.rows[1][0..<2])
+        """)
+
+@test("a view of an array behind a second reference, lent as a temporary, is still refused")
+fcr_reference_behind_reference_refused()
+    fcr_held_both(fcr_send() + raw"""
+        struct Inner
+            data: [8]u8
+
+        struct Holder
+            inner: &Inner
+
+        work(h: &Holder) -> usize = send(h.inner.data[0..<4])
+        """, "a counted temporary the enclosing expression is still holding", "send")
+
+// -- a local holding a view that owns no count ---------------------------------------------------------
+//
+// A local is held only where the frame owns a count through it (`library/fiber.md § A count held
+// across a switch is refused`). A view with a null owner -- a literal's bytes, a view of a raw pointer,
+// of an array laid in the frame or in module storage, or of another such local -- owns none, so the
+// local holding it holds nothing. The local loses that where the rest of its block may make it own one:
+// a write of a counted value, its address taken, a `ref` bound to it. A view of a view parameter or of a
+// `&T` parameter's referent is lent with no count only as a temporary; bound to a local it takes a count
+// of its owner (`retain_maybe` of the box in the IR), so the local is held.
+//
+// Cells skipped: a generic body (its instantiations are walked as any other body); a lent local
+// captured by a closure (the closure is a count of its own, held as `fcr_closure_capture` pins); a
+// write after the call, refused like one before it, since the walk does not order the rest of a block.
+
+@test("a local holding a literal's bytes, or a literal 'string', holds nothing across the call")
+fcr_local_literal_bytes()
+    fcr_lent(fcr_send() + raw"""
+        work() -> usize
+            val s = "ping".bytes
+            val t = "pong"
+            send(s) + send(t.bytes)
+        """)
+
+@test("a local holding a view of a frame array, or of one inside a struct local, holds nothing across the call")
+fcr_local_frame_array()
+    fcr_lent(fcr_send() + raw"""
+        struct Frame
+            data: [8]u8
+
+        work() -> usize
+            var a: [16]u8 = [0; 16]
+            val f = Frame([0; 8])
+            val s = a[0..<16]
+            val t = f.data[0..<4]
+            send(s) + send(t)
+        """)
+
+@test("a local holding a view of a raw pointer holds nothing across the call -- the reported shape")
+fcr_local_raw_pointer()
+    fcr_lent(fcr_send() + raw"""
+        work(p: *u8, n: usize) -> usize
+            val s = p[0..<n]
+            send(s)
+        """)
+
+@test("a local holding a view of a module 'val' array holds nothing across the call")
+fcr_local_val_array()
+    fcr_lent(fcr_send() + raw"""
+        val table: [4]u8 = [1, 2, 3, 4]
+
+        work() -> usize
+            val s = table[1..<3]
+            send(s)
+        """)
+
+@test("a local holding a view of another such local, or a copy of one, holds nothing across the call")
+fcr_local_view_of_local()
+    fcr_lent(fcr_send() + raw"""
+        work(p: *u8, n: usize) -> usize
+            val s = p[0..<n]
+            val t = s[0..<1]
+            val u = t
+            send(u)
+        """)
+
+@test("a 'var' view reassigned another view that owns no count before the call holds nothing")
+fcr_local_reassigned_before()
+    fcr_lent(fcr_send() + raw"""
+        work(p: *u8, q: *u8, n: usize) -> usize
+            var s: []const u8 = p[0..<n]
+            s = q[0..<1]
+            if n > 2 then s = "ab".bytes
+            send(s)
+        """)
+
+@test("a lent local used again after the call, and across a call in a loop, holds nothing")
+fcr_local_used_after()
+    fcr_lent(fcr_send() + raw"""
+        work(p: *u8, n: usize) -> usize
+            val s = p[0..<n]
+            var k: usize = 0
+
+            for i in 0..<3
+                k += send(s) + i
+
+            k + send(s) + s.len
+        """)
+
+@test("a local holding a heap string, or its bytes, is still refused")
+fcr_local_heap_string_refused()
+    fcr_held_both(fcr_send() + raw"""
+        work(a: string) -> usize
+            val s = a + "!"
+            send(s.bytes)
+        """, "'s'", "send")
+    fcr_held_both(fcr_send() + raw"""
+        work(a: string) -> usize
+            val s = (a + "!").bytes
+            send(s)
+        """, "'s'", "send")
+
+@test("a local holding a '&T' or a closure is still refused")
+fcr_local_reference_and_closure_refused()
+    fcr_held_both(fcr_send() + raw"""
+        work() -> usize
+            val b: &Box = Box(1)
+            send("x".bytes) + usize(b.n)
+        """, "'b'", "send")
+    fcr_held_both(fcr_send() + raw"""
+        work(a: string) -> usize
+            val f: &Fn() -> unit = () -> print(a)
+            val n = send("x".bytes)
+            f()
+            n
+        """, "'f'", "send")
+
+@test("a local holding a view of a view parameter takes a count of its owner, and is refused")
+fcr_local_view_of_parameter_refused()
+    fcr_held_both(fcr_send() + raw"""
+        work(b: []const u8) -> usize
+            val s = b[0..<1]
+            send(s)
+        """, "'s'", "send")
+
+@test("a local holding a view of a '&T' parameter's array takes a count of the box, and is refused")
+fcr_local_reference_parameter_array_refused()
+    fcr_held_both(fcr_send() + raw"""
+        struct Holder
+            data: [8]u8
+
+        work(h: &Holder) -> usize
+            val s = h.data[0..<4]
+            send(s)
+        """, "'s'", "send")
+
+@test("a lent local written a counted value before the call, even in a branch, is refused")
+fcr_local_rebound_counted_refused()
+    fcr_held_both(fcr_send() + raw"""
+        work(p: *u8, n: usize, a: string) -> usize
+            var s: []const u8 = p[0..<n]
+            s = (a + "!").bytes
+            send(s)
+        """, "'s'", "send")
+    fcr_held_both(fcr_send() + raw"""
+        work(p: *u8, n: usize, a: string) -> usize
+            var s: []const u8 = p[0..<n]
+            if n > 2 then s = (a + "!").bytes
+            send(s)
+        """, "'s'", "send")
+    fcr_held_both(fcr_send() + raw"""
+        work(p: *u8, n: usize, b: []const u8) -> usize
+            var s: []const u8 = p[0..<n]
+            s = b
+            send(s)
+        """, "'s'", "send")
+
+@test("a lent local whose address is taken, or that a 'ref' names, is refused")
+fcr_local_address_taken_refused()
+    fcr_held_both(fcr_send() + raw"""
+        put(into: *[]const u8, a: string) = *into = (a + "!").bytes
+
+        work(p: *u8, n: usize, a: string) -> usize
+            var s: []const u8 = p[0..<n]
+            put(&s, a)
+            send(s)
+        """, "'s'", "send")
+    fcr_held_both(fcr_send() + raw"""
+        work(p: *u8, n: usize, a: string) -> usize
+            var s: []const u8 = p[0..<n]
+            ref r = s
+            r = (a + "!").bytes
+            send(s)
+        """, "'s'", "send")
 
