@@ -1157,6 +1157,36 @@ gen_lent_view(e: *Emit, x: TExpr, callee: string, written: Set[string]) -> Val =
     TConstView(arg) -> gen_lent_view(e, arg, callee, written)
     _ -> gen_expr(e, x)
 
+// **A view bound to a local that holds no count** (`emit_stmt.sysl`'s lent declaration): a slice, a
+// cut or a read-only view is narrowed exactly as `gen_slice` narrows it, with no share of its owner and
+// nothing for the statement to give back, over a base built the same way. What keeps the elements
+// alive is the parameter's storage it is a view of (`param_views.sysl`). Anything else is built as it
+// always is.
+//
+// A string's bytes that may be short are a slot of the frame here (`gen_bytes`), since such a local is
+// only read; a heap copy would be a count the local does not hold, so meeting one is a gap, not a
+// silent miscount.
+gen_unshared_view(e: *Emit, x: TExpr) -> Val = *x.kind match
+    TSlice(base, lo, hi, inclusive, slice_ty) ->
+        if short_substring(slice_ty, base)
+            val v = gen_unshared_view(e, base)
+
+            gen_slice_of(e, str_source_parts(e, v), lo, hi, inclusive, slice_ty, x.span, false, Some(v))
+        else
+            val parts = nameless(texpr_type(base)) match
+                Slice(_, _) -> view_parts(e, gen_unshared_view(e, base), texpr_type(base))
+                Str -> view_parts(e, gen_unshared_view(e, base), texpr_type(base))
+                _ -> slice_base(e, base, slice_ty)
+
+            gen_slice_of(e, parts, lo, hi, inclusive, slice_ty, x.span, false)
+    TConstView(arg) -> gen_unshared_view(e, arg)
+    TBytes(_) ->
+        if bytes_temp(x) && !is_framed_bytes(e, x.span) && !is_place_bytes(e, x.span)
+            gap_here(e, "a view of a string's bytes bound to a local that holds no count, copied to the heap")
+
+        gen_expr(e, x)
+    _ -> gen_expr(e, x)
+
 // Whether a view of part of a place may cross to `callee` with no count of its own: what keeps its
 // elements alive stands for the whole of the call. That is a base the frame already holds a count for
 // (`held_unless`), or one of a type `callee` can neither write nor give back (`lends_in_place`) -- the

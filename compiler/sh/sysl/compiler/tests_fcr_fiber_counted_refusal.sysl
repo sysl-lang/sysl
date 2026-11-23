@@ -588,9 +588,11 @@ fcr_reference_behind_reference_refused()
 // across a switch is refused`). A view with a null owner -- a literal's bytes, a view of a raw pointer,
 // of an array laid in the frame or in module storage, or of another such local -- owns none, so the
 // local holding it holds nothing. The local loses that where the rest of its block may make it own one:
-// a write of a counted value, its address taken, a `ref` bound to it. A view of a view parameter or of a
-// `&T` parameter's referent is lent with no count only as a temporary; bound to a local it takes a count
-// of its owner (`retain_maybe` of the box in the IR), so the local is held.
+// a write of a counted value, its address taken, a `ref` bound to it. A view of a parameter's own
+// storage -- a slice of a view parameter, a string parameter's bytes or a cut of it, an array inside a
+// `&T` parameter's referent -- takes no count either (`param_views.sysl`, the predicate the emitter
+// asks too; its IR and runs are `tests_pvl_`), so long as the parameter stays put and is never used
+// whole, and the local is only read or handed to a call.
 //
 // Cells skipped: a generic body (its instantiations are walked as any other body); a lent local
 // captured by a closure (the closure is a count of its own, held as `fcr_closure_capture` pins); a
@@ -698,23 +700,152 @@ fcr_local_reference_and_closure_refused()
             n
         """, "'f'", "send")
 
-@test("a local holding a view of a view parameter takes a count of its owner, and is refused")
-fcr_local_view_of_parameter_refused()
-    fcr_held_both(fcr_send() + raw"""
+@test("a local holding a view of a view parameter, handed to a call that reaches the switch, holds nothing")
+fcr_local_view_of_parameter()
+    fcr_lent(fcr_send() + raw"""
         work(b: []const u8) -> usize
             val s = b[0..<1]
             send(s)
-        """, "'s'", "send")
+        """)
 
-@test("a local holding a view of a '&T' parameter's array takes a count of the box, and is refused")
-fcr_local_reference_parameter_array_refused()
-    fcr_held_both(fcr_send() + raw"""
+@test("a local holding a view of a '&T' parameter's array holds nothing -- the caller holds the box")
+fcr_local_reference_parameter_array()
+    fcr_lent(fcr_send() + raw"""
         struct Holder
             data: [8]u8
 
         work(h: &Holder) -> usize
             val s = h.data[0..<4]
             send(s)
+        """)
+
+@test("a view behind a second reference, bound to a local, is still refused")
+fcr_local_second_reference_refused()
+    fcr_held_both(fcr_send() + raw"""
+        struct Inner
+            data: [8]u8
+
+        struct Outer
+            inner: &Inner
+
+        work(h: &Outer) -> usize
+            val s = h.inner.data[0..<4]
+            send(s)
+        """, "'s'", "send")
+
+@test("avin's two shapes: a slice of a slice parameter in a loop, and a string parameter's bytes")
+fcr_local_avin_shapes()
+    fcr_lent(raw"""
+        send_all(bytes: []const u8) -> usize
+            var at: usize = 0
+
+            while at < bytes.len
+                val rest = bytes[at..<bytes.len]
+                wait()
+                at += rest.len
+
+            at
+
+        prompt(said_from: string) -> usize
+            val said = said_from.bytes
+            wait()
+            said.len
+        """)
+
+@test("a slice of such a local, a cut of a string parameter, and a '[]T' the body writes through hold nothing")
+fcr_local_parameter_view_shapes()
+    fcr_lent(fcr_send() + raw"""
+        work(b: []const u8, s: string, w: []u8) -> usize
+            val r = b[1..<4]
+            val q = r[0..<2]
+            val c = s[0..<2]
+            val part = w[0..<2]
+            w[0] = 1
+            wait()
+            part[1] = 2
+            q.len + c.len + send(r) + part.len
+        """)
+
+@test("a view of a parameter reassigned, or whose address is taken, is refused")
+fcr_local_parameter_moves_refused()
+    fcr_held_both(fcr_send() + raw"""
+        work(b: []const u8, c: []const u8) -> usize
+            val s = b[0..<1]
+            wait()
+            b = c
+            s.len
+        """, "'s'", "sched.wait")
+    fcr_held_both(fcr_send() + raw"""
+        look(p: *[]const u8) -> usize = (*p).len
+
+        work(b: []const u8) -> usize
+            val s = b[0..<1]
+            wait()
+            s.len + look(&b)
+        """, "'s'", "sched.wait")
+
+@test("a view of a parameter that is also used whole is refused")
+fcr_local_parameter_used_whole_refused()
+    fcr_held_both(fcr_send() + raw"""
+        work(b: []const u8) -> usize
+            val s = b[0..<1]
+            wait()
+            s.len + send(b)
+        """, "'s'", "sched.wait")
+
+@test("a view of a parameter returned, stored into a field, or captured by a kept closure is refused")
+fcr_local_parameter_view_escapes_refused()
+    fcr_held_both(fcr_send() + raw"""
+        work(b: []const u8) -> []const u8
+            val s = b[0..<1]
+            wait()
+            s
+        """, "'s'", "sched.wait")
+    fcr_held_both(fcr_send() + raw"""
+        struct Keep
+            v: []const u8
+
+        work(k: &Keep, b: []const u8) -> usize
+            val s = b[0..<1]
+            wait()
+            k.v = s
+            1
+        """, "'s'", "sched.wait")
+    fcr_held_both(fcr_send() + raw"""
+        var kept: Option[&Fn() -> usize] = None
+
+        work(b: []const u8) -> usize
+            val s = b[0..<1]
+            wait()
+            kept = Some(() -> s.len)
+            1
+        """, "'s'", "sched.wait")
+
+@test("a view of a parameter captured by a closure crossing threads is refused")
+fcr_local_parameter_view_sync_capture_refused()
+    if xvr_no_library() then return
+
+    val said = fcr_ir(fcr_send() + raw"""
+        work(b: []const u8) -> usize
+            val s = b[0..<1]
+            val f: &sync Fn() -> usize = () -> s.len
+            f()
+        """)
+
+    assert(said.contains("error:"), said)
+
+@test("a string parameter's bytes handed to a call, or named in a 'defer', are held and refused")
+fcr_local_parameter_bytes_handed_refused()
+    fcr_held_both(fcr_send() + raw"""
+        work(said_from: string) -> usize
+            val said = said_from.bytes
+            send(said)
+        """, "'said'", "send")
+    fcr_held_both(fcr_send() + raw"""
+        work(b: []const u8) -> usize
+            val s = b[0..<1]
+            defer print(s.len)
+            send("x".bytes)
         """, "'s'", "send")
 
 @test("a lent local written a counted value before the call, even in a branch, is refused")

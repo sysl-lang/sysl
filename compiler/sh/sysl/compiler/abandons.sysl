@@ -158,6 +158,10 @@ struct Abandoning
     // The locals of the body being walked that hold a view owning no count (`lends_nothing`), by their
     // unique names.
     lent: Set[string]
+
+    // The locals of the body being walked that hold a view of a parameter's own storage, which the
+    // emitter declares with no count (`param_views.sysl`) -- the same answer, asked of the same function.
+    views: Set[string]
 end Abandoning
 
 // Holds every body to what an abandoning call needs of it.
@@ -188,7 +192,7 @@ check_abandons(a: &Analysis, funcs: Buf[TFunc], externs: Buf[TExtern], vtables: 
         reached.push(item)
 
     val cx: &Abandoning = Abandoning(seeds, mays, may_abandon(funcs, reached), vtables, empty_scope(),
-                                     false, set(), false, set())
+                                     false, set(), false, set(), set())
 
     for f in funcs
         cx.scope = func_home(a, f.name)
@@ -235,13 +239,14 @@ check_switch_holds(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable])
     reached.push(key)
 
     val cx: &Abandoning = Abandoning(seeds, set(), may_switch(funcs, reached), vtables, empty_scope(),
-                                     false, set(), true, set())
+                                     false, set(), true, set(), set())
 
     for f in funcs
         if f.marks.pinned_thread || f.name == key || on_main_stack(f.name) then continue
 
         cx.scope = func_home(a, f.name)
         cx.lent = set()
+        cx.views = param_view_locals(f)
 
         scan_block(a, cx, f.body, held_on_entry(a, cx, f))
 end check_switch_holds
@@ -343,7 +348,9 @@ private scan_stmts(a: &Analysis, cx: &Abandoning, stmts: Buf[TStmt], held: strin
             TVarDecl(name, ty, init, _) ->
                 scan(a, cx, init, h)
 
-                if cx.fiber && lends_nothing(cx, init) && !rebound(cx, stmts, i + 1, name)
+                if cx.fiber && cx.views.has(name)
+                    ()
+                else if cx.fiber && lends_nothing(cx, init) && !rebound(cx, stmts, i + 1, name)
                     cx.lent.add(name)
                 else if h == "" && held_here(a, cx, ty)
                     h = s"'${shown_local(name)}'"
@@ -563,9 +570,9 @@ private in_named_referent(x: TExpr) -> bool = *x.kind match
 
 // Whether a view bound to a local owns no count, so the local holds nothing across a switch: a
 // literal's bytes, a view of a raw pointer or of an array laid in the frame or in module storage, and a
-// view of a local that already owns none -- every one has a null owner. Narrower than `owns_no_count`:
-// a view of a view parameter, or of anything reached through a `&T`, is lent with no count only as a
-// temporary; bound to a local it takes a count of its owner, which the local then holds.
+// view of a local that already owns none -- every one has a null owner. A view of a parameter's own
+// storage held in a local is the other local that holds nothing, and is answered by the predicate the
+// emitter asks (`param_view_locals`, `cx.views`), not here.
 private lends_nothing(cx: &Abandoning, x: TExpr) -> bool = *x.kind match
     TStrLit(_) -> true
     TLoad(name, _) -> cx.lent.has(name)
