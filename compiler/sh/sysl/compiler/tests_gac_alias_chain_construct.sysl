@@ -1,0 +1,199 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **An alias of a generic alias constructs and matches as the struct at the bottom of the chain.** A
+// generic alias is just as transparent as a plain one (`reference/declarations.md § Type
+// declarations`), a struct is constructed through its alias (`reference/types.md § Type aliases`),
+// and an alias of an alias is the type at the bottom of the chain. So `type PE[T] = PB[T]` over
+// `type PB[T] = PA[T]` calls `PA`'s constructor, with `T` read off the values or the expected type
+// and carried up through every alias between, each level's fixed arguments, defaults and bounds held.
+// The single-level cases are `tests_rac_alias_construct.sysl`'s; the run helpers are
+// `tests_enm_enum_run.sysl`'s.
+
+private gac_chain() -> string = "struct PA[T]\n    v: T\n\ntype PB[T] = PA[T]\ntype PE[T] = PB[T]\n\n"
+
+// A struct with two parameters, an alias fixing the second, and an alias of that alias.
+private gac_partial() -> string =
+    "struct PD[T, U]\n    a: T\n    b: U\n\ntype PC[T] = PD[T, int]\ntype PF[T] = PC[T]\n\n"
+
+// What a program of these files prints, or what stopped it.
+private gac_ran_files(files: []const (string, string)) -> string
+    val root = make_temp_dir("sysl-gac").unwrap()
+
+    for i in 0..<files.len
+        val at = s"$root/${files[i].0}"
+
+        make_dir_all(parent_of(at).unwrap()).unwrap()
+        write_text(at, files[i].1).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end gac_ran_files
+
+// -- the reproducer ---------------------------------------------------------------------------------
+
+@test("an alias of a generic alias infers its argument from the values")
+gac_chain_inferred()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(gac_chain() + "val e = PE(7)\nval a: PA[int] = e\nprint(a.v)\n"), "7\n")
+
+@test("an alias of a generic alias constructs at an argument written on it")
+gac_chain_explicit()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(gac_chain() + "val a: PA[long] = PE[long](8)\nprint(a.v, PE[string](v = \"s\").v)\n"),
+              "8 s\n")
+
+@test("an alias of a generic alias takes its argument from the expected type")
+gac_chain_expected()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("struct Ph[T]\n    n: int\n\ntype PB[T] = Ph[T]\ntype PE[T] = PB[T]\n\n" +
+                      "val p: PE[long] = PE(5)\nval q: Ph[long] = p\nprint(q.n)\n"), "5\n")
+
+@test("an alias three deep reaches the struct, and the expected type wins over the values")
+gac_three_deep()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(gac_chain() + "type PG[T] = PE[T]\n\nval g: PA[long] = PG(9)\nval h = PG(\"x\")\n" +
+                      "print(g.v, h.v)\n"), "9 x\n")
+
+@test("an alias of a generic alias with nothing to say what its parameter is asks for the expected type")
+gac_chain_uninferable()
+    if !enm_ready() then return
+
+    val said = enm_err("struct Ph[T]\n    n: int\n\ntype PB[T] = Ph[T]\ntype PE[T] = PB[T]\n\n" +
+                       "val p = PE(5)\nprint(p.n)\n")
+
+    assert(said.contains("cannot infer the type argument 'T' of 'PE' here — annotate the expected type"), said)
+
+// -- what each level fixes --------------------------------------------------------------------------
+
+@test("an alias of a partially applied alias keeps the argument the middle one fixed")
+gac_partial_chain()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(gac_partial() + "val f = PF(true, 9)\nval d: PD[bool, int] = f\n" +
+                      "print(d.a, d.b, PF[string](\"s\", 2).a)\n"), "true 9 s\n")
+
+@test("a value of the wrong type through an alias chain is refused against what the chain fixed")
+gac_partial_wrong_type()
+    if !enm_ready() then return
+
+    val said = enm_err(gac_partial() + "val f = PF(true, \"x\")\nprint(f.a)\n")
+
+    assert(said.contains("'b' of 'PD[bool, int]' is int, but string was given"), said)
+
+// `Sw2[X]` is `Sw[X, string]` is `PD[string, X]`: the parameter changes place at each level.
+@test("a parameter that changes place at each level of the chain lands where the struct wants it")
+gac_reordered()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("struct PD[T, U]\n    a: T\n    b: U\n\ntype Sw[A, B] = PD[B, A]\n" +
+                      "type Sw2[X] = Sw[X, string]\n\nval s = Sw2(\"s\", 3)\nval d: PD[string, int] = s\n" +
+                      "print(d.a, d.b)\n"), "s 3\n")
+
+@test("a value parameter passed down a chain and fixed partway holds at the call")
+gac_value_param()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("struct M[T, const N: usize]\n    x: T\n\ntype Q[T, const N: usize] = M[T, N]\n" +
+                      "type Q3[T] = Q[T, 3]\n\nval m = Q3(\"a\")\nval k: M[string, 3] = m\n" +
+                      "val j: M[int, 2] = Q[int, 2](4)\nprint(k.x, j.x)\n"), "a 4\n")
+
+@test("a default on an alias of an alias fills what nothing said")
+gac_chain_default()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("struct Ph[T]\n    n: int\n\ntype PB[T] = Ph[T]\ntype PD[T = long] = PB[T]\n\n" +
+                      "val p = PD(5)\nval q: Ph[long] = p\nprint(q.n)\n"), "5\n")
+
+@test("a bound partway down the chain is held at the call")
+gac_chain_bound()
+    if !enm_ready() then return
+
+    val said = enm_err("struct PA[T]\n    v: T\n\ntype NB[T: Integer] = PA[T]\ntype NC[T] = NB[T]\n\n" +
+                       "val b = NC(\"s\")\nprint(b.v)\n")
+
+    assert(said.contains("'NB' requires its type parameter 'T' to implement 'Integer', but string does not"),
+           said)
+
+// The call is made on the struct the renaming names, but the count was written on the alias, so the
+// message names the alias as the same mistake in a type position does.
+@test("an alias called with the wrong number of arguments is refused in the alias's name")
+gac_chain_arity()
+    if !enm_ready() then return
+
+    val chain = enm_err(gac_chain() + "print(PE[int, int](1).v)\n")
+    val one = enm_err(gac_chain() + "print(PB[int, int](1).v)\n")
+    val typed = enm_err(gac_chain() + "f(x: PE[int, int]) -> int = 1\nprint(1)\n")
+    val fixed = enm_err(gac_partial() + "print(PF[int, int](1, 2).a)\n")
+
+    assert(chain.contains("alias 'PE' takes 1 type argument, but 2 type arguments were given"), chain)
+    assert(one.contains("alias 'PB' takes 1 type argument, but 2 type arguments were given"), one)
+    assert(typed.contains("alias 'PE' takes 1 type argument, but 2 type arguments were given"), typed)
+    assert(fixed.contains("alias 'PF' takes 1 type argument, but 2 type arguments were given"), fixed)
+end gac_chain_arity
+
+@test("an alias of an alias of a tuple is still not called")
+gac_chain_tuple_not_called()
+    if !enm_ready() then return
+
+    val said = enm_err("type Pair[A, B] = (A, B)\ntype P2[A] = Pair[A, int]\n\nprint(P2(1, 2).0)\n")
+
+    assert(said.contains("'P2' is an alias, and an alias is not something that is called"), said)
+
+// -- where the alias is written ---------------------------------------------------------------------
+
+@test("an alias of a generic alias matches as a pattern, in an arm and in a binding")
+gac_chain_pattern()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(gac_chain() + "main()\n    val PE(z) = PA(16)\n\n    PE(14) match\n" +
+                      "        PE{v} -> print(z, v)\n"), "16 14\n")
+
+@test("an alias chain that fixes an argument refuses a pattern over another instantiation")
+gac_chain_pattern_refused()
+    if !enm_ready() then return
+
+    val said = enm_err("struct M[T, const N: usize]\n    x: T\n\ntype Q[T, const N: usize] = M[T, N]\n" +
+                       "type Q3[T] = Q[T, 3]\n\nmain()\n    val Q3(a) = M[int, 4](1)\n    print(a)\n")
+
+    assert(said.contains("'Q3(…)' does not match a M[int, 4] value"), said)
+
+@test("an alias of a generic alias as a return type, constructed inside a generic function")
+gac_chain_return_and_generic()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(gac_chain() + "mk(x: int) -> PE[int] = PE(x)\n" +
+                      "wrap[T](x: T) -> PA[T] = PE(x)\n\nprint(mk(12).v, wrap(\"w\").v, wrap(1.5).v)\n"),
+              "12 w 1.5\n")
+
+@test("an alias of a generic alias reached through a module import constructs and matches")
+gac_chain_imported()
+    if !enm_ready() then return
+
+    assert_eq(gac_ran_files([("m/m.sysl", "module m\n\n" + gac_chain()),
+                             ("main.sysl", "import m.{PA, PE}\n\nmain()\n    val e = PE(5)\n" +
+                                           "    val a: PA[int] = e\n    val PE(x) = a\n" +
+                                           "    print(x, m.PE[string](\"q\").v)\n")]),
+              "5 q\n")
+end gac_chain_imported

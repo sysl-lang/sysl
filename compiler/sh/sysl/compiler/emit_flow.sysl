@@ -93,6 +93,7 @@ merge_for(e: *Emit, ty: Type, into: Option[Val], in_place: bool = false) -> Merg
 store_merged(e: *Emit, b: TBlock, ty: Type, m: Merge, inherit: Buf[(Val, Type)] = buf())
     if b.ty == Never then gen_block_void(e, b, inherit)
     else if m.into then gen_block_into(e, b, m.at, inherit)
+    else if zero_sized(ty) then gen_block_void(e, b, inherit)
     else emit(e, InStore(lty(e, ty), gen_block_value(e, b, inherit), m.at, AccPlain, None))
 end store_merged
 
@@ -120,12 +121,12 @@ private gen_block_into(e: *Emit, b: TBlock, dest: Val, inherit: Buf[(Val, Type)]
     pop_temps(e)
 end gen_block_into
 
-// The slot a form's branches store their value into, or nothing where there is no value.
+// The slot a form's branches store their value into, or nothing where the value takes no room.
 private result_slot(e: *Emit, ty: Type) -> Val =
-    if no_value(ty) then VNothing else alloca(e, fresh_reg(e), lty(e, ty))
+    if zero_sized(ty) then VNothing else alloca(e, fresh_reg(e), lty(e, ty))
 
 private load_result(e: *Emit, slot: Val, ty: Type) -> Val
-    if no_value(ty) then return VNothing
+    if zero_sized(ty) then return zero_of(e, ty)
 
     val r = fresh_reg(e)
 
@@ -139,7 +140,7 @@ ends_nowhere(e: *Emit, ty: Type)
     if ty == Never then emit_term(e, InUnreachable)
 
 private store_block_value(e: *Emit, b: TBlock, ty: Type, slot: Val)
-    if b.ty == Never then gen_block_void(e, b)
+    if b.ty == Never || zero_sized(ty) then gen_block_void(e, b)
     else emit(e, InStore(lty(e, ty), gen_block_value(e, b), slot, AccPlain, None))
 
 // What emitting a condition left open: the owned scopes its `is` terms pushed for their bindings,
@@ -304,7 +305,7 @@ gen_while(e: *Emit, cond: Buf[TCondTerm], body: Buf[TStmt], else_block: Option[T
     val else_l = if else_block.is_some() then fresh_label(e, "while.else") else end_l
     val slot = result_slot(e, ty)
 
-    e.loops.push(GenLoop(end_l, cond_l, slot, !no_value(ty), e.owned_marks.len(),
+    e.loops.push(GenLoop(end_l, cond_l, slot, !zero_sized(ty), e.owned_marks.len(),
                          e.temp_marks.len(), e.trace_marks.len()))
     emit_term(e, InBr(cond_l))
     emit_label(e, cond_l)
@@ -336,7 +337,7 @@ gen_do_while(e: *Emit, body: Buf[TStmt], cond: TExpr, else_block: Option[TBlock]
     val else_l = if else_block.is_some() then fresh_label(e, "dowhile.else") else end_l
     val slot = result_slot(e, ty)
 
-    e.loops.push(GenLoop(end_l, cond_l, slot, !no_value(ty), e.owned_marks.len(),
+    e.loops.push(GenLoop(end_l, cond_l, slot, !zero_sized(ty), e.owned_marks.len(),
                          e.temp_marks.len(), e.trace_marks.len()))
     emit_term(e, InBr(body_l))
     emit_label(e, body_l)
@@ -369,7 +370,7 @@ gen_loop(e: *Emit, body: Buf[TStmt], ty: Type) -> Val
     val end_l = fresh_label(e, "loop.end")
     val slot = result_slot(e, ty)
 
-    e.loops.push(GenLoop(end_l, body_l, slot, !no_value(ty), e.owned_marks.len(),
+    e.loops.push(GenLoop(end_l, body_l, slot, !zero_sized(ty), e.owned_marks.len(),
                          e.temp_marks.len(), e.trace_marks.len()))
     emit_term(e, InBr(body_l))
     emit_label(e, body_l)
@@ -411,7 +412,7 @@ gen_for_each(e: *Emit, name: string, elem_ty: Type, seq: TExpr, body: Buf[TStmt]
     val slot = result_slot(e, ty)
 
     emit(e, InStore(w, VInt(from_int(0)), idx, AccPlain, None))
-    e.loops.push(GenLoop(end_l, step_l, slot, !no_value(ty), e.owned_marks.len(),
+    e.loops.push(GenLoop(end_l, step_l, slot, !zero_sized(ty), e.owned_marks.len(),
                          e.temp_marks.len(), e.trace_marks.len()))
     emit_term(e, InBr(cond_l))
     emit_label(e, cond_l)
@@ -534,7 +535,7 @@ gen_iterate(e: *Emit, cursor: string, cursor_ty: Type, init: TExpr, next: TExpr,
     // Recorded **after** the frame the option lives in, and deliberately: the body was reached
     // through the release below, so a `break` that unwound that frame as well would give the option
     // back twice.
-    e.loops.push(GenLoop(end_l, cond_l, slot, !no_value(ty), e.owned_marks.len(),
+    e.loops.push(GenLoop(end_l, cond_l, slot, !zero_sized(ty), e.owned_marks.len(),
                          e.temp_marks.len(), e.trace_marks.len()))
 
     val opt = gen_expr(e, next)
@@ -697,7 +698,7 @@ gen_for(e: *Emit, name: string, var_ty: Type, lo: TExpr, hi: TExpr, inclusive: b
     val else_l = if else_block.is_some() then fresh_label(e, "for.else") else end_l
     val slot = result_slot(e, ty)
     val home = local_alloca(e, name, w)
-    val at = ForTurns(name, var_ty, w, lo_v, hi, hi_v, inclusive, slot, !no_value(ty), home, else_l,
+    val at = ForTurns(name, var_ty, w, lo_v, hi, hi_v, inclusive, slot, !zero_sized(ty), home, else_l,
                       end_l)
 
     // A loop whose subscripts a test in front of it can prove runs a copy with their checks left out
@@ -810,7 +811,7 @@ gen_cfor(e: *Emit, init: Buf[TStmt], cond: Option[TExpr], step: Buf[TStmt], body
     val slot = result_slot(e, ty)
 
     gen_stmts(e, init)
-    e.loops.push(GenLoop(end_l, step_l, slot, !no_value(ty), e.owned_marks.len(),
+    e.loops.push(GenLoop(end_l, step_l, slot, !zero_sized(ty), e.owned_marks.len(),
                          e.temp_marks.len(), e.trace_marks.len()))
     emit_term(e, InBr(cond_l))
     emit_label(e, cond_l)

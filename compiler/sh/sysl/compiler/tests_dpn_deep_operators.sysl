@@ -1,0 +1,202 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.env.{get as env_var}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.slices.as_ptr
+import sysl.sync.Atomic
+import sysl.text.join
+
+// A deep nesting of operators compiles. Every pass walks the tree by recursion, one level per level
+// of nesting, so a nesting is bounded by the stack the compiler runs on. Two things set that bound:
+// the emitter's per-level cost, which an operator used to pay through `gen_expr_kind`'s 32 KiB frame
+// (a 300-term sum overflowed the 8 MiB main stack), and the stack itself, which is 1 GiB for the
+// compiler's own work (`compiler_stack.sysl`). The 400-term programs build on the test's own stack,
+// so they hold the emitter to its few KiB a level; the 4000-term ones on the compiler's stack, as
+// `main` runs them; and two go through the built binary, which is `main` itself.
+
+// `n` copies of `term`, joined by `sep`.
+private dpn_terms(n: int, term: string, sep: string) -> string
+    var parts: Buf[string] = buf()
+
+    for _ in 0..<n
+        parts.push(term)
+
+    join(parts.view(), sep)
+end dpn_terms
+
+// The shape the bug was found in: `s += 0 + a0.v + … + a{n-1}.v`, fields of `n` struct values.
+private dpn_fields(n: int) -> string
+    var lines: Buf[string] = buf()
+    var terms: Buf[string] = buf()
+
+    lines.push("struct A\n    v: int\n\nmain()")
+
+    for i in 0..<n
+        lines.push(s"    val a$i = A($i)")
+        terms.push(s"a$i.v")
+
+    lines.push("    var s = 0")
+    lines.push("    s += 0 + " + join(terms.view(), " + "))
+    lines.push("    print(s)\n")
+    join(lines.view(), "\n")
+end dpn_fields
+
+// A left-nested sum of `n` reads of a local: `0 + x + x + …`.
+private dpn_sum(n: int) -> string =
+    "main()\n    var x = 1\n    val s = 0 + " + dpn_terms(n, "x", " + ") + "\n    print(s)\n"
+
+// A left-nested string `+` of `n` reads: each step makes a new string the statement owns.
+private dpn_concat(n: int) -> string =
+    "main()\n    var x = \"ab\"\n    val s = \"\" + " + dpn_terms(n, "x", " + ") + "\n    print(s.len)\n"
+
+// `x && x && …`, and `x || x || …`: each level a branch with a region of its own.
+private dpn_all(n: int) -> string =
+    "main()\n    var x = true\n    val s = " + dpn_terms(n, "x", " && ") + "\n    print(s)\n"
+
+private dpn_any(n: int) -> string =
+    "main()\n    var x = false\n    val s = " + dpn_terms(n, "x", " || ") + "\n    print(s)\n"
+
+// A right-nested sum, `(x + (x + (… + 0)))`: the parser descends once per parenthesis.
+private dpn_right(n: int) -> string =
+    "main()\n    var x = 1\n    val s = " + dpn_terms(n, "(x + ", "") + "0" + dpn_terms(n, ")", "") +
+        "\n    print(s)\n"
+
+// `-(-(… x))`: a unary operator nested `n` deep.
+private dpn_negations(n: int) -> string =
+    "main()\n    var x = 5\n    val s = " + dpn_terms(n, "-(", "") + "x" + dpn_terms(n, ")", "") +
+        "\n    print(s)\n"
+
+// A sum of products: each term a binary operator of its own under the chain.
+private dpn_products(n: int) -> string =
+    "main()\n    var x = 2\n    val s = 0 + " + dpn_terms(n, "x * x", " + ") + "\n    print(s)\n"
+
+// `id(id(… 1))`: a nesting that is not an operator, which only the compiler's stack holds.
+private dpn_calls(n: int) -> string =
+    "id(v: int) -> int = v\n\nmain()\n    val s = " + dpn_terms(n, "id(", "") + "1" + dpn_terms(n, ")", "") +
+        "\n    print(s)\n"
+
+// `text` builds on this thread's own stack, runs, and prints `want`.
+private dpn_prints(text: string, want: string)
+    if std_root().is_err() then return
+
+    azc_main_prints(text, want)
+
+// What the build on the compiler's stack is handed, and what it says back: the program and the
+// output it owes, as the storage of a buffer holding the two -- as `main` hands over its arguments --
+// since the thread only reads them while the test waits on it.
+private struct DpnJob
+    texts: *string
+    passed: Atomic[i32]
+
+private dpn_build_here(job: *DpnJob)
+    val r = azc_ran([("main.sysl", job.texts[0])])
+
+    if r.built && r.ok && r.out == job.texts[1] then job.passed.store(1)
+    else print(s"built ${r.built}, exited zero ${r.ok}: ${r.said()}")
+
+// `text` builds on the stack the compiler gives its own work, runs, and prints `want`.
+private dpn_deep_prints(text: string, want: string)
+    if std_root().is_err() then return
+
+    var texts: Buf[string] = buf()
+
+    texts.push(text)
+    texts.push(want)
+
+    val job: &sync DpnJob = DpnJob(as_ptr(texts.view()), Atomic(0))
+
+    on_compiler_stack(&dpn_build_here, &*job)
+    assert(job.passed.load() == 1, "the deep program did not build, run and print what it owes")
+end dpn_deep_prints
+
+// `text` built by the `sysl` binary `SYSL_STAGE2` names -- `main`, on its own stack -- runs and
+// prints `want`.
+private dpn_binary_prints(text: string, want: string)
+    val binary = env_var("SYSL_STAGE2") match
+        Some(b) -> b
+        None ->
+            print("skipped: SYSL_STAGE2 names no sysl binary on this machine")
+            return
+
+    if std_root().is_err() then return
+
+    val root = make_temp_dir("sysl-dpn").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val built = capture(binary, ["build", s"$root/main.sysl", "-o", s"$root/built"]).unwrap()
+
+    assert(built.status.ok(), s"${built.text}${built.err.unwrap_or("")}")
+
+    val ran = capture(s"$root/built", []).unwrap()
+
+    remove_dir_all(root).unwrap_or(())
+    assert(ran.status.ok(), ran.text)
+    assert_eq(ran.text, want)
+end dpn_binary_prints
+
+// -- 400 terms, on the test's own stack -------------------------------------------------------------
+
+@test("dpn: the 400 fields summed into a compound assignment build on an ordinary stack")
+dpn_fields_400() = dpn_prints(dpn_fields(400), "79800\n")
+
+@test("dpn: a 400-term left-nested sum builds on an ordinary stack")
+dpn_sum_400() = dpn_prints(dpn_sum(400), "400\n")
+
+@test("dpn: a 400-term string concatenation builds on an ordinary stack")
+dpn_concat_400() = dpn_prints(dpn_concat(400), "800\n")
+
+@test("dpn: a 400-term && chain builds on an ordinary stack")
+dpn_all_400() = dpn_prints(dpn_all(400), "true\n")
+
+@test("dpn: a 400-term || chain builds on an ordinary stack")
+dpn_any_400() = dpn_prints(dpn_any(400), "false\n")
+
+@test("dpn: a 400-deep right-nested sum builds on an ordinary stack")
+dpn_right_400() = dpn_prints(dpn_right(400), "400\n")
+
+@test("dpn: 400 nested negations build on an ordinary stack")
+dpn_negations_400() = dpn_prints(dpn_negations(400), "5\n")
+
+@test("dpn: a 400-term sum of products builds on an ordinary stack")
+dpn_products_400() = dpn_prints(dpn_products(400), "1600\n")
+
+// -- 4000 terms, on the compiler's stack ----------------------------------------------------------
+
+@test("dpn: the 1000 fields summed into a compound assignment build on the compiler's stack")
+dpn_fields_1000() = dpn_deep_prints(dpn_fields(1000), "499500\n")
+
+@test("dpn: a 4000-term left-nested sum builds on the compiler's stack")
+dpn_sum_4000() = dpn_deep_prints(dpn_sum(4000), "4000\n")
+
+@test("dpn: a 4000-term string concatenation builds on the compiler's stack")
+dpn_concat_4000() = dpn_deep_prints(dpn_concat(4000), "8000\n")
+
+@test("dpn: a 4000-term && chain builds on the compiler's stack")
+dpn_all_4000() = dpn_deep_prints(dpn_all(4000), "true\n")
+
+@test("dpn: a 4000-term || chain builds on the compiler's stack")
+dpn_any_4000() = dpn_deep_prints(dpn_any(4000), "false\n")
+
+@test("dpn: a 4000-deep right-nested sum builds on the compiler's stack")
+dpn_right_4000() = dpn_deep_prints(dpn_right(4000), "4000\n")
+
+@test("dpn: 4000 nested negations build on the compiler's stack")
+dpn_negations_4000() = dpn_deep_prints(dpn_negations(4000), "5\n")
+
+@test("dpn: a 4000-term sum of products builds on the compiler's stack")
+dpn_products_4000() = dpn_deep_prints(dpn_products(4000), "16000\n")
+
+@test("dpn: 4000 nested calls build on the compiler's stack")
+dpn_calls_4000() = dpn_deep_prints(dpn_calls(4000), "1\n")
+
+// -- through the binary ---------------------------------------------------------------------------
+
+@test("dpn: sysl build of a 4000-term left-nested sum, as the command line runs it")
+dpn_binary_sum_4000() = dpn_binary_prints(dpn_sum(4000), "4000\n")
+
+@test("dpn: sysl build of a 4000-deep right-nested sum, as the command line runs it")
+dpn_binary_right_4000() = dpn_binary_prints(dpn_right(4000), "4000\n")
