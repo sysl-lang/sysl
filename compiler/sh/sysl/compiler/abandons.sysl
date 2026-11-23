@@ -158,6 +158,11 @@ struct Abandoning
     // The locals of the body being walked that hold a view owning no count (`lends_nothing`), by their
     // unique names.
     lent: Set[string]
+
+    // The arrays of the body being walked that the lowering moves to a counted buffer
+    // (`escape.sysl`'s `FuncPromotions`): the box is the frame's own count, held from the declaration
+    // to the end of its block.
+    promoted: Set[string]
 end Abandoning
 
 // Holds every body to what an abandoning call needs of it.
@@ -188,7 +193,7 @@ check_abandons(a: &Analysis, funcs: Buf[TFunc], externs: Buf[TExtern], vtables: 
         reached.push(item)
 
     val cx: &Abandoning = Abandoning(seeds, mays, may_abandon(funcs, reached), vtables, empty_scope(),
-                                     false, set(), false, set())
+                                     false, set(), false, set(), set())
 
     for f in funcs
         cx.scope = func_home(a, f.name)
@@ -235,13 +240,18 @@ check_switch_holds(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable])
     reached.push(key)
 
     val cx: &Abandoning = Abandoning(seeds, set(), may_switch(funcs, reached), vtables, empty_scope(),
-                                     false, set(), true, set())
+                                     false, set(), true, set(), set())
+    val moved = func_promotions(a, funcs, vtables)
 
     for f in funcs
         if f.marks.pinned_thread || f.name == key || on_main_stack(f.name) then continue
 
         cx.scope = func_home(a, f.name)
         cx.lent = set()
+        cx.promoted = set()
+
+        for name in moved.arrays(f)
+            cx.promoted.add(name)
 
         scan_block(a, cx, f.body, held_on_entry(a, cx, f))
 end check_switch_holds
@@ -343,7 +353,9 @@ private scan_stmts(a: &Analysis, cx: &Abandoning, stmts: Buf[TStmt], held: strin
             TVarDecl(name, ty, init, _) ->
                 scan(a, cx, init, h)
 
-                if cx.fiber && lends_nothing(cx, init) && !rebound(cx, stmts, i + 1, name)
+                if cx.fiber && cx.promoted.has(name)
+                    if h == "" then h = s"the array '${shown_local(name)}' (promoted to the heap, because a view of it outlives the frame)"
+                else if cx.fiber && lends_nothing(cx, init) && !rebound(cx, stmts, i + 1, name)
                     cx.lent.add(name)
                 else if h == "" && held_here(a, cx, ty)
                     h = s"'${shown_local(name)}'"
@@ -562,8 +574,8 @@ private in_named_referent(x: TExpr) -> bool = *x.kind match
     _ -> false
 
 // Whether a view bound to a local owns no count, so the local holds nothing across a switch: a
-// literal's bytes, a view of a raw pointer or of an array laid in the frame or in module storage, and a
-// view of a local that already owns none -- every one has a null owner. Narrower than `owns_no_count`:
+// literal's bytes, a view of a raw pointer or of an array laid in the frame (one not promoted to the
+// heap) or in module storage, and a view of a local that already owns none -- every one has a null owner. Narrower than `owns_no_count`:
 // a view of a view parameter, or of anything reached through a `&T`, is lent with no count only as a
 // temporary; bound to a local it takes a count of its owner, which the local then holds.
 private lends_nothing(cx: &Abandoning, x: TExpr) -> bool = *x.kind match
@@ -573,11 +585,18 @@ private lends_nothing(cx: &Abandoning, x: TExpr) -> bool = *x.kind match
     TConstView(arg) -> lends_nothing(cx, arg)
     TSlice(base, _, _, _, _) -> underlying(texpr_type(base)) match
         Ptr(_, _) -> true
-        Array(_, _, _) -> laid_in_place(base)
+        Array(_, _, _) -> laid_in_place(base) && !in_promoted(cx, base)
         Slice(_, _) -> lends_nothing(cx, base)
         Str -> lends_nothing(cx, base)
         _ -> false
     _ -> in_module_val(x)
+
+// Whether an array lies in a local this body promoted to the heap, whose box a view of it counts.
+private in_promoted(cx: &Abandoning, x: TExpr) -> bool = *x.kind match
+    TLoad(name, _) -> cx.promoted.has(name)
+    TField(receiver, _, _) -> in_promoted(cx, receiver)
+    TIndex(base, _, _) -> in_promoted(cx, base)
+    _ -> false
 
 // Whether the rest of a block may leave the local `name` owning a count: a write of it from a value
 // that owns one, a `ref` bound to it, or its address taken -- after which what it holds is not read off

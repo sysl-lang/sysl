@@ -756,3 +756,102 @@ fcr_local_address_taken_refused()
             send(s)
         """, "'s'", "send")
 
+// -- a frame array promoted to the heap ------------------------------------------------------------
+//
+// An array a view of which outlives the frame lives in a counted buffer (`escape.sysl`), and the box is
+// the frame's own count from the declaration to the end of its block -- released with a plain
+// decrement. So the array is held across a reaching call, and a view of it lends nothing, whether it
+// is lent as a temporary or bound to a local. The same array the escape analysis leaves in the frame
+// holds nothing. Not here: a promoted temporary array (`[0; 16][0..<n]` returned), whose box is made in
+// the statement that lets it out, so no call is made across it.
+
+private fcr_promoted() -> string = "the array 'a' (promoted to the heap, because a view of it outlives the frame)"
+
+@test("a promoted frame array lent as a temporary across a reaching call is refused, naming the array")
+fcr_promoted_array_inline_refused()
+    fcr_held_both(fcr_send() + raw"""
+        work(n: usize) -> []u8
+            var a: [16]u8 = [0; 16]
+            send(a[0..<2])
+            a[0..<n]
+        """, fcr_promoted(), "send")
+
+@test("a local view of a promoted frame array held across a reaching call is refused, naming the array")
+fcr_promoted_array_local_view_refused()
+    fcr_held_both(fcr_send() + raw"""
+        work(n: usize) -> []u8
+            var a: [16]u8 = [0; 16]
+            val v = a[0..<2]
+            send(v)
+            a[0..<n]
+        """, fcr_promoted(), "send")
+
+@test("a promoted array is held to the end of its block: a last use before the call is still refused")
+fcr_promoted_array_used_before_refused()
+    fcr_held_both(fcr_send() + raw"""
+        work(n: usize) -> []u8
+            var a: [16]u8 = [0; 16]
+            val out = a[0..<n]
+            send("ping".bytes)
+            out
+        """, fcr_promoted(), "send")
+    fcr_held_both(raw"""
+        work(n: usize) -> []u8
+            var a: [16]u8 = [0; 16]
+            val out = a[0..<n]
+            wait()
+            out
+        """, fcr_promoted(), "sched.wait")
+
+@test("a promoted array of arrays, lent a view of one element across the call, is refused")
+fcr_promoted_array_nested_refused()
+    fcr_held_both(fcr_send() + raw"""
+        work(n: usize) -> []u8
+            var a: [2][8]u8 = [[0; 8], [0; 8]]
+            send(a[1][0..<2])
+            a[0][0..<n]
+        """, fcr_promoted(), "send")
+
+@test("the same frame array with no view outliving the frame holds nothing across the call")
+fcr_unpromoted_array_accepted()
+    fcr_lent(fcr_send() + raw"""
+        work(n: usize) -> u8
+            var a: [16]u8 = [0; 16]
+            send(a[0..<2])
+            val v = a[0..<n]
+            send(v)
+            a[0]
+        """)
+
+@test("a promoted array whose block ends before the call holds nothing across it")
+fcr_promoted_array_dead_before_accepted()
+    fcr_lent(fcr_send() + raw"""
+        work(n: usize, b: []u8) -> []u8
+            if n > 8
+                var a: [16]u8 = [0; 16]
+                return a[0..<n]
+            send("ping".bytes)
+            b
+        """)
+
+@test("a promoted array declared after the call holds nothing across it")
+fcr_promoted_array_declared_after_accepted()
+    fcr_lent(fcr_send() + raw"""
+        work(n: usize) -> []u8
+            send("ping".bytes)
+            var a: [16]u8 = [0; 16]
+            a[0..<n]
+        """)
+
+@test("'@pinned(thread)' accepts a promoted array held across the switch")
+fcr_promoted_array_pinned_accepted()
+    fcr_lent(fcr_send() + raw"""
+        @pinned(thread)
+        work(n: usize) -> []u8
+            var a: [16]u8 = [0; 16]
+            val v = a[0..<2]
+            send(a[0..<2])
+            send(v)
+            a[0..<n]
+        """)
+

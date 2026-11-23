@@ -356,7 +356,7 @@ check_escapes(a: &Analysis, p: TProgram) -> Promotions
 
     for i in 0..<p.funcs.len()
         val f = p.funcs[i]
-        val w = walk_body(p, keeps, f.body.stmts, f.body.result, f.marks.views)
+        val w = walk_func(p, keeps, f)
         val home = func_home(a, f.name)
 
         report_body(a, p, home, Some(f.name), f.marks.gives_up("alloc"), w)
@@ -470,6 +470,33 @@ end note_promotions
 // treats the answer as made of its arguments (`any_view`), so a later store of the object is caught
 // where the caller makes it.
 //
+// One function's walk, as `check_escapes` makes it and `FuncPromotions` asks it again.
+private walk_func(p: TProgram, keeps: &KeptParams, f: TFunc) -> EscapeWalk =
+    walk_body(p, keeps, f.body.stmts, f.body.result, f.marks.views)
+
+// **The arrays a body moves to the heap, for a check that runs before `check_escapes`** (`abandons.sysl`'s
+// `check_switch_holds`, where a promoted array's box is a count the frame holds). It asks the walk the
+// lowering's own decision comes from, over the same bodies, so the two cannot disagree.
+struct FuncPromotions
+    p: TProgram
+    keeps: &KeptParams
+
+    // The arrays `f` declares and the lowering lays in a counted buffer rather than in its frame. A
+    // body that declares no array has none to move, and is not walked.
+    arrays(self, f: TFunc) -> Buf[string]
+        if local_arrays(with_result(f.body.stmts, f.body.result)).is_empty() then return buf()
+
+        walk_func(self.p, self.keeps, f).promoted
+end FuncPromotions
+
+func_promotions(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable]) -> &FuncPromotions
+    val p = TProgram(buf(), buf(), vtables, buf(), buf(), funcs, buf(), None, buf(), true, false, buf(),
+                     buf(), "", buf(), buf(), buf(), buf(), buf(), buf(), buf(), None, buf(), false,
+                     false, false, true, map(), buf(), false)
+
+    FuncPromotions(p, kept_params(a, p))
+end func_promotions
+
 // A function is known by its index in `p.funcs` -- the first one of its name, which is the one a
 // lookup by name always found.
 struct KeptParams
