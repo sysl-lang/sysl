@@ -24,19 +24,35 @@ no_value(t: Type) -> bool = t == Unit || t == Never
 // box's payload, which is exactly the end of the allocation, and AddressSanitizer faulted on the
 // access of no size. An `opaque` struct is someone else's storage of a size this program is not
 // told, a task is the address of its promise, and an `@align(n)` struct is padded out to `n` bytes.
-zero_sized(t: Type) -> bool = t match
+//
+// **A `@unique` struct keeps its room too**, and so does any struct holding one. Such a value has an
+// owner that lets go of it -- its destructor runs at the end of the owner's scope, when it is handed
+// on, or with the statement's temporaries -- and an owner is a slot: read as `unit` is, the binding
+// had none, so a local's destructor ran at the end of the statement that declared it. It still holds
+// no bytes (`holds_no_bytes`), and what reads one out of storage reads nothing.
+zero_sized(t: Type) -> bool = no_bytes(t, false)
+
+// Whether a value of this type occupies no bytes: what `zero_sized` answers, and a `@unique` struct
+// with no bytes as well. Such a value is still passed and stored as a value of its LLVM type, but its
+// storage is never read: the value is that type's zeroinitializer, which is the only one it has. Read
+// from a box's payload, it would be an access of no size at the end of the allocation.
+holds_no_bytes(t: Type) -> bool = no_bytes(t, true)
+
+private no_bytes(t: Type, unique: bool) -> bool = t match
     Unit -> true
     Never -> true
-    Struct(d) -> !d.opaque && d.base != TaskBase && d.min_align.is_none() && all_zero_sized(d.fields)
-    Array(n, elem, _) -> n == 0 || zero_sized(*elem)
+    Struct(d) ->
+        !d.opaque && (unique || !d.unique) && d.base != TaskBase && d.min_align.is_none() &&
+        all_no_bytes(d.fields, unique)
+    Array(n, elem, _) -> n == 0 || no_bytes(*elem, unique)
     _ -> false
 
-private all_zero_sized(fields: Buf[(string, Type)]) -> bool
+private all_no_bytes(fields: Buf[(string, Type)], unique: bool) -> bool
     for f in fields
-        if !zero_sized(f.1) then return false
+        if !no_bytes(f.1, unique) then return false
 
     true
-end all_zero_sized
+end all_no_bytes
 
 // Whether no value of this type can exist: `never`, and anything that would have to hold one by
 // value -- a struct or a tuple with such a field, an array of at least one such element, an enum

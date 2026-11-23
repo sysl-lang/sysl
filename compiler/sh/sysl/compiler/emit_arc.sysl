@@ -258,6 +258,11 @@ private walk_at(e: *Emit, ty: Type, p: Val, retain: bool)
         arc_call(e, name, p)
         return
 
+    // Storage holding no bytes is never read (`holds_no_bytes`): its value is its type's only one.
+    if holds_no_bytes(ty)
+        arc_value(e, ty, if zero_sized(ty) then zero_of(e, ty) else VZero, retain)
+        return
+
     val v = fresh_reg(e)
 
     emit(e, InLoad(v, lty(e, ty), p, AccPlain, None))
@@ -1263,6 +1268,7 @@ private let_go_of_payload(e: *Emit, payload: Type, pa: Val, drain: bool)
 
         if e.layout.indirect(payload) then walk_slot(e, payload, pa, false)
         else if zero_sized(payload) then release_value(e, payload, zero_of(e, payload))
+        else if holds_no_bytes(payload) then release_value(e, payload, VZero)
         else
             val whole = fresh_reg(e)
 
@@ -1274,12 +1280,14 @@ private let_go_of_payload(e: *Emit, payload: Type, pa: Val, drain: bool)
     end if
 
     // A payload that takes no room is never read: its value is its type's one value, and a
-    // destructor taking it by value has no parameter for it (`emit_sig.sysl`).
+    // destructor taking it by value has no parameter for it (`emit_sig.sysl`). A `@unique` one with
+    // no bytes is passed, as its zeroinitializer, but is not read either (`holds_no_bytes`).
     val empty = zero_sized(payload)
+    val unread = holds_no_bytes(payload)
     val by_address = destructor_by_address(e, payload)
-    val v = if empty then zero_of(e, payload) else fresh_reg(e)
+    val v = if empty then zero_of(e, payload) else if unread then VZero else fresh_reg(e)
 
-    if !by_address && !empty then emit(e, InLoad(v, lty(e, payload), pa, AccPlain, None))
+    if !by_address && !unread then emit(e, InLoad(v, lty(e, payload), pa, AccPlain, None))
 
     // **Before the walk, not after.** The destructor is handed the value as it stands, so it may
     // read a field to close what that field names; releasing first would hand it a value whose
@@ -1306,7 +1314,7 @@ private let_go_of_payload(e: *Emit, payload: Type, pa: Val, drain: bool)
             emit(e, ir_call(None, LVoid, VGlobal(d), args))
         None -> ()
 
-    if by_address && !empty then emit(e, InLoad(v, lty(e, payload), pa, AccPlain, None))
+    if by_address && !unread then emit(e, InLoad(v, lty(e, payload), pa, AccPlain, None))
 
     release_value(e, payload, v)
 end let_go_of_payload
