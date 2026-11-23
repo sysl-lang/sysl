@@ -4287,7 +4287,8 @@ where its parent's count already holds the object, across a `for` or the rest of
 provided the parent stays put (not a `var` assigned in the loop or whose address is taken), the view
 stays in a local, and nothing between may look at a count: only arithmetic, reads, and calls to
 functions that release nothing and write only their own locals (`slot_vacate` frees only at a strong
-count of one).
+count of one). A view of a parameter's own storage held in a local needs none of that
+([A view of a parameter's storage takes no count](#a-view-of-a-parameters-storage-takes-no-count)).
 
 **The same goes for a reference read out of storage** — a field through a parameter, a buffer's
 element, a matched payload, a key built for a lookup — where nothing between can give a count back,
@@ -4330,10 +4331,89 @@ main()
 ```
 
 The local must hold a count on everything stored into it and be read only where it lies. A parameter
-does not qualify: what a borrowed one holds is its caller's, and the share keeps its count.
+does not qualify for a reference read out of storage through it: what a borrowed one holds is its
+caller's, and the share keeps its count. A view of the parameter's own storage is another matter
+(below).
 Reading the payload straight out of the place being written (`self.input = self.input.unwrap().link`)
 keeps the share, since that release may be the packet's last, and so does a release whose teardown
 runs a destructor.
+
+### A view of a parameter's storage takes no count
+
+**A local holding a view of a parameter's own storage takes no count at all**, whatever runs while it
+is held — a call, a destructor, a fiber switch. Such a view can be a slice of a `[]T` or `[]const T`
+parameter, a `string` parameter's `.bytes` or a cut of it, a slice of another such local, or a slice
+of an array lying by value in a `&T` parameter's referent. A borrowed parameter's caller holds its
+share for the whole activation. Its frame is parked under this one, on the same fiber, so nothing can
+give that share back while the body runs. It holds when:
+
+- **the parameter stays put** — the body never assigns it, takes its address, binds a `ref` to it or
+  jumps back to its own entry. It is also **never used whole**, only sliced, cut, measured, indexed,
+  walked by a `for` or read through. Then no way out of the body keeps the parameter, and no last use
+  of it hands its count away while the view is still to be read;
+- **the local only reads the view** — its length, an element, a `for` over it, a slice of it read the
+  same way, the start of another such local, or an argument of a direct call. A view that is returned,
+  stored, captured or built into a value takes its count like any other local. **The bytes of a
+  string that may be short are not handed to a call either**: such bytes are the string's own words,
+  and a callee that keeps them gets a heap copy with a count of its own;
+- **the local is written once** — never assigned, its address never taken, no `ref` bound to it, not
+  named in a `defer`.
+
+A view behind a second reference, such as `h.inner.data` for `h: &Outer` with `inner: &Inner`, is not
+covered. The first referent may let go of the second while the body runs. The fiber-switch check asks
+the same question ([A count held across a switch is refused](/library/fiber/#a-count-held-across-a-switch-is-refused)),
+so a local the rule covers is held across nothing there, and one it does not cover is held:
+
+```sysl
+import sysl.fiber.{Context, Stack, switch}
+
+var home = Context.new()
+var away = Context.new()
+
+park()
+    switch(&away, &home)
+
+send_all(bytes: []const u8) -> usize
+    var at: usize = 0
+
+    while at < bytes.len
+        val rest = bytes[at..<bytes.len]   // no count of the bytes' owner
+        park()
+        at += rest.len
+
+    at
+
+prompt(said_from: string) -> usize
+    val said = said_from.bytes
+    park()
+    said.len
+
+@pinned(thread)
+work()
+    print(send_all(("pi" + "ng").bytes))
+    print(prompt("password" + ": "))
+
+run(p: *int)
+    work()
+
+    loop
+        park()
+
+var unused = 0
+
+main()
+    val stack = Stack.reserve(64 * 1024).unwrap()
+
+    away = Context.start(stack, &run, &unused)
+
+    for _ in 0..<4
+        switch(&home, &away)
+```
+
+```output
+4
+10
+```
 
 ### A read of a place that is written over next takes the place's count
 

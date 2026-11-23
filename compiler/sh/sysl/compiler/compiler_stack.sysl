@@ -1,0 +1,22 @@
+module sh.sysl.compiler
+
+import sysl.threads.spawn
+
+// **The compiler's work runs on a stack of its own, of 1 GiB of address space.** Nearly every pass is
+// a recursion over the tree, one level per level of nesting: the parser descends once per
+// parenthesis, the analyzer and the emitter once per operator of a chain, every whole-program walk the
+// same. A level costs a few KiB, so the system's 8 MiB main stack held a nesting of only several
+// hundred, and a generated `s += 0 + a0.v + … + a399.v` went past it. The walks are recursive because
+// the grammar is -- a right-nested `(x + (x + …))` cannot be walked in a loop by a descent that has
+// to come back to finish each level -- so the room is given rather than each walk rewritten. Only
+// the pages the deepest walk reaches are ever touched, so a shallow program pays for none of it.
+const COMPILER_STACK: usize = 1 << 30
+
+/** Runs `body(arg)` on a thread whose stack is `COMPILER_STACK`, and waits for it to finish. Where
+ * the system will not start the thread, `body` runs here instead, on the caller's own stack.
+ */
+@crossing(arg)
+on_compiler_stack[T](body: *extern(@lets_out *T) -> unit, arg: *T)
+    spawn(body, arg, COMPILER_STACK) match
+        Some(t) -> _ = t.join()
+        None -> body(arg)

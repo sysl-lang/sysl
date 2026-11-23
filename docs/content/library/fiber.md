@@ -320,10 +320,14 @@ What is held is what a frame owns a count of at the call: a local, a binding a `
 of, a counted temporary of the expression around the call. A scalar, a `*T` and a `&sync T` are not
 — the last has an atomic count. Nor is a local holding a view that owns no count: a literal's bytes,
 a view of a `*T`, of an array laid in the frame or in module storage, or of another such local, so
-long as nothing writes it a counted value, takes its address or binds a `ref` to it. A view of a view
-parameter or of storage reached through a `&T` is lent with no count as an argument, but bound to a
-local it takes a count of its owner, and is held. A value whose block has ended before the call is
-not held either, so the fix is usually to give the value a block of its own:
+long as nothing writes it a counted value, takes its address or binds a `ref` to it. Nor is a local
+holding a view of a parameter's own storage — a slice of a view parameter, a string parameter's
+bytes, an array inside a `&T` parameter's referent — which the caller holds for the whole call and
+which takes no count
+([A view of a parameter's storage takes no count](/reference/memory/#a-view-of-a-parameters-storage-takes-no-count)
+says when). A view of a slice reached through a `&T`, as `room` is above, is held: the referent may
+let go of that slice while the fiber is parked. A value whose block has ended before the call is not
+held either, so the fix is usually to give the value a block of its own:
 
 ```sysl
 import sysl.fiber.{Context, switch}

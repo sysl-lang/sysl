@@ -1,0 +1,206 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map, Set, set}
+
+// **A view of a parameter's own storage, kept in a local, takes no count** (`reference/memory.md § A
+// view of a parameter's storage takes no count`; `tests_pvl_param_view_locals.sysl`).
+//
+// A borrowed parameter's caller holds its share for the whole activation
+// (`docs/design/borrow-inference.md` row 7), and nothing the body does can give that share back while
+// the body runs -- not a call, not a destructor, not a fiber switch, since the caller's frame is parked
+// on the same fiber. So a view of the parameter's elements -- a slice of a `[]T`, a string's `.bytes`
+// or a cut of it, a slice of an array inside a `&T` parameter's referent -- is alive for as long as the
+// body is, and a local holding one needs no count of its own.
+//
+// **The answer is one function, asked by both sides**: the emitter declares these locals with no count
+// (`emit_func.sysl` adds them to `e.lent_decls`; `emit_place.sysl`'s `gen_unshared_view` builds the
+// value), and the fiber-switch check (`abandons.sysl`) treats them as holding nothing. A local the
+// rule does not cover is counted and, held across a switch, refused -- so the two cannot disagree.
+//
+// - **The parameter stays put**: the body never writes it, takes its address or binds a `ref` to it
+//   (`rebound`), never jumps back to its own entry, and is no task. And it is **never used whole** --
+//   only sliced, cut, measured, indexed, walked by a `for` or read through -- so no way out of the body
+//   keeps it (`owned_params.sysl`), and no last use of it hands its count away while a view of it is
+//   still to be read.
+// - **The local only reads the view**: its length, an element, a `for` over it, a slice of it read the
+//   same way, the initializer of another such local, or an argument of a direct call. Stored,
+//   returned, captured, built into a value or handed anywhere else, it keeps the view past what the
+//   rule can see, so it is counted. A view of a string's bytes that may be short is not handed to a
+//   call either: a callee that keeps it is handed a heap copy with a count of its own
+//   (`escape.sysl`'s `bytes_temp`).
+// - **The local is written once**: never assigned, its address never taken, no `ref` bound to it, not
+//   named in a `defer`.
+param_view_locals(f: TFunc) -> Set[string]
+    var out: Set[string] = set()
+
+    if f.marks.is_async() || !tail_calls_of(f).is_empty() then return out
+
+    val bound = rebound(f)
+
+    if bound.has(OPAQUE) then return out
+
+    val w: &ViewUses = ViewUses(map(), map(), map(), map(), buf(), set())
+
+    walk_block_stmts(f.body, TWalk(true, x -> view_node(w, x), wr -> (), s -> view_stmt(w, s)))
+
+    var stays: Set[string] = set()
+
+    for p in f.params
+        if !bound.has(p.0) && count_of(w.loads, p.0) == count_of(w.under, p.0) then stays.add(p.0)
+
+    // Each candidate's root, and whether its view passes through the bytes of a string that may be
+    // short -- inherited from a candidate it is a view of, which is declared before it.
+    var roots: Map[string, string] = map()
+    var maybe_short: Set[string] = set()
+
+    for d in w.decls
+        roots.put(d.0, d.1)
+        out.add(d.0)
+
+        if d.2 || maybe_short.has(d.1) then maybe_short.add(d.0)
+
+    var moved = true
+
+    while moved
+        moved = false
+
+        for d in w.decls
+            if !out.has(d.0) then continue
+
+            if !viewed_root(stays, out, d.1) || !reads_only(w, bound, out, maybe_short, d.0)
+                out.remove(d.0)
+                moved = true
+
+    out
+end param_view_locals
+
+// What the walk found: every load of a name (`loads`); the loads of one whose parent only looks into
+// it (`under`: sliced, cut, measured, indexed, walked, read through); the views rooted at a name that
+// are only read (`reads`) or handed to a direct call (`args`); the view locals, each with its root and
+// whether its view passes through bytes that may be short (`decls`); and the names a `defer` reads.
+private struct ViewUses
+    loads: Map[string, usize]
+    under: Map[string, usize]
+    reads: Map[string, usize]
+    args: Map[string, usize]
+    decls: Buf[(string, string, bool)]
+    deferred: Set[string]
+end ViewUses
+
+private count_of(m: Map[string, usize], name: string) -> usize = m.get(name).unwrap_or(0)
+
+private bump(m: Map[string, usize], name: string) = m.put(name, count_of(m, name) + 1)
+
+private view_node(w: &ViewUses, x: TExpr) = *x.kind match
+    TLoad(name, _) -> bump(w.loads, name)
+    TSlice(base, _, _, _, _) -> looked_into(w, base)
+    TBytes(r) -> looked_into(w, r)
+    TDeref(operand, _) -> looked_into(w, operand)
+    TLen(r, _) ->
+        looked_into(w, r)
+        read_view(w, r)
+    TIndex(r, _, _) ->
+        looked_into(w, r)
+        read_view(w, r)
+    TForEach(_, _, seq, _, _, _) ->
+        looked_into(w, seq)
+        read_view(w, seq)
+    TCall(_, args, _, _) ->
+        for a in args
+            chain_root(a) match
+                Some(n) -> bump(w.args, n)
+                None -> ()
+        end for
+    _ -> ()
+
+private note_deferred(w: &ViewUses, x: TExpr) = *x.kind match
+    TLoad(n, _) -> w.deferred.add(n)
+    _ -> ()
+
+private view_stmt(w: &ViewUses, s: TStmt) = s match
+    TVarDecl(name, ty, init, align) ->
+        if align.is_none() && is_view(ty) && !is_load(init)
+            view_source(init, false) match
+                Some(src) -> w.decls.push((name, src.0, src.1))
+                None -> ()
+        end if
+    TDefer(stmts, _) -> walk_stmts(stmts, expr_walk(true, x -> note_deferred(w, x)))
+    _ -> ()
+
+// A parameter loaded straight under a node that only looks into it.
+private looked_into(w: &ViewUses, x: TExpr) = *x.kind match
+    TLoad(name, _) -> bump(w.under, name)
+    _ -> ()
+
+// A view rooted at a name, read where it lies.
+private read_view(w: &ViewUses, x: TExpr) = chain_root(x) match
+    Some(n) -> bump(w.reads, n)
+    None -> ()
+
+private is_view(t: Type) -> bool = underlying(t) match
+    Slice(_, _) -> true
+    Str -> true
+    _ -> false
+
+private is_load(x: TExpr) -> bool = *x.kind match
+    TLoad(_, _) -> true
+    _ -> false
+
+// The name a view is a view of, followed down slices, cuts and read-only views of views.
+private chain_root(x: TExpr) -> Option[string] = *x.kind match
+    TLoad(name, ty) -> if is_view(ty) then Some(name) else None
+    TSlice(base, _, _, _, _) -> if is_view(texpr_type(base)) then chain_root(base) else None
+    TBytes(r) -> chain_root(r)
+    TConstView(arg) -> chain_root(arg)
+    _ -> None
+
+// What a local's initializer is a view of, and whether it passes through the bytes of a string that
+// may be short: a slice, a cut, a `.bytes` or a read-only view of a view parameter or local, or a slice
+// of an array lying by value in a `&T` parameter's referent.
+private view_source(x: TExpr, short: bool) -> Option[(string, bool)] = *x.kind match
+    TLoad(name, ty) -> if is_view(ty) then Some((name, short)) else None
+    TSlice(base, _, _, _, _) ->
+        if is_view(texpr_type(base)) then return view_source(base, short)
+
+        underlying(texpr_type(base)) match
+            Array(_, _, _) -> referent_root(base).map(n -> (n, short))
+            _ -> None
+    TBytes(r) -> view_source(r, short || !string_known_long(r))
+    TConstView(arg) -> view_source(arg, short)
+    _ -> None
+
+// The `&T` parameter whose referent an array lies in by value, through fields and array elements --
+// never behind a second reference, which the first referent may let go of.
+private referent_root(x: TExpr) -> Option[string] = *x.kind match
+    TDeref(operand, _) -> *operand.kind match
+        TLoad(name, ty) -> underlying(ty) match
+            Ref(_, _) -> Some(name)
+            _ -> None
+        _ -> None
+    TField(receiver, _, _) -> underlying(texpr_type(receiver)) match
+        Struct(_) -> referent_root(receiver)
+        _ -> None
+    TIndex(base, _, _) -> underlying(texpr_type(base)) match
+        Array(_, _, _) -> referent_root(base)
+        _ -> None
+    _ -> None
+
+private viewed_root(stays: Set[string], lent: Set[string], root: string) -> bool =
+    stays.has(root) || lent.has(root)
+
+// Whether every load of the local `name` reads its view where it lies, or hands it to a direct call
+// (not where it may be bytes a callee would need copied), or starts another such local.
+private reads_only(w: &ViewUses, bound: Set[string], lent: Set[string], maybe_short: Set[string],
+                   name: string) -> bool
+    if bound.has(name) || w.deferred.has(name) then return false
+
+    var used = count_of(w.reads, name)
+
+    if !maybe_short.has(name) then used += count_of(w.args, name)
+
+    for d in w.decls
+        if d.1 == name && lent.has(d.0) then used += 1
+
+    used == count_of(w.loads, name)
+end reads_only

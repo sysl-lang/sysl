@@ -1,0 +1,352 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{cstring, str_builder}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **A view of a parameter's own storage, kept in a local, takes no count** (`param_views.sysl`,
+// `reference/memory.md § A view of a parameter's storage takes no count`).
+//
+// Two proofs: the IR of the named function has no `arc.retain_maybe` of the view's owner (nor the
+// release that would give it back), and a program whose views are held across real fiber switches runs
+// on the counted heap at both ends of the optimizer giving everything back, and under AddressSanitizer
+// with the instrumentation confirmed -- a view wrongly left uncounted is a use-after-free ASan reports.
+// Each is asked with the short string form off and on. The counted rows assert the count IS still
+// taken. The same predicate answers the fiber-switch check, whose side is `tests_fcr_`.
+//
+// The axes: the parameter (a `[]const T`, a `[]T` whose elements the body writes, a `string`'s bytes, a
+// `string` cut, an array inside a `&T`'s referent), the local (bound once, in a loop body, a slice of
+// another such local), the string's length (short, long), and what breaks the rule (the parameter
+// reassigned, its address taken, used whole; the local returned, stored into a field, captured by a
+// closure, handed to a call while it may be a short string's bytes, named in a `defer`). Cells skipped:
+// a generic body (its instantiations are emitted as any other body); a task's body (`param_view_locals`
+// answers nothing for one, as `plus0_locals` does).
+
+private extern "setenv" pvl_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" pvl_c_unsetenv(name: *u8) -> int
+
+private struct PvlRun
+    ok: bool
+    out: string
+    err: string
+    hooks: usize
+
+private pvl_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end pvl_ready
+
+private pvl_ir(text: string, level: string) -> string
+    val root = make_temp_dir("sysl-pvl").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None, level) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end pvl_ir
+
+// One function's emitted text, from its `define` to the brace that closes it. A program with module
+// storage makes its functions members of the entry's environment (`@$env0.name`).
+private pvl_body(out: string, name: string) -> string
+    var b = str_builder()
+    var inside = false
+
+    for line in lines_of(out)
+        if !inside && line.starts_with("define ") &&
+           (line.contains("@" + name + "$$sysl") || line.contains("@$env0." + name + "(")) then inside = true
+
+        if inside
+            if line == "}" then return b.finish()
+
+            b.push(line)
+            b.push_char('\n')
+
+    if inside then b.finish() else s"no definition of '$name' in:\n$out"
+end pvl_body
+
+// Whether `name`'s unoptimized body takes a share of a view's owner, with the short form off and on.
+private pvl_shares(text: string, name: string, want: bool)
+    if !pvl_ready() then return
+
+    for short in [false, true]
+        force_short_strings(short)
+
+        val f = pvl_body(pvl_ir(text, "0"), name)
+
+        unforce_short_strings()
+        assert(f.starts_with("define"), f)
+        assert_eq(f.contains("call void @arc.retain_maybe"), want, s"short strings $short:\n$f")
+
+        if !want then assert(!f.contains("call void @arc.release_maybe"), s"short strings $short:\n$f")
+end pvl_shares
+
+private pvl_run(text: string, level: string, counted: bool, flags: string) -> PvlRun
+    val root = make_temp_dir("sysl-pvl").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    if counted then force_alloc_counting(true)
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+        val v = cstring(flags)
+
+        pvl_c_setenv(n.ptr, v.ptr, 1)
+    end if
+
+    val built = build_native_program(s"$root/main.sysl", None, None, level, Some(exe))
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+
+        pvl_c_unsetenv(n.ptr)
+
+    if counted then force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return PvlRun(false, failure_text(why), "", 0)
+        Ok(_) -> ()
+
+    val hooks = capture("nm", ["-u", exe], "", [], true) match
+        Ok(o) -> o.text.count_of("__asan_report")
+        Err(_) -> 0
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> PvlRun(false, "could not be started", "", 0)
+        Ok(o) -> PvlRun(o.status.ok(), o.text, o.err.unwrap_or(""), hooks)
+end pvl_run
+
+// Printed exactly `expected` at both ends of the optimizer on the counted heap, giving everything back,
+// and again under AddressSanitizer with the instrumentation in the binary -- with the short form off
+// and on.
+private pvl_prints(text: string, expected: string)
+    if !pvl_ready() then return
+
+    for short in [false, true]
+        force_short_strings(short)
+
+        for level in ["0", "2"]
+            val run = pvl_run(text, level, true, "")
+
+            assert(run.ok, s"short $short -O$level: ${run.out}${run.err}")
+            assert_eq(run.out, expected)
+            assert(alloc_count_reported(run.err) == 0, s"short $short -O$level: ${run.err}")
+
+        val asan = pvl_run(text, "0", false, "-fsanitize=address -g")
+
+        unforce_short_strings()
+        assert(asan.hooks > 0, "the AddressSanitizer build carries no instrumentation")
+        assert(asan.ok, s"short $short asan: ${asan.out}${asan.err}")
+        assert_eq(asan.out, expected)
+end pvl_prints
+
+// A fiber that parks once per `park()`, driven from `main` until it parks for good. `work` builds every
+// heap value the views are of, so all of it is given back before the fiber parks for good.
+private pvl_head() -> string = """
+    import sysl.fiber.{Context, Stack, switch}
+
+    struct Pair
+        home: Context
+        fiber: Context
+
+    var pair = Pair(Context.new(), Context.new())
+
+    park()
+        switch(&pair.fiber, &pair.home)
+
+    struct Holder
+        data: [8]u8
+
+    """
+
+private pvl_drive(work: string) -> string = pvl_head() + work + """
+
+    run(p: *Pair)
+        work()
+
+        loop
+            park()
+
+    main()
+        val stack = Stack.reserve(64 * 1024).unwrap()
+
+        pair.fiber = Context.start(stack, &run, &pair)
+
+        for _ in 0..<40
+            switch(&pair.home, &pair.fiber)
+    """
+
+// avin's two shapes, a slice of a slice, a loop, a `[]u8` whose elements the body writes, a cut of a
+// `string`, and an array inside a `&T` parameter's referent -- every view held across a real switch.
+private pvl_accepted() -> string = pvl_drive("""
+    send_all(bytes: []const u8) -> usize
+        var at: usize = 0
+
+        while at < bytes.len
+            val rest = bytes[at..<bytes.len]
+            val first = rest[0..<1]
+            park()
+            at += first.len
+            if rest.len == 0 then break
+
+        at
+
+    prompt(said_from: string) -> usize
+        val said = said_from.bytes
+        park()
+        said.len
+
+    cut(s: string) -> usize
+        val head = s[0..<2]
+        park()
+        head.len + head.bytes.len
+
+    fill(b: []u8) -> usize
+        val part = b[1..<3]
+        b[0] = 7
+        park()
+        part[0] = 9
+        usize(b[0]) + usize(b[1]) + part.len
+
+    peek(h: &Holder) -> usize
+        val s = h.data[0..<4]
+        park()
+        s.len + usize(s[3])
+
+    @pinned(thread)
+    work()
+        val text = "pi" + "ng!"
+        var buf: [4]u8 = [1, 2, 3, 4]
+        val h: &Holder = Holder([1, 2, 3, 4, 5, 6, 7, 8])
+
+        print(send_all(text.bytes))
+        print(prompt(text + " and more than fifteen bytes"))
+        print(prompt(text))
+        print(cut(text + " and more than fifteen bytes"))
+        print(cut(text))
+        print(fill(buf[0..<4]))
+        print(peek(h))
+    """)
+
+@test("a view of a parameter held in a local across real switches runs clean, short strings off and on")
+pvl_accepted_runs()
+    pvl_prints(pvl_accepted(), "5\n33\n5\n4\n4\n18\n8\n")
+
+@test("avin's two shapes take no share of the view's owner")
+pvl_avin_shapes_take_no_share()
+    pvl_shares(pvl_accepted(), "send_all", false)
+    pvl_shares(pvl_accepted(), "prompt", false)
+
+@test("a cut of a 'string' parameter, a '[]T' the body writes through, and a '&T' referent's array take no share")
+pvl_other_roots_take_no_share()
+    pvl_shares(pvl_accepted(), "cut", false)
+    pvl_shares(pvl_accepted(), "fill", false)
+    pvl_shares(pvl_accepted(), "peek", false)
+
+// Each body below breaks the rule once; its local keeps its count, and the program still runs clean.
+// Each is `@pinned(thread)`, so the fiber-switch check lets it hold that count across the switch that
+// keeps the share from being cancelled against its release.
+private pvl_counted() -> string = pvl_drive("""
+    struct Keep
+        v: []const u8
+
+    @pinned(thread)
+    reassigned(b: []const u8, c: []const u8) -> usize
+        val s = b[0..<1]
+        park()
+        b = c
+        s.len + b.len
+
+    @pinned(thread)
+    whole(b: []const u8) -> usize
+        val s = b[0..<1]
+        park()
+        s.len + measure(b)
+
+    measure(b: []const u8) -> usize = b.len
+
+    @pinned(thread)
+    returned(b: []const u8) -> []const u8
+        val s = b[0..<2]
+        park()
+        s
+
+    @pinned(thread)
+    stored(k: &Keep, b: []const u8) -> usize
+        val s = b[0..<2]
+        park()
+        k.v = s
+        s.len
+
+    @pinned(thread)
+    captured(b: []const u8) -> usize
+        val s = b[0..<2]
+        val f: &Fn() -> usize = () -> s.len
+        park()
+        f()
+
+    @pinned(thread)
+    handed(said_from: string) -> usize
+        val said = said_from.bytes
+        park()
+        measure(said)
+
+    @pinned(thread)
+    deferred(b: []const u8) -> usize
+        val s = b[0..<2]
+        defer print(s.len)
+        park()
+        s.len
+
+    @pinned(thread)
+    work()
+        val text = "pi" + "ng! and more than fifteen bytes"
+        val k: &Keep = Keep("".bytes)
+
+        print(reassigned(text.bytes, "ab".bytes))
+        print(whole(text.bytes))
+        print(returned(text.bytes).len)
+        print(stored(k, text.bytes), k.v.len)
+        print(captured(text.bytes))
+        print(handed(text))
+        print(handed("pi" + "ng"))
+        print(deferred(text.bytes))
+    """)
+
+@test("a local that breaks the rule still runs clean, short strings off and on")
+pvl_counted_runs()
+    pvl_prints(pvl_counted(), "3\n34\n2\n2 2\n2\n33\n4\n2\n2\n")
+
+@test("a view of a reassigned parameter, or of one used whole, keeps its share")
+pvl_parameter_moves_keeps_share()
+    pvl_shares(pvl_counted(), "reassigned", true)
+    pvl_shares(pvl_counted(), "whole", true)
+
+@test("a view returned, stored, captured, named in a 'defer', or of bytes handed to a call keeps its share")
+pvl_local_escapes_keeps_share()
+    pvl_shares(pvl_counted(), "returned", true)
+    pvl_shares(pvl_counted(), "stored", true)
+    pvl_shares(pvl_counted(), "captured", true)
+    pvl_shares(pvl_counted(), "handed", true)
+    pvl_shares(pvl_counted(), "deferred", true)

@@ -541,8 +541,19 @@ end written_call
 // anchored at the bracket, which is where the reading as a construction went wrong.
 private applied_type_call(cx: &Analyzer, span: Span, bracket: Span, name: string,
                           targ_exprs: Buf[Expr], args: Buf[Expr], expected: Option[Type]) -> TExpr
-    val key = renamed_generic(cx, lookup_type_key(cx.an, cx.scope, name).unwrap())
+    val written_key = lookup_type_key(cx.an, cx.scope, name).unwrap()
+    val key = renamed_generic(cx, written_key)
     val targs = written_type_args_for(cx, key, targ_exprs)
+
+    // An alias that only renames is called as the type it names, but its arguments were written on
+    // the alias, so their count is the alias's to judge and its name the one the message gives.
+    if key != written_key
+        cx.an.tables.types.get(written_key).unwrap().kind match
+            TypeOf(d) ->
+                if !check_arity(cx.an, cx.scope, bracket, name, d.tp.names, d.tp.defaults, targs, "alias") then
+                    return bad_expr(span)
+            _ -> ()
+    end if
 
     cx.an.tables.types.get(key).unwrap().kind match
         StructOf(_) -> struct_call(cx, span, key, name, args, expected, targs)
@@ -2506,24 +2517,69 @@ end format_count
 private behind_alias(cx: &Analyzer, key: string) -> Option[Type] =
     cx.an.tables.constrained_insts.get(key)
 
-// The struct a generic alias expands to, where its right-hand side names one: the struct's key, its
-// declaration, and the arguments the alias writes on it, in the alias's own terms. None for an alias
-// of anything else -- a tuple, a function type -- which has no constructor to call.
-private[compiler] alias_struct_head(a: &Analysis, home: Scope,
-                                    td: TypeDecl) -> Option[(string, StructDecl, Buf[TypeRef])]
+// How many aliases a chain may pass through on its way to a struct before it is taken to go nowhere.
+private val alias_chain_limit = 64
+
+// The struct a generic alias expands to, where its right-hand side names one, directly or through
+// further aliases (`type PE[T] = PB[T]` over `type PB[T] = PA[T]` is `PA`'s, as an alias of an alias
+// is the type at the bottom of the chain): the struct's key and its declaration. None for an alias of
+// anything else -- a tuple, a function type -- which has no constructor to call.
+private[compiler] alias_struct_head(a: &Analysis, home: Scope, td: TypeDecl) -> Option[(string, StructDecl)] =
+    struct_under(a, home, td, 0)
+
+private struct_under(a: &Analysis, home: Scope, td: TypeDecl, depth: int) -> Option[(string, StructDecl)]
+    if depth > alias_chain_limit then return None
+
     *td.base.kind match
-        NamedType(n, arg_refs) ->
+        NamedType(n, _) ->
             val key = lookup_type_key(a, home, n)
 
             if key.is_none() then return None
 
             a.tables.types.get(key.unwrap()) match
                 Some(decl) -> decl.kind match
-                    StructOf(sd) -> Some((key.unwrap(), sd, arg_refs))
+                    StructOf(sd) -> Some((key.unwrap(), sd))
+                    TypeOf(next) -> if is_plain_alias(next) then struct_under(a, decl.scope, next, depth + 1) else None
                     _ -> None
                 None -> None
         _ -> None
-end alias_struct_head
+end struct_under
+
+// What an alias's own parameters bind, given what the struct at the bottom of its chain bound: each
+// argument the alias writes on the next name down is unified against what that name's parameter bound,
+// one level at a time, so a parameter passed through any number of aliases reaches the one written
+// at the call -- and one an alias fixes (`type PC[T] = PD[T, int]`) binds nothing above it.
+private carried_up(a: &Analysis, home: Scope, td: TypeDecl, below: Buf[Binding], depth: int) -> Buf[Binding]
+    var bound: Buf[Binding] = buf()
+
+    if depth > alias_chain_limit then return bound
+
+    *td.base.kind match
+        NamedType(n, arg_refs) ->
+            val key = lookup_type_key(a, home, n)
+
+            if key.is_none() then return bound
+
+            a.tables.types.get(key.unwrap()) match
+                Some(decl) ->
+                    val names: Buf[string] = decl.kind match
+                        StructOf(sd) -> sd.tparams
+                        TypeOf(next) -> if is_plain_alias(next) then next.tp.names else buf()
+                        _ -> buf()
+                    val next_bound = decl.kind match
+                        TypeOf(next) -> carried_up(a, decl.scope, next, below, depth + 1)
+                        _ -> below
+
+                    for i in 0..<arg_refs.len()
+                        if i < names.len()
+                            bound_type(next_bound, names[i]) match
+                                Some(t) -> unify(a, home, arg_refs[i], t, td.tp.names, &bound)
+                                None -> ()
+                None -> ()
+        _ -> ()
+
+    bound
+end carried_up
 
 // The arguments a generic alias is applied at, read off what its parameters bound: each in order,
 // and where every one left is unbound and has a default, the list stops there so the defaults fill
@@ -2558,7 +2614,7 @@ end has_default
 // (`reference/declarations.md`), so a call through it is the constructor of the struct it expands
 // to, at the alias's arguments worked out the way a generic struct's are -- from the type the
 // position expects, then from the values read against the struct's fields -- and carried back
-// through the alias's right-hand side. The alias is then applied at what was found, so its own
+// through the alias's right-hand side and every alias under it. The alias is then applied at what was found, so its own
 // fixed arguments, defaults and bounds hold exactly as where it is written as a type. None where
 // the alias names no struct, which leaves the refusal it always had.
 private generic_alias_call(cx: &Analyzer, span: Span, key: string, td: TypeDecl, written: string,
@@ -2568,7 +2624,7 @@ private generic_alias_call(cx: &Analyzer, span: Span, key: string, td: TypeDecl,
 
     if head.is_none() then return None
 
-    val (skey, sd, arg_refs) = head.unwrap()
+    val (skey, sd) = head.unwrap()
     val shome = cx.an.tables.types.get(skey).unwrap().scope
     var bound: Buf[Binding] = buf()
 
@@ -2598,11 +2654,9 @@ private generic_alias_call(cx: &Analyzer, span: Span, key: string, td: TypeDecl,
             unify(cx.an, shome, typ, read, sd.tparams, &from_values)
         end if
 
-    for i in 0..<arg_refs.len()
-        if i < sd.tparams.len()
-            bound_type(from_values, sd.tparams[i]) match
-                Some(t) -> unify(cx.an, home, arg_refs[i], t, td.tp.names, &bound)
-                None -> ()
+    // What the expected type said comes first; the values fill only what it left open.
+    for item in carried_up(cx.an, home, td, from_values, 0)
+        if bound_type(bound, item.name).is_none() then bound.push(item)
 
     alias_targs(td, bound) match
         Err(open) ->
