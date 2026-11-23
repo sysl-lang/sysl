@@ -242,6 +242,109 @@ private const zsa_dropped: string = raw"""
         print(g.tell())
     """
 
+private const zsa_dropped_boxes: string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    trait Visitor
+        visit(self) -> int
+
+    struct Gone
+    end Gone
+
+    impl Drop for Gone
+        drop(self)
+            print("dropped")
+
+    impl Visitor for Gone
+        visit(self) -> int = 5
+
+    main()
+        val obj: &Visitor = Gone()
+        val keep: Option[&Visitor] = Some(obj)
+        var all: Buf[&Gone] = buf()
+
+        all.push(Gone())
+        all.push(Gone())
+        print(keep.unwrap().visit())
+        print(all.len())
+    """
+
+private const zsa_array_of_empties: string = raw"""
+    struct Mark
+    end Mark
+
+    impl Mark
+        tell(self) -> int = 7
+
+    struct Row
+        marks: [3]Mark
+        none: [0]int
+    end Row
+
+    trait Visitor
+        visit(self) -> int
+
+    impl Visitor for Row
+        visit(self) -> int
+            var sum = 0
+
+            for m in self.marks
+                sum += m.tell()
+
+            sum
+        end visit
+
+    main()
+        val marks = [Mark(), Mark()]
+        var sum = 0
+
+        for m in marks
+            sum += m.tell()
+
+        val obj: &Visitor = Row([Mark(), Mark(), Mark()], [])
+
+        print(sum + obj.visit())
+    """
+
+private const zsa_storage_and_align: string = raw"""
+    @align(16)
+    struct Wide
+    end Wide
+
+    struct Mark
+    end Mark
+
+    impl Mark
+        tell(self) -> int = 7
+
+    struct Holds
+        a: u8
+        w: Wide
+    end Holds
+
+    val names: [0]string = []
+    val mark = Mark()
+    var spare = Mark()
+
+    main()
+        print(sizeof(Wide))
+        print(alignof(Wide))
+        print(sizeof(Holds))
+        print(alignof(Holds))
+        print(sizeof(Mark))
+        print(names.len)
+
+        for n in names
+            print(n)
+
+        spare = mark
+        print(mark.tell() + spare.tell())
+
+        val h: &Holds = Holds(1, Wide())
+
+        print(h.a)
+    """
+
 private const zsa_trailing_field: string = raw"""
     struct Mark
     end Mark
@@ -385,6 +488,18 @@ zsa_buf_of_empty_boxes()
 zsa_empty_with_drop()
     zsa_everywhere(zsa_dropped, "5\ndropped\n")
 
+@test("an empty struct with a Drop in a heap box and in a Buf of boxes is dropped once each")
+zsa_empty_with_drop_boxed()
+    zsa_everywhere(zsa_dropped_boxes, "5\n2\ndropped\ndropped\ndropped\n")
+
+@test("an array of empty structs, local and as a boxed struct's field beside an empty array")
+zsa_array_of_empties_runs()
+    zsa_everywhere(zsa_array_of_empties, "35\n")
+
+@test("module storage of an empty struct and a [0]T is a val, and an @align(n) empty struct keeps its room")
+zsa_module_storage_and_align()
+    zsa_everywhere(zsa_storage_and_align, "16\n16\n32\n16\n0\n0\n14\n1\n")
+
 @test("an empty struct as the last field of a boxed struct, at the end of the allocation")
 zsa_empty_trailing_field()
     zsa_everywhere(zsa_trailing_field, "42\n")
@@ -403,8 +518,9 @@ zsa_empty_as_a_value()
 
 // -- the answer, in process -----------------------------------------------------------------------
 
-private zsa_struct(name: string, fields: Buf[(string, Type)], opaque: bool = false) -> &StructType =
-    StructType(name, buf(), fields, false, None, None, opaque, None, buf(), false, buf(), buf(), false)
+private zsa_struct(name: string, fields: Buf[(string, Type)], opaque: bool = false,
+                   align: Option[usize] = None) -> &StructType =
+    StructType(name, buf(), fields, false, align, None, opaque, None, buf(), false, buf(), buf(), false)
 
 private zsa_fields(a: Type, b: Option[Type]) -> Buf[(string, Type)]
     var out: Buf[(string, Type)] = buf()
@@ -440,3 +556,9 @@ zsa_zero_sized_takes_room()
     assert(!zero_sized(Ptr(inner, false)))
     assert(!zero_sized(Array(1, Bool, buf())))
     assert(!no_value(inner))
+
+    val aligned = Struct(zsa_struct("Wide", buf(), false, Some(16)))
+
+    assert(!zero_sized(aligned))
+    assert(!zero_sized(Struct(zsa_struct("Holds", zsa_fields(aligned, None)))))
+    assert(!zero_sized(Array(2, aligned, buf())))
