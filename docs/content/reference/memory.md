@@ -4288,7 +4288,7 @@ provided the parent stays put (not a `var` assigned in the loop or whose address
 stays in a local, and nothing between may look at a count: only arithmetic, reads, and calls to
 functions that release nothing and write only their own locals (`slot_vacate` frees only at a strong
 count of one). A view of a parameter's own storage held in a local needs none of that
-([A view of a parameter's storage takes no count](#a-view-of-a-parameters-storage-takes-no-count)).
+([A view of a parameter's storage takes no count](#a-view-of-a-parameter-s-storage-takes-no-count)).
 
 **The same goes for a reference read out of storage** — a field through a parameter, a buffer's
 element, a matched payload, a key built for a lookup — where nothing between can give a count back,
