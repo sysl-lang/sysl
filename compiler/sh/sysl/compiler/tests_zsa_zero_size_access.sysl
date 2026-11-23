@@ -242,6 +242,39 @@ private const zsa_dropped: string = raw"""
         print(g.tell())
     """
 
+// A `@unique` empty struct has an owner, so its destructor runs where the owner lets go of it: a local
+// at the end of its scope (once, after a move into a second local), a parameter at the end of the
+// callee, a field with its holder, a box with the box -- never at the end of the declaring statement.
+private const zsa_unique_owners: string = raw"""
+    @unique
+    struct Mark
+    end Mark
+
+    impl Drop for Mark
+        drop(self) = print("mark gone")
+
+    @unique
+    struct Holder
+        m: Mark
+        n: int
+
+    take(m: Mark) = print("took")
+
+    made() -> Mark = Mark()
+
+    main()
+        val k = Mark()
+        val moved = k
+
+        take(Mark())
+
+        val r = made()
+        val h = Holder(Mark(), 3)
+        val b: &Mark = Mark()
+
+        print("end", h.n)
+    """
+
 private const zsa_dropped_boxes: string = raw"""
     import sysl.buf.{Buf, buf}
 
@@ -492,6 +525,11 @@ zsa_empty_with_drop()
 zsa_empty_with_drop_boxed()
     zsa_everywhere(zsa_dropped_boxes, "5\n2\ndropped\ndropped\ndropped\n")
 
+@test("a '@unique' empty struct is dropped by its owner: a local, a parameter, a field, a box")
+zsa_unique_empty_dropped_by_its_owner()
+    zsa_everywhere(zsa_unique_owners,
+                   "took\nmark gone\nend 3\nmark gone\nmark gone\nmark gone\nmark gone\n")
+
 @test("an array of empty structs, local and as a boxed struct's field beside an empty array")
 zsa_array_of_empties_runs()
     zsa_everywhere(zsa_array_of_empties, "35\n")
@@ -519,8 +557,8 @@ zsa_empty_as_a_value()
 // -- the answer, in process -----------------------------------------------------------------------
 
 private zsa_struct(name: string, fields: Buf[(string, Type)], opaque: bool = false,
-                   align: Option[usize] = None) -> &StructType =
-    StructType(name, buf(), fields, false, align, None, opaque, None, buf(), false, buf(), buf(), false)
+                   align: Option[usize] = None, unique: bool = false) -> &StructType =
+    StructType(name, buf(), fields, false, align, None, opaque, None, buf(), false, buf(), buf(), unique)
 
 private zsa_fields(a: Type, b: Option[Type]) -> Buf[(string, Type)]
     var out: Buf[(string, Type)] = buf()
@@ -562,3 +600,17 @@ zsa_zero_sized_takes_room()
     assert(!zero_sized(aligned))
     assert(!zero_sized(Struct(zsa_struct("Holds", zsa_fields(aligned, None)))))
     assert(!zero_sized(Array(2, aligned, buf())))
+
+// A `@unique` value has an owner that lets go of it, and an owner is a slot: read as `unit` is, a
+// local's destructor ran at the end of the statement that declared it.
+@test("zero_sized: a '@unique' empty struct, a struct holding one and an array of them take room")
+zsa_zero_sized_unique_takes_room()
+    val mark = Struct(zsa_struct("Mark", buf(), false, None, true))
+
+    assert(!zero_sized(mark))
+    assert(!zero_sized(Struct(zsa_struct("Holds", zsa_fields(mark, None)))))
+    assert(!zero_sized(Struct(zsa_struct("Both", zsa_fields(Unit, Some(mark))))))
+    assert(!zero_sized(Array(2, mark, buf())))
+    assert(zero_sized(Array(0, mark, buf())))
+    assert(!zero_sized(Struct(zsa_struct("Owner", zsa_fields(Array(1, mark, buf()), None), false, None,
+                                         true))))
