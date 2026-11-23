@@ -339,10 +339,10 @@ impl Reader for File
 impl Writer for File
 
 open(path: string) -> Result[File, IoError]          // an existing file, for reading
-create(path: string) -> Result[File, IoError]        // makes one, or empties one that was there
+create(path: string, mode: u32 = 0o666) -> Result[File, IoError] // makes one, or empties one that was there
 append(path: string) -> Result[File, IoError]        // writes at the end
 open_update(path: string) -> Result[File, IoError]   // read and write; fails if it is not there
-create_update(path: string) -> Result[File, IoError] // read and write; empties what was there
+create_update(path: string, mode: u32 = 0o666) -> Result[File, IoError] // read and write; empties what was there
 ```
 
 **A `File` is a descriptor from `sysl.fs.sys` with a buffer in front of it, and the buffer is
@@ -965,6 +965,40 @@ remove_file(path).unwrap()
 true true true
 ```
 
+**A file can be born with its permission bits.** `create` and `create_update` take a `mode`, `0o666`
+by default, which goes to `open(2)` with `O_CREAT` and so is narrowed by the process umask as in
+POSIX. A secret file asks `0o600` and is owner-only from the moment it exists; creating it and then
+calling `set_permissions` leaves a window in which it is open to group and others. **The mode applies
+only when the file is created**: `create_update` on a file that exists keeps the mode it has. Bits
+above the twelve permission bits are dropped, as `set_permissions` drops them. `File.set_permissions(mode)`
+is `fchmod` on the open descriptor, for a program that holds the file and wants its mode changed
+without trusting the path; a closed file answers `NotOpen`. On a target with no permission bits the
+mode given at creation is ignored and `File.set_permissions` answers "not supported on this target",
+as `set_permissions` does.
+
+```sysl
+import sysl.fs.{create, metadata, remove_file}
+import sysl.process.pid
+
+var path = s"/tmp/sysl-fs-doc-mode-${pid()}.txt"
+
+var f = create(path, 0o600).unwrap()
+
+print(metadata(path).unwrap().permissions() == 0o600)
+
+f.set_permissions(0o640).unwrap()
+
+print(metadata(path).unwrap().permissions() == 0o640)
+
+f.close().unwrap()
+remove_file(path).unwrap()
+```
+
+```output
+true
+true
+```
+
 **`link_metadata` is the same reading about the path *itself*** — so a symbolic link is described
 rather than followed, and it is the only call here that can report one. `metadata`, `is_dir` and
 `exists` all follow a link silently, which is the right default and was for a long time the only
@@ -1483,7 +1517,7 @@ and outlives it; the `Dir`'s descriptor is closed when its last reference goes.
 
 **Everything above reaches the filesystem through `sysl.fs.sys` and through nothing else**: one
 `extern` per call — `sysl_fs_open`, `_read`, `_write`, `_pread`, `_pwrite`, `_sync`, `_close`, `_seek`, `_fstat`, `_ftruncate`, `_map`, `_unmap`, `_advise` and `_page_size` (the last two asked only by a program that advises a mapping; `_page_size` answers `usize`, zero meaning 4096; `_sync_data`, `_full_sync`, `_map_shared` and `_msync` asked only by a program that calls `sync_data`, `full_sync`, `map_mut` or a flush, and the `open` flags carry an uncached bit),
-`_stat`, `_truncate`, `_mkdir`, `_rmdir`, `_unlink`, `_rename`, `_access`, `_chmod`, `_chown`, `_opendir`,
+`_stat`, `_truncate`, `_mkdir`, `_rmdir`, `_unlink`, `_rename`, `_access`, `_chmod`, `_fchmod` (asked only by a program that calls `File.set_permissions`), `_chown`, `_opendir`,
 `_readdir`, `_closedir`, `_getcwd`, `_chdir`, `_temp_dir`, `_symlink`, `_link`, `_readlink` and
 `_realpath`, and for a `Dir` `_dir_open`, `_open_beneath`, `_stat_beneath` and `_unlink_beneath`,
 which refuse a link with `ELOOP` and an escape with `EXDEV`. Each answers an `int` by the contract every `*.sys` module has

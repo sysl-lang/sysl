@@ -322,6 +322,18 @@ struct File
         answered(fsys.ftruncate(self.inner.fd, length))
     end truncate
 
+    /** The twelve permission bits of this open file set to `mode` -- `fchmod(2)` on the descriptor, so
+     * it changes the file this handle holds whatever the path now names. `mode` is read as
+     * `set_permissions` reads it: bits above the twelve are dropped. Buffered bytes are not touched;
+     * the mode is not a write. A closed file answers `NotOpen`. A target with no permission bits
+     * (non-POSIX) answers "not supported on this target", exactly as `set_permissions` does.
+     */
+    set_permissions(*self, mode: u32) -> Result[unit, IoError]
+        if self.inner.shut then return Err(NotOpen)
+
+        answered(fsys.fchmod(self.inner.fd, mode & 0o7777))
+    end set_permissions
+
     /** What went wrong, for a caller that has just been told by `failed` that something did. */
     private[sysl] failure(*self) -> IoError = from_status(self.inner.fault)
 
@@ -629,11 +641,18 @@ end File
 /** The three ways a program opens a file, named for what it means rather than for the flags it
  * becomes. `open` reads an existing file; `create` makes one, or empties one that was there;
  * `append` writes at the end of whatever is there, making the file if it is not.
+ *
+ * **`create` and `create_update` take the permission bits a NEW file is born with**, `0o666` by
+ * default, which the process umask narrows exactly as `open(2)` with `O_CREAT` does. A secret file
+ * asks `0o600` here and is owner-only from the moment it exists, with no window between creating
+ * and `set_permissions`. The mode applies only when the file is created: one that already exists
+ * keeps the mode it has. Bits above the twelve permission bits are dropped, as in `set_permissions`.
+ * A target with no permission bits ignores the mode.
  */
 open(path: string) -> Result[File, IoError] = opened(path, fsys.open_read)
 
-create(path: string) -> Result[File, IoError] =
-    opened(path, fsys.open_write | fsys.open_create | fsys.open_truncate)
+create(path: string, mode: u32 = file_mode) -> Result[File, IoError] =
+    opened(path, fsys.open_write | fsys.open_create | fsys.open_truncate, mode)
 
 append(path: string) -> Result[File, IoError] =
     opened(path, fsys.open_write | fsys.open_create | fsys.open_append)
@@ -645,8 +664,8 @@ append(path: string) -> Result[File, IoError] =
  */
 open_update(path: string) -> Result[File, IoError] = opened(path, fsys.open_read | fsys.open_write)
 
-create_update(path: string) -> Result[File, IoError] =
-    opened(path, fsys.open_read | fsys.open_write | fsys.open_create | fsys.open_truncate)
+create_update(path: string, mode: u32 = file_mode) -> Result[File, IoError] =
+    opened(path, fsys.open_read | fsys.open_write | fsys.open_create | fsys.open_truncate, mode)
 
 /** A file opened for reading and writing that **bypasses the operating system's page cache**:
  * `O_DIRECT` on Linux, `fcntl(F_NOCACHE)` on macOS. A database that keeps its own buffer pool opens
@@ -670,9 +689,9 @@ end open_uncached
  * a combination the five names do not cover is asking for the platform's `open`, and that is a good
  * thing to have to say out loud with an `extern` of its own.
  */
-private opened(path: string, flags: u32) -> Result[File, IoError]
+private opened(path: string, flags: u32, mode: u32 = file_mode) -> Result[File, IoError]
     var fd = 0
-    val code = fsys.open(as_ptr(path.bytes), path.bytes.len, flags, file_mode, &fd)
+    val code = fsys.open(as_ptr(path.bytes), path.bytes.len, flags, mode & 0o7777, &fd)
 
     if code != 0 then return Err(from_status(code))
 

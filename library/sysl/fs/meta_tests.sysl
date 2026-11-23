@@ -288,3 +288,140 @@ canonicalize_of_nothing()
     canonicalize("/tmp/sysl-fs-meta-nothing/at/all") match
         Ok(_) -> assert(false, "resolving a path that does not exist answered")
         Err(e) -> assert_eq(e, IoError.NotFound)
+
+// -- the mode a file is created with --------------------------------------------------------------
+
+private made(path: string, mode: u32 = 0o666)
+    var f = create(path, mode).unwrap()
+
+    f.close().unwrap()
+end made
+
+private made_update(path: string, mode: u32)
+    var f = create_update(path, mode).unwrap()
+
+    f.close().unwrap()
+end made_update
+
+@test("a file created with 0o600 has mode 0600")
+create_with_private_mode()
+    val dir = scratch("cmode")
+    val path = dir + "/f"
+
+    made(path, 0o600)
+
+    assert_eq(metadata(path).unwrap().permissions(), 0o600)
+
+    ignore(remove_dir_all(dir))
+end create_with_private_mode
+
+@test("create_update with a mode makes the file with it")
+create_update_with_mode()
+    val dir = scratch("cumode")
+    val path = dir + "/f"
+
+    made_update(path, 0o640)
+
+    assert_eq(metadata(path).unwrap().permissions(), 0o640)
+
+    ignore(remove_dir_all(dir))
+end create_update_with_mode
+
+@test("the default mode is 0o666 narrowed by the umask, as it was")
+create_default_mode()
+    val dir = scratch("cdef")
+    val path = dir + "/f"
+    val plain = dir + "/g"
+
+    var f = create(path).unwrap()
+
+    f.close().unwrap()
+    made(plain, 0o666)
+
+    val got = metadata(path).unwrap().permissions()
+
+    assert_eq(got & ~u32(0o666), 0)
+    assert_eq(got, metadata(plain).unwrap().permissions())
+    assert(got & 0o600 == 0o600, "the owner can read and write a default file")
+
+    ignore(remove_dir_all(dir))
+end create_default_mode
+
+@test("create and create_update on an existing file leave its mode alone")
+create_existing_keeps_mode()
+    val dir = scratch("cexist")
+    val path = dir + "/f"
+
+    write_text(path, "x").unwrap()
+    set_permissions(path, 0o644).unwrap()
+    made(path, 0o600)
+
+    assert_eq(metadata(path).unwrap().permissions(), 0o644)
+
+    made_update(path, 0o600)
+
+    assert_eq(metadata(path).unwrap().permissions(), 0o644)
+
+    ignore(remove_dir_all(dir))
+end create_existing_keeps_mode
+
+@test("File.set_permissions changes the mode of the open file")
+file_set_permissions()
+    val dir = scratch("fperm")
+    val path = dir + "/f"
+    var f = create(path, 0o600).unwrap()
+
+    f.set_permissions(0o640).unwrap()
+
+    assert_eq(metadata(path).unwrap().permissions(), 0o640)
+
+    f.close().unwrap()
+
+    ignore(remove_dir_all(dir))
+end file_set_permissions
+
+@test("File.set_permissions follows the descriptor when the path was renamed away")
+file_set_permissions_follows_descriptor()
+    val dir = scratch("fdesc")
+    var f = create(dir + "/a", 0o600).unwrap()
+
+    rename(dir + "/a", dir + "/b").unwrap()
+    f.set_permissions(0o604).unwrap()
+
+    assert_eq(metadata(dir + "/b").unwrap().permissions(), 0o604)
+
+    f.close().unwrap()
+
+    ignore(remove_dir_all(dir))
+end file_set_permissions_follows_descriptor
+
+@test("File.set_permissions on a closed file is NotOpen")
+file_set_permissions_closed()
+    val dir = scratch("fclosed")
+    var f = create(dir + "/f").unwrap()
+
+    f.close().unwrap()
+
+    f.set_permissions(0o600) match
+        Ok(_) -> assert(false, "a closed file took a mode")
+        Err(e) -> assert_eq(e, IoError.NotOpen)
+
+    ignore(remove_dir_all(dir))
+end file_set_permissions_closed
+
+@test("bits above the twelve permission bits are dropped, at creation and on a file")
+mode_high_bits_dropped()
+    val dir = scratch("high")
+    val path = dir + "/f"
+    var f = create(path, 0o100600).unwrap()
+
+    assert_eq(metadata(path).unwrap().permissions(), 0o600)
+
+    f.set_permissions(0o170640).unwrap()
+
+    assert_eq(metadata(path).unwrap().permissions(), 0o640)
+
+    f.close().unwrap()
+
+    ignore(remove_dir_all(dir))
+end mode_high_bits_dropped
