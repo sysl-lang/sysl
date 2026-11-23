@@ -324,7 +324,7 @@ long as nothing writes it a counted value, takes its address or binds a `ref` to
 holding a view of a parameter's own storage — a slice of a view parameter, a string parameter's
 bytes, an array inside a `&T` parameter's referent — which the caller holds for the whole call and
 which takes no count
-([A view of a parameter's storage takes no count](/reference/memory/#a-view-of-a-parameters-storage-takes-no-count)
+([A view of a parameter's storage takes no count](/reference/memory/#a-view-of-a-parameter-s-storage-takes-no-count)
 says when). A view of a slice reached through a `&T`, as `room` is above, is held: the referent may
 let go of that slice while the fiber is parked. A value whose block has ended before the call is not
 held either, so the fix is usually to give the value a block of its own:
