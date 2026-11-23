@@ -1,0 +1,233 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// With the short form on, `==` of two strings and a substring's two boundary checks read each string
+// from its two words as they stand (`@sysl.str.eq.words`, `@sysl.str.boundary.words`), never from a
+// copy spilled to a frame slot, and a substring's short run is made on a branch of its own rather than
+// computed and selected (`gen_slice_of`). A spill on every read gives each function comparing or
+// cutting strings a slot and a store per read and keeps it from being inlined, long strings and short
+// alike. These tests pin the IR's shape with the form on and off, and that every
+// pairing of the forms compares and cuts as it should, in a program run both ways with the counted
+// heap left at zero.
+
+private sse_source() -> string = raw"""
+    same(a: string, b: string) -> bool = a == b
+
+    is_x(s: string) -> bool = s == "x"
+
+    cut(s: string, i: usize) -> string = s[i..<i + 1]
+    """
+
+private sse_ir(name: string, short: bool) -> string
+    force_short_strings(short)
+
+    val ir = emit_func_text(sse_source(), name)
+
+    unforce_short_strings()
+    assert(ir.starts_with("define"), ir)
+    ir
+end sse_ir
+
+// How many lines of `ir` hold `what`.
+private sse_count(ir: string, what: string) -> int
+    var n = 0
+
+    for line in ir.split("\n")
+        if line.contains(what) then n += 1
+
+    n
+end sse_count
+
+// The frame slots of `ir` other than its parameters' own (`%x.addr`): a spill is one of these.
+private sse_slots(ir: string) -> int = sse_count(ir, "alloca") - sse_count(ir, ".addr = alloca")
+
+// -- the IR -------------------------------------------------------------------------------------------
+
+@test("sse == of two strings spills neither, short form on")
+sse_eq_on()
+    if xvr_no_library() then return
+
+    val ir = sse_ir("same", true)
+
+    assert(ir.contains("@sysl.str.eq.words("), ir)
+    assert_eq(sse_slots(ir), 0, ir)
+
+@test("sse == of a string and a literal spills nothing, short form on")
+sse_eq_lit_on()
+    if xvr_no_library() then return
+
+    val ir = sse_ir("is_x", true)
+
+    assert(ir.contains("@sysl.str.eq.words("), ir)
+    assert_eq(sse_slots(ir), 0, ir)
+
+@test("sse == is the plain comparison with the short form off")
+sse_eq_off()
+    if xvr_no_library() then return
+
+    for name in ["same", "is_x"]
+        val ir = sse_ir(name, false)
+
+        assert(ir.contains("@sysl.str.eq("), ir)
+        assert_eq(ir.contains(".words"), false, ir)
+        assert_eq(sse_slots(ir), 0, ir)
+
+@test("sse a substring checks its boundaries from the words and makes its short run on a branch, short form on")
+sse_cut_on()
+    if xvr_no_library() then return
+
+    val ir = sse_ir("cut", true)
+
+    assert_eq(sse_count(ir, "@sysl.str.boundary.words("), 2, ir)
+    assert_eq(ir.contains("@sysl.str.boundary("), false, ir)
+    assert(ir.contains("br i1 ") && ir.contains("run.short"), ir)
+    // One slot only: where the two arms meet, never a spill of the source.
+    assert_eq(sse_slots(ir), 1, ir)
+    assert(ir.contains("@sysl.str.empty"), ir)
+
+@test("sse a substring is the plain cut with the short form off")
+sse_cut_off()
+    if xvr_no_library() then return
+
+    val ir = sse_ir("cut", false)
+
+    assert_eq(sse_count(ir, "@sysl.str.boundary("), 2, ir)
+    assert_eq(ir.contains(".words"), false, ir)
+    assert_eq(ir.contains("run.short"), false, ir)
+    assert_eq(sse_slots(ir), 0, ir)
+
+// -- the program --------------------------------------------------------------------------------------
+
+private struct SseRun
+    ok: bool
+    code: int
+    out: string
+    err: string
+
+private sse_run(main: string, short: bool) -> SseRun
+    val root = make_temp_dir("sysl-sse").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", main).unwrap()
+    force_alloc_counting(true)
+    force_short_strings(short)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization,
+                                     Some(s"$root/built"))
+
+    unforce_short_strings()
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return SseRun(false, -1, failure_text(why), "")
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> SseRun(false, -1, "could not be started", "")
+        Ok(o) -> SseRun(true, shell_status(o.status), o.text, o.err.unwrap_or(""))
+end sse_run
+
+// Every pairing of the forms: short strings are made by joining (`s"…"`), long ones are literals, cuts
+// of literals and joins past the short capacity. The 15-byte pair differs only in its last byte, the
+// most a short string holds on a 64-bit machine.
+private sse_main() -> string = sse_source() + "\n" + raw"""
+    val ab = "ab"
+    val word = "abcdefghij"
+    val s_abc = s"${ab}c"
+    val s_abd = s"${ab}d"
+    val s_ab = s"$ab"
+    val l_abc = word[0..<3]
+    val s15 = s"$word${word[0..<5]}"
+    val s15b = s"$word${word[0..<4]}f"
+    val long1 = s"$word$word"
+    val long2 = s"$word$word"
+
+    print(same(s_abc, s"${ab}c"))
+    print(same(s_abc, s_abd))
+    print(same(s_abc, s_ab))
+    print(same(s_abc, l_abc))
+    print(same(l_abc, s_abc))
+    print(same(s_abd, l_abc))
+    print(same(long1, long2))
+    print(same(long1, s15))
+    print(same(s15, "abcdefghijabcde"))
+    print(same(s15, s15b))
+    print(same(s"", ""))
+    print(same(s"$ab", "ab"))
+    print(s15 == "abcdefghijabcdefghij")
+    print(is_x(s"x"))
+    print(is_x(s"y"))
+    print(is_x(word[0..<1]))
+
+    val acute = "\u{e9}"
+    val accent = s"a${acute}b"
+    val long_accent = s"$word$acute$word"
+
+    print(cut(accent, 0))
+    print(accent[1..<3])
+    print(accent[3..<4])
+    print(accent[3..<3].len)
+    print(cut(long_accent, 9))
+    print(long_accent[10..<12])
+    print(long_accent[12..<12].len)
+    """
+
+private sse_expect() -> string =
+    "true\nfalse\nfalse\ntrue\ntrue\nfalse\ntrue\nfalse\ntrue\nfalse\ntrue\ntrue\nfalse\ntrue\nfalse\nfalse\n" +
+    "a\n\u{e9}\nb\n0\nj\n\u{e9}\n0\n"
+
+@test("sse every pairing of the forms compares and cuts as it should, short form on, counted heap at zero")
+sse_run_on()
+    if xvr_no_library() || !clang_available() then return
+
+    val run = sse_run(sse_main(), true)
+
+    assert(run.ok, run.out)
+    assert_eq(run.code, 0, run.out + run.err)
+    assert_eq(run.out, sse_expect())
+    assert_eq(run.err.contains(alloc_count_said()), false, run.err)
+
+@test("sse every pairing of the forms compares and cuts as it should, short form off, counted heap at zero")
+sse_run_off()
+    if xvr_no_library() || !clang_available() then return
+
+    val run = sse_run(sse_main(), false)
+
+    assert(run.ok, run.out)
+    assert_eq(run.code, 0, run.out + run.err)
+    assert_eq(run.out, sse_expect())
+    assert_eq(run.err.contains(alloc_count_said()), false, run.err)
+
+// A cut inside a character of a SHORT string is found from the words (`@sysl.str.boundary.words`'s
+// held path), at either end, as one of a long string is through the pointer.
+private sse_split(cut: string) -> string =
+    "val word = \"abcdefghij\"\n" +
+    "val acute = \"\\u{e9}\"\n" +
+    "val accent = s\"a${acute}b\"\n" +
+    "val long_accent = s\"$word$acute$word\"\n" +
+    "print(accent.len + long_accent.len)\n" +
+    s"print($cut)\n"
+
+private sse_traps(cut: string, said: string)
+    val run = sse_run(sse_split(cut), true)
+
+    assert(run.ok, run.out)
+    assert_eq(run.code, 133, run.out + run.err)
+    assert(run.err.contains(said), run.err)
+
+@test("sse a cut inside a character traps at either end, of a short string and a long one")
+sse_split_traps()
+    if xvr_no_library() || !clang_available() then return
+
+    sse_traps("accent[2..<3]", "range start 2 is not on a character boundary")
+    sse_traps("accent[0..<2]", "range end 2 is not on a character boundary")
+    sse_traps("long_accent[11..<12]", "range start 11 is not on a character boundary")

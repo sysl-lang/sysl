@@ -1223,9 +1223,29 @@ private payload_of(e: *Emit, payload: Type, p: Val) -> Val
 end payload_of
 
 // `arc.framedown.<T>`: what the release of a frame box's last share does, where the compiler counted
-// its shares (`frame_counts.sysl`) -- the payload let go of as a hook lets go of it, outside any
-// drain, and nothing freed.
+// its shares (`frame_counts.sysl`) -- the payload let go of as a hook lets go of it, and nothing freed.
+//
+// **A payload whose teardown runs the program's code is handed to the reaper**, as a heap box's last
+// release hands it: the header the frame entry may have left unwritten is written (the frame hook,
+// the frame mark for a weak count), and `arc.reap` starts a drain with it. A destructor's own releases -- a field
+// `drop(*self)` replaces -- and the destructors of what the walk lets go of then run in the order
+// they run for a heap box, after the destructor and in the drain's order. Torn down outside the
+// drain, each release in the destructor would run its own destructor on the spot. Inside a drain
+// already running (a frame box of a destructor's own) the box is torn down at once, since its frame
+// ends before the drain could reach it. A payload that runs no code tears down directly: nothing it
+// frees can tell the order.
 private gen_frame_down(e: *Emit, payload: Type)
+    if !is_compact(e, payload) && (destructor_of(e, payload).is_some() || runs_code(e, payload))
+        val bn = box_lty(e, payload)
+        val hook = request_helper(e, s"arc.dropframe.${mangle(payload)}", HrFrameDrop(payload))
+
+        store_header_word(e, bn, VReg("p"), 1, LPtr, VGlobal(hook))
+        store_header_word(e, bn, VReg("p"), 2, word_lty(e), VInt(from_int(frame_weak_mark())))
+        arc_call(e, "arc.reap", VReg("p"))
+        emit_term(e, InRet(None, None))
+        return
+    end if
+
     let_go_of_payload(e, payload, payload_of(e, payload, VReg("p")), false)
     emit_term(e, InRet(None, None))
 end gen_frame_down
@@ -1669,18 +1689,25 @@ own_at(e: *Emit, slot: Val, ty: Type)
     if owns_value(e, ty) && !e.owned_marks.is_empty() then e.owned_slots.push((slot, ty))
 
 // Registers the buffer a promoted array lives in, so the scope that declared it gives back its
-// share on the way out. A buffer is what a `&T` points at, so it is registered as one and the
+// share on the way out. A buffer is counted as a `&T` is, so it is registered as one and the
 // ordinary release path emits the `arc.release` -- the only reason it needs a slot of its own is
 // that everything owned is a place to load from rather than a value.
+//
+// **It is registered as a `&` to the whole array, never to its element.** A buffer is not a box of
+// its element: its header carries the hook that frees its elements, and its words past the hook are
+// its length and capacity. A `&` to an element of a compact type (`compact_box.sysl`) is let go of
+// by that type's own release, which reads the payload from the word after the count -- here, the
+// hook -- and so lets go of the code the hook points at. An array is never a compact payload, so a
+// `&` to one reaches the release that reads the hook, as every other view's owner word does.
 //
 // The count is what makes promotion work: a view of the array retains this box when it is returned
 // or stored, so the release below takes the declaration's share and the storage outlives the frame
 // exactly as long as some view of it does.
-own_box(e: *Emit, name: string, box: Val, elem: Type)
+own_box(e: *Emit, name: string, box: Val, array: Type)
     named_alloca(e, s"$name.box", LPtr, None)
     emit(e, InStore(LPtr, box, VReg(s"$name.box"), AccPlain, None))
 
-    if !e.owned_marks.is_empty() then e.owned_slots.push((VReg(s"$name.box"), Ref(elem, false)))
+    if !e.owned_marks.is_empty() then e.owned_slots.push((VReg(s"$name.box"), Ref(array, false)))
 end own_box
 
 // Hands a statement to the scope being emitted. Nothing is emitted here -- the `defer` itself costs

@@ -876,6 +876,55 @@ pfz_giving_back_the_holder_keeps_the_count()
 pfz_gives_runs()
     pfz_prints(pfz_gives(), "1 0\n")
 
+// The same hazard from the callee's own body, and through a field of module storage: overwriting
+// module storage is an edge of the summary's (`borrowing.sysl`'s `global_key`), so a value read
+// through a pointer into what it held keeps its count.
+private pfz_global_writers() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct S
+        items: Buf[int]
+
+    struct Box
+        s: S
+
+    struct Hold
+        box: &Box
+
+    var B: &Box = Box(S(buf()))
+    var H: Hold = Hold(Box(S(buf())))
+
+    grow(b: Buf[int]) -> usize
+        B = Box(S(buf()))
+        b.push(1)
+        b.len()
+
+    work(s: *S) -> usize = grow(s.items)
+
+    swap_held() -> int
+        H.box = Box(S(buf()))
+        3
+
+    field(s: *S) = s.items.push(swap_held())
+
+    main()
+        print(work(&B.s))
+        field(&H.box.s)
+        print(B.s.items.len(), H.box.s.items.len())
+    """
+
+@test("a callee writing module storage that holds the struct keeps the count of what it is lent")
+pfz_callee_writes_the_holder()
+    pfz_kept(pfz_global_writers(), "work")
+
+@test("a later argument writing a field of module storage that holds the struct keeps the count")
+pfz_later_argument_writes_a_held_field()
+    pfz_kept(pfz_global_writers(), "field")
+
+@test("and both run clean on the counted heap and under AddressSanitizer")
+pfz_global_writers_run()
+    pfz_prints(pfz_global_writers(), "1\n0 0\n")
+
 // A tuple of references built on the spot from a field through a pointer: the callee overwrites the
 // field, which writes nothing a tuple is part of but frees the very nodes the tuple points at.
 private pfz_referents() -> string = raw"""

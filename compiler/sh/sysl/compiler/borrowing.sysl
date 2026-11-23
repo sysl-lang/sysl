@@ -2585,6 +2585,9 @@ end EdgeKey
 edge_key(owner: Type, field: string, held: Type) -> EdgeKey =
     EdgeKey(underlying(owner), field, held, s"${mangle(underlying(owner))}.$field")
 
+// The edge module storage `symbol` of type `ty` is: the whole global, held by nothing but the module.
+global_key(symbol: string, ty: Type) -> EdgeKey = edge_key(ty, s"@$symbol", ty)
+
 // The edge the slots of storage of `elem` sit on.
 slot_key(elem: Type) -> EdgeKey = edge_key(elem, "[]", elem)
 
@@ -2601,7 +2604,9 @@ private nth_field_key(owner: Type, fields: Buf[(string, Type)], i: int) -> Optio
 // An edge as a reader is shown it, each type as `type_show` names it: `m.Node.next`, an enum payload's
 // `sysl.Option[&m.Node].Some.value`, or `the slots of &m.Node`.
 edge_text(k: EdgeKey) -> string =
-    if k.field == "[]" then s"the slots of ${type_show(k.owner)}" else s"${type_show(k.owner)}.${k.field}"
+    if k.field == "[]" then s"the slots of ${type_show(k.owner)}"
+    else if k.field.starts_with("@") then s"the module storage '${qualified_name(k.field[1..<k.field.bytes.len])}'"
+    else s"${type_show(k.owner)}.${k.field}"
 
 // **What a function, and everything it calls, may do to the edges a caller has read through** before
 // it returns: the edges it may overwrite (`keys`, by name in `named`); the types it may write through
@@ -2983,7 +2988,10 @@ own_base(place: TExpr, aliases: Set[string]) -> bool = *place.kind match
 
 private note_climb(sink: &EdgeSink, aliases: Set[string], place: TExpr, counted: bool) -> unit = *place.kind match
     TLoad(name, _) -> if aliases.has(name) then sink.pointer(place_type(place))
-    TGlobal(_, _, _) -> ()
+    // **Module storage is an edge of its own** (`global_key`): overwriting it gives back what it held,
+    // which may free the object a pointer handed to a caller points into (`plus0_locals.sysl`'s
+    // `pointer_back`). No chain of a counted root runs through it, so it never names one of theirs.
+    TGlobal(symbol, ty, _) -> if counted then sink.key(global_key(symbol, ty))
     TField(r, i, _) ->
         if counted then field_key(texpr_type(r), i) match
             Some(k) -> sink.key(k)

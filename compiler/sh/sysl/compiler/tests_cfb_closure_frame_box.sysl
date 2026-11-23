@@ -396,14 +396,18 @@ cfb_frame_boxes_run_clean_under_asan()
     assert_eq(got.out, cfb_matrix_output)
     assert_eq(got.err, "")
 
-@test("every closure of the matrix is boxed in its frame, and only the two counted values reach the heap")
+@test("every closure of the matrix is boxed in its frame, and so is the trait object; only the counted Cell reaches the heap")
 cfb_frame_boxes_are_allocas()
     if xvr_no_library() then return
 
     val ir = cfb_ir(cfb_matrix)
 
     assert_eq(cfb_lines_with(ir, "= alloca %arc.$closure"), 25)
-    assert_eq(cfb_lines_with(ir, "call ptr @malloc"), 2)
+    // `obj: &Visitor = Twice()` is only lent to `visit` (H4c/H4e follow the vcall), so its box is a
+    // frame alloca; `Cell` is captured by a closure and stays the one counted heap box.
+    assert(cfb_lines_with(ir, "= alloca %arc.Twice") > 0, "the trait object is not in a frame")
+    assert_eq(cfb_lines_with(ir, "= alloca %arc.Cell"), 0)
+    assert_eq(cfb_lines_with(ir, "call ptr @malloc"), 1)
 
 @test("a frame box whose closure holds a counted value lets go of it at the last release, and frees nothing")
 cfb_counted_payload_has_a_frame_hook()

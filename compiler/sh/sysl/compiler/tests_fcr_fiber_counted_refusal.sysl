@@ -427,3 +427,121 @@ fcr_pinned_thread_on_struct()
         """)
 
     assert(said.contains("an annotation marks a function, and only a function"), said)
+
+// A view that owns no count of its own, lent to a call that reaches the switch, is held across nothing
+// (`memory.md § Views own their heap storage, and a lent view takes no count`): a literal's bytes, a view
+// of a frame array, of a raw pointer or of a module `val` array (all with a null owner), a parameter
+// passed straight through, and a view of a view parameter, lent while the caller's count holds the
+// storage. Each shape is asked with the short string form off and on.
+private fcr_lent(body: string)
+    force_short_strings(false)
+    fcr_accepted(body)
+    force_short_strings(true)
+    fcr_accepted(body)
+    unforce_short_strings()
+
+private fcr_send() -> string = raw"""
+    send(b: []const u8) -> usize
+        wait()
+        b.len
+
+    """
+
+@test("a literal's bytes lent to a call that reaches the switch hold no count")
+fcr_lent_literal_bytes()
+    fcr_lent(fcr_send() + raw"""
+        work() -> usize = send("ping".bytes)
+        """)
+
+@test("a view of a frame array lent to a call that reaches the switch holds no count")
+fcr_lent_frame_array()
+    fcr_lent(fcr_send() + raw"""
+        work() -> usize
+            var a: [16]u8 = [0; 16]
+            send(a[0..<16])
+        """)
+
+@test("a view of a raw pointer lent to a call that reaches the switch holds no count")
+fcr_lent_raw_pointer()
+    fcr_lent(fcr_send() + raw"""
+        work(p: *u8, n: usize) -> usize = send(p[0..<n])
+        """)
+
+@test("a view of a module 'val' array lent to a call that reaches the switch holds no count")
+fcr_lent_val_array()
+    fcr_lent(fcr_send() + raw"""
+        val table: [4]u8 = [1, 2, 3, 4]
+
+        work() -> usize = send(table[1..<3])
+        """)
+
+@test("a 'string' parameter passed straight through, and its bytes, hold no count of the frame's")
+fcr_lent_string_parameter()
+    fcr_lent(raw"""
+        send(s: string) -> usize
+            wait()
+            s.len
+
+        bytes(b: []const u8) -> usize
+            wait()
+            b.len
+
+        work(s: string) -> usize = send(s) + bytes(s.bytes)
+        """)
+
+@test("a slice of a slice parameter, and of a slice of one, lent to a call that reaches the switch holds no count")
+fcr_lent_slice_of_parameter()
+    fcr_lent(fcr_send() + raw"""
+        work(b: []const u8) -> usize = send(b[1..<3]) + send(b[0..<4][1..<2])
+        """)
+
+@test("a view of a frame array inside a struct local holds no count")
+fcr_lent_array_in_struct()
+    fcr_lent(fcr_send() + raw"""
+        struct Frame
+            data: [8]u8
+
+        work() -> usize
+            val f = Frame([0; 8])
+            send(f.data[0..<4])
+        """)
+
+@test("a call that returns a '&T', lent as a temporary across a later reaching call, is still refused")
+fcr_ref_result_temporary()
+    fcr_refused(raw"""
+        made() -> &Box = Box(1)
+
+        waited() -> int
+            wait()
+            1
+
+        take(b: &Box, n: int) -> int = b.n + n
+
+        work()
+            print(take(made(), waited()))
+        """, "a counted temporary the enclosing expression is still holding", "waited")
+
+@test("a fresh heap string built in the argument is still refused")
+fcr_fresh_string_argument()
+    fcr_refused(raw"""
+        send(s: string) -> usize
+            wait()
+            s.len
+
+        work(a: string) -> usize = send(a + "!")
+        """, "a counted temporary the enclosing expression is still holding", "send")
+
+@test("a fresh heap string's bytes, or a view of one, are still refused")
+fcr_fresh_string_view()
+    fcr_refused(fcr_send() + raw"""
+        work(a: string) -> usize = send((a + "!").bytes[0..<1])
+        """, "a counted temporary the enclosing expression is still holding", "send")
+
+// A `Buf` parameter's name does not hold its storage (a growth through any other name gives it up), so
+// a view of it takes a count of the storage itself -- a count that is not atomic, held across the call.
+@test("a view of a heap 'Buf' lent to a call that reaches the switch is refused")
+fcr_buf_view_refused()
+    fcr_refused("import sysl.buf.Buf\n\n" + fcr_send() + raw"""
+        work(b: Buf[u8]) -> usize = send(b.view()[0..<1])
+        """, "a counted temporary the enclosing expression is still holding", "send")
+

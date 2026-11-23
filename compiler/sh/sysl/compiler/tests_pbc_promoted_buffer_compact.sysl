@@ -1,0 +1,264 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A promoted array's buffer is let go of by the release that reads its hook, whatever its element
+// is (`emit_arc.sysl`'s `own_box`). Registered as a `&` to its element, a buffer of a compact type
+// (`compact_box.sysl`) was let go of by that type's own release, which took the hook word for the
+// payload's first field: the count went down, and the "string" it found there was the code the hook
+// points at, whose count it wrote -- a fault once the declaration held the last share.
+//
+// The cells, each run at -O2 on a counted heap, where a fault, a leak or a second free is a failure:
+// the declaration releasing last (the fault) and first; an element that is a compact struct, a
+// compact enum, one holding a compact box of its own kind, a non-compact one (a weak reference made
+// of it) and a plain integer; the view stored in a `Buf`, returned out of the frame, and kept by a
+// loop body's scope on every turn, left by `break` and by an early `return`; a temporary array
+// literal; and a generic payload at two instantiations.
+//
+// Cells skipped, with the reason: a library, a C archive and a precompiled root -- they keep every
+// header, so no box in them is compact and the release was already the hook's; another machine --
+// the release chosen is the one every view's owner word already takes on every target.
+
+private struct PbcRun
+    out: string
+    err: string
+    code: int
+end PbcRun
+
+private pbc_run(program: string) -> PbcRun
+    val root = make_temp_dir("sysl-pbc-run").unwrap()
+
+    write_text(s"$root/main.sysl", program).unwrap()
+
+    val exe = s"$root/built"
+
+    force_alloc_counting(true)
+
+    val made = build_native_program(s"$root/main.sysl", None, None, "2", Some(exe))
+
+    force_alloc_counting(false)
+
+    made match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return PbcRun(failure_text(why), "", -1)
+        Ok(_) -> ()
+
+    val ran = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    ran match
+        Err(_) -> PbcRun("the program that was built could not be run", "", -1)
+        Ok(o) -> PbcRun(o.text, o.err.unwrap_or(""), shell_status(o.status))
+end pbc_run
+
+private pbc_prints(program: string, want: string)
+    if std_root().is_err() || !clang_available()
+        print("skipped: the standard module's source or clang is not on this machine")
+        return
+
+    val got = pbc_run(program)
+
+    assert_eq(got.out, want)
+    assert_eq(got.err, "")
+    assert_eq(got.code, 0)
+end pbc_prints
+
+@test("a promoted array of a compact struct, its view held by a Buf declared after it, comes apart")
+pbc_declaration_releases_last()
+    pbc_prints(raw"""
+        import sysl.buf.{Buf, buf}
+
+        struct Field
+            name: string
+            n: int
+
+        struct Holder
+            xs: []const Field
+
+        run()
+            val cols = [Field("v", 1)]
+            val held = buf[Holder]()
+
+            held.push(Holder(cols))
+            print(held[0].xs[0].name)
+
+        main()
+            run()
+            print("done")
+        """, "v\ndone\n")
+
+@test("the same array with the Buf declared before it, which lets go of the last share itself")
+pbc_declaration_releases_first()
+    pbc_prints(raw"""
+        import sysl.buf.{Buf, buf}
+
+        struct Field
+            name: string
+            n: int
+
+        struct Holder
+            xs: []const Field
+
+        run()
+            val held = buf[Holder]()
+            val cols = [Field("v", 1), Field("w", 2)]
+
+            held.push(Holder(cols))
+            print(held[0].xs[1].name)
+
+        main()
+            run()
+            print("done")
+        """, "w\ndone\n")
+
+@test("a compact enum, one holding a compact box of its own kind, and a non-compact element")
+pbc_element_kinds()
+    pbc_prints(raw"""
+        import sysl.buf.{Buf, buf}
+
+        enum Ty
+            Int
+            Text(name: string)
+            List(elem: &Ty)
+
+        struct Node
+            label: string
+            next: Option[&Node]
+
+        struct Kept
+            name: string
+
+        enums()
+            val tys = [Int, Text("t"), List(List(Text("u")))]
+            val held = buf[[]const Ty]()
+
+            held.push(tys)
+            print(held[0].len)
+
+        nodes()
+            val ns = [Node("a", Some(Node("b", None))), Node("c", None)]
+            val held = buf[[]const Node]()
+
+            held.push(ns)
+            print(held[0][0].label)
+
+        kept()
+            val k: &Kept = Kept("k")
+            val w: weak Kept = k
+            val ks = [Kept("x"), Kept("y")]
+            val held = buf[[]const Kept]()
+
+            held.push(ks)
+            print(held[0][1].name)
+            print(w.get().is_some())
+
+        main()
+            enums()
+            nodes()
+            kept()
+            print("done")
+        """, "3\na\ny\ntrue\ndone\n")
+
+@test("a promoted array of plain integers is let go of on the same path")
+pbc_plain_elements()
+    pbc_prints(raw"""
+        import sysl.buf.{Buf, buf}
+
+        run()
+            val xs = [1, 2, 3]
+            val held = buf[[]const int]()
+
+            held.push(xs)
+            print(held[0][2])
+
+        main()
+            run()
+            print("done")
+        """, "3\ndone\n")
+
+@test("a view returned out of the frame, a loop body's scope with break, and an early return")
+pbc_control_flow()
+    pbc_prints(raw"""
+        import sysl.buf.{Buf, buf}
+
+        struct Field
+            name: string
+            n: int
+
+        out() -> []const Field
+            val cols = [Field("r", 1)]
+
+            cols[..]
+
+        looped(held: Buf[[]const Field])
+            for i in 0..<4
+                val cols = [Field(s"l$i", i)]
+                val mine = buf[[]const Field]()
+
+                mine.push(cols)
+                if i == 2 then break
+                held.push(cols)
+
+        early(stop: bool) -> int
+            val cols = [Field("e", 7)]
+            val mine = buf[[]const Field]()
+
+            mine.push(cols)
+            if stop then return mine[0][0].n
+
+            0
+
+        main()
+            val r = out()
+
+            print(r[0].name)
+
+            val held = buf[[]const Field]()
+
+            looped(held)
+            print(held.len())
+            print(held[1][0].name)
+            print(early(true))
+            print(early(false))
+            print("done")
+        """, "r\n2\nl1\n7\n0\ndone\n")
+
+@test("a temporary array literal and a generic payload at two instantiations")
+pbc_temporary_and_generic()
+    pbc_prints(raw"""
+        import sysl.buf.{Buf, buf}
+
+        struct Field
+            name: string
+            n: int
+
+        struct Pair[T]
+            a: T
+            b: string
+
+        temp()
+            val held = buf[[]const Field]()
+
+            held.push([Field("t", 1)])
+            print(held[0][0].name)
+
+        generic()
+            val ps = [Pair(1, "one")]
+            val qs = [Pair("two", "2")]
+            val held = buf[[]const Pair[int]]()
+            val also = buf[[]const Pair[string]]()
+
+            held.push(ps)
+            also.push(qs)
+            print(held[0][0].b)
+            print(also[0][0].a)
+
+        main()
+            temp()
+            generic()
+            print("done")
+        """, "t\none\ntwo\ndone\n")
