@@ -39,8 +39,16 @@ literal_arithmetic(cx: &Analyzer, outermost: bool, t: TExpr) -> TExpr
     if !outermost then return t
 
     cx.in_literal_arithmetic = false
+    cx.exact_values.clear()
 
-    val zero = zero_divisor(t)
+    val checked = literal_arithmetic_checked(cx, t)
+
+    cx.exact_values.clear()
+    checked
+end literal_arithmetic
+
+private literal_arithmetic_checked(cx: &Analyzer, t: TExpr) -> TExpr
+    val zero = zero_divisor(cx, t)
 
     if zero.is_some()
         if chosen_by_constant(cx, zero.unwrap()) then return t
@@ -56,7 +64,7 @@ literal_arithmetic(cx: &Analyzer, outermost: bool, t: TExpr) -> TExpr
 
     val node = node_of(t)
     val ty = texpr_type(node)
-    val value = exact_value(node)
+    val value = exact_value(cx, node)
 
     if value.is_none() then return t
 
@@ -71,7 +79,7 @@ literal_arithmetic(cx: &Analyzer, outermost: bool, t: TExpr) -> TExpr
     *t.kind match
         TConstrainedCheck(_, target) -> TExpr(t.span, TConstrainedCheck(folded, target))
         _ -> folded
-end literal_arithmetic
+end literal_arithmetic_checked
 
 // Whether a trap at `at` lies in a branch of an `if` or a `match` over a constant
 // (`reference/modules.md`): only the branch the constant chooses is computed, so a branch that would
@@ -98,23 +106,24 @@ private chosen_by_constant(cx: &Analyzer, at: Span) -> bool
 end chosen_by_constant
 
 // The first division or remainder inside whose divisor is a literal zero.
-private zero_divisor(t: TExpr) -> Option[Span] = *t.kind match
-    TConstrainedCheck(inner, _) -> zero_divisor(inner)
-    TCast(inner, _) -> zero_divisor(inner)
-    TUnary(_, x, _) -> zero_divisor(x)
+private zero_divisor(cx: &Analyzer, t: TExpr) -> Option[Span] = *t.kind match
+    TConstrainedCheck(inner, _) -> zero_divisor(cx, inner)
+    TCast(inner, _) -> zero_divisor(cx, inner)
+    TUnary(_, x, _) -> zero_divisor(cx, x)
     TBinary(op, l, r, _) ->
-        val left = zero_divisor(l)
+        val left = zero_divisor(cx, l)
 
         if left.is_some() then return left
 
-        val right = zero_divisor(r)
+        val right = zero_divisor(cx, r)
 
         if right.is_some() then return right
 
-        val y = exact_value(r)
+        if op != "/" && op != "%" then return None
 
-        if (op == "/" || op == "%") && y.is_some() && cmp(y.unwrap(), from_int(0)) == 0 then Some(t.span)
-        else None
+        val y = exact_value(cx, r)
+
+        if y.is_some() && cmp(y.unwrap(), from_int(0)) == 0 then Some(t.span) else None
     _ -> None
 
 // The first left shift inside that has no value at the type it is read at: a count below zero or at
@@ -134,7 +143,7 @@ private bad_shift(cx: &Analyzer, t: TExpr) -> Option[(Span, string)] = *t.kind m
         if is_wrap_sat_op(op) then return unheld_operand(cx, l, r, ty)
         if op != "<<" then return None
 
-        val count = exact_value(r)
+        val count = exact_value(cx, r)
 
         if count.is_none() then return None
 
@@ -148,7 +157,7 @@ private bad_shift(cx: &Analyzer, t: TExpr) -> Option[(Span, string)] = *t.kind m
                     return Some((t.span, s"a constant shifted by ${to_string(n)} places, " +
                                          s"at or past the $bits bits of ${declared_show(cx, ty)}"))
 
-                val x = exact_value(l)
+                val x = exact_value(cx, l)
 
                 if x.is_some() && !fits(x.unwrap(), bits, signed) then
                     return Some((l.span, s"the value${shown(x.unwrap())} does not fit ${declared_show(cx, ty)}"))
@@ -163,7 +172,7 @@ private bad_shift(cx: &Analyzer, t: TExpr) -> Option[(Span, string)] = *t.kind m
 private unheld_operand(cx: &Analyzer, l: TExpr, r: TExpr, ty: Type) -> Option[(Span, string)] = underlying(ty) match
     Integer(bits, signed, _) ->
         for side in [l, r]
-            val v = exact_value(side)
+            val v = exact_value(cx, side)
 
             if v.is_some() && !fits(v.unwrap(), bits, signed) then
                 return Some((side.span, s"the value${shown(v.unwrap())} does not fit ${declared_show(cx, ty)}"))
@@ -179,7 +188,12 @@ literals_only(cx: &Analyzer, e: Expr) -> bool = *e.kind match
     Ident(_) -> untyped_int_const(cx, e)
     Field(_, _, _) -> untyped_int_const(cx, e)
     Unary(op, operand) -> (op == "-" || op == "~") && literals_only(cx, operand)
-    Binary(op, l, r) -> exact_operator(op) && literals_only(cx, l) && literals_only(cx, r)
+    // Every level of a chain asks this of itself, so the operand that is not an operator, the next
+    // term of a left-nested chain, is asked first and settles a chain of names without the rest.
+    Binary(op, l, r) ->
+        if !exact_operator(op) then false
+        else if operator_node(l) && !operator_node(r) then literals_only(cx, r) && literals_only(cx, l)
+        else literals_only(cx, l) && literals_only(cx, r)
     _ -> false
 
 private untyped_int_const(cx: &Analyzer, e: Expr) -> bool =
@@ -196,21 +210,35 @@ private node_of(t: TExpr) -> TExpr = *t.kind match
 
 // The exact value of an analyzed literal-only integer expression, or `None` where it is not one --
 // an operand that was refused, a literal read as a float or a fixed-point value, a zero divisor.
-private exact_value(t: TExpr) -> Option[BigInt] = *t.kind match
+// Worked out once per node of the expression being checked (`Analyzer.exact_values`), since the
+// checks above ask it of an operand at every level.
+private exact_value(cx: &Analyzer, t: TExpr) -> Option[BigInt]
+    val key = node_id(t)
+    val known = cx.exact_values.get(key)
+
+    if known.is_some() then return known.unwrap()
+
+    val out = exact_value_here(cx, t)
+
+    cx.exact_values.put(key, out)
+    out
+end exact_value
+
+private exact_value_here(cx: &Analyzer, t: TExpr) -> Option[BigInt] = *t.kind match
     TIntLit(v, _) -> Some(v)
-    TConstrainedCheck(inner, _) -> exact_value(inner)
+    TConstrainedCheck(inner, _) -> exact_value(cx, inner)
     // A conversion the analyzer inserted over a literal is a lossless widening, or a shift count
     // brought to the shifted value's type; either way the number is the one written.
     TCast(inner, to) -> underlying(to) match
-        Integer(_, _, _) -> exact_value(inner)
+        Integer(_, _, _) -> exact_value(cx, inner)
         _ -> None
     TBinary(op, l, r, ty) ->
-        val x = exact_value(l)
-        val y = exact_value(r)
+        val x = exact_value(cx, l)
+        val y = exact_value(cx, r)
 
         if x.is_none() || y.is_none() then None else binary_value(op, x.unwrap(), y.unwrap(), ty)
     TUnary(op, x, ty) ->
-        val v = exact_value(x)
+        val v = exact_value(cx, x)
 
         if v.is_none() then None else unary_value(op, v.unwrap(), ty)
     _ -> None

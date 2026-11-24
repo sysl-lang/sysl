@@ -322,7 +322,27 @@ private opens_of(cx: &Analyzer, e: Expr) -> Buf[string]
 
     if undecided(cx, e, found) then found else buf()
 
+// Inside an operator being read, an operator node's answer is kept (`Analyzer.undecided_answers`)
+// where it cannot change while the operator is read: no, since a part with a type of its own keeps
+// it, and yes over literals and constants alone. A yes that waits on open bindings is asked afresh,
+// since a use read meanwhile may fix them.
 private undecided(cx: &Analyzer, e: Expr, into: Buf[string]) -> bool
+    if cx.operator_depth == 0 || !operator_node(e) then return undecided_here(cx, e, into)
+
+    val key = usize(&*e.kind)
+    val known = cx.undecided_answers.get(key)
+
+    if known.is_some() then return known.unwrap().1
+
+    val before = into.len()
+    val out = undecided_here(cx, e, into)
+
+    if !out || into.len() == before then cx.undecided_answers.put(key, (e, out))
+
+    out
+end undecided
+
+private undecided_here(cx: &Analyzer, e: Expr, into: Buf[string]) -> bool
     if literal_default(e).is_some() || untyped_const_read(cx, e) then return true
 
     val open = open_name(cx, e)
@@ -334,11 +354,15 @@ private undecided(cx: &Analyzer, e: Expr, into: Buf[string]) -> bool
 
     *e.kind match
         Unary(op, operand) -> (op == "-" || op == "~") && undecided(cx, operand, into)
+        // The next term of a left-nested chain is asked first, alone, so a chain whose next term has a
+        // type of its own is settled without the chain below it, at every level.
         Binary(op, l, r) ->
             if op == "<<" || op == ">>" then undecided(cx, l, into)
-            else arithmetic_op(op) && undecided(cx, l, into) && undecided(cx, r, into)
+            else if !arithmetic_op(op) then false
+            else if operator_node(l) && !operator_node(r) && !undecided(cx, r, buf()) then false
+            else undecided(cx, l, into) && undecided(cx, r, into)
         _ -> false
-end undecided
+end undecided_here
 
 private arithmetic_op(op: string) -> bool =
     op == "+" || op == "-" || op == "*" || op == "/" || op == "%" || op == "&" || op == "|" || op == "^" ||

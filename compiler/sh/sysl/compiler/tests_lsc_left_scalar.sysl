@@ -191,3 +191,44 @@ lsc_compound_assignment_is_unaffected()
     val e = lsc_err(lsc_point() + "var k = 2\nk *= p\n")
 
     assert(lsc_says(e, "'*' needs matching types, got int and Point", "8:6"), e)
+
+// `1 * (1 * (… * p))`, `n` levels: a literal on the left of every level, each the receiver of the
+// level below's `Point`.
+private lsc_nested(n: int) -> string
+    var text = "print("
+
+    for _ in 0..<n
+        text = text + "1 * ("
+
+    text = text + "p"
+
+    for _ in 0..<n
+        text = text + ")"
+
+    text + ")\n"
+end lsc_nested
+
+// The right operand is read once, to decide and as the operand: reading it once to decide and again
+// for real read each level twice, so 40 levels were 2^40 readings and never finished.
+@test("a literal on the left of every level of a 40-deep chain is each level's receiver, read once")
+lsc_nested_literal_subjects_read_once()
+    if !lsc_ready() then return
+
+    assert_eq(lsc_ran(lsc_point() + lsc_nested(40)), "Point(x: 1, y: 2)\n")
+
+@test("a literal on the left beside a scalar chain of its own type takes the instruction, nested")
+lsc_nested_scalar_right_takes_the_instruction()
+    if !lsc_ready() then return
+
+    // The right operand reads as a `real` at every level, so no implementation is at stake and the
+    // literal is a `real` operand, as `2 * x` is.
+    assert_eq(lsc_ran(lsc_point() + "val x = 1.5\nprint(2 * (2 * (2 * x)), 2 * (p.x + (2 * x)))\n"), "12 8\n")
+
+@test("a right operand refused under a literal on the left is refused once")
+lsc_refused_right_operand_said_once()
+    if !lsc_ready() then return
+
+    val e = lsc_err(lsc_point() + "print(2 * (2 * (2 * nope)))\n")
+
+    assert(e.contains("nope"), e)
+    assert_eq(int(e.count_of("error:")), 1)

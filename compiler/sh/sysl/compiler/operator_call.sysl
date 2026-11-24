@@ -591,7 +591,7 @@ literal_operand_misfit(cx: &Analyzer, op: string, subject: Type, e: Expr) -> Opt
         Abstract(_, _) -> return None
         _ -> ()
 
-    val own = literal_arith_default(literal_shape(cx, e))
+    val own = const_arith_default(cx, e)
 
     if own.is_none() || !literal_valued(cx, e) || literal_fits(cx, e, own.unwrap()) then return None
 
@@ -619,7 +619,7 @@ end literal_operand_misfit
 // instruction of its own: the scalars implementing the trait at that type are the candidates, and
 // the literal fits none of them nor its own default.
 literal_subject_misfit(cx: &Analyzer, op: string, rhs: Type, e: Expr, scalars: Buf[Type]) -> Option[string]
-    val own = literal_arith_default(literal_shape(cx, e))
+    val own = const_arith_default(cx, e)
 
     if scalars.is_empty() || own.is_none() || literal_fits(cx, e, own.unwrap()) then return None
 
@@ -693,8 +693,8 @@ widened_operand(cx: &Analyzer, span: Span, op: string, subject: Type, t: TExpr,
         _ -> impl_heads(a, tr_name, subject, d.unwrap())
     // Arithmetic over literals is the literal it comes to (`literal_arith_default`): `b + 60 * 52` is
     // read at whichever implementation `b + 3120` is, and refused alike where that is ambiguous -- and
-    // so is an untyped constant (`literal_shape`): `b + K` at `const K = 3120` is `b + 3120`.
-    val literal = written.is_some() && literal_arith_default(literal_shape(cx, written.unwrap())).is_some()
+    // so is an untyped constant (`const_arith_default`): `b + K` at `const K = 3120` is `b + 3120`.
+    val literal = written.is_some() && const_arith_default(cx, written.unwrap()).is_some()
     var reached: Buf[Type] = buf()
 
     for h in heads
@@ -805,6 +805,43 @@ scalar_impls_at(a: &Analysis, op: string, rhs: Type) -> Buf[Type]
     val tr_name = library_key(spelling)
     val d = trait_decl_at(a, tr_name).unwrap()
 
+    for subject in scalar_subjects(a, tr_name)
+        for h in impl_heads(a, tr_name, subject, d)
+            if type_eq(h, rhs)
+                found.push(subject)
+                break
+
+    found
+end scalar_impls_at
+
+// Whether any scalar implements an operator's trait at a right-hand type the machine has no
+// instruction for -- whether `scalar_impls_at` can answer anything at all, asked without a right-hand
+// type, so a literal on the left need not read its neighbour to find out that nothing is at stake.
+// Answered once per operator for as long as no implementation is added.
+scalar_impls_exist(a: &Analysis, op: string) -> bool
+    if !selects_by_operand(a, op) then return false
+
+    val impls = a.tables.members.impls.len()
+    val known = a.scalar_impl_ops.get(op)
+
+    if known.is_some() && known.unwrap().0 == impls then return known.unwrap().1
+
+    val spelling = core_infix(op).unwrap()
+    val tr_name = library_key(spelling)
+    val d = trait_decl_at(a, tr_name).unwrap()
+    var any = false
+
+    for subject in scalar_subjects(a, tr_name)
+        for h in impl_heads(a, tr_name, subject, d)
+            if h != Unknown && !core_builtin(spelling, h) then any = true
+
+    a.scalar_impl_ops.put(op, (impls, any))
+    any
+end scalar_impls_exist
+
+// Every scalar an implementation of a trait was filed for, plus the named scalars, once each.
+private scalar_subjects(a: &Analysis, tr_name: string) -> Buf[Type]
+    var found: Buf[Type] = buf()
     var names: Buf[string] = buf()
 
     for n in ["int", "short", "long", "byte", "ushort", "uint", "ulong", "usize", "isize", "i8",
@@ -838,16 +875,11 @@ scalar_impls_at(a: &Analysis, op: string, rhs: Type) -> Buf[Type]
         for f in found
             if type_eq(f, subject) then seen = true
 
-        if seen then continue
-
-        for h in impl_heads(a, tr_name, subject, d)
-            if type_eq(h, rhs)
-                found.push(subject)
-                break
+        if !seen then found.push(subject)
     end for
 
     found
-end scalar_impls_at
+end scalar_subjects
 
 // Which of the scalar subjects a left operand reaches is the one meant, by the rule a method call's
 // argument is chosen by (`expr_call.sysl`'s `narrowed_at`), each subject standing as a candidate

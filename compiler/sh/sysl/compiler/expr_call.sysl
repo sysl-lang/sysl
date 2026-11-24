@@ -2733,9 +2733,9 @@ private into_subtype(cx: &Analyzer, span: Span, target: Type, written: string,
             // integer literal where the type has its own `From[int]`: read at a float base it would be
             // that float, and wrapped rather than handed to the `from` the type wrote for it -- and
             // arithmetic over integer literals is that literal (`Phase(1 + 2)` is `Phase(3)`), and so
-            // is an untyped constant (`Phase(K)`, `literal_shape`).
+            // is an untyped constant (`Phase(K)`, `const_arith_default`).
             val own_int = d.derived &&
-                          literal_arith_default(literal_shape(cx, args[0])).unwrap_or(Unknown) == int_type() &&
+                          const_arith_default(cx, args[0]).unwrap_or(Unknown) == int_type() &&
                           from_conversion(cx, int_type(), target).is_some()
 
             // A conversion's value is not used at the type it is converted to, so a literal binding
@@ -3955,6 +3955,106 @@ literal_shape(cx: &Analyzer, e: Expr) -> Expr
         Binary(op, l, r) -> expr(e.span, Binary(op, literal_shape(cx, l), literal_shape(cx, r)))
         _ -> e
 end literal_shape
+
+// `literal_arith_default(literal_shape(cx, e))`, the default an expression takes where every
+// untyped constant in it is the literal it stands for -- answered without building the shape, and
+// stopping at the first operand that is neither a literal nor such a constant. An operator asks this
+// of its operand once a level, so over a chain of `n` operators the answer must cost what finding
+// that operand costs, not the size of the chain below it: of the two operands of an operator, the
+// one that is not itself an operator is asked first, which is the next term of a chain nested
+// either way.
+//
+// Inside an operator being read, an operator node's answer is kept (`Analyzer.arith_answers`): a chain
+// of literals has no operand that settles it early, and each level asks again of the levels below.
+const_arith_default(cx: &Analyzer, e: Expr) -> Option[Type]
+    if cx.operator_depth == 0 || !operator_node(e) then return const_arith_answer(cx, e)
+
+    val key = usize(&*e.kind)
+    val known = cx.arith_answers.get(key)
+
+    if known.is_some() then return known.unwrap().1
+
+    val out = const_arith_answer(cx, e)
+
+    cx.arith_answers.put(key, (e, out))
+    out
+end const_arith_default
+
+private const_arith_answer(cx: &Analyzer, e: Expr) -> Option[Type]
+    if untyped_const_read(cx, e)
+        val t = untyped_const_type(cx, e)
+
+        return if type_eq(t, int_type()) || type_eq(t, real_type()) then Some(t) else None
+    end if
+
+    val own = literal_default(e)
+
+    if own.is_some() then return own
+
+    *e.kind match
+        Unary(op, operand) ->
+            if op == "-" then const_arith_default(cx, operand)
+            else if op == "~" && const_int_valued(cx, operand) then Some(int_type())
+            else None
+        Binary(op, l, r) ->
+            if op == "<<" || op == ">>"
+                if const_int_valued(cx, l) then Some(int_type()) else None
+            else if literal_arith_op(op)
+                val (first, second) = if operator_node(l) && !operator_node(r) then (r, l) else (l, r)
+                val a = const_arith_default(cx, first)
+
+                if a.is_none() then return None
+
+                val b = const_arith_default(cx, second)
+
+                if b.is_none() then None
+                else if type_eq(a.unwrap(), real_type()) || type_eq(b.unwrap(), real_type()) then Some(real_type())
+                else Some(int_type())
+            else None
+        _ -> None
+end const_arith_answer
+
+// An operator is being read: the outermost one starts with no answers kept.
+enter_operator(cx: &Analyzer)
+    if cx.operator_depth == 0 then forget_operator_answers(cx)
+
+    cx.operator_depth += 1
+
+// The reading of an operator is done; past the outermost, nothing kept is believed or held.
+leave_operator(cx: &Analyzer, t: TExpr) -> TExpr
+    cx.operator_depth -= 1
+
+    if cx.operator_depth == 0 then forget_operator_answers(cx)
+
+    t
+end leave_operator
+
+private forget_operator_answers(cx: &Analyzer)
+    cx.arith_answers.clear()
+    cx.valued_answers.clear()
+    cx.undecided_answers.clear()
+
+// `int_literal_valued(literal_shape(cx, e))`, answered as `const_arith_default` answers its own.
+private const_int_valued(cx: &Analyzer, e: Expr) -> bool
+    if untyped_const_read(cx, e) then return type_eq(untyped_const_type(cx, e), int_type())
+
+    if bare_int_literal(e) then return true
+
+    *e.kind match
+        Unary(op, operand) -> (op == "-" || op == "~") && const_int_valued(cx, operand)
+        Binary(op, l, r) ->
+            if op == "<<" || op == ">>" then const_int_valued(cx, l)
+            else if !literal_arith_op(op) then false
+            else if operator_node(l) && !operator_node(r) then const_int_valued(cx, r) && const_int_valued(cx, l)
+            else const_int_valued(cx, l) && const_int_valued(cx, r)
+        _ -> false
+end const_int_valued
+
+// Whether an expression is an operator over operands, which is what a chain is made of.
+operator_node(e: Expr) -> bool = *e.kind match
+    Unary(_, _) -> true
+    Binary(_, _, _) -> true
+    _ -> false
 
 // An operator whose result over two numbers is a number of their type.
 private literal_arith_op(op: string) -> bool =

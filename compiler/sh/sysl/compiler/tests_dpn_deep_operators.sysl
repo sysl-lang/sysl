@@ -73,6 +73,47 @@ private dpn_negations(n: int) -> string =
 private dpn_products(n: int) -> string =
     "main()\n    var x = 2\n    val s = 0 + " + dpn_terms(n, "x * x", " + ") + "\n    print(s)\n"
 
+// The chains below pin the TIME a chain takes, not only that it builds. Each level of a chain asks
+// questions of its operands -- is it arithmetic over literals, is it a literal's value, what does it
+// read as alone -- and asked over everything below at every level they cost `n^2` or, where an operand
+// was read once to decide and again for real, `2^n`. Each of these took longer than the test's five
+// minutes to build before it was linear (`n` fields: `n^3`, by the names looked up once a level per
+// term below; a right-nested chain with a literal on every left: `2^n`), and takes seconds after.
+
+// `(1 + (1 + (… + 0)))`: a right-nested chain of literals, `n` levels.
+private dpn_right_literals(n: int) -> string =
+    "main()\n    val s = " + dpn_terms(n, "(1 + ", "") + "0" + dpn_terms(n, ")", "") + "\n    print(s)\n"
+
+// `1 + 1 + … + 1`: a left-nested chain of literals.
+private dpn_left_literals(n: int) -> string =
+    "main()\n    val s = " + dpn_terms(n, "1", " + ") + "\n    print(s)\n"
+
+// `(1 + (x + (1 + (x + … 0))))`: a literal on every other left of a right-nested chain, the rest a
+// local's read.
+private dpn_alternating(n: int) -> string =
+    "main()\n    var x = 2\n    val s = " + dpn_terms(n / 2, "(1 + (x + ", "") + "0" + dpn_terms(n, ")", "") +
+        "\n    print(s)\n"
+
+// `K + K + … + K` over an untyped constant, into a binding the sum is the first use of.
+private dpn_constants(n: int) -> string =
+    "const K = 3\n\nmain()\n    var s = 0\n    s += " + dpn_terms(n, "K", " + ") + "\n    print(s)\n"
+
+// `n` reads of distinct locals' fields, nested to the right: `(a0.v + (a1.v + (… + 0)))`.
+private dpn_right_fields(n: int) -> string
+    var lines: Buf[string] = buf()
+    var terms: Buf[string] = buf()
+
+    lines.push("struct A\n    v: int\n\nmain()")
+
+    for i in 0..<n
+        lines.push(s"    val a$i = A($i)")
+        terms.push(s"(a$i.v + ")
+
+    lines.push("    val s = " + join(terms.view(), "") + "0" + dpn_terms(n, ")", ""))
+    lines.push("    print(s)\n")
+    join(lines.view(), "\n")
+end dpn_right_fields
+
 // `id(id(… 1))`: a nesting that is not an operator, which only the compiler's stack holds.
 private dpn_calls(n: int) -> string =
     "id(v: int) -> int = v\n\nmain()\n    val s = " + dpn_terms(n, "id(", "") + "1" + dpn_terms(n, ")", "") +
@@ -192,6 +233,29 @@ dpn_products_4000() = dpn_deep_prints(dpn_products(4000), "16000\n")
 
 @test("dpn: 4000 nested calls build on the compiler's stack")
 dpn_calls_4000() = dpn_deep_prints(dpn_calls(4000), "1\n")
+
+// -- in time: each of these outlasted the test's limit while a level cost more than its own term ----
+
+@test("dpn: the 8000 fields summed into a compound assignment build in time")
+dpn_fields_8000() = dpn_deep_prints(dpn_fields(8000), "31996000\n")
+
+@test("dpn: 8000 fields summed in a right-nested chain build in time")
+dpn_right_fields_8000() = dpn_deep_prints(dpn_right_fields(8000), "31996000\n")
+
+@test("dpn: a 4000-deep right-nested chain of literals builds in time")
+dpn_right_literals_4000() = dpn_deep_prints(dpn_right_literals(4000), "4000\n")
+
+@test("dpn: a 64-deep right-nested chain of literals builds on an ordinary stack in time")
+dpn_right_literals_64() = dpn_prints(dpn_right_literals(64), "64\n")
+
+@test("dpn: an 8000-term left-nested chain of literals builds in time")
+dpn_left_literals_8000() = dpn_deep_prints(dpn_left_literals(8000), "8000\n")
+
+@test("dpn: a 4000-deep chain with a literal on every other left builds in time")
+dpn_alternating_4000() = dpn_deep_prints(dpn_alternating(4000), "6000\n")
+
+@test("dpn: an 8000-term sum of an untyped constant builds in time")
+dpn_constants_8000() = dpn_deep_prints(dpn_constants(8000), "24000\n")
 
 // -- through the binary ---------------------------------------------------------------------------
 

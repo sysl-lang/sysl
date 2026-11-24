@@ -186,18 +186,22 @@ analyze_value(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr = *e.kind
     // Arithmetic over open bindings read where a type is expected of it fixes them, as the position
     // would fix one of them read there alone (`var_first_use.sysl`).
     Unary(op, operand) ->
+        enter_operator(cx)
+
         val outermost = enter_literal_arithmetic(cx, e)
 
         arith_fixed_by_position(cx, e, expected)
-        literal_arithmetic(cx, outermost, unary_expr(cx, e, op, operand, expected))
+        leave_operator(cx, literal_arithmetic(cx, outermost, unary_expr(cx, e, op, operand, expected)))
     PreIncDec(op, operand) -> inc_dec(cx, e.span, op, operand, true)
     PostIncDec(op, operand) -> inc_dec(cx, e.span, op, operand, false)
 
     Binary(op, l, r) ->
+        enter_operator(cx)
+
         val outermost = enter_literal_arithmetic(cx, e)
 
         arith_fixed_by_position(cx, e, expected)
-        literal_arithmetic(cx, outermost, binary_expr(cx, e.span, op, l, r, expected))
+        leave_operator(cx, literal_arithmetic(cx, outermost, binary_expr(cx, e.span, op, l, r, expected)))
     Compare(operands, ops) -> compare_expr(cx, e.span, operands, ops)
 
     Tuple(elements) -> tuple_expr(cx, e.span, elements, expected)
@@ -2188,9 +2192,10 @@ private binary_expr(cx: &Analyzer, span: Span, op: string, l: Expr, r: Expr,
     not_fixing_at(cx, r)
 
     val numeric = numeric_expectation(expected)
-    val literal_left = literal_subject_operands(cx, span, op, l, r, numeric)
-    val scaled = if literal_left.is_some() then literal_left else scale_operands(cx, op, l, r, numeric)
-    val (read_l, tr) = if scaled.is_some() then scaled.unwrap() else paired_operands(cx, op, l, r, numeric)
+    val read_r = read_beside_literal(cx, op, l, r, numeric)
+    val literal_left = literal_subject_operands(cx, span, op, l, r, numeric, read_r)
+    val scaled = if literal_left.is_some() then literal_left else scale_operands(cx, op, l, r, numeric, read_r)
+    val (read_l, tr) = if scaled.is_some() then scaled.unwrap() else paired_operands(cx, op, l, r, numeric, read_r)
 
     if texpr_type(read_l) == Unknown || texpr_type(tr) == Unknown then return bad_expr(span)
 
@@ -2231,18 +2236,39 @@ end binary_expr
 // implementation takes the literal, which leaves the pair to the readings below and their
 // diagnostics; a literal the right operand's own type takes is that reading too.
 //
-// The right operand is read alone first, in a sandbox, since a literal contributes nothing to what
-// its neighbour is read at.
+// **The right operand's own reading where a literal on the left may be the receiver** -- the reading
+// `literal_subject_operands` decides by and the pair is then made of, read once. The pair reads that
+// operand alone and first anyway, at the same expectation (`analyze_operands`, or a shift's count at
+// none), and keeps it, so it is that reading, made before the decision rather than after it: reading
+// it in a sandbox to decide and again for real read each level of a right-nested chain with a literal
+// on each left twice, and the chain 2^n times. The outer `None` is no reading -- nothing at stake: no
+// scalar implements the operator at a type without an instruction, the left operand is not a literal's
+// value, or the right one is itself arithmetic over literals, read alone a number, which takes the
+// operator by instruction; the inner one a reading that was refused, which the pair makes for real.
+private read_beside_literal(cx: &Analyzer, op: string, l: Expr, r: Expr,
+                            numeric: Option[Type]) -> Option[Option[TExpr]]
+    if is_literal(r) || typed_by_position(cx, r) || !scalar_impls_exist(cx.an, op) then return None
+
+    if const_arith_default(cx, l).is_none() then return None
+
+    val own_r = const_arith_default(cx, r)
+
+    if own_r.is_some() && core_builtin(core_infix(op).unwrap(), own_r.unwrap()) then return None
+
+    Some(attempt_operand(cx, r, if count_alone(cx, op, l, r, numeric) then None else numeric))
+end read_beside_literal
+
+// The right operand's own reading decides it (`read_r`, from `read_beside_literal`), since a literal
+// contributes nothing to what its neighbour is read at; nothing where it was not read.
 private literal_subject_operands(cx: &Analyzer, span: Span, op: string, l: Expr, r: Expr,
-                                 numeric: Option[Type]) -> Option[(TExpr, TExpr)]
-    val own = literal_arith_default(literal_shape(cx, l))
+                                 numeric: Option[Type], read_r: Option[Option[TExpr]]) -> Option[(TExpr, TExpr)]
+    if read_r.is_none() || read_r.unwrap().is_none() then return None
 
-    if own.is_none() || is_literal(r) || !selects_by_operand(cx.an, op) then return None
+    val own = const_arith_default(cx, l)
+    val read = read_r.unwrap().unwrap()
+    val rty = texpr_type(through_reference(cx, read))
 
-    val read = sandboxed_reading(cx, r)
-    val rty = texpr_type(through_reference(cx, read.0))
-
-    if read.1 || rty == Unknown || literal_fits(cx, l, rty) then return None
+    if own.is_none() || rty == Unknown || literal_fits(cx, l, rty) then return None
 
     var reached: Buf[Type] = buf()
     val scalars = scalar_impls_at(cx.an, op, rty)
@@ -2252,7 +2278,7 @@ private literal_subject_operands(cx: &Analyzer, span: Span, op: string, l: Expr,
 
     val misfit = literal_subject_misfit(cx, op, rty, l, scalars)
 
-    if misfit.is_some() then return Some((cx.err(l.span, misfit.unwrap()), read.0))
+    if misfit.is_some() then return Some((cx.err(l.span, misfit.unwrap()), read))
 
     val at = chosen_scalar(cx, span, op, l, own.unwrap(), rty, reached)
 
@@ -2262,7 +2288,7 @@ private literal_subject_operands(cx: &Analyzer, span: Span, op: string, l: Expr,
 
     one.push(r)
 
-    val tr = analyze_operands(cx, one, numeric, through = true)[0]
+    val tr = analyze_operands(cx, one, numeric, through = true, last_read = read_r)[0]
 
     if at.unwrap() == Unknown then return Some((bad_expr(l.span), tr))
 
@@ -2316,17 +2342,18 @@ end scalar_subject_widened
 // **Where the position says nothing, the count's type stands in**, as it would for any pair: `val
 // top = 1 << usize(depth)` is a `usize`, so `x % top` over a `usize` x needs no cast.
 private paired_operands(cx: &Analyzer, op: string, l: Expr, r: Expr,
-                        numeric: Option[Type]) -> (TExpr, TExpr)
-    if (op == "<<" || op == ">>") && numeric.is_some() && literal_valued(cx, l) && !literal_valued(cx, r)
+                        numeric: Option[Type], read_r: Option[Option[TExpr]]) -> (TExpr, TExpr)
+    if count_alone(cx, op, l, r, numeric)
         var left: Buf[Expr] = buf()
         var count: Buf[Expr] = buf()
 
         left.push(l)
         count.push(r)
 
-        val tl = analyze_operands(cx, left, numeric, through = true)[0]
+        val tl = analyze_operands(cx, left, numeric, through = true)
+        val tr = analyze_operands(cx, count, None, through = true, last_read = read_r)
 
-        return (tl, operand_rhs(cx, op, tl, r, analyze_operands(cx, count, None, through = true)[0]))
+        return (tl[0], operand_rhs(cx, op, tl[0], r, tr[0]))
     end if
 
     var operands: Buf[Expr] = buf()
@@ -2336,12 +2363,17 @@ private paired_operands(cx: &Analyzer, op: string, l: Expr, r: Expr,
 
     val unshifted = op != "<<" && op != ">>"
     val read = analyze_operands(cx, operands, numeric, unshifted, op == "*" || op == "/", false, unshifted,
-                                if is_wrap_sat_op(op) then op else "", op, true)
+                                if is_wrap_sat_op(op) then op else "", op, true, read_r)
     val ts = if op == "+" || op == "-" then fixed_siblings(cx, operands, read) else read
     val tl = ts[0]
 
     (tl, operand_rhs(cx, op, tl, r, ts[1]))
 end paired_operands
+
+// Whether a shift's count is read alone, at nothing: a shift of a literal's value where a number is
+// expected, by a count that is not one.
+private count_alone(cx: &Analyzer, op: string, l: Expr, r: Expr, numeric: Option[Type]) -> bool =
+    (op == "<<" || op == ">>") && numeric.is_some() && literal_valued(cx, l) && !literal_valued(cx, r)
 
 // `x * 3`, `3 * x`, `x / 2`, `x >> 1`: an integer literal beside a fixed-point operand of `*`, `/`
 // or a shift is a SCALE, read as the integer it is rather than as a fixed-point literal of the other
@@ -2352,7 +2384,7 @@ end paired_operands
 // contributes nothing to what its neighbour is read at; only where that neighbour turns out not to
 // be fixed-point does the literal take its type, as it always has.
 private scale_operands(cx: &Analyzer, op: string, l: Expr, r: Expr,
-                       numeric: Option[Type]) -> Option[(TExpr, TExpr)]
+                       numeric: Option[Type], read_r: Option[Option[TExpr]]) -> Option[(TExpr, TExpr)]
     if op != "*" && op != "/" && op != "<<" && op != ">>" then return None
 
     if bare_int_literal(r) && !is_literal(l)
@@ -2385,7 +2417,7 @@ private scale_operands(cx: &Analyzer, op: string, l: Expr, r: Expr,
 
         one.push(r)
 
-        val tr = analyze_operands(cx, one, numeric, through = true)[0]
+        val tr = analyze_operands(cx, one, numeric, through = true, last_read = read_r)[0]
 
         if is_fixed(texpr_type(tr)) then return Some((type_expr(cx, l, None), tr))
 
@@ -2622,14 +2654,19 @@ private same_handle_kind(a: Type, b: Type) -> bool = a match
 analyze_operands(cx: &Analyzer, operands: Buf[Expr], expected: Option[Type],
                  widen: bool = false, rescales: bool = false, compared: bool = false,
                  arithmetic: bool = false, held: string = "", dispatch: string = "",
-                 through: bool = false) -> Buf[TExpr]
+                 through: bool = false, last_read: Option[Option[TExpr]] = None) -> Buf[TExpr]
     var own: Buf[Option[TExpr]] = buf()
     var refused_before = false
 
-    for e in operands
+    for i in 0..<operands.len()
+        val e = operands[i]
+
         if is_literal(e) || typed_by_position(cx, e) then own.push(None)
         else
-            val read = attempt_operand(cx, e, expected)
+            // `last_read` is the last operand's own reading where the operator already made it
+            // (`read_beside_literal`), which is this reading, made once.
+            val read = if i + 1 == operands.len() && last_read.is_some() then last_read.unwrap()
+                       else attempt_operand(cx, e, expected)
             val t = if through && read.is_some() then Some(through_reference(cx, read.unwrap())) else read
 
             own.push(t)
