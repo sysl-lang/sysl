@@ -45,25 +45,29 @@ import sysl.text.Search
 //
 // A `va_list` parameter arrives as the one pointer C's convention names for it, and the definition
 // takes it as that same pointer (`emit_func.sysl`'s `receive_walk`), so it is handed on untouched.
-thunk_param_types(f: TFunc) -> Buf[Type]
+//
+// An empty aggregate is among them where the target's C gives one an argument slot (Windows x64,
+// `c_hollow`), and the thunk receives it there and hands the definition nothing for it.
+thunk_param_types(e: *Emit, f: TFunc) -> Buf[Type]
     var types: Buf[Type] = buf()
 
-    for item in stored_fields(f.params)
-        types.push(if underlying(item.1) == VaList then Ptr(VaList, false) else item.1)
+    for item in f.params
+        if c_crosses(e.layout, item.1, e.target)
+            types.push(if underlying(item.1) == VaList then Ptr(VaList, false) else item.1)
 
     types
 end thunk_param_types
 
 // The C signature of an export's thunk: what the artifact defining it emitted, and what a module
 // naming its address from elsewhere declares.
-export_thunk_type(e: *Emit, f: TFunc) -> IrFnType = foreign_signature(e, f.ret_ty, thunk_param_types(f), false)
+export_thunk_type(e: *Emit, f: TFunc) -> IrFnType = foreign_signature(e, f.ret_ty, thunk_param_types(e, f), false)
 
 gen_export_thunk(e: *Emit, f: TFunc, symbol: string, enters: bool) -> Option[IrFunc]
     start_function(e)
 
     if enters then emit(e, ir_call(None, LVoid, VGlobal(entry_prologue_symbol()), no_ir_args()))
 
-    val types = thunk_param_types(f)
+    val types = thunk_param_types(e, f)
     val c_type = foreign_signature(e, f.ret_ty, types, false)
 
     // The out-pointer is in front of every declared parameter, so the names run one behind wherever
@@ -94,7 +98,7 @@ gen_export_thunk(e: *Emit, f: TFunc, symbol: string, enters: bool) -> Option[IrF
     var passed: Buf[IrArg] = buf()
 
     for i in 0..<types.len()
-        passed.push(thunk_argument(e, types[i], incoming[i]))
+        if !zero_sized(types[i]) then passed.push(thunk_argument(e, types[i], incoming[i]))
 
     gen_thunk_call(e, f, symbol, passed, sret)
 
@@ -292,6 +296,15 @@ end gen_thunk_call
 // definition states.
 private gen_thunk_return(e: *Emit, ret_ty: Type, returned: Option[Val], sysl_slot: Option[Val],
                          sret: Option[Val])
+    // An empty result C reads out of a register or a slot (Windows x64) has nothing to put there, as
+    // clang's own definition returns `undef` for one.
+    if zero_sized(ret_ty) && c_hollow(e.layout, ret_ty, e.target).is_some()
+        c_result(e.layout, ret_ty, e.target) match
+            CrCoerced(coerced) -> emit_term(e, InRet(Some(coerced), Some(VUndef)))
+            _ -> emit_term(e, InRet(None, None))
+
+        return
+
     c_result(e.layout, ret_ty, e.target) match
         CrSret(coerced, align) ->
             // Where sysl returned into this very slot there is nothing left to do. Otherwise sysl

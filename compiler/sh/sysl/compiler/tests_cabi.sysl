@@ -690,3 +690,122 @@ an_empty_aggregate_is_left_alone()
     assert_eq(shape(thumb(), "    a: unit"),
               two("declare dso_local %struct.S @give()", "declare dso_local void @take()"))
 end an_empty_aggregate_is_left_alone
+
+// -- An empty struct on Windows x64 ----------------------------------------------------------------
+//
+// **Microsoft's C gives an empty struct four bytes** (`sizeof` 4 at alignment 1), so where every
+// convention above passes nothing, Windows x64 passes an integer of the C size. Each expectation is
+// clang 21's, `clang --target=x86_64-pc-windows-msvc -x c -S -emit-llvm` of the C in its comment:
+//
+//     struct E {};  struct E give(void);  void take(struct E);
+//       declare dso_local i32 @give()
+//       declare dso_local void @take(i32)
+//
+// (C++ answers `i8` instead, because a C++ empty class is one byte; an `extern` is a C declaration.)
+
+private empty() -> string = "struct S\nend S\n"
+
+// Every line of the module one source lowers to on a named machine -- the definitions and the calls
+// as well as the declarations, for the tests about where an argument lands among the others.
+private lowered_lines(text: string, target_name: string) -> Buf[string]
+    val t = target_named(target_name).unwrap()
+    val done = typed_of_target(text, t)
+    val p = strip_tests(program_of(done, done.main_module))
+
+    lines_of(ir_print_module(codegen_with_gaps(p, t, check_escapes(done.an, p)).0))
+end lowered_lines
+
+private line_holding(lines: Buf[string], part: string) -> string
+    for l in lines
+        if holds_text(l, part) then return l
+
+    s"no line holds '$part'"
+end line_holding
+
+@test("an empty struct takes a four-byte slot on Windows x64, either way it crosses")
+windows_empty_struct_is_four_bytes()
+    assert_eq(crossing(win(), s"${empty()}extern give() -> S\nextern take(v: S)"),
+              two("declare i32 @give()", "declare void @take(i32)"))
+    // A struct of a `unit` occupies nothing in sysl exactly as one of no fields does.
+    assert_eq(shape(win(), "    a: unit"), two("declare i32 @give()", "declare void @take(i32)"))
+end windows_empty_struct_is_four_bytes
+
+// `void mix(int a, struct E e, int b);` -- clang: `declare dso_local void @mix(i32 noundef, i32,
+// i32 noundef)`. Dropping the slot hands `b` over in `e`'s register, which is the miscompile.
+@test("an empty struct between two arguments keeps its slot on Windows x64")
+windows_empty_struct_between_arguments()
+    val src = s"${empty()}extern give() -> S\nextern mix(a: i32, v: S, b: i32)\nmix(1, give(), 2)\n"
+    val lines = lowered_lines(src, win())
+
+    assert_eq(line_holding(lines, "declare void @mix("), "declare void @mix(i32, i32, i32)")
+    assert(holds_text(line_holding(lines, "call void @mix("), "call void @mix(i32 1, i32 undef, i32 2)"))
+end windows_empty_struct_between_arguments
+
+// The same C on every other convention passes nothing for `e` (clang: `declare void @mix(i32
+// noundef, i32 noundef)` for x86_64-linux-gnu, aarch64-apple-macos, aarch64-linux-gnu, riscv64,
+// wasm32 and thumbv8m), so the slot is Windows' alone.
+@test("an empty struct between two arguments has no slot anywhere but Windows")
+empty_struct_between_arguments_elsewhere()
+    val decls = s"${empty()}extern mix(a: i32, v: S, b: i32)\nmix(1, S(), 2)\n"
+
+    for target in [x64(), arm(), arm_lnx(), wasm()]
+        assert_eq(line_holding(emit_declare_lines(decls, target), "@mix("), "declare void @mix(i32, i32)")
+
+    // RISC-V widens a 32-bit argument, and does it for both, which is the evidence nothing sits between.
+    assert_eq(line_holding(emit_declare_lines(decls, rv()), "@mix("),
+              "declare void @mix(i32 signext, i32 signext)")
+end empty_struct_between_arguments_elsewhere
+
+// Each empty member is four bytes of its own: `struct EE { struct E x; struct E y; }` is 8 (clang:
+// `declare dso_local i64 @give2()`), `struct O { struct E e; }` is 4, and `struct { struct E a[2]; }`
+// is 8.
+@test("an empty struct of empty structs is as large as its members on Windows x64")
+windows_nested_empty_structs()
+    val e = "struct E\nend E\n"
+
+    assert_eq(shape_with(win(), "    e: E", e), two("declare i32 @give()", "declare void @take(i32)"))
+    assert_eq(shape_with(win(), "    x: E\n    y: E", e), two("declare i64 @give()", "declare void @take(i64)"))
+    assert_eq(shape_with(win(), "    a: [2]E", e), two("declare i64 @give()", "declare void @take(i64)"))
+end windows_nested_empty_structs
+
+// `struct { int z[0]; }` and `struct { struct E a[0]; }` are 4 bytes, a struct never being smaller
+// than an empty one (clang: `declare dso_local void @take_z(i32)`); a union of two empty structs is
+// the larger of them, 4.
+@test("an empty struct is never less than four bytes on Windows x64")
+windows_empty_struct_floor()
+    assert_eq(shape(win(), "    z: [0]i32"), two("declare i32 @give()", "declare void @take(i32)"))
+    assert_eq(shape_with(win(), "    a: [0]E", "struct E\nend E\n"),
+              two("declare i32 @give()", "declare void @take(i32)"))
+    assert_eq(crossing(win(), "struct E\nend E\nunion S\n    x: E\n    y: E\nextern give() -> S\nextern take(v: S)"),
+              two("declare i32 @give()", "declare void @take(i32)"))
+end windows_empty_struct_floor
+
+// Past eight bytes it goes by address like any other aggregate: `struct E3 { struct E x, y, z; }` is
+// 12 (clang: `declare dso_local void @give3(ptr dead_on_unwind writable sret(%struct.E3) align 1)`,
+// `declare dso_local void @take3(ptr noundef)`). The storage is the C size, since the callee writes
+// all twelve bytes of it.
+@test("an empty struct of twelve C bytes goes by address on Windows x64")
+windows_empty_struct_in_memory()
+    assert_eq(shape_with(win(), "    x: E\n    y: E\n    z: E", "struct E\nend E\n"),
+              two("declare void @give(ptr sret([12 x i8]) align 1)", "declare void @take(ptr align 1)"))
+
+    val src = "struct E\nend E\nstruct S\n    x: E\n    y: E\n    z: E\nextern give() -> S\nextern take(v: S)\ntake(give())\n"
+    val lines = lowered_lines(src, win())
+
+    assert(holds_text(line_holding(lines, "call void @give("), "call void @give(ptr sret([12 x i8]) align 1 %"))
+    assert(holds_text(line_holding(lines, "call void @take("), "call void @take(ptr align 1 %"))
+end windows_empty_struct_in_memory
+
+// The other direction: `int defined(int a, struct E e, int b)` defined in C is `define dso_local i32
+// @defined(i32 noundef %0, i32 %1, i32 noundef %2)`, and `struct E defined_give(void)` is `define
+// dso_local i32 @defined_give()` returning `undef`. An export's thunk receives the slot and hands its
+// definition nothing for it.
+@test("an exported function takes and returns an empty struct in its C slot on Windows x64")
+windows_empty_struct_exported()
+    val src = s"${empty()}@export(\"mixed\")\nmixed(a: i32, v: S, b: i32) -> i32 = a + b\n@export(\"made\")\nmade() -> S = S()\n"
+    val lines = lowered_lines(src, win())
+
+    assert(holds_text(line_holding(lines, "@mixed("), "i32 @mixed(i32 %c.0, i32 %c.1, i32 %c.2)"))
+    assert(holds_text(line_holding(lines, "@made("), "i32 @made()"))
+    assert(holds_text(line_holding(lines, "ret i32 undef"), "ret i32 undef"))
+end windows_empty_struct_exported
