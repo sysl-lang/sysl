@@ -19,8 +19,8 @@ import sysl.text.{Search, join, replace_all, split}
 // `bool`, `u12`), load and store, where the storage is named (a pointee, a field, an element, module
 // storage, a `@packed` bitfield's container), the optimisation level (-O0, the default, -O2), the object
 // format (ELF for aarch64-freestanding, Mach-O for aarch64-macos), and LTO (the bitcode archive linked by
-// clang). Two cells pin what is outside the guarantee: another processor keeps LLVM's `load volatile`,
-// and a `u128`, which no one instruction moves, keeps it on AArch64 too.
+// clang). One cell pins what is outside the guarantee: another processor keeps LLVM's `load volatile`.
+// A volatile wider than 64 bits has no one instruction and is refused on AArch64 (`tests_volatile.sysl`).
 //
 // Skipped cells, and why: an under-aligned volatile scalar has no spelling (a `@packed` volatile field
 // that crosses its unit is refused, `reference/attributes.md`); a vector is refused as `volatile`
@@ -316,7 +316,7 @@ private vpa_ir(machine: string) -> Option[string]
     val dir = replace_all(make_temp_dir("sysl-vpa").unwrap(), "//", "/")
 
     make_dir_all(dir).unwrap()
-    write_text(s"$dir/main.sysl", vpa_fixture + "\n@export(\"wide\")\nwide(p: *volatile u128) = *p = *p + 1\n").unwrap()
+    write_text(s"$dir/main.sysl", vpa_fixture).unwrap()
     vpa_build_c(dir, ["--target", machine, "--emit-llvm", s"$dir/k.ll", "-o", s"$dir/libk.a"])
 
     val text = read_text(s"$dir/k.ll").unwrap()
@@ -508,19 +508,6 @@ vpa_ir_narrow_integers()
     assert(narrow.contains("call void asm sideeffect \"strh ${0:w}, [$1]\", \"r,r,~{memory}\"(i16 "), narrow)
     assert(!narrow.contains("(i1 ") && !narrow.contains("(i12 "), narrow)
 end vpa_ir_narrow_integers
-
-@test("a u128, which no one instruction moves, keeps LLVM's load volatile on AArch64")
-vpa_ir_wide_is_llvm_volatile()
-    val got = vpa_ir("aarch64-freestanding")
-
-    if got.is_none() then return
-
-    val wide = vpa_define(got.unwrap(), "wide")
-
-    assert(wide.contains("load volatile i128"), wide)
-    assert(wide.contains("store volatile i128"), wide)
-    assert(!wide.contains("asm"), wide)
-end vpa_ir_wide_is_llvm_volatile
 
 @test("the suites asking which accesses are volatile read each AArch64 asm back as the access it is")
 vpa_reads_back_as_llvm()

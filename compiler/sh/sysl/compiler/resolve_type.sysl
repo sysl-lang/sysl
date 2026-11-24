@@ -218,6 +218,18 @@ private storage_aggregate(t: Type, inner: TypeRef, written: string) -> string = 
     Vector(_, _, _) -> "a vector is several lanes. Declare a struct whose fields are volatile, as 'n: volatile u64'"
     _ -> ""
 
+// On AArch64 a volatile access is one plain `ldr` or `str`, which moves at most eight bytes: a wider
+// scalar has no one instruction (LLVM would pair two registers), so it is refused there. Every other
+// processor keeps the access it has.
+private a64_wide_ok(a: &Analysis, scope: Scope, span: Span, shown: string, bits: int) -> bool
+    if a.tables.target.cpu != Aarch64 || bits <= 64 then return true
+
+    a.fault(scope, span, s"'volatile $shown' is not a type on ${a.tables.target.name}: it is $bits bits " +
+            "wide, and an AArch64 volatile access is one 'ldr' or 'str' of at most 8 bytes (64 bits). " +
+            "Make two 64-bit volatile accesses instead, as two 'volatile u64' fields or elements")
+    false
+end a64_wide_ok
+
 // Whether a `volatile` may qualify this type. The qualifier promises exactly the one load or the one
 // store the source wrote, so it means something only where an access is one instruction; a register
 // block is qualified one field at a time, and anything counted is refused outright.
@@ -236,9 +248,9 @@ private volatile_admits(a: &Analysis, scope: Scope, span: Span, t: Type) -> bool
 
     val why = underlying(t) match
         Unknown -> return false
-        Integer(_, _, _) -> return true
-        Fixed(_, _, _) -> return true
-        Floating(_, _) -> return true
+        Integer(bits, _, wide) -> return a64_wide_ok(a, scope, span, shown, if wide then 0 else bits)
+        Fixed(bits, _, _) -> return a64_wide_ok(a, scope, span, shown, bits)
+        Floating(bits, _) -> return a64_wide_ok(a, scope, span, shown, bits)
         Char -> return true
         Bool -> return true
         Enum(d) ->
