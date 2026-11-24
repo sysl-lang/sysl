@@ -3991,6 +3991,36 @@ wait_for(n: u64)
   field is reached at its own address, never lifted out of the block; copying a whole block is an
   access to every register in it; `&regs.status` is a `*volatile u32`; a type parameter never binds a
   qualified type.
+- **On AArch64 a volatile access is one plain load or store of the declared width** — `ldrb`/`strb`,
+  `ldrh`/`strh`, `ldr`/`str` of a `w` or `x` register, the address a bare register: never written back
+  to the base (`ldr x9, [x0], #-8`), never one half of an `ldp`/`stp`, never through a floating-point
+  register, never merged or split. That is the form a hypervisor can emulate: an access of any other
+  form traps at a device with no syndrome (ISV=0), and QEMU under HVF stops on it. The compiler writes
+  each access as an `asm` of that one instruction, because LLVM may otherwise fold a volatile load in a
+  loop walking down registers into a post-indexed one — Linux's `readl`/`writel` are `asm` for the same
+  reason. It holds at every optimisation level and under LTO, and it costs only what the optimizer
+  might have folded. A `bool` and an integer narrower than its storage (`u12`) move their storage's
+  width (`ldrb`, `ldrh`), a float an integer register's; a `u128` has no one instruction and is LLVM's
+  volatile (an `ldp`). Every other processor keeps LLVM's `load volatile`: x86 decodes the faulting
+  instruction itself, and RISC-V has no writeback addressing.
+
+A loop walking down a FIFO's registers is the shape LLVM folds. Each read of `*at` here is
+`ldr x9, [x0]` and then a separate `sub x0, x0, #8`, never the one `ldr x9, [x0], #-8` an ordinary load
+would become:
+
+```sysl build=c target=aarch64-freestanding
+@export("drain")
+drain(fifo: *volatile u64, n: int) -> u64
+    var at = fifo
+    var sum: u64 = 0
+
+    for i in 0..<n
+        sum ^= *at
+        at = &at[-1]
+
+    sum
+end drain
+```
 - **`volatile` is not reserved** — special only before a type, as `sync` is after `&`. `[]const
   volatile u32` is a read-only register view: `const` is the view's property, `volatile` the
   element's.
