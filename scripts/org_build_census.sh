@@ -280,10 +280,13 @@ row() {
 # the warning a `package.hocon` manifest draws ("names its manifest package.hocon"), so a row quoting
 # it read as though the manifest were the refusal, and a test that failed under load looked like a
 # repository the compiler refused. The reason is the first `FAIL`, with the panic under it, else the
-# first `error`, else the first line that is not that warning.
+# first line that BEGINS with `error` (or `sysl: error`) -- a passing test line such as "answer the
+# refusals as errors" holds the word and is not a diagnostic -- else the first line holding `error`,
+# else the first line that is not that warning.
 why() {
     # Each lookup may find nothing, which must not end a script running under `set -e`.
     why_line=$(grep -m1 -A3 '^  FAIL ' "$1" | grep -v '^  *at ' | tr -s ' \n' ' ' || true)
+    [ -n "$why_line" ] || why_line=$(grep -m1 -E '^(sysl: )?error' "$1" || true)
     [ -n "$why_line" ] || why_line=$(grep -m1 'error' "$1" || true)
     [ -n "$why_line" ] || why_line=$(grep -v 'names its manifest' "$1" | grep -m1 . || true)
     [ -n "$why_line" ] || why_line=$(head -1 "$1")
