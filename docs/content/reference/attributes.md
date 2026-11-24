@@ -5444,9 +5444,10 @@ narrowed. That is the AAPCS rule for volatile bitfields, and what a peripheral r
 device may ignore, or fault on, an access narrower than its register. As with today's bitfields, the
 qualifier on any field of a unit qualifies every access to that unit, and nothing diagnoses what a
 read-modify-write costs a register whose read clears it. Under `@packed` a volatile field that lies
-across two units of its declared type has no single access to make, and is refused. On AArch64 each of
-those unit accesses is one plain `ldr`/`str` of the unit's width from a bare register address, as
-every volatile access is there ([memory](/reference/memory/#device-memory)).
+across two units of its declared type has no single access to make, and is refused. On AArch64, and on
+32-bit ARM for a unit of 4 bytes or fewer, each of those unit accesses is one plain `ldr`/`str` of the
+unit's width from a bare register address, as every such volatile access is there
+([memory](/reference/memory/#device-memory)).
 
 `@packed` on such a struct is GNU's `packed` (MSVC's `pack(1)`): the fields abut bit for bit, and
 `@align(n)` raises it as it raises any struct. The two kinds of bitfield do not mix in one struct — a

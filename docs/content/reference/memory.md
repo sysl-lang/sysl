@@ -4002,9 +4002,18 @@ wait_for(n: u64)
   might have folded. A `bool` and an integer narrower than its storage (`u12`) move their storage's
   width (`ldrb`, `ldrh`), a float an integer register's. **A volatile wider than 64 bits is refused on AArch64**
   — a `u128`, an `i128` or any wider integer has no one instruction, and LLVM's volatile of it is an
-  `ldp`/`stp` pair, the form a hypervisor cannot emulate. Write two 64-bit volatile accesses. Every other
-  processor keeps LLVM's `load volatile`: x86 decodes the faulting instruction itself, and RISC-V has no
-  writeback addressing, so a `volatile u128` is accepted there.
+  `ldp`/`stp` pair, the form a hypervisor cannot emulate. Write two 64-bit volatile accesses.
+- **On 32-bit ARM — every Thumb target, ARMv6-M to ARMv8-M — a volatile access of 1, 2 or 4 bytes is
+  the same one plain instruction**: `ldrb`/`strb`, `ldrh`/`strh`, `ldr`/`str` of a general register,
+  the address a bare register — never written back (`ldr r3, [r2], #4`), never an `ldm`/`stm` (an M0+'s
+  `ldm r2!, {r3}`), never an `ldrd`/`strd`, never through a floating-point register (`vldr s2, [r0]`).
+  An exception may abandon an `ldm`, `stm`, `ldrd` or `strd` part-way and run it again from the start,
+  reading a read-to-clear register twice; one `ldr` is done or not begun. It is an `asm` here too, at every
+  optimisation level and under LTO, and a `bool`, a `u12`, a float and a pointer move as they do on
+  AArch64. A volatile of 8 bytes (`u64`, `f64`) is two words on these machines and keeps LLVM's
+  `load volatile`, which may be an `ldrd` or two `ldr`s.
+- **Every other processor keeps LLVM's `load volatile`**: x86 decodes the faulting instruction itself,
+  and RISC-V has no writeback addressing, so a `volatile u128` is accepted there.
 
 ```sysl target=aarch64-freestanding
 struct Regs

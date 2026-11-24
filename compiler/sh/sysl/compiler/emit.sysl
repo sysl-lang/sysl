@@ -895,38 +895,46 @@ end fresh_label
 emit(e: *Emit, i: Inst)
     if e.terminated then return
 
-    if e.target.cpu == Aarch64 then emit_a64_access(e, i) else e.current.push(i)
+    e.target.cpu match
+        Aarch64 -> emit_plain_access(e, i, false)
+        Thumb -> emit_plain_access(e, i, true)
+        _ -> e.current.push(i)
 end emit
 
-// On AArch64, a volatile load or store that one plain instruction can make is marked to be written as
-// that instruction (`AccVolatileA64`): one `ldr` or `str` of its declared width from a bare register
-// address, never written back to the register, paired, merged or split. An integer narrower than its
-// storage (`a64_narrow`) is moved at the storage's width and converted beside it, as LLVM's own `load`
-// and `store` of it would be.
-private emit_a64_access(e: *Emit, i: Inst)
+// On AArch64 and on 32-bit ARM (`arm`), a volatile load or store that one plain instruction can make is
+// marked to be written as that instruction (`AccVolatileA64`, `AccVolatileArm`): one `ldr` or `str` of
+// its declared width from a bare register address, never written back to the register, paired, made
+// one of a multiple, merged or split. An integer narrower than its storage (`a64_narrow`) is moved at
+// the storage's width and converted beside it, as LLVM's own `load` and `store` of it would be.
+private emit_plain_access(e: *Emit, i: Inst, arm: bool)
+    val acc = if arm then AccVolatileArm else AccVolatileA64
+
     i match
-        InLoad(d, ty, p, AccVolatile, align) if a64_volatile_bytes(ty, align).is_some() ->
-            val bytes = a64_volatile_bytes(ty, align).unwrap()
+        InLoad(d, ty, p, AccVolatile, align) if plain_fits(ty, align, arm).is_some() ->
+            val bytes = plain_fits(ty, align, arm).unwrap()
 
             if a64_narrow(ty, bytes)
                 val wide = fresh_reg(e)
 
-                e.current.push(InLoad(wide, LInt(bytes * 8), p, AccVolatileA64, align))
+                e.current.push(InLoad(wide, LInt(bytes * 8), p, acc, align))
                 e.current.push(InCast(d, CastTrunc, LInt(bytes * 8), wide, ty))
             else
-                e.current.push(InLoad(d, ty, p, AccVolatileA64, align))
-        InStore(ty, v, p, AccVolatile, align) if a64_volatile_bytes(ty, align).is_some() ->
-            val bytes = a64_volatile_bytes(ty, align).unwrap()
+                e.current.push(InLoad(d, ty, p, acc, align))
+        InStore(ty, v, p, AccVolatile, align) if plain_fits(ty, align, arm).is_some() ->
+            val bytes = plain_fits(ty, align, arm).unwrap()
 
             if a64_narrow(ty, bytes)
                 val wide = fresh_reg(e)
 
                 e.current.push(InCast(wide, CastZExt, ty, v, LInt(bytes * 8)))
-                e.current.push(InStore(LInt(bytes * 8), wide, p, AccVolatileA64, align))
+                e.current.push(InStore(LInt(bytes * 8), wide, p, acc, align))
             else
-                e.current.push(InStore(ty, v, p, AccVolatileA64, align))
+                e.current.push(InStore(ty, v, p, acc, align))
         _ -> e.current.push(i)
-end emit_a64_access
+end emit_plain_access
+
+private plain_fits(ty: LType, align: Option[int], arm: bool) -> Option[int] =
+    if arm then arm_volatile_bytes(ty, align) else a64_volatile_bytes(ty, align)
 
 // Emits a stack slot into the function's entry block rather than where it is needed. Every name is
 // unique within a function, so hoisting is safe -- and it keeps a slot inside a loop from growing
