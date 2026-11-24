@@ -2366,7 +2366,23 @@ private every_branch_guesses(cx: &Analyzer, e: Expr, open: Option[Buf[string]]) 
 // bind it, or a branch an `is` test opens, the name may be one the reading has yet to declare.
 literal_valued(cx: &Analyzer, e: Expr) -> bool = literal_valued_at(cx, e, true)
 
+// Inside an operator being read, an operator node's answer with names believed is kept
+// (`Analyzer.valued_answers`), as `const_arith_default`'s is.
 private literal_valued_at(cx: &Analyzer, e: Expr, names: bool) -> bool
+    if !names || cx.operator_depth == 0 || !operator_node(e) then return literal_valued_here(cx, e, names)
+
+    val key = usize(&*e.kind)
+    val known = cx.valued_answers.get(key)
+
+    if known.is_some() then return known.unwrap().1
+
+    val out = literal_valued_here(cx, e, names)
+
+    cx.valued_answers.put(key, (e, out))
+    out
+end literal_valued_at
+
+private literal_valued_here(cx: &Analyzer, e: Expr, names: bool) -> bool
     if is_literal(e) then return true
 
     *e.kind match
@@ -2388,15 +2404,20 @@ private literal_valued_at(cx: &Analyzer, e: Expr, names: bool) -> bool
             finished
         Block(stmts) -> literal_block(cx, stmts, names)
         // A shift is its left operand's type whatever the count is, so `1 << bit` is a literal's
-        // value as much as `1` is; and arithmetic over such values is one too.
+        // value as much as `1` is; and arithmetic over such values is one too. An operator asks this of
+        // its operands at every level of a chain, so the operand that is not itself an operator is
+        // asked first: the next term of a left-nested chain settles it without the chain below.
         Binary(op, l, r) ->
             if op == "<<" || op == ">>" then literal_valued_at(cx, l, names)
-            else op != "&&" && op != "||" && literal_valued_at(cx, l, names) && literal_valued_at(cx, r, names)
+            else if op == "&&" || op == "||" then false
+            else if operator_node(l) && !operator_node(r) then
+                literal_valued_at(cx, r, names) && literal_valued_at(cx, l, names)
+            else literal_valued_at(cx, l, names) && literal_valued_at(cx, r, names)
         Unary(op, operand) -> (op == "-" || op == "~") && literal_valued_at(cx, operand, names)
         Ident(_) -> names && untyped_const_read(cx, e)
         Field(_, _, _) -> names && untyped_const_read(cx, e)
         _ -> false
-end literal_valued_at
+end literal_valued_here
 
 // Whether a condition tests a pattern anywhere, so the branch it opens may bind names.
 private tests_pattern(cond: Expr) -> bool = *cond.kind match

@@ -469,6 +469,38 @@ convention asks for, and the call converts each value into and out of them. The 
 wrote is unchanged, nothing about it is visible in a program, and nothing about it applies to a
 struct handed over behind a `*T`.
 
+**On Windows x64, a struct holding an empty struct does not cross by value.** An empty struct
+occupies no bytes in sysl, and none in C on every other target here — but Microsoft's C gives one
+four. An empty struct on its own still crosses, in the slot that C gives it; held as a field inside a
+struct that occupies bytes, it moves every field after it, so the two sides would disagree about the
+struct's size and where each field is. sysl keeps its own layout and refuses the crossing — as an
+`extern`'s parameter or result, or an `@export`'s — on that target alone, at any depth and through
+an array of empty structs as well. Built for `x86_64-windows`, this
+
+```sysl
+struct Empty
+end Empty
+
+struct Tagged
+    id: i32
+    mark: Empty
+    len: i32
+
+extern send(t: Tagged)
+
+send(Tagged(1, Empty(), 2))
+```
+
+is refused with
+
+```text
+error: 't' of the 'extern' 'send' is Tagged, whose field 'mark' is Empty: an empty struct occupies no bytes in sysl and four in Microsoft's C on 'x86_64-windows', so Tagged is laid out differently on the two sides of the call. Give the empty struct a field, or take 'mark' out of Tagged
+```
+
+and built for any other target it compiles. Give the empty struct a field, or leave it out of the struct C sees. A pointer to such a struct is
+not refused: the pointer is one register on both sides, and what C reads through it is the
+programmer's business, as above.
+
 **A [vector](/reference/vectors/) is the one shape that does not cross, in either direction.** Which
 register a `<4>f32` arrives in differs by target *and* by which instruction-set extensions the other
 side was compiled with — the same C source built with and without `-mavx2` does not agree — so there
