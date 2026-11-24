@@ -317,7 +317,11 @@ receive(k: &Carrier, want: usize) -> int
 ```
 
 What is held is what a frame owns a count of at the call: a local, a binding a `match` took a share
-of, a counted temporary of the expression around the call. A scalar, a `*T` and a `&sync T` are not
+of, a counted temporary of the expression around the call, and a parameter the function keeps, which
+a direct call hands over with a count of its own
+([A parameter the function keeps arrives with its count](/reference/memory/#a-parameter-the-function-keeps-arrives-with-its-count)) —
+held from entry to the end of the body, as a local declared there would be. A parameter the function
+only reads is its caller's to hold, and holds nothing here. A scalar, a `*T` and a `&sync T` are not
 — the last has an atomic count. Nor is a local holding a view that owns no count: a literal's bytes,
 a view of a `*T`, of an array laid in the frame or in module storage, or of another such local, so
 long as nothing writes it a counted value, takes its address or binds a `ref` to it. Nor is a local
@@ -358,6 +362,30 @@ print(receive(k, 2))
 
 ```output
 2
+```
+
+A parameter the function keeps has no block to end, so it is held across every call in the body
+that can switch — even one after it was stored:
+
+```sysl
+import sysl.fiber.{Context, switch}
+
+struct Holder
+    name: string
+
+var home = Context.new()
+var away = Context.new()
+
+wait()
+    switch(&away, &home)
+
+keep(s: string, out: &Holder)
+    out.name = s
+    wait()
+```
+
+```error
+'wait' can reach 'sysl.fiber.switch', which may resume this fiber on another thread, and this frame holds the parameter 's' (handed over with a count of its own, which this frame then gives back or keeps) across the call
 ```
 
 **A body whose fiber is only ever resumed on the thread it began on says so with
