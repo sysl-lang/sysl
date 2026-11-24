@@ -503,6 +503,127 @@ fcr_lent_slice_of_parameter()
         work(b: []const u8) -> usize = send(b[1..<3]) + send(b[0..<4][1..<2])
         """)
 
+// **An owned parameter is the frame's own count** (`owned_params.sysl`): a function that keeps its
+// parameter on every way out -- a store through a `&T` here -- is handed it with a count, which it
+// moves into the store or gives back at its exit. The check asks the emitter's own answer, and holds
+// such a parameter as a local declared at entry is held: to the end of the body. A parameter kept on
+// some paths only stays borrowed (the keeping path takes its own count where it stores), and holds
+// nothing. Each shape is asked with the short string form off and on.
+private fcr_holder() -> string = raw"""
+    struct Holder
+        name: string
+
+    """
+
+private fcr_owned_held() -> string = "the parameter 's' (handed over with a count of its own, which this frame then gives back or keeps)"
+
+@test("an owned parameter stored before the call and read after it is refused, naming the parameter")
+fcr_owned_param_read_after()
+    fcr_held_both(fcr_holder() + raw"""
+        keep(s: string, out: &Holder)
+            out.name = s
+            wait()
+            print(s)
+        """, fcr_owned_held(), "sched.wait")
+
+@test("an owned parameter moved into its store after the call is refused")
+fcr_owned_param_moved_after()
+    fcr_held_both(fcr_holder() + raw"""
+        keep(s: string, out: &Holder)
+            wait()
+            out.name = s
+        """, fcr_owned_held(), "sched.wait")
+
+@test("an owned parameter last read before the call, whose count is given back at the exit, is refused")
+fcr_owned_param_read_before()
+    fcr_held_both(fcr_holder() + raw"""
+        keep(s: string, out: &Holder)
+            out.name = s
+            print(s)
+            wait()
+        """, fcr_owned_held(), "sched.wait")
+
+// The emitter moves the count into the store here, so nothing is held at the call -- but the check
+// holds an owned parameter to the end of the body, as it holds a local moved before the call
+// (`fcr_dead_before_the_call` is the local's way out; `@pinned(thread)` is the parameter's).
+@test("an owned parameter moved into its store before the call is held to the end of the body, as a local is")
+fcr_owned_param_moved_before()
+    fcr_held_both(fcr_holder() + raw"""
+        keep(s: string, out: &Holder)
+            out.name = s
+            wait()
+        """, fcr_owned_held(), "sched.wait")
+
+@test("an owned parameter kept by handing it to another function's owned parameter is refused")
+fcr_owned_param_handed_on()
+    fcr_held_both(fcr_holder() + raw"""
+        store(s: string, out: &Holder)
+            out.name = s
+
+        keep(s: string, out: &Holder)
+            wait()
+            store(s, out)
+        """, fcr_owned_held(), "sched.wait")
+
+@test("a parameter the function only reads is borrowed and holds nothing across the call")
+fcr_borrowed_param_accepted()
+    fcr_lent(fcr_holder() + raw"""
+        look(s: string, out: &Holder)
+            wait()
+            print(s, out.name)
+        """)
+
+@test("a parameter kept on some paths only stays borrowed and holds nothing across the call")
+fcr_param_kept_on_some_paths_accepted()
+    fcr_lent(fcr_holder() + raw"""
+        maybe(s: string, out: &Holder, flag: bool)
+            if flag then out.name = s
+            wait()
+        """)
+
+@test("'@pinned(thread)' accepts an owned parameter held across the switch")
+fcr_owned_param_pinned_accepted()
+    fcr_lent(fcr_holder() + raw"""
+        @pinned(thread)
+        keep(s: string, out: &Holder)
+            out.name = s
+            wait()
+            print(s)
+        """)
+
+@test("an owned parameter of a body that calls nothing that can switch is accepted")
+fcr_owned_param_no_switch_accepted()
+    fcr_lent(fcr_holder() + raw"""
+        keep(s: string, out: &Holder)
+            print(add(1, 2))
+            out.name = s
+        """)
+
+@test("an owned parameter holding only scalars carries no count and is accepted")
+fcr_owned_scalar_param_accepted()
+    fcr_lent(raw"""
+        var boxes: [4]Box = [Box(0); 4]
+
+        keep(b: Box)
+            wait()
+            boxes[0] = b
+        """)
+
+@test("a '@unique' parameter with a destructor is always handed over, and its string field is held across the call")
+fcr_unique_param_refused()
+    fcr_held_both(raw"""
+        @unique
+        struct Res
+            name: string
+
+        impl Drop for Res
+            drop(self) = print("drop", self.name)
+
+        use(r: Res)
+            wait()
+            print(r.name)
+        """, "the parameter 'r' (handed over with a count of its own, which this frame then gives back or keeps)", "sched.wait")
+
 @test("a view of a frame array inside a struct local holds no count")
 fcr_lent_array_in_struct()
     fcr_lent(fcr_send() + raw"""
@@ -693,12 +814,22 @@ fcr_local_reference_and_closure_refused()
             send("x".bytes) + usize(b.n)
         """, "'b'", "send")
     fcr_held_both(fcr_send() + raw"""
-        work(a: string) -> usize
+        work(a: int) -> usize
             val f: &Fn() -> unit = () -> print(a)
             val n = send("x".bytes)
             f()
             n
         """, "'f'", "send")
+
+    // A closure that captures a counted parameter keeps it, so the parameter is handed over with a
+    // count and held from entry -- named before the closure that took it.
+    fcr_held_both(fcr_send() + raw"""
+        work(a: string) -> usize
+            val f: &Fn() -> unit = () -> print(a)
+            val n = send("x".bytes)
+            f()
+            n
+        """, "the parameter 'a' (handed over with a count of its own, which this frame then gives back or keeps)", "send")
 
 @test("a local holding a view of a view parameter, handed to a call that reaches the switch, holds nothing")
 fcr_local_view_of_parameter()

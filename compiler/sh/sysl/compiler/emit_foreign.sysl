@@ -59,7 +59,7 @@ foreign_signature(e: *Emit, ret_ty: Type, params: Buf[Type], variadic: bool) -> 
         _ -> ()
 
     for p in params
-        if !zero_sized(p) then foreign_params(e, p, &out)
+        if c_crosses(e.layout, p, e.target) then foreign_params(e, p, &out)
 
     val form = foreign_result(e, ret_ty)
 
@@ -132,7 +132,18 @@ gen_foreign_call(e: *Emit, what: CallForm, callee: Val, args: Buf[TExpr], ty: Ty
         val at = texpr_type(a)
         val v = to_c(e, gen_expr(e, a), at, i < kept.len() && kept[i])
 
-        if !zero_sized(at)
+        // An empty aggregate that takes a slot (Windows x64) has no bytes of its own to put there: the
+        // slot is filled with nothing in particular, as clang fills it from an uninitialised local.
+        if zero_sized(at)
+            if c_hollow(e.layout, at, e.target).is_some()
+                c_param(e.layout, at, e.target) match
+                    CpCoerced(pieces) ->
+                        for item in pieces
+                            arguments.push(IrArg(item.ty, VUndef, buf()))
+                    CpIndirect(cty, align, _) ->
+                        arguments.push(IrArg(LPtr, alloca(e, fresh_reg(e), cty), align_attrs(align)))
+                    CpPlain -> ()
+        else
             c_param(e.layout, at, e.target) match
                 // The extension is stated at the call as well as on the declaration, because it is
                 // the **caller's** obligation and the call is where the caller is.
@@ -145,6 +156,15 @@ gen_foreign_call(e: *Emit, what: CallForm, callee: Val, args: Buf[TExpr], ty: Ty
                     arguments.push(IrArg(LPtr, slot,
                                          if byval then byval_attrs(cty, align)
                                          else align_attrs(align)))
+
+    // An empty result that C hands back in a register or through storage (Windows x64) holds nothing
+    // to read back: the call is made in C's shape and the value is the type's only one.
+    if zero_sized(ty) && c_hollow(e.layout, ty, e.target).is_some()
+        result match
+            CrCoerced(_) -> emit(e, form_call(what, Some(fresh_reg(e)), callee, arguments, twice))
+            _ -> emit(e, form_call(what, None, callee, arguments, twice))
+
+        return zero_of(e, ty)
 
     result match
         CrSret(coerced, _) ->
