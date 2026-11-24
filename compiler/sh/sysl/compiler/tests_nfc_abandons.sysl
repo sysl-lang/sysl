@@ -415,3 +415,110 @@ nfc_not_erased()
         """)
 
     assert(said.contains("can reach a call that abandons every frame below it, and a call through a trait object cannot be followed there"), said)
+
+// -- a frame array promoted to the heap ------------------------------------------------------------
+//
+// An array a view of which outlives the frame lives in a counted buffer (`escape.sysl`), and the box is
+// the frame's own count from the declaration to the end of its block. Held across a call that can
+// reach an abandoning one, the box is never given back -- the same decision the fiber walk makes
+// (`tests_fcr_fiber_counted_refusal.sysl`), asked of the same escape walk. Each program is asked with
+// the short string form off and on; `work` begins on line 8.
+
+private nfc_leave() -> string = raw"""
+    @abandons
+    leave(code: int) -> never
+        exit(code)
+
+    handle(n: usize)
+        if n == 2 then leave(0)
+
+    """
+
+private nfc_promoted() -> string = "'handle' can reach a call that abandons every frame below it and never comes back, and this frame holds the array 'a' (promoted to the heap, because a view of it outlives the frame) across the call"
+
+// The program is refused, naming the promoted array at the call at `at`, with short strings off and on.
+private nfc_promoted_refused(body: string, at: string)
+    for short in [false, true]
+        force_short_strings(short)
+
+        val said = nfc_ir(nfc_leave() + body)
+
+        assert(said.contains(nfc_promoted()), said)
+        assert(said.contains(s"--> main.sysl:$at\n"), said)
+
+    unforce_short_strings()
+
+// The program builds, runs to the abandoning call and leaves nothing on the counted heap, with short
+// strings off and on.
+private nfc_promoted_clean(body: string)
+    if !nfc_ready() then return
+
+    for short in [false, true]
+        force_short_strings(short)
+
+        val run = nfc_run(nfc_leave() + body)
+
+        assert(run.ok, run.out)
+        assert(run.out == "", run.out)
+        assert(alloc_count_reported(run.err) == 0, run.err)
+
+    unforce_short_strings()
+
+@test("a promoted frame array lent as a temporary across a call that can abandon is refused, naming the array")
+nfc_promoted_array_inline_refused()
+    nfc_promoted_refused(raw"""
+        work(n: usize) -> []u8
+            var a: [16]u8 = [0; 16]
+            handle(a[0..<2].len)
+            a[0..<n]
+
+        print(work(3).len)
+        """, "10:5")
+
+@test("a local view of a promoted frame array held across a call that can abandon is refused, naming the array")
+nfc_promoted_array_local_view_refused()
+    nfc_promoted_refused(raw"""
+        work(n: usize) -> []u8
+            var a: [16]u8 = [0; 16]
+            val v = a[0..<2]
+            handle(v.len)
+            a[0..<n]
+
+        print(work(3).len)
+        """, "11:5")
+
+@test("a promoted array is held to the end of its block: a last use before the abandoning call is still refused")
+nfc_promoted_array_used_before_refused()
+    nfc_promoted_refused(raw"""
+        work(n: usize) -> []u8
+            var a: [16]u8 = [0; 16]
+            val out = a[0..<n]
+            handle(2)
+            out
+
+        print(work(3).len)
+        """, "11:5")
+
+@test("the same frame array with no view outliving the frame holds nothing across the call, and leaks nothing")
+nfc_unpromoted_array_accepted()
+    nfc_promoted_clean(raw"""
+        work(n: usize) -> u8
+            var a: [16]u8 = [0; 16]
+            handle(a[0..<2].len)
+            a[0]
+
+        print(work(3))
+        """)
+
+@test("a promoted array whose block ends before the call holds nothing across it, and leaks nothing")
+nfc_promoted_array_dead_before_accepted()
+    nfc_promoted_clean(raw"""
+        work(n: usize) -> []const u8
+            if n > 8
+                var a: [16]u8 = [0; 16]
+                return a[0..<n]
+            handle(2)
+            "".bytes
+
+        print(work(3).len)
+        """)
