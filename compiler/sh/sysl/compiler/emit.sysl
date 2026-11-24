@@ -893,7 +893,40 @@ end fresh_label
 
 // Emits a plain instruction, unless the current block is already terminated.
 emit(e: *Emit, i: Inst)
-    if !e.terminated then e.current.push(i)
+    if e.terminated then return
+
+    if e.target.cpu == Aarch64 then emit_a64_access(e, i) else e.current.push(i)
+end emit
+
+// On AArch64, a volatile load or store that one plain instruction can make is marked to be written as
+// that instruction (`AccVolatileA64`): one `ldr` or `str` of its declared width from a bare register
+// address, never written back to the register, paired, merged or split. An integer narrower than its
+// storage (`a64_narrow`) is moved at the storage's width and converted beside it, as LLVM's own `load`
+// and `store` of it would be.
+private emit_a64_access(e: *Emit, i: Inst)
+    i match
+        InLoad(d, ty, p, AccVolatile, align) if a64_volatile_bytes(ty, align).is_some() ->
+            val bytes = a64_volatile_bytes(ty, align).unwrap()
+
+            if a64_narrow(ty, bytes)
+                val wide = fresh_reg(e)
+
+                e.current.push(InLoad(wide, LInt(bytes * 8), p, AccVolatileA64, align))
+                e.current.push(InCast(d, CastTrunc, LInt(bytes * 8), wide, ty))
+            else
+                e.current.push(InLoad(d, ty, p, AccVolatileA64, align))
+        InStore(ty, v, p, AccVolatile, align) if a64_volatile_bytes(ty, align).is_some() ->
+            val bytes = a64_volatile_bytes(ty, align).unwrap()
+
+            if a64_narrow(ty, bytes)
+                val wide = fresh_reg(e)
+
+                e.current.push(InCast(wide, CastZExt, ty, v, LInt(bytes * 8)))
+                e.current.push(InStore(LInt(bytes * 8), wide, p, AccVolatileA64, align))
+            else
+                e.current.push(InStore(ty, v, p, AccVolatileA64, align))
+        _ -> e.current.push(i)
+end emit_a64_access
 
 // Emits a stack slot into the function's entry block rather than where it is needed. Every name is
 // unique within a function, so hoisting is safe -- and it keeps a slot inside a loop from growing
