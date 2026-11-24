@@ -552,7 +552,7 @@ private c_windows(size: int) -> CShape =
 // length times its element's, and never less than four for a struct, because the rule is about the
 // struct and not about what it holds (`struct { int z[0]; }` is 4 as well).
 c_hollow(l: TargetLayout, t: Type, target: Target) -> Option[int]
-    if target.cpu != X86_64 || target.os != Windows then return None
+    if !c_sizes_empty(target) then return None
 
     underlying(t) match
         Struct(_) -> if l.size(t) == 0 then Some(c_hollow_size(t)) else None
@@ -579,6 +579,47 @@ private c_hollow_size(t: Type) -> int = underlying(t) match
 
     Array(n, elem, _) -> n * c_hollow_size(*elem)
     _ -> 0
+
+// Whether the target's C gives an empty struct bytes of its own: Microsoft's does, four.
+c_sizes_empty(target: Target) -> bool = target.cpu == X86_64 && target.os == Windows
+
+// **An empty struct held inside one that occupies bytes has no layout both sides agree on** where the
+// target's C sizes an empty struct (`c_sizes_empty`). sysl gives it none, so `struct O { a: i32, e: E,
+// b: i32 }` is 8 bytes with `b` at 4; MSVC's C gives `e` four, so its `struct O` is 12 with `b` at 8
+// (clang `--target=x86_64-pc-windows-msvc -x c`), and it goes by address where sysl's would be one
+// register. sysl keeps its own layout and the boundary refuses such a struct by value instead.
+//
+// The answer is the first such field -- its path from `t`, dotted through the structs between, and the
+// empty struct it is or holds -- or nothing. An aggregate that occupies nothing itself is not asked:
+// it crosses in the C slot `c_hollow` gives it. An array of no elements is no bytes in either C
+// (`struct E z[0]` adds nothing to MSVC's size), and neither is a field of no struct (`unit`, `[0]i32`).
+c_nested_empty(l: TargetLayout, t: Type) -> Option[(string, Type)]
+    underlying(t) match
+        Struct(d) ->
+            if l.size(t) == 0 then return None
+
+            // Every declared field, since `stored()` is exactly the ones sysl gives room.
+            for item in d.fields
+                if empty_struct_in(l, item.1) then return Some((item.0, item.1))
+
+                c_nested_empty(l, item.1) match
+                    Some(found) -> return Some((s"${item.0}.${found.0}", found.1))
+                    None -> ()
+
+            None
+        Array(_, elem, _) -> c_nested_empty(l, *elem)
+        _ -> None
+end c_nested_empty
+
+// Whether a type occupies nothing in sysl and is, or is an array of, a struct -- which MSVC's C sizes.
+private empty_struct_in(l: TargetLayout, t: Type) -> bool
+    if l.size(t) != 0 then return false
+
+    underlying(t) match
+        Struct(_) -> true
+        Array(n, elem, _) -> n > 0 && empty_struct_in(l, *elem)
+        _ -> false
+end empty_struct_in
 
 // -- WebAssembly -------------------------------------------------------------------------------------
 

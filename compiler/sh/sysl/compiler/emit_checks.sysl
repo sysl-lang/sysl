@@ -54,6 +54,8 @@ private checks_before_lowering(a: &Analysis, p: TProgram, own: Buf[string],
     check_done("exported_constants")
     check_quad_externs(a, emitted)
     check_done("quad_externs")
+    check_nested_empty_externs(a, emitted)
+    check_done("nested_empty_externs")
     check_general_regs(a, emitted, own, pruned)
     check_done("general_regs")
     promotions
@@ -1275,6 +1277,9 @@ private export_signature(a: &Analysis, f: TFunc)
             a.fault(scope, f.span, s"'${p.0}' of the variadic export '${qualified_name(f.name)}' is " +
                     s"${type_show(p.1)}, an aggregate — ${variadic_export_reason()}. Take a pointer " +
                     "to it")
+        else if nested_empty_here(a, p.1).is_some()
+            a.fault(scope, f.span, s"'${p.0}' of the exported '${qualified_name(f.name)}' is " +
+                    nested_empty_reason(a, p.1, nested_empty_here(a, p.1).unwrap()))
 
     // A `va_list` result was refused where the signature was read, for every function.
     if no_value(f.ret_ty) || mentions_unknown(f.ret_ty) then return
@@ -1291,6 +1296,9 @@ private export_signature(a: &Analysis, f: TFunc)
         a.fault(scope, f.span, s"the variadic export '${qualified_name(f.name)}' returns " +
                 s"${type_show(f.ret_ty)}, an aggregate — ${variadic_export_reason()}. Return it " +
                 "through a pointer parameter")
+    else if nested_empty_here(a, f.ret_ty).is_some()
+        a.fault(scope, f.span, s"the exported '${qualified_name(f.name)}' returns " +
+                nested_empty_reason(a, f.ret_ty, nested_empty_here(a, f.ret_ty).unwrap()))
 end export_signature
 
 // An `extern` whose signature holds an `f128`, on a machine where C has no binary128 type -- the
@@ -1328,6 +1336,58 @@ check_quad_externs(a: &Analysis, p: TProgram)
             a.fault(at.scope, at.span, s"the 'extern' '${d.name}' returns ${type_show(x.ret_ty)}, " +
                     quad_unspellable(t))
 end check_quad_externs
+
+// An `extern` that hands over or answers, by value, a struct holding an empty struct, on a machine
+// whose C gives an empty struct bytes (`cabi.sysl`'s `c_nested_empty`): the C function was compiled
+// to a layout of that struct sysl does not share. Asked of the externs the program reached, as
+// `check_quad_externs` is.
+check_nested_empty_externs(a: &Analysis, p: TProgram)
+    if !c_sizes_empty(a.tables.target) then return
+
+    for x in p.externs
+        val home = a.tables.extern_scopes.get(x.name)
+        val decl = a.tables.externs.get(x.name)
+
+        if home.is_none() || decl.is_none() then continue
+
+        val at = home.unwrap()
+        val d = decl.unwrap()
+
+        for i in 0..<x.params.len()
+            val ty = x.params[i]
+            val found = nested_empty_here(a, ty)
+
+            if found.is_none() then continue
+
+            val name = if i < d.params.len() then d.params[i].name else s"parameter ${i + 1}"
+
+            a.fault(at.scope, at.span, s"'$name' of the 'extern' '${d.name}' is " +
+                    nested_empty_reason(a, ty, found.unwrap()))
+
+        val answered = nested_empty_here(a, x.ret_ty)
+
+        if answered.is_some()
+            a.fault(at.scope, at.span, s"the 'extern' '${d.name}' returns " +
+                    nested_empty_reason(a, x.ret_ty, answered.unwrap()))
+end check_nested_empty_externs
+
+// The empty struct a type crossing by value holds inside a struct that is not empty, where the
+// target's C sizes one -- the field's path and its type -- or nothing.
+private nested_empty_here(a: &Analysis, t: Type) -> Option[(string, Type)]
+    if !c_sizes_empty(a.tables.target) || mentions_unknown(t) then return None
+
+    c_nested_empty(a.tables.layout, t)
+end nested_empty_here
+
+// The tail of the refusal, after "'v' of the 'extern' 'take' is" or "... returns".
+private nested_empty_reason(a: &Analysis, t: Type, found: (string, Type)) -> string
+    val shown = type_show(t)
+
+    s"$shown, whose field '${found.0}' is ${type_show(found.1)}: an empty struct occupies no bytes " +
+    s"in sysl and four in Microsoft's C on '${a.tables.target.name}', so $shown is laid out " +
+    "differently on the two sides of the call. Give the empty struct a field, or take " +
+    s"'${found.0}' out of $shown"
+end nested_empty_reason
 
 // Whether an `f128` in `f`'s signature is something C on `t` can call it with. The quad runtime's
 // routines are the exception: LLVM is their only caller, and it passes `fp128` the same way on every

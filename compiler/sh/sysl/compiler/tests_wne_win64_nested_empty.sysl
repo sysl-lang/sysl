@@ -1,0 +1,154 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// **An empty struct held inside a struct that occupies bytes is refused by value at the C boundary on
+// Windows x64**, because Microsoft's C gives an empty struct four bytes and sysl gives it none. Each
+// layout below is clang 21's, `clang --target=x86_64-pc-windows-msvc -x c -S -emit-llvm`:
+//
+//     struct E {};  struct O { int a; struct E e; int b; };
+//       sizeof(struct O) == 12, offsetof(struct O, b) == 8      (sysl: 8, and 4)
+//       void take(struct O)  ->  declare void @take(ptr noundef)  (sysl's 8 bytes would be one i64)
+//
+// A lone empty struct, or one made only of empty structs, crosses in the C slot it has there and is
+// not refused (`tests_cabi.sysl`); every other target's C gives an empty struct no bytes either.
+
+// Every error a program earns through the checks that run before lowering, on a named machine.
+private wne_said(text: string, target_name: string) -> string
+    val done = typed_of_target(text, target_named(target_name).unwrap())
+
+    post_analysis_checks(done.an, program_of(done, done.main_module), buf())
+
+    val errors = errors_of(done.an.diagnostics())
+
+    if errors.is_empty() then "" else analysis_report(errors)
+end wne_said
+
+private wne_has(said: string, part: string) = assert(said.contains(part), said)
+
+private wne_win() -> string = "x86_64-windows"
+
+private wne_shapes() -> string = "struct E\nend E\nstruct O\n    a: i32\n    e: E\n    b: i32\n"
+
+// The tail every refusal ends with, for a struct `shown` whose field `field` is the empty `empty`.
+private wne_reason(shown: string, field: string, empty: string) -> string =
+    s"$shown, whose field '$field' is $empty: an empty struct occupies no bytes in sysl and four in " +
+    s"Microsoft's C on 'x86_64-windows', so $shown is laid out differently on the two sides of the " +
+    s"call. Give the empty struct a field, or take '$field' out of $shown"
+
+// The same programs on every other convention: an empty struct is no bytes in their C as well.
+private wne_elsewhere(text: string)
+    for target in ["x86_64-linux", "aarch64-macos", "aarch64-linux", "riscv64-linux", "wasm32-freestanding"]
+        assert_eq(wne_said(text, target), "")
+end wne_elsewhere
+
+@test("an extern taking a struct with an empty struct field is refused on Windows x64")
+wne_direct_param_refused()
+    val text = s"${wne_shapes()}extern take(v: O)\ntake(O(1, E(), 2))\n"
+
+    wne_has(wne_said(text, wne_win()), s"'v' of the 'extern' 'take' is ${wne_reason("O", "e", "E")}")
+    wne_elsewhere(text)
+
+@test("an empty struct last in the struct is refused too, since MSVC still pads it to four bytes")
+wne_trailing_field_refused()
+    // `struct L { int a; struct E e; }` is 8 to MSVC and 4 to sysl.
+    val text = "struct E\nend E\nstruct L\n    a: i32\n    e: E\nextern take(v: L)\ntake(L(1, E()))\n"
+
+    wne_has(wne_said(text, wne_win()), s"'v' of the 'extern' 'take' is ${wne_reason("L", "e", "E")}")
+    wne_elsewhere(text)
+
+@test("an empty struct two structs down is refused, named by its path")
+wne_transitive_refused()
+    val text = s"${wne_shapes()}struct W\n    o: O\n    c: i32\nextern take(v: W)\ntake(W(O(1, E(), 2), 3))\n"
+
+    wne_has(wne_said(text, wne_win()), s"'v' of the 'extern' 'take' is ${wne_reason("W", "o.e", "E")}")
+    wne_elsewhere(text)
+
+// `struct H { struct E e; }` is 4 bytes to MSVC and none to sysl, so as a field it shifts what follows
+// exactly as a bare empty struct does: `struct T { int a; struct H h; int b; }` is 12.
+@test("a field of a struct made only of empty structs is refused, naming that struct")
+wne_hollow_struct_field_refused()
+    val text = "struct E\nend E\nstruct H\n    e: E\nstruct T\n    a: i32\n    h: H\n    b: i32\n" +
+               "extern take(v: T)\ntake(T(1, H(E()), 2))\n"
+
+    wne_has(wne_said(text, wne_win()), s"'v' of the 'extern' 'take' is ${wne_reason("T", "h", "H")}")
+    wne_elsewhere(text)
+
+// `struct A { int a; struct E arr[2]; int b; }` is 16 to MSVC and 8 to sysl.
+@test("an array of empty structs as a field is refused")
+wne_array_field_refused()
+    val text = "struct E\nend E\nstruct A\n    a: i32\n    arr: [2]E\n    b: i32\n" +
+               "extern take(v: A)\ntake(A(1, [E(), E()], 2))\n"
+
+    wne_has(wne_said(text, wne_win()), s"'v' of the 'extern' 'take' is ${wne_reason("A", "arr", "[2]E")}")
+    wne_elsewhere(text)
+
+// `union U { char c; struct E e; }` is 4 to MSVC and 1 to sysl.
+@test("a union with an empty struct member is refused")
+wne_union_member_refused()
+    val text = "struct E\nend E\nunion U\n    c: u8\n    e: E\nextern take(v: U)\ntake(U(c = 1))\n"
+
+    wne_has(wne_said(text, wne_win()), s"'v' of the 'extern' 'take' is ${wne_reason("U", "e", "E")}")
+    wne_elsewhere(text)
+
+@test("an extern answering a struct with an empty struct field is refused on Windows x64")
+wne_return_refused()
+    val text = s"${wne_shapes()}extern give() -> O\nextern keep(a: i32)\nkeep(give().a)\n"
+    val said = wne_said(text, wne_win())
+
+    wne_has(said, s"the 'extern' 'give' returns ${wne_reason("O", "e", "E")}")
+    assert(!said.contains("of the 'extern' 'give'"), said)
+    wne_elsewhere(text)
+
+@test("an export taking or answering a struct with an empty struct field is refused on Windows x64")
+wne_export_refused()
+    val text = s"${wne_shapes()}@export(\"took\")\ntook(v: O) -> i32 = v.a\n" +
+               "@export(\"made\")\nmade() -> O = O(1, E(), 2)\n"
+    val said = wne_said(text, wne_win())
+
+    wne_has(said, s"'v' of the exported 'took' is ${wne_reason("O", "e", "E")}")
+    wne_has(said, s"the exported 'made' returns ${wne_reason("O", "e", "E")}")
+    wne_elsewhere(text)
+
+// What `tests_cabi.sysl`'s `windows_*` tests pass in the C slot `c_hollow` gives them stays accepted.
+@test("an empty struct by value, or one made only of empty structs, still crosses on Windows x64")
+wne_top_level_empty_accepted()
+    assert_eq(wne_said("struct E\nend E\nextern take(v: E)\nextern give() -> E\ntake(give())\n", wne_win()), "")
+    assert_eq(wne_said("struct E\nend E\nstruct H\n    x: E\n    y: E\nextern take(v: H)\nextern give() -> H\n" +
+                       "take(give())\n", wne_win()), "")
+    assert_eq(wne_said("struct E\nend E\n@export(\"made\")\nmade(v: E) -> E = v\n", wne_win()), "")
+
+// `struct Z { int a; struct E z[0]; }` is 4 to MSVC, as `int z[0]` is: no element, no bytes.
+@test("a field holding no empty struct, or none of one, is not refused")
+wne_no_empty_held_accepted()
+    assert_eq(wne_said("struct E\nend E\nstruct Z\n    a: i32\n    z: [0]E\nextern take(v: Z)\n" +
+                       "take(Z(1, []))\n", wne_win()), "")
+    assert_eq(wne_said("struct Z\n    a: i32\n    z: [0]i32\nextern take(v: Z)\ntake(Z(1, []))\n", wne_win()), "")
+    assert_eq(wne_said("struct P\n    a: i32\n    b: i32\nextern take(v: P)\ntake(P(1, 2))\n", wne_win()), "")
+
+// The refusal is about a value C lays out on its own side; a pointer is one register on both.
+@test("a struct with an empty struct field behind a pointer is not refused")
+wne_behind_pointer_accepted()
+    val text = s"${wne_shapes()}extern take(v: *O)\nextern give() -> *O\ntake(give())\n"
+
+    assert_eq(wne_said(text, wne_win()), "")
+
+// `reference/ffi.md § What crosses the boundary` quotes this refusal in a `text` block, since its
+// docs sweep cannot build a Windows program's standard module on this machine; this pins the quote.
+@test("the ffi page's example is refused in the words the page quotes")
+wne_ffi_page_example()
+    val text = "struct Empty\nend Empty\n\nstruct Tagged\n    id: i32\n    mark: Empty\n    len: i32\n\n" +
+               "extern send(t: Tagged)\n\nsend(Tagged(1, Empty(), 2))\n"
+
+    wne_has(wne_said(text, wne_win()),
+            "'t' of the 'extern' 'send' is Tagged, whose field 'mark' is Empty: an empty struct " +
+            "occupies no bytes in sysl and four in Microsoft's C on 'x86_64-windows', so Tagged is laid " +
+            "out differently on the two sides of the call. Give the empty struct a field, or take 'mark' " +
+            "out of Tagged")
+    wne_elsewhere(text)
+
+// As `check_quad_externs`: a declaration nothing calls is never declared to LLVM.
+@test("an extern over such a struct that nothing calls is not refused")
+wne_unreached_extern_accepted()
+    assert_eq(wne_said(s"${wne_shapes()}extern take(v: O)\nextern give() -> O\n", wne_win()), "")
