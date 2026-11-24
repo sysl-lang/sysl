@@ -305,6 +305,7 @@ check_exports_emitted(a: &Analysis, p: TProgram, own: Buf[string])
 
     export_duplicates(a, exported)
     export_names(a, exported, storage_by_symbol(p.vals))
+    export_header_hollow(a, exported, storage_by_symbol(p.vals))
     export_storage(a, p, archive_ways_in(p, own, exported))
     archive_placed_storage(a, p)
     stored_export_duplicates(a, p, exported)
@@ -1378,6 +1379,64 @@ private nested_empty_here(a: &Analysis, t: Type) -> Option[(string, Type)]
 
     c_nested_empty(a.tables.layout, t)
 end nested_empty_here
+
+// **An empty struct the header would declare where C lays it out**, on a machine whose C gives one
+// bytes (`c_header.sysl`'s `header_hollow`): behind an exported function's pointer, in a function
+// pointer's, or as exported storage. The header is the declaration a C project lays the type out by, and
+// its `typedef struct { } E;` is four bytes there and none here, so a store through it lands on what
+// sysl placed after it. Asked of what the header holds -- public exports, as `exports_by_symbol` and
+// `storage_by_symbol` give them -- since a private export is declared to no C project.
+private export_header_hollow(a: &Analysis, exported: Buf[TFunc], storage: Buf[TVal])
+    if !c_sizes_empty(a.tables.target) then return
+
+    val l = a.tables.layout
+    val target = a.tables.target
+
+    for f in exports_by_symbol(exported)
+        val scope = func_home(a, f.name)
+
+        for p in f.params
+            if mentions_unknown(p.1) then continue
+
+            val found = header_hollow(l, target, p.1, true)
+
+            if found.is_some()
+                a.fault(scope, f.span, s"'${p.0}' of the exported '${qualified_name(f.name)}' is " +
+                        hollow_reason(a, p.1, found.unwrap()))
+
+        if no_value(f.ret_ty) || mentions_unknown(f.ret_ty) then continue
+
+        val answered = header_hollow(l, target, f.ret_ty, true)
+
+        if answered.is_some()
+            a.fault(scope, f.span, s"the exported '${qualified_name(f.name)}' returns " +
+                    hollow_reason(a, f.ret_ty, answered.unwrap()))
+
+    for v in storage
+        val d = a.tables.vals.get(v.symbol)
+
+        if d.is_none() || mentions_unknown(v.ty) then continue
+
+        val found = header_hollow(l, target, v.ty, false)
+
+        if found.is_some()
+            a.fault(d.unwrap().scope, d.unwrap().span, s"the exported storage '${qualified_name(v.symbol)}' is " +
+                    hollow_reason(a, v.ty, found.unwrap()))
+end export_header_hollow
+
+// The tail of the header refusal, after "'p' of the exported 'f' is" or "... returns".
+private hollow_reason(a: &Analysis, t: Type, found: (string, Type)) -> string
+    val shown = type_show(t)
+    val empty = type_show(found.1)
+    val size = hollow_c_size(a.tables.layout, a.tables.target, found.1)
+    val reached = if !found.0.is_empty() then s"$shown, whose field '${found.0}' reaches $empty, which"
+                  else if shown == empty then s"$shown, which"
+                  else s"$shown, which reaches $empty, which"
+
+    s"$reached occupies no bytes in sysl and $size in Microsoft's C on '${a.tables.target.name}': the " +
+    s"header's declaration of $empty gives it a size sysl does not, so C storing one writes over what " +
+    s"sysl placed after it. Give the empty struct a field, or keep $empty out of what the header declares"
+end hollow_reason
 
 // The tail of the refusal, after "'v' of the 'extern' 'take' is" or "... returns".
 private nested_empty_reason(a: &Analysis, t: Type, found: (string, Type)) -> string
