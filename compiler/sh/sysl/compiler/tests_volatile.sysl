@@ -988,3 +988,90 @@ vo_with_on_a_register_computes_the_value()
                      "b.shcsr = b.shcsr with { memfaultena = 1, usgfaultena = 1 }\n" +
                      "print(b.shcsr.bits, b.shcsr.memfaultact, b.shcsr.busfaultena)\n"), "327683 1 0\n")
 end vo_with_on_a_register_computes_the_value
+
+// -- a volatile wider than 64 bits on AArch64 ---------------------------------------------------------
+
+private vo_on(machine: string, text: string) -> string = vo_ir_for(target_named(machine).unwrap(), [("main.sysl", text)])
+
+// The one sentence every refusal carries: the type, its width, and what to write instead.
+private vo_wide_said(out: string, shown: string, bits: string)
+    assert(vo_has(out, s"'volatile $shown' is not a type on "), out)
+    assert(vo_has(out, s"it is $bits bits wide"), out)
+    assert(vo_has(out, "one 'ldr' or 'str' of at most 8 bytes"), out)
+    assert(vo_has(out, "two 64-bit volatile accesses") || vo_has(out, "Make two 64-bit volatile accesses"), out)
+end vo_wide_said
+
+private val vo_wide_machines: []const string = ["aarch64-freestanding", "aarch64-macos"]
+
+@test("a '*volatile u128' pointee is refused on AArch64, with the width and the way out")
+vo_wide_pointee_refused()
+    if !vo_ready() then return
+
+    for m in vo_wide_machines
+        vo_wide_said(vo_on(m, "@export(\"w\")\nw(p: *volatile u128) = *p = *p + 1\n"), "u128", "128")
+
+@test("i128 and a wider integer are refused the same way")
+vo_wide_other_integers_refused()
+    if !vo_ready() then return
+
+    for m in vo_wide_machines
+        vo_wide_said(vo_on(m, "@export(\"w\")\nw(p: *volatile i128) = *p = *p + 1\n"), "i128", "128")
+        vo_wide_said(vo_on(m, "@export(\"w\")\nw(p: *volatile u256) = *p = *p + 1\n"), "u256", "256")
+
+@test("a struct field of volatile u128 is refused on AArch64")
+vo_wide_field_refused()
+    if !vo_ready() then return
+
+    for m in vo_wide_machines
+        vo_wide_said(vo_on(m, "struct R\n    a: volatile u128\n@export(\"w\")\nw(r: *R) = r.a = 1\n"), "u128", "128")
+
+@test("an array element of volatile u128 is refused on AArch64")
+vo_wide_element_refused()
+    if !vo_ready() then return
+
+    for m in vo_wide_machines
+        vo_wide_said(vo_on(m, "struct R\n    a: [2]volatile u128\n@export(\"w\")\nw(r: *R) = r.a[0] = 1\n"), "u128", "128")
+        vo_wide_said(vo_on(m, "@export(\"w\")\nw(v: []volatile u256) = v[0] = 1\n"), "u256", "256")
+
+@test("module storage 'var x: volatile u128' is refused on AArch64")
+vo_wide_module_storage_refused()
+    if !vo_ready() then return
+
+    for m in vo_wide_machines
+        vo_wide_said(vo_on(m, "static var x: volatile u128 = 0\n@export(\"w\")\nw() = x = 1\n"), "u128", "128")
+
+@test("a generic over Integer is refused where it is instantiated at u128 on AArch64")
+vo_wide_generic_instantiation_refused()
+    if !vo_ready() then return
+
+    val src = "bump[T: Integer](p: *volatile T) = *p = *p + 1\n@export(\"w\")\nw(p: *volatile u128) = ()\n" +
+              "@export(\"v\")\nv(p: *u8) = bump[u128](ptr_cast(p))\n"
+
+    for m in vo_wide_machines
+        assert(vo_has(vo_on(m, src), "one 'ldr' or 'str' of at most 8 bytes"))
+
+@test("a generic over Integer instantiated at u64 is accepted on AArch64")
+vo_wide_generic_at_u64_accepted()
+    if !vo_ready() then return
+
+    val src = "bump[T: Integer](p: *volatile T) = *p = *p + 1\n@export(\"v\")\nv(p: *u8) = bump[u64](ptr_cast(p))\n"
+
+    for m in vo_wide_machines
+        assert(!vo_has(vo_on(m, src), "at most 8 bytes"))
+
+@test("a volatile u64 is accepted on AArch64")
+vo_wide_u64_accepted()
+    if !vo_ready() then return
+
+    for m in vo_wide_machines
+        assert(vo_has(vo_on(m, "@export(\"w\")\nw(p: *volatile u64) = *p = *p + 1\n"), "define"))
+
+@test("a volatile u128 is accepted on x86_64 and riscv64, and stays LLVM's volatile access")
+vo_wide_other_processors_keep_it()
+    if !vo_ready() then return
+
+    for m in ["x86_64-linux", "riscv64-freestanding"]
+        val out = vo_on(m, "@export(\"w\")\nw(p: *volatile u128) = *p = *p + 1\n")
+
+        assert(!vo_has(out, "at most 8 bytes"), out)
+        assert(vo_has(vo_define(out, "w"), "load volatile i128"), out)

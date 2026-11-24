@@ -4000,9 +4000,20 @@ wait_for(n: u64)
   loop walking down registers into a post-indexed one — Linux's `readl`/`writel` are `asm` for the same
   reason. It holds at every optimisation level and under LTO, and it costs only what the optimizer
   might have folded. A `bool` and an integer narrower than its storage (`u12`) move their storage's
-  width (`ldrb`, `ldrh`), a float an integer register's; a `u128` has no one instruction and is LLVM's
-  volatile (an `ldp`). Every other processor keeps LLVM's `load volatile`: x86 decodes the faulting
-  instruction itself, and RISC-V has no writeback addressing.
+  width (`ldrb`, `ldrh`), a float an integer register's. **A volatile wider than 64 bits is refused on AArch64**
+  — a `u128`, an `i128` or any wider integer has no one instruction, and LLVM's volatile of it is an
+  `ldp`/`stp` pair, the form a hypervisor cannot emulate. Write two 64-bit volatile accesses. Every other
+  processor keeps LLVM's `load volatile`: x86 decodes the faulting instruction itself, and RISC-V has no
+  writeback addressing, so a `volatile u128` is accepted there.
+
+```sysl target=aarch64-freestanding
+struct Regs
+    wide: volatile u128
+```
+
+```error
+'volatile u128' is not a type on aarch64-freestanding: it is 128 bits wide, and an AArch64 volatile access is one 'ldr' or 'str' of at most 8 bytes (64 bits). Make two 64-bit volatile accesses instead, as two 'volatile u64' fields or elements
+```
 
 A loop walking down a FIFO's registers is the shape LLVM folds. Each read of `*at` here is
 `ldr x9, [x0]` and then a separate `sub x0, x0, #8`, never the one `ldr x9, [x0], #-8` an ordinary load
