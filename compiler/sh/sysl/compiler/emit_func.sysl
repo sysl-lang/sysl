@@ -74,17 +74,14 @@ gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
     val found = tail_calls_of(f)
     val lends_all = e.zero_body || e.frame_site.is_some()
     val owns = if lends_all then set()
-               else owning(f, e.address_taken.has(f.name), is_async || !found.is_empty(), e.inert.has(f.name))
+               else entry_owning(f, e.address_taken, e.inert)
 
     var owned_names: Set[string] = set()
 
     for j in 0..<f.params.len()
-        val p = f.params[j]
         val handed = !lends_all && e.owned_params.has(owned_key(f.name, j))
 
-        if !zero_sized(p.1) && !(value_drops(e, p.1) && reads_receiver(f, j)) && (owns.has(p.0) || handed) then
-            owned_names.add(p.0)
-    end for
+        if keeps_param(e, f, j, owns, handed) then owned_names.add(f.params[j].0)
 
     // **A local that only walks storage holds no count** (`plus0_locals.sysl`): its declaration, its
     // bindings and its assignments take none and give none back, and whatever keeps it takes one there.
@@ -329,6 +326,16 @@ gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
 
     Some(if strict then strict_fp_body(e, built) else built)
 end gen_function
+
+// Whether `f` keeps a count of its own for its parameter `j` from entry, before the +0 analysis
+// (`plus0_locals.sysl`) takes back what it can borrow: one `owning` owns (`owns`) or a direct call
+// hands over (`handed`), never a zero-sized one, which is no argument, nor a `(self)` receiver of a
+// value with a destructor, a copy that owns nothing. The fiber-switch check (`abandons.sysl`'s
+// `check_switch_holds`) asks the same question of the same bodies before emission.
+keeps_param(e: *Emit, f: TFunc, j: usize, owns: Set[string], handed: bool) -> bool
+    val p = f.params[j]
+
+    !zero_sized(p.1) && !(value_drops(e, p.1) && reads_receiver(f, j)) && (owns.has(p.0) || handed)
 
 // **The parameters `owning` owns only because the body rewrites them** (borrow-inference.md §4.3):
 // assigns them, or jumps back to its own entry with a new value for them. Each is a candidate the

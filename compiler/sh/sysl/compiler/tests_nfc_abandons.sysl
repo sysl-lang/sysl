@@ -222,6 +222,43 @@ nfc_a_local_held_across_is_refused()
         run()
         """), "'handle' can reach a call that abandons every frame below it and never comes back, and this frame holds 's' across the call — its count would never be given back. Give it back first: hold it in a function that returns before this call is made, or as a '*T'", "11:5")
 
+// A body something outside sysl's convention may call -- an `@export`, a `@section` -- arrives with
+// its parameters' counts its own (`borrowing.sysl`'s `owning`), so each counted one is held from entry.
+private nfc_entered_from_outside(mark: string) -> string = raw"""
+    @abandons
+    leave(code: int) -> never
+        exit(code)
+
+    handle(n: int)
+        if n == 0 then leave(1)
+
+    """ + mark + raw"""
+    run(s: string)
+        handle(2)
+        print(s)
+    """
+
+private nfc_param_held() -> string =
+    "'handle' can reach a call that abandons every frame below it and never comes back, and this frame holds the parameter 's' across the call"
+
+@test("a counted parameter of a '@section' function is held across a call that can abandon, and refused")
+nfc_section_param_is_refused()
+    val said = nfc_ir(nfc_entered_from_outside("@section(\"__TEXT,__nfc\")\n"))
+
+    assert(said.contains(s"error: ${nfc_param_held()}"), said)
+
+@test("a counted parameter of an '@export' function is held across a call that can abandon, and refused")
+nfc_export_param_is_refused()
+    val said = nfc_ir(nfc_entered_from_outside("@export(\"nfc_run\")\n"))
+
+    assert(said.contains(s"error: ${nfc_param_held()}"), said)
+
+@test("the same parameter of a plain function is its caller's to hold, and accepted")
+nfc_plain_param_is_accepted()
+    val said = nfc_ir(nfc_entered_from_outside(""))
+
+    assert(!said.contains("error:"), said)
+
 @test("a binding a 'match' arm took a share of is held across the call")
 nfc_an_arm_binding_is_held()
     val said = nfc_ir(raw"""

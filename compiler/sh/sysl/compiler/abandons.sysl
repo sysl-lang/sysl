@@ -2,7 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
-import sysl.container.{Set, set}
+import sysl.container.{map, Set, set}
 
 // `@abandons` -- a call that never comes back, after which the program goes on without the frames
 // below it (`reference/declarations.md § @abandons — a call that leaves its caller for good`).
@@ -205,7 +205,7 @@ check_abandons(a: &Analysis, funcs: Buf[TFunc], externs: Buf[TExtern], vtables: 
         cx.is_async = f.marks.is_async()
         cx.promoted = promoted_arrays(moved, f)
 
-        scan_block(a, cx, f.body, held_on_entry(a, cx, f, set()))
+        scan_block(a, cx, f.body, held_on_entry(a, cx, f, set(), set()))
 end check_abandons
 
 // -- a fiber that may move -----------------------------------------------------------------------------
@@ -227,7 +227,7 @@ end check_abandons
 // a fiber on it, say -- does not switch by being called, and a call through a value is not followed,
 // as a call through one is not for `@abandons`. A program that never calls the switch pays for no
 // walk at all.
-check_switch_holds(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable])
+check_switch_holds(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TVtable])
     var key = ""
 
     for f in funcs
@@ -249,10 +249,19 @@ check_switch_holds(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable])
                                      false, set(), true, set(), set(), set())
     val moved = func_promotions(a, funcs, vtables)
 
-    // The parameters a direct call hands over with a count of their own, asked of the same bodies the
-    // emitter asks (`owned_params.sysl`), so the two cannot disagree.
+    // The parameters a frame keeps a count of its own for, asked of the same bodies with the same
+    // questions the emitter asks (`gen_function`): the ones a direct call hands over with a count
+    // (`owned_params.sysl`), and the ones `owning` keeps -- a parameter the body assigns, every one of
+    // a function whose address is taken, of a body that jumps back to its own entry, and of a task.
+    // The +0 analysis may later borrow a rewritten parameter after all (`plus0_locals.sysl`); this
+    // asks before it, so such a parameter is refused though it holds nothing across the switch.
     var e = emitter_for(a.tables.target, destructors_of(a))
     val owned = owned_params(&e, funcs)
+    val p = TProgram(buf(), buf(), vtables, reached_externs(a), vals, funcs, buf(), None, buf(), true, false,
+                     buf(), buf(), "", buf(), buf(), buf(), buf(), buf(), buf(), buf(), None, buf(), false,
+                     false, false, true, map(), buf(), false)
+    val addressed = addressed_funcs(p)
+    val inert = inert_callees(p, owning_funcs(p, owned))
 
     for f in funcs
         if f.marks.pinned_thread || f.name == key || on_main_stack(f.name) then continue
@@ -262,7 +271,16 @@ check_switch_holds(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable])
         cx.promoted = promoted_arrays(moved, f)
         cx.views = param_view_locals(f)
 
-        scan_block(a, cx, f.body, held_on_entry(a, cx, f, owned))
+        val owns = entry_owning(f, addressed, inert)
+        var kept: Set[string] = set()
+
+        for j in 0..<f.params.len()
+            val k = owned_key(f.name, j)
+
+            if keeps_param(&e, f, j, owns, owned.has(k)) then kept.add(k)
+
+        scan_block(a, cx, f.body, held_on_entry(a, cx, f, owned, kept))
+    end for
 end check_switch_holds
 
 // The arrays `f` declares that the lowering moves to a counted buffer, asked of the escape walk the
@@ -326,10 +344,11 @@ private called_refs(out: &Refs, e: TExpr) = *e.kind match
 // (`borrowing.sysl`) -- except where something outside sysl's convention may call it, when the
 // count it arrived with is the frame's own, and a `@unique` value with a destructor, which the callee
 // is handed and drops (`design/affine-values.md` § 7). A `(self)` receiver of one owns nothing. Where
-// a fiber may move, only a count matters -- and a parameter a direct call hands over with a count
-// (`owned`, `owned_params.sysl`) is the frame's own count from entry, held as a local declared there
-// is, to the end of the body.
-private held_on_entry(a: &Analysis, cx: &Abandoning, f: TFunc, owned: Set[string]) -> string
+// a fiber may move, only a count matters -- and a parameter the frame keeps a count of its own for
+// (`kept`, as `<function>|<position>`) holds it from entry, as a local declared there does, to the end
+// of the body: one a direct call hands over with a count (`owned`, `owned_params.sysl`), or one
+// `owning` keeps (`borrowing.sysl`), which takes its count at entry.
+private held_on_entry(a: &Analysis, cx: &Abandoning, f: TFunc, owned: Set[string], kept: Set[string]) -> string
     if !cx.fiber
         for j in 0..<f.params.len()
             val p = f.params[j]
@@ -339,12 +358,15 @@ private held_on_entry(a: &Analysis, cx: &Abandoning, f: TFunc, owned: Set[string
     else
         for j in 0..<f.params.len()
             val p = f.params[j]
+            val k = owned_key(f.name, j)
 
-            if owned.has(owned_key(f.name, j)) && holds_count(cx, p.1)
-                return s"the parameter '${shown_local(p.0)}' (handed over with a count of its own, which this frame then gives back or keeps)"
+            if !kept.has(k) || !holds_count(cx, p.1) then continue
+
+            return if owned.has(k) then s"the parameter '${shown_local(p.0)}' (handed over with a count of its own, which this frame then gives back or keeps)"
+                   else s"the parameter '${shown_local(p.0)}' (kept with a count of its own, taken at entry and given back at the exit)"
     end if
 
-    if f.exported.is_none() && f.conv.is_none() then return ""
+    if f.exported.is_none() && f.conv.is_none() && f.section.is_none() then return ""
 
     for p in f.params
         if holds_count(cx, p.1) then return s"the parameter '${shown_local(p.0)}'"

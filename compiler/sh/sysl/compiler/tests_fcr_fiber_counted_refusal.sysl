@@ -609,6 +609,143 @@ fcr_owned_scalar_param_accepted()
             boxes[0] = b
         """)
 
+// **A parameter `owning` keeps is the frame's own count too** (`borrowing.sysl`): one the body
+// assigns, every one of a function whose address is taken, of a body that jumps back to its own
+// entry, and of a task. Each takes its count at entry and gives it back at the exit, so it is held
+// from entry to the end of the body. The check asks `owning` through `entry_owning`, as the emitter
+// does. Each shape is asked with the short string form off and on.
+private fcr_kept_held(name: string) -> string =
+    s"the parameter '$name' (kept with a count of its own, taken at entry and given back at the exit)"
+
+@test("a parameter the body assigns a value it made is kept with a count, and refused across the call")
+fcr_kept_reassigned_refused()
+    fcr_held_both(raw"""
+        grow(s: string)
+            s = s + "x"
+            wait()
+            print(s)
+        """, fcr_kept_held("s"), "sched.wait")
+
+@test("a parameter assigned only after the call is still kept from entry, and refused")
+fcr_kept_reassigned_after_refused()
+    fcr_held_both(raw"""
+        grow(s: string)
+            wait()
+            s = s + "x"
+            print(s)
+        """, fcr_kept_held("s"), "sched.wait")
+
+@test("every counted parameter of a function whose address is taken is kept, and refused across the call")
+fcr_kept_address_taken_refused()
+    fcr_held_both(raw"""
+        show(b: &Box)
+            wait()
+            print(b.n)
+
+        taken() -> bool
+            val g = &show
+            g != null
+        """, fcr_kept_held("b"), "sched.wait")
+
+@test("a parameter of a body that jumps back to its own entry with it is kept, and refused across the call")
+fcr_kept_self_jump_refused()
+    fcr_held_both(raw"""
+        count(s: string, n: int) -> int
+            wait()
+            if n == 0 then int(s.len) else count(s, n - 1)
+        """, fcr_kept_held("s"), "sched.wait")
+
+// The emitter peels this one: its own symbol borrows on entry and its jump enters `count.owned`, whose
+// frame holds the count across the switch.
+@test("a peeled self-jumping body, whose jump hands a fresh value, is refused")
+fcr_kept_peeled_jump_refused()
+    fcr_held_both(raw"""
+        count(s: string, n: int) -> int
+            wait()
+            if n == 0 then int(s.len) else count("x", n - 1)
+        """, fcr_kept_held("s"), "sched.wait")
+
+@test("a task's parameter is kept for the life of the task, and refused across the call")
+fcr_kept_async_refused()
+    fcr_held_both(raw"""
+        async later(s: string) -> usize
+            wait()
+            s.len
+        """, fcr_kept_held("s"), "sched.wait")
+
+@test("a parameter the function only reads, with nothing kept, is accepted")
+fcr_kept_plain_read_accepted()
+    fcr_lent(raw"""
+        show(s: string)
+            wait()
+            print(s)
+        """)
+
+@test("a reassigned, jumping or address-taken parameter that is a scalar carries no count and is accepted")
+fcr_kept_scalar_params_accepted()
+    fcr_lent(raw"""
+        bump(n: int)
+            n += 1
+            wait()
+            print(n)
+
+        down(n: int) -> int
+            wait()
+            if n == 0 then 0 else down(n - 1)
+
+        taken() -> bool
+            val g = &bump
+            g != null
+        """)
+
+// The check asks `owning` before the +0 analysis (`plus0_locals.sysl`), which borrows a parameter that
+// only walks what its caller handed over: `total` holds no count at all, and is refused even so. The
+// exact answer is the emitter's after that analysis.
+// TODO: exact check (the emitter's answer after the +0 analysis) is a 0.14 item; then this is accepted.
+private fcr_walking_param(mark: string) -> string = raw"""
+    struct Node
+        v: int
+        next: Option[&Node]
+
+    """ + mark + raw"""
+    total(p: Option[&Node]) -> int
+        var sum = 0
+
+        while p is Some(n)
+            sum += n.v
+            p = n.next
+
+        wait()
+        sum
+    """
+
+@test("KNOWN OVER-REFUSAL: a parameter that walks what it was handed, borrowed by the +0 analysis, is refused")
+fcr_kept_walking_param_over_refused()
+    fcr_held_both(fcr_walking_param(""), fcr_kept_held("p"), "sched.wait")
+
+@test("'@pinned(thread)' accepts the walking parameter the check over-refuses")
+fcr_kept_walking_param_pinned_accepted()
+    fcr_lent(fcr_walking_param("@pinned(thread)\n"))
+
+@test("'@pinned(thread)' accepts a kept parameter held across the switch")
+fcr_kept_pinned_accepted()
+    fcr_lent(raw"""
+        @pinned(thread)
+        grow(s: string)
+            s = s + "x"
+            wait()
+            print(s)
+        """)
+
+@test("a counted parameter of a '@section' function is the frame's own count, and refused across the call")
+fcr_kept_section_refused()
+    fcr_held_both(raw"""
+        @section("__TEXT,__fcr")
+        placed(s: string)
+            wait()
+            print(s)
+        """, fcr_kept_held("s"), "sched.wait")
+
 @test("a '@unique' parameter with a destructor is always handed over, and its string field is held across the call")
 fcr_unique_param_refused()
     fcr_held_both(raw"""
@@ -897,6 +1034,9 @@ fcr_local_parameter_view_shapes()
             q.len + c.len + send(r) + part.len
         """)
 
+// The parameter itself is kept with a count of its own once it is reassigned or its address is taken
+// (`owning`), and the frame holds it from entry -- so the refusal names it, the first thing held,
+// before the view of it.
 @test("a view of a parameter reassigned, or whose address is taken, is refused")
 fcr_local_parameter_moves_refused()
     fcr_held_both(fcr_send() + raw"""
@@ -905,7 +1045,7 @@ fcr_local_parameter_moves_refused()
             wait()
             b = c
             s.len
-        """, "'s'", "sched.wait")
+        """, fcr_kept_held("b"), "sched.wait")
     fcr_held_both(fcr_send() + raw"""
         look(p: *[]const u8) -> usize = (*p).len
 
@@ -913,7 +1053,7 @@ fcr_local_parameter_moves_refused()
             val s = b[0..<1]
             wait()
             s.len + look(&b)
-        """, "'s'", "sched.wait")
+        """, fcr_kept_held("b"), "sched.wait")
 
 @test("a view of a parameter that is also used whole is refused")
 fcr_local_parameter_used_whole_refused()
