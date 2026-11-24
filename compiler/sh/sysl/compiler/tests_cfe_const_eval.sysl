@@ -40,8 +40,8 @@ private cfe_scalars() -> Buf[string]
     out
 end cfe_scalars
 
-// What every differential program carries: a hiding function per type -- a `volatile` read behind a
-// call the optimizer may not look into -- and the renderers that print a float's bits.
+// What every differential program carries: a hiding function per type -- a `volatile` read (two 64-bit
+// ones for a 128-bit type) behind a call the optimizer may not look into -- and the renderers that print a float's bits.
 private cfe_support() -> string
     var out = ""
     val types = cfe_scalars()
@@ -49,8 +49,14 @@ private cfe_support() -> string
     for i in 0..<types.len()
         val t = types[i]
 
-        out = out + s"struct Hv_$t\n    v: volatile $t\n\n@noinline\nh_$t(x: $t) -> $t\n" +
-              s"    var c = Hv_$t(x)\n\n    c.v\n\n"
+        // AArch64 has no volatile access wider than 64 bits, so a 128-bit value hides as two halves.
+        if t == "i128" || t == "u128"
+            out = out + s"struct Hv_$t\n    lo: volatile u64\n    hi: volatile u64\n\n@noinline\n" +
+                  s"h_$t(x: $t) -> $t\n    var c = Hv_$t(u64.wrap(x), u64.wrap(x >> 64))\n\n" +
+                  s"    $t.wrap(u128(c.hi) << 64 | u128(c.lo))\n\n"
+        else
+            out = out + s"struct Hv_$t\n    v: volatile $t\n\n@noinline\nh_$t(x: $t) -> $t\n" +
+                  s"    var c = Hv_$t(x)\n\n    c.v\n\n"
 
     out + "b64(x: real) -> string\n    if x != x then return \"nan\"\n\n    var v = x\n" +
           "    val p: *u64 = ptr_cast(&v)\n\n    (*p).to_string()\n\n" +
