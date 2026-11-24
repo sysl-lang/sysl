@@ -79,7 +79,8 @@ end CShape
 // struct is the only C function it can correctly reach.
 //
 // A **zero-sized** aggregate is left alone. C passes nothing for one and LLVM assigns an empty
-// aggregate no register either, so the two already agree and there is nothing to coerce.
+// aggregate no register either, so the two already agree and there is nothing to coerce -- everywhere
+// but Windows x64, whose C gives one bytes and which `c_hollow` answers before this is asked.
 c_aggregate(l: TargetLayout, t: Type) -> bool = underlying(t) match
     Struct(_) -> l.size(t) > 0
     Array(_, _, _) -> l.size(t) > 0
@@ -90,6 +91,12 @@ c_aggregate(l: TargetLayout, t: Type) -> bool = underlying(t) match
     p -> erased(p) || c_erased_weak(p)
 
 c_result(l: TargetLayout, t: Type, target: Target) -> CResult
+    c_hollow(l, t, target) match
+        Some(size) -> return c_windows(size) match
+            CsRegisters(returned, _) -> CrCoerced(returned)
+            _ -> CrSret(LArr(size, LInt(8)), 1)
+        None -> ()
+
     if !c_aggregate(l, t) then return CrPlain
 
     c_shape(l, t, target) match
@@ -99,6 +106,12 @@ c_result(l: TargetLayout, t: Type, target: Target) -> CResult
 end c_result
 
 c_param(l: TargetLayout, t: Type, target: Target) -> CParam
+    c_hollow(l, t, target) match
+        Some(size) -> return c_windows(size) match
+            CsRegisters(_, passed) -> CpCoerced(passed)
+            _ -> CpIndirect(LArr(size, LInt(8)), 1, false)
+        None -> ()
+
     if !c_aggregate(l, t) then return CpPlain
 
     c_shape(l, t, target) match
@@ -526,6 +539,46 @@ end c_riscv
 private c_windows(size: int) -> CShape =
     if size == 1 || size == 2 || size == 4 || size == 8 then c_alike(l_one(LInt(size * 8)))
     else CsMemory
+
+// **Microsoft's C gives an empty struct four bytes**, where every other convention here gives it none
+// (clang `--target=x86_64-pc-windows-msvc -x c`: `sizeof(struct E {})` is 4 at alignment 1, and
+// `void take(struct E)` is `declare void @take(i32)`). So an aggregate that occupies nothing in sysl
+// still takes an argument slot on Windows x64, and a result register, by the C size it has there --
+// which is what keeps `mix(int a, struct E e, int b)` from handing `b` over in `e`'s register.
+//
+// The answer is the C size, or nothing where the type is not a zero-sized aggregate or the target's
+// C gives it no bytes either. A struct's C size is the sum of its members' (each empty member is
+// four bytes of its own: `struct { struct E x, y; }` is 8), a union's the largest, an array's its
+// length times its element's, and never less than four for a struct, because the rule is about the
+// struct and not about what it holds (`struct { int z[0]; }` is 4 as well).
+c_hollow(l: TargetLayout, t: Type, target: Target) -> Option[int]
+    if target.cpu != X86_64 || target.os != Windows then return None
+
+    underlying(t) match
+        Struct(_) -> if l.size(t) == 0 then Some(c_hollow_size(t)) else None
+        Array(_, _, _) -> if l.size(t) == 0 then Some(c_hollow_size(t)) else None
+        _ -> None
+end c_hollow
+
+// Whether a parameter is in a C signature at all: everything that occupies something, and an empty
+// aggregate wherever the target's C gives one bytes.
+c_crosses(l: TargetLayout, t: Type, target: Target) -> bool =
+    !zero_sized(t) || c_hollow(l, t, target).is_some()
+
+// The MSVC C size of a type that occupies nothing in sysl, so every member is empty too.
+private c_hollow_size(t: Type) -> int = underlying(t) match
+    Struct(d) ->
+        var held = 0
+
+        for f in d.fields
+            val n = c_hollow_size(f.1)
+
+            held = if d.union_layout then max_int(held, n) else held + n
+
+        max_int(held, 4)
+
+    Array(n, elem, _) -> n * c_hollow_size(*elem)
+    _ -> 0
 
 // -- WebAssembly -------------------------------------------------------------------------------------
 
