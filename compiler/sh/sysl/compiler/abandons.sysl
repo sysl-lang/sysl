@@ -203,7 +203,7 @@ check_abandons(a: &Analysis, funcs: Buf[TFunc], externs: Buf[TExtern], vtables: 
         cx.scope = func_home(a, f.name)
         cx.is_async = f.marks.is_async()
 
-        scan_block(a, cx, f.body, held_on_entry(a, cx, f))
+        scan_block(a, cx, f.body, held_on_entry(a, cx, f, set()))
 end check_abandons
 
 // -- a fiber that may move -----------------------------------------------------------------------------
@@ -247,6 +247,11 @@ check_switch_holds(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable])
                                      false, set(), true, set(), set(), set())
     val moved = func_promotions(a, funcs, vtables)
 
+    // The parameters a direct call hands over with a count of their own, asked of the same bodies the
+    // emitter asks (`owned_params.sysl`), so the two cannot disagree.
+    var e = emitter_for(a.tables.target, destructors_of(a))
+    val owned = owned_params(&e, funcs)
+
     for f in funcs
         if f.marks.pinned_thread || f.name == key || on_main_stack(f.name) then continue
 
@@ -259,7 +264,7 @@ check_switch_holds(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable])
 
         cx.views = param_view_locals(f)
 
-        scan_block(a, cx, f.body, held_on_entry(a, cx, f))
+        scan_block(a, cx, f.body, held_on_entry(a, cx, f, owned))
 end check_switch_holds
 
 // Whether a body runs on the main thread's own stack: the program's `main`, or the entry file's
@@ -310,14 +315,22 @@ private called_refs(out: &Refs, e: TExpr) = *e.kind match
 // (`borrowing.sysl`) -- except where something outside sysl's convention may call it, when the
 // count it arrived with is the frame's own, and a `@unique` value with a destructor, which the callee
 // is handed and drops (`design/affine-values.md` § 7). A `(self)` receiver of one owns nothing. Where
-// a fiber may move, only a count matters.
-private held_on_entry(a: &Analysis, cx: &Abandoning, f: TFunc) -> string
+// a fiber may move, only a count matters -- and a parameter a direct call hands over with a count
+// (`owned`, `owned_params.sysl`) is the frame's own count from entry, held as a local declared there
+// is, to the end of the body.
+private held_on_entry(a: &Analysis, cx: &Abandoning, f: TFunc, owned: Set[string]) -> string
     if !cx.fiber
         for j in 0..<f.params.len()
             val p = f.params[j]
 
             if unique_drop_held(a, p.1).is_some() && !(j == 0 && p.0 == "self" && !f.marks.consumes)
                 return s"the parameter '${shown_local(p.0)}'"
+    else
+        for j in 0..<f.params.len()
+            val p = f.params[j]
+
+            if owned.has(owned_key(f.name, j)) && holds_count(cx, p.1)
+                return s"the parameter '${shown_local(p.0)}' (handed over with a count of its own, which this frame then gives back or keeps)"
     end if
 
     if f.exported.is_none() && f.conv.is_none() then return ""
