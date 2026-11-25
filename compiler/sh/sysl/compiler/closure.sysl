@@ -1658,36 +1658,45 @@ private closure_body(cx: &Analyzer, span: Span, st: &StructType, fname: string,
     val contract = analyze_contract(inner, span, body, split, given.unwrap_or(Unit), false)
     val rest = statements_from(body, split)
 
+    // Where the body's value is read: the anchor of its last line, and of each branch's last line
+    // where that line is an `if` or a `match`.
+    var tails: Buf[Span] = buf()
+
+    tail_anchors(rest, tails)
+
     // **What the call's parameter fixes of the result is handed to the value the body gives**, as it
     // is to an argument: `() -> Ok(1)` at `f: &Fn() -> Result[T, E]` is a `Result[int, E]`.
-    if cx.yield_seed.is_some() && !rest.is_empty()
-        *rest[rest.len() - 1].kind match
-            ExprStmt(last) ->
-                val seed = cx.yield_seed.unwrap()
+    if cx.yield_seed.is_some() && !tails.is_empty()
+        val seed = cx.yield_seed.unwrap()
 
-                inner.variant_seed = Some(VariantSeed(anchor_of(last), seed.key, seed.known))
-            _ -> ()
+        inner.variant_seed = Some(VariantSeed(tails[0], seed.key, seed.known, tails))
 
     // A closure whose result the context did not fix is analyzed with nothing expected, so what its
     // body yields is what it yields -- the only reading under which `x -> x * 2` has a result at
     // all.
     //
     // **A `?` in it is the one thing that needs the result first**, since its failure is returned
-    // as the result. Where the callable the closure stands at yields an `Option` or a `Result` --
-    // `and_then[U](f: T -> Option[U])` before anything has said what `U` is -- the body is read once
-    // on trial with the `?` taken on that word alone, and what the trial yields is the result it is
-    // then read against for real, exactly as a closure the context gave the whole result is read.
+    // as the result. So the body is read once on trial with each `?` taken as it stands, and what
+    // the trial yields is the result it is then read against for real, exactly as a closure the
+    // context gave the whole result is read. Where the callable the closure stands at yields an
+    // `Option` or a `Result` -- `and_then[U](f: T -> Option[U])` before anything has said what `U`
+    // is -- a `?` of the other enum is refused on that word; where nothing says even that, the
+    // body says it all.
     var result = given
     var read: Option[TBlock] = None
-    val shape = try_shape_of(cx, span, given)
+    var shape = try_shape_of(cx, span, given)
+
+    if shape.is_none() && given.is_none() && may_hold_try(cx, body)
+        shape = Some(VariantSeed(span, "", no_bindings(), buf()))
 
     if shape.is_some()
         inner.open_result = "closure"
         inner.try_shape = shape
         inner.open_try = false
+        inner.try_seen = buf()
 
         val opened = begin_trial(inner)
-        val first = closure_block(inner, rest, None)
+        var first = closure_block(inner, rest, None)
         var still_open = false
 
         // A body with no `?` in it was read the one way it is ever read, so that reading is kept.
@@ -1695,22 +1704,65 @@ private closure_body(cx: &Analyzer, span: Span, st: &StructType, fname: string,
             keep_trial(inner)
             read = Some(first)
         else
-            val refused = refused_since(inner, opened)
+            var refused = refused_since(inner, opened)
 
             discard_trial(inner, opened)
+
+            // **A `Result` the body leaves without an error type takes the one its `?`s propagate**:
+            // `Ok(parse(s)? + 1)` says the success and the `?` says the failure, as the callable's
+            // parameter would have. The body is read on trial again with that error handed to its
+            // value. `?`s propagating two different errors name no one of them, and are told so.
+            val seen = inner.try_seen.copy()
+            val key = if shape.unwrap().key != "" then shape.unwrap().key else fallible_base(seen[0].1)
+            val err_name = result_error_name(inner)
+            var clash: Option[(Span, Type, Type)] = None
+
+            if refused && is_result_key(key) && err_name.is_some() &&
+               bound_type(shape.unwrap().known, err_name.unwrap()).is_none()
+                val err = first_error(seen)
+
+                if err.is_some()
+                    var known = shape.unwrap().known.copy()
+
+                    known.push(Binding(err_name.unwrap(), err.unwrap()))
+
+                    inner.try_shape = Some(VariantSeed(span, key, known, buf()))
+
+                    if !tails.is_empty() then inner.variant_seed = Some(VariantSeed(tails[0], key, known, tails))
+
+                    clash = error_clash(seen, err.unwrap())
+
+                    if clash.is_none()
+                        val again = begin_trial(inner)
+
+                        first = closure_block(inner, rest, None)
+                        refused = refused_since(inner, again)
+                        discard_trial(inner, again)
+                end if
+            end if
 
             // **A trial that complained keeps its `?` on trial**, so what it is told again is the
             // complaint and not a second one about a result it never reached.
             val yields = if first.result.is_some() then first.ty else Unit
 
             if refused then still_open = true
-            else if enum_base(yields) == shape.unwrap().key then result = Some(yields)
+            // Where nothing said which enum, what the body yields is the result, and a `?` it cannot
+            // carry is told so in the words a declared result gets.
+            else if shape.unwrap().key == "" || enum_base(yields) == shape.unwrap().key then result = Some(yields)
             // What the callable yields is the one thing the trial knew, so a body yielding something
             // else is told that, as a closure given its whole result is.
             else
                 inner.fault(span, s"this closure should yield ${module_show(shape.unwrap().key)}, " +
                             s"but its body yields ${type_show(yields)}")
                 still_open = true
+
+            if clash.is_some()
+                val (at, was, now) = clash.unwrap()
+
+                inner.fault(at, s"'?' propagates a ${type_show(now)} error where an earlier '?' in this " +
+                            s"closure propagates ${type_show(was)}, and nothing here says which the " +
+                            s"closure returns — write the type where the closure is stored or passed, " +
+                            s"as in 'val f: &Fn(…) -> Result[…] = …', and each '?' converts into it")
         end if
 
         inner.open_try = false
@@ -1788,6 +1840,66 @@ private try_shape_of(cx: &Analyzer, span: Span, given: Option[Type]) -> Option[V
 
     if seed.at.start != span.start || seed.at.end != span.end then None else Some(seed)
 end try_shape_of
+
+// Whether a closure's body is written with a `?` in it at all. One without has nothing to take on
+// trial and is read once; one whose `?` is only in a string or a comment is read on trial, and that
+// reading is the one kept.
+private may_hold_try(cx: &Analyzer, body: Buf[Stmt]) -> bool
+    if body.is_empty() then return false
+
+    val bytes = cx.scope.src.bytes
+    val from = body[0].span.start
+    val to = body[body.len() - 1].span.end
+
+    // A body whose text is not in this file cannot be looked at, so it is read on trial.
+    if to > bytes.len || from >= to then return true
+
+    for i in from..<to
+        if bytes[i] == u8('?') then return true
+
+    false
+end may_hold_try
+
+// The error the first `Result` `?` taken on trial propagates. A `never` one propagates nothing, since
+// its failure crosses into any error type, so it settles nothing.
+private first_error(seen: Buf[(Span, Type)]) -> Option[Type]
+    for s in seen
+        if propagates(s.1) then return Some(fallible_error(s.1))
+
+    None
+
+// The first `Result` `?` whose error is not `err`: where it is, `err`, and its own.
+private error_clash(seen: Buf[(Span, Type)], err: Type) -> Option[(Span, Type, Type)]
+    for s in seen
+        if propagates(s.1) && !type_eq(fallible_error(s.1), err) then return Some((s.0, err, fallible_error(s.1)))
+
+    None
+
+private propagates(t: Type) -> bool = is_result_key(fallible_base(t)) && fallible_error(t) != Never
+
+// The anchors of the lines a body's value is read from: its last line, or where that is an `if`, a
+// `match` or a block, the last line of each of its branches, as far down as they go.
+private tail_anchors(body: Buf[Stmt], out: Buf[Span])
+    if body.is_empty() then return
+
+    *body[body.len() - 1].kind match
+        ExprStmt(last) -> value_anchors(last, out)
+        _ -> ()
+
+// The same of one expression: its own anchor, or its branches' where it is an `if`, a `match` or a
+// block. A value a closure `return`s is read at these too (`stmt.sysl`'s `return_stmt`).
+value_anchors(e: Expr, out: Buf[Span])
+    *e.kind match
+        IfExpr(_, then_body, else_body, _) ->
+            tail_anchors(then_body, out)
+
+            if else_body.is_some() then tail_anchors(else_body.unwrap(), out)
+        MatchExpr(_, arms) ->
+            for arm in arms
+                tail_anchors(arm.body, out)
+        Block(stmts) -> tail_anchors(stmts, out)
+        _ -> out.push(anchor_of(e))
+end value_anchors
 
 private enum_base(t: Type) -> string = repr(t) match
     Enum(d) -> d.base

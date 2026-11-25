@@ -2911,10 +2911,14 @@ private seeded_for(cx: &Analyzer, span: Span, key: string) -> Buf[Binding]
 
     val seed = cx.variant_seed.unwrap()
 
-    if seed.key != key || seed.at.start != span.start || seed.at.end != span.end then
-        return no_bindings()
+    if seed.key != key then return no_bindings()
 
-    seed.known
+    if seed.at.start == span.start && seed.at.end == span.end then return seed.known
+
+    for t in seed.tails
+        if t.start == span.start && t.end == span.end then return seed.known
+
+    no_bindings()
 end seeded_for
 
 private variant_decl_named(ed: EnumDecl, name: string) -> Option[EnumVariantDecl]
@@ -5066,11 +5070,10 @@ end try_expr
 // whose result is read off its body.
 //
 // **Its failure is returned as the closure's result, so the result has to be known first**, and the
-// body is what would have said it. Where the callable the closure stands at says which enum it
-// yields, the `?` is taken on trial on that word: the body then says the rest, and is read again
-// against it. A `Result` must also be told its error type, since that is what the failure is
-// converted into -- a closure at `f: Fn() -> Result[int, E]` with `E` still open has no such word,
-// and is refused like a closure with no context at all, as rustc refuses both.
+// body is what would have said it. So a closure's `?` is taken on trial: the body says the result,
+// and is read again against it. Where the callable the closure stands at says which enum it yields,
+// a `?` of the other enum is refused at once. Each `?` taken is noted in `try_seen`, since a `Result`
+// the body leaves without an error type takes the one its `?`s propagate (`closure_body`).
 private open_try(cx: &Analyzer, span: Span, mark: Span, t: TExpr, ty: Type, ok: EnumVariant,
                  fail: EnumVariant, value: Type) -> TExpr
     val base = base_of(ty)
@@ -5078,15 +5081,15 @@ private open_try(cx: &Analyzer, span: Span, mark: Span, t: TExpr, ty: Type, ok: 
     if cx.try_shape.is_some()
         val shape = cx.try_shape.unwrap()
 
-        if shape.key != base then
+        if shape.key != "" && shape.key != base then
             return cx.err(mark, s"'?' may only be used in a function returning ${module_show(base)}, " +
                           s"not ${module_show(shape.key)}")
 
-        if base == option_key() || result_error(cx, shape).is_some()
-            cx.open_try = true
+        cx.open_try = true
+        cx.try_seen.push((mark, ty))
 
-            // The trial's reading is thrown away, so the node only has to carry the success type.
-            return TExpr(span, TTry(t, ok, fail, ty, fail, value, None))
+        // The trial's reading is thrown away, so the node only has to carry the success type.
+        return TExpr(span, TTry(t, ok, fail, ty, fail, value, None))
     end if
 
     if cx.open_result == "function" then
@@ -5098,16 +5101,25 @@ private open_try(cx: &Analyzer, span: Span, mark: Span, t: TExpr, ty: Type, ok: 
            s"'val f: &Fn(…) -> ${module_show(base)}[…] = …'")
 end open_try
 
-// The error type a generic call's parameter fixes of the `Result` its callable yields.
-private result_error(cx: &Analyzer, shape: VariantSeed) -> Option[Type]
+// The name `Result` gives the type parameter its error is, by which a seed binds it.
+result_error_name(cx: &Analyzer) -> Option[string]
     val decl = cx.an.tables.types.get(result_key())
 
     if decl.is_none() then return None
 
     decl.unwrap().kind match
-        EnumOf(ed) -> if ed.tparams.len() < 2 then None else bound_type(shape.known, ed.tparams[1])
+        EnumOf(ed) -> if ed.tparams.len() < 2 then None else Some(ed.tparams[1])
         _ -> None
-end result_error
+end result_error_name
+
+// Which of the two fallible enums a type is (empty for neither), and what its failure carries: a
+// `Result`'s error type, an `Option`'s `unit`.
+fallible_base(t: Type) -> string = if fallible_parts(t).is_some() then base_of(t) else ""
+fallible_error(t: Type) -> Type = fallible_parts(t) match
+    Some((_, fail, _)) -> carried(fail)
+    None -> Unit
+
+is_result_key(key: string) -> bool = key == result_key()
 
 // The library's `From`, whose one member is what a `?` across two error types goes through.
 private from_key() -> string = module_qualify(StdModule, "From")
