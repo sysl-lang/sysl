@@ -2,6 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
+import sysl.container.{Set, set}
 import sysl.text.Search
 
 // **The seam between the analyzer and the lowering**: what a program has to be true of before any of
@@ -56,6 +57,8 @@ private checks_before_lowering(a: &Analysis, p: TProgram, own: Buf[string],
     check_done("quad_externs")
     check_nested_empty_externs(a, emitted)
     check_done("nested_empty_externs")
+    check_nested_empty_fn_pointers(a, emitted)
+    check_done("nested_empty_fn_pointers")
     check_general_regs(a, emitted, own, pruned)
     check_done("general_regs")
     promotions
@@ -1447,6 +1450,139 @@ private nested_empty_reason(a: &Analysis, t: Type, found: (string, Type)) -> str
     "differently on the two sides of the call. Give the empty struct a field, or take " +
     s"'${found.0}' out of $shown"
 end nested_empty_reason
+
+// **A C function pointer is a C signature as much as an `extern` is**: a call through a `*extern(A) ->
+// R` is lowered by the `extern` call's own `gen_foreign_call`, and C calls through one it was handed
+// under its own layout of `A` and `R`. So a `*extern` type taking or answering, by value, a struct
+// holding an empty struct is refused on the machines `check_nested_empty_externs` refuses such an
+// `extern` on, and for the same reason.
+//
+// **The refusal is of the type**, wherever the program this build emits mentions it -- an `extern`'s
+// signature, module storage, a function's signature, a struct's or an enum's field, any depth of
+// pointer, array or function pointer, and every expression of every body (a local, a call through
+// one, a cast) -- rather than at the calls alone: a pointer sysl only stores and C calls through is
+// the same disagreement. Each type is refused once, where the walk first meets it; a struct's fields
+// are blamed on the struct's own declaration.
+check_nested_empty_fn_pointers(a: &Analysis, p: TProgram)
+    if !c_sizes_empty(a.tables.target) then return
+
+    var types: Set[string] = set()
+    var structs: Set[string] = set()
+    val met = &types
+    val held = &structs
+
+    for x in p.externs
+        val home = a.tables.extern_scopes.get(x.name)
+
+        if home.is_none() then continue
+
+        val at = home.unwrap()
+
+        for ty in x.params
+            fn_pointers_in(a, at.scope, at.span, ty, met, held)
+
+        fn_pointers_in(a, at.scope, at.span, x.ret_ty, met, held)
+
+    for v in p.vals
+        val d = a.tables.vals.get(v.symbol)
+
+        if d.is_some() then fn_pointers_in(a, d.unwrap().scope, d.unwrap().span, v.ty, met, held)
+
+    for f in p.funcs
+        val scope = func_home(a, f.name)
+
+        for item in f.params
+            fn_pointers_in(a, scope, f.span, item.1, met, held)
+
+        fn_pointers_in(a, scope, f.span, f.ret_ty, met, held)
+
+        val walk = expr_walk(false, e -> fn_pointers_in(a, scope, e.span, texpr_type(e), met, held))
+
+        walk_stmts(f.body.stmts, walk)
+
+        if f.body.result.is_some() then walk_texpr(f.body.result.unwrap(), walk)
+
+    val home = entry_home(a)
+
+    walk_stmts(p.main, expr_walk(false, e -> fn_pointers_in(a, home, e.span, texpr_type(e), met, held)))
+end check_nested_empty_fn_pointers
+
+// Every C function pointer type `t` is or holds -- through pointers, arrays, slices, the fields of a
+// struct or an enum and a function pointer's own signature -- each refused where it must be. `met` is
+// the function pointer types already asked, `held` the structs and enums already entered.
+private fn_pointers_in(a: &Analysis, scope: Scope, at: Span, t: Type, met: *Set[string],
+                       held: *Set[string])
+    underlying(t) match
+        CFn(params, ret, _) ->
+            // One type whatever its parameters are named (`reference/ffi.md`), shown as written.
+            if !met.add(type_show(nameless(underlying(t)))) then return
+
+            refuse_fn_pointer(a, scope, at, underlying(t))
+
+            for item in params
+                fn_pointers_in(a, scope, at, item, met, held)
+
+            fn_pointers_in(a, scope, at, *ret, met, held)
+        Ptr(inner, _) -> fn_pointers_in(a, scope, at, *inner, met, held)
+        Ref(inner, _) -> fn_pointers_in(a, scope, at, *inner, met, held)
+        Weak(inner) -> fn_pointers_in(a, scope, at, *inner, met, held)
+        Array(_, elem, _) -> fn_pointers_in(a, scope, at, *elem, met, held)
+        Slice(elem, _) -> fn_pointers_in(a, scope, at, *elem, met, held)
+        Pack(elems) ->
+            for item in elems
+                fn_pointers_in(a, scope, at, item, met, held)
+        Results(parts) ->
+            for item in parts.fields
+                fn_pointers_in(a, scope, at, item.1, met, held)
+        Struct(d) ->
+            if !held.add(d.name()) then return
+
+            val decl = a.tables.types.get(d.base)
+            val home = if decl.is_some() then decl.unwrap().scope else scope
+            val spot = if decl.is_some() then decl.unwrap().span else at
+
+            for item in d.fields
+                fn_pointers_in(a, home, spot, item.1, met, held)
+
+            for item in d.targs
+                fn_pointers_in(a, scope, at, item, met, held)
+        Enum(d) ->
+            if !held.add(d.name()) then return
+
+            val decl = a.tables.types.get(d.base)
+            val home = if decl.is_some() then decl.unwrap().scope else scope
+            val spot = if decl.is_some() then decl.unwrap().span else at
+
+            for v in d.variants
+                for item in v.fields
+                    fn_pointers_in(a, home, spot, item.1, met, held)
+
+            for item in d.targs
+                fn_pointers_in(a, scope, at, item, met, held)
+        _ -> ()
+end fn_pointers_in
+
+// The refusals one C function pointer type earns: each parameter, then the result, that crosses by
+// value holding an empty struct inside a struct that occupies bytes.
+private refuse_fn_pointer(a: &Analysis, scope: Scope, at: Span, t: Type)
+    val shown = type_show(t)
+
+    underlying(t) match
+        CFn(params, ret, _) ->
+            for i in 0..<params.len()
+                val found = nested_empty_here(a, params[i])
+
+                if found.is_some()
+                    a.fault(scope, at, s"parameter ${i + 1} of the function pointer type '$shown' is " +
+                            nested_empty_reason(a, params[i], found.unwrap()))
+
+            val answered = nested_empty_here(a, *ret)
+
+            if answered.is_some()
+                a.fault(scope, at, s"the function pointer type '$shown' returns " +
+                        nested_empty_reason(a, *ret, answered.unwrap()))
+        _ -> ()
+end refuse_fn_pointer
 
 // Whether an `f128` in `f`'s signature is something C on `t` can call it with. The quad runtime's
 // routines are the exception: LLVM is their only caller, and it passes `fp128` the same way on every

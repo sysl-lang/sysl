@@ -503,6 +503,35 @@ programmer's business, as above. A pointer to an empty struct itself is another 
 `@export` hands it to C, since the header then declares the empty struct
 (*A struct's layout in the header*, below).
 
+**A [function pointer](#a-function-s-address-extern-a-b-r) whose signature carries such a struct by
+value is refused on the same target, for the same reason**: a call through a `*extern(A) -> R` is an
+`extern` call, and C calls through one it was handed under its own layout of `A`. The type itself is
+refused, wherever the program mentions it — an `extern`'s parameter, a struct's field, module
+storage, a local, another function pointer's signature — whether or not sysl ever calls through it,
+and once per type. Built for `x86_64-windows`, this
+
+```sysl
+struct Empty
+end Empty
+
+struct Tagged
+    id: i32
+    mark: Empty
+    len: i32
+
+extern on_send(f: *extern(Tagged) -> unit)
+
+on_send(null)
+```
+
+is refused with
+
+```text
+error: parameter 1 of the function pointer type '*extern(Tagged) -> unit' is Tagged, whose field 'mark' is Empty: an empty struct occupies no bytes in sysl and four in Microsoft's C on 'x86_64-windows', so Tagged is laid out differently on the two sides of the call. Give the empty struct a field, or take 'mark' out of Tagged
+```
+
+and built for any other target it compiles. A `*extern(*Tagged) -> unit` is not refused.
+
 **A [vector](/reference/vectors/) is the one shape that does not cross, in either direction.** Which
 register a `<4>f32` arrives in differs by target *and* by which instruction-set extensions the other
 side was compiled with — the same C source built with and without `-mavx2` does not agree — so there
