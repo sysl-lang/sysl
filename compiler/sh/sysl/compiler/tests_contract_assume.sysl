@@ -518,3 +518,91 @@ ca_a_struct_without_clauses_is_told_nothing()
     val body = ca_body(ca_ir(seq("")), "Seq.at")
 
     assert(!body.contains("@llvm.assume"), body)
+
+// -- every clause and every receiver --------------------------------------------------------------------
+
+// A ring that keeps its count below a capacity below the storage's length: the element read is one
+// compare only where the optimizer is told both links, which chain `i < count` to `i < elems.len`.
+private ring(clauses: string, recv: string) -> string =
+    "@noinline\nroom(n: usize) -> usize = n\n\nstruct Ring\n    elems: []int\n    count: usize\n    cap: usize\n" +
+    clauses + s"\n    @noinline\n    at($recv, i: usize) -> int\n        if i >= self.count then exit(3)\n\n" +
+    "        self.elems[i]\n\nval r: &Ring = Ring([1, 2, 3], 2, 3)\nprint(r.at(1))\n"
+
+private ring_compares(clauses: string, recv: string, name: string) -> Option[int] = ca_optimized(ring(clauses, recv)).map(
+    out -> ca_compares(ca_body(out, name)))
+
+private both_links() -> string = "    invariant count <= cap && cap <= elems.len\n"
+
+// Every clause used to be said as one `&&` of them all, which lowers to a branch and so was never
+// kept: a struct with two clauses, or one clause written with `&&`, told the optimizer nothing.
+@test("each side of a clause's '&&' is told")
+ca_each_side_of_an_and_is_told()
+    if ca_no_library() then return
+
+    ring_compares(both_links(), "self", "Ring.at") match
+        None -> ()
+        Some(n) -> assert_eq(n, 1)
+
+@test("and so is each of two clauses")
+ca_each_of_two_clauses_is_told()
+    if ca_no_library() then return
+
+    ring_compares("    invariant count <= cap\n    invariant cap <= elems.len\n", "self", "Ring.at") match
+        None -> ()
+        Some(n) -> assert_eq(n, 1)
+
+@test("one link alone does not settle the read")
+ca_one_link_alone_does_not_settle_it()
+    if ca_no_library() then return
+
+    ring_compares("    invariant count <= cap\n", "self", "Ring.at") match
+        None -> ()
+        Some(n) -> assert_eq(n, 2)
+
+@test("a clause that cannot be repeated leaves the others told")
+ca_a_clause_that_cannot_be_repeated_leaves_the_others()
+    if ca_no_library() then return
+
+    ring_compares(both_links() + "    invariant room(count) >= count\n", "self", "Ring.at") match
+        None -> ()
+        Some(n) -> assert_eq(n, 1)
+
+    val body = ca_body(ca_ir(ring(both_links() + "    invariant room(count) >= count\n", "self")), "Ring.at")
+
+    assert(!body.contains("@room"), body)
+
+@test("an '||' is not split")
+ca_an_or_is_not_split()
+    if ca_no_library() then return
+
+    val body = ca_body(ca_ir(ring("    invariant count <= cap || cap <= elems.len\n", "self")), "Ring.at")
+
+    assert(!body.contains("@llvm.assume"), body)
+
+@test("a '&self' member is told too")
+ca_a_reference_receiver_is_told()
+    if ca_no_library() then return
+
+    assert(ca_body(ca_ir(ring(both_links(), "&self")), "Ring.at").contains("call void @llvm.assume(i1 "))
+
+    ring_compares(both_links(), "&self", "Ring.at") match
+        None -> ()
+        Some(n) -> assert_eq(n, 1)
+
+@test("and a '*self' one")
+ca_a_pointer_receiver_is_told()
+    if ca_no_library() then return
+
+    ring_compares(both_links(), "*self", "Ring.at") match
+        None -> ()
+        Some(n) -> assert_eq(n, 1)
+
+@test("and a member of a struct with a destructor")
+ca_a_destructor_struct_is_told()
+    if ca_no_library() then return
+
+    val src = ring(both_links(), "self") + "\nimpl Drop for Ring\n    drop(self) = print(\"gone\")\n"
+
+    ca_optimized(src) match
+        None -> ()
+        Some(out) -> assert_eq(ca_compares(ca_body(out, "Ring.at")), 1)

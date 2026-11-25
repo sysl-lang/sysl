@@ -107,17 +107,27 @@ assume_receiver_invariant(e: *Emit, f: TFunc)
 
     val ty = f.params[0].1
 
-    unqualified(ty) match
-        Struct(d) -> assume_invariant_of(e, f.span, TExpr(f.span, TLoad("self", ty)), *d)
-        Ptr(inner, _) ->
-            val target = unqualified(*inner)
+    // A receiver held as `*Self` or as `&Self` is read through it, as a field selection on it is
+    // (`auto_deref`); either way the struct behind it passed the check at every write.
+    val through = unqualified(ty) match
+        Ptr(inner, _) -> Some(*inner)
+        Ref(inner, _) -> Some(*inner)
+        _ -> None
 
-            target match
-                Struct(d) ->
-                    val recv = TExpr(f.span, TDeref(TExpr(f.span, TLoad("self", ty)), target))
+    if through.is_none()
+        unqualified(ty) match
+            Struct(d) -> assume_invariant_of(e, f.span, TExpr(f.span, TLoad("self", ty)), *d)
+            _ -> ()
+        return
+    end if
 
-                    assume_invariant_of(e, f.span, recv, *d)
-                _ -> ()
+    val target = unqualified(through.unwrap())
+
+    target match
+        Struct(d) ->
+            val recv = TExpr(f.span, TDeref(TExpr(f.span, TLoad("self", ty)), target))
+
+            assume_invariant_of(e, f.span, recv, *d)
         _ -> ()
 end assume_receiver_invariant
 
@@ -131,38 +141,41 @@ private assume_invariant_of(e: *Emit, at: Span, recv: TExpr, s: StructType)
     if !inv.body.stmts.is_empty() || inv.params.len() != s.fields.len() then return
     if inv.body.result.is_none() then return
 
-    val found_clause = all_clauses(inv.body.result.unwrap())
+    val found_clauses = all_clauses(inv.body.result.unwrap())
 
-    if found_clause.is_none() then return
-
-    val clause = found_clause.unwrap()
-
-    if ghostly(e, clause) then return
+    if found_clauses.is_none() then return
 
     var sub: Buf[(string, TExpr)] = buf()
 
     for i in 0..<s.fields.len()
         sub.push((inv.params[i].0, TExpr(at, TField(recv, int(i), s.fields[i].1))))
 
-    // **A module-level name is refused here where a postcondition keeps it**, because the two facts
-    // are about different moments: an invariant is assumed at a member's entry, arbitrarily long after
-    // the write that checked it, and a `var` the clause read may have moved in between.
-    val ported = port(clause, sub, false, false)
+    // **Each conjunct is said on its own**, and each is kept or put back on its own: a value of the type
+    // passed every clause, and a clause `a && b` held only where both halves did, so every conjunct is
+    // a fact by itself. Said together they would be one `&&`, which lowers to a branch and so is never
+    // kept -- one clause that cannot be repeated would silence the ones that can.
+    for clause in found_clauses.unwrap()
+        if !ghostly(e, clause)
+            // **A module-level name is refused here where a postcondition keeps it**, because the two
+            // facts are about different moments: an invariant is assumed at a member's entry,
+            // arbitrarily long after the write that checked it, and a `var` the clause read may have
+            // moved in between.
+            val ported = port(clause, sub, false, false)
 
-    if ported.is_some() then assume_clause(e, ported.unwrap())
+            if ported.is_some() then assume_clause(e, ported.unwrap())
 end assume_invariant_of
 
-// The clauses of a struct's `invariant` as their conjunction, out of the `if`s they lowered to
-// (`first_broken`): each clause the condition of one, as a block holding just the clause, and the
-// next `if` its branch for a clause that holds, down to the empty answer. Nothing where the body is
-// not that shape.
-private all_clauses(answer: TExpr) -> Option[TExpr]
-    var out: Option[TExpr] = None
+// The conjuncts of a struct's `invariant`, out of the `if`s its clauses lowered to (`first_broken`):
+// each clause the condition of one, as a block holding just the clause, and the next `if` its branch
+// for a clause that holds, down to the empty answer. A clause written `a && b` gives its two halves.
+// Nothing where the body is not that shape.
+private all_clauses(answer: TExpr) -> Option[Buf[TExpr]]
+    var out: Buf[TExpr] = buf()
     var at = answer
 
     loop
         val (cond, held) = *at.kind match
-            TStrLit(_) -> return out
+            TStrLit(_) -> return Some(out)
             TIf(conds, then_block, Some(_), _) if conds.len() == 1 && then_block.stmts.is_empty() ->
                 val clause = conds[0] match
                     TCondTest(c) -> *c.kind match
@@ -175,11 +188,17 @@ private all_clauses(answer: TExpr) -> Option[TExpr]
                 (clause, then_block.result.unwrap())
             _ -> return None
 
-        out = out match
-            Some(sofar) -> Some(TExpr(sofar.span, TLogical("&&", sofar, cond)))
-            None -> Some(cond)
+        conjuncts(cond, &out)
         at = held
 end all_clauses
+
+// The halves of `x` joined by `&&`, left to right, onto `out`; `x` itself where it is no `&&`.
+private conjuncts(x: TExpr, out: *Buf[TExpr])
+    *x.kind match
+        TLogical(op, l, r) if op == "&&" ->
+            conjuncts(l, out)
+            conjuncts(r, out)
+        _ -> out.push(x)
 
 // -- lowering a clause that may do nothing -------------------------------------------------------------
 

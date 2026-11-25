@@ -575,7 +575,12 @@ it again with `elems.len`. Told `count <= elems.len`, the second compare is impl
 goes: one compare per element read, where there were two.
 
 The clause is repeated by the same rule a postcondition is — lowered, and kept only if what came out
-is arithmetic and comparisons over the receiver's fields. **What it rests on is the checking**, so the
+is arithmetic and comparisons over the receiver's fields. **Each clause is said on its own, and so is
+each side of a clause's `&&`**: a value passed every clause, and `a && b` held only where both sides
+did, so one side that cannot be repeated — one that calls something, say — leaves the others told. An `||` is not split, since `a || b` holding says nothing of `a`. The receiver may be taken as
+`self`, `*self` or `&self`; the struct behind each passed the same checks.
+
+**What it rests on is the checking**, so the
 one thing outside it is what the checking cannot see: bytes written into the struct through a pointer
 of some other type, or by C, which are the writer's promise to keep exactly as every other guarantee
 about raw memory is ([the memory model](/reference/memory/)).
