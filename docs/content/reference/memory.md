@@ -4010,8 +4010,14 @@ wait_for(n: u64)
   An exception may abandon an `ldm`, `stm`, `ldrd` or `strd` part-way and run it again from the start,
   reading a read-to-clear register twice; one `ldr` is done or not begun. It is an `asm` here too, at every
   optimisation level and under LTO, and a `bool`, a `u12`, a float and a pointer move as they do on
-  AArch64. A volatile of 8 bytes (`u64`, `f64`) is two words on these machines and keeps LLVM's
-  `load volatile`, which may be an `ldrd` or two `ldr`s.
+  AArch64.
+- **On 32-bit ARM a volatile wider than 32 bits is one such `ldr` or `str` per 32-bit word, the word at
+  the lowest address first.** A `u64`, an `i64` or an `f64` is two plain word accesses, a `u128` four;
+  a float goes through the general registers. They are **separate accesses**: neither atomic nor one
+  bus transaction, so a device or an interrupt handler may change the high word between the two reads —
+  a free-running 64-bit counter is read again until two reads agree on the high word. A width that is
+  not whole words (`u40`, `u48`) has a tail no word access moves, and is refused there; one of 32 bits
+  or fewer (`u24`) keeps LLVM's access.
 - **Every other processor keeps LLVM's `load volatile`**: x86 decodes the faulting instruction itself,
   and RISC-V has no writeback addressing, so a `volatile u128` is accepted there.
 
@@ -4022,6 +4028,31 @@ struct Regs
 
 ```error
 'volatile u128' is not a type on aarch64-freestanding: it is 128 bits wide, and an AArch64 volatile access is one 'ldr' or 'str' of at most 8 bytes (64 bits). Make two 64-bit volatile accesses instead, as two 'volatile u64' fields or elements
+```
+
+```sysl target=thumb-freestanding
+struct Timer
+    stamp: volatile u48
+```
+
+```error
+'volatile u48' is not a type on thumb-freestanding: it is 48 bits wide, and a 32-bit ARM volatile wider than 32 bits is made as whole 32-bit words, one 'ldr' or 'str' each, which 48 bits is not
+```
+
+The counter read on a Cortex-M, where a `volatile u64` is two word reads:
+
+```sysl build=c target=thumb-freestanding
+struct Clock
+    count: volatile u64
+
+@export("now")
+now(c: *Clock) -> u64
+    loop
+        val before = c.count
+        val after = c.count
+
+        if after >> 32 == before >> 32 then return after
+end now
 ```
 
 A loop walking down a FIFO's registers is the shape LLVM folds. Each read of `*at` here is

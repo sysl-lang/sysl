@@ -909,6 +909,8 @@ end emit
 private emit_plain_access(e: *Emit, i: Inst, arm: bool)
     val acc = if arm then AccVolatileArm else AccVolatileA64
 
+    if arm && emit_arm_words(e, i) then return
+
     i match
         InLoad(d, ty, p, AccVolatile, align) if plain_fits(ty, align, arm).is_some() ->
             val bytes = plain_fits(ty, align, arm).unwrap()
@@ -935,6 +937,81 @@ end emit_plain_access
 
 private plain_fits(ty: LType, align: Option[int], arm: bool) -> Option[int] =
     if arm then arm_volatile_bytes(ty, align) else a64_volatile_bytes(ty, align)
+
+// On 32-bit ARM a volatile wider than a word (`arm_volatile_words`: a `u64`, an `f64`, a `u128`) is made
+// as one plain `ldr` or `str` of each 32-bit word, the lowest address first: separate accesses, neither
+// atomic nor one bus transaction. A load gathers the words into the integer of the whole width (a float
+// is that integer reinterpreted); a store takes each word out of it. Answers whether `i` was such an
+// access, and is now emitted.
+private emit_arm_words(e: *Emit, i: Inst) -> bool
+    i match
+        InLoad(d, ty, p, AccVolatile, align) if arm_volatile_words(ty, align).is_some() ->
+            val n = arm_volatile_words(ty, align).unwrap()
+            val whole = LInt(n * 32)
+            val is_float = ty match
+                LFloat(_, _) -> true
+                _ -> false
+
+            var acc = VUndef
+
+            for k in 0..<n
+                val word = fresh_reg(e)
+                val wide = fresh_reg(e)
+
+                e.current.push(InLoad(word, LInt(32), arm_word_at(e, p, k), AccVolatileArm, None))
+                e.current.push(InCast(wide, CastZExt, LInt(32), word, whole))
+
+                if k == 0
+                    acc = wide
+                else
+                    val moved = fresh_reg(e)
+                    val joined = if k == n - 1 && !is_float then d else fresh_reg(e)
+
+                    e.current.push(InBin(moved, OpShl, whole, wide, VInt(from_int(long(32 * k)))))
+                    e.current.push(InBin(joined, OpOr, whole, acc, moved))
+                    acc = joined
+
+            if is_float then e.current.push(InCast(d, CastBitCast, whole, acc, ty))
+
+            true
+        InStore(ty, v, p, AccVolatile, align) if arm_volatile_words(ty, align).is_some() ->
+            val n = arm_volatile_words(ty, align).unwrap()
+            val whole = LInt(n * 32)
+            var bits = v
+
+            ty match
+                LFloat(_, _) ->
+                    bits = fresh_reg(e)
+                    e.current.push(InCast(bits, CastBitCast, ty, v, whole))
+                _ -> ()
+
+            for k in 0..<n
+                var from = bits
+
+                if k > 0
+                    from = fresh_reg(e)
+                    e.current.push(InBin(from, OpLShr, whole, bits, VInt(from_int(long(32 * k)))))
+
+                val word = fresh_reg(e)
+
+                e.current.push(InCast(word, CastTrunc, whole, from, LInt(32)))
+                e.current.push(InStore(LInt(32), word, arm_word_at(e, p, k), AccVolatileArm, None))
+
+            true
+        _ -> false
+end emit_arm_words
+
+// The address of the `k`th 32-bit word from `p`.
+private arm_word_at(e: *Emit, p: Val, k: int) -> Val
+    if k == 0 then return p
+
+    val r = fresh_reg(e)
+    var idx: Buf[IrArg] = buf()
+
+    idx.push(ir_arg(LInt(32), VInt(from_int(long(4 * k)))))
+    e.current.push(InGep(r, LInt(8), p, idx))
+    r
+end arm_word_at
 
 // Emits a stack slot into the function's entry block rather than where it is needed. Every name is
 // unique within a function, so hoisting is safe -- and it keeps a slot inside a loop from growing

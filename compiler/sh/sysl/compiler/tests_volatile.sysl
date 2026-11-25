@@ -1075,3 +1075,74 @@ vo_wide_other_processors_keep_it()
 
         assert(!vo_has(out, "at most 8 bytes"), out)
         assert(vo_has(vo_define(out, "w"), "load volatile i128"), out)
+
+// On 32-bit ARM a volatile wider than a word is made one 32-bit word at a time, so its width must be
+// whole words (`reference/memory.md § Device memory`).
+private val vo_arm_machines: []const string = ["thumb-freestanding", "thumbv6m-freestanding", "thumbv7em-freestanding-dp"]
+
+private vo_arm_said(out: string, shown: string, bits: string)
+    assert(vo_has(out, s"'volatile $shown' is not a type on "), out)
+    assert(vo_has(out, s"it is $bits bits wide"), out)
+    assert(vo_has(out, "made as whole 32-bit words"), out)
+    assert(vo_has(out, "Widen it to a multiple of 32 bits"), out)
+end vo_arm_said
+
+@test("a volatile u48 is refused on 32-bit ARM, where no run of word accesses moves it exactly")
+vo_arm_u48_refused()
+    if !vo_ready() then return
+
+    for m in vo_arm_machines
+        vo_arm_said(vo_on(m, "@export(\"w\")\nw(p: *volatile u48) = *p = *p + 1\n"), "u48", "48")
+
+@test("so are u40, i33, u56 and u72, at every place a qualifier goes")
+vo_arm_odd_widths_refused()
+    if !vo_ready() then return
+
+    for m in vo_arm_machines
+        vo_arm_said(vo_on(m, "struct R\n    a: volatile u40\n@export(\"w\")\nw(r: *R) = r.a = 1\n"), "u40", "40")
+        vo_arm_said(vo_on(m, "struct R\n    a: [2]volatile i33\n@export(\"w\")\nw(r: *R) = r.a[0] = 1\n"), "i33", "33")
+        vo_arm_said(vo_on(m, "static var x: volatile u72 = 0\n@export(\"w\")\nw() = x = 1\n"), "u72", "72")
+        vo_arm_said(vo_on(m, "@export(\"w\")\nw(v: []volatile u56) = v[0] = 1\n"), "u56", "56")
+
+@test("a generic over Integer instantiated at u48 is refused on 32-bit ARM")
+vo_arm_generic_u48_refused()
+    if !vo_ready() then return
+
+    val src = "bump[T: Integer](p: *volatile T) = *p = *p + 1\n@export(\"v\")\nv(p: *u8) = bump[u48](ptr_cast(p))\n"
+
+    for m in vo_arm_machines
+        assert(vo_has(vo_on(m, src), "made as whole 32-bit words"))
+
+@test("a volatile of whole words -- u64, i64, f64, u96, u128, u256 -- is accepted on 32-bit ARM")
+vo_arm_whole_words_accepted()
+    if !vo_ready() then return
+
+    // Each read of `*p` is one volatile i32 load per word, and the write one store per word (the suite
+    // reads each word's asm back as the access it is).
+    for m in vo_arm_machines
+        for item in [("u64", 2), ("i64", 2), ("f64", 2), ("u96", 3), ("u128", 4), ("u256", 8)]
+            val ty = item.0
+            val words = item.1
+            val out = vo_on(m, s"@export(\"w\")\nw(p: *volatile $ty) = *p = *p + *p\n")
+            val body = vo_define(out, "w$$sysl")
+
+            assert(!vo_has(out, "whole 32-bit words"), out)
+            assert_eq(vo_count(body, "load volatile i32"), usize(2 * words), body)
+            assert_eq(vo_count(body, "store volatile i32"), usize(words), body)
+            assert_eq(vo_count(body, "load volatile") + vo_count(body, "store volatile"), usize(3 * words), body)
+
+@test("a volatile of 32 bits or fewer at an odd width (u24) is accepted on 32-bit ARM, as before")
+vo_arm_narrow_odd_accepted()
+    if !vo_ready() then return
+
+    for m in vo_arm_machines
+        assert(!vo_has(vo_on(m, "@export(\"w\")\nw(p: *volatile u24) = *p = 1\n"), "whole 32-bit words"))
+
+@test("a volatile u48 is still accepted on AArch64 and on x86_64")
+vo_arm_u48_elsewhere_accepted()
+    if !vo_ready() then return
+
+    for m in ["aarch64-freestanding", "x86_64-linux"]
+        val out = vo_on(m, "@export(\"w\")\nw(p: *volatile u48) = *p = *p + 1\n")
+
+        assert(!vo_has(out, "whole 32-bit words") && vo_has(out, "define"), out)

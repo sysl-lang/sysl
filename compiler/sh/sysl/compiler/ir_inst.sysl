@@ -205,7 +205,8 @@ ord_on_failure(o: IrOrdering) -> IrOrdering = o match
 // **`AccVolatileArm` is the same on 32-bit ARM (Thumb)**: one `ldr`/`str` (`b`/`h`) of a general
 // register from a bare register address, where LLVM's own may be a post-indexed `ldr r3, [r2], #4`, an
 // `ldm r2!, {r3}`, or a `vldr s2, [r0]` -- an `ldm`/`stm` an exception may abandon and restart, so a
-// read-to-clear register is read twice. A volatile of 8 bytes there is two words and keeps LLVM's.
+// read-to-clear register is read twice. A volatile wider than a word there is one such access per word,
+// lowest address first (`arm_volatile_words`, `emit.sysl`'s `emit_arm_words`).
 enum IrAccess
     AccPlain
     AccVolatile
@@ -234,6 +235,23 @@ a64_volatile_bytes(ty: LType, align: Option[int]) -> Option[int] = plain_volatil
 
 // The same on 32-bit ARM, whose general registers and pointers are 4 bytes: storage of 1, 2 or 4.
 arm_volatile_bytes(ty: LType, align: Option[int]) -> Option[int] = plain_volatile_bytes(ty, align, 4)
+
+// The 32-bit words a volatile of `ty` is made as on 32-bit ARM, where it is wider than one: an integer or
+// float of a whole number of words (a `u64`, an `f64`, a `u128`), at no less than a word's alignment.
+// `None` for anything one access moves, or that no run of word accesses moves exactly (a `u48`, which
+// the analyzer refuses there).
+arm_volatile_words(ty: LType, align: Option[int]) -> Option[int]
+    val bits = ty match
+        LInt(n) -> n
+        LFloat(n, _) -> n
+        _ -> return None
+
+    if bits <= 32 || bits % 32 != 0 then return None
+
+    align match
+        Some(a) if a < 4 -> None
+        _ -> Some(bits / 32)
+end arm_volatile_words
 
 // The bytes of `ty`'s storage where one `ldr`/`str` of a `word`-byte general register moves it.
 private plain_volatile_bytes(ty: LType, align: Option[int], word: int) -> Option[int]
