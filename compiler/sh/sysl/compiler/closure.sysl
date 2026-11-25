@@ -1675,18 +1675,18 @@ private closure_body(cx: &Analyzer, span: Span, st: &StructType, fname: string,
     // body yields is what it yields -- the only reading under which `x -> x * 2` has a result at
     // all.
     //
-    // **A `?` in it is the one thing that needs the result first**, since its failure is returned
-    // as the result. So the body is read once on trial with each `?` taken as it stands, and what
-    // the trial yields is the result it is then read against for real, exactly as a closure the
-    // context gave the whole result is read. Where the callable the closure stands at yields an
-    // `Option` or a `Result` -- `and_then[U](f: T -> Option[U])` before anything has said what `U`
-    // is -- a `?` of the other enum is refused on that word; where nothing says even that, the
-    // body says it all.
+    // **A `?` or a `return` with a value in it needs the result first**, since a `?`'s failure is
+    // returned as the result and a returned value is held to it. So the body is read once on trial
+    // with each taken as it stands (`open_try` says one was), and what the trial yields is the
+    // result it is then read against for real, exactly as a closure the context gave the whole
+    // result is read. Where the callable the closure stands at yields an `Option` or a `Result` --
+    // `and_then[U](f: T -> Option[U])` before anything has said what `U` is -- a `?` of the other
+    // enum is refused on that word; where nothing says even that, the body says it all.
     var result = given
     var read: Option[TBlock] = None
     var shape = try_shape_of(cx, span, given)
 
-    if shape.is_none() && given.is_none() && may_hold_try(cx, body)
+    if shape.is_none() && given.is_none() && needs_result_first(cx, body)
         shape = Some(VariantSeed(span, "", no_bindings(), buf()))
 
     if shape.is_some()
@@ -1699,7 +1699,7 @@ private closure_body(cx: &Analyzer, span: Span, st: &StructType, fname: string,
         var first = closure_block(inner, rest, None)
         var still_open = false
 
-        // A body with no `?` in it was read the one way it is ever read, so that reading is kept.
+        // A body with neither in it was read the one way it is ever read, so that reading is kept.
         if !inner.open_try
             keep_trial(inner)
             read = Some(first)
@@ -1713,7 +1713,8 @@ private closure_body(cx: &Analyzer, span: Span, st: &StructType, fname: string,
             // parameter would have. The body is read on trial again with that error handed to its
             // value. `?`s propagating two different errors name no one of them, and are told so.
             val seen = inner.try_seen.copy()
-            val key = if shape.unwrap().key != "" then shape.unwrap().key else fallible_base(seen[0].1)
+            val key = if shape.unwrap().key != "" || seen.is_empty() then shape.unwrap().key
+                      else fallible_base(seen[0].1)
             val err_name = result_error_name(inner)
             var clash: Option[(Span, Type, Type)] = None
 
@@ -1841,10 +1842,10 @@ private try_shape_of(cx: &Analyzer, span: Span, given: Option[Type]) -> Option[V
     if seed.at.start != span.start || seed.at.end != span.end then None else Some(seed)
 end try_shape_of
 
-// Whether a closure's body is written with a `?` in it at all. One without has nothing to take on
-// trial and is read once; one whose `?` is only in a string or a comment is read on trial, and that
-// reading is the one kept.
-private may_hold_try(cx: &Analyzer, body: Buf[Stmt]) -> bool
+// Whether a closure's body is written with a `?` or a `return` in it at all. One without has nothing
+// to take on trial and is read once; one where they are only in a string, a comment or a longer
+// name is read on trial, and that reading is the one kept.
+private needs_result_first(cx: &Analyzer, body: Buf[Stmt]) -> bool
     if body.is_empty() then return false
 
     val bytes = cx.scope.src.bytes
@@ -1854,11 +1855,21 @@ private may_hold_try(cx: &Analyzer, body: Buf[Stmt]) -> bool
     // A body whose text is not in this file cannot be looked at, so it is read on trial.
     if to > bytes.len || from >= to then return true
 
+    val word = "return"
+
     for i in from..<to
         if bytes[i] == u8('?') then return true
 
+        if i + word.len <= to && spells_at(bytes, i, word) then return true
+
     false
-end may_hold_try
+end needs_result_first
+
+private spells_at(bytes: []const u8, at: usize, word: string) -> bool
+    for j in 0..<word.len
+        if bytes[at + j] != word.bytes[j] then return false
+
+    true
 
 // The error the first `Result` `?` taken on trial propagates. A `never` one propagates nothing, since
 // its failure crosses into any error type, so it settles nothing.

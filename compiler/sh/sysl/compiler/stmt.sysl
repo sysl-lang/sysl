@@ -1201,7 +1201,12 @@ private return_stmt(cx: &Analyzer, span: Span, value: Option[Expr]) -> Buf[TStmt
 
     // In a closure whose result is read off its body, a value returned early is read as its last line
     // is: told what the callable's parameter or the body's `?`s fixed of the result (`closure_body`).
+    // **It is held to that result**, so the body is read again once the result is known, as a `?`'s
+    // is -- read only now, a `return "s"` from a body ending in `5` would hand a string back as an
+    // `int`.
     val seeded = cx.variant_seed
+
+    if want == Unknown && cx.open_result == "closure" then cx.open_try = true
 
     if want == Unknown && cx.open_result == "closure" && seeded.is_some()
         val s = seeded.unwrap()
@@ -1238,10 +1243,14 @@ private return_stmt(cx: &Analyzer, span: Span, value: Option[Expr]) -> Buf[TStmt
 end return_stmt
 
 // What a `return` hands back, read in the one position a function's own result list may stand.
+//
+// **A result not known is no type to read the value against**: in a closure whose result is read off
+// its body, a value returned early is read with nothing expected, as its last line is -- so `return if
+// c then Ok(1) else Err("b")` pools its branches as the same `if` ending the body does.
 private returned_value(cx: &Analyzer, e: Expr, want: Type) -> TExpr
     if cx.ret_is_list then return type_results(cx, e, Some(want))
 
-    type_expr(cx, e, Some(want))
+    type_expr(cx, e, if want == Unknown then None else Some(want))
 end returned_value
 
 // `become f(…)` -- `return f(…)` with the jump guaranteed. What is settled here is that there is a

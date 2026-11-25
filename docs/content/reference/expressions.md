@@ -2422,6 +2422,38 @@ print(twice, inc(41))
 A closure's parameter declares **no default**. A call reaches a closure through the `Fn` traits,
 which carry types and not names, so there would be nothing at the call to fill one from.
 
+**A closure's result is what its context says, or else what its body yields**, as for a function
+written `= …` with no result. A value it `return`s early is held to that result like any other
+function's: one that fits is taken, a narrower integer widens, and one that does not is refused. A
+`?` in such a body returns into the same result ([errors](/reference/errors/)).
+
+```sysl
+val first_even = (xs: []int) ->
+    for x in xs
+        if x % 2 == 0 then return x
+
+    -1
+
+print(first_even([3, 8, 5]), first_even([1]))
+```
+
+```output
+8 -1
+```
+
+```sysl
+val f = (c: bool) ->
+    if c then return "s"
+
+    5
+
+print(f(true))
+```
+
+```error
+return type mismatch: expected int, got string
+```
+
 ### A closure that does not outlive its variables captures them by reference
 
 **A closure that does not outlive the variables it captures holds where each `var` lives**, so a
