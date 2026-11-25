@@ -1355,13 +1355,21 @@ frame is laid in the frame**, not on the heap: the header and the payload a heap
 same way, in a slot of the frame. The destructor still runs when the last count goes, at the end of
 the scope as before; only the allocation is gone. A **factory** — a function whose answer is a box it
 built and kept nowhere else — lays that box in its caller's frame wherever the caller keeps it no
-longer than itself:
+longer than itself. So does a function whose answer is the box **another factory's call** answers it,
+kept nowhere else: `counter_plus` below hands its caller's slot on to `counter`, however deep the
+chain.
 
 ```sysl
 struct Counter
     n: int
 
 counter(start: int) -> &Counter = Counter(start)
+
+counter_plus(start: int) -> &Counter
+    val c = counter(start)
+
+    c.n += 1
+    c
 
 struct Res
     n: int
@@ -1376,6 +1384,7 @@ main()
 
     c.n += 2
     print(c.n)
+    print(counter_plus(1).n)
 
     val r: &Res = Res(1)
 
@@ -1385,12 +1394,13 @@ main()
 
 ```output
 7
+2
 1
 end
 closed 1
 ```
 
-Neither box above touches the heap. **A box stays on the heap wherever it may get out**: stored
+None of the boxes above touches the heap. **A box stays on the heap wherever it may get out**: stored
 anywhere but a local of the frame (module storage, a field reached through a reference or a pointer,
 a buffer, another box), returned other than as a factory's answer, captured by a closure, handed to a
 parameter whose body may let it out or answer it into something that does, weakened, given up with

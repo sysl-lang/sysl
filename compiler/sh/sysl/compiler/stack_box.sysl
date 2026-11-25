@@ -19,7 +19,10 @@ import sysl.container.{Map, map, Set, set}
 // call of a **factory** -- a function every way out of which may answer one box it built and kept
 // nowhere else, like `vector() -> &Vector[E] = Vector(slot_storage(0), 0, 0)` -- keyed by the call's
 // span. A factory call laid in the frame reaches the factory's **frame entry** (`<symbol>-frame`),
-// the same body taking one more parameter first: the caller's slot, which that one box is laid in.
+// the same body taking one more parameter first: the caller's slot, which that one box is laid in. A
+// body whose one site is a factory call it may answer, kept nowhere else, is a factory as well
+// (`vector_with(x)` answering `vector_of_size(1)`'s box): its frame entry hands the slot on to that
+// call's frame entry.
 //
 // **The question is a may-escape question, so every unknown answers "escapes".** A box is followed
 // through the locals that may hold it (a fixed point), each value built around it, each answer that
@@ -78,7 +81,7 @@ private stack_box_limit() -> usize = 1024
 stack_boxes(e: *Emit, p: TProgram) -> StackBoxes
     var out = no_stack_boxes()
     val tables: Option[TraitTables] = if p.entry_point then Some(tables_by_trait(p.vtables)) else None
-    val cx: &BoxCx = BoxCx(map(), p.funcs, map(), set(), map(), set(), map(), set(), tables, map())
+    val cx: &BoxCx = BoxCx(map(), p.funcs, map(), set(), map(), set(), map(), set(), tables, map(), map())
 
     for i in 0..<p.funcs.len()
         cx.index.put(p.funcs[i].name, i)
@@ -102,12 +105,43 @@ stack_boxes(e: *Emit, p: TProgram) -> StackBoxes
             if !w.escaped && w.answers
                 cx.factories.put(f.name, site.0)
 
-                if answers_only_site(f, site.0) then out.whole.add(f.name)
+                if answers_only_site(f, site.0, false) then out.whole.add(f.name)
 
                 break
             end if
         end for
     end for
+
+    // **A factory of a factory is a factory**: a body that builds no box of its own but may answer the
+    // box another factory's call answers it, and keeps that box nowhere else, has a frame entry too --
+    // one that hands its own caller's slot on to that call's frame entry. Each round may make the
+    // callers of the last round's factories factories in turn; a body is asked only once it is not one
+    // yet, so recursion among bodies none of which builds a box of its own makes none of them one.
+    var grew = true
+
+    while grew
+        grew = false
+
+        for f in p.funcs
+            if cx.factories.has(f.name) || !factory_shaped(p, f) || drops_a_param(e, f) then continue
+
+            for site in factory_calls(cx, f)
+                if mangle(ref_inner(site_ret(cx, site.1))) != mangle(ref_inner(f.ret_ty)) then continue
+
+                val w = follow_site(cx, f, site.0, true, true)
+
+                if !w.escaped && w.answers
+                    cx.factories.put(f.name, site.0)
+                    cx.chains.put(f.name, site.1)
+
+                    if out.whole.has(site.1) && answers_only_site(f, site.0, true) then out.whole.add(f.name)
+
+                    grew = true
+                    break
+                end if
+            end for
+        end for
+    end while
 
     for f in p.funcs
         if !frame_shaped(f) then continue
@@ -135,7 +169,13 @@ stack_boxes(e: *Emit, p: TProgram) -> StackBoxes
             good_calls.push(site.0)
             out.payloads.add(mangle(ref_inner(site_ret(cx, site.1))))
 
-            if !out.entries.has(site.1) then out.entries.put(site.1, cx.factories.get(site.1).unwrap())
+            // A factory of a factory's frame entry reaches the frame entry of the factory it calls.
+            var name = Some(site.1)
+
+            while name is Some(n) && !out.entries.has(n)
+                out.entries.put(n, cx.factories.get(n).unwrap())
+                name = cx.chains.get(n)
+            end while
         end for
 
         // Two boxes written at one span are told apart by nothing the emitter sees: either both are
@@ -169,6 +209,22 @@ drop_unentered(e: *Emit, p: TProgram, sb: StackBoxes) -> StackBoxes
     end for
 
     if gone.is_empty() then return sb
+
+    // A factory of a factory whose frame entry would reach one taken back is taken back with it.
+    var grew = true
+
+    while grew
+        grew = false
+
+        for f in p.funcs
+            if !sb.entries.has(f.name) || gone.has(f.name) then continue
+
+            if called_at(f, sb.entries.get(f.name).unwrap(), gone)
+                gone.add(f.name)
+                grew = true
+            end if
+        end for
+    end while
 
     var calls: Map[string, Buf[Span]] = map()
 
@@ -207,14 +263,16 @@ private struct SbFlag
     yes: bool
 
 // Whether every way out of a factory answers its one site: the site is the body's value, and nothing
-// in the body returns, becomes another call, or leaves through `?`.
-private answers_only_site(f: TFunc, site: Span) -> bool
+// in the body returns, becomes another call, or leaves through `?`. A `call_site` is a factory call
+// keyed by its own span; any other, a box keyed by its payload's.
+private answers_only_site(f: TFunc, site: Span, call_site: bool) -> bool
     val last = f.body.result
 
     if last.is_none() then return false
 
     val direct = *last.unwrap().kind match
-        TBox(v, _) -> v.span == site
+        TBox(v, _) -> !call_site && v.span == site
+        TCall(_, _, _, _) -> call_site && last.unwrap().span == site
         _ -> false
 
     if !direct then return false
@@ -417,6 +475,9 @@ private struct BoxCx
 
     // `StackBoxes.table_args`, joined over every walk that reached the call: a "may" from any wins.
     table_args: Map[string, (bool, bool)]
+
+    // Each factory of a factory, with the factory whose call its one site is.
+    chains: Map[string, string]
 end BoxCx
 
 // One walk of one body, following one thing: a site of this body (`site`, a box's payload span or a
