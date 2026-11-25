@@ -21,30 +21,35 @@ handling away from every program with no operating system to ask. Deciding what 
 
 ## Index
 
-[`append`](#append) [`append_bytes`](#append_bytes) [`append_text`](#append_text) [`cache_dir`](#cache_dir) [`canonicalize`](#canonicalize) [`config_dir`](#config_dir) [`copy_dir_all`](#copy_dir_all) [`copy_file`](#copy_file) [`create`](#create) [`create_update`](#create_update) [`current_dir`](#current_dir) [`data_dir`](#data_dir) [`entries`](#entries) [`entry_bytes`](#entry_bytes) [`exists`](#exists) [`from_errno`](#from_errno) [`hard_link`](#hard_link) [`home_dir`](#home_dir) [`is_dir`](#is_dir) [`is_file`](#is_file) [`is_link`](#is_link) [`link_metadata`](#link_metadata) [`make_dir`](#make_dir) [`make_dir_all`](#make_dir_all) [`make_temp_dir`](#make_temp_dir) [`map_file`](#map_file) [`metadata`](#metadata) [`open`](#open) [`open_dir`](#open_dir) [`open_options`](#open_options) [`open_uncached`](#open_uncached) [`open_update`](#open_update) [`open_with`](#open_with) [`page_size`](#page_size) [`pending_name`](#pending_name) [`publish_dir`](#publish_dir) [`publish_file`](#publish_file) [`read_bytes`](#read_bytes) [`read_link`](#read_link) [`read_text`](#read_text) [`readable`](#readable) [`remove_dir`](#remove_dir) [`remove_dir_all`](#remove_dir_all) [`remove_file`](#remove_file) [`rename`](#rename) [`rename_no_replace`](#rename_no_replace) [`set_current_dir`](#set_current_dir) [`set_modified`](#set_modified) [`set_owner`](#set_owner) [`set_permissions`](#set_permissions) [`size_of`](#size_of) [`symlink`](#symlink) [`truncate`](#truncate) [`walk`](#walk) [`writable`](#writable) [`write_bytes`](#write_bytes) [`write_bytes_atomic`](#write_bytes_atomic) [`write_text`](#write_text) [`write_text_atomic`](#write_text_atomic) [`Advice`](#advice) [`Dir`](#dir) [`Entry`](#entry) [`File`](#file) [`FileState`](#filestate) [`IoError`](#ioerror) [`Kind`](#kind) [`Mapped`](#mapped) [`MappedMut`](#mappedmut) [`Matching`](#matching) [`Meta`](#meta) [`OpenOptions`](#openoptions) [`Walk`](#walk-1) [Display for IoError](#display-for-ioerror) [Display for Kind](#display-for-kind) [Drop for Dir](#drop-for-dir) [Drop for FileState](#drop-for-filestate) [Drop for Mapped](#drop-for-mapped) [Drop for MappedMut](#drop-for-mappedmut) [Eq for IoError](#eq-for-ioerror) [Eq for Kind](#eq-for-kind) [Fallible for File](#fallible-for-file) [Iterate for Matching](#iterate-for-matching) [Iterate for Walk](#iterate-for-walk) [Positioned for File](#positioned-for-file) [ReadAt for File](#readat-for-file) [Reader for File](#reader-for-file) [WriteAt for File](#writeat-for-file) [Writer for File](#writer-for-file)
+[`append`](#append) [`append_bytes`](#append_bytes) [`append_text`](#append_text) [`cache_dir`](#cache_dir) [`canonicalize`](#canonicalize) [`config_dir`](#config_dir) [`copy_dir_all`](#copy_dir_all) [`copy_file`](#copy_file) [`create`](#create) [`create_update`](#create_update) [`current_dir`](#current_dir) [`data_dir`](#data_dir) [`entries`](#entries) [`entry_bytes`](#entry_bytes) [`executable`](#executable) [`exists`](#exists) [`from_errno`](#from_errno) [`hard_link`](#hard_link) [`home_dir`](#home_dir) [`is_dir`](#is_dir) [`is_file`](#is_file) [`is_link`](#is_link) [`link_metadata`](#link_metadata) [`make_dir`](#make_dir) [`make_dir_all`](#make_dir_all) [`make_temp_dir`](#make_temp_dir) [`map_file`](#map_file) [`metadata`](#metadata) [`open`](#open) [`open_dir`](#open_dir) [`open_options`](#open_options) [`open_uncached`](#open_uncached) [`open_update`](#open_update) [`open_with`](#open_with) [`page_size`](#page_size) [`pending_name`](#pending_name) [`publish_dir`](#publish_dir) [`publish_file`](#publish_file) [`read_bytes`](#read_bytes) [`read_link`](#read_link) [`read_text`](#read_text) [`readable`](#readable) [`remove_dir`](#remove_dir) [`remove_dir_all`](#remove_dir_all) [`remove_file`](#remove_file) [`rename`](#rename) [`rename_no_replace`](#rename_no_replace) [`set_current_dir`](#set_current_dir) [`set_link_owner`](#set_link_owner) [`set_modified`](#set_modified) [`set_owner`](#set_owner) [`set_permissions`](#set_permissions) [`size_of`](#size_of) [`space`](#space) [`symlink`](#symlink) [`truncate`](#truncate) [`walk`](#walk) [`writable`](#writable) [`write_bytes`](#write_bytes) [`write_bytes_atomic`](#write_bytes_atomic) [`write_text`](#write_text) [`write_text_atomic`](#write_text_atomic) [`Advice`](#advice) [`Dir`](#dir) [`Entry`](#entry) [`File`](#file) [`FileState`](#filestate) [`IoError`](#ioerror) [`Kind`](#kind) [`Mapped`](#mapped) [`MappedMut`](#mappedmut) [`Matching`](#matching) [`Meta`](#meta) [`OpenOptions`](#openoptions) [`Space`](#space-1) [`Walk`](#walk-1) [Display for IoError](#display-for-ioerror) [Display for Kind](#display-for-kind) [Drop for Dir](#drop-for-dir) [Drop for FileState](#drop-for-filestate) [Drop for Mapped](#drop-for-mapped) [Drop for MappedMut](#drop-for-mappedmut) [Eq for IoError](#eq-for-ioerror) [Eq for Kind](#eq-for-kind) [Fallible for File](#fallible-for-file) [Iterate for Matching](#iterate-for-matching) [Iterate for Walk](#iterate-for-walk) [Positioned for File](#positioned-for-file) [ReadAt for File](#readat-for-file) [Reader for File](#reader-for-file) [WriteAt for File](#writeat-for-file) [Writer for File](#writer-for-file)
 
 ## Functions
 
 ### `append`
 
 ```sysl
-append(path: string) -> Result[File, IoError]
+append(path: string, mode: u32 = file_mode) -> Result[File, IoError]
 ```
 
 ### `append_bytes`
 
 ```sysl
-append_bytes(path: string, bytes: []const u8) -> Result[unit, IoError]
+append_bytes(path: string, bytes: []const u8, mode: u32 = file_mode) -> Result[unit, IoError]
 ```
 
 Writes the bytes at the end of the file, making it if it is not there. Each call lands after
 whatever the file already held, including anything another program appended in between.
 
+`mode` is the permission bits of a file this call makes, as `write_bytes` takes them; a file that
+is already there keeps its own.
+
 ### `append_text`
 
 ```sysl
-append_text(path: string, text: string) -> Result[unit, IoError]
+append_text(path: string, text: string, mode: u32 = file_mode) -> Result[unit, IoError]
 ```
+
+`append_bytes` for text, with the same `mode`.
 
 ### `cache_dir`
 
@@ -216,6 +221,18 @@ same unpromised order as `entries`.
 make, on a filesystem that stores whatever bytes it was given. It never answers `InvalidUtf8`; a
 caller decodes each name itself with `sysl.text.from_utf8`, and decides what a name that does not
 decode should become. The bytes are a copy, so they outlive the listing.
+
+### `executable`
+
+```sysl
+executable(path: string) -> bool
+```
+
+Whether this program may execute what `path` names, as POSIX's `access` with `X_OK` answers it for
+the program's own user and groups. It is the system's answer rather than the bits', so it can differ
+from `Meta.executable`: a file whose only execute bit is another user's answers `false` here, and on
+a directory it is whether the program may search it. A program acting as user 0 may execute a file
+with any execute bit set. A path that is not there answers `false`.
 
 ### `exists`
 
@@ -401,12 +418,12 @@ The three ways a program opens a file, named for what it means rather than for t
 becomes. `open` reads an existing file; `create` makes one, or empties one that was there;
 `append` writes at the end of whatever is there, making the file if it is not.
 
-**`create` and `create_update` take the permission bits a NEW file is born with**, `0o666` by
-default, which the process umask narrows exactly as `open(2)` with `O_CREAT` does. A secret file
-asks `0o600` here and is owner-only from the moment it exists, with no window between creating
-and `set_permissions`. The mode applies only when the file is created: one that already exists
-keeps the mode it has. Bits above the twelve permission bits are dropped, as in `set_permissions`.
-A target with no permission bits ignores the mode.
+**`create`, `append` and `create_update` take the permission bits a NEW file is born with**,
+`0o666` by default, which the process umask narrows exactly as `open(2)` with `O_CREAT` does. A
+secret file asks `0o600` here and is owner-only from the moment it exists, with no window between
+creating and `set_permissions`. The mode applies only when the file is created: one that already
+exists keeps the mode it has. Bits above the twelve permission bits are dropped, as in
+`set_permissions`. A target with no permission bits ignores the mode.
 
 ### `open_dir`
 
@@ -650,6 +667,18 @@ in the program, and puts it back only if it remembers to.
 Prefer building an absolute path. This exists because a program that drives a build, or that is
 the shell-like thing at the top, genuinely needs it.
 
+### `set_link_owner`
+
+```sysl
+set_link_owner(path: string, owner: u32, group: u32) -> Result[unit, IoError]
+```
+
+The owner and group of `path` **itself** set to `owner` and `group`, as `lchown(2)`: a symbolic link
+is given the ids and what it names keeps its own, which is the writing half of `link_metadata`'s
+reading. Anything at `path` that is not a link is changed exactly as `set_owner` changes it, with
+`set_owner`'s privilege rule: giving it away is `NotPermitted` to a program not acting as user 0. A
+path that is not there is `NotFound`; a target whose filesystem has no owners reports `unsupported()`.
+
 ### `set_modified`
 
 ```sysl
@@ -698,6 +727,20 @@ How many bytes the file holds. It opens the file to ask, so it reports the same 
 does -- a missing file answers `NotFound` rather than zero, which is the distinction a caller
 sizing a buffer needs and the one a bare number could not carry.
 
+### `space`
+
+```sysl
+space(path: string) -> Result[Space, IoError]
+```
+
+The size and the unused bytes of the filesystem that holds `path`, which may name a file or a
+directory anywhere on it and is followed through a symbolic link. Each number is a block count of
+POSIX's `statvfs` times its fragment size, `f_frsize`, which is the unit those counts are in.
+
+**It is a reading, not a reservation**: another program can take what was free before the next write
+lands, so a program that must not run out still handles the write's own `NoSpaceLeft`. A
+path that is not there is `NotFound`; a target that cannot say reports `unsupported()`.
+
 ### `symlink`
 
 ```sysl
@@ -745,15 +788,21 @@ writable(path: string) -> bool
 ### `write_bytes`
 
 ```sysl
-write_bytes(path: string, bytes: []const u8) -> Result[unit, IoError]
+write_bytes(path: string, bytes: []const u8, mode: u32 = file_mode) -> Result[unit, IoError]
 ```
 
 Writes the bytes, replacing whatever was there and making the file if it was not.
 
+**`mode` is the permission bits a file this call makes is born with**, exactly as `create` takes
+them: `0o666` by default, narrowed by the process umask, bits above the twelve dropped, ignored on
+a target with no permission bits. A file that is already there keeps its own mode -- its contents
+are replaced, not the file. A failure answers what the open or the write said, the OS's reason
+included, whichever mode was asked for.
+
 ### `write_bytes_atomic`
 
 ```sysl
-write_bytes_atomic(path: string, bytes: []const u8) -> Result[unit, IoError]
+write_bytes_atomic(path: string, bytes: []const u8, mode: u32 = file_mode) -> Result[unit, IoError]
 ```
 
 Writes the bytes to `path` by way of a pending name, so a reader of `path` sees the whole of the
@@ -763,19 +812,27 @@ On any failure -- the write, the close or the rename -- the pending file is remo
 error is the answer, so `path` is exactly what it was before the call. A directory that is not
 there answers `NotFound` and leaves nothing anywhere.
 
+**`mode` is the permission bits the new file is born with**, as `write_bytes` takes them (`0o666`
+by default, narrowed by the umask). The pending file is created with them, so the file is never
+readable more widely than asked, not even under its pending name. **Unlike `write_bytes`, a file
+already at `path` does not keep its mode**: it is replaced by a new file, which has the mode asked
+for here.
+
 ### `write_text`
 
 ```sysl
-write_text(path: string, text: string) -> Result[unit, IoError]
+write_text(path: string, text: string, mode: u32 = file_mode) -> Result[unit, IoError]
 ```
+
+`write_bytes` for text, with the same `mode`.
 
 ### `write_text_atomic`
 
 ```sysl
-write_text_atomic(path: string, text: string) -> Result[unit, IoError]
+write_text_atomic(path: string, text: string, mode: u32 = file_mode) -> Result[unit, IoError]
 ```
 
-`write_bytes_atomic` for text.
+`write_bytes_atomic` for text, with the same `mode`.
 
 ## Types
 
@@ -815,14 +872,14 @@ own, and stays open after the directory is gone.
 |---|---|---|
 | `fd` | `fd(self) -> int` | The descriptor, lent for a call this module does not make; the directory still closes it. |
 | `open` | `open(self, path: string) -> Result[File, IoError]` | The five ways a file is opened, as `sysl.fs.open`, `create`, `append`, `open_update` and `create_update` open one, with `path` beneath this directory. |
-| `create` | `create(self, path: string) -> Result[File, IoError]` |  |
-| `append` | `append(self, path: string) -> Result[File, IoError]` |  |
+| `create` | `create(self, path: string, mode: u32 = file_mode) -> Result[File, IoError]` |  |
+| `append` | `append(self, path: string, mode: u32 = file_mode) -> Result[File, IoError]` |  |
 | `open_update` | `open_update(self, path: string) -> Result[File, IoError]` |  |
-| `create_update` | `create_update(self, path: string) -> Result[File, IoError]` |  |
+| `create_update` | `create_update(self, path: string, mode: u32 = file_mode) -> Result[File, IoError]` |  |
 | `read_bytes` | `read_bytes(self, path: string) -> Result[[]u8, IoError]` | The whole-file functions, as `sysl.fs.read_bytes`, `read_text`, `write_bytes` and `write_text` do them and with the same errors (the OS's reason for a failed write included), with `path` beneath this directory and refused exactly as `open` and `create` refuse it. |
 | `read_text` | `read_text(self, path: string) -> Result[string, IoError]` |  |
-| `write_bytes` | `write_bytes(self, path: string, bytes: []const u8) -> Result[unit, IoError]` |  |
-| `write_text` | `write_text(self, path: string, text: string) -> Result[unit, IoError]` |  |
+| `write_bytes` | `write_bytes(self, path: string, bytes: []const u8, mode: u32 = file_mode) -> Result[unit, IoError]` |  |
+| `write_text` | `write_text(self, path: string, text: string, mode: u32 = file_mode) -> Result[unit, IoError]` |  |
 | `link_metadata` | `link_metadata(self, path: string) -> Result[Meta, IoError]` | What is at `path`, described as `sysl.fs.link_metadata` describes it: a link as the last component is reported as a link (`is_link()`), never followed. |
 | `exists` | `exists(self, path: string) -> bool` | Whether anything is at `path`, a link included. |
 | `remove_file` | `remove_file(self, path: string) -> Result[unit, IoError]` | Removes the file at `path`. |
@@ -1079,6 +1136,7 @@ the library's resolution everywhere and is finer than any filesystem here record
 | `is_file` | `is_file(self) -> bool` |  |
 | `is_dir` | `is_dir(self) -> bool` |  |
 | `is_link` | `is_link(self) -> bool` | Whether the entry **itself** is a symbolic link, which only `link_metadata` can ever answer `true` to: `metadata` follows links, so what it describes is never one. |
+| `executable` | `executable(self) -> bool` | Whether the entry is a regular file with any of its three execute bits set -- the owner's, the group's or everyone else's. |
 | `same_file` | `same_file(self, other: Meta) -> bool` | Whether two readings name the same file, which is the inode and the device together and is not the path. |
 
 ### `OpenOptions`
@@ -1132,6 +1190,22 @@ to an open asking for it.
 | `dsync` | `dsync(self) -> OpenOptions` |  |
 | `nofollow` | `nofollow(self) -> OpenOptions` |  |
 | `mode` | `mode(self, bits: u32) -> OpenOptions` |  |
+
+### `Space`
+
+```sysl
+struct Space
+    total: u64
+    free: u64
+    available: u64
+```
+
+How big a filesystem is and how much of it is unused, in bytes -- one `statvfs` reading.
+
+**`free` and `available` are two answers because a filesystem keeps a reserve**: `free` is every
+unused byte, and `available` is the part of it a program not acting as user 0 may take, which is
+the one a program checking whether its write will fit compares against. So `available <= free <=
+total` on every filesystem, and the two are equal where nothing is held back.
 
 ### `Walk`
 

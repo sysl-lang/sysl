@@ -28,9 +28,6 @@ private[fs] const eloop: int = 40
  */
 private const exdev: int = 18
 
-/** The permission bits a file created beneath a directory asks for, as `create` asks. */
-private const created_mode: u32 = 0o666
-
 /** A directory open for reaching what is beneath it, and only that.
  *
  * **Every path handed to it is relative to it and stays inside it.** A symbolic link at any component
@@ -50,25 +47,28 @@ struct Dir
     fd(self) -> int = self.handle
 
     /** The five ways a file is opened, as `sysl.fs.open`, `create`, `append`, `open_update` and
-     * `create_update` open one, with `path` beneath this directory.
+     * `create_update` open one, with `path` beneath this directory. `create`, `append` and
+     * `create_update` take the `mode` a new file is born with, exactly as their namesakes do: `0o666`
+     * by default, narrowed by the umask, and a file already there keeps its own.
      */
     open(self, path: string) -> Result[File, IoError] = self.opened(path, fsys.open_read)
 
-    create(self, path: string) -> Result[File, IoError] =
-        self.opened(path, fsys.open_write | fsys.open_create | fsys.open_truncate)
+    create(self, path: string, mode: u32 = file_mode) -> Result[File, IoError] =
+        self.opened(path, fsys.open_write | fsys.open_create | fsys.open_truncate, mode)
 
-    append(self, path: string) -> Result[File, IoError] =
-        self.opened(path, fsys.open_write | fsys.open_create | fsys.open_append)
+    append(self, path: string, mode: u32 = file_mode) -> Result[File, IoError] =
+        self.opened(path, fsys.open_write | fsys.open_create | fsys.open_append, mode)
 
     open_update(self, path: string) -> Result[File, IoError] =
         self.opened(path, fsys.open_read | fsys.open_write)
 
-    create_update(self, path: string) -> Result[File, IoError] =
-        self.opened(path, fsys.open_read | fsys.open_write | fsys.open_create | fsys.open_truncate)
+    create_update(self, path: string, mode: u32 = file_mode) -> Result[File, IoError] =
+        self.opened(path, fsys.open_read | fsys.open_write | fsys.open_create | fsys.open_truncate, mode)
 
     /** The whole-file functions, as `sysl.fs.read_bytes`, `read_text`, `write_bytes` and `write_text`
      * do them and with the same errors (the OS's reason for a failed write included), with `path`
-     * beneath this directory and refused exactly as `open` and `create` refuse it.
+     * beneath this directory and refused exactly as `open` and `create` refuse it. `write_bytes` and
+     * `write_text` take the `mode` a new file is born with, as `sysl.fs.write_bytes` does.
      */
     read_bytes(self, path: string) -> Result[[]u8, IoError] = read_all(self.open(path)?)
 
@@ -80,9 +80,11 @@ struct Dir
             Err(e) -> Err(InvalidUtf8(e.offset))
     end read_text
 
-    write_bytes(self, path: string, bytes: []const u8) -> Result[unit, IoError] = put(self.create(path)?, bytes)
+    write_bytes(self, path: string, bytes: []const u8, mode: u32 = file_mode) -> Result[unit, IoError] =
+        put(self.create(path, mode)?, bytes)
 
-    write_text(self, path: string, text: string) -> Result[unit, IoError] = self.write_bytes(path, text.bytes)
+    write_text(self, path: string, text: string, mode: u32 = file_mode) -> Result[unit, IoError] =
+        self.write_bytes(path, text.bytes, mode)
 
     /** What is at `path`, described as `sysl.fs.link_metadata` describes it: a link as the last
      * component is reported as a link (`is_link()`), never followed. A link above it is refused.
@@ -110,11 +112,11 @@ struct Dir
         if code != 0 then Err(refusal(code)) else Ok(())
     end remove_file
 
-    private opened(self, path: string, flags: u32) -> Result[File, IoError]
+    private opened(self, path: string, flags: u32, mode: u32 = file_mode) -> Result[File, IoError]
         confined(path)?
 
         var fd = 0
-        val code = fsys.open_beneath(self.handle, as_ptr(path.bytes), path.bytes.len, flags, created_mode, &fd)
+        val code = fsys.open_beneath(self.handle, as_ptr(path.bytes), path.bytes.len, flags, mode & 0o7777, &fd)
 
         if code != 0 then return Err(refusal(code))
 
