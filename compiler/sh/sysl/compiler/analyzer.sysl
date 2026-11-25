@@ -129,6 +129,19 @@ struct Analyzer
     locals: Buf[Local]
     marks: Buf[(usize, usize)]
 
+    // An index over `locals`, so that a name is found in constant time however many are in scope:
+    // the position of the innermost binding of each name and of each unique name, and, beside each
+    // position in `locals`, where the binding it hides stood under its name and under its unique
+    // name; the position of the outermost binding of each unique name; and the positions of the
+    // bindings that are a `ref`, innermost last. Every push and every cut of `locals` goes through
+    // `push_local` and `cut_locals`, which keep them in step -- a scope left or a reading rewound
+    // restores what the bindings it takes away had hidden.
+    local_named: Map[string, usize]
+    local_uniquely: Map[string, usize]
+    local_hides: Buf[(Option[usize], Option[usize])]
+    local_first: Map[string, usize]
+    local_refs: Buf[usize]
+
     // Where each open scope found the file's imports. An `import` written inside a block binds for
     // the statements after it and no further, so what a block took on is taken back off at the
     // dedent -- three lengths, the three lists `Imports` is made of.
@@ -578,6 +591,11 @@ struct Analyzer
     // and a right-nested chain's right operand is everything below it.
     exact_values: Map[usize, Option[BigInt]]
 
+    // The position in `open_vars` of the first open binding under each unique name, so that a read
+    // asks whether its binding is open in constant time however many are. Every push and every cut of
+    // `open_vars` goes through `push_open` and `cut_open`, which keep the two in step.
+    open_first: Map[string, usize]
+
     // The body a `RefWatch` filed now belongs to.
     watch_key(self) -> string = if self.body != "" then self.body else self.func_name
 
@@ -659,7 +677,7 @@ struct Analyzer
 
             if self.const_local(local.unique).is_some() then self.unbind_const(local.name)
 
-        self.locals.truncate(mark)
+        self.cut_locals(mark)
 
         if self.import_marks.is_empty() then return
 
@@ -693,7 +711,7 @@ struct Analyzer
 
             if self.const_local(local.unique).is_some() then self.unbind_const(local.name)
 
-        self.locals.truncate(at.locals)
+        self.cut_locals(at.locals)
         self.scope.imports.names.truncate(at.names)
         self.scope.imports.modules.truncate(at.modules)
         self.scope.imports.wildcards.truncate(at.wildcards)
@@ -763,10 +781,79 @@ struct Analyzer
 
         val unique = self.fresh_name(name)
 
-        self.locals.push(Local(name, unique, ty, false, false, None, self.declared_at(named), None,
-                               self.an.defers(ty), None))
+        self.push_local(Local(name, unique, ty, false, false, None, self.declared_at(named), None,
+                              self.an.defers(ty), None))
         unique
     end bind
+
+    // Puts a binding innermost, recording what it hides under its name and its unique name.
+    private push_local(*self, l: Local)
+        val at = self.locals.len()
+
+        self.local_hides.push((self.local_named.get(l.name), self.local_uniquely.get(l.unique)))
+        self.local_named.put(l.name, at)
+        self.local_uniquely.put(l.unique, at)
+
+        if !self.local_first.has(l.unique) then self.local_first.put(l.unique, at)
+        if l.stands_for.is_some() then self.local_refs.push(at)
+
+        self.locals.push(l)
+    end push_local
+
+    // Takes every binding from position `to` on out of scope, innermost first, so that each name
+    // and unique name answers again with the binding it had before.
+    private cut_locals(*self, to: usize)
+        var i = self.locals.len()
+
+        while i > to
+            i -= 1
+
+            val l = self.locals[i]
+            val (named, uniquely) = self.local_hides[i]
+
+            if named.is_some() then self.local_named.put(l.name, named.unwrap())
+            else self.local_named.remove(l.name)
+
+            if uniquely.is_some() then self.local_uniquely.put(l.unique, uniquely.unwrap())
+            else self.local_uniquely.remove(l.unique)
+
+            if self.local_first.get(l.unique).unwrap_or(i + 1) == i then self.local_first.remove(l.unique)
+        end while
+
+        while !self.local_refs.is_empty() && self.local_refs[self.local_refs.len() - 1] >= to
+            self.local_refs.truncate(self.local_refs.len() - 1)
+
+        self.locals.truncate(to)
+        self.local_hides.truncate(to)
+    end cut_locals
+
+    // The position in `locals` of the innermost binding of a name, or none.
+    innermost_named(self, name: string) -> Option[usize] = self.local_named.get(name)
+
+    // The position in `locals` of the innermost binding a unique name names, or none.
+    innermost_unique(self, unique: string) -> Option[usize] = self.local_uniquely.get(unique)
+
+    // The position in `locals` of the outermost binding a unique name names, or none.
+    outermost_unique(self, unique: string) -> Option[usize] = self.local_first.get(unique)
+
+    // Records a binding as open, waiting for the use that fixes its type (`var_first_use.sysl`).
+    push_open(*self, o: OpenVar)
+        if !self.open_first.has(o.unique) then self.open_first.put(o.unique, self.open_vars.len())
+
+        self.open_vars.push(o)
+
+    // Takes every open binding from position `to` on back off the list.
+    cut_open(*self, to: usize)
+        for i in to..<self.open_vars.len()
+            val unique = self.open_vars[i].unique
+
+            if self.open_first.get(unique).unwrap_or(to) >= to then self.open_first.remove(unique)
+
+        self.open_vars.truncate(to)
+    end cut_open
+
+    // The first open binding under a unique name, or none.
+    open_named(self, unique: string) -> Option[OpenVar] = self.open_first.get(unique).map(i -> self.open_vars[i])
 
     // Marks the binding made last as deferred to each instantiation (`Local.deferred`).
     defer_last_binding(*self)
@@ -781,50 +868,32 @@ struct Analyzer
     spell_binding(*self, unique: string, s: Option[Spelling])
         if s.is_none() then return
 
-        var i = self.locals.len()
+        val at = self.innermost_unique(unique)
 
-        while i > 0
-            i -= 1
+        if at.is_none() then return
 
-            if self.locals[i].unique == unique
-                var l = self.locals[i]
+        var l = self.locals[at.unwrap()]
 
-                l.spelled = s
-                self.locals[i] = l
-                return
-            end if
-        end while
+        l.spelled = s
+        self.locals[at.unwrap()] = l
     end spell_binding
 
     // Records the values the read-only binding `unique` names is known to hold (`Local.known`).
     note_known(*self, unique: string, values: (BigInt, BigInt))
-        var i = self.locals.len()
+        val at = self.innermost_unique(unique)
 
-        while i > 0
-            i -= 1
+        if at.is_none() then return
 
-            if self.locals[i].unique == unique
-                var l = self.locals[i]
+        var l = self.locals[at.unwrap()]
 
-                if l.read_only && l.stands_for.is_none() then l.known = Some(values)
+        if l.read_only && l.stands_for.is_none() then l.known = Some(values)
 
-                self.locals[i] = l
-                return
-            end if
-        end while
+        self.locals[at.unwrap()] = l
     end note_known
 
     // The values the binding `unique` names is known to hold, where it is in scope and they are.
-    known_of(self, unique: string) -> Option[(BigInt, BigInt)]
-        var i = self.locals.len()
-
-        while i > 0
-            i -= 1
-
-            if self.locals[i].unique == unique then return self.locals[i].known
-
-        None
-    end known_of
+    known_of(self, unique: string) -> Option[(BigInt, BigInt)] =
+        self.innermost_unique(unique).and_then(i -> self.locals[i].known)
 
     // Binds a name that may not be assigned to again -- what a local `val` declares.
     bind_read_only(*self, name: string, ty: Type, named: Option[Span] = None) -> string
@@ -833,8 +902,8 @@ struct Analyzer
 
         val unique = self.fresh_name(name)
 
-        self.locals.push(Local(name, unique, ty, true, false, None, self.declared_at(named), None,
-                               self.an.defers(ty), None))
+        self.push_local(Local(name, unique, ty, true, false, None, self.declared_at(named), None,
+                              self.an.defers(ty), None))
         unique
     end bind_read_only
 
@@ -847,8 +916,8 @@ struct Analyzer
 
         val unique = self.fresh_name(name)
 
-        self.locals.push(Local(name, unique, texpr_type(place), read_only, false, Some(place),
-                               self.declared_at(named), None, self.an.defers(texpr_type(place)), None))
+        self.push_local(Local(name, unique, texpr_type(place), read_only, false, Some(place),
+                              self.declared_at(named), None, self.an.defers(texpr_type(place)), None))
         unique
     end bind_ref
 
@@ -859,8 +928,8 @@ struct Analyzer
 
         val unique = self.fresh_name(name)
 
-        self.locals.push(Local(name, unique, ty, true, true, None, self.declared_at(named), None,
-                               self.an.defers(ty), None))
+        self.push_local(Local(name, unique, ty, true, true, None, self.declared_at(named), None,
+                              self.an.defers(ty), None))
         unique
     end bind_pattern
 
@@ -868,7 +937,7 @@ struct Analyzer
     // parameter is loaded by the name its declaration gave it.
     bind_as(*self, name: string, unique: string, ty: Type)
         self.refuse_reserved_binding(name)
-        self.locals.push(Local(name, unique, ty, false, false, None, self.bind_site, None, self.an.defers(ty), None))
+        self.push_local(Local(name, unique, ty, false, false, None, self.bind_site, None, self.an.defers(ty), None))
 
     // A name nothing else in this **function** holds, which is what a slot of the frame is.
     //
@@ -911,16 +980,7 @@ struct Analyzer
     private held_at(self, name: string, at: usize) -> bool = at < self.used.len() && self.used[at] == name
 
     // The innermost binding of a name, or none.
-    lookup(self, name: string) -> Option[Local]
-        var i = self.locals.len()
-
-        while i > 0
-            i = i - 1
-
-            if self.locals[i].name == name then return Some(self.locals[i])
-
-        None
-    end lookup
+    lookup(self, name: string) -> Option[Local] = self.innermost_named(name).map(i -> self.locals[i])
 
     // Records a mistake about a place.
     fault(*self, span: Span, message: string)
@@ -956,13 +1016,13 @@ bad_expr(span: Span) -> TExpr = TExpr(span, TZero(Unknown))
 
 // An analyzer over a compilation's tables, reading a file in its own terms.
 analyzer_for(an: &Analysis, scope: Scope) -> &Analyzer =
-    Analyzer(an, scope, buf(), buf(), buf(), buf(), "", None, buf(), buf(), false, false,
+    Analyzer(an, scope, buf(), buf(), map(), map(), buf(), map(), buf(), buf(), buf(), "", None, buf(), buf(), false, false,
              None, 0, None, None, buf(), false, false, false, None, buf(), buf(), buf(),
              empty_names(), false, buf(), buf(), buf(), "", buf(), None, None, None, buf(), 0, buf(),
              false, false, false, AwaitOutside, false, buf(), "", buf(), buf(), 0, 0, "", buf(), buf(), buf(),
              false, buf(), buf(), map(), map(), buf(), false, buf(), buf(), buf(), buf(), buf(), false,
              false, false, false, None, buf(), buf(), buf(), None, buf(), None, None, None, 0, None, None,
-             None, None, buf(), false, false, "", None, false, buf(), 0, false, None, buf(), 0, map(), map(), map(), map())
+             None, None, buf(), false, false, "", None, false, buf(), 0, false, None, buf(), 0, map(), map(), map(), map(), map())
 
 // **The known half of a parameter like `Result[T, E]`, handed to the variant standing at it.** In
 // `keep[T](o: Result[T, E])` called as `keep(Ok(1))`, the `Ok` settles the enum's `T` from its value

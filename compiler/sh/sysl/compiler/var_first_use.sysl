@@ -78,7 +78,7 @@ first_use_read[T](cx: &Analyzer, stmts: Buf[Stmt], read: () -> T) -> T
         val got = read()
         val found = fixes_of(cx, stmts, tried.var_fixes)
 
-        cx.open_vars.truncate(open_mark)
+        cx.cut_open(open_mark)
 
         if found.is_empty()
             keep_trial(cx)
@@ -176,7 +176,7 @@ open_binding(cx: &Analyzer, span: Span, typ: Option[TypeRef], init: Expr, unique
 
     if fallback.is_none() then return
 
-    cx.open_vars.push(OpenVar(unique, span.start, init, cx.var_fix_log.len(), false, fallback.unwrap()))
+    cx.push_open(OpenVar(unique, span.start, init, cx.var_fix_log.len(), false, fallback.unwrap()))
 
 // The type a binding of `e` has where no use fixes one: a bare literal's default, or an untyped
 // numeric constant's, `int` or `real`. Nothing for anything else.
@@ -216,7 +216,7 @@ counted_first_use_read[T](cx: &Analyzer, at: usize, read: Option[Type] -> T) -> 
 
         if f.at == at && !type_eq(f.ty, int_type()) then fixed = Some(f.ty)
 
-    cx.open_vars.truncate(open_mark)
+    cx.cut_open(open_mark)
 
     if fixed.is_none()
         keep_trial(cx)
@@ -231,7 +231,7 @@ end counted_first_use_read
 
 // Records a counted `for`'s variable, just bound at `int`, as one waiting for its first use.
 open_counted(cx: &Analyzer, at: usize, lo: Expr, unique: string) =
-    cx.open_vars.push(OpenVar(unique, at, lo, cx.var_fix_log.len(), true, int_type()))
+    cx.push_open(OpenVar(unique, at, lo, cx.var_fix_log.len(), true, int_type()))
 
 // A name read where a type is expected of it: the use that fixes an open binding's type, unless the
 // name is an operand.
@@ -254,23 +254,24 @@ end fixed_by_position
 // `Prob` (`int within 0..<10`) makes `sum` an `int`, not a `Prob` that traps when the total passes 9.
 note_var_fix(cx: &Analyzer, unique: string, fixing: Type, beside: bool = false)
     val ty = if beside then computed_in(fixing) else fixing
+    val open = cx.open_named(unique)
 
-    for o in cx.open_vars
-        if o.unique != unique then continue
+    if open.is_none() then return
 
-        if !numeric_scalar(ty) then return
+    val o = open.unwrap()
 
-        if o.counted && !integer_scalar(ty) then return
+    if !numeric_scalar(ty) then return
 
-        for k in o.since..<cx.var_fix_log.len()
-            if cx.var_fix_log[k].at == o.at then return
+    if o.counted && !integer_scalar(ty) then return
 
-        val unfitting_told = beside && type_eq(o.fallback, int_type()) && integer_scalar(ty)
+    for k in o.since..<cx.var_fix_log.len()
+        if cx.var_fix_log[k].at == o.at then return
 
-        if !o.counted && !literal_fits(cx, o.init, ty) && !unfitting_told then return
+    val unfitting_told = beside && type_eq(o.fallback, int_type()) && integer_scalar(ty)
 
-        cx.var_fix_log.push(VarFix(o.at, ty, o.fallback))
-        return
+    if !o.counted && !literal_fits(cx, o.init, ty) && !unfitting_told then return
+
+    cx.var_fix_log.push(VarFix(o.at, ty, o.fallback))
 end note_var_fix
 
 // The type arithmetic or a comparison on a `t` computes in: a transparent subtype that checks something is read at
@@ -381,15 +382,16 @@ private waiting_open(cx: &Analyzer, e: Expr) -> Option[OpenVar]
 
     if unique.is_none() then return None
 
-    for o in cx.open_vars
-        if o.unique != unique.unwrap() then continue
+    val open = cx.open_named(unique.unwrap())
 
-        for k in o.since..<cx.var_fix_log.len()
-            if cx.var_fix_log[k].at == o.at then return None
+    if open.is_none() then return None
 
-        return Some(o)
+    val o = open.unwrap()
 
-    None
+    for k in o.since..<cx.var_fix_log.len()
+        if cx.var_fix_log[k].at == o.at then return None
+
+    open
 end waiting_open
 
 // **An open binding read at the parameter a generic call arrived at is fixed there, fitting or not**,
@@ -420,10 +422,7 @@ private open_name(cx: &Analyzer, e: Expr) -> Option[string]
 
             if local.is_none() then return None
 
-            for o in cx.open_vars
-                if o.unique == local.unwrap().unique then return Some(o.unique)
-
-            None
+            cx.open_named(local.unwrap().unique).map(o -> o.unique)
         _ -> None
 end open_name
 
@@ -433,9 +432,7 @@ private reads_open(cx: &Analyzer, t: TExpr) -> bool
     val sink = &found
 
     walk_texpr(t, expr_walk(true, x -> *x.kind match
-        TLoad(unique, _) ->
-            for o in cx.open_vars
-                if o.unique == unique then sink.push(unique)
+        TLoad(unique, _) -> if cx.open_named(unique).is_some() then sink.push(unique)
         _ -> ()))
 
     !found.is_empty()
@@ -526,4 +523,4 @@ end assigned_fix
 // The inner analyzer files its fixes in the outer's log.
 carry_open(outer: &Analyzer, inner: &Analyzer, outer_unique: string, inner_unique: string)
     for o in outer.open_vars
-        if o.unique == outer_unique then inner.open_vars.push(OpenVar(inner_unique, o.at, o.init, o.since, o.counted, o.fallback))
+        if o.unique == outer_unique then inner.push_open(OpenVar(inner_unique, o.at, o.init, o.since, o.counted, o.fallback))
