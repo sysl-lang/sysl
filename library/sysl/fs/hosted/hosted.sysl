@@ -27,8 +27,9 @@ import sysl.sys.{UNSUPPORTED, host_status}
 // way; `off_t`, whose width is the platform's; and the two calls that write into a buffer of
 // `PATH_MAX`, which is a `#define`. Each shim does one call and hands back the plain answer, and the
 // `errno` it leaves is read here. The shims under `__hosted__/` use only what wasi-libc has too; the
-// ones under `__posix__/` (`realpath`, the temporary directory, and mapping a file) need a POSIX C
-// library, and on any other target their hooks answer `UNSUPPORTED`, "not supported on this target".
+// ones under `__posix__/` (`realpath`, the temporary root, directory and file, and mapping a file)
+// need a POSIX C library, and on any other target their hooks answer `UNSUPPORTED`, "not supported
+// on this target".
 
 // `errno` is a **function** on every platform this builds for, not a variable -- C spells it as a
 // macro expanding to a dereference so that a threaded program gets its own -- so the binding is to
@@ -171,6 +172,8 @@ private extern "sysl_fs_host_readdir" c_readdir(d: *u8) -> *u8
 #if posix
 private extern "sysl_fs_host_realpath" c_realpath(path: *u8, into: *u8, room: u64) -> long
 private extern "sysl_fs_host_temp_dir" c_temp_dir(prefix: *u8, into: *u8, room: usize) -> int
+private extern "sysl_fs_host_temp_file" c_temp_file(prefix: *u8, into: *u8, room: usize, fd: *int) -> int
+private extern "sysl_fs_host_temp_root" c_temp_root(into: *u8, room: usize) -> long
 private extern "sysl_fs_host_map" c_map(fd: int, len: usize) -> *u8
 private extern "sysl_fs_host_map_shared" c_map_shared(fd: int, len: usize) -> *u8
 private extern "sysl_fs_host_msync" c_msync(at: *u8, len: usize, wait: int) -> int
@@ -542,6 +545,43 @@ supply_temp_dir(prefix: *u8, len: usize, into: *u8, room: usize, got: *usize) ->
     UNSUPPORTED
 #endif
 end supply_temp_dir
+
+@export("sysl_fs_temp_file")
+supply_temp_file(prefix: *u8, len: usize, into: *u8, room: usize, got: *usize, fd: *int) -> int
+#if posix
+    var c: [path_room]u8
+
+    if !terminated(prefix, len, c[..]) then return name_too_long
+
+    val code = c_temp_file(&c[0], into, room, fd)
+
+    if code != 0 then return host_status(code)
+
+    var n: usize = 0
+
+    while n < room && into[n] != 0
+        n += 1
+
+    *got = n
+    0
+#else
+    UNSUPPORTED
+#endif
+end supply_temp_file
+
+@export("sysl_fs_temp_root")
+supply_temp_root(into: *u8, room: usize, got: *usize) -> int
+#if posix
+    val n = c_temp_root(into, room)
+
+    if n < 0 then return failed()
+
+    *got = usize(n)
+    0
+#else
+    UNSUPPORTED
+#endif
+end supply_temp_root
 
 // -- beneath a directory -----------------------------------------------------------------------------
 

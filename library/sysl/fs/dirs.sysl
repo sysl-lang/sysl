@@ -131,8 +131,31 @@ private named(name: string) -> Option[string] = get(name).filter((s) -> s.len > 
 /** A leaf under the home directory, or `None` where there is no home to put it under. */
 private under_home(leaf: string) -> Option[string] = home_dir().map((h) -> join(h, leaf))
 
-/** A directory that did not exist a moment ago and that nobody else can take, made inside whatever
- * `TMPDIR` names -- or `/tmp` where it names nothing.
+/** The directory temporary files go in, which `temp_dir` and `temp_file` make things inside.
+ *
+ * **The rule, in order:** `TMPDIR` where it is set and not empty; otherwise, on macOS, the per-user
+ * directory `confstr(_CS_DARWIN_USER_TEMP_DIR)` names (`/var/folders/…/T`), which is where Apple's
+ * own `NSTemporaryDirectory` points and which only this user can write in; otherwise `/tmp`.
+ * Trailing slashes are dropped, so `s"${temp_root()}/name"` is the path the system will report back;
+ * `/` itself stays `/`.
+ *
+ * It is read afresh at every call rather than once, so a program that sets `TMPDIR` for itself is
+ * answered with what it set. It is not checked: a `TMPDIR` naming nothing is answered as it is, and
+ * the failure is `temp_dir`'s or `temp_file`'s, where there is something to fail. A target whose
+ * hooks cannot answer, and a root whose name is not UTF-8 and so cannot be a `string`, are answered
+ * `/tmp`; `temp_dir` and `temp_file` report the second as `InvalidUtf8` and leave nothing behind.
+ */
+temp_root() -> string
+    var into: []u8 = [0; path_bytes]
+    var n: usize = 0
+
+    if fsys.temp_root(as_mut_ptr(into), into.len, &n) != 0 then return "/tmp"
+
+    from_utf8(into[0..<n]).unwrap_or("/tmp")
+end temp_root
+
+/** A directory that did not exist a moment ago and that nobody else can take, made with mode `0700`
+ * inside `temp_root()`. Its name is `prefix` followed by six characters chosen to make it unique.
  *
  * **It is created, not merely named**, which is the whole point: inventing a path and then making it
  * leaves a gap between the two in which somebody else on a shared `/tmp` can take the name, and that
@@ -141,7 +164,13 @@ private under_home(leaf: string) -> Option[string] = home_dir().map((h) -> join(
  *
  * **Removing it is the caller's**, and `remove_dir_all` is the call: nothing here runs at the end of
  * a scope that the scope did not say, so `defer remove_dir_all(d)` is the idiom.
+ *
+ * A root that is not there answers `NotFound`, and one this process may not write in
+ * `PermissionDenied`.
  */
+temp_dir(prefix: string = "") -> Result[string, IoError] = make_temp_dir(prefix)
+
+/** `temp_dir` under the name it had first; the two are one call. */
 make_temp_dir(prefix: string) -> Result[string, IoError]
     var into: []u8 = [0; path_bytes]
     var n: usize = 0
@@ -149,10 +178,57 @@ make_temp_dir(prefix: string) -> Result[string, IoError]
 
     if code != 0 then return Err(from_status(code))
 
-    from_utf8(into[0..<n]) match
+    // A root whose name is not UTF-8 makes a directory no `string` can name, so it is taken back
+    // rather than left where nobody can be told to remove it.
+    answered_path(into[0..<n]) match
+        Ok(p) -> Ok(p)
+        Err(e) ->
+            _ = fsys.rmdir(as_ptr(into), n)
+            Err(e)
+end make_temp_dir
+
+/** A regular file that did not exist a moment ago and that nobody else can take, made inside
+ * `temp_root()` and answered open for reading and writing, with its path. Its name is `prefix`
+ * followed by six characters chosen to make it unique.
+ *
+ * **It is created and opened in one step** -- `O_CREAT | O_EXCL`, as `mkstemp` does -- **with mode
+ * `0600`**, so there is no moment at which the name is somebody else's file or is readable by
+ * anyone but this user. Naming a file and then `create`-ing it would be the race `temp_dir`
+ * describes, with the added hazard that `create` follows a symbolic link somebody planted at the
+ * name. The process umask can narrow the mode further and never widens it.
+ *
+ * The `File` closes when the last copy of it goes, like any other. **The file itself stays**:
+ * removing it is the caller's, and `defer remove_file(p)` is the idiom -- written after the binding,
+ * so it runs after the `File` is closed or dropped.
+ *
+ * A root that is not there answers `NotFound`, and one this process may not write in
+ * `PermissionDenied`.
+ */
+temp_file(prefix: string = "") -> Result[(File, string), IoError]
+    var into: []u8 = [0; path_bytes]
+    var n: usize = 0
+    var fd = 0
+    val code = fsys.temp_file(as_ptr(prefix.bytes), prefix.bytes.len, as_mut_ptr(into), into.len, &n,
+                              &fd)
+
+    if code != 0 then return Err(from_status(code))
+
+    val f = adopted(fd)
+
+    // As in `make_temp_dir`: a name no `string` can hold is removed rather than left behind, and the
+    // `File` closes as it goes.
+    answered_path(into[0..<n]) match
+        Ok(p) -> Ok((f, p))
+        Err(e) ->
+            _ = fsys.unlink(as_ptr(into), n)
+            Err(e)
+end temp_file
+
+/** A path the platform wrote, read as text. */
+private answered_path(b: []u8) -> Result[string, IoError] =
+    from_utf8(b) match
         Ok(s) -> Ok(s)
         Err(e) -> Err(InvalidUtf8(e.offset))
-end make_temp_dir
 
 /** Every directory on the path made, from the topmost one that is missing down.
  *

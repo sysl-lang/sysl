@@ -21,7 +21,7 @@ handling away from every program with no operating system to ask. Deciding what 
 
 ## Index
 
-[`append`](#append) [`append_bytes`](#append_bytes) [`append_text`](#append_text) [`cache_dir`](#cache_dir) [`canonicalize`](#canonicalize) [`config_dir`](#config_dir) [`copy_dir_all`](#copy_dir_all) [`copy_file`](#copy_file) [`create`](#create) [`create_update`](#create_update) [`current_dir`](#current_dir) [`data_dir`](#data_dir) [`entries`](#entries) [`entry_bytes`](#entry_bytes) [`exists`](#exists) [`from_errno`](#from_errno) [`hard_link`](#hard_link) [`home_dir`](#home_dir) [`is_dir`](#is_dir) [`is_file`](#is_file) [`is_link`](#is_link) [`link_metadata`](#link_metadata) [`make_dir`](#make_dir) [`make_dir_all`](#make_dir_all) [`make_temp_dir`](#make_temp_dir) [`map_file`](#map_file) [`metadata`](#metadata) [`open`](#open) [`open_dir`](#open_dir) [`open_update`](#open_update) [`page_size`](#page_size) [`pending_name`](#pending_name) [`publish_dir`](#publish_dir) [`publish_file`](#publish_file) [`read_bytes`](#read_bytes) [`read_link`](#read_link) [`read_text`](#read_text) [`readable`](#readable) [`remove_dir`](#remove_dir) [`remove_dir_all`](#remove_dir_all) [`remove_file`](#remove_file) [`rename`](#rename) [`set_current_dir`](#set_current_dir) [`set_modified`](#set_modified) [`set_owner`](#set_owner) [`set_permissions`](#set_permissions) [`size_of`](#size_of) [`symlink`](#symlink) [`truncate`](#truncate) [`walk`](#walk) [`writable`](#writable) [`write_bytes`](#write_bytes) [`write_bytes_atomic`](#write_bytes_atomic) [`write_text`](#write_text) [`write_text_atomic`](#write_text_atomic) [`Advice`](#advice) [`Dir`](#dir) [`Entry`](#entry) [`File`](#file) [`FileState`](#filestate) [`IoError`](#ioerror) [`Kind`](#kind) [`Mapped`](#mapped) [`Matching`](#matching) [`Meta`](#meta) [`Walk`](#walk-1) [Display for IoError](#display-for-ioerror) [Display for Kind](#display-for-kind) [Drop for Dir](#drop-for-dir) [Drop for FileState](#drop-for-filestate) [Drop for Mapped](#drop-for-mapped) [Eq for IoError](#eq-for-ioerror) [Eq for Kind](#eq-for-kind) [Fallible for File](#fallible-for-file) [Iterate for Matching](#iterate-for-matching) [Iterate for Walk](#iterate-for-walk) [Positioned for File](#positioned-for-file) [ReadAt for File](#readat-for-file) [Reader for File](#reader-for-file) [WriteAt for File](#writeat-for-file) [Writer for File](#writer-for-file)
+[`append`](#append) [`append_bytes`](#append_bytes) [`append_text`](#append_text) [`cache_dir`](#cache_dir) [`canonicalize`](#canonicalize) [`config_dir`](#config_dir) [`copy_dir_all`](#copy_dir_all) [`copy_file`](#copy_file) [`create`](#create) [`create_update`](#create_update) [`current_dir`](#current_dir) [`data_dir`](#data_dir) [`entries`](#entries) [`entry_bytes`](#entry_bytes) [`exists`](#exists) [`from_errno`](#from_errno) [`hard_link`](#hard_link) [`home_dir`](#home_dir) [`is_dir`](#is_dir) [`is_file`](#is_file) [`is_link`](#is_link) [`link_metadata`](#link_metadata) [`make_dir`](#make_dir) [`make_dir_all`](#make_dir_all) [`make_temp_dir`](#make_temp_dir) [`map_file`](#map_file) [`metadata`](#metadata) [`open`](#open) [`open_dir`](#open_dir) [`open_uncached`](#open_uncached) [`open_update`](#open_update) [`page_size`](#page_size) [`pending_name`](#pending_name) [`publish_dir`](#publish_dir) [`publish_file`](#publish_file) [`read_bytes`](#read_bytes) [`read_link`](#read_link) [`read_text`](#read_text) [`readable`](#readable) [`remove_dir`](#remove_dir) [`remove_dir_all`](#remove_dir_all) [`remove_file`](#remove_file) [`rename`](#rename) [`set_current_dir`](#set_current_dir) [`set_modified`](#set_modified) [`set_owner`](#set_owner) [`set_permissions`](#set_permissions) [`size_of`](#size_of) [`symlink`](#symlink) [`temp_dir`](#temp_dir) [`temp_file`](#temp_file) [`temp_root`](#temp_root) [`truncate`](#truncate) [`walk`](#walk) [`writable`](#writable) [`write_bytes`](#write_bytes) [`write_bytes_atomic`](#write_bytes_atomic) [`write_text`](#write_text) [`write_text_atomic`](#write_text_atomic) [`Advice`](#advice) [`Dir`](#dir) [`Entry`](#entry) [`File`](#file) [`FileState`](#filestate) [`IoError`](#ioerror) [`Kind`](#kind) [`Mapped`](#mapped) [`MappedMut`](#mappedmut) [`Matching`](#matching) [`Meta`](#meta) [`Walk`](#walk-1) [Display for IoError](#display-for-ioerror) [Display for Kind](#display-for-kind) [Drop for Dir](#drop-for-dir) [Drop for FileState](#drop-for-filestate) [Drop for Mapped](#drop-for-mapped) [Drop for MappedMut](#drop-for-mappedmut) [Eq for IoError](#eq-for-ioerror) [Eq for Kind](#eq-for-kind) [Fallible for File](#fallible-for-file) [Iterate for Matching](#iterate-for-matching) [Iterate for Walk](#iterate-for-walk) [Positioned for File](#positioned-for-file) [ReadAt for File](#readat-for-file) [Reader for File](#reader-for-file) [WriteAt for File](#writeat-for-file) [Writer for File](#writer-for-file)
 
 ## Functions
 
@@ -144,13 +144,13 @@ intended is the kind of surprise a library should not spring.
 ### `create`
 
 ```sysl
-create(path: string) -> Result[File, IoError]
+create(path: string, mode: u32 = file_mode) -> Result[File, IoError]
 ```
 
 ### `create_update`
 
 ```sysl
-create_update(path: string) -> Result[File, IoError]
+create_update(path: string, mode: u32 = file_mode) -> Result[File, IoError]
 ```
 
 ### `current_dir`
@@ -280,9 +280,10 @@ is_dir(path: string) -> bool
 ```
 
 Whether the path names a directory, asked of `stat` -- which follows a symbolic link, as every
-other question here does. A directory the program may not read or search is still a directory.
-Where the target does not support `stat` at all, it asks whether the path opens as a directory
-instead.
+other question here does. A directory the program may not read or search is still a directory;
+only a path `stat` cannot reach (missing, dangling, under an unsearchable directory) answers
+`false`. Where the target does not support `stat` at all, it asks whether the path opens as a
+directory instead.
 
 ### `is_file`
 
@@ -354,16 +355,7 @@ file) reports `AlreadyExists`. Neither is silently accepted.
 make_temp_dir(prefix: string) -> Result[string, IoError]
 ```
 
-A directory that did not exist a moment ago and that nobody else can take, made inside whatever
-`TMPDIR` names -- or `/tmp` where it names nothing.
-
-**It is created, not merely named**, which is the whole point: inventing a path and then making it
-leaves a gap between the two in which somebody else on a shared `/tmp` can take the name, and that
-somebody is not necessarily friendly. The prefix is for a human reading a directory listing and is
-not what makes the name unique.
-
-**Removing it is the caller's**, and `remove_dir_all` is the call: nothing here runs at the end of
-a scope that the scope did not say, so `defer remove_dir_all(d)` is the idiom.
+`temp_dir` under the name it had first; the two are one call.
 
 ### `map_file`
 
@@ -400,6 +392,13 @@ The three ways a program opens a file, named for what it means rather than for t
 becomes. `open` reads an existing file; `create` makes one, or empties one that was there;
 `append` writes at the end of whatever is there, making the file if it is not.
 
+**`create` and `create_update` take the permission bits a NEW file is born with**, `0o666` by
+default, which the process umask narrows exactly as `open(2)` with `O_CREAT` does. A secret file
+asks `0o600` here and is owner-only from the moment it exists, with no window between creating
+and `set_permissions`. The mode applies only when the file is created: one that already exists
+keeps the mode it has. Bits above the twelve permission bits are dropped, as in `set_permissions`.
+A target with no permission bits ignores the mode.
+
 ### `open_dir`
 
 ```sysl
@@ -411,6 +410,24 @@ The directory at `path`, held open to reach what is beneath it.
 A link as the last component of `path` is refused (`refused_link()`), and what is not a directory
 is `NotADirectory`. The components above it are the caller's own path and are followed as any path
 is -- `/tmp` is a link on macOS.
+
+### `open_uncached`
+
+```sysl
+open_uncached(path: string, create: bool = false) -> Result[File, IoError]
+```
+
+A file opened for reading and writing that **bypasses the operating system's page cache**:
+`O_DIRECT` on Linux, `fcntl(F_NOCACHE)` on macOS. A database that keeps its own buffer pool opens
+its files this way so a page is not held twice. `create` makes the file where it is missing and
+never empties one that exists.
+
+**Use it through `read_at` and `write_at`.** The buffered `read` and `write` move odd amounts
+and so do not suit it. On Linux every transfer must have its buffer address, its offset and its
+length at a multiple of the device's block size (512, in practice 4096), and a transfer that does
+not is `Other(22)` (`EINVAL`); macOS has no such rule. A filesystem that refuses the mode (tmpfs
+on older Linux kernels) answers `Other(22)` at the open. A target whose C library has neither
+mechanism answers "not supported on this target".
 
 ### `open_update`
 
@@ -651,6 +668,69 @@ unpacked. It is also stored **as written**: a relative target is resolved agains
 the link is in, every time it is followed, rather than against wherever the program was when it
 made the link.
 
+### `temp_dir`
+
+```sysl
+temp_dir(prefix: string = "") -> Result[string, IoError]
+```
+
+A directory that did not exist a moment ago and that nobody else can take, made with mode `0700`
+inside `temp_root()`. Its name is `prefix` followed by six characters chosen to make it unique.
+
+**It is created, not merely named**, which is the whole point: inventing a path and then making it
+leaves a gap between the two in which somebody else on a shared `/tmp` can take the name, and that
+somebody is not necessarily friendly. The prefix is for a human reading a directory listing and is
+not what makes the name unique.
+
+**Removing it is the caller's**, and `remove_dir_all` is the call: nothing here runs at the end of
+a scope that the scope did not say, so `defer remove_dir_all(d)` is the idiom.
+
+A root that is not there answers `NotFound`, and one this process may not write in
+`PermissionDenied`.
+
+### `temp_file`
+
+```sysl
+temp_file(prefix: string = "") -> Result[(File, string), IoError]
+```
+
+A regular file that did not exist a moment ago and that nobody else can take, made inside
+`temp_root()` and answered open for reading and writing, with its path. Its name is `prefix`
+followed by six characters chosen to make it unique.
+
+**It is created and opened in one step** -- `O_CREAT | O_EXCL`, as `mkstemp` does -- **with mode
+`0600`**, so there is no moment at which the name is somebody else's file or is readable by
+anyone but this user. Naming a file and then `create`-ing it would be the race `temp_dir`
+describes, with the added hazard that `create` follows a symbolic link somebody planted at the
+name. The process umask can narrow the mode further and never widens it.
+
+The `File` closes when the last copy of it goes, like any other. **The file itself stays**:
+removing it is the caller's, and `defer remove_file(p)` is the idiom -- written after the binding,
+so it runs after the `File` is closed or dropped.
+
+A root that is not there answers `NotFound`, and one this process may not write in
+`PermissionDenied`.
+
+### `temp_root`
+
+```sysl
+temp_root() -> string
+```
+
+The directory temporary files go in, which `temp_dir` and `temp_file` make things inside.
+
+**The rule, in order:** `TMPDIR` where it is set and not empty; otherwise, on macOS, the per-user
+directory `confstr(_CS_DARWIN_USER_TEMP_DIR)` names (`/var/folders/…/T`), which is where Apple's
+own `NSTemporaryDirectory` points and which only this user can write in; otherwise `/tmp`.
+Trailing slashes are dropped, so `s"${temp_root()}/name"` is the path the system will report back;
+`/` itself stays `/`.
+
+It is read afresh at every call rather than once, so a program that sets `TMPDIR` for itself is
+answered with what it set. It is not checked: a `TMPDIR` naming nothing is answered as it is, and
+the failure is `temp_dir`'s or `temp_file`'s, where there is something to fail. A target whose
+hooks cannot answer, and a root whose name is not UTF-8 and so cannot be a `string`, are answered
+`/tmp`; `temp_dir` and `temp_file` report the second as `InvalidUtf8` and leave nothing behind.
+
 ### `truncate`
 
 ```sysl
@@ -815,6 +895,9 @@ easy. While any copy lives the descriptor stays open.
 | `fd` | `fd(self) -> Result[int, IoError]` | The descriptor the file reads and writes through, for a call this module does not make. |
 | `into_raw_fd` | `into_raw_fd(*self) -> Result[int, IoError]` | The descriptor, given rather than lent: the file lets go of it, and closing it is from now on the caller's to do -- Rust's `into_raw_fd`. |
 | `map` | `map(*self) -> Result[&Mapped, IoError]` | The file's bytes, mapped read-only into memory rather than read -- `map_file`, for a file that is already open. |
+| `map_mut` | `map_mut(*self, len: usize = …) -> Result[&MappedMut, IoError]` | The file's bytes mapped readable and writable and shared, so a write through `bytes()` reaches the file. |
+| `sync_data` | `sync_data(*self) -> Result[unit, IoError]` | Hands what is buffered over and asks the device to keep the file's contents, returning once it has -- `sync` without the metadata a reader does not need (`fdatasync` on Linux, which skips an unchanged modification time). |
+| `full_sync` | `full_sync(*self) -> Result[unit, IoError]` | The strongest durability the platform offers: what is buffered is handed over and the device is made to empty its own write cache. |
 | `flush` | `flush(*self) -> Result[unit, IoError]` | Hands over what is buffered. |
 | `close` | `close(*self) -> Result[unit, IoError]` | Releases the descriptor, handing over what is still buffered. |
 | `tell` | `tell(*self) -> Result[long, IoError]` | Where the next read or write will happen, in bytes from the start. |
@@ -822,6 +905,7 @@ easy. While any copy lives the descriptor stays open.
 | `size` | `size(*self) -> Result[long, IoError]` | How many bytes the file holds. |
 | `at_end` | `at_end(*self) -> bool` | Whether a read has already run off the end. |
 | `truncate` | `truncate(*self, length: long) -> Result[unit, IoError]` | The file cut to a length, or extended to one with zeroes -- the one thing this surface could not do, having `seek` and `size` and no way to change what is there. |
+| `set_permissions` | `set_permissions(*self, mode: u32) -> Result[unit, IoError]` | The twelve permission bits of this open file set to `mode` -- `fchmod(2)` on the descriptor, so it changes the file this handle holds whatever the path now names. |
 | `read_failure` | `read_failure(*self) -> Option[IoError]` | What the file latched when a read failed, as the same `IoError` -- the system's own wording and `errno` -- that a whole-file read answers, or `None` while `failed` is false. |
 
 ### `FileState`
@@ -937,6 +1021,33 @@ empty view.
 | `is_empty` | `is_empty(self) -> bool` |  |
 | `bytes` | `bytes(&self) -> []const u8` | The whole file, read-only. |
 | `advise` | `advise(self, advice: Advice, from: usize = 0, len: usize = …) -> Result[unit, IoError]` | Tells the operating system how `len` bytes from offset `from` are about to be used; `len` left out means to the end of the mapping. |
+
+### `MappedMut`
+
+```sysl
+struct MappedMut
+    private at: *u8
+    private n: usize
+```
+
+A file's bytes mapped shared and writable, from `File.map_mut`: a write through `bytes()` is a
+write to the file.
+
+**Nothing is promised to be on the device until `flush`.** The system writes dirty pages back when
+it chooses, and a program that exits or drops the mapping loses nothing the system has accepted
+(it stays in the page cache and reaches the file), but only `flush` -- and `File.sync_data` or
+`full_sync` after it, for power-loss durability -- says the bytes are out. The mapping is as long
+as the file was when it was made and does not follow it: cutting the file shorter underneath makes
+a read of a page past the new end a signal. Dropping the last reference unmaps it; hold it as a
+`&MappedMut`.
+
+| Member | Signature | Description |
+|---|---|---|
+| `len` | `len(self) -> usize` |  |
+| `is_empty` | `is_empty(self) -> bool` |  |
+| `bytes` | `bytes(&self) -> []u8` | The whole mapping, writable. |
+| `flush` | `flush(self, from: usize = 0, len: usize = …) -> Result[unit, IoError]` | Writes `len` bytes from offset `from` (`len` left out: to the end) to the file and returns once they are there -- `msync(MS_SYNC)`. |
+| `flush_async` | `flush_async(self, from: usize = 0, len: usize = …) -> Result[unit, IoError]` | Schedules the same write-back and returns at once (`msync(MS_ASYNC)`). |
 
 ### `Matching`
 
@@ -1068,6 +1179,12 @@ its output arrived calls `close` and reads the answer.
 
 ```sysl
 impl Drop for Mapped
+```
+
+### Drop for MappedMut
+
+```sysl
+impl Drop for MappedMut
 ```
 
 ### Eq for IoError

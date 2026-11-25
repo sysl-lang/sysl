@@ -1,0 +1,183 @@
+module sysl.fs
+@requires(posix)
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.env.get
+import sysl.path.{file_name, is_absolute, parent}
+
+// `temp_root`, `temp_dir` and `temp_file` in this process, against whatever root the suite runs
+// with. **Where the root comes from** -- `TMPDIR` honoured, trailing slashes, the fallback, a root that
+// is missing, unwritable, a file or not UTF-8 -- and the umask and many processes at once are
+// `sysl/process/temp_tests.sysl`'s, which starts a program with an environment of its choosing: this
+// process's environment is shared by every test running beside it. Every entry a test here makes in
+// the root is its own and is removed before it ends.
+
+// `ENAMETOOLONG`, which a BSD and glibc number differently (`links.sysl`).
+#if bsd
+private const tmf_too_long: int = 63
+#else
+private const tmf_too_long: int = 36
+#endif
+
+/** The six characters `mkstemp` and `mkdtemp` put after a prefix. */
+private const tmf_unique: usize = 6
+
+private tmf_mode(p: string) -> u32 = metadata(p).unwrap().permissions()
+
+private tmf_name(p: string) -> string = file_name(p).unwrap()
+
+@test("tmf: the root is absolute, a directory, and ends in no slash")
+tmf_root_shape()
+    val r = temp_root()
+
+    assert(is_absolute(r), r)
+    assert(is_dir(r), r)
+    assert(r == "/" || !r.ends_with("/"), r)
+
+@test("tmf: the root is TMPDIR, as it is spelled less its trailing slashes, where TMPDIR is set")
+tmf_root_is_tmpdir()
+    val t = get("TMPDIR").unwrap_or("")
+
+    if t.len == 0 then return
+
+    val bare = t.trim_end_matches("/")
+
+    assert_eq(temp_root(), if bare.len == 0 then "/" else bare)
+
+@test("tmf: a temporary directory is made in the root, empty, owner-only, and named by six characters")
+tmf_dir_default()
+    val d = temp_dir().unwrap()
+
+    assert_eq(parent(d).unwrap(), temp_root())
+    assert(is_dir(d), d)
+    assert_eq(entries(d).unwrap().len(), 0)
+    assert_eq(tmf_mode(d), 0o700)
+    assert_eq(tmf_name(d).len, tmf_unique)
+    remove_dir_all(d).unwrap()
+
+@test("tmf: a directory's name is its prefix and then the six")
+tmf_dir_prefix()
+    val d = temp_dir("sysl-tmf-dir-").unwrap()
+    val name = tmf_name(d)
+
+    assert(name.starts_with("sysl-tmf-dir-"), name)
+    assert_eq(name.len, "sysl-tmf-dir-".len + tmf_unique)
+    remove_dir_all(d).unwrap()
+
+@test("tmf: make_temp_dir is temp_dir under its first name: the same root, a different directory")
+tmf_make_temp_dir_agrees()
+    val a = make_temp_dir("sysl-tmf-same-").unwrap()
+    val b = temp_dir("sysl-tmf-same-").unwrap()
+
+    assert(a != b)
+    assert_eq(parent(a).unwrap(), temp_root())
+    assert_eq(parent(b).unwrap(), temp_root())
+    assert_eq(tmf_mode(a), 0o700)
+    remove_dir_all(a).unwrap()
+    remove_dir_all(b).unwrap()
+
+@test("tmf: a temporary file is made in the root, empty, regular, owner-only, and named by six characters")
+tmf_file_default()
+    var (f, p) = temp_file().unwrap()
+    val m = metadata(p).unwrap()
+
+    assert_eq(parent(p).unwrap(), temp_root())
+    assert(m.is_file(), p)
+    assert_eq(m.size, 0)
+    assert_eq(m.permissions(), 0o600)
+    assert_eq(tmf_name(p).len, tmf_unique)
+    assert(!f.closed())
+    remove_file(p).unwrap()
+
+@test("tmf: a file's name is its prefix and then the six, a non-ASCII prefix included")
+tmf_file_prefix()
+    for prefix in ["sysl-tmf-file-", "sysl-tmf-é-"]
+        val (_, p) = temp_file(prefix).unwrap()
+        val name = tmf_name(p)
+
+        assert(name.starts_with(prefix), name)
+        assert_eq(name.len, prefix.len + tmf_unique)
+        remove_file(p).unwrap()
+
+@test("tmf: the file is answered open for writing and for reading back through the same handle")
+tmf_file_reads_and_writes()
+    var (f, p) = temp_file("sysl-tmf-rw-").unwrap()
+
+    f.write("written".bytes)
+    f.seek(0).unwrap()
+
+    var into: [16]u8 = [0; 16]
+
+    assert_eq(f.read(into[..]), "written".bytes)
+    f.close().unwrap()
+    assert_eq(read_text(p).unwrap(), "written")
+    remove_file(p).unwrap()
+
+@test("tmf: the file outlives its File: dropping the handle closes it and removes nothing")
+tmf_file_stays_after_drop()
+    val p = tmf_made_and_dropped()
+
+    assert(is_file(p), p)
+    assert_eq(read_text(p).unwrap(), "kept")
+    remove_file(p).unwrap()
+
+private tmf_made_and_dropped() -> string
+    var (f, p) = temp_file("sysl-tmf-drop-").unwrap()
+
+    f.write("kept".bytes)
+    p
+
+@test("tmf: the directory outlives the call too: nothing removes it but the caller")
+tmf_dir_stays()
+    val d = tmf_dir_made()
+
+    assert(is_dir(d), d)
+    remove_dir_all(d).unwrap()
+
+private tmf_dir_made() -> string = temp_dir("sysl-tmf-stay-").unwrap()
+
+@test("tmf: the handle still writes after the name is removed, so removing early is safe")
+tmf_file_unlinked_while_open()
+    var (f, p) = temp_file("sysl-tmf-gone-").unwrap()
+
+    remove_file(p).unwrap()
+    assert(!exists(p))
+    f.write("still".bytes)
+    f.seek(0).unwrap()
+
+    var into: [8]u8 = [0; 8]
+
+    assert_eq(f.read(into[..]), "still".bytes)
+    f.close().unwrap()
+
+@test("tmf: two hundred files and two hundred directories in a row are four hundred names")
+tmf_many_in_a_row()
+    var made: Buf[string] = buf()
+
+    for _ in 0..<200
+        val (_, p) = temp_file("sysl-tmf-many-").unwrap()
+
+        made.push(p)
+        made.push(temp_dir("sysl-tmf-many-").unwrap())
+
+    for i in 0..<made.len()
+        for j in (i + 1)..<made.len()
+            assert(made[i] != made[j], made[i])
+
+    for p in made
+        remove_dir_all(p).unwrap()
+
+    for p in made
+        assert(!exists(p), p)
+
+@test("tmf: a name the system cannot hold is refused at every length, and nothing is made")
+tmf_name_too_long()
+    // Past one name's limit, past the template's buffer, and past the hook's own storage.
+    val lengths: []usize = [300, 4080, 5000]
+
+    for n in lengths
+        val prefix = "x".repeat(n)
+
+        assert_eq(temp_file(prefix).err(), Some(Other(tmf_too_long)), s"$n")
+        assert_eq(temp_dir(prefix).err(), Some(Other(tmf_too_long)), s"$n")
