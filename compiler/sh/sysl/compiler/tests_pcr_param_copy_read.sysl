@@ -21,9 +21,8 @@ import sysl.process.capture
 // Skipped cells, and why: a call through a trait object or a function pointer asks the same
 // `vcall_reads` / `pointer_reads` the borrow rule does (`tests_bth_borrow_through.sysl` covers those
 // callees); a copy made by a callee storing into a local is `bind_call`, the path the direct copy
-// takes. Known conservative refusal: a local's copies are gathered flow-insensitively, so a copy
-// overwritten with a module address before the call is still refused, as `held = b` after the same
-// overwrite always has been (`pcr_reassigned_before_the_call`, ignored).
+// takes. A copy is followed along the body's ways: one overwritten on every way to the call no longer
+// holds the parameter there (the last section).
 
 // -- the harness ----------------------------------------------------------------------------------
 
@@ -453,7 +452,7 @@ pcr_heap_address()
             print(kept.unwrap().v)
         """, "5\n")
 
-@test("a copy overwritten with a module address before its address is handed over", ignore: "a local's copies are gathered flow-insensitively, as for 'held = b' after the same overwrite")
+@test("a copy overwritten with a module address before its address is handed over")
 pcr_reassigned_before_the_call()
     pcr_prints(raw"""
         key(a: *int)
@@ -470,3 +469,873 @@ pcr_reassigned_before_the_call()
             other()
             print(*held)
         """, "5\n7\n")
+
+// -- where the copy is overwritten: on every way to the hand-over, or only on some ---------------------
+//
+// A local's copy is gathered along the body's ways (`keeps.sysl`'s `copy_overwrite`, `rebinds`): a
+// whole store of something else into it overwrites it on that way, a store of the parameter back into
+// it -- by the body, or by a callee through its address -- puts it back, and where ways meet it is
+// overwritten only if it is on all of them. The axes: the shape of the way (straight, `if` with and
+// without `else`, `match`, a loop at its top and its bottom, `break`, `continue`, `return`, `defer`),
+// what overwrites it (a store, a declaration, a store through a pointer to it, a closure's body), and
+// what puts it back (a store, a copy of a copy, a callee given its address). Crossed with a closure
+// built before and after the overwrite, a method, a generic, nested loops, a read walk (`relay`).
+//
+// Still counted, on purpose (`copy_locals`): a store of one field, which leaves the rest; a local
+// whose address is held anywhere -- a pointer, a `ref`, a nested function's environment, a callee
+// that keeps it -- since a store through that address is one no piece names the local in; a
+// `defer`, asked as of the way out; and a name bound twice, followed by neither binding.
+
+@test("a copy stored straight into module storage after it is overwritten")
+pcr_reassigned_then_stored()
+    pcr_prints(raw"""
+        key(a: *int)
+            var b = a
+            b = &spare
+            held = b
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, "7\n")
+
+@test("a copy overwritten in both arms of an 'if' before its address is handed over")
+pcr_overwritten_both_arms()
+    pcr_prints(raw"""
+        var other_spare = 9
+
+        key(a: *int)
+            var b = a
+            if *a > 3
+                b = &spare
+            else
+                b = &other_spare
+            f1(&b)
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, "7\n")
+
+@test("a copy overwritten in one arm of an 'if' without an 'else'")
+pcr_overwritten_one_arm()
+    pcr_refused(raw"""
+        key(a: *int)
+            var b = a
+            if *a > 30 then b = &spare
+            f1(&b)
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_lets_out("f1"))
+
+@test("a copy overwritten in every arm of a 'match'")
+pcr_overwritten_every_match_arm()
+    pcr_prints(raw"""
+        var other_spare = 9
+
+        key(a: *int)
+            var b = a
+            *a match
+                5 -> b = &spare
+                _ -> b = &other_spare
+            f1(&b)
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, "7\n")
+
+@test("a copy overwritten in all but one arm of a 'match'")
+pcr_overwritten_some_match_arms()
+    pcr_refused(raw"""
+        key(a: *int)
+            var b = a
+            *a match
+                5 -> print(*b)
+                _ -> b = &spare
+            f1(&b)
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_lets_out("f1"))
+
+@test("a copy overwritten on one way, the other leaving by 'return'")
+pcr_overwritten_or_returned()
+    pcr_prints(raw"""
+        key(a: *int)
+            var b = a
+            if *a > 3
+                b = &spare
+            else
+                return
+            f1(&b)
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, "7\n")
+
+@test("a copy overwritten in a loop body that may not run")
+pcr_overwritten_in_a_loop_that_may_not_run()
+    pcr_refused(raw"""
+        key(a: *int)
+            var b = a
+            for i in 0..<*a - 5
+                b = &spare
+            f1(&b)
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_lets_out("f1"))
+
+@test("a copy overwritten at the top of a loop body, its address handed over below")
+pcr_overwritten_at_the_loop_top()
+    pcr_prints(raw"""
+        key(a: *int)
+            var b = a
+            for i in 0..<2
+                b = &spare
+                f1(&b)
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, "7\n")
+
+@test("a copy overwritten at the bottom of a loop body, its address handed over above")
+pcr_overwritten_at_the_loop_bottom()
+    pcr_refused(raw"""
+        key(a: *int)
+            var b = a
+            for i in 0..<2
+                f1(&b)
+                b = &spare
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_lets_out("f1"))
+
+@test("a copy put back at the bottom of a loop body after the top overwrote it")
+pcr_put_back_at_the_loop_bottom()
+    pcr_refused(raw"""
+        key(a: *int)
+            var b = a
+            b = &spare
+            for i in 0..<2
+                f1(&b)
+                b = a
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_lets_out("f1"))
+
+@test("a 'break' leaving a loop before the overwrite")
+pcr_break_before_the_overwrite()
+    pcr_refused(raw"""
+        key(a: *int)
+            var b = a
+            loop
+                if *a == 5 then break
+                b = &spare
+                break
+            f1(&b)
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_lets_out("f1"))
+
+@test("a 'continue' carrying a copy put back to the loop's head past the overwrite")
+pcr_continue_past_the_overwrite()
+    pcr_refused(raw"""
+        key(a: *int)
+            var b = a
+            b = &spare
+            var n = 0
+            loop
+                n += 1
+                if n == 2
+                    f1(&b)
+                    break
+                if n == 1
+                    b = a
+                    continue
+                b = &spare
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_lets_out("f1"))
+
+@test("a copy overwritten, then copied from the parameter again")
+pcr_overwritten_then_copied_again()
+    pcr_refused(raw"""
+        key(a: *int)
+            var b = a
+            b = &spare
+            b = a
+            f1(&b)
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_lets_out("f1"))
+
+@test("a copy of an overwritten copy")
+pcr_copy_of_an_overwritten_copy()
+    pcr_prints(raw"""
+        key(a: *int)
+            var b = a
+            b = &spare
+            var c = b
+            f1(&c)
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, "7\n")
+
+@test("a copy of a copy, the first copy overwritten after the second was made")
+pcr_first_copy_overwritten_after_the_second()
+    pcr_refused(raw"""
+        key(a: *int)
+            var b = a
+            var c = b
+            b = &spare
+            f1(&c)
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_lets_out("f1"))
+
+@test("a local declared with a module address, the copy stored into it only on one way")
+pcr_declared_overwritten_copied_on_one_way()
+    pcr_refused(raw"""
+        key(a: *int)
+            var b = &spare
+            if *a == 5 then b = a
+            f1(&b)
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_lets_out("f1"))
+
+@test("a copy overwritten through a pointer to it")
+pcr_overwritten_through_a_pointer()
+    pcr_refused(raw"""
+        key(a: *int)
+            var b = a
+            val p = &b
+            *p = &spare
+            f1(&b)
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_lets_out("f1"))
+
+@test("a copy overwritten, then put back by a callee given its address")
+pcr_put_back_by_a_callee()
+    pcr_refused(raw"""
+        put(p: **int, v: *int)
+            *p = v
+
+        key(a: *int)
+            var b = a
+            b = &spare
+            put(&b, a)
+            f1(&b)
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_lets_out("f1"))
+
+@test("a copy overwritten inside a closure's body")
+pcr_overwritten_in_a_closure()
+    pcr_refused(raw"""
+        key(a: *int)
+            var b = a
+            val reset = () -> b = &spare
+            reset()
+            f1(&b)
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_lets_out("f1"))
+
+@test("a deferred hand-over of a copy overwritten where the 'defer' is written and put back below")
+pcr_deferred_after_the_copy_is_put_back()
+    pcr_refused(raw"""
+        key(a: *int)
+            var b = a
+            b = &spare
+            defer f1(&b)
+            b = a
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_lets_out("f1"))
+
+@test("a copy overwritten, then put back through a pointer to it taken before")
+pcr_put_back_through_a_pointer()
+    pcr_refused(raw"""
+        key(a: *int)
+            var b = a
+            val p = &b
+            b = &spare
+            *p = a
+            f1(&b)
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_lets_out("f1"))
+
+@test("a copy overwritten, then put back through its address kept by a callee")
+pcr_put_back_through_a_kept_address()
+    pcr_refused(raw"""
+        var stash: **int = null
+
+        keep_it(p: **int)
+            stash = p
+
+        key(a: *int)
+            var b = a
+            keep_it(&b)
+            b = &spare
+            *stash = a
+            f1(&b)
+            stash = null
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, "keeps its parameter 'a'")
+
+@test("a copy overwritten, then put back by a nested function")
+pcr_put_back_by_a_nested_function()
+    pcr_refused(raw"""
+        key(a: *int)
+            var b = a
+            b = &spare
+
+            restore()
+                b = a
+
+            restore()
+            f1(&b)
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_lets_out("f1"))
+
+@test("a copy declared in an inner block under the name of an overwritten local")
+pcr_inner_copy_named_as_an_overwritten_one()
+    pcr_refused(raw"""
+        key(a: *int)
+            var b = a
+            b = &spare
+            if *a == 5
+                var b = a
+                f1(&b)
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_lets_out("f1"))
+
+@test("two copies overwritten in one multiple assignment")
+pcr_overwritten_by_a_multiple_assignment()
+    pcr_prints(raw"""
+        var other_spare = 9
+
+        key(a: *int)
+            var b = a
+            var c = a
+            b, c = &other_spare, &spare
+            f1(&b)
+            f1(&c)
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, "7\n")
+
+@test("a multiple assignment overwriting one copy and putting the parameter in the other")
+pcr_multiple_assignment_swaps_one_back()
+    pcr_refused(raw"""
+        key(a: *int)
+            var b = a
+            var c = &spare
+            b, c = c, b
+            f1(&c)
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_lets_out("f1"))
+
+@test("a struct holding the copy in a field, overwritten whole, the field stored")
+pcr_struct_overwritten_whole()
+    pcr_prints(raw"""
+        struct H
+            p: *int
+
+        key(a: *int)
+            var h = H(a)
+            h = H(&spare)
+            held = h.p
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, "7\n")
+
+@test("a struct holding the copy in a field, only the field overwritten, is still followed")
+pcr_struct_field_overwritten()
+    pcr_refused(raw"""
+        struct H
+            p: *int
+
+        key(a: *int)
+            var h = H(a)
+            h.p = &spare
+            held = h.p
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_kept("it is stored in 'held'"))
+
+@test("a pointer read through the parameter into a local, overwritten before it is stored")
+pcr_read_value_overwritten()
+    pcr_prints(raw"""
+        relay(p: **int)
+            var q = *p
+            print(*q)
+            q = &spare
+            held = q
+
+        other()
+            var y = 5
+            var x = &y
+            relay(&x)
+
+        main()
+            other()
+            print(*held)
+        """, "5\n7\n")
+
+@test("a pointer read through the parameter into a local, overwritten on one way only")
+pcr_read_value_overwritten_on_one_way()
+    pcr_refused(raw"""
+        relay(p: **int)
+            var q = *p
+            if *q > 30 then q = &spare
+            held = q
+
+        other()
+            var y = 5
+            var x = &y
+            relay(&x)
+
+        main()
+            other()
+            print(*held)
+        """, "'relay' lets what it reads through its parameter 'p' outlive the call")
+
+@test("a closure made after the copy is overwritten, storing what it captured")
+pcr_closure_made_after_the_overwrite()
+    pcr_prints(raw"""
+        key(a: *int)
+            var b = a
+            b = &spare
+            val g = () -> held = b
+            g()
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, "7\n")
+
+@test("a closure made before the copy is overwritten, storing what it captured")
+pcr_closure_made_before_the_overwrite()
+    pcr_refused(raw"""
+        key(a: *int)
+            var b = a
+            val g = () -> held = b
+            b = &spare
+            g()
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, "keeps its parameter 'a'")
+
+@test("a closure built in a loop whose next turn finds the copy put back")
+pcr_closure_built_in_a_loop()
+    pcr_refused(raw"""
+        key(a: *int)
+            var b = a
+            b = &spare
+            for i in 0..<2
+                val g = () -> held = b
+                g()
+                b = a
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, "keeps its parameter 'a'")
+
+@test("a closure built after the overwrite, handed to a callee that runs it")
+pcr_closure_handed_after_the_overwrite()
+    pcr_prints(raw"""
+        run_it(f: &Fn() -> unit) = f()
+
+        key(a: *int)
+            var b = a
+            b = &spare
+            run_it(() -> held = b)
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, "7\n")
+
+@test("a copy overwritten by a 'defer', its address handed over before the way out")
+pcr_overwritten_by_a_defer()
+    pcr_refused(raw"""
+        key(a: *int)
+            var b = a
+            defer b = &spare
+            f1(&b)
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_lets_out("f1"))
+
+@test("a copy overwritten in an outer loop's body, handed over in an inner loop")
+pcr_overwritten_in_an_outer_loop()
+    pcr_prints(raw"""
+        key(a: *int)
+            var b = a
+            for i in 0..<2
+                b = &spare
+                for j in 0..<2
+                    f1(&b)
+                b = a
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, "7\n")
+
+@test("a copy put back in an inner loop, handed over after it in the outer loop's body")
+pcr_put_back_in_an_inner_loop()
+    pcr_refused(raw"""
+        key(a: *int)
+            var b = a
+            for i in 0..<2
+                b = &spare
+                for j in 0..<*a - 5
+                    b = a
+                f1(&b)
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_lets_out("f1"))
+
+@test("a 'match' whose arm that does not overwrite the copy returns")
+pcr_match_arm_returns()
+    pcr_prints(raw"""
+        key(a: *int)
+            var b = a
+            *a match
+                5 -> b = &spare
+                _ -> return
+            f1(&b)
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, "7\n")
+
+@test("a 'while' loop overwriting the copy, its address handed over after it")
+pcr_while_loop_overwrites()
+    pcr_refused(raw"""
+        key(a: *int)
+            var b = a
+            var n = *a
+            while n > 5
+                b = &spare
+                n -= 1
+            f1(&b)
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_lets_out("f1"))
+
+@test("a method overwriting a copy of its parameter before handing its address over")
+pcr_method_overwrites()
+    pcr_prints(raw"""
+        struct S
+            n: int
+
+        impl S
+            key(*self, a: *int)
+                var b = a
+                b = &spare
+                f1(&b)
+
+        other()
+            var y = 5
+            var s = S(1)
+            s.key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, "7\n")
+
+@test("a generic function overwriting a copy of its parameter before handing its address over")
+pcr_generic_overwrites()
+    pcr_prints(raw"""
+        key[T](a: *int, t: T)
+            var b = a
+            b = &spare
+            f1(&b)
+
+        other()
+            var y = 5
+            key(&y, 1)
+            key(&y, true)
+
+        main()
+            other()
+            print(*held)
+        """, "7\n")
+
+@test("a copy overwritten, then put back through a 'ref' naming it")
+pcr_put_back_through_a_ref()
+    pcr_refused(raw"""
+        key(a: *int)
+            var b = a
+            ref r = b
+            b = &spare
+            r = a
+            f1(&b)
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_lets_out("f1"))
+
+@test("a copy overwritten through a 'ref' naming it")
+pcr_overwritten_through_a_ref()
+    pcr_refused(raw"""
+        key(a: *int)
+            var b = a
+            ref r = b
+            r = &spare
+            f1(&b)
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_lets_out("f1"))
+
+@test("a copy handed to a callee that keeps its address is followed as before")
+pcr_address_kept_by_a_callee()
+    pcr_refused(raw"""
+        var stash: **int = null
+
+        keep_it(p: **int)
+            stash = p
+
+        key(a: *int)
+            var b = a
+            b = &spare
+            keep_it(&b)
+            f1(&b)
+            stash = null
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_lets_out("f1"))

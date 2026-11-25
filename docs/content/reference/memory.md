@@ -864,6 +864,55 @@ run(c: bool)
 'store' keeps its parameter 'p' (it is stored in 'held'), and '&n' is the address of a local of 'run'
 ```
 
+**A local holding a copy of the parameter is followed along the same ways.** Written over with
+something else on every way to where it is stored or its address handed over, it no longer holds the
+parameter there; written over on only some — an `if` without an `else`, a loop body that may not run,
+one `match` arm, a `break` or `continue` past the store — it still does. Only a store of the whole
+local counts as writing it over: a store through a pointer to it, or in a closure's body, does not;
+and the parameter stored back into it, by the body or by a callee handed its address, makes it a copy
+again:
+
+```sysl
+static var spare = 0
+static var held: *int = &spare
+
+note(p: *int)
+    var q = p
+    print(*q)
+    q = &spare
+    held = q
+
+run()
+    var n = 41
+    note(&n)
+
+run()
+print(*held)
+```
+
+```output
+41
+0
+```
+
+```sysl
+static var spare = 0
+static var held: *int = &spare
+
+note(p: *int)
+    var q = p
+    if *p > 50 then q = &spare
+    held = q
+
+run()
+    var n = 41
+    note(&n)
+```
+
+```error
+'note' keeps its parameter 'p' (it is stored in 'held'), and '&n' is the address of a local of 'run'
+```
+
 ### Handing it back is not keeping it
 
 **An answer made of arguments is lent for as long as those arguments live in the caller.**
