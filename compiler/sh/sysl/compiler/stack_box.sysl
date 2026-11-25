@@ -3,6 +3,7 @@ module sh.sysl.compiler
 import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
 import sysl.container.{Map, map, Set, set}
+import sysl.slices.sort
 
 // **A `&T` nothing keeps past its frame is laid in that frame** (`reference/memory.md § A box nothing
 // keeps is laid in the frame`).
@@ -339,7 +340,7 @@ private site_payload_ok(e: *Emit, cx: &BoxCx, inner: Type) -> bool
     if e.layout.size(inner) > stack_box_limit() then return false
 
     cx.dtor_fns.get(mangle(inner)) match
-        Some(name) -> !summary(cx, name, 0, 1).0
+        Some(name) -> !summary(cx, name, 0, 1, None).0
         None -> true
 end site_payload_ok
 
@@ -485,6 +486,16 @@ end BoxCx
 // the loops each local is declared in, as `,1,4,`; `site_loop` the innermost loop the site is built
 // in (-1 for none). `answers` is set where a way out may answer it, which is an escape only for a
 // site that is not its factory's.
+//
+// **A closure's environment is a holder per capture** (`env`, `sb_slot_carries`). Each closure literal
+// is one struct type built at one place, so a walk that sees every construction of it knows which of
+// its slots may hold what is followed: `env` has the literal's base once one is seen, and `base#slot`
+// for each slot an argument that may carry it was built into. A read of any other slot of that
+// environment carries nothing. The record is only as good as the walk's sight of every such value:
+// `exact` says no value that may carry what is followed came from anywhere the walk cannot see the
+// making of (a call's answer, a store into a slot), and a parameter's walk inherits its caller's
+// record (`summary`), since that caller built what it hands over. Where it is not exact, or the
+// literal was never seen built, every slot may carry, as before.
 private struct BoxWalk
     cx: &BoxCx
     site: Span
@@ -500,12 +511,27 @@ private struct BoxWalk
     escaped: bool
     answers: bool
     changed: bool
+    exact: bool
+    env: Set[string]
 
     hold(*self, name: string)
         if !self.holders.has(name)
             self.holders.add(name)
             self.changed = true
     end hold
+
+    note_env(*self, entry: string)
+        if !self.env.has(entry)
+            self.env.add(entry)
+            self.changed = true
+    end note_env
+
+    // A value that may carry what is followed came from where the walk cannot see it built.
+    inexact(*self)
+        if self.exact
+            self.exact = false
+            self.changed = true
+    end inexact
 
     declare(*self, name: string)
         var text = ","
@@ -530,15 +556,24 @@ end BoxWalk
 // parameter, to a fixed point over the locals that may hold it.
 private follow_site(cx: &BoxCx, f: TFunc, site: Span, call_site: bool, factory: bool) -> &BoxWalk
     val w: &BoxWalk = BoxWalk(cx, site, call_site, false, factory, set(), set(), map(), buf(), 0, -1, false,
-                              false, true)
+                              false, true, true, set())
 
     run_walk(w, f)
     w
 end follow_site
 
-private follow_param(cx: &BoxCx, f: TFunc, j: usize) -> &BoxWalk
+// `env` is the caller's record of the closure environments it built (`BoxWalk.env`), `None` where the
+// caller's is not exact.
+private follow_param(cx: &BoxCx, f: TFunc, j: usize, env: Option[Set[string]]) -> &BoxWalk
+    var given: Set[string] = set()
+
+    if env.is_some()
+        for entry in env.unwrap()
+            given.add(entry)
+    end if
+
     val w: &BoxWalk = BoxWalk(cx, span_zero(), false, true, false, set(), set(), map(), buf(), 0, -1, false,
-                              false, true)
+                              false, true, env.is_some(), given)
 
     w.holders.add(f.params[j].0)
     run_walk(w, f)
@@ -623,8 +658,31 @@ end sb_write
 // A value that may be what is followed, written into `place`: a local's own storage holds it, and
 // anything else keeps it.
 private sb_store(w: &BoxWalk, place: TExpr) = sb_root(w, place) match
-    Some(n) -> w.hold(n)
+    Some(n) ->
+        // A slot of a closure's environment stored into after it was built holds what its
+        // construction did not say.
+        if in_closure_slot(place) then w.inexact()
+
+        w.hold(n)
     None -> sb_escape(w)
+
+// Whether a place steps through a field of a closure's environment.
+private in_closure_slot(place: TExpr) -> bool = *place.kind match
+    TField(r, _, _) -> is_closure_literal(underlying(texpr_type(r))) || in_closure_slot(r)
+    TIndex(r, _, _) -> in_closure_slot(r)
+    _ -> false
+
+// Whether slot `slot` of a value of type `ty` may carry what is followed: any slot of anything but a
+// closure's environment whose every construction the walk has seen (`BoxWalk.env`), and of that, a
+// slot built from something that may carry it.
+private sb_slot_carries(w: &BoxWalk, ty: Type, slot: int) -> bool = underlying(ty) match
+    Struct(st) ->
+        if !is_closure_literal(Struct(st)) || !w.exact || !w.env.has(st.base) then true
+        else w.env.has(s"${st.base}#$slot")
+    _ -> true
+
+// The caller's record of closure environments a callee's walk inherits: `None` unless it is exact.
+private sb_env(w: &BoxWalk) -> Option[Set[string]] = if w.exact then Some(w.env) else None
 
 // The local a place is inside of by value: a chain of field and element steps, never through a
 // pointer, a reference or a `ref`.
@@ -699,7 +757,7 @@ private sb_kind(w: &BoxWalk, x: TExpr) -> bool = *x.kind match
 
         for k in 0..<args.len()
             if sb_carry(w, args[k])
-                val s = summary(w.cx, name, k, args.len())
+                val s = summary(w.cx, name, k, args.len(), sb_env(w))
 
                 if s.0 then sb_escape(w)
                 if s.1 then answered = true
@@ -712,10 +770,22 @@ private sb_kind(w: &BoxWalk, x: TExpr) -> bool = *x.kind match
             return true
         end if
 
+        if answered && may_carry(texpr_type(x)) then w.inexact()
+
         answered
     TStructNew(st, args) ->
-        val c = sb_all(w, args)
+        val closure = is_closure_literal(Struct(st))
+        var c = false
 
+        for i in 0..<args.len()
+            if sb_carry(w, args[i])
+                c = true
+
+                if closure then w.note_env(s"${st.base}#${st.slot(i)}")
+            end if
+        end for
+
+        if closure then w.note_env(st.base)
         if c && w.cx.dtors.has(mangle(Struct(st))) then sb_escape(w)
 
         c
@@ -748,7 +818,7 @@ private sb_kind(w: &BoxWalk, x: TExpr) -> bool = *x.kind match
 
     // A step into a reference's payload reads what the payload holds, which the box can be part of only
     // by a store this walk has already called an escape.
-    TField(r, _, _) -> sb_carry(w, r) && !is_ref_type(texpr_type(r))
+    TField(r, slot, _) -> sb_carry(w, r) && !is_ref_type(texpr_type(r)) && sb_slot_carries(w, texpr_type(r), slot)
     TIndex(r, i, _) ->
         sb_see(w, i)
         sb_carry(w, r) && !is_ref_type(texpr_type(r))
@@ -903,7 +973,7 @@ private sb_kind(w: &BoxWalk, x: TExpr) -> bool = *x.kind match
                 var seen = w.cx.table_args.get(key).unwrap_or((false, false))
 
                 for name in callees.unwrap()
-                    val s = summary(w.cx, name, k, given)
+                    val s = summary(w.cx, name, k, given, sb_env(w))
 
                     if s.0 then sb_escape(w)
                     if s.1 then answered = true
@@ -914,6 +984,8 @@ private sb_kind(w: &BoxWalk, x: TExpr) -> bool = *x.kind match
                 w.cx.table_args.put(key, seen)
             end if
         end for
+
+        if answered && may_carry(texpr_type(x)) then w.inexact()
 
         answered
     _ ->
@@ -1083,8 +1155,10 @@ end table_callees
 // What the function `name` does with its parameter `k`: whether it may let it out (`.0`), and whether
 // its answer may be it or hold it (`.1`). Where no body is in sight, the arguments do not line up, the
 // body is a task's or is being worked out further up this very question, the answer is "it escapes".
-private summary(cx: &BoxCx, name: string, k: usize, given: usize) -> (bool, bool)
-    val key = s"$name|$k"
+// `env` is the asking walk's record of the closure environments it built (`BoxWalk.env`), which the
+// parameter's walk starts from; each record is its own question.
+private summary(cx: &BoxCx, name: string, k: usize, given: usize, env: Option[Set[string]]) -> (bool, bool)
+    val key = s"$name|$k" + env_key(env)
 
     cx.memo.get(key) match
         Some(known) -> return known
@@ -1103,7 +1177,7 @@ private summary(cx: &BoxCx, name: string, k: usize, given: usize) -> (bool, bool
 
     cx.busy.add(name)
 
-    val w = follow_param(cx, f, k)
+    val w = follow_param(cx, f, k, env)
 
     cx.busy.remove(name)
 
@@ -1111,7 +1185,27 @@ private summary(cx: &BoxCx, name: string, k: usize, given: usize) -> (bool, bool
 
     cx.memo.put(key, out)
 
-    if out.1 then cx.answering.add(key)
+    if out.1 then cx.answering.add(s"$name|$k")
 
     out
 end summary
+
+// A record of closure environments as a memo key: its entries in one order, or nothing where there
+// is no record.
+private env_key(env: Option[Set[string]]) -> string
+    if env.is_none() then return ""
+
+    var entries: Buf[string] = buf()
+
+    for entry in env.unwrap()
+        entries.push(entry)
+
+    sort(entries.view_mut())
+
+    var text = "|"
+
+    for entry in entries
+        text = text + entry + ","
+
+    text
+end env_key

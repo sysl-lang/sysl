@@ -43,7 +43,7 @@ decides which modules exist at all — there is no half of `sysl.fs` that works 
 |---|---|---|
 | whole file | `read_text`, `read_bytes`, `write_text`, `write_bytes`, `append_text`, `append_bytes`, `write_text_atomic`, `write_bytes_atomic` | storage the size of the file — allocates by nature |
 | open file | `open`, `create`, `append`, `open_update`, `create_update`, and `File`'s members | a buffer the caller already has |
-| path | `exists`, `readable`, `writable`, `is_file`, `is_dir`, `is_link`, `size_of`, `metadata`, `link_metadata`, `set_permissions`, `set_owner`, `set_modified`, `symlink`, `read_link`, `hard_link`, `canonicalize`, `make_dir`, `make_dir_all`, `remove_file`, `remove_dir`, `remove_dir_all`, `rename`, `pending_name`, `publish_file`, `publish_dir`, `copy_file`, `truncate`, `current_dir`, `set_current_dir`, `make_temp_dir` | one C call each, or a loop over them |
+| path | `exists`, `readable`, `writable`, `executable`, `is_file`, `is_dir`, `is_link`, `size_of`, `metadata`, `link_metadata`, `set_permissions`, `set_owner`, `set_link_owner`, `set_modified`, `space`, `symlink`, `read_link`, `hard_link`, `canonicalize`, `make_dir`, `make_dir_all`, `remove_file`, `remove_dir`, `remove_dir_all`, `rename`, `pending_name`, `publish_file`, `publish_dir`, `copy_file`, `truncate`, `current_dir`, `set_current_dir`, `make_temp_dir` | one C call each, or a loop over them |
 
 **Reading a whole file *is* asking for storage the size of the file**, so the top tier could not have
 been written any other way. Keeping it apart from `File` is what lets the middle tier stay honest:
@@ -119,6 +119,40 @@ refused: not UTF-8 at byte 2
 A caller that wants the text anyway — replacing what does not decode, or reading the file as some other
 encoding — reads `read_bytes` and decides for itself, with [`from_utf8`](/library/text/) or anything
 else.
+
+**A file the whole-file tier makes can be born with its permission bits.** `write_bytes`,
+`write_text`, `append_bytes`, `append_text` and the two `_atomic` writers take a last `mode`, `0o666`
+by default, with exactly the rules of `create`'s (§ One reading of an entry): the process umask
+narrows it, bits above the twelve permission bits are dropped, a target with no permission bits
+ignores it, and **a file that is already there keeps the mode it has** — its contents are replaced or
+added to, not the file. A secret is owner-only from the moment it exists, with no window before a
+`set_permissions`, and a failure answers the same error, the OS's reason included, whatever mode was
+asked for. The `_atomic` writers are the exception to keeping a mode, by their nature: they put a new
+file in the old one's place, and that file has the mode asked for.
+
+```sysl
+import sysl.fs.{append_text, metadata, read_text, remove_file, set_permissions, write_text}
+import sysl.process.pid
+
+val path = s"/tmp/sysl-fs-doc-write-mode-${pid()}.txt"
+
+write_text(path, "key\n", 0o600).unwrap()
+
+print(metadata(path).unwrap().permissions() == 0o600)
+
+set_permissions(path, 0o640).unwrap()
+append_text(path, "more\n", 0o600).unwrap()
+write_text(path, "replaced\n", 0o600).unwrap()
+
+print(metadata(path).unwrap().permissions() == 0o640, read_text(path).unwrap().len)
+
+remove_file(path).unwrap()
+```
+
+```output
+true
+true 9
+```
 
 ### Writing where somebody else is reading
 
@@ -340,7 +374,7 @@ impl Writer for File
 
 open(path: string) -> Result[File, IoError]          // an existing file, for reading
 create(path: string, mode: u32 = 0o666) -> Result[File, IoError] // makes one, or empties one that was there
-append(path: string) -> Result[File, IoError]        // writes at the end
+append(path: string, mode: u32 = 0o666) -> Result[File, IoError] // writes at the end
 open_update(path: string) -> Result[File, IoError]   // read and write; fails if it is not there
 create_update(path: string, mode: u32 = 0o666) -> Result[File, IoError] // read and write; empties what was there
 ```
@@ -965,11 +999,12 @@ remove_file(path).unwrap()
 true true true
 ```
 
-**A file can be born with its permission bits.** `create` and `create_update` take a `mode`, `0o666`
-by default, which goes to `open(2)` with `O_CREAT` and so is narrowed by the process umask as in
+**A file can be born with its permission bits.** `create`, `append` and `create_update` take a
+`mode`, `0o666` by default (as do the whole-file writers and a `Dir`'s own `create`, `append`,
+`create_update`, `write_bytes` and `write_text`), which goes to `open(2)` with `O_CREAT` and so is narrowed by the process umask as in
 POSIX. A secret file asks `0o600` and is owner-only from the moment it exists; creating it and then
 calling `set_permissions` leaves a window in which it is open to group and others. **The mode applies
-only when the file is created**: `create_update` on a file that exists keeps the mode it has. Bits
+only when the file is created**: `create_update` or `append` on a file that exists keeps the mode it has. Bits
 above the twelve permission bits are dropped, as `set_permissions` drops them. `File.set_permissions(mode)`
 is `fchmod` on the open descriptor, for a program that holds the file and wants its mode changed
 without trusting the path; a closed file answers `NotOpen`. On a target with no permission bits the
@@ -1007,6 +1042,38 @@ behaviour available.
 `Meta.same_file` is the inode and the device together, which is what says two paths name one file.
 Neither identifies a file on its own: inode numbers are reused, and are unique only within a device.
 
+**Whether something is a program is asked two ways, and they answer different questions.**
+`Meta.executable()` reads the bits: a regular file with any of its three execute bits set, whoever is
+asking — so a directory, whose execute bits mean it may be searched, answers `false`, as does a link
+that `link_metadata` described. `executable(path)` asks the system, beside `readable` and `writable`
+and as POSIX's `access` with `X_OK` does: whether **this** program may run it, which a file whose only
+execute bit is another class's is not. A program acting as user 0 may run a file with any execute bit
+set.
+
+```sysl
+import sysl.fs.{write_text, metadata, set_permissions, executable, remove_file}
+import sysl.process.pid
+
+val path = s"/tmp/sysl-fs-doc-exec-${pid()}.sh"
+
+write_text(path, "#!/bin/sh\necho hi\n").unwrap()
+set_permissions(path, 0o755).unwrap()
+print(metadata(path).unwrap().executable(), executable(path))
+
+set_permissions(path, 0o644).unwrap()
+print(metadata(path).unwrap().executable(), executable(path))
+
+print(metadata("/tmp").unwrap().executable(), executable("/tmp"))
+
+remove_file(path).unwrap()
+```
+
+```output
+true true
+false false
+false true
+```
+
 ### Who owns it
 
 **`Meta.owner` and `Meta.group` are `u32`s, the type [`sysl.process.user()`](/library/process/#who-the-program-is)
@@ -1040,8 +1107,39 @@ true
 **Giving a file away is privileged**, as `chown(2)` makes it: a program not acting as user 0 that
 hands one to somebody else is refused with `NotPermitted`. Giving a file to the owner and group it
 already has is the one change anybody may make. A symbolic link is followed, as `set_permissions`
-follows one, and there is no variant that changes the link itself, there being none for its
-permissions either. A target whose filesystem has no owners answers *not supported on this target*.
+follows one. A target whose filesystem has no owners answers *not supported on this target*.
+
+**`set_link_owner(path, owner, group)` is the same change to the path *itself***, over one `lchown`:
+a symbolic link is given the ids and what it names keeps its own, the writing half of
+`link_metadata`'s reading. Anything else at the path is changed exactly as `set_owner` changes it,
+under the same privilege rule. So a link the program made to a file of root's is the program's to
+set, and the file is not:
+
+```sysl
+import sysl.fs.{symlink, link_metadata, metadata, set_owner, set_link_owner, remove_file, IoError}
+import sysl.process.{pid, user}
+
+val link = s"/tmp/sysl-fs-doc-lchown-${pid()}"
+
+symlink("/bin/sh", link).unwrap()
+
+val mine = link_metadata(link).unwrap()
+
+print(set_link_owner(link, mine.owner, mine.group).is_ok())
+print(metadata(link).unwrap().owner == 0)
+print(user() == 0 || set_owner(link, mine.owner, mine.group).unwrap_err() == IoError.NotPermitted)
+
+remove_file(link).unwrap()
+```
+
+```output
+true
+true
+true
+```
+
+The names behind the ids are `sysl.process`'s, beside `user()` and `group()`:
+[`user_name` and `group_name`, and `user_id` and `group_id` the other way](/library/process/#who-the-program-is).
 
 **`set_modified(path, when)` sets the modification time** of a file or a directory, and its access
 time with it, over one `utimensat` hook. It is how a program records that something was used without
@@ -1066,6 +1164,30 @@ remove_file(path).unwrap()
 ```output
 1500000000
 ```
+
+### How much room a filesystem has
+
+**`space(path)` is one `statvfs` of the filesystem holding `path`**, as a `Space` of three byte
+counts: `total`, `free`, and `available` — the part of `free` a program not acting as user 0 may take,
+since a filesystem may hold a reserve back for root. So `available <= free <= total` always, and
+`available` is the one to compare a write against. Each is a block count times the fragment size,
+`f_frsize`, which is the unit POSIX says the counts are in. `path` may name a file or a directory
+anywhere on the filesystem; a path that is not there is `NotFound`.
+
+```sysl
+import sysl.fs.space
+
+val s = space("/tmp").unwrap()
+
+print(s.total > 0, s.available <= s.free, s.free <= s.total)
+```
+
+```output
+true true true
+```
+
+**It is a reading, not a reservation**: another program can take the room before the next write
+lands, so a program that must not run out still handles the write's own `NoSpaceLeft`.
 
 ### Links, and the path the filesystem agrees on
 
@@ -1517,7 +1639,7 @@ and outlives it; the `Dir`'s descriptor is closed when its last reference goes.
 
 **Everything above reaches the filesystem through `sysl.fs.sys` and through nothing else**: one
 `extern` per call — `sysl_fs_open`, `_read`, `_write`, `_pread`, `_pwrite`, `_sync`, `_close`, `_seek`, `_fstat`, `_ftruncate`, `_map`, `_unmap`, `_advise` and `_page_size` (the last two asked only by a program that advises a mapping; `_page_size` answers `usize`, zero meaning 4096; `_sync_data`, `_full_sync`, `_map_shared` and `_msync` asked only by a program that calls `sync_data`, `full_sync`, `map_mut` or a flush, and the `open` flags carry an uncached bit),
-`_stat`, `_truncate`, `_mkdir`, `_rmdir`, `_unlink`, `_rename`, `_access`, `_chmod`, `_fchmod` (asked only by a program that calls `File.set_permissions`), `_chown`, `_opendir`,
+`_stat`, `_truncate`, `_mkdir`, `_rmdir`, `_unlink`, `_rename`, `_access`, `_chmod`, `_fchmod` (asked only by a program that calls `File.set_permissions`), `_chown`, `_lchown` and `_space` (asked only by a program that calls `set_link_owner` or `space`), `_opendir`,
 `_readdir`, `_closedir`, `_getcwd`, `_chdir`, `_temp_dir`, `_symlink`, `_link`, `_readlink` and
 `_realpath`, and for a `Dir` `_dir_open`, `_open_beneath`, `_stat_beneath` and `_unlink_beneath`,
 which refuse a link with `ELOOP` and an escape with `EXDEV`. Each answers an `int` by the contract every `*.sys` module has
@@ -1553,7 +1675,7 @@ The question is asked only of what the program reaches, so a freestanding progra
 a file is asked nothing.
 
 **Every call on this page is there for such a program**, the reading ones included: `metadata`,
-`link_metadata`, `set_permissions`, `set_owner` and `set_modified` are one `stat`, `chmod`, `chown` or `utimensat` hook, the walk and `remove_dir_all`,
+`link_metadata`, `set_permissions`, `set_owner`, `set_link_owner`, `set_modified` and `space` are one `stat`, `chmod`, `chown`, `lchown`, `utimensat` or `statvfs` hook, `executable` is the `access` hook `readable` and `writable` are, the walk and `remove_dir_all`,
 `copy_dir_all` and `publish_dir` are `entries` and `link_metadata` with a leaf action, and
 `make_temp_dir` and `canonicalize` are the `temp_dir` and `realpath` hooks. A supplier fills `Stat`'s
 thirteen numbers in POSIX's shape and leaves zero what it has nothing to say about; a hook it answers

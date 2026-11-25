@@ -379,6 +379,131 @@ prh_hosted_identity_answers_weakly()
         assert(said.1.contains(c), s"the hosted answer does not call $c")
 end prh_hosted_identity_answers_weakly
 
+// -- names for ids, a link's own owner, and a filesystem's room ---------------------------------------
+
+// `getent`, `chown -h` and `df` between them: a group's name, an id from a name either way, a link
+// given to its owner, whether a path runs, and how much room is left -- the three name hooks of
+// `sysl.process.sys` and the `lchown`, `access` and `space` hooks of `sysl.fs.sys`.
+private val prh_names_program: string = raw"""
+    import sysl.fs.{executable, set_link_owner, space}
+    import sysl.process.{group_id, group_name, user_id}
+
+    go() -> int
+        var n = 0
+
+        if group_name(0).is_ok() then n += 1
+        if user_id("root").is_ok() && group_id("wheel").is_ok() then n += 2
+        if set_link_owner("/home/alice/link", 0, 0).is_ok() then n += 4
+        if executable("/bin/sh") then n += 8
+
+        space("/") match
+            Ok(s) -> if s.available <= s.free then n += 16
+            Err(_) -> ()
+
+        n
+    end go
+    """
+
+// The six hooks, answered as a kernel with no user database and a filesystem with no owners would.
+private val prh_names_hooks: string = raw"""
+    @export("sysl_proc_group_name")
+    k_group_name(id: u32, into: *u8, room: usize) -> isize = -38
+
+    @export("sysl_proc_user_id")
+    k_user_id(name: *u8, len: usize) -> i64 = -38
+
+    @export("sysl_proc_group_id")
+    k_group_id(name: *u8, len: usize) -> i64 = -38
+
+    @export("sysl_fs_lchown")
+    k_lchown(path: *u8, len: usize, owner: u32, group: u32) -> int = -38
+
+    @export("sysl_fs_access")
+    k_access(path: *u8, len: usize, how: int) -> int = -38
+
+    @export("sysl_fs_space")
+    k_space(path: *u8, len: usize, total: *u64, free: *u64, available: *u64) -> int = -38
+    """
+
+private val prh_names_hook_names: []string = ["sysl_proc_group_name", "sysl_proc_user_id",
+    "sysl_proc_group_id", "sysl_fs_lchown", "sysl_fs_access", "sysl_fs_space"]
+
+@test("a freestanding program that looks up names, sets a link's owner and asks for room links with its own hooks")
+prh_names_hooks_link()
+    if !prh_link_ready() then return
+
+    val p = prh_tree(prh_names_program + prh_runtime + prh_names_hooks)
+    val (said, out) = prh_build(p)
+
+    assert(said.0 == 0, said.1)
+
+    val elf = s"$out/img.elf"
+    val all = prh_symbols(elf, false)
+
+    assert_eq(prh_symbols(elf, true).trim(), "")
+
+    for hook in prh_names_hook_names
+        assert(all.contains(s" T $hook"), all)
+
+    for name in ["getgrgid_r", "getpwnam_r", "getgrnam_r", "lchown", "access", "statvfs"]
+        assert(!prh_names(all, name), s"'$name' is in the image")
+
+    lbr_drop([p, out])
+end prh_names_hooks_link
+
+@test("a freestanding program that looks up names with no hooks is refused, naming the ones it reaches")
+prh_names_hooks_unanswered()
+    if !lbr_ready() then return
+
+    val p = prh_tree(prh_names_program + prh_runtime)
+    val (said, out) = prh_build(p)
+
+    assert(said.0 != 0, "built with the name, lchown and space hooks unanswered")
+    assert(said.1.contains(s"error: this program reaches 'sysl.process', and '$prh_target' has no " +
+        "operating system under it for the standard library to answer a process or a user with, so " +
+        "the program answers it: define 'sysl_proc_group_id', 'sysl_proc_group_name', " +
+        "'sysl_proc_user_id' with '@export'"), said.1)
+    assert(said.1.contains(s"error: this program reaches 'sysl.fs', and '$prh_target' has no " +
+        "operating system under it for the standard library to answer a filesystem with, so the " +
+        "program answers it: define 'sysl_fs_access', 'sysl_fs_lchown', 'sysl_fs_space' with '@export'"),
+        said.1)
+    assert(!said.1.contains("undefined symbol"), said.1)
+
+    lbr_drop([p, out])
+end prh_names_hooks_unanswered
+
+@test("on a hosted target the library answers the name, lchown and space hooks under weak exports")
+prh_hosted_names_answer_weakly()
+    if !lbr_ready() then return
+
+    for target in ["x86_64-linux", "aarch64-linux", "aarch64-macos"]
+        val p = lbr_program(raw"""
+            import sysl.fs.{executable, set_link_owner, space}
+            import sysl.process.{group_id, group_name, user_id}
+
+            print(group_name(0).is_ok(), user_id("root").is_ok(), group_id("root").is_ok())
+            print(set_link_owner("x", 0, 0).is_ok(), executable("x"), space("/").is_ok())
+            """)
+        val said = lbr_cli(["sysl", "emit-llvm", "--no-std-lib", "--target", target, p])
+
+        lbr_drop([p])
+        assert(said.0 == 0, s"$target: ${said.1}")
+
+        for hook in prh_names_hook_names
+            var defined = ""
+
+            for line in lines_of(said.1)
+                if line.starts_with("define ") && line.contains(s" @$hook(") then defined = line
+
+            assert(defined.starts_with("define weak "), s"$target $hook: $defined")
+        end for
+
+        for c in ["@sysl_proc_posix_group_name(", "@sysl_proc_posix_user_id(", "@sysl_proc_posix_group_id(",
+                  "@lchown(", "@access(", "@sysl_fs_host_space("]
+            assert(said.1.contains(c), s"$target: the hosted answer does not call $c")
+    end for
+end prh_hosted_names_answer_weakly
+
 // -- a destructor is kept by its type, not by its module ---------------------------------------------
 
 // A program reaching `sysl.process` for a pipe and its own identity, and never for a child: the
