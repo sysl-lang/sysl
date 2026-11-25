@@ -4792,7 +4792,10 @@ The fields are laid end to end, the aggregate needs no alignment of its own, and
 no gap between elements either. A register block, and a C struct that has to match one, are what it
 is for.
 
-The fields still read and write their own values — packing changes where they sit, not what they are:
+The fields still read and write their own values — packing changes where they sit, not what they are.
+Each is read and written as storage on no boundary, as C's packed fields are, so a core that cannot
+reach a word at an odd address (an ARMv6-M Cortex-M0+) moves the `u32` below a byte at a time rather
+than faulting:
 
 ```sysl
 @packed

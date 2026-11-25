@@ -569,6 +569,10 @@ struct Emit
     // to a whole one on a machine whose volatiles are each one plain instruction is made field by field
     // (`emit_plain_aggregate`), which asks a named type what it holds.
     struct_decls: Map[string, &StructType]
+
+    // The registers of the body being written that address storage inside a `@packed` struct, and so
+    // need not be on their type's boundary (`packed_aligned`).
+    packed_ptrs: Set[string]
 end Emit
 
 const PeelNone: int = 0
@@ -792,7 +796,7 @@ emitter_for(t: Target, destructors: Buf[(string, string, bool)]) -> Emit
           "", set(), false, None, None, set(), None, map(), buf(), buf(), buf(), false, set(), None,
           buf(), buf(), false, false, false, false, buf(), map(), map(), set(), map(), buf(), map(), buf(), map(),
           held_args_none(), PeelNone, set(), false, false, map(), map(), map(), no_stack_boxes(), buf(), buf(),
-          None, buf(), set(), set(), buf(), map(), set(), map(), map())
+          None, buf(), set(), set(), buf(), map(), set(), map(), map(), set())
 end emitter_for
 
 // -- what a body could not say --------------------------------------------------------------------
@@ -835,6 +839,7 @@ start_function(e: *Emit)
     e.temp = 0
     e.label = 0
     e.terminated = false
+    e.packed_ptrs.clear()
     e.reached.clear()
     e.reached_at.clear()
     e.loops.clear()
@@ -900,11 +905,52 @@ end fresh_label
 emit(e: *Emit, i: Inst)
     if e.terminated then return
 
+    val j = packed_aligned(e, i)
+
     e.target.cpu match
-        Aarch64 -> emit_plain_access(e, i, false)
-        Thumb -> emit_plain_access(e, i, true)
-        _ -> e.current.push(i)
+        Aarch64 -> emit_plain_access(e, j, false)
+        Thumb -> emit_plain_access(e, j, true)
+        _ -> e.current.push(j)
 end emit
+
+// **An ordinary load or store inside a `@packed` struct's storage is at no boundary** (`align 1`): a
+// field sits at its declared offset and the struct itself needs no alignment
+// (`reference/attributes.md § @packed`), so a `u32` field is very often not on a word -- and LLVM, told
+// nothing, assumes it is, which an ARMv6-M core (an M0+) faults on. An address is such storage where it
+// was reached by stepping into a packed struct, or from such an address; one loaded from memory (a
+// `*T`) is not. A volatile access keeps its own width (`emit_plain_access`).
+private packed_aligned(e: *Emit, i: Inst) -> Inst = i match
+    InGep(d, ty, p, _) ->
+        if packed_step(e, ty, p) then note_packed(e, d)
+        i
+    InGepInBounds(d, ty, p, _) ->
+        if packed_step(e, ty, p) then note_packed(e, d)
+        i
+    InLoad(d, ty, p, acc, None) if is_plain_access(acc) && in_packed(e, p) -> InLoad(d, ty, p, acc, Some(1))
+    InStore(ty, v, p, acc, None) if is_plain_access(acc) && in_packed(e, p) -> InStore(ty, v, p, acc, Some(1))
+    _ -> i
+
+// Whether a step from `p` over `ty` lands inside a packed struct's storage.
+private packed_step(e: *Emit, ty: LType, p: Val) -> bool
+    if in_packed(e, p) then return true
+
+    ty match
+        LPackedStruct(_) -> true
+        LNamed(n) -> e.struct_decls.get(n) match
+            Some(d) -> d.packed
+            None -> false
+        _ -> false
+end packed_step
+
+private note_packed(e: *Emit, d: Val) = d match
+    VReg(n) ->
+        e.packed_ptrs.add(n)
+        ()
+    _ -> ()
+
+private in_packed(e: *Emit, p: Val) -> bool = p match
+    VReg(n) -> e.packed_ptrs.has(n)
+    _ -> false
 
 // On AArch64 and on 32-bit ARM (`arm`), a volatile load or store that one plain instruction can make is
 // marked to be written as that instruction (`AccVolatileA64`, `AccVolatileArm`): one `ldr` or `str` of
