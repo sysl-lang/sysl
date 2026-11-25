@@ -179,6 +179,9 @@ private vo_uart() -> string =
     "struct Uart\n    status: volatile u32\n    data:   volatile u32\n    baud:   u32\n" +
     "const UART: usize = 0x10000000\nstatic val regs: *Uart = ptr_cast(UART)\n"
 
+// The same block reached through a parameter, as a freestanding export reaches it.
+private vo_uart_block() -> string = "struct Uart\n    status: volatile u32\n    data:   volatile u32\n    baud:   u32\n"
+
 // A block held as an ordinary value, which is what makes it constructible: what a program may not
 // write is a `volatile` *variable*, and a struct whose fields are qualified is not one.
 private vo_gpio() -> string = "struct Gpio\n    input:  volatile uint\n    output: volatile u8\n    shadow: usize\n"
@@ -461,7 +464,21 @@ vo_copying_a_whole_block_is_volatile()
 
     val src = vo_uart() + "snapshot() -> u32\n    var u = *regs\n    u.status\nprint(snapshot())"
 
-    assert(vo_has(vo_define(vo_ir(src), "snapshot"), "load volatile %struct.Uart"))
+    // x86 keeps LLVM's aggregate access; AArch64 and 32-bit ARM make it one access per register.
+    assert(vo_has(vo_define(vo_on("x86_64-linux", src), "snapshot"), "load volatile %struct.Uart"))
+
+    val bare = vo_uart_block() + "@export(\"snapshot\")\nsnapshot(r: *Uart) -> u32\n    var u = *r\n    u.status\n"
+
+    // Each register of the block is read once, in order, at its own address; the read of 'u.status'
+    // after is the copy's own qualified field (a fourth volatile load, of the local).
+    for m in ["aarch64-macos", "thumb-freestanding"]
+        val body = vo_define(vo_on(m, bare), "snapshot$$sysl")
+
+        assert(!vo_has(body, "load volatile %struct.Uart"), body)
+        assert_eq(vo_count(body, "load volatile i32"), 4, body)
+        assert_eq(vo_count(body, "getelementptr %struct.Uart, ptr %t1, i32 0, i32 1"), 1, body)
+        assert_eq(vo_count(body, "getelementptr %struct.Uart, ptr %t1, i32 0, i32 2"), 1, body)
+        assert(body.index_of(", i32 0, i32 1").unwrap() < body.index_of(", i32 0, i32 2").unwrap(), body)
 end vo_copying_a_whole_block_is_volatile
 
 // -- what it refuses --------------------------------------------------------------------------------
@@ -834,10 +851,20 @@ end vo_reading_one_register_twice_is_two_loads
 vo_storing_a_built_block_whole()
     if !vo_ready() then return
 
-    val body = vo_define(vo_ir(vo_uart() + "go() = *regs = Uart(1u32, 2u32, 3u32)\ngo()"), "go")
+    val src = vo_uart() + "go() = *regs = Uart(1u32, 2u32, 3u32)\ngo()"
+    val body = vo_define(vo_on("x86_64-linux", src), "go")
 
     assert(vo_has(body, "insertvalue %struct.Uart"))
     assert(vo_has(body, "store volatile %struct.Uart"))
+
+    // On AArch64 and 32-bit ARM the block lands one register at a time.
+    val bare = vo_uart_block() + "@export(\"go\")\ngo(r: *Uart) = *r = Uart(1u32, 2u32, 3u32)\n"
+
+    for m in ["aarch64-macos", "thumb-freestanding"]
+        val each = vo_define(vo_on(m, bare), "go$$sysl")
+
+        assert(!vo_has(each, "store volatile %struct.Uart"), each)
+        assert_eq(vo_count(each, "store volatile i32"), 3, each)
 end vo_storing_a_built_block_whole
 
 // A zero-sized field takes no slot, so the field written third lands second -- and the marker has to

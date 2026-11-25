@@ -4000,7 +4000,9 @@ wait_for(n: u64)
   loop walking down registers into a post-indexed one — Linux's `readl`/`writel` are `asm` for the same
   reason. It holds at every optimisation level and under LTO, and it costs only what the optimizer
   might have folded. A `bool` and an integer narrower than its storage (`u12`) move their storage's
-  width (`ldrb`, `ldrh`), a float an integer register's. **A volatile wider than 64 bits is refused on AArch64**
+  width (`ldrb`, `ldrh`), a float an integer register's. A whole register block copied or stored
+  (`var u = *regs`, `*regs = Uart(1, 2, 3)`), and a bitfield register changed `with` new fields, is one
+  such access per register, the lowest address first. **A volatile wider than 64 bits is refused on AArch64**
   — a `u128`, an `i128` or any wider integer has no one instruction, and LLVM's volatile of it is an
   `ldp`/`stp` pair, the form a hypervisor cannot emulate. Write two 64-bit volatile accesses.
 - **On 32-bit ARM — every Thumb target, ARMv6-M to ARMv8-M — a volatile access of 1, 2 or 4 bytes is
@@ -4009,8 +4011,9 @@ wait_for(n: u64)
   `ldm r2!, {r3}`), never an `ldrd`/`strd`, never through a floating-point register (`vldr s2, [r0]`).
   An exception may abandon an `ldm`, `stm`, `ldrd` or `strd` part-way and run it again from the start,
   reading a read-to-clear register twice; one `ldr` is done or not begun. It is an `asm` here too, at every
-  optimisation level and under LTO, and a `bool`, a `u12`, a float and a pointer move as they do on
-  AArch64.
+  optimisation level and under LTO, and a `bool`, a `u12`, a float, a pointer, a whole block and a
+  register changed `with` new fields move as they do on AArch64 — a 32-bit bitfield register is one
+  `ldr` and one `str` even on an M0+, which would otherwise make it four bytes.
 - **On 32-bit ARM a volatile wider than 32 bits is one such `ldr` or `str` per 32-bit word, the word at
   the lowest address first.** A `u64`, an `i64` or an `f64` is two plain word accesses, a `u128` four;
   a float goes through the general registers. They are **separate accesses**: neither atomic nor one

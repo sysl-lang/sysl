@@ -564,6 +564,11 @@ struct Emit
     // which slots have a +0 entry after them, in order (`table_zero.sysl`).
     table_zeros: Set[string]
     zero_slots: Map[string, (usize, Buf[int])]
+
+    // Every struct of the program, by the name LLVM knows it by (`note_struct_decls`): a volatile access
+    // to a whole one on a machine whose volatiles are each one plain instruction is made field by field
+    // (`emit_plain_aggregate`), which asks a named type what it holds.
+    struct_decls: Map[string, &StructType]
 end Emit
 
 const PeelNone: int = 0
@@ -787,7 +792,7 @@ emitter_for(t: Target, destructors: Buf[(string, string, bool)]) -> Emit
           "", set(), false, None, None, set(), None, map(), buf(), buf(), buf(), false, set(), None,
           buf(), buf(), false, false, false, false, buf(), map(), map(), set(), map(), buf(), map(), buf(), map(),
           held_args_none(), PeelNone, set(), false, false, map(), map(), map(), no_stack_boxes(), buf(), buf(),
-          None, buf(), set(), set(), buf(), map(), set(), map())
+          None, buf(), set(), set(), buf(), map(), set(), map(), map())
 end emitter_for
 
 // -- what a body could not say --------------------------------------------------------------------
@@ -909,6 +914,7 @@ end emit
 private emit_plain_access(e: *Emit, i: Inst, arm: bool)
     val acc = if arm then AccVolatileArm else AccVolatileA64
 
+    if emit_plain_aggregate(e, i) then return
     if arm && emit_arm_words(e, i) then return
 
     i match
@@ -1001,6 +1007,97 @@ private emit_arm_words(e: *Emit, i: Inst) -> bool
         _ -> false
 end emit_arm_words
 
+// **A volatile access to a whole aggregate is made one part at a time, lowest address first**, each part
+// as the volatile access of its own type -- one plain `ldr`/`str` where one moves it (`emit`). A copy of a
+// whole register block (`var u = *regs`), a block stored whole (`*regs = Uart(1, 2, 3)`) and a register
+// changed `with` new fields are such accesses; LLVM's own `load volatile` of the aggregate splits it as it
+// likes, into an `ldrd`, an offset `ldr`, the fields in any order, or a 32-bit register's four bytes
+// where it cannot see the boundary. Answers whether `i` was such an access, and is now emitted.
+private emit_plain_aggregate(e: *Emit, i: Inst) -> bool
+    i match
+        InLoad(d, ty, p, AccVolatile, align) if aggregate_parts(e, ty, align).is_some() ->
+            val parts = aggregate_parts(e, ty, align).unwrap()
+            var acc = VUndef
+
+            for k in 0..<int(parts.len())
+                val part = fresh_reg(e)
+                val joined = if k == int(parts.len()) - 1 then d else fresh_reg(e)
+                var at: Buf[int] = buf()
+
+                at.push(k)
+                emit(e, InLoad(part, parts[k].0, aggregate_part_at(e, ty, p, k), AccVolatile, parts[k].1))
+                e.current.push(InInsert(joined, ty, acc, parts[k].0, part, at))
+                acc = joined
+
+            true
+        InStore(ty, v, p, AccVolatile, align) if aggregate_parts(e, ty, align).is_some() ->
+            val parts = aggregate_parts(e, ty, align).unwrap()
+
+            for k in 0..<int(parts.len())
+                val part = fresh_reg(e)
+                var at: Buf[int] = buf()
+
+                at.push(k)
+                e.current.push(InExtract(part, ty, v, at))
+                emit(e, InStore(parts[k].0, part, aggregate_part_at(e, ty, p, k), AccVolatile, parts[k].1))
+
+            true
+        _ -> false
+end emit_plain_aggregate
+
+// The parts of an aggregate `ty` in address order, each with the boundary an access to it may assume
+// (`None` for its type's own), or `None` where `ty` is not an aggregate this can take apart. A part of a
+// `@packed` struct with more than one is assumed at no boundary at all; the one integer a bitfield
+// register is, is moved at its own width and boundary, exactly as an access to one of its fields is
+// (`reference/attributes.md`: never narrowed).
+private aggregate_parts(e: *Emit, ty: LType, align: Option[int]) -> Option[Buf[(LType, Option[int])]]
+    var out: Buf[(LType, Option[int])] = buf()
+
+    ty match
+        LNamed(n) ->
+            val decl = e.struct_decls.get(n)
+
+            if decl.is_none() then return None
+
+            val d = decl.unwrap()
+            val def = struct_type_def(d, e.layout)
+
+            if def.is_none() then return None
+
+            val fields = def.unwrap().fields
+            val each = if !def.unwrap().packed || fields.len() == 1 then align else Some(1)
+
+            for f in fields
+                out.push((f, each))
+        LStruct(fields) ->
+            for f in fields
+                out.push((f, align))
+        LPackedStruct(fields) ->
+            val each = if fields.len() == 1 then align else Some(1)
+
+            for f in fields
+                out.push((f, each))
+        LArr(n, elem) ->
+            for k in 0..<n
+                out.push((*elem, align))
+        _ -> return None
+
+    if out.is_empty() then None else Some(out)
+end aggregate_parts
+
+// The address of part `k` of the aggregate `ty` at `p`.
+private aggregate_part_at(e: *Emit, ty: LType, p: Val, k: int) -> Val
+    if k == 0 then return p
+
+    val r = fresh_reg(e)
+    var idx: Buf[IrArg] = buf()
+
+    idx.push(ir_arg(LInt(32), VInt(from_int(0))))
+    idx.push(ir_arg(LInt(32), VInt(from_int(long(k)))))
+    e.current.push(InGep(r, ty, p, idx))
+    r
+end aggregate_part_at
+
 // The address of the `k`th 32-bit word from `p`.
 private arm_word_at(e: *Emit, p: Val, k: int) -> Val
     if k == 0 then return p
@@ -1030,6 +1127,13 @@ slot_align(e: *Emit, ty: LType) -> Option[int] = ty match
     LNamed(n) -> e.raised_types.get(n)
     LArr(_, elem) -> slot_align(e, *elem)
     _ -> None
+
+// Records every struct of the program under the name LLVM knows it by (`Emit.struct_decls`).
+note_struct_decls(e: *Emit, p: TProgram)
+    for item in p.structs
+        item match
+            Struct(d) -> e.struct_decls.put(l_render(struct_lty(d)), d)
+            _ -> ()
 
 // Records the boundary of every struct and data enum of the program that holds a raised
 // `@align(n)`, under the name LLVM knows it by.

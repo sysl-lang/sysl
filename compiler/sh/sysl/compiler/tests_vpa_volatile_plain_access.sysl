@@ -216,6 +216,63 @@ private val vpa_fixture: string = raw"""
     @export("reg")
     reg(r: *Reg)
         r.mode = 5
+    """ + vpa_aggregate_fixture
+
+// A register block copied, built and stored whole, and a bitfield register changed `with` new fields:
+// each a volatile access to an aggregate, made one part at a time (`emit.sysl`'s
+// `emit_plain_aggregate`). Shared by the AArch64 and the Thumb fixtures.
+private val vpa_aggregate_fixture: string = raw"""
+
+    struct Uart
+        status: volatile u32
+        data: volatile u32
+        baud: u32
+
+    struct Pair
+        lo: volatile u64
+        hi: volatile u64
+        mark: volatile u8
+
+    @packed
+    struct Shcsr
+        memfaultact: volatile u1
+        busfaultact: volatile u1
+        _: volatile u14
+        memfaultena: volatile u1
+        busfaultena: volatile u1
+        usgfaultena: volatile u1
+        _: volatile u13
+
+    struct Scb
+        shcsr: Shcsr
+
+    struct Bank
+        regs: [3]volatile u32
+
+    @export("snapshot")
+    snapshot(r: *Uart) -> u32
+        val u = *r
+        u.status + u.data
+
+    @export("store_block")
+    store_block(r: *Uart)
+        *r = Uart(1, 2, 3)
+
+    @export("copy_block")
+    copy_block(d: *Uart, s: *Uart)
+        *d = *s
+
+    @export("pair_copy")
+    pair_copy(d: *Pair, s: *Pair)
+        *d = *s
+
+    @export("three_fields")
+    three_fields(p: *Scb)
+        p.shcsr = p.shcsr with { memfaultena = 1, busfaultena = 1, usgfaultena = 1 }
+
+    @export("bank_copy")
+    bank_copy(d: *Bank, s: *Bank)
+        *d = *s
     """
 
 // Every function of the fixture, and an instruction its body must hold.
@@ -238,6 +295,7 @@ private vpa_expected() -> Buf[(string, string)]
     out.push(("bank", "str\tw"))
     out.push(("ticks", "str\tx"))
     out.push(("reg", "strb\tw"))
+    vpa_aggregate_expected(&out)
     out
 end vpa_expected
 
@@ -761,11 +819,22 @@ private val vpa_thumb_fixture: string = raw"""
     @export("reg")
     reg(r: *Reg)
         r.mode = 5
-    """
+    """ + vpa_aggregate_fixture
+
+// The aggregate cells, and an instruction each body must hold, on either processor.
+private vpa_aggregate_expected(out: *Buf[(string, string)])
+    out.push(("snapshot", "ldr"))
+    out.push(("store_block", "str"))
+    out.push(("copy_block", "str"))
+    out.push(("pair_copy", "str"))
+    out.push(("three_fields", "str"))
+    out.push(("bank_copy", "str"))
 
 // Every function of the Thumb fixture, and an instruction its body must hold.
 private vpa_thumb_expected() -> Buf[(string, string)]
     var out: Buf[(string, string)] = buf()
+
+    vpa_aggregate_expected(&out)
 
     out.push(("ld64", "ldr"))
     out.push(("st64", "str"))
@@ -1196,3 +1265,89 @@ vpa_thumb_reads_back_as_llvm()
     assert_eq(split(set64, "  store volatile i32 %").len, 3, set64)
     assert(!get64.contains("volatile i64") && !set64.contains("volatile i64"), get64 + set64)
 end vpa_thumb_reads_back_as_llvm
+
+// How many times `part` occurs in `text`.
+private vpa_count(text: string, part: string) -> int = int(split(text, part).len) - 1
+
+// The asm accesses of `define`, loads and stores, of any width.
+private vpa_asm_count(define: string) -> int =
+    vpa_count(define, "asm sideeffect \"ldr") + vpa_count(define, "asm sideeffect \"str")
+
+@test("a volatile copy of a whole block is one plain access per register, lowest address first, both ways")
+vpa_aggregate_ir_in_order()
+    for machine in ["aarch64-freestanding", "thumb-freestanding", "thumbv6m-freestanding"]
+        val got = vpa_ir(machine, if machine.starts_with("aarch64") then vpa_fixture else vpa_thumb_fixture)
+
+        if got.is_none() then return
+
+        val ir = got.unwrap()
+
+        assert(!ir.contains("load volatile %") && !ir.contains("store volatile %"), s"$machine:\n$ir")
+
+        // Uart: the register at the block's address, then the one at element 1, then element 2 -- read,
+        // and then written in the same order.
+        val copy = vpa_define(ir, "copy_block")
+
+        assert_eq(vpa_asm_count(copy), 6, s"$machine:\n$copy")
+        assert(copy.index_of("%struct.Uart, ptr %").is_some(), s"$machine:\n$copy")
+
+        val one = copy.index_of(", i32 0, i32 1").unwrap()
+        val two = copy.index_of(", i32 0, i32 2").unwrap()
+
+        assert(one < two, s"$machine:\n$copy")
+        assert(copy.index_of("asm sideeffect \"ldr").unwrap() < one, s"$machine:\n$copy")
+        assert(copy.index_of("asm sideeffect \"str").unwrap() > two, s"$machine:\n$copy")
+
+        // A block built whole is stored field by field, the first field first.
+        val store = vpa_define(ir, "store_block")
+
+        assert_eq(vpa_count(store, "asm sideeffect \"str"), 3, s"$machine:\n$store")
+        assert(store.index_of("asm sideeffect \"str").unwrap() < store.index_of(", i32 0, i32 1").unwrap(),
+               s"$machine:\n$store")
+        assert(store.index_of(", i32 0, i32 1").unwrap() < store.index_of(", i32 0, i32 2").unwrap(),
+               s"$machine:\n$store")
+
+        // An element array inside a block is its elements, in order.
+        assert_eq(vpa_asm_count(vpa_define(ir, "bank_copy")), 6, s"$machine:\n${vpa_define(ir, "bank_copy")}")
+
+        // A bitfield register changed `with` new fields is one read and one write of its one word.
+        val changed = vpa_define(ir, "three_fields")
+
+        assert_eq(vpa_count(changed, "asm sideeffect \"ldr"), 1, s"$machine:\n$changed")
+        assert_eq(vpa_count(changed, "asm sideeffect \"str"), 1, s"$machine:\n$changed")
+        assert(changed.contains("call i32 asm sideeffect"), s"$machine:\n$changed")
+
+        // Two u64 registers and a byte: one access each on AArch64, two words for each u64 on 32-bit ARM.
+        val pair = vpa_define(ir, "pair_copy")
+        val wide = if machine.starts_with("aarch64") then 3 else 5
+
+        assert_eq(vpa_count(pair, "asm sideeffect \"ldr"), wide, s"$machine:\n$pair")
+        assert_eq(vpa_count(pair, "asm sideeffect \"str"), wide, s"$machine:\n$pair")
+end vpa_aggregate_ir_in_order
+
+@test("on an M0+ a bitfield register changed 'with' new fields is one ldr and one str, never its four bytes")
+vpa_aggregate_with_on_v6m()
+    for level in ["0", "1", "2", "s"]
+        val got = vpa_code("thumbv6m-freestanding", level, vpa_thumb_fixture, "+fp-armv8d16")
+
+        if got.is_none() then return
+
+        val body = vpa_body(got.unwrap(), "three_fields", false)
+        val accesses = vpa_thumb_accesses(body)
+
+        assert_eq(accesses.len(), 2, s"-O$level:\n$body")
+        assert(accesses[0].starts_with("ldr "), s"-O$level:\n$body")
+        assert(accesses[1].starts_with("str "), s"-O$level:\n$body")
+end vpa_aggregate_with_on_v6m
+
+@test("the suites asking which accesses are volatile read a block copy back as one access per register")
+vpa_aggregate_reads_back()
+    val got = vpa_ir("aarch64-freestanding")
+
+    if got.is_none() then return
+
+    val copy = vpa_define(volatile_as_llvm(got.unwrap()), "copy_block")
+
+    assert_eq(vpa_count(copy, " = load volatile i32, ptr %"), 3, copy)
+    assert_eq(vpa_count(copy, "  store volatile i32 %"), 3, copy)
+end vpa_aggregate_reads_back
