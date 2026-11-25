@@ -120,6 +120,40 @@ A caller that wants the text anyway — replacing what does not decode, or readi
 encoding — reads `read_bytes` and decides for itself, with [`from_utf8`](/library/text/) or anything
 else.
 
+**A file the whole-file tier makes can be born with its permission bits.** `write_bytes`,
+`write_text`, `append_bytes`, `append_text` and the two `_atomic` writers take a last `mode`, `0o666`
+by default, with exactly the rules of `create`'s (§ One reading of an entry): the process umask
+narrows it, bits above the twelve permission bits are dropped, a target with no permission bits
+ignores it, and **a file that is already there keeps the mode it has** — its contents are replaced or
+added to, not the file. A secret is owner-only from the moment it exists, with no window before a
+`set_permissions`, and a failure answers the same error, the OS's reason included, whatever mode was
+asked for. The `_atomic` writers are the exception to keeping a mode, by their nature: they put a new
+file in the old one's place, and that file has the mode asked for.
+
+```sysl
+import sysl.fs.{append_text, metadata, read_text, remove_file, set_permissions, write_text}
+import sysl.process.pid
+
+val path = s"/tmp/sysl-fs-doc-write-mode-${pid()}.txt"
+
+write_text(path, "key\n", 0o600).unwrap()
+
+print(metadata(path).unwrap().permissions() == 0o600)
+
+set_permissions(path, 0o640).unwrap()
+append_text(path, "more\n", 0o600).unwrap()
+write_text(path, "replaced\n", 0o600).unwrap()
+
+print(metadata(path).unwrap().permissions() == 0o640, read_text(path).unwrap().len)
+
+remove_file(path).unwrap()
+```
+
+```output
+true
+true 9
+```
+
 ### Writing where somebody else is reading
 
 `write_text` truncates and then writes, so for as long as the write takes, a reader of the path finds
@@ -340,7 +374,7 @@ impl Writer for File
 
 open(path: string) -> Result[File, IoError]          // an existing file, for reading
 create(path: string, mode: u32 = 0o666) -> Result[File, IoError] // makes one, or empties one that was there
-append(path: string) -> Result[File, IoError]        // writes at the end
+append(path: string, mode: u32 = 0o666) -> Result[File, IoError] // writes at the end
 open_update(path: string) -> Result[File, IoError]   // read and write; fails if it is not there
 create_update(path: string, mode: u32 = 0o666) -> Result[File, IoError] // read and write; empties what was there
 ```
@@ -965,11 +999,12 @@ remove_file(path).unwrap()
 true true true
 ```
 
-**A file can be born with its permission bits.** `create` and `create_update` take a `mode`, `0o666`
-by default, which goes to `open(2)` with `O_CREAT` and so is narrowed by the process umask as in
+**A file can be born with its permission bits.** `create`, `append` and `create_update` take a
+`mode`, `0o666` by default (as do the whole-file writers and a `Dir`'s own `create`, `append`,
+`create_update`, `write_bytes` and `write_text`), which goes to `open(2)` with `O_CREAT` and so is narrowed by the process umask as in
 POSIX. A secret file asks `0o600` and is owner-only from the moment it exists; creating it and then
 calling `set_permissions` leaves a window in which it is open to group and others. **The mode applies
-only when the file is created**: `create_update` on a file that exists keeps the mode it has. Bits
+only when the file is created**: `create_update` or `append` on a file that exists keeps the mode it has. Bits
 above the twelve permission bits are dropped, as `set_permissions` drops them. `File.set_permissions(mode)`
 is `fchmod` on the open descriptor, for a program that holds the file and wants its mode changed
 without trusting the path; a closed file answers `NotOpen`. On a target with no permission bits the
