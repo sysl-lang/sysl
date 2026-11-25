@@ -148,6 +148,16 @@ private const at_cwd: int = -100
 #endif
 #endif
 
+// `flock`, whose `LOCK_*` numbers are the interface's own on every POSIX C library this builds for
+// (`sysl.fs.sys`'s `lock_*`), so it is bound directly. `LOCK_NB` is 4 on all of them as well. wasi-libc
+// and Windows have no `flock`, and their hooks answer `UNSUPPORTED`.
+#if posix
+private extern "flock" c_flock(fd: int, how: int) -> int
+
+private const lock_nb: int = 4
+private const lock_un: int = 8
+#endif
+
 // -- the shims beside this file ----------------------------------------------------------------------
 
 private extern "sysl_fs_host_sync_data" c_sync_data(fd: int) -> int
@@ -243,6 +253,24 @@ supply_sync_data(fd: int) -> int = status(c_sync_data(fd))
 
 @export("sysl_fs_full_sync")
 supply_full_sync(fd: int) -> int = status(c_full_sync(fd))
+
+@export("sysl_fs_lock")
+supply_lock(fd: int, how: int) -> int
+#if posix
+    status(c_flock(fd, how))
+#else
+    UNSUPPORTED
+#endif
+end supply_lock
+
+@export("sysl_fs_lock_now")
+supply_lock_now(fd: int, how: int) -> int
+#if posix
+    status(c_flock(fd, if how == lock_un then how else how | lock_nb))
+#else
+    UNSUPPORTED
+#endif
+end supply_lock_now
 
 @export("sysl_fs_close")
 supply_close(fd: int) -> int = status(c_close(fd))

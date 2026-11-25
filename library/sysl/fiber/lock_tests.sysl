@@ -1,0 +1,65 @@
+module sysl.fiber
+@requires(posix)
+@tests
+
+import sysl.fs.{File, IoError, LockKind, create, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{Status, capture}
+import sysl.testing.compiler
+
+// `File.lock` taken inside a fiber. The lock is `flock`'s, which belongs to the open file and not to
+// a thread or a stack, so a fiber switching away keeps it held and the home side may release it.
+// Another process -- a small program built into the test's temp dir, opening the file read-only and
+// asking `try_lock(Shared)` -- is the witness, since nothing in this process is excluded by the file's
+// own lock.
+
+private flk_ignore(r: Result[unit, IoError]) = ()
+
+private flk_ask(dir: string, path: string) -> string
+    val run = capture(s"$dir/prober", [path], stderr = true).unwrap()
+
+    assert_eq(run.status, Status.Exited(0), run.err.unwrap_or(""))
+    run.text
+end flk_ask
+
+private struct FlkFiber
+    home: Context
+    me: Context
+    f: File
+
+private flk_fiber_locks(p: *FlkFiber)
+    p.f.lock(LockKind.Exclusive).unwrap()
+
+    loop
+        switch(&p.me, &p.home)
+
+@test("flk a lock taken in a fiber stays held after it switches away, and the home side releases it")
+@pinned(thread)
+flk_fiber_switch_keeps_the_lock()
+    val dir = make_temp_dir("sysl-fiber-flk-").unwrap()
+
+    write_text(s"$dir/prober.sysl", "import sysl.fs.{LockKind, open}\n\n" +
+               "main(args: []string)\n" +
+               "    open(args[1]).unwrap().try_lock(LockKind.Shared) match\n" +
+               "        Ok(_) -> print(\"got\")\n" +
+               "        Err(e) -> print(if e.would_block() then \"would block\" else e.message())\n").unwrap()
+
+    val built = capture(compiler(), ["build", "-o", s"$dir/prober", s"$dir/prober.sysl"],
+                        stderr = true).unwrap()
+
+    assert_eq(built.status, Status.Exited(0), built.err.unwrap_or(""))
+
+    val path = s"$dir/fiber"
+    val s = Stack.reserve(64 * 1024).unwrap()
+    val p: &FlkFiber = FlkFiber(Context.new(), Context.new(), create(path).unwrap())
+
+    p.me = Context.start(s, &flk_fiber_locks, &*p)
+    switch(&p.home, &p.me)
+
+    assert_eq(flk_ask(dir, path), "would block\n")
+
+    p.f.unlock().unwrap()
+    assert_eq(flk_ask(dir, path), "got\n")
+
+    flk_ignore(p.f.close())
+    flk_ignore(remove_dir_all(dir))
+end flk_fiber_switch_keeps_the_lock

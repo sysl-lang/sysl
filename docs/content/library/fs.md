@@ -646,6 +646,149 @@ closing it twice is harmless rather than a use-after-free. A value type holding 
 made that mistake easy. It is also what gives the descriptor one point of death: the file is closed
 when the **last** copy goes, and stays open while any copy lives.
 
+### Locking a file
+
+`lock(kind)` takes an advisory lock on the whole file and waits for it; `try_lock(kind)` takes it now
+or answers an `IoError` whose `would_block()` is true; `unlock()` gives it up. `LockKind.Shared` is the
+readers' lock, any number of which may be held at once; `LockKind.Exclusive` is the writer's, which
+nobody else may hold beside it, shared or exclusive.
+
+```sysl
+import sysl.fs.{LockKind, create, open, remove_file}
+import sysl.process.pid
+
+val path = s"/tmp/sysl-fs-doc-lock-${pid()}"
+var writer = create(path).unwrap()
+var reader = open(path).unwrap()
+
+writer.lock(LockKind.Exclusive).unwrap()
+
+val refused = reader.try_lock(LockKind.Shared).unwrap_err()
+
+print(refused.would_block(), refused.message())
+
+writer.unlock().unwrap()
+print(reader.try_lock(LockKind.Shared).is_ok(), writer.try_lock(LockKind.Shared).is_ok())
+print(writer.try_lock(LockKind.Exclusive).unwrap_err().would_block())
+
+writer.close().unwrap()
+reader.close().unwrap()
+remove_file(path).unwrap()
+```
+
+```output
+true Resource temporarily unavailable
+true true
+true
+```
+
+**It is `flock`'s lock, and it belongs to the open file** — to the descriptor one `open` made, which
+every copy of the `File` shares — not to the process and not to the thread. That one sentence settles
+every question about who holds it:
+
+| | |
+|---|---|
+| a second `open` of the same path, in this process | is somebody else: excluded exactly as another process is (above) |
+| another process | excluded while the lock is held; a process that ends, or is killed, lets go of what it held |
+| a copy of the `File` | is the same open file, so it holds the same lock, and `unlock` through it releases it |
+| a fiber that takes a lock and switches away | still holds it: the lock is the file's, not the stack's, and the home side may `unlock` it |
+| another thread | cannot be handed a `File` at all (below); one that opens the file itself is another open file |
+| closing **another** descriptor to the same file | releases nothing |
+| `close`, the last copy going, `unlock` | releases it |
+| `into_raw_fd` | the descriptor keeps the lock, and it goes when the caller closes that number |
+
+The row about closing another descriptor is the reason for the choice. POSIX's other lock, `fcntl`'s
+record lock, belongs to the *process*, so two `open`s in one program never exclude each other, and
+closing **any** descriptor to the file drops **every** lock the process holds on it — a library that
+opens the same file to read its size silently unlocks its caller's database. Rust's `File::lock`
+(1.89) is `flock` on Unix too.
+
+```sysl
+import sysl.fs.{LockKind, create, open, remove_file}
+import sysl.process.pid
+
+val path = s"/tmp/sysl-fs-doc-lock2-${pid()}"
+var held = create(path).unwrap()
+
+held.lock(LockKind.Exclusive).unwrap()
+
+var glance = open(path).unwrap()
+
+glance.close().unwrap()
+
+var other = open(path).unwrap()
+
+print(other.try_lock(LockKind.Shared).unwrap_err().would_block())
+
+other.close().unwrap()
+held.close().unwrap()
+remove_file(path).unwrap()
+```
+
+```output
+true
+```
+
+The rest of what it is:
+
+- **Advisory.** It binds only programs that ask for it; a `read` or a `write` from one that never locks
+  is not stopped.
+- **The mode the file was opened in does not matter.** A file opened only for reading takes an
+  `Exclusive` lock, which `fcntl`'s write lock refuses.
+- **Asking again converts.** A file that holds a lock and asks for the other kind has it changed, and
+  the change is not atomic: the old lock is let go of first, so another waiter may get in between, and
+  a `try_lock` that fails part-way may leave the file holding nothing.
+- **`try_lock` never waits**, and what it refuses with is `EWOULDBLOCK` carried in `Other` — 35 on
+  macOS and the BSDs, 11 on Linux — so a program asks `would_block()` rather than the number.
+- **A lock does not flush.** Bytes written and still buffered are not in the file yet, so a writer
+  flushes before it unlocks if a reader is waiting for them. `close` flushes before it lets go.
+- **`lock` waits, and is declared `@blocks`**; `try_lock` and `unlock` do not, so a `@no_block` path
+  may try a lock and may not wait for one:
+
+```sysl
+import sysl.fs.{File, LockKind}
+
+@no_block
+on_tick(f: File) -> bool = f.lock(LockKind.Shared).is_ok()
+
+main()
+    print(1)
+```
+
+```error
+this reaches 'sysl.fs.File.lock', which blocks through 'sysl.fs.sys.lock', and 'on_tick' declared '@no_block'
+```
+
+A `File`'s shared state is counted without atomics, so a `File` does not cross to another thread; a
+thread that needs the lock opens the file itself and is, by the table, somebody else:
+
+```sysl
+import sysl.fs.{File, LockKind, create}
+import sysl.threads.spawn
+
+struct Job
+    f: File
+
+work(j: *Job) -> unit
+    _ = j.f.lock(LockKind.Shared)
+
+main()
+    val j: &Job = Job(create("/tmp/sysl-fs-doc-lock3").unwrap())
+
+    _ = spawn(&work, &*j)
+```
+
+```error
+reaches a '&FileState', whose count is not
+```
+
+**Where it is not.** On Linux a file on NFS is locked with `fcntl` underneath (the kernel emulates
+`flock` there as a whole-file record lock, since 2.6.12), so there the lock meets `fcntl`'s locks and
+an `Exclusive` one needs a file opened for writing; a filesystem with no lock service at all answers
+an error. wasi and
+Windows have no `flock`, and the hosted library answers *not supported on this target* there. A
+freestanding program answers the two hooks itself (below).
+
 ### Mapping a file instead of reading it
 
 ```sysl
@@ -1516,7 +1659,7 @@ and outlives it; the `Dir`'s descriptor is closed when its last reference goes.
 ## Answering the filesystem on a freestanding target
 
 **Everything above reaches the filesystem through `sysl.fs.sys` and through nothing else**: one
-`extern` per call — `sysl_fs_open`, `_read`, `_write`, `_pread`, `_pwrite`, `_sync`, `_close`, `_seek`, `_fstat`, `_ftruncate`, `_map`, `_unmap`, `_advise` and `_page_size` (the last two asked only by a program that advises a mapping; `_page_size` answers `usize`, zero meaning 4096; `_sync_data`, `_full_sync`, `_map_shared` and `_msync` asked only by a program that calls `sync_data`, `full_sync`, `map_mut` or a flush, and the `open` flags carry an uncached bit),
+`extern` per call — `sysl_fs_open`, `_read`, `_write`, `_pread`, `_pwrite`, `_sync`, `_close`, `_seek`, `_fstat`, `_ftruncate`, `_map`, `_unmap`, `_advise` and `_page_size` (the last two asked only by a program that advises a mapping; `_page_size` answers `usize`, zero meaning 4096; `_sync_data`, `_full_sync`, `_map_shared` and `_msync` asked only by a program that calls `sync_data`, `full_sync`, `map_mut` or a flush; `_lock`, which may wait, asked only by `File.lock`, and `_lock_now`, which may not, by `try_lock` and `unlock`, both taking `how` as `sysl.fs.sys`'s `lock_shared`, `lock_exclusive` or `lock_release`, and the `open` flags carry an uncached bit),
 `_stat`, `_truncate`, `_mkdir`, `_rmdir`, `_unlink`, `_rename`, `_access`, `_chmod`, `_fchmod` (asked only by a program that calls `File.set_permissions`), `_chown`, `_opendir`,
 `_readdir`, `_closedir`, `_getcwd`, `_chdir`, `_temp_dir`, `_symlink`, `_link`, `_readlink` and
 `_realpath`, and for a `Dir` `_dir_open`, `_open_beneath`, `_stat_beneath` and `_unlink_beneath`,

@@ -1,0 +1,194 @@
+module sysl.process
+@requires(posix)
+@tests
+
+import sysl.fs.{IoError, LockKind, create, make_temp_dir, open, remove_dir_all, write_text}
+import sysl.testing.compiler
+import sysl.time.{millis, sleep}
+
+// `File.lock`, `File.try_lock` and `File.unlock` against another process, asserted from here because
+// `sysl.fs` may not import this module. The other process is a small program built into the test's
+// own temp dir: `prober <path> shared|exclusive` opens the file read-only, asks `try_lock` and prints
+// `got` or `would block`; `prober <path> wait` asks `lock(Exclusive)`, which waits, and prints `got`.
+// Exiting releases whatever it took. The within-one-process cells are `sysl/fs/lock_tests.sysl`.
+
+private flk_dir() -> string = make_temp_dir("sysl-proc-flk-").unwrap()
+
+private flk_done(dir: string) = flk_ignore(remove_dir_all(dir))
+
+private flk_ignore(r: Result[unit, IoError]) = ()
+
+private flk_prober(dir: string) -> string
+    write_text(s"$dir/prober.sysl", "import sysl.fs.{LockKind, open}\nimport sysl.time.{millis, sleep}\n\n" +
+               "main(args: []string)\n" +
+               "    val f = open(args[1]).unwrap()\n\n" +
+               "    if args[2] == \"wait\"\n" +
+               "        f.lock(LockKind.Exclusive).unwrap()\n" +
+               "        print(\"got\")\n" +
+               "        return\n\n" +
+               "    if args[2] == \"hold\"\n" +
+               "        f.lock(LockKind.Exclusive).unwrap()\n\n" +
+               "        loop\n" +
+               "            sleep(millis(1000))\n\n" +
+               "    val kind = if args[2] == \"shared\" then LockKind.Shared else LockKind.Exclusive\n\n" +
+               "    f.try_lock(kind) match\n" +
+               "        Ok(_) -> print(\"got\")\n" +
+               "        Err(e) -> print(if e.would_block() then \"would block\" else e.message())\n").unwrap()
+
+    val built = capture(compiler(), ["build", "-o", s"$dir/prober", s"$dir/prober.sysl"],
+                        stderr = true).unwrap()
+
+    assert_eq(built.status, Status.Exited(0), built.err.unwrap_or(""))
+    s"$dir/prober"
+end flk_prober
+
+private flk_ask(prober: string, path: string, kind: string) -> string
+    val run = capture(prober, [path, kind], stderr = true).unwrap()
+
+    assert_eq(run.status, Status.Exited(0), run.err.unwrap_or(""))
+    run.text
+end flk_ask
+
+@test("flk an exclusive lock keeps another process out, shared and exclusive alike, until unlock")
+flk_exclusive_excludes_another_process()
+    val dir = flk_dir()
+    val prober = flk_prober(dir)
+    val path = s"$dir/locked"
+    var f = create(path).unwrap()
+
+    f.lock(LockKind.Exclusive).unwrap()
+    assert_eq(flk_ask(prober, path, "exclusive"), "would block\n")
+    assert_eq(flk_ask(prober, path, "shared"), "would block\n")
+
+    f.unlock().unwrap()
+    assert_eq(flk_ask(prober, path, "exclusive"), "got\n")
+    assert_eq(flk_ask(prober, path, "shared"), "got\n")
+
+    flk_ignore(f.close())
+    flk_done(dir)
+end flk_exclusive_excludes_another_process
+
+@test("flk a shared lock lets another process share it and keeps its exclusive lock out")
+flk_shared_coexists_across_processes()
+    val dir = flk_dir()
+    val prober = flk_prober(dir)
+    val path = s"$dir/shared"
+    var f = create(path).unwrap()
+
+    f.lock(LockKind.Shared).unwrap()
+    assert_eq(flk_ask(prober, path, "shared"), "got\n")
+    assert_eq(flk_ask(prober, path, "exclusive"), "would block\n")
+
+    flk_ignore(f.close())
+    flk_done(dir)
+end flk_shared_coexists_across_processes
+
+@test("flk close releases the lock for another process, and closing another descriptor does not")
+flk_close_releases_across_processes()
+    val dir = flk_dir()
+    val prober = flk_prober(dir)
+    val path = s"$dir/closed"
+
+    write_text(path, "").unwrap()
+
+    var f = open(path).unwrap()
+
+    f.lock(LockKind.Exclusive).unwrap()
+
+    var other = open(path).unwrap()
+
+    other.close().unwrap()
+    assert_eq(flk_ask(prober, path, "shared"), "would block\n")
+
+    f.close().unwrap()
+    assert_eq(flk_ask(prober, path, "exclusive"), "got\n")
+    flk_done(dir)
+end flk_close_releases_across_processes
+
+@test("flk lock in another process waits for the holder's unlock, and then takes it")
+flk_lock_waits_for_unlock()
+    val dir = flk_dir()
+    val prober = flk_prober(dir)
+    val path = s"$dir/wait"
+    var f = create(path).unwrap()
+
+    f.lock(LockKind.Shared).unwrap()
+
+    val child = start(prober, [path, "wait"], stderr = true, timeout = 60000).unwrap()
+
+    // A prober that did not wait would have printed and exited well inside this.
+    sleep(millis(300))
+    assert(child.try_wait().unwrap().is_none(), "the waiting lock did not wait")
+
+    f.unlock().unwrap()
+
+    val out = child.wait().unwrap()
+
+    assert_eq(out.status, Status.Exited(0), out.err.unwrap_or(""))
+    assert_eq(out.text, "got\n")
+
+    flk_ignore(f.close())
+    flk_done(dir)
+end flk_lock_waits_for_unlock
+
+@test("flk a process that dies holding a lock releases it")
+flk_dead_holder_releases()
+    val dir = flk_dir()
+    val prober = flk_prober(dir)
+    val path = s"$dir/dies"
+
+    write_text(path, "").unwrap()
+
+    var f = open(path).unwrap()
+    val child = start(prober, [path, "hold"], stderr = true, timeout = 60000).unwrap()
+
+    // The holder takes its lock some time after it starts; ask until it has, for at most ten seconds.
+    var held = false
+
+    for _ in 0..<200
+        f.try_lock(LockKind.Shared) match
+            Ok(_) ->
+                f.unlock().unwrap()
+                sleep(millis(50))
+            Err(e) ->
+                assert(e.would_block(), e.message())
+                held = true
+                break
+
+    assert(held, "the holder never took its lock")
+
+    child.kill(9).unwrap()
+    _ = child.wait()
+    f.try_lock(LockKind.Exclusive).unwrap()
+
+    flk_ignore(f.close())
+    flk_done(dir)
+end flk_dead_holder_releases
+
+// -- what may wait -----------------------------------------------------------------------------------
+
+// Builds `body` as a program of its own and answers what the compiler said, empty when it built.
+private flk_compile(dir: string, body: string) -> string
+    write_text(s"$dir/main.sysl", "import sysl.fs.{File, LockKind}\n\n" + body).unwrap()
+
+    val built = capture(compiler(), ["build", "-o", s"$dir/main", s"$dir/main.sysl"],
+                        stderr = true).unwrap()
+
+    if built.status == Status.Exited(0) then "" else built.err.unwrap_or("")
+end flk_compile
+
+@test("flk try_lock and unlock may be called from a @no_block function, and lock may not")
+flk_only_lock_blocks()
+    val dir = flk_dir()
+
+    assert_eq(flk_compile(dir, "@no_block\nquick(f: File) -> bool = f.try_lock(LockKind.Shared).is_ok() " +
+                               "&& f.unlock().is_ok()\n\nmain()\n    print(1)\n"), "")
+
+    val refused = flk_compile(dir, "@no_block\nslow(f: File) -> bool = f.lock(LockKind.Shared).is_ok()\n\n" +
+                                   "main()\n    print(1)\n")
+
+    assert(refused.contains("this reaches 'sysl.fs.File.lock', which blocks through 'sysl.fs.sys.lock'"),
+           refused)
+    assert(refused.contains("'slow' declared '@no_block'"), refused)
+    flk_done(dir)
+end flk_only_lock_blocks

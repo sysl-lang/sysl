@@ -1,0 +1,305 @@
+module sysl.fs
+@requires(posix)
+@tests
+
+import sysl.fs.sys as fsys
+import sysl.time.monotonic
+
+// `File.lock`, `File.try_lock` and `File.unlock` within one process -- `flock`'s lock belongs to the
+// open file, so a second `open` of the same path here is "somebody else" exactly as another process
+// is. The tests against another process are `sysl/process/lock_tests.sysl` and the one against a fiber
+// `sysl/fiber/lock_tests.sysl` (this module may not import either).
+//
+// The axes: who else asks (a second open, a copy of the same `File`); the two kinds against each
+// other; what ends a lock (`unlock`, `close`, the last copy going, and closing *another* descriptor to
+// the file, which must not); the mode the file was opened in; waiting against not waiting; a closed
+// file; the error a refusal carries. Not here: a failed conversion upward (Shared to Exclusive while
+// another holds Shared), which `flock` may answer by leaving no lock at all -- the page says "may", and
+// a test would pin one platform's choice; a filesystem that answers no locks (NFS without lockd), which
+// no test machine has; a thread, which cannot be handed a `File` at all (the page's `error` block).
+
+private flk_dir() -> string = make_temp_dir("sysl-fs-flk-").unwrap()
+
+private flk_done(dir: string) = flk_ignore(remove_dir_all(dir))
+
+private flk_ignore(r: Result[unit, IoError]) = ()
+
+private flk_blocked(r: Result[unit, IoError]) -> bool = r match
+    Ok(_) -> false
+    Err(e) -> e.would_block()
+
+private flk_not_open(r: Result[unit, IoError]) -> bool = r match
+    Err(NotOpen) -> true
+    _ -> false
+
+// Whether a fresh open of `path` is kept out of `kind` right now. The probe is closed again, so it
+// holds nothing afterwards.
+private flk_kept_out(path: string, kind: LockKind) -> bool
+    var probe = open(path).unwrap()
+    val out = flk_blocked(probe.try_lock(kind))
+
+    probe.close().unwrap()
+    out
+end flk_kept_out
+
+@test("flk a second open in this process is another open file: excluded, and try_lock does not wait")
+flk_second_open_is_excluded_without_waiting()
+    val dir = flk_dir()
+    val path = s"$dir/twice"
+    var a = create(path).unwrap()
+    var b = open(path).unwrap()
+
+    a.lock(LockKind.Exclusive).unwrap()
+
+    val t0 = monotonic()
+
+    assert(flk_blocked(b.try_lock(LockKind.Exclusive)))
+    assert(flk_blocked(b.try_lock(LockKind.Shared)))
+    assert((monotonic() - t0).us < 1000000)
+
+    a.unlock().unwrap()
+    b.try_lock(LockKind.Shared).unwrap()
+    a.try_lock(LockKind.Shared).unwrap()
+    assert(flk_blocked(a.try_lock(LockKind.Exclusive)))
+
+    flk_ignore(a.close())
+    flk_ignore(b.close())
+    flk_done(dir)
+end flk_second_open_is_excluded_without_waiting
+
+@test("flk shared locks coexist, and an exclusive one is kept out until the last is released")
+flk_shared_locks_coexist()
+    val dir = flk_dir()
+    val path = s"$dir/shared"
+    var a = create(path).unwrap()
+    var b = open(path).unwrap()
+
+    a.lock(LockKind.Shared).unwrap()
+    b.lock(LockKind.Shared).unwrap()
+    assert(!flk_kept_out(path, LockKind.Shared))
+    assert(flk_kept_out(path, LockKind.Exclusive))
+
+    a.unlock().unwrap()
+    assert(flk_kept_out(path, LockKind.Exclusive))
+    b.unlock().unwrap()
+    assert(!flk_kept_out(path, LockKind.Exclusive))
+
+    flk_ignore(a.close())
+    flk_ignore(b.close())
+    flk_done(dir)
+end flk_shared_locks_coexist
+
+@test("flk close releases the lock, and so does the last copy going")
+flk_close_and_drop_release()
+    val dir = flk_dir()
+    val path = s"$dir/closed"
+
+    write_text(path, "").unwrap()
+
+    var f = open(path).unwrap()
+
+    f.lock(LockKind.Exclusive).unwrap()
+    assert(flk_kept_out(path, LockKind.Shared))
+    f.close().unwrap()
+    assert(!flk_kept_out(path, LockKind.Exclusive))
+
+    flk_locked_and_dropped(path)
+    assert(!flk_kept_out(path, LockKind.Exclusive))
+    flk_done(dir)
+end flk_close_and_drop_release
+
+private flk_locked_and_dropped(path: string)
+    val g = open(path).unwrap()
+
+    g.lock(LockKind.Exclusive).unwrap()
+    assert(flk_kept_out(path, LockKind.Shared))
+
+@test("flk closing another descriptor to the same file releases nothing, unlike fcntl's locks")
+flk_closing_another_descriptor_keeps_the_lock()
+    val dir = flk_dir()
+    val path = s"$dir/other"
+    var f = create(path).unwrap()
+
+    f.lock(LockKind.Exclusive).unwrap()
+
+    var other = open(path).unwrap()
+
+    other.close().unwrap()
+    assert(flk_kept_out(path, LockKind.Shared))
+
+    flk_ignore(f.close())
+    flk_done(dir)
+end flk_closing_another_descriptor_keeps_the_lock
+
+@test("flk a file opened only for reading takes either kind")
+flk_read_only_file_takes_both_kinds()
+    val dir = flk_dir()
+    val path = s"$dir/readonly"
+
+    write_text(path, "x").unwrap()
+
+    var f = open(path).unwrap()
+
+    f.lock(LockKind.Shared).unwrap()
+    assert(!flk_kept_out(path, LockKind.Shared))
+    assert(flk_kept_out(path, LockKind.Exclusive))
+
+    f.lock(LockKind.Exclusive).unwrap()
+    assert(flk_kept_out(path, LockKind.Shared))
+
+    // And back down: an exclusive lock converted to a shared one lets a reader in.
+    f.lock(LockKind.Shared).unwrap()
+    assert(!flk_kept_out(path, LockKind.Shared))
+    assert(flk_kept_out(path, LockKind.Exclusive))
+
+    flk_ignore(f.close())
+    flk_done(dir)
+end flk_read_only_file_takes_both_kinds
+
+@test("flk a file opened only for appending, or for update, takes either kind")
+flk_write_modes_take_both_kinds()
+    val dir = flk_dir()
+    val path = s"$dir/modes"
+
+    write_text(path, "x").unwrap()
+
+    var a = append(path).unwrap()
+
+    a.lock(LockKind.Exclusive).unwrap()
+    assert(flk_kept_out(path, LockKind.Shared))
+    a.close().unwrap()
+
+    var u = open_update(path).unwrap()
+
+    u.lock(LockKind.Shared).unwrap()
+    assert(flk_kept_out(path, LockKind.Exclusive))
+    u.close().unwrap()
+    flk_done(dir)
+end flk_write_modes_take_both_kinds
+
+@test("flk a copy of a File holds the same lock, and unlocking through it releases it")
+flk_copies_share_the_lock()
+    val dir = flk_dir()
+    val path = s"$dir/copy"
+    var f = create(path).unwrap()
+    val g = f
+
+    f.lock(LockKind.Exclusive).unwrap()
+    g.try_lock(LockKind.Exclusive).unwrap()
+    assert(flk_kept_out(path, LockKind.Shared))
+
+    g.unlock().unwrap()
+    assert(!flk_kept_out(path, LockKind.Exclusive))
+
+    flk_ignore(f.close())
+    flk_done(dir)
+end flk_copies_share_the_lock
+
+@test("flk a would-block error says so, carries the platform's EWOULDBLOCK, and nothing else says so")
+flk_would_block_is_only_would_block()
+    val dir = flk_dir()
+    val path = s"$dir/words"
+    var a = create(path).unwrap()
+    var b = open(path).unwrap()
+
+    a.lock(LockKind.Exclusive).unwrap()
+
+    b.try_lock(LockKind.Exclusive) match
+        Ok(_) -> assert(false, "the second open got the lock")
+        Err(e) ->
+            assert(e.would_block())
+#if bsd
+            assert_eq(e.code(), 35)
+#else
+            assert_eq(e.code(), 11)
+#endif
+
+    assert(!NotFound.would_block())
+    assert(!Interrupted.would_block())
+    assert(!Other(4).would_block())
+
+    flk_ignore(a.close())
+    flk_ignore(b.close())
+    flk_done(dir)
+end flk_would_block_is_only_would_block
+
+@test("flk a closed file answers NotOpen to lock, try_lock and unlock")
+flk_closed_file_is_not_open()
+    val dir = flk_dir()
+    var f = create(s"$dir/gone").unwrap()
+
+    f.close().unwrap()
+    assert(flk_not_open(f.lock(LockKind.Shared)))
+    assert(flk_not_open(f.try_lock(LockKind.Exclusive)))
+    assert(flk_not_open(f.unlock()))
+    flk_done(dir)
+end flk_closed_file_is_not_open
+
+@test("flk a descriptor taken with into_raw_fd keeps the lock until it is closed")
+flk_raw_fd_keeps_the_lock()
+    val dir = flk_dir()
+    val path = s"$dir/raw"
+    var f = create(path).unwrap()
+
+    f.lock(LockKind.Exclusive).unwrap()
+
+    val n = f.into_raw_fd().unwrap()
+
+    assert(flk_not_open(f.unlock()))
+    assert(flk_kept_out(path, LockKind.Shared))
+
+    assert_eq(fsys.close(n), 0)
+    assert(!flk_kept_out(path, LockKind.Exclusive))
+    flk_done(dir)
+end flk_raw_fd_keeps_the_lock
+
+@test("flk try_lock converts a held lock either way when nobody else holds one")
+flk_try_lock_converts()
+    val dir = flk_dir()
+    val path = s"$dir/convert"
+    var f = create(path).unwrap()
+
+    f.try_lock(LockKind.Shared).unwrap()
+    f.try_lock(LockKind.Exclusive).unwrap()
+    assert(flk_kept_out(path, LockKind.Shared))
+
+    f.try_lock(LockKind.Shared).unwrap()
+    assert(!flk_kept_out(path, LockKind.Shared))
+    assert(flk_kept_out(path, LockKind.Exclusive))
+
+    // The same kind again is no change.
+    f.try_lock(LockKind.Shared).unwrap()
+    f.lock(LockKind.Shared).unwrap()
+    assert(flk_kept_out(path, LockKind.Exclusive))
+
+    flk_ignore(f.close())
+    flk_done(dir)
+end flk_try_lock_converts
+
+@test("flk a lock does not flush: what is buffered is not written by taking or giving it up")
+flk_lock_leaves_the_buffer_alone()
+    val dir = flk_dir()
+    val path = s"$dir/buffered"
+    var f = create(path).unwrap()
+
+    f.lock(LockKind.Exclusive).unwrap()
+    f.write("held".bytes)
+    f.unlock().unwrap()
+    assert_eq(read_text(path).unwrap(), "")
+
+    f.close().unwrap()
+    assert_eq(read_text(path).unwrap(), "held")
+    flk_done(dir)
+end flk_lock_leaves_the_buffer_alone
+
+@test("flk unlock on a file that holds no lock answers Ok")
+flk_unlock_without_a_lock()
+    val dir = flk_dir()
+    var f = create(s"$dir/none").unwrap()
+
+    f.unlock().unwrap()
+    f.unlock().unwrap()
+
+    flk_ignore(f.close())
+    flk_done(dir)
+end flk_unlock_without_a_lock

@@ -83,6 +83,17 @@ impl Drop for FileState
         _ = handed(self.fd, self.held, self.pending)
         _ = fsys.close(self.fd)
 
+/** Which lock `File.lock` and `File.try_lock` take: one any number of open files may hold together
+ * (`Shared`, for readers), or one no other open file may hold beside it (`Exclusive`, for a writer).
+ */
+enum LockKind
+    Shared
+    Exclusive
+
+    private[fs] how(self) -> int = self match
+        Shared    -> fsys.lock_shared
+        Exclusive -> fsys.lock_exclusive
+
 /** A file that is open, or that was.
  *
  * **It closes itself**: when the last copy of a `File` goes -- out of scope, out of a `Buf`, with the
@@ -200,6 +211,51 @@ struct File
 
         answered(fsys.full_sync(self.inner.fd))
     end full_sync
+
+    /** Takes an advisory lock on the whole file, waiting until no other open file holds one that
+     * conflicts: a `Shared` lock waits out an `Exclusive` one, and an `Exclusive` lock waits out both.
+     *
+     * **It is `flock`'s lock, which belongs to this open file** -- to the descriptor `open` made and
+     * every copy of this `File`, not to the process or the thread. So a second `open` of the same path
+     * in this very process is somebody else and is excluded like another process would be; a fiber
+     * that takes it and switches away still holds it (a `File` does not cross to another thread at
+     * all); and closing *another* descriptor to the same file
+     * releases nothing (the trap POSIX's `fcntl` record locks set). The lock goes with `unlock`, or when
+     * the file is closed -- by `close` or by its last copy going -- or when the process ends.
+     *
+     * Advisory means it binds only programs that ask: a `read` or `write` from a program that never
+     * locks is not stopped. The mode the file was opened in does not matter -- a file opened only for
+     * reading takes an `Exclusive` lock as well. A file that already holds a lock has it **converted**,
+     * and the conversion is not atomic: going from `Shared` to `Exclusive` lets go first, so another
+     * waiter may get in between.
+     *
+     * A target whose filesystem answers no locks says `not supported on this target`; a wait cut
+     * short by a signal answers `Interrupted`.
+     */
+    lock(self, kind: LockKind) -> Result[unit, IoError]
+        if self.inner.shut then return Err(NotOpen)
+
+        answered(fsys.lock(self.inner.fd, kind.how()))
+
+    /** `lock` without the wait: the lock is taken now, or the answer is an `IoError` whose
+     * `would_block()` says another open file holds one that conflicts, and nothing new is held. A
+     * conversion lets go of the old lock first (`lock`), so a failed one may leave the file holding
+     * no lock at all.
+     */
+    try_lock(self, kind: LockKind) -> Result[unit, IoError]
+        if self.inner.shut then return Err(NotOpen)
+
+        answered(fsys.lock_now(self.inner.fd, kind.how()))
+
+    /** Gives up the lock this file holds, of either kind. A file that holds none answers `Ok` all the
+     * same. Closing the file does this too. **It does not flush**: bytes written under the lock and
+     * still buffered are not in the file yet, so a writer calls `flush` first where a reader is
+     * waiting for them (`close` flushes before it lets go).
+     */
+    unlock(self) -> Result[unit, IoError]
+        if self.inner.shut then return Err(NotOpen)
+
+        answered(fsys.lock_now(self.inner.fd, fsys.lock_release))
 
     /** Hands over what is buffered.
      *

@@ -87,6 +87,8 @@ private fsh_hooks(left_out: []string) -> string
     rows.push(("ftruncate", "fd: int, length: long"))
     rows.push(("map", "fd: int, len: usize, at: **u8"))
     rows.push(("unmap", "at: *u8, len: usize"))
+    rows.push(("lock", "fd: int, how: int"))
+    rows.push(("lock_now", "fd: int, how: int"))
     rows.push(("stat", "path: *u8, len: usize, follow: int, out: *Stat"))
     rows.push(("truncate", "path: *u8, len: usize, length: long"))
     rows.push(("mkdir", "path: *u8, len: usize, mode: u32"))
@@ -304,9 +306,96 @@ fsh_refusal_names_only_what_is_reached()
     assert(!said.1.contains("sysl_fs_mkdir"), said.1)
     assert(!said.1.contains("sysl_fs_map"), said.1)
     assert(!said.1.contains("sysl_fs_unmap"), said.1)
+    assert(!said.1.contains("sysl_fs_lock"), said.1)
 
     lbr_drop([p, out])
 end fsh_refusal_names_only_what_is_reached
+
+// -- locking a file ------------------------------------------------------------------------------------
+
+// A program taking each kind of lock, waiting and not, and giving it up: it reaches the two lock hooks
+// beside the open and close a lock is taken through.
+private val fsh_locks_a_file: string = raw"""
+    import sysl.fs.{LockKind, open}
+    import sysl.fs.sys.Stat
+
+    run() -> int
+        var n = 0
+
+        open("/hello.txt") match
+            Ok(f) ->
+                var g = f
+
+                if g.lock(LockKind.Exclusive).is_ok() then n += 1
+                if g.try_lock(LockKind.Shared).is_ok() then n += 1
+                if g.unlock().is_ok() then n += 1
+                if g.close().is_ok() then n += 1
+            Err(_) -> ()
+
+        n
+    end run
+    """
+
+@test("a freestanding program locking a file links once it answers lock and lock_now, with no flock in the image")
+fsh_lock_hooks_answered_link()
+    if !fsh_link_ready() then return
+
+    val p = fsh_tree(fsh_locks_a_file + fsh_runtime + fsh_hooks([]))
+    val (said, out) = fsh_build(p)
+
+    assert(said.0 == 0, said.1)
+
+    val elf = s"$out/img.elf"
+    val all = fsh_symbols(elf, false)
+
+    assert_eq(fsh_symbols(elf, true).trim(), "")
+
+    // The program's own answers are what the lock reaches. `File.lock` is small enough to be inlined
+    // into the program, which then calls its hook's body directly, so the image may hold the body
+    // alone (`k_lock$$sysl`) rather than the exported symbol, which nothing else needs.
+    for hook in ["lock", "lock_now"]
+        assert(all.contains(" T sysl_fs_" + hook + "\n") || all.contains(" T k_" + hook + "$$sysl\n"), all)
+
+    for name in ["flock", "fcntl", "__errno_location"]
+        assert(!fsh_names(all, name), s"'$name' is in the image")
+
+    lbr_drop([p, out])
+end fsh_lock_hooks_answered_link
+
+@test("a freestanding program locking a file and leaving the lock hooks unanswered is refused naming both")
+fsh_lock_hooks_unanswered_refused()
+    if !lbr_ready() then return
+
+    val p = fsh_tree(fsh_locks_a_file + fsh_runtime + fsh_hooks(["lock", "lock_now"]))
+    val (said, out) = fsh_build(p)
+
+    assert(said.0 != 0, "built with the lock hooks unanswered")
+    assert(said.1.contains("define 'sysl_fs_lock', 'sysl_fs_lock_now' with '@export'"), said.1)
+    assert(!said.1.contains("undefined symbol"), said.1)
+
+    lbr_drop([p, out])
+end fsh_lock_hooks_unanswered_refused
+
+@test("a freestanding program that only tries a lock is asked for lock_now and not for the waiting lock")
+fsh_try_lock_asks_only_lock_now()
+    if !lbr_ready() then return
+
+    val p = fsh_tree(raw"""
+        import sysl.fs.{LockKind, open}
+        import sysl.fs.sys.Stat
+
+        run() -> int = open("/hello.txt") match
+            Ok(f) -> if f.try_lock(LockKind.Shared).is_ok() then 1 else 0
+            Err(_) -> -1
+        """ + fsh_runtime + fsh_hooks(["lock", "lock_now"]))
+    val (said, out) = fsh_build(p)
+
+    assert(said.0 != 0, "built with lock_now unanswered")
+    assert(said.1.contains("define 'sysl_fs_lock_now' with '@export'"), said.1)
+    assert(!said.1.contains("'sysl_fs_lock',"), said.1)
+
+    lbr_drop([p, out])
+end fsh_try_lock_asks_only_lock_now
 
 // -- mapping a file ------------------------------------------------------------------------------------
 
