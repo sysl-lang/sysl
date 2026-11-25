@@ -672,6 +672,11 @@ private runtime_bundles(e: *Emit, t: Target, bounds_overridden: bool, trap_overr
     if e.maybe_heap then out.push(RtTemplate("arc.maybe", arc_maybe(t)))
     if e.weak_heap then out.push(RtTemplate("arc.weak", arc_weak(t)))
 
+    // The counters a counted build's runtime adds into (`retain_count.sysl`), wherever any of it is,
+    // or the report reads them.
+    if retain_counting_active() && (e.heap || e.sync_heap || e.maybe_heap || e.weak_heap || reports_retains(e))
+        out.push(RtTemplate("arc.counts", retain_counts_text(s"i${t.pointer_bits()}")))
+
     // The weak defaults a failure reports through -- each unless this module's own `@export` is
     // its override, which would make the default a second definition of the one symbol.
     if e.bounds_fails && !(bounds_overridden && trap_overridden)
@@ -1256,6 +1261,10 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
 
     if defines_alloc_count(e)
         for s in alloc_count_symbols()
+            seen.push(s)
+
+    if e.requested_set.has(count_report_libc())
+        for s in count_report_libc_symbols()
             seen.push(s)
 
     if dispatcher_marks(p) || bounds_prints then seen.push("write")
