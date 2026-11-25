@@ -501,7 +501,7 @@ and built for any other target it compiles. Give the empty struct a field, or le
 not refused: the pointer is one register on both sides, and what C reads through it is the
 programmer's business, as above.
 
-**A [function pointer](#a-functions-address-externa-b-r) whose signature carries such a struct by
+**A [function pointer](#a-function-s-address-extern-a-b-r) whose signature carries such a struct by
 value is refused on the same target, for the same reason**: a call through a `*extern(A) -> R` is an
 `extern` call, and C calls through one it was handed under its own layout of `A`. The type itself is
 refused, wherever the program mentions it — an `extern`'s parameter, a struct's field, module
