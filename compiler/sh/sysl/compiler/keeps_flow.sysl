@@ -94,11 +94,47 @@ struct FlowWalk
 
     // Every closure literal stored somewhere that a later overwrite took back (`note_taken_back`).
     taken_back: Buf[KeptAt]
+
+    // **Told the state of the way a piece is on, just before the piece is asked what it does**: which
+    // locals' copies every way to it has overwritten (`c:<local>` in `cleared`, `copies_gone`), so a
+    // piece handing over a local whose copy is gone hands nothing over (`keeps.sysl`'s `walk_track`).
+    sees: &Fn(&PathState) -> unit
 end FlowWalk
 
 flow_walk(org: &Origins, stmt_events: &Fn(TStmt) -> Buf[FlowEv], expr_events: &Fn(TExpr) -> Buf[FlowEv],
           arm_events: &Fn(TExpr, TPattern, bool) -> Buf[FlowEv]) -> &FlowWalk =
-    FlowWalk(stmt_events, expr_events, arm_events, buf(), buf(), buf(), buf(), false, buf(), org, false, buf())
+    FlowWalk(stmt_events, expr_events, arm_events, buf(), buf(), buf(), buf(), false, buf(), org, false, buf(),
+             st -> ())
+
+// **A local whose copy of what is tracked is overwritten** is said `c:<local>`: a clear of it lands
+// in `cleared` like any other, so only a local every way here overwrote is held to be overwritten, and
+// a store of what is tracked back into the local is a keep of it, which takes it out again
+// (`copy_back_ev`). Neither is ever a place anything is held at.
+copy_gone_ev(local: string, at: Span) -> FlowEv = cleared_ev(CopyMark + local, at)
+
+copy_back_ev(local: string, at: Span) -> FlowEv = FlowEv(false, CopyMark + local, "", at, 0)
+
+const CopyMark: string = "c:"
+
+// The locals whose copies `cleared` holds overwritten.
+copies_gone(cleared: Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for c in cleared
+        if c.starts_with(CopyMark) then out.push(c[CopyMark.bytes.len..<c.bytes.len])
+
+    out
+end copies_gone
+
+private stmt_events_at(w: &FlowWalk, s: TStmt, st: &PathState) -> Buf[FlowEv]
+    w.sees(st)
+    w.stmt_events(s)
+end stmt_events_at
+
+private expr_events_at(w: &FlowWalk, e: TExpr, st: &PathState) -> Buf[FlowEv]
+    w.sees(st)
+    w.expr_events(e)
+end expr_events_at
 
 // Walks a function's body from its entry to every way out.
 flow_body(w: &FlowWalk, body: TBlock)
@@ -245,6 +281,16 @@ private apply_event(w: &FlowWalk, st: &PathState, ev: FlowEv)
         return
     end if
 
+    if !ev.clear && ev.loc.starts_with(CopyMark)
+        var cleared: Buf[string] = buf()
+
+        for c in st.cleared
+            if c != ev.loc then cleared.push(c)
+
+        st.cleared = cleared
+        return
+    end if
+
     // A second task started into a handle whose first is still unawaited leaves the first with nobody
     // to await it.
     if !ev.clear && ev.loc.starts_with("j:") && has_loc(st.pending, ev.loc)
@@ -356,16 +402,16 @@ private flow_stmt(w: &FlowWalk, s: TStmt, st: &PathState, top: bool)
     s match
         TExprStmt(e) -> flow_expr(w, e, st)
         TReturn(v) ->
-            if v.is_some() then flow_piece(w, w.expr_events(v.unwrap()), st, expr_jumps(v.unwrap()))
+            if v.is_some() then flow_piece(w, expr_events_at(w, v.unwrap(), st), st, expr_jumps(v.unwrap()))
 
             flow_exit(w, st)
             st.dead = true
         TBecome(call) ->
-            flow_piece(w, w.expr_events(call), st, expr_jumps(call))
+            flow_piece(w, expr_events_at(w, call, st), st, expr_jumps(call))
             flow_exit(w, st)
             st.dead = true
         TBreak(v, depth) ->
-            if v.is_some() then flow_piece(w, w.expr_events(v.unwrap()), st, expr_jumps(v.unwrap()))
+            if v.is_some() then flow_piece(w, expr_events_at(w, v.unwrap(), st), st, expr_jumps(v.unwrap()))
 
             flow_jump(w, st, depth, true)
             st.dead = true
@@ -378,7 +424,11 @@ private flow_stmt(w: &FlowWalk, s: TStmt, st: &PathState, top: bool)
                 _ -> false
 
             for inner in stmts
-                for ev in w.stmt_events(inner)
+                // **A `defer` runs at a way out, not where it is written**, so it is asked with no
+                // copy known to be overwritten, and what it overwrites of one is not followed.
+                for ev in stmt_events_at(w, inner, fresh_state())
+                    if ev.loc.starts_with(CopyMark) then continue
+
                     // A `defer` runs after whatever moved a pointer read out of memory, so a store
                     // through one there names nothing that is known to be the storage stored at.
                     if ev.clear && (ev.loc.starts_with(">") || ev.loc.index_of(">{").is_some()) then continue
@@ -389,7 +439,7 @@ private flow_stmt(w: &FlowWalk, s: TStmt, st: &PathState, top: bool)
                     else
                         add_kept(&w.deferred_keeps, kept_at(ev, ev.loc))
                     end if
-        _ -> flow_piece(w, w.stmt_events(s), st, stmt_jumps(s))
+        _ -> flow_piece(w, stmt_events_at(w, s, st), st, stmt_jumps(s))
 end flow_stmt
 
 // A piece with no control flow followed: what it stores, then a way out if one is inside it, then
@@ -444,11 +494,12 @@ private flow_block(w: &FlowWalk, b: TBlock, st: &PathState)
 private flow_terms(w: &FlowWalk, cond: Buf[TCondTerm], st: &PathState)
     for term in cond
         term match
-            TCondTest(c) -> flow_piece(w, w.expr_events(c), st, expr_jumps(c))
-            TCondIs(subject, _, _) -> flow_piece(w, w.expr_events(subject), st, expr_jumps(subject))
+            TCondTest(c) -> flow_piece(w, expr_events_at(w, c, st), st, expr_jumps(c))
+            TCondIs(subject, _, _) -> flow_piece(w, expr_events_at(w, subject, st), st, expr_jumps(subject))
 end flow_terms
 
-private flow_flat(w: &FlowWalk, e: TExpr, st: &PathState) = flow_piece(w, w.expr_events(e), st, expr_jumps(e))
+private flow_flat(w: &FlowWalk, e: TExpr, st: &PathState) =
+    flow_piece(w, expr_events_at(w, e, st), st, expr_jumps(e))
 
 private flow_expr(w: &FlowWalk, e: TExpr, st: &PathState)
     if st.dead then return
@@ -590,6 +641,7 @@ private flow_loop(w: &FlowWalk, st: &PathState, body: Buf[TStmt], step: Buf[TStm
     var head = copy_state(st)
     val edges: &LoopEdges = LoopEdges(buf(), buf())
     var rounds = 0
+    var forgot = false
 
     loop
         edges.exits = buf()
@@ -613,7 +665,17 @@ private flow_loop(w: &FlowWalk, st: &PathState, body: Buf[TStmt], step: Buf[TStm
 
         rounds += 1
 
-        if same_state(next, head) || rounds > 8 then break
+        if same_state(next, head) then break
+
+        // **A loop given up on is walked once more with no copy held overwritten at its head**: a head
+        // that had not settled may still claim one overwritten that a later round would bring back.
+        if rounds > 8
+            if forgot || copies_gone(next.cleared).is_empty() then break
+
+            forgot = true
+            head = without_copies(next)
+            continue
+        end if
 
         head = next
 
@@ -628,6 +690,17 @@ private flow_loop(w: &FlowWalk, st: &PathState, body: Buf[TStmt], step: Buf[TStm
 
     assign_state(st, out)
 end flow_loop
+
+private without_copies(s: &PathState) -> &PathState
+    val out = copy_state(s)
+    var cleared: Buf[string] = buf()
+
+    for c in s.cleared
+        if !c.starts_with(CopyMark) then cleared.push(c)
+
+    out.cleared = cleared
+    out
+end without_copies
 
 // -- the ways out a piece has inside it ------------------------------------------------------------------
 

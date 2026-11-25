@@ -9,9 +9,15 @@ requires: "requires { os }"
 
 ## Index
 
-[`access_exists`](#access_exists) [`access_read`](#access_read) [`access_write`](#access_write) [`open_append`](#open_append) [`open_create`](#open_create) [`open_read`](#open_read) [`open_truncate`](#open_truncate) [`open_write`](#open_write) [`seek_current`](#seek_current) [`seek_end`](#seek_end) [`seek_start`](#seek_start) [`Stat`](#stat)
+[`access_execute`](#access_execute) [`access_exists`](#access_exists) [`access_read`](#access_read) [`access_write`](#access_write) [`open_append`](#open_append) [`open_create`](#open_create) [`open_read`](#open_read) [`open_truncate`](#open_truncate) [`open_uncached`](#open_uncached) [`open_write`](#open_write) [`seek_current`](#seek_current) [`seek_end`](#seek_end) [`seek_start`](#seek_start) [`Stat`](#stat)
 
 ## Constants
+
+### `access_execute`
+
+```sysl
+const access_execute: int = 1
+```
 
 ### `access_exists`
 
@@ -20,7 +26,7 @@ const access_exists: int = 0
 ```
 
 What `sysl_fs_access` is asked: whether anything is at the path at all, or whether the program may
-read it or write it. They are POSIX's numbers for the same questions.
+read it, write it or execute it. They are POSIX's numbers for the same questions.
 
 ### `access_read`
 
@@ -64,6 +70,16 @@ write at the end of whatever the file holds at that moment.
 ```sysl
 const open_truncate: u32 = 8
 ```
+
+### `open_uncached`
+
+```sysl
+const open_uncached: u32 = 32
+```
+
+Bypass the operating system's page cache: `O_DIRECT` on Linux, `fcntl(F_NOCACHE)` on Darwin. A
+supplier with neither refuses the open rather than hand back a cached file. Linux then requires the
+buffer, the offset and the length of every transfer to be multiples of the device's block size.
 
 ### `open_write`
 
