@@ -1400,9 +1400,10 @@ heap. **A call through a trait object or a callable is a call of every body its 
 a program, which sees every table there is, each method or closure of that trait at the receiver's own
 arguments; the box stays in the frame where none of them lets it out. A call with no body in sight — a
 C function pointer, an `extern`, a trait object or a callable in a library, which may be handed one
-whose table it never saw — or a recursion still being worked out answers "it may get out", as does a
-task's body and a payload over a kilobyte, which every frame of a recursion would pay for. A
-`&sync T` is never laid in a frame.
+whose table it never saw — answers "it may get out", as does a task's body and a payload over a
+kilobyte, which every frame of a recursion would pay for. **A recursion is settled at a fixed point**:
+a box handed to a recursive function, or to a cycle of functions calling one another, stays in the
+frame unless one of their paths lets it out. A `&sync T` is never laid in a frame.
 
 ```sysl
 trait Reader

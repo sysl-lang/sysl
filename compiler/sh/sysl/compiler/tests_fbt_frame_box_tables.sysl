@@ -16,7 +16,7 @@ import sysl.text.{cstring, Search}
 // method writing its receiver; a closure reading what it is handed; one of two tables keeping it (heap);
 // a callee answering it, read locally (frame) and kept (heap); a generic trait at two arguments, only
 // one of which keeps; a payload with a destructor erased and called through its table; recursion
-// through a table (heap: the walk answers "escapes" for a callee still being worked out); a C function
+// through a table (frame: settled at a fixed point, `tests_frs_frame_box_recursion.sysl`); a C function
 // pointer (heap: no body in sight); and the same program built as a library, which may be handed an
 // object whose table it never saw (heap). Each runs on the counted heap with `SYSL_COUNT_BYTES`, the
 // frame cells again under AddressSanitizer.
@@ -332,7 +332,8 @@ private const fbt_closure_keeps: string = raw"""
         kept = None
     """
 
-// The walk answers "escapes" for a callee still being worked out, a table's included.
+// A recursion through a table is settled at a least fixed point, as a direct one is: neither the
+// receiver handed back to itself nor the box it reads gets out.
 private const fbt_recursive: string = raw"""
     trait Walk
         depth(self, me: &Walk, a: &Acc, k: int) -> int
@@ -354,15 +355,21 @@ private const fbt_recursive: string = raw"""
         print(w.depth(w, a, 3))
     """
 
-@test("a table or closure that keeps or answers out its argument, or recursion through one, keeps it on the heap")
+@test("a table or closure that keeps or answers out its argument keeps it on the heap")
 fbt_ways_out_stay_on_the_heap()
     if !enm_ready() then return
 
     fbt_check("fbt_one_keeps", fbt_one_keeps, "7 false\n", false)
     fbt_check("fbt_answer_kept", fbt_answer_kept, "5\n", false)
     fbt_check("fbt_closure_keeps", fbt_closure_keeps, "6\n", false)
-    fbt_check("fbt_recursive", fbt_recursive, "5\n", false)
 end fbt_ways_out_stay_on_the_heap
+
+@test("a recursion through a table that keeps nothing lays its boxes in the frame")
+fbt_recursion_through_a_table()
+    if !enm_ready() then return
+
+    fbt_check("fbt_recursive", fbt_recursive, "5\n", true)
+end fbt_recursion_through_a_table
 
 // Only the table at the receiver's own arguments is followed: `Visit[&Acc]`'s keeping body never
 // reaches a `&Visit[&Point]` call, so `Point` is laid in the frame and `Acc` is not.

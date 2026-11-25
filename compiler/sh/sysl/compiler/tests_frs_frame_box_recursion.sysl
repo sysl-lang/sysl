@@ -1,0 +1,622 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Var}
+import sysl.text.{cstring, replace_all, Search}
+
+// A box handed to a recursive function is laid in the frame where the recursion never lets it out
+// (`stack_box.sysl`'s `summary` and `SbOpen`: the strongly connected questions are settled at a least
+// fixed point, from "keeps nothing", widening until no value read has grown).
+//
+// The soundness cells are the ways a recursion can keep what it is handed, each found only through
+// the recursion and each staying on the heap: a store into module storage on the base case
+// (`frs_global`), into a field of another parameter (`frs_field`), an answer that is the parameter and
+// is kept by the caller (`frs_answer_kept`), a capture by a closure kept in module storage
+// (`frs_captured`), parameters swapped on the way down so the kept one is the other argument
+// (`frs_swapped`), a store at the far end of a mutual recursion (`frs_mutual_keeps`), across two
+// modules (`frs_modules_keep`), through a closed-world trait call (`frs_trait_keeps`) and a callable
+// (`frs_closure_keeps`), at one instantiation of a generic recursion (`frs_generic_keeps`), and at the
+// end of a forty-function cycle (`frs_deep_keeps`).
+//
+// The frame cells are the same shapes where nothing keeps the box: a self-recursive reader, one
+// writing through the box, one answering it to a caller that only reads it, a box each frame of a
+// recursion builds and hands down, mutual recursion in one module and across two, a trait method
+// recursing through its object, a recursion through a callable, a generic recursion instantiated
+// twice, and the forty-function cycle. Between the two, a cycle swapping two boxes keeps one and frames
+// the other (`frs_parameters_apart`): each parameter is its own question.
+// Every cell runs on the counted heap with `SYSL_COUNT_BYTES` (a frame cell allocates no bytes, a
+// heap cell some, every cell gives back everything it took); the frame cells run again under
+// AddressSanitizer with every returned frame kept.
+//
+// Skipped cells, and why: a precompiled `.syslib` callee is answered from the same body a program's
+// own is, and codegen units and a bare-metal target change no decision, as in
+// `tests_fbx_frame_box.sysl`; an `async` recursion is never asked (a task's body answers "escapes"
+// before any value is read), and neither is a body with a tail call (it lays nothing, so the frames
+// cell recurses outside a tail position); a call whose bodies cannot be named (a C function pointer, a table in a
+// library) answers "escapes" before any summary is asked, as `tests_fbt_frame_box_tables.sysl` pins.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private extern "setenv" frs_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" frs_c_unsetenv(name: *u8) -> int
+
+private struct FrsRun
+    out: string
+    err: string
+    bytes: long
+    hooks: usize
+end FrsRun
+
+// A package of `main.sysl` and, where `m` is not empty, a second file: the module `m` where it says
+// so, else a sibling file of the root module. Built on the counted heap -- or with `flags` handed to
+// clang -- and run with `SYSL_COUNT_BYTES`.
+private frs_run(text: string, m: string, flags: string) -> FrsRun
+    val root = make_temp_dir("sysl-frs").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/sysl.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    if m.starts_with("module m")
+        make_dir_all(s"$root/m").unwrap()
+        write_text(s"$root/m/m.sysl", m).unwrap()
+    else if m != ""
+        write_text(s"$root/other.sysl", m).unwrap()
+    end if
+
+    val exe = s"$root/built"
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+        val v = cstring(flags)
+
+        frs_c_setenv(n.ptr, v.ptr, 1)
+    end if
+
+    force_alloc_counting(flags == "")
+
+    val made = build_native_program(root, None, None, DefaultOptimization, Some(exe))
+
+    force_alloc_counting(false)
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+
+        frs_c_unsetenv(n.ptr)
+    end if
+
+    made match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return FrsRun(failure_text(why), "", -1, 0)
+        Ok(_) -> ()
+
+    val hooks = capture("nm", ["-u", exe], "", [], true) match
+        Ok(o) -> o.text.count_of("__asan_report")
+        Err(_) -> 0
+
+    val env = [Var(alloc_bytes_variable(), "1"), Var("ASAN_OPTIONS", "detect_stack_use_after_return=1")]
+    val ran = capture(exe, [], "", env, true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    ran match
+        Err(_) -> FrsRun("could not be started", "", -1, hooks)
+        Ok(o) -> FrsRun(o.text, o.err.unwrap_or(""), alloc_bytes_reported(o.err.unwrap_or("")), hooks)
+end frs_run
+
+// The program printed `want`, gave back everything it took, and allocated nothing where its box is
+// `framed` -- something where it is not. A framed program runs again under AddressSanitizer, which
+// must be instrumented and report nothing.
+private frs_check(name: string, text: string, m: string, want: string, framed: bool)
+    val got = frs_run(text, m, "")
+
+    assert_eq(got.out, want)
+    assert_eq(alloc_count_reported(got.err), 0)
+
+    if !framed
+        assert(got.bytes > 0, s"$name allocated nothing, so its box was laid in the frame")
+        return
+    end if
+
+    assert(got.bytes == 0, s"$name allocated ${got.bytes} bytes:\n${got.err}")
+
+    val clean = frs_run(text, m, "-fsanitize=address -g")
+
+    assert(clean.hooks > 0, s"$name not instrumented: ${clean.out}")
+    assert_eq(clean.out, want)
+    assert_eq(clean.err, "")
+end frs_check
+
+// -- self-recursion -------------------------------------------------------------------------------
+
+@test("a box handed to a recursive reader is laid in the frame")
+frs_self_reader()
+    if !enm_ready() then return
+
+    frs_check("frs_reader", raw"""
+        struct Acc
+            n: int
+
+        depth(a: &Acc, k: int) -> int = if k == 0 then a.n else 1 + depth(a, k - 1)
+
+        main()
+            val a: &Acc = Acc(2)
+
+            print(depth(a, 3))
+        """, "", "5\n", true)
+end frs_self_reader
+
+@test("a box a recursion writes through, and one each frame builds and hands down, are laid in the frame")
+frs_self_writer()
+    if !enm_ready() then return
+
+    frs_check("frs_writer", raw"""
+        struct Acc
+            n: int
+
+        bump(a: &Acc, k: int)
+            if k == 0 then return
+
+            a.n += k
+            bump(a, k - 1)
+
+        main()
+            val a: &Acc = Acc(0)
+
+            bump(a, 4)
+            print(a.n)
+        """, "", "10\n", true)
+
+    frs_check("frs_each_frame", raw"""
+        struct Acc
+            n: int
+
+        sum(k: int, up: &Acc) -> int
+            val mine: &Acc = Acc(up.n + k)
+
+            if k == 0 then mine.n else 1 + sum(k - 1, mine)
+
+        main()
+            val a: &Acc = Acc(0)
+
+            print(sum(4, a))
+        """, "", "14\n", true)
+end frs_self_writer
+
+@test("a recursion that keeps its parameter on one path keeps it")
+frs_self_keeps()
+    if !enm_ready() then return
+
+    frs_check("frs_global", raw"""
+        struct Acc
+            n: int
+
+        var kept: Option[&Acc] = None
+
+        depth(a: &Acc, k: int) -> int
+            if k == 0
+                kept = Some(a)
+                return a.n
+            end if
+
+            1 + depth(a, k - 1)
+
+        main()
+            val a: &Acc = Acc(2)
+
+            print(depth(a, 3))
+            kept = None
+        """, "", "5\n", false)
+
+    frs_check("frs_field", raw"""
+        struct Acc
+            n: int
+
+        struct Holder
+            held: Option[&Acc]
+
+        hold(h: &Holder, a: &Acc, k: int)
+            if k == 0 then h.held = Some(a) else hold(h, a, k - 1)
+
+        main()
+            val h: &Holder = Holder(None)
+
+            run(h)
+            print(h.held.unwrap().n)
+
+        run(h: &Holder)
+            val a: &Acc = Acc(7)
+
+            hold(h, a, 3)
+        """, "", "7\n", false)
+
+    frs_check("frs_captured", raw"""
+        struct Acc
+            n: int
+
+        var later: Option[&Fn() -> int] = None
+
+        wrap(a: &Acc, k: int)
+            if k == 0 then later = Some(() -> a.n) else wrap(a, k - 1)
+
+        main()
+            run()
+            print(later.unwrap()())
+            later = None
+
+        run()
+            val a: &Acc = Acc(9)
+
+            wrap(a, 2)
+        """, "", "9\n", false)
+
+    frs_check("frs_swapped", raw"""
+        struct Acc
+            n: int
+
+        var kept: Option[&Acc] = None
+
+        keep_first(a: &Acc, b: &Acc, k: int)
+            if k == 0 then kept = Some(a) else keep_first(b, a, k - 1)
+
+        main()
+            val x: &Acc = Acc(1)
+            val y: &Acc = Acc(2)
+
+            keep_first(x, y, 1)
+            print(kept.unwrap().n)
+            kept = None
+        """, "", "2\n", false)
+end frs_self_keeps
+
+@test("a recursion answering its parameter: framed where the caller reads the answer, heap where it keeps it")
+frs_answers()
+    if !enm_ready() then return
+
+    frs_check("frs_answer_read", raw"""
+        struct Acc
+            n: int
+
+        bottom(a: &Acc, k: int) -> &Acc = if k == 0 then a else bottom(a, k - 1)
+
+        main()
+            val a: &Acc = Acc(6)
+
+            print(bottom(a, 3).n)
+        """, "", "6\n", true)
+
+    frs_check("frs_answer_kept", raw"""
+        struct Acc
+            n: int
+
+        var kept: Option[&Acc] = None
+
+        bottom(a: &Acc, k: int) -> &Acc = if k == 0 then a else bottom(a, k - 1)
+
+        main()
+            run()
+            print(kept.unwrap().n)
+            kept = None
+
+        run()
+            val a: &Acc = Acc(6)
+
+            kept = Some(bottom(a, 3))
+        """, "", "6\n", false)
+end frs_answers
+
+// -- mutual recursion -------------------------------------------------------------------------------
+
+private const frs_mutual: string = raw"""
+    struct Acc
+        n: int
+
+    var kept: Option[&Acc] = None
+
+    even(a: &Acc, k: int) -> bool = if k == 0 then a.n > 0 else odd(a, k - 1)
+
+    odd(a: &Acc, k: int) -> bool
+        if k == 0
+            KEEP
+            return a.n < 0
+        end if
+
+        even(a, k - 1)
+
+    main()
+        val a: &Acc = Acc(1)
+
+        print(even(a, 4))
+        print(even(a, 3))
+        kept = None
+    """
+
+@test("mutual recursion: framed where neither function keeps the box, heap where the far one does")
+frs_mutual_recursion()
+    if !enm_ready() then return
+
+    frs_check("frs_mutual_reads", replace_all(frs_mutual, "KEEP","()"), "", "true\nfalse\n", true)
+    frs_check("frs_mutual_keeps", replace_all(frs_mutual, "KEEP","kept = Some(a)"), "", "true\nfalse\n", false)
+end frs_mutual_recursion
+
+// Two modules cannot import each other, so a recursion between them goes back through a trait object
+// the lower one declares and the upper one implements.
+private const frs_module: string = raw"""
+    module m
+
+    struct Acc
+        n: int
+
+    trait Back
+        back(self, a: &Acc, k: int) -> int
+
+    var kept: Option[&Acc] = None
+
+    pong(b: &Back, a: &Acc, k: int) -> int
+        if k == 0
+            KEEP
+            return a.n
+        end if
+
+        b.back(a, k - 1)
+    """
+
+private const frs_module_main: string = raw"""
+    import m.{Acc, Back, kept, pong}
+
+    struct Ping
+        step: int
+
+    impl Back for Ping
+        back(self, a: &Acc, k: int) -> int = self.step + pong(Ping(self.step), a, k)
+
+    main()
+        val b: &Back = Ping(1)
+        val a: &Acc = Acc(3)
+
+        print(pong(b, a, 4))
+        kept = None
+    """
+
+// Two files of one module call each other directly.
+private const frs_sibling: string = raw"""
+    var kept: Option[&Acc] = None
+
+    pong(a: &Acc, k: int) -> int
+        if k == 0
+            KEEP
+            return a.n
+        end if
+
+        ping(a, k - 1)
+    """
+
+private const frs_sibling_main: string = raw"""
+    struct Acc
+        n: int
+
+    ping(a: &Acc, k: int) -> int = 1 + pong(a, k)
+
+    main()
+        val a: &Acc = Acc(3)
+
+        print(ping(a, 4))
+        kept = None
+    """
+
+@test("mutual recursion across two files of a module, and across two modules, is settled the same way")
+frs_mutual_across_files()
+    if !enm_ready() then return
+
+    frs_check("frs_siblings_read", frs_sibling_main, replace_all(frs_sibling, "KEEP", "()"), "8\n", true)
+    frs_check("frs_siblings_keep", frs_sibling_main, replace_all(frs_sibling, "KEEP", "kept = Some(a)"), "8\n",
+              false)
+    frs_check("frs_modules_read", frs_module_main, replace_all(frs_module, "KEEP", "()"), "7\n", true)
+    frs_check("frs_modules_keep", frs_module_main, replace_all(frs_module, "KEEP", "kept = Some(a)"), "7\n", false)
+end frs_mutual_across_files
+
+// -- recursion through a table, a callable, a generic -------------------------------------------------
+
+private const frs_trait: string = raw"""
+    trait Walker
+        walk(self, a: &Acc, k: int) -> int
+
+    struct Acc
+        n: int
+
+    struct Down
+        step: int
+
+    var kept: Option[&Acc] = None
+
+    impl Walker for Down
+        walk(self, a: &Acc, k: int) -> int
+            if k == 0
+                KEEP
+                return a.n
+            end if
+
+            val next: &Walker = Down(self.step)
+
+            self.step + next.walk(a, k - 1)
+
+    main()
+        val w: &Walker = Down(2)
+        val a: &Acc = Acc(1)
+
+        print(w.walk(a, 3))
+        kept = None
+    """
+
+@test("a recursion through a trait object, every body of whose slot the program names")
+frs_through_a_table()
+    if !enm_ready() then return
+
+    frs_check("frs_trait_reads", replace_all(frs_trait, "KEEP","()"), "", "7\n", true)
+    frs_check("frs_trait_keeps", replace_all(frs_trait, "KEEP","kept = Some(a)"), "", "7\n", false)
+end frs_through_a_table
+
+private const frs_closure: string = raw"""
+    struct Acc
+        n: int
+
+    var kept: Option[&Acc] = None
+    var step: Option[&Fn(&Acc, int) -> int] = None
+
+    depth(a: &Acc, k: int) -> int
+        if k == 0 then return a.n
+
+        val s = step.unwrap()
+
+        1 + s(a, k - 1)
+
+    via(a: &Acc, k: int) -> int
+        KEEP
+        depth(a, k)
+
+    main()
+        step = Some(via)
+
+        val a: &Acc = Acc(2)
+
+        print(depth(a, 3))
+        step = None
+        kept = None
+    """
+
+@test("a recursion through a callable, every body of which the program names")
+frs_through_a_callable()
+    if !enm_ready() then return
+
+    frs_check("frs_closure_reads", replace_all(frs_closure, "KEEP","()"), "", "5\n", true)
+    frs_check("frs_closure_keeps", replace_all(frs_closure, "KEEP","kept = Some(a)"), "", "5\n", false)
+end frs_through_a_callable
+
+private const frs_generic: string = raw"""
+    trait Note
+        note(&self)
+
+    struct Acc
+        n: int
+
+    struct Name
+        s: string
+
+    var kept: Option[&Name] = None
+
+    impl Note for Acc
+        note(&self) = ()
+
+    impl Note for Name
+        note(&self) = KEEP
+
+    count[T: Note](a: &T, k: int) -> int
+        if k == 0
+            a.note()
+            return 0
+        end if
+
+        1 + count(a, k - 1)
+
+    main()
+        val a: &Acc = Acc(1)
+        val b: &Name = Name("x")
+
+        print(count(a, 3) + count(b, 2))
+        kept = None
+    """
+
+@test("a generic recursion is settled per instantiation")
+frs_generic_recursion()
+    if !enm_ready() then return
+
+    frs_check("frs_generic_reads", replace_all(frs_generic, "KEEP","()"), "", "5\n", true)
+    frs_check("frs_generic_keeps", replace_all(frs_generic, "KEEP","kept = Some(self)"), "", "5\n", false)
+end frs_generic_recursion
+
+// -- a deep cycle -----------------------------------------------------------------------------------
+
+// Forty functions calling the next, the last calling the first; `f$keep` stores what it is handed (none
+// where `keep` is -1), and `main` hands its box to `f$entry`.
+private frs_cycle(keep: int, entry: int) -> string
+    var s = "struct Acc\n    n: int\n\nvar kept: Option[&Acc] = None\n\n"
+
+    for i in 0..<40
+        val next = (i + 1) % 40
+        val store = if i == keep then "kept = Some(a)\n        " else ""
+
+        s = s + s"f$i(a: &Acc, k: int) -> int\n    if k == 0\n        ${store}return a.n\n\n    1 + f$next(a, k - 1)\n\n"
+    end for
+
+    s + s"main()\n    val a: &Acc = Acc(1)\n\n    print(f$entry(a, 100))\n    kept = None\n"
+end frs_cycle
+
+// Four functions in a cycle, each handing its two boxes on swapped, the last keeping its first: around
+// an even cycle a parameter keeps its parity, so `main`'s `b` reaches the store and its `a` never
+// does. Each parameter is its own question, so `a` is laid in the frame and only `b` is on the heap --
+// exactly the bytes of one box kept, measured by a program that keeps one.
+private const frs_swapped_cycle: string = raw"""
+    struct Acc
+        n: int
+
+    var kept: Option[&Acc] = None
+
+    f0(a: &Acc, b: &Acc, k: int) -> int = if k == 0 then a.n + b.n else 1 + f1(b, a, k - 1)
+    f1(a: &Acc, b: &Acc, k: int) -> int = if k == 0 then a.n + b.n else 1 + f2(b, a, k - 1)
+    f2(a: &Acc, b: &Acc, k: int) -> int = if k == 0 then a.n + b.n else 1 + f3(b, a, k - 1)
+
+    f3(a: &Acc, b: &Acc, k: int) -> int
+        if k == 0
+            kept = Some(a)
+            return a.n + b.n
+        end if
+
+        1 + f0(b, a, k - 1)
+
+    main()
+        val a: &Acc = Acc(1)
+        val b: &Acc = Acc(2)
+
+        print(f0(a, b, 11))
+        kept = None
+    """
+
+@test("each parameter of a recursion is its own question: of two boxes swapped around a cycle, only the kept one is on the heap")
+frs_parameters_apart()
+    if !enm_ready() then return
+
+    val one = frs_run(raw"""
+        struct Acc
+            n: int
+
+        var kept: Option[&Acc] = None
+
+        main()
+            val b: &Acc = Acc(2)
+
+            kept = Some(b)
+            print(kept.unwrap().n)
+            kept = None
+        """, "", "")
+    val got = frs_run(frs_swapped_cycle, "", "")
+
+    assert_eq(one.out, "2\n")
+    assert_eq(got.out, "14\n")
+    assert_eq(alloc_count_reported(got.err), 0)
+    assert(one.bytes > 0, s"the control kept nothing on the heap:\n${one.err}")
+    assert_eq(got.bytes, one.bytes)
+end frs_parameters_apart
+
+// Entered at `f1` with the store in `f0`, the escape is found by `f0`'s walk after every other
+// function of the cycle read `f0`'s first value, so it reaches `f1` only in a second round.
+@test("a forty-function cycle is settled: framed where nothing keeps, heap wherever one stores")
+frs_deep_cycle()
+    if !enm_ready() then return
+
+    frs_check("frs_deep_reads", frs_cycle(-1, 0), "", "101\n", true)
+    frs_check("frs_deep_keeps", frs_cycle(39, 0), "", "101\n", false)
+    frs_check("frs_deep_keeps_upstream", frs_cycle(0, 1), "", "101\n", false)
+end frs_deep_cycle

@@ -29,8 +29,9 @@ import sysl.container.{Map, map, Set, set}
 // parameter as the thing followed, never lets the parameter out but by answering it (`summary`). A
 // call through a table or a callable, in a program that sees every table, is a call of each body that
 // slot may hold (`table_callees`), each asked the same way. A call with no body in sight (an `extern`,
-// a function pointer, a table in a library or an archive), a task, recursion still being worked out,
-// and every node this walk does not know answer "escapes".
+// a function pointer, a table in a library or an archive), a task, and every node this walk does not
+// know answer "escapes". Recursion is settled at a least fixed point (`SbOpen`): a recursive function
+// keeps its parameter only where one of its paths does.
 //
 // **A loop builds into the same slot every turn**, so a box built in a loop's body may be held only by
 // locals declared inside that loop's body, which are gone by the next turn.
@@ -78,7 +79,8 @@ private stack_box_limit() -> usize = 1024
 stack_boxes(e: *Emit, p: TProgram) -> StackBoxes
     var out = no_stack_boxes()
     val tables: Option[TraitTables] = if p.entry_point then Some(tables_by_trait(p.vtables)) else None
-    val cx: &BoxCx = BoxCx(map(), p.funcs, map(), set(), map(), set(), map(), set(), tables, map())
+    val open: &SbOpen = SbOpen(map(), map(), buf(), buf(), set(), 0, false)
+    val cx: &BoxCx = BoxCx(map(), p.funcs, map(), open, map(), set(), map(), set(), tables, map())
 
     for i in 0..<p.funcs.len()
         cx.index.put(p.funcs[i].name, i)
@@ -397,12 +399,12 @@ private is_sync_ref(t: Type) -> bool = underlying(t) match
 // -- the walk ----------------------------------------------------------------------------------------
 
 // What the walks of one program share: the bodies by name, each parameter's answer once worked out
-// (`summary`), the functions being worked out now, and the factories found.
+// (`summary`), the questions being worked out now (`SbOpen`), and the factories found.
 private struct BoxCx
     index: Map[string, usize]
     funcs: Buf[TFunc]
     memo: Map[string, (bool, bool)]
-    busy: Set[string]
+    open: &SbOpen
     factories: Map[string, Span]
     dtors: Set[string]
     dtor_fns: Map[string, string]
@@ -1019,9 +1021,31 @@ private table_callees(cx: &BoxCx, recv: TExpr, slot: int) -> Option[Buf[string]]
     if out.is_empty() then None else Some(out)
 end table_callees
 
+// The questions `summary` is working out now, settled over recursion as a least fixed point.
+//
+// A question asked again while it is still open -- a recursive function handing its parameter to
+// itself, or to a function that hands it back -- is answered with its value so far (`values`; "keeps
+// nothing" at first) and noted as `read`. The open questions are numbered in the order they were
+// asked (`order`) and stacked (`stack`, Tarjan's), and each walk under way keeps the lowest number it
+// read (`lows`). A walk that read no question older than its own is the first of its component: if
+// a value some walk read has grown since (`changed`), every question of the component is walked
+// again from the values reached so far; otherwise each value is the answer, and goes in the memo.
+// Values only grow, two flags each, so the iteration ends; and the last round read every value as it
+// ends, so each answer covers what its body does given the others'.
+private struct SbOpen
+    values: Map[string, (bool, bool)]
+    order: Map[string, usize]
+    stack: Buf[string]
+    lows: Buf[usize]
+    read: Set[string]
+    next: usize
+    changed: bool
+end SbOpen
+
 // What the function `name` does with its parameter `k`: whether it may let it out (`.0`), and whether
-// its answer may be it or hold it (`.1`). Where no body is in sight, the arguments do not line up, the
-// body is a task's or is being worked out further up this very question, the answer is "it escapes".
+// its answer may be it or hold it (`.1`). Where no body is in sight, the arguments do not line up, or
+// the body is a task's, the answer is "it escapes". A question asked again while it is being worked
+// out is answered from `SbOpen`.
 private summary(cx: &BoxCx, name: string, k: usize, given: usize) -> (bool, bool)
     val key = s"$name|$k"
 
@@ -1029,7 +1053,18 @@ private summary(cx: &BoxCx, name: string, k: usize, given: usize) -> (bool, bool
         Some(known) -> return known
         None -> ()
 
-    if cx.busy.has(name) then return (true, true)
+    val open = cx.open
+
+    open.order.get(key) match
+        Some(n) ->
+            val top = open.lows.len() - 1
+
+            if n < open.lows[top] then open.lows[top] = n
+
+            open.read.add(key)
+
+            return open.values.get(key).unwrap_or((false, false))
+        None -> ()
 
     val at = cx.index.get(name)
 
@@ -1040,17 +1075,68 @@ private summary(cx: &BoxCx, name: string, k: usize, given: usize) -> (bool, bool
     if f.ghost || f.variadic || f.marks.is_async() || k >= f.params.len() || given != f.params.len() then
         return (true, true)
 
-    cx.busy.add(name)
+    val mine = open.next
+    val outer_changed = open.changed
 
-    val w = follow_param(cx, f, k)
+    open.next += 1
+    open.order.put(key, mine)
+    open.stack.push(key)
+    open.lows.push(mine)
 
-    cx.busy.remove(name)
+    loop
+        open.changed = false
 
-    val out = (w.escaped, w.answers)
+        val w = follow_param(cx, f, k)
+        val was = open.values.get(key).unwrap_or((false, false))
+        val now = (was.0 || w.escaped, was.1 || w.answers)
 
-    cx.memo.put(key, out)
+        if now != was
+            open.values.put(key, now)
 
-    if out.1 then cx.answering.add(key)
+            if open.read.has(key) then open.changed = true
 
-    out
+        val low = open.lows.pop().unwrap()
+
+        // A question older than this one was read: this one belongs to that one's component, which
+        // settles it.
+        if low < mine
+            val top = open.lows.len() - 1
+
+            if low < open.lows[top] then open.lows[top] = low
+
+            open.changed = open.changed || outer_changed
+            return now
+        end if
+
+        if !open.changed then break
+
+        // Another round: every question asked since this one is asked afresh, from its value so far.
+        while open.stack.len() > 0 && open.stack[open.stack.len() - 1] != key
+            val gone = open.stack.pop().unwrap()
+
+            open.order.remove(gone)
+            open.read.remove(gone)
+
+        open.read.remove(key)
+        open.lows.push(mine)
+    end loop
+
+    // Settled: this question and every one of its component still stacked above it.
+    loop
+        val done = open.stack.pop().unwrap()
+        val out = open.values.get(done).unwrap_or((false, false))
+
+        cx.memo.put(done, out)
+
+        if out.1 then cx.answering.add(done)
+
+        open.order.remove(done)
+        open.read.remove(done)
+        open.values.remove(done)
+
+        if done == key then break
+    end loop
+
+    open.changed = outer_changed
+    cx.memo.get(key).unwrap()
 end summary
