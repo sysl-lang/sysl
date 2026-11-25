@@ -1,0 +1,398 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Var}
+import sysl.text.{cstring, Search}
+
+// **A closure's environment is a holder per capture** (`stack_box.sysl`'s `BoxWalk.env`,
+// `sb_slot_carries`): a box captured beside something else stays in the frame when the closure only
+// hands the OTHER capture to a call that keeps it (`pl.keep(a)`, havlak's `node_pool.append(ydash)`).
+// Before, a read of any slot of the environment "might be" the box, so the keep of `a` let `pl` out.
+//
+// The axes: where the other capture goes (a keeping call -- frame; the box itself stored through the
+// other capture, or kept by a call -- heap); how the box reaches the slot (a by-reference `val`, a
+// `var` given the box only after the closure is built -- heap); nesting (a closure in a closure --
+// frame; the inner one storing the box through the outer's other capture -- heap); two literals over
+// the same names; where the closure goes (a generic parameter -- frame; a call's answer, whose making
+// the walk cannot see -- heap; a `&Fn` field of a returned struct -- heap; a task -- heap; a thread's
+// `&sync Fn` -- heap); and `--explain-escapes`, whose closure lines are unchanged. Each cell asserts
+// its output, the counted heap's net 0, and whether `pool`'s frame entry is called.
+//
+// Skipped cells, and why: a store into a slot of a closure's environment after it is built cannot be
+// written (a closure's fields have no name), and the walk treats one as unknown (`in_closure_slot`);
+// codegen units and a bare-metal target change no decision, which is made on the typed tree first; a
+// `.syslib` callee has no body in the program's index and answers "escapes", as before.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private struct FceRun
+    out: string
+    err: string
+end FceRun
+
+// The program built on the counted heap and run with `SYSL_COUNT_BYTES`, or with `flags` handed to
+// clang.
+private fce_run(text: string, flags: string = "") -> FceRun
+    val root = make_temp_dir("sysl-fce").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    val exe = s"$root/built"
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+        val v = cstring(flags)
+
+        fce_c_setenv(n.ptr, v.ptr, 1)
+    end if
+
+    force_alloc_counting(flags == "")
+
+    val made = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe))
+
+    force_alloc_counting(false)
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+
+        fce_c_unsetenv(n.ptr)
+    end if
+
+    made match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return FceRun(failure_text(why), "")
+        Ok(_) -> ()
+
+    val ran = capture(exe, [], "", [Var(alloc_bytes_variable(), "1")], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    ran match
+        Err(_) -> FceRun("could not be started", "")
+        Ok(o) -> FceRun(o.text, o.err.unwrap_or(""))
+end fce_run
+
+private extern "setenv" fce_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" fce_c_unsetenv(name: *u8) -> int
+
+private fce_ir(text: string) -> string
+    val root = make_temp_dir("sysl-fce").unwrap()
+
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end fce_ir
+
+// The program printed `want`, gave back everything it took, and reached `pool`'s frame entry where
+// its box is `framed` -- `pool` itself where it is not.
+private fce_check(name: string, text: string, want: string, framed: bool)
+    val got = fce_run(text)
+
+    assert_eq(got.out, want)
+    assert_eq(alloc_count_reported(got.err), 0)
+
+    val ir = fce_ir(text)
+    val entered = ir.contains("call ptr @pool$$sysl-frame(")
+
+    if framed then assert(entered, s"$name: 'pool' was not laid in the frame")
+    else assert(!entered && ir.contains("call ptr @pool$$sysl()"), s"$name: 'pool' was laid in the frame")
+end fce_check
+
+// -- the programs ---------------------------------------------------------------------------------
+
+private const fce_pool: string = raw"""
+    struct Node
+        n: int
+
+    struct Pool
+        last: Option[&Node]
+        count: int
+
+        keep(&self, a: &Node)
+            self.last = Some(a)
+            self.count += 1
+
+    pool() -> &Pool = Pool(None, 0)
+
+    each(xs: []int, f: int -> unit) =
+        for x in xs
+            f(x)
+    """
+
+private const fce_other_kept: string = raw"""
+    fill(xs: []int, a: &Node, pl: &Pool) = each(xs, x -> pl.keep(a))
+
+    main()
+        val a: &Node = Node(4)
+        val pl = pool()
+
+        fill([1, 2, 3], a, pl)
+        print(pl.count + pl.last.unwrap().n)
+    """
+
+private const fce_nested: string = raw"""
+    fill(xs: []int, a: &Node, pl: &Pool) = each(xs, x -> each(xs, y -> pl.keep(a)))
+
+    main()
+        val a: &Node = Node(4)
+        val pl = pool()
+
+        fill([1, 2], a, pl)
+        print(pl.count + pl.last.unwrap().n)
+    """
+
+private const fce_two_literals: string = raw"""
+    fill(xs: []int, a: &Node, pl: &Pool)
+        each(xs, x -> pl.keep(a))
+        each(xs, x ->
+            val b = a
+            pl.keep(b))
+
+    main()
+        val a: &Node = Node(4)
+        val pl = pool()
+
+        fill([1, 2, 3], a, pl)
+        print(pl.count + pl.last.unwrap().n)
+    """
+
+private const fce_local: string = raw"""
+    main()
+        val a: &Node = Node(4)
+        val pl = pool()
+
+        each([1, 2], x -> pl.keep(a))
+        print(pl.count + pl.last.unwrap().n)
+    """
+
+private const fce_through_other: string = raw"""
+    struct Sink
+        held: Option[&Pool]
+
+    fill(xs: []int, s: *Sink, pl: &Pool) = each(xs, x ->
+        pl.count += x
+        s.held = Some(pl))
+
+    main()
+        var s = Sink(None)
+        val pl = pool()
+
+        fill([1, 2, 3], &s, pl)
+        print(s.held.unwrap().count)
+    """
+
+private const fce_kept_capture: string = raw"""
+    var kept: Option[&Pool] = None
+
+    keep_pool(p: &Pool) = kept = Some(p)
+
+    fill(xs: []int, a: &Node, pl: &Pool) = each(xs, x ->
+        pl.count += a.n
+        keep_pool(pl))
+
+    main()
+        val a: &Node = Node(2)
+        val pl = pool()
+
+        fill([1, 2, 3], a, pl)
+        print(kept.unwrap().count)
+        kept = None
+    """
+
+private const fce_var_after: string = raw"""
+    var kept: Option[&Pool] = None
+
+    keep_pool(p: &Pool) = kept = Some(p)
+
+    main()
+        val pl = pool()
+        var h = pool()
+        val f = (x: int) -> keep_pool(h)
+
+        h = pl
+        pl.count = 5
+        each([1, 2], f)
+        print(kept.unwrap().count)
+        kept = None
+    """
+
+private const fce_nested_through: string = raw"""
+    struct Sink
+        held: Option[&Pool]
+
+    fill(xs: []int, s: *Sink, pl: &Pool) = each(xs, x -> each(xs, y ->
+        pl.count += 1
+        s.held = Some(pl)))
+
+    main()
+        var s = Sink(None)
+        val pl = pool()
+
+        fill([1, 2], &s, pl)
+        print(s.held.unwrap().count)
+    """
+
+private const fce_answered: string = raw"""
+    struct Sink
+        held: Option[&Pool]
+
+    pass[F](f: F) -> F = f
+
+    fill(xs: []int, s: *Sink, pl: &Pool) = each(xs, pass((x: int) ->
+        pl.count += x
+        s.held = Some(pl)))
+
+    main()
+        var s = Sink(None)
+        val pl = pool()
+
+        fill([1, 2, 3], &s, pl)
+        print(s.held.unwrap().count)
+    """
+
+private const fce_returned: string = raw"""
+    struct Holder
+        f: &Fn(int) -> unit
+
+    make(a: &Node, pl: &Pool) -> Holder = Holder(x -> pl.keep(a))
+
+    main()
+        val a: &Node = Node(4)
+        val pl = pool()
+        val h = make(a, pl)
+
+        h.f(1)
+        h.f(2)
+        print(pl.count + pl.last.unwrap().n)
+    """
+
+private const fce_task: string = raw"""
+    async each_task(xs: []int, f: int -> unit) -> int
+        for x in xs
+            f(x)
+            await yield_now()
+
+        3
+
+    fill(xs: []int, a: &Node, pl: &Pool) -> int = block_on(each_task(xs, x -> pl.keep(a)))
+
+    main()
+        val a: &Node = Node(4)
+        val pl = pool()
+
+        print(fill([1, 2, 3], a, pl) + pl.count + pl.last.unwrap().n)
+    """
+
+private const fce_thread: string = raw"""
+    main()
+        var pl = pool()
+        var k = 3
+        val pp = &pl
+        val kp = &k
+
+        scope((s) ->
+            val t = s.spawn(() -> (*pp).count += *kp)
+
+            t.join())
+        print(pl.count)
+    """
+
+// The pool's program with `rest` after it, and `imports` before it.
+private fce_with(rest: string, imports: string = "") -> string = imports + fce_pool + rest
+
+// -- the cells ------------------------------------------------------------------------------------
+
+@test("a box captured beside another capture the closure keeps stays in the frame")
+fce_other_capture_kept_stays_in_the_frame()
+    if !enm_ready() then return
+
+    fce_check("fce_other_kept", fce_with(fce_other_kept), "7\n", true)
+    fce_check("fce_nested", fce_with(fce_nested), "8\n", true)
+    fce_check("fce_two_literals", fce_with(fce_two_literals), "10\n", true)
+    fce_check("fce_local", fce_with(fce_local), "6\n", true)
+end fce_other_capture_kept_stays_in_the_frame
+
+@test("a box let out through another capture, a keeping call, a later variable, an answer, a task or a thread stays on the heap")
+fce_ways_out_stay_on_the_heap()
+    if !enm_ready() then return
+
+    fce_check("fce_through_other", fce_with(fce_through_other), "6\n", false)
+    fce_check("fce_kept_capture", fce_with(fce_kept_capture), "6\n", false)
+    fce_check("fce_var_after", fce_with(fce_var_after), "5\n", false)
+    fce_check("fce_nested_through", fce_with(fce_nested_through), "4\n", false)
+    fce_check("fce_answered", fce_with(fce_answered), "6\n", false)
+    fce_check("fce_returned", fce_with(fce_returned), "6\n", false)
+    fce_check("fce_task", fce_with(fce_task), "10\n", false)
+    fce_check("fce_thread", fce_with(fce_thread, "import sysl.threads.scope\n"), "3\n", false)
+end fce_ways_out_stay_on_the_heap
+
+@test("and under AddressSanitizer: the frame cells read nothing outside a live frame")
+fce_frame_cells_run_clean_under_asan()
+    if !enm_ready() then return
+
+    for item in [(fce_other_kept, "7\n"), (fce_nested, "8\n"), (fce_two_literals, "10\n"), (fce_local, "6\n"),
+                 (fce_answered, "6\n")]
+        val got = fce_run(fce_with(item.0), "-fsanitize=address -g")
+
+        assert_eq(got.out, item.1)
+        assert_eq(got.err, "")
+    end for
+end fce_frame_cells_run_clean_under_asan
+
+@test("--explain-escapes says the same of the closure whose box is now laid in the frame")
+fce_explain_escapes_is_unchanged()
+    if xvr_no_library() then return
+
+    val root = make_temp_dir("sysl-fce").unwrap()
+
+    write_text(s"$root/main.sysl", forms_imported(fce_with(fce_other_kept))).unwrap()
+
+    var lines: Buf[string] = buf()
+    var notes: Buf[string] = buf()
+    val sink = &lines
+    val noted = &notes
+
+    var args: Buf[string] = buf()
+
+    args.push("sysl")
+    args.push("emit-llvm")
+    args.push("--explain-escapes")
+    args.push(s"$root/main.sysl")
+    run_cli_noted(args.view(), (line) -> sink.push(line), (line) -> noted.push(line))
+    remove_dir_all(root).unwrap_or(())
+
+    assert_eq(notes.len(), 1)
+    assert(notes[0].ends_with(": a closure holds 'pl' and 'a' by reference, because nothing it is handed to or stored in keeps it"),
+           notes[0])
+end fce_explain_escapes_is_unchanged
+
+// **A closure literal handed to a generic call is typed by a trial whose record of its struct the
+// instantiation keeps** (`closure_mode.sysl`'s `apply_closure_modes`): turned only where the struct
+// table reached it, `pass[F]`'s and `each[F]`'s signatures kept the by-value fields, so the copy and
+// dispose built from them retained and released the ADDRESS of a by-reference capture -- the closure
+// then read the pool through a bumped pointer.
+@test("a closure held by reference and passed through a generic answer copies no capture's address as a count")
+fce_generic_answer_turns_the_trial_record()
+    if !enm_ready() then return
+
+    val got = fce_run(fce_with(fce_answered))
+
+    assert_eq(got.out, "6\n")
+    assert_eq(got.err.index_of("was taken as"), None)
+    assert_eq(alloc_count_reported(got.err), 0)
+
+    val ir = fce_ir(fce_with(fce_answered))
+
+    // Every capture is held by reference, so nothing of the closure's is counted.
+    assert(!ir.contains("@arc.dispose.$closure0("), "the closure's dispose releases a capture's address")
+    assert(!ir.contains("@arc.copy.$closure0("), "the closure's copy retains a capture's address")
+end fce_generic_answer_turns_the_trial_record

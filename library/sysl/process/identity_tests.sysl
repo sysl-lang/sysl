@@ -5,7 +5,8 @@ module sysl.process
 import sysl.buf.{Buf, buf}
 import sysl.posix.time.sleep
 import sysl.time.millis
-import sysl.fs.{IoError, make_temp_dir, metadata, remove_dir_all, set_owner, write_text}
+import sysl.fs.{IoError, executable, link_metadata, make_temp_dir, metadata, remove_dir_all}
+import sysl.fs.{set_link_owner, set_owner, set_permissions, space, symlink, write_text}
 import sysl.process.sys as psys
 import sysl.slices.as_mut_ptr
 import sysl.testing.skip
@@ -374,3 +375,226 @@ user_name_refuses_a_short_room()
 
     assert(psys.user_name(0, as_mut_ptr(raw), 0) < 0, "a room of zero bytes held a name")
     assert(psys.user_name(0, as_mut_ptr(raw), 1) < 0, "a one-byte room held 'root'")
+
+// -- groups by id, and both databases by name ---------------------------------------------------------
+
+@test("group_name of this program's group is the name `id -gn` reports")
+group_name_matches_id()
+    val out = capture("id", ["-gn"]).unwrap()
+
+    assert(out.status.ok(), "id -gn failed")
+    assert_eq(group_name(group()).unwrap(), out.text.trim())
+
+@test("group_name of 0 is the system's first group, and an id nobody has is NotFound")
+group_name_zero_and_absent()
+#if bsd
+    assert_eq(group_name(0).unwrap(), "wheel")
+#else
+    assert_eq(group_name(0).unwrap(), "root")
+#endif
+    assert_eq(group_name(4_000_000_001).unwrap_err(), IoError.NotFound)
+
+@test("a group name that does not fit the room it is given is a failure, never a cut-short success")
+group_name_refuses_a_short_room()
+    var raw: []u8 = [0; 1]
+
+    assert(psys.group_name(0, as_mut_ptr(raw), 0) < 0, "a room of zero bytes held a name")
+    assert(psys.group_name(0, as_mut_ptr(raw), 1) < 0, "a one-byte room held group 0's name")
+
+@test("user_id is user_name's reverse: the program's own name, and root's, round trip")
+user_id_round_trips()
+    assert_eq(user_id(user_name(user()).unwrap()).unwrap(), user())
+    assert_eq(user_id("root").unwrap(), 0)
+    assert_eq(user_name(user_id(user_name(user()).unwrap()).unwrap()).unwrap(), user_name(user()).unwrap())
+
+@test("group_id is group_name's reverse, for every group `id -G` says the program is in")
+group_id_round_trips()
+    assert_eq(group_id(group_name(group()).unwrap()).unwrap(), group())
+    assert_eq(group_id(group_name(0).unwrap()).unwrap(), 0)
+
+    val out = capture("id", ["-G"]).unwrap()
+
+    assert(out.status.ok(), "id -G failed")
+
+    for word in out.text.fields()
+        var g: u32 = 0
+
+        for b in word.bytes do g = g * 10 + u32(b - u8('0'))
+
+        // A group the program is in may have no entry of its own (a container's bare gid): only one
+        // that has a name is asked back.
+        group_name(g) match
+            Ok(name) -> assert_eq(group_id(name).unwrap(), g)
+            Err(e) -> assert_eq(e, IoError.NotFound)
+    end for
+end group_id_round_trips
+
+@test("a name nobody has, an empty name and a name holding a zero byte are all NotFound")
+names_absent()
+    for name in ["sysl-no-such-account-x7", "", "root\0", "\0root"]
+        assert_eq(user_id(name).unwrap_err(), IoError.NotFound)
+        assert_eq(group_id(name).unwrap_err(), IoError.NotFound)
+
+/** Nothing is folded or trimmed on this side; what the database does with case is its own. macOS's
+ * Directory Services matches a name whatever its case, and Linux's files backend matches it exactly.
+ */
+@test("a name is handed to the database as given: no space trimmed, and a slice names only its own bytes")
+names_exact()
+    assert_eq(user_id(" root").unwrap_err(), IoError.NotFound)
+    assert_eq(user_id("root ").unwrap_err(), IoError.NotFound)
+    assert_eq(group_id(" root").unwrap_err(), IoError.NotFound)
+
+#if macos
+    assert_eq(user_id("ROOT").unwrap(), 0)
+    assert_eq(group_id("WHEEL").unwrap(), 0)
+#else
+    assert_eq(user_id("ROOT").unwrap_err(), IoError.NotFound)
+#endif
+
+    // Not followed by a zero: a shim that read past the slice would look up `rootless-sysl`.
+    val longer = "rootless-sysl"
+
+    assert_eq(user_id(longer[0..<4]).unwrap(), 0)
+    assert_eq(user_id(longer).unwrap_err(), IoError.NotFound)
+
+    val zero_group = group_name(0).unwrap()
+    val padded = zero_group + "-sysl"
+
+    assert_eq(group_id(padded[0..<zero_group.len]).unwrap(), 0)
+    assert_eq(group_id(padded).unwrap_err(), IoError.NotFound)
+end names_exact
+
+// -- what the filesystem says of the program's own files ----------------------------------------------
+
+/** A new file's group is the program's group (`getgid`'s effective twin) on Linux, and the directory's
+ * on a BSD -- POSIX allows both, and a directory with its setgid bit set asks for the second on Linux
+ * too -- so the expected group is worked out from the directory rather than assumed.
+ */
+@test("a file the program made carries its ids: Meta.owner is user(), Meta.group the group POSIX gives it")
+id_meta_ids_are_the_programs()
+    val dir = make_temp_dir("sysl-proc-ids").unwrap()
+    val path = s"$dir/mine"
+
+    write_text(path, "x").unwrap()
+
+    val m = metadata(path).unwrap()
+    val parent = metadata(dir).unwrap()
+
+    assert_eq(m.owner, user())
+    assert_eq(m.owner, id_of("-u"))
+
+#if bsd
+    assert_eq(m.group, parent.group)
+#else
+    assert_eq(m.group, if (parent.mode & 0o2000) != 0 then parent.group else group())
+#endif
+
+    remove_dir_all(dir)
+end id_meta_ids_are_the_programs
+
+@test("executable(path) asks for this program: another class's execute bit does not let the owner run it")
+id_executable_is_the_programs()
+    if user() == 0 then skip("run as root, who may execute a file with any execute bit set")
+
+    val dir = make_temp_dir("sysl-proc-exec").unwrap()
+    val path = s"$dir/script"
+
+    write_text(path, "#!/bin/sh\nexit 0\n").unwrap()
+
+    val cases: [](u32, bool) = [(0o700, true), (0o100, true), (0o070, false), (0o007, false),
+                                (0o001, false), (0o600, false)]
+
+    for (mode, runs) in cases
+        set_permissions(path, mode).unwrap()
+
+        // The bits say "a program" whenever any execute bit is set; the system answers for the owner.
+        assert_eq(metadata(path).unwrap().executable(), (mode & 0o111) != 0)
+        assert_eq(executable(path), runs)
+    end for
+
+    remove_dir_all(dir)
+end id_executable_is_the_programs
+
+/** The link is the program's and what it names is root's, so giving the link to the program succeeds
+ * while giving the target to it is refused -- which is the target left alone, told from outside.
+ */
+@test("set_link_owner leaves the target: a link to root's file is the program's to set, the file not")
+id_link_owner_leaves_the_target()
+    if user() == 0 then skip("run as root, so the target could be given away too")
+
+    val dir = make_temp_dir("sysl-proc-lchown").unwrap()
+    val link = s"$dir/sh"
+    val target = "/bin/sh"
+
+    symlink(target, link).unwrap()
+
+    val theirs = metadata(target).unwrap()
+
+    assert_eq(theirs.owner, 0)
+    assert_eq(link_metadata(link).unwrap().owner, user())
+
+    set_link_owner(link, user(), group()).unwrap()
+
+    val refused = set_owner(link, user(), group())
+
+    assert_eq(metadata(target).unwrap().owner, theirs.owner)
+    assert_eq(metadata(target).unwrap().group, theirs.group)
+    assert_eq(link_metadata(link).unwrap().owner, user())
+    assert_eq(link_metadata(link).unwrap().group, group())
+    remove_dir_all(dir)
+
+    refused match
+        Ok(_) -> assert(false, "root's file was given to the program through a link")
+        Err(e) -> assert_eq(e, IoError.NotPermitted)
+end id_link_owner_leaves_the_target
+
+@test("set_link_owner giving a file to root, by a program that is not root, is NotPermitted")
+id_link_owner_to_root_is_refused()
+    if user() == 0 then skip("run as root, so giving a file away is allowed")
+
+    val dir = make_temp_dir("sysl-proc-lchown").unwrap()
+    val path = s"$dir/mine"
+
+    write_text(path, "x").unwrap()
+
+    val refused = set_link_owner(path, 0, metadata(path).unwrap().group)
+
+    assert_eq(metadata(path).unwrap().owner, user())
+    remove_dir_all(dir)
+
+    refused match
+        Ok(_) -> assert(false, "a file was given to root")
+        Err(e) -> assert_eq(e, IoError.NotPermitted)
+end id_link_owner_to_root_is_refused
+
+/** `df -P -k` prints the size in 1024-byte blocks in the format POSIX fixes, read off the same
+ * `statvfs`, so the total agrees to the kilobyte -- a reading multiplied by `f_bsize` rather than
+ * `f_frsize`, or a count read from the wrong field, would not. It is here rather than beside `space`
+ * because `sysl.fs`'s own tests may not start a child.
+ */
+@test("space's total is what df reports for the same path, to the kilobyte")
+id_space_matches_df()
+    val dir = make_temp_dir("sysl-proc-df").unwrap()
+    val out = capture("df", ["-P", "-k", dir]).unwrap()
+
+    assert(out.status.ok(), "df failed")
+
+    // The second line's second field: the total in 1024-byte blocks.
+    val lines = out.text.lines()
+
+    assert(lines.len >= 2, s"df printed '${out.text}'")
+
+    val fields = lines[1].fields()
+
+    assert(fields.len >= 2, s"df printed '${lines[1]}'")
+
+    var blocks: u64 = 0
+
+    for b in fields[1].bytes do blocks = blocks * 10 + u64(b - u8('0'))
+
+    val kib = space(dir).unwrap().total / 1024
+
+    assert(kib == blocks || kib + 1 == blocks || kib == blocks + 1, s"space ${kib}K, df ${blocks}K")
+
+    remove_dir_all(dir)
+end id_space_matches_df

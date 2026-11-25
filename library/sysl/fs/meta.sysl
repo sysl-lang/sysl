@@ -150,6 +150,14 @@ struct Meta
      */
     is_link(self) -> bool = (self.mode & s_ifmt) == s_iflnk
 
+    /** Whether the entry is a regular file with any of its three execute bits set -- the owner's, the
+     * group's or everyone else's. It is the question "is this a program", read from the bits alone, so
+     * it answers the same whoever asks: a directory's execute bits mean it may be searched and answer
+     * `false` here, and so does a symbolic link that `link_metadata` described. Whether **this**
+     * program may run the file is `sysl.fs.executable(path)`, which asks the system as `access` does.
+     */
+    executable(self) -> bool = self.is_file() && (self.mode & 0o111) != 0
+
     /** Whether two readings name the same file, which is the inode and the device together and is
      * not the path. Two hard links to one file answer `true`; two copies of identical contents
      * answer `false`.
@@ -207,6 +215,15 @@ set_permissions(path: string, mode: u32) -> Result[unit, IoError] =
  */
 set_owner(path: string, owner: u32, group: u32) -> Result[unit, IoError] =
     answered(fsys.chown(as_ptr(path.bytes), path.bytes.len, owner, group))
+
+/** The owner and group of `path` **itself** set to `owner` and `group`, as `lchown(2)`: a symbolic link
+ * is given the ids and what it names keeps its own, which is the writing half of `link_metadata`'s
+ * reading. Anything at `path` that is not a link is changed exactly as `set_owner` changes it, with
+ * `set_owner`'s privilege rule: giving it away is `NotPermitted` to a program not acting as user 0. A
+ * path that is not there is `NotFound`; a target whose filesystem has no owners reports `unsupported()`.
+ */
+set_link_owner(path: string, owner: u32, group: u32) -> Result[unit, IoError] =
+    answered(fsys.lchown(as_ptr(path.bytes), path.bytes.len, owner, group))
 
 /** The modification time of what `path` names -- a file or a directory -- set to `when`, and its
  * access time with it, following a symbolic link. It is what makes "last used" a thing a program can
