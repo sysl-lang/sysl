@@ -645,3 +645,62 @@ supply_realpath(path: *u8, len: usize, into: *u8, room: usize, got: *usize) -> i
     UNSUPPORTED
 #endif
 end supply_realpath
+
+// -- watching for changes ----------------------------------------------------------------------------
+//
+// **The watcher is C, in `__posix__/watch.c`**: kqueue on Darwin and the BSDs, inotify on Linux, and
+// "no such call" on a POSIX system with neither. Each shim answers a count, a number or zero, or an
+// `errno` negated, which the hook here turns into the contract's status.
+
+#if posix
+private extern "sysl_fs_host_watch_open" c_watch_open(handle: *usize) -> int
+private extern "sysl_fs_host_watch_add" c_watch_add(handle: usize, path: *u8, len: usize) -> int
+private extern "sysl_fs_host_watch_remove" c_watch_remove(handle: usize, id: int) -> int
+private extern "sysl_fs_host_watch_read" c_watch_read(handle: usize, into: *u8, room: usize, more: *i32) -> long
+private extern "sysl_fs_host_watch_close" c_watch_close(handle: usize) -> int
+
+/** A shim's answer as a hook's: what it answered, or the failure's status. */
+private watched(k: int) -> int = if k < 0 then host_status(-k) else k
+#endif
+
+@export("sysl_fs_watch_open")
+supply_watch_open(handle: *usize) -> int
+#if posix
+    watched(c_watch_open(handle))
+#else
+    UNSUPPORTED
+#endif
+
+@export("sysl_fs_watch_add")
+supply_watch_add(handle: usize, path: *u8, len: usize) -> int
+#if posix
+    watched(c_watch_add(handle, path, len))
+#else
+    UNSUPPORTED
+#endif
+
+@export("sysl_fs_watch_remove")
+supply_watch_remove(handle: usize, id: int) -> int
+#if posix
+    watched(c_watch_remove(handle, id))
+#else
+    UNSUPPORTED
+#endif
+
+@export("sysl_fs_watch_read")
+supply_watch_read(handle: usize, into: *u8, room: usize, more: *i32) -> isize
+#if posix
+    val k = c_watch_read(handle, into, room, more)
+
+    if k < 0 then isize(host_status(int(-k))) else isize(k)
+#else
+    isize(UNSUPPORTED)
+#endif
+
+@export("sysl_fs_watch_close")
+supply_watch_close(handle: usize) -> int
+#if posix
+    watched(c_watch_close(handle))
+#else
+    UNSUPPORTED
+#endif

@@ -1,0 +1,604 @@
+module sysl.fs.watch
+@requires(posix)
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fiber.{Context, Stack, switch}
+import sysl.fs.{NotFound, NotOpen, append_text, make_dir, make_temp_dir, remove_dir, remove_dir_all, remove_file, rename, set_permissions, symlink, truncate, write_text}
+import sysl.io.poll.Poller
+import sysl.io.poll as poll
+import sysl.io.wait.Readable
+import sysl.path.join
+import sysl.time.millis
+
+// The axes: what is watched (a file, a directory, both, the same object twice); each change on each
+// (created, removed, modified -- by a write and by a truncation -- renamed within, between, out of
+// and into watched directories and over an existing name, attributes, overflow); what a directory
+// watch deliberately does not see (an entry's contents, a subdirectory's entries); the watch's own
+// life (added, removed, ended by its object going, followed through a rename); the watcher's (read
+// with nothing, read of more records than one hand-over holds, closed, dropped, shared between
+// copies); and how it is waited on (`readable`, a `Poller`, a fiber parked on a poller).
+//
+// **No test sleeps to guess.** Both kernels record a change by the time the call making it returns,
+// so a test makes its changes and then waits -- for at most five seconds -- for the descriptor to
+// be readable. A test that something is NOT reported makes that change, then a second one that is
+// reported, waits for it, and asserts it is the only event.
+//
+// The two systems differ in two places, each a `#if linux || android` here: a change undone before a
+// read (inotify reports both halves, kqueue neither) and how an overflow is provoked (inotify's queue,
+// a directory kqueue can no longer list).
+//
+// Not here: a relative path added (the working directory is the process's, shared with every test
+// running beside this one), and a record too big for the first hand-over (a path would need to be
+// over 16 KiB, which no filesystem here stores).
+
+private scratch(tag: string) -> string = make_temp_dir("sysl-fs-watch-" + tag).unwrap()
+
+/** What is there to read once the watcher says there is, waiting at most five seconds. */
+private next(w: Watcher) -> Buf[Event]
+    assert(w.readable(millis(5000)).unwrap(), "the watcher never became readable")
+    w.read().unwrap()
+
+private one(got: Buf[Event], want: Event)
+    assert_eq(got.len(), 1, s"events: ${got.len()}")
+    assert_eq(got[0], want)
+
+private ev(change: Change, path: string, w: Watch) -> Event = Event(change, path, None, Some(w))
+
+private has(got: Buf[Event], want: Event) -> bool = got.any((e) -> e == want)
+
+// -- a watched file ----------------------------------------------------------------------------------
+
+@test("fsw a write to a watched file is Modified, naming the path it was added with")
+fsw_file_write_is_modified()
+    val root = scratch("write")
+    val f = join(root, "f")
+
+    write_text(f, "").unwrap()
+
+    val w = Watcher.open().unwrap()
+    val id = w.add(f).unwrap()
+
+    append_text(f, "hello").unwrap()
+    one(next(w), ev(Modified, f, id))
+    remove_dir_all(root).unwrap()
+
+@test("fsw truncating a watched file is Modified, not Attributes, on both systems")
+fsw_file_truncate_is_modified()
+    val root = scratch("truncate")
+    val f = join(root, "f")
+
+    write_text(f, "some bytes").unwrap()
+
+    val w = Watcher.open().unwrap()
+    val id = w.add(f).unwrap()
+
+    truncate(f, 2).unwrap()
+    one(next(w), ev(Modified, f, id))
+    remove_dir_all(root).unwrap()
+
+@test("fsw a chmod of a watched file is Attributes and nothing else")
+fsw_file_chmod_is_attributes()
+    val root = scratch("chmod")
+    val f = join(root, "f")
+
+    write_text(f, "x").unwrap()
+
+    val w = Watcher.open().unwrap()
+    val id = w.add(f).unwrap()
+
+    set_permissions(f, 0o600).unwrap()
+    one(next(w), ev(Attributes, f, id))
+    remove_dir_all(root).unwrap()
+
+@test("fsw a watched file that moves is Renamed with no new name, and the watch follows it")
+fsw_file_rename_followed()
+    val root = scratch("follow")
+    val f = join(root, "f")
+    val g = join(root, "g")
+
+    write_text(f, "").unwrap()
+
+    val w = Watcher.open().unwrap()
+    val id = w.add(f).unwrap()
+
+    rename(f, g).unwrap()
+    one(next(w), ev(Renamed, f, id))
+    append_text(g, "after").unwrap()
+    one(next(w), ev(Modified, f, id))
+    remove_dir_all(root).unwrap()
+
+@test("fsw a watched file removed is Removed once, and its watch is over")
+fsw_file_removed_ends_the_watch()
+    val root = scratch("gone")
+    val f = join(root, "f")
+
+    write_text(f, "x").unwrap()
+
+    val w = Watcher.open().unwrap()
+    val id = w.add(f).unwrap()
+
+    remove_file(f).unwrap()
+    one(next(w), ev(Removed, f, id))
+    assert_eq(w.remove(id), Err(NotFound))
+    remove_dir_all(root).unwrap()
+
+// -- a watched directory -----------------------------------------------------------------------------
+
+@test("fsw an entry made in a watched directory is Created, with the entry's path")
+fsw_dir_created()
+    val root = scratch("created")
+    val w = Watcher.open().unwrap()
+    val id = w.add(root).unwrap()
+
+    write_text(join(root, "new"), "x").unwrap()
+    one(next(w), ev(Created, join(root, "new"), id))
+    remove_dir_all(root).unwrap()
+
+@test("fsw an entry removed from a watched directory is Removed")
+fsw_dir_removed()
+    val root = scratch("removed")
+
+    write_text(join(root, "old"), "x").unwrap()
+
+    val w = Watcher.open().unwrap()
+    val id = w.add(root).unwrap()
+
+    remove_file(join(root, "old")).unwrap()
+    one(next(w), ev(Removed, join(root, "old"), id))
+    remove_dir_all(root).unwrap()
+
+@test("fsw a rename inside a watched directory is one Renamed from the old name to the new")
+fsw_dir_rename_within()
+    val root = scratch("within")
+
+    write_text(join(root, "a"), "x").unwrap()
+
+    val w = Watcher.open().unwrap()
+    val id = w.add(root).unwrap()
+
+    rename(join(root, "a"), join(root, "b")).unwrap()
+    one(next(w), Event(Renamed, join(root, "a"), Some(join(root, "b")), Some(id)))
+    remove_dir_all(root).unwrap()
+
+@test("fsw a rename over an existing entry is one Renamed, the name it replaced not Removed")
+fsw_dir_rename_over()
+    val root = scratch("over")
+
+    write_text(join(root, "a"), "new").unwrap()
+    write_text(join(root, "b"), "old").unwrap()
+
+    val w = Watcher.open().unwrap()
+    val id = w.add(root).unwrap()
+
+    rename(join(root, "a"), join(root, "b")).unwrap()
+    one(next(w), Event(Renamed, join(root, "a"), Some(join(root, "b")), Some(id)))
+    remove_dir_all(root).unwrap()
+
+@test("fsw a move between two watched directories is one Renamed, under the destination's watch")
+fsw_dir_rename_between()
+    val root = scratch("between")
+    val x = join(root, "x")
+    val y = join(root, "y")
+
+    make_dir(x).unwrap()
+    make_dir(y).unwrap()
+    write_text(join(x, "f"), "x").unwrap()
+
+    val w = Watcher.open().unwrap()
+    _ = w.add(x).unwrap()
+
+    val wy = w.add(y).unwrap()
+
+    rename(join(x, "f"), join(y, "g")).unwrap()
+
+    var got = next(w)
+
+    // The two directories may be reported by two notifications that land on either side of a read.
+    if got.len() == 0 then got = next(w)
+
+    one(got, Event(Renamed, join(x, "f"), Some(join(y, "g")), Some(wy)))
+    remove_dir_all(root).unwrap()
+
+@test("fsw a move out of everything watched is Removed, and a move in is Created")
+fsw_dir_move_out_and_in()
+    val root = scratch("outin")
+    val x = join(root, "x")
+
+    make_dir(x).unwrap()
+    write_text(join(x, "f"), "x").unwrap()
+
+    val w = Watcher.open().unwrap()
+    val id = w.add(x).unwrap()
+
+    rename(join(x, "f"), join(root, "f")).unwrap()
+    one(next(w), ev(Removed, join(x, "f"), id))
+    rename(join(root, "f"), join(x, "back")).unwrap()
+    one(next(w), ev(Created, join(x, "back"), id))
+    remove_dir_all(root).unwrap()
+
+@test("fsw a write to or chmod of an entry inside a watched directory is not reported")
+fsw_dir_entry_contents_not_reported()
+    val root = scratch("contents")
+
+    write_text(join(root, "f"), "").unwrap()
+
+    val w = Watcher.open().unwrap()
+    val id = w.add(root).unwrap()
+
+    append_text(join(root, "f"), "more").unwrap()
+    set_permissions(join(root, "f"), 0o600).unwrap()
+    write_text(join(root, "marker"), "").unwrap()
+    one(next(w), ev(Created, join(root, "marker"), id))
+    remove_dir_all(root).unwrap()
+
+@test("fsw a subdirectory made is Created, and what is made inside it is not seen: nothing is recursive")
+fsw_dir_not_recursive()
+    val root = scratch("recursive")
+    val w = Watcher.open().unwrap()
+    val id = w.add(root).unwrap()
+
+    make_dir(join(root, "sub")).unwrap()
+    one(next(w), ev(Created, join(root, "sub"), id))
+    write_text(join(join(root, "sub"), "deep"), "").unwrap()
+    write_text(join(root, "marker"), "").unwrap()
+    one(next(w), ev(Created, join(root, "marker"), id))
+    remove_dir_all(root).unwrap()
+
+@test("fsw a chmod of a watched directory is Attributes of the directory")
+fsw_dir_chmod_is_attributes()
+    val root = scratch("dirchmod")
+    val d = join(root, "d")
+
+    make_dir(d).unwrap()
+
+    val w = Watcher.open().unwrap()
+    val id = w.add(d).unwrap()
+
+    set_permissions(d, 0o700).unwrap()
+    one(next(w), ev(Attributes, d, id))
+    remove_dir_all(root).unwrap()
+
+@test("fsw a watched directory removed is Removed, and its watch is over")
+fsw_dir_removed_itself()
+    val root = scratch("dirgone")
+    val d = join(root, "d")
+
+    make_dir(d).unwrap()
+
+    val w = Watcher.open().unwrap()
+    val id = w.add(d).unwrap()
+
+    remove_dir(d).unwrap()
+    one(next(w), ev(Removed, d, id))
+    assert_eq(w.remove(id), Err(NotFound))
+    remove_dir_all(root).unwrap()
+
+@test("fsw a watched directory that moves is Renamed with no new name, and its entries keep the old path")
+fsw_dir_moved_followed()
+    val root = scratch("dirmove")
+    val d = join(root, "d")
+    val e = join(root, "e")
+
+    make_dir(d).unwrap()
+
+    val w = Watcher.open().unwrap()
+    val id = w.add(d).unwrap()
+
+    rename(d, e).unwrap()
+    one(next(w), ev(Renamed, d, id))
+    write_text(join(e, "new"), "").unwrap()
+    one(next(w), ev(Created, join(d, "new"), id))
+    remove_dir_all(root).unwrap()
+
+@test("fsw a file and its directory both watched each report what they see")
+fsw_file_and_dir_both_watched()
+    val root = scratch("both")
+    val f = join(root, "f")
+
+    write_text(f, "").unwrap()
+
+    val w = Watcher.open().unwrap()
+    val wd = w.add(root).unwrap()
+    val wf = w.add(f).unwrap()
+
+    assert(wd != wf)
+    append_text(f, "x").unwrap()
+    one(next(w), ev(Modified, f, wf))
+    remove_file(f).unwrap()
+
+    var got = next(w)
+
+    // The file's own notification and its directory's may land on either side of a read.
+    if got.len() < 2 && w.readable(millis(5000)).unwrap() then got.extend(w.read().unwrap().view())
+
+    assert_eq(got.len(), 2)
+    assert(has(got, ev(Removed, f, wf)))
+    assert(has(got, ev(Removed, f, wd)))
+    remove_dir_all(root).unwrap()
+
+@test("fsw a made-and-removed entry between two reads is no change on kqueue, both on inotify")
+fsw_net_change()
+    val root = scratch("net")
+    val w = Watcher.open().unwrap()
+    val id = w.add(root).unwrap()
+
+    write_text(join(root, "brief"), "").unwrap()
+    remove_file(join(root, "brief")).unwrap()
+    write_text(join(root, "marker"), "").unwrap()
+
+    var got: Buf[Event] = buf()
+
+    // Gather until the marker, which comes last on both systems.
+    while !has(got, ev(Created, join(root, "marker"), id))
+        got.extend(next(w).view())
+#if linux || android
+    assert_eq(got.len(), 3)
+    assert_eq(got[0], ev(Created, join(root, "brief"), id))
+    assert_eq(got[1], ev(Removed, join(root, "brief"), id))
+#else
+    assert_eq(got.len(), 1)
+#endif
+    remove_dir_all(root).unwrap()
+
+@test("fsw more records than one hand-over holds all come back from one read, in order of names made")
+fsw_many_events_one_read()
+    val root = scratch("many")
+    val w = Watcher.open().unwrap()
+    val id = w.add(root).unwrap()
+
+    for i in 0..<600 do write_text(join(root, s"entry-with-a-long-name-to-fill-the-room-$i"), "").unwrap()
+
+    var got = next(w)
+
+    assert_eq(got.len(), 600)
+
+    for e in got.view()
+        assert_eq(e.change, Created)
+        assert_eq(e.watch, Some(id))
+        assert(e.path.starts_with(join(root, "entry-with-a-long-name-to-fill-the-room-")))
+
+    assert_eq(w.read().unwrap().len(), 0)
+    remove_dir_all(root).unwrap()
+
+// -- overflow ----------------------------------------------------------------------------------------
+
+#if linux || android
+@test("fsw inotify's queue filled before it is read is reported as Overflow, with no path and no watch")
+fsw_overflow_inotify()
+    val root = scratch("overflow")
+    val w = Watcher.open().unwrap()
+    _ = w.add(root).unwrap()
+
+    // 20,000 makes and removes are 40,000 events, past the default queue of 16,384.
+    for i in 0..<20000
+        write_text(join(root, s"f$i"), "").unwrap()
+        remove_file(join(root, s"f$i")).unwrap()
+
+    val got = next(w)
+
+    assert(has(got, Event(Overflow, "", None, None)))
+    remove_dir_all(root).unwrap()
+#else
+@test("fsw kqueue has no queue to fill: 20,000 makes and removes unread are no change at all")
+fsw_overflow_kqueue_storm()
+    val root = scratch("storm")
+    val w = Watcher.open().unwrap()
+    val id = w.add(root).unwrap()
+
+    for i in 0..<20000
+        write_text(join(root, s"f$i"), "").unwrap()
+        remove_file(join(root, s"f$i")).unwrap()
+
+    write_text(join(root, "marker"), "").unwrap()
+    one(next(w), ev(Created, join(root, "marker"), id))
+    remove_dir_all(root).unwrap()
+
+@test("fsw a watched directory that can no longer be listed is Overflow under kqueue")
+fsw_overflow_kqueue_unlistable()
+    val root = scratch("unlistable")
+    val d = join(root, "d")
+
+    make_dir(d).unwrap()
+
+    val w = Watcher.open().unwrap()
+    val id = w.add(d).unwrap()
+
+    write_text(join(d, "f"), "").unwrap()
+    set_permissions(d, 0o300).unwrap()
+
+    val got = next(w)
+
+    set_permissions(d, 0o700).unwrap()
+    assert(has(got, Event(Overflow, "", None, None)), s"events: ${got.len()}")
+    assert(has(got, ev(Attributes, d, id)))
+    remove_dir_all(root).unwrap()
+#endif
+
+// -- watches -----------------------------------------------------------------------------------------
+
+@test("fsw a path added twice, or through a symbolic link, answers the watch it already has")
+fsw_add_twice_is_one_watch()
+    val root = scratch("twice")
+    val f = join(root, "f")
+
+    write_text(f, "").unwrap()
+    symlink(f, join(root, "link")).unwrap()
+
+    val w = Watcher.open().unwrap()
+    val a = w.add(f).unwrap()
+
+    assert_eq(w.add(f).unwrap(), a)
+    assert_eq(w.add(join(root, "link")).unwrap(), a)
+    append_text(f, "x").unwrap()
+    one(next(w), ev(Modified, f, a))
+    remove_dir_all(root).unwrap()
+
+@test("fsw a path that does not exist is NotFound, and a watch never added is NotFound to remove")
+fsw_add_missing()
+    val root = scratch("missing")
+    val w = Watcher.open().unwrap()
+
+    assert_eq(w.add(join(root, "nothing")), Err(NotFound))
+    assert_eq(w.remove(Watch(12345)), Err(NotFound))
+    remove_dir_all(root).unwrap()
+
+@test("fsw a removed watch reports nothing more, not even a change made before the remove")
+fsw_remove_stops_events()
+    val root = scratch("remove")
+    val a = join(root, "a")
+    val b = join(root, "b")
+
+    write_text(a, "").unwrap()
+    write_text(b, "").unwrap()
+
+    val w = Watcher.open().unwrap()
+    val wa = w.add(a).unwrap()
+    val wb = w.add(b).unwrap()
+
+    append_text(a, "before").unwrap()
+    w.remove(wa).unwrap()
+    append_text(a, "after").unwrap()
+    append_text(b, "marker").unwrap()
+    one(next(w), ev(Modified, b, wb))
+    assert_eq(w.remove(wa), Err(NotFound))
+    remove_dir_all(root).unwrap()
+
+// -- the watcher -------------------------------------------------------------------------------------
+
+@test("fsw a watcher with nothing to say is not readable and reads nothing, at once")
+fsw_nothing_to_read()
+    val root = scratch("quiet")
+    val w = Watcher.open().unwrap()
+
+    _ = w.add(root).unwrap()
+    assert_eq(w.readable(millis(0)), Ok(false))
+    assert_eq(w.read().unwrap().len(), 0)
+    remove_dir_all(root).unwrap()
+
+@test("fsw a watcher registered with a poller comes back from its wait with its token")
+fsw_poller_reports_the_watcher()
+    val root = scratch("poller")
+    val w = Watcher.open().unwrap()
+    val id = w.add(root).unwrap()
+    val p = Poller.open().unwrap()
+    var got = [poll.Event.none; 4]
+
+    p.register(w.fd().unwrap(), [Readable], 41).unwrap()
+    assert_eq(p.wait(got[..], Some(millis(0))).unwrap(), 0)
+    write_text(join(root, "f"), "").unwrap()
+    assert_eq(p.wait(got[..], Some(millis(5000))).unwrap(), 1)
+    assert_eq(got[0].token, 41)
+    assert(got[0].readable)
+    one(w.read().unwrap(), ev(Created, join(root, "f"), id))
+    assert_eq(p.wait(got[..], Some(millis(0))).unwrap(), 0)
+    remove_dir_all(root).unwrap()
+
+private struct Parked
+    home: Context
+    me: Context
+    w: Watcher
+    got: Buf[Event]
+    woke: int
+
+/** A fiber's whole life: read, and where there is nothing, park until its runtime switches back. It
+ * is only ever resumed by the test that started it, on that test's thread.
+ */
+@pinned(thread)
+private parked(p: *Parked)
+    loop
+        val e = p.w.read().unwrap()
+
+        if e.len() > 0
+            p.got = e
+            p.woke += 1
+        end if
+
+        switch(&p.me, &p.home)
+
+@test("fsw a fiber parked on a watcher's descriptor is woken by its poller when a change lands")
+@pinned(thread)
+fsw_fiber_wakes_on_change()
+    val root = scratch("fiber")
+    val f = join(root, "f")
+
+    write_text(f, "").unwrap()
+
+    val w = Watcher.open().unwrap()
+    val id = w.add(f).unwrap()
+    val s = Stack.reserve(256 * 1024).unwrap()
+    val p: &Parked = Parked(Context.new(), Context.new(), w, buf(), 0)
+    val poller = Poller.open().unwrap()
+    var ready = [poll.Event.none; 4]
+
+    poller.register(w.fd().unwrap(), [Readable], 3).unwrap()
+    p.me = Context.start(s, &parked, &*p)
+    switch(&p.home, &p.me)
+    assert_eq(p.woke, 0)
+    assert_eq(poller.wait(ready[..], Some(millis(0))).unwrap(), 0)
+    append_text(f, "x").unwrap()
+    assert_eq(poller.wait(ready[..], Some(millis(5000))).unwrap(), 1)
+    assert_eq(ready[0].token, 3)
+    switch(&p.home, &p.me)
+    assert_eq(p.woke, 1)
+    one(p.got, ev(Modified, f, id))
+    remove_dir_all(root).unwrap()
+
+@test("fsw a closed watcher answers NotOpen to every call, through every copy, and closes once")
+fsw_close_then_not_open()
+    val root = scratch("close")
+    val w = Watcher.open().unwrap()
+    val copy = w
+
+    _ = w.add(root).unwrap()
+    assert(w.fd().unwrap() >= 0)
+    assert_eq(copy.close(), Ok(()))
+    assert_eq(w.close(), Err(NotOpen))
+    assert_eq(w.fd(), Err(NotOpen))
+    assert_eq(w.add(root), Err(NotOpen))
+    assert_eq(w.read(), Err(NotOpen))
+    assert_eq(w.readable(millis(0)), Err(NotOpen))
+    remove_dir_all(root).unwrap()
+
+// A new descriptor is the lowest one free (POSIX), so after a few thousand watchers have come and
+// gone, the next one's number says whether any of theirs is still open: each leaked would have pushed
+// it up by three -- the kqueue or inotify instance, and under kqueue a descriptor per watched path.
+// Everything else the test process holds at once is far below the bound. A process whose limit is
+// below the count fails sooner, at the `open` that finds none free.
+private const cycles: int = 3000
+
+@test("fsw closing a watcher gives its descriptors back: the next one is as low as the first")
+fsw_close_releases_the_fd()
+    val root = scratch("release")
+
+    write_text(join(root, "f"), "").unwrap()
+
+    for _ in 0..<cycles
+        val w = Watcher.open().unwrap()
+
+        _ = w.add(root).unwrap()
+        _ = w.add(join(root, "f")).unwrap()
+        w.close().unwrap()
+
+    val after = Watcher.open().unwrap()
+
+    assert(after.fd().unwrap() < cycles, s"descriptor ${after.fd().unwrap()} after $cycles watchers")
+    remove_dir_all(root).unwrap()
+
+@test("fsw a watcher's last copy going gives its descriptors back, as close does")
+fsw_drop_releases_the_fd()
+    val root = scratch("drop")
+
+    write_text(join(root, "f"), "").unwrap()
+
+    for _ in 0..<cycles
+        val w = Watcher.open().unwrap()
+        val copy = w
+
+        _ = copy.add(root).unwrap()
+        _ = w.add(join(root, "f")).unwrap()
+
+    val after = Watcher.open().unwrap()
+
+    assert(after.fd().unwrap() < cycles, s"descriptor ${after.fd().unwrap()} after $cycles watchers")
+    remove_dir_all(root).unwrap()
