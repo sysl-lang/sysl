@@ -117,7 +117,7 @@ everything that can affect its bytes:
   `--const-steps`, `--cpu` (by the processor's name and, for `native`, its feature list) and
   `--no-std-lib`;
 - the standard module, and the environment that reaches the toolchain: `SYSL_EXTRA_CFLAGS`,
-  `SYSL_COUNT_ALLOCS`, `WASI_SDK_PATH` and the four Android variables.
+  `SYSL_COUNT_ALLOCS`, `SYSL_COUNT_RETAINS`, `WASI_SDK_PATH` and the four Android variables.
 
 With nothing changed, the same binary runs again; change any of these and the key changes, so a kept
 binary cannot be stale. **A kept binary is also sealed**: a file beside it records the key and the
@@ -1795,6 +1795,68 @@ optimization flag joined to its level. sysl therefore rewrites `-O2` into `-O 2`
 options — only for that letter, and only when something follows it — so a bare `-O` still takes the
 next argument and `--optimize` is unaffected. The rewrite cannot reach the program's own arguments,
 which have already been split off at the `--`.
+
+## Counting what a program does
+
+Three environment variables build or run a program that counts something its output cannot show, and
+says the count on standard error as it exits. Each is a mode of `build`, `run` and `test` for a POSIX
+host — the report is a `dprintf` from an `atexit` — and asks for nothing elsewhere. Only the value `1`
+asks.
+
+| variable | read when | what is said at exit |
+|---|---|---|
+| `SYSL_COUNT_ALLOCS=1` | building | `sysl: N counted allocations still live at exit`, only where `N` is not zero |
+| `SYSL_COUNT_BYTES=1` | running a program built with `SYSL_COUNT_ALLOCS=1` | `sysl: N bytes allocated in all` — every allocation's size added up, never subtracted |
+| `SYSL_COUNT_RETAINS=1` | building | `sysl: N retains, M releases (atomic A/B, views V/W)`, always |
+
+`SYSL_COUNT_RETAINS` counts every share of a counted value the runtime takes and gives back: a `&T`
+copied into a buffer, a closure's capture, a view of a string or a slice kept. `N` and `M` are all of
+them; `A/B` are the atomic ones among them — a `&sync T`, a task, a string shared between threads — and
+`V/W` the views among them. A share of nothing — a static string's — is not counted, nor is a `weak`
+reference's own count (the share `get` takes is). A count starts once module storage is filled, so a
+module-level `val` adds nothing, and ends when the program exits: a program that calls `exit` reports
+what it still held, and one that panics aborts and reports nothing.
+
+What it counts is what the compiler wrote, after its own elision of shares a value did not need: so
+the count is the same at every optimization level, and a change that makes a program take fewer
+shares shows up as a smaller number where the output and the timing say nothing:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+struct Node
+    v: int
+
+look(n: &Node) -> int = n.v
+
+main()
+    val a: &Node = Node(7)
+    var xs: Buf[&Node] = buf()
+    var t = 0
+
+    for i in 0..<5
+        xs.push(a)
+        t += look(a)
+
+    print(t)
+```
+
+```output
+35
+```
+
+```
+$ SYSL_COUNT_RETAINS=1 sysl run nodes.sysl
+sysl: 5 retains, 8 releases (atomic 0/0, views 0/1)
+35
+```
+
+The five pushes are five retains; the five calls to `look`, which only reads its parameter, are none.
+The releases are those five, the node's own, the buffer's, and the buffer's element storage — a view.
+
+The counters are in every module of the program, the standard module's prebuilt half among them, so
+the standard module's artifact is built apart for a counted program, and the run cache keeps a counted
+binary under a key of its own. With nothing set, a build carries no counter and no report at all.
 
 ## The standard module is never named
 
