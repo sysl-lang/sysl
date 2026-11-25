@@ -685,9 +685,78 @@ open_uncached(path: string, create: bool = false) -> Result[File, IoError]
     opened(path, if create then how | fsys.open_create else how)
 end open_uncached
 
-/** The flags are a constant at every call above, which is also why this is private: a program wanting
- * a combination the five names do not cover is asking for the platform's `open`, and that is a good
- * thing to have to say out loud with an `extern` of its own.
+/** What `open_with` is asked to do, said one option at a time: `open_options()` is the empty set, and
+ * each member answers the same set with one more thing asked of the open, so a set reads as a chain --
+ * `open_options().write().create_new().mode(0o600)`. It is the shape a `Walk` has, and a value rather
+ * than a list of parameters so that a program can build one set and open several files with it.
+ *
+ * **Every option reaches the operating system or the open fails**; none is dropped quietly:
+ *
+ * - `read` and `write` say how the file is used. Asking neither reads it, as `open(2)` does with no
+ *   access mode.
+ * - `append` writes at the end of whatever is there at each write, and implies `write`.
+ * - `truncate` empties a file that is there. It needs `write`: an open asking it without is refused
+ *   with `Other(22)` (`EINVAL`) before the call, because POSIX leaves `O_TRUNC` on a file opened only
+ *   for reading unspecified.
+ * - `create` makes the file where it is missing (`O_CREAT`).
+ * - `create_new` makes the file and fails with `AlreadyExists` where anything is there, a symbolic
+ *   link included, dangling or not (`O_CREAT | O_EXCL`): the check and the making are one step, which
+ *   is what a lock file or a never-overwrite save needs and what `exists` followed by `create` is not.
+ * - `sync` makes every write wait until the data and the metadata needed to read it back are on the
+ *   device (`O_SYNC`); `dsync` waits for the data, and for the metadata only where reading the data
+ *   back needs it (`O_DSYNC`, or `O_SYNC` where a C library has no `O_DSYNC`).
+ * - `nofollow` refuses a symbolic link at the last component of the path (`O_NOFOLLOW`): the error
+ *   answers `refused_link()`. A link in a directory above the last component is still followed --
+ *   confining a whole path is `Dir`'s work -- and a chain of links that loops above it is refused the
+ *   same way, since the kernel gives the two one code.
+ * - `mode` is the permission bits a file this open creates is born with, `0o666` unless asked, which
+ *   the process umask narrows exactly as it does for `create`. It applies only when the file is
+ *   created; bits above the twelve permission bits are dropped.
+ *
+ * A target whose C library has no `O_SYNC` or no `O_NOFOLLOW` answers "not supported on this target"
+ * to an open asking for it.
+ */
+struct OpenOptions
+    private flags: u32
+    private bits: u32
+
+    read(self) -> OpenOptions = OpenOptions(self.flags | fsys.open_read, self.bits)
+    write(self) -> OpenOptions = OpenOptions(self.flags | fsys.open_write, self.bits)
+    append(self) -> OpenOptions = OpenOptions(self.flags | fsys.open_write | fsys.open_append, self.bits)
+    truncate(self) -> OpenOptions = OpenOptions(self.flags | fsys.open_truncate, self.bits)
+    create(self) -> OpenOptions = OpenOptions(self.flags | fsys.open_create, self.bits)
+
+    create_new(self) -> OpenOptions =
+        OpenOptions(self.flags | fsys.open_create | fsys.open_exclusive, self.bits)
+
+    sync(self) -> OpenOptions = OpenOptions(self.flags | fsys.open_sync, self.bits)
+    dsync(self) -> OpenOptions = OpenOptions(self.flags | fsys.open_dsync, self.bits)
+    nofollow(self) -> OpenOptions = OpenOptions(self.flags | fsys.open_nofollow, self.bits)
+    mode(self, bits: u32) -> OpenOptions = OpenOptions(self.flags, bits & 0o7777)
+end OpenOptions
+
+/** The empty set of options: a file opened with it is read, and must already be there. */
+open_options() -> OpenOptions = OpenOptions(0, file_mode)
+
+/** A file opened with exactly the options in `options` -- see `OpenOptions` for what each asks of the
+ * operating system and what each failure is.
+ */
+open_with(path: string, options: OpenOptions) -> Result[File, IoError]
+    val flags = options.flags
+
+    if flags & fsys.open_truncate != 0 && flags & fsys.open_write == 0 then return Err(Other(22))
+
+    var fd = 0
+    val code = fsys.open(as_ptr(path.bytes), path.bytes.len, flags, options.bits, &fd)
+
+    if code == -eloop && flags & fsys.open_nofollow != 0 then return Err(Other(link_refused_code))
+    if code != 0 then return Err(from_status(code))
+
+    Ok(adopted(fd))
+end open_with
+
+/** The flags are a constant at every call above, which is also why this is private: a combination the
+ * names above do not cover is `open_with`'s, which says each option out loud.
  */
 private opened(path: string, flags: u32, mode: u32 = file_mode) -> Result[File, IoError]
     var fd = 0

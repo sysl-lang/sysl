@@ -21,7 +21,7 @@ handling away from every program with no operating system to ask. Deciding what 
 
 ## Index
 
-[`append`](#append) [`append_bytes`](#append_bytes) [`append_text`](#append_text) [`cache_dir`](#cache_dir) [`canonicalize`](#canonicalize) [`config_dir`](#config_dir) [`copy_dir_all`](#copy_dir_all) [`copy_file`](#copy_file) [`create`](#create) [`create_update`](#create_update) [`current_dir`](#current_dir) [`data_dir`](#data_dir) [`entries`](#entries) [`entry_bytes`](#entry_bytes) [`exists`](#exists) [`from_errno`](#from_errno) [`hard_link`](#hard_link) [`home_dir`](#home_dir) [`is_dir`](#is_dir) [`is_file`](#is_file) [`is_link`](#is_link) [`link_metadata`](#link_metadata) [`make_dir`](#make_dir) [`make_dir_all`](#make_dir_all) [`make_temp_dir`](#make_temp_dir) [`map_file`](#map_file) [`metadata`](#metadata) [`open`](#open) [`open_dir`](#open_dir) [`open_update`](#open_update) [`page_size`](#page_size) [`pending_name`](#pending_name) [`publish_dir`](#publish_dir) [`publish_file`](#publish_file) [`read_bytes`](#read_bytes) [`read_link`](#read_link) [`read_text`](#read_text) [`readable`](#readable) [`remove_dir`](#remove_dir) [`remove_dir_all`](#remove_dir_all) [`remove_file`](#remove_file) [`rename`](#rename) [`set_current_dir`](#set_current_dir) [`set_modified`](#set_modified) [`set_owner`](#set_owner) [`set_permissions`](#set_permissions) [`size_of`](#size_of) [`symlink`](#symlink) [`truncate`](#truncate) [`walk`](#walk) [`writable`](#writable) [`write_bytes`](#write_bytes) [`write_bytes_atomic`](#write_bytes_atomic) [`write_text`](#write_text) [`write_text_atomic`](#write_text_atomic) [`Advice`](#advice) [`Dir`](#dir) [`Entry`](#entry) [`File`](#file) [`FileState`](#filestate) [`IoError`](#ioerror) [`Kind`](#kind) [`Mapped`](#mapped) [`Matching`](#matching) [`Meta`](#meta) [`Walk`](#walk-1) [Display for IoError](#display-for-ioerror) [Display for Kind](#display-for-kind) [Drop for Dir](#drop-for-dir) [Drop for FileState](#drop-for-filestate) [Drop for Mapped](#drop-for-mapped) [Eq for IoError](#eq-for-ioerror) [Eq for Kind](#eq-for-kind) [Fallible for File](#fallible-for-file) [Iterate for Matching](#iterate-for-matching) [Iterate for Walk](#iterate-for-walk) [Positioned for File](#positioned-for-file) [ReadAt for File](#readat-for-file) [Reader for File](#reader-for-file) [WriteAt for File](#writeat-for-file) [Writer for File](#writer-for-file)
+[`append`](#append) [`append_bytes`](#append_bytes) [`append_text`](#append_text) [`cache_dir`](#cache_dir) [`canonicalize`](#canonicalize) [`config_dir`](#config_dir) [`copy_dir_all`](#copy_dir_all) [`copy_file`](#copy_file) [`create`](#create) [`create_update`](#create_update) [`current_dir`](#current_dir) [`data_dir`](#data_dir) [`entries`](#entries) [`entry_bytes`](#entry_bytes) [`exists`](#exists) [`from_errno`](#from_errno) [`hard_link`](#hard_link) [`home_dir`](#home_dir) [`is_dir`](#is_dir) [`is_file`](#is_file) [`is_link`](#is_link) [`link_metadata`](#link_metadata) [`make_dir`](#make_dir) [`make_dir_all`](#make_dir_all) [`make_temp_dir`](#make_temp_dir) [`map_file`](#map_file) [`metadata`](#metadata) [`open`](#open) [`open_dir`](#open_dir) [`open_options`](#open_options) [`open_uncached`](#open_uncached) [`open_update`](#open_update) [`open_with`](#open_with) [`page_size`](#page_size) [`pending_name`](#pending_name) [`publish_dir`](#publish_dir) [`publish_file`](#publish_file) [`read_bytes`](#read_bytes) [`read_link`](#read_link) [`read_text`](#read_text) [`readable`](#readable) [`remove_dir`](#remove_dir) [`remove_dir_all`](#remove_dir_all) [`remove_file`](#remove_file) [`rename`](#rename) [`rename_no_replace`](#rename_no_replace) [`set_current_dir`](#set_current_dir) [`set_modified`](#set_modified) [`set_owner`](#set_owner) [`set_permissions`](#set_permissions) [`size_of`](#size_of) [`symlink`](#symlink) [`truncate`](#truncate) [`walk`](#walk) [`writable`](#writable) [`write_bytes`](#write_bytes) [`write_bytes_atomic`](#write_bytes_atomic) [`write_text`](#write_text) [`write_text_atomic`](#write_text_atomic) [`Advice`](#advice) [`Dir`](#dir) [`Entry`](#entry) [`File`](#file) [`FileState`](#filestate) [`IoError`](#ioerror) [`Kind`](#kind) [`Mapped`](#mapped) [`MappedMut`](#mappedmut) [`Matching`](#matching) [`Meta`](#meta) [`OpenOptions`](#openoptions) [`Walk`](#walk-1) [Display for IoError](#display-for-ioerror) [Display for Kind](#display-for-kind) [Drop for Dir](#drop-for-dir) [Drop for FileState](#drop-for-filestate) [Drop for Mapped](#drop-for-mapped) [Drop for MappedMut](#drop-for-mappedmut) [Eq for IoError](#eq-for-ioerror) [Eq for Kind](#eq-for-kind) [Fallible for File](#fallible-for-file) [Iterate for Matching](#iterate-for-matching) [Iterate for Walk](#iterate-for-walk) [Positioned for File](#positioned-for-file) [ReadAt for File](#readat-for-file) [Reader for File](#reader-for-file) [WriteAt for File](#writeat-for-file) [Writer for File](#writer-for-file)
 
 ## Functions
 
@@ -144,13 +144,13 @@ intended is the kind of surprise a library should not spring.
 ### `create`
 
 ```sysl
-create(path: string) -> Result[File, IoError]
+create(path: string, mode: u32 = file_mode) -> Result[File, IoError]
 ```
 
 ### `create_update`
 
 ```sysl
-create_update(path: string) -> Result[File, IoError]
+create_update(path: string, mode: u32 = file_mode) -> Result[File, IoError]
 ```
 
 ### `current_dir`
@@ -280,9 +280,10 @@ is_dir(path: string) -> bool
 ```
 
 Whether the path names a directory, asked of `stat` -- which follows a symbolic link, as every
-other question here does. A directory the program may not read or search is still a directory.
-Where the target does not support `stat` at all, it asks whether the path opens as a directory
-instead.
+other question here does. A directory the program may not read or search is still a directory;
+only a path `stat` cannot reach (missing, dangling, under an unsearchable directory) answers
+`false`. Where the target does not support `stat` at all, it asks whether the path opens as a
+directory instead.
 
 ### `is_file`
 
@@ -400,6 +401,13 @@ The three ways a program opens a file, named for what it means rather than for t
 becomes. `open` reads an existing file; `create` makes one, or empties one that was there;
 `append` writes at the end of whatever is there, making the file if it is not.
 
+**`create` and `create_update` take the permission bits a NEW file is born with**, `0o666` by
+default, which the process umask narrows exactly as `open(2)` with `O_CREAT` does. A secret file
+asks `0o600` here and is owner-only from the moment it exists, with no window between creating
+and `set_permissions`. The mode applies only when the file is created: one that already exists
+keeps the mode it has. Bits above the twelve permission bits are dropped, as in `set_permissions`.
+A target with no permission bits ignores the mode.
+
 ### `open_dir`
 
 ```sysl
@@ -412,6 +420,32 @@ A link as the last component of `path` is refused (`refused_link()`), and what i
 is `NotADirectory`. The components above it are the caller's own path and are followed as any path
 is -- `/tmp` is a link on macOS.
 
+### `open_options`
+
+```sysl
+open_options() -> OpenOptions
+```
+
+The empty set of options: a file opened with it is read, and must already be there.
+
+### `open_uncached`
+
+```sysl
+open_uncached(path: string, create: bool = false) -> Result[File, IoError]
+```
+
+A file opened for reading and writing that **bypasses the operating system's page cache**:
+`O_DIRECT` on Linux, `fcntl(F_NOCACHE)` on macOS. A database that keeps its own buffer pool opens
+its files this way so a page is not held twice. `create` makes the file where it is missing and
+never empties one that exists.
+
+**Use it through `read_at` and `write_at`.** The buffered `read` and `write` move odd amounts
+and so do not suit it. On Linux every transfer must have its buffer address, its offset and its
+length at a multiple of the device's block size (512, in practice 4096), and a transfer that does
+not is `Other(22)` (`EINVAL`); macOS has no such rule. A filesystem that refuses the mode (tmpfs
+on older Linux kernels) answers `Other(22)` at the open. A target whose C library has neither
+mechanism answers "not supported on this target".
+
 ### `open_update`
 
 ```sysl
@@ -422,6 +456,15 @@ A file opened for reading **and** writing, which the three above cannot express 
 update mode is a different answer to "and what about what is already there", and naming them apart
 is what keeps a caller from having to know that one fails on a missing file while the other empties
 one that exists.
+
+### `open_with`
+
+```sysl
+open_with(path: string, options: OpenOptions) -> Result[File, IoError]
+```
+
+A file opened with exactly the options in `options` -- see `OpenOptions` for what each asks of the
+operating system and what each failure is.
 
 ### `page_size`
 
@@ -575,6 +618,24 @@ Moves a path to another name, replacing whatever was at the destination.
 It is one operation as far as anything watching is concerned when both paths are on the same
 filesystem, and it fails rather than copying when they are not -- which is `rename(2)`'s contract
 and worth knowing, since a program moving a file across devices has to read and write it itself.
+
+### `rename_no_replace`
+
+```sysl
+rename_no_replace(from: string, to: string) -> Result[unit, IoError]
+```
+
+Moves a path to another name **only where nothing is there**, and reports `AlreadyExists` where
+something is -- a file, a directory, a symbolic link, even a dangling one, and the file being moved
+itself, by the same path or a hard link, where `rename` would succeed doing nothing -- leaving both
+untouched.
+
+The check and the move are one operation in the kernel: `renamex_np` with `RENAME_EXCL` on macOS,
+`renameat2` with `RENAME_NOREPLACE` on Linux. Checking with `exists` and then calling `rename` is a
+race that replaces whatever appears between the two, so **a target with neither call answers "not
+supported on this target"** rather than that. A Linux filesystem that cannot make the promise
+answers `Other(22)` (`EINVAL`). Otherwise it is `rename`: one step to anything watching, and a
+failure rather than a copy across filesystems.
 
 ### `set_current_dir`
 
@@ -815,6 +876,9 @@ easy. While any copy lives the descriptor stays open.
 | `fd` | `fd(self) -> Result[int, IoError]` | The descriptor the file reads and writes through, for a call this module does not make. |
 | `into_raw_fd` | `into_raw_fd(*self) -> Result[int, IoError]` | The descriptor, given rather than lent: the file lets go of it, and closing it is from now on the caller's to do -- Rust's `into_raw_fd`. |
 | `map` | `map(*self) -> Result[&Mapped, IoError]` | The file's bytes, mapped read-only into memory rather than read -- `map_file`, for a file that is already open. |
+| `map_mut` | `map_mut(*self, len: usize = …) -> Result[&MappedMut, IoError]` | The file's bytes mapped readable and writable and shared, so a write through `bytes()` reaches the file. |
+| `sync_data` | `sync_data(*self) -> Result[unit, IoError]` | Hands what is buffered over and asks the device to keep the file's contents, returning once it has -- `sync` without the metadata a reader does not need (`fdatasync` on Linux, which skips an unchanged modification time). |
+| `full_sync` | `full_sync(*self) -> Result[unit, IoError]` | The strongest durability the platform offers: what is buffered is handed over and the device is made to empty its own write cache. |
 | `flush` | `flush(*self) -> Result[unit, IoError]` | Hands over what is buffered. |
 | `close` | `close(*self) -> Result[unit, IoError]` | Releases the descriptor, handing over what is still buffered. |
 | `tell` | `tell(*self) -> Result[long, IoError]` | Where the next read or write will happen, in bytes from the start. |
@@ -822,6 +886,7 @@ easy. While any copy lives the descriptor stays open.
 | `size` | `size(*self) -> Result[long, IoError]` | How many bytes the file holds. |
 | `at_end` | `at_end(*self) -> bool` | Whether a read has already run off the end. |
 | `truncate` | `truncate(*self, length: long) -> Result[unit, IoError]` | The file cut to a length, or extended to one with zeroes -- the one thing this surface could not do, having `seek` and `size` and no way to change what is there. |
+| `set_permissions` | `set_permissions(*self, mode: u32) -> Result[unit, IoError]` | The twelve permission bits of this open file set to `mode` -- `fchmod(2)` on the descriptor, so it changes the file this handle holds whatever the path now names. |
 | `read_failure` | `read_failure(*self) -> Option[IoError]` | What the file latched when a read failed, as the same `IoError` -- the system's own wording and `errno` -- that a whole-file read answers, or `None` while `failed` is false. |
 
 ### `FileState`
@@ -881,7 +946,7 @@ Why a filesystem operation did not happen.
 |---|---|---|
 | `code` | `code(self) -> int` | The number this came from, so a program can report or compare one the set does not name. |
 | `message` | `message(self) -> string` | A sentence, in the terms the operation was asked in rather than in C's. |
-| `refused_link` | `refused_link(self) -> bool` | Whether a `Dir` refused this path because a component of it is a symbolic link -- the last one or any above it, whether the link points inside the directory or out of it. |
+| `refused_link` | `refused_link(self) -> bool` | Whether a `Dir` refused this path because a component of it is a symbolic link -- the last one or any above it, whether the link points inside the directory or out of it -- or `open_with` asked `nofollow` refused it because its last component is one. |
 | `escaped` | `escaped(self) -> bool` | Whether a `Dir` refused this path because it leads out of the directory: an absolute path, a `..` component, or the kernel finding a way out. |
 
 ### `Kind`
@@ -938,6 +1003,33 @@ empty view.
 | `bytes` | `bytes(&self) -> []const u8` | The whole file, read-only. |
 | `advise` | `advise(self, advice: Advice, from: usize = 0, len: usize = …) -> Result[unit, IoError]` | Tells the operating system how `len` bytes from offset `from` are about to be used; `len` left out means to the end of the mapping. |
 
+### `MappedMut`
+
+```sysl
+struct MappedMut
+    private at: *u8
+    private n: usize
+```
+
+A file's bytes mapped shared and writable, from `File.map_mut`: a write through `bytes()` is a
+write to the file.
+
+**Nothing is promised to be on the device until `flush`.** The system writes dirty pages back when
+it chooses, and a program that exits or drops the mapping loses nothing the system has accepted
+(it stays in the page cache and reaches the file), but only `flush` -- and `File.sync_data` or
+`full_sync` after it, for power-loss durability -- says the bytes are out. The mapping is as long
+as the file was when it was made and does not follow it: cutting the file shorter underneath makes
+a read of a page past the new end a signal. Dropping the last reference unmaps it; hold it as a
+`&MappedMut`.
+
+| Member | Signature | Description |
+|---|---|---|
+| `len` | `len(self) -> usize` |  |
+| `is_empty` | `is_empty(self) -> bool` |  |
+| `bytes` | `bytes(&self) -> []u8` | The whole mapping, writable. |
+| `flush` | `flush(self, from: usize = 0, len: usize = …) -> Result[unit, IoError]` | Writes `len` bytes from offset `from` (`len` left out: to the end) to the file and returns once they are there -- `msync(MS_SYNC)`. |
+| `flush_async` | `flush_async(self, from: usize = 0, len: usize = …) -> Result[unit, IoError]` | Schedules the same write-back and returns at once (`msync(MS_ASYNC)`). |
+
 ### `Matching`
 
 ```sysl
@@ -988,6 +1080,58 @@ the library's resolution everywhere and is finer than any filesystem here record
 | `is_dir` | `is_dir(self) -> bool` |  |
 | `is_link` | `is_link(self) -> bool` | Whether the entry **itself** is a symbolic link, which only `link_metadata` can ever answer `true` to: `metadata` follows links, so what it describes is never one. |
 | `same_file` | `same_file(self, other: Meta) -> bool` | Whether two readings name the same file, which is the inode and the device together and is not the path. |
+
+### `OpenOptions`
+
+```sysl
+struct OpenOptions
+    private flags: u32
+    private bits: u32
+```
+
+What `open_with` is asked to do, said one option at a time: `open_options()` is the empty set, and
+each member answers the same set with one more thing asked of the open, so a set reads as a chain --
+`open_options().write().create_new().mode(0o600)`. It is the shape a `Walk` has, and a value rather
+than a list of parameters so that a program can build one set and open several files with it.
+
+**Every option reaches the operating system or the open fails**; none is dropped quietly:
+
+- `read` and `write` say how the file is used. Asking neither reads it, as `open(2)` does with no
+  access mode.
+- `append` writes at the end of whatever is there at each write, and implies `write`.
+- `truncate` empties a file that is there. It needs `write`: an open asking it without is refused
+  with `Other(22)` (`EINVAL`) before the call, because POSIX leaves `O_TRUNC` on a file opened only
+  for reading unspecified.
+- `create` makes the file where it is missing (`O_CREAT`).
+- `create_new` makes the file and fails with `AlreadyExists` where anything is there, a symbolic
+  link included, dangling or not (`O_CREAT | O_EXCL`): the check and the making are one step, which
+  is what a lock file or a never-overwrite save needs and what `exists` followed by `create` is not.
+- `sync` makes every write wait until the data and the metadata needed to read it back are on the
+  device (`O_SYNC`); `dsync` waits for the data, and for the metadata only where reading the data
+  back needs it (`O_DSYNC`, or `O_SYNC` where a C library has no `O_DSYNC`).
+- `nofollow` refuses a symbolic link at the last component of the path (`O_NOFOLLOW`): the error
+  answers `refused_link()`. A link in a directory above the last component is still followed --
+  confining a whole path is `Dir`'s work -- and a chain of links that loops above it is refused the
+  same way, since the kernel gives the two one code.
+- `mode` is the permission bits a file this open creates is born with, `0o666` unless asked, which
+  the process umask narrows exactly as it does for `create`. It applies only when the file is
+  created; bits above the twelve permission bits are dropped.
+
+A target whose C library has no `O_SYNC` or no `O_NOFOLLOW` answers "not supported on this target"
+to an open asking for it.
+
+| Member | Signature | Description |
+|---|---|---|
+| `read` | `read(self) -> OpenOptions` |  |
+| `write` | `write(self) -> OpenOptions` |  |
+| `append` | `append(self) -> OpenOptions` |  |
+| `truncate` | `truncate(self) -> OpenOptions` |  |
+| `create` | `create(self) -> OpenOptions` |  |
+| `create_new` | `create_new(self) -> OpenOptions` |  |
+| `sync` | `sync(self) -> OpenOptions` |  |
+| `dsync` | `dsync(self) -> OpenOptions` |  |
+| `nofollow` | `nofollow(self) -> OpenOptions` |  |
+| `mode` | `mode(self, bits: u32) -> OpenOptions` |  |
 
 ### `Walk`
 
@@ -1068,6 +1212,12 @@ its output arrived calls `close` and reads the answer.
 
 ```sysl
 impl Drop for Mapped
+```
+
+### Drop for MappedMut
+
+```sysl
+impl Drop for MappedMut
 ```
 
 ### Eq for IoError

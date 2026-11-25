@@ -1,0 +1,697 @@
+module sysl.fs
+@requires(os)
+@tests
+
+// `open_with` and its `OpenOptions`, and `rename_no_replace`.
+//
+// **Each option is checked at the operating system, not at the flag word**: an exclusive create is
+// shown failing on something that is there, `nofollow` failing on a link, a mode read back through
+// `metadata`, and `sync` and `dsync` read back from the descriptor with `fcntl(F_GETFL)`, against a
+// plain open of the same file that must not carry them. Every test has a directory of its own.
+
+private ignore(r: Result[unit, IoError]) = ()
+
+private scratch(name: string) -> string
+    val dir = "/tmp/sysl-fs-opw-" + name
+
+    ignore(remove_dir_all(dir))
+    make_dir(dir).unwrap()
+    dir
+end scratch
+
+private shut(f: File)
+    var g = f
+
+    g.close().unwrap()
+end shut
+
+// The file status flags as the kernel holds them, and the bits `O_SYNC` and `O_DSYNC` are there.
+// Linux spells `O_SYNC` as `__O_SYNC | O_DSYNC`, so the `sync` bit tested there is the one only
+// `O_SYNC` sets.
+private extern "fcntl" c_fcntl(fd: int, cmd: int, ...) -> int
+
+private const f_getfl: int = 3
+
+#if bsd
+private const sync_bit: int = 0x80
+private const dsync_bit: int = 0x400000
+#else
+private const sync_bit: int = 0x100000
+private const dsync_bit: int = 0x1000
+#endif
+
+private status_flags(f: File) -> int = c_fcntl(f.fd().unwrap(), f_getfl)
+
+// -- create_new: O_CREAT | O_EXCL ------------------------------------------------------------------
+
+@test("opw_fs create_new makes a file that is not there, and writes to it")
+opw_fs_create_new_fresh()
+    val dir = scratch("new-fresh")
+    val path = dir + "/f"
+
+    var f = open_with(path, open_options().write().create_new()).unwrap()
+
+    f.write("made".bytes)
+    shut(f)
+
+    assert_eq(read_text(path).unwrap(), "made")
+
+    ignore(remove_dir_all(dir))
+end opw_fs_create_new_fresh
+
+@test("opw_fs create_new on an existing file is AlreadyExists and leaves it alone")
+opw_fs_create_new_existing()
+    val dir = scratch("new-exist")
+    val path = dir + "/f"
+
+    write_text(path, "kept").unwrap()
+
+    assert_eq(open_with(path, open_options().write().create_new()).unwrap_err(), AlreadyExists)
+    assert_eq(open_with(path, open_options().write().create_new().truncate()).unwrap_err(),
+              AlreadyExists)
+    assert_eq(read_text(path).unwrap(), "kept")
+
+    ignore(remove_dir_all(dir))
+end opw_fs_create_new_existing
+
+@test("opw_fs create_new on a dangling link is AlreadyExists and does not make its target")
+opw_fs_create_new_dangling_link()
+    val dir = scratch("new-dangle")
+    val link = dir + "/l"
+
+    symlink(dir + "/nowhere", link).unwrap()
+
+    assert_eq(open_with(link, open_options().write().create_new()).unwrap_err(), AlreadyExists)
+    assert(!exists(dir + "/nowhere"), "the link's target was created")
+
+    ignore(remove_dir_all(dir))
+end opw_fs_create_new_dangling_link
+
+@test("opw_fs create_new on a directory is AlreadyExists")
+opw_fs_create_new_directory()
+    val dir = scratch("new-dir")
+
+    assert_eq(open_with(dir, open_options().write().create_new()).unwrap_err(), AlreadyExists)
+
+    ignore(remove_dir_all(dir))
+end opw_fs_create_new_directory
+
+@test("opw_fs create without create_new opens what is there and keeps its bytes")
+opw_fs_create_existing_keeps()
+    val dir = scratch("create-keep")
+    val path = dir + "/f"
+
+    write_text(path, "abc").unwrap()
+
+    shut(open_with(path, open_options().write().create()).unwrap())
+
+    assert_eq(read_text(path).unwrap(), "abc")
+
+    ignore(remove_dir_all(dir))
+end opw_fs_create_existing_keeps
+
+@test("opw_fs no create on a missing file is NotFound, and nothing is made")
+opw_fs_missing_without_create()
+    val dir = scratch("missing")
+    val path = dir + "/f"
+
+    assert_eq(open_with(path, open_options().write()).unwrap_err(), NotFound)
+    assert_eq(open_with(path, open_options()).unwrap_err(), NotFound)
+    assert(!exists(path), "an open without create made the file")
+
+    ignore(remove_dir_all(dir))
+end opw_fs_missing_without_create
+
+// -- read, write, append, truncate -----------------------------------------------------------------
+
+@test("opw_fs the empty set reads an existing file")
+opw_fs_empty_set_reads()
+    val dir = scratch("read")
+    val path = dir + "/f"
+
+    write_text(path, "hello").unwrap()
+
+    var f = open_with(path, open_options()).unwrap()
+    var into: [8]u8 = [0; 8]
+
+    assert_eq(f.read(into[..]).len, 5)
+    shut(f)
+
+    var g = open_with(path, open_options().read()).unwrap()
+
+    assert_eq(g.read(into[..]).len, 5)
+    shut(g)
+
+    ignore(remove_dir_all(dir))
+end opw_fs_empty_set_reads
+
+@test("opw_fs truncate with write empties the file")
+opw_fs_truncate_empties()
+    val dir = scratch("trunc")
+    val path = dir + "/f"
+
+    write_text(path, "longer text").unwrap()
+
+    var f = open_with(path, open_options().write().truncate()).unwrap()
+
+    f.write("ab".bytes)
+    shut(f)
+
+    assert_eq(read_text(path).unwrap(), "ab")
+
+    ignore(remove_dir_all(dir))
+end opw_fs_truncate_empties
+
+@test("opw_fs truncate without write is refused with EINVAL before the file is touched")
+opw_fs_truncate_without_write()
+    val dir = scratch("trunc-ro")
+    val path = dir + "/f"
+
+    write_text(path, "kept").unwrap()
+
+    assert_eq(open_with(path, open_options().truncate()).unwrap_err(), Other(22))
+    assert_eq(open_with(path, open_options().read().truncate()).unwrap_err(), Other(22))
+    assert_eq(read_text(path).unwrap(), "kept")
+
+    ignore(remove_dir_all(dir))
+end opw_fs_truncate_without_write
+
+@test("opw_fs append writes at the end of what is there, and implies write")
+opw_fs_append_at_end()
+    val dir = scratch("append")
+    val path = dir + "/f"
+
+    write_text(path, "one ").unwrap()
+
+    var f = open_with(path, open_options().append()).unwrap()
+
+    f.write("two".bytes)
+    shut(f)
+
+    assert_eq(read_text(path).unwrap(), "one two")
+
+    ignore(remove_dir_all(dir))
+end opw_fs_append_at_end
+
+@test("opw_fs an options value is not changed by a chain built on it")
+opw_fs_options_are_values()
+    val dir = scratch("values")
+    val path = dir + "/f"
+    val base = open_options().write()
+    val making = base.create_new()
+
+    assert_eq(open_with(path, base).unwrap_err(), NotFound)
+
+    shut(open_with(path, making).unwrap())
+
+    assert_eq(open_with(path, making).unwrap_err(), AlreadyExists)
+    shut(open_with(path, base).unwrap())
+
+    ignore(remove_dir_all(dir))
+end opw_fs_options_are_values
+
+// -- mode ------------------------------------------------------------------------------------------
+
+@test("opw_fs mode is the permission bits a created file is born with")
+opw_fs_mode_on_create()
+    val dir = scratch("mode")
+    val path = dir + "/f"
+    val other = dir + "/g"
+
+    shut(open_with(path, open_options().write().create_new().mode(0o600)).unwrap())
+    shut(open_with(other, open_options().write().create().mode(0o640)).unwrap())
+
+    assert_eq(metadata(path).unwrap().permissions(), 0o600)
+    assert_eq(metadata(other).unwrap().permissions(), 0o640)
+
+    ignore(remove_dir_all(dir))
+end opw_fs_mode_on_create
+
+@test("opw_fs mode leaves an existing file's bits alone, and bits above the twelve are dropped")
+opw_fs_mode_existing_and_high_bits()
+    val dir = scratch("mode-exist")
+    val path = dir + "/f"
+    val high = dir + "/h"
+
+    write_text(path, "x").unwrap()
+    set_permissions(path, 0o644).unwrap()
+
+    shut(open_with(path, open_options().write().create().mode(0o600)).unwrap())
+
+    assert_eq(metadata(path).unwrap().permissions(), 0o644)
+
+    shut(open_with(high, open_options().write().create_new().mode(0o100640)).unwrap())
+
+    assert_eq(metadata(high).unwrap().permissions(), 0o640)
+
+    ignore(remove_dir_all(dir))
+end opw_fs_mode_existing_and_high_bits
+
+@test("opw_fs without mode a created file gets 0o666 narrowed by the umask, as create does")
+opw_fs_mode_default()
+    val dir = scratch("mode-def")
+    val path = dir + "/f"
+    val plain = dir + "/g"
+
+    shut(open_with(path, open_options().write().create_new()).unwrap())
+    shut(create(plain).unwrap())
+
+    assert_eq(metadata(path).unwrap().permissions(), metadata(plain).unwrap().permissions())
+
+    ignore(remove_dir_all(dir))
+end opw_fs_mode_default
+
+// -- nofollow --------------------------------------------------------------------------------------
+
+@test("opw_fs nofollow refuses a link at the last component, and the target is untouched")
+opw_fs_nofollow_refuses_link()
+    val dir = scratch("nofollow")
+    val target = dir + "/t"
+    val link = dir + "/l"
+
+    write_text(target, "kept").unwrap()
+    symlink(target, link).unwrap()
+
+    val e = open_with(link, open_options().nofollow()).unwrap_err()
+
+    assert(e.refused_link(), "nofollow opened a symbolic link")
+    assert_eq(e.message(), "the path goes through a symbolic link")
+
+    val w = open_with(link, open_options().write().truncate().nofollow()).unwrap_err()
+
+    assert(w.refused_link(), "nofollow opened a symbolic link for writing")
+    assert_eq(read_text(target).unwrap(), "kept")
+
+    // Without it the same link is followed: the refusal above is the option's.
+    shut(open_with(link, open_options()).unwrap())
+
+    ignore(remove_dir_all(dir))
+end opw_fs_nofollow_refuses_link
+
+@test("opw_fs nofollow with create refuses a dangling link rather than making its target")
+opw_fs_nofollow_dangling_create()
+    val dir = scratch("nofollow-dangle")
+    val link = dir + "/l"
+
+    symlink(dir + "/nowhere", link).unwrap()
+
+    assert(open_with(link, open_options().write().create().nofollow()).unwrap_err().refused_link(),
+           "nofollow followed a dangling link")
+    assert(!exists(dir + "/nowhere"), "the link's target was created")
+
+    // create_new is checked first: anything at the path, a link included, is AlreadyExists.
+    assert_eq(open_with(link, open_options().write().create_new().nofollow()).unwrap_err(),
+              AlreadyExists)
+
+    ignore(remove_dir_all(dir))
+end opw_fs_nofollow_dangling_create
+
+@test("opw_fs nofollow opens a plain file, and follows a link above the last component")
+opw_fs_nofollow_plain_and_parent_link()
+    val dir = scratch("nofollow-parent")
+    val real = dir + "/real"
+    val via = dir + "/via"
+
+    make_dir(real).unwrap()
+    write_text(real + "/f", "inside").unwrap()
+    symlink(real, via).unwrap()
+
+    shut(open_with(real + "/f", open_options().nofollow()).unwrap())
+    shut(open_with(via + "/f", open_options().nofollow()).unwrap())
+
+    ignore(remove_dir_all(dir))
+end opw_fs_nofollow_plain_and_parent_link
+
+@test("opw_fs an ELOOP without nofollow is an ordinary error, not a refused link")
+opw_fs_loop_without_nofollow()
+    val dir = scratch("loop")
+    val a = dir + "/a"
+    val b = dir + "/b"
+
+    symlink(b, a).unwrap()
+    symlink(a, b).unwrap()
+
+    val e = open_with(a, open_options()).unwrap_err()
+
+    assert(!e.refused_link(), "a loop without nofollow was called a refused link")
+    assert_eq(e.code(), eloop)
+
+    ignore(remove_dir_all(dir))
+end opw_fs_loop_without_nofollow
+
+@test("opw_fs nofollow refuses a link to a directory too")
+opw_fs_nofollow_dir_link()
+    val dir = scratch("nofollow-dirlink")
+    val sub = dir + "/sub"
+    val link = dir + "/l"
+
+    make_dir(sub).unwrap()
+    symlink(sub, link).unwrap()
+
+    assert(open_with(link, open_options().nofollow()).unwrap_err().refused_link(),
+           "nofollow opened a link to a directory")
+
+    ignore(remove_dir_all(dir))
+end opw_fs_nofollow_dir_link
+
+// -- the operating system's own refusals, through open_with ----------------------------------------
+
+@test("opw_fs a mode of 0 is a file nobody may open, and a 0o444 file refuses write")
+opw_fs_mode_refuses()
+    val dir = scratch("mode-refuse")
+    val zero = dir + "/z"
+    val ro = dir + "/r"
+
+    shut(open_with(zero, open_options().write().create_new().mode(0)).unwrap())
+
+    assert_eq(metadata(zero).unwrap().permissions(), 0)
+    assert_eq(open_with(zero, open_options()).unwrap_err(), PermissionDenied)
+
+    shut(open_with(ro, open_options().write().create_new().mode(0o444)).unwrap())
+
+    assert_eq(open_with(ro, open_options().write()).unwrap_err(), PermissionDenied)
+    assert_eq(open_with(ro, open_options().append()).unwrap_err(), PermissionDenied)
+    shut(open_with(ro, open_options()).unwrap())
+
+    ignore(remove_dir_all(dir))
+end opw_fs_mode_refuses
+
+@test("opw_fs a directory opens to read and refuses write; a file as a parent is NotADirectory")
+opw_fs_directory_and_file_parent()
+    val dir = scratch("dirs")
+    val f = dir + "/f"
+
+    write_text(f, "x").unwrap()
+
+    assert_eq(open_with(dir, open_options().write()).unwrap_err(), IsADirectory)
+    shut(open_with(dir, open_options()).unwrap())
+    assert_eq(open_with(f + "/x", open_options().write().create()).unwrap_err(), NotADirectory)
+    assert_eq(open_with("", open_options()).unwrap_err(), NotFound)
+
+    ignore(remove_dir_all(dir))
+end opw_fs_directory_and_file_parent
+
+@test("opw_fs create without write makes the file and opens it for reading")
+opw_fs_create_read_only()
+    val dir = scratch("create-ro")
+    val path = dir + "/f"
+
+    var f = open_with(path, open_options().create().mode(0o640)).unwrap()
+    var into: [4]u8 = [0; 4]
+
+    assert_eq(f.read(into[..]).len, 0)
+    shut(f)
+
+    assert(exists(path), "create without write made nothing")
+    assert_eq(metadata(path).unwrap().permissions(), 0o640)
+
+    ignore(remove_dir_all(dir))
+end opw_fs_create_read_only
+
+@test("opw_fs append with create makes a missing file, and truncate with append empties it first")
+opw_fs_append_create_and_truncate()
+    val dir = scratch("append-create")
+    val path = dir + "/f"
+
+    var f = open_with(path, open_options().append().create()).unwrap()
+
+    f.write("a".bytes)
+    shut(f)
+
+    var g = open_with(path, open_options().append().create()).unwrap()
+
+    g.write("b".bytes)
+    shut(g)
+
+    assert_eq(read_text(path).unwrap(), "ab")
+
+    var h = open_with(path, open_options().append().truncate()).unwrap()
+
+    h.write("c".bytes)
+    shut(h)
+
+    assert_eq(read_text(path).unwrap(), "c")
+
+    ignore(remove_dir_all(dir))
+end opw_fs_append_create_and_truncate
+
+@test("opw_fs read and write together on a create_new file read back what was written")
+opw_fs_update_round_trip()
+    val dir = scratch("update")
+    val path = dir + "/f"
+
+    var f = open_with(path, open_options().read().write().create_new().sync()).unwrap()
+
+    f.write("round".bytes)
+    f.seek(0).unwrap()
+
+    var into: [8]u8 = [0; 8]
+
+    assert_eq(f.read(into[..]).len, 5)
+    assert_eq(into[0], u8('r'))
+    shut(f)
+
+    ignore(remove_dir_all(dir))
+end opw_fs_update_round_trip
+
+@test("opw_fs an options value crosses a function, a field and a closure unchanged")
+opw_fs_options_travel()
+    val dir = scratch("travel")
+    val held = Held(open_options().write().create_new().mode(0o600))
+    val open_in = (name: string) -> open_with(dir + "/" + name, held.options)
+
+    shut(open_in("a").unwrap())
+    shut(opening(dir + "/b", held.options).unwrap())
+
+    assert_eq(open_in("a").unwrap_err(), AlreadyExists)
+    assert_eq(metadata(dir + "/a").unwrap().permissions(), 0o600)
+    assert_eq(metadata(dir + "/b").unwrap().permissions(), 0o600)
+
+    ignore(remove_dir_all(dir))
+end opw_fs_options_travel
+
+private struct Held
+    options: OpenOptions
+
+private opening(path: string, options: OpenOptions) -> Result[File, IoError] = open_with(path, options)
+
+@test("opw_fs a failure leaves no descriptor behind: many refused opens in a row still leave room")
+opw_fs_failures_do_not_leak()
+    val dir = scratch("leak")
+    val path = dir + "/f"
+
+    write_text(path, "x").unwrap()
+
+    for i in 0..<4096
+        assert_eq(open_with(path, open_options().write().create_new()).unwrap_err(), AlreadyExists)
+
+    shut(open_with(path, open_options()).unwrap())
+
+    ignore(remove_dir_all(dir))
+end opw_fs_failures_do_not_leak
+
+// -- sync and dsync --------------------------------------------------------------------------------
+
+@test("opw_fs sync reaches the descriptor as O_SYNC, and a plain open has no such bit")
+opw_fs_sync_reaches_the_os()
+    val dir = scratch("sync")
+    val path = dir + "/f"
+
+    var f = open_with(path, open_options().write().create_new().sync()).unwrap()
+
+    assert(status_flags(f) & sync_bit == sync_bit, "O_SYNC is not on the descriptor")
+    f.write("durable".bytes)
+    shut(f)
+
+    var plain = open_with(path, open_options().write()).unwrap()
+
+    assert_eq(status_flags(plain) & sync_bit, 0)
+    shut(plain)
+
+    assert_eq(read_text(path).unwrap(), "durable")
+
+    ignore(remove_dir_all(dir))
+end opw_fs_sync_reaches_the_os
+
+@test("opw_fs dsync reaches the descriptor as O_DSYNC, and a plain open has no such bit")
+opw_fs_dsync_reaches_the_os()
+    val dir = scratch("dsync")
+    val path = dir + "/f"
+
+    var f = open_with(path, open_options().write().create_new().dsync()).unwrap()
+
+    assert(status_flags(f) & dsync_bit == dsync_bit, "O_DSYNC is not on the descriptor")
+    f.write("data".bytes)
+    shut(f)
+
+    var plain = open_with(path, open_options().read()).unwrap()
+
+    assert_eq(status_flags(plain) & dsync_bit, 0)
+    shut(plain)
+
+    assert_eq(read_text(path).unwrap(), "data")
+
+    ignore(remove_dir_all(dir))
+end opw_fs_dsync_reaches_the_os
+
+// -- a path that is a slice of a longer string -----------------------------------------------------
+
+@test("opw_fs open_with and rename_no_replace read a sliced path to its end and no further")
+opw_fs_sliced_paths()
+    val dir = scratch("sliced")
+    val path = dir + "/f"
+    val longer = path + "-and-more"
+
+    shut(open_with(longer[0..<path.bytes.len], open_options().write().create_new()).unwrap())
+
+    assert(exists(path), "the sliced path was not the one created")
+    assert(!exists(longer), "the bytes after the slice were read")
+
+    val to = dir + "/g"
+    val to_longer = to + "-and-more"
+
+    rename_no_replace(longer[0..<path.bytes.len], to_longer[0..<to.bytes.len]).unwrap()
+
+    assert(exists(to) && !exists(path) && !exists(to_longer), "the sliced rename went elsewhere")
+
+    ignore(remove_dir_all(dir))
+end opw_fs_sliced_paths
+
+// -- rename_no_replace -----------------------------------------------------------------------------
+
+@test("opw_fs rename_no_replace moves a file to a free name")
+opw_fs_rename_free()
+    val dir = scratch("rn-free")
+    val a = dir + "/a"
+    val b = dir + "/b"
+
+    write_text(a, "moved").unwrap()
+    rename_no_replace(a, b).unwrap()
+
+    assert(!exists(a), "the old name is still there")
+    assert_eq(read_text(b).unwrap(), "moved")
+
+    ignore(remove_dir_all(dir))
+end opw_fs_rename_free
+
+@test("opw_fs rename_no_replace onto an existing file is AlreadyExists and changes neither")
+opw_fs_rename_onto_file()
+    val dir = scratch("rn-file")
+    val a = dir + "/a"
+    val b = dir + "/b"
+
+    write_text(a, "from").unwrap()
+    write_text(b, "to").unwrap()
+
+    val e = rename_no_replace(a, b).unwrap_err()
+
+    assert_eq(e, AlreadyExists)
+    assert_eq(e.message(), "already exists")
+    assert_eq(read_text(a).unwrap(), "from")
+    assert_eq(read_text(b).unwrap(), "to")
+
+    // The replacing rename on the same pair does replace: the refusal is this call's.
+    rename(a, b).unwrap()
+
+    assert_eq(read_text(b).unwrap(), "from")
+
+    ignore(remove_dir_all(dir))
+end opw_fs_rename_onto_file
+
+@test("opw_fs rename_no_replace onto a dangling link or a directory is AlreadyExists")
+opw_fs_rename_onto_link_and_dir()
+    val dir = scratch("rn-link")
+    val a = dir + "/a"
+    val link = dir + "/l"
+    val sub = dir + "/d"
+
+    write_text(a, "x").unwrap()
+    symlink(dir + "/nowhere", link).unwrap()
+    make_dir(sub).unwrap()
+
+    assert_eq(rename_no_replace(a, link).unwrap_err(), AlreadyExists)
+    assert(is_link(link), "the link was replaced")
+    assert_eq(rename_no_replace(a, sub).unwrap_err(), AlreadyExists)
+    assert(is_dir(sub), "the directory was replaced")
+    assert_eq(read_text(a).unwrap(), "x")
+
+    ignore(remove_dir_all(dir))
+end opw_fs_rename_onto_link_and_dir
+
+@test("opw_fs rename_no_replace of a file onto its own name or a hard link to it is AlreadyExists")
+opw_fs_rename_same_file()
+    val dir = scratch("rn-same")
+    val a = dir + "/a"
+    val twin = dir + "/twin"
+
+    write_text(a, "one").unwrap()
+    hard_link(a, twin).unwrap()
+
+    assert_eq(rename_no_replace(a, a).unwrap_err(), AlreadyExists)
+    assert_eq(rename_no_replace(a, twin).unwrap_err(), AlreadyExists)
+    assert(exists(a) && exists(twin), "a name of the file went")
+
+    // `rename` keeps its rule: two names of one file is success with nothing done.
+    rename(a, a).unwrap()
+
+    assert_eq(read_text(a).unwrap(), "one")
+
+    ignore(remove_dir_all(dir))
+end opw_fs_rename_same_file
+
+@test("opw_fs rename_no_replace moves a link itself, never what it points at")
+opw_fs_rename_moves_the_link()
+    val dir = scratch("rn-moves-link")
+    val target = dir + "/t"
+    val link = dir + "/l"
+    val moved = dir + "/m"
+
+    write_text(target, "t").unwrap()
+    symlink(target, link).unwrap()
+    rename_no_replace(link, moved).unwrap()
+
+    assert(is_link(moved), "the link was not moved as a link")
+    assert_eq(read_link(moved).unwrap(), target)
+    assert_eq(read_text(target).unwrap(), "t")
+
+    ignore(remove_dir_all(dir))
+end opw_fs_rename_moves_the_link
+
+@test("opw_fs rename_no_replace's failures: no parent, a file as a parent, an empty name, a name too long")
+opw_fs_rename_failures()
+    val dir = scratch("rn-fail")
+    val a = dir + "/a"
+
+    write_text(a, "x").unwrap()
+
+    assert_eq(rename_no_replace(a, dir + "/none/b").unwrap_err(), NotFound)
+    assert_eq(rename_no_replace(a, a + "/b").unwrap_err(), NotADirectory)
+    assert_eq(rename_no_replace("", dir + "/b").unwrap_err(), NotFound)
+
+    var long = dir + "/"
+
+    for i in 0..<5000
+        long += "n"
+
+    assert(rename_no_replace(a, long).is_err(), "a name past the room was renamed to")
+    assert_eq(read_text(a).unwrap(), "x")
+
+    ignore(remove_dir_all(dir))
+end opw_fs_rename_failures
+
+@test("opw_fs rename_no_replace moves a directory, and a missing source is NotFound")
+opw_fs_rename_dir_and_missing()
+    val dir = scratch("rn-dir")
+    val from = dir + "/d"
+    val to = dir + "/e"
+
+    make_dir(from).unwrap()
+    write_text(from + "/f", "in").unwrap()
+    rename_no_replace(from, to).unwrap()
+
+    assert_eq(read_text(to + "/f").unwrap(), "in")
+    assert_eq(rename_no_replace(dir + "/none", dir + "/other").unwrap_err(), NotFound)
+    assert(!exists(dir + "/other"), "a failed rename made its destination")
+
+    ignore(remove_dir_all(dir))
+end opw_fs_rename_dir_and_missing
