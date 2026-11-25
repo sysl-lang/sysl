@@ -1,0 +1,38 @@
+module sysl.fs
+@requires(os)
+
+import sysl.fs.sys as fsys
+import sysl.slices.as_ptr
+
+/** How big a filesystem is and how much of it is unused, in bytes -- one `statvfs` reading.
+ *
+ * **`free` and `available` are two answers because a filesystem keeps a reserve**: `free` is every
+ * unused byte, and `available` is the part of it a program not acting as user 0 may take, which is
+ * the one a program checking whether its write will fit compares against. So `available <= free <=
+ * total` on every filesystem, and the two are equal where nothing is held back.
+ */
+struct Space
+    total: u64
+    free: u64
+    available: u64
+end Space
+
+/** The size and the unused bytes of the filesystem that holds `path`, which may name a file or a
+ * directory anywhere on it and is followed through a symbolic link. Each number is a block count of
+ * POSIX's `statvfs` times its fragment size, `f_frsize`, which is the unit those counts are in.
+ *
+ * **It is a reading, not a reservation**: another program can take what was free before the next write
+ * lands, so a program that must not run out still handles the write's own `NoSpaceLeft`. A
+ * path that is not there is `NotFound`; a target that cannot say reports `unsupported()`.
+ */
+space(path: string) -> Result[Space, IoError]
+    var total: u64 = 0
+    var free: u64 = 0
+    var available: u64 = 0
+
+    val code = fsys.space(as_ptr(path.bytes), path.bytes.len, &total, &free, &available)
+
+    if code != 0 then return Err(from_status(code))
+
+    Ok(Space(total, free, available))
+end space
