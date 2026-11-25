@@ -1,0 +1,217 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.from_int
+import sysl.env.{get as env_var}
+import sysl.text.Search
+
+// **Counting the references**: a build in which every share the runtime takes and gives back is
+// counted, and the program says at exit how many there were.
+//
+// A missed elision, a copy where a move was meant, a closure that retains what it only reads: none
+// of them changes what a program prints, and a timing only says "slower". A count says exactly how
+// many, so a test can pin it. `SYSL_COUNT_RETAINS=1` asks for it on any command that builds a
+// program for a POSIX host -- the report is `dprintf` from an `atexit`, which only a POSIX host is
+// sure to have -- and nothing else changes: the same program, the same elisions, one more line.
+//
+// **What is counted is what the runtime performs**: each call of a share-taking or share-giving
+// function the emitted code still makes after the compiler's own elision, and the per-type release
+// helpers' own decrements. A share of nothing -- a null owner, a static string's -- is no work and is
+// not counted. A weak reference's count is not a share and is not counted either. What LLVM folds
+// afterwards is not seen: the count is of the calls the compiler wrote.
+//
+// **Three tallies, each a retain and a release**: every share in all; the atomic ones among them (a
+// `&sync T`, a task, a view whose owner is marked shared); and the views among them (a string or a
+// slice, whose owner the `_maybe` pair counts). A shared view's change is in both of the last two.
+//
+// **The counters are one weak global every module with any of the runtime defines**, so a program
+// split into codegen units and the standard module's prebuilt half share one set; the increments are
+// relaxed atomics, because two threads each taking plain shares of their own objects still change
+// the same counter. The standard module's artifact is keyed by the choice (`retain_counting_key`), so
+// a counted build never links an uncounted one.
+//
+// **When the report is made**: like the counted heap's, after module storage is filled the counters
+// are cleared and the report registered with `atexit` -- so a computed `val`'s shares are not in it,
+// and a `main` that returned has given back everything it held. The report is registered before the
+// counted heap's, so where both are asked for the heap's line comes first. The line is always made,
+// zero included: asking for the count is asking for the line.
+
+// Set by a test that builds in-process, where setting the environment would reach every other test.
+private var retain_counting_forced: bool = false
+
+force_retain_counting(on: bool)
+    retain_counting_forced = on
+
+// Whether this command was asked to count shares: by `SYSL_COUNT_RETAINS=1`, or by a test.
+retain_counting_asked() -> bool =
+    retain_counting_forced || env_var("SYSL_COUNT_RETAINS").unwrap_or("") == "1"
+
+// Settled once per command by the driver, beside the allocator and for the same reason: every module
+// of the program, the standard module's artifact included, has to agree.
+private var retain_counting_on: bool = false
+
+retain_counting_active() -> bool = retain_counting_on
+
+use_retain_counting(on: bool)
+    retain_counting_on = on
+end use_retain_counting
+
+// What the choice adds to an artifact's key: nothing for the default, so an ordinary build's path is
+// unchanged.
+retain_counting_key() -> string = if retain_counting_on then "-rc" else ""
+
+// The counters' symbol. A C-reserved name, so no program's own symbol can be it.
+retain_counts_symbol() -> string = "__sysl_retain_counts"
+
+// The slots of the counters, in the order the report says them.
+val RetainAll = 0
+val ReleaseAll = 1
+val RetainAtomic = 2
+val ReleaseAtomic = 3
+val RetainView = 4
+val ReleaseView = 5
+private val RetainSlots = 6
+
+// The counters, as every module that changes one defines them.
+retain_counts_text(word: string) -> string =
+    s"@${retain_counts_symbol()} = weak global [$RetainSlots x $word] zeroinitializer\n"
+
+// The lines a runtime template adds to count into `slot`, or nothing where counting is off: what
+// keeps the instrument out of an ordinary build. Each register is named by its slot, so a body adds
+// each slot once.
+retain_count_lines(word: string, slots: []const int) -> string
+    if !retain_counting_on then return ""
+
+    var out = ""
+
+    for slot in slots
+        out = out + s"  %counted.$slot = atomicrmw add ptr getelementptr inbounds ([$RetainSlots x $word], " +
+            s"ptr @${retain_counts_symbol()}, i32 0, i32 $slot), $word 1 monotonic\n"
+
+    out
+end retain_count_lines
+
+// The same, emitted into a body the emitter builds (`emit_arc.sysl`'s per-type releases).
+gen_retain_count(e: *Emit, slot: int)
+    if !retain_counting_on then return
+
+    val word = word_lty(e)
+    val at = fresh_reg(e)
+    var indices: Buf[IrArg] = buf()
+
+    indices.push(ir_arg(LInt(32), VInt(from_int(0))))
+    indices.push(ir_arg(LInt(32), VInt(from_int(long(slot)))))
+    emit(e, InGep(at, LArr(RetainSlots, word), VGlobal(retain_counts_symbol()), indices))
+    emit(e, InAtomicRmw(fresh_reg(e), RmwAdd, at, word, VInt(from_int(1)), OrdRelaxed))
+end gen_retain_count
+
+// What a counted program says at exit, as the `dprintf` format.
+private retain_count_format() -> string =
+    "sysl: %zu retains, %zu releases (atomic %zu/%zu, views %zu/%zu)"
+
+// The words after the first number, which is what the report is found by.
+retain_count_said() -> string = "retains, "
+
+// The mark and the report, as the entry module carries them.
+private retain_report_text(word: string) -> string
+    val said = retain_count_format()
+    val counts = retain_counts_symbol()
+    val arr = s"[$RetainSlots x $word]"
+    var clear = ""
+    var loads = ""
+    var args = ""
+
+    for i in 0..<RetainSlots
+        clear = clear + s"  store atomic $word 0, ptr getelementptr inbounds ($arr, ptr @$counts, i32 0, i32 $i) " +
+            s"monotonic, align ${word_bytes_of(word)}\n"
+        loads = loads + s"  %c$i = load atomic $word, ptr getelementptr inbounds ($arr, ptr @$counts, i32 0, i32 $i) " +
+            s"monotonic, align ${word_bytes_of(word)}\n"
+        args = args + s", $word %c$i"
+
+    s"""
+    @sysl.retains.said = private constant [${said.bytes.len + 2} x i8] c"$said\\0A\\00"
+
+    define internal void @sysl.retains.mark() {
+    entry:
+    $clear  %r = call i32 @atexit(ptr @sysl.retains.report)
+      ret void
+    }
+
+    define internal void @sysl.retains.report() {
+    entry:
+    $loads  %w = call i32 (i32, ptr, ...) @dprintf(i32 2, ptr @sysl.retains.said$args)
+      ret void
+    }
+    """
+end retain_report_text
+
+// A machine word's size in bytes, for the alignment an atomic access of one states.
+private word_bytes_of(word: string) -> string = word match
+    "i64" -> "8"
+    "i32" -> "4"
+    else "2"
+
+// The libc the two reports call, requested by each so a module asked for both states it once.
+count_report_libc_text() -> string = "declare i32 @dprintf(i32, ptr, ...)\ndeclare i32 @atexit(ptr)\n"
+
+// The name the declarations are requested under.
+count_report_libc() -> string = "sysl.count.libc"
+
+// The symbols that text declares, which nothing else in the module may state again.
+count_report_libc_symbols() -> []const string = ["dprintf", "atexit"]
+
+// The mark, emitted once module storage is filled, and the report it registers.
+gen_retain_count_mark(e: *Emit)
+    if !retain_counting_on then return
+
+    request_text(e, count_report_libc(), count_report_libc_text())
+    request_text(e, "sysl.retains", retain_report_text(s"i${e.word_bits}"))
+    emit(e, ir_call(None, LVoid, VGlobal("sysl.retains.mark"), buf()))
+end gen_retain_count_mark
+
+// Whether this module holds the report, and so needs the counters whatever else it holds.
+reports_retains(e: *Emit) -> bool = e.requested_set.has("sysl.retains")
+
+// What a counted program said about its shares, read off its standard error: the six numbers in the
+// order of the slots, or `None` where it said nothing.
+struct RetainCounts
+    retains: long
+    releases: long
+    atomic_retains: long
+    atomic_releases: long
+    view_retains: long
+    view_releases: long
+
+retain_count_reported(err: string) -> Option[RetainCounts]
+    val at = err.index_of(s" ${retain_count_said()}") match
+        Some(i) -> i
+        None -> return None
+
+    var start = at
+
+    while start > 0 && err.bytes[start - 1] != u8(' ')
+        start -= 1
+
+    var numbers: Buf[long] = buf()
+    var n: long = 0
+    var inside = false
+    var i = start
+
+    while i < err.bytes.len && err.bytes[i] != u8('\n') && numbers.len() < 6
+        val b = err.bytes[i]
+
+        if b >= u8('0') && b <= u8('9')
+            n = n * 10 + long(b - u8('0'))
+            inside = true
+        else if inside
+            numbers.push(n)
+            n = 0
+            inside = false
+
+        i += 1
+
+    if inside && numbers.len() < 6 then numbers.push(n)
+    if numbers.len() != 6 then return None
+
+    Some(RetainCounts(numbers[0], numbers[1], numbers[2], numbers[3], numbers[4], numbers[5]))
+end retain_count_reported

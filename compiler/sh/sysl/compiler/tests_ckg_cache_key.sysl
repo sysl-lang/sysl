@@ -877,17 +877,35 @@ ckg_count_allocs()
     remove_dir_all(root).unwrap_or(())
 end ckg_count_allocs
 
+@test("SYSL_COUNT_RETAINS keys the run cache: a counted binary is never replayed for an uncounted run")
+ckg_count_retains()
+    if !ckg_ready() then return
+
+    val root = ckg_featured("fancy = []")
+    val got = ckg_seam(root, "", "", () -> ckg_unsetenv("SYSL_COUNT_RETAINS"),
+                       () -> ckg_setenv("SYSL_COUNT_RETAINS", "1"))
+
+    ckg_unsetenv("SYSL_COUNT_RETAINS")
+    assert_eq(got, "1 | 1 | 1 | miss miss hit | different bytes")
+    remove_dir_all(root).unwrap_or(())
+end ckg_count_retains
+
 // An in-process test asks for counting without the environment, so the key reads whether counting
 // was asked rather than the variable: before, a forced build was kept under -- and replayed for --
 // the uncounted key.
-@test("counting asked for in-process keys the run cache as the variable does")
+@test("counting asked for in-process keys the run cache as the variable does, for both counters")
 ckg_forced_counting()
     if !ckg_ready() then return
 
     val root = ckg_featured("fancy = []")
+    val retains = ckg_seam(root, "", "", () -> force_retain_counting(false), () -> force_retain_counting(true))
+
+    force_retain_counting(false)
+
     val allocs = ckg_seam(root, "", "", () -> force_alloc_counting(false), () -> force_alloc_counting(true))
 
     force_alloc_counting(false)
+    assert_eq(retains, "1 | 1 | 1 | miss miss hit | different bytes")
     assert_eq(allocs, "1 | 1 | 1 | miss miss hit | different bytes")
     remove_dir_all(root).unwrap_or(())
 end ckg_forced_counting
@@ -897,10 +915,10 @@ ckg_counting_needs_a_one()
     if !ckg_ready() then return
 
     val root = ckg_featured("fancy = []")
-    val got = ckg_seam(root, "", "", () -> ckg_unsetenv("SYSL_COUNT_ALLOCS"),
-                       () -> ckg_setenv("SYSL_COUNT_ALLOCS", "0"))
+    val got = ckg_seam(root, "", "", () -> ckg_unsetenv("SYSL_COUNT_RETAINS"),
+                       () -> ckg_setenv("SYSL_COUNT_RETAINS", "0"))
 
-    ckg_unsetenv("SYSL_COUNT_ALLOCS")
+    ckg_unsetenv("SYSL_COUNT_RETAINS")
     assert_eq(got, "1 | 1 | 1 | miss hit hit | 1 entries")
     remove_dir_all(root).unwrap_or(())
 end ckg_counting_needs_a_one
