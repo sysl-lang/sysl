@@ -37,6 +37,9 @@ end cgb_body
 
 cgb_main(src: string) -> string = cgb_body(cgb_ir(src), "main")
 
+// What a one-file program prints, built and run.
+cgb_ran(src: string) -> string = xvr_ran([("main.sysl", src)])
+
 private cgb_is_digit(c: u8) -> bool = c >= u8('0') && c <= u8('9')
 
 // The text with every temporary's number written `N` -- `%t17` is `%tN` -- so a line the reference
@@ -95,18 +98,13 @@ cgb_a_var_lowers_to_alloca_and_store()
 cgb_reassignment_stores_again()
     if xvr_no_library() then return
 
-    val out = cgb_ir("var x = 1\nx = 2")
-
-    assert(out.contains("store i32 2, ptr %x.addr"), out)
+    assert_eq(cgb_ran("var x = 1\nprint(x)\nx = 2\nprint(x)"), "1\n2\n")
 
 @test("a compound assignment loads, operates, and stores back")
 cgb_a_compound_assignment_loads_operates_and_stores()
     if xvr_no_library() then return
 
-    val out = cgb_ir("var x = 10\nx += 5")
-
-    for want in ["load i32, ptr %x.addr", "add i32", "store i32"]
-        assert(out.contains(want), s"$want in:\n$out")
+    assert_eq(cgb_ran("var x = 10\nx += 5\nprint(x)\nx -= 3\nprint(x)"), "15\n12\n")
 
 // -- programs the analysis refuses, and the diagnostic each produces ------------------------------
 
@@ -136,45 +134,29 @@ cgb_mixing_int_and_real_is_rejected()
 
     assert(said.contains("'+' needs matching types, got long and real"), said)
 
-    val pair = cgb_ir("print(1 + 2.0)")
-
-    assert(pair.contains("fadd double 0x3FF0000000000000, 0x4000000000000000"), pair)
+    assert_eq(cgb_ran("val x = 1 + 2.25\nprint(x, x / 2)"), "3.25 1.625\n")
 
 // -- expressions: instruction selection, precedence, comparison chains ----------------------------
 
-@test("precedence shows in instruction order — mul before add")
+@test("precedence: mul before add, whether the operands are variables or literals")
 cgb_precedence_shows_in_instruction_order()
     if xvr_no_library() then return
 
-    val main = cgb_main("var a = 1\nvar b = 2\nvar c = 3\nprint(a + b * c)")
-    val mul = main.index_of("mul i32")
-    val add = main.index_of("add i32")
-
-    assert(mul.is_some() && add.is_some() && mul.unwrap() < add.unwrap(), main)
-
-    // Written out of literals alone, the arithmetic is one constant and no instruction at all.
-    val folded = cgb_main("print(1 + 2 * 3)")
-
-    assert(folded.contains("i32 7") && !folded.contains("mul i32"), folded)
+    assert_eq(cgb_ran("var a = 1\nvar b = 2\nvar c = 3\nprint(a + b * c, (a + b) * c, 1 + 2 * 3)"), "7 9 7\n")
 end cgb_precedence_shows_in_instruction_order
 
-@test("integer division uses signed sdiv")
+@test("integer division is signed, truncating toward zero")
 cgb_integer_division_uses_sdiv()
     if xvr_no_library() then return
 
-    val main = cgb_main("var a = 7\nprint(a / 2)")
-
-    assert(cgb_has(main, "sdiv i32 %tN, 2"), main)
-    assert(cgb_main("print(7 / 2)").contains("i32 3"), "a literal quotient is the constant")
+    assert_eq(cgb_ran("var a = -7\nprint(a / 2, a % 2, 7 / 2, -7 / 2)"), "-3 -1 3 -3\n")
 end cgb_integer_division_uses_sdiv
 
-@test("float arithmetic uses the fadd family")
+@test("float arithmetic is floating point")
 cgb_float_arithmetic_uses_fadd()
     if xvr_no_library() then return
 
-    val main = cgb_main("print(1.5 + 2.5)")
-
-    assert(main.contains("fadd double"), main)
+    assert_eq(cgb_ran("var a = 1.5\nprint(a + 2.25, a * 3, a - 2, a / 4)"), "3.75 4.5 -0.5 0.375\n")
 
 // Still two comparisons, but the right one sits in a conditionally-entered block rather than being
 // eagerly `and`ed with the left.
@@ -243,36 +225,28 @@ cgb_a_pointer_is_an_opaque_ptr()
 cgb_a_store_through_a_dereference()
     if xvr_no_library() then return
 
-    val out = cgb_ir("var n = 1\nvar p = &n\n*p = 7")
+    assert_eq(cgb_ran("var n = 1\nvar m = 2\nvar p = &n\n*p = 7\np = &m\n*p += 1\nprint(n, m)"), "7 3\n")
 
-    assert(cgb_has(out, "%tN = load ptr, ptr %p.addr"), out)
-    assert(cgb_has(out, "store i32 7, ptr %tN"), out)
-
-@test("a field through a pointer is one getelementptr from the pointer value")
+@test("a field through a pointer writes the field of what it points at")
 cgb_a_field_through_a_pointer()
     if xvr_no_library() then return
 
-    val out = cgb_ir("struct P\n    x: int\n    y: int\nvar v = P(1, 2)\nvar p = &v\np.y = 9")
+    assert_eq(cgb_ran("struct P\n    x: int\n    y: int\nvar v = P(1, 2)\nvar p = &v\np.y = 9\nprint(v.x, v.y, p.y)"),
+              "1 9 9\n")
 
-    assert(cgb_has(out, "%tN = load ptr, ptr %p.addr"), out)
-    assert(cgb_has(out, "getelementptr %struct.P, ptr %tN, i32 0, i32 1"), out)
-
-@test("a field of a local is addressed from its own slot, with no load")
+@test("a field of a local is written in its own slot, leaving the other fields")
 cgb_a_field_of_a_local()
     if xvr_no_library() then return
 
-    val out = cgb_ir("struct P\n    x: int\n    y: int\nvar v = P(1, 2)\nv.x = 9")
+    assert_eq(cgb_ran("struct P\n    x: int\n    y: int\nvar v = P(1, 2)\nv.x = 9\nprint(v.x, v.y)"), "9 2\n")
 
-    assert(out.contains("getelementptr %struct.P, ptr %v.addr, i32 0, i32 0"), out)
-
-@test("a recursive struct lowers its self-reference to a pointer")
+@test("a recursive struct holds its self-reference as a pointer")
 cgb_a_recursive_struct()
     if xvr_no_library() then return
 
-    val out = cgb_ir("struct Node\n    value: int\n    next: *Node\nvar n = Node(1, null)")
-
-    assert(out.contains("%struct.Node = type { i32, ptr }"), out)
-    assert(out.contains("insertvalue %struct.Node %t1, ptr null, 1"), out)
+    assert_eq(cgb_ran("struct Node\n    value: int\n    next: *Node\nvar n = Node(1, null)\nvar m = Node(2, &n)\n" +
+                      "print(m.next.value, n.next == null, m.next == &n, sizeof(Node) == 2 * sizeof(*Node))"),
+              "1 true true true\n")
 
 @test("null lowers to the LLVM null constant")
 cgb_null_lowers_to_null()
@@ -286,11 +260,10 @@ cgb_null_lowers_to_null()
 cgb_pointer_and_bool_equality()
     if xvr_no_library() then return
 
-    val ptrs = cgb_ir("var n = 1\nvar p = &n\nprint(p == null)")
-    val bools = cgb_ir("var b = true\nprint(b == false)")
-
-    assert(cgb_has(ptrs, "icmp eq ptr %tN, null"), ptrs)
-    assert(cgb_has(bools, "icmp eq i1 %tN, 0"), bools)
+    assert_eq(cgb_ran("var n = 1\nvar m = 1\nvar p = &n\nvar q: *int = null\n" +
+                      "print(p == null, q == null, p == &n, p == &m, p != q)\n" +
+                      "var b = true\nvar c = false\nprint(b == false, b == true, c == false, b != c)"),
+              "false true true false true\nfalse true true true\n")
 
 @test("a memory mode is mangled as a word, since a sigil is not an LLVM name")
 cgb_a_memory_mode_is_mangled_as_a_word()

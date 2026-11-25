@@ -81,24 +81,6 @@ private rlb_err(files: []const (string, string)) -> string
     analysis_report(errors_of(done.an.diagnostics()))
 end rlb_err
 
-// The LLVM text of a program of several files, which is what a claim about a symbol is read out of.
-private rlb_ir(files: []const (string, string)) -> string
-    val units = rlb_units(files) match
-        Err(why) -> return why
-        Ok(us) -> us
-
-    val done = analyze_bodies(units, host_target())
-    val whole = program_of(done, "")
-    val promotions = post_analysis_checks(done.an, whole, buf())
-
-    if !errors_of(done.an.diagnostics()).is_empty()
-        return analysis_report(errors_of(done.an.diagnostics()))
-
-    val kept = prune(strip_tests(whole), program_own(units))
-
-    ir_print_module(codegen_with_gaps(kept, host_target(), promotions).0)
-end rlb_ir
-
 // What a program of several files **prints**. The tree goes on disk, since a module is a directory
 // and a build reads one.
 private rlb_ran(files: []const (string, string)) -> string
@@ -313,21 +295,6 @@ rlb_the_module_path_reaches_the_public_one()
                                     "from_a() -> string = s\"${helper()} ${m.helper()}\"\n"),
                        ("m/b.sysl", "module m\nhelper() -> int = 1\n")]),
               "2 1\n")
-
-// Both are emitted, under two symbols -- the private one at its numbered slot and with internal
-// linkage, since every caller it has is in its own file.
-@test("and both functions are emitted, each under a symbol of its own")
-rlb_both_functions_are_emitted()
-    if rlb_no_library() then return
-
-    val out = rlb_ir([("main.sysl", "print(m.from_a(), m.helper())\n"),
-                      ("a.sysl", "module m\nprivate helper() -> int = 2\nfrom_a() -> int = helper()\n"),
-                      ("b.sysl", "module m\nhelper() -> int = 1\n")])
-
-    assert(out.contains("define i32 @m$helper() {"), out)
-    assert(out.contains("define internal i32 @m$helper.private1() {"), out)
-    assert(out.contains("call i32 @m$helper.private1()"), out)
-end rlb_both_functions_are_emitted
 
 // -- the private file's spelling, against a public one of another signature or kind ----------------
 

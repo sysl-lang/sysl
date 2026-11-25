@@ -129,25 +129,6 @@ fad_two_of_one_signature()
         """), "1 3\n")
 end fad_two_of_one_signature
 
-// A function nothing calls is dropped from the program. Taking its address has to count as a use,
-// or the address would be of a definition that is not there.
-@test("keeps a function nothing calls, since the address is the only use")
-fad_keeps_a_function_nothing_calls()
-    if xvr_no_library() then return
-
-    val out = fad_ir(fad_qsort() + raw"""
-        only_addressed(a: *u8, b: *u8) -> i32 = 0
-
-        var xs = [2i32, 1i32]
-
-        qsort(ptr_cast(&xs[0]), 2usize, 4usize, &only_addressed)
-        print(xs[0])
-        """)
-
-    assert(out.contains("define i32 @only_addressed$$sysl(ptr %a.param, ptr %b.param) {\n"), out)
-    assert(out.contains("i64 2, i64 4, ptr @only_addressed$$sysl)\n"), out)
-end fad_keeps_a_function_nothing_calls
-
 @test("and a C function's own address is one too")
 fad_a_c_functions_own_address()
     if xvr_no_library() then return
@@ -576,6 +557,7 @@ end fad_a_call_coerces_an_aggregate
 
 // The test is made by shape rather than by asking the target's classification, so a program
 // accepted for one machine is accepted for every machine.
+// Kept as IR text: the cross-target promise, checked on every target's lowering, which a host run cannot see.
 @test("an address is accepted or refused the same way on every target")
 fad_the_same_way_on_every_target()
     if xvr_no_library() then return
@@ -757,21 +739,19 @@ end fad_a_function_that_takes_its_own_address
 fad_reached_only_through_an_address()
     if xvr_no_library() then return
 
-    val out = fad_ir(fad_qsort() + raw"""
-        inner(n: i32) -> i32 = n
+    assert_eq(fad_ran(fad_qsort() + raw"""
+        inner(n: i32) -> i32 = 0i32 - n
 
         compare(a: *u8, b: *u8) -> i32
             var f: *extern(i32) -> i32 = &inner
-            f(0i32)
+            var pa: *i32 = ptr_cast(a)
+            var pb: *i32 = ptr_cast(b)
+            f(*pa - *pb)
 
-        var xs = [2i32, 1i32]
-        qsort(ptr_cast(&xs[0]), 2usize, 4usize, &compare)
-        print(xs[0])
-        """)
-
-    assert(out.contains("define i32 @compare$$sysl(ptr %a.param, ptr %b.param) {\n"), out)
-    assert(out.contains("define i32 @inner$$sysl(i32 %n.param) {\n"), out)
-    assert(out.contains("store ptr @inner$$sysl, ptr %f.addr\n"), out)
+        var xs = [2i32, 3i32, 1i32]
+        qsort(ptr_cast(&xs[0]), 3usize, 4usize, &compare)
+        print(xs[0], xs[1], xs[2])
+        """), "3 2 1\n")
 end fad_reached_only_through_an_address
 
 @test("one held in a module-level val")
@@ -793,7 +773,7 @@ end fad_one_held_in_a_module_level_val
 fad_named_once_with_an_alias()
     if xvr_no_library() then return
 
-    assert(fad_ir(raw"""
+    assert_eq(fad_ran(raw"""
         type Comparison = *extern(*u8, *u8) -> i32
 
         compare(a: *u8, b: *u8) -> i32 = i32(a[0]) - i32(b[0])
@@ -803,7 +783,7 @@ fad_named_once_with_an_alias()
         var xs = [9u8, 4u8]
 
         print(call(&compare, &xs[0], &xs[1]).to_string())
-        """).contains(" = call i32 @call$$sysl(ptr @compare$$sysl, ptr "))
+        """), "5\n")
 
     assert_eq(fad_ran(raw"""
         type Handle = *u8

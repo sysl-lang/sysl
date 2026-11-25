@@ -122,11 +122,8 @@ cgz_a_declared_width_becomes_the_llvm_width()
 cgz_signedness_picks_the_division()
     if xvr_no_library() then return
 
-    val u = cgz_main("var u: uint = 9\nprint(u / 2)\n")
-    val s = cgz_main("var s: int = 9\nprint(s / 2)\n")
-
-    assert(u.contains("udiv i32"), u)
-    assert(s.contains("sdiv i32"), s)
+    assert_eq(cgb_ran("var u: uint = 4294967295\nvar s: int = -9\nprint(u / 2, u % 7, s / 2, s % 2)\n"),
+              "2147483647 3 -4 -1\n")
 
 @test("signedness picks between the right shifts")
 cgz_signedness_picks_the_right_shift()
@@ -142,9 +139,8 @@ cgz_signedness_picks_the_right_shift()
 cgz_an_unsigned_comparison_is_unsigned()
     if xvr_no_library() then return
 
-    val main = cgz_main("var u: uint = 9\nprint(u < 10)\n")
-
-    assert(main.contains("icmp ult i32"), main)
+    assert_eq(cgb_ran("var u: uint = 4000000000\nvar v: byte = 200\nprint(u < 10, u > 10, v < 100, v >= 128)\n"),
+              "false true false true\n")
 
 @test("a narrower target truncates")
 cgz_a_narrower_target_truncates()
@@ -196,18 +192,9 @@ cgz_a_narrower_float_constant_is_rounded()
 cgz_printing_widens_to_the_renderer()
     if xvr_no_library() then return
 
-    val b = cgz_main("var b: byte = 9\nprint(b)\n")
-
-    assert(b.contains("%t2 = zext i8 %t1 to i64"), b)
-    assert(b.contains("call void @sysl$printu(i64 %t2)"), b)
-
-    val n = cgz_main("var n: long = 9\nprint(n)\n")
-    val u = cgz_main("var u: ulong = 9\nprint(u)\n")
-    val r = cgz_main("var r: real = 1.5\nprint(r)\n")
-
-    assert(n.contains("call void @sysl$printi(i64 %t"), n)
-    assert(u.contains("call void @sysl$printu(i64 %t"), u)
-    assert(r.contains("call void @sysl$printr(double %t"), r)
+    assert_eq(cgb_ran("var b: byte = 200\nvar n: long = -9\nvar u: ulong = 18446744073709551615\nvar r: real = 1.5\n" +
+                      "print(b, n, u, r)\n"),
+              "200 -9 18446744073709551615 1.5\n")
 end cgz_printing_widens_to_the_renderer
 
 // A float is the exception: the digits that read back are a property of the width, so widening an
@@ -216,30 +203,18 @@ end cgz_printing_widens_to_the_renderer
 cgz_printing_a_float_keeps_its_width()
     if xvr_no_library() then return
 
-    val f = cgz_main("var f: f32 = 1.5\nprint(f)\n")
-    val h = cgz_main("var h: f16 = 1.5\nprint(h)\n")
-    val b = cgz_main("var b: bf16 = 1.5\nprint(b)\n")
-
-    assert(f.contains("call void @sysl$printf32(float %t"), f)
-    assert(h.contains("call void @sysl$printf16(half %t"), h)
-    assert(b.contains("call void @sysl$printbf16(bfloat %t"), b)
-    assert(!f.contains("fpext"), f)
+    assert_eq(cgb_ran("var f: f32 = 0.1\nvar h: f16 = 0.1\nvar b: bf16 = 1.5\nprint(f, h, b)\n"), "0.1 0.1 1.5\n")
 end cgz_printing_a_float_keeps_its_width
 
 @test("the renderer a value reaches carries the matching conversion")
 cgz_the_renderer_carries_the_conversion()
     if xvr_no_library() then return
 
-    val unsigned = cgz_body(cgz_ir("var b: byte = 9\nprint(b)\n"), "printu")
-    val signed = cgz_body(cgz_ir("var n: long = 9\nprint(n)\n"), "printi")
-    val real = cgz_ir("var x = 2.5\nprint(x)\n")
-
-    assert(unsigned.contains("@sysl$digits_ulong("), unsigned)
-    assert(signed.contains("@sysl$digits_long("), signed)
+    assert_eq(cgb_ran("var b: byte = 255\nvar n: long = -9223372036854775807\nvar x = 2.5\nvar y = 1e21\nprint(b, n, x, y)\n"),
+              "255 -9223372036854775807 2.5 1000000000000000000000\n")
     // A float is rendered by the library's own shortest-digits writer in sysl, so no C format string
     // is laid down.
-    assert(real.contains("call void @sysl$write_plain("), real)
-    assert(!real.contains("@snprintf("), real)
+    assert(!cgz_ir("var x = 2.5\nprint(x)\n").contains("@snprintf("), "a float's renderer reaches no C formatter")
 
 // Encoding a code point is sysl in the library, not a runtime helper the compiler emits. The module
 // text is read before the `#99` (nounwind) group is attached on the way to clang and `emit-llvm`, so

@@ -1,7 +1,8 @@
 module sh.sysl.compiler
 @tests
 
-import sysl.fs.{make_dir_all, write_text}
+import sysl.fs.{make_dir_all, remove_dir_all, write_text}
+import sysl.process.capture
 import sysl.text.Search
 
 // The reference's `SeamSupplierTests`: a module supplying a symbol another module's `extern` declared,
@@ -38,10 +39,35 @@ private azd_ss_text(modules: [](string, string), program: string) -> string
     said
 end azd_ss_text
 
+// What `program` prints, built with a `--lib` root holding `modules`.
+private azd_ss_ran(modules: [](string, string), program: string) -> string
+    val lib = azd_temp("sysl-seam-lib")
+    val prog = azd_temp("sysl-seam-prog")
+
+    for m in modules
+        make_dir_all(s"$lib/${m.0}").unwrap()
+        write_text(s"$lib/${m.0}/${m.0}.sysl", m.1).unwrap()
+
+    write_text(s"$prog/main.sysl", program).unwrap()
+
+    val (code, said) = azd_cli(["sysl", "build", s"$prog/main.sysl", "--lib", lib, "-o", s"$prog/built"])
+
+    assert_eq(code, 0, said)
+
+    val ran = capture(s"$prog/built", [], "", [], true)
+
+    remove_dir_all(lib).unwrap_or(())
+    remove_dir_all(prog).unwrap_or(())
+
+    ran match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text + out.err.unwrap_or("")
+end azd_ss_ran
+
 @test("is kept although nothing imports its module")
 azd_ss_kept()
     if !azd_ready() then return
-    assert(azd_ss_text([("clock", azd_ss_clock()), ("chip", azd_ss_chip())], azd_ss_asks()).contains("define i64 @seam_wall_us"))
+    assert_eq(azd_ss_ran([("clock", azd_ss_clock()), ("chip", azd_ss_chip())], azd_ss_asks()), "7\n")
 
 // A `declare` beside a `define` of one symbol is LLVM's `invalid redefinition of function`.
 @test("leaves no declaration of the symbol beside its definition")
@@ -74,10 +100,7 @@ azd_ss_second_seam()
     val chained = "module chip\n\nprivate extern \"seam_drift_us\" c_drift() -> long\n\n" +
         "@export(\"seam_wall_us\")\nwall_us() -> long = 7 + c_drift()\n"
     val drift = "module drift\n\n@export(\"seam_drift_us\")\ndrift() -> long = 11\n"
-    val out = azd_ss_text([("clock", azd_ss_clock()), ("chip", chained), ("drift", drift)], azd_ss_asks())
-
-    assert(out.contains("define i64 @seam_wall_us"), out)
-    assert(out.contains("define i64 @seam_drift_us"), out)
+    assert_eq(azd_ss_ran([("clock", azd_ss_clock()), ("chip", chained), ("drift", drift)], azd_ss_asks()), "18\n")
 end azd_ss_second_seam
 
 // One supplier per image; said here, it names both declarations rather than a symbol in no sysl file.

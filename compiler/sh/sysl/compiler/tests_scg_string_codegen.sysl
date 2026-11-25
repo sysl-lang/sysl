@@ -2,7 +2,6 @@ module sh.sysl.compiler
 @tests
 
 import sysl.text.Search
-import sysl.text.split
 
 // What a `string` lowers to across a whole program: the three words it is, the immortal owner a
 // literal carries, and the runtime pieces its content needs -- emitted only where the program
@@ -40,8 +39,6 @@ private scg_define_of(ir: string, name: string) -> string
 
         rest = rest[eol..<rest.len]
 end scg_define_of
-
-private scg_main_of(ir: string) -> string = scg_define_of(ir, "main")
 
 private scg_is_digit(b: u8) -> bool = b >= u8('0') && b <= u8('9')
 
@@ -103,9 +100,7 @@ scg_a_literal_is_a_constant()
 scg_a_length_is_a_word_of_the_value()
     if xvr_no_library() then return
 
-    val out = scg_ir("var s = \"hi\"\nprint(s.len)\n")
-
-    assert(scg_has(out, "extractvalue { ptr, ptr, i64 } %t#, 2"), out)
+    assert_eq(cgb_ran("var s = \"h\\u{e9}llo\"\nvar e = \"\"\nprint(s.len, e.len, s[1..<3].len)\n"), "6 0 2\n")
 
 @test("the bytes of a string are the string, with nothing emitted to convert them")
 scg_the_bytes_of_a_string_are_the_string()
@@ -132,44 +127,18 @@ scg_a_literals_owner_is_null()
 scg_printing_goes_by_length()
     if xvr_no_library() then return
 
-    val out = scg_ir("print(\"hi\")\n")
-    val sink = scg_define_of(out, "sysl$putbytes")
-
-    assert(scg_main_of(out).contains("call void @sysl$prints({ ptr, ptr, i64 } "), out)
-    assert(scg_has(sink, "extractvalue { ptr, ptr, i64 } %t#, 2"), sink)
-    assert(sink.contains("call i64 @sysl_stdout_write(ptr %"), sink)
-    assert(!sink.contains("@putchar"), sink)
-
-    for line in split(out, "\n")
-        if line.starts_with("@.str") then assert(!line.contains("%s"), line)
+    // A NUL in the middle and a `%s` are written as the bytes they are.
+    assert_eq(cgb_ran("var s = \"a\\0b\"\nprint(s, \"100%s\", s[0..<1])\n"), "a\0b 100%s a\n")
 end scg_printing_goes_by_length
 
-// Every value is its own call to the renderer its type reaches, with a space between and a newline
-// at the end -- and the separators go out as characters rather than one-character strings, so
-// printing a number never reaches the string runtime at all.
+// Every value is rendered by the renderer its type reaches, with a space between and a newline at
+// the end.
 @test("each argument is rendered by its own call")
 scg_each_argument_is_rendered_by_its_own_call()
     if xvr_no_library() then return
 
-    val main = scg_main_of(scg_ir("print(1, 2, \"x\", 3, 4)\n"))
-    val renderers = ["printi", "printu", "printr", "printb", "printc", "prints"]
-    var called = ""
-
-    for line in split(main, "\n")
-        val l = line.trim()
-
-        if l.starts_with("call void @sysl$")
-            val rest = l["call void @sysl$".len..<l.len]
-
-            rest.index_of("(") match
-                None -> ()
-                Some(open) ->
-                    for r in renderers
-                        if rest[0..<open] == r then called = called + " " + r
-
-    assert_eq(called, " printi printc printi printc prints printc printi printc printi printc")
-    assert(main.contains("call void @sysl$printc(i32 32)"), main)
-    assert(main.contains("call void @sysl$printc(i32 10)"), main)
+    assert_eq(cgb_ran("val u: u8 = 200\nval w: u64 = 18446744073709551615\nprint(1, -2, \"x\", u, w, 2.5, true, 'c')\n"),
+              "1 -2 x 200 18446744073709551615 2.5 true c\n")
 end scg_each_argument_is_rendered_by_its_own_call
 
 @test("comparison is a call, and every operator reads its answer")
@@ -198,12 +167,16 @@ scg_a_substring_is_checked_at_both_ends()
     force_short_strings(true)
     defer unforce_short_strings()
 
-    val out = scg_ir("var s = \"hi\"\nvar t = s[0..<1]\nprint(t.len)\n")
-
     // With the short form on, as these tests pin it, the source is read as its two words as they stand.
-    assert(scg_has(out, "call i1 @sysl.str.boundary.words(ptr %t#, i64 %t#, i64 %t#, i64 0)"), out)
-    assert(scg_has(out, "call i1 @sysl.str.boundary.words(ptr %t#, i64 %t#, i64 %t#, i64 1)"), out)
-    assert(out.contains("%cont = icmp eq i8 %top, -128"), out)
+    assert_eq(cgb_ran("var s = \"h\\u{e9}llo\"\nprint(s[0..<1], s[1..<3], s[3..<6])\n"), "h \u{e9} llo\n")
+
+    if !enm_ready() then return
+
+    val end_inside = enm_panic_text("var s = \"h\\u{e9}llo\"\nprint(s[0..<2])\n")
+    val start_inside = enm_panic_text("var s = \"h\\u{e9}llo\"\nprint(s[2..<4])\n")
+
+    assert(end_inside.contains("range end 2 is not on a character boundary"), end_inside)
+    assert(start_inside.contains("range start 2 is not on a character boundary"), start_inside)
 
 @test("slicing a string yields a string, so it is checked; slicing bytes is not")
 scg_slicing_bytes_is_not_checked()
@@ -217,10 +190,7 @@ scg_slicing_bytes_is_not_checked()
 scg_concatenation_is_one_call()
     if xvr_no_library() then return
 
-    val out = scg_ir("print(\"a\" + \"b\")\n")
-
-    assert(scg_has(out, "call { ptr, ptr, i64 } @sysl.str.concat(ptr %t#, i64 %t#, ptr %t#, i64 %t#)"), out)
-    assert(out.contains("define private { ptr, ptr, i64 } @sysl.str.concat"), out)
+    assert_eq(cgb_ran("var a = \"a\"\nval e = \"\"\nprint(a + \"b\", (a + e) + \"yz\", (e + e).len)\n"), "ab ayz 0\n")
 
 // The buffer a join builds is an ARC box, so it carries a header and a hook like any other -- the
 // hook that frees and does nothing else, raw bytes holding no references.
@@ -276,11 +246,9 @@ scg_rendering_a_bool_selects_a_word()
 scg_rendering_a_char_goes_through_the_encoder()
     if xvr_no_library() then return
 
-    val out = scg_ir("print('A'.to_string())\n")
-
-    assert(out.contains("define private { ptr, ptr, i64 } @sysl.str.char"), out)
-    assert(out.contains("call ptr @sysl.utf8(i32 %cp, ptr %buf)"), out)
-    assert(out.contains("define private ptr @sysl.utf8"), out)
+    assert_eq(cgb_ran("print('A'.to_string(), '\\u{e9}'.to_string().len, '\\u{20ac}'.to_string().len, " +
+                      "'\\u{1f600}'.to_string().len, '\\u{e9}'.to_string() == \"\\u{e9}\")\n"),
+              "A 2 3 4 true\n")
 
 @test("str of a float is the library's format_real_plain, with no specifier and no snprintf")
 scg_rendering_a_float_goes_through_format_real()

@@ -37,9 +37,10 @@ cgb_the_owner_of_a_view_of_a_heap_array()
 cgb_a_view_of_a_view_inherits_the_owner()
     if xvr_no_library() then return
 
-    val out = cgb_ir(cgb_buf + "var s = buf[2..<6]\nvar t = s[1..<3]\nprint(t.len)")
-
-    assert(cgb_has(out, "extractvalue { ptr, ptr, i64 } %tN, 0"), out)
+    // The buffer's own name lets go of it: only the owner the view inherited keeps its bytes alive.
+    assert_eq(cgb_ran(cgb_buf + "var s = buf[2..<6]\nvar t = s[1..<3]\n\nbuf = [0; 8]\ns = buf[..]\n" +
+                      "print(t.len, t[0], t[1], s[3])"),
+              "2 4 5 0\n")
 
 // The text is the module as lowered, before `#99` (nounwind) is marked on the defines for clang.
 @test("an owner may be absent, so its count is taken null-tolerantly")
@@ -63,10 +64,13 @@ cgb_a_slices_length_is_a_word()
 cgb_indexing_a_slice_starts_from_its_pointer()
     if xvr_no_library() then return
 
-    val out = cgb_ir(cgb_buf + "var s = buf[..]\nvar i = 0\nprint(s[i])")
+    assert_eq(cgb_ran(cgb_buf + "var s = buf[2..<8]\nvar i = 1\nprint(s[i], s[0], s[5])"), "4 3 8\n")
 
-    assert(cgb_has(out, "extractvalue { ptr, ptr, i64 } %tN, 1"), out)
-    assert(cgb_has(out, "getelementptr inbounds i8, ptr %tN, i64 %tN"), out)
+    if !enm_ready() then return
+
+    val said = enm_panic_text(cgb_buf + "var s = buf[2..<8]\nvar i = 6\nprint(s[i])")
+
+    assert(said.contains("index 6 out of bounds for length 6"), said)
 
 @test("a slice held in a local gives its count back when the scope ends")
 cgb_a_slice_in_a_local_gives_its_count_back()
@@ -81,20 +85,27 @@ cgb_a_slice_in_a_local_gives_its_count_back()
 cgb_an_exclusive_and_an_inclusive_high_end()
     if xvr_no_library() then return
 
-    val exclusive = cgb_ir(cgb_buf + "var n = 3\nvar s = buf[0..<n]\nprint(s.len)")
-    val inclusive = cgb_ir(cgb_buf + "var n = 3\nvar s = buf[0..n]\nprint(s.len)")
+    assert_eq(cgb_ran(cgb_buf + "var n = 8\nvar m = 7\nprint(buf[0..<n].len, buf[0..m].len)"), "8 8\n")
 
-    assert(cgb_has(exclusive, "icmp ule i64 %tN, 8"), exclusive)
-    assert(cgb_has(inclusive, "icmp ult i64 %tN, 8"), inclusive)
-    assert(cgb_has(inclusive, "%tN = add i64 %tN, 1"), inclusive)
+    if !enm_ready() then return
+
+    val exclusive = enm_panic_text(cgb_buf + "var n = 9\nprint(buf[0..<n].len)")
+    val inclusive = enm_panic_text(cgb_buf + "var n = 8\nprint(buf[0..n].len)")
+
+    assert(exclusive.contains("range 0..<9 out of bounds for length 8"), exclusive)
+    assert(inclusive.contains("range 0..8 out of bounds for length 8"), inclusive)
 
 @test("the two ends are checked against each other as well")
 cgb_the_two_ends_are_checked_against_each_other()
     if xvr_no_library() then return
 
-    val out = cgb_ir(cgb_buf + "var s = buf[2..<6]\nprint(s.len)")
+    assert_eq(cgb_ran(cgb_buf + "var a = 2\nvar b = 6\nprint(buf[a..<b].len, buf[b..<b].len)"), "4 0\n")
 
-    assert(out.contains("icmp ule i64 2, 6"), out)
+    if !enm_ready() then return
+
+    val said = enm_panic_text(cgb_buf + "var a = 6\nvar b = 2\nprint(buf[a..<b].len)")
+
+    assert(said.contains("range start 6 is past its end 2"), said)
 
 // -- the module scaffolding, string interning, and which renderer `print` reaches -----------------
 
@@ -104,10 +115,10 @@ cgb_the_two_ends_are_checked_against_each_other()
 cgb_defines_main_with_the_platforms_pair()
     if xvr_no_library() then return
 
-    val out = cgb_ir("print(1)")
+    if !enm_ready() then return
 
-    assert(out.contains("define i32 @main(i32 %argc, ptr %argv) {"), out)
-    assert(out.contains("ret i32 0"), out)
+    assert_eq(enm_ran("print(1)\n"), "1\n")
+    assert_eq(enm_ran("main(args: []string)\n    print(args.len, args[0].len > 0)\n"), "1 true\n")
 
 // Nothing emits a call to `printf`, so nothing may declare it either.
 @test("declares no printf of its own")
@@ -138,31 +149,21 @@ cgb_a_string_constant_is_interned_nul_terminated()
 cgb_an_int_goes_to_the_signed_renderer()
     if xvr_no_library() then return
 
-    val out = cgb_ir("print(42)")
-    val main = cgb_body(out, "main")
+    assert_eq(cgb_ran("val a: i8 = -5\nval b: i16 = -300\nval c = -42\nval d: i64 = -9000000000\nprint(a, b, c, d, 42)"),
+              "-5 -300 -42 -9000000000 42\n")
 
-    assert(main.contains("call void @sysl$printi(i64 %t1)"), main)
-    assert(main.contains("sext i32 42 to i64"), main)
-    assert(out.contains("define i64 @sysl$digits_long("), out)
-
-@test("a float is emitted as a hex double and rendered in sysl, with no snprintf")
+@test("a float is rendered exactly, in sysl, with no snprintf")
 cgb_a_float_is_a_hex_double()
     if xvr_no_library() then return
 
-    val out = cgb_ir("print(1.5)")
-    val main = cgb_body(out, "main")
-
-    assert(main.contains("call void @sysl$printr(double 0x3FF8000000000000)"), main)
-    assert(!out.contains("@snprintf"), out)
+    assert_eq(cgb_ran("val x = 1.5\nval y: f32 = 0.25\nprint(x, y, 0.1, -2.5e-3)"), "1.5 0.25 0.1 -0.0025\n")
+    assert(!cgb_ir("print(1.5)").contains("@snprintf"), "a float's renderer reaches no C formatter")
 
 @test("multiple args are separated by a printed space")
 cgb_multiple_args_are_separated_by_a_space()
     if xvr_no_library() then return
 
-    val main = cgb_main("print(1, 2)")
-
-    assert(main.contains("call void @sysl$printc(i32 32)"), main)
-    assert_eq(main.count_of("@sysl$printi"), 2)
+    assert_eq(cgb_ran("print(1, 2)\nprint(\"a\", 1.5, true, 'c')\nprint()"), "1 2\na 1.5 true c\n\n")
 
 // -- claims about the emitted text: the counted box's header, and two deliberate shortcuts --------
 

@@ -4,6 +4,7 @@ module sh.sysl.compiler
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.Status
 import sysl.text.{replace_all, Search}
 
 // The library as a **tree of modules** rather than one flat module (`reference/modules.md`,
@@ -178,24 +179,34 @@ end ltr_says
 
 private ltr_real(main: string, want: string) = ltr_says(buf(), ltr_program(main), want)
 
+// A one-file program over the real library, built and run: it prints `want`.
+private ltr_runs(main: string, want: string)
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(main), want)
+
 // -- a submodule of the library -------------------------------------------------------------------
 
 @test("does not put its names in scope for nothing")
 ltr_sub_does_not_put_its_names_in_scope()
     ltr_says(ltr_tree(), ltr_program("flag(21)\n"), "undefined function 'flag'")
 
+// Kept as IR text: a stand-in library links no program, so the body a name reached is read off its call.
 @test("while the standard module's names still arrive unasked-for")
 ltr_sub_standard_names_still_arrive()
     ltr_says(ltr_tree(), ltr_program("mark(21)\n"), "call i32 @sysl$mark(")
 
+// Kept as IR text: a stand-in library links no program, so the body a name reached is read off its call.
 @test("is reached by naming it, with nothing imported")
 ltr_sub_reached_by_naming_it()
     ltr_says(ltr_tree(), ltr_program("sysl.sys.flag(21)\n"), "call i32 @sysl.sys$flag(")
 
+// Kept as IR text: a stand-in library links no program, so the body a name reached is read off its call.
 @test("or by importing it")
 ltr_sub_or_by_importing_it()
     ltr_says(ltr_tree(), ltr_program("import sysl.sys.flag\nflag(21)\n"), "call i32 @sysl.sys$flag(")
 
+// Kept as IR text: a stand-in library links no program, so the body a name reached is read off its call.
 @test("or by a wildcard over it")
 ltr_sub_or_by_a_wildcard()
     ltr_says(ltr_tree(), ltr_program("import sysl.sys.*\nflag(21)\n"), "call i32 @sysl.sys$flag(")
@@ -217,6 +228,7 @@ ltr_sub_a_program_may_not_declare_it()
 ltr_two_resolves_bare_to_the_standard_modules()
     ltr_says(ltr_both(), ltr_program("pick(21)\n"), "call i32 @sysl$pick(")
 
+// Kept as IR text: a stand-in library links no program, so the body a name reached is read off its call.
 @test("and the submodule's is still there for a program that names it")
 ltr_two_the_submodules_is_still_there()
     ltr_says(ltr_both(), ltr_program("sysl.sys.pick(21)\n"), "call i32 @sysl.sys$pick(")
@@ -235,6 +247,7 @@ private ltr_text_lib(sys: string) -> Buf[LtrFile] =
             ("sysl.text", "t.sysl", "module sysl.text\nwiden(n: int) -> int = n + 7\n"),
             ("sysl.sys", "sys.sysl", sys)])
 
+// Kept as IR text: a stand-in library links no program, so the body a name reached is read off its call.
 @test("reach a sibling submodule's by importing it")
 ltr_own_reach_a_sibling_by_importing()
     ltr_says(ltr_text_lib("module sysl.sys\nimport sysl.text.widen\nflag(n: int) -> int = widen(n)\n"),
@@ -261,12 +274,14 @@ ltr_kept_is_out_of_reach()
     ltr_says(ltr_kept(), ltr_program("sysl.sys.hold(21)\n"), "'sysl.sys.hold' is private to module 'sysl'")
 
 // `private[sysl]` names an ancestor of `sysl.sys`, so the rest of the library is inside it.
+// Kept as IR text: a stand-in library links no program, so the body a name reached is read off its call.
 @test("and reachable from the rest of the library, which is what the modifier says")
 ltr_kept_reachable_from_the_rest_of_the_library()
     ltr_says(ltr_kept(), ltr_program("mark(21)\n"), "@sysl.sys$hold(i32")
 
 // -- the edges of the arrangement --------------------------------------------------------------------
 
+// Kept as IR text: a stand-in library links no program, so the body a name reached is read off its call.
 @test("a submodule of a submodule is reached the same way")
 ltr_edge_a_submodule_of_a_submodule()
     val lib = ltr_of([("sysl", "std.sysl", "module sysl\nmark(n: int) -> int = n + 1\n"),
@@ -274,6 +289,7 @@ ltr_edge_a_submodule_of_a_submodule()
 
     ltr_says(lib, ltr_program("sysl.text.utf8.decode(7)\n"), "call i32 @sysl.text.utf8$decode(")
 
+// Kept as IR text: a stand-in library links no program, so the body a name reached is read off its call.
 @test("an imported submodule is named by its last segment")
 ltr_edge_an_imported_submodule_is_named_by_its_last_segment()
     ltr_says(ltr_tree(), ltr_program("import sysl.sys\nsys.flag(21)\n"), "call i32 @sysl.sys$flag(")
@@ -301,11 +317,13 @@ ltr_edge_a_submodule_may_keep_something_from_the_standard_module()
 
     ltr_says(lib, ltr_program("mark(21)\n"), "'sysl.sys.hold' is private to module 'sysl.sys'")
 
+// Kept as IR text: a stand-in library links no program, so the body a name reached is read off its call.
 @test("while `private[sysl]` on the same declaration reaches the whole library, which is the widening")
 ltr_edge_private_sysl_reaches_the_whole_library()
     ltr_says(ltr_kept(), ltr_program("mark(21)\n"), "@sysl.sys$hold(i32")
 
 // A module of the library is refused only where the library actually carries it.
+// Kept as IR text: a stand-in library links no program, so the body a name reached is read off its call.
 @test("a program may declare a module under a library name the library does not carry")
 ltr_edge_a_program_may_declare_a_module_the_library_does_not_carry()
     ltr_says(ltr_tree(),
@@ -347,8 +365,7 @@ ltr_std_printing_needs_no_import()
 
 @test("leave the argument conversion reachable, under the path that names it")
 ltr_std_argument_conversion_by_path()
-    ltr_real("var v: [1]*u8 = [c\"x\"]\nvar a = sysl.args.args_of(1i32, &v[0])\nprint(a.len)\n",
-             "call { ptr, ptr, i64 } @sysl.args$args_of(")
+    ltr_runs("var v: [1]*u8 = [c\"x\"]\nvar a = sysl.args.args_of(1i32, &v[0])\nprint(a.len, a[0])\n", "1 x\n")
 
 @test("and not under a bare one")
 ltr_std_argument_conversion_not_bare()
@@ -357,11 +374,15 @@ ltr_std_argument_conversion_not_bare()
 // The compiler names it by key rather than by resolving the word.
 @test("though a 'main' taking arguments still gets it without naming anything")
 ltr_std_main_taking_arguments_gets_it()
-    ltr_real("main(args: []string)\n    print(args.len)\n", "@sysl.args$args_of(i32 %argc, ptr %argv)")
+    ltr_runs("main(args: []string)\n    print(args.len, args[0].len > 0)\n", "1 true\n")
 
 @test("and `exit` stays a word every program has, which is why it is not in `sys`")
 ltr_std_exit_stays_a_word()
-    ltr_real("exit(3)\n", "call void @exit(")
+    if !enm_ready() then return
+
+    cgz_exit("print(1)\nexit(3)\nprint(2)\n") match
+        Ok(s) -> assert_eq(s, Status.Exited(3))
+        Err(why) -> assert(false, why)
 
 @test("put the reading surface behind an import, so a program that reads says so")
 ltr_std_reading_needs_an_import()
@@ -369,12 +390,11 @@ ltr_std_reading_needs_an_import()
 
 @test("which the path reaches without one")
 ltr_std_reading_by_path()
-    ltr_real("var r = sysl.io.stdin()\nprint(r.fd)\n", "call %struct.sysl.io$FdReader @sysl.io$stdin()")
+    ltr_runs("var r = sysl.io.stdin()\nprint(r.fd)\n", "0\n")
 
 @test("and an import reaches by the bare word again")
 ltr_std_reading_by_import()
-    ltr_real("import sysl.io.stdin\n\nvar r = stdin()\nprint(r.fd)\n",
-             "call %struct.sysl.io$FdReader @sysl.io$stdin()")
+    ltr_runs("import sysl.io.stdin\n\nvar r = stdin()\nprint(r.fd)\n", "0\n")
 
 @test("including the trait a program implements to be read from")
 ltr_std_the_reader_trait_too()
@@ -382,7 +402,7 @@ ltr_std_the_reader_trait_too()
 
 @test("while the surface itself reaches the standard module's names freely")
 ltr_std_the_surface_reaches_the_standard_names()
-    ltr_real("sysl.io.line_text(\"hi\".bytes)\n", "@sysl.io$line_text(")
+    ltr_runs("print(sysl.io.line_text(\"hi\".bytes).unwrap())\n", "hi\n")
 
 @test("put the text conversions behind an import too")
 ltr_std_text_conversions_need_an_import()
@@ -398,13 +418,13 @@ ltr_std_the_builder_and_the_c_copy()
 // `sysl.text` is several files and one module.
 @test("which one import over the module reaches, however many files declared them")
 ltr_std_one_import_reaches_every_file()
-    ltr_real(raw"""
+    ltr_runs(raw"""
         import sysl.text.*
 
         var b = str_builder()
         b.push("x")
-        print(b.finish(), cstring("y").len)
-        """, "call %struct.sysl.text$StrBuilder @sysl.text$str_builder()")
+        print(b.finish(), cstring("yz").len, from_utf8("yz".bytes).unwrap())
+        """, "x 2 yz\n")
 
 // `.chars` is a member the compiler provides, so it names `chars_of` by key.
 @test("while a character walk still costs a program no import at all")
@@ -426,8 +446,7 @@ ltr_std_the_sink_needs_an_import()
 
 @test("while an import reaches the generic, whose instantiation is keyed by the module it moved to")
 ltr_std_the_generic_is_keyed_by_its_module()
-    ltr_real("import sysl.buf.*\n\nvar b: Buf[int] = buf()\nb.push(7)\nprint(b[0usize])\n",
-             "@sysl.buf$Buf.push.int(")
+    ltr_runs("import sysl.buf.*\n\nvar b: Buf[int] = buf()\nb.push(7)\nb.push(8)\nprint(b[0usize], b.len())\n", "7 2\n")
 
 // What an `impl Display` writes stays where a program needs to name nothing to write one.
 @test("while making a value printable still needs nothing named at all")
@@ -484,9 +503,11 @@ end ltr_tree_no_module_the_library_carries
 // A path under a carried module is not itself carried.
 @test("while a module under one of them is still a program's own to declare")
 ltr_tree_a_module_under_one_is_the_programs()
-    ltr_says(buf(), ltr_with_module("sysl.buf.mine", "module sysl.buf.mine\n\nflag(n: int) -> int = n + 5\n",
-                                    "sysl.buf.mine.flag(21)\n"),
-             "call i32 @sysl.buf.mine$flag(")
+    if !enm_ready() then return
+
+    assert_eq(xvr_ran([("main.sysl", "print(sysl.buf.mine.flag(21))\n"),
+                       ("sysl/buf/mine/mine.sysl", "module sysl.buf.mine\n\nflag(n: int) -> int = n + 5\n")]),
+              "26\n")
 
 @test("and an import of a submodule the library does not carry is refused")
 ltr_tree_an_uncarried_submodule_is_refused()

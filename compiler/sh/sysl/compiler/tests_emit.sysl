@@ -109,6 +109,7 @@ a_zero_sized_parameter_is_not_an_argument()
               "}\n")
 end a_zero_sized_parameter_is_not_an_argument
 
+// Kept as IR text: linkage is what the object shows the linker and C, which no run can see.
 @test("a file-private function is emitted under internal linkage")
 a_private_definition_is_internal()
     assert_eq(lowered("private p() -> int = 1\n", "p"),
@@ -296,39 +297,14 @@ end a_match_on_an_enum
 
 @test("'try' tests membership at 64 bits and picks a branch, so a miss is a value rather than a trap")
 an_enum_read_through_try()
-    if emit_no_library() then return
+    if emit_no_library() || !enm_ready() then return
 
-    assert_eq(lowered_beside_library("enum C\n    Red\n    Green\nend C\n\n" +
-                                     "t(n: int) -> Option[C] = C.try(n)\n\n" +
-                                     "print(t(1).is_some())\n", "t"),
-              "define %enum.sysl$Option.C @t$$sysl(i32 %n.param) {\n" +
-              "entry:\n" +
-              "  %n.addr = alloca i32\n" +
-              "  %t6 = alloca %enum.sysl$Option.C\n" +
-              "  %t8 = alloca %enum.sysl$Option.C\n" +
-              "  store i32 %n.param, ptr %n.addr\n" +
-              "  %t1 = load i32, ptr %n.addr\n" +
-              "  %t2 = sext i32 %t1 to i64\n" +
-              "  %t3 = icmp eq i64 %t2, 0\n" +
-              "  %t4 = icmp eq i64 %t2, 1\n" +
-              "  %t5 = or i1 %t3, %t4\n" +
-              "  br i1 %t5, label %try.some1, label %try.none2\n" +
-              "try.some1:\n" +
-              "  %t7 = insertvalue %sysl$Option.C.Some undef, i32 %t1, 0\n" +
-              "  store i32 1, ptr %t8\n" +
-              "  %t9 = getelementptr %enum.sysl$Option.C, ptr %t8, i32 0, i32 1\n" +
-              "  store %sysl$Option.C.Some %t7, ptr %t9\n" +
-              "  %t10 = load %enum.sysl$Option.C, ptr %t8\n" +
-              "  store %enum.sysl$Option.C %t10, ptr %t6\n" +
-              "  br label %try.end3\n" +
-              "try.none2:\n" +
-              "  %t11 = insertvalue %enum.sysl$Option.C undef, i32 0, 0\n" +
-              "  store %enum.sysl$Option.C %t11, ptr %t6\n" +
-              "  br label %try.end3\n" +
-              "try.end3:\n" +
-              "  %t12 = load %enum.sysl$Option.C, ptr %t6\n" +
-              "  ret %enum.sysl$Option.C %t12\n" +
-              "}\n")
+    // `2^32 + 1` would read as `Green` were the test made below 64 bits.
+    assert_eq(enm_ran("enum C\n    Red\n    Green\nend C\n\nt(n: int) -> Option[C] = C.try(n)\n\n" +
+                      "w(n: long) -> Option[C] = C.try(n)\n\n" +
+                      "print(t(0).is_some(), t(1).is_some(), t(2).is_some(), t(-1).is_some())\n" +
+                      "print(t(1).unwrap() == Green, t(0).unwrap() == Red, w(4294967297).is_some(), w(1).is_some())\n"),
+              "true true false false\ntrue true false true\n")
 end an_enum_read_through_try
 
 @test("and the membership test makes every comparison before it folds any of them together")
