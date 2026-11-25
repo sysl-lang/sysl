@@ -4437,9 +4437,10 @@ give that share back while the body runs. It holds when:
   of it hands its count away while the view is still to be read;
 - **the local only reads the view** — its length, an element, a `for` over it, a slice of it read the
   same way, the start of another such local, or an argument of a direct call. A view that is returned,
-  stored, captured or built into a value takes its count like any other local. **The bytes of a
-  string that may be short are not handed to a call either**: such bytes are the string's own words,
-  and a callee that keeps them gets a heap copy with a count of its own;
+  stored, captured or built into a value takes its count like any other local. **Where the short
+  string form is on, the bytes of a string that may be short are not handed to a call either**: such
+  bytes are the string's own words, and a callee that keeps them gets a heap copy with a count of its
+  own. With the form off, a string's bytes are its own storage and are handed to a call as a slice is;
 - **the local is written once** — never assigned, its address never taken, no `ref` bound to it, not
   named in a `defer`.
 
