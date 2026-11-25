@@ -1351,3 +1351,31 @@ vpa_aggregate_reads_back()
     assert_eq(vpa_count(copy, " = load volatile i32, ptr %"), 3, copy)
     assert_eq(vpa_count(copy, "  store volatile i32 %"), 3, copy)
 end vpa_aggregate_reads_back
+
+private val vpa_view_fixture: string = raw"""
+    struct Tagged
+        status: volatile u32
+        name: []const u8
+
+    @export("tagged_copy")
+    tagged_copy(d: *Tagged, s: *Tagged)
+        *d = *s
+    """
+
+@test("a view held in a register block is moved whole, never taken apart into its words")
+vpa_aggregate_keeps_a_view_whole()
+    for machine in ["aarch64-freestanding", "thumb-freestanding"]
+        val got = vpa_ir(machine, vpa_view_fixture)
+
+        if got.is_none() then return
+
+        val copy = vpa_define(got.unwrap(), "tagged_copy")
+
+        // The register is one plain access each time the block is read or written -- the source read, the
+        // destination's old contents read (a view carries a count to give back), the destination written
+        // -- and the view one load or store of all of it each time.
+        assert_eq(vpa_asm_count(copy), 3, s"$machine:\n$copy")
+        assert_eq(vpa_count(copy, " = load volatile { ptr, ptr, "), 2, s"$machine:\n$copy")
+        assert_eq(vpa_count(copy, "store volatile { ptr, ptr, "), 1, s"$machine:\n$copy")
+        assert(!copy.contains("extractvalue { ptr, ptr, "), s"$machine:\n$copy")
+end vpa_aggregate_keeps_a_view_whole
