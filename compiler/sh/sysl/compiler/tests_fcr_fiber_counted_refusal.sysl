@@ -1105,9 +1105,18 @@ fcr_local_parameter_view_sync_capture_refused()
 
     assert(said.contains("error:"), said)
 
-@test("a string parameter's bytes handed to a call, or named in a 'defer', are held and refused")
+// With the short form on, a string parameter's bytes may be its own words, which a callee that keeps
+// them is handed a heap copy of; with it off they are the string's own storage, lent as a slice is.
+private fcr_only_short(body: string, held: string, callee: string)
+    force_short_strings(false)
+    fcr_accepted(body)
+    force_short_strings(true)
+    fcr_refused(body, held, callee)
+    unforce_short_strings()
+
+@test("a string parameter's bytes handed to a call are held and refused only with the short form on; named in a 'defer', always")
 fcr_local_parameter_bytes_handed_refused()
-    fcr_held_both(fcr_send() + raw"""
+    fcr_only_short(fcr_send() + raw"""
         work(said_from: string) -> usize
             val said = said_from.bytes
             send(said)
@@ -1118,6 +1127,132 @@ fcr_local_parameter_bytes_handed_refused()
             defer print(s.len)
             send("x".bytes)
         """, "'s'", "send")
+
+private fcr_measure() -> string = raw"""
+    measure(b: []const u8) -> usize = b.len
+
+    struct Named
+        name: string
+
+    """
+
+@test("a string parameter's bytes handed to a call that cannot switch, dead after it or read after the switch, are held only with the short form on")
+fcr_bytes_handed_then_switch()
+    fcr_only_short(fcr_measure() + raw"""
+        work(s: string) -> usize
+            val said = s.bytes
+            val n = measure(said)
+            wait()
+            n
+        """, "'said'", "sched.wait")
+    fcr_only_short(fcr_measure() + raw"""
+        work(s: string) -> usize
+            val said = s.bytes
+            val n = measure(said)
+            wait()
+            n + measure(said)
+        """, "'said'", "sched.wait")
+
+@test("avin's 'viaString': a string parameter's bytes handed to an extern through 'as_ptr' are held only with the short form on")
+fcr_bytes_via_string_extern()
+    fcr_only_short(raw"""
+        import sysl.slices.as_ptr
+
+        extern "write" c_write(fd: i32, p: *const u8, n: i64) -> i64
+
+        via_slice(bytes: []const u8)
+            val rest = bytes[0..<bytes.len]
+            _ = c_write(1, as_ptr(rest), i64(rest.len))
+            wait()
+
+        via_string(s: string)
+            val said = s.bytes
+            _ = c_write(1, as_ptr(said), i64(said.len))
+            wait()
+        """, "'said'", "sched.wait")
+
+@test("a string parameter's bytes handed to a generic function, read by a method, walked or sliced are held only with the short form on")
+fcr_bytes_handed_neighbours()
+    for body in [raw"""
+        gen[T](b: []const T) -> usize = b.len
+
+        work(s: string) -> usize
+            val said = s.bytes
+            wait()
+            gen(said)
+        """, raw"""
+        work(s: string) -> bool
+            val said = s.bytes
+            wait()
+            said.starts_with("a".bytes)
+        """, fcr_measure() + raw"""
+        work(s: string) -> usize
+            val said = s.bytes
+            var n: usize = 0
+
+            for c in said
+                n += measure(said[0..<1]) + usize(c)
+                wait()
+
+            n
+        """, fcr_measure() + raw"""
+        work(s: string) -> usize
+            val said = s.bytes
+            val part = said[1..<2]
+            wait()
+            measure(part)
+        """]
+        fcr_only_short(body, "'said'", "sched.wait")
+
+@test("the bytes of a cut of a string parameter handed to a call are held only with the short form on")
+fcr_bytes_of_cut_handed()
+    fcr_only_short(fcr_measure() + raw"""
+        work(s: string) -> usize
+            val c = s[0..<1].bytes
+            wait()
+            measure(c)
+        """, "'c'", "sched.wait")
+
+@test("the bytes of a string field of a '&T' parameter, or of a local string, are held and refused")
+fcr_bytes_of_field_or_local_refused()
+    fcr_held_both(fcr_measure() + raw"""
+        work(h: &Named) -> usize
+            val b = h.name.bytes
+            wait()
+            measure(b)
+        """, "'b'", "sched.wait")
+    fcr_held_both(fcr_measure() + raw"""
+        work(a: string) -> usize
+            val t = a + "!"
+            val b = t.bytes
+            wait()
+            measure(b)
+        """, "'t'", "sched.wait")
+
+// No cell for a function whose address is taken: a `string` parameter is an aggregate, so `&f` of one is
+// refused before the check is asked.
+@test("the bytes of a reassigned, task or '@section' string parameter handed to a call are refused")
+fcr_bytes_of_kept_param_refused()
+    fcr_held_both(fcr_measure() + raw"""
+        work(s: string) -> usize
+            val b = s.bytes
+            wait()
+            s = "x"
+            measure(b) + s.len
+        """, fcr_kept_held("s"), "sched.wait")
+    fcr_held_both(fcr_measure() + raw"""
+        async later(s: string) -> usize
+            val b = s.bytes
+            wait()
+            measure(b)
+        """, fcr_kept_held("s"), "sched.wait")
+    fcr_held_both(fcr_measure() + raw"""
+        @section("__TEXT,__fcr")
+        placed(s: string)
+            val b = s.bytes
+            wait()
+            print(measure(b))
+        """, fcr_kept_held("s"), "sched.wait")
 
 @test("a lent local written a counted value before the call, even in a branch, is refused")
 fcr_local_rebound_counted_refused()

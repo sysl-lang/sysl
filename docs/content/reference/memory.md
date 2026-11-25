@@ -1396,7 +1396,10 @@ a buffer, another box), returned other than as a factory's answer, captured by a
 parameter whose body may let it out or answer it into something that does, weakened, given up with
 `into_raw`, carried out of a loop by `break`, or held by a local that outlives the loop turn that
 built it. A view of an array inside a box owns the box, so a view that gets out keeps its box on the
-heap. **A call through a trait object or a callable is a call of every body its table may hold** — in
+heap. **Each capture of a closure is a holder of its own**: a closure handed to a parameter of its own
+type that captures the box beside something else, and keeps only that something else
+(`each(xs, x -> pool.append(node))` keeps `node`, not `pool`), leaves the box in the frame; one that
+stores the box through another capture, or hands it to a call that keeps it, does not. **A call through a trait object or a callable is a call of every body its table may hold** — in
 a program, which sees every table there is, each method or closure of that trait at the receiver's own
 arguments; the box stays in the frame where none of them lets it out. A call with no body in sight — a
 C function pointer, an `extern`, a trait object or a callable in a library, which may be handed one
@@ -4000,11 +4003,29 @@ wait_for(n: u64)
   loop walking down registers into a post-indexed one — Linux's `readl`/`writel` are `asm` for the same
   reason. It holds at every optimisation level and under LTO, and it costs only what the optimizer
   might have folded. A `bool` and an integer narrower than its storage (`u12`) move their storage's
-  width (`ldrb`, `ldrh`), a float an integer register's. **A volatile wider than 64 bits is refused on AArch64**
+  width (`ldrb`, `ldrh`), a float an integer register's. A whole register block copied or stored
+  (`var u = *regs`, `*regs = Uart(1, 2, 3)`), and a bitfield register changed `with` new fields, is one
+  such access per register, the lowest address first. **A volatile wider than 64 bits is refused on AArch64**
   — a `u128`, an `i128` or any wider integer has no one instruction, and LLVM's volatile of it is an
-  `ldp`/`stp` pair, the form a hypervisor cannot emulate. Write two 64-bit volatile accesses. Every other
-  processor keeps LLVM's `load volatile`: x86 decodes the faulting instruction itself, and RISC-V has no
-  writeback addressing, so a `volatile u128` is accepted there.
+  `ldp`/`stp` pair, the form a hypervisor cannot emulate. Write two 64-bit volatile accesses.
+- **On 32-bit ARM — every Thumb target, ARMv6-M to ARMv8-M — a volatile access of 1, 2 or 4 bytes is
+  the same one plain instruction**: `ldrb`/`strb`, `ldrh`/`strh`, `ldr`/`str` of a general register,
+  the address a bare register — never written back (`ldr r3, [r2], #4`), never an `ldm`/`stm` (an M0+'s
+  `ldm r2!, {r3}`), never an `ldrd`/`strd`, never through a floating-point register (`vldr s2, [r0]`).
+  An exception may abandon an `ldm`, `stm`, `ldrd` or `strd` part-way and run it again from the start,
+  reading a read-to-clear register twice; one `ldr` is done or not begun. It is an `asm` here too, at every
+  optimisation level and under LTO, and a `bool`, a `u12`, a float, a pointer, a whole block and a
+  register changed `with` new fields move as they do on AArch64 — a 32-bit bitfield register is one
+  `ldr` and one `str` even on an M0+, which would otherwise make it four bytes.
+- **On 32-bit ARM a volatile wider than 32 bits is one such `ldr` or `str` per 32-bit word, the word at
+  the lowest address first.** A `u64`, an `i64` or an `f64` is two plain word accesses, a `u128` four;
+  a float goes through the general registers. They are **separate accesses**: neither atomic nor one
+  bus transaction, so a device or an interrupt handler may change the high word between the two reads —
+  a free-running 64-bit counter is read again until two reads agree on the high word. A width that is
+  not whole words (`u40`, `u48`) has a tail no word access moves, and is refused there; one of 32 bits
+  or fewer (`u24`) keeps LLVM's access.
+- **Every other processor keeps LLVM's `load volatile`**: x86 decodes the faulting instruction itself,
+  and RISC-V has no writeback addressing, so a `volatile u128` is accepted there.
 
 ```sysl target=aarch64-freestanding
 struct Regs
@@ -4013,6 +4034,31 @@ struct Regs
 
 ```error
 'volatile u128' is not a type on aarch64-freestanding: it is 128 bits wide, and an AArch64 volatile access is one 'ldr' or 'str' of at most 8 bytes (64 bits). Make two 64-bit volatile accesses instead, as two 'volatile u64' fields or elements
+```
+
+```sysl target=thumb-freestanding
+struct Timer
+    stamp: volatile u48
+```
+
+```error
+'volatile u48' is not a type on thumb-freestanding: it is 48 bits wide, and a 32-bit ARM volatile wider than 32 bits is made as whole 32-bit words, one 'ldr' or 'str' each, which 48 bits is not
+```
+
+The counter read on a Cortex-M, where a `volatile u64` is two word reads:
+
+```sysl build=c target=thumb-freestanding
+struct Clock
+    count: volatile u64
+
+@export("now")
+now(c: *Clock) -> u64
+    loop
+        val before = c.count
+        val after = c.count
+
+        if after >> 32 == before >> 32 then return after
+end now
 ```
 
 A loop walking down a FIFO's registers is the shape LLVM folds. Each read of `*at` here is
@@ -4394,9 +4440,10 @@ give that share back while the body runs. It holds when:
   of it hands its count away while the view is still to be read;
 - **the local only reads the view** — its length, an element, a `for` over it, a slice of it read the
   same way, the start of another such local, or an argument of a direct call. A view that is returned,
-  stored, captured or built into a value takes its count like any other local. **The bytes of a
-  string that may be short are not handed to a call either**: such bytes are the string's own words,
-  and a callee that keeps them gets a heap copy with a count of its own;
+  stored, captured or built into a value takes its count like any other local. **Where the short
+  string form is on, the bytes of a string that may be short are not handed to a call either**: such
+  bytes are the string's own words, and a callee that keeps them gets a heap copy with a count of its
+  own. With the form off, a string's bytes are its own storage and are handed to a call as a slice is;
 - **the local is written once** — never assigned, its address never taken, no `ref` bound to it, not
   named in a `defer`.
 

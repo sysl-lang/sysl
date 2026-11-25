@@ -584,8 +584,35 @@ true
 true
 ```
 
-An id with no entry is `NotFound`, and a name that is not valid UTF-8 is `InvalidUtf8`. Group names
-(`/etc/group`) are not here.
+An id with no entry is `NotFound`, and a name that is not valid UTF-8 is `InvalidUtf8`.
+**`group_name(id)` is the same over the group database** (`getgrgid_r`), and **`user_id(name)` and
+`group_id(name)` are the two the other way** (`getpwnam_r`, `getgrnam_r`), answering a `u32` — so
+`user_id(user_name(user())?)` is `user()`. A name is handed to the database exactly as given, with
+nothing trimmed or folded, and whether case matters is the database's own: macOS's matches `"ROOT"`
+too, Linux's files do not. A name with no entry is `NotFound`, as is one holding a zero byte, which no entry's name can. Every
+lookup is the re-entrant `_r` form, so two threads may look up at once, and a group with more members
+than a first guess holds is still answered.
+
+```sysl
+import sysl.fs.IoError
+import sysl.process.{group, group_id, group_name, user, user_id, user_name}
+
+print(user_id("root").unwrap())
+print(user_id(user_name(user()).unwrap()).unwrap() == user())
+print(group_id(group_name(group()).unwrap()).unwrap() == group())
+print(group_id(group_name(0).unwrap()).unwrap())
+print(user_id("no-such-user-here").unwrap_err() == IoError.NotFound)
+print(group_name(4_000_000_001).unwrap_err() == IoError.NotFound)
+```
+
+```output
+0
+true
+true
+0
+true
+true
+```
 
 ## How much memory
 
@@ -944,6 +971,9 @@ with an `@export`**, over whatever its kernel provides, and `run`, `capture`, `s
 | `sysl_proc_kill(pid, signal) -> int` | zero |
 | `sysl_proc_temp_path(into, room) -> isize` | the length of the path it wrote |
 | `sysl_proc_user_name(id, into, room) -> isize` | the length of the user's name written to `into`; `ENOENT` negated for an id with no entry |
+| `sysl_proc_group_name(id, into, room) -> isize` | the length of the group's name written to `into`; `ENOENT` negated for an id with no entry |
+| `sysl_proc_user_id(name, len) -> i64` | the id of the user called `name`; `ENOENT` negated for a name with no entry |
+| `sysl_proc_group_id(name, len) -> i64` | the id of the group called `name`; `ENOENT` negated for a name with no entry |
 | `sysl_proc_get_id(which) -> i64` | the id: `which` is `id_user` 0 or `id_group` 1 (effective), `id_real_user` 2 or `id_real_group` 3 |
 | `sysl_proc_set_id(which, id: u32) -> int` | zero, having made the program act as user or group `id` (`which` 0 or 1) |
 | `sysl_proc_exec(path, path_len, argv, argc, envp, envc, inherit_env) -> int` | only a failure: a success does not return |
