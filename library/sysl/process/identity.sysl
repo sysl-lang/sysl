@@ -5,7 +5,7 @@ import sysl.buf.{Buf, buf}
 import sysl.fs.{IoError, from_status}
 import sysl.sys.UNSUPPORTED
 import sysl.process.sys as psys
-import sysl.slices.as_mut_ptr
+import sysl.slices.{as_mut_ptr, as_ptr}
 import sysl.text.from_utf8
 
 // Which user and group the program runs as, and changing them.
@@ -92,14 +92,51 @@ private changed(code: int) -> Result[unit, IoError] = if code >= 0 then Ok(()) e
 user_name(id: u32) -> Result[string, IoError]
     var raw: []u8 = [0; 1024]
 
-    val n = psys.user_name(id, as_mut_ptr(raw), raw.len)
+    name_answer(psys.user_name(id, as_mut_ptr(raw), raw.len), raw)
+end user_name
 
+/** The name the system's group database gives group `id`, as POSIX's `getgrgid_r`: `group_name(0)` is
+ * `"wheel"` on macOS and `"root"` on Linux, and `group_name(group())` is the program's own group's.
+ *
+ * It answers as `user_name` does: **an id with no entry is `NotFound`**, a name that is not valid
+ * UTF-8 is `InvalidUtf8`, a lookup that failed is the system's own error, and a target with no group
+ * database fails with `unsupported()`. A group with more members than any first guess holds is still
+ * answered: the lookup grows its room until the entry fits.
+ */
+group_name(id: u32) -> Result[string, IoError]
+    var raw: []u8 = [0; 1024]
+
+    name_answer(psys.group_name(id, as_mut_ptr(raw), raw.len), raw)
+end group_name
+
+/** A name hook's answer as the name: its length, or a failure's code negated. */
+private name_answer(n: isize, raw: []u8) -> Result[string, IoError]
     if n < 0 then return Err(from_status(int(n)))
 
     from_utf8(raw[0..<usize(n)]) match
         Ok(s) -> Ok(s)
         Err(e) -> Err(IoError.InvalidUtf8(e.offset))
-end user_name
+end name_answer
+
+/** The id of the user the system's user database calls `name`, as POSIX's `getpwnam_r`, and the
+ * reverse of `user_name`: `user_id("root")` is 0, and `user_id(user_name(user())?)` is `user()`.
+ *
+ * **A name with no entry is `NotFound`**, and so is one holding a zero byte, which no entry's name can
+ * hold. The name is handed to the database exactly as given -- nothing is trimmed or folded here --
+ * and whether case matters is the database's own: macOS's matches `"ROOT"` too, Linux's files do
+ * not. A lookup that failed is the system's own error; a target with no user database fails with
+ * `unsupported()`.
+ */
+user_id(name: string) -> Result[u32, IoError] = id_of_name(psys.user_id(as_ptr(name.bytes), name.bytes.len))
+
+/** The id of the group the system's group database calls `name`, as POSIX's `getgrnam_r`, and the
+ * reverse of `group_name`, with `user_id`'s answers: `NotFound` for a name with no entry.
+ */
+group_id(name: string) -> Result[u32, IoError] = id_of_name(psys.group_id(as_ptr(name.bytes), name.bytes.len))
+
+/** An id hook's answer as the id: the id itself, or a failure's code negated. */
+private id_of_name(answer: i64) -> Result[u32, IoError] =
+    if answer < 0 then Err(from_status(int(answer))) else Ok(u32(answer))
 
 /** The name this machine calls itself, as POSIX's `gethostname`: `"build-7"`, or a fully qualified
  * `"build-7.example.org"`, whichever the host was configured with. It is whatever the host says and
