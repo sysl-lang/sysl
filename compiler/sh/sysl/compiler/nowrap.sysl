@@ -87,14 +87,27 @@ end NoWrap
 
 no_wrap_none() -> NoWrap = NoWrap(set(), set(), set(), buf(), buf(), 0, 0, false, set(), set())
 
-// What a walk over a body found.
-private struct NwScan
+// What a walk over a body found: the locals it saw reached by address and written, those it saw
+// declared -- in order, and as a set, so that a body of `n` declarations costs `n` to scan and not
+// `n^2` -- and those declared more than once. `asked` counts the questions the scan asked of the
+// declarations before each one, which a test holds to one a declaration.
+struct NwScan
     escaped: Set[string]
     written: Set[string]
     decls: Buf[string]
+    declared: Set[string]
     twice: Set[string]
+    asked: usize
 
-private nw_scan() -> &NwScan = NwScan(set(), set(), buf(), set())
+private nw_scan() -> &NwScan = NwScan(set(), set(), buf(), set(), set(), 0)
+
+// The walk `nowrap_begin` makes over a body.
+nw_scan_body(f: TFunc) -> &NwScan
+    val s = nw_scan()
+
+    walk_block_stmts(f.body, nw_walker(s))
+    s
+end nw_scan_body
 
 // The local a write to `place` changes, where it changes a local's own value.
 private nw_root(place: TExpr) -> Option[string] = *place.kind match
@@ -135,10 +148,12 @@ end nw_on_expr
 private nw_on_stmt(s: &NwScan, st: TStmt)
     st match
         TVarDecl(name, _, _, _) ->
-            for d in s.decls
-                if d == name then s.twice.add(name)
+            s.asked += 1
+
+            if s.declared.has(name) then s.twice.add(name)
 
             s.decls.push(name)
+            s.declared.add(name)
         TRefDecl(_, _, place) -> nw_escape(s, place)
         TAsm(_, operands, _, _) ->
             for item in operands
@@ -151,20 +166,13 @@ private nw_walker(s: &NwScan) -> &TWalk =
     TWalk(true, x -> nw_on_expr(s, x), w -> nw_wrote(s, w.place), st -> nw_on_stmt(s, st))
 
 // Whether a scan saw `name` written, declared or reached by address.
-private nw_touches(s: &NwScan, name: string) -> bool
-    if s.written.has(name) || s.escaped.has(name) then return true
-
-    for d in s.decls
-        if d == name then return true
-
-    false
-end nw_touches
+private nw_touches(s: &NwScan, name: string) -> bool =
+    s.written.has(name) || s.escaped.has(name) || s.declared.has(name)
 
 // Sets up what is known for the function about to be lowered.
 nowrap_begin(e: *Emit, f: TFunc)
-    val s = nw_scan()
+    val s = nw_scan_body(f)
 
-    walk_block_stmts(f.body, nw_walker(s))
     e.nowrap = no_wrap_none()
     e.nowrap.escaped = s.escaped
     e.nowrap.ready = true

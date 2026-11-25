@@ -3,9 +3,11 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
-import sysl.text.Search
+import sysl.text.{Search, join}
 import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
 import sysl.process.{capture, Status}
+import sysl.slices.as_ptr
+import sysl.sync.Atomic
 
 // An unsigned add the body proves cannot wrap is laid down as `add nuw` (`nowrap.sysl`), and a guard
 // in the non-wrapping form `n > L || len > L - n` is said again as an `llvm.assume`, so the bounds test
@@ -356,3 +358,95 @@ nwb_the_non_wrapping_guard_turns_it_away()
 
         assert_eq(printed, "false\n")
         assert(state == Status.Exited(0), s"-O$level stopped with $state: $err")
+
+// -- the scan of a body's declarations --------------------------------------------------------------
+
+// `f(v, w)`: an immutable `m` bounded by `v.len`, a binding of `m` in a block that hides it --
+// `inner` is its declaration and what the block does with it -- and a loop variable added to each.
+private nwb_shadowed(inner: string) -> string =
+    "@noinline\nf(v: []u8, w: []u8) -> usize\n    val m = v.len\n    var t = 0usize\n\n" +
+    "    if true\n" + inner + "\n        for i in 0..<w.len\n            t = t ^ (i + m)\n\n" +
+    "    for i in 0..<v.len\n        t = t ^ (i + m)\n\n    t\n\nprint(f([u8(1)], [u8(2)]))\n"
+
+@test("a local hidden by a block's own binding of its name carries its bound, and so does the binding")
+nwb_a_shadowed_local_and_its_shadow_carry_bounds()
+    if nwb_no_library() then return
+
+    assert_eq(nwb_flags(nwb_body(nwb_ir(nwb_shadowed("        val m = w.len\n")), "@f")), 2)
+
+@test("a hiding binding written after its declaration carries nothing, and the one it hides still does")
+nwb_a_written_shadow_leaves_the_outer_bound()
+    if nwb_no_library() then return
+
+    assert_eq(nwb_flags(nwb_body(nwb_ir(nwb_shadowed("        var m = w.len\n\n        m = 7\n")), "@f")), 1)
+
+// `n` locals declared and never read but the last. Lowering scans every declaration once, to know
+// which are written after it and which are declared twice; that scan asked each declaration of every
+// one before it, so a body of `n` cost `n^2` to lower -- 256000 took 55 seconds in a release build of
+// 0.13.6, against under five now. The scan counts the questions it asks (`NwScan.asked`), and the
+// test holds them to linear with no clock.
+private nwb_decls(n: int) -> string
+    var lines: Buf[string] = buf()
+
+    lines.push("main()")
+
+    for i in 0..<n
+        lines.push(s"    val v$i = $i")
+
+    lines.push(s"    print(v${n - 1})\n")
+    join(lines.view(), "\n")
+end nwb_decls
+
+private struct NwbJob
+    texts: *string
+    passed: Atomic[i32]
+
+private nwb_build_here(job: *NwbJob)
+    val r = azc_ran([("main.sysl", job.texts[0])])
+
+    if r.built && r.ok && r.out == job.texts[1] then job.passed.store(1)
+    else print(s"built ${r.built}, exited zero ${r.ok}: ${r.said()}")
+
+// How many questions the scan of `main` asks of a body of `n` declarations.
+private nwb_asked(n: int) -> usize
+    val parsed = parse(source_of("t.sysl", nwb_decls(n)))
+    var units: Buf[Program] = buf()
+
+    for item in nwb_library()
+        units.push(item)
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    assert(done.reported.is_empty(), "the body of declarations was refused")
+
+    for f in program_of(done, "").funcs
+        if f.name == "main" then return nw_scan_body(f).asked
+
+    assert(false, "nothing is named main")
+    0
+end nwb_asked
+
+@test("the scan of a body's declarations asks one question a declaration")
+nwb_declaration_scan_is_linear()
+    if nwb_no_library() then return
+
+    assert_eq(nwb_asked(1000), 1000)
+    assert_eq(nwb_asked(2000), 2000)
+    assert_eq(nwb_asked(4000), 4000)
+
+@test("a body of 64000 declarations builds, runs and prints its last")
+nwb_many_declarations_build()
+    if !std_root().is_ok() || !clang_available() then return
+
+    var texts: Buf[string] = buf()
+
+    texts.push(nwb_decls(64000))
+    texts.push("63999\n")
+
+    val job: &sync NwbJob = NwbJob(as_ptr(texts.view()), Atomic(0))
+
+    on_compiler_stack(&nwb_build_here, &*job)
+    assert(job.passed.load() == 1, "the body of many declarations did not build, run and print what it owes")
+end nwb_many_declarations_build
